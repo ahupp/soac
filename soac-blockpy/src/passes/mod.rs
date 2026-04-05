@@ -68,7 +68,7 @@ pub enum InstrWithYield {
 
 #[derive(Clone, derive_more::From, DelegateMatchDefault)]
 #[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, Debug)]
-pub enum CoreBlockPyExpr<N: BlockPyNameLike = UnresolvedName> {
+pub enum InstrLow<N: BlockPyNameLike = UnresolvedName> {
     Literal(LiteralValue),
     BinOp(BinOp<Self>),
     UnaryOp(UnaryOp<Self>),
@@ -87,7 +87,9 @@ pub enum CoreBlockPyExpr<N: BlockPyNameLike = UnresolvedName> {
     MakeFunction(MakeFunction<Self>),
 }
 
-pub type LocatedInstr = CoreBlockPyExpr<LocatedName>;
+pub type CoreBlockPyExpr<N = UnresolvedName> = InstrLow<N>;
+pub type LocatedCoreBlockPyExpr = InstrLow<LocatedName>;
+pub type LocatedInstr = InstrLow<LocatedName>;
 
 #[derive(Debug, Clone)]
 pub struct CoreBlockPyPassWithAwaitAndYield;
@@ -107,14 +109,14 @@ impl BlockPyPass for CoreBlockPyPassWithYield {
 pub struct CoreBlockPyPass;
 
 impl BlockPyPass for CoreBlockPyPass {
-    type Expr = CoreBlockPyExpr<UnresolvedName>;
+    type Expr = InstrLow<UnresolvedName>;
 }
 
 #[derive(Debug, Clone)]
 pub struct ResolvedStorageBlockPyPass;
 
 impl BlockPyPass for ResolvedStorageBlockPyPass {
-    type Expr = CoreBlockPyExpr<LocatedName>;
+    type Expr = InstrLow<LocatedName>;
 }
 
 #[derive(Debug, Clone)]

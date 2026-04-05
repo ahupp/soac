@@ -4,7 +4,7 @@ use crate::block_py::{
     runtime_symbol, BindingKind, BindingPurpose, BindingTarget, BlockArg, BlockPyFunction,
     BlockPyModule, BlockPyNameLike, BlockTerm, Call, CallArgPositional, CallableScopeInfo,
     CallableScopeKind, CellBindingKind, CellCaptureBinding, CellLocation, CellRef, CellRefForName,
-    ChildVisitable, ClassBodyFallback, ClosureInit, ClosureSlot, CoreBlockPyExpr,
+    ChildVisitable, ClassBodyFallback, ClosureInit, ClosureSlot, CoreBlockPyExpr, InstrLow,
     CoreNumberLiteral, CoreNumberLiteralValue, CoreStringLiteral, Del, DelItem, EffectiveBinding,
     FunctionId, FunctionKind, HasMeta, Load, LocalLocation, LocatedInstr, LocatedName,
     MakeCell, MakeFunction, MapFunction, MapInstr, Mappable, NameLocation, SetItem, StorageLayout,
@@ -1022,7 +1022,7 @@ impl MapInstr<CoreBlockPyExpr, CoreBlockPyExpr> for NameBindingMapper<'_> {
                 meta.range,
             );
         }
-        match_default!(expr: crate::passes::CoreBlockPyExpr {
+        match_default!(expr: crate::passes::InstrLow {
             CoreBlockPyExpr::Load(op) => {
                 let meta = op.meta();
                 if op.name.is_runtime_name() {
@@ -2027,7 +2027,7 @@ impl NameLocator<'_> {
 
 impl MapInstr<CoreBlockPyExpr, CoreBlockPyExpr<LocatedName>> for NameLocator<'_> {
     fn map_instr(&mut self, expr: CoreBlockPyExpr) -> CoreBlockPyExpr<LocatedName> {
-        match_default!(expr: crate::passes::CoreBlockPyExpr {
+        match_default!(expr: crate::passes::InstrLow {
             CoreBlockPyExpr::Literal(literal) => CoreBlockPyExpr::Literal(literal),
             CoreBlockPyExpr::Load(op) => {
                 let meta = op.meta();

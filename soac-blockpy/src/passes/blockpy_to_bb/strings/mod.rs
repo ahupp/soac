@@ -1,8 +1,9 @@
 use crate::block_py::{
-    BlockPyFunction, BlockPyModule, CodegenBlockPyExpr, HasMeta, LiteralValue, Load,
-    LocatedInstr, LocatedName, MapFunction, MapInstr, Mappable, NameLocation, WithMeta,
+    BlockPyFunction, BlockPyModule, CodegenBlockPyExpr, HasMeta, InstrLow, LiteralValue, Load,
+    LocatedCoreBlockPyExpr, LocatedInstr, LocatedName, MapFunction, MapInstr, Mappable,
+    NameLocation, WithMeta,
 };
-use crate::passes::{CodegenBlockPyPass, CoreBlockPyExpr, ResolvedStorageBlockPyPass};
+use crate::passes::{CodegenBlockPyPass, ResolvedStorageBlockPyPass};
 use soac_macros::match_default;
 
 pub fn normalize_bb_module_strings(
@@ -43,7 +44,7 @@ impl CodegenExprNormalizer {
 
 impl MapInstr<LocatedInstr, CodegenBlockPyExpr> for CodegenExprNormalizer {
     fn map_instr(&mut self, expr: LocatedInstr) -> CodegenBlockPyExpr {
-        match_default!(expr: crate::passes::CoreBlockPyExpr<LocatedName> {
+        match_default!(expr: crate::passes::InstrLow<LocatedName> {
             LocatedInstr::Literal(literal) => {
                 let meta = literal.meta();
                 let constant_index = self.push_module_constant(literal);

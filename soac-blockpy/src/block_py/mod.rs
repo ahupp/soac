@@ -33,8 +33,8 @@ pub(crate) mod scope;
 pub(crate) mod validate;
 mod visit;
 pub use crate::passes::{
-    CoreBlockPyExpr, InstrWithAwaitAndYield, InstrWithYield,
-    LocatedInstr,
+    CoreBlockPyExpr, CoreBlockPyExprWithAwaitAndYield, CoreBlockPyExprWithYield, InstrLow,
+    InstrWithAwaitAndYield, InstrWithYield, LocatedCoreBlockPyExpr, LocatedInstr,
 };
 #[allow(unused_imports)]
 pub(crate) use map::{
@@ -646,7 +646,7 @@ pub struct BlockPyModule<P: BlockPyPass, S = <P as BlockPyPass>::Expr> {
     pub module_name_gen: ModuleNameGen,
     pub global_names: Vec<String>,
     pub callable_defs: Vec<BlockPyFunction<P, S>>,
-    pub module_constants: Vec<CoreBlockPyExpr<LocatedName>>,
+    pub module_constants: Vec<InstrLow<LocatedName>>,
     pub counter_defs: Vec<CounterDef>,
 }
 
@@ -801,7 +801,7 @@ impl Instr for InstrWithYield {
     type Name = UnresolvedName;
 }
 
-impl<N: BlockPyNameLike> Instr for CoreBlockPyExpr<N> {
+impl<N: BlockPyNameLike> Instr for InstrLow<N> {
     type Name = N;
 }
 
@@ -1375,7 +1375,7 @@ impl ImplicitNoneExpr for InstrWithYield {
     }
 }
 
-impl ImplicitNoneExpr for CoreBlockPyExpr {
+impl ImplicitNoneExpr for InstrLow {
     fn implicit_none_expr() -> Self {
         core_runtime_name_expr_with_meta("NONE", Default::default(), Default::default())
     }
@@ -1383,7 +1383,7 @@ impl ImplicitNoneExpr for CoreBlockPyExpr {
     fn is_implicit_none_expr(expr: &Self) -> bool {
         matches!(
             expr,
-            CoreBlockPyExpr::Load(op) if op.name.is_runtime_symbol("NONE")
+            InstrLow::Load(op) if op.name.is_runtime_symbol("NONE")
         )
     }
 }
