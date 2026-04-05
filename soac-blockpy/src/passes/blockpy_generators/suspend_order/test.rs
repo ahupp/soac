@@ -7,6 +7,7 @@ use crate::block_py::{
 };
 use crate::passes::core_await_lower::lower_awaits_in_core_blockpy_module;
 use crate::passes::{CoreBlockPyPassWithAwaitAndYield, CoreBlockPyPassWithYield};
+use ruff_python_ast as ast;
 
 fn test_name(id: &str) -> UnresolvedName {
     let ast::Expr::Name(expr) = crate::py_expr!("{id:id}", id = id) else {
@@ -65,7 +66,7 @@ fn lower_awaits_in_test_block(
 fn lower_yield_block(
     block: Block<CoreBlockPyExprWithAwaitAndYield>,
 ) -> Block<CoreBlockPyExprWithYield> {
-    make_eval_order_explicit_in_core_callable_def(test_callable_def_with_yield_block(
+    make_suspend_order_explicit_in_core_callable_def(test_callable_def_with_yield_block(
         lower_awaits_in_test_block(block),
     ))
         .blocks
@@ -127,7 +128,7 @@ fn eval_order_hoists_nested_call_in_assignment_rhs() {
     let block = Block {
         label: BlockLabel::from_index(0),
         body: vec![Store::new(
-            fresh_eval_name(),
+            test_name("tmp"),
             Box::new(CoreBlockPyExprWithAwaitAndYield::from(crate::py_expr!(
                 "f(g(x))"
             ))),
