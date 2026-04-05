@@ -6,7 +6,7 @@ use crate::block_py::{
     CallableScopeKind, CellBindingKind, CellCaptureBinding, CellLocation, CellRef, CellRefForName,
     ChildVisitable, ClassBodyFallback, ClosureInit, ClosureSlot, InstrLow,
     CoreNumberLiteral, CoreNumberLiteralValue, CoreStringLiteral, Del, DelItem, EffectiveBinding,
-    FunctionId, FunctionKind, HasMeta, Load, LocalLocation, LocatedInstr, LocatedName,
+    FunctionId, FunctionKind, HasMeta, Load, LocalLocation, InstrResolved, ResolvedName,
     MakeCell, MakeFunction, MapFunction, MapInstr, Mappable, NameLocation, SetItem, StorageLayout,
     Store, UnresolvedName, WithMeta,
 };
@@ -71,8 +71,8 @@ fn op_stmt(operation: impl Into<InstrLow>) -> CoreStmt {
     op_expr(operation)
 }
 
-fn constant_location_expr(meta: crate::block_py::Meta, index: u32) -> LocatedInstr {
-    let name = LocatedName {
+fn constant_location_expr(meta: crate::block_py::Meta, index: u32) -> InstrResolved {
+    let name = ResolvedName {
         id: "__dp_constant".into(),
         location: NameLocation::Constant(index),
     };
@@ -1888,7 +1888,7 @@ impl NameLocator<'_> {
         self.resolve_raw_cell_location(source_name.as_str())
     }
 
-    fn locate_name(&mut self, name: ast::name::Name) -> LocatedName {
+    fn locate_name(&mut self, name: ast::name::Name) -> ResolvedName {
         let name_text = name.to_string();
         let location = if self.exception_param_names.contains(name_text.as_str()) {
             let slot = self
@@ -1963,20 +1963,20 @@ impl NameLocator<'_> {
         } else {
             NameLocation::global(self.global_slots.slot_for(name_text.as_str()))
         };
-        LocatedName { id: name, location }
+        ResolvedName { id: name, location }
     }
 
-    fn locate_unresolved_name(&mut self, name: UnresolvedName) -> LocatedName {
+    fn locate_unresolved_name(&mut self, name: UnresolvedName) -> ResolvedName {
         match name {
             UnresolvedName::SourceName(name) => self.locate_name(name),
-            UnresolvedName::RuntimeName(name) => LocatedName {
+            UnresolvedName::RuntimeName(name) => ResolvedName {
                 id: name,
                 location: NameLocation::RuntimeName,
             },
         }
     }
 
-    fn mark_raw_cell_store_name(&self, name: LocatedName) -> LocatedName {
+    fn mark_raw_cell_store_name(&self, name: ResolvedName) -> ResolvedName {
         let name_text = name.id.to_string();
         if resolve_cell_storage_name(self.scope, name_text.as_str()).is_some() {
             if let Some(slot) = self.local_slots.get(name_text.as_str()).copied() {
@@ -1986,7 +1986,7 @@ impl NameLocator<'_> {
         self.mark_raw_cell_name(name)
     }
 
-    fn mark_raw_cell_name(&self, name: LocatedName) -> LocatedName {
+    fn mark_raw_cell_name(&self, name: ResolvedName) -> ResolvedName {
         let name_text = name.id.to_string();
         if name.location.is_global() {
             if resolve_captured_cell_source_storage_name(self.scope, name_text.as_str()).is_some()
@@ -2008,8 +2008,8 @@ impl NameLocator<'_> {
 
     fn mark_raw_cell_expr(
         &self,
-        expr: InstrLow<LocatedName>,
-    ) -> InstrLow<LocatedName> {
+        expr: InstrLow<ResolvedName>,
+    ) -> InstrLow<ResolvedName> {
         match expr {
             InstrLow::Load(op) => {
                 let meta = op.meta();
@@ -2025,8 +2025,8 @@ impl NameLocator<'_> {
     }
 }
 
-impl MapInstr<InstrLow, InstrLow<LocatedName>> for NameLocator<'_> {
-    fn map_instr(&mut self, expr: InstrLow) -> InstrLow<LocatedName> {
+impl MapInstr<InstrLow, InstrLow<ResolvedName>> for NameLocator<'_> {
+    fn map_instr(&mut self, expr: InstrLow) -> InstrLow<ResolvedName> {
         match_default!(expr: crate::passes::InstrLow {
             InstrLow::Literal(literal) => InstrLow::Literal(literal),
             InstrLow::Load(op) => {
@@ -2090,7 +2090,7 @@ impl MapInstr<InstrLow, InstrLow<LocatedName>> for NameLocator<'_> {
         })
     }
 
-    fn map_name(&mut self, name: UnresolvedName) -> LocatedName {
+    fn map_name(&mut self, name: UnresolvedName) -> ResolvedName {
         self.locate_unresolved_name(name)
     }
 }
@@ -2644,7 +2644,7 @@ fn normalize_stmt_ops_in_resolved_callable(
 
 #[derive(Default)]
 struct ModuleConstantExtractor {
-    constants: Vec<LocatedInstr>,
+    constants: Vec<InstrResolved>,
 }
 
 impl ModuleConstantExtractor {
@@ -2672,15 +2672,15 @@ impl ModuleConstantExtractor {
         }
     }
 
-    fn extract_stmt(&mut self, stmt: &mut LocatedInstr) {
+    fn extract_stmt(&mut self, stmt: &mut InstrResolved) {
         self.extract_expr(stmt);
     }
 
-    fn extract_term(&mut self, term: &mut BlockTerm<LocatedInstr>) {
+    fn extract_term(&mut self, term: &mut BlockTerm<InstrResolved>) {
         crate::block_py::walk_term_mut(self, term);
     }
 
-    fn extract_expr(&mut self, expr: &mut LocatedInstr) {
+    fn extract_expr(&mut self, expr: &mut InstrResolved) {
         if matches!(expr, InstrLow::Literal(_))
             || matches!(expr, InstrLow::Load(op) if op.name.is_runtime_name())
         {
@@ -2697,8 +2697,8 @@ impl ModuleConstantExtractor {
     }
 }
 
-impl crate::block_py::VisitMut<LocatedInstr> for ModuleConstantExtractor {
-    fn visit_instr_mut(&mut self, expr: &mut LocatedInstr) {
+impl crate::block_py::VisitMut<InstrResolved> for ModuleConstantExtractor {
+    fn visit_instr_mut(&mut self, expr: &mut InstrResolved) {
         self.extract_expr(expr);
     }
 }

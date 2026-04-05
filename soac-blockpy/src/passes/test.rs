@@ -2,7 +2,7 @@ use crate::block_py::{BindingKind, ClosureInit, ClosureSlot};
 use crate::block_py::{
     BlockPyFunction, BlockPyModule, BlockPyNameLike, BlockTerm, Call, CallArgKeyword,
     CallArgPositional, CallableScopeKind, CellBindingKind, InstrLow, FunctionKind,
-    LocatedName, NameLocation, ResolvedStorageBlock,
+    ResolvedName, NameLocation, ResolvedStorageBlock,
 };
 use crate::passes::{CoreBlockPyPassWithAwaitAndYield, ResolvedStorageBlockPyPass};
 use crate::{lower_python_to_blockpy_for_testing, LoweringResult};
@@ -166,9 +166,9 @@ fn function_or_constants_use_text(
 
 fn runtime_call_by_name<'a>(
     module: &'a BlockPyModule<ResolvedStorageBlockPyPass>,
-    expr: &'a InstrLow<LocatedName>,
+    expr: &'a InstrLow<ResolvedName>,
     name: &str,
-) -> Option<&'a Call<InstrLow<LocatedName>>> {
+) -> Option<&'a Call<InstrLow<ResolvedName>>> {
     let InstrLow::Call(call) = expr else {
         return None;
     };

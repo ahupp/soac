@@ -1,6 +1,6 @@
 use crate::block_py::{
     BlockPyFunction, BlockPyModule, CodegenBlockPyExpr, HasMeta, InstrLow, LiteralValue, Load,
-    LocatedInstr, LocatedName, MapFunction, MapInstr, Mappable, NameLocation, WithMeta,
+    InstrResolved, ResolvedName, MapFunction, MapInstr, Mappable, NameLocation, WithMeta,
 };
 use crate::passes::{CodegenBlockPyPass, ResolvedStorageBlockPyPass};
 use soac_macros::match_default;
@@ -28,7 +28,7 @@ pub fn normalize_bb_module_strings(
 
 #[derive(Default)]
 struct CodegenExprNormalizer {
-    module_constants: Vec<LocatedInstr>,
+    module_constants: Vec<InstrResolved>,
 }
 
 impl CodegenExprNormalizer {
@@ -36,36 +36,36 @@ impl CodegenExprNormalizer {
         let index = u32::try_from(self.module_constants.len())
             .expect("module constant count should fit in u32");
         self.module_constants
-            .push(LocatedInstr::Literal(literal));
+            .push(InstrResolved::Literal(literal));
         index
     }
 }
 
-impl MapInstr<LocatedInstr, CodegenBlockPyExpr> for CodegenExprNormalizer {
-    fn map_instr(&mut self, expr: LocatedInstr) -> CodegenBlockPyExpr {
-        match_default!(expr: crate::passes::InstrLow<LocatedName> {
-            LocatedInstr::Literal(literal) => {
+impl MapInstr<InstrResolved, CodegenBlockPyExpr> for CodegenExprNormalizer {
+    fn map_instr(&mut self, expr: InstrResolved) -> CodegenBlockPyExpr {
+        match_default!(expr: crate::passes::InstrLow<ResolvedName> {
+            InstrResolved::Literal(literal) => {
                 let meta = literal.meta();
                 let constant_index = self.push_module_constant(literal);
-                Load::new(LocatedName {
+                Load::new(ResolvedName {
                     id: format!("__dp_constant_{constant_index}").into(),
                     location: NameLocation::Constant(constant_index),
                 })
                 .with_meta(meta)
                 .into()
             },
-            LocatedInstr::CellRefForName(node) => {
+            InstrResolved::CellRefForName(node) => {
                 panic!(
                     "cell_ref should lower to a resolved cell ref before codegen, got {:?}",
                     node.logical_name
                 );
             },
-            LocatedInstr::CellRef(node) => node.into(),
+            InstrResolved::CellRef(node) => node.into(),
             rest => rest.map_children(self).into(),
         })
     }
 
-    fn map_name(&mut self, name: LocatedName) -> LocatedName {
+    fn map_name(&mut self, name: ResolvedName) -> ResolvedName {
         name
     }
 }

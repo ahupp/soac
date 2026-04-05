@@ -33,7 +33,7 @@ pub(crate) mod scope;
 pub(crate) mod validate;
 mod visit;
 pub use crate::passes::{
-    InstrLow, InstrWithAwaitAndYield, InstrWithYield, LocatedInstr,
+    InstrLow, InstrWithAwaitAndYield, InstrWithYield, InstrResolved,
 };
 #[allow(unused_imports)]
 pub(crate) use map::{
@@ -468,18 +468,18 @@ impl Mappable<RuffExpr> for RuffExpr {
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
-pub struct LocatedName {
+pub struct ResolvedName {
     pub id: ruff_python_ast::name::Name,
     pub location: NameLocation,
 }
 
-impl fmt::Debug for LocatedName {
+impl fmt::Debug for ResolvedName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.pretty_id())
     }
 }
 
-impl LocatedName {
+impl ResolvedName {
     pub fn with_location(mut self, location: NameLocation) -> Self {
         self.location = location;
         self
@@ -502,7 +502,7 @@ impl LocatedName {
     }
 }
 
-impl BlockPyNameLike for LocatedName {
+impl BlockPyNameLike for ResolvedName {
     fn id_str(&self) -> &str {
         self.id.as_str()
     }
@@ -645,7 +645,7 @@ pub struct BlockPyModule<P: BlockPyPass, S = <P as BlockPyPass>::Expr> {
     pub module_name_gen: ModuleNameGen,
     pub global_names: Vec<String>,
     pub callable_defs: Vec<BlockPyFunction<P, S>>,
-    pub module_constants: Vec<InstrLow<LocatedName>>,
+    pub module_constants: Vec<InstrLow<ResolvedName>>,
     pub counter_defs: Vec<CounterDef>,
 }
 
@@ -805,7 +805,7 @@ impl<N: BlockPyNameLike> Instr for InstrLow<N> {
 }
 
 impl Instr for CodegenBlockPyExpr {
-    type Name = LocatedName;
+    type Name = ResolvedName;
 }
 
 pub(crate) fn core_call_expr_with_meta<E>(
@@ -1050,7 +1050,7 @@ pub trait BlockPyPass: Clone + fmt::Debug {
 }
 
 pub type InstrName<I> = <I as Instr>::Name;
-pub type ResolvedStorageBlock = Block<LocatedInstr>;
+pub type ResolvedStorageBlock = Block<InstrResolved>;
 pub type CodegenBlock = Block<CodegenBlockPyExpr>;
 pub type CodegenBlockPyFunction = BlockPyFunction<crate::passes::CodegenBlockPyPass>;
 pub type CodegenBlockPyModule = BlockPyModule<crate::passes::CodegenBlockPyPass>;
@@ -1387,9 +1387,9 @@ impl ImplicitNoneExpr for InstrLow {
     }
 }
 
-impl ImplicitNoneExpr for LocatedInstr {
+impl ImplicitNoneExpr for InstrResolved {
     fn implicit_none_expr() -> Self {
-        Load::new(LocatedName {
+        Load::new(ResolvedName {
             id: "NONE".into(),
             location: NameLocation::RuntimeName,
         })
@@ -1399,14 +1399,14 @@ impl ImplicitNoneExpr for LocatedInstr {
     fn is_implicit_none_expr(expr: &Self) -> bool {
         matches!(
             expr,
-            LocatedInstr::Load(op) if op.name.is_runtime_symbol("NONE")
+            InstrResolved::Load(op) if op.name.is_runtime_symbol("NONE")
         )
     }
 }
 
 impl ImplicitNoneExpr for CodegenBlockPyExpr {
     fn implicit_none_expr() -> Self {
-        Load::new(LocatedName {
+        Load::new(ResolvedName {
             id: "NONE".into(),
             location: NameLocation::RuntimeName,
         })

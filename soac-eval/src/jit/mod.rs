@@ -17,7 +17,7 @@ use soac_blockpy::block_py::{
     AbruptKind, BlockArg, BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword,
     CallArgPositional, CellLocation, CodegenBlock, CodegenBlockPyExpr, CounterDef, CounterId,
     ChildVisitable, CounterScope, CounterSite, FunctionId, HasMeta, InstrId, LocalLocation,
-    LocatedName, NameLocation, ParamDefaultSource, StorageLayout, Visit, WithMeta, BlockLabel,
+    ResolvedName, NameLocation, ParamDefaultSource, StorageLayout, Visit, WithMeta, BlockLabel,
     operation as blockpy_intrinsics,
 };
 use soac_blockpy::passes::CodegenBlockPyPass;
@@ -488,7 +488,7 @@ fn emit_codegen_local_name_load(
 
 fn emit_codegen_located_name_load(
     fb: &mut FunctionBuilder<'_>,
-    name: &LocatedName,
+    name: &ResolvedName,
     local_names: &mut Vec<String>,
     local_values: &mut Vec<ir::Value>,
     ctx: &JitEmitCtx<'_>,
@@ -1234,7 +1234,7 @@ fn build_counted_runtime_refcount_helpers(
 
 fn emit_raw_cell_object_for_name(
     fb: &mut FunctionBuilder<'_>,
-    name: &LocatedName,
+    name: &ResolvedName,
     local_names: &[String],
     local_values: &[ir::Value],
     ctx: &JitEmitCtx<'_>,

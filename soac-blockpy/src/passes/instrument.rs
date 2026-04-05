@@ -250,7 +250,7 @@ mod tests {
     use super::*;
     use crate::block_py::{
         BlockEdge, CalleeFunctionId, Call, CallArgPositional, CallDirect, CodegenBlockPyExpr,
-        FunctionId, HasMeta, InstrId, Load, LocatedName, Meta, NameLocation, TermBranchTable,
+        FunctionId, HasMeta, InstrId, Load, ResolvedName, Meta, NameLocation, TermBranchTable,
         WithMeta,
     };
     use crate::py_expr;
@@ -390,7 +390,7 @@ mod tests {
     }
 
     fn runtime_name_expr(name: &str, meta: Meta) -> CodegenBlockPyExpr {
-        Load::new(LocatedName {
+        Load::new(ResolvedName {
             id: Name::new(name),
             location: NameLocation::RuntimeName,
         })

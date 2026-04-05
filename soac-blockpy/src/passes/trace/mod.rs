@@ -1,7 +1,7 @@
 use crate::block_py::{
     core_call_expr_with_meta, literal_expr, BlockPyFunction, BlockPyModule, CallArgPositional,
     ChildVisitable, CodegenBlockPyExpr, CoreStringLiteral, CounterScope, CounterSite, HasMeta,
-    IncrementCounter, Load, LocatedInstr, LocatedName, Meta, NameLocation, Visit,
+    IncrementCounter, Load, InstrResolved, ResolvedName, Meta, NameLocation, Visit,
     WithMeta,
 };
 use crate::passes::{CodegenBlockPyPass, CounterBuilder};
@@ -324,7 +324,7 @@ impl PreparedTraceNameLocator {
         }
     }
 
-    fn load_name(&self, id: &str) -> LocatedName {
+    fn load_name(&self, id: &str) -> ResolvedName {
         let location = if let Some(slot) = self.local_slots.get(id).copied() {
             NameLocation::local(slot)
         } else if let Some(location) = self.existing_locations.get(id).copied() {
@@ -341,7 +341,7 @@ impl PreparedTraceNameLocator {
                 .unwrap_or_else(|| panic!("trace locator missing global slot for {id}"));
             NameLocation::global(slot)
         };
-        LocatedName {
+        ResolvedName {
             id: id.into(),
             location,
         }
@@ -350,7 +350,7 @@ impl PreparedTraceNameLocator {
 
 fn helper_call_expr(helper_name: &str, args: Vec<CodegenBlockPyExpr>) -> CodegenBlockPyExpr {
     let meta = Meta::synthetic();
-    let func = Load::new(LocatedName {
+    let func = Load::new(ResolvedName {
         id: helper_name.into(),
         location: NameLocation::RuntimeName,
     })
@@ -368,7 +368,7 @@ fn helper_call_expr(helper_name: &str, args: Vec<CodegenBlockPyExpr>) -> Codegen
 }
 
 fn string_literal_expr(
-    module_constants: &mut Vec<LocatedInstr>,
+    module_constants: &mut Vec<InstrResolved>,
     value: &str,
 ) -> CodegenBlockPyExpr {
     let meta = Meta::synthetic();
@@ -380,7 +380,7 @@ fn string_literal_expr(
         },
         meta.clone(),
     ));
-    crate::block_py::Load::new(crate::block_py::LocatedName {
+    crate::block_py::Load::new(crate::block_py::ResolvedName {
         id: format!("__dp_constant_{index}").into(),
         location: NameLocation::Constant(index),
     })
@@ -393,7 +393,7 @@ fn tuple_expr(values: Vec<CodegenBlockPyExpr>) -> CodegenBlockPyExpr {
 }
 
 fn param_pairs_expr(
-    module_constants: &mut Vec<LocatedInstr>,
+    module_constants: &mut Vec<InstrResolved>,
     locator: &PreparedTraceNameLocator,
     params: &[String],
 ) -> CodegenBlockPyExpr {

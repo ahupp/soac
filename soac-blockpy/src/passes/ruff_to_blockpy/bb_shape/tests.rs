@@ -4,7 +4,7 @@ use super::{
 };
 use crate::block_py::{
     Block, BlockLabel, BlockParam, BlockParamRole, BlockPyNameLike, BlockPyStmtBuilder, BlockTerm,
-    CallArgPositional, ChildVisitable, InstrLow, LocatedInstr, LocatedName, Meta,
+    CallArgPositional, ChildVisitable, InstrLow, InstrResolved, ResolvedName, Meta,
     ModuleNameGen, NameLocation, ResolvedStorageBlock, StructuredIf, StructuredInstr, TermIf,
     WithMeta,
 };
@@ -48,7 +48,7 @@ pub(crate) fn lower_structured_unresolved_core_blocks_to_bb_blocks(
 }
 
 pub(crate) fn lower_structured_located_blocks_to_bb_blocks(
-    blocks: &[Block<StructuredInstr<InstrLow<LocatedName>>, LocatedInstr>],
+    blocks: &[Block<StructuredInstr<InstrLow<ResolvedName>>, InstrResolved>],
 ) -> Vec<ResolvedStorageBlock> {
     let mut lowered = lower_structured_core_blocks_to_bb_blocks(blocks);
     rewrite_current_exception_in_located_core_blocks(&mut lowered);
@@ -56,7 +56,7 @@ pub(crate) fn lower_structured_located_blocks_to_bb_blocks(
 }
 
 fn rewrite_current_exception_in_located_core_blocks(
-    blocks: &mut [Block<LocatedInstr, LocatedInstr>],
+    blocks: &mut [Block<InstrResolved, InstrResolved>],
 ) {
     for block in blocks {
         let Some(exc_name) = block.exception_param().map(ToString::to_string) else {
@@ -70,21 +70,21 @@ fn rewrite_current_exception_in_located_core_blocks(
 }
 
 fn rewrite_current_exception_in_located_term(
-    term: &mut BlockTerm<LocatedInstr>,
+    term: &mut BlockTerm<InstrResolved>,
     exc_name: &str,
 ) {
     struct RewriteTermVisitor<'a> {
         exc_name: &'a str,
     }
 
-    impl crate::block_py::VisitMut<LocatedInstr> for RewriteTermVisitor<'_> {
-        fn visit_instr_mut(&mut self, expr: &mut LocatedInstr) {
+    impl crate::block_py::VisitMut<InstrResolved> for RewriteTermVisitor<'_> {
+        fn visit_instr_mut(&mut self, expr: &mut InstrResolved) {
             rewrite_current_exception_in_located_expr(expr, self.exc_name);
         }
 
         fn visit_raise_term_mut(
             &mut self,
-            raise_term: &mut crate::block_py::TermRaise<LocatedInstr>,
+            raise_term: &mut crate::block_py::TermRaise<InstrResolved>,
         ) {
             if let Some(exc) = raise_term.exc.as_mut() {
                 rewrite_current_exception_in_located_expr(exc, self.exc_name);
@@ -97,13 +97,13 @@ fn rewrite_current_exception_in_located_term(
     crate::block_py::walk_term_mut(&mut RewriteTermVisitor { exc_name }, term);
 }
 
-fn rewrite_current_exception_in_located_expr(expr: &mut LocatedInstr, exc_name: &str) {
+fn rewrite_current_exception_in_located_expr(expr: &mut InstrResolved, exc_name: &str) {
     struct RewriteVisitor<'a> {
         exc_name: &'a str,
     }
 
-    impl crate::block_py::VisitMut<LocatedInstr> for RewriteVisitor<'_> {
-        fn visit_instr_mut(&mut self, expr: &mut LocatedInstr) {
+    impl crate::block_py::VisitMut<InstrResolved> for RewriteVisitor<'_> {
+        fn visit_instr_mut(&mut self, expr: &mut InstrResolved) {
             rewrite_current_exception_in_located_expr(expr, self.exc_name);
         }
     }
@@ -114,8 +114,8 @@ fn rewrite_current_exception_in_located_expr(expr: &mut LocatedInstr, exc_name: 
     }
 }
 
-fn current_exception_name_expr_located(exc_name: &str) -> LocatedInstr {
-    crate::block_py::Load::new(LocatedName {
+fn current_exception_name_expr_located(exc_name: &str) -> InstrResolved {
+    crate::block_py::Load::new(ResolvedName {
         id: exc_name.into(),
         location: NameLocation::global(0),
     })

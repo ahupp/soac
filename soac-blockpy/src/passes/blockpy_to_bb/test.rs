@@ -1,7 +1,7 @@
 use crate::block_py::{
     literal_expr, Block, BlockLabel, BlockPyLiteral, BlockPyStmtBuilder, BlockTerm,
-    CallArgPositional, InstrLow, CoreStringLiteral, GetAttr, LocatedInstr,
-    LocatedName, NameLocation, Store, StructuredIf, StructuredInstr, WithMeta,
+    CallArgPositional, InstrLow, CoreStringLiteral, GetAttr, InstrResolved,
+    ResolvedName, NameLocation, Store, StructuredIf, StructuredInstr, WithMeta,
 };
 use crate::passes::ruff_to_blockpy::{
     lower_structured_located_blocks_to_bb_blocks, populate_exception_edge_args,
@@ -11,12 +11,12 @@ use ruff_text_size::TextRange;
 
 #[test]
 fn linearizes_structured_if_stmt_into_explicit_blocks() {
-    let block: Block<StructuredInstr<LocatedInstr>, LocatedInstr> = Block {
+    let block: Block<StructuredInstr<InstrResolved>, InstrResolved> = Block {
         label: BlockLabel::from_index(0),
         body: vec![
             StructuredInstr::Expr(
                 Store::new(
-                    LocatedName {
+                    ResolvedName {
                         id: "x".into(),
                         location: NameLocation::global(0),
                     },
@@ -28,7 +28,7 @@ fn linearizes_structured_if_stmt_into_explicit_blocks() {
                 test: core_name_expr("cond"),
                 body: BlockPyStmtBuilder::from_stmts(vec![StructuredInstr::Expr(
                     Store::new(
-                        LocatedName {
+                        ResolvedName {
                             id: "x".into(),
                             location: NameLocation::global(0),
                         },
@@ -38,7 +38,7 @@ fn linearizes_structured_if_stmt_into_explicit_blocks() {
                 )]),
                 orelse: BlockPyStmtBuilder::from_stmts(vec![StructuredInstr::Expr(
                     Store::new(
-                        LocatedName {
+                        ResolvedName {
                             id: "x".into(),
                             location: NameLocation::global(0),
                         },
@@ -66,8 +66,8 @@ fn linearizes_structured_if_stmt_into_explicit_blocks() {
     assert!(matches!(blocks[0].term, BlockTerm::IfTerm(_)));
 }
 
-fn core_name_expr(name: &str) -> LocatedInstr {
-    let name = LocatedName {
+fn core_name_expr(name: &str) -> InstrResolved {
+    let name = ResolvedName {
         id: name.into(),
         location: NameLocation::global(0),
     };
@@ -76,7 +76,7 @@ fn core_name_expr(name: &str) -> LocatedInstr {
         .into()
 }
 
-fn core_call_expr(name: &str, args: Vec<LocatedInstr>) -> LocatedInstr {
+fn core_call_expr(name: &str, args: Vec<InstrResolved>) -> InstrResolved {
     crate::block_py::core_call_expr_with_meta(
         core_name_expr(name),
         ast::AtomicNodeIndex::default(),
@@ -90,7 +90,7 @@ fn core_call_expr(name: &str, args: Vec<LocatedInstr>) -> LocatedInstr {
 
 #[test]
 fn rewrites_current_exception_placeholders_in_final_core_blocks() {
-    let block: Block<StructuredInstr<LocatedInstr>, LocatedInstr> = Block {
+    let block: Block<StructuredInstr<InstrResolved>, InstrResolved> = Block {
         label: BlockLabel::from_index(0),
         body: vec![StructuredInstr::Expr(core_call_expr(
             "current_exception",
@@ -127,13 +127,13 @@ fn rewrites_current_exception_placeholders_in_final_core_blocks() {
 
 #[test]
 fn rewrites_current_exception_inside_intrinsic_helper_args() {
-    let block: Block<StructuredInstr<LocatedInstr>, LocatedInstr> = Block {
+    let block: Block<StructuredInstr<InstrResolved>, InstrResolved> = Block {
         label: BlockLabel::from_index(0),
         body: Vec::new(),
         term: BlockTerm::Return(
             GetAttr::new(
                 core_call_expr("current_exception", Vec::new()),
-                literal_expr::<LocatedInstr>(
+                literal_expr::<InstrResolved>(
                     CoreStringLiteral {
                         value: "value".to_string(),
                     },
@@ -182,12 +182,12 @@ fn rewrites_current_exception_inside_intrinsic_helper_args() {
 
 #[test]
 fn exception_edges_seed_hidden_try_exception_locals_from_current_exception() {
-    let mut blocks: Vec<crate::block_py::Block<LocatedInstr>> = vec![
+    let mut blocks: Vec<crate::block_py::Block<InstrResolved>> = vec![
         crate::block_py::Block {
             label: BlockLabel::from_index(0),
             body: Vec::new(),
-            term: BlockTerm::<LocatedInstr>::Return(
-                <LocatedInstr as crate::block_py::ImplicitNoneExpr>::implicit_none_expr(),
+            term: BlockTerm::<InstrResolved>::Return(
+                <InstrResolved as crate::block_py::ImplicitNoneExpr>::implicit_none_expr(),
             ),
             params: vec![crate::block_py::BlockParam {
                 name: "_dp_outer_exc".to_string(),
@@ -198,7 +198,7 @@ fn exception_edges_seed_hidden_try_exception_locals_from_current_exception() {
         crate::block_py::Block {
             label: BlockLabel::from_index(1),
             body: Vec::new(),
-            term: BlockTerm::<LocatedInstr>::Jump(crate::block_py::BlockEdge::with_args(
+            term: BlockTerm::<InstrResolved>::Jump(crate::block_py::BlockEdge::with_args(
                 BlockLabel::from_index(2),
                 vec![
                     crate::block_py::BlockArg::AbruptKind(crate::block_py::AbruptKind::Exception),
@@ -220,8 +220,8 @@ fn exception_edges_seed_hidden_try_exception_locals_from_current_exception() {
         crate::block_py::Block {
             label: BlockLabel::from_index(2),
             body: Vec::new(),
-            term: BlockTerm::<LocatedInstr>::Return(
-                <LocatedInstr as crate::block_py::ImplicitNoneExpr>::implicit_none_expr(),
+            term: BlockTerm::<InstrResolved>::Return(
+                <InstrResolved as crate::block_py::ImplicitNoneExpr>::implicit_none_expr(),
             ),
             params: Vec::new(),
             exc_edge: None,

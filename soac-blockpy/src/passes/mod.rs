@@ -14,7 +14,7 @@ use crate::block_py::{cfg::relabel_blockpy_blocks_dense, BlockPyModule};
 use crate::block_py::{
     Await, BinOp, BlockPyNameLike, BlockPyPass, Call, CellRef, CellRefForName, ChildVisitable,
     CodegenBlockPyExpr, Del, DelItem, GetAttr, GetItem, HasMeta, Instr, LiteralValue, Load,
-    LocatedName, MakeCell, MakeFunction, MapInstr, Mappable, Meta, SetAttr, SetItem, Store,
+    ResolvedName, MakeCell, MakeFunction, MapInstr, Mappable, Meta, SetAttr, SetItem, Store,
     TryMapInstr, UnaryOp, UnresolvedName, WithMeta, Yield, YieldFrom,
 };
 use soac_macros::{enum_broadcast, DelegateMatchDefault};
@@ -87,7 +87,7 @@ pub enum InstrLow<N: BlockPyNameLike = UnresolvedName> {
     MakeFunction(MakeFunction<Self>),
 }
 
-pub type LocatedInstr = InstrLow<LocatedName>;
+pub type InstrResolved = InstrLow<ResolvedName>;
 
 #[derive(Debug, Clone)]
 pub struct CoreBlockPyPassWithAwaitAndYield;
@@ -114,7 +114,7 @@ impl BlockPyPass for CoreBlockPyPass {
 pub struct ResolvedStorageBlockPyPass;
 
 impl BlockPyPass for ResolvedStorageBlockPyPass {
-    type Expr = InstrLow<LocatedName>;
+    type Expr = InstrLow<ResolvedName>;
 }
 
 #[derive(Debug, Clone)]

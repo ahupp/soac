@@ -65,7 +65,7 @@ impl BlockPyPrettyPrinter for CodegenBlockPyPass {
 fn render_resolved_storage_block_metadata<P, S>(block: &Block<S, P::Expr>) -> Vec<String>
 where
     P: BlockPyPass,
-    P::Expr: Instr<Name = super::LocatedName>,
+    P::Expr: Instr<Name = super::ResolvedName>,
 {
     let mut lines = Vec::new();
     if !block.params.is_empty() {

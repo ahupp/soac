@@ -4,7 +4,7 @@ use soac_blockpy::block_py::{
     Call, CallArgPositional, CellLocation, ClosureInit, ClosureSlot, CodegenBlock,
     CodegenBlockPyExpr, InstrLow, CoreNumberLiteral, CoreNumberLiteralValue,
     CoreStringLiteral, CounterSite, Del, DelItem, FunctionName, LiteralValue, Load,
-    LocatedInstr, LocatedName, ModuleNameGen, NameLocation, Param, ParamKind, ParamSpec,
+    InstrResolved, ResolvedName, ModuleNameGen, NameLocation, Param, ParamKind, ParamSpec,
     StorageLayout, Store,
 };
 use soac_blockpy::passes::{
@@ -27,42 +27,42 @@ mod tests {
         CAPSULE_DESTROYED.store(true, Ordering::SeqCst);
     }
 
-    fn test_name(name: &str) -> LocatedName {
-        LocatedName {
+    fn test_name(name: &str) -> ResolvedName {
+        ResolvedName {
             id: name.into(),
             location: NameLocation::local(0),
         }
     }
 
-    fn test_global_name(name: &str) -> LocatedName {
-        LocatedName {
+    fn test_global_name(name: &str) -> ResolvedName {
+        ResolvedName {
             id: name.into(),
             location: NameLocation::global(0),
         }
     }
 
-    fn test_runtime_name(name: &str) -> LocatedName {
-        LocatedName {
+    fn test_runtime_name(name: &str) -> ResolvedName {
+        ResolvedName {
             id: name.into(),
             location: NameLocation::RuntimeName,
         }
     }
 
-    fn test_closure_cell_name(name: &str, slot: u32) -> LocatedName {
-        LocatedName {
+    fn test_closure_cell_name(name: &str, slot: u32) -> ResolvedName {
+        ResolvedName {
             id: name.into(),
             location: NameLocation::closure_cell(slot),
         }
     }
 
-    fn test_constant_name(index: u32) -> LocatedName {
-        LocatedName {
+    fn test_constant_name(index: u32) -> ResolvedName {
+        ResolvedName {
             id: "__dp_constant".into(),
             location: NameLocation::Constant(index),
         }
     }
 
-    fn int_literal(value: i64) -> LocatedInstr {
+    fn int_literal(value: i64) -> InstrResolved {
         let value_str = value.to_string();
         let literal = BlockPyLiteral::NumberLiteral(CoreNumberLiteral {
             value: CoreNumberLiteralValue::Int(
@@ -73,7 +73,7 @@ mod tests {
         InstrLow::Literal(LiteralValue::new(literal))
     }
 
-    fn string_literal(value: &str) -> LocatedInstr {
+    fn string_literal(value: &str) -> InstrResolved {
         let literal = BlockPyLiteral::StringLiteral(CoreStringLiteral {
             value: value.to_string(),
         });
@@ -82,11 +82,11 @@ mod tests {
 
     #[derive(Default)]
     struct TestConstantPool {
-        module_constants: Vec<LocatedInstr>,
+        module_constants: Vec<InstrResolved>,
     }
 
     impl TestConstantPool {
-        fn push_literal(&mut self, literal: LocatedInstr) -> CodegenBlockPyExpr {
+        fn push_literal(&mut self, literal: InstrResolved) -> CodegenBlockPyExpr {
             let index = u32::try_from(self.module_constants.len())
                 .expect("test module constant count should fit in u32");
             self.module_constants.push(literal);
@@ -102,7 +102,7 @@ mod tests {
         }
     }
 
-    fn name_expr(name: LocatedName) -> CodegenBlockPyExpr {
+    fn name_expr(name: ResolvedName) -> CodegenBlockPyExpr {
         Load::new(name).into()
     }
 
@@ -139,11 +139,11 @@ mod tests {
         staging_dir
     }
 
-    fn assign_stmt(target: LocatedName, value: CodegenBlockPyExpr) -> CodegenBlockPyExpr {
+    fn assign_stmt(target: ResolvedName, value: CodegenBlockPyExpr) -> CodegenBlockPyExpr {
         expr_stmt(op_expr(Store::new(target, value)))
     }
 
-    fn delete_stmt(target: LocatedName) -> CodegenBlockPyExpr {
+    fn delete_stmt(target: ResolvedName) -> CodegenBlockPyExpr {
         expr_stmt(op_expr(Del::new(target, false)))
     }
 
@@ -219,7 +219,7 @@ mod tests {
     fn render_test_jit_function_with_module_constants(
         function: &BlockPyFunction<CodegenBlockPyPass>,
         blocks: &[ObjPtr],
-        module_constants: Vec<LocatedInstr>,
+        module_constants: Vec<InstrResolved>,
     ) -> String {
         let module = BlockPyModule {
             module_name_gen: ModuleNameGen::new(0),
