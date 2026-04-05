@@ -1,12 +1,12 @@
 use crate::block_py::cfg::hoist_matching_subexpressions_in_callable_def;
-use crate::block_py::{instr_any, BlockPyFunction, CoreBlockPyExprWithYield};
+use crate::block_py::{instr_any, BlockPyFunction, InstrWithYield};
 use crate::passes::CoreBlockPyPassWithYield;
 
-fn expr_contains_suspend(expr: &CoreBlockPyExprWithYield) -> bool {
+fn expr_contains_suspend(expr: &InstrWithYield) -> bool {
     instr_any(expr, |expr| {
         matches!(
             expr,
-            CoreBlockPyExprWithYield::Yield(_) | CoreBlockPyExprWithYield::YieldFrom(_)
+            InstrWithYield::Yield(_) | InstrWithYield::YieldFrom(_)
         )
     })
 }

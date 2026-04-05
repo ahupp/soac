@@ -1,7 +1,7 @@
 use crate::block_py::cfg::linearize_structured_ifs;
 use crate::block_py::{
     BlockArg, BlockEdge, BlockPyNameLike, BlockTerm, ChildVisitable, CoreBlockPyExpr,
-    CoreBlockPyExprWithAwaitAndYield, FunctionNameGen, Instr, Load, Meta, StructuredInstr,
+    InstrWithAwaitAndYield, FunctionNameGen, Instr, Load, Meta, StructuredInstr,
     UnresolvedName, WithMeta,
 };
 use ruff_python_ast::{self as ast};
@@ -75,13 +75,13 @@ where
     }
 }
 
-impl CurrentExceptionExpr for CoreBlockPyExprWithAwaitAndYield {
+impl CurrentExceptionExpr for InstrWithAwaitAndYield {
     fn is_current_exception_call(&self) -> bool {
-        let CoreBlockPyExprWithAwaitAndYield::Call(call) = self else {
+        let InstrWithAwaitAndYield::Call(call) = self else {
             return false;
         };
         let Some(func_name) = (match call.func.as_ref() {
-            CoreBlockPyExprWithAwaitAndYield::Load(op) => Some(op.name.id_str()),
+            InstrWithAwaitAndYield::Load(op) => Some(op.name.id_str()),
             _ => None,
         }) else {
             return false;
@@ -108,8 +108,8 @@ pub(crate) fn rewrite_current_exception_in_core_blocks<E>(
 
 pub(crate) fn rewrite_current_exception_in_core_blocks_with_await_and_yield(
     blocks: &mut [crate::block_py::Block<
-        CoreBlockPyExprWithAwaitAndYield,
-        CoreBlockPyExprWithAwaitAndYield,
+        InstrWithAwaitAndYield,
+        InstrWithAwaitAndYield,
     >],
 ) {
     rewrite_current_exception_in_core_blocks(blocks);

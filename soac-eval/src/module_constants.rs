@@ -3,7 +3,7 @@ use pyo3::prelude::*;
 use soac_blockpy::block_py::{
     AbruptKind, BlockArg, BlockPyFunction, BlockPyLiteral, BlockPyModule, BlockPyNameLike,
     BlockTerm, CallArgKeyword, ChildVisitable, CodegenBlockPyExpr, CoreBlockPyExpr,
-    CoreNumberLiteralValue, LocatedCoreBlockPyExpr, ParamDefaultSource,
+    CoreNumberLiteralValue, LocatedInstr, ParamDefaultSource,
     operation as blockpy_intrinsics,
 };
 use soac_blockpy::passes::CodegenBlockPyPass;
@@ -206,7 +206,7 @@ impl ModuleCodegenConstants {
         self.ids.get(value).copied()
     }
 
-    fn push_explicit_constant_expr(&mut self, expr: &LocatedCoreBlockPyExpr) -> ModuleConstantId {
+    fn push_explicit_constant_expr(&mut self, expr: &LocatedInstr) -> ModuleConstantId {
         let value = match expr {
             CoreBlockPyExpr::Literal(literal) => match literal.as_literal() {
                 BlockPyLiteral::StringLiteral(string) => {

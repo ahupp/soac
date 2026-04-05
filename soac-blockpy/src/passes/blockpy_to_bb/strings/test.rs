@@ -2,7 +2,7 @@ use super::normalize_bb_module_strings;
 use crate::{
     block_py::{
         BlockPyLiteral, BlockPyNameLike, ChildVisitable, CodegenBlockPyExpr, CoreBlockPyExpr,
-        LocatedCoreBlockPyExpr,
+        LocatedInstr,
     },
     lower_python_to_blockpy_for_testing,
     passes::lower_try_jump_exception_flow,
@@ -19,7 +19,7 @@ fn tracked_name_binding_module(
         .clone()
 }
 
-fn module_constants_contain_string(exprs: &[LocatedCoreBlockPyExpr]) -> bool {
+fn module_constants_contain_string(exprs: &[LocatedInstr]) -> bool {
     exprs.iter().any(|expr| {
         matches!(
             expr,

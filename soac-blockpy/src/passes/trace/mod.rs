@@ -1,7 +1,7 @@
 use crate::block_py::{
     core_call_expr_with_meta, literal_expr, BlockPyFunction, BlockPyModule, CallArgPositional,
     ChildVisitable, CodegenBlockPyExpr, CoreStringLiteral, CounterScope, CounterSite, HasMeta,
-    IncrementCounter, Load, LocatedCoreBlockPyExpr, LocatedName, Meta, NameLocation, Visit,
+    IncrementCounter, Load, LocatedInstr, LocatedName, Meta, NameLocation, Visit,
     WithMeta,
 };
 use crate::passes::{CodegenBlockPyPass, CounterBuilder};
@@ -368,7 +368,7 @@ fn helper_call_expr(helper_name: &str, args: Vec<CodegenBlockPyExpr>) -> Codegen
 }
 
 fn string_literal_expr(
-    module_constants: &mut Vec<LocatedCoreBlockPyExpr>,
+    module_constants: &mut Vec<LocatedInstr>,
     value: &str,
 ) -> CodegenBlockPyExpr {
     let meta = Meta::synthetic();
@@ -393,7 +393,7 @@ fn tuple_expr(values: Vec<CodegenBlockPyExpr>) -> CodegenBlockPyExpr {
 }
 
 fn param_pairs_expr(
-    module_constants: &mut Vec<LocatedCoreBlockPyExpr>,
+    module_constants: &mut Vec<LocatedInstr>,
     locator: &PreparedTraceNameLocator,
     params: &[String],
 ) -> CodegenBlockPyExpr {

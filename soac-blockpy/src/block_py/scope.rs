@@ -1,7 +1,7 @@
 use super::{
     is_internal_symbol, walk_block, walk_expr, Block, BlockPyFunction, BlockPyLiteral,
     BlockPyNameLike, BlockPyPass, Call, CallArgPositional, ChildVisitable, CoreBlockPyExpr,
-    CoreBlockPyExprWithAwaitAndYield, CoreBlockPyExprWithYield, FunctionName, Instr, RuffExpr,
+    InstrWithAwaitAndYield, InstrWithYield, FunctionName, Instr, RuffExpr,
 };
 use crate::passes::ast_to_ast::scope_helpers::cell_name;
 use ruff_python_ast::{self as ast, Expr};
@@ -536,7 +536,7 @@ impl ScopeExprNode for RuffExpr {
     }
 }
 
-impl ScopeExprNode for CoreBlockPyExprWithAwaitAndYield {
+impl ScopeExprNode for InstrWithAwaitAndYield {
     fn root_name_id(&self) -> Option<&str> {
         match self {
             Self::Call(call) => call.func.as_ref().root_name_id(),
@@ -592,7 +592,7 @@ impl ScopeExprNode for CoreBlockPyExprWithAwaitAndYield {
     }
 }
 
-impl ScopeExprNode for CoreBlockPyExprWithYield {
+impl ScopeExprNode for InstrWithYield {
     fn root_name_id(&self) -> Option<&str> {
         match self {
             Self::Call(call) => call.func.as_ref().root_name_id(),

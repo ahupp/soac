@@ -139,7 +139,7 @@ pub(crate) fn build_core_blockpy_callable_def_from_runtime_input(
     let function_id = name_gen.function_id();
     let mut blocks = Vec::new();
     let entry_label =
-        lower_stmt_sequence_with_state::<crate::block_py::CoreBlockPyExprWithAwaitAndYield>(
+        lower_stmt_sequence_with_state::<crate::block_py::InstrWithAwaitAndYield>(
             context,
             runtime_input_body,
             RegionTargets::new(end_label.clone(), None),

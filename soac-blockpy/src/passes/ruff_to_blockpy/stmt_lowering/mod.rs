@@ -267,8 +267,8 @@ pub(crate) fn lower_stmt_into(
     context: &Context,
     stmt: &Stmt,
     out: &mut crate::block_py::BlockBuilder<
-        StructuredInstr<crate::block_py::CoreBlockPyExprWithAwaitAndYield>,
-        BlockTerm<crate::block_py::CoreBlockPyExprWithAwaitAndYield>,
+        StructuredInstr<crate::block_py::InstrWithAwaitAndYield>,
+        BlockTerm<crate::block_py::InstrWithAwaitAndYield>,
     >,
     loop_ctx: Option<&LoopContext>,
     next_label_id: &mut usize,

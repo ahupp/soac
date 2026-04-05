@@ -1,6 +1,6 @@
 use crate::block_py::{
     BlockPyFunction, BlockPyModule, CodegenBlockPyExpr, HasMeta, LiteralValue, Load,
-    LocatedCoreBlockPyExpr, LocatedName, MapFunction, MapInstr, Mappable, NameLocation, WithMeta,
+    LocatedInstr, LocatedName, MapFunction, MapInstr, Mappable, NameLocation, WithMeta,
 };
 use crate::passes::{CodegenBlockPyPass, CoreBlockPyExpr, ResolvedStorageBlockPyPass};
 use soac_macros::match_default;
@@ -28,7 +28,7 @@ pub fn normalize_bb_module_strings(
 
 #[derive(Default)]
 struct CodegenExprNormalizer {
-    module_constants: Vec<LocatedCoreBlockPyExpr>,
+    module_constants: Vec<LocatedInstr>,
 }
 
 impl CodegenExprNormalizer {
@@ -36,15 +36,15 @@ impl CodegenExprNormalizer {
         let index = u32::try_from(self.module_constants.len())
             .expect("module constant count should fit in u32");
         self.module_constants
-            .push(LocatedCoreBlockPyExpr::Literal(literal));
+            .push(LocatedInstr::Literal(literal));
         index
     }
 }
 
-impl MapInstr<LocatedCoreBlockPyExpr, CodegenBlockPyExpr> for CodegenExprNormalizer {
-    fn map_instr(&mut self, expr: LocatedCoreBlockPyExpr) -> CodegenBlockPyExpr {
+impl MapInstr<LocatedInstr, CodegenBlockPyExpr> for CodegenExprNormalizer {
+    fn map_instr(&mut self, expr: LocatedInstr) -> CodegenBlockPyExpr {
         match_default!(expr: crate::passes::CoreBlockPyExpr<LocatedName> {
-            LocatedCoreBlockPyExpr::Literal(literal) => {
+            LocatedInstr::Literal(literal) => {
                 let meta = literal.meta();
                 let constant_index = self.push_module_constant(literal);
                 Load::new(LocatedName {
@@ -54,13 +54,13 @@ impl MapInstr<LocatedCoreBlockPyExpr, CodegenBlockPyExpr> for CodegenExprNormali
                 .with_meta(meta)
                 .into()
             },
-            LocatedCoreBlockPyExpr::CellRefForName(node) => {
+            LocatedInstr::CellRefForName(node) => {
                 panic!(
                     "cell_ref should lower to a resolved cell ref before codegen, got {:?}",
                     node.logical_name
                 );
             },
-            LocatedCoreBlockPyExpr::CellRef(node) => node.into(),
+            LocatedInstr::CellRef(node) => node.into(),
             rest => rest.map_children(self).into(),
         })
     }

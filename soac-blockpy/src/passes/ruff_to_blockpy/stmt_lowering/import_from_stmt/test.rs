@@ -1,6 +1,6 @@
 use super::super::{simplify_stmt_ast_once_for_blockpy, BlockPyStmtBuilder};
 use super::*;
-use crate::block_py::CoreBlockPyExprWithAwaitAndYield;
+use crate::block_py::InstrWithAwaitAndYield;
 use crate::passes::ast_to_ast::context::Context;
 
 #[test]
@@ -23,7 +23,7 @@ fn stmt_importfrom_to_blockpy_uses_trait_owned_simplification_path() {
         panic!("expected import-from stmt");
     };
     let context = Context::new("");
-    let mut out = BlockPyStmtBuilder::<CoreBlockPyExprWithAwaitAndYield>::new();
+    let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new();
     let mut next_label_id = 0usize;
 
     import_stmt

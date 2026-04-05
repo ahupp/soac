@@ -21,7 +21,7 @@ use soac_macros::{enum_broadcast, DelegateMatchDefault};
 
 #[derive(Clone, derive_more::From, DelegateMatchDefault)]
 #[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, Debug)]
-pub enum CoreBlockPyExprWithAwaitAndYield {
+pub enum InstrWithAwaitAndYield {
     Literal(LiteralValue),
     BinOp(BinOp<Self>),
     UnaryOp(UnaryOp<Self>),
@@ -45,7 +45,7 @@ pub enum CoreBlockPyExprWithAwaitAndYield {
 
 #[derive(Clone, derive_more::From, DelegateMatchDefault)]
 #[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, Debug)]
-pub enum CoreBlockPyExprWithYield {
+pub enum InstrWithYield {
     Literal(LiteralValue),
     BinOp(BinOp<Self>),
     UnaryOp(UnaryOp<Self>),
@@ -87,20 +87,20 @@ pub enum CoreBlockPyExpr<N: BlockPyNameLike = UnresolvedName> {
     MakeFunction(MakeFunction<Self>),
 }
 
-pub type LocatedCoreBlockPyExpr = CoreBlockPyExpr<LocatedName>;
+pub type LocatedInstr = CoreBlockPyExpr<LocatedName>;
 
 #[derive(Debug, Clone)]
 pub struct CoreBlockPyPassWithAwaitAndYield;
 
 impl BlockPyPass for CoreBlockPyPassWithAwaitAndYield {
-    type Expr = CoreBlockPyExprWithAwaitAndYield;
+    type Expr = InstrWithAwaitAndYield;
 }
 
 #[derive(Debug, Clone)]
 pub struct CoreBlockPyPassWithYield;
 
 impl BlockPyPass for CoreBlockPyPassWithYield {
-    type Expr = CoreBlockPyExprWithYield;
+    type Expr = InstrWithYield;
 }
 
 #[derive(Debug, Clone)]

@@ -1,10 +1,10 @@
-use crate::block_py::{BlockPyStmtBuilder, CoreBlockPyExprWithAwaitAndYield, StructuredInstr};
+use crate::block_py::{BlockPyStmtBuilder, InstrWithAwaitAndYield, StructuredInstr};
 use crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup;
 use crate::py_expr;
 
 #[test]
 fn boolop_lowering_emits_blockpy_setup_directly() {
-    let mut out = BlockPyStmtBuilder::<CoreBlockPyExprWithAwaitAndYield>::new();
+    let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new();
     let mut next_label_id = 0usize;
 
     let lowered =
@@ -17,7 +17,7 @@ fn boolop_lowering_emits_blockpy_setup_directly() {
     assert!(
         fragment.body.iter().any(|stmt| matches!(
             stmt,
-            StructuredInstr::Expr(CoreBlockPyExprWithAwaitAndYield::Store(_))
+            StructuredInstr::Expr(InstrWithAwaitAndYield::Store(_))
         )),
         "{fragment:?}"
     );
@@ -32,7 +32,7 @@ fn boolop_lowering_emits_blockpy_setup_directly() {
 
 #[test]
 fn compare_lowering_keeps_native_compare_expr() {
-    let mut out = BlockPyStmtBuilder::<CoreBlockPyExprWithAwaitAndYield>::new();
+    let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new();
     let mut next_label_id = 0usize;
 
     let lowered = lower_expr_into_with_setup(py_expr!("a < b"), &mut out, None, &mut next_label_id)

@@ -1,6 +1,6 @@
 use super::super::BlockPyStmtBuilder;
 use super::*;
-use crate::block_py::{CoreBlockPyExprWithAwaitAndYield, StructuredInstr};
+use crate::block_py::{InstrWithAwaitAndYield, StructuredInstr};
 use crate::passes::ast_to_ast::context::Context;
 
 #[test]
@@ -23,7 +23,7 @@ fn stmt_augassign_to_blockpy_emits_direct_core_operations() {
         panic!("expected augassign stmt");
     };
     let context = Context::new("");
-    let mut out = BlockPyStmtBuilder::<CoreBlockPyExprWithAwaitAndYield>::new();
+    let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new();
     let mut next_label_id = 0usize;
 
     aug_stmt
@@ -49,7 +49,7 @@ fn stmt_pow_augassign_to_blockpy_uses_inplace_pow() {
         panic!("expected augassign stmt");
     };
     let context = Context::new("");
-    let mut out = BlockPyStmtBuilder::<CoreBlockPyExprWithAwaitAndYield>::new();
+    let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new();
     let mut next_label_id = 0usize;
 
     aug_stmt
@@ -57,7 +57,7 @@ fn stmt_pow_augassign_to_blockpy_uses_inplace_pow() {
         .expect("pow augassign lowering should succeed");
 
     let fragment = out.finish();
-    let Some(StructuredInstr::Expr(CoreBlockPyExprWithAwaitAndYield::Store(assign))) =
+    let Some(StructuredInstr::Expr(InstrWithAwaitAndYield::Store(assign))) =
         fragment.body.last()
     else {
         panic!("expected final store expr stmt, got {fragment:?}");

@@ -2,19 +2,19 @@ use super::*;
 
 use crate::block_py::{BinOpKind, BlockPyLiteral, BlockPyNameLike, UnaryOpKind};
 
-fn lower_semantic_expr_without_setup(expr: &Expr) -> CoreBlockPyExprWithAwaitAndYield {
-    CoreBlockPyExprWithAwaitAndYield::from(expr.clone())
+fn lower_semantic_expr_without_setup(expr: &Expr) -> InstrWithAwaitAndYield {
+    InstrWithAwaitAndYield::from(expr.clone())
 }
 
-use crate::block_py::{CallArgKeyword, CallArgPositional, CoreBlockPyExprWithAwaitAndYield};
+use crate::block_py::{CallArgKeyword, CallArgPositional, InstrWithAwaitAndYield};
 use crate::lower_python_to_blockpy_for_testing;
 use crate::py_expr;
 use ruff_python_parser::parse_expression;
 
-fn is_raw_load_name_expr(expr: &CoreBlockPyExprWithAwaitAndYield, expected: &str) -> bool {
+fn is_raw_load_name_expr(expr: &InstrWithAwaitAndYield, expected: &str) -> bool {
     matches!(
         expr,
-        CoreBlockPyExprWithAwaitAndYield::Load(op) if op.name.id_str() == expected
+        InstrWithAwaitAndYield::Load(op) if op.name.id_str() == expected
     )
 }
 
@@ -43,11 +43,11 @@ fn expr_simplify_recurses_bottom_up_for_operator_family() {
     let expr = Expr::from(py_expr!("-(x + 1)"));
     let lowered = lower_semantic_expr_without_setup(&expr);
 
-    let CoreBlockPyExprWithAwaitAndYield::UnaryOp(op) = lowered else {
+    let InstrWithAwaitAndYield::UnaryOp(op) = lowered else {
         panic!("expected unary-op core expr");
     };
     assert_eq!(op.kind, UnaryOpKind::Neg);
-    let CoreBlockPyExprWithAwaitAndYield::BinOp(inner) = op.operand.as_ref() else {
+    let InstrWithAwaitAndYield::BinOp(inner) = op.operand.as_ref() else {
         panic!("expected __dp_neg to receive one lowered op arg");
     };
     assert_eq!(inner.kind, BinOpKind::Add);
@@ -56,36 +56,36 @@ fn expr_simplify_recurses_bottom_up_for_operator_family() {
 #[test]
 fn core_blockpy_expr_uses_reduced_variants_for_simple_shapes() {
     assert!(is_raw_load_name_expr(
-        &CoreBlockPyExprWithAwaitAndYield::from(py_expr!("x")),
+        &InstrWithAwaitAndYield::from(py_expr!("x")),
         "x"
     ));
     assert!(matches!(
-        CoreBlockPyExprWithAwaitAndYield::from(py_expr!("1")),
-        CoreBlockPyExprWithAwaitAndYield::Literal(literal)
+        InstrWithAwaitAndYield::from(py_expr!("1")),
+        InstrWithAwaitAndYield::Literal(literal)
             if matches!(literal.as_literal(), BlockPyLiteral::NumberLiteral(_))
     ));
     assert!(matches!(
-        CoreBlockPyExprWithAwaitAndYield::from(py_expr!("f(x)")),
-        CoreBlockPyExprWithAwaitAndYield::Call(_)
+        InstrWithAwaitAndYield::from(py_expr!("f(x)")),
+        InstrWithAwaitAndYield::Call(_)
     ));
     assert!(matches!(
-        CoreBlockPyExprWithAwaitAndYield::from(py_expr!("await f(x)")),
-        CoreBlockPyExprWithAwaitAndYield::Await(_)
+        InstrWithAwaitAndYield::from(py_expr!("await f(x)")),
+        InstrWithAwaitAndYield::Await(_)
     ));
     assert!(matches!(
-        CoreBlockPyExprWithAwaitAndYield::from(py_expr!("yield x")),
-        CoreBlockPyExprWithAwaitAndYield::Yield(_)
+        InstrWithAwaitAndYield::from(py_expr!("yield x")),
+        InstrWithAwaitAndYield::Yield(_)
     ));
     assert!(matches!(
-        CoreBlockPyExprWithAwaitAndYield::from(py_expr!("yield from xs")),
-        CoreBlockPyExprWithAwaitAndYield::YieldFrom(_)
+        InstrWithAwaitAndYield::from(py_expr!("yield from xs")),
+        InstrWithAwaitAndYield::YieldFrom(_)
     ));
 }
 
 #[test]
 fn core_blockpy_call_supports_star_args_and_kwargs() {
-    let CoreBlockPyExprWithAwaitAndYield::Call(call) =
-        CoreBlockPyExprWithAwaitAndYield::from(py_expr!("f(x, *args, y=z, **kw)"))
+    let InstrWithAwaitAndYield::Call(call) =
+        InstrWithAwaitAndYield::from(py_expr!("f(x, *args, y=z, **kw)"))
     else {
         panic!("expected reduced call expr");
     };
@@ -104,8 +104,8 @@ fn core_blockpy_call_supports_star_args_and_kwargs() {
 #[test]
 fn core_blockpy_expr_reduces_add_to_structured_intrinsic() {
     let parsed = *parse_expression("x + y").unwrap().into_syntax().body;
-    let CoreBlockPyExprWithAwaitAndYield::BinOp(op) =
-        CoreBlockPyExprWithAwaitAndYield::from(parsed)
+    let InstrWithAwaitAndYield::BinOp(op) =
+        InstrWithAwaitAndYield::from(parsed)
     else {
         panic!("expected operation-shaped reduced expr for x + y");
     };
@@ -116,24 +116,24 @@ fn core_blockpy_expr_reduces_add_to_structured_intrinsic() {
 fn core_blockpy_expr_reduces_operator_helper_families_to_intrinsics() {
     for expr in ["obj.attr", "obj[idx]", "-x", "x < y", "x in y", "x is y"] {
         let parsed = *parse_expression(expr).unwrap().into_syntax().body;
-        let lowered = CoreBlockPyExprWithAwaitAndYield::from(parsed);
+        let lowered = InstrWithAwaitAndYield::from(parsed);
         let matches_expected = match (&*expr, &lowered) {
-            ("obj.attr", CoreBlockPyExprWithAwaitAndYield::GetAttr(_)) => true,
-            ("obj[idx]", CoreBlockPyExprWithAwaitAndYield::GetItem(_)) => true,
-            ("-x", CoreBlockPyExprWithAwaitAndYield::UnaryOp(op))
+            ("obj.attr", InstrWithAwaitAndYield::GetAttr(_)) => true,
+            ("obj[idx]", InstrWithAwaitAndYield::GetItem(_)) => true,
+            ("-x", InstrWithAwaitAndYield::UnaryOp(op))
                 if op.kind == UnaryOpKind::Neg =>
             {
                 true
             }
-            ("x < y", CoreBlockPyExprWithAwaitAndYield::BinOp(op)) if op.kind == BinOpKind::Lt => {
+            ("x < y", InstrWithAwaitAndYield::BinOp(op)) if op.kind == BinOpKind::Lt => {
                 true
             }
-            ("x in y", CoreBlockPyExprWithAwaitAndYield::BinOp(op))
+            ("x in y", InstrWithAwaitAndYield::BinOp(op))
                 if op.kind == BinOpKind::Contains =>
             {
                 true
             }
-            ("x is y", CoreBlockPyExprWithAwaitAndYield::BinOp(op)) if op.kind == BinOpKind::Is => {
+            ("x is y", InstrWithAwaitAndYield::BinOp(op)) if op.kind == BinOpKind::Is => {
                 true
             }
             _ => false,
@@ -151,15 +151,15 @@ fn core_blockpy_expr_keeps_non_intrinsic_helper_families_as_named_calls() {
         ("{x: y}", "dict"),
     ] {
         let parsed = *parse_expression(expr).unwrap().into_syntax().body;
-        let CoreBlockPyExprWithAwaitAndYield::Call(call) =
-            CoreBlockPyExprWithAwaitAndYield::from(parsed)
+        let InstrWithAwaitAndYield::Call(call) =
+            InstrWithAwaitAndYield::from(parsed)
         else {
             panic!("expected call-shaped reduced expr for {expr}");
         };
         assert!(
             matches!(
                 &*call.func,
-                CoreBlockPyExprWithAwaitAndYield::Load(op)
+                InstrWithAwaitAndYield::Load(op)
                     if op.name.is_runtime_symbol(helper_name)
             ),
             "{call:?}",
@@ -170,8 +170,8 @@ fn core_blockpy_expr_keeps_non_intrinsic_helper_families_as_named_calls() {
 #[test]
 fn core_blockpy_expr_reuses_shared_tuple_splat_intrinsic_shape() {
     let parsed = *parse_expression("(x, *xs, y)").unwrap().into_syntax().body;
-    let lowered = CoreBlockPyExprWithAwaitAndYield::from(parsed);
-    let CoreBlockPyExprWithAwaitAndYield::BinOp(op) = &lowered else {
+    let lowered = InstrWithAwaitAndYield::from(parsed);
+    let InstrWithAwaitAndYield::BinOp(op) = &lowered else {
         panic!("expected operation-shaped reduced tuple expr");
     };
     assert_eq!(op.kind, BinOpKind::Add);
@@ -183,14 +183,14 @@ fn core_blockpy_expr_reuses_shared_tuple_splat_intrinsic_shape() {
 fn core_blockpy_expr_reuses_shared_tuple_splat_for_list_and_set() {
     for (expr, intrinsic) in [("[x, *xs, y]", "list"), ("{x, *xs, y}", "set")] {
         let parsed = *parse_expression(expr).unwrap().into_syntax().body;
-        let CoreBlockPyExprWithAwaitAndYield::Call(call) =
-            CoreBlockPyExprWithAwaitAndYield::from(parsed)
+        let InstrWithAwaitAndYield::Call(call) =
+            InstrWithAwaitAndYield::from(parsed)
         else {
             panic!("expected call-shaped reduced expr for {expr}");
         };
         assert!(matches!(
             &*call.func,
-            CoreBlockPyExprWithAwaitAndYield::Load(op)
+            InstrWithAwaitAndYield::Load(op)
                 if op.name.is_runtime_symbol(intrinsic)
         ));
         let [CallArgPositional::Positional(tupleish)] = &call.args[..] else {
@@ -211,7 +211,7 @@ fn helper_scoped_families_do_not_reach_core_blockpy_boundary() {
         "(x for x in xs)",
     ] {
         let parsed = *parse_expression(expr).unwrap().into_syntax().body;
-        let panic = std::panic::catch_unwind(|| CoreBlockPyExprWithAwaitAndYield::from(parsed));
+        let panic = std::panic::catch_unwind(|| InstrWithAwaitAndYield::from(parsed));
         assert!(
             panic.is_err(),
             "{expr} should be lowered before the core boundary"

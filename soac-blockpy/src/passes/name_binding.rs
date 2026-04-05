@@ -6,7 +6,7 @@ use crate::block_py::{
     CallableScopeKind, CellBindingKind, CellCaptureBinding, CellLocation, CellRef, CellRefForName,
     ChildVisitable, ClassBodyFallback, ClosureInit, ClosureSlot, CoreBlockPyExpr,
     CoreNumberLiteral, CoreNumberLiteralValue, CoreStringLiteral, Del, DelItem, EffectiveBinding,
-    FunctionId, FunctionKind, HasMeta, Load, LocalLocation, LocatedCoreBlockPyExpr, LocatedName,
+    FunctionId, FunctionKind, HasMeta, Load, LocalLocation, LocatedInstr, LocatedName,
     MakeCell, MakeFunction, MapFunction, MapInstr, Mappable, NameLocation, SetItem, StorageLayout,
     Store, UnresolvedName, WithMeta,
 };
@@ -71,7 +71,7 @@ fn op_stmt(operation: impl Into<CoreBlockPyExpr>) -> CoreStmt {
     op_expr(operation)
 }
 
-fn constant_location_expr(meta: crate::block_py::Meta, index: u32) -> LocatedCoreBlockPyExpr {
+fn constant_location_expr(meta: crate::block_py::Meta, index: u32) -> LocatedInstr {
     let name = LocatedName {
         id: "__dp_constant".into(),
         location: NameLocation::Constant(index),
@@ -2644,7 +2644,7 @@ fn normalize_stmt_ops_in_resolved_callable(
 
 #[derive(Default)]
 struct ModuleConstantExtractor {
-    constants: Vec<LocatedCoreBlockPyExpr>,
+    constants: Vec<LocatedInstr>,
 }
 
 impl ModuleConstantExtractor {
@@ -2672,15 +2672,15 @@ impl ModuleConstantExtractor {
         }
     }
 
-    fn extract_stmt(&mut self, stmt: &mut LocatedCoreBlockPyExpr) {
+    fn extract_stmt(&mut self, stmt: &mut LocatedInstr) {
         self.extract_expr(stmt);
     }
 
-    fn extract_term(&mut self, term: &mut BlockTerm<LocatedCoreBlockPyExpr>) {
+    fn extract_term(&mut self, term: &mut BlockTerm<LocatedInstr>) {
         crate::block_py::walk_term_mut(self, term);
     }
 
-    fn extract_expr(&mut self, expr: &mut LocatedCoreBlockPyExpr) {
+    fn extract_expr(&mut self, expr: &mut LocatedInstr) {
         if matches!(expr, CoreBlockPyExpr::Literal(_))
             || matches!(expr, CoreBlockPyExpr::Load(op) if op.name.is_runtime_name())
         {
@@ -2697,8 +2697,8 @@ impl ModuleConstantExtractor {
     }
 }
 
-impl crate::block_py::VisitMut<LocatedCoreBlockPyExpr> for ModuleConstantExtractor {
-    fn visit_instr_mut(&mut self, expr: &mut LocatedCoreBlockPyExpr) {
+impl crate::block_py::VisitMut<LocatedInstr> for ModuleConstantExtractor {
+    fn visit_instr_mut(&mut self, expr: &mut LocatedInstr) {
         self.extract_expr(expr);
     }
 }

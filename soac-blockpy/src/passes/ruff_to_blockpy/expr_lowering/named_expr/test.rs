@@ -1,12 +1,12 @@
 use crate::block_py::{
-    BlockPyNameLike, BlockPyStmtBuilder, CoreBlockPyExprWithAwaitAndYield, StructuredInstr,
+    BlockPyNameLike, BlockPyStmtBuilder, InstrWithAwaitAndYield, StructuredInstr,
 };
 use crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup;
 use crate::py_expr;
 
 #[test]
 fn named_expr_lowering_emits_blockpy_assign_directly() {
-    let mut out = BlockPyStmtBuilder::<CoreBlockPyExprWithAwaitAndYield>::new();
+    let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new();
     let mut next_label_id = 0usize;
 
     let _lowered =
@@ -14,7 +14,7 @@ fn named_expr_lowering_emits_blockpy_assign_directly() {
             .expect("expr lowering should succeed");
 
     let fragment = out.finish();
-    let [StructuredInstr::Expr(CoreBlockPyExprWithAwaitAndYield::Store(assign))] =
+    let [StructuredInstr::Expr(InstrWithAwaitAndYield::Store(assign))] =
         &fragment.body[..]
     else {
         panic!("expected one direct store expr stmt, got {fragment:?}");

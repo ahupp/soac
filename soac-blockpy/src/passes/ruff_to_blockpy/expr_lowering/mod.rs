@@ -1,6 +1,6 @@
 use crate::block_py::{
     core_runtime_positional_call_expr_with_meta, literal_expr, operation, BlockPyStmtBuilder,
-    CoreBlockPyExprWithAwaitAndYield, CoreStringLiteral, Del, FunctionId, FunctionKind, Instr,
+    InstrWithAwaitAndYield, CoreStringLiteral, Del, FunctionId, FunctionKind, Instr,
     Meta, Store, UnresolvedName, WithMeta,
 };
 use crate::namegen::fresh_name;
@@ -19,7 +19,7 @@ fn string_literal_expr(
     node_index: ast::AtomicNodeIndex,
     range: TextRange,
     value: String,
-) -> CoreBlockPyExprWithAwaitAndYield {
+) -> InstrWithAwaitAndYield {
     literal_expr(CoreStringLiteral { value }, Meta::new(node_index, range))
 }
 
@@ -114,7 +114,7 @@ fn inplace_kind(op: ast::Operator) -> Option<operation::BinOpKind> {
     })
 }
 
-impl RuffToBlockPyExpr for CoreBlockPyExprWithAwaitAndYield {
+impl RuffToBlockPyExpr for InstrWithAwaitAndYield {
     fn from_lowered_expr(expr: Expr) -> Self {
         lower_direct_core_helper_expr(&expr).unwrap_or_else(|| expr.into())
     }
@@ -154,7 +154,7 @@ impl RuffToBlockPyExpr for CoreBlockPyExprWithAwaitAndYield {
             range,
             "load_deleted_name",
             vec![
-                CoreBlockPyExprWithAwaitAndYield::from(py_expr!("{name:literal}", name = name)),
+                InstrWithAwaitAndYield::from(py_expr!("{name:literal}", name = name)),
                 value,
             ],
         )
@@ -327,9 +327,9 @@ fn lowered_helper_call<'a>(
     Some(call)
 }
 
-fn lower_direct_core_helper_expr(expr: &Expr) -> Option<CoreBlockPyExprWithAwaitAndYield> {
-    fn lowered(expr: Expr) -> CoreBlockPyExprWithAwaitAndYield {
-        <CoreBlockPyExprWithAwaitAndYield as RuffToBlockPyExpr>::from_lowered_expr(expr)
+fn lower_direct_core_helper_expr(expr: &Expr) -> Option<InstrWithAwaitAndYield> {
+    fn lowered(expr: Expr) -> InstrWithAwaitAndYield {
+        <InstrWithAwaitAndYield as RuffToBlockPyExpr>::from_lowered_expr(expr)
     }
 
     if let Some(call) = lowered_helper_call(expr, "make_function", 5) {

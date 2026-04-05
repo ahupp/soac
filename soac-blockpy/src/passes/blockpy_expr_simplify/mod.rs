@@ -2,7 +2,7 @@ use super::ast_to_ast::string_templates::lower_string_templates_in_expr;
 use crate::block_py::{
     core_call_expr_with_meta, core_runtime_name_expr_with_meta,
     core_runtime_positional_call_expr_with_meta, literal_expr, operation, Await, CallArgKeyword,
-    CallArgPositional, CoreBlockPyExprWithAwaitAndYield, CoreBytesLiteral, CoreNumberLiteral,
+    CallArgPositional, InstrWithAwaitAndYield, CoreBytesLiteral, CoreNumberLiteral,
     CoreNumberLiteralValue, CoreStringLiteral, HasMeta, ImplicitNoneExpr, Meta, WithMeta, Yield,
     YieldFrom,
 };
@@ -10,12 +10,12 @@ use crate::passes::ast_to_ast::expr_utils::make_tuple;
 use crate::py_expr;
 use ruff_python_ast::{self as ast, Expr};
 
-fn core_builtin_name(id: &str) -> CoreBlockPyExprWithAwaitAndYield {
+fn core_builtin_name(id: &str) -> InstrWithAwaitAndYield {
     core_runtime_name_expr_with_meta(id, Default::default(), Default::default())
 }
 
-fn reduce_core_blockpy_dict(items: Box<[ast::DictItem]>) -> CoreBlockPyExprWithAwaitAndYield {
-    let mut segments: Vec<CoreBlockPyExprWithAwaitAndYield> = Vec::new();
+fn reduce_core_blockpy_dict(items: Box<[ast::DictItem]>) -> InstrWithAwaitAndYield {
+    let mut segments: Vec<InstrWithAwaitAndYield> = Vec::new();
     let mut keyed_pairs = Vec::new();
 
     for item in items {
@@ -33,12 +33,12 @@ fn reduce_core_blockpy_dict(items: Box<[ast::DictItem]>) -> CoreBlockPyExprWithA
             ast::DictItem { key: None, value } => {
                 if !keyed_pairs.is_empty() {
                     let tuple = make_tuple(std::mem::take(&mut keyed_pairs));
-                    segments.push(CoreBlockPyExprWithAwaitAndYield::from(py_expr!(
+                    segments.push(InstrWithAwaitAndYield::from(py_expr!(
                         "__soac__.dict({tuple:expr})",
                         tuple = tuple
                     )));
                 }
-                segments.push(CoreBlockPyExprWithAwaitAndYield::from(py_expr!(
+                segments.push(InstrWithAwaitAndYield::from(py_expr!(
                     "__soac__.dict({mapping:expr})",
                     mapping = value
                 )));
@@ -48,7 +48,7 @@ fn reduce_core_blockpy_dict(items: Box<[ast::DictItem]>) -> CoreBlockPyExprWithA
 
     if !keyed_pairs.is_empty() {
         let tuple = make_tuple(keyed_pairs);
-        segments.push(CoreBlockPyExprWithAwaitAndYield::from(py_expr!(
+        segments.push(InstrWithAwaitAndYield::from(py_expr!(
             "__soac__.dict({tuple:expr})",
             tuple = tuple
         )));
@@ -76,16 +76,16 @@ fn reduce_core_blockpy_dict(items: Box<[ast::DictItem]>) -> CoreBlockPyExprWithA
 }
 
 fn core_operation_expr(
-    operation: impl Into<CoreBlockPyExprWithAwaitAndYield>,
-) -> CoreBlockPyExprWithAwaitAndYield {
-    CoreBlockPyExprWithAwaitAndYield::from(operation.into())
+    operation: impl Into<InstrWithAwaitAndYield>,
+) -> InstrWithAwaitAndYield {
+    InstrWithAwaitAndYield::from(operation.into())
 }
 
 fn core_operation_expr_with_meta(
-    detail: impl Into<CoreBlockPyExprWithAwaitAndYield>,
+    detail: impl Into<InstrWithAwaitAndYield>,
     node_index: ast::AtomicNodeIndex,
     range: ruff_text_size::TextRange,
-) -> CoreBlockPyExprWithAwaitAndYield {
+) -> InstrWithAwaitAndYield {
     core_operation_expr(detail.into().with_meta(Meta::new(node_index, range)))
 }
 
@@ -93,8 +93,8 @@ fn unary_op_expr_with_meta(
     node_index: ast::AtomicNodeIndex,
     range: ruff_text_size::TextRange,
     kind: operation::UnaryOpKind,
-    operand: CoreBlockPyExprWithAwaitAndYield,
-) -> CoreBlockPyExprWithAwaitAndYield {
+    operand: InstrWithAwaitAndYield,
+) -> InstrWithAwaitAndYield {
     core_operation_expr_with_meta(
         operation::UnaryOp::new(kind, Box::new(operand)),
         node_index,
@@ -106,9 +106,9 @@ fn binop_expr_with_meta(
     node_index: ast::AtomicNodeIndex,
     range: ruff_text_size::TextRange,
     kind: operation::BinOpKind,
-    left: CoreBlockPyExprWithAwaitAndYield,
-    right: CoreBlockPyExprWithAwaitAndYield,
-) -> CoreBlockPyExprWithAwaitAndYield {
+    left: InstrWithAwaitAndYield,
+    right: InstrWithAwaitAndYield,
+) -> InstrWithAwaitAndYield {
     core_operation_expr_with_meta(
         operation::BinOp::new(kind, Box::new(left), Box::new(right)),
         node_index,
@@ -119,9 +119,9 @@ fn binop_expr_with_meta(
 fn getattr_expr_with_meta(
     node_index: ast::AtomicNodeIndex,
     range: ruff_text_size::TextRange,
-    value: CoreBlockPyExprWithAwaitAndYield,
+    value: InstrWithAwaitAndYield,
     attr: String,
-) -> CoreBlockPyExprWithAwaitAndYield {
+) -> InstrWithAwaitAndYield {
     let attr_expr = literal_expr(
         CoreStringLiteral { value: attr },
         Meta::new(node_index.clone(), range),
@@ -136,9 +136,9 @@ fn getattr_expr_with_meta(
 fn getitem_expr_with_meta(
     node_index: ast::AtomicNodeIndex,
     range: ruff_text_size::TextRange,
-    value: CoreBlockPyExprWithAwaitAndYield,
-    index: CoreBlockPyExprWithAwaitAndYield,
-) -> CoreBlockPyExprWithAwaitAndYield {
+    value: InstrWithAwaitAndYield,
+    index: InstrWithAwaitAndYield,
+) -> InstrWithAwaitAndYield {
     core_operation_expr_with_meta(
         operation::GetItem::new(Box::new(value), Box::new(index)),
         node_index,
@@ -150,8 +150,8 @@ fn unary_op_expr_from_ast_with_meta(
     node_index: ast::AtomicNodeIndex,
     range: ruff_text_size::TextRange,
     op: ast::UnaryOp,
-    operand: CoreBlockPyExprWithAwaitAndYield,
-) -> CoreBlockPyExprWithAwaitAndYield {
+    operand: InstrWithAwaitAndYield,
+) -> InstrWithAwaitAndYield {
     let kind = match op {
         ast::UnaryOp::Not => operation::UnaryOpKind::Not,
         ast::UnaryOp::Invert => operation::UnaryOpKind::Invert,
@@ -165,9 +165,9 @@ fn binop_expr_from_ast_with_meta(
     node_index: ast::AtomicNodeIndex,
     range: ruff_text_size::TextRange,
     op: ast::Operator,
-    left: CoreBlockPyExprWithAwaitAndYield,
-    right: CoreBlockPyExprWithAwaitAndYield,
-) -> CoreBlockPyExprWithAwaitAndYield {
+    left: InstrWithAwaitAndYield,
+    right: InstrWithAwaitAndYield,
+) -> InstrWithAwaitAndYield {
     match op {
         ast::Operator::Add => add_op_expr_with_meta(node_index, range, left, right),
         _ => {
@@ -195,9 +195,9 @@ fn compare_expr_from_ast_with_meta(
     node_index: ast::AtomicNodeIndex,
     range: ruff_text_size::TextRange,
     op: ast::CmpOp,
-    left: CoreBlockPyExprWithAwaitAndYield,
-    right: CoreBlockPyExprWithAwaitAndYield,
-) -> CoreBlockPyExprWithAwaitAndYield {
+    left: InstrWithAwaitAndYield,
+    right: InstrWithAwaitAndYield,
+) -> InstrWithAwaitAndYield {
     match op {
         ast::CmpOp::Eq => {
             binop_expr_with_meta(node_index, range, operation::BinOpKind::Eq, left, right)
@@ -251,16 +251,16 @@ fn compare_expr_from_ast_with_meta(
 fn add_op_expr_with_meta(
     node_index: ast::AtomicNodeIndex,
     range: ruff_text_size::TextRange,
-    left: CoreBlockPyExprWithAwaitAndYield,
-    right: CoreBlockPyExprWithAwaitAndYield,
-) -> CoreBlockPyExprWithAwaitAndYield {
+    left: InstrWithAwaitAndYield,
+    right: InstrWithAwaitAndYield,
+) -> InstrWithAwaitAndYield {
     binop_expr_with_meta(node_index, range, operation::BinOpKind::Add, left, right)
 }
 
 fn add_op_expr(
-    left: CoreBlockPyExprWithAwaitAndYield,
-    right: CoreBlockPyExprWithAwaitAndYield,
-) -> CoreBlockPyExprWithAwaitAndYield {
+    left: InstrWithAwaitAndYield,
+    right: InstrWithAwaitAndYield,
+) -> InstrWithAwaitAndYield {
     add_op_expr_with_meta(
         ast::AtomicNodeIndex::default(),
         Default::default(),
@@ -271,28 +271,28 @@ fn add_op_expr(
 
 fn lower_core_call_args(
     args: Vec<Expr>,
-) -> Vec<CallArgPositional<CoreBlockPyExprWithAwaitAndYield>> {
+) -> Vec<CallArgPositional<InstrWithAwaitAndYield>> {
     args.into_iter()
         .map(|arg| match arg {
             Expr::Starred(starred) => {
-                CallArgPositional::Starred(CoreBlockPyExprWithAwaitAndYield::from(*starred.value))
+                CallArgPositional::Starred(InstrWithAwaitAndYield::from(*starred.value))
             }
-            other => CallArgPositional::Positional(CoreBlockPyExprWithAwaitAndYield::from(other)),
+            other => CallArgPositional::Positional(InstrWithAwaitAndYield::from(other)),
         })
         .collect()
 }
 
 fn lower_core_call_keywords(
     keywords: Vec<ast::Keyword>,
-) -> Vec<CallArgKeyword<CoreBlockPyExprWithAwaitAndYield>> {
+) -> Vec<CallArgKeyword<InstrWithAwaitAndYield>> {
     keywords
         .into_iter()
         .map(|keyword| match keyword.arg {
             Some(arg) => CallArgKeyword::Named {
                 arg,
-                value: CoreBlockPyExprWithAwaitAndYield::from(keyword.value),
+                value: InstrWithAwaitAndYield::from(keyword.value),
             },
-            None => CallArgKeyword::Starred(CoreBlockPyExprWithAwaitAndYield::from(keyword.value)),
+            None => CallArgKeyword::Starred(InstrWithAwaitAndYield::from(keyword.value)),
         })
         .collect()
 }
@@ -324,8 +324,8 @@ fn make_function_id_from_literal(expr: &Expr) -> Option<crate::block_py::Functio
         .map(crate::block_py::FunctionId::from_packed)
 }
 
-fn string_arg_from_core_expr(expr: CoreBlockPyExprWithAwaitAndYield) -> Option<String> {
-    let CoreBlockPyExprWithAwaitAndYield::Literal(literal) = expr else {
+fn string_arg_from_core_expr(expr: InstrWithAwaitAndYield) -> Option<String> {
+    let InstrWithAwaitAndYield::Literal(literal) = expr else {
         return None;
     };
     let crate::block_py::BlockPyLiteral::StringLiteral(literal) = literal.into_literal() else {
@@ -338,8 +338,8 @@ fn non_operator_operation_from_helper_call(
     name: &str,
     node_index: ast::AtomicNodeIndex,
     range: ruff_text_size::TextRange,
-    args: Vec<CoreBlockPyExprWithAwaitAndYield>,
-) -> Option<CoreBlockPyExprWithAwaitAndYield> {
+    args: Vec<InstrWithAwaitAndYield>,
+) -> Option<InstrWithAwaitAndYield> {
     let mut args = args.into_iter();
     let meta = Meta::new(node_index, range);
     let operation = match name {
@@ -369,7 +369,7 @@ fn lower_core_call_expr_with_meta(
     range: ruff_text_size::TextRange,
     args: Vec<Expr>,
     keywords: Vec<ast::Keyword>,
-) -> CoreBlockPyExprWithAwaitAndYield {
+) -> InstrWithAwaitAndYield {
     if keywords.is_empty() {
         if let Expr::Attribute(attr) = &func {
             if matches!(attr.value.as_ref(), Expr::Name(base) if base.id.as_str() == "__soac__")
@@ -384,8 +384,8 @@ fn lower_core_call_expr_with_meta(
                         operation::MakeFunction::new(
                             function_id,
                             kind,
-                            Box::new(CoreBlockPyExprWithAwaitAndYield::from(args[3].clone())),
-                            Box::new(CoreBlockPyExprWithAwaitAndYield::from(args[4].clone())),
+                            Box::new(InstrWithAwaitAndYield::from(args[3].clone())),
+                            Box::new(InstrWithAwaitAndYield::from(args[4].clone())),
                         )
                         .with_meta(Meta::new(node_index, range)),
                     );
@@ -404,7 +404,7 @@ fn lower_core_call_expr_with_meta(
                 }
                 if !saw_starred {
                     for arg in &args {
-                        operation_args.push(CoreBlockPyExprWithAwaitAndYield::from(arg.clone()));
+                        operation_args.push(InstrWithAwaitAndYield::from(arg.clone()));
                     }
                     if let Some(operation) = non_operator_operation_from_helper_call(
                         attr.attr.id.as_str(),
@@ -420,7 +420,7 @@ fn lower_core_call_expr_with_meta(
     }
 
     core_call_expr_with_meta(
-        CoreBlockPyExprWithAwaitAndYield::from(func),
+        InstrWithAwaitAndYield::from(func),
         node_index,
         range,
         lower_core_call_args(args),
@@ -428,9 +428,9 @@ fn lower_core_call_expr_with_meta(
     )
 }
 
-fn reduce_core_tuple_splat(elts: Vec<Expr>) -> CoreBlockPyExprWithAwaitAndYield {
-    let mut segments: Vec<CoreBlockPyExprWithAwaitAndYield> = Vec::new();
-    let mut values: Vec<CoreBlockPyExprWithAwaitAndYield> = Vec::new();
+fn reduce_core_tuple_splat(elts: Vec<Expr>) -> InstrWithAwaitAndYield {
+    let mut segments: Vec<InstrWithAwaitAndYield> = Vec::new();
+    let mut values: Vec<InstrWithAwaitAndYield> = Vec::new();
 
     for elt in elts {
         match elt {
@@ -452,10 +452,10 @@ fn reduce_core_tuple_splat(elts: Vec<Expr>) -> CoreBlockPyExprWithAwaitAndYield 
                     "tuple_from_iter",
                     node_index,
                     range,
-                    vec![CoreBlockPyExprWithAwaitAndYield::from(*value)],
+                    vec![InstrWithAwaitAndYield::from(*value)],
                 ));
             }
-            other => values.push(CoreBlockPyExprWithAwaitAndYield::from(other)),
+            other => values.push(InstrWithAwaitAndYield::from(other)),
         }
     }
 
@@ -478,7 +478,7 @@ fn reduce_core_tuple_splat(elts: Vec<Expr>) -> CoreBlockPyExprWithAwaitAndYield 
     })
 }
 
-impl From<Expr> for CoreBlockPyExprWithAwaitAndYield {
+impl From<Expr> for InstrWithAwaitAndYield {
     fn from(value: Expr) -> Self {
         let mut value = value;
         lower_string_templates_in_expr(&mut value);
@@ -498,7 +498,7 @@ impl From<Expr> for CoreBlockPyExprWithAwaitAndYield {
                 Yield::new(
                     node.value
                         .map(|value| Self::from(*value))
-                        .unwrap_or_else(CoreBlockPyExprWithAwaitAndYield::implicit_none_expr),
+                        .unwrap_or_else(InstrWithAwaitAndYield::implicit_none_expr),
                 )
                 .with_meta(Meta::new(node.node_index, node.range)),
             ),
@@ -651,7 +651,7 @@ impl From<Expr> for CoreBlockPyExprWithAwaitAndYield {
             Expr::Dict(node) => reduce_core_blockpy_dict(node.items.into()),
             Expr::Name(node) => {
                 let meta = node.meta();
-                CoreBlockPyExprWithAwaitAndYield::Load(operation::Load::new(node).with_meta(meta))
+                InstrWithAwaitAndYield::Load(operation::Load::new(node).with_meta(meta))
             }
             other => panic!(
                 "unexpected expr reached late core BlockPy boundary: {}",

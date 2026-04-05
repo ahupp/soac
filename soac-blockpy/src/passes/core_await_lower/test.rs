@@ -2,7 +2,7 @@ use super::*;
 
 use crate::block_py::{
     Block, BlockLabel, BlockPyFunction, BlockPyNameLike, BlockTerm, CallableScopeInfo,
-    CoreBlockPyExprWithAwaitAndYield, CoreBlockPyExprWithYield, FunctionKind, FunctionName,
+    InstrWithAwaitAndYield, InstrWithYield, FunctionKind, FunctionName,
 };
 
 fn test_name_gen() -> crate::block_py::FunctionNameGen {
@@ -15,7 +15,7 @@ fn lowers_await_to_yield_from_await_iter() {
     let structured_block = Block {
         label: BlockLabel::from_index(0),
         body: Vec::new(),
-        term: BlockTerm::Return(CoreBlockPyExprWithAwaitAndYield::from(crate::py_expr!(
+        term: BlockTerm::Return(InstrWithAwaitAndYield::from(crate::py_expr!(
             "await foo()"
         ))),
         params: Vec::new(),
@@ -48,13 +48,13 @@ fn lowers_await_to_yield_from_await_iter() {
     let lowered = lower_awaits_in_core_blockpy_module(module);
     let block = &lowered.callable_defs[0].blocks[0];
     assert!(block.body.is_empty());
-    let BlockTerm::Return(CoreBlockPyExprWithYield::YieldFrom(yield_from)) = &block.term else {
+    let BlockTerm::Return(InstrWithYield::YieldFrom(yield_from)) = &block.term else {
         panic!("expected return of lowered await yield from");
     };
-    let CoreBlockPyExprWithYield::Call(call) = yield_from.value.as_ref() else {
+    let InstrWithYield::Call(call) = yield_from.value.as_ref() else {
         panic!("expected await_iter call op");
     };
-    let CoreBlockPyExprWithYield::Load(operation) = call.func.as_ref() else {
+    let InstrWithYield::Load(operation) = call.func.as_ref() else {
         panic!("expected await helper load");
     };
     assert!(operation.name.is_runtime_symbol("await_iter"));

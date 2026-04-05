@@ -7,7 +7,7 @@ use crate::block_py::{
     core_call_expr_with_meta, BinOpKind, BindingKind, BindingPurpose, Block, BlockBuilder,
     BlockLabel, BlockPyLiteral, BlockPyNameLike, BlockTerm, CallArgPositional, CallableScopeInfo,
     CallableScopeKind, CellBindingKind, ClosureInit, ClosureSlot, CoreBlockPyExpr,
-    CoreBlockPyExprWithYield, FunctionId, FunctionName, HasMeta, Meta, StorageLayout,
+    InstrWithYield, FunctionId, FunctionName, HasMeta, Meta, StorageLayout,
     StructuredInstr, TryMapTerm, UnaryOpKind, WithMeta, Yield,
 };
 use crate::passes::ast_to_ast::scope_helpers::is_internal_symbol;
@@ -99,7 +99,7 @@ fn name_expr(name: &str) -> ast::ExprName {
     name
 }
 
-fn core_load_with_yield(name: &str) -> CoreBlockPyExprWithYield {
+fn core_load_with_yield(name: &str) -> InstrWithYield {
     let name = name_expr(name);
     let meta = name.meta();
     crate::block_py::Load::new(name).with_meta(meta).into()
@@ -395,7 +395,7 @@ fn term_conversion_to_no_yield_rejects_nested_yield() {
         ast::AtomicNodeIndex::default(),
         TextRange::default(),
         vec![CallArgPositional::Positional(
-            CoreBlockPyExprWithYield::Yield(
+            InstrWithYield::Yield(
                 Yield::new(core_load_with_yield("x")).with_meta(Meta::default()),
             ),
         )],

@@ -1,6 +1,6 @@
 use super::super::BlockPyStmtBuilder;
 use super::*;
-use crate::block_py::{CoreBlockPyExprWithAwaitAndYield, StructuredInstr};
+use crate::block_py::{InstrWithAwaitAndYield, StructuredInstr};
 use crate::passes::ast_to_ast::context::Context;
 
 #[test]
@@ -10,7 +10,7 @@ fn stmt_assign_to_blockpy_emits_direct_core_setitem() {
         panic!("expected assign stmt");
     };
     let context = Context::new("");
-    let mut out = BlockPyStmtBuilder::<CoreBlockPyExprWithAwaitAndYield>::new();
+    let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new();
     let mut next_label_id = 0usize;
 
     assign_stmt

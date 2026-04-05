@@ -33,8 +33,8 @@ pub(crate) mod scope;
 pub(crate) mod validate;
 mod visit;
 pub use crate::passes::{
-    CoreBlockPyExpr, CoreBlockPyExprWithAwaitAndYield, CoreBlockPyExprWithYield,
-    LocatedCoreBlockPyExpr,
+    CoreBlockPyExpr, InstrWithAwaitAndYield, InstrWithYield,
+    LocatedInstr,
 };
 #[allow(unused_imports)]
 pub(crate) use map::{
@@ -793,11 +793,11 @@ impl fmt::Debug for CoreNumberLiteralValue {
     }
 }
 
-impl Instr for CoreBlockPyExprWithAwaitAndYield {
+impl Instr for InstrWithAwaitAndYield {
     type Name = UnresolvedName;
 }
 
-impl Instr for CoreBlockPyExprWithYield {
+impl Instr for InstrWithYield {
     type Name = UnresolvedName;
 }
 
@@ -1051,7 +1051,7 @@ pub trait BlockPyPass: Clone + fmt::Debug {
 }
 
 pub type InstrName<I> = <I as Instr>::Name;
-pub type ResolvedStorageBlock = Block<LocatedCoreBlockPyExpr>;
+pub type ResolvedStorageBlock = Block<LocatedInstr>;
 pub type CodegenBlock = Block<CodegenBlockPyExpr>;
 pub type CodegenBlockPyFunction = BlockPyFunction<crate::passes::CodegenBlockPyPass>;
 pub type CodegenBlockPyModule = BlockPyModule<crate::passes::CodegenBlockPyPass>;
@@ -1348,7 +1348,7 @@ impl ImplicitNoneExpr for Expr {
     }
 }
 
-impl ImplicitNoneExpr for CoreBlockPyExprWithAwaitAndYield {
+impl ImplicitNoneExpr for InstrWithAwaitAndYield {
     fn implicit_none_expr() -> Self {
         core_runtime_name_expr_with_meta("NONE", Default::default(), Default::default())
     }
@@ -1356,13 +1356,13 @@ impl ImplicitNoneExpr for CoreBlockPyExprWithAwaitAndYield {
     fn is_implicit_none_expr(expr: &Self) -> bool {
         matches!(
             expr,
-            CoreBlockPyExprWithAwaitAndYield::Load(op)
+            InstrWithAwaitAndYield::Load(op)
                 if op.name.is_runtime_symbol("NONE")
         )
     }
 }
 
-impl ImplicitNoneExpr for CoreBlockPyExprWithYield {
+impl ImplicitNoneExpr for InstrWithYield {
     fn implicit_none_expr() -> Self {
         core_runtime_name_expr_with_meta("NONE", Default::default(), Default::default())
     }
@@ -1370,7 +1370,7 @@ impl ImplicitNoneExpr for CoreBlockPyExprWithYield {
     fn is_implicit_none_expr(expr: &Self) -> bool {
         matches!(
             expr,
-            CoreBlockPyExprWithYield::Load(op) if op.name.is_runtime_symbol("NONE")
+            InstrWithYield::Load(op) if op.name.is_runtime_symbol("NONE")
         )
     }
 }
@@ -1388,7 +1388,7 @@ impl ImplicitNoneExpr for CoreBlockPyExpr {
     }
 }
 
-impl ImplicitNoneExpr for LocatedCoreBlockPyExpr {
+impl ImplicitNoneExpr for LocatedInstr {
     fn implicit_none_expr() -> Self {
         Load::new(LocatedName {
             id: "NONE".into(),
@@ -1400,7 +1400,7 @@ impl ImplicitNoneExpr for LocatedCoreBlockPyExpr {
     fn is_implicit_none_expr(expr: &Self) -> bool {
         matches!(
             expr,
-            LocatedCoreBlockPyExpr::Load(op) if op.name.is_runtime_symbol("NONE")
+            LocatedInstr::Load(op) if op.name.is_runtime_symbol("NONE")
         )
     }
 }

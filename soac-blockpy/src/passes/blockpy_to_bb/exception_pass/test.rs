@@ -2,7 +2,7 @@ use super::lower_try_jump_exception_flow;
 use crate::block_py::{
     validate_module, AbruptKind, BindingKind, BlockArg, BlockEdge, BlockLabel, BlockParam,
     BlockParamRole, BlockPyLiteral, BlockTerm, CellBindingKind, CodegenBlock, CodegenBlockPyExpr,
-    CoreBlockPyExpr, CoreNumberLiteral, CoreNumberLiteralValue, LocatedCoreBlockPyExpr,
+    CoreBlockPyExpr, CoreNumberLiteral, CoreNumberLiteralValue, LocatedInstr,
     NameLocation, ResolvedStorageBlock, StorageLayout,
 };
 use crate::lower_python_to_blockpy_for_testing;
@@ -27,7 +27,7 @@ fn tracked_codegen_module(source: &str) -> crate::block_py::BlockPyModule<Codege
     codegen
 }
 
-fn is_return_of_number_constant(term: &BlockTerm<LocatedCoreBlockPyExpr>) -> bool {
+fn is_return_of_number_constant(term: &BlockTerm<LocatedInstr>) -> bool {
     match term {
         BlockTerm::Return(CoreBlockPyExpr::Literal(literal))
             if matches!(
@@ -68,8 +68,8 @@ def f(x):
         function.blocks.push(ResolvedStorageBlock {
             label: body_label.clone(),
             body: vec![],
-            term: BlockTerm::<LocatedCoreBlockPyExpr>::Return(
-                <LocatedCoreBlockPyExpr as crate::block_py::ImplicitNoneExpr>::implicit_none_expr(),
+            term: BlockTerm::<LocatedInstr>::Return(
+                <LocatedInstr as crate::block_py::ImplicitNoneExpr>::implicit_none_expr(),
             ),
             params: vec![crate::block_py::BlockParam {
                 name: "_dp_try_exc_manual".to_string(),
@@ -80,8 +80,8 @@ def f(x):
         function.blocks.push(ResolvedStorageBlock {
             label: except_label.clone(),
             body: vec![],
-            term: BlockTerm::<LocatedCoreBlockPyExpr>::Return(
-                <LocatedCoreBlockPyExpr as crate::block_py::ImplicitNoneExpr>::implicit_none_expr(),
+            term: BlockTerm::<LocatedInstr>::Return(
+                <LocatedInstr as crate::block_py::ImplicitNoneExpr>::implicit_none_expr(),
             ),
             params: Vec::new(),
             exc_edge: None,
@@ -304,8 +304,8 @@ def f():
     function.blocks.push(ResolvedStorageBlock {
         label: except_label.clone(),
         body: vec![],
-        term: BlockTerm::<LocatedCoreBlockPyExpr>::Return(
-            <LocatedCoreBlockPyExpr as crate::block_py::ImplicitNoneExpr>::implicit_none_expr(),
+        term: BlockTerm::<LocatedInstr>::Return(
+            <LocatedInstr as crate::block_py::ImplicitNoneExpr>::implicit_none_expr(),
         ),
         params: Vec::new(),
         exc_edge: None,
@@ -372,8 +372,8 @@ def f():
     function.blocks.push(ResolvedStorageBlock {
         label: except_label.clone(),
         body: vec![],
-        term: BlockTerm::<LocatedCoreBlockPyExpr>::Return(
-            <LocatedCoreBlockPyExpr as crate::block_py::ImplicitNoneExpr>::implicit_none_expr(),
+        term: BlockTerm::<LocatedInstr>::Return(
+            <LocatedInstr as crate::block_py::ImplicitNoneExpr>::implicit_none_expr(),
         ),
         params: Vec::new(),
         exc_edge: None,

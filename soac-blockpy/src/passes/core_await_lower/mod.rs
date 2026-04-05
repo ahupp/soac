@@ -1,6 +1,6 @@
 use crate::block_py::{
-    core_runtime_positional_call_expr_with_meta, BlockPyModule, CoreBlockPyExprWithAwaitAndYield,
-    CoreBlockPyExprWithYield, HasMeta, MapInstr, MapModule, Mappable, UnresolvedName, WithMeta,
+    core_runtime_positional_call_expr_with_meta, BlockPyModule, InstrWithAwaitAndYield,
+    InstrWithYield, HasMeta, MapInstr, MapModule, Mappable, UnresolvedName, WithMeta,
     YieldFrom,
 };
 use crate::passes::{CoreBlockPyPassWithAwaitAndYield, CoreBlockPyPassWithYield};
@@ -8,12 +8,12 @@ use soac_macros::match_default;
 
 struct CoreAwaitLoweringMap;
 
-impl MapInstr<CoreBlockPyExprWithAwaitAndYield, CoreBlockPyExprWithYield> for CoreAwaitLoweringMap {
-    fn map_instr(&mut self, expr: CoreBlockPyExprWithAwaitAndYield) -> CoreBlockPyExprWithYield {
-        match_default!(expr: crate::passes::CoreBlockPyExprWithAwaitAndYield {
-            CoreBlockPyExprWithAwaitAndYield::Await(node) => {
+impl MapInstr<InstrWithAwaitAndYield, InstrWithYield> for CoreAwaitLoweringMap {
+    fn map_instr(&mut self, expr: InstrWithAwaitAndYield) -> InstrWithYield {
+        match_default!(expr: crate::passes::InstrWithAwaitAndYield {
+            InstrWithAwaitAndYield::Await(node) => {
                 let meta = node.meta();
-                CoreBlockPyExprWithYield::YieldFrom(
+                InstrWithYield::YieldFrom(
                     YieldFrom::new(core_runtime_positional_call_expr_with_meta(
                         "await_iter",
                         meta.node_index.clone(),

@@ -9,7 +9,7 @@ use crate::block_py::{
     BlockBuilder, BlockEdge, BlockLabel, BlockParam, BlockParamRole, BlockPyFunction,
     BlockPyModule, BlockPyNameLike, BlockTerm, CallArgKeyword, CallArgPositional,
     CallableScopeInfo, CellBindingKind, CellRefForName, ClosureInit, ClosureSlot, CoreBlockPyExpr,
-    CoreBlockPyExprWithYield, CoreNumberLiteral, CoreNumberLiteralValue, CoreStringLiteral,
+    InstrWithYield, CoreNumberLiteral, CoreNumberLiteralValue, CoreStringLiteral,
     FunctionId, FunctionKind, FunctionName, FunctionNameGen, GetAttr, ImplicitNoneExpr, Instr,
     Load, MakeFunction, Mappable, ModuleNameGen, ScopeExprNode, StorageLayout, Store,
     TermBranchTable, TermIf, TermRaise, TryMapFunction, TryMapInstr, TryMapTerm, UnaryOp,
@@ -55,42 +55,42 @@ const ASYNC_GENERATOR_RESUME_ABI_PARAMS: [ResumeAbiParam; 4] = [
     ResumeAbiParam::TransportSent,
 ];
 
-type LinearYieldStmt = CoreBlockPyExprWithYield;
+type LinearYieldStmt = InstrWithYield;
 type LinearCoreStmt = CoreBlockPyExpr;
-type LinearYieldBlock = Block<LinearYieldStmt, CoreBlockPyExprWithYield>;
+type LinearYieldBlock = Block<LinearYieldStmt, InstrWithYield>;
 type LinearCoreBlock = Block<LinearCoreStmt, CoreBlockPyExpr>;
 type BlockPyBlock = LinearCoreBlock;
 
 struct ErrOnYield;
 
 fn try_lower_core_expr_without_yield_with_mapper<M>(
-    expr: CoreBlockPyExprWithYield,
+    expr: InstrWithYield,
     map: &mut M,
-) -> Result<CoreBlockPyExpr, CoreBlockPyExprWithYield>
+) -> Result<CoreBlockPyExpr, InstrWithYield>
 where
-    M: TryMapInstr<CoreBlockPyExprWithYield, CoreBlockPyExpr, CoreBlockPyExprWithYield>,
+    M: TryMapInstr<InstrWithYield, CoreBlockPyExpr, InstrWithYield>,
 {
-    match_default!(expr: crate::passes::CoreBlockPyExprWithYield {
-        CoreBlockPyExprWithYield::Yield(node) => Err(node.into()),
-        CoreBlockPyExprWithYield::YieldFrom(node) => Err(node.into()),
+    match_default!(expr: crate::passes::InstrWithYield {
+        InstrWithYield::Yield(node) => Err(node.into()),
+        InstrWithYield::YieldFrom(node) => Err(node.into()),
         rest => Ok(rest.try_map_children(map)?.into()),
     })
 }
 
-impl TryMapInstr<CoreBlockPyExprWithYield, CoreBlockPyExpr, CoreBlockPyExprWithYield>
+impl TryMapInstr<InstrWithYield, CoreBlockPyExpr, InstrWithYield>
     for ErrOnYield
 {
     fn try_map_instr(
         &mut self,
-        expr: CoreBlockPyExprWithYield,
-    ) -> Result<CoreBlockPyExpr, CoreBlockPyExprWithYield> {
+        expr: InstrWithYield,
+    ) -> Result<CoreBlockPyExpr, InstrWithYield> {
         try_lower_core_expr_without_yield_with_mapper(expr, self)
     }
 
     fn try_map_name(
         &mut self,
         name: UnresolvedName,
-    ) -> Result<UnresolvedName, CoreBlockPyExprWithYield> {
+    ) -> Result<UnresolvedName, InstrWithYield> {
         Ok(name)
     }
 }
@@ -411,7 +411,7 @@ fn is_generator_like(kind: FunctionKind) -> bool {
     )
 }
 
-fn injected_exception_names<S>(blocks: &[Block<S, CoreBlockPyExprWithYield>]) -> HashSet<String> {
+fn injected_exception_names<S>(blocks: &[Block<S, InstrWithYield>]) -> HashSet<String> {
     let mut names = HashSet::new();
     for block in blocks {
         if let Some(exc_param) = block.exception_param() {
@@ -669,38 +669,38 @@ fn resume_param_spec(kind: FunctionKind) -> ParamSpec {
 
 #[derive(Clone)]
 enum YieldSite {
-    ExprYield(Option<CoreBlockPyExprWithYield>),
+    ExprYield(Option<InstrWithYield>),
     AssignYield {
         target: UnresolvedName,
-        value: Option<CoreBlockPyExprWithYield>,
+        value: Option<InstrWithYield>,
     },
-    ReturnYield(Option<CoreBlockPyExprWithYield>),
-    ExprYieldFrom(CoreBlockPyExprWithYield),
+    ReturnYield(Option<InstrWithYield>),
+    ExprYieldFrom(InstrWithYield),
     AssignYieldFrom {
         target: UnresolvedName,
-        value: CoreBlockPyExprWithYield,
+        value: InstrWithYield,
     },
-    ReturnYieldFrom(CoreBlockPyExprWithYield),
+    ReturnYieldFrom(InstrWithYield),
 }
 
-fn explicit_yield_value(value: &CoreBlockPyExprWithYield) -> Option<CoreBlockPyExprWithYield> {
-    (!CoreBlockPyExprWithYield::is_implicit_none_expr(value)).then(|| value.clone())
+fn explicit_yield_value(value: &InstrWithYield) -> Option<InstrWithYield> {
+    (!InstrWithYield::is_implicit_none_expr(value)).then(|| value.clone())
 }
 
 fn stmt_yield_site(stmt: &LinearYieldStmt) -> Option<YieldSite> {
     match stmt {
-        CoreBlockPyExprWithYield::Yield(yield_expr) => Some(YieldSite::ExprYield(
+        InstrWithYield::Yield(yield_expr) => Some(YieldSite::ExprYield(
             explicit_yield_value(&yield_expr.value),
         )),
-        CoreBlockPyExprWithYield::YieldFrom(yield_from) => {
+        InstrWithYield::YieldFrom(yield_from) => {
             Some(YieldSite::ExprYieldFrom((*yield_from.value).clone()))
         }
-        CoreBlockPyExprWithYield::Store(store) => match store.value.as_ref() {
-            CoreBlockPyExprWithYield::Yield(yield_expr) => Some(YieldSite::AssignYield {
+        InstrWithYield::Store(store) => match store.value.as_ref() {
+            InstrWithYield::Yield(yield_expr) => Some(YieldSite::AssignYield {
                 target: store.name.clone(),
                 value: explicit_yield_value(&yield_expr.value),
             }),
-            CoreBlockPyExprWithYield::YieldFrom(yield_from) => Some(YieldSite::AssignYieldFrom {
+            InstrWithYield::YieldFrom(yield_from) => Some(YieldSite::AssignYieldFrom {
                 target: store.name.clone(),
                 value: (*yield_from.value).clone(),
             }),
@@ -710,12 +710,12 @@ fn stmt_yield_site(stmt: &LinearYieldStmt) -> Option<YieldSite> {
     }
 }
 
-fn term_yield_site(term: &BlockTerm<CoreBlockPyExprWithYield>) -> Option<YieldSite> {
+fn term_yield_site(term: &BlockTerm<InstrWithYield>) -> Option<YieldSite> {
     match term {
-        BlockTerm::Return(CoreBlockPyExprWithYield::Yield(yield_expr)) => Some(
+        BlockTerm::Return(InstrWithYield::Yield(yield_expr)) => Some(
             YieldSite::ReturnYield(explicit_yield_value(&yield_expr.value)),
         ),
-        BlockTerm::Return(CoreBlockPyExprWithYield::YieldFrom(yield_from)) => {
+        BlockTerm::Return(InstrWithYield::YieldFrom(yield_from)) => {
             Some(YieldSite::ReturnYieldFrom((*yield_from.value).clone()))
         }
         _ => None,
@@ -731,7 +731,7 @@ fn lower_stmt_no_yield(stmt: LinearYieldStmt) -> LinearCoreStmt {
         })
 }
 
-fn lower_term_no_yield(term: BlockTerm<CoreBlockPyExprWithYield>) -> BlockTerm<CoreBlockPyExpr> {
+fn lower_term_no_yield(term: BlockTerm<InstrWithYield>) -> BlockTerm<CoreBlockPyExpr> {
     let mut mapper = ErrOnYield;
     mapper.try_map_term(term.clone()).unwrap_or_else(|_| {
         panic!(
@@ -740,7 +740,7 @@ fn lower_term_no_yield(term: BlockTerm<CoreBlockPyExprWithYield>) -> BlockTerm<C
     })
 }
 
-fn yield_value_expr(value: Option<CoreBlockPyExprWithYield>) -> CoreBlockPyExpr {
+fn yield_value_expr(value: Option<InstrWithYield>) -> CoreBlockPyExpr {
     value
         .map(|value| {
             ErrOnYield
@@ -991,7 +991,7 @@ fn lower_resume_fragment(
     state: &mut ResumeLoweringState,
     label: BlockLabel,
     body: Vec<LinearYieldStmt>,
-    term: BlockTerm<CoreBlockPyExprWithYield>,
+    term: BlockTerm<InstrWithYield>,
     params: Vec<BlockParam>,
     exc_target: Option<BlockLabel>,
 ) {
@@ -1026,7 +1026,7 @@ fn lower_resume_fragment(
             &mut prefix,
             site,
             Vec::new(),
-            BlockTerm::Return(CoreBlockPyExprWithYield::implicit_none_expr()),
+            BlockTerm::Return(InstrWithYield::implicit_none_expr()),
             params,
             exc_target,
         );
@@ -1073,7 +1073,7 @@ fn emit_yield_site(
     prefix: &mut Vec<LinearCoreStmt>,
     site: YieldSite,
     tail_body: Vec<LinearYieldStmt>,
-    tail_term: BlockTerm<CoreBlockPyExprWithYield>,
+    tail_term: BlockTerm<InstrWithYield>,
     params: Vec<BlockParam>,
     exc_target: Option<BlockLabel>,
 ) {
@@ -1185,7 +1185,7 @@ fn emit_resume_after_yield(
     resume_label: BlockLabel,
     assign_target: Option<UnresolvedName>,
     mut tail_body: Vec<LinearYieldStmt>,
-    tail_term: BlockTerm<CoreBlockPyExprWithYield>,
+    tail_term: BlockTerm<InstrWithYield>,
     params: Vec<BlockParam>,
     exc_target: Option<BlockLabel>,
 ) {
@@ -1239,10 +1239,10 @@ fn emit_yield_from_site(
     state: &mut ResumeLoweringState,
     label: BlockLabel,
     prefix: &mut Vec<LinearCoreStmt>,
-    value: CoreBlockPyExprWithYield,
+    value: InstrWithYield,
     assign_target: Option<UnresolvedName>,
     mut tail_body: Vec<LinearYieldStmt>,
-    tail_term: BlockTerm<CoreBlockPyExprWithYield>,
+    tail_term: BlockTerm<InstrWithYield>,
     params: Vec<BlockParam>,
     exc_target: Option<BlockLabel>,
 ) {
@@ -1490,7 +1490,7 @@ fn emit_yield_from_site(
         0,
         internal_store_stmt(
             "_dp_yieldfrom",
-            CoreBlockPyExprWithYield::implicit_none_expr(),
+            InstrWithYield::implicit_none_expr(),
         ),
     );
     if let Some(target) = assign_target {
@@ -1501,7 +1501,7 @@ fn emit_yield_from_site(
                 unresolved_load_expr(unresolved_name(yielded_value_name.as_str())),
             ),
         );
-    } else if matches!(tail_term, BlockTerm::Return(CoreBlockPyExprWithYield::Load(ref op)) if op.name.id_str() == "_dp_yield_from_value")
+    } else if matches!(tail_term, BlockTerm::Return(InstrWithYield::Load(ref op)) if op.name.id_str() == "_dp_yield_from_value")
     {
         tail_body.insert(
             1,

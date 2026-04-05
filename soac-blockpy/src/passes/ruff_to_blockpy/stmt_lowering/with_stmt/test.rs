@@ -1,6 +1,6 @@
 use super::super::{simplify_stmt_ast_once_for_blockpy, BlockPyStmtBuilder};
 use super::*;
-use crate::block_py::CoreBlockPyExprWithAwaitAndYield;
+use crate::block_py::InstrWithAwaitAndYield;
 use crate::passes::ast_to_ast::context::Context;
 
 #[test]
@@ -46,7 +46,7 @@ fn stmt_with_to_blockpy_simplifies_before_hitting_sequence_only_try_lowering() {
         panic!("expected with stmt");
     };
     let context = Context::new("");
-    let mut out = BlockPyStmtBuilder::<CoreBlockPyExprWithAwaitAndYield>::new();
+    let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new();
     let mut next_label_id = 0usize;
 
     let _ = with_stmt.to_blockpy(&context, &mut out, None, &mut next_label_id);

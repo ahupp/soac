@@ -72,11 +72,11 @@ fn stmt_fragment_can_carry_optional_term() {
 
 #[test]
 fn core_blockpy_expr_wraps_name_expr() {
-    let expr = CoreBlockPyExprWithAwaitAndYield::from(py_expr!("y"));
+    let expr = InstrWithAwaitAndYield::from(py_expr!("y"));
 
     assert!(matches!(
         expr,
-        CoreBlockPyExprWithAwaitAndYield::Load(op)
+        InstrWithAwaitAndYield::Load(op)
             if op.name.id_str() == "y"
     ));
 }

@@ -1,7 +1,7 @@
 use super::*;
 use crate::block_py::{BlockBuilder, BlockParam, BlockParamRole, StructuredInstr};
 use crate::block_py::{
-    ClosureInit, ClosureSlot, CoreBlockPyExprWithAwaitAndYield, Expr, LocatedName, NameLocation,
+    ClosureInit, ClosureSlot, InstrWithAwaitAndYield, Expr, LocatedName, NameLocation,
     StorageLayout,
 };
 use crate::lower_python_to_blockpy_for_testing;
@@ -21,7 +21,7 @@ fn parse_blockpy_expr(source: &str) -> Expr {
     (*parse_expression(source).unwrap().into_syntax().body).into()
 }
 
-fn parse_core_blockpy_expr(source: &str) -> CoreBlockPyExprWithAwaitAndYield {
+fn parse_core_blockpy_expr(source: &str) -> InstrWithAwaitAndYield {
     parse_blockpy_expr(source).into()
 }
 
@@ -105,7 +105,7 @@ fn renders_empty_module_marker() {
 #[test]
 fn bb_text_renders_located_names_with_resolved_locations() {
     let closure_name = located_name("captured", NameLocation::closure_cell(2));
-    let closure_expr: crate::block_py::LocatedCoreBlockPyExpr =
+    let closure_expr: crate::block_py::LocatedInstr =
         crate::block_py::Load::new(closure_name.clone()).into();
     let assign_stmt = crate::block_py::Store::new(
         located_name("temp", NameLocation::local(1)),
@@ -113,7 +113,7 @@ fn bb_text_renders_located_names_with_resolved_locations() {
     )
     .into();
     let global_name = located_name("answer", NameLocation::global(0));
-    let global_expr: crate::block_py::LocatedCoreBlockPyExpr =
+    let global_expr: crate::block_py::LocatedInstr =
         crate::block_py::Load::new(global_name.clone()).into();
 
     let closure_rendered = bb_expr_text(&closure_expr);
@@ -491,7 +491,7 @@ fn renders_bb_block_metadata_with_shared_layout() {
                     label: label(1),
                     body: vec![],
                     term: BlockTerm::Return(
-                        <crate::block_py::LocatedCoreBlockPyExpr as crate::block_py::ImplicitNoneExpr>::implicit_none_expr(
+                        <crate::block_py::LocatedInstr as crate::block_py::ImplicitNoneExpr>::implicit_none_expr(
                         ),
                     ),
                     params: vec![BlockParam {
