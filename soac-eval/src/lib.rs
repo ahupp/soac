@@ -1197,6 +1197,14 @@ mod tests {
 
     unsafe extern "C" {
         fn PyUnstable_Type_AssignVersionTag(type_obj: *mut ffi::PyTypeObject) -> i32;
+        fn PyFunction_SetDefaults(
+            function: *mut ffi::PyObject,
+            defaults: *mut ffi::PyObject,
+        ) -> i32;
+        fn PyFunction_SetKwDefaults(
+            function: *mut ffi::PyObject,
+            defaults: *mut ffi::PyObject,
+        ) -> i32;
     }
 
     fn initialize_test_python() {
@@ -1221,80 +1229,164 @@ mod tests {
         Python::initialize();
     }
 
+    unsafe fn make_test_module<'py>(py: Python<'py>) -> (Bound<'py, PyModule>, Bound<'py, PyAny>) {
+        let module = PyModule::new(py, "watcher_test").expect("module should allocate");
+        let globals = module.dict();
+        let locals = PyDict::new(py);
+        let builtins = py.import("builtins").expect("builtins should import");
+        globals
+            .set_item("__builtins__", &builtins)
+            .expect("module globals should accept builtins");
+        locals
+            .set_item("__builtins__", &builtins)
+            .expect("locals should accept builtins");
+
+        let source = std::ffi::CString::new(
+            "class C:\n    def f(self, x=1, *, y=2):\n        return x + y\n",
+        )
+        .expect("python source should be CString-compatible");
+        assert!(
+            !ffi::PyRun_StringFlags(
+                source.as_ptr(),
+                ffi::Py_file_input,
+                globals.as_ptr(),
+                locals.as_ptr(),
+                ptr::null_mut(),
+            )
+            .is_null(),
+            "class definition should execute"
+        );
+
+        let cls = locals
+            .get_item("C")
+            .expect("locals lookup should succeed")
+            .expect("class should exist");
+        globals
+            .set_item("C", &cls)
+            .expect("module globals should accept class");
+        (module, cls)
+    }
+
+    unsafe fn assert_function_mutation_invalidates_type_version(
+        owner_type: *mut ffi::PyTypeObject,
+        mutation_name: &str,
+        mutate: impl FnOnce() -> i32,
+    ) {
+        assert_eq!(
+            PyUnstable_Type_AssignVersionTag(owner_type),
+            1,
+            "{mutation_name}: class should receive a version tag"
+        );
+        let before = (*owner_type).tp_version_tag;
+        assert_ne!(
+            before, 0,
+            "{mutation_name}: type version tag should be assigned"
+        );
+        assert_eq!(mutate(), 0, "{mutation_name}: mutation should succeed");
+        assert_ne!(
+            (*owner_type).tp_version_tag,
+            before,
+            "{mutation_name}: function mutation should invalidate the owner type version"
+        );
+    }
+
+    unsafe fn compile_replacement_function(py: Python<'_>) -> *mut ffi::PyObject {
+        let globals = PyDict::new(py);
+        let locals = PyDict::new(py);
+        let builtins = py.import("builtins").expect("builtins should import");
+        globals
+            .set_item("__builtins__", &builtins)
+            .expect("replacement globals should accept builtins");
+        locals
+            .set_item("__builtins__", &builtins)
+            .expect("replacement locals should accept builtins");
+        let source =
+            std::ffi::CString::new("def replacement(self, x=1, *, y=2):\n    return x - y\n")
+                .expect("replacement source should be CString-compatible");
+        let run_result = ffi::PyRun_StringFlags(
+            source.as_ptr(),
+            ffi::Py_file_input,
+            globals.as_ptr(),
+            locals.as_ptr(),
+            ptr::null_mut(),
+        );
+        assert!(
+            !run_result.is_null(),
+            "replacement function definition should execute"
+        );
+        ffi::Py_DECREF(run_result);
+        let replacement = locals
+            .get_item("replacement")
+            .expect("replacement lookup should succeed")
+            .expect("replacement function should exist");
+        let replacement_code =
+            ffi::PyObject_GetAttrString(replacement.as_ptr(), c"__code__".as_ptr());
+        assert!(
+            !replacement_code.is_null(),
+            "replacement function should expose __code__"
+        );
+        replacement_code
+    }
+
     #[test]
-    fn function_watcher_invalidates_owner_type_version() {
+    fn function_watcher_invalidates_owner_type_version_for_all_expected_mutations() {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         initialize_test_python();
         Python::attach(|py| unsafe {
-            let module = PyModule::new(py, "watcher_test").expect("module should allocate");
-            let globals = module.dict();
-            let locals = PyDict::new(py);
-            let builtins = py.import("builtins").expect("builtins should import");
-            globals
-                .set_item("__builtins__", &builtins)
-                .expect("module globals should accept builtins");
-            locals
-                .set_item("__builtins__", &builtins)
-                .expect("locals should accept builtins");
-
-            let source =
-                std::ffi::CString::new("class C:\n    def f(self, x=1):\n        return x\n")
-                    .expect("python source should be CString-compatible");
-            assert!(
-                !ffi::PyRun_StringFlags(
-                    source.as_ptr(),
-                    ffi::Py_file_input,
-                    globals.as_ptr(),
-                    locals.as_ptr(),
-                    ptr::null_mut(),
-                )
-                .is_null(),
-                "class definition should execute"
-            );
-
-            let cls = locals
-                .get_item("C")
-                .expect("locals lookup should succeed")
-                .expect("class should exist");
-            globals
-                .set_item("C", &cls)
-                .expect("module globals should accept class");
-
+            let (module, cls) = make_test_module(py);
             register_function_owner_types_for_module(module.as_ptr())
                 .expect("owner type registration should succeed");
 
             let owner_type = cls.as_ptr() as *mut ffi::PyTypeObject;
-            assert_eq!(
-                PyUnstable_Type_AssignVersionTag(owner_type),
-                1,
-                "class should receive a version tag"
-            );
-            let before = (*owner_type).tp_version_tag;
-            assert_ne!(before, 0, "type version tag should be assigned");
-
             let func = ffi::PyObject_GetAttrString(cls.as_ptr(), c"f".as_ptr());
             assert!(
                 !func.is_null(),
                 "class attribute lookup should resolve function"
             );
-            let defaults = ffi::PyTuple_New(1);
-            assert!(!defaults.is_null(), "defaults tuple should allocate");
-            let default_value = ffi::PyLong_FromLongLong(2);
-            assert!(!default_value.is_null(), "default value should allocate");
-            assert_eq!(ffi::PyTuple_SetItem(defaults, 0, default_value), 0);
-            assert_eq!(
-                ffi::PyObject_SetAttrString(func, c"__defaults__".as_ptr(), defaults),
-                0,
-                "updating method defaults should succeed"
-            );
-            ffi::Py_DECREF(defaults);
-            ffi::Py_DECREF(func);
 
-            assert_ne!(
-                (*owner_type).tp_version_tag,
-                before,
-                "function mutation should invalidate the owner type version"
-            );
+            assert_function_mutation_invalidates_type_version(owner_type, "defaults", || {
+                let defaults = ffi::PyTuple_New(1);
+                assert!(!defaults.is_null(), "defaults tuple should allocate");
+                let default_value = ffi::PyLong_FromLongLong(3);
+                assert!(!default_value.is_null(), "default value should allocate");
+                assert_eq!(ffi::PyTuple_SetItem(defaults, 0, default_value), 0);
+                let result = PyFunction_SetDefaults(func, defaults);
+                ffi::Py_DECREF(defaults);
+                result
+            });
+
+            assert_function_mutation_invalidates_type_version(owner_type, "kwdefaults", || {
+                let kwdefaults = ffi::PyDict_New();
+                assert!(!kwdefaults.is_null(), "kwdefaults dict should allocate");
+                let key = ffi::PyUnicode_FromString(c"y".as_ptr());
+                let value = ffi::PyLong_FromLongLong(4);
+                assert!(!key.is_null(), "kwdefaults key should allocate");
+                assert!(!value.is_null(), "kwdefaults value should allocate");
+                assert_eq!(ffi::PyDict_SetItem(kwdefaults, key, value), 0);
+                ffi::Py_DECREF(key);
+                ffi::Py_DECREF(value);
+                let result = PyFunction_SetKwDefaults(func, kwdefaults);
+                ffi::Py_DECREF(kwdefaults);
+                result
+            });
+
+            assert_function_mutation_invalidates_type_version(owner_type, "qualname", || {
+                let qualname = ffi::PyUnicode_FromString(c"C.f_renamed".as_ptr());
+                assert!(!qualname.is_null(), "qualname should allocate");
+                let result = ffi::PyObject_SetAttrString(func, c"__qualname__".as_ptr(), qualname);
+                ffi::Py_DECREF(qualname);
+                result
+            });
+
+            assert_function_mutation_invalidates_type_version(owner_type, "code", || {
+                let replacement_code = compile_replacement_function(py);
+                let result =
+                    ffi::PyObject_SetAttrString(func, c"__code__".as_ptr(), replacement_code);
+                ffi::Py_DECREF(replacement_code);
+                result
+            });
+
+            ffi::Py_DECREF(func);
         });
     }
 }
