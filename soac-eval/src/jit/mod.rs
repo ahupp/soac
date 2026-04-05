@@ -16,13 +16,14 @@ use pyo3::ffi;
 use soac_blockpy::block_py::{
     AbruptKind, BlockArg, BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword,
     CallArgPositional, CellLocation, CodegenBlock, CodegenBlockPyExpr, CounterDef, CounterId,
-    ChildVisitable, CounterScope, CounterSite, FunctionId, HasMeta, LocalLocation, LocatedName,
-    NameLocation, ParamDefaultSource, StorageLayout, Visit, WithMeta,
+    ChildVisitable, CounterScope, CounterSite, FunctionId, HasMeta, InstrId, LocalLocation,
+    LocatedName, NameLocation, ParamDefaultSource, StorageLayout, Visit, WithMeta, BlockLabel,
     operation as blockpy_intrinsics,
 };
 use soac_blockpy::passes::CodegenBlockPyPass;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -230,6 +231,11 @@ static DP_JIT_PYOBJECT_TO_I64_IMPORT: ImportSpec = ImportSpec::new(
 );
 static DP_JIT_CALLEE_FUNCTION_ID_IMPORT: ImportSpec =
     ImportSpec::new("dp_jit_callee_function_id", &[SigType::Pointer], &[SigType::I64]);
+static DP_JIT_RECORD_COUNTER_VALUE_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_record_counter_value",
+    &[SigType::Pointer, SigType::I64, SigType::I64],
+    &[],
+);
 static DP_JIT_RAISE_DELETED_NAME_ERROR_IMPORT: ImportSpec =
     ImportSpec::new("dp_jit_raise_deleted_name_error", &[SigType::Pointer], &[]);
 static DP_JIT_MAKE_CELL_IMPORT: ImportSpec =
@@ -700,10 +706,15 @@ struct JitEmitCtx<'mc> {
     py_call_object_ref: ir::FuncRef,
     py_call_with_kw_ref: ir::FuncRef,
     callee_function_id_ref: ir::FuncRef,
+    record_counter_value_ref: ir::FuncRef,
     tuple_new_ref: ir::FuncRef,
     tuple_set_item_ref: ir::FuncRef,
     stack_slots: StackSlots,
     direct_call_code_ptrs: &'mc HashMap<FunctionId, ObjPtr>,
+    call_target_counter_ids: &'mc HashMap<InstrId, CounterId>,
+    call_target_specializations: &'mc HashMap<InstrId, Vec<FunctionId>>,
+    call_direct_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
+    call_direct_fallback_counter_ids: &'mc HashMap<InstrId, CounterId>,
 }
 
 struct CodegenIntrinsicEmitState<'a, 'b, 'mc, 'c, 'd> {
@@ -1629,6 +1640,214 @@ fn collect_call_direct_targets(
     out
 }
 
+fn collect_runtime_counter_ids_by_kind(
+    counter_defs: &[CounterDef],
+    function_id: FunctionId,
+    kind: &str,
+) -> HashMap<InstrId, CounterId> {
+    counter_defs
+        .iter()
+        .filter_map(|counter| match &counter.site {
+            CounterSite::Runtime {
+                function_id: Some(counter_function_id),
+                instr_id: Some(instr_id),
+            } if counter.kind == kind && *counter_function_id == function_id => {
+                Some((*instr_id, counter.id))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn parse_call_target_specializations_env(
+    module_name: &str,
+    function_id: FunctionId,
+) -> Result<HashMap<InstrId, Vec<FunctionId>>, String> {
+    let Ok(raw) = env::var("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS") else {
+        return Ok(HashMap::new());
+    };
+    let mut out = HashMap::new();
+    for entry in raw.split(';').map(str::trim).filter(|entry| !entry.is_empty()) {
+        let Some((site, targets)) = entry.split_once('=') else {
+            return Err(format!("invalid call target specialization entry: {entry}"));
+        };
+        let mut site_parts = site.split('|');
+        let Some(entry_module_name) = site_parts.next() else {
+            return Err(format!("missing module in specialization entry: {entry}"));
+        };
+        let Some(entry_function_id) = site_parts.next() else {
+            return Err(format!("missing function_id in specialization entry: {entry}"));
+        };
+        let Some(entry_block_label) = site_parts.next() else {
+            return Err(format!("missing block label in specialization entry: {entry}"));
+        };
+        let Some(entry_instr_index) = site_parts.next() else {
+            return Err(format!("missing instr index in specialization entry: {entry}"));
+        };
+        if site_parts.next().is_some() {
+            return Err(format!("too many site fields in specialization entry: {entry}"));
+        }
+        if entry_module_name != module_name {
+            continue;
+        }
+        let parsed_function_id = entry_function_id
+            .parse::<u64>()
+            .map(FunctionId::from_packed)
+            .map_err(|err| format!("invalid function_id in specialization entry {entry}: {err}"))?;
+        if parsed_function_id != function_id {
+            continue;
+        }
+        let block_label = entry_block_label
+            .parse::<u32>()
+            .map_err(|err| format!("invalid block label in specialization entry {entry}: {err}"))?;
+        let instr_index = entry_instr_index
+            .parse::<u32>()
+            .map_err(|err| format!("invalid instr index in specialization entry {entry}: {err}"))?;
+        let targets = targets
+            .split(',')
+            .map(str::trim)
+            .filter(|target| !target.is_empty())
+            .map(|target| {
+                target
+                    .parse::<u64>()
+                    .map(FunctionId::from_packed)
+                    .map_err(|err| {
+                        format!("invalid hot target function id in specialization entry {entry}: {err}")
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if targets.is_empty() {
+            continue;
+        }
+        out.insert(
+            InstrId::new(BlockLabel::from_index(block_label as usize), instr_index),
+            targets,
+        );
+    }
+    Ok(out)
+}
+
+fn emit_callee_function_id_checked(
+    fb: &mut FunctionBuilder<'_>,
+    callable: ir::Value,
+    ctx: &JitEmitCtx<'_>,
+) -> ir::Value {
+    let call_inst = fb.ins().call(ctx.callee_function_id_ref, &[callable]);
+    let callee_id = fb.inst_results(call_inst)[0];
+    let errored = fb
+        .ins()
+        .icmp_imm(ir::condcodes::IntCC::SignedLessThan, callee_id, 0);
+    let ok_block = fb.create_block();
+    fb.append_block_param(ok_block, ctx.consts.i64_ty);
+    fb.ins().brif(
+        errored,
+        ctx.consts.step_null_block,
+        &step_null_block_args(ctx),
+        ok_block,
+        &[ir::BlockArg::Value(callee_id)],
+    );
+    fb.switch_to_block(ok_block);
+    fb.block_params(ok_block)[0]
+}
+
+fn emit_record_call_target_counter(
+    fb: &mut FunctionBuilder<'_>,
+    counter_id: CounterId,
+    callee_id: ir::Value,
+    ctx: &JitEmitCtx<'_>,
+) {
+    let counter_id_value = fb.ins().iconst(ctx.consts.i64_ty, counter_id.0 as i64);
+    fb.ins().call(
+        ctx.record_counter_value_ref,
+        &[ctx.consts.vmctx_value, counter_id_value, callee_id],
+    );
+}
+
+fn emit_direct_call_resolved(
+    fb: &mut FunctionBuilder<'_>,
+    callable: ir::Value,
+    callable_is_borrowed: bool,
+    args: &[&CodegenBlockPyExpr],
+    target_function: &BlockPyFunction<CodegenBlockPyPass>,
+    target_code_ptr: ObjPtr,
+    local_names: &mut Vec<String>,
+    local_values: &mut Vec<ir::Value>,
+    ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> ir::Value {
+    let ptr_ty = ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let mut arg_values: Vec<ir::Value> = Vec::with_capacity(args.len());
+    let mut arg_borrowed: Vec<bool> = Vec::with_capacity(args.len());
+    for arg in args {
+        let borrowed_arg = codegen_expr_is_borrowable(
+            arg,
+            local_names,
+            &ctx.stack_slots,
+            ctx.storage_layout.as_ref(),
+        );
+        arg_borrowed.push(borrowed_arg);
+        arg_values.push(emit_codegen_expr(
+            fb,
+            arg,
+            local_names,
+            local_values,
+            ctx,
+            borrowed_arg,
+            jit_module,
+            func_imports,
+        ));
+    }
+
+    let mut direct_sig = jit_module.make_signature();
+    direct_sig.params.push(ir::AbiParam::special(
+        ptr_ty,
+        ir::ArgumentPurpose::VMContext,
+    ));
+    direct_sig.params.push(ir::AbiParam::new(ptr_ty));
+    for _ in target_function.params.iter() {
+        direct_sig.params.push(ir::AbiParam::new(ptr_ty));
+    }
+    direct_sig.returns.push(ir::AbiParam::new(ptr_ty));
+    let direct_sig_ref = fb.import_signature(direct_sig);
+
+    let mut call_args = Vec::with_capacity(arg_values.len() + 2);
+    call_args.push(ctx.consts.vmctx_value);
+    call_args.push(callable);
+    call_args.extend(arg_values.iter().copied());
+
+    let callee_ptr = fb.ins().iconst(ptr_ty, target_code_ptr as i64);
+    let call_inst = fb
+        .ins()
+        .call_indirect(direct_sig_ref, callee_ptr, &call_args);
+    let call_value = fb.inst_results(call_inst)[0];
+
+    for (value, borrowed_arg) in arg_values.into_iter().zip(arg_borrowed.into_iter()) {
+        if !borrowed_arg {
+            fb.ins().call(ctx.decref_ref, &[value]);
+        }
+    }
+    if !callable_is_borrowed {
+        fb.ins().call(ctx.decref_ref, &[callable]);
+    }
+
+    let call_is_null = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, call_value, null_ptr);
+    let call_ok_block = fb.create_block();
+    fb.append_block_param(call_ok_block, ptr_ty);
+    fb.ins().brif(
+        call_is_null,
+        ctx.consts.step_null_block,
+        &step_null_block_args(ctx),
+        call_ok_block,
+        &[ir::BlockArg::Value(call_value)],
+    );
+    fb.switch_to_block(call_ok_block);
+    fb.block_params(call_ok_block)[0]
+}
+
 fn emit_call_direct_expr(
     fb: &mut FunctionBuilder<'_>,
     call: &soac_blockpy::block_py::CallDirect<CodegenBlockPyExpr>,
@@ -1638,12 +1857,7 @@ fn emit_call_direct_expr(
     jit_module: &mut JITModule,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> ir::Value {
-    let Some(target_function) = ctx
-        .module
-        .callable_defs
-        .iter()
-        .find(|function| function.function_id == call.function_id)
-    else {
+    let mut fallback = || {
         let fallback = CodegenBlockPyExpr::Call(
             soac_blockpy::block_py::Call::new(
                 (*call.callable).clone(),
@@ -1652,7 +1866,7 @@ fn emit_call_direct_expr(
             )
             .with_meta(call.meta()),
         );
-        return emit_codegen_expr(
+        emit_codegen_expr(
             fb,
             &fallback,
             local_names,
@@ -1661,7 +1875,16 @@ fn emit_call_direct_expr(
             false,
             jit_module,
             func_imports,
-        );
+        )
+    };
+
+    let Some(target_function) = ctx
+        .module
+        .callable_defs
+        .iter()
+        .find(|function| function.function_id == call.function_id)
+    else {
+        return fallback();
     };
 
     let supports_direct_call = call.keywords.is_empty()
@@ -1671,25 +1894,12 @@ fn emit_call_direct_expr(
             .iter()
             .all(|arg| matches!(arg, CallArgPositional::Positional(_)));
     if !supports_direct_call {
-        let fallback = CodegenBlockPyExpr::Call(
-            soac_blockpy::block_py::Call::new(
-                (*call.callable).clone(),
-                call.args.clone(),
-                call.keywords.clone(),
-            )
-            .with_meta(call.meta()),
-        );
-        return emit_codegen_expr(
-            fb,
-            &fallback,
-            local_names,
-            local_values,
-            ctx,
-            false,
-            jit_module,
-            func_imports,
-        );
+        return fallback();
     }
+
+    let Some(&target_code_ptr) = ctx.direct_call_code_ptrs.get(&call.function_id) else {
+        return fallback();
+    };
 
     let callable_is_borrowed = codegen_expr_is_borrowable(
         call.callable.as_ref(),
@@ -1707,100 +1917,27 @@ fn emit_call_direct_expr(
         jit_module,
         func_imports,
     );
-    let target_code_ptr_inst = fb.ins().call(
-        ctx.lookup_direct_code_ptr_ref,
-        &[
-            ctx.consts.vmctx_value,
-            fb.ins().iconst(ctx.consts.i64_ty, call.function_id.packed() as i64),
-        ],
-    );
-    let target_code_ptr = fb.inst_results(target_code_ptr_inst)[0];
-    let null_ptr = fb.ins().iconst(ctx.consts.ptr_ty, 0);
-    let code_ptr_is_null = fb
-        .ins()
-        .icmp(ir::condcodes::IntCC::Equal, target_code_ptr, null_ptr);
-    let code_ptr_ok_block = fb.create_block();
-    fb.append_block_param(code_ptr_ok_block, ctx.consts.ptr_ty);
-    fb.ins().brif(
-        code_ptr_is_null,
-        ctx.consts.step_null_block,
-        &step_null_block_args(ctx),
-        code_ptr_ok_block,
-        &[ir::BlockArg::Value(target_code_ptr)],
-    );
-    fb.switch_to_block(code_ptr_ok_block);
-    let target_code_ptr = fb.block_params(code_ptr_ok_block)[0];
-
-    let mut direct_sig = jit_module.make_signature();
-    direct_sig.params.push(ir::AbiParam::special(
-        ctx.consts.ptr_ty,
-        ir::ArgumentPurpose::VMContext,
-    ));
-    direct_sig.params.push(ir::AbiParam::new(ctx.consts.ptr_ty));
-    for _ in target_function.params.iter() {
-        direct_sig.params.push(ir::AbiParam::new(ctx.consts.ptr_ty));
-    }
-    direct_sig.returns.push(ir::AbiParam::new(ctx.consts.ptr_ty));
-    let direct_sig_ref = fb.import_signature(direct_sig);
-
-    let mut call_args = Vec::with_capacity(target_function.params.len() + 2);
-    call_args.push(ctx.consts.vmctx_value);
-    call_args.push(callable);
-    let mut owned_args = Vec::new();
-    for arg in &call.args {
-        let CallArgPositional::Positional(expr) = arg else {
-            unreachable!("non-positional direct args should have used generic fallback");
-        };
-        let arg_is_borrowed = codegen_expr_is_borrowable(
-            expr,
-            local_names,
-            &ctx.stack_slots,
-            ctx.storage_layout.as_ref(),
-        );
-        let arg_value = emit_codegen_expr(
-            fb,
-            expr,
-            local_names,
-            local_values,
-            ctx,
-            arg_is_borrowed,
-            jit_module,
-            func_imports,
-        );
-        if !arg_is_borrowed {
-            owned_args.push(arg_value);
-        }
-        call_args.push(arg_value);
-    }
-    while call_args.len() < target_function.params.len() + 2 {
-        call_args.push(null_ptr);
-    }
-
-    let direct_call_inst = fb
-        .ins()
-        .call_indirect(direct_sig_ref, target_code_ptr, &call_args);
-    let direct_result = fb.inst_results(direct_call_inst)[0];
-    for arg_value in owned_args {
-        fb.ins().call(ctx.decref_ref, &[arg_value]);
-    }
-    if !callable_is_borrowed {
-        fb.ins().call(ctx.decref_ref, &[callable]);
-    }
-
-    let result_is_null = fb
-        .ins()
-        .icmp(ir::condcodes::IntCC::Equal, direct_result, null_ptr);
-    let result_ok_block = fb.create_block();
-    fb.append_block_param(result_ok_block, ctx.consts.ptr_ty);
-    fb.ins().brif(
-        result_is_null,
-        ctx.consts.step_null_block,
-        &step_null_block_args(ctx),
-        result_ok_block,
-        &[ir::BlockArg::Value(direct_result)],
-    );
-    fb.switch_to_block(result_ok_block);
-    fb.block_params(result_ok_block)[0]
+    let args = call
+        .args
+        .iter()
+        .map(|arg| match arg {
+            CallArgPositional::Positional(expr) => expr,
+            CallArgPositional::Starred(_) => unreachable!("non-positional direct args should have used generic fallback"),
+        })
+        .collect::<Vec<_>>();
+    emit_direct_call_resolved(
+        fb,
+        callable,
+        callable_is_borrowed,
+        args.as_slice(),
+        target_function,
+        target_code_ptr,
+        local_names,
+        local_values,
+        ctx,
+        jit_module,
+        func_imports,
+    )
 }
 
 fn emit_codegen_expr(
@@ -2677,28 +2814,133 @@ fn emit_codegen_expr(
                 }
             }
 
-            let callable = emit_codegen_expr(
-                fb,
-                call.func.as_ref(),
-                local_names,
-                local_values,
-                ctx,
-                codegen_expr_is_borrowable(
-                    call.func.as_ref(),
-                    local_names,
-                    &ctx.stack_slots,
-                    ctx.storage_layout.as_ref(),
-                ),
-                jit_module,
-                func_imports,
-            );
             let callable_is_borrowed = codegen_expr_is_borrowable(
                 call.func.as_ref(),
                 local_names,
                 &ctx.stack_slots,
                 ctx.storage_layout.as_ref(),
             );
+            let callable = emit_codegen_expr(
+                fb,
+                call.func.as_ref(),
+                local_names,
+                local_values,
+                ctx,
+                callable_is_borrowed,
+                jit_module,
+                func_imports,
+            );
             if keywords.is_empty() {
+                let site_instr_id = call.meta().instr_id;
+                let counter_id =
+                    site_instr_id.and_then(|instr_id| ctx.call_target_counter_ids.get(&instr_id).copied());
+                let direct_hit_counter_id = site_instr_id
+                    .and_then(|instr_id| ctx.call_direct_hit_counter_ids.get(&instr_id).copied());
+                let direct_fallback_counter_id = site_instr_id.and_then(|instr_id| {
+                    ctx.call_direct_fallback_counter_ids
+                        .get(&instr_id)
+                        .copied()
+                });
+                let direct_specializations = site_instr_id
+                    .and_then(|instr_id| ctx.call_target_specializations.get(&instr_id))
+                    .map(|targets| {
+                        targets
+                            .iter()
+                            .copied()
+                            .filter_map(|function_id| {
+                                let target_function = ctx
+                                    .module
+                                    .callable_defs
+                                    .iter()
+                                    .find(|function| function.function_id == function_id)?;
+                                if args.len() != target_function.params.len() {
+                                    return None;
+                                }
+                                let &target_code_ptr = ctx.direct_call_code_ptrs.get(&function_id)?;
+                                Some((function_id, target_code_ptr))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+
+                if counter_id.is_some() || !direct_specializations.is_empty() {
+                    let callee_id = emit_callee_function_id_checked(fb, callable, ctx);
+                    if let Some(counter_id) = counter_id {
+                        emit_record_call_target_counter(fb, counter_id, callee_id, ctx);
+                    }
+                    if !direct_specializations.is_empty() {
+                        let result_block = fb.create_block();
+                        fb.append_block_param(result_block, ptr_ty);
+                        let generic_block = fb.create_block();
+                        for (index, &(function_id, target_code_ptr)) in
+                            direct_specializations.iter().enumerate()
+                        {
+                            let direct_block = fb.create_block();
+                            let miss_block = if index + 1 == direct_specializations.len() {
+                                generic_block
+                            } else {
+                                fb.create_block()
+                            };
+                            let is_match = fb.ins().icmp_imm(
+                                ir::condcodes::IntCC::Equal,
+                                callee_id,
+                                function_id.packed() as i64,
+                            );
+                            fb.ins()
+                                .brif(is_match, direct_block, &[], miss_block, &[]);
+
+                            fb.switch_to_block(direct_block);
+                            let target_function = ctx
+                                .module
+                                .callable_defs
+                                .iter()
+                                .find(|function| function.function_id == function_id)
+                                .expect("direct specialization target should exist");
+                            if let Some(counter_id) = direct_hit_counter_id {
+                                let _ = emit_increment_counter(fb, counter_id, ctx);
+                            }
+                            let direct_result = emit_direct_call_resolved(
+                                fb,
+                                callable,
+                                callable_is_borrowed,
+                                args.as_slice(),
+                                target_function,
+                                target_code_ptr,
+                                local_names,
+                                local_values,
+                                ctx,
+                                jit_module,
+                                func_imports,
+                            );
+                            fb.ins()
+                                .jump(result_block, &[ir::BlockArg::Value(direct_result)]);
+                            if index + 1 != direct_specializations.len() {
+                                fb.switch_to_block(miss_block);
+                            }
+                        }
+
+                        fb.switch_to_block(generic_block);
+                        if let Some(counter_id) = direct_fallback_counter_id {
+                            let _ = emit_increment_counter(fb, counter_id, ctx);
+                        }
+                        let generic_result = emit_positional_vectorcall(
+                            fb,
+                            callable,
+                            callable_is_borrowed,
+                            args.as_slice(),
+                            local_names,
+                            local_values,
+                            ctx,
+                            jit_module,
+                            func_imports,
+                        );
+                        fb.ins()
+                            .jump(result_block, &[ir::BlockArg::Value(generic_result)]);
+                        fb.switch_to_block(result_block);
+                        return fb.block_params(result_block)[0];
+                    }
+                }
+
                 return emit_positional_vectorcall(
                     fb,
                     callable,
@@ -4160,6 +4402,7 @@ fn build_cranelift_run_bb_specialized_function(
     counter_defs: &[CounterDef],
     module_constant_ptrs: &[*mut ffi::PyObject],
     counter_ptrs: &[*mut u64],
+    direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
 ) -> Result<BuiltSpecializedFunction, String> {
     let block_count = function.blocks.len();
     if block_count == 0 {
@@ -4189,6 +4432,38 @@ fn build_cranelift_run_bb_specialized_function(
                     ));
                 }
             }
+        }
+    }
+
+    let call_target_counter_ids =
+        collect_runtime_counter_ids_by_kind(counter_defs, function.function_id, "call_hot_targets");
+    let call_direct_hit_counter_ids =
+        collect_runtime_counter_ids_by_kind(counter_defs, function.function_id, "call_direct_hit");
+    let call_direct_fallback_counter_ids = collect_runtime_counter_ids_by_kind(
+        counter_defs,
+        function.function_id,
+        "call_direct_fallback",
+    );
+    let call_target_specializations = match direct_call_resolver {
+        Some(shared_state) => {
+            parse_call_target_specializations_env(shared_state.module_name.as_str(), function.function_id)?
+        }
+        None => HashMap::new(),
+    };
+
+    let mut direct_call_targets = collect_call_direct_targets(function);
+    for targets in call_target_specializations.values() {
+        direct_call_targets.extend(targets.iter().copied());
+    }
+
+    let mut direct_call_code_ptrs = HashMap::new();
+    for function_id in direct_call_targets {
+        let maybe_code_ptr = match direct_call_resolver {
+            Some(shared_state) => shared_state.lookup_or_compile_direct_code_ptr(function_id)?,
+            None => None,
+        };
+        if let Some(code_ptr) = maybe_code_ptr {
+            direct_call_code_ptrs.insert(function_id, code_ptr);
         }
     }
 
@@ -4377,10 +4652,10 @@ fn build_cranelift_run_bb_specialized_function(
             &mut fb.func,
             &DP_JIT_CALLEE_FUNCTION_ID_IMPORT,
         );
-        let lookup_direct_code_ptr_ref = func_imports.get_or_panic(
+        let record_counter_value_ref = func_imports.get_or_panic(
             jit_module,
             &mut fb.func,
-            &DP_JIT_LOOKUP_DIRECT_CODE_PTR_IMPORT,
+            &DP_JIT_RECORD_COUNTER_VALUE_IMPORT,
         );
         let raise_deleted_name_error_ref = func_imports.get_or_panic(
             jit_module,
@@ -4655,10 +4930,15 @@ fn build_cranelift_run_bb_specialized_function(
                 py_call_object_ref,
                 py_call_with_kw_ref,
                 callee_function_id_ref,
-                lookup_direct_code_ptr_ref,
+                record_counter_value_ref,
                 tuple_new_ref,
                 tuple_set_item_ref,
                 stack_slots: stack_slots.clone(),
+                direct_call_code_ptrs: &direct_call_code_ptrs,
+                call_target_counter_ids: &call_target_counter_ids,
+                call_target_specializations: &call_target_specializations,
+                call_direct_hit_counter_ids: &call_direct_hit_counter_ids,
+                call_direct_fallback_counter_ids: &call_direct_fallback_counter_ids,
             };
             let block = &function.blocks[index];
             let mut local_names = Vec::new();
@@ -4836,6 +5116,7 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_cfg(
         &[],
         &module_constant_ptrs,
         &counter_ptrs,
+        None,
     )?;
     let mut out = String::new();
     out.push_str("; import fn aliases (Cranelift display id -> symbol)\n");
@@ -4906,6 +5187,7 @@ pub unsafe fn compile_cranelift_run_bb_specialized_cached(
     counter_defs: &[CounterDef],
     module_constant_ptrs: &[*mut ffi::PyObject],
     counter_ptrs: &[*mut u64],
+    direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
 ) -> Result<ObjPtr, String> {
     let mut compiled = Box::new(CompiledSpecializedRunner {
         _jit_module: new_jit_module()?,
@@ -4920,6 +5202,7 @@ pub unsafe fn compile_cranelift_run_bb_specialized_cached(
         counter_defs,
         module_constant_ptrs,
         counter_ptrs,
+        direct_call_resolver,
     )?;
     let mut ctx = built.ctx;
     let main_id = built.main_id;

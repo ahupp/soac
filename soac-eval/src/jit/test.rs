@@ -263,6 +263,7 @@ mod tests {
                 &[],
                 &module_constant_ptrs,
                 &counter_ptrs,
+                None,
             )
             .expect("specialized JIT build should succeed");
             let (clif, _cfg_dot, _vcode_disasm) = render_compiled_clif_and_vcode_disasm(
@@ -749,6 +750,7 @@ def f():
                     &shared_state.lowered_module.counter_defs,
                     &module_constant_ptrs,
                     &counter_ptrs,
+                    Some(shared_state.as_ref()),
                 )
                 .expect("direct counter test function should compile");
                 let (code_ptr, param_count) = compiled_direct_runner_info(compiled_handle)
@@ -878,6 +880,7 @@ def f(x):
                     &shared_state.lowered_module.counter_defs,
                     &module_constant_ptrs,
                     &counter_ptrs,
+                    Some(shared_state.as_ref()),
                 )
                 .expect("direct refcount counter test function should compile");
                 let (code_ptr, param_count) = compiled_direct_runner_info(compiled_handle)
@@ -1065,7 +1068,7 @@ def f(x):
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
         let rendered =
-            render_test_jit_function_with_constants(&function, &blocks, &module_constants);
+            render_test_jit_function_with_constants(&module, &function, &blocks, &module_constants);
         assert!(
             !rendered.contains("call dp_jit_load_module_constant"),
             "constant slot lowering should not call the module constant hook anymore:\n{rendered}"

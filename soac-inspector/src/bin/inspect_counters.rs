@@ -33,8 +33,16 @@ fn print_usage() {
 }
 
 fn format_counter_row(row: &CounterDumpRowView<'_>) -> String {
+    let observed_value = row
+        .observed_value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let max_overcount = row
+        .max_overcount
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string());
     format!(
-        "  counter={} scope={} kind={} site={} site_function_id={} current_function_id={} instr_id={} function={} block={} value={}",
+        "  counter={} scope={} kind={} site={} site_function_id={} current_function_id={} instr_id={} function={} block={} value={} observed_value={} max_overcount={}",
         row.counter_id,
         row.scope,
         row.kind,
@@ -51,6 +59,8 @@ fn format_counter_row(row: &CounterDumpRowView<'_>) -> String {
         row.function_qualname.unwrap_or("-"),
         row.block_label.unwrap_or("-"),
         row.value,
+        observed_value,
+        max_overcount,
     )
 }
 
@@ -93,6 +103,8 @@ mod tests {
             function_qualname: Some("pkg.mod.f"),
             block_label: None,
             value: 11,
+            observed_value: Some(12),
+            max_overcount: Some(1),
         };
 
         let rendered = format_counter_row(&row);
@@ -108,6 +120,8 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("instr_id=bb2:4"), "{rendered}");
+        assert!(rendered.contains("observed_value=12"), "{rendered}");
+        assert!(rendered.contains("max_overcount=1"), "{rendered}");
     }
 
     #[test]
@@ -123,6 +137,8 @@ mod tests {
             function_qualname: None,
             block_label: None,
             value: 11,
+            observed_value: None,
+            max_overcount: None,
         };
 
         let rendered = format_counter_row(&row);

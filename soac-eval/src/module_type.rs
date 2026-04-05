@@ -1,3 +1,4 @@
+use crate::counter::{Counter, CounterEntry};
 use crate::counter_dump::{CounterDumpRecord, CounterDumpRow};
 use crate::module_constants::ModuleCodegenConstants;
 use crate::module_globals::ModuleGlobalCache;
@@ -31,8 +32,9 @@ pub struct SharedModuleState {
     pub codegen_constants: ModuleCodegenConstants,
     function_index_by_id: HashMap<FunctionId, usize>,
     module_constant_objs: Vec<Py<PyAny>>,
-    counter_slots_by_id: Box<[usize]>,
+    counter_slots_by_id: Box<[CounterRuntimeSlot]>,
     counter_values: Box<[u64]>,
+    call_target_counter_values: Box<[Mutex<Counter<2, u64>>]>,
     compiled_direct_runner_handles: Mutex<HashMap<FunctionId, DirectRunnerCacheEntry>>,
 }
 
@@ -50,6 +52,12 @@ enum CounterStorageKey {
         site: CounterSite,
         kind: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CounterRuntimeSlot {
+    Scalar(usize),
+    CallHotTargets(usize),
 }
 
 impl SharedModuleState {
@@ -73,7 +81,12 @@ impl SharedModuleState {
     pub(crate) fn counter_ptrs(&self) -> Vec<*mut u64> {
         self.counter_slots_by_id
             .iter()
-            .map(|slot| &self.counter_values[*slot] as *const u64 as *mut u64)
+            .map(|slot| match slot {
+                CounterRuntimeSlot::Scalar(slot) => {
+                    &self.counter_values[*slot] as *const u64 as *mut u64
+                }
+                CounterRuntimeSlot::CallHotTargets(_) => ptr::null_mut(),
+            })
             .collect()
     }
 
@@ -85,7 +98,51 @@ impl SharedModuleState {
         let Some(slot) = self.counter_slots_by_id.get(counter_id.0).copied() else {
             return 0;
         };
-        self.counter_values.get(slot).copied().unwrap_or_default()
+        match slot {
+            CounterRuntimeSlot::Scalar(slot) => {
+                self.counter_values.get(slot).copied().unwrap_or_default()
+            }
+            CounterRuntimeSlot::CallHotTargets(_) => 0,
+        }
+    }
+
+    pub(crate) fn record_call_target_counter(
+        &self,
+        counter_id: CounterId,
+        value: u64,
+    ) -> Result<(), String> {
+        let Some(slot) = self.counter_slots_by_id.get(counter_id.0).copied() else {
+            return Err(format!("missing counter slot for counter id {}", counter_id.0));
+        };
+        let CounterRuntimeSlot::CallHotTargets(slot) = slot else {
+            return Err(format!(
+                "counter id {} is not a call target counter",
+                counter_id.0
+            ));
+        };
+        let counter = self
+            .call_target_counter_values
+            .get(slot)
+            .ok_or_else(|| format!("missing call target counter slot {}", slot))?;
+        let mut counter = counter
+            .lock()
+            .map_err(|_| "call target counter lock poisoned".to_string())?;
+        counter.record(value);
+        Ok(())
+    }
+
+    fn call_target_counter_snapshot(
+        &self,
+        counter_id: CounterId,
+    ) -> Option<Vec<CounterEntry<u64>>> {
+        let CounterRuntimeSlot::CallHotTargets(slot) =
+            self.counter_slots_by_id.get(counter_id.0).copied()?
+        else {
+            return None;
+        };
+        let counter = self.call_target_counter_values.get(slot)?;
+        let counter = counter.lock().ok()?;
+        Some(counter.snapshot())
     }
 
     pub(crate) fn lookup_or_compile_direct_code_ptr(
@@ -150,56 +207,78 @@ impl SharedModuleState {
             return None;
         }
 
-        let rows = self
-            .lowered_module
-            .counter_defs
-            .iter()
-            .map(|counter| {
-                let value = self.counter_value(counter.id);
+        let mut rows = Vec::new();
+        for counter in &self.lowered_module.counter_defs {
+            let (site_kind, function_id, current_function_id, instr_id, function_qualname, block_label) =
                 match &counter.site {
                     CounterSite::BlockEntry {
                         function_id,
                         block_label,
                     } => {
                         let function = self.lookup_function(*function_id);
-                        CounterDumpRow {
-                            counter_id: u32::try_from(counter.id.0)
-                                .expect("counter ids should fit in u32"),
-                            scope: counter_scope_name(counter.scope).to_string(),
-                            kind: counter.kind.clone(),
-                            site_kind: "block_entry".to_string(),
-                            function_id: Some(*function_id),
-                            current_function_id: Some(*function_id),
-                            instr_id: None,
-                            function_qualname: function
+                        (
+                            "block_entry".to_string(),
+                            Some(*function_id),
+                            Some(*function_id),
+                            None,
+                            function
                                 .map(|function| function.names.qualname.clone())
                                 .or_else(|| Some("<missing-function>".to_string())),
-                            block_label: Some(block_label.to_string()),
-                            value,
-                        }
+                            Some(block_label.to_string()),
+                        )
                     }
                     CounterSite::Runtime {
                         function_id,
                         instr_id,
-                    } => CounterDumpRow {
-                        counter_id: u32::try_from(counter.id.0)
-                            .expect("counter ids should fit in u32"),
-                        scope: counter_scope_name(counter.scope).to_string(),
-                        kind: counter.kind.clone(),
-                        site_kind: "runtime".to_string(),
-                        function_id: Some(function_id.unwrap_or(FunctionId::global())),
-                        current_function_id: Some(function_id.unwrap_or(FunctionId::global())),
-                        instr_id: *instr_id,
-                        function_qualname: function_id.and_then(|function_id| {
+                    } => (
+                        "runtime".to_string(),
+                        Some(function_id.unwrap_or(FunctionId::global())),
+                        Some(function_id.unwrap_or(FunctionId::global())),
+                        *instr_id,
+                        function_id.and_then(|function_id| {
                             self.lookup_function(function_id)
                                 .map(|function| function.names.qualname.clone())
                         }),
-                        block_label: None,
-                        value,
-                    },
+                        None,
+                    ),
+                };
+
+            let base_row = CounterDumpRow {
+                counter_id: u32::try_from(counter.id.0).expect("counter ids should fit in u32"),
+                scope: counter_scope_name(counter.scope).to_string(),
+                kind: counter.kind.clone(),
+                site_kind,
+                function_id,
+                current_function_id,
+                instr_id,
+                function_qualname,
+                block_label,
+                value: 0,
+                observed_value: None,
+                max_overcount: None,
+            };
+
+            if counter_uses_call_target_storage(counter) {
+                let snapshot = self
+                    .call_target_counter_snapshot(counter.id)
+                    .unwrap_or_default();
+                if snapshot.is_empty() {
+                    rows.push(base_row);
+                } else {
+                    for entry in snapshot {
+                        let mut row = base_row.clone();
+                        row.value = entry.approx_count;
+                        row.observed_value = Some(entry.value);
+                        row.max_overcount = Some(entry.max_overcount);
+                        rows.push(row);
+                    }
                 }
-            })
-            .collect();
+            } else {
+                let mut row = base_row;
+                row.value = self.counter_value(counter.id);
+                rows.push(row);
+            }
+        }
 
         Some(CounterDumpRecord {
             module_name: self.module_name.clone(),
@@ -256,10 +335,22 @@ fn counter_storage_key(counter: &CounterDef) -> PyResult<CounterStorageKey> {
     }
 }
 
-fn build_counter_storage(counter_defs: &[CounterDef]) -> PyResult<(Box<[usize]>, Box<[u64]>)> {
-    let mut slots_by_id = vec![usize::MAX; counter_defs.len()];
-    let mut slot_by_key = HashMap::new();
+fn counter_uses_call_target_storage(counter: &CounterDef) -> bool {
+    counter.kind == "call_hot_targets"
+}
+
+fn build_counter_storage(
+    counter_defs: &[CounterDef],
+) -> PyResult<(
+    Box<[CounterRuntimeSlot]>,
+    Box<[u64]>,
+    Box<[Mutex<Counter<2, u64>>]>,
+)> {
+    let mut slots_by_id = vec![None; counter_defs.len()];
+    let mut scalar_slot_by_key = HashMap::new();
+    let mut call_target_slot_by_key = HashMap::new();
     let mut counter_values = Vec::new();
+    let mut call_target_counter_values = Vec::new();
     for counter in counter_defs {
         if counter.id.0 >= slots_by_id.len() {
             return Err(PyRuntimeError::new_err(format!(
@@ -269,19 +360,39 @@ fn build_counter_storage(counter_defs: &[CounterDef]) -> PyResult<(Box<[usize]>,
             )));
         }
         let key = counter_storage_key(counter)?;
-        let slot = if let Some(slot) = slot_by_key.get(&key).copied() {
-            slot
+        let slot = if counter_uses_call_target_storage(counter) {
+            let slot = if let Some(slot) = call_target_slot_by_key.get(&key).copied() {
+                slot
+            } else {
+                let slot = call_target_counter_values.len();
+                call_target_counter_values.push(Mutex::new(Counter::new()));
+                call_target_slot_by_key.insert(key, slot);
+                slot
+            };
+            CounterRuntimeSlot::CallHotTargets(slot)
         } else {
-            let slot = counter_values.len();
-            counter_values.push(0);
-            slot_by_key.insert(key, slot);
-            slot
+            let slot = if let Some(slot) = scalar_slot_by_key.get(&key).copied() {
+                slot
+            } else {
+                let slot = counter_values.len();
+                counter_values.push(0);
+                scalar_slot_by_key.insert(key, slot);
+                slot
+            };
+            CounterRuntimeSlot::Scalar(slot)
         };
-        slots_by_id[counter.id.0] = slot;
+        slots_by_id[counter.id.0] = Some(slot);
     }
     Ok((
-        slots_by_id.into_boxed_slice(),
+        slots_by_id
+            .into_iter()
+            .map(|slot| {
+                slot.expect("every counter id should map to a runtime counter slot")
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
         counter_values.into_boxed_slice(),
+        call_target_counter_values.into_boxed_slice(),
     ))
 }
 
@@ -293,7 +404,7 @@ pub(crate) fn build_shared_state_for_testing(
     package_name: &str,
 ) -> PyResult<Arc<SharedModuleState>> {
     let function_index_by_id = build_function_index_by_id(&lowered_module)?;
-    let (counter_slots_by_id, counter_values) =
+    let (counter_slots_by_id, counter_values, call_target_counter_values) =
         build_counter_storage(&lowered_module.counter_defs)?;
     let codegen_constants = ModuleCodegenConstants::collect_from_module(&lowered_module);
     let module_constant_objs = codegen_constants.build_python_constants(py)?;
@@ -306,6 +417,7 @@ pub(crate) fn build_shared_state_for_testing(
         module_constant_objs,
         counter_slots_by_id,
         counter_values,
+        call_target_counter_values,
         compiled_direct_runner_handles: Mutex::new(HashMap::new()),
     }))
 }
@@ -350,7 +462,7 @@ impl SoacExtModuleState {
             ));
         }
         let function_index_by_id = build_function_index_by_id(&lowered_module)?;
-        let (counter_slots_by_id, counter_values) =
+        let (counter_slots_by_id, counter_values, call_target_counter_values) =
             build_counter_storage(&lowered_module.counter_defs)?;
         let codegen_constants = ModuleCodegenConstants::collect_from_module(&lowered_module);
         let module_constant_objs = codegen_constants.build_python_constants(py)?;
@@ -363,6 +475,7 @@ impl SoacExtModuleState {
             module_constant_objs,
             counter_slots_by_id,
             counter_values,
+            call_target_counter_values,
             compiled_direct_runner_handles: Mutex::new(HashMap::new()),
         }));
         self.initialized = true;
@@ -616,8 +729,9 @@ def f():
                 .expect("function index should build"),
             codegen_constants: ModuleCodegenConstants::collect_from_module(&lowered),
             module_constant_objs: Vec::new(),
-            counter_slots_by_id: vec![0].into_boxed_slice(),
+            counter_slots_by_id: vec![CounterRuntimeSlot::Scalar(0)].into_boxed_slice(),
             counter_values: vec![3].into_boxed_slice(),
+            call_target_counter_values: Vec::new().into_boxed_slice(),
             lowered_module: lowered,
             module_name: "counter_test".to_string(),
             package_name: String::new(),
@@ -644,6 +758,8 @@ def f():
         assert_eq!(row.function_qualname.as_deref(), Some("f"));
         assert_eq!(row.block_label, Some(entry_label_text));
         assert_eq!(row.value, 3);
+        assert_eq!(row.observed_value, None);
+        assert_eq!(row.max_overcount, None);
     }
 
     #[test]
@@ -696,9 +812,10 @@ def f():
             },
         ];
 
-        let (slots_by_id, counter_values) =
+        let (slots_by_id, counter_values, call_target_counter_values) =
             build_counter_storage(&counter_defs).expect("counter storage should build");
         assert_eq!(counter_values.len(), 3);
+        assert!(call_target_counter_values.is_empty());
         assert_eq!(slots_by_id[0], slots_by_id[1]);
         assert_eq!(slots_by_id[2], slots_by_id[3]);
         assert_ne!(slots_by_id[0], slots_by_id[2]);
@@ -725,8 +842,13 @@ def f():
                 .expect("function index should build"),
             codegen_constants: ModuleCodegenConstants::collect_from_module(&lowered),
             module_constant_objs: Vec::new(),
-            counter_slots_by_id: vec![0, 1].into_boxed_slice(),
+            counter_slots_by_id: vec![
+                CounterRuntimeSlot::Scalar(0),
+                CounterRuntimeSlot::Scalar(1),
+            ]
+            .into_boxed_slice(),
             counter_values: vec![5, 8].into_boxed_slice(),
+            call_target_counter_values: Vec::new().into_boxed_slice(),
             lowered_module: lowered,
             module_name: "counter_test".to_string(),
             package_name: "pkg".to_string(),

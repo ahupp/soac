@@ -131,13 +131,15 @@ pub use instrument::{
     CounterBuilder, CounterHandle, CounterSpec, InstrumentInstr, OptBlock, OptInstr,
 };
 pub use trace::{
+    instrument_bb_module_with_call_target_counters,
     instrument_bb_module_with_block_entry_counters, instrument_bb_module_with_global_load_counters,
     instrument_bb_module_with_refcount_counters,
 };
 
 pub(crate) use name_binding::lower_name_binding_in_core_blockpy_module;
 pub(crate) use trace::{
-    global_load_counter_instrumentation_enabled, instrument_bb_module_for_trace, parse_trace_env,
+    call_target_counter_instrumentation_enabled, global_load_counter_instrumentation_enabled,
+    instrument_bb_module_for_trace, parse_trace_env,
 };
 
 pub fn relabel_dense_bb_module(module: &mut BlockPyModule<CodegenBlockPyPass>) {

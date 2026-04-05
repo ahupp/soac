@@ -10,10 +10,10 @@ use crate::module_globals::ModuleGlobalCache;
 
 use std::sync::atomic::{AtomicPtr, Ordering};
 
-use soac_blockpy::block_py::FunctionId;
-
 use crate::module_constants::raise_name_error_for_missing_name;
+#[cfg(not(test))]
 use crate::tree_walk;
+#[cfg(not(test))]
 use super::vmctx::JitModuleVmCtx;
 
 #[cfg(not(test))]
@@ -118,40 +118,6 @@ unsafe extern "C" fn callee_function_id_hook(callable: ObjPtr) -> i64 {
 }
 
 #[cfg(not(test))]
-unsafe extern "C" fn lookup_direct_code_ptr_hook(vmctx: ObjPtr, function_id: i64) -> ObjPtr {
-    if vmctx.is_null() || function_id < 0 {
-        ffi::PyErr_SetString(
-            ffi::PyExc_RuntimeError,
-            b"invalid arguments to dp_jit_lookup_direct_code_ptr\0".as_ptr() as *const i8,
-        );
-        return ptr::null_mut();
-    }
-    let vmctx = &*(vmctx as *const JitModuleVmCtx);
-    let Some(shared_state) = vmctx.shared_module_state.as_ref() else {
-        ffi::PyErr_SetString(
-            ffi::PyExc_RuntimeError,
-            b"missing shared module state for direct JIT call\0".as_ptr() as *const i8,
-        );
-        return ptr::null_mut();
-    };
-    match shared_state.lookup_or_compile_direct_code_ptr(FunctionId::from_packed(function_id as u64))
-    {
-        Ok(code_ptr) => code_ptr,
-        Err(err) => {
-            if let Ok(message) = std::ffi::CString::new(err) {
-                ffi::PyErr_SetString(ffi::PyExc_RuntimeError, message.as_ptr());
-            } else {
-                ffi::PyErr_SetString(
-                    ffi::PyExc_RuntimeError,
-                    b"failed to resolve direct JIT code pointer\0".as_ptr() as *const i8,
-                );
-            }
-            ptr::null_mut()
-        }
-    }
-}
-
-#[cfg(not(test))]
 unsafe extern "C" fn py_call_with_kw_hook(
     callable: ObjPtr,
     args: ObjPtr,
@@ -162,6 +128,38 @@ unsafe extern "C" fn py_call_with_kw_hook(
         args as *mut ffi::PyObject,
         kwargs as *mut ffi::PyObject,
     ) as ObjPtr
+}
+
+#[cfg(not(test))]
+unsafe extern "C" fn record_counter_value_hook(vmctx: ObjPtr, counter_id: i64, value: i64) {
+    if vmctx.is_null() || counter_id < 0 || value < 0 {
+        ffi::PyErr_SetString(
+            ffi::PyExc_RuntimeError,
+            b"invalid arguments to dp_jit_record_counter_value\0".as_ptr() as *const i8,
+        );
+        return;
+    }
+    let vmctx = &*(vmctx as *const JitModuleVmCtx);
+    let Some(shared_state) = vmctx.shared_module_state.as_ref() else {
+        ffi::PyErr_SetString(
+            ffi::PyExc_RuntimeError,
+            b"missing shared module state for counter recording\0".as_ptr() as *const i8,
+        );
+        return;
+    };
+    if let Err(err) = shared_state.record_call_target_counter(
+        soac_blockpy::block_py::CounterId(counter_id as usize),
+        value as u64,
+    ) {
+        if let Ok(message) = std::ffi::CString::new(err) {
+            ffi::PyErr_SetString(ffi::PyExc_RuntimeError, message.as_ptr());
+        } else {
+            ffi::PyErr_SetString(
+                ffi::PyExc_RuntimeError,
+                b"failed to record counter value\0".as_ptr() as *const i8,
+            );
+        }
+    }
 }
 
 #[cfg(not(test))]
@@ -922,7 +920,7 @@ mod test_only_export_stubs {
     ));
     panic_obj_export!(dp_jit_py_call_with_kw(callable: ObjPtr, args: ObjPtr, kw: ObjPtr));
     panic_i64_export!(dp_jit_callee_function_id(callable: ObjPtr));
-    panic_obj_export!(dp_jit_lookup_direct_code_ptr(vmctx: ObjPtr, function_id: i64));
+    panic_unit_export!(dp_jit_record_counter_value(vmctx: ObjPtr, counter_id: i64, value: i64));
     panic_obj_export!(dp_jit_get_raised_exception());
     panic_obj_export!(dp_jit_get_arg_item(args: ObjPtr, index: i64));
     panic_obj_export!(dp_jit_load_runtime_obj(name: ObjPtr));
@@ -1018,8 +1016,8 @@ pub unsafe extern "C" fn dp_jit_callee_function_id(callable: ObjPtr) -> i64 {
 }
 
 #[cfg(not(test))]
-pub unsafe extern "C" fn dp_jit_lookup_direct_code_ptr(vmctx: ObjPtr, function_id: i64) -> ObjPtr {
-    lookup_direct_code_ptr_hook(vmctx, function_id)
+pub unsafe extern "C" fn dp_jit_record_counter_value(vmctx: ObjPtr, counter_id: i64, value: i64) {
+    record_counter_value_hook(vmctx, counter_id, value)
 }
 
 #[cfg(not(test))]
@@ -1438,8 +1436,8 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
         dp_jit_callee_function_id as *const u8,
     );
     builder.symbol(
-        "dp_jit_lookup_direct_code_ptr",
-        dp_jit_lookup_direct_code_ptr as *const u8,
+        "dp_jit_record_counter_value",
+        dp_jit_record_counter_value as *const u8,
     );
     builder.symbol(
         "dp_jit_raise_deleted_name_error",

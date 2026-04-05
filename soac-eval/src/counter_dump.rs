@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::mem::size_of;
 
 pub const COUNTER_DUMP_MAGIC: [u8; 8] = *b"SOACCNTR";
-pub const COUNTER_DUMP_VERSION: u16 = 4;
+pub const COUNTER_DUMP_VERSION: u16 = 5;
 pub const COUNTER_DUMP_NONE_U32: u32 = u32::MAX;
 pub const COUNTER_DUMP_NONE_U64: u64 = u64::MAX;
 
@@ -35,6 +35,8 @@ pub struct CounterDumpRecordHeader {
     pub function_qualname_offset: u32,
     pub block_label_offset: u32,
     pub value_offset: u32,
+    pub observed_value_offset: u32,
+    pub max_overcount_offset: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +51,8 @@ pub struct CounterDumpRow {
     pub function_qualname: Option<String>,
     pub block_label: Option<String>,
     pub value: u64,
+    pub observed_value: Option<u64>,
+    pub max_overcount: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +104,8 @@ impl CounterDumpRecord {
         let mut function_qualname = Vec::with_capacity(self.rows.len());
         let mut block_label = Vec::with_capacity(self.rows.len());
         let mut value = Vec::with_capacity(self.rows.len());
+        let mut observed_value = Vec::with_capacity(self.rows.len());
+        let mut max_overcount = Vec::with_capacity(self.rows.len());
 
         for row in &self.rows {
             counter_id.push(row.counter_id);
@@ -135,6 +141,8 @@ impl CounterDumpRecord {
                 None => COUNTER_DUMP_NONE_U32,
             });
             value.push(row.value);
+            observed_value.push(row.observed_value.unwrap_or(COUNTER_DUMP_NONE_U64));
+            max_overcount.push(row.max_overcount.unwrap_or(COUNTER_DUMP_NONE_U64));
         }
 
         let string_count = u32::try_from(strings.strings.len())
@@ -168,7 +176,9 @@ impl CounterDumpRecord {
         let block_label_offset =
             function_qualname_offset + function_qualname.len() * size_of::<u32>();
         let value_offset = align_up(block_label_offset + block_label.len() * size_of::<u32>(), 8);
-        let record_len = align_up(value_offset + value.len() * size_of::<u64>(), 8);
+        let observed_value_offset = value_offset + value.len() * size_of::<u64>();
+        let max_overcount_offset = observed_value_offset + observed_value.len() * size_of::<u64>();
+        let record_len = align_up(max_overcount_offset + max_overcount.len() * size_of::<u64>(), 8);
 
         let header = CounterDumpRecordHeader {
             magic: COUNTER_DUMP_MAGIC,
@@ -208,6 +218,10 @@ impl CounterDumpRecord {
             block_label_offset: u32::try_from(block_label_offset)
                 .map_err(|_| "counter dump offset exceeds u32 capacity".to_string())?,
             value_offset: u32::try_from(value_offset)
+                .map_err(|_| "counter dump offset exceeds u32 capacity".to_string())?,
+            observed_value_offset: u32::try_from(observed_value_offset)
+                .map_err(|_| "counter dump offset exceeds u32 capacity".to_string())?,
+            max_overcount_offset: u32::try_from(max_overcount_offset)
                 .map_err(|_| "counter dump offset exceeds u32 capacity".to_string())?,
         };
 
@@ -262,6 +276,16 @@ impl CounterDumpRecord {
             bytes_of_slice(block_label.as_slice()),
         )?;
         write_bytes(&mut bytes, value_offset, bytes_of_slice(value.as_slice()))?;
+        write_bytes(
+            &mut bytes,
+            observed_value_offset,
+            bytes_of_slice(observed_value.as_slice()),
+        )?;
+        write_bytes(
+            &mut bytes,
+            max_overcount_offset,
+            bytes_of_slice(max_overcount.as_slice()),
+        )?;
         Ok(bytes)
     }
 }
@@ -339,6 +363,8 @@ mod tests {
                     function_qualname: Some("f".to_string()),
                     block_label: Some("bb0".to_string()),
                     value: 11,
+                    observed_value: None,
+                    max_overcount: None,
                 },
                 CounterDumpRow {
                     counter_id: 4,
@@ -351,6 +377,8 @@ mod tests {
                     function_qualname: None,
                     block_label: None,
                     value: 19,
+                    observed_value: Some(42),
+                    max_overcount: Some(7),
                 },
             ],
         };
@@ -376,6 +404,8 @@ mod tests {
         let function_qualname_offset = read_u32(&bytes, 76) as usize;
         let block_label_offset = read_u32(&bytes, 80) as usize;
         let value_offset = read_u32(&bytes, 84) as usize;
+        let observed_value_offset = read_u32(&bytes, 88) as usize;
+        let max_overcount_offset = read_u32(&bytes, 92) as usize;
 
         assert_eq!(header_size, size_of::<CounterDumpRecordHeader>());
         assert_eq!(record_len, bytes.len());
@@ -392,6 +422,8 @@ mod tests {
         assert!(function_qualname_offset > instr_index_in_block_offset);
         assert!(block_label_offset > function_qualname_offset);
         assert!(value_offset > block_label_offset);
+        assert!(observed_value_offset > value_offset);
+        assert!(max_overcount_offset > observed_value_offset);
         assert_eq!(value_offset % 8, 0);
 
         let string_offsets_len = (string_count as usize + 1) * size_of::<u32>();
@@ -435,6 +467,10 @@ mod tests {
         assert_eq!(read_u32(&bytes, instr_index_in_block_offset + 4), 3);
         assert_eq!(read_u64(&bytes, value_offset), 11);
         assert_eq!(read_u64(&bytes, value_offset + 8), 19);
+        assert_eq!(read_u64(&bytes, observed_value_offset), COUNTER_DUMP_NONE_U64);
+        assert_eq!(read_u64(&bytes, observed_value_offset + 8), 42);
+        assert_eq!(read_u64(&bytes, max_overcount_offset), COUNTER_DUMP_NONE_U64);
+        assert_eq!(read_u64(&bytes, max_overcount_offset + 8), 7);
 
         let string_offsets_end = string_offsets_offset + string_offsets_len;
         assert!(string_bytes_offset + string_bytes_len <= counter_id_offset);

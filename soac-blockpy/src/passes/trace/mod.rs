@@ -1,7 +1,8 @@
 use crate::block_py::{
     core_call_expr_with_meta, literal_expr, BlockPyFunction, BlockPyModule, CallArgPositional,
-    CodegenBlockPyExpr, CoreStringLiteral, CounterScope, CounterSite, IncrementCounter, Load,
-    LocatedCoreBlockPyExpr, LocatedName, Meta, NameLocation, WithMeta,
+    ChildVisitable, CodegenBlockPyExpr, CoreStringLiteral, CounterScope, CounterSite, HasMeta,
+    IncrementCounter, Load, LocatedCoreBlockPyExpr, LocatedName, Meta, NameLocation, Visit,
+    WithMeta,
 };
 use crate::passes::{CodegenBlockPyPass, CounterBuilder};
 use std::collections::HashMap;
@@ -20,6 +21,15 @@ pub(crate) fn parse_trace_env() -> Option<TraceConfig> {
 
 pub(crate) fn global_load_counter_instrumentation_enabled() -> bool {
     env::var("DIET_PYTHON_GLOBAL_LOAD_COUNTERS")
+        .map(|raw| {
+            let trimmed = raw.trim();
+            !(trimmed.is_empty() || trimmed == "0")
+        })
+        .unwrap_or(false)
+}
+
+pub(crate) fn call_target_counter_instrumentation_enabled() -> bool {
+    env::var("DIET_PYTHON_CALL_TARGET_COUNTERS")
         .map(|raw| {
             let trimmed = raw.trim();
             !(trimmed.is_empty() || trimmed == "0")
@@ -172,6 +182,67 @@ pub fn instrument_bb_module_with_global_load_counters(
                 instr_id: None,
             },
         );
+    }
+}
+
+pub fn instrument_bb_module_with_call_target_counters(
+    module: &mut BlockPyModule<CodegenBlockPyPass>,
+) {
+    struct DirectCallCandidateCounterCollector<'a, 'b> {
+        function_id: crate::block_py::FunctionId,
+        counters: &'a mut CounterBuilder<'b>,
+    }
+
+    impl Visit<CodegenBlockPyExpr> for DirectCallCandidateCounterCollector<'_, '_> {
+        fn visit_instr(&mut self, expr: &CodegenBlockPyExpr) {
+            if let CodegenBlockPyExpr::Call(call) = expr {
+                let is_candidate = call.keywords.is_empty()
+                    && call
+                        .args
+                        .iter()
+                        .all(|arg| matches!(arg, CallArgPositional::Positional(_)));
+                if is_candidate {
+                    let instr_id = expr
+                        .meta()
+                        .instr_id
+                        .expect("call target counters require preassigned InstrId");
+                    self.counters.define_if_missing(
+                        CounterScope::This,
+                        "call_hot_targets",
+                        CounterSite::Runtime {
+                            function_id: Some(self.function_id),
+                            instr_id: Some(instr_id),
+                        },
+                    );
+                    self.counters.define_if_missing(
+                        CounterScope::This,
+                        "call_direct_hit",
+                        CounterSite::Runtime {
+                            function_id: Some(self.function_id),
+                            instr_id: Some(instr_id),
+                        },
+                    );
+                    self.counters.define_if_missing(
+                        CounterScope::This,
+                        "call_direct_fallback",
+                        CounterSite::Runtime {
+                            function_id: Some(self.function_id),
+                            instr_id: Some(instr_id),
+                        },
+                    );
+                }
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut counters = CounterBuilder::new(&mut module.counter_defs);
+    for function in &module.callable_defs {
+        let mut collector = DirectCallCandidateCounterCollector {
+            function_id: function.function_id,
+            counters: &mut counters,
+        };
+        collector.visit_fn(function);
     }
 }
 

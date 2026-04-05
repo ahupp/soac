@@ -34,6 +34,8 @@ pub struct CounterDumpRecordView<'a> {
     function_qualname: &'a [u32],
     block_label: &'a [u32],
     value: &'a [u64],
+    observed_value: &'a [u64],
+    max_overcount: &'a [u64],
 }
 
 pub struct CounterDumpRowView<'a> {
@@ -47,6 +49,8 @@ pub struct CounterDumpRowView<'a> {
     pub function_qualname: Option<&'a str>,
     pub block_label: Option<&'a str>,
     pub value: u64,
+    pub observed_value: Option<u64>,
+    pub max_overcount: Option<u64>,
 }
 
 impl CounterDumpFile {
@@ -110,6 +114,10 @@ impl<'a> CounterDumpRecordView<'a> {
             function_qualname: self.resolve_optional_string_id(self.function_qualname[index])?,
             block_label: self.resolve_optional_string_id(self.block_label[index])?,
             value: self.value[index],
+            observed_value: (self.observed_value[index] != COUNTER_DUMP_NONE_U64)
+                .then_some(self.observed_value[index]),
+            max_overcount: (self.max_overcount[index] != COUNTER_DUMP_NONE_U64)
+                .then_some(self.max_overcount[index]),
         })
     }
 
@@ -248,6 +256,12 @@ pub fn parse_counter_dump_records(bytes: &[u8]) -> Result<Vec<CounterDumpRecordV
         let value_offset = usize::try_from(header.value_offset).map_err(|_| {
             format!("counter dump value offset at byte offset {offset} is too large")
         })?;
+        let observed_value_offset = usize::try_from(header.observed_value_offset).map_err(|_| {
+            format!("counter dump observed_value offset at byte offset {offset} is too large")
+        })?;
+        let max_overcount_offset = usize::try_from(header.max_overcount_offset).map_err(|_| {
+            format!("counter dump max_overcount offset at byte offset {offset} is too large")
+        })?;
 
         if !is_nondecreasing(&[
             usize::from(header.header_size),
@@ -264,6 +278,8 @@ pub fn parse_counter_dump_records(bytes: &[u8]) -> Result<Vec<CounterDumpRecordV
             function_qualname_offset,
             block_label_offset,
             value_offset,
+            observed_value_offset,
+            max_overcount_offset,
             record_len,
         ]) {
             return Err(format!(
@@ -297,6 +313,10 @@ pub fn parse_counter_dump_records(bytes: &[u8]) -> Result<Vec<CounterDumpRecordV
         let block_label =
             unsafe { cast_slice::<u32>(record_bytes, block_label_offset, row_count) }?;
         let value = unsafe { cast_slice::<u64>(record_bytes, value_offset, row_count) }?;
+        let observed_value =
+            unsafe { cast_slice::<u64>(record_bytes, observed_value_offset, row_count) }?;
+        let max_overcount =
+            unsafe { cast_slice::<u64>(record_bytes, max_overcount_offset, row_count) }?;
 
         if string_offsets.first().copied().unwrap_or(0) != 0 {
             return Err(format!(
@@ -327,6 +347,8 @@ pub fn parse_counter_dump_records(bytes: &[u8]) -> Result<Vec<CounterDumpRecordV
             function_qualname,
             block_label,
             value,
+            observed_value,
+            max_overcount,
         });
         offset += record_len;
     }
@@ -410,6 +432,8 @@ mod test {
                 function_qualname: Some("f".to_string()),
                 block_label: Some("bb0".to_string()),
                 value: 5,
+                observed_value: None,
+                max_overcount: None,
             }],
         };
         let second = CounterDumpRecord {
@@ -426,6 +450,8 @@ mod test {
                 function_qualname: None,
                 block_label: None,
                 value: 11,
+                observed_value: Some(7),
+                max_overcount: Some(2),
             }],
         };
 

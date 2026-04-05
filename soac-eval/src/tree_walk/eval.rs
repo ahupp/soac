@@ -384,6 +384,7 @@ unsafe fn ensure_clif_vectorcall_compiled(
                 .counter_defs,
             &module_constant_ptrs,
             &counter_ptrs,
+            Some(data.module_runtime.shared_module_state_owner.as_ref()),
         ) {
             Ok(handle) => handle,
             Err(err) => {
