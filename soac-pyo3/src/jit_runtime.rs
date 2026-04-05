@@ -81,14 +81,15 @@ fn register_clif_vectorcall_raw(
     module_runtime: soac_jit::ModuleRuntimeContext,
 ) -> PyResult<()> {
     unsafe {
-        soac_jit::register_clif_vectorcall(func.as_ptr(), function_id, module_runtime)
-            .map_err(|_| {
+        soac_jit::register_clif_vectorcall(func.as_ptr(), function_id, module_runtime).map_err(
+            |_| {
                 if ffi::PyErr_Occurred().is_null() {
                     PyRuntimeError::new_err("failed to register CLIF vectorcall")
                 } else {
                     PyErr::fetch(py)
                 }
-            })
+            },
+        )
     }
 }
 
@@ -143,15 +144,13 @@ fn register_lazy_clif_vectorcall(
     module_runtime: &soac_jit::ModuleRuntimeContext,
 ) -> PyResult<()> {
     let owned_runtime =
-        unsafe { soac_jit::clone_module_runtime_context(module_runtime) }.map_err(
-            |_| {
-                if unsafe { ffi::PyErr_Occurred() }.is_null() {
-                    PyRuntimeError::new_err("failed to clone module runtime context")
-                } else {
-                    PyErr::fetch(py)
-                }
-            },
-        )?;
+        unsafe { soac_jit::clone_module_runtime_context(module_runtime) }.map_err(|_| {
+            if unsafe { ffi::PyErr_Occurred() }.is_null() {
+                PyRuntimeError::new_err("failed to clone module runtime context")
+            } else {
+                PyErr::fetch(py)
+            }
+        })?;
     match register_clif_vectorcall_raw(py, func, function_id, owned_runtime) {
         Ok(()) => maybe_eager_compile_clif_entry(py, func, module_runtime, function_id),
         Err(err) if err.is_instance_of::<PyNotImplementedError>(py) => Err(err),
@@ -697,18 +696,18 @@ fn exec_module(py: Python<'_>, module: Py<PyAny>) -> PyResult<()> {
         let dp = import_dp_module(py)?;
         let empty = PyTuple::empty(py);
         let none = py.None();
-        let mut module_runtime = unsafe {
-            soac_jit::build_module_runtime_context_for_module(module.as_ptr())
-        }
-        .map_err(|_| {
-            if unsafe { ffi::PyErr_Occurred() }.is_null() {
-                PyRuntimeError::new_err(
-                    "failed to build module runtime context for module execution",
-                )
-            } else {
-                PyErr::fetch(py)
-            }
-        })?;
+        let mut module_runtime =
+            unsafe { soac_jit::build_module_runtime_context_for_module(module.as_ptr()) }.map_err(
+                |_| {
+                    if unsafe { ffi::PyErr_Occurred() }.is_null() {
+                        PyRuntimeError::new_err(
+                            "failed to build module runtime context for module execution",
+                        )
+                    } else {
+                        PyErr::fetch(py)
+                    }
+                },
+            )?;
         let module_init = instantiate_bb_function(
             py,
             &dp,
@@ -727,6 +726,17 @@ fn exec_module(py: Python<'_>, module: Py<PyAny>) -> PyResult<()> {
             )
         };
         result?;
+        unsafe { soac_jit::register_function_owner_types_for_module(module.as_ptr()) }.map_err(
+            |_| {
+                if unsafe { ffi::PyErr_Occurred() }.is_null() {
+                    PyRuntimeError::new_err(
+                        "failed to register function owner types for type invalidation",
+                    )
+                } else {
+                    PyErr::fetch(py)
+                }
+            },
+        )?;
         Ok(())
     })
 }

@@ -3,7 +3,7 @@
 
 include!(concat!(env!("OUT_DIR"), "/soac_runtime_clif.rs"));
 
-#[cfg(test)]
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
 mod jit;
@@ -39,7 +39,28 @@ use std::time::Instant;
 
 unsafe extern "C" {
     fn PyFunction_SetVectorcall(func: *mut ffi::PyFunctionObject, vectorcall: ffi::vectorcallfunc);
+    fn PyFunction_AddWatcher(callback: PyFunctionWatchCallback) -> i32;
+    fn PyType_Modified(type_obj: *mut ffi::PyTypeObject);
+    fn PyWeakref_NewRef(
+        object: *mut ffi::PyObject,
+        callback: *mut ffi::PyObject,
+    ) -> *mut ffi::PyObject;
+    fn PyWeakref_GetRef(reference: *mut ffi::PyObject, object: *mut *mut ffi::PyObject) -> i32;
 }
+
+type PyFunctionWatchEvent = i32;
+type PyFunctionWatchCallback = unsafe extern "C" fn(
+    event: PyFunctionWatchEvent,
+    func: *mut ffi::PyFunctionObject,
+    new_value: *mut ffi::PyObject,
+) -> i32;
+
+const PY_FUNCTION_EVENT_CREATE: PyFunctionWatchEvent = 0;
+const PY_FUNCTION_EVENT_DESTROY: PyFunctionWatchEvent = 1;
+const PY_FUNCTION_EVENT_MODIFY_CODE: PyFunctionWatchEvent = 2;
+const PY_FUNCTION_EVENT_MODIFY_DEFAULTS: PyFunctionWatchEvent = 3;
+const PY_FUNCTION_EVENT_MODIFY_KWDEFAULTS: PyFunctionWatchEvent = 4;
+const PY_FUNCTION_EVENT_MODIFY_QUALNAME: PyFunctionWatchEvent = 5;
 
 fn panic_payload_to_string(payload: Box<dyn Any + Send>) -> String {
     if let Some(message) = payload.downcast_ref::<&'static str>() {
@@ -48,6 +69,104 @@ fn panic_payload_to_string(payload: Box<dyn Any + Send>) -> String {
         message.clone()
     } else {
         "unknown panic payload".to_string()
+    }
+}
+
+unsafe extern "C" fn function_owner_type_watcher_callback(
+    event: PyFunctionWatchEvent,
+    func: *mut ffi::PyFunctionObject,
+    _new_value: *mut ffi::PyObject,
+) -> i32 {
+    let Some(Ok(registry)) = FUNCTION_OWNER_TYPE_REGISTRY.get() else {
+        return 0;
+    };
+
+    match event {
+        PY_FUNCTION_EVENT_MODIFY_CODE
+        | PY_FUNCTION_EVENT_MODIFY_DEFAULTS
+        | PY_FUNCTION_EVENT_MODIFY_KWDEFAULTS
+        | PY_FUNCTION_EVENT_MODIFY_QUALNAME => {
+            let weakrefs = match registry.owner_type_weakrefs_by_function.lock() {
+                Ok(owner_types_by_function) => owner_types_by_function
+                    .get(&(func as usize))
+                    .cloned()
+                    .unwrap_or_default(),
+                Err(_) => {
+                    ffi::PyErr_SetString(
+                        ffi::PyExc_RuntimeError,
+                        c"function owner type registry lock poisoned".as_ptr(),
+                    );
+                    return -1;
+                }
+            };
+            let mut stale_weakrefs = Vec::new();
+            for weakref in weakrefs {
+                let mut owner_type = ptr::null_mut();
+                match PyWeakref_GetRef(weakref as *mut ffi::PyObject, &mut owner_type) {
+                    1 => {
+                        PyType_Modified(owner_type as *mut ffi::PyTypeObject);
+                        ffi::Py_DECREF(owner_type);
+                    }
+                    0 => stale_weakrefs.push(weakref),
+                    _ => return -1,
+                }
+            }
+            if !stale_weakrefs.is_empty() {
+                let _ = registry.owner_type_weakrefs_by_function.lock().map(
+                    |mut weakrefs_by_function| {
+                        if let Some(registered_weakrefs) =
+                            weakrefs_by_function.get_mut(&(func as usize))
+                        {
+                            registered_weakrefs.retain(|weakref| {
+                                let keep = !stale_weakrefs.contains(weakref);
+                                if !keep {
+                                    unsafe { ffi::Py_DECREF(*weakref as *mut ffi::PyObject) };
+                                }
+                                keep
+                            });
+                        }
+                    },
+                );
+            }
+        }
+        PY_FUNCTION_EVENT_DESTROY => {
+            let owner_types = match registry.owner_type_weakrefs_by_function.lock() {
+                Ok(mut owner_types_by_function) => owner_types_by_function
+                    .remove(&(func as usize))
+                    .unwrap_or_default(),
+                Err(_) => {
+                    ffi::PyErr_SetString(
+                        ffi::PyExc_RuntimeError,
+                        c"function owner type registry lock poisoned".as_ptr(),
+                    );
+                    return -1;
+                }
+            };
+            for owner_type in owner_types {
+                ffi::Py_DECREF(owner_type as *mut ffi::PyObject);
+            }
+        }
+        PY_FUNCTION_EVENT_CREATE => {}
+        _ => {}
+    }
+
+    0
+}
+
+fn function_owner_type_registry() -> Result<&'static FunctionOwnerTypeRegistry, ()> {
+    match FUNCTION_OWNER_TYPE_REGISTRY.get_or_init(|| unsafe {
+        let watcher_id = PyFunction_AddWatcher(function_owner_type_watcher_callback);
+        if watcher_id < 0 {
+            Err(())
+        } else {
+            Ok(FunctionOwnerTypeRegistry {
+                watcher_id,
+                owner_type_weakrefs_by_function: Mutex::new(HashMap::new()),
+            })
+        }
+    }) {
+        Ok(registry) => Ok(registry),
+        Err(()) => Err(()),
     }
 }
 
@@ -74,6 +193,27 @@ struct ClifFunctionData {
     compiled_vectorcall_handle: *mut c_void,
     compiled_vectorcall_entry: Option<jit::VectorcallEntryFn>,
 }
+
+struct FunctionOwnerTypeRegistry {
+    watcher_id: i32,
+    owner_type_weakrefs_by_function: Mutex<HashMap<usize, Vec<usize>>>,
+}
+
+impl Drop for FunctionOwnerTypeRegistry {
+    fn drop(&mut self) {
+        if let Ok(mut weakrefs_by_function) = self.owner_type_weakrefs_by_function.lock() {
+            for weakrefs in weakrefs_by_function.values_mut() {
+                for weakref in weakrefs.drain(..) {
+                    unsafe { ffi::Py_DECREF(weakref as *mut ffi::PyObject) };
+                }
+            }
+        }
+        let _ = self.watcher_id;
+    }
+}
+
+static FUNCTION_OWNER_TYPE_REGISTRY: OnceLock<Result<FunctionOwnerTypeRegistry, ()>> =
+    OnceLock::new();
 
 fn set_type_error<T>(msg: &str) -> Result<T, ()> {
     unsafe {
@@ -379,6 +519,140 @@ pub unsafe fn registered_clif_function_id(
     }
     let data = &*(ptr as *const ClifFunctionData);
     Ok(Some(data.function.function_id))
+}
+
+unsafe fn register_owner_type_for_function(
+    function: *mut ffi::PyObject,
+    owner_type: *mut ffi::PyTypeObject,
+) -> Result<(), ()> {
+    let registry = function_owner_type_registry()?;
+    let function_key = function as usize;
+    let mut owner_types_by_function =
+        registry
+            .owner_type_weakrefs_by_function
+            .lock()
+            .map_err(|_| {
+                ffi::PyErr_SetString(
+                    ffi::PyExc_RuntimeError,
+                    c"function owner type registry lock poisoned".as_ptr(),
+                );
+            })?;
+    let owner_types = owner_types_by_function.entry(function_key).or_default();
+    for weakref in owner_types.iter().copied() {
+        let mut existing_owner = ptr::null_mut();
+        match PyWeakref_GetRef(weakref as *mut ffi::PyObject, &mut existing_owner) {
+            1 => {
+                let matches = existing_owner == owner_type as *mut ffi::PyObject;
+                ffi::Py_DECREF(existing_owner);
+                if matches {
+                    return Ok(());
+                }
+            }
+            0 => {}
+            _ => return Err(()),
+        }
+    }
+    let owner_type_weakref = PyWeakref_NewRef(owner_type as *mut ffi::PyObject, ptr::null_mut());
+    if owner_type_weakref.is_null() {
+        return Err(());
+    }
+    owner_types.push(owner_type_weakref as usize);
+    Ok(())
+}
+
+unsafe fn type_is_defined_in_module(
+    owner_type: *mut ffi::PyTypeObject,
+    module_name: *mut ffi::PyObject,
+) -> bool {
+    let owner_module =
+        ffi::PyObject_GetAttrString(owner_type as *mut ffi::PyObject, c"__module__".as_ptr());
+    if owner_module.is_null() {
+        ffi::PyErr_Clear();
+        return false;
+    }
+    let matches = ffi::PyObject_RichCompareBool(owner_module, module_name, ffi::Py_EQ);
+    ffi::Py_DECREF(owner_module);
+    if matches < 0 {
+        ffi::PyErr_Clear();
+        return false;
+    }
+    matches != 0
+}
+
+unsafe fn register_owner_types_from_type(
+    owner_type: *mut ffi::PyTypeObject,
+    module_name: *mut ffi::PyObject,
+    visited_types: &mut HashSet<usize>,
+) -> Result<(), ()> {
+    if owner_type.is_null() || !visited_types.insert(owner_type as usize) {
+        return Ok(());
+    }
+    if !type_is_defined_in_module(owner_type, module_name) {
+        return Ok(());
+    }
+    let dict = (*owner_type).tp_dict;
+    if dict.is_null() {
+        return Ok(());
+    }
+    let mut pos: ffi::Py_ssize_t = 0;
+    let mut key = ptr::null_mut();
+    let mut value = ptr::null_mut();
+    while ffi::PyDict_Next(dict, &mut pos, &mut key, &mut value) != 0 {
+        if ffi::PyFunction_Check(value) != 0 {
+            register_owner_type_for_function(value, owner_type)?;
+        } else if ffi::PyType_Check(value) != 0 {
+            register_owner_types_from_type(
+                value as *mut ffi::PyTypeObject,
+                module_name,
+                visited_types,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub unsafe fn register_function_owner_types_for_module(
+    module: *mut ffi::PyObject,
+) -> Result<(), ()> {
+    if module.is_null() {
+        ffi::PyErr_SetString(
+            ffi::PyExc_RuntimeError,
+            c"register_function_owner_types_for_module requires a module".as_ptr(),
+        );
+        return Err(());
+    }
+    let globals = ffi::PyModule_GetDict(module);
+    if globals.is_null() {
+        if ffi::PyErr_Occurred().is_null() {
+            ffi::PyErr_SetString(
+                ffi::PyExc_RuntimeError,
+                c"module globals missing while registering owner types".as_ptr(),
+            );
+        }
+        return Err(());
+    }
+    let module_name = ffi::PyDict_GetItemString(globals, c"__name__".as_ptr());
+    if module_name.is_null() {
+        ffi::PyErr_SetString(
+            ffi::PyExc_RuntimeError,
+            c"module.__dict__ missing __name__ while registering owner types".as_ptr(),
+        );
+        return Err(());
+    }
+    let mut visited_types = HashSet::new();
+    let mut pos: ffi::Py_ssize_t = 0;
+    let mut key = ptr::null_mut();
+    let mut value = ptr::null_mut();
+    while ffi::PyDict_Next(globals, &mut pos, &mut key, &mut value) != 0 {
+        if ffi::PyType_Check(value) != 0 {
+            register_owner_types_from_type(
+                value as *mut ffi::PyTypeObject,
+                module_name,
+                &mut visited_types,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 unsafe fn ensure_clif_vectorcall_compiled(
@@ -914,4 +1188,113 @@ pub unsafe fn compile_clif_vectorcall(function: *mut ffi::PyObject) -> Result<()
     let py = Python::assume_attached();
     let data = clif_vectorcall_data(function)?;
     ensure_clif_vectorcall_compiled(py, function, data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pyo3::types::{PyDict, PyModule};
+
+    unsafe extern "C" {
+        fn PyUnstable_Type_AssignVersionTag(type_obj: *mut ffi::PyTypeObject) -> i32;
+    }
+
+    fn initialize_test_python() {
+        let python_home = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace crate should have a repo-root parent")
+            .join("vendor")
+            .join("cpython");
+        unsafe {
+            std::env::set_var("PYTHONHOME", &python_home);
+        }
+        let rel_build_dir = std::fs::read_to_string(python_home.join("pybuilddir.txt"))
+            .expect("vendored CPython pybuilddir.txt should exist");
+        let python_path = std::env::join_paths([
+            python_home.join("Lib"),
+            python_home.join(rel_build_dir.trim()),
+        ])
+        .expect("test PYTHONPATH should join");
+        unsafe {
+            std::env::set_var("PYTHONPATH", python_path);
+        }
+        Python::initialize();
+    }
+
+    #[test]
+    fn function_watcher_invalidates_owner_type_version() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        initialize_test_python();
+        Python::attach(|py| unsafe {
+            let module = PyModule::new(py, "watcher_test").expect("module should allocate");
+            let globals = module.dict();
+            let locals = PyDict::new(py);
+            let builtins = py.import("builtins").expect("builtins should import");
+            globals
+                .set_item("__builtins__", &builtins)
+                .expect("module globals should accept builtins");
+            locals
+                .set_item("__builtins__", &builtins)
+                .expect("locals should accept builtins");
+
+            let source =
+                std::ffi::CString::new("class C:\n    def f(self, x=1):\n        return x\n")
+                    .expect("python source should be CString-compatible");
+            assert!(
+                !ffi::PyRun_StringFlags(
+                    source.as_ptr(),
+                    ffi::Py_file_input,
+                    globals.as_ptr(),
+                    locals.as_ptr(),
+                    ptr::null_mut(),
+                )
+                .is_null(),
+                "class definition should execute"
+            );
+
+            let cls = locals
+                .get_item("C")
+                .expect("locals lookup should succeed")
+                .expect("class should exist");
+            globals
+                .set_item("C", &cls)
+                .expect("module globals should accept class");
+
+            register_function_owner_types_for_module(module.as_ptr())
+                .expect("owner type registration should succeed");
+
+            let owner_type = cls.as_ptr() as *mut ffi::PyTypeObject;
+            assert_eq!(
+                PyUnstable_Type_AssignVersionTag(owner_type),
+                1,
+                "class should receive a version tag"
+            );
+            let before = (*owner_type).tp_version_tag;
+            assert_ne!(before, 0, "type version tag should be assigned");
+
+            let func = ffi::PyObject_GetAttrString(cls.as_ptr(), c"f".as_ptr());
+            assert!(
+                !func.is_null(),
+                "class attribute lookup should resolve function"
+            );
+            let defaults = ffi::PyTuple_New(1);
+            assert!(!defaults.is_null(), "defaults tuple should allocate");
+            let default_value = ffi::PyLong_FromLongLong(2);
+            assert!(!default_value.is_null(), "default value should allocate");
+            assert_eq!(ffi::PyTuple_SetItem(defaults, 0, default_value), 0);
+            assert_eq!(
+                ffi::PyObject_SetAttrString(func, c"__defaults__".as_ptr(), defaults),
+                0,
+                "updating method defaults should succeed"
+            );
+            ffi::Py_DECREF(defaults);
+            ffi::Py_DECREF(func);
+
+            assert_ne!(
+                (*owner_type).tp_version_tag,
+                before,
+                "function mutation should invalidate the owner type version"
+            );
+        });
+    }
 }
