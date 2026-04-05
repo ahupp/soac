@@ -1280,3 +1280,159 @@ Challenging parts:
   - Those should keep using the ordinary path until they have their own explicit guard story.
 - The fallback must not duplicate receiver evaluation or alter exception behavior.
   - The direct branch and fallback branch need to preserve the same user-visible semantics around evaluation order.
+
+## Implement multi-type guarded direct method-call specialization
+
+Goal:
+- Specialize hot method call sites like `obj.m(args...)` without constructing `PyMethod`.
+- Allow multiple concrete receiver types to share the same fast path when they all resolve to the same default function descriptor and underlying `FunctionId`.
+- Keep the runtime guard cheap: exact receiver type pointer plus type version.
+
+1. Add an explicit replay-time specialization record for direct method calls.
+   - Keep the profile payload keyed by call site:
+     - `(caller FunctionId, InstrId) -> hot callee FunctionId`
+   - Add a replay-only structure that carries the guard candidates:
+
+   ```rust
+   struct DirectMethodSpecialization {
+       method_name: String,
+       target_function_id: FunctionId,
+       guard_types: Vec<GuardedReceiverType>,
+   }
+
+   struct GuardedReceiverType {
+       type_ptr: *mut ffi::PyTypeObject,
+       expected_version: u32,
+   }
+   ```
+
+   - `guard_types` is allowed to have more than one entry so inherited receiver types can share the same target body.
+
+2. Keep the profile counter on plain `FunctionId`, not `TypeId`.
+   - At instrumentation time, continue to observe only the resolved callee `FunctionId`.
+   - Do not bake receiver type into the counter yet.
+   - Reason:
+     - multiple receiver types may legitimately share one default method body
+     - the site replay pass can reconstruct the valid receiver-type set later
+
+3. Restrict the replay matcher to one very specific IR shape first.
+   - Only specialize a call site if it still looks like:
+
+   ```text
+   Call(GetAttr(receiver, "literal_method_name"), positional_args_only, no_keywords)
+   ```
+
+   - Reject:
+     - starred args
+     - keyword args
+     - dynamic attribute names
+     - `classmethod`
+     - custom descriptors
+   - This keeps the first slice semantically narrow and easier to validate.
+
+4. Add a runtime/type registry query for "which receiver types still default-bind to this function for this method name?"
+   - Given:
+     - `method_name`
+     - `FunctionId`
+   - produce a small set of concrete receiver types whose current class-dict / inheritance lookup still resolves that method name to the default Python function descriptor for that same `FunctionId`.
+   - Sketch:
+
+   ```rust
+   fn current_guarded_receiver_types_for_method(
+       method_name: &str,
+       target: FunctionId,
+   ) -> Vec<GuardedReceiverType>
+   ```
+
+   - This should use the existing owner-type registration and type-version invalidation machinery, not rediscover identity from scratch.
+
+5. Build the replay pass that upgrades a hot call site into a direct-method specialization.
+   - Input:
+     - original call site IR
+     - hot `FunctionId` from counters
+     - current guarded receiver-type set
+   - Output:
+     - either a `DirectMethodSpecialization`
+     - or no specialization if the site is not still eligible
+   - Sketch:
+
+   ```rust
+   match instr {
+       Call(GetAttr(receiver, "copy"), args, []) => {
+           let hot = profile.hot_target(site)?;
+           let guards = current_guarded_receiver_types_for_method("copy", hot);
+           if !guards.is_empty() {
+               Some(DirectMethodSpecialization { ... })
+           } else {
+               None
+           }
+       }
+       _ => None,
+   }
+   ```
+
+6. Add an explicit guard helper op for codegen.
+   - Instead of re-running descriptor logic on the fast path, add a small helper that checks:
+     - `Py_TYPE(receiver) == expected_type_ptr`
+     - `Py_TYPE(receiver)->tp_version_tag == expected_version`
+   - Sketch:
+
+   ```rust
+   GuardTypeVersion(receiver, expected_type_ptr, expected_version) -> bool
+   ```
+
+   - This should be JIT-only and cheap.
+
+7. Lower the specialized call site into a CFG fragment with one shared fast block.
+   - Evaluate the original receiver and arguments exactly once.
+   - Emit a guard chain:
+
+   ```text
+   if guard(receiver, T0, V0): goto fast
+   if guard(receiver, T1, V1): goto fast
+   if guard(receiver, T2, V2): goto fast
+   goto slow
+   ```
+
+   - In `fast`:
+     - prepend `receiver` to the explicit args
+     - emit `CallDirect(target_function_id, [receiver, ...args])`
+   - In `slow`:
+     - emit the original generic `Call(GetAttr(...), ...)`
+   - Both branches rejoin at one continuation block.
+
+8. Validate the fast-path shape before lowering.
+   - Extend `validate` so this specialization is only legal when:
+     - the direct target arity equals `1 + explicit_arg_count`
+     - the target function is compatible with direct call lowering
+     - the original call result shape matches `CallDirect`
+     - the guard candidate set is non-empty
+
+9. Add observability counters for the guard chain.
+   - At the specialized site, collect:
+     - `direct_method_hit`
+     - `direct_method_guard_miss`
+     - `direct_method_fallback`
+   - This should answer:
+     - did we hit the method fast path?
+     - did version/type checks fail?
+     - is remaining vectorcall cost coming from other sites?
+
+10. Land the first production slice on the motivating hot site.
+   - Use the current pystone-shaped `PtrGlb.copy()` / `Record.copy` case as the target.
+   - Success criteria:
+     - the call site specializes
+     - the specialized site shows fast-path hits
+     - perf shows that site no longer contributes to `bind_direct_args_from_vectorcall`
+
+11. Only after the single-site path is stable, widen the receiver-type set logic.
+   - First support:
+     - exact owner type only
+   - Then widen to:
+     - inherited receiver types that still resolve to the same default descriptor
+   - This keeps the initial implementation easy to debug.
+
+Challenging parts:
+- The replay query that maps `(method_name, FunctionId)` to current valid receiver types is the most semantically delicate part.
+- The slow path must preserve evaluation order and exception behavior exactly.
+- The multi-type guard chain should stay small; if a site accumulates too many receiver types, it should fall back instead of emitting a huge branch ladder.
