@@ -135,6 +135,8 @@
     - add typed handling for integer-valued ops needed by JIT lowering;
     - convert `CalleeFunctionId` to that path;
     - remove the remaining `PyLong` conversion on the `br_table`/dispatch path for this case.
+  - Add a validation/typecheck pass on `Instr` values, run from `validate`, that verifies argument-shape sanity for typed ops.
+  - The first required check there is `CallDirect`: validate that its argument/result shape matches the plain `Call` shape it is specializing, so bad direct-call rewrites fail explicitly instead of relying on lowering-time assumptions.
   - Once closure generator factories construct `_DpClosureGenerator` / `_DpClosureAsyncGenerator` directly, they should stop rebuilding `.__code__.replace(...)` on every factory call.
   - The follow-up is to materialize those code objects once during module init and reference them as module constants from the generated factory blocks.
 
@@ -1014,3 +1016,267 @@ After that is stable:
 - add `BeforeStmt(i)` and `BeforeTerm`
 - add named policy helpers that can target whole function families
 - consider whether trace instrumentation and counter instrumentation should share a generic “late BB instrumentation” framework
+
+## Move to a whole-program JITModule for shared direct calls and inlining
+
+- Planning note:
+  - Goal: replace the current "fresh `JITModule` per compiled runner" model with a long-lived module that owns all JIT-visible functions for a transformed Python module, so callers can refer to callees by normal CLIF function references instead of embedding opaque code pointers.
+  - The migration should preserve CPython-visible behavior first. The first success condition is stable direct calls across compiled SOAC functions; inlining should come only after symbol ownership, invalidation, and recursion behavior are explicit.
+  - Keep one owner for compiled code. The natural owner is `SharedModuleState`, not a process-global singleton.
+
+1. Introduce an explicit per-module JIT code registry in `SharedModuleState`.
+   - Add one long-lived JIT owner that holds:
+     - the `JITModule`
+     - the common ISA/settings/context objects needed to declare and define functions
+     - a registry keyed by packed `FunctionId`
+   - Split function state into:
+     - declared but not compiled
+     - compiling
+     - compiled/current generation
+   - Sketch:
+
+   ```rust
+   struct SharedJitModule {
+       module: JITModule,
+       functions: HashMap<FunctionId, CompiledFunctionState>,
+   }
+
+   enum CompiledFunctionState {
+       Declared { func_id: cranelift_module::FuncId },
+       Compiling { func_id: cranelift_module::FuncId },
+       Ready {
+           func_id: cranelift_module::FuncId,
+           entry_ptr: *const u8,
+           generation: u32,
+       },
+   }
+   ```
+
+   - This step should not change call lowering yet; it just moves ownership of code and symbols into one place.
+
+2. Separate symbol declaration from function body compilation.
+   - Today declaration and compilation are effectively tied together inside the per-runner compile path.
+   - Add an early declaration pass over transformed functions that assigns a stable CLIF `FuncId` for each `FunctionId` before any bodies are compiled.
+   - This is what makes recursive and mutually recursive direct calls possible without raw-pointer patching.
+   - The first invariant should be: if a SOAC function has a `FunctionId`, it has exactly one declared CLIF symbol in the owning module.
+
+3. Change direct-call lowering from immediate code pointers to module-local `FuncRef`s.
+   - Replace the current "embed pointer and `call_indirect`" path with:
+     - look up the callee's declared `FuncId`
+     - import it into the caller function with `declare_func_in_func`
+     - emit a normal CLIF `call`
+   - Sketch:
+
+   ```rust
+   let callee_func_id = shared_jit.lookup_declared_func_id(target_function_id)?;
+   let callee_ref = jit_module.declare_func_in_func(callee_func_id, fb.func);
+   let call = fb.ins().call(callee_ref, &args);
+   ```
+
+   - Keep the existing generic `Call(...)` fallback until the direct path is proven correct.
+
+4. Make compilation demand-driven but module-stable.
+   - Keep lazy compilation, but change the cache contract:
+     - declaration can happen eagerly for all functions in a module
+     - body compilation happens on first need
+     - once compiled, the symbol remains owned by the module registry
+   - If caller `A` needs callee `B`, compiling `A` may force compilation of `B`, but it should never need to invent a new symbol identity for `B`.
+   - Recursive cycles should compile against already-declared symbols, not fall back solely because the target is "not yet compiled."
+
+5. Add explicit generation/versioning for invalidation and recompilation.
+   - A long-lived module needs a rule for "what happens when specialized code changes."
+   - Add a generation number per compiled function and a policy for replacing stale bodies.
+   - The safe initial policy is:
+     - compile once per transformed module lifetime
+     - no in-place body replacement yet
+     - on invalidation, mark old code stale and compile a new generation under a fresh symbol if needed
+   - Only after this is stable should we try to let already-compiled callers point at newer callees automatically.
+
+6. Move specialization dependency tracking into the module registry.
+   - The current `CallDirect` path already needs to know when a direct target is unavailable or in progress.
+   - In the shared-module design, keep a dependency graph:
+     - caller `FunctionId`
+     - callee `FunctionId`
+     - whether the direct edge was emitted, deferred, or forced to generic fallback
+   - This enables a fixed-point recompilation loop later without inventing a second cache system beside the shared module.
+   - First slice:
+     - record unresolved direct edges
+     - expose them for debugging
+     - do not automatically recompile callers yet
+
+7. Add a validation pass for cross-function call compatibility.
+   - Before allowing arbitrary direct calls, validate that caller and callee agree on the lowered calling convention and argument/result shape.
+   - This should live beside the new `Instr`/`validate` checks for `CallDirect`, so bad direct-call rewrites fail before CLIF lowering.
+   - The first required checks are:
+     - positional-arg arity matches
+     - keyword handling is unsupported or explicitly rejected
+     - return value shape matches the generic `Call` contract at that site
+
+8. Add focused observability before turning on inlining.
+   - Keep counters/debug state for:
+     - direct-call hits vs generic fallback
+     - direct edges blocked by missing compile state
+     - direct edges blocked by signature mismatch
+     - recursive SCCs that compile with unresolved edges
+   - This should be readable from the existing binary counter dump or a sibling JIT-state debug dump.
+   - The point is to explain performance and correctness before adding another optimization layer.
+
+9. Once stable direct calls work, add a small explicit inliner over the shared call graph.
+   - Do not start with arbitrary inlining.
+   - First slice:
+     - leaf functions only
+     - small body size threshold
+     - no exception edges / no unsupported control-flow shapes
+   - Use the shared registry and declared call graph to decide eligibility.
+   - Keep inlining as a separate pass over generated BlockPy or lowered CLIF IR; do not hide it inside the runtime cache.
+
+10. Stage rollout behind flags and keep the old path until parity is proven.
+   - Suggested sequence:
+     1. shared declaration registry only
+     2. direct CLIF calls for `CallDirect`
+     3. lazy body compilation against shared symbols
+     4. dependency tracking for unresolved direct edges
+     5. optional fixed-point recompilation
+     6. optional inlining
+   - Each stage should have a flag so regressions can be isolated quickly.
+
+Suggested first implementation slice:
+- Build `SharedJitModule` under `SharedModuleState`.
+- Eagerly declare every transformed function's CLIF symbol by `FunctionId`.
+- Teach `CallDirect` lowering to use declared `FuncId` + CLIF `call`.
+- Leave generic `Call(...)` and the current specialization policy unchanged.
+- Add one recursive-call test and one mutually-recursive-call test proving the direct path no longer needs raw code-pointer embedding.
+
+Challenging parts:
+- Invalidation/redefinition is the biggest architectural risk.
+  - A shared module makes symbol lifetime easy, but replacing code safely is much harder than in the current per-runner model.
+- Recursive compilation needs careful lock/state design.
+  - Declaration must be separate from body compilation, or recursive direct calls will deadlock or force spurious fallback.
+- Inlining wants a stable call graph and explicit safety checks.
+  - It should come only after direct-call correctness, signature validation, and observability are already in place.
+
+## Direct instance-method calls from stable type version
+
+- Planning note:
+  - Goal: add a direct-call fast path for common user-defined instance methods without constructing a `PyMethod` object.
+  - Assumption for this slice: instance-dict shadowing is handled separately, so this plan only covers the type/descriptor side of the guard.
+  - The key invariant is:
+    - if, at specialization time, receiver type version `V` resolves attribute `name` to descriptor object `D`,
+    - and the runtime receiver still has type version `V`,
+    - then the descriptor for `name` is still `D`.
+  - Under that invariant, the runtime fast path does not need to re-read the descriptor object or call `__get__` on every call.
+
+1. Introduce a distinct "direct bound method call" specialization shape.
+   - Keep this separate from the current resolved-callable `CallDirect` path.
+   - It should represent:
+     - receiver expression
+     - method name / cache key
+     - expected receiver type version
+     - target `FunctionId`
+   - Sketch:
+
+   ```rust
+   DirectMethodCall {
+       receiver: I,
+       method_name: ModuleConstantId,
+       expected_type_version: u32,
+       function_id: FunctionId,
+       args: Vec<CallArgPositional<I>>,
+   }
+   ```
+
+   - Lowering semantics:
+     - if the receiver type/version guard passes, call the target directly with `receiver` prepended as arg 0
+     - otherwise fall back to normal attribute lookup plus generic call
+
+2. Build the optimization only for the plain Python-function descriptor case.
+   - Do not start with `classmethod`, `staticmethod`, or arbitrary descriptors.
+   - Specialize only when the resolved descriptor is:
+     - exact `PyFunction_Type`
+     - registered as a SOAC function with the expected `FunctionId`
+   - This matches the common case of user-defined instance methods.
+
+3. Capture the type-version guard at profiling/specialization time.
+   - When a hot call site is identified as a bound-method candidate, record:
+     - receiver type object
+     - receiver type version token
+     - method name
+     - target `FunctionId`
+   - The optimized site should key off the receiver type version, not off re-running descriptor resolution on every call.
+
+4. Add a runtime helper that returns the receiver type-version token.
+   - This should be a cheap integer-valued helper used only on the fast path guard.
+   - Sketch:
+
+   ```rust
+   receiver_type_version(receiver: PyObject) -> u32
+   ```
+
+   - The version contract must explicitly cover:
+     - type dict replacement for the method name
+     - slot changes affecting attribute lookup
+     - MRO-relevant invalidations for that type
+
+5. Lower the fast path without constructing `PyMethod`.
+   - The direct branch should:
+     - evaluate the receiver once
+     - guard on receiver type version
+     - prepend receiver to the arg list
+     - direct-call the compiled target function
+   - Sketch:
+
+   ```text
+   receiver = ...
+   version = ReceiverTypeVersion(receiver)
+   if version == expected_version:
+       result = CallDirect(function_id, [receiver, arg1, arg2, ...])
+   else:
+       result = Call(LoadAttr(receiver, "method"), [arg1, arg2, ...])
+   ```
+
+   - This avoids both:
+     - `PyMethod_New`
+     - `__func__` probing on the fast path
+
+6. Make the fallback preserve ordinary descriptor semantics.
+   - The fallback must still perform:
+     - normal attribute lookup
+     - descriptor binding
+     - ordinary generic call semantics
+   - This ensures that if the type-version guard fails, user-visible behavior stays identical to CPython.
+
+7. Add validation for receiver/target shape.
+   - Before lowering `DirectMethodCall`, validate:
+     - target callee arity matches `1 + explicit_args`
+     - target is a plain function-style direct-call target
+     - result shape matches the generic call site
+   - This should live with the `Instr` validation work for `CallDirect`.
+
+8. Add focused observability.
+   - Track counters for:
+     - direct bound-method fast-path hits
+     - type-version guard misses
+     - fallback executions
+   - This should let us confirm whether the remaining `bind_direct_args_from_vectorcall` time is actually removed by this path.
+
+9. Start with a single concrete pystone-shaped site.
+   - The motivating site is the hot bound-method call like `PtrGlb.copy()` in `Proc1`.
+   - Use that as the first end-to-end target:
+     - collect profile data
+     - specialize to `DirectMethodCall`
+     - confirm perf no longer shows that site going through the vectorcall binder
+
+Suggested first implementation slice:
+- Add a new `DirectMethodCall` IR node or equivalent specialization record.
+- Add a runtime helper for receiver type version.
+- Specialize only exact plain Python function descriptors.
+- Lower the fast path to `CallDirect(function_id, receiver + args)` with a version guard.
+- Add one focused integration test for a hot bound instance method and one pystone regression/perf check.
+
+Challenging parts:
+- The type-version contract must be explicit and trusted.
+  - If version invalidation misses any descriptor-affecting mutation, the fast path becomes unsound.
+- This slice intentionally excludes `classmethod` and custom descriptors.
+  - Those should keep using the ordinary path until they have their own explicit guard story.
+- The fallback must not duplicate receiver evaluation or alter exception behavior.
+  - The direct branch and fallback branch need to preserve the same user-visible semantics around evaluation order.
