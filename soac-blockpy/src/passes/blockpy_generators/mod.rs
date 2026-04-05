@@ -8,7 +8,7 @@ use crate::block_py::{
     core_runtime_positional_call_expr_with_meta, literal_expr, BindingKind, Block, BlockArg,
     BlockBuilder, BlockEdge, BlockLabel, BlockParam, BlockParamRole, BlockPyFunction,
     BlockPyModule, BlockPyNameLike, BlockTerm, CallArgKeyword, CallArgPositional,
-    CallableScopeInfo, CellBindingKind, CellRefForName, ClosureInit, ClosureSlot, CoreBlockPyExpr,
+    CallableScopeInfo, CellBindingKind, CellRefForName, ClosureInit, ClosureSlot, InstrLow,
     InstrWithYield, CoreNumberLiteral, CoreNumberLiteralValue, CoreStringLiteral,
     FunctionId, FunctionKind, FunctionName, FunctionNameGen, GetAttr, ImplicitNoneExpr, Instr,
     Load, MakeFunction, Mappable, ModuleNameGen, ScopeExprNode, StorageLayout, Store,
@@ -56,9 +56,9 @@ const ASYNC_GENERATOR_RESUME_ABI_PARAMS: [ResumeAbiParam; 4] = [
 ];
 
 type LinearYieldStmt = InstrWithYield;
-type LinearCoreStmt = CoreBlockPyExpr;
+type LinearCoreStmt = InstrLow;
 type LinearYieldBlock = Block<LinearYieldStmt, InstrWithYield>;
-type LinearCoreBlock = Block<LinearCoreStmt, CoreBlockPyExpr>;
+type LinearCoreBlock = Block<LinearCoreStmt, InstrLow>;
 type BlockPyBlock = LinearCoreBlock;
 
 struct ErrOnYield;
@@ -66,9 +66,9 @@ struct ErrOnYield;
 fn try_lower_core_expr_without_yield_with_mapper<M>(
     expr: InstrWithYield,
     map: &mut M,
-) -> Result<CoreBlockPyExpr, InstrWithYield>
+) -> Result<InstrLow, InstrWithYield>
 where
-    M: TryMapInstr<InstrWithYield, CoreBlockPyExpr, InstrWithYield>,
+    M: TryMapInstr<InstrWithYield, InstrLow, InstrWithYield>,
 {
     match_default!(expr: crate::passes::InstrWithYield {
         InstrWithYield::Yield(node) => Err(node.into()),
@@ -77,13 +77,13 @@ where
     })
 }
 
-impl TryMapInstr<InstrWithYield, CoreBlockPyExpr, InstrWithYield>
+impl TryMapInstr<InstrWithYield, InstrLow, InstrWithYield>
     for ErrOnYield
 {
     fn try_map_instr(
         &mut self,
         expr: InstrWithYield,
-    ) -> Result<CoreBlockPyExpr, InstrWithYield> {
+    ) -> Result<InstrLow, InstrWithYield> {
         try_lower_core_expr_without_yield_with_mapper(expr, self)
     }
 
@@ -191,7 +191,7 @@ fn unresolved_name(id: &str) -> UnresolvedName {
     ast::name::Name::new(id).into()
 }
 
-fn core_name(name: &str) -> CoreBlockPyExpr {
+fn core_name(name: &str) -> InstrLow {
     unresolved_load_expr(unresolved_name(name))
 }
 
@@ -300,7 +300,7 @@ where
     expr.visit_children(&mut NamedExprTargetVisitor { names });
 }
 
-fn core_literal_int(value: usize) -> CoreBlockPyExpr {
+fn core_literal_int(value: usize) -> InstrLow {
     let text = value.to_string();
     literal_expr(
         CoreNumberLiteral {
@@ -313,11 +313,11 @@ fn core_literal_int(value: usize) -> CoreBlockPyExpr {
     )
 }
 
-fn core_none() -> CoreBlockPyExpr {
-    CoreBlockPyExpr::implicit_none_expr()
+fn core_none() -> InstrLow {
+    InstrLow::implicit_none_expr()
 }
 
-fn core_string_literal(value: &str) -> CoreBlockPyExpr {
+fn core_string_literal(value: &str) -> InstrLow {
     literal_expr(
         CoreStringLiteral {
             value: value.to_string(),
@@ -326,7 +326,7 @@ fn core_string_literal(value: &str) -> CoreBlockPyExpr {
     )
 }
 
-fn core_call(func_name: &str, args: Vec<CoreBlockPyExpr>) -> CoreBlockPyExpr {
+fn core_call(func_name: &str, args: Vec<InstrLow>) -> InstrLow {
     core_runtime_positional_call_expr_with_meta(
         func_name,
         ast::AtomicNodeIndex::default(),
@@ -336,10 +336,10 @@ fn core_call(func_name: &str, args: Vec<CoreBlockPyExpr>) -> CoreBlockPyExpr {
 }
 
 fn core_call_expr(
-    func: CoreBlockPyExpr,
-    args: Vec<CoreBlockPyExpr>,
-    keywords: Vec<(&str, CoreBlockPyExpr)>,
-) -> CoreBlockPyExpr {
+    func: InstrLow,
+    args: Vec<InstrLow>,
+    keywords: Vec<(&str, InstrLow)>,
+) -> InstrLow {
     core_call_expr_with_meta(
         func,
         ast::AtomicNodeIndex::default(),
@@ -357,19 +357,19 @@ fn core_call_expr(
     )
 }
 
-fn core_runtime_attr(attr: &str) -> CoreBlockPyExpr {
+fn core_runtime_attr(attr: &str) -> InstrLow {
     core_runtime_name_expr_with_meta(attr, ast::AtomicNodeIndex::default(), Default::default())
 }
 
-fn core_get_attr(value: CoreBlockPyExpr, attr: &str) -> CoreBlockPyExpr {
+fn core_get_attr(value: InstrLow, attr: &str) -> InstrLow {
     GetAttr::new(Box::new(value), Box::new(core_string_literal(attr))).into()
 }
 
-fn core_cell_ref(logical_name: &str) -> CoreBlockPyExpr {
+fn core_cell_ref(logical_name: &str) -> InstrLow {
     CellRefForName::new(logical_name.to_string()).into()
 }
 
-fn core_generator_code(async_gen: bool, name: &str, qualname: &str) -> CoreBlockPyExpr {
+fn core_generator_code(async_gen: bool, name: &str, qualname: &str) -> InstrLow {
     let template_attr = if async_gen {
         "code_template_async_gen"
     } else {
@@ -392,9 +392,9 @@ fn core_generator_code(async_gen: bool, name: &str, qualname: &str) -> CoreBlock
 fn core_make_function(
     function_id: FunctionId,
     kind: FunctionKind,
-    param_defaults: CoreBlockPyExpr,
-    annotate_fn: CoreBlockPyExpr,
-) -> CoreBlockPyExpr {
+    param_defaults: InstrLow,
+    annotate_fn: InstrLow,
+) -> InstrLow {
     MakeFunction::new(
         function_id,
         kind,
@@ -731,7 +731,7 @@ fn lower_stmt_no_yield(stmt: LinearYieldStmt) -> LinearCoreStmt {
         })
 }
 
-fn lower_term_no_yield(term: BlockTerm<InstrWithYield>) -> BlockTerm<CoreBlockPyExpr> {
+fn lower_term_no_yield(term: BlockTerm<InstrWithYield>) -> BlockTerm<InstrLow> {
     let mut mapper = ErrOnYield;
     mapper.try_map_term(term.clone()).unwrap_or_else(|_| {
         panic!(
@@ -740,7 +740,7 @@ fn lower_term_no_yield(term: BlockTerm<InstrWithYield>) -> BlockTerm<CoreBlockPy
     })
 }
 
-fn yield_value_expr(value: Option<InstrWithYield>) -> CoreBlockPyExpr {
+fn yield_value_expr(value: Option<InstrWithYield>) -> InstrLow {
     value
         .map(|value| {
             ErrOnYield
@@ -752,8 +752,8 @@ fn yield_value_expr(value: Option<InstrWithYield>) -> CoreBlockPyExpr {
 
 fn completion_raise(
     kind: FunctionKind,
-    value: Option<CoreBlockPyExpr>,
-) -> BlockTerm<CoreBlockPyExpr> {
+    value: Option<InstrLow>,
+) -> BlockTerm<InstrLow> {
     match kind {
         FunctionKind::Generator | FunctionKind::Coroutine => {
             let exc = if let Some(value) = value {
@@ -774,7 +774,7 @@ fn push_completion_raise_block(
     state: &mut ResumeLoweringState,
     label: BlockLabel,
     body: Vec<LinearCoreStmt>,
-    value: Option<CoreBlockPyExpr>,
+    value: Option<InstrLow>,
     params: Vec<BlockParam>,
     exc_target: Option<BlockLabel>,
 ) {
@@ -808,7 +808,7 @@ fn explicit_jump_args_for_params(params: &[BlockParam]) -> Vec<BlockArg> {
         .collect()
 }
 
-fn is_resume_exc_test() -> CoreBlockPyExpr {
+fn is_resume_exc_test() -> InstrLow {
     crate::block_py::operation::UnaryOp::new(
         crate::block_py::operation::UnaryOpKind::Not,
         Box::new(
@@ -827,7 +827,7 @@ fn is_resume_exc_test() -> CoreBlockPyExpr {
     .into()
 }
 
-fn is_send_none_test() -> CoreBlockPyExpr {
+fn is_send_none_test() -> InstrLow {
     crate::block_py::operation::BinOp::new(
         crate::block_py::operation::BinOpKind::Is,
         Box::new(core_name("_dp_send_value")),
@@ -836,7 +836,7 @@ fn is_send_none_test() -> CoreBlockPyExpr {
     .into()
 }
 
-fn is_name_none_test(name: &str) -> CoreBlockPyExpr {
+fn is_name_none_test(name: &str) -> InstrLow {
     crate::block_py::operation::BinOp::new(
         crate::block_py::operation::BinOpKind::Is,
         Box::new(core_name(name)),
@@ -845,11 +845,11 @@ fn is_name_none_test(name: &str) -> CoreBlockPyExpr {
     .into()
 }
 
-fn is_name_not_none_test(name: &str) -> CoreBlockPyExpr {
+fn is_name_not_none_test(name: &str) -> InstrLow {
     UnaryOp::new(UnaryOpKind::Not, Box::new(is_name_none_test(name))).into()
 }
 
-fn is_resume_generator_exit_test() -> CoreBlockPyExpr {
+fn is_resume_generator_exit_test() -> InstrLow {
     core_call(
         "isinstance",
         vec![
@@ -859,13 +859,13 @@ fn is_resume_generator_exit_test() -> CoreBlockPyExpr {
     )
 }
 
-fn resume_exc_raise_term() -> BlockTerm<CoreBlockPyExpr> {
+fn resume_exc_raise_term() -> BlockTerm<InstrLow> {
     BlockTerm::Raise(TermRaise {
         exc: Some(core_name("_dp_resume_exc")),
     })
 }
 
-fn stop_iteration_match_test(exc_name: &str) -> CoreBlockPyExpr {
+fn stop_iteration_match_test(exc_name: &str) -> InstrLow {
     core_call_expr(
         core_runtime_attr("exception_matches"),
         vec![core_name(exc_name), core_runtime_attr("StopIteration")],
@@ -873,15 +873,15 @@ fn stop_iteration_match_test(exc_name: &str) -> CoreBlockPyExpr {
     )
 }
 
-fn current_exception_value_expr(exc_name: &str) -> CoreBlockPyExpr {
+fn current_exception_value_expr(exc_name: &str) -> InstrLow {
     core_get_attr(core_name(exc_name), "value")
 }
 
-fn yield_from_next_expr() -> CoreBlockPyExpr {
+fn yield_from_next_expr() -> InstrLow {
     core_call("next", vec![core_name("_dp_yieldfrom")])
 }
 
-fn yield_from_send_expr() -> CoreBlockPyExpr {
+fn yield_from_send_expr() -> InstrLow {
     core_call_expr(
         core_get_attr(core_name("_dp_yieldfrom"), "send"),
         vec![core_name("_dp_send_value")],
@@ -889,7 +889,7 @@ fn yield_from_send_expr() -> CoreBlockPyExpr {
     )
 }
 
-fn yield_from_method_lookup_expr(method: &str) -> CoreBlockPyExpr {
+fn yield_from_method_lookup_expr(method: &str) -> InstrLow {
     core_call(
         "getattr",
         vec![
@@ -900,11 +900,11 @@ fn yield_from_method_lookup_expr(method: &str) -> CoreBlockPyExpr {
     )
 }
 
-fn no_arg_name_call_expr(name: &str) -> CoreBlockPyExpr {
+fn no_arg_name_call_expr(name: &str) -> InstrLow {
     core_call_expr(core_name(name), Vec::new(), Vec::new())
 }
 
-fn single_arg_name_call_expr(name: &str, arg: CoreBlockPyExpr) -> CoreBlockPyExpr {
+fn single_arg_name_call_expr(name: &str, arg: InstrLow) -> InstrLow {
     core_call_expr(core_name(name), vec![arg], Vec::new())
 }
 
@@ -970,7 +970,7 @@ impl ResumeLoweringState {
         self.blocks.push(block);
     }
 
-    fn prune_term_target_args(&self, term: &mut BlockTerm<CoreBlockPyExpr>) {
+    fn prune_term_target_args(&self, term: &mut BlockTerm<InstrLow>) {
         let BlockTerm::Jump(edge) = term else {
             return;
         };

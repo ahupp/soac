@@ -33,8 +33,7 @@ pub(crate) mod scope;
 pub(crate) mod validate;
 mod visit;
 pub use crate::passes::{
-    CoreBlockPyExpr, CoreBlockPyExprWithAwaitAndYield, CoreBlockPyExprWithYield, InstrLow,
-    InstrWithAwaitAndYield, InstrWithYield, LocatedCoreBlockPyExpr, LocatedInstr,
+    InstrLow, InstrWithAwaitAndYield, InstrWithYield, LocatedInstr,
 };
 #[allow(unused_imports)]
 pub(crate) use map::{

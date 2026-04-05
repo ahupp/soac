@@ -1,6 +1,6 @@
 use super::{
     is_internal_symbol, walk_block, walk_expr, Block, BlockPyFunction, BlockPyLiteral,
-    BlockPyNameLike, BlockPyPass, Call, CallArgPositional, ChildVisitable, CoreBlockPyExpr,
+    BlockPyNameLike, BlockPyPass, Call, CallArgPositional, ChildVisitable, InstrLow,
     InstrWithAwaitAndYield, InstrWithYield, FunctionName, Instr, RuffExpr,
 };
 use crate::passes::ast_to_ast::scope_helpers::cell_name;
@@ -648,7 +648,7 @@ impl ScopeExprNode for InstrWithYield {
     }
 }
 
-impl<N> ScopeExprNode for CoreBlockPyExpr<N>
+impl<N> ScopeExprNode for InstrLow<N>
 where
     N: BlockPyNameLike,
 {

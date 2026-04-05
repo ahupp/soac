@@ -4,7 +4,7 @@ use crate::block_py::{
     runtime_symbol, BindingKind, BindingPurpose, BindingTarget, BlockArg, BlockPyFunction,
     BlockPyModule, BlockPyNameLike, BlockTerm, Call, CallArgPositional, CallableScopeInfo,
     CallableScopeKind, CellBindingKind, CellCaptureBinding, CellLocation, CellRef, CellRefForName,
-    ChildVisitable, ClassBodyFallback, ClosureInit, ClosureSlot, CoreBlockPyExpr, InstrLow,
+    ChildVisitable, ClassBodyFallback, ClosureInit, ClosureSlot, InstrLow,
     CoreNumberLiteral, CoreNumberLiteralValue, CoreStringLiteral, Del, DelItem, EffectiveBinding,
     FunctionId, FunctionKind, HasMeta, Load, LocalLocation, LocatedInstr, LocatedName,
     MakeCell, MakeFunction, MapFunction, MapInstr, Mappable, NameLocation, SetItem, StorageLayout,
@@ -30,7 +30,7 @@ fn core_string_expr(
     value: String,
     node_index: ast::AtomicNodeIndex,
     range: ruff_text_size::TextRange,
-) -> CoreBlockPyExpr {
+) -> InstrLow {
     literal_expr(
         CoreStringLiteral { value },
         crate::block_py::Meta::new(node_index, range),
@@ -41,7 +41,7 @@ fn core_int_expr(
     value: u64,
     node_index: ast::AtomicNodeIndex,
     range: ruff_text_size::TextRange,
-) -> CoreBlockPyExpr {
+) -> InstrLow {
     let text = value.to_string();
     literal_expr(
         CoreNumberLiteral {
@@ -57,17 +57,17 @@ fn core_int_expr(
 fn globals_expr(
     node_index: ast::AtomicNodeIndex,
     range: ruff_text_size::TextRange,
-) -> CoreBlockPyExpr {
+) -> InstrLow {
     core_runtime_positional_call_expr_with_meta("globals", node_index, range, Vec::new())
 }
 
-fn op_expr(operation: impl Into<CoreBlockPyExpr>) -> CoreBlockPyExpr {
+fn op_expr(operation: impl Into<InstrLow>) -> InstrLow {
     operation.into()
 }
 
-type CoreStmt = CoreBlockPyExpr;
+type CoreStmt = InstrLow;
 
-fn op_stmt(operation: impl Into<CoreBlockPyExpr>) -> CoreStmt {
+fn op_stmt(operation: impl Into<InstrLow>) -> CoreStmt {
     op_expr(operation)
 }
 
@@ -78,7 +78,7 @@ fn constant_location_expr(meta: crate::block_py::Meta, index: u32) -> LocatedIns
     };
     Load::new(name).with_meta(meta).into()
 }
-fn rewrite_global_name_load(name: ast::name::Name, meta: crate::block_py::Meta) -> CoreBlockPyExpr {
+fn rewrite_global_name_load(name: ast::name::Name, meta: crate::block_py::Meta) -> InstrLow {
     op_expr(Load::new(name).with_meta(meta))
 }
 
@@ -86,7 +86,7 @@ fn rewrite_local_name_load(
     name: ast::name::Name,
     meta: crate::block_py::Meta,
     resolver: &NameBindingMapper<'_>,
-) -> CoreBlockPyExpr {
+) -> InstrLow {
     let _ = resolver;
     rewrite_global_name_load(name, meta)
 }
@@ -96,7 +96,7 @@ fn cell_expr_for_name(
     scope: &CallableScopeInfo,
     node_index: ast::AtomicNodeIndex,
     range: ruff_text_size::TextRange,
-) -> CoreBlockPyExpr {
+) -> InstrLow {
     let _ = scope;
     CellRefForName::new(name.to_string())
         .with_meta(crate::block_py::Meta::new(node_index, range))
@@ -108,7 +108,7 @@ fn rewrite_cell_name_load(
     meta: crate::block_py::Meta,
     scope: &CallableScopeInfo,
     resolver: &NameBindingMapper<'_>,
-) -> CoreBlockPyExpr {
+) -> InstrLow {
     let _ = (scope, resolver);
     rewrite_global_name_load(name, meta)
 }
@@ -118,18 +118,18 @@ fn rewrite_raw_cell_storage_name_load(
     meta: crate::block_py::Meta,
     scope: &CallableScopeInfo,
     resolver: &NameBindingMapper<'_>,
-) -> Option<CoreBlockPyExpr> {
+) -> Option<InstrLow> {
     let _ = (scope, resolver);
     resolve_cell_storage_name(scope, name.as_str())?;
     Some(rewrite_global_name_load(name, meta))
 }
 
-fn raw_load_name<N>(expr: &CoreBlockPyExpr<N>) -> Option<String>
+fn raw_load_name<N>(expr: &InstrLow<N>) -> Option<String>
 where
     N: BlockPyNameLike,
 {
     match expr {
-        CoreBlockPyExpr::Load(op) => Some(op.name.id_str().to_string()),
+        InstrLow::Load(op) => Some(op.name.id_str().to_string()),
         _ => None,
     }
 }
@@ -139,7 +139,7 @@ fn rewrite_name_load(
     meta: crate::block_py::Meta,
     scope: &CallableScopeInfo,
     resolver: &NameBindingMapper<'_>,
-) -> CoreBlockPyExpr {
+) -> InstrLow {
     if is_internal_symbol(name.as_str()) && !scope.honors_internal_binding(name.as_str()) {
         return Load::new(name).with_meta(meta).into();
     }
@@ -181,7 +181,7 @@ fn rewrite_cell_ref_expr(
     _semantic: &CallableScopeInfo,
     node_index: ast::AtomicNodeIndex,
     range: ruff_text_size::TextRange,
-) -> CoreBlockPyExpr {
+) -> InstrLow {
     op_expr(
         CellRefForName::new(logical_name.to_string())
             .with_meta(crate::block_py::Meta::new(node_index.clone(), range)),
@@ -190,7 +190,7 @@ fn rewrite_cell_ref_expr(
 
 fn rewrite_global_binding_assign(
     target: UnresolvedName,
-    value: CoreBlockPyExpr,
+    value: InstrLow,
     meta: crate::block_py::Meta,
 ) -> CoreStmt {
     op_stmt(Store::new(target, Box::new(value)).with_meta(meta))
@@ -198,7 +198,7 @@ fn rewrite_global_binding_assign(
 
 fn rewrite_class_namespace_binding_assign(
     target: UnresolvedName,
-    value: CoreBlockPyExpr,
+    value: InstrLow,
     meta: crate::block_py::Meta,
 ) -> CoreStmt {
     let bind_name = target.id_str().to_string();
@@ -218,7 +218,7 @@ fn rewrite_class_namespace_binding_assign(
 
 fn rewrite_cell_binding_assign(
     target: UnresolvedName,
-    value: CoreBlockPyExpr,
+    value: InstrLow,
     meta: crate::block_py::Meta,
     scope: &CallableScopeInfo,
     resolver: &NameBindingMapper<'_>,
@@ -274,8 +274,8 @@ fn wrap_deleted_name_load_expr(
     logical_name: String,
     node_index: ast::AtomicNodeIndex,
     range: ruff_text_size::TextRange,
-    value: CoreBlockPyExpr,
-) -> CoreBlockPyExpr {
+    value: InstrLow,
+) -> InstrLow {
     core_runtime_positional_call_expr_with_meta(
         "load_deleted_name",
         node_index.clone(),
@@ -288,44 +288,44 @@ fn wrap_deleted_name_load_expr(
 }
 
 fn with_helper_arg_mut<N: BlockPyNameLike + Clone>(
-    expr: &mut CoreBlockPyExpr<N>,
+    expr: &mut InstrLow<N>,
     index: usize,
-    f: &mut impl FnMut(&mut CoreBlockPyExpr<N>),
+    f: &mut impl FnMut(&mut InstrLow<N>),
 ) -> bool {
     match expr {
-        CoreBlockPyExpr::BinOp(operation) => with_helper_arg_mut_in_operation(operation, index, f),
-        CoreBlockPyExpr::UnaryOp(operation) => {
+        InstrLow::BinOp(operation) => with_helper_arg_mut_in_operation(operation, index, f),
+        InstrLow::UnaryOp(operation) => {
             with_helper_arg_mut_in_operation(operation, index, f)
         }
-        CoreBlockPyExpr::Call(operation) => with_helper_arg_mut_in_operation(operation, index, f),
-        CoreBlockPyExpr::GetAttr(operation) => {
+        InstrLow::Call(operation) => with_helper_arg_mut_in_operation(operation, index, f),
+        InstrLow::GetAttr(operation) => {
             with_helper_arg_mut_in_operation(operation, index, f)
         }
-        CoreBlockPyExpr::SetAttr(operation) => {
+        InstrLow::SetAttr(operation) => {
             with_helper_arg_mut_in_operation(operation, index, f)
         }
-        CoreBlockPyExpr::GetItem(operation) => {
+        InstrLow::GetItem(operation) => {
             with_helper_arg_mut_in_operation(operation, index, f)
         }
-        CoreBlockPyExpr::SetItem(operation) => {
+        InstrLow::SetItem(operation) => {
             with_helper_arg_mut_in_operation(operation, index, f)
         }
-        CoreBlockPyExpr::DelItem(operation) => {
+        InstrLow::DelItem(operation) => {
             with_helper_arg_mut_in_operation(operation, index, f)
         }
-        CoreBlockPyExpr::Load(operation) => with_helper_arg_mut_in_operation(operation, index, f),
-        CoreBlockPyExpr::Store(operation) => with_helper_arg_mut_in_operation(operation, index, f),
-        CoreBlockPyExpr::Del(operation) => with_helper_arg_mut_in_operation(operation, index, f),
-        CoreBlockPyExpr::MakeCell(operation) => {
+        InstrLow::Load(operation) => with_helper_arg_mut_in_operation(operation, index, f),
+        InstrLow::Store(operation) => with_helper_arg_mut_in_operation(operation, index, f),
+        InstrLow::Del(operation) => with_helper_arg_mut_in_operation(operation, index, f),
+        InstrLow::MakeCell(operation) => {
             with_helper_arg_mut_in_operation(operation, index, f)
         }
-        CoreBlockPyExpr::CellRefForName(operation) => {
+        InstrLow::CellRefForName(operation) => {
             with_helper_arg_mut_in_operation(operation, index, f)
         }
-        CoreBlockPyExpr::CellRef(operation) => {
+        InstrLow::CellRef(operation) => {
             with_helper_arg_mut_in_operation(operation, index, f)
         }
-        CoreBlockPyExpr::MakeFunction(operation) => {
+        InstrLow::MakeFunction(operation) => {
             with_helper_arg_mut_in_operation(operation, index, f)
         }
         _ => false,
@@ -335,11 +335,11 @@ fn with_helper_arg_mut<N: BlockPyNameLike + Clone>(
 fn with_helper_arg_mut_in_operation<N: BlockPyNameLike + Clone, T>(
     operation: &mut T,
     index: usize,
-    f: &mut impl FnMut(&mut CoreBlockPyExpr<N>),
+    f: &mut impl FnMut(&mut InstrLow<N>),
 ) -> bool
 where
-    T: crate::block_py::Mappable<CoreBlockPyExpr<N>, Mapped<CoreBlockPyExpr<N>> = T>
-        + crate::block_py::ChildVisitable<CoreBlockPyExpr<N>>,
+    T: crate::block_py::Mappable<InstrLow<N>, Mapped<InstrLow<N>> = T>
+        + crate::block_py::ChildVisitable<InstrLow<N>>,
 {
     let current = 0;
     let applied = false;
@@ -348,15 +348,15 @@ where
         index: usize,
         applied: bool,
         f: &'a mut F,
-        _marker: std::marker::PhantomData<fn(CoreBlockPyExpr<N>)>,
+        _marker: std::marker::PhantomData<fn(InstrLow<N>)>,
     }
 
-    impl<N, F> crate::block_py::VisitMut<CoreBlockPyExpr<N>> for IndexedArgMutVisitor<'_, N, F>
+    impl<N, F> crate::block_py::VisitMut<InstrLow<N>> for IndexedArgMutVisitor<'_, N, F>
     where
         N: BlockPyNameLike + Clone,
-        F: FnMut(&mut CoreBlockPyExpr<N>),
+        F: FnMut(&mut InstrLow<N>),
     {
-        fn visit_instr_mut(&mut self, expr: &mut CoreBlockPyExpr<N>) {
+        fn visit_instr_mut(&mut self, expr: &mut InstrLow<N>) {
             if self.current == self.index && !self.applied {
                 (self.f)(expr);
                 self.applied = true;
@@ -377,7 +377,7 @@ where
 }
 
 fn rewrite_deleted_name_loads_in_expr(
-    expr: &mut CoreBlockPyExpr,
+    expr: &mut InstrLow,
     scope: &CallableScopeInfo,
     storage_layout: &StorageLayout,
     resolver: &NameBindingMapper<'_>,
@@ -402,7 +402,7 @@ fn rewrite_deleted_name_loads_in_expr(
         }
     }
     match expr {
-        CoreBlockPyExpr::Load(op) => {
+        InstrLow::Load(op) => {
             let meta = op.meta();
             let always_unbound = always_unbound_names.contains(op.name.id_str());
             let deleted = deleted_names.contains(op.name.id_str());
@@ -447,16 +447,16 @@ fn rewrite_deleted_name_loads_in_expr(
                 }
             }
         }
-        CoreBlockPyExpr::BinOp(_)
-        | CoreBlockPyExpr::UnaryOp(_)
-        | CoreBlockPyExpr::Call(_)
-        | CoreBlockPyExpr::GetAttr(_)
-        | CoreBlockPyExpr::SetAttr(_)
-        | CoreBlockPyExpr::GetItem(_)
-        | CoreBlockPyExpr::SetItem(_)
-        | CoreBlockPyExpr::DelItem(_)
-        | CoreBlockPyExpr::MakeCell(_)
-        | CoreBlockPyExpr::MakeFunction(_) => {
+        InstrLow::BinOp(_)
+        | InstrLow::UnaryOp(_)
+        | InstrLow::Call(_)
+        | InstrLow::GetAttr(_)
+        | InstrLow::SetAttr(_)
+        | InstrLow::GetItem(_)
+        | InstrLow::SetItem(_)
+        | InstrLow::DelItem(_)
+        | InstrLow::MakeCell(_)
+        | InstrLow::MakeFunction(_) => {
             struct RewriteVisitor<'a> {
                 scope: &'a CallableScopeInfo,
                 storage_layout: &'a StorageLayout,
@@ -465,8 +465,8 @@ fn rewrite_deleted_name_loads_in_expr(
                 always_unbound_names: &'a HashSet<String>,
             }
 
-            impl crate::block_py::VisitMut<CoreBlockPyExpr> for RewriteVisitor<'_> {
-                fn visit_instr_mut(&mut self, expr: &mut CoreBlockPyExpr) {
+            impl crate::block_py::VisitMut<InstrLow> for RewriteVisitor<'_> {
+                fn visit_instr_mut(&mut self, expr: &mut InstrLow) {
                     rewrite_deleted_name_loads_in_expr(
                         expr,
                         self.scope,
@@ -486,7 +486,7 @@ fn rewrite_deleted_name_loads_in_expr(
                 always_unbound_names,
             });
         }
-        CoreBlockPyExpr::Store(_) => {
+        InstrLow::Store(_) => {
             with_helper_arg_mut(expr, 1, &mut |value_expr| {
                 rewrite_deleted_name_loads_in_expr(
                     value_expr,
@@ -498,10 +498,10 @@ fn rewrite_deleted_name_loads_in_expr(
                 );
             });
         }
-        CoreBlockPyExpr::Del(_)
-        | CoreBlockPyExpr::CellRefForName(_)
-        | CoreBlockPyExpr::CellRef(_) => {}
-        CoreBlockPyExpr::Literal(_) => {}
+        InstrLow::Del(_)
+        | InstrLow::CellRefForName(_)
+        | InstrLow::CellRef(_) => {}
+        InstrLow::Literal(_) => {}
     }
 }
 
@@ -510,7 +510,7 @@ fn core_name_expr(
     ctx: ast::ExprContext,
     node_index: ast::AtomicNodeIndex,
     range: ruff_text_size::TextRange,
-) -> CoreBlockPyExpr {
+) -> InstrLow {
     assert!(
         matches!(ctx, ast::ExprContext::Load),
         "core_name_expr should only produce load expressions"
@@ -551,21 +551,21 @@ fn compat_range() -> ruff_text_size::TextRange {
 fn class_namespace_expr(
     node_index: ast::AtomicNodeIndex,
     range: ruff_text_size::TextRange,
-) -> CoreBlockPyExpr {
+) -> InstrLow {
     core_name_expr("_dp_class_ns", ast::ExprContext::Load, node_index, range)
 }
 
 fn deleted_sentinel_expr(
     node_index: ast::AtomicNodeIndex,
     range: ruff_text_size::TextRange,
-) -> CoreBlockPyExpr {
+) -> InstrLow {
     core_name_expr("DELETED", ast::ExprContext::Load, node_index, range)
 }
 
 fn rewrite_class_name_load_global(
     name: ast::name::Name,
     meta: crate::block_py::Meta,
-) -> CoreBlockPyExpr {
+) -> InstrLow {
     let bind_name = name.to_string();
     core_runtime_positional_call_expr_with_meta(
         "class_lookup_global",
@@ -583,7 +583,7 @@ fn rewrite_class_name_load_cell(
     name: ast::name::Name,
     meta: crate::block_py::Meta,
     scope: &CallableScopeInfo,
-) -> CoreBlockPyExpr {
+) -> InstrLow {
     let bind_name = name.to_string();
     core_runtime_positional_call_expr_with_meta(
         "class_lookup_cell",
@@ -632,8 +632,8 @@ fn rewrite_quiet_delete_marker(
     }
 }
 
-fn quiet_delete_marker_target(expr: &CoreBlockPyExpr) -> Option<ast::name::Name> {
-    let CoreBlockPyExpr::Call(call) = expr else {
+fn quiet_delete_marker_target(expr: &InstrLow) -> Option<ast::name::Name> {
+    let InstrLow::Call(call) = expr else {
         return None;
     };
     let Call {
@@ -650,7 +650,7 @@ fn quiet_delete_marker_target(expr: &CoreBlockPyExpr) -> Option<ast::name::Name>
     }
     match &args[0] {
         CallArgPositional::Positional(expr) => {
-            let CoreBlockPyExpr::Call(nested_call) = expr else {
+            let InstrLow::Call(nested_call) = expr else {
                 return raw_load_name(expr).map(ast::name::Name::new);
             };
             if !nested_call.keywords.is_empty()
@@ -672,12 +672,12 @@ fn quiet_delete_marker_target(expr: &CoreBlockPyExpr) -> Option<ast::name::Name>
     }
 }
 
-fn is_deleted_sentinel_expr(expr: &CoreBlockPyExpr) -> bool {
-    matches!(expr, CoreBlockPyExpr::Load(op) if op.name.is_runtime_symbol("DELETED"))
+fn is_deleted_sentinel_expr(expr: &InstrLow) -> bool {
+    matches!(expr, InstrLow::Load(op) if op.name.is_runtime_symbol("DELETED"))
 }
 
-fn cell_ref_marker_target(expr: &CoreBlockPyExpr) -> Option<String> {
-    let CoreBlockPyExpr::CellRefForName(CellRefForName { logical_name, .. }) = expr else {
+fn cell_ref_marker_target(expr: &InstrLow) -> Option<String> {
+    let InstrLow::CellRefForName(CellRefForName { logical_name, .. }) = expr else {
         return None;
     };
     Some(logical_name.clone())
@@ -693,11 +693,11 @@ fn make_function_kind_name(kind: FunctionKind) -> &'static str {
 }
 
 fn cell_load_logical_name(
-    expr: &CoreBlockPyExpr,
+    expr: &InstrLow,
     scope: &CallableScopeInfo,
     _storage_layout: &StorageLayout,
 ) -> Option<String> {
-    let CoreBlockPyExpr::Load(op) = expr else {
+    let InstrLow::Load(op) = expr else {
         return None;
     };
     logical_name_for_cell_bound_name(scope, &op.name)
@@ -731,7 +731,7 @@ fn build_local_cell_init_assign(
     )
 }
 
-fn closure_slot_init_expr(slot: &ClosureSlot) -> CoreBlockPyExpr {
+fn closure_slot_init_expr(slot: &ClosureSlot) -> InstrLow {
     let node_index = compat_node_index();
     let range = compat_range();
     match slot.init {
@@ -850,11 +850,11 @@ fn logical_name_for_cell_bound_name(
 }
 
 fn store_cell_deleted_logical_name(
-    expr: &CoreBlockPyExpr,
+    expr: &InstrLow,
     scope: &CallableScopeInfo,
     _storage_layout: &StorageLayout,
 ) -> Option<String> {
-    let CoreBlockPyExpr::Store(op) = expr else {
+    let InstrLow::Store(op) = expr else {
         return None;
     };
     if !is_deleted_sentinel_expr(&op.value) {
@@ -864,11 +864,11 @@ fn store_cell_deleted_logical_name(
 }
 
 fn del_deref_logical_name(
-    expr: &CoreBlockPyExpr,
+    expr: &InstrLow,
     scope: &CallableScopeInfo,
     _storage_layout: &StorageLayout,
 ) -> Option<String> {
-    let CoreBlockPyExpr::Del(op) = expr else {
+    let InstrLow::Del(op) = expr else {
         return None;
     };
     if op.quietly {
@@ -878,11 +878,11 @@ fn del_deref_logical_name(
 }
 
 fn store_cell_runtime_logical_name(
-    expr: &CoreBlockPyExpr,
+    expr: &InstrLow,
     scope: &CallableScopeInfo,
     _storage_layout: &StorageLayout,
 ) -> Option<String> {
-    let CoreBlockPyExpr::Store(op) = expr else {
+    let InstrLow::Store(op) = expr else {
         return None;
     };
     if is_deleted_sentinel_expr(&op.value) {
@@ -902,8 +902,8 @@ impl NameBindingMapper<'_> {
     fn materialize_make_function_expr(
         &mut self,
         meta: crate::block_py::Meta,
-        op: MakeFunction<CoreBlockPyExpr>,
-    ) -> CoreBlockPyExpr {
+        op: MakeFunction<InstrLow>,
+    ) -> InstrLow {
         let captures = self
             .callee_make_function_captures
             .get(&op.function_id)
@@ -957,7 +957,7 @@ impl NameBindingMapper<'_> {
 
 fn rewrite_binding_assign_by_name(
     name: String,
-    value: CoreBlockPyExpr,
+    value: InstrLow,
     scope: &CallableScopeInfo,
     resolver: &NameBindingMapper<'_>,
     node_index: ast::AtomicNodeIndex,
@@ -995,8 +995,8 @@ fn rewrite_binding_assign_by_name(
     }
 }
 
-impl MapInstr<CoreBlockPyExpr, CoreBlockPyExpr> for NameBindingMapper<'_> {
-    fn map_instr(&mut self, expr: CoreBlockPyExpr) -> CoreBlockPyExpr {
+impl MapInstr<InstrLow, InstrLow> for NameBindingMapper<'_> {
+    fn map_instr(&mut self, expr: InstrLow) -> InstrLow {
         if let Some(name) = quiet_delete_marker_target(&expr) {
             return rewrite_quiet_delete_marker(name, expr.meta(), self.scope, self);
         }
@@ -1023,7 +1023,7 @@ impl MapInstr<CoreBlockPyExpr, CoreBlockPyExpr> for NameBindingMapper<'_> {
             );
         }
         match_default!(expr: crate::passes::InstrLow {
-            CoreBlockPyExpr::Load(op) => {
+            InstrLow::Load(op) => {
                 let meta = op.meta();
                 if op.name.is_runtime_name() {
                     Load::new(op.name).with_meta(meta).into()
@@ -1045,9 +1045,9 @@ impl MapInstr<CoreBlockPyExpr, CoreBlockPyExpr> for NameBindingMapper<'_> {
                     rewrite_name_load(op.name.name(), meta, self.scope, self)
                 }
             },
-            CoreBlockPyExpr::Literal(literal) => CoreBlockPyExpr::Literal(literal),
-            CoreBlockPyExpr::MakeFunction(op) => self.materialize_make_function_expr(op.meta(), op),
-            CoreBlockPyExpr::Call(call)
+            InstrLow::Literal(literal) => InstrLow::Literal(literal),
+            InstrLow::MakeFunction(op) => self.materialize_make_function_expr(op.meta(), op),
+            InstrLow::Call(call)
                 if call.args.is_empty()
                     && call.keywords.is_empty()
                     && raw_load_name(call.func.as_ref())
@@ -1061,7 +1061,7 @@ impl MapInstr<CoreBlockPyExpr, CoreBlockPyExpr> for NameBindingMapper<'_> {
                 let meta = call.meta();
                 globals_expr(meta.node_index, meta.range)
             },
-            CoreBlockPyExpr::Call(call)
+            InstrLow::Call(call)
                 if call.keywords.is_empty()
                     && call.args.len() == 3
                     && raw_load_name(call.func.as_ref())
@@ -1085,7 +1085,7 @@ impl MapInstr<CoreBlockPyExpr, CoreBlockPyExpr> for NameBindingMapper<'_> {
                     .with_meta(meta)
                     .into()
             },
-            CoreBlockPyExpr::Call(call) => call.map_same_children(self).into(),
+            InstrLow::Call(call) => call.map_same_children(self).into(),
             rest => rest.map_children(self).into(),
         })
     }
@@ -1096,14 +1096,14 @@ impl MapInstr<CoreBlockPyExpr, CoreBlockPyExpr> for NameBindingMapper<'_> {
 }
 
 fn unresolved_semantic_store_parts(
-    expr: &CoreBlockPyExpr,
+    expr: &InstrLow,
 ) -> Option<(
     String,
-    CoreBlockPyExpr,
+    InstrLow,
     ast::AtomicNodeIndex,
     ruff_text_size::TextRange,
 )> {
-    let CoreBlockPyExpr::Store(op) = expr else {
+    let InstrLow::Store(op) = expr else {
         return None;
     };
     if op.name.is_runtime_name() || is_internal_symbol(op.name.id_str()) {
@@ -1119,9 +1119,9 @@ fn unresolved_semantic_store_parts(
 }
 
 fn unresolved_semantic_delete_target(
-    expr: &CoreBlockPyExpr,
+    expr: &InstrLow,
 ) -> Option<(ast::name::Name, crate::block_py::Meta)> {
-    let CoreBlockPyExpr::Del(op) = expr else {
+    let InstrLow::Del(op) = expr else {
         return None;
     };
     if op.quietly || op.name.is_runtime_name() || is_internal_symbol(op.name.id_str()) {
@@ -1173,7 +1173,7 @@ fn rewrite_deleted_name_loads_in_stmt(
 }
 
 fn rewrite_deleted_name_loads_in_term(
-    term: &mut BlockTerm<CoreBlockPyExpr>,
+    term: &mut BlockTerm<InstrLow>,
     scope: &CallableScopeInfo,
     storage_layout: &StorageLayout,
     resolver: &NameBindingMapper<'_>,
@@ -1188,8 +1188,8 @@ fn rewrite_deleted_name_loads_in_term(
         always_unbound_names: &'a HashSet<String>,
     }
 
-    impl crate::block_py::VisitMut<CoreBlockPyExpr> for RewriteTermVisitor<'_> {
-        fn visit_instr_mut(&mut self, expr: &mut CoreBlockPyExpr) {
+    impl crate::block_py::VisitMut<InstrLow> for RewriteTermVisitor<'_> {
+        fn visit_instr_mut(&mut self, expr: &mut InstrLow) {
             rewrite_deleted_name_loads_in_expr(
                 expr,
                 self.scope,
@@ -1214,12 +1214,12 @@ fn rewrite_deleted_name_loads_in_term(
 }
 
 fn rewrite_raw_cell_loads_in_expr(
-    expr: &mut CoreBlockPyExpr,
+    expr: &mut InstrLow,
     scope: &CallableScopeInfo,
     resolver: &NameBindingMapper<'_>,
 ) {
     match expr {
-        CoreBlockPyExpr::Call(call) => {
+        InstrLow::Call(call) => {
             if call.keywords.is_empty()
                 && call.args.len() == 3
                 && raw_load_name(call.func.as_ref())
@@ -1240,29 +1240,29 @@ fn rewrite_raw_cell_loads_in_expr(
                 resolver: &'a NameBindingMapper<'a>,
             }
 
-            impl crate::block_py::VisitMut<CoreBlockPyExpr> for RewriteVisitor<'_> {
-                fn visit_instr_mut(&mut self, expr: &mut CoreBlockPyExpr) {
+            impl crate::block_py::VisitMut<InstrLow> for RewriteVisitor<'_> {
+                fn visit_instr_mut(&mut self, expr: &mut InstrLow) {
                     rewrite_raw_cell_loads_in_expr(expr, self.scope, self.resolver);
                 }
             }
 
             call.visit_children_mut(&mut RewriteVisitor { scope, resolver });
         }
-        CoreBlockPyExpr::BinOp(_)
-        | CoreBlockPyExpr::UnaryOp(_)
-        | CoreBlockPyExpr::GetAttr(_)
-        | CoreBlockPyExpr::SetAttr(_)
-        | CoreBlockPyExpr::GetItem(_)
-        | CoreBlockPyExpr::SetItem(_)
-        | CoreBlockPyExpr::DelItem(_)
-        | CoreBlockPyExpr::Load(_)
-        | CoreBlockPyExpr::Store(_)
-        | CoreBlockPyExpr::Del(_)
-        | CoreBlockPyExpr::MakeCell(_)
-        | CoreBlockPyExpr::CellRefForName(_)
-        | CoreBlockPyExpr::CellRef(_)
-        | CoreBlockPyExpr::MakeFunction(_) => {
-            if let CoreBlockPyExpr::Load(op) = expr {
+        InstrLow::BinOp(_)
+        | InstrLow::UnaryOp(_)
+        | InstrLow::GetAttr(_)
+        | InstrLow::SetAttr(_)
+        | InstrLow::GetItem(_)
+        | InstrLow::SetItem(_)
+        | InstrLow::DelItem(_)
+        | InstrLow::Load(_)
+        | InstrLow::Store(_)
+        | InstrLow::Del(_)
+        | InstrLow::MakeCell(_)
+        | InstrLow::CellRefForName(_)
+        | InstrLow::CellRef(_)
+        | InstrLow::MakeFunction(_) => {
+            if let InstrLow::Load(op) = expr {
                 if let UnresolvedName::SourceName(name) = &op.name {
                     if matches!(
                         scope.binding_kind(name.as_str()),
@@ -1278,23 +1278,23 @@ fn rewrite_raw_cell_loads_in_expr(
                 resolver: &'a NameBindingMapper<'a>,
             }
 
-            impl crate::block_py::VisitMut<CoreBlockPyExpr> for RewriteVisitor<'_> {
-                fn visit_instr_mut(&mut self, expr: &mut CoreBlockPyExpr) {
+            impl crate::block_py::VisitMut<InstrLow> for RewriteVisitor<'_> {
+                fn visit_instr_mut(&mut self, expr: &mut InstrLow) {
                     rewrite_raw_cell_loads_in_expr(expr, self.scope, self.resolver);
                 }
             }
 
             expr.visit_children_mut(&mut RewriteVisitor { scope, resolver });
         }
-        CoreBlockPyExpr::Literal(_) => {}
+        InstrLow::Literal(_) => {}
     }
 }
 
-fn is_local_cell_init_store(expr: &CoreBlockPyExpr) -> bool {
-    let CoreBlockPyExpr::Store(Store { name, value, .. }) = expr else {
+fn is_local_cell_init_store(expr: &InstrLow) -> bool {
+    let InstrLow::Store(Store { name, value, .. }) = expr else {
         return false;
     };
-    name.id_str().starts_with("_dp_cell_") && matches!(value.as_ref(), CoreBlockPyExpr::MakeCell(_))
+    name.id_str().starts_with("_dp_cell_") && matches!(value.as_ref(), InstrLow::MakeCell(_))
 }
 
 fn rewrite_raw_cell_loads_in_stmt(
@@ -1309,7 +1309,7 @@ fn rewrite_raw_cell_loads_in_stmt(
 }
 
 fn rewrite_raw_cell_loads_in_term(
-    term: &mut BlockTerm<CoreBlockPyExpr>,
+    term: &mut BlockTerm<InstrLow>,
     scope: &CallableScopeInfo,
     resolver: &NameBindingMapper<'_>,
 ) {
@@ -1318,8 +1318,8 @@ fn rewrite_raw_cell_loads_in_term(
         resolver: &'a NameBindingMapper<'a>,
     }
 
-    impl crate::block_py::VisitMut<CoreBlockPyExpr> for RewriteTermVisitor<'_> {
-        fn visit_instr_mut(&mut self, expr: &mut CoreBlockPyExpr) {
+    impl crate::block_py::VisitMut<InstrLow> for RewriteTermVisitor<'_> {
+        fn visit_instr_mut(&mut self, expr: &mut InstrLow) {
             rewrite_raw_cell_loads_in_expr(expr, self.scope, self.resolver);
         }
     }
@@ -1327,7 +1327,7 @@ fn rewrite_raw_cell_loads_in_term(
     crate::block_py::walk_term_mut(&mut RewriteTermVisitor { scope, resolver }, term);
 }
 
-fn normal_successor_labels(term: &BlockTerm<CoreBlockPyExpr>) -> Vec<&crate::block_py::BlockLabel> {
+fn normal_successor_labels(term: &BlockTerm<InstrLow>) -> Vec<&crate::block_py::BlockLabel> {
     match term {
         BlockTerm::Jump(edge) => vec![&edge.target],
         BlockTerm::IfTerm(if_term) => vec![&if_term.then_label, &if_term.else_label],
@@ -1341,7 +1341,7 @@ fn normal_successor_labels(term: &BlockTerm<CoreBlockPyExpr>) -> Vec<&crate::blo
 }
 
 fn normal_predecessor_exc_param_names(
-    blocks: &[crate::block_py::Block<CoreBlockPyExpr, CoreBlockPyExpr>],
+    blocks: &[crate::block_py::Block<InstrLow, InstrLow>],
 ) -> HashMap<crate::block_py::BlockLabel, Vec<Option<String>>> {
     let mut predecessors = HashMap::new();
     for block in blocks {
@@ -1357,7 +1357,7 @@ fn normal_predecessor_exc_param_names(
 }
 
 fn sync_exception_param_cell_in_block(
-    block: &mut crate::block_py::Block<CoreBlockPyExpr, CoreBlockPyExpr>,
+    block: &mut crate::block_py::Block<InstrLow, InstrLow>,
     normal_predecessor_exc_names: &[Option<String>],
     scope: &CallableScopeInfo,
     resolver: &NameBindingMapper<'_>,
@@ -1391,7 +1391,7 @@ fn sync_exception_param_cell_in_block(
 }
 
 fn collect_deleted_names_in_blocks(
-    blocks: &[crate::block_py::Block<CoreBlockPyExpr, CoreBlockPyExpr>],
+    blocks: &[crate::block_py::Block<InstrLow, InstrLow>],
     scope: &CallableScopeInfo,
     storage_layout: &StorageLayout,
 ) -> HashSet<String> {
@@ -1421,7 +1421,7 @@ fn collect_runtime_bound_local_names_in_stmt(
 }
 
 fn collect_runtime_bound_local_names(
-    blocks: &[crate::block_py::Block<CoreBlockPyExpr, CoreBlockPyExpr>],
+    blocks: &[crate::block_py::Block<InstrLow, InstrLow>],
     scope: &CallableScopeInfo,
     storage_layout: &StorageLayout,
 ) -> HashSet<String> {
@@ -1461,38 +1461,38 @@ fn collect_always_unbound_local_names(
         .collect()
 }
 
-fn collect_remaining_names_in_expr(expr: &CoreBlockPyExpr, names: &mut HashSet<String>) {
+fn collect_remaining_names_in_expr(expr: &InstrLow, names: &mut HashSet<String>) {
     match expr {
-        CoreBlockPyExpr::Load(op) => {
+        InstrLow::Load(op) => {
             names.insert(op.name.id_str().to_string());
         }
-        CoreBlockPyExpr::Store(op) => {
+        InstrLow::Store(op) => {
             names.insert(op.name.id_str().to_string());
         }
-        CoreBlockPyExpr::Del(op) => {
+        InstrLow::Del(op) => {
             names.insert(op.name.id_str().to_string());
         }
-        CoreBlockPyExpr::Literal(_)
-        | CoreBlockPyExpr::BinOp(_)
-        | CoreBlockPyExpr::UnaryOp(_)
-        | CoreBlockPyExpr::Call(_)
-        | CoreBlockPyExpr::GetAttr(_)
-        | CoreBlockPyExpr::SetAttr(_)
-        | CoreBlockPyExpr::GetItem(_)
-        | CoreBlockPyExpr::SetItem(_)
-        | CoreBlockPyExpr::DelItem(_)
-        | CoreBlockPyExpr::MakeCell(_)
-        | CoreBlockPyExpr::CellRefForName(_)
-        | CoreBlockPyExpr::CellRef(_)
-        | CoreBlockPyExpr::MakeFunction(_) => {}
+        InstrLow::Literal(_)
+        | InstrLow::BinOp(_)
+        | InstrLow::UnaryOp(_)
+        | InstrLow::Call(_)
+        | InstrLow::GetAttr(_)
+        | InstrLow::SetAttr(_)
+        | InstrLow::GetItem(_)
+        | InstrLow::SetItem(_)
+        | InstrLow::DelItem(_)
+        | InstrLow::MakeCell(_)
+        | InstrLow::CellRefForName(_)
+        | InstrLow::CellRef(_)
+        | InstrLow::MakeFunction(_) => {}
     }
 
     struct RemainingNamesVisitor<'a> {
         names: &'a mut HashSet<String>,
     }
 
-    impl crate::block_py::Visit<CoreBlockPyExpr> for RemainingNamesVisitor<'_> {
-        fn visit_instr(&mut self, expr: &CoreBlockPyExpr) {
+    impl crate::block_py::Visit<InstrLow> for RemainingNamesVisitor<'_> {
+        fn visit_instr(&mut self, expr: &InstrLow) {
             collect_remaining_names_in_expr(expr, self.names);
         }
     }
@@ -1504,13 +1504,13 @@ fn collect_remaining_names_in_stmt(stmt: &CoreStmt, names: &mut HashSet<String>)
     collect_remaining_names_in_expr(stmt, names)
 }
 
-fn collect_remaining_names_in_term(term: &BlockTerm<CoreBlockPyExpr>, names: &mut HashSet<String>) {
+fn collect_remaining_names_in_term(term: &BlockTerm<InstrLow>, names: &mut HashSet<String>) {
     struct RemainingNamesVisitor<'a> {
         names: &'a mut HashSet<String>,
     }
 
-    impl crate::block_py::Visit<CoreBlockPyExpr> for RemainingNamesVisitor<'_> {
-        fn visit_instr(&mut self, expr: &CoreBlockPyExpr) {
+    impl crate::block_py::Visit<InstrLow> for RemainingNamesVisitor<'_> {
+        fn visit_instr(&mut self, expr: &InstrLow) {
             collect_remaining_names_in_expr(expr, self.names);
         }
 
@@ -1716,10 +1716,10 @@ fn compute_local_slot_locations_from_analysis(
         for stmt in &block.body {
             collect_remaining_names_in_stmt(stmt, &mut remaining);
             match stmt {
-                CoreBlockPyExpr::Store(op) => {
+                InstrLow::Store(op) => {
                     explicitly_stored.insert(op.name.id_str().to_string());
                 }
-                CoreBlockPyExpr::Del(op) => {
+                InstrLow::Del(op) => {
                     explicitly_stored.insert(op.name.id_str().to_string());
                 }
                 _ => {}
@@ -2008,10 +2008,10 @@ impl NameLocator<'_> {
 
     fn mark_raw_cell_expr(
         &self,
-        expr: CoreBlockPyExpr<LocatedName>,
-    ) -> CoreBlockPyExpr<LocatedName> {
+        expr: InstrLow<LocatedName>,
+    ) -> InstrLow<LocatedName> {
         match expr {
-            CoreBlockPyExpr::Load(op) => {
+            InstrLow::Load(op) => {
                 let meta = op.meta();
                 let name = op.name;
                 let marked = self.mark_raw_cell_name(name);
@@ -2025,11 +2025,11 @@ impl NameLocator<'_> {
     }
 }
 
-impl MapInstr<CoreBlockPyExpr, CoreBlockPyExpr<LocatedName>> for NameLocator<'_> {
-    fn map_instr(&mut self, expr: CoreBlockPyExpr) -> CoreBlockPyExpr<LocatedName> {
+impl MapInstr<InstrLow, InstrLow<LocatedName>> for NameLocator<'_> {
+    fn map_instr(&mut self, expr: InstrLow) -> InstrLow<LocatedName> {
         match_default!(expr: crate::passes::InstrLow {
-            CoreBlockPyExpr::Literal(literal) => CoreBlockPyExpr::Literal(literal),
-            CoreBlockPyExpr::Load(op) => {
+            InstrLow::Literal(literal) => InstrLow::Literal(literal),
+            InstrLow::Load(op) => {
                 let meta = op.meta();
                 let name = self.locate_unresolved_name(op.name);
                 let name = if name.is_runtime_name() {
@@ -2039,7 +2039,7 @@ impl MapInstr<CoreBlockPyExpr, CoreBlockPyExpr<LocatedName>> for NameLocator<'_>
                 };
                 Load::new(name).with_meta(meta).into()
             },
-            CoreBlockPyExpr::Store(op) => {
+            InstrLow::Store(op) => {
                 let meta = op.meta();
                 let name = self.locate_unresolved_name(op.name);
                 let name = if name.is_runtime_name() {
@@ -2050,7 +2050,7 @@ impl MapInstr<CoreBlockPyExpr, CoreBlockPyExpr<LocatedName>> for NameLocator<'_>
                 let value = self.map_instr(*op.value);
                 Store::new(name, Box::new(value)).with_meta(meta).into()
             },
-            CoreBlockPyExpr::Del(op) => {
+            InstrLow::Del(op) => {
                 let meta = op.meta();
                 let name = self.locate_unresolved_name(op.name);
                 let name = if name.is_runtime_name() {
@@ -2060,12 +2060,12 @@ impl MapInstr<CoreBlockPyExpr, CoreBlockPyExpr<LocatedName>> for NameLocator<'_>
                 };
                 Del::new(name, op.quietly).with_meta(meta).into()
             },
-            CoreBlockPyExpr::CellRefForName(op) => {
+            InstrLow::CellRefForName(op) => {
                 let meta = op.meta();
                 let location = self.resolve_cell_ref_location(op.logical_name.as_str());
                 CellRef::new(location).with_meta(meta).into()
             },
-            CoreBlockPyExpr::Call(call) => {
+            InstrLow::Call(call) => {
                 let meta = call.meta();
                 let call = call.map_children(self);
                 if raw_load_name(call.func.as_ref())
@@ -2085,7 +2085,7 @@ impl MapInstr<CoreBlockPyExpr, CoreBlockPyExpr<LocatedName>> for NameLocator<'_>
                 }
                 call.with_meta(meta).into()
             },
-            CoreBlockPyExpr::CellRef(node) => node.into(),
+            InstrLow::CellRef(node) => node.into(),
             rest => rest.map_children(self).into(),
         })
     }
@@ -2121,10 +2121,10 @@ fn locate_names_in_callable(
     mapper.map_fn(callable)
 }
 
-fn collect_make_function_callee_ids_in_expr(expr: &CoreBlockPyExpr, out: &mut Vec<FunctionId>) {
+fn collect_make_function_callee_ids_in_expr(expr: &InstrLow, out: &mut Vec<FunctionId>) {
     match expr {
-        CoreBlockPyExpr::Literal(_) => {}
-        CoreBlockPyExpr::MakeFunction(op) => {
+        InstrLow::Literal(_) => {}
+        InstrLow::MakeFunction(op) => {
             out.push(op.function_id);
         }
         _ => {
@@ -2132,8 +2132,8 @@ fn collect_make_function_callee_ids_in_expr(expr: &CoreBlockPyExpr, out: &mut Ve
                 out: &'a mut Vec<FunctionId>,
             }
 
-            impl crate::block_py::Visit<CoreBlockPyExpr> for CalleeVisitor<'_> {
-                fn visit_instr(&mut self, expr: &CoreBlockPyExpr) {
+            impl crate::block_py::Visit<InstrLow> for CalleeVisitor<'_> {
+                fn visit_instr(&mut self, expr: &InstrLow) {
                     collect_make_function_callee_ids_in_expr(expr, self.out);
                 }
             }
@@ -2163,15 +2163,15 @@ fn collect_make_function_callee_ids_in_stmt(stmt: &CoreStmt, out: &mut Vec<Funct
 }
 
 fn collect_make_function_callee_ids_in_term(
-    term: &BlockTerm<CoreBlockPyExpr>,
+    term: &BlockTerm<InstrLow>,
     out: &mut Vec<FunctionId>,
 ) {
     struct CalleeVisitor<'a> {
         out: &'a mut Vec<FunctionId>,
     }
 
-    impl crate::block_py::Visit<CoreBlockPyExpr> for CalleeVisitor<'_> {
-        fn visit_instr(&mut self, expr: &CoreBlockPyExpr) {
+    impl crate::block_py::Visit<InstrLow> for CalleeVisitor<'_> {
+        fn visit_instr(&mut self, expr: &InstrLow) {
             collect_make_function_callee_ids_in_expr(expr, self.out);
         }
     }
@@ -2681,8 +2681,8 @@ impl ModuleConstantExtractor {
     }
 
     fn extract_expr(&mut self, expr: &mut LocatedInstr) {
-        if matches!(expr, CoreBlockPyExpr::Literal(_))
-            || matches!(expr, CoreBlockPyExpr::Load(op) if op.name.is_runtime_name())
+        if matches!(expr, InstrLow::Literal(_))
+            || matches!(expr, InstrLow::Load(op) if op.name.is_runtime_name())
         {
             let meta = expr.meta();
             let index = u32::try_from(self.constants.len())
@@ -2691,7 +2691,7 @@ impl ModuleConstantExtractor {
             self.constants.push(constant);
             return;
         }
-        if !matches!(expr, CoreBlockPyExpr::Literal(_)) {
+        if !matches!(expr, InstrLow::Literal(_)) {
             expr.visit_children_mut(self);
         }
     }

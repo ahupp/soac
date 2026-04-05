@@ -1,7 +1,6 @@
 use crate::block_py::{
     BlockPyFunction, BlockPyModule, CodegenBlockPyExpr, HasMeta, InstrLow, LiteralValue, Load,
-    LocatedCoreBlockPyExpr, LocatedInstr, LocatedName, MapFunction, MapInstr, Mappable,
-    NameLocation, WithMeta,
+    LocatedInstr, LocatedName, MapFunction, MapInstr, Mappable, NameLocation, WithMeta,
 };
 use crate::passes::{CodegenBlockPyPass, ResolvedStorageBlockPyPass};
 use soac_macros::match_default;

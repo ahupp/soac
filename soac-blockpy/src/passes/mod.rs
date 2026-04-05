@@ -87,8 +87,6 @@ pub enum InstrLow<N: BlockPyNameLike = UnresolvedName> {
     MakeFunction(MakeFunction<Self>),
 }
 
-pub type CoreBlockPyExpr<N = UnresolvedName> = InstrLow<N>;
-pub type LocatedCoreBlockPyExpr = InstrLow<LocatedName>;
 pub type LocatedInstr = InstrLow<LocatedName>;
 
 #[derive(Debug, Clone)]

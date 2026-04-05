@@ -1,7 +1,7 @@
 use super::normalize_bb_module_strings;
 use crate::{
     block_py::{
-        BlockPyLiteral, BlockPyNameLike, ChildVisitable, CodegenBlockPyExpr, CoreBlockPyExpr,
+        BlockPyLiteral, BlockPyNameLike, ChildVisitable, CodegenBlockPyExpr, InstrLow,
         LocatedInstr,
     },
     lower_python_to_blockpy_for_testing,
@@ -23,7 +23,7 @@ fn module_constants_contain_string(exprs: &[LocatedInstr]) -> bool {
     exprs.iter().any(|expr| {
         matches!(
             expr,
-            CoreBlockPyExpr::Literal(literal)
+            InstrLow::Literal(literal)
                 if matches!(literal.as_literal(), BlockPyLiteral::StringLiteral(_))
         )
     })

@@ -1,7 +1,7 @@
 use crate::block_py::{BindingKind, ClosureInit, ClosureSlot};
 use crate::block_py::{
     BlockPyFunction, BlockPyModule, BlockPyNameLike, BlockTerm, Call, CallArgKeyword,
-    CallArgPositional, CallableScopeKind, CellBindingKind, CoreBlockPyExpr, FunctionKind,
+    CallArgPositional, CallableScopeKind, CellBindingKind, InstrLow, FunctionKind,
     LocatedName, NameLocation, ResolvedStorageBlock,
 };
 use crate::passes::{CoreBlockPyPassWithAwaitAndYield, ResolvedStorageBlockPyPass};
@@ -102,7 +102,7 @@ fn slot_by_name<'a>(slots: &'a [ClosureSlot], logical_name: &str) -> &'a Closure
         .unwrap_or_else(|| panic!("missing closure slot {logical_name}; got {slots:?}"))
 }
 
-fn expr_text<N: BlockPyNameLike>(expr: &CoreBlockPyExpr<N>) -> String {
+fn expr_text<N: BlockPyNameLike>(expr: &InstrLow<N>) -> String {
     crate::block_py::pretty::bb_expr_text(expr)
 }
 
@@ -166,13 +166,13 @@ fn function_or_constants_use_text(
 
 fn runtime_call_by_name<'a>(
     module: &'a BlockPyModule<ResolvedStorageBlockPyPass>,
-    expr: &'a CoreBlockPyExpr<LocatedName>,
+    expr: &'a InstrLow<LocatedName>,
     name: &str,
-) -> Option<&'a Call<CoreBlockPyExpr<LocatedName>>> {
-    let CoreBlockPyExpr::Call(call) = expr else {
+) -> Option<&'a Call<InstrLow<LocatedName>>> {
+    let InstrLow::Call(call) = expr else {
         return None;
     };
-    let CoreBlockPyExpr::Load(load) = call.func.as_ref() else {
+    let InstrLow::Load(load) = call.func.as_ref() else {
         return None;
     };
     if load.name.is_runtime_symbol(name) {
@@ -181,7 +181,7 @@ fn runtime_call_by_name<'a>(
     let Some(constant_index) = load.name.location.as_constant() else {
         return None;
     };
-    let Some(CoreBlockPyExpr::Load(helper_load)) =
+    let Some(InstrLow::Load(helper_load)) =
         module.module_constants.get(constant_index as usize)
     else {
         return None;
@@ -294,7 +294,7 @@ def f():
         .position(|expr| {
             matches!(
                 expr,
-                CoreBlockPyExpr::Load(load)
+                InstrLow::Load(load)
                     if load.name.is_runtime_name()
                         && load.name.id_str() == "make_function"
                         && load.name.location == NameLocation::RuntimeName
@@ -302,7 +302,7 @@ def f():
         })
         .unwrap_or_else(|| panic!("expected lifted make_function runtime load, got {bb_module:?}"));
     let runtime_make_function = &bb_module.module_constants[make_function_index];
-    let CoreBlockPyExpr::Load(load) = runtime_make_function else {
+    let InstrLow::Load(load) = runtime_make_function else {
         unreachable!();
     };
     assert_eq!(load.name.location, NameLocation::RuntimeName, "{load:?}");
@@ -1889,11 +1889,11 @@ def outer(x):
         .iter()
         .find(|func| func.names.bind_name == "outer")
         .expect("outer function should be present");
-    let Some(CoreBlockPyExpr::Store(assign)) = outer.entry_block().body.first() else {
+    let Some(InstrLow::Store(assign)) = outer.entry_block().body.first() else {
         panic!("expected first entry stmt to be Expr(Store(...))");
     };
     assert!(
-        matches!(&*assign.value, CoreBlockPyExpr::MakeCell(_)),
+        matches!(&*assign.value, InstrLow::MakeCell(_)),
         "{assign:?}"
     );
 }

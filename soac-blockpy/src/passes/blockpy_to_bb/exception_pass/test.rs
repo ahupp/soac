@@ -2,7 +2,7 @@ use super::lower_try_jump_exception_flow;
 use crate::block_py::{
     validate_module, AbruptKind, BindingKind, BlockArg, BlockEdge, BlockLabel, BlockParam,
     BlockParamRole, BlockPyLiteral, BlockTerm, CellBindingKind, CodegenBlock, CodegenBlockPyExpr,
-    CoreBlockPyExpr, CoreNumberLiteral, CoreNumberLiteralValue, LocatedInstr,
+    InstrLow, CoreNumberLiteral, CoreNumberLiteralValue, LocatedInstr,
     NameLocation, ResolvedStorageBlock, StorageLayout,
 };
 use crate::lower_python_to_blockpy_for_testing;
@@ -29,7 +29,7 @@ fn tracked_codegen_module(source: &str) -> crate::block_py::BlockPyModule<Codege
 
 fn is_return_of_number_constant(term: &BlockTerm<LocatedInstr>) -> bool {
     match term {
-        BlockTerm::Return(CoreBlockPyExpr::Literal(literal))
+        BlockTerm::Return(InstrLow::Literal(literal))
             if matches!(
                 literal.as_literal(),
                 BlockPyLiteral::NumberLiteral(CoreNumberLiteral {
@@ -40,7 +40,7 @@ fn is_return_of_number_constant(term: &BlockTerm<LocatedInstr>) -> bool {
         {
             true
         }
-        BlockTerm::Return(CoreBlockPyExpr::Load(op))
+        BlockTerm::Return(InstrLow::Load(op))
             if matches!(op.name.location, NameLocation::Constant(_)) =>
         {
             true

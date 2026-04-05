@@ -1,6 +1,6 @@
 use crate::block_py::{
     literal_expr, Block, BlockLabel, BlockPyLiteral, BlockPyStmtBuilder, BlockTerm,
-    CallArgPositional, CoreBlockPyExpr, CoreStringLiteral, GetAttr, LocatedInstr,
+    CallArgPositional, InstrLow, CoreStringLiteral, GetAttr, LocatedInstr,
     LocatedName, NameLocation, Store, StructuredIf, StructuredInstr, WithMeta,
 };
 use crate::passes::ruff_to_blockpy::{
@@ -116,10 +116,10 @@ fn rewrites_current_exception_placeholders_in_final_core_blocks() {
     let body_expr = &block.body[0];
     assert!(matches!(
         body_expr,
-        CoreBlockPyExpr::Load(load) if load.name.id.as_str() == "_dp_try_exc_0"
+        InstrLow::Load(load) if load.name.id.as_str() == "_dp_try_exc_0"
     ));
 
-    let BlockTerm::Return(CoreBlockPyExpr::Load(load)) = &block.term else {
+    let BlockTerm::Return(InstrLow::Load(load)) = &block.term else {
         panic!("expected rewritten return expr");
     };
     assert_eq!(load.name.id.as_str(), "_dp_try_exc_0");
@@ -162,17 +162,17 @@ fn rewrites_current_exception_inside_intrinsic_helper_args() {
     }]);
     let block = &lowered[0];
 
-    let BlockTerm::Return(CoreBlockPyExpr::GetAttr(GetAttr { value, attr, .. })) = &block.term
+    let BlockTerm::Return(InstrLow::GetAttr(GetAttr { value, attr, .. })) = &block.term
     else {
         panic!("expected getattr operation");
     };
     assert!(matches!(
         value.as_ref(),
-        CoreBlockPyExpr::Load(load) if load.name.id.as_str() == "_dp_try_exc_0"
+        InstrLow::Load(load) if load.name.id.as_str() == "_dp_try_exc_0"
     ));
     assert!(matches!(
         attr.as_ref(),
-        CoreBlockPyExpr::Literal(literal)
+        InstrLow::Literal(literal)
             if matches!(
                 literal.as_literal(),
                 BlockPyLiteral::StringLiteral(CoreStringLiteral { value }) if value == "value"

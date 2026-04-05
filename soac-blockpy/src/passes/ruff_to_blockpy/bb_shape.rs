@@ -1,6 +1,6 @@
 use crate::block_py::cfg::linearize_structured_ifs;
 use crate::block_py::{
-    BlockArg, BlockEdge, BlockPyNameLike, BlockTerm, ChildVisitable, CoreBlockPyExpr,
+    BlockArg, BlockEdge, BlockPyNameLike, BlockTerm, ChildVisitable, InstrLow,
     InstrWithAwaitAndYield, FunctionNameGen, Instr, Load, Meta, StructuredInstr,
     UnresolvedName, WithMeta,
 };
@@ -57,16 +57,16 @@ pub(crate) trait CurrentExceptionExpr:
     fn is_current_exception_call(&self) -> bool;
 }
 
-impl<N> CurrentExceptionExpr for CoreBlockPyExpr<N>
+impl<N> CurrentExceptionExpr for InstrLow<N>
 where
     N: BlockPyNameLike,
 {
     fn is_current_exception_call(&self) -> bool {
-        let CoreBlockPyExpr::Call(call) = self else {
+        let InstrLow::Call(call) = self else {
             return false;
         };
         let Some(func_name) = (match call.func.as_ref() {
-            CoreBlockPyExpr::Load(op) => Some(op.name.id_str()),
+            InstrLow::Load(op) => Some(op.name.id_str()),
             _ => None,
         }) else {
             return false;
