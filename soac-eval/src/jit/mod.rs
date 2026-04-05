@@ -1922,7 +1922,9 @@ fn emit_call_direct_expr(
         .iter()
         .map(|arg| match arg {
             CallArgPositional::Positional(expr) => expr,
-            CallArgPositional::Starred(_) => unreachable!("non-positional direct args should have used generic fallback"),
+            CallArgPositional::Starred(_) => unreachable!(
+                "non-positional direct args should have used generic fallback"
+            ),
         })
         .collect::<Vec<_>>();
     emit_direct_call_resolved(

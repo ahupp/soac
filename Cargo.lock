@@ -1687,7 +1687,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "soac-eval"
+name = "soac-inspector"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "http-body-util",
+ "memmap2",
+ "pyo3",
+ "serde",
+ "serde_json",
+ "soac-blockpy",
+ "soac-jit",
+ "tokio",
+ "tower",
+ "tower-http",
+]
+
+[[package]]
+name = "soac-jit"
 version = "0.1.0"
 dependencies = [
  "cranelift-codegen",
@@ -1703,23 +1720,6 @@ dependencies = [
  "pyo3-build-config",
  "ruff_python_ast",
  "soac-blockpy",
-]
-
-[[package]]
-name = "soac-inspector"
-version = "0.1.0"
-dependencies = [
- "axum",
- "http-body-util",
- "memmap2",
- "pyo3",
- "serde",
- "serde_json",
- "soac-blockpy",
- "soac-eval",
- "tokio",
- "tower",
- "tower-http",
 ]
 
 [[package]]
@@ -1739,7 +1739,7 @@ dependencies = [
  "pyo3",
  "serde_json",
  "soac-blockpy",
- "soac-eval",
+ "soac-jit",
 ]
 
 [[package]]

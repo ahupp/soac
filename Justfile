@@ -406,7 +406,7 @@ _pytest-run *args='': ensure-venv
     exit 0
   fi
 
-  export RUST_LOG="${RUST_LOG:-soac_eval::tree_walk::eval=info}"
+  export RUST_LOG="${RUST_LOG:-soac_jit=info}"
   # Repo tests are written around transforming integration modules and the
   # modules they explicitly opt into. Rewriting pytest/stdlib imports here
   # adds noise and teardown-only failures without improving coverage.

@@ -1,11 +1,11 @@
 use memmap2::Mmap;
 use soac_blockpy::block_py::{BlockLabel, FunctionId, InstrId};
-use soac_eval::counter_dump::{
+use soac_jit::counter_dump::{
     COUNTER_DUMP_MAGIC, COUNTER_DUMP_NONE_U32, COUNTER_DUMP_NONE_U64, COUNTER_DUMP_VERSION,
     CounterDumpRecordHeader,
 };
 #[cfg(test)]
-use soac_eval::counter_dump::{CounterDumpRecord, CounterDumpRow};
+use soac_jit::counter_dump::{CounterDumpRecord, CounterDumpRow};
 use std::fs::File;
 use std::mem::{align_of, size_of};
 use std::path::Path;

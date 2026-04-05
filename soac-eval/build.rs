@@ -16,7 +16,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let repo_root = manifest_dir
         .parent()
-        .ok_or("soac-eval should live under the repo root")?;
+        .ok_or("soac-jit should live under the repo root")?;
     let runtime_dir = repo_root.join("soac-runtime");
     let runtime_src = runtime_dir.join("src").join("lib.rs");
     emit_vendored_python_link(repo_root)?;

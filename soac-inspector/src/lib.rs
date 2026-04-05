@@ -10,8 +10,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use soac_blockpy::block_py::{BlockPyFunction, FunctionId};
 use soac_blockpy::passes::CodegenBlockPyPass;
-use soac_eval::jit;
-use soac_eval::module_constants::ModuleCodegenConstants;
+use soac_jit::{
+    exc_dispatch_plan, jit_param_names_for_block, lookup_blockpy_function, lookup_blockpy_module,
+    register_clif_module_plans, render_cranelift_run_bb_specialized_with_cfg,
+};
+use soac_jit::module_constants::ModuleCodegenConstants;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::Once;
@@ -245,7 +248,7 @@ fn render_inspector_payload(source: &str, output: &soac_blockpy::LoweringResult)
 
 pub fn register_named_plans_from_source(source: &str, module_name: &str) -> Result<(), String> {
     let output = lower_source_recorded(source).map_err(|err| err.error)?;
-    jit::register_clif_module_plans(module_name, &output.codegen_module)?;
+    register_clif_module_plans(module_name, &output.codegen_module)?;
     Ok(())
 }
 
@@ -264,7 +267,7 @@ fn inspect_pipeline_payload(source: &str) -> Result<Value, ApiError> {
 }
 
 pub fn jit_debug_plan(module_name: &str, function_id: FunctionId) -> Result<String, String> {
-    let Some(function) = jit::lookup_blockpy_function(module_name, function_id) else {
+    let Some(function) = lookup_blockpy_function(module_name, function_id) else {
         return Err(format!(
             "no specialized JIT plan for {module_name}.fn#{function_id}"
         ));
@@ -275,8 +278,8 @@ pub fn jit_debug_plan(module_name: &str, function_id: FunctionId) -> Result<Stri
         .map(|block| {
             (
                 block.label.to_string(),
-                jit::jit_param_names_for_block(block),
-                jit::exc_dispatch_plan(&function, block),
+                jit_param_names_for_block(block),
+                exc_dispatch_plan(&function, block),
             )
         })
         .collect::<Vec<_>>();
@@ -290,7 +293,7 @@ pub fn render_registered_jit_clif(
     module_name: &str,
     function_id: FunctionId,
 ) -> Result<JitClifResponse, String> {
-    let module = jit::lookup_blockpy_module(module_name)
+    let module = lookup_blockpy_module(module_name)
         .ok_or_else(|| format!("no specialized JIT plan for {module_name}"))?;
     let function = module
         .callable_defs
@@ -304,7 +307,7 @@ pub fn render_registered_jit_clif(
         ensure_python_support_paths(py, repo_root).map_err(|err| err.error)?;
         PyModule::import(py, "soac.runtime").map_err(|err| err.to_string())?;
         unsafe {
-            jit::render_cranelift_run_bb_specialized_with_cfg(
+            render_cranelift_run_bb_specialized_with_cfg(
                 &vec![std::ptr::null_mut::<c_void>(); function.blocks.len()],
                 &module,
                 &function,

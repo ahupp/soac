@@ -1,5 +1,8 @@
 use soac_blockpy::block_py::FunctionKind;
-use soac_eval::jit;
+use soac_jit::{
+    exc_dispatch_plan, jit_param_names_for_block, lookup_blockpy_function,
+    register_clif_module_plans,
+};
 use std::any::Any;
 use std::collections::HashSet;
 
@@ -44,7 +47,7 @@ fn validate_bb_module_for_jit(
 }
 
 fn run_cranelift_jit_preflight(result: &soac_blockpy::LoweringResult) -> Result<(), String> {
-    soac_eval::jit::run_cranelift_smoke(&result.codegen_module)
+    soac_jit::run_cranelift_smoke(&result.codegen_module)
 }
 
 #[test]
@@ -64,14 +67,14 @@ def outer(scale):
     let result = parse_and_lower(source).expect("lowering should succeed");
     let normalized = result.codegen_module.clone();
     let module_name = "jit_plan_slot_inventory_test";
-    jit::register_clif_module_plans(module_name, &normalized)
+    register_clif_module_plans(module_name, &normalized)
         .expect("plan registration should succeed");
     let inner_function = normalized
         .callable_defs
         .iter()
         .find(|function| function.names.bind_name == "inner")
         .expect("missing lowered inner function");
-    let registered_function = jit::lookup_blockpy_function(module_name, inner_function.function_id)
+    let registered_function = lookup_blockpy_function(module_name, inner_function.function_id)
         .expect("registered plan should exist");
     let storage_layout = inner_function
         .storage_layout()
@@ -203,24 +206,24 @@ def exercise():
     let result = parse_and_lower_runtime_style(source).expect("lowering should succeed");
     let normalized = result.codegen_module.clone();
     let module_name = "jit_plan_generator_throw_handler_param_test";
-    jit::register_clif_module_plans(module_name, &normalized)
+    register_clif_module_plans(module_name, &normalized)
         .expect("plan registration should succeed");
     let gen_function = normalized
         .callable_defs
         .iter()
         .find(|function| function.names.bind_name == "gen_resume")
         .expect("missing lowered generator resume function");
-    let registered_function = jit::lookup_blockpy_function(module_name, gen_function.function_id)
+    let registered_function = lookup_blockpy_function(module_name, gen_function.function_id)
         .expect("registered plan should exist");
     let plan_runtime_param_names = registered_function
         .blocks
         .iter()
-        .map(jit::jit_param_names_for_block)
+        .map(jit_param_names_for_block)
         .collect::<Vec<_>>();
     let plan_exc_dispatches = registered_function
         .blocks
         .iter()
-        .map(|block| jit::exc_dispatch_plan(&registered_function, block))
+        .map(|block| exc_dispatch_plan(&registered_function, block))
         .collect::<Vec<_>>();
 
     let handler_entry_targets = plan_runtime_param_names

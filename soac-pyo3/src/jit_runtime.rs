@@ -10,7 +10,7 @@ use soac_blockpy::block_py::{BlockPyFunction, BlockPyModule, FunctionId, Functio
 use soac_blockpy::lower_python_to_blockpy;
 use soac_blockpy::pass_tracker::NoopPassTracker;
 use soac_blockpy::passes::CodegenBlockPyPass;
-use soac_eval::module_type::SoacExtModule;
+use soac_jit::module_type::SoacExtModule;
 use std::time::Instant;
 
 unsafe extern "C" {
@@ -37,13 +37,13 @@ fn register_blockpy_module_plans(
     module_name: &str,
     module: &BlockPyModule<CodegenBlockPyPass>,
 ) -> PyResult<()> {
-    soac_eval::jit::register_clif_module_plans(module_name, module).map_err(|err| {
+    soac_jit::register_clif_module_plans(module_name, module).map_err(|err| {
         pyo3::exceptions::PyRuntimeError::new_err(format!(
             "failed to register BB plans for {module_name}: {err}"
         ))
     })?;
     if module_name.ends_with(".__main__") && module_name != "__main__" {
-        soac_eval::jit::register_clif_module_plans("__main__", module).map_err(|err| {
+        soac_jit::register_clif_module_plans("__main__", module).map_err(|err| {
             pyo3::exceptions::PyRuntimeError::new_err(format!(
                 "failed to register BB plans alias for __main__ from {module_name}: {err}"
             ))
@@ -78,10 +78,10 @@ fn register_clif_vectorcall_raw(
     py: Python<'_>,
     func: &Bound<'_, PyAny>,
     function_id: FunctionId,
-    module_runtime: soac_eval::jit::ModuleRuntimeContext,
+    module_runtime: soac_jit::ModuleRuntimeContext,
 ) -> PyResult<()> {
     unsafe {
-        soac_eval::tree_walk::register_clif_vectorcall(func.as_ptr(), function_id, module_runtime)
+        soac_jit::register_clif_vectorcall(func.as_ptr(), function_id, module_runtime)
             .map_err(|_| {
                 if ffi::PyErr_Occurred().is_null() {
                     PyRuntimeError::new_err("failed to register CLIF vectorcall")
@@ -102,7 +102,7 @@ fn eager_clif_compile_requested() -> bool {
 fn maybe_eager_compile_clif_entry(
     py: Python<'_>,
     func: &Bound<'_, PyAny>,
-    module_runtime: &soac_eval::jit::ModuleRuntimeContext,
+    module_runtime: &soac_jit::ModuleRuntimeContext,
     function_id: FunctionId,
 ) -> PyResult<()> {
     if !eager_clif_compile_requested() {
@@ -110,7 +110,7 @@ fn maybe_eager_compile_clif_entry(
     }
     let start = Instant::now();
     let compile_result = unsafe {
-        soac_eval::tree_walk::compile_clif_vectorcall(func.as_ptr()).map_err(|_| {
+        soac_jit::compile_clif_vectorcall(func.as_ptr()).map_err(|_| {
             if ffi::PyErr_Occurred().is_null() {
                 PyRuntimeError::new_err("failed to eagerly compile CLIF entry")
             } else {
@@ -140,10 +140,10 @@ fn register_lazy_clif_vectorcall(
     py: Python<'_>,
     func: &Bound<'_, PyAny>,
     function_id: FunctionId,
-    module_runtime: &soac_eval::jit::ModuleRuntimeContext,
+    module_runtime: &soac_jit::ModuleRuntimeContext,
 ) -> PyResult<()> {
     let owned_runtime =
-        unsafe { soac_eval::tree_walk::clone_module_runtime_context(module_runtime) }.map_err(
+        unsafe { soac_jit::clone_module_runtime_context(module_runtime) }.map_err(
             |_| {
                 if unsafe { ffi::PyErr_Occurred() }.is_null() {
                     PyRuntimeError::new_err("failed to clone module runtime context")
@@ -254,7 +254,7 @@ fn resolve_module_package(module_globals: &Bound<'_, PyAny>, operation: &str) ->
 
 fn module_globals_from_runtime<'py>(
     py: Python<'py>,
-    module_runtime: &soac_eval::jit::ModuleRuntimeContext,
+    module_runtime: &soac_jit::ModuleRuntimeContext,
     operation: &str,
 ) -> PyResult<Bound<'py, PyAny>> {
     let globals_ptr = module_runtime.vmctx.globals_obj as *mut ffi::PyObject;
@@ -267,7 +267,7 @@ fn module_globals_from_runtime<'py>(
 }
 
 fn module_name_from_runtime(
-    module_runtime: &soac_eval::jit::ModuleRuntimeContext,
+    module_runtime: &soac_jit::ModuleRuntimeContext,
     operation: &str,
 ) -> PyResult<String> {
     let module_name = module_runtime
@@ -283,7 +283,7 @@ fn module_name_from_runtime(
 }
 
 fn lookup_bb_function(
-    shared_state: &soac_eval::module_type::SharedModuleState,
+    shared_state: &soac_jit::module_type::SharedModuleState,
     function_id: FunctionId,
     operation: &str,
 ) -> PyResult<BlockPyFunction<CodegenBlockPyPass>> {
@@ -543,7 +543,7 @@ fn instantiate_bb_function(
     param_defaults: &Bound<'_, PyAny>,
     module_globals: &Bound<'_, PyAny>,
     annotate_fn: &Bound<'_, PyAny>,
-    module_runtime: &soac_eval::jit::ModuleRuntimeContext,
+    module_runtime: &soac_jit::ModuleRuntimeContext,
 ) -> PyResult<Py<PyAny>> {
     let signature = build_bb_signature(py, function, param_defaults)?;
     let entry = instantiate_closure_backed_entry(
@@ -584,7 +584,7 @@ fn instantiate_closure_backed_entry<'py>(
     function: &BlockPyFunction<CodegenBlockPyPass>,
     captures: &Bound<'py, PyAny>,
     module_globals: &Bound<'py, PyAny>,
-    module_runtime: &soac_eval::jit::ModuleRuntimeContext,
+    module_runtime: &soac_jit::ModuleRuntimeContext,
     entry_name: &str,
     qualname: &str,
 ) -> PyResult<Bound<'py, PyAny>> {
@@ -616,7 +616,7 @@ fn make_bb_function(
 ) -> PyResult<Py<PyAny>> {
     let dp = import_dp_module(py)?;
     unsafe {
-        soac_eval::tree_walk::with_current_module_runtime_context(|module_runtime| {
+        soac_jit::with_current_module_runtime_context(|module_runtime| {
             let module_globals =
                 module_globals_from_runtime(py, module_runtime, "function instantiation")?;
             let module_name = module_name_from_runtime(module_runtime, "function instantiation")?;
@@ -651,7 +651,7 @@ fn make_bb_function(
 
 #[pyfunction]
 fn create_module(py: Python<'_>, source: &str, spec: Py<PyAny>) -> PyResult<Py<PyAny>> {
-    let session = soac_eval::CompileSession::new();
+    let session = soac_jit::CompileSession::new();
     let output: soac_blockpy::LoweringResult<NoopPassTracker> =
         lower_python_to_blockpy(source, session.module_name_gen())
             .map_err(lowering_error_to_pyerr)?;
@@ -698,7 +698,7 @@ fn exec_module(py: Python<'_>, module: Py<PyAny>) -> PyResult<()> {
         let empty = PyTuple::empty(py);
         let none = py.None();
         let mut module_runtime = unsafe {
-            soac_eval::tree_walk::build_module_runtime_context_for_module(module.as_ptr())
+            soac_jit::build_module_runtime_context_for_module(module.as_ptr())
         }
         .map_err(|_| {
             if unsafe { ffi::PyErr_Occurred() }.is_null() {
@@ -721,7 +721,7 @@ fn exec_module(py: Python<'_>, module: Py<PyAny>) -> PyResult<()> {
             &module_runtime,
         )?;
         let result = unsafe {
-            soac_eval::tree_walk::with_active_module_runtime_context(
+            soac_jit::with_active_module_runtime_context(
                 std::ptr::addr_of_mut!(module_runtime),
                 || module_init.call0(py),
             )

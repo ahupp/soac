@@ -9,13 +9,7 @@ use std::sync::OnceLock;
 use crate::module_globals::ModuleGlobalCache;
 
 use std::sync::atomic::{AtomicPtr, Ordering};
-
 use crate::module_constants::raise_name_error_for_missing_name;
-#[cfg(not(test))]
-use crate::tree_walk;
-#[cfg(not(test))]
-use super::vmctx::JitModuleVmCtx;
-
 #[cfg(not(test))]
 use crate::module_constants::load_runtime_name_owned;
 
@@ -105,7 +99,7 @@ unsafe extern "C" fn callee_function_id_hook(callable: ObjPtr) -> i64 {
     if function.is_null() {
         return i64::MIN;
     }
-    let packed = match tree_walk::registered_clif_function_id(function as *mut ffi::PyObject) {
+    let packed = match crate::registered_clif_function_id(function as *mut ffi::PyObject) {
         Ok(Some(function_id)) => function_id.packed() as i64,
         Ok(None) => 0,
         Err(()) => {
@@ -115,6 +109,41 @@ unsafe extern "C" fn callee_function_id_hook(callable: ObjPtr) -> i64 {
     };
     ffi::Py_DECREF(function as *mut ffi::PyObject);
     packed
+}
+
+#[cfg(not(test))]
+unsafe extern "C" fn lookup_direct_code_ptr_hook(vmctx: ObjPtr, function_id: i64) -> ObjPtr {
+    if vmctx.is_null() || function_id < 0 {
+        ffi::PyErr_SetString(
+            ffi::PyExc_RuntimeError,
+            b"invalid arguments to dp_jit_lookup_direct_code_ptr\0".as_ptr() as *const i8,
+        );
+        return ptr::null_mut();
+    }
+    let vmctx = &*(vmctx as *const super::vmctx::JitModuleVmCtx);
+    let Some(shared_state) = vmctx.shared_module_state.as_ref() else {
+        ffi::PyErr_SetString(
+            ffi::PyExc_RuntimeError,
+            b"missing shared module state for direct JIT call\0".as_ptr() as *const i8,
+        );
+        return ptr::null_mut();
+    };
+    match shared_state.lookup_or_compile_direct_code_ptr(soac_blockpy::block_py::FunctionId::from_packed(function_id as u64))
+    {
+        Ok(Some(code_ptr)) => code_ptr,
+        Ok(None) => ptr::null_mut(),
+        Err(err) => {
+            if let Ok(message) = std::ffi::CString::new(err) {
+                ffi::PyErr_SetString(ffi::PyExc_RuntimeError, message.as_ptr());
+            } else {
+                ffi::PyErr_SetString(
+                    ffi::PyExc_RuntimeError,
+                    b"failed to resolve direct JIT code pointer\0".as_ptr() as *const i8,
+                );
+            }
+            ptr::null_mut()
+        }
+    }
 }
 
 #[cfg(not(test))]
@@ -139,7 +168,7 @@ unsafe extern "C" fn record_counter_value_hook(vmctx: ObjPtr, counter_id: i64, v
         );
         return;
     }
-    let vmctx = &*(vmctx as *const JitModuleVmCtx);
+    let vmctx = &*(vmctx as *const super::vmctx::JitModuleVmCtx);
     let Some(shared_state) = vmctx.shared_module_state.as_ref() else {
         ffi::PyErr_SetString(
             ffi::PyExc_RuntimeError,
