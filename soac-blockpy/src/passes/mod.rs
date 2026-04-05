@@ -68,7 +68,7 @@ pub enum InstrWithYield {
 
 #[derive(Clone, derive_more::From, DelegateMatchDefault)]
 #[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, Debug)]
-pub enum InstrLow<N: BlockPyNameLike = UnresolvedName> {
+pub enum InstrLow<N: BlockPyNameLike> {
     Literal(LiteralValue),
     BinOp(BinOp<Self>),
     UnaryOp(UnaryOp<Self>),
@@ -87,6 +87,7 @@ pub enum InstrLow<N: BlockPyNameLike = UnresolvedName> {
     MakeFunction(MakeFunction<Self>),
 }
 
+pub type InstrUnresolved = InstrLow<UnresolvedName>;
 pub type InstrResolved = InstrLow<ResolvedName>;
 
 #[derive(Debug, Clone)]

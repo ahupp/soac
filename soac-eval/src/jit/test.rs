@@ -2,7 +2,7 @@ use super::*;
 use soac_blockpy::block_py::{
     BinOp, BinOpKind, BlockParamRole, BlockPyFunction, BlockPyLiteral, BlockPyModule, BlockTerm,
     Call, CallArgPositional, CellLocation, ClosureInit, ClosureSlot, CodegenBlock,
-    CodegenBlockPyExpr, InstrLow, CoreNumberLiteral, CoreNumberLiteralValue,
+    CodegenBlockPyExpr, InstrUnresolved, CoreNumberLiteral, CoreNumberLiteralValue,
     CoreStringLiteral, CounterSite, Del, DelItem, FunctionName, LiteralValue, Load,
     InstrResolved, ResolvedName, ModuleNameGen, NameLocation, Param, ParamKind, ParamSpec,
     StorageLayout, Store,
@@ -70,14 +70,14 @@ mod tests {
                     .expect("test integer literal should parse"),
             ),
         });
-        InstrLow::Literal(LiteralValue::new(literal))
+        InstrResolved::Literal(LiteralValue::new(literal))
     }
 
     fn string_literal(value: &str) -> InstrResolved {
         let literal = BlockPyLiteral::StringLiteral(CoreStringLiteral {
             value: value.to_string(),
         });
-        InstrLow::Literal(LiteralValue::new(literal))
+        InstrResolved::Literal(LiteralValue::new(literal))
     }
 
     #[derive(Default)]
@@ -1446,7 +1446,7 @@ def f(x):
         let rendered = render_test_jit_function_with_module_constants(
             &function,
             &blocks,
-            vec![InstrLow::Load(Load::new(test_runtime_name(
+            vec![InstrResolved::Load(Load::new(test_runtime_name(
                 "globals",
             )))],
         );

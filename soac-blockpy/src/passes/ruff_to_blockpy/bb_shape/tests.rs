@@ -4,7 +4,7 @@ use super::{
 };
 use crate::block_py::{
     Block, BlockLabel, BlockParam, BlockParamRole, BlockPyNameLike, BlockPyStmtBuilder, BlockTerm,
-    CallArgPositional, ChildVisitable, InstrLow, InstrResolved, ResolvedName, Meta,
+    CallArgPositional, ChildVisitable, InstrLow, InstrUnresolved, InstrResolved, ResolvedName, Meta,
     ModuleNameGen, NameLocation, ResolvedStorageBlock, StructuredIf, StructuredInstr, TermIf,
     WithMeta,
 };
@@ -31,8 +31,8 @@ where
 }
 
 pub(crate) fn lower_structured_unresolved_core_blocks_to_bb_blocks(
-    blocks: &[Block<StructuredInstr<InstrLow>, InstrLow>],
-) -> Vec<Block<InstrLow, InstrLow>> {
+    blocks: &[Block<StructuredInstr<InstrUnresolved>, InstrUnresolved>],
+) -> Vec<Block<InstrUnresolved, InstrUnresolved>> {
     let module_name_gen = ModuleNameGen::new(0);
     let name_gen = module_name_gen.next_function_name_gen();
     let mut normalized_blocks = blocks.to_vec();
@@ -124,7 +124,7 @@ fn current_exception_name_expr_located(exc_name: &str) -> InstrResolved {
 }
 
 fn rewrite_current_exception_in_core_blocks_structured(
-    blocks: &mut [Block<StructuredInstr<InstrLow>, InstrLow>],
+    blocks: &mut [Block<StructuredInstr<InstrUnresolved>, InstrUnresolved>],
 ) {
     for block in blocks {
         let Some(exc_name) = block.exception_param().map(ToString::to_string) else {
@@ -138,7 +138,7 @@ fn rewrite_current_exception_in_core_blocks_structured(
 }
 
 fn rewrite_current_exception_in_blockpy_stmt(
-    stmt: &mut StructuredInstr<InstrLow>,
+    stmt: &mut StructuredInstr<InstrUnresolved>,
     exc_name: &str,
 ) {
     match stmt {
@@ -172,7 +172,7 @@ fn expr_name(name: &str, ctx: ast::ExprContext) -> ast::ExprName {
     }
 }
 
-fn core_name_expr(name: &str) -> InstrLow {
+fn core_name_expr(name: &str) -> InstrUnresolved {
     let name = expr_name(name, ast::ExprContext::Load);
     crate::block_py::Load::new(name.clone())
         .with_meta(crate::block_py::Meta::synthetic())
@@ -188,7 +188,7 @@ fn lower_structured_core_blocks_to_bb_blocks_handles_unlocated_names() {
                 core_name_expr("current_exception"),
                 ast::AtomicNodeIndex::default(),
                 TextRange::default(),
-                Vec::<CallArgPositional<InstrLow>>::new(),
+                Vec::<CallArgPositional<InstrUnresolved>>::new(),
                 Vec::new(),
             ),
             body: BlockPyStmtBuilder::from_stmts(vec![StructuredInstr::Expr(
@@ -218,7 +218,7 @@ fn lower_structured_core_blocks_to_bb_blocks_handles_unlocated_names() {
 
     assert_eq!(lowered.len(), 3, "{lowered:?}");
     let BlockTerm::IfTerm(TermIf {
-        test: InstrLow::Load(load),
+        test: InstrUnresolved::Load(load),
         ..
     }) = &lowered[0].term
     else {

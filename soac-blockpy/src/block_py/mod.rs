@@ -33,7 +33,7 @@ pub(crate) mod scope;
 pub(crate) mod validate;
 mod visit;
 pub use crate::passes::{
-    InstrLow, InstrWithAwaitAndYield, InstrWithYield, InstrResolved,
+    InstrLow, InstrUnresolved, InstrWithAwaitAndYield, InstrWithYield, InstrResolved,
 };
 #[allow(unused_imports)]
 pub(crate) use map::{
@@ -1374,7 +1374,7 @@ impl ImplicitNoneExpr for InstrWithYield {
     }
 }
 
-impl ImplicitNoneExpr for InstrLow {
+impl ImplicitNoneExpr for InstrUnresolved {
     fn implicit_none_expr() -> Self {
         core_runtime_name_expr_with_meta("NONE", Default::default(), Default::default())
     }
@@ -1382,7 +1382,7 @@ impl ImplicitNoneExpr for InstrLow {
     fn is_implicit_none_expr(expr: &Self) -> bool {
         matches!(
             expr,
-            InstrLow::Load(op) if op.name.is_runtime_symbol("NONE")
+            InstrUnresolved::Load(op) if op.name.is_runtime_symbol("NONE")
         )
     }
 }

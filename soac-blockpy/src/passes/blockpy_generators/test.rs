@@ -6,7 +6,7 @@ use super::{
 use crate::block_py::{
     core_call_expr_with_meta, BinOpKind, BindingKind, BindingPurpose, Block, BlockBuilder,
     BlockLabel, BlockPyLiteral, BlockPyNameLike, BlockTerm, CallArgPositional, CallableScopeInfo,
-    CallableScopeKind, CellBindingKind, ClosureInit, ClosureSlot, InstrLow,
+    CallableScopeKind, CellBindingKind, ClosureInit, ClosureSlot, InstrUnresolved,
     InstrWithYield, FunctionId, FunctionName, HasMeta, Meta, StorageLayout,
     StructuredInstr, TryMapTerm, UnaryOpKind, WithMeta, Yield,
 };
@@ -108,19 +108,19 @@ fn core_load_with_yield(name: &str) -> InstrWithYield {
 #[test]
 fn name_not_none_helper_builds_not_is_none_shape() {
     let expr = is_name_not_none_test("value");
-    let InstrLow::UnaryOp(not_expr) = expr else {
+    let InstrUnresolved::UnaryOp(not_expr) = expr else {
         panic!("expected unary not expression");
     };
     assert_eq!(not_expr.kind, UnaryOpKind::Not);
-    let InstrLow::BinOp(is_expr) = *not_expr.operand else {
+    let InstrUnresolved::BinOp(is_expr) = *not_expr.operand else {
         panic!("expected inner identity test");
     };
     assert_eq!(is_expr.kind, BinOpKind::Is);
-    let InstrLow::Load(name) = *is_expr.left else {
+    let InstrUnresolved::Load(name) = *is_expr.left else {
         panic!("expected left side to load the named value");
     };
     assert_eq!(name.name.id_str(), "value");
-    let InstrLow::Load(name) = *is_expr.right else {
+    let InstrUnresolved::Load(name) = *is_expr.right else {
         panic!("expected right side to load NONE");
     };
     assert_eq!(name.name.id_str(), "NONE");
@@ -130,17 +130,17 @@ fn name_not_none_helper_builds_not_is_none_shape() {
 #[test]
 fn yield_from_send_helper_builds_send_call_shape() {
     let expr = yield_from_send_expr();
-    let InstrLow::Call(call) = expr else {
+    let InstrUnresolved::Call(call) = expr else {
         panic!("expected call expression");
     };
-    let InstrLow::GetAttr(get_attr) = *call.func else {
+    let InstrUnresolved::GetAttr(get_attr) = *call.func else {
         panic!("expected getattr call target");
     };
-    let InstrLow::Load(name) = *get_attr.value else {
+    let InstrUnresolved::Load(name) = *get_attr.value else {
         panic!("expected send receiver load");
     };
     assert_eq!(name.name.id_str(), "_dp_yieldfrom");
-    let InstrLow::Literal(lit) = *get_attr.attr else {
+    let InstrUnresolved::Literal(lit) = *get_attr.attr else {
         panic!("expected send attr literal");
     };
     let BlockPyLiteral::StringLiteral(lit) = lit.into_literal() else {
@@ -148,7 +148,7 @@ fn yield_from_send_helper_builds_send_call_shape() {
     };
     assert_eq!(lit.value, "send");
     assert_eq!(call.args.len(), 1);
-    let CallArgPositional::Positional(InstrLow::Load(name)) = &call.args[0] else {
+    let CallArgPositional::Positional(InstrUnresolved::Load(name)) = &call.args[0] else {
         panic!("expected positional _dp_send_value argument");
     };
     assert_eq!(name.name.id_str(), "_dp_send_value");
@@ -157,27 +157,27 @@ fn yield_from_send_helper_builds_send_call_shape() {
 #[test]
 fn yield_from_lookup_helper_builds_getattr_call_shape() {
     let expr = yield_from_method_lookup_expr("close");
-    let InstrLow::Call(call) = expr else {
+    let InstrUnresolved::Call(call) = expr else {
         panic!("expected call expression");
     };
-    let InstrLow::Load(name) = *call.func else {
+    let InstrUnresolved::Load(name) = *call.func else {
         panic!("expected getattr load target");
     };
     assert_eq!(name.name.id_str(), "getattr");
     assert!(name.name.is_runtime_name());
     assert_eq!(call.args.len(), 3);
-    let CallArgPositional::Positional(InstrLow::Load(name)) = &call.args[0] else {
+    let CallArgPositional::Positional(InstrUnresolved::Load(name)) = &call.args[0] else {
         panic!("expected first positional _dp_yieldfrom argument");
     };
     assert_eq!(name.name.id_str(), "_dp_yieldfrom");
-    let CallArgPositional::Positional(InstrLow::Literal(lit)) = &call.args[1] else {
+    let CallArgPositional::Positional(InstrUnresolved::Literal(lit)) = &call.args[1] else {
         panic!("expected second positional string attr argument");
     };
     let BlockPyLiteral::StringLiteral(lit) = lit.clone().into_literal() else {
         panic!("expected string attr literal");
     };
     assert_eq!(lit.value, "close");
-    let CallArgPositional::Positional(InstrLow::Load(name)) = &call.args[2] else {
+    let CallArgPositional::Positional(InstrUnresolved::Load(name)) = &call.args[2] else {
         panic!("expected third positional NONE default argument");
     };
     assert_eq!(name.name.id_str(), "NONE");
@@ -187,14 +187,14 @@ fn yield_from_lookup_helper_builds_getattr_call_shape() {
 #[test]
 fn current_exception_value_helper_builds_value_attr_lookup() {
     let expr = current_exception_value_expr("_dp_exc");
-    let InstrLow::GetAttr(get_attr) = expr else {
+    let InstrUnresolved::GetAttr(get_attr) = expr else {
         panic!("expected attribute lookup");
     };
-    let InstrLow::Load(name) = *get_attr.value else {
+    let InstrUnresolved::Load(name) = *get_attr.value else {
         panic!("expected value load on the left");
     };
     assert_eq!(name.name.id_str(), "_dp_exc");
-    let InstrLow::Literal(lit) = *get_attr.attr else {
+    let InstrUnresolved::Literal(lit) = *get_attr.attr else {
         panic!("expected literal attr name");
     };
     let BlockPyLiteral::StringLiteral(lit) = lit.into_literal() else {

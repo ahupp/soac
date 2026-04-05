@@ -8,7 +8,7 @@ use crate::block_py::{
     core_runtime_positional_call_expr_with_meta, literal_expr, BindingKind, Block, BlockArg,
     BlockBuilder, BlockEdge, BlockLabel, BlockParam, BlockParamRole, BlockPyFunction,
     BlockPyModule, BlockPyNameLike, BlockTerm, CallArgKeyword, CallArgPositional,
-    CallableScopeInfo, CellBindingKind, CellRefForName, ClosureInit, ClosureSlot, InstrLow,
+    CallableScopeInfo, CellBindingKind, CellRefForName, ClosureInit, ClosureSlot, InstrUnresolved,
     InstrWithYield, CoreNumberLiteral, CoreNumberLiteralValue, CoreStringLiteral,
     FunctionId, FunctionKind, FunctionName, FunctionNameGen, GetAttr, ImplicitNoneExpr, Instr,
     Load, MakeFunction, Mappable, ModuleNameGen, ScopeExprNode, StorageLayout, Store,
@@ -56,9 +56,9 @@ const ASYNC_GENERATOR_RESUME_ABI_PARAMS: [ResumeAbiParam; 4] = [
 ];
 
 type LinearYieldStmt = InstrWithYield;
-type LinearCoreStmt = InstrLow;
+type LinearCoreStmt = InstrUnresolved;
 type LinearYieldBlock = Block<LinearYieldStmt, InstrWithYield>;
-type LinearCoreBlock = Block<LinearCoreStmt, InstrLow>;
+type LinearCoreBlock = Block<LinearCoreStmt, InstrUnresolved>;
 type BlockPyBlock = LinearCoreBlock;
 
 struct ErrOnYield;
@@ -66,9 +66,9 @@ struct ErrOnYield;
 fn try_lower_core_expr_without_yield_with_mapper<M>(
     expr: InstrWithYield,
     map: &mut M,
-) -> Result<InstrLow, InstrWithYield>
+) -> Result<InstrUnresolved, InstrWithYield>
 where
-    M: TryMapInstr<InstrWithYield, InstrLow, InstrWithYield>,
+    M: TryMapInstr<InstrWithYield, InstrUnresolved, InstrWithYield>,
 {
     match_default!(expr: crate::passes::InstrWithYield {
         InstrWithYield::Yield(node) => Err(node.into()),
@@ -77,13 +77,13 @@ where
     })
 }
 
-impl TryMapInstr<InstrWithYield, InstrLow, InstrWithYield>
+impl TryMapInstr<InstrWithYield, InstrUnresolved, InstrWithYield>
     for ErrOnYield
 {
     fn try_map_instr(
         &mut self,
         expr: InstrWithYield,
-    ) -> Result<InstrLow, InstrWithYield> {
+    ) -> Result<InstrUnresolved, InstrWithYield> {
         try_lower_core_expr_without_yield_with_mapper(expr, self)
     }
 
@@ -191,7 +191,7 @@ fn unresolved_name(id: &str) -> UnresolvedName {
     ast::name::Name::new(id).into()
 }
 
-fn core_name(name: &str) -> InstrLow {
+fn core_name(name: &str) -> InstrUnresolved {
     unresolved_load_expr(unresolved_name(name))
 }
 
@@ -300,7 +300,7 @@ where
     expr.visit_children(&mut NamedExprTargetVisitor { names });
 }
 
-fn core_literal_int(value: usize) -> InstrLow {
+fn core_literal_int(value: usize) -> InstrUnresolved {
     let text = value.to_string();
     literal_expr(
         CoreNumberLiteral {
@@ -313,11 +313,11 @@ fn core_literal_int(value: usize) -> InstrLow {
     )
 }
 
-fn core_none() -> InstrLow {
-    InstrLow::implicit_none_expr()
+fn core_none() -> InstrUnresolved {
+    InstrUnresolved::implicit_none_expr()
 }
 
-fn core_string_literal(value: &str) -> InstrLow {
+fn core_string_literal(value: &str) -> InstrUnresolved {
     literal_expr(
         CoreStringLiteral {
             value: value.to_string(),
@@ -326,7 +326,7 @@ fn core_string_literal(value: &str) -> InstrLow {
     )
 }
 
-fn core_call(func_name: &str, args: Vec<InstrLow>) -> InstrLow {
+fn core_call(func_name: &str, args: Vec<InstrUnresolved>) -> InstrUnresolved {
     core_runtime_positional_call_expr_with_meta(
         func_name,
         ast::AtomicNodeIndex::default(),
@@ -336,10 +336,10 @@ fn core_call(func_name: &str, args: Vec<InstrLow>) -> InstrLow {
 }
 
 fn core_call_expr(
-    func: InstrLow,
-    args: Vec<InstrLow>,
-    keywords: Vec<(&str, InstrLow)>,
-) -> InstrLow {
+    func: InstrUnresolved,
+    args: Vec<InstrUnresolved>,
+    keywords: Vec<(&str, InstrUnresolved)>,
+) -> InstrUnresolved {
     core_call_expr_with_meta(
         func,
         ast::AtomicNodeIndex::default(),
@@ -357,19 +357,19 @@ fn core_call_expr(
     )
 }
 
-fn core_runtime_attr(attr: &str) -> InstrLow {
+fn core_runtime_attr(attr: &str) -> InstrUnresolved {
     core_runtime_name_expr_with_meta(attr, ast::AtomicNodeIndex::default(), Default::default())
 }
 
-fn core_get_attr(value: InstrLow, attr: &str) -> InstrLow {
+fn core_get_attr(value: InstrUnresolved, attr: &str) -> InstrUnresolved {
     GetAttr::new(Box::new(value), Box::new(core_string_literal(attr))).into()
 }
 
-fn core_cell_ref(logical_name: &str) -> InstrLow {
+fn core_cell_ref(logical_name: &str) -> InstrUnresolved {
     CellRefForName::new(logical_name.to_string()).into()
 }
 
-fn core_generator_code(async_gen: bool, name: &str, qualname: &str) -> InstrLow {
+fn core_generator_code(async_gen: bool, name: &str, qualname: &str) -> InstrUnresolved {
     let template_attr = if async_gen {
         "code_template_async_gen"
     } else {
@@ -392,9 +392,9 @@ fn core_generator_code(async_gen: bool, name: &str, qualname: &str) -> InstrLow 
 fn core_make_function(
     function_id: FunctionId,
     kind: FunctionKind,
-    param_defaults: InstrLow,
-    annotate_fn: InstrLow,
-) -> InstrLow {
+    param_defaults: InstrUnresolved,
+    annotate_fn: InstrUnresolved,
+) -> InstrUnresolved {
     MakeFunction::new(
         function_id,
         kind,
@@ -731,7 +731,7 @@ fn lower_stmt_no_yield(stmt: LinearYieldStmt) -> LinearCoreStmt {
         })
 }
 
-fn lower_term_no_yield(term: BlockTerm<InstrWithYield>) -> BlockTerm<InstrLow> {
+fn lower_term_no_yield(term: BlockTerm<InstrWithYield>) -> BlockTerm<InstrUnresolved> {
     let mut mapper = ErrOnYield;
     mapper.try_map_term(term.clone()).unwrap_or_else(|_| {
         panic!(
@@ -740,7 +740,7 @@ fn lower_term_no_yield(term: BlockTerm<InstrWithYield>) -> BlockTerm<InstrLow> {
     })
 }
 
-fn yield_value_expr(value: Option<InstrWithYield>) -> InstrLow {
+fn yield_value_expr(value: Option<InstrWithYield>) -> InstrUnresolved {
     value
         .map(|value| {
             ErrOnYield
@@ -752,8 +752,8 @@ fn yield_value_expr(value: Option<InstrWithYield>) -> InstrLow {
 
 fn completion_raise(
     kind: FunctionKind,
-    value: Option<InstrLow>,
-) -> BlockTerm<InstrLow> {
+    value: Option<InstrUnresolved>,
+) -> BlockTerm<InstrUnresolved> {
     match kind {
         FunctionKind::Generator | FunctionKind::Coroutine => {
             let exc = if let Some(value) = value {
@@ -774,7 +774,7 @@ fn push_completion_raise_block(
     state: &mut ResumeLoweringState,
     label: BlockLabel,
     body: Vec<LinearCoreStmt>,
-    value: Option<InstrLow>,
+    value: Option<InstrUnresolved>,
     params: Vec<BlockParam>,
     exc_target: Option<BlockLabel>,
 ) {
@@ -808,7 +808,7 @@ fn explicit_jump_args_for_params(params: &[BlockParam]) -> Vec<BlockArg> {
         .collect()
 }
 
-fn is_resume_exc_test() -> InstrLow {
+fn is_resume_exc_test() -> InstrUnresolved {
     crate::block_py::operation::UnaryOp::new(
         crate::block_py::operation::UnaryOpKind::Not,
         Box::new(
@@ -827,7 +827,7 @@ fn is_resume_exc_test() -> InstrLow {
     .into()
 }
 
-fn is_send_none_test() -> InstrLow {
+fn is_send_none_test() -> InstrUnresolved {
     crate::block_py::operation::BinOp::new(
         crate::block_py::operation::BinOpKind::Is,
         Box::new(core_name("_dp_send_value")),
@@ -836,7 +836,7 @@ fn is_send_none_test() -> InstrLow {
     .into()
 }
 
-fn is_name_none_test(name: &str) -> InstrLow {
+fn is_name_none_test(name: &str) -> InstrUnresolved {
     crate::block_py::operation::BinOp::new(
         crate::block_py::operation::BinOpKind::Is,
         Box::new(core_name(name)),
@@ -845,11 +845,11 @@ fn is_name_none_test(name: &str) -> InstrLow {
     .into()
 }
 
-fn is_name_not_none_test(name: &str) -> InstrLow {
+fn is_name_not_none_test(name: &str) -> InstrUnresolved {
     UnaryOp::new(UnaryOpKind::Not, Box::new(is_name_none_test(name))).into()
 }
 
-fn is_resume_generator_exit_test() -> InstrLow {
+fn is_resume_generator_exit_test() -> InstrUnresolved {
     core_call(
         "isinstance",
         vec![
@@ -859,13 +859,13 @@ fn is_resume_generator_exit_test() -> InstrLow {
     )
 }
 
-fn resume_exc_raise_term() -> BlockTerm<InstrLow> {
+fn resume_exc_raise_term() -> BlockTerm<InstrUnresolved> {
     BlockTerm::Raise(TermRaise {
         exc: Some(core_name("_dp_resume_exc")),
     })
 }
 
-fn stop_iteration_match_test(exc_name: &str) -> InstrLow {
+fn stop_iteration_match_test(exc_name: &str) -> InstrUnresolved {
     core_call_expr(
         core_runtime_attr("exception_matches"),
         vec![core_name(exc_name), core_runtime_attr("StopIteration")],
@@ -873,15 +873,15 @@ fn stop_iteration_match_test(exc_name: &str) -> InstrLow {
     )
 }
 
-fn current_exception_value_expr(exc_name: &str) -> InstrLow {
+fn current_exception_value_expr(exc_name: &str) -> InstrUnresolved {
     core_get_attr(core_name(exc_name), "value")
 }
 
-fn yield_from_next_expr() -> InstrLow {
+fn yield_from_next_expr() -> InstrUnresolved {
     core_call("next", vec![core_name("_dp_yieldfrom")])
 }
 
-fn yield_from_send_expr() -> InstrLow {
+fn yield_from_send_expr() -> InstrUnresolved {
     core_call_expr(
         core_get_attr(core_name("_dp_yieldfrom"), "send"),
         vec![core_name("_dp_send_value")],
@@ -889,7 +889,7 @@ fn yield_from_send_expr() -> InstrLow {
     )
 }
 
-fn yield_from_method_lookup_expr(method: &str) -> InstrLow {
+fn yield_from_method_lookup_expr(method: &str) -> InstrUnresolved {
     core_call(
         "getattr",
         vec![
@@ -900,11 +900,11 @@ fn yield_from_method_lookup_expr(method: &str) -> InstrLow {
     )
 }
 
-fn no_arg_name_call_expr(name: &str) -> InstrLow {
+fn no_arg_name_call_expr(name: &str) -> InstrUnresolved {
     core_call_expr(core_name(name), Vec::new(), Vec::new())
 }
 
-fn single_arg_name_call_expr(name: &str, arg: InstrLow) -> InstrLow {
+fn single_arg_name_call_expr(name: &str, arg: InstrUnresolved) -> InstrUnresolved {
     core_call_expr(core_name(name), vec![arg], Vec::new())
 }
 
@@ -970,7 +970,7 @@ impl ResumeLoweringState {
         self.blocks.push(block);
     }
 
-    fn prune_term_target_args(&self, term: &mut BlockTerm<InstrLow>) {
+    fn prune_term_target_args(&self, term: &mut BlockTerm<InstrUnresolved>) {
         let BlockTerm::Jump(edge) = term else {
             return;
         };

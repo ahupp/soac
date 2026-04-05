@@ -2,8 +2,8 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use soac_blockpy::block_py::{
     AbruptKind, BlockArg, BlockPyFunction, BlockPyLiteral, BlockPyModule, BlockPyNameLike,
-    BlockTerm, CallArgKeyword, ChildVisitable, CodegenBlockPyExpr, InstrLow,
-    CoreNumberLiteralValue, InstrResolved, ParamDefaultSource,
+    BlockTerm, CallArgKeyword, ChildVisitable, CodegenBlockPyExpr, CoreNumberLiteralValue,
+    InstrResolved, ParamDefaultSource,
     operation as blockpy_intrinsics,
 };
 use soac_blockpy::passes::CodegenBlockPyPass;
@@ -208,7 +208,7 @@ impl ModuleCodegenConstants {
 
     fn push_explicit_constant_expr(&mut self, expr: &InstrResolved) -> ModuleConstantId {
         let value = match expr {
-            InstrLow::Literal(literal) => match literal.as_literal() {
+            InstrResolved::Literal(literal) => match literal.as_literal() {
                 BlockPyLiteral::StringLiteral(string) => {
                     ModuleConstantValue::Unicode(string.value.as_bytes().to_vec())
                 }
@@ -228,7 +228,7 @@ impl ModuleCodegenConstants {
                     }
                 },
             },
-            InstrLow::Load(op) if op.name.is_runtime_name() => {
+            InstrResolved::Load(op) if op.name.is_runtime_name() => {
                 ModuleConstantValue::RuntimeName(op.name.id_str().as_bytes().to_vec())
             }
             _ => {

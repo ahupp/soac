@@ -1,8 +1,8 @@
 use crate::block_py::{BindingKind, ClosureInit, ClosureSlot};
 use crate::block_py::{
     BlockPyFunction, BlockPyModule, BlockPyNameLike, BlockTerm, Call, CallArgKeyword,
-    CallArgPositional, CallableScopeKind, CellBindingKind, InstrLow, FunctionKind,
-    ResolvedName, NameLocation, ResolvedStorageBlock,
+    CallArgPositional, CallableScopeKind, CellBindingKind, InstrLow, InstrResolved,
+    FunctionKind, ResolvedName, NameLocation, ResolvedStorageBlock,
 };
 use crate::passes::{CoreBlockPyPassWithAwaitAndYield, ResolvedStorageBlockPyPass};
 use crate::{lower_python_to_blockpy_for_testing, LoweringResult};
@@ -169,10 +169,10 @@ fn runtime_call_by_name<'a>(
     expr: &'a InstrLow<ResolvedName>,
     name: &str,
 ) -> Option<&'a Call<InstrLow<ResolvedName>>> {
-    let InstrLow::Call(call) = expr else {
+    let InstrResolved::Call(call) = expr else {
         return None;
     };
-    let InstrLow::Load(load) = call.func.as_ref() else {
+    let InstrResolved::Load(load) = call.func.as_ref() else {
         return None;
     };
     if load.name.is_runtime_symbol(name) {
@@ -181,7 +181,7 @@ fn runtime_call_by_name<'a>(
     let Some(constant_index) = load.name.location.as_constant() else {
         return None;
     };
-    let Some(InstrLow::Load(helper_load)) =
+    let Some(InstrResolved::Load(helper_load)) =
         module.module_constants.get(constant_index as usize)
     else {
         return None;
@@ -294,7 +294,7 @@ def f():
         .position(|expr| {
             matches!(
                 expr,
-                InstrLow::Load(load)
+                InstrResolved::Load(load)
                     if load.name.is_runtime_name()
                         && load.name.id_str() == "make_function"
                         && load.name.location == NameLocation::RuntimeName
@@ -302,7 +302,7 @@ def f():
         })
         .unwrap_or_else(|| panic!("expected lifted make_function runtime load, got {bb_module:?}"));
     let runtime_make_function = &bb_module.module_constants[make_function_index];
-    let InstrLow::Load(load) = runtime_make_function else {
+    let InstrResolved::Load(load) = runtime_make_function else {
         unreachable!();
     };
     assert_eq!(load.name.location, NameLocation::RuntimeName, "{load:?}");
@@ -1889,11 +1889,11 @@ def outer(x):
         .iter()
         .find(|func| func.names.bind_name == "outer")
         .expect("outer function should be present");
-    let Some(InstrLow::Store(assign)) = outer.entry_block().body.first() else {
+    let Some(InstrResolved::Store(assign)) = outer.entry_block().body.first() else {
         panic!("expected first entry stmt to be Expr(Store(...))");
     };
     assert!(
-        matches!(&*assign.value, InstrLow::MakeCell(_)),
+        matches!(&*assign.value, InstrResolved::MakeCell(_)),
         "{assign:?}"
     );
 }
