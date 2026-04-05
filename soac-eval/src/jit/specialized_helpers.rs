@@ -112,6 +112,26 @@ unsafe extern "C" fn callee_function_id_hook(callable: ObjPtr) -> i64 {
 }
 
 #[cfg(not(test))]
+unsafe extern "C" fn guard_method_type_version_hook(
+    receiver: ObjPtr,
+    expected_type: ObjPtr,
+    expected_version: i64,
+) -> i32 {
+    if receiver.is_null() || expected_type.is_null() || expected_version < 0 {
+        ffi::PyErr_SetString(
+            ffi::PyExc_RuntimeError,
+            b"invalid arguments to dp_jit_guard_method_type_version\0".as_ptr() as *const i8,
+        );
+        return -1;
+    }
+    let receiver_type = ffi::Py_TYPE(receiver as *mut ffi::PyObject);
+    if receiver_type != expected_type as *mut ffi::PyTypeObject {
+        return 0;
+    }
+    ((*receiver_type).tp_version_tag == expected_version as u32) as i32
+}
+
+#[cfg(not(test))]
 unsafe extern "C" fn lookup_direct_code_ptr_hook(vmctx: ObjPtr, function_id: i64) -> ObjPtr {
     if vmctx.is_null() || function_id < 0 {
         ffi::PyErr_SetString(
@@ -949,6 +969,11 @@ mod test_only_export_stubs {
     ));
     panic_obj_export!(dp_jit_py_call_with_kw(callable: ObjPtr, args: ObjPtr, kw: ObjPtr));
     panic_i64_export!(dp_jit_callee_function_id(callable: ObjPtr));
+    panic_i32_export!(dp_jit_guard_method_type_version(
+        receiver: ObjPtr,
+        expected_type: ObjPtr,
+        expected_version: i64
+    ));
     panic_unit_export!(dp_jit_record_counter_value(vmctx: ObjPtr, counter_id: i64, value: i64));
     panic_obj_export!(dp_jit_get_raised_exception());
     panic_obj_export!(dp_jit_get_arg_item(args: ObjPtr, index: i64));
@@ -1042,6 +1067,15 @@ pub unsafe extern "C" fn dp_jit_py_call_with_kw(
 #[cfg(not(test))]
 pub unsafe extern "C" fn dp_jit_callee_function_id(callable: ObjPtr) -> i64 {
     callee_function_id_hook(callable)
+}
+
+#[cfg(not(test))]
+pub unsafe extern "C" fn dp_jit_guard_method_type_version(
+    receiver: ObjPtr,
+    expected_type: ObjPtr,
+    expected_version: i64,
+) -> i32 {
+    guard_method_type_version_hook(receiver, expected_type, expected_version)
 }
 
 #[cfg(not(test))]
@@ -1463,6 +1497,10 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol(
         "dp_jit_callee_function_id",
         dp_jit_callee_function_id as *const u8,
+    );
+    builder.symbol(
+        "dp_jit_guard_method_type_version",
+        dp_jit_guard_method_type_version as *const u8,
     );
     builder.symbol(
         "dp_jit_record_counter_value",

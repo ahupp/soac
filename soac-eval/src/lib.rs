@@ -41,6 +41,7 @@ unsafe extern "C" {
     fn PyFunction_SetVectorcall(func: *mut ffi::PyFunctionObject, vectorcall: ffi::vectorcallfunc);
     fn PyFunction_AddWatcher(callback: PyFunctionWatchCallback) -> i32;
     fn PyType_Modified(type_obj: *mut ffi::PyTypeObject);
+    fn PyUnstable_Type_AssignVersionTag(type_obj: *mut ffi::PyTypeObject) -> i32;
     fn PyWeakref_NewRef(
         object: *mut ffi::PyObject,
         callback: *mut ffi::PyObject,
@@ -86,10 +87,10 @@ unsafe extern "C" fn function_owner_type_watcher_callback(
         | PY_FUNCTION_EVENT_MODIFY_DEFAULTS
         | PY_FUNCTION_EVENT_MODIFY_KWDEFAULTS
         | PY_FUNCTION_EVENT_MODIFY_QUALNAME => {
-            let weakrefs = match registry.owner_type_weakrefs_by_function.lock() {
+            let weakrefs = match registry.registered_owner_types_by_function.lock() {
                 Ok(owner_types_by_function) => owner_types_by_function
                     .get(&(func as usize))
-                    .cloned()
+                    .map(|entry| entry.owner_type_weakrefs.clone())
                     .unwrap_or_default(),
                 Err(_) => {
                     ffi::PyErr_SetString(
@@ -112,12 +113,11 @@ unsafe extern "C" fn function_owner_type_watcher_callback(
                 }
             }
             if !stale_weakrefs.is_empty() {
-                let _ = registry.owner_type_weakrefs_by_function.lock().map(
+                let _ = registry.registered_owner_types_by_function.lock().map(
                     |mut weakrefs_by_function| {
-                        if let Some(registered_weakrefs) =
-                            weakrefs_by_function.get_mut(&(func as usize))
+                        if let Some(registered) = weakrefs_by_function.get_mut(&(func as usize))
                         {
-                            registered_weakrefs.retain(|weakref| {
+                            registered.owner_type_weakrefs.retain(|weakref| {
                                 let keep = !stale_weakrefs.contains(weakref);
                                 if !keep {
                                     unsafe { ffi::Py_DECREF(*weakref as *mut ffi::PyObject) };
@@ -130,10 +130,13 @@ unsafe extern "C" fn function_owner_type_watcher_callback(
             }
         }
         PY_FUNCTION_EVENT_DESTROY => {
-            let owner_types = match registry.owner_type_weakrefs_by_function.lock() {
+            let registered = match registry.registered_owner_types_by_function.lock() {
                 Ok(mut owner_types_by_function) => owner_types_by_function
                     .remove(&(func as usize))
-                    .unwrap_or_default(),
+                    .unwrap_or_else(|| RegisteredFunctionOwnerTypes {
+                        function_weakref: 0,
+                        owner_type_weakrefs: Vec::new(),
+                    }),
                 Err(_) => {
                     ffi::PyErr_SetString(
                         ffi::PyExc_RuntimeError,
@@ -142,7 +145,10 @@ unsafe extern "C" fn function_owner_type_watcher_callback(
                     return -1;
                 }
             };
-            for owner_type in owner_types {
+            if registered.function_weakref != 0 {
+                ffi::Py_DECREF(registered.function_weakref as *mut ffi::PyObject);
+            }
+            for owner_type in registered.owner_type_weakrefs {
                 ffi::Py_DECREF(owner_type as *mut ffi::PyObject);
             }
         }
@@ -161,7 +167,7 @@ fn function_owner_type_registry() -> Result<&'static FunctionOwnerTypeRegistry, 
         } else {
             Ok(FunctionOwnerTypeRegistry {
                 watcher_id,
-                owner_type_weakrefs_by_function: Mutex::new(HashMap::new()),
+                registered_owner_types_by_function: Mutex::new(HashMap::new()),
             })
         }
     }) {
@@ -194,16 +200,26 @@ struct ClifFunctionData {
     compiled_vectorcall_entry: Option<jit::VectorcallEntryFn>,
 }
 
+#[derive(Clone, Debug)]
+struct RegisteredFunctionOwnerTypes {
+    function_weakref: usize,
+    owner_type_weakrefs: Vec<usize>,
+}
+
 struct FunctionOwnerTypeRegistry {
     watcher_id: i32,
-    owner_type_weakrefs_by_function: Mutex<HashMap<usize, Vec<usize>>>,
+    registered_owner_types_by_function: Mutex<HashMap<usize, RegisteredFunctionOwnerTypes>>,
 }
 
 impl Drop for FunctionOwnerTypeRegistry {
     fn drop(&mut self) {
-        if let Ok(mut weakrefs_by_function) = self.owner_type_weakrefs_by_function.lock() {
-            for weakrefs in weakrefs_by_function.values_mut() {
-                for weakref in weakrefs.drain(..) {
+        if let Ok(mut weakrefs_by_function) = self.registered_owner_types_by_function.lock() {
+            for registered in weakrefs_by_function.values_mut() {
+                if registered.function_weakref != 0 {
+                    unsafe { ffi::Py_DECREF(registered.function_weakref as *mut ffi::PyObject) };
+                    registered.function_weakref = 0;
+                }
+                for weakref in registered.owner_type_weakrefs.drain(..) {
                     unsafe { ffi::Py_DECREF(weakref as *mut ffi::PyObject) };
                 }
             }
@@ -214,6 +230,13 @@ impl Drop for FunctionOwnerTypeRegistry {
 
 static FUNCTION_OWNER_TYPE_REGISTRY: OnceLock<Result<FunctionOwnerTypeRegistry, ()>> =
     OnceLock::new();
+
+#[derive(Clone, Copy, Debug)]
+pub struct DirectMethodOwnerType {
+    pub function_obj: *mut ffi::PyObject,
+    pub owner_type: *mut ffi::PyTypeObject,
+    pub type_version: u32,
+}
 
 fn set_type_error<T>(msg: &str) -> Result<T, ()> {
     unsafe {
@@ -529,7 +552,7 @@ unsafe fn register_owner_type_for_function(
     let function_key = function as usize;
     let mut owner_types_by_function =
         registry
-            .owner_type_weakrefs_by_function
+            .registered_owner_types_by_function
             .lock()
             .map_err(|_| {
                 ffi::PyErr_SetString(
@@ -537,8 +560,24 @@ unsafe fn register_owner_type_for_function(
                     c"function owner type registry lock poisoned".as_ptr(),
                 );
             })?;
-    let owner_types = owner_types_by_function.entry(function_key).or_default();
-    for weakref in owner_types.iter().copied() {
+    let registered = owner_types_by_function.entry(function_key).or_insert_with(|| {
+        let function_weakref = PyWeakref_NewRef(function, ptr::null_mut());
+        if function_weakref.is_null() {
+            RegisteredFunctionOwnerTypes {
+                function_weakref: 0,
+                owner_type_weakrefs: Vec::new(),
+            }
+        } else {
+            RegisteredFunctionOwnerTypes {
+                function_weakref: function_weakref as usize,
+                owner_type_weakrefs: Vec::new(),
+            }
+        }
+    });
+    if registered.function_weakref == 0 {
+        return Err(());
+    }
+    for weakref in registered.owner_type_weakrefs.iter().copied() {
         let mut existing_owner = ptr::null_mut();
         match PyWeakref_GetRef(weakref as *mut ffi::PyObject, &mut existing_owner) {
             1 => {
@@ -556,8 +595,161 @@ unsafe fn register_owner_type_for_function(
     if owner_type_weakref.is_null() {
         return Err(());
     }
-    owner_types.push(owner_type_weakref as usize);
+    registered.owner_type_weakrefs.push(owner_type_weakref as usize);
     Ok(())
+}
+
+unsafe fn incref_weakref_snapshot(weakref: usize) -> usize {
+    ffi::Py_INCREF(weakref as *mut ffi::PyObject);
+    weakref
+}
+
+unsafe fn resolve_weakref_target(
+    weakref: usize,
+) -> Result<Option<*mut ffi::PyObject>, ()> {
+    let mut value = ptr::null_mut();
+    match PyWeakref_GetRef(weakref as *mut ffi::PyObject, &mut value) {
+        1 => Ok(Some(value)),
+        0 => Ok(None),
+        _ => Err(()),
+    }
+}
+
+unsafe fn lookup_exact_owner_types_for_function_object(
+    function_obj: *mut ffi::PyObject,
+    method_name: &str,
+    owner_type_weakrefs: &[usize],
+) -> Result<Vec<DirectMethodOwnerType>, ()> {
+    let method_name = CString::new(method_name).map_err(|_| {
+        ffi::PyErr_SetString(
+            ffi::PyExc_ValueError,
+            c"method name for direct specialization contained NUL".as_ptr(),
+        );
+    })?;
+    let mut out = Vec::new();
+    for &owner_type_weakref in owner_type_weakrefs {
+        let Some(owner_type_obj) = (unsafe { resolve_weakref_target(owner_type_weakref)? }) else {
+            continue;
+        };
+        let owner_type = owner_type_obj as *mut ffi::PyTypeObject;
+        let dict = (*owner_type).tp_dict;
+        if !dict.is_null() {
+            let current_descriptor = ffi::PyDict_GetItemString(dict, method_name.as_ptr());
+            if current_descriptor == function_obj && ffi::PyFunction_Check(current_descriptor) != 0 {
+                if (*owner_type).tp_version_tag == 0 {
+                    let _ = PyUnstable_Type_AssignVersionTag(owner_type);
+                }
+                let type_version = (*owner_type).tp_version_tag;
+                if type_version != 0 {
+                    out.push(DirectMethodOwnerType {
+                        function_obj,
+                        owner_type,
+                        type_version,
+                    });
+                }
+            }
+        }
+        ffi::Py_DECREF(owner_type_obj);
+    }
+    out.sort_by_key(|entry| (entry.owner_type as usize, entry.function_obj as usize));
+    out.dedup_by_key(|entry| (entry.owner_type as usize, entry.function_obj as usize));
+    Ok(out)
+}
+
+pub unsafe fn lookup_exact_owner_types_for_method(
+    function_id: FunctionId,
+    method_name: &str,
+) -> Result<Vec<DirectMethodOwnerType>, ()> {
+    maybe_register_current_module_owner_types();
+    let Ok(registry) = function_owner_type_registry() else {
+        return Ok(Vec::new());
+    };
+    let snapshot = {
+        let registered_by_function = registry
+            .registered_owner_types_by_function
+            .lock()
+            .map_err(|_| {
+                ffi::PyErr_SetString(
+                    ffi::PyExc_RuntimeError,
+                    c"function owner type registry lock poisoned".as_ptr(),
+                );
+            })?;
+        registered_by_function
+            .values()
+            .map(|registered| {
+                (
+                    unsafe { incref_weakref_snapshot(registered.function_weakref) },
+                    registered
+                        .owner_type_weakrefs
+                        .iter()
+                        .copied()
+                        .map(|weakref| unsafe { incref_weakref_snapshot(weakref) })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut out = Vec::new();
+    for (function_weakref, owner_type_weakrefs) in snapshot {
+        let Some(function_obj) = (unsafe { resolve_weakref_target(function_weakref)? }) else {
+            ffi::Py_DECREF(function_weakref as *mut ffi::PyObject);
+            for owner_type_weakref in owner_type_weakrefs {
+                ffi::Py_DECREF(owner_type_weakref as *mut ffi::PyObject);
+            }
+            continue;
+        };
+        let matches_function_id =
+            matches!(registered_clif_function_id(function_obj)?, Some(registered) if registered == function_id);
+        if matches_function_id {
+            let exact_owner_types = lookup_exact_owner_types_for_function_object(
+                function_obj,
+                method_name,
+                owner_type_weakrefs.as_slice(),
+            )?;
+            for owner in exact_owner_types {
+                if let Some(current_id) = registered_clif_function_id(owner.function_obj)? {
+                    if current_id == function_id {
+                        out.push(owner);
+                    }
+                }
+            }
+            for owner_type_weakref in owner_type_weakrefs {
+                ffi::Py_DECREF(owner_type_weakref as *mut ffi::PyObject);
+            }
+        } else {
+            for owner_type_weakref in owner_type_weakrefs {
+                ffi::Py_DECREF(owner_type_weakref as *mut ffi::PyObject);
+            }
+        }
+        ffi::Py_DECREF(function_obj);
+        ffi::Py_DECREF(function_weakref as *mut ffi::PyObject);
+    }
+    Ok(out)
+}
+
+unsafe fn maybe_register_current_module_owner_types() {
+    let Ok(result) = with_current_module_runtime_context(|runtime| unsafe {
+        let Ok(module_name) = CString::new(runtime.shared_module_state_owner.module_name.as_str())
+        else {
+            return Ok(());
+        };
+        let module_name_obj = ffi::PyUnicode_FromString(module_name.as_ptr());
+        if module_name_obj.is_null() {
+            return Err(());
+        }
+        let result = register_function_owner_types_for_globals(
+            runtime.vmctx.globals_obj as *mut ffi::PyObject,
+            module_name_obj,
+        );
+        ffi::Py_DECREF(module_name_obj);
+        result
+    }) else {
+        return;
+    };
+    if result.is_err() {
+        ffi::PyErr_Clear();
+    }
 }
 
 unsafe fn type_is_defined_in_module(
@@ -599,12 +791,106 @@ unsafe fn register_owner_types_from_type(
     let mut value = ptr::null_mut();
     while ffi::PyDict_Next(dict, &mut pos, &mut key, &mut value) != 0 {
         if ffi::PyFunction_Check(value) != 0 {
+            if std::env::var_os("DIET_PYTHON_DEBUG_DIRECT_METHOD_SPECIALIZATIONS").is_some() {
+                let key_repr = ffi::PyObject_Repr(key);
+                let key_text = if key_repr.is_null() {
+                    "<repr error>".to_string()
+                } else {
+                    let text = std::ffi::CStr::from_ptr(ffi::PyUnicode_AsUTF8(key_repr))
+                        .to_string_lossy()
+                        .into_owned();
+                    ffi::Py_DECREF(key_repr);
+                    text
+                };
+                let owner_repr = ffi::PyObject_Repr(owner_type as *mut ffi::PyObject);
+                let owner_text = if owner_repr.is_null() {
+                    "<repr error>".to_string()
+                } else {
+                    let text = std::ffi::CStr::from_ptr(ffi::PyUnicode_AsUTF8(owner_repr))
+                        .to_string_lossy()
+                        .into_owned();
+                    ffi::Py_DECREF(owner_repr);
+                    text
+                };
+                let function_id = registered_clif_function_id(value)
+                    .ok()
+                    .flatten()
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "<none>".to_string());
+                eprintln!(
+                    "direct-method-register owner={owner_text} method={key_text} function_id={function_id}"
+                );
+            }
             register_owner_type_for_function(value, owner_type)?;
         } else if ffi::PyType_Check(value) != 0 {
             register_owner_types_from_type(
                 value as *mut ffi::PyTypeObject,
                 module_name,
                 visited_types,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+unsafe fn register_function_owner_types_for_globals(
+    globals: *mut ffi::PyObject,
+    module_name: *mut ffi::PyObject,
+) -> Result<(), ()> {
+    let debug_direct_methods =
+        std::env::var_os("DIET_PYTHON_DEBUG_DIRECT_METHOD_SPECIALIZATIONS").is_some();
+    if globals.is_null() {
+        if ffi::PyErr_Occurred().is_null() {
+            ffi::PyErr_SetString(
+                ffi::PyExc_RuntimeError,
+                c"module globals missing while registering owner types".as_ptr(),
+            );
+        }
+        return Err(());
+    }
+    if module_name.is_null() {
+        ffi::PyErr_SetString(
+            ffi::PyExc_RuntimeError,
+            c"module name missing while registering owner types".as_ptr(),
+        );
+        return Err(());
+    }
+    if debug_direct_methods {
+        let module_name_repr = ffi::PyObject_Repr(module_name);
+        let module_name_text = if module_name_repr.is_null() {
+            "<repr error>".to_string()
+        } else {
+            let text = std::ffi::CStr::from_ptr(ffi::PyUnicode_AsUTF8(module_name_repr))
+                .to_string_lossy()
+                .into_owned();
+            ffi::Py_DECREF(module_name_repr);
+            text
+        };
+        eprintln!("direct-method-register module={module_name_text}");
+    }
+    let mut visited_types = HashSet::new();
+    let mut pos: ffi::Py_ssize_t = 0;
+    let mut key = ptr::null_mut();
+    let mut value = ptr::null_mut();
+    while ffi::PyDict_Next(globals, &mut pos, &mut key, &mut value) != 0 {
+        if ffi::PyType_Check(value) != 0 {
+            if debug_direct_methods {
+                let type_repr = ffi::PyObject_Repr(value);
+                let type_text = if type_repr.is_null() {
+                    "<repr error>".to_string()
+                } else {
+                    let text = std::ffi::CStr::from_ptr(ffi::PyUnicode_AsUTF8(type_repr))
+                        .to_string_lossy()
+                        .into_owned();
+                    ffi::Py_DECREF(type_repr);
+                    text
+                };
+                eprintln!("direct-method-register found-type {type_text}");
+            }
+            register_owner_types_from_type(
+                value as *mut ffi::PyTypeObject,
+                module_name,
+                &mut visited_types,
             )?;
         }
     }
@@ -622,37 +908,12 @@ pub unsafe fn register_function_owner_types_for_module(
         return Err(());
     }
     let globals = ffi::PyModule_GetDict(module);
-    if globals.is_null() {
-        if ffi::PyErr_Occurred().is_null() {
-            ffi::PyErr_SetString(
-                ffi::PyExc_RuntimeError,
-                c"module globals missing while registering owner types".as_ptr(),
-            );
-        }
-        return Err(());
-    }
-    let module_name = ffi::PyDict_GetItemString(globals, c"__name__".as_ptr());
-    if module_name.is_null() {
-        ffi::PyErr_SetString(
-            ffi::PyExc_RuntimeError,
-            c"module.__dict__ missing __name__ while registering owner types".as_ptr(),
-        );
-        return Err(());
-    }
-    let mut visited_types = HashSet::new();
-    let mut pos: ffi::Py_ssize_t = 0;
-    let mut key = ptr::null_mut();
-    let mut value = ptr::null_mut();
-    while ffi::PyDict_Next(globals, &mut pos, &mut key, &mut value) != 0 {
-        if ffi::PyType_Check(value) != 0 {
-            register_owner_types_from_type(
-                value as *mut ffi::PyTypeObject,
-                module_name,
-                &mut visited_types,
-            )?;
-        }
-    }
-    Ok(())
+    let module_name = if globals.is_null() {
+        ptr::null_mut()
+    } else {
+        ffi::PyDict_GetItemString(globals, c"__name__".as_ptr())
+    };
+    register_function_owner_types_for_globals(globals, module_name)
 }
 
 unsafe fn ensure_clif_vectorcall_compiled(
@@ -1326,6 +1587,70 @@ mod tests {
             "replacement function should expose __code__"
         );
         replacement_code
+    }
+
+    unsafe fn class_dict_function(
+        owner_type: *mut ffi::PyTypeObject,
+        name: &'static std::ffi::CStr,
+    ) -> *mut ffi::PyObject {
+        let dict = (*owner_type).tp_dict;
+        assert!(!dict.is_null(), "owner type should have a tp_dict");
+        let function = ffi::PyDict_GetItemString(dict, name.as_ptr());
+        assert!(!function.is_null(), "class dict should contain requested function");
+        ffi::Py_INCREF(function);
+        function
+    }
+
+    #[test]
+    fn exact_owner_type_lookup_uses_current_class_dict_binding() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        initialize_test_python();
+        Python::attach(|py| unsafe {
+            let (module, cls) = make_test_module(py);
+            register_function_owner_types_for_module(module.as_ptr())
+                .expect("owner type registration should succeed");
+
+            let owner_type = cls.as_ptr() as *mut ffi::PyTypeObject;
+            let function = class_dict_function(owner_type, c"f");
+
+            let owners = lookup_exact_owner_types_for_function_object(function, "f", &{
+                let registry = function_owner_type_registry().expect("owner type registry should initialize");
+                let registered = registry
+                    .registered_owner_types_by_function
+                    .lock()
+                    .expect("owner type registry lock should succeed");
+                registered
+                    .get(&(function as usize))
+                    .expect("registered owner types should contain class method")
+                    .owner_type_weakrefs
+                    .clone()
+            })
+            .expect("owner type lookup should succeed");
+            assert_eq!(owners.len(), 1, "expected one exact owner type for C.f");
+            assert_eq!(owners[0].owner_type, owner_type);
+            assert_eq!(owners[0].function_obj, function);
+            assert_ne!(owners[0].type_version, 0);
+
+            let wrong_name = lookup_exact_owner_types_for_function_object(function, "g", &{
+                let registry = function_owner_type_registry().expect("owner type registry should initialize");
+                let registered = registry
+                    .registered_owner_types_by_function
+                    .lock()
+                    .expect("owner type registry lock should succeed");
+                registered
+                    .get(&(function as usize))
+                    .expect("registered owner types should contain class method")
+                    .owner_type_weakrefs
+                    .clone()
+            })
+            .expect("owner type lookup with wrong name should still succeed");
+            assert!(
+                wrong_name.is_empty(),
+                "wrong method name should not produce an exact owner binding"
+            );
+
+            ffi::Py_DECREF(function);
+        });
     }
 
     #[test]

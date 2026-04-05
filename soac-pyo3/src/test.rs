@@ -1,10 +1,13 @@
 use soac_blockpy::block_py::FunctionKind;
+use pyo3::prelude::*;
+use pyo3::types::PyModule;
 use soac_jit::{
     exc_dispatch_plan, jit_param_names_for_block, lookup_blockpy_function,
     register_clif_module_plans,
 };
 use std::any::Any;
 use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
 
 fn panic_payload_to_string(payload: Box<dyn Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
@@ -48,6 +51,45 @@ fn validate_bb_module_for_jit(
 
 fn run_cranelift_jit_preflight(result: &soac_blockpy::LoweringResult) -> Result<(), String> {
     soac_jit::run_cranelift_smoke(&result.codegen_module)
+}
+
+fn python_runtime_test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn initialize_test_python() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace crate should have a repo-root parent");
+    let python_home = repo_root.join("vendor").join("cpython");
+    unsafe {
+        std::env::set_var("PYTHONHOME", &python_home);
+    }
+    let rel_build_dir = std::fs::read_to_string(python_home.join("pybuilddir.txt"))
+        .expect("vendored CPython pybuilddir.txt should exist");
+    let python_path = std::env::join_paths([
+        python_home.join("Lib"),
+        python_home.join(rel_build_dir.trim()),
+        repo_root.join("soac_py").join("src"),
+    ])
+    .expect("test PYTHONPATH should join");
+    unsafe {
+        std::env::set_var("PYTHONPATH", python_path);
+    }
+    Python::initialize();
+}
+
+unsafe fn class_dict_function(
+    owner_type: *mut pyo3::ffi::PyTypeObject,
+    name: &'static std::ffi::CStr,
+) -> *mut pyo3::ffi::PyObject {
+    let dict = (*owner_type).tp_dict;
+    assert!(!dict.is_null(), "owner type should have a tp_dict");
+    let function = pyo3::ffi::PyDict_GetItemString(dict, name.as_ptr());
+    assert!(!function.is_null(), "class dict should contain requested function");
+    pyo3::ffi::Py_INCREF(function);
+    function
 }
 
 #[test]
@@ -186,6 +228,60 @@ def f(x):
     let bb_module = &result.codegen_module;
     validate_bb_module_for_jit(bb_module).expect("validator should allow module");
     run_cranelift_jit_preflight(&result).expect("cranelift preflight should run");
+}
+
+#[test]
+fn transformed_module_methods_register_owner_types_for_lookup() {
+    let _guard = python_runtime_test_lock().lock().unwrap();
+    initialize_test_python();
+    Python::attach(|py| unsafe {
+        let ext = PyModule::new(py, "_soac_ext").expect("extension module should allocate");
+        crate::_soac_ext(py, &ext).expect("extension init should succeed");
+        let sys = py.import("sys").expect("sys should import");
+        let modules = sys
+            .getattr("modules")
+            .expect("sys.modules should exist");
+        modules
+            .set_item("_soac_ext", &ext)
+            .expect("sys.modules should accept _soac_ext");
+        let importlib = py
+            .import("importlib.machinery")
+            .expect("importlib.machinery should import");
+        let module_spec = importlib
+            .getattr("ModuleSpec")
+            .expect("ModuleSpec should exist");
+        let spec = module_spec
+            .call1(("transformed_owner_lookup_test", py.None()))
+            .expect("ModuleSpec should instantiate");
+        let source = "class C:\n    def f(self):\n        return 1\n";
+        let module = ext
+            .getattr("create_module")
+            .expect("create_module should be exported")
+            .call1((source, &spec))
+            .expect("transformed module creation should succeed");
+        module
+            .getattr("__dict__")
+            .expect("module should expose __dict__")
+            .set_item("__package__", "")
+            .expect("module globals should accept __package__");
+        ext.getattr("exec_module")
+            .expect("exec_module should be exported")
+            .call1((&module,))
+            .expect("transformed module execution should succeed");
+
+        let cls = module.getattr("C").expect("executed module should define C");
+        let owner_type = cls.as_ptr() as *mut pyo3::ffi::PyTypeObject;
+        let function = class_dict_function(owner_type, c"f");
+        let function_id = soac_jit::registered_clif_function_id(function)
+            .expect("registered function id lookup should succeed")
+            .expect("transformed method should carry a FunctionId");
+        let owners = soac_jit::lookup_exact_owner_types_for_method(function_id, "f")
+            .expect("exact owner lookup should succeed");
+        assert_eq!(owners.len(), 1, "expected one owner type for transformed C.f");
+        assert_eq!(owners[0].owner_type, owner_type);
+        assert_eq!(owners[0].function_obj, function);
+        pyo3::ffi::Py_DECREF(function);
+    });
 }
 
 #[test]
