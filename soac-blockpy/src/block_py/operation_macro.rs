@@ -289,6 +289,98 @@ macro_rules! define_operation {
         [$($struct_fields:tt)*]
         [$($ctor_args:tt)*]
         [$($ctor_init:tt)*]
+        $field:ident : Vec<$inner_expr_ty:ident>,
+        $($rest:tt)*
+    ) => {
+        define_operation!(
+            @collect_fields
+            [$vis]
+            [$name]
+            [$expr_ty]
+            [$($raw_fields)*]
+            [$($struct_fields)* pub $field: Vec<$inner_expr_ty>,]
+            [$($ctor_args)* $field: impl Into<Vec<$inner_expr_ty>>,]
+            [$($ctor_init)* $field: $field.into(),]
+            $($rest)*
+        );
+    };
+    (
+        @collect_fields
+        [$vis:vis]
+        [$name:ident]
+        [$expr_ty:ident]
+        [$($raw_fields:tt)*]
+        [$($struct_fields:tt)*]
+        [$($ctor_args:tt)*]
+        [$($ctor_init:tt)*]
+        $field:ident : Vec<$inner_expr_ty:ident>
+    ) => {
+        define_operation!(
+            @collect_fields
+            [$vis]
+            [$name]
+            [$expr_ty]
+            [$($raw_fields)*]
+            [$($struct_fields)* pub $field: Vec<$inner_expr_ty>,]
+            [$($ctor_args)* $field: impl Into<Vec<$inner_expr_ty>>,]
+            [$($ctor_init)* $field: $field.into(),]
+        );
+    };
+    (
+        @collect_fields
+        [$vis:vis]
+        [$name:ident]
+        [$expr_ty:ident]
+        [$($raw_fields:tt)*]
+        [$($struct_fields:tt)*]
+        [$($ctor_args:tt)*]
+        [$($ctor_init:tt)*]
+        $field:ident : Option<Box<$inner_expr_ty:ident>>,
+        $($rest:tt)*
+    ) => {
+        define_operation!(
+            @collect_fields
+            [$vis]
+            [$name]
+            [$expr_ty]
+            [$($raw_fields)*]
+            [$($struct_fields)* pub $field: Option<Box<$inner_expr_ty>>,]
+            [$($ctor_args)* $field: impl Into<Option<Box<$inner_expr_ty>>>,]
+            [$($ctor_init)* $field: $field.into(),]
+            $($rest)*
+        );
+    };
+    (
+        @collect_fields
+        [$vis:vis]
+        [$name:ident]
+        [$expr_ty:ident]
+        [$($raw_fields:tt)*]
+        [$($struct_fields:tt)*]
+        [$($ctor_args:tt)*]
+        [$($ctor_init:tt)*]
+        $field:ident : Option<Box<$inner_expr_ty:ident>>
+    ) => {
+        define_operation!(
+            @collect_fields
+            [$vis]
+            [$name]
+            [$expr_ty]
+            [$($raw_fields)*]
+            [$($struct_fields)* pub $field: Option<Box<$inner_expr_ty>>,]
+            [$($ctor_args)* $field: impl Into<Option<Box<$inner_expr_ty>>>,]
+            [$($ctor_init)* $field: $field.into(),]
+        );
+    };
+    (
+        @collect_fields
+        [$vis:vis]
+        [$name:ident]
+        [$expr_ty:ident]
+        [$($raw_fields:tt)*]
+        [$($struct_fields:tt)*]
+        [$($ctor_args:tt)*]
+        [$($ctor_init:tt)*]
         $field:ident : Box<$inner_expr_ty:ident>
     ) => {
         define_operation!(
@@ -356,10 +448,54 @@ macro_rules! define_operation {
     (@visit_expr_fields $self:ident, $visitor:ident, $field:ident : Box<$expr_ty:ident>) => {
         $visitor.visit_instr(&$self.$field);
     };
+    (@visit_expr_fields $self:ident, $visitor:ident, $field:ident : Vec<$expr_ty:ident>, $($rest:tt)*) => {
+        for item in &$self.$field {
+            $visitor.visit_instr(item);
+        }
+        define_operation!(@visit_expr_fields $self, $visitor, $($rest)*);
+    };
+    (@visit_expr_fields $self:ident, $visitor:ident, $field:ident : Vec<$expr_ty:ident>) => {
+        for item in &$self.$field {
+            $visitor.visit_instr(item);
+        }
+    };
+    (@visit_expr_fields $self:ident, $visitor:ident, $field:ident : Option<Box<$expr_ty:ident>>, $($rest:tt)*) => {
+        if let Some(item) = &$self.$field {
+            $visitor.visit_instr(item);
+        }
+        define_operation!(@visit_expr_fields $self, $visitor, $($rest)*);
+    };
+    (@visit_expr_fields $self:ident, $visitor:ident, $field:ident : Option<Box<$expr_ty:ident>>) => {
+        if let Some(item) = &$self.$field {
+            $visitor.visit_instr(item);
+        }
+    };
     (@visit_expr_fields $self:ident, $visitor:ident, $field:ident : $ty:ty, $($rest:tt)*) => {
         define_operation!(@visit_expr_fields $self, $visitor, $($rest)*);
     };
     (@visit_expr_fields $self:ident, $visitor:ident, $field:ident : $ty:ty) => {};
+    (@visit_expr_fields $self:ident, $visitor:ident, $field:ident : Vec<$expr_ty:ident>, $($rest:tt)*) => {
+        for item in &$self.$field {
+            $visitor.visit_instr(item);
+        }
+        define_operation!(@visit_expr_fields $self, $visitor, $($rest)*);
+    };
+    (@visit_expr_fields $self:ident, $visitor:ident, $field:ident : Vec<$expr_ty:ident>) => {
+        for item in &$self.$field {
+            $visitor.visit_instr(item);
+        }
+    };
+    (@visit_expr_fields $self:ident, $visitor:ident, $field:ident : Option<Box<$expr_ty:ident>>, $($rest:tt)*) => {
+        if let Some(item) = &$self.$field {
+            $visitor.visit_instr(item);
+        }
+        define_operation!(@visit_expr_fields $self, $visitor, $($rest)*);
+    };
+    (@visit_expr_fields $self:ident, $visitor:ident, $field:ident : Option<Box<$expr_ty:ident>>) => {
+        if let Some(item) = &$self.$field {
+            $visitor.visit_instr(item);
+        }
+    };
     (@visit_expr_fields_mut $self:ident, $visitor:ident,) => {};
     (@visit_expr_fields_mut $self:ident, $visitor:ident, $field:ident : Box<$expr_ty:ident>, $($rest:tt)*) => {
         $visitor.visit_instr_mut(&mut $self.$field);
@@ -368,10 +504,54 @@ macro_rules! define_operation {
     (@visit_expr_fields_mut $self:ident, $visitor:ident, $field:ident : Box<$expr_ty:ident>) => {
         $visitor.visit_instr_mut(&mut $self.$field);
     };
+    (@visit_expr_fields_mut $self:ident, $visitor:ident, $field:ident : Vec<$expr_ty:ident>, $($rest:tt)*) => {
+        for item in &mut $self.$field {
+            $visitor.visit_instr_mut(item);
+        }
+        define_operation!(@visit_expr_fields_mut $self, $visitor, $($rest)*);
+    };
+    (@visit_expr_fields_mut $self:ident, $visitor:ident, $field:ident : Vec<$expr_ty:ident>) => {
+        for item in &mut $self.$field {
+            $visitor.visit_instr_mut(item);
+        }
+    };
+    (@visit_expr_fields_mut $self:ident, $visitor:ident, $field:ident : Option<Box<$expr_ty:ident>>, $($rest:tt)*) => {
+        if let Some(item) = &mut $self.$field {
+            $visitor.visit_instr_mut(item);
+        }
+        define_operation!(@visit_expr_fields_mut $self, $visitor, $($rest)*);
+    };
+    (@visit_expr_fields_mut $self:ident, $visitor:ident, $field:ident : Option<Box<$expr_ty:ident>>) => {
+        if let Some(item) = &mut $self.$field {
+            $visitor.visit_instr_mut(item);
+        }
+    };
     (@visit_expr_fields_mut $self:ident, $visitor:ident, $field:ident : $ty:ty, $($rest:tt)*) => {
         define_operation!(@visit_expr_fields_mut $self, $visitor, $($rest)*);
     };
     (@visit_expr_fields_mut $self:ident, $visitor:ident, $field:ident : $ty:ty) => {};
+    (@visit_expr_fields_mut $self:ident, $visitor:ident, $field:ident : Vec<$expr_ty:ident>, $($rest:tt)*) => {
+        for item in &mut $self.$field {
+            $visitor.visit_instr_mut(item);
+        }
+        define_operation!(@visit_expr_fields_mut $self, $visitor, $($rest)*);
+    };
+    (@visit_expr_fields_mut $self:ident, $visitor:ident, $field:ident : Vec<$expr_ty:ident>) => {
+        for item in &mut $self.$field {
+            $visitor.visit_instr_mut(item);
+        }
+    };
+    (@visit_expr_fields_mut $self:ident, $visitor:ident, $field:ident : Option<Box<$expr_ty:ident>>, $($rest:tt)*) => {
+        if let Some(item) = &mut $self.$field {
+            $visitor.visit_instr_mut(item);
+        }
+        define_operation!(@visit_expr_fields_mut $self, $visitor, $($rest)*);
+    };
+    (@visit_expr_fields_mut $self:ident, $visitor:ident, $field:ident : Option<Box<$expr_ty:ident>>) => {
+        if let Some(item) = &mut $self.$field {
+            $visitor.visit_instr_mut(item);
+        }
+    };
     (@debug_tuple_fields $builder:ident, $self:ident,) => {};
     (@debug_tuple_fields $builder:ident, $self:ident, $field:ident : Box<$expr_ty:ident>, $($rest:tt)*) => {
         $builder.field(&$self.$field);
@@ -385,6 +565,20 @@ macro_rules! define_operation {
         define_operation!(@debug_tuple_fields $builder, $self, $($rest)*);
     };
     (@debug_tuple_fields $builder:ident, $self:ident, $field:ident : $ty:ty) => {
+        $builder.field(&$self.$field);
+    };
+    (@debug_tuple_fields $builder:ident, $self:ident, $field:ident : Vec<$expr_ty:ident>, $($rest:tt)*) => {
+        $builder.field(&$self.$field);
+        define_operation!(@debug_tuple_fields $builder, $self, $($rest)*);
+    };
+    (@debug_tuple_fields $builder:ident, $self:ident, $field:ident : Vec<$expr_ty:ident>) => {
+        $builder.field(&$self.$field);
+    };
+    (@debug_tuple_fields $builder:ident, $self:ident, $field:ident : Option<Box<$expr_ty:ident>>, $($rest:tt)*) => {
+        $builder.field(&$self.$field);
+        define_operation!(@debug_tuple_fields $builder, $self, $($rest)*);
+    };
+    (@debug_tuple_fields $builder:ident, $self:ident, $field:ident : Option<Box<$expr_ty:ident>>) => {
         $builder.field(&$self.$field);
     };
     (@build_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $f:ident,) => {
@@ -432,6 +626,32 @@ macro_rules! define_operation {
     (@build_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Box<$expr_ty:ident>) => {
         $($mapped_ctor)+ { _meta: $self._meta, $($out)* $field: Box::new($map.map_instr(*$self.$field)), }
     };
+    (@build_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Vec<$expr_ty:ident>, $($rest:tt)*) => {
+        define_operation!(
+            @build_mapped
+            [$($mapped_ctor)+]
+            [$($out)* $field: $self.$field.into_iter().map(|value| $map.map_instr(value)).collect(),]
+            $self,
+            $map,
+            $($rest)*
+        )
+    };
+    (@build_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Vec<$expr_ty:ident>) => {
+        $($mapped_ctor)+ { _meta: $self._meta, $($out)* $field: $self.$field.into_iter().map(|value| $map.map_instr(value)).collect(), }
+    };
+    (@build_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<Box<$expr_ty:ident>>, $($rest:tt)*) => {
+        define_operation!(
+            @build_mapped
+            [$($mapped_ctor)+]
+            [$($out)* $field: $self.$field.map(|value| Box::new($map.map_instr(*value))),]
+            $self,
+            $map,
+            $($rest)*
+        )
+    };
+    (@build_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<Box<$expr_ty:ident>>) => {
+        $($mapped_ctor)+ { _meta: $self._meta, $($out)* $field: $self.$field.map(|value| Box::new($map.map_instr(*value))), }
+    };
     (@build_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $f:ident, $field:ident : $ty:ty, $($rest:tt)*) => {
         define_operation!(
             @build_mapped
@@ -444,6 +664,32 @@ macro_rules! define_operation {
     };
     (@build_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $f:ident, $field:ident : $ty:ty) => {
         $($mapped_ctor)+ { _meta: $self._meta, $($out)* $field: $self.$field, }
+    };
+    (@build_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Vec<$expr_ty:ident>, $($rest:tt)*) => {
+        define_operation!(
+            @build_mapped
+            [$($mapped_ctor)+]
+            [$($out)* $field: self.$field.into_iter().map(|value| $map.map_instr(value)).collect(),]
+            $self,
+            $map,
+            $($rest)*
+        )
+    };
+    (@build_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Vec<$expr_ty:ident>) => {
+        $($mapped_ctor)+ { _meta: $self._meta, $($out)* $field: self.$field.into_iter().map(|value| $map.map_instr(value)).collect(), }
+    };
+    (@build_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<Box<$expr_ty:ident>>, $($rest:tt)*) => {
+        define_operation!(
+            @build_mapped
+            [$($mapped_ctor)+]
+            [$($out)* $field: self.$field.map(|value| Box::new($map.map_instr(*value))),]
+            $self,
+            $map,
+            $($rest)*
+        )
+    };
+    (@build_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<Box<$expr_ty:ident>>) => {
+        $($mapped_ctor)+ { _meta: $self._meta, $($out)* $field: $self.$field.map(|value| Box::new($map.map_instr(*value))), }
     };
     (@build_try_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $f:ident,) => {
         Ok($($mapped_ctor)+ { _meta: $self._meta, $($out)* })
@@ -461,6 +707,32 @@ macro_rules! define_operation {
     (@build_try_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Box<$expr_ty:ident>) => {
         Ok($($mapped_ctor)+ { _meta: $self._meta, $($out)* $field: Box::new($map.try_map_instr(*$self.$field)?), })
     };
+    (@build_try_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Vec<$expr_ty:ident>, $($rest:tt)*) => {
+        define_operation!(
+            @build_try_mapped
+            [$($mapped_ctor)+]
+            [$($out)* $field: $self.$field.into_iter().map(|value| $map.try_map_instr(value)).collect::<Result<Vec<_>, _>>()?,]
+            $self,
+            $map,
+            $($rest)*
+        )
+    };
+    (@build_try_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Vec<$expr_ty:ident>) => {
+        Ok($($mapped_ctor)+ { _meta: $self._meta, $($out)* $field: $self.$field.into_iter().map(|value| $map.try_map_instr(value)).collect::<Result<Vec<_>, _>>()?, })
+    };
+    (@build_try_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<Box<$expr_ty:ident>>, $($rest:tt)*) => {
+        define_operation!(
+            @build_try_mapped
+            [$($mapped_ctor)+]
+            [$($out)* $field: $self.$field.map(|value| $map.try_map_instr(*value).map(Box::new)).transpose()?,]
+            $self,
+            $map,
+            $($rest)*
+        )
+    };
+    (@build_try_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<Box<$expr_ty:ident>>) => {
+        Ok($($mapped_ctor)+ { _meta: $self._meta, $($out)* $field: $self.$field.map(|value| $map.try_map_instr(*value).map(Box::new)).transpose()?, })
+    };
     (@build_try_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $f:ident, $field:ident : $ty:ty, $($rest:tt)*) => {
         define_operation!(
             @build_try_mapped
@@ -473,6 +745,32 @@ macro_rules! define_operation {
     };
     (@build_try_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $f:ident, $field:ident : $ty:ty) => {
         Ok($($mapped_ctor)+ { _meta: $self._meta, $($out)* $field: $self.$field, })
+    };
+    (@build_try_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Vec<$expr_ty:ident>, $($rest:tt)*) => {
+        define_operation!(
+            @build_try_mapped
+            [$($mapped_ctor)+]
+            [$($out)* $field: $self.$field.into_iter().map(|value| $map.try_map_instr(value)).collect::<Result<Vec<_>, _>>()?,]
+            $self,
+            $map,
+            $($rest)*
+        )
+    };
+    (@build_try_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Vec<$expr_ty:ident>) => {
+        Ok($($mapped_ctor)+ { _meta: $self._meta, $($out)* $field: $self.$field.into_iter().map(|value| $map.try_map_instr(value)).collect::<Result<Vec<_>, _>>()?, })
+    };
+    (@build_try_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<Box<$expr_ty:ident>>, $($rest:tt)*) => {
+        define_operation!(
+            @build_try_mapped
+            [$($mapped_ctor)+]
+            [$($out)* $field: $self.$field.map(|value| $map.try_map_instr(*value).map(Box::new)).transpose()?,]
+            $self,
+            $map,
+            $($rest)*
+        )
+    };
+    (@build_try_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<Box<$expr_ty:ident>>) => {
+        Ok($($mapped_ctor)+ { _meta: $self._meta, $($out)* $field: $self.$field.map(|value| $map.try_map_instr(*value).map(Box::new)).transpose()?, })
     };
 }
 

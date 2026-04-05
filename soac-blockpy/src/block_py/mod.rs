@@ -13,8 +13,16 @@ pub use self::scope::{
 use crate::py_expr;
 pub use operation::{
     Await, BinOp, BinOpKind, CalleeFunctionId, Call, CallDirect, CellRef, CellRefForName, Del,
-    DelItem, GetAttr, GetItem, Load, MakeCell, MakeFunction, SetAttr, SetItem, Store, UnaryOp,
-    UnaryOpKind, Yield, YieldFrom,
+    DelItem, ExprAttribute, ExprBoolOp, ExprBooleanLiteral, ExprBytesLiteral, ExprCompare,
+    ExprDict, ExprDictComp, ExprEllipsisLiteral, ExprFString, ExprGenerator, ExprIpyEscapeCommand,
+    ExprLambda, ExprList, ExprListComp, ExprName, ExprNamed, ExprNoneLiteral, ExprNumberLiteral,
+    ExprSet, ExprSetComp, ExprSlice, ExprStarred, ExprStringLiteral, ExprSubscript, ExprTString,
+    ExprTuple,
+    ExprIf, GetAttr, GetItem, Load, MakeCell, MakeFunction, SetAttr, SetItem,
+    StmtAnnAssign, StmtAssign, StmtAssert, StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue, StmtDelete,
+    StmtExpr, StmtFor, StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom,
+    StmtIpyEscapeCommand, StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry,
+    StmtTypeAlias, StmtWhile, StmtWith, Store, UnaryOp, UnaryOpKind, Yield, YieldFrom,
 };
 pub use ruff_python_ast::Expr;
 use ruff_python_ast::{self as ast};
@@ -33,7 +41,7 @@ pub(crate) mod scope;
 pub(crate) mod validate;
 mod visit;
 pub use crate::passes::{
-    InstrLow, InstrUnresolved, InstrWithAwaitAndYield, InstrWithYield, InstrResolved,
+    InstrLow, InstrResolved, InstrRuff, InstrUnresolved, InstrWithAwaitAndYield, InstrWithYield,
 };
 #[allow(unused_imports)]
 pub(crate) use map::{
@@ -226,21 +234,6 @@ pub trait BlockPyNameLike: Clone + fmt::Debug {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct RuffExpr(pub ast::Expr);
-
-impl From<ast::Expr> for RuffExpr {
-    fn from(value: ast::Expr) -> Self {
-        Self(value)
-    }
-}
-
-impl From<RuffExpr> for ast::Expr {
-    fn from(value: RuffExpr) -> Self {
-        value.0
-    }
-}
-
 pub trait ChildVisitable<E: Instr>: Clone + fmt::Debug + Sized {
     fn visit_children<V>(&self, visitor: &mut V)
     where
@@ -358,10 +351,6 @@ impl Instr for Expr {
     type Name = ast::ExprName;
 }
 
-impl Instr for RuffExpr {
-    type Name = ast::ExprName;
-}
-
 #[derive(Clone)]
 pub enum UnresolvedName {
     SourceName(ast::name::Name),
@@ -406,66 +395,6 @@ impl UnresolvedName {
     }
 }
 
-impl ChildVisitable<RuffExpr> for RuffExpr {
-    fn visit_children<V>(&self, visitor: &mut V)
-    where
-        V: crate::block_py::Visit<RuffExpr> + ?Sized,
-    {
-        struct RuffChildVisitor<'a, V: ?Sized>(&'a mut V);
-
-        impl<V> crate::block_py::Visit<Expr> for RuffChildVisitor<'_, V>
-        where
-            V: crate::block_py::Visit<RuffExpr> + ?Sized,
-        {
-            fn visit_instr(&mut self, expr: &Expr) {
-                self.0.visit_instr(&RuffExpr(expr.clone()));
-            }
-        }
-
-        self.0.visit_children(&mut RuffChildVisitor(visitor));
-    }
-
-    fn visit_children_mut<V>(&mut self, visitor: &mut V)
-    where
-        V: crate::block_py::VisitMut<RuffExpr> + ?Sized,
-    {
-        struct RuffChildVisitor<'a, V: ?Sized>(&'a mut V);
-
-        impl<V> crate::block_py::VisitMut<Expr> for RuffChildVisitor<'_, V>
-        where
-            V: crate::block_py::VisitMut<RuffExpr> + ?Sized,
-        {
-            fn visit_instr_mut(&mut self, expr: &mut Expr) {
-                let mut wrapped = RuffExpr(expr.clone());
-                self.0.visit_instr_mut(&mut wrapped);
-                *expr = wrapped.0;
-            }
-        }
-
-        self.0.visit_children_mut(&mut RuffChildVisitor(visitor));
-    }
-}
-
-impl Mappable<RuffExpr> for RuffExpr {
-    type Mapped<T: Instr> = T;
-
-    fn map_children<T, M>(self, map: &mut M) -> Self::Mapped<T>
-    where
-        T: Instr,
-        M: MapInstr<RuffExpr, T>,
-    {
-        map.map_instr(self)
-    }
-
-    fn try_map_children<T, Error, M>(self, map: &mut M) -> Result<Self::Mapped<T>, Error>
-    where
-        T: Instr,
-        M: TryMapInstr<RuffExpr, T, Error>,
-    {
-        map.try_map_instr(self)
-    }
-
-}
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct ResolvedName {

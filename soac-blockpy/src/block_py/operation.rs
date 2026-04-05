@@ -3,6 +3,7 @@ use super::{
     BlockPyNameLike, CallArgKeyword, CallArgPositional, CellLocation, ChildVisitable, FunctionId,
     FunctionKind, HasMeta, Instr, InstrName, MapInstr, Mappable, Meta, TryMapInstr, WithMeta,
 };
+use ruff_python_ast::{self as ast};
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
@@ -685,5 +686,375 @@ define_operation! {
 define_operation! {
     pub struct YieldFrom<E> {
         value: Box<E>,
+    }
+}
+
+define_operation! {
+    pub struct ExprBoolOp<E> {
+        op: ast::BoolOp,
+        values: Vec<E>,
+    }
+}
+
+define_operation! {
+    pub struct ExprNamed<E> {
+        target: Box<E>,
+        value: Box<E>,
+    }
+}
+
+define_operation! {
+    pub struct ExprLambda<E> {
+        parameters: Option<Box<ast::Parameters>>,
+        body: Box<E>,
+    }
+}
+
+define_operation! {
+    pub struct ExprIf<E> {
+        test: Box<E>,
+        body: Box<E>,
+        orelse: Box<E>,
+    }
+}
+
+define_operation! {
+    pub struct ExprDict {
+        items: Vec<ast::DictItem>,
+    }
+}
+
+define_operation! {
+    pub struct ExprSet<E> {
+        elts: Vec<E>,
+    }
+}
+
+define_operation! {
+    pub struct ExprListComp<E> {
+        elt: Box<E>,
+        generators: Vec<ast::Comprehension>,
+    }
+}
+
+define_operation! {
+    pub struct ExprSetComp<E> {
+        elt: Box<E>,
+        generators: Vec<ast::Comprehension>,
+    }
+}
+
+define_operation! {
+    pub struct ExprDictComp<E> {
+        key: Box<E>,
+        value: Box<E>,
+        generators: Vec<ast::Comprehension>,
+    }
+}
+
+define_operation! {
+    pub struct ExprGenerator<E> {
+        elt: Box<E>,
+        generators: Vec<ast::Comprehension>,
+        parenthesized: bool,
+    }
+}
+
+define_operation! {
+    pub struct ExprCompare<E> {
+        left: Box<E>,
+        ops: Vec<ast::CmpOp>,
+        comparators: Vec<E>,
+    }
+}
+
+define_operation! {
+    pub struct ExprFString {
+        value: ast::FStringValue,
+    }
+}
+
+define_operation! {
+    pub struct ExprTString {
+        value: ast::TStringValue,
+    }
+}
+
+define_operation! {
+    pub struct ExprStringLiteral {
+        value: ast::StringLiteralValue,
+    }
+}
+
+define_operation! {
+    pub struct ExprBytesLiteral {
+        value: ast::BytesLiteralValue,
+    }
+}
+
+define_operation! {
+    pub struct ExprNumberLiteral {
+        value: ast::Number,
+    }
+}
+
+define_operation! {
+    pub struct ExprBooleanLiteral {
+        value: bool,
+    }
+}
+
+define_operation! {
+    pub struct ExprNoneLiteral {
+    }
+}
+
+define_operation! {
+    pub struct ExprEllipsisLiteral {
+    }
+}
+
+define_operation! {
+    pub struct ExprAttribute<E> {
+        value: Box<E>,
+        attr: ast::Identifier,
+        ctx: ast::ExprContext,
+    }
+}
+
+define_operation! {
+    pub struct ExprSubscript<E> {
+        value: Box<E>,
+        slice: Box<E>,
+        ctx: ast::ExprContext,
+    }
+}
+
+define_operation! {
+    pub struct ExprStarred<E> {
+        value: Box<E>,
+        ctx: ast::ExprContext,
+    }
+}
+
+define_operation! {
+    pub struct ExprName {
+        id: ast::name::Name,
+        ctx: ast::ExprContext,
+    }
+}
+
+define_operation! {
+    pub struct ExprList<E> {
+        elts: Vec<E>,
+        ctx: ast::ExprContext,
+    }
+}
+
+define_operation! {
+    pub struct ExprTuple<E> {
+        elts: Vec<E>,
+        ctx: ast::ExprContext,
+        parenthesized: bool,
+    }
+}
+
+define_operation! {
+    pub struct ExprSlice<E> {
+        lower: Option<Box<E>>,
+        upper: Option<Box<E>>,
+        step: Option<Box<E>>,
+    }
+}
+
+define_operation! {
+    pub struct ExprIpyEscapeCommand {
+        kind: ast::IpyEscapeKind,
+        value: Box<str>,
+    }
+}
+
+define_operation! {
+    pub struct StmtFunctionDef<E> {
+        is_async: bool,
+        decorator_list: Vec<ast::Decorator>,
+        name: ast::Identifier,
+        type_params: Option<Box<ast::TypeParams>>,
+        parameters: Box<ast::Parameters>,
+        returns: Option<Box<E>>,
+        body: Vec<E>,
+    }
+}
+
+define_operation! {
+    pub struct StmtClassDef<E> {
+        decorator_list: Vec<ast::Decorator>,
+        name: ast::Identifier,
+        type_params: Option<Box<ast::TypeParams>>,
+        arguments: Option<Box<ast::Arguments>>,
+        body: Vec<E>,
+    }
+}
+
+define_operation! {
+    pub struct StmtReturn<E> {
+        value: Option<Box<E>>,
+    }
+}
+
+define_operation! {
+    pub struct StmtDelete<E> {
+        targets: Vec<E>,
+    }
+}
+
+define_operation! {
+    pub struct StmtTypeAlias<E> {
+        name: Box<E>,
+        type_params: Option<Box<ast::TypeParams>>,
+        value: Box<E>,
+    }
+}
+
+define_operation! {
+    pub struct StmtAssign<E> {
+        targets: Vec<E>,
+        value: Box<E>,
+    }
+}
+
+define_operation! {
+    pub struct StmtAugAssign<E> {
+        target: Box<E>,
+        op: ast::Operator,
+        value: Box<E>,
+    }
+}
+
+define_operation! {
+    pub struct StmtAnnAssign<E> {
+        target: Box<E>,
+        annotation: Box<E>,
+        value: Option<Box<E>>,
+        simple: bool,
+    }
+}
+
+define_operation! {
+    pub struct StmtFor<E> {
+        is_async: bool,
+        target: Box<E>,
+        iter: Box<E>,
+        body: Vec<E>,
+        orelse: Vec<E>,
+    }
+}
+
+define_operation! {
+    pub struct StmtWhile<E> {
+        test: Box<E>,
+        body: Vec<E>,
+        orelse: Vec<E>,
+    }
+}
+
+define_operation! {
+    pub struct StmtIf<E> {
+        test: Box<E>,
+        body: Vec<E>,
+        elif_else_clauses: Vec<ast::ElifElseClause>,
+    }
+}
+
+define_operation! {
+    pub struct StmtWith<E> {
+        is_async: bool,
+        items: Vec<ast::WithItem>,
+        body: Vec<E>,
+    }
+}
+
+define_operation! {
+    pub struct StmtMatch<E> {
+        subject: Box<E>,
+        cases: Vec<ast::MatchCase>,
+    }
+}
+
+define_operation! {
+    pub struct StmtRaise<E> {
+        exc: Option<Box<E>>,
+        cause: Option<Box<E>>,
+    }
+}
+
+define_operation! {
+    pub struct StmtTry<E> {
+        body: Vec<E>,
+        handlers: Vec<ast::ExceptHandler>,
+        orelse: Vec<E>,
+        finalbody: Vec<E>,
+        is_star: bool,
+    }
+}
+
+define_operation! {
+    pub struct StmtAssert<E> {
+        test: Box<E>,
+        msg: Option<Box<E>>,
+    }
+}
+
+define_operation! {
+    pub struct StmtImport {
+        names: Vec<ast::Alias>,
+    }
+}
+
+define_operation! {
+    pub struct StmtImportFrom {
+        module: Option<ast::Identifier>,
+        names: Vec<ast::Alias>,
+        level: u32,
+    }
+}
+
+define_operation! {
+    pub struct StmtGlobal {
+        names: Vec<ast::Identifier>,
+    }
+}
+
+define_operation! {
+    pub struct StmtNonlocal {
+        names: Vec<ast::Identifier>,
+    }
+}
+
+define_operation! {
+    pub struct StmtExpr<E> {
+        value: Box<E>,
+    }
+}
+
+define_operation! {
+    pub struct StmtPass {
+    }
+}
+
+define_operation! {
+    pub struct StmtBreak {
+    }
+}
+
+define_operation! {
+    pub struct StmtContinue {
+    }
+}
+
+define_operation! {
+    pub struct StmtIpyEscapeCommand {
+        kind: ast::IpyEscapeKind,
+        value: Box<str>,
     }
 }

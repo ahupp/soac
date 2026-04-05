@@ -1,4 +1,4 @@
-use super::{BlockLabel, RuffExpr};
+use super::BlockLabel;
 use ruff_python_ast::{self as ast, HasNodeIndex};
 use ruff_text_size::{Ranged, TextRange};
 use std::fmt;
@@ -71,11 +71,5 @@ where
 {
     fn meta(&self) -> Meta {
         Meta::new(self.node_index().clone(), self.range())
-    }
-}
-
-impl HasMeta for RuffExpr {
-    fn meta(&self) -> Meta {
-        self.0.meta()
     }
 }

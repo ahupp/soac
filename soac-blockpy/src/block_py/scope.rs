@@ -1,7 +1,7 @@
 use super::{
     is_internal_symbol, walk_block, walk_expr, Block, BlockPyFunction, BlockPyLiteral,
     BlockPyNameLike, BlockPyPass, Call, CallArgPositional, ChildVisitable, InstrLow,
-    InstrWithAwaitAndYield, InstrWithYield, FunctionName, Instr, RuffExpr,
+    InstrWithAwaitAndYield, InstrWithYield, FunctionName, Instr, InstrRuff,
 };
 use crate::passes::ast_to_ast::scope_helpers::cell_name;
 use ruff_python_ast::{self as ast, Expr};
@@ -514,25 +514,130 @@ impl ScopeExprNode for Expr {
     }
 }
 
-impl ScopeExprNode for RuffExpr {
+fn walk_assigned_name_targets_in_instr_ruff(target: &InstrRuff, f: &mut impl FnMut(&str)) {
+    match target {
+        InstrRuff::ExprName(name) => {
+            if matches!(name.ctx, ast::ExprContext::Store | ast::ExprContext::Del) {
+                f(name.id.as_str());
+            }
+        }
+        InstrRuff::ExprTuple(tuple) => {
+            for elt in &tuple.elts {
+                walk_assigned_name_targets_in_instr_ruff(elt, f);
+            }
+        }
+        InstrRuff::ExprList(list) => {
+            for elt in &list.elts {
+                walk_assigned_name_targets_in_instr_ruff(elt, f);
+            }
+        }
+        InstrRuff::ExprStarred(starred) => {
+            walk_assigned_name_targets_in_instr_ruff(starred.value.as_ref(), f)
+        }
+        InstrRuff::ExprNamed(named) => walk_assigned_name_targets_in_instr_ruff(named.target.as_ref(), f),
+        InstrRuff::StmtAssign(stmt) => {
+            for target in &stmt.targets {
+                walk_assigned_name_targets_in_instr_ruff(target, f);
+            }
+        }
+        InstrRuff::StmtDelete(stmt) => {
+            for target in &stmt.targets {
+                walk_assigned_name_targets_in_instr_ruff(target, f);
+            }
+        }
+        _ => {}
+    }
+}
+
+impl ScopeExprNode for InstrRuff {
     fn root_name_id(&self) -> Option<&str> {
-        self.0.root_name_id()
+        match self {
+            Self::ExprName(name) => Some(name.id.as_str()),
+            Self::ExprAttribute(attr) if matches!(attr.value.as_ref(), Self::ExprName(name) if name.id.as_str() == "__soac__") => {
+                Some(attr.attr.as_str())
+            }
+            Self::Call(call) => call.func.as_ref().root_name_id(),
+            Self::StmtFunctionDef(stmt) => Some(stmt.name.as_str()),
+            Self::StmtClassDef(stmt) => Some(stmt.name.as_str()),
+            Self::StmtExpr(stmt) => stmt.value.as_ref().root_name_id(),
+            _ => None,
+        }
     }
 
     fn root_string_literal_value(&self) -> Option<String> {
-        self.0.root_string_literal_value()
+        match self {
+            Self::ExprStringLiteral(literal) => Some(literal.value.to_str().to_string()),
+            Self::StmtExpr(stmt) => stmt.value.as_ref().root_string_literal_value(),
+            _ => None,
+        }
     }
 
     fn walk_root_loaded_names(&self, f: &mut impl FnMut(&str)) {
-        self.0.walk_root_loaded_names(f);
+        match self {
+            Self::ExprName(name) => {
+                if matches!(name.ctx, ast::ExprContext::Load) {
+                    f(name.id.as_str());
+                }
+            }
+            Self::Call(call) => {
+                if let Some(name) = call.func.as_ref().root_name_id() {
+                    f(name);
+                }
+            }
+            Self::StmtExpr(stmt) => stmt.value.as_ref().walk_root_loaded_names(f),
+            _ => {}
+        }
     }
 
     fn walk_root_defined_names(&self, f: &mut impl FnMut(&str)) {
-        self.0.walk_root_defined_names(f);
+        match self {
+            Self::ExprNamed(named) => {
+                walk_assigned_name_targets_in_instr_ruff(named.target.as_ref(), f);
+            }
+            Self::ExprName(name) => {
+                if matches!(name.ctx, ast::ExprContext::Store) {
+                    f(name.id.as_str());
+                }
+            }
+            Self::StmtAssign(stmt) => {
+                for target in &stmt.targets {
+                    walk_assigned_name_targets_in_instr_ruff(target, f);
+                }
+            }
+            Self::StmtFunctionDef(stmt) => f(stmt.name.as_str()),
+            Self::StmtClassDef(stmt) => f(stmt.name.as_str()),
+            Self::StmtExpr(stmt) => stmt.value.as_ref().walk_root_defined_names(f),
+            _ => {}
+        }
+    }
+
+    fn walk_root_deleted_names(&self, f: &mut impl FnMut(&str)) {
+        match self {
+            Self::ExprName(name) => {
+                if matches!(name.ctx, ast::ExprContext::Del) {
+                    f(name.id.as_str());
+                }
+            }
+            Self::StmtDelete(stmt) => {
+                for target in &stmt.targets {
+                    walk_assigned_name_targets_in_instr_ruff(target, f);
+                }
+            }
+            Self::StmtExpr(stmt) => stmt.value.as_ref().walk_root_deleted_names(f),
+            _ => {}
+        }
     }
 
     fn walk_root_cell_ref_logical_names(&self, f: &mut impl FnMut(&str)) {
-        self.0.walk_root_cell_ref_logical_names(f);
+        match self {
+            Self::Call(call) => {
+                if let Some(name) = call_root_cell_ref_logical_name(call) {
+                    f(name.as_str());
+                }
+            }
+            Self::StmtExpr(stmt) => stmt.value.as_ref().walk_root_cell_ref_logical_names(f),
+            _ => {}
+        }
     }
 }
 

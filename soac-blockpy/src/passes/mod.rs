@@ -13,11 +13,94 @@ mod trace;
 use crate::block_py::{cfg::relabel_blockpy_blocks_dense, BlockPyModule};
 use crate::block_py::{
     Await, BinOp, BlockPyNameLike, BlockPyPass, Call, CellRef, CellRefForName, ChildVisitable,
-    CodegenBlockPyExpr, Del, DelItem, GetAttr, GetItem, HasMeta, Instr, LiteralValue, Load,
-    ResolvedName, MakeCell, MakeFunction, MapInstr, Mappable, Meta, SetAttr, SetItem, Store,
-    TryMapInstr, UnaryOp, UnresolvedName, WithMeta, Yield, YieldFrom,
+    CodegenBlockPyExpr, Del, DelItem, ExprAttribute, ExprBoolOp, ExprBooleanLiteral,
+    ExprBytesLiteral, ExprCompare, ExprDict, ExprDictComp, ExprEllipsisLiteral, ExprFString,
+    ExprGenerator, ExprIpyEscapeCommand, ExprIf, ExprLambda, ExprList, ExprListComp, ExprName,
+    ExprNamed, ExprNoneLiteral, ExprNumberLiteral, ExprSet, ExprSetComp, ExprSlice, ExprStarred,
+    ExprStringLiteral, ExprSubscript, ExprTString, ExprTuple, GetAttr, GetItem, HasMeta, Instr,
+    Load, LiteralValue, MakeCell, MakeFunction, MapInstr, Mappable, Meta, ResolvedName, SetAttr,
+    SetItem, StmtAnnAssign, StmtAssign, StmtAssert, StmtAugAssign, StmtBreak,
+    StmtClassDef, StmtContinue, StmtDelete, StmtExpr, StmtFor, StmtFunctionDef, StmtGlobal,
+    StmtIf, StmtImport, StmtImportFrom, StmtIpyEscapeCommand, StmtMatch, StmtNonlocal, StmtPass,
+    StmtRaise, StmtReturn, StmtTry, StmtTypeAlias, StmtWhile, StmtWith, Store, TryMapInstr,
+    UnaryOp, UnresolvedName, WithMeta, Yield, YieldFrom,
 };
+use ruff_python_ast::{self as ast};
 use soac_macros::{enum_broadcast, DelegateMatchDefault};
+
+#[derive(Clone, derive_more::From, DelegateMatchDefault)]
+#[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, Debug)]
+pub enum InstrRuff {
+    ExprBoolOp(ExprBoolOp<Self>),
+    ExprNamed(ExprNamed<Self>),
+    BinOp(BinOp<Self>),
+    UnaryOp(UnaryOp<Self>),
+    ExprLambda(ExprLambda<Self>),
+    ExprIf(ExprIf<Self>),
+    ExprDict(ExprDict),
+    ExprSet(ExprSet<Self>),
+    ExprListComp(ExprListComp<Self>),
+    ExprSetComp(ExprSetComp<Self>),
+    ExprDictComp(ExprDictComp<Self>),
+    ExprGenerator(ExprGenerator<Self>),
+    Await(Await<Self>),
+    Yield(Yield<Self>),
+    YieldFrom(YieldFrom<Self>),
+    ExprCompare(ExprCompare<Self>),
+    Call(Call<Self>),
+    ExprFString(ExprFString),
+    ExprTString(ExprTString),
+    ExprStringLiteral(ExprStringLiteral),
+    ExprBytesLiteral(ExprBytesLiteral),
+    ExprNumberLiteral(ExprNumberLiteral),
+    ExprBooleanLiteral(ExprBooleanLiteral),
+    ExprNoneLiteral(ExprNoneLiteral),
+    ExprEllipsisLiteral(ExprEllipsisLiteral),
+    ExprAttribute(ExprAttribute<Self>),
+    ExprSubscript(ExprSubscript<Self>),
+    ExprStarred(ExprStarred<Self>),
+    ExprName(ExprName),
+    ExprList(ExprList<Self>),
+    ExprTuple(ExprTuple<Self>),
+    ExprSlice(ExprSlice<Self>),
+    ExprIpyEscapeCommand(ExprIpyEscapeCommand),
+    StmtFunctionDef(StmtFunctionDef<Self>),
+    StmtClassDef(StmtClassDef<Self>),
+    StmtReturn(StmtReturn<Self>),
+    StmtDelete(StmtDelete<Self>),
+    StmtTypeAlias(StmtTypeAlias<Self>),
+    StmtAssign(StmtAssign<Self>),
+    StmtAugAssign(StmtAugAssign<Self>),
+    StmtAnnAssign(StmtAnnAssign<Self>),
+    StmtFor(StmtFor<Self>),
+    StmtWhile(StmtWhile<Self>),
+    StmtIf(StmtIf<Self>),
+    StmtWith(StmtWith<Self>),
+    StmtMatch(StmtMatch<Self>),
+    StmtRaise(StmtRaise<Self>),
+    StmtTry(StmtTry<Self>),
+    StmtAssert(StmtAssert<Self>),
+    StmtImport(StmtImport),
+    StmtImportFrom(StmtImportFrom),
+    StmtGlobal(StmtGlobal),
+    StmtNonlocal(StmtNonlocal),
+    StmtExpr(StmtExpr<Self>),
+    StmtPass(StmtPass),
+    StmtBreak(StmtBreak),
+    StmtContinue(StmtContinue),
+    StmtIpyEscapeCommand(StmtIpyEscapeCommand),
+}
+
+#[derive(Debug, Clone)]
+pub struct RuffBlockPyPass;
+
+impl BlockPyPass for RuffBlockPyPass {
+    type Expr = InstrRuff;
+}
+
+impl Instr for InstrRuff {
+    type Name = ast::ExprName;
+}
 
 #[derive(Clone, derive_more::From, DelegateMatchDefault)]
 #[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, Debug)]
