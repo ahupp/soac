@@ -310,6 +310,7 @@ perf-pystone-jit-warm loops="500000" output_prefix="logs/pystone_jit_perf_warm":
   REPORT_DSO="${OUTPUT_PREFIX}_by_dso.txt"
   REPORT_DSO_SYMBOLS="${OUTPUT_PREFIX}_by_dso_symbol.txt"
   REPORT_CALLGRAPH="${OUTPUT_PREFIX}_callgraph.txt"
+  REPORT_SPEEDSCOPE="${OUTPUT_PREFIX}_speedscope.json"
   PYO3_RELEASE_LIB="$REPO_ROOT/target/release/lib_soac_ext.so"
   PYO3_STAGING_DIR="$(mktemp -d)"
   READY_FILE="$(mktemp "$REPO_ROOT/tmp/pystone_jit_perf_ready.XXXXXX")"
@@ -335,6 +336,11 @@ perf-pystone-jit-warm loops="500000" output_prefix="logs/pystone_jit_perf_warm":
     echo "perf is required but was not found on PATH" >&2
     exit 1
   fi
+  if ! command -v inferno-collapse-perf >/dev/null 2>&1; then
+    echo "inferno-collapse-perf is required but was not found on PATH" >&2
+    echo "install it with: cargo install inferno" >&2
+    exit 1
+  fi
 
   echo "date: $(date +%F)"
   echo "warmup loops: ${WARMUP_LOOPS}"
@@ -346,6 +352,7 @@ perf-pystone-jit-warm loops="500000" output_prefix="logs/pystone_jit_perf_warm":
   echo "report by dso: ${REPORT_DSO}"
   echo "report by dso/symbol: ${REPORT_DSO_SYMBOLS}"
   echo "report callgraph: ${REPORT_CALLGRAPH}"
+  echo "report speedscope: ${REPORT_SPEEDSCOPE}"
   echo "perf buildid dir: ${PERF_BUILDID_DIR}"
 
   cd "$REPO_ROOT"
@@ -473,7 +480,32 @@ perf-pystone-jit-warm loops="500000" output_prefix="logs/pystone_jit_perf_warm":
     -i "${PERF_DATA}" \
     >"${REPORT_CALLGRAPH}"
 
+  perf script -i "${PERF_DATA}" \
+    | inferno-collapse-perf \
+    | python3 "$REPO_ROOT/scripts/folded_to_speedscope.py" "$(basename "${OUTPUT_PREFIX}")" \
+    >"${REPORT_SPEEDSCOPE}"
+
   echo "finished"
+
+perf-pystone-jit-specialized loops="500000" output_prefix="logs/pystone_jit_perf_warm_specialized": ensure-cpython (update-venv) (build-extension "release")
+  #!/usr/bin/env bash
+  set -euo pipefail
+  export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  WARMUP_LOOPS="${WARMUP_LOOPS:-1000}"
+  SPECIALIZATION_PROFILE_LOOPS="${SPECIALIZATION_PROFILE_LOOPS:-8000000}"
+
+  cd "$REPO_ROOT"
+  counter_dump_path="$(mktemp "${TMPDIR:-/tmp}/soac_perf_call_targets_XXXXXX.bin")"
+  trap 'rm -f "$counter_dump_path"' EXIT
+
+  LOOPS="${SPECIALIZATION_PROFILE_LOOPS}" \
+  WARMUP_LOOPS="${WARMUP_LOOPS}" \
+  DIET_PYTHON_CALL_TARGET_COUNTERS=1 \
+  DIET_PYTHON_COUNTERS_OUTPUT_FILE="$counter_dump_path" \
+    "$REPO_ROOT/.venv/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)' >/tmp/soac_perf_specialization_profile.out 2>&1
+
+  DIET_PYTHON_COUNTERS_FILE="$counter_dump_path" \
+    just perf-pystone-jit-warm "{{loops}}" "{{output_prefix}}"
 
 [private]
 _pytest-run *args='': ensure-venv
