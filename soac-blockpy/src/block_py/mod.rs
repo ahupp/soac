@@ -805,7 +805,6 @@ pub trait BlockPyFallthroughTerm: BlockPyJumpTerm {
 
 pub(crate) trait ImplicitNoneExpr {
     fn implicit_none_expr() -> Self;
-    fn is_implicit_none_expr(expr: &Self) -> bool;
 }
 
 #[derive(Debug, Clone)]
@@ -1004,39 +1003,17 @@ impl ImplicitNoneExpr for InstrWithAwaitAndYield {
     fn implicit_none_expr() -> Self {
         core_runtime_name_expr_with_meta("NONE", Default::default(), Default::default())
     }
-
-    fn is_implicit_none_expr(expr: &Self) -> bool {
-        matches!(
-            expr,
-            InstrWithAwaitAndYield::Load(op)
-                if op.name.is_runtime_symbol("NONE")
-        )
-    }
 }
 
 impl ImplicitNoneExpr for InstrWithYield {
     fn implicit_none_expr() -> Self {
         core_runtime_name_expr_with_meta("NONE", Default::default(), Default::default())
     }
-
-    fn is_implicit_none_expr(expr: &Self) -> bool {
-        matches!(
-            expr,
-            InstrWithYield::Load(op) if op.name.is_runtime_symbol("NONE")
-        )
-    }
 }
 
 impl ImplicitNoneExpr for InstrUnresolved {
     fn implicit_none_expr() -> Self {
         core_runtime_name_expr_with_meta("NONE", Default::default(), Default::default())
-    }
-
-    fn is_implicit_none_expr(expr: &Self) -> bool {
-        matches!(
-            expr,
-            InstrUnresolved::Load(op) if op.name.is_runtime_symbol("NONE")
-        )
     }
 }
 
@@ -1048,13 +1025,6 @@ impl ImplicitNoneExpr for InstrResolved {
         })
         .into()
     }
-
-    fn is_implicit_none_expr(expr: &Self) -> bool {
-        matches!(
-            expr,
-            InstrResolved::Load(op) if op.name.is_runtime_symbol("NONE")
-        )
-    }
 }
 
 impl ImplicitNoneExpr for InstrCodegen {
@@ -1064,13 +1034,6 @@ impl ImplicitNoneExpr for InstrCodegen {
             location: NameLocation::RuntimeName,
         })
         .into()
-    }
-
-    fn is_implicit_none_expr(expr: &Self) -> bool {
-        matches!(
-            expr,
-            InstrCodegen::Load(op) if op.name.is_runtime_symbol("NONE")
-        )
     }
 }
 

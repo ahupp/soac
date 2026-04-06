@@ -1,7 +1,7 @@
 use super::{
     instr_any, map_function_blocks, Block, BlockLabel, BlockPyFunction, BlockTerm,
-    ChildVisitable, Del, ImplicitNoneExpr, Instr, Load, MapInstr, MapTerm, ModuleShape,
-    Mappable, Meta, Store, UnresolvedName, WithMeta,
+    ChildVisitable, Del, Instr, Load, MapInstr, MapTerm, ModuleShape, Mappable, Meta, Store,
+    UnresolvedName, WithMeta,
 };
 use crate::namegen::fresh_name;
 use ruff_python_ast as ast;
@@ -22,19 +22,13 @@ fn blockpy_successors<E: Instr>(block: &Block<E>) -> Vec<BlockLabel> {
     }
 }
 
-pub(crate) fn fold_jumps_to_trivial_none_return_blockpy<E>(blocks: &mut [Block<E>])
+pub(crate) fn fold_jumps_to_trivial_return_blockpy<E>(blocks: &mut [Block<E>])
 where
-    E: Clone + ImplicitNoneExpr + Instr,
+    E: Clone + Instr,
 {
     let trivial_ret_none_terms: HashMap<BlockLabel, BlockTerm<E>> = blocks
         .iter()
-        .filter(|block| {
-            block.body.is_empty()
-                && match &block.term {
-                    BlockTerm::Return(expr) => E::is_implicit_none_expr(expr),
-                    _ => false,
-                }
-        })
+        .filter(|block| block.body.is_empty() && matches!(&block.term, BlockTerm::Return(_)))
         .map(|block| (block.label.clone(), block.term.clone()))
         .collect();
 

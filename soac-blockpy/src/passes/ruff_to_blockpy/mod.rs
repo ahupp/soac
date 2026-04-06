@@ -1,5 +1,5 @@
 use crate::block_py::cfg::{
-    fold_jumps_to_trivial_none_return_blockpy, prune_unreachable_blockpy_blocks,
+    fold_jumps_to_trivial_return_blockpy, prune_unreachable_blockpy_blocks,
 };
 use crate::block_py::param_specs::ParamSpec;
 use crate::block_py::{
@@ -500,7 +500,7 @@ pub(crate) fn build_core_blockpy_callable_def_from_runtime_input(
             exc_edge: None,
         });
     }
-    fold_jumps_to_trivial_none_return_blockpy(&mut blocks);
+    fold_jumps_to_trivial_return_blockpy(&mut blocks);
     let extra_roots = blocks
         .iter()
         .filter_map(|block| block.exc_edge.as_ref().map(|edge| edge.target.clone()))

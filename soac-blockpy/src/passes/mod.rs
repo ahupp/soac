@@ -106,10 +106,6 @@ impl ImplicitNoneExpr for InstrRuff {
     fn implicit_none_expr() -> Self {
         ExprNoneLiteral::new().into()
     }
-
-    fn is_implicit_none_expr(expr: &Self) -> bool {
-        matches!(expr, Self::ExprNoneLiteral(_))
-    }
 }
 
 #[derive(Clone, derive_more::From)]
