@@ -305,16 +305,29 @@ perf-pystone-jit-warm loops="500000" output_prefix="logs/pystone_jit_perf_warm":
   PERF_DATA_BASENAME="$(basename "${OUTPUT_PREFIX}").data"
   PERF_DATA="$REPO_ROOT/tmp/${PERF_DATA_BASENAME}"
   RUN_LOG="${OUTPUT_PREFIX}.log"
+  PERF_RECORD_LOG="${OUTPUT_PREFIX}_record.txt"
   REPORT_SYMBOLS="${OUTPUT_PREFIX}_report.txt"
   REPORT_DSO="${OUTPUT_PREFIX}_by_dso.txt"
   REPORT_DSO_SYMBOLS="${OUTPUT_PREFIX}_by_dso_symbol.txt"
   REPORT_CALLGRAPH="${OUTPUT_PREFIX}_callgraph.txt"
   PYO3_RELEASE_LIB="$REPO_ROOT/target/release/lib_soac_ext.so"
   PYO3_STAGING_DIR="$(mktemp -d)"
+  READY_FILE="$(mktemp "$REPO_ROOT/tmp/pystone_jit_perf_ready.XXXXXX")"
   PYTHONPATH_PREFIX="${REPO_ROOT}:${REPO_ROOT}/soac_py/src:${REPO_ROOT}/scripts:${PYO3_STAGING_DIR}"
+  PY_PID=""
+  PERF_PID=""
 
   cleanup() {
+    if [[ -n "${PERF_PID}" ]] && kill -0 "${PERF_PID}" >/dev/null 2>&1; then
+      kill -INT "${PERF_PID}" >/dev/null 2>&1 || true
+      wait "${PERF_PID}" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "${PY_PID}" ]] && kill -0 "${PY_PID}" >/dev/null 2>&1; then
+      kill "${PY_PID}" >/dev/null 2>&1 || true
+      wait "${PY_PID}" >/dev/null 2>&1 || true
+    fi
     rm -rf "$PYO3_STAGING_DIR"
+    rm -f "$READY_FILE"
   }
   trap cleanup EXIT
 
@@ -328,6 +341,7 @@ perf-pystone-jit-warm loops="500000" output_prefix="logs/pystone_jit_perf_warm":
   echo "profile loops: ${LOOPS}"
   echo "perf data: ${PERF_DATA}"
   echo "run log: ${RUN_LOG}"
+  echo "perf record log: ${PERF_RECORD_LOG}"
   echo "report: ${REPORT_SYMBOLS}"
   echo "report by dso: ${REPORT_DSO}"
   echo "report by dso/symbol: ${REPORT_DSO_SYMBOLS}"
@@ -344,19 +358,90 @@ perf-pystone-jit-warm loops="500000" output_prefix="logs/pystone_jit_perf_warm":
 
   ln -sf "$PYO3_RELEASE_LIB" "$PYO3_STAGING_DIR/_soac_ext.so"
 
-  perf record \
-    --call-graph "${PERF_CALL_GRAPH}" \
-    -F "${PERF_FREQUENCY}" \
-    -o "${PERF_DATA}" \
-    -- \
-    env \
+  rm -f "${READY_FILE}"
+  env \
     LOOPS="${LOOPS}" \
     WARMUP_LOOPS="${WARMUP_LOOPS}" \
     PERF_BUILDID_DIR="${PERF_BUILDID_DIR}" \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH="${PYTHONPATH_PREFIX}${PYTHONPATH:+:${PYTHONPATH}}" \
-    "$CPYTHON_BIN" -c 'import os; from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)' \
-    >"${RUN_LOG}" 2>&1
+    READY_FILE="${READY_FILE}" \
+    "$CPYTHON_BIN" -c 'import os, signal; from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); open(os.environ["READY_FILE"], "w").write("ready\n"); os.kill(os.getpid(), signal.SIGSTOP); pystone.main(loops)' \
+    >"${RUN_LOG}" 2>&1 &
+  PY_PID=$!
+
+  for _ in $(seq 1 400); do
+    if [[ -f "${READY_FILE}" ]]; then
+      break
+    fi
+    if ! kill -0 "${PY_PID}" >/dev/null 2>&1; then
+      wait "${PY_PID}"
+      echo "python exited before signaling readiness" >&2
+      exit 1
+    fi
+    sleep 0.05
+  done
+
+  if [[ ! -f "${READY_FILE}" ]]; then
+    echo "timed out waiting for python warmup readiness" >&2
+    exit 1
+  fi
+
+  for _ in $(seq 1 200); do
+    if [[ "$(ps -o state= -p "${PY_PID}" 2>/dev/null | tr -d ' ')" == T* ]]; then
+      break
+    fi
+    if ! kill -0 "${PY_PID}" >/dev/null 2>&1; then
+      wait "${PY_PID}"
+      echo "python exited before stopping for perf attach" >&2
+      exit 1
+    fi
+    sleep 0.01
+  done
+
+  if [[ "$(ps -o state= -p "${PY_PID}" 2>/dev/null | tr -d ' ')" != T* ]]; then
+    echo "python never entered SIGSTOP state for perf attach" >&2
+    exit 1
+  fi
+
+  perf record \
+    --call-graph "${PERF_CALL_GRAPH}" \
+    -F "${PERF_FREQUENCY}" \
+    -o "${PERF_DATA}" \
+    -p "${PY_PID}" \
+    >"${PERF_RECORD_LOG}" 2>&1 &
+  PERF_PID=$!
+
+  for _ in $(seq 1 100); do
+    if ! kill -0 "${PERF_PID}" >/dev/null 2>&1; then
+      wait "${PERF_PID}"
+      cat "${PERF_RECORD_LOG}" >&2
+      echo "perf exited before the benchmark resumed" >&2
+      exit 1
+    fi
+    sleep 0.01
+  done
+
+  kill -CONT "${PY_PID}"
+  wait "${PY_PID}"
+  PY_STATUS=$?
+  PY_PID=""
+
+  if kill -0 "${PERF_PID}" >/dev/null 2>&1; then
+    kill -INT "${PERF_PID}" >/dev/null 2>&1 || true
+  fi
+  wait "${PERF_PID}"
+  PERF_STATUS=$?
+  PERF_PID=""
+
+  if [[ ${PY_STATUS} -ne 0 ]]; then
+    cat "${RUN_LOG}" >&2
+    exit "${PY_STATUS}"
+  fi
+  if [[ ${PERF_STATUS} -ne 0 && ${PERF_STATUS} -ne 130 ]]; then
+    cat "${PERF_RECORD_LOG}" >&2
+    exit "${PERF_STATUS}"
+  fi
 
   perf report \
     --stdio \
