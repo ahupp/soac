@@ -4867,12 +4867,18 @@ fn new_jit_module() -> Result<JITModule, String> {
     Ok(jit_module)
 }
 
+#[derive(Debug)]
+struct DefinedFunctionArtifact {
+    code_size: usize,
+    systemv_unwind_info: Option<cranelift_codegen::isa::unwind::systemv::UnwindInfo>,
+}
+
 fn define_function_with_incremental_cache(
     jit_module: &mut JITModule,
     func_id: FuncId,
     ctx: &mut cranelift_codegen::Context,
     err_prefix: &str,
-) -> Result<usize, String> {
+) -> Result<DefinedFunctionArtifact, String> {
     inline_runtime_support_calls(jit_module, ctx, err_prefix)?;
     let func_for_relocs = ctx.func.clone();
     let mut ctrl_plane = ControlPlane::default();
@@ -4889,10 +4895,20 @@ fn define_function_with_incremental_cache(
         .iter()
         .map(|reloc| ModuleReloc::from_mach_reloc(reloc, &func_for_relocs, func_id))
         .collect::<Vec<_>>();
+    let systemv_unwind_info = compiled
+        .create_unwind_info(jit_module.isa())
+        .map_err(|err| format!("{err_prefix}: failed to create unwind info: {err:?}"))?
+        .and_then(|unwind_info| match unwind_info {
+            cranelift_codegen::isa::unwind::UnwindInfo::SystemV(info) => Some(info),
+            _ => None,
+        });
     jit_module
         .define_function_bytes(func_id, alignment, compiled.code_buffer(), &relocs)
         .map_err(|err| format!("{err_prefix}: {err}"))?;
-    Ok(compiled.code_buffer().len())
+    Ok(DefinedFunctionArtifact {
+        code_size: compiled.code_buffer().len(),
+        systemv_unwind_info,
+    })
 }
 
 const RUNTIME_SUPPORT_INLINE_MAX_INSTS: usize = 32;
@@ -6349,7 +6365,7 @@ pub unsafe fn compile_cranelift_run_bb_specialized_cached(
     })?;
     let mut ctx = built.ctx;
     let main_id = built.main_id;
-    let main_code_size = define_function_with_incremental_cache(
+    let main_artifact = define_function_with_incremental_cache(
         &mut compiled._jit_module,
         main_id,
         &mut ctx,
@@ -6369,7 +6385,13 @@ pub unsafe fn compile_cranelift_run_bb_specialized_cached(
     let code_ptr = compiled._jit_module.get_finalized_function(main_id);
     let main_symbol =
         jit_python_perf_symbol_name(JIT_PYTHON_PERF_SYMBOL_KIND_DIRECT, &function.names.qualname);
-    jitdump::record_code_load(&main_symbol, code_ptr.cast::<u8>(), main_code_size)?;
+    jitdump::record_code_load(
+        &main_symbol,
+        code_ptr.cast::<u8>(),
+        main_artifact.code_size,
+        compiled._jit_module.isa(),
+        main_artifact.systemv_unwind_info.as_ref(),
+    )?;
     compiled.entry = Some(CompiledRunnerEntry::Direct {
         code_ptr,
         param_count: function.params.len(),
@@ -6542,7 +6564,7 @@ pub unsafe fn compile_cranelift_vectorcall_direct_trampoline(
         fb.finalize();
     }
 
-    let main_code_size = define_function_with_incremental_cache(
+    let main_artifact = define_function_with_incremental_cache(
         &mut jit_module,
         main_id,
         &mut ctx,
@@ -6554,7 +6576,13 @@ pub unsafe fn compile_cranelift_vectorcall_direct_trampoline(
         .map_err(|err| format!("failed to finalize direct vectorcall trampoline: {err}"))?;
 
     let code_ptr = jit_module.get_finalized_function(main_id);
-    jitdump::record_code_load(symbol_name, code_ptr.cast::<u8>(), main_code_size)?;
+    jitdump::record_code_load(
+        symbol_name,
+        code_ptr.cast::<u8>(),
+        main_artifact.code_size,
+        jit_module.isa(),
+        main_artifact.systemv_unwind_info.as_ref(),
+    )?;
     let entry: VectorcallEntryFn = std::mem::transmute(code_ptr);
     let compiled = Box::new(CompiledVectorcallRunner {
         _jit_module: jit_module,

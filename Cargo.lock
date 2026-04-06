@@ -1713,6 +1713,7 @@ dependencies = [
  "cranelift-module",
  "cranelift-native",
  "cranelift-reader",
+ "gimli",
  "libc",
  "log",
  "memmap2",

@@ -19,6 +19,7 @@ cranelift-jit = "0.125"
 cranelift-module = "0.125"
 cranelift-native = "0.125"
 cranelift-reader = "0.125"
+gimli = "0.32"
 libc = "0.2"
 memmap2 = "0.9"
 
