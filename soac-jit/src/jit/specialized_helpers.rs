@@ -1695,9 +1695,17 @@ define_unary_obj_wrapper!(pynumber_positive_wrapper, "PyNumber_Positive");
 define_unary_obj_wrapper!(pynumber_negative_wrapper, "PyNumber_Negative");
 define_unary_obj_wrapper!(pynumber_invert_wrapper, "PyNumber_Invert");
 
-#[cfg(not(test))]
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|raw| {
+            let trimmed = raw.trim();
+            !(trimmed.is_empty() || trimmed == "0")
+        })
+        .unwrap_or(false)
+}
+
 fn should_preserve_perf_helper_frames() -> bool {
-    std::env::var_os("SOAC_JIT_PERF_HELPER_FRAMES").is_some()
+    env_flag_enabled("SOAC_JIT_PERF_HELPER_FRAMES")
 }
 
 #[cfg(test)]
@@ -2121,5 +2129,27 @@ mod tests {
             ffi::Py_DECREF(replacement);
             ffi::Py_DECREF(module_value);
         });
+    }
+
+    #[test]
+    fn perf_helper_frames_env_respects_falsey_values() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        let prior = std::env::var_os("SOAC_JIT_PERF_HELPER_FRAMES");
+        unsafe { std::env::remove_var("SOAC_JIT_PERF_HELPER_FRAMES") };
+        assert!(!should_preserve_perf_helper_frames());
+
+        unsafe { std::env::set_var("SOAC_JIT_PERF_HELPER_FRAMES", "1") };
+        assert!(should_preserve_perf_helper_frames());
+
+        unsafe { std::env::set_var("SOAC_JIT_PERF_HELPER_FRAMES", "0") };
+        assert!(!should_preserve_perf_helper_frames());
+
+        unsafe { std::env::set_var("SOAC_JIT_PERF_HELPER_FRAMES", "") };
+        assert!(!should_preserve_perf_helper_frames());
+
+        match prior {
+            Some(value) => unsafe { std::env::set_var("SOAC_JIT_PERF_HELPER_FRAMES", value) },
+            None => unsafe { std::env::remove_var("SOAC_JIT_PERF_HELPER_FRAMES") },
+        }
     }
 }
