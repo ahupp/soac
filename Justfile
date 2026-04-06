@@ -54,7 +54,13 @@ build-python: ensure-cpython-checkout
   #!/usr/bin/env bash
   set -euo pipefail
   cd "$REPO_ROOT/vendor/cpython"
-  make clean && LDFLAGS="-Wl,-rpath,'\$\$ORIGIN'" ./configure --enable-shared --enable-optimizations
+  make clean && \
+    LDFLAGS="-Wl,-rpath,'\$\$ORIGIN'" \
+    ./configure \
+      --enable-shared \
+      --enable-optimizations \
+      --with-lto \
+      CFLAGS_NODIST="-O3 -g -fno-omit-frame-pointer -fasynchronous-unwind-tables"
   make -j"$(nproc)"
 
 [private]
