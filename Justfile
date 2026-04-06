@@ -655,7 +655,28 @@ _call-target-specializations-from-dump dump_path:
         }
       '
 
-benchmark loops="1000000": (update-venv) (build-extension "release")
+benchmark-warm loops="8000000": (update-venv) (build-extension "release")
+  #!/usr/bin/env bash
+  set -euo pipefail
+  export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  WARMUP_LOOPS="${WARMUP_LOOPS:-1000}"
+  echo "date: $(date +%F)"
+  echo "loops: {{loops}}"
+  echo "warmup loops: ${WARMUP_LOOPS}"
+
+  cd "$REPO_ROOT"
+
+  echo "jit transformed warm"
+  LOOPS="{{loops}}" \
+  WARMUP_LOOPS="${WARMUP_LOOPS}" \
+    "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
+
+  echo "stock cpython"
+  LOOPS="{{loops}}" \
+  WARMUP_LOOPS="${WARMUP_LOOPS}" \
+    "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
+
+benchmark loops="8000000": (update-venv) (build-extension "release")
   #!/usr/bin/env bash
   set -euo pipefail
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
