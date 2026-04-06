@@ -1,29 +1,6 @@
 use super::assign_stmt::rewrite_assignment_target;
 use super::*;
 
-impl StmtLowerer for ast::StmtWith {
-    fn simplify_ast(self, _context: &Context) -> Vec<Stmt> {
-        desugar_structured_with_stmt_for_blockpy(self)
-    }
-
-    fn plan_head(self, _context: &Context) -> StmtSequenceHeadPlan {
-        StmtSequenceHeadPlan::With(self)
-    }
-
-    fn to_blockpy<E>(
-        &self,
-        context: &Context,
-        out: &mut BlockPyStmtBuilder<E>,
-        loop_ctx: Option<&LoopContext>,
-        next_label_id: &mut usize,
-    ) -> Result<(), String>
-    where
-        E: RuffToBlockPyExpr,
-    {
-        lower_stmt_via_simplify(context, self, out, loop_ctx, next_label_id)
-    }
-}
-
 fn maybe_placeholder(expr: Expr) -> (Vec<Stmt>, Expr, bool) {
     if is_simple(&expr) && !matches!(&expr, Expr::StringLiteral(_) | Expr::BytesLiteral(_)) {
         return (Vec::new(), expr, false);
@@ -147,19 +124,38 @@ finally:
     lowered_body
 }
 
+pub(super) fn desugar_structured_with_instr_for_blockpy(
+    with_stmt: crate::block_py::StmtWith<InstrRuff>,
+) -> Vec<InstrRuff> {
+    let crate::block_py::StmtWith {
+        is_async,
+        items,
+        body,
+        ..
+    } = with_stmt;
+    let rewritten = desugar_structured_with_stmt_for_blockpy(ast::StmtWith {
+        range: Default::default(),
+        node_index: Default::default(),
+        is_async,
+        items,
+        body: body.into_iter().map(InstrRuff::into_ast_stmt).collect(),
+    });
+    rewritten.into_iter().map(InstrRuff::from_ast_stmt).collect()
+}
+
 pub(crate) fn lower_with_stmt_sequence<F, E>(
     context: &Context,
-    with_stmt: ast::StmtWith,
-    remaining_stmts: &[Stmt],
+    with_stmt: crate::block_py::StmtWith<InstrRuff>,
+    remaining_stmts: &[InstrRuff],
     targets: RegionTargets,
-    linear: Vec<Stmt>,
+    linear: Vec<InstrRuff>,
     blocks: &mut Vec<LoweredBlockPyBlock<E>>,
     name_gen: &FunctionNameGen,
     _needs_finally_return_flow: bool,
     lower_sequence: &mut F,
 ) -> BlockLabel
 where
-    F: FnMut(&[Stmt], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
+    F: FnMut(&[InstrRuff], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
     E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
 {
     if with_stmt.items.is_empty() {
@@ -170,10 +166,8 @@ where
         };
         return lower_expanded_stmt_sequence(
             context,
-            {
-                let mut body = with_stmt.body;
-                std::mem::take(&mut body)
-            },
+            name_gen,
+            with_stmt.body,
             remaining_stmts,
             targets,
             linear,
@@ -190,7 +184,8 @@ where
     };
     lower_expanded_stmt_sequence(
         context,
-        desugar_structured_with_stmt_for_blockpy(with_stmt),
+        name_gen,
+        desugar_structured_with_instr_for_blockpy(with_stmt),
         remaining_stmts,
         targets,
         linear,

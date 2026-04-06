@@ -89,7 +89,7 @@ impl fmt::Display for BlockLabel {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FunctionNameGen {
     state: Arc<FunctionNameGenState>,
 }

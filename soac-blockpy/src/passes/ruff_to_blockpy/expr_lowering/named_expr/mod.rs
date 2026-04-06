@@ -1,45 +1,48 @@
 use super::{BlockPySetupExprLowerer, RuffToBlockPyExpr};
-use crate::block_py::{BlockPyStmtBuilder, Meta, Store, StructuredInstr, WithMeta};
+use crate::block_py::{HasMeta, Meta, Store, WithMeta};
+use crate::passes::InstrRuff;
 use crate::passes::ruff_to_blockpy::LoopContext;
-use ruff_python_ast::{self as ast, Expr};
+use crate::passes::ruff_to_blockpy::stmt_lowering::BlockPyStmtBuilder;
+use ruff_python_ast::{self as ast};
 
-fn into_store_name(name: ast::ExprName) -> ast::ExprName {
-    ast::ExprName {
-        ctx: ast::ExprContext::Store,
-        ..name
-    }
+fn into_store_name(name: ast::name::Name) -> ast::name::Name {
+    name
 }
 
-fn into_load_name(name: ast::ExprName) -> Expr {
-    Expr::Name(ast::ExprName {
+fn into_load_name(name: ast::ExprName) -> InstrRuff {
+    InstrRuff::from_ast_expr(ast::Expr::Name(ast::ExprName {
+        id: name.id,
         ctx: ast::ExprContext::Load,
-        ..name
-    })
+        range: name.range,
+        node_index: name.node_index,
+    }))
 }
 
 pub(super) fn lower_named_expr_into<L, E>(
     lowerer: &L,
-    named_expr: ast::ExprNamed,
+    named_expr: crate::block_py::ExprNamed<InstrRuff>,
     out: &mut BlockPyStmtBuilder<E>,
     loop_ctx: Option<&LoopContext>,
-    next_label_id: &mut usize,
-) -> Result<Expr, String>
+) -> Result<InstrRuff, String>
 where
     L: BlockPySetupExprLowerer + ?Sized,
-    E: RuffToBlockPyExpr,
+    E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
 {
-    let ast::ExprNamed { target, value, .. } = named_expr;
-    let Expr::Name(target_name) = *target else {
+    let crate::block_py::ExprNamed { target, value, .. } = named_expr;
+    let InstrRuff::ExprName(target_name) = *target else {
         return Err("named expression lowering expected a name target".to_string());
     };
-    let value =
-        E::from_lowered_expr(lowerer.lower_expr_ast_into(*value, out, loop_ctx, next_label_id)?);
-    let load_target = target_name.clone();
-    let target_name = into_store_name(target_name);
-    let meta = Meta::new(target_name.node_index.clone(), target_name.range);
-    out.push_stmt(StructuredInstr::Expr(
-        Store::new(target_name, value).with_meta(meta).into(),
-    ));
+    let value = E::from_lowered_expr(lowerer.lower_expr_instr_into(*value, out, loop_ctx)?);
+    let target_meta = target_name.meta();
+    let load_target = ast::ExprName {
+        id: target_name.id.clone(),
+        ctx: target_name.ctx,
+        range: target_meta.range,
+        node_index: target_meta.node_index.clone(),
+    };
+    let target_name = into_store_name(target_name.id);
+    let meta = Meta::new(target_meta.node_index, target_meta.range);
+    out.push_stmt(Store::new(target_name, value).with_meta(meta).into());
     Ok(into_load_name(load_target))
 }
 

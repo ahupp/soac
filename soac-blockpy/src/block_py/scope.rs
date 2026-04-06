@@ -4,7 +4,7 @@ use super::{
     InstrWithAwaitAndYield, InstrWithYield, FunctionName, Instr, InstrRuff,
 };
 use crate::passes::ast_to_ast::scope_helpers::cell_name;
-use ruff_python_ast::{self as ast, Expr};
+use ruff_python_ast::{self as ast};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -429,24 +429,6 @@ pub(crate) trait ScopeExprNode: Instr + ChildVisitable<Self> {
     fn walk_root_cell_ref_logical_names(&self, _f: &mut impl FnMut(&str)) {}
 }
 
-fn walk_assigned_name_targets_in_expr(target: &Expr, f: &mut impl FnMut(&str)) {
-    match target {
-        Expr::Name(name) => f(name.id.as_str()),
-        Expr::Tuple(tuple) => {
-            for elt in &tuple.elts {
-                walk_assigned_name_targets_in_expr(elt, f);
-            }
-        }
-        Expr::List(list) => {
-            for elt in &list.elts {
-                walk_assigned_name_targets_in_expr(elt, f);
-            }
-        }
-        Expr::Starred(starred) => walk_assigned_name_targets_in_expr(starred.value.as_ref(), f),
-        _ => {}
-    }
-}
-
 fn call_root_cell_ref_logical_name<E>(call: &Call<E>) -> Option<String>
 where
     E: ScopeExprNode,
@@ -459,59 +441,6 @@ where
         return None;
     };
     arg.root_string_literal_value()
-}
-
-impl ScopeExprNode for Expr {
-    fn root_name_id(&self) -> Option<&str> {
-        match self {
-            Expr::Name(name) => Some(name.id.as_str()),
-            Expr::Attribute(ast::ExprAttribute { value, attr, .. }) if matches!(value.as_ref(), Expr::Name(name) if name.id.as_str() == "__soac__") => {
-                Some(attr.id.as_str())
-            }
-            _ => None,
-        }
-    }
-
-    fn root_string_literal_value(&self) -> Option<String> {
-        match self {
-            Expr::StringLiteral(literal) => Some(literal.value.to_str().to_string()),
-            _ => None,
-        }
-    }
-
-    fn walk_root_loaded_names(&self, f: &mut impl FnMut(&str)) {
-        if let Expr::Name(name) = self {
-            if matches!(name.ctx, ast::ExprContext::Load) {
-                f(name.id.as_str());
-            }
-        }
-    }
-
-    fn walk_root_defined_names(&self, f: &mut impl FnMut(&str)) {
-        if let Expr::Named(named) = self {
-            walk_assigned_name_targets_in_expr(named.target.as_ref(), f);
-        }
-    }
-
-    fn walk_root_cell_ref_logical_names(&self, f: &mut impl FnMut(&str)) {
-        let Expr::Call(call) = self else {
-            return;
-        };
-        let Some(Expr::Attribute(ast::ExprAttribute { value, attr, .. })) =
-            Some(call.func.as_ref())
-        else {
-            return;
-        };
-        if !matches!(value.as_ref(), Expr::Name(name) if name.id.as_str() == "__soac__")
-            || attr.id.as_str() != "cell_ref"
-        {
-            return;
-        }
-        let Some(ast::Expr::StringLiteral(literal)) = call.arguments.args.first() else {
-            return;
-        };
-        f(literal.value.to_str().as_ref());
-    }
 }
 
 fn walk_assigned_name_targets_in_instr_ruff(target: &InstrRuff, f: &mut impl FnMut(&str)) {

@@ -5,11 +5,11 @@ use crate::block_py::param_specs::ParamSpec;
 use crate::block_py::{
     assert_blockpy_block_normalized, Block, BlockBuilder, BlockEdge, BlockLabel,
     BlockPyFallthroughTerm, BlockPyFunction, BlockPyModule, BlockTerm, CallableScopeInfo,
-    FunctionKind, FunctionName, FunctionNameGen, Instr, StructuredInstr,
+    FunctionKind, FunctionName, FunctionNameGen, Instr,
 };
 use crate::namegen::fresh_name;
 use crate::passes::ast_to_ast::context::Context;
-use crate::passes::CoreBlockPyPassWithAwaitAndYield;
+use crate::passes::{CoreBlockPyPassWithAwaitAndYield, InstrRuff};
 use crate::ruff_ast_to_string;
 use crate::template::is_simple;
 use crate::{py_expr, py_stmt};
@@ -46,15 +46,210 @@ pub(crate) use stmt_lowering::{
     lower_with_stmt_sequence,
 };
 pub(crate) use stmt_sequences::{
-    lower_expanded_stmt_sequence, lower_stmt_sequence_with_state, lower_stmts_to_blockpy_stmts,
+    lower_expanded_stmt_sequence, lower_stmt_sequence_with_state,
 };
 pub(crate) use try_regions::{
     block_references_label, build_try_plan, finalize_try_regions, lower_try_regions,
     prepare_except_body, prepare_finally_body, TryPlan,
 };
 
-pub(crate) type LoweredBlockPyBlock<E = Expr> = Block<StructuredInstr<E>, E>;
-pub(crate) type InlineBlockBuilder<I> = BlockBuilder<I, BlockTerm<I>>;
+pub(crate) type LoweredBlockPyBlock<E = Expr> = Block<E, E>;
+
+#[derive(Debug, Clone)]
+pub(crate) struct InlineBlockBuilder<I: Instr> {
+    name_gen: FunctionNameGen,
+    entry_label: BlockLabel,
+    current_label: BlockLabel,
+    current: BlockBuilder<I, BlockTerm<I>>,
+    deps: Vec<Block<I, I>>,
+}
+
+impl<I: Instr> InlineBlockBuilder<I> {
+    pub(crate) fn new(name_gen: &FunctionNameGen) -> Self {
+        let entry_label = name_gen.next_block_name();
+        Self {
+            name_gen: name_gen.share(),
+            entry_label,
+            current_label: entry_label,
+            current: BlockBuilder::new(),
+            deps: Vec::new(),
+        }
+    }
+
+    pub(crate) fn push_stmt(&mut self, stmt: I)
+    where
+        I: crate::block_py::NormalizedInstr,
+    {
+        self.current.push_stmt(stmt);
+    }
+
+    pub(crate) fn name_gen(&self) -> &FunctionNameGen {
+        &self.name_gen
+    }
+
+    pub(crate) fn set_term(&mut self, term: BlockTerm<I>) {
+        self.current.set_term(term);
+    }
+
+    pub(crate) fn ensure_fallthrough_term(&mut self) {
+        self.current.ensure_fallthrough_term();
+    }
+
+    pub(crate) fn append_fragment(&mut self, mut fragment: InlineFragment<I>)
+    where
+        I: crate::block_py::NormalizedInstr,
+    {
+        assert!(
+            self.current.term.is_none(),
+            "cannot append inline fragment after builder terminator"
+        );
+        let continuation = self.name_gen.next_block_name();
+        self.current
+            .set_term(BlockTerm::Jump(BlockEdge::new(fragment.entry.label)));
+        self.flush_current_block();
+        fragment.entry.replace_fallthrough_target(continuation);
+        for dep in &mut fragment.deps {
+            dep.replace_fallthrough_target(continuation);
+        }
+        self.deps.push(fragment.entry);
+        self.deps.extend(fragment.deps);
+        self.current_label = continuation;
+        self.current = BlockBuilder::new();
+    }
+
+    pub(crate) fn finish_with_term(mut self, term: BlockTerm<I>) -> InlineFragment<I>
+    where
+        I: crate::block_py::NormalizedInstr,
+    {
+        if self.current.term.is_none() {
+            self.current.set_term(term);
+        }
+        self.finish_fragment()
+    }
+
+    pub(crate) fn finish_fallthrough(mut self) -> InlineFragment<I>
+    where
+        I: crate::block_py::NormalizedInstr,
+    {
+        self.current.ensure_fallthrough_term();
+        self.finish_fragment()
+    }
+
+    pub(crate) fn finish_fallthrough_blocks(mut self) -> (BlockLabel, Vec<Block<I, I>>)
+    where
+        I: crate::block_py::NormalizedInstr,
+    {
+        self.current.ensure_fallthrough_term();
+        self.finish_blocks()
+    }
+
+    pub(crate) fn finish_linear_block(mut self, label: BlockLabel, term: BlockTerm<I>) -> Option<Block<I, I>>
+    where
+        I: crate::block_py::NormalizedInstr,
+    {
+        if !self.deps.is_empty() {
+            return None;
+        }
+        if self.current.term.is_none() {
+            self.current.set_term(term);
+        }
+        let current = self.current.finish();
+        Some(Block::new(label, current.body, current.term.expect("explicit term"), Vec::new(), None))
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.deps.is_empty() && self.current.body.is_empty() && self.current.term.is_none()
+    }
+
+    fn flush_current_block(&mut self)
+    where
+        I: crate::block_py::NormalizedInstr,
+    {
+        let current = std::mem::replace(&mut self.current, BlockBuilder::new()).finish();
+        let term = current
+            .term
+            .expect("inline block builder current block must have an explicit terminator");
+        self.deps.push(Block::new(
+            self.current_label,
+            current.body,
+            term,
+            Vec::new(),
+            None,
+        ));
+    }
+
+    fn finish_fragment(self) -> InlineFragment<I>
+    where
+        I: crate::block_py::NormalizedInstr,
+    {
+        let (entry_label, mut blocks) = self.finish_blocks();
+        if blocks.len() == 1 {
+            return InlineFragment::new(blocks.pop().expect("single block fragment"), Vec::new());
+        }
+        let entry = if let Some(entry_index) = blocks.iter().position(|block| block.label == entry_label) {
+            blocks.remove(entry_index)
+        } else {
+            let first_target = blocks
+                .first()
+                .map(|block| block.label)
+                .expect("multi-block fragment should contain at least one block");
+            Block::new(
+                entry_label,
+                Vec::new(),
+                BlockTerm::Jump(BlockEdge::new(first_target)),
+                Vec::new(),
+                None,
+            )
+        };
+        InlineFragment::new(entry, blocks)
+    }
+
+    pub(crate) fn finish_blocks(self) -> (BlockLabel, Vec<Block<I, I>>)
+    where
+        I: crate::block_py::NormalizedInstr,
+    {
+        let current = self.current.finish();
+        let term = current
+            .term
+            .expect("inline block builder must end with an explicit terminator");
+        let entry = Block::new(
+            self.current_label,
+            current.body,
+            term,
+            Vec::new(),
+            None,
+        );
+        let mut blocks = self.deps;
+        blocks.push(entry);
+        if !blocks.iter().any(|block| block.label == self.entry_label) {
+            let target = blocks
+                .first()
+                .map(|block| block.label)
+                .expect("inline block builder with a current block should produce blocks");
+            blocks.insert(
+                0,
+                Block::new(
+                    self.entry_label,
+                    Vec::new(),
+                    BlockTerm::Jump(BlockEdge::new(target)),
+                    Vec::new(),
+                    None,
+                ),
+            );
+        }
+        (self.entry_label, blocks)
+    }
+}
+
+#[cfg(test)]
+impl<I: Instr> InlineBlockBuilder<I>
+where
+    I: crate::block_py::NormalizedInstr,
+{
+    pub(crate) fn finish(self) -> InlineFragment<I> {
+        self.finish_fallthrough()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct InlineFragment<I: Instr> {
@@ -67,43 +262,6 @@ impl<I: Instr> InlineFragment<I> {
         let fragment = Self { entry, deps };
         fragment.assert_well_formed();
         fragment
-    }
-
-    pub(crate) fn from_closed_builder(
-        label: BlockLabel,
-        entry: InlineBlockBuilder<I>,
-        deps: Vec<Block<I, I>>,
-    ) -> Self
-    where
-        I: crate::block_py::NormalizedInstr,
-    {
-        let entry = entry.finish();
-        assert!(
-            entry.term.is_some(),
-            "inline fragment entry must have an explicit terminator"
-        );
-        Self::new(
-            Block::new(
-                label,
-                entry.body,
-                entry.term.expect("checked explicit terminator"),
-                Vec::new(),
-                None,
-            ),
-            deps,
-        )
-    }
-
-    pub(crate) fn from_fallthrough_builder(
-        label: BlockLabel,
-        mut entry: InlineBlockBuilder<I>,
-        deps: Vec<Block<I, I>>,
-    ) -> Self
-    where
-        I: crate::block_py::NormalizedInstr,
-    {
-        entry.ensure_fallthrough_term();
-        Self::from_closed_builder(label, entry, deps)
     }
 
     fn assert_well_formed(&self) {
@@ -126,14 +284,131 @@ impl<I: Instr> InlineFragment<I> {
                 block.label
             );
         }
+
+        let block_summaries = std::iter::once(&self.entry)
+            .chain(self.deps.iter())
+            .map(|block| match &block.term {
+                BlockTerm::Jump(edge) => format!("{}: jump {}", block.label, edge.target),
+                BlockTerm::IfTerm(if_term) => {
+                    format!("{}: if {} / {}", block.label, if_term.then_label, if_term.else_label)
+                }
+                BlockTerm::BranchTable(branch) => format!(
+                    "{}: branch {:?} default {}",
+                    block.label, branch.targets, branch.default_label
+                ),
+                BlockTerm::Raise(_) => format!("{}: raise", block.label),
+                BlockTerm::Return(_) => format!("{}: return", block.label),
+            })
+            .collect::<Vec<_>>();
+
+        fn assert_target_present(
+            labels: &HashSet<BlockLabel>,
+            block_summaries: &[String],
+            source: BlockLabel,
+            target: BlockLabel,
+            kind: &str,
+        ) {
+            let mut sorted_labels = labels.iter().copied().collect::<Vec<_>>();
+            sorted_labels.sort();
+            assert!(
+                target.is_fallthrough() || labels.contains(&target),
+                "inline fragment block {} has {} target {} outside fragment; labels={:?}; blocks={:?}",
+                source,
+                kind,
+                target,
+                sorted_labels,
+                block_summaries
+            );
+        }
+
+        for block in &self.deps {
+            match &block.term {
+                BlockTerm::Jump(edge) => {
+                    assert_target_present(
+                        &labels,
+                        &block_summaries,
+                        block.label,
+                        edge.target,
+                        "jump",
+                    );
+                }
+                BlockTerm::IfTerm(if_term) => {
+                    assert_target_present(
+                        &labels,
+                        &block_summaries,
+                        block.label,
+                        if_term.then_label,
+                        "then",
+                    );
+                    assert_target_present(
+                        &labels,
+                        &block_summaries,
+                        block.label,
+                        if_term.else_label,
+                        "else",
+                    );
+                }
+                BlockTerm::BranchTable(branch) => {
+                    for target in &branch.targets {
+                        assert_target_present(
+                            &labels,
+                            &block_summaries,
+                            block.label,
+                            *target,
+                            "branch",
+                        );
+                    }
+                    assert_target_present(
+                        &labels,
+                        &block_summaries,
+                        block.label,
+                        branch.default_label,
+                        "branch default",
+                    );
+                }
+                BlockTerm::Raise(_) | BlockTerm::Return(_) => {}
+            }
+            if let Some(edge) = &block.exc_edge {
+                assert_target_present(
+                    &labels,
+                    &block_summaries,
+                    block.label,
+                    edge.target,
+                    "exception",
+                );
+            }
+        }
+    }
+
+    pub(crate) fn relabel_entry(&mut self, new_label: BlockLabel) {
+        let old_label = self.entry.label;
+        if old_label == new_label {
+            return;
+        }
+        self.entry.label = new_label;
+        self.entry.term.replace_target(old_label, new_label);
+        if let Some(edge) = &mut self.entry.exc_edge {
+            if edge.target == old_label {
+                edge.target = new_label;
+            }
+        }
+        for block in &mut self.deps {
+            block.term.replace_target(old_label, new_label);
+            if let Some(edge) = &mut block.exc_edge {
+                if edge.target == old_label {
+                    edge.target = new_label;
+                }
+            }
+        }
+        self.assert_well_formed();
     }
 }
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
-pub(crate) struct LoweredExpr<I: Instr> {
-    pub setup: InlineFragment<I>,
-    pub value: I,
+pub(crate) struct LoweredExpr<S: Instr, V = S> {
+    pub setup: InlineFragment<S>,
+    pub value: V,
 }
 
 pub(crate) fn rewrite_ast_to_core_blockpy_module_with_module(
@@ -150,32 +425,26 @@ pub(crate) fn rewrite_ast_to_core_blockpy_module_with_module(
     )
 }
 
+#[cfg(test)]
+pub(crate) fn test_name_gen() -> FunctionNameGen {
+    crate::block_py::ModuleNameGen::new(0).next_function_name_gen()
+}
+
 #[derive(Clone)]
 pub(crate) enum StmtSequenceHeadPlan {
-    Linear(Stmt),
-    Expanded(Vec<Stmt>),
-    FunctionDef(ast::StmtFunctionDef),
-    Raise(ast::StmtRaise),
-    Return(Option<Expr>),
-    If(ast::StmtIf),
-    While(ast::StmtWhile),
-    For(ast::StmtFor),
-    Try(ast::StmtTry),
-    With(ast::StmtWith),
+    Linear(InstrRuff),
+    Expanded(Vec<InstrRuff>),
+    FunctionDef(crate::block_py::StmtFunctionDef<InstrRuff>),
+    Raise(crate::block_py::StmtRaise<InstrRuff>),
+    Return(InstrRuff),
+    If(crate::block_py::StmtIf<InstrRuff>),
+    While(crate::block_py::StmtWhile<InstrRuff>),
+    For(crate::block_py::StmtFor<InstrRuff>),
+    Try(crate::block_py::StmtTry<InstrRuff>),
+    With(crate::block_py::StmtWith<InstrRuff>),
     Break,
     Continue,
     Unsupported,
-}
-
-pub(crate) enum StmtSequenceDriveResult {
-    Exhausted {
-        linear: Vec<Stmt>,
-    },
-    Break {
-        linear: Vec<Stmt>,
-        index: usize,
-        plan: StmtSequenceHeadPlan,
-    },
 }
 
 pub(crate) fn attach_exception_edges_to_blocks<S, E: Instr>(
@@ -212,7 +481,7 @@ pub(crate) fn build_core_blockpy_callable_def_from_runtime_input(
     name_gen: FunctionNameGen,
     names: FunctionName,
     params: ParamSpec,
-    runtime_input_body: &[Stmt],
+    runtime_input_body: &[InstrRuff],
     doc: Option<String>,
     end_label: BlockLabel,
     blockpy_kind: FunctionKind,

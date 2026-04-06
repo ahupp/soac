@@ -1,25 +1,36 @@
 use super::*;
 use crate::block_py::{
-    Block, BlockBuilder, BlockLabel, BlockTerm, Expr, ImplicitNoneExpr, Instr, StructuredInstr,
-    TermIf, TermRaise,
+    Await, Block, BlockEdge, BlockLabel, BlockTerm, Call, CallArgPositional, ExprAttribute,
+    ImplicitNoneExpr, Instr, TermIf, TermRaise, WithMeta,
 };
 use crate::passes::ast_to_ast::context::Context;
+use crate::passes::InstrRuff;
 use crate::passes::ruff_to_blockpy::expr_lowering::{
     try_lower_branching_expr_direct, try_lower_if_expr_direct, AstSetupExprLowerer,
 };
 use crate::passes::ruff_to_blockpy::stmt_sequences::lower_stmts_to_blockpy_stmts_with_context;
 
+fn try_lower_direct_expr<E>(
+    name_gen: &FunctionNameGen,
+    expr: InstrRuff,
+) -> Option<Result<LoweredExpr<E, InstrRuff>, String>>
+where
+    E: RuffToBlockPyExpr + ImplicitNoneExpr,
+{
+    match expr {
+        InstrRuff::ExprIf(if_expr) => {
+            try_lower_if_expr_direct::<_, E>(&AstSetupExprLowerer, name_gen, if_expr, None)
+        }
+        other => try_lower_branching_expr_direct::<_, E>(&AstSetupExprLowerer, name_gen, other, None),
+    }
+}
+
 fn with_exc_meta<E: Instr>(
-    block: crate::block_py::Block<StructuredInstr<E>, E>,
+    mut block: crate::block_py::Block<E, E>,
     exc_target: Option<&BlockLabel>,
 ) -> LoweredBlockPyBlock<E> {
-    crate::block_py::Block {
-        label: block.label,
-        body: block.body,
-        term: block.term,
-        params: block.params,
-        exc_edge: exc_target.cloned().map(crate::block_py::BlockEdge::new),
-    }
+    block.exc_edge = exc_target.cloned().map(crate::block_py::BlockEdge::new);
+    block
 }
 
 fn compat_block_from_inline_with_exc_target_and_expr<E>(
@@ -31,16 +42,7 @@ where
     E: RuffToBlockPyExpr + ImplicitNoneExpr,
 {
     block.replace_fallthrough_target(fallthrough_target);
-    with_exc_meta(
-        Block {
-            label: block.label,
-            body: block.body.into_iter().map(StructuredInstr::Expr).collect(),
-            term: block.term,
-            params: block.params,
-            exc_edge: None,
-        },
-        exc_target,
-    )
+    with_exc_meta(block, exc_target)
 }
 
 pub(crate) fn emit_inline_fragment_with_exc_target_and_expr<E>(
@@ -69,88 +71,50 @@ where
 }
 
 pub(crate) fn compat_block_from_blockpy_with_exc_target_and_expr<E>(
+    context: &Context,
+    name_gen: &FunctionNameGen,
     label: BlockLabel,
-    body: Vec<Stmt>,
+    body: Vec<InstrRuff>,
     term: BlockTerm<E>,
     exc_target: Option<&BlockLabel>,
 ) -> LoweredBlockPyBlock<E>
 where
     E: RuffToBlockPyExpr + ImplicitNoneExpr,
 {
-    let body = lower_stmts_to_blockpy_stmts::<E>(&body).unwrap_or_else(|err| {
-        panic!("failed to convert compatibility block body to BlockPy: {err}")
-    });
-    assert!(
-        body.term.is_none(),
-        "compatibility block body should not contain its own terminator"
-    );
-    with_exc_meta(
-        Block::from_builder(
-            label,
-            BlockBuilder::with_term(body.body, Some(term)),
-            Vec::new(),
-            None,
-            None,
-        ),
-        exc_target,
-    )
+    let body = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &body, name_gen)
+        .unwrap_or_else(|err| panic!("failed to convert compatibility block body to BlockPy: {err}"));
+    compat_block_from_lowered_builder_with_exc_target_and_expr(label, body, term, exc_target)
 }
 
 pub(crate) fn compat_block_from_lowered_builder_with_exc_target_and_expr<E>(
     label: BlockLabel,
-    structured: crate::block_py::BlockBuilder<StructuredInstr<E>, BlockTerm<E>>,
+    builder: InlineBlockBuilder<E>,
     term: BlockTerm<E>,
     exc_target: Option<&BlockLabel>,
 ) -> LoweredBlockPyBlock<E>
 where
     E: RuffToBlockPyExpr + ImplicitNoneExpr,
 {
-    let structured = structured.finish();
-    assert!(
-        structured.term.is_none(),
-        "compatibility block body should not contain its own terminator"
-    );
-    with_exc_meta(
-        Block::from_builder(
-            label,
-            BlockBuilder::with_term(structured.body, Some(term)),
-            Vec::new(),
-            None,
-            None,
-        ),
-        exc_target,
-    )
+    let block = builder
+        .finish_linear_block(label, term)
+        .unwrap_or_else(|| panic!("compatibility block body should lower to a single linear block"));
+    with_exc_meta(block, exc_target)
 }
 
-fn try_inline_builder_from_blockpy_stmts<E>(
-    structured: crate::block_py::BlockBuilder<StructuredInstr<E>, BlockTerm<E>>,
-) -> Result<
-    InlineBlockBuilder<E>,
-    crate::block_py::BlockBuilder<StructuredInstr<E>, BlockTerm<E>>,
->
+fn emit_lowered_builder_fragment_with_exc_target_and_expr<E>(
+    blocks: &mut Vec<LoweredBlockPyBlock<E>>,
+    label: BlockLabel,
+    builder: InlineBlockBuilder<E>,
+    term: BlockTerm<E>,
+    fallthrough_target: BlockLabel,
+    exc_target: Option<&BlockLabel>,
+) -> BlockLabel
 where
     E: RuffToBlockPyExpr + ImplicitNoneExpr,
 {
-    let structured = structured.finish();
-    if structured.term.is_some() {
-        return Err(structured);
-    }
-    if structured
-        .body
-        .iter()
-        .any(|stmt| !matches!(stmt, StructuredInstr::Expr(_)))
-    {
-        return Err(structured);
-    }
-
-    let mut entry = BlockBuilder::<E, BlockTerm<E>>::new();
-    for stmt in structured.body {
-        let StructuredInstr::Expr(stmt) = stmt else {
-            unreachable!("checked expr-only fragment body");
-        };
-        entry.push_stmt(stmt);
-    }
-    Ok(entry)
+    let mut fragment = builder.finish_with_term(term);
+    fragment.relabel_entry(label);
+    emit_inline_fragment_with_exc_target_and_expr(blocks, fragment, fallthrough_target, exc_target)
 }
 
 pub(crate) fn set_region_exc_param<E: Instr>(
@@ -199,22 +163,25 @@ fn rename_exception_edge_args<E: Instr>(
 pub(crate) fn emit_sequence_jump_block<E>(
     context: &Context,
     blocks: &mut Vec<LoweredBlockPyBlock<E>>,
+    name_gen: &FunctionNameGen,
     label: BlockLabel,
-    linear: Vec<Stmt>,
+    linear: Vec<InstrRuff>,
     target_label: BlockLabel,
     exc_target: Option<&BlockLabel>,
 ) -> BlockLabel
 where
     E: RuffToBlockPyExpr + ImplicitNoneExpr,
 {
-    let lowered_linear = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &linear)
+    let lowered_linear = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &linear, name_gen)
         .unwrap_or_else(|err| panic!("failed to lower sequence jump prefix through production path: {err}"));
-    blocks.push(compat_block_from_lowered_builder_with_exc_target_and_expr(
+    emit_lowered_builder_fragment_with_exc_target_and_expr(
+        blocks,
         label.clone(),
         lowered_linear,
-        BlockTerm::Jump(BlockEdge::new(target_label)),
+        BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())),
+        target_label,
         exc_target,
-    ));
+    );
     label
 }
 
@@ -223,51 +190,34 @@ pub(crate) fn emit_sequence_return_block_with_expr_setup_and_expr<E>(
     blocks: &mut Vec<LoweredBlockPyBlock<E>>,
     name_gen: &FunctionNameGen,
     label: BlockLabel,
-    linear: Vec<Stmt>,
-    value: Option<Expr>,
+    linear: Vec<InstrRuff>,
+    value: Option<InstrRuff>,
     exc_target: Option<&BlockLabel>,
 ) -> Result<BlockLabel, String>
 where
     E: RuffToBlockPyExpr + ImplicitNoneExpr,
 {
-    let mut out = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &linear)?;
+    let mut out = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &linear, name_gen)?;
     if let Some(expr) = value.clone() {
-        let lowered_direct = match expr {
-            Expr::If(if_expr) => {
-                try_lower_if_expr_direct::<_, E>(&AstSetupExprLowerer, name_gen, if_expr, None)
-            }
-            other => {
-                try_lower_branching_expr_direct::<_, E>(&AstSetupExprLowerer, name_gen, other, None)
-            }
-        };
+        let lowered_direct = try_lower_direct_expr::<E>(name_gen, expr);
         if let Some(Ok(lowered)) = lowered_direct {
-            let linear_fragment = out.finish();
-            assert!(
-                linear_fragment.term.is_none(),
-                "compatibility block body should not contain its own terminator"
-            );
-            let fragment_entry_label = if linear_fragment.body.is_empty() {
+            let fragment_entry_label = if out.is_empty() {
                 label.clone()
             } else {
                 let next_label = name_gen.next_block_name();
-                blocks.push(with_exc_meta(
-                    Block::from_builder(
-                        label.clone(),
-                        BlockBuilder::with_term(
-                            linear_fragment.body,
-                            Some(BlockTerm::Jump(BlockEdge::new(next_label.clone()))),
-                        ),
-                        Vec::new(),
-                        None,
-                        None,
-                    ),
+                emit_lowered_builder_fragment_with_exc_target_and_expr(
+                    blocks,
+                    label.clone(),
+                    out,
+                    BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())),
+                    next_label.clone(),
                     exc_target,
-                ));
+                );
                 next_label
             };
             let dispatch_label = name_gen.next_block_name();
             let mut setup = lowered.setup;
-            setup.entry.label = fragment_entry_label;
+            setup.relabel_entry(fragment_entry_label);
             emit_inline_fragment_with_exc_target_and_expr(
                 blocks,
                 setup,
@@ -275,14 +225,11 @@ where
                 exc_target,
             );
             blocks.push(with_exc_meta(
-                Block::from_builder(
+                Block::new(
                     dispatch_label,
-                    BlockBuilder::with_term(
-                        Vec::new(),
-                        Some(BlockTerm::Return(lowered.value)),
-                    ),
                     Vec::new(),
-                    None,
+                    BlockTerm::Return(E::from_lowered_expr(lowered.value)),
+                    Vec::new(),
                     None,
                 ),
                 exc_target,
@@ -290,51 +237,22 @@ where
             return Ok(label);
         }
     }
-    let mut next_label_id = 0usize;
     let value = value
-        .map(|expr| {
-            crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
-                expr,
-                &mut out,
-                None,
-                &mut next_label_id,
-            )
-        })
+        .map(|expr| crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
+            expr,
+            &mut out,
+            None,
+        ))
         .transpose()?;
-    match try_inline_builder_from_blockpy_stmts(out) {
-        Ok(mut entry) => {
-            entry.set_term(BlockTerm::Return(
-                value.unwrap_or_else(E::implicit_none_expr),
-            ));
-            emit_inline_fragment_with_exc_target_and_expr(
-                blocks,
-                InlineFragment::from_closed_builder(label.clone(), entry, Vec::new()),
-                BlockLabel::fallthrough(),
-                exc_target,
-            );
-        }
-        Err(fragment) => {
-            assert!(
-                fragment.term.is_none(),
-                "compatibility block body should not contain its own terminator"
-            );
-            blocks.push(with_exc_meta(
-                Block::from_builder(
-                    label.clone(),
-                    BlockBuilder::with_term(
-                        fragment.body,
-                        Some(BlockTerm::Return(
-                            value.unwrap_or_else(E::implicit_none_expr),
-                        )),
-                    ),
-                    Vec::new(),
-                    None,
-                    None,
-                ),
-                exc_target,
-            ));
-        }
-    }
+    let return_term = BlockTerm::Return(value.unwrap_or_else(E::implicit_none_expr));
+    emit_lowered_builder_fragment_with_exc_target_and_expr(
+        blocks,
+        label.clone(),
+        out,
+        return_term,
+        BlockLabel::fallthrough(),
+        exc_target,
+    );
     Ok(label)
 }
 
@@ -343,51 +261,34 @@ pub(crate) fn emit_sequence_raise_block_with_expr_setup_and_expr<E>(
     blocks: &mut Vec<LoweredBlockPyBlock<E>>,
     name_gen: &FunctionNameGen,
     label: BlockLabel,
-    linear: Vec<Stmt>,
-    exc: TermRaise<Expr>,
+    linear: Vec<InstrRuff>,
+    exc: TermRaise<InstrRuff>,
     exc_target: Option<&BlockLabel>,
 ) -> Result<BlockLabel, String>
 where
     E: RuffToBlockPyExpr + ImplicitNoneExpr,
 {
-    let mut out = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &linear)?;
+    let mut out = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &linear, name_gen)?;
     if let Some(expr) = exc.exc.clone() {
-        let lowered_direct = match expr {
-            Expr::If(if_expr) => {
-                try_lower_if_expr_direct::<_, E>(&AstSetupExprLowerer, name_gen, if_expr, None)
-            }
-            other => {
-                try_lower_branching_expr_direct::<_, E>(&AstSetupExprLowerer, name_gen, other, None)
-            }
-        };
+        let lowered_direct = try_lower_direct_expr::<E>(name_gen, expr);
         if let Some(Ok(lowered)) = lowered_direct {
-            let linear_fragment = out.finish();
-            assert!(
-                linear_fragment.term.is_none(),
-                "compatibility block body should not contain its own terminator"
-            );
-            let fragment_entry_label = if linear_fragment.body.is_empty() {
+            let fragment_entry_label = if out.is_empty() {
                 label.clone()
             } else {
                 let next_label = name_gen.next_block_name();
-                blocks.push(with_exc_meta(
-                    Block::from_builder(
-                        label.clone(),
-                        BlockBuilder::with_term(
-                            linear_fragment.body,
-                            Some(BlockTerm::Jump(BlockEdge::new(next_label.clone()))),
-                        ),
-                        Vec::new(),
-                        None,
-                        None,
-                    ),
+                emit_lowered_builder_fragment_with_exc_target_and_expr(
+                    blocks,
+                    label.clone(),
+                    out,
+                    BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())),
+                    next_label.clone(),
                     exc_target,
-                ));
+                );
                 next_label
             };
             let dispatch_label = name_gen.next_block_name();
             let mut setup = lowered.setup;
-            setup.entry.label = fragment_entry_label;
+            setup.relabel_entry(fragment_entry_label);
             emit_inline_fragment_with_exc_target_and_expr(
                 blocks,
                 setup,
@@ -395,16 +296,13 @@ where
                 exc_target,
             );
             blocks.push(with_exc_meta(
-                Block::from_builder(
+                Block::new(
                     dispatch_label,
-                    BlockBuilder::with_term(
-                        Vec::new(),
-                        Some(BlockTerm::Raise(TermRaise {
-                            exc: Some(lowered.value),
-                        })),
-                    ),
                     Vec::new(),
-                    None,
+                    BlockTerm::Raise(TermRaise {
+                        exc: Some(E::from_lowered_expr(lowered.value)),
+                    }),
+                    Vec::new(),
                     None,
                 ),
                 exc_target,
@@ -412,7 +310,6 @@ where
             return Ok(label);
         }
     }
-    let mut next_label_id = 0usize;
     let exc = TermRaise {
         exc: exc
             .exc
@@ -421,38 +318,19 @@ where
                     expr,
                     &mut out,
                     None,
-                    &mut next_label_id,
                 )
             })
             .transpose()?,
     };
-    match try_inline_builder_from_blockpy_stmts(out) {
-        Ok(mut entry) => {
-            entry.set_term(BlockTerm::Raise(exc));
-            emit_inline_fragment_with_exc_target_and_expr(
-                blocks,
-                InlineFragment::from_closed_builder(label.clone(), entry, Vec::new()),
-                BlockLabel::fallthrough(),
-                exc_target,
-            );
-        }
-        Err(fragment) => {
-            assert!(
-                fragment.term.is_none(),
-                "compatibility block body should not contain its own terminator"
-            );
-            blocks.push(with_exc_meta(
-                Block::from_builder(
-                    label.clone(),
-                    BlockBuilder::with_term(fragment.body, Some(BlockTerm::Raise(exc))),
-                    Vec::new(),
-                    None,
-                    None,
-                ),
-                exc_target,
-            ));
-        }
-    }
+    let raise_term = BlockTerm::Raise(exc);
+    emit_lowered_builder_fragment_with_exc_target_and_expr(
+        blocks,
+        label.clone(),
+        out,
+        raise_term,
+        BlockLabel::fallthrough(),
+        exc_target,
+    );
     Ok(label)
 }
 
@@ -461,8 +339,8 @@ pub(crate) fn emit_if_branch_block_with_expr_setup_and_expr<E>(
     blocks: &mut Vec<LoweredBlockPyBlock<E>>,
     name_gen: &FunctionNameGen,
     label: BlockLabel,
-    body: Vec<Stmt>,
-    test: Expr,
+    body: Vec<InstrRuff>,
+    test: InstrRuff,
     then_label: BlockLabel,
     else_label: BlockLabel,
     exc_target: Option<&BlockLabel>,
@@ -470,17 +348,7 @@ pub(crate) fn emit_if_branch_block_with_expr_setup_and_expr<E>(
 where
     E: RuffToBlockPyExpr + ImplicitNoneExpr,
 {
-    let lowered_direct = match test.clone() {
-        Expr::If(if_expr) => {
-            try_lower_if_expr_direct::<_, E>(&AstSetupExprLowerer, name_gen, if_expr, None)
-        }
-        other => try_lower_branching_expr_direct::<_, E>(
-            &AstSetupExprLowerer,
-            name_gen,
-            other,
-            None,
-        ),
-    };
+    let lowered_direct = try_lower_direct_expr::<E>(name_gen, test.clone());
     if let Some(Ok(lowered)) = lowered_direct {
         let setup_label = if body.is_empty() {
             label.clone()
@@ -489,7 +357,7 @@ where
         };
         let dispatch_label = name_gen.next_block_name();
         let mut setup = lowered.setup;
-        setup.entry.label = setup_label.clone();
+        setup.relabel_entry(setup_label.clone());
         emit_inline_fragment_with_exc_target_and_expr(
             blocks,
             setup,
@@ -497,70 +365,53 @@ where
             exc_target,
         );
         blocks.push(with_exc_meta(
-            Block::from_builder(
+            Block::new(
                 dispatch_label,
-                BlockBuilder::with_term(
-                    Vec::new(),
-                    Some(BlockTerm::IfTerm(TermIf {
-                        test: lowered.value,
-                        then_label,
-                        else_label,
-                    })),
-                ),
                 Vec::new(),
-                None,
+                BlockTerm::IfTerm(TermIf {
+                    test: E::from_lowered_expr(lowered.value),
+                    then_label,
+                    else_label,
+                }),
+                Vec::new(),
                 None,
             ),
             exc_target,
         ));
         if !body.is_empty() {
-            let lowered_body = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &body)?;
-            blocks.push(compat_block_from_lowered_builder_with_exc_target_and_expr(
+            let lowered_body = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &body, name_gen)?;
+            emit_lowered_builder_fragment_with_exc_target_and_expr(
+                blocks,
                 label.clone(),
                 lowered_body,
-                BlockTerm::Jump(BlockEdge::new(setup_label)),
+                BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())),
+                setup_label,
                 exc_target,
-            ));
+            );
         }
         return Ok(label);
     }
 
-    let mut out = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &body)?;
-    let mut next_label_id = 0usize;
+    let mut out = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &body, name_gen)?;
     let lowered_test = crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
-        test.clone(),
+        test,
         &mut out,
         None,
-        &mut next_label_id,
     )?;
-    match try_inline_builder_from_blockpy_stmts(out) {
-        Ok(mut entry) => {
-            entry.set_term(BlockTerm::IfTerm(TermIf {
-                test: lowered_test,
-                then_label,
-                else_label,
-            }));
-            Ok(emit_inline_fragment_with_exc_target_and_expr(
-                blocks,
-                InlineFragment::from_closed_builder(label, entry, Vec::new()),
-                BlockLabel::fallthrough(),
-                exc_target,
-            ))
-        }
-        Err(fragment) => {
-            blocks.push(compat_block_from_lowered_builder_with_exc_target_and_expr(
-                label.clone(),
-                fragment,
-                BlockTerm::IfTerm(TermIf {
-                    test: lowered_test,
-                    then_label,
-                    else_label,
-                }),
-                exc_target,
-            ));
-            Ok(label)
-        }
-    }
+    let if_term = BlockTerm::IfTerm(TermIf {
+        test: lowered_test,
+        then_label,
+        else_label,
+    });
+    emit_lowered_builder_fragment_with_exc_target_and_expr(
+        blocks,
+        label.clone(),
+        out,
+        if_term,
+        BlockLabel::fallthrough(),
+        exc_target,
+    );
+    Ok(label)
 }
 
 pub(crate) fn emit_simple_while_blocks_with_expr_setup_and_expr<E>(
@@ -569,8 +420,8 @@ pub(crate) fn emit_simple_while_blocks_with_expr_setup_and_expr<E>(
     name_gen: &FunctionNameGen,
     test_label: BlockLabel,
     linear_label: Option<BlockLabel>,
-    linear: Vec<Stmt>,
-    test: Expr,
+    linear: Vec<InstrRuff>,
+    test: InstrRuff,
     body_entry: BlockLabel,
     cond_false_entry: BlockLabel,
     exc_target: Option<&BlockLabel>,
@@ -578,16 +429,11 @@ pub(crate) fn emit_simple_while_blocks_with_expr_setup_and_expr<E>(
 where
     E: RuffToBlockPyExpr + ImplicitNoneExpr,
 {
-    let lowered_direct = match test.clone() {
-        Expr::If(if_expr) => {
-            try_lower_if_expr_direct::<_, E>(&AstSetupExprLowerer, name_gen, if_expr, None)
-        }
-        other => try_lower_branching_expr_direct::<_, E>(&AstSetupExprLowerer, name_gen, other, None),
-    };
+    let lowered_direct = try_lower_direct_expr::<E>(name_gen, test.clone());
     if let Some(Ok(lowered)) = lowered_direct {
         let dispatch_label = name_gen.next_block_name();
         let mut setup = lowered.setup;
-        setup.entry.label = test_label.clone();
+        setup.relabel_entry(test_label.clone());
         emit_inline_fragment_with_exc_target_and_expr(
             blocks,
             setup,
@@ -595,67 +441,50 @@ where
             exc_target,
         );
         blocks.push(with_exc_meta(
-            Block::from_builder(
+            Block::new(
                 dispatch_label,
-                BlockBuilder::with_term(
-                    Vec::new(),
-                    Some(BlockTerm::IfTerm(TermIf {
-                        test: lowered.value,
-                        then_label: body_entry,
-                        else_label: cond_false_entry,
-                    })),
-                ),
                 Vec::new(),
-                None,
+                BlockTerm::IfTerm(TermIf {
+                    test: E::from_lowered_expr(lowered.value),
+                    then_label: body_entry,
+                    else_label: cond_false_entry,
+                }),
+                Vec::new(),
                 None,
             ),
             exc_target,
         ));
     } else {
-        let mut out = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &[])?;
-        let mut next_label_id = 0usize;
+        let mut out = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &[], name_gen)?;
         let lowered_test = crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
             test,
             &mut out,
             None,
-            &mut next_label_id,
         )?;
-        match try_inline_builder_from_blockpy_stmts(out) {
-            Ok(mut entry) => {
-                entry.set_term(BlockTerm::IfTerm(TermIf {
-                    test: lowered_test,
-                    then_label: body_entry,
-                    else_label: cond_false_entry,
-                }));
-                emit_inline_fragment_with_exc_target_and_expr(
-                    blocks,
-                    InlineFragment::from_closed_builder(test_label.clone(), entry, Vec::new()),
-                    BlockLabel::fallthrough(),
-                    exc_target,
-                );
-            }
-            Err(fragment) => {
-                blocks.push(compat_block_from_lowered_builder_with_exc_target_and_expr(
-                    test_label.clone(),
-                    fragment,
-                    BlockTerm::IfTerm(TermIf {
-                        test: lowered_test,
-                        then_label: body_entry,
-                        else_label: cond_false_entry,
-                    }),
-                    exc_target,
-                ));
-            }
-        }
+        let if_term = BlockTerm::IfTerm(TermIf {
+            test: lowered_test,
+            then_label: body_entry,
+            else_label: cond_false_entry,
+        });
+        emit_lowered_builder_fragment_with_exc_target_and_expr(
+            blocks,
+            test_label.clone(),
+            out,
+            if_term,
+            BlockLabel::fallthrough(),
+            exc_target,
+        );
     }
     if let Some(linear_label) = linear_label {
-        let lowered_linear = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &linear)?;
-        blocks.push(compat_block_from_lowered_builder_with_exc_target_and_expr(
+        let lowered_linear = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &linear, name_gen)?;
+        emit_lowered_builder_fragment_with_exc_target_and_expr(
+            blocks,
             linear_label.clone(),
             lowered_linear,
-            BlockTerm::Jump(BlockEdge::new(test_label)),
+            BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())),
+            test_label,
             exc_target,
-        ));
+        );
         Ok(linear_label)
     } else {
         Ok(test_label)
@@ -663,51 +492,75 @@ where
 }
 
 pub(crate) fn emit_for_loop_blocks<E>(
+    context: &Context,
+    name_gen: &FunctionNameGen,
     blocks: &mut Vec<LoweredBlockPyBlock<E>>,
     setup_label: BlockLabel,
     assign_label: BlockLabel,
     loop_check_label: BlockLabel,
     loop_continue_label: BlockLabel,
-    linear: Vec<Stmt>,
+    linear: Vec<InstrRuff>,
     iter_name: &str,
     tmp_name: &str,
-    iterable: Expr,
+    iterable: InstrRuff,
     is_async: bool,
     exhausted_entry: BlockLabel,
     body_entry: BlockLabel,
-    assign_body: Vec<Stmt>,
+    assign_body: Vec<InstrRuff>,
     exc_target: Option<&BlockLabel>,
 ) -> BlockLabel
 where
     E: RuffToBlockPyExpr + ImplicitNoneExpr,
 {
-    let iter_expr = py_expr!("{iter:id}", iter = iter_name);
-    let tmp_expr = py_expr!("{tmp:id}", tmp = tmp_name);
+    let synthetic_name_expr = |name: &str| InstrRuff::from_ast_expr(py_expr!("{name:id}", name = name));
+    let runtime_helper_expr = |name: &'static str| {
+        InstrRuff::ExprAttribute(
+            ExprAttribute::new(
+                synthetic_name_expr("__soac__"),
+                ast::Identifier::new(name, Default::default()),
+                ast::ExprContext::Load,
+            )
+            .with_meta(crate::block_py::Meta::synthetic()),
+        )
+    };
 
-    blocks.push(compat_block_from_blockpy_with_exc_target_and_expr(
+    let lowered_assign = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &assign_body, name_gen)
+        .unwrap_or_else(|err| panic!("failed to lower for-loop target assignment through production path: {err}"));
+    blocks.push(compat_block_from_lowered_builder_with_exc_target_and_expr(
         assign_label.clone(),
-        assign_body,
+        lowered_assign,
         BlockTerm::Jump(BlockEdge::new(body_entry)),
         exc_target,
     ));
 
-    let exhausted_test = py_expr!("{value:expr} is __soac__.ITER_COMPLETE", value = tmp_expr);
-    let check_body = if is_async {
-        vec![py_stmt!(
-            "{tmp:id} = await __soac__.anext_or_sentinel({iter:expr})",
-            tmp = tmp_name,
-            iter = iter_expr.clone(),
-        )]
+    let exhausted_test = InstrRuff::from_ast_expr(
+        py_expr!("{tmp:id} is __soac__.ITER_COMPLETE", tmp = tmp_name)
+    );
+    let next_helper = if is_async { "anext_or_sentinel" } else { "next_or_sentinel" };
+    let next_call: InstrRuff = Call::new(
+        runtime_helper_expr(next_helper),
+        vec![CallArgPositional::Positional(synthetic_name_expr(iter_name))],
+        Vec::new(),
+    )
+    .with_meta(crate::block_py::Meta::synthetic())
+    .into();
+    let next_value: InstrRuff = if is_async {
+        Await::new(next_call)
+            .with_meta(crate::block_py::Meta::synthetic())
+            .into()
     } else {
-        vec![py_stmt!(
-            "{tmp:id} = __soac__.next_or_sentinel({iter:expr})",
-            tmp = tmp_name,
-            iter = iter_expr.clone(),
-        )]
+        next_call
     };
-    blocks.push(compat_block_from_blockpy_with_exc_target_and_expr(
+    let check_body = vec![crate::block_py::StmtAssign::new(
+        vec![InstrRuff::from_ast_expr(py_expr!("{tmp:id}", tmp = tmp_name))],
+        next_value,
+    )
+    .into()];
+    let lowered_check = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &check_body, name_gen)
+        .unwrap_or_else(|err| panic!("failed to lower for-loop next step through production path: {err}"));
+    blocks.push(compat_block_from_lowered_builder_with_exc_target_and_expr(
         loop_check_label.clone(),
-        check_body,
+        lowered_check,
         BlockTerm::IfTerm(TermIf {
             test: E::from_lowered_expr(exhausted_test),
             then_label: exhausted_entry,
@@ -716,23 +569,27 @@ where
         exc_target,
     ));
 
+    let iter_helper = if is_async { "aiter" } else { "iter" };
     let mut setup_body = linear;
-    if is_async {
-        setup_body.push(py_stmt!(
-            "{iter:id} = __soac__.aiter({iterable:expr})",
-            iter = iter_name,
-            iterable = iterable,
-        ));
-    } else {
-        setup_body.push(py_stmt!(
-            "{iter:id} = __soac__.iter({iterable:expr})",
-            iter = iter_name,
-            iterable = iterable,
-        ));
-    }
-    blocks.push(compat_block_from_blockpy_with_exc_target_and_expr(
+    let iter_value: InstrRuff = Call::new(
+        runtime_helper_expr(iter_helper),
+        vec![CallArgPositional::Positional(iterable)],
+        Vec::new(),
+    )
+    .with_meta(crate::block_py::Meta::synthetic())
+    .into();
+    setup_body.push(
+        crate::block_py::StmtAssign::new(
+            vec![InstrRuff::from_ast_expr(py_expr!("{iter:id}", iter = iter_name))],
+            iter_value,
+        )
+        .into(),
+    );
+    let lowered_setup = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &setup_body, name_gen)
+        .unwrap_or_else(|err| panic!("failed to lower for-loop setup through production path: {err}"));
+    blocks.push(compat_block_from_lowered_builder_with_exc_target_and_expr(
         setup_label.clone(),
-        setup_body,
+        lowered_setup,
         BlockTerm::Jump(BlockEdge::new(loop_continue_label)),
         exc_target,
     ));

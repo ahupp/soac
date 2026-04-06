@@ -2,17 +2,18 @@ use super::*;
 
 use crate::block_py::{
     BlockEdge, BlockLabel, BlockPyFunction, BlockPyModule, BlockPyPass, BlockTerm,
-    InstrWithAwaitAndYield, StructuredInstr, TermRaise,
+    InstrWithAwaitAndYield, TermRaise,
 };
 use crate::lower_python_to_blockpy_for_testing;
 use crate::passes::ast_to_ast::context::Context;
 use crate::passes::ruff_to_blockpy::stmt_sequences::{
     lower_for_stmt_sequence, lower_if_stmt_sequence, lower_if_stmt_sequence_from_stmt,
-    lower_while_stmt_sequence, lower_while_stmt_sequence_from_stmt, plan_stmt_sequence_head,
+    plan_instr_sequence_head,
+    lower_while_stmt_sequence, lower_while_stmt_sequence_from_stmt,
 };
 use crate::passes::ruff_to_blockpy::try_regions::build_try_plan;
-use crate::passes::{CoreBlockPyPass, CoreBlockPyPassWithAwaitAndYield};
-use stmt_lowering::lower_stmt_into;
+use crate::passes::{CoreBlockPyPass, CoreBlockPyPassWithAwaitAndYield, InstrRuff};
+use stmt_lowering::lower_instr_for_test;
 
 fn test_name_gen() -> FunctionNameGen {
     let module_name_gen = crate::block_py::ModuleNameGen::new(0);
@@ -56,12 +57,12 @@ fn function_by_name<'a, P: BlockPyPass>(
 
 fn lower_stmt_for_panic_test(stmt: &Stmt) {
     let context = Context::new("");
-    let mut out = crate::block_py::BlockBuilder::<
-        StructuredInstr<InstrWithAwaitAndYield>,
-        BlockTerm<InstrWithAwaitAndYield>,
-    >::new();
-    let mut next_label_id = 0usize;
-    let _ = lower_stmt_into(&context, stmt, &mut out, None, &mut next_label_id);
+    let name_gen = test_name_gen();
+    let mut out = crate::passes::ruff_to_blockpy::InlineBlockBuilder::<
+        InstrWithAwaitAndYield,
+    >::new(&name_gen);
+    let stmt = InstrRuff::from_ast_stmt(stmt.clone());
+    let _ = lower_instr_for_test(&context, &stmt, &name_gen, &mut out, None);
 }
 
 fn test_context() -> Context {
@@ -72,8 +73,15 @@ fn label(index: u32) -> BlockLabel {
     BlockLabel::from_index(index as usize)
 }
 
-type TestBlock =
-    Block<StructuredInstr<InstrWithAwaitAndYield>, InstrWithAwaitAndYield>;
+type TestBlock = Block<InstrWithAwaitAndYield, InstrWithAwaitAndYield>;
+
+fn instr_stmt(stmt: Stmt) -> InstrRuff {
+    InstrRuff::from_ast_stmt(stmt)
+}
+
+fn instr_expr(expr: Expr) -> InstrRuff {
+    InstrRuff::from_ast_expr(expr)
+}
 
 #[test]
 fn lowers_post_simplification_control_flow() {
@@ -137,6 +145,19 @@ def gen(n):
 }
 
 #[test]
+fn lowers_generator_yield_boolop_without_external_fragment_jump() {
+    let blockpy = wrapped_core_blockpy(
+        r#"
+def gen(flag):
+    yield flag and 1
+"#,
+    );
+    let rendered = crate::block_py::pretty::blockpy_module_to_string(&blockpy);
+    assert!(rendered.contains("generator gen(flag):"), "{rendered}");
+    assert!(!rendered.contains("jump bb0"), "{rendered}");
+}
+
+#[test]
 fn stmt_sequence_head_plan_leaves_yield_expr_linear() {
     let module = ruff_python_parser::parse_module(
         r#"
@@ -153,7 +174,7 @@ def gen():
     let stmt = &func.body[0];
 
     assert!(matches!(
-        plan_stmt_sequence_head(&test_context(), stmt),
+        plan_instr_sequence_head(&test_context(), &instr_stmt(stmt.clone())),
         StmtSequenceHeadPlan::Linear(_)
     ));
 }
@@ -175,7 +196,7 @@ def gen():
     let stmt = &func.body[0];
 
     assert!(matches!(
-        plan_stmt_sequence_head(&test_context(), stmt),
+        plan_instr_sequence_head(&test_context(), &instr_stmt(stmt.clone())),
         StmtSequenceHeadPlan::Linear(_)
     ));
 }
@@ -197,7 +218,7 @@ def f():
     let stmt = &func.body[0];
 
     assert!(matches!(
-        plan_stmt_sequence_head(&test_context(), stmt),
+        plan_instr_sequence_head(&test_context(), &instr_stmt(stmt.clone())),
         StmtSequenceHeadPlan::Return(_)
     ));
 }
@@ -219,7 +240,7 @@ def gen(n):
     let stmt = &func.body[0];
 
     assert!(matches!(
-        plan_stmt_sequence_head(&test_context(), stmt),
+        plan_instr_sequence_head(&test_context(), &instr_stmt(stmt.clone())),
         StmtSequenceHeadPlan::Return(_)
     ));
 }
@@ -241,7 +262,7 @@ def f():
     let stmt = &func.body[0];
 
     assert!(matches!(
-        plan_stmt_sequence_head(&test_context(), stmt),
+        plan_instr_sequence_head(&test_context(), &instr_stmt(stmt.clone())),
         StmtSequenceHeadPlan::If(_)
     ));
 }
@@ -264,12 +285,13 @@ def f():
     };
     let stmt = &func.body[0];
 
-    let StmtSequenceHeadPlan::Expanded(body) = plan_stmt_sequence_head(&test_context(), stmt)
+    let StmtSequenceHeadPlan::Expanded(body) =
+        plan_instr_sequence_head(&test_context(), &instr_stmt(stmt.clone()))
     else {
         panic!("expected expanded match body");
     };
-    assert!(matches!(body[0], Stmt::Assign(_)));
-    assert!(body.iter().any(|stmt| matches!(stmt, Stmt::If(_))));
+    assert!(matches!(body[0], InstrRuff::StmtAssign(_)));
+    assert!(body.iter().any(|stmt| matches!(stmt, InstrRuff::StmtIf(_))));
 }
 
 #[test]
@@ -292,22 +314,23 @@ def f():
     };
     let stmt = &func.body[0];
 
-    let StmtSequenceHeadPlan::Expanded(body) = plan_stmt_sequence_head(&test_context(), stmt)
+    let StmtSequenceHeadPlan::Expanded(body) =
+        plan_instr_sequence_head(&test_context(), &instr_stmt(stmt.clone()))
     else {
         panic!("expected expanded match body");
     };
     let match_if = body
         .iter()
-        .find(|stmt| matches!(stmt, Stmt::If(_)))
+        .find(|stmt| matches!(stmt, InstrRuff::StmtIf(_)))
         .expect("expected expanded match body to contain an if");
 
     assert!(
         matches!(
-            plan_stmt_sequence_head(&test_context(), match_if),
+            plan_instr_sequence_head(&test_context(), match_if),
             StmtSequenceHeadPlan::If(_)
         ),
         "{}",
-        crate::ruff_ast_to_string(match_if).trim_end()
+        crate::ruff_ast_to_string(match_if.clone().into_ast_stmt()).trim_end()
     );
 }
 
@@ -367,10 +390,16 @@ def f(xs):
     let ast::Stmt::For(for_stmt) = &func.body[0] else {
         panic!("expected for stmt");
     };
+    let InstrRuff::StmtFor(for_stmt) = InstrRuff::from_ast_stmt(ast::Stmt::For(for_stmt.clone())) else {
+        panic!("expected InstrRuff::StmtFor");
+    };
 
     let mut blocks = Vec::new();
+    let name_gen = test_name_gen();
     let entry = lower_for_stmt_sequence(
-        for_stmt.clone(),
+        &Context::new(""),
+        &name_gen,
+        for_stmt,
         &[],
         RegionTargets::new(label(99), None),
         Vec::new(),
@@ -381,8 +410,11 @@ def f(xs):
         label(0),
         label(1),
         label(2),
-        vec![py_stmt!("x = _dp_tmp_0"), py_stmt!("_dp_tmp_0 = None")],
-        &mut |_stmts: &[Stmt], targets: RegionTargets, _blocks: &mut Vec<TestBlock>| {
+        vec![
+            InstrRuff::from_ast_stmt(py_stmt!("x = _dp_tmp_0")),
+            InstrRuff::from_ast_stmt(py_stmt!("del _dp_tmp_0")),
+        ],
+        &mut |_stmts: &[InstrRuff], targets: RegionTargets, _blocks: &mut Vec<TestBlock>| {
             targets.normal_cont
         },
     );
@@ -418,21 +450,24 @@ def f(ctx, value):
     let mut saw_with_ok_assign = false;
     let entry = lower_with_stmt_sequence(
         &context,
-        with_stmt.clone(),
+        match InstrRuff::from_ast_stmt(Stmt::With(with_stmt.clone())) {
+            InstrRuff::StmtWith(with_stmt) => with_stmt,
+            _ => unreachable!(),
+        },
         &[],
         RegionTargets::new(label(99), None),
         Vec::new(),
         &mut blocks,
         &name_gen,
         false,
-        &mut |_expanded: &[Stmt], targets: RegionTargets, _blocks: &mut Vec<TestBlock>| {
+        &mut |_expanded: &[InstrRuff], targets: RegionTargets, _blocks: &mut Vec<TestBlock>| {
             saw_try_stmt = _expanded
                 .iter()
-                .any(|stmt| matches!(stmt, ast::Stmt::Try(_)));
+                .any(|stmt| matches!(stmt, InstrRuff::StmtTry(_)));
             saw_with_ok_assign = _expanded.iter().any(|stmt| {
                 match stmt {
-                    ast::Stmt::Assign(assign) => assign.targets.iter().any(|target| {
-                        matches!(target, Expr::Name(name) if name.id.as_str().contains("with_ok"))
+                    InstrRuff::StmtAssign(assign) => assign.targets.iter().any(|target| {
+                        matches!(target, InstrRuff::ExprName(name) if name.id.as_str().contains("with_ok"))
                     }),
                     _ => false,
                 }
@@ -472,7 +507,10 @@ def f():
     let name_gen = test_name_gen();
     let try_plan = build_try_plan(&name_gen, false, false);
     let entry = lower_try_stmt_sequence(
-        try_stmt.clone(),
+        match InstrRuff::from_ast_stmt(Stmt::Try(try_stmt.clone())) {
+            InstrRuff::StmtTry(try_stmt) => try_stmt,
+            _ => unreachable!(),
+        },
         &[],
         RegionTargets::new(label(99), None),
         Vec::new(),
@@ -480,12 +518,14 @@ def f():
         &name_gen,
         label(0),
         try_plan,
-        &mut |_expanded: &[Stmt], targets: RegionTargets, blocks: &mut Vec<TestBlock>| {
+        &mut |_expanded: &[InstrRuff], targets: RegionTargets, blocks: &mut Vec<TestBlock>| {
             let label = BlockLabel::from_index(100 + blocks.len());
             blocks.push(
                 crate::passes::ruff_to_blockpy::compat::compat_block_from_blockpy_with_exc_target_and_expr::<
                     InstrWithAwaitAndYield,
                 >(
+                    &test_context(),
+                    &test_name_gen(),
                     label,
                     Vec::new(),
                     BlockTerm::Jump(BlockEdge::new(targets.normal_cont)),
@@ -525,15 +565,17 @@ fn expanded_stmt_helper_returns_expanded_entry_without_linear_prefix() {
     let mut blocks = Vec::new();
     let mut saw_expanded = false;
     let context = Context::new("");
+    let name_gen = test_name_gen();
     let entry = lower_expanded_stmt_sequence(
         &context,
-        vec![py_stmt!("pass")],
+        &name_gen,
+        vec![instr_stmt(py_stmt!("pass"))],
         &[],
         RegionTargets::new(label(99), None),
         Vec::new(),
         &mut blocks,
         None,
-        &mut |expanded: &[Stmt], targets: RegionTargets, _blocks: &mut Vec<TestBlock>| {
+        &mut |expanded: &[InstrRuff], targets: RegionTargets, _blocks: &mut Vec<TestBlock>| {
             assert_eq!(expanded.len(), 1);
             assert_eq!(targets.normal_cont, label(99));
             saw_expanded = true;
@@ -550,15 +592,17 @@ fn expanded_stmt_helper_returns_expanded_entry_without_linear_prefix() {
 fn expanded_stmt_helper_emits_linear_jump_prefix() {
     let mut blocks = Vec::new();
     let context = Context::new("");
+    let name_gen = test_name_gen();
     let entry = lower_expanded_stmt_sequence(
         &context,
-        vec![py_stmt!("pass")],
+        &name_gen,
+        vec![instr_stmt(py_stmt!("pass"))],
         &[],
         RegionTargets::new(label(99), None),
-        vec![py_stmt!("x = 1")],
+        vec![instr_stmt(py_stmt!("x = 1"))],
         &mut blocks,
         Some(label(10)),
-        &mut |_expanded: &[Stmt], _targets: RegionTargets, _blocks: &mut Vec<TestBlock>| label(11),
+        &mut |_expanded: &[InstrRuff], _targets: RegionTargets, _blocks: &mut Vec<TestBlock>| label(11),
     );
 
     assert_eq!(entry, label(10));
@@ -583,13 +627,13 @@ fn if_stmt_helper_lowers_both_branches_via_callback() {
         &mut blocks,
         &test_name_gen(),
         label(10),
-        vec![py_stmt!("prefix = 0")],
-        py_expr!("flag"),
-        &then_body,
-        &else_body,
+        vec![instr_stmt(py_stmt!("prefix = 0"))],
+        instr_expr(py_expr!("flag")),
+        &then_body.iter().cloned().map(instr_stmt).collect::<Vec<_>>(),
+        &else_body.iter().cloned().map(instr_stmt).collect::<Vec<_>>(),
         label(99),
         &RegionTargets::new(label(99), None),
-        &mut |stmts: &[Stmt], targets: RegionTargets, _blocks: &mut Vec<TestBlock>| {
+        &mut |stmts: &[InstrRuff], targets: RegionTargets, _blocks: &mut Vec<TestBlock>| {
             calls.push((stmts.len(), targets.normal_cont.clone()));
             label(200 + calls.len() as u32)
         },
@@ -618,13 +662,13 @@ fn if_stmt_helper_lowers_if_expr_test_via_inline_fragment() {
         &mut blocks,
         &name_gen,
         label(10),
-        vec![py_stmt!("prefix = 0")],
-        py_expr!("left if cond else right"),
-        &[py_stmt!("x = 1")],
-        &[py_stmt!("x = 2")],
+        vec![instr_stmt(py_stmt!("prefix = 0"))],
+        instr_expr(py_expr!("left if cond else right")),
+        &vec![instr_stmt(py_stmt!("x = 1"))],
+        &vec![instr_stmt(py_stmt!("x = 2"))],
         label(99),
         &RegionTargets::new(label(99), None),
-        &mut |_stmts: &[Stmt], _targets: RegionTargets, _blocks: &mut Vec<TestBlock>| label(200),
+        &mut |_stmts: &[InstrRuff], _targets: RegionTargets, _blocks: &mut Vec<TestBlock>| label(200),
     );
 
     assert_eq!(entry, label(10));
@@ -676,13 +720,13 @@ fn if_stmt_helper_lowers_boolop_test_via_inline_fragment() {
         &mut blocks,
         &name_gen,
         label(10),
-        vec![py_stmt!("prefix = 0")],
-        py_expr!("left and right"),
-        &[py_stmt!("x = 1")],
-        &[py_stmt!("x = 2")],
+        vec![instr_stmt(py_stmt!("prefix = 0"))],
+        instr_expr(py_expr!("left and right")),
+        &vec![instr_stmt(py_stmt!("x = 1"))],
+        &vec![instr_stmt(py_stmt!("x = 2"))],
         label(99),
         &RegionTargets::new(label(99), None),
-        &mut |_stmts: &[Stmt], _targets: RegionTargets, _blocks: &mut Vec<TestBlock>| label(200),
+        &mut |_stmts: &[InstrRuff], _targets: RegionTargets, _blocks: &mut Vec<TestBlock>| label(200),
     );
 
     assert_eq!(entry, label(10));
@@ -712,13 +756,13 @@ fn if_stmt_helper_lowers_compare_chain_test_via_inline_fragment() {
         &mut blocks,
         &name_gen,
         label(10),
-        vec![py_stmt!("prefix = 0")],
-        py_expr!("a < b < c"),
-        &[py_stmt!("x = 1")],
-        &[py_stmt!("x = 2")],
+        vec![instr_stmt(py_stmt!("prefix = 0"))],
+        instr_expr(py_expr!("a < b < c")),
+        &vec![instr_stmt(py_stmt!("x = 1"))],
+        &vec![instr_stmt(py_stmt!("x = 2"))],
         label(99),
         &RegionTargets::new(label(99), None),
-        &mut |_stmts: &[Stmt], _targets: RegionTargets, _blocks: &mut Vec<TestBlock>| label(200),
+        &mut |_stmts: &[InstrRuff], _targets: RegionTargets, _blocks: &mut Vec<TestBlock>| label(200),
     );
 
     assert_eq!(entry, label(10));
@@ -741,11 +785,13 @@ fn if_stmt_helper_lowers_compare_chain_test_via_inline_fragment() {
 fn sequence_jump_helper_emits_jump_block() {
     let mut blocks = Vec::new();
     let context = Context::new("");
+    let name_gen = test_name_gen();
     let entry = emit_sequence_jump_block::<InstrWithAwaitAndYield>(
         &context,
         &mut blocks,
+        &name_gen,
         label(10),
-        vec![py_stmt!("prefix = 0")],
+        vec![instr_stmt(py_stmt!("prefix = 0"))],
         label(11),
         None,
     );
@@ -768,8 +814,8 @@ fn sequence_return_helper_emits_return_block() {
             &mut blocks,
             &test_name_gen(),
             label(10),
-            vec![py_stmt!("prefix = 0")],
-            Some(py_expr!("value")),
+            vec![instr_stmt(py_stmt!("prefix = 0"))],
+            Some(instr_expr(py_expr!("value"))),
             None,
         )
         .expect("sequence return helper should lower");
@@ -789,9 +835,9 @@ fn sequence_raise_helper_emits_raise_block() {
             &mut blocks,
             &test_name_gen(),
             label(10),
-            vec![py_stmt!("prefix = 0")],
+            vec![instr_stmt(py_stmt!("prefix = 0"))],
             TermRaise {
-                exc: Some(py_expr!("exc").into()),
+                exc: Some(InstrRuff::from_ast_expr(py_expr!("exc"))),
             },
             None,
         )
@@ -816,8 +862,8 @@ fn sequence_return_helper_lowers_boolop_via_inline_fragment() {
             &mut blocks,
             &name_gen,
             label(10),
-            vec![py_stmt!("prefix = 0")],
-            Some(py_expr!("lhs() and rhs()")),
+            vec![instr_stmt(py_stmt!("prefix = 0"))],
+            Some(instr_expr(py_expr!("lhs() and rhs()"))),
             None,
         )
         .expect("sequence return helper should lower");
@@ -839,9 +885,9 @@ fn sequence_raise_helper_lowers_compare_chain_via_inline_fragment() {
             &mut blocks,
             &name_gen,
             label(10),
-            vec![py_stmt!("prefix = 0")],
+            vec![instr_stmt(py_stmt!("prefix = 0"))],
             TermRaise {
-                exc: Some(py_expr!("a() < b() < c()").into()),
+                exc: Some(InstrRuff::from_ast_expr(py_expr!("a() < b() < c()"))),
             },
             None,
         )
@@ -923,13 +969,16 @@ y = 3
     let entry = lower_if_stmt_sequence_from_stmt(
         &context,
         &test_name_gen(),
-        if_stmt.clone(),
-        &remaining,
+        match InstrRuff::from_ast_stmt(Stmt::If(if_stmt.clone())) {
+            InstrRuff::StmtIf(if_stmt) => if_stmt,
+            _ => unreachable!(),
+        },
+        &remaining.iter().cloned().map(instr_stmt).collect::<Vec<_>>(),
         RegionTargets::new(label(99), None),
-        vec![py_stmt!("prefix = 0")],
+        vec![instr_stmt(py_stmt!("prefix = 0"))],
         &mut blocks,
         label(10),
-        &mut |stmts: &[Stmt], targets: RegionTargets, _blocks: &mut Vec<TestBlock>| {
+        &mut |stmts: &[InstrRuff], targets: RegionTargets, _blocks: &mut Vec<TestBlock>| {
             calls.push((stmts.len(), targets.normal_cont.clone()));
             label(200 + calls.len() as u32)
         },
@@ -970,7 +1019,7 @@ y = 3
 }
 
 #[test]
-fn if_stmt_from_stmt_helper_falls_back_when_branch_setup_is_not_plain() {
+fn if_stmt_from_stmt_helper_inlines_fragment_compatible_branch_setup() {
     let module = ruff_python_parser::parse_module(
         r#"
 if flag:
@@ -994,13 +1043,16 @@ done = 1
     let entry = lower_if_stmt_sequence_from_stmt(
         &context,
         &test_name_gen(),
-        if_stmt.clone(),
-        &remaining,
+        match InstrRuff::from_ast_stmt(Stmt::If(if_stmt.clone())) {
+            InstrRuff::StmtIf(if_stmt) => if_stmt,
+            _ => unreachable!(),
+        },
+        &remaining.iter().cloned().map(instr_stmt).collect::<Vec<_>>(),
         RegionTargets::new(label(99), None),
-        vec![py_stmt!("prefix = 0")],
+        vec![instr_stmt(py_stmt!("prefix = 0"))],
         &mut blocks,
         label(10),
-        &mut |stmts: &[Stmt], targets: RegionTargets, _blocks: &mut Vec<TestBlock>| {
+        &mut |stmts: &[InstrRuff], targets: RegionTargets, _blocks: &mut Vec<TestBlock>| {
             calls.push((stmts.len(), targets.normal_cont.clone()));
             label(200 + calls.len() as u32)
         },
@@ -1012,14 +1064,13 @@ done = 1
             .into_iter()
             .map(|(len, label)| (len, label))
             .collect::<Vec<_>>(),
-        vec![
-            (remaining.len(), label(99)),
-            (1, label(201)),
-            (1, label(201))
-        ]
+        vec![(remaining.len(), label(99))]
     );
-    assert_eq!(blocks.len(), 1);
-    assert!(matches!(blocks[0].term, BlockTerm::IfTerm(_)));
+    assert!(blocks.len() > 1, "{blocks:#?}");
+    assert!(
+        blocks.iter().any(|block| matches!(block.term, BlockTerm::IfTerm(_))),
+        "{blocks:#?}"
+    );
 }
 
 #[test]
@@ -1038,13 +1089,13 @@ fn while_stmt_helper_lowers_loop_and_else_via_callbacks() {
         &test_name_gen(),
         label(0),
         Some(label(1)),
-        vec![py_stmt!("prefix = 0")],
-        py_expr!("flag"),
-        &body,
-        &else_body,
-        &remaining,
+        vec![instr_stmt(py_stmt!("prefix = 0"))],
+        instr_expr(py_expr!("flag")),
+        &body.iter().cloned().map(instr_stmt).collect::<Vec<_>>(),
+        &else_body.iter().cloned().map(instr_stmt).collect::<Vec<_>>(),
+        &remaining.iter().cloned().map(instr_stmt).collect::<Vec<_>>(),
         RegionTargets::new(label(99), None),
-        &mut |stmts: &[Stmt], targets: RegionTargets, _blocks: &mut Vec<TestBlock>| {
+        &mut |stmts: &[InstrRuff], targets: RegionTargets, _blocks: &mut Vec<TestBlock>| {
             if let Some(loop_labels) = targets.loop_labels {
                 loop_calls.push((
                     stmts.len(),
@@ -1097,13 +1148,13 @@ fn while_stmt_helper_lowers_boolop_test_via_inline_fragment() {
         &name_gen,
         test_label,
         Some(linear_label),
-        vec![py_stmt!("prefix = 0")],
-        py_expr!("lhs() and rhs()"),
-        &body,
+        vec![instr_stmt(py_stmt!("prefix = 0"))],
+        instr_expr(py_expr!("lhs() and rhs()")),
+        &body.iter().cloned().map(instr_stmt).collect::<Vec<_>>(),
         &[],
-        &remaining,
+        &remaining.iter().cloned().map(instr_stmt).collect::<Vec<_>>(),
         RegionTargets::new(label(99), None),
-        &mut |stmts: &[Stmt], targets: RegionTargets, _blocks: &mut Vec<TestBlock>| {
+        &mut |stmts: &[InstrRuff], targets: RegionTargets, _blocks: &mut Vec<TestBlock>| {
             if let Some(loop_labels) = targets.loop_labels {
                 loop_calls.push((
                     stmts.len(),
@@ -1156,13 +1207,13 @@ fn while_stmt_helper_lowers_compare_chain_test_via_inline_fragment() {
         &name_gen,
         test_label,
         Some(linear_label),
-        vec![py_stmt!("prefix = 0")],
-        py_expr!("a() < b() < c()"),
-        &body,
+        vec![instr_stmt(py_stmt!("prefix = 0"))],
+        instr_expr(py_expr!("a() < b() < c()")),
+        &body.iter().cloned().map(instr_stmt).collect::<Vec<_>>(),
         &[],
-        &remaining,
+        &remaining.iter().cloned().map(instr_stmt).collect::<Vec<_>>(),
         RegionTargets::new(label(99), None),
-        &mut |stmts: &[Stmt], targets: RegionTargets, _blocks: &mut Vec<TestBlock>| {
+        &mut |stmts: &[InstrRuff], targets: RegionTargets, _blocks: &mut Vec<TestBlock>| {
             if let Some(loop_labels) = targets.loop_labels {
                 loop_calls.push((
                     stmts.len(),
@@ -1223,14 +1274,17 @@ y = 3
     let entry = lower_while_stmt_sequence_from_stmt(
         &context,
         &test_name_gen(),
-        while_stmt.clone(),
-        &remaining,
+        match InstrRuff::from_ast_stmt(Stmt::While(while_stmt.clone())) {
+            InstrRuff::StmtWhile(while_stmt) => while_stmt,
+            _ => unreachable!(),
+        },
+        &remaining.iter().cloned().map(instr_stmt).collect::<Vec<_>>(),
         RegionTargets::new(label(99), None),
-        vec![py_stmt!("prefix = 0")],
+        vec![instr_stmt(py_stmt!("prefix = 0"))],
         &mut blocks,
         label(0),
         Some(label(1)),
-        &mut |stmts: &[Stmt], targets: RegionTargets, _blocks: &mut Vec<TestBlock>| {
+        &mut |stmts: &[InstrRuff], targets: RegionTargets, _blocks: &mut Vec<TestBlock>| {
             if let Some(loop_labels) = targets.loop_labels {
                 loop_calls.push((
                     stmts.len(),
@@ -1372,19 +1426,19 @@ def f(x):
         panic!("expected function def");
     };
     let context = test_context();
-    let mut out = crate::block_py::BlockBuilder::<
-        StructuredInstr<InstrWithAwaitAndYield>,
-        BlockTerm<InstrWithAwaitAndYield>,
-    >::new();
-    let mut next_label_id = 0usize;
-    lower_stmt_into(&context, &func.body[0], &mut out, None, &mut next_label_id)
+    let name_gen = test_name_gen();
+    let mut out = crate::passes::ruff_to_blockpy::InlineBlockBuilder::<
+        InstrWithAwaitAndYield,
+    >::new(&name_gen);
+    let stmt = InstrRuff::from_ast_stmt(func.body[0].clone());
+    lower_instr_for_test(&context, &stmt, &name_gen, &mut out, None)
         .expect("assert lowering should succeed");
     let fragment = out.finish();
-    assert!(matches!(fragment.body.as_slice(), [StructuredInstr::If(_)]));
+    assert!(!fragment.deps.is_empty());
 }
 
 #[test]
-#[should_panic(expected = "ClassDef should be lowered before Ruff AST -> BlockPy conversion")]
+#[should_panic(expected = "ClassDef X should be lowered before Ruff AST -> BlockPy conversion")]
 fn panics_if_classdef_reaches_blockpy() {
     let module = ruff_python_parser::parse_module(
         r#"
@@ -1417,19 +1471,19 @@ def f(x):
         panic!("expected function def");
     };
     let context = test_context();
-    let mut out = crate::block_py::BlockBuilder::<
-        StructuredInstr<InstrWithAwaitAndYield>,
-        BlockTerm<InstrWithAwaitAndYield>,
-    >::new();
-    let mut next_label_id = 0usize;
-    lower_stmt_into(&context, &func.body[0], &mut out, None, &mut next_label_id)
+    let name_gen = test_name_gen();
+    let mut out = crate::passes::ruff_to_blockpy::InlineBlockBuilder::<
+        InstrWithAwaitAndYield,
+    >::new(&name_gen);
+    let stmt = InstrRuff::from_ast_stmt(func.body[0].clone());
+    lower_instr_for_test(&context, &stmt, &name_gen, &mut out, None)
         .expect("augassign lowering should succeed");
     let fragment = out.finish();
     assert!(matches!(
-        fragment.body.as_slice(),
+        fragment.entry.body.as_slice(),
         [
-            StructuredInstr::Expr(_),
-            StructuredInstr::Expr(InstrWithAwaitAndYield::Store(_))
+            _,
+            InstrWithAwaitAndYield::Store(_)
         ]
     ));
 }
@@ -1466,15 +1520,15 @@ def f():
     .into_syntax()
     .body;
     let context = test_context();
-    let mut out = crate::block_py::BlockBuilder::<
-        StructuredInstr<InstrWithAwaitAndYield>,
-        BlockTerm<InstrWithAwaitAndYield>,
-    >::new();
-    let mut next_label_id = 0usize;
-    lower_stmt_into(&context, &module[0], &mut out, None, &mut next_label_id)
+    let name_gen = test_name_gen();
+    let mut out = crate::passes::ruff_to_blockpy::InlineBlockBuilder::<
+        InstrWithAwaitAndYield,
+    >::new(&name_gen);
+    let stmt = InstrRuff::from_ast_stmt(module[0].clone());
+    lower_instr_for_test(&context, &stmt, &name_gen, &mut out, None)
         .expect("type alias lowering should succeed");
     let fragment = out.finish();
-    assert!(!fragment.body.is_empty());
+    assert!(!fragment.entry.body.is_empty());
 }
 
 #[test]
@@ -1494,15 +1548,15 @@ def f(x):
         panic!("expected function def");
     };
     let context = test_context();
-    let mut out = crate::block_py::BlockBuilder::<
-        StructuredInstr<InstrWithAwaitAndYield>,
-        BlockTerm<InstrWithAwaitAndYield>,
-    >::new();
-    let mut next_label_id = 0usize;
-    lower_stmt_into(&context, &func.body[0], &mut out, None, &mut next_label_id)
+    let name_gen = test_name_gen();
+    let mut out = crate::passes::ruff_to_blockpy::InlineBlockBuilder::<
+        InstrWithAwaitAndYield,
+    >::new(&name_gen);
+    let stmt = InstrRuff::from_ast_stmt(func.body[0].clone());
+    lower_instr_for_test(&context, &stmt, &name_gen, &mut out, None)
         .expect("match lowering should succeed");
     let fragment = out.finish();
-    assert!(!fragment.body.is_empty() || fragment.term.is_some());
+    assert!(!fragment.entry.body.is_empty() || !fragment.deps.is_empty());
 }
 
 #[test]
@@ -1520,19 +1574,17 @@ def f():
         panic!("expected function def");
     };
     let context = test_context();
-    let mut out = crate::block_py::BlockBuilder::<
-        StructuredInstr<InstrWithAwaitAndYield>,
-        BlockTerm<InstrWithAwaitAndYield>,
-    >::new();
-    let mut next_label_id = 0usize;
-    lower_stmt_into(&context, &func.body[0], &mut out, None, &mut next_label_id)
+    let name_gen = test_name_gen();
+    let mut out = crate::passes::ruff_to_blockpy::InlineBlockBuilder::<
+        InstrWithAwaitAndYield,
+    >::new(&name_gen);
+    let stmt = InstrRuff::from_ast_stmt(func.body[0].clone());
+    lower_instr_for_test(&context, &stmt, &name_gen, &mut out, None)
         .expect("import lowering should succeed");
     let fragment = out.finish();
     assert!(matches!(
-        fragment.body.as_slice(),
-        [StructuredInstr::Expr(
-            InstrWithAwaitAndYield::Store(_)
-        )]
+        fragment.entry.body.as_slice(),
+        [InstrWithAwaitAndYield::Store(_)]
     ));
 }
 
@@ -1551,15 +1603,15 @@ def f():
         panic!("expected function def");
     };
     let context = test_context();
-    let mut out = crate::block_py::BlockBuilder::<
-        StructuredInstr<InstrWithAwaitAndYield>,
-        BlockTerm<InstrWithAwaitAndYield>,
-    >::new();
-    let mut next_label_id = 0usize;
-    lower_stmt_into(&context, &func.body[0], &mut out, None, &mut next_label_id)
+    let name_gen = test_name_gen();
+    let mut out = crate::passes::ruff_to_blockpy::InlineBlockBuilder::<
+        InstrWithAwaitAndYield,
+    >::new(&name_gen);
+    let stmt = InstrRuff::from_ast_stmt(func.body[0].clone());
+    lower_instr_for_test(&context, &stmt, &name_gen, &mut out, None)
         .expect("import-from lowering should succeed");
     let fragment = out.finish();
-    assert!(!fragment.body.is_empty());
+    assert!(!fragment.entry.body.is_empty());
 }
 
 #[test]
@@ -1608,17 +1660,11 @@ fn panics_if_while_reaches_stmt_list_lowering() {
         panic!("expected while stmt");
     };
     let context = test_context();
-    let mut out = crate::block_py::BlockBuilder::<
-        StructuredInstr<InstrWithAwaitAndYield>,
-        BlockTerm<InstrWithAwaitAndYield>,
-    >::new();
-    let mut next_label_id = 0usize;
-    lower_stmt_into(
-        &context,
-        &Stmt::While(while_stmt.clone()),
-        &mut out,
-        None,
-        &mut next_label_id,
-    )
+    let name_gen = test_name_gen();
+    let mut out = crate::passes::ruff_to_blockpy::InlineBlockBuilder::<
+        InstrWithAwaitAndYield,
+    >::new(&name_gen);
+    let stmt = InstrRuff::from_ast_stmt(Stmt::While(while_stmt.clone()));
+    lower_instr_for_test(&context, &stmt, &name_gen, &mut out, None)
     .unwrap();
 }

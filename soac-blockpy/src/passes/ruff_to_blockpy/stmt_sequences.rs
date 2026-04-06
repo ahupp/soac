@@ -1,51 +1,50 @@
-use super::stmt_lowering::lower_stmt_into_with_expr;
+use super::stmt_lowering::{lower_instr_into_with_expr, plan_instr_head_for_blockpy};
 use super::*;
-use crate::block_py::{BlockTerm, Expr, ImplicitNoneExpr, Instr, StructuredInstr, TermRaise};
+use crate::block_py::{BlockTerm, ImplicitNoneExpr, Instr, TermRaise};
 use crate::passes::ast_to_ast::context::Context;
+use crate::passes::InstrRuff;
 
 pub(crate) fn lower_stmts_to_blockpy_stmts_with_context<E>(
     context: &Context,
-    stmts: &[Stmt],
-) -> Result<crate::block_py::BlockBuilder<StructuredInstr<E>, BlockTerm<E>>, String>
+    stmts: &[InstrRuff],
+    name_gen: &FunctionNameGen,
+) -> Result<crate::passes::ruff_to_blockpy::stmt_lowering::BlockPyStmtBuilder<E>, String>
 where
-    E: RuffToBlockPyExpr,
+    E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
 {
-    let mut out = crate::block_py::BlockBuilder::<StructuredInstr<E>, BlockTerm<E>>::new();
-    let mut next_label_id = 0usize;
+    let mut out = crate::passes::ruff_to_blockpy::stmt_lowering::BlockPyStmtBuilder::<E>::new(name_gen);
     for stmt in stmts {
-        lower_stmt_into_with_expr(context, stmt, &mut out, None, &mut next_label_id)?;
+        lower_instr_into_with_expr(context, stmt, name_gen, &mut out, None)?;
     }
-    Ok(out.finish())
+    Ok(out)
 }
 
-pub(crate) fn lower_stmts_to_blockpy_stmts<E>(
-    stmts: &[Stmt],
-) -> Result<crate::block_py::BlockBuilder<StructuredInstr<E>, BlockTerm<E>>, String>
-where
-    E: RuffToBlockPyExpr,
-{
-    let context = Context::new("");
-    lower_stmts_to_blockpy_stmts_with_context(&context, stmts)
-}
-
-pub(crate) fn plan_stmt_sequence_head(context: &Context, stmt: &Stmt) -> StmtSequenceHeadPlan {
-    super::stmt_lowering::plan_stmt_head_for_blockpy(context, stmt)
-}
-
-pub(crate) fn drive_stmt_sequence_until_control(
+pub(crate) fn plan_instr_sequence_head(
     context: &Context,
-    stmts: &[Stmt],
-    mut linear: Vec<Stmt>,
-) -> StmtSequenceDriveResult {
+    stmt: &InstrRuff,
+) -> StmtSequenceHeadPlan {
+    plan_instr_head_for_blockpy(context, stmt)
+}
+
+pub(crate) enum InstrSequenceDriveResult {
+    Exhausted { linear: Vec<InstrRuff> },
+    Break { linear: Vec<InstrRuff>, index: usize, plan: StmtSequenceHeadPlan },
+}
+
+pub(crate) fn drive_instr_sequence_until_control(
+    context: &Context,
+    stmts: &[InstrRuff],
+    mut linear: Vec<InstrRuff>,
+) -> InstrSequenceDriveResult {
     let mut index = 0;
     while index < stmts.len() {
-        match plan_stmt_sequence_head(context, &stmts[index]) {
+        match plan_instr_sequence_head(context, &stmts[index]) {
             StmtSequenceHeadPlan::Linear(stmt) => {
                 linear.push(stmt);
                 index += 1;
             }
             StmtSequenceHeadPlan::Expanded(stmts) => {
-                return StmtSequenceDriveResult::Break {
+                return InstrSequenceDriveResult::Break {
                     linear,
                     index,
                     plan: StmtSequenceHeadPlan::Expanded(stmts),
@@ -58,7 +57,7 @@ pub(crate) fn drive_stmt_sequence_until_control(
                 );
             }
             plan => {
-                return StmtSequenceDriveResult::Break {
+                return InstrSequenceDriveResult::Break {
                     linear,
                     index,
                     plan,
@@ -66,21 +65,19 @@ pub(crate) fn drive_stmt_sequence_until_control(
             }
         }
     }
-    StmtSequenceDriveResult::Exhausted { linear }
+    InstrSequenceDriveResult::Exhausted { linear }
 }
 
-fn compat_blockpy_raise_from_stmt(raise_stmt: ast::StmtRaise) -> TermRaise<Expr> {
+fn compat_blockpy_raise_from_instr(raise_stmt: crate::block_py::StmtRaise<InstrRuff>) -> TermRaise<InstrRuff> {
     assert!(
         raise_stmt.cause.is_none(),
         "raise-from should be lowered before Ruff AST -> BlockPy conversion"
     );
-    TermRaise {
-        exc: raise_stmt.exc.map(|expr| (*expr).into()),
-    }
+    TermRaise { exc: raise_stmt.exc.map(|expr| *expr) }
 }
 
-fn contains_return_stmt_in_body(stmts: &[Stmt]) -> bool {
-    stmts.iter().any(contains_return_stmt)
+fn contains_return_instr_in_body(stmts: &[InstrRuff]) -> bool {
+    stmts.iter().any(contains_return_instr)
 }
 
 fn contains_return_stmt_in_handlers(handlers: &[ast::ExceptHandler]) -> bool {
@@ -90,30 +87,33 @@ fn contains_return_stmt_in_handlers(handlers: &[ast::ExceptHandler]) -> bool {
     })
 }
 
-fn contains_return_stmt(stmt: &Stmt) -> bool {
-    match stmt {
-        Stmt::Return(_) => true,
-        Stmt::If(stmt) => {
-            contains_return_stmt_in_body(&stmt.body)
-                || stmt
-                    .elif_else_clauses
-                    .iter()
-                    .any(|clause| contains_return_stmt_in_body(&clause.body))
+fn contains_return_stmt_in_body(stmts: &[Stmt]) -> bool {
+    stmts.iter()
+        .cloned()
+        .map(InstrRuff::from_ast_stmt)
+        .any(|stmt| contains_return_instr(&stmt))
+}
+
+fn contains_return_instr(instr: &InstrRuff) -> bool {
+    match instr {
+        InstrRuff::StmtReturn(_) => true,
+        InstrRuff::StmtIf(stmt) => {
+            contains_return_instr_in_body(&stmt.body) || contains_return_instr_in_body(&stmt.orelse)
         }
-        Stmt::While(stmt) => {
-            contains_return_stmt_in_body(&stmt.body) || contains_return_stmt_in_body(&stmt.orelse)
+        InstrRuff::StmtWhile(stmt) => {
+            contains_return_instr_in_body(&stmt.body) || contains_return_instr_in_body(&stmt.orelse)
         }
-        Stmt::For(stmt) => {
-            contains_return_stmt_in_body(&stmt.body) || contains_return_stmt_in_body(&stmt.orelse)
+        InstrRuff::StmtFor(stmt) => {
+            contains_return_instr_in_body(&stmt.body) || contains_return_instr_in_body(&stmt.orelse)
         }
-        Stmt::Try(stmt) => {
-            contains_return_stmt_in_body(&stmt.body)
+        InstrRuff::StmtTry(stmt) => {
+            contains_return_instr_in_body(&stmt.body)
                 || contains_return_stmt_in_handlers(&stmt.handlers)
-                || contains_return_stmt_in_body(&stmt.orelse)
-                || contains_return_stmt_in_body(&stmt.finalbody)
+                || contains_return_instr_in_body(&stmt.orelse)
+                || contains_return_instr_in_body(&stmt.finalbody)
         }
-        Stmt::With(stmt) => contains_return_stmt_in_body(&stmt.body),
-        Stmt::FunctionDef(_) | Stmt::ClassDef(_) => false,
+        InstrRuff::StmtWith(stmt) => contains_return_instr_in_body(&stmt.body),
+        InstrRuff::StmtFunctionDef(_) | InstrRuff::StmtClassDef(_) => false,
         _ => false,
     }
 }
@@ -122,15 +122,15 @@ pub(crate) fn lower_common_stmt_sequence_head<FSeq, E>(
     context: &Context,
     name_gen: &FunctionNameGen,
     plan: StmtSequenceHeadPlan,
-    remaining_stmts: &[Stmt],
+    remaining_stmts: &[InstrRuff],
     targets: RegionTargets,
-    linear: Vec<Stmt>,
+    linear: Vec<InstrRuff>,
     blocks: &mut Vec<LoweredBlockPyBlock<E>>,
     next_label: &mut dyn FnMut() -> BlockLabel,
     lower_sequence: &mut FSeq,
 ) -> Option<BlockLabel>
 where
-    FSeq: FnMut(&[Stmt], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
+    FSeq: FnMut(&[InstrRuff], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
     E: RuffToBlockPyExpr + ImplicitNoneExpr,
 {
     match plan {
@@ -141,7 +141,7 @@ where
                 name_gen,
                 next_label(),
                 linear,
-                compat_blockpy_raise_from_stmt(raise_stmt),
+                compat_blockpy_raise_from_instr(raise_stmt),
                 targets.active_exc.as_ref(),
             )
             .unwrap_or_else(|err| {
@@ -155,7 +155,7 @@ where
                 name_gen,
                 next_label(),
                 linear,
-                value,
+                Some(value),
                 targets.active_exc.as_ref(),
             )
             .unwrap_or_else(|err| {
@@ -194,25 +194,27 @@ where
             ))
         }
         StmtSequenceHeadPlan::Break => match targets.loop_labels {
-            Some(loop_labels) => Some(emit_sequence_jump_block(
-                context,
-                blocks,
-                next_label(),
-                linear,
-                loop_labels.break_label,
-                targets.active_exc.as_ref(),
-            )),
+                Some(loop_labels) => Some(emit_sequence_jump_block(
+                    context,
+                    blocks,
+                    name_gen,
+                    next_label(),
+                    linear,
+                    loop_labels.break_label,
+                    targets.active_exc.as_ref(),
+                )),
             None => Some(targets.normal_cont),
         },
         StmtSequenceHeadPlan::Continue => match targets.loop_labels {
-            Some(loop_labels) => Some(emit_sequence_jump_block(
-                context,
-                blocks,
-                next_label(),
-                linear,
-                loop_labels.continue_label,
-                targets.active_exc.as_ref(),
-            )),
+                Some(loop_labels) => Some(emit_sequence_jump_block(
+                    context,
+                    blocks,
+                    name_gen,
+                    next_label(),
+                    linear,
+                    loop_labels.continue_label,
+                    targets.active_exc.as_ref(),
+                )),
             None => Some(targets.normal_cont),
         },
         _ => None,
@@ -221,26 +223,29 @@ where
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_for_stmt_sequence_head<F, E>(
+    context: &Context,
     name_gen: &FunctionNameGen,
-    for_stmt: ast::StmtFor,
-    remaining_stmts: &[Stmt],
+    for_stmt: crate::block_py::StmtFor<InstrRuff>,
+    remaining_stmts: &[InstrRuff],
     targets: RegionTargets,
-    linear: Vec<Stmt>,
+    linear: Vec<InstrRuff>,
     blocks: &mut Vec<LoweredBlockPyBlock<E>>,
     iter_name: &str,
     tmp_name: &str,
     loop_check_label: BlockLabel,
     loop_continue_label: BlockLabel,
-    assign_body: Vec<Stmt>,
+    assign_body: Vec<InstrRuff>,
     lower_region: &mut F,
 ) -> BlockLabel
 where
-    F: FnMut(&[Stmt], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
+    F: FnMut(&[InstrRuff], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
     E: RuffToBlockPyExpr + ImplicitNoneExpr,
 {
     let assign_label = name_gen.next_block_name();
     let setup_label = name_gen.next_block_name();
     lower_for_stmt_sequence(
+        context,
+        name_gen,
         for_stmt,
         remaining_stmts,
         targets,
@@ -259,7 +264,20 @@ where
 
 pub(crate) fn lower_stmt_sequence_with_state<E>(
     context: &Context,
-    stmts: &[Stmt],
+    stmts: &[InstrRuff],
+    targets: RegionTargets,
+    blocks: &mut Vec<LoweredBlockPyBlock<E>>,
+    name_gen: &FunctionNameGen,
+) -> BlockLabel
+where
+    E: RuffToBlockPyExpr + ImplicitNoneExpr,
+{
+    lower_instr_stmt_sequence_with_state(context, stmts, targets, blocks, name_gen)
+}
+
+fn lower_instr_stmt_sequence_with_state<E>(
+    context: &Context,
+    stmts: &[InstrRuff],
     targets: RegionTargets,
     blocks: &mut Vec<LoweredBlockPyBlock<E>>,
     name_gen: &FunctionNameGen,
@@ -275,25 +293,25 @@ where
     let mut index = 0;
     while index < stmts.len() {
         let plan;
-        (linear, index, plan) =
-            match drive_stmt_sequence_until_control(context, &stmts[index..], linear) {
-                StmtSequenceDriveResult::Exhausted { linear } => {
-                    let label = name_gen.next_block_name();
-                    return emit_sequence_jump_block(
-                        context,
-                        blocks,
-                        label,
-                        linear,
-                        targets.normal_cont.clone(),
-                        targets.active_exc.as_ref(),
-                    );
-                }
-                StmtSequenceDriveResult::Break {
+        (linear, index, plan) = match drive_instr_sequence_until_control(context, &stmts[index..], linear) {
+            InstrSequenceDriveResult::Exhausted { linear } => {
+                let label = name_gen.next_block_name();
+                return emit_sequence_jump_block(
+                    context,
+                    blocks,
+                    name_gen,
+                    label,
                     linear,
-                    index: break_index,
-                    plan,
-                } => (linear, index + break_index, plan),
-            };
+                    targets.normal_cont.clone(),
+                    targets.active_exc.as_ref(),
+                );
+            }
+            InstrSequenceDriveResult::Break {
+                linear,
+                index: break_index,
+                plan,
+            } => (linear, index + break_index, plan),
+        };
 
         match plan {
             plan @ (StmtSequenceHeadPlan::Raise(_)
@@ -308,18 +326,17 @@ where
                     plan,
                     &stmts[index + 1..],
                     targets.clone(),
-                    linear,
+                    linear.clone(),
                     blocks,
                     &mut || name_gen.next_block_name(),
                     &mut |stmts, nested_targets, blocks| {
-                        let label = lower_stmt_sequence_with_state(
+                        lower_instr_stmt_sequence_with_state(
                             context,
                             stmts,
                             nested_targets,
                             blocks,
                             name_gen,
-                        );
-                        label
+                        )
                     },
                 );
                 if let Some(label) = label {
@@ -328,25 +345,24 @@ where
                 unreachable!("common head helper must lower supported head");
             }
             StmtSequenceHeadPlan::With(with_stmt) => {
-                let needs_finally_return_flow = contains_return_stmt_in_body(&with_stmt.body);
+                let needs_finally_return_flow = contains_return_instr_in_body(&with_stmt.body);
                 let entry = lower_with_stmt_sequence(
                     context,
                     with_stmt,
                     &stmts[index + 1..],
                     targets.clone(),
-                    linear,
+                    linear.clone(),
                     blocks,
                     name_gen,
                     needs_finally_return_flow,
                     &mut |stmts, nested_targets, blocks| {
-                        let label = lower_stmt_sequence_with_state(
+                        lower_instr_stmt_sequence_with_state(
                             context,
                             stmts,
                             nested_targets,
                             blocks,
                             name_gen,
-                        );
-                        label
+                        )
                     },
                 );
                 return entry;
@@ -354,21 +370,20 @@ where
             StmtSequenceHeadPlan::For(for_stmt) => {
                 let iter_name = name_gen.next_tmp_name("iter");
                 let tmp_name = name_gen.next_tmp_name("tmp");
-                let tmp_expr = py_expr!("{name:id}", name = tmp_name.as_str());
                 let loop_check_label = name_gen.next_block_name();
                 let loop_continue_label = loop_check_label.clone();
                 let assign_body = build_for_target_assign_body(
-                    for_stmt.target.as_ref(),
-                    tmp_expr,
+                    *for_stmt.target.clone(),
+                    InstrRuff::from_ast_expr(py_expr!("{name:id}", name = tmp_name.as_str())),
                     tmp_name.as_str(),
-                    &mut |prefix| name_gen.next_tmp_name(prefix).to_string(),
                 );
-                let label = lower_for_stmt_sequence_head(
+                return lower_for_stmt_sequence_head(
+                    context,
                     name_gen,
                     for_stmt,
                     &stmts[index + 1..],
                     targets.clone(),
-                    linear,
+                    linear.clone(),
                     blocks,
                     iter_name.as_str(),
                     tmp_name.as_str(),
@@ -376,69 +391,65 @@ where
                     loop_continue_label,
                     assign_body,
                     &mut |stmts, nested_targets, blocks| {
-                        let label = lower_stmt_sequence_with_state(
+                        lower_instr_stmt_sequence_with_state(
                             context,
                             stmts,
                             nested_targets,
                             blocks,
                             name_gen,
-                        );
-                        label
+                        )
                     },
                 );
-                return label;
             }
             StmtSequenceHeadPlan::Try(try_stmt) => {
                 let label = if try_stmt.is_star {
                     let jump_label = (!linear.is_empty()).then(|| name_gen.next_block_name());
                     lower_star_try_stmt_sequence(
                         context,
+                        name_gen,
                         try_stmt,
                         &stmts[index + 1..],
                         targets.clone(),
-                        linear,
+                        linear.clone(),
                         blocks,
                         jump_label,
                         &mut |stmts, nested_targets, blocks| {
-                            let label = lower_stmt_sequence_with_state(
+                            lower_instr_stmt_sequence_with_state(
                                 context,
                                 stmts,
                                 nested_targets,
                                 blocks,
                                 name_gen,
-                            );
-                            label
+                            )
                         },
                     )
                 } else {
                     let has_finally = !&try_stmt.finalbody.is_empty();
                     let needs_finally_return_flow = has_finally
-                        && (contains_return_stmt_in_body(&try_stmt.body)
+                        && (contains_return_instr_in_body(&try_stmt.body)
                             || contains_return_stmt_in_handlers(&try_stmt.handlers)
-                            || contains_return_stmt_in_body(&try_stmt.orelse));
+                            || contains_return_instr_in_body(&try_stmt.orelse));
                     let try_plan = build_try_plan(name_gen, has_finally, needs_finally_return_flow);
                     let label = name_gen.next_block_name();
-                    let entry = lower_try_stmt_sequence(
+                    lower_try_stmt_sequence(
                         try_stmt,
                         &stmts[index + 1..],
                         targets.clone(),
-                        linear,
+                        linear.clone(),
                         blocks,
                         name_gen,
                         label.clone(),
                         try_plan,
                         &mut |stmts, nested_targets, blocks| {
-                            let label = lower_stmt_sequence_with_state(
+                            lower_instr_stmt_sequence_with_state(
                                 context,
                                 stmts,
                                 nested_targets,
                                 blocks,
                                 name_gen,
-                            );
-                            label
+                            )
                         },
-                    );
-                    entry
+                    )
                 };
                 return label;
             }
@@ -449,14 +460,15 @@ where
                 let jump_label = (!linear.is_empty()).then(|| name_gen.next_block_name());
                 return lower_expanded_stmt_sequence(
                     context,
+                    name_gen,
                     expanded_stmts,
                     &stmts[index + 1..],
                     targets,
-                    linear,
+                    linear.clone(),
                     blocks,
                     jump_label,
                     &mut |stmts, nested_targets, blocks| {
-                        lower_stmt_sequence_with_state(
+                        lower_instr_stmt_sequence_with_state(
                             context,
                             stmts,
                             nested_targets,
@@ -474,6 +486,7 @@ where
     emit_sequence_jump_block(
         context,
         blocks,
+        name_gen,
         label,
         linear,
         targets.normal_cont,
@@ -483,16 +496,17 @@ where
 
 pub(crate) fn lower_expanded_stmt_sequence<F, E>(
     context: &Context,
-    desugared_stmts: Vec<Stmt>,
-    remaining_stmts: &[Stmt],
+    name_gen: &FunctionNameGen,
+    desugared_stmts: Vec<InstrRuff>,
+    remaining_stmts: &[InstrRuff],
     targets: RegionTargets,
-    linear: Vec<Stmt>,
+    linear: Vec<InstrRuff>,
     blocks: &mut Vec<LoweredBlockPyBlock<E>>,
     jump_label: Option<BlockLabel>,
     lower_sequence: &mut F,
 ) -> BlockLabel
 where
-    F: FnMut(&[Stmt], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
+    F: FnMut(&[InstrRuff], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
     E: RuffToBlockPyExpr + ImplicitNoneExpr,
 {
     let mut expanded = desugared_stmts;
@@ -503,7 +517,7 @@ where
         return expanded_entry;
     }
     let jump_label = jump_label.expect("linear prefix requires a jump label");
-    let lowered_linear = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &linear)
+    let lowered_linear = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &linear, name_gen)
         .unwrap_or_else(|err| panic!("failed to lower expanded-sequence jump prefix through production path: {err}"));
     blocks.push(crate::passes::ruff_to_blockpy::compat::compat_block_from_lowered_builder_with_exc_target_and_expr(
         jump_label.clone(),
@@ -519,16 +533,16 @@ pub(crate) fn lower_if_stmt_sequence<F, E>(
     blocks: &mut Vec<LoweredBlockPyBlock<E>>,
     name_gen: &FunctionNameGen,
     label: BlockLabel,
-    linear: Vec<Stmt>,
-    test: Expr,
-    then_body: &[Stmt],
-    else_body: &[Stmt],
+    linear: Vec<InstrRuff>,
+    test: InstrRuff,
+    then_body: &[InstrRuff],
+    else_body: &[InstrRuff],
     rest_entry: BlockLabel,
     targets: &RegionTargets,
     lower_region: &mut F,
 ) -> BlockLabel
 where
-    F: FnMut(&[Stmt], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
+    F: FnMut(&[InstrRuff], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
     E: RuffToBlockPyExpr + ImplicitNoneExpr,
 {
     let then_entry = lower_region(
@@ -566,16 +580,16 @@ where
 pub(crate) fn lower_if_stmt_sequence_from_stmt<F, E>(
     context: &Context,
     name_gen: &FunctionNameGen,
-    if_stmt: ast::StmtIf,
-    remaining_stmts: &[Stmt],
+    if_stmt: crate::block_py::StmtIf<InstrRuff>,
+    remaining_stmts: &[InstrRuff],
     targets: RegionTargets,
-    linear: Vec<Stmt>,
+    linear: Vec<InstrRuff>,
     blocks: &mut Vec<LoweredBlockPyBlock<E>>,
     label: BlockLabel,
     lower_region: &mut F,
 ) -> BlockLabel
 where
-    F: FnMut(&[Stmt], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
+    F: FnMut(&[InstrRuff], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
     E: RuffToBlockPyExpr + ImplicitNoneExpr,
 {
     let rest_entry = lower_region(remaining_stmts, targets.clone(), blocks);
@@ -583,14 +597,14 @@ where
         continue_label: loop_labels.continue_label.clone(),
         break_label: loop_labels.break_label.clone(),
     });
-    if let Some(Ok(mut fragment)) = stmt_lowering::try_lower_if_stmt_fragment::<E>(
+    if let Some(Ok(mut fragment)) = stmt_lowering::try_lower_if_instr_fragment::<E>(
         context,
         name_gen,
         &if_stmt,
         loop_ctx.as_ref(),
     ) {
         if linear.is_empty() {
-            fragment.entry.label = label;
+            fragment.relabel_entry(label);
         }
         let fragment_entry = emit_inline_fragment_with_exc_target_and_expr(
             blocks,
@@ -604,6 +618,7 @@ where
         return emit_sequence_jump_block(
             context,
             blocks,
+            name_gen,
             label,
             linear,
             fragment_entry,
@@ -612,7 +627,7 @@ where
     }
 
     let then_body = &if_stmt.body.to_vec();
-    let else_body = extract_if_else_body(&if_stmt);
+    let else_body = if_stmt.orelse.clone();
     lower_if_stmt_sequence(
         context,
         blocks,
@@ -628,33 +643,22 @@ where
     )
 }
 
-fn extract_if_else_body(if_stmt: &ast::StmtIf) -> Vec<Stmt> {
-    if if_stmt.elif_else_clauses.is_empty() {
-        return Vec::new();
-    }
-    if_stmt
-        .elif_else_clauses
-        .first()
-        .map(|clause| clause.body.to_vec())
-        .unwrap_or_default()
-}
-
 pub(crate) fn lower_while_stmt_sequence<F, E>(
     context: &Context,
     blocks: &mut Vec<LoweredBlockPyBlock<E>>,
     name_gen: &FunctionNameGen,
     test_label: BlockLabel,
     linear_label: Option<BlockLabel>,
-    linear: Vec<Stmt>,
-    test: Expr,
-    body: &[Stmt],
-    else_body: &[Stmt],
-    remaining_stmts: &[Stmt],
+    linear: Vec<InstrRuff>,
+    test: InstrRuff,
+    body: &[InstrRuff],
+    else_body: &[InstrRuff],
+    remaining_stmts: &[InstrRuff],
     targets: RegionTargets,
     lower_region: &mut F,
 ) -> BlockLabel
 where
-    F: FnMut(&[Stmt], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
+    F: FnMut(&[InstrRuff], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
     E: RuffToBlockPyExpr + ImplicitNoneExpr,
 {
     let rest_entry = lower_region(remaining_stmts, targets.clone(), blocks);
@@ -692,17 +696,17 @@ where
 pub(crate) fn lower_while_stmt_sequence_from_stmt<F, E>(
     context: &Context,
     name_gen: &FunctionNameGen,
-    while_stmt: ast::StmtWhile,
-    remaining_stmts: &[Stmt],
+    while_stmt: crate::block_py::StmtWhile<InstrRuff>,
+    remaining_stmts: &[InstrRuff],
     targets: RegionTargets,
-    linear: Vec<Stmt>,
+    linear: Vec<InstrRuff>,
     blocks: &mut Vec<LoweredBlockPyBlock<E>>,
     test_label: BlockLabel,
     linear_label: Option<BlockLabel>,
     lower_region: &mut F,
 ) -> BlockLabel
 where
-    F: FnMut(&[Stmt], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
+    F: FnMut(&[InstrRuff], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
     E: RuffToBlockPyExpr + ImplicitNoneExpr,
 {
     let body = &while_stmt.body.to_vec();
@@ -725,13 +729,13 @@ where
 
 pub(crate) fn lower_for_stmt_exit_entries<F, E>(
     blocks: &mut Vec<LoweredBlockPyBlock<E>>,
-    else_body: &[Stmt],
-    remaining_stmts: &[Stmt],
+    else_body: &[InstrRuff],
+    remaining_stmts: &[InstrRuff],
     targets: RegionTargets,
     lower_region: &mut F,
 ) -> (BlockLabel, BlockLabel)
 where
-    F: FnMut(&[Stmt], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
+    F: FnMut(&[InstrRuff], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
     E: ImplicitNoneExpr + Instr,
 {
     let rest_entry = lower_region(remaining_stmts, targets.clone(), blocks);
@@ -746,13 +750,13 @@ where
 pub(crate) fn lower_for_stmt_body_entry<F, E>(
     blocks: &mut Vec<LoweredBlockPyBlock<E>>,
     loop_continue_label: BlockLabel,
-    body: &[Stmt],
+    body: &[InstrRuff],
     break_label: BlockLabel,
     targets: &RegionTargets,
     lower_region: &mut F,
 ) -> BlockLabel
 where
-    F: FnMut(&[Stmt], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
+    F: FnMut(&[InstrRuff], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
     E: ImplicitNoneExpr + Instr,
 {
     let body_entry = lower_region(
@@ -771,10 +775,12 @@ where
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_for_stmt_sequence<F, E>(
-    for_stmt: ast::StmtFor,
-    remaining_stmts: &[Stmt],
+    context: &Context,
+    name_gen: &FunctionNameGen,
+    for_stmt: crate::block_py::StmtFor<InstrRuff>,
+    remaining_stmts: &[InstrRuff],
     targets: RegionTargets,
-    linear: Vec<Stmt>,
+    linear: Vec<InstrRuff>,
     blocks: &mut Vec<LoweredBlockPyBlock<E>>,
     iter_name: &str,
     tmp_name: &str,
@@ -782,11 +788,11 @@ pub(crate) fn lower_for_stmt_sequence<F, E>(
     loop_continue_label: BlockLabel,
     assign_label: BlockLabel,
     setup_label: BlockLabel,
-    assign_body: Vec<Stmt>,
+    assign_body: Vec<InstrRuff>,
     lower_region: &mut F,
 ) -> BlockLabel
 where
-    F: FnMut(&[Stmt], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
+    F: FnMut(&[InstrRuff], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
     E: RuffToBlockPyExpr + ImplicitNoneExpr,
 {
     let else_body = &for_stmt.orelse.to_vec();
@@ -809,6 +815,8 @@ where
     );
 
     emit_for_loop_blocks(
+        context,
+        name_gen,
         blocks,
         setup_label,
         assign_label,

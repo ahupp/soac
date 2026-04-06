@@ -1,5 +1,3 @@
-#[cfg(test)]
-use super::StructuredInstr;
 use super::{
     Block, BlockArg, BlockEdge, BlockLabel, BlockParamRole, BlockPyFunction, BlockPyModule,
     BlockPyPass, BlockTerm, FunctionKind, Instr, TermIf, TermRaise,
@@ -914,45 +912,6 @@ where
         collect_referenced_labels_from_term(&block.term, &mut referenced);
     }
     referenced
-}
-
-#[cfg(test)]
-fn collect_referenced_labels_from_structured_blocks<E>(
-    blocks: &[Block<StructuredInstr<E>, E>],
-) -> HashSet<BlockLabel>
-where
-    E: Clone + std::fmt::Debug + Instr,
-{
-    let mut referenced = HashSet::new();
-    for block in blocks {
-        if let Some(exc_edge) = &block.exc_edge {
-            referenced.insert(exc_edge.target);
-        }
-        collect_referenced_labels_from_structured_stmts(&block.body, &mut referenced);
-        collect_referenced_labels_from_term(&block.term, &mut referenced);
-    }
-    referenced
-}
-
-#[cfg(test)]
-fn collect_referenced_labels_from_structured_stmts<E>(
-    stmts: &[StructuredInstr<E>],
-    out: &mut HashSet<BlockLabel>,
-) where
-    E: Clone + std::fmt::Debug + Instr,
-{
-    for stmt in stmts {
-        if let StructuredInstr::If(if_stmt) = stmt {
-            collect_referenced_labels_from_structured_stmts(&if_stmt.body.body, out);
-            if let Some(term) = &if_stmt.body.term {
-                collect_referenced_labels_from_term(term, out);
-            }
-            collect_referenced_labels_from_structured_stmts(&if_stmt.orelse.body, out);
-            if let Some(term) = &if_stmt.orelse.term {
-                collect_referenced_labels_from_term(term, out);
-            }
-        }
-    }
 }
 
 fn collect_referenced_labels_from_term(

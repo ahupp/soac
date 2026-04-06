@@ -10,7 +10,7 @@ mod name_binding;
 pub mod ruff_to_blockpy;
 mod trace;
 
-use crate::block_py::{cfg::relabel_blockpy_blocks_dense, BlockPyModule};
+use crate::block_py::{cfg::relabel_blockpy_blocks_dense, BlockPyModule, ImplicitNoneExpr};
 use crate::block_py::{
     Await, BinOp, BlockPyNameLike, BlockPyPass, Call, CallArgKeyword, CallArgPositional, CellRef,
     CellRefForName, ChildVisitable, CodegenBlockPyExpr, Del, DelItem, ExprAttribute, ExprBoolOp,
@@ -100,7 +100,17 @@ impl BlockPyPass for RuffBlockPyPass {
 }
 
 impl Instr for InstrRuff {
-    type Name = ast::ExprName;
+    type Name = UnresolvedName;
+}
+
+impl ImplicitNoneExpr for InstrRuff {
+    fn implicit_none_expr() -> Self {
+        ExprNoneLiteral::new().into()
+    }
+
+    fn is_implicit_none_expr(expr: &Self) -> bool {
+        matches!(expr, Self::ExprNoneLiteral(_))
+    }
 }
 
 impl InstrRuff {
@@ -111,8 +121,345 @@ impl InstrRuff {
         op.with_meta(meta).into()
     }
 
+    fn wrap_ast_stmt<O>(meta: Meta, op: O) -> Self
+    where
+        O: WithMeta + Into<Self>,
+    {
+        op.with_meta(meta).into()
+    }
+
     fn none_expr_with_meta(meta: Meta) -> Self {
         ExprNoneLiteral::new().with_meta(meta).into()
+    }
+
+    fn from_ast_suite(body: Vec<ast::Stmt>) -> Vec<Self> {
+        body.into_iter().map(Self::from_ast_stmt).collect()
+    }
+
+    fn into_ast_suite(body: Vec<Self>) -> Vec<ast::Stmt> {
+        body.into_iter().map(Self::into_ast_stmt).collect()
+    }
+
+    fn normalize_if_orelse(elif_else_clauses: Vec<ast::ElifElseClause>) -> Vec<Self> {
+        let mut clauses = elif_else_clauses.into_iter();
+        let Some(first) = clauses.next() else {
+            return Vec::new();
+        };
+
+        let ast::ElifElseClause {
+            test,
+            body,
+            range,
+            node_index,
+        } = first;
+
+        match test {
+            Some(test) => {
+                vec![Self::wrap_ast_stmt(
+                    Meta::new(node_index, range),
+                    StmtIf::new(
+                        Self::from_ast_expr(test),
+                        Self::from_ast_suite(body),
+                        Self::normalize_if_orelse(clauses.collect()),
+                    ),
+                )]
+            }
+            None => Self::from_ast_suite(body),
+        }
+    }
+
+    fn denormalize_if_orelse(orelse: Vec<Self>) -> Vec<ast::ElifElseClause> {
+        if orelse.is_empty() {
+            return Vec::new();
+        }
+
+        let mut iter = orelse.into_iter();
+        match iter.next().expect("checked non-empty orelse") {
+            Self::StmtIf(node) if iter.next().is_none() => {
+                vec![ast::ElifElseClause {
+                    range: node.meta().range,
+                    node_index: node.meta().node_index,
+                    test: Some(node.test.into_ast_expr()),
+                    body: Self::into_ast_suite(node.body),
+                }]
+                .into_iter()
+                .chain(Self::denormalize_if_orelse(node.orelse))
+                .collect()
+            }
+            first => {
+                let mut body = vec![first.into_ast_stmt()];
+                body.extend(iter.map(Self::into_ast_stmt));
+                vec![ast::ElifElseClause {
+                    range: Default::default(),
+                    node_index: ast::AtomicNodeIndex::default(),
+                    test: None,
+                    body,
+                }]
+            }
+        }
+    }
+
+    pub fn into_ast_expr(self) -> ast::Expr {
+        match self {
+            Self::ExprBoolOp(node) => ast::Expr::BoolOp(ast::ExprBoolOp {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                op: node.op,
+                values: node
+                    .values
+                    .into_iter()
+                    .map(Self::into_ast_expr)
+                    .collect::<Vec<_>>()
+                    .into(),
+            }),
+            Self::ExprNamed(node) => ast::Expr::Named(ast::ExprNamed {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                target: Box::new(node.target.into_ast_expr()),
+                value: Box::new(node.value.into_ast_expr()),
+            }),
+            Self::BinOp(node) => ast::Expr::BinOp(ast::ExprBinOp {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                left: Box::new(node.left.into_ast_expr()),
+                op: node.kind.into_ast_operator(),
+                right: Box::new(node.right.into_ast_expr()),
+            }),
+            Self::UnaryOp(node) => ast::Expr::UnaryOp(ast::ExprUnaryOp {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                op: node.kind.into_ast_unary_op(),
+                operand: Box::new(node.operand.into_ast_expr()),
+            }),
+            Self::ExprLambda(node) => ast::Expr::Lambda(ast::ExprLambda {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                parameters: node.parameters,
+                body: Box::new(node.body.into_ast_expr()),
+            }),
+            Self::ExprIf(node) => ast::Expr::If(ast::ExprIf {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                test: Box::new(node.test.into_ast_expr()),
+                body: Box::new(node.body.into_ast_expr()),
+                orelse: Box::new(node.orelse.into_ast_expr()),
+            }),
+            Self::ExprDict(node) => ast::Expr::Dict(ast::ExprDict {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                items: node.items,
+            }),
+            Self::ExprSet(node) => ast::Expr::Set(ast::ExprSet {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                elts: node
+                    .elts
+                    .into_iter()
+                    .map(Self::into_ast_expr)
+                    .collect::<Vec<_>>()
+                    .into(),
+            }),
+            Self::ExprListComp(node) => ast::Expr::ListComp(ast::ExprListComp {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                elt: Box::new(node.elt.into_ast_expr()),
+                generators: node.generators,
+            }),
+            Self::ExprSetComp(node) => ast::Expr::SetComp(ast::ExprSetComp {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                elt: Box::new(node.elt.into_ast_expr()),
+                generators: node.generators,
+            }),
+            Self::ExprDictComp(node) => ast::Expr::DictComp(ast::ExprDictComp {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                key: Box::new(node.key.into_ast_expr()),
+                value: Box::new(node.value.into_ast_expr()),
+                generators: node.generators,
+            }),
+            Self::ExprGenerator(node) => ast::Expr::Generator(ast::ExprGenerator {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                elt: Box::new(node.elt.into_ast_expr()),
+                generators: node.generators,
+                parenthesized: node.parenthesized,
+            }),
+            Self::Await(node) => ast::Expr::Await(ast::ExprAwait {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                value: Box::new(node.value.into_ast_expr()),
+            }),
+            Self::Yield(node) => ast::Expr::Yield(ast::ExprYield {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                value: Some(Box::new(node.value.into_ast_expr())),
+            }),
+            Self::YieldFrom(node) => ast::Expr::YieldFrom(ast::ExprYieldFrom {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                value: Box::new(node.value.into_ast_expr()),
+            }),
+            Self::ExprCompare(node) => ast::Expr::Compare(ast::ExprCompare {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                left: Box::new(node.left.into_ast_expr()),
+                ops: node.ops.into(),
+                comparators: node
+                    .comparators
+                    .into_iter()
+                    .map(Self::into_ast_expr)
+                    .collect::<Vec<_>>()
+                    .into(),
+            }),
+            Self::Call(node) => ast::Expr::Call(ast::ExprCall {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                func: Box::new(node.func.into_ast_expr()),
+                arguments: ast::Arguments {
+                    range: Default::default(),
+                    node_index: ast::AtomicNodeIndex::default(),
+                    args: node
+                        .args
+                        .into_iter()
+                        .map(|arg| match arg {
+                            CallArgPositional::Positional(expr) => expr.into_ast_expr(),
+                            CallArgPositional::Starred(expr) => ast::Expr::Starred(
+                                ast::ExprStarred {
+                                    range: expr.meta().range,
+                                    node_index: expr.meta().node_index,
+                                    value: Box::new(expr.into_ast_expr()),
+                                    ctx: ast::ExprContext::Load,
+                                },
+                            ),
+                        })
+                        .collect::<Vec<_>>()
+                        .into(),
+                    keywords: node
+                        .keywords
+                        .into_iter()
+                        .map(|keyword| match keyword {
+                            CallArgKeyword::Named { arg, value } => ast::Keyword {
+                                range: value.meta().range,
+                                node_index: value.meta().node_index,
+                                arg: Some(arg),
+                                value: value.into_ast_expr(),
+                            },
+                            CallArgKeyword::Starred(value) => ast::Keyword {
+                                range: value.meta().range,
+                                node_index: value.meta().node_index,
+                                arg: None,
+                                value: value.into_ast_expr(),
+                            },
+                        })
+                        .collect::<Vec<_>>()
+                        .into(),
+                },
+            }),
+            Self::ExprFString(node) => ast::Expr::FString(ast::ExprFString {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                value: node.value,
+            }),
+            Self::ExprTString(node) => ast::Expr::TString(ast::ExprTString {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                value: node.value,
+            }),
+            Self::ExprStringLiteral(node) => ast::Expr::StringLiteral(ast::ExprStringLiteral {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                value: node.value,
+            }),
+            Self::ExprBytesLiteral(node) => ast::Expr::BytesLiteral(ast::ExprBytesLiteral {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                value: node.value,
+            }),
+            Self::ExprNumberLiteral(node) => ast::Expr::NumberLiteral(ast::ExprNumberLiteral {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                value: node.value,
+            }),
+            Self::ExprBooleanLiteral(node) => ast::Expr::BooleanLiteral(ast::ExprBooleanLiteral {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                value: node.value,
+            }),
+            Self::ExprNoneLiteral(node) => ast::Expr::NoneLiteral(ast::ExprNoneLiteral {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+            }),
+            Self::ExprEllipsisLiteral(node) => ast::Expr::EllipsisLiteral(ast::ExprEllipsisLiteral {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+            }),
+            Self::ExprAttribute(node) => ast::Expr::Attribute(ast::ExprAttribute {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                value: Box::new(node.value.into_ast_expr()),
+                attr: node.attr,
+                ctx: node.ctx,
+            }),
+            Self::ExprSubscript(node) => ast::Expr::Subscript(ast::ExprSubscript {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                value: Box::new(node.value.into_ast_expr()),
+                slice: Box::new(node.slice.into_ast_expr()),
+                ctx: node.ctx,
+            }),
+            Self::ExprStarred(node) => ast::Expr::Starred(ast::ExprStarred {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                value: Box::new(node.value.into_ast_expr()),
+                ctx: node.ctx,
+            }),
+            Self::ExprName(node) => ast::Expr::Name(ast::ExprName {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                id: node.id,
+                ctx: node.ctx,
+            }),
+            Self::ExprList(node) => ast::Expr::List(ast::ExprList {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                elts: node
+                    .elts
+                    .into_iter()
+                    .map(Self::into_ast_expr)
+                    .collect::<Vec<_>>()
+                    .into(),
+                ctx: node.ctx,
+            }),
+            Self::ExprTuple(node) => ast::Expr::Tuple(ast::ExprTuple {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                elts: node
+                    .elts
+                    .into_iter()
+                    .map(Self::into_ast_expr)
+                    .collect::<Vec<_>>()
+                    .into(),
+                ctx: node.ctx,
+                parenthesized: node.parenthesized,
+            }),
+            Self::ExprSlice(node) => ast::Expr::Slice(ast::ExprSlice {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                lower: node.lower.map(|expr| Box::new(expr.into_ast_expr())),
+                upper: node.upper.map(|expr| Box::new(expr.into_ast_expr())),
+                step: node.step.map(|expr| Box::new(expr.into_ast_expr())),
+            }),
+            Self::ExprIpyEscapeCommand(node) => {
+                ast::Expr::IpyEscapeCommand(ast::ExprIpyEscapeCommand {
+                    range: node.meta().range,
+                    node_index: node.meta().node_index,
+                    kind: node.kind,
+                    value: node.value,
+                })
+            }
+            other => panic!("expected expression-shaped InstrRuff, got {other:?}"),
+        }
     }
 
     pub fn from_ast_expr(value: ast::Expr) -> Self {
@@ -388,6 +735,391 @@ impl InstrRuff {
                 let meta = node.meta();
                 Self::wrap_ast_expr(meta, ExprIpyEscapeCommand::new(node.kind, node.value))
             }
+        }
+    }
+    pub fn from_ast_stmt(value: ast::Stmt) -> Self {
+        match value {
+            ast::Stmt::FunctionDef(node) => {
+                let meta = node.meta();
+                Self::wrap_ast_stmt(
+                    meta,
+                    StmtFunctionDef::new(
+                        node.is_async,
+                        node.decorator_list,
+                        node.name,
+                        node.type_params,
+                        node.parameters,
+                        node.returns.map(|expr| Box::new(Self::from_ast_expr(*expr))),
+                        Self::from_ast_suite(node.body),
+                    ),
+                )
+            }
+            ast::Stmt::ClassDef(node) => {
+                let meta = node.meta();
+                Self::wrap_ast_stmt(
+                    meta,
+                    StmtClassDef::new(
+                        node.decorator_list,
+                        node.name,
+                        node.type_params,
+                        node.arguments,
+                        Self::from_ast_suite(node.body),
+                    ),
+                )
+            }
+            ast::Stmt::Return(node) => {
+                let meta = node.meta();
+                let implicit_none = Box::new(Self::none_expr_with_meta(meta.clone()));
+                Self::wrap_ast_stmt(
+                    meta,
+                    StmtReturn::new(
+                        node.value
+                            .map(|expr| Box::new(Self::from_ast_expr(*expr)))
+                            .unwrap_or(implicit_none),
+                    ),
+                )
+            }
+            ast::Stmt::Delete(node) => {
+                let meta = node.meta();
+                Self::wrap_ast_stmt(
+                    meta,
+                    StmtDelete::new(node.targets.into_iter().map(Self::from_ast_expr).collect::<Vec<_>>()),
+                )
+            }
+            ast::Stmt::TypeAlias(node) => {
+                let meta = node.meta();
+                Self::wrap_ast_stmt(
+                    meta,
+                    StmtTypeAlias::new(
+                        Self::from_ast_expr(*node.name),
+                        node.type_params,
+                        Self::from_ast_expr(*node.value),
+                    ),
+                )
+            }
+            ast::Stmt::Assign(node) => {
+                let meta = node.meta();
+                Self::wrap_ast_stmt(
+                    meta,
+                    StmtAssign::new(
+                        node.targets.into_iter().map(Self::from_ast_expr).collect::<Vec<_>>(),
+                        Self::from_ast_expr(*node.value),
+                    ),
+                )
+            }
+            ast::Stmt::AugAssign(node) => {
+                let meta = node.meta();
+                Self::wrap_ast_stmt(
+                    meta,
+                    StmtAugAssign::new(
+                        Self::from_ast_expr(*node.target),
+                        node.op,
+                        Self::from_ast_expr(*node.value),
+                    ),
+                )
+            }
+            ast::Stmt::AnnAssign(node) => {
+                let meta = node.meta();
+                Self::wrap_ast_stmt(
+                    meta,
+                    StmtAnnAssign::new(
+                        Self::from_ast_expr(*node.target),
+                        Self::from_ast_expr(*node.annotation),
+                        node.value.map(|expr| Box::new(Self::from_ast_expr(*expr))),
+                        node.simple,
+                    ),
+                )
+            }
+            ast::Stmt::For(node) => {
+                let meta = node.meta();
+                Self::wrap_ast_stmt(
+                    meta,
+                    StmtFor::new(
+                        node.is_async,
+                        Self::from_ast_expr(*node.target),
+                        Self::from_ast_expr(*node.iter),
+                        Self::from_ast_suite(node.body),
+                        Self::from_ast_suite(node.orelse),
+                    ),
+                )
+            }
+            ast::Stmt::While(node) => {
+                let meta = node.meta();
+                Self::wrap_ast_stmt(
+                    meta,
+                    StmtWhile::new(
+                        Self::from_ast_expr(*node.test),
+                        Self::from_ast_suite(node.body),
+                        Self::from_ast_suite(node.orelse),
+                    ),
+                )
+            }
+            ast::Stmt::If(node) => {
+                let meta = node.meta();
+                Self::wrap_ast_stmt(
+                    meta,
+                    StmtIf::new(
+                        Self::from_ast_expr(*node.test),
+                        Self::from_ast_suite(node.body),
+                        Self::normalize_if_orelse(node.elif_else_clauses),
+                    ),
+                )
+            }
+            ast::Stmt::With(node) => {
+                let meta = node.meta();
+                Self::wrap_ast_stmt(
+                    meta,
+                    StmtWith::new(
+                        node.is_async,
+                        node.items,
+                        Self::from_ast_suite(node.body),
+                    ),
+                )
+            }
+            ast::Stmt::Match(node) => {
+                let meta = node.meta();
+                Self::wrap_ast_stmt(
+                    meta,
+                    StmtMatch::new(Self::from_ast_expr(*node.subject), node.cases),
+                )
+            }
+            ast::Stmt::Raise(node) => {
+                let meta = node.meta();
+                Self::wrap_ast_stmt(
+                    meta,
+                    StmtRaise::new(
+                        node.exc.map(|expr| Box::new(Self::from_ast_expr(*expr))),
+                        node.cause.map(|expr| Box::new(Self::from_ast_expr(*expr))),
+                    ),
+                )
+            }
+            ast::Stmt::Try(node) => {
+                let meta = node.meta();
+                Self::wrap_ast_stmt(
+                    meta,
+                    StmtTry::new(
+                        Self::from_ast_suite(node.body),
+                        node.handlers,
+                        Self::from_ast_suite(node.orelse),
+                        Self::from_ast_suite(node.finalbody),
+                        node.is_star,
+                    ),
+                )
+            }
+            ast::Stmt::Assert(node) => {
+                let meta = node.meta();
+                Self::wrap_ast_stmt(
+                    meta,
+                    StmtAssert::new(
+                        Self::from_ast_expr(*node.test),
+                        node.msg.map(|expr| Box::new(Self::from_ast_expr(*expr))),
+                    ),
+                )
+            }
+            ast::Stmt::Import(node) => {
+                let meta = node.meta();
+                Self::wrap_ast_stmt(meta, StmtImport::new(node.names))
+            }
+            ast::Stmt::ImportFrom(node) => {
+                let meta = node.meta();
+                Self::wrap_ast_stmt(meta, StmtImportFrom::new(node.module, node.names, node.level))
+            }
+            ast::Stmt::Global(node) => {
+                let meta = node.meta();
+                Self::wrap_ast_stmt(meta, StmtGlobal::new(node.names))
+            }
+            ast::Stmt::Nonlocal(node) => {
+                let meta = node.meta();
+                Self::wrap_ast_stmt(meta, StmtNonlocal::new(node.names))
+            }
+            ast::Stmt::Expr(node) => {
+                let meta = node.meta();
+                Self::wrap_ast_stmt(meta, StmtExpr::new(Self::from_ast_expr(*node.value)))
+            }
+            ast::Stmt::Pass(node) => {
+                let meta = node.meta();
+                Self::wrap_ast_stmt(meta, StmtPass::new())
+            }
+            ast::Stmt::Break(node) => {
+                let meta = node.meta();
+                Self::wrap_ast_stmt(meta, StmtBreak::new())
+            }
+            ast::Stmt::Continue(node) => {
+                let meta = node.meta();
+                Self::wrap_ast_stmt(meta, StmtContinue::new())
+            }
+            ast::Stmt::IpyEscapeCommand(node) => {
+                let meta = node.meta();
+                Self::wrap_ast_stmt(meta, StmtIpyEscapeCommand::new(node.kind, node.value))
+            }
+        }
+    }
+
+    pub fn into_ast_stmt(self) -> ast::Stmt {
+        match self {
+            Self::StmtFunctionDef(node) => ast::Stmt::FunctionDef(ast::StmtFunctionDef {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                is_async: node.is_async,
+                decorator_list: node.decorator_list,
+                name: node.name,
+                type_params: node.type_params,
+                parameters: node.parameters,
+                returns: node.returns.map(|expr| Box::new(expr.into_ast_expr())),
+                body: Self::into_ast_suite(node.body),
+            }),
+            Self::StmtClassDef(node) => ast::Stmt::ClassDef(ast::StmtClassDef {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                decorator_list: node.decorator_list,
+                name: node.name,
+                type_params: node.type_params,
+                arguments: node.arguments,
+                body: Self::into_ast_suite(node.body),
+            }),
+            Self::StmtReturn(node) => ast::Stmt::Return(ast::StmtReturn {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                value: Some(Box::new(node.value.into_ast_expr())),
+            }),
+            Self::StmtDelete(node) => ast::Stmt::Delete(ast::StmtDelete {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                targets: node.targets.into_iter().map(Self::into_ast_expr).collect(),
+            }),
+            Self::StmtTypeAlias(node) => ast::Stmt::TypeAlias(ast::StmtTypeAlias {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                name: Box::new(node.name.into_ast_expr()),
+                type_params: node.type_params,
+                value: Box::new(node.value.into_ast_expr()),
+            }),
+            Self::StmtAssign(node) => ast::Stmt::Assign(ast::StmtAssign {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                targets: node.targets.into_iter().map(Self::into_ast_expr).collect(),
+                value: Box::new(node.value.into_ast_expr()),
+            }),
+            Self::StmtAugAssign(node) => ast::Stmt::AugAssign(ast::StmtAugAssign {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                target: Box::new(node.target.into_ast_expr()),
+                op: node.op,
+                value: Box::new(node.value.into_ast_expr()),
+            }),
+            Self::StmtAnnAssign(node) => ast::Stmt::AnnAssign(ast::StmtAnnAssign {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                target: Box::new(node.target.into_ast_expr()),
+                annotation: Box::new(node.annotation.into_ast_expr()),
+                value: node.value.map(|expr| Box::new(expr.into_ast_expr())),
+                simple: node.simple,
+            }),
+            Self::StmtFor(node) => ast::Stmt::For(ast::StmtFor {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                is_async: node.is_async,
+                target: Box::new(node.target.into_ast_expr()),
+                iter: Box::new(node.iter.into_ast_expr()),
+                body: Self::into_ast_suite(node.body),
+                orelse: Self::into_ast_suite(node.orelse),
+            }),
+            Self::StmtWhile(node) => ast::Stmt::While(ast::StmtWhile {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                test: Box::new(node.test.into_ast_expr()),
+                body: Self::into_ast_suite(node.body),
+                orelse: Self::into_ast_suite(node.orelse),
+            }),
+            Self::StmtIf(node) => ast::Stmt::If(ast::StmtIf {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                test: Box::new(node.test.into_ast_expr()),
+                body: Self::into_ast_suite(node.body),
+                elif_else_clauses: Self::denormalize_if_orelse(node.orelse),
+            }),
+            Self::StmtWith(node) => ast::Stmt::With(ast::StmtWith {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                is_async: node.is_async,
+                items: node.items,
+                body: Self::into_ast_suite(node.body),
+            }),
+            Self::StmtMatch(node) => ast::Stmt::Match(ast::StmtMatch {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                subject: Box::new(node.subject.into_ast_expr()),
+                cases: node.cases,
+            }),
+            Self::StmtRaise(node) => ast::Stmt::Raise(ast::StmtRaise {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                exc: node.exc.map(|expr| Box::new(expr.into_ast_expr())),
+                cause: node.cause.map(|expr| Box::new(expr.into_ast_expr())),
+            }),
+            Self::StmtTry(node) => ast::Stmt::Try(ast::StmtTry {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                body: Self::into_ast_suite(node.body),
+                handlers: node.handlers,
+                orelse: Self::into_ast_suite(node.orelse),
+                finalbody: Self::into_ast_suite(node.finalbody),
+                is_star: node.is_star,
+            }),
+            Self::StmtAssert(node) => ast::Stmt::Assert(ast::StmtAssert {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                test: Box::new(node.test.into_ast_expr()),
+                msg: node.msg.map(|expr| Box::new(expr.into_ast_expr())),
+            }),
+            Self::StmtImport(node) => ast::Stmt::Import(ast::StmtImport {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                names: node.names,
+            }),
+            Self::StmtImportFrom(node) => ast::Stmt::ImportFrom(ast::StmtImportFrom {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                module: node.module,
+                names: node.names,
+                level: node.level,
+            }),
+            Self::StmtGlobal(node) => ast::Stmt::Global(ast::StmtGlobal {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                names: node.names,
+            }),
+            Self::StmtNonlocal(node) => ast::Stmt::Nonlocal(ast::StmtNonlocal {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                names: node.names,
+            }),
+            Self::StmtExpr(node) => ast::Stmt::Expr(ast::StmtExpr {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                value: Box::new(node.value.into_ast_expr()),
+            }),
+            Self::StmtPass(node) => ast::Stmt::Pass(ast::StmtPass {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+            }),
+            Self::StmtBreak(node) => ast::Stmt::Break(ast::StmtBreak {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+            }),
+            Self::StmtContinue(node) => ast::Stmt::Continue(ast::StmtContinue {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+            }),
+            Self::StmtIpyEscapeCommand(node) => ast::Stmt::IpyEscapeCommand(
+                ast::StmtIpyEscapeCommand {
+                    range: node.meta().range,
+                    node_index: node.meta().node_index,
+                    kind: node.kind,
+                    value: node.value,
+                },
+            ),
+            other => panic!("expected statement-shaped InstrRuff, got {other:?}"),
         }
     }
 }

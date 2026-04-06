@@ -1,23 +1,25 @@
-use crate::block_py::{BlockPyStmtBuilder, InstrWithAwaitAndYield, StructuredInstr};
+use crate::block_py::InstrWithAwaitAndYield;
+use crate::passes::InstrRuff;
 use crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup;
+use crate::passes::ruff_to_blockpy::stmt_lowering::BlockPyStmtBuilder;
+use crate::passes::ruff_to_blockpy::test_name_gen;
 use crate::py_expr;
 use ruff_python_parser::parse_expression;
 
 #[test]
 fn nested_boolop_in_call_argument_emits_setup_via_expr_lowering() {
-    let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new();
-    let mut next_label_id = 0usize;
-
-    let lowered: InstrWithAwaitAndYield =
-        lower_expr_into_with_setup(py_expr!("f(a and b)"), &mut out, None, &mut next_label_id)
-            .expect("expr lowering should succeed");
+    let name_gen = test_name_gen();
+    let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new(&name_gen);
+    let lowered: InstrWithAwaitAndYield = lower_expr_into_with_setup(
+        InstrRuff::from_ast_expr(py_expr!("f(a and b)")),
+        &mut out,
+        None,
+    )
+    .expect("expr lowering should succeed");
 
     let fragment = out.finish();
     assert!(
-        fragment
-            .body
-            .iter()
-            .any(|stmt| matches!(stmt, StructuredInstr::If(_))),
+        !fragment.deps.is_empty(),
         "{fragment:?}"
     );
     let rendered = format!("{lowered:?}");
@@ -26,21 +28,19 @@ fn nested_boolop_in_call_argument_emits_setup_via_expr_lowering() {
 
 #[test]
 fn direct_core_expr_lowering_materializes_make_function_operation() {
-    let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new();
-    let mut next_label_id = 0usize;
-
+    let name_gen = test_name_gen();
+    let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new(&name_gen);
     let lowered = lower_expr_into_with_setup(
-        py_expr!(
+        InstrRuff::from_ast_expr(py_expr!(
             "__soac__.make_function(7, \"function\", __soac__.tuple_values(), __soac__.tuple_values(), None)"
-        ),
+        )),
         &mut out,
         None,
-        &mut next_label_id,
     )
     .expect("expr lowering should succeed");
 
     assert!(
-        out.finish().body.is_empty(),
+        out.finish().entry.body.is_empty(),
         "make_function should not need setup"
     );
     let rendered = format!("{lowered:?}");
@@ -57,19 +57,17 @@ fn direct_core_expr_lowering_materializes_live_operation_helpers() {
         ),
         ("__soac__.cell_ref(\"__class__\")", "CellRefForName("),
     ] {
-        let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new();
-        let mut next_label_id = 0usize;
-
+        let name_gen = test_name_gen();
+        let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new(&name_gen);
         let lowered = lower_expr_into_with_setup(
-            *parse_expression(source).unwrap().into_syntax().body,
+            InstrRuff::from_ast_expr(*parse_expression(source).unwrap().into_syntax().body),
             &mut out,
             None,
-            &mut next_label_id,
         )
         .expect("expr lowering should succeed");
 
         assert!(
-            out.finish().body.is_empty(),
+            out.finish().entry.body.is_empty(),
             "{source} should not need setup"
         );
         let rendered = format!("{lowered:?}");

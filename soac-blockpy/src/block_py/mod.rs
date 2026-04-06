@@ -10,7 +10,6 @@ pub use self::scope::{
     CellBindingKind, CellCaptureBinding, ClassBodyFallback, ClosureInit, ClosureSlot,
     EffectiveBinding, StorageLayout,
 };
-use crate::py_expr;
 pub use operation::{
     Await, BinOp, BinOpKind, CalleeFunctionId, Call, CallDirect, CellRef, CellRefForName, Del,
     DelItem, ExprAttribute, ExprBoolOp, ExprBooleanLiteral, ExprBytesLiteral, ExprCompare,
@@ -280,76 +279,6 @@ pub trait Instr: Clone + fmt::Debug + Sized {
     type Name: BlockPyNameLike;
 }
 
-impl BlockPyNameLike for ast::ExprName {
-    fn id_str(&self) -> &str {
-        self.id.as_str()
-    }
-}
-
-impl ChildVisitable<Expr> for Expr {
-    fn visit_children<V>(&self, visitor: &mut V)
-    where
-        V: crate::block_py::Visit<Expr> + ?Sized,
-    {
-        struct DirectChildVisitor<'a, V: ?Sized>(&'a mut V);
-
-        impl<V> crate::block_py::VisitMut<Expr> for DirectChildVisitor<'_, V>
-        where
-            V: crate::block_py::Visit<Expr> + ?Sized,
-        {
-            fn visit_instr_mut(&mut self, expr: &mut Expr) {
-                self.0.visit_instr(expr);
-            }
-        }
-
-        let mut cloned = self.clone();
-        cloned.visit_children_mut(&mut DirectChildVisitor(visitor));
-    }
-
-    fn visit_children_mut<V>(&mut self, visitor: &mut V)
-    where
-        V: crate::block_py::VisitMut<Expr> + ?Sized,
-    {
-        struct DirectChildTransformer<'a, V: ?Sized>(&'a mut V);
-
-        impl<V> crate::transformer::Transformer for DirectChildTransformer<'_, V>
-        where
-            V: crate::block_py::VisitMut<Expr> + ?Sized,
-        {
-            fn visit_expr(&mut self, expr: &mut Expr) {
-                self.0.visit_instr_mut(expr);
-            }
-        }
-
-        let mut transformer = DirectChildTransformer(visitor);
-        crate::transformer::walk_expr(&mut transformer, self);
-    }
-}
-
-impl Mappable<Expr> for Expr {
-    type Mapped<T: Instr> = T;
-
-    fn map_children<T, M>(self, map: &mut M) -> Self::Mapped<T>
-    where
-        T: Instr,
-        M: MapInstr<Expr, T>,
-    {
-        map.map_instr(self)
-    }
-
-    fn try_map_children<T, Error, M>(self, map: &mut M) -> Result<Self::Mapped<T>, Error>
-    where
-        T: Instr,
-        M: TryMapInstr<Expr, T, Error>,
-    {
-        map.try_map_instr(self)
-    }
-
-}
-
-impl Instr for Expr {
-    type Name = ast::ExprName;
-}
 
 #[derive(Clone)]
 pub enum UnresolvedName {
@@ -372,12 +301,6 @@ impl BlockPyNameLike for UnresolvedName {
 
     fn is_runtime_name(&self) -> bool {
         matches!(self, Self::RuntimeName(_))
-    }
-}
-
-impl From<ast::ExprName> for UnresolvedName {
-    fn from(value: ast::ExprName) -> Self {
-        Self::SourceName(value.id)
     }
 }
 
@@ -1026,8 +949,6 @@ pub struct BlockBuilder<S, T> {
     pub term: Option<T>,
 }
 
-pub(crate) type BlockPyStmtBuilder<I> = BlockBuilder<StructuredInstr<I>, BlockTerm<I>>;
-
 impl<S: NormalizedInstr, T> BlockBuilder<S, T> {
     pub fn new() -> Self {
         Self {
@@ -1101,33 +1022,6 @@ impl<S: NormalizedInstr, T: Instr> BlockBuilder<S, BlockTerm<T>> {
     }
 }
 
-#[derive(Debug, Clone)]
-pub(crate) enum StructuredInstr<I: Instr> {
-    Expr(I),
-    If(StructuredIf<I>),
-}
-
-impl<I: Instr> From<I> for StructuredInstr<I> {
-    fn from(value: I) -> Self {
-        Self::Expr(value)
-    }
-}
-
-impl<I: Instr> StructuredInstr<I> {
-    pub fn assert_normalized(&self) {
-        if let Self::If(if_stmt) = self {
-            if_stmt.body.assert_normalized();
-            if_stmt.orelse.assert_normalized();
-        }
-    }
-}
-
-impl<I: Instr> NormalizedInstr for StructuredInstr<I> {
-    fn assert_blockpy_normalized(&self) {
-        self.assert_normalized();
-    }
-}
-
 impl<I> NormalizedInstr for I
 where
     I: Instr,
@@ -1184,13 +1078,6 @@ impl<I: Instr> BlockTerm<I> {
             Self::Raise(_) | Self::Return(_) => false,
         }
     }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct StructuredIf<I: Instr> {
-    pub test: I,
-    pub body: BlockBuilder<StructuredInstr<I>, BlockTerm<I>>,
-    pub orelse: BlockBuilder<StructuredInstr<I>, BlockTerm<I>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1288,16 +1175,6 @@ pub struct BlockParam {
 impl<I: Instr> BlockPyJumpTerm for BlockTerm<I> {
     fn jump_term(target: BlockLabel) -> Self {
         Self::Jump(BlockEdge::new(target))
-    }
-}
-
-impl ImplicitNoneExpr for Expr {
-    fn implicit_none_expr() -> Self {
-        py_expr!("None")
-    }
-
-    fn is_implicit_none_expr(expr: &Self) -> bool {
-        matches!(expr, Expr::NoneLiteral(_))
     }
 }
 

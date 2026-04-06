@@ -20,17 +20,21 @@ class C:
 #     block bb1:
 #         if_term eq(_dp_format, 4):
 #             then:
-#                 block bb7:
+#                 block bb15:
 #                     return dict(tuple_values(tuple_values("x", "int")))
 #             else:
-#                 block bb2:
-#                     if_term gt(_dp_format, 2):
-#                         then:
-#                             block bb5:
-#                                 raise GetAttr(builtins, "NotImplementedError")
-#                         else:
-#                             block bb3:
-#                                 return dict(tuple_values(tuple_values("x", int)))
+#                 block bb16:
+#                     jump bb2
+#                     block bb2:
+#                         if_term gt(_dp_format, 2):
+#                             then:
+#                                 block bb9:
+#                                     raise GetAttr(builtins, "NotImplementedError")
+#                             else:
+#                                 block bb10:
+#                                     jump bb3
+#                                     block bb3:
+#                                         return dict(tuple_values(tuple_values("x", int)))
 
 # function _dp_class_ns_C(_dp_class_ns, _dp_classcell_arg):
 #     function_id: 0:3

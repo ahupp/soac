@@ -1,7 +1,8 @@
-use super::super::{simplify_stmt_ast_once_for_blockpy, BlockPyStmtBuilder};
+use super::super::{lower_instr_for_test, simplify_stmt_ast_once_for_blockpy, BlockPyStmtBuilder};
 use super::*;
 use crate::block_py::InstrWithAwaitAndYield;
 use crate::passes::ast_to_ast::context::Context;
+use crate::passes::ruff_to_blockpy::test_name_gen;
 
 #[test]
 fn stmt_type_alias_simplify_ast_desugars_before_blockpy_lowering() {
@@ -19,19 +20,15 @@ fn stmt_type_alias_simplify_ast_desugars_before_blockpy_lowering() {
 #[test]
 fn stmt_type_alias_to_blockpy_uses_trait_owned_simplification_path() {
     let stmt = py_stmt!("type X = int");
-    let Stmt::TypeAlias(type_alias) = stmt else {
-        panic!("expected type alias stmt");
-    };
+    let type_alias = crate::passes::InstrRuff::from_ast_stmt(stmt);
     let context = Context::new("");
-    let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new();
-    let mut next_label_id = 0usize;
-
-    type_alias
-        .to_blockpy(&context, &mut out, None, &mut next_label_id)
+    let name_gen = test_name_gen();
+    let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new(&name_gen);
+    lower_instr_for_test(&context, &type_alias, &name_gen, &mut out, None)
         .expect("type alias lowering should succeed");
 
     let fragment = out.finish();
-    assert!(!fragment.body.is_empty());
+    assert!(!fragment.entry.body.is_empty());
 }
 
 #[test]

@@ -1,7 +1,8 @@
-use super::super::BlockPyStmtBuilder;
+use super::super::{BlockPyStmtBuilder, lower_instr_for_test};
 use super::*;
-use crate::block_py::{InstrWithAwaitAndYield, StructuredInstr};
+use crate::block_py::InstrWithAwaitAndYield;
 use crate::passes::ast_to_ast::context::Context;
+use crate::passes::ruff_to_blockpy::test_name_gen;
 
 #[test]
 fn stmt_augassign_simplify_ast_keeps_stmt_for_direct_lowering() {
@@ -19,19 +20,15 @@ fn stmt_augassign_simplify_ast_keeps_stmt_for_direct_lowering() {
 #[test]
 fn stmt_augassign_to_blockpy_emits_direct_core_operations() {
     let stmt = py_stmt!("obj[idx] += y");
-    let Stmt::AugAssign(aug_stmt) = stmt else {
-        panic!("expected augassign stmt");
-    };
+    let aug_stmt = crate::passes::InstrRuff::from_ast_stmt(stmt);
     let context = Context::new("");
-    let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new();
-    let mut next_label_id = 0usize;
-
-    aug_stmt
-        .to_blockpy(&context, &mut out, None, &mut next_label_id)
+    let name_gen = test_name_gen();
+    let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new(&name_gen);
+    lower_instr_for_test(&context, &aug_stmt, &name_gen, &mut out, None)
         .expect("augassign lowering should succeed");
 
     let fragment = out.finish();
-    let Some(StructuredInstr::Expr(expr)) = fragment.body.last() else {
+    let Some(expr) = fragment.entry.body.last() else {
         panic!("expected final expr stmt, got {fragment:?}");
     };
     let rendered = format!("{expr:?}");
@@ -45,20 +42,15 @@ fn stmt_augassign_to_blockpy_emits_direct_core_operations() {
 #[test]
 fn stmt_pow_augassign_to_blockpy_uses_inplace_pow() {
     let stmt = py_stmt!("x **= y");
-    let Stmt::AugAssign(aug_stmt) = stmt else {
-        panic!("expected augassign stmt");
-    };
+    let aug_stmt = crate::passes::InstrRuff::from_ast_stmt(stmt);
     let context = Context::new("");
-    let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new();
-    let mut next_label_id = 0usize;
-
-    aug_stmt
-        .to_blockpy(&context, &mut out, None, &mut next_label_id)
+    let name_gen = test_name_gen();
+    let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new(&name_gen);
+    lower_instr_for_test(&context, &aug_stmt, &name_gen, &mut out, None)
         .expect("pow augassign lowering should succeed");
 
     let fragment = out.finish();
-    let Some(StructuredInstr::Expr(InstrWithAwaitAndYield::Store(assign))) =
-        fragment.body.last()
+    let Some(InstrWithAwaitAndYield::Store(assign)) = fragment.entry.body.last()
     else {
         panic!("expected final store expr stmt, got {fragment:?}");
     };

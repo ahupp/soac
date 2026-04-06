@@ -1,13 +1,15 @@
 use crate::block_py::{
-    core_runtime_positional_call_expr_with_meta, literal_expr, operation, BlockPyStmtBuilder,
+    core_runtime_positional_call_expr_with_meta, literal_expr, operation,
     InstrWithAwaitAndYield, CoreStringLiteral, Del, FunctionId, FunctionKind, Instr,
-    Meta, Store, UnresolvedName, WithMeta,
+    Meta, Store, UnresolvedName, WithMeta, HasMeta,
 };
 use crate::namegen::fresh_name;
-use crate::passes::ast_to_ast::string_templates::lower_string_templates_in_expr;
+use crate::passes::ast_to_ast::string_templates::lower_string_templates_in_instr_ruff;
+use crate::passes::InstrRuff;
 use crate::passes::ruff_to_blockpy::LoopContext;
+use crate::passes::ruff_to_blockpy::stmt_lowering::BlockPyStmtBuilder;
 use crate::py_expr;
-use ruff_python_ast::{self as ast, Expr};
+use ruff_python_ast::{self as ast};
 use ruff_text_size::TextRange;
 
 mod boolop_compare;
@@ -31,7 +33,7 @@ pub(crate) trait RuffToBlockPyExpr:
     + Clone
     + Sized
 {
-    fn from_lowered_expr(expr: Expr) -> Self;
+    fn from_lowered_expr(expr: InstrRuff) -> Self;
 
     fn helper_call(
         node_index: ast::AtomicNodeIndex,
@@ -98,9 +100,9 @@ fn inplace_kind(op: ast::Operator) -> Option<operation::BinOpKind> {
 }
 
 impl RuffToBlockPyExpr for InstrWithAwaitAndYield {
-    fn from_lowered_expr(expr: Expr) -> Self {
+    fn from_lowered_expr(expr: InstrRuff) -> Self {
         lower_direct_core_helper_expr(&expr)
-            .unwrap_or_else(|| InstrWithAwaitAndYield::from_ast_expr(expr))
+            .unwrap_or_else(|| InstrWithAwaitAndYield::from_ruff_expr(expr))
     }
 
     fn helper_call(
@@ -205,37 +207,29 @@ impl RuffToBlockPyExpr for InstrWithAwaitAndYield {
 }
 
 pub(crate) trait BlockPySetupExprLowerer {
-    fn lower_expr_ast_into<E>(
+    fn lower_expr_instr_into<E>(
         &self,
-        expr: Expr,
+        expr: InstrRuff,
         out: &mut BlockPyStmtBuilder<E>,
         loop_ctx: Option<&LoopContext>,
-        next_label_id: &mut usize,
-    ) -> Result<Expr, String>
+    ) -> Result<InstrRuff, String>
     where
-        E: RuffToBlockPyExpr,
+        E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
     {
-        let mut expr = expr;
-        lower_string_templates_in_expr(&mut expr);
-        recursive::lower_expr_ast_recursive(self, expr, out, loop_ctx, next_label_id)
+        let expr = lower_string_templates_in_instr_ruff(expr);
+        recursive::lower_expr_ast_recursive(self, expr, out, loop_ctx)
     }
 
     fn lower_expr_into<E>(
         &self,
-        expr: Expr,
+        expr: InstrRuff,
         out: &mut BlockPyStmtBuilder<E>,
         loop_ctx: Option<&LoopContext>,
-        next_label_id: &mut usize,
     ) -> Result<E, String>
     where
-        E: RuffToBlockPyExpr,
+        E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
     {
-        Ok(E::from_lowered_expr(self.lower_expr_ast_into(
-            expr,
-            out,
-            loop_ctx,
-            next_label_id,
-        )?))
+        Ok(E::from_lowered_expr(self.lower_expr_instr_into(expr, out, loop_ctx)?))
     }
 }
 
@@ -246,24 +240,23 @@ impl BlockPySetupExprLowerer for AstSetupExprLowerer {}
 pub(crate) use if_expr::try_lower_if_expr_direct;
 pub(crate) use boolop_compare::try_lower_branching_expr_direct;
 
-pub(crate) fn lower_expr_head_ast_for_blockpy(expr: Expr) -> Expr {
+pub(crate) fn lower_expr_head_ast_for_blockpy(expr: InstrRuff) -> InstrRuff {
     expr
 }
 
 pub(crate) fn lower_expr_into_with_setup<E>(
-    expr: Expr,
+    expr: InstrRuff,
     out: &mut BlockPyStmtBuilder<E>,
     loop_ctx: Option<&LoopContext>,
-    next_label_id: &mut usize,
 ) -> Result<E, String>
 where
-    E: RuffToBlockPyExpr,
+    E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
 {
-    AstSetupExprLowerer.lower_expr_into(expr, out, loop_ctx, next_label_id)
+    AstSetupExprLowerer.lower_expr_into(expr, out, loop_ctx)
 }
 
-fn make_function_kind_from_literal(expr: &Expr) -> Option<FunctionKind> {
-    let Expr::StringLiteral(string) = expr else {
+fn make_function_kind_from_literal(expr: &InstrRuff) -> Option<FunctionKind> {
+    let InstrRuff::ExprStringLiteral(string) = expr else {
         return None;
     };
     Some(match string.value.to_str() {
@@ -275,8 +268,8 @@ fn make_function_kind_from_literal(expr: &Expr) -> Option<FunctionKind> {
     })
 }
 
-fn make_function_id_from_literal(expr: &Expr) -> Option<FunctionId> {
-    let Expr::NumberLiteral(number) = expr else {
+fn make_function_id_from_literal(expr: &InstrRuff) -> Option<FunctionId> {
+    let InstrRuff::ExprNumberLiteral(number) = expr else {
         return None;
     };
     let ast::Number::Int(value) = &number.value else {
@@ -285,75 +278,91 @@ fn make_function_id_from_literal(expr: &Expr) -> Option<FunctionId> {
     value.to_string().parse().ok().map(FunctionId::from_packed)
 }
 
-fn string_literal_value(expr: &Expr) -> Option<String> {
-    let Expr::StringLiteral(string) = expr else {
+fn string_literal_value(expr: &InstrRuff) -> Option<String> {
+    let InstrRuff::ExprStringLiteral(string) = expr else {
         return None;
     };
     Some(string.value.to_str().to_string())
 }
 
 fn lowered_helper_call<'a>(
-    expr: &'a Expr,
+    expr: &'a InstrRuff,
     expected_name: &str,
     arity: usize,
-) -> Option<&'a ast::ExprCall> {
-    let Expr::Call(call) = expr else {
+) -> Option<&'a operation::Call<InstrRuff>> {
+    let InstrRuff::Call(call) = expr else {
         return None;
     };
-    if !call.arguments.keywords.is_empty() || call.arguments.args.len() != arity {
+    if !call.keywords.is_empty() || call.args.len() != arity {
         return None;
     }
     if !matches!(
         call.func.as_ref(),
-        Expr::Attribute(ast::ExprAttribute { value, attr, .. })
-            if matches!(value.as_ref(), Expr::Name(name) if name.id.as_str() == "__soac__")
-                && attr.id.as_str() == expected_name
+        InstrRuff::ExprAttribute(attr_expr)
+            if matches!(attr_expr.value.as_ref(), InstrRuff::ExprName(name) if name.id.as_str() == "__soac__")
+                && attr_expr.attr.id.as_str() == expected_name
     ) {
         return None;
     }
     Some(call)
 }
 
-fn lower_direct_core_helper_expr(expr: &Expr) -> Option<InstrWithAwaitAndYield> {
-    fn lowered(expr: Expr) -> InstrWithAwaitAndYield {
+fn lower_direct_core_helper_expr(expr: &InstrRuff) -> Option<InstrWithAwaitAndYield> {
+    fn lowered(expr: InstrRuff) -> InstrWithAwaitAndYield {
         <InstrWithAwaitAndYield as RuffToBlockPyExpr>::from_lowered_expr(expr)
     }
 
     if let Some(call) = lowered_helper_call(expr, "make_function", 5) {
-        let function_id = make_function_id_from_literal(&call.arguments.args[0])?;
-        let kind = make_function_kind_from_literal(&call.arguments.args[1])?;
+        let crate::block_py::CallArgPositional::Positional(function_id_expr) = &call.args[0] else {
+            return None;
+        };
+        let crate::block_py::CallArgPositional::Positional(kind_expr) = &call.args[1] else {
+            return None;
+        };
+        let crate::block_py::CallArgPositional::Positional(param_defaults_expr) = &call.args[3] else {
+            return None;
+        };
+        let crate::block_py::CallArgPositional::Positional(annotate_fn_expr) = &call.args[4] else {
+            return None;
+        };
+        let function_id = make_function_id_from_literal(function_id_expr)?;
+        let kind = make_function_kind_from_literal(kind_expr)?;
         return Some(
             operation::MakeFunction::new(
                 function_id,
                 kind,
-                Box::new(lowered(call.arguments.args[3].clone())),
-                Box::new(lowered(call.arguments.args[4].clone())),
+                Box::new(lowered(param_defaults_expr.clone())),
+                Box::new(lowered(annotate_fn_expr.clone())),
             )
-            .with_meta(Meta::new(call.node_index.clone(), call.range))
+            .with_meta(call.meta())
             .into(),
         );
     }
 
     if let Some(call) = lowered_helper_call(expr, "store_global", 3) {
+        let crate::block_py::CallArgPositional::Positional(name_expr) = &call.args[1] else {
+            return None;
+        };
+        let crate::block_py::CallArgPositional::Positional(value_expr) = &call.args[2] else {
+            return None;
+        };
         return Some(
             operation::Store::new(
-                ast::ExprName {
-                    id: string_literal_value(&call.arguments.args[1])?.into(),
-                    ctx: ast::ExprContext::Store,
-                    node_index: call.node_index.clone(),
-                    range: call.range,
-                },
-                Box::new(lowered(call.arguments.args[2].clone())),
+                ast::name::Name::new(string_literal_value(name_expr)?),
+                Box::new(lowered(value_expr.clone())),
             )
-            .with_meta(Meta::new(call.node_index.clone(), call.range))
+            .with_meta(call.meta())
             .into(),
         );
     }
 
     if let Some(call) = lowered_helper_call(expr, "cell_ref", 1) {
+        let crate::block_py::CallArgPositional::Positional(name_expr) = &call.args[0] else {
+            return None;
+        };
         return Some(
-            operation::CellRefForName::new(string_literal_value(&call.arguments.args[0])?)
-                .with_meta(Meta::new(call.node_index.clone(), call.range))
+            operation::CellRefForName::new(string_literal_value(name_expr)?)
+                .with_meta(call.meta())
                 .into(),
         );
     }

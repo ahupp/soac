@@ -1,4 +1,4 @@
-snapshot_class::class_with_method: blockpy=9, clif=9
+snapshot_class::class_with_method: blockpy=11, clif=11
 snapshot_class::class_method_named_open_calls_builtin: blockpy=4, clif=4
 snapshot_class::class_with_base: blockpy=3, clif=3
 snapshot_class::class_scope_inner_capture: blockpy=4, clif=4
@@ -14,7 +14,7 @@ snapshot_expr::boolop_chain: blockpy=7, clif=7
 snapshot_expr::compare_lt: blockpy=1, clif=1
 snapshot_expr::compare_chain: blockpy=4, clif=4
 snapshot_expr::compare_not_in: blockpy=1, clif=1
-snapshot_expr::if_expr: blockpy=4, clif=4
+snapshot_expr::if_expr: blockpy=5, clif=5
 snapshot_expr::named_expr: blockpy=1, clif=1
 snapshot_expr::lambda_simple: blockpy=2, clif=2
 snapshot_expr::generator_expr: blockpy=7, clif=15
@@ -41,12 +41,12 @@ snapshot_stmt::assign_subscript: blockpy=1, clif=1
 snapshot_stmt::assign_tuple_unpack: blockpy=1, clif=1
 snapshot_stmt::assign_star_unpack: blockpy=1, clif=1
 snapshot_stmt::assign_multi_targets: blockpy=1, clif=1
-snapshot_stmt::ann_assign_simple: blockpy=6, clif=6
+snapshot_stmt::ann_assign_simple: blockpy=8, clif=8
 snapshot_stmt::ann_assign_attr: blockpy=1, clif=1
 snapshot_stmt::aug_assign_attr: blockpy=1, clif=1
 snapshot_stmt::delete_mixed: blockpy=1, clif=1
-snapshot_stmt::assert_no_msg: blockpy=4, clif=4
-snapshot_stmt::assert_with_msg: blockpy=4, clif=4
+snapshot_stmt::assert_no_msg: blockpy=7, clif=7
+snapshot_stmt::assert_with_msg: blockpy=7, clif=7
 snapshot_stmt::raise_from: blockpy=1, clif=1
 snapshot_stmt::try_except_typed: ERROR snapshot regeneration failed | panic: py_stmt template must produce exactly one statement, got 2
 snapshot_stmt::for_else: blockpy=5, clif=5
@@ -58,13 +58,13 @@ snapshot_stmt::comprehension_in_function: blockpy=9, clif=9
 snapshot_stmt::comprehension_in_class_body: blockpy=8, clif=8
 snapshot_stmt::with_multi: blockpy=28, clif=32
 snapshot_stmt::async_for: blockpy=6, clif=28
-snapshot_stmt::async_with: blockpy=17, clif=107
+snapshot_stmt::async_with: blockpy=20, clif=113
 snapshot_stmt::match_simple: blockpy=4, clif=4
 snapshot_stmt::generator_yield: blockpy=2, clif=9
 snapshot_stmt::yield_from: blockpy=2, clif=24
 snapshot_stmt::with_exit_suppresses_exception: blockpy=15, clif=16
 snapshot_stmt::closure_cell_simple: blockpy=3, clif=3
-snapshot_stmt::bb_if_else_function: blockpy=4, clif=4
+snapshot_stmt::bb_if_else_function: blockpy=5, clif=5
 snapshot_stmt::closure_cell_nonlocal: blockpy=3, clif=3
 snapshot_stmt::plain try / catch: blockpy=5, clif=5
 snapshot_stmt::complicated generator: blockpy=10, clif=20

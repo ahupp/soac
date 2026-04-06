@@ -24,24 +24,5 @@ if __debug__:
     }])
 }
 
-impl StmtLowerer for ast::StmtAssert {
-    fn simplify_ast(self, _context: &Context) -> Vec<Stmt> {
-        stmts_from_rewrite(rewrite_assert_stmt(self))
-    }
-
-    fn to_blockpy<E>(
-        &self,
-        context: &Context,
-        out: &mut BlockPyStmtBuilder<E>,
-        loop_ctx: Option<&LoopContext>,
-        next_label_id: &mut usize,
-    ) -> Result<(), String>
-    where
-        E: RuffToBlockPyExpr,
-    {
-        lower_stmt_via_simplify(context, self, out, loop_ctx, next_label_id)
-    }
-}
-
 #[cfg(test)]
 mod test;

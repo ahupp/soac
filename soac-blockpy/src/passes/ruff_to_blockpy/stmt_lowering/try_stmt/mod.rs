@@ -223,33 +223,49 @@ finally:
     )])
 }
 
-impl StmtLowerer for ast::StmtTry {
-    fn simplify_ast(self, _context: &Context) -> Vec<Stmt> {
-        stmts_from_rewrite(rewrite_try_stmt(self))
+pub(crate) fn rewrite_try_instr(stmt: crate::block_py::StmtTry<InstrRuff>) -> Vec<InstrRuff> {
+    let crate::block_py::StmtTry {
+        body,
+        handlers,
+        orelse,
+        finalbody,
+        is_star,
+        ..
+    } = stmt;
+    let rewritten = rewrite_try_stmt(ast::StmtTry {
+        range: Default::default(),
+        node_index: Default::default(),
+        body: body.into_iter().map(InstrRuff::into_ast_stmt).collect(),
+        handlers,
+        orelse: orelse.into_iter().map(InstrRuff::into_ast_stmt).collect(),
+        finalbody: finalbody.into_iter().map(InstrRuff::into_ast_stmt).collect(),
+        is_star,
+    });
+    match rewritten {
+        Rewrite::Unmodified(stmt) => vec![InstrRuff::from_ast_stmt(stmt)],
+        Rewrite::Walk(stmts) => stmts.into_iter().map(InstrRuff::from_ast_stmt).collect(),
     }
 }
 
 pub(crate) fn lower_star_try_stmt_sequence<F, E>(
     context: &Context,
-    try_stmt: ast::StmtTry,
-    remaining_stmts: &[Stmt],
+    name_gen: &FunctionNameGen,
+    try_stmt: crate::block_py::StmtTry<InstrRuff>,
+    remaining_stmts: &[InstrRuff],
     targets: RegionTargets,
-    linear: Vec<Stmt>,
+    linear: Vec<InstrRuff>,
     blocks: &mut Vec<LoweredBlockPyBlock<E>>,
     jump_label: Option<BlockLabel>,
     lower_sequence: &mut F,
 ) -> BlockLabel
 where
-    F: FnMut(&[Stmt], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
+    F: FnMut(&[InstrRuff], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
     E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
 {
-    let rewritten_try = match rewrite_try_stmt(try_stmt) {
-        Rewrite::Unmodified(stmt) => stmt_to_stmts(stmt),
-        Rewrite::Walk(stmts) => stmts,
-    };
     lower_expanded_stmt_sequence(
         context,
-        rewritten_try,
+        name_gen,
+        rewrite_try_instr(try_stmt),
         remaining_stmts,
         targets,
         linear,
@@ -260,10 +276,10 @@ where
 }
 
 pub(crate) fn lower_try_stmt_sequence<F, E>(
-    try_stmt: ast::StmtTry,
-    remaining_stmts: &[Stmt],
+    try_stmt: crate::block_py::StmtTry<InstrRuff>,
+    remaining_stmts: &[InstrRuff],
     targets: RegionTargets,
-    linear: Vec<Stmt>,
+    linear: Vec<InstrRuff>,
     blocks: &mut Vec<LoweredBlockPyBlock<E>>,
     name_gen: &FunctionNameGen,
     label: BlockLabel,
@@ -271,17 +287,31 @@ pub(crate) fn lower_try_stmt_sequence<F, E>(
     lower_sequence: &mut F,
 ) -> BlockLabel
 where
-    F: FnMut(&[Stmt], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
+    F: FnMut(&[InstrRuff], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
     E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
 {
     let rest_entry = lower_sequence(remaining_stmts, targets.clone(), blocks);
 
-    let else_body = try_stmt.orelse.to_vec();
-    let try_body = try_stmt.body.to_vec();
+    let else_body = try_stmt
+        .orelse
+        .into_iter()
+        .map(InstrRuff::into_ast_stmt)
+        .collect::<Vec<_>>();
+    let try_body = try_stmt
+        .body
+        .into_iter()
+        .map(InstrRuff::into_ast_stmt)
+        .collect::<Vec<_>>();
     let except_body =
         (!try_stmt.handlers.is_empty()).then(|| prepare_except_body(&try_stmt.handlers));
     let finally_body = if !try_stmt.finalbody.is_empty() {
-        Some(prepare_finally_body(&try_stmt.finalbody))
+        Some(prepare_finally_body(
+            &try_stmt
+                .finalbody
+                .into_iter()
+                .map(InstrRuff::into_ast_stmt)
+                .collect::<Vec<_>>(),
+        ))
     } else {
         None
     };
@@ -297,13 +327,17 @@ where
         except_body,
         targets.loop_labels.clone(),
         targets.active_exc.clone(),
-        lower_sequence,
+        &mut |stmts, nested_targets, blocks| {
+            let stmts = stmts.iter().cloned().map(InstrRuff::from_ast_stmt).collect::<Vec<_>>();
+            lower_sequence(&stmts, nested_targets, blocks)
+        },
     );
 
     finalize_try_regions(
         blocks,
+        name_gen,
         label,
-        linear,
+        linear.into_iter().map(InstrRuff::into_ast_stmt).collect(),
         try_plan,
         lowered_try,
         targets.active_exc,

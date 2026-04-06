@@ -8,8 +8,9 @@ use crate::block_py::{
     BlockLabel, BlockPyLiteral, BlockPyNameLike, BlockTerm, CallArgPositional, CallableScopeInfo,
     CallableScopeKind, CellBindingKind, ClosureInit, ClosureSlot, InstrUnresolved,
     InstrWithYield, FunctionId, FunctionName, HasMeta, Meta, StorageLayout,
-    StructuredInstr, TryMapTerm, UnaryOpKind, WithMeta, Yield,
+    TryMapTerm, UnaryOpKind, WithMeta, Yield,
 };
+use crate::passes::InstrRuff;
 use crate::passes::ast_to_ast::scope_helpers::is_internal_symbol;
 use crate::py_expr;
 use ruff_python_ast::{self as ast, Expr};
@@ -55,7 +56,7 @@ fn build_closure_backed_generator_factory_block(
     _layout: &StorageLayout,
     is_coroutine: bool,
     is_async_generator: bool,
-) -> Block<StructuredInstr<Expr>, Expr> {
+) -> Block<InstrRuff, InstrRuff> {
     let resume_entry = py_expr!(
         "__dp_make_function({function_id:literal}, \"function\", __dp_tuple(), __dp_tuple(), None)",
         function_id = resume_function_id.packed(),
@@ -85,7 +86,10 @@ fn build_closure_backed_generator_factory_block(
 
     Block::from_builder(
         BlockLabel::from_index(0),
-        BlockBuilder::with_term(Vec::new(), Some(BlockTerm::Return(return_value.into()))),
+        BlockBuilder::with_term(
+            Vec::new(),
+            Some(BlockTerm::Return(InstrRuff::from_ast_expr(return_value))),
+        ),
         Vec::new(),
         None,
         None,
@@ -102,7 +106,7 @@ fn name_expr(name: &str) -> ast::ExprName {
 fn core_load_with_yield(name: &str) -> InstrWithYield {
     let name = name_expr(name);
     let meta = name.meta();
-    crate::block_py::Load::new(name).with_meta(meta).into()
+    crate::block_py::Load::new(name.id).with_meta(meta).into()
 }
 
 #[test]

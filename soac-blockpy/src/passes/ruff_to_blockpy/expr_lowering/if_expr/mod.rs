@@ -1,57 +1,48 @@
 use super::{BlockPySetupExprLowerer, RuffToBlockPyExpr};
 use crate::block_py::{
-    BlockPyStmtBuilder, BlockTerm, Meta, Store, StructuredIf, StructuredInstr, TermIf, WithMeta,
+    BlockTerm, Meta, Store, TermIf, WithMeta,
 };
+use crate::passes::InstrRuff;
 use crate::passes::ruff_to_blockpy::expr_lowering::fresh_setup_name;
 use crate::passes::ruff_to_blockpy::{InlineFragment, LoweredExpr, LoopContext};
 use crate::py_expr;
-use ruff_python_ast::{self as ast, Expr};
+use ruff_python_ast::{self as ast};
 
-fn store_name(name: &str) -> ast::ExprName {
-    ast::ExprName {
-        id: name.into(),
-        ctx: ast::ExprContext::Store,
-        range: Default::default(),
-        node_index: ast::AtomicNodeIndex::default(),
-    }
+fn store_name(name: &str) -> ast::name::Name {
+    name.into()
 }
 
-fn load_name(name: &str) -> Expr {
-    py_expr!("{name:id}", name = name)
+fn load_name(name: &str) -> InstrRuff {
+    InstrRuff::from_ast_expr(py_expr!("{name:id}", name = name))
 }
 
-fn assign_name<E>(target: &str, value: Expr) -> StructuredInstr<E>
+fn assign_name<E>(target: &str, value: InstrRuff) -> E
 where
     E: RuffToBlockPyExpr,
 {
     let target = store_name(target);
-    let meta = Meta::new(target.node_index.clone(), target.range);
-    StructuredInstr::Expr(
-        Store::new(target, Box::new(E::from_lowered_expr(value)))
-            .with_meta(meta)
-            .into(),
-    )
+    let meta = Meta::synthetic();
+    Store::new(target, E::from_lowered_expr(value))
+        .with_meta(meta)
+        .into()
 }
 
 #[allow(dead_code)]
 pub(crate) fn try_lower_if_expr_direct<L, E>(
      lowerer: &L,
      name_gen: &crate::block_py::FunctionNameGen,
-     if_expr: ast::ExprIf,
+     if_expr: crate::block_py::ExprIf<InstrRuff>,
      loop_ctx: Option<&LoopContext>,
- ) -> Option<Result<LoweredExpr<E>, String>>
+ ) -> Option<Result<LoweredExpr<E, InstrRuff>, String>>
  where
      L: BlockPySetupExprLowerer + ?Sized,
      E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
  {
-     let ast::ExprIf {
-         test, body, orelse, ..
-     } = if_expr;
+     let crate::block_py::ExprIf { test, body, orelse, .. } = if_expr;
      let bridge = crate::passes::ruff_to_blockpy::stmt_lowering::StructuredLoweringBridge::new();
-     let Some(test_setup) = bridge.try_lower_inline_value::<E, Expr>(
-         |structured, scratch_next_label_id| {
-             lowerer.lower_expr_ast_into(*test.clone(), structured, loop_ctx, scratch_next_label_id)
-         },
+     let Some(test_setup) = bridge.try_lower_inline_value::<E, InstrRuff>(
+         name_gen,
+         |structured| lowerer.lower_expr_instr_into(*test.clone(), structured, loop_ctx),
      )
      else {
          return None;
@@ -62,14 +53,10 @@ pub(crate) fn try_lower_if_expr_direct<L, E>(
      };
  
      let target = fresh_setup_name("tmp");
-     let Some(body_setup) = bridge.try_lower_inline_value::<E, Expr>(
-         |structured, scratch_next_label_id| {
-             let body_value = lowerer.lower_expr_ast_into(
-                 *body.clone(),
-                 structured,
-                 loop_ctx,
-                 scratch_next_label_id,
-             )?;
+     let Some(body_setup) = bridge.try_lower_inline_value::<E, InstrRuff>(
+         name_gen,
+         |structured| {
+             let body_value = lowerer.lower_expr_instr_into(*body.clone(), structured, loop_ctx)?;
              structured.push_stmt(assign_name(&target, body_value.clone()));
              Ok(body_value)
          },
@@ -81,17 +68,13 @@ pub(crate) fn try_lower_if_expr_direct<L, E>(
         Ok(value) => value,
         Err(err) => return Some(Err(err)),
     };
-    let body_fragment =
-        InlineFragment::from_fallthrough_builder(name_gen.next_block_name(), body_entry, Vec::new());
+    let mut body_fragment = body_entry.finish_fallthrough();
  
-     let Some(orelse_setup) = bridge.try_lower_inline_value::<E, Expr>(
-         |structured, scratch_next_label_id| {
-             let orelse_value = lowerer.lower_expr_ast_into(
-                 *orelse.clone(),
-                 structured,
-                 loop_ctx,
-                 scratch_next_label_id,
-             )?;
+     let Some(orelse_setup) = bridge.try_lower_inline_value::<E, InstrRuff>(
+         name_gen,
+         |structured| {
+             let orelse_value =
+                 lowerer.lower_expr_instr_into(*orelse.clone(), structured, loop_ctx)?;
              structured.push_stmt(assign_name(&target, orelse_value.clone()));
              Ok(orelse_value)
          },
@@ -103,11 +86,7 @@ pub(crate) fn try_lower_if_expr_direct<L, E>(
         Ok(value) => value,
         Err(err) => return Some(Err(err)),
     };
-    let orelse_fragment = InlineFragment::from_fallthrough_builder(
-        name_gen.next_block_name(),
-        orelse_entry,
-        Vec::new(),
-    );
+    let mut orelse_fragment = orelse_entry.finish_fallthrough();
  
      let then_label = name_gen.next_block_name();
      let else_label = name_gen.next_block_name();
@@ -117,53 +96,40 @@ pub(crate) fn try_lower_if_expr_direct<L, E>(
          else_label,
      }));
  
-     let mut deps = Vec::new();
-     let mut body_entry_block = body_fragment.entry;
-     body_entry_block.label = then_label;
-     deps.push(body_entry_block);
-     deps.extend(body_fragment.deps);
-     let mut orelse_entry_block = orelse_fragment.entry;
-     orelse_entry_block.label = else_label;
-     deps.push(orelse_entry_block);
-     deps.extend(orelse_fragment.deps);
- 
-     Some(Ok(LoweredExpr {
-         setup: InlineFragment::from_closed_builder(name_gen.next_block_name(), entry, deps),
-         value: E::from_lowered_expr(load_name(&target)),
-     }))
+    body_fragment.relabel_entry(then_label);
+    orelse_fragment.relabel_entry(else_label);
+
+    let mut deps = Vec::new();
+    deps.push(body_fragment.entry);
+    deps.extend(body_fragment.deps);
+    deps.push(orelse_fragment.entry);
+    deps.extend(orelse_fragment.deps);
+
+    let mut setup = entry.finish_fallthrough();
+    setup.relabel_entry(name_gen.next_block_name());
+    setup.deps.extend(deps);
+
+    Some(Ok(LoweredExpr {
+        setup: InlineFragment::new(setup.entry, setup.deps),
+        value: load_name(&target),
+    }))
 }
 pub(super) fn lower_if_expr_into<L, E>(
     lowerer: &L,
-    if_expr: ast::ExprIf,
-    out: &mut BlockPyStmtBuilder<E>,
+    if_expr: crate::block_py::ExprIf<InstrRuff>,
+    out: &mut crate::passes::ruff_to_blockpy::stmt_lowering::BlockPyStmtBuilder<E>,
     loop_ctx: Option<&LoopContext>,
-    next_label_id: &mut usize,
-) -> Result<Expr, String>
+) -> Result<InstrRuff, String>
 where
     L: BlockPySetupExprLowerer + ?Sized,
-    E: RuffToBlockPyExpr,
+    E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
 {
-    let ast::ExprIf {
-        test, body, orelse, ..
-    } = if_expr;
-    let target = fresh_setup_name("tmp");
-    let test = lowerer.lower_expr_ast_into(*test, out, loop_ctx, next_label_id)?;
-
-    let mut body_out = BlockPyStmtBuilder::<E>::new();
-    let body_value = lowerer.lower_expr_ast_into(*body, &mut body_out, loop_ctx, next_label_id)?;
-    body_out.push_stmt(assign_name(&target, body_value));
-
-    let mut orelse_out = BlockPyStmtBuilder::<E>::new();
-    let orelse_value =
-        lowerer.lower_expr_ast_into(*orelse, &mut orelse_out, loop_ctx, next_label_id)?;
-    orelse_out.push_stmt(assign_name(&target, orelse_value));
-
-    out.push_stmt(StructuredInstr::If(StructuredIf {
-        test: E::from_lowered_expr(test),
-        body: body_out.finish(),
-        orelse: orelse_out.finish(),
-    }));
-    Ok(load_name(&target))
+    if let Some(lowered) = try_lower_if_expr_direct(lowerer, out.name_gen(), if_expr, loop_ctx) {
+        let lowered = lowered?;
+        out.append_fragment(lowered.setup);
+        return Ok(lowered.value);
+    }
+    Err("if expression lowering requires inline fragment lowering".to_string())
 }
 
 #[cfg(test)]

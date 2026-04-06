@@ -1,50 +1,27 @@
-use crate::block_py::cfg::linearize_structured_ifs;
 use crate::block_py::{
     BlockArg, BlockEdge, BlockPyNameLike, BlockTerm, ChildVisitable, InstrLow,
-    InstrWithAwaitAndYield, FunctionNameGen, Instr, Load, Meta, StructuredInstr,
-    UnresolvedName, WithMeta,
+    InstrWithAwaitAndYield, FunctionNameGen, Instr, Load, Meta, UnresolvedName, WithMeta,
 };
 use ruff_python_ast::{self as ast};
 use ruff_text_size::TextRange;
 use std::collections::{HashMap, HashSet};
 
 pub(crate) fn lower_structured_blocks_to_bb_blocks<E, N>(
-    name_gen: &FunctionNameGen,
-    blocks: &[crate::block_py::Block<StructuredInstr<E>, E>],
+    _name_gen: &FunctionNameGen,
+    blocks: &[crate::block_py::Block<E, E>],
 ) -> Vec<crate::block_py::Block<E, E>>
 where
     E: Clone + Instr<Name = N>,
     N: BlockPyNameLike,
 {
-    let exception_edges = lowered_exception_edges(blocks);
-    let (linear_blocks, _linear_block_params, linear_exception_edges) =
-        linearize_structured_ifs(name_gen, blocks, &HashMap::new(), &exception_edges);
-    let mut bb_blocks = linear_blocks
+    let mut bb_blocks = blocks
         .iter()
-        .map(|block| {
-            let exc_edge = linear_exception_edges
-                .get(&block.label)
-                .cloned()
-                .flatten()
-                .map(BlockEdge::new);
-            let ops = block
-                .body
-                .clone()
-                .into_iter()
-                .map(|stmt| match stmt {
-                    StructuredInstr::Expr(expr) => expr,
-                    StructuredInstr::If(_) => {
-                        unreachable!("structured ifs should be linearized before BB lowering")
-                    }
-                })
-                .collect::<Vec<_>>();
-            crate::block_py::Block {
-                label: block.label.clone(),
-                body: ops,
-                term: block.term.clone(),
-                params: block.bb_params().cloned().collect(),
-                exc_edge,
-            }
+        .map(|block| crate::block_py::Block {
+            label: block.label.clone(),
+            body: block.body.clone(),
+            term: block.term.clone(),
+            params: block.bb_params().cloned().collect(),
+            exc_edge: block.exc_edge.clone(),
         })
         .collect::<Vec<_>>();
     populate_exception_edge_args(&mut bb_blocks);

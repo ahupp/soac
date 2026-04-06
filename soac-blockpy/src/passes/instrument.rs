@@ -250,9 +250,10 @@ mod tests {
     use super::*;
     use crate::block_py::{
         BlockEdge, CalleeFunctionId, Call, CallArgPositional, CallDirect, CodegenBlockPyExpr,
-        FunctionId, HasMeta, InstrId, Load, ResolvedName, Meta, NameLocation, TermBranchTable,
-        WithMeta,
+        FunctionId, HasMeta, ImplicitNoneExpr, InstrId, Load, Meta, NameLocation,
+        ResolvedName, TermBranchTable, WithMeta,
     };
+    use crate::passes::InstrRuff;
     use crate::py_expr;
     use ruff_python_ast::name::Name;
 
@@ -472,7 +473,7 @@ mod tests {
     fn opt_block_accepts_fallthrough_fragment() {
         let entry = Block::new(
             BlockLabel::from_index(0),
-            vec![py_expr!("x")],
+            vec![InstrRuff::from_ast_expr(py_expr!("x"))],
             BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())),
             Vec::new(),
             None,
@@ -487,14 +488,14 @@ mod tests {
     fn opt_block_rejects_non_fallthrough_cycle() {
         let entry = Block::new(
             BlockLabel::from_index(0),
-            Vec::<ruff_python_ast::Expr>::new(),
+            Vec::<InstrRuff>::new(),
             BlockTerm::Jump(BlockEdge::new(BlockLabel::from_index(1))),
             Vec::new(),
             None,
         );
         let dep = Block::new(
             BlockLabel::from_index(1),
-            Vec::<ruff_python_ast::Expr>::new(),
+            Vec::<InstrRuff>::new(),
             BlockTerm::Jump(BlockEdge::new(BlockLabel::from_index(0))),
             Vec::new(),
             None,
@@ -509,8 +510,8 @@ mod tests {
     fn opt_block_rejects_return_exit() {
         let entry = Block::new(
             BlockLabel::from_index(0),
-            Vec::<ruff_python_ast::Expr>::new(),
-            BlockTerm::Return(py_expr!("None")),
+            Vec::<InstrRuff>::new(),
+            BlockTerm::Return(InstrRuff::implicit_none_expr()),
             Vec::new(),
             None,
         );

@@ -1522,6 +1522,40 @@ fn lower_resume_blocks(
     HashMap<BlockLabel, Option<BlockLabel>>,
     BlockLabel,
 ) {
+    let labels = callable
+        .blocks
+        .iter()
+        .map(|block| block.label)
+        .collect::<std::collections::HashSet<_>>();
+    for block in &callable.blocks {
+        let check = |target: BlockLabel, kind: &str| {
+            assert!(
+                target.is_fallthrough() || labels.contains(&target),
+                "dangling {} in resume source {} from {} to {}",
+                kind,
+                callable.names.qualname,
+                block.label,
+                target,
+            );
+        };
+        match &block.term {
+            BlockTerm::Jump(edge) => check(edge.target, "jump"),
+            BlockTerm::IfTerm(if_term) => {
+                check(if_term.then_label, "then");
+                check(if_term.else_label, "else");
+            }
+            BlockTerm::BranchTable(branch) => {
+                for target in &branch.targets {
+                    check(*target, "branch");
+                }
+                check(branch.default_label, "branch default");
+            }
+            BlockTerm::Raise(_) | BlockTerm::Return(_) => {}
+        }
+        if let Some(edge) = &block.exc_edge {
+            check(edge.target, "exception");
+        }
+    }
     let relabel = callable
         .blocks
         .iter()

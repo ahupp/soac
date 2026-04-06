@@ -1,19 +1,19 @@
 use super::*;
-use crate::passes::CoreBlockPyPass;
+use crate::passes::{CoreBlockPyPass, InstrRuff};
 use crate::py_expr;
 
 #[test]
 fn cfg_block_new_sets_explicit_term() {
     let block = Block::new(
         BlockLabel::from_index(0),
-        vec![StructuredInstr::Expr(py_expr!("x"))],
-        BlockTerm::<Expr>::Jump(crate::block_py::BlockEdge::new(BlockLabel::from_index(1))),
+        vec![InstrRuff::from_ast_expr(py_expr!("x"))],
+        BlockTerm::<InstrRuff>::Jump(crate::block_py::BlockEdge::new(BlockLabel::from_index(1))),
         Vec::new(),
         None,
     );
 
     assert_eq!(block.body.len(), 1);
-    assert!(matches!(block.body[0], StructuredInstr::Expr(_)));
+    assert!(matches!(block.body[0], InstrRuff::ExprName(_)));
     assert!(matches!(block.term, BlockTerm::Jump(_)));
 }
 
@@ -21,7 +21,7 @@ fn cfg_block_new_sets_explicit_term() {
 fn cfg_block_from_fragment_without_term_uses_implicit_none_return_value() {
     let block = Block::from_builder(
         BlockLabel::from_index(0),
-        BlockBuilder::from_stmts(vec![StructuredInstr::Expr(py_expr!("x"))]),
+        BlockBuilder::from_stmts(vec![InstrRuff::from_ast_expr(py_expr!("x"))]),
         Vec::new(),
         None,
         None,
@@ -30,7 +30,7 @@ fn cfg_block_from_fragment_without_term_uses_implicit_none_return_value() {
     assert_eq!(block.body.len(), 1);
     assert!(matches!(
         &block.term,
-        BlockTerm::Return(Expr::NoneLiteral(_))
+        BlockTerm::Return(InstrRuff::ExprNoneLiteral(_))
     ));
 }
 
@@ -45,8 +45,8 @@ fn block_label_fallthrough_is_distinct() {
 fn cfg_block_can_replace_fallthrough_target() {
     let mut block = Block::new(
         BlockLabel::from_index(0),
-        Vec::<Expr>::new(),
-        BlockTerm::<Expr>::Jump(crate::block_py::BlockEdge::new(BlockLabel::fallthrough())),
+        Vec::<InstrRuff>::new(),
+        BlockTerm::<InstrRuff>::Jump(crate::block_py::BlockEdge::new(BlockLabel::fallthrough())),
         Vec::new(),
         None,
     );
@@ -60,13 +60,13 @@ fn cfg_block_can_replace_fallthrough_target() {
 
 #[test]
 fn stmt_fragment_can_carry_optional_term() {
-    let fragment: BlockBuilder<StructuredInstr<Expr>, BlockTerm<Expr>> = BlockBuilder::with_term(
-        vec![StructuredInstr::Expr(py_expr!("x"))],
-        Some(BlockTerm::Return(py_expr!("None"))),
+    let fragment: BlockBuilder<InstrRuff, BlockTerm<InstrRuff>> = BlockBuilder::with_term(
+        vec![InstrRuff::from_ast_expr(py_expr!("x"))],
+        Some(BlockTerm::Return(InstrRuff::from_ast_expr(py_expr!("None")))),
     );
 
     assert_eq!(fragment.body.len(), 1);
-    assert!(matches!(fragment.body[0], StructuredInstr::Expr(_)));
+    assert!(matches!(fragment.body[0], InstrRuff::ExprName(_)));
     assert!(matches!(fragment.term, Some(BlockTerm::Return(_))));
 }
 

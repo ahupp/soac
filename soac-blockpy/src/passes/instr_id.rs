@@ -111,13 +111,9 @@ def g(v):
             walk_block(&mut collector, block);
         }
 
-        for block in &f.blocks {
-            let ids = collector
-                .ids_by_block
-                .get(&block.label)
-                .expect("every populated block should collect ids");
+        for (block_label, ids) in &collector.ids_by_block {
             let expected = (0..u32::try_from(ids.len()).unwrap())
-                .map(|instr_index_in_block| InstrId::new(block.label, instr_index_in_block))
+                .map(|instr_index_in_block| InstrId::new(*block_label, instr_index_in_block))
                 .collect::<Vec<_>>();
             assert_eq!(*ids, expected);
         }

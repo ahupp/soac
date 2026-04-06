@@ -6,7 +6,7 @@ use crate::block_py::{
 };
 use crate::passes::{CoreBlockPyPassWithAwaitAndYield, InstrRuff, ResolvedStorageBlockPyPass};
 use crate::{lower_python_to_blockpy_for_testing, LoweringResult};
-use ruff_python_ast::{self as ast, Expr};
+use ruff_python_ast::{self as ast, Expr, Stmt};
 
 fn tracked_core_blockpy_with_await_and_yield(
     source: &str,
@@ -173,6 +173,79 @@ fn instr_ruff_from_ast_expr_normalizes_call_args_and_keywords() {
     assert!(matches!(call.keywords[1], CallArgKeyword::Starred(_)));
 }
 
+#[test]
+fn instr_ruff_from_ast_stmt_recursively_lowers_assign_value() {
+    let instr = InstrRuff::from_ast_stmt(crate::py_stmt!("x = bare_yield"));
+
+    let InstrRuff::StmtAssign(assign) = instr else {
+        panic!("expected InstrRuff::StmtAssign");
+    };
+    assert_eq!(assign.targets.len(), 1);
+    assert!(matches!(assign.targets[0], InstrRuff::ExprName(_)));
+    assert!(matches!(assign.value.as_ref(), InstrRuff::ExprName(_)));
+}
+
+#[test]
+fn instr_ruff_from_ast_stmt_recursively_lowers_function_body_and_return() {
+    let instr = InstrRuff::from_ast_stmt(Stmt::FunctionDef(ast::StmtFunctionDef {
+        node_index: ast::AtomicNodeIndex::default(),
+        range: ruff_text_size::TextRange::default(),
+        is_async: false,
+        decorator_list: Vec::new(),
+        name: ast::Identifier::new("f", ruff_text_size::TextRange::default()),
+        type_params: None,
+        parameters: Box::new(ast::Parameters {
+            range: ruff_text_size::TextRange::default(),
+            node_index: ast::AtomicNodeIndex::default(),
+            posonlyargs: Vec::new(),
+            args: Vec::new(),
+            vararg: None,
+            kwonlyargs: Vec::new(),
+            kwarg: None,
+        }),
+        returns: None,
+        body: vec![crate::py_stmt!("return g(x)")],
+    }));
+
+    let InstrRuff::StmtFunctionDef(func) = instr else {
+        panic!("expected InstrRuff::StmtFunctionDef");
+    };
+    assert_eq!(func.body.len(), 1);
+    let InstrRuff::StmtReturn(ret) = &func.body[0] else {
+        panic!("expected function body return");
+    };
+    let value = &ret.value;
+    assert!(matches!(value.as_ref(), InstrRuff::Call(_)));
+}
+
+#[test]
+fn instr_ruff_from_ast_stmt_normalizes_bare_return_to_explicit_none() {
+    let instr = InstrRuff::from_ast_stmt(crate::py_stmt!("return"));
+
+    let InstrRuff::StmtReturn(ret) = instr else {
+        panic!("expected InstrRuff::StmtReturn");
+    };
+    let value = &ret.value;
+    assert!(matches!(value.as_ref(), InstrRuff::ExprNoneLiteral(_)));
+}
+
+#[test]
+fn instr_ruff_from_ast_stmt_recursively_lowers_loop_body_and_orelse() {
+    let instr = InstrRuff::from_ast_stmt(Stmt::While(ast::StmtWhile {
+        node_index: ast::AtomicNodeIndex::default(),
+        range: ruff_text_size::TextRange::default(),
+        test: Box::new(crate::py_expr!("cond")),
+        body: vec![crate::py_stmt!("x = 1")],
+        orelse: vec![crate::py_stmt!("y = 2")],
+    }));
+
+    let InstrRuff::StmtWhile(while_stmt) = instr else {
+        panic!("expected InstrRuff::StmtWhile");
+    };
+    assert!(matches!(while_stmt.test.as_ref(), InstrRuff::ExprName(_)));
+    assert!(matches!(&while_stmt.body[..], [InstrRuff::StmtAssign(_)]));
+    assert!(matches!(&while_stmt.orelse[..], [InstrRuff::StmtAssign(_)]));
+}
 fn function_uses_text(
     function: &BlockPyFunction<ResolvedStorageBlockPyPass>,
     needle: &str,

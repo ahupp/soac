@@ -13,7 +13,7 @@ fn test_name(id: &str) -> UnresolvedName {
     let ast::Expr::Name(expr) = crate::py_expr!("{id:id}", id = id) else {
         unreachable!();
     };
-    expr.into()
+    expr.id.into()
 }
 
 fn is_name_like(expr: &InstrWithYield) -> bool {

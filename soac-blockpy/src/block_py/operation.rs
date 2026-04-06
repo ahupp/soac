@@ -80,6 +80,25 @@ impl BinOpKind {
             ast::Operator::FloorDiv => Self::InplaceFloorDiv,
         }
     }
+
+    pub fn into_ast_operator(self) -> ast::Operator {
+        match self {
+            Self::Add | Self::InplaceAdd => ast::Operator::Add,
+            Self::Sub | Self::InplaceSub => ast::Operator::Sub,
+            Self::Mul | Self::InplaceMul => ast::Operator::Mult,
+            Self::MatMul | Self::InplaceMatMul => ast::Operator::MatMult,
+            Self::TrueDiv | Self::InplaceTrueDiv => ast::Operator::Div,
+            Self::FloorDiv | Self::InplaceFloorDiv => ast::Operator::FloorDiv,
+            Self::Mod | Self::InplaceMod => ast::Operator::Mod,
+            Self::Pow | Self::InplacePow => ast::Operator::Pow,
+            Self::LShift | Self::InplaceLShift => ast::Operator::LShift,
+            Self::RShift | Self::InplaceRShift => ast::Operator::RShift,
+            Self::Or | Self::InplaceOr => ast::Operator::BitOr,
+            Self::Xor | Self::InplaceXor => ast::Operator::BitXor,
+            Self::And | Self::InplaceAnd => ast::Operator::BitAnd,
+            other => panic!("comparison-only BinOpKind has no ast::Operator: {other:?}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
@@ -98,6 +117,15 @@ impl UnaryOpKind {
             ast::UnaryOp::Invert => Self::Invert,
             ast::UnaryOp::USub => Self::Neg,
             ast::UnaryOp::UAdd => Self::Pos,
+        }
+    }
+
+    pub fn into_ast_unary_op(self) -> ast::UnaryOp {
+        match self {
+            Self::Pos => ast::UnaryOp::UAdd,
+            Self::Neg => ast::UnaryOp::USub,
+            Self::Invert => ast::UnaryOp::Invert,
+            Self::Not | Self::Truth => ast::UnaryOp::Not,
         }
     }
 }
@@ -947,7 +975,7 @@ define_operation! {
 
 define_operation! {
     pub struct StmtReturn<E> {
-        value: Option<Box<E>>,
+        value: Box<E>,
     }
 }
 
@@ -1011,7 +1039,7 @@ define_operation! {
     pub struct StmtIf<E> {
         test: Box<E>,
         body: Vec<E>,
-        elif_else_clauses: Vec<ast::ElifElseClause>,
+        orelse: Vec<E>,
     }
 }
 

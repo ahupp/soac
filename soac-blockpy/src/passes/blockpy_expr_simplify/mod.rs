@@ -6,6 +6,7 @@ use crate::block_py::{
     CoreNumberLiteralValue, CoreStringLiteral, HasMeta, ImplicitNoneExpr, Meta, WithMeta, Yield,
     YieldFrom,
 };
+use crate::passes::InstrRuff;
 use crate::passes::ast_to_ast::expr_utils::make_tuple;
 use crate::py_expr;
 use ruff_python_ast::{self as ast, Expr};
@@ -460,6 +461,129 @@ fn reduce_core_tuple_splat(elts: Vec<Expr>) -> InstrWithAwaitAndYield {
 }
 
 impl InstrWithAwaitAndYield {
+    pub(crate) fn from_ruff_expr(value: InstrRuff) -> Self {
+        match value {
+            InstrRuff::Await(node) => {
+                let meta = node.meta();
+                Self::Await(
+                    Await::new(Self::from_ruff_expr(*node.value))
+                        .with_meta(Meta::new(meta.node_index, meta.range)),
+                )
+            }
+            InstrRuff::Yield(node) => {
+                let meta = node.meta();
+                Self::Yield(
+                    Yield::new(Self::from_ruff_expr(*node.value))
+                        .with_meta(Meta::new(meta.node_index, meta.range)),
+                )
+            }
+            InstrRuff::YieldFrom(node) => {
+                let meta = node.meta();
+                Self::YieldFrom(
+                    YieldFrom::new(Self::from_ruff_expr(*node.value))
+                        .with_meta(Meta::new(meta.node_index, meta.range)),
+                )
+            }
+            InstrRuff::ExprStringLiteral(node) => literal_expr(
+                CoreStringLiteral {
+                    value: node.value.to_str().to_string(),
+                },
+                Meta::new(node.meta().node_index, node.meta().range),
+            ),
+            InstrRuff::ExprBytesLiteral(node) => literal_expr(
+                CoreBytesLiteral {
+                    value: {
+                        let value: std::borrow::Cow<[u8]> = (&node.value).into();
+                        value.into_owned()
+                    },
+                },
+                Meta::new(node.meta().node_index, node.meta().range),
+            ),
+            InstrRuff::ExprNumberLiteral(node) => {
+                let meta = node.meta();
+                literal_expr(
+                    CoreNumberLiteral {
+                        value: match node.value {
+                            ast::Number::Int(value) => CoreNumberLiteralValue::Int(value),
+                            ast::Number::Float(value) => CoreNumberLiteralValue::Float(value),
+                            ast::Number::Complex { .. } => {
+                                panic!("complex literal reached late core BlockPy boundary")
+                            }
+                        },
+                    },
+                    Meta::new(meta.node_index, meta.range),
+                )
+            }
+            InstrRuff::ExprBooleanLiteral(node) => {
+                if node.value {
+                    core_builtin_name("TRUE")
+                } else {
+                    core_builtin_name("FALSE")
+                }
+            }
+            InstrRuff::ExprNoneLiteral(_) => core_builtin_name("NONE"),
+            InstrRuff::ExprEllipsisLiteral(_) => core_builtin_name("ELLIPSIS"),
+            InstrRuff::ExprAttribute(node) if matches!(node.ctx, ast::ExprContext::Load) => {
+                if matches!(
+                    node.value.as_ref(),
+                    InstrRuff::ExprName(base) if base.id.as_str() == "__soac__"
+                ) {
+                    return core_runtime_name_expr_with_meta(
+                        node.attr.id.as_str(),
+                        node.meta().node_index,
+                        node.meta().range,
+                    );
+                }
+                let node_index = node.meta().node_index;
+                let range = node.meta().range;
+                let value = Self::from_ruff_expr(*node.value);
+                getattr_expr_with_meta(node_index, range, value, node.attr.id.as_str().to_string())
+            }
+            InstrRuff::ExprSubscript(node) if matches!(node.ctx, ast::ExprContext::Load) => {
+                let node_index = node.meta().node_index;
+                let range = node.meta().range;
+                let value = Self::from_ruff_expr(*node.value);
+                let index = Self::from_ruff_expr(*node.slice);
+                getitem_expr_with_meta(node_index, range, value, index)
+            }
+            InstrRuff::UnaryOp(node) => {
+                let node_index = node.meta().node_index;
+                let range = node.meta().range;
+                let operand = Self::from_ruff_expr(*node.operand);
+                unary_op_expr_with_meta(node_index, range, node.kind, operand)
+            }
+            InstrRuff::BinOp(node) => {
+                let node_index = node.meta().node_index;
+                let range = node.meta().range;
+                let left = Self::from_ruff_expr(*node.left);
+                let right = Self::from_ruff_expr(*node.right);
+                binop_expr_with_meta(node_index, range, node.kind, left, right)
+            }
+            InstrRuff::ExprCompare(node) if node.ops.len() == 1 && node.comparators.len() == 1 => {
+                let node_index = node.meta().node_index;
+                let range = node.meta().range;
+                let left = Self::from_ruff_expr(*node.left);
+                let right = Self::from_ruff_expr(
+                    node.comparators
+                        .into_iter()
+                        .next()
+                        .expect("single compare comparator"),
+                );
+                let op = node.ops.into_iter().next().expect("single compare op");
+                compare_expr_from_ast_with_meta(node_index, range, op, left, right)
+            }
+            InstrRuff::ExprDict(node) => reduce_core_blockpy_dict(node.items.into()),
+            InstrRuff::ExprName(node) => {
+                let meta = node.meta();
+                InstrWithAwaitAndYield::Load(operation::Load::new(node.id).with_meta(meta))
+            }
+            InstrRuff::ExprIpyEscapeCommand(_) => {
+                panic!("IpyEscapeCommand should not reach late core BlockPy boundary")
+            }
+            other => Self::from_ast_expr(other.into_ast_expr()),
+        }
+    }
+
     pub(crate) fn from_ast_expr(value: Expr) -> Self {
         let mut value = value;
         lower_string_templates_in_expr(&mut value);
@@ -632,7 +756,7 @@ impl InstrWithAwaitAndYield {
             Expr::Dict(node) => reduce_core_blockpy_dict(node.items.into()),
             Expr::Name(node) => {
                 let meta = node.meta();
-                InstrWithAwaitAndYield::Load(operation::Load::new(node).with_meta(meta))
+                InstrWithAwaitAndYield::Load(operation::Load::new(node.id).with_meta(meta))
             }
             Expr::IpyEscapeCommand(_) => {
                 panic!("IpyEscapeCommand should not reach late core BlockPy boundary")

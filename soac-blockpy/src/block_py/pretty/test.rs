@@ -1,11 +1,11 @@
 use super::*;
-use crate::block_py::{BlockBuilder, BlockParam, BlockParamRole, StructuredInstr};
+use crate::block_py::{BlockParam, BlockParamRole};
 use crate::block_py::{
-    ClosureInit, ClosureSlot, InstrWithAwaitAndYield, Expr, ResolvedName, NameLocation,
+    ClosureInit, ClosureSlot, InstrWithAwaitAndYield, ResolvedName, NameLocation,
     StorageLayout,
 };
 use crate::lower_python_to_blockpy_for_testing;
-use crate::passes::{CoreBlockPyPassWithAwaitAndYield, ResolvedStorageBlockPyPass};
+use crate::passes::{CoreBlockPyPassWithAwaitAndYield, InstrRuff, ResolvedStorageBlockPyPass};
 use ruff_python_parser::parse_expression;
 
 fn wrapped_blockpy(source: &str) -> BlockPyModule<CoreBlockPyPassWithAwaitAndYield> {
@@ -17,12 +17,12 @@ fn wrapped_blockpy(source: &str) -> BlockPyModule<CoreBlockPyPassWithAwaitAndYie
         .clone()
 }
 
-fn parse_blockpy_expr(source: &str) -> Expr {
-    (*parse_expression(source).unwrap().into_syntax().body).into()
+fn parse_blockpy_expr(source: &str) -> InstrRuff {
+    InstrRuff::from_ast_expr((*parse_expression(source).unwrap().into_syntax().body).into())
 }
 
 fn parse_core_blockpy_expr(source: &str) -> InstrWithAwaitAndYield {
-    InstrWithAwaitAndYield::from_ast_expr(parse_blockpy_expr(source))
+    InstrWithAwaitAndYield::from_ruff_expr(parse_blockpy_expr(source))
 }
 
 fn empty_param_spec() -> ParamSpec {
@@ -429,30 +429,29 @@ fn sorts_rendered_root_and_child_blocks_by_label() {
 }
 
 #[test]
-fn collects_referenced_labels_from_nested_if_fragments_via_visitor() {
-    let referenced = collect_referenced_labels_from_structured_blocks(&[Block {
-        label: label(0),
-        body: vec![StructuredInstr::If(crate::block_py::StructuredIf {
-            test: parse_blockpy_expr("cond"),
-            body: BlockBuilder {
-                body: Vec::<StructuredInstr<Expr>>::new(),
-                term: Some(BlockTerm::Jump(BlockEdge::new(label(1)))),
-            },
-            orelse: BlockBuilder {
-                body: Vec::<StructuredInstr<Expr>>::new(),
-                term: Some(BlockTerm::BranchTable(super::super::TermBranchTable {
-                    index: parse_blockpy_expr("index"),
-                    targets: vec![label(2), label(3)],
-                    default_label: label(4),
-                })),
-            },
-        })],
-        term: BlockTerm::Jump(BlockEdge::new(label(5))),
-        params: Vec::new(),
-        exc_edge: Some(BlockEdge::new(label(6))),
-    }]);
+fn collects_referenced_labels_from_plain_blocks_via_term_and_exc_edges() {
+    let referenced = collect_referenced_labels_from_blocks::<CoreBlockPyPassWithAwaitAndYield>(&[
+        Block {
+            label: label(0),
+            body: vec![parse_core_blockpy_expr("x")],
+            term: BlockTerm::BranchTable(super::super::TermBranchTable {
+                index: parse_core_blockpy_expr("index"),
+                targets: vec![label(2), label(3)],
+                default_label: label(4),
+            }),
+            params: Vec::new(),
+            exc_edge: Some(BlockEdge::new(label(6))),
+        },
+        Block {
+            label: label(1),
+            body: Vec::new(),
+            term: BlockTerm::Jump(BlockEdge::new(label(5))),
+            params: Vec::new(),
+            exc_edge: None,
+        },
+    ]);
 
-    let expected = [label(1), label(2), label(3), label(4), label(5), label(6)]
+    let expected = [label(2), label(3), label(4), label(5), label(6)]
         .into_iter()
         .collect::<HashSet<_>>();
 

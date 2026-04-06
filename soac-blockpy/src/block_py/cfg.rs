@@ -1,15 +1,13 @@
 use super::{
-    instr_any, Block, BlockBuilder, BlockLabel, BlockParam, BlockPyFunction, BlockPyNameLike,
-    BlockPyPass, BlockTerm, ChildVisitable, Del, FunctionNameGen, HasMeta, ImplicitNoneExpr,
-    Instr, Load, MapInstr, MapTerm, Mappable, Store, StructuredInstr, TermIf, UnresolvedName,
+    instr_any, Block, BlockLabel, BlockPyFunction, BlockPyPass, BlockTerm, ChildVisitable, Del,
+    ImplicitNoneExpr, Instr, Load, MapInstr, MapTerm, Mappable, Meta, Store, UnresolvedName,
     WithMeta,
 };
 use crate::namegen::fresh_name;
-use crate::py_expr;
 use ruff_python_ast as ast;
 use std::collections::{HashMap, HashSet};
 
-fn blockpy_successors<E: Instr>(block: &Block<StructuredInstr<E>, E>) -> Vec<BlockLabel> {
+fn blockpy_successors<E: Instr>(block: &Block<E, E>) -> Vec<BlockLabel> {
     match &block.term {
         BlockTerm::Jump(target) => vec![target.target.clone()],
         BlockTerm::IfTerm(if_term) => {
@@ -24,200 +22,8 @@ fn blockpy_successors<E: Instr>(block: &Block<StructuredInstr<E>, E>) -> Vec<Blo
     }
 }
 
-fn params_for_linearized_names(
-    param_names: &[String],
-    declared_params: &[BlockParam],
-) -> Vec<BlockParam> {
-    declared_params
-        .iter()
-        .filter(|param| param_names.iter().any(|name| name == &param.name))
-        .cloned()
-        .collect()
-}
-
-fn linearize_blockpy_if_sequence<E>(
-    name_gen: &FunctionNameGen,
-    label: BlockLabel,
-    body: Vec<StructuredInstr<E>>,
-    final_term: BlockTerm<E>,
-    exc_edge: Option<super::BlockEdge>,
-    block_params: Vec<String>,
-    declared_params: Vec<BlockParam>,
-    exc_target: Option<BlockLabel>,
-    out_blocks: &mut Vec<Block<StructuredInstr<E>, E>>,
-    out_block_params: &mut HashMap<BlockLabel, Vec<String>>,
-    out_exception_edges: &mut HashMap<BlockLabel, Option<BlockLabel>>,
-) where
-    E: Clone + Instr,
-{
-    let Some(if_index) = body
-        .iter()
-        .position(|stmt| matches!(stmt, StructuredInstr::If(_)))
-    else {
-        out_block_params.insert(label.clone(), block_params.clone());
-        out_exception_edges.insert(label.clone(), exc_target);
-        out_blocks.push(Block {
-            label,
-            body,
-            term: final_term,
-            params: params_for_linearized_names(&block_params, &declared_params),
-            exc_edge,
-        });
-        return;
-    };
-
-    let mut body = body;
-    let rest = body.split_off(if_index + 1);
-    let if_stmt = match body.pop() {
-        Some(StructuredInstr::If(if_stmt)) => if_stmt,
-        _ => unreachable!("expected structured BlockPy if at split point"),
-    };
-    let then_label = name_gen.next_block_name();
-    let else_label = name_gen.next_block_name();
-    let join_label = if rest.is_empty() {
-        None
-    } else {
-        Some(name_gen.next_block_name())
-    };
-
-    out_block_params.insert(label.clone(), block_params.clone());
-    out_exception_edges.insert(label.clone(), exc_target.clone());
-    out_blocks.push(Block {
-        label: label.clone(),
-        body,
-        term: BlockTerm::IfTerm(TermIf {
-            test: if_stmt.test.clone(),
-            then_label: then_label.clone(),
-            else_label: else_label.clone(),
-        }),
-        params: params_for_linearized_names(
-            out_block_params.get(&label).unwrap(),
-            &declared_params,
-        ),
-        exc_edge: exc_edge.clone(),
-    });
-
-    let branch_fallthrough = join_label
-        .clone()
-        .map(|next_label| BlockTerm::Jump(super::BlockEdge::new(next_label)))
-        .unwrap_or_else(|| final_term.clone());
-    linearize_blockpy_fragment(
-        name_gen,
-        then_label,
-        if_stmt.body,
-        branch_fallthrough.clone(),
-        exc_edge.clone(),
-        block_params.clone(),
-        declared_params.clone(),
-        exc_target.clone(),
-        out_blocks,
-        out_block_params,
-        out_exception_edges,
-    );
-    linearize_blockpy_fragment(
-        name_gen,
-        else_label,
-        if_stmt.orelse,
-        branch_fallthrough,
-        exc_edge.clone(),
-        block_params.clone(),
-        declared_params.clone(),
-        exc_target.clone(),
-        out_blocks,
-        out_block_params,
-        out_exception_edges,
-    );
-
-    if let Some(join_label) = join_label {
-        linearize_blockpy_if_sequence(
-            name_gen,
-            join_label,
-            rest,
-            final_term,
-            exc_edge,
-            block_params,
-            declared_params,
-            exc_target,
-            out_blocks,
-            out_block_params,
-            out_exception_edges,
-        );
-    }
-}
-
-fn linearize_blockpy_fragment<E>(
-    name_gen: &FunctionNameGen,
-    label: BlockLabel,
-    fragment: BlockBuilder<StructuredInstr<E>, BlockTerm<E>>,
-    fallthrough_term: BlockTerm<E>,
-    exc_edge: Option<super::BlockEdge>,
-    block_params: Vec<String>,
-    declared_params: Vec<BlockParam>,
-    exc_target: Option<BlockLabel>,
-    out_blocks: &mut Vec<Block<StructuredInstr<E>, E>>,
-    out_block_params: &mut HashMap<BlockLabel, Vec<String>>,
-    out_exception_edges: &mut HashMap<BlockLabel, Option<BlockLabel>>,
-) where
-    E: Clone + Instr,
-{
-    linearize_blockpy_if_sequence(
-        name_gen,
-        label,
-        fragment.body,
-        fragment.term.unwrap_or(fallthrough_term),
-        exc_edge,
-        block_params,
-        declared_params,
-        exc_target,
-        out_blocks,
-        out_block_params,
-        out_exception_edges,
-    );
-}
-
-pub(crate) fn linearize_structured_ifs<E>(
-    name_gen: &FunctionNameGen,
-    blocks: &[Block<StructuredInstr<E>, E>],
-    block_params: &HashMap<BlockLabel, Vec<String>>,
-    exception_edges: &HashMap<BlockLabel, Option<BlockLabel>>,
-) -> (
-    Vec<Block<StructuredInstr<E>, E>>,
-    HashMap<BlockLabel, Vec<String>>,
-    HashMap<BlockLabel, Option<BlockLabel>>,
-)
-where
-    E: Clone + Instr,
-{
-    let mut out_blocks = Vec::new();
-    let mut out_block_params = HashMap::new();
-    let mut out_exception_edges = HashMap::new();
-    for block in blocks {
-        let mut params = block_params.get(&block.label).cloned().unwrap_or_default();
-        for name in block.bb_param_names() {
-            if !params.iter().any(|existing| existing == name) {
-                params.push(name.to_string());
-            }
-        }
-        let exc_target = exception_edges.get(&block.label).cloned().unwrap_or(None);
-        linearize_blockpy_if_sequence(
-            name_gen,
-            block.label.clone(),
-            block.body.clone(),
-            block.term.clone(),
-            block.exc_edge.clone(),
-            params,
-            block.params.clone(),
-            exc_target,
-            &mut out_blocks,
-            &mut out_block_params,
-            &mut out_exception_edges,
-        );
-    }
-    (out_blocks, out_block_params, out_exception_edges)
-}
-
 pub(crate) fn fold_jumps_to_trivial_none_return_blockpy<E>(
-    blocks: &mut [Block<StructuredInstr<E>, E>],
+    blocks: &mut [Block<E, E>],
 ) where
     E: Clone + ImplicitNoneExpr + Instr,
 {
@@ -249,7 +55,7 @@ pub(crate) fn fold_jumps_to_trivial_none_return_blockpy<E>(
 pub(crate) fn prune_unreachable_blockpy_blocks<E: Instr>(
     entry_label: BlockLabel,
     extra_roots: &[BlockLabel],
-    blocks: &mut Vec<Block<StructuredInstr<E>, E>>,
+    blocks: &mut Vec<Block<E, E>>,
 ) {
     let index_by_label: HashMap<BlockLabel, usize> = blocks
         .iter()
@@ -275,39 +81,31 @@ pub(crate) fn prune_unreachable_blockpy_blocks<E: Instr>(
     blocks.retain(|block| reachable.contains(&block.label));
 }
 
-fn fresh_eval_name() -> ast::ExprName {
-    let name = fresh_name("eval");
-    let ast::Expr::Name(expr) = py_expr!("{name:id}", name = name.as_str()) else {
-        unreachable!();
-    };
-    expr
+fn fresh_eval_name() -> ast::name::Name {
+    fresh_name("eval").into()
 }
 
-fn typed_store_expr<E, N>(target: N, value: E) -> E
+fn typed_store_expr<E>(target: ast::name::Name, meta: Meta, value: E) -> E
 where
     E: Instr + From<Store<E>>,
-    N: BlockPyNameLike + HasMeta + Into<<E as Instr>::Name>,
+    <E as Instr>::Name: From<ast::name::Name>,
 {
-    let meta = target.meta();
     Store::<E>::new(target, value).with_meta(meta).into()
 }
 
-fn typed_del_expr<E, N>(target: N) -> E
+fn typed_del_expr<E>(target: ast::name::Name, meta: Meta) -> E
 where
     E: Instr<Name = UnresolvedName> + From<Del<E>>,
-    N: HasMeta + Into<<E as Instr>::Name>,
 {
-    let meta = target.meta();
-    let target = target.into();
     Del::<E>::new(target, false).with_meta(meta).into()
 }
 
-fn append_stmt_cleanup<E>(out: &mut Vec<E>, cleanup: Vec<ast::ExprName>)
+fn append_stmt_cleanup<E>(out: &mut Vec<E>, cleanup: Vec<ast::name::Name>)
 where
     E: Instr<Name = UnresolvedName> + From<Del<E>>,
 {
     for temp in cleanup.into_iter().rev() {
-        out.push(typed_del_expr(temp));
+        out.push(typed_del_expr(temp, Meta::synthetic()));
     }
 }
 
@@ -322,7 +120,7 @@ where
 fn hoist_subexpression_if_matching<E, F>(
     expr: E,
     out: &mut Vec<E>,
-    cleanup: &mut Vec<ast::ExprName>,
+    cleanup: &mut Vec<ast::name::Name>,
     should_hoist: &mut F,
 ) -> E
 where
@@ -339,10 +137,9 @@ where
     });
     if should_hoist(&expr) {
         let target = fresh_eval_name();
-        out.push(typed_store_expr(target.clone(), expr));
+        out.push(typed_store_expr(target.clone(), Meta::synthetic(), expr));
         cleanup.push(target.clone());
-        let meta = target.meta();
-        Load::new(target).with_meta(meta).into()
+        Load::new(target).with_meta(Meta::synthetic()).into()
     } else {
         expr
     }
@@ -351,7 +148,7 @@ where
 fn rewrite_matching_children_in_expr<E, F>(
     expr: E,
     out: &mut Vec<E>,
-    cleanup: &mut Vec<ast::ExprName>,
+    cleanup: &mut Vec<ast::name::Name>,
     should_hoist: &mut F,
 ) -> E
 where
@@ -370,7 +167,7 @@ where
 
 struct HoistMatchingSubexpressionsInTerm<'a, 'b, E, F> {
     out: &'a mut Vec<E>,
-    cleanup: &'b mut Vec<ast::ExprName>,
+    cleanup: &'b mut Vec<ast::name::Name>,
     should_hoist: &'b mut F,
 }
 
@@ -501,10 +298,9 @@ impl<E: Instr> RelabelBlockTargets for BlockTerm<E> {
     fn relabel_targets(&mut self, relabel: &HashMap<BlockLabel, BlockLabel>) {
         match self {
             BlockTerm::Jump(edge) => {
-                edge.target = relabel
+                edge.target = *relabel
                     .get(&edge.target)
-                    .expect("dense relabel should cover every jump target")
-                    .clone();
+                    .expect("dense relabel should cover every jump target");
             }
             BlockTerm::IfTerm(if_term) => {
                 if_term.then_label = relabel

@@ -1,18 +1,18 @@
 use super::{
-    lower_structured_blocks_to_bb_blocks, rewrite_current_exception_in_expr,
-    rewrite_current_exception_in_term, CurrentExceptionExpr,
+    lower_structured_blocks_to_bb_blocks, rewrite_current_exception_in_core_blocks,
+    CurrentExceptionExpr,
 };
 use crate::block_py::{
-    Block, BlockLabel, BlockParam, BlockParamRole, BlockPyNameLike, BlockPyStmtBuilder, BlockTerm,
+    Block, BlockLabel, BlockParam, BlockParamRole, BlockPyNameLike, BlockTerm,
     CallArgPositional, ChildVisitable, InstrLow, InstrUnresolved, InstrResolved, ResolvedName, Meta,
-    ModuleNameGen, NameLocation, ResolvedStorageBlock, StructuredIf, StructuredInstr, TermIf,
+    ModuleNameGen, NameLocation, ResolvedStorageBlock, TermIf,
     WithMeta,
 };
 use ruff_python_ast::{self as ast};
 use ruff_text_size::TextRange;
 
 pub(crate) fn lower_structured_core_blocks_to_bb_blocks<N>(
-    blocks: &[Block<StructuredInstr<InstrLow<N>>, InstrLow<N>>],
+    blocks: &[Block<InstrLow<N>, InstrLow<N>>],
 ) -> Vec<Block<InstrLow<N>, InstrLow<N>>>
 where
     N: BlockPyNameLike,
@@ -31,7 +31,7 @@ where
 }
 
 pub(crate) fn lower_structured_unresolved_core_blocks_to_bb_blocks(
-    blocks: &[Block<StructuredInstr<InstrUnresolved>, InstrUnresolved>],
+    blocks: &[Block<InstrUnresolved, InstrUnresolved>],
 ) -> Vec<Block<InstrUnresolved, InstrUnresolved>> {
     let module_name_gen = ModuleNameGen::new(0);
     let name_gen = module_name_gen.next_function_name_gen();
@@ -43,12 +43,12 @@ pub(crate) fn lower_structured_unresolved_core_blocks_to_bb_blocks(
     {
         while name_gen.next_block_name().index() <= max_label {}
     }
-    rewrite_current_exception_in_core_blocks_structured(&mut normalized_blocks);
+    rewrite_current_exception_in_core_blocks(&mut normalized_blocks);
     lower_structured_blocks_to_bb_blocks(&name_gen, &normalized_blocks)
 }
 
 pub(crate) fn lower_structured_located_blocks_to_bb_blocks(
-    blocks: &[Block<StructuredInstr<InstrLow<ResolvedName>>, InstrResolved>],
+    blocks: &[Block<InstrLow<ResolvedName>, InstrResolved>],
 ) -> Vec<ResolvedStorageBlock> {
     let mut lowered = lower_structured_core_blocks_to_bb_blocks(blocks);
     rewrite_current_exception_in_located_core_blocks(&mut lowered);
@@ -123,46 +123,6 @@ fn current_exception_name_expr_located(exc_name: &str) -> InstrResolved {
     .into()
 }
 
-fn rewrite_current_exception_in_core_blocks_structured(
-    blocks: &mut [Block<StructuredInstr<InstrUnresolved>, InstrUnresolved>],
-) {
-    for block in blocks {
-        let Some(exc_name) = block.exception_param().map(ToString::to_string) else {
-            continue;
-        };
-        for stmt in &mut block.body {
-            rewrite_current_exception_in_blockpy_stmt(stmt, exc_name.as_str());
-        }
-        rewrite_current_exception_in_term(&mut block.term, exc_name.as_str());
-    }
-}
-
-fn rewrite_current_exception_in_blockpy_stmt(
-    stmt: &mut StructuredInstr<InstrUnresolved>,
-    exc_name: &str,
-) {
-    match stmt {
-        StructuredInstr::Expr(expr) => {
-            rewrite_current_exception_in_expr(expr, exc_name);
-        }
-        StructuredInstr::If(if_stmt) => {
-            rewrite_current_exception_in_expr(&mut if_stmt.test, exc_name);
-            for stmt in &mut if_stmt.body.body {
-                rewrite_current_exception_in_blockpy_stmt(stmt, exc_name);
-            }
-            if let Some(term) = if_stmt.body.term.as_mut() {
-                rewrite_current_exception_in_term(term, exc_name);
-            }
-            for stmt in &mut if_stmt.orelse.body {
-                rewrite_current_exception_in_blockpy_stmt(stmt, exc_name);
-            }
-            if let Some(term) = if_stmt.orelse.term.as_mut() {
-                rewrite_current_exception_in_term(term, exc_name);
-            }
-        }
-    }
-}
-
 fn expr_name(name: &str, ctx: ast::ExprContext) -> ast::ExprName {
     ast::ExprName {
         id: name.into(),
@@ -174,45 +134,57 @@ fn expr_name(name: &str, ctx: ast::ExprContext) -> ast::ExprName {
 
 fn core_name_expr(name: &str) -> InstrUnresolved {
     let name = expr_name(name, ast::ExprContext::Load);
-    crate::block_py::Load::new(name.clone())
+    crate::block_py::Load::new(name.id.clone())
         .with_meta(crate::block_py::Meta::synthetic())
         .into()
 }
 
 #[test]
 fn lower_structured_core_blocks_to_bb_blocks_handles_unlocated_names() {
-    let blocks = vec![Block {
-        label: BlockLabel::from_index(0),
-        body: vec![StructuredInstr::If(StructuredIf {
-            test: crate::block_py::core_call_expr_with_meta(
-                core_name_expr("current_exception"),
-                ast::AtomicNodeIndex::default(),
-                TextRange::default(),
-                Vec::<CallArgPositional<InstrUnresolved>>::new(),
-                Vec::new(),
-            ),
-            body: BlockPyStmtBuilder::from_stmts(vec![StructuredInstr::Expr(
-                crate::block_py::Store::new(
-                    expr_name("x", ast::ExprContext::Store),
-                    Box::new(core_name_expr("a")),
-                )
-                .into(),
-            )]),
-            orelse: BlockPyStmtBuilder::from_stmts(vec![StructuredInstr::Expr(
-                crate::block_py::Store::new(
-                    expr_name("x", ast::ExprContext::Store),
-                    Box::new(core_name_expr("b")),
-                )
-                .into(),
-            )]),
-        })],
-        term: BlockTerm::Return(core_name_expr("__dp_NONE")),
-        params: vec![BlockParam {
-            name: "_dp_try_exc_0".to_string(),
-            role: BlockParamRole::Exception,
-        }],
-        exc_edge: None,
-    }];
+    let blocks = vec![
+        Block {
+            label: BlockLabel::from_index(0),
+            body: Vec::new(),
+            term: BlockTerm::IfTerm(TermIf {
+                test: crate::block_py::core_call_expr_with_meta(
+                    core_name_expr("current_exception"),
+                    ast::AtomicNodeIndex::default(),
+                    TextRange::default(),
+                    Vec::<CallArgPositional<InstrUnresolved>>::new(),
+                    Vec::new(),
+                ),
+                then_label: BlockLabel::from_index(1),
+                else_label: BlockLabel::from_index(2),
+            }),
+            params: vec![BlockParam {
+                name: "_dp_try_exc_0".to_string(),
+                role: BlockParamRole::Exception,
+            }],
+            exc_edge: None,
+        },
+        Block {
+            label: BlockLabel::from_index(1),
+            body: vec![crate::block_py::Store::new(
+                expr_name("x", ast::ExprContext::Store).id,
+                core_name_expr("a"),
+            )
+            .into()],
+            term: BlockTerm::Return(core_name_expr("__dp_NONE")),
+            params: Vec::new(),
+            exc_edge: None,
+        },
+        Block {
+            label: BlockLabel::from_index(2),
+            body: vec![crate::block_py::Store::new(
+                expr_name("x", ast::ExprContext::Store).id,
+                core_name_expr("b"),
+            )
+            .into()],
+            term: BlockTerm::Return(core_name_expr("__dp_NONE")),
+            params: Vec::new(),
+            exc_edge: None,
+        },
+    ];
 
     let lowered = lower_structured_unresolved_core_blocks_to_bb_blocks(&blocks);
 

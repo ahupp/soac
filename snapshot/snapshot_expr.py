@@ -67,28 +67,30 @@ x = a and b or c
 # function _dp_module_init():
 #     function_id: 0:1
 #     block bb1:
-#         StoreName("_dp_target_2", a)
-#         if_term _dp_target_2:
-#             then:
-#                 block bb2:
-#                     StoreName("_dp_target_2", b)
-#                     jump bb4
-#             else:
-#                 block bb3:
-#                     jump bb4
-#         block bb4:
-#             StoreName("_dp_target_1", _dp_target_2)
-#             if_term UnaryOp(Not, _dp_target_1):
-#                 then:
-#                     block bb5:
-#                         StoreName("_dp_target_1", c)
+#         jump bb3
+#         block bb3:
+#             jump bb4
+#             block bb4:
+#                 StoreName("_dp_target_2", a)
+#                 if_term _dp_target_2:
+#                     then:
+#                         block bb5:
+#                             StoreName("_dp_target_2", b)
+#                             jump bb7
+#                     else:
 #                         jump bb7
-#                 else:
-#                     block bb6:
-#                         jump bb7
-#             block bb7:
-#                 StoreName("x", _dp_target_1)
-#                 return NONE
+#                 block bb7:
+#                     StoreName("_dp_target_1", _dp_target_2)
+#                     if_term UnaryOp(Not, _dp_target_1):
+#                         then:
+#                             block bb8:
+#                                 StoreName("_dp_target_1", c)
+#                                 jump bb10
+#                         else:
+#                             jump bb10
+#                     block bb10:
+#                         StoreName("x", _dp_target_1)
+#                         return NONE
 
 # compare_lt
 
@@ -111,20 +113,21 @@ x = a < b < c
 # function _dp_module_init():
 #     function_id: 0:1
 #     block bb1:
-#         StoreName("_dp_compare_1", a)
-#         StoreName("_dp_compare_3", b)
-#         StoreName("_dp_target_2", BinOp(Lt, _dp_compare_1, _dp_compare_3))
-#         if_term _dp_target_2:
-#             then:
-#                 block bb2:
-#                     StoreName("_dp_target_2", BinOp(Lt, _dp_compare_3, c))
-#                     jump bb4
-#             else:
-#                 block bb3:
-#                     jump bb4
-#         block bb4:
-#             StoreName("x", _dp_target_2)
-#             return NONE
+#         jump bb3
+#         block bb3:
+#             StoreName("_dp_compare_1", a)
+#             StoreName("_dp_compare_3", b)
+#             StoreName("_dp_target_2", BinOp(Lt, _dp_compare_1, _dp_compare_3))
+#             if_term _dp_target_2:
+#                 then:
+#                     block bb4:
+#                         StoreName("_dp_target_2", BinOp(Lt, _dp_compare_3, c))
+#                         jump bb6
+#                 else:
+#                     jump bb6
+#             block bb6:
+#                 StoreName("x", _dp_target_2)
+#                 return NONE
 
 # compare_not_in
 
@@ -147,18 +150,20 @@ x = a if cond else b
 # function _dp_module_init():
 #     function_id: 0:1
 #     block bb1:
-#         if_term cond:
-#             then:
-#                 block bb2:
-#                     StoreName("_dp_tmp_1", a)
-#                     jump bb4
-#             else:
-#                 block bb3:
-#                     StoreName("_dp_tmp_1", b)
-#                     jump bb4
-#         block bb4:
-#             StoreName("x", _dp_tmp_1)
-#             return NONE
+#         jump bb8
+#         block bb8:
+#             if_term cond:
+#                 then:
+#                     block bb6:
+#                         StoreName("_dp_tmp_1", a)
+#                         jump bb9
+#                 else:
+#                     block bb7:
+#                         StoreName("_dp_tmp_1", b)
+#                         jump bb9
+#             block bb9:
+#                 StoreName("x", _dp_tmp_1)
+#                 return NONE
 
 # named_expr
 
@@ -210,10 +215,10 @@ x = (i for i in it)
 #                         StoreName("_dp_tmp_4", next_or_sentinel(_dp_iter_3))
 #                         if_term BinOp(Is, _dp_tmp_4, ITER_COMPLETE):
 #                             then:
-#                                 block bb5:
+#                                 block bb6:
 #                                     return NONE
 #                             else:
-#                                 block bb6:
+#                                 block bb8:
 #                                     StoreName("i", _dp_tmp_4)
 #                                     yield i
 #                                     jump bb1
@@ -324,8 +329,8 @@ x = [i for i in it]
 #                         StoreName("_dp_tmp_0_1_1", _dp_tmp_0_1_1)
 #                         StoreName("i", _dp_tmp_0_1_1)
 #                         Del { name: "_dp_tmp_0_1_1", quietly: false }
-#                         jump bb5
-#                         block bb5:
+#                         jump bb6
+#                         block bb6:
 #                             GetAttr(_dp_tmp_1, "append")(i)
 #                             jump bb1
 
@@ -360,8 +365,8 @@ x = {i for i in it}
 #                         StoreName("_dp_tmp_0_1_1", _dp_tmp_0_1_1)
 #                         StoreName("i", _dp_tmp_0_1_1)
 #                         Del { name: "_dp_tmp_0_1_1", quietly: false }
-#                         jump bb5
-#                         block bb5:
+#                         jump bb6
+#                         block bb6:
 #                             GetAttr(_dp_tmp_1, "add")(i)
 #                             jump bb1
 
@@ -394,13 +399,14 @@ x = {k: v for k, v in it}
 #                 else:
 #                     block bb2:
 #                         StoreName("_dp_tmp_0_1_1", _dp_tmp_0_1_1)
-#                         StoreName("_dp_tmp_0_1_2", unpack(_dp_tmp_0_1_1, tuple_values(TRUE, TRUE)))
-#                         StoreName("k", GetItem(_dp_tmp_0_1_2, 0))
-#                         StoreName("v", GetItem(_dp_tmp_0_1_2, 1))
-#                         Del { name: "_dp_tmp_0_1_2", quietly: false }
+#                         StoreName("_dp_assign_value_9", _dp_tmp_0_1_1)
+#                         StoreName("_dp_unpack_10", unpack(_dp_assign_value_9, tuple_values(TRUE, TRUE)))
+#                         StoreName("k", GetItem(_dp_unpack_10, 0))
+#                         StoreName("v", GetItem(_dp_unpack_10, 1))
+#                         Del { name: "_dp_unpack_10", quietly: false }
 #                         Del { name: "_dp_tmp_0_1_1", quietly: false }
-#                         jump bb5
-#                         block bb5:
+#                         jump bb6
+#                         block bb6:
 #                             StoreName("_dp_dictcomp_key_2", k)
 #                             StoreName("_dp_dictcomp_value_3", v)
 #                             StoreName("_dp_assign_value_6", _dp_dictcomp_value_3)
