@@ -59,3 +59,18 @@ def test_normalize_weights_keeps_small_profiles_unchanged():
     weights = [17, 5, 9]
 
     assert module.normalize_weights(weights, target_total_weight=100) == weights
+
+
+def test_sampled_profile_output_sets_required_bounds():
+    module = load_module()
+
+    frames = [{"name": "python"}, {"name": "py:d:Proc0"}]
+    samples = [[0, 1], [0]]
+    weights = [17, 5]
+
+    output = module.build_sampled_profile_output("test-profile", frames, samples, weights)
+    profile = output["profiles"][0]
+
+    assert profile["startValue"] == 0
+    assert profile["endValue"] == 22
+    assert profile["weights"] == weights

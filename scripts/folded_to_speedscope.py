@@ -54,11 +54,14 @@ def normalize_weights(weights: list[int], *, target_total_weight: int = TARGET_T
     return normalized
 
 
-def main() -> int:
-    profile_name = sys.argv[1] if len(sys.argv) > 1 else "perf"
-    frames, samples, weights = parse_folded_stacks(sys.stdin.readlines())
-    weights = normalize_weights(weights)
-    output = {
+def build_sampled_profile_output(
+    profile_name: str,
+    frames: list[dict[str, str]],
+    samples: list[list[int]],
+    weights: list[int],
+) -> dict[str, object]:
+    total_weight = sum(weights)
+    return {
         "$schema": "https://www.speedscope.app/file-format-schema.json",
         "shared": {"frames": frames},
         "profiles": [
@@ -66,6 +69,8 @@ def main() -> int:
                 "type": "sampled",
                 "name": profile_name,
                 "unit": "samples",
+                "startValue": 0,
+                "endValue": total_weight,
                 "samples": samples,
                 "weights": weights,
             }
@@ -74,6 +79,13 @@ def main() -> int:
         "name": profile_name,
         "activeProfileIndex": 0,
     }
+
+
+def main() -> int:
+    profile_name = sys.argv[1] if len(sys.argv) > 1 else "perf"
+    frames, samples, weights = parse_folded_stacks(sys.stdin.readlines())
+    weights = normalize_weights(weights)
+    output = build_sampled_profile_output(profile_name, frames, samples, weights)
     json.dump(output, sys.stdout)
     sys.stdout.write("\n")
     return 0
