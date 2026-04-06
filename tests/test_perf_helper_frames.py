@@ -27,8 +27,12 @@ def _symbol_body(symbol: str) -> str:
     return "\n".join(body)
 
 
-def test_dp_jit_py_vectorcall_keeps_helper_frame():
+def test_default_dp_jit_py_vectorcall_stays_tail_call_fast_path():
     body = _symbol_body("soac_jit::jit::specialized_helpers::dp_jit_py_vectorcall")
+    assert "jmp" in body
+
+
+def test_dp_jit_py_vectorcall_with_frame_keeps_helper_frame():
+    body = _symbol_body("soac_jit::jit::specialized_helpers::dp_jit_py_vectorcall_with_frame")
     assert "call" in body
     assert "jmp" not in body
-

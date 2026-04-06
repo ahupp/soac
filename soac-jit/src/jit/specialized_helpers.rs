@@ -937,6 +937,26 @@ mod test_only_export_stubs {
         };
     }
 
+    macro_rules! panic_dual_obj_export {
+        (
+            $fast:ident,
+            $with_frame:ident($($arg:ident : $ty:ty),* $(,)?)
+        ) => {
+            panic_obj_export!($fast($($arg : $ty),*));
+            panic_obj_export!($with_frame($($arg : $ty),*));
+        };
+    }
+
+    macro_rules! panic_dual_i32_export {
+        (
+            $fast:ident,
+            $with_frame:ident($($arg:ident : $ty:ty),* $(,)?)
+        ) => {
+            panic_i32_export!($fast($($arg : $ty),*));
+            panic_i32_export!($with_frame($($arg : $ty),*));
+        };
+    }
+
     macro_rules! panic_i64_export {
         ($name:ident($($arg:ident : $ty:ty),* $(,)?)) => {
             pub unsafe extern "C" fn $name($($arg: $ty),*) -> i64 {
@@ -955,30 +975,42 @@ mod test_only_export_stubs {
         };
     }
 
-    panic_i32_export!(dp_jit_raise_from_exc(exc: ObjPtr));
-    panic_obj_export!(dp_jit_py_call_positional_three(
+    panic_dual_i32_export!(dp_jit_raise_from_exc, dp_jit_raise_from_exc_with_frame(
+        exc: ObjPtr
+    ));
+    panic_dual_obj_export!(dp_jit_py_call_positional_three, dp_jit_py_call_positional_three_with_frame(
         callable: ObjPtr,
         arg1: ObjPtr,
         arg2: ObjPtr,
         arg3: ObjPtr,
         sentinel: ObjPtr,
     ));
-    panic_obj_export!(dp_jit_py_call_object(callable: ObjPtr, args: ObjPtr));
-    panic_obj_export!(dp_jit_py_vectorcall(
+    panic_dual_obj_export!(dp_jit_py_call_object, dp_jit_py_call_object_with_frame(
+        callable: ObjPtr,
+        args: ObjPtr
+    ));
+    panic_dual_obj_export!(dp_jit_py_vectorcall, dp_jit_py_vectorcall_with_frame(
         callable: ObjPtr,
         args: ObjPtr,
         nargsf: ObjPtr,
         kwnames: ObjPtr
     ));
-    panic_obj_export!(dp_jit_py_call_with_kw(callable: ObjPtr, args: ObjPtr, kw: ObjPtr));
-    panic_i32_export!(dp_jit_guard_method_type_version(
+    panic_dual_obj_export!(dp_jit_py_call_with_kw, dp_jit_py_call_with_kw_with_frame(
+        callable: ObjPtr,
+        args: ObjPtr,
+        kw: ObjPtr
+    ));
+    panic_dual_i32_export!(dp_jit_guard_method_type_version, dp_jit_guard_method_type_version_with_frame(
         receiver: ObjPtr,
         expected_type: ObjPtr,
         expected_version: i64
     ));
     panic_unit_export!(dp_jit_record_counter_value(vmctx: ObjPtr, counter_id: i64, value: i64));
-    panic_obj_export!(dp_jit_get_raised_exception());
-    panic_obj_export!(dp_jit_get_arg_item(args: ObjPtr, index: i64));
+    panic_dual_obj_export!(dp_jit_get_raised_exception, dp_jit_get_raised_exception_with_frame());
+    panic_dual_obj_export!(dp_jit_get_arg_item, dp_jit_get_arg_item_with_frame(
+        args: ObjPtr,
+        index: i64
+    ));
     panic_obj_export!(dp_jit_load_runtime_obj(name: ObjPtr));
     panic_obj_export!(dp_jit_function_closure_cell(callable: ObjPtr, slot: i64));
     panic_obj_export!(dp_jit_function_positional_default_obj(
@@ -1026,9 +1058,9 @@ mod test_only_export_stubs {
 #[cfg(test)]
 pub use test_only_export_stubs::*;
 
-#[cfg(not(test))]
 // Keep thin exported helpers as real call/return wrappers so perf can attribute
 // time to them instead of tail-collapsing directly into the C API callee.
+#[cfg(not(test))]
 macro_rules! preserve_helper_frame {
     ($expr:expr) => {{
         let result = $expr;
@@ -1038,57 +1070,78 @@ macro_rules! preserve_helper_frame {
 }
 
 #[cfg(not(test))]
-pub unsafe extern "C" fn dp_jit_raise_from_exc(exc: ObjPtr) -> i32 {
-    preserve_helper_frame!(raise_from_exc_hook(exc))
+macro_rules! define_perf_toggle_export {
+    (
+        $ret:ty,
+        $fast:ident,
+        $with_frame:ident($($arg:ident : $ty:ty),* $(,)?) => $body:expr
+    ) => {
+        pub unsafe extern "C" fn $fast($($arg: $ty),*) -> $ret {
+            $body
+        }
+
+        pub unsafe extern "C" fn $with_frame($($arg: $ty),*) -> $ret {
+            preserve_helper_frame!($body)
+        }
+    };
 }
 
 #[cfg(not(test))]
-pub unsafe extern "C" fn dp_jit_py_call_positional_three(
-    callable: ObjPtr,
-    arg1: ObjPtr,
-    arg2: ObjPtr,
-    arg3: ObjPtr,
-    _sentinel: ObjPtr,
-) -> ObjPtr {
-    preserve_helper_frame!(py_call_positional_three_hook(callable, arg1, arg2, arg3))
-}
+define_perf_toggle_export!(
+    i32,
+    dp_jit_raise_from_exc,
+    dp_jit_raise_from_exc_with_frame(exc: ObjPtr) => raise_from_exc_hook(exc)
+);
 
 #[cfg(not(test))]
-pub unsafe extern "C" fn dp_jit_py_call_object(callable: ObjPtr, args: ObjPtr) -> ObjPtr {
-    preserve_helper_frame!(py_call_object_hook(callable, args))
-}
+define_perf_toggle_export!(
+    ObjPtr,
+    dp_jit_py_call_positional_three,
+    dp_jit_py_call_positional_three_with_frame(
+        callable: ObjPtr,
+        arg1: ObjPtr,
+        arg2: ObjPtr,
+        arg3: ObjPtr,
+        _sentinel: ObjPtr
+    ) => py_call_positional_three_hook(callable, arg1, arg2, arg3)
+);
 
 #[cfg(not(test))]
-pub unsafe extern "C" fn dp_jit_py_vectorcall(
-    callable: ObjPtr,
-    args: ObjPtr,
-    nargsf: ObjPtr,
-    kwnames: ObjPtr,
-) -> ObjPtr {
-    preserve_helper_frame!(py_vectorcall_hook(callable, args, nargsf, kwnames))
-}
+define_perf_toggle_export!(
+    ObjPtr,
+    dp_jit_py_call_object,
+    dp_jit_py_call_object_with_frame(callable: ObjPtr, args: ObjPtr) => py_call_object_hook(callable, args)
+);
 
 #[cfg(not(test))]
-pub unsafe extern "C" fn dp_jit_py_call_with_kw(
-    callable: ObjPtr,
-    args: ObjPtr,
-    kw: ObjPtr,
-) -> ObjPtr {
-    preserve_helper_frame!(py_call_with_kw_hook(callable, args, kw))
-}
+define_perf_toggle_export!(
+    ObjPtr,
+    dp_jit_py_vectorcall,
+    dp_jit_py_vectorcall_with_frame(
+        callable: ObjPtr,
+        args: ObjPtr,
+        nargsf: ObjPtr,
+        kwnames: ObjPtr
+    ) => py_vectorcall_hook(callable, args, nargsf, kwnames)
+);
 
 #[cfg(not(test))]
-pub unsafe extern "C" fn dp_jit_guard_method_type_version(
-    receiver: ObjPtr,
-    expected_type: ObjPtr,
-    expected_version: i64,
-) -> i32 {
-    preserve_helper_frame!(guard_method_type_version_hook(
-        receiver,
-        expected_type,
-        expected_version
-    ))
-}
+define_perf_toggle_export!(
+    ObjPtr,
+    dp_jit_py_call_with_kw,
+    dp_jit_py_call_with_kw_with_frame(callable: ObjPtr, args: ObjPtr, kw: ObjPtr) => py_call_with_kw_hook(callable, args, kw)
+);
+
+#[cfg(not(test))]
+define_perf_toggle_export!(
+    i32,
+    dp_jit_guard_method_type_version,
+    dp_jit_guard_method_type_version_with_frame(
+        receiver: ObjPtr,
+        expected_type: ObjPtr,
+        expected_version: i64
+    ) => guard_method_type_version_hook(receiver, expected_type, expected_version)
+);
 
 #[cfg(not(test))]
 pub unsafe extern "C" fn dp_jit_record_counter_value(vmctx: ObjPtr, counter_id: i64, value: i64) {
@@ -1096,14 +1149,18 @@ pub unsafe extern "C" fn dp_jit_record_counter_value(vmctx: ObjPtr, counter_id: 
 }
 
 #[cfg(not(test))]
-pub unsafe extern "C" fn dp_jit_get_raised_exception() -> ObjPtr {
-    preserve_helper_frame!(py_get_raised_exception_hook())
-}
+define_perf_toggle_export!(
+    ObjPtr,
+    dp_jit_get_raised_exception,
+    dp_jit_get_raised_exception_with_frame() => py_get_raised_exception_hook()
+);
 
 #[cfg(not(test))]
-pub unsafe extern "C" fn dp_jit_get_arg_item(args: ObjPtr, index: i64) -> ObjPtr {
-    preserve_helper_frame!(get_arg_item_hook(args, index))
-}
+define_perf_toggle_export!(
+    ObjPtr,
+    dp_jit_get_arg_item,
+    dp_jit_get_arg_item_with_frame(args: ObjPtr, index: i64) => get_arg_item_hook(args, index)
+);
 
 #[cfg(not(test))]
 #[unsafe(no_mangle)]
@@ -1638,15 +1695,49 @@ define_unary_obj_wrapper!(pynumber_positive_wrapper, "PyNumber_Positive");
 define_unary_obj_wrapper!(pynumber_negative_wrapper, "PyNumber_Negative");
 define_unary_obj_wrapper!(pynumber_invert_wrapper, "PyNumber_Invert");
 
+#[cfg(not(test))]
+fn should_preserve_perf_helper_frames() -> bool {
+    std::env::var_os("SOAC_JIT_PERF_HELPER_FRAMES").is_some()
+}
+
+#[cfg(test)]
+fn chosen_helper_symbol(fast: *const u8, _with_frame: *const u8) -> *const u8 {
+    fast
+}
+
+#[cfg(not(test))]
+fn chosen_helper_symbol(fast: *const u8, with_frame: *const u8) -> *const u8 {
+    if should_preserve_perf_helper_frames() {
+        with_frame
+    } else {
+        fast
+    }
+}
+
 pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol("PyFunction_Type", std::ptr::addr_of_mut!(PyFunction_Type) as *const u8);
     builder.symbol("PyMethod_Type", std::ptr::addr_of_mut!(PyMethod_Type) as *const u8);
     builder.symbol(
         "dp_jit_py_call_positional_three",
-        dp_jit_py_call_positional_three as *const u8,
+        chosen_helper_symbol(
+            dp_jit_py_call_positional_three as *const u8,
+            dp_jit_py_call_positional_three_with_frame as *const u8,
+        ),
     );
-    builder.symbol("dp_jit_py_call_object", dp_jit_py_call_object as *const u8);
-    builder.symbol("dp_jit_py_vectorcall", dp_jit_py_vectorcall as *const u8);
+    builder.symbol(
+        "dp_jit_py_call_object",
+        chosen_helper_symbol(
+            dp_jit_py_call_object as *const u8,
+            dp_jit_py_call_object_with_frame as *const u8,
+        ),
+    );
+    builder.symbol(
+        "dp_jit_py_vectorcall",
+        chosen_helper_symbol(
+            dp_jit_py_vectorcall as *const u8,
+            dp_jit_py_vectorcall_with_frame as *const u8,
+        ),
+    );
     builder.symbol(
         "dp_jit_pytype_generic_alloc",
         pytype_generic_alloc_hook as *const u8,
@@ -1657,13 +1748,25 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
     );
     builder.symbol(
         "dp_jit_py_call_with_kw",
-        dp_jit_py_call_with_kw as *const u8,
+        chosen_helper_symbol(
+            dp_jit_py_call_with_kw as *const u8,
+            dp_jit_py_call_with_kw_with_frame as *const u8,
+        ),
     );
     builder.symbol(
         "dp_jit_get_raised_exception",
-        dp_jit_get_raised_exception as *const u8,
+        chosen_helper_symbol(
+            dp_jit_get_raised_exception as *const u8,
+            dp_jit_get_raised_exception_with_frame as *const u8,
+        ),
     );
-    builder.symbol("dp_jit_get_arg_item", dp_jit_get_arg_item as *const u8);
+    builder.symbol(
+        "dp_jit_get_arg_item",
+        chosen_helper_symbol(
+            dp_jit_get_arg_item as *const u8,
+            dp_jit_get_arg_item_with_frame as *const u8,
+        ),
+    );
     builder.symbol(
         "dp_jit_load_runtime_obj",
         dp_jit_load_runtime_obj as *const u8,
@@ -1717,7 +1820,10 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
     );
     builder.symbol(
         "dp_jit_guard_method_type_version",
-        dp_jit_guard_method_type_version as *const u8,
+        chosen_helper_symbol(
+            dp_jit_guard_method_type_version as *const u8,
+            dp_jit_guard_method_type_version_with_frame as *const u8,
+        ),
     );
     builder.symbol(
         "dp_jit_record_counter_value",
@@ -1738,7 +1844,13 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol("dp_jit_tuple_new", dp_jit_tuple_new as *const u8);
     builder.symbol("dp_jit_tuple_set_item", dp_jit_tuple_set_item as *const u8);
     builder.symbol("dp_jit_is_true", dp_jit_is_true as *const u8);
-    builder.symbol("dp_jit_raise_from_exc", dp_jit_raise_from_exc as *const u8);
+    builder.symbol(
+        "dp_jit_raise_from_exc",
+        chosen_helper_symbol(
+            dp_jit_raise_from_exc as *const u8,
+            dp_jit_raise_from_exc_with_frame as *const u8,
+        ),
+    );
     builder.symbol(
         "PyObject_RichCompare",
         pyobject_richcompare_wrapper as *const u8,
