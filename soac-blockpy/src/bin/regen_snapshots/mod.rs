@@ -8,7 +8,7 @@ use std::process::Command;
 use log::{log_enabled, trace, Level};
 use soac_blockpy::block_py::BlockPyModule;
 use soac_blockpy::fixture::{parse_fixture, render_fixture, FixtureBlock};
-use soac_blockpy::passes::CodegenBlockPyPass;
+use soac_blockpy::passes::CodegenModuleShape;
 use soac_blockpy::{init_logging, lower_python_to_blockpy_for_testing};
 
 struct SnapshotSummaryRow {
@@ -135,7 +135,7 @@ fn with_suppressed_panic_hook<T>(f: impl FnOnce() -> Result<T, String>) -> Resul
     }
 }
 
-fn count_clif_blocks(module: &BlockPyModule<CodegenBlockPyPass>) -> usize {
+fn count_clif_blocks(module: &BlockPyModule<CodegenModuleShape>) -> usize {
     module
         .callable_defs
         .iter()

@@ -2,7 +2,7 @@ use crate::block_py::{
     core_runtime_positional_call_expr_with_meta, BlockPyModule, HasMeta, InstrWithAwaitAndYield,
     InstrWithYield, MapInstr, MapModule, Mappable, UnresolvedName, WithMeta, YieldFrom,
 };
-use crate::passes::{CoreBlockPyPassWithAwaitAndYield, CoreBlockPyPassWithYield};
+use crate::passes::{CoreModuleShapeWithAwaitAndYield, CoreModuleShapeWithYield};
 use soac_macros::match_default;
 
 struct CoreAwaitLoweringMap;
@@ -32,8 +32,8 @@ impl MapInstr<InstrWithAwaitAndYield, InstrWithYield> for CoreAwaitLoweringMap {
 }
 
 pub(crate) fn lower_awaits_in_core_blockpy_module(
-    module: BlockPyModule<CoreBlockPyPassWithAwaitAndYield>,
-) -> BlockPyModule<CoreBlockPyPassWithYield> {
+    module: BlockPyModule<CoreModuleShapeWithAwaitAndYield>,
+) -> BlockPyModule<CoreModuleShapeWithYield> {
     let mut mapper = CoreAwaitLoweringMap;
     mapper.map_module(module)
 }

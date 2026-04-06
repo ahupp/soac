@@ -1,13 +1,13 @@
 use crate::block_py::param_specs::{collect_param_spec_and_defaults, param_defaults_to_expr};
 use crate::block_py::{
-    BindingKind, BlockPyFunction, BlockPyModule, BlockPyPass, CallableScopeInfo, CellBindingKind,
+    BindingKind, BlockPyFunction, BlockPyModule, ModuleShape, CallableScopeInfo, CellBindingKind,
     FunctionKind, FunctionNameGen, ModuleNameGen,
 };
 use crate::passes::ast_to_ast::body::{split_docstring, Suite};
 use crate::passes::ast_to_ast::context::Context;
 use crate::passes::ast_to_ast::rewrite_stmt;
 use crate::passes::ast_to_ast::semantic::{SemanticAstState, SemanticScope};
-use crate::passes::{CoreBlockPyPassWithAwaitAndYield, InstrRuff};
+use crate::passes::{CoreModuleShapeWithAwaitAndYield, InstrRuff};
 use crate::transformer::{walk_expr, walk_stmt, Transformer};
 use crate::{py_expr, py_stmt, py_stmt_typed};
 use ruff_python_ast::{self as ast, Expr, Stmt};
@@ -22,7 +22,7 @@ struct FunctionScopeFrame {
     hoisted_to_parent: Vec<Stmt>,
 }
 
-struct BlockPyModuleRewriter<'a, P: BlockPyPass> {
+struct BlockPyModuleRewriter<'a, P: ModuleShape> {
     context: &'a Context,
     semantic_state: SemanticAstState,
     module_name_gen: ModuleNameGen,
@@ -46,7 +46,7 @@ pub(crate) fn rewrite_ast_to_core_blockpy_module_plan_with_module(
     mut module: Suite,
     semantic_state: &SemanticAstState,
     module_name_gen: ModuleNameGen,
-) -> BlockPyModule<CoreBlockPyPassWithAwaitAndYield> {
+) -> BlockPyModule<CoreModuleShapeWithAwaitAndYield> {
     crate::passes::ast_to_ast::simplify::flatten(&mut module);
     let mut rewriter = BlockPyModuleRewriter {
         context,
@@ -57,7 +57,7 @@ pub(crate) fn rewrite_ast_to_core_blockpy_module_plan_with_module(
         lower_function_to_blockpy: try_lower_function_to_core_blockpy_bundle,
     };
     let module_init =
-        BlockPyModuleRewriter::<CoreBlockPyPassWithAwaitAndYield>::root_module_init_stmt(
+        BlockPyModuleRewriter::<CoreModuleShapeWithAwaitAndYield>::root_module_init_stmt(
             &mut module,
         );
     rewriter.lower_root_function_def(module_init);
@@ -110,7 +110,7 @@ fn try_lower_function_to_core_blockpy_bundle(
     func: &ast::StmtFunctionDef,
     callable_scope: &CallableScopeInfo,
     name_gen: FunctionNameGen,
-) -> BlockPyFunction<CoreBlockPyPassWithAwaitAndYield> {
+) -> BlockPyFunction<CoreModuleShapeWithAwaitAndYield> {
     let (docstring, lowered_input_body) = split_docstring(&func.body);
     let lowered_input_body = lowered_input_body
         .iter()
@@ -160,7 +160,7 @@ fn build_lowered_function_instantiation_expr(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn rewrite_function_def_stmt_via_blockpy_with_pass<P: BlockPyPass>(
+fn rewrite_function_def_stmt_via_blockpy_with_pass<P: ModuleShape>(
     context: &Context,
     parent_hoisted: &mut Vec<Stmt>,
     func: &mut ast::StmtFunctionDef,
@@ -202,7 +202,7 @@ fn rewrite_function_def_stmt_via_blockpy_with_pass<P: BlockPyPass>(
     }
 }
 
-impl<P: BlockPyPass> BlockPyModuleRewriter<'_, P> {
+impl<P: ModuleShape> BlockPyModuleRewriter<'_, P> {
     fn lower_lambda_expr(&mut self, lambda: &mut ast::ExprLambda) -> Expr {
         let lambda_scope = self
             .semantic_state
@@ -350,7 +350,7 @@ def {func:id}():
     }
 }
 
-impl<P: BlockPyPass> Transformer for BlockPyModuleRewriter<'_, P> {
+impl<P: ModuleShape> Transformer for BlockPyModuleRewriter<'_, P> {
     fn visit_body(&mut self, body: &mut Suite) {
         let mut rewritten = Vec::with_capacity(body.len());
         for stmt in std::mem::take(body) {

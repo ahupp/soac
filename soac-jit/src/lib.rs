@@ -30,7 +30,7 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 use soac_blockpy::block_py::{FunctionId, ParamKind};
-use soac_blockpy::passes::CodegenBlockPyPass;
+use soac_blockpy::passes::CodegenModuleShape;
 use std::any::Any;
 use std::cell::RefCell;
 use std::ffi::{CString, c_char, c_void};
@@ -213,7 +213,7 @@ thread_local! {
 }
 
 struct ClifFunctionData {
-    function: soac_blockpy::block_py::BlockPyFunction<CodegenBlockPyPass>,
+    function: soac_blockpy::block_py::BlockPyFunction<CodegenModuleShape>,
     module_runtime: jit::ModuleRuntimeContext,
     compiled_handle: *mut c_void,
     compiled_vectorcall_handle: *mut c_void,
@@ -1192,7 +1192,7 @@ unsafe fn build_function_bound_args(
     args: *const *mut ffi::PyObject,
     nargsf: usize,
     kwnames: *mut ffi::PyObject,
-    function: &soac_blockpy::block_py::BlockPyFunction<CodegenBlockPyPass>,
+    function: &soac_blockpy::block_py::BlockPyFunction<CodegenModuleShape>,
 ) -> Result<Vec<*mut ffi::PyObject>, ()> {
     if callable.is_null() {
         ffi::PyErr_SetString(

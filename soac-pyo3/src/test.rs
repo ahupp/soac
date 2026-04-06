@@ -36,7 +36,7 @@ fn parse_and_lower_runtime_style(source: &str) -> Result<soac_blockpy::LoweringR
 }
 
 fn validate_bb_module_for_jit(
-    bb_module: &soac_blockpy::block_py::BlockPyModule<soac_blockpy::passes::CodegenBlockPyPass>,
+    bb_module: &soac_blockpy::block_py::BlockPyModule<soac_blockpy::passes::CodegenModuleShape>,
 ) -> Result<(), String> {
     for function in &bb_module.callable_defs {
         match function.lowered_kind() {

@@ -1,5 +1,5 @@
 use soac_blockpy::block_py::{BlockArg, BlockPyFunction, BlockPyModule, CodegenBlock, FunctionId};
-use soac_blockpy::passes::CodegenBlockPyPass;
+use soac_blockpy::passes::CodegenModuleShape;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
@@ -9,7 +9,7 @@ pub struct BlockExcDispatchPlan {
     pub slot_writes: Vec<(String, BlockArg)>,
 }
 
-type ModuleRegistry = HashMap<String, BlockPyModule<CodegenBlockPyPass>>;
+type ModuleRegistry = HashMap<String, BlockPyModule<CodegenModuleShape>>;
 
 static BB_MODULE_REGISTRY: OnceLock<Mutex<ModuleRegistry>> = OnceLock::new();
 
@@ -18,7 +18,7 @@ pub fn jit_param_names_for_block(block: &CodegenBlock) -> Vec<String> {
 }
 
 pub fn exc_dispatch_plan(
-    function: &BlockPyFunction<CodegenBlockPyPass>,
+    function: &BlockPyFunction<CodegenModuleShape>,
     block: &CodegenBlock,
 ) -> Option<BlockExcDispatchPlan> {
     let exc_edge = block.exc_edge.as_ref()?;
@@ -61,7 +61,7 @@ fn bb_module_registry() -> &'static Mutex<ModuleRegistry> {
 
 pub fn register_clif_module_plans(
     module_name: &str,
-    module: &BlockPyModule<CodegenBlockPyPass>,
+    module: &BlockPyModule<CodegenModuleShape>,
 ) -> Result<(), String> {
     let mut module_registry = bb_module_registry()
         .lock()
@@ -70,7 +70,7 @@ pub fn register_clif_module_plans(
     Ok(())
 }
 
-pub fn lookup_blockpy_module(module_name: &str) -> Option<BlockPyModule<CodegenBlockPyPass>> {
+pub fn lookup_blockpy_module(module_name: &str) -> Option<BlockPyModule<CodegenModuleShape>> {
     let registry = bb_module_registry().lock().ok()?;
     registry.get(module_name).cloned()
 }
@@ -78,7 +78,7 @@ pub fn lookup_blockpy_module(module_name: &str) -> Option<BlockPyModule<CodegenB
 pub fn lookup_blockpy_function(
     module_name: &str,
     function_id: FunctionId,
-) -> Option<BlockPyFunction<CodegenBlockPyPass>> {
+) -> Option<BlockPyFunction<CodegenModuleShape>> {
     let module = lookup_blockpy_module(module_name)?;
     module
         .callable_defs

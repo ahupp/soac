@@ -10,13 +10,13 @@ use crate::lower_python_to_blockpy_for_testing;
 use crate::passes::ast_to_ast::context::Context;
 use crate::passes::ast_to_ast::semantic::SemanticAstState;
 use crate::passes::ruff_to_blockpy::rewrite_ast_to_core_blockpy_module_with_module;
-use crate::passes::CoreBlockPyPassWithAwaitAndYield;
+use crate::passes::CoreModuleShapeWithAwaitAndYield;
 use ruff_python_ast::Stmt;
 use ruff_python_parser::parse_module;
 
 fn tracked_core_blockpy_with_await_and_yield(
     source: &str,
-) -> BlockPyModule<CoreBlockPyPassWithAwaitAndYield> {
+) -> BlockPyModule<CoreModuleShapeWithAwaitAndYield> {
     lower_python_to_blockpy_for_testing(source)
         .unwrap()
         .pass_tracker
@@ -28,7 +28,7 @@ fn tracked_core_blockpy_with_await_and_yield(
 fn lower_test_module_plan(
     context: &Context,
     mut module: Vec<Stmt>,
-) -> BlockPyModule<CoreBlockPyPassWithAwaitAndYield> {
+) -> BlockPyModule<CoreModuleShapeWithAwaitAndYield> {
     crate::passes::ast_to_ast::simplify::flatten(&mut module);
     let mut semantic_state = SemanticAstState::from_ruff(&mut module);
     if !module.iter().any(

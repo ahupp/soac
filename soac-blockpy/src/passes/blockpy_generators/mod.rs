@@ -17,7 +17,7 @@ use crate::block_py::{
 };
 use crate::passes::ast_to_ast::scope_helpers::is_internal_symbol;
 use crate::passes::ruff_to_blockpy::{attach_exception_edges_to_blocks, lowered_exception_edges};
-use crate::passes::{CoreBlockPyPass, CoreBlockPyPassWithYield};
+use crate::passes::{CoreModuleShape, CoreModuleShapeWithYield};
 use ruff_python_ast::{self as ast};
 use soac_macros::match_default;
 use std::collections::HashSet;
@@ -414,7 +414,7 @@ fn injected_exception_names<I: Instr>(blocks: &[Block<I>]) -> HashSet<String> {
 }
 
 fn build_generator_storage_layout(
-    callable: &BlockPyFunction<CoreBlockPyPassWithYield>,
+    callable: &BlockPyFunction<CoreModuleShapeWithYield>,
 ) -> StorageLayout {
     let param_names = callable.params.names();
     let semantic_layout = compute_storage_layout_from_scope(callable).unwrap_or(StorageLayout {
@@ -1504,7 +1504,7 @@ fn emit_yield_from_site(
 }
 
 fn lower_resume_blocks(
-    callable: &BlockPyFunction<CoreBlockPyPassWithYield>,
+    callable: &BlockPyFunction<CoreModuleShapeWithYield>,
     resume_name_gen: FunctionNameGen,
 ) -> (
     Vec<LinearCoreBlock>,
@@ -1675,7 +1675,7 @@ fn lower_resume_blocks(
 }
 
 fn ordered_resume_binding_logical_names(
-    _callable: &BlockPyFunction<CoreBlockPyPassWithYield>,
+    _callable: &BlockPyFunction<CoreModuleShapeWithYield>,
     persistent_state_order: &[String],
 ) -> Vec<String> {
     let mut seen = HashSet::new();
@@ -1687,9 +1687,9 @@ fn ordered_resume_binding_logical_names(
 }
 
 pub(crate) fn lower_generator_like_function(
-    callable: BlockPyFunction<CoreBlockPyPassWithYield>,
+    callable: BlockPyFunction<CoreModuleShapeWithYield>,
     module_name_gen: &ModuleNameGen,
-) -> Vec<BlockPyFunction<CoreBlockPyPass>> {
+) -> Vec<BlockPyFunction<CoreModuleShape>> {
     assert!(
         is_generator_like(callable.kind),
         "generator lowering only applies to generator-like callables"
@@ -1764,8 +1764,8 @@ pub(crate) fn lower_generator_like_function(
 }
 
 pub(crate) fn lower_yield_in_lowered_core_blockpy_module_bundle(
-    module: BlockPyModule<CoreBlockPyPassWithYield>,
-) -> BlockPyModule<CoreBlockPyPass> {
+    module: BlockPyModule<CoreModuleShapeWithYield>,
+) -> BlockPyModule<CoreModuleShape> {
     let module = module.map_callable_defs(make_suspend_order_explicit_in_core_callable_def);
     let module_name_gen = module.module_name_gen.clone();
     let mut callable_defs = Vec::new();

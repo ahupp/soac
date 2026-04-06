@@ -8,7 +8,7 @@ use pyo3::types::{PyList, PyModule};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use soac_blockpy::block_py::{BlockPyFunction, FunctionId};
-use soac_blockpy::passes::CodegenBlockPyPass;
+use soac_blockpy::passes::CodegenModuleShape;
 use soac_jit::module_constants::ModuleCodegenConstants;
 use soac_jit::{
     exc_dispatch_plan, jit_param_names_for_block, lookup_blockpy_function, lookup_blockpy_module,
@@ -214,7 +214,7 @@ fn lower_source_recorded(source: &str) -> Result<soac_blockpy::LoweringResult, A
         .map_err(|err| ApiError::internal(err.to_string()))
 }
 
-fn inspector_function_payload(function: &BlockPyFunction<CodegenBlockPyPass>) -> Value {
+fn inspector_function_payload(function: &BlockPyFunction<CodegenModuleShape>) -> Value {
     json!({
         "functionId": function.function_id.packed().to_string(),
         "qualname": function.names.qualname,

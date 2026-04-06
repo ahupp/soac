@@ -5,7 +5,7 @@ use soac_blockpy::block_py::{
     ChildVisitable, InstrCodegen, InstrResolved, Literal, NameLike, NumberLiteralValue,
     ParamDefaultSource, operation as blockpy_intrinsics,
 };
-use soac_blockpy::passes::CodegenBlockPyPass;
+use soac_blockpy::passes::CodegenModuleShape;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_int};
 use std::ptr;
@@ -45,7 +45,7 @@ pub struct ModuleCodegenConstants {
 }
 
 impl ModuleCodegenConstants {
-    pub fn collect_from_module(module: &BlockPyModule<CodegenBlockPyPass>) -> Self {
+    pub fn collect_from_module(module: &BlockPyModule<CodegenModuleShape>) -> Self {
         let mut collector = ModuleConstantCollector::default();
         for expr in &module.module_constants {
             collector.constants.push_explicit_constant_expr(expr);
@@ -60,7 +60,7 @@ impl ModuleCodegenConstants {
     }
 
     pub fn collect_from_functions<'a>(
-        functions: impl IntoIterator<Item = &'a BlockPyFunction<CodegenBlockPyPass>>,
+        functions: impl IntoIterator<Item = &'a BlockPyFunction<CodegenModuleShape>>,
     ) -> Self {
         let mut collector = ModuleConstantCollector::default();
         for name in ALWAYS_REQUIRED_UNICODE_CONSTANTS {
@@ -372,7 +372,7 @@ struct ModuleConstantCollector {
 }
 
 impl ModuleConstantCollector {
-    fn collect_function(&mut self, function: &BlockPyFunction<CodegenBlockPyPass>) {
+    fn collect_function(&mut self, function: &BlockPyFunction<CodegenModuleShape>) {
         for (param, default_source) in function.params.iter_with_default_sources() {
             match default_source {
                 Some(ParamDefaultSource::Positional(_)) => {

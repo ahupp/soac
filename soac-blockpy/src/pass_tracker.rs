@@ -2,7 +2,7 @@ use crate::block_py::pretty::BlockPyPrettyPrint;
 use crate::block_py::BlockPyModule;
 use crate::passes::ast_to_ast::body::Suite;
 use crate::passes::{
-    CoreBlockPyPass, CoreBlockPyPassWithAwaitAndYield, ResolvedStorageBlockPyPass,
+    CoreModuleShape, CoreModuleShapeWithAwaitAndYield, ResolvedStorageModuleShape,
 };
 use ruff_python_ast::{self as ast, ModModule};
 use ruff_text_size::TextRange;
@@ -135,20 +135,20 @@ impl RecordingPassTracker {
             })
     }
 
-    pub fn pass_core_blockpy(&self) -> Option<&BlockPyModule<CoreBlockPyPass>> {
-        self.get::<BlockPyModule<CoreBlockPyPass>>("core_blockpy")
+    pub fn pass_core_blockpy(&self) -> Option<&BlockPyModule<CoreModuleShape>> {
+        self.get::<BlockPyModule<CoreModuleShape>>("core_blockpy")
     }
 
     pub fn pass_core_blockpy_with_await_and_yield(
         &self,
-    ) -> Option<&BlockPyModule<CoreBlockPyPassWithAwaitAndYield>> {
-        self.get::<BlockPyModule<CoreBlockPyPassWithAwaitAndYield>>(
+    ) -> Option<&BlockPyModule<CoreModuleShapeWithAwaitAndYield>> {
+        self.get::<BlockPyModule<CoreModuleShapeWithAwaitAndYield>>(
             "core_blockpy_with_await_and_yield",
         )
     }
 
-    pub fn pass_name_binding(&self) -> Option<&BlockPyModule<ResolvedStorageBlockPyPass>> {
-        self.get::<BlockPyModule<ResolvedStorageBlockPyPass>>("name_binding")
+    pub fn pass_name_binding(&self) -> Option<&BlockPyModule<ResolvedStorageModuleShape>> {
+        self.get::<BlockPyModule<ResolvedStorageModuleShape>>("name_binding")
     }
 
     pub fn render_pass_text(&self, name: &str) -> Option<String> {

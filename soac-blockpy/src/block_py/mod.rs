@@ -346,7 +346,7 @@ impl<I: Instr> Block<I> {
     }
 }
 
-impl<I: NormalizedInstr + Instr> Block<I> {
+impl<I: Instr> Block<I> {
     pub fn new(
         label: BlockLabel,
         body: Vec<I>,
@@ -354,19 +354,17 @@ impl<I: NormalizedInstr + Instr> Block<I> {
         params: Vec<BlockParam>,
         exc_edge: Option<BlockEdge>,
     ) -> Self {
-        let block = Self {
+        Self {
             label,
             body,
             term,
             params,
             exc_edge,
-        };
-        assert_blockpy_block_normalized(&block);
-        block
+        }
     }
 }
 
-impl<I: NormalizedInstr + Instr> Block<I> {
+impl<I: Instr> Block<I> {
     pub(crate) fn from_builder(
         label: BlockLabel,
         builder: BlockBuilder<I>,
@@ -448,7 +446,7 @@ impl<I: Instr> Block<I> {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct BlockPyModule<P: BlockPyPass> {
+pub struct BlockPyModule<P: ModuleShape> {
     pub module_name_gen: ModuleNameGen,
     pub global_names: Vec<String>,
     pub callable_defs: Vec<BlockPyFunction<P>>,
@@ -456,8 +454,8 @@ pub struct BlockPyModule<P: BlockPyPass> {
     pub counter_defs: Vec<CounterDef>,
 }
 
-impl<P: BlockPyPass> BlockPyModule<P> {
-    pub fn map_callable_defs<Q: BlockPyPass>(
+impl<P: ModuleShape> BlockPyModule<P> {
+    pub fn map_callable_defs<Q: ModuleShape>(
         self,
         mut f: impl FnMut(BlockPyFunction<P>) -> BlockPyFunction<Q>,
     ) -> BlockPyModule<Q> {
@@ -767,7 +765,7 @@ impl FunctionName {
 }
 
 #[derive(Debug)]
-pub struct BlockPyFunction<P: BlockPyPass> {
+pub struct BlockPyFunction<P: ModuleShape> {
     pub function_id: FunctionId,
     pub name_gen: FunctionNameGen,
     pub names: FunctionName,
@@ -779,7 +777,7 @@ pub struct BlockPyFunction<P: BlockPyPass> {
     pub scope: CallableScopeInfo,
 }
 
-impl<P: BlockPyPass> Clone for BlockPyFunction<P> {
+impl<P: ModuleShape> Clone for BlockPyFunction<P> {
     fn clone(&self) -> Self {
         Self {
             function_id: self.function_id,
@@ -797,7 +795,7 @@ impl<P: BlockPyPass> Clone for BlockPyFunction<P> {
     }
 }
 
-impl<P: BlockPyPass> BlockPyFunction<P> {
+impl<P: ModuleShape> BlockPyFunction<P> {
     pub fn lowered_kind(&self) -> &FunctionKind {
         &self.kind
     }
@@ -812,7 +810,7 @@ impl<P: BlockPyPass> BlockPyFunction<P> {
             .expect("BlockPyFunction should have at least one block")
     }
 
-    pub fn map_blocks<Q: BlockPyPass>(
+    pub fn map_blocks<Q: ModuleShape>(
         self,
         mut f: impl FnMut(Block<P::Instr>) -> Block<Q::Instr>,
     ) -> BlockPyFunction<Q> {
@@ -830,19 +828,15 @@ impl<P: BlockPyPass> BlockPyFunction<P> {
     }
 }
 
-pub trait NormalizedInstr {
-    fn assert_blockpy_normalized(&self);
-}
-
-pub trait BlockPyPass: Clone + fmt::Debug {
+pub trait ModuleShape: Clone + fmt::Debug {
     type Instr: Instr;
 }
 
 pub type InstrName<I> = <I as Instr>::Name;
 pub type ResolvedStorageBlock = Block<InstrResolved>;
 pub type CodegenBlock = Block<InstrCodegen>;
-pub type CodegenBlockPyFunction = BlockPyFunction<crate::passes::CodegenBlockPyPass>;
-pub type CodegenBlockPyModule = BlockPyModule<crate::passes::CodegenBlockPyPass>;
+pub type CodegenBlockPyFunction = BlockPyFunction<crate::passes::CodegenModuleShape>;
+pub type CodegenBlockPyModule = BlockPyModule<crate::passes::CodegenModuleShape>;
 
 pub trait BlockPyJumpTerm {
     fn jump_term(target: BlockLabel) -> Self;
@@ -857,29 +851,17 @@ pub(crate) trait ImplicitNoneExpr {
     fn is_implicit_none_expr(expr: &Self) -> bool;
 }
 
-pub fn assert_blockpy_block_normalized<I: NormalizedInstr + Instr>(block: &Block<I>) {
-    for stmt in &block.body {
-        stmt.assert_blockpy_normalized();
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct BlockBuilder<I: Instr> {
     pub body: Vec<I>,
     pub term: Option<BlockTerm<I>>,
 }
 
-impl<I: NormalizedInstr + Instr> BlockBuilder<I> {
+impl<I: Instr> BlockBuilder<I> {
     pub fn new() -> Self {
         Self {
             body: Vec::new(),
             term: None,
-        }
-    }
-
-    pub fn assert_normalized(&self) {
-        for stmt in &self.body {
-            stmt.assert_blockpy_normalized();
         }
     }
 
@@ -888,12 +870,10 @@ impl<I: NormalizedInstr + Instr> BlockBuilder<I> {
     }
 
     pub fn with_term(body: Vec<I>, term: impl Into<Option<BlockTerm<I>>>) -> Self {
-        let builder = BlockBuilder {
+        BlockBuilder {
             body,
             term: term.into(),
-        };
-        builder.assert_normalized();
-        builder
+        }
     }
 
     pub fn push_stmt(&mut self, stmt: I) {
@@ -901,7 +881,6 @@ impl<I: NormalizedInstr + Instr> BlockBuilder<I> {
             self.term.is_none(),
             "cannot append structured BlockPy stmt after block-builder terminator"
         );
-        stmt.assert_blockpy_normalized();
         self.body.push(stmt);
     }
 
@@ -923,12 +902,11 @@ impl<I: NormalizedInstr + Instr> BlockBuilder<I> {
     }
 
     pub fn finish(self) -> Self {
-        self.assert_normalized();
         self
     }
 }
 
-impl<I: NormalizedInstr + Instr> BlockBuilder<I> {
+impl<I: Instr> BlockBuilder<I> {
     pub fn jump(target: BlockLabel) -> Self {
         Self::with_term(Vec::new(), Some(BlockTerm::jump_term(target)))
     }
@@ -938,13 +916,6 @@ impl<I: NormalizedInstr + Instr> BlockBuilder<I> {
             self.set_term(BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())));
         }
     }
-}
-
-impl<I> NormalizedInstr for I
-where
-    I: Instr,
-{
-    fn assert_blockpy_normalized(&self) {}
 }
 
 #[derive(Debug, Clone)]

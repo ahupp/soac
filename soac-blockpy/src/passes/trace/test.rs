@@ -8,7 +8,7 @@ use crate::passes::{lower_try_jump_exception_flow, normalize_bb_module_strings};
 
 fn tracked_name_binding_module(
     source: &str,
-) -> anyhow::Result<Option<crate::block_py::BlockPyModule<crate::passes::ResolvedStorageBlockPyPass>>>
+) -> anyhow::Result<Option<crate::block_py::BlockPyModule<crate::passes::ResolvedStorageModuleShape>>>
 {
     Ok(lower_python_to_blockpy_for_testing(source)?
         .pass_tracker

@@ -136,8 +136,8 @@ where
 
 pub(crate) trait MapFunction<PIn, POut>: MapBlock<PIn::Instr, POut::Instr>
 where
-    PIn: BlockPyPass,
-    POut: BlockPyPass,
+    PIn: ModuleShape,
+    POut: ModuleShape,
 {
     fn map_fn(&mut self, func: BlockPyFunction<PIn>) -> BlockPyFunction<POut> {
         BlockPyFunction {
@@ -160,16 +160,16 @@ where
 
 impl<PIn, POut, M> MapFunction<PIn, POut> for M
 where
-    PIn: BlockPyPass,
-    POut: BlockPyPass,
+    PIn: ModuleShape,
+    POut: ModuleShape,
     M: MapBlock<PIn::Instr, POut::Instr>,
 {
 }
 
 pub(crate) trait MapModule<PIn, POut>: MapFunction<PIn, POut>
 where
-    PIn: BlockPyPass,
-    POut: BlockPyPass,
+    PIn: ModuleShape,
+    POut: ModuleShape,
 {
     fn map_module(&mut self, module: BlockPyModule<PIn>) -> BlockPyModule<POut> {
         BlockPyModule {
@@ -188,8 +188,8 @@ where
 
 impl<PIn, POut, M> MapModule<PIn, POut> for M
 where
-    PIn: BlockPyPass,
-    POut: BlockPyPass,
+    PIn: ModuleShape,
+    POut: ModuleShape,
     M: MapFunction<PIn, POut>,
 {
 }
@@ -265,8 +265,8 @@ where
 pub(crate) trait TryMapFunction<PIn, POut, Error>:
     TryMapBlock<PIn::Instr, POut::Instr, Error>
 where
-    PIn: BlockPyPass,
-    POut: BlockPyPass,
+    PIn: ModuleShape,
+    POut: ModuleShape,
 {
     fn try_map_fn(&mut self, func: BlockPyFunction<PIn>) -> Result<BlockPyFunction<POut>, Error> {
         Ok(BlockPyFunction {
@@ -289,8 +289,8 @@ where
 
 impl<PIn, POut, Error, M> TryMapFunction<PIn, POut, Error> for M
 where
-    PIn: BlockPyPass,
-    POut: BlockPyPass,
+    PIn: ModuleShape,
+    POut: ModuleShape,
     M: TryMapBlock<PIn::Instr, POut::Instr, Error>,
 {
 }
@@ -298,8 +298,8 @@ where
 #[allow(dead_code)]
 pub(crate) trait TryMapModule<PIn, POut, Error>: TryMapFunction<PIn, POut, Error>
 where
-    PIn: BlockPyPass,
-    POut: BlockPyPass,
+    PIn: ModuleShape,
+    POut: ModuleShape,
 {
     fn try_map_module(&mut self, module: BlockPyModule<PIn>) -> Result<BlockPyModule<POut>, Error> {
         Ok(BlockPyModule {
@@ -318,8 +318,8 @@ where
 
 impl<PIn, POut, Error, M> TryMapModule<PIn, POut, Error> for M
 where
-    PIn: BlockPyPass,
-    POut: BlockPyPass,
+    PIn: ModuleShape,
+    POut: ModuleShape,
     M: TryMapFunction<PIn, POut, Error>,
 {
 }

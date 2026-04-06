@@ -4,10 +4,10 @@ use crate::block_py::{
     ClosureInit, ClosureSlot, InstrWithAwaitAndYield, NameLocation, ResolvedName, StorageLayout,
 };
 use crate::lower_python_to_blockpy_for_testing;
-use crate::passes::{CoreBlockPyPassWithAwaitAndYield, InstrRuff, ResolvedStorageBlockPyPass};
+use crate::passes::{CoreModuleShapeWithAwaitAndYield, InstrRuff, ResolvedStorageModuleShape};
 use ruff_python_parser::parse_expression;
 
-fn wrapped_blockpy(source: &str) -> BlockPyModule<CoreBlockPyPassWithAwaitAndYield> {
+fn wrapped_blockpy(source: &str) -> BlockPyModule<CoreModuleShapeWithAwaitAndYield> {
     lower_python_to_blockpy_for_testing(source)
         .expect("expected lowered core BlockPy module")
         .pass_tracker
@@ -90,7 +90,7 @@ def classify(a, /, b: int = 1, *args, c=2, **kwargs):
 
 #[test]
 fn renders_empty_module_marker() {
-    let empty_module: BlockPyModule<CoreBlockPyPassWithAwaitAndYield> = BlockPyModule {
+    let empty_module: BlockPyModule<CoreModuleShapeWithAwaitAndYield> = BlockPyModule {
         module_name_gen: crate::block_py::ModuleNameGen::new(0),
         global_names: Vec::new(),
         callable_defs: Vec::new(),
@@ -218,7 +218,7 @@ async def no_lying():
         .collect::<HashSet<_>>();
 
     let missing_labels =
-        collect_referenced_labels_from_blocks::<CoreBlockPyPassWithAwaitAndYield>(&function.blocks)
+        collect_referenced_labels_from_blocks::<CoreModuleShapeWithAwaitAndYield>(&function.blocks)
             .into_iter()
             .map(|label| label.to_string())
             .filter(|label| !inlined_labels.contains(label))
@@ -236,7 +236,7 @@ fn renders_public_closure_metadata_in_function_header() {
     let rendered = blockpy_module_to_string(&BlockPyModule {
         module_name_gen: crate::block_py::ModuleNameGen::new(0),
         global_names: Vec::new(),
-        callable_defs: vec![BlockPyFunction::<CoreBlockPyPassWithAwaitAndYield> {
+        callable_defs: vec![BlockPyFunction::<CoreModuleShapeWithAwaitAndYield> {
             function_id: crate::block_py::FunctionId::new(0, 1),
             name_gen: test_name_gen(),
             names: crate::block_py::FunctionName::new("gen", "gen", "gen", "gen"),
@@ -282,7 +282,7 @@ fn renders_public_closure_metadata_in_function_header() {
 
 #[test]
 fn renders_followup_blocks_under_their_owning_entry_block() {
-    let function: BlockPyFunction<CoreBlockPyPassWithAwaitAndYield> = BlockPyFunction {
+    let function: BlockPyFunction<CoreModuleShapeWithAwaitAndYield> = BlockPyFunction {
         function_id: crate::block_py::FunctionId::new(0, 1),
         name_gen: test_name_gen(),
         names: crate::block_py::FunctionName::new("f", "f", "f", "f"),
@@ -363,7 +363,7 @@ def choose(a, b):
 
 #[test]
 fn sorts_rendered_root_and_child_blocks_by_label() {
-    let function: BlockPyFunction<CoreBlockPyPassWithAwaitAndYield> = BlockPyFunction {
+    let function: BlockPyFunction<CoreModuleShapeWithAwaitAndYield> = BlockPyFunction {
         function_id: crate::block_py::FunctionId::new(0, 1),
         name_gen: test_name_gen(),
         names: crate::block_py::FunctionName::new("f", "f", "f", "f"),
@@ -429,7 +429,7 @@ fn sorts_rendered_root_and_child_blocks_by_label() {
 
 #[test]
 fn collects_referenced_labels_from_plain_blocks_via_term_and_exc_edges() {
-    let referenced = collect_referenced_labels_from_blocks::<CoreBlockPyPassWithAwaitAndYield>(&[
+    let referenced = collect_referenced_labels_from_blocks::<CoreModuleShapeWithAwaitAndYield>(&[
         Block {
             label: label(0),
             body: vec![parse_core_blockpy_expr("x")],
@@ -462,7 +462,7 @@ fn renders_bb_block_metadata_with_shared_layout() {
     let rendered = blockpy_module_to_string(&BlockPyModule {
         module_name_gen: crate::block_py::ModuleNameGen::new(0),
         global_names: Vec::new(),
-        callable_defs: vec![BlockPyFunction::<ResolvedStorageBlockPyPass> {
+        callable_defs: vec![BlockPyFunction::<ResolvedStorageModuleShape> {
             function_id: crate::block_py::FunctionId::new(0, 1),
             name_gen: test_name_gen(),
             names: crate::block_py::FunctionName::new("f", "f", "f", "f"),

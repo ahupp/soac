@@ -1,11 +1,11 @@
 use super::{
     Block, BlockArg, BlockEdge, BlockLabel, BlockParamRole, BlockPyFunction, BlockPyModule,
-    BlockPyPass, BlockTerm, FunctionKind, Instr, TermIf, TermRaise,
+    ModuleShape, BlockTerm, FunctionKind, Instr, TermIf, TermRaise,
 };
 use crate::block_py::param_specs::{ParamKind, ParamSpec};
 use crate::passes::{
-    CodegenBlockPyPass, CoreBlockPyPass, CoreBlockPyPassWithAwaitAndYield,
-    CoreBlockPyPassWithYield, ResolvedStorageBlockPyPass,
+    CodegenModuleShape, CoreModuleShape, CoreModuleShapeWithAwaitAndYield,
+    CoreModuleShapeWithYield, ResolvedStorageModuleShape,
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -17,7 +17,7 @@ enum IfBranchKind {
     Else,
 }
 
-pub(crate) trait BlockPyPrettyPrinter: BlockPyPass {
+pub(crate) trait BlockPyPrettyPrinter: ModuleShape {
     fn block_metadata_lines(block: &Block<Self::Instr>) -> Vec<String>
     where
         Self: Sized;
@@ -36,12 +36,12 @@ macro_rules! impl_default_blockpy_pretty_printer {
 }
 
 impl_default_blockpy_pretty_printer!(
-    CoreBlockPyPassWithAwaitAndYield,
-    CoreBlockPyPassWithYield,
-    CoreBlockPyPass,
+    CoreModuleShapeWithAwaitAndYield,
+    CoreModuleShapeWithYield,
+    CoreModuleShape,
 );
 
-impl BlockPyPrettyPrinter for ResolvedStorageBlockPyPass {
+impl BlockPyPrettyPrinter for ResolvedStorageModuleShape {
     fn block_metadata_lines(block: &Block<Self::Instr>) -> Vec<String> {
         let mut lines = Vec::new();
         if let Some(exc_edge) = &block.exc_edge {
@@ -54,7 +54,7 @@ impl BlockPyPrettyPrinter for ResolvedStorageBlockPyPass {
     }
 }
 
-impl BlockPyPrettyPrinter for CodegenBlockPyPass {
+impl BlockPyPrettyPrinter for CodegenModuleShape {
     fn block_metadata_lines(block: &Block<Self::Instr>) -> Vec<String> {
         render_resolved_storage_block_metadata::<Self>(block)
     }
@@ -62,7 +62,7 @@ impl BlockPyPrettyPrinter for CodegenBlockPyPass {
 
 fn render_resolved_storage_block_metadata<P>(block: &Block<P::Instr>) -> Vec<String>
 where
-    P: BlockPyPass,
+    P: ModuleShape,
     P::Instr: Instr<Name = super::ResolvedName>,
 {
     let mut lines = Vec::new();
@@ -704,7 +704,7 @@ fn collect_top_level_successors_from_block<P>(
     label_to_index: &HashMap<BlockLabel, usize>,
 ) -> Vec<usize>
 where
-    P: BlockPyPass,
+    P: ModuleShape,
 {
     let mut successors = Vec::new();
     let mut seen = HashSet::new();
@@ -893,7 +893,7 @@ fn compute_immediate_dominators(
 
 fn collect_referenced_labels_from_blocks<P>(blocks: &[Block<P::Instr>]) -> HashSet<BlockLabel>
 where
-    P: BlockPyPass,
+    P: ModuleShape,
 {
     let mut referenced = HashSet::new();
     for block in blocks {

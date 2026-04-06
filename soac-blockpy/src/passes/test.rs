@@ -15,8 +15,8 @@ use crate::passes::ast_to_ast::{
 use crate::passes::core_await_lower::lower_awaits_in_core_blockpy_module;
 use crate::passes::ruff_to_blockpy::rewrite_ast_to_core_blockpy_module_with_module;
 use crate::passes::{
-    CoreBlockPyPassWithAwaitAndYield, CoreBlockPyPassWithYield, InstrRuff,
-    ResolvedStorageBlockPyPass,
+    CoreModuleShapeWithAwaitAndYield, CoreModuleShapeWithYield, InstrRuff,
+    ResolvedStorageModuleShape,
 };
 use crate::{lower_python_to_blockpy_for_testing, LoweringResult};
 use ruff_python_ast::{self as ast, Expr, Stmt};
@@ -24,7 +24,7 @@ use ruff_python_parser::parse_module;
 
 fn tracked_core_blockpy_with_await_and_yield(
     source: &str,
-) -> BlockPyModule<CoreBlockPyPassWithAwaitAndYield> {
+) -> BlockPyModule<CoreModuleShapeWithAwaitAndYield> {
     lower_python_to_blockpy_for_testing(source)
         .expect("transform should succeed")
         .pass_tracker
@@ -53,7 +53,7 @@ fn rewrite_ast_to_ast_for_testing(source: &str) -> (Context, Suite, SemanticAstS
     (context, body, semantic_state)
 }
 
-fn tracked_core_blockpy_with_yield_only(source: &str) -> BlockPyModule<CoreBlockPyPassWithYield> {
+fn tracked_core_blockpy_with_yield_only(source: &str) -> BlockPyModule<CoreModuleShapeWithYield> {
     let (context, module, semantic_state) = rewrite_ast_to_ast_for_testing(source);
     let core_blockpy = rewrite_ast_to_core_blockpy_module_with_module(
         &context,
@@ -66,7 +66,7 @@ fn tracked_core_blockpy_with_yield_only(source: &str) -> BlockPyModule<CoreBlock
 
 fn assert_all_targets_present<P, S>(module: &BlockPyModule<P>)
 where
-    P: crate::block_py::BlockPyPass<Instr = S> + crate::block_py::pretty::BlockPyPrettyPrinter,
+    P: crate::block_py::ModuleShape<Instr = S> + crate::block_py::pretty::BlockPyPrettyPrinter,
     S: crate::block_py::Instr + std::fmt::Debug,
     P::Instr: std::fmt::Debug,
 {
@@ -110,7 +110,7 @@ where
 
 fn tracked_name_binding_module(
     source: &str,
-) -> anyhow::Result<Option<BlockPyModule<ResolvedStorageBlockPyPass>>> {
+) -> anyhow::Result<Option<BlockPyModule<ResolvedStorageModuleShape>>> {
     Ok(lower_python_to_blockpy_for_testing(source)?
         .pass_tracker
         .pass_name_binding()
@@ -119,7 +119,7 @@ fn tracked_name_binding_module(
 
 struct TrackedLowering {
     result: LoweringResult,
-    blockpy_module: BlockPyModule<CoreBlockPyPassWithAwaitAndYield>,
+    blockpy_module: BlockPyModule<CoreModuleShapeWithAwaitAndYield>,
 }
 
 impl TrackedLowering {
@@ -131,7 +131,7 @@ impl TrackedLowering {
         }
     }
 
-    fn blockpy_module(&self) -> BlockPyModule<CoreBlockPyPassWithAwaitAndYield> {
+    fn blockpy_module(&self) -> BlockPyModule<CoreModuleShapeWithAwaitAndYield> {
         self.blockpy_module.clone()
     }
 
@@ -154,22 +154,22 @@ impl TrackedLowering {
             .unwrap_or_else(|| panic!("expected renderable pass {name}"))
     }
 
-    fn bb_module(&self) -> &BlockPyModule<ResolvedStorageBlockPyPass> {
+    fn bb_module(&self) -> &BlockPyModule<ResolvedStorageModuleShape> {
         self.result
             .pass_tracker
             .pass_name_binding()
             .expect("bb module should be available")
     }
 
-    fn bb_function(&self, bind_name: &str) -> &BlockPyFunction<ResolvedStorageBlockPyPass> {
+    fn bb_function(&self, bind_name: &str) -> &BlockPyFunction<ResolvedStorageModuleShape> {
         function_by_name(self.bb_module(), bind_name)
     }
 }
 
 fn function_by_name<'a>(
-    bb_module: &'a BlockPyModule<ResolvedStorageBlockPyPass>,
+    bb_module: &'a BlockPyModule<ResolvedStorageModuleShape>,
     bind_name: &str,
-) -> &'a BlockPyFunction<ResolvedStorageBlockPyPass> {
+) -> &'a BlockPyFunction<ResolvedStorageModuleShape> {
     let resume_name = format!("{bind_name}_resume");
     if let Some(resume) = bb_module
         .callable_defs
@@ -197,9 +197,9 @@ fn expr_text<N: NameLike>(expr: &InstrLow<N>) -> String {
 }
 
 fn callable_def_by_name<'a>(
-    blockpy_module: &'a BlockPyModule<CoreBlockPyPassWithAwaitAndYield>,
+    blockpy_module: &'a BlockPyModule<CoreModuleShapeWithAwaitAndYield>,
     bind_name: &str,
-) -> &'a BlockPyFunction<CoreBlockPyPassWithAwaitAndYield> {
+) -> &'a BlockPyFunction<CoreModuleShapeWithAwaitAndYield> {
     blockpy_module
         .callable_defs
         .iter()
@@ -336,7 +336,7 @@ fn instr_ruff_from_ast_stmt_recursively_lowers_loop_body_and_orelse() {
     assert!(matches!(&while_stmt.orelse[..], [InstrRuff::StmtAssign(_)]));
 }
 fn function_uses_text(
-    function: &BlockPyFunction<ResolvedStorageBlockPyPass>,
+    function: &BlockPyFunction<ResolvedStorageModuleShape>,
     needle: &str,
 ) -> bool {
     function
@@ -345,7 +345,7 @@ fn function_uses_text(
         .any(|block| block_uses_text(block, needle))
 }
 
-fn module_constant_text(module: &BlockPyModule<ResolvedStorageBlockPyPass>) -> String {
+fn module_constant_text(module: &BlockPyModule<ResolvedStorageModuleShape>) -> String {
     module
         .module_constants
         .iter()
@@ -355,15 +355,15 @@ fn module_constant_text(module: &BlockPyModule<ResolvedStorageBlockPyPass>) -> S
 }
 
 fn function_or_constants_use_text(
-    module: &BlockPyModule<ResolvedStorageBlockPyPass>,
-    function: &BlockPyFunction<ResolvedStorageBlockPyPass>,
+    module: &BlockPyModule<ResolvedStorageModuleShape>,
+    function: &BlockPyFunction<ResolvedStorageModuleShape>,
     needle: &str,
 ) -> bool {
     function_uses_text(function, needle) || module_constant_text(module).contains(needle)
 }
 
 fn runtime_call_by_name<'a>(
-    module: &'a BlockPyModule<ResolvedStorageBlockPyPass>,
+    module: &'a BlockPyModule<ResolvedStorageModuleShape>,
     expr: &'a InstrLow<ResolvedName>,
     name: &str,
 ) -> Option<&'a Call<InstrLow<ResolvedName>>> {

@@ -9,7 +9,7 @@ use pyo3::types::{PyAny, PyDict, PyFunction, PyModule, PyString, PyTuple};
 use soac_blockpy::block_py::{BlockPyFunction, BlockPyModule, FunctionId, FunctionKind, ParamKind};
 use soac_blockpy::lower_python_to_blockpy;
 use soac_blockpy::pass_tracker::NoopPassTracker;
-use soac_blockpy::passes::CodegenBlockPyPass;
+use soac_blockpy::passes::CodegenModuleShape;
 use soac_jit::module_type::SoacExtModule;
 use std::time::Instant;
 
@@ -35,7 +35,7 @@ pub(crate) fn register_lowered_module_plans<P>(
 
 fn register_blockpy_module_plans(
     module_name: &str,
-    module: &BlockPyModule<CodegenBlockPyPass>,
+    module: &BlockPyModule<CodegenModuleShape>,
 ) -> PyResult<()> {
     soac_jit::register_clif_module_plans(module_name, module).map_err(|err| {
         pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -285,7 +285,7 @@ fn lookup_bb_function(
     shared_state: &soac_jit::module_type::SharedModuleState,
     function_id: FunctionId,
     operation: &str,
-) -> PyResult<BlockPyFunction<CodegenBlockPyPass>> {
+) -> PyResult<BlockPyFunction<CodegenModuleShape>> {
     shared_state.lookup_function(function_id).cloned().ok_or_else(|| {
         PyRuntimeError::new_err(format!(
             "JIT basic-block {operation} failed to resolve static function metadata for {}.fn#{}",
@@ -296,9 +296,9 @@ fn lookup_bb_function(
 }
 
 fn lookup_module_init_function(
-    module: &BlockPyModule<CodegenBlockPyPass>,
+    module: &BlockPyModule<CodegenModuleShape>,
     module_name: &str,
-) -> PyResult<BlockPyFunction<CodegenBlockPyPass>> {
+) -> PyResult<BlockPyFunction<CodegenModuleShape>> {
     module
         .callable_defs
         .iter()
@@ -345,7 +345,7 @@ fn build_capture_map<'py>(
 
 fn split_param_defaults<'py>(
     py: Python<'py>,
-    function: &BlockPyFunction<CodegenBlockPyPass>,
+    function: &BlockPyFunction<CodegenModuleShape>,
     param_defaults: &Bound<'py, PyAny>,
 ) -> PyResult<(Option<Bound<'py, PyTuple>>, Option<Bound<'py, PyDict>>)> {
     let defaults = param_defaults.cast::<PyTuple>().map_err(|_| {
@@ -410,7 +410,7 @@ fn inspect_param_kind<'py>(
 
 fn build_bb_signature<'py>(
     py: Python<'py>,
-    function: &BlockPyFunction<CodegenBlockPyPass>,
+    function: &BlockPyFunction<CodegenModuleShape>,
     param_defaults: &Bound<'py, PyAny>,
 ) -> PyResult<Py<PyAny>> {
     let inspect_module = PyModule::import(py, "inspect")?;
@@ -453,7 +453,7 @@ fn build_bb_signature<'py>(
 fn build_closure_shaped_entry<'py>(
     py: Python<'py>,
     dp: &Bound<'py, PyModule>,
-    function: &BlockPyFunction<CodegenBlockPyPass>,
+    function: &BlockPyFunction<CodegenModuleShape>,
     module_globals: &Bound<'py, PyAny>,
     qualname: &str,
     captured_names: &[String],
@@ -537,7 +537,7 @@ fn instantiate_bb_function(
     py: Python<'_>,
     dp: &Bound<'_, PyModule>,
     module_name: &str,
-    function: &BlockPyFunction<CodegenBlockPyPass>,
+    function: &BlockPyFunction<CodegenModuleShape>,
     captures: &Bound<'_, PyAny>,
     param_defaults: &Bound<'_, PyAny>,
     module_globals: &Bound<'_, PyAny>,
@@ -580,7 +580,7 @@ fn instantiate_closure_backed_entry<'py>(
     py: Python<'py>,
     dp: &Bound<'py, PyModule>,
     _module_name: &str,
-    function: &BlockPyFunction<CodegenBlockPyPass>,
+    function: &BlockPyFunction<CodegenModuleShape>,
     captures: &Bound<'py, PyAny>,
     module_globals: &Bound<'py, PyAny>,
     module_runtime: &soac_jit::ModuleRuntimeContext,

@@ -7,7 +7,7 @@ use soac_blockpy::block_py::{
     ParamSpec, ResolvedName, StorageLayout, Store, StringLiteral, WithMeta,
 };
 use soac_blockpy::passes::{
-    CodegenBlockPyPass, instrument_bb_module_with_block_entry_counters,
+    CodegenModuleShape, instrument_bb_module_with_block_entry_counters,
     instrument_bb_module_with_refcount_counters,
 };
 mod tests {
@@ -166,7 +166,7 @@ mod tests {
     }
 
     fn test_source_block(
-        function: &BlockPyFunction<CodegenBlockPyPass>,
+        function: &BlockPyFunction<CodegenModuleShape>,
         ops: Vec<InstrCodegen>,
         term: BlockTerm<InstrCodegen>,
     ) -> CodegenBlock {
@@ -179,7 +179,7 @@ mod tests {
         }
     }
 
-    fn test_function() -> BlockPyFunction<CodegenBlockPyPass> {
+    fn test_function() -> BlockPyFunction<CodegenModuleShape> {
         let module_name_gen = ModuleNameGen::new(0);
         let name_gen = module_name_gen.next_function_name_gen();
         BlockPyFunction {
@@ -196,14 +196,14 @@ mod tests {
     }
 
     fn with_test_blocks(
-        mut function: BlockPyFunction<CodegenBlockPyPass>,
+        mut function: BlockPyFunction<CodegenModuleShape>,
         blocks: Vec<CodegenBlock>,
-    ) -> BlockPyFunction<CodegenBlockPyPass> {
+    ) -> BlockPyFunction<CodegenModuleShape> {
         function.blocks = blocks;
         function
     }
 
-    fn set_stack_slots(function: &mut BlockPyFunction<CodegenBlockPyPass>, names: &[&str]) {
+    fn set_stack_slots(function: &mut BlockPyFunction<CodegenModuleShape>, names: &[&str]) {
         function
             .storage_layout
             .get_or_insert_with(StorageLayout::default)
@@ -211,23 +211,23 @@ mod tests {
     }
 
     fn with_single_test_block(
-        function: BlockPyFunction<CodegenBlockPyPass>,
+        function: BlockPyFunction<CodegenModuleShape>,
         ops: Vec<InstrCodegen>,
         term: BlockTerm<InstrCodegen>,
-    ) -> BlockPyFunction<CodegenBlockPyPass> {
+    ) -> BlockPyFunction<CodegenModuleShape> {
         let block = test_source_block(&function, ops, term);
         with_test_blocks(function, vec![block])
     }
 
     fn render_test_jit_function(
-        function: &BlockPyFunction<CodegenBlockPyPass>,
+        function: &BlockPyFunction<CodegenModuleShape>,
         blocks: &[ObjPtr],
     ) -> String {
         render_test_jit_function_with_module_constants(function, blocks, Vec::new())
     }
 
     fn render_test_jit_function_with_module_constants(
-        function: &BlockPyFunction<CodegenBlockPyPass>,
+        function: &BlockPyFunction<CodegenModuleShape>,
         blocks: &[ObjPtr],
         module_constants: Vec<InstrResolved>,
     ) -> String {
@@ -244,8 +244,8 @@ mod tests {
     }
 
     fn render_test_jit_function_with_call_target_specializations(
-        module: &BlockPyModule<CodegenBlockPyPass>,
-        function: &BlockPyFunction<CodegenBlockPyPass>,
+        module: &BlockPyModule<CodegenModuleShape>,
+        function: &BlockPyFunction<CodegenModuleShape>,
         blocks: &[ObjPtr],
         specializations: &[(InstrId, FunctionId)],
     ) -> String {
@@ -358,7 +358,7 @@ mod tests {
     }
 
     fn render_test_jit_function_with_operator_specializations(
-        function: &BlockPyFunction<CodegenBlockPyPass>,
+        function: &BlockPyFunction<CodegenModuleShape>,
         blocks: &[ObjPtr],
         module_constants: Vec<InstrResolved>,
         operator_specializations: &[(InstrId, u64)],
@@ -475,8 +475,8 @@ mod tests {
     }
 
     fn render_test_jit_function_with_constants(
-        module: &BlockPyModule<CodegenBlockPyPass>,
-        function: &BlockPyFunction<CodegenBlockPyPass>,
+        module: &BlockPyModule<CodegenModuleShape>,
+        function: &BlockPyFunction<CodegenModuleShape>,
         blocks: &[ObjPtr],
         module_constants: &crate::module_constants::ModuleCodegenConstants,
     ) -> String {

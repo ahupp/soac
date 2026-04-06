@@ -3,13 +3,13 @@ use crate::block_py::cfg::{
 };
 use crate::block_py::param_specs::ParamSpec;
 use crate::block_py::{
-    assert_blockpy_block_normalized, Block, BlockBuilder, BlockEdge, BlockLabel,
-    BlockPyFallthroughTerm, BlockPyFunction, BlockPyModule, BlockTerm, CallableScopeInfo,
-    FunctionKind, FunctionName, FunctionNameGen, Instr,
+    Block, BlockBuilder, BlockEdge, BlockLabel, BlockPyFallthroughTerm, BlockPyFunction,
+    BlockPyModule, BlockTerm, CallableScopeInfo, FunctionKind, FunctionName, FunctionNameGen,
+    Instr,
 };
 use crate::namegen::fresh_name;
 use crate::passes::ast_to_ast::context::Context;
-use crate::passes::{CoreBlockPyPassWithAwaitAndYield, InstrRuff};
+use crate::passes::{CoreModuleShapeWithAwaitAndYield, InstrRuff};
 use crate::ruff_ast_to_string;
 use crate::template::is_simple;
 use crate::{py_expr, py_stmt};
@@ -87,8 +87,6 @@ impl<I: Instr> InlineBlockBuilder<I> {
     }
 
     pub(crate) fn push_stmt(&mut self, stmt: I)
-    where
-        I: crate::block_py::NormalizedInstr,
     {
         self.current_block.push_stmt(stmt);
     }
@@ -109,10 +107,7 @@ impl<I: Instr> InlineBlockBuilder<I> {
         self.current_block.ensure_fallthrough_term();
     }
 
-    pub(crate) fn append_fragment(&mut self, mut fragment: InlineFragment<I>)
-    where
-        I: crate::block_py::NormalizedInstr,
-    {
+    pub(crate) fn append_fragment(&mut self, mut fragment: InlineFragment<I>) {
         assert!(
             self.current_block.term.is_none(),
             "cannot append inline fragment after builder terminator"
@@ -137,28 +132,19 @@ impl<I: Instr> InlineBlockBuilder<I> {
     pub(crate) fn finish_blocks_with_term(
         mut self,
         term: BlockTerm<I>,
-    ) -> (InlineBlockRef, Vec<Block<I>>)
-    where
-        I: crate::block_py::NormalizedInstr,
-    {
+    ) -> (InlineBlockRef, Vec<Block<I>>) {
         if self.current_block.term.is_none() {
             self.current_block.set_term(term);
         }
         self.finish_blocks()
     }
 
-    pub(crate) fn finish_fallthrough(mut self) -> InlineFragment<I>
-    where
-        I: crate::block_py::NormalizedInstr,
-    {
+    pub(crate) fn finish_fallthrough(mut self) -> InlineFragment<I> {
         self.current_block.ensure_fallthrough_term();
         self.finish_fragment()
     }
 
-    pub(crate) fn finish_fallthrough_blocks(mut self) -> (InlineBlockRef, Vec<Block<I>>)
-    where
-        I: crate::block_py::NormalizedInstr,
-    {
+    pub(crate) fn finish_fallthrough_blocks(mut self) -> (InlineBlockRef, Vec<Block<I>>) {
         self.current_block.ensure_fallthrough_term();
         self.finish_blocks()
     }
@@ -167,10 +153,7 @@ impl<I: Instr> InlineBlockBuilder<I> {
         mut self,
         label: BlockLabel,
         term: BlockTerm<I>,
-    ) -> Option<Block<I>>
-    where
-        I: crate::block_py::NormalizedInstr,
-    {
+    ) -> Option<Block<I>> {
         if !self.deps.is_empty() {
             return None;
         }
@@ -193,10 +176,7 @@ impl<I: Instr> InlineBlockBuilder<I> {
             && self.current_block.term.is_none()
     }
 
-    fn flush_current_block(&mut self)
-    where
-        I: crate::block_py::NormalizedInstr,
-    {
+    fn flush_current_block(&mut self) {
         let current = std::mem::replace(&mut self.current_block, BlockBuilder::new()).finish();
         let term = current
             .term
@@ -210,10 +190,7 @@ impl<I: Instr> InlineBlockBuilder<I> {
         ));
     }
 
-    fn finish_fragment(self) -> InlineFragment<I>
-    where
-        I: crate::block_py::NormalizedInstr,
-    {
+    fn finish_fragment(self) -> InlineFragment<I> {
         let (entry_ref, mut blocks) = self.finish_blocks();
         if blocks.len() == 1 {
             return InlineFragment::new(blocks.pop().expect("single block fragment"), Vec::new());
@@ -239,10 +216,7 @@ impl<I: Instr> InlineBlockBuilder<I> {
         InlineFragment::new(entry, blocks)
     }
 
-    pub(crate) fn finish_blocks(self) -> (InlineBlockRef, Vec<Block<I>>)
-    where
-        I: crate::block_py::NormalizedInstr,
-    {
+    pub(crate) fn finish_blocks(self) -> (InlineBlockRef, Vec<Block<I>>) {
         let current = self.current_block.finish();
         let term = current
             .term
@@ -277,10 +251,7 @@ impl<I: Instr> InlineBlockBuilder<I> {
 }
 
 #[cfg(test)]
-impl<I: Instr> InlineBlockBuilder<I>
-where
-    I: crate::block_py::NormalizedInstr,
-{
+impl<I: Instr> InlineBlockBuilder<I> {
     pub(crate) fn finish(self) -> InlineFragment<I> {
         self.finish_fallthrough()
     }
@@ -435,7 +406,7 @@ pub(crate) fn rewrite_ast_to_core_blockpy_module_with_module(
     module: Vec<Stmt>,
     semantic_state: &crate::passes::ast_to_ast::semantic::SemanticAstState,
     module_name_gen: crate::block_py::ModuleNameGen,
-) -> BlockPyModule<CoreBlockPyPassWithAwaitAndYield> {
+) -> BlockPyModule<CoreModuleShapeWithAwaitAndYield> {
     rewrite_ast_to_core_blockpy_module_plan_with_module(
         context,
         module,
@@ -505,7 +476,7 @@ pub(crate) fn build_core_blockpy_callable_def_from_runtime_input(
     end_label: BlockLabel,
     blockpy_kind: FunctionKind,
     scope: &CallableScopeInfo,
-) -> BlockPyFunction<CoreBlockPyPassWithAwaitAndYield> {
+) -> BlockPyFunction<CoreModuleShapeWithAwaitAndYield> {
     let function_id = name_gen.function_id();
     let mut blocks = Vec::new();
     let entry_label = lower_stmt_sequence_with_state::<crate::block_py::InstrWithAwaitAndYield>(
@@ -516,9 +487,6 @@ pub(crate) fn build_core_blockpy_callable_def_from_runtime_input(
         &name_gen,
     );
     move_entry_block_to_front(&mut blocks, entry_label.clone());
-    for block in &blocks {
-        assert_blockpy_block_normalized(block);
-    }
     let needs_end_block = entry_label == end_label
         || blocks
             .iter()

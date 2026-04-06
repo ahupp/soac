@@ -2,11 +2,11 @@ use crate::block_py::{
     BlockEdge, BlockPyFunction, BlockPyModule, BlockTerm, InstrLow, ResolvedStorageBlock,
 };
 use crate::passes::ruff_to_blockpy::populate_exception_edge_args;
-use crate::passes::ResolvedStorageBlockPyPass;
+use crate::passes::ResolvedStorageModuleShape;
 
 pub fn lower_try_jump_exception_flow(
-    module: &BlockPyModule<ResolvedStorageBlockPyPass>,
-) -> BlockPyModule<ResolvedStorageBlockPyPass> {
+    module: &BlockPyModule<ResolvedStorageModuleShape>,
+) -> BlockPyModule<ResolvedStorageModuleShape> {
     let callable_defs = module
         .callable_defs
         .iter()
@@ -23,8 +23,8 @@ pub fn lower_try_jump_exception_flow(
 }
 
 fn lower_function_try_jump_exception_flow(
-    function: BlockPyFunction<ResolvedStorageBlockPyPass>,
-) -> BlockPyFunction<ResolvedStorageBlockPyPass> {
+    function: BlockPyFunction<ResolvedStorageModuleShape>,
+) -> BlockPyFunction<ResolvedStorageModuleShape> {
     let mut function = BlockPyFunction {
         function_id: function.function_id,
         name_gen: function.name_gen,
@@ -47,7 +47,7 @@ fn lower_function_try_jump_exception_flow(
 }
 
 fn split_exception_blocks_for_expr_checks(
-    function: &mut BlockPyFunction<ResolvedStorageBlockPyPass>,
+    function: &mut BlockPyFunction<ResolvedStorageModuleShape>,
 ) {
     let mut out = Vec::with_capacity(function.blocks.len());
 

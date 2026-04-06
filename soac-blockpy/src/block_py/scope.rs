@@ -1,5 +1,5 @@
 use super::{
-    is_internal_symbol, walk_block, walk_expr, Block, BlockPyFunction, BlockPyPass, Call,
+    is_internal_symbol, walk_block, walk_expr, Block, BlockPyFunction, ModuleShape, Call,
     CallArgPositional, ChildVisitable, FunctionName, Instr, InstrLow, InstrRuff,
     InstrWithAwaitAndYield, InstrWithYield, Literal, NameLike,
 };
@@ -839,7 +839,7 @@ pub(crate) fn compute_make_function_capture_bindings_from_scope<P>(
     callable_def: &BlockPyFunction<P>,
 ) -> Vec<CellCaptureBinding>
 where
-    P: BlockPyPass,
+    P: ModuleShape,
     P::Instr: ScopeExprNode,
 {
     let normalize_capture_name = |name: &str| {
@@ -907,7 +907,7 @@ pub(crate) fn compute_storage_layout_from_scope<P>(
     callable_def: &BlockPyFunction<P>,
 ) -> Option<StorageLayout>
 where
-    P: BlockPyPass,
+    P: ModuleShape,
     P::Instr: ScopeExprNode,
 {
     let owned_cell_slot_names = callable_def.scope.owned_cell_storage_names();
@@ -939,7 +939,7 @@ pub(crate) fn build_storage_layout_from_capture_names<P>(
     local_cell_slots: &[String],
 ) -> Option<StorageLayout>
 where
-    P: BlockPyPass,
+    P: ModuleShape,
 {
     capture_names.sort();
     capture_names.dedup();

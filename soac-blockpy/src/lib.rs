@@ -1,7 +1,7 @@
 use crate::block_py::{BlockPyModule, ModuleNameGen};
 use crate::driver::rewrite_module_with_tracker;
 use crate::pass_tracker::{NoopPassTracker, PassTracker, RecordingPassTracker};
-use crate::passes::CodegenBlockPyPass;
+use crate::passes::CodegenModuleShape;
 use anyhow::Error as AnyhowError;
 use ruff_python_ast::{self as ast, Expr, Stmt};
 use ruff_python_codegen::{Generator, Indentation};
@@ -75,7 +75,7 @@ pub fn init_logging() {
 
 pub struct LoweringResult<P = RecordingPassTracker> {
     pub total_time: Duration,
-    pub codegen_module: BlockPyModule<CodegenBlockPyPass>,
+    pub codegen_module: BlockPyModule<CodegenModuleShape>,
     pub pass_tracker: P,
 }
 

@@ -7,7 +7,7 @@ use crate::{
 
 fn tracked_name_binding_module(
     source: &str,
-) -> crate::block_py::BlockPyModule<crate::passes::ResolvedStorageBlockPyPass> {
+) -> crate::block_py::BlockPyModule<crate::passes::ResolvedStorageModuleShape> {
     lower_python_to_blockpy_for_testing(source)
         .expect("transform should succeed")
         .pass_tracker

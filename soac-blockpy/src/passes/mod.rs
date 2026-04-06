@@ -12,7 +12,7 @@ mod trace;
 
 use crate::block_py::{cfg::relabel_blockpy_blocks_dense, BlockPyModule, ImplicitNoneExpr};
 use crate::block_py::{
-    Await, BinOp, BlockPyPass, Call, CallArgKeyword, CallArgPositional, CallDirect,
+    Await, BinOp, ModuleShape, Call, CallArgKeyword, CallArgPositional, CallDirect,
     CalleeFunctionId, CellRef, CellRefForName, ChildVisitable, Del, DelItem, ExprAttribute,
     ExprBoolOp, ExprBooleanLiteral, ExprBytesLiteral, ExprCompare, ExprDict, ExprDictComp,
     ExprEllipsisLiteral, ExprFString, ExprGenerator, ExprIf, ExprIpyEscapeCommand, ExprLambda,
@@ -92,9 +92,9 @@ pub enum InstrRuff {
 }
 
 #[derive(Debug, Clone)]
-pub struct RuffBlockPyPass;
+pub struct RuffModuleShape;
 
-impl BlockPyPass for RuffBlockPyPass {
+impl ModuleShape for RuffModuleShape {
     type Instr = InstrRuff;
 }
 
@@ -1244,37 +1244,37 @@ pub type InstrUnresolved = InstrLow<UnresolvedName>;
 pub type InstrResolved = InstrLow<ResolvedName>;
 
 #[derive(Debug, Clone)]
-pub struct CoreBlockPyPassWithAwaitAndYield;
+pub struct CoreModuleShapeWithAwaitAndYield;
 
-impl BlockPyPass for CoreBlockPyPassWithAwaitAndYield {
+impl ModuleShape for CoreModuleShapeWithAwaitAndYield {
     type Instr = InstrWithAwaitAndYield;
 }
 
 #[derive(Debug, Clone)]
-pub struct CoreBlockPyPassWithYield;
+pub struct CoreModuleShapeWithYield;
 
-impl BlockPyPass for CoreBlockPyPassWithYield {
+impl ModuleShape for CoreModuleShapeWithYield {
     type Instr = InstrWithYield;
 }
 
 #[derive(Debug, Clone)]
-pub struct CoreBlockPyPass;
+pub struct CoreModuleShape;
 
-impl BlockPyPass for CoreBlockPyPass {
+impl ModuleShape for CoreModuleShape {
     type Instr = InstrLow<UnresolvedName>;
 }
 
 #[derive(Debug, Clone)]
-pub struct ResolvedStorageBlockPyPass;
+pub struct ResolvedStorageModuleShape;
 
-impl BlockPyPass for ResolvedStorageBlockPyPass {
+impl ModuleShape for ResolvedStorageModuleShape {
     type Instr = InstrLow<ResolvedName>;
 }
 
 #[derive(Debug, Clone)]
-pub struct CodegenBlockPyPass;
+pub struct CodegenModuleShape;
 
-impl BlockPyPass for CodegenBlockPyPass {
+impl ModuleShape for CodegenModuleShape {
     type Instr = InstrCodegen;
 }
 
@@ -1295,7 +1295,7 @@ pub(crate) use trace::{
     instrument_bb_module_for_trace, parse_trace_env,
 };
 
-pub fn relabel_dense_bb_module(module: &mut BlockPyModule<CodegenBlockPyPass>) {
+pub fn relabel_dense_bb_module(module: &mut BlockPyModule<CodegenModuleShape>) {
     for callable in &mut module.callable_defs {
         relabel_blockpy_blocks_dense(&mut callable.blocks);
     }

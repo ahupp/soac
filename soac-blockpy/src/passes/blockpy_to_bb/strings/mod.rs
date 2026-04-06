@@ -2,12 +2,12 @@ use crate::block_py::{
     BlockPyFunction, BlockPyModule, HasMeta, InstrCodegen, InstrLow, InstrResolved, LiteralValue,
     Load, MapFunction, MapInstr, Mappable, NameLocation, ResolvedName, WithMeta,
 };
-use crate::passes::{CodegenBlockPyPass, ResolvedStorageBlockPyPass};
+use crate::passes::{CodegenModuleShape, ResolvedStorageModuleShape};
 use soac_macros::match_default;
 
 pub fn normalize_bb_module_strings(
-    module: &BlockPyModule<ResolvedStorageBlockPyPass>,
-) -> BlockPyModule<CodegenBlockPyPass> {
+    module: &BlockPyModule<ResolvedStorageModuleShape>,
+) -> BlockPyModule<CodegenModuleShape> {
     let mut normalizer = CodegenExprNormalizer::default();
     let module = module.clone();
     let mut module_constants = module.module_constants;
@@ -15,7 +15,7 @@ pub fn normalize_bb_module_strings(
         .callable_defs
         .into_iter()
         .map(|function| normalizer.map_fn(function))
-        .collect::<Vec<BlockPyFunction<CodegenBlockPyPass>>>();
+        .collect::<Vec<BlockPyFunction<CodegenModuleShape>>>();
     module_constants.extend(normalizer.module_constants);
     BlockPyModule {
         module_name_gen: module.module_name_gen,

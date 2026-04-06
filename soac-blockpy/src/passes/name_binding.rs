@@ -13,7 +13,7 @@ use crate::block_py::{
 use crate::passes::ruff_to_blockpy::{
     populate_exception_edge_args, rewrite_current_exception_in_core_blocks,
 };
-use crate::passes::{CoreBlockPyPass, ResolvedStorageBlockPyPass};
+use crate::passes::{CoreModuleShape, ResolvedStorageModuleShape};
 use ruff_python_ast::{self as ast};
 use soac_macros::match_default;
 use std::collections::{HashMap, HashSet};
@@ -763,7 +763,7 @@ fn build_closure_slot_cell_init_assign(slot: &ClosureSlot) -> CoreStmt {
     )
 }
 
-fn prepend_owned_cell_init_preamble(callable: &mut BlockPyFunction<CoreBlockPyPass>) {
+fn prepend_owned_cell_init_preamble(callable: &mut BlockPyFunction<CoreModuleShape>) {
     let init_stmts = match callable.kind {
         FunctionKind::Function => {
             let mut storage_names = callable
@@ -1417,7 +1417,7 @@ fn collect_runtime_bound_local_names(
 }
 
 fn collect_always_unbound_local_names(
-    callable: &BlockPyFunction<CoreBlockPyPass>,
+    callable: &BlockPyFunction<CoreModuleShape>,
 ) -> HashSet<String> {
     let scope = &callable.scope;
     let storage_layout = callable
@@ -1528,7 +1528,7 @@ fn resolve_captured_cell_source_storage_name(
 }
 
 fn collect_captured_cell_slot_locations(
-    callable: &BlockPyFunction<CoreBlockPyPass>,
+    callable: &BlockPyFunction<CoreModuleShape>,
 ) -> HashMap<String, u32> {
     let mut slots = HashMap::new();
     if let Some(layout) = callable.storage_layout.as_ref() {
@@ -1541,7 +1541,7 @@ fn collect_captured_cell_slot_locations(
 }
 
 fn collect_owned_cell_storage_bindings(
-    callable: &BlockPyFunction<CoreBlockPyPass>,
+    callable: &BlockPyFunction<CoreModuleShape>,
 ) -> Vec<(String, String)> {
     if let Some(layout) = callable
         .storage_layout
@@ -1575,7 +1575,7 @@ fn collect_owned_cell_storage_bindings(
 }
 
 fn collect_owned_cell_slot_locations(
-    callable: &BlockPyFunction<CoreBlockPyPass>,
+    callable: &BlockPyFunction<CoreModuleShape>,
 ) -> HashMap<String, u32> {
     let mut slots = HashMap::new();
     for (slot, (logical_name, storage_name)) in collect_owned_cell_storage_bindings(callable)
@@ -1589,7 +1589,7 @@ fn collect_owned_cell_slot_locations(
 }
 
 fn collect_cell_bindings(
-    callable: &BlockPyFunction<CoreBlockPyPass>,
+    callable: &BlockPyFunction<CoreModuleShape>,
 ) -> HashMap<String, (String, CellBindingKind)> {
     let mut bindings = HashMap::new();
     let Some(layout) = callable.storage_layout.as_ref() else {
@@ -1662,7 +1662,7 @@ fn is_remaining_local_name(
 }
 
 fn compute_local_slot_locations_from_analysis(
-    callable: &BlockPyFunction<CoreBlockPyPass>,
+    callable: &BlockPyFunction<CoreModuleShape>,
 ) -> HashMap<String, u32> {
     let mut slots = HashMap::new();
     for (slot, param_name) in callable.params.names().into_iter().enumerate() {
@@ -1737,7 +1737,7 @@ fn ordered_slot_names_from_local_slots(local_slots: HashMap<String, u32>) -> Vec
 }
 
 fn collect_local_slot_locations(
-    callable: &BlockPyFunction<CoreBlockPyPass>,
+    callable: &BlockPyFunction<CoreModuleShape>,
 ) -> HashMap<String, u32> {
     if let Some(layout) = callable
         .storage_layout
@@ -1755,7 +1755,7 @@ fn collect_local_slot_locations(
     compute_local_slot_locations_from_analysis(callable)
 }
 
-fn populate_stack_slots_in_storage_layout<P: crate::block_py::BlockPyPass>(
+fn populate_stack_slots_in_storage_layout<P: crate::block_py::ModuleShape>(
     callable: &mut BlockPyFunction<P>,
     local_slots: HashMap<String, u32>,
 ) {
@@ -1766,7 +1766,7 @@ fn populate_stack_slots_in_storage_layout<P: crate::block_py::BlockPyPass>(
         .set_stack_slots(stack_slots);
 }
 
-fn ensure_storage_layout_covers_block_params<P: crate::block_py::BlockPyPass>(
+fn ensure_storage_layout_covers_block_params<P: crate::block_py::ModuleShape>(
     callable: &mut BlockPyFunction<P>,
 ) {
     let Some(layout) = callable.storage_layout.as_mut() else {
@@ -2075,9 +2075,9 @@ impl MapInstr<InstrUnresolved, InstrLow<ResolvedName>> for NameLocator<'_> {
 }
 
 fn locate_names_in_callable(
-    callable: BlockPyFunction<CoreBlockPyPass>,
+    callable: BlockPyFunction<CoreModuleShape>,
     global_slots: &mut ModuleGlobalSlots,
-) -> BlockPyFunction<ResolvedStorageBlockPyPass> {
+) -> BlockPyFunction<ResolvedStorageModuleShape> {
     let scope = callable.scope.clone();
     let exception_param_names = callable
         .blocks
@@ -2123,7 +2123,7 @@ fn collect_make_function_callee_ids_in_expr(expr: &InstrUnresolved, out: &mut Ve
 }
 
 fn collect_make_function_callee_ids(
-    callable: &BlockPyFunction<CoreBlockPyPass>,
+    callable: &BlockPyFunction<CoreModuleShape>,
 ) -> Vec<FunctionId> {
     let mut out = Vec::new();
     for block in &callable.blocks {
@@ -2160,7 +2160,7 @@ fn collect_make_function_callee_ids_in_term(
 
 fn compute_callable_storage_layout_for_name_binding(
     function_id: FunctionId,
-    callable_by_id: &HashMap<FunctionId, &BlockPyFunction<CoreBlockPyPass>>,
+    callable_by_id: &HashMap<FunctionId, &BlockPyFunction<CoreModuleShape>>,
     make_function_callees: &HashMap<FunctionId, Vec<FunctionId>>,
     memo: &mut HashMap<FunctionId, Option<StorageLayout>>,
     visiting: &mut HashSet<FunctionId>,
@@ -2254,8 +2254,8 @@ fn compute_callable_storage_layout_for_name_binding(
 }
 
 fn ensure_module_storage_layouts(
-    callable_defs: Vec<BlockPyFunction<CoreBlockPyPass>>,
-) -> Vec<BlockPyFunction<CoreBlockPyPass>> {
+    callable_defs: Vec<BlockPyFunction<CoreModuleShape>>,
+) -> Vec<BlockPyFunction<CoreModuleShape>> {
     let computed_layouts = {
         let callable_by_id = callable_defs
             .iter()
@@ -2299,11 +2299,11 @@ fn ensure_module_storage_layouts(
 }
 
 fn compute_module_make_function_capture_names(
-    callable_defs: &[BlockPyFunction<CoreBlockPyPass>],
+    callable_defs: &[BlockPyFunction<CoreModuleShape>],
 ) -> HashMap<FunctionId, Vec<CellCaptureBinding>> {
     fn compute_callable_make_function_capture_bindings_for_name_binding(
         function_id: FunctionId,
-        callable_by_id: &HashMap<FunctionId, &BlockPyFunction<CoreBlockPyPass>>,
+        callable_by_id: &HashMap<FunctionId, &BlockPyFunction<CoreModuleShape>>,
         make_function_callees: &HashMap<FunctionId, Vec<FunctionId>>,
         memo: &mut HashMap<FunctionId, Vec<CellCaptureBinding>>,
         visiting: &mut HashSet<FunctionId>,
@@ -2463,8 +2463,8 @@ fn compute_module_make_function_capture_names(
 }
 
 fn refresh_bb_callable_block_params(
-    callable: BlockPyFunction<ResolvedStorageBlockPyPass>,
-) -> BlockPyFunction<ResolvedStorageBlockPyPass> {
+    callable: BlockPyFunction<ResolvedStorageModuleShape>,
+) -> BlockPyFunction<ResolvedStorageModuleShape> {
     let BlockPyFunction {
         function_id,
         name_gen,
@@ -2553,10 +2553,10 @@ fn populate_jump_edge_args(blocks: &mut [crate::block_py::ResolvedStorageBlock])
 }
 
 fn lower_name_binding_callable(
-    callable: BlockPyFunction<CoreBlockPyPass>,
+    callable: BlockPyFunction<CoreModuleShape>,
     callee_make_function_captures: &HashMap<crate::block_py::FunctionId, Vec<CellCaptureBinding>>,
     global_slots: &mut ModuleGlobalSlots,
-) -> BlockPyFunction<ResolvedStorageBlockPyPass> {
+) -> BlockPyFunction<ResolvedStorageModuleShape> {
     let scope = callable.scope.clone();
     let local_slots = collect_local_slot_locations(&callable);
     let mut mapper = NameBindingMapper {
@@ -2616,8 +2616,8 @@ fn lower_name_binding_callable(
 }
 
 fn normalize_stmt_ops_in_resolved_callable(
-    callable: BlockPyFunction<ResolvedStorageBlockPyPass>,
-) -> BlockPyFunction<ResolvedStorageBlockPyPass> {
+    callable: BlockPyFunction<ResolvedStorageModuleShape>,
+) -> BlockPyFunction<ResolvedStorageModuleShape> {
     callable
 }
 
@@ -2629,8 +2629,8 @@ struct ModuleConstantExtractor {
 impl ModuleConstantExtractor {
     fn extract_module(
         mut self,
-        mut module: BlockPyModule<ResolvedStorageBlockPyPass>,
-    ) -> BlockPyModule<ResolvedStorageBlockPyPass> {
+        mut module: BlockPyModule<ResolvedStorageModuleShape>,
+    ) -> BlockPyModule<ResolvedStorageModuleShape> {
         debug_assert!(
             module.module_constants.is_empty(),
             "name binding should be the first pass to populate module constants"
@@ -2642,7 +2642,7 @@ impl ModuleConstantExtractor {
         module
     }
 
-    fn extract_function(&mut self, function: &mut BlockPyFunction<ResolvedStorageBlockPyPass>) {
+    fn extract_function(&mut self, function: &mut BlockPyFunction<ResolvedStorageModuleShape>) {
         for block in &mut function.blocks {
             for stmt in &mut block.body {
                 self.extract_stmt(stmt);
@@ -2683,8 +2683,8 @@ impl crate::block_py::VisitMut<InstrResolved> for ModuleConstantExtractor {
 }
 
 pub(crate) fn lower_name_binding_in_core_blockpy_module(
-    module: BlockPyModule<CoreBlockPyPass>,
-) -> BlockPyModule<ResolvedStorageBlockPyPass> {
+    module: BlockPyModule<CoreModuleShape>,
+) -> BlockPyModule<ResolvedStorageModuleShape> {
     let callable_defs = ensure_module_storage_layouts(module.callable_defs);
     let callee_make_function_capture_names =
         compute_module_make_function_capture_names(&callable_defs);

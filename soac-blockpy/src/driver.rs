@@ -11,8 +11,8 @@ use crate::passes::ast_to_ast::{
 use crate::passes::core_await_lower::lower_awaits_in_core_blockpy_module;
 use crate::passes::ruff_to_blockpy::rewrite_ast_to_core_blockpy_module_with_module;
 use crate::passes::{
-    self, CodegenBlockPyPass, CoreBlockPyPass, CoreBlockPyPassWithAwaitAndYield,
-    CoreBlockPyPassWithYield, ResolvedStorageBlockPyPass,
+    self, CodegenModuleShape, CoreModuleShape, CoreModuleShapeWithAwaitAndYield,
+    CoreModuleShapeWithYield, ResolvedStorageModuleShape,
 };
 use crate::{ParseError, Result};
 use ruff_python_ast::{self as ast, Stmt};
@@ -69,7 +69,7 @@ pub(crate) fn rewrite_module_with_tracker(
     source: &str,
     module_name_gen: ModuleNameGen,
     pass_tracker: &mut impl PassTracker,
-) -> Result<BlockPyModule<CodegenBlockPyPass>> {
+) -> Result<BlockPyModule<CodegenModuleShape>> {
     let module =
         pass_tracker.record_timing("parse", || -> std::result::Result<_, ParseError> {
             let mut module = parse_module(source).map(|module| module.into_syntax())?;
@@ -125,7 +125,7 @@ pub(crate) fn rewrite_module_with_tracker(
        still jump to finally.
     */
 
-    let core_blockpy: BlockPyModule<CoreBlockPyPassWithAwaitAndYield> =
+    let core_blockpy: BlockPyModule<CoreModuleShapeWithAwaitAndYield> =
         pass_tracker.run_pass("core_blockpy_with_await_and_yield", || {
             rewrite_ast_to_core_blockpy_module_with_module(
                 &context,
@@ -138,7 +138,7 @@ pub(crate) fn rewrite_module_with_tracker(
     /*
       A very simple pass to rewrite `await foo` into `yield from __soac__.await_iter(foo)`
     */
-    let core_blockpy_without_await: BlockPyModule<CoreBlockPyPassWithYield> = pass_tracker
+    let core_blockpy_without_await: BlockPyModule<CoreModuleShapeWithYield> = pass_tracker
         .run_pass("core_blockpy_with_yield", || {
             lower_awaits_in_core_blockpy_module(core_blockpy)
         });
@@ -149,7 +149,7 @@ pub(crate) fn rewrite_module_with_tracker(
      `resume` carries state in closure cells, with blocks split at yield/resume points.
 
     */
-    let core_blockpy_without_await_or_yield: BlockPyModule<CoreBlockPyPass> = pass_tracker
+    let core_blockpy_without_await_or_yield: BlockPyModule<CoreModuleShape> = pass_tracker
         .run_pass("core_blockpy", || {
             passes::lower_yield_in_lowered_core_blockpy_module_bundle(core_blockpy_without_await)
         });
@@ -163,23 +163,23 @@ pub(crate) fn rewrite_module_with_tracker(
        - locals are assigned stack slots, and become LoadLocation / StoreLocation / DelLocation with local-slot locations.
 
     */
-    let name_binding: BlockPyModule<ResolvedStorageBlockPyPass> = pass_tracker
+    let name_binding: BlockPyModule<ResolvedStorageModuleShape> = pass_tracker
         .run_pass("name_binding", || {
             passes::lower_name_binding_in_core_blockpy_module(core_blockpy_without_await_or_yield)
         });
 
-    let bb_prepared: BlockPyModule<ResolvedStorageBlockPyPass> = pass_tracker
+    let bb_prepared: BlockPyModule<ResolvedStorageModuleShape> = pass_tracker
         .run_pass("bb_prepared", || {
             passes::lower_try_jump_exception_flow(&name_binding)
         });
-    let bb_codegen: BlockPyModule<CodegenBlockPyPass> = pass_tracker.run_pass("bb_codegen", || {
+    let bb_codegen: BlockPyModule<CodegenModuleShape> = pass_tracker.run_pass("bb_codegen", || {
         let mut bb_codegen = passes::normalize_bb_module_strings(&bb_prepared);
         passes::relabel_dense_bb_module(&mut bb_codegen);
         passes::assign_module_instr_ids(&mut bb_codegen);
         bb_codegen
     });
 
-    let bb_traced: BlockPyModule<CodegenBlockPyPass> =
+    let bb_traced: BlockPyModule<CodegenModuleShape> =
         if let Some(config) = passes::parse_trace_env() {
             pass_tracker.run_pass("bb_trace", || {
                 let mut traced = bb_codegen;
@@ -190,7 +190,7 @@ pub(crate) fn rewrite_module_with_tracker(
             bb_codegen
         };
 
-    let bb_counted: BlockPyModule<CodegenBlockPyPass> =
+    let bb_counted: BlockPyModule<CodegenModuleShape> =
         if passes::global_load_counter_instrumentation_enabled() {
             pass_tracker.run_pass("bb_global_load_counters", || {
                 let mut counted = bb_traced;
@@ -201,7 +201,7 @@ pub(crate) fn rewrite_module_with_tracker(
             bb_traced
         };
 
-    let bb_call_target_counted: BlockPyModule<CodegenBlockPyPass> =
+    let bb_call_target_counted: BlockPyModule<CodegenModuleShape> =
         if passes::call_target_counter_instrumentation_enabled() {
             pass_tracker.run_pass("bb_call_target_counters", || {
                 let mut counted = bb_counted;

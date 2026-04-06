@@ -3,7 +3,7 @@ use crate::block_py::{
     ChildVisitable, CounterScope, CounterSite, HasMeta, IncrementCounter, InstrCodegen,
     InstrResolved, Load, Meta, NameLocation, ResolvedName, StringLiteral, Visit, WithMeta,
 };
-use crate::passes::{CodegenBlockPyPass, CounterBuilder};
+use crate::passes::{CodegenModuleShape, CounterBuilder};
 use std::collections::HashMap;
 use std::env;
 
@@ -57,7 +57,7 @@ pub(crate) fn parse_trace_config(raw: &str) -> Option<TraceConfig> {
 }
 
 pub(crate) fn instrument_bb_module_for_trace(
-    module: &mut BlockPyModule<CodegenBlockPyPass>,
+    module: &mut BlockPyModule<CodegenModuleShape>,
     config: &TraceConfig,
 ) {
     let global_names = module.global_names.clone();
@@ -96,7 +96,7 @@ pub(crate) fn instrument_bb_module_for_trace(
 }
 
 pub fn instrument_bb_module_with_block_entry_counters(
-    module: &mut BlockPyModule<CodegenBlockPyPass>,
+    module: &mut BlockPyModule<CodegenModuleShape>,
 ) {
     let mut counters = CounterBuilder::new(&mut module.counter_defs);
     for function in &mut module.callable_defs {
@@ -120,7 +120,7 @@ pub fn instrument_bb_module_with_block_entry_counters(
 }
 
 pub fn instrument_bb_module_with_refcount_counters(
-    module: &mut BlockPyModule<CodegenBlockPyPass>,
+    module: &mut BlockPyModule<CodegenModuleShape>,
     scope: CounterScope,
 ) -> Result<(), String> {
     let mut counters = CounterBuilder::new(&mut module.counter_defs);
@@ -167,7 +167,7 @@ pub fn instrument_bb_module_with_refcount_counters(
 }
 
 pub fn instrument_bb_module_with_global_load_counters(
-    module: &mut BlockPyModule<CodegenBlockPyPass>,
+    module: &mut BlockPyModule<CodegenModuleShape>,
 ) {
     let mut counters = CounterBuilder::new(&mut module.counter_defs);
     for kind in ["global_load_hit", "global_load_miss"] {
@@ -183,7 +183,7 @@ pub fn instrument_bb_module_with_global_load_counters(
 }
 
 pub fn instrument_bb_module_with_call_target_counters(
-    module: &mut BlockPyModule<CodegenBlockPyPass>,
+    module: &mut BlockPyModule<CodegenModuleShape>,
 ) {
     fn is_operator_specialization_candidate(expr: &InstrCodegen) -> bool {
         match expr {
@@ -296,7 +296,7 @@ struct PreparedTraceNameLocator {
 }
 
 impl PreparedTraceNameLocator {
-    fn new(function: &BlockPyFunction<CodegenBlockPyPass>, global_names: &[String]) -> Self {
+    fn new(function: &BlockPyFunction<CodegenModuleShape>, global_names: &[String]) -> Self {
         let mut local_slots = function
             .storage_layout
             .as_ref()

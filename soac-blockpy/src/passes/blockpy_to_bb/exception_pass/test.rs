@@ -5,11 +5,11 @@ use crate::block_py::{
     NameLocation, NumberLiteral, NumberLiteralValue, ResolvedStorageBlock, StorageLayout,
 };
 use crate::lower_python_to_blockpy_for_testing;
-use crate::passes::CodegenBlockPyPass;
+use crate::passes::CodegenModuleShape;
 
 fn tracked_name_binding_module(
     source: &str,
-) -> crate::block_py::BlockPyModule<crate::passes::ResolvedStorageBlockPyPass> {
+) -> crate::block_py::BlockPyModule<crate::passes::ResolvedStorageModuleShape> {
     lower_python_to_blockpy_for_testing(source)
         .expect("lowering must succeed")
         .pass_tracker
@@ -18,7 +18,7 @@ fn tracked_name_binding_module(
         .clone()
 }
 
-fn tracked_codegen_module(source: &str) -> crate::block_py::BlockPyModule<CodegenBlockPyPass> {
+fn tracked_codegen_module(source: &str) -> crate::block_py::BlockPyModule<CodegenModuleShape> {
     let name_binding = tracked_name_binding_module(source);
     let lowered = lower_try_jump_exception_flow(&name_binding);
     let mut codegen = crate::passes::normalize_bb_module_strings(&lowered);

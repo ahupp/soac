@@ -9,7 +9,7 @@ use pyo3::types::PyAnyMethods;
 use soac_blockpy::block_py::{
     BlockPyFunction, BlockPyModule, CounterDef, CounterId, CounterScope, CounterSite, FunctionId,
 };
-use soac_blockpy::passes::CodegenBlockPyPass;
+use soac_blockpy::passes::CodegenModuleShape;
 use std::collections::HashMap;
 use std::env;
 use std::ffi::{c_int, c_void};
@@ -26,7 +26,7 @@ pub struct SoacExtModuleDataRef<'a> {
 }
 
 pub struct SharedModuleState {
-    pub lowered_module: BlockPyModule<CodegenBlockPyPass>,
+    pub lowered_module: BlockPyModule<CodegenModuleShape>,
     pub module_name: String,
     pub package_name: String,
     pub codegen_constants: ModuleCodegenConstants,
@@ -64,7 +64,7 @@ impl SharedModuleState {
     pub fn lookup_function(
         &self,
         function_id: FunctionId,
-    ) -> Option<&BlockPyFunction<CodegenBlockPyPass>> {
+    ) -> Option<&BlockPyFunction<CodegenModuleShape>> {
         let function_index = self.function_index_by_id.get(&function_id).copied()?;
         let function = self.lowered_module.callable_defs.get(function_index)?;
         assert_eq!(function.function_id, function_id);
@@ -416,7 +416,7 @@ fn build_counter_storage(
 #[cfg(test)]
 pub(crate) fn build_shared_state_for_testing(
     py: Python<'_>,
-    lowered_module: BlockPyModule<CodegenBlockPyPass>,
+    lowered_module: BlockPyModule<CodegenModuleShape>,
     module_name: &str,
     package_name: &str,
 ) -> PyResult<Arc<SharedModuleState>> {
@@ -440,7 +440,7 @@ pub(crate) fn build_shared_state_for_testing(
 }
 
 fn build_function_index_by_id(
-    module: &BlockPyModule<CodegenBlockPyPass>,
+    module: &BlockPyModule<CodegenModuleShape>,
 ) -> PyResult<HashMap<FunctionId, usize>> {
     let mut function_index_by_id = HashMap::with_capacity(module.callable_defs.len());
     for (function_index, function) in module.callable_defs.iter().enumerate() {
@@ -469,7 +469,7 @@ impl SoacExtModuleState {
     unsafe fn init(
         &mut self,
         py: Python<'_>,
-        lowered_module: BlockPyModule<CodegenBlockPyPass>,
+        lowered_module: BlockPyModule<CodegenModuleShape>,
         module_name: String,
         package_name: String,
     ) -> PyResult<()> {
@@ -663,7 +663,7 @@ impl SoacExtModule {
     pub fn new(
         py: Python<'_>,
         spec: &Bound<'_, PyAny>,
-        lowered_module: BlockPyModule<CodegenBlockPyPass>,
+        lowered_module: BlockPyModule<CodegenModuleShape>,
     ) -> PyResult<Py<PyAny>> {
         let module_name = spec
             .getattr("name")?

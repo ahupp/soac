@@ -2,7 +2,7 @@ use crate::block_py::{
     walk_expr_mut, BlockLabel, BlockPyFunction, BlockPyModule, ChildVisitable, HasMeta,
     InstrCodegen, InstrId, VisitMut, WithMeta,
 };
-use crate::passes::CodegenBlockPyPass;
+use crate::passes::CodegenModuleShape;
 
 struct BlockInstrIdAssigner {
     block_label: BlockLabel,
@@ -37,7 +37,7 @@ impl VisitMut<InstrCodegen> for BlockInstrIdAssigner {
     }
 }
 
-pub fn assign_function_instr_ids(function: &mut BlockPyFunction<CodegenBlockPyPass>) {
+pub fn assign_function_instr_ids(function: &mut BlockPyFunction<CodegenModuleShape>) {
     for block in &mut function.blocks {
         let mut assigner = BlockInstrIdAssigner {
             block_label: block.label,
@@ -47,7 +47,7 @@ pub fn assign_function_instr_ids(function: &mut BlockPyFunction<CodegenBlockPyPa
     }
 }
 
-pub fn assign_module_instr_ids(module: &mut BlockPyModule<CodegenBlockPyPass>) {
+pub fn assign_module_instr_ids(module: &mut BlockPyModule<CodegenModuleShape>) {
     for function in &mut module.callable_defs {
         assign_function_instr_ids(function);
     }

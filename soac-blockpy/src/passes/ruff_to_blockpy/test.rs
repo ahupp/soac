@@ -1,7 +1,7 @@
 use super::*;
 
 use crate::block_py::{
-    BlockEdge, BlockLabel, BlockPyFunction, BlockPyModule, BlockPyPass, BlockTerm,
+    BlockEdge, BlockLabel, BlockPyFunction, BlockPyModule, ModuleShape, BlockTerm,
     InstrWithAwaitAndYield, TermRaise,
 };
 use crate::lower_python_to_blockpy_for_testing;
@@ -11,7 +11,7 @@ use crate::passes::ruff_to_blockpy::stmt_sequences::{
     lower_while_stmt_sequence, lower_while_stmt_sequence_from_stmt, plan_instr_sequence_head,
 };
 use crate::passes::ruff_to_blockpy::try_regions::build_try_plan;
-use crate::passes::{CoreBlockPyPass, CoreBlockPyPassWithAwaitAndYield, InstrRuff};
+use crate::passes::{CoreModuleShape, CoreModuleShapeWithAwaitAndYield, InstrRuff};
 use stmt_lowering::lower_instr_for_test;
 
 fn test_name_gen() -> FunctionNameGen {
@@ -19,7 +19,7 @@ fn test_name_gen() -> FunctionNameGen {
     module_name_gen.next_function_name_gen()
 }
 
-fn wrapped_blockpy(source: &str) -> BlockPyModule<CoreBlockPyPassWithAwaitAndYield> {
+fn wrapped_blockpy(source: &str) -> BlockPyModule<CoreModuleShapeWithAwaitAndYield> {
     lower_python_to_blockpy_for_testing(source)
         .unwrap()
         .pass_tracker
@@ -30,11 +30,11 @@ fn wrapped_blockpy(source: &str) -> BlockPyModule<CoreBlockPyPassWithAwaitAndYie
 
 fn wrapped_core_blockpy_with_await_and_yield(
     source: &str,
-) -> BlockPyModule<CoreBlockPyPassWithAwaitAndYield> {
+) -> BlockPyModule<CoreModuleShapeWithAwaitAndYield> {
     wrapped_blockpy(source)
 }
 
-fn wrapped_core_blockpy(source: &str) -> BlockPyModule<CoreBlockPyPass> {
+fn wrapped_core_blockpy(source: &str) -> BlockPyModule<CoreModuleShape> {
     lower_python_to_blockpy_for_testing(source)
         .unwrap()
         .pass_tracker
@@ -43,7 +43,7 @@ fn wrapped_core_blockpy(source: &str) -> BlockPyModule<CoreBlockPyPass> {
         .clone()
 }
 
-fn function_by_name<'a, P: BlockPyPass>(
+fn function_by_name<'a, P: ModuleShape>(
     blockpy: &'a BlockPyModule<P>,
     bind_name: &str,
 ) -> &'a BlockPyFunction<P> {

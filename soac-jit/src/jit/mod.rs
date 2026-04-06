@@ -23,7 +23,7 @@ use soac_blockpy::block_py::{
     NameLocation, ParamDefaultSource, ResolvedName, StorageLayout, Visit, WithMeta,
     operation as blockpy_intrinsics,
 };
-use soac_blockpy::passes::{CodegenBlockPyPass, InstrResolved};
+use soac_blockpy::passes::{CodegenModuleShape, InstrResolved};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -712,7 +712,7 @@ struct JitEmitConsts {
 }
 
 struct JitEmitCtx<'mc> {
-    module: &'mc BlockPyModule<CodegenBlockPyPass>,
+    module: &'mc BlockPyModule<CodegenModuleShape>,
     shared_state: Option<&'mc crate::module_type::SharedModuleState>,
     module_constants: &'mc ModuleCodegenConstants,
     module_constant_ptrs: &'mc [*mut ffi::PyObject],
@@ -1251,7 +1251,7 @@ fn build_counted_runtime_refcount_helper(
 
 fn build_counted_runtime_refcount_helpers(
     jit_module: &mut JITModule,
-    function: &BlockPyFunction<CodegenBlockPyPass>,
+    function: &BlockPyFunction<CodegenModuleShape>,
     counter_defs: &[CounterDef],
     counter_ptrs: &[*mut u64],
 ) -> Result<CountedRefcountHelpers, String> {
@@ -1693,7 +1693,7 @@ fn emit_checked_i32_result(
 }
 
 fn module_constant_string_value<'a>(
-    module: &'a BlockPyModule<CodegenBlockPyPass>,
+    module: &'a BlockPyModule<CodegenModuleShape>,
     constant_index: u32,
 ) -> Option<&'a str> {
     let InstrResolved::Literal(literal) = module.module_constants.get(constant_index as usize)?
@@ -1707,7 +1707,7 @@ fn module_constant_string_value<'a>(
 }
 
 fn codegen_constant_string_value<'a>(
-    module: &'a BlockPyModule<CodegenBlockPyPass>,
+    module: &'a BlockPyModule<CodegenModuleShape>,
     expr: &InstrCodegen,
 ) -> Option<&'a str> {
     let InstrCodegen::Load(load) = expr else {
@@ -1863,7 +1863,7 @@ fn direct_constructor_specializations_for_call_site(
 }
 
 fn collect_call_direct_targets(
-    function: &BlockPyFunction<CodegenBlockPyPass>,
+    function: &BlockPyFunction<CodegenModuleShape>,
 ) -> HashSet<FunctionId> {
     struct CallDirectTargetCollector<'a> {
         out: &'a mut HashSet<FunctionId>,
@@ -2359,7 +2359,7 @@ fn emit_direct_call_resolved_raw_with_arg_values(
     callable_is_borrowed: bool,
     arg_values: Vec<ir::Value>,
     arg_borrowed: Vec<bool>,
-    target_function: &BlockPyFunction<CodegenBlockPyPass>,
+    target_function: &BlockPyFunction<CodegenModuleShape>,
     target_code_ptr: ObjPtr,
     ctx: &JitEmitCtx<'_>,
     jit_module: &mut JITModule,
@@ -2408,7 +2408,7 @@ fn emit_direct_call_resolved_with_arg_values(
     callable_is_borrowed: bool,
     arg_values: Vec<ir::Value>,
     arg_borrowed: Vec<bool>,
-    target_function: &BlockPyFunction<CodegenBlockPyPass>,
+    target_function: &BlockPyFunction<CodegenModuleShape>,
     target_code_ptr: ObjPtr,
     ctx: &JitEmitCtx<'_>,
     jit_module: &mut JITModule,
@@ -2449,7 +2449,7 @@ fn emit_direct_constructor_resolved_with_arg_values(
     arg_values: Vec<ir::Value>,
     arg_borrowed: Vec<bool>,
     specialization: DirectConstructorSpecialization,
-    target_function: &BlockPyFunction<CodegenBlockPyPass>,
+    target_function: &BlockPyFunction<CodegenModuleShape>,
     ctx: &JitEmitCtx<'_>,
     jit_module: &mut JITModule,
 ) -> ir::Value {
@@ -2529,7 +2529,7 @@ fn emit_direct_call_resolved(
     callable: ir::Value,
     callable_is_borrowed: bool,
     args: &[&InstrCodegen],
-    target_function: &BlockPyFunction<CodegenBlockPyPass>,
+    target_function: &BlockPyFunction<CodegenModuleShape>,
     target_code_ptr: ObjPtr,
     local_names: &mut Vec<String>,
     local_values: &mut Vec<ir::Value>,
@@ -5477,7 +5477,7 @@ fn rewrite_block_header_annotations(
     out
 }
 
-pub fn run_cranelift_smoke(module: &BlockPyModule<CodegenBlockPyPass>) -> Result<(), String> {
+pub fn run_cranelift_smoke(module: &BlockPyModule<CodegenModuleShape>) -> Result<(), String> {
     let function_count = module.callable_defs.len() as i64;
     let block_count = module
         .callable_defs
@@ -5529,8 +5529,8 @@ pub fn run_cranelift_smoke(module: &BlockPyModule<CodegenBlockPyPass>) -> Result
 fn build_cranelift_run_bb_specialized_function(
     jit_module: &mut JITModule,
     blocks: &[ObjPtr],
-    module: &BlockPyModule<CodegenBlockPyPass>,
-    function: &BlockPyFunction<CodegenBlockPyPass>,
+    module: &BlockPyModule<CodegenModuleShape>,
+    function: &BlockPyFunction<CodegenModuleShape>,
     module_constants: &ModuleCodegenConstants,
     counter_defs: &[CounterDef],
     module_constant_ptrs: &[*mut ffi::PyObject],
@@ -6262,8 +6262,8 @@ fn build_cranelift_run_bb_specialized_function(
 
 pub unsafe fn render_cranelift_run_bb_specialized_with_cfg(
     blocks: &[ObjPtr],
-    module: &BlockPyModule<CodegenBlockPyPass>,
-    function: &soac_blockpy::block_py::BlockPyFunction<CodegenBlockPyPass>,
+    module: &BlockPyModule<CodegenModuleShape>,
+    function: &soac_blockpy::block_py::BlockPyFunction<CodegenModuleShape>,
     module_constants: &ModuleCodegenConstants,
 ) -> Result<RenderedSpecializedClif, String> {
     if blocks.is_empty() {
@@ -6359,8 +6359,8 @@ fn render_compiled_clif_and_vcode_disasm(
 
 pub unsafe fn compile_cranelift_run_bb_specialized_cached(
     blocks: &[ObjPtr],
-    module: &BlockPyModule<CodegenBlockPyPass>,
-    function: &soac_blockpy::block_py::BlockPyFunction<CodegenBlockPyPass>,
+    module: &BlockPyModule<CodegenModuleShape>,
+    function: &soac_blockpy::block_py::BlockPyFunction<CodegenModuleShape>,
     module_constants: &ModuleCodegenConstants,
     counter_defs: &[CounterDef],
     module_constant_ptrs: &[*mut ffi::PyObject],

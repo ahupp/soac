@@ -6,7 +6,7 @@ use crate::block_py::{
     YieldFrom,
 };
 use crate::passes::core_await_lower::lower_awaits_in_core_blockpy_module;
-use crate::passes::{CoreBlockPyPassWithAwaitAndYield, CoreBlockPyPassWithYield};
+use crate::passes::{CoreModuleShapeWithAwaitAndYield, CoreModuleShapeWithYield};
 use ruff_python_ast as ast;
 
 fn test_name(id: &str) -> UnresolvedName {
@@ -26,7 +26,7 @@ fn test_name_gen() -> crate::block_py::FunctionNameGen {
 
 fn test_callable_def_with_yield_block(
     block: Block<InstrWithYield>,
-) -> BlockPyFunction<CoreBlockPyPassWithYield> {
+) -> BlockPyFunction<CoreModuleShapeWithYield> {
     BlockPyFunction {
         function_id: FunctionId::new(0, 1),
         name_gen: test_name_gen(),
@@ -44,7 +44,7 @@ fn lower_awaits_in_test_block(block: Block<InstrWithAwaitAndYield>) -> Block<Ins
     let lowered = lower_awaits_in_core_blockpy_module(BlockPyModule {
         module_name_gen: ModuleNameGen::new(0),
         global_names: Vec::new(),
-        callable_defs: vec![BlockPyFunction::<CoreBlockPyPassWithAwaitAndYield> {
+        callable_defs: vec![BlockPyFunction::<CoreModuleShapeWithAwaitAndYield> {
             function_id: FunctionId::new(0, 1),
             name_gen: test_name_gen(),
             names: FunctionName::new("f", "f", "f", "f"),

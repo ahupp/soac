@@ -1,5 +1,5 @@
 use super::{
-    instr_any, Block, BlockLabel, BlockPyFunction, BlockPyPass, BlockTerm, ChildVisitable, Del,
+    instr_any, Block, BlockLabel, BlockPyFunction, ModuleShape, BlockTerm, ChildVisitable, Del,
     ImplicitNoneExpr, Instr, Load, MapInstr, MapTerm, Mappable, Meta, Store, UnresolvedName,
     WithMeta,
 };
@@ -217,7 +217,7 @@ pub(crate) fn hoist_matching_subexpressions_in_callable_def<P, E, F>(
     mut should_hoist: F,
 ) -> BlockPyFunction<P>
 where
-    P: BlockPyPass<Instr = E>,
+    P: ModuleShape<Instr = E>,
     E: Instr<Name = UnresolvedName>
         + ChildVisitable<E>
         + Mappable<E, Mapped<E> = E>
