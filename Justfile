@@ -659,28 +659,38 @@ benchmark loops="1000000": (update-venv) (build-extension "release")
   #!/usr/bin/env bash
   set -euo pipefail
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  WARMUP_LOOPS="${WARMUP_LOOPS:-1000}"
   echo "date: $(date +%F)"
   echo "loops: {{loops}}"
+  echo "warmup loops: ${WARMUP_LOOPS}"
 
   cd "$REPO_ROOT"
   counter_dump_path="$(mktemp "${TMPDIR:-/tmp}/soac_benchmark_call_targets_XXXXXX.bin")"
   trap 'rm -f "$counter_dump_path"' EXIT
 
   echo "jit transformed profile pass"
+  LOOPS="{{loops}}" \
+  WARMUP_LOOPS="${WARMUP_LOOPS}" \
   DIET_PYTHON_CALL_TARGET_COUNTERS=1 \
-    DIET_PYTHON_COUNTERS_FILE="$counter_dump_path" \
-    "$VENV_DIR/bin/python" -m soac.import_hook scripts/pystone.py "{{loops}}"
+  DIET_PYTHON_COUNTERS_FILE="$counter_dump_path" \
+    "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
 
   specializations="$(just _call-target-specializations-from-dump "$counter_dump_path")"
   if [[ -n "$specializations" ]]; then
     site_count="$(awk -F';' 'NF { print NF }' <<<"$specializations")"
     echo "jit transformed specialized pass (${site_count} callsites)"
+    LOOPS="{{loops}}" \
+    WARMUP_LOOPS="${WARMUP_LOOPS}" \
     DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS="$specializations" \
-      "$VENV_DIR/bin/python" -m soac.import_hook scripts/pystone.py "{{loops}}"
+      "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
   else
     echo "jit transformed specialized pass (no hot callsites recorded)"
-    "$VENV_DIR/bin/python" -m soac.import_hook scripts/pystone.py "{{loops}}"
+    LOOPS="{{loops}}" \
+    WARMUP_LOOPS="${WARMUP_LOOPS}" \
+      "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
   fi
 
   echo "stock cpython"
-  "$VENV_DIR/bin/python" scripts/pystone.py "{{loops}}"
+  LOOPS="{{loops}}" \
+  WARMUP_LOOPS="${WARMUP_LOOPS}" \
+    "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
