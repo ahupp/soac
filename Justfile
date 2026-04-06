@@ -460,7 +460,10 @@ perf-pystone-jit-warm loops="500000" output_prefix="logs/pystone_jit_perf_warm":
     | python3 "$REPO_ROOT/scripts/perf_report_to_speedscope.py" "$(basename "${OUTPUT_PREFIX}")" \
     >"${REPORT_SPEEDSCOPE}"
 
+  VIEW_SPEEDSCOPE_PROFILE="$("$CPYTHON_BIN" -c 'import pathlib, sys; repo_root = pathlib.Path(sys.argv[1]).resolve(); report_path = pathlib.Path(sys.argv[2]).resolve(); print(report_path.relative_to(repo_root))' "$REPO_ROOT" "$REPORT_SPEEDSCOPE")"
+
   echo "finished"
+  echo "view speedscope: just view-speedscope ${VIEW_SPEEDSCOPE_PROFILE@Q}"
 
 perf-pystone-jit-specialized loops="500000" output_prefix="logs/pystone_jit_perf_warm_specialized": ensure-cpython (update-venv) (build-extension "release")
   #!/usr/bin/env bash
