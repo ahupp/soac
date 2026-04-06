@@ -689,14 +689,6 @@ pub trait ModuleShape: Clone + fmt::Debug {
 pub type ResolvedStorageBlock = Block<InstrResolved>;
 pub type CodegenBlock = Block<InstrCodegen>;
 
-pub trait BlockPyJumpTerm {
-    fn jump_term(target: BlockLabel) -> Self;
-}
-
-pub trait BlockPyFallthroughTerm: BlockPyJumpTerm {
-    fn implicit_function_return() -> Self;
-}
-
 #[derive(Debug, Clone)]
 pub struct BlockBuilder<I: Instr> {
     pub body: Vec<I>,
@@ -774,6 +766,14 @@ pub enum BlockTerm<I: Instr> {
 }
 
 impl<I: Instr> BlockTerm<I> {
+    pub fn jump_term(target: BlockLabel) -> Self {
+        Self::Jump(BlockEdge::new(target))
+    }
+
+    pub fn implicit_function_return() -> Self {
+        Self::Return(I::constant_none())
+    }
+
     pub fn replace_target(&mut self, from: BlockLabel, to: BlockLabel) -> bool {
         match self {
             Self::Jump(edge) => {
@@ -881,18 +881,6 @@ pub enum BlockParamRole {
 pub struct BlockParam {
     pub name: String,
     pub role: BlockParamRole,
-}
-
-impl<I: Instr> BlockPyJumpTerm for BlockTerm<I> {
-    fn jump_term(target: BlockLabel) -> Self {
-        Self::Jump(BlockEdge::new(target))
-    }
-}
-
-impl<I: Instr> BlockPyFallthroughTerm for BlockTerm<I> {
-    fn implicit_function_return() -> Self {
-        Self::Return(I::constant_none())
-    }
 }
 
 #[cfg(test)]

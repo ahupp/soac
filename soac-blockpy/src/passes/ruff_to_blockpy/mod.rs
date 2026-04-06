@@ -3,7 +3,7 @@ use crate::block_py::cfg::{
 };
 use crate::block_py::param_specs::ParamSpec;
 use crate::block_py::{
-    Block, BlockBuilder, BlockEdge, BlockLabel, BlockPyFallthroughTerm, BlockPyFunction,
+    Block, BlockBuilder, BlockEdge, BlockLabel, BlockPyFunction,
     BlockPyModule, BlockTerm, CallableScopeInfo, FunctionKind, FunctionName, FunctionNameGen,
     Instr,
 };
