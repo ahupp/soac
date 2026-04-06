@@ -7,9 +7,7 @@ use crate::passes::ast_to_ast::context::Context;
 use crate::passes::ruff_to_blockpy::expr_lowering::{
     try_lower_branching_expr_direct, try_lower_if_expr_direct, AstSetupExprLowerer,
 };
-use crate::passes::ruff_to_blockpy::stmt_lowering::{
-    lower_nested_stmt_into_with_expr, StructuredLoweringBridge,
-};
+use crate::passes::ruff_to_blockpy::stmt_lowering::lower_nested_stmt_into_with_expr;
 
 fn with_exc_meta<E: Instr>(
     block: crate::block_py::Block<StructuredInstr<E>, E>,
@@ -111,6 +109,27 @@ where
         lower_nested_stmt_into_with_expr(context, stmt, &mut out, None, &mut next_label_id)?;
     }
     Ok(out)
+}
+
+fn try_inline_builder_from_blockpy_stmts<E>(
+    structured: crate::block_py::BlockBuilder<StructuredInstr<E>, BlockTerm<E>>,
+) -> Option<InlineBlockBuilder<E>>
+where
+    E: RuffToBlockPyExpr + ImplicitNoneExpr,
+{
+    let structured = structured.finish();
+    if structured.term.is_some() {
+        return None;
+    }
+
+    let mut entry = BlockBuilder::<E, BlockTerm<E>>::new();
+    for stmt in structured.body {
+        let StructuredInstr::Expr(stmt) = stmt else {
+            return None;
+        };
+        entry.push_stmt(stmt);
+    }
+    Some(entry)
 }
 
 pub(crate) fn compat_if_jump_block_with_expr_setup_and_exc_target_and_expr<E>(
@@ -499,29 +518,17 @@ where
         return Ok(label);
     }
 
-    let bridge = StructuredLoweringBridge::new();
-    if let Some(fragment) = bridge.try_lower_inline_value::<E, E>(
-        |out, scratch_next_label_id| {
-            for stmt in &body {
-                lower_nested_stmt_into_with_expr(
-                    context,
-                    stmt,
-                    out,
-                    None,
-                    scratch_next_label_id,
-                )?;
-            }
-            crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
-                test.clone(),
-                out,
-                None,
-                scratch_next_label_id,
-            )
-        },
-    ) {
-        let (mut entry, test) = fragment?;
+    let mut out = compat_block_builder_with_expr_setup_and_expr::<E>(context, body.clone())?;
+    let mut next_label_id = 0usize;
+    let lowered_test = crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
+        test.clone(),
+        &mut out,
+        None,
+        &mut next_label_id,
+    )?;
+    if let Some(mut entry) = try_inline_builder_from_blockpy_stmts(out) {
         entry.set_term(BlockTerm::IfTerm(TermIf {
-            test,
+            test: lowered_test,
             then_label,
             else_label,
         }));
