@@ -207,6 +207,16 @@ changes:
       - Stock CPython: 954,347 loops/s
       - So without counters enabled, the JIT is about 25.7% of stock throughput, or 3.89x slower.
 
+2026-04-06: better specialization coverage, and constant string interning:
+  - transformed/JIT profile pass: 221,542 loops/s
+  - transformed/JIT specialized pass: 294,980 loops/s
+  - stock CPython: 864,134 loops/s
+
+  Headline comparison:
+
+  - specialized transformed is about 0.341x stock
+  - stock CPython is about 2.93x faster
+
 # Design
 
 Dropping to basic block format:
