@@ -220,6 +220,18 @@ fn helper_scoped_families_do_not_reach_core_blockpy_boundary() {
 }
 
 #[test]
+#[should_panic(expected = "IpyEscapeCommand should not reach late core BlockPy boundary")]
+fn ipy_escape_command_does_not_reach_core_blockpy_boundary() {
+    let expr = Expr::IpyEscapeCommand(ast::ExprIpyEscapeCommand {
+        node_index: ast::AtomicNodeIndex::default(),
+        range: ruff_text_size::TextRange::default(),
+        kind: ast::IpyEscapeKind::Shell,
+        value: "ls".into(),
+    });
+    let _ = InstrWithAwaitAndYield::from_ast_expr(expr);
+}
+
+#[test]
 fn core_blockpy_keeps_function_defaults_out_of_blockpy_ir() {
     let source = r#"
 def f(*, d={"metaclass": Meta}, **kw):

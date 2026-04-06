@@ -634,6 +634,9 @@ impl InstrWithAwaitAndYield {
                 let meta = node.meta();
                 InstrWithAwaitAndYield::Load(operation::Load::new(node).with_meta(meta))
             }
+            Expr::IpyEscapeCommand(_) => {
+                panic!("IpyEscapeCommand should not reach late core BlockPy boundary")
+            }
             other => panic!(
                 "unexpected expr reached late core BlockPy boundary: {}",
                 crate::ruff_ast_to_string(&other)
