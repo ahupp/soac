@@ -386,6 +386,24 @@ Notes:
   benchmark recipes near [Justfile:711](/home/adam/project/soac-profile/Justfile#L711),
   control the pre-measurement pystone warmup count.
 
+- `BENCHMARK_CPU=<int>`
+  In [scripts/run_benchmark_with_cpu_mode.sh](/home/adam/project/soac-profile/scripts/run_benchmark_with_cpu_mode.sh),
+  choose the CPU core that the benchmark recipes pin to with `taskset`.
+  The default is `0`. Pinning all benchmark phases to one core reduces
+  scheduler and heterogeneous-core variance without requiring privileged
+  clock controls.
+
+- `BENCHMARK_CONSTANT_CLOCKS=1`
+  In [scripts/run_benchmark_with_cpu_mode.sh](/home/adam/project/soac-profile/scripts/run_benchmark_with_cpu_mode.sh),
+  ask the benchmark wrapper to temporarily force steadier CPU clocks for
+  the selected benchmark core and its related CPUs by setting the
+  governor to `performance`, locking `scaling_min_freq` and
+  `scaling_max_freq` to the hardware max frequency, and disabling boost
+  when the kernel exposes a writable `boost` knob. The wrapper restores
+  the previous settings on exit. This mode requires writable `cpufreq`
+  sysfs controls and will fail clearly if the current user does not have
+  permission.
+
 - `SPECIALIZATION_PROFILE_LOOPS=<int>`
   In recipe `perf-pystone-jit-specialized`, at
   [Justfile:480](/home/adam/project/soac-profile/Justfile#L480), control

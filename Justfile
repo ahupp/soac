@@ -709,30 +709,42 @@ benchmark-warm loops="8000000": (update-venv) (build-extension "release")
   set -euo pipefail
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
   WARMUP_LOOPS="${WARMUP_LOOPS:-1000}"
+  BENCHMARK_CPU="${BENCHMARK_CPU:-0}"
+  BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS:-0}"
   echo "date: $(date +%F)"
   echo "loops: {{loops}}"
   echo "warmup loops: ${WARMUP_LOOPS}"
+  echo "benchmark cpu: ${BENCHMARK_CPU}"
+  echo "benchmark constant clocks: ${BENCHMARK_CONSTANT_CLOCKS}"
 
   cd "$REPO_ROOT"
 
   echo "jit transformed warm"
   LOOPS="{{loops}}" \
   WARMUP_LOOPS="${WARMUP_LOOPS}" \
-    "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
+  BENCHMARK_CPU="${BENCHMARK_CPU}" \
+  BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
+    "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
 
   echo "stock cpython"
   LOOPS="{{loops}}" \
   WARMUP_LOOPS="${WARMUP_LOOPS}" \
-    "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
+  BENCHMARK_CPU="${BENCHMARK_CPU}" \
+  BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
+    "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
 
 benchmark loops="8000000": (update-venv) (build-extension "release")
   #!/usr/bin/env bash
   set -euo pipefail
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
   WARMUP_LOOPS="${WARMUP_LOOPS:-1000}"
+  BENCHMARK_CPU="${BENCHMARK_CPU:-0}"
+  BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS:-0}"
   echo "date: $(date +%F)"
   echo "loops: {{loops}}"
   echo "warmup loops: ${WARMUP_LOOPS}"
+  echo "benchmark cpu: ${BENCHMARK_CPU}"
+  echo "benchmark constant clocks: ${BENCHMARK_CONSTANT_CLOCKS}"
 
   cd "$REPO_ROOT"
   counter_dump_path="$(mktemp "${TMPDIR:-/tmp}/soac_benchmark_call_targets_XXXXXX.bin")"
@@ -741,25 +753,33 @@ benchmark loops="8000000": (update-venv) (build-extension "release")
   echo "jit transformed profile pass"
   LOOPS="{{loops}}" \
   WARMUP_LOOPS="${WARMUP_LOOPS}" \
+  BENCHMARK_CPU="${BENCHMARK_CPU}" \
+  BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
   DIET_PYTHON_CALL_TARGET_COUNTERS=1 \
   DIET_PYTHON_COUNTERS_OUTPUT_FILE="$counter_dump_path" \
-    "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
+    "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
 
   site_count="$(just _call-target-specializations-from-dump "$counter_dump_path" | awk -F';' 'NF { print NF }')"
   if [[ -n "$site_count" && "$site_count" != "0" ]]; then
     echo "jit transformed specialized pass (${site_count} callsites)"
     LOOPS="{{loops}}" \
     WARMUP_LOOPS="${WARMUP_LOOPS}" \
+    BENCHMARK_CPU="${BENCHMARK_CPU}" \
+    BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
     DIET_PYTHON_COUNTERS_FILE="$counter_dump_path" \
-      "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
+      "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
   else
     echo "jit transformed specialized pass (no hot callsites recorded)"
     LOOPS="{{loops}}" \
     WARMUP_LOOPS="${WARMUP_LOOPS}" \
-      "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
+    BENCHMARK_CPU="${BENCHMARK_CPU}" \
+    BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
+      "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
   fi
 
   echo "stock cpython"
   LOOPS="{{loops}}" \
   WARMUP_LOOPS="${WARMUP_LOOPS}" \
-    "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
+  BENCHMARK_CPU="${BENCHMARK_CPU}" \
+  BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
+    "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'

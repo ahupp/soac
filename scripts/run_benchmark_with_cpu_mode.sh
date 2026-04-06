@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+if [[ $# -eq 0 ]]; then
+  echo "usage: $0 <command> [args...]" >&2
+  exit 2
+fi
+
+env_flag_enabled() {
+  local raw="${!1-}"
+  case "$raw" in
+    "" | 0 | false | False | FALSE | no | No | NO | off | Off | OFF)
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+restore_cpufreq_state() {
+  local cpu_dir
+  local value
+  local cpu
+
+  for cpu in "${RESTORE_CPUS[@]}"; do
+    cpu_dir="/sys/devices/system/cpu/cpu${cpu}/cpufreq"
+
+    value="${RESTORE_SCALING_MAX_FREQ[$cpu]-}"
+    if [[ -n "$value" && -w "$cpu_dir/scaling_max_freq" ]]; then
+      printf '%s\n' "$value" > "$cpu_dir/scaling_max_freq"
+    fi
+
+    value="${RESTORE_SCALING_MIN_FREQ[$cpu]-}"
+    if [[ -n "$value" && -w "$cpu_dir/scaling_min_freq" ]]; then
+      printf '%s\n' "$value" > "$cpu_dir/scaling_min_freq"
+    fi
+
+    value="${RESTORE_SCALING_GOVERNOR[$cpu]-}"
+    if [[ -n "$value" && -w "$cpu_dir/scaling_governor" ]]; then
+      printf '%s\n' "$value" > "$cpu_dir/scaling_governor"
+    fi
+
+    value="${RESTORE_EPP[$cpu]-}"
+    if [[ -n "$value" && -w "$cpu_dir/energy_performance_preference" ]]; then
+      printf '%s\n' "$value" > "$cpu_dir/energy_performance_preference"
+    fi
+  done
+
+  if [[ -n "${RESTORE_BOOST_FILE-}" && -n "${RESTORE_BOOST_VALUE-}" && -w "$RESTORE_BOOST_FILE" ]]; then
+    printf '%s\n' "$RESTORE_BOOST_VALUE" > "$RESTORE_BOOST_FILE"
+  fi
+}
+
+CPU="${BENCHMARK_CPU:-0}"
+CPU_DIR="/sys/devices/system/cpu/cpu${CPU}/cpufreq"
+if [[ ! -d "$CPU_DIR" ]]; then
+  echo "benchmark cpu ${CPU} does not expose cpufreq controls at $CPU_DIR" >&2
+  exit 1
+fi
+
+if ! command -v taskset >/dev/null 2>&1; then
+  echo "taskset is required for benchmark cpu pinning" >&2
+  exit 1
+fi
+
+if env_flag_enabled BENCHMARK_CONSTANT_CLOCKS; then
+  if [[ ! -r "$CPU_DIR/related_cpus" ]]; then
+    echo "benchmark constant-clock mode needs readable related_cpus at $CPU_DIR/related_cpus" >&2
+    exit 1
+  fi
+
+  read -r -a RESTORE_CPUS <<<"$(<"$CPU_DIR/related_cpus")"
+  declare -Ag RESTORE_SCALING_GOVERNOR=()
+  declare -Ag RESTORE_SCALING_MIN_FREQ=()
+  declare -Ag RESTORE_SCALING_MAX_FREQ=()
+  declare -Ag RESTORE_EPP=()
+  RESTORE_BOOST_FILE=""
+  RESTORE_BOOST_VALUE=""
+
+  if [[ -w "$CPU_DIR/boost" ]]; then
+    RESTORE_BOOST_FILE="$CPU_DIR/boost"
+    RESTORE_BOOST_VALUE="$(<"$CPU_DIR/boost")"
+    printf '0\n' > "$CPU_DIR/boost"
+  fi
+
+  trap restore_cpufreq_state EXIT
+
+  for cpu in "${RESTORE_CPUS[@]}"; do
+    cpu_dir="/sys/devices/system/cpu/cpu${cpu}/cpufreq"
+    if [[ ! -d "$cpu_dir" ]]; then
+      continue
+    fi
+
+    if [[ ! -w "$cpu_dir/scaling_governor" || ! -w "$cpu_dir/scaling_min_freq" || ! -w "$cpu_dir/scaling_max_freq" ]]; then
+      echo "benchmark constant-clock mode needs writable cpufreq knobs under $cpu_dir; rerun with sufficient privileges or leave BENCHMARK_CONSTANT_CLOCKS unset" >&2
+      exit 1
+    fi
+
+    RESTORE_SCALING_GOVERNOR[$cpu]="$(<"$cpu_dir/scaling_governor")"
+    RESTORE_SCALING_MIN_FREQ[$cpu]="$(<"$cpu_dir/scaling_min_freq")"
+    RESTORE_SCALING_MAX_FREQ[$cpu]="$(<"$cpu_dir/scaling_max_freq")"
+
+    if [[ -r "$cpu_dir/energy_performance_preference" ]]; then
+      RESTORE_EPP[$cpu]="$(<"$cpu_dir/energy_performance_preference")"
+    fi
+
+    max_freq="$(<"$cpu_dir/cpuinfo_max_freq")"
+    printf 'performance\n' > "$cpu_dir/scaling_governor"
+    printf '%s\n' "$max_freq" > "$cpu_dir/scaling_min_freq"
+    printf '%s\n' "$max_freq" > "$cpu_dir/scaling_max_freq"
+
+    if [[ -w "$cpu_dir/energy_performance_preference" ]]; then
+      printf 'performance\n' > "$cpu_dir/energy_performance_preference"
+    fi
+  done
+fi
+
+taskset -c "$CPU" "$@"
