@@ -1,0 +1,7 @@
+Vendored from `speedscope@1.25.0` on npm.
+
+Source tarball:
+https://registry.npmjs.org/speedscope/-/speedscope-1.25.0.tgz
+
+Only the published `dist/release/` bundle plus upstream license files are
+checked in here.

@@ -1,7 +1,7 @@
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::extract::{Query, State};
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyModule};
@@ -46,6 +46,11 @@ struct JitClifRequest {
     qualname: Option<String>,
     #[serde(rename = "entryLabel")]
     entry_label: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SpeedscopeProfileRequest {
+    path: String,
 }
 
 #[derive(Serialize)]
@@ -109,6 +114,7 @@ pub fn app_with_state(state: AppState) -> Router {
     Router::new()
         .route("/api/inspect_pipeline", post(handle_inspect_pipeline))
         .route("/api/jit_clif", post(handle_jit_clif))
+        .route("/api/speedscope_profile", get(handle_speedscope_profile))
         .fallback_service(ServeDir::new(state.web_dir.clone()))
         .with_state(state)
 }
@@ -377,19 +383,68 @@ async fn handle_jit_clif(
     )?))
 }
 
+async fn handle_speedscope_profile(
+    State(state): State<AppState>,
+    Query(request): Query<SpeedscopeProfileRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let profile_path = resolve_speedscope_profile_path(&state.repo_root, request.path.as_str())?;
+    let body = std::fs::read_to_string(&profile_path)
+        .map_err(|err| ApiError::bad_request(format!("failed to read profile JSON: {err}")))?;
+    Ok(([(header::CONTENT_TYPE, "application/json; charset=utf-8")], body))
+}
+
 fn parse_packed_function_id(raw: &str) -> Result<FunctionId, ApiError> {
     raw.parse::<u64>()
         .map(FunctionId::from_packed)
         .map_err(|err| ApiError::bad_request(format!("invalid functionId '{raw}': {err}")))
 }
 
+fn resolve_speedscope_profile_path(repo_root: &Path, raw_path: &str) -> Result<PathBuf, ApiError> {
+    let logs_root = repo_root.join("logs");
+    let logs_root = logs_root.canonicalize().map_err(|err| {
+        ApiError::internal(format!(
+            "failed to resolve logs directory '{}': {err}",
+            logs_root.display()
+        ))
+    })?;
+
+    let requested_path = Path::new(raw_path);
+    let candidate_path = if requested_path.is_absolute() {
+        requested_path.to_path_buf()
+    } else {
+        repo_root.join(requested_path)
+    };
+    let candidate_path = candidate_path.canonicalize().map_err(|err| {
+        ApiError::bad_request(format!(
+            "failed to resolve requested profile '{}': {err}",
+            requested_path.display()
+        ))
+    })?;
+
+    if !candidate_path.starts_with(&logs_root) {
+        return Err(ApiError::bad_request(format!(
+            "speedscope profiles must live under '{}'",
+            logs_root.display()
+        )));
+    }
+    if candidate_path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+        return Err(ApiError::bad_request(format!(
+            "expected a .json speedscope profile, got '{}'",
+            candidate_path.display()
+        )));
+    }
+
+    Ok(candidate_path)
+}
+
 #[cfg(test)]
 mod test {
-    use super::app;
+    use super::{AppState, app, app_with_state};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
     use serde_json::{Value, json};
+    use std::path::{Path, PathBuf};
     use tower::ServiceExt;
 
     async fn response_text(response: axum::response::Response) -> String {
@@ -502,5 +557,86 @@ mod test {
                 .unwrap()
                 .starts_with("classify::__dp_fn_")
         );
+    }
+
+    fn temp_test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "soac-inspector-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp test dir should be created");
+        dir
+    }
+
+    fn write_file(path: &Path, contents: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("parent dir should be created");
+        }
+        std::fs::write(path, contents).expect("file write should succeed");
+    }
+
+    #[tokio::test]
+    async fn serves_speedscope_profiles_from_logs_dir() {
+        let temp_root = temp_test_dir("speedscope-profile");
+        write_file(
+            &temp_root.join("web").join("index.html"),
+            "<!doctype html><title>test</title>",
+        );
+        write_file(
+            &temp_root.join("logs").join("profile.json"),
+            "{\"name\":\"demo\"}",
+        );
+        let app = app_with_state(AppState {
+            repo_root: temp_root.clone(),
+            web_dir: temp_root.join("web"),
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/speedscope_profile?path=logs/profile.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("speedscope profile request should succeed");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[axum::http::header::CONTENT_TYPE], "application/json; charset=utf-8");
+        let body = response_text(response).await;
+        assert_eq!(body, "{\"name\":\"demo\"}");
+
+        std::fs::remove_dir_all(&temp_root).expect("temp test dir should be removed");
+    }
+
+    #[tokio::test]
+    async fn rejects_speedscope_profiles_outside_logs_dir() {
+        let temp_root = temp_test_dir("speedscope-profile-reject");
+        write_file(
+            &temp_root.join("web").join("index.html"),
+            "<!doctype html><title>test</title>",
+        );
+        write_file(&temp_root.join("outside.json"), "{\"name\":\"demo\"}");
+        std::fs::create_dir_all(temp_root.join("logs")).expect("logs dir should exist");
+        let app = app_with_state(AppState {
+            repo_root: temp_root.clone(),
+            web_dir: temp_root.join("web"),
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/speedscope_profile?path=outside.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("speedscope profile rejection should succeed");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        std::fs::remove_dir_all(&temp_root).expect("temp test dir should be removed");
     }
 }

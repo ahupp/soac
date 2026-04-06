@@ -232,59 +232,33 @@ history-metrics-report history_jsonl="logs/warloc_history.jsonl" daily_jsonl="lo
 run-web-inspector: build-web-inspector
   #!/usr/bin/env bash
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-  open_browser() {
-    local open_url="$1"
-    echo "[3/3] Opening browser..."
-    if command -v open >/dev/null 2>&1; then
-      open "$open_url" >/dev/null 2>&1 || true
-    elif command -v xdg-open >/dev/null 2>&1; then
-      xdg-open "$open_url" >/dev/null 2>&1 || true
-    else
-      echo "No browser opener found. Open this URL manually: $open_url"
-    fi
-  }
-
-  if ss -ltnH "( sport = :$PORT )" | grep -q .; then
-    if curl -fsS "$URL/api/inspect_pipeline" \
-      -H 'content-type: application/json' \
-      -d '{"source":"def classify(n):\n    return n\n"}' >/dev/null 2>&1; then
-      OPEN_URL="${URL}/?v=$(date +%s)"
-      echo "[2/3] Reusing existing web inspector at $URL ..."
-      open_browser "$OPEN_URL"
-      echo "Serving $URL (opened $OPEN_URL)."
-      exit 0
-    fi
-
-    echo "Port $PORT is already in use, but the existing listener is not a healthy soac-inspector server." >&2
-    ss -ltnp "( sport = :$PORT )" >&2 || true
-    exit 1
-  fi
-
-  echo "[2/3] Starting web server in $WEB_DIR on $URL ..."
-
-  cd "$REPO_ROOT"
-  HOST="$HOST" PORT="$PORT" "$INSPECTOR_BIN" &
-  SERVER_PID=$!
-
-  cleanup() {
-    if kill -0 "$SERVER_PID" >/dev/null 2>&1; then
-      kill "$SERVER_PID" >/dev/null 2>&1 || true
-    fi
-  }
-  trap cleanup EXIT INT TERM
-
-  sleep 0.5
-
-  if ! kill -0 "$SERVER_PID" >/dev/null 2>&1; then
-    echo "Web inspector server exited before startup." >&2
-    wait "$SERVER_PID"
-  fi
-
   OPEN_URL="${URL}/?v=$(date +%s)"
-  open_browser "$OPEN_URL"
+  "$REPO_ROOT/scripts/open_web_url.sh" "$OPEN_URL"
 
-  echo "Serving $URL (opened $OPEN_URL, pid=$SERVER_PID). Press Ctrl+C to stop."
-  wait "$SERVER_PID"
+view-speedscope profile="": build-web-inspector
+  #!/usr/bin/env bash
+  export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  PROFILE="{{profile}}"
+
+  if [[ -z "$PROFILE" ]]; then
+    PROFILE="$(
+      find "$REPO_ROOT/logs" -maxdepth 1 -type f -name '*speedscope.json' -printf '%T@ %P\n' \
+        | sort -nr \
+        | head -n 1 \
+        | cut -d' ' -f2-
+    )"
+    if [[ -z "$PROFILE" ]]; then
+      echo "no speedscope profile found under $REPO_ROOT/logs" >&2
+      exit 1
+    fi
+    PROFILE="logs/$PROFILE"
+  fi
+
+  PROFILE_URL="$("$CPYTHON_BIN" -c 'import pathlib, sys, urllib.parse; base_url = sys.argv[1]; profile_arg = sys.argv[2]; repo_root = pathlib.Path.cwd().resolve(); profile_path = pathlib.Path(profile_arg); rel_path = profile_path.resolve().relative_to(repo_root) if profile_path.is_absolute() else pathlib.Path(profile_arg); print(f"{base_url}/api/speedscope_profile?path={urllib.parse.quote(str(rel_path))}")' "$URL" "$PROFILE")"
+
+  OPEN_URL="$("$CPYTHON_BIN" -c 'import pathlib, sys, urllib.parse; base_url = sys.argv[1]; profile_url = sys.argv[2]; profile_arg = sys.argv[3]; title = pathlib.Path(profile_arg).name; print(base_url + "/speedscope/#profileURL=" + urllib.parse.quote(profile_url, safe="") + "&title=" + urllib.parse.quote(title, safe=""))' "$URL" "$PROFILE_URL" "$PROFILE")"
+
+  "$REPO_ROOT/scripts/open_web_url.sh" "$OPEN_URL"
 
 perf-pystone-jit-warm loops="500000" output_prefix="logs/pystone_jit_perf_warm": ensure-cpython
   #!/usr/bin/env bash
