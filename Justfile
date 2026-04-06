@@ -785,6 +785,7 @@ benchmark loops="8000000": (update-venv) (build-extension "release")
 
   cp "$counter_dump_path" "$LAST_BENCHMARK_COUNTERS"
   echo "last benchmark counters: $LAST_BENCHMARK_COUNTERS"
+  echo "run speedscope from these counters: just run-and-view-speedscope"
 
   site_count="$(just _call-target-specializations-from-dump "$counter_dump_path" | awk -F';' 'NF { print NF }')"
   if [[ -n "$site_count" && "$site_count" != "0" ]]; then
