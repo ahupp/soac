@@ -194,6 +194,44 @@ where
 {
 }
 
+pub(crate) fn map_function_blocks<PIn, POut>(
+    func: BlockPyFunction<PIn>,
+    mut map_block: impl FnMut(Block<PIn::Instr>) -> Block<POut::Instr>,
+) -> BlockPyFunction<POut>
+where
+    PIn: ModuleShape,
+    POut: ModuleShape,
+{
+    BlockPyFunction {
+        function_id: func.function_id,
+        name_gen: func.name_gen,
+        names: func.names,
+        kind: func.kind,
+        params: func.params,
+        blocks: func.blocks.into_iter().map(&mut map_block).collect(),
+        doc: func.doc,
+        storage_layout: func.storage_layout,
+        scope: func.scope,
+    }
+}
+
+pub(crate) fn map_module_functions<PIn, POut>(
+    module: BlockPyModule<PIn>,
+    mut map_fn: impl FnMut(BlockPyFunction<PIn>) -> BlockPyFunction<POut>,
+) -> BlockPyModule<POut>
+where
+    PIn: ModuleShape,
+    POut: ModuleShape,
+{
+    BlockPyModule {
+        module_name_gen: module.module_name_gen,
+        global_names: module.global_names,
+        callable_defs: module.callable_defs.into_iter().map(&mut map_fn).collect(),
+        module_constants: module.module_constants,
+        counter_defs: module.counter_defs,
+    }
+}
+
 pub(crate) trait TryMapTerm<In, Out, Error>: TryMapInstr<In, Out, Error>
 where
     In: Instr,

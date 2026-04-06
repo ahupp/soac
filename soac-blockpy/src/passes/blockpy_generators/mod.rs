@@ -10,10 +10,10 @@ use crate::block_py::{
     BlockPyModule, BlockTerm, CallArgKeyword, CallArgPositional, CallableScopeInfo,
     CellBindingKind, CellRefForName, ClosureInit, ClosureSlot, FunctionId, FunctionKind,
     FunctionName, FunctionNameGen, GetAttr, ImplicitNoneExpr, Instr, InstrUnresolved,
-    InstrWithYield, Load, MakeFunction, Mappable, ModuleNameGen, NameLike, NumberLiteral,
-    NumberLiteralValue, ScopeExprNode, StorageLayout, Store, StringLiteral, TermBranchTable,
-    TermIf, TermRaise, TryMapFunction, TryMapInstr, TryMapTerm, UnaryOp, UnaryOpKind,
-    UnresolvedName,
+    InstrWithYield, Load, MakeFunction, map_module_functions, Mappable, ModuleNameGen, NameLike,
+    NumberLiteral, NumberLiteralValue, ScopeExprNode, StorageLayout, Store, StringLiteral,
+    TermBranchTable, TermIf, TermRaise, TryMapFunction, TryMapInstr, TryMapTerm, UnaryOp,
+    UnaryOpKind, UnresolvedName,
 };
 use crate::passes::ast_to_ast::scope_helpers::is_internal_symbol;
 use crate::passes::ruff_to_blockpy::{attach_exception_edges_to_blocks, lowered_exception_edges};
@@ -661,12 +661,12 @@ fn resume_param_spec(kind: FunctionKind) -> ParamSpec {
 
 #[derive(Clone)]
 enum YieldSite {
-    ExprYield(Option<InstrWithYield>),
+    ExprYield(InstrWithYield),
     AssignYield {
         target: UnresolvedName,
-        value: Option<InstrWithYield>,
+        value: InstrWithYield,
     },
-    ReturnYield(Option<InstrWithYield>),
+    ReturnYield(InstrWithYield),
     ExprYieldFrom(InstrWithYield),
     AssignYieldFrom {
         target: UnresolvedName,
@@ -675,22 +675,16 @@ enum YieldSite {
     ReturnYieldFrom(InstrWithYield),
 }
 
-fn explicit_yield_value(value: &InstrWithYield) -> Option<InstrWithYield> {
-    (!InstrWithYield::is_implicit_none_expr(value)).then(|| value.clone())
-}
-
 fn stmt_yield_site(stmt: &LinearYieldStmt) -> Option<YieldSite> {
     match stmt {
-        InstrWithYield::Yield(yield_expr) => Some(YieldSite::ExprYield(explicit_yield_value(
-            &yield_expr.value,
-        ))),
+        InstrWithYield::Yield(yield_expr) => Some(YieldSite::ExprYield(yield_expr.value.as_ref().clone())),
         InstrWithYield::YieldFrom(yield_from) => {
             Some(YieldSite::ExprYieldFrom((*yield_from.value).clone()))
         }
         InstrWithYield::Store(store) => match store.value.as_ref() {
             InstrWithYield::Yield(yield_expr) => Some(YieldSite::AssignYield {
                 target: store.name.clone(),
-                value: explicit_yield_value(&yield_expr.value),
+                value: yield_expr.value.as_ref().clone(),
             }),
             InstrWithYield::YieldFrom(yield_from) => Some(YieldSite::AssignYieldFrom {
                 target: store.name.clone(),
@@ -704,9 +698,9 @@ fn stmt_yield_site(stmt: &LinearYieldStmt) -> Option<YieldSite> {
 
 fn term_yield_site(term: &BlockTerm<InstrWithYield>) -> Option<YieldSite> {
     match term {
-        BlockTerm::Return(InstrWithYield::Yield(yield_expr)) => Some(YieldSite::ReturnYield(
-            explicit_yield_value(&yield_expr.value),
-        )),
+        BlockTerm::Return(InstrWithYield::Yield(yield_expr)) => {
+            Some(YieldSite::ReturnYield(yield_expr.value.as_ref().clone()))
+        }
         BlockTerm::Return(InstrWithYield::YieldFrom(yield_from)) => {
             Some(YieldSite::ReturnYieldFrom((*yield_from.value).clone()))
         }
@@ -732,14 +726,10 @@ fn lower_term_no_yield(term: BlockTerm<InstrWithYield>) -> BlockTerm<InstrUnreso
     })
 }
 
-fn yield_value_expr(value: Option<InstrWithYield>) -> InstrUnresolved {
-    value
-        .map(|value| {
-            ErrOnYield
-                .try_map_instr(value)
-                .unwrap_or_else(|_| panic!("yield payload unexpectedly contained nested yield"))
-        })
-        .unwrap_or_else(core_none)
+fn yield_value_expr(value: InstrWithYield) -> InstrUnresolved {
+    ErrOnYield
+        .try_map_instr(value)
+        .unwrap_or_else(|_| panic!("yield payload unexpectedly contained nested yield"))
 }
 
 fn completion_raise(
@@ -1766,7 +1756,7 @@ pub(crate) fn lower_generator_like_function(
 pub(crate) fn lower_yield_in_lowered_core_blockpy_module_bundle(
     module: BlockPyModule<CoreModuleShapeWithYield>,
 ) -> BlockPyModule<CoreModuleShape> {
-    let module = module.map_callable_defs(make_suspend_order_explicit_in_core_callable_def);
+    let module = map_module_functions(module, make_suspend_order_explicit_in_core_callable_def);
     let module_name_gen = module.module_name_gen.clone();
     let mut callable_defs = Vec::new();
     for callable in module.callable_defs {

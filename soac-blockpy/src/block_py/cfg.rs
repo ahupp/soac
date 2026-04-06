@@ -1,7 +1,7 @@
 use super::{
-    instr_any, Block, BlockLabel, BlockPyFunction, ModuleShape, BlockTerm, ChildVisitable, Del,
-    ImplicitNoneExpr, Instr, Load, MapInstr, MapTerm, Mappable, Meta, Store, UnresolvedName,
-    WithMeta,
+    instr_any, map_function_blocks, Block, BlockLabel, BlockPyFunction, BlockTerm,
+    ChildVisitable, Del, ImplicitNoneExpr, Instr, Load, MapInstr, MapTerm, ModuleShape,
+    Mappable, Meta, Store, UnresolvedName, WithMeta,
 };
 use crate::namegen::fresh_name;
 use ruff_python_ast as ast;
@@ -226,7 +226,7 @@ where
         + From<Del<E>>,
     F: FnMut(&E) -> bool,
 {
-    callable_def.map_blocks(|block| {
+    map_function_blocks(callable_def, |block| {
         let Block {
             label,
             body: input_body,

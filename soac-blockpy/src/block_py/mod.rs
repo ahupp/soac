@@ -43,8 +43,8 @@ pub use crate::passes::{
 };
 #[allow(unused_imports)]
 pub(crate) use map::{
-    MapBlock, MapFunction, MapModule, MapTerm, TryMapBlock, TryMapFunction, TryMapModule,
-    TryMapTerm,
+    map_function_blocks, map_module_functions, MapBlock, MapFunction, MapModule, MapTerm,
+    TryMapBlock, TryMapFunction, TryMapModule, TryMapTerm,
 };
 pub use map::{MapInstr, Mappable, TryMapInstr};
 pub use name_gen::{BlockLabel, FunctionId, FunctionNameGen, ModuleNameGen};
@@ -454,29 +454,6 @@ pub struct BlockPyModule<P: ModuleShape> {
     pub counter_defs: Vec<CounterDef>,
 }
 
-impl<P: ModuleShape> BlockPyModule<P> {
-    pub fn map_callable_defs<Q: ModuleShape>(
-        self,
-        mut f: impl FnMut(BlockPyFunction<P>) -> BlockPyFunction<Q>,
-    ) -> BlockPyModule<Q> {
-        debug_assert!(
-            self.module_constants.is_empty(),
-            "map_callable_defs does not preserve module constants"
-        );
-        debug_assert!(
-            self.counter_defs.is_empty(),
-            "map_callable_defs does not preserve counter defs"
-        );
-        BlockPyModule {
-            module_name_gen: self.module_name_gen,
-            global_names: self.global_names,
-            callable_defs: self.callable_defs.into_iter().map(&mut f).collect(),
-            module_constants: Vec::new(),
-            counter_defs: Vec::new(),
-        }
-    }
-}
-
 define_operation! {
     pub struct IncrementCounter {
         counter_id: CounterId,
@@ -809,34 +786,14 @@ impl<P: ModuleShape> BlockPyFunction<P> {
             .first()
             .expect("BlockPyFunction should have at least one block")
     }
-
-    pub fn map_blocks<Q: ModuleShape>(
-        self,
-        mut f: impl FnMut(Block<P::Instr>) -> Block<Q::Instr>,
-    ) -> BlockPyFunction<Q> {
-        BlockPyFunction {
-            function_id: self.function_id,
-            name_gen: self.name_gen,
-            names: self.names,
-            kind: self.kind,
-            params: self.params,
-            blocks: self.blocks.into_iter().map(&mut f).collect(),
-            doc: self.doc,
-            storage_layout: self.storage_layout,
-            scope: self.scope,
-        }
-    }
 }
 
 pub trait ModuleShape: Clone + fmt::Debug {
     type Instr: Instr;
 }
 
-pub type InstrName<I> = <I as Instr>::Name;
 pub type ResolvedStorageBlock = Block<InstrResolved>;
 pub type CodegenBlock = Block<InstrCodegen>;
-pub type CodegenBlockPyFunction = BlockPyFunction<crate::passes::CodegenModuleShape>;
-pub type CodegenBlockPyModule = BlockPyModule<crate::passes::CodegenModuleShape>;
 
 pub trait BlockPyJumpTerm {
     fn jump_term(target: BlockLabel) -> Self;
@@ -986,30 +943,6 @@ pub struct TermBranchTable<I: Instr> {
 #[derive(Debug, Clone)]
 pub struct TermRaise<I: Instr> {
     pub exc: Option<I>,
-}
-
-pub fn convert_blockpy_term_expr<IIn, IOut>(value: BlockTerm<IIn>) -> BlockTerm<IOut>
-where
-    IIn: Instr,
-    IOut: Instr + From<IIn>,
-{
-    struct IntoInstrMap<IIn, IOut>(std::marker::PhantomData<fn(IIn) -> IOut>);
-
-    impl<IIn, IOut> MapInstr<IIn, IOut> for IntoInstrMap<IIn, IOut>
-    where
-        IIn: Instr,
-        IOut: Instr + From<IIn>,
-    {
-        fn map_instr(&mut self, instr: IIn) -> IOut {
-            instr.into()
-        }
-
-        fn map_name(&mut self, _name: IIn::Name) -> IOut::Name {
-            unreachable!("BlockTerm carries no names")
-        }
-    }
-
-    IntoInstrMap(std::marker::PhantomData).map_term(value)
 }
 
 #[derive(Debug, Clone)]

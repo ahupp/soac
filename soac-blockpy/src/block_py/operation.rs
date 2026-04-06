@@ -1,7 +1,7 @@
 use super::operation_macro::define_operation;
 use super::{
     CallArgKeyword, CallArgPositional, CellLocation, ChildVisitable, FunctionId, FunctionKind,
-    HasMeta, Instr, InstrName, MapInstr, Mappable, Meta, NameLike, TryMapInstr, WithMeta,
+    HasMeta, Instr, MapInstr, Mappable, Meta, NameLike, TryMapInstr, WithMeta,
 };
 use ruff_python_ast::{self as ast};
 use std::fmt;
@@ -471,7 +471,7 @@ define_operation! {
 #[derive(Clone)]
 pub struct Load<I: Instr> {
     _meta: Meta,
-    pub name: InstrName<I>,
+    pub name: I::Name,
 }
 
 impl<I: Instr> fmt::Debug for Load<I> {
@@ -481,7 +481,7 @@ impl<I: Instr> fmt::Debug for Load<I> {
 }
 
 impl<I: Instr> Load<I> {
-    pub fn new(name: impl Into<InstrName<I>>) -> Self {
+    pub fn new(name: impl Into<I::Name>) -> Self {
         Self {
             _meta: Meta::default(),
             name: name.into(),
@@ -548,7 +548,7 @@ impl<I: Instr> Mappable<I> for Load<I> {
 #[derive(Clone)]
 pub struct Store<I: Instr> {
     _meta: Meta,
-    pub name: InstrName<I>,
+    pub name: I::Name,
     pub value: Box<I>,
 }
 
@@ -568,7 +568,7 @@ impl<I: Instr> fmt::Debug for Store<I> {
 }
 
 impl<I: Instr> Store<I> {
-    pub fn new(name: impl Into<InstrName<I>>, value: impl Into<Box<I>>) -> Self {
+    pub fn new(name: impl Into<I::Name>, value: impl Into<Box<I>>) -> Self {
         Self {
             _meta: Meta::default(),
             name: name.into(),
@@ -640,7 +640,7 @@ impl<I: Instr> Mappable<I> for Store<I> {
 #[derive(Clone)]
 pub struct Del<I: Instr> {
     _meta: Meta,
-    pub name: InstrName<I>,
+    pub name: I::Name,
     pub quietly: bool,
 }
 
@@ -654,7 +654,7 @@ impl<I: Instr> fmt::Debug for Del<I> {
 }
 
 impl<I: Instr> Del<I> {
-    pub fn new(name: impl Into<InstrName<I>>, quietly: bool) -> Self {
+    pub fn new(name: impl Into<I::Name>, quietly: bool) -> Self {
         Self {
             _meta: Meta::default(),
             name: name.into(),
