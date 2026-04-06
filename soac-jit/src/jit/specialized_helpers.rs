@@ -5,6 +5,7 @@ use std::ffi::c_void;
 use std::ptr;
 use std::sync::OnceLock;
 
+#[cfg(not(test))]
 use crate::operator_specialization::{ExactIntBinaryOpKind, ExactIntUnaryOpKind};
 
 #[cfg(not(test))]
@@ -18,11 +19,15 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 unsafe extern "C" {
     static mut PyFunction_Type: ffi::PyTypeObject;
     static mut PyMethod_Type: ffi::PyTypeObject;
-    static mut PyLong_Type: ffi::PyTypeObject;
     fn PyType_GenericAlloc(
         type_obj: *mut ffi::PyTypeObject,
         nitems: ffi::Py_ssize_t,
     ) -> *mut ffi::PyObject;
+}
+
+#[cfg(not(test))]
+unsafe extern "C" {
+    static mut PyLong_Type: ffi::PyTypeObject;
 }
 
 #[cfg(not(test))]
@@ -1058,6 +1063,15 @@ mod test_only_export_stubs {
     panic_obj_export!(dp_jit_tuple_new(size: i64));
     panic_i32_export!(dp_jit_tuple_set_item(tuple_obj: ObjPtr, index: i64, item: ObjPtr));
     panic_i32_export!(dp_jit_is_true(value: ObjPtr));
+    panic_dual_obj_export!(dp_jit_exact_long_binary_op, dp_jit_exact_long_binary_op_with_frame(
+        kind: i64,
+        lhs: ObjPtr,
+        rhs: ObjPtr
+    ));
+    panic_dual_obj_export!(dp_jit_exact_long_unary_op, dp_jit_exact_long_unary_op_with_frame(
+        kind: i64,
+        operand: ObjPtr
+    ));
 }
 
 #[cfg(test)]
@@ -1085,6 +1099,7 @@ macro_rules! define_perf_toggle_export {
             $body
         }
 
+        #[inline(never)]
         pub unsafe extern "C" fn $with_frame($($arg: $ty),*) -> $ret {
             preserve_helper_frame!($body)
         }
@@ -1361,6 +1376,7 @@ macro_rules! define_unary_obj_wrapper {
     };
 }
 
+#[cfg(not(test))]
 unsafe fn exact_long_type_mismatch_error() {
     ffi::PyErr_SetString(
         ffi::PyExc_RuntimeError,
@@ -1368,6 +1384,7 @@ unsafe fn exact_long_type_mismatch_error() {
     );
 }
 
+#[cfg(not(test))]
 unsafe fn exact_long_missing_slot_error() {
     ffi::PyErr_SetString(
         ffi::PyExc_RuntimeError,
@@ -1375,7 +1392,9 @@ unsafe fn exact_long_missing_slot_error() {
     );
 }
 
-unsafe extern "C" fn dp_jit_exact_long_binary_op(kind: i64, lhs: ObjPtr, rhs: ObjPtr) -> ObjPtr {
+#[cfg(not(test))]
+#[inline(never)]
+unsafe extern "C" fn exact_long_binary_op_hook(kind: i64, lhs: ObjPtr, rhs: ObjPtr) -> ObjPtr {
     let lhs = lhs as *mut ffi::PyObject;
     let rhs = rhs as *mut ffi::PyObject;
     if lhs.is_null() || rhs.is_null() {
@@ -1496,7 +1515,16 @@ unsafe extern "C" fn dp_jit_exact_long_binary_op(kind: i64, lhs: ObjPtr, rhs: Ob
     result as ObjPtr
 }
 
-unsafe extern "C" fn dp_jit_exact_long_unary_op(kind: i64, operand: ObjPtr) -> ObjPtr {
+#[cfg(not(test))]
+define_perf_toggle_export!(
+    ObjPtr,
+    dp_jit_exact_long_binary_op,
+    dp_jit_exact_long_binary_op_with_frame(kind: i64, lhs: ObjPtr, rhs: ObjPtr) => exact_long_binary_op_hook(kind, lhs, rhs)
+);
+
+#[cfg(not(test))]
+#[inline(never)]
+unsafe extern "C" fn exact_long_unary_op_hook(kind: i64, operand: ObjPtr) -> ObjPtr {
     let operand = operand as *mut ffi::PyObject;
     if operand.is_null() {
         return ptr::null_mut();
@@ -1555,6 +1583,13 @@ unsafe extern "C" fn dp_jit_exact_long_unary_op(kind: i64, operand: ObjPtr) -> O
         }
     }
 }
+
+#[cfg(not(test))]
+define_perf_toggle_export!(
+    ObjPtr,
+    dp_jit_exact_long_unary_op,
+    dp_jit_exact_long_unary_op_with_frame(kind: i64, operand: ObjPtr) => exact_long_unary_op_hook(kind, operand)
+);
 
 macro_rules! define_unary_i32_wrapper {
     ($fn_name:ident, $symbol:literal) => {
@@ -1878,11 +1913,17 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol("PyObject_IsTrue", pyobject_is_true_wrapper as *const u8);
     builder.symbol(
         "dp_jit_exact_long_binary_op",
-        dp_jit_exact_long_binary_op as *const u8,
+        chosen_helper_symbol(
+            dp_jit_exact_long_binary_op as *const u8,
+            dp_jit_exact_long_binary_op_with_frame as *const u8,
+        ),
     );
     builder.symbol(
         "dp_jit_exact_long_unary_op",
-        dp_jit_exact_long_unary_op as *const u8,
+        chosen_helper_symbol(
+            dp_jit_exact_long_unary_op as *const u8,
+            dp_jit_exact_long_unary_op_with_frame as *const u8,
+        ),
     );
     builder.symbol("PyNumber_Add", pynumber_add_wrapper as *const u8);
     builder.symbol("PyNumber_Subtract", pynumber_subtract_wrapper as *const u8);
