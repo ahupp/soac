@@ -263,14 +263,20 @@ impl ModuleCodegenConstants {
 }
 
 fn build_unicode_constant<'py>(py: Python<'py>, bytes: &[u8]) -> PyResult<Bound<'py, PyAny>> {
-    let ptr = unsafe {
+    let mut ptr = unsafe {
         ffi::PyUnicode_DecodeUTF8(
             bytes.as_ptr() as *const i8,
             bytes.len() as ffi::Py_ssize_t,
             c"surrogatepass".as_ptr(),
         )
     };
-    unsafe { Bound::from_owned_ptr_or_err(py, ptr) }
+    if ptr.is_null() {
+        return unsafe { Bound::from_owned_ptr_or_err(py, ptr) };
+    }
+    unsafe {
+        ffi::PyUnicode_InternInPlace(&mut ptr);
+        Bound::from_owned_ptr_or_err(py, ptr)
+    }
 }
 
 fn mark_constants_immortal(constants: &[Py<PyAny>]) {
