@@ -28,6 +28,11 @@ use std::env;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+unsafe extern "C" {
+    static mut PyFunction_Type: ffi::PyTypeObject;
+    static mut PyMethod_Type: ffi::PyTypeObject;
+}
+
 mod intrinsics;
 mod planning;
 mod specialized_helpers;
@@ -142,11 +147,6 @@ static DP_JIT_INCREF_IMPORT: ImportSpec =
     ImportSpec::local(SOAC_RUNTIME_INCREF_SYMBOL, &[SigType::Pointer], &[]);
 static DP_JIT_DECREF_IMPORT: ImportSpec =
     ImportSpec::local(SOAC_RUNTIME_DECREF_SYMBOL, &[SigType::Pointer], &[]);
-static DP_JIT_CALLEE_FUNCTION_ID_IMPORT: ImportSpec = ImportSpec::local(
-    SOAC_RUNTIME_CALLEE_FUNCTION_ID_SYMBOL,
-    &[SigType::Pointer],
-    &[SigType::I64],
-);
 static DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_py_call_positional_three",
     &[
@@ -687,6 +687,8 @@ struct JitEmitConsts {
     empty_tuple_const: ir::Value,
     block_const: ir::Value,
     global_slots_const: ir::Value,
+    py_function_type_ptr: *mut ffi::PyTypeObject,
+    py_method_type_ptr: *mut ffi::PyTypeObject,
     global_load_hit_counter_ptr: Option<*mut u64>,
     global_load_miss_counter_ptr: Option<*mut u64>,
 }
@@ -716,7 +718,6 @@ struct JitEmitCtx<'mc> {
     store_cell_ref: ir::FuncRef,
     py_call_object_ref: ir::FuncRef,
     py_call_with_kw_ref: ir::FuncRef,
-    callee_function_id_ref: ir::FuncRef,
     guard_method_type_version_ref: ir::FuncRef,
     record_counter_value_ref: ir::FuncRef,
     tuple_new_ref: ir::FuncRef,
@@ -1614,11 +1615,11 @@ fn emit_branch_index_i64(
                 jit_module,
                 func_imports,
             );
-            let call_inst = fb.ins().call(ctx.callee_function_id_ref, &[callable]);
+            let callee_id = emit_callee_function_id_checked(fb, callable, ctx);
             if !callable_is_borrowed {
                 fb.ins().call(ctx.decref_ref, &[callable]);
             }
-            fb.inst_results(call_inst)[0]
+            callee_id
         }
         _ => {
             let index_obj = emit_codegen_expr(
@@ -1890,8 +1891,113 @@ fn emit_callee_function_id_checked(
     callable: ir::Value,
     ctx: &JitEmitCtx<'_>,
 ) -> ir::Value {
-    let call_inst = fb.ins().call(ctx.callee_function_id_ref, &[callable]);
-    let callee_id = fb.inst_results(call_inst)[0];
+    const PYOBJECT_OB_TYPE_OFFSET: i32 = 8;
+    const PYMETHOD_IM_FUNC_OFFSET: i32 = 16;
+    const PYFUNCTION_SOAC_FUNCTION_ID_OFFSET: i32 = 160;
+
+    let ptr_ty = ctx.consts.ptr_ty;
+    let i64_ty = ctx.consts.i64_ty;
+    let null_block = fb.create_block();
+    let not_null_block = fb.create_block();
+    let function_block = fb.create_block();
+    let maybe_method_block = fb.create_block();
+    let method_block = fb.create_block();
+    let miss_block = fb.create_block();
+    let function_value_block = fb.create_block();
+    let done_block = fb.create_block();
+    let nonzero_id_block = fb.create_block();
+    fb.append_block_param(function_value_block, ptr_ty);
+    fb.append_block_param(done_block, i64_ty);
+
+    let callable_is_null = fb.ins().icmp_imm(ir::condcodes::IntCC::Equal, callable, 0);
+    fb.ins().brif(
+        callable_is_null,
+        null_block,
+        &[],
+        not_null_block,
+        &[],
+    );
+
+    fb.switch_to_block(null_block);
+    let err_const = fb.ins().iconst(i64_ty, i64::MIN);
+    fb.ins().jump(done_block, &[ir::BlockArg::Value(err_const)]);
+
+    fb.switch_to_block(not_null_block);
+    let callable_type = fb.ins().load(
+        ptr_ty,
+        ir::MemFlags::trusted(),
+        callable,
+        PYOBJECT_OB_TYPE_OFFSET,
+    );
+    let py_function_type = fb
+        .ins()
+        .iconst(ptr_ty, ctx.consts.py_function_type_ptr as i64);
+    let is_function = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, callable_type, py_function_type);
+    fb.ins()
+        .brif(is_function, function_block, &[], maybe_method_block, &[]);
+
+    fb.switch_to_block(function_block);
+    fb.ins()
+        .jump(function_value_block, &[ir::BlockArg::Value(callable)]);
+
+    fb.switch_to_block(maybe_method_block);
+    let py_method_type = fb
+        .ins()
+        .iconst(ptr_ty, ctx.consts.py_method_type_ptr as i64);
+    let is_method = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, callable_type, py_method_type);
+    fb.ins().brif(is_method, method_block, &[], miss_block, &[]);
+
+    fb.switch_to_block(method_block);
+    let method_function = fb.ins().load(
+        ptr_ty,
+        ir::MemFlags::trusted(),
+        callable,
+        PYMETHOD_IM_FUNC_OFFSET,
+    );
+    fb.ins()
+        .jump(function_value_block, &[ir::BlockArg::Value(method_function)]);
+
+    fb.switch_to_block(miss_block);
+    let zero_const = fb.ins().iconst(i64_ty, 0);
+    fb.ins().jump(done_block, &[ir::BlockArg::Value(zero_const)]);
+
+    fb.switch_to_block(function_value_block);
+    let function_value = fb.block_params(function_value_block)[0];
+    let function_is_null = fb
+        .ins()
+        .icmp_imm(ir::condcodes::IntCC::Equal, function_value, 0);
+    fb.ins().brif(
+        function_is_null,
+        null_block,
+        &[],
+        nonzero_id_block,
+        &[],
+    );
+
+    fb.switch_to_block(nonzero_id_block);
+    let packed_plus_one = fb.ins().load(
+        i64_ty,
+        ir::MemFlags::trusted(),
+        function_value,
+        PYFUNCTION_SOAC_FUNCTION_ID_OFFSET,
+    );
+    let id_is_zero = fb
+        .ins()
+        .icmp_imm(ir::condcodes::IntCC::Equal, packed_plus_one, 0);
+    let id_done_block = fb.create_block();
+    fb.ins()
+        .brif(id_is_zero, miss_block, &[], id_done_block, &[]);
+
+    fb.switch_to_block(id_done_block);
+    let callee_id = fb.ins().iadd_imm(packed_plus_one, -1);
+    fb.ins().jump(done_block, &[ir::BlockArg::Value(callee_id)]);
+
+    fb.switch_to_block(done_block);
+    let callee_id = fb.block_params(done_block)[0];
     let errored = fb
         .ins()
         .icmp_imm(ir::condcodes::IntCC::SignedLessThan, callee_id, 0);
@@ -4612,8 +4718,10 @@ fn remap_runtime_clif_extern_user_names(
             import_data_ids.insert(symbol.clone(), import_id);
             import_id
         };
-        let mapped_name = ir::UserExternalName::new(1, import_id.as_u32());
-        let mapped_name_ref = function.params.ensure_user_func_name(mapped_name);
+        let mapped_name_ref = function.declare_imported_user_function(ir::UserExternalName::new(
+            1,
+            import_id.as_u32(),
+        ));
         if let ir::GlobalValueData::Symbol { name, .. } = &mut function.global_values[gv] {
             *name = ir::ExternalName::User(mapped_name_ref);
         }
@@ -5108,11 +5216,6 @@ fn build_cranelift_run_bb_specialized_function(
             func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_PYOBJECT_SETITEM_IMPORT);
         let pyobject_to_i64_ref =
             func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_PYOBJECT_TO_I64_IMPORT);
-        let callee_function_id_ref = func_imports.get_or_panic(
-            jit_module,
-            &mut fb.func,
-            &DP_JIT_CALLEE_FUNCTION_ID_IMPORT,
-        );
         let guard_method_type_version_ref = func_imports.get_or_panic(
             jit_module,
             &mut fb.func,
@@ -5381,6 +5484,8 @@ fn build_cranelift_run_bb_specialized_function(
                     empty_tuple_const,
                     block_const,
                     global_slots_const,
+                    py_function_type_ptr: std::ptr::addr_of_mut!(PyFunction_Type),
+                    py_method_type_ptr: std::ptr::addr_of_mut!(PyMethod_Type),
                     global_load_hit_counter_ptr,
                     global_load_miss_counter_ptr,
                 },
@@ -5397,7 +5502,6 @@ fn build_cranelift_run_bb_specialized_function(
                 store_cell_ref,
                 py_call_object_ref,
                 py_call_with_kw_ref,
-                callee_function_id_ref,
                 guard_method_type_version_ref,
                 record_counter_value_ref,
                 tuple_new_ref,
