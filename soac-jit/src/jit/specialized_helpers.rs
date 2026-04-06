@@ -1027,8 +1027,19 @@ mod test_only_export_stubs {
 pub use test_only_export_stubs::*;
 
 #[cfg(not(test))]
+// Keep thin exported helpers as real call/return wrappers so perf can attribute
+// time to them instead of tail-collapsing directly into the C API callee.
+macro_rules! preserve_helper_frame {
+    ($expr:expr) => {{
+        let result = $expr;
+        std::ptr::read_volatile(&result);
+        result
+    }};
+}
+
+#[cfg(not(test))]
 pub unsafe extern "C" fn dp_jit_raise_from_exc(exc: ObjPtr) -> i32 {
-    raise_from_exc_hook(exc)
+    preserve_helper_frame!(raise_from_exc_hook(exc))
 }
 
 #[cfg(not(test))]
@@ -1039,12 +1050,12 @@ pub unsafe extern "C" fn dp_jit_py_call_positional_three(
     arg3: ObjPtr,
     _sentinel: ObjPtr,
 ) -> ObjPtr {
-    py_call_positional_three_hook(callable, arg1, arg2, arg3)
+    preserve_helper_frame!(py_call_positional_three_hook(callable, arg1, arg2, arg3))
 }
 
 #[cfg(not(test))]
 pub unsafe extern "C" fn dp_jit_py_call_object(callable: ObjPtr, args: ObjPtr) -> ObjPtr {
-    py_call_object_hook(callable, args)
+    preserve_helper_frame!(py_call_object_hook(callable, args))
 }
 
 #[cfg(not(test))]
@@ -1054,7 +1065,7 @@ pub unsafe extern "C" fn dp_jit_py_vectorcall(
     nargsf: ObjPtr,
     kwnames: ObjPtr,
 ) -> ObjPtr {
-    py_vectorcall_hook(callable, args, nargsf, kwnames)
+    preserve_helper_frame!(py_vectorcall_hook(callable, args, nargsf, kwnames))
 }
 
 #[cfg(not(test))]
@@ -1063,7 +1074,7 @@ pub unsafe extern "C" fn dp_jit_py_call_with_kw(
     args: ObjPtr,
     kw: ObjPtr,
 ) -> ObjPtr {
-    py_call_with_kw_hook(callable, args, kw)
+    preserve_helper_frame!(py_call_with_kw_hook(callable, args, kw))
 }
 
 #[cfg(not(test))]
@@ -1072,7 +1083,11 @@ pub unsafe extern "C" fn dp_jit_guard_method_type_version(
     expected_type: ObjPtr,
     expected_version: i64,
 ) -> i32 {
-    guard_method_type_version_hook(receiver, expected_type, expected_version)
+    preserve_helper_frame!(guard_method_type_version_hook(
+        receiver,
+        expected_type,
+        expected_version
+    ))
 }
 
 #[cfg(not(test))]
@@ -1082,12 +1097,12 @@ pub unsafe extern "C" fn dp_jit_record_counter_value(vmctx: ObjPtr, counter_id: 
 
 #[cfg(not(test))]
 pub unsafe extern "C" fn dp_jit_get_raised_exception() -> ObjPtr {
-    py_get_raised_exception_hook()
+    preserve_helper_frame!(py_get_raised_exception_hook())
 }
 
 #[cfg(not(test))]
 pub unsafe extern "C" fn dp_jit_get_arg_item(args: ObjPtr, index: i64) -> ObjPtr {
-    get_arg_item_hook(args, index)
+    preserve_helper_frame!(get_arg_item_hook(args, index))
 }
 
 #[cfg(not(test))]
