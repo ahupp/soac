@@ -151,9 +151,9 @@
     - a monotonic `u64` increment inserted at a chosen block entry.
   - The current codebase already has the right extension points for that shape:
     - BlockPy CFG instrumentation passes mutate function blocks in `instrument_bb_module_for_trace`, in `fn instrument_bb_module_for_trace`, at `soac-blockpy/src/passes/trace/mod.rs:41`;
-    - lowered modules already carry shared per-module data in `struct SharedModuleState`, at `soac-eval/src/module_type.rs:18`;
-    - JIT code already reads runtime pointers out of `struct JitModuleVmCtx`, at `soac-eval/src/jit/vmctx.rs:10`;
-    - specialized JIT code already allocates and updates per-function execution state via stack slots in `fn build_cranelift_run_bb_specialized_function`, at `soac-eval/src/jit/mod.rs:3600`.
+    - lowered modules already carry shared per-module data in `struct SharedModuleState`, at `soac-jit/src/module_type.rs:18`;
+    - JIT code already reads runtime pointers out of `struct JitModuleVmCtx`, at `soac-jit/src/jit/vmctx.rs:10`;
+    - specialized JIT code already allocates and updates per-function execution state via stack slots in `fn build_cranelift_run_bb_specialized_function`, at `soac-jit/src/jit/mod.rs:3600`.
   - A good staged plan is:
     1. Introduce an explicit codegen-visible counter op in BlockPy.
        - Add a small op such as `IncrementCounter { counter_id: u32 }` to the codegen instruction set, instead of reusing helper calls like trace currently does.
@@ -182,7 +182,7 @@
          - attach human-readable labels for reporting.
        - Keep that policy as a pass-local transform first, not as environment-variable behavior baked into codegen.
     3. Add explicit runtime storage for counters in shared module state.
-       - Extend `SharedModuleState`, in `struct SharedModuleState`, at `soac-eval/src/module_type.rs:18`, with a counter storage owner:
+       - Extend `SharedModuleState`, in `struct SharedModuleState`, at `soac-jit/src/module_type.rs:18`, with a counter storage owner:
          ```rust
          pub struct CounterStorage {
              values: Vec<AtomicU64>,
@@ -195,7 +195,7 @@
          - it can be read again at shutdown without coordinating with a process-global map.
        - For the first implementation, `AtomicU64` is simpler than raw `u64`, even if execution is effectively single-threaded under the GIL today.
     4. Thread a counter-storage pointer through the JIT runtime context.
-       - Extend `JitModuleVmCtx`, in `struct JitModuleVmCtx`, at `soac-eval/src/jit/vmctx.rs:10`, with one pointer field for counter storage:
+       - Extend `JitModuleVmCtx`, in `struct JitModuleVmCtx`, at `soac-jit/src/jit/vmctx.rs:10`, with one pointer field for counter storage:
          ```rust
          pub counter_base: *mut u64,
          ```
@@ -205,7 +205,7 @@
        - This keeps the JIT-side access model identical to globals/module constants:
          load one base pointer from vmctx, then index into it.
     5. Lower `IncrementCounter` directly in JIT codegen.
-       - In `fn build_cranelift_run_bb_specialized_function`, at `soac-eval/src/jit/mod.rs:3600`, handle `IncrementCounter` by:
+       - In `fn build_cranelift_run_bb_specialized_function`, at `soac-jit/src/jit/mod.rs:3600`, handle `IncrementCounter` by:
          - loading the counter base pointer from vmctx;
          - computing `base + counter_id * size_of::<u64>()`;
          - loading the current value;
@@ -221,7 +221,7 @@
          ```
        - For the first slice, do this only in JIT codegen. Tree-walk/native execution can either ignore the op explicitly or reject it until the instrumentation path is used only for JIT benchmarking.
     6. Expose readout through module/runtime APIs.
-       - Add one small readout API near module runtime ownership, probably in `soac-pyo3/src/jit_runtime.rs` or `soac-eval/src/module_type.rs`, that returns:
+       - Add one small readout API near module runtime ownership, probably in `soac-pyo3/src/jit_runtime.rs` or `soac-jit/src/module_type.rs`, that returns:
          - current values by ID; and/or
          - `(CounterDef, value)` pairs.
        - This supports both:
@@ -432,7 +432,7 @@
 
 - Planning note:
   - Ordinary function creation still round-trips through transformed Python via `__dp_make_function(...)` in `soac-blockpy/src/passes/ruff_to_blockpy/module_plan/mod.rs`, `runtime.make_function(...)` in `soac_py/src/soac/runtime.py`, and `_soac_ext.make_bb_function(...)` in `soac-pyo3/src/jit_runtime.rs`.
-  - That path is the remaining reason we keep `with_current_module_runtime_context(...)` / active-runtime TLS in `soac-eval/src/tree_walk/eval.rs`.
+  - That path is the remaining reason we keep `with_current_module_runtime_context(...)` / active-runtime TLS in `soac-jit/src/tree_walk/eval.rs`.
   - The clean end state is for `MakeFunction` to remain a native operation through later lowering and evaluation instead of being materialized back into a Python helper call in `soac-blockpy/src/passes/name_binding.rs`.
   - A safe implementation order is:
     - keep `OperationDetail::MakeFunction(...)` alive after `name_binding` instead of rewriting it into `__dp_make_function(...)`;
@@ -565,9 +565,9 @@
     - The likely real fix is either a non-string temp/id representation carried through the IR, or one late legalization/materialization pass that checks concrete Python names once.
 
 - Everything about annotation_export.rs needs revisiting.
-- Move refcount management out of `soac-eval` and into a new explicit pass in `rewrite_module`.
+- Move refcount management out of `soac-jit` and into a new explicit pass in `rewrite_module`.
   - Planning note:
-    - The current JIT path in `soac-eval` still owns a large amount of `incref` / `decref` insertion and runtime helper wiring (`dp_jit_incref`, `dp_jit_decref`), which makes ownership of reference semantics backend-local instead of pipeline-visible.
+    - The current JIT path in `soac-jit` still owns a large amount of `incref` / `decref` insertion and runtime helper wiring (`dp_jit_incref`, `dp_jit_decref`), which makes ownership of reference semantics backend-local instead of pipeline-visible.
     - The desired end state is for refcount ownership to become an explicit lowered-module pass in `rewrite_module`, so later backends consume already-refcount-annotated IR instead of each backend re-deriving those rules.
     - A good first pass is to identify the minimal IR annotation or explicit stmt/term forms needed for retain/release edges, then move the current JIT-only reference-management decisions behind one driver-visible transform boundary.
 - Merge `ast_to_ast::semantic` and `block_py::semantics` and `ast_symbol_analysis`, `dataflow`, and `callable_semantic.rs`
@@ -614,7 +614,7 @@
     - A good first pass is to inventory the current handling of `None`/`True`/`False`/ellipsis, strings/bytes, tuples of constants, and large literals, then choose one pass boundary where constant representation becomes final for all backends.
 - Handle integer literals larger than can fit in an `i64`.
   - Planning note:
-    - The current direct-simple JIT literal planning in `soac-eval/src/jit/planning.rs` only lowers integer literals that fit in `i64`, so larger Python ints fall out of that fast path.
+    - The current direct-simple JIT literal planning in `soac-jit/src/jit/planning.rs` only lowers integer literals that fit in `i64`, so larger Python ints fall out of that fast path.
     - A good first pass is to decide whether large ints should be materialized through a general Python-object literal helper at planning/codegen time, or whether they should be excluded from the direct-simple subset in a more explicit way.
 - Give intrinsics typed expr builders instead of raw `Vec` arg construction.
   - Planning note:
@@ -649,8 +649,8 @@
     - Python runtime constants: real `PyObject` values such as strings, bytes, large ints, kw-name tuples, and any other per-module objects that generated code wants to load or call against.
     - Internal lowering data: Rust-only metadata such as `BlockPyModule<CodegenBlockPyPass>`, function tables, storage layouts, block plans, and any future compile-time descriptors.
   - Today those are split inconsistently:
-    - Python constants are mostly re-materialized ad hoc in JIT codegen, for example `emit_owned_string_constant` and the bytes/int/float literal paths in `soac-eval/src/jit/intrinsics.rs` and `soac-eval/src/jit/mod.rs`.
-    - Internal data is stored per module in `_soac_ext` module state for the root `BlockPyModule`, but function-level lookup still escapes through the global `BB_FUNCTION_REGISTRY` in `soac-eval/src/jit/planning.rs`, keyed by `(module_name, function_id)`.
+    - Python constants are mostly re-materialized ad hoc in JIT codegen, for example `emit_owned_string_constant` and the bytes/int/float literal paths in `soac-jit/src/jit/intrinsics.rs` and `soac-jit/src/jit/mod.rs`.
+    - Internal data is stored per module in `_soac_ext` module state for the root `BlockPyModule`, but function-level lookup still escapes through the global `BB_FUNCTION_REGISTRY` in `soac-jit/src/jit/planning.rs`, keyed by `(module_name, function_id)`.
   - The clean split is:
     - `CompileSession` owns all internal lowering data and typed ids.
     - `_soac_ext` module state owns the realized Python constant pool for that module, plus a typed handle back to the owning `CompileSession` / module id.
@@ -664,7 +664,7 @@
       - start with string-ish cases that are already obvious, e.g. attribute names, global-name loads, bytes/string literals, and decode-literal helpers;
       - handle larger or composite constants later, e.g. big ints, kw-name tuples, and any tuple/dict literal fragments that should become pooled objects.
     - Realize that Python constant pool once per module in `_soac_ext` module state, not in the Rust-only `CompileSession`. That keeps Python references attached to the module object that owns their lifetime.
-    - Because module state would then hold `PyObject` references, reintroduce real `m_traverse` / `m_clear` handling in `soac-eval/src/module_type.rs` so GC can see and clear those Python constant references safely.
+    - Because module state would then hold `PyObject` references, reintroduce real `m_traverse` / `m_clear` handling in `soac-jit/src/module_type.rs` so GC can see and clear those Python constant references safely.
     - Add a small runtime accessor layer for JIT codegen, for example “load python const by id from module state / owner”, instead of emitting bespoke bytes-to-string decode logic at every site.
   - Design constraints to preserve:
     - Keep evaluation order unchanged. Pooling a constant is only a representation change; it must not move side effects or accidentally share objects whose identity is supposed to be fresh.
@@ -707,13 +707,13 @@
   - Keep the extraction logic deterministic and deduplicate only by semantic constant value plus kind, not by source location.
   - Add validation so late codegen fails if an expression shape that should already have become `LoadConstant` still carries pooled-literal payloads.
 - Module-state ownership:
-  - Extend `SharedModuleState` in `soac-eval/src/module_type.rs` with a `module_constants` table that owns `Py<PyAny>` references in id order.
+  - Extend `SharedModuleState` in `soac-jit/src/module_type.rs` with a `module_constants` table that owns `Py<PyAny>` references in id order.
   - Build that table when `_soac_ext.create_module(...)` initializes module state, after lowering has produced the constant descriptors but before execution starts.
   - Keep the lowered-module metadata and the Python object table separate in structure even if both live in `SharedModuleState`, so future session-owned lowering cleanup does not entangle Rust metadata with GC-owned Python references.
   - Add typed lookup helpers on `SharedModuleState` and `SoacExtModuleDataRef` for "constant by id" so tree-walk and JIT paths use one access story.
 - GC integration:
   - Replace the current "Rust-only state" assumption in `SOAC_EXT_MODULE_DEF` with real module GC support once `SharedModuleState` owns `PyObject` references.
-  - Implement `m_traverse` in `soac-eval/src/module_type.rs` to visit every entry in `module_constants`.
+  - Implement `m_traverse` in `soac-jit/src/module_type.rs` to visit every entry in `module_constants`.
   - Keep `m_clear` responsible for dropping the constant table and the rest of shared state in a GC-safe order.
   - Audit `clone_shared_state` and `ModuleRuntimeContext` so cloned `Arc<SharedModuleState>` values keep the module constants alive correctly without introducing hidden Python roots outside the intended module lifetime.
 - Runtime and codegen plumbing:
@@ -725,9 +725,9 @@
     - `emit_owned_string_constant`;
     - `MakeString`;
     - raw-name loads used by `LoadGlobal`, `LoadRuntime`, `GetAttr`, `SetAttr`, and deleted-name helpers;
-    - bytes and numeric literal materialization paths in `soac-eval/src/jit/mod.rs`.
+    - bytes and numeric literal materialization paths in `soac-jit/src/jit/mod.rs`.
 - Cleanup after conversion:
-  - Remove the per-compiled-runner `_literal_pool` storage in `soac-eval/src/jit/mod.rs` once no emitted code relies on embedded byte-slice addresses staying alive.
+  - Remove the per-compiled-runner `_literal_pool` storage in `soac-jit/src/jit/mod.rs` once no emitted code relies on embedded byte-slice addresses staying alive.
   - Delete `intern_bytes_literal(...)` and the `dp_jit_decode_literal_bytes` helper/export once all callers are gone.
   - Collapse any now-redundant helper paths that only existed to smuggle names through raw byte decoding.
   - Revisit `CodegenBlockPyLiteral` and remove variants that are no longer needed once constants are represented exclusively as `LoadConstant` or genuinely non-pooled literals.
@@ -990,7 +990,7 @@ Planned steps:
    - That is enough to cover most “arbitrary CFG point” needs without introducing term splitting yet.
 
 4. Allocate counter backing storage in `SharedModuleState`.
-   - Extend `SharedModuleState` in `soac-eval/src/module_type.rs` with something like:
+   - Extend `SharedModuleState` in `soac-jit/src/module_type.rs` with something like:
 
    ```rust
    pub counter_defs: Vec<CounterDef>,
@@ -1018,7 +1018,7 @@ Planned steps:
    - The addresses are module-lifetime-stable because they live in `SharedModuleState`.
 
 6. Lower `IncrementCounter` directly in JIT codegen.
-   - In the statement/body lowering path in `soac-eval/src/jit/mod.rs`, add:
+   - In the statement/body lowering path in `soac-jit/src/jit/mod.rs`, add:
 
    ```rust
    CodegenInstr::IncrementCounter(id) => {

@@ -11,7 +11,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 soac-blockpy = { path = "../soac-blockpy" }
-soac-jit = { path = "../soac-eval" }
+soac-jit = { path = "../soac-jit" }
 pyo3 = { workspace = true, features = ["extension-module"] }
 log = "0.4"
 serde_json = "1"

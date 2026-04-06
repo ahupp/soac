@@ -117,8 +117,8 @@ Proposed fix:
 
 Landed fix:
 - JIT planning/runtime updates in:
-  - `soac-eval/src/jit/planning.rs`
-  - `soac-eval/src/jit/mod.rs`
+  - `soac-jit/src/jit/planning.rs`
+  - `soac-jit/src/jit/mod.rs`
 - async-generator completion updates in:
   - `soac-blockpy/src/passes/blockpy_generators/mod.rs`
   - `soac_py/src/soac/runtime.py`
@@ -144,7 +144,7 @@ Proposed fix:
 
 Landed fix:
 - Runtime cleanup in `soac_py/src/soac/runtime.py`
-- JIT refcount fixes in `soac-eval/src/jit/mod.rs`
+- JIT refcount fixes in `soac-jit/src/jit/mod.rs`
 
 Status:
 - fixed
@@ -169,8 +169,8 @@ Proposed fix:
 - Rewrite bare `exec(...)` / `eval(...)` calls so they pass an explicit `__dp_locals()` mapping when they intend to use the caller’s default local scope.
 
 Landed fix:
-- Removed the JIT `__dp_eval_` / `__dp_exec_` shortcut in `soac-eval/src/jit/mod.rs`
-- Included ambient values in JIT locals synthesis in `soac-eval/src/jit/mod.rs`
+- Removed the JIT `__dp_eval_` / `__dp_exec_` shortcut in `soac-jit/src/jit/mod.rs`
+- Included ambient values in JIT locals synthesis in `soac-jit/src/jit/mod.rs`
 - Rewrote one-argument `exec(...)` / `eval(...)` to pass `None, __dp_locals()` in `soac-blockpy/src/passes/ast_to_ast/rewrite_names.rs`
 - Kept `_default_visible_locals(...)` support in `soac_py/src/soac/runtime.py`
 
