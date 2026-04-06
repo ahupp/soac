@@ -94,7 +94,7 @@ where
         elif_else_clauses,
         ..
     } = if_stmt;
-    let mut bridge = StructuredLoweringBridge::new();
+    let bridge = StructuredLoweringBridge::new();
     let Some(test_setup) = bridge.try_lower_inline_value(
         |structured, scratch_next_label_id| {
             crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
@@ -116,7 +116,7 @@ where
             name_gen,
             body,
             loop_ctx,
-            &mut bridge,
+            &bridge,
         )
     else {
         return Err("if-body still requires structured lowering".to_string());
@@ -129,7 +129,7 @@ where
         elif_else_clauses,
         &Stmt::If(if_stmt.clone()),
         loop_ctx,
-        &mut bridge,
+        &bridge,
     ) else {
         return Err("if-orelse still requires structured lowering".to_string());
     };
@@ -228,7 +228,7 @@ fn lower_nested_body_to_inline_fragment<E>(
     name_gen: &FunctionNameGen,
     body: &Suite,
     loop_ctx: Option<&LoopContext>,
-    bridge: &mut StructuredLoweringBridge,
+    bridge: &StructuredLoweringBridge,
 ) -> Option<Result<InlineFragment<E>, String>>
 where
     E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
@@ -289,7 +289,7 @@ fn lower_orelse_to_inline_fragment<E>(
     clauses: &[ast::ElifElseClause],
     stmt: &Stmt,
     loop_ctx: Option<&LoopContext>,
-    bridge: &mut StructuredLoweringBridge,
+    bridge: &StructuredLoweringBridge,
 ) -> Option<Result<InlineFragment<E>, String>>
 where
     E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,

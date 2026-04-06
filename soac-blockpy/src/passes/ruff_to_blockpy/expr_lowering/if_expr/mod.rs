@@ -47,7 +47,7 @@ pub(crate) fn try_lower_if_expr_direct<L, E>(
      let ast::ExprIf {
          test, body, orelse, ..
      } = if_expr;
-     let mut bridge = crate::passes::ruff_to_blockpy::stmt_lowering::StructuredLoweringBridge::new();
+     let bridge = crate::passes::ruff_to_blockpy::stmt_lowering::StructuredLoweringBridge::new();
      let Some(test_setup) = bridge.try_lower_inline_value::<E, Expr>(
          |structured, scratch_next_label_id| {
              lowerer.lower_expr_ast_into(*test.clone(), structured, loop_ctx, scratch_next_label_id)

@@ -6,37 +6,32 @@ use crate::passes::ast_to_ast::context::Context;
 pub(super) type BlockPyStmtBuilder<E> =
     crate::block_py::BlockBuilder<StructuredInstr<E>, BlockTerm<E>>;
 
-pub(crate) struct StructuredLoweringBridge {
-    legacy_next_label_id: usize,
-}
+pub(crate) struct StructuredLoweringBridge;
 
 impl StructuredLoweringBridge {
     pub(crate) fn new() -> Self {
-        Self {
-            legacy_next_label_id: 0,
-        }
+        Self
     }
 
     pub(crate) fn try_lower_inline_value<E, T>(
-        &mut self,
+        &self,
         lower: impl FnOnce(&mut BlockPyStmtBuilder<E>, &mut usize) -> Result<T, String>,
     ) -> Option<Result<(InlineBlockBuilder<E>, T), String>>
     where
         E: RuffToBlockPyExpr,
     {
-        try_lower_inline_value_from_structured(&mut self.legacy_next_label_id, lower)
+        try_lower_inline_value_from_structured(lower)
     }
 }
 
 fn try_lower_inline_value_from_structured<E, T>(
-    next_label_id: &mut usize,
     lower: impl FnOnce(&mut BlockPyStmtBuilder<E>, &mut usize) -> Result<T, String>,
 ) -> Option<Result<(InlineBlockBuilder<E>, T), String>>
 where
     E: RuffToBlockPyExpr,
 {
     let mut structured = BlockPyStmtBuilder::<E>::new();
-    let mut scratch_next_label_id = *next_label_id;
+    let mut scratch_next_label_id = 0usize;
     let value = match lower(&mut structured, &mut scratch_next_label_id) {
         Ok(value) => value,
         Err(err) => return Some(Err(err)),
@@ -56,7 +51,6 @@ where
         Some(term) => entry.set_term(term),
     }
 
-    *next_label_id = scratch_next_label_id;
     Some(Ok((entry, value)))
 }
 

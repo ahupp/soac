@@ -91,7 +91,7 @@ where
 {
     let ast::ExprBoolOp { op, values, .. } = bool_op;
     let target = fresh_setup_name("target");
-    let mut bridge = crate::passes::ruff_to_blockpy::stmt_lowering::StructuredLoweringBridge::new();
+    let bridge = crate::passes::ruff_to_blockpy::stmt_lowering::StructuredLoweringBridge::new();
     let mut values = values.into_iter();
     let first = values.next().expect("bool op expects at least one value");
     let (mut entry, first) = bridge
@@ -182,7 +182,7 @@ where
     } = compare;
     let compare_name = fresh_setup_name("compare");
     let target_name = fresh_setup_name("target");
-    let mut bridge = crate::passes::ruff_to_blockpy::stmt_lowering::StructuredLoweringBridge::new();
+    let bridge = crate::passes::ruff_to_blockpy::stmt_lowering::StructuredLoweringBridge::new();
     let ops = ops.into_vec();
     let comparators = comparators.into_vec();
     let mut steps = ops.into_iter().zip(comparators.into_iter()).peekable();

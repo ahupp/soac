@@ -499,7 +499,7 @@ where
         return Ok(label);
     }
 
-    let mut bridge = StructuredLoweringBridge::new();
+    let bridge = StructuredLoweringBridge::new();
     if let Some(fragment) = bridge.try_lower_inline_value::<E, E>(
         |out, scratch_next_label_id| {
             for stmt in &body {
