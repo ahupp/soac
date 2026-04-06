@@ -596,16 +596,91 @@ test-all:
   just uninstall-extension
   exit 0
 
+_call-target-specializations-from-dump dump_path:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cd "$REPO_ROOT"
+  cargo run -q -p soac-inspector --bin inspect_counters -- "{{dump_path}}" \
+    | awk '
+        /^record=/ {
+          module = "";
+          for (i = 1; i <= NF; i++) {
+            if ($i ~ /^module=/) {
+              module = substr($i, 8);
+            }
+          }
+          next;
+        }
+        / kind=call_hot_targets / {
+          site_function_id = "";
+          instr_id = "";
+          observed_value = "-";
+          for (i = 1; i <= NF; i++) {
+            if ($i ~ /^site_function_id=/) {
+              site_function_id = substr($i, 18);
+            } else if ($i ~ /^instr_id=/) {
+              instr_id = substr($i, 10);
+            } else if ($i ~ /^observed_value=/) {
+              observed_value = substr($i, 16);
+            }
+          }
+          if (module == "" || site_function_id == "" || instr_id == "-" || observed_value == "-" || observed_value == "0") {
+            next;
+          }
+          if (instr_id !~ /^bb[0-9]+:[0-9]+$/) {
+            next;
+          }
+          split(substr(instr_id, 3), instr_parts, ":");
+          key = module "|" site_function_id "|" instr_parts[1] "|" instr_parts[2];
+          target_key = key "|" observed_value;
+          if (!(target_key in seen)) {
+            seen[target_key] = 1;
+            if (key in targets) {
+              targets[key] = targets[key] "," observed_value;
+            } else {
+              order[++count] = key;
+              targets[key] = observed_value;
+            }
+          }
+        }
+        END {
+          for (i = 1; i <= count; i++) {
+            key = order[i];
+            printf "%s=%s", key, targets[key];
+            if (i < count) {
+              printf ";";
+            }
+          }
+          printf "\n";
+        }
+      '
+
 benchmark loops="1000000": (update-venv) (build-extension "release")
   #!/usr/bin/env bash
+  set -euo pipefail
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
   echo "date: $(date +%F)"
   echo "loops: {{loops}}"
 
   cd "$REPO_ROOT"
+  counter_dump_path="$(mktemp "${TMPDIR:-/tmp}/soac_benchmark_call_targets_XXXXXX.bin")"
+  trap 'rm -f "$counter_dump_path"' EXIT
 
-  echo "jit transformed"
-  "$VENV_DIR/bin/python" -m soac.import_hook scripts/pystone.py "{{loops}}"
+  echo "jit transformed profile pass"
+  DIET_PYTHON_CALL_TARGET_COUNTERS=1 \
+    DIET_PYTHON_COUNTERS_FILE="$counter_dump_path" \
+    "$VENV_DIR/bin/python" -m soac.import_hook scripts/pystone.py "{{loops}}"
+
+  specializations="$(just _call-target-specializations-from-dump "$counter_dump_path")"
+  if [[ -n "$specializations" ]]; then
+    site_count="$(awk -F';' 'NF { print NF }' <<<"$specializations")"
+    echo "jit transformed specialized pass (${site_count} callsites)"
+    DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS="$specializations" \
+      "$VENV_DIR/bin/python" -m soac.import_hook scripts/pystone.py "{{loops}}"
+  else
+    echo "jit transformed specialized pass (no hot callsites recorded)"
+    "$VENV_DIR/bin/python" -m soac.import_hook scripts/pystone.py "{{loops}}"
+  fi
 
   echo "stock cpython"
   "$VENV_DIR/bin/python" scripts/pystone.py "{{loops}}"
