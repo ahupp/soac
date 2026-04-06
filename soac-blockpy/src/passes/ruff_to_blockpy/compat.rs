@@ -47,7 +47,6 @@ where
 
 pub(crate) fn emit_inline_fragment_with_exc_target_and_expr<E>(
     blocks: &mut Vec<LoweredBlockPyBlock<E>>,
-    label: BlockLabel,
     fragment: InlineFragment<E>,
     fallthrough_target: BlockLabel,
     exc_target: Option<&BlockLabel>,
@@ -55,8 +54,9 @@ pub(crate) fn emit_inline_fragment_with_exc_target_and_expr<E>(
 where
     E: RuffToBlockPyExpr + ImplicitNoneExpr,
 {
+    let entry_label = fragment.entry.label;
     blocks.push(compat_block_from_inline_with_exc_target_and_expr(
-        Block::from_builder(label.clone(), fragment.entry, Vec::new(), None, None),
+        fragment.entry,
         fallthrough_target.clone(),
         exc_target,
     ));
@@ -67,7 +67,7 @@ where
             exc_target,
         )
     }));
-    label
+    entry_label
 }
 
 pub(crate) fn compat_block_from_blockpy_with_exc_target_and_expr<E>(
@@ -267,10 +267,11 @@ where
                 next_label
             };
             let dispatch_label = name_gen.next_block_name();
+            let mut setup = lowered.setup;
+            setup.entry.label = fragment_entry_label;
             emit_inline_fragment_with_exc_target_and_expr(
                 blocks,
-                fragment_entry_label,
-                lowered.setup,
+                setup,
                 dispatch_label.clone(),
                 exc_target,
             );
@@ -372,10 +373,11 @@ where
                 next_label
             };
             let dispatch_label = name_gen.next_block_name();
+            let mut setup = lowered.setup;
+            setup.entry.label = fragment_entry_label;
             emit_inline_fragment_with_exc_target_and_expr(
                 blocks,
-                fragment_entry_label,
-                lowered.setup,
+                setup,
                 dispatch_label.clone(),
                 exc_target,
             );
@@ -461,10 +463,11 @@ where
             name_gen.next_block_name()
         };
         let dispatch_label = name_gen.next_block_name();
+        let mut setup = lowered.setup;
+        setup.entry.label = setup_label.clone();
         emit_inline_fragment_with_exc_target_and_expr(
             blocks,
-            setup_label.clone(),
-            lowered.setup,
+            setup,
             dispatch_label.clone(),
             exc_target,
         );
@@ -525,8 +528,7 @@ where
         }));
         return Ok(emit_inline_fragment_with_exc_target_and_expr(
             blocks,
-            label,
-            InlineFragment::new(entry, Vec::new()),
+            InlineFragment::from_builder(label, entry, Vec::new()),
             BlockLabel::fallthrough(),
             exc_target,
         ));
@@ -569,10 +571,11 @@ where
     };
     if let Some(Ok(lowered)) = lowered_direct {
         let dispatch_label = name_gen.next_block_name();
+        let mut setup = lowered.setup;
+        setup.entry.label = test_label.clone();
         emit_inline_fragment_with_exc_target_and_expr(
             blocks,
-            test_label.clone(),
-            lowered.setup,
+            setup,
             dispatch_label.clone(),
             exc_target,
         );

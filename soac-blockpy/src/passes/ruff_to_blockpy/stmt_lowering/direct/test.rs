@@ -65,9 +65,11 @@ fn stmt_expr_to_blockpy_emits_setup_for_named_exprs() {
 fn stmt_expr_fragment_uses_plain_instr_body_with_fallthrough() {
     let stmt = py_stmt!("(x := y)");
     let context = Context::new("");
+    let name_gen = crate::block_py::ModuleNameGen::new(0).next_function_name_gen();
 
     let Some(fragment) = try_lower_direct_stmt_fragment::<InstrWithAwaitAndYield>(
         &context,
+        &name_gen,
         &stmt,
         None,
     ) else {
@@ -82,7 +84,7 @@ fn stmt_expr_fragment_uses_plain_instr_body_with_fallthrough() {
     ));
     assert!(matches!(
         fragment.entry.term,
-        Some(BlockTerm::Jump(BlockEdge { target, args }))
+        BlockTerm::Jump(BlockEdge { target, args })
             if target == BlockLabel::fallthrough() && args.is_empty()
     ));
 }
@@ -91,9 +93,11 @@ fn stmt_expr_fragment_uses_plain_instr_body_with_fallthrough() {
 fn stmt_expr_fragment_returns_none_for_branchy_expr_setup() {
     let stmt = py_stmt!("x if cond else y");
     let context = Context::new("");
+    let name_gen = crate::block_py::ModuleNameGen::new(0).next_function_name_gen();
 
     let fragment = try_lower_direct_stmt_fragment::<InstrWithAwaitAndYield>(
         &context,
+        &name_gen,
         &stmt,
         None,
     );
@@ -105,9 +109,11 @@ fn stmt_expr_fragment_returns_none_for_branchy_expr_setup() {
 fn stmt_return_fragment_sets_terminator_for_plain_value() {
     let stmt = py_stmt!("return value");
     let context = Context::new("");
+    let name_gen = crate::block_py::ModuleNameGen::new(0).next_function_name_gen();
 
     let Some(fragment) = try_lower_direct_stmt_fragment::<InstrWithAwaitAndYield>(
         &context,
+        &name_gen,
         &stmt,
         None,
     ) else {
@@ -116,16 +122,18 @@ fn stmt_return_fragment_sets_terminator_for_plain_value() {
     let fragment = fragment.expect("return fragment lowering should succeed");
 
     assert!(fragment.deps.is_empty());
-    assert!(matches!(fragment.entry.term, Some(BlockTerm::Return(_))));
+    assert!(matches!(fragment.entry.term, BlockTerm::Return(_)));
 }
 
 #[test]
 fn stmt_raise_fragment_sets_terminator_for_plain_exc() {
     let stmt = py_stmt!("raise exc");
     let context = Context::new("");
+    let name_gen = crate::block_py::ModuleNameGen::new(0).next_function_name_gen();
 
     let Some(fragment) = try_lower_direct_stmt_fragment::<InstrWithAwaitAndYield>(
         &context,
+        &name_gen,
         &stmt,
         None,
     ) else {
@@ -136,7 +144,7 @@ fn stmt_raise_fragment_sets_terminator_for_plain_exc() {
     assert!(fragment.deps.is_empty());
     assert!(matches!(
         fragment.entry.term,
-        Some(BlockTerm::Raise(TermRaise { exc: Some(_) }))
+        BlockTerm::Raise(TermRaise { exc: Some(_) })
     ));
 }
 
@@ -144,6 +152,7 @@ fn stmt_raise_fragment_sets_terminator_for_plain_exc() {
 fn stmt_break_fragment_uses_loop_jump() {
     let stmt = py_stmt!("break");
     let context = Context::new("");
+    let name_gen = crate::block_py::ModuleNameGen::new(0).next_function_name_gen();
     let loop_ctx = LoopContext {
         continue_label: BlockLabel::from_index(7),
         break_label: BlockLabel::from_index(9),
@@ -151,6 +160,7 @@ fn stmt_break_fragment_uses_loop_jump() {
 
     let Some(fragment) = try_lower_direct_stmt_fragment::<InstrWithAwaitAndYield>(
         &context,
+        &name_gen,
         &stmt,
         Some(&loop_ctx),
     ) else {
@@ -161,7 +171,7 @@ fn stmt_break_fragment_uses_loop_jump() {
     assert!(fragment.deps.is_empty());
     assert!(matches!(
         fragment.entry.term,
-        Some(BlockTerm::Jump(BlockEdge { target, ref args }))
+        BlockTerm::Jump(BlockEdge { target, ref args })
             if target == BlockLabel::from_index(9) && args.is_empty()
     ));
 }

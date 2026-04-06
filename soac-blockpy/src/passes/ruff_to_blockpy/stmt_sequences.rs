@@ -573,32 +573,29 @@ where
         continue_label: loop_labels.continue_label.clone(),
         break_label: loop_labels.break_label.clone(),
     });
-    if let Some(Ok(fragment)) = stmt_lowering::try_lower_if_stmt_fragment::<E>(
+    if let Some(Ok(mut fragment)) = stmt_lowering::try_lower_if_stmt_fragment::<E>(
         context,
         name_gen,
         &if_stmt,
         loop_ctx.as_ref(),
     ) {
-        let fragment_label = if linear.is_empty() {
-            label.clone()
-        } else {
-            name_gen.next_block_name()
-        };
-        emit_inline_fragment_with_exc_target_and_expr(
+        if linear.is_empty() {
+            fragment.entry.label = label;
+        }
+        let fragment_entry = emit_inline_fragment_with_exc_target_and_expr(
             blocks,
-            fragment_label.clone(),
             fragment,
             rest_entry,
             targets.active_exc.as_ref(),
         );
         if linear.is_empty() {
-            return label;
+            return fragment_entry;
         }
         return emit_sequence_jump_block(
             blocks,
             label,
             linear,
-            fragment_label,
+            fragment_entry,
             targets.active_exc.as_ref(),
         );
     }

@@ -20,13 +20,13 @@ class C:
 #     block bb1:
 #         if_term eq(_dp_format, 4):
 #             then:
-#                 block bb5:
+#                 block bb7:
 #                     return dict(tuple_values(tuple_values("x", "int")))
 #             else:
 #                 block bb2:
 #                     if_term gt(_dp_format, 2):
 #                         then:
-#                             block bb4:
+#                             block bb5:
 #                                 raise GetAttr(builtins, "NotImplementedError")
 #                         else:
 #                             block bb3:

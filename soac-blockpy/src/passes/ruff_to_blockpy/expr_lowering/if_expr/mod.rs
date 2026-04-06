@@ -1,7 +1,6 @@
 use super::{BlockPySetupExprLowerer, RuffToBlockPyExpr};
 use crate::block_py::{
-    Block, BlockPyStmtBuilder, BlockTerm, Meta, Store, StructuredIf, StructuredInstr, TermIf,
-    WithMeta,
+    BlockPyStmtBuilder, BlockTerm, Meta, Store, StructuredIf, StructuredInstr, TermIf, WithMeta,
 };
 use crate::passes::ruff_to_blockpy::expr_lowering::fresh_setup_name;
 use crate::passes::ruff_to_blockpy::{InlineFragment, LoweredExpr, LoopContext};
@@ -97,7 +96,7 @@ pub(crate) fn try_lower_if_expr_direct<L, E>(
             crate::block_py::BlockLabel::fallthrough(),
         )));
     }
-    let body_fragment = InlineFragment::new(body_entry, Vec::new());
+    let body_fragment = InlineFragment::from_builder(name_gen.next_block_name(), body_entry, Vec::new());
  
      let Some(orelse_setup) =
          crate::passes::ruff_to_blockpy::stmt_lowering::try_lower_inline_value_from_structured::<
@@ -128,7 +127,8 @@ pub(crate) fn try_lower_if_expr_direct<L, E>(
             crate::block_py::BlockLabel::fallthrough(),
         )));
     }
-    let orelse_fragment = InlineFragment::new(orelse_entry, Vec::new());
+    let orelse_fragment =
+        InlineFragment::from_builder(name_gen.next_block_name(), orelse_entry, Vec::new());
  
      let then_label = name_gen.next_block_name();
      let else_label = name_gen.next_block_name();
@@ -139,25 +139,17 @@ pub(crate) fn try_lower_if_expr_direct<L, E>(
      }));
  
      let mut deps = Vec::new();
-     deps.push(Block::from_builder(
-         then_label,
-         body_fragment.entry,
-         Vec::new(),
-         None,
-         None,
-     ));
+     let mut body_entry_block = body_fragment.entry;
+     body_entry_block.label = then_label;
+     deps.push(body_entry_block);
      deps.extend(body_fragment.deps);
-     deps.push(Block::from_builder(
-         else_label,
-         orelse_fragment.entry,
-         Vec::new(),
-         None,
-         None,
-     ));
+     let mut orelse_entry_block = orelse_fragment.entry;
+     orelse_entry_block.label = else_label;
+     deps.push(orelse_entry_block);
      deps.extend(orelse_fragment.deps);
  
      Some(Ok(LoweredExpr {
-         setup: InlineFragment::new(entry, deps),
+         setup: InlineFragment::from_builder(name_gen.next_block_name(), entry, deps),
          value: E::from_lowered_expr(load_name(&target)),
      }))
 }

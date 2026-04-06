@@ -109,9 +109,16 @@ where
         return Err("if-test setup still requires structured lowering".to_string());
     };
     let (mut entry, test) = test_setup?;
+    let entry_label = name_gen.next_block_name();
 
     let Some(body_setup) =
-        lower_nested_body_to_inline_fragment(context, body, loop_ctx, &mut legacy_next_label_id)
+        lower_nested_body_to_inline_fragment(
+            context,
+            name_gen,
+            body,
+            loop_ctx,
+            &mut legacy_next_label_id,
+        )
     else {
         return Err("if-body still requires structured lowering".to_string());
     };
@@ -119,6 +126,7 @@ where
 
     let Some(orelse_setup) = lower_orelse_to_inline_fragment(
         context,
+        name_gen,
         elif_else_clauses,
         &Stmt::If(if_stmt.clone()),
         loop_ctx,
@@ -137,24 +145,16 @@ where
     }));
 
     let mut deps = Vec::new();
-    deps.push(Block::from_builder(
-        then_label,
-        body_setup.entry,
-        Vec::new(),
-        None,
-        None,
-    ));
+    let mut body_entry = body_setup.entry;
+    body_entry.label = then_label;
+    deps.push(body_entry);
     deps.extend(body_setup.deps);
-    deps.push(Block::from_builder(
-        else_label,
-        orelse_setup.entry,
-        Vec::new(),
-        None,
-        None,
-    ));
+    let mut orelse_entry = orelse_setup.entry;
+    orelse_entry.label = else_label;
+    deps.push(orelse_entry);
     deps.extend(orelse_setup.deps);
 
-    Ok(InlineFragment::new(entry, deps))
+    Ok(InlineFragment::from_builder(entry_label, entry, deps))
 }
 
 impl StmtLowerer for ast::StmtIf {
@@ -226,6 +226,7 @@ where
 #[allow(dead_code)]
 fn lower_nested_body_to_inline_fragment<E>(
     context: &Context,
+    name_gen: &FunctionNameGen,
     body: &Suite,
     loop_ctx: Option<&LoopContext>,
     next_label_id: &mut usize,
@@ -237,22 +238,13 @@ where
         return None;
     }
 
-    try_lower_inline_from_structured(next_label_id, |out, scratch_next_label_id| {
+    try_lower_inline_from_structured(name_gen, next_label_id, |out, scratch_next_label_id| {
         for stmt in body {
             lower_nested_stmt_into_with_expr(context, stmt, out, loop_ctx, scratch_next_label_id)?;
         }
         Ok(())
     })
-    .map(|result| {
-        result.map(|mut fragment| {
-            if fragment.entry.term.is_none() {
-                fragment
-                    .entry
-                    .set_term(BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())));
-            }
-            fragment
-        })
-    })
+    .map(|result| result)
 }
 
 fn lower_orelse_to_stmts_with_expr<E>(
@@ -283,6 +275,7 @@ where
 #[allow(dead_code)]
 fn lower_orelse_to_inline_fragment<E>(
     context: &Context,
+    name_gen: &FunctionNameGen,
     clauses: &[ast::ElifElseClause],
     stmt: &Stmt,
     loop_ctx: Option<&LoopContext>,
@@ -293,14 +286,23 @@ where
 {
     match clauses {
         [] => Some(Ok(InlineFragment::new(
-            crate::block_py::BlockBuilder::with_term(
+            Block::new(
+                name_gen.next_block_name(),
                 Vec::new(),
-                Some(BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough()))),
+                BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())),
+                Vec::new(),
+                None,
             ),
             Vec::new(),
         ))),
         [clause] if clause.test.is_none() && suite_is_plain_linear(context, &clause.body) => {
-            lower_nested_body_to_inline_fragment(context, &clause.body, loop_ctx, next_label_id)
+            lower_nested_body_to_inline_fragment(
+                context,
+                name_gen,
+                &clause.body,
+                loop_ctx,
+                next_label_id,
+            )
         }
         _ => Some(Err(format!(
             "`elif` chain reached inline Ruff fragment lowering\nstmt:\n{}",

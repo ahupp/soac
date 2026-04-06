@@ -210,10 +210,10 @@ x = (i for i in it)
 #                         StoreName("_dp_tmp_4", next_or_sentinel(_dp_iter_3))
 #                         if_term BinOp(Is, _dp_tmp_4, ITER_COMPLETE):
 #                             then:
-#                                 block bb4:
+#                                 block bb5:
 #                                     return NONE
 #                             else:
-#                                 block bb5:
+#                                 block bb6:
 #                                     StoreName("i", _dp_tmp_4)
 #                                     yield i
 #                                     jump bb1

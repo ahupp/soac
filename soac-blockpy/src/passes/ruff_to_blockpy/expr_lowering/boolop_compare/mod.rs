@@ -41,6 +41,24 @@ where
     BlockBuilder::from_stmts(Vec::new())
 }
 
+fn close_inline_block<E>(label: BlockLabel, builder: BlockBuilder<E, BlockTerm<E>>) -> Block<E, E>
+where
+    E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
+{
+    let block = builder.finish();
+    assert!(
+        block.term.is_some(),
+        "inline boolop/compare fragment block must have an explicit terminator"
+    );
+    Block::new(
+        label,
+        block.body,
+        block.term.expect("checked explicit terminator"),
+        Vec::new(),
+        None,
+    )
+}
+
 #[allow(dead_code)]
 pub(crate) fn try_lower_branching_expr_direct<L, E>(
     lowerer: &L,
@@ -155,11 +173,11 @@ where
 
     let deps = dep_builders
         .into_iter()
-        .map(|(label, builder)| Block::from_builder(label, builder, Vec::new(), None, None))
+        .map(|(label, builder)| close_inline_block(label, builder))
         .collect();
 
     Ok(LoweredExpr {
-        setup: InlineFragment::new(entry, deps),
+        setup: InlineFragment::from_builder(name_gen.next_block_name(), entry, deps),
         value: E::from_lowered_expr(load_name(&target)),
     })
 }
@@ -297,11 +315,11 @@ where
 
     let deps = dep_builders
         .into_iter()
-        .map(|(label, builder)| Block::from_builder(label, builder, Vec::new(), None, None))
+        .map(|(label, builder)| close_inline_block(label, builder))
         .collect();
 
     Ok(LoweredExpr {
-        setup: InlineFragment::new(entry, deps),
+        setup: InlineFragment::from_builder(name_gen.next_block_name(), entry, deps),
         value: E::from_lowered_expr(load_name(&target_name)),
     })
 }

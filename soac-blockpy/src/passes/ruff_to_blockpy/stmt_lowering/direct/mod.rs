@@ -24,27 +24,26 @@ pub(crate) fn rewrite_raise_stmt(mut raise: ast::StmtRaise) -> Rewrite {
 
 pub(super) fn try_lower_direct_stmt_fragment<E>(
     context: &Context,
+    name_gen: &FunctionNameGen,
     stmt: &Stmt,
     loop_ctx: Option<&LoopContext>,
 ) -> Option<Result<InlineFragment<E>, String>>
 where
     E: RuffToBlockPyExpr,
 {
-    fn fallthrough_fragment<E>(entry: crate::block_py::BlockBuilder<E, BlockTerm<E>>) -> InlineFragment<E>
-    where
-        E: RuffToBlockPyExpr,
-    {
-        let mut entry = entry;
-        entry.set_term(BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())));
-        InlineFragment::new(entry, Vec::new())
-    }
-
     match stmt {
         Stmt::Global(_) | Stmt::Nonlocal(_) | Stmt::Pass(_) => {
-            Some(Ok(fallthrough_fragment(crate::block_py::BlockBuilder::new())))
+            let mut entry = crate::block_py::BlockBuilder::new();
+            entry.set_term(BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())));
+            Some(Ok(InlineFragment::from_builder(
+                name_gen.next_block_name(),
+                entry,
+                Vec::new(),
+            )))
         }
         Stmt::Break(_) => match loop_ctx {
-            Some(loop_ctx) => Some(Ok(InlineFragment::new(
+            Some(loop_ctx) => Some(Ok(InlineFragment::from_builder(
+                name_gen.next_block_name(),
                 crate::block_py::BlockBuilder::with_term(
                     Vec::new(),
                     Some(BlockTerm::Jump(BlockEdge::new(loop_ctx.break_label.clone()))),
@@ -54,7 +53,8 @@ where
             None => None,
         },
         Stmt::Continue(_) => match loop_ctx {
-            Some(loop_ctx) => Some(Ok(InlineFragment::new(
+            Some(loop_ctx) => Some(Ok(InlineFragment::from_builder(
+                name_gen.next_block_name(),
                 crate::block_py::BlockBuilder::with_term(
                     Vec::new(),
                     Some(BlockTerm::Jump(BlockEdge::new(loop_ctx.continue_label.clone()))),
@@ -65,7 +65,10 @@ where
         },
         Stmt::Expr(stmt) => {
             let mut legacy_next_label_id = 0usize;
-            try_lower_inline_from_structured(&mut legacy_next_label_id, |structured, scratch_next_label_id| {
+            try_lower_inline_from_structured(
+                name_gen,
+                &mut legacy_next_label_id,
+                |structured, scratch_next_label_id| {
                 let value = crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
                     (*stmt.value).clone(),
                     structured,
@@ -74,16 +77,10 @@ where
                 )?;
                 structured.push_stmt(StructuredInstr::Expr(value));
                 Ok(())
-            })
+            },
+            )
             .map(|fragment| {
-                fragment.map(|mut fragment| {
-                    if fragment.entry.term.is_none() {
-                        fragment
-                            .entry
-                            .set_term(BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())));
-                    }
-                    fragment
-                })
+                fragment.map(|fragment| fragment)
             })
         }
         Stmt::Return(stmt) => {
@@ -105,7 +102,7 @@ where
             value.map(|result| {
                 result.map(|(mut entry, value)| {
                     entry.set_term(BlockTerm::Return(value));
-                    InlineFragment::new(entry, Vec::new())
+                    InlineFragment::from_builder(name_gen.next_block_name(), entry, Vec::new())
                 })
             })
         }
@@ -128,7 +125,7 @@ where
             exc.map(|result| {
                 result.map(|(mut entry, exc)| {
                     entry.set_term(BlockTerm::Raise(TermRaise { exc }));
-                    InlineFragment::new(entry, Vec::new())
+                    InlineFragment::from_builder(name_gen.next_block_name(), entry, Vec::new())
                 })
             })
         }

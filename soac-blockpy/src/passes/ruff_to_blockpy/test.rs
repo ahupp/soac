@@ -851,32 +851,32 @@ fn sequence_raise_helper_lowers_compare_chain_via_inline_fragment() {
 #[test]
 fn inline_fragment_helper_splices_fallthrough_into_entry_and_deps() {
     let mut blocks = Vec::new();
+    let name_gen = test_name_gen();
     let fragment = InlineFragment::new(
-        crate::block_py::BlockBuilder::with_term(
+        Block::new(
+            name_gen.next_block_name(),
             vec![py_expr!("head()").into()],
-            Some(BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough()))),
-        ),
-        vec![Block::from_builder(
-            label(11),
-            crate::block_py::BlockBuilder::with_term(
-                vec![py_expr!("tail()").into()],
-                Some(BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough()))),
-            ),
+            BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())),
             Vec::new(),
             None,
+        ),
+        vec![Block::new(
+            name_gen.next_block_name(),
+                vec![py_expr!("tail()").into()],
+                BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())),
+            Vec::new(),
             None,
         )],
     );
 
     let entry = emit_inline_fragment_with_exc_target_and_expr::<InstrWithAwaitAndYield>(
         &mut blocks,
-        label(10),
         fragment,
         label(99),
         None,
     );
 
-    assert_eq!(entry, label(10));
+    assert_eq!(entry, blocks[0].label);
     assert_eq!(blocks.len(), 2);
     assert!(matches!(
         blocks[0].term,

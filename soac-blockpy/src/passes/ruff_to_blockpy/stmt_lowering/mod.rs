@@ -6,28 +6,6 @@ use crate::passes::ast_to_ast::context::Context;
 pub(super) type BlockPyStmtBuilder<E> =
     crate::block_py::BlockBuilder<StructuredInstr<E>, BlockTerm<E>>;
 
-fn append_trivial_inline_fragment<E>(
-    fragment: InlineFragment<E>,
-    out: &mut BlockPyStmtBuilder<E>,
-) -> Result<(), String>
-where
-    E: RuffToBlockPyExpr,
-{
-    if !fragment.deps.is_empty() {
-        return Err("inline fragment adapter does not support dependency blocks yet".to_string());
-    }
-
-    let entry = fragment.entry.finish();
-    out.extend(entry.body.into_iter().map(StructuredInstr::Expr));
-    match entry.term {
-        Some(BlockTerm::Jump(edge)) if edge.target.is_fallthrough() && edge.args.is_empty() => {}
-        None => unreachable!("inline fragment should always carry an explicit terminator"),
-        Some(term) => out.set_term(term),
-    }
-
-    Ok(())
-}
-
 pub(crate) fn try_lower_inline_value_from_structured<E, T>(
     next_label_id: &mut usize,
     lower: impl FnOnce(&mut BlockPyStmtBuilder<E>, &mut usize) -> Result<T, String>,
@@ -61,6 +39,7 @@ where
 }
 
 pub(super) fn try_lower_inline_from_structured<E>(
+    name_gen: &FunctionNameGen,
     next_label_id: &mut usize,
     lower: impl FnOnce(&mut BlockPyStmtBuilder<E>, &mut usize) -> Result<(), String>,
 ) -> Option<Result<InlineFragment<E>, String>>
@@ -68,18 +47,28 @@ where
     E: RuffToBlockPyExpr,
 {
     try_lower_inline_value_from_structured(next_label_id, lower)
-        .map(|result| result.map(|(entry, ())| InlineFragment::new(entry, Vec::new())))
+        .map(|result| {
+            result.map(|(mut entry, ())| {
+                if entry.term.is_none() {
+                    entry.set_term(BlockTerm::Jump(crate::block_py::BlockEdge::new(
+                        BlockLabel::fallthrough(),
+                    )));
+                }
+                InlineFragment::from_builder(name_gen.next_block_name(), entry, Vec::new())
+            })
+        })
 }
 
 pub(crate) fn lower_stmt_fragment<E>(
     context: &Context,
+    name_gen: &FunctionNameGen,
     stmt: &Stmt,
     loop_ctx: Option<&LoopContext>,
 ) -> Option<Result<InlineFragment<E>, String>>
 where
     E: RuffToBlockPyExpr,
 {
-    direct::try_lower_direct_stmt_fragment(context, stmt, loop_ctx)
+    direct::try_lower_direct_stmt_fragment(context, name_gen, stmt, loop_ctx)
 }
 
 pub(super) fn stmts_from_rewrite(rewrite: Rewrite) -> Vec<Stmt> {
@@ -363,11 +352,6 @@ pub(crate) fn lower_stmt_into_with_expr<E>(
 where
     E: RuffToBlockPyExpr,
 {
-    if let Some(fragment) = lower_stmt_fragment(context, stmt, loop_ctx) {
-        append_trivial_inline_fragment(fragment?, out)?;
-        return Ok(());
-    }
-
     match stmt {
         Stmt::Global(stmt) => stmt.to_blockpy(context, out, loop_ctx, next_label_id),
         Stmt::Nonlocal(stmt) => stmt.to_blockpy(context, out, loop_ctx, next_label_id),

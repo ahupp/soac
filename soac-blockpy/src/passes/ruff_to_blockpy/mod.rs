@@ -58,13 +58,58 @@ pub(crate) type InlineBlockBuilder<I> = BlockBuilder<I, BlockTerm<I>>;
 
 #[derive(Debug, Clone)]
 pub(crate) struct InlineFragment<I: Instr> {
-    pub entry: InlineBlockBuilder<I>,
+    pub entry: Block<I, I>,
     pub deps: Vec<Block<I, I>>,
 }
 
 impl<I: Instr> InlineFragment<I> {
-    pub(crate) fn new(entry: InlineBlockBuilder<I>, deps: Vec<Block<I, I>>) -> Self {
-        Self { entry, deps }
+    pub(crate) fn new(entry: Block<I, I>, deps: Vec<Block<I, I>>) -> Self {
+        let fragment = Self { entry, deps };
+        fragment.assert_well_formed();
+        fragment
+    }
+
+    pub(crate) fn from_builder(label: BlockLabel, entry: InlineBlockBuilder<I>, deps: Vec<Block<I, I>>) -> Self
+    where
+        I: crate::block_py::NormalizedInstr,
+    {
+        let entry = entry.finish();
+        assert!(
+            entry.term.is_some(),
+            "inline fragment entry must have an explicit terminator"
+        );
+        Self::new(
+            Block::new(
+                label,
+                entry.body,
+                entry.term.expect("checked explicit terminator"),
+                Vec::new(),
+                None,
+            ),
+            deps,
+        )
+    }
+
+    fn assert_well_formed(&self) {
+        use std::collections::HashSet;
+
+        assert!(
+            !self.entry.label.is_fallthrough(),
+            "inline fragment entry must have a real label"
+        );
+
+        let mut labels = HashSet::from([self.entry.label]);
+        for block in &self.deps {
+            assert!(
+                !block.label.is_fallthrough(),
+                "inline fragment dependency block must have a real label"
+            );
+            assert!(
+                labels.insert(block.label),
+                "duplicate block label in inline fragment: {}",
+                block.label
+            );
+        }
     }
 }
 
