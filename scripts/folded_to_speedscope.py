@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import sys
 
+TARGET_TOTAL_WEIGHT = 100_000
+
 
 def parse_folded_stacks(lines: list[str]) -> tuple[list[dict[str, str]], list[list[int]], list[int]]:
     frames: list[dict[str, str]] = []
@@ -37,9 +39,25 @@ def parse_folded_stacks(lines: list[str]) -> tuple[list[dict[str, str]], list[li
     return frames, samples, weights
 
 
+def normalize_weights(weights: list[int], *, target_total_weight: int = TARGET_TOTAL_WEIGHT) -> list[int]:
+    positive_total = sum(weight for weight in weights if weight > 0)
+    if positive_total <= target_total_weight:
+        return weights
+
+    scale = positive_total / target_total_weight
+    normalized: list[int] = []
+    for weight in weights:
+        if weight <= 0:
+            normalized.append(0)
+            continue
+        normalized.append(max(1, round(weight / scale)))
+    return normalized
+
+
 def main() -> int:
     profile_name = sys.argv[1] if len(sys.argv) > 1 else "perf"
     frames, samples, weights = parse_folded_stacks(sys.stdin.readlines())
+    weights = normalize_weights(weights)
     output = {
         "$schema": "https://www.speedscope.app/file-format-schema.json",
         "shared": {"frames": frames},

@@ -41,3 +41,21 @@ def test_folded_parser_preserves_jit_and_c_api_context():
     )
     assert "py:d:Proc0" in serialized
     assert "PyObject_SetAttr" in serialized
+
+
+def test_normalize_weights_bounds_total_weight_and_preserves_order():
+    module = load_module()
+
+    normalized = module.normalize_weights([4_800_000, 2_400_000, 1_200_000], target_total_weight=100)
+
+    assert sum(normalized) <= 100
+    assert normalized[0] > normalized[1] > normalized[2] > 0
+    assert normalized == [57, 29, 14]
+
+
+def test_normalize_weights_keeps_small_profiles_unchanged():
+    module = load_module()
+
+    weights = [17, 5, 9]
+
+    assert module.normalize_weights(weights, target_total_weight=100) == weights
