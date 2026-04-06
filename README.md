@@ -267,3 +267,211 @@ Dropping to basic block format:
  * Constant
  * ReadOnly
  * ExactTypes(...)
+
+# Environment Variables
+
+This repo consults a number of environment variables directly. The list
+below is the user-facing set that changes runtime behavior, profiling,
+benchmarking, test wrappers, or the local web UI. Pure `Justfile`
+plumbing such as `REPO_ROOT`, `VENV_DIR`, `WEB_DIR`, and similar helper
+exports are intentionally omitted here.
+
+## Import Hook And Runtime Behavior
+
+- `DIET_PYTHON_INSTALL_HOOK=1`
+  Have the repo-root [`sitecustomize.py`](/home/adam/project/soac-profile/sitecustomize.py)
+  install the transformed import hook automatically at interpreter
+  startup.
+
+- `DIET_PYTHON_INTEGRATION_ONLY=1`
+  In `def _integration_only_enabled`, at
+  [soac_py/src/soac/import_hook.py:18](/home/adam/project/soac-profile/soac_py/src/soac/import_hook.py#L18),
+  restrict transformed imports to integration-test modules instead of
+  transforming arbitrary imports.
+
+- `DIET_PYTHON_ALLOW_TEMP=1`
+  In `def _should_transform`, at
+  [soac_py/src/soac/import_hook.py:57](/home/adam/project/soac-profile/soac_py/src/soac/import_hook.py#L57),
+  allow the import hook to transform modules loaded from the system temp
+  directory. By default temp files are skipped.
+
+- `DIET_PYTHON_JIT_COMPILE_MODE=eager`
+  In `fn eager_clif_compile_requested`, at
+  [soac-pyo3/src/jit_runtime.rs:96](/home/adam/project/soac-profile/soac-pyo3/src/jit_runtime.rs#L96),
+  eagerly compile lazy CLIF/JIT entries as they are registered instead
+  of waiting for first execution.
+
+- `DIET_PYTHON_BB_TRACE=<selector>`
+  In `fn parse_trace_env`, at
+  [soac-blockpy/src/passes/trace/mod.rs:15](/home/adam/project/soac-profile/soac-blockpy/src/passes/trace/mod.rs#L15),
+  enable basic-block tracing. Accepted forms are:
+  - `all`, `1`, `*`, or empty selector: trace all functions
+  - `<exact-qualname>`: trace one function
+  - append `:params` to include block parameters
+
+- `DIET_PYTHON_DEBUG_DIRECT_METHOD_SPECIALIZATIONS=1`
+  In `unsafe fn register_owner_types_from_type`, at
+  [soac-jit/src/lib.rs:912](/home/adam/project/soac-profile/soac-jit/src/lib.rs#L912),
+  print debug logging for direct-method and owner-type specialization
+  registration.
+
+## Counters And Specialization
+
+- `DIET_PYTHON_CALL_TARGET_COUNTERS=1`
+  In `fn call_target_counter_instrumentation_enabled`, at
+  [soac-blockpy/src/passes/trace/mod.rs:27](/home/adam/project/soac-profile/soac-blockpy/src/passes/trace/mod.rs#L27),
+  enable runtime call-target profiling. This is the first-pass input for
+  call-target and operator specialization.
+
+- `DIET_PYTHON_GLOBAL_LOAD_COUNTERS=1`
+  In `fn global_load_counter_instrumentation_enabled`, at
+  [soac-blockpy/src/passes/trace/mod.rs:19](/home/adam/project/soac-profile/soac-blockpy/src/passes/trace/mod.rs#L19),
+  enable global-load profiling counters.
+
+- `DIET_PYTHON_COUNTERS_OUTPUT_FILE=/path/to/dump.bin`
+  In `fn counter_dump_file_from_env`, at
+  [soac-jit/src/module_type.rs:570](/home/adam/project/soac-profile/soac-jit/src/module_type.rs#L570),
+  write a counter dump on process exit.
+
+- `DIET_PYTHON_COUNTERS_FILE=/path/to/dump.bin`
+  In `fn load_call_target_specializations`, at
+  [soac-jit/src/jit/mod.rs:1968](/home/adam/project/soac-profile/soac-jit/src/jit/mod.rs#L1968),
+  read an existing counter dump and derive specializations in-process.
+  This is input-only; it is not rewritten on exit.
+
+- `DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS=...`
+  In `fn parse_call_target_specializations_env`, at
+  [soac-jit/src/jit/mod.rs:1888](/home/adam/project/soac-profile/soac-jit/src/jit/mod.rs#L1888),
+  provide an explicit advanced override for call-target
+  specializations. If this is set, it wins over
+  `DIET_PYTHON_COUNTERS_FILE`.
+
+- `DIET_PYTHON_OPERATOR_SPECIALIZATIONS=...`
+  In `fn parse_operator_specializations_env`, at
+  [soac-jit/src/jit/mod.rs:1989](/home/adam/project/soac-profile/soac-jit/src/jit/mod.rs#L1989),
+  provide an explicit advanced override for operator specializations. If
+  this is set, it wins over `DIET_PYTHON_COUNTERS_FILE`.
+
+Notes:
+- If `DIET_PYTHON_CALL_TARGET_COUNTERS` is enabled for the current run,
+  specialization loading is disabled for that run and the process stays
+  in profiling mode.
+- In normal workflows you should prefer `DIET_PYTHON_COUNTERS_OUTPUT_FILE`
+  for the profiling pass and `DIET_PYTHON_COUNTERS_FILE` for the
+  specialized pass rather than manually building specialization strings.
+
+## Perf And Benchmarking
+
+- `SOAC_JIT_PERF_HELPER_FRAMES=1`
+  In `fn should_preserve_perf_helper_frames`, at
+  [soac-jit/src/jit/specialized_helpers.rs:1700](/home/adam/project/soac-profile/soac-jit/src/jit/specialized_helpers.rs#L1700),
+  select profiling-oriented helper wrappers that preserve explicit stack
+  frames. This improves perf call stacks but is slower than the default
+  fast helper path. The perf recipes default it on.
+
+- `SOAC_JIT_JITDUMP_DIR=/path/to/dir`
+  In `fn new`, at
+  [soac-jit/src/jit/jitdump.rs:98](/home/adam/project/soac-profile/soac-jit/src/jit/jitdump.rs#L98),
+  choose where `soac-jit` writes `jit-$PID.dump`.
+
+- `PERF_BUILDID_DIR=/path/to/dir`
+  Used by the perf recipes in [Justfile](/home/adam/project/soac-profile/Justfile)
+  and checked in `fn serialize_unwind_info`, at
+  [soac-jit/src/jit/jitdump.rs:262](/home/adam/project/soac-profile/soac-jit/src/jit/jitdump.rs#L262),
+  to control where perf build-id artifacts are written.
+
+- `WARMUP_LOOPS=<int>`
+  In recipe `perf-pystone-jit-warm`, at
+  [Justfile:271](/home/adam/project/soac-profile/Justfile#L271), and the
+  benchmark recipes near [Justfile:711](/home/adam/project/soac-profile/Justfile#L711),
+  control the pre-measurement pystone warmup count.
+
+- `SPECIALIZATION_PROFILE_LOOPS=<int>`
+  In recipe `perf-pystone-jit-specialized`, at
+  [Justfile:480](/home/adam/project/soac-profile/Justfile#L480), control
+  the first-pass profiling loop count used to derive specializations.
+
+- `PERF_FREQUENCY=<int>`
+  In recipe `perf-pystone-jit-warm`, at
+  [Justfile:272](/home/adam/project/soac-profile/Justfile#L272), set the
+  `perf record -F` sample frequency.
+
+- `PERF_CALL_GRAPH=<mode>`
+  In recipe `perf-pystone-jit-warm`, at
+  [Justfile:273](/home/adam/project/soac-profile/Justfile#L273), set the
+  `perf record --call-graph` mode. The default is `dwarf,16384`.
+
+- `PERF_PERCENT_LIMIT=<float>`
+  In recipe `perf-pystone-jit-warm`, at
+  [Justfile:274](/home/adam/project/soac-profile/Justfile#L274), control
+  the threshold used when rendering perf text reports.
+
+## Resource Limits And Test Wrappers
+
+- `DIET_PYTHON_MEMORY_LIMIT_MB=<int>`
+  In [scripts/run_with_limits.sh](/home/adam/project/soac-profile/scripts/run_with_limits.sh),
+  set the cgroup memory cap in MiB. `0` disables the memory cap.
+
+- `DIET_PYTHON_TIMEOUT_SECS=<int>`
+  In [scripts/run_with_limits.sh](/home/adam/project/soac-profile/scripts/run_with_limits.sh),
+  set the cgroup wall-clock timeout in seconds. `0` disables the timeout.
+
+- `DIET_PYTHON_CPUSET=<cpuset>`
+  In [scripts/run_with_limits.sh](/home/adam/project/soac-profile/scripts/run_with_limits.sh),
+  restrict build/test execution to a Linux cpuset such as `0-7`. An
+  empty value disables CPU pinning.
+
+- `DIET_PYTHON_SYSTEMD_RUNTIME_DIR=/run/user/<uid>`
+  In [scripts/run_with_limits.sh](/home/adam/project/soac-profile/scripts/run_with_limits.sh),
+  override the runtime dir used to reach the user systemd bus.
+
+- `DIET_PYTHON_LIMITS_ALREADY_APPLIED=1`
+  In [scripts/run_pytest_parallel.py](/home/adam/project/soac-profile/scripts/run_pytest_parallel.py),
+  mark that the process is already running under the limit wrapper so it
+  does not re-wrap itself.
+
+- `DIET_PYTHON_TEST_ALL_TIMEOUT_SECS=<int>`
+  In recipe `test-all`, at
+  [Justfile:687](/home/adam/project/soac-profile/Justfile#L687), override
+  the wall-clock timeout used by the full test gate. `0` disables it.
+
+- `SKIP_EXPECTED_FAILURES=1`
+  In [scripts/collect_cpython_skip_ids.sh](/home/adam/project/soac-profile/scripts/collect_cpython_skip_ids.sh),
+  include expected-failure IDs when building the CPython skip list. Set
+  it to `0` to stop filtering on `EXPECTED_FAILURE.md`.
+
+- `CPYTHON_TEST_SETS_GLOB=<glob>`
+  In [scripts/run_cpython_test_sets.sh](/home/adam/project/soac-profile/scripts/run_cpython_test_sets.sh),
+  choose which test-set files to run.
+
+- `CPYTHON_TEST_TEMPDIR=/tmp/...`
+  In [scripts/run_cpython_test_sets.sh](/home/adam/project/soac-profile/scripts/run_cpython_test_sets.sh),
+  choose the tempdir used for CPython regrtest set runs.
+
+- `CPYTHON_TEST_LOG_DIR=/path/to/logs`
+  In [scripts/run_cpython_test_sets.sh](/home/adam/project/soac-profile/scripts/run_cpython_test_sets.sh),
+  choose where per-set CPython logs are written.
+
+- `SKIP_FILE=/path/to/cpython_skipped_tests.txt`
+  In [scripts/collect_cpython_skip_ids.sh](/home/adam/project/soac-profile/scripts/collect_cpython_skip_ids.sh),
+  choose the base skipped-test list file.
+
+- `EXPECTED_FAILURES_FILE=/path/to/EXPECTED_FAILURE.md`
+  In [scripts/collect_cpython_skip_ids.sh](/home/adam/project/soac-profile/scripts/collect_cpython_skip_ids.sh),
+  choose the markdown file that contributes expected-failure test IDs.
+
+- `PYTHON_BIN=/path/to/python`
+  In [scripts/collect_cpython_skip_ids.sh](/home/adam/project/soac-profile/scripts/collect_cpython_skip_ids.sh),
+  choose which Python binary is used when collecting skip IDs.
+
+## Local Web Inspector
+
+- `HOST=<bind-address>`
+  In [`fn main`, at [soac-inspector/src/main.rs:8](/home/adam/project/soac-profile/soac-inspector/src/main.rs#L8)],
+  control the bind address for the local inspector server. The `Justfile`
+  default is `127.0.0.1`.
+
+- `PORT=<port>`
+  In [`fn main`, at [soac-inspector/src/main.rs:9](/home/adam/project/soac-profile/soac-inspector/src/main.rs#L9)],
+  control the bind port for the local inspector server. The `Justfile`
+  default is `8000`.
