@@ -230,6 +230,7 @@ impl StmtLowerer for ast::StmtTry {
 }
 
 pub(crate) fn lower_star_try_stmt_sequence<F, E>(
+    context: &Context,
     try_stmt: ast::StmtTry,
     remaining_stmts: &[Stmt],
     targets: RegionTargets,
@@ -247,6 +248,7 @@ where
         Rewrite::Walk(stmts) => stmts,
     };
     lower_expanded_stmt_sequence(
+        context,
         rewritten_try,
         remaining_stmts,
         targets,

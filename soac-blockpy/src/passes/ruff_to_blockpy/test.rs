@@ -413,9 +413,11 @@ def f(ctx, value):
 
     let mut blocks = Vec::new();
     let name_gen = test_name_gen();
+    let context = Context::new("");
     let mut saw_try_stmt = false;
     let mut saw_with_ok_assign = false;
     let entry = lower_with_stmt_sequence(
+        &context,
         with_stmt.clone(),
         &[],
         RegionTargets::new(label(99), None),
@@ -522,7 +524,9 @@ def f():
 fn expanded_stmt_helper_returns_expanded_entry_without_linear_prefix() {
     let mut blocks = Vec::new();
     let mut saw_expanded = false;
+    let context = Context::new("");
     let entry = lower_expanded_stmt_sequence(
+        &context,
         vec![py_stmt!("pass")],
         &[],
         RegionTargets::new(label(99), None),
@@ -545,7 +549,9 @@ fn expanded_stmt_helper_returns_expanded_entry_without_linear_prefix() {
 #[test]
 fn expanded_stmt_helper_emits_linear_jump_prefix() {
     let mut blocks = Vec::new();
+    let context = Context::new("");
     let entry = lower_expanded_stmt_sequence(
+        &context,
         vec![py_stmt!("pass")],
         &[],
         RegionTargets::new(label(99), None),
@@ -734,11 +740,13 @@ fn if_stmt_helper_lowers_compare_chain_test_via_inline_fragment() {
 #[test]
 fn sequence_jump_helper_emits_jump_block() {
     let mut blocks = Vec::new();
+    let context = Context::new("");
     let entry = emit_sequence_jump_block::<InstrWithAwaitAndYield>(
+        &context,
         &mut blocks,
         label(10),
         vec![py_stmt!("prefix = 0")],
-        label(11).into(),
+        label(11),
         None,
     );
 

@@ -96,7 +96,7 @@ where
     )
 }
 
-fn compat_block_from_lowered_builder_with_exc_target_and_expr<E>(
+pub(crate) fn compat_block_from_lowered_builder_with_exc_target_and_expr<E>(
     label: BlockLabel,
     structured: crate::block_py::BlockBuilder<StructuredInstr<E>, BlockTerm<E>>,
     term: BlockTerm<E>,
@@ -197,6 +197,7 @@ fn rename_exception_edge_args<E: Instr>(
 }
 
 pub(crate) fn emit_sequence_jump_block<E>(
+    context: &Context,
     blocks: &mut Vec<LoweredBlockPyBlock<E>>,
     label: BlockLabel,
     linear: Vec<Stmt>,
@@ -206,9 +207,11 @@ pub(crate) fn emit_sequence_jump_block<E>(
 where
     E: RuffToBlockPyExpr + ImplicitNoneExpr,
 {
-    blocks.push(compat_block_from_blockpy_with_exc_target_and_expr(
+    let lowered_linear = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &linear)
+        .unwrap_or_else(|err| panic!("failed to lower sequence jump prefix through production path: {err}"));
+    blocks.push(compat_block_from_lowered_builder_with_exc_target_and_expr(
         label.clone(),
-        linear,
+        lowered_linear,
         BlockTerm::Jump(BlockEdge::new(target_label)),
         exc_target,
     ));

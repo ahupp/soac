@@ -148,6 +148,7 @@ finally:
 }
 
 pub(crate) fn lower_with_stmt_sequence<F, E>(
+    context: &Context,
     with_stmt: ast::StmtWith,
     remaining_stmts: &[Stmt],
     targets: RegionTargets,
@@ -168,6 +169,7 @@ where
             Some(name_gen.next_block_name())
         };
         return lower_expanded_stmt_sequence(
+            context,
             {
                 let mut body = with_stmt.body;
                 std::mem::take(&mut body)
@@ -187,6 +189,7 @@ where
         Some(name_gen.next_block_name())
     };
     lower_expanded_stmt_sequence(
+        context,
         desugar_structured_with_stmt_for_blockpy(with_stmt),
         remaining_stmts,
         targets,

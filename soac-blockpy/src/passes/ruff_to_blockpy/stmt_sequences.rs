@@ -195,6 +195,7 @@ where
         }
         StmtSequenceHeadPlan::Break => match targets.loop_labels {
             Some(loop_labels) => Some(emit_sequence_jump_block(
+                context,
                 blocks,
                 next_label(),
                 linear,
@@ -205,6 +206,7 @@ where
         },
         StmtSequenceHeadPlan::Continue => match targets.loop_labels {
             Some(loop_labels) => Some(emit_sequence_jump_block(
+                context,
                 blocks,
                 next_label(),
                 linear,
@@ -278,6 +280,7 @@ where
                 StmtSequenceDriveResult::Exhausted { linear } => {
                     let label = name_gen.next_block_name();
                     return emit_sequence_jump_block(
+                        context,
                         blocks,
                         label,
                         linear,
@@ -327,6 +330,7 @@ where
             StmtSequenceHeadPlan::With(with_stmt) => {
                 let needs_finally_return_flow = contains_return_stmt_in_body(&with_stmt.body);
                 let entry = lower_with_stmt_sequence(
+                    context,
                     with_stmt,
                     &stmts[index + 1..],
                     targets.clone(),
@@ -388,6 +392,7 @@ where
                 let label = if try_stmt.is_star {
                     let jump_label = (!linear.is_empty()).then(|| name_gen.next_block_name());
                     lower_star_try_stmt_sequence(
+                        context,
                         try_stmt,
                         &stmts[index + 1..],
                         targets.clone(),
@@ -443,6 +448,7 @@ where
             StmtSequenceHeadPlan::Expanded(expanded_stmts) => {
                 let jump_label = (!linear.is_empty()).then(|| name_gen.next_block_name());
                 return lower_expanded_stmt_sequence(
+                    context,
                     expanded_stmts,
                     &stmts[index + 1..],
                     targets,
@@ -466,6 +472,7 @@ where
 
     let label = name_gen.next_block_name();
     emit_sequence_jump_block(
+        context,
         blocks,
         label,
         linear,
@@ -475,6 +482,7 @@ where
 }
 
 pub(crate) fn lower_expanded_stmt_sequence<F, E>(
+    context: &Context,
     desugared_stmts: Vec<Stmt>,
     remaining_stmts: &[Stmt],
     targets: RegionTargets,
@@ -495,9 +503,11 @@ where
         return expanded_entry;
     }
     let jump_label = jump_label.expect("linear prefix requires a jump label");
-    blocks.push(compat_block_from_blockpy_with_exc_target_and_expr(
+    let lowered_linear = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &linear)
+        .unwrap_or_else(|err| panic!("failed to lower expanded-sequence jump prefix through production path: {err}"));
+    blocks.push(crate::passes::ruff_to_blockpy::compat::compat_block_from_lowered_builder_with_exc_target_and_expr(
         jump_label.clone(),
-        linear,
+        lowered_linear,
         BlockTerm::Jump(BlockEdge::new(expanded_entry)),
         active_exc.as_ref(),
     ));
@@ -592,6 +602,7 @@ where
             return fragment_entry;
         }
         return emit_sequence_jump_block(
+            context,
             blocks,
             label,
             linear,
