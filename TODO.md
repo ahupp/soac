@@ -1436,3 +1436,82 @@ Challenging parts:
 - The replay query that maps `(method_name, FunctionId)` to current valid receiver types is the most semantically delicate part.
 - The slow path must preserve evaluation order and exception behavior exactly.
 - The multi-type guard chain should stay small; if a site accumulates too many receiver types, it should fall back instead of emitting a huge branch ladder.
+## Review tuvqlvnp fb122fc7 (direct call with version check)
+
+- review tuvqlvnp fb122fc7 (direct call with version check)
+
+## Replace StructuredInstr / StmtHeadPlan with inline Ruff fragments
+
+1. Add a local Ruff-lowering fragment type that carries one inline block plus dependency blocks.
+   - Keep this scoped to `ruff_to_blockpy` first.
+   - Use a fallthrough sentinel label for the implied successor.
+   - Sketch:
+
+   ```rust
+   struct InlineFragment<I: Instr> {
+       entry: BlockBuilder<I, BlockTerm<I>>,
+       deps: Vec<Block<I, I>>,
+   }
+   ```
+
+2. Add one splice helper that resolves `fallthrough()` to the actual remainder label.
+   - This should be the only place that knows how to patch the sentinel.
+   - Every lowering helper returns a fragment; sequence lowering just splices fragments together.
+
+3. Introduce fragment-returning lowering entrypoints before deleting the old ones.
+   - Add:
+
+   ```rust
+   fn lower_stmt_fragment<E>(...) -> Result<InlineFragment<E>, String>;
+   fn lower_expr_fragment<E>(...) -> Result<(Vec<I>, E), String>;
+   ```
+
+   - Keep the current `lower_stmt_into_with_expr` path temporarily as an adapter over fragments so the migration can happen case by case.
+
+4. Port linear statements first.
+   - `Expr`, `Assign`, `Delete`, `Pass`, imports, and other straight-line statements should return a fragment with only an inline body and an implicit fallthrough term.
+   - Once these are on fragments, stop using `StmtSequenceHeadPlan::Linear`.
+
+5. Port control-flow statements one family at a time.
+   - `Return`, `Raise`, `Break`, `Continue`
+   - `If`
+   - `While`
+   - `For`
+   - `With`
+   - `Try`
+   - Each one should return a fragment whose exits target either dependency blocks or `fallthrough()`.
+
+6. Delete `StmtSequenceHeadPlan` and the lookahead driver once all statement families lower through fragments.
+   - Remove the split between "linear prefix" and "control head".
+   - Sequence lowering should become:
+
+   ```rust
+   for stmt in stmts {
+       let fragment = lower_stmt_fragment(stmt, ...)?;
+       splice_fragment(fragment, next_label, out_blocks);
+       if !fragment_can_fallthrough {
+           return entry_label;
+       }
+   }
+   ```
+
+7. After fragment lowering is stable, change the input seam from raw Ruff AST to `InstrRuff`.
+   - First add lossless conversion helpers from `Stmt`/`Expr` to `InstrRuff`.
+   - Then change the fragment entrypoints to consume `InstrRuff`.
+   - Only after that, remove the raw `Stmt`/`Expr` dispatch in Ruff lowering.
+
+8. Remove `StructuredInstr` from the Ruff-to-BlockPy path.
+   - Replace `Block<StructuredInstr<E>, E>` in Ruff lowering with plain `Block<E, E>`.
+   - Keep `StructuredInstr` only if another pass still needs it. If not, delete it entirely.
+
+9. Add focused regressions at each stage.
+   - Linear-statement fragment splicing.
+   - Fallthrough patching.
+   - Nested `if` / `while` / `for`.
+   - `with` and `try` normal and exceptional control flow.
+   - Snapshot coverage to ensure the final core BlockPy is unchanged.
+
+Challenging parts:
+- `try` / `with` need careful fallthrough and exception-edge handling so their normal exits compose with the implicit remainder exactly once.
+- Evaluation order must stay identical when lowering expression-bearing statements into fragments.
+- The temporary adapter layer should be short-lived; otherwise the old and new lowering shapes will drift.

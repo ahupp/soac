@@ -62,6 +62,51 @@ fn stmt_expr_to_blockpy_emits_setup_for_named_exprs() {
 }
 
 #[test]
+fn stmt_expr_fragment_uses_plain_instr_body_with_fallthrough() {
+    let stmt = py_stmt!("(x := y)");
+    let context = Context::new("");
+    let mut next_label_id = 0usize;
+
+    let Some(fragment) = try_lower_direct_stmt_fragment::<InstrWithAwaitAndYield>(
+        &context,
+        &stmt,
+        None,
+        &mut next_label_id,
+    ) else {
+        panic!("expected direct expr stmt fragment");
+    };
+    let fragment = fragment.expect("expr fragment lowering should succeed");
+
+    assert!(fragment.deps.is_empty());
+    assert!(matches!(
+        fragment.entry.body.as_slice(),
+        [InstrWithAwaitAndYield::Store(_), _]
+    ));
+    assert!(matches!(
+        fragment.entry.term,
+        Some(BlockTerm::Jump(BlockEdge { target, args }))
+            if target == BlockLabel::fallthrough() && args.is_empty()
+    ));
+}
+
+#[test]
+fn stmt_expr_fragment_returns_none_for_branchy_expr_setup() {
+    let stmt = py_stmt!("x if cond else y");
+    let context = Context::new("");
+    let mut next_label_id = 17usize;
+
+    let fragment = try_lower_direct_stmt_fragment::<InstrWithAwaitAndYield>(
+        &context,
+        &stmt,
+        None,
+        &mut next_label_id,
+    );
+
+    assert!(fragment.is_none());
+    assert_eq!(next_label_id, 17);
+}
+
+#[test]
 fn stmt_return_to_blockpy_emits_setup_for_if_exprs() {
     let stmt = py_stmt!("return x if cond else y");
     let Stmt::Return(return_stmt) = stmt else {

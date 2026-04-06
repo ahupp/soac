@@ -3,9 +3,9 @@ use crate::block_py::cfg::{
 };
 use crate::block_py::param_specs::ParamSpec;
 use crate::block_py::{
-    assert_blockpy_block_normalized, Block, BlockEdge, BlockLabel, BlockPyFallthroughTerm,
-    BlockPyFunction, BlockPyModule, BlockTerm, CallableScopeInfo, FunctionKind, FunctionName,
-    FunctionNameGen, Instr, StructuredInstr,
+    assert_blockpy_block_normalized, Block, BlockBuilder, BlockEdge, BlockLabel,
+    BlockPyFallthroughTerm, BlockPyFunction, BlockPyModule, BlockTerm, CallableScopeInfo,
+    FunctionKind, FunctionName, FunctionNameGen, Instr, StructuredInstr,
 };
 use crate::namegen::fresh_name;
 use crate::passes::ast_to_ast::context::Context;
@@ -53,6 +53,26 @@ pub(crate) use try_regions::{
 };
 
 pub(crate) type LoweredBlockPyBlock<E = Expr> = Block<StructuredInstr<E>, E>;
+pub(crate) type InlineBlockBuilder<I> = BlockBuilder<I, BlockTerm<I>>;
+
+#[derive(Debug, Clone)]
+pub(crate) struct InlineFragment<I: Instr> {
+    pub entry: InlineBlockBuilder<I>,
+    pub deps: Vec<Block<I, I>>,
+}
+
+impl<I: Instr> InlineFragment<I> {
+    pub(crate) fn new(entry: InlineBlockBuilder<I>, deps: Vec<Block<I, I>>) -> Self {
+        Self { entry, deps }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct LoweredExpr<I: Instr> {
+    pub setup: InlineFragment<I>,
+    pub value: I,
+}
 
 pub(crate) fn rewrite_ast_to_core_blockpy_module_with_module(
     context: &Context,
