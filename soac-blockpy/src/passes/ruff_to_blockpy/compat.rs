@@ -113,23 +113,33 @@ where
 
 fn try_inline_builder_from_blockpy_stmts<E>(
     structured: crate::block_py::BlockBuilder<StructuredInstr<E>, BlockTerm<E>>,
-) -> Option<InlineBlockBuilder<E>>
+) -> Result<
+    InlineBlockBuilder<E>,
+    crate::block_py::BlockBuilder<StructuredInstr<E>, BlockTerm<E>>,
+>
 where
     E: RuffToBlockPyExpr + ImplicitNoneExpr,
 {
     let structured = structured.finish();
     if structured.term.is_some() {
-        return None;
+        return Err(structured);
+    }
+    if structured
+        .body
+        .iter()
+        .any(|stmt| !matches!(stmt, StructuredInstr::Expr(_)))
+    {
+        return Err(structured);
     }
 
     let mut entry = BlockBuilder::<E, BlockTerm<E>>::new();
     for stmt in structured.body {
         let StructuredInstr::Expr(stmt) = stmt else {
-            return None;
+            unreachable!("checked expr-only fragment body");
         };
         entry.push_stmt(stmt);
     }
-    Some(entry)
+    Ok(entry)
 }
 
 pub(crate) fn compat_if_jump_block_with_expr_setup_and_exc_target_and_expr<E>(
@@ -321,26 +331,40 @@ where
             )
         })
         .transpose()?;
-    let fragment = out.finish();
-    assert!(
-        fragment.term.is_none(),
-        "compatibility block body should not contain its own terminator"
-    );
-    blocks.push(with_exc_meta(
-        Block::from_builder(
-            label.clone(),
-            BlockBuilder::with_term(
-                fragment.body,
-                Some(BlockTerm::Return(
-                    value.unwrap_or_else(E::implicit_none_expr),
-                )),
-            ),
-            Vec::new(),
-            None,
-            None,
-        ),
-        exc_target,
-    ));
+    match try_inline_builder_from_blockpy_stmts(out) {
+        Ok(mut entry) => {
+            entry.set_term(BlockTerm::Return(
+                value.unwrap_or_else(E::implicit_none_expr),
+            ));
+            emit_inline_fragment_with_exc_target_and_expr(
+                blocks,
+                InlineFragment::from_closed_builder(label.clone(), entry, Vec::new()),
+                BlockLabel::fallthrough(),
+                exc_target,
+            );
+        }
+        Err(fragment) => {
+            assert!(
+                fragment.term.is_none(),
+                "compatibility block body should not contain its own terminator"
+            );
+            blocks.push(with_exc_meta(
+                Block::from_builder(
+                    label.clone(),
+                    BlockBuilder::with_term(
+                        fragment.body,
+                        Some(BlockTerm::Return(
+                            value.unwrap_or_else(E::implicit_none_expr),
+                        )),
+                    ),
+                    Vec::new(),
+                    None,
+                    None,
+                ),
+                exc_target,
+            ));
+        }
+    }
     Ok(label)
 }
 
@@ -432,21 +456,33 @@ where
             })
             .transpose()?,
     };
-    let fragment = out.finish();
-    assert!(
-        fragment.term.is_none(),
-        "compatibility block body should not contain its own terminator"
-    );
-    blocks.push(with_exc_meta(
-        Block::from_builder(
-            label.clone(),
-            BlockBuilder::with_term(fragment.body, Some(BlockTerm::Raise(exc))),
-            Vec::new(),
-            None,
-            None,
-        ),
-        exc_target,
-    ));
+    match try_inline_builder_from_blockpy_stmts(out) {
+        Ok(mut entry) => {
+            entry.set_term(BlockTerm::Raise(exc));
+            emit_inline_fragment_with_exc_target_and_expr(
+                blocks,
+                InlineFragment::from_closed_builder(label.clone(), entry, Vec::new()),
+                BlockLabel::fallthrough(),
+                exc_target,
+            );
+        }
+        Err(fragment) => {
+            assert!(
+                fragment.term.is_none(),
+                "compatibility block body should not contain its own terminator"
+            );
+            blocks.push(with_exc_meta(
+                Block::from_builder(
+                    label.clone(),
+                    BlockBuilder::with_term(fragment.body, Some(BlockTerm::Raise(exc))),
+                    Vec::new(),
+                    None,
+                    None,
+                ),
+                exc_target,
+            ));
+        }
+    }
     Ok(label)
 }
 
@@ -526,32 +562,35 @@ where
         None,
         &mut next_label_id,
     )?;
-    if let Some(mut entry) = try_inline_builder_from_blockpy_stmts(out) {
-        entry.set_term(BlockTerm::IfTerm(TermIf {
-            test: lowered_test,
-            then_label,
-            else_label,
-        }));
-        return Ok(emit_inline_fragment_with_exc_target_and_expr(
-            blocks,
-            InlineFragment::from_closed_builder(label, entry, Vec::new()),
-            BlockLabel::fallthrough(),
-            exc_target,
-        ));
+    match try_inline_builder_from_blockpy_stmts(out) {
+        Ok(mut entry) => {
+            entry.set_term(BlockTerm::IfTerm(TermIf {
+                test: lowered_test,
+                then_label,
+                else_label,
+            }));
+            Ok(emit_inline_fragment_with_exc_target_and_expr(
+                blocks,
+                InlineFragment::from_closed_builder(label, entry, Vec::new()),
+                BlockLabel::fallthrough(),
+                exc_target,
+            ))
+        }
+        Err(_) => {
+            blocks.push(
+                compat_if_jump_block_with_expr_setup_and_exc_target_and_expr(
+                    context,
+                    label.clone(),
+                    body,
+                    test,
+                    then_label,
+                    else_label,
+                    exc_target,
+                )?,
+            );
+            Ok(label)
+        }
     }
-
-    blocks.push(
-        compat_if_jump_block_with_expr_setup_and_exc_target_and_expr(
-            context,
-            label.clone(),
-            body,
-            test,
-            then_label,
-            else_label,
-            exc_target,
-        )?,
-    );
-    Ok(label)
 }
 
 pub(crate) fn emit_simple_while_blocks_with_expr_setup_and_expr<E>(
