@@ -1,11 +1,25 @@
-use crate::block_py::{BindingKind, ClosureInit, ClosureSlot};
+use crate::block_py::pretty::BlockPyPrettyPrint;
+use crate::block_py::{BindingKind, ClosureInit, ClosureSlot, ModuleNameGen};
 use crate::block_py::{
     BlockPyFunction, BlockPyModule, BlockPyNameLike, BlockTerm, Call, CallArgKeyword,
     CallArgPositional, CallableScopeKind, CellBindingKind, InstrLow, InstrResolved,
     FunctionKind, ResolvedName, NameLocation, ResolvedStorageBlock,
 };
-use crate::passes::{CoreBlockPyPassWithAwaitAndYield, InstrRuff, ResolvedStorageBlockPyPass};
+use crate::passes::ast_to_ast::ast_rewrite::rewrite_with_pass;
+use crate::passes::ast_to_ast::context::Context;
+use crate::passes::ast_to_ast::rewrite_class_def;
+use crate::passes::ast_to_ast::rewrite_expr::ScopedHelperExprPass;
+use crate::passes::ast_to_ast::{
+    body::Suite, rewrite_future_annotations, rewrite_stmt, semantic::SemanticAstState,
+};
+use crate::passes::core_await_lower::lower_awaits_in_core_blockpy_module;
+use crate::passes::ruff_to_blockpy::rewrite_ast_to_core_blockpy_module_with_module;
+use crate::passes::{
+    CoreBlockPyPassWithAwaitAndYield, CoreBlockPyPassWithYield, InstrRuff,
+    ResolvedStorageBlockPyPass,
+};
 use crate::{lower_python_to_blockpy_for_testing, LoweringResult};
+use ruff_python_parser::parse_module;
 use ruff_python_ast::{self as ast, Expr, Stmt};
 
 fn tracked_core_blockpy_with_await_and_yield(
@@ -17,6 +31,81 @@ fn tracked_core_blockpy_with_await_and_yield(
         .pass_core_blockpy_with_await_and_yield()
         .expect("core_blockpy_with_await_and_yield pass should be tracked")
         .clone()
+}
+
+fn rewrite_ast_to_ast_for_testing(source: &str) -> (Context, Suite, SemanticAstState) {
+    let module = parse_module(source)
+        .expect("source should parse")
+        .into_syntax();
+    let mut body = module.body;
+    rewrite_future_annotations::rewrite(&mut body).expect("future annotation rewrite");
+    let context = Context::new(source);
+    rewrite_class_def::private::rewrite_private_names(&context, &mut body);
+    rewrite_stmt::annotation::rewrite_ann_assign_to_dunder_annotate(&context, &mut body);
+    rewrite_with_pass(&context, None, Some(&ScopedHelperExprPass), &mut body);
+    let mut semantic_state = SemanticAstState::from_ruff(&mut body);
+    crate::driver::wrap_module_init(&mut semantic_state, &mut body);
+    rewrite_class_def::class_body::rewrite_class_body_scopes(
+        &context,
+        &mut semantic_state,
+        &mut body,
+    );
+    (context, body, semantic_state)
+}
+
+fn tracked_core_blockpy_with_yield_only(source: &str) -> BlockPyModule<CoreBlockPyPassWithYield> {
+    let (context, module, semantic_state) = rewrite_ast_to_ast_for_testing(source);
+    let core_blockpy = rewrite_ast_to_core_blockpy_module_with_module(
+        &context,
+        module,
+        &semantic_state,
+        ModuleNameGen::new(0),
+    );
+    lower_awaits_in_core_blockpy_module(core_blockpy)
+}
+
+fn assert_all_targets_present<P, S>(module: &BlockPyModule<P, S>)
+where
+    P: crate::block_py::BlockPyPass<Expr = S> + crate::block_py::pretty::BlockPyPrettyPrinter,
+    S: crate::block_py::Instr + std::fmt::Debug,
+    P::Expr: std::fmt::Debug,
+{
+    let rendered = module.pretty_print();
+    for callable in &module.callable_defs {
+        let labels = callable
+            .blocks
+            .iter()
+            .map(|block| block.label)
+            .collect::<std::collections::HashSet<_>>();
+        for block in &callable.blocks {
+            let check = |target: crate::block_py::BlockLabel, kind| {
+                assert!(
+                    target.is_fallthrough() || labels.contains(&target),
+                    "dangling {kind} in {} from {} to {}\n{rendered}",
+                    callable.names.qualname,
+                    block.label,
+                    target,
+                );
+            };
+            match &block.term {
+                BlockTerm::Jump(edge) => check(edge.target, "jump"),
+                BlockTerm::IfTerm(if_term) => {
+                    check(if_term.then_label, "then");
+                    check(if_term.else_label, "else");
+                }
+                BlockTerm::BranchTable(branch) => {
+                    for target in &branch.targets {
+                        check(*target, "branch");
+                    }
+                    check(branch.default_label, "branch default");
+                }
+                BlockTerm::Raise(_) | BlockTerm::Return(_) => {}
+            }
+            if let Some(edge) = &block.exc_edge {
+                check(edge.target, "exception");
+            }
+        }
+    }
 }
 
 fn tracked_name_binding_module(
@@ -2228,6 +2317,30 @@ async def run():
         !blockpy_rendered.contains("await Once()"),
         "{blockpy_rendered}"
     );
+}
+
+#[test]
+fn coroutine_closure_state_core_blockpy_with_yield_has_no_dangling_labels() {
+    let source = r#"
+class Once:
+    def __await__(self):
+        yielded = yield "tick"
+        return yielded if yielded is not None else 5
+
+def make_runner(delta):
+    outer = delta
+
+    async def run():
+        total = 1
+        total += outer
+        total += await Once()
+        return total
+
+    return run()
+"#;
+
+    let blockpy = tracked_core_blockpy_with_yield_only(source);
+    assert_all_targets_present(&blockpy);
 }
 
 #[test]

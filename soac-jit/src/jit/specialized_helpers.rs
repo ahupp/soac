@@ -1064,7 +1064,7 @@ pub use test_only_export_stubs::*;
 macro_rules! preserve_helper_frame {
     ($expr:expr) => {{
         let result = $expr;
-        std::ptr::read_volatile(&result);
+        std::hint::black_box(result);
         result
     }};
 }

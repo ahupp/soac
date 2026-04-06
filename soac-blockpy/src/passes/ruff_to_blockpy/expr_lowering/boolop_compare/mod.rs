@@ -25,29 +25,6 @@ where
         .into()
 }
 
-fn relabel_blocks_entry<E>(
-    blocks: &mut [crate::block_py::Block<E, E>],
-    old_label: BlockLabel,
-    new_label: BlockLabel,
-) where
-    E: crate::block_py::Instr,
-{
-    if old_label == new_label {
-        return;
-    }
-    for block in blocks {
-        if block.label == old_label {
-            block.label = new_label;
-        }
-        block.term.replace_target(old_label, new_label);
-        if let Some(edge) = &mut block.exc_edge {
-            if edge.target == old_label {
-                edge.target = new_label;
-            }
-        }
-    }
-}
-
 #[allow(dead_code)]
 pub(crate) fn try_lower_branching_expr_direct<L, E>(
     lowerer: &L,
@@ -83,7 +60,7 @@ where
     let bridge = crate::passes::ruff_to_blockpy::stmt_lowering::StructuredLoweringBridge::new();
     let mut values = values.into_iter();
     let first = values.next().expect("bool op expects at least one value");
-    let (mut entry, first) = bridge
+    let (entry, first) = bridge
         .try_lower_inline_value::<E, InstrRuff>(name_gen, |structured| {
             let first = lowerer.lower_expr_instr_into(first.clone(), structured, loop_ctx)?;
             structured.push_stmt(assign_name(&target, first.clone()));
@@ -93,29 +70,15 @@ where
         .ok_or_else(|| "boolop setup still requires structured lowering".to_string())?;
     let _ = first;
 
-    let mut dep_builders: Vec<(BlockLabel, crate::passes::ruff_to_blockpy::stmt_lowering::BlockPyStmtBuilder<E>)> = Vec::new();
-    let mut current_dep_index: Option<usize> = None;
+    let mut fragments = Vec::new();
+    let mut current_builder = entry;
     for value in values {
-        let next_label = name_gen.next_block_name();
         let test = match op {
             ast::BoolOp::And => load_name(&target),
             ast::BoolOp::Or => {
                 InstrRuff::from_ast_expr(py_expr!("not {target:id}", target = target.as_str()))
             }
         };
-        match current_dep_index {
-            None => entry.set_term(BlockTerm::IfTerm(TermIf {
-                test: E::from_lowered_expr(test),
-                then_label: next_label,
-                else_label: BlockLabel::fallthrough(),
-            })),
-            Some(index) => dep_builders[index].1.set_term(BlockTerm::IfTerm(TermIf {
-                test: E::from_lowered_expr(test),
-                then_label: next_label,
-                else_label: BlockLabel::fallthrough(),
-            })),
-        }
-
         let (next_entry, value) = bridge
             .try_lower_inline_value::<E, InstrRuff>(name_gen, |structured| {
                 let value = lowerer.lower_expr_instr_into(value.clone(), structured, loop_ctx)?;
@@ -125,24 +88,28 @@ where
             .transpose()?
             .ok_or_else(|| "boolop step still requires structured lowering".to_string())?;
         let _ = value;
-        dep_builders.push((next_label, next_entry));
-        current_dep_index = Some(dep_builders.len() - 1);
+        current_builder.set_term(BlockTerm::IfTerm(TermIf {
+            test: E::from_lowered_expr(test),
+            then_label: next_entry.entry_ref().label(),
+            else_label: BlockLabel::fallthrough(),
+        }));
+        fragments.push(current_builder.finish_blocks());
+        current_builder = next_entry;
     }
 
-    match current_dep_index {
-        None => entry.ensure_fallthrough_term(),
-        Some(index) => dep_builders[index].1.ensure_fallthrough_term(),
-    }
+    current_builder.ensure_fallthrough_term();
+    fragments.push(current_builder.finish_blocks());
 
-    let (setup_entry_label, mut setup_blocks) = entry.finish_fallthrough_blocks();
-    for (label, builder) in dep_builders {
-        let (entry_label, mut blocks) = builder.finish_fallthrough_blocks();
-        relabel_blocks_entry(&mut blocks, entry_label, label);
-        setup_blocks.extend(blocks);
+    let mut fragments = fragments.into_iter();
+    let (setup_entry_ref, mut setup_blocks) = fragments
+        .next()
+        .expect("boolop setup should produce at least one fragment");
+    for (_, mut blocks) in fragments {
+        setup_blocks.append(&mut blocks);
     }
     let setup_entry_index = setup_blocks
         .iter()
-        .position(|block| block.label == setup_entry_label)
+        .position(|block| block.label == setup_entry_ref.label())
         .expect("boolop setup entry label should be present in assembled blocks");
     let setup_entry = setup_blocks.remove(setup_entry_index);
     Ok(LoweredExpr {
@@ -176,7 +143,7 @@ where
     };
     let first_has_more = steps.peek().is_some();
 
-    let (mut entry, (_initial_left, first_comparator)) = bridge
+    let (entry, (_initial_left, first_comparator)) = bridge
         .try_lower_inline_value::<E, (InstrRuff, InstrRuff)>(name_gen, |structured| {
                 let current_left =
                     lowerer.lower_expr_instr_into((*left).clone(), structured, loop_ctx)?;
@@ -199,24 +166,10 @@ where
         .ok_or_else(|| "compare setup still requires structured lowering".to_string())?;
     let mut current_left = first_comparator.clone();
 
-    let mut dep_builders: Vec<(BlockLabel, crate::passes::ruff_to_blockpy::stmt_lowering::BlockPyStmtBuilder<E>)> = Vec::new();
-    let mut current_dep_index: Option<usize> = None;
+    let mut fragments = Vec::new();
+    let mut current_builder = entry;
 
     while let Some((op, comparator)) = steps.next() {
-        let next_label = name_gen.next_block_name();
-        match current_dep_index {
-            None => entry.set_term(BlockTerm::IfTerm(TermIf {
-                test: E::from_lowered_expr(load_name(&target_name)),
-                then_label: next_label,
-                else_label: BlockLabel::fallthrough(),
-            })),
-            Some(index) => dep_builders[index].1.set_term(BlockTerm::IfTerm(TermIf {
-                test: E::from_lowered_expr(load_name(&target_name)),
-                then_label: next_label,
-                else_label: BlockLabel::fallthrough(),
-            })),
-        }
-
         let has_more = steps.peek().is_some();
         let current_left_for_step = current_left.clone();
         let (next_entry, comparator_expr) = bridge
@@ -238,24 +191,28 @@ where
             .ok_or_else(|| "compare step still requires structured lowering".to_string())?;
 
         current_left = comparator_expr.clone();
-        dep_builders.push((next_label, next_entry));
-        current_dep_index = Some(dep_builders.len() - 1);
+        current_builder.set_term(BlockTerm::IfTerm(TermIf {
+            test: E::from_lowered_expr(load_name(&target_name)),
+            then_label: next_entry.entry_ref().label(),
+            else_label: BlockLabel::fallthrough(),
+        }));
+        fragments.push(current_builder.finish_blocks());
+        current_builder = next_entry;
     }
 
-    match current_dep_index {
-        None => entry.ensure_fallthrough_term(),
-        Some(index) => dep_builders[index].1.ensure_fallthrough_term(),
-    }
+    current_builder.ensure_fallthrough_term();
+    fragments.push(current_builder.finish_blocks());
 
-    let (setup_entry_label, mut setup_blocks) = entry.finish_fallthrough_blocks();
-    for (label, builder) in dep_builders {
-        let (entry_label, mut blocks) = builder.finish_fallthrough_blocks();
-        relabel_blocks_entry(&mut blocks, entry_label, label);
-        setup_blocks.extend(blocks);
+    let mut fragments = fragments.into_iter();
+    let (setup_entry_ref, mut setup_blocks) = fragments
+        .next()
+        .expect("compare setup should produce at least one fragment");
+    for (_, mut blocks) in fragments {
+        setup_blocks.append(&mut blocks);
     }
     let setup_entry_index = setup_blocks
         .iter()
-        .position(|block| block.label == setup_entry_label)
+        .position(|block| block.label == setup_entry_ref.label())
         .expect("compare setup entry label should be present in assembled blocks");
     let setup_entry = setup_blocks.remove(setup_entry_index);
     Ok(LoweredExpr {

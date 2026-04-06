@@ -50,11 +50,11 @@ pub(crate) fn emit_inline_fragment_with_exc_target_and_expr<E>(
     fragment: InlineFragment<E>,
     fallthrough_target: BlockLabel,
     exc_target: Option<&BlockLabel>,
-) -> BlockLabel
+) -> InlineBlockRef
 where
     E: RuffToBlockPyExpr + ImplicitNoneExpr,
 {
-    let entry_label = fragment.entry.label;
+    let entry_ref = fragment.entry_ref();
     blocks.push(compat_block_from_inline_with_exc_target_and_expr(
         fragment.entry,
         fallthrough_target.clone(),
@@ -67,7 +67,7 @@ where
             exc_target,
         )
     }));
-    entry_label
+    entry_ref
 }
 
 pub(crate) fn compat_block_from_blockpy_with_exc_target_and_expr<E>(
@@ -103,18 +103,23 @@ where
 
 fn emit_lowered_builder_fragment_with_exc_target_and_expr<E>(
     blocks: &mut Vec<LoweredBlockPyBlock<E>>,
-    label: BlockLabel,
     builder: InlineBlockBuilder<E>,
     term: BlockTerm<E>,
     fallthrough_target: BlockLabel,
     exc_target: Option<&BlockLabel>,
-) -> BlockLabel
+) -> InlineBlockRef
 where
     E: RuffToBlockPyExpr + ImplicitNoneExpr,
 {
-    let mut fragment = builder.finish_with_term(term);
-    fragment.relabel_entry(label);
-    emit_inline_fragment_with_exc_target_and_expr(blocks, fragment, fallthrough_target, exc_target)
+    let (entry_ref, finished_blocks) = builder.finish_blocks_with_term(term);
+    for block in finished_blocks {
+        blocks.push(compat_block_from_inline_with_exc_target_and_expr(
+            block,
+            fallthrough_target.clone(),
+            exc_target,
+        ));
+    }
+    entry_ref
 }
 
 pub(crate) fn set_region_exc_param<E: Instr>(
@@ -164,7 +169,6 @@ pub(crate) fn emit_sequence_jump_block<E>(
     context: &Context,
     blocks: &mut Vec<LoweredBlockPyBlock<E>>,
     name_gen: &FunctionNameGen,
-    label: BlockLabel,
     linear: Vec<InstrRuff>,
     target_label: BlockLabel,
     exc_target: Option<&BlockLabel>,
@@ -172,24 +176,25 @@ pub(crate) fn emit_sequence_jump_block<E>(
 where
     E: RuffToBlockPyExpr + ImplicitNoneExpr,
 {
+    if linear.is_empty() {
+        return target_label;
+    }
     let lowered_linear = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &linear, name_gen)
         .unwrap_or_else(|err| panic!("failed to lower sequence jump prefix through production path: {err}"));
     emit_lowered_builder_fragment_with_exc_target_and_expr(
         blocks,
-        label.clone(),
         lowered_linear,
         BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())),
         target_label,
         exc_target,
-    );
-    label
+    )
+    .label()
 }
 
 pub(crate) fn emit_sequence_return_block_with_expr_setup_and_expr<E>(
     context: &Context,
     blocks: &mut Vec<LoweredBlockPyBlock<E>>,
     name_gen: &FunctionNameGen,
-    label: BlockLabel,
     linear: Vec<InstrRuff>,
     value: Option<InstrRuff>,
     exc_target: Option<&BlockLabel>,
@@ -201,26 +206,10 @@ where
     if let Some(expr) = value.clone() {
         let lowered_direct = try_lower_direct_expr::<E>(name_gen, expr);
         if let Some(Ok(lowered)) = lowered_direct {
-            let fragment_entry_label = if out.is_empty() {
-                label.clone()
-            } else {
-                let next_label = name_gen.next_block_name();
-                emit_lowered_builder_fragment_with_exc_target_and_expr(
-                    blocks,
-                    label.clone(),
-                    out,
-                    BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())),
-                    next_label.clone(),
-                    exc_target,
-                );
-                next_label
-            };
             let dispatch_label = name_gen.next_block_name();
-            let mut setup = lowered.setup;
-            setup.relabel_entry(fragment_entry_label);
-            emit_inline_fragment_with_exc_target_and_expr(
+            let setup_entry = emit_inline_fragment_with_exc_target_and_expr(
                 blocks,
-                setup,
+                lowered.setup,
                 dispatch_label.clone(),
                 exc_target,
             );
@@ -234,7 +223,18 @@ where
                 ),
                 exc_target,
             ));
-            return Ok(label);
+            let fragment_entry = if out.is_empty() {
+                None
+            } else {
+                Some(emit_lowered_builder_fragment_with_exc_target_and_expr(
+                    blocks,
+                    out,
+                    BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())),
+                    setup_entry.label(),
+                    exc_target,
+                ))
+            };
+            return Ok(fragment_entry.unwrap_or(setup_entry).label());
         }
     }
     let value = value
@@ -245,22 +245,20 @@ where
         ))
         .transpose()?;
     let return_term = BlockTerm::Return(value.unwrap_or_else(E::implicit_none_expr));
-    emit_lowered_builder_fragment_with_exc_target_and_expr(
+    Ok(emit_lowered_builder_fragment_with_exc_target_and_expr(
         blocks,
-        label.clone(),
         out,
         return_term,
         BlockLabel::fallthrough(),
         exc_target,
-    );
-    Ok(label)
+    )
+    .label())
 }
 
 pub(crate) fn emit_sequence_raise_block_with_expr_setup_and_expr<E>(
     context: &Context,
     blocks: &mut Vec<LoweredBlockPyBlock<E>>,
     name_gen: &FunctionNameGen,
-    label: BlockLabel,
     linear: Vec<InstrRuff>,
     exc: TermRaise<InstrRuff>,
     exc_target: Option<&BlockLabel>,
@@ -272,26 +270,10 @@ where
     if let Some(expr) = exc.exc.clone() {
         let lowered_direct = try_lower_direct_expr::<E>(name_gen, expr);
         if let Some(Ok(lowered)) = lowered_direct {
-            let fragment_entry_label = if out.is_empty() {
-                label.clone()
-            } else {
-                let next_label = name_gen.next_block_name();
-                emit_lowered_builder_fragment_with_exc_target_and_expr(
-                    blocks,
-                    label.clone(),
-                    out,
-                    BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())),
-                    next_label.clone(),
-                    exc_target,
-                );
-                next_label
-            };
             let dispatch_label = name_gen.next_block_name();
-            let mut setup = lowered.setup;
-            setup.relabel_entry(fragment_entry_label);
-            emit_inline_fragment_with_exc_target_and_expr(
+            let setup_entry = emit_inline_fragment_with_exc_target_and_expr(
                 blocks,
-                setup,
+                lowered.setup,
                 dispatch_label.clone(),
                 exc_target,
             );
@@ -307,7 +289,18 @@ where
                 ),
                 exc_target,
             ));
-            return Ok(label);
+            let fragment_entry = if out.is_empty() {
+                None
+            } else {
+                Some(emit_lowered_builder_fragment_with_exc_target_and_expr(
+                    blocks,
+                    out,
+                    BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())),
+                    setup_entry.label(),
+                    exc_target,
+                ))
+            };
+            return Ok(fragment_entry.unwrap_or(setup_entry).label());
         }
     }
     let exc = TermRaise {
@@ -323,22 +316,20 @@ where
             .transpose()?,
     };
     let raise_term = BlockTerm::Raise(exc);
-    emit_lowered_builder_fragment_with_exc_target_and_expr(
+    Ok(emit_lowered_builder_fragment_with_exc_target_and_expr(
         blocks,
-        label.clone(),
         out,
         raise_term,
         BlockLabel::fallthrough(),
         exc_target,
-    );
-    Ok(label)
+    )
+    .label())
 }
 
 pub(crate) fn emit_if_branch_block_with_expr_setup_and_expr<E>(
     context: &Context,
     blocks: &mut Vec<LoweredBlockPyBlock<E>>,
     name_gen: &FunctionNameGen,
-    label: BlockLabel,
     body: Vec<InstrRuff>,
     test: InstrRuff,
     then_label: BlockLabel,
@@ -350,17 +341,10 @@ where
 {
     let lowered_direct = try_lower_direct_expr::<E>(name_gen, test.clone());
     if let Some(Ok(lowered)) = lowered_direct {
-        let setup_label = if body.is_empty() {
-            label.clone()
-        } else {
-            name_gen.next_block_name()
-        };
         let dispatch_label = name_gen.next_block_name();
-        let mut setup = lowered.setup;
-        setup.relabel_entry(setup_label.clone());
-        emit_inline_fragment_with_exc_target_and_expr(
+        let setup_entry = emit_inline_fragment_with_exc_target_and_expr(
             blocks,
-            setup,
+            lowered.setup,
             dispatch_label.clone(),
             exc_target,
         );
@@ -380,16 +364,16 @@ where
         ));
         if !body.is_empty() {
             let lowered_body = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &body, name_gen)?;
-            emit_lowered_builder_fragment_with_exc_target_and_expr(
+            return Ok(emit_lowered_builder_fragment_with_exc_target_and_expr(
                 blocks,
-                label.clone(),
                 lowered_body,
                 BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())),
-                setup_label,
+                setup_entry.label(),
                 exc_target,
-            );
+            )
+            .label());
         }
-        return Ok(label);
+        return Ok(setup_entry.label());
     }
 
     let mut out = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &body, name_gen)?;
@@ -403,15 +387,14 @@ where
         then_label,
         else_label,
     });
-    emit_lowered_builder_fragment_with_exc_target_and_expr(
+    Ok(emit_lowered_builder_fragment_with_exc_target_and_expr(
         blocks,
-        label.clone(),
         out,
         if_term,
         BlockLabel::fallthrough(),
         exc_target,
-    );
-    Ok(label)
+    )
+    .label())
 }
 
 pub(crate) fn emit_simple_while_blocks_with_expr_setup_and_expr<E>(
@@ -432,14 +415,24 @@ where
     let lowered_direct = try_lower_direct_expr::<E>(name_gen, test.clone());
     if let Some(Ok(lowered)) = lowered_direct {
         let dispatch_label = name_gen.next_block_name();
-        let mut setup = lowered.setup;
-        setup.relabel_entry(test_label.clone());
-        emit_inline_fragment_with_exc_target_and_expr(
+        let setup_entry = emit_inline_fragment_with_exc_target_and_expr(
             blocks,
-            setup,
+            lowered.setup,
             dispatch_label.clone(),
             exc_target,
         );
+        if setup_entry.label() != test_label {
+            blocks.push(with_exc_meta(
+                Block::new(
+                    test_label.clone(),
+                    Vec::new(),
+                    BlockTerm::Jump(BlockEdge::new(setup_entry.label())),
+                    Vec::new(),
+                    None,
+                ),
+                exc_target,
+            ));
+        }
         blocks.push(with_exc_meta(
             Block::new(
                 dispatch_label,
@@ -466,25 +459,47 @@ where
             then_label: body_entry,
             else_label: cond_false_entry,
         });
-        emit_lowered_builder_fragment_with_exc_target_and_expr(
+        let emitted_test_entry = emit_lowered_builder_fragment_with_exc_target_and_expr(
             blocks,
-            test_label.clone(),
             out,
             if_term,
             BlockLabel::fallthrough(),
             exc_target,
         );
+        if emitted_test_entry.label() != test_label {
+            blocks.push(with_exc_meta(
+                Block::new(
+                    test_label.clone(),
+                    Vec::new(),
+                    BlockTerm::Jump(BlockEdge::new(emitted_test_entry.label())),
+                    Vec::new(),
+                    None,
+                ),
+                exc_target,
+            ));
+        }
     }
     if let Some(linear_label) = linear_label {
         let lowered_linear = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &linear, name_gen)?;
-        emit_lowered_builder_fragment_with_exc_target_and_expr(
+        let emitted_linear_entry = emit_lowered_builder_fragment_with_exc_target_and_expr(
             blocks,
-            linear_label.clone(),
             lowered_linear,
             BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())),
             test_label,
             exc_target,
         );
+        if emitted_linear_entry.label() != linear_label {
+            blocks.push(with_exc_meta(
+                Block::new(
+                    linear_label.clone(),
+                    Vec::new(),
+                    BlockTerm::Jump(BlockEdge::new(emitted_linear_entry.label())),
+                    Vec::new(),
+                    None,
+                ),
+                exc_target,
+            ));
+        }
         Ok(linear_label)
     } else {
         Ok(test_label)

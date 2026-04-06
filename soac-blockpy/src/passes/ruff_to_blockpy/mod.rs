@@ -55,23 +55,36 @@ pub(crate) use try_regions::{
 
 pub(crate) type LoweredBlockPyBlock<E = Expr> = Block<E, E>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct InlineBlockRef(BlockLabel);
+
+impl InlineBlockRef {
+    fn from_label(label: BlockLabel) -> Self {
+        Self(label)
+    }
+
+    pub(crate) fn label(self) -> BlockLabel {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct InlineBlockBuilder<I: Instr> {
     name_gen: FunctionNameGen,
-    entry_label: BlockLabel,
-    current_label: BlockLabel,
-    current: BlockBuilder<I, BlockTerm<I>>,
+    entry: InlineBlockRef,
+    current_ref: InlineBlockRef,
+    current_block: BlockBuilder<I, BlockTerm<I>>,
     deps: Vec<Block<I, I>>,
 }
 
 impl<I: Instr> InlineBlockBuilder<I> {
     pub(crate) fn new(name_gen: &FunctionNameGen) -> Self {
-        let entry_label = name_gen.next_block_name();
+        let entry = InlineBlockRef::from_label(name_gen.next_block_name());
         Self {
             name_gen: name_gen.share(),
-            entry_label,
-            current_label: entry_label,
-            current: BlockBuilder::new(),
+            entry,
+            current_ref: entry,
+            current_block: BlockBuilder::new(),
             deps: Vec::new(),
         }
     }
@@ -80,19 +93,23 @@ impl<I: Instr> InlineBlockBuilder<I> {
     where
         I: crate::block_py::NormalizedInstr,
     {
-        self.current.push_stmt(stmt);
+        self.current_block.push_stmt(stmt);
     }
 
     pub(crate) fn name_gen(&self) -> &FunctionNameGen {
         &self.name_gen
     }
 
+    pub(crate) fn entry_ref(&self) -> InlineBlockRef {
+        self.entry
+    }
+
     pub(crate) fn set_term(&mut self, term: BlockTerm<I>) {
-        self.current.set_term(term);
+        self.current_block.set_term(term);
     }
 
     pub(crate) fn ensure_fallthrough_term(&mut self) {
-        self.current.ensure_fallthrough_term();
+        self.current_block.ensure_fallthrough_term();
     }
 
     pub(crate) fn append_fragment(&mut self, mut fragment: InlineFragment<I>)
@@ -100,77 +117,86 @@ impl<I: Instr> InlineBlockBuilder<I> {
         I: crate::block_py::NormalizedInstr,
     {
         assert!(
-            self.current.term.is_none(),
+            self.current_block.term.is_none(),
             "cannot append inline fragment after builder terminator"
         );
-        let continuation = self.name_gen.next_block_name();
-        self.current
-            .set_term(BlockTerm::Jump(BlockEdge::new(fragment.entry.label)));
+        let continuation = InlineBlockRef::from_label(self.name_gen.next_block_name());
+        self.current_block
+            .set_term(BlockTerm::Jump(BlockEdge::new(fragment.entry_ref().label())));
         self.flush_current_block();
-        fragment.entry.replace_fallthrough_target(continuation);
+        fragment.entry.replace_fallthrough_target(continuation.label());
         for dep in &mut fragment.deps {
-            dep.replace_fallthrough_target(continuation);
+            dep.replace_fallthrough_target(continuation.label());
         }
         self.deps.push(fragment.entry);
         self.deps.extend(fragment.deps);
-        self.current_label = continuation;
-        self.current = BlockBuilder::new();
+        self.current_ref = continuation;
+        self.current_block = BlockBuilder::new();
     }
 
-    pub(crate) fn finish_with_term(mut self, term: BlockTerm<I>) -> InlineFragment<I>
+    pub(crate) fn finish_blocks_with_term(
+        mut self,
+        term: BlockTerm<I>,
+    ) -> (InlineBlockRef, Vec<Block<I, I>>)
     where
         I: crate::block_py::NormalizedInstr,
     {
-        if self.current.term.is_none() {
-            self.current.set_term(term);
+        if self.current_block.term.is_none() {
+            self.current_block.set_term(term);
         }
-        self.finish_fragment()
+        self.finish_blocks()
     }
 
     pub(crate) fn finish_fallthrough(mut self) -> InlineFragment<I>
     where
         I: crate::block_py::NormalizedInstr,
     {
-        self.current.ensure_fallthrough_term();
+        self.current_block.ensure_fallthrough_term();
         self.finish_fragment()
     }
 
-    pub(crate) fn finish_fallthrough_blocks(mut self) -> (BlockLabel, Vec<Block<I, I>>)
+    pub(crate) fn finish_fallthrough_blocks(mut self) -> (InlineBlockRef, Vec<Block<I, I>>)
     where
         I: crate::block_py::NormalizedInstr,
     {
-        self.current.ensure_fallthrough_term();
+        self.current_block.ensure_fallthrough_term();
         self.finish_blocks()
     }
 
-    pub(crate) fn finish_linear_block(mut self, label: BlockLabel, term: BlockTerm<I>) -> Option<Block<I, I>>
+    pub(crate) fn finish_linear_block(
+        mut self,
+        label: BlockLabel,
+        term: BlockTerm<I>,
+    ) -> Option<Block<I, I>>
     where
         I: crate::block_py::NormalizedInstr,
     {
         if !self.deps.is_empty() {
             return None;
         }
-        if self.current.term.is_none() {
-            self.current.set_term(term);
+        if self.current_block.term.is_none() {
+            self.current_block.set_term(term);
         }
-        let current = self.current.finish();
+        let current = self.current_block.finish();
         Some(Block::new(label, current.body, current.term.expect("explicit term"), Vec::new(), None))
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.deps.is_empty() && self.current.body.is_empty() && self.current.term.is_none()
+        self.deps.is_empty()
+            && self.current_block.body.is_empty()
+            && self.current_block.term.is_none()
     }
 
     fn flush_current_block(&mut self)
     where
         I: crate::block_py::NormalizedInstr,
     {
-        let current = std::mem::replace(&mut self.current, BlockBuilder::new()).finish();
+        let current = std::mem::replace(&mut self.current_block, BlockBuilder::new()).finish();
         let term = current
             .term
             .expect("inline block builder current block must have an explicit terminator");
         self.deps.push(Block::new(
-            self.current_label,
+            self.current_ref.label(),
             current.body,
             term,
             Vec::new(),
@@ -182,11 +208,14 @@ impl<I: Instr> InlineBlockBuilder<I> {
     where
         I: crate::block_py::NormalizedInstr,
     {
-        let (entry_label, mut blocks) = self.finish_blocks();
+        let (entry_ref, mut blocks) = self.finish_blocks();
         if blocks.len() == 1 {
             return InlineFragment::new(blocks.pop().expect("single block fragment"), Vec::new());
         }
-        let entry = if let Some(entry_index) = blocks.iter().position(|block| block.label == entry_label) {
+        let entry = if let Some(entry_index) = blocks
+            .iter()
+            .position(|block| block.label == entry_ref.label())
+        {
             blocks.remove(entry_index)
         } else {
             let first_target = blocks
@@ -194,7 +223,7 @@ impl<I: Instr> InlineBlockBuilder<I> {
                 .map(|block| block.label)
                 .expect("multi-block fragment should contain at least one block");
             Block::new(
-                entry_label,
+                entry_ref.label(),
                 Vec::new(),
                 BlockTerm::Jump(BlockEdge::new(first_target)),
                 Vec::new(),
@@ -204,16 +233,16 @@ impl<I: Instr> InlineBlockBuilder<I> {
         InlineFragment::new(entry, blocks)
     }
 
-    pub(crate) fn finish_blocks(self) -> (BlockLabel, Vec<Block<I, I>>)
+    pub(crate) fn finish_blocks(self) -> (InlineBlockRef, Vec<Block<I, I>>)
     where
         I: crate::block_py::NormalizedInstr,
     {
-        let current = self.current.finish();
+        let current = self.current_block.finish();
         let term = current
             .term
             .expect("inline block builder must end with an explicit terminator");
         let entry = Block::new(
-            self.current_label,
+            self.current_ref.label(),
             current.body,
             term,
             Vec::new(),
@@ -221,7 +250,7 @@ impl<I: Instr> InlineBlockBuilder<I> {
         );
         let mut blocks = self.deps;
         blocks.push(entry);
-        if !blocks.iter().any(|block| block.label == self.entry_label) {
+        if !blocks.iter().any(|block| block.label == self.entry.label()) {
             let target = blocks
                 .first()
                 .map(|block| block.label)
@@ -229,7 +258,7 @@ impl<I: Instr> InlineBlockBuilder<I> {
             blocks.insert(
                 0,
                 Block::new(
-                    self.entry_label,
+                    self.entry.label(),
                     Vec::new(),
                     BlockTerm::Jump(BlockEdge::new(target)),
                     Vec::new(),
@@ -237,7 +266,7 @@ impl<I: Instr> InlineBlockBuilder<I> {
                 ),
             );
         }
-        (self.entry_label, blocks)
+        (self.entry, blocks)
     }
 }
 
@@ -321,7 +350,7 @@ impl<I: Instr> InlineFragment<I> {
             );
         }
 
-        for block in &self.deps {
+        for block in std::iter::once(&self.entry).chain(self.deps.iter()) {
             match &block.term {
                 BlockTerm::Jump(edge) => {
                     assert_target_present(
@@ -380,27 +409,8 @@ impl<I: Instr> InlineFragment<I> {
         }
     }
 
-    pub(crate) fn relabel_entry(&mut self, new_label: BlockLabel) {
-        let old_label = self.entry.label;
-        if old_label == new_label {
-            return;
-        }
-        self.entry.label = new_label;
-        self.entry.term.replace_target(old_label, new_label);
-        if let Some(edge) = &mut self.entry.exc_edge {
-            if edge.target == old_label {
-                edge.target = new_label;
-            }
-        }
-        for block in &mut self.deps {
-            block.term.replace_target(old_label, new_label);
-            if let Some(edge) = &mut block.exc_edge {
-                if edge.target == old_label {
-                    edge.target = new_label;
-                }
-            }
-        }
-        self.assert_well_formed();
+    pub(crate) fn entry_ref(&self) -> InlineBlockRef {
+        InlineBlockRef::from_label(self.entry.label)
     }
 }
 

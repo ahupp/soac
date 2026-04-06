@@ -626,7 +626,6 @@ fn if_stmt_helper_lowers_both_branches_via_callback() {
         &context,
         &mut blocks,
         &test_name_gen(),
-        label(10),
         vec![instr_stmt(py_stmt!("prefix = 0"))],
         instr_expr(py_expr!("flag")),
         &then_body.iter().cloned().map(instr_stmt).collect::<Vec<_>>(),
@@ -639,7 +638,7 @@ fn if_stmt_helper_lowers_both_branches_via_callback() {
         },
     );
 
-    assert_eq!(entry, label(10));
+    assert!(blocks.iter().any(|block| block.label == entry), "{blocks:#?}");
     assert_eq!(
         calls
             .into_iter()
@@ -661,7 +660,6 @@ fn if_stmt_helper_lowers_if_expr_test_via_inline_fragment() {
         &context,
         &mut blocks,
         &name_gen,
-        label(10),
         vec![instr_stmt(py_stmt!("prefix = 0"))],
         instr_expr(py_expr!("left if cond else right")),
         &vec![instr_stmt(py_stmt!("x = 1"))],
@@ -671,9 +669,17 @@ fn if_stmt_helper_lowers_if_expr_test_via_inline_fragment() {
         &mut |_stmts: &[InstrRuff], _targets: RegionTargets, _blocks: &mut Vec<TestBlock>| label(200),
     );
 
-    assert_eq!(entry, label(10));
+    assert!(blocks.iter().any(|block| block.label == entry), "{blocks:#?}");
+    let setup_label = blocks
+        .iter()
+        .find_map(|block| match &block.term {
+            BlockTerm::Jump(BlockEdge { target, args }) if block.label == entry && args.is_empty() => {
+                Some(*target)
+            }
+            _ => None,
+        })
+        .expect("entry should be a linear prefix jump into the lowered setup");
     assert_eq!(blocks.len(), 5);
-    let setup_label = blocks[0].label;
     let if_labels = blocks
         .iter()
         .filter_map(|block| match block.term {
@@ -719,7 +725,6 @@ fn if_stmt_helper_lowers_boolop_test_via_inline_fragment() {
         &context,
         &mut blocks,
         &name_gen,
-        label(10),
         vec![instr_stmt(py_stmt!("prefix = 0"))],
         instr_expr(py_expr!("left and right")),
         &vec![instr_stmt(py_stmt!("x = 1"))],
@@ -729,20 +734,36 @@ fn if_stmt_helper_lowers_boolop_test_via_inline_fragment() {
         &mut |_stmts: &[InstrRuff], _targets: RegionTargets, _blocks: &mut Vec<TestBlock>| label(200),
     );
 
-    assert_eq!(entry, label(10));
+    assert!(blocks.iter().any(|block| block.label == entry), "{blocks:#?}");
     assert_eq!(blocks.len(), 4);
-    assert!(matches!(blocks[0].term, BlockTerm::IfTerm(_)));
-    assert!(matches!(
-        blocks[1].term,
+    let setup_label = blocks
+        .iter()
+        .find_map(|block| match &block.term {
+            BlockTerm::Jump(BlockEdge { target, args }) if block.label == entry && args.is_empty() => {
+                Some(*target)
+            }
+            _ => None,
+        })
+        .expect("entry should jump to the first short-circuit test block");
+    assert!(blocks
+        .iter()
+        .find(|block| block.label == setup_label)
+        .is_some_and(|block| matches!(block.term, BlockTerm::IfTerm(_))), "{blocks:#?}");
+    let second_if_label = blocks
+        .iter()
+        .find(|block| block.label != setup_label && matches!(block.term, BlockTerm::IfTerm(_)))
+        .map(|block| block.label)
+        .expect("second if block should exist");
+    assert!(blocks.iter().any(|block| matches!(
+        block.term,
         BlockTerm::Jump(BlockEdge { target, ref args })
-            if target == blocks[2].label && args.is_empty()
-    ));
-    assert!(matches!(blocks[2].term, BlockTerm::IfTerm(_)));
-    assert!(matches!(
-        blocks[3].term,
+            if target == second_if_label && args.is_empty()
+    )), "{blocks:#?}");
+    assert!(blocks.iter().any(|block| matches!(
+        block.term,
         BlockTerm::Jump(BlockEdge { target, ref args })
-            if target == blocks[0].label && args.is_empty()
-    ));
+            if target == setup_label && args.is_empty()
+    )), "{blocks:#?}");
 }
 
 #[test]
@@ -755,7 +776,6 @@ fn if_stmt_helper_lowers_compare_chain_test_via_inline_fragment() {
         &context,
         &mut blocks,
         &name_gen,
-        label(10),
         vec![instr_stmt(py_stmt!("prefix = 0"))],
         instr_expr(py_expr!("a < b < c")),
         &vec![instr_stmt(py_stmt!("x = 1"))],
@@ -765,20 +785,36 @@ fn if_stmt_helper_lowers_compare_chain_test_via_inline_fragment() {
         &mut |_stmts: &[InstrRuff], _targets: RegionTargets, _blocks: &mut Vec<TestBlock>| label(200),
     );
 
-    assert_eq!(entry, label(10));
+    assert!(blocks.iter().any(|block| block.label == entry), "{blocks:#?}");
     assert_eq!(blocks.len(), 4);
-    assert!(matches!(blocks[0].term, BlockTerm::IfTerm(_)));
-    assert!(matches!(
-        blocks[1].term,
+    let setup_label = blocks
+        .iter()
+        .find_map(|block| match &block.term {
+            BlockTerm::Jump(BlockEdge { target, args }) if block.label == entry && args.is_empty() => {
+                Some(*target)
+            }
+            _ => None,
+        })
+        .expect("entry should jump to the first compare-test block");
+    assert!(blocks
+        .iter()
+        .find(|block| block.label == setup_label)
+        .is_some_and(|block| matches!(block.term, BlockTerm::IfTerm(_))), "{blocks:#?}");
+    let second_if_label = blocks
+        .iter()
+        .find(|block| block.label != setup_label && matches!(block.term, BlockTerm::IfTerm(_)))
+        .map(|block| block.label)
+        .expect("second if block should exist");
+    assert!(blocks.iter().any(|block| matches!(
+        block.term,
         BlockTerm::Jump(BlockEdge { target, ref args })
-            if target == blocks[2].label && args.is_empty()
-    ));
-    assert!(matches!(blocks[2].term, BlockTerm::IfTerm(_)));
-    assert!(matches!(
-        blocks[3].term,
+            if target == second_if_label && args.is_empty()
+    )), "{blocks:#?}");
+    assert!(blocks.iter().any(|block| matches!(
+        block.term,
         BlockTerm::Jump(BlockEdge { target, ref args })
-            if target == blocks[0].label && args.is_empty()
-    ));
+            if target == setup_label && args.is_empty()
+    )), "{blocks:#?}");
 }
 
 #[test]
@@ -790,13 +826,12 @@ fn sequence_jump_helper_emits_jump_block() {
         &context,
         &mut blocks,
         &name_gen,
-        label(10),
         vec![instr_stmt(py_stmt!("prefix = 0"))],
         label(11),
         None,
     );
 
-    assert_eq!(entry, label(10));
+    assert!(blocks.iter().any(|block| block.label == entry), "{blocks:#?}");
     assert_eq!(blocks.len(), 1);
     assert!(matches!(
         &blocks[0].term,
@@ -813,14 +848,13 @@ fn sequence_return_helper_emits_return_block() {
             &context,
             &mut blocks,
             &test_name_gen(),
-            label(10),
             vec![instr_stmt(py_stmt!("prefix = 0"))],
             Some(instr_expr(py_expr!("value"))),
             None,
         )
         .expect("sequence return helper should lower");
 
-    assert_eq!(entry, label(10));
+    assert!(blocks.iter().any(|block| block.label == entry), "{blocks:#?}");
     assert_eq!(blocks.len(), 1);
     assert!(matches!(blocks[0].term, BlockTerm::Return(_)));
 }
@@ -834,7 +868,6 @@ fn sequence_raise_helper_emits_raise_block() {
             &context,
             &mut blocks,
             &test_name_gen(),
-            label(10),
             vec![instr_stmt(py_stmt!("prefix = 0"))],
             TermRaise {
                 exc: Some(InstrRuff::from_ast_expr(py_expr!("exc"))),
@@ -843,7 +876,7 @@ fn sequence_raise_helper_emits_raise_block() {
         )
         .expect("sequence raise helper should lower");
 
-    assert_eq!(entry, label(10));
+    assert!(blocks.iter().any(|block| block.label == entry), "{blocks:#?}");
     assert_eq!(blocks.len(), 1);
     assert!(matches!(
         blocks[0].term,
@@ -861,16 +894,14 @@ fn sequence_return_helper_lowers_boolop_via_inline_fragment() {
             &context,
             &mut blocks,
             &name_gen,
-            label(10),
             vec![instr_stmt(py_stmt!("prefix = 0"))],
             Some(instr_expr(py_expr!("lhs() and rhs()"))),
             None,
         )
         .expect("sequence return helper should lower");
 
-    assert_eq!(entry, label(10));
+    assert!(blocks.iter().any(|block| block.label == entry), "{blocks:#?}");
     assert!(blocks.len() > 1, "{blocks:#?}");
-    assert_eq!(blocks[0].label, label(10));
     assert!(blocks.iter().any(|block| matches!(block.term, BlockTerm::Return(_))));
 }
 
@@ -884,7 +915,6 @@ fn sequence_raise_helper_lowers_compare_chain_via_inline_fragment() {
             &context,
             &mut blocks,
             &name_gen,
-            label(10),
             vec![instr_stmt(py_stmt!("prefix = 0"))],
             TermRaise {
                 exc: Some(InstrRuff::from_ast_expr(py_expr!("a() < b() < c()"))),
@@ -893,13 +923,95 @@ fn sequence_raise_helper_lowers_compare_chain_via_inline_fragment() {
         )
         .expect("sequence raise helper should lower");
 
-    assert_eq!(entry, label(10));
+    assert!(blocks.iter().any(|block| block.label == entry), "{blocks:#?}");
     assert!(blocks.len() > 1, "{blocks:#?}");
-    assert_eq!(blocks[0].label, label(10));
     assert!(blocks.iter().any(|block| matches!(
         block.term,
         BlockTerm::Raise(TermRaise { exc: Some(_) })
     )));
+}
+
+fn assert_all_block_targets_present<E: Instr>(blocks: &[Block<E, E>]) {
+    let labels = blocks
+        .iter()
+        .map(|block| block.label)
+        .collect::<std::collections::HashSet<_>>();
+    for block in blocks {
+        let check = |target: BlockLabel, kind: &str| {
+            assert!(
+                target.is_fallthrough() || labels.contains(&target),
+                "dangling {kind} from {} to {} in {blocks:#?}",
+                block.label,
+                target,
+            );
+        };
+        match &block.term {
+            BlockTerm::Jump(edge) => check(edge.target, "jump"),
+            BlockTerm::IfTerm(if_term) => {
+                check(if_term.then_label, "then");
+                check(if_term.else_label, "else");
+            }
+            BlockTerm::BranchTable(branch) => {
+                for target in &branch.targets {
+                    check(*target, "branch");
+                }
+                check(branch.default_label, "branch default");
+            }
+            BlockTerm::Raise(_) | BlockTerm::Return(_) => {}
+        }
+        if let Some(edge) = &block.exc_edge {
+            check(edge.target, "exception");
+        }
+    }
+}
+
+#[test]
+fn sequence_return_helper_keeps_direct_if_expr_setup_reachable_after_linear_prefix() {
+    let mut blocks = Vec::new();
+    let context = Context::new("");
+    let name_gen = test_name_gen();
+    let entry =
+        emit_sequence_return_block_with_expr_setup_and_expr::<InstrWithAwaitAndYield>(
+            &context,
+            &mut blocks,
+            &name_gen,
+            vec![instr_stmt(py_stmt!("prefix = 0"))],
+            Some(instr_expr(py_expr!("value if cond else other"))),
+            None,
+        )
+        .expect("sequence return helper should lower");
+
+    assert!(blocks.iter().any(|block| block.label == entry), "{blocks:#?}");
+    assert!(blocks.len() > 1, "{blocks:#?}");
+    assert!(blocks.iter().any(|block| matches!(block.term, BlockTerm::Return(_))));
+    assert_all_block_targets_present(&blocks);
+}
+
+#[test]
+fn sequence_raise_helper_keeps_direct_if_expr_setup_reachable_after_linear_prefix() {
+    let mut blocks = Vec::new();
+    let context = Context::new("");
+    let name_gen = test_name_gen();
+    let entry =
+        emit_sequence_raise_block_with_expr_setup_and_expr::<InstrWithAwaitAndYield>(
+            &context,
+            &mut blocks,
+            &name_gen,
+            vec![instr_stmt(py_stmt!("prefix = 0"))],
+            TermRaise {
+                exc: Some(InstrRuff::from_ast_expr(py_expr!("value if cond else other"))),
+            },
+            None,
+        )
+        .expect("sequence raise helper should lower");
+
+    assert!(blocks.iter().any(|block| block.label == entry), "{blocks:#?}");
+    assert!(blocks.len() > 1, "{blocks:#?}");
+    assert!(blocks.iter().any(|block| matches!(
+        block.term,
+        BlockTerm::Raise(TermRaise { exc: Some(_) })
+    )));
+    assert_all_block_targets_present(&blocks);
 }
 
 #[test]
@@ -930,7 +1042,7 @@ fn inline_fragment_helper_splices_fallthrough_into_entry_and_deps() {
         None,
     );
 
-    assert_eq!(entry, blocks[0].label);
+    assert_eq!(entry.label(), blocks[0].label);
     assert_eq!(blocks.len(), 2);
     assert!(matches!(
         blocks[0].term,
@@ -977,14 +1089,21 @@ y = 3
         RegionTargets::new(label(99), None),
         vec![instr_stmt(py_stmt!("prefix = 0"))],
         &mut blocks,
-        label(10),
         &mut |stmts: &[InstrRuff], targets: RegionTargets, _blocks: &mut Vec<TestBlock>| {
             calls.push((stmts.len(), targets.normal_cont.clone()));
             label(200 + calls.len() as u32)
         },
     );
 
-    assert_eq!(entry, label(10));
+    let fragment_label = blocks
+        .iter()
+        .find_map(|block| match &block.term {
+            BlockTerm::Jump(BlockEdge { target, args }) if block.label == entry && args.is_empty() => {
+                Some(*target)
+            }
+            _ => None,
+        })
+        .expect("entry should be a linear prefix jump into the lowered if fragment");
     assert_eq!(
         calls
             .into_iter()
@@ -993,8 +1112,11 @@ y = 3
         vec![(remaining.len(), label(99))]
     );
     assert_eq!(blocks.len(), 4);
-    let fragment_label = blocks[0].label;
-    assert!(matches!(blocks[0].term, BlockTerm::IfTerm(_)));
+    assert!(blocks.iter().any(|block| block.label == entry), "{blocks:#?}");
+    assert!(blocks
+        .iter()
+        .find(|block| block.label == fragment_label)
+        .is_some_and(|block| matches!(block.term, BlockTerm::IfTerm(_))), "{blocks:#?}");
     let jump_targets = blocks
         .iter()
         .filter_map(|block| match &block.term {
@@ -1051,14 +1173,13 @@ done = 1
         RegionTargets::new(label(99), None),
         vec![instr_stmt(py_stmt!("prefix = 0"))],
         &mut blocks,
-        label(10),
         &mut |stmts: &[InstrRuff], targets: RegionTargets, _blocks: &mut Vec<TestBlock>| {
             calls.push((stmts.len(), targets.normal_cont.clone()));
             label(200 + calls.len() as u32)
         },
     );
 
-    assert_eq!(entry, label(10));
+    assert!(blocks.iter().any(|block| block.label == entry), "{blocks:#?}");
     assert_eq!(
         calls
             .into_iter()
@@ -1185,7 +1306,8 @@ fn while_stmt_helper_lowers_boolop_test_via_inline_fragment() {
         vec![(body.len(), test_label, label(201))]
     );
     assert!(blocks.len() > 2, "{blocks:#?}");
-    assert_eq!(blocks[0].label, test_label);
+    assert!(blocks.iter().any(|block| block.label == test_label), "{blocks:#?}");
+    assert!(blocks.iter().any(|block| block.label == linear_label), "{blocks:#?}");
     assert!(blocks.iter().any(|block| block.label != test_label && block.label != linear_label));
 }
 
@@ -1244,7 +1366,8 @@ fn while_stmt_helper_lowers_compare_chain_test_via_inline_fragment() {
         vec![(body.len(), test_label, label(201))]
     );
     assert!(blocks.len() > 2, "{blocks:#?}");
-    assert_eq!(blocks[0].label, test_label);
+    assert!(blocks.iter().any(|block| block.label == test_label), "{blocks:#?}");
+    assert!(blocks.iter().any(|block| block.label == linear_label), "{blocks:#?}");
     assert!(blocks.iter().any(|block| block.label != test_label && block.label != linear_label));
 }
 

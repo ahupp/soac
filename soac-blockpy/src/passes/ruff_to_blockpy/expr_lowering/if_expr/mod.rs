@@ -68,7 +68,6 @@ pub(crate) fn try_lower_if_expr_direct<L, E>(
         Ok(value) => value,
         Err(err) => return Some(Err(err)),
     };
-    let mut body_fragment = body_entry.finish_fallthrough();
  
      let Some(orelse_setup) = bridge.try_lower_inline_value::<E, InstrRuff>(
          name_gen,
@@ -86,31 +85,28 @@ pub(crate) fn try_lower_if_expr_direct<L, E>(
         Ok(value) => value,
         Err(err) => return Some(Err(err)),
     };
-    let mut orelse_fragment = orelse_entry.finish_fallthrough();
- 
-     let then_label = name_gen.next_block_name();
-     let else_label = name_gen.next_block_name();
+
+     let then_label = body_entry.entry_ref().label();
+     let else_label = orelse_entry.entry_ref().label();
      entry.set_term(BlockTerm::IfTerm(TermIf {
          test: E::from_lowered_expr(test),
          then_label,
          else_label,
      }));
- 
-    body_fragment.relabel_entry(then_label);
-    orelse_fragment.relabel_entry(else_label);
 
-    let mut deps = Vec::new();
-    deps.push(body_fragment.entry);
-    deps.extend(body_fragment.deps);
-    deps.push(orelse_fragment.entry);
-    deps.extend(orelse_fragment.deps);
-
-    let mut setup = entry.finish_fallthrough();
-    setup.relabel_entry(name_gen.next_block_name());
-    setup.deps.extend(deps);
+    let (setup_entry_ref, mut deps) = entry.finish_blocks();
+    let (_, mut body_blocks) = body_entry.finish_fallthrough_blocks();
+    let (_, mut orelse_blocks) = orelse_entry.finish_fallthrough_blocks();
+    deps.append(&mut body_blocks);
+    deps.append(&mut orelse_blocks);
+    let setup_entry_index = deps
+        .iter()
+        .position(|block| block.label == setup_entry_ref.label())
+        .expect("if-expression setup entry label should be present in assembled blocks");
+    let setup_entry = deps.remove(setup_entry_index);
 
     Some(Ok(LoweredExpr {
-        setup: InlineFragment::new(setup.entry, setup.deps),
+        setup: InlineFragment::new(setup_entry, deps),
         value: load_name(&target),
     }))
 }

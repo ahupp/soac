@@ -139,7 +139,6 @@ where
                 context,
                 blocks,
                 name_gen,
-                next_label(),
                 linear,
                 compat_blockpy_raise_from_instr(raise_stmt),
                 targets.active_exc.as_ref(),
@@ -153,7 +152,6 @@ where
                 context,
                 blocks,
                 name_gen,
-                next_label(),
                 linear,
                 Some(value),
                 targets.active_exc.as_ref(),
@@ -170,7 +168,6 @@ where
             targets,
             linear,
             blocks,
-            next_label(),
             &mut |stmts, targets, blocks| lower_sequence(stmts, targets, blocks),
         )),
         StmtSequenceHeadPlan::While(while_stmt) => {
@@ -198,7 +195,6 @@ where
                     context,
                     blocks,
                     name_gen,
-                    next_label(),
                     linear,
                     loop_labels.break_label,
                     targets.active_exc.as_ref(),
@@ -210,7 +206,6 @@ where
                     context,
                     blocks,
                     name_gen,
-                    next_label(),
                     linear,
                     loop_labels.continue_label,
                     targets.active_exc.as_ref(),
@@ -295,12 +290,10 @@ where
         let plan;
         (linear, index, plan) = match drive_instr_sequence_until_control(context, &stmts[index..], linear) {
             InstrSequenceDriveResult::Exhausted { linear } => {
-                let label = name_gen.next_block_name();
                 return emit_sequence_jump_block(
                     context,
                     blocks,
                     name_gen,
-                    label,
                     linear,
                     targets.normal_cont.clone(),
                     targets.active_exc.as_ref(),
@@ -482,12 +475,10 @@ where
         }
     }
 
-    let label = name_gen.next_block_name();
     emit_sequence_jump_block(
         context,
         blocks,
         name_gen,
-        label,
         linear,
         targets.normal_cont,
         targets.active_exc.as_ref(),
@@ -532,7 +523,6 @@ pub(crate) fn lower_if_stmt_sequence<F, E>(
     context: &Context,
     blocks: &mut Vec<LoweredBlockPyBlock<E>>,
     name_gen: &FunctionNameGen,
-    label: BlockLabel,
     linear: Vec<InstrRuff>,
     test: InstrRuff,
     then_body: &[InstrRuff],
@@ -567,7 +557,6 @@ where
         context,
         blocks,
         name_gen,
-        label,
         linear,
         test,
         then_entry,
@@ -585,7 +574,6 @@ pub(crate) fn lower_if_stmt_sequence_from_stmt<F, E>(
     targets: RegionTargets,
     linear: Vec<InstrRuff>,
     blocks: &mut Vec<LoweredBlockPyBlock<E>>,
-    label: BlockLabel,
     lower_region: &mut F,
 ) -> BlockLabel
 where
@@ -597,15 +585,12 @@ where
         continue_label: loop_labels.continue_label.clone(),
         break_label: loop_labels.break_label.clone(),
     });
-    if let Some(Ok(mut fragment)) = stmt_lowering::try_lower_if_instr_fragment::<E>(
+    if let Some(Ok(fragment)) = stmt_lowering::try_lower_if_instr_fragment::<E>(
         context,
         name_gen,
         &if_stmt,
         loop_ctx.as_ref(),
     ) {
-        if linear.is_empty() {
-            fragment.relabel_entry(label);
-        }
         let fragment_entry = emit_inline_fragment_with_exc_target_and_expr(
             blocks,
             fragment,
@@ -613,15 +598,14 @@ where
             targets.active_exc.as_ref(),
         );
         if linear.is_empty() {
-            return fragment_entry;
+            return fragment_entry.label();
         }
         return emit_sequence_jump_block(
             context,
             blocks,
             name_gen,
-            label,
             linear,
-            fragment_entry,
+            fragment_entry.label(),
             targets.active_exc.as_ref(),
         );
     }
@@ -632,7 +616,6 @@ where
         context,
         blocks,
         name_gen,
-        label,
         linear,
         *if_stmt.test,
         &then_body,

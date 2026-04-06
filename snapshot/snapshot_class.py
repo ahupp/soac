@@ -17,23 +17,23 @@ class C:
 
 # function C.__annotate_func__(_dp_format, __soac__):
 #     function_id: 0:2
-#     block bb1:
+#     block bb5:
 #         if_term eq(_dp_format, 4):
 #             then:
-#                 block bb15:
+#                 block bb6:
 #                     return dict(tuple_values(tuple_values("x", "int")))
 #             else:
-#                 block bb16:
+#                 block bb7:
 #                     jump bb2
 #                     block bb2:
 #                         if_term gt(_dp_format, 2):
 #                             then:
-#                                 block bb9:
+#                                 block bb3:
 #                                     raise GetAttr(builtins, "NotImplementedError")
 #                             else:
-#                                 block bb10:
-#                                     jump bb3
-#                                     block bb3:
+#                                 block bb4:
+#                                     jump bb1
+#                                     block bb1:
 #                                         return dict(tuple_values(tuple_values("x", int)))
 
 # function _dp_class_ns_C(_dp_class_ns, _dp_classcell_arg):

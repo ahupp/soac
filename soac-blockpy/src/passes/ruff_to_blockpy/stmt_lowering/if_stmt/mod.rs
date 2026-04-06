@@ -126,7 +126,6 @@ where
         return Err("if-test setup still requires structured lowering".to_string());
     };
     let (mut entry, test) = test_setup?;
-    let entry_label = name_gen.next_block_name();
 
     let Some(body_setup) =
         lower_nested_body_to_inline_fragment(
@@ -153,32 +152,26 @@ where
     };
     let orelse_setup = orelse_setup?;
 
-    let then_label = name_gen.next_block_name();
-    let else_label = name_gen.next_block_name();
+    let then_label = body_setup.entry_ref().label();
+    let else_label = orelse_setup.entry_ref().label();
     entry.set_term(BlockTerm::IfTerm(TermIf {
         test,
         then_label,
         else_label,
     }));
 
-    let (fragment_entry_label, mut blocks) = entry.finish_blocks();
-    let mut body_setup = body_setup;
-    body_setup.relabel_entry(then_label);
+    let (fragment_entry_ref, mut blocks) = entry.finish_blocks();
     blocks.push(body_setup.entry);
     blocks.extend(body_setup.deps);
-    let mut orelse_setup = orelse_setup;
-    orelse_setup.relabel_entry(else_label);
     blocks.push(orelse_setup.entry);
     blocks.extend(orelse_setup.deps);
 
     let entry_index = blocks
         .iter()
-        .position(|block| block.label == fragment_entry_label)
+        .position(|block| block.label == fragment_entry_ref.label())
         .expect("if fragment entry label should be present in assembled blocks");
     let entry = blocks.remove(entry_index);
-    let mut fragment = InlineFragment::new(entry, blocks);
-    fragment.relabel_entry(entry_label);
-    Ok(fragment)
+    Ok(InlineFragment::new(entry, blocks))
 }
 
 fn lower_simplified_if_instr_fragment<E>(
@@ -201,7 +194,6 @@ where
         return Err("if-test setup still requires structured lowering".to_string());
     };
     let (mut entry, test) = test_setup?;
-    let entry_label = name_gen.next_block_name();
 
     let Some(body_setup) = lower_nested_instr_body_to_inline_fragment(
         context,
@@ -225,32 +217,26 @@ where
     };
     let orelse_setup = orelse_setup?;
 
-    let then_label = name_gen.next_block_name();
-    let else_label = name_gen.next_block_name();
+    let then_label = body_setup.entry_ref().label();
+    let else_label = orelse_setup.entry_ref().label();
     entry.set_term(BlockTerm::IfTerm(TermIf {
         test,
         then_label,
         else_label,
     }));
 
-    let (fragment_entry_label, mut blocks) = entry.finish_blocks();
-    let mut body_setup = body_setup;
-    body_setup.relabel_entry(then_label);
+    let (fragment_entry_ref, mut blocks) = entry.finish_blocks();
     blocks.push(body_setup.entry);
     blocks.extend(body_setup.deps);
-    let mut orelse_setup = orelse_setup;
-    orelse_setup.relabel_entry(else_label);
     blocks.push(orelse_setup.entry);
     blocks.extend(orelse_setup.deps);
 
     let entry_index = blocks
         .iter()
-        .position(|block| block.label == fragment_entry_label)
+        .position(|block| block.label == fragment_entry_ref.label())
         .expect("if fragment entry label should be present in assembled blocks");
     let entry = blocks.remove(entry_index);
-    let mut fragment = InlineFragment::new(entry, blocks);
-    fragment.relabel_entry(entry_label);
-    Ok(fragment)
+    Ok(InlineFragment::new(entry, blocks))
 }
 
 #[allow(dead_code)]

@@ -98,10 +98,14 @@ fn stmt_break_to_blockpy_uses_loop_jump() {
     lower_instr_for_test(&context, &break_stmt, &name_gen, &mut out, Some(&loop_ctx))
         .expect("break lowering should succeed");
 
-    let fragment = out.finish();
+    let (entry_ref, blocks) = out.finish_blocks();
+    let entry = blocks
+        .iter()
+        .find(|block| block.label == entry_ref.label())
+        .expect("break entry block should be present");
 
     assert!(matches!(
-        fragment.entry.term,
+        entry.term,
         BlockTerm::Jump(BlockEdge { target, ref args })
             if target == BlockLabel::from_index(9) && args.is_empty()
     ));
