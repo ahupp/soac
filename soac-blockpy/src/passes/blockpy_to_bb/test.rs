@@ -32,7 +32,7 @@ fn core_call_expr(name: &str, args: Vec<InstrResolved>) -> InstrResolved {
 
 #[test]
 fn rewrites_current_exception_placeholders_in_final_core_blocks() {
-    let block: Block<InstrResolved, InstrResolved> = Block {
+    let block: Block<InstrResolved> = Block {
         label: BlockLabel::from_index(0),
         body: vec![core_call_expr("current_exception", Vec::new())],
         term: BlockTerm::Return(core_call_expr("current_exception", Vec::new())),
@@ -66,7 +66,7 @@ fn rewrites_current_exception_placeholders_in_final_core_blocks() {
 
 #[test]
 fn rewrites_current_exception_inside_intrinsic_helper_args() {
-    let block: Block<InstrResolved, InstrResolved> = Block {
+    let block: Block<InstrResolved> = Block {
         label: BlockLabel::from_index(0),
         body: Vec::new(),
         term: BlockTerm::Return(

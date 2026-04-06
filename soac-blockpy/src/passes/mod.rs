@@ -12,19 +12,18 @@ mod trace;
 
 use crate::block_py::{cfg::relabel_blockpy_blocks_dense, BlockPyModule, ImplicitNoneExpr};
 use crate::block_py::{
-    Await, BinOp, BlockPyPass, CalleeFunctionId, Call, CallArgKeyword, CallArgPositional,
-    CallDirect, CellRef, CellRefForName, ChildVisitable, Del, DelItem, ExprAttribute,
+    Await, BinOp, BlockPyPass, Call, CallArgKeyword, CallArgPositional, CallDirect,
+    CalleeFunctionId, CellRef, CellRefForName, ChildVisitable, Del, DelItem, ExprAttribute,
     ExprBoolOp, ExprBooleanLiteral, ExprBytesLiteral, ExprCompare, ExprDict, ExprDictComp,
     ExprEllipsisLiteral, ExprFString, ExprGenerator, ExprIf, ExprIpyEscapeCommand, ExprLambda,
     ExprList, ExprListComp, ExprName, ExprNamed, ExprNoneLiteral, ExprNumberLiteral, ExprSet,
-    ExprSetComp, ExprSlice, ExprStarred, ExprStringLiteral, ExprSubscript, ExprTString,
-    ExprTuple, GetAttr, GetItem, HasMeta, IncrementCounter, Instr, LiteralValue, Load, MakeCell,
-    MakeFunction, MapInstr, Mappable, Meta, NameLike, ResolvedName, SetAttr, SetItem,
-    StmtAnnAssign, StmtAssert, StmtAssign, StmtAugAssign, StmtBreak, StmtClassDef,
-    StmtContinue, StmtDelete, StmtExpr, StmtFor, StmtFunctionDef, StmtGlobal, StmtIf,
-    StmtImport, StmtImportFrom, StmtIpyEscapeCommand, StmtMatch, StmtNonlocal, StmtPass,
-    StmtRaise, StmtReturn, StmtTry, StmtTypeAlias, StmtWhile, StmtWith, Store, TryMapInstr,
-    UnaryOp, UnresolvedName, WithMeta, Yield, YieldFrom,
+    ExprSetComp, ExprSlice, ExprStarred, ExprStringLiteral, ExprSubscript, ExprTString, ExprTuple,
+    GetAttr, GetItem, HasMeta, IncrementCounter, Instr, LiteralValue, Load, MakeCell, MakeFunction,
+    MapInstr, Mappable, Meta, NameLike, ResolvedName, SetAttr, SetItem, StmtAnnAssign, StmtAssert,
+    StmtAssign, StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue, StmtDelete, StmtExpr,
+    StmtFor, StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom, StmtIpyEscapeCommand,
+    StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry, StmtTypeAlias, StmtWhile,
+    StmtWith, Store, TryMapInstr, UnaryOp, UnresolvedName, WithMeta, Yield, YieldFrom,
 };
 use ruff_python_ast::{self as ast};
 use soac_macros::{enum_broadcast, DelegateMatchDefault};
@@ -133,6 +132,10 @@ pub enum InstrCodegen {
     IncrementCounter(IncrementCounter),
     CellRef(CellRef),
     MakeFunction(MakeFunction<Self>),
+}
+
+impl Instr for InstrCodegen {
+    type Name = ResolvedName;
 }
 
 impl InstrRuff {
@@ -1181,6 +1184,10 @@ pub enum InstrWithAwaitAndYield {
     YieldFrom(YieldFrom<Self>),
 }
 
+impl Instr for InstrWithAwaitAndYield {
+    type Name = UnresolvedName;
+}
+
 #[derive(Clone, derive_more::From, DelegateMatchDefault)]
 #[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, Debug)]
 pub enum InstrWithYield {
@@ -1204,6 +1211,10 @@ pub enum InstrWithYield {
     YieldFrom(YieldFrom<Self>),
 }
 
+impl Instr for InstrWithYield {
+    type Name = UnresolvedName;
+}
+
 #[derive(Clone, derive_more::From, DelegateMatchDefault)]
 #[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, Debug)]
 pub enum InstrLow<N: NameLike> {
@@ -1223,6 +1234,10 @@ pub enum InstrLow<N: NameLike> {
     CellRefForName(CellRefForName),
     CellRef(CellRef),
     MakeFunction(MakeFunction<Self>),
+}
+
+impl<N: NameLike> Instr for InstrLow<N> {
+    type Name = N;
 }
 
 pub type InstrUnresolved = InstrLow<UnresolvedName>;

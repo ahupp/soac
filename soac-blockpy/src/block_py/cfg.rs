@@ -7,7 +7,7 @@ use crate::namegen::fresh_name;
 use ruff_python_ast as ast;
 use std::collections::{HashMap, HashSet};
 
-fn blockpy_successors<E: Instr>(block: &Block<E, E>) -> Vec<BlockLabel> {
+fn blockpy_successors<E: Instr>(block: &Block<E>) -> Vec<BlockLabel> {
     match &block.term {
         BlockTerm::Jump(target) => vec![target.target.clone()],
         BlockTerm::IfTerm(if_term) => {
@@ -22,7 +22,7 @@ fn blockpy_successors<E: Instr>(block: &Block<E, E>) -> Vec<BlockLabel> {
     }
 }
 
-pub(crate) fn fold_jumps_to_trivial_none_return_blockpy<E>(blocks: &mut [Block<E, E>])
+pub(crate) fn fold_jumps_to_trivial_none_return_blockpy<E>(blocks: &mut [Block<E>])
 where
     E: Clone + ImplicitNoneExpr + Instr,
 {
@@ -54,7 +54,7 @@ where
 pub(crate) fn prune_unreachable_blockpy_blocks<E: Instr>(
     entry_label: BlockLabel,
     extra_roots: &[BlockLabel],
-    blocks: &mut Vec<Block<E, E>>,
+    blocks: &mut Vec<Block<E>>,
 ) {
     let index_by_label: HashMap<BlockLabel, usize> = blocks
         .iter()
@@ -258,10 +258,7 @@ where
     })
 }
 
-pub(crate) fn relabel_blockpy_blocks_dense<S, T: Instr>(blocks: &mut [Block<S, T>])
-where
-    BlockTerm<T>: RelabelBlockTargets,
-{
+pub(crate) fn relabel_blockpy_blocks_dense<I: Instr>(blocks: &mut [Block<I>]) {
     let relabel = blocks
         .iter()
         .enumerate()

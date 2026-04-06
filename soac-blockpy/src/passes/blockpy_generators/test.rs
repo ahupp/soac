@@ -56,7 +56,7 @@ fn build_closure_backed_generator_factory_block(
     _layout: &StorageLayout,
     is_coroutine: bool,
     is_async_generator: bool,
-) -> Block<InstrRuff, InstrRuff> {
+) -> Block<InstrRuff> {
     let resume_entry = py_expr!(
         "__dp_make_function({function_id:literal}, \"function\", __dp_tuple(), __dp_tuple(), None)",
         function_id = resume_function_id.packed(),

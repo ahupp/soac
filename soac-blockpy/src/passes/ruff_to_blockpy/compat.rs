@@ -28,7 +28,7 @@ where
 }
 
 fn with_exc_meta<E: Instr>(
-    mut block: crate::block_py::Block<E, E>,
+    mut block: crate::block_py::Block<E>,
     exc_target: Option<&BlockLabel>,
 ) -> LoweredBlockPyBlock<E> {
     block.exc_edge = exc_target.cloned().map(crate::block_py::BlockEdge::new);
@@ -36,7 +36,7 @@ fn with_exc_meta<E: Instr>(
 }
 
 fn compat_block_from_inline_with_exc_target_and_expr<E>(
-    mut block: Block<E, E>,
+    mut block: Block<E>,
     fallthrough_target: BlockLabel,
     exc_target: Option<&BlockLabel>,
 ) -> LoweredBlockPyBlock<E>

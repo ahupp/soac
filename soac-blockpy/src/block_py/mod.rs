@@ -332,25 +332,25 @@ pub enum FunctionKind {
 }
 
 #[derive(Debug, Clone)]
-pub struct Block<S, T: Instr = S> {
+pub struct Block<I: Instr> {
     pub label: BlockLabel,
-    pub body: Vec<S>,
-    pub term: BlockTerm<T>,
+    pub body: Vec<I>,
+    pub term: BlockTerm<I>,
     pub params: Vec<BlockParam>,
     pub exc_edge: Option<BlockEdge>,
 }
 
-impl<S, T: Instr> Block<S, T> {
+impl<I: Instr> Block<I> {
     pub fn label_str(&self) -> String {
         self.label.to_string()
     }
 }
 
-impl<S: NormalizedInstr, T: Instr> Block<S, T> {
+impl<I: NormalizedInstr + Instr> Block<I> {
     pub fn new(
         label: BlockLabel,
-        body: Vec<S>,
-        term: BlockTerm<T>,
+        body: Vec<I>,
+        term: BlockTerm<I>,
         params: Vec<BlockParam>,
         exc_edge: Option<BlockEdge>,
     ) -> Self {
@@ -366,23 +366,23 @@ impl<S: NormalizedInstr, T: Instr> Block<S, T> {
     }
 }
 
-impl<S: NormalizedInstr, T: Instr> Block<S, T>
-where
-    BlockTerm<T>: BlockPyFallthroughTerm,
-{
-    pub fn from_builder(
+impl<I: NormalizedInstr + Instr> Block<I> {
+    pub(crate) fn from_builder(
         label: BlockLabel,
-        builder: BlockBuilder<S, BlockTerm<T>>,
+        builder: BlockBuilder<I>,
         params: Vec<BlockParam>,
         exc_edge: Option<BlockEdge>,
         fallthrough_target: Option<BlockLabel>,
-    ) -> Self {
+    ) -> Self
+    where
+        I: ImplicitNoneExpr,
+    {
         Self::new(
             label,
             builder.body,
             builder.term.unwrap_or_else(|| match fallthrough_target {
-                Some(target) => BlockTerm::<T>::jump_term(target),
-                None => BlockTerm::<T>::implicit_function_return(),
+                Some(target) => BlockTerm::<I>::jump_term(target),
+                None => BlockTerm::<I>::implicit_function_return(),
             }),
             params,
             exc_edge,
@@ -390,7 +390,7 @@ where
     }
 }
 
-impl<S, T: Instr> Block<S, T> {
+impl<I: Instr> Block<I> {
     pub fn ensure_param(&mut self, name: impl Into<String>, role: BlockParamRole) {
         let name = name.into();
         if self.params.iter().any(|param| param.name == name) {
@@ -448,19 +448,19 @@ impl<S, T: Instr> Block<S, T> {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct BlockPyModule<P: BlockPyPass, S = <P as BlockPyPass>::Instr> {
+pub struct BlockPyModule<P: BlockPyPass> {
     pub module_name_gen: ModuleNameGen,
     pub global_names: Vec<String>,
-    pub callable_defs: Vec<BlockPyFunction<P, S>>,
+    pub callable_defs: Vec<BlockPyFunction<P>>,
     pub module_constants: Vec<InstrLow<ResolvedName>>,
     pub counter_defs: Vec<CounterDef>,
 }
 
-impl<P: BlockPyPass, S> BlockPyModule<P, S> {
-    pub fn map_callable_defs<Q: BlockPyPass, T>(
+impl<P: BlockPyPass> BlockPyModule<P> {
+    pub fn map_callable_defs<Q: BlockPyPass>(
         self,
-        mut f: impl FnMut(BlockPyFunction<P, S>) -> BlockPyFunction<Q, T>,
-    ) -> BlockPyModule<Q, T> {
+        mut f: impl FnMut(BlockPyFunction<P>) -> BlockPyFunction<Q>,
+    ) -> BlockPyModule<Q> {
         debug_assert!(
             self.module_constants.is_empty(),
             "map_callable_defs does not preserve module constants"
@@ -575,22 +575,6 @@ impl fmt::Debug for NumberLiteralValue {
             Self::Float(value) => write!(f, "{value:?}"),
         }
     }
-}
-
-impl Instr for InstrWithAwaitAndYield {
-    type Name = UnresolvedName;
-}
-
-impl Instr for InstrWithYield {
-    type Name = UnresolvedName;
-}
-
-impl<N: NameLike> Instr for InstrLow<N> {
-    type Name = N;
-}
-
-impl Instr for InstrCodegen {
-    type Name = ResolvedName;
 }
 
 pub(crate) fn core_call_expr_with_meta<E>(
@@ -783,19 +767,19 @@ impl FunctionName {
 }
 
 #[derive(Debug)]
-pub struct BlockPyFunction<P: BlockPyPass, S = <P as BlockPyPass>::Instr> {
+pub struct BlockPyFunction<P: BlockPyPass> {
     pub function_id: FunctionId,
     pub name_gen: FunctionNameGen,
     pub names: FunctionName,
     pub kind: FunctionKind,
     pub params: ParamSpec,
-    pub blocks: Vec<Block<S, P::Instr>>,
+    pub blocks: Vec<Block<P::Instr>>,
     pub doc: Option<String>,
     pub storage_layout: Option<StorageLayout>,
     pub scope: CallableScopeInfo,
 }
 
-impl<P: BlockPyPass, S: Clone> Clone for BlockPyFunction<P, S> {
+impl<P: BlockPyPass> Clone for BlockPyFunction<P> {
     fn clone(&self) -> Self {
         Self {
             function_id: self.function_id,
@@ -813,7 +797,7 @@ impl<P: BlockPyPass, S: Clone> Clone for BlockPyFunction<P, S> {
     }
 }
 
-impl<P: BlockPyPass, S> BlockPyFunction<P, S> {
+impl<P: BlockPyPass> BlockPyFunction<P> {
     pub fn lowered_kind(&self) -> &FunctionKind {
         &self.kind
     }
@@ -822,16 +806,16 @@ impl<P: BlockPyPass, S> BlockPyFunction<P, S> {
         &self.storage_layout
     }
 
-    pub fn entry_block(&self) -> &Block<S, P::Instr> {
+    pub fn entry_block(&self) -> &Block<P::Instr> {
         self.blocks
             .first()
             .expect("BlockPyFunction should have at least one block")
     }
 
-    pub fn map_blocks<Q: BlockPyPass, T>(
+    pub fn map_blocks<Q: BlockPyPass>(
         self,
-        mut f: impl FnMut(Block<S, P::Instr>) -> Block<T, Q::Instr>,
-    ) -> BlockPyFunction<Q, T> {
+        mut f: impl FnMut(Block<P::Instr>) -> Block<Q::Instr>,
+    ) -> BlockPyFunction<Q> {
         BlockPyFunction {
             function_id: self.function_id,
             name_gen: self.name_gen,
@@ -873,19 +857,19 @@ pub(crate) trait ImplicitNoneExpr {
     fn is_implicit_none_expr(expr: &Self) -> bool;
 }
 
-pub fn assert_blockpy_block_normalized<S: NormalizedInstr, T: Instr>(block: &Block<S, T>) {
+pub fn assert_blockpy_block_normalized<I: NormalizedInstr + Instr>(block: &Block<I>) {
     for stmt in &block.body {
         stmt.assert_blockpy_normalized();
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct BlockBuilder<S, T> {
-    pub body: Vec<S>,
-    pub term: Option<T>,
+pub struct BlockBuilder<I: Instr> {
+    pub body: Vec<I>,
+    pub term: Option<BlockTerm<I>>,
 }
 
-impl<S: NormalizedInstr, T> BlockBuilder<S, T> {
+impl<I: NormalizedInstr + Instr> BlockBuilder<I> {
     pub fn new() -> Self {
         Self {
             body: Vec::new(),
@@ -899,11 +883,11 @@ impl<S: NormalizedInstr, T> BlockBuilder<S, T> {
         }
     }
 
-    pub fn from_stmts(stmts: Vec<S>) -> Self {
+    pub fn from_stmts(stmts: Vec<I>) -> Self {
         Self::with_term(stmts, None)
     }
 
-    pub fn with_term(body: Vec<S>, term: impl Into<Option<T>>) -> Self {
+    pub fn with_term(body: Vec<I>, term: impl Into<Option<BlockTerm<I>>>) -> Self {
         let builder = BlockBuilder {
             body,
             term: term.into(),
@@ -912,7 +896,7 @@ impl<S: NormalizedInstr, T> BlockBuilder<S, T> {
         builder
     }
 
-    pub fn push_stmt(&mut self, stmt: S) {
+    pub fn push_stmt(&mut self, stmt: I) {
         assert!(
             self.term.is_none(),
             "cannot append structured BlockPy stmt after block-builder terminator"
@@ -921,16 +905,16 @@ impl<S: NormalizedInstr, T> BlockBuilder<S, T> {
         self.body.push(stmt);
     }
 
-    pub fn extend<I>(&mut self, stmts: I)
+    pub fn extend<It>(&mut self, stmts: It)
     where
-        I: IntoIterator<Item = S>,
+        It: IntoIterator<Item = I>,
     {
         for stmt in stmts {
             self.push_stmt(stmt);
         }
     }
 
-    pub fn set_term(&mut self, term: T) {
+    pub fn set_term(&mut self, term: BlockTerm<I>) {
         assert!(
             self.term.is_none(),
             "cannot replace existing block-builder terminator"
@@ -944,13 +928,11 @@ impl<S: NormalizedInstr, T> BlockBuilder<S, T> {
     }
 }
 
-impl<S: NormalizedInstr, T: BlockPyJumpTerm> BlockBuilder<S, T> {
+impl<I: NormalizedInstr + Instr> BlockBuilder<I> {
     pub fn jump(target: BlockLabel) -> Self {
-        Self::with_term(Vec::new(), Some(T::jump_term(target)))
+        Self::with_term(Vec::new(), Some(BlockTerm::jump_term(target)))
     }
-}
 
-impl<S: NormalizedInstr, T: Instr> BlockBuilder<S, BlockTerm<T>> {
     pub fn ensure_fallthrough_term(&mut self) {
         if self.term.is_none() {
             self.set_term(BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())));

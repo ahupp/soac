@@ -111,7 +111,7 @@ pub trait Visit<I: Instr> {
         self.visit_instr(value);
     }
 
-    fn visit_block(&mut self, block: &Block<I, I>)
+    fn visit_block(&mut self, block: &Block<I>)
     where
         I: ChildVisitable<I>,
     {
@@ -205,7 +205,7 @@ pub trait VisitMut<I: Instr> {
         self.visit_instr_mut(value);
     }
 
-    fn visit_block_mut(&mut self, block: &mut Block<I, I>)
+    fn visit_block_mut(&mut self, block: &mut Block<I>)
     where
         I: ChildVisitable<I>,
     {
@@ -288,7 +288,7 @@ where
     }
 }
 
-pub(crate) fn walk_block<V, I>(visitor: &mut V, block: &Block<I, I>)
+pub(crate) fn walk_block<V, I>(visitor: &mut V, block: &Block<I>)
 where
     V: Visit<I> + ?Sized,
     I: Instr + ChildVisitable<I>,
@@ -305,7 +305,7 @@ where
     visitor.visit_term(&block.term);
 }
 
-pub(crate) fn walk_block_mut<V, I>(visitor: &mut V, block: &mut Block<I, I>)
+pub(crate) fn walk_block_mut<V, I>(visitor: &mut V, block: &mut Block<I>)
 where
     V: VisitMut<I> + ?Sized,
     I: Instr + ChildVisitable<I>,

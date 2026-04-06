@@ -3,10 +3,9 @@ use crate::block_py::{
     BlockPyFunction, BlockPyModule, BlockPyPass, BlockTerm, ScopeExprNode,
 };
 
-pub(crate) fn validate_module<P: BlockPyPass, S>(module: &BlockPyModule<P, S>) -> Result<(), String>
+pub(crate) fn validate_module<P: BlockPyPass>(module: &BlockPyModule<P>) -> Result<(), String>
 where
-    P: BlockPyPass<Instr = S>,
-    S: ScopeExprNode + crate::block_py::Instr,
+    P::Instr: ScopeExprNode + crate::block_py::Instr,
 {
     for function in &module.callable_defs {
         validate_function(function)?;
@@ -14,10 +13,9 @@ where
     Ok(())
 }
 
-fn validate_function<P: BlockPyPass, S>(function: &BlockPyFunction<P, S>) -> Result<(), String>
+fn validate_function<P: BlockPyPass>(function: &BlockPyFunction<P>) -> Result<(), String>
 where
-    P: BlockPyPass<Instr = S>,
-    S: ScopeExprNode + crate::block_py::Instr,
+    P::Instr: ScopeExprNode + crate::block_py::Instr,
 {
     let qualname = function.names.qualname.as_str();
     validate_storage_layout_scoping(function, qualname)?;
@@ -107,8 +105,8 @@ where
 }
 
 fn validate_non_exception_edge<P: BlockPyPass, S>(
-    function: &BlockPyFunction<P, S>,
-    source_block: &Block<S, P::Instr>,
+    function: &BlockPyFunction<P>,
+    source_block: &Block<P::Instr>,
     edge: &BlockEdge,
     qualname: &str,
     label_kind: &str,
@@ -134,8 +132,8 @@ where
 }
 
 fn validate_edge_param_forwarding<P: BlockPyPass, S>(
-    source_block: &Block<S, P::Instr>,
-    target_block: &Block<S, P::Instr>,
+    source_block: &Block<P::Instr>,
+    target_block: &Block<P::Instr>,
     explicit_args: &[BlockArg],
     qualname: &str,
     label_kind: &str,
@@ -202,8 +200,8 @@ where
 }
 
 fn validate_explicit_edge_arg<P: BlockPyPass, S>(
-    source_block: &Block<S, P::Instr>,
-    target_block: &Block<S, P::Instr>,
+    source_block: &Block<P::Instr>,
+    target_block: &Block<P::Instr>,
     target_param: &BlockParam,
     source_arg: &BlockArg,
     qualname: &str,
@@ -229,7 +227,7 @@ where
 }
 
 fn validate_storage_layout_scoping<P: BlockPyPass, S>(
-    function: &BlockPyFunction<P, S>,
+    function: &BlockPyFunction<P>,
     qualname: &str,
 ) -> Result<(), String>
 where
@@ -312,7 +310,7 @@ fn lookup_known_block<'a, P: BlockPyPass>(
     qualname: &str,
     block_label: BlockLabel,
     label_kind: &str,
-) -> Result<&'a Block<P::Instr, P::Instr>, String> {
+) -> Result<&'a Block<P::Instr>, String> {
     let Some(target_block) = function.blocks.get(label.index()) else {
         return Err(format!(
             "unknown {label_kind} {label} in {}:{}",

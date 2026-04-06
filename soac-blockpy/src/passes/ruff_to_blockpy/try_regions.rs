@@ -338,7 +338,7 @@ where
 }
 
 fn rewrite_region_returns_to_finally_blockpy<E>(
-    blocks: &mut [Block<E, E>],
+    blocks: &mut [Block<E>],
     finally_target: &BlockLabel,
     payload_name: &str,
 ) where
@@ -447,7 +447,7 @@ where
 }
 
 pub(crate) fn block_references_label<E: Instr>(
-    block: &crate::block_py::Block<E, E>,
+    block: &crate::block_py::Block<E>,
     label: &BlockLabel,
 ) -> bool {
     fn term_references_label<E: Instr>(term: &BlockTerm<E>, label: &BlockLabel) -> bool {

@@ -50,7 +50,7 @@ pub(crate) use try_regions::{
     prepare_except_body, prepare_finally_body, TryPlan,
 };
 
-pub(crate) type LoweredBlockPyBlock<E = Expr> = Block<E, E>;
+pub(crate) type LoweredBlockPyBlock<E = Expr> = Block<E>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct InlineBlockRef(BlockLabel);
@@ -70,8 +70,8 @@ pub(crate) struct InlineBlockBuilder<I: Instr> {
     name_gen: FunctionNameGen,
     entry: InlineBlockRef,
     current_ref: InlineBlockRef,
-    current_block: BlockBuilder<I, BlockTerm<I>>,
-    deps: Vec<Block<I, I>>,
+    current_block: BlockBuilder<I>,
+    deps: Vec<Block<I>>,
 }
 
 impl<I: Instr> InlineBlockBuilder<I> {
@@ -137,7 +137,7 @@ impl<I: Instr> InlineBlockBuilder<I> {
     pub(crate) fn finish_blocks_with_term(
         mut self,
         term: BlockTerm<I>,
-    ) -> (InlineBlockRef, Vec<Block<I, I>>)
+    ) -> (InlineBlockRef, Vec<Block<I>>)
     where
         I: crate::block_py::NormalizedInstr,
     {
@@ -155,7 +155,7 @@ impl<I: Instr> InlineBlockBuilder<I> {
         self.finish_fragment()
     }
 
-    pub(crate) fn finish_fallthrough_blocks(mut self) -> (InlineBlockRef, Vec<Block<I, I>>)
+    pub(crate) fn finish_fallthrough_blocks(mut self) -> (InlineBlockRef, Vec<Block<I>>)
     where
         I: crate::block_py::NormalizedInstr,
     {
@@ -167,7 +167,7 @@ impl<I: Instr> InlineBlockBuilder<I> {
         mut self,
         label: BlockLabel,
         term: BlockTerm<I>,
-    ) -> Option<Block<I, I>>
+    ) -> Option<Block<I>>
     where
         I: crate::block_py::NormalizedInstr,
     {
@@ -239,7 +239,7 @@ impl<I: Instr> InlineBlockBuilder<I> {
         InlineFragment::new(entry, blocks)
     }
 
-    pub(crate) fn finish_blocks(self) -> (InlineBlockRef, Vec<Block<I, I>>)
+    pub(crate) fn finish_blocks(self) -> (InlineBlockRef, Vec<Block<I>>)
     where
         I: crate::block_py::NormalizedInstr,
     {
@@ -288,12 +288,12 @@ where
 
 #[derive(Debug, Clone)]
 pub(crate) struct InlineFragment<I: Instr> {
-    pub entry: Block<I, I>,
-    pub deps: Vec<Block<I, I>>,
+    pub entry: Block<I>,
+    pub deps: Vec<Block<I>>,
 }
 
 impl<I: Instr> InlineFragment<I> {
-    pub(crate) fn new(entry: Block<I, I>, deps: Vec<Block<I, I>>) -> Self {
+    pub(crate) fn new(entry: Block<I>, deps: Vec<Block<I>>) -> Self {
         let fragment = Self { entry, deps };
         fragment.assert_well_formed();
         fragment
@@ -466,10 +466,10 @@ pub(crate) enum StmtSequenceHeadPlan {
     Unsupported,
 }
 
-pub(crate) fn attach_exception_edges_to_blocks<S, E: Instr>(
-    blocks: Vec<Block<S, E>>,
+pub(crate) fn attach_exception_edges_to_blocks<E: Instr>(
+    blocks: Vec<Block<E>>,
     exception_edges: &HashMap<BlockLabel, Option<BlockLabel>>,
-) -> Vec<Block<S, E>> {
+) -> Vec<Block<E>> {
     blocks
         .into_iter()
         .map(|block| Block {
@@ -486,7 +486,7 @@ pub(crate) fn attach_exception_edges_to_blocks<S, E: Instr>(
         .collect()
 }
 
-fn move_entry_block_to_front<S, T: Instr>(blocks: &mut Vec<Block<S, T>>, entry_label: BlockLabel) {
+fn move_entry_block_to_front<I: Instr>(blocks: &mut Vec<Block<I>>, entry_label: BlockLabel) {
     if let Some(entry_index) = blocks.iter().position(|block| block.label == entry_label) {
         if entry_index != 0 {
             let entry_block = blocks.remove(entry_index);

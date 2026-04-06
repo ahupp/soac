@@ -11,8 +11,8 @@ use ruff_python_ast::{self as ast};
 use ruff_text_size::TextRange;
 
 pub(crate) fn lower_structured_core_blocks_to_bb_blocks<N>(
-    blocks: &[Block<InstrLow<N>, InstrLow<N>>],
-) -> Vec<Block<InstrLow<N>, InstrLow<N>>>
+    blocks: &[Block<InstrLow<N>>],
+) -> Vec<Block<InstrLow<N>>>
 where
     N: NameLike,
 {
@@ -30,8 +30,8 @@ where
 }
 
 pub(crate) fn lower_structured_unresolved_core_blocks_to_bb_blocks(
-    blocks: &[Block<InstrUnresolved, InstrUnresolved>],
-) -> Vec<Block<InstrUnresolved, InstrUnresolved>> {
+    blocks: &[Block<InstrUnresolved>],
+) -> Vec<Block<InstrUnresolved>> {
     let module_name_gen = ModuleNameGen::new(0);
     let name_gen = module_name_gen.next_function_name_gen();
     let mut normalized_blocks = blocks.to_vec();
@@ -47,16 +47,14 @@ pub(crate) fn lower_structured_unresolved_core_blocks_to_bb_blocks(
 }
 
 pub(crate) fn lower_structured_located_blocks_to_bb_blocks(
-    blocks: &[Block<InstrLow<ResolvedName>, InstrResolved>],
+    blocks: &[Block<InstrResolved>],
 ) -> Vec<ResolvedStorageBlock> {
     let mut lowered = lower_structured_core_blocks_to_bb_blocks(blocks);
     rewrite_current_exception_in_located_core_blocks(&mut lowered);
     lowered
 }
 
-fn rewrite_current_exception_in_located_core_blocks(
-    blocks: &mut [Block<InstrResolved, InstrResolved>],
-) {
+fn rewrite_current_exception_in_located_core_blocks(blocks: &mut [Block<InstrResolved>]) {
     for block in blocks {
         let Some(exc_name) = block.exception_param().map(ToString::to_string) else {
             continue;

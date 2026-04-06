@@ -57,8 +57,8 @@ const ASYNC_GENERATOR_RESUME_ABI_PARAMS: [ResumeAbiParam; 4] = [
 
 type LinearYieldStmt = InstrWithYield;
 type LinearCoreStmt = InstrUnresolved;
-type LinearYieldBlock = Block<LinearYieldStmt, InstrWithYield>;
-type LinearCoreBlock = Block<LinearCoreStmt, InstrUnresolved>;
+type LinearYieldBlock = Block<LinearYieldStmt>;
+type LinearCoreBlock = Block<LinearCoreStmt>;
 type BlockPyBlock = LinearCoreBlock;
 
 struct ErrOnYield;
@@ -208,7 +208,7 @@ where
     Load::new(name).into()
 }
 
-fn collect_state_vars<E>(param_names: &[String], blocks: &[Block<E, E>]) -> Vec<String>
+fn collect_state_vars<E>(param_names: &[String], blocks: &[Block<E>]) -> Vec<String>
 where
     E: ScopeExprNode + Instr,
 {
@@ -403,7 +403,7 @@ fn is_generator_like(kind: FunctionKind) -> bool {
     )
 }
 
-fn injected_exception_names<S>(blocks: &[Block<S, InstrWithYield>]) -> HashSet<String> {
+fn injected_exception_names<I: Instr>(blocks: &[Block<I>]) -> HashSet<String> {
     let mut names = HashSet::new();
     for block in blocks {
         if let Some(exc_param) = block.exception_param() {

@@ -72,7 +72,7 @@ fn label(index: u32) -> BlockLabel {
     BlockLabel::from_index(index as usize)
 }
 
-type TestBlock = Block<InstrWithAwaitAndYield, InstrWithAwaitAndYield>;
+type TestBlock = Block<InstrWithAwaitAndYield>;
 
 fn instr_stmt(stmt: Stmt) -> InstrRuff {
     InstrRuff::from_ast_stmt(stmt)
@@ -996,7 +996,7 @@ fn sequence_raise_helper_lowers_compare_chain_via_inline_fragment() {
         .any(|block| matches!(block.term, BlockTerm::Raise(TermRaise { exc: Some(_) }))));
 }
 
-fn assert_all_block_targets_present<E: Instr>(blocks: &[Block<E, E>]) {
+fn assert_all_block_targets_present<E: Instr>(blocks: &[Block<E>]) {
     let labels = blocks
         .iter()
         .map(|block| block.label)

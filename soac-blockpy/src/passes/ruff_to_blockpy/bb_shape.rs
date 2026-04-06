@@ -8,8 +8,8 @@ use std::collections::{HashMap, HashSet};
 
 pub(crate) fn lower_structured_blocks_to_bb_blocks<E, N>(
     _name_gen: &FunctionNameGen,
-    blocks: &[crate::block_py::Block<E, E>],
-) -> Vec<crate::block_py::Block<E, E>>
+    blocks: &[crate::block_py::Block<E>],
+) -> Vec<crate::block_py::Block<E>>
 where
     E: Clone + Instr<Name = N>,
     N: NameLike,
@@ -67,9 +67,8 @@ impl CurrentExceptionExpr for InstrWithAwaitAndYield {
     }
 }
 
-pub(crate) fn rewrite_current_exception_in_core_blocks<E>(
-    blocks: &mut [crate::block_py::Block<E, E>],
-) where
+pub(crate) fn rewrite_current_exception_in_core_blocks<E>(blocks: &mut [crate::block_py::Block<E>])
+where
     E: CurrentExceptionExpr + Instr<Name = UnresolvedName>,
 {
     for block in blocks {
@@ -84,7 +83,7 @@ pub(crate) fn rewrite_current_exception_in_core_blocks<E>(
 }
 
 pub(crate) fn rewrite_current_exception_in_core_blocks_with_await_and_yield(
-    blocks: &mut [crate::block_py::Block<InstrWithAwaitAndYield, InstrWithAwaitAndYield>],
+    blocks: &mut [crate::block_py::Block<InstrWithAwaitAndYield>],
 ) {
     rewrite_current_exception_in_core_blocks(blocks);
 }
@@ -147,7 +146,7 @@ where
     }
 }
 
-pub(crate) fn populate_exception_edge_args<E, N>(blocks: &mut [crate::block_py::Block<E, E>])
+pub(crate) fn populate_exception_edge_args<E, N>(blocks: &mut [crate::block_py::Block<E>])
 where
     E: Instr<Name = N>,
     N: NameLike,
@@ -207,8 +206,8 @@ where
     }
 }
 
-pub(crate) fn lowered_exception_edges<S, T: crate::block_py::Instr>(
-    blocks: &[crate::block_py::Block<S, T>],
+pub(crate) fn lowered_exception_edges<I: crate::block_py::Instr>(
+    blocks: &[crate::block_py::Block<I>],
 ) -> HashMap<crate::block_py::BlockLabel, Option<crate::block_py::BlockLabel>> {
     blocks
         .iter()

@@ -60,7 +60,7 @@ fn cfg_block_can_replace_fallthrough_target() {
 
 #[test]
 fn stmt_fragment_can_carry_optional_term() {
-    let fragment: BlockBuilder<InstrRuff, BlockTerm<InstrRuff>> = BlockBuilder::with_term(
+    let fragment: BlockBuilder<InstrRuff> = BlockBuilder::with_term(
         vec![InstrRuff::from_ast_expr(py_expr!("x"))],
         Some(BlockTerm::Return(InstrRuff::from_ast_expr(py_expr!(
             "None"

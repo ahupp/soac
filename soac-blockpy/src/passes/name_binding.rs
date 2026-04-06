@@ -1323,7 +1323,7 @@ fn normal_successor_labels(term: &BlockTerm<InstrUnresolved>) -> Vec<&crate::blo
 }
 
 fn normal_predecessor_exc_param_names(
-    blocks: &[crate::block_py::Block<InstrUnresolved, InstrUnresolved>],
+    blocks: &[crate::block_py::Block<InstrUnresolved>],
 ) -> HashMap<crate::block_py::BlockLabel, Vec<Option<String>>> {
     let mut predecessors = HashMap::new();
     for block in blocks {
@@ -1339,7 +1339,7 @@ fn normal_predecessor_exc_param_names(
 }
 
 fn sync_exception_param_cell_in_block(
-    block: &mut crate::block_py::Block<InstrUnresolved, InstrUnresolved>,
+    block: &mut crate::block_py::Block<InstrUnresolved>,
     normal_predecessor_exc_names: &[Option<String>],
     scope: &CallableScopeInfo,
     resolver: &NameBindingMapper<'_>,
@@ -1373,7 +1373,7 @@ fn sync_exception_param_cell_in_block(
 }
 
 fn collect_deleted_names_in_blocks(
-    blocks: &[crate::block_py::Block<InstrUnresolved, InstrUnresolved>],
+    blocks: &[crate::block_py::Block<InstrUnresolved>],
     scope: &CallableScopeInfo,
     storage_layout: &StorageLayout,
 ) -> HashSet<String> {
@@ -1403,7 +1403,7 @@ fn collect_runtime_bound_local_names_in_stmt(
 }
 
 fn collect_runtime_bound_local_names(
-    blocks: &[crate::block_py::Block<InstrUnresolved, InstrUnresolved>],
+    blocks: &[crate::block_py::Block<InstrUnresolved>],
     scope: &CallableScopeInfo,
     storage_layout: &StorageLayout,
 ) -> HashSet<String> {

@@ -64,7 +64,7 @@ fn tracked_core_blockpy_with_yield_only(source: &str) -> BlockPyModule<CoreBlock
     lower_awaits_in_core_blockpy_module(core_blockpy)
 }
 
-fn assert_all_targets_present<P, S>(module: &BlockPyModule<P, S>)
+fn assert_all_targets_present<P, S>(module: &BlockPyModule<P>)
 where
     P: crate::block_py::BlockPyPass<Instr = S> + crate::block_py::pretty::BlockPyPrettyPrinter,
     S: crate::block_py::Instr + std::fmt::Debug,

@@ -89,12 +89,12 @@ pub enum OptInstr<I: Instr> {
 
 #[derive(Debug, Clone)]
 pub struct OptBlock<I: Instr> {
-    entry: Block<I, I>,
-    dependencies: Vec<Block<I, I>>,
+    entry: Block<I>,
+    dependencies: Vec<Block<I>>,
 }
 
 impl<I: Instr> OptBlock<I> {
-    pub fn new(entry: Block<I, I>, dependencies: Vec<Block<I, I>>) -> Result<Self, String> {
+    pub fn new(entry: Block<I>, dependencies: Vec<Block<I>>) -> Result<Self, String> {
         validate_opt_block(&entry, &dependencies)?;
         Ok(Self {
             entry,
@@ -102,23 +102,23 @@ impl<I: Instr> OptBlock<I> {
         })
     }
 
-    pub fn entry(&self) -> &Block<I, I> {
+    pub fn entry(&self) -> &Block<I> {
         &self.entry
     }
 
-    pub fn entry_mut(&mut self) -> &mut Block<I, I> {
+    pub fn entry_mut(&mut self) -> &mut Block<I> {
         &mut self.entry
     }
 
-    pub fn dependencies(&self) -> &[Block<I, I>] {
+    pub fn dependencies(&self) -> &[Block<I>] {
         &self.dependencies
     }
 
-    pub fn dependencies_mut(&mut self) -> &mut [Block<I, I>] {
+    pub fn dependencies_mut(&mut self) -> &mut [Block<I>] {
         &mut self.dependencies
     }
 
-    pub fn into_parts(self) -> (Block<I, I>, Vec<Block<I, I>>) {
+    pub fn into_parts(self) -> (Block<I>, Vec<Block<I>>) {
         (self.entry, self.dependencies)
     }
 
@@ -139,10 +139,7 @@ pub trait InstrumentInstr<I: Instr> {
     fn optimize_instr(&self, counter: &Self::Counter, instr: &I) -> OptInstr<I>;
 }
 
-fn validate_opt_block<I: Instr>(
-    entry: &Block<I, I>,
-    dependencies: &[Block<I, I>],
-) -> Result<(), String> {
+fn validate_opt_block<I: Instr>(entry: &Block<I>, dependencies: &[Block<I>]) -> Result<(), String> {
     let mut blocks_by_label = HashMap::new();
     blocks_by_label.insert(entry.label, entry);
     for block in dependencies {
@@ -184,7 +181,7 @@ fn validate_opt_block<I: Instr>(
 
 fn all_paths_end_in_fallthrough<I: Instr>(
     label: BlockLabel,
-    blocks_by_label: &HashMap<BlockLabel, &Block<I, I>>,
+    blocks_by_label: &HashMap<BlockLabel, &Block<I>>,
     reachable: &mut HashSet<BlockLabel>,
     stack: &mut Vec<BlockLabel>,
     memo: &mut HashMap<BlockLabel, bool>,

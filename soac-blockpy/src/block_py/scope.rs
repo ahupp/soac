@@ -813,7 +813,7 @@ where
         walk_expr::<Self, I>(self, expr);
     }
 
-    fn visit_block(&mut self, block: &Block<I, I>) {
+    fn visit_block(&mut self, block: &Block<I>) {
         if let Some(exc_param) = block.exception_param() {
             self.used_names.insert(exc_param.to_string());
         }
