@@ -285,6 +285,7 @@ perf-pystone-jit-warm loops="500000" output_prefix="logs/pystone_jit_perf_warm":
   REPORT_DSO_SYMBOLS="${OUTPUT_PREFIX}_by_dso_symbol.txt"
   REPORT_CALLGRAPH="${OUTPUT_PREFIX}_callgraph.txt"
   REPORT_SPEEDSCOPE="${OUTPUT_PREFIX}_speedscope.json"
+  INJECTED_PERF_DATA="$REPO_ROOT/tmp/$(basename "${OUTPUT_PREFIX}").injected.data"
   PYO3_RELEASE_LIB="$REPO_ROOT/target/release/lib_soac_ext.so"
   PYO3_STAGING_DIR="$(mktemp -d)"
   READY_FILE="$(mktemp "$REPO_ROOT/tmp/pystone_jit_perf_ready.XXXXXX")"
@@ -308,6 +309,10 @@ perf-pystone-jit-warm loops="500000" output_prefix="logs/pystone_jit_perf_warm":
 
   if ! command -v perf >/dev/null 2>&1; then
     echo "perf is required but was not found on PATH" >&2
+    exit 1
+  fi
+  if ! command -v inferno-collapse-perf >/dev/null 2>&1; then
+    echo "inferno-collapse-perf is required but was not found on PATH; install it with: cargo install inferno" >&2
     exit 1
   fi
   echo "date: $(date +%F)"
@@ -382,6 +387,7 @@ perf-pystone-jit-warm loops="500000" output_prefix="logs/pystone_jit_perf_warm":
   perf record \
     --call-graph "${PERF_CALL_GRAPH}" \
     -F "${PERF_FREQUENCY}" \
+    -k 1 \
     -o "${PERF_DATA}" \
     -p "${PY_PID}" \
     >"${PERF_RECORD_LOG}" 2>&1 &
@@ -448,16 +454,14 @@ perf-pystone-jit-warm loops="500000" output_prefix="logs/pystone_jit_perf_warm":
     -i "${PERF_DATA}" \
     >"${REPORT_CALLGRAPH}"
 
-  perf report \
-    --stdio \
-    --stdio-color never \
-    --no-children \
-    --show-nr-samples \
-    --percent-limit 0 \
-    --sort overhead,dso,symbol \
-    --call-graph flat,0,caller,count \
+  perf inject --jit \
     -i "${PERF_DATA}" \
-    | python3 "$REPO_ROOT/scripts/perf_report_to_speedscope.py" "$(basename "${OUTPUT_PREFIX}")" \
+    -o "${INJECTED_PERF_DATA}"
+
+  perf script \
+    -i "${INJECTED_PERF_DATA}" \
+    | inferno-collapse-perf \
+    | python3 "$REPO_ROOT/scripts/folded_to_speedscope.py" "$(basename "${OUTPUT_PREFIX}")" \
     >"${REPORT_SPEEDSCOPE}"
 
   VIEW_SPEEDSCOPE_PROFILE="$("$CPYTHON_BIN" -c 'import pathlib, sys; repo_root = pathlib.Path(sys.argv[1]).resolve(); report_path = pathlib.Path(sys.argv[2]).resolve(); print(report_path.relative_to(repo_root))' "$REPO_ROOT" "$REPORT_SPEEDSCOPE")"

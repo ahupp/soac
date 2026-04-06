@@ -40,6 +40,7 @@ unsafe extern "C" {
 }
 
 mod intrinsics;
+mod jitdump;
 mod planning;
 mod specialized_helpers;
 mod vmctx;
@@ -1239,7 +1240,7 @@ fn build_counted_runtime_refcount_helper(
         fb.finalize();
     }
 
-    define_function_with_incremental_cache(
+    let _ = define_function_with_incremental_cache(
         jit_module,
         helper_id,
         &mut ctx,
@@ -4871,7 +4872,7 @@ fn define_function_with_incremental_cache(
     func_id: FuncId,
     ctx: &mut cranelift_codegen::Context,
     err_prefix: &str,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     inline_runtime_support_calls(jit_module, ctx, err_prefix)?;
     let func_for_relocs = ctx.func.clone();
     let mut ctrl_plane = ControlPlane::default();
@@ -4891,7 +4892,7 @@ fn define_function_with_incremental_cache(
     jit_module
         .define_function_bytes(func_id, alignment, compiled.code_buffer(), &relocs)
         .map_err(|err| format!("{err_prefix}: {err}"))?;
-    Ok(())
+    Ok(compiled.code_buffer().len())
 }
 
 const RUNTIME_SUPPORT_INLINE_MAX_INSTS: usize = 32;
@@ -5280,7 +5281,7 @@ fn load_runtime_support_clif(jit_module: &mut JITModule) -> Result<(), String> {
         )?;
         let mut ctx = jit_module.make_context();
         ctx.func = function;
-        define_function_with_incremental_cache(
+        let _ = define_function_with_incremental_cache(
             jit_module,
             func_id,
             &mut ctx,
@@ -5467,7 +5468,7 @@ pub fn run_cranelift_smoke(module: &BlockPyModule<CodegenBlockPyPass>) -> Result
     }
 
     let function_id = declare_local_fn(&mut jit_module, "dp_jit_smoke", &ctx.func.signature)?;
-    define_function_with_incremental_cache(
+    let _ = define_function_with_incremental_cache(
         &mut jit_module,
         function_id,
         &mut ctx,
@@ -6348,7 +6349,7 @@ pub unsafe fn compile_cranelift_run_bb_specialized_cached(
     })?;
     let mut ctx = built.ctx;
     let main_id = built.main_id;
-    define_function_with_incremental_cache(
+    let main_code_size = define_function_with_incremental_cache(
         &mut compiled._jit_module,
         main_id,
         &mut ctx,
@@ -6366,6 +6367,9 @@ pub unsafe fn compile_cranelift_run_bb_specialized_cached(
         .finalize_definitions()
         .map_err(|err| format!("failed to finalize specialized jit run_bb function: {err}"))?;
     let code_ptr = compiled._jit_module.get_finalized_function(main_id);
+    let main_symbol =
+        jit_python_perf_symbol_name(JIT_PYTHON_PERF_SYMBOL_KIND_DIRECT, &function.names.qualname);
+    jitdump::record_code_load(&main_symbol, code_ptr.cast::<u8>(), main_code_size)?;
     compiled.entry = Some(CompiledRunnerEntry::Direct {
         code_ptr,
         param_count: function.params.len(),
@@ -6538,7 +6542,7 @@ pub unsafe fn compile_cranelift_vectorcall_direct_trampoline(
         fb.finalize();
     }
 
-    define_function_with_incremental_cache(
+    let main_code_size = define_function_with_incremental_cache(
         &mut jit_module,
         main_id,
         &mut ctx,
@@ -6550,6 +6554,7 @@ pub unsafe fn compile_cranelift_vectorcall_direct_trampoline(
         .map_err(|err| format!("failed to finalize direct vectorcall trampoline: {err}"))?;
 
     let code_ptr = jit_module.get_finalized_function(main_id);
+    jitdump::record_code_load(symbol_name, code_ptr.cast::<u8>(), main_code_size)?;
     let entry: VectorcallEntryFn = std::mem::transmute(code_ptr);
     let compiled = Box::new(CompiledVectorcallRunner {
         _jit_module: jit_module,
