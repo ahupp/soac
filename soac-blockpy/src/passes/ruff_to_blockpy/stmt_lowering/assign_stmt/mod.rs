@@ -12,7 +12,7 @@ fn rhs_temp_name(name: &str, ctx: ast::ExprContext) -> ast::ExprName {
 }
 
 pub(super) fn temp_load_expr<E: RuffToBlockPyExpr>(name: &str) -> E {
-    Expr::Name(rhs_temp_name(name, ast::ExprContext::Load)).into()
+    E::from_lowered_expr(Expr::Name(rhs_temp_name(name, ast::ExprContext::Load)))
 }
 
 pub(super) fn bind_temp<E: RuffToBlockPyExpr>(
@@ -184,12 +184,12 @@ where
         unpack_meta.node_index,
         unpack_meta.range,
         "unpack",
-        vec![value, E::from(spec_expr)],
+        vec![value, E::from_lowered_expr(spec_expr)],
     );
     let unpacked_temp = bind_temp(out, unpacked_name.clone(), unpacked_value);
 
     for (index, elt) in elts.into_iter().enumerate() {
-        let index_expr = E::from(py_expr!("{index:literal}", index = index as i64));
+        let index_expr = E::from_lowered_expr(py_expr!("{index:literal}", index = index as i64));
         match elt {
             Expr::Starred(ast::ExprStarred { value, .. }) => {
                 let item_expr = E::get_item(

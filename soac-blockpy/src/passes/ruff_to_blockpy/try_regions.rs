@@ -379,14 +379,20 @@ pub(crate) fn emit_finally_abrupt_dispatch_blocks<E>(
     blocks.push(compat_block_from_blockpy_with_exc_target_and_expr(
         finally_return_label.clone(),
         Vec::new(),
-        BlockTerm::Return(py_expr!("{name:id}", name = payload_name).into()),
+        BlockTerm::Return(E::from_lowered_expr(py_expr!(
+            "{name:id}",
+            name = payload_name
+        ))),
         active_exc_target.as_ref(),
     ));
     blocks.push(compat_block_from_blockpy_with_exc_target_and_expr(
         finally_raise_label.clone(),
         Vec::new(),
         BlockTerm::Raise(TermRaise {
-            exc: Some(py_expr!("{name:id}", name = payload_name).into()),
+            exc: Some(E::from_lowered_expr(py_expr!(
+                "{name:id}",
+                name = payload_name
+            ))),
         }),
         active_exc_target.as_ref(),
     ));
@@ -394,7 +400,7 @@ pub(crate) fn emit_finally_abrupt_dispatch_blocks<E>(
         finally_dispatch_label.clone(),
         Vec::new(),
         BlockTerm::BranchTable(TermBranchTable {
-            index: py_expr!("{name:id}", name = kind_name).into(),
+            index: E::from_lowered_expr(py_expr!("{name:id}", name = kind_name)),
             targets: vec![
                 rest_entry.clone(),
                 finally_return_label,

@@ -24,17 +24,14 @@ fn string_literal_expr(
 }
 
 pub(crate) trait RuffToBlockPyExpr:
-    From<Expr>
-    + From<Store<Self>>
+    From<Store<Self>>
     + From<Del<Self>>
     + Instr<Name = UnresolvedName>
     + std::fmt::Debug
     + Clone
     + Sized
 {
-    fn from_lowered_expr(expr: Expr) -> Self {
-        expr.into()
-    }
+    fn from_lowered_expr(expr: Expr) -> Self;
 
     fn helper_call(
         node_index: ast::AtomicNodeIndex,

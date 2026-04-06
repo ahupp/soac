@@ -27,7 +27,7 @@ impl StmtLowerer for ast::StmtAugAssign {
                 let current_value = bind_temp(
                     out,
                     context.fresh("augassign_value"),
-                    Expr::Name(load_name).into(),
+                    E::from_lowered_expr(Expr::Name(load_name)),
                 );
                 let rhs =
                     crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(

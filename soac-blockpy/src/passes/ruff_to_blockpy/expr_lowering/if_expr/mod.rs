@@ -112,7 +112,7 @@ pub(crate) fn try_lower_if_expr_direct<L, E>(
      let then_label = name_gen.next_block_name();
      let else_label = name_gen.next_block_name();
      entry.set_term(BlockTerm::IfTerm(TermIf {
-         test: test.into(),
+         test: E::from_lowered_expr(test),
          then_label,
          else_label,
      }));
@@ -159,7 +159,7 @@ where
     orelse_out.push_stmt(assign_name(&target, orelse_value));
 
     out.push_stmt(StructuredInstr::If(StructuredIf {
-        test: test.into(),
+        test: E::from_lowered_expr(test),
         body: body_out.finish(),
         orelse: orelse_out.finish(),
     }));

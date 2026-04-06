@@ -49,7 +49,10 @@ where
             let object_value =
                 lower_target_object_with_setup(*value, out, loop_ctx, next_label_id)?;
             let object_temp = bind_temp(out, context.fresh("delete_obj"), object_value);
-            let attr_expr: E = Expr::from(py_expr!("{attr:literal}", attr = attr.as_str())).into();
+            let attr_expr: E = E::from_lowered_expr(Expr::from(py_expr!(
+                "{attr:literal}",
+                attr = attr.as_str()
+            )));
             out.push_stmt(StructuredInstr::Expr(E::helper_call(
                 node_index,
                 range,

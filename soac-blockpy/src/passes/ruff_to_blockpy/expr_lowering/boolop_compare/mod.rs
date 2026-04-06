@@ -315,7 +315,7 @@ where
             ast::BoolOp::Or => py_expr!("not {target:id}", target = target.as_str()),
         };
         out.push_stmt(StructuredInstr::If(StructuredIf {
-            test: test.into(),
+            test: E::from_lowered_expr(test),
             body: body.finish(),
             orelse: empty_fragment(),
         }));
@@ -393,7 +393,7 @@ where
         ));
         current_left = comparator_expr;
         out.push_stmt(StructuredInstr::If(StructuredIf {
-            test: load_name(&target_name).into(),
+            test: E::from_lowered_expr(load_name(&target_name)),
             body: step_body.finish(),
             orelse: empty_fragment(),
         }));

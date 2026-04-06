@@ -709,7 +709,7 @@ where
         loop_check_label.clone(),
         check_body,
         BlockTerm::IfTerm(TermIf {
-            test: exhausted_test.into(),
+            test: E::from_lowered_expr(exhausted_test),
             then_label: exhausted_entry,
             else_label: assign_label.clone(),
         }),

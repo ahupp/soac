@@ -181,7 +181,7 @@ impl StmtLowerer for ast::StmtReturn {
                     next_label_id,
                 )?
             }
-            None => crate::py_expr!("None").into(),
+            None => E::from_lowered_expr(crate::py_expr!("None")),
         };
         out.set_term(BlockTerm::Return(value));
         Ok(())
