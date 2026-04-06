@@ -32,7 +32,9 @@ class C:
 #                                     raise GetAttr(builtins, "NotImplementedError")
 #                             else:
 #                                 block bb4:
-#                                     return dict(tuple_values(tuple_values("x", int)))
+#                                     jump bb1
+#                                     block bb1:
+#                                         return dict(tuple_values(tuple_values("x", int)))
 
 # function _dp_class_ns_C(_dp_class_ns, _dp_classcell_arg):
 #     function_id: 0:3
