@@ -511,9 +511,10 @@ where
             exc_target,
         ));
         if !body.is_empty() {
-            blocks.push(compat_block_from_blockpy_with_exc_target_and_expr(
+            let lowered_body = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &body)?;
+            blocks.push(compat_block_from_lowered_builder_with_exc_target_and_expr(
                 label.clone(),
-                body,
+                lowered_body,
                 BlockTerm::Jump(BlockEdge::new(setup_label)),
                 exc_target,
             ));
@@ -645,9 +646,10 @@ where
         }
     }
     if let Some(linear_label) = linear_label {
-        blocks.push(compat_block_from_blockpy_with_exc_target_and_expr(
+        let lowered_linear = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &linear)?;
+        blocks.push(compat_block_from_lowered_builder_with_exc_target_and_expr(
             linear_label.clone(),
-            linear,
+            lowered_linear,
             BlockTerm::Jump(BlockEdge::new(test_label)),
             exc_target,
         ));
