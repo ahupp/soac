@@ -1,5 +1,7 @@
 use crate::SOAC_RUNTIME_CLIF;
-use crate::counter_dump::read_call_target_specializations_from_file;
+use crate::counter_dump::{
+    read_call_target_specializations_from_file, read_operator_specializations_from_file,
+};
 use crate::module_constants::{ModuleCodegenConstants, ModuleConstantId};
 use cranelift_codegen::cfg_printer::CFGPrinter;
 use cranelift_codegen::incremental_cache::CacheKvStore;
@@ -34,6 +36,7 @@ unsafe extern "C" {
     static mut PyFunction_Type: ffi::PyTypeObject;
     static mut PyMethod_Type: ffi::PyTypeObject;
     static mut PyType_Type: ffi::PyTypeObject;
+    static mut PyLong_Type: ffi::PyTypeObject;
 }
 
 mod intrinsics;
@@ -693,6 +696,7 @@ struct JitEmitConsts {
     py_function_type_ptr: *mut ffi::PyTypeObject,
     py_method_type_ptr: *mut ffi::PyTypeObject,
     py_type_type_ptr: *mut ffi::PyTypeObject,
+    py_long_type_ptr: *mut ffi::PyTypeObject,
     global_load_hit_counter_ptr: Option<*mut u64>,
     global_load_miss_counter_ptr: Option<*mut u64>,
 }
@@ -732,6 +736,10 @@ struct JitEmitCtx<'mc> {
     call_target_specializations: &'mc HashMap<InstrId, Vec<FunctionId>>,
     call_direct_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
     call_direct_fallback_counter_ids: &'mc HashMap<InstrId, CounterId>,
+    operator_shape_counter_ids: &'mc HashMap<InstrId, CounterId>,
+    operator_specializations: &'mc HashMap<InstrId, Vec<u64>>,
+    operator_specialized_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
+    operator_specialized_fallback_counter_ids: &'mc HashMap<InstrId, CounterId>,
 }
 
 #[derive(Clone, Copy)]
@@ -1917,6 +1925,97 @@ fn load_call_target_specializations(
     read_call_target_specializations_from_file(path, module_name, function_id)
 }
 
+fn parse_operator_specializations_env(
+    module_name: &str,
+    function_id: FunctionId,
+) -> Result<HashMap<InstrId, Vec<u64>>, String> {
+    let Ok(raw) = env::var("DIET_PYTHON_OPERATOR_SPECIALIZATIONS") else {
+        return Ok(HashMap::new());
+    };
+    let mut out = HashMap::new();
+    for entry in raw.split(';').map(str::trim).filter(|entry| !entry.is_empty()) {
+        let Some((site, targets)) = entry.split_once('=') else {
+            return Err(format!("invalid operator specialization entry: {entry}"));
+        };
+        let mut site_parts = site.split('|').map(str::trim);
+        let Some(site_module) = site_parts.next() else {
+            return Err(format!("missing module in operator specialization entry: {entry}"));
+        };
+        let Some(site_function_id_raw) = site_parts.next() else {
+            return Err(format!("missing function_id in operator specialization entry: {entry}"));
+        };
+        let Some(block_label_raw) = site_parts.next() else {
+            return Err(format!("missing block label in operator specialization entry: {entry}"));
+        };
+        let Some(instr_index_raw) = site_parts.next() else {
+            return Err(format!("missing instr index in operator specialization entry: {entry}"));
+        };
+        if site_parts.next().is_some() {
+            return Err(format!(
+                "too many site fields in operator specialization entry: {entry}"
+            ));
+        }
+        let site_function_id = site_function_id_raw
+            .parse::<u64>()
+            .map(FunctionId::from_packed)
+            .map_err(|err| {
+                format!("invalid function_id in operator specialization entry {entry}: {err}")
+            })?;
+        let block_label = block_label_raw.parse::<u32>().map_err(|err| {
+            format!("invalid block label in operator specialization entry {entry}: {err}")
+        })?;
+        let instr_index = instr_index_raw.parse::<u32>().map_err(|err| {
+            format!("invalid instr index in operator specialization entry {entry}: {err}")
+        })?;
+        if site_module != module_name || site_function_id != function_id {
+            continue;
+        }
+        let instr_id = InstrId::new(BlockLabel::from_index(block_label as usize), instr_index);
+        let shapes = targets
+            .split(',')
+            .map(str::trim)
+            .filter(|target| !target.is_empty())
+            .map(|target| {
+                target.parse::<u64>().map_err(|err| {
+                    format!("invalid operator specialization target in entry {entry}: {err}")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if shapes.is_empty() {
+            continue;
+        }
+        out.insert(instr_id, shapes);
+    }
+    Ok(out)
+}
+
+fn load_operator_specializations(
+    module_name: &str,
+    function_id: FunctionId,
+) -> Result<HashMap<InstrId, Vec<u64>>, String> {
+    if env::var("DIET_PYTHON_OPERATOR_SPECIALIZATIONS").is_ok() {
+        return parse_operator_specializations_env(module_name, function_id);
+    }
+    if env::var("DIET_PYTHON_CALL_TARGET_COUNTERS")
+        .ok()
+        .is_some_and(|raw| !raw.trim().is_empty())
+    {
+        return Ok(HashMap::new());
+    }
+    let Some(path) = env::var("DIET_PYTHON_COUNTERS_FILE")
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+    else {
+        return Ok(HashMap::new());
+    };
+    let path = std::path::Path::new(path.as_str());
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    read_operator_specializations_from_file(path, module_name, function_id)
+}
+
 fn emit_callee_function_id_checked(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
@@ -2144,17 +2243,26 @@ fn emit_callee_function_id_checked(
     fb.block_params(ok_block)[0]
 }
 
+fn emit_record_observed_value_counter(
+    fb: &mut FunctionBuilder<'_>,
+    counter_id: CounterId,
+    observed_value: ir::Value,
+    ctx: &JitEmitCtx<'_>,
+) {
+    let counter_id_value = fb.ins().iconst(ctx.consts.i64_ty, counter_id.0 as i64);
+    fb.ins().call(
+        ctx.record_counter_value_ref,
+        &[ctx.consts.vmctx_value, counter_id_value, observed_value],
+    );
+}
+
 fn emit_record_call_target_counter(
     fb: &mut FunctionBuilder<'_>,
     counter_id: CounterId,
     callee_id: ir::Value,
     ctx: &JitEmitCtx<'_>,
 ) {
-    let counter_id_value = fb.ins().iconst(ctx.consts.i64_ty, counter_id.0 as i64);
-    fb.ins().call(
-        ctx.record_counter_value_ref,
-        &[ctx.consts.vmctx_value, counter_id_value, callee_id],
-    );
+    emit_record_observed_value_counter(fb, counter_id, callee_id, ctx);
 }
 
 fn emit_direct_call_resolved_with_arg_values(
@@ -5143,9 +5251,27 @@ fn build_cranelift_run_bb_specialized_function(
         function.function_id,
         "call_direct_fallback",
     );
+    let operator_shape_counter_ids =
+        collect_runtime_counter_ids_by_kind(counter_defs, function.function_id, "operator_hot_shapes");
+    let operator_specialized_hit_counter_ids = collect_runtime_counter_ids_by_kind(
+        counter_defs,
+        function.function_id,
+        "operator_specialized_hit",
+    );
+    let operator_specialized_fallback_counter_ids = collect_runtime_counter_ids_by_kind(
+        counter_defs,
+        function.function_id,
+        "operator_specialized_fallback",
+    );
     let call_target_specializations = match direct_call_resolver {
         Some(shared_state) => {
             load_call_target_specializations(shared_state.module_name.as_str(), function.function_id)?
+        }
+        None => HashMap::new(),
+    };
+    let operator_specializations = match direct_call_resolver {
+        Some(shared_state) => {
+            load_operator_specializations(shared_state.module_name.as_str(), function.function_id)?
         }
         None => HashMap::new(),
     };
@@ -5617,6 +5743,7 @@ fn build_cranelift_run_bb_specialized_function(
                     py_function_type_ptr: std::ptr::addr_of_mut!(PyFunction_Type),
                     py_method_type_ptr: std::ptr::addr_of_mut!(PyMethod_Type),
                     py_type_type_ptr: std::ptr::addr_of_mut!(PyType_Type),
+                    py_long_type_ptr: std::ptr::addr_of_mut!(PyLong_Type),
                     global_load_hit_counter_ptr,
                     global_load_miss_counter_ptr,
                 },
@@ -5643,6 +5770,10 @@ fn build_cranelift_run_bb_specialized_function(
                 call_target_specializations: &call_target_specializations,
                 call_direct_hit_counter_ids: &call_direct_hit_counter_ids,
                 call_direct_fallback_counter_ids: &call_direct_fallback_counter_ids,
+                operator_shape_counter_ids: &operator_shape_counter_ids,
+                operator_specializations: &operator_specializations,
+                operator_specialized_hit_counter_ids: &operator_specialized_hit_counter_ids,
+                operator_specialized_fallback_counter_ids: &operator_specialized_fallback_counter_ids,
             };
             let block = &function.blocks[index];
             let mut local_names = Vec::new();

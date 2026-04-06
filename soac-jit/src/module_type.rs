@@ -106,6 +106,7 @@ impl SharedModuleState {
         }
     }
 
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn record_call_target_counter(
         &self,
         counter_id: CounterId,
@@ -336,7 +337,10 @@ fn counter_storage_key(counter: &CounterDef) -> PyResult<CounterStorageKey> {
 }
 
 fn counter_uses_call_target_storage(counter: &CounterDef) -> bool {
-    counter.kind == "call_hot_targets"
+    matches!(
+        counter.kind.as_str(),
+        "call_hot_targets" | "operator_hot_shapes"
+    )
 }
 
 fn build_counter_storage(

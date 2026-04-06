@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
 mod jit;
+pub(crate) mod operator_specialization;
 pub use jit::*;
 
 pub mod counter;

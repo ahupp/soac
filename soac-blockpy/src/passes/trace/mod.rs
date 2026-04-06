@@ -1,8 +1,7 @@
 use crate::block_py::{
     core_call_expr_with_meta, literal_expr, BlockPyFunction, BlockPyModule, CallArgPositional,
     ChildVisitable, CodegenBlockPyExpr, CoreStringLiteral, CounterScope, CounterSite, HasMeta,
-    IncrementCounter, Load, InstrResolved, ResolvedName, Meta, NameLocation, Visit,
-    WithMeta,
+    IncrementCounter, Load, InstrResolved, ResolvedName, Meta, NameLocation, Visit, WithMeta,
 };
 use crate::passes::{CodegenBlockPyPass, CounterBuilder};
 use std::collections::HashMap;
@@ -188,6 +187,14 @@ pub fn instrument_bb_module_with_global_load_counters(
 pub fn instrument_bb_module_with_call_target_counters(
     module: &mut BlockPyModule<CodegenBlockPyPass>,
 ) {
+    fn is_operator_specialization_candidate(expr: &CodegenBlockPyExpr) -> bool {
+        match expr {
+            CodegenBlockPyExpr::BinOp(op) => !matches!(op.kind, crate::block_py::BinOpKind::Contains | crate::block_py::BinOpKind::Is | crate::block_py::BinOpKind::MatMul | crate::block_py::BinOpKind::InplaceMatMul),
+            CodegenBlockPyExpr::UnaryOp(_) => true,
+            _ => false,
+        }
+    }
+
     struct DirectCallCandidateCounterCollector<'a, 'b> {
         function_id: crate::block_py::FunctionId,
         counters: &'a mut CounterBuilder<'b>,
@@ -195,6 +202,36 @@ pub fn instrument_bb_module_with_call_target_counters(
 
     impl Visit<CodegenBlockPyExpr> for DirectCallCandidateCounterCollector<'_, '_> {
         fn visit_instr(&mut self, expr: &CodegenBlockPyExpr) {
+            if is_operator_specialization_candidate(expr) {
+                let instr_id = expr
+                    .meta()
+                    .instr_id
+                    .expect("operator specialization counters require preassigned InstrId");
+                self.counters.define_if_missing(
+                    CounterScope::This,
+                    "operator_hot_shapes",
+                    CounterSite::Runtime {
+                        function_id: Some(self.function_id),
+                        instr_id: Some(instr_id),
+                    },
+                );
+                self.counters.define_if_missing(
+                    CounterScope::This,
+                    "operator_specialized_hit",
+                    CounterSite::Runtime {
+                        function_id: Some(self.function_id),
+                        instr_id: Some(instr_id),
+                    },
+                );
+                self.counters.define_if_missing(
+                    CounterScope::This,
+                    "operator_specialized_fallback",
+                    CounterSite::Runtime {
+                        function_id: Some(self.function_id),
+                        instr_id: Some(instr_id),
+                    },
+                );
+            }
             if let CodegenBlockPyExpr::Call(call) = expr {
                 let is_candidate = call.keywords.is_empty()
                     && call

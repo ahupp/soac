@@ -1,13 +1,18 @@
 use super::{
-    ImportSpec, JitEmitCtx, SigType, emit_increment_counter_ptr,
-    emit_owned_module_constant_from_parts,
+    ImportSpec, JitEmitCtx, SigType, emit_increment_counter_ptr, emit_owned_module_constant_from_parts,
 };
 use crate::jit::blockpy_intrinsics;
+use crate::operator_specialization::{
+    BINARY_RHS_TAG_SHIFT, ExactIntBinaryOpKind, ExactIntUnaryOpKind, ExactTypeTag,
+    UNARY_TAG_SHIFT, pack_binary_shape, pack_unary_shape, unpack_binary_shape,
+    unpack_unary_shape,
+};
 use cranelift_codegen::ir;
 use cranelift_codegen::ir::InstBuilder;
 use cranelift_frontend::FunctionBuilder;
 use pyo3::ffi;
-use soac_blockpy::block_py::{BlockPyNameLike, CodegenBlockPyExpr, Instr, NameLocation};
+use soac_blockpy::block_py::{BlockPyNameLike, CodegenBlockPyExpr, HasMeta, Instr, NameLocation};
+use std::mem::offset_of;
 
 pub(super) trait OperationEmitState<'fb, E> {
     fn ctx(&self) -> &JitEmitCtx<'_>;
@@ -52,17 +57,6 @@ pub(super) trait OperationEmitState<'fb, E> {
         self.finish_owned_result(result)
     }
 
-    fn emit_bool_func_call(&mut self, func_ref: ir::FuncRef, args: &[&E]) -> ir::Value {
-        let arg_values = self.emit_arg_values(args);
-        let values = arg_values
-            .iter()
-            .map(|(value, _)| *value)
-            .collect::<Vec<_>>();
-        let call_inst = self.fb().ins().call(func_ref, &values);
-        self.release_arg_values(&arg_values);
-        let result = self.fb().inst_results(call_inst)[0];
-        self.emit_owned_bool_from_i32_result(result)
-    }
 }
 
 macro_rules! define_owned_import_spec {
@@ -290,80 +284,110 @@ static PYNUMBER_POWER_IMPORT: ImportSpec = ImportSpec::new(
     &[SigType::Pointer, SigType::Pointer, SigType::Pointer],
     &[SigType::Pointer],
 );
+static DP_JIT_EXACT_LONG_BINARY_OP_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_exact_long_binary_op",
+    &[SigType::I64, SigType::Pointer, SigType::Pointer],
+    &[SigType::Pointer],
+);
+static DP_JIT_EXACT_LONG_UNARY_OP_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_exact_long_unary_op",
+    &[SigType::I64, SigType::Pointer],
+    &[SigType::Pointer],
+);
+
+const PYOBJECT_OB_TYPE_OFFSET: i32 = offset_of!(ffi::PyObject, ob_type) as i32;
 fn emit_positional_owned_call<'fb, E>(
     spec: &'static ImportSpec,
     state: &mut impl OperationEmitState<'fb, E>,
     args: &[&E],
 ) -> ir::Value {
-    let func_ref = state.import_func(spec);
-    state.emit_owned_func_call(func_ref, &args)
+    let arg_values = state.emit_arg_values(args);
+    emit_positional_owned_call_from_values(spec, state, &arg_values)
 }
 
-fn emit_positional_bool_call<'fb, E>(
+fn emit_positional_owned_call_from_values<'fb, E>(
     spec: &'static ImportSpec,
     state: &mut impl OperationEmitState<'fb, E>,
-    args: &[&E],
+    arg_values: &[(ir::Value, bool)],
 ) -> ir::Value {
     let func_ref = state.import_func(spec);
-    state.emit_bool_func_call(func_ref, &args)
-}
-
-fn emit_pow_like<'fb, E>(
-    spec: &'static ImportSpec,
-    state: &mut impl OperationEmitState<'fb, E>,
-    args: &[&E],
-) -> ir::Value {
-    let arg_values = state.emit_arg_values(&args);
-    let func_ref = state.import_func(spec);
-    let none_const = state.ctx().consts.none_const;
-    let call_inst = match arg_values {
-        ref arg_values => match arg_values.as_slice() {
-            [(left, _), (right, _)] => state
-                .fb()
-                .ins()
-                .call(func_ref, &[*left, *right, none_const]),
-            [(left, _), (right, _), (modulo, _)] => {
-                state.fb().ins().call(func_ref, &[*left, *right, *modulo])
-            }
-            _ => panic!(
-                "pow-like operation received unsupported arity {}",
-                arg_values.len()
-            ),
-        },
-    };
-    state.release_arg_values(&arg_values);
+    let values = arg_values
+        .iter()
+        .map(|(value, _)| *value)
+        .collect::<Vec<_>>();
+    let call_inst = state.fb().ins().call(func_ref, &values);
+    state.release_arg_values(arg_values);
     let result = state.fb().inst_results(call_inst)[0];
     state.finish_owned_result(result)
 }
 
-fn emit_richcompare<'fb, E>(
+fn emit_positional_bool_call_from_values<'fb, E>(
+    spec: &'static ImportSpec,
+    state: &mut impl OperationEmitState<'fb, E>,
+    arg_values: &[(ir::Value, bool)],
+) -> ir::Value {
+    let func_ref = state.import_func(spec);
+    let values = arg_values
+        .iter()
+        .map(|(value, _)| *value)
+        .collect::<Vec<_>>();
+    let call_inst = state.fb().ins().call(func_ref, &values);
+    state.release_arg_values(arg_values);
+    let result = state.fb().inst_results(call_inst)[0];
+    state.emit_owned_bool_from_i32_result(result)
+}
+
+fn emit_pow_like_from_values<'fb, E>(
+    spec: &'static ImportSpec,
+    state: &mut impl OperationEmitState<'fb, E>,
+    arg_values: &[(ir::Value, bool)],
+) -> ir::Value {
+    let func_ref = state.import_func(spec);
+    let none_const = state.ctx().consts.none_const;
+    let call_inst = match arg_values {
+        [(left, _), (right, _)] => state
+            .fb()
+            .ins()
+            .call(func_ref, &[*left, *right, none_const]),
+        [(left, _), (right, _), (modulo, _)] => {
+            state.fb().ins().call(func_ref, &[*left, *right, *modulo])
+        }
+        _ => panic!(
+            "pow-like operation received unsupported arity {}",
+            arg_values.len()
+        ),
+    };
+    state.release_arg_values(arg_values);
+    let result = state.fb().inst_results(call_inst)[0];
+    state.finish_owned_result(result)
+}
+
+fn emit_richcompare_from_values<'fb, E>(
     compare_op: i32,
     state: &mut impl OperationEmitState<'fb, E>,
-    args: &[&E],
+    arg_values: &[(ir::Value, bool)],
 ) -> ir::Value {
-    let arg_values = state.emit_arg_values(&args);
     let func_ref = state.import_func(&PYOBJECT_RICHCOMPARE_IMPORT);
     let compare_op = state.fb().ins().iconst(ir::types::I32, compare_op as i64);
     let call_inst = state
         .fb()
         .ins()
         .call(func_ref, &[arg_values[0].0, arg_values[1].0, compare_op]);
-    state.release_arg_values(&arg_values);
+    state.release_arg_values(arg_values);
     let result = state.fb().inst_results(call_inst)[0];
     state.finish_owned_result(result)
 }
 
-fn emit_identity_compare<'fb, E>(
+fn emit_identity_compare_from_values<'fb, E>(
     state: &mut impl OperationEmitState<'fb, E>,
-    args: &[&E],
+    arg_values: &[(ir::Value, bool)],
 ) -> ir::Value {
-    let arg_values = state.emit_arg_values(&args);
     let cond = state.fb().ins().icmp(
         ir::condcodes::IntCC::Equal,
         arg_values[0].0,
         arg_values[1].0,
     );
-    state.release_arg_values(&arg_values);
+    state.release_arg_values(arg_values);
     state.emit_owned_bool_from_cond(cond)
 }
 
@@ -414,98 +438,267 @@ fn emit_setitem<'fb, E>(state: &mut impl OperationEmitState<'fb, E>, args: &[&E]
     state.emit_owned_func_call(state.ctx().pyobject_setitem_ref, &args)
 }
 
+fn emit_exact_type_tag_for_value<'fb, E>(
+    state: &mut impl OperationEmitState<'fb, E>,
+    value: ir::Value,
+) -> ir::Value {
+    let ptr_ty = state.ctx().consts.ptr_ty;
+    let i64_ty = state.ctx().consts.i64_ty;
+    let py_long_type_ptr = state.ctx().consts.py_long_type_ptr as i64;
+    let object_type = state
+        .fb()
+        .ins()
+        .load(ptr_ty, ir::MemFlags::trusted(), value, PYOBJECT_OB_TYPE_OFFSET);
+    let py_long_type = state.fb().ins().iconst(ptr_ty, py_long_type_ptr);
+    let is_long = state
+        .fb()
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, object_type, py_long_type);
+    let exact_int_tag = state
+        .fb()
+        .ins()
+        .iconst(i64_ty, ExactTypeTag::Int.packed() as i64);
+    let zero = state.fb().ins().iconst(i64_ty, 0);
+    state.fb().ins().select(is_long, exact_int_tag, zero)
+}
+
+fn emit_unary_operator_shape_from_values<'fb, E>(
+    state: &mut impl OperationEmitState<'fb, E>,
+    arg_values: &[(ir::Value, bool)],
+) -> ir::Value {
+    let i64_ty = state.ctx().consts.i64_ty;
+    let tag = emit_exact_type_tag_for_value(state, arg_values[0].0);
+    let shift = state.fb().ins().iconst(i64_ty, UNARY_TAG_SHIFT as i64);
+    state.fb().ins().ishl(tag, shift)
+}
+
+fn emit_binary_operator_shape_from_values<'fb, E>(
+    state: &mut impl OperationEmitState<'fb, E>,
+    arg_values: &[(ir::Value, bool)],
+) -> ir::Value {
+    let i64_ty = state.ctx().consts.i64_ty;
+    let lhs_tag = emit_exact_type_tag_for_value(state, arg_values[0].0);
+    let rhs_tag = emit_exact_type_tag_for_value(state, arg_values[1].0);
+    let rhs_shift = state.fb().ins().iconst(i64_ty, BINARY_RHS_TAG_SHIFT as i64);
+    let rhs_bits = state.fb().ins().ishl(rhs_tag, rhs_shift);
+    state.fb().ins().bor(lhs_tag, rhs_bits)
+}
+
+fn emit_exact_long_binary_op<'fb, E>(
+    kind: ExactIntBinaryOpKind,
+    state: &mut impl OperationEmitState<'fb, E>,
+    arg_values: &[(ir::Value, bool)],
+) -> ir::Value {
+    let func_ref = state.import_func(&DP_JIT_EXACT_LONG_BINARY_OP_IMPORT);
+    let i64_ty = state.ctx().consts.i64_ty;
+    let kind_value = state.fb().ins().iconst(i64_ty, kind as i64);
+    let call_inst = state
+        .fb()
+        .ins()
+        .call(func_ref, &[kind_value, arg_values[0].0, arg_values[1].0]);
+    state.release_arg_values(arg_values);
+    let result = state.fb().inst_results(call_inst)[0];
+    state.finish_owned_result(result)
+}
+
+fn emit_exact_long_unary_op<'fb, E>(
+    kind: ExactIntUnaryOpKind,
+    state: &mut impl OperationEmitState<'fb, E>,
+    arg_values: &[(ir::Value, bool)],
+) -> ir::Value {
+    let func_ref = state.import_func(&DP_JIT_EXACT_LONG_UNARY_OP_IMPORT);
+    let i64_ty = state.ctx().consts.i64_ty;
+    let kind_value = state.fb().ins().iconst(i64_ty, kind as i64);
+    let call_inst = state
+        .fb()
+        .ins()
+        .call(func_ref, &[kind_value, arg_values[0].0]);
+    state.release_arg_values(arg_values);
+    let result = state.fb().inst_results(call_inst)[0];
+    state.finish_owned_result(result)
+}
+
+fn emit_binop_with_arg_values<'fb, E>(
+    kind: blockpy_intrinsics::BinOpKind,
+    state: &mut impl OperationEmitState<'fb, E>,
+    arg_values: &[(ir::Value, bool)],
+) -> ir::Value {
+    match kind {
+        blockpy_intrinsics::BinOpKind::Add => {
+            emit_positional_owned_call_from_values(&PYNUMBER_ADD_IMPORT, state, arg_values)
+        }
+        blockpy_intrinsics::BinOpKind::Sub => emit_positional_owned_call_from_values(
+            &PYNUMBER_SUBTRACT_IMPORT,
+            state,
+            arg_values,
+        ),
+        blockpy_intrinsics::BinOpKind::Mul => emit_positional_owned_call_from_values(
+            &PYNUMBER_MULTIPLY_IMPORT,
+            state,
+            arg_values,
+        ),
+        blockpy_intrinsics::BinOpKind::MatMul => emit_positional_owned_call_from_values(
+            &PYNUMBER_MATMUL_IMPORT,
+            state,
+            arg_values,
+        ),
+        blockpy_intrinsics::BinOpKind::TrueDiv => emit_positional_owned_call_from_values(
+            &PYNUMBER_TRUE_DIVIDE_IMPORT,
+            state,
+            arg_values,
+        ),
+        blockpy_intrinsics::BinOpKind::FloorDiv => emit_positional_owned_call_from_values(
+            &PYNUMBER_FLOOR_DIVIDE_IMPORT,
+            state,
+            arg_values,
+        ),
+        blockpy_intrinsics::BinOpKind::Mod => emit_positional_owned_call_from_values(
+            &PYNUMBER_REMAINDER_IMPORT,
+            state,
+            arg_values,
+        ),
+        blockpy_intrinsics::BinOpKind::Pow => {
+            emit_pow_like_from_values(&PYNUMBER_POWER_IMPORT, state, arg_values)
+        }
+        blockpy_intrinsics::BinOpKind::LShift => emit_positional_owned_call_from_values(
+            &PYNUMBER_LSHIFT_IMPORT,
+            state,
+            arg_values,
+        ),
+        blockpy_intrinsics::BinOpKind::RShift => emit_positional_owned_call_from_values(
+            &PYNUMBER_RSHIFT_IMPORT,
+            state,
+            arg_values,
+        ),
+        blockpy_intrinsics::BinOpKind::Or => {
+            emit_positional_owned_call_from_values(&PYNUMBER_OR_IMPORT, state, arg_values)
+        }
+        blockpy_intrinsics::BinOpKind::Xor => {
+            emit_positional_owned_call_from_values(&PYNUMBER_XOR_IMPORT, state, arg_values)
+        }
+        blockpy_intrinsics::BinOpKind::And => {
+            emit_positional_owned_call_from_values(&PYNUMBER_AND_IMPORT, state, arg_values)
+        }
+        blockpy_intrinsics::BinOpKind::InplaceAdd => emit_positional_owned_call_from_values(
+            &PYNUMBER_INPLACE_ADD_IMPORT,
+            state,
+            arg_values,
+        ),
+        blockpy_intrinsics::BinOpKind::InplaceSub => emit_positional_owned_call_from_values(
+            &PYNUMBER_INPLACE_SUBTRACT_IMPORT,
+            state,
+            arg_values,
+        ),
+        blockpy_intrinsics::BinOpKind::InplaceMul => emit_positional_owned_call_from_values(
+            &PYNUMBER_INPLACE_MULTIPLY_IMPORT,
+            state,
+            arg_values,
+        ),
+        blockpy_intrinsics::BinOpKind::InplaceMatMul => emit_positional_owned_call_from_values(
+            &PYNUMBER_INPLACE_MATMUL_IMPORT,
+            state,
+            arg_values,
+        ),
+        blockpy_intrinsics::BinOpKind::InplaceTrueDiv => emit_positional_owned_call_from_values(
+            &PYNUMBER_INPLACE_TRUE_DIVIDE_IMPORT,
+            state,
+            arg_values,
+        ),
+        blockpy_intrinsics::BinOpKind::InplaceFloorDiv => emit_positional_owned_call_from_values(
+            &PYNUMBER_INPLACE_FLOOR_DIVIDE_IMPORT,
+            state,
+            arg_values,
+        ),
+        blockpy_intrinsics::BinOpKind::InplaceMod => emit_positional_owned_call_from_values(
+            &PYNUMBER_INPLACE_REMAINDER_IMPORT,
+            state,
+            arg_values,
+        ),
+        blockpy_intrinsics::BinOpKind::InplacePow => {
+            emit_pow_like_from_values(&PYNUMBER_INPLACE_POWER_IMPORT, state, arg_values)
+        }
+        blockpy_intrinsics::BinOpKind::InplaceLShift => emit_positional_owned_call_from_values(
+            &PYNUMBER_INPLACE_LSHIFT_IMPORT,
+            state,
+            arg_values,
+        ),
+        blockpy_intrinsics::BinOpKind::InplaceRShift => emit_positional_owned_call_from_values(
+            &PYNUMBER_INPLACE_RSHIFT_IMPORT,
+            state,
+            arg_values,
+        ),
+        blockpy_intrinsics::BinOpKind::InplaceOr => emit_positional_owned_call_from_values(
+            &PYNUMBER_INPLACE_OR_IMPORT,
+            state,
+            arg_values,
+        ),
+        blockpy_intrinsics::BinOpKind::InplaceXor => emit_positional_owned_call_from_values(
+            &PYNUMBER_INPLACE_XOR_IMPORT,
+            state,
+            arg_values,
+        ),
+        blockpy_intrinsics::BinOpKind::InplaceAnd => emit_positional_owned_call_from_values(
+            &PYNUMBER_INPLACE_AND_IMPORT,
+            state,
+            arg_values,
+        ),
+        blockpy_intrinsics::BinOpKind::Eq => {
+            emit_richcompare_from_values(ffi::Py_EQ, state, arg_values)
+        }
+        blockpy_intrinsics::BinOpKind::Ne => {
+            emit_richcompare_from_values(ffi::Py_NE, state, arg_values)
+        }
+        blockpy_intrinsics::BinOpKind::Lt => {
+            emit_richcompare_from_values(ffi::Py_LT, state, arg_values)
+        }
+        blockpy_intrinsics::BinOpKind::Le => {
+            emit_richcompare_from_values(ffi::Py_LE, state, arg_values)
+        }
+        blockpy_intrinsics::BinOpKind::Gt => {
+            emit_richcompare_from_values(ffi::Py_GT, state, arg_values)
+        }
+        blockpy_intrinsics::BinOpKind::Ge => {
+            emit_richcompare_from_values(ffi::Py_GE, state, arg_values)
+        }
+        blockpy_intrinsics::BinOpKind::Contains => {
+            emit_positional_bool_call_from_values(&PYSEQUENCE_CONTAINS_IMPORT, state, arg_values)
+        }
+        blockpy_intrinsics::BinOpKind::Is => emit_identity_compare_from_values(state, arg_values),
+    }
+}
+
 fn emit_binop<'fb, E>(
     kind: blockpy_intrinsics::BinOpKind,
     state: &mut impl OperationEmitState<'fb, E>,
     args: &[&E],
 ) -> ir::Value {
+    let arg_values = state.emit_arg_values(args);
+    emit_binop_with_arg_values(kind, state, &arg_values)
+}
+
+fn emit_unary_op_with_arg_values<'fb, E>(
+    kind: blockpy_intrinsics::UnaryOpKind,
+    state: &mut impl OperationEmitState<'fb, E>,
+    arg_values: &[(ir::Value, bool)],
+) -> ir::Value {
     match kind {
-        blockpy_intrinsics::BinOpKind::Add => {
-            emit_positional_owned_call(&PYNUMBER_ADD_IMPORT, state, args)
+        blockpy_intrinsics::UnaryOpKind::Pos => {
+            emit_positional_owned_call_from_values(&PYNUMBER_POSITIVE_IMPORT, state, arg_values)
         }
-        blockpy_intrinsics::BinOpKind::Sub => {
-            emit_positional_owned_call(&PYNUMBER_SUBTRACT_IMPORT, state, args)
+        blockpy_intrinsics::UnaryOpKind::Neg => {
+            emit_positional_owned_call_from_values(&PYNUMBER_NEGATIVE_IMPORT, state, arg_values)
         }
-        blockpy_intrinsics::BinOpKind::Mul => {
-            emit_positional_owned_call(&PYNUMBER_MULTIPLY_IMPORT, state, args)
+        blockpy_intrinsics::UnaryOpKind::Invert => {
+            emit_positional_owned_call_from_values(&PYNUMBER_INVERT_IMPORT, state, arg_values)
         }
-        blockpy_intrinsics::BinOpKind::MatMul => {
-            emit_positional_owned_call(&PYNUMBER_MATMUL_IMPORT, state, args)
+        blockpy_intrinsics::UnaryOpKind::Not => {
+            emit_positional_bool_call_from_values(&PYOBJECT_NOT_IMPORT, state, arg_values)
         }
-        blockpy_intrinsics::BinOpKind::TrueDiv => {
-            emit_positional_owned_call(&PYNUMBER_TRUE_DIVIDE_IMPORT, state, args)
-        }
-        blockpy_intrinsics::BinOpKind::FloorDiv => {
-            emit_positional_owned_call(&PYNUMBER_FLOOR_DIVIDE_IMPORT, state, args)
-        }
-        blockpy_intrinsics::BinOpKind::Mod => {
-            emit_positional_owned_call(&PYNUMBER_REMAINDER_IMPORT, state, args)
-        }
-        blockpy_intrinsics::BinOpKind::Pow => emit_pow_like(&PYNUMBER_POWER_IMPORT, state, args),
-        blockpy_intrinsics::BinOpKind::LShift => {
-            emit_positional_owned_call(&PYNUMBER_LSHIFT_IMPORT, state, args)
-        }
-        blockpy_intrinsics::BinOpKind::RShift => {
-            emit_positional_owned_call(&PYNUMBER_RSHIFT_IMPORT, state, args)
-        }
-        blockpy_intrinsics::BinOpKind::Or => {
-            emit_positional_owned_call(&PYNUMBER_OR_IMPORT, state, args)
-        }
-        blockpy_intrinsics::BinOpKind::Xor => {
-            emit_positional_owned_call(&PYNUMBER_XOR_IMPORT, state, args)
-        }
-        blockpy_intrinsics::BinOpKind::And => {
-            emit_positional_owned_call(&PYNUMBER_AND_IMPORT, state, args)
-        }
-        blockpy_intrinsics::BinOpKind::InplaceAdd => {
-            emit_positional_owned_call(&PYNUMBER_INPLACE_ADD_IMPORT, state, args)
-        }
-        blockpy_intrinsics::BinOpKind::InplaceSub => {
-            emit_positional_owned_call(&PYNUMBER_INPLACE_SUBTRACT_IMPORT, state, args)
-        }
-        blockpy_intrinsics::BinOpKind::InplaceMul => {
-            emit_positional_owned_call(&PYNUMBER_INPLACE_MULTIPLY_IMPORT, state, args)
-        }
-        blockpy_intrinsics::BinOpKind::InplaceMatMul => {
-            emit_positional_owned_call(&PYNUMBER_INPLACE_MATMUL_IMPORT, state, args)
-        }
-        blockpy_intrinsics::BinOpKind::InplaceTrueDiv => {
-            emit_positional_owned_call(&PYNUMBER_INPLACE_TRUE_DIVIDE_IMPORT, state, args)
-        }
-        blockpy_intrinsics::BinOpKind::InplaceFloorDiv => {
-            emit_positional_owned_call(&PYNUMBER_INPLACE_FLOOR_DIVIDE_IMPORT, state, args)
-        }
-        blockpy_intrinsics::BinOpKind::InplaceMod => {
-            emit_positional_owned_call(&PYNUMBER_INPLACE_REMAINDER_IMPORT, state, args)
-        }
-        blockpy_intrinsics::BinOpKind::InplacePow => {
-            emit_pow_like(&PYNUMBER_INPLACE_POWER_IMPORT, state, args)
-        }
-        blockpy_intrinsics::BinOpKind::InplaceLShift => {
-            emit_positional_owned_call(&PYNUMBER_INPLACE_LSHIFT_IMPORT, state, args)
-        }
-        blockpy_intrinsics::BinOpKind::InplaceRShift => {
-            emit_positional_owned_call(&PYNUMBER_INPLACE_RSHIFT_IMPORT, state, args)
-        }
-        blockpy_intrinsics::BinOpKind::InplaceOr => {
-            emit_positional_owned_call(&PYNUMBER_INPLACE_OR_IMPORT, state, args)
-        }
-        blockpy_intrinsics::BinOpKind::InplaceXor => {
-            emit_positional_owned_call(&PYNUMBER_INPLACE_XOR_IMPORT, state, args)
-        }
-        blockpy_intrinsics::BinOpKind::InplaceAnd => {
-            emit_positional_owned_call(&PYNUMBER_INPLACE_AND_IMPORT, state, args)
-        }
-        blockpy_intrinsics::BinOpKind::Eq => emit_richcompare(ffi::Py_EQ, state, args),
-        blockpy_intrinsics::BinOpKind::Ne => emit_richcompare(ffi::Py_NE, state, args),
-        blockpy_intrinsics::BinOpKind::Lt => emit_richcompare(ffi::Py_LT, state, args),
-        blockpy_intrinsics::BinOpKind::Le => emit_richcompare(ffi::Py_LE, state, args),
-        blockpy_intrinsics::BinOpKind::Gt => emit_richcompare(ffi::Py_GT, state, args),
-        blockpy_intrinsics::BinOpKind::Ge => emit_richcompare(ffi::Py_GE, state, args),
-        blockpy_intrinsics::BinOpKind::Contains => {
-            emit_positional_bool_call(&PYSEQUENCE_CONTAINS_IMPORT, state, args)
-        }
-        blockpy_intrinsics::BinOpKind::Is => emit_identity_compare(state, args),
+        blockpy_intrinsics::UnaryOpKind::Truth => emit_positional_bool_call_from_values(
+            &PYOBJECT_IS_TRUE_IMPORT,
+            state,
+            arg_values,
+        ),
     }
 }
 
@@ -514,23 +707,191 @@ fn emit_unary_op<'fb, E>(
     state: &mut impl OperationEmitState<'fb, E>,
     args: &[&E],
 ) -> ir::Value {
-    match kind {
-        blockpy_intrinsics::UnaryOpKind::Pos => {
-            emit_positional_owned_call(&PYNUMBER_POSITIVE_IMPORT, state, args)
-        }
-        blockpy_intrinsics::UnaryOpKind::Neg => {
-            emit_positional_owned_call(&PYNUMBER_NEGATIVE_IMPORT, state, args)
-        }
-        blockpy_intrinsics::UnaryOpKind::Invert => {
-            emit_positional_owned_call(&PYNUMBER_INVERT_IMPORT, state, args)
-        }
-        blockpy_intrinsics::UnaryOpKind::Not => {
-            emit_positional_bool_call(&PYOBJECT_NOT_IMPORT, state, args)
-        }
-        blockpy_intrinsics::UnaryOpKind::Truth => {
-            emit_positional_bool_call(&PYOBJECT_IS_TRUE_IMPORT, state, args)
-        }
+    let arg_values = state.emit_arg_values(args);
+    emit_unary_op_with_arg_values(kind, state, &arg_values)
+}
+
+fn emit_specialized_binop<'fb>(
+    op: &blockpy_intrinsics::BinOp<CodegenBlockPyExpr>,
+    state: &mut impl OperationEmitState<'fb, CodegenBlockPyExpr>,
+) -> Option<ir::Value> {
+    let instr_id = op.meta().instr_id?;
+    let ptr_ty = state.ctx().consts.ptr_ty;
+    let i64_ty = state.ctx().consts.i64_ty;
+    let vmctx_value = state.ctx().consts.vmctx_value;
+    let record_counter_value_ref = state.ctx().record_counter_value_ref;
+    let counter_id = state.ctx().operator_shape_counter_ids.get(&instr_id).copied();
+    let specialized_hit_counter_id = state
+        .ctx()
+        .operator_specialized_hit_counter_ids
+        .get(&instr_id)
+        .copied();
+    let specialized_fallback_counter_id = state
+        .ctx()
+        .operator_specialized_fallback_counter_ids
+        .get(&instr_id)
+        .copied();
+    let hot_shapes = state
+        .ctx()
+        .operator_specializations
+        .get(&instr_id)
+        .cloned()
+        .unwrap_or_default();
+    let specialized_hit_counter_ptr = specialized_hit_counter_id.map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
+    let specialized_fallback_counter_ptr =
+        specialized_fallback_counter_id.map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
+    if counter_id.is_none() && hot_shapes.is_empty() {
+        return None;
     }
+
+    let arg_values = state.emit_arg_values(&[op.left.as_ref(), op.right.as_ref()]);
+    let shape = emit_binary_operator_shape_from_values(state, &arg_values);
+    if let Some(counter_id) = counter_id {
+        let counter_id_value = state.fb().ins().iconst(i64_ty, counter_id.0 as i64);
+        state
+            .fb()
+            .ins()
+            .call(record_counter_value_ref, &[vmctx_value, counter_id_value, shape]);
+    }
+
+    let Some(exact_int_kind) = ExactIntBinaryOpKind::from_binop_kind(op.kind) else {
+        return Some(emit_binop_with_arg_values(op.kind, state, &arg_values));
+    };
+    let exact_int_shape = pack_binary_shape(ExactTypeTag::Int, ExactTypeTag::Int);
+    let supports_exact_int = hot_shapes.into_iter().any(|shape| {
+        unpack_binary_shape(shape)
+            .is_some_and(|shape| shape == (ExactTypeTag::Int, ExactTypeTag::Int))
+    });
+    if !supports_exact_int {
+        return Some(emit_binop_with_arg_values(op.kind, state, &arg_values));
+    }
+
+    let result_block = state.fb().create_block();
+    state.fb().append_block_param(result_block, ptr_ty);
+    let generic_block = state.fb().create_block();
+    let direct_block = state.fb().create_block();
+    let expected_shape = state.fb().ins().iconst(i64_ty, exact_int_shape as i64);
+    let is_match = state
+        .fb()
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, shape, expected_shape);
+    state
+        .fb()
+        .ins()
+        .brif(is_match, direct_block, &[], generic_block, &[]);
+
+    state.fb().switch_to_block(direct_block);
+    if let Some(counter_ptr) = specialized_hit_counter_ptr {
+        emit_increment_counter_ptr(state.fb(), ptr_ty, counter_ptr);
+    }
+    let direct_result = emit_exact_long_binary_op(exact_int_kind, state, &arg_values);
+    state
+        .fb()
+        .ins()
+        .jump(result_block, &[ir::BlockArg::Value(direct_result)]);
+
+    state.fb().switch_to_block(generic_block);
+    if let Some(counter_ptr) = specialized_fallback_counter_ptr {
+        emit_increment_counter_ptr(state.fb(), ptr_ty, counter_ptr);
+    }
+    let generic_result = emit_binop_with_arg_values(op.kind, state, &arg_values);
+    state
+        .fb()
+        .ins()
+        .jump(result_block, &[ir::BlockArg::Value(generic_result)]);
+
+    state.fb().switch_to_block(result_block);
+    Some(state.fb().block_params(result_block)[0])
+}
+
+fn emit_specialized_unary_op<'fb>(
+    op: &blockpy_intrinsics::UnaryOp<CodegenBlockPyExpr>,
+    state: &mut impl OperationEmitState<'fb, CodegenBlockPyExpr>,
+) -> Option<ir::Value> {
+    let instr_id = op.meta().instr_id?;
+    let ptr_ty = state.ctx().consts.ptr_ty;
+    let i64_ty = state.ctx().consts.i64_ty;
+    let vmctx_value = state.ctx().consts.vmctx_value;
+    let record_counter_value_ref = state.ctx().record_counter_value_ref;
+    let counter_id = state.ctx().operator_shape_counter_ids.get(&instr_id).copied();
+    let specialized_hit_counter_id = state
+        .ctx()
+        .operator_specialized_hit_counter_ids
+        .get(&instr_id)
+        .copied();
+    let specialized_fallback_counter_id = state
+        .ctx()
+        .operator_specialized_fallback_counter_ids
+        .get(&instr_id)
+        .copied();
+    let hot_shapes = state
+        .ctx()
+        .operator_specializations
+        .get(&instr_id)
+        .cloned()
+        .unwrap_or_default();
+    let specialized_hit_counter_ptr = specialized_hit_counter_id.map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
+    let specialized_fallback_counter_ptr =
+        specialized_fallback_counter_id.map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
+    if counter_id.is_none() && hot_shapes.is_empty() {
+        return None;
+    }
+
+    let arg_values = state.emit_arg_values(&[op.operand.as_ref()]);
+    let shape = emit_unary_operator_shape_from_values(state, &arg_values);
+    if let Some(counter_id) = counter_id {
+        let counter_id_value = state.fb().ins().iconst(i64_ty, counter_id.0 as i64);
+        state
+            .fb()
+            .ins()
+            .call(record_counter_value_ref, &[vmctx_value, counter_id_value, shape]);
+    }
+
+    let exact_int_kind = ExactIntUnaryOpKind::from_unary_op_kind(op.kind);
+    let exact_int_shape = pack_unary_shape(ExactTypeTag::Int);
+    let supports_exact_int = hot_shapes
+        .into_iter()
+        .any(|shape| unpack_unary_shape(shape) == Some(ExactTypeTag::Int));
+    if !supports_exact_int {
+        return Some(emit_unary_op_with_arg_values(op.kind, state, &arg_values));
+    }
+
+    let result_block = state.fb().create_block();
+    state.fb().append_block_param(result_block, ptr_ty);
+    let generic_block = state.fb().create_block();
+    let direct_block = state.fb().create_block();
+    let expected_shape = state.fb().ins().iconst(i64_ty, exact_int_shape as i64);
+    let is_match = state
+        .fb()
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, shape, expected_shape);
+    state
+        .fb()
+        .ins()
+        .brif(is_match, direct_block, &[], generic_block, &[]);
+
+    state.fb().switch_to_block(direct_block);
+    if let Some(counter_ptr) = specialized_hit_counter_ptr {
+        emit_increment_counter_ptr(state.fb(), ptr_ty, counter_ptr);
+    }
+    let direct_result = emit_exact_long_unary_op(exact_int_kind, state, &arg_values);
+    state
+        .fb()
+        .ins()
+        .jump(result_block, &[ir::BlockArg::Value(direct_result)]);
+
+    state.fb().switch_to_block(generic_block);
+    if let Some(counter_ptr) = specialized_fallback_counter_ptr {
+        emit_increment_counter_ptr(state.fb(), ptr_ty, counter_ptr);
+    }
+    let generic_result = emit_unary_op_with_arg_values(op.kind, state, &arg_values);
+    state
+        .fb()
+        .ins()
+        .jump(result_block, &[ir::BlockArg::Value(generic_result)]);
+
+    state.fb().switch_to_block(result_block);
+    Some(state.fb().block_params(result_block)[0])
 }
 
 fn emit_load<'fb>(
@@ -693,14 +1054,11 @@ pub(super) fn emit_operation<'fb>(
         CodegenBlockPyExpr::CalleeFunctionId(_) => None,
         CodegenBlockPyExpr::Call(_) => None,
         CodegenBlockPyExpr::CallDirect(_) => None,
-        CodegenBlockPyExpr::BinOp(op) => Some(emit_binop(
-            op.kind,
-            state,
-            &[op.left.as_ref(), op.right.as_ref()],
-        )),
-        CodegenBlockPyExpr::UnaryOp(op) => {
-            Some(emit_unary_op(op.kind, state, &[op.operand.as_ref()]))
-        }
+        CodegenBlockPyExpr::BinOp(op) => emit_specialized_binop(op, state).or_else(|| {
+            Some(emit_binop(op.kind, state, &[op.left.as_ref(), op.right.as_ref()]))
+        }),
+        CodegenBlockPyExpr::UnaryOp(op) => emit_specialized_unary_op(op, state)
+            .or_else(|| Some(emit_unary_op(op.kind, state, &[op.operand.as_ref()]))),
         CodegenBlockPyExpr::GetAttr(op) => Some(emit_getattr(op, state)),
         CodegenBlockPyExpr::SetAttr(op) => Some(emit_setattr(op, state)),
         CodegenBlockPyExpr::GetItem(op) => {

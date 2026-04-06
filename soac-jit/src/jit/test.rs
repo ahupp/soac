@@ -4,8 +4,8 @@ use soac_blockpy::block_py::{
     Call, CallArgPositional, CellLocation, ClosureInit, ClosureSlot, CodegenBlock,
     CodegenBlockPyExpr, CoreNumberLiteral, CoreNumberLiteralValue,
     CoreStringLiteral, CounterSite, Del, DelItem, FunctionName, LiteralValue, Load,
-    InstrResolved, ResolvedName, ModuleNameGen, NameLocation, Param, ParamKind, ParamSpec,
-    StorageLayout, Store,
+    InstrResolved, Meta, ModuleNameGen, NameLocation, Param, ParamKind, ParamSpec, ResolvedName,
+    StorageLayout, Store, WithMeta,
 };
 use soac_blockpy::passes::{
     CodegenBlockPyPass, instrument_bb_module_with_block_entry_counters,
@@ -112,6 +112,13 @@ mod tests {
 
     fn expr_stmt(expr: CodegenBlockPyExpr) -> CodegenBlockPyExpr {
         expr
+    }
+
+    fn with_instr_id(expr: CodegenBlockPyExpr, instr_id: InstrId) -> CodegenBlockPyExpr {
+        expr.with_meta(Meta {
+            instr_id: Some(instr_id),
+            ..Meta::synthetic()
+        })
     }
 
     fn repo_root() -> &'static Path {
@@ -231,6 +238,130 @@ mod tests {
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
         render_test_jit_function_with_constants(&module, &function, blocks, &module_constants)
+    }
+
+    fn render_test_jit_function_with_operator_specializations(
+        function: &BlockPyFunction<CodegenBlockPyPass>,
+        blocks: &[ObjPtr],
+        module_constants: Vec<InstrResolved>,
+        operator_specializations: &[(InstrId, u64)],
+    ) -> String {
+        let module_name = "counter_test";
+        let function_id = function.function_id.packed();
+        let specialization_value = operator_specializations
+            .iter()
+            .map(|(instr_id, shape)| {
+                format!(
+                    "{module_name}|{function_id}|{}|{}={shape}",
+                    instr_id.block_label().as_u32(),
+                    instr_id.instr_index_in_block(),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(";");
+
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        let old_operator_specializations =
+            std::env::var_os("DIET_PYTHON_OPERATOR_SPECIALIZATIONS");
+        let old_call_target_specializations =
+            std::env::var_os("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS");
+        let old_counters_file = std::env::var_os("DIET_PYTHON_COUNTERS_FILE");
+        let old_call_target_counters = std::env::var_os("DIET_PYTHON_CALL_TARGET_COUNTERS");
+        let old_pythonhome = std::env::var_os("PYTHONHOME");
+        let old_pythonpath = std::env::var_os("PYTHONPATH");
+        let python_home = vendored_python_home();
+        let python_path = std::env::join_paths([
+            python_home.join("Lib"),
+            vendored_python_build_lib_dir(),
+            repo_root().join("soac_py").join("src"),
+        ])
+        .expect("test PYTHONPATH should join");
+        unsafe {
+            std::env::set_var(
+                "DIET_PYTHON_OPERATOR_SPECIALIZATIONS",
+                specialization_value.as_str(),
+            );
+            std::env::remove_var("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS");
+            std::env::remove_var("DIET_PYTHON_COUNTERS_FILE");
+            std::env::remove_var("DIET_PYTHON_CALL_TARGET_COUNTERS");
+            std::env::set_var("PYTHONHOME", &python_home);
+            std::env::set_var("PYTHONPATH", python_path);
+        }
+
+        let module = BlockPyModule {
+            module_name_gen: ModuleNameGen::new(0),
+            global_names: Vec::new(),
+            callable_defs: vec![function.clone()],
+            module_constants,
+            counter_defs: Vec::new(),
+        };
+
+        let rendered = unsafe {
+            Python::initialize();
+            Python::attach(|py| {
+                let shared_state = crate::module_type::build_shared_state_for_testing(
+                    py,
+                    module,
+                    module_name,
+                    "",
+                )
+                .expect("shared state should build");
+                let mut jit_module = new_jit_module().expect("test jit module should construct");
+                let module_constant_ptrs = shared_state.module_constant_ptrs();
+                let counter_ptrs = shared_state.counter_ptrs();
+                let built = build_cranelift_run_bb_specialized_function(
+                    &mut jit_module,
+                    blocks,
+                    &shared_state.lowered_module,
+                    function,
+                    &shared_state.codegen_constants,
+                    &shared_state.lowered_module.counter_defs,
+                    &module_constant_ptrs,
+                    &counter_ptrs,
+                    Some(shared_state.as_ref()),
+                )
+                .expect("specialized JIT build should succeed");
+                let (clif, _cfg_dot, _vcode_disasm) = render_compiled_clif_and_vcode_disasm(
+                    &mut jit_module,
+                    built.ctx,
+                    &built.import_id_to_symbol,
+                    &built.block_annotations,
+                )
+                .expect("specialized JIT CLIF render should succeed");
+                clif
+            })
+        };
+
+        unsafe {
+            match old_operator_specializations {
+                Some(value) => std::env::set_var("DIET_PYTHON_OPERATOR_SPECIALIZATIONS", value),
+                None => std::env::remove_var("DIET_PYTHON_OPERATOR_SPECIALIZATIONS"),
+            }
+            match old_call_target_specializations {
+                Some(value) => {
+                    std::env::set_var("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS", value)
+                }
+                None => std::env::remove_var("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS"),
+            }
+            match old_counters_file {
+                Some(value) => std::env::set_var("DIET_PYTHON_COUNTERS_FILE", value),
+                None => std::env::remove_var("DIET_PYTHON_COUNTERS_FILE"),
+            }
+            match old_call_target_counters {
+                Some(value) => std::env::set_var("DIET_PYTHON_CALL_TARGET_COUNTERS", value),
+                None => std::env::remove_var("DIET_PYTHON_CALL_TARGET_COUNTERS"),
+            }
+            match old_pythonhome {
+                Some(value) => std::env::set_var("PYTHONHOME", value),
+                None => std::env::remove_var("PYTHONHOME"),
+            }
+            match old_pythonpath {
+                Some(value) => std::env::set_var("PYTHONPATH", value),
+                None => std::env::remove_var("PYTHONPATH"),
+            }
+        }
+
+        rendered
     }
 
     fn render_test_jit_function_with_constants(
@@ -1019,6 +1150,132 @@ def f(x):
         assert!(
             rendered.contains("call PyObject_RichCompare"),
             "comparison lowering should use PyObject_RichCompare in rendered CLIF:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn render_specialized_jit_exact_int_binop_uses_operator_fast_path() {
+        let blocks = [1usize as ObjPtr];
+        let mut constants = TestConstantPool::default();
+        let mut function = test_function();
+        let block_label = function.name_gen.next_block_name();
+        let instr_id = InstrId::new(block_label, 0);
+        let block = CodegenBlock {
+            label: block_label,
+            body: vec![],
+            term: ret_term(with_instr_id(
+                op_expr(BinOp::new(
+                    BinOpKind::Add,
+                    constants.int_expr(1),
+                    constants.int_expr(2),
+                )),
+                instr_id,
+            )),
+            params: vec![],
+            exc_edge: None,
+        };
+        function.blocks = vec![block];
+        let rendered = render_test_jit_function_with_operator_specializations(
+            &function,
+            &blocks,
+            constants.module_constants,
+            &[(
+                instr_id,
+                crate::operator_specialization::pack_binary_shape(
+                    crate::operator_specialization::ExactTypeTag::Int,
+                    crate::operator_specialization::ExactTypeTag::Int,
+                ),
+            )],
+        );
+        assert!(
+            rendered.contains("call dp_jit_exact_long_binary_op"),
+            "exact-int binop specialization should call the direct helper:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("iconst.i64 257"),
+            "exact-int binop specialization should guard on the profiled exact-int shape:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn render_specialized_jit_exact_int_compare_uses_operator_fast_path() {
+        let blocks = [1usize as ObjPtr];
+        let mut constants = TestConstantPool::default();
+        let mut function = test_function();
+        let block_label = function.name_gen.next_block_name();
+        let instr_id = InstrId::new(block_label, 0);
+        let block = CodegenBlock {
+            label: block_label,
+            body: vec![],
+            term: ret_term(with_instr_id(
+                op_expr(BinOp::new(
+                    BinOpKind::Lt,
+                    constants.int_expr(1),
+                    constants.int_expr(2),
+                )),
+                instr_id,
+            )),
+            params: vec![],
+            exc_edge: None,
+        };
+        function.blocks = vec![block];
+        let rendered = render_test_jit_function_with_operator_specializations(
+            &function,
+            &blocks,
+            constants.module_constants,
+            &[(
+                instr_id,
+                crate::operator_specialization::pack_binary_shape(
+                    crate::operator_specialization::ExactTypeTag::Int,
+                    crate::operator_specialization::ExactTypeTag::Int,
+                ),
+            )],
+        );
+        assert!(
+            rendered.contains("call dp_jit_exact_long_binary_op"),
+            "exact-int compare specialization should call the direct helper:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("iconst.i64 257"),
+            "exact-int compare specialization should guard on the profiled exact-int shape:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn render_specialized_jit_exact_int_unary_uses_operator_fast_path() {
+        let blocks = [1usize as ObjPtr];
+        let mut constants = TestConstantPool::default();
+        let mut function = test_function();
+        let block_label = function.name_gen.next_block_name();
+        let instr_id = InstrId::new(block_label, 0);
+        let block = CodegenBlock {
+            label: block_label,
+            body: vec![],
+            term: ret_term(with_instr_id(
+                op_expr(soac_blockpy::block_py::UnaryOp::new(
+                    soac_blockpy::block_py::UnaryOpKind::Neg,
+                    constants.int_expr(1),
+                )),
+                instr_id,
+            )),
+            params: vec![],
+            exc_edge: None,
+        };
+        function.blocks = vec![block];
+        let rendered = render_test_jit_function_with_operator_specializations(
+            &function,
+            &blocks,
+            constants.module_constants,
+            &[(
+                instr_id,
+                crate::operator_specialization::pack_unary_shape(
+                    crate::operator_specialization::ExactTypeTag::Int,
+                ),
+            )],
+        );
+        assert!(
+            rendered.contains("call dp_jit_exact_long_unary_op"),
+            "exact-int unary specialization should call the direct helper:\n{rendered}"
         );
     }
 

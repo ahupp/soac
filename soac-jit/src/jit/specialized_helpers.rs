@@ -5,6 +5,8 @@ use std::ffi::c_void;
 use std::ptr;
 use std::sync::OnceLock;
 
+use crate::operator_specialization::{ExactIntBinaryOpKind, ExactIntUnaryOpKind};
+
 #[cfg(not(test))]
 use crate::module_globals::ModuleGlobalCache;
 
@@ -16,6 +18,7 @@ use crate::module_constants::load_runtime_name_owned;
 unsafe extern "C" {
     static mut PyFunction_Type: ffi::PyTypeObject;
     static mut PyMethod_Type: ffi::PyTypeObject;
+    static mut PyLong_Type: ffi::PyTypeObject;
 }
 
 #[cfg(not(test))]
@@ -116,41 +119,6 @@ unsafe extern "C" fn guard_method_type_version_hook(
         return 0;
     }
     ((*receiver_type).tp_version_tag == expected_version as u32) as i32
-}
-
-#[cfg(not(test))]
-unsafe extern "C" fn lookup_direct_code_ptr_hook(vmctx: ObjPtr, function_id: i64) -> ObjPtr {
-    if vmctx.is_null() || function_id < 0 {
-        ffi::PyErr_SetString(
-            ffi::PyExc_RuntimeError,
-            b"invalid arguments to dp_jit_lookup_direct_code_ptr\0".as_ptr() as *const i8,
-        );
-        return ptr::null_mut();
-    }
-    let vmctx = &*(vmctx as *const super::vmctx::JitModuleVmCtx);
-    let Some(shared_state) = vmctx.shared_module_state.as_ref() else {
-        ffi::PyErr_SetString(
-            ffi::PyExc_RuntimeError,
-            b"missing shared module state for direct JIT call\0".as_ptr() as *const i8,
-        );
-        return ptr::null_mut();
-    };
-    match shared_state.lookup_or_compile_direct_code_ptr(soac_blockpy::block_py::FunctionId::from_packed(function_id as u64))
-    {
-        Ok(Some(code_ptr)) => code_ptr,
-        Ok(None) => ptr::null_mut(),
-        Err(err) => {
-            if let Ok(message) = std::ffi::CString::new(err) {
-                ffi::PyErr_SetString(ffi::PyExc_RuntimeError, message.as_ptr());
-            } else {
-                ffi::PyErr_SetString(
-                    ffi::PyExc_RuntimeError,
-                    b"failed to resolve direct JIT code pointer\0".as_ptr() as *const i8,
-                );
-            }
-            ptr::null_mut()
-        }
-    }
 }
 
 #[cfg(not(test))]
@@ -1268,6 +1236,205 @@ macro_rules! define_unary_obj_wrapper {
     };
 }
 
+unsafe fn exact_long_type_mismatch_error() {
+    ffi::PyErr_SetString(
+        ffi::PyExc_RuntimeError,
+        c"exact long specialization received a non-int operand".as_ptr(),
+    );
+}
+
+unsafe fn exact_long_missing_slot_error() {
+    ffi::PyErr_SetString(
+        ffi::PyExc_RuntimeError,
+        c"exact long specialization missing slot".as_ptr(),
+    );
+}
+
+unsafe extern "C" fn dp_jit_exact_long_binary_op(kind: i64, lhs: ObjPtr, rhs: ObjPtr) -> ObjPtr {
+    let lhs = lhs as *mut ffi::PyObject;
+    let rhs = rhs as *mut ffi::PyObject;
+    if lhs.is_null() || rhs.is_null() {
+        return ptr::null_mut();
+    }
+    let long_type = std::ptr::addr_of_mut!(PyLong_Type);
+    if ffi::Py_TYPE(lhs) != long_type || ffi::Py_TYPE(rhs) != long_type {
+        exact_long_type_mismatch_error();
+        return ptr::null_mut();
+    }
+    let methods = (*long_type).tp_as_number;
+    if methods.is_null() {
+        exact_long_missing_slot_error();
+        return ptr::null_mut();
+    }
+
+    let result = match kind {
+        x if x == ExactIntBinaryOpKind::Add as i64 => (*methods).nb_add.map(|slot| slot(lhs, rhs)),
+        x if x == ExactIntBinaryOpKind::Sub as i64 => {
+            (*methods).nb_subtract.map(|slot| slot(lhs, rhs))
+        }
+        x if x == ExactIntBinaryOpKind::Mul as i64 => {
+            (*methods).nb_multiply.map(|slot| slot(lhs, rhs))
+        }
+        x if x == ExactIntBinaryOpKind::TrueDiv as i64 => {
+            (*methods).nb_true_divide.map(|slot| slot(lhs, rhs))
+        }
+        x if x == ExactIntBinaryOpKind::FloorDiv as i64 => {
+            (*methods).nb_floor_divide.map(|slot| slot(lhs, rhs))
+        }
+        x if x == ExactIntBinaryOpKind::Mod as i64 => {
+            (*methods).nb_remainder.map(|slot| slot(lhs, rhs))
+        }
+        x if x == ExactIntBinaryOpKind::Pow as i64 => {
+            (*methods).nb_power.map(|slot| slot(lhs, rhs, ffi::Py_None()))
+        }
+        x if x == ExactIntBinaryOpKind::LShift as i64 => {
+            (*methods).nb_lshift.map(|slot| slot(lhs, rhs))
+        }
+        x if x == ExactIntBinaryOpKind::RShift as i64 => {
+            (*methods).nb_rshift.map(|slot| slot(lhs, rhs))
+        }
+        x if x == ExactIntBinaryOpKind::Or as i64 => (*methods).nb_or.map(|slot| slot(lhs, rhs)),
+        x if x == ExactIntBinaryOpKind::Xor as i64 => {
+            (*methods).nb_xor.map(|slot| slot(lhs, rhs))
+        }
+        x if x == ExactIntBinaryOpKind::And as i64 => {
+            (*methods).nb_and.map(|slot| slot(lhs, rhs))
+        }
+        x if x == ExactIntBinaryOpKind::InplaceAdd as i64 => (*methods)
+            .nb_inplace_add
+            .or((*methods).nb_add)
+            .map(|slot| slot(lhs, rhs)),
+        x if x == ExactIntBinaryOpKind::InplaceSub as i64 => (*methods)
+            .nb_inplace_subtract
+            .or((*methods).nb_subtract)
+            .map(|slot| slot(lhs, rhs)),
+        x if x == ExactIntBinaryOpKind::InplaceMul as i64 => (*methods)
+            .nb_inplace_multiply
+            .or((*methods).nb_multiply)
+            .map(|slot| slot(lhs, rhs)),
+        x if x == ExactIntBinaryOpKind::InplaceTrueDiv as i64 => (*methods)
+            .nb_inplace_true_divide
+            .or((*methods).nb_true_divide)
+            .map(|slot| slot(lhs, rhs)),
+        x if x == ExactIntBinaryOpKind::InplaceFloorDiv as i64 => (*methods)
+            .nb_inplace_floor_divide
+            .or((*methods).nb_floor_divide)
+            .map(|slot| slot(lhs, rhs)),
+        x if x == ExactIntBinaryOpKind::InplaceMod as i64 => (*methods)
+            .nb_inplace_remainder
+            .or((*methods).nb_remainder)
+            .map(|slot| slot(lhs, rhs)),
+        x if x == ExactIntBinaryOpKind::InplacePow as i64 => (*methods)
+            .nb_inplace_power
+            .or((*methods).nb_power)
+            .map(|slot| slot(lhs, rhs, ffi::Py_None())),
+        x if x == ExactIntBinaryOpKind::InplaceLShift as i64 => (*methods)
+            .nb_inplace_lshift
+            .or((*methods).nb_lshift)
+            .map(|slot| slot(lhs, rhs)),
+        x if x == ExactIntBinaryOpKind::InplaceRShift as i64 => (*methods)
+            .nb_inplace_rshift
+            .or((*methods).nb_rshift)
+            .map(|slot| slot(lhs, rhs)),
+        x if x == ExactIntBinaryOpKind::InplaceOr as i64 => (*methods)
+            .nb_inplace_or
+            .or((*methods).nb_or)
+            .map(|slot| slot(lhs, rhs)),
+        x if x == ExactIntBinaryOpKind::InplaceXor as i64 => (*methods)
+            .nb_inplace_xor
+            .or((*methods).nb_xor)
+            .map(|slot| slot(lhs, rhs)),
+        x if x == ExactIntBinaryOpKind::InplaceAnd as i64 => (*methods)
+            .nb_inplace_and
+            .or((*methods).nb_and)
+            .map(|slot| slot(lhs, rhs)),
+        x if x == ExactIntBinaryOpKind::Eq as i64 => {
+            (*long_type).tp_richcompare.map(|slot| slot(lhs, rhs, ffi::Py_EQ))
+        }
+        x if x == ExactIntBinaryOpKind::Ne as i64 => {
+            (*long_type).tp_richcompare.map(|slot| slot(lhs, rhs, ffi::Py_NE))
+        }
+        x if x == ExactIntBinaryOpKind::Lt as i64 => {
+            (*long_type).tp_richcompare.map(|slot| slot(lhs, rhs, ffi::Py_LT))
+        }
+        x if x == ExactIntBinaryOpKind::Le as i64 => {
+            (*long_type).tp_richcompare.map(|slot| slot(lhs, rhs, ffi::Py_LE))
+        }
+        x if x == ExactIntBinaryOpKind::Gt as i64 => {
+            (*long_type).tp_richcompare.map(|slot| slot(lhs, rhs, ffi::Py_GT))
+        }
+        x if x == ExactIntBinaryOpKind::Ge as i64 => {
+            (*long_type).tp_richcompare.map(|slot| slot(lhs, rhs, ffi::Py_GE))
+        }
+        _ => None,
+    };
+    let Some(result) = result else {
+        exact_long_missing_slot_error();
+        return ptr::null_mut();
+    };
+    result as ObjPtr
+}
+
+unsafe extern "C" fn dp_jit_exact_long_unary_op(kind: i64, operand: ObjPtr) -> ObjPtr {
+    let operand = operand as *mut ffi::PyObject;
+    if operand.is_null() {
+        return ptr::null_mut();
+    }
+    let long_type = std::ptr::addr_of_mut!(PyLong_Type);
+    if ffi::Py_TYPE(operand) != long_type {
+        exact_long_type_mismatch_error();
+        return ptr::null_mut();
+    }
+    let methods = (*long_type).tp_as_number;
+    if methods.is_null() {
+        exact_long_missing_slot_error();
+        return ptr::null_mut();
+    }
+    match kind {
+        x if x == ExactIntUnaryOpKind::Pos as i64 => {
+            let Some(slot) = (*methods).nb_positive else {
+                exact_long_missing_slot_error();
+                return ptr::null_mut();
+            };
+            slot(operand) as ObjPtr
+        }
+        x if x == ExactIntUnaryOpKind::Neg as i64 => {
+            let Some(slot) = (*methods).nb_negative else {
+                exact_long_missing_slot_error();
+                return ptr::null_mut();
+            };
+            slot(operand) as ObjPtr
+        }
+        x if x == ExactIntUnaryOpKind::Invert as i64 => {
+            let Some(slot) = (*methods).nb_invert else {
+                exact_long_missing_slot_error();
+                return ptr::null_mut();
+            };
+            slot(operand) as ObjPtr
+        }
+        x if x == ExactIntUnaryOpKind::Not as i64 || x == ExactIntUnaryOpKind::Truth as i64 => {
+            let Some(slot) = (*methods).nb_bool else {
+                exact_long_missing_slot_error();
+                return ptr::null_mut();
+            };
+            let truth = slot(operand);
+            if truth < 0 {
+                return ptr::null_mut();
+            }
+            let truth = if x == ExactIntUnaryOpKind::Not as i64 {
+                (truth == 0) as libc::c_long
+            } else {
+                (truth != 0) as libc::c_long
+            };
+            ffi::PyBool_FromLong(truth) as ObjPtr
+        }
+        _ => {
+            exact_long_missing_slot_error();
+            ptr::null_mut()
+        }
+    }
+}
+
 macro_rules! define_unary_i32_wrapper {
     ($fn_name:ident, $symbol:literal) => {
         unsafe extern "C" fn $fn_name(value: ObjPtr) -> i32 {
@@ -1511,6 +1678,14 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
     );
     builder.symbol("PyObject_Not", pyobject_not_wrapper as *const u8);
     builder.symbol("PyObject_IsTrue", pyobject_is_true_wrapper as *const u8);
+    builder.symbol(
+        "dp_jit_exact_long_binary_op",
+        dp_jit_exact_long_binary_op as *const u8,
+    );
+    builder.symbol(
+        "dp_jit_exact_long_unary_op",
+        dp_jit_exact_long_unary_op as *const u8,
+    );
     builder.symbol("PyNumber_Add", pynumber_add_wrapper as *const u8);
     builder.symbol("PyNumber_Subtract", pynumber_subtract_wrapper as *const u8);
     builder.symbol("PyNumber_Multiply", pynumber_multiply_wrapper as *const u8);
