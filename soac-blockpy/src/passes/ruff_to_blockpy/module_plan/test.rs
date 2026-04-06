@@ -589,7 +589,7 @@ fn lowering_nonlocal_inner_captures_outer_cell() {
         });
     assert!(
         rendered
-            .contains("StoreName(\"inner\", MakeFunction(0:0, Function, tuple_values(), NONE))"),
+            .contains("StoreName(\"inner\", MakeFunction(0:1, Function, tuple_values(), NONE))"),
         "{rendered}"
     );
 }

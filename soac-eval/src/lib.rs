@@ -511,11 +511,11 @@ pub unsafe fn registered_clif_function_id(
     if ffi::PyFunction_Check(function) == 0 {
         return Ok(None);
     }
-    let packed_plus_one = PyFunction_GetSoacFunctionId(function);
-    if packed_plus_one == 0 {
+    let packed = PyFunction_GetSoacFunctionId(function);
+    if packed == 0 {
         return Ok(None);
     }
-    Ok(Some(FunctionId::from_packed(packed_plus_one - 1)))
+    Ok(Some(FunctionId::from_packed(packed)))
 }
 
 pub unsafe fn registered_clif_type_function_id(
@@ -528,11 +528,11 @@ pub unsafe fn registered_clif_type_function_id(
     if ((*type_obj).tp_flags & ffi::Py_TPFLAGS_HEAPTYPE) == 0 {
         return Ok(None);
     }
-    let packed_plus_one = PyType_GetSoacFunctionId(type_obj as *mut ffi::PyObject);
-    if packed_plus_one == 0 {
+    let packed = PyType_GetSoacFunctionId(type_obj as *mut ffi::PyObject);
+    if packed == 0 {
         return Ok(None);
     }
-    Ok(Some(FunctionId::from_packed(packed_plus_one - 1)))
+    Ok(Some(FunctionId::from_packed(packed)))
 }
 
 unsafe fn register_owner_type_for_function(
@@ -835,19 +835,9 @@ unsafe fn register_owner_types_from_type(
         }
     }
     if let Some(function_id) = constructor_function_id {
-        let encoded_function_id = function_id
-            .packed()
-            .checked_add(1)
-            .ok_or_else(|| {
-                ffi::PyErr_SetString(
-                    ffi::PyExc_RuntimeError,
-                    c"SOAC type function id overflow".as_ptr(),
-                );
-            })
-            .map_err(|_| ())?;
         if PyType_SetSoacMetadata(
             owner_type as *mut ffi::PyObject,
-            encoded_function_id,
+            function_id.packed(),
             ptr::null_mut(),
             None,
         ) != 0
@@ -1427,19 +1417,9 @@ pub unsafe fn register_clif_vectorcall(
     }
 
     let data_ptr = make_clif_function_data(function, function_id, module_runtime)?;
-    let packed_plus_one = function_id
-        .packed()
-        .checked_add(1)
-        .ok_or_else(|| {
-            ffi::PyErr_SetString(
-                ffi::PyExc_RuntimeError,
-                c"SOAC function id overflow".as_ptr(),
-            );
-        })
-        .map_err(|_| ())?;
     if PyFunction_SetSoacMetadata(
         function,
-        packed_plus_one,
+        function_id.packed(),
         data_ptr,
         Some(free_clif_function_data),
     ) != 0
@@ -1713,15 +1693,11 @@ mod tests {
             TEST_SOAC_METADATA_DROPS.store(0, Ordering::SeqCst);
             let function = make_test_function(py);
             let function_id = FunctionId::new(7, 11);
-            let encoded_function_id = function_id
-                .packed()
-                .checked_add(1)
-                .expect("test function id encoding should not overflow");
             let metadata = Box::into_raw(Box::new(123usize)) as *mut c_void;
             assert_eq!(
                 PyFunction_SetSoacMetadata(
                     function,
-                    encoded_function_id,
+                    function_id.packed(),
                     metadata,
                     Some(free_test_soac_metadata),
                 ),
@@ -1735,8 +1711,8 @@ mod tests {
             );
             assert_eq!(
                 PyFunction_GetSoacFunctionId(function),
-                encoded_function_id,
-                "encoded function id should round-trip"
+                function_id.packed(),
+                "packed function id should round-trip"
             );
             assert_eq!(
                 registered_clif_function_id(function).expect("function id lookup should succeed"),
@@ -1744,7 +1720,12 @@ mod tests {
                 "registered function id should decode from SOAC metadata"
             );
             assert_eq!(
-                PyFunction_SetSoacMetadata(function, 0, ptr::null_mut(), None),
+                PyFunction_SetSoacMetadata(
+                    function,
+                    0,
+                    ptr::null_mut(),
+                    None,
+                ),
                 0,
                 "clearing SOAC metadata should succeed"
             );
@@ -1775,15 +1756,11 @@ mod tests {
             let (_module, cls) = make_test_module(py);
             let class_obj = cls.as_ptr();
             let function_id = FunctionId::new(9, 3);
-            let encoded_function_id = function_id
-                .packed()
-                .checked_add(1)
-                .expect("test function id encoding should not overflow");
             let metadata = Box::into_raw(Box::new(321usize)) as *mut c_void;
             assert_eq!(
                 PyType_SetSoacMetadata(
                     class_obj,
-                    encoded_function_id,
+                    function_id.packed(),
                     metadata,
                     Some(free_test_soac_metadata),
                 ),
@@ -1797,8 +1774,8 @@ mod tests {
             );
             assert_eq!(
                 PyType_GetSoacFunctionId(class_obj),
-                encoded_function_id,
-                "encoded type function id should round-trip"
+                function_id.packed(),
+                "packed type function id should round-trip"
             );
             assert_eq!(
                 registered_clif_type_function_id(class_obj)
@@ -1807,7 +1784,12 @@ mod tests {
                 "registered type function id should decode from SOAC metadata"
             );
             assert_eq!(
-                PyType_SetSoacMetadata(class_obj, 0, ptr::null_mut(), None),
+                PyType_SetSoacMetadata(
+                    class_obj,
+                    0,
+                    ptr::null_mut(),
+                    None,
+                ),
                 0,
                 "clearing SOAC type metadata should succeed"
             );
@@ -1837,12 +1819,13 @@ mod tests {
             let owner_type = cls.as_ptr() as *mut ffi::PyTypeObject;
             let init_function = class_dict_function(owner_type, c"__init__");
             let function_id = FunctionId::new(10, 4);
-            let encoded_function_id = function_id
-                .packed()
-                .checked_add(1)
-                .expect("test function id encoding should not overflow");
             assert_eq!(
-                PyFunction_SetSoacMetadata(init_function, encoded_function_id, ptr::null_mut(), None),
+                PyFunction_SetSoacMetadata(
+                    init_function,
+                    function_id.packed(),
+                    ptr::null_mut(),
+                    None,
+                ),
                 0,
                 "registering __init__ SOAC id should succeed"
             );
@@ -1850,8 +1833,8 @@ mod tests {
                 .expect("owner type registration should succeed");
             assert_eq!(
                 PyType_GetSoacFunctionId(cls.as_ptr()),
-                encoded_function_id,
-                "owner type registration should attach encoded __init__ function id"
+                function_id.packed(),
+                "owner type registration should attach packed __init__ function id"
             );
             assert_eq!(
                 registered_clif_type_function_id(cls.as_ptr())

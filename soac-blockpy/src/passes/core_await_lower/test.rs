@@ -25,7 +25,7 @@ fn lowers_await_to_yield_from_await_iter() {
         module_name_gen: crate::block_py::ModuleNameGen::new(0),
         global_names: Vec::new(),
         callable_defs: vec![BlockPyFunction {
-            function_id: crate::block_py::FunctionId::new(0, 0),
+            function_id: crate::block_py::FunctionId::new(0, 1),
             name_gen: test_name_gen(),
             names: FunctionName::new("f", "f", "f", "f"),
             kind: FunctionKind::Coroutine,

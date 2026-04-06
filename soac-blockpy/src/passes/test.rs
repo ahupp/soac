@@ -1796,7 +1796,7 @@ def outer():
     assert!(
         blockpy_rendered.contains("function outer.<locals>.inner():")
             && blockpy_rendered.contains(
-                "StoreName(\"inner\", MakeFunction(0:0, Function, tuple_values(), NONE))"
+                "StoreName(\"inner\", MakeFunction(0:1, Function, tuple_values(), NONE))"
             )
             && blockpy_rendered.contains("Del {")
             && blockpy_rendered.contains("quietly: false"),

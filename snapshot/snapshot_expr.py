@@ -5,7 +5,7 @@ x = a[b]
 # ==
 
 # function _dp_module_init():
-#     function_id: 0:0
+#     function_id: 0:1
 #     block bb1:
 #         StoreName("x", GetItem(a, b))
 #         return NONE
@@ -17,7 +17,7 @@ x = a[1:2:3]
 # ==
 
 # function _dp_module_init():
-#     function_id: 0:0
+#     function_id: 0:1
 #     block bb1:
 #         StoreName("x", GetItem(a, slice(1, 2, 3)))
 #         return NONE
@@ -29,7 +29,7 @@ x = a + b
 # ==
 
 # function _dp_module_init():
-#     function_id: 0:0
+#     function_id: 0:1
 #     block bb1:
 #         StoreName("x", BinOp(Add, a, b))
 #         return NONE
@@ -41,7 +41,7 @@ x = a | b
 # ==
 
 # function _dp_module_init():
-#     function_id: 0:0
+#     function_id: 0:1
 #     block bb1:
 #         StoreName("x", BinOp(Or, a, b))
 #         return NONE
@@ -53,7 +53,7 @@ x = -a
 # ==
 
 # function _dp_module_init():
-#     function_id: 0:0
+#     function_id: 0:1
 #     block bb1:
 #         StoreName("x", UnaryOp(Neg, a))
 #         return NONE
@@ -65,7 +65,7 @@ x = a and b or c
 # ==
 
 # function _dp_module_init():
-#     function_id: 0:0
+#     function_id: 0:1
 #     block bb1:
 #         StoreName("_dp_target_2", a)
 #         if_term _dp_target_2:
@@ -97,7 +97,7 @@ x = a < b
 # ==
 
 # function _dp_module_init():
-#     function_id: 0:0
+#     function_id: 0:1
 #     block bb1:
 #         StoreName("x", BinOp(Lt, a, b))
 #         return NONE
@@ -109,7 +109,7 @@ x = a < b < c
 # ==
 
 # function _dp_module_init():
-#     function_id: 0:0
+#     function_id: 0:1
 #     block bb1:
 #         StoreName("_dp_compare_1", a)
 #         StoreName("_dp_compare_3", b)
@@ -133,7 +133,7 @@ x = a not in b
 # ==
 
 # function _dp_module_init():
-#     function_id: 0:0
+#     function_id: 0:1
 #     block bb1:
 #         StoreName("x", UnaryOp(Not, BinOp(Contains, b, a)))
 #         return NONE
@@ -145,7 +145,7 @@ x = a if cond else b
 # ==
 
 # function _dp_module_init():
-#     function_id: 0:0
+#     function_id: 0:1
 #     block bb1:
 #         if_term cond:
 #             then:
@@ -167,7 +167,7 @@ x = (y := f())
 # ==
 
 # function _dp_module_init():
-#     function_id: 0:0
+#     function_id: 0:1
 #     block bb1:
 #         StoreName("y", f())
 #         StoreName("x", y)
@@ -180,15 +180,15 @@ x = lambda y: y + 1
 # ==
 
 # function <lambda>(y):
-#     function_id: 0:0
+#     function_id: 0:1
 #     display_name: <lambda>
 #     block bb1:
 #         return BinOp(Add, y, 1)
 
 # function _dp_module_init():
-#     function_id: 0:1
+#     function_id: 0:2
 #     block bb1:
-#         StoreName("x", MakeFunction(0:0, Function, tuple_values(), NONE))
+#         StoreName("x", MakeFunction(0:1, Function, tuple_values(), NONE))
 #         return NONE
 
 # generator_expr
@@ -198,7 +198,7 @@ x = (i for i in it)
 # ==
 
 # generator <genexpr>(_dp_iter_2):
-#     function_id: 0:0
+#     function_id: 0:1
 #     display_name: <genexpr>
 #     block bb2:
 #         StoreName("_dp_iter_3", _dp_iter_2)
@@ -222,9 +222,9 @@ x = (i for i in it)
 #                         return NONE
 
 # function _dp_module_init():
-#     function_id: 0:1
+#     function_id: 0:2
 #     block bb1:
-#         StoreName("_dp_genexpr_1", MakeFunction(0:0, Generator, tuple_values(), NONE))
+#         StoreName("_dp_genexpr_1", MakeFunction(0:1, Generator, tuple_values(), NONE))
 #         StoreName("x", _dp_genexpr_1(iter(it)))
 #         return NONE
 
@@ -235,7 +235,7 @@ x = [a, b]
 # ==
 
 # function _dp_module_init():
-#     function_id: 0:0
+#     function_id: 0:1
 #     block bb1:
 #         StoreName("x", list(tuple_values(a, b)))
 #         return NONE
@@ -247,7 +247,7 @@ x = [a, *b]
 # ==
 
 # function _dp_module_init():
-#     function_id: 0:0
+#     function_id: 0:1
 #     block bb1:
 #         StoreName("x", list(BinOp(Add, tuple_values(a), tuple_from_iter(b))))
 #         return NONE
@@ -259,7 +259,7 @@ x = (a, *b)
 # ==
 
 # function _dp_module_init():
-#     function_id: 0:0
+#     function_id: 0:1
 #     block bb1:
 #         StoreName("x", BinOp(Add, tuple_values(a), tuple_from_iter(b)))
 #         return NONE
@@ -271,7 +271,7 @@ x = {a, b}
 # ==
 
 # function _dp_module_init():
-#     function_id: 0:0
+#     function_id: 0:1
 #     block bb1:
 #         StoreName("x", set(tuple_values(a, b)))
 #         return NONE
@@ -283,7 +283,7 @@ x = {"a": 1, "b": 2}
 # ==
 
 # function _dp_module_init():
-#     function_id: 0:0
+#     function_id: 0:1
 #     block bb1:
 #         StoreName("x", dict(tuple_values(tuple_values("a", 1), tuple_values("b", 2))))
 #         return NONE
@@ -295,7 +295,7 @@ x = {"a": 1, **m, "b": 2}
 # ==
 
 # function _dp_module_init():
-#     function_id: 0:0
+#     function_id: 0:1
 #     block bb1:
 #         StoreName("x", BinOp(Or, BinOp(Or, dict(tuple_values(tuple_values("a", 1))), dict(m)), dict(tuple_values(tuple_values("b", 2)))))
 #         return NONE
@@ -307,32 +307,32 @@ x = [i for i in it]
 # ==
 
 # function _dp_listcomp_3(_dp_iter_2):
-#     function_id: 0:0
+#     function_id: 0:1
 #     display_name: <listcomp>
 #     block bb3:
 #         StoreName("_dp_tmp_1", list(tuple_values()))
-#         StoreName("_dp_iter_0_0_0", iter(_dp_iter_2))
+#         StoreName("_dp_iter_0_1_0", iter(_dp_iter_2))
 #         jump bb1
 #         block bb1:
-#             StoreName("_dp_tmp_0_0_1", next_or_sentinel(_dp_iter_0_0_0))
-#             if_term BinOp(Is, _dp_tmp_0_0_1, ITER_COMPLETE):
+#             StoreName("_dp_tmp_0_1_1", next_or_sentinel(_dp_iter_0_1_0))
+#             if_term BinOp(Is, _dp_tmp_0_1_1, ITER_COMPLETE):
 #                 then:
 #                     block bb4:
 #                         return _dp_tmp_1
 #                 else:
 #                     block bb2:
-#                         StoreName("_dp_tmp_0_0_1", _dp_tmp_0_0_1)
-#                         StoreName("i", _dp_tmp_0_0_1)
-#                         Del { name: "_dp_tmp_0_0_1", quietly: false }
+#                         StoreName("_dp_tmp_0_1_1", _dp_tmp_0_1_1)
+#                         StoreName("i", _dp_tmp_0_1_1)
+#                         Del { name: "_dp_tmp_0_1_1", quietly: false }
 #                         jump bb5
 #                         block bb5:
 #                             GetAttr(_dp_tmp_1, "append")(i)
 #                             jump bb1
 
 # function _dp_module_init():
-#     function_id: 0:1
+#     function_id: 0:2
 #     block bb1:
-#         StoreName("_dp_listcomp_3", MakeFunction(0:0, Function, tuple_values(), NONE))
+#         StoreName("_dp_listcomp_3", MakeFunction(0:1, Function, tuple_values(), NONE))
 #         StoreName("x", _dp_listcomp_3(it))
 #         return NONE
 
@@ -343,32 +343,32 @@ x = {i for i in it}
 # ==
 
 # function _dp_setcomp_3(_dp_iter_2):
-#     function_id: 0:0
+#     function_id: 0:1
 #     display_name: <setcomp>
 #     block bb3:
 #         StoreName("_dp_tmp_1", set())
-#         StoreName("_dp_iter_0_0_0", iter(_dp_iter_2))
+#         StoreName("_dp_iter_0_1_0", iter(_dp_iter_2))
 #         jump bb1
 #         block bb1:
-#             StoreName("_dp_tmp_0_0_1", next_or_sentinel(_dp_iter_0_0_0))
-#             if_term BinOp(Is, _dp_tmp_0_0_1, ITER_COMPLETE):
+#             StoreName("_dp_tmp_0_1_1", next_or_sentinel(_dp_iter_0_1_0))
+#             if_term BinOp(Is, _dp_tmp_0_1_1, ITER_COMPLETE):
 #                 then:
 #                     block bb4:
 #                         return _dp_tmp_1
 #                 else:
 #                     block bb2:
-#                         StoreName("_dp_tmp_0_0_1", _dp_tmp_0_0_1)
-#                         StoreName("i", _dp_tmp_0_0_1)
-#                         Del { name: "_dp_tmp_0_0_1", quietly: false }
+#                         StoreName("_dp_tmp_0_1_1", _dp_tmp_0_1_1)
+#                         StoreName("i", _dp_tmp_0_1_1)
+#                         Del { name: "_dp_tmp_0_1_1", quietly: false }
 #                         jump bb5
 #                         block bb5:
 #                             GetAttr(_dp_tmp_1, "add")(i)
 #                             jump bb1
 
 # function _dp_module_init():
-#     function_id: 0:1
+#     function_id: 0:2
 #     block bb1:
-#         StoreName("_dp_setcomp_3", MakeFunction(0:0, Function, tuple_values(), NONE))
+#         StoreName("_dp_setcomp_3", MakeFunction(0:1, Function, tuple_values(), NONE))
 #         StoreName("x", _dp_setcomp_3(it))
 #         return NONE
 
@@ -379,26 +379,26 @@ x = {k: v for k, v in it}
 # ==
 
 # function _dp_dictcomp_5(_dp_iter_4):
-#     function_id: 0:0
+#     function_id: 0:1
 #     display_name: <dictcomp>
 #     block bb3:
 #         StoreName("_dp_tmp_1", dict())
-#         StoreName("_dp_iter_0_0_0", iter(_dp_iter_4))
+#         StoreName("_dp_iter_0_1_0", iter(_dp_iter_4))
 #         jump bb1
 #         block bb1:
-#             StoreName("_dp_tmp_0_0_1", next_or_sentinel(_dp_iter_0_0_0))
-#             if_term BinOp(Is, _dp_tmp_0_0_1, ITER_COMPLETE):
+#             StoreName("_dp_tmp_0_1_1", next_or_sentinel(_dp_iter_0_1_0))
+#             if_term BinOp(Is, _dp_tmp_0_1_1, ITER_COMPLETE):
 #                 then:
 #                     block bb4:
 #                         return _dp_tmp_1
 #                 else:
 #                     block bb2:
-#                         StoreName("_dp_tmp_0_0_1", _dp_tmp_0_0_1)
-#                         StoreName("_dp_tmp_0_0_2", unpack(_dp_tmp_0_0_1, tuple_values(TRUE, TRUE)))
-#                         StoreName("k", GetItem(_dp_tmp_0_0_2, 0))
-#                         StoreName("v", GetItem(_dp_tmp_0_0_2, 1))
-#                         Del { name: "_dp_tmp_0_0_2", quietly: false }
-#                         Del { name: "_dp_tmp_0_0_1", quietly: false }
+#                         StoreName("_dp_tmp_0_1_1", _dp_tmp_0_1_1)
+#                         StoreName("_dp_tmp_0_1_2", unpack(_dp_tmp_0_1_1, tuple_values(TRUE, TRUE)))
+#                         StoreName("k", GetItem(_dp_tmp_0_1_2, 0))
+#                         StoreName("v", GetItem(_dp_tmp_0_1_2, 1))
+#                         Del { name: "_dp_tmp_0_1_2", quietly: false }
+#                         Del { name: "_dp_tmp_0_1_1", quietly: false }
 #                         jump bb5
 #                         block bb5:
 #                             StoreName("_dp_dictcomp_key_2", k)
@@ -410,9 +410,9 @@ x = {k: v for k, v in it}
 #                             jump bb1
 
 # function _dp_module_init():
-#     function_id: 0:1
+#     function_id: 0:2
 #     block bb1:
-#         StoreName("_dp_dictcomp_5", MakeFunction(0:0, Function, tuple_values(), NONE))
+#         StoreName("_dp_dictcomp_5", MakeFunction(0:1, Function, tuple_values(), NONE))
 #         StoreName("x", _dp_dictcomp_5(it))
 #         return NONE
 
@@ -423,7 +423,7 @@ x = f().y
 # ==
 
 # function _dp_module_init():
-#     function_id: 0:0
+#     function_id: 0:1
 #     block bb1:
 #         StoreName("x", GetAttr(f(), "y"))
 #         return NONE
@@ -435,7 +435,7 @@ x = f"{a}"
 # ==
 
 # function _dp_module_init():
-#     function_id: 0:0
+#     function_id: 0:1
 #     block bb1:
 #         StoreName("x", format(a))
 #         return NONE
@@ -447,7 +447,7 @@ x = t"{a}"
 # ==
 
 # function _dp_module_init():
-#     function_id: 0:0
+#     function_id: 0:1
 #     block bb1:
 #         StoreName("x", templatelib_Template(*tuple_values(templatelib_Interpolation(a, "a", NONE, ""))))
 #         return NONE
@@ -468,7 +468,7 @@ x = 1.234567890123456789
 # ==
 
 # function _dp_module_init():
-#     function_id: 0:0
+#     function_id: 0:1
 #     block bb1:
 #         StoreName("x", 1.2345678901234567)
 #         return NONE

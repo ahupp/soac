@@ -7,7 +7,7 @@ use std::sync::Arc;
 pub struct FunctionId(u64);
 
 impl FunctionId {
-    pub const GLOBAL: Self = Self(0);
+    pub const GLOBAL: Self = Self(u64::MAX);
 
     pub const fn new(module_id: u32, function_id: u32) -> Self {
         Self(((module_id as u64) << 32) | function_id as u64)
@@ -148,7 +148,7 @@ impl ModuleNameGen {
     pub fn new(module_id: u32) -> Self {
         Self {
             module_id,
-            state: Arc::new(AtomicU32::new(0)),
+            state: Arc::new(AtomicU32::new(1)),
         }
     }
 

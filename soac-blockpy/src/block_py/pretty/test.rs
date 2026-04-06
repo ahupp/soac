@@ -238,7 +238,7 @@ fn renders_public_closure_metadata_in_function_header() {
         module_name_gen: crate::block_py::ModuleNameGen::new(0),
         global_names: Vec::new(),
         callable_defs: vec![BlockPyFunction::<CoreBlockPyPassWithAwaitAndYield> {
-            function_id: crate::block_py::FunctionId::new(0, 0),
+            function_id: crate::block_py::FunctionId::new(0, 1),
             name_gen: test_name_gen(),
             names: crate::block_py::FunctionName::new("gen", "gen", "gen", "gen"),
             kind: FunctionKind::Function,
@@ -276,7 +276,7 @@ fn renders_public_closure_metadata_in_function_header() {
     });
 
     assert!(rendered.contains(
-            "function gen():\n    function_id: 0:0\n    freevars: [factor->factor@inherited]\n    cellvars: [total->_dp_cell_total@deferred]\n    runtime_cells: [_dp_pc->_dp_cell__dp_pc@pc_unstarted]"
+            "function gen():\n    function_id: 0:1\n    freevars: [factor->factor@inherited]\n    cellvars: [total->_dp_cell_total@deferred]\n    runtime_cells: [_dp_pc->_dp_cell__dp_pc@pc_unstarted]"
         ));
     assert!(!rendered.contains("entry:"));
 }
@@ -284,7 +284,7 @@ fn renders_public_closure_metadata_in_function_header() {
 #[test]
 fn renders_followup_blocks_under_their_owning_entry_block() {
     let function: BlockPyFunction<CoreBlockPyPassWithAwaitAndYield> = BlockPyFunction {
-        function_id: crate::block_py::FunctionId::new(0, 0),
+        function_id: crate::block_py::FunctionId::new(0, 1),
         name_gen: test_name_gen(),
         names: crate::block_py::FunctionName::new("f", "f", "f", "f"),
         kind: FunctionKind::Function,
@@ -365,7 +365,7 @@ def choose(a, b):
 #[test]
 fn sorts_rendered_root_and_child_blocks_by_label() {
     let function: BlockPyFunction<CoreBlockPyPassWithAwaitAndYield> = BlockPyFunction {
-        function_id: crate::block_py::FunctionId::new(0, 0),
+        function_id: crate::block_py::FunctionId::new(0, 1),
         name_gen: test_name_gen(),
         names: crate::block_py::FunctionName::new("f", "f", "f", "f"),
         kind: FunctionKind::Function,
@@ -465,7 +465,7 @@ fn renders_bb_block_metadata_with_shared_layout() {
         module_name_gen: crate::block_py::ModuleNameGen::new(0),
         global_names: Vec::new(),
         callable_defs: vec![BlockPyFunction::<ResolvedStorageBlockPyPass> {
-            function_id: crate::block_py::FunctionId::new(0, 0),
+            function_id: crate::block_py::FunctionId::new(0, 1),
             name_gen: test_name_gen(),
             names: crate::block_py::FunctionName::new("f", "f", "f", "f"),
             kind: FunctionKind::Function,
@@ -510,7 +510,7 @@ fn renders_bb_block_metadata_with_shared_layout() {
     });
 
     assert!(rendered.contains("function f():"), "{rendered}");
-    assert!(rendered.contains("function_id: 0:0"), "{rendered}");
+    assert!(rendered.contains("function_id: 0:1"), "{rendered}");
     assert!(
         rendered.contains("block bb0(err: Exception, x: AbruptPayload):"),
         "{rendered}"

@@ -6,9 +6,10 @@ use std::collections::HashMap;
 use std::mem::size_of;
 
 pub const COUNTER_DUMP_MAGIC: [u8; 8] = *b"SOACCNTR";
-pub const COUNTER_DUMP_VERSION: u16 = 5;
+pub const COUNTER_DUMP_VERSION: u16 = 6;
 pub const COUNTER_DUMP_NONE_U32: u32 = u32::MAX;
 pub const COUNTER_DUMP_NONE_U64: u64 = u64::MAX;
+pub const COUNTER_DUMP_NONE_FUNCTION_ID: u64 = 0;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -115,12 +116,12 @@ impl CounterDumpRecord {
             function_id.push(
                 row.function_id
                     .map(FunctionId::packed)
-                    .unwrap_or(COUNTER_DUMP_NONE_U64),
+                    .unwrap_or(COUNTER_DUMP_NONE_FUNCTION_ID),
             );
             current_function_id.push(
                 row.current_function_id
                     .map(FunctionId::packed)
-                    .unwrap_or(COUNTER_DUMP_NONE_U64),
+                    .unwrap_or(COUNTER_DUMP_NONE_FUNCTION_ID),
             );
             instr_block_label.push(
                 row.instr_id

@@ -2048,7 +2048,7 @@ fn emit_callee_function_id_checked(
         .brif(is_heap_type, nonzero_type_id_block, &[], miss_block, &[]);
 
     fb.switch_to_block(nonzero_type_id_block);
-    let packed_plus_one = fb.ins().load(
+    let packed = fb.ins().load(
         i64_ty,
         ir::MemFlags::trusted(),
         callable,
@@ -2056,14 +2056,13 @@ fn emit_callee_function_id_checked(
     );
     let id_is_zero = fb
         .ins()
-        .icmp_imm(ir::condcodes::IntCC::Equal, packed_plus_one, 0);
+        .icmp_imm(ir::condcodes::IntCC::Equal, packed, 0);
     let type_id_done_block = fb.create_block();
     fb.ins()
         .brif(id_is_zero, miss_block, &[], type_id_done_block, &[]);
 
     fb.switch_to_block(type_id_done_block);
-    let callee_id = fb.ins().iadd_imm(packed_plus_one, -1);
-    fb.ins().jump(done_block, &[ir::BlockArg::Value(callee_id)]);
+    fb.ins().jump(done_block, &[ir::BlockArg::Value(packed)]);
 
     fb.switch_to_block(function_value_block);
     let function_value = fb.block_params(function_value_block)[0];
@@ -2079,7 +2078,7 @@ fn emit_callee_function_id_checked(
     );
 
     fb.switch_to_block(nonzero_id_block);
-    let packed_plus_one = fb.ins().load(
+    let packed = fb.ins().load(
         i64_ty,
         ir::MemFlags::trusted(),
         function_value,
@@ -2087,14 +2086,13 @@ fn emit_callee_function_id_checked(
     );
     let id_is_zero = fb
         .ins()
-        .icmp_imm(ir::condcodes::IntCC::Equal, packed_plus_one, 0);
+        .icmp_imm(ir::condcodes::IntCC::Equal, packed, 0);
     let id_done_block = fb.create_block();
     fb.ins()
         .brif(id_is_zero, miss_block, &[], id_done_block, &[]);
 
     fb.switch_to_block(id_done_block);
-    let callee_id = fb.ins().iadd_imm(packed_plus_one, -1);
-    fb.ins().jump(done_block, &[ir::BlockArg::Value(callee_id)]);
+    fb.ins().jump(done_block, &[ir::BlockArg::Value(packed)]);
 
     fb.switch_to_block(miss_block);
     let zero_const = fb.ins().iconst(i64_ty, 0);

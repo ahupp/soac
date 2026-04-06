@@ -465,7 +465,7 @@ fn builds_closure_backed_generator_factory_block() {
     let block = build_closure_backed_generator_factory_block(
         "_dp_bb_demo_factory",
         &FunctionName::new("gen", "gen", "gen", "gen"),
-        FunctionId::new(0, 0),
+        FunctionId::new(0, 1),
         &[
             "_dp_cell_captured".to_string(),
             "_dp_cell_x".to_string(),

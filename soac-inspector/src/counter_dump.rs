@@ -1,7 +1,8 @@
 use memmap2::Mmap;
 use soac_blockpy::block_py::{BlockLabel, FunctionId, InstrId};
 use soac_jit::counter_dump::{
-    COUNTER_DUMP_MAGIC, COUNTER_DUMP_NONE_U32, COUNTER_DUMP_NONE_U64, COUNTER_DUMP_VERSION,
+    COUNTER_DUMP_MAGIC, COUNTER_DUMP_NONE_FUNCTION_ID, COUNTER_DUMP_NONE_U32,
+    COUNTER_DUMP_NONE_U64, COUNTER_DUMP_VERSION,
     CounterDumpRecordHeader,
 };
 #[cfg(test)]
@@ -97,9 +98,9 @@ impl<'a> CounterDumpRecordView<'a> {
             scope: self.resolve_string_id(self.scope[index])?,
             kind: self.resolve_string_id(self.kind[index])?,
             site_kind: self.resolve_string_id(self.site_kind[index])?,
-            function_id: (self.function_id[index] != COUNTER_DUMP_NONE_U64)
+            function_id: (self.function_id[index] != COUNTER_DUMP_NONE_FUNCTION_ID)
                 .then_some(FunctionId::from_packed(self.function_id[index])),
-            current_function_id: (self.current_function_id[index] != COUNTER_DUMP_NONE_U64)
+            current_function_id: (self.current_function_id[index] != COUNTER_DUMP_NONE_FUNCTION_ID)
                 .then_some(FunctionId::from_packed(self.current_function_id[index])),
             instr_id: if self.instr_block_label[index] == COUNTER_DUMP_NONE_U32
                 || self.instr_index_in_block[index] == COUNTER_DUMP_NONE_U32

@@ -125,7 +125,7 @@ mod tests {
     }
 
     #[test]
-    fn global_row_output_uses_zero_function_id() {
+    fn global_row_output_uses_global_function_id() {
         let row = CounterDumpRowView {
             counter_id: 3,
             scope: "global",
@@ -142,7 +142,17 @@ mod tests {
         };
 
         let rendered = format_counter_row(&row);
-        assert!(rendered.contains("site_function_id=0"), "{rendered}");
-        assert!(rendered.contains("current_function_id=0"), "{rendered}");
+        assert!(
+            rendered.contains(
+                format!("site_function_id={}", FunctionId::global().packed()).as_str()
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                format!("current_function_id={}", FunctionId::global().packed()).as_str()
+            ),
+            "{rendered}"
+        );
     }
 }

@@ -123,7 +123,7 @@ fn test_name_gen() -> FunctionNameGen {
 #[test]
 fn storage_layout_semantics_collects_structured_cell_ref_logical_names() {
     let function = BlockPyFunction::<CoreBlockPyPass> {
-        function_id: FunctionId::new(0, 0),
+        function_id: FunctionId::new(0, 1),
         name_gen: test_name_gen(),
         names: FunctionName::new("f", "f", "f", "f"),
         kind: FunctionKind::Function,

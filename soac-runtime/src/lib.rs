@@ -182,9 +182,9 @@ pub unsafe extern "C" fn soac_runtime_callee_function_id(callable: *mut c_void) 
     if function.is_null() {
         return i64::MIN;
     }
-    let packed_plus_one = unsafe { (*(function as *mut PyFunctionObject)).func_soac_function_id };
-    if packed_plus_one == 0 {
+    let packed = unsafe { (*(function as *mut PyFunctionObject)).func_soac_function_id };
+    if packed == 0 {
         return 0;
     }
-    (packed_plus_one - 1) as i64
+    packed as i64
 }
