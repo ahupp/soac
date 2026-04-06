@@ -47,6 +47,15 @@ unsafe extern "C" {
     ) -> i32;
     fn PyFunction_GetSoacMetadata(function: *mut ffi::PyObject) -> *mut c_void;
     fn PyFunction_GetSoacFunctionId(function: *mut ffi::PyObject) -> u64;
+    fn PyType_SetSoacMetadata(
+        type_obj: *mut ffi::PyObject,
+        soac_function_id: u64,
+        metadata: *mut c_void,
+        destructor: Option<unsafe extern "C" fn(*mut c_void)>,
+    ) -> i32;
+    #[cfg(test)]
+    fn PyType_GetSoacMetadata(type_obj: *mut ffi::PyObject) -> *mut c_void;
+    fn PyType_GetSoacFunctionId(type_obj: *mut ffi::PyObject) -> u64;
     fn PyFunction_AddWatcher(callback: PyFunctionWatchCallback) -> i32;
     fn PyType_Modified(type_obj: *mut ffi::PyTypeObject);
     fn PyUnstable_Type_AssignVersionTag(type_obj: *mut ffi::PyTypeObject) -> i32;
@@ -509,6 +518,23 @@ pub unsafe fn registered_clif_function_id(
     Ok(Some(FunctionId::from_packed(packed_plus_one - 1)))
 }
 
+pub unsafe fn registered_clif_type_function_id(
+    type_obj: *mut ffi::PyObject,
+) -> Result<Option<FunctionId>, ()> {
+    if ffi::PyType_Check(type_obj) == 0 {
+        return Ok(None);
+    }
+    let type_obj = type_obj as *mut ffi::PyTypeObject;
+    if ((*type_obj).tp_flags & ffi::Py_TPFLAGS_HEAPTYPE) == 0 {
+        return Ok(None);
+    }
+    let packed_plus_one = PyType_GetSoacFunctionId(type_obj as *mut ffi::PyObject);
+    if packed_plus_one == 0 {
+        return Ok(None);
+    }
+    Ok(Some(FunctionId::from_packed(packed_plus_one - 1)))
+}
+
 unsafe fn register_owner_type_for_function(
     function: *mut ffi::PyObject,
     owner_type: *mut ffi::PyTypeObject,
@@ -751,10 +777,14 @@ unsafe fn register_owner_types_from_type(
     if !type_is_defined_in_module(owner_type, module_name) {
         return Ok(());
     }
+    if PyType_SetSoacMetadata(owner_type as *mut ffi::PyObject, 0, ptr::null_mut(), None) != 0 {
+        return Err(());
+    }
     let dict = (*owner_type).tp_dict;
     if dict.is_null() {
         return Ok(());
     }
+    let mut constructor_function_id = None;
     let mut pos: ffi::Py_ssize_t = 0;
     let mut key = ptr::null_mut();
     let mut value = ptr::null_mut();
@@ -790,6 +820,11 @@ unsafe fn register_owner_types_from_type(
                     "direct-method-register owner={owner_text} method={key_text} function_id={function_id}"
                 );
             }
+            if ffi::PyUnicode_Check(key) != 0
+                && ffi::PyUnicode_CompareWithASCIIString(key, c"__init__".as_ptr()) == 0
+            {
+                constructor_function_id = registered_clif_function_id(value)?;
+            }
             register_owner_type_for_function(value, owner_type)?;
         } else if ffi::PyType_Check(value) != 0 {
             register_owner_types_from_type(
@@ -797,6 +832,27 @@ unsafe fn register_owner_types_from_type(
                 module_name,
                 visited_types,
             )?;
+        }
+    }
+    if let Some(function_id) = constructor_function_id {
+        let encoded_function_id = function_id
+            .packed()
+            .checked_add(1)
+            .ok_or_else(|| {
+                ffi::PyErr_SetString(
+                    ffi::PyExc_RuntimeError,
+                    c"SOAC type function id overflow".as_ptr(),
+                );
+            })
+            .map_err(|_| ())?;
+        if PyType_SetSoacMetadata(
+            owner_type as *mut ffi::PyObject,
+            encoded_function_id,
+            ptr::null_mut(),
+            None,
+        ) != 0
+        {
+            return Err(());
         }
     }
     Ok(())
@@ -1461,7 +1517,7 @@ mod tests {
             .expect("locals should accept builtins");
 
         let source = std::ffi::CString::new(
-            "class C:\n    def f(self, x=1, *, y=2):\n        return x + y\n",
+            "class C:\n    def __init__(self):\n        self.value = 1\n    def f(self, x=1, *, y=2):\n        return x + y\n",
         )
         .expect("python source should be CString-compatible");
         assert!(
@@ -1707,6 +1763,103 @@ mod tests {
                 "clearing should invoke the registered metadata destructor once"
             );
             ffi::Py_DECREF(function);
+        });
+    }
+
+    #[test]
+    fn pyheaptype_soac_metadata_roundtrips_without_type_dict_storage() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        initialize_test_python();
+        Python::attach(|py| unsafe {
+            TEST_SOAC_METADATA_DROPS.store(0, Ordering::SeqCst);
+            let (_module, cls) = make_test_module(py);
+            let class_obj = cls.as_ptr();
+            let function_id = FunctionId::new(9, 3);
+            let encoded_function_id = function_id
+                .packed()
+                .checked_add(1)
+                .expect("test function id encoding should not overflow");
+            let metadata = Box::into_raw(Box::new(321usize)) as *mut c_void;
+            assert_eq!(
+                PyType_SetSoacMetadata(
+                    class_obj,
+                    encoded_function_id,
+                    metadata,
+                    Some(free_test_soac_metadata),
+                ),
+                0,
+                "setting SOAC type metadata should succeed"
+            );
+            assert_eq!(
+                PyType_GetSoacMetadata(class_obj),
+                metadata,
+                "type metadata pointer should round-trip"
+            );
+            assert_eq!(
+                PyType_GetSoacFunctionId(class_obj),
+                encoded_function_id,
+                "encoded type function id should round-trip"
+            );
+            assert_eq!(
+                registered_clif_type_function_id(class_obj)
+                    .expect("type function id lookup should succeed"),
+                Some(function_id),
+                "registered type function id should decode from SOAC metadata"
+            );
+            assert_eq!(
+                PyType_SetSoacMetadata(class_obj, 0, ptr::null_mut(), None),
+                0,
+                "clearing SOAC type metadata should succeed"
+            );
+            assert!(
+                PyType_GetSoacMetadata(class_obj).is_null(),
+                "cleared SOAC type metadata should not retain a pointer"
+            );
+            assert_eq!(
+                PyType_GetSoacFunctionId(class_obj),
+                0,
+                "cleared SOAC type function id should be unset"
+            );
+            assert_eq!(
+                TEST_SOAC_METADATA_DROPS.load(Ordering::SeqCst),
+                1,
+                "clearing type metadata should invoke the registered destructor once"
+            );
+        });
+    }
+
+    #[test]
+    fn owner_type_registration_sets_constructor_type_function_id() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        initialize_test_python();
+        Python::attach(|py| unsafe {
+            let (module, cls) = make_test_module(py);
+            let owner_type = cls.as_ptr() as *mut ffi::PyTypeObject;
+            let init_function = class_dict_function(owner_type, c"__init__");
+            let function_id = FunctionId::new(10, 4);
+            let encoded_function_id = function_id
+                .packed()
+                .checked_add(1)
+                .expect("test function id encoding should not overflow");
+            assert_eq!(
+                PyFunction_SetSoacMetadata(init_function, encoded_function_id, ptr::null_mut(), None),
+                0,
+                "registering __init__ SOAC id should succeed"
+            );
+            register_function_owner_types_for_module(module.as_ptr())
+                .expect("owner type registration should succeed");
+            assert_eq!(
+                PyType_GetSoacFunctionId(cls.as_ptr()),
+                encoded_function_id,
+                "owner type registration should attach encoded __init__ function id"
+            );
+            assert_eq!(
+                registered_clif_type_function_id(cls.as_ptr())
+                    .expect("type function id lookup should succeed"),
+                Some(function_id),
+                "owner type registration should decode the attached constructor id"
+            );
+            ffi::Py_DECREF(init_function);
         });
     }
 

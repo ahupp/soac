@@ -25,12 +25,14 @@ use soac_blockpy::passes::{CodegenBlockPyPass, InstrResolved};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::mem::offset_of;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 unsafe extern "C" {
     static mut PyFunction_Type: ffi::PyTypeObject;
     static mut PyMethod_Type: ffi::PyTypeObject;
+    static mut PyType_Type: ffi::PyTypeObject;
 }
 
 mod intrinsics;
@@ -689,6 +691,7 @@ struct JitEmitConsts {
     global_slots_const: ir::Value,
     py_function_type_ptr: *mut ffi::PyTypeObject,
     py_method_type_ptr: *mut ffi::PyTypeObject,
+    py_type_type_ptr: *mut ffi::PyTypeObject,
     global_load_hit_counter_ptr: Option<*mut u64>,
     global_load_miss_counter_ptr: Option<*mut u64>,
 }
@@ -1891,9 +1894,65 @@ fn emit_callee_function_id_checked(
     callable: ir::Value,
     ctx: &JitEmitCtx<'_>,
 ) -> ir::Value {
-    const PYOBJECT_OB_TYPE_OFFSET: i32 = 8;
-    const PYMETHOD_IM_FUNC_OFFSET: i32 = 16;
-    const PYFUNCTION_SOAC_FUNCTION_ID_OFFSET: i32 = 160;
+    #[repr(C)]
+    struct PyMethodObjectPrefix {
+        ob_refcnt: isize,
+        ob_type: *mut ffi::PyTypeObject,
+        im_func: *mut ffi::PyObject,
+    }
+
+    #[repr(C)]
+    struct PyFunctionObjectSoacPrefix {
+        ob_refcnt: isize,
+        ob_type: *mut ffi::PyTypeObject,
+        func_globals: *mut ffi::PyObject,
+        func_builtins: *mut ffi::PyObject,
+        func_name: *mut ffi::PyObject,
+        func_qualname: *mut ffi::PyObject,
+        func_code: *mut ffi::PyObject,
+        func_defaults: *mut ffi::PyObject,
+        func_kwdefaults: *mut ffi::PyObject,
+        func_closure: *mut ffi::PyObject,
+        func_doc: *mut ffi::PyObject,
+        func_dict: *mut ffi::PyObject,
+        func_weakreflist: *mut ffi::PyObject,
+        func_module: *mut ffi::PyObject,
+        func_annotations: *mut ffi::PyObject,
+        func_annotate: *mut ffi::PyObject,
+        func_typeparams: *mut ffi::PyObject,
+        vectorcall: ffi::vectorcallfunc,
+        func_soac_metadata: *mut std::ffi::c_void,
+        func_soac_metadata_destructor: *mut std::ffi::c_void,
+        func_soac_function_id: u64,
+    }
+
+    #[repr(C)]
+    struct PyHeapTypeObjectSoacPrefix {
+        ht_type: ffi::PyTypeObject,
+        as_async: ffi::PyAsyncMethods,
+        as_number: ffi::PyNumberMethods,
+        as_mapping: ffi::PyMappingMethods,
+        as_sequence: ffi::PySequenceMethods,
+        as_buffer: ffi::PyBufferProcs,
+        ht_name: *mut ffi::PyObject,
+        ht_slots: *mut ffi::PyObject,
+        ht_qualname: *mut ffi::PyObject,
+        ht_cached_keys: *mut std::ffi::c_void,
+        ht_module: *mut ffi::PyObject,
+        ht_tpname: *mut i8,
+        ht_token: *mut std::ffi::c_void,
+        ht_soac_metadata: *mut std::ffi::c_void,
+        ht_soac_metadata_destructor: *mut std::ffi::c_void,
+        ht_soac_function_id: u64,
+    }
+
+    const PYOBJECT_OB_TYPE_OFFSET: i32 = offset_of!(ffi::PyObject, ob_type) as i32;
+    const PYMETHOD_IM_FUNC_OFFSET: i32 = offset_of!(PyMethodObjectPrefix, im_func) as i32;
+    const PYFUNCTION_SOAC_FUNCTION_ID_OFFSET: i32 =
+        offset_of!(PyFunctionObjectSoacPrefix, func_soac_function_id) as i32;
+    const PYTYPE_TP_FLAGS_OFFSET: i32 = offset_of!(ffi::PyTypeObject, tp_flags) as i32;
+    const PYHEAPTYPE_SOAC_FUNCTION_ID_OFFSET: i32 =
+        offset_of!(PyHeapTypeObjectSoacPrefix, ht_soac_function_id) as i32;
 
     let ptr_ty = ctx.consts.ptr_ty;
     let i64_ty = ctx.consts.i64_ty;
@@ -1902,10 +1961,13 @@ fn emit_callee_function_id_checked(
     let function_block = fb.create_block();
     let maybe_method_block = fb.create_block();
     let method_block = fb.create_block();
+    let maybe_type_block = fb.create_block();
+    let type_block = fb.create_block();
     let miss_block = fb.create_block();
     let function_value_block = fb.create_block();
     let done_block = fb.create_block();
     let nonzero_id_block = fb.create_block();
+    let nonzero_type_id_block = fb.create_block();
     fb.append_block_param(function_value_block, ptr_ty);
     fb.append_block_param(done_block, i64_ty);
 
@@ -1949,7 +2011,8 @@ fn emit_callee_function_id_checked(
     let is_method = fb
         .ins()
         .icmp(ir::condcodes::IntCC::Equal, callable_type, py_method_type);
-    fb.ins().brif(is_method, method_block, &[], miss_block, &[]);
+    fb.ins()
+        .brif(is_method, method_block, &[], maybe_type_block, &[]);
 
     fb.switch_to_block(method_block);
     let method_function = fb.ins().load(
@@ -1961,9 +2024,46 @@ fn emit_callee_function_id_checked(
     fb.ins()
         .jump(function_value_block, &[ir::BlockArg::Value(method_function)]);
 
-    fb.switch_to_block(miss_block);
-    let zero_const = fb.ins().iconst(i64_ty, 0);
-    fb.ins().jump(done_block, &[ir::BlockArg::Value(zero_const)]);
+    fb.switch_to_block(maybe_type_block);
+    let py_type_type = fb.ins().iconst(ptr_ty, ctx.consts.py_type_type_ptr as i64);
+    let is_type_object = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, callable_type, py_type_type);
+    fb.ins()
+        .brif(is_type_object, type_block, &[], miss_block, &[]);
+
+    fb.switch_to_block(type_block);
+    let type_flags = fb.ins().load(
+        i64_ty,
+        ir::MemFlags::trusted(),
+        callable,
+        PYTYPE_TP_FLAGS_OFFSET,
+    );
+    let heaptype_mask = fb.ins().iconst(i64_ty, ffi::Py_TPFLAGS_HEAPTYPE as i64);
+    let heaptype_bits = fb.ins().band(type_flags, heaptype_mask);
+    let is_heap_type = fb
+        .ins()
+        .icmp_imm(ir::condcodes::IntCC::NotEqual, heaptype_bits, 0);
+    fb.ins()
+        .brif(is_heap_type, nonzero_type_id_block, &[], miss_block, &[]);
+
+    fb.switch_to_block(nonzero_type_id_block);
+    let packed_plus_one = fb.ins().load(
+        i64_ty,
+        ir::MemFlags::trusted(),
+        callable,
+        PYHEAPTYPE_SOAC_FUNCTION_ID_OFFSET,
+    );
+    let id_is_zero = fb
+        .ins()
+        .icmp_imm(ir::condcodes::IntCC::Equal, packed_plus_one, 0);
+    let type_id_done_block = fb.create_block();
+    fb.ins()
+        .brif(id_is_zero, miss_block, &[], type_id_done_block, &[]);
+
+    fb.switch_to_block(type_id_done_block);
+    let callee_id = fb.ins().iadd_imm(packed_plus_one, -1);
+    fb.ins().jump(done_block, &[ir::BlockArg::Value(callee_id)]);
 
     fb.switch_to_block(function_value_block);
     let function_value = fb.block_params(function_value_block)[0];
@@ -1995,6 +2095,10 @@ fn emit_callee_function_id_checked(
     fb.switch_to_block(id_done_block);
     let callee_id = fb.ins().iadd_imm(packed_plus_one, -1);
     fb.ins().jump(done_block, &[ir::BlockArg::Value(callee_id)]);
+
+    fb.switch_to_block(miss_block);
+    let zero_const = fb.ins().iconst(i64_ty, 0);
+    fb.ins().jump(done_block, &[ir::BlockArg::Value(zero_const)]);
 
     fb.switch_to_block(done_block);
     let callee_id = fb.block_params(done_block)[0];
@@ -5486,6 +5590,7 @@ fn build_cranelift_run_bb_specialized_function(
                     global_slots_const,
                     py_function_type_ptr: std::ptr::addr_of_mut!(PyFunction_Type),
                     py_method_type_ptr: std::ptr::addr_of_mut!(PyMethod_Type),
+                    py_type_type_ptr: std::ptr::addr_of_mut!(PyType_Type),
                     global_load_hit_counter_ptr,
                     global_load_miss_counter_ptr,
                 },

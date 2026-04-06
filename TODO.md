@@ -239,6 +239,63 @@
 
 ## Remove Ruff Expr dependency from blockpy_generators
 
+## Specialize transformed class constructor calls
+
+- Planning note:
+  - The current call-target specialization path only recognizes callables that lower to exact `PyFunctionObject` or exact `PyMethodObject`.
+  - In pystone, the remaining steady-state `_PyEval_EvalFrameDefault` cost comes from the constructor path inside `Record.copy` in `scripts/pystone.py`:
+    - `Proc1` calls `PtrGlb.copy()`;
+    - `Record.copy` calls `Record(...)`;
+    - that call goes through the transformed class object, not a plain Python function or bound method;
+    - the current callee-id probe returns `0` for that shape, so the direct-call specialization path never fires and CPython falls back to `PyObject_Vectorcall -> _PyEval_EvalFrameDefault` for `Record.__init__`.
+  - The right design principle is:
+    - specialize transformed class calls explicitly as class calls, rather than trying to force them through the existing function/method callee-id path.
+  - A good implementation plan is:
+    1. Identify transformed class objects in the runtime.
+       - When a transformed class is constructed in module init, attach SOAC metadata to the resulting type object that points at its constructor target.
+       - The minimum metadata needed is:
+         ```rust
+         struct SoacClassCallMetadata {
+             init_function_id: FunctionId,
+         }
+         ```
+       - Keep that metadata private and runtime-facing, not as a Python-level attribute.
+    2. Add a fast runtime accessor for transformed class call metadata.
+       - Extend the vendored CPython metadata support for type objects with a no-raise getter/setter pair parallel to the function metadata path.
+       - The getter should return “no metadata” cheaply for ordinary Python classes.
+       - Do not route this through Python attribute lookup or descriptor machinery.
+    3. Add a codegen-visible probe op for class-call target resolution.
+       - Introduce a small typed op in the codegen IR, parallel to `CalleeFunctionId`, for example:
+         ```rust
+         ClassInitFunctionId(E)
+         ```
+         or a more general `CallableDirectTarget(E)`.
+       - This should produce a raw packed id (or zero on miss), not a `PyLong`.
+    4. Extend profiling instrumentation to record transformed class targets.
+       - The current `call_hot_targets` instrumentation rewrites plain `Call` sites through `CalleeFunctionId`.
+       - For callsites whose callee is statically a transformed class object, record the class-init target instead.
+       - For generic callsites, either:
+         - keep function/method and class probes as separate counters first; or
+         - unify them under one “direct target id” notion if the representation stays simple.
+    5. Add a dedicated direct-call specialization path for transformed class calls.
+       - Lower the constructor call directly to the transformed `__init__` target, passing the instance/self argument in the same way the runtime class call path does now.
+       - Keep all existing user-visible CPython behavior requirements explicit:
+         - exact argument evaluation order;
+         - error behavior when `__init__` returns non-`None`;
+         - correct instance allocation/initialization semantics.
+       - This path should be separate from the existing plain function/method `callee_function_id` fast path.
+    6. Start with the narrow case that perf showed.
+       - Only optimize transformed class objects created by SOAC itself.
+       - Do not try to specialize arbitrary Python metaclass/type call behavior in the first slice.
+       - That keeps the optimization explicit and makes fallback-to-CPython semantics straightforward.
+    7. Add focused regression coverage and measurement.
+       - Add a minimal transformed-runtime integration test that exercises:
+         - a transformed class method returning `ClassName(...)`;
+         - constructor invocation through the specialized path;
+         - unchanged user-visible behavior.
+       - Add a focused benchmark/profiling assertion around the pystone `Record.copy -> Record(...)` shape, or at least leave behind a counter/profiling check that shows the site no longer records target `0`.
+  - The main technical risk is not target lookup. It is reproducing Python class-call semantics exactly enough when bypassing the generic type-call path. The first implementation should therefore target only the internal transformed-class shape that SOAC fully controls, and fall back to CPython immediately for anything outside that shape.
+
 - Planning note:
   - The remaining Ruff AST dependency in `soac-blockpy/src/passes/blockpy_generators/mod.rs` is localized to the helper cluster:
     - function `expr_name`, at `soac-blockpy/src/passes/blockpy_generators/mod.rs:175`
