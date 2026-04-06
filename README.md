@@ -393,16 +393,17 @@ Notes:
   scheduler and heterogeneous-core variance without requiring privileged
   clock controls.
 
-- `BENCHMARK_CONSTANT_CLOCKS=1`
+- `BENCHMARK_CONSTANT_CLOCKS=0|1`
   In [scripts/run_benchmark_with_cpu_mode.sh](/home/adam/project/soac-profile/scripts/run_benchmark_with_cpu_mode.sh),
-  ask the benchmark wrapper to temporarily force steadier CPU clocks for
+  control whether the benchmark wrapper temporarily forces steadier CPU clocks for
   the selected benchmark core and its related CPUs by setting the
   governor to `performance`, locking `scaling_min_freq` and
   `scaling_max_freq` to the hardware max frequency, and disabling boost
-  when the kernel exposes a writable `boost` knob. The wrapper restores
-  the previous settings on exit. This mode requires writable `cpufreq`
-  sysfs controls and will fail clearly if the current user does not have
-  permission.
+  when the kernel exposes a `boost` knob. The benchmark recipes default
+  this to `1`, and the wrapper restores the previous settings on exit.
+  When direct writes are not permitted, the wrapper uses `sudo`
+  automatically for the sysfs write and restore path. Set
+  `BENCHMARK_CONSTANT_CLOCKS=0` to opt out.
 
 - `SPECIALIZATION_PROFILE_LOOPS=<int>`
   In recipe `perf-pystone-jit-specialized`, at

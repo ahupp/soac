@@ -19,6 +19,39 @@ env_flag_enabled() {
   esac
 }
 
+needs_elevated_write() {
+  local path="$1"
+  [[ ! -w "$path" ]]
+}
+
+ensure_sudo_ready() {
+  if [[ -n "${BENCHMARK_CLOCKS_SUDO_READY-}" ]]; then
+    return 0
+  fi
+  if ! command -v sudo >/dev/null 2>&1; then
+    echo "benchmark constant-clock mode needs sudo for cpufreq writes, but sudo is not installed" >&2
+    exit 1
+  fi
+  if [[ -t 0 && -t 2 ]]; then
+    sudo -v
+  elif ! sudo -n -v 2>/dev/null; then
+    echo "benchmark constant-clock mode needs sudo credentials, but this benchmark is running without a tty; rerun from an interactive terminal or set BENCHMARK_CONSTANT_CLOCKS=0" >&2
+    exit 1
+  fi
+  BENCHMARK_CLOCKS_SUDO_READY=1
+}
+
+write_sysfs_value() {
+  local path="$1"
+  local value="$2"
+  if needs_elevated_write "$path"; then
+    ensure_sudo_ready
+    printf '%s\n' "$value" | sudo tee "$path" >/dev/null
+  else
+    printf '%s\n' "$value" > "$path"
+  fi
+}
+
 restore_cpufreq_state() {
   local cpu_dir
   local value
@@ -28,28 +61,28 @@ restore_cpufreq_state() {
     cpu_dir="/sys/devices/system/cpu/cpu${cpu}/cpufreq"
 
     value="${RESTORE_SCALING_MAX_FREQ[$cpu]-}"
-    if [[ -n "$value" && -w "$cpu_dir/scaling_max_freq" ]]; then
-      printf '%s\n' "$value" > "$cpu_dir/scaling_max_freq"
+    if [[ -n "$value" && -e "$cpu_dir/scaling_max_freq" ]]; then
+      write_sysfs_value "$cpu_dir/scaling_max_freq" "$value"
     fi
 
     value="${RESTORE_SCALING_MIN_FREQ[$cpu]-}"
-    if [[ -n "$value" && -w "$cpu_dir/scaling_min_freq" ]]; then
-      printf '%s\n' "$value" > "$cpu_dir/scaling_min_freq"
+    if [[ -n "$value" && -e "$cpu_dir/scaling_min_freq" ]]; then
+      write_sysfs_value "$cpu_dir/scaling_min_freq" "$value"
     fi
 
     value="${RESTORE_SCALING_GOVERNOR[$cpu]-}"
-    if [[ -n "$value" && -w "$cpu_dir/scaling_governor" ]]; then
-      printf '%s\n' "$value" > "$cpu_dir/scaling_governor"
+    if [[ -n "$value" && -e "$cpu_dir/scaling_governor" ]]; then
+      write_sysfs_value "$cpu_dir/scaling_governor" "$value"
     fi
 
     value="${RESTORE_EPP[$cpu]-}"
-    if [[ -n "$value" && -w "$cpu_dir/energy_performance_preference" ]]; then
-      printf '%s\n' "$value" > "$cpu_dir/energy_performance_preference"
+    if [[ -n "$value" && -e "$cpu_dir/energy_performance_preference" ]]; then
+      write_sysfs_value "$cpu_dir/energy_performance_preference" "$value"
     fi
   done
 
-  if [[ -n "${RESTORE_BOOST_FILE-}" && -n "${RESTORE_BOOST_VALUE-}" && -w "$RESTORE_BOOST_FILE" ]]; then
-    printf '%s\n' "$RESTORE_BOOST_VALUE" > "$RESTORE_BOOST_FILE"
+  if [[ -n "${RESTORE_BOOST_FILE-}" && -n "${RESTORE_BOOST_VALUE-}" && -e "$RESTORE_BOOST_FILE" ]]; then
+    write_sysfs_value "$RESTORE_BOOST_FILE" "$RESTORE_BOOST_VALUE"
   fi
 }
 
@@ -79,10 +112,10 @@ if env_flag_enabled BENCHMARK_CONSTANT_CLOCKS; then
   RESTORE_BOOST_FILE=""
   RESTORE_BOOST_VALUE=""
 
-  if [[ -w "$CPU_DIR/boost" ]]; then
+  if [[ -e "$CPU_DIR/boost" ]]; then
     RESTORE_BOOST_FILE="$CPU_DIR/boost"
     RESTORE_BOOST_VALUE="$(<"$CPU_DIR/boost")"
-    printf '0\n' > "$CPU_DIR/boost"
+    write_sysfs_value "$CPU_DIR/boost" "0"
   fi
 
   trap restore_cpufreq_state EXIT
@@ -93,8 +126,8 @@ if env_flag_enabled BENCHMARK_CONSTANT_CLOCKS; then
       continue
     fi
 
-    if [[ ! -w "$cpu_dir/scaling_governor" || ! -w "$cpu_dir/scaling_min_freq" || ! -w "$cpu_dir/scaling_max_freq" ]]; then
-      echo "benchmark constant-clock mode needs writable cpufreq knobs under $cpu_dir; rerun with sufficient privileges or leave BENCHMARK_CONSTANT_CLOCKS unset" >&2
+    if [[ ! -e "$cpu_dir/scaling_governor" || ! -e "$cpu_dir/scaling_min_freq" || ! -e "$cpu_dir/scaling_max_freq" ]]; then
+      echo "benchmark constant-clock mode needs cpufreq knobs under $cpu_dir; rerun with BENCHMARK_CONSTANT_CLOCKS=0 if this cpu does not support them" >&2
       exit 1
     fi
 
@@ -107,12 +140,12 @@ if env_flag_enabled BENCHMARK_CONSTANT_CLOCKS; then
     fi
 
     max_freq="$(<"$cpu_dir/cpuinfo_max_freq")"
-    printf 'performance\n' > "$cpu_dir/scaling_governor"
-    printf '%s\n' "$max_freq" > "$cpu_dir/scaling_min_freq"
-    printf '%s\n' "$max_freq" > "$cpu_dir/scaling_max_freq"
+    write_sysfs_value "$cpu_dir/scaling_governor" "performance"
+    write_sysfs_value "$cpu_dir/scaling_min_freq" "$max_freq"
+    write_sysfs_value "$cpu_dir/scaling_max_freq" "$max_freq"
 
-    if [[ -w "$cpu_dir/energy_performance_preference" ]]; then
-      printf 'performance\n' > "$cpu_dir/energy_performance_preference"
+    if [[ -e "$cpu_dir/energy_performance_preference" ]]; then
+      write_sysfs_value "$cpu_dir/energy_performance_preference" "performance"
     fi
   done
 fi

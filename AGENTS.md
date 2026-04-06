@@ -192,10 +192,12 @@ instance's live working commit.
 - `BENCHMARK_CPU` / `BENCHMARK_CONSTANT_CLOCKS`
   The benchmark recipes use
   [scripts/run_benchmark_with_cpu_mode.sh](/home/adam/project/soac-profile/scripts/run_benchmark_with_cpu_mode.sh)
-  to pin runs to a specific CPU, and can optionally request steadier
-  clocks by temporarily changing `cpufreq` settings. If you add or
-  change benchmark-stability knobs, document them in `README.md` and in
-  this appendix note.
+  to pin runs to a specific CPU. The benchmark recipes default to
+  `BENCHMARK_CONSTANT_CLOCKS=1`, which uses `sudo` as needed to request
+  steadier clocks by temporarily changing `cpufreq` settings; use
+  `BENCHMARK_CONSTANT_CLOCKS=0` to opt out. If you add or change
+  benchmark-stability knobs, document them in `README.md` and in this
+  appendix note.
 
 ### CPython-specific notes
 

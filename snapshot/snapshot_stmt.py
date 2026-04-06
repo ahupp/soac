@@ -154,9 +154,7 @@ x: int = 1
 #                                     raise GetAttr(builtins, "NotImplementedError")
 #                             else:
 #                                 block bb4:
-#                                     jump bb1
-#                                     block bb1:
-#                                         return dict(tuple_values(tuple_values("x", int)))
+#                                     return dict(tuple_values(tuple_values("x", int)))
 
 # function _dp_module_init():
 #     function_id: 0:2
