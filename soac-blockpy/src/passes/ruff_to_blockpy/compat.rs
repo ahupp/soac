@@ -1,13 +1,13 @@
 use super::*;
 use crate::block_py::{
-    Block, BlockBuilder, BlockLabel, BlockPyStmtBuilder, BlockTerm, Expr, ImplicitNoneExpr, Instr,
-    StructuredInstr, TermIf, TermRaise,
+    Block, BlockBuilder, BlockLabel, BlockTerm, Expr, ImplicitNoneExpr, Instr, StructuredInstr,
+    TermIf, TermRaise,
 };
 use crate::passes::ast_to_ast::context::Context;
 use crate::passes::ruff_to_blockpy::expr_lowering::{
     try_lower_branching_expr_direct, try_lower_if_expr_direct, AstSetupExprLowerer,
 };
-use crate::passes::ruff_to_blockpy::stmt_lowering::lower_nested_stmt_into_with_expr;
+use crate::passes::ruff_to_blockpy::stmt_sequences::lower_stmts_to_blockpy_stmts_with_context;
 
 fn with_exc_meta<E: Instr>(
     block: crate::block_py::Block<StructuredInstr<E>, E>,
@@ -96,21 +96,6 @@ where
     )
 }
 
-fn compat_block_builder_with_expr_setup_and_expr<E>(
-    context: &Context,
-    body: Vec<Stmt>,
-) -> Result<BlockPyStmtBuilder<E>, String>
-where
-    E: RuffToBlockPyExpr + ImplicitNoneExpr,
-{
-    let mut out = BlockPyStmtBuilder::<E>::new();
-    let mut next_label_id = 0usize;
-    for stmt in &body {
-        lower_nested_stmt_into_with_expr(context, stmt, &mut out, None, &mut next_label_id)?;
-    }
-    Ok(out)
-}
-
 fn try_inline_builder_from_blockpy_stmts<E>(
     structured: crate::block_py::BlockBuilder<StructuredInstr<E>, BlockTerm<E>>,
 ) -> Result<
@@ -154,7 +139,7 @@ pub(crate) fn compat_if_jump_block_with_expr_setup_and_exc_target_and_expr<E>(
 where
     E: RuffToBlockPyExpr + ImplicitNoneExpr,
 {
-    let mut out = compat_block_builder_with_expr_setup_and_expr::<E>(context, body)?;
+    let mut out = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &body)?;
     let mut next_label_id = 0usize;
     let test = crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
         test,
@@ -260,7 +245,7 @@ pub(crate) fn emit_sequence_return_block_with_expr_setup_and_expr<E>(
 where
     E: RuffToBlockPyExpr + ImplicitNoneExpr,
 {
-    let mut out = compat_block_builder_with_expr_setup_and_expr::<E>(context, linear)?;
+    let mut out = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &linear)?;
     if let Some(expr) = value.clone() {
         let lowered_direct = match expr {
             Expr::If(if_expr) => {
@@ -380,7 +365,7 @@ pub(crate) fn emit_sequence_raise_block_with_expr_setup_and_expr<E>(
 where
     E: RuffToBlockPyExpr + ImplicitNoneExpr,
 {
-    let mut out = compat_block_builder_with_expr_setup_and_expr::<E>(context, linear)?;
+    let mut out = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &linear)?;
     if let Some(expr) = exc.exc.clone() {
         let lowered_direct = match expr {
             Expr::If(if_expr) => {
@@ -554,7 +539,7 @@ where
         return Ok(label);
     }
 
-    let mut out = compat_block_builder_with_expr_setup_and_expr::<E>(context, body.clone())?;
+    let mut out = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &body)?;
     let mut next_label_id = 0usize;
     let lowered_test = crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
         test.clone(),
