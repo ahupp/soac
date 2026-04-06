@@ -13,16 +13,18 @@ use crate::module_constants::raise_name_error_for_missing_name;
 #[cfg(not(test))]
 use crate::module_constants::load_runtime_name_owned;
 
+unsafe extern "C" {
+    static mut PyFunction_Type: ffi::PyTypeObject;
+    static mut PyMethod_Type: ffi::PyTypeObject;
+}
+
 #[cfg(not(test))]
 unsafe extern "C" {
     static mut PyCell_Type: ffi::PyTypeObject;
-    static mut PyMethod_Type: ffi::PyTypeObject;
     fn PyCell_New(obj: *mut ffi::PyObject) -> *mut ffi::PyObject;
     fn PyCell_Get(cell: *mut ffi::PyObject) -> *mut ffi::PyObject;
     fn PyCell_Set(cell: *mut ffi::PyObject, value: *mut ffi::PyObject) -> libc::c_int;
     fn PyErr_SetRaisedException(exc: *mut ffi::PyObject);
-    fn PyMethod_Function(method: *mut ffi::PyObject) -> *mut ffi::PyObject;
-    fn PyFunction_GetSoacFunctionId(function: *mut ffi::PyObject) -> u64;
 }
 
 pub type ObjPtr = *mut c_void;
@@ -94,29 +96,6 @@ unsafe extern "C" fn py_vectorcall_hook(
         nargsf as usize,
         kwnames as *mut ffi::PyObject,
     ) as ObjPtr
-}
-
-#[cfg(not(test))]
-unsafe extern "C" fn callee_function_id_hook(callable: ObjPtr) -> i64 {
-    let callable = callable as *mut ffi::PyObject;
-    if callable.is_null() {
-        return i64::MIN;
-    }
-    let function = if ffi::PyFunction_Check(callable) != 0 {
-        callable
-    } else if ffi::Py_TYPE(callable) == std::ptr::addr_of_mut!(PyMethod_Type) {
-        PyMethod_Function(callable)
-    } else {
-        return 0;
-    };
-    if function.is_null() {
-        return i64::MIN;
-    }
-    let packed_plus_one = PyFunction_GetSoacFunctionId(function);
-    if packed_plus_one == 0 {
-        return 0;
-    }
-    (packed_plus_one - 1) as i64
 }
 
 #[cfg(not(test))]
@@ -976,7 +955,6 @@ mod test_only_export_stubs {
         kwnames: ObjPtr
     ));
     panic_obj_export!(dp_jit_py_call_with_kw(callable: ObjPtr, args: ObjPtr, kw: ObjPtr));
-    panic_i64_export!(dp_jit_callee_function_id(callable: ObjPtr));
     panic_i32_export!(dp_jit_guard_method_type_version(
         receiver: ObjPtr,
         expected_type: ObjPtr,
@@ -1070,11 +1048,6 @@ pub unsafe extern "C" fn dp_jit_py_call_with_kw(
     kw: ObjPtr,
 ) -> ObjPtr {
     py_call_with_kw_hook(callable, args, kw)
-}
-
-#[cfg(not(test))]
-pub unsafe extern "C" fn dp_jit_callee_function_id(callable: ObjPtr) -> i64 {
-    callee_function_id_hook(callable)
 }
 
 #[cfg(not(test))]
@@ -1436,6 +1409,8 @@ define_unary_obj_wrapper!(pynumber_negative_wrapper, "PyNumber_Negative");
 define_unary_obj_wrapper!(pynumber_invert_wrapper, "PyNumber_Invert");
 
 pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
+    builder.symbol("PyFunction_Type", std::ptr::addr_of_mut!(PyFunction_Type) as *const u8);
+    builder.symbol("PyMethod_Type", std::ptr::addr_of_mut!(PyMethod_Type) as *const u8);
     builder.symbol(
         "dp_jit_py_call_positional_three",
         dp_jit_py_call_positional_three as *const u8,
@@ -1501,10 +1476,6 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol(
         "dp_jit_pyobject_to_i64",
         dp_jit_pyobject_to_i64 as *const u8,
-    );
-    builder.symbol(
-        "dp_jit_callee_function_id",
-        dp_jit_callee_function_id as *const u8,
     );
     builder.symbol(
         "dp_jit_guard_method_type_version",

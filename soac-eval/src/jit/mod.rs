@@ -142,6 +142,11 @@ static DP_JIT_INCREF_IMPORT: ImportSpec =
     ImportSpec::local(SOAC_RUNTIME_INCREF_SYMBOL, &[SigType::Pointer], &[]);
 static DP_JIT_DECREF_IMPORT: ImportSpec =
     ImportSpec::local(SOAC_RUNTIME_DECREF_SYMBOL, &[SigType::Pointer], &[]);
+static DP_JIT_CALLEE_FUNCTION_ID_IMPORT: ImportSpec = ImportSpec::local(
+    SOAC_RUNTIME_CALLEE_FUNCTION_ID_SYMBOL,
+    &[SigType::Pointer],
+    &[SigType::I64],
+);
 static DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_py_call_positional_three",
     &[
@@ -230,8 +235,6 @@ static DP_JIT_PYOBJECT_TO_I64_IMPORT: ImportSpec = ImportSpec::new(
     &[SigType::Pointer],
     &[SigType::I64],
 );
-static DP_JIT_CALLEE_FUNCTION_ID_IMPORT: ImportSpec =
-    ImportSpec::new("dp_jit_callee_function_id", &[SigType::Pointer], &[SigType::I64]);
 static DP_JIT_GUARD_METHOD_TYPE_VERSION_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_guard_method_type_version",
     &[SigType::Pointer, SigType::Pointer, SigType::I64],
@@ -4269,11 +4272,14 @@ impl RuntimeSupportInliner {
     fn for_module(jit_module: &mut JITModule) -> Result<Self, String> {
         let library = runtime_support_library()?;
         let mut import_func_ids = HashMap::new();
+        let mut import_data_ids = HashMap::new();
         let mut inlineable = HashMap::new();
         for parsed in &library.functions {
             if !matches!(
                 parsed.symbol.as_str(),
-                SOAC_RUNTIME_INCREF_SYMBOL | SOAC_RUNTIME_DECREF_SYMBOL
+                SOAC_RUNTIME_INCREF_SYMBOL
+                    | SOAC_RUNTIME_DECREF_SYMBOL
+                    | SOAC_RUNTIME_CALLEE_FUNCTION_ID_SYMBOL
             ) {
                 continue;
             }
@@ -4290,7 +4296,9 @@ impl RuntimeSupportInliner {
                 jit_module,
                 &mut function,
                 &parsed.extern_symbols,
+                &parsed.global_extern_symbols,
                 &mut import_func_ids,
+                &mut import_data_ids,
             )?;
             if function.dfg.num_insts() > RUNTIME_SUPPORT_INLINE_MAX_INSTS {
                 continue;
@@ -4384,6 +4392,7 @@ pub(crate) const JIT_PYTHON_PERF_SYMBOL_KIND_DIRECT: &str = "d";
 pub(crate) const JIT_PYTHON_PERF_SYMBOL_KIND_VECTORCALL: &str = "v";
 pub(crate) const SOAC_RUNTIME_INCREF_SYMBOL: &str = "soac_runtime_incref";
 pub(crate) const SOAC_RUNTIME_DECREF_SYMBOL: &str = "soac_runtime_decref";
+pub(crate) const SOAC_RUNTIME_CALLEE_FUNCTION_ID_SYMBOL: &str = "soac_runtime_callee_function_id";
 
 pub(crate) fn jit_python_perf_symbol_name(kind: &str, qualname: &str) -> String {
     format!("py:{kind}:{qualname}")
@@ -4412,6 +4421,7 @@ struct ParsedRuntimeClifFunction {
     symbol: String,
     function: ir::Function,
     extern_symbols: HashMap<ir::UserExternalName, String>,
+    global_extern_symbols: HashMap<u32, String>,
 }
 
 fn parse_runtime_clif_functions() -> Result<Vec<ParsedRuntimeClifFunction>, String> {
@@ -4432,6 +4442,7 @@ fn parse_runtime_clif_functions() -> Result<Vec<ParsedRuntimeClifFunction>, Stri
             symbol: (*symbol).to_string(),
             function,
             extern_symbols: parse_runtime_clif_extern_symbols(clif_text)?,
+            global_extern_symbols: parse_runtime_clif_global_extern_symbols(clif_text)?,
         });
     }
     Ok(parsed_functions)
@@ -4445,6 +4456,9 @@ fn parse_runtime_clif_extern_symbols(
         if !line.contains("::{extern#") {
             continue;
         }
+        if !line.contains(" = u") {
+            continue;
+        }
         let Some(user_name) = parse_runtime_clif_user_name(line) else {
             return Err(format!(
                 "failed to parse user function name from runtime CLIF line: {line}"
@@ -4456,6 +4470,41 @@ fn parse_runtime_clif_extern_symbols(
             ));
         };
         extern_symbols.insert(user_name, symbol);
+    }
+    Ok(extern_symbols)
+}
+
+fn parse_runtime_clif_global_extern_symbols(clif_text: &str) -> Result<HashMap<u32, String>, String> {
+    let mut extern_symbols = HashMap::new();
+    for line in clif_text.lines() {
+        if !line.contains("::{extern#") || !line.contains(" = symbol userextname") {
+            continue;
+        }
+        let Some(alias_pos) = line.find("userextname") else {
+            return Err(format!(
+                "failed to parse user global name from runtime CLIF line: {line}"
+            ));
+        };
+        let alias = &line[(alias_pos + "userextname".len())..];
+        let alias_end = alias
+            .find(|ch: char| !ch.is_ascii_digit())
+            .unwrap_or(alias.len());
+        let Some(alias) = alias.get(..alias_end) else {
+            return Err(format!(
+                "failed to parse user global name from runtime CLIF line: {line}"
+            ));
+        };
+        let Ok(alias) = alias.parse::<u32>() else {
+            return Err(format!(
+                "failed to parse user global name from runtime CLIF line: {line}"
+            ));
+        };
+        let Some(symbol) = parse_runtime_clif_extern_symbol(line) else {
+            return Err(format!(
+                "failed to parse extern symbol from runtime CLIF line: {line}"
+            ));
+        };
+        extern_symbols.insert(alias, symbol);
     }
     Ok(extern_symbols)
 }
@@ -4493,7 +4542,9 @@ fn remap_runtime_clif_extern_user_names(
     jit_module: &mut JITModule,
     function: &mut ir::Function,
     extern_symbols: &HashMap<ir::UserExternalName, String>,
+    global_extern_symbols: &HashMap<u32, String>,
     import_func_ids: &mut HashMap<String, FuncId>,
+    import_data_ids: &mut HashMap<String, cranelift_module::DataId>,
 ) -> Result<(), String> {
     let remaps = function
         .dfg
@@ -4531,12 +4582,49 @@ fn remap_runtime_clif_extern_user_names(
         };
         function.params.reset_user_func_name(name_ref, mapped_name);
     }
+
+    let global_symbol_remaps = function
+        .global_values
+        .iter()
+        .filter_map(|(gv, data)| {
+            let ir::GlobalValueData::Symbol {
+                name: ir::ExternalName::User(name_ref),
+                ..
+            } = data
+            else {
+                return None;
+            };
+            Some((gv, *name_ref))
+        })
+        .collect::<Vec<_>>();
+    for (gv, name_ref) in global_symbol_remaps {
+        let Some(symbol) = global_extern_symbols.get(&name_ref.as_u32()) else {
+            continue;
+        };
+        let import_id = if let Some(import_id) = import_data_ids.get(symbol) {
+            *import_id
+        } else {
+            let import_id = jit_module
+                .declare_data(symbol, Linkage::Import, false, false)
+                .map_err(|err| {
+                    format!("failed to declare runtime CLIF extern data symbol {symbol}: {err}")
+                })?;
+            import_data_ids.insert(symbol.clone(), import_id);
+            import_id
+        };
+        let mapped_name = ir::UserExternalName::new(1, import_id.as_u32());
+        let mapped_name_ref = function.params.ensure_user_func_name(mapped_name);
+        if let ir::GlobalValueData::Symbol { name, .. } = &mut function.global_values[gv] {
+            *name = ir::ExternalName::User(mapped_name_ref);
+        }
+    }
     Ok(())
 }
 
 fn load_runtime_support_clif(jit_module: &mut JITModule) -> Result<(), String> {
     let library = runtime_support_library()?;
     let mut import_func_ids = HashMap::new();
+    let mut import_data_ids = HashMap::new();
     for parsed in library.functions.iter().cloned() {
         let func_id = jit_module
             .declare_function(&parsed.symbol, Linkage::Local, &parsed.function.signature)
@@ -4551,7 +4639,9 @@ fn load_runtime_support_clif(jit_module: &mut JITModule) -> Result<(), String> {
             jit_module,
             &mut function,
             &parsed.extern_symbols,
+            &parsed.global_extern_symbols,
             &mut import_func_ids,
+            &mut import_data_ids,
         )?;
         let mut ctx = jit_module.make_context();
         ctx.func = function;
