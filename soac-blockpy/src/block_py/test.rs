@@ -115,6 +115,65 @@ fn call_and_keyword_arg_expr_helpers_preserve_shape() {
     ));
 }
 
+#[test]
+fn ast_call_arg_helpers_preserve_star_shapes() {
+    let positional = CallArgPositional::from_ast_expr_with(py_expr!("x"), |expr| expr);
+    assert!(matches!(
+        positional,
+        CallArgPositional::Positional(Expr::Name(name)) if name.id.as_str() == "x"
+    ));
+
+    let starred = CallArgPositional::from_ast_expr_with(py_expr!("*xs"), |expr| expr);
+    assert!(matches!(
+        starred,
+        CallArgPositional::Starred(Expr::Name(name)) if name.id.as_str() == "xs"
+    ));
+
+    let named = CallArgKeyword::from_ast_keyword_with(
+        ast::Keyword {
+            node_index: ast::AtomicNodeIndex::default(),
+            range: ruff_text_size::TextRange::default(),
+            arg: Some(ast::Identifier::new(
+                "value",
+                ruff_text_size::TextRange::default(),
+            )),
+            value: py_expr!("y"),
+        },
+        |expr| expr,
+    );
+    assert!(matches!(
+        named,
+        CallArgKeyword::Named { arg, value: Expr::Name(_), .. } if arg.as_str() == "value"
+    ));
+
+    let starred_keyword = CallArgKeyword::from_ast_keyword_with(
+        ast::Keyword {
+            node_index: ast::AtomicNodeIndex::default(),
+            range: ruff_text_size::TextRange::default(),
+            arg: None,
+            value: py_expr!("kw"),
+        },
+        |expr| expr,
+    );
+    assert!(matches!(
+        starred_keyword,
+        CallArgKeyword::Starred(Expr::Name(name)) if name.id.as_str() == "kw"
+    ));
+}
+
+#[test]
+fn ast_operator_kind_helpers_cover_python_ops() {
+    assert_eq!(BinOpKind::from_ast_operator(ast::Operator::Div), BinOpKind::TrueDiv);
+    assert_eq!(
+        BinOpKind::from_ast_inplace_operator(ast::Operator::Div),
+        BinOpKind::InplaceTrueDiv
+    );
+    assert_eq!(
+        UnaryOpKind::from_ast_unary_op(ast::UnaryOp::USub),
+        UnaryOpKind::Neg
+    );
+}
+
 fn test_name_gen() -> FunctionNameGen {
     let module_name_gen = ModuleNameGen::new(0);
     module_name_gen.next_function_name_gen()

@@ -44,6 +44,44 @@ pub enum BinOpKind {
     InplaceAnd,
 }
 
+impl BinOpKind {
+    pub fn from_ast_operator(op: ast::Operator) -> Self {
+        match op {
+            ast::Operator::Add => Self::Add,
+            ast::Operator::Sub => Self::Sub,
+            ast::Operator::Mult => Self::Mul,
+            ast::Operator::MatMult => Self::MatMul,
+            ast::Operator::Div => Self::TrueDiv,
+            ast::Operator::Mod => Self::Mod,
+            ast::Operator::Pow => Self::Pow,
+            ast::Operator::LShift => Self::LShift,
+            ast::Operator::RShift => Self::RShift,
+            ast::Operator::BitOr => Self::Or,
+            ast::Operator::BitXor => Self::Xor,
+            ast::Operator::BitAnd => Self::And,
+            ast::Operator::FloorDiv => Self::FloorDiv,
+        }
+    }
+
+    pub fn from_ast_inplace_operator(op: ast::Operator) -> Self {
+        match op {
+            ast::Operator::Add => Self::InplaceAdd,
+            ast::Operator::Sub => Self::InplaceSub,
+            ast::Operator::Mult => Self::InplaceMul,
+            ast::Operator::MatMult => Self::InplaceMatMul,
+            ast::Operator::Div => Self::InplaceTrueDiv,
+            ast::Operator::Mod => Self::InplaceMod,
+            ast::Operator::Pow => Self::InplacePow,
+            ast::Operator::LShift => Self::InplaceLShift,
+            ast::Operator::RShift => Self::InplaceRShift,
+            ast::Operator::BitOr => Self::InplaceOr,
+            ast::Operator::BitXor => Self::InplaceXor,
+            ast::Operator::BitAnd => Self::InplaceAnd,
+            ast::Operator::FloorDiv => Self::InplaceFloorDiv,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum UnaryOpKind {
     Pos,
@@ -51,6 +89,17 @@ pub enum UnaryOpKind {
     Invert,
     Not,
     Truth,
+}
+
+impl UnaryOpKind {
+    pub fn from_ast_unary_op(op: ast::UnaryOp) -> Self {
+        match op {
+            ast::UnaryOp::Not => Self::Not,
+            ast::UnaryOp::Invert => Self::Invert,
+            ast::UnaryOp::USub => Self::Neg,
+            ast::UnaryOp::UAdd => Self::Pos,
+        }
+    }
 }
 
 define_operation! {

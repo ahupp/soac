@@ -94,21 +94,7 @@ pub(crate) trait RuffToBlockPyExpr:
 }
 
 fn inplace_kind(op: ast::Operator) -> Option<operation::BinOpKind> {
-    Some(match op {
-        ast::Operator::Add => operation::BinOpKind::InplaceAdd,
-        ast::Operator::Sub => operation::BinOpKind::InplaceSub,
-        ast::Operator::Mult => operation::BinOpKind::InplaceMul,
-        ast::Operator::MatMult => operation::BinOpKind::InplaceMatMul,
-        ast::Operator::Div => operation::BinOpKind::InplaceTrueDiv,
-        ast::Operator::Mod => operation::BinOpKind::InplaceMod,
-        ast::Operator::Pow => operation::BinOpKind::InplacePow,
-        ast::Operator::LShift => operation::BinOpKind::InplaceLShift,
-        ast::Operator::RShift => operation::BinOpKind::InplaceRShift,
-        ast::Operator::BitOr => operation::BinOpKind::InplaceOr,
-        ast::Operator::BitXor => operation::BinOpKind::InplaceXor,
-        ast::Operator::BitAnd => operation::BinOpKind::InplaceAnd,
-        ast::Operator::FloorDiv => operation::BinOpKind::InplaceFloorDiv,
-    })
+    Some(operation::BinOpKind::from_ast_inplace_operator(op))
 }
 
 impl RuffToBlockPyExpr for InstrWithAwaitAndYield {

@@ -152,13 +152,12 @@ fn unary_op_expr_from_ast_with_meta(
     op: ast::UnaryOp,
     operand: InstrWithAwaitAndYield,
 ) -> InstrWithAwaitAndYield {
-    let kind = match op {
-        ast::UnaryOp::Not => operation::UnaryOpKind::Not,
-        ast::UnaryOp::Invert => operation::UnaryOpKind::Invert,
-        ast::UnaryOp::USub => operation::UnaryOpKind::Neg,
-        ast::UnaryOp::UAdd => operation::UnaryOpKind::Pos,
-    };
-    unary_op_expr_with_meta(node_index, range, kind, operand)
+    unary_op_expr_with_meta(
+        node_index,
+        range,
+        operation::UnaryOpKind::from_ast_unary_op(op),
+        operand,
+    )
 }
 
 fn binop_expr_from_ast_with_meta(
@@ -170,24 +169,13 @@ fn binop_expr_from_ast_with_meta(
 ) -> InstrWithAwaitAndYield {
     match op {
         ast::Operator::Add => add_op_expr_with_meta(node_index, range, left, right),
-        _ => {
-            let kind = match op {
-                ast::Operator::Add => unreachable!("handled above"),
-                ast::Operator::Sub => operation::BinOpKind::Sub,
-                ast::Operator::Mult => operation::BinOpKind::Mul,
-                ast::Operator::MatMult => operation::BinOpKind::MatMul,
-                ast::Operator::Div => operation::BinOpKind::TrueDiv,
-                ast::Operator::Mod => operation::BinOpKind::Mod,
-                ast::Operator::Pow => operation::BinOpKind::Pow,
-                ast::Operator::LShift => operation::BinOpKind::LShift,
-                ast::Operator::RShift => operation::BinOpKind::RShift,
-                ast::Operator::BitOr => operation::BinOpKind::Or,
-                ast::Operator::BitXor => operation::BinOpKind::Xor,
-                ast::Operator::BitAnd => operation::BinOpKind::And,
-                ast::Operator::FloorDiv => operation::BinOpKind::FloorDiv,
-            };
-            binop_expr_with_meta(node_index, range, kind, left, right)
-        }
+        _ => binop_expr_with_meta(
+            node_index,
+            range,
+            operation::BinOpKind::from_ast_operator(op),
+            left,
+            right,
+        ),
     }
 }
 
@@ -273,11 +261,8 @@ fn lower_core_call_args(
     args: Vec<Expr>,
 ) -> Vec<CallArgPositional<InstrWithAwaitAndYield>> {
     args.into_iter()
-        .map(|arg| match arg {
-            Expr::Starred(starred) => {
-                CallArgPositional::Starred(InstrWithAwaitAndYield::from_ast_expr(*starred.value))
-            }
-            other => CallArgPositional::Positional(InstrWithAwaitAndYield::from_ast_expr(other)),
+        .map(|arg| {
+            CallArgPositional::from_ast_expr_with(arg, InstrWithAwaitAndYield::from_ast_expr)
         })
         .collect()
 }
@@ -287,12 +272,8 @@ fn lower_core_call_keywords(
 ) -> Vec<CallArgKeyword<InstrWithAwaitAndYield>> {
     keywords
         .into_iter()
-        .map(|keyword| match keyword.arg {
-            Some(arg) => CallArgKeyword::Named {
-                arg,
-                value: InstrWithAwaitAndYield::from_ast_expr(keyword.value),
-            },
-            None => CallArgKeyword::Starred(InstrWithAwaitAndYield::from_ast_expr(keyword.value)),
+        .map(|keyword| {
+            CallArgKeyword::from_ast_keyword_with(keyword, InstrWithAwaitAndYield::from_ast_expr)
         })
         .collect()
 }

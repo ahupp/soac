@@ -810,6 +810,13 @@ pub enum CallArgPositional<E> {
 }
 
 impl<E> CallArgPositional<E> {
+    pub fn from_ast_expr_with(expr: ast::Expr, lower: impl FnOnce(ast::Expr) -> E) -> Self {
+        match expr {
+            ast::Expr::Starred(starred) => Self::Starred(lower(*starred.value)),
+            other => Self::Positional(lower(other)),
+        }
+    }
+
     pub fn expr(&self) -> &E {
         match self {
             Self::Positional(expr) | Self::Starred(expr) => expr,
@@ -847,6 +854,16 @@ pub enum CallArgKeyword<E> {
 }
 
 impl<E> CallArgKeyword<E> {
+    pub fn from_ast_keyword_with(keyword: ast::Keyword, lower: impl FnOnce(ast::Expr) -> E) -> Self {
+        match keyword.arg {
+            Some(arg) => Self::Named {
+                arg,
+                value: lower(keyword.value),
+            },
+            None => Self::Starred(lower(keyword.value)),
+        }
+    }
+
     pub fn expr(&self) -> &E {
         match self {
             Self::Named { value, .. } | Self::Starred(value) => value,
