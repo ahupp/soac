@@ -33,12 +33,12 @@ fn reduce_core_blockpy_dict(items: Box<[ast::DictItem]>) -> InstrWithAwaitAndYie
             ast::DictItem { key: None, value } => {
                 if !keyed_pairs.is_empty() {
                     let tuple = make_tuple(std::mem::take(&mut keyed_pairs));
-                    segments.push(InstrWithAwaitAndYield::from(py_expr!(
+                    segments.push(InstrWithAwaitAndYield::from_ast_expr(py_expr!(
                         "__soac__.dict({tuple:expr})",
                         tuple = tuple
                     )));
                 }
-                segments.push(InstrWithAwaitAndYield::from(py_expr!(
+                segments.push(InstrWithAwaitAndYield::from_ast_expr(py_expr!(
                     "__soac__.dict({mapping:expr})",
                     mapping = value
                 )));
@@ -48,7 +48,7 @@ fn reduce_core_blockpy_dict(items: Box<[ast::DictItem]>) -> InstrWithAwaitAndYie
 
     if !keyed_pairs.is_empty() {
         let tuple = make_tuple(keyed_pairs);
-        segments.push(InstrWithAwaitAndYield::from(py_expr!(
+        segments.push(InstrWithAwaitAndYield::from_ast_expr(py_expr!(
             "__soac__.dict({tuple:expr})",
             tuple = tuple
         )));
@@ -78,7 +78,7 @@ fn reduce_core_blockpy_dict(items: Box<[ast::DictItem]>) -> InstrWithAwaitAndYie
 fn core_operation_expr(
     operation: impl Into<InstrWithAwaitAndYield>,
 ) -> InstrWithAwaitAndYield {
-    InstrWithAwaitAndYield::from(operation.into())
+    operation.into()
 }
 
 fn core_operation_expr_with_meta(
@@ -275,9 +275,9 @@ fn lower_core_call_args(
     args.into_iter()
         .map(|arg| match arg {
             Expr::Starred(starred) => {
-                CallArgPositional::Starred(InstrWithAwaitAndYield::from(*starred.value))
+                CallArgPositional::Starred(InstrWithAwaitAndYield::from_ast_expr(*starred.value))
             }
-            other => CallArgPositional::Positional(InstrWithAwaitAndYield::from(other)),
+            other => CallArgPositional::Positional(InstrWithAwaitAndYield::from_ast_expr(other)),
         })
         .collect()
 }
@@ -290,9 +290,9 @@ fn lower_core_call_keywords(
         .map(|keyword| match keyword.arg {
             Some(arg) => CallArgKeyword::Named {
                 arg,
-                value: InstrWithAwaitAndYield::from(keyword.value),
+                value: InstrWithAwaitAndYield::from_ast_expr(keyword.value),
             },
-            None => CallArgKeyword::Starred(InstrWithAwaitAndYield::from(keyword.value)),
+            None => CallArgKeyword::Starred(InstrWithAwaitAndYield::from_ast_expr(keyword.value)),
         })
         .collect()
 }
@@ -384,8 +384,8 @@ fn lower_core_call_expr_with_meta(
                         operation::MakeFunction::new(
                             function_id,
                             kind,
-                            Box::new(InstrWithAwaitAndYield::from(args[3].clone())),
-                            Box::new(InstrWithAwaitAndYield::from(args[4].clone())),
+                            Box::new(InstrWithAwaitAndYield::from_ast_expr(args[3].clone())),
+                            Box::new(InstrWithAwaitAndYield::from_ast_expr(args[4].clone())),
                         )
                         .with_meta(Meta::new(node_index, range)),
                     );
@@ -404,7 +404,7 @@ fn lower_core_call_expr_with_meta(
                 }
                 if !saw_starred {
                     for arg in &args {
-                        operation_args.push(InstrWithAwaitAndYield::from(arg.clone()));
+                        operation_args.push(InstrWithAwaitAndYield::from_ast_expr(arg.clone()));
                     }
                     if let Some(operation) = non_operator_operation_from_helper_call(
                         attr.attr.id.as_str(),
@@ -420,7 +420,7 @@ fn lower_core_call_expr_with_meta(
     }
 
     core_call_expr_with_meta(
-        InstrWithAwaitAndYield::from(func),
+        InstrWithAwaitAndYield::from_ast_expr(func),
         node_index,
         range,
         lower_core_call_args(args),
@@ -452,10 +452,10 @@ fn reduce_core_tuple_splat(elts: Vec<Expr>) -> InstrWithAwaitAndYield {
                     "tuple_from_iter",
                     node_index,
                     range,
-                    vec![InstrWithAwaitAndYield::from(*value)],
+                    vec![InstrWithAwaitAndYield::from_ast_expr(*value)],
                 ));
             }
-            other => values.push(InstrWithAwaitAndYield::from(other)),
+            other => values.push(InstrWithAwaitAndYield::from_ast_expr(other)),
         }
     }
 
@@ -478,8 +478,8 @@ fn reduce_core_tuple_splat(elts: Vec<Expr>) -> InstrWithAwaitAndYield {
     })
 }
 
-impl From<Expr> for InstrWithAwaitAndYield {
-    fn from(value: Expr) -> Self {
+impl InstrWithAwaitAndYield {
+    pub(crate) fn from_ast_expr(value: Expr) -> Self {
         let mut value = value;
         lower_string_templates_in_expr(&mut value);
         match value {
@@ -491,19 +491,19 @@ impl From<Expr> for InstrWithAwaitAndYield {
                 node.arguments.keywords.into_vec(),
             ),
             Expr::Await(node) => Self::Await(
-                Await::new(Self::from(*node.value))
+                Await::new(Self::from_ast_expr(*node.value))
                     .with_meta(Meta::new(node.node_index, node.range)),
             ),
             Expr::Yield(node) => Self::Yield(
                 Yield::new(
                     node.value
-                        .map(|value| Self::from(*value))
+                        .map(|value| Self::from_ast_expr(*value))
                         .unwrap_or_else(InstrWithAwaitAndYield::implicit_none_expr),
                 )
                 .with_meta(Meta::new(node.node_index, node.range)),
             ),
             Expr::YieldFrom(node) => Self::YieldFrom(
-                YieldFrom::new(Self::from(*node.value))
+                YieldFrom::new(Self::from_ast_expr(*node.value))
                     .with_meta(Meta::new(node.node_index, node.range)),
             ),
             Expr::StringLiteral(node) => literal_expr(
@@ -553,7 +553,7 @@ impl From<Expr> for InstrWithAwaitAndYield {
                         node.range,
                     );
                 }
-                let value = Self::from(*node.value);
+                let value = Self::from_ast_expr(*node.value);
                 getattr_expr_with_meta(
                     node.node_index,
                     node.range,
@@ -562,17 +562,17 @@ impl From<Expr> for InstrWithAwaitAndYield {
                 )
             }
             Expr::Subscript(node) if matches!(node.ctx, ast::ExprContext::Load) => {
-                let value = Self::from(*node.value);
-                let index = Self::from(*node.slice);
+                let value = Self::from_ast_expr(*node.value);
+                let index = Self::from_ast_expr(*node.slice);
                 getitem_expr_with_meta(node.node_index, node.range, value, index)
             }
             Expr::UnaryOp(node) => {
-                let operand = Self::from(*node.operand);
+                let operand = Self::from_ast_expr(*node.operand);
                 unary_op_expr_from_ast_with_meta(node.node_index, node.range, node.op, operand)
             }
             Expr::BinOp(node) => {
-                let left = Self::from(*node.left);
-                let right = Self::from(*node.right);
+                let left = Self::from_ast_expr(*node.left);
+                let right = Self::from_ast_expr(*node.right);
                 binop_expr_from_ast_with_meta(node.node_index, node.range, node.op, left, right)
             }
             Expr::Compare(node) if node.ops.len() == 1 && node.comparators.len() == 1 => {
@@ -595,8 +595,8 @@ impl From<Expr> for InstrWithAwaitAndYield {
                     node_index,
                     range,
                     op,
-                    Self::from(left),
-                    Self::from(right),
+                    Self::from_ast_expr(left),
+                    Self::from_ast_expr(right),
                 )
             }
             Expr::Tuple(node) if matches!(node.ctx, ast::ExprContext::Load) => {
@@ -605,13 +605,13 @@ impl From<Expr> for InstrWithAwaitAndYield {
                 } else {
                     make_tuple(node.elts)
                 };
-                Self::from(tuple)
+                Self::from_ast_expr(tuple)
             }
             Expr::List(node) if matches!(node.ctx, ast::ExprContext::Load) => {
                 let tuple = if node.elts.iter().any(Expr::is_starred_expr) {
                     reduce_core_tuple_splat(node.elts)
                 } else {
-                    Self::from(make_tuple(node.elts))
+                    Self::from_ast_expr(make_tuple(node.elts))
                 };
                 core_runtime_positional_call_expr_with_meta(
                     "list",
@@ -624,7 +624,7 @@ impl From<Expr> for InstrWithAwaitAndYield {
                 let tuple = if node.elts.iter().any(Expr::is_starred_expr) {
                     reduce_core_tuple_splat(node.elts)
                 } else {
-                    Self::from(make_tuple(node.elts))
+                    Self::from_ast_expr(make_tuple(node.elts))
                 };
                 core_runtime_positional_call_expr_with_meta(
                     "set",
@@ -633,7 +633,7 @@ impl From<Expr> for InstrWithAwaitAndYield {
                     vec![tuple],
                 )
             }
-            Expr::Slice(node) => Self::from(py_expr!(
+            Expr::Slice(node) => Self::from_ast_expr(py_expr!(
                 "__soac__.slice({lower:expr}, {upper:expr}, {step:expr})",
                 lower = node
                     .lower

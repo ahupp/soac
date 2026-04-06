@@ -80,7 +80,7 @@ fn eval_order_hoists_call_arguments_in_return_value_to_temps() {
     let block = Block {
         label: BlockLabel::from_index(0),
         body: Vec::new(),
-        term: BlockTerm::Return(InstrWithAwaitAndYield::from(crate::py_expr!(
+        term: BlockTerm::Return(InstrWithAwaitAndYield::from_ast_expr(crate::py_expr!(
             "f(g(x), h(y))"
         ))),
         params: Vec::new(),
@@ -108,7 +108,7 @@ fn eval_order_hoists_return_value_to_temp() {
     let block = Block {
         label: BlockLabel::from_index(0),
         body: Vec::new(),
-        term: BlockTerm::Return(InstrWithAwaitAndYield::from(crate::py_expr!(
+        term: BlockTerm::Return(InstrWithAwaitAndYield::from_ast_expr(crate::py_expr!(
             "f(g(x))"
         ))),
         params: Vec::new(),
@@ -129,12 +129,12 @@ fn eval_order_hoists_nested_call_in_assignment_rhs() {
         label: BlockLabel::from_index(0),
         body: vec![Store::new(
             test_name("tmp"),
-            Box::new(InstrWithAwaitAndYield::from(crate::py_expr!(
+            Box::new(InstrWithAwaitAndYield::from_ast_expr(crate::py_expr!(
                 "f(g(x))"
             ))),
         )
         .into()],
-        term: BlockTerm::Return(InstrWithAwaitAndYield::from(crate::py_expr!(
+        term: BlockTerm::Return(InstrWithAwaitAndYield::from_ast_expr(crate::py_expr!(
             "__dp_NONE"
         ))),
         params: Vec::new(),
@@ -164,12 +164,12 @@ fn eval_order_hoists_lowered_await_in_assignment_call_argument() {
             test_name("total"),
             Box::new(InstrWithAwaitAndYield::BinOp(BinOp::new(
                 BinOpKind::InplaceAdd,
-                InstrWithAwaitAndYield::from(crate::py_expr!("total")),
-                InstrWithAwaitAndYield::from(crate::py_expr!("await it")),
+                InstrWithAwaitAndYield::from_ast_expr(crate::py_expr!("total")),
+                InstrWithAwaitAndYield::from_ast_expr(crate::py_expr!("await it")),
             ))),
         )
         .into()],
-        term: BlockTerm::Return(InstrWithAwaitAndYield::from(crate::py_expr!(
+        term: BlockTerm::Return(InstrWithAwaitAndYield::from_ast_expr(crate::py_expr!(
             "__dp_NONE"
         ))),
         params: Vec::new(),
@@ -210,15 +210,15 @@ fn eval_order_hoists_yield_from_in_assignment_call_argument() {
             test_name("total"),
             Box::new(InstrWithAwaitAndYield::BinOp(BinOp::new(
                 BinOpKind::InplaceAdd,
-                InstrWithAwaitAndYield::from(crate::py_expr!("total")),
+                InstrWithAwaitAndYield::from_ast_expr(crate::py_expr!("total")),
                 InstrWithAwaitAndYield::YieldFrom(
-                    YieldFrom::new(InstrWithAwaitAndYield::from(crate::py_expr!("it")))
+                    YieldFrom::new(InstrWithAwaitAndYield::from_ast_expr(crate::py_expr!("it")))
                         .with_meta(Meta::default()),
                 ),
             ))),
         )
         .into()],
-        term: BlockTerm::Return(InstrWithAwaitAndYield::from(crate::py_expr!(
+        term: BlockTerm::Return(InstrWithAwaitAndYield::from_ast_expr(crate::py_expr!(
             "__dp_NONE"
         ))),
         params: Vec::new(),
@@ -259,12 +259,12 @@ fn eval_order_leaves_non_yield_binop_stmt_shape_alone() {
             test_name("total"),
             Box::new(InstrWithAwaitAndYield::BinOp(BinOp::new(
                 BinOpKind::InplaceAdd,
-                InstrWithAwaitAndYield::from(crate::py_expr!("total")),
-                InstrWithAwaitAndYield::from(crate::py_expr!("rhs")),
+                InstrWithAwaitAndYield::from_ast_expr(crate::py_expr!("total")),
+                InstrWithAwaitAndYield::from_ast_expr(crate::py_expr!("rhs")),
             ))),
         )
         .into()],
-        term: BlockTerm::Return(InstrWithAwaitAndYield::from(crate::py_expr!(
+        term: BlockTerm::Return(InstrWithAwaitAndYield::from_ast_expr(crate::py_expr!(
             "__dp_NONE"
         ))),
         params: Vec::new(),

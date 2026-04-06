@@ -15,7 +15,7 @@ fn lowers_await_to_yield_from_await_iter() {
     let structured_block = Block {
         label: BlockLabel::from_index(0),
         body: Vec::new(),
-        term: BlockTerm::Return(InstrWithAwaitAndYield::from(crate::py_expr!(
+        term: BlockTerm::Return(InstrWithAwaitAndYield::from_ast_expr(crate::py_expr!(
             "await foo()"
         ))),
         params: Vec::new(),

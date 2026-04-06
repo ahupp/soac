@@ -22,7 +22,7 @@ fn parse_blockpy_expr(source: &str) -> Expr {
 }
 
 fn parse_core_blockpy_expr(source: &str) -> InstrWithAwaitAndYield {
-    parse_blockpy_expr(source).into()
+    InstrWithAwaitAndYield::from_ast_expr(parse_blockpy_expr(source))
 }
 
 fn empty_param_spec() -> ParamSpec {

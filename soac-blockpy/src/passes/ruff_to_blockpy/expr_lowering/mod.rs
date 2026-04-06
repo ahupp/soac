@@ -113,7 +113,8 @@ fn inplace_kind(op: ast::Operator) -> Option<operation::BinOpKind> {
 
 impl RuffToBlockPyExpr for InstrWithAwaitAndYield {
     fn from_lowered_expr(expr: Expr) -> Self {
-        lower_direct_core_helper_expr(&expr).unwrap_or_else(|| expr.into())
+        lower_direct_core_helper_expr(&expr)
+            .unwrap_or_else(|| InstrWithAwaitAndYield::from_ast_expr(expr))
     }
 
     fn helper_call(
@@ -151,7 +152,7 @@ impl RuffToBlockPyExpr for InstrWithAwaitAndYield {
             range,
             "load_deleted_name",
             vec![
-                InstrWithAwaitAndYield::from(py_expr!("{name:literal}", name = name)),
+                InstrWithAwaitAndYield::from_ast_expr(py_expr!("{name:literal}", name = name)),
                 value,
             ],
         )

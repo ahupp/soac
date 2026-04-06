@@ -72,7 +72,7 @@ fn stmt_fragment_can_carry_optional_term() {
 
 #[test]
 fn core_blockpy_expr_wraps_name_expr() {
-    let expr = InstrWithAwaitAndYield::from(py_expr!("y"));
+    let expr = InstrWithAwaitAndYield::from_ast_expr(py_expr!("y"));
 
     assert!(matches!(
         expr,

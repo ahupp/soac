@@ -863,15 +863,15 @@ fn inline_fragment_helper_splices_fallthrough_into_entry_and_deps() {
     let fragment = InlineFragment::new(
         Block::new(
             name_gen.next_block_name(),
-            vec![py_expr!("head()").into()],
+            vec![InstrWithAwaitAndYield::from_ast_expr(py_expr!("head()"))],
             BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())),
             Vec::new(),
             None,
         ),
         vec![Block::new(
             name_gen.next_block_name(),
-                vec![py_expr!("tail()").into()],
-                BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())),
+            vec![InstrWithAwaitAndYield::from_ast_expr(py_expr!("tail()"))],
+            BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())),
             Vec::new(),
             None,
         )],
