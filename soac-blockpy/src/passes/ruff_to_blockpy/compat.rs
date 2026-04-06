@@ -8,7 +8,7 @@ use crate::passes::ruff_to_blockpy::expr_lowering::{
     try_lower_branching_expr_direct, try_lower_if_expr_direct, AstSetupExprLowerer,
 };
 use crate::passes::ruff_to_blockpy::stmt_lowering::{
-    lower_nested_stmt_into_with_expr, try_lower_inline_value_from_structured,
+    lower_nested_stmt_into_with_expr, StructuredLoweringBridge,
 };
 
 fn with_exc_meta<E: Instr>(
@@ -499,9 +499,8 @@ where
         return Ok(label);
     }
 
-    let mut legacy_next_label_id = 0usize;
-    if let Some(fragment) = try_lower_inline_value_from_structured::<E, E>(
-        &mut legacy_next_label_id,
+    let mut bridge = StructuredLoweringBridge::new();
+    if let Some(fragment) = bridge.try_lower_inline_value::<E, E>(
         |out, scratch_next_label_id| {
             for stmt in &body {
                 lower_nested_stmt_into_with_expr(

@@ -94,9 +94,8 @@ where
         elif_else_clauses,
         ..
     } = if_stmt;
-    let mut legacy_next_label_id = 0usize;
-    let Some(test_setup) = try_lower_inline_value_from_structured(
-        &mut legacy_next_label_id,
+    let mut bridge = StructuredLoweringBridge::new();
+    let Some(test_setup) = bridge.try_lower_inline_value(
         |structured, scratch_next_label_id| {
             crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
                 *test.clone(),
@@ -117,7 +116,7 @@ where
             name_gen,
             body,
             loop_ctx,
-            &mut legacy_next_label_id,
+            &mut bridge,
         )
     else {
         return Err("if-body still requires structured lowering".to_string());
@@ -130,7 +129,7 @@ where
         elif_else_clauses,
         &Stmt::If(if_stmt.clone()),
         loop_ctx,
-        &mut legacy_next_label_id,
+        &mut bridge,
     ) else {
         return Err("if-orelse still requires structured lowering".to_string());
     };
@@ -229,7 +228,7 @@ fn lower_nested_body_to_inline_fragment<E>(
     name_gen: &FunctionNameGen,
     body: &Suite,
     loop_ctx: Option<&LoopContext>,
-    next_label_id: &mut usize,
+    bridge: &mut StructuredLoweringBridge,
 ) -> Option<Result<InlineFragment<E>, String>>
 where
     E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
@@ -238,7 +237,7 @@ where
         return None;
     }
 
-    try_lower_inline_from_structured(name_gen, next_label_id, |out, scratch_next_label_id| {
+    bridge.try_lower_inline_stmt(name_gen, |out, scratch_next_label_id| {
         for stmt in body {
             lower_nested_stmt_into_with_expr(context, stmt, out, loop_ctx, scratch_next_label_id)?;
         }
@@ -279,7 +278,7 @@ fn lower_orelse_to_inline_fragment<E>(
     clauses: &[ast::ElifElseClause],
     stmt: &Stmt,
     loop_ctx: Option<&LoopContext>,
-    next_label_id: &mut usize,
+    bridge: &mut StructuredLoweringBridge,
 ) -> Option<Result<InlineFragment<E>, String>>
 where
     E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
@@ -301,7 +300,7 @@ where
                 name_gen,
                 &clause.body,
                 loop_ctx,
-                next_label_id,
+                bridge,
             )
         }
         _ => Some(Err(format!(

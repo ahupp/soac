@@ -6,7 +6,40 @@ use crate::passes::ast_to_ast::context::Context;
 pub(super) type BlockPyStmtBuilder<E> =
     crate::block_py::BlockBuilder<StructuredInstr<E>, BlockTerm<E>>;
 
-pub(crate) fn try_lower_inline_value_from_structured<E, T>(
+pub(crate) struct StructuredLoweringBridge {
+    legacy_next_label_id: usize,
+}
+
+impl StructuredLoweringBridge {
+    pub(crate) fn new() -> Self {
+        Self {
+            legacy_next_label_id: 0,
+        }
+    }
+
+    pub(crate) fn try_lower_inline_value<E, T>(
+        &mut self,
+        lower: impl FnOnce(&mut BlockPyStmtBuilder<E>, &mut usize) -> Result<T, String>,
+    ) -> Option<Result<(InlineBlockBuilder<E>, T), String>>
+    where
+        E: RuffToBlockPyExpr,
+    {
+        try_lower_inline_value_from_structured(&mut self.legacy_next_label_id, lower)
+    }
+
+    pub(crate) fn try_lower_inline_stmt<E>(
+        &mut self,
+        name_gen: &FunctionNameGen,
+        lower: impl FnOnce(&mut BlockPyStmtBuilder<E>, &mut usize) -> Result<(), String>,
+    ) -> Option<Result<InlineFragment<E>, String>>
+    where
+        E: RuffToBlockPyExpr,
+    {
+        try_lower_inline_from_structured(name_gen, &mut self.legacy_next_label_id, lower)
+    }
+}
+
+fn try_lower_inline_value_from_structured<E, T>(
     next_label_id: &mut usize,
     lower: impl FnOnce(&mut BlockPyStmtBuilder<E>, &mut usize) -> Result<T, String>,
 ) -> Option<Result<(InlineBlockBuilder<E>, T), String>>

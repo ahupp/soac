@@ -47,17 +47,12 @@ pub(crate) fn try_lower_if_expr_direct<L, E>(
      let ast::ExprIf {
          test, body, orelse, ..
      } = if_expr;
-     let mut legacy_next_label_id = 0usize;
-     let Some(test_setup) =
-         crate::passes::ruff_to_blockpy::stmt_lowering::try_lower_inline_value_from_structured::<
-             E,
-             Expr,
-         >(
-             &mut legacy_next_label_id,
-             |structured, scratch_next_label_id| {
-                 lowerer.lower_expr_ast_into(*test.clone(), structured, loop_ctx, scratch_next_label_id)
-             },
-         )
+     let mut bridge = crate::passes::ruff_to_blockpy::stmt_lowering::StructuredLoweringBridge::new();
+     let Some(test_setup) = bridge.try_lower_inline_value::<E, Expr>(
+         |structured, scratch_next_label_id| {
+             lowerer.lower_expr_ast_into(*test.clone(), structured, loop_ctx, scratch_next_label_id)
+         },
+     )
      else {
          return None;
      };
@@ -67,23 +62,18 @@ pub(crate) fn try_lower_if_expr_direct<L, E>(
      };
  
      let target = fresh_setup_name("tmp");
-     let Some(body_setup) =
-         crate::passes::ruff_to_blockpy::stmt_lowering::try_lower_inline_value_from_structured::<
-             E,
-             Expr,
-         >(
-             &mut legacy_next_label_id,
-             |structured, scratch_next_label_id| {
-                 let body_value = lowerer.lower_expr_ast_into(
-                     *body.clone(),
-                     structured,
-                     loop_ctx,
-                     scratch_next_label_id,
-                 )?;
-                 structured.push_stmt(assign_name(&target, body_value.clone()));
-                 Ok(body_value)
-             },
-         )
+     let Some(body_setup) = bridge.try_lower_inline_value::<E, Expr>(
+         |structured, scratch_next_label_id| {
+             let body_value = lowerer.lower_expr_ast_into(
+                 *body.clone(),
+                 structured,
+                 loop_ctx,
+                 scratch_next_label_id,
+             )?;
+             structured.push_stmt(assign_name(&target, body_value.clone()));
+             Ok(body_value)
+         },
+     )
      else {
          return None;
      };
@@ -94,23 +84,18 @@ pub(crate) fn try_lower_if_expr_direct<L, E>(
     let body_fragment =
         InlineFragment::from_fallthrough_builder(name_gen.next_block_name(), body_entry, Vec::new());
  
-     let Some(orelse_setup) =
-         crate::passes::ruff_to_blockpy::stmt_lowering::try_lower_inline_value_from_structured::<
-             E,
-             Expr,
-         >(
-             &mut legacy_next_label_id,
-             |structured, scratch_next_label_id| {
-                 let orelse_value = lowerer.lower_expr_ast_into(
-                     *orelse.clone(),
-                     structured,
-                     loop_ctx,
-                     scratch_next_label_id,
-                 )?;
-                 structured.push_stmt(assign_name(&target, orelse_value.clone()));
-                 Ok(orelse_value)
-             },
-         )
+     let Some(orelse_setup) = bridge.try_lower_inline_value::<E, Expr>(
+         |structured, scratch_next_label_id| {
+             let orelse_value = lowerer.lower_expr_ast_into(
+                 *orelse.clone(),
+                 structured,
+                 loop_ctx,
+                 scratch_next_label_id,
+             )?;
+             structured.push_stmt(assign_name(&target, orelse_value.clone()));
+             Ok(orelse_value)
+         },
+     )
      else {
          return None;
      };

@@ -91,22 +91,16 @@ where
 {
     let ast::ExprBoolOp { op, values, .. } = bool_op;
     let target = fresh_setup_name("target");
-    let mut legacy_next_label_id = 0usize;
+    let mut bridge = crate::passes::ruff_to_blockpy::stmt_lowering::StructuredLoweringBridge::new();
     let mut values = values.into_iter();
     let first = values.next().expect("bool op expects at least one value");
-    let (mut entry, first) =
-        crate::passes::ruff_to_blockpy::stmt_lowering::try_lower_inline_value_from_structured::<
-            E,
-            Expr,
-        >(
-            &mut legacy_next_label_id,
-            |structured, scratch_next_label_id| {
-                let first =
-                    lowerer.lower_expr_ast_into(first.clone(), structured, loop_ctx, scratch_next_label_id)?;
-                structured.push_stmt(assign_name(&target, first.clone()));
-                Ok(first)
-            },
-        )
+    let (mut entry, first) = bridge
+        .try_lower_inline_value::<E, Expr>(|structured, scratch_next_label_id| {
+            let first =
+                lowerer.lower_expr_ast_into(first.clone(), structured, loop_ctx, scratch_next_label_id)?;
+            structured.push_stmt(assign_name(&target, first.clone()));
+            Ok(first)
+        })
         .transpose()?
         .ok_or_else(|| "boolop setup still requires structured lowering".to_string())?;
     let _ = first;
@@ -132,23 +126,17 @@ where
             })),
         }
 
-        let (next_entry, value) =
-            crate::passes::ruff_to_blockpy::stmt_lowering::try_lower_inline_value_from_structured::<
-                E,
-                Expr,
-            >(
-                &mut legacy_next_label_id,
-                |structured, scratch_next_label_id| {
-                    let value = lowerer.lower_expr_ast_into(
-                        value.clone(),
-                        structured,
-                        loop_ctx,
-                        scratch_next_label_id,
-                    )?;
-                    structured.push_stmt(assign_name(&target, value.clone()));
-                    Ok(value)
-                },
-            )
+        let (next_entry, value) = bridge
+            .try_lower_inline_value::<E, Expr>(|structured, scratch_next_label_id| {
+                let value = lowerer.lower_expr_ast_into(
+                    value.clone(),
+                    structured,
+                    loop_ctx,
+                    scratch_next_label_id,
+                )?;
+                structured.push_stmt(assign_name(&target, value.clone()));
+                Ok(value)
+            })
             .transpose()?
             .ok_or_else(|| "boolop step still requires structured lowering".to_string())?;
         let _ = value;
@@ -194,7 +182,7 @@ where
     } = compare;
     let compare_name = fresh_setup_name("compare");
     let target_name = fresh_setup_name("target");
-    let mut legacy_next_label_id = 0usize;
+    let mut bridge = crate::passes::ruff_to_blockpy::stmt_lowering::StructuredLoweringBridge::new();
     let ops = ops.into_vec();
     let comparators = comparators.into_vec();
     let mut steps = ops.into_iter().zip(comparators.into_iter()).peekable();
@@ -203,38 +191,32 @@ where
     };
     let first_has_more = steps.peek().is_some();
 
-    let (mut entry, (_initial_left, first_comparator)) =
-        crate::passes::ruff_to_blockpy::stmt_lowering::try_lower_inline_value_from_structured::<
-            E,
-            (Expr, Expr),
-        >(
-            &mut legacy_next_label_id,
-            |structured, scratch_next_label_id| {
-                let current_left = lowerer.lower_expr_ast_into(
-                    (*left).clone(),
-                    structured,
-                    loop_ctx,
-                    scratch_next_label_id,
-                )?;
-                structured.push_stmt(assign_name(&compare_name, current_left.clone()));
-                let mut first_comparator = lowerer.lower_expr_ast_into(
-                    first_comparator_expr.clone(),
-                    structured,
-                    loop_ctx,
-                    scratch_next_label_id,
-                )?;
-                if first_has_more {
-                    let tmp_name = fresh_setup_name("compare");
-                    structured.push_stmt(assign_name(&tmp_name, first_comparator.clone()));
-                    first_comparator = load_name(&tmp_name);
-                }
-                structured.push_stmt(assign_name(
-                    &target_name,
-                    compare_expr(first_op, load_name(&compare_name), first_comparator.clone()),
-                ));
-                Ok((load_name(&compare_name), first_comparator))
-            },
-        )
+    let (mut entry, (_initial_left, first_comparator)) = bridge
+        .try_lower_inline_value::<E, (Expr, Expr)>(|structured, scratch_next_label_id| {
+            let current_left = lowerer.lower_expr_ast_into(
+                (*left).clone(),
+                structured,
+                loop_ctx,
+                scratch_next_label_id,
+            )?;
+            structured.push_stmt(assign_name(&compare_name, current_left.clone()));
+            let mut first_comparator = lowerer.lower_expr_ast_into(
+                first_comparator_expr.clone(),
+                structured,
+                loop_ctx,
+                scratch_next_label_id,
+            )?;
+            if first_has_more {
+                let tmp_name = fresh_setup_name("compare");
+                structured.push_stmt(assign_name(&tmp_name, first_comparator.clone()));
+                first_comparator = load_name(&tmp_name);
+            }
+            structured.push_stmt(assign_name(
+                &target_name,
+                compare_expr(first_op, load_name(&compare_name), first_comparator.clone()),
+            ));
+            Ok((load_name(&compare_name), first_comparator))
+        })
         .transpose()?
         .ok_or_else(|| "compare setup still requires structured lowering".to_string())?;
     let mut current_left = first_comparator.clone();
@@ -259,31 +241,25 @@ where
 
         let has_more = steps.peek().is_some();
         let current_left_for_step = current_left.clone();
-        let (next_entry, comparator_expr) =
-            crate::passes::ruff_to_blockpy::stmt_lowering::try_lower_inline_value_from_structured::<
-                E,
-                Expr,
-            >(
-                &mut legacy_next_label_id,
-                |structured, scratch_next_label_id| {
-                    let mut comparator_expr = lowerer.lower_expr_ast_into(
-                        comparator.clone(),
-                        structured,
-                        loop_ctx,
-                        scratch_next_label_id,
-                    )?;
-                    if has_more {
-                        let tmp_name = fresh_setup_name("compare");
-                        structured.push_stmt(assign_name(&tmp_name, comparator_expr.clone()));
-                        comparator_expr = load_name(&tmp_name);
-                    }
-                    structured.push_stmt(assign_name(
-                        &target_name,
-                        compare_expr(op, current_left_for_step.clone(), comparator_expr.clone()),
-                    ));
-                    Ok(comparator_expr)
-                },
-            )
+        let (next_entry, comparator_expr) = bridge
+            .try_lower_inline_value::<E, Expr>(|structured, scratch_next_label_id| {
+                let mut comparator_expr = lowerer.lower_expr_ast_into(
+                    comparator.clone(),
+                    structured,
+                    loop_ctx,
+                    scratch_next_label_id,
+                )?;
+                if has_more {
+                    let tmp_name = fresh_setup_name("compare");
+                    structured.push_stmt(assign_name(&tmp_name, comparator_expr.clone()));
+                    comparator_expr = load_name(&tmp_name);
+                }
+                structured.push_stmt(assign_name(
+                    &target_name,
+                    compare_expr(op, current_left_for_step.clone(), comparator_expr.clone()),
+                ));
+                Ok(comparator_expr)
+            })
             .transpose()?
             .ok_or_else(|| "compare step still requires structured lowering".to_string())?;
 
