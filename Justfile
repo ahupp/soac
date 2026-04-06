@@ -336,12 +336,6 @@ perf-pystone-jit-warm loops="500000" output_prefix="logs/pystone_jit_perf_warm":
     echo "perf is required but was not found on PATH" >&2
     exit 1
   fi
-  if ! command -v inferno-collapse-perf >/dev/null 2>&1; then
-    echo "inferno-collapse-perf is required but was not found on PATH" >&2
-    echo "install it with: cargo install inferno" >&2
-    exit 1
-  fi
-
   echo "date: $(date +%F)"
   echo "warmup loops: ${WARMUP_LOOPS}"
   echo "profile loops: ${LOOPS}"
@@ -480,9 +474,16 @@ perf-pystone-jit-warm loops="500000" output_prefix="logs/pystone_jit_perf_warm":
     -i "${PERF_DATA}" \
     >"${REPORT_CALLGRAPH}"
 
-  perf script -i "${PERF_DATA}" \
-    | inferno-collapse-perf \
-    | python3 "$REPO_ROOT/scripts/folded_to_speedscope.py" "$(basename "${OUTPUT_PREFIX}")" \
+  perf report \
+    --stdio \
+    --stdio-color never \
+    --no-children \
+    --show-nr-samples \
+    --percent-limit 0 \
+    --sort overhead,dso,symbol \
+    --call-graph flat,0,caller,count \
+    -i "${PERF_DATA}" \
+    | python3 "$REPO_ROOT/scripts/perf_report_to_speedscope.py" "$(basename "${OUTPUT_PREFIX}")" \
     >"${REPORT_SPEEDSCOPE}"
 
   echo "finished"
