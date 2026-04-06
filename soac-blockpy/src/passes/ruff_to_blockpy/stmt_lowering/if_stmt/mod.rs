@@ -237,13 +237,24 @@ where
         return None;
     }
 
-    bridge.try_lower_inline_stmt(name_gen, |out, scratch_next_label_id| {
-        for stmt in body {
-            lower_nested_stmt_into_with_expr(context, stmt, out, loop_ctx, scratch_next_label_id)?;
-        }
-        Ok(())
-    })
-    .map(|result| result)
+    bridge
+        .try_lower_inline_value::<E, ()>(|out, scratch_next_label_id| {
+            for stmt in body {
+                lower_nested_stmt_into_with_expr(
+                    context,
+                    stmt,
+                    out,
+                    loop_ctx,
+                    scratch_next_label_id,
+                )?;
+            }
+            Ok(())
+        })
+        .map(|result| {
+            result.map(|(entry, ())| {
+                InlineFragment::from_fallthrough_builder(name_gen.next_block_name(), entry, Vec::new())
+            })
+        })
 }
 
 fn lower_orelse_to_stmts_with_expr<E>(

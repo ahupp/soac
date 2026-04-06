@@ -26,17 +26,6 @@ impl StructuredLoweringBridge {
     {
         try_lower_inline_value_from_structured(&mut self.legacy_next_label_id, lower)
     }
-
-    pub(crate) fn try_lower_inline_stmt<E>(
-        &mut self,
-        name_gen: &FunctionNameGen,
-        lower: impl FnOnce(&mut BlockPyStmtBuilder<E>, &mut usize) -> Result<(), String>,
-    ) -> Option<Result<InlineFragment<E>, String>>
-    where
-        E: RuffToBlockPyExpr,
-    {
-        try_lower_inline_from_structured(name_gen, &mut self.legacy_next_label_id, lower)
-    }
 }
 
 fn try_lower_inline_value_from_structured<E, T>(
@@ -69,22 +58,6 @@ where
 
     *next_label_id = scratch_next_label_id;
     Some(Ok((entry, value)))
-}
-
-pub(super) fn try_lower_inline_from_structured<E>(
-    name_gen: &FunctionNameGen,
-    next_label_id: &mut usize,
-    lower: impl FnOnce(&mut BlockPyStmtBuilder<E>, &mut usize) -> Result<(), String>,
-) -> Option<Result<InlineFragment<E>, String>>
-where
-    E: RuffToBlockPyExpr,
-{
-    try_lower_inline_value_from_structured(next_label_id, lower)
-        .map(|result| {
-            result.map(|(entry, ())| {
-                InlineFragment::from_fallthrough_builder(name_gen.next_block_name(), entry, Vec::new())
-            })
-        })
 }
 
 pub(super) fn stmts_from_rewrite(rewrite: Rewrite) -> Vec<Stmt> {
