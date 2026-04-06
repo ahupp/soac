@@ -1692,7 +1692,6 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "http-body-util",
- "memmap2",
  "pyo3",
  "serde",
  "serde_json",
@@ -1716,6 +1715,7 @@ dependencies = [
  "cranelift-reader",
  "libc",
  "log",
+ "memmap2",
  "pyo3",
  "pyo3-build-config",
  "ruff_python_ast",

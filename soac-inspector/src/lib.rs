@@ -3,7 +3,6 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
-mod counter_dump;
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyModule};
 use serde::{Deserialize, Serialize};
@@ -21,7 +20,7 @@ use std::sync::Once;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tower_http::services::ServeDir;
 
-pub use counter_dump::{
+pub use soac_jit::counter_dump::{
     CounterDumpFile, CounterDumpRecordView, CounterDumpRowView, parse_counter_dump_records,
 };
 

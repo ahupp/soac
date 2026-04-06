@@ -1,8 +1,7 @@
 use soac_inspector::CounterDumpFile;
-use soac_inspector::CounterDumpRecordView;
 use soac_inspector::CounterDumpRowView;
 use soac_blockpy::block_py::FunctionId;
-use std::collections::HashSet;
+use soac_jit::counter_dump::render_call_target_specializations;
 use std::path::PathBuf;
 
 struct Args {
@@ -79,75 +78,12 @@ fn format_counter_row(row: &CounterDumpRowView<'_>) -> String {
     )
 }
 
-fn format_specializations(records: &[CounterDumpRecordView<'_>]) -> Result<String, String> {
-    let mut ordered_keys = Vec::new();
-    let mut seen_targets = HashSet::new();
-    let mut targets = std::collections::HashMap::<String, Vec<u64>>::new();
-    for record in records {
-        let module = record.module_name()?;
-        for row_index in 0..record.row_count() {
-            let row = record.row(row_index)?;
-            if row.kind != "call_hot_targets" {
-                continue;
-            }
-            let Some(site_function_id) = row.function_id else {
-                continue;
-            };
-            let Some(instr_id) = row.instr_id else {
-                continue;
-            };
-            let Some(observed_value) = row.observed_value else {
-                continue;
-            };
-            if observed_value == 0 {
-                continue;
-            }
-            let observed_function_id = FunctionId::from_packed(observed_value);
-            if observed_function_id == FunctionId::global() {
-                continue;
-            }
-            let key = format!(
-                "{}|{}|{}|{}",
-                module,
-                site_function_id.packed(),
-                instr_id.block_label().as_u32(),
-                instr_id.instr_index_in_block(),
-            );
-            let target_key = format!("{key}|{}", observed_function_id.packed());
-            if seen_targets.insert(target_key) {
-                if !targets.contains_key(&key) {
-                    ordered_keys.push(key.clone());
-                }
-                targets.entry(key).or_default().push(observed_function_id.packed());
-            }
-        }
-    }
-    let mut out = String::new();
-    for (index, key) in ordered_keys.iter().enumerate() {
-        if index > 0 {
-            out.push(';');
-        }
-        out.push_str(key);
-        out.push('=');
-        let Some(values) = targets.get(key) else {
-            return Err(format!("missing specialization targets for key {key}"));
-        };
-        for (value_index, value) in values.iter().enumerate() {
-            if value_index > 0 {
-                out.push(',');
-            }
-            out.push_str(&value.to_string());
-        }
-    }
-    Ok(out)
-}
-
 fn main() -> Result<(), String> {
     let args = parse_args().inspect_err(|_| print_usage())?;
     let dump = CounterDumpFile::open(args.path.as_path())?;
     let records = dump.records()?;
     if args.emit_specializations {
-        println!("{}", format_specializations(&records)?);
+        println!("{}", render_call_target_specializations(&records)?);
         return Ok(());
     }
     for (record_index, record) in records.iter().enumerate() {
@@ -168,10 +104,12 @@ fn main() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_counter_row, format_specializations};
+    use super::format_counter_row;
     use soac_blockpy::block_py::{BlockLabel, FunctionId, InstrId};
     use soac_inspector::parse_counter_dump_records;
-    use soac_jit::counter_dump::{CounterDumpRecord, CounterDumpRow};
+    use soac_jit::counter_dump::{
+        CounterDumpRecord, CounterDumpRow, render_call_target_specializations,
+    };
     use soac_inspector::CounterDumpRowView;
 
     #[test]
@@ -327,7 +265,8 @@ mod tests {
         };
         let bytes = record.encode().expect("counter dump should encode");
         let records = parse_counter_dump_records(bytes.as_slice()).expect("counter dump should parse");
-        let rendered = format_specializations(&records).expect("specializations should render");
+        let rendered = render_call_target_specializations(&records)
+            .expect("specializations should render");
         assert_eq!(rendered, "mod|4294967303|2|4=4294967305,4294967306");
     }
 }

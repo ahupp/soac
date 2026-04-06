@@ -1,4 +1,5 @@
 use crate::SOAC_RUNTIME_CLIF;
+use crate::counter_dump::read_call_target_specializations_from_file;
 use crate::module_constants::{ModuleCodegenConstants, ModuleConstantId};
 use cranelift_codegen::cfg_printer::CFGPrinter;
 use cranelift_codegen::incremental_cache::CacheKvStore;
@@ -1887,6 +1888,33 @@ fn parse_call_target_specializations_env(
         );
     }
     Ok(out)
+}
+
+fn load_call_target_specializations(
+    module_name: &str,
+    function_id: FunctionId,
+) -> Result<HashMap<InstrId, Vec<FunctionId>>, String> {
+    if env::var("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS").is_ok() {
+        return parse_call_target_specializations_env(module_name, function_id);
+    }
+    if env::var("DIET_PYTHON_CALL_TARGET_COUNTERS")
+        .ok()
+        .is_some_and(|raw| !raw.trim().is_empty())
+    {
+        return Ok(HashMap::new());
+    }
+    let Some(path) = env::var("DIET_PYTHON_COUNTERS_FILE")
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+    else {
+        return Ok(HashMap::new());
+    };
+    let path = std::path::Path::new(path.as_str());
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    read_call_target_specializations_from_file(path, module_name, function_id)
 }
 
 fn emit_callee_function_id_checked(
@@ -5117,7 +5145,7 @@ fn build_cranelift_run_bb_specialized_function(
     );
     let call_target_specializations = match direct_call_resolver {
         Some(shared_state) => {
-            parse_call_target_specializations_env(shared_state.module_name.as_str(), function.function_id)?
+            load_call_target_specializations(shared_state.module_name.as_str(), function.function_id)?
         }
         None => HashMap::new(),
     };

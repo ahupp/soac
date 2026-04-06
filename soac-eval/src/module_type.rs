@@ -558,7 +558,7 @@ impl SoacExtModuleState {
 }
 
 fn counter_dump_file_from_env() -> Option<std::path::PathBuf> {
-    let raw = env::var("DIET_PYTHON_COUNTERS_FILE").ok()?;
+    let raw = env::var("DIET_PYTHON_COUNTERS_OUTPUT_FILE").ok()?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         None

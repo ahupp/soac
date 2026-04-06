@@ -8,7 +8,7 @@ from tests._integration import integration_module
 def test_counter_dump_file_is_written_on_module_exit(tmp_path, monkeypatch):
     dump_path = tmp_path / "counters.bin"
     monkeypatch.setenv("DIET_PYTHON_GLOBAL_LOAD_COUNTERS", "1")
-    monkeypatch.setenv("DIET_PYTHON_COUNTERS_FILE", str(dump_path))
+    monkeypatch.setenv("DIET_PYTHON_COUNTERS_OUTPUT_FILE", str(dump_path))
 
     source = """
 VALUE = 7

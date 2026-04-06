@@ -6,7 +6,6 @@ build = "build.rs"
 
 [dependencies]
 axum = "0.8"
-memmap2 = "0.9"
 soac-blockpy = { path = "../soac-blockpy" }
 pyo3 = { workspace = true }
 serde = { version = "1", features = ["derive"] }
