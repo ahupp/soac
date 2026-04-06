@@ -182,7 +182,13 @@ impl SharedModuleState {
                 &module_constant_ptrs,
                 &counter_ptrs,
                 Some(self),
-            )?
+            )
+            .map_err(|err| {
+                format!(
+                    "{err} [direct_target={} id={}]",
+                    function.names.qualname, function.function_id
+                )
+            })?
         };
         let code_ptr = match crate::jit::compiled_direct_code_ptr(handle) {
             Ok(code_ptr) => code_ptr,

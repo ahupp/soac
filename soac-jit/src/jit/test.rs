@@ -1,10 +1,10 @@
 use super::*;
 use soac_blockpy::block_py::{
-    BinOp, BinOpKind, BlockParamRole, BlockPyFunction, BlockPyLiteral, BlockPyModule, BlockTerm,
-    Call, CallArgPositional, CellLocation, ClosureInit, ClosureSlot, CodegenBlock,
-    CodegenBlockPyExpr, CoreNumberLiteral, CoreNumberLiteralValue,
-    CoreStringLiteral, CounterSite, Del, DelItem, FunctionName, LiteralValue, Load,
-    InstrResolved, Meta, ModuleNameGen, NameLocation, Param, ParamKind, ParamSpec, ResolvedName,
+    BinOp, BinOpKind, BlockLabel, BlockParamRole, BlockPyFunction, BlockPyLiteral, BlockPyModule,
+    BlockTerm, Call, CallArgPositional, CellLocation, ClosureInit, ClosureSlot, CodegenBlock,
+    CodegenBlockPyExpr, CoreNumberLiteral, CoreNumberLiteralValue, CoreStringLiteral, CounterSite,
+    Del, DelItem, FunctionId, FunctionName, InstrResolved, LiteralValue, Load, Meta, ModuleNameGen,
+    NameLocation, Param, ParamKind, ParamSpec, ResolvedName,
     StorageLayout, Store, WithMeta,
 };
 use soac_blockpy::passes::{
@@ -78,6 +78,10 @@ mod tests {
             value: value.to_string(),
         });
         InstrResolved::Literal(LiteralValue::new(literal))
+    }
+
+    fn none_expr() -> CodegenBlockPyExpr {
+        Load::new(test_runtime_name("NONE")).into()
     }
 
     #[derive(Default)]
@@ -238,6 +242,123 @@ mod tests {
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
         render_test_jit_function_with_constants(&module, &function, blocks, &module_constants)
+    }
+
+    fn render_test_jit_function_with_call_target_specializations(
+        module: &BlockPyModule<CodegenBlockPyPass>,
+        function: &BlockPyFunction<CodegenBlockPyPass>,
+        blocks: &[ObjPtr],
+        specializations: &[(InstrId, FunctionId)],
+    ) -> String {
+        let module_name = "counter_test";
+        let function_id = function.function_id.packed();
+        let specialization_value = specializations
+            .iter()
+            .map(|(instr_id, target_function_id)| {
+                format!(
+                    "{module_name}|{function_id}|{}|{}={}",
+                    instr_id.block_label().as_u32(),
+                    instr_id.instr_index_in_block(),
+                    target_function_id.packed(),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(";");
+
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        let old_call_target_specializations =
+            std::env::var_os("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS");
+        let old_operator_specializations =
+            std::env::var_os("DIET_PYTHON_OPERATOR_SPECIALIZATIONS");
+        let old_counters_file = std::env::var_os("DIET_PYTHON_COUNTERS_FILE");
+        let old_call_target_counters = std::env::var_os("DIET_PYTHON_CALL_TARGET_COUNTERS");
+        let old_pythonhome = std::env::var_os("PYTHONHOME");
+        let old_pythonpath = std::env::var_os("PYTHONPATH");
+        let python_home = vendored_python_home();
+        let python_path = std::env::join_paths([
+            python_home.join("Lib"),
+            vendored_python_build_lib_dir(),
+            repo_root().join("soac_py").join("src"),
+        ])
+        .expect("test PYTHONPATH should join");
+        unsafe {
+            std::env::set_var(
+                "DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS",
+                specialization_value.as_str(),
+            );
+            std::env::remove_var("DIET_PYTHON_OPERATOR_SPECIALIZATIONS");
+            std::env::remove_var("DIET_PYTHON_COUNTERS_FILE");
+            std::env::remove_var("DIET_PYTHON_CALL_TARGET_COUNTERS");
+            std::env::set_var("PYTHONHOME", &python_home);
+            std::env::set_var("PYTHONPATH", python_path);
+        }
+
+        let rendered = unsafe {
+            Python::initialize();
+            Python::attach(|py| {
+                let shared_state = crate::module_type::build_shared_state_for_testing(
+                    py,
+                    module.clone(),
+                    module_name,
+                    "",
+                )
+                .expect("shared state should build");
+                let mut jit_module = new_jit_module().expect("test jit module should construct");
+                let module_constant_ptrs = shared_state.module_constant_ptrs();
+                let counter_ptrs = shared_state.counter_ptrs();
+                let built = build_cranelift_run_bb_specialized_function(
+                    &mut jit_module,
+                    blocks,
+                    &shared_state.lowered_module,
+                    function,
+                    &shared_state.codegen_constants,
+                    &shared_state.lowered_module.counter_defs,
+                    &module_constant_ptrs,
+                    &counter_ptrs,
+                    Some(shared_state.as_ref()),
+                )
+                .expect("specialized JIT build should succeed");
+                let (clif, _cfg_dot, _vcode_disasm) = render_compiled_clif_and_vcode_disasm(
+                    &mut jit_module,
+                    built.ctx,
+                    &built.import_id_to_symbol,
+                    &built.block_annotations,
+                )
+                .expect("specialized JIT CLIF render should succeed");
+                clif
+            })
+        };
+
+        unsafe {
+            match old_call_target_specializations {
+                Some(value) => {
+                    std::env::set_var("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS", value)
+                }
+                None => std::env::remove_var("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS"),
+            }
+            match old_operator_specializations {
+                Some(value) => std::env::set_var("DIET_PYTHON_OPERATOR_SPECIALIZATIONS", value),
+                None => std::env::remove_var("DIET_PYTHON_OPERATOR_SPECIALIZATIONS"),
+            }
+            match old_counters_file {
+                Some(value) => std::env::set_var("DIET_PYTHON_COUNTERS_FILE", value),
+                None => std::env::remove_var("DIET_PYTHON_COUNTERS_FILE"),
+            }
+            match old_call_target_counters {
+                Some(value) => std::env::set_var("DIET_PYTHON_CALL_TARGET_COUNTERS", value),
+                None => std::env::remove_var("DIET_PYTHON_CALL_TARGET_COUNTERS"),
+            }
+            match old_pythonhome {
+                Some(value) => std::env::set_var("PYTHONHOME", value),
+                None => std::env::remove_var("PYTHONHOME"),
+            }
+            match old_pythonpath {
+                Some(value) => std::env::set_var("PYTHONPATH", value),
+                None => std::env::remove_var("PYTHONPATH"),
+            }
+        }
+
+        rendered
     }
 
     fn render_test_jit_function_with_operator_specializations(
@@ -1746,6 +1867,314 @@ def f(x):
                 && !rendered.contains("call dp_jit_py_call_object")
                 && !rendered.contains("call dp_jit_py_call_with_kw"),
             "generic positional calls should avoid the tuple/kwargs helper path:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn render_specialized_jit_direct_function_calls_use_direct_call_path() {
+        let blocks = [1usize as ObjPtr];
+        let mut constants = TestConstantPool::default();
+        let module_name_gen = ModuleNameGen::new(0);
+        let callee_name_gen = module_name_gen.next_function_name_gen();
+        let caller_name_gen = module_name_gen.next_function_name_gen();
+
+        let mut callee_function = BlockPyFunction {
+            function_id: callee_name_gen.function_id(),
+            name_gen: callee_name_gen,
+            names: FunctionName::new("callee", "callee", "callee", "callee"),
+            kind: soac_blockpy::block_py::FunctionKind::Function,
+            params: ParamSpec {
+                params: vec![Param {
+                    name: "x".into(),
+                    kind: ParamKind::Any,
+                    has_default: false,
+                }],
+            },
+            blocks: vec![CodegenBlock {
+                label: BlockLabel::from_index(0),
+                body: vec![],
+                term: ret_term(name_expr(test_name("x"))),
+                params: vec![],
+                exc_edge: None,
+            }],
+            doc: None,
+            storage_layout: None,
+            scope: Default::default(),
+        };
+        set_stack_slots(&mut callee_function, &["x"]);
+
+        let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+        let caller_function = BlockPyFunction {
+            function_id: caller_name_gen.function_id(),
+            name_gen: caller_name_gen,
+            names: FunctionName::new("caller", "caller", "caller", "caller"),
+            kind: soac_blockpy::block_py::FunctionKind::Function,
+            params: ParamSpec::default(),
+            blocks: vec![CodegenBlock {
+                label: BlockLabel::from_index(0),
+                body: vec![],
+                term: ret_term(with_instr_id(
+                    op_expr(Call::new(
+                        name_expr(test_global_name("callee")),
+                        vec![CallArgPositional::Positional(constants.int_expr(1))],
+                        vec![],
+                    )),
+                    call_instr_id,
+                )),
+                params: vec![],
+                exc_edge: None,
+            }],
+            doc: None,
+            storage_layout: None,
+            scope: Default::default(),
+        };
+
+        let module = BlockPyModule {
+            module_name_gen: ModuleNameGen::new(0),
+            global_names: vec!["callee".into()],
+            callable_defs: vec![callee_function.clone(), caller_function.clone()],
+            module_constants: constants.module_constants,
+            counter_defs: Vec::new(),
+        };
+        let rendered = render_test_jit_function_with_call_target_specializations(
+            &module,
+            &caller_function,
+            &blocks,
+            &[(call_instr_id, callee_function.function_id)],
+        );
+
+        assert!(
+            rendered.contains("call_indirect"),
+            "direct call specialization should emit an indirect call to the compiled target:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(format!("iconst.i64 {}", callee_function.function_id.packed()).as_str()),
+            "direct call specialization should compare against the profiled target function id:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn render_specialized_jit_type_constructors_use_constructor_fast_path() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        let old_call_target_specializations =
+            std::env::var_os("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS");
+        let old_counters_file = std::env::var_os("DIET_PYTHON_COUNTERS_FILE");
+        let old_call_target_counters = std::env::var_os("DIET_PYTHON_CALL_TARGET_COUNTERS");
+        let old_pythonhome = std::env::var_os("PYTHONHOME");
+        let old_pythonpath = std::env::var_os("PYTHONPATH");
+        let python_home = vendored_python_home();
+        let python_path = std::env::join_paths([
+            python_home.join("Lib"),
+            vendored_python_build_lib_dir(),
+            repo_root().join("soac_py").join("src"),
+        ])
+        .expect("test PYTHONPATH should join");
+        unsafe {
+            std::env::remove_var("DIET_PYTHON_COUNTERS_FILE");
+            std::env::remove_var("DIET_PYTHON_CALL_TARGET_COUNTERS");
+            std::env::set_var("PYTHONHOME", &python_home);
+            std::env::set_var("PYTHONPATH", python_path);
+        }
+
+        let rendered = unsafe {
+            Python::initialize();
+            Python::attach(|py| {
+                let mut constants = TestConstantPool::default();
+                let module_name_gen = ModuleNameGen::new(0);
+                let init_name_gen = module_name_gen.next_function_name_gen();
+                let init_function_id = init_name_gen.function_id();
+                let caller_name_gen = module_name_gen.next_function_name_gen();
+                let caller_function_id = caller_name_gen.function_id();
+
+                let mut init_function = BlockPyFunction {
+                    function_id: init_function_id,
+                    name_gen: init_name_gen,
+                    names: FunctionName::new("Record.__init__", "Record.__init__", "Record.__init__", "Record.__init__"),
+                    kind: soac_blockpy::block_py::FunctionKind::Function,
+                    params: ParamSpec {
+                        params: vec![
+                            Param {
+                                name: "self".into(),
+                                kind: ParamKind::Any,
+                                has_default: false,
+                            },
+                            Param {
+                                name: "x".into(),
+                                kind: ParamKind::Any,
+                                has_default: false,
+                            },
+                        ],
+                    },
+                    blocks: vec![CodegenBlock {
+                        label: BlockLabel::from_index(0),
+                        body: vec![],
+                        term: ret_term(none_expr()),
+                        params: vec![],
+                        exc_edge: None,
+                    }],
+                    doc: None,
+                    storage_layout: None,
+                    scope: Default::default(),
+                };
+                set_stack_slots(&mut init_function, &["self", "x"]);
+
+                let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+                let caller_function = BlockPyFunction {
+                    function_id: caller_function_id,
+                    name_gen: caller_name_gen,
+                    names: FunctionName::new("make_record", "make_record", "make_record", "make_record"),
+                    kind: soac_blockpy::block_py::FunctionKind::Function,
+                    params: ParamSpec::default(),
+                    blocks: vec![CodegenBlock {
+                        label: BlockLabel::from_index(0),
+                        body: vec![],
+                        term: ret_term(with_instr_id(
+                            op_expr(Call::new(
+                                name_expr(test_global_name("Record")),
+                                vec![CallArgPositional::Positional(constants.int_expr(1))],
+                                vec![],
+                            )),
+                            call_instr_id,
+                        )),
+                        params: vec![],
+                        exc_edge: None,
+                    }],
+                    doc: None,
+                    storage_layout: None,
+                    scope: Default::default(),
+                };
+
+                let module = BlockPyModule {
+                    module_name_gen: ModuleNameGen::new(0),
+                    global_names: vec!["Record".into()],
+                    callable_defs: vec![init_function.clone(), caller_function.clone()],
+                    module_constants: constants.module_constants,
+                    counter_defs: Vec::new(),
+                };
+                let specialization_value = format!(
+                    "counter_test|{}|{}|{}={}",
+                    caller_function.function_id.packed(),
+                    call_instr_id.block_label().as_u32(),
+                    call_instr_id.instr_index_in_block(),
+                    init_function.function_id.packed(),
+                );
+                std::env::set_var(
+                    "DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS",
+                    specialization_value,
+                );
+
+                let shared_state = crate::module_type::build_shared_state_for_testing(
+                    py,
+                    module,
+                    "counter_test",
+                    "",
+                )
+                .expect("shared state should build");
+                let mut runtime = build_test_module_runtime(py, shared_state.clone());
+                let globals = pyo3::Bound::<pyo3::PyAny>::from_borrowed_ptr(
+                    py,
+                    runtime.vmctx.globals_obj.cast(),
+                )
+                .cast_into::<pyo3::types::PyDict>()
+                .expect("runtime globals should be a dict");
+                globals
+                    .set_item("__name__", "counter_test")
+                    .expect("globals should accept __name__");
+                let class_source = std::ffi::CString::new(
+                    "class Record:\n    def __init__(self, x):\n        self.x = x\n",
+                )
+                .expect("class source should be CString-compatible");
+                let run_result = ffi::PyRun_StringFlags(
+                    class_source.as_ptr(),
+                    ffi::Py_file_input,
+                    globals.as_ptr(),
+                    globals.as_ptr(),
+                    std::ptr::null_mut(),
+                );
+                assert!(
+                    !run_result.is_null(),
+                    "class definition should execute in test globals"
+                );
+                ffi::Py_DECREF(run_result);
+                let cls = globals
+                    .get_item("Record")
+                    .expect("class should exist");
+                let owner_type = cls.as_ptr() as *mut ffi::PyTypeObject;
+                let init_function_obj = ffi::PyDict_GetItemString((*owner_type).tp_dict, c"__init__".as_ptr());
+                assert!(
+                    !init_function_obj.is_null(),
+                    "class dict should contain __init__"
+                );
+                ffi::Py_INCREF(init_function_obj);
+                let runtime_clone = crate::clone_module_runtime_context(&runtime)
+                    .expect("runtime clone should succeed");
+                crate::register_clif_vectorcall(
+                    init_function_obj,
+                    init_function.function_id,
+                    runtime_clone,
+                )
+                .expect("registering __init__ vectorcall should succeed");
+                ffi::Py_DECREF(init_function_obj);
+
+                crate::with_active_module_runtime_context(&mut runtime, || {
+                    let mut jit_module =
+                        new_jit_module().expect("test jit module should construct");
+                    let module_constant_ptrs = shared_state.module_constant_ptrs();
+                    let counter_ptrs = shared_state.counter_ptrs();
+                    let built = build_cranelift_run_bb_specialized_function(
+                        &mut jit_module,
+                        &[1usize as ObjPtr],
+                        &shared_state.lowered_module,
+                        &caller_function,
+                        &shared_state.codegen_constants,
+                        &shared_state.lowered_module.counter_defs,
+                        &module_constant_ptrs,
+                        &counter_ptrs,
+                        Some(shared_state.as_ref()),
+                    )
+                    .expect("specialized JIT build should succeed");
+                    let (clif, _cfg_dot, _vcode_disasm) = render_compiled_clif_and_vcode_disasm(
+                        &mut jit_module,
+                        built.ctx,
+                        &built.import_id_to_symbol,
+                        &built.block_annotations,
+                    )
+                    .expect("specialized JIT CLIF render should succeed");
+                    clif
+                })
+            })
+        };
+
+        match old_call_target_specializations {
+            Some(value) => unsafe {
+                std::env::set_var("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS", value)
+            },
+            None => unsafe { std::env::remove_var("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS") },
+        }
+        match old_counters_file {
+            Some(value) => unsafe { std::env::set_var("DIET_PYTHON_COUNTERS_FILE", value) },
+            None => unsafe { std::env::remove_var("DIET_PYTHON_COUNTERS_FILE") },
+        }
+        match old_call_target_counters {
+            Some(value) => unsafe { std::env::set_var("DIET_PYTHON_CALL_TARGET_COUNTERS", value) },
+            None => unsafe { std::env::remove_var("DIET_PYTHON_CALL_TARGET_COUNTERS") },
+        }
+        match old_pythonhome {
+            Some(value) => unsafe { std::env::set_var("PYTHONHOME", value) },
+            None => unsafe { std::env::remove_var("PYTHONHOME") },
+        }
+        match old_pythonpath {
+            Some(value) => unsafe { std::env::set_var("PYTHONPATH", value) },
+            None => unsafe { std::env::remove_var("PYTHONPATH") },
+        }
+
+        assert!(
+            rendered.contains("call dp_jit_pytype_generic_alloc"),
+            "constructor specialization should allocate via the constructor fast path:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("call dp_jit_finish_constructor_init"),
+            "constructor specialization should validate __init__ results in the fast path:\n{rendered}"
         );
     }
 

@@ -19,6 +19,10 @@ unsafe extern "C" {
     static mut PyFunction_Type: ffi::PyTypeObject;
     static mut PyMethod_Type: ffi::PyTypeObject;
     static mut PyLong_Type: ffi::PyTypeObject;
+    fn PyType_GenericAlloc(
+        type_obj: *mut ffi::PyTypeObject,
+        nitems: ffi::Py_ssize_t,
+    ) -> *mut ffi::PyObject;
 }
 
 #[cfg(not(test))]
@@ -37,7 +41,6 @@ unsafe fn is_cell_object(obj: *mut ffi::PyObject) -> bool {
     !obj.is_null() && ffi::Py_TYPE(obj) == std::ptr::addr_of_mut!(PyCell_Type)
 }
 
-#[cfg(not(test))]
 unsafe fn object_type_name(obj: *mut ffi::PyObject) -> String {
     if obj.is_null() {
         return "<null>".to_string();
@@ -99,6 +102,51 @@ unsafe extern "C" fn py_vectorcall_hook(
         nargsf as usize,
         kwnames as *mut ffi::PyObject,
     ) as ObjPtr
+}
+
+unsafe extern "C" fn pytype_generic_alloc_hook(type_obj: ObjPtr, nitems: i64) -> ObjPtr {
+    if type_obj.is_null() || nitems < 0 {
+        ffi::PyErr_SetString(
+            ffi::PyExc_RuntimeError,
+            b"invalid arguments to dp_jit_pytype_generic_alloc\0".as_ptr() as *const i8,
+        );
+        return ptr::null_mut();
+    }
+    PyType_GenericAlloc(type_obj as *mut ffi::PyTypeObject, nitems as ffi::Py_ssize_t) as ObjPtr
+}
+
+unsafe extern "C" fn finish_constructor_init_hook(obj: ObjPtr, init_result: ObjPtr) -> ObjPtr {
+    if obj.is_null() {
+        ffi::PyErr_SetString(
+            ffi::PyExc_RuntimeError,
+            b"invalid constructor object in dp_jit_finish_constructor_init\0".as_ptr()
+                as *const i8,
+        );
+        return ptr::null_mut();
+    }
+    let obj = obj as *mut ffi::PyObject;
+    let init_result = init_result as *mut ffi::PyObject;
+    if init_result.is_null() {
+        ffi::Py_DECREF(obj);
+        return ptr::null_mut();
+    }
+    if init_result != ffi::Py_None() {
+        let type_name = object_type_name(init_result);
+        let message = format!("__init__() should return None, not '{type_name}'");
+        if let Ok(c_message) = std::ffi::CString::new(message) {
+            ffi::PyErr_SetString(ffi::PyExc_TypeError, c_message.as_ptr());
+        } else {
+            ffi::PyErr_SetString(
+                ffi::PyExc_TypeError,
+                b"__init__() should return None\0".as_ptr() as *const i8,
+            );
+        }
+        ffi::Py_DECREF(init_result);
+        ffi::Py_DECREF(obj);
+        return ptr::null_mut();
+    }
+    ffi::Py_DECREF(init_result);
+    obj as ObjPtr
 }
 
 #[cfg(not(test))]
@@ -1584,6 +1632,14 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
     );
     builder.symbol("dp_jit_py_call_object", dp_jit_py_call_object as *const u8);
     builder.symbol("dp_jit_py_vectorcall", dp_jit_py_vectorcall as *const u8);
+    builder.symbol(
+        "dp_jit_pytype_generic_alloc",
+        pytype_generic_alloc_hook as *const u8,
+    );
+    builder.symbol(
+        "dp_jit_finish_constructor_init",
+        finish_constructor_init_hook as *const u8,
+    );
     builder.symbol(
         "dp_jit_py_call_with_kw",
         dp_jit_py_call_with_kw as *const u8,

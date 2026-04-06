@@ -60,6 +60,12 @@ unsafe extern "C" {
     fn PyFunction_AddWatcher(callback: PyFunctionWatchCallback) -> i32;
     fn PyType_Modified(type_obj: *mut ffi::PyTypeObject);
     fn PyUnstable_Type_AssignVersionTag(type_obj: *mut ffi::PyTypeObject) -> i32;
+    static mut PyType_Type: ffi::PyTypeObject;
+    static mut PyBaseObject_Type: ffi::PyTypeObject;
+    fn PyType_GenericAlloc(
+        type_obj: *mut ffi::PyTypeObject,
+        nitems: ffi::Py_ssize_t,
+    ) -> *mut ffi::PyObject;
     fn PyWeakref_NewRef(
         object: *mut ffi::PyObject,
         callback: *mut ffi::PyObject,
@@ -249,6 +255,13 @@ static FUNCTION_OWNER_TYPE_REGISTRY: OnceLock<Result<FunctionOwnerTypeRegistry, 
 #[derive(Clone, Copy, Debug)]
 pub struct DirectMethodOwnerType {
     pub function_obj: *mut ffi::PyObject,
+    pub owner_type: *mut ffi::PyTypeObject,
+    pub type_version: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DirectConstructorOwnerType {
+    pub init_function_obj: *mut ffi::PyObject,
     pub owner_type: *mut ffi::PyTypeObject,
     pub type_version: u32,
 }
@@ -648,6 +661,65 @@ unsafe fn lookup_exact_owner_types_for_function_object(
     Ok(out)
 }
 
+unsafe fn owner_type_has_simple_default_constructor(
+    owner_type: *mut ffi::PyTypeObject,
+) -> bool {
+    if owner_type.is_null() {
+        return false;
+    }
+    if ((*owner_type).tp_flags & ffi::Py_TPFLAGS_HEAPTYPE) == 0 {
+        return false;
+    }
+    if ((*owner_type).tp_flags & ffi::Py_TPFLAGS_IS_ABSTRACT) != 0 {
+        return false;
+    }
+    if ffi::Py_TYPE(owner_type as *mut ffi::PyObject) != std::ptr::addr_of_mut!(PyType_Type) {
+        return false;
+    }
+    let Some(owner_tp_new) = (*owner_type).tp_new else {
+        return false;
+    };
+    let Some(base_tp_new) = PyBaseObject_Type.tp_new else {
+        return false;
+    };
+    if !std::ptr::fn_addr_eq(owner_tp_new, base_tp_new) {
+        return false;
+    }
+    let Some(owner_tp_alloc) = (*owner_type).tp_alloc else {
+        return false;
+    };
+    let generic_alloc: unsafe extern "C" fn(
+        *mut ffi::PyTypeObject,
+        ffi::Py_ssize_t,
+    ) -> *mut ffi::PyObject = PyType_GenericAlloc;
+    if !std::ptr::fn_addr_eq(owner_tp_alloc, generic_alloc) {
+        return false;
+    }
+    (*owner_type).tp_init.is_some()
+}
+
+unsafe fn lookup_exact_owner_types_for_constructor_object(
+    function_obj: *mut ffi::PyObject,
+    owner_type_weakrefs: &[usize],
+) -> Result<Vec<DirectConstructorOwnerType>, ()> {
+    let owners =
+        lookup_exact_owner_types_for_function_object(function_obj, "__init__", owner_type_weakrefs)?;
+    let mut out = Vec::new();
+    for owner in owners {
+        if !owner_type_has_simple_default_constructor(owner.owner_type) {
+            continue;
+        }
+        out.push(DirectConstructorOwnerType {
+            init_function_obj: owner.function_obj,
+            owner_type: owner.owner_type,
+            type_version: owner.type_version,
+        });
+    }
+    out.sort_by_key(|entry| (entry.owner_type as usize, entry.init_function_obj as usize));
+    out.dedup_by_key(|entry| (entry.owner_type as usize, entry.init_function_obj as usize));
+    Ok(out)
+}
+
 pub unsafe fn lookup_exact_owner_types_for_method(
     function_id: FunctionId,
     method_name: &str,
@@ -701,6 +773,76 @@ pub unsafe fn lookup_exact_owner_types_for_method(
             )?;
             for owner in exact_owner_types {
                 if let Some(current_id) = registered_clif_function_id(owner.function_obj)? {
+                    if current_id == function_id {
+                        out.push(owner);
+                    }
+                }
+            }
+            for owner_type_weakref in owner_type_weakrefs {
+                ffi::Py_DECREF(owner_type_weakref as *mut ffi::PyObject);
+            }
+        } else {
+            for owner_type_weakref in owner_type_weakrefs {
+                ffi::Py_DECREF(owner_type_weakref as *mut ffi::PyObject);
+            }
+        }
+        ffi::Py_DECREF(function_obj);
+        ffi::Py_DECREF(function_weakref as *mut ffi::PyObject);
+    }
+    Ok(out)
+}
+
+pub unsafe fn lookup_exact_owner_types_for_constructor(
+    function_id: FunctionId,
+) -> Result<Vec<DirectConstructorOwnerType>, ()> {
+    maybe_register_current_module_owner_types();
+    let Ok(registry) = function_owner_type_registry() else {
+        return Ok(Vec::new());
+    };
+    let snapshot = {
+        let registered_by_function = registry
+            .registered_owner_types_by_function
+            .lock()
+            .map_err(|_| {
+                ffi::PyErr_SetString(
+                    ffi::PyExc_RuntimeError,
+                    c"function owner type registry lock poisoned".as_ptr(),
+                );
+            })?;
+        registered_by_function
+            .values()
+            .map(|registered| {
+                (
+                    unsafe { incref_weakref_snapshot(registered.function_weakref) },
+                    registered
+                        .owner_type_weakrefs
+                        .iter()
+                        .copied()
+                        .map(|weakref| unsafe { incref_weakref_snapshot(weakref) })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut out = Vec::new();
+    for (function_weakref, owner_type_weakrefs) in snapshot {
+        let Some(function_obj) = (unsafe { resolve_weakref_target(function_weakref)? }) else {
+            ffi::Py_DECREF(function_weakref as *mut ffi::PyObject);
+            for owner_type_weakref in owner_type_weakrefs {
+                ffi::Py_DECREF(owner_type_weakref as *mut ffi::PyObject);
+            }
+            continue;
+        };
+        let matches_function_id =
+            matches!(registered_clif_function_id(function_obj)?, Some(registered) if registered == function_id);
+        if matches_function_id {
+            let exact_owner_types = lookup_exact_owner_types_for_constructor_object(
+                function_obj,
+                owner_type_weakrefs.as_slice(),
+            )?;
+            for owner in exact_owner_types {
+                if let Some(current_id) = registered_clif_function_id(owner.init_function_obj)? {
                     if current_id == function_id {
                         out.push(owner);
                     }
@@ -1485,7 +1627,10 @@ mod tests {
         Python::initialize();
     }
 
-    unsafe fn make_test_module<'py>(py: Python<'py>) -> (Bound<'py, PyModule>, Bound<'py, PyAny>) {
+    unsafe fn make_test_module_with_source<'py>(
+        py: Python<'py>,
+        source: &str,
+    ) -> (Bound<'py, PyModule>, Bound<'py, PyAny>) {
         let module = PyModule::new(py, "watcher_test").expect("module should allocate");
         let globals = module.dict();
         let locals = PyDict::new(py);
@@ -1497,10 +1642,8 @@ mod tests {
             .set_item("__builtins__", &builtins)
             .expect("locals should accept builtins");
 
-        let source = std::ffi::CString::new(
-            "class C:\n    def __init__(self):\n        self.value = 1\n    def f(self, x=1, *, y=2):\n        return x + y\n",
-        )
-        .expect("python source should be CString-compatible");
+        let source = std::ffi::CString::new(source)
+            .expect("python source should be CString-compatible");
         assert!(
             !ffi::PyRun_StringFlags(
                 source.as_ptr(),
@@ -1521,6 +1664,13 @@ mod tests {
             .set_item("C", &cls)
             .expect("module globals should accept class");
         (module, cls)
+    }
+
+    unsafe fn make_test_module<'py>(py: Python<'py>) -> (Bound<'py, PyModule>, Bound<'py, PyAny>) {
+        make_test_module_with_source(
+            py,
+            "class C:\n    def __init__(self):\n        self.value = 1\n    def f(self, x=1, *, y=2):\n        return x + y\n",
+        )
     }
 
     unsafe fn assert_function_mutation_invalidates_type_version(
@@ -1842,6 +1992,71 @@ mod tests {
                     .expect("type function id lookup should succeed"),
                 Some(function_id),
                 "owner type registration should decode the attached constructor id"
+            );
+            ffi::Py_DECREF(init_function);
+        });
+    }
+
+    #[test]
+    fn exact_constructor_owner_lookup_returns_simple_heap_types() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        initialize_test_python();
+        Python::attach(|py| unsafe {
+            let (module, cls) = make_test_module(py);
+            let owner_type = cls.as_ptr() as *mut ffi::PyTypeObject;
+            let init_function = class_dict_function(owner_type, c"__init__");
+            let function_id = FunctionId::new(10, 7);
+            assert_eq!(
+                PyFunction_SetSoacMetadata(
+                    init_function,
+                    function_id.packed(),
+                    ptr::null_mut(),
+                    None,
+                ),
+                0,
+                "registering __init__ SOAC id should succeed"
+            );
+            register_function_owner_types_for_module(module.as_ptr())
+                .expect("owner type registration should succeed");
+            let owners = lookup_exact_owner_types_for_constructor(function_id)
+                .expect("constructor owner lookup should succeed");
+            assert_eq!(owners.len(), 1, "expected one constructor owner type");
+            assert_eq!(owners[0].owner_type, owner_type);
+            assert_eq!(owners[0].init_function_obj, init_function);
+            assert_ne!(owners[0].type_version, 0);
+            ffi::Py_DECREF(init_function);
+        });
+    }
+
+    #[test]
+    fn exact_constructor_owner_lookup_skips_custom_new_types() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        initialize_test_python();
+        Python::attach(|py| unsafe {
+            let (module, cls) = make_test_module_with_source(
+                py,
+                "class C:\n    def __new__(cls, value):\n        return super().__new__(cls)\n    def __init__(self, value):\n        self.value = value\n",
+            );
+            let owner_type = cls.as_ptr() as *mut ffi::PyTypeObject;
+            let init_function = class_dict_function(owner_type, c"__init__");
+            let function_id = FunctionId::new(10, 8);
+            assert_eq!(
+                PyFunction_SetSoacMetadata(
+                    init_function,
+                    function_id.packed(),
+                    ptr::null_mut(),
+                    None,
+                ),
+                0,
+                "registering __init__ SOAC id should succeed"
+            );
+            register_function_owner_types_for_module(module.as_ptr())
+                .expect("owner type registration should succeed");
+            let owners = lookup_exact_owner_types_for_constructor(function_id)
+                .expect("constructor owner lookup should succeed");
+            assert!(
+                owners.is_empty(),
+                "custom __new__ types should not use the simple constructor fast path"
             );
             ffi::Py_DECREF(init_function);
         });

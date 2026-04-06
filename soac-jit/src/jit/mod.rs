@@ -184,6 +184,16 @@ static DP_JIT_PY_CALL_WITH_KW_IMPORT: ImportSpec = ImportSpec::new(
     &[SigType::Pointer, SigType::Pointer, SigType::Pointer],
     &[SigType::Pointer],
 );
+static DP_JIT_PYTYPE_GENERIC_ALLOC_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_pytype_generic_alloc",
+    &[SigType::Pointer, SigType::I64],
+    &[SigType::Pointer],
+);
+static DP_JIT_FINISH_CONSTRUCTOR_INIT_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_finish_constructor_init",
+    &[SigType::Pointer, SigType::Pointer],
+    &[SigType::Pointer],
+);
 static DP_JIT_GET_RAISED_EXCEPTION_IMPORT: ImportSpec =
     ImportSpec::new("dp_jit_get_raised_exception", &[], &[SigType::Pointer]);
 static DP_JIT_LOAD_GLOBAL_OBJ_IMPORT: ImportSpec = ImportSpec::new(
@@ -712,6 +722,8 @@ struct JitEmitCtx<'mc> {
     decref_ref: ir::FuncRef,
     py_call_positional_three_ref: ir::FuncRef,
     py_vectorcall_ref: ir::FuncRef,
+    pytype_generic_alloc_ref: ir::FuncRef,
+    finish_constructor_init_ref: ir::FuncRef,
     consts: JitEmitConsts,
     load_global_obj_ref: ir::FuncRef,
     load_runtime_obj_ref: ir::FuncRef,
@@ -747,6 +759,15 @@ struct DirectMethodSpecialization {
     function_id: FunctionId,
     target_code_ptr: ObjPtr,
     descriptor_function: ObjPtr,
+    owner_type: *mut ffi::PyTypeObject,
+    type_version: u32,
+}
+
+#[derive(Clone, Copy)]
+struct DirectConstructorSpecialization {
+    function_id: FunctionId,
+    target_code_ptr: ObjPtr,
+    init_function: ObjPtr,
     owner_type: *mut ffi::PyTypeObject,
     type_version: u32,
 }
@@ -1789,6 +1810,50 @@ fn direct_method_specializations_for_call_site(
     out
 }
 
+fn direct_constructor_specializations_for_call_site(
+    call: &blockpy_intrinsics::Call<CodegenBlockPyExpr>,
+    ctx: &JitEmitCtx<'_>,
+) -> Vec<DirectConstructorSpecialization> {
+    if ctx.shared_state.is_none() {
+        return Vec::new();
+    }
+    let Some(instr_id) = call.meta().instr_id else {
+        return Vec::new();
+    };
+    let Some(targets) = ctx.call_target_specializations.get(&instr_id) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for function_id in targets.iter().copied() {
+        let Some(target_function) = ctx
+            .module
+            .callable_defs
+            .iter()
+            .find(|function| function.function_id == function_id)
+        else {
+            continue;
+        };
+        if call.args.len() + 1 != target_function.params.len() {
+            continue;
+        }
+        let Some(&target_code_ptr) = ctx.direct_call_code_ptrs.get(&function_id) else {
+            continue;
+        };
+        let Ok(owner_types) = (unsafe { crate::lookup_exact_owner_types_for_constructor(function_id) })
+        else {
+            continue;
+        };
+        out.extend(owner_types.into_iter().map(|owner| DirectConstructorSpecialization {
+            function_id,
+            target_code_ptr,
+            init_function: owner.init_function_obj as ObjPtr,
+            owner_type: owner.owner_type,
+            type_version: owner.type_version,
+        }));
+    }
+    out
+}
+
 fn collect_call_direct_targets(
     function: &BlockPyFunction<CodegenBlockPyPass>,
 ) -> HashSet<FunctionId> {
@@ -2265,7 +2330,7 @@ fn emit_record_call_target_counter(
     emit_record_observed_value_counter(fb, counter_id, callee_id, ctx);
 }
 
-fn emit_direct_call_resolved_with_arg_values(
+fn emit_direct_call_resolved_raw_with_arg_values(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
     callable_is_borrowed: bool,
@@ -2278,7 +2343,6 @@ fn emit_direct_call_resolved_with_arg_values(
 ) -> ir::Value {
     debug_assert_eq!(arg_values.len(), target_function.params.len());
     let ptr_ty = ctx.consts.ptr_ty;
-    let null_ptr = fb.ins().iconst(ptr_ty, 0);
 
     let mut direct_sig = jit_module.make_signature();
     direct_sig.params.push(ir::AbiParam::special(
@@ -2312,6 +2376,33 @@ fn emit_direct_call_resolved_with_arg_values(
         fb.ins().call(ctx.decref_ref, &[callable]);
     }
 
+    call_value
+}
+
+fn emit_direct_call_resolved_with_arg_values(
+    fb: &mut FunctionBuilder<'_>,
+    callable: ir::Value,
+    callable_is_borrowed: bool,
+    arg_values: Vec<ir::Value>,
+    arg_borrowed: Vec<bool>,
+    target_function: &BlockPyFunction<CodegenBlockPyPass>,
+    target_code_ptr: ObjPtr,
+    ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+) -> ir::Value {
+    let ptr_ty = ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let call_value = emit_direct_call_resolved_raw_with_arg_values(
+        fb,
+        callable,
+        callable_is_borrowed,
+        arg_values,
+        arg_borrowed,
+        target_function,
+        target_code_ptr,
+        ctx,
+        jit_module,
+    );
     let call_is_null = fb
         .ins()
         .icmp(ir::condcodes::IntCC::Equal, call_value, null_ptr);
@@ -2326,6 +2417,88 @@ fn emit_direct_call_resolved_with_arg_values(
     );
     fb.switch_to_block(call_ok_block);
     fb.block_params(call_ok_block)[0]
+}
+
+fn emit_direct_constructor_resolved_with_arg_values(
+    fb: &mut FunctionBuilder<'_>,
+    callable: ir::Value,
+    callable_is_borrowed: bool,
+    arg_values: Vec<ir::Value>,
+    arg_borrowed: Vec<bool>,
+    specialization: DirectConstructorSpecialization,
+    target_function: &BlockPyFunction<CodegenBlockPyPass>,
+    ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+) -> ir::Value {
+    let ptr_ty = ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let zero = fb.ins().iconst(ctx.consts.i64_ty, 0);
+    let alloc_inst = fb
+        .ins()
+        .call(ctx.pytype_generic_alloc_ref, &[callable, zero]);
+    let allocated = fb.inst_results(alloc_inst)[0];
+    if !callable_is_borrowed {
+        fb.ins().call(ctx.decref_ref, &[callable]);
+    }
+    let alloc_is_null = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, allocated, null_ptr);
+    let alloc_failed = fb.create_block();
+    let alloc_ok = fb.create_block();
+    fb.append_block_param(alloc_ok, ptr_ty);
+    fb.ins().brif(
+        alloc_is_null,
+        alloc_failed,
+        &[],
+        alloc_ok,
+        &[ir::BlockArg::Value(allocated)],
+    );
+
+    fb.switch_to_block(alloc_failed);
+    for (value, borrowed_arg) in arg_values.iter().copied().zip(arg_borrowed.iter().copied()) {
+        if !borrowed_arg {
+            fb.ins().call(ctx.decref_ref, &[value]);
+        }
+    }
+    fb.ins()
+        .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
+
+    fb.switch_to_block(alloc_ok);
+    let allocated = fb.block_params(alloc_ok)[0];
+    let mut init_arg_values = Vec::with_capacity(arg_values.len() + 1);
+    let mut init_arg_borrowed = Vec::with_capacity(arg_borrowed.len() + 1);
+    init_arg_values.push(allocated);
+    init_arg_borrowed.push(true);
+    init_arg_values.extend(arg_values);
+    init_arg_borrowed.extend(arg_borrowed);
+    let init_callable = fb.ins().iconst(ptr_ty, specialization.init_function as i64);
+    let init_result = emit_direct_call_resolved_raw_with_arg_values(
+        fb,
+        init_callable,
+        true,
+        init_arg_values,
+        init_arg_borrowed,
+        target_function,
+        specialization.target_code_ptr,
+        ctx,
+        jit_module,
+    );
+    let finish_inst = fb
+        .ins()
+        .call(ctx.finish_constructor_init_ref, &[allocated, init_result]);
+    let result = fb.inst_results(finish_inst)[0];
+    let result_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, result, null_ptr);
+    let result_ok_block = fb.create_block();
+    fb.append_block_param(result_ok_block, ptr_ty);
+    fb.ins().brif(
+        result_is_null,
+        ctx.consts.step_null_block,
+        &step_null_block_args(ctx),
+        result_ok_block,
+        &[ir::BlockArg::Value(result)],
+    );
+    fb.switch_to_block(result_ok_block);
+    fb.block_params(result_ok_block)[0]
 }
 
 fn emit_direct_call_resolved(
@@ -3542,6 +3715,8 @@ fn emit_codegen_expr(
                     jit_module,
                     func_imports,
                 );
+                let constructor_specializations =
+                    direct_constructor_specializations_for_call_site(call, ctx);
                 let direct_specializations = site_instr_id
                     .and_then(|instr_id| ctx.call_target_specializations.get(&instr_id))
                     .map(|targets| {
@@ -3564,59 +3739,173 @@ fn emit_codegen_expr(
                     })
                     .unwrap_or_default();
 
-                if counter_id.is_some() || !direct_specializations.is_empty() {
+                if counter_id.is_some()
+                    || !constructor_specializations.is_empty()
+                    || !direct_specializations.is_empty()
+                {
                     let callee_id = emit_callee_function_id_checked(fb, callable, ctx);
                     if let Some(counter_id) = counter_id {
                         emit_record_call_target_counter(fb, counter_id, callee_id, ctx);
                     }
-                    if !direct_specializations.is_empty() {
+                    if !constructor_specializations.is_empty() || !direct_specializations.is_empty()
+                    {
                         let result_block = fb.create_block();
                         fb.append_block_param(result_block, ptr_ty);
                         let generic_block = fb.create_block();
-                        for (index, &(function_id, target_code_ptr)) in
-                            direct_specializations.iter().enumerate()
-                        {
-                            let direct_block = fb.create_block();
-                            let miss_block = if index + 1 == direct_specializations.len() {
-                                generic_block
-                            } else {
-                                fb.create_block()
-                            };
-                            let is_match = fb.ins().icmp_imm(
-                                ir::condcodes::IntCC::Equal,
-                                callee_id,
-                                function_id.packed() as i64,
-                            );
-                            fb.ins()
-                                .brif(is_match, direct_block, &[], miss_block, &[]);
+                        let mut direct_chain_start = None;
+                        if !constructor_specializations.is_empty() {
+                            let mut next_miss_block = fb.create_block();
+                            for (index, specialization) in
+                                constructor_specializations.iter().copied().enumerate()
+                            {
+                                let type_match_block = fb.create_block();
+                                let direct_block = fb.create_block();
+                                let miss_block = if index + 1
+                                    == constructor_specializations.len()
+                                {
+                                    if direct_specializations.is_empty() {
+                                        generic_block
+                                    } else {
+                                        fb.create_block()
+                                    }
+                                } else {
+                                    fb.create_block()
+                                };
+                                let expected_type =
+                                    fb.ins().iconst(ptr_ty, specialization.owner_type as i64);
+                                let is_exact_type = fb.ins().icmp(
+                                    ir::condcodes::IntCC::Equal,
+                                    callable,
+                                    expected_type,
+                                );
+                                fb.ins()
+                                    .brif(is_exact_type, type_match_block, &[], miss_block, &[]);
 
-                            fb.switch_to_block(direct_block);
-                            let target_function = ctx
-                                .module
-                                .callable_defs
-                                .iter()
-                                .find(|function| function.function_id == function_id)
-                                .expect("direct specialization target should exist");
-                            if let Some(counter_id) = direct_hit_counter_id {
-                                let _ = emit_increment_counter(fb, counter_id, ctx);
+                                fb.switch_to_block(type_match_block);
+                                let type_version = fb.ins().load(
+                                    ir::types::I32,
+                                    ir::MemFlags::trusted(),
+                                    callable,
+                                    offset_of!(ffi::PyTypeObject, tp_version_tag) as i32,
+                                );
+                                let version_matches = fb.ins().icmp_imm(
+                                    ir::condcodes::IntCC::Equal,
+                                    type_version,
+                                    specialization.type_version as i64,
+                                );
+                                fb.ins().brif(
+                                    version_matches,
+                                    direct_block,
+                                    &[],
+                                    miss_block,
+                                    &[],
+                                );
+
+                                fb.switch_to_block(direct_block);
+                                let target_function = ctx
+                                    .module
+                                    .callable_defs
+                                    .iter()
+                                    .find(|function| function.function_id == specialization.function_id)
+                                    .expect(
+                                        "direct constructor specialization target should exist",
+                                    );
+                                if let Some(counter_id) = direct_hit_counter_id {
+                                    let _ = emit_increment_counter(fb, counter_id, ctx);
+                                }
+                                let mut arg_values = Vec::with_capacity(args.len());
+                                let mut arg_borrowed = Vec::with_capacity(args.len());
+                                for arg in args.as_slice() {
+                                    let borrowed_arg = codegen_expr_is_borrowable(
+                                        arg,
+                                        local_names,
+                                        &ctx.stack_slots,
+                                        ctx.storage_layout.as_ref(),
+                                    );
+                                    arg_borrowed.push(borrowed_arg);
+                                    arg_values.push(emit_codegen_expr(
+                                        fb,
+                                        arg,
+                                        local_names,
+                                        local_values,
+                                        ctx,
+                                        borrowed_arg,
+                                        jit_module,
+                                        func_imports,
+                                    ));
+                                }
+                                let direct_result =
+                                    emit_direct_constructor_resolved_with_arg_values(
+                                        fb,
+                                        callable,
+                                        callable_is_borrowed,
+                                        arg_values,
+                                        arg_borrowed,
+                                        specialization,
+                                        target_function,
+                                        ctx,
+                                        jit_module,
+                                    );
+                                fb.ins()
+                                    .jump(result_block, &[ir::BlockArg::Value(direct_result)]);
+                                if index + 1 != constructor_specializations.len() {
+                                    fb.switch_to_block(miss_block);
+                                } else {
+                                    next_miss_block = miss_block;
+                                }
                             }
-                            let direct_result = emit_direct_call_resolved(
-                                fb,
-                                callable,
-                                callable_is_borrowed,
-                                args.as_slice(),
-                                target_function,
-                                target_code_ptr,
-                                local_names,
-                                local_values,
-                                ctx,
-                                jit_module,
-                                func_imports,
-                            );
-                            fb.ins()
-                                .jump(result_block, &[ir::BlockArg::Value(direct_result)]);
-                            if index + 1 != direct_specializations.len() {
-                                fb.switch_to_block(miss_block);
+                            direct_chain_start = Some(next_miss_block);
+                        }
+
+                        if !direct_specializations.is_empty() {
+                            if let Some(start_block) = direct_chain_start {
+                                fb.switch_to_block(start_block);
+                            }
+                            for (index, &(function_id, target_code_ptr)) in
+                                direct_specializations.iter().enumerate()
+                            {
+                                let direct_block = fb.create_block();
+                                let miss_block = if index + 1 == direct_specializations.len() {
+                                    generic_block
+                                } else {
+                                    fb.create_block()
+                                };
+                                let is_match = fb.ins().icmp_imm(
+                                    ir::condcodes::IntCC::Equal,
+                                    callee_id,
+                                    function_id.packed() as i64,
+                                );
+                                fb.ins()
+                                    .brif(is_match, direct_block, &[], miss_block, &[]);
+
+                                fb.switch_to_block(direct_block);
+                                let target_function = ctx
+                                    .module
+                                    .callable_defs
+                                    .iter()
+                                    .find(|function| function.function_id == function_id)
+                                    .expect("direct specialization target should exist");
+                                if let Some(counter_id) = direct_hit_counter_id {
+                                    let _ = emit_increment_counter(fb, counter_id, ctx);
+                                }
+                                let direct_result = emit_direct_call_resolved(
+                                    fb,
+                                    callable,
+                                    callable_is_borrowed,
+                                    args.as_slice(),
+                                    target_function,
+                                    target_code_ptr,
+                                    local_names,
+                                    local_values,
+                                    ctx,
+                                    jit_module,
+                                    func_imports,
+                                );
+                                fb.ins()
+                                    .jump(result_block, &[ir::BlockArg::Value(direct_result)]);
+                                if index + 1 != direct_specializations.len() {
+                                    fb.switch_to_block(miss_block);
+                                }
                             }
                         }
 
@@ -5434,6 +5723,16 @@ fn build_cranelift_run_bb_specialized_function(
             func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_PY_VECTORCALL_IMPORT);
         let py_call_with_kw_ref =
             func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_PY_CALL_WITH_KW_IMPORT);
+        let pytype_generic_alloc_ref = func_imports.get_or_panic(
+            jit_module,
+            &mut fb.func,
+            &DP_JIT_PYTYPE_GENERIC_ALLOC_IMPORT,
+        );
+        let finish_constructor_init_ref = func_imports.get_or_panic(
+            jit_module,
+            &mut fb.func,
+            &DP_JIT_FINISH_CONSTRUCTOR_INIT_IMPORT,
+        );
         let get_raised_exception_ref = func_imports.get_or_panic(
             jit_module,
             &mut fb.func,
@@ -5725,6 +6024,8 @@ fn build_cranelift_run_bb_specialized_function(
                 decref_ref,
                 py_call_positional_three_ref,
                 py_vectorcall_ref,
+                pytype_generic_alloc_ref,
+                finish_constructor_init_ref,
                 consts: JitEmitConsts {
                     step_null_block: fast_step_null_block,
                     step_null_args: fast_step_null_args,
@@ -6038,7 +6339,13 @@ pub unsafe fn compile_cranelift_run_bb_specialized_cached(
         module_constant_ptrs,
         counter_ptrs,
         direct_call_resolver,
-    )?;
+    )
+    .map_err(|err| {
+        format!(
+            "{err} [function={} id={}]",
+            function.names.qualname, function.function_id
+        )
+    })?;
     let mut ctx = built.ctx;
     let main_id = built.main_id;
     define_function_with_incremental_cache(
@@ -6046,7 +6353,13 @@ pub unsafe fn compile_cranelift_run_bb_specialized_cached(
         main_id,
         &mut ctx,
         "failed to define specialized jit run_bb function",
-    )?;
+    )
+    .map_err(|err| {
+        format!(
+            "{err} [function={} id={}]",
+            function.names.qualname, function.function_id
+        )
+    })?;
     compiled._jit_module.clear_context(&mut ctx);
     compiled
         ._jit_module
