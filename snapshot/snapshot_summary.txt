@@ -51,18 +51,18 @@ snapshot_stmt::raise_from: blockpy=1, clif=1
 snapshot_stmt::try_except_typed: ERROR snapshot regeneration failed | panic: py_stmt template must produce exactly one statement, got 2
 snapshot_stmt::for_else: blockpy=5, clif=5
 snapshot_stmt::while_else: blockpy=3, clif=3
-snapshot_stmt::with_as: blockpy=14, clif=15
+snapshot_stmt::with_as: blockpy=15, clif=16
 snapshot_stmt::function_local_ann_assign: blockpy=2, clif=2
 snapshot_stmt::comprehension_global: blockpy=16, clif=16
-snapshot_stmt::comprehension_in_function: blockpy=8, clif=8
+snapshot_stmt::comprehension_in_function: blockpy=9, clif=9
 snapshot_stmt::comprehension_in_class_body: blockpy=8, clif=8
-snapshot_stmt::with_multi: blockpy=26, clif=30
+snapshot_stmt::with_multi: blockpy=28, clif=32
 snapshot_stmt::async_for: blockpy=6, clif=28
-snapshot_stmt::async_with: blockpy=16, clif=106
-snapshot_stmt::match_simple: blockpy=3, clif=3
+snapshot_stmt::async_with: blockpy=17, clif=107
+snapshot_stmt::match_simple: blockpy=4, clif=4
 snapshot_stmt::generator_yield: blockpy=2, clif=9
 snapshot_stmt::yield_from: blockpy=2, clif=24
-snapshot_stmt::with_exit_suppresses_exception: blockpy=14, clif=15
+snapshot_stmt::with_exit_suppresses_exception: blockpy=15, clif=16
 snapshot_stmt::closure_cell_simple: blockpy=3, clif=3
 snapshot_stmt::bb_if_else_function: blockpy=4, clif=4
 snapshot_stmt::closure_cell_nonlocal: blockpy=3, clif=3

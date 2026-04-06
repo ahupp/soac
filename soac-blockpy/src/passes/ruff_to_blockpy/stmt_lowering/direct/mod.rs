@@ -26,7 +26,6 @@ pub(super) fn try_lower_direct_stmt_fragment<E>(
     context: &Context,
     stmt: &Stmt,
     loop_ctx: Option<&LoopContext>,
-    next_label_id: &mut usize,
 ) -> Option<Result<InlineFragment<E>, String>>
 where
     E: RuffToBlockPyExpr,
@@ -44,8 +43,29 @@ where
         Stmt::Global(_) | Stmt::Nonlocal(_) | Stmt::Pass(_) => {
             Some(Ok(fallthrough_fragment(crate::block_py::BlockBuilder::new())))
         }
+        Stmt::Break(_) => match loop_ctx {
+            Some(loop_ctx) => Some(Ok(InlineFragment::new(
+                crate::block_py::BlockBuilder::with_term(
+                    Vec::new(),
+                    Some(BlockTerm::Jump(BlockEdge::new(loop_ctx.break_label.clone()))),
+                ),
+                Vec::new(),
+            ))),
+            None => None,
+        },
+        Stmt::Continue(_) => match loop_ctx {
+            Some(loop_ctx) => Some(Ok(InlineFragment::new(
+                crate::block_py::BlockBuilder::with_term(
+                    Vec::new(),
+                    Some(BlockTerm::Jump(BlockEdge::new(loop_ctx.continue_label.clone()))),
+                ),
+                Vec::new(),
+            ))),
+            None => None,
+        },
         Stmt::Expr(stmt) => {
-            try_lower_inline_from_structured(next_label_id, |structured, scratch_next_label_id| {
+            let mut legacy_next_label_id = 0usize;
+            try_lower_inline_from_structured(&mut legacy_next_label_id, |structured, scratch_next_label_id| {
                 let value = crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
                     (*stmt.value).clone(),
                     structured,
@@ -63,6 +83,52 @@ where
                             .set_term(BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())));
                     }
                     fragment
+                })
+            })
+        }
+        Stmt::Return(stmt) => {
+            let mut legacy_next_label_id = 0usize;
+            let value = match stmt.value.as_ref() {
+                Some(value) => try_lower_inline_value_from_structured(&mut legacy_next_label_id, |structured, scratch_next_label_id| {
+                    crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
+                        (**value).clone(),
+                        structured,
+                        loop_ctx,
+                        scratch_next_label_id,
+                    )
+                }),
+                None => Some(Ok((
+                    crate::block_py::BlockBuilder::<E, BlockTerm<E>>::new(),
+                    crate::py_expr!("None").into(),
+                ))),
+            };
+            value.map(|result| {
+                result.map(|(mut entry, value)| {
+                    entry.set_term(BlockTerm::Return(value));
+                    InlineFragment::new(entry, Vec::new())
+                })
+            })
+        }
+        Stmt::Raise(stmt) => {
+            if stmt.cause.is_some() {
+                return None;
+            }
+            let mut legacy_next_label_id = 0usize;
+            let exc = match stmt.exc.as_ref() {
+                Some(exc) => try_lower_inline_value_from_structured(&mut legacy_next_label_id, |structured, scratch_next_label_id| {
+                    Ok(Some(crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
+                        (**exc).clone(),
+                        structured,
+                        loop_ctx,
+                        scratch_next_label_id,
+                    )?))
+                }),
+                None => Some(Ok((crate::block_py::BlockBuilder::<E, BlockTerm<E>>::new(), None))),
+            };
+            exc.map(|result| {
+                result.map(|(mut entry, exc)| {
+                    entry.set_term(BlockTerm::Raise(TermRaise { exc }));
+                    InlineFragment::new(entry, Vec::new())
                 })
             })
         }

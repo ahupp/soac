@@ -120,6 +120,7 @@ fn contains_return_stmt(stmt: &Stmt) -> bool {
 
 pub(crate) fn lower_common_stmt_sequence_head<FSeq, E>(
     context: &Context,
+    name_gen: &FunctionNameGen,
     plan: StmtSequenceHeadPlan,
     remaining_stmts: &[Stmt],
     targets: RegionTargets,
@@ -137,6 +138,7 @@ where
             emit_sequence_raise_block_with_expr_setup_and_expr(
                 context,
                 blocks,
+                name_gen,
                 next_label(),
                 linear,
                 compat_blockpy_raise_from_stmt(raise_stmt),
@@ -150,6 +152,7 @@ where
             emit_sequence_return_block_with_expr_setup_and_expr(
                 context,
                 blocks,
+                name_gen,
                 next_label(),
                 linear,
                 value,
@@ -161,6 +164,7 @@ where
         ),
         StmtSequenceHeadPlan::If(if_stmt) => Some(lower_if_stmt_sequence_from_stmt(
             context,
+            name_gen,
             if_stmt,
             remaining_stmts,
             targets,
@@ -178,6 +182,7 @@ where
             };
             Some(lower_while_stmt_sequence_from_stmt(
                 context,
+                name_gen,
                 while_stmt,
                 remaining_stmts,
                 targets,
@@ -296,6 +301,7 @@ where
             | StmtSequenceHeadPlan::Continue) => {
                 let label = lower_common_stmt_sequence_head(
                     context,
+                    name_gen,
                     plan,
                     &stmts[index + 1..],
                     targets.clone(),
@@ -501,6 +507,7 @@ where
 pub(crate) fn lower_if_stmt_sequence<F, E>(
     context: &Context,
     blocks: &mut Vec<LoweredBlockPyBlock<E>>,
+    name_gen: &FunctionNameGen,
     label: BlockLabel,
     linear: Vec<Stmt>,
     test: Expr,
@@ -535,6 +542,7 @@ where
     emit_if_branch_block_with_expr_setup_and_expr(
         context,
         blocks,
+        name_gen,
         label,
         linear,
         test,
@@ -547,6 +555,7 @@ where
 
 pub(crate) fn lower_if_stmt_sequence_from_stmt<F, E>(
     context: &Context,
+    name_gen: &FunctionNameGen,
     if_stmt: ast::StmtIf,
     remaining_stmts: &[Stmt],
     targets: RegionTargets,
@@ -559,12 +568,47 @@ where
     F: FnMut(&[Stmt], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
     E: RuffToBlockPyExpr + ImplicitNoneExpr,
 {
+    let rest_entry = lower_region(remaining_stmts, targets.clone(), blocks);
+    let loop_ctx = targets.loop_labels.as_ref().map(|loop_labels| LoopContext {
+        continue_label: loop_labels.continue_label.clone(),
+        break_label: loop_labels.break_label.clone(),
+    });
+    if let Some(Ok(fragment)) = stmt_lowering::try_lower_if_stmt_fragment::<E>(
+        context,
+        name_gen,
+        &if_stmt,
+        loop_ctx.as_ref(),
+    ) {
+        let fragment_label = if linear.is_empty() {
+            label.clone()
+        } else {
+            name_gen.next_block_name()
+        };
+        emit_inline_fragment_with_exc_target_and_expr(
+            blocks,
+            fragment_label.clone(),
+            fragment,
+            rest_entry,
+            targets.active_exc.as_ref(),
+        );
+        if linear.is_empty() {
+            return label;
+        }
+        return emit_sequence_jump_block(
+            blocks,
+            label,
+            linear,
+            fragment_label,
+            targets.active_exc.as_ref(),
+        );
+    }
+
     let then_body = &if_stmt.body.to_vec();
     let else_body = extract_if_else_body(&if_stmt);
-    let rest_entry = lower_region(remaining_stmts, targets.clone(), blocks);
     lower_if_stmt_sequence(
         context,
         blocks,
+        name_gen,
         label,
         linear,
         *if_stmt.test,
@@ -590,6 +634,7 @@ fn extract_if_else_body(if_stmt: &ast::StmtIf) -> Vec<Stmt> {
 pub(crate) fn lower_while_stmt_sequence<F, E>(
     context: &Context,
     blocks: &mut Vec<LoweredBlockPyBlock<E>>,
+    name_gen: &FunctionNameGen,
     test_label: BlockLabel,
     linear_label: Option<BlockLabel>,
     linear: Vec<Stmt>,
@@ -624,6 +669,7 @@ where
     emit_simple_while_blocks_with_expr_setup_and_expr(
         context,
         blocks,
+        name_gen,
         test_label,
         linear_label,
         linear,
@@ -637,6 +683,7 @@ where
 
 pub(crate) fn lower_while_stmt_sequence_from_stmt<F, E>(
     context: &Context,
+    name_gen: &FunctionNameGen,
     while_stmt: ast::StmtWhile,
     remaining_stmts: &[Stmt],
     targets: RegionTargets,
@@ -655,6 +702,7 @@ where
     lower_while_stmt_sequence(
         context,
         blocks,
+        name_gen,
         test_label,
         linear_label,
         linear,

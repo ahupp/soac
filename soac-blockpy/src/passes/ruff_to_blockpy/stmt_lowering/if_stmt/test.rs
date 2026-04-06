@@ -1,6 +1,6 @@
 use super::super::{simplify_stmt_ast_once_for_blockpy, BlockPyStmtBuilder};
 use super::*;
-use crate::block_py::InstrWithAwaitAndYield;
+use crate::block_py::{BlockTerm, InstrWithAwaitAndYield};
 use crate::passes::ast_to_ast::context::Context;
 
 #[test]
@@ -44,4 +44,38 @@ fn stmt_if_to_blockpy_uses_trait_owned_simplification_path_for_elif() {
         lowered_if.orelse.body.as_slice(),
         [StructuredInstr::If(_)]
     ));
+}
+
+#[test]
+fn stmt_if_fragment_empty_orelse_uses_explicit_fallthrough() {
+    let stmt = py_stmt!("if False:\n    x = None");
+    let Stmt::If(if_stmt) = stmt else {
+        panic!("expected if stmt");
+    };
+
+    let module_name_gen = crate::block_py::ModuleNameGen::new(0);
+    let name_gen = module_name_gen.next_function_name_gen();
+    let context = Context::new("");
+    let fragment = try_lower_if_stmt_fragment::<InstrWithAwaitAndYield>(
+        &context,
+        &name_gen,
+        &if_stmt,
+        None,
+    )
+    .expect("if stmt should use direct fragment path")
+    .expect("if stmt fragment lowering should succeed");
+
+    let else_block = fragment
+        .deps
+        .iter()
+        .find(|block| {
+            block.body.is_empty()
+                && matches!(
+                    &block.term,
+                    BlockTerm::Jump(edge) if edge.target.is_fallthrough()
+                )
+        })
+        .expect("empty else branch should become an explicit fallthrough block");
+
+    assert!(else_block.body.is_empty(), "{else_block:#?}");
 }

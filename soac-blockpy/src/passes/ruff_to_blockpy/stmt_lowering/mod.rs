@@ -18,32 +18,29 @@ where
     }
 
     let entry = fragment.entry.finish();
+    out.extend(entry.body.into_iter().map(StructuredInstr::Expr));
     match entry.term {
         Some(BlockTerm::Jump(edge)) if edge.target.is_fallthrough() && edge.args.is_empty() => {}
-        None => {}
-        Some(_) => {
-            return Err(
-                "inline fragment adapter only supports trivial fallthrough fragments".to_string(),
-            );
-        }
+        None => unreachable!("inline fragment should always carry an explicit terminator"),
+        Some(term) => out.set_term(term),
     }
 
-    out.extend(entry.body.into_iter().map(StructuredInstr::Expr));
     Ok(())
 }
 
-pub(super) fn try_lower_inline_from_structured<E>(
+pub(crate) fn try_lower_inline_value_from_structured<E, T>(
     next_label_id: &mut usize,
-    lower: impl FnOnce(&mut BlockPyStmtBuilder<E>, &mut usize) -> Result<(), String>,
-) -> Option<Result<InlineFragment<E>, String>>
+    lower: impl FnOnce(&mut BlockPyStmtBuilder<E>, &mut usize) -> Result<T, String>,
+) -> Option<Result<(InlineBlockBuilder<E>, T), String>>
 where
     E: RuffToBlockPyExpr,
 {
     let mut structured = BlockPyStmtBuilder::<E>::new();
     let mut scratch_next_label_id = *next_label_id;
-    if let Err(err) = lower(&mut structured, &mut scratch_next_label_id) {
-        return Some(Err(err));
-    }
+    let value = match lower(&mut structured, &mut scratch_next_label_id) {
+        Ok(value) => value,
+        Err(err) => return Some(Err(err)),
+    };
     let structured = structured.finish();
 
     let mut entry = crate::block_py::BlockBuilder::<E, BlockTerm<E>>::new();
@@ -60,19 +57,29 @@ where
     }
 
     *next_label_id = scratch_next_label_id;
-    Some(Ok(InlineFragment::new(entry, Vec::new())))
+    Some(Ok((entry, value)))
+}
+
+pub(super) fn try_lower_inline_from_structured<E>(
+    next_label_id: &mut usize,
+    lower: impl FnOnce(&mut BlockPyStmtBuilder<E>, &mut usize) -> Result<(), String>,
+) -> Option<Result<InlineFragment<E>, String>>
+where
+    E: RuffToBlockPyExpr,
+{
+    try_lower_inline_value_from_structured(next_label_id, lower)
+        .map(|result| result.map(|(entry, ())| InlineFragment::new(entry, Vec::new())))
 }
 
 pub(crate) fn lower_stmt_fragment<E>(
     context: &Context,
     stmt: &Stmt,
     loop_ctx: Option<&LoopContext>,
-    next_label_id: &mut usize,
 ) -> Option<Result<InlineFragment<E>, String>>
 where
     E: RuffToBlockPyExpr,
 {
-    direct::try_lower_direct_stmt_fragment(context, stmt, loop_ctx, next_label_id)
+    direct::try_lower_direct_stmt_fragment(context, stmt, loop_ctx)
 }
 
 pub(super) fn stmts_from_rewrite(rewrite: Rewrite) -> Vec<Stmt> {
@@ -208,6 +215,7 @@ mod unreduced;
 mod with_stmt;
 
 pub(crate) use assign_stmt::build_for_target_assign_body;
+pub(crate) use if_stmt::try_lower_if_stmt_fragment;
 pub(crate) use try_stmt::{lower_star_try_stmt_sequence, lower_try_stmt_sequence};
 pub(crate) use with_stmt::lower_with_stmt_sequence;
 
@@ -355,7 +363,7 @@ pub(crate) fn lower_stmt_into_with_expr<E>(
 where
     E: RuffToBlockPyExpr,
 {
-    if let Some(fragment) = lower_stmt_fragment(context, stmt, loop_ctx, next_label_id) {
+    if let Some(fragment) = lower_stmt_fragment(context, stmt, loop_ctx) {
         append_trivial_inline_fragment(fragment?, out)?;
         return Ok(());
     }
