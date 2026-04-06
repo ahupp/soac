@@ -7,7 +7,7 @@ use crate::passes::ruff_to_blockpy::test_name_gen;
 #[test]
 fn stmt_delete_to_blockpy_emits_direct_core_delitem() {
     let stmt = py_stmt!("del obj[idx]");
-    let delete_stmt = crate::passes::InstrRuff::from_ast_stmt(stmt);
+    let delete_stmt = crate::passes::ast_to_instr::from_ast_stmt(stmt);
     let context = Context::new("");
     let name_gen = test_name_gen();
     let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new(&name_gen);

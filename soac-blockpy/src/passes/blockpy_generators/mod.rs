@@ -9,7 +9,7 @@ use crate::block_py::{
     BlockBuilder, BlockEdge, BlockLabel, BlockParam, BlockParamRole, BlockPyFunction,
     BlockPyModule, BlockTerm, CallArgKeyword, CallArgPositional, CallableScopeInfo,
     CellBindingKind, CellRefForName, ClosureInit, ClosureSlot, FunctionId, FunctionKind,
-    FunctionName, FunctionNameGen, GetAttr, ImplicitNoneExpr, Instr, InstrUnresolved,
+    FunctionName, FunctionNameGen, GetAttr, Instr, InstrUnresolved,
     InstrWithYield, Load, MakeFunction, map_module_functions, Mappable, ModuleNameGen, NameLike,
     NumberLiteral, NumberLiteralValue, ScopeExprNode, StorageLayout, Store, StringLiteral,
     TermBranchTable, TermIf, TermRaise, TryMapFunction, TryMapInstr, TryMapTerm, UnaryOp,
@@ -306,7 +306,7 @@ fn core_literal_int(value: usize) -> InstrUnresolved {
 }
 
 fn core_none() -> InstrUnresolved {
-    InstrUnresolved::implicit_none_expr()
+    InstrUnresolved::constant_none()
 }
 
 fn core_string_literal(value: &str) -> InstrUnresolved {
@@ -1008,7 +1008,7 @@ fn lower_resume_fragment(
             &mut prefix,
             site,
             Vec::new(),
-            BlockTerm::Return(InstrWithYield::implicit_none_expr()),
+            BlockTerm::Return(InstrWithYield::constant_none()),
             params,
             exc_target,
         );
@@ -1470,7 +1470,7 @@ fn emit_yield_from_site(
 
     tail_body.insert(
         0,
-        internal_store_stmt("_dp_yieldfrom", InstrWithYield::implicit_none_expr()),
+        internal_store_stmt("_dp_yieldfrom", InstrWithYield::constant_none()),
     );
     if let Some(target) = assign_target {
         tail_body.insert(

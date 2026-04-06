@@ -138,11 +138,14 @@ pub(super) fn desugar_structured_with_instr_for_blockpy(
         node_index: Default::default(),
         is_async,
         items,
-        body: body.into_iter().map(InstrRuff::into_ast_stmt).collect(),
+        body: body
+            .into_iter()
+            .map(crate::passes::ast_to_instr::into_ast_stmt)
+            .collect(),
     });
     rewritten
         .into_iter()
-        .map(InstrRuff::from_ast_stmt)
+        .map(crate::passes::ast_to_instr::from_ast_stmt)
         .collect()
 }
 
@@ -159,7 +162,7 @@ pub(crate) fn lower_with_stmt_sequence<F, E>(
 ) -> BlockLabel
 where
     F: FnMut(&[InstrRuff], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
-    E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     if with_stmt.items.is_empty() {
         let jump_label = if linear.is_empty() {

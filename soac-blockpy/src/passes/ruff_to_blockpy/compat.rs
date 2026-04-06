@@ -1,7 +1,7 @@
 use super::*;
 use crate::block_py::{
     Await, Block, BlockEdge, BlockLabel, BlockTerm, Call, CallArgPositional, ExprAttribute,
-    ImplicitNoneExpr, Instr, TermIf, TermRaise, WithMeta,
+    Instr, TermIf, TermRaise, WithMeta,
 };
 use crate::passes::ast_to_ast::context::Context;
 use crate::passes::ruff_to_blockpy::expr_lowering::{
@@ -15,7 +15,7 @@ fn try_lower_direct_expr<E>(
     expr: InstrRuff,
 ) -> Option<Result<LoweredExpr<E, InstrRuff>, String>>
 where
-    E: RuffToBlockPyExpr + ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     match expr {
         InstrRuff::ExprIf(if_expr) => {
@@ -41,7 +41,7 @@ fn compat_block_from_inline_with_exc_target_and_expr<E>(
     exc_target: Option<&BlockLabel>,
 ) -> LoweredBlockPyBlock<E>
 where
-    E: RuffToBlockPyExpr + ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     block.replace_fallthrough_target(fallthrough_target);
     with_exc_meta(block, exc_target)
@@ -54,7 +54,7 @@ pub(crate) fn emit_inline_fragment_with_exc_target_and_expr<E>(
     exc_target: Option<&BlockLabel>,
 ) -> InlineBlockRef
 where
-    E: RuffToBlockPyExpr + ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     let entry_ref = fragment.entry_ref();
     blocks.push(compat_block_from_inline_with_exc_target_and_expr(
@@ -81,7 +81,7 @@ pub(crate) fn compat_block_from_blockpy_with_exc_target_and_expr<E>(
     exc_target: Option<&BlockLabel>,
 ) -> LoweredBlockPyBlock<E>
 where
-    E: RuffToBlockPyExpr + ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     let body = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &body, name_gen)
         .unwrap_or_else(|err| {
@@ -97,7 +97,7 @@ pub(crate) fn compat_block_from_lowered_builder_with_exc_target_and_expr<E>(
     exc_target: Option<&BlockLabel>,
 ) -> LoweredBlockPyBlock<E>
 where
-    E: RuffToBlockPyExpr + ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     let block = builder.finish_linear_block(label, term).unwrap_or_else(|| {
         panic!("compatibility block body should lower to a single linear block")
@@ -113,7 +113,7 @@ fn emit_lowered_builder_fragment_with_exc_target_and_expr<E>(
     exc_target: Option<&BlockLabel>,
 ) -> InlineBlockRef
 where
-    E: RuffToBlockPyExpr + ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     let (entry_ref, finished_blocks) = builder.finish_blocks_with_term(term);
     for block in finished_blocks {
@@ -178,7 +178,7 @@ pub(crate) fn emit_sequence_jump_block<E>(
     exc_target: Option<&BlockLabel>,
 ) -> BlockLabel
 where
-    E: RuffToBlockPyExpr + ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     if linear.is_empty() {
         return target_label;
@@ -206,7 +206,7 @@ pub(crate) fn emit_sequence_return_block_with_expr_setup_and_expr<E>(
     exc_target: Option<&BlockLabel>,
 ) -> Result<BlockLabel, String>
 where
-    E: RuffToBlockPyExpr + ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     let mut out = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &linear, name_gen)?;
     if let Some(expr) = value.clone() {
@@ -250,7 +250,7 @@ where
             )
         })
         .transpose()?;
-    let return_term = BlockTerm::Return(value.unwrap_or_else(E::implicit_none_expr));
+    let return_term = BlockTerm::Return(value.unwrap_or_else(E::constant_none));
     Ok(emit_lowered_builder_fragment_with_exc_target_and_expr(
         blocks,
         out,
@@ -270,7 +270,7 @@ pub(crate) fn emit_sequence_raise_block_with_expr_setup_and_expr<E>(
     exc_target: Option<&BlockLabel>,
 ) -> Result<BlockLabel, String>
 where
-    E: RuffToBlockPyExpr + ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     let mut out = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &linear, name_gen)?;
     if let Some(expr) = exc.exc.clone() {
@@ -341,7 +341,7 @@ pub(crate) fn emit_if_branch_block_with_expr_setup_and_expr<E>(
     exc_target: Option<&BlockLabel>,
 ) -> Result<BlockLabel, String>
 where
-    E: RuffToBlockPyExpr + ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     let lowered_direct = try_lower_direct_expr::<E>(name_gen, test.clone());
     if let Some(Ok(lowered)) = lowered_direct {
@@ -413,7 +413,7 @@ pub(crate) fn emit_simple_while_blocks_with_expr_setup_and_expr<E>(
     exc_target: Option<&BlockLabel>,
 ) -> Result<BlockLabel, String>
 where
-    E: RuffToBlockPyExpr + ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     let lowered_direct = try_lower_direct_expr::<E>(name_gen, test.clone());
     if let Some(Ok(lowered)) = lowered_direct {
@@ -528,10 +528,10 @@ pub(crate) fn emit_for_loop_blocks<E>(
     exc_target: Option<&BlockLabel>,
 ) -> BlockLabel
 where
-    E: RuffToBlockPyExpr + ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     let synthetic_name_expr =
-        |name: &str| InstrRuff::from_ast_expr(py_expr!("{name:id}", name = name));
+        |name: &str| crate::passes::ast_to_instr::from_ast_expr(py_expr!("{name:id}", name = name));
     let runtime_helper_expr = |name: &'static str| {
         InstrRuff::ExprAttribute(
             ExprAttribute::new(
@@ -555,7 +555,7 @@ where
         exc_target,
     ));
 
-    let exhausted_test = InstrRuff::from_ast_expr(py_expr!(
+    let exhausted_test = crate::passes::ast_to_instr::from_ast_expr(py_expr!(
         "{tmp:id} is __soac__.ITER_COMPLETE",
         tmp = tmp_name
     ));
@@ -581,7 +581,7 @@ where
         next_call
     };
     let check_body = vec![crate::block_py::StmtAssign::new(
-        vec![InstrRuff::from_ast_expr(py_expr!(
+        vec![crate::passes::ast_to_instr::from_ast_expr(py_expr!(
             "{tmp:id}",
             tmp = tmp_name
         ))],
@@ -615,7 +615,7 @@ where
     .into();
     setup_body.push(
         crate::block_py::StmtAssign::new(
-            vec![InstrRuff::from_ast_expr(py_expr!(
+            vec![crate::passes::ast_to_instr::from_ast_expr(py_expr!(
                 "{iter:id}",
                 iter = iter_name
             ))],

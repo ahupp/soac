@@ -10,7 +10,7 @@ pub(crate) fn lower_augassign_instr_into<E>(
     loop_ctx: Option<&LoopContext>,
 ) -> Result<(), String>
 where
-    E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     match stmt.target.as_ref() {
         InstrRuff::ExprName(target) => {
@@ -125,7 +125,7 @@ where
         }
         _ => Err(assign_delete_error(
             "unsupported augmented assignment target reached BlockPy conversion",
-            &InstrRuff::StmtAugAssign(stmt.clone()).into_ast_stmt(),
+            &crate::passes::ast_to_instr::into_ast_stmt(InstrRuff::StmtAugAssign(stmt.clone())),
         )),
     }
 }

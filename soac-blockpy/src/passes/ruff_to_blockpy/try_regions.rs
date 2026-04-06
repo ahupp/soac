@@ -6,7 +6,6 @@ use crate::block_py::{
 };
 use crate::passes::ast_to_ast::body::Suite;
 use crate::passes::ast_to_ast::context::Context;
-use crate::passes::InstrRuff;
 
 fn expr_name(id: &str) -> ast::name::Name {
     ast::name::Name::new(id)
@@ -110,7 +109,7 @@ pub(crate) fn lower_try_regions<F, E>(
 ) -> LoweredTryRegions
 where
     F: FnMut(&[Stmt], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
-    E: crate::block_py::ImplicitNoneExpr + RuffToBlockPyExpr,
+    E: RuffToBlockPyExpr,
 {
     let finally_label = if let Some(finally_body) = finally_body {
         let finally_region_start = blocks.len();
@@ -287,7 +286,7 @@ pub(crate) fn finalize_try_regions<E>(
     active_exc_target: Option<BlockLabel>,
 ) -> BlockLabel
 where
-    E: crate::block_py::ImplicitNoneExpr + RuffToBlockPyExpr,
+    E: RuffToBlockPyExpr,
 {
     if let Some(finally_target) = lowered_try.finally_label.as_ref() {
         let payload_name = try_plan
@@ -342,11 +341,11 @@ fn rewrite_region_returns_to_finally_blockpy<E>(
     finally_target: &BlockLabel,
     payload_name: &str,
 ) where
-    E: crate::block_py::ImplicitNoneExpr + RuffToBlockPyExpr,
+    E: RuffToBlockPyExpr,
 {
     for block in blocks.iter_mut() {
         let ret_value =
-            match std::mem::replace(&mut block.term, BlockTerm::Return(E::implicit_none_expr())) {
+            match std::mem::replace(&mut block.term, BlockTerm::Return(E::constant_none())) {
                 BlockTerm::Return(value) => value,
                 other => {
                     block.term = other;
@@ -377,14 +376,14 @@ pub(crate) fn emit_finally_abrupt_dispatch_blocks<E>(
     rest_entry: BlockLabel,
     active_exc_target: Option<BlockLabel>,
 ) where
-    E: crate::block_py::ImplicitNoneExpr + RuffToBlockPyExpr,
+    E: RuffToBlockPyExpr,
 {
     blocks.push(compat_block_from_blockpy_with_exc_target_and_expr(
         &Context::new(""),
         name_gen,
         finally_return_label.clone(),
         Vec::new(),
-        BlockTerm::Return(E::from_lowered_expr(InstrRuff::from_ast_expr(py_expr!(
+        BlockTerm::Return(E::from_lowered_expr(crate::passes::ast_to_instr::from_ast_expr(py_expr!(
             "{name:id}",
             name = payload_name
         )))),
@@ -396,7 +395,7 @@ pub(crate) fn emit_finally_abrupt_dispatch_blocks<E>(
         finally_raise_label.clone(),
         Vec::new(),
         BlockTerm::Raise(TermRaise {
-            exc: Some(E::from_lowered_expr(InstrRuff::from_ast_expr(py_expr!(
+            exc: Some(E::from_lowered_expr(crate::passes::ast_to_instr::from_ast_expr(py_expr!(
                 "{name:id}",
                 name = payload_name
             )))),
@@ -409,7 +408,7 @@ pub(crate) fn emit_finally_abrupt_dispatch_blocks<E>(
         finally_dispatch_label.clone(),
         Vec::new(),
         BlockTerm::BranchTable(TermBranchTable {
-            index: E::from_lowered_expr(InstrRuff::from_ast_expr(py_expr!(
+            index: E::from_lowered_expr(crate::passes::ast_to_instr::from_ast_expr(py_expr!(
                 "{name:id}",
                 name = kind_name
             ))),
@@ -433,13 +432,16 @@ pub(crate) fn emit_try_jump_entry<E>(
     active_exc_target: Option<BlockLabel>,
 ) -> BlockLabel
 where
-    E: crate::block_py::ImplicitNoneExpr + RuffToBlockPyExpr,
+    E: RuffToBlockPyExpr,
 {
     blocks.push(compat_block_from_blockpy_with_exc_target_and_expr(
         &Context::new(""),
         name_gen,
         label.clone(),
-        linear.into_iter().map(InstrRuff::from_ast_stmt).collect(),
+        linear
+            .into_iter()
+            .map(crate::passes::ast_to_instr::from_ast_stmt)
+            .collect(),
         BlockTerm::Jump(BlockEdge::new(body_label)),
         active_exc_target.as_ref(),
     ));

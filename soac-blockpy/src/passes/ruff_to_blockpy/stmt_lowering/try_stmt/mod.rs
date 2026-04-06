@@ -235,18 +235,27 @@ pub(crate) fn rewrite_try_instr(stmt: crate::block_py::StmtTry<InstrRuff>) -> Ve
     let rewritten = rewrite_try_stmt(ast::StmtTry {
         range: Default::default(),
         node_index: Default::default(),
-        body: body.into_iter().map(InstrRuff::into_ast_stmt).collect(),
+        body: body
+            .into_iter()
+            .map(crate::passes::ast_to_instr::into_ast_stmt)
+            .collect(),
         handlers,
-        orelse: orelse.into_iter().map(InstrRuff::into_ast_stmt).collect(),
+        orelse: orelse
+            .into_iter()
+            .map(crate::passes::ast_to_instr::into_ast_stmt)
+            .collect(),
         finalbody: finalbody
             .into_iter()
-            .map(InstrRuff::into_ast_stmt)
+            .map(crate::passes::ast_to_instr::into_ast_stmt)
             .collect(),
         is_star,
     });
     match rewritten {
-        Rewrite::Unmodified(stmt) => vec![InstrRuff::from_ast_stmt(stmt)],
-        Rewrite::Walk(stmts) => stmts.into_iter().map(InstrRuff::from_ast_stmt).collect(),
+        Rewrite::Unmodified(stmt) => vec![crate::passes::ast_to_instr::from_ast_stmt(stmt)],
+        Rewrite::Walk(stmts) => stmts
+            .into_iter()
+            .map(crate::passes::ast_to_instr::from_ast_stmt)
+            .collect(),
     }
 }
 
@@ -263,7 +272,7 @@ pub(crate) fn lower_star_try_stmt_sequence<F, E>(
 ) -> BlockLabel
 where
     F: FnMut(&[InstrRuff], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
-    E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     lower_expanded_stmt_sequence(
         context,
@@ -291,19 +300,19 @@ pub(crate) fn lower_try_stmt_sequence<F, E>(
 ) -> BlockLabel
 where
     F: FnMut(&[InstrRuff], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
-    E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     let rest_entry = lower_sequence(remaining_stmts, targets.clone(), blocks);
 
     let else_body = try_stmt
         .orelse
         .into_iter()
-        .map(InstrRuff::into_ast_stmt)
+        .map(crate::passes::ast_to_instr::into_ast_stmt)
         .collect::<Vec<_>>();
     let try_body = try_stmt
         .body
         .into_iter()
-        .map(InstrRuff::into_ast_stmt)
+        .map(crate::passes::ast_to_instr::into_ast_stmt)
         .collect::<Vec<_>>();
     let except_body =
         (!try_stmt.handlers.is_empty()).then(|| prepare_except_body(&try_stmt.handlers));
@@ -312,7 +321,7 @@ where
             &try_stmt
                 .finalbody
                 .into_iter()
-                .map(InstrRuff::into_ast_stmt)
+                .map(crate::passes::ast_to_instr::into_ast_stmt)
                 .collect::<Vec<_>>(),
         ))
     } else {
@@ -334,7 +343,7 @@ where
             let stmts = stmts
                 .iter()
                 .cloned()
-                .map(InstrRuff::from_ast_stmt)
+                .map(crate::passes::ast_to_instr::from_ast_stmt)
                 .collect::<Vec<_>>();
             lower_sequence(&stmts, nested_targets, blocks)
         },
@@ -344,7 +353,10 @@ where
         blocks,
         name_gen,
         label,
-        linear.into_iter().map(InstrRuff::into_ast_stmt).collect(),
+        linear
+            .into_iter()
+            .map(crate::passes::ast_to_instr::into_ast_stmt)
+            .collect(),
         try_plan,
         lowered_try,
         targets.active_exc,

@@ -66,7 +66,7 @@ pub(crate) fn try_lower_if_stmt_fragment<E>(
     loop_ctx: Option<&LoopContext>,
 ) -> Option<Result<InlineFragment<E>, String>>
 where
-    E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     match simplify_stmt_head_ast_for_blockpy(context, Stmt::If(if_stmt.clone())).as_slice() {
         [Stmt::If(simplified_if)] => Some(lower_simplified_if_stmt_fragment(
@@ -86,7 +86,7 @@ pub(crate) fn try_lower_if_instr_fragment<E>(
     loop_ctx: Option<&LoopContext>,
 ) -> Option<Result<InlineFragment<E>, String>>
 where
-    E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     Some(lower_simplified_if_instr_fragment(
         context, name_gen, if_stmt, loop_ctx,
@@ -101,7 +101,7 @@ fn lower_simplified_if_stmt_fragment<E>(
     loop_ctx: Option<&LoopContext>,
 ) -> Result<InlineFragment<E>, String>
 where
-    E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     let ast::StmtIf {
         test,
@@ -112,7 +112,7 @@ where
     let bridge = StructuredLoweringBridge::new();
     let Some(test_setup) = bridge.try_lower_inline_value(name_gen, |structured| {
         crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
-            InstrRuff::from_ast_expr(*test.clone()),
+            crate::passes::ast_to_instr::from_ast_expr(*test.clone()),
             structured,
             loop_ctx,
         )
@@ -169,7 +169,7 @@ fn lower_simplified_if_instr_fragment<E>(
     loop_ctx: Option<&LoopContext>,
 ) -> Result<InlineFragment<E>, String>
 where
-    E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     let bridge = StructuredLoweringBridge::new();
     let Some(test_setup) = bridge.try_lower_inline_value(name_gen, |structured| {
@@ -236,7 +236,7 @@ fn lower_nested_body_to_inline_fragment<E>(
     bridge: &StructuredLoweringBridge,
 ) -> Option<Result<InlineFragment<E>, String>>
 where
-    E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     if !suite_is_inline_fragment_compatible(context, body) {
         return None;
@@ -260,7 +260,7 @@ fn lower_nested_instr_body_to_inline_fragment<E>(
     bridge: &StructuredLoweringBridge,
 ) -> Option<Result<InlineFragment<E>, String>>
 where
-    E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     if !instr_suite_is_inline_fragment_compatible(context, body) {
         return None;
@@ -286,7 +286,7 @@ fn lower_orelse_to_inline_fragment<E>(
     bridge: &StructuredLoweringBridge,
 ) -> Option<Result<InlineFragment<E>, String>>
 where
-    E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     match clauses {
         [] => Some(Ok(InlineFragment::new(
@@ -317,7 +317,7 @@ fn lower_instr_orelse_to_inline_fragment<E>(
     bridge: &StructuredLoweringBridge,
 ) -> Option<Result<InlineFragment<E>, String>>
 where
-    E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     if orelse.is_empty() {
         return Some(Ok(InlineFragment::new(

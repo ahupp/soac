@@ -60,7 +60,7 @@ fn lower_stmt_for_panic_test(stmt: &Stmt) {
     let mut out = crate::passes::ruff_to_blockpy::InlineBlockBuilder::<InstrWithAwaitAndYield>::new(
         &name_gen,
     );
-    let stmt = InstrRuff::from_ast_stmt(stmt.clone());
+    let stmt = crate::passes::ast_to_instr::from_ast_stmt(stmt.clone());
     let _ = lower_instr_for_test(&context, &stmt, &name_gen, &mut out, None);
 }
 
@@ -75,11 +75,11 @@ fn label(index: u32) -> BlockLabel {
 type TestBlock = Block<InstrWithAwaitAndYield>;
 
 fn instr_stmt(stmt: Stmt) -> InstrRuff {
-    InstrRuff::from_ast_stmt(stmt)
+    crate::passes::ast_to_instr::from_ast_stmt(stmt)
 }
 
 fn instr_expr(expr: Expr) -> InstrRuff {
-    InstrRuff::from_ast_expr(expr)
+    crate::passes::ast_to_instr::from_ast_expr(expr)
 }
 
 #[test]
@@ -329,7 +329,8 @@ def f():
             StmtSequenceHeadPlan::If(_)
         ),
         "{}",
-        crate::ruff_ast_to_string(match_if.clone().into_ast_stmt()).trim_end()
+        crate::ruff_ast_to_string(crate::passes::ast_to_instr::into_ast_stmt(match_if.clone()))
+            .trim_end()
     );
 }
 
@@ -392,7 +393,7 @@ def f(xs):
     let ast::Stmt::For(for_stmt) = &func.body[0] else {
         panic!("expected for stmt");
     };
-    let InstrRuff::StmtFor(for_stmt) = InstrRuff::from_ast_stmt(ast::Stmt::For(for_stmt.clone()))
+    let InstrRuff::StmtFor(for_stmt) = crate::passes::ast_to_instr::from_ast_stmt(ast::Stmt::For(for_stmt.clone()))
     else {
         panic!("expected InstrRuff::StmtFor");
     };
@@ -414,8 +415,8 @@ def f(xs):
         label(1),
         label(2),
         vec![
-            InstrRuff::from_ast_stmt(py_stmt!("x = _dp_tmp_0")),
-            InstrRuff::from_ast_stmt(py_stmt!("del _dp_tmp_0")),
+            crate::passes::ast_to_instr::from_ast_stmt(py_stmt!("x = _dp_tmp_0")),
+            crate::passes::ast_to_instr::from_ast_stmt(py_stmt!("del _dp_tmp_0")),
         ],
         &mut |_stmts: &[InstrRuff], targets: RegionTargets, _blocks: &mut Vec<TestBlock>| {
             targets.normal_cont
@@ -453,7 +454,7 @@ def f(ctx, value):
     let mut saw_with_ok_assign = false;
     let entry = lower_with_stmt_sequence(
         &context,
-        match InstrRuff::from_ast_stmt(Stmt::With(with_stmt.clone())) {
+        match crate::passes::ast_to_instr::from_ast_stmt(Stmt::With(with_stmt.clone())) {
             InstrRuff::StmtWith(with_stmt) => with_stmt,
             _ => unreachable!(),
         },
@@ -510,7 +511,7 @@ def f():
     let name_gen = test_name_gen();
     let try_plan = build_try_plan(&name_gen, false, false);
     let entry = lower_try_stmt_sequence(
-        match InstrRuff::from_ast_stmt(Stmt::Try(try_stmt.clone())) {
+        match crate::passes::ast_to_instr::from_ast_stmt(Stmt::Try(try_stmt.clone())) {
             InstrRuff::StmtTry(try_stmt) => try_stmt,
             _ => unreachable!(),
         },
@@ -927,7 +928,7 @@ fn sequence_raise_helper_emits_raise_block() {
         &test_name_gen(),
         vec![instr_stmt(py_stmt!("prefix = 0"))],
         TermRaise {
-            exc: Some(InstrRuff::from_ast_expr(py_expr!("exc"))),
+            exc: Some(crate::passes::ast_to_instr::from_ast_expr(py_expr!("exc"))),
         },
         None,
     )
@@ -980,7 +981,7 @@ fn sequence_raise_helper_lowers_compare_chain_via_inline_fragment() {
         &name_gen,
         vec![instr_stmt(py_stmt!("prefix = 0"))],
         TermRaise {
-            exc: Some(InstrRuff::from_ast_expr(py_expr!("a() < b() < c()"))),
+            exc: Some(crate::passes::ast_to_instr::from_ast_expr(py_expr!("a() < b() < c()"))),
         },
         None,
     )
@@ -1067,7 +1068,7 @@ fn sequence_raise_helper_keeps_direct_if_expr_setup_reachable_after_linear_prefi
         &name_gen,
         vec![instr_stmt(py_stmt!("prefix = 0"))],
         TermRaise {
-            exc: Some(InstrRuff::from_ast_expr(py_expr!(
+            exc: Some(crate::passes::ast_to_instr::from_ast_expr(py_expr!(
                 "value if cond else other"
             ))),
         },
@@ -1153,7 +1154,7 @@ y = 3
     let entry = lower_if_stmt_sequence_from_stmt(
         &context,
         &test_name_gen(),
-        match InstrRuff::from_ast_stmt(Stmt::If(if_stmt.clone())) {
+        match crate::passes::ast_to_instr::from_ast_stmt(Stmt::If(if_stmt.clone())) {
             InstrRuff::StmtIf(if_stmt) => if_stmt,
             _ => unreachable!(),
         },
@@ -1247,7 +1248,7 @@ done = 1
     let entry = lower_if_stmt_sequence_from_stmt(
         &context,
         &test_name_gen(),
-        match InstrRuff::from_ast_stmt(Stmt::If(if_stmt.clone())) {
+        match crate::passes::ast_to_instr::from_ast_stmt(Stmt::If(if_stmt.clone())) {
             InstrRuff::StmtIf(if_stmt) => if_stmt,
             _ => unreachable!(),
         },
@@ -1520,7 +1521,7 @@ y = 3
     let entry = lower_while_stmt_sequence_from_stmt(
         &context,
         &test_name_gen(),
-        match InstrRuff::from_ast_stmt(Stmt::While(while_stmt.clone())) {
+        match crate::passes::ast_to_instr::from_ast_stmt(Stmt::While(while_stmt.clone())) {
             InstrRuff::StmtWhile(while_stmt) => while_stmt,
             _ => unreachable!(),
         },
@@ -1680,7 +1681,7 @@ def f(x):
     let mut out = crate::passes::ruff_to_blockpy::InlineBlockBuilder::<InstrWithAwaitAndYield>::new(
         &name_gen,
     );
-    let stmt = InstrRuff::from_ast_stmt(func.body[0].clone());
+    let stmt = crate::passes::ast_to_instr::from_ast_stmt(func.body[0].clone());
     lower_instr_for_test(&context, &stmt, &name_gen, &mut out, None)
         .expect("assert lowering should succeed");
     let fragment = out.finish();
@@ -1725,7 +1726,7 @@ def f(x):
     let mut out = crate::passes::ruff_to_blockpy::InlineBlockBuilder::<InstrWithAwaitAndYield>::new(
         &name_gen,
     );
-    let stmt = InstrRuff::from_ast_stmt(func.body[0].clone());
+    let stmt = crate::passes::ast_to_instr::from_ast_stmt(func.body[0].clone());
     lower_instr_for_test(&context, &stmt, &name_gen, &mut out, None)
         .expect("augassign lowering should succeed");
     let fragment = out.finish();
@@ -1771,7 +1772,7 @@ def f():
     let mut out = crate::passes::ruff_to_blockpy::InlineBlockBuilder::<InstrWithAwaitAndYield>::new(
         &name_gen,
     );
-    let stmt = InstrRuff::from_ast_stmt(module[0].clone());
+    let stmt = crate::passes::ast_to_instr::from_ast_stmt(module[0].clone());
     lower_instr_for_test(&context, &stmt, &name_gen, &mut out, None)
         .expect("type alias lowering should succeed");
     let fragment = out.finish();
@@ -1799,7 +1800,7 @@ def f(x):
     let mut out = crate::passes::ruff_to_blockpy::InlineBlockBuilder::<InstrWithAwaitAndYield>::new(
         &name_gen,
     );
-    let stmt = InstrRuff::from_ast_stmt(func.body[0].clone());
+    let stmt = crate::passes::ast_to_instr::from_ast_stmt(func.body[0].clone());
     lower_instr_for_test(&context, &stmt, &name_gen, &mut out, None)
         .expect("match lowering should succeed");
     let fragment = out.finish();
@@ -1825,7 +1826,7 @@ def f():
     let mut out = crate::passes::ruff_to_blockpy::InlineBlockBuilder::<InstrWithAwaitAndYield>::new(
         &name_gen,
     );
-    let stmt = InstrRuff::from_ast_stmt(func.body[0].clone());
+    let stmt = crate::passes::ast_to_instr::from_ast_stmt(func.body[0].clone());
     lower_instr_for_test(&context, &stmt, &name_gen, &mut out, None)
         .expect("import lowering should succeed");
     let fragment = out.finish();
@@ -1854,7 +1855,7 @@ def f():
     let mut out = crate::passes::ruff_to_blockpy::InlineBlockBuilder::<InstrWithAwaitAndYield>::new(
         &name_gen,
     );
-    let stmt = InstrRuff::from_ast_stmt(func.body[0].clone());
+    let stmt = crate::passes::ast_to_instr::from_ast_stmt(func.body[0].clone());
     lower_instr_for_test(&context, &stmt, &name_gen, &mut out, None)
         .expect("import-from lowering should succeed");
     let fragment = out.finish();
@@ -1911,6 +1912,6 @@ fn panics_if_while_reaches_stmt_list_lowering() {
     let mut out = crate::passes::ruff_to_blockpy::InlineBlockBuilder::<InstrWithAwaitAndYield>::new(
         &name_gen,
     );
-    let stmt = InstrRuff::from_ast_stmt(Stmt::While(while_stmt.clone()));
+    let stmt = crate::passes::ast_to_instr::from_ast_stmt(Stmt::While(while_stmt.clone()));
     lower_instr_for_test(&context, &stmt, &name_gen, &mut out, None).unwrap();
 }

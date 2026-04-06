@@ -6,7 +6,7 @@ use crate::py_expr;
 fn cfg_block_new_sets_explicit_term() {
     let block = Block::new(
         BlockLabel::from_index(0),
-        vec![InstrRuff::from_ast_expr(py_expr!("x"))],
+        vec![crate::passes::ast_to_instr::from_ast_expr(py_expr!("x"))],
         BlockTerm::<InstrRuff>::Jump(crate::block_py::BlockEdge::new(BlockLabel::from_index(1))),
         Vec::new(),
         None,
@@ -21,7 +21,7 @@ fn cfg_block_new_sets_explicit_term() {
 fn cfg_block_from_fragment_without_term_uses_implicit_none_return_value() {
     let block = Block::from_builder(
         BlockLabel::from_index(0),
-        BlockBuilder::from_stmts(vec![InstrRuff::from_ast_expr(py_expr!("x"))]),
+        BlockBuilder::from_stmts(vec![crate::passes::ast_to_instr::from_ast_expr(py_expr!("x"))]),
         Vec::new(),
         None,
         None,
@@ -61,8 +61,8 @@ fn cfg_block_can_replace_fallthrough_target() {
 #[test]
 fn stmt_fragment_can_carry_optional_term() {
     let fragment: BlockBuilder<InstrRuff> = BlockBuilder::with_term(
-        vec![InstrRuff::from_ast_expr(py_expr!("x"))],
-        Some(BlockTerm::Return(InstrRuff::from_ast_expr(py_expr!(
+        vec![crate::passes::ast_to_instr::from_ast_expr(py_expr!("x"))],
+        Some(BlockTerm::Return(crate::passes::ast_to_instr::from_ast_expr(py_expr!(
             "None"
         )))),
     );
@@ -195,7 +195,7 @@ fn storage_layout_semantics_collects_structured_cell_ref_logical_names() {
         blocks: vec![Block {
             label: BlockLabel::from_index(0),
             body: vec![CellRefForName::new("captured".to_string()).into()],
-            term: BlockTerm::Return(<InstrUnresolved as ImplicitNoneExpr>::implicit_none_expr()),
+            term: BlockTerm::Return(InstrUnresolved::constant_none()),
             params: Vec::new(),
             exc_edge: None,
         }],

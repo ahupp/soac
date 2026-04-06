@@ -17,7 +17,7 @@ pub(super) fn lower_expr_ast_recursive<L, E>(
 ) -> Result<InstrRuff, String>
 where
     L: BlockPySetupExprLowerer + ?Sized,
-    E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     match expr {
         InstrRuff::ExprBoolOp(bool_op) => lower_boolop_into(lowerer, bool_op, out, loop_ctx),

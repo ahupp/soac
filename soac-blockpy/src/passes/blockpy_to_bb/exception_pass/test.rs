@@ -1,8 +1,8 @@
 use super::lower_try_jump_exception_flow;
 use crate::block_py::{
     validate_module, AbruptKind, BindingKind, BlockArg, BlockEdge, BlockLabel, BlockParam,
-    BlockParamRole, BlockTerm, CellBindingKind, CodegenBlock, InstrCodegen, InstrResolved, Literal,
-    NameLocation, NumberLiteral, NumberLiteralValue, ResolvedStorageBlock, StorageLayout,
+    BlockParamRole, BlockTerm, CellBindingKind, CodegenBlock, Instr, InstrCodegen, InstrResolved,
+    Literal, NameLocation, NumberLiteral, NumberLiteralValue, ResolvedStorageBlock, StorageLayout,
 };
 use crate::lower_python_to_blockpy_for_testing;
 use crate::passes::CodegenModuleShape;
@@ -68,7 +68,7 @@ def f(x):
             label: body_label.clone(),
             body: vec![],
             term: BlockTerm::<InstrResolved>::Return(
-                <InstrResolved as crate::block_py::ImplicitNoneExpr>::implicit_none_expr(),
+                InstrResolved::constant_none(),
             ),
             params: vec![crate::block_py::BlockParam {
                 name: "_dp_try_exc_manual".to_string(),
@@ -80,7 +80,7 @@ def f(x):
             label: except_label.clone(),
             body: vec![],
             term: BlockTerm::<InstrResolved>::Return(
-                <InstrResolved as crate::block_py::ImplicitNoneExpr>::implicit_none_expr(),
+                InstrResolved::constant_none(),
             ),
             params: Vec::new(),
             exc_edge: None,
@@ -221,7 +221,7 @@ def f():
         label: target,
         body: vec![],
         term: BlockTerm::<InstrCodegen>::Return(
-            <InstrCodegen as crate::block_py::ImplicitNoneExpr>::implicit_none_expr(),
+            InstrCodegen::constant_none(),
         ),
         params: vec![BlockParam {
             name: "_dp_try_exc".to_string(),
@@ -304,7 +304,7 @@ def f():
         label: except_label.clone(),
         body: vec![],
         term: BlockTerm::<InstrResolved>::Return(
-            <InstrResolved as crate::block_py::ImplicitNoneExpr>::implicit_none_expr(),
+            InstrResolved::constant_none(),
         ),
         params: Vec::new(),
         exc_edge: None,
@@ -372,7 +372,7 @@ def f():
         label: except_label.clone(),
         body: vec![],
         term: BlockTerm::<InstrResolved>::Return(
-            <InstrResolved as crate::block_py::ImplicitNoneExpr>::implicit_none_expr(),
+            InstrResolved::constant_none(),
         ),
         params: Vec::new(),
         exc_edge: None,

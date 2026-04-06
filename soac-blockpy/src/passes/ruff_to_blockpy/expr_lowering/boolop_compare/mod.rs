@@ -11,7 +11,7 @@ fn store_name(name: &str) -> ast::name::Name {
 }
 
 fn load_name(name: &str) -> InstrRuff {
-    InstrRuff::from_ast_expr(py_expr!("{name:id}", name = name))
+    crate::passes::ast_to_instr::from_ast_expr(py_expr!("{name:id}", name = name))
 }
 
 fn assign_name<E>(target: &str, value: InstrRuff) -> E
@@ -34,7 +34,7 @@ pub(crate) fn try_lower_branching_expr_direct<L, E>(
 ) -> Option<Result<LoweredExpr<E, InstrRuff>, String>>
 where
     L: BlockPySetupExprLowerer + ?Sized,
-    E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     match expr {
         InstrRuff::ExprBoolOp(bool_op) => {
@@ -55,7 +55,7 @@ fn lower_boolop_direct<L, E>(
 ) -> Result<LoweredExpr<E, InstrRuff>, String>
 where
     L: BlockPySetupExprLowerer + ?Sized,
-    E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     let crate::block_py::ExprBoolOp { op, values, .. } = bool_op;
     let target = fresh_setup_name("target");
@@ -78,7 +78,7 @@ where
         let test = match op {
             ast::BoolOp::And => load_name(&target),
             ast::BoolOp::Or => {
-                InstrRuff::from_ast_expr(py_expr!("not {target:id}", target = target.as_str()))
+                crate::passes::ast_to_instr::from_ast_expr(py_expr!("not {target:id}", target = target.as_str()))
             }
         };
         let (next_entry, value) = bridge
@@ -128,7 +128,7 @@ fn lower_compare_chain_direct<L, E>(
 ) -> Result<LoweredExpr<E, InstrRuff>, String>
 where
     L: BlockPySetupExprLowerer + ?Sized,
-    E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     let crate::block_py::ExprCompare {
         left,
@@ -233,7 +233,7 @@ pub(super) fn lower_boolop_into<L, E>(
 ) -> Result<InstrRuff, String>
 where
     L: BlockPySetupExprLowerer + ?Sized,
-    E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     if let Some(lowered) = try_lower_branching_expr_direct(
         lowerer,
@@ -256,7 +256,7 @@ pub(super) fn lower_compare_into<L, E>(
 ) -> Result<InstrRuff, String>
 where
     L: BlockPySetupExprLowerer + ?Sized,
-    E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     if compare.ops.len() == 1 {
         let crate::block_py::ExprCompare {

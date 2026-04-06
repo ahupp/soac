@@ -1,5 +1,5 @@
 use super::*;
-use crate::block_py::{BlockParam, BlockParamRole};
+use crate::block_py::{BlockParam, BlockParamRole, Instr};
 use crate::block_py::{
     ClosureInit, ClosureSlot, InstrWithAwaitAndYield, NameLocation, ResolvedName, StorageLayout,
 };
@@ -17,7 +17,7 @@ fn wrapped_blockpy(source: &str) -> BlockPyModule<CoreModuleShapeWithAwaitAndYie
 }
 
 fn parse_blockpy_expr(source: &str) -> InstrRuff {
-    InstrRuff::from_ast_expr((*parse_expression(source).unwrap().into_syntax().body).into())
+    crate::passes::ast_to_instr::from_ast_expr((*parse_expression(source).unwrap().into_syntax().body).into())
 }
 
 fn parse_core_blockpy_expr(source: &str) -> InstrWithAwaitAndYield {
@@ -489,8 +489,7 @@ fn renders_bb_block_metadata_with_shared_layout() {
                     label: label(1),
                     body: vec![],
                     term: BlockTerm::Return(
-                        <crate::block_py::InstrResolved as crate::block_py::ImplicitNoneExpr>::implicit_none_expr(
-                        ),
+                        crate::block_py::InstrResolved::constant_none(),
                     ),
                     params: vec![BlockParam {
                         name: "err".to_string(),

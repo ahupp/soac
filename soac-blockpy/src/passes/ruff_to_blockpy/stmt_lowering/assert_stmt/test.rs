@@ -20,7 +20,7 @@ fn stmt_assert_simplify_ast_desugars_before_blockpy_lowering() {
 #[test]
 fn stmt_assert_to_blockpy_uses_trait_owned_simplification_path() {
     let stmt = py_stmt!("assert cond, msg");
-    let assert_stmt = crate::passes::InstrRuff::from_ast_stmt(stmt);
+    let assert_stmt = crate::passes::ast_to_instr::from_ast_stmt(stmt);
     let context = Context::new("");
     let name_gen = test_name_gen();
     let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new(&name_gen);

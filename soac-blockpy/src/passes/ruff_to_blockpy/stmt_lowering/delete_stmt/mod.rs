@@ -10,7 +10,7 @@ fn lower_delete_target_into<E>(
     loop_ctx: Option<&LoopContext>,
 ) -> Result<(), String>
 where
-    E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     match target {
         InstrRuff::ExprSubscript(target) => {
@@ -36,7 +36,7 @@ where
             let target_meta = target.meta();
             let object_value = lower_target_object_with_setup(*target.value, out, loop_ctx)?;
             let object_temp = bind_temp(out, context.fresh("delete_obj"), object_value);
-            let attr_expr: E = E::from_lowered_expr(InstrRuff::from_ast_expr(Expr::from(
+            let attr_expr: E = E::from_lowered_expr(crate::passes::ast_to_instr::from_ast_expr(Expr::from(
                 py_expr!("{attr:literal}", attr = target.attr.as_str()),
             )));
             out.push_stmt(E::helper_call(
@@ -54,7 +54,9 @@ where
         }
         other => Err(assign_delete_error(
             "unsupported delete target reached BlockPy conversion",
-            &InstrRuff::StmtDelete(crate::block_py::StmtDelete::new(vec![other])).into_ast_stmt(),
+            &crate::passes::ast_to_instr::into_ast_stmt(InstrRuff::StmtDelete(
+                crate::block_py::StmtDelete::new(vec![other]),
+            )),
         )),
     }
 }
@@ -66,7 +68,7 @@ pub(crate) fn lower_delete_instr_into<E>(
     loop_ctx: Option<&LoopContext>,
 ) -> Result<(), String>
 where
-    E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     for target in stmt.targets.iter().cloned() {
         lower_delete_target_into(context, target, out, loop_ctx)?;

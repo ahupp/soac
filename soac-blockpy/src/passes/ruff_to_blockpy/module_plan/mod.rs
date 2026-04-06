@@ -7,7 +7,7 @@ use crate::passes::ast_to_ast::body::{split_docstring, Suite};
 use crate::passes::ast_to_ast::context::Context;
 use crate::passes::ast_to_ast::rewrite_stmt;
 use crate::passes::ast_to_ast::semantic::{SemanticAstState, SemanticScope};
-use crate::passes::{CoreModuleShapeWithAwaitAndYield, InstrRuff};
+use crate::passes::CoreModuleShapeWithAwaitAndYield;
 use crate::transformer::{walk_expr, walk_stmt, Transformer};
 use crate::{py_expr, py_stmt, py_stmt_typed};
 use ruff_python_ast::{self as ast, Expr, Stmt};
@@ -115,7 +115,7 @@ fn try_lower_function_to_core_blockpy_bundle(
     let lowered_input_body = lowered_input_body
         .iter()
         .cloned()
-        .map(InstrRuff::from_ast_stmt)
+        .map(crate::passes::ast_to_instr::from_ast_stmt)
         .collect::<Vec<_>>();
     let (param_spec, _param_defaults) = collect_param_spec_and_defaults(&func.parameters);
 

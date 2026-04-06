@@ -43,7 +43,7 @@ fn stmt_with_simplify_ast_uses_native_identity_test() {
 #[should_panic(expected = "With should be lowered before Ruff AST -> BlockPy stmt-list conversion")]
 fn stmt_with_to_blockpy_rejects_sequence_only_stmt_lowering() {
     let stmt = py_stmt!("with cm:\n    body()");
-    let with_stmt = crate::passes::InstrRuff::from_ast_stmt(stmt);
+    let with_stmt = crate::passes::ast_to_instr::from_ast_stmt(stmt);
     let context = Context::new("");
     let name_gen = test_name_gen();
     let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new(&name_gen);

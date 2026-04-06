@@ -1,5 +1,4 @@
 pub use self::meta::{HasMeta, InstrId, Meta, WithMeta};
-use self::operation_macro::define_operation;
 pub use self::param_specs::{Param, ParamDefaultSource, ParamKind, ParamSpec};
 pub(crate) use self::scope::{
     build_storage_layout_from_capture_names, compute_make_function_capture_bindings_from_scope,
@@ -32,6 +31,8 @@ mod meta;
 mod name_gen;
 pub mod operation;
 mod operation_macro;
+mod counters;
+mod literal;
 pub(crate) mod param_specs;
 pub mod pretty;
 pub(crate) mod scope;
@@ -41,12 +42,17 @@ pub use crate::passes::{
     InstrCodegen, InstrLow, InstrResolved, InstrRuff, InstrUnresolved, InstrWithAwaitAndYield,
     InstrWithYield,
 };
+pub use counters::{CounterDef, CounterId, CounterScope, CounterSite, IncrementCounter};
+pub use literal::{
+    BytesLiteral, Literal, LiteralValue, NumberLiteral, NumberLiteralValue, StringLiteral,
+};
 #[allow(unused_imports)]
 pub(crate) use map::{
     map_function_blocks, map_module_functions, MapBlock, MapFunction, MapModule, MapTerm,
     TryMapBlock, TryMapFunction, TryMapModule, TryMapTerm,
 };
 pub use map::{MapInstr, Mappable, TryMapInstr};
+pub(crate) use literal::literal_expr;
 pub use name_gen::{BlockLabel, FunctionId, FunctionNameGen, ModuleNameGen};
 pub(crate) use validate::validate_module;
 #[allow(unused_imports)]
@@ -56,35 +62,6 @@ pub(crate) use visit::{
 };
 pub use visit::{ChildVisitable, Visit, VisitMut};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct CounterId(pub usize);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum CounterScope {
-    This,
-    Function,
-    Global,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum CounterSite {
-    BlockEntry {
-        function_id: FunctionId,
-        block_label: BlockLabel,
-    },
-    Runtime {
-        function_id: Option<FunctionId>,
-        instr_id: Option<InstrId>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct CounterDef {
-    pub id: CounterId,
-    pub scope: CounterScope,
-    pub kind: String,
-    pub site: CounterSite,
-}
 fn is_internal_symbol(name: &str) -> bool {
     name.starts_with("_dp_") || name == "__soac__"
 }
@@ -221,6 +198,7 @@ impl NameLocation {
 
 pub trait NameLike: Clone + fmt::Debug {
     fn id_str(&self) -> &str;
+    fn runtime_name(name: &str) -> Self;
     fn pretty_id(&self) -> String {
         self.id_str().to_string()
     }
@@ -234,6 +212,8 @@ pub trait NameLike: Clone + fmt::Debug {
 
 pub trait Instr: Clone + fmt::Debug + Sized {
     type Name: NameLike;
+
+    fn constant_none() -> Self;
 }
 
 #[derive(Clone)]
@@ -253,6 +233,10 @@ impl NameLike for UnresolvedName {
         match self {
             Self::SourceName(name) | Self::RuntimeName(name) => name.as_str(),
         }
+    }
+
+    fn runtime_name(name: &str) -> Self {
+        Self::RuntimeName(name.into())
     }
 
     fn is_runtime_name(&self) -> bool {
@@ -314,6 +298,13 @@ impl NameLike for ResolvedName {
         self.id.as_str()
     }
 
+    fn runtime_name(name: &str) -> Self {
+        Self {
+            id: name.into(),
+            location: NameLocation::RuntimeName,
+        }
+    }
+
     fn pretty_id(&self) -> String {
         self.resolved_pretty_id()
     }
@@ -372,8 +363,6 @@ impl<I: Instr> Block<I> {
         exc_edge: Option<BlockEdge>,
         fallthrough_target: Option<BlockLabel>,
     ) -> Self
-    where
-        I: ImplicitNoneExpr,
     {
         Self::new(
             label,
@@ -454,104 +443,6 @@ pub struct BlockPyModule<P: ModuleShape> {
     pub counter_defs: Vec<CounterDef>,
 }
 
-define_operation! {
-    pub struct IncrementCounter {
-        counter_id: CounterId,
-    }
-}
-
-#[derive(Clone, derive_more::From)]
-pub enum Literal {
-    StringLiteral(StringLiteral),
-    BytesLiteral(BytesLiteral),
-    NumberLiteral(NumberLiteral),
-}
-
-impl fmt::Debug for Literal {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::StringLiteral(value) => value.fmt(f),
-            Self::BytesLiteral(value) => value.fmt(f),
-            Self::NumberLiteral(value) => value.fmt(f),
-        }
-    }
-}
-
-define_operation! {
-    pub struct LiteralValue {
-        literal: Literal,
-    }
-}
-
-impl LiteralValue {
-    pub fn as_literal(&self) -> &Literal {
-        &self.literal
-    }
-
-    pub fn into_literal(self) -> Literal {
-        self.literal
-    }
-}
-
-pub(crate) fn literal_value(literal: impl Into<Literal>, meta: Meta) -> LiteralValue {
-    LiteralValue::new(literal.into()).with_meta(meta)
-}
-
-pub(crate) fn literal_expr<E>(literal: impl Into<Literal>, meta: Meta) -> E
-where
-    E: From<LiteralValue>,
-{
-    E::from(literal_value(literal, meta))
-}
-
-#[derive(Clone)]
-pub struct StringLiteral {
-    pub value: String,
-}
-
-impl fmt::Debug for StringLiteral {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", self.value)
-    }
-}
-
-#[derive(Clone)]
-pub struct BytesLiteral {
-    pub value: Vec<u8>,
-}
-
-impl fmt::Debug for BytesLiteral {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", self.value)
-    }
-}
-
-#[derive(Clone)]
-pub struct NumberLiteral {
-    pub value: NumberLiteralValue,
-}
-
-impl fmt::Debug for NumberLiteral {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.value.fmt(f)
-    }
-}
-
-#[derive(Clone)]
-pub enum NumberLiteralValue {
-    Int(ast::Int),
-    Float(f64),
-}
-
-impl fmt::Debug for NumberLiteralValue {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Int(value) => write!(f, "{value}"),
-            Self::Float(value) => write!(f, "{value:?}"),
-        }
-    }
-}
-
 pub(crate) fn core_call_expr_with_meta<E>(
     func: E,
     node_index: ast::AtomicNodeIndex,
@@ -573,11 +464,18 @@ pub(crate) fn core_runtime_name_expr_with_meta<E>(
     range: ruff_text_size::TextRange,
 ) -> E
 where
-    E: Instr<Name = UnresolvedName> + From<Load<E>>,
+    E: Instr + From<Load<E>>,
 {
-    Load::new(runtime_symbol(name))
+    Load::new(E::Name::runtime_name(name))
         .with_meta(Meta::new(node_index, range))
         .into()
+}
+
+pub(crate) fn runtime_name_load<E>(name: &str) -> E
+where
+    E: Instr + From<Load<E>>,
+{
+    Load::new(E::Name::runtime_name(name)).into()
 }
 
 pub(crate) fn core_runtime_named_call_expr_with_meta<E>(
@@ -588,7 +486,7 @@ pub(crate) fn core_runtime_named_call_expr_with_meta<E>(
     keywords: Vec<CallArgKeyword<E>>,
 ) -> E
 where
-    E: Instr<Name = UnresolvedName> + From<Call<E>> + From<Load<E>>,
+    E: Instr + From<Call<E>> + From<Load<E>>,
 {
     let func = core_runtime_name_expr_with_meta(func_name, node_index.clone(), range);
     core_call_expr_with_meta(func, node_index, range, args, keywords)
@@ -601,7 +499,7 @@ pub(crate) fn core_runtime_positional_call_expr_with_meta<E>(
     args: Vec<E>,
 ) -> E
 where
-    E: Instr<Name = UnresolvedName> + From<Call<E>> + From<Load<E>>,
+    E: Instr + From<Call<E>> + From<Load<E>>,
 {
     core_runtime_named_call_expr_with_meta(
         func_name,
@@ -612,10 +510,6 @@ where
             .collect(),
         Vec::new(),
     )
-}
-
-pub(crate) fn runtime_symbol(name: &str) -> UnresolvedName {
-    UnresolvedName::RuntimeName(name.into())
 }
 
 #[derive(Debug, Clone)]
@@ -801,10 +695,6 @@ pub trait BlockPyJumpTerm {
 
 pub trait BlockPyFallthroughTerm: BlockPyJumpTerm {
     fn implicit_function_return() -> Self;
-}
-
-pub(crate) trait ImplicitNoneExpr {
-    fn implicit_none_expr() -> Self;
 }
 
 #[derive(Debug, Clone)]
@@ -999,47 +889,9 @@ impl<I: Instr> BlockPyJumpTerm for BlockTerm<I> {
     }
 }
 
-impl ImplicitNoneExpr for InstrWithAwaitAndYield {
-    fn implicit_none_expr() -> Self {
-        core_runtime_name_expr_with_meta("NONE", Default::default(), Default::default())
-    }
-}
-
-impl ImplicitNoneExpr for InstrWithYield {
-    fn implicit_none_expr() -> Self {
-        core_runtime_name_expr_with_meta("NONE", Default::default(), Default::default())
-    }
-}
-
-impl ImplicitNoneExpr for InstrUnresolved {
-    fn implicit_none_expr() -> Self {
-        core_runtime_name_expr_with_meta("NONE", Default::default(), Default::default())
-    }
-}
-
-impl ImplicitNoneExpr for InstrResolved {
-    fn implicit_none_expr() -> Self {
-        Load::new(ResolvedName {
-            id: "NONE".into(),
-            location: NameLocation::RuntimeName,
-        })
-        .into()
-    }
-}
-
-impl ImplicitNoneExpr for InstrCodegen {
-    fn implicit_none_expr() -> Self {
-        Load::new(ResolvedName {
-            id: "NONE".into(),
-            location: NameLocation::RuntimeName,
-        })
-        .into()
-    }
-}
-
-impl<I: Instr + ImplicitNoneExpr> BlockPyFallthroughTerm for BlockTerm<I> {
+impl<I: Instr> BlockPyFallthroughTerm for BlockTerm<I> {
     fn implicit_function_return() -> Self {
-        Self::Return(I::implicit_none_expr())
+        Self::Return(I::constant_none())
     }
 }
 

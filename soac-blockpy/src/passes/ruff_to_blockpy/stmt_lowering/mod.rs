@@ -19,7 +19,7 @@ impl StructuredLoweringBridge {
         lower: impl FnOnce(&mut BlockPyStmtBuilder<E>) -> Result<T, String>,
     ) -> Option<Result<(BlockPyStmtBuilder<E>, T), String>>
     where
-        E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
+        E: RuffToBlockPyExpr,
     {
         try_lower_inline_value_from_structured(name_gen, lower)
     }
@@ -30,7 +30,7 @@ fn try_lower_inline_value_from_structured<E, T>(
     lower: impl FnOnce(&mut BlockPyStmtBuilder<E>) -> Result<T, String>,
 ) -> Option<Result<(BlockPyStmtBuilder<E>, T), String>>
 where
-    E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     let mut structured = BlockPyStmtBuilder::<E>::new(name_gen);
     let value = match lower(&mut structured) {
@@ -50,7 +50,7 @@ pub(super) fn stmts_from_rewrite(rewrite: Rewrite) -> Vec<Stmt> {
 pub(super) fn instrs_from_rewrite(rewrite: Rewrite) -> Vec<InstrRuff> {
     stmts_from_rewrite(rewrite)
         .into_iter()
-        .map(InstrRuff::from_ast_stmt)
+        .map(crate::passes::ast_to_instr::from_ast_stmt)
         .collect()
 }
 
@@ -66,13 +66,13 @@ pub(crate) fn lower_nested_stmt_into_with_expr<E>(
     loop_ctx: Option<&LoopContext>,
 ) -> Result<(), String>
 where
-    E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     if should_simplify_nested_stmt_head(stmt) {
         for simplified in simplify_stmt_head_ast_for_blockpy(context, stmt.clone()) {
             lower_instr_into_with_expr(
                 context,
-                &InstrRuff::from_ast_stmt(simplified),
+                &crate::passes::ast_to_instr::from_ast_stmt(simplified),
                 name_gen,
                 out,
                 loop_ctx,
@@ -82,7 +82,7 @@ where
     } else {
         lower_instr_into_with_expr(
             context,
-            &InstrRuff::from_ast_stmt(stmt.clone()),
+            &crate::passes::ast_to_instr::from_ast_stmt(stmt.clone()),
             name_gen,
             out,
             loop_ctx,
@@ -199,8 +199,12 @@ pub(super) fn simplify_instr_head_for_blockpy(
                 ast::StmtRaise {
                     range: stmt.meta().range,
                     node_index: stmt.meta().node_index,
-                    exc: stmt.exc.map(|expr| Box::new(expr.into_ast_expr())),
-                    cause: stmt.cause.map(|expr| Box::new(expr.into_ast_expr())),
+                    exc: stmt
+                        .exc
+                        .map(|expr| Box::new(crate::passes::ast_to_instr::into_ast_expr(*expr))),
+                    cause: stmt
+                        .cause
+                        .map(|expr| Box::new(crate::passes::ast_to_instr::into_ast_expr(*expr))),
                 },
             ),
         ),
@@ -212,8 +216,10 @@ pub(super) fn simplify_instr_head_for_blockpy(
                 ast::StmtAssert {
                     range: stmt.meta().range,
                     node_index: stmt.meta().node_index,
-                    test: Box::new((*stmt.test).into_ast_expr()),
-                    msg: stmt.msg.map(|expr| Box::new(expr.into_ast_expr())),
+                    test: Box::new(crate::passes::ast_to_instr::into_ast_expr(*stmt.test)),
+                    msg: stmt
+                        .msg
+                        .map(|expr| Box::new(crate::passes::ast_to_instr::into_ast_expr(*expr))),
                 },
             ),
         ),
@@ -223,7 +229,7 @@ pub(super) fn simplify_instr_head_for_blockpy(
                 ast::StmtMatch {
                     range: stmt.meta().range,
                     node_index: stmt.meta().node_index,
-                    subject: Box::new((*stmt.subject).into_ast_expr()),
+                    subject: Box::new(crate::passes::ast_to_instr::into_ast_expr(*stmt.subject)),
                     cases: stmt.cases,
                 },
             ),
@@ -253,9 +259,9 @@ pub(super) fn simplify_instr_head_for_blockpy(
                 ast::StmtTypeAlias {
                     range: stmt.meta().range,
                     node_index: stmt.meta().node_index,
-                    name: Box::new(stmt.name.into_ast_expr()),
+                    name: Box::new(crate::passes::ast_to_instr::into_ast_expr(*stmt.name)),
                     type_params: stmt.type_params,
-                    value: Box::new((*stmt.value).into_ast_expr()),
+                    value: Box::new(crate::passes::ast_to_instr::into_ast_expr(*stmt.value)),
                 },
             ),
         ),
@@ -267,12 +273,11 @@ fn finish_stmt_head_ast_for_blockpy(_context: &Context, stmts: Vec<Stmt>) -> Vec
     match stmts.as_slice() {
         [Stmt::If(if_stmt)] => {
             let mut if_stmt = if_stmt.clone();
-            if_stmt.test = Box::new(
+            let lowered_test =
                 crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_head_ast_for_blockpy(
-                    crate::passes::InstrRuff::from_ast_expr(*if_stmt.test),
-                )
-                .into_ast_expr(),
-            );
+                    crate::passes::ast_to_instr::from_ast_expr(*if_stmt.test),
+                );
+            if_stmt.test = Box::new(crate::passes::ast_to_instr::into_ast_expr(lowered_test));
             vec![Stmt::If(if_stmt)]
         }
         [_] | [] => stmts,
@@ -344,7 +349,7 @@ pub(crate) fn lower_instr_into_with_expr<E>(
     loop_ctx: Option<&LoopContext>,
 ) -> Result<(), String>
 where
-    E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     let lower_simplified =
         |instrs: Vec<InstrRuff>, out: &mut BlockPyStmtBuilder<E>| -> Result<(), String> {

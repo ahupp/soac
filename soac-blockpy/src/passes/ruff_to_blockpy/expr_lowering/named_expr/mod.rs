@@ -10,7 +10,7 @@ fn into_store_name(name: ast::name::Name) -> ast::name::Name {
 }
 
 fn into_load_name(name: ast::ExprName) -> InstrRuff {
-    InstrRuff::from_ast_expr(ast::Expr::Name(ast::ExprName {
+    crate::passes::ast_to_instr::from_ast_expr(ast::Expr::Name(ast::ExprName {
         id: name.id,
         ctx: ast::ExprContext::Load,
         range: name.range,
@@ -26,7 +26,7 @@ pub(super) fn lower_named_expr_into<L, E>(
 ) -> Result<InstrRuff, String>
 where
     L: BlockPySetupExprLowerer + ?Sized,
-    E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     let crate::block_py::ExprNamed { target, value, .. } = named_expr;
     let InstrRuff::ExprName(target_name) = *target else {

@@ -2,7 +2,6 @@ use crate::block_py::InstrWithAwaitAndYield;
 use crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup;
 use crate::passes::ruff_to_blockpy::stmt_lowering::BlockPyStmtBuilder;
 use crate::passes::ruff_to_blockpy::test_name_gen;
-use crate::passes::InstrRuff;
 use crate::py_expr;
 use ruff_python_parser::parse_expression;
 
@@ -11,7 +10,7 @@ fn nested_boolop_in_call_argument_emits_setup_via_expr_lowering() {
     let name_gen = test_name_gen();
     let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new(&name_gen);
     let lowered: InstrWithAwaitAndYield = lower_expr_into_with_setup(
-        InstrRuff::from_ast_expr(py_expr!("f(a and b)")),
+        crate::passes::ast_to_instr::from_ast_expr(py_expr!("f(a and b)")),
         &mut out,
         None,
     )
@@ -28,7 +27,7 @@ fn direct_core_expr_lowering_materializes_make_function_operation() {
     let name_gen = test_name_gen();
     let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new(&name_gen);
     let lowered = lower_expr_into_with_setup(
-        InstrRuff::from_ast_expr(py_expr!(
+        crate::passes::ast_to_instr::from_ast_expr(py_expr!(
             "__soac__.make_function(7, \"function\", __soac__.tuple_values(), __soac__.tuple_values(), None)"
         )),
         &mut out,
@@ -57,7 +56,7 @@ fn direct_core_expr_lowering_materializes_live_operation_helpers() {
         let name_gen = test_name_gen();
         let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new(&name_gen);
         let lowered = lower_expr_into_with_setup(
-            InstrRuff::from_ast_expr(*parse_expression(source).unwrap().into_syntax().body),
+            crate::passes::ast_to_instr::from_ast_expr(*parse_expression(source).unwrap().into_syntax().body),
             &mut out,
             None,
         )

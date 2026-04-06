@@ -1,6 +1,6 @@
 use crate::block_py::{
-    literal_expr, Block, BlockLabel, BlockTerm, CallArgPositional, GetAttr, InstrResolved, Literal,
-    NameLocation, ResolvedName, StringLiteral, WithMeta,
+    literal_expr, Block, BlockLabel, BlockTerm, CallArgPositional, GetAttr, Instr, InstrResolved,
+    Literal, NameLocation, ResolvedName, StringLiteral, WithMeta,
 };
 use crate::passes::ruff_to_blockpy::{
     lower_structured_located_blocks_to_bb_blocks, populate_exception_edge_args,
@@ -125,7 +125,7 @@ fn exception_edges_seed_hidden_try_exception_locals_from_current_exception() {
             label: BlockLabel::from_index(0),
             body: Vec::new(),
             term: BlockTerm::<InstrResolved>::Return(
-                <InstrResolved as crate::block_py::ImplicitNoneExpr>::implicit_none_expr(),
+                InstrResolved::constant_none(),
             ),
             params: vec![crate::block_py::BlockParam {
                 name: "_dp_outer_exc".to_string(),
@@ -159,7 +159,7 @@ fn exception_edges_seed_hidden_try_exception_locals_from_current_exception() {
             label: BlockLabel::from_index(2),
             body: Vec::new(),
             term: BlockTerm::<InstrResolved>::Return(
-                <InstrResolved as crate::block_py::ImplicitNoneExpr>::implicit_none_expr(),
+                InstrResolved::constant_none(),
             ),
             params: Vec::new(),
             exc_edge: None,

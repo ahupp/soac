@@ -23,7 +23,7 @@ fn stmt_raise_simplify_ast_desugars_raise_from_before_blockpy_lowering() {
 #[test]
 fn stmt_raise_to_blockpy_handles_bare_raise_directly() {
     let stmt = py_stmt!("raise");
-    let raise_stmt = InstrRuff::from_ast_stmt(stmt);
+    let raise_stmt = crate::passes::ast_to_instr::from_ast_stmt(stmt);
     let context = Context::new("");
     let name_gen = test_name_gen();
     let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new(&name_gen);
@@ -37,7 +37,7 @@ fn stmt_raise_to_blockpy_handles_bare_raise_directly() {
 #[test]
 fn stmt_expr_to_blockpy_emits_setup_for_named_exprs() {
     let stmt = py_stmt!("(x := y)");
-    let expr_stmt = InstrRuff::from_ast_stmt(stmt);
+    let expr_stmt = crate::passes::ast_to_instr::from_ast_stmt(stmt);
     let context = Context::new("");
     let name_gen = test_name_gen();
     let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new(&name_gen);
@@ -55,7 +55,7 @@ fn stmt_expr_to_blockpy_emits_setup_for_named_exprs() {
 fn stmt_return_to_blockpy_sets_terminator_for_plain_value() {
     let stmt = py_stmt!("return value");
     let context = Context::new("");
-    let return_stmt = InstrRuff::from_ast_stmt(stmt);
+    let return_stmt = crate::passes::ast_to_instr::from_ast_stmt(stmt);
     let name_gen = test_name_gen();
     let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new(&name_gen);
     lower_instr_for_test(&context, &return_stmt, &name_gen, &mut out, None)
@@ -70,7 +70,7 @@ fn stmt_return_to_blockpy_sets_terminator_for_plain_value() {
 fn stmt_raise_to_blockpy_sets_terminator_for_plain_exc() {
     let stmt = py_stmt!("raise exc");
     let context = Context::new("");
-    let raise_stmt = InstrRuff::from_ast_stmt(stmt);
+    let raise_stmt = crate::passes::ast_to_instr::from_ast_stmt(stmt);
     let name_gen = test_name_gen();
     let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new(&name_gen);
     lower_instr_for_test(&context, &raise_stmt, &name_gen, &mut out, None)
@@ -88,7 +88,7 @@ fn stmt_raise_to_blockpy_sets_terminator_for_plain_exc() {
 fn stmt_break_to_blockpy_uses_loop_jump() {
     let stmt = py_stmt!("break");
     let context = Context::new("");
-    let break_stmt = InstrRuff::from_ast_stmt(stmt);
+    let break_stmt = crate::passes::ast_to_instr::from_ast_stmt(stmt);
     let loop_ctx = LoopContext {
         continue_label: BlockLabel::from_index(7),
         break_label: BlockLabel::from_index(9),
@@ -114,7 +114,7 @@ fn stmt_break_to_blockpy_uses_loop_jump() {
 #[test]
 fn stmt_return_to_blockpy_emits_setup_for_if_exprs() {
     let stmt = py_stmt!("return x if cond else y");
-    let return_stmt = InstrRuff::from_ast_stmt(stmt);
+    let return_stmt = crate::passes::ast_to_instr::from_ast_stmt(stmt);
     let context = Context::new("");
     let name_gen = test_name_gen();
     let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new(&name_gen);

@@ -247,8 +247,7 @@ mod tests {
     use super::*;
     use crate::block_py::{
         BlockEdge, Call, CallArgPositional, CallDirect, CalleeFunctionId, FunctionId, HasMeta,
-        ImplicitNoneExpr, InstrCodegen, InstrId, Load, Meta, NameLocation, ResolvedName,
-        TermBranchTable, WithMeta,
+        InstrCodegen, InstrId, Load, Meta, NameLocation, ResolvedName, TermBranchTable, WithMeta,
     };
     use crate::passes::InstrRuff;
     use crate::py_expr;
@@ -469,7 +468,7 @@ mod tests {
     fn opt_block_accepts_fallthrough_fragment() {
         let entry = Block::new(
             BlockLabel::from_index(0),
-            vec![InstrRuff::from_ast_expr(py_expr!("x"))],
+            vec![crate::passes::ast_to_instr::from_ast_expr(py_expr!("x"))],
             BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())),
             Vec::new(),
             None,
@@ -507,7 +506,7 @@ mod tests {
         let entry = Block::new(
             BlockLabel::from_index(0),
             Vec::<InstrRuff>::new(),
-            BlockTerm::Return(InstrRuff::implicit_none_expr()),
+            BlockTerm::Return(InstrRuff::constant_none()),
             Vec::new(),
             None,
         );

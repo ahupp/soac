@@ -209,7 +209,7 @@ pub(crate) trait BlockPySetupExprLowerer {
         loop_ctx: Option<&LoopContext>,
     ) -> Result<InstrRuff, String>
     where
-        E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
+        E: RuffToBlockPyExpr,
     {
         let expr = lower_string_templates_in_instr_ruff(expr);
         recursive::lower_expr_ast_recursive(self, expr, out, loop_ctx)
@@ -222,7 +222,7 @@ pub(crate) trait BlockPySetupExprLowerer {
         loop_ctx: Option<&LoopContext>,
     ) -> Result<E, String>
     where
-        E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
+        E: RuffToBlockPyExpr,
     {
         Ok(E::from_lowered_expr(
             self.lower_expr_instr_into(expr, out, loop_ctx)?,
@@ -247,7 +247,7 @@ pub(crate) fn lower_expr_into_with_setup<E>(
     loop_ctx: Option<&LoopContext>,
 ) -> Result<E, String>
 where
-    E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     AstSetupExprLowerer.lower_expr_into(expr, out, loop_ctx)
 }

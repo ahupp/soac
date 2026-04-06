@@ -30,7 +30,7 @@ match x:
     case 1:
         y = 1"
     );
-    let match_stmt = crate::passes::InstrRuff::from_ast_stmt(stmt);
+    let match_stmt = crate::passes::ast_to_instr::from_ast_stmt(stmt);
     let context = Context::new("");
     let name_gen = test_name_gen();
     let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new(&name_gen);

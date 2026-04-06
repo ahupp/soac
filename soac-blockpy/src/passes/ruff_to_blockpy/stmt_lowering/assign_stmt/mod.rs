@@ -7,10 +7,10 @@ fn rhs_temp_name(name: &str) -> ast::name::Name {
     name.into()
 }
 
-pub(super) fn temp_load_expr<E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr>(
+pub(super) fn temp_load_expr<E: RuffToBlockPyExpr>(
     name: &str,
 ) -> E {
-    E::from_lowered_expr(InstrRuff::from_ast_expr(Expr::Name(ast::ExprName {
+    E::from_lowered_expr(crate::passes::ast_to_instr::from_ast_expr(Expr::Name(ast::ExprName {
         id: rhs_temp_name(name),
         ctx: ast::ExprContext::Load,
         range: Default::default(),
@@ -18,7 +18,7 @@ pub(super) fn temp_load_expr<E: RuffToBlockPyExpr + crate::block_py::ImplicitNon
     })))
 }
 
-pub(super) fn bind_temp<E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr>(
+pub(super) fn bind_temp<E: RuffToBlockPyExpr>(
     out: &mut BlockPyStmtBuilder<E>,
     name: String,
     value: E,
@@ -29,7 +29,7 @@ pub(super) fn bind_temp<E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr
     temp_load_expr(&name)
 }
 
-fn delete_temp<E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr>(
+fn delete_temp<E: RuffToBlockPyExpr>(
     out: &mut BlockPyStmtBuilder<E>,
     name: String,
 ) {
@@ -39,7 +39,7 @@ fn delete_temp<E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr>(
 }
 
 pub(super) fn lower_target_object_with_setup<
-    E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 >(
     target_value: InstrRuff,
     out: &mut BlockPyStmtBuilder<E>,
@@ -69,7 +69,7 @@ fn lower_assignment_target_into<E>(
     loop_ctx: Option<&LoopContext>,
 ) -> Result<(), String>
 where
-    E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     match target {
         InstrRuff::ExprTuple(tuple) => lower_unpack_target_into(
@@ -146,7 +146,7 @@ fn lower_unpack_target_into<E>(
     kind: UnpackTargetKind,
 ) -> Result<(), String>
 where
-    E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     let mut starred_seen = false;
     let mut spec_elts = Vec::new();
@@ -172,13 +172,13 @@ where
         "unpack",
         vec![
             value,
-            E::from_lowered_expr(InstrRuff::from_ast_expr(spec_expr)),
+            E::from_lowered_expr(crate::passes::ast_to_instr::from_ast_expr(spec_expr)),
         ],
     );
     let unpacked_temp = bind_temp(out, unpacked_name.clone(), unpacked_value);
 
     for (index, elt) in elts.into_iter().enumerate() {
-        let index_expr = E::from_lowered_expr(InstrRuff::from_ast_expr(py_expr!(
+        let index_expr = E::from_lowered_expr(crate::passes::ast_to_instr::from_ast_expr(py_expr!(
             "{index:literal}",
             index = index as i64
         )));
@@ -234,7 +234,7 @@ pub(crate) fn lower_assign_instr_into<E>(
     loop_ctx: Option<&LoopContext>,
 ) -> Result<(), String>
 where
-    E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     let mut value = crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
         (*stmt.value).clone(),
@@ -259,7 +259,7 @@ pub(crate) fn build_for_target_assign_body(
     tmp_name: &str,
 ) -> Vec<InstrRuff> {
     let tmp_name_expr = |ctx| {
-        InstrRuff::from_ast_expr(Expr::Name(ast::ExprName {
+        crate::passes::ast_to_instr::from_ast_expr(Expr::Name(ast::ExprName {
             id: rhs_temp_name(tmp_name),
             ctx,
             range: Default::default(),

@@ -1,7 +1,7 @@
 use crate::block_py::{
     build_storage_layout_from_capture_names, compute_make_function_capture_bindings_from_scope,
     compute_storage_layout_from_scope, core_runtime_positional_call_expr_with_meta, literal_expr,
-    runtime_symbol, BindingKind, BindingPurpose, BindingTarget, BlockArg, BlockPyFunction,
+    BindingKind, BindingPurpose, BindingTarget, BlockArg, BlockPyFunction,
     BlockPyModule, BlockTerm, Call, CallArgPositional, CallableScopeInfo, CallableScopeKind,
     CellBindingKind, CellCaptureBinding, CellLocation, CellRef, CellRefForName, ChildVisitable,
     ClassBodyFallback, ClosureInit, ClosureSlot, Del, DelItem, EffectiveBinding, FunctionId,
@@ -513,7 +513,7 @@ fn core_name_expr(
                 | "make_function"
         )
     {
-        return Load::new(runtime_symbol(id))
+        return Load::new(<UnresolvedName as NameLike>::runtime_name(id))
             .with_meta(crate::block_py::Meta::new(node_index, range))
             .into();
     }

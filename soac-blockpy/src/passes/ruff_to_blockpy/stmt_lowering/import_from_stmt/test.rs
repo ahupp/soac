@@ -21,7 +21,7 @@ fn stmt_importfrom_simplify_ast_desugars_before_blockpy_lowering() {
 #[test]
 fn stmt_importfrom_to_blockpy_uses_trait_owned_simplification_path() {
     let stmt = py_stmt!("from math import sqrt");
-    let import_stmt = crate::passes::InstrRuff::from_ast_stmt(stmt);
+    let import_stmt = crate::passes::ast_to_instr::from_ast_stmt(stmt);
     let context = Context::new("");
     let name_gen = test_name_gen();
     let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new(&name_gen);

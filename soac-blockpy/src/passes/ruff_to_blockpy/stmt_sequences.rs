@@ -1,6 +1,6 @@
 use super::stmt_lowering::{lower_instr_into_with_expr, plan_instr_head_for_blockpy};
 use super::*;
-use crate::block_py::{BlockTerm, ImplicitNoneExpr, Instr, TermRaise};
+use crate::block_py::{BlockTerm, Instr, TermRaise};
 use crate::passes::ast_to_ast::context::Context;
 use crate::passes::InstrRuff;
 
@@ -10,7 +10,7 @@ pub(crate) fn lower_stmts_to_blockpy_stmts_with_context<E>(
     name_gen: &FunctionNameGen,
 ) -> Result<crate::passes::ruff_to_blockpy::stmt_lowering::BlockPyStmtBuilder<E>, String>
 where
-    E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     let mut out =
         crate::passes::ruff_to_blockpy::stmt_lowering::BlockPyStmtBuilder::<E>::new(name_gen);
@@ -102,7 +102,7 @@ fn contains_return_stmt_in_body(stmts: &[Stmt]) -> bool {
     stmts
         .iter()
         .cloned()
-        .map(InstrRuff::from_ast_stmt)
+        .map(crate::passes::ast_to_instr::from_ast_stmt)
         .any(|stmt| contains_return_instr(&stmt))
 }
 
@@ -143,7 +143,7 @@ pub(crate) fn lower_common_stmt_sequence_head<FSeq, E>(
 ) -> Option<BlockLabel>
 where
     FSeq: FnMut(&[InstrRuff], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
-    E: RuffToBlockPyExpr + ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     match plan {
         StmtSequenceHeadPlan::Raise(raise_stmt) => Some(
@@ -246,7 +246,7 @@ pub(crate) fn lower_for_stmt_sequence_head<F, E>(
 ) -> BlockLabel
 where
     F: FnMut(&[InstrRuff], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
-    E: RuffToBlockPyExpr + ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     let assign_label = name_gen.next_block_name();
     let setup_label = name_gen.next_block_name();
@@ -277,7 +277,7 @@ pub(crate) fn lower_stmt_sequence_with_state<E>(
     name_gen: &FunctionNameGen,
 ) -> BlockLabel
 where
-    E: RuffToBlockPyExpr + ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     lower_instr_stmt_sequence_with_state(context, stmts, targets, blocks, name_gen)
 }
@@ -290,7 +290,7 @@ fn lower_instr_stmt_sequence_with_state<E>(
     name_gen: &FunctionNameGen,
 ) -> BlockLabel
 where
-    E: RuffToBlockPyExpr + ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     if stmts.is_empty() {
         return targets.normal_cont;
@@ -380,7 +380,7 @@ where
                 let loop_continue_label = loop_check_label.clone();
                 let assign_body = build_for_target_assign_body(
                     *for_stmt.target.clone(),
-                    InstrRuff::from_ast_expr(py_expr!("{name:id}", name = tmp_name.as_str())),
+                    crate::passes::ast_to_instr::from_ast_expr(py_expr!("{name:id}", name = tmp_name.as_str())),
                     tmp_name.as_str(),
                 );
                 return lower_for_stmt_sequence_head(
@@ -511,7 +511,7 @@ pub(crate) fn lower_expanded_stmt_sequence<F, E>(
 ) -> BlockLabel
 where
     F: FnMut(&[InstrRuff], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
-    E: RuffToBlockPyExpr + ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     let mut expanded = desugared_stmts;
     expanded.extend_from_slice(remaining_stmts);
@@ -548,7 +548,7 @@ pub(crate) fn lower_if_stmt_sequence<F, E>(
 ) -> BlockLabel
 where
     F: FnMut(&[InstrRuff], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
-    E: RuffToBlockPyExpr + ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     let then_entry = lower_region(
         then_body,
@@ -593,7 +593,7 @@ pub(crate) fn lower_if_stmt_sequence_from_stmt<F, E>(
 ) -> BlockLabel
 where
     F: FnMut(&[InstrRuff], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
-    E: RuffToBlockPyExpr + ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     let rest_entry = lower_region(remaining_stmts, targets.clone(), blocks);
     let loop_ctx = targets.loop_labels.as_ref().map(|loop_labels| LoopContext {
@@ -657,7 +657,7 @@ pub(crate) fn lower_while_stmt_sequence<F, E>(
 ) -> BlockLabel
 where
     F: FnMut(&[InstrRuff], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
-    E: RuffToBlockPyExpr + ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     let rest_entry = lower_region(remaining_stmts, targets.clone(), blocks);
     let cond_false_entry = if else_body.is_empty() {
@@ -705,7 +705,7 @@ pub(crate) fn lower_while_stmt_sequence_from_stmt<F, E>(
 ) -> BlockLabel
 where
     F: FnMut(&[InstrRuff], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
-    E: RuffToBlockPyExpr + ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     let body = &while_stmt.body.to_vec();
     let else_body = &while_stmt.orelse.to_vec();
@@ -734,7 +734,7 @@ pub(crate) fn lower_for_stmt_exit_entries<F, E>(
 ) -> (BlockLabel, BlockLabel)
 where
     F: FnMut(&[InstrRuff], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
-    E: ImplicitNoneExpr + Instr,
+    E: Instr,
 {
     let rest_entry = lower_region(remaining_stmts, targets.clone(), blocks);
     let exhausted_entry = if else_body.is_empty() {
@@ -755,7 +755,7 @@ pub(crate) fn lower_for_stmt_body_entry<F, E>(
 ) -> BlockLabel
 where
     F: FnMut(&[InstrRuff], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
-    E: ImplicitNoneExpr + Instr,
+    E: Instr,
 {
     let body_entry = lower_region(
         body,
@@ -791,7 +791,7 @@ pub(crate) fn lower_for_stmt_sequence<F, E>(
 ) -> BlockLabel
 where
     F: FnMut(&[InstrRuff], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
-    E: RuffToBlockPyExpr + ImplicitNoneExpr,
+    E: RuffToBlockPyExpr,
 {
     let else_body = &for_stmt.orelse.to_vec();
     let (rest_entry, exhausted_entry) = lower_for_stmt_exit_entries(

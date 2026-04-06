@@ -205,14 +205,14 @@ pub fn lower_string_templates_in_expr(expr: &mut Expr) {
 pub fn lower_string_templates_in_instr_ruff(expr: InstrRuff) -> InstrRuff {
     match expr {
         InstrRuff::ExprFString(node) => {
-            InstrRuff::from_ast_expr(rewrite_fstring(ast::ExprFString {
+            crate::passes::ast_to_instr::from_ast_expr(rewrite_fstring(ast::ExprFString {
                 range: node.meta().range,
                 node_index: node.meta().node_index,
                 value: node.value,
             }))
         }
         InstrRuff::ExprTString(node) => {
-            InstrRuff::from_ast_expr(rewrite_tstring(ast::ExprTString {
+            crate::passes::ast_to_instr::from_ast_expr(rewrite_tstring(ast::ExprTString {
                 range: node.meta().range,
                 node_index: node.meta().node_index,
                 value: node.value,
