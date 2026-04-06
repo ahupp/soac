@@ -21,7 +21,9 @@ use std::sync::Once;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tower_http::services::ServeDir;
 
-pub use counter_dump::{CounterDumpFile, CounterDumpRecordView, CounterDumpRowView};
+pub use counter_dump::{
+    CounterDumpFile, CounterDumpRecordView, CounterDumpRowView, parse_counter_dump_records,
+};
 
 static NEXT_WEB_MODULE_ID: AtomicU64 = AtomicU64::new(1);
 static PYTHON_INIT: Once = Once::new();

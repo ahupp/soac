@@ -685,60 +685,7 @@ _call-target-specializations-from-dump dump_path:
   #!/usr/bin/env bash
   set -euo pipefail
   cd "$REPO_ROOT"
-  cargo run -q -p soac-inspector --bin inspect_counters -- "{{dump_path}}" \
-    | awk '
-        /^record=/ {
-          module = "";
-          for (i = 1; i <= NF; i++) {
-            if ($i ~ /^module=/) {
-              module = substr($i, 8);
-            }
-          }
-          next;
-        }
-        / kind=call_hot_targets / {
-          site_function_id = "";
-          instr_id = "";
-          observed_value = "-";
-          for (i = 1; i <= NF; i++) {
-            if ($i ~ /^site_function_id=/) {
-              site_function_id = substr($i, 18);
-            } else if ($i ~ /^instr_id=/) {
-              instr_id = substr($i, 10);
-            } else if ($i ~ /^observed_value=/) {
-              observed_value = substr($i, 16);
-            }
-          }
-          if (module == "" || site_function_id == "" || instr_id == "-" || observed_value == "-" || observed_value == "0") {
-            next;
-          }
-          if (instr_id !~ /^bb[0-9]+:[0-9]+$/) {
-            next;
-          }
-          split(substr(instr_id, 3), instr_parts, ":");
-          key = module "|" site_function_id "|" instr_parts[1] "|" instr_parts[2];
-          target_key = key "|" observed_value;
-          if (!(target_key in seen)) {
-            seen[target_key] = 1;
-            if (key in targets) {
-              targets[key] = targets[key] "," observed_value;
-            } else {
-              order[++count] = key;
-              targets[key] = observed_value;
-            }
-          }
-        }
-        END {
-          for (i = 1; i <= count; i++) {
-            key = order[i];
-            printf "%s=%s", key, targets[key];
-            if (i < count) {
-              printf ";";
-            }
-          }
-          printf "\n";
-        }
-      '
+  cargo run -q -p soac-inspector --bin inspect_counters -- --specializations "{{dump_path}}"
 
 benchmark-warm loops="8000000": (update-venv) (build-extension "release")
   #!/usr/bin/env bash
