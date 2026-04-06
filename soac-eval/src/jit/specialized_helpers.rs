@@ -16,10 +16,13 @@ use crate::module_constants::load_runtime_name_owned;
 #[cfg(not(test))]
 unsafe extern "C" {
     static mut PyCell_Type: ffi::PyTypeObject;
+    static mut PyMethod_Type: ffi::PyTypeObject;
     fn PyCell_New(obj: *mut ffi::PyObject) -> *mut ffi::PyObject;
     fn PyCell_Get(cell: *mut ffi::PyObject) -> *mut ffi::PyObject;
     fn PyCell_Set(cell: *mut ffi::PyObject, value: *mut ffi::PyObject) -> libc::c_int;
     fn PyErr_SetRaisedException(exc: *mut ffi::PyObject);
+    fn PyMethod_Function(method: *mut ffi::PyObject) -> *mut ffi::PyObject;
+    fn PyFunction_GetSoacFunctionId(function: *mut ffi::PyObject) -> u64;
 }
 
 pub type ObjPtr = *mut c_void;
@@ -95,20 +98,25 @@ unsafe extern "C" fn py_vectorcall_hook(
 
 #[cfg(not(test))]
 unsafe extern "C" fn callee_function_id_hook(callable: ObjPtr) -> i64 {
-    let function = resolve_function_object(callable);
+    let callable = callable as *mut ffi::PyObject;
+    if callable.is_null() {
+        return i64::MIN;
+    }
+    let function = if ffi::PyFunction_Check(callable) != 0 {
+        callable
+    } else if ffi::Py_TYPE(callable) == std::ptr::addr_of_mut!(PyMethod_Type) {
+        PyMethod_Function(callable)
+    } else {
+        return 0;
+    };
     if function.is_null() {
         return i64::MIN;
     }
-    let packed = match crate::registered_clif_function_id(function as *mut ffi::PyObject) {
-        Ok(Some(function_id)) => function_id.packed() as i64,
-        Ok(None) => 0,
-        Err(()) => {
-            ffi::Py_DECREF(function as *mut ffi::PyObject);
-            return i64::MIN;
-        }
-    };
-    ffi::Py_DECREF(function as *mut ffi::PyObject);
-    packed
+    let packed_plus_one = PyFunction_GetSoacFunctionId(function);
+    if packed_plus_one == 0 {
+        return 0;
+    }
+    (packed_plus_one - 1) as i64
 }
 
 #[cfg(not(test))]

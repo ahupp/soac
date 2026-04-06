@@ -39,6 +39,14 @@ use std::time::Instant;
 
 unsafe extern "C" {
     fn PyFunction_SetVectorcall(func: *mut ffi::PyFunctionObject, vectorcall: ffi::vectorcallfunc);
+    fn PyFunction_SetSoacMetadata(
+        function: *mut ffi::PyObject,
+        soac_function_id: u64,
+        metadata: *mut c_void,
+        destructor: Option<unsafe extern "C" fn(*mut c_void)>,
+    ) -> i32;
+    fn PyFunction_GetSoacMetadata(function: *mut ffi::PyObject) -> *mut c_void;
+    fn PyFunction_GetSoacFunctionId(function: *mut ffi::PyObject) -> u64;
     fn PyFunction_AddWatcher(callback: PyFunctionWatchCallback) -> i32;
     fn PyType_Modified(type_obj: *mut ffi::PyTypeObject);
     fn PyUnstable_Type_AssignVersionTag(type_obj: *mut ffi::PyTypeObject) -> i32;
@@ -183,9 +191,6 @@ fn set_runtime_error<T>(msg: &str) -> Result<T, ()> {
     Err(())
 }
 
-const CLIF_VECTORCALL_CAPSULE_NAME: &[u8] = b"soac.clif_vectorcall_data\0";
-const CLIF_VECTORCALL_ATTR: &[u8] = b"__dp_clif_vectorcall_data\0";
-
 thread_local! {
     static ACTIVE_MODULE_RUNTIME_STACK: RefCell<Vec<*mut jit::ModuleRuntimeContext>> = const {
         RefCell::new(Vec::new())
@@ -245,30 +250,13 @@ fn set_type_error<T>(msg: &str) -> Result<T, ()> {
     Err(())
 }
 
-unsafe fn free_clif_function_data(ptr: *mut c_void) {
+unsafe extern "C" fn free_clif_function_data(ptr: *mut c_void) {
     if ptr.is_null() {
         return;
     }
     let data = unsafe { Box::from_raw(ptr as *mut ClifFunctionData) };
     unsafe { jit::free_cranelift_run_bb_specialized_cached(data.compiled_handle) };
     unsafe { jit::free_cranelift_vectorcall_trampoline(data.compiled_vectorcall_handle) };
-}
-
-unsafe extern "C" fn free_clif_vectorcall_capsule(capsule: *mut ffi::PyObject) {
-    if capsule.is_null() {
-        return;
-    }
-    let ptr = unsafe {
-        ffi::PyCapsule_GetPointer(
-            capsule,
-            CLIF_VECTORCALL_CAPSULE_NAME.as_ptr() as *const c_char,
-        )
-    };
-    if !ptr.is_null() {
-        unsafe { free_clif_function_data(ptr) };
-    } else if !unsafe { ffi::PyErr_Occurred() }.is_null() {
-        unsafe { ffi::PyErr_Clear() };
-    }
 }
 
 unsafe fn py_string(obj: *mut ffi::PyObject) -> Result<String, ()> {
@@ -501,20 +489,9 @@ unsafe fn clif_vectorcall_data(
         );
         return Err(());
     }
-    let dict = (*(function as *mut ffi::PyFunctionObject)).func_dict;
-    if dict.is_null() {
-        return set_runtime_error("missing CLIF vectorcall metadata dictionary");
-    }
-    let capsule = ffi::PyDict_GetItemString(dict, CLIF_VECTORCALL_ATTR.as_ptr() as *const c_char);
-    if capsule.is_null() {
-        return set_runtime_error("missing CLIF vectorcall metadata capsule");
-    }
-    let ptr = ffi::PyCapsule_GetPointer(
-        capsule,
-        CLIF_VECTORCALL_CAPSULE_NAME.as_ptr() as *const c_char,
-    );
+    let ptr = PyFunction_GetSoacMetadata(function);
     if ptr.is_null() {
-        return Err(());
+        return set_runtime_error("missing CLIF vectorcall metadata");
     }
     Ok(&mut *(ptr as *mut ClifFunctionData))
 }
@@ -525,23 +502,11 @@ pub unsafe fn registered_clif_function_id(
     if ffi::PyFunction_Check(function) == 0 {
         return Ok(None);
     }
-    let dict = (*(function as *mut ffi::PyFunctionObject)).func_dict;
-    if dict.is_null() {
+    let packed_plus_one = PyFunction_GetSoacFunctionId(function);
+    if packed_plus_one == 0 {
         return Ok(None);
     }
-    let capsule = ffi::PyDict_GetItemString(dict, CLIF_VECTORCALL_ATTR.as_ptr() as *const c_char);
-    if capsule.is_null() {
-        return Ok(None);
-    }
-    let ptr = ffi::PyCapsule_GetPointer(
-        capsule,
-        CLIF_VECTORCALL_CAPSULE_NAME.as_ptr() as *const c_char,
-    );
-    if ptr.is_null() {
-        return Err(());
-    }
-    let data = &*(ptr as *const ClifFunctionData);
-    Ok(Some(data.function.function_id))
+    Ok(Some(FunctionId::from_packed(packed_plus_one - 1)))
 }
 
 unsafe fn register_owner_type_for_function(
@@ -729,14 +694,20 @@ pub unsafe fn lookup_exact_owner_types_for_method(
 }
 
 unsafe fn maybe_register_current_module_owner_types() {
-    let Ok(result) = with_current_module_runtime_context(|runtime| unsafe {
+    let Some(runtime) =
+        ACTIVE_MODULE_RUNTIME_STACK.with(|stack| stack.borrow().last().copied())
+    else {
+        return;
+    };
+    let result = unsafe {
+        let runtime = &*runtime;
         let Ok(module_name) = CString::new(runtime.shared_module_state_owner.module_name.as_str())
         else {
-            return Ok(());
+            return;
         };
         let module_name_obj = ffi::PyUnicode_FromString(module_name.as_ptr());
         if module_name_obj.is_null() {
-            return Err(());
+            return;
         }
         let result = register_function_owner_types_for_globals(
             runtime.vmctx.globals_obj as *mut ffi::PyObject,
@@ -744,8 +715,6 @@ unsafe fn maybe_register_current_module_owner_types() {
         );
         ffi::Py_DECREF(module_name_obj);
         result
-    }) else {
-        return;
     };
     if result.is_err() {
         ffi::PyErr_Clear();
@@ -1396,44 +1365,32 @@ pub unsafe fn register_clif_vectorcall(
         return Err(());
     }
     let func = function as *mut ffi::PyFunctionObject;
-    if !(*func).func_dict.is_null()
-        && !ffi::PyDict_GetItemString(
-            (*func).func_dict,
-            CLIF_VECTORCALL_ATTR.as_ptr() as *const c_char,
-        )
-        .is_null()
-    {
+    if !PyFunction_GetSoacMetadata(function).is_null() {
         PyFunction_SetVectorcall(func, lazy_clif_vectorcall);
         return Ok(());
     }
 
     let data_ptr = make_clif_function_data(function, function_id, module_runtime)?;
-    let capsule = ffi::PyCapsule_New(
+    let packed_plus_one = function_id
+        .packed()
+        .checked_add(1)
+        .ok_or_else(|| {
+            ffi::PyErr_SetString(
+                ffi::PyExc_RuntimeError,
+                c"SOAC function id overflow".as_ptr(),
+            );
+        })
+        .map_err(|_| ())?;
+    if PyFunction_SetSoacMetadata(
+        function,
+        packed_plus_one,
         data_ptr,
-        CLIF_VECTORCALL_CAPSULE_NAME.as_ptr() as *const c_char,
-        Some(free_clif_vectorcall_capsule),
-    );
-    if capsule.is_null() {
+        Some(free_clif_function_data),
+    ) != 0
+    {
         free_clif_function_data(data_ptr);
         return Err(());
     }
-    if (*func).func_dict.is_null() {
-        (*func).func_dict = ffi::PyDict_New();
-        if (*func).func_dict.is_null() {
-            ffi::Py_DECREF(capsule);
-            return Err(());
-        }
-    }
-    if ffi::PyDict_SetItemString(
-        (*func).func_dict,
-        CLIF_VECTORCALL_ATTR.as_ptr() as *const c_char,
-        capsule,
-    ) != 0
-    {
-        ffi::Py_DECREF(capsule);
-        return Err(());
-    }
-    ffi::Py_DECREF(capsule);
     PyFunction_SetVectorcall(func, lazy_clif_vectorcall);
     Ok(())
 }
@@ -1455,6 +1412,7 @@ pub unsafe fn compile_clif_vectorcall(function: *mut ffi::PyObject) -> Result<()
 mod tests {
     use super::*;
     use pyo3::types::{PyDict, PyModule};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     unsafe extern "C" {
         fn PyUnstable_Type_AssignVersionTag(type_obj: *mut ffi::PyTypeObject) -> i32;
@@ -1589,6 +1547,44 @@ mod tests {
         replacement_code
     }
 
+    static TEST_SOAC_METADATA_DROPS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn free_test_soac_metadata(ptr: *mut c_void) {
+        if !ptr.is_null() {
+            drop(Box::from_raw(ptr as *mut usize));
+        }
+        TEST_SOAC_METADATA_DROPS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    unsafe fn make_test_function(py: Python<'_>) -> *mut ffi::PyObject {
+        let globals = PyDict::new(py);
+        let locals = PyDict::new(py);
+        let builtins = py.import("builtins").expect("builtins should import");
+        globals
+            .set_item("__builtins__", &builtins)
+            .expect("globals should accept builtins");
+        locals
+            .set_item("__builtins__", &builtins)
+            .expect("locals should accept builtins");
+        let source = std::ffi::CString::new("def f():\n    return 1\n")
+            .expect("test function source should be CString-compatible");
+        let run_result = ffi::PyRun_StringFlags(
+            source.as_ptr(),
+            ffi::Py_file_input,
+            globals.as_ptr(),
+            locals.as_ptr(),
+            ptr::null_mut(),
+        );
+        assert!(!run_result.is_null(), "test function definition should execute");
+        ffi::Py_DECREF(run_result);
+        let function = locals
+            .get_item("f")
+            .expect("function lookup should succeed")
+            .expect("function should exist");
+        ffi::Py_INCREF(function.as_ptr());
+        function.as_ptr()
+    }
+
     unsafe fn class_dict_function(
         owner_type: *mut ffi::PyTypeObject,
         name: &'static std::ffi::CStr,
@@ -1649,6 +1645,67 @@ mod tests {
                 "wrong method name should not produce an exact owner binding"
             );
 
+            ffi::Py_DECREF(function);
+        });
+    }
+
+    #[test]
+    fn pyfunction_soac_metadata_roundtrips_without_func_dict_storage() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        initialize_test_python();
+        Python::attach(|py| unsafe {
+            TEST_SOAC_METADATA_DROPS.store(0, Ordering::SeqCst);
+            let function = make_test_function(py);
+            let function_id = FunctionId::new(7, 11);
+            let encoded_function_id = function_id
+                .packed()
+                .checked_add(1)
+                .expect("test function id encoding should not overflow");
+            let metadata = Box::into_raw(Box::new(123usize)) as *mut c_void;
+            assert_eq!(
+                PyFunction_SetSoacMetadata(
+                    function,
+                    encoded_function_id,
+                    metadata,
+                    Some(free_test_soac_metadata),
+                ),
+                0,
+                "setting SOAC metadata should succeed"
+            );
+            assert_eq!(
+                PyFunction_GetSoacMetadata(function),
+                metadata,
+                "metadata pointer should round-trip"
+            );
+            assert_eq!(
+                PyFunction_GetSoacFunctionId(function),
+                encoded_function_id,
+                "encoded function id should round-trip"
+            );
+            assert_eq!(
+                registered_clif_function_id(function).expect("function id lookup should succeed"),
+                Some(function_id),
+                "registered function id should decode from SOAC metadata"
+            );
+            assert_eq!(
+                PyFunction_SetSoacMetadata(function, 0, ptr::null_mut(), None),
+                0,
+                "clearing SOAC metadata should succeed"
+            );
+            assert!(
+                PyFunction_GetSoacMetadata(function).is_null(),
+                "cleared SOAC metadata should not retain a pointer"
+            );
+            assert_eq!(
+                PyFunction_GetSoacFunctionId(function),
+                0,
+                "cleared SOAC function id should be unset"
+            );
+            assert_eq!(
+                TEST_SOAC_METADATA_DROPS.load(Ordering::SeqCst),
+                1,
+                "clearing should invoke the registered metadata destructor once"
+            );
             ffi::Py_DECREF(function);
         });
     }
