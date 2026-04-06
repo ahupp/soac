@@ -293,7 +293,7 @@ perf-pystone-jit-warm loops="500000" output_prefix="logs/pystone_jit_perf_warm":
   OUTPUT_PREFIX="{{output_prefix}}"
   WARMUP_LOOPS="${WARMUP_LOOPS:-1000}"
   PERF_FREQUENCY="${PERF_FREQUENCY:-999}"
-  PERF_CALL_GRAPH="${PERF_CALL_GRAPH:-dwarf,16384}"
+  PERF_CALL_GRAPH="${PERF_CALL_GRAPH:-dwarf,65528}"
   PERF_PERCENT_LIMIT="${PERF_PERCENT_LIMIT:-0.5}"
   PERF_HELPER_FRAMES="${SOAC_JIT_PERF_HELPER_FRAMES:-1}"
   PERF_BUILDID_DIR="${PERF_BUILDID_DIR:-$REPO_ROOT/tmp/perf-buildid}"

@@ -418,7 +418,10 @@ Notes:
 - `PERF_CALL_GRAPH=<mode>`
   In recipe `perf-pystone-jit-warm`, at
   [Justfile:273](/home/adam/project/soac-profile/Justfile#L273), set the
-  `perf record --call-graph` mode. The default is `dwarf,16384`.
+  `perf record --call-graph` mode. The default is `dwarf,65528`, which
+  captures a much larger user-space stack dump so mixed JIT/CPython
+  stacks are less likely to truncate into misleading leaf-only C helper
+  frames.
 
 - `PERF_PERCENT_LIMIT=<float>`
   In recipe `perf-pystone-jit-warm`, at

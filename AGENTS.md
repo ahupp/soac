@@ -198,6 +198,12 @@ instance's live working commit.
   `BENCHMARK_CONSTANT_CLOCKS=0` to opt out. If you add or change
   benchmark-stability knobs, document them in `README.md` and in this
   appendix note.
+- `PERF_CALL_GRAPH`
+  The perf profiling recipes default to `PERF_CALL_GRAPH=dwarf,65528`
+  rather than a shallower stack dump, because the larger DWARF capture
+  materially reduces truncated mixed JIT/CPython stacks in the exported
+  profiles. If you change that default or add related perf-stack knobs,
+  document them in `README.md` and in this appendix note.
 
 ### CPython-specific notes
 
