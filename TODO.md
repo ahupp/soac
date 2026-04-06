@@ -1572,3 +1572,7 @@ Challenging parts:
 - `try` / `with` need careful fallthrough and exception-edge handling so their normal exits compose with the implicit remainder exactly once.
 - Evaluation order must stay identical when lowering expression-bearing statements into fragments.
 - The temporary adapter layer should be short-lived; otherwise the old and new lowering shapes will drift.
+
+## Improve specialization for dp_jit_exact_long_binary_op
+
+- Improve specialization for `dp_jit_exact_long_binary_op`.

@@ -257,10 +257,6 @@ instance's live working commit.
   generalizable design principle that captures that decision.  Confirm
   that with me, then add to AGENTS.md
 
-- Only record something in `TODO.md` when I explicitly ask for a plan.
-  For each such planning request, create a new heading of the form
-  `## {plan description}` and put the plan details under that heading.
-
 - When pointing at code, include both the name of the enclosing item
   as well as the file and line number.  e.g don't just refer to a file
   and `src/foo/bar.rs:124`, say `in struct FooBar, at
