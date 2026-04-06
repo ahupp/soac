@@ -69,7 +69,11 @@ impl<I: Instr> InlineFragment<I> {
         fragment
     }
 
-    pub(crate) fn from_builder(label: BlockLabel, entry: InlineBlockBuilder<I>, deps: Vec<Block<I, I>>) -> Self
+    pub(crate) fn from_closed_builder(
+        label: BlockLabel,
+        entry: InlineBlockBuilder<I>,
+        deps: Vec<Block<I, I>>,
+    ) -> Self
     where
         I: crate::block_py::NormalizedInstr,
     {
@@ -88,6 +92,18 @@ impl<I: Instr> InlineFragment<I> {
             ),
             deps,
         )
+    }
+
+    pub(crate) fn from_fallthrough_builder(
+        label: BlockLabel,
+        mut entry: InlineBlockBuilder<I>,
+        deps: Vec<Block<I, I>>,
+    ) -> Self
+    where
+        I: crate::block_py::NormalizedInstr,
+    {
+        entry.ensure_fallthrough_term();
+        Self::from_closed_builder(label, entry, deps)
     }
 
     fn assert_well_formed(&self) {

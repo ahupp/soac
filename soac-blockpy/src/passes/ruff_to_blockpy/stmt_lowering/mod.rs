@@ -48,27 +48,10 @@ where
 {
     try_lower_inline_value_from_structured(next_label_id, lower)
         .map(|result| {
-            result.map(|(mut entry, ())| {
-                if entry.term.is_none() {
-                    entry.set_term(BlockTerm::Jump(crate::block_py::BlockEdge::new(
-                        BlockLabel::fallthrough(),
-                    )));
-                }
-                InlineFragment::from_builder(name_gen.next_block_name(), entry, Vec::new())
+            result.map(|(entry, ())| {
+                InlineFragment::from_fallthrough_builder(name_gen.next_block_name(), entry, Vec::new())
             })
         })
-}
-
-pub(crate) fn lower_stmt_fragment<E>(
-    context: &Context,
-    name_gen: &FunctionNameGen,
-    stmt: &Stmt,
-    loop_ctx: Option<&LoopContext>,
-) -> Option<Result<InlineFragment<E>, String>>
-where
-    E: RuffToBlockPyExpr,
-{
-    direct::try_lower_direct_stmt_fragment(context, name_gen, stmt, loop_ctx)
 }
 
 pub(super) fn stmts_from_rewrite(rewrite: Rewrite) -> Vec<Stmt> {

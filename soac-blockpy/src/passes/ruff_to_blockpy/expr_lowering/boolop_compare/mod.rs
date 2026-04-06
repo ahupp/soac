@@ -1,6 +1,6 @@
 use super::{BlockPySetupExprLowerer, RuffToBlockPyExpr};
 use crate::block_py::{
-    Block, BlockBuilder, BlockEdge, BlockLabel, BlockPyStmtBuilder, BlockTerm, Instr, Meta, Store,
+    Block, BlockBuilder, BlockLabel, BlockPyStmtBuilder, BlockTerm, Instr, Meta, Store,
     StructuredIf, StructuredInstr, TermIf, WithMeta,
 };
 use crate::passes::ruff_to_blockpy::expr_lowering::fresh_setup_name;
@@ -158,16 +158,10 @@ where
 
     match current_dep_index {
         None => {
-            if entry.term.is_none() {
-                entry.set_term(BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())));
-            }
+            entry.ensure_fallthrough_term();
         }
         Some(index) => {
-            if dep_builders[index].1.term.is_none() {
-                dep_builders[index]
-                    .1
-                    .set_term(BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())));
-            }
+            dep_builders[index].1.ensure_fallthrough_term();
         }
     }
 
@@ -177,7 +171,7 @@ where
         .collect();
 
     Ok(LoweredExpr {
-        setup: InlineFragment::from_builder(name_gen.next_block_name(), entry, deps),
+        setup: InlineFragment::from_closed_builder(name_gen.next_block_name(), entry, deps),
         value: E::from_lowered_expr(load_name(&target)),
     })
 }
@@ -300,16 +294,10 @@ where
 
     match current_dep_index {
         None => {
-            if entry.term.is_none() {
-                entry.set_term(BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())));
-            }
+            entry.ensure_fallthrough_term();
         }
         Some(index) => {
-            if dep_builders[index].1.term.is_none() {
-                dep_builders[index]
-                    .1
-                    .set_term(BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())));
-            }
+            dep_builders[index].1.ensure_fallthrough_term();
         }
     }
 
@@ -319,7 +307,7 @@ where
         .collect();
 
     Ok(LoweredExpr {
-        setup: InlineFragment::from_builder(name_gen.next_block_name(), entry, deps),
+        setup: InlineFragment::from_closed_builder(name_gen.next_block_name(), entry, deps),
         value: E::from_lowered_expr(load_name(&target_name)),
     })
 }

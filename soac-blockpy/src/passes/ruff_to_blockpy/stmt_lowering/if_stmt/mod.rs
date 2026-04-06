@@ -154,7 +154,7 @@ where
     deps.push(orelse_entry);
     deps.extend(orelse_setup.deps);
 
-    Ok(InlineFragment::from_builder(entry_label, entry, deps))
+    Ok(InlineFragment::from_closed_builder(entry_label, entry, deps))
 }
 
 impl StmtLowerer for ast::StmtIf {

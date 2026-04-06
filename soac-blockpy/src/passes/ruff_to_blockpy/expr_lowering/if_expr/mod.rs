@@ -87,16 +87,12 @@ pub(crate) fn try_lower_if_expr_direct<L, E>(
      else {
          return None;
      };
-    let (mut body_entry, _) = match body_setup {
+    let (body_entry, _) = match body_setup {
         Ok(value) => value,
         Err(err) => return Some(Err(err)),
     };
-    if body_entry.term.is_none() {
-        body_entry.set_term(BlockTerm::Jump(crate::block_py::BlockEdge::new(
-            crate::block_py::BlockLabel::fallthrough(),
-        )));
-    }
-    let body_fragment = InlineFragment::from_builder(name_gen.next_block_name(), body_entry, Vec::new());
+    let body_fragment =
+        InlineFragment::from_fallthrough_builder(name_gen.next_block_name(), body_entry, Vec::new());
  
      let Some(orelse_setup) =
          crate::passes::ruff_to_blockpy::stmt_lowering::try_lower_inline_value_from_structured::<
@@ -118,17 +114,15 @@ pub(crate) fn try_lower_if_expr_direct<L, E>(
      else {
          return None;
      };
-    let (mut orelse_entry, _) = match orelse_setup {
+    let (orelse_entry, _) = match orelse_setup {
         Ok(value) => value,
         Err(err) => return Some(Err(err)),
     };
-    if orelse_entry.term.is_none() {
-        orelse_entry.set_term(BlockTerm::Jump(crate::block_py::BlockEdge::new(
-            crate::block_py::BlockLabel::fallthrough(),
-        )));
-    }
-    let orelse_fragment =
-        InlineFragment::from_builder(name_gen.next_block_name(), orelse_entry, Vec::new());
+    let orelse_fragment = InlineFragment::from_fallthrough_builder(
+        name_gen.next_block_name(),
+        orelse_entry,
+        Vec::new(),
+    );
  
      let then_label = name_gen.next_block_name();
      let else_label = name_gen.next_block_name();
@@ -149,7 +143,7 @@ pub(crate) fn try_lower_if_expr_direct<L, E>(
      deps.extend(orelse_fragment.deps);
  
      Some(Ok(LoweredExpr {
-         setup: InlineFragment::from_builder(name_gen.next_block_name(), entry, deps),
+         setup: InlineFragment::from_closed_builder(name_gen.next_block_name(), entry, deps),
          value: E::from_lowered_expr(load_name(&target)),
      }))
 }

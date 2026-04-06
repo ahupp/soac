@@ -1076,6 +1076,14 @@ impl<S: NormalizedInstr, T: BlockPyJumpTerm> BlockBuilder<S, T> {
     }
 }
 
+impl<S: NormalizedInstr, T: Instr> BlockBuilder<S, BlockTerm<T>> {
+    pub fn ensure_fallthrough_term(&mut self) {
+        if self.term.is_none() {
+            self.set_term(BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())));
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum StructuredInstr<I: Instr> {
     Expr(I),

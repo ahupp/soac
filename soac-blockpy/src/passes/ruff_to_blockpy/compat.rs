@@ -528,7 +528,7 @@ where
         }));
         return Ok(emit_inline_fragment_with_exc_target_and_expr(
             blocks,
-            InlineFragment::from_builder(label, entry, Vec::new()),
+            InlineFragment::from_closed_builder(label, entry, Vec::new()),
             BlockLabel::fallthrough(),
             exc_target,
         ));

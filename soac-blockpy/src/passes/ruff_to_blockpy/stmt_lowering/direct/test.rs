@@ -62,116 +62,69 @@ fn stmt_expr_to_blockpy_emits_setup_for_named_exprs() {
 }
 
 #[test]
-fn stmt_expr_fragment_uses_plain_instr_body_with_fallthrough() {
-    let stmt = py_stmt!("(x := y)");
-    let context = Context::new("");
-    let name_gen = crate::block_py::ModuleNameGen::new(0).next_function_name_gen();
-
-    let Some(fragment) = try_lower_direct_stmt_fragment::<InstrWithAwaitAndYield>(
-        &context,
-        &name_gen,
-        &stmt,
-        None,
-    ) else {
-        panic!("expected direct expr stmt fragment");
-    };
-    let fragment = fragment.expect("expr fragment lowering should succeed");
-
-    assert!(fragment.deps.is_empty());
-    assert!(matches!(
-        fragment.entry.body.as_slice(),
-        [InstrWithAwaitAndYield::Store(_), _]
-    ));
-    assert!(matches!(
-        fragment.entry.term,
-        BlockTerm::Jump(BlockEdge { target, args })
-            if target == BlockLabel::fallthrough() && args.is_empty()
-    ));
-}
-
-#[test]
-fn stmt_expr_fragment_returns_none_for_branchy_expr_setup() {
-    let stmt = py_stmt!("x if cond else y");
-    let context = Context::new("");
-    let name_gen = crate::block_py::ModuleNameGen::new(0).next_function_name_gen();
-
-    let fragment = try_lower_direct_stmt_fragment::<InstrWithAwaitAndYield>(
-        &context,
-        &name_gen,
-        &stmt,
-        None,
-    );
-
-    assert!(fragment.is_none());
-}
-
-#[test]
-fn stmt_return_fragment_sets_terminator_for_plain_value() {
+fn stmt_return_to_blockpy_sets_terminator_for_plain_value() {
     let stmt = py_stmt!("return value");
     let context = Context::new("");
-    let name_gen = crate::block_py::ModuleNameGen::new(0).next_function_name_gen();
-
-    let Some(fragment) = try_lower_direct_stmt_fragment::<InstrWithAwaitAndYield>(
-        &context,
-        &name_gen,
-        &stmt,
-        None,
-    ) else {
-        panic!("expected direct return stmt fragment");
+    let Stmt::Return(return_stmt) = stmt else {
+        panic!("expected return stmt");
     };
-    let fragment = fragment.expect("return fragment lowering should succeed");
+    let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new();
+    let mut next_label_id = 0usize;
 
-    assert!(fragment.deps.is_empty());
-    assert!(matches!(fragment.entry.term, BlockTerm::Return(_)));
+    return_stmt
+        .to_blockpy(&context, &mut out, None, &mut next_label_id)
+        .expect("return lowering should succeed");
+
+    let fragment = out.finish();
+
+    assert!(matches!(fragment.term, Some(BlockTerm::Return(_))));
 }
 
 #[test]
-fn stmt_raise_fragment_sets_terminator_for_plain_exc() {
+fn stmt_raise_to_blockpy_sets_terminator_for_plain_exc() {
     let stmt = py_stmt!("raise exc");
     let context = Context::new("");
-    let name_gen = crate::block_py::ModuleNameGen::new(0).next_function_name_gen();
-
-    let Some(fragment) = try_lower_direct_stmt_fragment::<InstrWithAwaitAndYield>(
-        &context,
-        &name_gen,
-        &stmt,
-        None,
-    ) else {
-        panic!("expected direct raise stmt fragment");
+    let Stmt::Raise(raise_stmt) = stmt else {
+        panic!("expected raise stmt");
     };
-    let fragment = fragment.expect("raise fragment lowering should succeed");
+    let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new();
+    let mut next_label_id = 0usize;
 
-    assert!(fragment.deps.is_empty());
+    raise_stmt
+        .to_blockpy(&context, &mut out, None, &mut next_label_id)
+        .expect("raise lowering should succeed");
+
+    let fragment = out.finish();
+
     assert!(matches!(
-        fragment.entry.term,
-        BlockTerm::Raise(TermRaise { exc: Some(_) })
+        fragment.term,
+        Some(BlockTerm::Raise(TermRaise { exc: Some(_) }))
     ));
 }
 
 #[test]
-fn stmt_break_fragment_uses_loop_jump() {
+fn stmt_break_to_blockpy_uses_loop_jump() {
     let stmt = py_stmt!("break");
     let context = Context::new("");
-    let name_gen = crate::block_py::ModuleNameGen::new(0).next_function_name_gen();
+    let Stmt::Break(break_stmt) = stmt else {
+        panic!("expected break stmt");
+    };
     let loop_ctx = LoopContext {
         continue_label: BlockLabel::from_index(7),
         break_label: BlockLabel::from_index(9),
     };
+    let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new();
+    let mut next_label_id = 0usize;
 
-    let Some(fragment) = try_lower_direct_stmt_fragment::<InstrWithAwaitAndYield>(
-        &context,
-        &name_gen,
-        &stmt,
-        Some(&loop_ctx),
-    ) else {
-        panic!("expected direct break stmt fragment");
-    };
-    let fragment = fragment.expect("break fragment lowering should succeed");
+    break_stmt
+        .to_blockpy(&context, &mut out, Some(&loop_ctx), &mut next_label_id)
+        .expect("break lowering should succeed");
 
-    assert!(fragment.deps.is_empty());
+    let fragment = out.finish();
+
     assert!(matches!(
-        fragment.entry.term,
-        BlockTerm::Jump(BlockEdge { target, ref args })
+        fragment.term,
+        Some(BlockTerm::Jump(BlockEdge { target, ref args }))
             if target == BlockLabel::from_index(9) && args.is_empty()
     ));
 }
