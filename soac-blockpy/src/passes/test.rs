@@ -4,8 +4,9 @@ use crate::block_py::{
     CallArgPositional, CallableScopeKind, CellBindingKind, InstrLow, InstrResolved,
     FunctionKind, ResolvedName, NameLocation, ResolvedStorageBlock,
 };
-use crate::passes::{CoreBlockPyPassWithAwaitAndYield, ResolvedStorageBlockPyPass};
+use crate::passes::{CoreBlockPyPassWithAwaitAndYield, InstrRuff, ResolvedStorageBlockPyPass};
 use crate::{lower_python_to_blockpy_for_testing, LoweringResult};
+use ruff_python_ast::{self as ast, Expr};
 
 fn tracked_core_blockpy_with_await_and_yield(
     source: &str,
@@ -135,6 +136,41 @@ fn block_uses_text(block: &ResolvedStorageBlock, needle: &str) -> bool {
 
 fn count_occurrences(text: &str, needle: &str) -> usize {
     text.matches(needle).count()
+}
+
+#[test]
+fn instr_ruff_from_ast_expr_normalizes_bare_yield_to_explicit_none() {
+    let instr = InstrRuff::from_ast_expr(Expr::Yield(ast::ExprYield {
+        node_index: ast::AtomicNodeIndex::default(),
+        range: ruff_text_size::TextRange::default(),
+        value: None,
+    }));
+
+    let InstrRuff::Yield(yield_expr) = instr else {
+        panic!("expected InstrRuff::Yield");
+    };
+    assert!(matches!(
+        yield_expr.value.as_ref(),
+        InstrRuff::ExprNoneLiteral(_)
+    ));
+}
+
+#[test]
+fn instr_ruff_from_ast_expr_normalizes_call_args_and_keywords() {
+    let instr = InstrRuff::from_ast_expr(crate::py_expr!("f(x, *args, y=z, **kw)"));
+
+    let InstrRuff::Call(call) = instr else {
+        panic!("expected InstrRuff::Call");
+    };
+    assert_eq!(call.args.len(), 2);
+    assert!(matches!(call.args[0], CallArgPositional::Positional(_)));
+    assert!(matches!(call.args[1], CallArgPositional::Starred(_)));
+    assert_eq!(call.keywords.len(), 2);
+    assert!(matches!(
+        &call.keywords[0],
+        CallArgKeyword::Named { arg, .. } if arg.as_str() == "y"
+    ));
+    assert!(matches!(call.keywords[1], CallArgKeyword::Starred(_)));
 }
 
 fn function_uses_text(
