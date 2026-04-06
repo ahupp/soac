@@ -96,6 +96,32 @@ where
     )
 }
 
+fn compat_block_from_lowered_builder_with_exc_target_and_expr<E>(
+    label: BlockLabel,
+    structured: crate::block_py::BlockBuilder<StructuredInstr<E>, BlockTerm<E>>,
+    term: BlockTerm<E>,
+    exc_target: Option<&BlockLabel>,
+) -> LoweredBlockPyBlock<E>
+where
+    E: RuffToBlockPyExpr + ImplicitNoneExpr,
+{
+    let structured = structured.finish();
+    assert!(
+        structured.term.is_none(),
+        "compatibility block body should not contain its own terminator"
+    );
+    with_exc_meta(
+        Block::from_builder(
+            label,
+            BlockBuilder::with_term(structured.body, Some(term)),
+            Vec::new(),
+            None,
+            None,
+        ),
+        exc_target,
+    )
+}
+
 fn try_inline_builder_from_blockpy_stmts<E>(
     structured: crate::block_py::BlockBuilder<StructuredInstr<E>, BlockTerm<E>>,
 ) -> Result<
@@ -125,50 +151,6 @@ where
         entry.push_stmt(stmt);
     }
     Ok(entry)
-}
-
-pub(crate) fn compat_if_jump_block_with_expr_setup_and_exc_target_and_expr<E>(
-    context: &Context,
-    label: BlockLabel,
-    body: Vec<Stmt>,
-    test: Expr,
-    then_label: BlockLabel,
-    else_label: BlockLabel,
-    exc_target: Option<&BlockLabel>,
-) -> Result<LoweredBlockPyBlock<E>, String>
-where
-    E: RuffToBlockPyExpr + ImplicitNoneExpr,
-{
-    let mut out = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &body)?;
-    let mut next_label_id = 0usize;
-    let test = crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
-        test,
-        &mut out,
-        None,
-        &mut next_label_id,
-    )?;
-    let fragment = out.finish();
-    assert!(
-        fragment.term.is_none(),
-        "compatibility block body should not contain its own terminator"
-    );
-    Ok(with_exc_meta(
-        Block::from_builder(
-            label,
-            BlockBuilder::with_term(
-                fragment.body,
-                Some(BlockTerm::IfTerm(TermIf {
-                    test,
-                    then_label,
-                    else_label,
-                })),
-            ),
-            Vec::new(),
-            None,
-            None,
-        ),
-        exc_target,
-    ))
 }
 
 pub(crate) fn set_region_exc_param<E: Instr>(
@@ -561,18 +543,17 @@ where
                 exc_target,
             ))
         }
-        Err(_) => {
-            blocks.push(
-                compat_if_jump_block_with_expr_setup_and_exc_target_and_expr(
-                    context,
-                    label.clone(),
-                    body,
-                    test,
+        Err(fragment) => {
+            blocks.push(compat_block_from_lowered_builder_with_exc_target_and_expr(
+                label.clone(),
+                fragment,
+                BlockTerm::IfTerm(TermIf {
+                    test: lowered_test,
                     then_label,
                     else_label,
-                    exc_target,
-                )?,
-            );
+                }),
+                exc_target,
+            ));
             Ok(label)
         }
     }
@@ -627,17 +608,41 @@ where
             exc_target,
         ));
     } else {
-        blocks.push(
-            compat_if_jump_block_with_expr_setup_and_exc_target_and_expr(
-                context,
-                test_label.clone(),
-                Vec::new(),
-                test,
-                body_entry,
-                cond_false_entry,
-                exc_target,
-            )?,
-        );
+        let mut out = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &[])?;
+        let mut next_label_id = 0usize;
+        let lowered_test = crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
+            test,
+            &mut out,
+            None,
+            &mut next_label_id,
+        )?;
+        match try_inline_builder_from_blockpy_stmts(out) {
+            Ok(mut entry) => {
+                entry.set_term(BlockTerm::IfTerm(TermIf {
+                    test: lowered_test,
+                    then_label: body_entry,
+                    else_label: cond_false_entry,
+                }));
+                emit_inline_fragment_with_exc_target_and_expr(
+                    blocks,
+                    InlineFragment::from_closed_builder(test_label.clone(), entry, Vec::new()),
+                    BlockLabel::fallthrough(),
+                    exc_target,
+                );
+            }
+            Err(fragment) => {
+                blocks.push(compat_block_from_lowered_builder_with_exc_target_and_expr(
+                    test_label.clone(),
+                    fragment,
+                    BlockTerm::IfTerm(TermIf {
+                        test: lowered_test,
+                        then_label: body_entry,
+                        else_label: cond_false_entry,
+                    }),
+                    exc_target,
+                ));
+            }
+        }
     }
     if let Some(linear_label) = linear_label {
         blocks.push(compat_block_from_blockpy_with_exc_target_and_expr(
