@@ -168,6 +168,12 @@ instance's live working commit.
   Use for vendored CPython regrtest runs.
 - `just regen-snapshots`
   Regenerates fixture snapshots.
+- `just benchmark`
+  Default benchmark for performance requests. This is the two-pass run:
+  a profiling pass followed by a specialized transformed pass, compared
+  against stock CPython. Report the specialized second-pass throughput
+  as the transformed result unless I explicitly ask for the warm
+  unspecialized baseline.
 
 ### CPython-specific notes
 

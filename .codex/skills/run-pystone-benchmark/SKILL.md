@@ -1,11 +1,11 @@
 ---
 name: run-pystone-benchmark
-description: Run this repo's pystone benchmark script and capture the output in logs/. Use when Codex needs to benchmark transformed or JIT execution against stock CPython, compare loops per second, or summarize the throughput reported by scripts/benchmark.sh.
+description: Run this repo's pystone benchmark recipes and capture the output in logs/. Use when Codex needs to benchmark transformed or JIT execution against stock CPython, compare loops per second, or summarize the two-pass specialized benchmark or the warmed unspecialized baseline.
 ---
 
 # Run Pystone Benchmark
 
-Use `scripts/benchmark.sh` from the repo root and capture the output to a file in `logs/`.
+Use the `Justfile` benchmark recipes from the repo root and capture the output to a file in `logs/`.
 
 ## Run
 
@@ -13,25 +13,41 @@ Use `set -o pipefail` so the benchmark exit status is preserved when logging:
 
 ```bash
 set -o pipefail
-./scripts/benchmark.sh 1000000 2>&1 | tee logs/benchmark_run.log
+just benchmark 2>&1 | tee logs/benchmark_run.log
 ```
 
-If the user requests a different loop count, pass it as the first argument and keep the log in `logs/`.
+If the user requests a different loop count, pass it as the first argument to the `just` recipe and keep the log in `logs/`.
+
+By default, a plain benchmark request means `just benchmark`, which is the
+two-pass flow:
+
+- transformed profiling pass
+- transformed specialized pass
+- stock CPython baseline
+
+Report the specialized second-pass throughput as the transformed result unless
+the user explicitly asks for the warmed unspecialized baseline, in which case
+use `just benchmark-warm`.
 
 ## Summarize
 
-The script prints two sections:
+`just benchmark` prints three sections:
 
-- `jit transformed`
+- `jit transformed profile pass`
+- `jit transformed specialized pass`
 - `stock cpython`
 
-For each run, report:
+For a default benchmark request, report:
 
-- transformed or JIT loops per second
+- specialized transformed/JIT loops per second
 - stock loops per second
 - relative slowdown or speedup factor
 
-If the user asks for a warmed comparison, note that `scripts/benchmark.sh` is a cold run wrapper. Use the perf profiling workflow or an explicit same-process warmup if they need steady-state numbers.
+If helpful, you may also mention the profiling-pass throughput, but do not use it
+as the headline transformed result.
+
+If the user asks for a warmed unspecialized comparison, use `just benchmark-warm`
+and label it clearly as the warm baseline rather than the default benchmark.
 
 ## Notes
 
