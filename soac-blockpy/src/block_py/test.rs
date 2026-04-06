@@ -62,7 +62,9 @@ fn cfg_block_can_replace_fallthrough_target() {
 fn stmt_fragment_can_carry_optional_term() {
     let fragment: BlockBuilder<InstrRuff, BlockTerm<InstrRuff>> = BlockBuilder::with_term(
         vec![InstrRuff::from_ast_expr(py_expr!("x"))],
-        Some(BlockTerm::Return(InstrRuff::from_ast_expr(py_expr!("None")))),
+        Some(BlockTerm::Return(InstrRuff::from_ast_expr(py_expr!(
+            "None"
+        )))),
     );
 
     assert_eq!(fragment.body.len(), 1);
@@ -163,7 +165,10 @@ fn ast_call_arg_helpers_preserve_star_shapes() {
 
 #[test]
 fn ast_operator_kind_helpers_cover_python_ops() {
-    assert_eq!(BinOpKind::from_ast_operator(ast::Operator::Div), BinOpKind::TrueDiv);
+    assert_eq!(
+        BinOpKind::from_ast_operator(ast::Operator::Div),
+        BinOpKind::TrueDiv
+    );
     assert_eq!(
         BinOpKind::from_ast_inplace_operator(ast::Operator::Div),
         BinOpKind::InplaceTrueDiv

@@ -1,8 +1,7 @@
 use super::*;
 use crate::block_py::{BlockParam, BlockParamRole};
 use crate::block_py::{
-    ClosureInit, ClosureSlot, InstrWithAwaitAndYield, ResolvedName, NameLocation,
-    StorageLayout,
+    ClosureInit, ClosureSlot, InstrWithAwaitAndYield, NameLocation, ResolvedName, StorageLayout,
 };
 use crate::lower_python_to_blockpy_for_testing;
 use crate::passes::{CoreBlockPyPassWithAwaitAndYield, InstrRuff, ResolvedStorageBlockPyPass};

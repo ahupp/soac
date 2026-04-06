@@ -139,8 +139,7 @@ unsafe extern "C" fn function_owner_type_watcher_callback(
             if !stale_weakrefs.is_empty() {
                 let _ = registry.registered_owner_types_by_function.lock().map(
                     |mut weakrefs_by_function| {
-                        if let Some(registered) = weakrefs_by_function.get_mut(&(func as usize))
-                        {
+                        if let Some(registered) = weakrefs_by_function.get_mut(&(func as usize)) {
                             registered.owner_type_weakrefs.retain(|weakref| {
                                 let keep = !stale_weakrefs.contains(weakref);
                                 if !keep {
@@ -565,20 +564,22 @@ unsafe fn register_owner_type_for_function(
                     c"function owner type registry lock poisoned".as_ptr(),
                 );
             })?;
-    let registered = owner_types_by_function.entry(function_key).or_insert_with(|| {
-        let function_weakref = PyWeakref_NewRef(function, ptr::null_mut());
-        if function_weakref.is_null() {
-            RegisteredFunctionOwnerTypes {
-                function_weakref: 0,
-                owner_type_weakrefs: Vec::new(),
+    let registered = owner_types_by_function
+        .entry(function_key)
+        .or_insert_with(|| {
+            let function_weakref = PyWeakref_NewRef(function, ptr::null_mut());
+            if function_weakref.is_null() {
+                RegisteredFunctionOwnerTypes {
+                    function_weakref: 0,
+                    owner_type_weakrefs: Vec::new(),
+                }
+            } else {
+                RegisteredFunctionOwnerTypes {
+                    function_weakref: function_weakref as usize,
+                    owner_type_weakrefs: Vec::new(),
+                }
             }
-        } else {
-            RegisteredFunctionOwnerTypes {
-                function_weakref: function_weakref as usize,
-                owner_type_weakrefs: Vec::new(),
-            }
-        }
-    });
+        });
     if registered.function_weakref == 0 {
         return Err(());
     }
@@ -600,7 +601,9 @@ unsafe fn register_owner_type_for_function(
     if owner_type_weakref.is_null() {
         return Err(());
     }
-    registered.owner_type_weakrefs.push(owner_type_weakref as usize);
+    registered
+        .owner_type_weakrefs
+        .push(owner_type_weakref as usize);
     Ok(())
 }
 
@@ -609,9 +612,7 @@ unsafe fn incref_weakref_snapshot(weakref: usize) -> usize {
     weakref
 }
 
-unsafe fn resolve_weakref_target(
-    weakref: usize,
-) -> Result<Option<*mut ffi::PyObject>, ()> {
+unsafe fn resolve_weakref_target(weakref: usize) -> Result<Option<*mut ffi::PyObject>, ()> {
     let mut value = ptr::null_mut();
     match PyWeakref_GetRef(weakref as *mut ffi::PyObject, &mut value) {
         1 => Ok(Some(value)),
@@ -640,7 +641,8 @@ unsafe fn lookup_exact_owner_types_for_function_object(
         let dict = (*owner_type).tp_dict;
         if !dict.is_null() {
             let current_descriptor = ffi::PyDict_GetItemString(dict, method_name.as_ptr());
-            if current_descriptor == function_obj && ffi::PyFunction_Check(current_descriptor) != 0 {
+            if current_descriptor == function_obj && ffi::PyFunction_Check(current_descriptor) != 0
+            {
                 if (*owner_type).tp_version_tag == 0 {
                     let _ = PyUnstable_Type_AssignVersionTag(owner_type);
                 }
@@ -661,9 +663,7 @@ unsafe fn lookup_exact_owner_types_for_function_object(
     Ok(out)
 }
 
-unsafe fn owner_type_has_simple_default_constructor(
-    owner_type: *mut ffi::PyTypeObject,
-) -> bool {
+unsafe fn owner_type_has_simple_default_constructor(owner_type: *mut ffi::PyTypeObject) -> bool {
     if owner_type.is_null() {
         return false;
     }
@@ -702,8 +702,11 @@ unsafe fn lookup_exact_owner_types_for_constructor_object(
     function_obj: *mut ffi::PyObject,
     owner_type_weakrefs: &[usize],
 ) -> Result<Vec<DirectConstructorOwnerType>, ()> {
-    let owners =
-        lookup_exact_owner_types_for_function_object(function_obj, "__init__", owner_type_weakrefs)?;
+    let owners = lookup_exact_owner_types_for_function_object(
+        function_obj,
+        "__init__",
+        owner_type_weakrefs,
+    )?;
     let mut out = Vec::new();
     for owner in owners {
         if !owner_type_has_simple_default_constructor(owner.owner_type) {
@@ -729,15 +732,16 @@ pub unsafe fn lookup_exact_owner_types_for_method(
         return Ok(Vec::new());
     };
     let snapshot = {
-        let registered_by_function = registry
-            .registered_owner_types_by_function
-            .lock()
-            .map_err(|_| {
-                ffi::PyErr_SetString(
-                    ffi::PyExc_RuntimeError,
-                    c"function owner type registry lock poisoned".as_ptr(),
-                );
-            })?;
+        let registered_by_function =
+            registry
+                .registered_owner_types_by_function
+                .lock()
+                .map_err(|_| {
+                    ffi::PyErr_SetString(
+                        ffi::PyExc_RuntimeError,
+                        c"function owner type registry lock poisoned".as_ptr(),
+                    );
+                })?;
         registered_by_function
             .values()
             .map(|registered| {
@@ -763,8 +767,7 @@ pub unsafe fn lookup_exact_owner_types_for_method(
             }
             continue;
         };
-        let matches_function_id =
-            matches!(registered_clif_function_id(function_obj)?, Some(registered) if registered == function_id);
+        let matches_function_id = matches!(registered_clif_function_id(function_obj)?, Some(registered) if registered == function_id);
         if matches_function_id {
             let exact_owner_types = lookup_exact_owner_types_for_function_object(
                 function_obj,
@@ -800,15 +803,16 @@ pub unsafe fn lookup_exact_owner_types_for_constructor(
         return Ok(Vec::new());
     };
     let snapshot = {
-        let registered_by_function = registry
-            .registered_owner_types_by_function
-            .lock()
-            .map_err(|_| {
-                ffi::PyErr_SetString(
-                    ffi::PyExc_RuntimeError,
-                    c"function owner type registry lock poisoned".as_ptr(),
-                );
-            })?;
+        let registered_by_function =
+            registry
+                .registered_owner_types_by_function
+                .lock()
+                .map_err(|_| {
+                    ffi::PyErr_SetString(
+                        ffi::PyExc_RuntimeError,
+                        c"function owner type registry lock poisoned".as_ptr(),
+                    );
+                })?;
         registered_by_function
             .values()
             .map(|registered| {
@@ -834,8 +838,7 @@ pub unsafe fn lookup_exact_owner_types_for_constructor(
             }
             continue;
         };
-        let matches_function_id =
-            matches!(registered_clif_function_id(function_obj)?, Some(registered) if registered == function_id);
+        let matches_function_id = matches!(registered_clif_function_id(function_obj)?, Some(registered) if registered == function_id);
         if matches_function_id {
             let exact_owner_types = lookup_exact_owner_types_for_constructor_object(
                 function_obj,
@@ -863,8 +866,7 @@ pub unsafe fn lookup_exact_owner_types_for_constructor(
 }
 
 unsafe fn maybe_register_current_module_owner_types() {
-    let Some(runtime) =
-        ACTIVE_MODULE_RUNTIME_STACK.with(|stack| stack.borrow().last().copied())
+    let Some(runtime) = ACTIVE_MODULE_RUNTIME_STACK.with(|stack| stack.borrow().last().copied())
     else {
         return;
     };
@@ -1476,7 +1478,7 @@ unsafe extern "C" fn bind_direct_args_from_vectorcall(
     }
 }
 
-unsafe extern "C" fn lazy_clif_vectorcall(
+unsafe extern "C" fn lazy_vectorcall(
     callable: *mut ffi::PyObject,
     args: *const *mut ffi::PyObject,
     nargsf: usize,
@@ -1525,7 +1527,7 @@ unsafe extern "C" fn lazy_clif_vectorcall(
         Ok(value) => value,
         Err(payload) => {
             let message = format!(
-                "panic in lazy_clif_vectorcall: {}",
+                "panic in lazy_vectorcall: {}",
                 panic_payload_to_string(payload)
             );
             if let Ok(c_msg) = CString::new(message) {
@@ -1533,7 +1535,7 @@ unsafe extern "C" fn lazy_clif_vectorcall(
             } else {
                 ffi::PyErr_SetString(
                     ffi::PyExc_RuntimeError,
-                    b"panic in lazy_clif_vectorcall\0".as_ptr() as *const i8,
+                    b"panic in lazy_vectorcall\0".as_ptr() as *const i8,
                 );
             }
             ptr::null_mut()
@@ -1555,7 +1557,7 @@ pub unsafe fn register_clif_vectorcall(
     }
     let func = function as *mut ffi::PyFunctionObject;
     if !PyFunction_GetSoacMetadata(function).is_null() {
-        PyFunction_SetVectorcall(func, lazy_clif_vectorcall);
+        PyFunction_SetVectorcall(func, lazy_vectorcall);
         return Ok(());
     }
 
@@ -1570,7 +1572,7 @@ pub unsafe fn register_clif_vectorcall(
         free_clif_function_data(data_ptr);
         return Err(());
     }
-    PyFunction_SetVectorcall(func, lazy_clif_vectorcall);
+    PyFunction_SetVectorcall(func, lazy_vectorcall);
     Ok(())
 }
 
@@ -1642,8 +1644,8 @@ mod tests {
             .set_item("__builtins__", &builtins)
             .expect("locals should accept builtins");
 
-        let source = std::ffi::CString::new(source)
-            .expect("python source should be CString-compatible");
+        let source =
+            std::ffi::CString::new(source).expect("python source should be CString-compatible");
         assert!(
             !ffi::PyRun_StringFlags(
                 source.as_ptr(),
@@ -1762,7 +1764,10 @@ mod tests {
             locals.as_ptr(),
             ptr::null_mut(),
         );
-        assert!(!run_result.is_null(), "test function definition should execute");
+        assert!(
+            !run_result.is_null(),
+            "test function definition should execute"
+        );
         ffi::Py_DECREF(run_result);
         let function = locals
             .get_item("f")
@@ -1779,7 +1784,10 @@ mod tests {
         let dict = (*owner_type).tp_dict;
         assert!(!dict.is_null(), "owner type should have a tp_dict");
         let function = ffi::PyDict_GetItemString(dict, name.as_ptr());
-        assert!(!function.is_null(), "class dict should contain requested function");
+        assert!(
+            !function.is_null(),
+            "class dict should contain requested function"
+        );
         ffi::Py_INCREF(function);
         function
     }
@@ -1797,7 +1805,8 @@ mod tests {
             let function = class_dict_function(owner_type, c"f");
 
             let owners = lookup_exact_owner_types_for_function_object(function, "f", &{
-                let registry = function_owner_type_registry().expect("owner type registry should initialize");
+                let registry =
+                    function_owner_type_registry().expect("owner type registry should initialize");
                 let registered = registry
                     .registered_owner_types_by_function
                     .lock()
@@ -1815,7 +1824,8 @@ mod tests {
             assert_ne!(owners[0].type_version, 0);
 
             let wrong_name = lookup_exact_owner_types_for_function_object(function, "g", &{
-                let registry = function_owner_type_registry().expect("owner type registry should initialize");
+                let registry =
+                    function_owner_type_registry().expect("owner type registry should initialize");
                 let registered = registry
                     .registered_owner_types_by_function
                     .lock()
@@ -1871,12 +1881,7 @@ mod tests {
                 "registered function id should decode from SOAC metadata"
             );
             assert_eq!(
-                PyFunction_SetSoacMetadata(
-                    function,
-                    0,
-                    ptr::null_mut(),
-                    None,
-                ),
+                PyFunction_SetSoacMetadata(function, 0, ptr::null_mut(), None,),
                 0,
                 "clearing SOAC metadata should succeed"
             );
@@ -1935,12 +1940,7 @@ mod tests {
                 "registered type function id should decode from SOAC metadata"
             );
             assert_eq!(
-                PyType_SetSoacMetadata(
-                    class_obj,
-                    0,
-                    ptr::null_mut(),
-                    None,
-                ),
+                PyType_SetSoacMetadata(class_obj, 0, ptr::null_mut(), None,),
                 0,
                 "clearing SOAC type metadata should succeed"
             );

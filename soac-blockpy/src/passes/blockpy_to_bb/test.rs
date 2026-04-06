@@ -1,7 +1,6 @@
 use crate::block_py::{
-    literal_expr, Block, BlockLabel, BlockPyLiteral, BlockTerm,
-    CallArgPositional, CoreStringLiteral, GetAttr, InstrResolved,
-    ResolvedName, NameLocation, WithMeta,
+    literal_expr, Block, BlockLabel, BlockTerm, CallArgPositional, GetAttr, InstrResolved, Literal,
+    NameLocation, ResolvedName, StringLiteral, WithMeta,
 };
 use crate::passes::ruff_to_blockpy::{
     lower_structured_located_blocks_to_bb_blocks, populate_exception_edge_args,
@@ -74,7 +73,7 @@ fn rewrites_current_exception_inside_intrinsic_helper_args() {
             GetAttr::new(
                 core_call_expr("current_exception", Vec::new()),
                 literal_expr::<InstrResolved>(
-                    CoreStringLiteral {
+                    StringLiteral {
                         value: "value".to_string(),
                     },
                     crate::block_py::Meta::synthetic(),
@@ -102,8 +101,7 @@ fn rewrites_current_exception_inside_intrinsic_helper_args() {
     }]);
     let block = &lowered[0];
 
-    let BlockTerm::Return(InstrResolved::GetAttr(GetAttr { value, attr, .. })) = &block.term
-    else {
+    let BlockTerm::Return(InstrResolved::GetAttr(GetAttr { value, attr, .. })) = &block.term else {
         panic!("expected getattr operation");
     };
     assert!(matches!(
@@ -115,7 +113,7 @@ fn rewrites_current_exception_inside_intrinsic_helper_args() {
         InstrResolved::Literal(literal)
             if matches!(
                 literal.as_literal(),
-                BlockPyLiteral::StringLiteral(CoreStringLiteral { value }) if value == "value"
+                Literal::StringLiteral(StringLiteral { value }) if value == "value"
             )
     ));
 }

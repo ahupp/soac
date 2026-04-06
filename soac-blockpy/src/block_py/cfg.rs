@@ -22,9 +22,8 @@ fn blockpy_successors<E: Instr>(block: &Block<E, E>) -> Vec<BlockLabel> {
     }
 }
 
-pub(crate) fn fold_jumps_to_trivial_none_return_blockpy<E>(
-    blocks: &mut [Block<E, E>],
-) where
+pub(crate) fn fold_jumps_to_trivial_none_return_blockpy<E>(blocks: &mut [Block<E, E>])
+where
     E: Clone + ImplicitNoneExpr + Instr,
 {
     let trivial_ret_none_terms: HashMap<BlockLabel, BlockTerm<E>> = blocks
@@ -218,7 +217,7 @@ pub(crate) fn hoist_matching_subexpressions_in_callable_def<P, E, F>(
     mut should_hoist: F,
 ) -> BlockPyFunction<P>
 where
-    P: BlockPyPass<Expr = E>,
+    P: BlockPyPass<Instr = E>,
     E: Instr<Name = UnresolvedName>
         + ChildVisitable<E>
         + Mappable<E, Mapped<E> = E>
@@ -239,17 +238,11 @@ where
         for expr in input_body {
             let mut setup = Vec::new();
             let mut cleanup = Vec::new();
-            let expr =
-                if expr_contains_matching_subexpression(&expr, &mut should_hoist) {
-                    rewrite_matching_children_in_expr(
-                        expr,
-                        &mut setup,
-                        &mut cleanup,
-                        &mut should_hoist,
-                    )
-                } else {
-                    expr
-                };
+            let expr = if expr_contains_matching_subexpression(&expr, &mut should_hoist) {
+                rewrite_matching_children_in_expr(expr, &mut setup, &mut cleanup, &mut should_hoist)
+            } else {
+                expr
+            };
             body.extend(setup);
             body.push(expr);
             append_stmt_cleanup(&mut body, cleanup);

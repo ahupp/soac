@@ -204,24 +204,24 @@ pub fn lower_string_templates_in_expr(expr: &mut Expr) {
 
 pub fn lower_string_templates_in_instr_ruff(expr: InstrRuff) -> InstrRuff {
     match expr {
-        InstrRuff::ExprFString(node) => InstrRuff::from_ast_expr(rewrite_fstring(
-            ast::ExprFString {
+        InstrRuff::ExprFString(node) => {
+            InstrRuff::from_ast_expr(rewrite_fstring(ast::ExprFString {
                 range: node.meta().range,
                 node_index: node.meta().node_index,
                 value: node.value,
-            },
-        )),
-        InstrRuff::ExprTString(node) => InstrRuff::from_ast_expr(rewrite_tstring(
-            ast::ExprTString {
+            }))
+        }
+        InstrRuff::ExprTString(node) => {
+            InstrRuff::from_ast_expr(rewrite_tstring(ast::ExprTString {
                 range: node.meta().range,
                 node_index: node.meta().node_index,
                 value: node.value,
-            },
-        )),
+            }))
+        }
         other => other
-            .try_map_same_children(&mut |child| Ok::<_, std::convert::Infallible>(
-                lower_string_templates_in_instr_ruff(child),
-            ))
+            .try_map_same_children(&mut |child| {
+                Ok::<_, std::convert::Infallible>(lower_string_templates_in_instr_ruff(child))
+            })
             .expect("InstrRuff string-template lowering should be infallible"),
     }
 }

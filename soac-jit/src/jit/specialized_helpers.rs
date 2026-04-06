@@ -10,10 +10,10 @@ use crate::operator_specialization::{ExactIntBinaryOpKind, ExactIntUnaryOpKind};
 #[cfg(not(test))]
 use crate::module_globals::ModuleGlobalCache;
 
-use std::sync::atomic::{AtomicPtr, Ordering};
-use crate::module_constants::raise_name_error_for_missing_name;
 #[cfg(not(test))]
 use crate::module_constants::load_runtime_name_owned;
+use crate::module_constants::raise_name_error_for_missing_name;
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 unsafe extern "C" {
     static mut PyFunction_Type: ffi::PyTypeObject;
@@ -112,15 +112,17 @@ unsafe extern "C" fn pytype_generic_alloc_hook(type_obj: ObjPtr, nitems: i64) ->
         );
         return ptr::null_mut();
     }
-    PyType_GenericAlloc(type_obj as *mut ffi::PyTypeObject, nitems as ffi::Py_ssize_t) as ObjPtr
+    PyType_GenericAlloc(
+        type_obj as *mut ffi::PyTypeObject,
+        nitems as ffi::Py_ssize_t,
+    ) as ObjPtr
 }
 
 unsafe extern "C" fn finish_constructor_init_hook(obj: ObjPtr, init_result: ObjPtr) -> ObjPtr {
     if obj.is_null() {
         ffi::PyErr_SetString(
             ffi::PyExc_RuntimeError,
-            b"invalid constructor object in dp_jit_finish_constructor_init\0".as_ptr()
-                as *const i8,
+            b"invalid constructor object in dp_jit_finish_constructor_init\0".as_ptr() as *const i8,
         );
         return ptr::null_mut();
     }
@@ -1006,7 +1008,10 @@ mod test_only_export_stubs {
         expected_version: i64
     ));
     panic_unit_export!(dp_jit_record_counter_value(vmctx: ObjPtr, counter_id: i64, value: i64));
-    panic_dual_obj_export!(dp_jit_get_raised_exception, dp_jit_get_raised_exception_with_frame());
+    panic_dual_obj_export!(
+        dp_jit_get_raised_exception,
+        dp_jit_get_raised_exception_with_frame()
+    );
     panic_dual_obj_export!(dp_jit_get_arg_item, dp_jit_get_arg_item_with_frame(
         args: ObjPtr,
         index: i64
@@ -1404,9 +1409,9 @@ unsafe extern "C" fn dp_jit_exact_long_binary_op(kind: i64, lhs: ObjPtr, rhs: Ob
         x if x == ExactIntBinaryOpKind::Mod as i64 => {
             (*methods).nb_remainder.map(|slot| slot(lhs, rhs))
         }
-        x if x == ExactIntBinaryOpKind::Pow as i64 => {
-            (*methods).nb_power.map(|slot| slot(lhs, rhs, ffi::Py_None()))
-        }
+        x if x == ExactIntBinaryOpKind::Pow as i64 => (*methods)
+            .nb_power
+            .map(|slot| slot(lhs, rhs, ffi::Py_None())),
         x if x == ExactIntBinaryOpKind::LShift as i64 => {
             (*methods).nb_lshift.map(|slot| slot(lhs, rhs))
         }
@@ -1414,12 +1419,8 @@ unsafe extern "C" fn dp_jit_exact_long_binary_op(kind: i64, lhs: ObjPtr, rhs: Ob
             (*methods).nb_rshift.map(|slot| slot(lhs, rhs))
         }
         x if x == ExactIntBinaryOpKind::Or as i64 => (*methods).nb_or.map(|slot| slot(lhs, rhs)),
-        x if x == ExactIntBinaryOpKind::Xor as i64 => {
-            (*methods).nb_xor.map(|slot| slot(lhs, rhs))
-        }
-        x if x == ExactIntBinaryOpKind::And as i64 => {
-            (*methods).nb_and.map(|slot| slot(lhs, rhs))
-        }
+        x if x == ExactIntBinaryOpKind::Xor as i64 => (*methods).nb_xor.map(|slot| slot(lhs, rhs)),
+        x if x == ExactIntBinaryOpKind::And as i64 => (*methods).nb_and.map(|slot| slot(lhs, rhs)),
         x if x == ExactIntBinaryOpKind::InplaceAdd as i64 => (*methods)
             .nb_inplace_add
             .or((*methods).nb_add)
@@ -1468,24 +1469,24 @@ unsafe extern "C" fn dp_jit_exact_long_binary_op(kind: i64, lhs: ObjPtr, rhs: Ob
             .nb_inplace_and
             .or((*methods).nb_and)
             .map(|slot| slot(lhs, rhs)),
-        x if x == ExactIntBinaryOpKind::Eq as i64 => {
-            (*long_type).tp_richcompare.map(|slot| slot(lhs, rhs, ffi::Py_EQ))
-        }
-        x if x == ExactIntBinaryOpKind::Ne as i64 => {
-            (*long_type).tp_richcompare.map(|slot| slot(lhs, rhs, ffi::Py_NE))
-        }
-        x if x == ExactIntBinaryOpKind::Lt as i64 => {
-            (*long_type).tp_richcompare.map(|slot| slot(lhs, rhs, ffi::Py_LT))
-        }
-        x if x == ExactIntBinaryOpKind::Le as i64 => {
-            (*long_type).tp_richcompare.map(|slot| slot(lhs, rhs, ffi::Py_LE))
-        }
-        x if x == ExactIntBinaryOpKind::Gt as i64 => {
-            (*long_type).tp_richcompare.map(|slot| slot(lhs, rhs, ffi::Py_GT))
-        }
-        x if x == ExactIntBinaryOpKind::Ge as i64 => {
-            (*long_type).tp_richcompare.map(|slot| slot(lhs, rhs, ffi::Py_GE))
-        }
+        x if x == ExactIntBinaryOpKind::Eq as i64 => (*long_type)
+            .tp_richcompare
+            .map(|slot| slot(lhs, rhs, ffi::Py_EQ)),
+        x if x == ExactIntBinaryOpKind::Ne as i64 => (*long_type)
+            .tp_richcompare
+            .map(|slot| slot(lhs, rhs, ffi::Py_NE)),
+        x if x == ExactIntBinaryOpKind::Lt as i64 => (*long_type)
+            .tp_richcompare
+            .map(|slot| slot(lhs, rhs, ffi::Py_LT)),
+        x if x == ExactIntBinaryOpKind::Le as i64 => (*long_type)
+            .tp_richcompare
+            .map(|slot| slot(lhs, rhs, ffi::Py_LE)),
+        x if x == ExactIntBinaryOpKind::Gt as i64 => (*long_type)
+            .tp_richcompare
+            .map(|slot| slot(lhs, rhs, ffi::Py_GT)),
+        x if x == ExactIntBinaryOpKind::Ge as i64 => (*long_type)
+            .tp_richcompare
+            .map(|slot| slot(lhs, rhs, ffi::Py_GE)),
         _ => None,
     };
     let Some(result) = result else {
@@ -1723,8 +1724,14 @@ fn chosen_helper_symbol(fast: *const u8, with_frame: *const u8) -> *const u8 {
 }
 
 pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
-    builder.symbol("PyFunction_Type", std::ptr::addr_of_mut!(PyFunction_Type) as *const u8);
-    builder.symbol("PyMethod_Type", std::ptr::addr_of_mut!(PyMethod_Type) as *const u8);
+    builder.symbol(
+        "PyFunction_Type",
+        std::ptr::addr_of_mut!(PyFunction_Type) as *const u8,
+    );
+    builder.symbol(
+        "PyMethod_Type",
+        std::ptr::addr_of_mut!(PyMethod_Type) as *const u8,
+    );
     builder.symbol(
         "dp_jit_py_call_positional_three",
         chosen_helper_symbol(

@@ -1,6 +1,6 @@
 use crate::block_py::{
-    BlockPyFunction, BlockPyModule, CodegenBlockPyExpr, HasMeta, InstrLow, LiteralValue, Load,
-    InstrResolved, ResolvedName, MapFunction, MapInstr, Mappable, NameLocation, WithMeta,
+    BlockPyFunction, BlockPyModule, HasMeta, InstrCodegen, InstrLow, InstrResolved, LiteralValue,
+    Load, MapFunction, MapInstr, Mappable, NameLocation, ResolvedName, WithMeta,
 };
 use crate::passes::{CodegenBlockPyPass, ResolvedStorageBlockPyPass};
 use soac_macros::match_default;
@@ -35,14 +35,13 @@ impl CodegenExprNormalizer {
     fn push_module_constant(&mut self, literal: LiteralValue) -> u32 {
         let index = u32::try_from(self.module_constants.len())
             .expect("module constant count should fit in u32");
-        self.module_constants
-            .push(InstrResolved::Literal(literal));
+        self.module_constants.push(InstrResolved::Literal(literal));
         index
     }
 }
 
-impl MapInstr<InstrResolved, CodegenBlockPyExpr> for CodegenExprNormalizer {
-    fn map_instr(&mut self, expr: InstrResolved) -> CodegenBlockPyExpr {
+impl MapInstr<InstrResolved, InstrCodegen> for CodegenExprNormalizer {
+    fn map_instr(&mut self, expr: InstrResolved) -> InstrCodegen {
         match_default!(expr: crate::passes::InstrLow<ResolvedName> {
             InstrResolved::Literal(literal) => {
                 let meta = literal.meta();

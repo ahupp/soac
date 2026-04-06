@@ -1,8 +1,8 @@
-use crate::passes::InstrRuff;
+use crate::block_py::InstrWithAwaitAndYield;
 use crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup;
 use crate::passes::ruff_to_blockpy::stmt_lowering::BlockPyStmtBuilder;
 use crate::passes::ruff_to_blockpy::test_name_gen;
-use crate::block_py::InstrWithAwaitAndYield;
+use crate::passes::InstrRuff;
 use crate::py_expr;
 
 #[test]
@@ -22,7 +22,8 @@ fn if_expr_lowering_emits_blockpy_setup_directly() {
     assert!(fragment.entry.body.is_empty(), "{fragment:?}");
     assert_eq!(fragment.deps.len(), 4, "{fragment:?}");
     assert!(fragment.deps.iter().any(|block| {
-        block.body
+        block
+            .body
             .iter()
             .any(|stmt| matches!(stmt, InstrWithAwaitAndYield::Store(_)))
     }));

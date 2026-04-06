@@ -96,7 +96,7 @@ fn split_exception_blocks_for_expr_checks(
 
 fn op_updates_exception_state<N>(op: &InstrLow<N>) -> bool
 where
-    N: crate::block_py::BlockPyNameLike,
+    N: crate::block_py::NameLike,
 {
     matches!(op, InstrLow::Store(_) | InstrLow::Del(_))
 }

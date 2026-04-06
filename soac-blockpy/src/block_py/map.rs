@@ -1,5 +1,36 @@
 use super::*;
 
+pub trait Mappable<E>: Sized
+where
+    E: Instr,
+{
+    type Mapped<T: Instr>;
+
+    fn map_children<T, M>(self, map: &mut M) -> Self::Mapped<T>
+    where
+        T: Instr,
+        M: MapInstr<E, T>;
+
+    fn try_map_children<T, Error, M>(self, map: &mut M) -> Result<Self::Mapped<T>, Error>
+    where
+        T: Instr,
+        M: TryMapInstr<E, T, Error>;
+
+    fn map_same_children<M>(self, map: &mut M) -> Self::Mapped<E>
+    where
+        M: MapInstr<E, E>,
+    {
+        self.map_children(map)
+    }
+
+    fn try_map_same_children<Error, M>(self, map: &mut M) -> Result<Self::Mapped<E>, Error>
+    where
+        M: TryMapInstr<E, E, Error>,
+    {
+        self.try_map_children(map)
+    }
+}
+
 pub trait MapInstr<In: Instr, Out: Instr> {
     fn map_instr(&mut self, instr: In) -> Out;
     fn map_name(&mut self, name: In::Name) -> Out::Name;
@@ -103,7 +134,7 @@ where
 {
 }
 
-pub(crate) trait MapFunction<PIn, POut>: MapBlock<PIn::Expr, POut::Expr>
+pub(crate) trait MapFunction<PIn, POut>: MapBlock<PIn::Instr, POut::Instr>
 where
     PIn: BlockPyPass,
     POut: BlockPyPass,
@@ -131,7 +162,7 @@ impl<PIn, POut, M> MapFunction<PIn, POut> for M
 where
     PIn: BlockPyPass,
     POut: BlockPyPass,
-    M: MapBlock<PIn::Expr, POut::Expr>,
+    M: MapBlock<PIn::Instr, POut::Instr>,
 {
 }
 
@@ -232,7 +263,7 @@ where
 }
 
 pub(crate) trait TryMapFunction<PIn, POut, Error>:
-    TryMapBlock<PIn::Expr, POut::Expr, Error>
+    TryMapBlock<PIn::Instr, POut::Instr, Error>
 where
     PIn: BlockPyPass,
     POut: BlockPyPass,
@@ -260,7 +291,7 @@ impl<PIn, POut, Error, M> TryMapFunction<PIn, POut, Error> for M
 where
     PIn: BlockPyPass,
     POut: BlockPyPass,
-    M: TryMapBlock<PIn::Expr, POut::Expr, Error>,
+    M: TryMapBlock<PIn::Instr, POut::Instr, Error>,
 {
 }
 

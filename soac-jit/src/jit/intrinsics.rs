@@ -1,17 +1,17 @@
 use super::{
-    ImportSpec, JitEmitCtx, SigType, emit_increment_counter_ptr, emit_owned_module_constant_from_parts,
+    ImportSpec, JitEmitCtx, SigType, emit_increment_counter_ptr,
+    emit_owned_module_constant_from_parts,
 };
 use crate::jit::blockpy_intrinsics;
 use crate::operator_specialization::{
-    BINARY_RHS_TAG_SHIFT, ExactIntBinaryOpKind, ExactIntUnaryOpKind, ExactTypeTag,
-    UNARY_TAG_SHIFT, pack_binary_shape, pack_unary_shape, unpack_binary_shape,
-    unpack_unary_shape,
+    BINARY_RHS_TAG_SHIFT, ExactIntBinaryOpKind, ExactIntUnaryOpKind, ExactTypeTag, UNARY_TAG_SHIFT,
+    pack_binary_shape, pack_unary_shape, unpack_binary_shape, unpack_unary_shape,
 };
 use cranelift_codegen::ir;
 use cranelift_codegen::ir::InstBuilder;
 use cranelift_frontend::FunctionBuilder;
 use pyo3::ffi;
-use soac_blockpy::block_py::{BlockPyNameLike, CodegenBlockPyExpr, HasMeta, Instr, NameLocation};
+use soac_blockpy::block_py::{HasMeta, Instr, InstrCodegen, NameLike, NameLocation};
 use std::mem::offset_of;
 
 pub(super) trait OperationEmitState<'fb, E> {
@@ -56,7 +56,6 @@ pub(super) trait OperationEmitState<'fb, E> {
         let result = self.fb().inst_results(call_inst)[0];
         self.finish_owned_result(result)
     }
-
 }
 
 macro_rules! define_owned_import_spec {
@@ -445,10 +444,12 @@ fn emit_exact_type_tag_for_value<'fb, E>(
     let ptr_ty = state.ctx().consts.ptr_ty;
     let i64_ty = state.ctx().consts.i64_ty;
     let py_long_type_ptr = state.ctx().consts.py_long_type_ptr as i64;
-    let object_type = state
-        .fb()
-        .ins()
-        .load(ptr_ty, ir::MemFlags::trusted(), value, PYOBJECT_OB_TYPE_OFFSET);
+    let object_type = state.fb().ins().load(
+        ptr_ty,
+        ir::MemFlags::trusted(),
+        value,
+        PYOBJECT_OB_TYPE_OFFSET,
+    );
     let py_long_type = state.fb().ins().iconst(ptr_ty, py_long_type_ptr);
     let is_long = state
         .fb()
@@ -527,49 +528,33 @@ fn emit_binop_with_arg_values<'fb, E>(
         blockpy_intrinsics::BinOpKind::Add => {
             emit_positional_owned_call_from_values(&PYNUMBER_ADD_IMPORT, state, arg_values)
         }
-        blockpy_intrinsics::BinOpKind::Sub => emit_positional_owned_call_from_values(
-            &PYNUMBER_SUBTRACT_IMPORT,
-            state,
-            arg_values,
-        ),
-        blockpy_intrinsics::BinOpKind::Mul => emit_positional_owned_call_from_values(
-            &PYNUMBER_MULTIPLY_IMPORT,
-            state,
-            arg_values,
-        ),
-        blockpy_intrinsics::BinOpKind::MatMul => emit_positional_owned_call_from_values(
-            &PYNUMBER_MATMUL_IMPORT,
-            state,
-            arg_values,
-        ),
-        blockpy_intrinsics::BinOpKind::TrueDiv => emit_positional_owned_call_from_values(
-            &PYNUMBER_TRUE_DIVIDE_IMPORT,
-            state,
-            arg_values,
-        ),
-        blockpy_intrinsics::BinOpKind::FloorDiv => emit_positional_owned_call_from_values(
-            &PYNUMBER_FLOOR_DIVIDE_IMPORT,
-            state,
-            arg_values,
-        ),
-        blockpy_intrinsics::BinOpKind::Mod => emit_positional_owned_call_from_values(
-            &PYNUMBER_REMAINDER_IMPORT,
-            state,
-            arg_values,
-        ),
+        blockpy_intrinsics::BinOpKind::Sub => {
+            emit_positional_owned_call_from_values(&PYNUMBER_SUBTRACT_IMPORT, state, arg_values)
+        }
+        blockpy_intrinsics::BinOpKind::Mul => {
+            emit_positional_owned_call_from_values(&PYNUMBER_MULTIPLY_IMPORT, state, arg_values)
+        }
+        blockpy_intrinsics::BinOpKind::MatMul => {
+            emit_positional_owned_call_from_values(&PYNUMBER_MATMUL_IMPORT, state, arg_values)
+        }
+        blockpy_intrinsics::BinOpKind::TrueDiv => {
+            emit_positional_owned_call_from_values(&PYNUMBER_TRUE_DIVIDE_IMPORT, state, arg_values)
+        }
+        blockpy_intrinsics::BinOpKind::FloorDiv => {
+            emit_positional_owned_call_from_values(&PYNUMBER_FLOOR_DIVIDE_IMPORT, state, arg_values)
+        }
+        blockpy_intrinsics::BinOpKind::Mod => {
+            emit_positional_owned_call_from_values(&PYNUMBER_REMAINDER_IMPORT, state, arg_values)
+        }
         blockpy_intrinsics::BinOpKind::Pow => {
             emit_pow_like_from_values(&PYNUMBER_POWER_IMPORT, state, arg_values)
         }
-        blockpy_intrinsics::BinOpKind::LShift => emit_positional_owned_call_from_values(
-            &PYNUMBER_LSHIFT_IMPORT,
-            state,
-            arg_values,
-        ),
-        blockpy_intrinsics::BinOpKind::RShift => emit_positional_owned_call_from_values(
-            &PYNUMBER_RSHIFT_IMPORT,
-            state,
-            arg_values,
-        ),
+        blockpy_intrinsics::BinOpKind::LShift => {
+            emit_positional_owned_call_from_values(&PYNUMBER_LSHIFT_IMPORT, state, arg_values)
+        }
+        blockpy_intrinsics::BinOpKind::RShift => {
+            emit_positional_owned_call_from_values(&PYNUMBER_RSHIFT_IMPORT, state, arg_values)
+        }
         blockpy_intrinsics::BinOpKind::Or => {
             emit_positional_owned_call_from_values(&PYNUMBER_OR_IMPORT, state, arg_values)
         }
@@ -579,11 +564,9 @@ fn emit_binop_with_arg_values<'fb, E>(
         blockpy_intrinsics::BinOpKind::And => {
             emit_positional_owned_call_from_values(&PYNUMBER_AND_IMPORT, state, arg_values)
         }
-        blockpy_intrinsics::BinOpKind::InplaceAdd => emit_positional_owned_call_from_values(
-            &PYNUMBER_INPLACE_ADD_IMPORT,
-            state,
-            arg_values,
-        ),
+        blockpy_intrinsics::BinOpKind::InplaceAdd => {
+            emit_positional_owned_call_from_values(&PYNUMBER_INPLACE_ADD_IMPORT, state, arg_values)
+        }
         blockpy_intrinsics::BinOpKind::InplaceSub => emit_positional_owned_call_from_values(
             &PYNUMBER_INPLACE_SUBTRACT_IMPORT,
             state,
@@ -627,21 +610,15 @@ fn emit_binop_with_arg_values<'fb, E>(
             state,
             arg_values,
         ),
-        blockpy_intrinsics::BinOpKind::InplaceOr => emit_positional_owned_call_from_values(
-            &PYNUMBER_INPLACE_OR_IMPORT,
-            state,
-            arg_values,
-        ),
-        blockpy_intrinsics::BinOpKind::InplaceXor => emit_positional_owned_call_from_values(
-            &PYNUMBER_INPLACE_XOR_IMPORT,
-            state,
-            arg_values,
-        ),
-        blockpy_intrinsics::BinOpKind::InplaceAnd => emit_positional_owned_call_from_values(
-            &PYNUMBER_INPLACE_AND_IMPORT,
-            state,
-            arg_values,
-        ),
+        blockpy_intrinsics::BinOpKind::InplaceOr => {
+            emit_positional_owned_call_from_values(&PYNUMBER_INPLACE_OR_IMPORT, state, arg_values)
+        }
+        blockpy_intrinsics::BinOpKind::InplaceXor => {
+            emit_positional_owned_call_from_values(&PYNUMBER_INPLACE_XOR_IMPORT, state, arg_values)
+        }
+        blockpy_intrinsics::BinOpKind::InplaceAnd => {
+            emit_positional_owned_call_from_values(&PYNUMBER_INPLACE_AND_IMPORT, state, arg_values)
+        }
         blockpy_intrinsics::BinOpKind::Eq => {
             emit_richcompare_from_values(ffi::Py_EQ, state, arg_values)
         }
@@ -694,11 +671,9 @@ fn emit_unary_op_with_arg_values<'fb, E>(
         blockpy_intrinsics::UnaryOpKind::Not => {
             emit_positional_bool_call_from_values(&PYOBJECT_NOT_IMPORT, state, arg_values)
         }
-        blockpy_intrinsics::UnaryOpKind::Truth => emit_positional_bool_call_from_values(
-            &PYOBJECT_IS_TRUE_IMPORT,
-            state,
-            arg_values,
-        ),
+        blockpy_intrinsics::UnaryOpKind::Truth => {
+            emit_positional_bool_call_from_values(&PYOBJECT_IS_TRUE_IMPORT, state, arg_values)
+        }
     }
 }
 
@@ -712,15 +687,19 @@ fn emit_unary_op<'fb, E>(
 }
 
 fn emit_specialized_binop<'fb>(
-    op: &blockpy_intrinsics::BinOp<CodegenBlockPyExpr>,
-    state: &mut impl OperationEmitState<'fb, CodegenBlockPyExpr>,
+    op: &blockpy_intrinsics::BinOp<InstrCodegen>,
+    state: &mut impl OperationEmitState<'fb, InstrCodegen>,
 ) -> Option<ir::Value> {
     let instr_id = op.meta().instr_id?;
     let ptr_ty = state.ctx().consts.ptr_ty;
     let i64_ty = state.ctx().consts.i64_ty;
     let vmctx_value = state.ctx().consts.vmctx_value;
     let record_counter_value_ref = state.ctx().record_counter_value_ref;
-    let counter_id = state.ctx().operator_shape_counter_ids.get(&instr_id).copied();
+    let counter_id = state
+        .ctx()
+        .operator_shape_counter_ids
+        .get(&instr_id)
+        .copied();
     let specialized_hit_counter_id = state
         .ctx()
         .operator_specialized_hit_counter_ids
@@ -737,7 +716,8 @@ fn emit_specialized_binop<'fb>(
         .get(&instr_id)
         .cloned()
         .unwrap_or_default();
-    let specialized_hit_counter_ptr = specialized_hit_counter_id.map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
+    let specialized_hit_counter_ptr =
+        specialized_hit_counter_id.map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
     let specialized_fallback_counter_ptr =
         specialized_fallback_counter_id.map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
     if counter_id.is_none() && hot_shapes.is_empty() {
@@ -748,10 +728,10 @@ fn emit_specialized_binop<'fb>(
     let shape = emit_binary_operator_shape_from_values(state, &arg_values);
     if let Some(counter_id) = counter_id {
         let counter_id_value = state.fb().ins().iconst(i64_ty, counter_id.0 as i64);
-        state
-            .fb()
-            .ins()
-            .call(record_counter_value_ref, &[vmctx_value, counter_id_value, shape]);
+        state.fb().ins().call(
+            record_counter_value_ref,
+            &[vmctx_value, counter_id_value, shape],
+        );
     }
 
     let Some(exact_int_kind) = ExactIntBinaryOpKind::from_binop_kind(op.kind) else {
@@ -805,15 +785,19 @@ fn emit_specialized_binop<'fb>(
 }
 
 fn emit_specialized_unary_op<'fb>(
-    op: &blockpy_intrinsics::UnaryOp<CodegenBlockPyExpr>,
-    state: &mut impl OperationEmitState<'fb, CodegenBlockPyExpr>,
+    op: &blockpy_intrinsics::UnaryOp<InstrCodegen>,
+    state: &mut impl OperationEmitState<'fb, InstrCodegen>,
 ) -> Option<ir::Value> {
     let instr_id = op.meta().instr_id?;
     let ptr_ty = state.ctx().consts.ptr_ty;
     let i64_ty = state.ctx().consts.i64_ty;
     let vmctx_value = state.ctx().consts.vmctx_value;
     let record_counter_value_ref = state.ctx().record_counter_value_ref;
-    let counter_id = state.ctx().operator_shape_counter_ids.get(&instr_id).copied();
+    let counter_id = state
+        .ctx()
+        .operator_shape_counter_ids
+        .get(&instr_id)
+        .copied();
     let specialized_hit_counter_id = state
         .ctx()
         .operator_specialized_hit_counter_ids
@@ -830,7 +814,8 @@ fn emit_specialized_unary_op<'fb>(
         .get(&instr_id)
         .cloned()
         .unwrap_or_default();
-    let specialized_hit_counter_ptr = specialized_hit_counter_id.map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
+    let specialized_hit_counter_ptr =
+        specialized_hit_counter_id.map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
     let specialized_fallback_counter_ptr =
         specialized_fallback_counter_id.map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
     if counter_id.is_none() && hot_shapes.is_empty() {
@@ -841,10 +826,10 @@ fn emit_specialized_unary_op<'fb>(
     let shape = emit_unary_operator_shape_from_values(state, &arg_values);
     if let Some(counter_id) = counter_id {
         let counter_id_value = state.fb().ins().iconst(i64_ty, counter_id.0 as i64);
-        state
-            .fb()
-            .ins()
-            .call(record_counter_value_ref, &[vmctx_value, counter_id_value, shape]);
+        state.fb().ins().call(
+            record_counter_value_ref,
+            &[vmctx_value, counter_id_value, shape],
+        );
     }
 
     let exact_int_kind = ExactIntUnaryOpKind::from_unary_op_kind(op.kind);
@@ -895,8 +880,8 @@ fn emit_specialized_unary_op<'fb>(
 }
 
 fn emit_load<'fb>(
-    op: &blockpy_intrinsics::Load<CodegenBlockPyExpr>,
-    state: &mut impl OperationEmitState<'fb, CodegenBlockPyExpr>,
+    op: &blockpy_intrinsics::Load<InstrCodegen>,
+    state: &mut impl OperationEmitState<'fb, InstrCodegen>,
 ) -> ir::Value {
     let func_ref = match op.name.location {
         NameLocation::Global(_) => state.import_func(&DP_JIT_LOAD_GLOBAL_OBJ_IMPORT),
@@ -976,8 +961,8 @@ fn emit_load<'fb>(
 }
 
 fn emit_store<'fb>(
-    op: &blockpy_intrinsics::Store<CodegenBlockPyExpr>,
-    state: &mut impl OperationEmitState<'fb, CodegenBlockPyExpr>,
+    op: &blockpy_intrinsics::Store<InstrCodegen>,
+    state: &mut impl OperationEmitState<'fb, InstrCodegen>,
 ) -> ir::Value {
     let arg_values = state.emit_arg_values(&[&op.value]);
     let name_obj = state.emit_owned_string_constant(op.name.id_str());
@@ -1002,8 +987,8 @@ fn emit_store<'fb>(
 }
 
 fn emit_del<'fb>(
-    op: &blockpy_intrinsics::Del<CodegenBlockPyExpr>,
-    state: &mut impl OperationEmitState<'fb, CodegenBlockPyExpr>,
+    op: &blockpy_intrinsics::Del<InstrCodegen>,
+    state: &mut impl OperationEmitState<'fb, InstrCodegen>,
 ) -> ir::Value {
     let name_obj = state.emit_owned_string_constant(op.name.id_str());
     let func_ref = if op.quietly {
@@ -1047,24 +1032,28 @@ pub(super) fn emit_del_deref_raw_cell<'fb, E>(
 }
 
 pub(super) fn emit_operation<'fb>(
-    operation: &CodegenBlockPyExpr,
-    state: &mut impl OperationEmitState<'fb, CodegenBlockPyExpr>,
+    operation: &InstrCodegen,
+    state: &mut impl OperationEmitState<'fb, InstrCodegen>,
 ) -> Option<ir::Value> {
     match operation {
-        CodegenBlockPyExpr::CalleeFunctionId(_) => None,
-        CodegenBlockPyExpr::Call(_) => None,
-        CodegenBlockPyExpr::CallDirect(_) => None,
-        CodegenBlockPyExpr::BinOp(op) => emit_specialized_binop(op, state).or_else(|| {
-            Some(emit_binop(op.kind, state, &[op.left.as_ref(), op.right.as_ref()]))
+        InstrCodegen::CalleeFunctionId(_) => None,
+        InstrCodegen::Call(_) => None,
+        InstrCodegen::CallDirect(_) => None,
+        InstrCodegen::BinOp(op) => emit_specialized_binop(op, state).or_else(|| {
+            Some(emit_binop(
+                op.kind,
+                state,
+                &[op.left.as_ref(), op.right.as_ref()],
+            ))
         }),
-        CodegenBlockPyExpr::UnaryOp(op) => emit_specialized_unary_op(op, state)
+        InstrCodegen::UnaryOp(op) => emit_specialized_unary_op(op, state)
             .or_else(|| Some(emit_unary_op(op.kind, state, &[op.operand.as_ref()]))),
-        CodegenBlockPyExpr::GetAttr(op) => Some(emit_getattr(op, state)),
-        CodegenBlockPyExpr::SetAttr(op) => Some(emit_setattr(op, state)),
-        CodegenBlockPyExpr::GetItem(op) => {
+        InstrCodegen::GetAttr(op) => Some(emit_getattr(op, state)),
+        InstrCodegen::SetAttr(op) => Some(emit_setattr(op, state)),
+        InstrCodegen::GetItem(op) => {
             Some(emit_getitem(state, &[op.value.as_ref(), op.index.as_ref()]))
         }
-        CodegenBlockPyExpr::SetItem(op) => Some(emit_setitem(
+        InstrCodegen::SetItem(op) => Some(emit_setitem(
             state,
             &[
                 op.value.as_ref(),
@@ -1072,23 +1061,19 @@ pub(super) fn emit_operation<'fb>(
                 op.replacement.as_ref(),
             ],
         )),
-        CodegenBlockPyExpr::DelItem(op) => Some(emit_positional_owned_call(
+        InstrCodegen::DelItem(op) => Some(emit_positional_owned_call(
             &DP_JIT_PYOBJECT_DELITEM_IMPORT,
             state,
             &[op.value.as_ref(), op.index.as_ref()],
         )),
-        CodegenBlockPyExpr::Load(op) => (op.name.location.is_global()
+        InstrCodegen::Load(op) => (op.name.location.is_global()
             || op.name.location.is_runtime_name())
         .then(|| emit_load(op, state)),
-        CodegenBlockPyExpr::MakeCell(op) => {
-            Some(emit_make_cell(state, &[op.initial_value.as_ref()]))
-        }
-        CodegenBlockPyExpr::IncrementCounter(_) => None,
-        CodegenBlockPyExpr::CellRef(_) => None,
-        CodegenBlockPyExpr::MakeFunction(_) => None,
-        CodegenBlockPyExpr::Store(op) => {
-            op.name.location.is_global().then(|| emit_store(op, state))
-        }
-        CodegenBlockPyExpr::Del(op) => op.name.location.is_global().then(|| emit_del(op, state)),
+        InstrCodegen::MakeCell(op) => Some(emit_make_cell(state, &[op.initial_value.as_ref()])),
+        InstrCodegen::IncrementCounter(_) => None,
+        InstrCodegen::CellRef(_) => None,
+        InstrCodegen::MakeFunction(_) => None,
+        InstrCodegen::Store(op) => op.name.location.is_global().then(|| emit_store(op, state)),
+        InstrCodegen::Del(op) => op.name.location.is_global().then(|| emit_del(op, state)),
     }
 }

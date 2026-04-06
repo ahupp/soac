@@ -1,7 +1,7 @@
 use crate::block_py::{
     core_call_expr_with_meta, literal_expr, BlockPyFunction, BlockPyModule, CallArgPositional,
-    ChildVisitable, CodegenBlockPyExpr, CoreStringLiteral, CounterScope, CounterSite, HasMeta,
-    IncrementCounter, Load, InstrResolved, ResolvedName, Meta, NameLocation, Visit, WithMeta,
+    ChildVisitable, CounterScope, CounterSite, HasMeta, IncrementCounter, InstrCodegen,
+    InstrResolved, Load, Meta, NameLocation, ResolvedName, StringLiteral, Visit, WithMeta,
 };
 use crate::passes::{CodegenBlockPyPass, CounterBuilder};
 use std::collections::HashMap;
@@ -113,9 +113,7 @@ pub fn instrument_bb_module_with_block_entry_counters(
                 .id();
             block.body.insert(
                 0,
-                CodegenBlockPyExpr::from(
-                    IncrementCounter::new(counter_id).with_meta(Meta::synthetic()),
-                ),
+                InstrCodegen::from(IncrementCounter::new(counter_id).with_meta(Meta::synthetic())),
             );
         }
     }
@@ -187,10 +185,16 @@ pub fn instrument_bb_module_with_global_load_counters(
 pub fn instrument_bb_module_with_call_target_counters(
     module: &mut BlockPyModule<CodegenBlockPyPass>,
 ) {
-    fn is_operator_specialization_candidate(expr: &CodegenBlockPyExpr) -> bool {
+    fn is_operator_specialization_candidate(expr: &InstrCodegen) -> bool {
         match expr {
-            CodegenBlockPyExpr::BinOp(op) => !matches!(op.kind, crate::block_py::BinOpKind::Contains | crate::block_py::BinOpKind::Is | crate::block_py::BinOpKind::MatMul | crate::block_py::BinOpKind::InplaceMatMul),
-            CodegenBlockPyExpr::UnaryOp(_) => true,
+            InstrCodegen::BinOp(op) => !matches!(
+                op.kind,
+                crate::block_py::BinOpKind::Contains
+                    | crate::block_py::BinOpKind::Is
+                    | crate::block_py::BinOpKind::MatMul
+                    | crate::block_py::BinOpKind::InplaceMatMul
+            ),
+            InstrCodegen::UnaryOp(_) => true,
             _ => false,
         }
     }
@@ -200,8 +204,8 @@ pub fn instrument_bb_module_with_call_target_counters(
         counters: &'a mut CounterBuilder<'b>,
     }
 
-    impl Visit<CodegenBlockPyExpr> for DirectCallCandidateCounterCollector<'_, '_> {
-        fn visit_instr(&mut self, expr: &CodegenBlockPyExpr) {
+    impl Visit<InstrCodegen> for DirectCallCandidateCounterCollector<'_, '_> {
+        fn visit_instr(&mut self, expr: &InstrCodegen) {
             if is_operator_specialization_candidate(expr) {
                 let instr_id = expr
                     .meta()
@@ -232,7 +236,7 @@ pub fn instrument_bb_module_with_call_target_counters(
                     },
                 );
             }
-            if let CodegenBlockPyExpr::Call(call) = expr {
+            if let InstrCodegen::Call(call) = expr {
                 let is_candidate = call.keywords.is_empty()
                     && call
                         .args
@@ -311,7 +315,7 @@ impl PreparedTraceNameLocator {
         let mut existing_locations = HashMap::new();
         for block in &function.blocks {
             for stmt in &block.body {
-                if let CodegenBlockPyExpr::Store(store) = stmt {
+                if let InstrCodegen::Store(store) = stmt {
                     existing_locations
                         .entry(store.name.id.to_string())
                         .or_insert(store.name.location);
@@ -385,7 +389,7 @@ impl PreparedTraceNameLocator {
     }
 }
 
-fn helper_call_expr(helper_name: &str, args: Vec<CodegenBlockPyExpr>) -> CodegenBlockPyExpr {
+fn helper_call_expr(helper_name: &str, args: Vec<InstrCodegen>) -> InstrCodegen {
     let meta = Meta::synthetic();
     let func = Load::new(ResolvedName {
         id: helper_name.into(),
@@ -404,15 +408,12 @@ fn helper_call_expr(helper_name: &str, args: Vec<CodegenBlockPyExpr>) -> Codegen
     )
 }
 
-fn string_literal_expr(
-    module_constants: &mut Vec<InstrResolved>,
-    value: &str,
-) -> CodegenBlockPyExpr {
+fn string_literal_expr(module_constants: &mut Vec<InstrResolved>, value: &str) -> InstrCodegen {
     let meta = Meta::synthetic();
     let index = u32::try_from(module_constants.len())
         .expect("trace module constant count should fit in u32");
     module_constants.push(literal_expr(
-        CoreStringLiteral {
+        StringLiteral {
             value: value.to_string(),
         },
         meta.clone(),
@@ -425,7 +426,7 @@ fn string_literal_expr(
     .into()
 }
 
-fn tuple_expr(values: Vec<CodegenBlockPyExpr>) -> CodegenBlockPyExpr {
+fn tuple_expr(values: Vec<InstrCodegen>) -> InstrCodegen {
     helper_call_expr("tuple_values", values)
 }
 
@@ -433,7 +434,7 @@ fn param_pairs_expr(
     module_constants: &mut Vec<InstrResolved>,
     locator: &PreparedTraceNameLocator,
     params: &[String],
-) -> CodegenBlockPyExpr {
+) -> InstrCodegen {
     tuple_expr(
         params
             .iter()

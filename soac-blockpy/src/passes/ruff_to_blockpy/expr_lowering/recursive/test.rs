@@ -1,8 +1,8 @@
 use crate::block_py::InstrWithAwaitAndYield;
-use crate::passes::InstrRuff;
 use crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup;
 use crate::passes::ruff_to_blockpy::stmt_lowering::BlockPyStmtBuilder;
 use crate::passes::ruff_to_blockpy::test_name_gen;
+use crate::passes::InstrRuff;
 use crate::py_expr;
 use ruff_python_parser::parse_expression;
 
@@ -18,10 +18,7 @@ fn nested_boolop_in_call_argument_emits_setup_via_expr_lowering() {
     .expect("expr lowering should succeed");
 
     let fragment = out.finish();
-    assert!(
-        !fragment.deps.is_empty(),
-        "{fragment:?}"
-    );
+    assert!(!fragment.deps.is_empty(), "{fragment:?}");
     let rendered = format!("{lowered:?}");
     assert!(rendered.starts_with("f(_dp_target_"), "{rendered}");
 }

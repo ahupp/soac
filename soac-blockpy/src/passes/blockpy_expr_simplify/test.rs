@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::block_py::{BinOpKind, BlockPyLiteral, BlockPyNameLike, UnaryOpKind};
+use crate::block_py::{BinOpKind, Literal, NameLike, UnaryOpKind};
 
 fn lower_semantic_expr_without_setup(expr: &Expr) -> InstrWithAwaitAndYield {
     InstrWithAwaitAndYield::from_ast_expr(expr.clone())
@@ -62,7 +62,7 @@ fn core_blockpy_expr_uses_reduced_variants_for_simple_shapes() {
     assert!(matches!(
         InstrWithAwaitAndYield::from_ast_expr(py_expr!("1")),
         InstrWithAwaitAndYield::Literal(literal)
-            if matches!(literal.as_literal(), BlockPyLiteral::NumberLiteral(_))
+            if matches!(literal.as_literal(), Literal::NumberLiteral(_))
     ));
     assert!(matches!(
         InstrWithAwaitAndYield::from_ast_expr(py_expr!("f(x)")),
@@ -104,9 +104,7 @@ fn core_blockpy_call_supports_star_args_and_kwargs() {
 #[test]
 fn core_blockpy_expr_reduces_add_to_structured_intrinsic() {
     let parsed = *parse_expression("x + y").unwrap().into_syntax().body;
-    let InstrWithAwaitAndYield::BinOp(op) =
-        InstrWithAwaitAndYield::from_ast_expr(parsed)
-    else {
+    let InstrWithAwaitAndYield::BinOp(op) = InstrWithAwaitAndYield::from_ast_expr(parsed) else {
         panic!("expected operation-shaped reduced expr for x + y");
     };
     assert_eq!(op.kind, BinOpKind::Add);
@@ -120,22 +118,10 @@ fn core_blockpy_expr_reduces_operator_helper_families_to_intrinsics() {
         let matches_expected = match (&*expr, &lowered) {
             ("obj.attr", InstrWithAwaitAndYield::GetAttr(_)) => true,
             ("obj[idx]", InstrWithAwaitAndYield::GetItem(_)) => true,
-            ("-x", InstrWithAwaitAndYield::UnaryOp(op))
-                if op.kind == UnaryOpKind::Neg =>
-            {
-                true
-            }
-            ("x < y", InstrWithAwaitAndYield::BinOp(op)) if op.kind == BinOpKind::Lt => {
-                true
-            }
-            ("x in y", InstrWithAwaitAndYield::BinOp(op))
-                if op.kind == BinOpKind::Contains =>
-            {
-                true
-            }
-            ("x is y", InstrWithAwaitAndYield::BinOp(op)) if op.kind == BinOpKind::Is => {
-                true
-            }
+            ("-x", InstrWithAwaitAndYield::UnaryOp(op)) if op.kind == UnaryOpKind::Neg => true,
+            ("x < y", InstrWithAwaitAndYield::BinOp(op)) if op.kind == BinOpKind::Lt => true,
+            ("x in y", InstrWithAwaitAndYield::BinOp(op)) if op.kind == BinOpKind::Contains => true,
+            ("x is y", InstrWithAwaitAndYield::BinOp(op)) if op.kind == BinOpKind::Is => true,
             _ => false,
         };
         assert!(matches_expected, "{lowered:?}");
@@ -151,8 +137,7 @@ fn core_blockpy_expr_keeps_non_intrinsic_helper_families_as_named_calls() {
         ("{x: y}", "dict"),
     ] {
         let parsed = *parse_expression(expr).unwrap().into_syntax().body;
-        let InstrWithAwaitAndYield::Call(call) =
-            InstrWithAwaitAndYield::from_ast_expr(parsed)
+        let InstrWithAwaitAndYield::Call(call) = InstrWithAwaitAndYield::from_ast_expr(parsed)
         else {
             panic!("expected call-shaped reduced expr for {expr}");
         };
@@ -183,8 +168,7 @@ fn core_blockpy_expr_reuses_shared_tuple_splat_intrinsic_shape() {
 fn core_blockpy_expr_reuses_shared_tuple_splat_for_list_and_set() {
     for (expr, intrinsic) in [("[x, *xs, y]", "list"), ("{x, *xs, y}", "set")] {
         let parsed = *parse_expression(expr).unwrap().into_syntax().body;
-        let InstrWithAwaitAndYield::Call(call) =
-            InstrWithAwaitAndYield::from_ast_expr(parsed)
+        let InstrWithAwaitAndYield::Call(call) = InstrWithAwaitAndYield::from_ast_expr(parsed)
         else {
             panic!("expected call-shaped reduced expr for {expr}");
         };

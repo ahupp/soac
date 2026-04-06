@@ -1,10 +1,9 @@
 use pyo3::ffi;
 use pyo3::prelude::*;
 use soac_blockpy::block_py::{
-    AbruptKind, BlockArg, BlockPyFunction, BlockPyLiteral, BlockPyModule, BlockPyNameLike,
-    BlockTerm, CallArgKeyword, ChildVisitable, CodegenBlockPyExpr, CoreNumberLiteralValue,
-    InstrResolved, ParamDefaultSource,
-    operation as blockpy_intrinsics,
+    AbruptKind, BlockArg, BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword,
+    ChildVisitable, InstrCodegen, InstrResolved, Literal, NameLike, NumberLiteralValue,
+    ParamDefaultSource, operation as blockpy_intrinsics,
 };
 use soac_blockpy::passes::CodegenBlockPyPass;
 use std::collections::HashMap;
@@ -209,21 +208,19 @@ impl ModuleCodegenConstants {
     fn push_explicit_constant_expr(&mut self, expr: &InstrResolved) -> ModuleConstantId {
         let value = match expr {
             InstrResolved::Literal(literal) => match literal.as_literal() {
-                BlockPyLiteral::StringLiteral(string) => {
+                Literal::StringLiteral(string) => {
                     ModuleConstantValue::Unicode(string.value.as_bytes().to_vec())
                 }
-                BlockPyLiteral::BytesLiteral(bytes) => {
-                    ModuleConstantValue::Bytes(bytes.value.clone())
-                }
-                BlockPyLiteral::NumberLiteral(number) => match &number.value {
-                    CoreNumberLiteralValue::Int(value) => {
+                Literal::BytesLiteral(bytes) => ModuleConstantValue::Bytes(bytes.value.clone()),
+                Literal::NumberLiteral(number) => match &number.value {
+                    NumberLiteralValue::Int(value) => {
                         if let Some(value) = value.as_i64() {
                             ModuleConstantValue::Int(value)
                         } else {
                             ModuleConstantValue::BigInt(value.to_string())
                         }
                     }
-                    CoreNumberLiteralValue::Float(value) => {
+                    NumberLiteralValue::Float(value) => {
                         ModuleConstantValue::FloatBits(value.to_bits())
                     }
                 },
@@ -395,11 +392,11 @@ impl ModuleConstantCollector {
         }
     }
 
-    fn collect_stmt(&mut self, stmt: &CodegenBlockPyExpr) {
+    fn collect_stmt(&mut self, stmt: &InstrCodegen) {
         self.collect_expr(stmt);
     }
 
-    fn collect_term(&mut self, term: &BlockTerm<CodegenBlockPyExpr>) {
+    fn collect_term(&mut self, term: &BlockTerm<InstrCodegen>) {
         match term {
             BlockTerm::Jump(edge) => self.collect_block_args(&edge.args),
             BlockTerm::IfTerm(if_term) => self.collect_expr(&if_term.test),
@@ -421,13 +418,13 @@ impl ModuleConstantCollector {
         }
     }
 
-    fn collect_expr(&mut self, expr: &CodegenBlockPyExpr) {
+    fn collect_expr(&mut self, expr: &InstrCodegen) {
         match expr {
-            CodegenBlockPyExpr::IncrementCounter(_) => {}
-            CodegenBlockPyExpr::CalleeFunctionId(op) => {
+            InstrCodegen::IncrementCounter(_) => {}
+            InstrCodegen::CalleeFunctionId(op) => {
                 self.collect_expr(op.value.as_ref());
             }
-            CodegenBlockPyExpr::Call(call) => {
+            InstrCodegen::Call(call) => {
                 if let Some(const_bytes) = self.string_constant_bytes_for_specialized_codegen(expr)
                 {
                     self.constants.intern_unicode_bytes(const_bytes.as_slice());
@@ -447,7 +444,7 @@ impl ModuleConstantCollector {
                     self.collect_expr(keyword.expr());
                 }
             }
-            CodegenBlockPyExpr::CallDirect(call) => {
+            InstrCodegen::CallDirect(call) => {
                 self.collect_expr(call.callable.as_ref());
                 for arg in &call.args {
                     self.collect_expr(arg.expr());
@@ -459,7 +456,7 @@ impl ModuleConstantCollector {
                     self.collect_expr(keyword.expr());
                 }
             }
-            CodegenBlockPyExpr::GetAttr(op) => {
+            InstrCodegen::GetAttr(op) => {
                 if let Some(attr_bytes) =
                     self.string_constant_bytes_for_specialized_codegen(op.attr.as_ref())
                 {
@@ -467,7 +464,7 @@ impl ModuleConstantCollector {
                 }
                 op.visit_children(self);
             }
-            CodegenBlockPyExpr::SetAttr(op) => {
+            InstrCodegen::SetAttr(op) => {
                 if let Some(attr_bytes) =
                     self.string_constant_bytes_for_specialized_codegen(op.attr.as_ref())
                 {
@@ -475,51 +472,51 @@ impl ModuleConstantCollector {
                 }
                 op.visit_children(self);
             }
-            CodegenBlockPyExpr::Load(op)
+            InstrCodegen::Load(op)
                 if op.name.location.is_global() || op.name.location.is_runtime_name() =>
             {
                 self.constants
                     .intern_unicode_bytes(op.name.id_str().as_bytes());
             }
-            CodegenBlockPyExpr::Load(_) => {}
-            CodegenBlockPyExpr::Store(op) if op.name.location.is_global() => {
+            InstrCodegen::Load(_) => {}
+            InstrCodegen::Store(op) if op.name.location.is_global() => {
                 self.constants
                     .intern_unicode_bytes(op.name.id_str().as_bytes());
                 op.visit_children(self);
             }
-            CodegenBlockPyExpr::Store(op) => {
+            InstrCodegen::Store(op) => {
                 op.visit_children(self);
             }
-            CodegenBlockPyExpr::Del(op) if op.name.location.is_global() => {
+            InstrCodegen::Del(op) if op.name.location.is_global() => {
                 self.constants
                     .intern_unicode_bytes(op.name.id_str().as_bytes());
             }
-            CodegenBlockPyExpr::BinOp(op) => op.visit_children(self),
-            CodegenBlockPyExpr::UnaryOp(op) => {
+            InstrCodegen::BinOp(op) => op.visit_children(self),
+            InstrCodegen::UnaryOp(op) => {
                 op.visit_children(self);
             }
-            CodegenBlockPyExpr::GetItem(op) => {
+            InstrCodegen::GetItem(op) => {
                 op.visit_children(self);
             }
-            CodegenBlockPyExpr::SetItem(op) => {
+            InstrCodegen::SetItem(op) => {
                 op.visit_children(self);
             }
-            CodegenBlockPyExpr::DelItem(op) => {
+            InstrCodegen::DelItem(op) => {
                 op.visit_children(self);
             }
-            CodegenBlockPyExpr::MakeCell(op) => {
+            InstrCodegen::MakeCell(op) => {
                 op.visit_children(self);
             }
-            CodegenBlockPyExpr::MakeFunction(op) => {
+            InstrCodegen::MakeFunction(op) => {
                 op.visit_children(self);
             }
-            CodegenBlockPyExpr::Del(_) | CodegenBlockPyExpr::CellRef(_) => {}
+            InstrCodegen::Del(_) | InstrCodegen::CellRef(_) => {}
         }
     }
 
     fn deleted_name_arg_bytes(
         &self,
-        call: &blockpy_intrinsics::Call<CodegenBlockPyExpr>,
+        call: &blockpy_intrinsics::Call<InstrCodegen>,
     ) -> Option<Vec<u8>> {
         if helper_name_for_codegen_expr(call.func.as_ref(), &self.constants)
             != Some("load_deleted_name")
@@ -532,15 +529,15 @@ impl ModuleConstantCollector {
 
     fn string_constant_bytes_for_specialized_codegen(
         &self,
-        expr: &CodegenBlockPyExpr,
+        expr: &InstrCodegen,
     ) -> Option<Vec<u8>> {
         match expr {
-            CodegenBlockPyExpr::Load(op) => op.name.location.as_constant().and_then(|index| {
+            InstrCodegen::Load(op) => op.name.location.as_constant().and_then(|index| {
                 self.constants
                     .constant_string_bytes_value(ModuleConstantId(index as usize))
                     .map(ToOwned::to_owned)
             }),
-            CodegenBlockPyExpr::Call(call) => {
+            InstrCodegen::Call(call) => {
                 if helper_name_for_codegen_expr(call.func.as_ref(), &self.constants) != Some("str")
                     || call.args.len() != 1
                     || !call.keywords.is_empty()
@@ -554,23 +551,23 @@ impl ModuleConstantCollector {
     }
 }
 
-impl soac_blockpy::block_py::Visit<CodegenBlockPyExpr> for ModuleConstantCollector {
-    fn visit_instr(&mut self, expr: &CodegenBlockPyExpr) {
+impl soac_blockpy::block_py::Visit<InstrCodegen> for ModuleConstantCollector {
+    fn visit_instr(&mut self, expr: &InstrCodegen) {
         self.collect_expr(expr);
     }
 }
 
 fn helper_name_for_codegen_expr<'a>(
-    expr: &'a CodegenBlockPyExpr,
+    expr: &'a InstrCodegen,
     module_constants: &'a ModuleCodegenConstants,
 ) -> Option<&'a str> {
     match expr {
-        CodegenBlockPyExpr::Load(op)
+        InstrCodegen::Load(op)
             if op.name.location.is_global() || op.name.location.is_runtime_name() =>
         {
             Some(op.name.id.as_str())
         }
-        CodegenBlockPyExpr::Load(op) => op.name.location.as_constant().and_then(|index| {
+        InstrCodegen::Load(op) => op.name.location.as_constant().and_then(|index| {
             module_constants.constant_runtime_name_value(ModuleConstantId(index as usize))
         }),
         _ => None,

@@ -1,6 +1,6 @@
 use crate::block_py::{
-    walk_expr_mut, BlockLabel, BlockPyFunction, BlockPyModule, ChildVisitable, CodegenBlockPyExpr,
-    HasMeta, InstrId, VisitMut, WithMeta,
+    walk_expr_mut, BlockLabel, BlockPyFunction, BlockPyModule, ChildVisitable, HasMeta,
+    InstrCodegen, InstrId, VisitMut, WithMeta,
 };
 use crate::passes::CodegenBlockPyPass;
 
@@ -27,10 +27,10 @@ impl BlockInstrIdAssigner {
     }
 }
 
-impl VisitMut<CodegenBlockPyExpr> for BlockInstrIdAssigner {
-    fn visit_instr_mut(&mut self, expr: &mut CodegenBlockPyExpr)
+impl VisitMut<InstrCodegen> for BlockInstrIdAssigner {
+    fn visit_instr_mut(&mut self, expr: &mut InstrCodegen)
     where
-        CodegenBlockPyExpr: ChildVisitable<CodegenBlockPyExpr>,
+        InstrCodegen: ChildVisitable<InstrCodegen>,
     {
         self.assign(expr);
         walk_expr_mut(self, expr);
@@ -56,9 +56,7 @@ pub fn assign_module_instr_ids(module: &mut BlockPyModule<CodegenBlockPyPass>) {
 #[cfg(test)]
 mod test {
     use super::assign_module_instr_ids;
-    use crate::block_py::{
-        walk_block, ChildVisitable, CodegenBlockPyExpr, HasMeta, InstrId, Visit,
-    };
+    use crate::block_py::{walk_block, ChildVisitable, HasMeta, InstrCodegen, InstrId, Visit};
     use crate::lower_python_to_blockpy_for_testing;
     use std::collections::HashMap;
 
@@ -66,10 +64,10 @@ mod test {
         ids_by_block: HashMap<crate::block_py::BlockLabel, Vec<InstrId>>,
     }
 
-    impl Visit<CodegenBlockPyExpr> for InstrIdCollector {
-        fn visit_instr(&mut self, expr: &CodegenBlockPyExpr)
+    impl Visit<InstrCodegen> for InstrIdCollector {
+        fn visit_instr(&mut self, expr: &InstrCodegen)
         where
-            CodegenBlockPyExpr: ChildVisitable<CodegenBlockPyExpr>,
+            InstrCodegen: ChildVisitable<InstrCodegen>,
         {
             let instr_id = expr.meta().instr_id.expect("instr ids should be assigned");
             self.ids_by_block

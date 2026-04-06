@@ -1,9 +1,8 @@
 use super::lower_try_jump_exception_flow;
 use crate::block_py::{
     validate_module, AbruptKind, BindingKind, BlockArg, BlockEdge, BlockLabel, BlockParam,
-    BlockParamRole, BlockPyLiteral, BlockTerm, CellBindingKind, CodegenBlock, CodegenBlockPyExpr,
-    CoreNumberLiteral, CoreNumberLiteralValue, InstrResolved,
-    NameLocation, ResolvedStorageBlock, StorageLayout,
+    BlockParamRole, BlockTerm, CellBindingKind, CodegenBlock, InstrCodegen, InstrResolved, Literal,
+    NameLocation, NumberLiteral, NumberLiteralValue, ResolvedStorageBlock, StorageLayout,
 };
 use crate::lower_python_to_blockpy_for_testing;
 use crate::passes::CodegenBlockPyPass;
@@ -32,8 +31,8 @@ fn is_return_of_number_constant(term: &BlockTerm<InstrResolved>) -> bool {
         BlockTerm::Return(InstrResolved::Literal(literal))
             if matches!(
                 literal.as_literal(),
-                BlockPyLiteral::NumberLiteral(CoreNumberLiteral {
-                    value: CoreNumberLiteralValue::Int(_),
+                Literal::NumberLiteral(NumberLiteral {
+                    value: NumberLiteralValue::Int(_),
                     ..
                 })
             ) =>
@@ -221,8 +220,8 @@ def f():
     function.blocks.push(CodegenBlock {
         label: target,
         body: vec![],
-        term: BlockTerm::<CodegenBlockPyExpr>::Return(
-            <CodegenBlockPyExpr as crate::block_py::ImplicitNoneExpr>::implicit_none_expr(),
+        term: BlockTerm::<InstrCodegen>::Return(
+            <InstrCodegen as crate::block_py::ImplicitNoneExpr>::implicit_none_expr(),
         ),
         params: vec![BlockParam {
             name: "_dp_try_exc".to_string(),

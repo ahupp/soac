@@ -12,7 +12,8 @@ pub(crate) fn lower_stmts_to_blockpy_stmts_with_context<E>(
 where
     E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
 {
-    let mut out = crate::passes::ruff_to_blockpy::stmt_lowering::BlockPyStmtBuilder::<E>::new(name_gen);
+    let mut out =
+        crate::passes::ruff_to_blockpy::stmt_lowering::BlockPyStmtBuilder::<E>::new(name_gen);
     for stmt in stmts {
         lower_instr_into_with_expr(context, stmt, name_gen, &mut out, None)?;
     }
@@ -27,8 +28,14 @@ pub(crate) fn plan_instr_sequence_head(
 }
 
 pub(crate) enum InstrSequenceDriveResult {
-    Exhausted { linear: Vec<InstrRuff> },
-    Break { linear: Vec<InstrRuff>, index: usize, plan: StmtSequenceHeadPlan },
+    Exhausted {
+        linear: Vec<InstrRuff>,
+    },
+    Break {
+        linear: Vec<InstrRuff>,
+        index: usize,
+        plan: StmtSequenceHeadPlan,
+    },
 }
 
 pub(crate) fn drive_instr_sequence_until_control(
@@ -68,12 +75,16 @@ pub(crate) fn drive_instr_sequence_until_control(
     InstrSequenceDriveResult::Exhausted { linear }
 }
 
-fn compat_blockpy_raise_from_instr(raise_stmt: crate::block_py::StmtRaise<InstrRuff>) -> TermRaise<InstrRuff> {
+fn compat_blockpy_raise_from_instr(
+    raise_stmt: crate::block_py::StmtRaise<InstrRuff>,
+) -> TermRaise<InstrRuff> {
     assert!(
         raise_stmt.cause.is_none(),
         "raise-from should be lowered before Ruff AST -> BlockPy conversion"
     );
-    TermRaise { exc: raise_stmt.exc.map(|expr| *expr) }
+    TermRaise {
+        exc: raise_stmt.exc.map(|expr| *expr),
+    }
 }
 
 fn contains_return_instr_in_body(stmts: &[InstrRuff]) -> bool {
@@ -88,7 +99,8 @@ fn contains_return_stmt_in_handlers(handlers: &[ast::ExceptHandler]) -> bool {
 }
 
 fn contains_return_stmt_in_body(stmts: &[Stmt]) -> bool {
-    stmts.iter()
+    stmts
+        .iter()
         .cloned()
         .map(InstrRuff::from_ast_stmt)
         .any(|stmt| contains_return_instr(&stmt))
@@ -191,25 +203,25 @@ where
             ))
         }
         StmtSequenceHeadPlan::Break => match targets.loop_labels {
-                Some(loop_labels) => Some(emit_sequence_jump_block(
-                    context,
-                    blocks,
-                    name_gen,
-                    linear,
-                    loop_labels.break_label,
-                    targets.active_exc.as_ref(),
-                )),
+            Some(loop_labels) => Some(emit_sequence_jump_block(
+                context,
+                blocks,
+                name_gen,
+                linear,
+                loop_labels.break_label,
+                targets.active_exc.as_ref(),
+            )),
             None => Some(targets.normal_cont),
         },
         StmtSequenceHeadPlan::Continue => match targets.loop_labels {
-                Some(loop_labels) => Some(emit_sequence_jump_block(
-                    context,
-                    blocks,
-                    name_gen,
-                    linear,
-                    loop_labels.continue_label,
-                    targets.active_exc.as_ref(),
-                )),
+            Some(loop_labels) => Some(emit_sequence_jump_block(
+                context,
+                blocks,
+                name_gen,
+                linear,
+                loop_labels.continue_label,
+                targets.active_exc.as_ref(),
+            )),
             None => Some(targets.normal_cont),
         },
         _ => None,
@@ -288,23 +300,24 @@ where
     let mut index = 0;
     while index < stmts.len() {
         let plan;
-        (linear, index, plan) = match drive_instr_sequence_until_control(context, &stmts[index..], linear) {
-            InstrSequenceDriveResult::Exhausted { linear } => {
-                return emit_sequence_jump_block(
-                    context,
-                    blocks,
-                    name_gen,
+        (linear, index, plan) =
+            match drive_instr_sequence_until_control(context, &stmts[index..], linear) {
+                InstrSequenceDriveResult::Exhausted { linear } => {
+                    return emit_sequence_jump_block(
+                        context,
+                        blocks,
+                        name_gen,
+                        linear,
+                        targets.normal_cont.clone(),
+                        targets.active_exc.as_ref(),
+                    );
+                }
+                InstrSequenceDriveResult::Break {
                     linear,
-                    targets.normal_cont.clone(),
-                    targets.active_exc.as_ref(),
-                );
-            }
-            InstrSequenceDriveResult::Break {
-                linear,
-                index: break_index,
-                plan,
-            } => (linear, index + break_index, plan),
-        };
+                    index: break_index,
+                    plan,
+                } => (linear, index + break_index, plan),
+            };
 
         match plan {
             plan @ (StmtSequenceHeadPlan::Raise(_)
@@ -509,7 +522,9 @@ where
     }
     let jump_label = jump_label.expect("linear prefix requires a jump label");
     let lowered_linear = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &linear, name_gen)
-        .unwrap_or_else(|err| panic!("failed to lower expanded-sequence jump prefix through production path: {err}"));
+        .unwrap_or_else(|err| {
+            panic!("failed to lower expanded-sequence jump prefix through production path: {err}")
+        });
     blocks.push(crate::passes::ruff_to_blockpy::compat::compat_block_from_lowered_builder_with_exc_target_and_expr(
         jump_label.clone(),
         lowered_linear,

@@ -5,13 +5,13 @@ use super::{
 };
 use crate::block_py::{
     core_call_expr_with_meta, BinOpKind, BindingKind, BindingPurpose, Block, BlockBuilder,
-    BlockLabel, BlockPyLiteral, BlockPyNameLike, BlockTerm, CallArgPositional, CallableScopeInfo,
-    CallableScopeKind, CellBindingKind, ClosureInit, ClosureSlot, InstrUnresolved,
-    InstrWithYield, FunctionId, FunctionName, HasMeta, Meta, StorageLayout,
-    TryMapTerm, UnaryOpKind, WithMeta, Yield,
+    BlockLabel, BlockTerm, CallArgPositional, CallableScopeInfo, CallableScopeKind,
+    CellBindingKind, ClosureInit, ClosureSlot, FunctionId, FunctionName, HasMeta, InstrUnresolved,
+    InstrWithYield, Literal, Meta, NameLike, StorageLayout, TryMapTerm, UnaryOpKind, WithMeta,
+    Yield,
 };
-use crate::passes::InstrRuff;
 use crate::passes::ast_to_ast::scope_helpers::is_internal_symbol;
+use crate::passes::InstrRuff;
 use crate::py_expr;
 use ruff_python_ast::{self as ast, Expr};
 use ruff_text_size::TextRange;
@@ -147,7 +147,7 @@ fn yield_from_send_helper_builds_send_call_shape() {
     let InstrUnresolved::Literal(lit) = *get_attr.attr else {
         panic!("expected send attr literal");
     };
-    let BlockPyLiteral::StringLiteral(lit) = lit.into_literal() else {
+    let Literal::StringLiteral(lit) = lit.into_literal() else {
         panic!("expected string attr literal");
     };
     assert_eq!(lit.value, "send");
@@ -177,7 +177,7 @@ fn yield_from_lookup_helper_builds_getattr_call_shape() {
     let CallArgPositional::Positional(InstrUnresolved::Literal(lit)) = &call.args[1] else {
         panic!("expected second positional string attr argument");
     };
-    let BlockPyLiteral::StringLiteral(lit) = lit.clone().into_literal() else {
+    let Literal::StringLiteral(lit) = lit.clone().into_literal() else {
         panic!("expected string attr literal");
     };
     assert_eq!(lit.value, "close");
@@ -201,7 +201,7 @@ fn current_exception_value_helper_builds_value_attr_lookup() {
     let InstrUnresolved::Literal(lit) = *get_attr.attr else {
         panic!("expected literal attr name");
     };
-    let BlockPyLiteral::StringLiteral(lit) = lit.into_literal() else {
+    let Literal::StringLiteral(lit) = lit.into_literal() else {
         panic!("expected string attr literal");
     };
     assert_eq!(lit.value, "value");
@@ -398,11 +398,9 @@ fn term_conversion_to_no_yield_rejects_nested_yield() {
         core_load_with_yield("f"),
         ast::AtomicNodeIndex::default(),
         TextRange::default(),
-        vec![CallArgPositional::Positional(
-            InstrWithYield::Yield(
-                Yield::new(core_load_with_yield("x")).with_meta(Meta::default()),
-            ),
-        )],
+        vec![CallArgPositional::Positional(InstrWithYield::Yield(
+            Yield::new(core_load_with_yield("x")).with_meta(Meta::default()),
+        ))],
         Vec::new(),
     ));
 

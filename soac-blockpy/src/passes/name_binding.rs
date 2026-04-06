@@ -2,13 +2,13 @@ use crate::block_py::{
     build_storage_layout_from_capture_names, compute_make_function_capture_bindings_from_scope,
     compute_storage_layout_from_scope, core_runtime_positional_call_expr_with_meta, literal_expr,
     runtime_symbol, BindingKind, BindingPurpose, BindingTarget, BlockArg, BlockPyFunction,
-    BlockPyModule, BlockPyNameLike, BlockTerm, Call, CallArgPositional, CallableScopeInfo,
-    CallableScopeKind, CellBindingKind, CellCaptureBinding, CellLocation, CellRef, CellRefForName,
-    ChildVisitable, ClassBodyFallback, ClosureInit, ClosureSlot, InstrLow, InstrUnresolved,
-    CoreNumberLiteral, CoreNumberLiteralValue, CoreStringLiteral, Del, DelItem, EffectiveBinding,
-    FunctionId, FunctionKind, HasMeta, Load, LocalLocation, InstrResolved, ResolvedName,
-    MakeCell, MakeFunction, MapFunction, MapInstr, Mappable, NameLocation, SetItem, StorageLayout,
-    Store, UnresolvedName, WithMeta,
+    BlockPyModule, BlockTerm, Call, CallArgPositional, CallableScopeInfo, CallableScopeKind,
+    CellBindingKind, CellCaptureBinding, CellLocation, CellRef, CellRefForName, ChildVisitable,
+    ClassBodyFallback, ClosureInit, ClosureSlot, Del, DelItem, EffectiveBinding, FunctionId,
+    FunctionKind, HasMeta, InstrLow, InstrResolved, InstrUnresolved, Load, LocalLocation, MakeCell,
+    MakeFunction, MapFunction, MapInstr, Mappable, NameLike, NameLocation, NumberLiteral,
+    NumberLiteralValue, ResolvedName, SetItem, StorageLayout, Store, StringLiteral, UnresolvedName,
+    WithMeta,
 };
 use crate::passes::ruff_to_blockpy::{
     populate_exception_edge_args, rewrite_current_exception_in_core_blocks,
@@ -32,7 +32,7 @@ fn core_string_expr(
     range: ruff_text_size::TextRange,
 ) -> InstrUnresolved {
     literal_expr(
-        CoreStringLiteral { value },
+        StringLiteral { value },
         crate::block_py::Meta::new(node_index, range),
     )
 }
@@ -44,8 +44,8 @@ fn core_int_expr(
 ) -> InstrUnresolved {
     let text = value.to_string();
     literal_expr(
-        CoreNumberLiteral {
-            value: CoreNumberLiteralValue::Int(
+        NumberLiteral {
+            value: NumberLiteralValue::Int(
                 ast::Int::from_str_radix(text.as_str(), 10, text.as_str())
                     .expect("function id should round-trip through Int"),
             ),
@@ -126,7 +126,7 @@ fn rewrite_raw_cell_storage_name_load(
 
 fn raw_load_name<N>(expr: &InstrLow<N>) -> Option<String>
 where
-    N: BlockPyNameLike,
+    N: NameLike,
 {
     match expr {
         InstrLow::Load(op) => Some(op.name.id_str().to_string()),
@@ -287,52 +287,34 @@ fn wrap_deleted_name_load_expr(
     )
 }
 
-fn with_helper_arg_mut<N: BlockPyNameLike + Clone>(
+fn with_helper_arg_mut<N: NameLike + Clone>(
     expr: &mut InstrLow<N>,
     index: usize,
     f: &mut impl FnMut(&mut InstrLow<N>),
 ) -> bool {
     match expr {
         InstrLow::BinOp(operation) => with_helper_arg_mut_in_operation(operation, index, f),
-        InstrLow::UnaryOp(operation) => {
-            with_helper_arg_mut_in_operation(operation, index, f)
-        }
+        InstrLow::UnaryOp(operation) => with_helper_arg_mut_in_operation(operation, index, f),
         InstrLow::Call(operation) => with_helper_arg_mut_in_operation(operation, index, f),
-        InstrLow::GetAttr(operation) => {
-            with_helper_arg_mut_in_operation(operation, index, f)
-        }
-        InstrLow::SetAttr(operation) => {
-            with_helper_arg_mut_in_operation(operation, index, f)
-        }
-        InstrLow::GetItem(operation) => {
-            with_helper_arg_mut_in_operation(operation, index, f)
-        }
-        InstrLow::SetItem(operation) => {
-            with_helper_arg_mut_in_operation(operation, index, f)
-        }
-        InstrLow::DelItem(operation) => {
-            with_helper_arg_mut_in_operation(operation, index, f)
-        }
+        InstrLow::GetAttr(operation) => with_helper_arg_mut_in_operation(operation, index, f),
+        InstrLow::SetAttr(operation) => with_helper_arg_mut_in_operation(operation, index, f),
+        InstrLow::GetItem(operation) => with_helper_arg_mut_in_operation(operation, index, f),
+        InstrLow::SetItem(operation) => with_helper_arg_mut_in_operation(operation, index, f),
+        InstrLow::DelItem(operation) => with_helper_arg_mut_in_operation(operation, index, f),
         InstrLow::Load(operation) => with_helper_arg_mut_in_operation(operation, index, f),
         InstrLow::Store(operation) => with_helper_arg_mut_in_operation(operation, index, f),
         InstrLow::Del(operation) => with_helper_arg_mut_in_operation(operation, index, f),
-        InstrLow::MakeCell(operation) => {
-            with_helper_arg_mut_in_operation(operation, index, f)
-        }
+        InstrLow::MakeCell(operation) => with_helper_arg_mut_in_operation(operation, index, f),
         InstrLow::CellRefForName(operation) => {
             with_helper_arg_mut_in_operation(operation, index, f)
         }
-        InstrLow::CellRef(operation) => {
-            with_helper_arg_mut_in_operation(operation, index, f)
-        }
-        InstrLow::MakeFunction(operation) => {
-            with_helper_arg_mut_in_operation(operation, index, f)
-        }
+        InstrLow::CellRef(operation) => with_helper_arg_mut_in_operation(operation, index, f),
+        InstrLow::MakeFunction(operation) => with_helper_arg_mut_in_operation(operation, index, f),
         _ => false,
     }
 }
 
-fn with_helper_arg_mut_in_operation<N: BlockPyNameLike + Clone, T>(
+fn with_helper_arg_mut_in_operation<N: NameLike + Clone, T>(
     operation: &mut T,
     index: usize,
     f: &mut impl FnMut(&mut InstrLow<N>),
@@ -343,7 +325,7 @@ where
 {
     let current = 0;
     let applied = false;
-    struct IndexedArgMutVisitor<'a, N: BlockPyNameLike, F> {
+    struct IndexedArgMutVisitor<'a, N: NameLike, F> {
         current: usize,
         index: usize,
         applied: bool,
@@ -353,7 +335,7 @@ where
 
     impl<N, F> crate::block_py::VisitMut<InstrLow<N>> for IndexedArgMutVisitor<'_, N, F>
     where
-        N: BlockPyNameLike + Clone,
+        N: NameLike + Clone,
         F: FnMut(&mut InstrLow<N>),
     {
         fn visit_instr_mut(&mut self, expr: &mut InstrLow<N>) {
@@ -746,14 +728,14 @@ fn closure_slot_init_expr(slot: &ClosureSlot) -> InstrUnresolved {
         ),
         ClosureInit::DeletedSentinel => deleted_sentinel_expr(node_index, range),
         ClosureInit::RuntimePcUnstarted => literal_expr(
-            CoreNumberLiteral {
-                value: CoreNumberLiteralValue::Int(ast::Int::ONE),
+            NumberLiteral {
+                value: NumberLiteralValue::Int(ast::Int::ONE),
             },
             crate::block_py::Meta::new(node_index, range),
         ),
         ClosureInit::RuntimeAbruptKindFallthrough => literal_expr(
-            CoreNumberLiteral {
-                value: CoreNumberLiteralValue::Int(
+            NumberLiteral {
+                value: NumberLiteralValue::Int(
                     ast::Int::from_str_radix("0", 10, "0")
                         .expect("zero should parse as an integer literal"),
                 ),
@@ -2006,11 +1988,8 @@ impl NameLocator<'_> {
         }
     }
 
-fn mark_raw_cell_expr(
-    &self,
-    expr: InstrLow<ResolvedName>,
-) -> InstrLow<ResolvedName> {
-    match expr {
+    fn mark_raw_cell_expr(&self, expr: InstrLow<ResolvedName>) -> InstrLow<ResolvedName> {
+        match expr {
             InstrLow::Load(op) => {
                 let meta = op.meta();
                 let name = op.name;

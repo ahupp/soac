@@ -1,13 +1,12 @@
 use super::ast_to_ast::string_templates::lower_string_templates_in_expr;
 use crate::block_py::{
     core_call_expr_with_meta, core_runtime_name_expr_with_meta,
-    core_runtime_positional_call_expr_with_meta, literal_expr, operation, Await, CallArgKeyword,
-    CallArgPositional, InstrWithAwaitAndYield, CoreBytesLiteral, CoreNumberLiteral,
-    CoreNumberLiteralValue, CoreStringLiteral, HasMeta, ImplicitNoneExpr, Meta, WithMeta, Yield,
-    YieldFrom,
+    core_runtime_positional_call_expr_with_meta, literal_expr, operation, Await, BytesLiteral,
+    CallArgKeyword, CallArgPositional, HasMeta, ImplicitNoneExpr, InstrWithAwaitAndYield, Meta,
+    NumberLiteral, NumberLiteralValue, StringLiteral, WithMeta, Yield, YieldFrom,
 };
-use crate::passes::InstrRuff;
 use crate::passes::ast_to_ast::expr_utils::make_tuple;
+use crate::passes::InstrRuff;
 use crate::py_expr;
 use ruff_python_ast::{self as ast, Expr};
 
@@ -76,9 +75,7 @@ fn reduce_core_blockpy_dict(items: Box<[ast::DictItem]>) -> InstrWithAwaitAndYie
     expr
 }
 
-fn core_operation_expr(
-    operation: impl Into<InstrWithAwaitAndYield>,
-) -> InstrWithAwaitAndYield {
+fn core_operation_expr(operation: impl Into<InstrWithAwaitAndYield>) -> InstrWithAwaitAndYield {
     operation.into()
 }
 
@@ -124,7 +121,7 @@ fn getattr_expr_with_meta(
     attr: String,
 ) -> InstrWithAwaitAndYield {
     let attr_expr = literal_expr(
-        CoreStringLiteral { value: attr },
+        StringLiteral { value: attr },
         Meta::new(node_index.clone(), range),
     );
     core_operation_expr_with_meta(
@@ -258,9 +255,7 @@ fn add_op_expr(
     )
 }
 
-fn lower_core_call_args(
-    args: Vec<Expr>,
-) -> Vec<CallArgPositional<InstrWithAwaitAndYield>> {
+fn lower_core_call_args(args: Vec<Expr>) -> Vec<CallArgPositional<InstrWithAwaitAndYield>> {
     args.into_iter()
         .map(|arg| {
             CallArgPositional::from_ast_expr_with(arg, InstrWithAwaitAndYield::from_ast_expr)
@@ -310,7 +305,7 @@ fn string_arg_from_core_expr(expr: InstrWithAwaitAndYield) -> Option<String> {
     let InstrWithAwaitAndYield::Literal(literal) = expr else {
         return None;
     };
-    let crate::block_py::BlockPyLiteral::StringLiteral(literal) = literal.into_literal() else {
+    let crate::block_py::Literal::StringLiteral(literal) = literal.into_literal() else {
         return None;
     };
     Some(literal.value)
@@ -485,13 +480,13 @@ impl InstrWithAwaitAndYield {
                 )
             }
             InstrRuff::ExprStringLiteral(node) => literal_expr(
-                CoreStringLiteral {
+                StringLiteral {
                     value: node.value.to_str().to_string(),
                 },
                 Meta::new(node.meta().node_index, node.meta().range),
             ),
             InstrRuff::ExprBytesLiteral(node) => literal_expr(
-                CoreBytesLiteral {
+                BytesLiteral {
                     value: {
                         let value: std::borrow::Cow<[u8]> = (&node.value).into();
                         value.into_owned()
@@ -502,10 +497,10 @@ impl InstrWithAwaitAndYield {
             InstrRuff::ExprNumberLiteral(node) => {
                 let meta = node.meta();
                 literal_expr(
-                    CoreNumberLiteral {
+                    NumberLiteral {
                         value: match node.value {
-                            ast::Number::Int(value) => CoreNumberLiteralValue::Int(value),
-                            ast::Number::Float(value) => CoreNumberLiteralValue::Float(value),
+                            ast::Number::Int(value) => NumberLiteralValue::Int(value),
+                            ast::Number::Float(value) => NumberLiteralValue::Float(value),
                             ast::Number::Complex { .. } => {
                                 panic!("complex literal reached late core BlockPy boundary")
                             }
@@ -612,13 +607,13 @@ impl InstrWithAwaitAndYield {
                     .with_meta(Meta::new(node.node_index, node.range)),
             ),
             Expr::StringLiteral(node) => literal_expr(
-                CoreStringLiteral {
+                StringLiteral {
                     value: node.value.to_str().to_string(),
                 },
                 Meta::new(node.node_index, node.range),
             ),
             Expr::BytesLiteral(node) => literal_expr(
-                CoreBytesLiteral {
+                BytesLiteral {
                     value: {
                         let value: std::borrow::Cow<[u8]> = (&node.value).into();
                         value.into_owned()
@@ -627,10 +622,10 @@ impl InstrWithAwaitAndYield {
                 Meta::new(node.node_index, node.range),
             ),
             Expr::NumberLiteral(node) => literal_expr(
-                CoreNumberLiteral {
+                NumberLiteral {
                     value: match node.value {
-                        ast::Number::Int(value) => CoreNumberLiteralValue::Int(value),
-                        ast::Number::Float(value) => CoreNumberLiteralValue::Float(value),
+                        ast::Number::Int(value) => NumberLiteralValue::Int(value),
+                        ast::Number::Float(value) => NumberLiteralValue::Float(value),
                         ast::Number::Complex { .. } => {
                             panic!("complex literal reached late core BlockPy boundary")
                         }

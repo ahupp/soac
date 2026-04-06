@@ -1,8 +1,8 @@
 use super::{BlockPySetupExprLowerer, RuffToBlockPyExpr};
 use crate::block_py::{HasMeta, Meta, Store, WithMeta};
-use crate::passes::InstrRuff;
-use crate::passes::ruff_to_blockpy::LoopContext;
 use crate::passes::ruff_to_blockpy::stmt_lowering::BlockPyStmtBuilder;
+use crate::passes::ruff_to_blockpy::LoopContext;
+use crate::passes::InstrRuff;
 use ruff_python_ast::{self as ast};
 
 fn into_store_name(name: ast::name::Name) -> ast::name::Name {

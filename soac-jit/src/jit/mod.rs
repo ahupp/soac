@@ -17,11 +17,10 @@ use cranelift_module::{FuncId, Linkage, Module, ModuleReloc};
 use cranelift_reader::parse_functions;
 use pyo3::ffi;
 use soac_blockpy::block_py::{
-    AbruptKind, BlockArg, BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword,
-    CallArgPositional, CellLocation, CodegenBlock, CodegenBlockPyExpr, CounterDef, CounterId,
-    ChildVisitable, CounterScope, CounterSite, FunctionId, HasMeta, InstrId, LocalLocation,
-    ResolvedName, NameLocation, ParamDefaultSource, StorageLayout, Visit, WithMeta, BlockLabel,
-    BlockPyLiteral,
+    AbruptKind, BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword,
+    CallArgPositional, CellLocation, ChildVisitable, CodegenBlock, CounterDef, CounterId,
+    CounterScope, CounterSite, FunctionId, HasMeta, InstrCodegen, InstrId, Literal, LocalLocation,
+    NameLocation, ParamDefaultSource, ResolvedName, StorageLayout, Visit, WithMeta,
     operation as blockpy_intrinsics,
 };
 use soac_blockpy::passes::{CodegenBlockPyPass, InstrResolved};
@@ -451,13 +450,13 @@ enum CompiledRunnerEntry {
 }
 
 fn codegen_expr_is_borrowable(
-    expr: &CodegenBlockPyExpr,
+    expr: &InstrCodegen,
     local_names: &[String],
     stack_slots: &StackSlots,
     storage_layout: Option<&StorageLayout>,
 ) -> bool {
     match expr {
-        CodegenBlockPyExpr::Load(op) => op
+        InstrCodegen::Load(op) => op
             .name
             .local_location()
             .and_then(|location| storage_layout?.stack_slots().get(location.slot() as usize))
@@ -639,14 +638,14 @@ fn emit_codegen_located_name_load(
 }
 
 fn codegen_expr_const_string(
-    expr: &CodegenBlockPyExpr,
+    expr: &InstrCodegen,
     module_constants: &ModuleCodegenConstants,
 ) -> Option<String> {
     match expr {
-        CodegenBlockPyExpr::Load(op) => op.name.location.as_constant().and_then(|index| {
+        InstrCodegen::Load(op) => op.name.location.as_constant().and_then(|index| {
             module_constants.constant_string_value(ModuleConstantId(index as usize))
         }),
-        CodegenBlockPyExpr::Call(call) => {
+        InstrCodegen::Call(call) => {
             if codegen_expr_helper_name(call.func.as_ref(), module_constants) != Some("str")
                 || call.args.len() != 1
                 || !call.keywords.is_empty()
@@ -663,16 +662,16 @@ fn codegen_expr_const_string(
 }
 
 fn codegen_expr_helper_name<'a>(
-    expr: &'a CodegenBlockPyExpr,
+    expr: &'a InstrCodegen,
     module_constants: &'a ModuleCodegenConstants,
 ) -> Option<&'a str> {
     match expr {
-        CodegenBlockPyExpr::Load(op)
+        InstrCodegen::Load(op)
             if op.name.location.is_global() || op.name.location.is_runtime_name() =>
         {
             Some(op.name.id.as_str())
         }
-        CodegenBlockPyExpr::Load(op) => op.name.location.as_constant().and_then(|index| {
+        InstrCodegen::Load(op) => op.name.location.as_constant().and_then(|index| {
             module_constants.constant_runtime_name_value(ModuleConstantId(index as usize))
         }),
         _ => None,
@@ -924,7 +923,7 @@ fn delete_local_value(
     Ok(())
 }
 
-impl<'a, 'b, 'mc, 'c, 'd> intrinsics::OperationEmitState<'b, CodegenBlockPyExpr>
+impl<'a, 'b, 'mc, 'c, 'd> intrinsics::OperationEmitState<'b, InstrCodegen>
     for CodegenIntrinsicEmitState<'a, 'b, 'mc, 'c, 'd>
 {
     fn ctx(&self) -> &JitEmitCtx<'mc> {
@@ -940,7 +939,7 @@ impl<'a, 'b, 'mc, 'c, 'd> intrinsics::OperationEmitState<'b, CodegenBlockPyExpr>
             .get_or_panic(self.jit_module, &mut self.fb.func, spec)
     }
 
-    fn emit_arg_values(&mut self, args: &[&CodegenBlockPyExpr]) -> Vec<(ir::Value, bool)> {
+    fn emit_arg_values(&mut self, args: &[&InstrCodegen]) -> Vec<(ir::Value, bool)> {
         let mut arg_values = Vec::with_capacity(args.len());
         for arg in args {
             let borrowed_arg = codegen_expr_is_borrowable(
@@ -1513,7 +1512,7 @@ fn emit_positional_vectorcall(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
     callable_is_borrowed: bool,
-    args: &[&CodegenBlockPyExpr],
+    args: &[&InstrCodegen],
     local_names: &mut Vec<String>,
     local_values: &mut Vec<ir::Value>,
     ctx: &JitEmitCtx<'_>,
@@ -1623,7 +1622,7 @@ fn emit_owned_bool_from_i32_result(
 
 fn emit_branch_index_i64(
     fb: &mut FunctionBuilder<'_>,
-    expr: &CodegenBlockPyExpr,
+    expr: &InstrCodegen,
     local_names: &mut Vec<String>,
     local_values: &mut Vec<ir::Value>,
     ctx: &JitEmitCtx<'_>,
@@ -1632,7 +1631,7 @@ fn emit_branch_index_i64(
     pyobject_to_i64_ref: ir::FuncRef,
 ) -> ir::Value {
     match expr {
-        CodegenBlockPyExpr::CalleeFunctionId(op) => {
+        InstrCodegen::CalleeFunctionId(op) => {
             let callable_is_borrowed = codegen_expr_is_borrowable(
                 op.value.as_ref(),
                 local_names,
@@ -1679,9 +1678,7 @@ fn emit_checked_i32_result(
     result: ir::Value,
     ctx: &JitEmitCtx<'_>,
 ) -> ir::Value {
-    let errored = fb
-        .ins()
-        .icmp_imm(ir::condcodes::IntCC::Equal, result, -1);
+    let errored = fb.ins().icmp_imm(ir::condcodes::IntCC::Equal, result, -1);
     let ok_block = fb.create_block();
     fb.append_block_param(ok_block, ctx.consts.i32_ty);
     fb.ins().brif(
@@ -1699,10 +1696,11 @@ fn module_constant_string_value<'a>(
     module: &'a BlockPyModule<CodegenBlockPyPass>,
     constant_index: u32,
 ) -> Option<&'a str> {
-    let InstrResolved::Literal(literal) = module.module_constants.get(constant_index as usize)? else {
+    let InstrResolved::Literal(literal) = module.module_constants.get(constant_index as usize)?
+    else {
         return None;
     };
-    let BlockPyLiteral::StringLiteral(literal) = literal.as_literal() else {
+    let Literal::StringLiteral(literal) = literal.as_literal() else {
         return None;
     };
     Some(literal.value.as_str())
@@ -1710,9 +1708,9 @@ fn module_constant_string_value<'a>(
 
 fn codegen_constant_string_value<'a>(
     module: &'a BlockPyModule<CodegenBlockPyPass>,
-    expr: &CodegenBlockPyExpr,
+    expr: &InstrCodegen,
 ) -> Option<&'a str> {
-    let CodegenBlockPyExpr::Load(load) = expr else {
+    let InstrCodegen::Load(load) = expr else {
         return None;
     };
     let NameLocation::Constant(constant_index) = load.name.location else {
@@ -1722,7 +1720,7 @@ fn codegen_constant_string_value<'a>(
 }
 
 fn direct_method_specializations_for_call_site(
-    call: &blockpy_intrinsics::Call<CodegenBlockPyExpr>,
+    call: &blockpy_intrinsics::Call<InstrCodegen>,
     ctx: &JitEmitCtx<'_>,
 ) -> Vec<DirectMethodSpecialization> {
     let debug_direct_methods =
@@ -1742,7 +1740,7 @@ fn direct_method_specializations_for_call_site(
         }
         return Vec::new();
     }
-    let CodegenBlockPyExpr::GetAttr(getattr) = call.func.as_ref() else {
+    let InstrCodegen::GetAttr(getattr) = call.func.as_ref() else {
         if debug_direct_methods {
             eprintln!("direct-method-skip non-getattr {}", debug_site());
         }
@@ -1784,9 +1782,9 @@ fn direct_method_specializations_for_call_site(
         let Some(&target_code_ptr) = ctx.direct_call_code_ptrs.get(&function_id) else {
             continue;
         };
-        let Ok(owner_types) = (unsafe {
-            crate::lookup_exact_owner_types_for_method(function_id, method_name)
-        }) else {
+        let Ok(owner_types) =
+            (unsafe { crate::lookup_exact_owner_types_for_method(function_id, method_name) })
+        else {
             if debug_direct_methods {
                 eprintln!(
                     "direct-method-skip owner-query-error method={method_name} function_id={function_id} instr_id={instr_id}"
@@ -1800,19 +1798,23 @@ fn direct_method_specializations_for_call_site(
                 owner_types.len()
             );
         }
-        out.extend(owner_types.into_iter().map(|owner| DirectMethodSpecialization {
-            function_id,
-            target_code_ptr,
-            descriptor_function: owner.function_obj as ObjPtr,
-            owner_type: owner.owner_type,
-            type_version: owner.type_version,
-        }));
+        out.extend(
+            owner_types
+                .into_iter()
+                .map(|owner| DirectMethodSpecialization {
+                    function_id,
+                    target_code_ptr,
+                    descriptor_function: owner.function_obj as ObjPtr,
+                    owner_type: owner.owner_type,
+                    type_version: owner.type_version,
+                }),
+        );
     }
     out
 }
 
 fn direct_constructor_specializations_for_call_site(
-    call: &blockpy_intrinsics::Call<CodegenBlockPyExpr>,
+    call: &blockpy_intrinsics::Call<InstrCodegen>,
     ctx: &JitEmitCtx<'_>,
 ) -> Vec<DirectConstructorSpecialization> {
     if ctx.shared_state.is_none() {
@@ -1840,17 +1842,22 @@ fn direct_constructor_specializations_for_call_site(
         let Some(&target_code_ptr) = ctx.direct_call_code_ptrs.get(&function_id) else {
             continue;
         };
-        let Ok(owner_types) = (unsafe { crate::lookup_exact_owner_types_for_constructor(function_id) })
+        let Ok(owner_types) =
+            (unsafe { crate::lookup_exact_owner_types_for_constructor(function_id) })
         else {
             continue;
         };
-        out.extend(owner_types.into_iter().map(|owner| DirectConstructorSpecialization {
-            function_id,
-            target_code_ptr,
-            init_function: owner.init_function_obj as ObjPtr,
-            owner_type: owner.owner_type,
-            type_version: owner.type_version,
-        }));
+        out.extend(
+            owner_types
+                .into_iter()
+                .map(|owner| DirectConstructorSpecialization {
+                    function_id,
+                    target_code_ptr,
+                    init_function: owner.init_function_obj as ObjPtr,
+                    owner_type: owner.owner_type,
+                    type_version: owner.type_version,
+                }),
+        );
     }
     out
 }
@@ -1862,9 +1869,9 @@ fn collect_call_direct_targets(
         out: &'a mut HashSet<FunctionId>,
     }
 
-    impl Visit<CodegenBlockPyExpr> for CallDirectTargetCollector<'_> {
-        fn visit_instr(&mut self, expr: &CodegenBlockPyExpr) {
-            if let CodegenBlockPyExpr::CallDirect(call) = expr {
+    impl Visit<InstrCodegen> for CallDirectTargetCollector<'_> {
+        fn visit_instr(&mut self, expr: &InstrCodegen) {
+            if let InstrCodegen::CallDirect(call) = expr {
                 self.out.insert(call.function_id);
             }
             expr.visit_children(self);
@@ -1904,7 +1911,11 @@ fn parse_call_target_specializations_env(
         return Ok(HashMap::new());
     };
     let mut out = HashMap::new();
-    for entry in raw.split(';').map(str::trim).filter(|entry| !entry.is_empty()) {
+    for entry in raw
+        .split(';')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
         let Some((site, targets)) = entry.split_once('=') else {
             return Err(format!("invalid call target specialization entry: {entry}"));
         };
@@ -1913,16 +1924,24 @@ fn parse_call_target_specializations_env(
             return Err(format!("missing module in specialization entry: {entry}"));
         };
         let Some(entry_function_id) = site_parts.next() else {
-            return Err(format!("missing function_id in specialization entry: {entry}"));
+            return Err(format!(
+                "missing function_id in specialization entry: {entry}"
+            ));
         };
         let Some(entry_block_label) = site_parts.next() else {
-            return Err(format!("missing block label in specialization entry: {entry}"));
+            return Err(format!(
+                "missing block label in specialization entry: {entry}"
+            ));
         };
         let Some(entry_instr_index) = site_parts.next() else {
-            return Err(format!("missing instr index in specialization entry: {entry}"));
+            return Err(format!(
+                "missing instr index in specialization entry: {entry}"
+            ));
         };
         if site_parts.next().is_some() {
-            return Err(format!("too many site fields in specialization entry: {entry}"));
+            return Err(format!(
+                "too many site fields in specialization entry: {entry}"
+            ));
         }
         if entry_module_name != module_name {
             continue;
@@ -1949,7 +1968,9 @@ fn parse_call_target_specializations_env(
                     .parse::<u64>()
                     .map(FunctionId::from_packed)
                     .map_err(|err| {
-                        format!("invalid hot target function id in specialization entry {entry}: {err}")
+                        format!(
+                            "invalid hot target function id in specialization entry {entry}: {err}"
+                        )
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1999,22 +2020,34 @@ fn parse_operator_specializations_env(
         return Ok(HashMap::new());
     };
     let mut out = HashMap::new();
-    for entry in raw.split(';').map(str::trim).filter(|entry| !entry.is_empty()) {
+    for entry in raw
+        .split(';')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
         let Some((site, targets)) = entry.split_once('=') else {
             return Err(format!("invalid operator specialization entry: {entry}"));
         };
         let mut site_parts = site.split('|').map(str::trim);
         let Some(site_module) = site_parts.next() else {
-            return Err(format!("missing module in operator specialization entry: {entry}"));
+            return Err(format!(
+                "missing module in operator specialization entry: {entry}"
+            ));
         };
         let Some(site_function_id_raw) = site_parts.next() else {
-            return Err(format!("missing function_id in operator specialization entry: {entry}"));
+            return Err(format!(
+                "missing function_id in operator specialization entry: {entry}"
+            ));
         };
         let Some(block_label_raw) = site_parts.next() else {
-            return Err(format!("missing block label in operator specialization entry: {entry}"));
+            return Err(format!(
+                "missing block label in operator specialization entry: {entry}"
+            ));
         };
         let Some(instr_index_raw) = site_parts.next() else {
-            return Err(format!("missing instr index in operator specialization entry: {entry}"));
+            return Err(format!(
+                "missing instr index in operator specialization entry: {entry}"
+            ));
         };
         if site_parts.next().is_some() {
             return Err(format!(
@@ -2165,13 +2198,8 @@ fn emit_callee_function_id_checked(
     fb.append_block_param(done_block, i64_ty);
 
     let callable_is_null = fb.ins().icmp_imm(ir::condcodes::IntCC::Equal, callable, 0);
-    fb.ins().brif(
-        callable_is_null,
-        null_block,
-        &[],
-        not_null_block,
-        &[],
-    );
+    fb.ins()
+        .brif(callable_is_null, null_block, &[], not_null_block, &[]);
 
     fb.switch_to_block(null_block);
     let err_const = fb.ins().iconst(i64_ty, i64::MIN);
@@ -2214,8 +2242,10 @@ fn emit_callee_function_id_checked(
         callable,
         PYMETHOD_IM_FUNC_OFFSET,
     );
-    fb.ins()
-        .jump(function_value_block, &[ir::BlockArg::Value(method_function)]);
+    fb.ins().jump(
+        function_value_block,
+        &[ir::BlockArg::Value(method_function)],
+    );
 
     fb.switch_to_block(maybe_type_block);
     let py_type_type = fb.ins().iconst(ptr_ty, ctx.consts.py_type_type_ptr as i64);
@@ -2247,9 +2277,7 @@ fn emit_callee_function_id_checked(
         callable,
         PYHEAPTYPE_SOAC_FUNCTION_ID_OFFSET,
     );
-    let id_is_zero = fb
-        .ins()
-        .icmp_imm(ir::condcodes::IntCC::Equal, packed, 0);
+    let id_is_zero = fb.ins().icmp_imm(ir::condcodes::IntCC::Equal, packed, 0);
     let type_id_done_block = fb.create_block();
     fb.ins()
         .brif(id_is_zero, miss_block, &[], type_id_done_block, &[]);
@@ -2262,13 +2290,8 @@ fn emit_callee_function_id_checked(
     let function_is_null = fb
         .ins()
         .icmp_imm(ir::condcodes::IntCC::Equal, function_value, 0);
-    fb.ins().brif(
-        function_is_null,
-        null_block,
-        &[],
-        nonzero_id_block,
-        &[],
-    );
+    fb.ins()
+        .brif(function_is_null, null_block, &[], nonzero_id_block, &[]);
 
     fb.switch_to_block(nonzero_id_block);
     let packed = fb.ins().load(
@@ -2277,9 +2300,7 @@ fn emit_callee_function_id_checked(
         function_value,
         PYFUNCTION_SOAC_FUNCTION_ID_OFFSET,
     );
-    let id_is_zero = fb
-        .ins()
-        .icmp_imm(ir::condcodes::IntCC::Equal, packed, 0);
+    let id_is_zero = fb.ins().icmp_imm(ir::condcodes::IntCC::Equal, packed, 0);
     let id_done_block = fb.create_block();
     fb.ins()
         .brif(id_is_zero, miss_block, &[], id_done_block, &[]);
@@ -2289,7 +2310,8 @@ fn emit_callee_function_id_checked(
 
     fb.switch_to_block(miss_block);
     let zero_const = fb.ins().iconst(i64_ty, 0);
-    fb.ins().jump(done_block, &[ir::BlockArg::Value(zero_const)]);
+    fb.ins()
+        .jump(done_block, &[ir::BlockArg::Value(zero_const)]);
 
     fb.switch_to_block(done_block);
     let callee_id = fb.block_params(done_block)[0];
@@ -2506,7 +2528,7 @@ fn emit_direct_call_resolved(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
     callable_is_borrowed: bool,
-    args: &[&CodegenBlockPyExpr],
+    args: &[&InstrCodegen],
     target_function: &BlockPyFunction<CodegenBlockPyPass>,
     target_code_ptr: ObjPtr,
     local_names: &mut Vec<String>,
@@ -2551,7 +2573,7 @@ fn emit_direct_call_resolved(
 
 fn emit_call_direct_expr(
     fb: &mut FunctionBuilder<'_>,
-    call: &soac_blockpy::block_py::CallDirect<CodegenBlockPyExpr>,
+    call: &soac_blockpy::block_py::CallDirect<InstrCodegen>,
     local_names: &mut Vec<String>,
     local_values: &mut Vec<ir::Value>,
     ctx: &JitEmitCtx<'_>,
@@ -2559,7 +2581,7 @@ fn emit_call_direct_expr(
     func_imports: &mut FuncBuildImports<'_>,
 ) -> ir::Value {
     let mut fallback = || {
-        let fallback = CodegenBlockPyExpr::Call(
+        let fallback = InstrCodegen::Call(
             soac_blockpy::block_py::Call::new(
                 (*call.callable).clone(),
                 call.args.clone(),
@@ -2623,9 +2645,9 @@ fn emit_call_direct_expr(
         .iter()
         .map(|arg| match arg {
             CallArgPositional::Positional(expr) => expr,
-            CallArgPositional::Starred(_) => unreachable!(
-                "non-positional direct args should have used generic fallback"
-            ),
+            CallArgPositional::Starred(_) => {
+                unreachable!("non-positional direct args should have used generic fallback")
+            }
         })
         .collect::<Vec<_>>();
     emit_direct_call_resolved(
@@ -2645,7 +2667,7 @@ fn emit_call_direct_expr(
 
 fn emit_codegen_expr(
     fb: &mut FunctionBuilder<'_>,
-    expr: &CodegenBlockPyExpr,
+    expr: &InstrCodegen,
     local_names: &mut Vec<String>,
     local_values: &mut Vec<ir::Value>,
     ctx: &JitEmitCtx<'_>,
@@ -2670,9 +2692,9 @@ fn emit_codegen_expr(
     let tuple_new_ref = ctx.tuple_new_ref;
     let tuple_set_item_ref = ctx.tuple_set_item_ref;
 
-        match expr {
-            CodegenBlockPyExpr::Load(op) => {
-                return emit_codegen_located_name_load(
+    match expr {
+        InstrCodegen::Load(op) => {
+            return emit_codegen_located_name_load(
                 fb,
                 &op.name,
                 local_names,
@@ -2681,26 +2703,26 @@ fn emit_codegen_expr(
                 borrowed,
             );
         }
-        CodegenBlockPyExpr::IncrementCounter(op) => {
+        InstrCodegen::IncrementCounter(op) => {
             assert!(
                 !borrowed,
                 "increment_counter must not request a borrowed result"
             );
             return emit_increment_counter(fb, op.counter_id, ctx);
         }
-        expr @ (CodegenBlockPyExpr::BinOp(_)
-        | CodegenBlockPyExpr::UnaryOp(_)
-        | CodegenBlockPyExpr::CalleeFunctionId(_)
-        | CodegenBlockPyExpr::GetAttr(_)
-        | CodegenBlockPyExpr::SetAttr(_)
-        | CodegenBlockPyExpr::GetItem(_)
-        | CodegenBlockPyExpr::SetItem(_)
-        | CodegenBlockPyExpr::DelItem(_)
-        | CodegenBlockPyExpr::Store(_)
-        | CodegenBlockPyExpr::Del(_)
-        | CodegenBlockPyExpr::MakeCell(_)
-        | CodegenBlockPyExpr::CellRef(_)
-        | CodegenBlockPyExpr::MakeFunction(_)) => {
+        expr @ (InstrCodegen::BinOp(_)
+        | InstrCodegen::UnaryOp(_)
+        | InstrCodegen::CalleeFunctionId(_)
+        | InstrCodegen::GetAttr(_)
+        | InstrCodegen::SetAttr(_)
+        | InstrCodegen::GetItem(_)
+        | InstrCodegen::SetItem(_)
+        | InstrCodegen::DelItem(_)
+        | InstrCodegen::Store(_)
+        | InstrCodegen::Del(_)
+        | InstrCodegen::MakeCell(_)
+        | InstrCodegen::CellRef(_)
+        | InstrCodegen::MakeFunction(_)) => {
             assert!(
                 !borrowed,
                 "codegen operation expression must not use borrowed result"
@@ -2713,14 +2735,14 @@ fn emit_codegen_expr(
                 jit_module,
                 func_imports,
             };
-            if matches!(expr, CodegenBlockPyExpr::MakeFunction(_)) {
+            if matches!(expr, InstrCodegen::MakeFunction(_)) {
                 panic!("MakeFunction should lower to a regular call before codegen");
             }
             if let Some(value) = intrinsics::emit_operation(expr, &mut intrinsic_state) {
                 return value;
             }
             match expr {
-                CodegenBlockPyExpr::CellRef(op) => emit_raw_cell_object_for_location(
+                InstrCodegen::CellRef(op) => emit_raw_cell_object_for_location(
                     intrinsic_state.fb,
                     op.location,
                     "cell_ref",
@@ -2728,7 +2750,7 @@ fn emit_codegen_expr(
                     intrinsic_state.local_values,
                     intrinsic_state.ctx,
                 ),
-                CodegenBlockPyExpr::Store(op) => {
+                InstrCodegen::Store(op) => {
                     if let Some(location) = op.name.local_location() {
                         let layout =
                             intrinsic_state.ctx.storage_layout.as_ref().expect(
@@ -2765,8 +2787,7 @@ fn emit_codegen_expr(
                     let Some(location) = op.name.cell_location() else {
                         panic!("Store should be resolved before codegen: {op:?}");
                     };
-                    if location.is_owned()
-                        && matches!(op.value.as_ref(), CodegenBlockPyExpr::MakeCell(_))
+                    if location.is_owned() && matches!(op.value.as_ref(), InstrCodegen::MakeCell(_))
                     {
                         let layout = intrinsic_state.ctx.storage_layout.as_ref().expect(
                             "Store owned cell slot should have storage layout during codegen",
@@ -2849,7 +2870,7 @@ fn emit_codegen_expr(
                         call_value,
                     )
                 }
-                CodegenBlockPyExpr::Del(op) => {
+                InstrCodegen::Del(op) => {
                     if let Some(location) = op.name.local_location() {
                         let layout = intrinsic_state
                             .ctx
@@ -2888,7 +2909,7 @@ fn emit_codegen_expr(
                     );
                     intrinsics::emit_del_deref_raw_cell(raw_cell, op.quietly, &mut intrinsic_state)
                 }
-                CodegenBlockPyExpr::MakeFunction(_) => {
+                InstrCodegen::MakeFunction(_) => {
                     unreachable!("MakeFunction should panic before intrinsic fallback")
                 }
                 _ => {
@@ -2896,7 +2917,7 @@ fn emit_codegen_expr(
                 }
             }
         }
-        CodegenBlockPyExpr::CallDirect(call) => {
+        InstrCodegen::CallDirect(call) => {
             assert!(
                 !borrowed,
                 "codegen direct-call expression must not use borrowed result"
@@ -2911,14 +2932,14 @@ fn emit_codegen_expr(
                 func_imports,
             );
         }
-        CodegenBlockPyExpr::Call(call) => {
+        InstrCodegen::Call(call) => {
             assert!(
                 !borrowed,
                 "codegen call expression must not use borrowed result"
             );
             let null_ptr = fb.ins().iconst(ptr_ty, 0);
-            let mut simple_args: Vec<&CodegenBlockPyExpr> = Vec::new();
-            let mut simple_keywords: Vec<(&str, &CodegenBlockPyExpr)> = Vec::new();
+            let mut simple_args: Vec<&InstrCodegen> = Vec::new();
+            let mut simple_keywords: Vec<(&str, &InstrCodegen)> = Vec::new();
             let mut has_unpack = false;
             for arg in &call.args {
                 match arg {
@@ -3493,7 +3514,7 @@ fn emit_codegen_expr(
                     }
                     if func_name == "cell_ref" && args.len() == 1 {
                         let cell_expr = &args[0];
-                        let CodegenBlockPyExpr::Load(cell_name) = cell_expr else {
+                        let InstrCodegen::Load(cell_name) = cell_expr else {
                             panic!(
                                 "cell_ref should lower to a located load arg, got {:?}",
                                 cell_expr
@@ -3519,19 +3540,17 @@ fn emit_codegen_expr(
 
             if keywords.is_empty() {
                 let site_instr_id = call.meta().instr_id;
-                let counter_id =
-                    site_instr_id.and_then(|instr_id| ctx.call_target_counter_ids.get(&instr_id).copied());
+                let counter_id = site_instr_id
+                    .and_then(|instr_id| ctx.call_target_counter_ids.get(&instr_id).copied());
                 let direct_hit_counter_id = site_instr_id
                     .and_then(|instr_id| ctx.call_direct_hit_counter_ids.get(&instr_id).copied());
                 let direct_fallback_counter_id = site_instr_id.and_then(|instr_id| {
-                    ctx.call_direct_fallback_counter_ids
-                        .get(&instr_id)
-                        .copied()
+                    ctx.call_direct_fallback_counter_ids.get(&instr_id).copied()
                 });
                 let direct_method_specializations =
                     direct_method_specializations_for_call_site(call, ctx);
                 if !direct_method_specializations.is_empty() {
-                    let CodegenBlockPyExpr::GetAttr(getattr) = call.func.as_ref() else {
+                    let InstrCodegen::GetAttr(getattr) = call.func.as_ref() else {
                         unreachable!("direct method specializations require GetAttr call target");
                     };
                     let receiver_is_borrowed = codegen_expr_is_borrowable(
@@ -3564,8 +3583,9 @@ fn emit_codegen_expr(
                         };
                         let expected_type =
                             fb.ins().iconst(ptr_ty, specialization.owner_type as i64);
-                        let expected_version =
-                            fb.ins().iconst(ctx.consts.i64_ty, specialization.type_version as i64);
+                        let expected_version = fb
+                            .ins()
+                            .iconst(ctx.consts.i64_ty, specialization.type_version as i64);
                         let guard_inst = fb.ins().call(
                             ctx.guard_method_type_version_ref,
                             &[receiver, expected_type, expected_version],
@@ -3573,9 +3593,9 @@ fn emit_codegen_expr(
                         let guard_result =
                             emit_checked_i32_result(fb, fb.inst_results(guard_inst)[0], ctx);
                         let is_match =
-                            fb.ins().icmp_imm(ir::condcodes::IntCC::NotEqual, guard_result, 0);
-                        fb.ins()
-                            .brif(is_match, direct_block, &[], miss_block, &[]);
+                            fb.ins()
+                                .icmp_imm(ir::condcodes::IntCC::NotEqual, guard_result, 0);
+                        fb.ins().brif(is_match, direct_block, &[], miss_block, &[]);
 
                         fb.switch_to_block(direct_block);
                         let target_function = ctx
@@ -3663,9 +3683,9 @@ fn emit_codegen_expr(
                         fb.ins().call(ctx.decref_ref, &[receiver]);
                     }
                     let callable = fb.inst_results(getattr_inst)[0];
-                    let callable_is_null = fb
-                        .ins()
-                        .icmp(ir::condcodes::IntCC::Equal, callable, null_ptr);
+                    let callable_is_null =
+                        fb.ins()
+                            .icmp(ir::condcodes::IntCC::Equal, callable, null_ptr);
                     let callable_ok_block = fb.create_block();
                     fb.append_block_param(callable_ok_block, ptr_ty);
                     fb.ins().brif(
@@ -3733,7 +3753,8 @@ fn emit_codegen_expr(
                                 if args.len() != target_function.params.len() {
                                     return None;
                                 }
-                                let &target_code_ptr = ctx.direct_call_code_ptrs.get(&function_id)?;
+                                let &target_code_ptr =
+                                    ctx.direct_call_code_ptrs.get(&function_id)?;
                                 Some((function_id, target_code_ptr))
                             })
                             .collect::<Vec<_>>()
@@ -3761,9 +3782,7 @@ fn emit_codegen_expr(
                             {
                                 let type_match_block = fb.create_block();
                                 let direct_block = fb.create_block();
-                                let miss_block = if index + 1
-                                    == constructor_specializations.len()
-                                {
+                                let miss_block = if index + 1 == constructor_specializations.len() {
                                     if direct_specializations.is_empty() {
                                         generic_block
                                     } else {
@@ -3779,8 +3798,13 @@ fn emit_codegen_expr(
                                     callable,
                                     expected_type,
                                 );
-                                fb.ins()
-                                    .brif(is_exact_type, type_match_block, &[], miss_block, &[]);
+                                fb.ins().brif(
+                                    is_exact_type,
+                                    type_match_block,
+                                    &[],
+                                    miss_block,
+                                    &[],
+                                );
 
                                 fb.switch_to_block(type_match_block);
                                 let type_version = fb.ins().load(
@@ -3794,20 +3818,17 @@ fn emit_codegen_expr(
                                     type_version,
                                     specialization.type_version as i64,
                                 );
-                                fb.ins().brif(
-                                    version_matches,
-                                    direct_block,
-                                    &[],
-                                    miss_block,
-                                    &[],
-                                );
+                                fb.ins()
+                                    .brif(version_matches, direct_block, &[], miss_block, &[]);
 
                                 fb.switch_to_block(direct_block);
                                 let target_function = ctx
                                     .module
                                     .callable_defs
                                     .iter()
-                                    .find(|function| function.function_id == specialization.function_id)
+                                    .find(|function| {
+                                        function.function_id == specialization.function_id
+                                    })
                                     .expect(
                                         "direct constructor specialization target should exist",
                                     );
@@ -3876,8 +3897,7 @@ fn emit_codegen_expr(
                                     callee_id,
                                     function_id.packed() as i64,
                                 );
-                                fb.ins()
-                                    .brif(is_match, direct_block, &[], miss_block, &[]);
+                                fb.ins().brif(is_match, direct_block, &[], miss_block, &[]);
 
                                 fb.switch_to_block(direct_block);
                                 let target_function = ctx
@@ -4458,7 +4478,7 @@ fn emit_truthy_from_owned(
 
 fn emit_codegen_ops(
     fb: &mut FunctionBuilder<'_>,
-    ops: &[CodegenBlockPyExpr],
+    ops: &[InstrCodegen],
     local_names: &mut Vec<String>,
     local_values: &mut Vec<ir::Value>,
     _stack_slots: &StackSlots,
@@ -4485,7 +4505,7 @@ fn emit_codegen_ops(
 fn emit_codegen_term(
     fb: &mut FunctionBuilder<'_>,
     block_label: &str,
-    term: &BlockTerm<CodegenBlockPyExpr>,
+    term: &BlockTerm<InstrCodegen>,
     exec_blocks: &[ir::Block],
     runtime_block_param_names: &[Vec<String>],
     full_block_param_names: &[Vec<String>],
@@ -5124,7 +5144,9 @@ fn parse_runtime_clif_extern_symbols(
     Ok(extern_symbols)
 }
 
-fn parse_runtime_clif_global_extern_symbols(clif_text: &str) -> Result<HashMap<u32, String>, String> {
+fn parse_runtime_clif_global_extern_symbols(
+    clif_text: &str,
+) -> Result<HashMap<u32, String>, String> {
     let mut extern_symbols = HashMap::new();
     for line in clif_text.lines() {
         if !line.contains("::{extern#") || !line.contains(" = symbol userextname") {
@@ -5262,10 +5284,8 @@ fn remap_runtime_clif_extern_user_names(
             import_data_ids.insert(symbol.clone(), import_id);
             import_id
         };
-        let mapped_name_ref = function.declare_imported_user_function(ir::UserExternalName::new(
-            1,
-            import_id.as_u32(),
-        ));
+        let mapped_name_ref = function
+            .declare_imported_user_function(ir::UserExternalName::new(1, import_id.as_u32()));
         if let ir::GlobalValueData::Symbol { name, .. } = &mut function.global_values[gv] {
             *name = ir::ExternalName::User(mapped_name_ref);
         }
@@ -5537,7 +5557,7 @@ fn build_cranelift_run_bb_specialized_function(
     }
     for block in &function.blocks {
         for expr in &block.body {
-            if let CodegenBlockPyExpr::IncrementCounter(op) = expr {
+            if let InstrCodegen::IncrementCounter(op) = expr {
                 if op.counter_id.0 >= counter_ptrs.len() {
                     return Err(format!(
                         "specialized JIT counter pointer length mismatch: missing counter id {} for function {}",
@@ -5557,8 +5577,11 @@ fn build_cranelift_run_bb_specialized_function(
         function.function_id,
         "call_direct_fallback",
     );
-    let operator_shape_counter_ids =
-        collect_runtime_counter_ids_by_kind(counter_defs, function.function_id, "operator_hot_shapes");
+    let operator_shape_counter_ids = collect_runtime_counter_ids_by_kind(
+        counter_defs,
+        function.function_id,
+        "operator_hot_shapes",
+    );
     let operator_specialized_hit_counter_ids = collect_runtime_counter_ids_by_kind(
         counter_defs,
         function.function_id,
@@ -5570,9 +5593,10 @@ fn build_cranelift_run_bb_specialized_function(
         "operator_specialized_fallback",
     );
     let call_target_specializations = match direct_call_resolver {
-        Some(shared_state) => {
-            load_call_target_specializations(shared_state.module_name.as_str(), function.function_id)?
-        }
+        Some(shared_state) => load_call_target_specializations(
+            shared_state.module_name.as_str(),
+            function.function_id,
+        )?,
         None => HashMap::new(),
     };
     let operator_specializations = match direct_call_resolver {
@@ -6091,7 +6115,8 @@ fn build_cranelift_run_bb_specialized_function(
                 operator_shape_counter_ids: &operator_shape_counter_ids,
                 operator_specializations: &operator_specializations,
                 operator_specialized_hit_counter_ids: &operator_specialized_hit_counter_ids,
-                operator_specialized_fallback_counter_ids: &operator_specialized_fallback_counter_ids,
+                operator_specialized_fallback_counter_ids:
+                    &operator_specialized_fallback_counter_ids,
             };
             let block = &function.blocks[index];
             let mut local_names = Vec::new();
@@ -6254,7 +6279,7 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_cfg(
             .iter()
             .flat_map(|block| block.body.iter())
             .filter_map(|expr| match expr {
-                CodegenBlockPyExpr::IncrementCounter(op) => Some(op.counter_id.0),
+                InstrCodegen::IncrementCounter(op) => Some(op.counter_id.0),
                 _ => None,
             })
             .max()

@@ -1,10 +1,8 @@
 use super::{BlockPySetupExprLowerer, RuffToBlockPyExpr};
-use crate::block_py::{
-    BlockTerm, Meta, Store, TermIf, WithMeta,
-};
-use crate::passes::InstrRuff;
+use crate::block_py::{BlockTerm, Meta, Store, TermIf, WithMeta};
 use crate::passes::ruff_to_blockpy::expr_lowering::fresh_setup_name;
-use crate::passes::ruff_to_blockpy::{InlineFragment, LoweredExpr, LoopContext};
+use crate::passes::ruff_to_blockpy::{InlineFragment, LoopContext, LoweredExpr};
+use crate::passes::InstrRuff;
 use crate::py_expr;
 use ruff_python_ast::{self as ast};
 
@@ -29,70 +27,64 @@ where
 
 #[allow(dead_code)]
 pub(crate) fn try_lower_if_expr_direct<L, E>(
-     lowerer: &L,
-     name_gen: &crate::block_py::FunctionNameGen,
-     if_expr: crate::block_py::ExprIf<InstrRuff>,
-     loop_ctx: Option<&LoopContext>,
- ) -> Option<Result<LoweredExpr<E, InstrRuff>, String>>
- where
-     L: BlockPySetupExprLowerer + ?Sized,
-     E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
- {
-     let crate::block_py::ExprIf { test, body, orelse, .. } = if_expr;
-     let bridge = crate::passes::ruff_to_blockpy::stmt_lowering::StructuredLoweringBridge::new();
-     let Some(test_setup) = bridge.try_lower_inline_value::<E, InstrRuff>(
-         name_gen,
-         |structured| lowerer.lower_expr_instr_into(*test.clone(), structured, loop_ctx),
-     )
-     else {
-         return None;
-     };
-     let (mut entry, test) = match test_setup {
-         Ok(value) => value,
-         Err(err) => return Some(Err(err)),
-     };
- 
-     let target = fresh_setup_name("tmp");
-     let Some(body_setup) = bridge.try_lower_inline_value::<E, InstrRuff>(
-         name_gen,
-         |structured| {
-             let body_value = lowerer.lower_expr_instr_into(*body.clone(), structured, loop_ctx)?;
-             structured.push_stmt(assign_name(&target, body_value.clone()));
-             Ok(body_value)
-         },
-     )
-     else {
-         return None;
-     };
+    lowerer: &L,
+    name_gen: &crate::block_py::FunctionNameGen,
+    if_expr: crate::block_py::ExprIf<InstrRuff>,
+    loop_ctx: Option<&LoopContext>,
+) -> Option<Result<LoweredExpr<E, InstrRuff>, String>>
+where
+    L: BlockPySetupExprLowerer + ?Sized,
+    E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
+{
+    let crate::block_py::ExprIf {
+        test, body, orelse, ..
+    } = if_expr;
+    let bridge = crate::passes::ruff_to_blockpy::stmt_lowering::StructuredLoweringBridge::new();
+    let Some(test_setup) = bridge.try_lower_inline_value::<E, InstrRuff>(name_gen, |structured| {
+        lowerer.lower_expr_instr_into(*test.clone(), structured, loop_ctx)
+    }) else {
+        return None;
+    };
+    let (mut entry, test) = match test_setup {
+        Ok(value) => value,
+        Err(err) => return Some(Err(err)),
+    };
+
+    let target = fresh_setup_name("tmp");
+    let Some(body_setup) = bridge.try_lower_inline_value::<E, InstrRuff>(name_gen, |structured| {
+        let body_value = lowerer.lower_expr_instr_into(*body.clone(), structured, loop_ctx)?;
+        structured.push_stmt(assign_name(&target, body_value.clone()));
+        Ok(body_value)
+    }) else {
+        return None;
+    };
     let (body_entry, _) = match body_setup {
         Ok(value) => value,
         Err(err) => return Some(Err(err)),
     };
- 
-     let Some(orelse_setup) = bridge.try_lower_inline_value::<E, InstrRuff>(
-         name_gen,
-         |structured| {
-             let orelse_value =
-                 lowerer.lower_expr_instr_into(*orelse.clone(), structured, loop_ctx)?;
-             structured.push_stmt(assign_name(&target, orelse_value.clone()));
-             Ok(orelse_value)
-         },
-     )
-     else {
-         return None;
-     };
+
+    let Some(orelse_setup) =
+        bridge.try_lower_inline_value::<E, InstrRuff>(name_gen, |structured| {
+            let orelse_value =
+                lowerer.lower_expr_instr_into(*orelse.clone(), structured, loop_ctx)?;
+            structured.push_stmt(assign_name(&target, orelse_value.clone()));
+            Ok(orelse_value)
+        })
+    else {
+        return None;
+    };
     let (orelse_entry, _) = match orelse_setup {
         Ok(value) => value,
         Err(err) => return Some(Err(err)),
     };
 
-     let then_label = body_entry.entry_ref().label();
-     let else_label = orelse_entry.entry_ref().label();
-     entry.set_term(BlockTerm::IfTerm(TermIf {
-         test: E::from_lowered_expr(test),
-         then_label,
-         else_label,
-     }));
+    let then_label = body_entry.entry_ref().label();
+    let else_label = orelse_entry.entry_ref().label();
+    entry.set_term(BlockTerm::IfTerm(TermIf {
+        test: E::from_lowered_expr(test),
+        then_label,
+        else_label,
+    }));
 
     let (setup_entry_ref, mut deps) = entry.finish_blocks();
     let (_, mut body_blocks) = body_entry.finish_fallthrough_blocks();

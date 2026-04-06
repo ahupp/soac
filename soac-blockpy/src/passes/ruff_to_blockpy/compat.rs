@@ -4,11 +4,11 @@ use crate::block_py::{
     ImplicitNoneExpr, Instr, TermIf, TermRaise, WithMeta,
 };
 use crate::passes::ast_to_ast::context::Context;
-use crate::passes::InstrRuff;
 use crate::passes::ruff_to_blockpy::expr_lowering::{
     try_lower_branching_expr_direct, try_lower_if_expr_direct, AstSetupExprLowerer,
 };
 use crate::passes::ruff_to_blockpy::stmt_sequences::lower_stmts_to_blockpy_stmts_with_context;
+use crate::passes::InstrRuff;
 
 fn try_lower_direct_expr<E>(
     name_gen: &FunctionNameGen,
@@ -21,7 +21,9 @@ where
         InstrRuff::ExprIf(if_expr) => {
             try_lower_if_expr_direct::<_, E>(&AstSetupExprLowerer, name_gen, if_expr, None)
         }
-        other => try_lower_branching_expr_direct::<_, E>(&AstSetupExprLowerer, name_gen, other, None),
+        other => {
+            try_lower_branching_expr_direct::<_, E>(&AstSetupExprLowerer, name_gen, other, None)
+        }
     }
 }
 
@@ -82,7 +84,9 @@ where
     E: RuffToBlockPyExpr + ImplicitNoneExpr,
 {
     let body = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &body, name_gen)
-        .unwrap_or_else(|err| panic!("failed to convert compatibility block body to BlockPy: {err}"));
+        .unwrap_or_else(|err| {
+            panic!("failed to convert compatibility block body to BlockPy: {err}")
+        });
     compat_block_from_lowered_builder_with_exc_target_and_expr(label, body, term, exc_target)
 }
 
@@ -95,9 +99,9 @@ pub(crate) fn compat_block_from_lowered_builder_with_exc_target_and_expr<E>(
 where
     E: RuffToBlockPyExpr + ImplicitNoneExpr,
 {
-    let block = builder
-        .finish_linear_block(label, term)
-        .unwrap_or_else(|| panic!("compatibility block body should lower to a single linear block"));
+    let block = builder.finish_linear_block(label, term).unwrap_or_else(|| {
+        panic!("compatibility block body should lower to a single linear block")
+    });
     with_exc_meta(block, exc_target)
 }
 
@@ -180,7 +184,9 @@ where
         return target_label;
     }
     let lowered_linear = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &linear, name_gen)
-        .unwrap_or_else(|err| panic!("failed to lower sequence jump prefix through production path: {err}"));
+        .unwrap_or_else(|err| {
+            panic!("failed to lower sequence jump prefix through production path: {err}")
+        });
     emit_lowered_builder_fragment_with_exc_target_and_expr(
         blocks,
         lowered_linear,
@@ -238,11 +244,11 @@ where
         }
     }
     let value = value
-        .map(|expr| crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
-            expr,
-            &mut out,
-            None,
-        ))
+        .map(|expr| {
+            crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
+                expr, &mut out, None,
+            )
+        })
         .transpose()?;
     let return_term = BlockTerm::Return(value.unwrap_or_else(E::implicit_none_expr));
     Ok(emit_lowered_builder_fragment_with_exc_target_and_expr(
@@ -308,9 +314,7 @@ where
             .exc
             .map(|expr| {
                 crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
-                    expr,
-                    &mut out,
-                    None,
+                    expr, &mut out, None,
                 )
             })
             .transpose()?,
@@ -363,7 +367,8 @@ where
             exc_target,
         ));
         if !body.is_empty() {
-            let lowered_body = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &body, name_gen)?;
+            let lowered_body =
+                lower_stmts_to_blockpy_stmts_with_context::<E>(context, &body, name_gen)?;
             return Ok(emit_lowered_builder_fragment_with_exc_target_and_expr(
                 blocks,
                 lowered_body,
@@ -378,9 +383,7 @@ where
 
     let mut out = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &body, name_gen)?;
     let lowered_test = crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
-        test,
-        &mut out,
-        None,
+        test, &mut out, None,
     )?;
     let if_term = BlockTerm::IfTerm(TermIf {
         test: lowered_test,
@@ -449,11 +452,10 @@ where
         ));
     } else {
         let mut out = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &[], name_gen)?;
-        let lowered_test = crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
-            test,
-            &mut out,
-            None,
-        )?;
+        let lowered_test =
+            crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
+                test, &mut out, None,
+            )?;
         let if_term = BlockTerm::IfTerm(TermIf {
             test: lowered_test,
             then_label: body_entry,
@@ -480,7 +482,8 @@ where
         }
     }
     if let Some(linear_label) = linear_label {
-        let lowered_linear = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &linear, name_gen)?;
+        let lowered_linear =
+            lower_stmts_to_blockpy_stmts_with_context::<E>(context, &linear, name_gen)?;
         let emitted_linear_entry = emit_lowered_builder_fragment_with_exc_target_and_expr(
             blocks,
             lowered_linear,
@@ -527,7 +530,8 @@ pub(crate) fn emit_for_loop_blocks<E>(
 where
     E: RuffToBlockPyExpr + ImplicitNoneExpr,
 {
-    let synthetic_name_expr = |name: &str| InstrRuff::from_ast_expr(py_expr!("{name:id}", name = name));
+    let synthetic_name_expr =
+        |name: &str| InstrRuff::from_ast_expr(py_expr!("{name:id}", name = name));
     let runtime_helper_expr = |name: &'static str| {
         InstrRuff::ExprAttribute(
             ExprAttribute::new(
@@ -539,8 +543,11 @@ where
         )
     };
 
-    let lowered_assign = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &assign_body, name_gen)
-        .unwrap_or_else(|err| panic!("failed to lower for-loop target assignment through production path: {err}"));
+    let lowered_assign =
+        lower_stmts_to_blockpy_stmts_with_context::<E>(context, &assign_body, name_gen)
+            .unwrap_or_else(|err| {
+                panic!("failed to lower for-loop target assignment through production path: {err}")
+            });
     blocks.push(compat_block_from_lowered_builder_with_exc_target_and_expr(
         assign_label.clone(),
         lowered_assign,
@@ -548,13 +555,20 @@ where
         exc_target,
     ));
 
-    let exhausted_test = InstrRuff::from_ast_expr(
-        py_expr!("{tmp:id} is __soac__.ITER_COMPLETE", tmp = tmp_name)
-    );
-    let next_helper = if is_async { "anext_or_sentinel" } else { "next_or_sentinel" };
+    let exhausted_test = InstrRuff::from_ast_expr(py_expr!(
+        "{tmp:id} is __soac__.ITER_COMPLETE",
+        tmp = tmp_name
+    ));
+    let next_helper = if is_async {
+        "anext_or_sentinel"
+    } else {
+        "next_or_sentinel"
+    };
     let next_call: InstrRuff = Call::new(
         runtime_helper_expr(next_helper),
-        vec![CallArgPositional::Positional(synthetic_name_expr(iter_name))],
+        vec![CallArgPositional::Positional(synthetic_name_expr(
+            iter_name,
+        ))],
         Vec::new(),
     )
     .with_meta(crate::block_py::Meta::synthetic())
@@ -567,12 +581,18 @@ where
         next_call
     };
     let check_body = vec![crate::block_py::StmtAssign::new(
-        vec![InstrRuff::from_ast_expr(py_expr!("{tmp:id}", tmp = tmp_name))],
+        vec![InstrRuff::from_ast_expr(py_expr!(
+            "{tmp:id}",
+            tmp = tmp_name
+        ))],
         next_value,
     )
     .into()];
-    let lowered_check = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &check_body, name_gen)
-        .unwrap_or_else(|err| panic!("failed to lower for-loop next step through production path: {err}"));
+    let lowered_check =
+        lower_stmts_to_blockpy_stmts_with_context::<E>(context, &check_body, name_gen)
+            .unwrap_or_else(|err| {
+                panic!("failed to lower for-loop next step through production path: {err}")
+            });
     blocks.push(compat_block_from_lowered_builder_with_exc_target_and_expr(
         loop_check_label.clone(),
         lowered_check,
@@ -595,13 +615,19 @@ where
     .into();
     setup_body.push(
         crate::block_py::StmtAssign::new(
-            vec![InstrRuff::from_ast_expr(py_expr!("{iter:id}", iter = iter_name))],
+            vec![InstrRuff::from_ast_expr(py_expr!(
+                "{iter:id}",
+                iter = iter_name
+            ))],
             iter_value,
         )
         .into(),
     );
-    let lowered_setup = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &setup_body, name_gen)
-        .unwrap_or_else(|err| panic!("failed to lower for-loop setup through production path: {err}"));
+    let lowered_setup =
+        lower_stmts_to_blockpy_stmts_with_context::<E>(context, &setup_body, name_gen)
+            .unwrap_or_else(|err| {
+                panic!("failed to lower for-loop setup through production path: {err}")
+            });
     blocks.push(compat_block_from_lowered_builder_with_exc_target_and_expr(
         setup_label.clone(),
         lowered_setup,

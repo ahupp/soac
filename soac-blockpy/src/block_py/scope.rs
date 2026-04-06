@@ -1,7 +1,7 @@
 use super::{
-    is_internal_symbol, walk_block, walk_expr, Block, BlockPyFunction, BlockPyLiteral,
-    BlockPyNameLike, BlockPyPass, Call, CallArgPositional, ChildVisitable, InstrLow,
-    InstrWithAwaitAndYield, InstrWithYield, FunctionName, Instr, InstrRuff,
+    is_internal_symbol, walk_block, walk_expr, Block, BlockPyFunction, BlockPyPass, Call,
+    CallArgPositional, ChildVisitable, FunctionName, Instr, InstrLow, InstrRuff,
+    InstrWithAwaitAndYield, InstrWithYield, Literal, NameLike,
 };
 use crate::passes::ast_to_ast::scope_helpers::cell_name;
 use ruff_python_ast::{self as ast};
@@ -463,7 +463,9 @@ fn walk_assigned_name_targets_in_instr_ruff(target: &InstrRuff, f: &mut impl FnM
         InstrRuff::ExprStarred(starred) => {
             walk_assigned_name_targets_in_instr_ruff(starred.value.as_ref(), f)
         }
-        InstrRuff::ExprNamed(named) => walk_assigned_name_targets_in_instr_ruff(named.target.as_ref(), f),
+        InstrRuff::ExprNamed(named) => {
+            walk_assigned_name_targets_in_instr_ruff(named.target.as_ref(), f)
+        }
         InstrRuff::StmtAssign(stmt) => {
             for target in &stmt.targets {
                 walk_assigned_name_targets_in_instr_ruff(target, f);
@@ -582,7 +584,7 @@ impl ScopeExprNode for InstrWithAwaitAndYield {
     fn root_string_literal_value(&self) -> Option<String> {
         match self {
             Self::Literal(literal) => match literal.as_literal() {
-                BlockPyLiteral::StringLiteral(literal) => Some(literal.value.clone()),
+                Literal::StringLiteral(literal) => Some(literal.value.clone()),
                 _ => None,
             },
             _ => None,
@@ -638,7 +640,7 @@ impl ScopeExprNode for InstrWithYield {
     fn root_string_literal_value(&self) -> Option<String> {
         match self {
             Self::Literal(literal) => match literal.as_literal() {
-                BlockPyLiteral::StringLiteral(literal) => Some(literal.value.clone()),
+                Literal::StringLiteral(literal) => Some(literal.value.clone()),
                 _ => None,
             },
             _ => None,
@@ -684,7 +686,7 @@ impl ScopeExprNode for InstrWithYield {
 
 impl<N> ScopeExprNode for InstrLow<N>
 where
-    N: BlockPyNameLike,
+    N: NameLike,
 {
     fn root_name_id(&self) -> Option<&str> {
         match self {
@@ -697,7 +699,7 @@ where
     fn root_string_literal_value(&self) -> Option<String> {
         match self {
             Self::Literal(literal) => match literal.as_literal() {
-                BlockPyLiteral::StringLiteral(literal) => Some(literal.value.clone()),
+                Literal::StringLiteral(literal) => Some(literal.value.clone()),
                 _ => None,
             },
             _ => None,
@@ -741,7 +743,7 @@ where
     }
 }
 
-impl ScopeExprNode for super::CodegenBlockPyExpr {
+impl ScopeExprNode for super::InstrCodegen {
     fn root_name_id(&self) -> Option<&str> {
         match self {
             Self::Call(call) => call.func.as_ref().root_name_id(),
@@ -838,7 +840,7 @@ pub(crate) fn compute_make_function_capture_bindings_from_scope<P>(
 ) -> Vec<CellCaptureBinding>
 where
     P: BlockPyPass,
-    P::Expr: ScopeExprNode,
+    P::Instr: ScopeExprNode,
 {
     let normalize_capture_name = |name: &str| {
         callable_def
@@ -906,7 +908,7 @@ pub(crate) fn compute_storage_layout_from_scope<P>(
 ) -> Option<StorageLayout>
 where
     P: BlockPyPass,
-    P::Expr: ScopeExprNode,
+    P::Instr: ScopeExprNode,
 {
     let owned_cell_slot_names = callable_def.scope.owned_cell_storage_names();
     let mut local_cell_slots = owned_cell_slot_names.iter().cloned().collect::<Vec<_>>();

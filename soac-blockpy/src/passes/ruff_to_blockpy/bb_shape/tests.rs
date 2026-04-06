@@ -3,10 +3,9 @@ use super::{
     CurrentExceptionExpr,
 };
 use crate::block_py::{
-    Block, BlockLabel, BlockParam, BlockParamRole, BlockPyNameLike, BlockTerm,
-    CallArgPositional, ChildVisitable, InstrLow, InstrUnresolved, InstrResolved, ResolvedName, Meta,
-    ModuleNameGen, NameLocation, ResolvedStorageBlock, TermIf,
-    WithMeta,
+    Block, BlockLabel, BlockParam, BlockParamRole, BlockTerm, CallArgPositional, ChildVisitable,
+    InstrLow, InstrResolved, InstrUnresolved, Meta, ModuleNameGen, NameLike, NameLocation,
+    ResolvedName, ResolvedStorageBlock, TermIf, WithMeta,
 };
 use ruff_python_ast::{self as ast};
 use ruff_text_size::TextRange;
@@ -15,7 +14,7 @@ pub(crate) fn lower_structured_core_blocks_to_bb_blocks<N>(
     blocks: &[Block<InstrLow<N>, InstrLow<N>>],
 ) -> Vec<Block<InstrLow<N>, InstrLow<N>>>
 where
-    N: BlockPyNameLike,
+    N: NameLike,
 {
     let module_name_gen = ModuleNameGen::new(0);
     let name_gen = module_name_gen.next_function_name_gen();
@@ -69,10 +68,7 @@ fn rewrite_current_exception_in_located_core_blocks(
     }
 }
 
-fn rewrite_current_exception_in_located_term(
-    term: &mut BlockTerm<InstrResolved>,
-    exc_name: &str,
-) {
+fn rewrite_current_exception_in_located_term(term: &mut BlockTerm<InstrResolved>, exc_name: &str) {
     struct RewriteTermVisitor<'a> {
         exc_name: &'a str,
     }

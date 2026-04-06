@@ -4,25 +4,25 @@ pub(crate) mod blockpy_expr_simplify;
 mod blockpy_generators;
 pub mod blockpy_to_bb;
 pub(crate) mod core_await_lower;
-mod instrument;
 mod instr_id;
+mod instrument;
 mod name_binding;
 pub mod ruff_to_blockpy;
 mod trace;
 
 use crate::block_py::{cfg::relabel_blockpy_blocks_dense, BlockPyModule, ImplicitNoneExpr};
 use crate::block_py::{
-    Await, BinOp, BlockPyNameLike, BlockPyPass, Call, CallArgKeyword, CallArgPositional, CellRef,
-    CellRefForName, ChildVisitable, CodegenBlockPyExpr, Del, DelItem, ExprAttribute, ExprBoolOp,
-    ExprBooleanLiteral, ExprBytesLiteral, ExprCompare, ExprDict, ExprDictComp,
-    ExprEllipsisLiteral, ExprFString, ExprGenerator, ExprIpyEscapeCommand, ExprIf, ExprLambda,
+    Await, BinOp, BlockPyPass, CalleeFunctionId, Call, CallArgKeyword, CallArgPositional,
+    CallDirect, CellRef, CellRefForName, ChildVisitable, Del, DelItem, ExprAttribute,
+    ExprBoolOp, ExprBooleanLiteral, ExprBytesLiteral, ExprCompare, ExprDict, ExprDictComp,
+    ExprEllipsisLiteral, ExprFString, ExprGenerator, ExprIf, ExprIpyEscapeCommand, ExprLambda,
     ExprList, ExprListComp, ExprName, ExprNamed, ExprNoneLiteral, ExprNumberLiteral, ExprSet,
     ExprSetComp, ExprSlice, ExprStarred, ExprStringLiteral, ExprSubscript, ExprTString,
-    ExprTuple, GetAttr, GetItem, HasMeta, Instr, Load, LiteralValue, MakeCell, MakeFunction,
-    MapInstr, Mappable, Meta, ResolvedName, SetAttr, SetItem, StmtAnnAssign, StmtAssign,
-    StmtAssert, StmtAugAssign, StmtBreak,
-    StmtClassDef, StmtContinue, StmtDelete, StmtExpr, StmtFor, StmtFunctionDef, StmtGlobal,
-    StmtIf, StmtImport, StmtImportFrom, StmtIpyEscapeCommand, StmtMatch, StmtNonlocal, StmtPass,
+    ExprTuple, GetAttr, GetItem, HasMeta, IncrementCounter, Instr, LiteralValue, Load, MakeCell,
+    MakeFunction, MapInstr, Mappable, Meta, NameLike, ResolvedName, SetAttr, SetItem,
+    StmtAnnAssign, StmtAssert, StmtAssign, StmtAugAssign, StmtBreak, StmtClassDef,
+    StmtContinue, StmtDelete, StmtExpr, StmtFor, StmtFunctionDef, StmtGlobal, StmtIf,
+    StmtImport, StmtImportFrom, StmtIpyEscapeCommand, StmtMatch, StmtNonlocal, StmtPass,
     StmtRaise, StmtReturn, StmtTry, StmtTypeAlias, StmtWhile, StmtWith, Store, TryMapInstr,
     UnaryOp, UnresolvedName, WithMeta, Yield, YieldFrom,
 };
@@ -96,7 +96,7 @@ pub enum InstrRuff {
 pub struct RuffBlockPyPass;
 
 impl BlockPyPass for RuffBlockPyPass {
-    type Expr = InstrRuff;
+    type Instr = InstrRuff;
 }
 
 impl Instr for InstrRuff {
@@ -111,6 +111,28 @@ impl ImplicitNoneExpr for InstrRuff {
     fn is_implicit_none_expr(expr: &Self) -> bool {
         matches!(expr, Self::ExprNoneLiteral(_))
     }
+}
+
+#[derive(Clone, derive_more::From)]
+#[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, Debug)]
+pub enum InstrCodegen {
+    BinOp(BinOp<Self>),
+    UnaryOp(UnaryOp<Self>),
+    CalleeFunctionId(CalleeFunctionId<Self>),
+    Call(Call<Self>),
+    CallDirect(CallDirect<Self>),
+    GetAttr(GetAttr<Self>),
+    SetAttr(SetAttr<Self>),
+    GetItem(GetItem<Self>),
+    SetItem(SetItem<Self>),
+    DelItem(DelItem<Self>),
+    Load(Load<Self>),
+    Store(Store<Self>),
+    Del(Del<Self>),
+    MakeCell(MakeCell<Self>),
+    IncrementCounter(IncrementCounter),
+    CellRef(CellRef),
+    MakeFunction(MakeFunction<Self>),
 }
 
 impl InstrRuff {
@@ -175,17 +197,15 @@ impl InstrRuff {
 
         let mut iter = orelse.into_iter();
         match iter.next().expect("checked non-empty orelse") {
-            Self::StmtIf(node) if iter.next().is_none() => {
-                vec![ast::ElifElseClause {
-                    range: node.meta().range,
-                    node_index: node.meta().node_index,
-                    test: Some(node.test.into_ast_expr()),
-                    body: Self::into_ast_suite(node.body),
-                }]
-                .into_iter()
-                .chain(Self::denormalize_if_orelse(node.orelse))
-                .collect()
-            }
+            Self::StmtIf(node) if iter.next().is_none() => vec![ast::ElifElseClause {
+                range: node.meta().range,
+                node_index: node.meta().node_index,
+                test: Some(node.test.into_ast_expr()),
+                body: Self::into_ast_suite(node.body),
+            }]
+            .into_iter()
+            .chain(Self::denormalize_if_orelse(node.orelse))
+            .collect(),
             first => {
                 let mut body = vec![first.into_ast_stmt()];
                 body.extend(iter.map(Self::into_ast_stmt));
@@ -324,14 +344,14 @@ impl InstrRuff {
                         .into_iter()
                         .map(|arg| match arg {
                             CallArgPositional::Positional(expr) => expr.into_ast_expr(),
-                            CallArgPositional::Starred(expr) => ast::Expr::Starred(
-                                ast::ExprStarred {
+                            CallArgPositional::Starred(expr) => {
+                                ast::Expr::Starred(ast::ExprStarred {
                                     range: expr.meta().range,
                                     node_index: expr.meta().node_index,
                                     value: Box::new(expr.into_ast_expr()),
                                     ctx: ast::ExprContext::Load,
-                                },
-                            ),
+                                })
+                            }
                         })
                         .collect::<Vec<_>>()
                         .into(),
@@ -390,10 +410,12 @@ impl InstrRuff {
                 range: node.meta().range,
                 node_index: node.meta().node_index,
             }),
-            Self::ExprEllipsisLiteral(node) => ast::Expr::EllipsisLiteral(ast::ExprEllipsisLiteral {
-                range: node.meta().range,
-                node_index: node.meta().node_index,
-            }),
+            Self::ExprEllipsisLiteral(node) => {
+                ast::Expr::EllipsisLiteral(ast::ExprEllipsisLiteral {
+                    range: node.meta().range,
+                    node_index: node.meta().node_index,
+                })
+            }
             Self::ExprAttribute(node) => ast::Expr::Attribute(ast::ExprAttribute {
                 range: node.meta().range,
                 node_index: node.meta().node_index,
@@ -481,7 +503,10 @@ impl InstrRuff {
                 let meta = node.meta();
                 Self::wrap_ast_expr(
                     meta,
-                    ExprNamed::new(Self::from_ast_expr(*node.target), Self::from_ast_expr(*node.value)),
+                    ExprNamed::new(
+                        Self::from_ast_expr(*node.target),
+                        Self::from_ast_expr(*node.value),
+                    ),
                 )
             }
             ast::Expr::BinOp(node) => {
@@ -749,7 +774,8 @@ impl InstrRuff {
                         node.name,
                         node.type_params,
                         node.parameters,
-                        node.returns.map(|expr| Box::new(Self::from_ast_expr(*expr))),
+                        node.returns
+                            .map(|expr| Box::new(Self::from_ast_expr(*expr))),
                         Self::from_ast_suite(node.body),
                     ),
                 )
@@ -783,7 +809,12 @@ impl InstrRuff {
                 let meta = node.meta();
                 Self::wrap_ast_stmt(
                     meta,
-                    StmtDelete::new(node.targets.into_iter().map(Self::from_ast_expr).collect::<Vec<_>>()),
+                    StmtDelete::new(
+                        node.targets
+                            .into_iter()
+                            .map(Self::from_ast_expr)
+                            .collect::<Vec<_>>(),
+                    ),
                 )
             }
             ast::Stmt::TypeAlias(node) => {
@@ -802,7 +833,10 @@ impl InstrRuff {
                 Self::wrap_ast_stmt(
                     meta,
                     StmtAssign::new(
-                        node.targets.into_iter().map(Self::from_ast_expr).collect::<Vec<_>>(),
+                        node.targets
+                            .into_iter()
+                            .map(Self::from_ast_expr)
+                            .collect::<Vec<_>>(),
                         Self::from_ast_expr(*node.value),
                     ),
                 )
@@ -869,11 +903,7 @@ impl InstrRuff {
                 let meta = node.meta();
                 Self::wrap_ast_stmt(
                     meta,
-                    StmtWith::new(
-                        node.is_async,
-                        node.items,
-                        Self::from_ast_suite(node.body),
-                    ),
+                    StmtWith::new(node.is_async, node.items, Self::from_ast_suite(node.body)),
                 )
             }
             ast::Stmt::Match(node) => {
@@ -922,7 +952,10 @@ impl InstrRuff {
             }
             ast::Stmt::ImportFrom(node) => {
                 let meta = node.meta();
-                Self::wrap_ast_stmt(meta, StmtImportFrom::new(node.module, node.names, node.level))
+                Self::wrap_ast_stmt(
+                    meta,
+                    StmtImportFrom::new(node.module, node.names, node.level),
+                )
             }
             ast::Stmt::Global(node) => {
                 let meta = node.meta();
@@ -1111,14 +1144,14 @@ impl InstrRuff {
                 range: node.meta().range,
                 node_index: node.meta().node_index,
             }),
-            Self::StmtIpyEscapeCommand(node) => ast::Stmt::IpyEscapeCommand(
-                ast::StmtIpyEscapeCommand {
+            Self::StmtIpyEscapeCommand(node) => {
+                ast::Stmt::IpyEscapeCommand(ast::StmtIpyEscapeCommand {
                     range: node.meta().range,
                     node_index: node.meta().node_index,
                     kind: node.kind,
                     value: node.value,
-                },
-            ),
+                })
+            }
             other => panic!("expected statement-shaped InstrRuff, got {other:?}"),
         }
     }
@@ -1173,7 +1206,7 @@ pub enum InstrWithYield {
 
 #[derive(Clone, derive_more::From, DelegateMatchDefault)]
 #[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, Debug)]
-pub enum InstrLow<N: BlockPyNameLike> {
+pub enum InstrLow<N: NameLike> {
     Literal(LiteralValue),
     BinOp(BinOp<Self>),
     UnaryOp(UnaryOp<Self>),
@@ -1199,35 +1232,35 @@ pub type InstrResolved = InstrLow<ResolvedName>;
 pub struct CoreBlockPyPassWithAwaitAndYield;
 
 impl BlockPyPass for CoreBlockPyPassWithAwaitAndYield {
-    type Expr = InstrWithAwaitAndYield;
+    type Instr = InstrWithAwaitAndYield;
 }
 
 #[derive(Debug, Clone)]
 pub struct CoreBlockPyPassWithYield;
 
 impl BlockPyPass for CoreBlockPyPassWithYield {
-    type Expr = InstrWithYield;
+    type Instr = InstrWithYield;
 }
 
 #[derive(Debug, Clone)]
 pub struct CoreBlockPyPass;
 
 impl BlockPyPass for CoreBlockPyPass {
-    type Expr = InstrLow<UnresolvedName>;
+    type Instr = InstrLow<UnresolvedName>;
 }
 
 #[derive(Debug, Clone)]
 pub struct ResolvedStorageBlockPyPass;
 
 impl BlockPyPass for ResolvedStorageBlockPyPass {
-    type Expr = InstrLow<ResolvedName>;
+    type Instr = InstrLow<ResolvedName>;
 }
 
 #[derive(Debug, Clone)]
 pub struct CodegenBlockPyPass;
 
 impl BlockPyPass for CodegenBlockPyPass {
-    type Expr = CodegenBlockPyExpr;
+    type Instr = InstrCodegen;
 }
 
 pub(crate) use blockpy_generators::lower_yield_in_lowered_core_blockpy_module_bundle;
@@ -1237,9 +1270,8 @@ pub use instrument::{
     CounterBuilder, CounterHandle, CounterSpec, InstrumentInstr, OptBlock, OptInstr,
 };
 pub use trace::{
-    instrument_bb_module_with_call_target_counters,
-    instrument_bb_module_with_block_entry_counters, instrument_bb_module_with_global_load_counters,
-    instrument_bb_module_with_refcount_counters,
+    instrument_bb_module_with_block_entry_counters, instrument_bb_module_with_call_target_counters,
+    instrument_bb_module_with_global_load_counters, instrument_bb_module_with_refcount_counters,
 };
 
 pub(crate) use name_binding::lower_name_binding_in_core_blockpy_module;

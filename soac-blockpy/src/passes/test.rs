@@ -1,9 +1,9 @@
 use crate::block_py::pretty::BlockPyPrettyPrint;
 use crate::block_py::{BindingKind, ClosureInit, ClosureSlot, ModuleNameGen};
 use crate::block_py::{
-    BlockPyFunction, BlockPyModule, BlockPyNameLike, BlockTerm, Call, CallArgKeyword,
-    CallArgPositional, CallableScopeKind, CellBindingKind, InstrLow, InstrResolved,
-    FunctionKind, ResolvedName, NameLocation, ResolvedStorageBlock,
+    BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional,
+    CallableScopeKind, CellBindingKind, FunctionKind, InstrLow, InstrResolved, NameLike,
+    NameLocation, ResolvedName, ResolvedStorageBlock,
 };
 use crate::passes::ast_to_ast::ast_rewrite::rewrite_with_pass;
 use crate::passes::ast_to_ast::context::Context;
@@ -19,8 +19,8 @@ use crate::passes::{
     ResolvedStorageBlockPyPass,
 };
 use crate::{lower_python_to_blockpy_for_testing, LoweringResult};
-use ruff_python_parser::parse_module;
 use ruff_python_ast::{self as ast, Expr, Stmt};
+use ruff_python_parser::parse_module;
 
 fn tracked_core_blockpy_with_await_and_yield(
     source: &str,
@@ -66,9 +66,9 @@ fn tracked_core_blockpy_with_yield_only(source: &str) -> BlockPyModule<CoreBlock
 
 fn assert_all_targets_present<P, S>(module: &BlockPyModule<P, S>)
 where
-    P: crate::block_py::BlockPyPass<Expr = S> + crate::block_py::pretty::BlockPyPrettyPrinter,
+    P: crate::block_py::BlockPyPass<Instr = S> + crate::block_py::pretty::BlockPyPrettyPrinter,
     S: crate::block_py::Instr + std::fmt::Debug,
-    P::Expr: std::fmt::Debug,
+    P::Instr: std::fmt::Debug,
 {
     let rendered = module.pretty_print();
     for callable in &module.callable_defs {
@@ -192,7 +192,7 @@ fn slot_by_name<'a>(slots: &'a [ClosureSlot], logical_name: &str) -> &'a Closure
         .unwrap_or_else(|| panic!("missing closure slot {logical_name}; got {slots:?}"))
 }
 
-fn expr_text<N: BlockPyNameLike>(expr: &InstrLow<N>) -> String {
+fn expr_text<N: NameLike>(expr: &InstrLow<N>) -> String {
     crate::block_py::pretty::bb_expr_text(expr)
 }
 

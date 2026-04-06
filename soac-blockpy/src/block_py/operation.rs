@@ -1,7 +1,7 @@
 use super::operation_macro::define_operation;
 use super::{
-    BlockPyNameLike, CallArgKeyword, CallArgPositional, CellLocation, ChildVisitable, FunctionId,
-    FunctionKind, HasMeta, Instr, InstrName, MapInstr, Mappable, Meta, TryMapInstr, WithMeta,
+    CallArgKeyword, CallArgPositional, CellLocation, ChildVisitable, FunctionId, FunctionKind,
+    HasMeta, Instr, InstrName, MapInstr, Mappable, Meta, NameLike, TryMapInstr, WithMeta,
 };
 use ruff_python_ast::{self as ast};
 use std::fmt;

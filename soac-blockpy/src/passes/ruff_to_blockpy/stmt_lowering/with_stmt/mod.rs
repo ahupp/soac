@@ -140,7 +140,10 @@ pub(super) fn desugar_structured_with_instr_for_blockpy(
         items,
         body: body.into_iter().map(InstrRuff::into_ast_stmt).collect(),
     });
-    rewritten.into_iter().map(InstrRuff::from_ast_stmt).collect()
+    rewritten
+        .into_iter()
+        .map(InstrRuff::from_ast_stmt)
+        .collect()
 }
 
 pub(crate) fn lower_with_stmt_sequence<F, E>(

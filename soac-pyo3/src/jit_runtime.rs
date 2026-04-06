@@ -137,7 +137,7 @@ fn maybe_eager_compile_clif_entry(
     }
 }
 
-fn register_lazy_clif_vectorcall(
+fn register_lazy_vectorcall(
     py: Python<'_>,
     func: &Bound<'_, PyAny>,
     function_id: FunctionId,
@@ -601,7 +601,7 @@ fn instantiate_closure_backed_entry<'py>(
             &closure_values,
         )?
     };
-    register_lazy_clif_vectorcall(py, &entry, function.function_id, module_runtime)?;
+    register_lazy_vectorcall(py, &entry, function.function_id, module_runtime)?;
     Ok(entry)
 }
 

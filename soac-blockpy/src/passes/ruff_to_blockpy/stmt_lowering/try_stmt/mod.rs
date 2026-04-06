@@ -238,7 +238,10 @@ pub(crate) fn rewrite_try_instr(stmt: crate::block_py::StmtTry<InstrRuff>) -> Ve
         body: body.into_iter().map(InstrRuff::into_ast_stmt).collect(),
         handlers,
         orelse: orelse.into_iter().map(InstrRuff::into_ast_stmt).collect(),
-        finalbody: finalbody.into_iter().map(InstrRuff::into_ast_stmt).collect(),
+        finalbody: finalbody
+            .into_iter()
+            .map(InstrRuff::into_ast_stmt)
+            .collect(),
         is_star,
     });
     match rewritten {
@@ -328,7 +331,11 @@ where
         targets.loop_labels.clone(),
         targets.active_exc.clone(),
         &mut |stmts, nested_targets, blocks| {
-            let stmts = stmts.iter().cloned().map(InstrRuff::from_ast_stmt).collect::<Vec<_>>();
+            let stmts = stmts
+                .iter()
+                .cloned()
+                .map(InstrRuff::from_ast_stmt)
+                .collect::<Vec<_>>();
             lower_sequence(&stmts, nested_targets, blocks)
         },
     );

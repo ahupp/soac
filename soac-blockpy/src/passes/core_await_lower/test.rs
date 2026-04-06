@@ -1,8 +1,8 @@
 use super::*;
 
 use crate::block_py::{
-    Block, BlockLabel, BlockPyFunction, BlockPyNameLike, BlockTerm, CallableScopeInfo,
-    InstrWithAwaitAndYield, InstrWithYield, FunctionKind, FunctionName,
+    Block, BlockLabel, BlockPyFunction, BlockTerm, CallableScopeInfo, FunctionKind, FunctionName,
+    InstrWithAwaitAndYield, InstrWithYield, NameLike,
 };
 
 fn test_name_gen() -> crate::block_py::FunctionNameGen {

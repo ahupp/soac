@@ -113,7 +113,10 @@ impl SharedModuleState {
         value: u64,
     ) -> Result<(), String> {
         let Some(slot) = self.counter_slots_by_id.get(counter_id.0).copied() else {
-            return Err(format!("missing counter slot for counter id {}", counter_id.0));
+            return Err(format!(
+                "missing counter slot for counter id {}",
+                counter_id.0
+            ));
         };
         let CounterRuntimeSlot::CallHotTargets(slot) = slot else {
             return Err(format!(
@@ -216,39 +219,45 @@ impl SharedModuleState {
 
         let mut rows = Vec::new();
         for counter in &self.lowered_module.counter_defs {
-            let (site_kind, function_id, current_function_id, instr_id, function_qualname, block_label) =
-                match &counter.site {
-                    CounterSite::BlockEntry {
-                        function_id,
-                        block_label,
-                    } => {
-                        let function = self.lookup_function(*function_id);
-                        (
-                            "block_entry".to_string(),
-                            Some(*function_id),
-                            Some(*function_id),
-                            None,
-                            function
-                                .map(|function| function.names.qualname.clone())
-                                .or_else(|| Some("<missing-function>".to_string())),
-                            Some(block_label.to_string()),
-                        )
-                    }
-                    CounterSite::Runtime {
-                        function_id,
-                        instr_id,
-                    } => (
-                        "runtime".to_string(),
-                        Some(function_id.unwrap_or(FunctionId::global())),
-                        Some(function_id.unwrap_or(FunctionId::global())),
-                        *instr_id,
-                        function_id.and_then(|function_id| {
-                            self.lookup_function(function_id)
-                                .map(|function| function.names.qualname.clone())
-                        }),
+            let (
+                site_kind,
+                function_id,
+                current_function_id,
+                instr_id,
+                function_qualname,
+                block_label,
+            ) = match &counter.site {
+                CounterSite::BlockEntry {
+                    function_id,
+                    block_label,
+                } => {
+                    let function = self.lookup_function(*function_id);
+                    (
+                        "block_entry".to_string(),
+                        Some(*function_id),
+                        Some(*function_id),
                         None,
-                    ),
-                };
+                        function
+                            .map(|function| function.names.qualname.clone())
+                            .or_else(|| Some("<missing-function>".to_string())),
+                        Some(block_label.to_string()),
+                    )
+                }
+                CounterSite::Runtime {
+                    function_id,
+                    instr_id,
+                } => (
+                    "runtime".to_string(),
+                    Some(function_id.unwrap_or(FunctionId::global())),
+                    Some(function_id.unwrap_or(FunctionId::global())),
+                    *instr_id,
+                    function_id.and_then(|function_id| {
+                        self.lookup_function(function_id)
+                            .map(|function| function.names.qualname.clone())
+                    }),
+                    None,
+                ),
+            };
 
             let base_row = CounterDumpRow {
                 counter_id: u32::try_from(counter.id.0).expect("counter ids should fit in u32"),
@@ -396,9 +405,7 @@ fn build_counter_storage(
     Ok((
         slots_by_id
             .into_iter()
-            .map(|slot| {
-                slot.expect("every counter id should map to a runtime counter slot")
-            })
+            .map(|slot| slot.expect("every counter id should map to a runtime counter slot"))
             .collect::<Vec<_>>()
             .into_boxed_slice(),
         counter_values.into_boxed_slice(),
@@ -852,11 +859,8 @@ def f():
                 .expect("function index should build"),
             codegen_constants: ModuleCodegenConstants::collect_from_module(&lowered),
             module_constant_objs: Vec::new(),
-            counter_slots_by_id: vec![
-                CounterRuntimeSlot::Scalar(0),
-                CounterRuntimeSlot::Scalar(1),
-            ]
-            .into_boxed_slice(),
+            counter_slots_by_id: vec![CounterRuntimeSlot::Scalar(0), CounterRuntimeSlot::Scalar(1)]
+                .into_boxed_slice(),
             counter_values: vec![5, 8].into_boxed_slice(),
             call_target_counter_values: Vec::new().into_boxed_slice(),
             lowered_module: lowered,

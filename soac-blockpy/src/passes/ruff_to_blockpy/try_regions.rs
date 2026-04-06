@@ -1,12 +1,12 @@
 use super::compat::set_region_exc_param;
 use super::*;
-use crate::passes::InstrRuff;
-use crate::passes::ast_to_ast::context::Context;
 use crate::block_py::{
     AbruptKind, Block, BlockArg, BlockBuilder, BlockEdge, BlockLabel, BlockParamRole, BlockTerm,
     Instr, Meta, Store, TermBranchTable, TermRaise, WithMeta,
 };
 use crate::passes::ast_to_ast::body::Suite;
+use crate::passes::ast_to_ast::context::Context;
+use crate::passes::InstrRuff;
 
 fn expr_name(id: &str) -> ast::name::Name {
     ast::name::Name::new(id)
@@ -355,7 +355,9 @@ fn rewrite_region_returns_to_finally_blockpy<E>(
             };
         let target = expr_name(payload_name);
         let meta = Meta::synthetic();
-        block.body.push(Store::new(target, ret_value).with_meta(meta).into());
+        block
+            .body
+            .push(Store::new(target, ret_value).with_meta(meta).into());
         let payload_arg = BlockArg::Name(payload_name.to_string());
         block.term = BlockTerm::Jump(BlockEdge::with_args(
             finally_target.clone(),

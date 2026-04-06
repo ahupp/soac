@@ -9,11 +9,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use soac_blockpy::block_py::{BlockPyFunction, FunctionId};
 use soac_blockpy::passes::CodegenBlockPyPass;
+use soac_jit::module_constants::ModuleCodegenConstants;
 use soac_jit::{
     exc_dispatch_plan, jit_param_names_for_block, lookup_blockpy_function, lookup_blockpy_module,
     register_clif_module_plans, render_cranelift_run_bb_specialized_with_cfg,
 };
-use soac_jit::module_constants::ModuleCodegenConstants;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::Once;
@@ -390,7 +390,10 @@ async fn handle_speedscope_profile(
     let profile_path = resolve_speedscope_profile_path(&state.repo_root, request.path.as_str())?;
     let body = std::fs::read_to_string(&profile_path)
         .map_err(|err| ApiError::bad_request(format!("failed to read profile JSON: {err}")))?;
-    Ok(([(header::CONTENT_TYPE, "application/json; charset=utf-8")], body))
+    Ok((
+        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+        body,
+    ))
 }
 
 fn parse_packed_function_id(raw: &str) -> Result<FunctionId, ApiError> {
@@ -605,7 +608,10 @@ mod test {
             .await
             .expect("speedscope profile request should succeed");
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers()[axum::http::header::CONTENT_TYPE], "application/json; charset=utf-8");
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "application/json; charset=utf-8"
+        );
         let body = response_text(response).await;
         assert_eq!(body, "{\"name\":\"demo\"}");
 

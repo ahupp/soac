@@ -1,8 +1,8 @@
 use super::{BlockPySetupExprLowerer, RuffToBlockPyExpr};
 use crate::block_py::{BlockLabel, BlockTerm, Meta, Store, TermIf, WithMeta};
-use crate::passes::InstrRuff;
 use crate::passes::ruff_to_blockpy::expr_lowering::fresh_setup_name;
 use crate::passes::ruff_to_blockpy::{FunctionNameGen, InlineFragment, LoopContext, LoweredExpr};
+use crate::passes::InstrRuff;
 use crate::py_expr;
 use ruff_python_ast::{self as ast, CmpOp};
 
@@ -37,10 +37,12 @@ where
     E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
 {
     match expr {
-        InstrRuff::ExprBoolOp(bool_op) => Some(lower_boolop_direct(lowerer, name_gen, bool_op, loop_ctx)),
-        InstrRuff::ExprCompare(compare) if compare.ops.len() > 1 => {
-            Some(lower_compare_chain_direct(lowerer, name_gen, compare, loop_ctx))
+        InstrRuff::ExprBoolOp(bool_op) => {
+            Some(lower_boolop_direct(lowerer, name_gen, bool_op, loop_ctx))
         }
+        InstrRuff::ExprCompare(compare) if compare.ops.len() > 1 => Some(
+            lower_compare_chain_direct(lowerer, name_gen, compare, loop_ctx),
+        ),
         _ => None,
     }
 }
@@ -145,23 +147,25 @@ where
 
     let (entry, (_initial_left, first_comparator)) = bridge
         .try_lower_inline_value::<E, (InstrRuff, InstrRuff)>(name_gen, |structured| {
-                let current_left =
-                    lowerer.lower_expr_instr_into((*left).clone(), structured, loop_ctx)?;
-                structured.push_stmt(assign_name(&compare_name, current_left.clone()));
-                let mut first_comparator =
-                    lowerer.lower_expr_instr_into(first_comparator_expr.clone(), structured, loop_ctx)?;
-                if first_has_more {
-                    let tmp_name = fresh_setup_name("compare");
-                    structured.push_stmt(assign_name(&tmp_name, first_comparator.clone()));
-                    first_comparator = load_name(&tmp_name);
-                }
-                structured.push_stmt(assign_name(
-                    &target_name,
-                    compare_expr(first_op, load_name(&compare_name), first_comparator.clone()),
-                ));
-                Ok((load_name(&compare_name), first_comparator))
-            },
-        )
+            let current_left =
+                lowerer.lower_expr_instr_into((*left).clone(), structured, loop_ctx)?;
+            structured.push_stmt(assign_name(&compare_name, current_left.clone()));
+            let mut first_comparator = lowerer.lower_expr_instr_into(
+                first_comparator_expr.clone(),
+                structured,
+                loop_ctx,
+            )?;
+            if first_has_more {
+                let tmp_name = fresh_setup_name("compare");
+                structured.push_stmt(assign_name(&tmp_name, first_comparator.clone()));
+                first_comparator = load_name(&tmp_name);
+            }
+            structured.push_stmt(assign_name(
+                &target_name,
+                compare_expr(first_op, load_name(&compare_name), first_comparator.clone()),
+            ));
+            Ok((load_name(&compare_name), first_comparator))
+        })
         .transpose()?
         .ok_or_else(|| "compare setup still requires structured lowering".to_string())?;
     let mut current_left = first_comparator.clone();
@@ -231,7 +235,12 @@ where
     L: BlockPySetupExprLowerer + ?Sized,
     E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
 {
-    if let Some(lowered) = try_lower_branching_expr_direct(lowerer, out.name_gen(), InstrRuff::ExprBoolOp(bool_op), loop_ctx) {
+    if let Some(lowered) = try_lower_branching_expr_direct(
+        lowerer,
+        out.name_gen(),
+        InstrRuff::ExprBoolOp(bool_op),
+        loop_ctx,
+    ) {
         let lowered = lowered?;
         out.append_fragment(lowered.setup);
         return Ok(lowered.value);
@@ -264,7 +273,12 @@ where
         )?;
         return Ok(compare_expr(ops[0], left, right));
     }
-    if let Some(lowered) = try_lower_branching_expr_direct(lowerer, out.name_gen(), InstrRuff::ExprCompare(compare), loop_ctx) {
+    if let Some(lowered) = try_lower_branching_expr_direct(
+        lowerer,
+        out.name_gen(),
+        InstrRuff::ExprCompare(compare),
+        loop_ctx,
+    ) {
         let lowered = lowered?;
         out.append_fragment(lowered.setup);
         return Ok(lowered.value);

@@ -7,13 +7,13 @@ use crate::block_py::{
     compute_storage_layout_from_scope, core_call_expr_with_meta, core_runtime_name_expr_with_meta,
     core_runtime_positional_call_expr_with_meta, literal_expr, BindingKind, Block, BlockArg,
     BlockBuilder, BlockEdge, BlockLabel, BlockParam, BlockParamRole, BlockPyFunction,
-    BlockPyModule, BlockPyNameLike, BlockTerm, CallArgKeyword, CallArgPositional,
-    CallableScopeInfo, CellBindingKind, CellRefForName, ClosureInit, ClosureSlot, InstrUnresolved,
-    InstrWithYield, CoreNumberLiteral, CoreNumberLiteralValue, CoreStringLiteral,
-    FunctionId, FunctionKind, FunctionName, FunctionNameGen, GetAttr, ImplicitNoneExpr, Instr,
-    Load, MakeFunction, Mappable, ModuleNameGen, ScopeExprNode, StorageLayout, Store,
-    TermBranchTable, TermIf, TermRaise, TryMapFunction, TryMapInstr, TryMapTerm, UnaryOp,
-    UnaryOpKind, UnresolvedName,
+    BlockPyModule, BlockTerm, CallArgKeyword, CallArgPositional, CallableScopeInfo,
+    CellBindingKind, CellRefForName, ClosureInit, ClosureSlot, FunctionId, FunctionKind,
+    FunctionName, FunctionNameGen, GetAttr, ImplicitNoneExpr, Instr, InstrUnresolved,
+    InstrWithYield, Load, MakeFunction, Mappable, ModuleNameGen, NameLike, NumberLiteral,
+    NumberLiteralValue, ScopeExprNode, StorageLayout, Store, StringLiteral, TermBranchTable,
+    TermIf, TermRaise, TryMapFunction, TryMapInstr, TryMapTerm, UnaryOp, UnaryOpKind,
+    UnresolvedName,
 };
 use crate::passes::ast_to_ast::scope_helpers::is_internal_symbol;
 use crate::passes::ruff_to_blockpy::{attach_exception_edges_to_blocks, lowered_exception_edges};
@@ -77,20 +77,12 @@ where
     })
 }
 
-impl TryMapInstr<InstrWithYield, InstrUnresolved, InstrWithYield>
-    for ErrOnYield
-{
-    fn try_map_instr(
-        &mut self,
-        expr: InstrWithYield,
-    ) -> Result<InstrUnresolved, InstrWithYield> {
+impl TryMapInstr<InstrWithYield, InstrUnresolved, InstrWithYield> for ErrOnYield {
+    fn try_map_instr(&mut self, expr: InstrWithYield) -> Result<InstrUnresolved, InstrWithYield> {
         try_lower_core_expr_without_yield_with_mapper(expr, self)
     }
 
-    fn try_map_name(
-        &mut self,
-        name: UnresolvedName,
-    ) -> Result<UnresolvedName, InstrWithYield> {
+    fn try_map_name(&mut self, name: UnresolvedName) -> Result<UnresolvedName, InstrWithYield> {
         Ok(name)
     }
 }
@@ -303,8 +295,8 @@ where
 fn core_literal_int(value: usize) -> InstrUnresolved {
     let text = value.to_string();
     literal_expr(
-        CoreNumberLiteral {
-            value: CoreNumberLiteralValue::Int(
+        NumberLiteral {
+            value: NumberLiteralValue::Int(
                 ast::Int::from_str_radix(text.as_str(), 10, text.as_str())
                     .expect("usize decimal literal should always parse"),
             ),
@@ -319,7 +311,7 @@ fn core_none() -> InstrUnresolved {
 
 fn core_string_literal(value: &str) -> InstrUnresolved {
     literal_expr(
-        CoreStringLiteral {
+        StringLiteral {
             value: value.to_string(),
         },
         Default::default(),
@@ -689,9 +681,9 @@ fn explicit_yield_value(value: &InstrWithYield) -> Option<InstrWithYield> {
 
 fn stmt_yield_site(stmt: &LinearYieldStmt) -> Option<YieldSite> {
     match stmt {
-        InstrWithYield::Yield(yield_expr) => Some(YieldSite::ExprYield(
-            explicit_yield_value(&yield_expr.value),
-        )),
+        InstrWithYield::Yield(yield_expr) => Some(YieldSite::ExprYield(explicit_yield_value(
+            &yield_expr.value,
+        ))),
         InstrWithYield::YieldFrom(yield_from) => {
             Some(YieldSite::ExprYieldFrom((*yield_from.value).clone()))
         }
@@ -712,9 +704,9 @@ fn stmt_yield_site(stmt: &LinearYieldStmt) -> Option<YieldSite> {
 
 fn term_yield_site(term: &BlockTerm<InstrWithYield>) -> Option<YieldSite> {
     match term {
-        BlockTerm::Return(InstrWithYield::Yield(yield_expr)) => Some(
-            YieldSite::ReturnYield(explicit_yield_value(&yield_expr.value)),
-        ),
+        BlockTerm::Return(InstrWithYield::Yield(yield_expr)) => Some(YieldSite::ReturnYield(
+            explicit_yield_value(&yield_expr.value),
+        )),
         BlockTerm::Return(InstrWithYield::YieldFrom(yield_from)) => {
             Some(YieldSite::ReturnYieldFrom((*yield_from.value).clone()))
         }
@@ -1488,10 +1480,7 @@ fn emit_yield_from_site(
 
     tail_body.insert(
         0,
-        internal_store_stmt(
-            "_dp_yieldfrom",
-            InstrWithYield::implicit_none_expr(),
-        ),
+        internal_store_stmt("_dp_yieldfrom", InstrWithYield::implicit_none_expr()),
     );
     if let Some(target) = assign_target {
         tail_body.insert(
@@ -1777,8 +1766,7 @@ pub(crate) fn lower_generator_like_function(
 pub(crate) fn lower_yield_in_lowered_core_blockpy_module_bundle(
     module: BlockPyModule<CoreBlockPyPassWithYield>,
 ) -> BlockPyModule<CoreBlockPyPass> {
-    let module =
-        module.map_callable_defs(make_suspend_order_explicit_in_core_callable_def);
+    let module = module.map_callable_defs(make_suspend_order_explicit_in_core_callable_def);
     let module_name_gen = module.module_name_gen.clone();
     let mut callable_defs = Vec::new();
     for callable in module.callable_defs {

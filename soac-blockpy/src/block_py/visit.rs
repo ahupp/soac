@@ -2,6 +2,16 @@
 
 use super::*;
 
+pub trait ChildVisitable<E: Instr>: Clone + std::fmt::Debug + Sized {
+    fn visit_children<V>(&self, visitor: &mut V)
+    where
+        V: crate::block_py::Visit<E> + ?Sized;
+
+    fn visit_children_mut<V>(&mut self, visitor: &mut V)
+    where
+        V: crate::block_py::VisitMut<E> + ?Sized;
+}
+
 pub(crate) fn instr_any<I, F>(instr: &I, mut predicate: F) -> bool
 where
     I: Instr + ChildVisitable<I>,
@@ -125,7 +135,7 @@ pub trait Visit<I: Instr> {
 
     fn visit_fn<P>(&mut self, func: &BlockPyFunction<P>)
     where
-        P: BlockPyPass<Expr = I>,
+        P: BlockPyPass<Instr = I>,
         I: ChildVisitable<I>,
     {
         walk_fn(self, func);
@@ -133,7 +143,7 @@ pub trait Visit<I: Instr> {
 
     fn visit_module<P>(&mut self, module: &BlockPyModule<P>)
     where
-        P: BlockPyPass<Expr = I>,
+        P: BlockPyPass<Instr = I>,
         I: ChildVisitable<I>,
     {
         walk_module(self, module);
@@ -219,7 +229,7 @@ pub trait VisitMut<I: Instr> {
 
     fn visit_fn_mut<P>(&mut self, func: &mut BlockPyFunction<P>)
     where
-        P: BlockPyPass<Expr = I>,
+        P: BlockPyPass<Instr = I>,
         I: ChildVisitable<I>,
     {
         walk_fn_mut(self, func);
@@ -227,7 +237,7 @@ pub trait VisitMut<I: Instr> {
 
     fn visit_module_mut<P>(&mut self, module: &mut BlockPyModule<P>)
     where
-        P: BlockPyPass<Expr = I>,
+        P: BlockPyPass<Instr = I>,
         I: ChildVisitable<I>,
     {
         walk_module_mut(self, module);
@@ -236,9 +246,9 @@ pub trait VisitMut<I: Instr> {
 
 pub(crate) fn walk_module<V, P>(visitor: &mut V, module: &BlockPyModule<P>)
 where
-    V: Visit<P::Expr> + ?Sized,
+    V: Visit<P::Instr> + ?Sized,
     P: BlockPyPass,
-    P::Expr: ChildVisitable<P::Expr>,
+    P::Instr: ChildVisitable<P::Instr>,
 {
     for func in &module.callable_defs {
         visitor.visit_fn(func);
@@ -247,9 +257,9 @@ where
 
 pub(crate) fn walk_module_mut<V, P>(visitor: &mut V, module: &mut BlockPyModule<P>)
 where
-    V: VisitMut<P::Expr> + ?Sized,
+    V: VisitMut<P::Instr> + ?Sized,
     P: BlockPyPass,
-    P::Expr: ChildVisitable<P::Expr>,
+    P::Instr: ChildVisitable<P::Instr>,
 {
     for func in &mut module.callable_defs {
         visitor.visit_fn_mut(func);
@@ -258,9 +268,9 @@ where
 
 pub(crate) fn walk_fn<V, P>(visitor: &mut V, func: &BlockPyFunction<P>)
 where
-    V: Visit<P::Expr> + ?Sized,
+    V: Visit<P::Instr> + ?Sized,
     P: BlockPyPass,
-    P::Expr: ChildVisitable<P::Expr>,
+    P::Instr: ChildVisitable<P::Instr>,
 {
     for block in &func.blocks {
         visitor.visit_block(block);
@@ -269,9 +279,9 @@ where
 
 pub(crate) fn walk_fn_mut<V, P>(visitor: &mut V, func: &mut BlockPyFunction<P>)
 where
-    V: VisitMut<P::Expr> + ?Sized,
+    V: VisitMut<P::Instr> + ?Sized,
     P: BlockPyPass,
-    P::Expr: ChildVisitable<P::Expr>,
+    P::Instr: ChildVisitable<P::Instr>,
 {
     for block in &mut func.blocks {
         visitor.visit_block_mut(block);

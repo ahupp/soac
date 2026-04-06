@@ -1,7 +1,6 @@
 use crate::block_py::{
-    core_runtime_positional_call_expr_with_meta, BlockPyModule, InstrWithAwaitAndYield,
-    InstrWithYield, HasMeta, MapInstr, MapModule, Mappable, UnresolvedName, WithMeta,
-    YieldFrom,
+    core_runtime_positional_call_expr_with_meta, BlockPyModule, HasMeta, InstrWithAwaitAndYield,
+    InstrWithYield, MapInstr, MapModule, Mappable, UnresolvedName, WithMeta, YieldFrom,
 };
 use crate::passes::{CoreBlockPyPassWithAwaitAndYield, CoreBlockPyPassWithYield};
 use soac_macros::match_default;

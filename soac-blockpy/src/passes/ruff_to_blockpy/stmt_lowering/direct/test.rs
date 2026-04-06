@@ -123,6 +123,15 @@ fn stmt_return_to_blockpy_emits_setup_for_if_exprs() {
 
     let fragment = out.finish();
     assert!(fragment.entry.body.is_empty(), "{fragment:?}");
-    assert!(matches!(fragment.entry.term, BlockTerm::Jump(_)), "{fragment:?}");
-    assert!(fragment.deps.iter().any(|block| matches!(block.term, BlockTerm::Return(_))), "{fragment:?}");
+    assert!(
+        matches!(fragment.entry.term, BlockTerm::Jump(_)),
+        "{fragment:?}"
+    );
+    assert!(
+        fragment
+            .deps
+            .iter()
+            .any(|block| matches!(block.term, BlockTerm::Return(_))),
+        "{fragment:?}"
+    );
 }

@@ -89,10 +89,7 @@ where
     E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
 {
     Some(lower_simplified_if_instr_fragment(
-        context,
-        name_gen,
-        if_stmt,
-        loop_ctx,
+        context, name_gen, if_stmt, loop_ctx,
     ))
 }
 
@@ -113,28 +110,19 @@ where
         ..
     } = if_stmt;
     let bridge = StructuredLoweringBridge::new();
-    let Some(test_setup) = bridge.try_lower_inline_value(
-        name_gen,
-        |structured| {
-            crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
-                InstrRuff::from_ast_expr(*test.clone()),
-                structured,
-                loop_ctx,
-            )
-        },
-    ) else {
+    let Some(test_setup) = bridge.try_lower_inline_value(name_gen, |structured| {
+        crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
+            InstrRuff::from_ast_expr(*test.clone()),
+            structured,
+            loop_ctx,
+        )
+    }) else {
         return Err("if-test setup still requires structured lowering".to_string());
     };
     let (mut entry, test) = test_setup?;
 
     let Some(body_setup) =
-        lower_nested_body_to_inline_fragment(
-            context,
-            name_gen,
-            body,
-            loop_ctx,
-            &bridge,
-        )
+        lower_nested_body_to_inline_fragment(context, name_gen, body, loop_ctx, &bridge)
     else {
         return Err("if-body still requires structured lowering".to_string());
     };
@@ -257,21 +245,11 @@ where
     bridge
         .try_lower_inline_value::<E, ()>(name_gen, |out| {
             for stmt in body {
-                lower_nested_stmt_into_with_expr(
-                    context,
-                    name_gen,
-                    stmt,
-                    out,
-                    loop_ctx,
-                )?;
+                lower_nested_stmt_into_with_expr(context, name_gen, stmt, out, loop_ctx)?;
             }
             Ok(())
         })
-        .map(|result| {
-            result.map(|(entry, ())| {
-                entry.finish_fallthrough()
-            })
-        })
+        .map(|result| result.map(|(entry, ())| entry.finish_fallthrough()))
 }
 
 fn lower_nested_instr_body_to_inline_fragment<E>(
@@ -322,13 +300,7 @@ where
             Vec::new(),
         ))),
         [clause] if clause.test.is_none() => {
-            lower_nested_body_to_inline_fragment(
-                context,
-                name_gen,
-                &clause.body,
-                loop_ctx,
-                bridge,
-            )
+            lower_nested_body_to_inline_fragment(context, name_gen, &clause.body, loop_ctx, bridge)
         }
         _ => Some(Err(format!(
             "`elif` chain reached inline Ruff fragment lowering\nstmt:\n{}",

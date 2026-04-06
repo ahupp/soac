@@ -16,9 +16,9 @@ def load_module():
 def test_folded_parser_preserves_jit_and_c_api_context():
     module = load_module()
     folded = [
-        "python;soac_jit::lazy_clif_vectorcall;py:v:main;py:d:main;py:d:pystones;py:d:Proc0 17\n",
-        "python;soac_jit::lazy_clif_vectorcall;py:v:main;py:d:main;py:d:pystones;py:d:Proc0;PyObject_SetAttr 5\n",
-        "python;soac_jit::lazy_clif_vectorcall;py:v:main;py:d:main;py:d:pystones;py:d:Proc0;py:d:Proc1 9\n",
+        "python;soac_jit::lazy_vectorcall;py:v:main;py:d:main;py:d:pystones;py:d:Proc0 17\n",
+        "python;soac_jit::lazy_vectorcall;py:v:main;py:d:main;py:d:pystones;py:d:Proc0;PyObject_SetAttr 5\n",
+        "python;soac_jit::lazy_vectorcall;py:v:main;py:d:main;py:d:pystones;py:d:Proc0;py:d:Proc1 9\n",
     ]
 
     frames, samples, weights = module.parse_folded_stacks(folded)

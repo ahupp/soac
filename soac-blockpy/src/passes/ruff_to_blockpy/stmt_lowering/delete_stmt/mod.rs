@@ -36,10 +36,9 @@ where
             let target_meta = target.meta();
             let object_value = lower_target_object_with_setup(*target.value, out, loop_ctx)?;
             let object_temp = bind_temp(out, context.fresh("delete_obj"), object_value);
-            let attr_expr: E = E::from_lowered_expr(InstrRuff::from_ast_expr(Expr::from(py_expr!(
-                "{attr:literal}",
-                attr = target.attr.as_str()
-            ))));
+            let attr_expr: E = E::from_lowered_expr(InstrRuff::from_ast_expr(Expr::from(
+                py_expr!("{attr:literal}", attr = target.attr.as_str()),
+            )));
             out.push_stmt(E::helper_call(
                 target_meta.node_index,
                 target_meta.range,

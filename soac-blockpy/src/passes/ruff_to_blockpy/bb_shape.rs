@@ -1,6 +1,6 @@
 use crate::block_py::{
-    BlockArg, BlockEdge, BlockPyNameLike, BlockTerm, ChildVisitable, InstrLow,
-    InstrWithAwaitAndYield, FunctionNameGen, Instr, Load, Meta, UnresolvedName, WithMeta,
+    BlockArg, BlockEdge, BlockTerm, ChildVisitable, FunctionNameGen, Instr, InstrLow,
+    InstrWithAwaitAndYield, Load, Meta, NameLike, UnresolvedName, WithMeta,
 };
 use ruff_python_ast::{self as ast};
 use ruff_text_size::TextRange;
@@ -12,7 +12,7 @@ pub(crate) fn lower_structured_blocks_to_bb_blocks<E, N>(
 ) -> Vec<crate::block_py::Block<E, E>>
 where
     E: Clone + Instr<Name = N>,
-    N: BlockPyNameLike,
+    N: NameLike,
 {
     let mut bb_blocks = blocks
         .iter()
@@ -36,7 +36,7 @@ pub(crate) trait CurrentExceptionExpr:
 
 impl<N> CurrentExceptionExpr for InstrLow<N>
 where
-    N: BlockPyNameLike,
+    N: NameLike,
 {
     fn is_current_exception_call(&self) -> bool {
         let InstrLow::Call(call) = self else {
@@ -84,10 +84,7 @@ pub(crate) fn rewrite_current_exception_in_core_blocks<E>(
 }
 
 pub(crate) fn rewrite_current_exception_in_core_blocks_with_await_and_yield(
-    blocks: &mut [crate::block_py::Block<
-        InstrWithAwaitAndYield,
-        InstrWithAwaitAndYield,
-    >],
+    blocks: &mut [crate::block_py::Block<InstrWithAwaitAndYield, InstrWithAwaitAndYield>],
 ) {
     rewrite_current_exception_in_core_blocks(blocks);
 }
@@ -153,7 +150,7 @@ where
 pub(crate) fn populate_exception_edge_args<E, N>(blocks: &mut [crate::block_py::Block<E, E>])
 where
     E: Instr<Name = N>,
-    N: BlockPyNameLike,
+    N: NameLike,
 {
     let label_to_index = blocks
         .iter()

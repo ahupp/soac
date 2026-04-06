@@ -1,6 +1,6 @@
+use soac_blockpy::block_py::FunctionId;
 use soac_inspector::CounterDumpFile;
 use soac_inspector::CounterDumpRowView;
-use soac_blockpy::block_py::FunctionId;
 use soac_jit::counter_dump::render_call_target_specializations;
 use std::path::PathBuf;
 
@@ -106,11 +106,11 @@ fn main() -> Result<(), String> {
 mod tests {
     use super::format_counter_row;
     use soac_blockpy::block_py::{BlockLabel, FunctionId, InstrId};
+    use soac_inspector::CounterDumpRowView;
     use soac_inspector::parse_counter_dump_records;
     use soac_jit::counter_dump::{
         CounterDumpRecord, CounterDumpRow, render_call_target_specializations,
     };
-    use soac_inspector::CounterDumpRowView;
 
     #[test]
     fn row_output_includes_current_function_id() {
@@ -165,9 +165,8 @@ mod tests {
 
         let rendered = format_counter_row(&row);
         assert!(
-            rendered.contains(
-                format!("site_function_id={}", FunctionId::global().packed()).as_str()
-            ),
+            rendered
+                .contains(format!("site_function_id={}", FunctionId::global().packed()).as_str()),
             "{rendered}"
         );
         assert!(
@@ -264,9 +263,10 @@ mod tests {
             ],
         };
         let bytes = record.encode().expect("counter dump should encode");
-        let records = parse_counter_dump_records(bytes.as_slice()).expect("counter dump should parse");
-        let rendered = render_call_target_specializations(&records)
-            .expect("specializations should render");
+        let records =
+            parse_counter_dump_records(bytes.as_slice()).expect("counter dump should parse");
+        let rendered =
+            render_call_target_specializations(&records).expect("specializations should render");
         assert_eq!(rendered, "mod|4294967303|2|4=4294967305,4294967306");
     }
 }

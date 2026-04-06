@@ -85,11 +85,12 @@ where
             let object_value =
                 lower_target_object_with_setup((*target.value).clone(), out, loop_ctx)?;
             let object_temp = bind_temp(out, context.fresh("augassign_obj"), object_value);
-            let index_value = crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
-                (*target.slice).clone(),
-                out,
-                loop_ctx,
-            )?;
+            let index_value =
+                crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
+                    (*target.slice).clone(),
+                    out,
+                    loop_ctx,
+                )?;
             let index_temp = bind_temp(out, context.fresh("augassign_index"), index_value);
             let current_value = bind_temp(
                 out,

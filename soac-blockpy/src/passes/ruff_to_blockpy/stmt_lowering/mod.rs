@@ -235,8 +235,8 @@ pub(super) fn simplify_instr_head_for_blockpy(
                 names: stmt.names,
             }),
         ),
-        InstrRuff::StmtImportFrom(stmt) => instrs_from_rewrite(
-            crate::passes::ast_to_ast::rewrite_import::rewrite_from(
+        InstrRuff::StmtImportFrom(stmt) => {
+            instrs_from_rewrite(crate::passes::ast_to_ast::rewrite_import::rewrite_from(
                 context,
                 ast::StmtImportFrom {
                     range: stmt.meta().range,
@@ -245,8 +245,8 @@ pub(super) fn simplify_instr_head_for_blockpy(
                     names: stmt.names,
                     level: stmt.level,
                 },
-            ),
-        ),
+            ))
+        }
         InstrRuff::StmtTypeAlias(stmt) => instrs_from_rewrite(
             crate::passes::ruff_to_blockpy::stmt_lowering::type_alias_stmt::rewrite_type_alias_stmt(
                 context,
@@ -319,7 +319,10 @@ pub(crate) fn plan_instr_head_for_blockpy(
     context: &Context,
     stmt: &InstrRuff,
 ) -> StmtSequenceHeadPlan {
-    plan_simplified_instr_head_for_blockpy(context, simplify_instr_head_for_blockpy(context, stmt.clone()))
+    plan_simplified_instr_head_for_blockpy(
+        context,
+        simplify_instr_head_for_blockpy(context, stmt.clone()),
+    )
 }
 
 #[cfg(test)]
@@ -364,24 +367,27 @@ where
         InstrRuff::StmtAssign(stmt) => lower_assign_instr_into(context, stmt, out, loop_ctx),
         InstrRuff::StmtAugAssign(stmt) => lower_augassign_instr_into(context, stmt, out, loop_ctx),
         InstrRuff::StmtDelete(stmt) => lower_delete_instr_into(context, stmt, out, loop_ctx),
-        InstrRuff::StmtIf(stmt) => match try_lower_if_instr_fragment(context, name_gen, stmt, loop_ctx) {
-            Some(result) => {
-                out.append_fragment(result?);
-                Ok(())
+        InstrRuff::StmtIf(stmt) => {
+            match try_lower_if_instr_fragment(context, name_gen, stmt, loop_ctx) {
+                Some(result) => {
+                    out.append_fragment(result?);
+                    Ok(())
+                }
+                None => Err("if statement lowering requires inline fragment lowering".to_string()),
             }
-            None => Err("if statement lowering requires inline fragment lowering".to_string()),
-        },
+        }
         InstrRuff::StmtAssert(_)
         | InstrRuff::StmtImport(_)
         | InstrRuff::StmtImportFrom(_)
         | InstrRuff::StmtMatch(_)
-        | InstrRuff::StmtTypeAlias(_) => lower_simplified(
-            simplify_instr_head_for_blockpy(context, stmt.clone()),
-            out,
-        ),
+        | InstrRuff::StmtTypeAlias(_) => {
+            lower_simplified(simplify_instr_head_for_blockpy(context, stmt.clone()), out)
+        }
         InstrRuff::StmtBreak(_) => {
             if let Some(loop_ctx) = loop_ctx {
-                out.set_term(BlockTerm::Jump(BlockEdge::new(loop_ctx.break_label.clone())));
+                out.set_term(BlockTerm::Jump(BlockEdge::new(
+                    loop_ctx.break_label.clone(),
+                )));
                 Ok(())
             } else {
                 panic!("Break should be lowered before Ruff AST -> BlockPy conversion");

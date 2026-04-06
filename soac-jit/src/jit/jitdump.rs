@@ -92,7 +92,8 @@ mod imp {
 
     unsafe impl Send for JitDumpSession {}
 
-    static JITDUMP_SESSION: OnceLock<Result<Option<Mutex<JitDumpSession>>, String>> = OnceLock::new();
+    static JITDUMP_SESSION: OnceLock<Result<Option<Mutex<JitDumpSession>>, String>> =
+        OnceLock::new();
 
     impl JitDumpSession {
         fn new() -> Result<Self, String> {
@@ -424,10 +425,7 @@ mod imp {
 
     fn write_plain<T>(file: &mut File, value: &T) -> Result<(), String> {
         let bytes = unsafe {
-            slice::from_raw_parts(
-                (value as *const T).cast::<u8>(),
-                std::mem::size_of::<T>(),
-            )
+            slice::from_raw_parts((value as *const T).cast::<u8>(), std::mem::size_of::<T>())
         };
         file.write_all(bytes)
             .map_err(|err| format!("failed to write jitdump bytes: {err}"))
@@ -457,13 +455,17 @@ mod imp {
         #[test]
         fn jitdump_session_writes_header_and_code_load_event() {
             let dir = unique_test_dir();
-            let mut session = JitDumpSession::new_in_dir(&dir).expect("jitdump session should init");
+            let mut session =
+                JitDumpSession::new_in_dir(&dir).expect("jitdump session should init");
             let code = [0x90_u8, 0xC3_u8];
             let code_ptr = code.as_ptr();
             let event = CodeLoadEvent {
                 base: super::BaseEvent {
                     event: 0,
-                    size: (std::mem::size_of::<CodeLoadEvent>() + b"py:d:test".len() + 1 + code.len()) as u32,
+                    size: (std::mem::size_of::<CodeLoadEvent>()
+                        + b"py:d:test".len()
+                        + 1
+                        + code.len()) as u32,
                     time_stamp: 0,
                 },
                 process_id: std::process::id(),
@@ -484,7 +486,9 @@ mod imp {
             let bytes = fs::read(&dump_path).expect("jitdump file should exist");
             assert!(
                 bytes.len()
-                    >= std::mem::size_of::<Header>() + std::mem::size_of::<CodeLoadEvent>() + code.len()
+                    >= std::mem::size_of::<Header>()
+                        + std::mem::size_of::<CodeLoadEvent>()
+                        + code.len()
             );
 
             let header = unsafe { &*(bytes.as_ptr().cast::<Header>()) };
@@ -512,7 +516,8 @@ mod imp {
         #[test]
         fn jitdump_session_writes_unwinding_info_before_code_load() {
             let dir = unique_test_dir();
-            let mut session = JitDumpSession::new_in_dir(&dir).expect("jitdump session should init");
+            let mut session =
+                JitDumpSession::new_in_dir(&dir).expect("jitdump session should init");
             session
                 .record_serialized_unwind_info(&SerializedUnwindInfo {
                     eh_frame: vec![1, 2, 3, 4],
@@ -533,7 +538,10 @@ mod imp {
             let event = CodeLoadEvent {
                 base: super::BaseEvent {
                     event: 0,
-                    size: (std::mem::size_of::<CodeLoadEvent>() + b"py:d:test".len() + 1 + code.len()) as u32,
+                    size: (std::mem::size_of::<CodeLoadEvent>()
+                        + b"py:d:test".len()
+                        + 1
+                        + code.len()) as u32,
                     time_stamp: 0,
                 },
                 process_id: std::process::id(),

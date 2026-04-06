@@ -249,9 +249,9 @@ fn all_paths_end_in_fallthrough<I: Instr>(
 mod tests {
     use super::*;
     use crate::block_py::{
-        BlockEdge, CalleeFunctionId, Call, CallArgPositional, CallDirect, CodegenBlockPyExpr,
-        FunctionId, HasMeta, ImplicitNoneExpr, InstrId, Load, Meta, NameLocation,
-        ResolvedName, TermBranchTable, WithMeta,
+        BlockEdge, Call, CallArgPositional, CallDirect, CalleeFunctionId, FunctionId, HasMeta,
+        ImplicitNoneExpr, InstrCodegen, InstrId, Load, Meta, NameLocation, ResolvedName,
+        TermBranchTable, WithMeta,
     };
     use crate::passes::InstrRuff;
     use crate::py_expr;
@@ -294,11 +294,11 @@ mod tests {
         generic_label: BlockLabel,
     }
 
-    impl InstrumentInstr<CodegenBlockPyExpr> for ExampleCallHotTargetRule {
+    impl InstrumentInstr<InstrCodegen> for ExampleCallHotTargetRule {
         type Counter = CallHotTargetsCounterSpec;
 
-        fn instrument_instr(&self, instr: &CodegenBlockPyExpr) -> Option<Self::Counter> {
-            let CodegenBlockPyExpr::Call(_) = instr else {
+        fn instrument_instr(&self, instr: &InstrCodegen) -> Option<Self::Counter> {
+            let InstrCodegen::Call(_) = instr else {
                 return None;
             };
             Some(CallHotTargetsCounterSpec {
@@ -313,9 +313,9 @@ mod tests {
         fn optimize_instr(
             &self,
             counter: &Self::Counter,
-            instr: &CodegenBlockPyExpr,
-        ) -> OptInstr<CodegenBlockPyExpr> {
-            let CodegenBlockPyExpr::Call(call) = instr else {
+            instr: &InstrCodegen,
+        ) -> OptInstr<InstrCodegen> {
+            let InstrCodegen::Call(call) = instr else {
                 return OptInstr::Instr(instr.clone());
             };
             let hot_targets = HotCallTargets {
@@ -328,7 +328,7 @@ mod tests {
                 self.entry_label,
                 Vec::new(),
                 BlockTerm::BranchTable(TermBranchTable {
-                    index: CodegenBlockPyExpr::CalleeFunctionId(
+                    index: InstrCodegen::CalleeFunctionId(
                         CalleeFunctionId::new((*call.func).clone()).with_meta(meta.clone()),
                     ),
                     targets: vec![self.hot0_label, self.hot1_label],
@@ -339,7 +339,7 @@ mod tests {
             );
             let hot0 = Block::new(
                 self.hot0_label,
-                vec![CodegenBlockPyExpr::CallDirect(
+                vec![InstrCodegen::CallDirect(
                     CallDirect::new(
                         (*call.func).clone(),
                         hot_targets.most_frequent,
@@ -354,7 +354,7 @@ mod tests {
             );
             let hot1 = Block::new(
                 self.hot1_label,
-                vec![CodegenBlockPyExpr::CallDirect(
+                vec![InstrCodegen::CallDirect(
                     CallDirect::new(
                         (*call.func).clone(),
                         hot_targets.second_most_frequent,
@@ -369,10 +369,9 @@ mod tests {
             );
             let generic = Block::new(
                 self.generic_label,
-                vec![CodegenBlockPyExpr::Call(call.clone().with_meta(counter_instr_meta(
-                    counter,
-                    meta,
-                )))],
+                vec![InstrCodegen::Call(
+                    call.clone().with_meta(counter_instr_meta(counter, meta)),
+                )],
                 BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())),
                 Vec::new(),
                 None,
@@ -390,7 +389,7 @@ mod tests {
         meta
     }
 
-    fn runtime_name_expr(name: &str, meta: Meta) -> CodegenBlockPyExpr {
+    fn runtime_name_expr(name: &str, meta: Meta) -> InstrCodegen {
         Load::new(ResolvedName {
             id: Name::new(name),
             location: NameLocation::RuntimeName,
@@ -531,7 +530,7 @@ mod tests {
             hot1_label: BlockLabel::from_index(12),
             generic_label: BlockLabel::from_index(13),
         };
-        let call = CodegenBlockPyExpr::Call(
+        let call = InstrCodegen::Call(
             Call::new(
                 runtime_name_expr("__dp_dynamic_callee", Meta::synthetic()),
                 vec![CallArgPositional::Positional(runtime_name_expr(
@@ -560,24 +559,24 @@ mod tests {
         let BlockTerm::BranchTable(branch) = &fragment.entry().term else {
             panic!("entry fragment should dispatch with br_table");
         };
-        assert!(matches!(
-            branch.index,
-            CodegenBlockPyExpr::CalleeFunctionId(_)
-        ));
-        assert_eq!(branch.targets, vec![BlockLabel::from_index(11), BlockLabel::from_index(12)]);
+        assert!(matches!(branch.index, InstrCodegen::CalleeFunctionId(_)));
+        assert_eq!(
+            branch.targets,
+            vec![BlockLabel::from_index(11), BlockLabel::from_index(12)]
+        );
         assert_eq!(branch.default_label, BlockLabel::from_index(13));
         assert_eq!(fragment.dependencies().len(), 3);
         assert!(matches!(
             fragment.dependencies()[0].body[0],
-            CodegenBlockPyExpr::CallDirect(_)
+            InstrCodegen::CallDirect(_)
         ));
         assert!(matches!(
             fragment.dependencies()[1].body[0],
-            CodegenBlockPyExpr::CallDirect(_)
+            InstrCodegen::CallDirect(_)
         ));
         assert!(matches!(
             fragment.dependencies()[2].body[0],
-            CodegenBlockPyExpr::Call(_)
+            InstrCodegen::Call(_)
         ));
         for block in fragment.dependencies() {
             let BlockTerm::Jump(edge) = &block.term else {

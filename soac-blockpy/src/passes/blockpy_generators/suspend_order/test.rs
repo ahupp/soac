@@ -1,9 +1,9 @@
 use super::*;
 use crate::block_py::{
     BinOp, BinOpKind, Block, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm,
-    CallArgPositional, CallableScopeInfo, InstrWithAwaitAndYield,
-    InstrWithYield, FunctionId, FunctionKind, FunctionName, Meta, ModuleNameGen,
-    Store, UnresolvedName, WithMeta, YieldFrom,
+    CallArgPositional, CallableScopeInfo, FunctionId, FunctionKind, FunctionName,
+    InstrWithAwaitAndYield, InstrWithYield, Meta, ModuleNameGen, Store, UnresolvedName, WithMeta,
+    YieldFrom,
 };
 use crate::passes::core_await_lower::lower_awaits_in_core_blockpy_module;
 use crate::passes::{CoreBlockPyPassWithAwaitAndYield, CoreBlockPyPassWithYield};
@@ -40,9 +40,7 @@ fn test_callable_def_with_yield_block(
     }
 }
 
-fn lower_awaits_in_test_block(
-    block: Block<InstrWithAwaitAndYield>,
-) -> Block<InstrWithYield> {
+fn lower_awaits_in_test_block(block: Block<InstrWithAwaitAndYield>) -> Block<InstrWithYield> {
     let lowered = lower_awaits_in_core_blockpy_module(BlockPyModule {
         module_name_gen: ModuleNameGen::new(0),
         global_names: Vec::new(),
@@ -63,16 +61,14 @@ fn lower_awaits_in_test_block(
     lowered.callable_defs[0].blocks[0].clone()
 }
 
-fn lower_yield_block(
-    block: Block<InstrWithAwaitAndYield>,
-) -> Block<InstrWithYield> {
+fn lower_yield_block(block: Block<InstrWithAwaitAndYield>) -> Block<InstrWithYield> {
     make_suspend_order_explicit_in_core_callable_def(test_callable_def_with_yield_block(
         lower_awaits_in_test_block(block),
     ))
-        .blocks
-        .into_iter()
-        .next()
-        .expect("test callable should have one block")
+    .blocks
+    .into_iter()
+    .next()
+    .expect("test callable should have one block")
 }
 
 #[test]
@@ -181,24 +177,15 @@ fn eval_order_hoists_lowered_await_in_assignment_call_argument() {
     let InstrWithYield::Store(temp_assign) = &lowered.body[0] else {
         panic!("expected hoisted yield-from temp store");
     };
-    assert!(matches!(
-        *temp_assign.value,
-        InstrWithYield::YieldFrom(_)
-    ));
+    assert!(matches!(*temp_assign.value, InstrWithYield::YieldFrom(_)));
     let InstrWithYield::Store(assign) = &lowered.body[1] else {
         panic!("expected rewritten store");
     };
     let InstrWithYield::BinOp(op) = &*assign.value else {
         panic!("expected inplace add operation");
     };
-    assert!(matches!(
-        op.right.as_ref(),
-        InstrWithYield::Load(_)
-    ));
-    assert!(matches!(
-        assign.value.as_ref(),
-        InstrWithYield::BinOp(_)
-    ));
+    assert!(matches!(op.right.as_ref(), InstrWithYield::Load(_)));
+    assert!(matches!(assign.value.as_ref(), InstrWithYield::BinOp(_)));
     assert!(matches!(lowered.body[2], InstrWithYield::Del(_)));
 }
 
@@ -230,24 +217,15 @@ fn eval_order_hoists_yield_from_in_assignment_call_argument() {
     let InstrWithYield::Store(temp_assign) = &lowered.body[0] else {
         panic!("expected hoisted yield-from temp store");
     };
-    assert!(matches!(
-        *temp_assign.value,
-        InstrWithYield::YieldFrom(_)
-    ));
+    assert!(matches!(*temp_assign.value, InstrWithYield::YieldFrom(_)));
     let InstrWithYield::Store(assign) = &lowered.body[1] else {
         panic!("expected rewritten store");
     };
     let InstrWithYield::BinOp(op) = &*assign.value else {
         panic!("expected inplace add operation");
     };
-    assert!(matches!(
-        op.right.as_ref(),
-        InstrWithYield::Load(_)
-    ));
-    assert!(matches!(
-        assign.value.as_ref(),
-        InstrWithYield::BinOp(_)
-    ));
+    assert!(matches!(op.right.as_ref(), InstrWithYield::Load(_)));
+    assert!(matches!(assign.value.as_ref(), InstrWithYield::BinOp(_)));
     assert!(matches!(lowered.body[2], InstrWithYield::Del(_)));
 }
 
@@ -280,8 +258,5 @@ fn eval_order_leaves_non_yield_binop_stmt_shape_alone() {
         panic!("expected iadd operation");
     };
     assert_eq!(op.kind, BinOpKind::InplaceAdd);
-    assert!(matches!(
-        op.right.as_ref(),
-        InstrWithYield::Load(_)
-    ));
+    assert!(matches!(op.right.as_ref(), InstrWithYield::Load(_)));
 }

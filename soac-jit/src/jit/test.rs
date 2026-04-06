@@ -1,11 +1,10 @@
 use super::*;
 use soac_blockpy::block_py::{
-    BinOp, BinOpKind, BlockLabel, BlockParamRole, BlockPyFunction, BlockPyLiteral, BlockPyModule,
-    BlockTerm, Call, CallArgPositional, CellLocation, ClosureInit, ClosureSlot, CodegenBlock,
-    CodegenBlockPyExpr, CoreNumberLiteral, CoreNumberLiteralValue, CoreStringLiteral, CounterSite,
-    Del, DelItem, FunctionId, FunctionName, InstrResolved, LiteralValue, Load, Meta, ModuleNameGen,
-    NameLocation, Param, ParamKind, ParamSpec, ResolvedName,
-    StorageLayout, Store, WithMeta,
+    BinOp, BinOpKind, BlockLabel, BlockParamRole, BlockPyFunction, BlockPyModule, BlockTerm, Call,
+    CallArgPositional, CellLocation, ClosureInit, ClosureSlot, CodegenBlock, CounterSite, Del,
+    DelItem, FunctionId, FunctionName, InstrCodegen, InstrResolved, Literal, LiteralValue, Load,
+    Meta, ModuleNameGen, NameLocation, NumberLiteral, NumberLiteralValue, Param, ParamKind,
+    ParamSpec, ResolvedName, StorageLayout, Store, StringLiteral, WithMeta,
 };
 use soac_blockpy::passes::{
     CodegenBlockPyPass, instrument_bb_module_with_block_entry_counters,
@@ -64,8 +63,8 @@ mod tests {
 
     fn int_literal(value: i64) -> InstrResolved {
         let value_str = value.to_string();
-        let literal = BlockPyLiteral::NumberLiteral(CoreNumberLiteral {
-            value: CoreNumberLiteralValue::Int(
+        let literal = Literal::NumberLiteral(NumberLiteral {
+            value: NumberLiteralValue::Int(
                 ast::Int::from_str_radix(value_str.as_str(), 10, value_str.as_str())
                     .expect("test integer literal should parse"),
             ),
@@ -74,13 +73,13 @@ mod tests {
     }
 
     fn string_literal(value: &str) -> InstrResolved {
-        let literal = BlockPyLiteral::StringLiteral(CoreStringLiteral {
+        let literal = Literal::StringLiteral(StringLiteral {
             value: value.to_string(),
         });
         InstrResolved::Literal(LiteralValue::new(literal))
     }
 
-    fn none_expr() -> CodegenBlockPyExpr {
+    fn none_expr() -> InstrCodegen {
         Load::new(test_runtime_name("NONE")).into()
     }
 
@@ -90,35 +89,35 @@ mod tests {
     }
 
     impl TestConstantPool {
-        fn push_literal(&mut self, literal: InstrResolved) -> CodegenBlockPyExpr {
+        fn push_literal(&mut self, literal: InstrResolved) -> InstrCodegen {
             let index = u32::try_from(self.module_constants.len())
                 .expect("test module constant count should fit in u32");
             self.module_constants.push(literal);
             Load::new(test_constant_name(index)).into()
         }
 
-        fn int_expr(&mut self, value: i64) -> CodegenBlockPyExpr {
+        fn int_expr(&mut self, value: i64) -> InstrCodegen {
             self.push_literal(int_literal(value))
         }
 
-        fn string_expr(&mut self, value: &str) -> CodegenBlockPyExpr {
+        fn string_expr(&mut self, value: &str) -> InstrCodegen {
             self.push_literal(string_literal(value))
         }
     }
 
-    fn name_expr(name: ResolvedName) -> CodegenBlockPyExpr {
+    fn name_expr(name: ResolvedName) -> InstrCodegen {
         Load::new(name).into()
     }
 
-    fn op_expr(operation: impl Into<CodegenBlockPyExpr>) -> CodegenBlockPyExpr {
+    fn op_expr(operation: impl Into<InstrCodegen>) -> InstrCodegen {
         operation.into()
     }
 
-    fn expr_stmt(expr: CodegenBlockPyExpr) -> CodegenBlockPyExpr {
+    fn expr_stmt(expr: InstrCodegen) -> InstrCodegen {
         expr
     }
 
-    fn with_instr_id(expr: CodegenBlockPyExpr, instr_id: InstrId) -> CodegenBlockPyExpr {
+    fn with_instr_id(expr: InstrCodegen, instr_id: InstrId) -> InstrCodegen {
         expr.with_meta(Meta {
             instr_id: Some(instr_id),
             ..Meta::synthetic()
@@ -150,26 +149,26 @@ mod tests {
         staging_dir
     }
 
-    fn assign_stmt(target: ResolvedName, value: CodegenBlockPyExpr) -> CodegenBlockPyExpr {
+    fn assign_stmt(target: ResolvedName, value: InstrCodegen) -> InstrCodegen {
         expr_stmt(op_expr(Store::new(target, value)))
     }
 
-    fn delete_stmt(target: ResolvedName) -> CodegenBlockPyExpr {
+    fn delete_stmt(target: ResolvedName) -> InstrCodegen {
         expr_stmt(op_expr(Del::new(target, false)))
     }
 
-    fn ret_term(value: CodegenBlockPyExpr) -> BlockTerm<CodegenBlockPyExpr> {
+    fn ret_term(value: InstrCodegen) -> BlockTerm<InstrCodegen> {
         BlockTerm::Return(value)
     }
 
-    fn raise_term() -> BlockTerm<CodegenBlockPyExpr> {
+    fn raise_term() -> BlockTerm<InstrCodegen> {
         BlockTerm::Raise(soac_blockpy::block_py::TermRaise { exc: None })
     }
 
     fn test_source_block(
         function: &BlockPyFunction<CodegenBlockPyPass>,
-        ops: Vec<CodegenBlockPyExpr>,
-        term: BlockTerm<CodegenBlockPyExpr>,
+        ops: Vec<InstrCodegen>,
+        term: BlockTerm<InstrCodegen>,
     ) -> CodegenBlock {
         CodegenBlock {
             label: function.name_gen.next_block_name(),
@@ -213,8 +212,8 @@ mod tests {
 
     fn with_single_test_block(
         function: BlockPyFunction<CodegenBlockPyPass>,
-        ops: Vec<CodegenBlockPyExpr>,
-        term: BlockTerm<CodegenBlockPyExpr>,
+        ops: Vec<InstrCodegen>,
+        term: BlockTerm<InstrCodegen>,
     ) -> BlockPyFunction<CodegenBlockPyPass> {
         let block = test_source_block(&function, ops, term);
         with_test_blocks(function, vec![block])
@@ -268,8 +267,7 @@ mod tests {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         let old_call_target_specializations =
             std::env::var_os("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS");
-        let old_operator_specializations =
-            std::env::var_os("DIET_PYTHON_OPERATOR_SPECIALIZATIONS");
+        let old_operator_specializations = std::env::var_os("DIET_PYTHON_OPERATOR_SPECIALIZATIONS");
         let old_counters_file = std::env::var_os("DIET_PYTHON_COUNTERS_FILE");
         let old_call_target_counters = std::env::var_os("DIET_PYTHON_CALL_TARGET_COUNTERS");
         let old_pythonhome = std::env::var_os("PYTHONHOME");
@@ -331,9 +329,7 @@ mod tests {
 
         unsafe {
             match old_call_target_specializations {
-                Some(value) => {
-                    std::env::set_var("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS", value)
-                }
+                Some(value) => std::env::set_var("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS", value),
                 None => std::env::remove_var("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS"),
             }
             match old_operator_specializations {
@@ -382,8 +378,7 @@ mod tests {
             .join(";");
 
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        let old_operator_specializations =
-            std::env::var_os("DIET_PYTHON_OPERATOR_SPECIALIZATIONS");
+        let old_operator_specializations = std::env::var_os("DIET_PYTHON_OPERATOR_SPECIALIZATIONS");
         let old_call_target_specializations =
             std::env::var_os("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS");
         let old_counters_file = std::env::var_os("DIET_PYTHON_COUNTERS_FILE");
@@ -420,13 +415,9 @@ mod tests {
         let rendered = unsafe {
             Python::initialize();
             Python::attach(|py| {
-                let shared_state = crate::module_type::build_shared_state_for_testing(
-                    py,
-                    module,
-                    module_name,
-                    "",
-                )
-                .expect("shared state should build");
+                let shared_state =
+                    crate::module_type::build_shared_state_for_testing(py, module, module_name, "")
+                        .expect("shared state should build");
                 let mut jit_module = new_jit_module().expect("test jit module should construct");
                 let module_constant_ptrs = shared_state.module_constant_ptrs();
                 let counter_ptrs = shared_state.counter_ptrs();
@@ -459,9 +450,7 @@ mod tests {
                 None => std::env::remove_var("DIET_PYTHON_OPERATOR_SPECIALIZATIONS"),
             }
             match old_call_target_specializations {
-                Some(value) => {
-                    std::env::set_var("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS", value)
-                }
+                Some(value) => std::env::set_var("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS", value),
                 None => std::env::remove_var("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS"),
             }
             match old_counters_file {
@@ -500,7 +489,7 @@ mod tests {
                     .iter()
                     .flat_map(|block| block.body.iter())
                     .filter_map(|expr| match expr {
-                        CodegenBlockPyExpr::IncrementCounter(op) => Some(op.counter_id.0),
+                        InstrCodegen::IncrementCounter(op) => Some(op.counter_id.0),
                         _ => None,
                     })
                     .max()
@@ -1824,9 +1813,7 @@ def f(x):
         let rendered = render_test_jit_function_with_module_constants(
             &function,
             &blocks,
-            vec![InstrResolved::Load(Load::new(test_runtime_name(
-                "globals",
-            )))],
+            vec![InstrResolved::Load(Load::new(test_runtime_name("globals")))],
         );
         assert!(
             !rendered.contains("call dp_jit_load_runtime_obj")
@@ -1948,7 +1935,8 @@ def f(x):
             "direct call specialization should emit an indirect call to the compiled target:\n{rendered}"
         );
         assert!(
-            rendered.contains(format!("iconst.i64 {}", callee_function.function_id.packed()).as_str()),
+            rendered
+                .contains(format!("iconst.i64 {}", callee_function.function_id.packed()).as_str()),
             "direct call specialization should compare against the profiled target function id:\n{rendered}"
         );
     }
@@ -1989,7 +1977,12 @@ def f(x):
                 let mut init_function = BlockPyFunction {
                     function_id: init_function_id,
                     name_gen: init_name_gen,
-                    names: FunctionName::new("Record.__init__", "Record.__init__", "Record.__init__", "Record.__init__"),
+                    names: FunctionName::new(
+                        "Record.__init__",
+                        "Record.__init__",
+                        "Record.__init__",
+                        "Record.__init__",
+                    ),
                     kind: soac_blockpy::block_py::FunctionKind::Function,
                     params: ParamSpec {
                         params: vec![
@@ -2022,7 +2015,12 @@ def f(x):
                 let caller_function = BlockPyFunction {
                     function_id: caller_function_id,
                     name_gen: caller_name_gen,
-                    names: FunctionName::new("make_record", "make_record", "make_record", "make_record"),
+                    names: FunctionName::new(
+                        "make_record",
+                        "make_record",
+                        "make_record",
+                        "make_record",
+                    ),
                     kind: soac_blockpy::block_py::FunctionKind::Function,
                     params: ParamSpec::default(),
                     blocks: vec![CodegenBlock {
@@ -2096,11 +2094,10 @@ def f(x):
                     "class definition should execute in test globals"
                 );
                 ffi::Py_DECREF(run_result);
-                let cls = globals
-                    .get_item("Record")
-                    .expect("class should exist");
+                let cls = globals.get_item("Record").expect("class should exist");
                 let owner_type = cls.as_ptr() as *mut ffi::PyTypeObject;
-                let init_function_obj = ffi::PyDict_GetItemString((*owner_type).tp_dict, c"__init__".as_ptr());
+                let init_function_obj =
+                    ffi::PyDict_GetItemString((*owner_type).tp_dict, c"__init__".as_ptr());
                 assert!(
                     !init_function_obj.is_null(),
                     "class dict should contain __init__"

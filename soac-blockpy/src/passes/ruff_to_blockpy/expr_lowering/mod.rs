@@ -1,13 +1,13 @@
 use crate::block_py::{
-    core_runtime_positional_call_expr_with_meta, literal_expr, operation,
-    InstrWithAwaitAndYield, CoreStringLiteral, Del, FunctionId, FunctionKind, Instr,
-    Meta, Store, UnresolvedName, WithMeta, HasMeta,
+    core_runtime_positional_call_expr_with_meta, literal_expr, operation, Del, FunctionId,
+    FunctionKind, HasMeta, Instr, InstrWithAwaitAndYield, Meta, Store, StringLiteral,
+    UnresolvedName, WithMeta,
 };
 use crate::namegen::fresh_name;
 use crate::passes::ast_to_ast::string_templates::lower_string_templates_in_instr_ruff;
-use crate::passes::InstrRuff;
-use crate::passes::ruff_to_blockpy::LoopContext;
 use crate::passes::ruff_to_blockpy::stmt_lowering::BlockPyStmtBuilder;
+use crate::passes::ruff_to_blockpy::LoopContext;
+use crate::passes::InstrRuff;
 use crate::py_expr;
 use ruff_python_ast::{self as ast};
 use ruff_text_size::TextRange;
@@ -22,16 +22,11 @@ fn string_literal_expr(
     range: TextRange,
     value: String,
 ) -> InstrWithAwaitAndYield {
-    literal_expr(CoreStringLiteral { value }, Meta::new(node_index, range))
+    literal_expr(StringLiteral { value }, Meta::new(node_index, range))
 }
 
 pub(crate) trait RuffToBlockPyExpr:
-    From<Store<Self>>
-    + From<Del<Self>>
-    + Instr<Name = UnresolvedName>
-    + std::fmt::Debug
-    + Clone
-    + Sized
+    From<Store<Self>> + From<Del<Self>> + Instr<Name = UnresolvedName> + std::fmt::Debug + Clone + Sized
 {
     fn from_lowered_expr(expr: InstrRuff) -> Self;
 
@@ -229,7 +224,9 @@ pub(crate) trait BlockPySetupExprLowerer {
     where
         E: RuffToBlockPyExpr + crate::block_py::ImplicitNoneExpr,
     {
-        Ok(E::from_lowered_expr(self.lower_expr_instr_into(expr, out, loop_ctx)?))
+        Ok(E::from_lowered_expr(
+            self.lower_expr_instr_into(expr, out, loop_ctx)?,
+        ))
     }
 }
 
@@ -237,8 +234,8 @@ pub(crate) struct AstSetupExprLowerer;
 
 impl BlockPySetupExprLowerer for AstSetupExprLowerer {}
 
-pub(crate) use if_expr::try_lower_if_expr_direct;
 pub(crate) use boolop_compare::try_lower_branching_expr_direct;
+pub(crate) use if_expr::try_lower_if_expr_direct;
 
 pub(crate) fn lower_expr_head_ast_for_blockpy(expr: InstrRuff) -> InstrRuff {
     expr
@@ -319,7 +316,8 @@ fn lower_direct_core_helper_expr(expr: &InstrRuff) -> Option<InstrWithAwaitAndYi
         let crate::block_py::CallArgPositional::Positional(kind_expr) = &call.args[1] else {
             return None;
         };
-        let crate::block_py::CallArgPositional::Positional(param_defaults_expr) = &call.args[3] else {
+        let crate::block_py::CallArgPositional::Positional(param_defaults_expr) = &call.args[3]
+        else {
             return None;
         };
         let crate::block_py::CallArgPositional::Positional(annotate_fn_expr) = &call.args[4] else {

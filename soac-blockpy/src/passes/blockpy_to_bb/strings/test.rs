@@ -1,8 +1,6 @@
 use super::normalize_bb_module_strings;
 use crate::{
-    block_py::{
-        BlockPyLiteral, BlockPyNameLike, ChildVisitable, CodegenBlockPyExpr, InstrResolved,
-    },
+    block_py::{ChildVisitable, InstrCodegen, InstrResolved, Literal, NameLike},
     lower_python_to_blockpy_for_testing,
     passes::lower_try_jump_exception_flow,
 };
@@ -23,79 +21,79 @@ fn module_constants_contain_string(exprs: &[InstrResolved]) -> bool {
         matches!(
             expr,
             InstrResolved::Literal(literal)
-                if matches!(literal.as_literal(), BlockPyLiteral::StringLiteral(_))
+                if matches!(literal.as_literal(), Literal::StringLiteral(_))
         )
     })
 }
 
-fn collect_helper_like_names_in_expr(out: &mut Vec<String>, expr: &CodegenBlockPyExpr) {
+fn collect_helper_like_names_in_expr(out: &mut Vec<String>, expr: &InstrCodegen) {
     struct HelperNameVisitor<'a> {
         out: &'a mut Vec<String>,
     }
 
-    impl crate::block_py::Visit<CodegenBlockPyExpr> for HelperNameVisitor<'_> {
-        fn visit_instr(&mut self, expr: &CodegenBlockPyExpr) {
+    impl crate::block_py::Visit<InstrCodegen> for HelperNameVisitor<'_> {
+        fn visit_instr(&mut self, expr: &InstrCodegen) {
             collect_helper_like_names_in_expr(self.out, expr);
         }
     }
 
     match expr {
-        CodegenBlockPyExpr::CalleeFunctionId(operation) => {
+        InstrCodegen::CalleeFunctionId(operation) => {
             operation.visit_children(&mut HelperNameVisitor { out });
         }
-        CodegenBlockPyExpr::GetAttr(operation) => {
+        InstrCodegen::GetAttr(operation) => {
             out.push("__dp_getattr".to_string());
             operation.visit_children(&mut HelperNameVisitor { out });
         }
-        CodegenBlockPyExpr::SetAttr(operation) => {
+        InstrCodegen::SetAttr(operation) => {
             out.push("__dp_setattr".to_string());
             operation.visit_children(&mut HelperNameVisitor { out });
         }
-        CodegenBlockPyExpr::GetItem(operation) => {
+        InstrCodegen::GetItem(operation) => {
             out.push("__dp_getitem".to_string());
             operation.visit_children(&mut HelperNameVisitor { out });
         }
-        CodegenBlockPyExpr::SetItem(operation) => {
+        InstrCodegen::SetItem(operation) => {
             out.push("__dp_setitem".to_string());
             operation.visit_children(&mut HelperNameVisitor { out });
         }
-        CodegenBlockPyExpr::Call(operation) => {
-            if let CodegenBlockPyExpr::Load(op) = &*operation.func {
+        InstrCodegen::Call(operation) => {
+            if let InstrCodegen::Load(op) = &*operation.func {
                 out.push(op.name.id_str().to_string());
             }
             operation.visit_children(&mut HelperNameVisitor { out });
         }
-        CodegenBlockPyExpr::CallDirect(operation) => {
+        InstrCodegen::CallDirect(operation) => {
             operation.visit_children(&mut HelperNameVisitor { out });
         }
-        CodegenBlockPyExpr::BinOp(operation) => {
+        InstrCodegen::BinOp(operation) => {
             operation.visit_children(&mut HelperNameVisitor { out });
         }
-        CodegenBlockPyExpr::UnaryOp(operation) => {
+        InstrCodegen::UnaryOp(operation) => {
             operation.visit_children(&mut HelperNameVisitor { out });
         }
-        CodegenBlockPyExpr::Load(operation) => {
+        InstrCodegen::Load(operation) => {
             operation.visit_children(&mut HelperNameVisitor { out });
         }
-        CodegenBlockPyExpr::Store(operation) => {
+        InstrCodegen::Store(operation) => {
             operation.visit_children(&mut HelperNameVisitor { out });
         }
-        CodegenBlockPyExpr::Del(operation) => {
+        InstrCodegen::Del(operation) => {
             operation.visit_children(&mut HelperNameVisitor { out });
         }
-        CodegenBlockPyExpr::MakeCell(operation) => {
+        InstrCodegen::MakeCell(operation) => {
             operation.visit_children(&mut HelperNameVisitor { out });
         }
-        CodegenBlockPyExpr::IncrementCounter(operation) => {
+        InstrCodegen::IncrementCounter(operation) => {
             operation.visit_children(&mut HelperNameVisitor { out });
         }
-        CodegenBlockPyExpr::CellRef(operation) => {
+        InstrCodegen::CellRef(operation) => {
             operation.visit_children(&mut HelperNameVisitor { out });
         }
-        CodegenBlockPyExpr::MakeFunction(operation) => {
+        InstrCodegen::MakeFunction(operation) => {
             operation.visit_children(&mut HelperNameVisitor { out });
         }
-        CodegenBlockPyExpr::DelItem(operation) => {
+        InstrCodegen::DelItem(operation) => {
             operation.visit_children(&mut HelperNameVisitor { out });
         }
     }

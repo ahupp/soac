@@ -1,6 +1,6 @@
-use soac_blockpy::block_py::FunctionKind;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
+use soac_blockpy::block_py::FunctionKind;
 use soac_jit::{
     exc_dispatch_plan, jit_param_names_for_block, lookup_blockpy_function,
     register_clif_module_plans,
@@ -87,7 +87,10 @@ unsafe fn class_dict_function(
     let dict = (*owner_type).tp_dict;
     assert!(!dict.is_null(), "owner type should have a tp_dict");
     let function = pyo3::ffi::PyDict_GetItemString(dict, name.as_ptr());
-    assert!(!function.is_null(), "class dict should contain requested function");
+    assert!(
+        !function.is_null(),
+        "class dict should contain requested function"
+    );
     pyo3::ffi::Py_INCREF(function);
     function
 }
@@ -109,8 +112,7 @@ def outer(scale):
     let result = parse_and_lower(source).expect("lowering should succeed");
     let normalized = result.codegen_module.clone();
     let module_name = "jit_plan_slot_inventory_test";
-    register_clif_module_plans(module_name, &normalized)
-        .expect("plan registration should succeed");
+    register_clif_module_plans(module_name, &normalized).expect("plan registration should succeed");
     let inner_function = normalized
         .callable_defs
         .iter()
@@ -238,9 +240,7 @@ fn transformed_module_methods_register_owner_types_for_lookup() {
         let ext = PyModule::new(py, "_soac_ext").expect("extension module should allocate");
         crate::_soac_ext(py, &ext).expect("extension init should succeed");
         let sys = py.import("sys").expect("sys should import");
-        let modules = sys
-            .getattr("modules")
-            .expect("sys.modules should exist");
+        let modules = sys.getattr("modules").expect("sys.modules should exist");
         modules
             .set_item("_soac_ext", &ext)
             .expect("sys.modules should accept _soac_ext");
@@ -269,7 +269,9 @@ fn transformed_module_methods_register_owner_types_for_lookup() {
             .call1((&module,))
             .expect("transformed module execution should succeed");
 
-        let cls = module.getattr("C").expect("executed module should define C");
+        let cls = module
+            .getattr("C")
+            .expect("executed module should define C");
         let owner_type = cls.as_ptr() as *mut pyo3::ffi::PyTypeObject;
         let function = class_dict_function(owner_type, c"f");
         let function_id = soac_jit::registered_clif_function_id(function)
@@ -277,7 +279,11 @@ fn transformed_module_methods_register_owner_types_for_lookup() {
             .expect("transformed method should carry a FunctionId");
         let owners = soac_jit::lookup_exact_owner_types_for_method(function_id, "f")
             .expect("exact owner lookup should succeed");
-        assert_eq!(owners.len(), 1, "expected one owner type for transformed C.f");
+        assert_eq!(
+            owners.len(),
+            1,
+            "expected one owner type for transformed C.f"
+        );
         assert_eq!(owners[0].owner_type, owner_type);
         assert_eq!(owners[0].function_obj, function);
         pyo3::ffi::Py_DECREF(function);
@@ -302,8 +308,7 @@ def exercise():
     let result = parse_and_lower_runtime_style(source).expect("lowering should succeed");
     let normalized = result.codegen_module.clone();
     let module_name = "jit_plan_generator_throw_handler_param_test";
-    register_clif_module_plans(module_name, &normalized)
-        .expect("plan registration should succeed");
+    register_clif_module_plans(module_name, &normalized).expect("plan registration should succeed");
     let gen_function = normalized
         .callable_defs
         .iter()

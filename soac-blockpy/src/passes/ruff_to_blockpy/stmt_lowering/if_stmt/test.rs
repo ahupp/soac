@@ -47,14 +47,10 @@ fn stmt_if_fragment_empty_orelse_uses_explicit_fallthrough() {
     let module_name_gen = crate::block_py::ModuleNameGen::new(0);
     let name_gen = module_name_gen.next_function_name_gen();
     let context = Context::new("");
-    let fragment = try_lower_if_stmt_fragment::<InstrWithAwaitAndYield>(
-        &context,
-        &name_gen,
-        &if_stmt,
-        None,
-    )
-    .expect("if stmt should use direct fragment path")
-    .expect("if stmt fragment lowering should succeed");
+    let fragment =
+        try_lower_if_stmt_fragment::<InstrWithAwaitAndYield>(&context, &name_gen, &if_stmt, None)
+            .expect("if stmt should use direct fragment path")
+            .expect("if stmt fragment lowering should succeed");
 
     let else_block = fragment
         .deps

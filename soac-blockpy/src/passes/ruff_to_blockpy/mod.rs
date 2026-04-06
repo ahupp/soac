@@ -34,9 +34,8 @@ pub(crate) use module_plan::rewrite_ast_to_core_blockpy_module_plan_with_module;
 
 pub(crate) use compat::{
     compat_block_from_blockpy_with_exc_target_and_expr, emit_for_loop_blocks,
-    emit_inline_fragment_with_exc_target_and_expr,
-    emit_if_branch_block_with_expr_setup_and_expr, emit_sequence_jump_block,
-    emit_sequence_raise_block_with_expr_setup_and_expr,
+    emit_if_branch_block_with_expr_setup_and_expr, emit_inline_fragment_with_exc_target_and_expr,
+    emit_sequence_jump_block, emit_sequence_raise_block_with_expr_setup_and_expr,
     emit_sequence_return_block_with_expr_setup_and_expr,
     emit_simple_while_blocks_with_expr_setup_and_expr,
 };
@@ -45,9 +44,7 @@ pub(crate) use stmt_lowering::{
     build_for_target_assign_body, lower_star_try_stmt_sequence, lower_try_stmt_sequence,
     lower_with_stmt_sequence,
 };
-pub(crate) use stmt_sequences::{
-    lower_expanded_stmt_sequence, lower_stmt_sequence_with_state,
-};
+pub(crate) use stmt_sequences::{lower_expanded_stmt_sequence, lower_stmt_sequence_with_state};
 pub(crate) use try_regions::{
     block_references_label, build_try_plan, finalize_try_regions, lower_try_regions,
     prepare_except_body, prepare_finally_body, TryPlan,
@@ -121,10 +118,13 @@ impl<I: Instr> InlineBlockBuilder<I> {
             "cannot append inline fragment after builder terminator"
         );
         let continuation = InlineBlockRef::from_label(self.name_gen.next_block_name());
-        self.current_block
-            .set_term(BlockTerm::Jump(BlockEdge::new(fragment.entry_ref().label())));
+        self.current_block.set_term(BlockTerm::Jump(BlockEdge::new(
+            fragment.entry_ref().label(),
+        )));
         self.flush_current_block();
-        fragment.entry.replace_fallthrough_target(continuation.label());
+        fragment
+            .entry
+            .replace_fallthrough_target(continuation.label());
         for dep in &mut fragment.deps {
             dep.replace_fallthrough_target(continuation.label());
         }
@@ -178,7 +178,13 @@ impl<I: Instr> InlineBlockBuilder<I> {
             self.current_block.set_term(term);
         }
         let current = self.current_block.finish();
-        Some(Block::new(label, current.body, current.term.expect("explicit term"), Vec::new(), None))
+        Some(Block::new(
+            label,
+            current.body,
+            current.term.expect("explicit term"),
+            Vec::new(),
+            None,
+        ))
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -319,7 +325,10 @@ impl<I: Instr> InlineFragment<I> {
             .map(|block| match &block.term {
                 BlockTerm::Jump(edge) => format!("{}: jump {}", block.label, edge.target),
                 BlockTerm::IfTerm(if_term) => {
-                    format!("{}: if {} / {}", block.label, if_term.then_label, if_term.else_label)
+                    format!(
+                        "{}: if {} / {}",
+                        block.label, if_term.then_label, if_term.else_label
+                    )
                 }
                 BlockTerm::BranchTable(branch) => format!(
                     "{}: branch {:?} default {}",
@@ -499,14 +508,13 @@ pub(crate) fn build_core_blockpy_callable_def_from_runtime_input(
 ) -> BlockPyFunction<CoreBlockPyPassWithAwaitAndYield> {
     let function_id = name_gen.function_id();
     let mut blocks = Vec::new();
-    let entry_label =
-        lower_stmt_sequence_with_state::<crate::block_py::InstrWithAwaitAndYield>(
-            context,
-            runtime_input_body,
-            RegionTargets::new(end_label.clone(), None),
-            &mut blocks,
-            &name_gen,
-        );
+    let entry_label = lower_stmt_sequence_with_state::<crate::block_py::InstrWithAwaitAndYield>(
+        context,
+        runtime_input_body,
+        RegionTargets::new(end_label.clone(), None),
+        &mut blocks,
+        &name_gen,
+    );
     move_entry_block_to_front(&mut blocks, entry_label.clone());
     for block in &blocks {
         assert_blockpy_block_normalized(block);

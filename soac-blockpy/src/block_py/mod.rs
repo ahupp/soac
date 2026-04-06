@@ -11,21 +11,19 @@ pub use self::scope::{
     EffectiveBinding, StorageLayout,
 };
 pub use operation::{
-    Await, BinOp, BinOpKind, CalleeFunctionId, Call, CallDirect, CellRef, CellRefForName, Del,
+    Await, BinOp, BinOpKind, Call, CallDirect, CalleeFunctionId, CellRef, CellRefForName, Del,
     DelItem, ExprAttribute, ExprBoolOp, ExprBooleanLiteral, ExprBytesLiteral, ExprCompare,
-    ExprDict, ExprDictComp, ExprEllipsisLiteral, ExprFString, ExprGenerator, ExprIpyEscapeCommand,
-    ExprLambda, ExprList, ExprListComp, ExprName, ExprNamed, ExprNoneLiteral, ExprNumberLiteral,
-    ExprSet, ExprSetComp, ExprSlice, ExprStarred, ExprStringLiteral, ExprSubscript, ExprTString,
-    ExprTuple,
-    ExprIf, GetAttr, GetItem, Load, MakeCell, MakeFunction, SetAttr, SetItem,
-    StmtAnnAssign, StmtAssign, StmtAssert, StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue, StmtDelete,
-    StmtExpr, StmtFor, StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom,
-    StmtIpyEscapeCommand, StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry,
-    StmtTypeAlias, StmtWhile, StmtWith, Store, UnaryOp, UnaryOpKind, Yield, YieldFrom,
+    ExprDict, ExprDictComp, ExprEllipsisLiteral, ExprFString, ExprGenerator, ExprIf,
+    ExprIpyEscapeCommand, ExprLambda, ExprList, ExprListComp, ExprName, ExprNamed, ExprNoneLiteral,
+    ExprNumberLiteral, ExprSet, ExprSetComp, ExprSlice, ExprStarred, ExprStringLiteral,
+    ExprSubscript, ExprTString, ExprTuple, GetAttr, GetItem, Load, MakeCell, MakeFunction, SetAttr,
+    SetItem, StmtAnnAssign, StmtAssert, StmtAssign, StmtAugAssign, StmtBreak, StmtClassDef,
+    StmtContinue, StmtDelete, StmtExpr, StmtFor, StmtFunctionDef, StmtGlobal, StmtIf, StmtImport,
+    StmtImportFrom, StmtIpyEscapeCommand, StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn,
+    StmtTry, StmtTypeAlias, StmtWhile, StmtWith, Store, UnaryOp, UnaryOpKind, Yield, YieldFrom,
 };
 pub use ruff_python_ast::Expr;
 use ruff_python_ast::{self as ast};
-use soac_macros::enum_broadcast;
 use std::fmt;
 
 pub(crate) mod cfg;
@@ -40,14 +38,15 @@ pub(crate) mod scope;
 pub(crate) mod validate;
 mod visit;
 pub use crate::passes::{
-    InstrLow, InstrResolved, InstrRuff, InstrUnresolved, InstrWithAwaitAndYield, InstrWithYield,
+    InstrCodegen, InstrLow, InstrResolved, InstrRuff, InstrUnresolved, InstrWithAwaitAndYield,
+    InstrWithYield,
 };
 #[allow(unused_imports)]
 pub(crate) use map::{
     MapBlock, MapFunction, MapModule, MapTerm, TryMapBlock, TryMapFunction, TryMapModule,
     TryMapTerm,
 };
-pub use map::{MapInstr, TryMapInstr};
+pub use map::{MapInstr, Mappable, TryMapInstr};
 pub use name_gen::{BlockLabel, FunctionId, FunctionNameGen, ModuleNameGen};
 pub(crate) use validate::validate_module;
 #[allow(unused_imports)]
@@ -55,7 +54,7 @@ pub(crate) use visit::{
     instr_any, walk_block, walk_block_mut, walk_expr, walk_expr_mut, walk_fn, walk_fn_mut,
     walk_module, walk_module_mut, walk_stmt, walk_stmt_mut, walk_term, walk_term_mut,
 };
-pub use visit::{Visit, VisitMut};
+pub use visit::{ChildVisitable, Visit, VisitMut};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CounterId(pub usize);
@@ -220,7 +219,7 @@ impl NameLocation {
     }
 }
 
-pub trait BlockPyNameLike: Clone + fmt::Debug {
+pub trait NameLike: Clone + fmt::Debug {
     fn id_str(&self) -> &str;
     fn pretty_id(&self) -> String {
         self.id_str().to_string()
@@ -233,52 +232,9 @@ pub trait BlockPyNameLike: Clone + fmt::Debug {
     }
 }
 
-pub trait ChildVisitable<E: Instr>: Clone + fmt::Debug + Sized {
-    fn visit_children<V>(&self, visitor: &mut V)
-    where
-        V: crate::block_py::Visit<E> + ?Sized;
-
-    fn visit_children_mut<V>(&mut self, visitor: &mut V)
-    where
-        V: crate::block_py::VisitMut<E> + ?Sized;
-}
-
-pub trait Mappable<E>: Sized
-where
-    E: Instr,
-{
-    type Mapped<T: Instr>;
-
-    fn map_children<T, M>(self, map: &mut M) -> Self::Mapped<T>
-    where
-        T: Instr,
-        M: MapInstr<E, T>;
-
-    fn try_map_children<T, Error, M>(self, map: &mut M) -> Result<Self::Mapped<T>, Error>
-    where
-        T: Instr,
-        M: TryMapInstr<E, T, Error>;
-
-    fn map_same_children<M>(self, map: &mut M) -> Self::Mapped<E>
-    where
-        M: MapInstr<E, E>,
-    {
-        self.map_children(map)
-    }
-
-    fn try_map_same_children<Error, M>(self, map: &mut M) -> Result<Self::Mapped<E>, Error>
-    where
-        M: TryMapInstr<E, E, Error>,
-    {
-        self.try_map_children(map)
-    }
-
-}
-
 pub trait Instr: Clone + fmt::Debug + Sized {
-    type Name: BlockPyNameLike;
+    type Name: NameLike;
 }
-
 
 #[derive(Clone)]
 pub enum UnresolvedName {
@@ -292,7 +248,7 @@ impl fmt::Debug for UnresolvedName {
     }
 }
 
-impl BlockPyNameLike for UnresolvedName {
+impl NameLike for UnresolvedName {
     fn id_str(&self) -> &str {
         match self {
             Self::SourceName(name) | Self::RuntimeName(name) => name.as_str(),
@@ -317,7 +273,6 @@ impl UnresolvedName {
         }
     }
 }
-
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct ResolvedName {
@@ -354,7 +309,7 @@ impl ResolvedName {
     }
 }
 
-impl BlockPyNameLike for ResolvedName {
+impl NameLike for ResolvedName {
     fn id_str(&self) -> &str {
         self.id.as_str()
     }
@@ -493,7 +448,7 @@ impl<S, T: Instr> Block<S, T> {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct BlockPyModule<P: BlockPyPass, S = <P as BlockPyPass>::Expr> {
+pub struct BlockPyModule<P: BlockPyPass, S = <P as BlockPyPass>::Instr> {
     pub module_name_gen: ModuleNameGen,
     pub global_names: Vec<String>,
     pub callable_defs: Vec<BlockPyFunction<P, S>>,
@@ -524,28 +479,6 @@ impl<P: BlockPyPass, S> BlockPyModule<P, S> {
     }
 }
 
-#[derive(Clone, derive_more::From)]
-#[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, Debug)]
-pub enum CodegenBlockPyExpr {
-    BinOp(BinOp<Self>),
-    UnaryOp(UnaryOp<Self>),
-    CalleeFunctionId(CalleeFunctionId<Self>),
-    Call(Call<Self>),
-    CallDirect(CallDirect<Self>),
-    GetAttr(GetAttr<Self>),
-    SetAttr(SetAttr<Self>),
-    GetItem(GetItem<Self>),
-    SetItem(SetItem<Self>),
-    DelItem(DelItem<Self>),
-    Load(Load<Self>),
-    Store(Store<Self>),
-    Del(Del<Self>),
-    MakeCell(MakeCell<Self>),
-    IncrementCounter(IncrementCounter),
-    CellRef(CellRef),
-    MakeFunction(MakeFunction<Self>),
-}
-
 define_operation! {
     pub struct IncrementCounter {
         counter_id: CounterId,
@@ -553,13 +486,13 @@ define_operation! {
 }
 
 #[derive(Clone, derive_more::From)]
-pub enum BlockPyLiteral {
-    StringLiteral(CoreStringLiteral),
-    BytesLiteral(CoreBytesLiteral),
-    NumberLiteral(CoreNumberLiteral),
+pub enum Literal {
+    StringLiteral(StringLiteral),
+    BytesLiteral(BytesLiteral),
+    NumberLiteral(NumberLiteral),
 }
 
-impl fmt::Debug for BlockPyLiteral {
+impl fmt::Debug for Literal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::StringLiteral(value) => value.fmt(f),
@@ -571,25 +504,25 @@ impl fmt::Debug for BlockPyLiteral {
 
 define_operation! {
     pub struct LiteralValue {
-        literal: BlockPyLiteral,
+        literal: Literal,
     }
 }
 
 impl LiteralValue {
-    pub fn as_literal(&self) -> &BlockPyLiteral {
+    pub fn as_literal(&self) -> &Literal {
         &self.literal
     }
 
-    pub fn into_literal(self) -> BlockPyLiteral {
+    pub fn into_literal(self) -> Literal {
         self.literal
     }
 }
 
-pub(crate) fn literal_value(literal: impl Into<BlockPyLiteral>, meta: Meta) -> LiteralValue {
+pub(crate) fn literal_value(literal: impl Into<Literal>, meta: Meta) -> LiteralValue {
     LiteralValue::new(literal.into()).with_meta(meta)
 }
 
-pub(crate) fn literal_expr<E>(literal: impl Into<BlockPyLiteral>, meta: Meta) -> E
+pub(crate) fn literal_expr<E>(literal: impl Into<Literal>, meta: Meta) -> E
 where
     E: From<LiteralValue>,
 {
@@ -597,45 +530,45 @@ where
 }
 
 #[derive(Clone)]
-pub struct CoreStringLiteral {
+pub struct StringLiteral {
     pub value: String,
 }
 
-impl fmt::Debug for CoreStringLiteral {
+impl fmt::Debug for StringLiteral {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:?}", self.value)
     }
 }
 
 #[derive(Clone)]
-pub struct CoreBytesLiteral {
+pub struct BytesLiteral {
     pub value: Vec<u8>,
 }
 
-impl fmt::Debug for CoreBytesLiteral {
+impl fmt::Debug for BytesLiteral {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:?}", self.value)
     }
 }
 
 #[derive(Clone)]
-pub struct CoreNumberLiteral {
-    pub value: CoreNumberLiteralValue,
+pub struct NumberLiteral {
+    pub value: NumberLiteralValue,
 }
 
-impl fmt::Debug for CoreNumberLiteral {
+impl fmt::Debug for NumberLiteral {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.value.fmt(f)
     }
 }
 
 #[derive(Clone)]
-pub enum CoreNumberLiteralValue {
+pub enum NumberLiteralValue {
     Int(ast::Int),
     Float(f64),
 }
 
-impl fmt::Debug for CoreNumberLiteralValue {
+impl fmt::Debug for NumberLiteralValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Int(value) => write!(f, "{value}"),
@@ -652,11 +585,11 @@ impl Instr for InstrWithYield {
     type Name = UnresolvedName;
 }
 
-impl<N: BlockPyNameLike> Instr for InstrLow<N> {
+impl<N: NameLike> Instr for InstrLow<N> {
     type Name = N;
 }
 
-impl Instr for CodegenBlockPyExpr {
+impl Instr for InstrCodegen {
     type Name = ResolvedName;
 }
 
@@ -777,7 +710,10 @@ pub enum CallArgKeyword<E> {
 }
 
 impl<E> CallArgKeyword<E> {
-    pub fn from_ast_keyword_with(keyword: ast::Keyword, lower: impl FnOnce(ast::Expr) -> E) -> Self {
+    pub fn from_ast_keyword_with(
+        keyword: ast::Keyword,
+        lower: impl FnOnce(ast::Expr) -> E,
+    ) -> Self {
         match keyword.arg {
             Some(arg) => Self::Named {
                 arg,
@@ -847,13 +783,13 @@ impl FunctionName {
 }
 
 #[derive(Debug)]
-pub struct BlockPyFunction<P: BlockPyPass, S = <P as BlockPyPass>::Expr> {
+pub struct BlockPyFunction<P: BlockPyPass, S = <P as BlockPyPass>::Instr> {
     pub function_id: FunctionId,
     pub name_gen: FunctionNameGen,
     pub names: FunctionName,
     pub kind: FunctionKind,
     pub params: ParamSpec,
-    pub blocks: Vec<Block<S, P::Expr>>,
+    pub blocks: Vec<Block<S, P::Instr>>,
     pub doc: Option<String>,
     pub storage_layout: Option<StorageLayout>,
     pub scope: CallableScopeInfo,
@@ -886,7 +822,7 @@ impl<P: BlockPyPass, S> BlockPyFunction<P, S> {
         &self.storage_layout
     }
 
-    pub fn entry_block(&self) -> &Block<S, P::Expr> {
+    pub fn entry_block(&self) -> &Block<S, P::Instr> {
         self.blocks
             .first()
             .expect("BlockPyFunction should have at least one block")
@@ -894,7 +830,7 @@ impl<P: BlockPyPass, S> BlockPyFunction<P, S> {
 
     pub fn map_blocks<Q: BlockPyPass, T>(
         self,
-        mut f: impl FnMut(Block<S, P::Expr>) -> Block<T, Q::Expr>,
+        mut f: impl FnMut(Block<S, P::Instr>) -> Block<T, Q::Instr>,
     ) -> BlockPyFunction<Q, T> {
         BlockPyFunction {
             function_id: self.function_id,
@@ -915,12 +851,12 @@ pub trait NormalizedInstr {
 }
 
 pub trait BlockPyPass: Clone + fmt::Debug {
-    type Expr: Instr;
+    type Instr: Instr;
 }
 
 pub type InstrName<I> = <I as Instr>::Name;
 pub type ResolvedStorageBlock = Block<InstrResolved>;
-pub type CodegenBlock = Block<CodegenBlockPyExpr>;
+pub type CodegenBlock = Block<InstrCodegen>;
 pub type CodegenBlockPyFunction = BlockPyFunction<crate::passes::CodegenBlockPyPass>;
 pub type CodegenBlockPyModule = BlockPyModule<crate::passes::CodegenBlockPyPass>;
 
@@ -1235,7 +1171,7 @@ impl ImplicitNoneExpr for InstrResolved {
     }
 }
 
-impl ImplicitNoneExpr for CodegenBlockPyExpr {
+impl ImplicitNoneExpr for InstrCodegen {
     fn implicit_none_expr() -> Self {
         Load::new(ResolvedName {
             id: "NONE".into(),
@@ -1247,7 +1183,7 @@ impl ImplicitNoneExpr for CodegenBlockPyExpr {
     fn is_implicit_none_expr(expr: &Self) -> bool {
         matches!(
             expr,
-            CodegenBlockPyExpr::Load(op) if op.name.is_runtime_symbol("NONE")
+            InstrCodegen::Load(op) if op.name.is_runtime_symbol("NONE")
         )
     }
 }

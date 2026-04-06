@@ -5,7 +5,7 @@ use crate::block_py::{
 
 pub(crate) fn validate_module<P: BlockPyPass, S>(module: &BlockPyModule<P, S>) -> Result<(), String>
 where
-    P: BlockPyPass<Expr = S>,
+    P: BlockPyPass<Instr = S>,
     S: ScopeExprNode + crate::block_py::Instr,
 {
     for function in &module.callable_defs {
@@ -16,7 +16,7 @@ where
 
 fn validate_function<P: BlockPyPass, S>(function: &BlockPyFunction<P, S>) -> Result<(), String>
 where
-    P: BlockPyPass<Expr = S>,
+    P: BlockPyPass<Instr = S>,
     S: ScopeExprNode + crate::block_py::Instr,
 {
     let qualname = function.names.qualname.as_str();
@@ -108,13 +108,13 @@ where
 
 fn validate_non_exception_edge<P: BlockPyPass, S>(
     function: &BlockPyFunction<P, S>,
-    source_block: &Block<S, P::Expr>,
+    source_block: &Block<S, P::Instr>,
     edge: &BlockEdge,
     qualname: &str,
     label_kind: &str,
 ) -> Result<(), String>
 where
-    P: BlockPyPass<Expr = S>,
+    P: BlockPyPass<Instr = S>,
     S: crate::block_py::Instr,
 {
     let target_block = lookup_known_block(
@@ -134,14 +134,14 @@ where
 }
 
 fn validate_edge_param_forwarding<P: BlockPyPass, S>(
-    source_block: &Block<S, P::Expr>,
-    target_block: &Block<S, P::Expr>,
+    source_block: &Block<S, P::Instr>,
+    target_block: &Block<S, P::Instr>,
     explicit_args: &[BlockArg],
     qualname: &str,
     label_kind: &str,
 ) -> Result<(), String>
 where
-    P: BlockPyPass<Expr = S>,
+    P: BlockPyPass<Instr = S>,
     S: crate::block_py::Instr,
 {
     if explicit_args.len() > target_block.params.len() {
@@ -202,15 +202,15 @@ where
 }
 
 fn validate_explicit_edge_arg<P: BlockPyPass, S>(
-    source_block: &Block<S, P::Expr>,
-    target_block: &Block<S, P::Expr>,
+    source_block: &Block<S, P::Instr>,
+    target_block: &Block<S, P::Instr>,
     target_param: &BlockParam,
     source_arg: &BlockArg,
     qualname: &str,
     label_kind: &str,
 ) -> Result<(), String>
 where
-    P: BlockPyPass<Expr = S>,
+    P: BlockPyPass<Instr = S>,
     S: crate::block_py::Instr,
 {
     match (target_param.role, source_arg) {
@@ -233,7 +233,7 @@ fn validate_storage_layout_scoping<P: BlockPyPass, S>(
     qualname: &str,
 ) -> Result<(), String>
 where
-    P: BlockPyPass<Expr = S>,
+    P: BlockPyPass<Instr = S>,
     S: ScopeExprNode + crate::block_py::Instr,
 {
     let expected_layout = compute_storage_layout_from_scope(function);
@@ -312,7 +312,7 @@ fn lookup_known_block<'a, P: BlockPyPass>(
     qualname: &str,
     block_label: BlockLabel,
     label_kind: &str,
-) -> Result<&'a Block<P::Expr, P::Expr>, String> {
+) -> Result<&'a Block<P::Instr, P::Instr>, String> {
     let Some(target_block) = function.blocks.get(label.index()) else {
         return Err(format!(
             "unknown {label_kind} {label} in {}:{}",

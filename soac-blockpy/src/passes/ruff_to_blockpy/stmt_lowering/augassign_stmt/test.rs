@@ -1,4 +1,4 @@
-use super::super::{BlockPyStmtBuilder, lower_instr_for_test};
+use super::super::{lower_instr_for_test, BlockPyStmtBuilder};
 use super::*;
 use crate::block_py::InstrWithAwaitAndYield;
 use crate::passes::ast_to_ast::context::Context;
@@ -50,8 +50,7 @@ fn stmt_pow_augassign_to_blockpy_uses_inplace_pow() {
         .expect("pow augassign lowering should succeed");
 
     let fragment = out.finish();
-    let Some(InstrWithAwaitAndYield::Store(assign)) = fragment.entry.body.last()
-    else {
+    let Some(InstrWithAwaitAndYield::Store(assign)) = fragment.entry.body.last() else {
         panic!("expected final store expr stmt, got {fragment:?}");
     };
     let rendered = format!("{:?}", assign.value);

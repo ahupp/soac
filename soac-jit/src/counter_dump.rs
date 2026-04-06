@@ -229,7 +229,10 @@ impl CounterDumpRecord {
         let value_offset = align_up(block_label_offset + block_label.len() * size_of::<u32>(), 8);
         let observed_value_offset = value_offset + value.len() * size_of::<u64>();
         let max_overcount_offset = observed_value_offset + observed_value.len() * size_of::<u64>();
-        let record_len = align_up(max_overcount_offset + max_overcount.len() * size_of::<u64>(), 8);
+        let record_len = align_up(
+            max_overcount_offset + max_overcount.len() * size_of::<u64>(),
+            8,
+        );
 
         let header = CounterDumpRecordHeader {
             magic: COUNTER_DUMP_MAGIC,
@@ -544,9 +547,10 @@ pub fn parse_counter_dump_records(bytes: &[u8]) -> Result<Vec<CounterDumpRecordV
         let value_offset = usize::try_from(header.value_offset).map_err(|_| {
             format!("counter dump value offset at byte offset {offset} is too large")
         })?;
-        let observed_value_offset = usize::try_from(header.observed_value_offset).map_err(|_| {
-            format!("counter dump observed_value offset at byte offset {offset} is too large")
-        })?;
+        let observed_value_offset =
+            usize::try_from(header.observed_value_offset).map_err(|_| {
+                format!("counter dump observed_value offset at byte offset {offset} is too large")
+            })?;
         let max_overcount_offset = usize::try_from(header.max_overcount_offset).map_err(|_| {
             format!("counter dump max_overcount offset at byte offset {offset} is too large")
         })?;
@@ -705,7 +709,12 @@ fn observed_value_entries_for_kind(
             if observed_value == 0 {
                 continue;
             }
-            entries.push((module_name.clone(), site_function_id, instr_id, observed_value));
+            entries.push((
+                module_name.clone(),
+                site_function_id,
+                instr_id,
+                observed_value,
+            ));
         }
     }
     Ok(entries)
@@ -1052,9 +1061,15 @@ mod tests {
         assert_eq!(read_u32(&bytes, instr_index_in_block_offset + 4), 3);
         assert_eq!(read_u64(&bytes, value_offset), 11);
         assert_eq!(read_u64(&bytes, value_offset + 8), 19);
-        assert_eq!(read_u64(&bytes, observed_value_offset), COUNTER_DUMP_NONE_U64);
+        assert_eq!(
+            read_u64(&bytes, observed_value_offset),
+            COUNTER_DUMP_NONE_U64
+        );
         assert_eq!(read_u64(&bytes, observed_value_offset + 8), 42);
-        assert_eq!(read_u64(&bytes, max_overcount_offset), COUNTER_DUMP_NONE_U64);
+        assert_eq!(
+            read_u64(&bytes, max_overcount_offset),
+            COUNTER_DUMP_NONE_U64
+        );
         assert_eq!(read_u64(&bytes, max_overcount_offset + 8), 7);
 
         let string_offsets_end = string_offsets_offset + string_offsets_len;
@@ -1220,9 +1235,10 @@ mod tests {
         };
 
         let bytes = record.encode().expect("counter dump should encode");
-        let records = parse_counter_dump_records(bytes.as_slice()).expect("counter dump should parse");
-        let rendered = render_call_target_specializations(&records)
-            .expect("specializations should render");
+        let records =
+            parse_counter_dump_records(bytes.as_slice()).expect("counter dump should parse");
+        let rendered =
+            render_call_target_specializations(&records).expect("specializations should render");
         assert_eq!(rendered, "mod|4294967303|2|4=4294967305,4294967306");
 
         let collected = collect_call_target_specializations_for_function(
@@ -1319,12 +1335,9 @@ mod tests {
         let bytes = record.encode().expect("counter dump should encode");
         let records =
             parse_counter_dump_records(bytes.as_slice()).expect("counter dump should parse");
-        let collected = collect_operator_specializations_for_function(
-            &records,
-            "mod",
-            FunctionId::new(1, 7),
-        )
-        .expect("operator specializations should collect");
+        let collected =
+            collect_operator_specializations_for_function(&records, "mod", FunctionId::new(1, 7))
+                .expect("operator specializations should collect");
         assert_eq!(
             collected.get(&InstrId::new(BlockLabel::from_index(2), 4)),
             Some(&vec![1, 257])
