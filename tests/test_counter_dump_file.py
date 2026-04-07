@@ -24,5 +24,11 @@ def read():
     gc.collect()
 
     data = dump_path.read_bytes()
-    assert data.startswith(b"SOACCNTR")
+    assert data.startswith(b"SOACRKV1")
+    assert int.from_bytes(data[8:10], "little") == 1
+    header_len = int.from_bytes(data[10:12], "little")
+    payload_len = int.from_bytes(data[16:24], "little")
+    assert header_len == 32
+    assert payload_len > 0
+    assert header_len + payload_len <= len(data)
     assert len(data) > 64

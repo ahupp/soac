@@ -168,9 +168,14 @@ pub(crate) fn rewrite_module_with_tracker(
             passes::lower_name_binding_in_core_blockpy_module(core_blockpy_without_await_or_yield)
         });
 
+    let global_index: BlockPyModule<ResolvedStorageModuleShape> =
+        pass_tracker.run_pass("global_index", || {
+            passes::lower_global_index_in_resolved_module_default(name_binding.clone())
+        });
+
     let bb_prepared: BlockPyModule<ResolvedStorageModuleShape> = pass_tracker
         .run_pass("bb_prepared", || {
-            passes::lower_try_jump_exception_flow(&name_binding)
+            passes::lower_try_jump_exception_flow(&global_index)
         });
     let bb_codegen: BlockPyModule<CodegenModuleShape> = pass_tracker.run_pass("bb_codegen", || {
         let mut bb_codegen = passes::normalize_bb_module_strings(&bb_prepared);

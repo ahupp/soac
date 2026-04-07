@@ -518,6 +518,73 @@ mod tests {
         }
     }
 
+    fn render_test_jit_function_with_constants_and_runtime_inline(
+        module: &BlockPyModule<CodegenModuleShape>,
+        function: &BlockPyFunction<CodegenModuleShape>,
+        blocks: &[ObjPtr],
+        module_constants: &crate::module_constants::ModuleCodegenConstants,
+    ) -> String {
+        unsafe {
+            let mut jit_module = new_jit_module().expect("test jit module should construct");
+            let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
+            let counter_ptrs = placeholder_counter_ptrs(0);
+            let mut built = build_cranelift_run_bb_specialized_function(
+                &mut jit_module,
+                blocks,
+                module,
+                function,
+                module_constants,
+                &[],
+                &module_constant_ptrs,
+                &counter_ptrs,
+                None,
+            )
+            .expect("specialized JIT build should succeed");
+            inline_runtime_support_calls(&mut jit_module, &mut built.ctx, "test")
+                .expect("runtime support helpers should inline");
+            let (clif, _cfg_dot, _vcode_disasm) = render_compiled_clif_and_vcode_disasm(
+                &mut jit_module,
+                built.ctx,
+                &built.import_id_to_symbol,
+                &built.block_annotations,
+            )
+            .expect("specialized JIT CLIF render should succeed");
+            clif
+        }
+    }
+
+    fn render_test_jit_function_with_runtime_inline(
+        function: &BlockPyFunction<CodegenModuleShape>,
+        blocks: &[ObjPtr],
+        module_constants: Vec<InstrResolved>,
+    ) -> String {
+        let module = BlockPyModule {
+            module_name_gen: ModuleNameGen::new(0),
+            global_names: Vec::new(),
+            callable_defs: vec![function.clone()],
+            module_constants,
+            counter_defs: Vec::new(),
+        };
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        render_test_jit_function_with_constants_and_runtime_inline(
+            &module,
+            function,
+            blocks,
+            &module_constants,
+        )
+    }
+
+    fn assert_inlined_indexed_global_guard(rendered: &str, message: &str) {
+        assert!(
+            rendered.contains("load.i64 notrap v7+40")
+                && rendered.contains("load.i64 notrap v7+32")
+                && rendered.contains("load.i8 notrap")
+                && rendered.contains("iconst.i64 -1"),
+            "{message}:\n{rendered}"
+        );
+    }
+
     fn vendored_python_home() -> std::path::PathBuf {
         repo_root().join("vendor").join("cpython")
     }
@@ -546,17 +613,11 @@ mod tests {
         ffi::Py_INCREF(deleted_obj.cast());
         let empty_tuple_obj = pyo3::types::PyTuple::empty(py).as_ptr().cast::<c_void>();
         ffi::Py_INCREF(empty_tuple_obj.cast());
-        let global_cache = crate::module_globals::ModuleGlobalCache::new(
-            globals_obj.cast(),
-            shared_state.lowered_module.global_names.as_slice(),
-        )
-        .expect("test runtime should create module global cache");
         crate::jit::ModuleRuntimeContext {
             vmctx: crate::jit::JitModuleVmCtx {
                 shared_module_state: std::sync::Arc::as_ptr(&shared_state),
                 current_exception_slot: crate::jit::vmctx_current_thread_raised_exception_slot(),
                 globals_obj,
-                global_slots: global_cache.slots_ptr().cast::<c_void>(),
                 true_obj,
                 false_obj,
                 none_obj,
@@ -564,7 +625,6 @@ mod tests {
                 empty_tuple_obj,
             },
             shared_module_state_owner: shared_state,
-            global_cache_owner: global_cache,
         }
     }
 
@@ -1176,7 +1236,7 @@ def f(x):
                 test_source_block(&function, vec![], raise_term()),
             ],
         );
-        let rendered = render_test_jit_function(&function, &blocks);
+        let rendered = render_test_jit_function_with_runtime_inline(&function, &blocks, Vec::new());
         assert!(
             rendered.contains("function"),
             "specialized JIT CLIF render should produce function text:\n{}",
@@ -1582,12 +1642,15 @@ def f():
             vec![],
             ret_term(name_expr(test_global_name("x"))),
         );
-        let rendered = render_test_jit_function(&function, &blocks);
+        let rendered = render_test_jit_function_with_runtime_inline(&function, &blocks, Vec::new());
         assert!(
             !rendered.contains("call dp_jit_function_globals")
-                && rendered.contains("call dp_jit_load_global_obj")
                 && !rendered.contains("call dp_jit_load_module_constant"),
-            "global located names should use vmctx-backed globals and pass the name object as an immediate constant:\n{rendered}"
+            "global located names should use vmctx-backed globals and module constant names:\n{rendered}"
+        );
+        assert_inlined_indexed_global_guard(
+            &rendered,
+            "global located names should inline the indexed-module-dict guard",
         );
     }
 
@@ -1599,10 +1662,10 @@ def f():
             vec![],
             ret_term(op_expr(Load::new(test_global_name("x")))),
         );
-        let rendered = render_test_jit_function(&function, &blocks);
-        assert!(
-            rendered.contains("call dp_jit_load_global_obj"),
-            "load_global intrinsic should use the direct JIT helper:\n{rendered}"
+        let rendered = render_test_jit_function_with_runtime_inline(&function, &blocks, Vec::new());
+        assert_inlined_indexed_global_guard(
+            &rendered,
+            "load_global intrinsic should inline the indexed-module-dict guard",
         );
     }
 
@@ -1618,14 +1681,14 @@ def f():
                 constants.int_expr(3),
             ))),
         );
-        let rendered = render_test_jit_function_with_module_constants(
+        let rendered = render_test_jit_function_with_runtime_inline(
             &function,
             &blocks,
             constants.module_constants,
         );
-        assert!(
-            rendered.contains("call dp_jit_store_global"),
-            "store_global intrinsic should use the direct JIT helper:\n{rendered}"
+        assert_inlined_indexed_global_guard(
+            &rendered,
+            "store_global intrinsic should inline the indexed-module-dict guard",
         );
     }
 

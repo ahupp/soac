@@ -1,18 +1,18 @@
 use crate::counter::{Counter, CounterEntry};
-use crate::counter_dump::{CounterDumpRecord, CounterDumpRow};
+use crate::counter_dump::{CounterDumpKeyLayout, CounterDumpRecord, CounterDumpRow};
 use crate::module_constants::ModuleCodegenConstants;
-use crate::module_globals::ModuleGlobalCache;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::types::PyAnyMethods;
+use pyo3::sync::PyOnceLock;
+use pyo3::types::{PyAnyMethods, PyList, PyTuple};
 use soac_blockpy::block_py::{
     BlockPyFunction, BlockPyModule, CounterDef, CounterId, CounterScope, CounterSite, FunctionId,
 };
 use soac_blockpy::passes::CodegenModuleShape;
 use std::collections::HashMap;
 use std::env;
-use std::ffi::{c_int, c_void};
+use std::ffi::{c_char, c_int, c_void};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::mem::MaybeUninit;
@@ -21,8 +21,35 @@ use std::ptr;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+unsafe extern "C" {
+    fn _PyDict_WatchSplitKeysForType(type_obj: *mut ffi::PyObject) -> c_int;
+    fn _PyDict_GetKeyLayoutEvents() -> *mut ffi::PyObject;
+    fn _PyDict_NewIndexedKeySet(keys: *mut ffi::PyObject) -> *mut c_void;
+    fn _PyDict_NewWithIndexedKeySet(keys: *mut c_void) -> *mut ffi::PyObject;
+    fn _PyDictKeys_DecRef(keys: *mut c_void);
+}
+
 pub struct SoacExtModuleDataRef<'a> {
     pub shared_state: &'a SharedModuleState,
+}
+
+#[repr(C)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModuleInfo {
+    pub hash: u64,
+    pub indexed_module_keys: Vec<String>,
+}
+
+pub fn hash_module_source(source: &str) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x00000100000001b3;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in source.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }
 
 pub struct SharedModuleState {
@@ -34,7 +61,7 @@ pub struct SharedModuleState {
     module_constant_objs: Vec<Py<PyAny>>,
     counter_slots_by_id: Box<[CounterRuntimeSlot]>,
     counter_values: Box<[u64]>,
-    call_target_counter_values: Box<[Mutex<Counter<2, u64>>]>,
+    top_value_counters: Box<[Mutex<Counter<2, u64>>]>,
     compiled_direct_runner_handles: Mutex<HashMap<FunctionId, DirectRunnerCacheEntry>>,
 }
 
@@ -57,7 +84,7 @@ enum CounterStorageKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CounterRuntimeSlot {
     Scalar(usize),
-    CallHotTargets(usize),
+    TopValues(usize),
 }
 
 impl SharedModuleState {
@@ -85,7 +112,7 @@ impl SharedModuleState {
                 CounterRuntimeSlot::Scalar(slot) => {
                     &self.counter_values[*slot] as *const u64 as *mut u64
                 }
-                CounterRuntimeSlot::CallHotTargets(_) => ptr::null_mut(),
+                CounterRuntimeSlot::TopValues(_) => ptr::null_mut(),
             })
             .collect()
     }
@@ -102,12 +129,12 @@ impl SharedModuleState {
             CounterRuntimeSlot::Scalar(slot) => {
                 self.counter_values.get(slot).copied().unwrap_or_default()
             }
-            CounterRuntimeSlot::CallHotTargets(_) => 0,
+            CounterRuntimeSlot::TopValues(_) => 0,
         }
     }
 
     #[cfg_attr(test, allow(dead_code))]
-    pub(crate) fn record_call_target_counter(
+    pub(crate) fn record_top_value_sample(
         &self,
         counter_id: CounterId,
         value: u64,
@@ -118,33 +145,30 @@ impl SharedModuleState {
                 counter_id.0
             ));
         };
-        let CounterRuntimeSlot::CallHotTargets(slot) = slot else {
+        let CounterRuntimeSlot::TopValues(slot) = slot else {
             return Err(format!(
-                "counter id {} is not a call target counter",
+                "counter id {} is not a top-value counter",
                 counter_id.0
             ));
         };
         let counter = self
-            .call_target_counter_values
+            .top_value_counters
             .get(slot)
-            .ok_or_else(|| format!("missing call target counter slot {}", slot))?;
+            .ok_or_else(|| format!("missing top-value counter slot {}", slot))?;
         let mut counter = counter
             .lock()
-            .map_err(|_| "call target counter lock poisoned".to_string())?;
+            .map_err(|_| "top-value counter lock poisoned".to_string())?;
         counter.record(value);
         Ok(())
     }
 
-    fn call_target_counter_snapshot(
-        &self,
-        counter_id: CounterId,
-    ) -> Option<Vec<CounterEntry<u64>>> {
-        let CounterRuntimeSlot::CallHotTargets(slot) =
+    fn top_values_counter_snapshot(&self, counter_id: CounterId) -> Option<Vec<CounterEntry<u64>>> {
+        let CounterRuntimeSlot::TopValues(slot) =
             self.counter_slots_by_id.get(counter_id.0).copied()?
         else {
             return None;
         };
-        let counter = self.call_target_counter_values.get(slot)?;
+        let counter = self.top_value_counters.get(slot)?;
         let counter = counter.lock().ok()?;
         Some(counter.snapshot())
     }
@@ -213,9 +237,8 @@ impl SharedModuleState {
     }
 
     pub fn counter_dump_record(&self) -> Option<CounterDumpRecord> {
-        if self.lowered_module.counter_defs.is_empty() {
-            return None;
-        }
+        let module_keys = self.counter_dump_module_keys();
+        let type_keys = self.counter_dump_type_keys();
 
         let mut rows = Vec::new();
         for counter in &self.lowered_module.counter_defs {
@@ -276,7 +299,7 @@ impl SharedModuleState {
 
             if counter_uses_call_target_storage(counter) {
                 let snapshot = self
-                    .call_target_counter_snapshot(counter.id)
+                    .top_values_counter_snapshot(counter.id)
                     .unwrap_or_default();
                 if snapshot.is_empty() {
                     rows.push(base_row);
@@ -296,11 +319,40 @@ impl SharedModuleState {
             }
         }
 
+        if rows.is_empty() && module_keys.is_empty() && type_keys.is_empty() {
+            return None;
+        }
+
         Some(CounterDumpRecord {
             module_name: self.module_name.clone(),
             package_name: (!self.package_name.is_empty()).then(|| self.package_name.clone()),
             rows,
+            module_keys,
+            type_keys,
         })
+    }
+
+    fn counter_dump_module_keys(&self) -> Vec<CounterDumpKeyLayout> {
+        if !key_layout_counter_enabled() {
+            return Vec::new();
+        }
+        self.lowered_module
+            .global_names
+            .iter()
+            .enumerate()
+            .map(|(index, key)| CounterDumpKeyLayout {
+                owner: self.module_name.clone(),
+                key: key.clone(),
+                index: u32::try_from(index).expect("global-name index should fit in u32"),
+            })
+            .collect()
+    }
+
+    fn counter_dump_type_keys(&self) -> Vec<CounterDumpKeyLayout> {
+        if !key_layout_counter_enabled() {
+            return Vec::new();
+        }
+        snapshot_type_key_layout_events(self.module_name.as_str())
     }
 
     pub fn append_counter_dump_file(&self, path: &Path) -> Result<(), String> {
@@ -367,9 +419,9 @@ fn build_counter_storage(
 )> {
     let mut slots_by_id = vec![None; counter_defs.len()];
     let mut scalar_slot_by_key = HashMap::new();
-    let mut call_target_slot_by_key = HashMap::new();
+    let mut top_values_slot_by_key = HashMap::new();
     let mut counter_values = Vec::new();
-    let mut call_target_counter_values = Vec::new();
+    let mut top_value_counters = Vec::new();
     for counter in counter_defs {
         if counter.id.0 >= slots_by_id.len() {
             return Err(PyRuntimeError::new_err(format!(
@@ -380,15 +432,15 @@ fn build_counter_storage(
         }
         let key = counter_storage_key(counter)?;
         let slot = if counter_uses_call_target_storage(counter) {
-            let slot = if let Some(slot) = call_target_slot_by_key.get(&key).copied() {
+            let slot = if let Some(slot) = top_values_slot_by_key.get(&key).copied() {
                 slot
             } else {
-                let slot = call_target_counter_values.len();
-                call_target_counter_values.push(Mutex::new(Counter::new()));
-                call_target_slot_by_key.insert(key, slot);
+                let slot = top_value_counters.len();
+                top_value_counters.push(Mutex::new(Counter::new()));
+                top_values_slot_by_key.insert(key, slot);
                 slot
             };
-            CounterRuntimeSlot::CallHotTargets(slot)
+            CounterRuntimeSlot::TopValues(slot)
         } else {
             let slot = if let Some(slot) = scalar_slot_by_key.get(&key).copied() {
                 slot
@@ -409,7 +461,7 @@ fn build_counter_storage(
             .collect::<Vec<_>>()
             .into_boxed_slice(),
         counter_values.into_boxed_slice(),
-        call_target_counter_values.into_boxed_slice(),
+        top_value_counters.into_boxed_slice(),
     ))
 }
 
@@ -421,7 +473,7 @@ pub(crate) fn build_shared_state_for_testing(
     package_name: &str,
 ) -> PyResult<Arc<SharedModuleState>> {
     let function_index_by_id = build_function_index_by_id(&lowered_module)?;
-    let (counter_slots_by_id, counter_values, call_target_counter_values) =
+    let (counter_slots_by_id, counter_values, top_value_counters) =
         build_counter_storage(&lowered_module.counter_defs)?;
     let codegen_constants = ModuleCodegenConstants::collect_from_module(&lowered_module);
     let module_constant_objs = codegen_constants.build_python_constants(py)?;
@@ -434,7 +486,7 @@ pub(crate) fn build_shared_state_for_testing(
         module_constant_objs,
         counter_slots_by_id,
         counter_values,
-        call_target_counter_values,
+        top_value_counters,
         compiled_direct_runner_handles: Mutex::new(HashMap::new()),
     }))
 }
@@ -461,8 +513,6 @@ fn build_function_index_by_id(
 struct SoacExtModuleState {
     initialized: bool,
     shared_state: MaybeUninit<Arc<SharedModuleState>>,
-    global_cache: MaybeUninit<Arc<ModuleGlobalCache>>,
-    global_cache_initialized: bool,
 }
 
 impl SoacExtModuleState {
@@ -479,7 +529,7 @@ impl SoacExtModuleState {
             ));
         }
         let function_index_by_id = build_function_index_by_id(&lowered_module)?;
-        let (counter_slots_by_id, counter_values, call_target_counter_values) =
+        let (counter_slots_by_id, counter_values, top_value_counters) =
             build_counter_storage(&lowered_module.counter_defs)?;
         let codegen_constants = ModuleCodegenConstants::collect_from_module(&lowered_module);
         let module_constant_objs = codegen_constants.build_python_constants(py)?;
@@ -492,11 +542,10 @@ impl SoacExtModuleState {
             module_constant_objs,
             counter_slots_by_id,
             counter_values,
-            call_target_counter_values,
+            top_value_counters,
             compiled_direct_runner_handles: Mutex::new(HashMap::new()),
         }));
         self.initialized = true;
-        self.global_cache_initialized = false;
         Ok(())
     }
 
@@ -512,10 +561,6 @@ impl SoacExtModuleState {
                     path.display()
                 );
             }
-        }
-        if self.global_cache_initialized {
-            unsafe { ptr::drop_in_place(self.global_cache.as_mut_ptr()) };
-            self.global_cache_initialized = false;
         }
         unsafe { ptr::drop_in_place(self.shared_state.as_mut_ptr()) };
         self.initialized = false;
@@ -540,38 +585,75 @@ impl SoacExtModuleState {
         }
         Ok(unsafe { self.shared_state.assume_init_ref().clone() })
     }
+}
 
-    unsafe fn clone_or_init_global_cache(
-        &mut self,
-        globals_obj: *mut ffi::PyObject,
-    ) -> PyResult<Arc<ModuleGlobalCache>> {
-        if !self.initialized {
-            return Err(PyRuntimeError::new_err(
-                "missing transformed-module lowering data in module state",
-            ));
+pub fn key_layout_counter_enabled() -> bool {
+    env_flag_enabled("DIET_PYTHON_KEY_LAYOUT_COUNTERS")
+        || env_flag_enabled("DIET_PYTHON_CALL_TARGET_COUNTERS")
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    match env::var_os(name) {
+        None => false,
+        Some(value) => {
+            let raw = value.to_string_lossy();
+            !matches!(
+                raw.as_ref(),
+                "" | "0" | "false" | "False" | "FALSE" | "no" | "No" | "NO" | "off" | "Off" | "OFF"
+            )
         }
-        if self.global_cache_initialized {
-            return Ok(unsafe { self.global_cache.assume_init_ref().clone() });
-        }
-        let global_names = unsafe {
-            self.shared_state
-                .assume_init_ref()
-                .lowered_module
-                .global_names
-                .clone()
-        };
-        let cache = unsafe { ModuleGlobalCache::new(globals_obj, global_names.as_slice()) }
-            .map_err(|_| {
-                if unsafe { ffi::PyErr_Occurred() }.is_null() {
-                    PyRuntimeError::new_err("failed to create module global cache")
-                } else {
-                    PyErr::fetch(Python::assume_attached())
-                }
-            })?;
-        self.global_cache.write(cache.clone());
-        self.global_cache_initialized = true;
-        Ok(cache)
     }
+}
+
+pub unsafe fn watch_split_keys_for_type(type_obj: *mut ffi::PyObject) -> Result<(), ()> {
+    if !key_layout_counter_enabled() {
+        return Ok(());
+    }
+    if type_obj.is_null() {
+        return Err(());
+    }
+    if unsafe { _PyDict_WatchSplitKeysForType(type_obj) } < 0 {
+        Err(())
+    } else {
+        Ok(())
+    }
+}
+
+fn snapshot_type_key_layout_events(module_name: &str) -> Vec<CounterDumpKeyLayout> {
+    let events = unsafe { _PyDict_GetKeyLayoutEvents() };
+    if events.is_null() {
+        unsafe { ffi::PyErr_Clear() };
+        return Vec::new();
+    }
+
+    let py = unsafe { Python::assume_attached() };
+    let events = unsafe { Bound::from_owned_ptr(py, events) };
+    snapshot_type_key_layout_events_bound(events.as_any(), module_name).unwrap_or_default()
+}
+
+fn snapshot_type_key_layout_events_bound(
+    events: &Bound<'_, PyAny>,
+    module_name: &str,
+) -> PyResult<Vec<CounterDumpKeyLayout>> {
+    let events = events.cast::<PyList>()?;
+    let mut out = Vec::new();
+    for event in events.iter() {
+        let event = event.cast::<PyTuple>()?;
+        let owner = event.get_item(0)?;
+        let key: String = event.get_item(1)?.extract()?;
+        let index: u32 = event.get_item(2)?.extract()?;
+        let owner_module: String = owner.getattr("__module__")?.extract()?;
+        if owner_module != module_name {
+            continue;
+        }
+        let owner_qualname: String = owner.getattr("__qualname__")?.extract()?;
+        out.push(CounterDumpKeyLayout {
+            owner: format!("{owner_module}.{owner_qualname}"),
+            key,
+            index,
+        });
+    }
+    Ok(out)
 }
 
 fn counter_dump_file_from_env() -> Option<std::path::PathBuf> {
@@ -618,6 +700,188 @@ unsafe extern "C" fn soac_ext_module_free(module: *mut c_void) {
     }
 }
 
+unsafe fn soac_indexed_module_dict(keys: *mut ffi::PyObject) -> *mut ffi::PyObject {
+    let indexed_keys = unsafe { _PyDict_NewIndexedKeySet(keys) };
+    if indexed_keys.is_null() {
+        return ptr::null_mut();
+    }
+    let indexed_dict = unsafe { _PyDict_NewWithIndexedKeySet(indexed_keys) };
+    unsafe { _PyDictKeys_DecRef(indexed_keys) };
+    indexed_dict
+}
+
+unsafe fn soac_module_dict_slot(module: *mut ffi::PyObject) -> PyResult<*mut *mut ffi::PyObject> {
+    let type_obj = unsafe { ffi::Py_TYPE(module) };
+    let offset = unsafe { (*type_obj).tp_dictoffset };
+    if offset <= 0 {
+        return Err(PyRuntimeError::new_err(
+            "IndexedModuleType did not inherit a module __dict__ slot",
+        ));
+    }
+    Ok(unsafe {
+        module
+            .cast::<u8>()
+            .offset(offset as isize)
+            .cast::<*mut ffi::PyObject>()
+    })
+}
+
+fn soac_indexed_module_info_offset() -> usize {
+    let base_size = unsafe { ffi::PyModule_Type.tp_basicsize as usize };
+    let align = std::mem::align_of::<*mut ModuleInfo>();
+    base_size.next_multiple_of(align)
+}
+
+unsafe fn soac_indexed_module_info_slot(module: *mut ffi::PyObject) -> *mut *mut ModuleInfo {
+    unsafe {
+        module
+            .cast::<u8>()
+            .add(soac_indexed_module_info_offset())
+            .cast::<*mut ModuleInfo>()
+    }
+}
+
+pub fn indexed_module_info(module: &Bound<'_, PyAny>) -> PyResult<ModuleInfo> {
+    if !module.is_instance(soac_indexed_module_type(module.py())?)? {
+        return Err(PyTypeError::new_err(
+            "expected an instance of _soac_ext.IndexedModuleType",
+        ));
+    }
+    let module_info = unsafe { *soac_indexed_module_info_slot(module.as_ptr()) };
+    if module_info.is_null() {
+        return Err(PyRuntimeError::new_err(
+            "expected a transformed module initialized via _soac_ext.create_module",
+        ));
+    }
+    Ok(unsafe { (*module_info).clone() })
+}
+
+unsafe fn soac_replace_module_dict(
+    py: Python<'_>,
+    module: *mut ffi::PyObject,
+    indexed_dict: *mut ffi::PyObject,
+) -> PyResult<()> {
+    let old_dict = unsafe { ffi::PyModule_GetDict(module) };
+    if old_dict.is_null() {
+        return Err(PyErr::fetch(py));
+    }
+    if unsafe { ffi::PyDict_Update(indexed_dict, old_dict) } != 0 {
+        return Err(PyErr::fetch(py));
+    }
+
+    let dict_slot = unsafe { soac_module_dict_slot(module)? };
+    let old_dict = unsafe { *dict_slot };
+    unsafe {
+        *dict_slot = indexed_dict;
+        ffi::Py_DECREF(old_dict);
+    }
+    Ok(())
+}
+
+unsafe fn soac_new_indexed_module_object(
+    module_type: &Bound<'_, PyAny>,
+    name: *mut ffi::PyObject,
+) -> *mut ffi::PyObject {
+    unsafe { ffi::PyObject_CallOneArg(module_type.as_ptr(), name) }
+}
+
+unsafe fn soac_init_indexed_module_object(
+    py: Python<'_>,
+    module: *mut ffi::PyObject,
+    module_info: ModuleInfo,
+) -> PyResult<()> {
+    // Py_mod_create can only see (spec, def). Install SOAC's Rust-owned layout
+    // metadata immediately after PyModule_FromDefAndSpec returns instead of
+    // smuggling it through temporary Python-visible spec attributes.
+    let keys_tuple = unsafe { tuple_from_global_names(py, &module_info.indexed_module_keys)? };
+    let indexed_dict = unsafe { soac_indexed_module_dict(keys_tuple.as_ptr()) };
+    if indexed_dict.is_null() {
+        return Err(PyErr::fetch(py));
+    }
+    if let Err(err) = unsafe { soac_replace_module_dict(py, module, indexed_dict) } {
+        unsafe { ffi::Py_DECREF(indexed_dict) };
+        return Err(err);
+    }
+
+    let info_slot = unsafe { soac_indexed_module_info_slot(module) };
+    if unsafe { !(*info_slot).is_null() } {
+        return Err(PyRuntimeError::new_err(
+            "transformed module ModuleInfo was initialized twice",
+        ));
+    }
+    unsafe { *info_slot = Box::into_raw(Box::new(module_info)) };
+    Ok(())
+}
+
+unsafe extern "C" fn soac_indexed_module_new(
+    subtype: *mut ffi::PyTypeObject,
+    args: *mut ffi::PyObject,
+    kwargs: *mut ffi::PyObject,
+) -> *mut ffi::PyObject {
+    let py = unsafe { Python::assume_attached() };
+    let Some(base_new) = (unsafe { ffi::PyModule_Type.tp_new }) else {
+        PyRuntimeError::new_err("module base type does not expose tp_new").restore(py);
+        return ptr::null_mut();
+    };
+
+    let module = unsafe { base_new(subtype, args, kwargs) };
+    if module.is_null() {
+        return ptr::null_mut();
+    }
+
+    let info_slot = unsafe { soac_indexed_module_info_slot(module) };
+    unsafe { ptr::write(info_slot, ptr::null_mut::<ModuleInfo>()) };
+    module
+}
+
+unsafe extern "C" fn soac_indexed_module_dealloc(module: *mut ffi::PyObject) {
+    let module_info = unsafe { *soac_indexed_module_info_slot(module) };
+    if !module_info.is_null() {
+        unsafe { drop(Box::from_raw(module_info)) };
+    }
+    let Some(base_dealloc) = (unsafe { ffi::PyModule_Type.tp_dealloc }) else {
+        unsafe { ffi::PyObject_Free(module.cast::<c_void>()) };
+        return;
+    };
+    unsafe { base_dealloc(module) };
+}
+
+unsafe extern "C" fn soac_ext_module_create(
+    spec: *mut ffi::PyObject,
+    _def: *mut ffi::PyModuleDef,
+) -> *mut ffi::PyObject {
+    let py = unsafe { Python::assume_attached() };
+    let module_type = match soac_indexed_module_type(py) {
+        Ok(module_type) => module_type,
+        Err(err) => {
+            err.restore(py);
+            return ptr::null_mut();
+        }
+    };
+
+    let name = unsafe { ffi::PyObject_GetAttrString(spec, c"name".as_ptr()) };
+    if name.is_null() {
+        return ptr::null_mut();
+    }
+
+    let module = unsafe { soac_new_indexed_module_object(module_type, name) };
+    unsafe {
+        ffi::Py_DECREF(name);
+    }
+    module
+}
+
+static mut SOAC_EXT_MODULE_SLOTS: [ffi::PyModuleDef_Slot; 2] = [
+    ffi::PyModuleDef_Slot {
+        slot: ffi::Py_mod_create,
+        value: soac_ext_module_create as *mut c_void,
+    },
+    ffi::PyModuleDef_Slot {
+        slot: 0,
+        value: ptr::null_mut(),
+    },
+];
+
 static mut SOAC_EXT_MODULE_DEF: ffi::PyModuleDef = ffi::PyModuleDef {
     m_base: ffi::PyModuleDef_HEAD_INIT,
     m_name: c"_soac_ext.module_state".as_ptr(),
@@ -631,7 +895,10 @@ static mut SOAC_EXT_MODULE_DEF: ffi::PyModuleDef = ffi::PyModuleDef {
 };
 
 fn soac_ext_module_def() -> *mut ffi::PyModuleDef {
-    ptr::addr_of_mut!(SOAC_EXT_MODULE_DEF)
+    unsafe {
+        SOAC_EXT_MODULE_DEF.m_slots = ptr::addr_of_mut!(SOAC_EXT_MODULE_SLOTS).cast();
+        ptr::addr_of_mut!(SOAC_EXT_MODULE_DEF)
+    }
 }
 
 fn soac_ext_module_state(module: &Bound<'_, PyAny>) -> PyResult<*mut SoacExtModuleState> {
@@ -657,14 +924,105 @@ fn soac_ext_module_state(module: &Bound<'_, PyAny>) -> PyResult<*mut SoacExtModu
     }
 }
 
+const MODULE_DICT_METADATA_NAMES: &[&str] = &[
+    "__name__",
+    "__doc__",
+    "__package__",
+    "__loader__",
+    "__spec__",
+    "__builtins__",
+    "__file__",
+    "__cached__",
+    "__path__",
+];
+
+static SOAC_INDEXED_MODULE_TYPE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+
+fn create_soac_indexed_module_type(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    unsafe {
+        let bases = ffi::PyTuple_Pack(
+            1,
+            ptr::addr_of_mut!(ffi::PyModule_Type).cast::<ffi::PyObject>(),
+        );
+        let bases = Bound::from_owned_ptr_or_err(py, bases)?;
+        let mut slots = [
+            ffi::PyType_Slot {
+                slot: ffi::Py_tp_new,
+                pfunc: soac_indexed_module_new as *mut c_void,
+            },
+            ffi::PyType_Slot {
+                slot: ffi::Py_tp_dealloc,
+                pfunc: soac_indexed_module_dealloc as *mut c_void,
+            },
+            ffi::PyType_Slot {
+                slot: 0,
+                pfunc: ptr::null_mut(),
+            },
+        ];
+        let mut spec = ffi::PyType_Spec {
+            name: c"_soac_ext.IndexedModuleType".as_ptr(),
+            basicsize: (soac_indexed_module_info_offset() + std::mem::size_of::<*mut ModuleInfo>())
+                as c_int,
+            itemsize: 0,
+            flags: (ffi::Py_TPFLAGS_DEFAULT | ffi::Py_TPFLAGS_BASETYPE) as _,
+            slots: slots.as_mut_ptr(),
+        };
+        Py::from_owned_ptr_or_err(py, ffi::PyType_FromSpecWithBases(&mut spec, bases.as_ptr()))
+    }
+}
+
+fn soac_indexed_module_type(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
+    SOAC_INDEXED_MODULE_TYPE
+        .get_or_try_init(py, || create_soac_indexed_module_type(py))
+        .map(|module_type| module_type.bind(py))
+}
+
+pub fn indexed_module_type_for_python(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    Ok(soac_indexed_module_type(py)?.clone().unbind())
+}
+
+fn ensure_module_dict_metadata_names(global_names: &mut Vec<String>) {
+    for name in MODULE_DICT_METADATA_NAMES {
+        if !global_names.iter().any(|existing| existing == name) {
+            global_names.push((*name).to_string());
+        }
+    }
+}
+
+unsafe fn tuple_from_global_names<'py>(
+    py: Python<'py>,
+    global_names: &[String],
+) -> PyResult<Bound<'py, PyTuple>> {
+    let tuple = unsafe { ffi::PyTuple_New(global_names.len() as ffi::Py_ssize_t) };
+    let tuple = unsafe { Bound::from_owned_ptr_or_err(py, tuple)? }.cast_into::<PyTuple>()?;
+    for (index, name) in global_names.iter().enumerate() {
+        let item = unsafe {
+            ffi::PyUnicode_FromStringAndSize(
+                name.as_ptr().cast::<c_char>(),
+                name.len() as ffi::Py_ssize_t,
+            )
+        };
+        if item.is_null() {
+            return Err(PyErr::fetch(py));
+        }
+        if unsafe { ffi::PyTuple_SetItem(tuple.as_ptr(), index as ffi::Py_ssize_t, item) } != 0 {
+            return Err(PyErr::fetch(py));
+        }
+    }
+    Ok(tuple)
+}
+
 pub struct SoacExtModule;
 
 impl SoacExtModule {
     pub fn new(
         py: Python<'_>,
         spec: &Bound<'_, PyAny>,
-        lowered_module: BlockPyModule<CodegenModuleShape>,
+        mut lowered_module: BlockPyModule<CodegenModuleShape>,
+        mut module_info: ModuleInfo,
     ) -> PyResult<Py<PyAny>> {
+        ensure_module_dict_metadata_names(&mut lowered_module.global_names);
+        module_info.indexed_module_keys = lowered_module.global_names.clone();
         let module_name = spec
             .getattr("name")?
             .extract::<String>()
@@ -679,13 +1037,12 @@ impl SoacExtModule {
                 ffi::PyModule_FromDefAndSpec(soac_ext_module_def(), spec.as_ptr()),
             )?
         };
+        unsafe { soac_init_indexed_module_object(py, module.as_ptr(), module_info)? };
         if unsafe { ffi::PyModule_ExecDef(module.as_ptr(), soac_ext_module_def()) } != 0 {
             return Err(PyErr::fetch(py));
         }
         let state = soac_ext_module_state(&module)?;
-        unsafe {
-            (*state).init(py, lowered_module, module_name, package_name)?;
-        }
+        unsafe { (*state).init(py, lowered_module, module_name, package_name)? };
         Ok(module.unbind())
     }
 
@@ -700,14 +1057,6 @@ impl SoacExtModule {
     pub fn clone_shared_state(module: &Bound<'_, PyAny>) -> PyResult<Arc<SharedModuleState>> {
         let state = soac_ext_module_state(module)?;
         unsafe { (*state).clone_shared_state() }
-    }
-
-    pub fn clone_or_init_global_cache(
-        module: &Bound<'_, PyAny>,
-        globals_obj: *mut ffi::PyObject,
-    ) -> PyResult<Arc<ModuleGlobalCache>> {
-        let state = soac_ext_module_state(module)?;
-        unsafe { (*state).clone_or_init_global_cache(globals_obj) }
     }
 }
 
@@ -748,7 +1097,7 @@ def f():
             module_constant_objs: Vec::new(),
             counter_slots_by_id: vec![CounterRuntimeSlot::Scalar(0)].into_boxed_slice(),
             counter_values: vec![3].into_boxed_slice(),
-            call_target_counter_values: Vec::new().into_boxed_slice(),
+            top_value_counters: Vec::new().into_boxed_slice(),
             lowered_module: lowered,
             module_name: "counter_test".to_string(),
             package_name: String::new(),
@@ -829,10 +1178,10 @@ def f():
             },
         ];
 
-        let (slots_by_id, counter_values, call_target_counter_values) =
+        let (slots_by_id, counter_values, top_value_counters) =
             build_counter_storage(&counter_defs).expect("counter storage should build");
         assert_eq!(counter_values.len(), 3);
-        assert!(call_target_counter_values.is_empty());
+        assert!(top_value_counters.is_empty());
         assert_eq!(slots_by_id[0], slots_by_id[1]);
         assert_eq!(slots_by_id[2], slots_by_id[3]);
         assert_ne!(slots_by_id[0], slots_by_id[2]);
@@ -862,7 +1211,7 @@ def f():
             counter_slots_by_id: vec![CounterRuntimeSlot::Scalar(0), CounterRuntimeSlot::Scalar(1)]
                 .into_boxed_slice(),
             counter_values: vec![5, 8].into_boxed_slice(),
-            call_target_counter_values: Vec::new().into_boxed_slice(),
+            top_value_counters: Vec::new().into_boxed_slice(),
             lowered_module: lowered,
             module_name: "counter_test".to_string(),
             package_name: "pkg".to_string(),

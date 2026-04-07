@@ -24,24 +24,16 @@ def _runtime_bootstrap_in_progress() -> bool:
     return runtime is not None and not getattr(runtime, "_SOAC_RUNTIME_READY", False)
 
 
-def _create_module_from_source(path: str, source: str, spec):
+def _create_module_from_path(path: str, spec):
+    absolute_path = os.path.abspath(path)
     try:
-        return _soac_ext.create_module(source, spec)
+        return _soac_ext.create_module(absolute_path, spec)
     except SyntaxError as err:
         if err.filename is None:
-            err.filename = path
+            err.filename = absolute_path
         raise
     except Exception as err:
-        raise ImportError(f"diet-python failed for {path}: {err}") from err
-
-
-def _create_module_from_path(path: str, spec):
-    try:
-        with open(path, "r", encoding="utf-8") as file:
-            source = file.read()
-    except OSError as err:
-        raise ImportError(f"diet-python could not read source for {path}: {err}") from err
-    return _create_module_from_source(path, source, spec)
+        raise ImportError(f"diet-python failed for {absolute_path}: {err}") from err
 
 
 def _is_integration_module(resolved: Path) -> bool:

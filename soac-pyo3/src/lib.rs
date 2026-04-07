@@ -43,8 +43,12 @@ fn transform_source_with_name(source: &str, module_name: &str) -> PyResult<Strin
 }
 
 #[pymodule]
-fn _soac_ext(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _soac_ext(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     soac_blockpy::init_logging();
+    module.add(
+        "IndexedModuleType",
+        soac_jit::module_type::indexed_module_type_for_python(py)?,
+    )?;
     module.add_function(wrap_pyfunction!(transform_source_with_name, module)?)?;
     jit_runtime::add_module_functions(module)?;
     Ok(())

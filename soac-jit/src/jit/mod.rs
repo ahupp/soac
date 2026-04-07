@@ -36,6 +36,7 @@ unsafe extern "C" {
     static mut PyMethod_Type: ffi::PyTypeObject;
     static mut PyType_Type: ffi::PyTypeObject;
     static mut PyLong_Type: ffi::PyTypeObject;
+    static mut _PyDict_IndexedValueTombstone: i8;
 }
 
 mod intrinsics;
@@ -53,7 +54,7 @@ use specialized_helpers::register_specialized_jit_symbols;
 pub(crate) use vmctx::current_thread_raised_exception_slot as vmctx_current_thread_raised_exception_slot;
 use vmctx::{
     CURRENT_EXCEPTION_SLOT_OFFSET, DELETED_OBJ_OFFSET, EMPTY_TUPLE_OBJ_OFFSET, FALSE_OBJ_OFFSET,
-    GLOBAL_SLOTS_OFFSET, GLOBALS_OBJ_OFFSET, NONE_OBJ_OFFSET, TRUE_OBJ_OFFSET,
+    GLOBALS_OBJ_OFFSET, NONE_OBJ_OFFSET, TRUE_OBJ_OFFSET,
 };
 pub use vmctx::{JitModuleVmCtx, ModuleRuntimeContext};
 
@@ -154,6 +155,21 @@ static DP_JIT_INCREF_IMPORT: ImportSpec =
     ImportSpec::local(SOAC_RUNTIME_INCREF_SYMBOL, &[SigType::Pointer], &[]);
 static DP_JIT_DECREF_IMPORT: ImportSpec =
     ImportSpec::local(SOAC_RUNTIME_DECREF_SYMBOL, &[SigType::Pointer], &[]);
+static SOAC_RUNTIME_LOAD_GLOBAL_IMPORT: ImportSpec = ImportSpec::local(
+    SOAC_RUNTIME_LOAD_GLOBAL_SYMBOL,
+    &[SigType::Pointer, SigType::Pointer, SigType::I64],
+    &[SigType::Pointer],
+);
+static SOAC_RUNTIME_STORE_GLOBAL_IMPORT: ImportSpec = ImportSpec::local(
+    SOAC_RUNTIME_STORE_GLOBAL_SYMBOL,
+    &[
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::I64,
+        SigType::Pointer,
+    ],
+    &[SigType::Pointer],
+);
 static DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_py_call_positional_three",
     &[
@@ -197,16 +213,6 @@ static DP_JIT_PYTYPE_GENERIC_ALLOC_IMPORT: ImportSpec = ImportSpec::new(
 static DP_JIT_FINISH_CONSTRUCTOR_INIT_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_finish_constructor_init",
     &[SigType::Pointer, SigType::Pointer],
-    &[SigType::Pointer],
-);
-static DP_JIT_LOAD_GLOBAL_OBJ_IMPORT: ImportSpec = ImportSpec::new(
-    "dp_jit_load_global_obj",
-    &[
-        SigType::Pointer,
-        SigType::Pointer,
-        SigType::Pointer,
-        SigType::I64,
-    ],
     &[SigType::Pointer],
 );
 static DP_JIT_LOAD_RUNTIME_OBJ_IMPORT: ImportSpec = ImportSpec::new(
@@ -259,8 +265,8 @@ static DP_JIT_GUARD_METHOD_TYPE_VERSION_IMPORT: ImportSpec = ImportSpec::new(
     &[SigType::Pointer, SigType::Pointer, SigType::I64],
     &[SigType::I32],
 );
-static DP_JIT_RECORD_COUNTER_VALUE_IMPORT: ImportSpec = ImportSpec::new(
-    "dp_jit_record_counter_value",
+static DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_record_top_value_sample",
     &[SigType::Pointer, SigType::I64, SigType::I64],
     &[],
 );
@@ -563,32 +569,13 @@ fn emit_codegen_located_name_load(
         NameLocation::Cell(_) => {
             unreachable!("all cell location cases should be handled above");
         }
+        NameLocation::GlobalName => {
+            panic!("symbolic global name reached JIT codegen without the global_index pass");
+        }
         NameLocation::Global(slot) => {
             let globals_obj = ctx.consts.block_const;
-            let global_slots = ctx.consts.global_slots_const;
-            let slot_offset = i64::from(slot.slot()) * i64::from(ptr_ty.bytes());
-            let slot_addr = fb.ins().iadd_imm(global_slots, slot_offset);
-            let cached = fb.ins().load(ptr_ty, ir::MemFlags::trusted(), slot_addr, 0);
-            let cached_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, cached, null_ptr);
-            let cached_hit_block = fb.create_block();
-            let slowpath_block = fb.create_block();
             let value_ok_block = fb.create_block();
             fb.append_block_param(value_ok_block, ptr_ty);
-            fb.ins()
-                .brif(cached_is_null, slowpath_block, &[], cached_hit_block, &[]);
-
-            fb.switch_to_block(cached_hit_block);
-            if let Some(counter_ptr) = ctx.consts.global_load_hit_counter_ptr {
-                emit_increment_counter_ptr(fb, ptr_ty, counter_ptr);
-            }
-            fb.ins().call(ctx.incref_ref, &[cached]);
-            fb.ins()
-                .jump(value_ok_block, &[ir::BlockArg::Value(cached)]);
-
-            fb.switch_to_block(slowpath_block);
-            if let Some(counter_ptr) = ctx.consts.global_load_miss_counter_ptr {
-                emit_increment_counter_ptr(fb, ptr_ty, counter_ptr);
-            }
             let name_obj = emit_owned_module_constant(
                 fb,
                 ctx.module_constants
@@ -597,8 +584,8 @@ fn emit_codegen_located_name_load(
             );
             let slot_index = fb.ins().iconst(ir::types::I64, i64::from(slot.slot()));
             let value_inst = fb.ins().call(
-                ctx.load_global_obj_ref,
-                &[globals_obj, global_slots, name_obj, slot_index],
+                ctx.load_global_fast_ref,
+                &[globals_obj, name_obj, slot_index],
             );
             fb.ins().call(ctx.decref_ref, &[name_obj]);
             let value = fb.inst_results(value_inst)[0];
@@ -840,13 +827,10 @@ struct JitEmitConsts {
     deleted_const: ir::Value,
     empty_tuple_const: ir::Value,
     block_const: ir::Value,
-    global_slots_const: ir::Value,
     py_function_type_ptr: *mut ffi::PyTypeObject,
     py_method_type_ptr: *mut ffi::PyTypeObject,
     py_type_type_ptr: *mut ffi::PyTypeObject,
     py_long_type_ptr: *mut ffi::PyTypeObject,
-    global_load_hit_counter_ptr: Option<*mut u64>,
-    global_load_miss_counter_ptr: Option<*mut u64>,
 }
 
 struct JitEmitCtx<'mc> {
@@ -864,7 +848,7 @@ struct JitEmitCtx<'mc> {
     pytype_generic_alloc_ref: ir::FuncRef,
     finish_constructor_init_ref: ir::FuncRef,
     consts: JitEmitConsts,
-    load_global_obj_ref: ir::FuncRef,
+    load_global_fast_ref: ir::FuncRef,
     load_runtime_obj_ref: ir::FuncRef,
     direct_code_ptr_ref: ir::FuncRef,
     direct_vmctx_ref: ir::FuncRef,
@@ -882,7 +866,7 @@ struct JitEmitCtx<'mc> {
     py_call_object_ref: ir::FuncRef,
     py_call_with_kw_ref: ir::FuncRef,
     guard_method_type_version_ref: ir::FuncRef,
-    record_counter_value_ref: ir::FuncRef,
+    record_top_value_sample_ref: ir::FuncRef,
     tuple_new_ref: ir::FuncRef,
     tuple_set_item_ref: ir::FuncRef,
     stack_slots: StackSlots,
@@ -1325,24 +1309,6 @@ fn counter_ptr_for_id(
         .get(counter_id.0)
         .copied()
         .ok_or_else(|| format!("missing counter pointer for counter id {}", counter_id.0))
-}
-
-fn lookup_global_runtime_counter_ptr(
-    counter_defs: &[CounterDef],
-    counter_ptrs: &[*mut u64],
-    kind: &str,
-) -> Result<Option<*mut u64>, String> {
-    lookup_counter_id(
-        counter_defs,
-        CounterScope::Global,
-        kind,
-        &CounterSite::Runtime {
-            function_id: None,
-            instr_id: None,
-        },
-    )
-    .map(|counter_id| counter_ptr_for_id(counter_ptrs, counter_id))
-    .transpose()
 }
 
 fn build_counted_runtime_refcount_helper(
@@ -2521,7 +2487,7 @@ fn emit_callee_function_id_checked(
     fb.block_params(ok_block)[0]
 }
 
-fn emit_record_observed_value_counter(
+fn emit_record_top_value_sample(
     fb: &mut FunctionBuilder<'_>,
     counter_id: CounterId,
     observed_value: ir::Value,
@@ -2529,18 +2495,18 @@ fn emit_record_observed_value_counter(
 ) {
     let counter_id_value = fb.ins().iconst(ctx.consts.i64_ty, counter_id.0 as i64);
     fb.ins().call(
-        ctx.record_counter_value_ref,
+        ctx.record_top_value_sample_ref,
         &[ctx.consts.vmctx_value, counter_id_value, observed_value],
     );
 }
 
-fn emit_record_call_target_counter(
+fn emit_record_call_target_sample(
     fb: &mut FunctionBuilder<'_>,
     counter_id: CounterId,
     callee_id: ir::Value,
     ctx: &JitEmitCtx<'_>,
 ) {
-    emit_record_observed_value_counter(fb, counter_id, callee_id, ctx);
+    emit_record_top_value_sample(fb, counter_id, callee_id, ctx);
 }
 
 fn emit_direct_call_resolved_raw_with_arg_values(
@@ -3254,16 +3220,7 @@ fn emit_codegen_expr(
                     ctx.module_constants.require_unicode_constant_id("list"),
                     ctx,
                 );
-                let uncached_slot = fb.ins().iconst(ir::types::I64, -1);
-                let list_callable_inst = fb.ins().call(
-                    ctx.load_global_obj_ref,
-                    &[
-                        block_const,
-                        ctx.consts.global_slots_const,
-                        list_name_obj,
-                        uncached_slot,
-                    ],
-                );
+                let list_callable_inst = fb.ins().call(ctx.load_runtime_obj_ref, &[list_name_obj]);
                 fb.ins().call(decref_ref, &[list_name_obj]);
                 let list_callable = fb.inst_results(list_callable_inst)[0];
                 let list_callable_is_null =
@@ -3307,16 +3264,8 @@ fn emit_codegen_expr(
                         ctx.module_constants.require_unicode_constant_id("dict"),
                         ctx,
                     );
-                    let uncached_slot = fb.ins().iconst(ir::types::I64, -1);
-                    let dict_callable_inst = fb.ins().call(
-                        ctx.load_global_obj_ref,
-                        &[
-                            block_const,
-                            ctx.consts.global_slots_const,
-                            dict_name_obj,
-                            uncached_slot,
-                        ],
-                    );
+                    let dict_callable_inst =
+                        fb.ins().call(ctx.load_runtime_obj_ref, &[dict_name_obj]);
                     fb.ins().call(decref_ref, &[dict_name_obj]);
                     let dict_callable = fb.inst_results(dict_callable_inst)[0];
                     let dict_callable_is_null =
@@ -3568,16 +3517,8 @@ fn emit_codegen_expr(
                         .require_unicode_constant_id("tuple_from_iter"),
                     ctx,
                 );
-                let uncached_slot = fb.ins().iconst(ir::types::I64, -1);
-                let tuple_callable_inst = fb.ins().call(
-                    ctx.load_global_obj_ref,
-                    &[
-                        block_const,
-                        ctx.consts.global_slots_const,
-                        tuple_name_obj,
-                        uncached_slot,
-                    ],
-                );
+                let tuple_callable_inst =
+                    fb.ins().call(ctx.load_runtime_obj_ref, &[tuple_name_obj]);
                 fb.ins().call(decref_ref, &[tuple_name_obj]);
                 let tuple_callable = fb.inst_results(tuple_callable_inst)[0];
                 let tuple_callable_is_null =
@@ -3855,7 +3796,7 @@ fn emit_codegen_expr(
                                 ctx.consts.i64_ty,
                                 specialization.function_id.packed() as i64,
                             );
-                            emit_record_call_target_counter(fb, counter_id, callee_id, ctx);
+                            emit_record_call_target_sample(fb, counter_id, callee_id, ctx);
                         }
                         if let Some(counter_id) = direct_hit_counter_id {
                             let _ = emit_increment_counter(fb, counter_id, ctx);
@@ -3945,7 +3886,7 @@ fn emit_codegen_expr(
                     let callable = fb.block_params(callable_ok_block)[0];
                     if let Some(counter_id) = counter_id {
                         let callee_id = emit_callee_function_id_checked(fb, callable, ctx);
-                        emit_record_call_target_counter(fb, counter_id, callee_id, ctx);
+                        emit_record_call_target_sample(fb, counter_id, callee_id, ctx);
                     }
                     if let Some(counter_id) = direct_fallback_counter_id {
                         let _ = emit_increment_counter(fb, counter_id, ctx);
@@ -4013,7 +3954,7 @@ fn emit_codegen_expr(
                 {
                     let callee_id = emit_callee_function_id_checked(fb, callable, ctx);
                     if let Some(counter_id) = counter_id {
-                        emit_record_call_target_counter(fb, counter_id, callee_id, ctx);
+                        emit_record_call_target_sample(fb, counter_id, callee_id, ctx);
                     }
                     if !constructor_specializations.is_empty() || !direct_specializations.is_empty()
                     {
@@ -4302,16 +4243,7 @@ fn emit_codegen_expr(
                     ctx.module_constants.require_unicode_constant_id("dict"),
                     ctx,
                 );
-                let uncached_slot = fb.ins().iconst(ir::types::I64, -1);
-                let dict_callable_inst = fb.ins().call(
-                    ctx.load_global_obj_ref,
-                    &[
-                        block_const,
-                        ctx.consts.global_slots_const,
-                        dict_name_obj,
-                        uncached_slot,
-                    ],
-                );
+                let dict_callable_inst = fb.ins().call(ctx.load_runtime_obj_ref, &[dict_name_obj]);
                 fb.ins().call(decref_ref, &[dict_name_obj]);
                 let dict_callable = fb.inst_results(dict_callable_inst)[0];
                 let dict_callable_is_null =
@@ -5123,6 +5055,10 @@ fn new_jit_builder() -> Result<JITBuilder, String> {
         .map_err(|err| format!("failed to finish ISA: {err}"))?;
     let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
     builder.symbol("_Py_Dealloc", py_dealloc_symbol());
+    builder.symbol(
+        "_PyDict_IndexedValueTombstone",
+        std::ptr::addr_of_mut!(_PyDict_IndexedValueTombstone).cast::<u8>(),
+    );
     register_specialized_jit_symbols(&mut builder);
     Ok(builder)
 }
@@ -5177,7 +5113,7 @@ fn define_function_with_incremental_cache(
     })
 }
 
-const RUNTIME_SUPPORT_INLINE_MAX_INSTS: usize = 32;
+const RUNTIME_SUPPORT_INLINE_MAX_INSTS: usize = 128;
 
 #[derive(Debug)]
 struct RuntimeSupportInliner {
@@ -5197,6 +5133,8 @@ impl RuntimeSupportInliner {
                     | SOAC_RUNTIME_DECREF_SYMBOL
                     | SOAC_RUNTIME_CALLEE_FUNCTION_ID_SYMBOL
                     | SOAC_RUNTIME_FUNCTION_DATA_BLOCK_SYMBOL
+                    | SOAC_RUNTIME_LOAD_GLOBAL_SYMBOL
+                    | SOAC_RUNTIME_STORE_GLOBAL_SYMBOL
             ) {
                 continue;
             }
@@ -5311,6 +5249,8 @@ pub(crate) const SOAC_RUNTIME_INCREF_SYMBOL: &str = "soac_runtime_incref";
 pub(crate) const SOAC_RUNTIME_DECREF_SYMBOL: &str = "soac_runtime_decref";
 pub(crate) const SOAC_RUNTIME_CALLEE_FUNCTION_ID_SYMBOL: &str = "soac_runtime_callee_function_id";
 pub(crate) const SOAC_RUNTIME_FUNCTION_DATA_BLOCK_SYMBOL: &str = "soac_runtime_function_data_block";
+pub(crate) const SOAC_RUNTIME_LOAD_GLOBAL_SYMBOL: &str = "soac_runtime_load_global";
+pub(crate) const SOAC_RUNTIME_STORE_GLOBAL_SYMBOL: &str = "soac_runtime_store_global";
 
 pub(crate) fn jit_python_perf_symbol_name(kind: &str, qualname: &str) -> String {
     format!("py:{kind}:{qualname}")
@@ -6017,12 +5957,21 @@ fn build_cranelift_run_bb_specialized_function(
             func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_DIRECT_CODE_PTR_IMPORT);
         let direct_vmctx_ref =
             func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_DIRECT_VMCTX_IMPORT);
-        let direct_function_data_ref =
-            func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_DIRECT_FUNCTION_DATA_IMPORT);
-        let enter_recursive_ref =
-            func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_ENTER_RECURSIVE_CALL_IMPORT);
-        let leave_recursive_ref =
-            func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_LEAVE_RECURSIVE_CALL_IMPORT);
+        let direct_function_data_ref = func_imports.get_or_panic(
+            jit_module,
+            &mut fb.func,
+            &DP_JIT_DIRECT_FUNCTION_DATA_IMPORT,
+        );
+        let enter_recursive_ref = func_imports.get_or_panic(
+            jit_module,
+            &mut fb.func,
+            &DP_JIT_ENTER_RECURSIVE_CALL_IMPORT,
+        );
+        let leave_recursive_ref = func_imports.get_or_panic(
+            jit_module,
+            &mut fb.func,
+            &DP_JIT_LEAVE_RECURSIVE_CALL_IMPORT,
+        );
         let pytype_generic_alloc_ref = func_imports.get_or_panic(
             jit_module,
             &mut fb.func,
@@ -6033,8 +5982,8 @@ fn build_cranelift_run_bb_specialized_function(
             &mut fb.func,
             &DP_JIT_FINISH_CONSTRUCTOR_INIT_IMPORT,
         );
-        let load_global_obj_ref =
-            func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_LOAD_GLOBAL_OBJ_IMPORT);
+        let load_global_fast_ref =
+            func_imports.get_or_panic(jit_module, &mut fb.func, &SOAC_RUNTIME_LOAD_GLOBAL_IMPORT);
         let load_runtime_obj_ref =
             func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_LOAD_RUNTIME_OBJ_IMPORT);
         let is_true_ref =
@@ -6056,10 +6005,10 @@ fn build_cranelift_run_bb_specialized_function(
             &mut fb.func,
             &DP_JIT_GUARD_METHOD_TYPE_VERSION_IMPORT,
         );
-        let record_counter_value_ref = func_imports.get_or_panic(
+        let record_top_value_sample_ref = func_imports.get_or_panic(
             jit_module,
             &mut fb.func,
-            &DP_JIT_RECORD_COUNTER_VALUE_IMPORT,
+            &DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT,
         );
         let raise_deleted_name_error_ref = func_imports.get_or_panic(
             jit_module,
@@ -6273,18 +6222,12 @@ fn build_cranelift_run_bb_specialized_function(
                 fb.ins().call(decref_ref, &[*param_value]);
             }
             let block_const = load_vmctx_obj(&mut fb, ptr_ty, vmctx_value, GLOBALS_OBJ_OFFSET);
-            let global_slots_const =
-                load_vmctx_obj(&mut fb, ptr_ty, vmctx_value, GLOBAL_SLOTS_OFFSET);
             let none_const = load_vmctx_obj(&mut fb, ptr_ty, vmctx_value, NONE_OBJ_OFFSET);
             let true_const = load_vmctx_obj(&mut fb, ptr_ty, vmctx_value, TRUE_OBJ_OFFSET);
             let false_const = load_vmctx_obj(&mut fb, ptr_ty, vmctx_value, FALSE_OBJ_OFFSET);
             let deleted_const = load_vmctx_obj(&mut fb, ptr_ty, vmctx_value, DELETED_OBJ_OFFSET);
             let empty_tuple_const =
                 load_vmctx_obj(&mut fb, ptr_ty, vmctx_value, EMPTY_TUPLE_OBJ_OFFSET);
-            let global_load_hit_counter_ptr =
-                lookup_global_runtime_counter_ptr(counter_defs, counter_ptrs, "global_load_hit")?;
-            let global_load_miss_counter_ptr =
-                lookup_global_runtime_counter_ptr(counter_defs, counter_ptrs, "global_load_miss")?;
             let fast_step_null_block =
                 exception_dispatch_blocks[index].unwrap_or(cleanup_null_blocks[index]);
             let fast_step_null_args = Vec::new();
@@ -6316,15 +6259,12 @@ fn build_cranelift_run_bb_specialized_function(
                     deleted_const,
                     empty_tuple_const,
                     block_const,
-                    global_slots_const,
                     py_function_type_ptr: std::ptr::addr_of_mut!(PyFunction_Type),
                     py_method_type_ptr: std::ptr::addr_of_mut!(PyMethod_Type),
                     py_type_type_ptr: std::ptr::addr_of_mut!(PyType_Type),
                     py_long_type_ptr: std::ptr::addr_of_mut!(PyLong_Type),
-                    global_load_hit_counter_ptr,
-                    global_load_miss_counter_ptr,
                 },
-                load_global_obj_ref,
+                load_global_fast_ref,
                 load_runtime_obj_ref,
                 direct_code_ptr_ref,
                 direct_vmctx_ref,
@@ -6342,7 +6282,7 @@ fn build_cranelift_run_bb_specialized_function(
                 py_call_object_ref,
                 py_call_with_kw_ref,
                 guard_method_type_version_ref,
-                record_counter_value_ref,
+                record_top_value_sample_ref,
                 tuple_new_ref,
                 tuple_set_item_ref,
                 stack_slots: stack_slots.clone(),

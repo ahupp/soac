@@ -122,6 +122,15 @@ install-extension build="debug": ensure-venv ensure-cpython
   just uninstall-extension
   ln -sf "$SOURCE_EXT" "$TARGET_EXT"
 
+setup-dev-env: ensure-cpython
+  #!/usr/bin/env bash
+  set -euo pipefail
+  rustup toolchain install nightly
+  rustup component add rustc-codegen-cranelift-preview --toolchain nightly
+  cargo install --locked inferno
+  echo 'Run "apt update && apt install -y gdb"'
+  just update-venv
+
 update-venv: ensure-cpython
   #!/usr/bin/env bash
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -133,12 +142,6 @@ update-venv: ensure-cpython
     VIRTUAL_ENV="$VENV_DIR" PATH="$VENV_DIR/bin:$PATH" \
       uv sync --project "$REPO_ROOT/soac_py" --group dev --frozen --active
   )
-
-setup-dev-env:
-  #!/usr/bin/env bash
-  set -euo pipefail
-  cargo install --locked inferno
-  echo 'Run "apt update && apt install -y gdb"'
 
 build-extension build="debug": ensure-cpython
   #!/usr/bin/env bash
@@ -742,7 +745,7 @@ benchmark-warm loops="8000000": (update-venv) (build-extension "release")
   set -euo pipefail
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
   WARMUP_LOOPS="${WARMUP_LOOPS:-1000}"
-  BENCHMARK_CPU="${BENCHMARK_CPU:-0}"
+  BENCHMARK_CPU="${BENCHMARK_CPU:-}"
   BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS:-0}"
   echo "date: $(date +%F)"
   echo "loops: {{loops}}"
@@ -771,7 +774,7 @@ benchmark loops="8000000": (update-venv) (build-extension "release")
   set -euo pipefail
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
   WARMUP_LOOPS="${WARMUP_LOOPS:-1000}"
-  BENCHMARK_CPU="${BENCHMARK_CPU:-0}"
+  BENCHMARK_CPU="${BENCHMARK_CPU:-}"
   BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS:-0}"
   echo "date: $(date +%F)"
   echo "loops: {{loops}}"

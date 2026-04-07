@@ -12,7 +12,9 @@ For each specialization, this covers:
 
 ## Profiling Input
 
-There are currently two specialization input streams:
+There are currently two hot specialization input streams and one cold
+key-layout metadata stream in the counter dump. The hot streams are
+consumed by the current replay path:
 
 - `call_hot_targets`
   - Instrumented for `Call` expressions with no keywords and only
@@ -34,7 +36,31 @@ There are currently two specialization input streams:
     `collect_operator_specializations_for_function`, at
     `soac-jit/src/counter_dump.rs:789`.
 
-The JIT loads both kinds from `DIET_PYTHON_COUNTERS_FILE` unless an
+The cold metadata stream records dictionary-key layouts for later replay
+passes, but does not currently change emitted code:
+
+- `module_keys`
+  - Recorded when `DIET_PYTHON_KEY_LAYOUT_COUNTERS=1`, or implicitly
+    when `DIET_PYTHON_CALL_TARGET_COUNTERS=1`.
+  - Contains the lowered module global-name table as
+    `(module_name, key, index)` entries.
+  - Consumed from the binary counter dump with
+    `collect_module_key_layouts`, at `soac-jit/src/counter_dump.rs`.
+
+- `type_keys`
+  - Recorded from the vendored CPython split-key insertion watcher for
+    transformed classes created while key-layout profiling is enabled.
+  - Contains `(module.qualname, key, split_keys_index)` entries.
+  - Consumed from the binary counter dump with
+    `collect_type_key_layouts`, at `soac-jit/src/counter_dump.rs`.
+
+Planned use: a later attribute-load/store replay pass can combine
+`type_keys` with profile counts, guard that an object's instance dict
+still uses the expected shared-key layout, and load the value slot by the
+recorded key index. That pass must still provide a normal CPython
+attribute-lookup fallback.
+
+The JIT loads both hot kinds from `DIET_PYTHON_COUNTERS_FILE` unless an
 explicit override env var is present:
 
 - `load_call_target_specializations`, at

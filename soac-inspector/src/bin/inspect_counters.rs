@@ -1,5 +1,6 @@
 use soac_blockpy::block_py::FunctionId;
 use soac_inspector::CounterDumpFile;
+use soac_inspector::CounterDumpKeyLayoutView;
 use soac_inspector::CounterDumpRowView;
 use soac_jit::counter_dump::render_call_target_specializations;
 use std::path::PathBuf;
@@ -78,6 +79,13 @@ fn format_counter_row(row: &CounterDumpRowView<'_>) -> String {
     )
 }
 
+fn format_key_layout_row(kind: &str, row: &CounterDumpKeyLayoutView<'_>) -> String {
+    format!(
+        "  {kind}_key owner={} key={} index={}",
+        row.owner, row.key, row.index
+    )
+}
+
 fn main() -> Result<(), String> {
     let args = parse_args().inspect_err(|_| print_usage())?;
     let dump = CounterDumpFile::open(args.path.as_path())?;
@@ -88,12 +96,22 @@ fn main() -> Result<(), String> {
     }
     for (record_index, record) in records.iter().enumerate() {
         println!(
-            "record={} module={} package={} rows={}",
+            "record={} module={} package={} rows={} module_keys={} type_keys={}",
             record_index,
             record.module_name()?,
             record.package_name()?.unwrap_or("-"),
-            record.row_count()
+            record.row_count(),
+            record.module_key_count(),
+            record.type_key_count()
         );
+        for key_index in 0..record.module_key_count() {
+            let key = record.module_key(key_index)?;
+            println!("{}", format_key_layout_row("module", &key));
+        }
+        for key_index in 0..record.type_key_count() {
+            let key = record.type_key(key_index)?;
+            println!("{}", format_key_layout_row("type", &key));
+        }
         for row_index in 0..record.row_count() {
             let row = record.row(row_index)?;
             println!("{}", format_counter_row(&row));
@@ -203,6 +221,8 @@ mod tests {
         let record = CounterDumpRecord {
             module_name: "mod".to_string(),
             package_name: None,
+            module_keys: Vec::new(),
+            type_keys: Vec::new(),
             rows: vec![
                 CounterDumpRow {
                     counter_id: 1,

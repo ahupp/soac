@@ -1,5 +1,4 @@
 use super::ObjPtr;
-use crate::module_globals::ModuleGlobalCache;
 use crate::module_type::SharedModuleState;
 use pyo3::ffi;
 use std::ffi::c_void;
@@ -38,7 +37,6 @@ pub struct JitModuleVmCtx {
     pub shared_module_state: *const SharedModuleState,
     pub current_exception_slot: ObjPtr,
     pub globals_obj: ObjPtr,
-    pub global_slots: ObjPtr,
     pub true_obj: ObjPtr,
     pub false_obj: ObjPtr,
     pub none_obj: ObjPtr,
@@ -49,7 +47,6 @@ pub struct JitModuleVmCtx {
 pub struct ModuleRuntimeContext {
     pub vmctx: JitModuleVmCtx,
     pub shared_module_state_owner: Arc<SharedModuleState>,
-    pub global_cache_owner: Arc<ModuleGlobalCache>,
 }
 
 pub unsafe fn current_thread_raised_exception_slot() -> ObjPtr {
@@ -85,7 +82,6 @@ impl Drop for ModuleRuntimeContext {
         self.vmctx.shared_module_state = ptr::null();
         self.vmctx.current_exception_slot = ptr::null_mut::<c_void>();
         self.vmctx.globals_obj = ptr::null_mut::<c_void>();
-        self.vmctx.global_slots = ptr::null_mut::<c_void>();
         self.vmctx.true_obj = ptr::null_mut::<c_void>();
         self.vmctx.false_obj = ptr::null_mut::<c_void>();
         self.vmctx.none_obj = ptr::null_mut::<c_void>();
@@ -97,7 +93,6 @@ impl Drop for ModuleRuntimeContext {
 pub const CURRENT_EXCEPTION_SLOT_OFFSET: i32 =
     offset_of!(JitModuleVmCtx, current_exception_slot) as i32;
 pub const GLOBALS_OBJ_OFFSET: i32 = offset_of!(JitModuleVmCtx, globals_obj) as i32;
-pub const GLOBAL_SLOTS_OFFSET: i32 = offset_of!(JitModuleVmCtx, global_slots) as i32;
 pub const TRUE_OBJ_OFFSET: i32 = offset_of!(JitModuleVmCtx, true_obj) as i32;
 pub const FALSE_OBJ_OFFSET: i32 = offset_of!(JitModuleVmCtx, false_obj) as i32;
 pub const NONE_OBJ_OFFSET: i32 = offset_of!(JitModuleVmCtx, none_obj) as i32;

@@ -3,6 +3,7 @@ use pyo3::types::PyModule;
 use soac_blockpy::block_py::FunctionKind;
 use soac_jit::{
     exc_dispatch_plan, jit_param_names_for_block, lookup_blockpy_function,
+    module_type::{hash_module_source, indexed_module_info},
     register_clif_module_plans,
 };
 use std::any::Any;
@@ -254,11 +255,33 @@ fn transformed_module_methods_register_owner_types_for_lookup() {
             .call1(("transformed_owner_lookup_test", py.None()))
             .expect("ModuleSpec should instantiate");
         let source = "class C:\n    def f(self):\n        return 1\n";
+        let source_path = std::env::temp_dir().join(format!(
+            "soac_create_module_test_{}_{}.py",
+            std::process::id(),
+            "owner_lookup"
+        ));
+        std::fs::write(&source_path, source).expect("test source file should be writable");
         let module = ext
             .getattr("create_module")
             .expect("create_module should be exported")
-            .call1((source, &spec))
+            .call1((
+                source_path
+                    .to_str()
+                    .expect("test source path should be utf-8"),
+                &spec,
+            ))
             .expect("transformed module creation should succeed");
+        let module_info = indexed_module_info(module.as_any())
+            .expect("created module should expose SOAC module info");
+        assert_eq!(
+            module_info.hash,
+            hash_module_source(source),
+            "IndexedModuleType tail should store the source hash"
+        );
+        assert!(
+            module_info.indexed_module_keys.iter().any(|key| key == "C"),
+            "IndexedModuleType tail should preserve Rust-owned module-key metadata: {module_info:?}"
+        );
         module
             .getattr("__dict__")
             .expect("module should expose __dict__")

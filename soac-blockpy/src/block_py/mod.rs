@@ -114,6 +114,7 @@ impl CellLocation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NameLocation {
     Local(LocalLocation),
+    GlobalName,
     Global(GlobalSlot),
     RuntimeName,
     Cell(CellLocation),
@@ -127,6 +128,10 @@ impl NameLocation {
 
     pub fn global(slot: u32) -> Self {
         Self::Global(GlobalSlot(slot))
+    }
+
+    pub fn global_name() -> Self {
+        Self::GlobalName
     }
 
     pub fn runtime_name() -> Self {
@@ -152,33 +157,53 @@ impl NameLocation {
     pub fn as_local(self) -> Option<LocalLocation> {
         match self {
             Self::Local(location) => Some(location),
-            Self::Global(_) | Self::RuntimeName | Self::Cell(_) | Self::Constant(_) => None,
+            Self::GlobalName
+            | Self::Global(_)
+            | Self::RuntimeName
+            | Self::Cell(_)
+            | Self::Constant(_) => None,
         }
     }
 
     pub fn as_cell(self) -> Option<CellLocation> {
         match self {
             Self::Cell(location) => Some(location),
-            Self::Local(_) | Self::Global(_) | Self::RuntimeName | Self::Constant(_) => None,
+            Self::Local(_)
+            | Self::GlobalName
+            | Self::Global(_)
+            | Self::RuntimeName
+            | Self::Constant(_) => None,
         }
     }
 
     pub fn as_constant(self) -> Option<u32> {
         match self {
             Self::Constant(index) => Some(index),
-            Self::Local(_) | Self::Global(_) | Self::RuntimeName | Self::Cell(_) => None,
+            Self::Local(_)
+            | Self::GlobalName
+            | Self::Global(_)
+            | Self::RuntimeName
+            | Self::Cell(_) => None,
         }
     }
 
     pub fn as_global(self) -> Option<GlobalSlot> {
         match self {
             Self::Global(slot) => Some(slot),
-            Self::Local(_) | Self::RuntimeName | Self::Cell(_) | Self::Constant(_) => None,
+            Self::Local(_)
+            | Self::GlobalName
+            | Self::RuntimeName
+            | Self::Cell(_)
+            | Self::Constant(_) => None,
         }
     }
 
     pub fn is_global(self) -> bool {
         matches!(self, Self::Global(_))
+    }
+
+    pub fn is_global_name(self) -> bool {
+        matches!(self, Self::GlobalName)
     }
 
     pub fn is_runtime_name(self) -> bool {
@@ -188,6 +213,7 @@ impl NameLocation {
     pub fn pretty_id(self, unresolved_name: &str) -> String {
         match self {
             Self::Local(location) => format!("{location:?}"),
+            Self::GlobalName => format!("{unresolved_name}@global"),
             Self::Global(slot) => format!("{unresolved_name}@g{}", slot.slot()),
             Self::RuntimeName => unresolved_name.to_string(),
             Self::Cell(location) => format!("{location:?}"),

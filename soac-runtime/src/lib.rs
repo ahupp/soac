@@ -70,6 +70,39 @@ struct PyFunctionObject {
 }
 
 #[repr(C)]
+struct PyDictObject {
+    ob_base: PyObject,
+    ma_used: isize,
+    ma_watcher_tag: u64,
+    ma_keys: *mut PyDictKeysObject,
+    ma_values: *mut PyDictIndexedValues,
+}
+
+#[repr(C)]
+struct PyDictKeysObject {
+    dk_refcnt: isize,
+    dk_log2_size: u8,
+    dk_log2_index_bytes: u8,
+    dk_kind: u8,
+    dk_version: u32,
+    dk_usable: isize,
+    dk_nentries: isize,
+}
+
+#[repr(C)]
+struct PyDictUnicodeEntry {
+    me_key: *mut PyObject,
+    me_value: *mut PyObject,
+}
+
+#[repr(C)]
+struct PyDictIndexedValues {
+    capacity: isize,
+    order_size: isize,
+    values: [*mut PyObject; 1],
+}
+
+#[repr(C)]
 struct PyMethodObject {
     ob_base: PyObject,
     im_func: *mut PyObject,
@@ -85,8 +118,32 @@ struct ClifFunctionData {
 
 unsafe extern "C" {
     fn _Py_Dealloc(obj: *mut PyObject);
+    fn soac_runtime_load_global_slow(
+        dict: *mut c_void,
+        key: *mut c_void,
+        index: isize,
+    ) -> *mut c_void;
+    fn dp_jit_store_global(
+        globals_obj: *mut c_void,
+        name: *mut c_void,
+        slot_index: i64,
+        value: *mut c_void,
+    ) -> *mut c_void;
     static mut PyFunction_Type: c_void;
     static mut PyMethod_Type: c_void;
+    static mut _PyDict_IndexedValueTombstone: c_void;
+}
+
+#[inline(always)]
+unsafe fn dict_unicode_entries(keys: *mut PyDictKeysObject) -> *mut PyDictUnicodeEntry {
+    let indices = unsafe { keys.cast::<u8>().add(core::mem::size_of::<PyDictKeysObject>()) };
+    let entries = unsafe { indices.add(1usize << (*keys).dk_log2_index_bytes) };
+    entries.cast::<PyDictUnicodeEntry>()
+}
+
+#[inline(always)]
+unsafe fn indexed_key(keys: *mut PyDictKeysObject, index: isize) -> *mut PyObject {
+    unsafe { (*dict_unicode_entries(keys).offset(index)).me_key }
 }
 
 #[inline(always)]
@@ -169,6 +226,80 @@ pub unsafe extern "C" fn soac_runtime_incref(obj: *mut c_void) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soac_runtime_decref(obj: *mut c_void) {
     unsafe { decref_impl(obj.cast::<PyObject>()) };
+}
+
+#[inline(always)]
+unsafe fn dict_guarded_index(
+    dict: *mut PyDictObject,
+    key: *mut PyObject,
+    index: isize,
+) -> i64 {
+    let values = unsafe { (*dict).ma_values };
+    if !values.is_null() && unsafe { index < (*values).capacity } {
+        debug_assert!(unsafe { index < (*values).capacity });
+        let slot_key = unsafe { indexed_key((*dict).ma_keys, index) };
+        if slot_key == key {
+            return index as i64;
+        }
+    }
+    -1
+}
+
+#[inline(always)]
+unsafe fn indexed_value(values: *mut PyDictIndexedValues, index: isize) -> *mut PyObject {
+    let values_ptr = unsafe { (&raw const (*values).values).cast::<*mut PyObject>() };
+    unsafe { *values_ptr.offset(index) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soac_runtime_load_global(
+    dict: *mut c_void,
+    key: *mut c_void,
+    index: isize,
+) -> *mut c_void {
+    let dict = dict.cast::<PyDictObject>();
+    let key = key.cast::<PyObject>();
+    debug_assert!(!dict.is_null());
+    debug_assert!(!key.is_null());
+    debug_assert!(index >= 0);
+
+    if unsafe { dict_guarded_index(dict, key, index) } >= 0 {
+        let values = unsafe { (*dict).ma_values };
+        let value = unsafe { indexed_value(values, index) };
+        if !value.is_null()
+            && value.cast::<c_void>() != (&raw mut _PyDict_IndexedValueTombstone)
+        {
+            unsafe { incref_impl(value) };
+            return value.cast::<c_void>();
+        }
+    }
+
+    unsafe { soac_runtime_load_global_slow(dict.cast::<c_void>(), key.cast::<c_void>(), index) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soac_runtime_store_global(
+    dict: *mut c_void,
+    key: *mut c_void,
+    index: isize,
+    value: *mut c_void,
+) -> *mut c_void {
+    let dict = dict.cast::<PyDictObject>();
+    let key = key.cast::<PyObject>();
+    debug_assert!(!dict.is_null());
+    debug_assert!(!key.is_null());
+    debug_assert!(!value.is_null());
+    debug_assert!(index >= 0);
+
+    let guarded_index = unsafe { dict_guarded_index(dict, key, index) };
+    unsafe {
+        dp_jit_store_global(
+            dict.cast::<c_void>(),
+            key.cast::<c_void>(),
+            guarded_index,
+            value,
+        )
+    }
 }
 
 #[unsafe(no_mangle)]

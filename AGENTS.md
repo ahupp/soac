@@ -57,6 +57,12 @@ because it should affect engineering decisions:
    global structure and then all consumers take that structure rather
    than directly accessing the global.
 
+7. Keep SOAC metadata explicit across CPython callback boundaries.
+   Do not smuggle compiler/runtime state through temporary Python
+   attributes or thread-local context just to reach a fixed-signature
+   CPython hook; prefer an explicit post-create/post-callback init step
+   or a clearly-owned Rust state object.
+
 ## THE DEVELOPMENT LOOP
 
 When I submit a request, if it's a simple, fully-specific or
@@ -100,6 +106,9 @@ current `@`. Do not treat another workspace's live `@` as a dependency.
 5. Add focused regression coverage for real bugs.
    If fixing a CPython regression, add a minimal reproducing integration test first.
    If diagnosing a hang, add follow-up instrumentation where practical and leave behind a focused regression or assertion for that hang shape.
+   Avoid render-only tests for BlockPy/CLIF/inspector text. Prefer behavior,
+   structure, or API tests; exact renderer output changes too often to be a
+   useful default regression surface.
 
 6. Avoid render-as-behavior tests.
 
@@ -201,18 +210,23 @@ instance's live working commit.
 - `BENCHMARK_CPU` / `BENCHMARK_CONSTANT_CLOCKS`
   The benchmark recipes use
   [scripts/run_benchmark_with_cpu_mode.sh](/home/adam/project/soac-profile/scripts/run_benchmark_with_cpu_mode.sh)
-  to pin runs to a specific CPU. The benchmark recipes default to
-  `BENCHMARK_CONSTANT_CLOCKS=0`; use `BENCHMARK_CONSTANT_CLOCKS=1` to
-  request steadier clocks by temporarily changing `cpufreq` settings.
-  That opt-in path uses `sudo` when direct writes are not permitted. If
-  you add or change benchmark-stability knobs, document them in
-  `README.md` and in this appendix note.
+  for optional CPU pinning and optional constant-clock mode. By default
+  benchmarks are not CPU-pinned and do not change `cpufreq`; set
+  `BENCHMARK_CPU=<cpu>` to pin with `taskset`, and set
+  `BENCHMARK_CONSTANT_CLOCKS=1` only when you explicitly want the wrapper
+  to request steadier clocks. If you add or change benchmark-stability
+  knobs, document them in `README.md` and in this appendix note.
 - `PERF_CALL_GRAPH`
   The perf profiling recipes default to `PERF_CALL_GRAPH=dwarf,65528`
   rather than a shallower stack dump, because the larger DWARF capture
   materially reduces truncated mixed JIT/CPython stacks in the exported
   profiles. If you change that default or add related perf-stack knobs,
   document them in `README.md` and in this appendix note.
+- `DIET_PYTHON_KEY_LAYOUT_COUNTERS`
+  Enables cold module/type key-layout records in the counter dump. This
+  is metadata collection, not a hot increment counter: module keys are
+  copied from lowered module globals, and type keys are collected through
+  the vendored CPython split-key watcher.
 
 ### CPython-specific notes
 

@@ -86,19 +86,26 @@ restore_cpufreq_state() {
   fi
 }
 
-CPU="${BENCHMARK_CPU:-0}"
-CPU_DIR="/sys/devices/system/cpu/cpu${CPU}/cpufreq"
-if [[ ! -d "$CPU_DIR" ]]; then
-  echo "benchmark cpu ${CPU} does not expose cpufreq controls at $CPU_DIR" >&2
-  exit 1
-fi
+CPU="${BENCHMARK_CPU:-}"
+if [[ -n "$CPU" ]]; then
+  CPU_DIR="/sys/devices/system/cpu/cpu${CPU}/cpufreq"
+  if [[ ! -d "$CPU_DIR" ]]; then
+    echo "benchmark cpu ${CPU} does not expose cpufreq controls at $CPU_DIR" >&2
+    exit 1
+  fi
 
-if ! command -v taskset >/dev/null 2>&1; then
-  echo "taskset is required for benchmark cpu pinning" >&2
-  exit 1
+  if ! command -v taskset >/dev/null 2>&1; then
+    echo "taskset is required for benchmark cpu pinning" >&2
+    exit 1
+  fi
 fi
 
 if env_flag_enabled BENCHMARK_CONSTANT_CLOCKS; then
+  if [[ -z "$CPU" ]]; then
+    echo "benchmark constant-clock mode requires BENCHMARK_CPU=<cpu>; rerun with BENCHMARK_CONSTANT_CLOCKS=0 or set BENCHMARK_CPU" >&2
+    exit 1
+  fi
+
   if [[ ! -r "$CPU_DIR/related_cpus" ]]; then
     echo "benchmark constant-clock mode needs readable related_cpus at $CPU_DIR/related_cpus" >&2
     exit 1
@@ -150,4 +157,8 @@ if env_flag_enabled BENCHMARK_CONSTANT_CLOCKS; then
   done
 fi
 
-taskset -c "$CPU" "$@"
+if [[ -n "$CPU" ]]; then
+  taskset -c "$CPU" "$@"
+else
+  "$@"
+fi

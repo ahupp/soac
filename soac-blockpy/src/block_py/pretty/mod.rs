@@ -1,6 +1,6 @@
 use super::{
     Block, BlockArg, BlockEdge, BlockLabel, BlockParamRole, BlockPyFunction, BlockPyModule,
-    ModuleShape, BlockTerm, FunctionKind, Instr, TermIf, TermRaise,
+    BlockTerm, FunctionKind, Instr, ModuleShape, TermIf, TermRaise,
 };
 use crate::block_py::param_specs::{ParamKind, ParamSpec};
 use crate::passes::{
@@ -115,15 +115,6 @@ where
     let mut formatter = BlockPyFormatter::<DebugInlineExprRenderer>::default();
     formatter.write_module(module);
     formatter.finish()
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn blockpy_module_to_debug_string<P>(module: &BlockPyModule<P>) -> String
-where
-    P: BlockPyPrettyPrinter,
-    P::Instr: fmt::Debug,
-{
-    blockpy_module_to_string(module)
 }
 
 trait InlineExprRenderer<E> {
@@ -443,13 +434,6 @@ fn function_kind_name(kind: FunctionKind) -> &'static str {
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn bb_expr_text<N: fmt::Debug>(expr: &N) -> String {
     format!("{expr:?}")
-}
-
-#[cfg(test)]
-pub(crate) fn core_bb_stmt_text<N: crate::block_py::NameLike>(
-    stmt: &crate::block_py::InstrLow<N>,
-) -> String {
-    bb_expr_text(stmt)
 }
 
 #[cfg(test)]
@@ -926,6 +910,3 @@ fn collect_referenced_labels_from_term(
         BlockTerm::Raise(_) | BlockTerm::Return(_) => {}
     }
 }
-
-#[cfg(test)]
-mod test;

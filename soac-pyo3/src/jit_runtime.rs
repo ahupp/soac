@@ -1,7 +1,7 @@
 use crate::lowering_error_to_pyerr;
 use log::info;
 use pyo3::exceptions::{
-    PyAttributeError, PyNotImplementedError, PyRuntimeError, PyTypeError, PyValueError,
+    PyAttributeError, PyNotImplementedError, PyOSError, PyRuntimeError, PyTypeError, PyValueError,
 };
 use pyo3::ffi;
 use pyo3::prelude::*;
@@ -10,7 +10,8 @@ use soac_blockpy::block_py::{BlockPyFunction, BlockPyModule, FunctionId, Functio
 use soac_blockpy::lower_python_to_blockpy;
 use soac_blockpy::pass_tracker::NoopPassTracker;
 use soac_blockpy::passes::CodegenModuleShape;
-use soac_jit::module_type::SoacExtModule;
+use soac_jit::module_type::{ModuleInfo, SoacExtModule, hash_module_source};
+use std::fs;
 use std::time::Instant;
 
 unsafe extern "C" {
@@ -24,6 +25,23 @@ fn is_cell_object(obj: *mut ffi::PyObject) -> bool {
 
 fn import_dp_module<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyModule>> {
     PyModule::import(py, "soac.runtime")
+}
+
+fn tuple_from_owned_objects<'py>(
+    py: Python<'py>,
+    objects: Vec<Py<PyAny>>,
+) -> PyResult<Bound<'py, PyTuple>> {
+    let tuple = unsafe { ffi::PyTuple_New(objects.len() as ffi::Py_ssize_t) };
+    let tuple = unsafe { Bound::from_owned_ptr_or_err(py, tuple)? }.cast_into::<PyTuple>()?;
+    for (index, object) in objects.into_iter().enumerate() {
+        if unsafe {
+            ffi::PyTuple_SetItem(tuple.as_ptr(), index as ffi::Py_ssize_t, object.into_ptr())
+        } != 0
+        {
+            return Err(PyErr::fetch(py));
+        }
+    }
+    Ok(tuple)
 }
 
 pub(crate) fn register_lowered_module_plans<P>(
@@ -384,7 +402,7 @@ fn split_param_defaults<'py>(
     let positional_defaults = if positional_defaults.is_empty() {
         None
     } else {
-        Some(PyTuple::new(py, positional_defaults)?)
+        Some(tuple_from_owned_objects(py, positional_defaults)?)
     };
     let kwdefaults = if kwdefaults.is_empty() {
         None
@@ -446,7 +464,7 @@ fn build_bb_signature<'py>(
             "bb param defaults payload is longer than the param spec",
         ));
     }
-    let signature_obj = signature.call1((PyTuple::new(py, signature_params)?,))?;
+    let signature_obj = signature.call1((tuple_from_owned_objects(py, signature_params)?,))?;
     Ok(signature_obj.unbind())
 }
 
@@ -491,7 +509,7 @@ fn build_closure_shaped_entry<'py>(
             closure_cells.push(unsafe { Bound::from_owned_ptr(py, cell) }.unbind());
         }
     }
-    let closure = PyTuple::new(py, closure_cells)?;
+    let closure = tuple_from_owned_objects(py, closure_cells)?;
     let qualname = PyString::new(py, qualname);
     let func = unsafe {
         let ptr = ffi::PyFunction_NewWithQualName(
@@ -649,12 +667,23 @@ fn make_bb_function(
 }
 
 #[pyfunction]
-fn create_module(py: Python<'_>, source: &str, spec: Py<PyAny>) -> PyResult<Py<PyAny>> {
+fn create_module(py: Python<'_>, path: &str, spec: Py<PyAny>) -> PyResult<Py<PyAny>> {
+    let source = fs::read_to_string(path)
+        .map_err(|err| PyOSError::new_err(format!("could not read source for {path}: {err}")))?;
+    let module_info = ModuleInfo {
+        hash: hash_module_source(&source),
+        indexed_module_keys: Vec::new(),
+    };
     let session = soac_jit::CompileSession::new();
     let output: soac_blockpy::LoweringResult<NoopPassTracker> =
-        lower_python_to_blockpy(source, session.module_name_gen())
+        lower_python_to_blockpy(&source, session.module_name_gen())
             .map_err(lowering_error_to_pyerr)?;
-    SoacExtModule::new(py, spec.bind(py).as_any(), output.codegen_module)
+    SoacExtModule::new(
+        py,
+        spec.bind(py).as_any(),
+        output.codegen_module,
+        module_info,
+    )
 }
 
 fn ensure_module_builtins(globals: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -741,9 +770,23 @@ fn exec_module(py: Python<'_>, module: Py<PyAny>) -> PyResult<()> {
     })
 }
 
+#[pyfunction]
+fn profile_watch_type_key_layout(type_obj: &Bound<'_, PyAny>) -> PyResult<()> {
+    unsafe { soac_jit::module_type::watch_split_keys_for_type(type_obj.as_ptr()) }.map_err(|_| {
+        Python::attach(|py| {
+            if unsafe { ffi::PyErr_Occurred() }.is_null() {
+                PyRuntimeError::new_err("failed to watch type split-key layout")
+            } else {
+                PyErr::fetch(py)
+            }
+        })
+    })
+}
+
 pub(crate) fn add_module_functions(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(create_module, module)?)?;
     module.add_function(wrap_pyfunction!(exec_module, module)?)?;
     module.add_function(wrap_pyfunction!(make_bb_function, module)?)?;
+    module.add_function(wrap_pyfunction!(profile_watch_type_key_layout, module)?)?;
     Ok(())
 }

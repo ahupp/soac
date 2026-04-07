@@ -1,6 +1,6 @@
 use super::{
-    ImportSpec, JitEmitCtx, SigType, emit_increment_counter_ptr,
-    emit_owned_module_constant_from_parts,
+    ImportSpec, JitEmitCtx, SOAC_RUNTIME_LOAD_GLOBAL_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_IMPORT,
+    SigType, emit_increment_counter_ptr, emit_owned_module_constant_from_parts,
 };
 use crate::jit::blockpy_intrinsics;
 use crate::operator_specialization::{
@@ -227,30 +227,9 @@ define_owned_import_spec!(
     &[SigType::Pointer, SigType::Pointer]
 );
 define_owned_import_spec!(
-    DP_JIT_LOAD_GLOBAL_OBJ_IMPORT,
-    "dp_jit_load_global_obj",
-    &[
-        SigType::Pointer,
-        SigType::Pointer,
-        SigType::Pointer,
-        SigType::Pointer,
-        SigType::I64,
-    ]
-);
-define_owned_import_spec!(
     DP_JIT_LOAD_RUNTIME_OBJ_IMPORT,
     "dp_jit_load_runtime_obj",
     &[SigType::Pointer]
-);
-define_owned_import_spec!(
-    DP_JIT_STORE_GLOBAL_IMPORT,
-    "dp_jit_store_global",
-    &[
-        SigType::Pointer,
-        SigType::Pointer,
-        SigType::I64,
-        SigType::Pointer
-    ]
 );
 define_owned_import_spec!(
     DP_JIT_DEL_GLOBAL_IMPORT,
@@ -694,7 +673,7 @@ fn emit_specialized_binop<'fb>(
     let ptr_ty = state.ctx().consts.ptr_ty;
     let i64_ty = state.ctx().consts.i64_ty;
     let vmctx_value = state.ctx().consts.vmctx_value;
-    let record_counter_value_ref = state.ctx().record_counter_value_ref;
+    let record_top_value_sample_ref = state.ctx().record_top_value_sample_ref;
     let counter_id = state
         .ctx()
         .operator_shape_counter_ids
@@ -729,7 +708,7 @@ fn emit_specialized_binop<'fb>(
     if let Some(counter_id) = counter_id {
         let counter_id_value = state.fb().ins().iconst(i64_ty, counter_id.0 as i64);
         state.fb().ins().call(
-            record_counter_value_ref,
+            record_top_value_sample_ref,
             &[vmctx_value, counter_id_value, shape],
         );
     }
@@ -792,7 +771,7 @@ fn emit_specialized_unary_op<'fb>(
     let ptr_ty = state.ctx().consts.ptr_ty;
     let i64_ty = state.ctx().consts.i64_ty;
     let vmctx_value = state.ctx().consts.vmctx_value;
-    let record_counter_value_ref = state.ctx().record_counter_value_ref;
+    let record_top_value_sample_ref = state.ctx().record_top_value_sample_ref;
     let counter_id = state
         .ctx()
         .operator_shape_counter_ids
@@ -827,7 +806,7 @@ fn emit_specialized_unary_op<'fb>(
     if let Some(counter_id) = counter_id {
         let counter_id_value = state.fb().ins().iconst(i64_ty, counter_id.0 as i64);
         state.fb().ins().call(
-            record_counter_value_ref,
+            record_top_value_sample_ref,
             &[vmctx_value, counter_id_value, shape],
         );
     }
@@ -884,52 +863,20 @@ fn emit_load<'fb>(
     state: &mut impl OperationEmitState<'fb, InstrCodegen>,
 ) -> ir::Value {
     let func_ref = match op.name.location {
-        NameLocation::Global(_) => state.import_func(&DP_JIT_LOAD_GLOBAL_OBJ_IMPORT),
+        NameLocation::Global(_) => state.import_func(&SOAC_RUNTIME_LOAD_GLOBAL_IMPORT),
         NameLocation::RuntimeName => state.import_func(&DP_JIT_LOAD_RUNTIME_OBJ_IMPORT),
         _ => unreachable!("emit_load only applies to global and runtime helper names"),
     };
     let decref_ref = state.ctx().decref_ref;
-    let incref_ref = state.ctx().incref_ref;
     let result = match op.name.location {
         NameLocation::Global(slot) => {
             let globals_obj = state.ctx().consts.block_const;
-            let global_slots = state.ctx().consts.global_slots_const;
             let ptr_ty = state.ctx().consts.ptr_ty;
-            let slot_offset = i64::from(slot.slot()) * i64::from(ptr_ty.bytes());
-            let slot_addr = state.fb().ins().iadd_imm(global_slots, slot_offset);
-            let cached = state
-                .fb()
-                .ins()
-                .load(ptr_ty, ir::MemFlags::trusted(), slot_addr, 0);
+            let step_null_block = state.ctx().consts.step_null_block;
+            let step_null_args = super::step_null_block_args(state.ctx());
             let null_ptr = state.fb().ins().iconst(ptr_ty, 0);
-            let cached_is_null =
-                state
-                    .fb()
-                    .ins()
-                    .icmp(ir::condcodes::IntCC::Equal, cached, null_ptr);
-            let cached_hit_block = state.fb().create_block();
-            let slowpath_block = state.fb().create_block();
             let value_ok_block = state.fb().create_block();
             state.fb().append_block_param(value_ok_block, ptr_ty);
-            state
-                .fb()
-                .ins()
-                .brif(cached_is_null, slowpath_block, &[], cached_hit_block, &[]);
-
-            state.fb().switch_to_block(cached_hit_block);
-            if let Some(counter_ptr) = state.ctx().consts.global_load_hit_counter_ptr {
-                emit_increment_counter_ptr(state.fb(), ptr_ty, counter_ptr);
-            }
-            state.fb().ins().call(incref_ref, &[cached]);
-            state
-                .fb()
-                .ins()
-                .jump(value_ok_block, &[ir::BlockArg::Value(cached)]);
-
-            state.fb().switch_to_block(slowpath_block);
-            if let Some(counter_ptr) = state.ctx().consts.global_load_miss_counter_ptr {
-                emit_increment_counter_ptr(state.fb(), ptr_ty, counter_ptr);
-            }
             let name_obj = state.emit_owned_string_constant(op.name.id_str());
             let slot_index = state
                 .fb()
@@ -938,9 +885,25 @@ fn emit_load<'fb>(
             let call_inst = state
                 .fb()
                 .ins()
-                .call(func_ref, &[globals_obj, global_slots, name_obj, slot_index]);
+                .call(func_ref, &[globals_obj, name_obj, slot_index]);
             state.fb().ins().call(decref_ref, &[name_obj]);
             let slow_value = state.fb().inst_results(call_inst)[0];
+            let slow_value_is_null =
+                state
+                    .fb()
+                    .ins()
+                    .icmp(ir::condcodes::IntCC::Equal, slow_value, null_ptr);
+            let slow_value_ok = state.fb().create_block();
+            state.fb().append_block_param(slow_value_ok, ptr_ty);
+            state.fb().ins().brif(
+                slow_value_is_null,
+                step_null_block,
+                &step_null_args,
+                slow_value_ok,
+                &[ir::BlockArg::Value(slow_value)],
+            );
+            state.fb().switch_to_block(slow_value_ok);
+            let slow_value = state.fb().block_params(slow_value_ok)[0];
             state
                 .fb()
                 .ins()
@@ -966,7 +929,7 @@ fn emit_store<'fb>(
 ) -> ir::Value {
     let arg_values = state.emit_arg_values(&[&op.value]);
     let name_obj = state.emit_owned_string_constant(op.name.id_str());
-    let func_ref = state.import_func(&DP_JIT_STORE_GLOBAL_IMPORT);
+    let func_ref = state.import_func(&SOAC_RUNTIME_STORE_GLOBAL_IMPORT);
     let decref_ref = state.ctx().decref_ref;
     let globals_obj = state.ctx().consts.block_const;
     let slot_index = match op.name.location {

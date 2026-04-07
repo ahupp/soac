@@ -8,6 +8,21 @@ outputs with:
 cargo run --bin regen_snapshots
 ```
 
+# Development Environment
+
+Install the Python-side venv and the nightly Rust codegen backend used by
+`soac-jit`:
+
+```
+just setup-dev-env
+```
+
+# CLIF
+
+```
+$ ./rust-clif-dist/rustc-clif --out-dir=clif-out/ --crate-type=rlib fastadd.rs -Cdebuginfo=0 --emit link,llvm-ir
+```
+
 # Log
 
 2026-01-15:
@@ -153,6 +168,21 @@ changes:
   - specialized transformed is about 0.341x stock
   - stock CPython is about 2.93x faster
 
+2026-04-07: new baseline on VM
+  profile pass:      118,016 loops/s
+  specialized pass:  201,970 loops/s
+  stock CPython:     620,991 loops/s
+  hot callsites:     22
+
+  Specialized baseline is ~32.5% of stock.
+
+# Design
+
+Dropping to basic block format:
+
+ - gave control over name binding for functions
+ - significantly improved fidelity to flow control, made generators easier, and reduced JIT surface area
+
 
 # Principles
 
@@ -258,6 +288,16 @@ exports are intentionally omitted here.
   [soac-blockpy/src/passes/trace/mod.rs:19](/home/adam/project/soac-profile/soac-blockpy/src/passes/trace/mod.rs#L19),
   enable global-load profiling counters.
 
+- `DIET_PYTHON_KEY_LAYOUT_COUNTERS=1`
+  In `fn key_layout_counter_enabled`, at
+  [soac-jit/src/module_type.rs](/home/adam/project/soac-profile/soac-jit/src/module_type.rs),
+  record cold key-layout metadata into the counter dump. Module-key
+  entries come from the lowered module global-name table; type-key
+  entries come from CPython split-key insertion watcher events. This is
+  enabled automatically in call-target counter profiling mode; set this
+  environment variable when you want key-layout metadata without
+  call-target probes.
+
 - `DIET_PYTHON_COUNTERS_OUTPUT_FILE=/path/to/dump.bin`
   In `fn counter_dump_file_from_env`, at
   [soac-jit/src/module_type.rs:570](/home/adam/project/soac-profile/soac-jit/src/module_type.rs#L570),
@@ -319,9 +359,8 @@ Notes:
 - `BENCHMARK_CPU=<int>`
   In [scripts/run_benchmark_with_cpu_mode.sh](/home/adam/project/soac-profile/scripts/run_benchmark_with_cpu_mode.sh),
   choose the CPU core that the benchmark recipes pin to with `taskset`.
-  The default is `0`. Pinning all benchmark phases to one core reduces
-  scheduler and heterogeneous-core variance without requiring privileged
-  clock controls.
+  The default is empty, which runs without CPU pinning. Set an explicit
+  CPU core when you want lower scheduler or heterogeneous-core variance.
 
 - `BENCHMARK_CONSTANT_CLOCKS=0|1`
   In [scripts/run_benchmark_with_cpu_mode.sh](/home/adam/project/soac-profile/scripts/run_benchmark_with_cpu_mode.sh),
@@ -374,7 +413,7 @@ Notes:
 - `DIET_PYTHON_CPUSET=<cpuset>`
   In [scripts/run_with_limits.sh](/home/adam/project/soac-profile/scripts/run_with_limits.sh),
   restrict a limit-wrapper run to a Linux cpuset such as `0-7`. An empty
-  value disables CPU pinning.
+  value disables CPU pinning and is the default.
 
 - `DIET_PYTHON_SYSTEMD_RUNTIME_DIR=/run/user/<uid>`
   In [scripts/run_with_limits.sh](/home/adam/project/soac-profile/scripts/run_with_limits.sh),

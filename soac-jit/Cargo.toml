@@ -22,6 +22,7 @@ cranelift-reader = "0.125"
 gimli = "0.32"
 libc = "0.2"
 memmap2 = "0.9"
+rkyv = { version = "0.8", features = ["alloc"] }
 
 [build-dependencies]
 pyo3-build-config = { git = "https://github.com/PyO3/pyo3", branch = "main", features = ["resolve-config"] }

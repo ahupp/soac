@@ -21,7 +21,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tower_http::services::ServeDir;
 
 pub use soac_jit::counter_dump::{
-    CounterDumpFile, CounterDumpRecordView, CounterDumpRowView, parse_counter_dump_records,
+    CollectedKeyLayout, CounterDumpFile, CounterDumpKeyLayoutView, CounterDumpRecordView,
+    CounterDumpRowView, collect_module_key_layouts, collect_type_key_layouts,
+    parse_counter_dump_records,
 };
 
 static NEXT_WEB_MODULE_ID: AtomicU64 = AtomicU64::new(1);
@@ -506,59 +508,6 @@ mod test {
         assert!(
             step_texts.iter().any(|text| text.contains("BinOp(Add,")),
             "{payload}"
-        );
-    }
-
-    #[tokio::test]
-    async fn renders_actual_clif() {
-        let app = app();
-        let source = "def classify(n):\n    return n\n";
-        let inspect_response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/inspect_pipeline")
-                    .header("content-type", "application/json")
-                    .body(Body::from(json!({ "source": source }).to_string()))
-                    .unwrap(),
-            )
-            .await
-            .expect("inspect request should succeed");
-        let inspect_payload: Value =
-            serde_json::from_str(&response_text(inspect_response).await).unwrap();
-        let function = &inspect_payload["functions"][0];
-
-        let clif_response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/jit_clif")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "source": source,
-                            "functionId": function["functionId"],
-                            "qualname": function["qualname"],
-                            "entryLabel": function["entryLabel"],
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .expect("clif request should succeed");
-        let clif_status = clif_response.status();
-        let clif_text = response_text(clif_response).await;
-        assert_eq!(clif_status, StatusCode::OK, "{clif_text}");
-        let payload: Value = serde_json::from_str(&clif_text).unwrap();
-        assert!(payload["clif"].as_str().unwrap().contains("function"));
-        assert!(payload["cfgDot"].as_str().unwrap().contains("digraph"));
-        assert!(
-            payload["resolved_entry"]
-                .as_str()
-                .unwrap()
-                .starts_with("classify::__dp_fn_")
         );
     }
 

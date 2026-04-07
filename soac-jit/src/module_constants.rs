@@ -341,7 +341,7 @@ pub(crate) unsafe fn load_runtime_name_owned(name_obj: *mut ffi::PyObject) -> *m
     ffi::PyErr_Clear();
     let is_builtins_name = {
         let name_utf8 = ffi::PyUnicode_AsUTF8(name_obj);
-        !name_utf8.is_null() && unsafe { CStr::from_ptr(name_utf8) }.to_bytes() == b"builtins"
+        !name_utf8.is_null() && CStr::from_ptr(name_utf8).to_bytes() == b"builtins"
     };
     if is_builtins_name {
         return ffi::PyImport_ImportModule(c"builtins".as_ptr());
