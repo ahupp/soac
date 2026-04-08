@@ -538,7 +538,6 @@ fn emit_specialized_setattr<'fb>(
     let ptr_ty = state.ctx().consts.ptr_ty;
     let i64_ty = state.ctx().consts.i64_ty;
     let i32_ty = state.ctx().consts.i32_ty;
-    let null_ptr = state.fb().ins().iconst(ptr_ty, 0);
     let zero_i32 = state.fb().ins().iconst(i32_ty, 0);
     let owner_type = state
         .fb()
@@ -569,7 +568,6 @@ fn emit_specialized_setattr<'fb>(
     state.fb().append_block_param(result_block, ptr_ty);
     let maybe_direct_block = state.fb().create_block();
     let direct_block = state.fb().create_block();
-    state.fb().append_block_param(direct_block, ptr_ty);
     let fallback_block = state.fb().create_block();
 
     let guard_inst = state.fb().ins().call(
@@ -597,27 +595,24 @@ fn emit_specialized_setattr<'fb>(
             arg_values[2].0,
         ],
     );
-    let direct_value = state.fb().inst_results(direct_inst)[0];
-    let direct_is_null =
+    let direct_result = state.fb().inst_results(direct_inst)[0];
+    let direct_missed =
         state
             .fb()
             .ins()
-            .icmp(ir::condcodes::IntCC::Equal, direct_value, null_ptr);
+            .icmp(ir::condcodes::IntCC::Equal, direct_result, zero_i32);
     state.fb().ins().brif(
-        direct_is_null,
+        direct_missed,
         fallback_block,
         &[],
         direct_block,
-        &[ir::BlockArg::Value(direct_value)],
+        &[],
     );
 
     state.fb().switch_to_block(direct_block);
-    let direct_value = state.fb().block_params(direct_block)[0];
     increment_counter_ptr_with_state(state, hit_counter_ptr);
     let none_const = state.ctx().consts.none_const;
     let incref_ref = state.ctx().incref_ref;
-    let decref_ref = state.ctx().decref_ref;
-    state.fb().ins().call(decref_ref, &[direct_value]);
     state.fb().ins().call(incref_ref, &[none_const]);
     state.release_arg_values(&arg_values);
     state

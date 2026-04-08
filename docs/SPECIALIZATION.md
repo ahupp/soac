@@ -145,25 +145,28 @@ override env var is present:
 
 - Constant-string `GetAttr` sites with a recorded key index get a
   guard on exact owner type and owner type version.
-- After that guard, the local-runtime helper fetches the instance dict,
-  checks that it is still a CPython split dict with the expected key at
-  the recorded index, and returns an owned reference to the value slot.
-- Missing values, promoted/combined dicts, key-index mismatch, type
-  guard miss, or type-version miss increment the fallback counter when
-  enabled and execute normal CPython attribute lookup.
+- After that guard, the inlineable local-runtime helper checks the
+  currently attached split dict, or the object's CPython inline-values
+  block when no dict has been materialized, for the expected key at the
+  recorded index. Loads return an owned reference to the value slot.
+- Missing values, invalidated inline-values blocks, promoted/combined
+  dicts, key-index mismatch, type guard miss, or type-version miss
+  increment the fallback counter when enabled and execute normal CPython
+  attribute lookup.
 - `SetAttr` sites use generic attribute set by default.
 - When `DIET_PYTHON_UNSOUND_INDEXED_STORES=1`, constant-string `SetAttr`
   sites with a recorded key index get the same exact-owner/version guard
-  and then perform a raw overwrite of an existing split-dict value slot.
+  and then perform a raw overwrite of an existing split-dict or
+  inline-values slot.
 
 ### Limitations / Soundness / Extensions
 
 - The owner guard is exact-type today; it is sound but does not yet keep
   base-class field fast paths active on subclasses.
 - Direct field stores are opt-in/unsound. First insert, missing value,
-  promoted dict, and key-index mismatch still fall back; an existing
-  value slot may be overwritten without CPython bookkeeping only when
-  `DIET_PYTHON_UNSOUND_INDEXED_STORES=1`.
+  invalid inline values, promoted dict, and key-index mismatch still
+  fall back; an existing value slot may be overwritten without CPython
+  bookkeeping only when `DIET_PYTHON_UNSOUND_INDEXED_STORES=1`.
 - Class attributes and descriptors are excluded by compile-time owner
   inspection. Runtime type-version guards are the fallback if a later
   class mutation invalidates that inspection.
@@ -234,8 +237,8 @@ override env var is present:
   `soac-jit/src/jit/mod.rs:3530`.
 - The fast path:
   - evaluates the receiver once
-  - guards exact owner type and owner type version via
-    `dp_jit_guard_method_type_version`
+  - guards exact owner type and owner type version via the inlineable
+    `soac_runtime_guard_type_version`
   - uses the descriptor function object directly
   - prepends the receiver as arg0
   - emits a direct `call_indirect` to the compiled target function

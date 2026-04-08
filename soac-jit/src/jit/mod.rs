@@ -205,7 +205,7 @@ static SOAC_RUNTIME_STORE_FIELD_INDEXED_IMPORT: ImportSpec = ImportSpec::local(
         SigType::I64,
         SigType::Pointer,
     ],
-    &[SigType::Pointer],
+    &[SigType::I32],
 );
 static DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_py_call_positional_three",
@@ -297,8 +297,8 @@ static DP_JIT_PYOBJECT_TO_I64_IMPORT: ImportSpec = ImportSpec::new(
     &[SigType::Pointer],
     &[SigType::I64],
 );
-static DP_JIT_GUARD_METHOD_TYPE_VERSION_IMPORT: ImportSpec = ImportSpec::new(
-    "dp_jit_guard_method_type_version",
+static SOAC_RUNTIME_GUARD_TYPE_VERSION_IMPORT: ImportSpec = ImportSpec::local(
+    SOAC_RUNTIME_GUARD_TYPE_VERSION_SYMBOL,
     &[SigType::Pointer, SigType::Pointer, SigType::I64],
     &[SigType::I32],
 );
@@ -5389,6 +5389,7 @@ impl RuntimeSupportInliner {
                     | SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL
                     | SOAC_RUNTIME_LOAD_FIELD_INDEXED_SYMBOL
                     | SOAC_RUNTIME_STORE_FIELD_INDEXED_SYMBOL
+                    | SOAC_RUNTIME_GUARD_TYPE_VERSION_SYMBOL
             ) {
                 continue;
             }
@@ -5513,6 +5514,8 @@ pub(crate) const SOAC_RUNTIME_LOAD_FIELD_INDEXED_SYMBOL: &str =
     "soac_runtime_load_field_indexed";
 pub(crate) const SOAC_RUNTIME_STORE_FIELD_INDEXED_SYMBOL: &str =
     "soac_runtime_store_field_indexed";
+pub(crate) const SOAC_RUNTIME_GUARD_TYPE_VERSION_SYMBOL: &str =
+    "soac_runtime_guard_type_version";
 
 pub(crate) fn jit_python_perf_symbol_name(kind: &str, qualname: &str) -> String {
     format!("py:{kind}:{qualname}")
@@ -6315,7 +6318,7 @@ fn build_cranelift_run_bb_specialized_function(
         let guard_method_type_version_ref = func_imports.get_or_panic(
             jit_module,
             &mut fb.func,
-            &DP_JIT_GUARD_METHOD_TYPE_VERSION_IMPORT,
+            &SOAC_RUNTIME_GUARD_TYPE_VERSION_IMPORT,
         );
         let record_top_value_sample_ref = func_imports.get_or_panic(
             jit_module,
