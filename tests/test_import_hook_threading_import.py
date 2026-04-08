@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -31,6 +32,8 @@ def test_import_hook_entry_module_bootstraps_runtime():
 
 
 def test_import_hook_transforms_resolvable_frozen_module_source():
+    env = os.environ.copy()
+    env.pop("DIET_PYTHON_INTEGRATION_ONLY", None)
     code = "\n".join(
         [
             "from soac import import_hook",
@@ -46,5 +49,6 @@ def test_import_hook_transforms_resolvable_frozen_module_source():
         check=True,
         text=True,
         capture_output=True,
+        env=env,
     )
     assert result.stdout.splitlines() == ["DietPythonLoader", "True", "True"]
