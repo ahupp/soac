@@ -1,6 +1,7 @@
 use soac_blockpy::block_py::FunctionId;
 use soac_inspector::{
-    jit_debug_plan, register_named_plans_from_source, render_registered_jit_clif,
+    JitClifRenderOptions, jit_debug_plan, register_named_plans_from_source,
+    render_registered_jit_clif_with_options,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,6 +14,7 @@ struct Args {
     module_name: Option<String>,
     cfg_dot_out: Option<PathBuf>,
     debug_plan: bool,
+    specialized: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -20,6 +22,7 @@ fn parse_args() -> Result<Args, String> {
     let mut module_name = None;
     let mut cfg_dot_out = None;
     let mut debug_plan = false;
+    let mut specialized = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -37,6 +40,9 @@ fn parse_args() -> Result<Args, String> {
             }
             "--debug-plan" => {
                 debug_plan = true;
+            }
+            "--specialized" => {
+                specialized = true;
             }
             "--help" | "-h" => {
                 print_usage();
@@ -61,12 +67,16 @@ fn parse_args() -> Result<Args, String> {
         module_name,
         cfg_dot_out,
         debug_plan,
+        specialized,
     })
 }
 
 fn print_usage() {
     eprintln!(
-        "usage: render_jit_clif <source> <function_id> [--module-name NAME] [--cfg-dot-out PATH] [--debug-plan]"
+        "usage: render_jit_clif <source> <function_id> [--module-name NAME] [--cfg-dot-out PATH] [--debug-plan] [--specialized]"
+    );
+    eprintln!(
+        "       --specialized renders the second-pass shape using DIET_PYTHON_COUNTERS_FILE or explicit specialization env"
     );
 }
 
@@ -103,8 +113,14 @@ fn main() -> Result<(), String> {
         eprintln!("{}", jit_debug_plan(&module_name, args.function_id)?);
     }
 
-    let rendered =
-        render_registered_jit_clif(&soac_inspector::repo_root(), &module_name, args.function_id)?;
+    let rendered = render_registered_jit_clif_with_options(
+        &soac_inspector::repo_root(),
+        &module_name,
+        args.function_id,
+        JitClifRenderOptions {
+            load_runtime_specializations: args.specialized,
+        },
+    )?;
     if let Some(path) = args.cfg_dot_out {
         fs::write(&path, rendered.cfg_dot.as_bytes())
             .map_err(|err| format!("failed to write {}: {err}", path.display()))?;

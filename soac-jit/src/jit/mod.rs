@@ -3,6 +3,7 @@ use crate::counter_dump::{
     read_call_target_specializations_from_file, read_operator_specializations_from_file,
 };
 use crate::module_constants::{ModuleCodegenConstants, ModuleConstantId};
+use crate::module_type::SharedModuleState;
 use cranelift_codegen::cfg_printer::CFGPrinter;
 use cranelift_codegen::incremental_cache::CacheKvStore;
 use cranelift_codegen::inline::{Inline, InlineCommand};
@@ -6444,35 +6445,62 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_cfg(
     function: &soac_blockpy::block_py::BlockPyFunction<CodegenModuleShape>,
     module_constants: &ModuleCodegenConstants,
 ) -> Result<RenderedSpecializedClif, String> {
+    unsafe {
+        render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
+            blocks,
+            module,
+            function,
+            module_constants,
+            None,
+        )
+    }
+}
+
+pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
+    blocks: &[ObjPtr],
+    module: &BlockPyModule<CodegenModuleShape>,
+    function: &soac_blockpy::block_py::BlockPyFunction<CodegenModuleShape>,
+    module_constants: &ModuleCodegenConstants,
+    runtime_state: Option<&SharedModuleState>,
+) -> Result<RenderedSpecializedClif, String> {
     if blocks.is_empty() {
         return Err("specialized JIT run_bb requires at least one block".to_string());
     }
 
     let builder = new_jit_builder()?;
     let mut jit_module = JITModule::new(builder);
-    let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
-    let counter_ptrs = placeholder_counter_ptrs(
-        function
-            .blocks
-            .iter()
-            .flat_map(|block| block.body.iter())
-            .filter_map(|expr| match expr {
-                InstrCodegen::IncrementCounter(op) => Some(op.counter_id.0),
-                _ => None,
-            })
-            .max()
-            .map_or(0, |max_counter_id| max_counter_id + 1),
-    );
+    let module_constant_ptrs = runtime_state
+        .map(SharedModuleState::module_constant_ptrs)
+        .unwrap_or_else(|| placeholder_module_constant_ptrs(module_constants.len()));
+    let counter_ptrs = runtime_state
+        .map(SharedModuleState::counter_ptrs)
+        .unwrap_or_else(|| {
+            placeholder_counter_ptrs(
+                function
+                    .blocks
+                    .iter()
+                    .flat_map(|block| block.body.iter())
+                    .filter_map(|expr| match expr {
+                        InstrCodegen::IncrementCounter(op) => Some(op.counter_id.0),
+                        _ => None,
+                    })
+                    .max()
+                    .map_or(0, |max_counter_id| max_counter_id + 1),
+            )
+        });
+    let counter_defs = runtime_state
+        .map(|state| state.lowered_module.counter_defs.as_slice())
+        .unwrap_or(&[]);
     let built = build_cranelift_run_bb_specialized_function(
         &mut jit_module,
         blocks,
         module,
         function,
         module_constants,
-        &[],
+        counter_defs,
         &module_constant_ptrs,
         &counter_ptrs,
-        None,
+        runtime_state,
     )?;
     let mut out = String::new();
     out.push_str("; import fn aliases (Cranelift display id -> symbol)\n");

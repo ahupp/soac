@@ -465,8 +465,7 @@ fn build_counter_storage(
     ))
 }
 
-#[cfg(test)]
-pub(crate) fn build_shared_state_for_testing(
+pub fn build_shared_state_for_inspection(
     py: Python<'_>,
     lowered_module: BlockPyModule<CodegenModuleShape>,
     module_name: &str,
@@ -489,6 +488,16 @@ pub(crate) fn build_shared_state_for_testing(
         top_value_counters,
         compiled_direct_runner_handles: Mutex::new(HashMap::new()),
     }))
+}
+
+#[cfg(test)]
+pub(crate) fn build_shared_state_for_testing(
+    py: Python<'_>,
+    lowered_module: BlockPyModule<CodegenModuleShape>,
+    module_name: &str,
+    package_name: &str,
+) -> PyResult<Arc<SharedModuleState>> {
+    build_shared_state_for_inspection(py, lowered_module, module_name, package_name)
 }
 
 fn build_function_index_by_id(

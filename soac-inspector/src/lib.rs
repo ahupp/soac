@@ -10,9 +10,10 @@ use serde_json::{Value, json};
 use soac_blockpy::block_py::{BlockPyFunction, FunctionId};
 use soac_blockpy::passes::CodegenModuleShape;
 use soac_jit::module_constants::ModuleCodegenConstants;
+use soac_jit::module_type::build_shared_state_for_inspection;
 use soac_jit::{
     exc_dispatch_plan, jit_param_names_for_block, lookup_blockpy_function, lookup_blockpy_module,
-    register_clif_module_plans, render_cranelift_run_bb_specialized_with_cfg,
+    register_clif_module_plans, render_cranelift_run_bb_specialized_with_runtime_state_and_cfg,
 };
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
@@ -63,6 +64,11 @@ pub struct JitClifResponse {
     #[serde(rename = "vcodeDisasm")]
     pub vcode_disasm: String,
     pub resolved_entry: String,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct JitClifRenderOptions {
+    pub load_runtime_specializations: bool,
 }
 
 #[derive(Debug)]
@@ -302,6 +308,20 @@ pub fn render_registered_jit_clif(
     module_name: &str,
     function_id: FunctionId,
 ) -> Result<JitClifResponse, String> {
+    render_registered_jit_clif_with_options(
+        repo_root,
+        module_name,
+        function_id,
+        JitClifRenderOptions::default(),
+    )
+}
+
+pub fn render_registered_jit_clif_with_options(
+    repo_root: &Path,
+    module_name: &str,
+    function_id: FunctionId,
+    options: JitClifRenderOptions,
+) -> Result<JitClifResponse, String> {
     let module = lookup_blockpy_module(module_name)
         .ok_or_else(|| format!("no specialized JIT plan for {module_name}"))?;
     let function = module
@@ -315,12 +335,21 @@ pub fn render_registered_jit_clif(
     let rendered = Python::attach(|py| {
         ensure_python_support_paths(py, repo_root).map_err(|err| err.error)?;
         PyModule::import(py, "soac.runtime").map_err(|err| err.to_string())?;
+        let runtime_state = if options.load_runtime_specializations {
+            Some(
+                build_shared_state_for_inspection(py, module.clone(), module_name, "")
+                    .map_err(|err| err.to_string())?,
+            )
+        } else {
+            None
+        };
         unsafe {
-            render_cranelift_run_bb_specialized_with_cfg(
+            render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
                 &vec![std::ptr::null_mut::<c_void>(); function.blocks.len()],
                 &module,
                 &function,
                 &module_constants,
+                runtime_state.as_deref(),
             )
         }
     })?;
