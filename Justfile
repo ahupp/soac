@@ -774,10 +774,12 @@ benchmark loops="8000000": (update-venv) (build-extension "release")
   set -euo pipefail
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
   WARMUP_LOOPS="${WARMUP_LOOPS:-1000}"
+  PROFILE_LOOPS="100000"
   BENCHMARK_CPU="${BENCHMARK_CPU:-}"
   BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS:-0}"
   echo "date: $(date +%F)"
   echo "loops: {{loops}}"
+  echo "profile loops: ${PROFILE_LOOPS}"
   echo "warmup loops: ${WARMUP_LOOPS}"
   echo "benchmark cpu: ${BENCHMARK_CPU}"
   echo "benchmark constant clocks: ${BENCHMARK_CONSTANT_CLOCKS}"
@@ -788,7 +790,7 @@ benchmark loops="8000000": (update-venv) (build-extension "release")
   trap 'rm -f "$counter_dump_path"' EXIT
 
   echo "jit transformed profile pass"
-  LOOPS="{{loops}}" \
+  LOOPS="${PROFILE_LOOPS}" \
   WARMUP_LOOPS="${WARMUP_LOOPS}" \
   BENCHMARK_CPU="${BENCHMARK_CPU}" \
   BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
