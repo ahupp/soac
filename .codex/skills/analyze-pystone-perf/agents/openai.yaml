@@ -1,0 +1,3 @@
+display_name: Analyze Pystone Perf
+short_description: Profile pystone, inspect specialized CLIF, and rank SOAC optimization targets.
+default_prompt: Run the specialized pystone benchmark under perf, render relevant specialized CLIF, and report the top optimization opportunities with evidence.
