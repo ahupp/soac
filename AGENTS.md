@@ -255,6 +255,13 @@ instance's live working commit.
   overwritten directly by `soac-runtime`, skipping CPython watchers,
   dict versions, insertion-order maintenance, and first-insert
   bookkeeping.
+- `UNSOUND`
+  Enables intentionally unsound performance experiments. The benchmark
+  and pytest correctness recipes default this to `1`; xfail tests that
+  specifically assert the skipped semantics under this mode. Current
+  behavior includes rewriting undeclared known-builtin global loads to
+  `RuntimeName` module constants in name binding, so module globals are
+  not checked for those names.
 
 ### CPython-specific notes
 

@@ -197,6 +197,15 @@ exports are intentionally omitted here.
   dict version updates, insertion-order maintenance, and first-insert
   bookkeeping. Leave unset for correctness tests and ordinary runs.
 
+- `UNSOUND=1`
+  Enables compiler/runtime shortcuts that intentionally skip observable
+  CPython semantics. Today this includes name-binding-time builtin
+  rewriting: undeclared global loads whose names are on the known-builtin
+  allowlist are lowered to `RuntimeName`, lifted into module constant
+  slots, and loaded without checking module globals. The benchmark
+  and pytest correctness recipes default to `UNSOUND=1`; set
+  `UNSOUND=0` to run the compatibility path.
+
 Notes:
 - In normal workflows set one `DIET_PYTHON_COUNTERS_DIR` for the whole
   multi-pass run and change only `DIET_PYTHON_SPECIALIZATION_MODE`.

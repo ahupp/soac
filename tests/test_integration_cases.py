@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import sys
 
@@ -12,6 +13,13 @@ from tests._integration import (
 )
 
 MODULES_DIR = Path(__file__).resolve().parent / "integration_modules"
+
+
+def _env_flag_enabled(name: str) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return False
+    return raw.strip().lower() not in {"", "0", "false", "no", "off"}
 
 
 def _case_paths() -> list[Path]:
@@ -75,6 +83,14 @@ def test_integration_case(tmp_path: Path, case_path: Path, mode: str) -> None:
         "scope_locals",
     }:
         pytest.xfail("scope-aware builtin rewriting has been removed")
+    if (
+        mode == "transform"
+        and _env_flag_enabled("UNSOUND")
+        and case_path.stem in {
+            "builtin_dynamic_global_shadow",
+        }
+    ):
+        pytest.xfail("UNSOUND runtime-builtin loads intentionally skip module-global shadowing")
 
     source, validate_source = split_integration_case(case_path)
     module_name = case_path.stem

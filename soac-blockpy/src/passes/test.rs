@@ -150,6 +150,21 @@ fn tracked_name_binding_module(
         .cloned())
 }
 
+fn unsound_runtime_builtin_name_binding_module(
+    source: &str,
+) -> BlockPyModule<ResolvedStorageModuleShape> {
+    let result = lower_python_to_blockpy_for_testing(source).expect("transform should succeed");
+    let core_blockpy = result
+        .pass_tracker
+        .pass_core_blockpy()
+        .expect("core_blockpy pass should be available")
+        .clone();
+    super::name_binding::lower_name_binding_in_core_blockpy_module_with_unsound_runtime_builtins(
+        core_blockpy,
+        true,
+    )
+}
+
 struct TrackedLowering {
     result: LoweringResult,
     blockpy_module: BlockPyModule<CoreModuleShapeWithAwaitAndYield>,
@@ -650,6 +665,16 @@ fn runtime_call_by_name<'a>(
     helper_load.name.is_runtime_symbol(name).then_some(call)
 }
 
+fn module_constant_runtime_name(
+    module: &BlockPyModule<ResolvedStorageModuleShape>,
+    name: &str,
+) -> bool {
+    module
+        .module_constants
+        .iter()
+        .any(|expr| matches!(expr, InstrResolved::Load(load) if load.name.is_runtime_symbol(name)))
+}
+
 #[test]
 fn core_blockpy_with_await_keeps_plain_coroutines_without_fake_yield_marker() {
     let source = r#"
@@ -796,6 +821,55 @@ def f():
         rendered_init.contains(format!("constant slot {make_function_index}(").as_str()),
         "expected module init to call through the extracted runtime constant slot:\n{rendered_init}"
     );
+}
+
+#[test]
+fn unsound_name_binding_lifts_undeclared_builtin_global_loads_into_module_constants() {
+    let source = r#"
+def f(value):
+    print(len(range(value)))
+"#;
+
+    let bb_module = unsound_runtime_builtin_name_binding_module(source);
+    let f = function_by_name(&bb_module, "f");
+    for name in ["print", "len", "range"] {
+        assert!(
+            module_constant_runtime_name(&bb_module, name),
+            "expected {name} to be an extracted runtime-name constant; got {:?}",
+            bb_module.module_constants
+        );
+        assert!(
+            !resolved_function_uses_global(f, name),
+            "expected {name} load to skip module globals in unsound mode; got {f:?}",
+        );
+    }
+}
+
+#[test]
+fn unsound_name_binding_keeps_assigned_or_declared_builtin_names_global() {
+    let source = r#"
+len = lambda value: 42
+
+def assigned(value):
+    return len(value)
+
+def declared(value):
+    global range
+    range = lambda value: [value]
+    return range(value)
+"#;
+
+    let bb_module = unsound_runtime_builtin_name_binding_module(source);
+    assert!(
+        !module_constant_runtime_name(&bb_module, "len"),
+        "assigned module global len should not be a runtime-name constant"
+    );
+    assert!(
+        !module_constant_runtime_name(&bb_module, "range"),
+        "explicit global range should not be a runtime-name constant"
+    );
+    assert!(resolved_module_uses_global(&bb_module, "len"));
+    assert!(resolved_module_uses_global(&bb_module, "range"));
 }
 
 #[test]

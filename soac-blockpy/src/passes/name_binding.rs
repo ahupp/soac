@@ -1,13 +1,13 @@
 use crate::block_py::{
     build_storage_layout_from_capture_names, compute_make_function_capture_bindings_from_scope,
     compute_storage_layout_from_scope, core_runtime_positional_call_expr_with_meta, literal_expr,
-    BindingKind, BindingPurpose, BindingTarget, BlockArg, BlockPyFunction,
-    BlockPyModule, BlockTerm, Call, CallArgPositional, CallableScopeInfo, CallableScopeKind,
-    CellBindingKind, CellCaptureBinding, CellLocation, CellRef, CellRefForName, ChildVisitable,
-    ClassBodyFallback, ClosureInit, ClosureSlot, Del, DelItem, EffectiveBinding, FunctionId,
-    FunctionKind, HasMeta, InstrLow, InstrResolved, InstrUnresolved, Load, LocalLocation, MakeCell,
-    MakeFunction, MapFunction, MapInstr, Mappable, NameLike, NameLocation, NumberLiteral,
-    NumberLiteralValue, ResolvedName, SetItem, StorageLayout, Store, StringLiteral, UnresolvedName,
+    BindingKind, BindingPurpose, BindingTarget, BlockArg, BlockPyFunction, BlockPyModule,
+    BlockTerm, Call, CallArgPositional, CallableScopeInfo, CallableScopeKind, CellBindingKind,
+    CellCaptureBinding, CellLocation, CellRef, CellRefForName, ChildVisitable, ClassBodyFallback,
+    ClosureInit, ClosureSlot, Del, DelItem, EffectiveBinding, FunctionId, FunctionKind, HasMeta,
+    InstrLow, InstrResolved, InstrUnresolved, Load, LocalLocation, MakeCell, MakeFunction,
+    MapFunction, MapInstr, Mappable, NameLike, NameLocation, NumberLiteral, NumberLiteralValue,
+    ResolvedName, SetItem, StorageLayout, Store, StringLiteral, UnresolvedName, Visit, VisitMut,
     WithMeta,
 };
 use crate::passes::ruff_to_blockpy::{
@@ -17,9 +17,183 @@ use crate::passes::{CoreModuleShape, ResolvedStorageModuleShape};
 use ruff_python_ast::{self as ast};
 use soac_macros::match_default;
 use std::collections::{HashMap, HashSet};
+use std::env;
 
 fn is_internal_symbol(name: &str) -> bool {
     name.starts_with("_dp_") || name == "__soac__"
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    env::var(name)
+        .map(|value| {
+            let trimmed = value.trim();
+            !trimmed.is_empty()
+                && trimmed != "0"
+                && !trimmed.eq_ignore_ascii_case("false")
+                && !trimmed.eq_ignore_ascii_case("no")
+                && !trimmed.eq_ignore_ascii_case("off")
+        })
+        .unwrap_or(false)
+}
+
+fn unsound_runtime_builtin_names_enabled() -> bool {
+    env_flag_enabled("UNSOUND")
+}
+
+fn is_unsound_runtime_builtin_candidate(name: &str) -> bool {
+    // Builtins that are expected to live in the builtin namespace. Rewriting
+    // these as RuntimeName is intentionally unsound because it skips module
+    // globals and snapshots the value in a module constant slot.
+    matches!(
+        name,
+        "ArithmeticError"
+            | "AssertionError"
+            | "AttributeError"
+            | "BaseException"
+            | "BaseExceptionGroup"
+            | "BlockingIOError"
+            | "BrokenPipeError"
+            | "BufferError"
+            | "BytesWarning"
+            | "ChildProcessError"
+            | "ConnectionAbortedError"
+            | "ConnectionError"
+            | "ConnectionRefusedError"
+            | "ConnectionResetError"
+            | "DeprecationWarning"
+            | "EOFError"
+            | "EncodingWarning"
+            | "EnvironmentError"
+            | "Exception"
+            | "ExceptionGroup"
+            | "FileExistsError"
+            | "FileNotFoundError"
+            | "FloatingPointError"
+            | "FutureWarning"
+            | "GeneratorExit"
+            | "IOError"
+            | "ImportError"
+            | "ImportWarning"
+            | "IndentationError"
+            | "IndexError"
+            | "InterruptedError"
+            | "IsADirectoryError"
+            | "KeyError"
+            | "KeyboardInterrupt"
+            | "LookupError"
+            | "MemoryError"
+            | "ModuleNotFoundError"
+            | "NameError"
+            | "NotADirectoryError"
+            | "NotImplemented"
+            | "NotImplementedError"
+            | "OSError"
+            | "OverflowError"
+            | "PendingDeprecationWarning"
+            | "PermissionError"
+            | "ProcessLookupError"
+            | "RecursionError"
+            | "ReferenceError"
+            | "ResourceWarning"
+            | "RuntimeError"
+            | "RuntimeWarning"
+            | "StopAsyncIteration"
+            | "StopIteration"
+            | "SyntaxError"
+            | "SyntaxWarning"
+            | "SystemError"
+            | "SystemExit"
+            | "TabError"
+            | "TimeoutError"
+            | "TypeError"
+            | "UnboundLocalError"
+            | "UnicodeDecodeError"
+            | "UnicodeEncodeError"
+            | "UnicodeError"
+            | "UnicodeTranslateError"
+            | "UnicodeWarning"
+            | "UserWarning"
+            | "ValueError"
+            | "Warning"
+            | "ZeroDivisionError"
+            | "__build_class__"
+            | "__import__"
+            | "abs"
+            | "aiter"
+            | "all"
+            | "anext"
+            | "any"
+            | "ascii"
+            | "bin"
+            | "bool"
+            | "breakpoint"
+            | "bytearray"
+            | "bytes"
+            | "callable"
+            | "chr"
+            | "classmethod"
+            | "compile"
+            | "complex"
+            | "copyright"
+            | "credits"
+            | "delattr"
+            | "dict"
+            | "dir"
+            | "divmod"
+            | "enumerate"
+            | "eval"
+            | "exec"
+            | "exit"
+            | "filter"
+            | "float"
+            | "format"
+            | "frozenset"
+            | "getattr"
+            | "globals"
+            | "hasattr"
+            | "hash"
+            | "help"
+            | "hex"
+            | "id"
+            | "input"
+            | "int"
+            | "isinstance"
+            | "issubclass"
+            | "iter"
+            | "len"
+            | "license"
+            | "list"
+            | "locals"
+            | "map"
+            | "max"
+            | "memoryview"
+            | "min"
+            | "next"
+            | "object"
+            | "oct"
+            | "open"
+            | "ord"
+            | "pow"
+            | "print"
+            | "property"
+            | "quit"
+            | "range"
+            | "repr"
+            | "reversed"
+            | "round"
+            | "set"
+            | "setattr"
+            | "slice"
+            | "sorted"
+            | "staticmethod"
+            | "str"
+            | "sum"
+            | "super"
+            | "tuple"
+            | "type"
+            | "vars"
+            | "zip"
+    )
 }
 
 fn should_late_bind_name(name: &str, scope: &CallableScopeInfo) -> bool {
@@ -2655,20 +2829,133 @@ impl crate::block_py::VisitMut<InstrResolved> for ModuleConstantExtractor {
     }
 }
 
-pub(crate) fn lower_name_binding_in_core_blockpy_module(
+#[derive(Default)]
+struct DeclaredGlobalNameCollector {
+    names: HashSet<String>,
+}
+
+impl DeclaredGlobalNameCollector {
+    fn collect_module(
+        mut self,
+        module: &BlockPyModule<ResolvedStorageModuleShape>,
+    ) -> HashSet<String> {
+        for callable in &module.callable_defs {
+            self.collect_callable_body_declarations(callable);
+        }
+        self.names
+    }
+
+    fn collect_callable_body_declarations(
+        &mut self,
+        callable: &BlockPyFunction<ResolvedStorageModuleShape>,
+    ) {
+        for block in &callable.blocks {
+            for stmt in &block.body {
+                self.visit_instr(stmt);
+            }
+            crate::block_py::walk_term(self, &block.term);
+        }
+    }
+
+    fn collect_declared_name(&mut self, name: &ResolvedName) {
+        if name.location.is_global_name() {
+            self.names.insert(name.id.to_string());
+        }
+    }
+}
+
+impl Visit<InstrResolved> for DeclaredGlobalNameCollector {
+    fn visit_instr(&mut self, expr: &InstrResolved) {
+        match expr {
+            InstrResolved::Store(op) => {
+                self.collect_declared_name(&op.name);
+                op.visit_children(self);
+            }
+            InstrResolved::Del(op) => {
+                self.collect_declared_name(&op.name);
+                op.visit_children(self);
+            }
+            _ => expr.visit_children(self),
+        }
+    }
+}
+
+struct UnsoundBuiltinRuntimeNameRewriter<'a> {
+    declared_global_names: &'a HashSet<String>,
+}
+
+impl UnsoundBuiltinRuntimeNameRewriter<'_> {
+    fn maybe_rewrite_name(&self, name: &mut ResolvedName) {
+        if !name.location.is_global_name()
+            || self.declared_global_names.contains(name.id.as_str())
+            || !is_unsound_runtime_builtin_candidate(name.id.as_str())
+        {
+            return;
+        }
+        name.location = NameLocation::RuntimeName;
+    }
+}
+
+impl crate::block_py::VisitMut<InstrResolved> for UnsoundBuiltinRuntimeNameRewriter<'_> {
+    fn visit_instr_mut(&mut self, expr: &mut InstrResolved) {
+        match expr {
+            InstrResolved::Load(op) => {
+                self.maybe_rewrite_name(&mut op.name);
+                op.visit_children_mut(self);
+            }
+            _ => expr.visit_children_mut(self),
+        }
+    }
+}
+
+fn rewrite_unsound_builtin_loads_as_runtime_names(
+    mut module: BlockPyModule<ResolvedStorageModuleShape>,
+) -> BlockPyModule<ResolvedStorageModuleShape> {
+    let declared_global_names = DeclaredGlobalNameCollector::default().collect_module(&module);
+    let mut rewriter = UnsoundBuiltinRuntimeNameRewriter {
+        declared_global_names: &declared_global_names,
+    };
+    for callable in &mut module.callable_defs {
+        for block in &mut callable.blocks {
+            for stmt in &mut block.body {
+                rewriter.visit_instr_mut(stmt);
+            }
+            crate::block_py::walk_term_mut(&mut rewriter, &mut block.term);
+        }
+    }
+    module
+}
+
+pub(crate) fn lower_name_binding_in_core_blockpy_module_with_unsound_runtime_builtins(
     module: BlockPyModule<CoreModuleShape>,
+    unsound_runtime_builtin_names: bool,
 ) -> BlockPyModule<ResolvedStorageModuleShape> {
     let callable_defs = ensure_module_storage_layouts(module.callable_defs);
     let callee_make_function_capture_names =
         compute_module_make_function_capture_names(&callable_defs);
-    ModuleConstantExtractor::default().extract_module(BlockPyModule {
+    let mut module = BlockPyModule {
         module_name_gen: module.module_name_gen,
         global_names: Vec::new(),
         callable_defs: callable_defs
             .into_iter()
-            .map(|callable| lower_name_binding_callable(callable, &callee_make_function_capture_names))
+            .map(|callable| {
+                lower_name_binding_callable(callable, &callee_make_function_capture_names)
+            })
             .collect(),
         module_constants: Vec::new(),
         counter_defs: Vec::new(),
-    })
+    };
+    if unsound_runtime_builtin_names {
+        module = rewrite_unsound_builtin_loads_as_runtime_names(module);
+    }
+    ModuleConstantExtractor::default().extract_module(module)
+}
+
+pub(crate) fn lower_name_binding_in_core_blockpy_module(
+    module: BlockPyModule<CoreModuleShape>,
+) -> BlockPyModule<ResolvedStorageModuleShape> {
+    lower_name_binding_in_core_blockpy_module_with_unsound_runtime_builtins(
+        module,
+        unsound_runtime_builtin_names_enabled(),
+    )
 }

@@ -131,3 +131,21 @@ watchers, dict version updates, insertion-order maintenance,
 that lives in the normal store path. Use it only in perf runs that
 explicitly want to estimate the upper bound for guarded indexed stores;
 do not enable it for correctness tests or compatibility claims.
+
+`UNSOUND=1` enables broad compatibility-skipping performance
+experiments. It is enabled by default in benchmark and pytest
+correctness recipes so ordinary transformed test runs still detect
+unexpected fallout from these experiments.
+
+Current behavior:
+
+- undeclared known-builtin global loads are rewritten during name
+  binding into `RuntimeName` loads; module-constant extraction then
+  snapshots the runtime/builtin object in a constant slot
+
+This is not CPython-compatible. A module can install or mutate a global
+named `len`, `range`, `print`, etc. through `globals()`, `exec`, custom
+module initialization, or ordinary code that this static declaration
+check does not see. That mutation should shadow builtins for normal
+Python global lookup, but the unsound runtime-name path does not check
+module globals.
