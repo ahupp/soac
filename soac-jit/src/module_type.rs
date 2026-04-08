@@ -58,6 +58,7 @@ pub struct SharedModuleState {
     pub package_name: String,
     pub codegen_constants: ModuleCodegenConstants,
     function_index_by_id: HashMap<FunctionId, usize>,
+    original_code_by_function_id: HashMap<FunctionId, Py<PyAny>>,
     module_constant_objs: Vec<Py<PyAny>>,
     counter_slots_by_id: Box<[CounterRuntimeSlot]>,
     counter_values: Box<[u64]>,
@@ -96,6 +97,10 @@ impl SharedModuleState {
         let function = self.lowered_module.callable_defs.get(function_index)?;
         assert_eq!(function.function_id, function_id);
         Some(function)
+    }
+
+    pub fn lookup_original_code(&self, function_id: FunctionId) -> Option<&Py<PyAny>> {
+        self.original_code_by_function_id.get(&function_id)
     }
 
     pub(crate) fn module_constant_ptrs(&self) -> Vec<*mut ffi::PyObject> {
@@ -481,6 +486,7 @@ pub fn build_shared_state_for_inspection(
         package_name: package_name.to_string(),
         codegen_constants,
         function_index_by_id,
+        original_code_by_function_id: HashMap::new(),
         module_constant_objs,
         counter_slots_by_id,
         counter_values,
@@ -528,6 +534,7 @@ impl SoacExtModuleState {
         &mut self,
         py: Python<'_>,
         lowered_module: BlockPyModule<CodegenModuleShape>,
+        original_code_by_function_id: HashMap<FunctionId, Py<PyAny>>,
         module_name: String,
         package_name: String,
     ) -> PyResult<()> {
@@ -547,6 +554,7 @@ impl SoacExtModuleState {
             package_name,
             codegen_constants,
             function_index_by_id,
+            original_code_by_function_id,
             module_constant_objs,
             counter_slots_by_id,
             counter_values,
@@ -733,6 +741,12 @@ unsafe extern "C" fn soac_ext_module_traverse(
     let shared_state = unsafe { (*state).shared_state.assume_init_ref().as_ref() };
     for obj in &shared_state.module_constant_objs {
         let rc = unsafe { visit(obj.as_ptr(), arg) };
+        if rc != 0 {
+            return rc;
+        }
+    }
+    for code in shared_state.original_code_by_function_id.values() {
+        let rc = unsafe { visit(code.as_ptr(), arg) };
         if rc != 0 {
             return rc;
         }
@@ -1066,6 +1080,7 @@ impl SoacExtModule {
         spec: &Bound<'_, PyAny>,
         mut lowered_module: BlockPyModule<CodegenModuleShape>,
         mut module_info: ModuleInfo,
+        original_code_by_function_id: HashMap<FunctionId, Py<PyAny>>,
     ) -> PyResult<Py<PyAny>> {
         ensure_module_dict_metadata_names(&mut lowered_module.global_names);
         module_info.indexed_module_keys = lowered_module.global_names.clone();
@@ -1088,7 +1103,15 @@ impl SoacExtModule {
             return Err(PyErr::fetch(py));
         }
         let state = soac_ext_module_state(&module)?;
-        unsafe { (*state).init(py, lowered_module, module_name, package_name)? };
+        unsafe {
+            (*state).init(
+                py,
+                lowered_module,
+                original_code_by_function_id,
+                module_name,
+                package_name,
+            )?
+        };
         Ok(module.unbind())
     }
 
@@ -1148,6 +1171,7 @@ def f():
             module_name: "counter_test".to_string(),
             package_name: String::new(),
             compiled_direct_runner_handles: Mutex::new(HashMap::new()),
+            original_code_by_function_id: HashMap::new(),
         };
 
         let record = shared_state
@@ -1262,6 +1286,7 @@ def f():
             module_name: "counter_test".to_string(),
             package_name: "pkg".to_string(),
             compiled_direct_runner_handles: Mutex::new(HashMap::new()),
+            original_code_by_function_id: HashMap::new(),
         };
 
         let unique = SystemTime::now()

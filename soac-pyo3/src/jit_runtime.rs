@@ -10,7 +10,8 @@ use soac_blockpy::block_py::{BlockPyFunction, BlockPyModule, FunctionId, Functio
 use soac_blockpy::lower_python_to_blockpy;
 use soac_blockpy::pass_tracker::NoopPassTracker;
 use soac_blockpy::passes::CodegenModuleShape;
-use soac_jit::module_type::{ModuleInfo, SoacExtModule, hash_module_source};
+use soac_jit::module_type::{hash_module_source, ModuleInfo, SoacExtModule};
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::time::Instant;
 
@@ -44,6 +45,74 @@ fn tuple_from_owned_objects<'py>(
     Ok(tuple)
 }
 
+type OriginalCodeMap = HashMap<FunctionId, Py<PyAny>>;
+type OriginalCodeByQualname = HashMap<String, VecDeque<Py<PyAny>>>;
+
+fn compile_original_module_code(py: Python<'_>, source: &str, path: &str) -> PyResult<Py<PyAny>> {
+    let code = PyModule::import(py, "builtins")?
+        .getattr("compile")?
+        .call1((source, path, "exec"))?;
+    Ok(code.unbind())
+}
+
+fn collect_original_code_objects(
+    code: &Bound<'_, PyAny>,
+    code_type: &Bound<'_, PyAny>,
+    by_qualname: &mut OriginalCodeByQualname,
+) -> PyResult<()> {
+    let qualname = code.getattr("co_qualname")?.extract::<String>()?;
+    by_qualname
+        .entry(qualname)
+        .or_default()
+        .push_back(code.clone().unbind());
+
+    let consts = code.getattr("co_consts")?.cast_into::<PyTuple>()?;
+    for item in consts.iter() {
+        if item.is_instance(code_type)? {
+            collect_original_code_objects(&item, code_type, by_qualname)?;
+        }
+    }
+    Ok(())
+}
+
+fn original_code_lookup_key(function: &BlockPyFunction<CodegenModuleShape>) -> Option<&str> {
+    let qualname = function.names.qualname.as_str();
+    if qualname == "_dp_module_init"
+        || qualname == "__annotate__"
+        || qualname.ends_with(".__annotate_func__")
+        || function.names.bind_name.starts_with("_dp_class_ns_")
+        || function.names.bind_name.starts_with("_dp_define_class_")
+    {
+        return None;
+    }
+    Some(qualname)
+}
+
+fn match_original_code_to_functions(
+    py: Python<'_>,
+    module_code: &Bound<'_, PyAny>,
+    lowered_module: &BlockPyModule<CodegenModuleShape>,
+) -> PyResult<OriginalCodeMap> {
+    let code_type = PyModule::import(py, "types")?.getattr("CodeType")?;
+    let mut code_by_qualname = HashMap::new();
+    collect_original_code_objects(module_code, &code_type, &mut code_by_qualname)?;
+
+    let mut code_by_function_id = HashMap::new();
+    for function in &lowered_module.callable_defs {
+        let Some(qualname) = original_code_lookup_key(function) else {
+            continue;
+        };
+        let Some(codes) = code_by_qualname.get_mut(qualname) else {
+            continue;
+        };
+        let Some(code) = codes.pop_front() else {
+            continue;
+        };
+        code_by_function_id.insert(function.function_id, code);
+    }
+    Ok(code_by_function_id)
+}
+
 pub(crate) fn register_lowered_module_plans<P>(
     output: &soac_blockpy::LoweringResult<P>,
     module_name: &str,
@@ -75,12 +144,21 @@ fn make_lazy_clif_entry<'py>(
     dp: &Bound<'py, PyModule>,
     function_name: &str,
     module_globals: &Bound<'py, PyAny>,
+    original_code: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let module_globals = module_globals
         .cast::<PyDict>()
         .map_err(|_| PyTypeError::new_err("module_globals must be a dict"))?;
-    let template = dp.getattr("_entry_template")?;
-    let code = template.getattr("__code__")?;
+    let template;
+    let template_code;
+    let code = match original_code {
+        Some(code) => code,
+        None => {
+            template = dp.getattr("_entry_template")?;
+            template_code = template.getattr("__code__")?;
+            &template_code
+        }
+    };
     unsafe {
         let func = ffi::PyFunction_New(code.as_ptr(), module_globals.as_ptr());
         if func.is_null() {
@@ -476,19 +554,27 @@ fn build_closure_shaped_entry<'py>(
     qualname: &str,
     captured_names: &[String],
     captured_values: &Bound<'py, PyDict>,
+    original_code: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
     debug_assert!(!captured_names.is_empty());
-    let (is_async, is_generator) = match function.lowered_kind() {
-        FunctionKind::Function => (false, false),
-        FunctionKind::Coroutine => (true, false),
-        FunctionKind::Generator => (false, true),
-        FunctionKind::AsyncGenerator => (true, true),
+    let generated_code;
+    let code = match original_code {
+        Some(code) => code.clone(),
+        None => {
+            let (is_async, is_generator) = match function.lowered_kind() {
+                FunctionKind::Function => (false, false),
+                FunctionKind::Coroutine => (true, false),
+                FunctionKind::Generator => (false, true),
+                FunctionKind::AsyncGenerator => (true, true),
+            };
+            generated_code = dp.getattr("code_with_freevars")?.call1((
+                PyTuple::new(py, captured_names)?,
+                is_async,
+                is_generator,
+            ))?;
+            generated_code
+        }
     };
-    let code = dp.getattr("code_with_freevars")?.call1((
-        PyTuple::new(py, captured_names)?,
-        is_async,
-        is_generator,
-    ))?;
     let freevars_obj = code.getattr("co_freevars")?;
     let freevars = freevars_obj.cast::<PyTuple>()?;
     let mut closure_cells = Vec::with_capacity(freevars.len());
@@ -606,8 +692,18 @@ fn instantiate_closure_backed_entry<'py>(
     qualname: &str,
 ) -> PyResult<Bound<'py, PyAny>> {
     let (captured_names, closure_values) = build_capture_map(py, captures)?;
+    let original_code = module_runtime
+        .shared_module_state_owner
+        .lookup_original_code(function.function_id)
+        .map(|code| code.bind(py));
     let entry = if captured_names.is_empty() {
-        make_lazy_clif_entry(py, dp, entry_name, module_globals)?
+        make_lazy_clif_entry(
+            py,
+            dp,
+            entry_name,
+            module_globals,
+            original_code.as_ref().map(|code| code.as_any()),
+        )?
     } else {
         build_closure_shaped_entry(
             py,
@@ -617,6 +713,7 @@ fn instantiate_closure_backed_entry<'py>(
             qualname,
             &captured_names,
             &closure_values,
+            original_code.as_ref().map(|code| code.as_any()),
         )?
     };
     register_lazy_vectorcall(py, &entry, function.function_id, module_runtime)?;
@@ -678,11 +775,15 @@ fn create_module(py: Python<'_>, path: &str, spec: Py<PyAny>) -> PyResult<Py<PyA
     let output: soac_blockpy::LoweringResult<NoopPassTracker> =
         lower_python_to_blockpy(&source, session.module_name_gen())
             .map_err(lowering_error_to_pyerr)?;
+    let module_code = compile_original_module_code(py, &source, path)?;
+    let original_code_by_function_id =
+        match_original_code_to_functions(py, module_code.bind(py), &output.codegen_module)?;
     SoacExtModule::new(
         py,
         spec.bind(py).as_any(),
         output.codegen_module,
         module_info,
+        original_code_by_function_id,
     )
 }
 
