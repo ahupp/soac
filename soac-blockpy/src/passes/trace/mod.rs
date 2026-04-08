@@ -208,13 +208,76 @@ pub fn instrument_bb_module_with_call_target_counters(
         }
     }
 
-    struct DirectCallCandidateCounterCollector<'a, 'b> {
+    fn is_global_index_candidate(expr: &InstrCodegen) -> bool {
+        match expr {
+            InstrCodegen::Load(op) => matches!(op.name.location, NameLocation::Global(_)),
+            InstrCodegen::Store(op) => matches!(op.name.location, NameLocation::Global(_)),
+            _ => false,
+        }
+    }
+
+    fn is_field_index_candidate(expr: &InstrCodegen) -> bool {
+        matches!(expr, InstrCodegen::GetAttr(_) | InstrCodegen::SetAttr(_))
+    }
+
+    fn define_indexed_hit_fallback_counters(
+        counters: &mut CounterBuilder<'_>,
+        function_id: crate::block_py::FunctionId,
+        instr_id: crate::block_py::InstrId,
+        hit_kind: &'static str,
+        fallback_kind: &'static str,
+    ) {
+        counters.define_if_missing(
+            CounterScope::This,
+            hit_kind,
+            CounterSite::Runtime {
+                function_id: Some(function_id),
+                instr_id: Some(instr_id),
+            },
+        );
+        counters.define_if_missing(
+            CounterScope::This,
+            fallback_kind,
+            CounterSite::Runtime {
+                function_id: Some(function_id),
+                instr_id: Some(instr_id),
+            },
+        );
+    }
+
+    struct SpecializationCandidateCounterCollector<'a, 'b> {
         function_id: crate::block_py::FunctionId,
         counters: &'a mut CounterBuilder<'b>,
     }
 
-    impl Visit<InstrCodegen> for DirectCallCandidateCounterCollector<'_, '_> {
+    impl Visit<InstrCodegen> for SpecializationCandidateCounterCollector<'_, '_> {
         fn visit_instr(&mut self, expr: &InstrCodegen) {
+            if is_global_index_candidate(expr) {
+                let instr_id = expr
+                    .meta()
+                    .instr_id
+                    .expect("global index counters require preassigned InstrId");
+                define_indexed_hit_fallback_counters(
+                    self.counters,
+                    self.function_id,
+                    instr_id,
+                    "global_indexed_hit",
+                    "global_indexed_fallback",
+                );
+            }
+            if is_field_index_candidate(expr) {
+                let instr_id = expr
+                    .meta()
+                    .instr_id
+                    .expect("field index counters require preassigned InstrId");
+                define_indexed_hit_fallback_counters(
+                    self.counters,
+                    self.function_id,
+                    instr_id,
+                    "field_indexed_hit",
+                    "field_indexed_fallback",
+                );
+            }
             if is_operator_specialization_candidate(expr) {
                 let instr_id = expr
                     .meta()
@@ -288,7 +351,7 @@ pub fn instrument_bb_module_with_call_target_counters(
 
     let mut counters = CounterBuilder::new(&mut module.counter_defs);
     for function in &module.callable_defs {
-        let mut collector = DirectCallCandidateCounterCollector {
+        let mut collector = SpecializationCandidateCounterCollector {
             function_id: function.function_id,
             counters: &mut counters,
         };

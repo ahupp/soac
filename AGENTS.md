@@ -63,6 +63,12 @@ because it should affect engineering decisions:
    CPython hook; prefer an explicit post-create/post-callback init step
    or a clearly-owned Rust state object.
 
+8. Keep `soac-runtime` visibly raw and ABI-shaped. It is the very-hot
+   local runtime layer that gets inlined into generated code: avoid PyO3
+   wrapper types there, name hand-written CPython layout mirrors with a
+   `RawPy*` prefix, and keep casts clustered at ABI boundaries so direct
+   layout access remains obvious in review.
+
 ## THE DEVELOPMENT LOOP
 
 When I submit a request, if it's a simple, fully-specific or

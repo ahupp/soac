@@ -1,6 +1,7 @@
 use crate::SOAC_RUNTIME_CLIF;
 use crate::counter_dump::{
-    read_call_target_specializations_from_file, read_operator_specializations_from_file,
+    CollectedKeyLayout, collect_type_key_layouts, read_call_target_specializations_from_file,
+    read_operator_specializations_from_file,
 };
 use crate::module_constants::{ModuleCodegenConstants, ModuleConstantId};
 use crate::module_type::SharedModuleState;
@@ -161,8 +162,43 @@ static SOAC_RUNTIME_LOAD_GLOBAL_IMPORT: ImportSpec = ImportSpec::local(
     &[SigType::Pointer, SigType::Pointer, SigType::I64],
     &[SigType::Pointer],
 );
+static SOAC_RUNTIME_LOAD_GLOBAL_INDEXED_IMPORT: ImportSpec = ImportSpec::local(
+    SOAC_RUNTIME_LOAD_GLOBAL_INDEXED_SYMBOL,
+    &[SigType::Pointer, SigType::Pointer, SigType::I64],
+    &[SigType::Pointer],
+);
+static SOAC_RUNTIME_LOAD_GLOBAL_SLOW_IMPORT: ImportSpec = ImportSpec::new(
+    "soac_runtime_load_global_slow",
+    &[SigType::Pointer, SigType::Pointer, SigType::I64],
+    &[SigType::Pointer],
+);
 static SOAC_RUNTIME_STORE_GLOBAL_IMPORT: ImportSpec = ImportSpec::local(
     SOAC_RUNTIME_STORE_GLOBAL_SYMBOL,
+    &[
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::I64,
+        SigType::Pointer,
+    ],
+    &[SigType::Pointer],
+);
+static SOAC_RUNTIME_STORE_GLOBAL_INDEXED_IMPORT: ImportSpec = ImportSpec::local(
+    SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL,
+    &[
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::I64,
+        SigType::Pointer,
+    ],
+    &[SigType::Pointer],
+);
+static SOAC_RUNTIME_LOAD_FIELD_INDEXED_IMPORT: ImportSpec = ImportSpec::local(
+    SOAC_RUNTIME_LOAD_FIELD_INDEXED_SYMBOL,
+    &[SigType::Pointer, SigType::Pointer, SigType::I64],
+    &[SigType::Pointer],
+);
+static SOAC_RUNTIME_STORE_FIELD_INDEXED_IMPORT: ImportSpec = ImportSpec::local(
+    SOAC_RUNTIME_STORE_FIELD_INDEXED_SYMBOL,
     &[
         SigType::Pointer,
         SigType::Pointer,
@@ -524,6 +560,7 @@ fn emit_codegen_local_name_load(
 fn emit_codegen_located_name_load(
     fb: &mut FunctionBuilder<'_>,
     name: &ResolvedName,
+    load_instr_id: Option<InstrId>,
     local_names: &mut Vec<String>,
     local_values: &mut Vec<ir::Value>,
     ctx: &JitEmitCtx<'_>,
@@ -575,8 +612,6 @@ fn emit_codegen_located_name_load(
         }
         NameLocation::Global(slot) => {
             let globals_obj = ctx.consts.block_const;
-            let value_ok_block = fb.create_block();
-            fb.append_block_param(value_ok_block, ptr_ty);
             let name_obj = emit_owned_module_constant(
                 fb,
                 ctx.module_constants
@@ -584,12 +619,27 @@ fn emit_codegen_located_name_load(
                 ctx,
             );
             let slot_index = fb.ins().iconst(ir::types::I64, i64::from(slot.slot()));
-            let value_inst = fb.ins().call(
-                ctx.load_global_fast_ref,
-                &[globals_obj, name_obj, slot_index],
-            );
-            fb.ins().call(ctx.decref_ref, &[name_obj]);
-            let value = fb.inst_results(value_inst)[0];
+            let value = if let Some(instr_id) = load_instr_id
+                && ctx.global_indexed_hit_counter_ids.contains_key(&instr_id)
+            {
+                emit_codegen_indexed_global_load(
+                    fb,
+                    globals_obj,
+                    name_obj,
+                    slot_index,
+                    instr_id,
+                    ctx,
+                )
+            } else {
+                let value_inst = fb.ins().call(
+                    ctx.load_global_fast_ref,
+                    &[globals_obj, name_obj, slot_index],
+                );
+                fb.ins().call(ctx.decref_ref, &[name_obj]);
+                fb.inst_results(value_inst)[0]
+            };
+            let value_ok_block = fb.create_block();
+            fb.append_block_param(value_ok_block, ptr_ty);
             let value_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, value, null_ptr);
             fb.ins().brif(
                 value_is_null,
@@ -626,6 +676,80 @@ fn emit_codegen_located_name_load(
             fb.block_params(value_ok_block)[0]
         }
     }
+}
+
+fn emit_optional_counter_increment_for_kind(
+    fb: &mut FunctionBuilder<'_>,
+    ctx: &JitEmitCtx<'_>,
+    counters: &HashMap<InstrId, CounterId>,
+    instr_id: InstrId,
+) {
+    if let Some(counter_id) = counters.get(&instr_id).copied() {
+        let counter_ptr = ctx.counter_ptrs[counter_id.0];
+        emit_increment_counter_ptr(fb, ctx.consts.ptr_ty, counter_ptr);
+    }
+}
+
+fn emit_codegen_indexed_global_load(
+    fb: &mut FunctionBuilder<'_>,
+    globals_obj: ir::Value,
+    name_obj: ir::Value,
+    slot_index: ir::Value,
+    instr_id: InstrId,
+    ctx: &JitEmitCtx<'_>,
+) -> ir::Value {
+    let ptr_ty = ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let result_block = fb.create_block();
+    fb.append_block_param(result_block, ptr_ty);
+    let fallback_block = fb.create_block();
+    let direct_block = fb.create_block();
+    fb.append_block_param(direct_block, ptr_ty);
+
+    let direct_inst = fb
+        .ins()
+        .call(ctx.load_global_indexed_ref, &[globals_obj, name_obj, slot_index]);
+    let direct_value = fb.inst_results(direct_inst)[0];
+    let direct_is_null =
+        fb.ins()
+            .icmp(ir::condcodes::IntCC::Equal, direct_value, null_ptr);
+    fb.ins().brif(
+        direct_is_null,
+        fallback_block,
+        &[],
+        direct_block,
+        &[ir::BlockArg::Value(direct_value)],
+    );
+
+    fb.switch_to_block(direct_block);
+    let direct_value = fb.block_params(direct_block)[0];
+    emit_optional_counter_increment_for_kind(
+        fb,
+        ctx,
+        ctx.global_indexed_hit_counter_ids,
+        instr_id,
+    );
+    fb.ins().call(ctx.decref_ref, &[name_obj]);
+    fb.ins()
+        .jump(result_block, &[ir::BlockArg::Value(direct_value)]);
+
+    fb.switch_to_block(fallback_block);
+    emit_optional_counter_increment_for_kind(
+        fb,
+        ctx,
+        ctx.global_indexed_fallback_counter_ids,
+        instr_id,
+    );
+    let fallback_inst = fb
+        .ins()
+        .call(ctx.load_global_slow_ref, &[globals_obj, name_obj, slot_index]);
+    let fallback_value = fb.inst_results(fallback_inst)[0];
+    fb.ins().call(ctx.decref_ref, &[name_obj]);
+    fb.ins()
+        .jump(result_block, &[ir::BlockArg::Value(fallback_value)]);
+
+    fb.switch_to_block(result_block);
+    fb.block_params(result_block)[0]
 }
 
 fn codegen_expr_const_string(
@@ -850,6 +974,11 @@ struct JitEmitCtx<'mc> {
     finish_constructor_init_ref: ir::FuncRef,
     consts: JitEmitConsts,
     load_global_fast_ref: ir::FuncRef,
+    load_global_indexed_ref: ir::FuncRef,
+    load_global_slow_ref: ir::FuncRef,
+    store_global_indexed_ref: ir::FuncRef,
+    load_field_indexed_ref: ir::FuncRef,
+    store_field_indexed_ref: ir::FuncRef,
     load_runtime_obj_ref: ir::FuncRef,
     direct_code_ptr_ref: ir::FuncRef,
     direct_vmctx_ref: ir::FuncRef,
@@ -880,6 +1009,11 @@ struct JitEmitCtx<'mc> {
     operator_specializations: &'mc HashMap<InstrId, Vec<u64>>,
     operator_specialized_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
     operator_specialized_fallback_counter_ids: &'mc HashMap<InstrId, CounterId>,
+    global_indexed_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
+    global_indexed_fallback_counter_ids: &'mc HashMap<InstrId, CounterId>,
+    field_indexed_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
+    field_indexed_fallback_counter_ids: &'mc HashMap<InstrId, CounterId>,
+    field_index_specializations: &'mc HashMap<String, Vec<FieldIndexSpecialization>>,
 }
 
 #[derive(Clone, Copy)]
@@ -896,6 +1030,13 @@ struct DirectConstructorSpecialization {
     function_id: FunctionId,
     target_code_ptr: ObjPtr,
     init_function: ObjPtr,
+    owner_type: *mut ffi::PyTypeObject,
+    type_version: u32,
+}
+
+#[derive(Clone, Copy)]
+struct FieldIndexSpecialization {
+    expected_index: u32,
     owner_type: *mut ffi::PyTypeObject,
     type_version: u32,
 }
@@ -1863,7 +2004,7 @@ fn module_constant_string_value<'a>(
     Some(literal.value.as_str())
 }
 
-fn codegen_constant_string_value<'a>(
+pub(super) fn codegen_constant_string_value<'a>(
     module: &'a BlockPyModule<CodegenModuleShape>,
     expr: &InstrCodegen,
 ) -> Option<&'a str> {
@@ -2266,6 +2407,66 @@ fn load_operator_specializations(
         return Ok(HashMap::new());
     }
     read_operator_specializations_from_file(path, module_name, function_id)
+}
+
+fn type_layout_is_for_module_owner(module_name: &str, layout: &CollectedKeyLayout) -> bool {
+    layout.owner == module_name
+        || layout
+            .owner
+            .strip_prefix(module_name)
+            .is_some_and(|suffix| suffix.starts_with('.'))
+}
+
+fn load_field_index_specializations(
+    module_name: &str,
+) -> Result<HashMap<String, Vec<FieldIndexSpecialization>>, String> {
+    if specialization_mode_is_profile() {
+        return Ok(HashMap::new());
+    }
+    let Some(path) = counter_dump_input_path_from_env() else {
+        return Ok(HashMap::new());
+    };
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let dump = crate::counter_dump::CounterDumpFile::open(path.as_path())?;
+    let records = dump.records()?;
+    let type_keys = collect_type_key_layouts(records.as_slice())?;
+    let mut out = HashMap::<String, Vec<FieldIndexSpecialization>>::new();
+    for layouts in type_keys.values() {
+        for layout in layouts {
+            if !type_layout_is_for_module_owner(module_name, layout) {
+                continue;
+            }
+            let Ok(Some(owner)) =
+                (unsafe { crate::lookup_exact_owner_type_for_field(&layout.owner, &layout.key) })
+            else {
+                continue;
+            };
+            out.entry(layout.key.clone())
+                .or_default()
+                .push(FieldIndexSpecialization {
+                    expected_index: layout.index,
+                    owner_type: owner.owner_type,
+                    type_version: owner.type_version,
+                });
+        }
+    }
+    for specializations in out.values_mut() {
+        specializations.sort_by_key(|specialization| {
+            (
+                specialization.owner_type as usize,
+                specialization.expected_index,
+            )
+        });
+        specializations.dedup_by_key(|specialization| {
+            (
+                specialization.owner_type as usize,
+                specialization.expected_index,
+            )
+        });
+    }
+    Ok(out)
 }
 
 fn specialization_mode_from_env() -> Option<String> {
@@ -2939,6 +3140,7 @@ fn emit_codegen_expr(
             return emit_codegen_located_name_load(
                 fb,
                 &op.name,
+                op.meta().instr_id,
                 local_names,
                 local_values,
                 ctx,
@@ -5164,7 +5366,11 @@ impl RuntimeSupportInliner {
                     | SOAC_RUNTIME_CALLEE_FUNCTION_ID_SYMBOL
                     | SOAC_RUNTIME_FUNCTION_DATA_BLOCK_SYMBOL
                     | SOAC_RUNTIME_LOAD_GLOBAL_SYMBOL
+                    | SOAC_RUNTIME_LOAD_GLOBAL_INDEXED_SYMBOL
                     | SOAC_RUNTIME_STORE_GLOBAL_SYMBOL
+                    | SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL
+                    | SOAC_RUNTIME_LOAD_FIELD_INDEXED_SYMBOL
+                    | SOAC_RUNTIME_STORE_FIELD_INDEXED_SYMBOL
             ) {
                 continue;
             }
@@ -5280,7 +5486,15 @@ pub(crate) const SOAC_RUNTIME_DECREF_SYMBOL: &str = "soac_runtime_decref";
 pub(crate) const SOAC_RUNTIME_CALLEE_FUNCTION_ID_SYMBOL: &str = "soac_runtime_callee_function_id";
 pub(crate) const SOAC_RUNTIME_FUNCTION_DATA_BLOCK_SYMBOL: &str = "soac_runtime_function_data_block";
 pub(crate) const SOAC_RUNTIME_LOAD_GLOBAL_SYMBOL: &str = "soac_runtime_load_global";
+pub(crate) const SOAC_RUNTIME_LOAD_GLOBAL_INDEXED_SYMBOL: &str =
+    "soac_runtime_load_global_indexed";
 pub(crate) const SOAC_RUNTIME_STORE_GLOBAL_SYMBOL: &str = "soac_runtime_store_global";
+pub(crate) const SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL: &str =
+    "soac_runtime_store_global_indexed";
+pub(crate) const SOAC_RUNTIME_LOAD_FIELD_INDEXED_SYMBOL: &str =
+    "soac_runtime_load_field_indexed";
+pub(crate) const SOAC_RUNTIME_STORE_FIELD_INDEXED_SYMBOL: &str =
+    "soac_runtime_store_field_indexed";
 
 pub(crate) fn jit_python_perf_symbol_name(kind: &str, qualname: &str) -> String {
     format!("py:{kind}:{qualname}")
@@ -5810,6 +6024,26 @@ fn build_cranelift_run_bb_specialized_function(
         function.function_id,
         "operator_specialized_fallback",
     );
+    let global_indexed_hit_counter_ids = collect_runtime_counter_ids_by_kind(
+        counter_defs,
+        function.function_id,
+        "global_indexed_hit",
+    );
+    let global_indexed_fallback_counter_ids = collect_runtime_counter_ids_by_kind(
+        counter_defs,
+        function.function_id,
+        "global_indexed_fallback",
+    );
+    let field_indexed_hit_counter_ids = collect_runtime_counter_ids_by_kind(
+        counter_defs,
+        function.function_id,
+        "field_indexed_hit",
+    );
+    let field_indexed_fallback_counter_ids = collect_runtime_counter_ids_by_kind(
+        counter_defs,
+        function.function_id,
+        "field_indexed_fallback",
+    );
     let call_target_specializations = match direct_call_resolver {
         Some(shared_state) => load_call_target_specializations(
             shared_state.module_name.as_str(),
@@ -5821,6 +6055,10 @@ fn build_cranelift_run_bb_specialized_function(
         Some(shared_state) => {
             load_operator_specializations(shared_state.module_name.as_str(), function.function_id)?
         }
+        None => HashMap::new(),
+    };
+    let field_index_specializations = match direct_call_resolver {
+        Some(shared_state) => load_field_index_specializations(shared_state.module_name.as_str())?,
         None => HashMap::new(),
     };
     let function_runtime_data_layout = FunctionRuntimeDataLayout::from_function(function);
@@ -6014,6 +6252,31 @@ fn build_cranelift_run_bb_specialized_function(
         );
         let load_global_fast_ref =
             func_imports.get_or_panic(jit_module, &mut fb.func, &SOAC_RUNTIME_LOAD_GLOBAL_IMPORT);
+        let load_global_indexed_ref = func_imports.get_or_panic(
+            jit_module,
+            &mut fb.func,
+            &SOAC_RUNTIME_LOAD_GLOBAL_INDEXED_IMPORT,
+        );
+        let load_global_slow_ref = func_imports.get_or_panic(
+            jit_module,
+            &mut fb.func,
+            &SOAC_RUNTIME_LOAD_GLOBAL_SLOW_IMPORT,
+        );
+        let store_global_indexed_ref = func_imports.get_or_panic(
+            jit_module,
+            &mut fb.func,
+            &SOAC_RUNTIME_STORE_GLOBAL_INDEXED_IMPORT,
+        );
+        let load_field_indexed_ref = func_imports.get_or_panic(
+            jit_module,
+            &mut fb.func,
+            &SOAC_RUNTIME_LOAD_FIELD_INDEXED_IMPORT,
+        );
+        let store_field_indexed_ref = func_imports.get_or_panic(
+            jit_module,
+            &mut fb.func,
+            &SOAC_RUNTIME_STORE_FIELD_INDEXED_IMPORT,
+        );
         let load_runtime_obj_ref =
             func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_LOAD_RUNTIME_OBJ_IMPORT);
         let is_true_ref =
@@ -6295,6 +6558,11 @@ fn build_cranelift_run_bb_specialized_function(
                     py_long_type_ptr: std::ptr::addr_of_mut!(PyLong_Type),
                 },
                 load_global_fast_ref,
+                load_global_indexed_ref,
+                load_global_slow_ref,
+                store_global_indexed_ref,
+                load_field_indexed_ref,
+                store_field_indexed_ref,
                 load_runtime_obj_ref,
                 direct_code_ptr_ref,
                 direct_vmctx_ref,
@@ -6326,6 +6594,11 @@ fn build_cranelift_run_bb_specialized_function(
                 operator_specialized_hit_counter_ids: &operator_specialized_hit_counter_ids,
                 operator_specialized_fallback_counter_ids:
                     &operator_specialized_fallback_counter_ids,
+                global_indexed_hit_counter_ids: &global_indexed_hit_counter_ids,
+                global_indexed_fallback_counter_ids: &global_indexed_fallback_counter_ids,
+                field_indexed_hit_counter_ids: &field_indexed_hit_counter_ids,
+                field_indexed_fallback_counter_ids: &field_indexed_fallback_counter_ids,
+                field_index_specializations: &field_index_specializations,
             };
             let block = &function.blocks[index];
             let mut local_names = Vec::new();

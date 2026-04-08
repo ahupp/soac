@@ -1,6 +1,7 @@
 use super::{
     ImportSpec, JitEmitCtx, SOAC_RUNTIME_LOAD_GLOBAL_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_IMPORT,
-    SigType, emit_increment_counter_ptr, emit_owned_module_constant_from_parts,
+    SigType, codegen_constant_string_value, emit_increment_counter_ptr,
+    emit_owned_module_constant_from_parts,
 };
 use crate::jit::blockpy_intrinsics;
 use crate::operator_specialization::{
@@ -369,34 +370,269 @@ fn emit_identity_compare_from_values<'fb, E>(
     state.emit_owned_bool_from_cond(cond)
 }
 
-fn emit_getattr<'fb, E: Instr>(
-    op: &blockpy_intrinsics::GetAttr<E>,
+fn emit_counted_getattr_fallback<'fb, E: Instr>(
     state: &mut impl OperationEmitState<'fb, E>,
+    instr_id: Option<soac_blockpy::block_py::InstrId>,
+    arg_values: &[(ir::Value, bool)],
 ) -> ir::Value {
-    let arg_values = state.emit_arg_values(&[&op.value, &op.attr]);
+    if let Some(instr_id) = instr_id {
+        let counter_ptr = state
+            .ctx()
+            .field_indexed_fallback_counter_ids
+            .get(&instr_id)
+            .map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
+        increment_counter_ptr_with_state(state, counter_ptr);
+    }
     let pyobject_getattr_ref = state.ctx().pyobject_getattr_ref;
     let call_inst = state
         .fb()
         .ins()
         .call(pyobject_getattr_ref, &[arg_values[0].0, arg_values[1].0]);
-    state.release_arg_values(&arg_values);
-    let result = state.fb().inst_results(call_inst)[0];
-    state.finish_owned_result(result)
+    state.fb().inst_results(call_inst)[0]
 }
 
-fn emit_setattr<'fb, E: Instr>(
-    op: &blockpy_intrinsics::SetAttr<E>,
-    state: &mut impl OperationEmitState<'fb, E>,
+fn emit_specialized_getattr<'fb>(
+    op: &blockpy_intrinsics::GetAttr<InstrCodegen>,
+    state: &mut impl OperationEmitState<'fb, InstrCodegen>,
+) -> Option<ir::Value> {
+    let instr_id = op.meta().instr_id?;
+    let attr_name = codegen_constant_string_value(state.ctx().module, op.attr.as_ref())?;
+    let specialization = *state
+        .ctx()
+        .field_index_specializations
+        .get(attr_name)?
+        .first()?;
+    let arg_values = state.emit_arg_values(&[op.value.as_ref(), op.attr.as_ref()]);
+    let ptr_ty = state.ctx().consts.ptr_ty;
+    let i64_ty = state.ctx().consts.i64_ty;
+    let i32_ty = state.ctx().consts.i32_ty;
+    let null_ptr = state.fb().ins().iconst(ptr_ty, 0);
+    let zero_i32 = state.fb().ins().iconst(i32_ty, 0);
+    let owner_type = state
+        .fb()
+        .ins()
+        .iconst(ptr_ty, specialization.owner_type as i64);
+    let expected_version = state
+        .fb()
+        .ins()
+        .iconst(i64_ty, i64::from(specialization.type_version));
+    let expected_index = state
+        .fb()
+        .ins()
+        .iconst(i64_ty, i64::from(specialization.expected_index));
+    let load_field_indexed_ref = state.ctx().load_field_indexed_ref;
+    let guard_type_version_ref = state.ctx().guard_method_type_version_ref;
+    let hit_counter_ptr = state
+        .ctx()
+        .field_indexed_hit_counter_ids
+        .get(&instr_id)
+        .map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
+    let fallback_counter_ptr = state
+        .ctx()
+        .field_indexed_fallback_counter_ids
+        .get(&instr_id)
+        .map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
+
+    let result_block = state.fb().create_block();
+    state.fb().append_block_param(result_block, ptr_ty);
+    let maybe_direct_block = state.fb().create_block();
+    let direct_block = state.fb().create_block();
+    state.fb().append_block_param(direct_block, ptr_ty);
+    let fallback_block = state.fb().create_block();
+
+    let guard_inst = state.fb().ins().call(
+        guard_type_version_ref,
+        &[arg_values[0].0, owner_type, expected_version],
+    );
+    let guard_result = state.fb().inst_results(guard_inst)[0];
+    let type_matches =
+        state
+            .fb()
+            .ins()
+            .icmp(ir::condcodes::IntCC::NotEqual, guard_result, zero_i32);
+    state
+        .fb()
+        .ins()
+        .brif(type_matches, maybe_direct_block, &[], fallback_block, &[]);
+
+    state.fb().switch_to_block(maybe_direct_block);
+    let direct_inst = state.fb().ins().call(
+        load_field_indexed_ref,
+        &[arg_values[0].0, arg_values[1].0, expected_index],
+    );
+    let direct_value = state.fb().inst_results(direct_inst)[0];
+    let direct_is_null =
+        state
+            .fb()
+            .ins()
+            .icmp(ir::condcodes::IntCC::Equal, direct_value, null_ptr);
+    state.fb().ins().brif(
+        direct_is_null,
+        fallback_block,
+        &[],
+        direct_block,
+        &[ir::BlockArg::Value(direct_value)],
+    );
+
+    state.fb().switch_to_block(direct_block);
+    let direct_value = state.fb().block_params(direct_block)[0];
+    increment_counter_ptr_with_state(state, hit_counter_ptr);
+    state.release_arg_values(&arg_values);
+    state
+        .fb()
+        .ins()
+        .jump(result_block, &[ir::BlockArg::Value(direct_value)]);
+
+    state.fb().switch_to_block(fallback_block);
+    increment_counter_ptr_with_state(state, fallback_counter_ptr);
+    let fallback_value = emit_counted_getattr_fallback(state, None, &arg_values);
+    state.release_arg_values(&arg_values);
+    state
+        .fb()
+        .ins()
+        .jump(result_block, &[ir::BlockArg::Value(fallback_value)]);
+
+    state.fb().switch_to_block(result_block);
+    let result = state.fb().block_params(result_block)[0];
+    Some(state.finish_owned_result(result))
+}
+
+fn emit_setattr_fallback<'fb>(
+    state: &mut impl OperationEmitState<'fb, InstrCodegen>,
+    instr_id: Option<soac_blockpy::block_py::InstrId>,
+    arg_values: &[(ir::Value, bool)],
 ) -> ir::Value {
-    let arg_values = state.emit_arg_values(&[&op.value, &op.attr, &op.replacement]);
+    if let Some(instr_id) = instr_id {
+        let counter_ptr = state
+            .ctx()
+            .field_indexed_fallback_counter_ids
+            .get(&instr_id)
+            .map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
+        increment_counter_ptr_with_state(state, counter_ptr);
+    }
     let pyobject_setattr_ref = state.ctx().pyobject_setattr_ref;
     let call_inst = state.fb().ins().call(
         pyobject_setattr_ref,
         &[arg_values[0].0, arg_values[1].0, arg_values[2].0],
     );
+    state.fb().inst_results(call_inst)[0]
+}
+
+fn emit_specialized_setattr<'fb>(
+    op: &blockpy_intrinsics::SetAttr<InstrCodegen>,
+    state: &mut impl OperationEmitState<'fb, InstrCodegen>,
+) -> Option<ir::Value> {
+    let instr_id = op.meta().instr_id?;
+    let attr_name = codegen_constant_string_value(state.ctx().module, op.attr.as_ref())?;
+    let specialization = *state
+        .ctx()
+        .field_index_specializations
+        .get(attr_name)?
+        .first()?;
+    let arg_values =
+        state.emit_arg_values(&[op.value.as_ref(), op.attr.as_ref(), op.replacement.as_ref()]);
+    let ptr_ty = state.ctx().consts.ptr_ty;
+    let i64_ty = state.ctx().consts.i64_ty;
+    let i32_ty = state.ctx().consts.i32_ty;
+    let null_ptr = state.fb().ins().iconst(ptr_ty, 0);
+    let zero_i32 = state.fb().ins().iconst(i32_ty, 0);
+    let owner_type = state
+        .fb()
+        .ins()
+        .iconst(ptr_ty, specialization.owner_type as i64);
+    let expected_version = state
+        .fb()
+        .ins()
+        .iconst(i64_ty, i64::from(specialization.type_version));
+    let expected_index = state
+        .fb()
+        .ins()
+        .iconst(i64_ty, i64::from(specialization.expected_index));
+    let store_field_indexed_ref = state.ctx().store_field_indexed_ref;
+    let guard_type_version_ref = state.ctx().guard_method_type_version_ref;
+    let hit_counter_ptr = state
+        .ctx()
+        .field_indexed_hit_counter_ids
+        .get(&instr_id)
+        .map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
+    let fallback_counter_ptr = state
+        .ctx()
+        .field_indexed_fallback_counter_ids
+        .get(&instr_id)
+        .map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
+
+    let result_block = state.fb().create_block();
+    state.fb().append_block_param(result_block, ptr_ty);
+    let maybe_direct_block = state.fb().create_block();
+    let direct_block = state.fb().create_block();
+    state.fb().append_block_param(direct_block, ptr_ty);
+    let fallback_block = state.fb().create_block();
+
+    let guard_inst = state.fb().ins().call(
+        guard_type_version_ref,
+        &[arg_values[0].0, owner_type, expected_version],
+    );
+    let guard_result = state.fb().inst_results(guard_inst)[0];
+    let type_matches =
+        state
+            .fb()
+            .ins()
+            .icmp(ir::condcodes::IntCC::NotEqual, guard_result, zero_i32);
+    state
+        .fb()
+        .ins()
+        .brif(type_matches, maybe_direct_block, &[], fallback_block, &[]);
+
+    state.fb().switch_to_block(maybe_direct_block);
+    let direct_inst = state.fb().ins().call(
+        store_field_indexed_ref,
+        &[
+            arg_values[0].0,
+            arg_values[1].0,
+            expected_index,
+            arg_values[2].0,
+        ],
+    );
+    let direct_value = state.fb().inst_results(direct_inst)[0];
+    let direct_is_null =
+        state
+            .fb()
+            .ins()
+            .icmp(ir::condcodes::IntCC::Equal, direct_value, null_ptr);
+    state.fb().ins().brif(
+        direct_is_null,
+        fallback_block,
+        &[],
+        direct_block,
+        &[ir::BlockArg::Value(direct_value)],
+    );
+
+    state.fb().switch_to_block(direct_block);
+    let direct_value = state.fb().block_params(direct_block)[0];
+    increment_counter_ptr_with_state(state, hit_counter_ptr);
+    let none_const = state.ctx().consts.none_const;
+    let incref_ref = state.ctx().incref_ref;
+    let decref_ref = state.ctx().decref_ref;
+    state.fb().ins().call(decref_ref, &[direct_value]);
+    state.fb().ins().call(incref_ref, &[none_const]);
     state.release_arg_values(&arg_values);
-    let result = state.fb().inst_results(call_inst)[0];
-    state.finish_owned_result(result)
+    state
+        .fb()
+        .ins()
+        .jump(result_block, &[ir::BlockArg::Value(none_const)]);
+
+    state.fb().switch_to_block(fallback_block);
+    increment_counter_ptr_with_state(state, fallback_counter_ptr);
+    let fallback_value = emit_setattr_fallback(state, None, &arg_values);
+    state.release_arg_values(&arg_values);
+    state
+        .fb()
+        .ins()
+        .jump(result_block, &[ir::BlockArg::Value(fallback_value)]);
+
+    state.fb().switch_to_block(result_block);
+    let result = state.fb().block_params(result_block)[0];
+    Some(state.finish_owned_result(result))
 }
 
 fn emit_make_cell<'fb, E>(state: &mut impl OperationEmitState<'fb, E>, args: &[&E]) -> ir::Value {
@@ -858,6 +1094,89 @@ fn emit_specialized_unary_op<'fb>(
     Some(state.fb().block_params(result_block)[0])
 }
 
+fn increment_counter_ptr_with_state<'fb, E>(
+    state: &mut impl OperationEmitState<'fb, E>,
+    counter_ptr: Option<*mut u64>,
+) {
+    let Some(counter_ptr) = counter_ptr else {
+        return;
+    };
+    let ptr_ty = state.ctx().consts.ptr_ty;
+    emit_increment_counter_ptr(state.fb(), ptr_ty, counter_ptr);
+}
+
+fn emit_indexed_global_load_with_state<'fb>(
+    state: &mut impl OperationEmitState<'fb, InstrCodegen>,
+    globals_obj: ir::Value,
+    name_obj: ir::Value,
+    slot_index: ir::Value,
+    instr_id: soac_blockpy::block_py::InstrId,
+) -> ir::Value {
+    let ptr_ty = state.ctx().consts.ptr_ty;
+    let null_ptr = state.fb().ins().iconst(ptr_ty, 0);
+    let load_global_indexed_ref = state.ctx().load_global_indexed_ref;
+    let load_global_slow_ref = state.ctx().load_global_slow_ref;
+    let decref_ref = state.ctx().decref_ref;
+    let hit_counter_ptr = state
+        .ctx()
+        .global_indexed_hit_counter_ids
+        .get(&instr_id)
+        .map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
+    let fallback_counter_ptr = state
+        .ctx()
+        .global_indexed_fallback_counter_ids
+        .get(&instr_id)
+        .map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
+    let result_block = state.fb().create_block();
+    state.fb().append_block_param(result_block, ptr_ty);
+    let fallback_block = state.fb().create_block();
+    let direct_block = state.fb().create_block();
+    state.fb().append_block_param(direct_block, ptr_ty);
+
+    let direct_inst = state
+        .fb()
+        .ins()
+        .call(load_global_indexed_ref, &[globals_obj, name_obj, slot_index]);
+    let direct_value = state.fb().inst_results(direct_inst)[0];
+    let direct_is_null =
+        state
+            .fb()
+            .ins()
+            .icmp(ir::condcodes::IntCC::Equal, direct_value, null_ptr);
+    state.fb().ins().brif(
+        direct_is_null,
+        fallback_block,
+        &[],
+        direct_block,
+        &[ir::BlockArg::Value(direct_value)],
+    );
+
+    state.fb().switch_to_block(direct_block);
+    let direct_value = state.fb().block_params(direct_block)[0];
+    increment_counter_ptr_with_state(state, hit_counter_ptr);
+    state.fb().ins().call(decref_ref, &[name_obj]);
+    state
+        .fb()
+        .ins()
+        .jump(result_block, &[ir::BlockArg::Value(direct_value)]);
+
+    state.fb().switch_to_block(fallback_block);
+    increment_counter_ptr_with_state(state, fallback_counter_ptr);
+    let fallback_inst = state
+        .fb()
+        .ins()
+        .call(load_global_slow_ref, &[globals_obj, name_obj, slot_index]);
+    let fallback_value = state.fb().inst_results(fallback_inst)[0];
+    state.fb().ins().call(decref_ref, &[name_obj]);
+    state
+        .fb()
+        .ins()
+        .jump(result_block, &[ir::BlockArg::Value(fallback_value)]);
+
+    state.fb().switch_to_block(result_block);
+    state.fb().block_params(result_block)[0]
+}
+
 fn emit_load<'fb>(
     op: &blockpy_intrinsics::Load<InstrCodegen>,
     state: &mut impl OperationEmitState<'fb, InstrCodegen>,
@@ -882,12 +1201,27 @@ fn emit_load<'fb>(
                 .fb()
                 .ins()
                 .iconst(ir::types::I64, i64::from(slot.slot()));
-            let call_inst = state
-                .fb()
-                .ins()
-                .call(func_ref, &[globals_obj, name_obj, slot_index]);
-            state.fb().ins().call(decref_ref, &[name_obj]);
-            let slow_value = state.fb().inst_results(call_inst)[0];
+            let slow_value = if let Some(instr_id) = op.meta().instr_id
+                && state
+                    .ctx()
+                    .global_indexed_hit_counter_ids
+                    .contains_key(&instr_id)
+            {
+                emit_indexed_global_load_with_state(
+                    state,
+                    globals_obj,
+                    name_obj,
+                    slot_index,
+                    instr_id,
+                )
+            } else {
+                let call_inst = state
+                    .fb()
+                    .ins()
+                    .call(func_ref, &[globals_obj, name_obj, slot_index]);
+                state.fb().ins().call(decref_ref, &[name_obj]);
+                state.fb().inst_results(call_inst)[0]
+            };
             let slow_value_is_null =
                 state
                     .fb()
@@ -939,13 +1273,84 @@ fn emit_store<'fb>(
             .iconst(ir::types::I64, i64::from(slot.slot())),
         _ => unreachable!("emit_store only applies to global names"),
     };
-    let call_inst = state.fb().ins().call(
-        func_ref,
-        &[globals_obj, name_obj, slot_index, arg_values[0].0],
-    );
-    state.release_arg_values(&arg_values);
-    state.fb().ins().call(decref_ref, &[name_obj]);
-    let result = state.fb().inst_results(call_inst)[0];
+    let result = if let Some(instr_id) = op.meta().instr_id
+        && state
+            .ctx()
+            .global_indexed_hit_counter_ids
+            .contains_key(&instr_id)
+    {
+        let ptr_ty = state.ctx().consts.ptr_ty;
+        let null_ptr = state.fb().ins().iconst(ptr_ty, 0);
+        let store_global_indexed_ref = state.ctx().store_global_indexed_ref;
+        let hit_counter_ptr = state
+            .ctx()
+            .global_indexed_hit_counter_ids
+            .get(&instr_id)
+            .map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
+        let fallback_counter_ptr = state
+            .ctx()
+            .global_indexed_fallback_counter_ids
+            .get(&instr_id)
+            .map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
+        let result_block = state.fb().create_block();
+        state.fb().append_block_param(result_block, ptr_ty);
+        let fallback_block = state.fb().create_block();
+        let direct_block = state.fb().create_block();
+        state.fb().append_block_param(direct_block, ptr_ty);
+        let direct_inst = state.fb().ins().call(
+            store_global_indexed_ref,
+            &[globals_obj, name_obj, slot_index, arg_values[0].0],
+        );
+        let direct_value = state.fb().inst_results(direct_inst)[0];
+        let direct_is_null =
+            state
+                .fb()
+                .ins()
+                .icmp(ir::condcodes::IntCC::Equal, direct_value, null_ptr);
+        state.fb().ins().brif(
+            direct_is_null,
+            fallback_block,
+            &[],
+            direct_block,
+            &[ir::BlockArg::Value(direct_value)],
+        );
+
+        state.fb().switch_to_block(direct_block);
+        let direct_value = state.fb().block_params(direct_block)[0];
+        increment_counter_ptr_with_state(state, hit_counter_ptr);
+        state.release_arg_values(&arg_values);
+        state.fb().ins().call(decref_ref, &[name_obj]);
+        state
+            .fb()
+            .ins()
+            .jump(result_block, &[ir::BlockArg::Value(direct_value)]);
+
+        state.fb().switch_to_block(fallback_block);
+        increment_counter_ptr_with_state(state, fallback_counter_ptr);
+        let fallback_inst = state.fb().ins().call(
+            func_ref,
+            &[globals_obj, name_obj, slot_index, arg_values[0].0],
+        );
+        let fallback_value = state.fb().inst_results(fallback_inst)[0];
+        state.release_arg_values(&arg_values);
+        state.fb().ins().call(decref_ref, &[name_obj]);
+        state
+            .fb()
+            .ins()
+            .jump(result_block, &[ir::BlockArg::Value(fallback_value)]);
+
+        state.fb().switch_to_block(result_block);
+        state.fb().block_params(result_block)[0]
+    } else {
+        let call_inst = state.fb().ins().call(
+            func_ref,
+            &[globals_obj, name_obj, slot_index, arg_values[0].0],
+        );
+        let result = state.fb().inst_results(call_inst)[0];
+        state.release_arg_values(&arg_values);
+        state.fb().ins().call(decref_ref, &[name_obj]);
+        result
+    };
     state.finish_owned_result(result)
 }
 
@@ -1011,8 +1416,32 @@ pub(super) fn emit_operation<'fb>(
         }),
         InstrCodegen::UnaryOp(op) => emit_specialized_unary_op(op, state)
             .or_else(|| Some(emit_unary_op(op.kind, state, &[op.operand.as_ref()]))),
-        InstrCodegen::GetAttr(op) => Some(emit_getattr(op, state)),
-        InstrCodegen::SetAttr(op) => Some(emit_setattr(op, state)),
+        InstrCodegen::GetAttr(op) => {
+            if let Some(value) = emit_specialized_getattr(op, state) {
+                Some(value)
+            } else {
+                let instr_id = op.meta().instr_id;
+                let arg_values = state.emit_arg_values(&[op.value.as_ref(), op.attr.as_ref()]);
+                let result = emit_counted_getattr_fallback(state, instr_id, &arg_values);
+                state.release_arg_values(&arg_values);
+                Some(state.finish_owned_result(result))
+            }
+        }
+        InstrCodegen::SetAttr(op) => {
+            if let Some(value) = emit_specialized_setattr(op, state) {
+                Some(value)
+            } else {
+                let instr_id = op.meta().instr_id;
+                let arg_values = state.emit_arg_values(&[
+                    op.value.as_ref(),
+                    op.attr.as_ref(),
+                    op.replacement.as_ref(),
+                ]);
+                let result = emit_setattr_fallback(state, instr_id, &arg_values);
+                state.release_arg_values(&arg_values);
+                Some(state.finish_owned_result(result))
+            }
+        }
         InstrCodegen::GetItem(op) => {
             Some(emit_getitem(state, &[op.value.as_ref(), op.index.as_ref()]))
         }

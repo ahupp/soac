@@ -12,9 +12,9 @@ For each specialization, this covers:
 
 ## Profiling Input
 
-There are currently two hot specialization input streams and one cold
-key-layout metadata stream in the counter dump. The hot streams are
-consumed by the current replay path:
+The counter dump contains hot specialization input, cold key-layout
+metadata, and optional verify counters for indexed storage fast paths.
+The hot streams consumed by the current replay path are:
 
 - `call_hot_targets`
   - Instrumented for `Call` expressions with no keywords and only
@@ -36,8 +36,7 @@ consumed by the current replay path:
     `collect_operator_specializations_for_function`, at
     `soac-jit/src/counter_dump.rs:789`.
 
-The cold metadata stream records dictionary-key layouts for later replay
-passes, but does not currently change emitted code:
+The cold metadata stream records dictionary-key layouts for replay:
 
 - `module_keys`
   - Recorded when `DIET_PYTHON_KEY_LAYOUT_COUNTERS=1`, or implicitly
@@ -54,11 +53,17 @@ passes, but does not currently change emitted code:
   - Consumed from the binary counter dump with
     `collect_type_key_layouts`, at `soac-jit/src/counter_dump.rs`.
 
-Planned use: a later attribute-load/store replay pass can combine
-`type_keys` with profile counts, guard that an object's instance dict
-still uses the expected shared-key layout, and load the value slot by the
-recorded key index. That pass must still provide a normal CPython
-attribute-lookup fallback.
+Verify-mode indexed-storage counters are scalar per-site counters:
+
+- `global_indexed_hit` / `global_indexed_fallback`
+  - Instrumented for lowered global loads/stores.
+  - Count whether the indexed module-dict helper returned a direct
+    result or needed the normal global slow path.
+
+- `field_indexed_hit` / `field_indexed_fallback`
+  - Instrumented for `GetAttr`/`SetAttr`.
+  - Count whether a type-key specialization loaded the instance
+    split-dict value directly or fell back to CPython attribute access.
 
 Normal multi-pass runs use one counters directory and one mode:
 
@@ -86,6 +91,76 @@ override env var is present:
   `soac-jit/src/jit/mod.rs:1966`
 - `load_operator_specializations`, at
   `soac-jit/src/jit/mod.rs:2057`
+
+
+## Indexed Globals
+
+### Counted Input
+
+- Source layout input is `module_keys`.
+- In profile/apply modes, the transformed module object creates an
+  indexed unicode dict whose key table matches the lowered module
+  global-name table.
+- In verify mode, each global load/store also gets
+  `global_indexed_hit` and `global_indexed_fallback` scalar counters.
+
+### Codegen
+
+- Direct-name global loads/stores use the expected lowered global index.
+- The emitted fast path calls a local-runtime helper with the globals
+  dict, constant key object, and expected index.
+- The helper guards that the globals dict still has an indexed-unicode
+  keys object and an indexed-values block large enough for the compiled
+  slot, then reads or writes that slot.
+- On guard miss, tombstone, absent value, or store failure, codegen
+  increments the fallback counter when enabled and executes the existing
+  global load/store slow path.
+
+### Limitations / Soundness / Extensions
+
+- This path does not cache a module global value outside the dict; the
+  dict remains the storage authority.
+- Builtins readthrough stays on the slow path because a value appearing
+  in the module globals dict changes the correct result.
+- The fast path is specific to indexed module dictionaries. Ordinary
+  `dict` globals miss the guard and use the existing slow path.
+
+
+## Indexed Instance Fields
+
+### Counted Input
+
+- Source layout input is `type_keys`, recorded from CPython split-key
+  insertion events.
+- Codegen resolves a recorded owner name to the currently imported type,
+  then rejects the specialization if a class binding/descriptor for that
+  attribute is present.
+- In verify mode, each `GetAttr`/`SetAttr` also gets
+  `field_indexed_hit` and `field_indexed_fallback` scalar counters.
+
+### Codegen
+
+- Constant-string `GetAttr` sites with a recorded key index get a
+  guard on exact owner type and owner type version.
+- After that guard, the local-runtime helper fetches the instance dict,
+  checks that it is still a CPython split dict with the expected key at
+  the recorded index, and returns an owned reference to the value slot.
+- Missing values, promoted/combined dicts, key-index mismatch, type
+  guard miss, or type-version miss increment the fallback counter when
+  enabled and execute normal CPython attribute lookup.
+- `SetAttr` sites currently use the guarded/direct probe only as a
+  conservative miss-producing helper and then run generic attribute set.
+
+### Limitations / Soundness / Extensions
+
+- The owner guard is exact-type today; it is sound but does not yet keep
+  base-class field fast paths active on subclasses.
+- Direct field stores intentionally fall back for now. A direct store
+  needs CPython split-dict bookkeeping for `ma_used`, insertion order,
+  watchers, promotion, and resize.
+- Class attributes and descriptors are excluded by compile-time owner
+  inspection. Runtime type-version guards are the fallback if a later
+  class mutation invalidates that inspection.
 
 
 ## Direct Function Calls
