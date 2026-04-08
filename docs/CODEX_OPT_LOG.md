@@ -1,7 +1,8 @@
 # Codex Optimization Log
 
-Chronological log of finalized performance changes made by Codex agents.
-Keep entries succinct: what changed, which jj change id carried it, the
+Chronological log of finalized performance changes and not-landed
+optimization attempts made by Codex agents. Keep entries succinct: what
+changed or was tried, which jj change id carried it when landed, the
 benchmarked throughput delta, and the headline pre/post numbers.
 
 ## 2026-04-08 - Inline runtime guard and indexed-field helpers
@@ -100,3 +101,20 @@ benchmarked throughput delta, and the headline pre/post numbers.
 - post-change benchmark:
   - specialized pass, 1M loops x3: `319499`, `320812`, `308803 loops/s`
   - stock CPython: `558357 loops/s`
+
+## 2026-04-08 - Not landed: post-list-fastpath micro-optimizations
+
+- jj change id: not landed
+- summary: Tried several follow-up pystone optimizations after the
+  exact-list helper change and reverted each candidate because it was
+  benchmark-negative or too close to noise.
+- attempts:
+  - generated exact-list / compact-int getitem fast path in CLIF:
+    median `319499 -> 314717 loops/s`, `-1.50%`
+  - direct `ob_type` checks inside the exact-list helper: median
+    `319499 -> 320632 loops/s`, `+0.35%`; treated as noise and not
+    landed
+  - generated singleton-truth fast path before `dp_jit_is_true`:
+    median `319499 -> 307591 loops/s`, `-3.73%`
+  - singleton fast path inside `dp_jit_is_true`: median
+    `319499 -> 304941 loops/s`, `-4.56%`
