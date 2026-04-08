@@ -116,6 +116,22 @@ experiments. It is enabled by default in benchmark and pytest
 correctness recipes so ordinary transformed test runs still detect
 unexpected fallout from these experiments.
 
+User-visible summary: Python code may stop seeing module-global
+mutations that should shadow builtin names, and external observers of a
+module or object dictionary may stop seeing updates from optimized
+stores. Treat results from this mode as a cost-model experiment, not a
+CPython compatibility claim.
+
+Current behavior:
+
+- guarded existing module-global store may replace
+  `PyDictIndexedValues.values[index]` directly
+- guarded existing split instance-field store may replace
+  `PyDictValues.values[index]` directly
+- undeclared known-builtin global loads are rewritten during name
+  binding into `RuntimeName` loads; module-constant extraction then
+  snapshots the runtime/builtin object in a constant slot
+
 When enabled, specialized JIT code may call `soac-runtime` helpers that
 overwrite an existing guarded storage slot directly:
 
@@ -133,16 +149,6 @@ watchers, dict version updates, insertion-order maintenance,
 that lives in the normal store path. Use it only in perf runs that
 explicitly want to estimate the upper bound for guarded indexed stores;
 do not enable it for correctness tests or compatibility claims.
-
-Current behavior:
-
-- guarded existing module-global store may replace
-  `PyDictIndexedValues.values[index]` directly
-- guarded existing split instance-field store may replace
-  `PyDictValues.values[index]` directly
-- undeclared known-builtin global loads are rewritten during name
-  binding into `RuntimeName` loads; module-constant extraction then
-  snapshots the runtime/builtin object in a constant slot
 
 This is not CPython-compatible. A module can install or mutate a global
 named `len`, `range`, `print`, etc. through `globals()`, `exec`, custom

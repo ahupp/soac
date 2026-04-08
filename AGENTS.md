@@ -252,11 +252,12 @@ instance's live working commit.
 - `SOAC_OPT_UNSOUND`
   Enables intentionally unsound performance experiments. The benchmark
   and pytest correctness recipes default this to `1`; xfail tests that
-  specifically assert the skipped semantics under this mode. Current
-  behavior includes raw indexed module-global stores, raw indexed
-  split-field stores, and rewriting undeclared known-builtin global loads
-  to `RuntimeName` module constants in name binding. These skip some
-  normal CPython dict/object/type bookkeeping or module-global shadowing.
+  specifically assert the skipped semantics under this mode. User-visible
+  risks: later module-global shadowing of a builtin name may be ignored,
+  and optimized stores may not notify CPython-level dict/object/type
+  observers. Implementation today: raw indexed module-global stores, raw
+  indexed split-field stores, and rewriting undeclared known-builtin
+  global loads to `RuntimeName` module constants in name binding.
 
 ### CPython-specific notes
 
