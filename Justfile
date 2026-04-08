@@ -153,7 +153,7 @@ build-extension build="debug": ensure-cpython
 
   (
     cd "$REPO_ROOT"
-    cargo build --quiet "${BUILD_ARGS[@]}" -p soac-pyo3
+    cargo build "${BUILD_ARGS[@]}" -p soac-pyo3
   )
   just install-extension "$BUILD"
 
@@ -162,7 +162,7 @@ build-all: (update-venv) ensure-cpython ensure-shared-python
   set -euo pipefail
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
   cd "$REPO_ROOT"
-  cargo build --quiet --workspace --tests
+  cargo build --workspace --tests
   just build-extension debug
   just build-web-inspector-server
 
@@ -611,7 +611,7 @@ fmt-markdown:
 regen-snapshots:
   #!/usr/bin/env bash
   cd "$REPO_ROOT"
-  cargo run --quiet --bin regen_snapshots
+  cargo run --bin regen_snapshots
 
 [private]
 _test-all-test-phase:
@@ -733,7 +733,7 @@ _call-target-specializations-from-dump dump_path:
   #!/usr/bin/env bash
   set -euo pipefail
   cd "$REPO_ROOT"
-  cargo run -q -p soac-inspector --bin inspect_counters -- --specializations "{{dump_path}}"
+  cargo run -p soac-inspector --bin inspect_counters -- --specializations "{{dump_path}}"
 
 benchmark-warm loops="8000000": (update-venv) (build-extension "release")
   #!/usr/bin/env bash
