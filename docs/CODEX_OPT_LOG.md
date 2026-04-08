@@ -118,3 +118,5 @@ benchmarked throughput delta, and the headline pre/post numbers.
     median `319499 -> 307591 loops/s`, `-3.73%`
   - singleton fast path inside `dp_jit_is_true`: median
     `319499 -> 304941 loops/s`, `-4.56%`
+  - branch-context richcompare-truth helper: median
+    `319499 -> 306582 loops/s`, `-4.04%`

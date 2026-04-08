@@ -130,6 +130,13 @@ It only targeted the already-small consumer helper and did not remove
 the `PyObject_RichCompare` call, bool-object result, decref, or the
 helper call frame itself.
 
+A sound branch-context helper that combined `PyObject_RichCompare`,
+truth conversion, and compare-result decref was also negative: median
+specialized throughput changed `319499 -> 306582 loops/s` (`-4.04%`).
+It removed the `PyObject_RichCompare` / `dp_jit_is_true` pair from
+rendered Proc0 CLIF, but still produced the owned compare result inside
+an out-of-line Rust helper and still paid generic rich-compare dispatch.
+
 Lesson: optimize branch-producing comparisons as comparisons, not as
 owned-bool objects followed by generic truth. A better hypothesis would
 lower branch-context exact-int, identity, or Unicode/string comparisons
