@@ -69,3 +69,18 @@ benchmarked throughput delta, and the headline pre/post numbers.
 - post-change benchmark:
   - specialized pass, 1M loops x3: `175180`, `159439`, `178348 loops/s`
   - stock CPython: `568659 loops/s`
+
+## 2026-04-08 - Avoid KeyError allocation in global-load fallback
+
+- jj change id: `lzqutouv`
+- summary: The JIT runtime global-load fallback now probes exact dict
+  globals and dict builtins with `PyDict_GetItemRef`, preserving the
+  owned-reference contract without first calling mapping subscript,
+  constructing `KeyError`, clearing it, and then looking in builtins.
+- throughput: `+15.81%` median
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `214770`, `217031`, `223132 loops/s`
+  - stock CPython: `559279 loops/s`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `252020`, `251340`, `248906 loops/s`
+  - stock CPython: `552461 loops/s`

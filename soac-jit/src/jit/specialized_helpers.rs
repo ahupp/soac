@@ -35,6 +35,12 @@ unsafe extern "C" {
         nitems: ffi::Py_ssize_t,
     ) -> *mut ffi::PyObject;
     #[cfg(not(test))]
+    fn PyDict_GetItemRef(
+        dict: *mut ffi::PyObject,
+        key: *mut ffi::PyObject,
+        result: *mut *mut ffi::PyObject,
+    ) -> libc::c_int;
+    #[cfg(not(test))]
     fn PyIter_NextItem(iterator: *mut ffi::PyObject, item: *mut *mut ffi::PyObject) -> libc::c_int;
 }
 
@@ -370,21 +376,42 @@ unsafe fn load_global_slow(
     globals_obj: *mut ffi::PyObject,
     name_obj: *mut ffi::PyObject,
 ) -> *mut ffi::PyObject {
-    let value = ffi::PyObject_GetItem(globals_obj, name_obj);
-    if !value.is_null() {
-        return value;
+    if ffi::PyDict_Check(globals_obj) != 0 {
+        let mut value = ptr::null_mut();
+        let rc = PyDict_GetItemRef(globals_obj, name_obj, ptr::addr_of_mut!(value));
+        if rc > 0 {
+            return value;
+        }
+        if rc < 0 {
+            return ptr::null_mut();
+        }
+    } else {
+        let value = ffi::PyObject_GetItem(globals_obj, name_obj);
+        if !value.is_null() {
+            return value;
+        }
+        if ffi::PyErr_ExceptionMatches(ffi::PyExc_KeyError) == 0 {
+            return ptr::null_mut();
+        }
+        ffi::PyErr_Clear();
     }
-    if ffi::PyErr_ExceptionMatches(ffi::PyExc_KeyError) == 0 {
-        return ptr::null_mut();
-    }
-    ffi::PyErr_Clear();
 
     let builtins = globals_builtins_owned(globals_obj);
     if builtins.is_null() {
         return ptr::null_mut();
     }
     let value = if ffi::PyDict_Check(builtins) != 0 {
-        ffi::PyObject_GetItem(builtins, name_obj)
+        let mut value = ptr::null_mut();
+        let rc = PyDict_GetItemRef(builtins, name_obj, ptr::addr_of_mut!(value));
+        ffi::Py_DECREF(builtins);
+        if rc > 0 {
+            return value;
+        }
+        if rc < 0 {
+            return ptr::null_mut();
+        }
+        raise_name_error_for_missing_name(name_obj);
+        return ptr::null_mut();
     } else {
         ffi::PyObject_GetAttr(builtins, name_obj)
     };
