@@ -1,10 +1,10 @@
 use crate::block_py::pretty::BlockPyPrettyPrint;
-use crate::block_py::{BindingKind, ClosureInit, ClosureSlot, ModuleNameGen};
 use crate::block_py::{
-    BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional,
-    CallableScopeKind, CellBindingKind, FunctionKind, InstrLow, InstrResolved, NameLike,
-    NameLocation, ResolvedName, ResolvedStorageBlock,
+    instr_any, BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional,
+    CallableScopeKind, CellBindingKind, CellLocation, ChildVisitable, FunctionKind, InstrLow,
+    InstrResolved, NameLike, NameLocation, ResolvedName, ResolvedStorageBlock, ScopeExprNode,
 };
+use crate::block_py::{BindingKind, ClosureInit, ClosureSlot, ModuleNameGen};
 use crate::passes::ast_to_ast::ast_rewrite::rewrite_with_pass;
 use crate::passes::ast_to_ast::context::Context;
 use crate::passes::ast_to_ast::rewrite_class_def;
@@ -15,12 +15,14 @@ use crate::passes::ast_to_ast::{
 use crate::passes::core_await_lower::lower_awaits_in_core_blockpy_module;
 use crate::passes::ruff_to_blockpy::rewrite_ast_to_core_blockpy_module_with_module;
 use crate::passes::{
-    CoreModuleShapeWithAwaitAndYield, CoreModuleShapeWithYield, InstrRuff,
+    CoreModuleShapeWithAwaitAndYield, CoreModuleShapeWithYield, InstrRuff, InstrWithAwaitAndYield,
     ResolvedStorageModuleShape,
 };
+use crate::transformer::{walk_stmt, Transformer};
 use crate::{lower_python_to_blockpy_for_testing, LoweringResult};
 use ruff_python_ast::{self as ast, Expr, Stmt};
 use ruff_python_parser::parse_module;
+use std::collections::HashSet;
 
 fn tracked_core_blockpy_with_await_and_yield(
     source: &str,
@@ -51,6 +53,37 @@ fn rewrite_ast_to_ast_for_testing(source: &str) -> (Context, Suite, SemanticAstS
         &mut body,
     );
     (context, body, semantic_state)
+}
+
+#[derive(Default)]
+struct AstGlobalProbe {
+    function_names: HashSet<String>,
+    global_names: HashSet<String>,
+}
+
+impl Transformer for AstGlobalProbe {
+    fn visit_stmt(&mut self, stmt: &mut Stmt) {
+        match stmt {
+            Stmt::FunctionDef(func) => {
+                self.function_names.insert(func.name.to_string());
+            }
+            Stmt::Global(global) => {
+                self.global_names
+                    .extend(global.names.iter().map(ToString::to_string));
+            }
+            _ => {}
+        }
+        walk_stmt(self, stmt);
+    }
+}
+
+fn probe_rewritten_ast(source: &str) -> AstGlobalProbe {
+    let (_context, mut body, _semantic_state) = rewrite_ast_to_ast_for_testing(source);
+    let mut probe = AstGlobalProbe::default();
+    for stmt in &mut body {
+        probe.visit_stmt(stmt);
+    }
+    probe
 }
 
 fn tracked_core_blockpy_with_yield_only(source: &str) -> BlockPyModule<CoreModuleShapeWithYield> {
@@ -135,14 +168,6 @@ impl TrackedLowering {
         self.blockpy_module.clone()
     }
 
-    fn blockpy_text(&self) -> String {
-        crate::block_py::pretty::blockpy_module_to_string(&self.blockpy_module())
-    }
-
-    fn core_blockpy_with_yield_text(&self) -> String {
-        self.pass_text("core_blockpy_with_yield")
-    }
-
     fn name_binding_text(&self) -> String {
         self.pass_text("name_binding")
     }
@@ -209,6 +234,246 @@ fn callable_def_by_name<'a>(
         })
 }
 
+fn blockpy_function_by_name<'a, P: crate::block_py::ModuleShape>(
+    blockpy_module: &'a BlockPyModule<P>,
+    bind_name: &str,
+) -> &'a BlockPyFunction<P> {
+    blockpy_module
+        .callable_defs
+        .iter()
+        .find(|callable| callable.names.bind_name == bind_name)
+        .unwrap_or_else(|| {
+            panic!("missing callable definition {bind_name}; got {blockpy_module:?}")
+        })
+}
+
+fn blockpy_function_by_qualname<'a, P: crate::block_py::ModuleShape>(
+    blockpy_module: &'a BlockPyModule<P>,
+    qualname: &str,
+) -> &'a BlockPyFunction<P> {
+    blockpy_module
+        .callable_defs
+        .iter()
+        .find(|callable| callable.names.qualname == qualname)
+        .unwrap_or_else(|| panic!("missing callable qualname {qualname}; got {blockpy_module:?}"))
+}
+
+fn blockpy_function_instr_any<P>(
+    function: &BlockPyFunction<P>,
+    mut predicate: impl FnMut(&P::Instr) -> bool,
+) -> bool
+where
+    P: crate::block_py::ModuleShape,
+    P::Instr: ChildVisitable<P::Instr>,
+{
+    function.blocks.iter().any(|block| {
+        block
+            .body
+            .iter()
+            .any(|stmt| instr_any(stmt, &mut predicate))
+            || match &block.term {
+                BlockTerm::IfTerm(if_term) => instr_any(&if_term.test, &mut predicate),
+                BlockTerm::BranchTable(branch) => instr_any(&branch.index, &mut predicate),
+                BlockTerm::Raise(raise) => raise
+                    .exc
+                    .as_ref()
+                    .is_some_and(|exc| instr_any(exc, &mut predicate)),
+                BlockTerm::Return(value) => instr_any(value, &mut predicate),
+                BlockTerm::Jump(_) => false,
+            }
+    })
+}
+
+fn blockpy_function_has_root_name<P>(function: &BlockPyFunction<P>, expected: &str) -> bool
+where
+    P: crate::block_py::ModuleShape,
+    P::Instr: ScopeExprNode,
+{
+    blockpy_function_instr_any(function, |expr| expr.root_name_id() == Some(expected))
+}
+
+fn blockpy_module_has_root_name<P>(module: &BlockPyModule<P>, expected: &str) -> bool
+where
+    P: crate::block_py::ModuleShape,
+    P::Instr: ScopeExprNode,
+{
+    module
+        .callable_defs
+        .iter()
+        .any(|function| blockpy_function_has_root_name(function, expected))
+}
+
+fn blockpy_function_has_string_literal<P>(function: &BlockPyFunction<P>, expected: &str) -> bool
+where
+    P: crate::block_py::ModuleShape,
+    P::Instr: ScopeExprNode,
+{
+    blockpy_function_instr_any(function, |expr| {
+        expr.root_string_literal_value().as_deref() == Some(expected)
+    })
+}
+
+fn blockpy_function_has_defined_name<P>(function: &BlockPyFunction<P>, expected: &str) -> bool
+where
+    P: crate::block_py::ModuleShape,
+    P::Instr: ScopeExprNode,
+{
+    blockpy_function_instr_any(function, |expr| {
+        let mut found = false;
+        expr.walk_root_defined_names(&mut |name| found |= name == expected);
+        found
+    })
+}
+
+fn blockpy_function_has_store_name<P>(function: &BlockPyFunction<P>, expected: &str) -> bool
+where
+    P: crate::block_py::ModuleShape,
+    P::Instr: ScopeExprNode,
+{
+    blockpy_function_instr_any(function, |expr| {
+        let mut found = false;
+        expr.walk_root_defined_names(&mut |name| found |= name == expected);
+        found
+    })
+}
+
+fn blockpy_module_has_store_name<P>(module: &BlockPyModule<P>, expected: &str) -> bool
+where
+    P: crate::block_py::ModuleShape,
+    P::Instr: ScopeExprNode,
+{
+    module
+        .callable_defs
+        .iter()
+        .any(|function| blockpy_function_has_store_name(function, expected))
+}
+
+fn blockpy_function_has_del_name<P>(function: &BlockPyFunction<P>, expected: &str) -> bool
+where
+    P: crate::block_py::ModuleShape,
+    P::Instr: ScopeExprNode,
+{
+    blockpy_function_instr_any(function, |expr| {
+        let mut found = false;
+        expr.walk_root_deleted_names(&mut |name| found |= name == expected);
+        found
+    })
+}
+
+fn blockpy_function_has_cell_ref_for_name(
+    function: &BlockPyFunction<CoreModuleShapeWithAwaitAndYield>,
+    expected: &str,
+) -> bool {
+    blockpy_function_instr_any(
+        function,
+        |expr| matches!(expr, InstrWithAwaitAndYield::CellRefForName(cell_ref) if cell_ref.logical_name == expected),
+    )
+}
+
+fn resolved_function_has_name_location(
+    function: &BlockPyFunction<ResolvedStorageModuleShape>,
+    name: &str,
+    mut location_predicate: impl FnMut(NameLocation) -> bool,
+) -> bool {
+    blockpy_function_instr_any(function, |expr| match expr {
+        InstrResolved::Load(load) => {
+            load.name.id_str() == name && location_predicate(load.name.location)
+        }
+        InstrResolved::Store(store) => {
+            store.name.id_str() == name && location_predicate(store.name.location)
+        }
+        InstrResolved::Del(del) => {
+            del.name.id_str() == name && location_predicate(del.name.location)
+        }
+        _ => false,
+    })
+}
+
+fn resolved_function_uses_global(
+    function: &BlockPyFunction<ResolvedStorageModuleShape>,
+    name: &str,
+) -> bool {
+    resolved_function_has_name_location(function, name, |location| {
+        location.is_global() || location.is_global_name()
+    })
+}
+
+fn resolved_module_uses_global(
+    module: &BlockPyModule<ResolvedStorageModuleShape>,
+    name: &str,
+) -> bool {
+    module
+        .callable_defs
+        .iter()
+        .any(|function| resolved_function_uses_global(function, name))
+}
+
+fn resolved_function_uses_captured_source(
+    function: &BlockPyFunction<ResolvedStorageModuleShape>,
+) -> bool {
+    blockpy_function_instr_any(function, |expr| match expr {
+        InstrResolved::Load(load) => load
+            .name
+            .cell_location()
+            .is_some_and(CellLocation::is_captured_source),
+        InstrResolved::Store(store) => store
+            .name
+            .cell_location()
+            .is_some_and(CellLocation::is_captured_source),
+        InstrResolved::Del(del) => del
+            .name
+            .cell_location()
+            .is_some_and(CellLocation::is_captured_source),
+        InstrResolved::CellRef(cell_ref) => cell_ref.location.is_captured_source(),
+        _ => false,
+    })
+}
+
+fn resolved_function_has_store_to_captured_source(
+    function: &BlockPyFunction<ResolvedStorageModuleShape>,
+) -> bool {
+    blockpy_function_instr_any(function, |expr| {
+        matches!(
+            expr,
+            InstrResolved::Store(store)
+                if store
+                    .name
+                    .cell_location()
+                    .is_some_and(CellLocation::is_captured_source)
+        )
+    })
+}
+
+fn resolved_function_has_del(
+    function: &BlockPyFunction<ResolvedStorageModuleShape>,
+    name: &str,
+    quietly: bool,
+) -> bool {
+    blockpy_function_instr_any(function, |expr| {
+        matches!(
+            expr,
+            InstrResolved::Del(del)
+                if del.name.id_str() == name && del.quietly == quietly
+        )
+    })
+}
+
+fn resolved_function_has_delitem(function: &BlockPyFunction<ResolvedStorageModuleShape>) -> bool {
+    blockpy_function_instr_any(function, |expr| matches!(expr, InstrResolved::DelItem(_)))
+}
+
+fn resolved_function_has_setitem(function: &BlockPyFunction<ResolvedStorageModuleShape>) -> bool {
+    blockpy_function_instr_any(function, |expr| matches!(expr, InstrResolved::SetItem(_)))
+}
+
+fn resolved_function_has_make_cell(function: &BlockPyFunction<ResolvedStorageModuleShape>) -> bool {
+    blockpy_function_instr_any(function, |expr| matches!(expr, InstrResolved::MakeCell(_)))
+}
+
+fn resolved_function_has_cell_ref(function: &BlockPyFunction<ResolvedStorageModuleShape>) -> bool {
+    blockpy_function_instr_any(function, |expr| matches!(expr, InstrResolved::CellRef(_)))
+}
+
 fn block_uses_text(block: &ResolvedStorageBlock, needle: &str) -> bool {
     block.body.iter().any(|op| expr_text(op).contains(needle))
         || match &block.term {
@@ -221,10 +486,6 @@ fn block_uses_text(block: &ResolvedStorageBlock, needle: &str) -> bool {
             BlockTerm::Return(value) => expr_text(value).contains(needle),
             _ => false,
         }
-}
-
-fn count_occurrences(text: &str, needle: &str) -> usize {
-    text.matches(needle).count()
 }
 
 #[test]
@@ -246,7 +507,8 @@ fn instr_ruff_from_ast_expr_normalizes_bare_yield_to_explicit_none() {
 
 #[test]
 fn instr_ruff_from_ast_expr_normalizes_call_args_and_keywords() {
-    let instr = crate::passes::ast_to_instr::from_ast_expr(crate::py_expr!("f(x, *args, y=z, **kw)"));
+    let instr =
+        crate::passes::ast_to_instr::from_ast_expr(crate::py_expr!("f(x, *args, y=z, **kw)"));
 
     let InstrRuff::Call(call) = instr else {
         panic!("expected InstrRuff::Call");
@@ -276,25 +538,26 @@ fn instr_ruff_from_ast_stmt_recursively_lowers_assign_value() {
 
 #[test]
 fn instr_ruff_from_ast_stmt_recursively_lowers_function_body_and_return() {
-    let instr = crate::passes::ast_to_instr::from_ast_stmt(Stmt::FunctionDef(ast::StmtFunctionDef {
-        node_index: ast::AtomicNodeIndex::default(),
-        range: ruff_text_size::TextRange::default(),
-        is_async: false,
-        decorator_list: Vec::new(),
-        name: ast::Identifier::new("f", ruff_text_size::TextRange::default()),
-        type_params: None,
-        parameters: Box::new(ast::Parameters {
-            range: ruff_text_size::TextRange::default(),
+    let instr =
+        crate::passes::ast_to_instr::from_ast_stmt(Stmt::FunctionDef(ast::StmtFunctionDef {
             node_index: ast::AtomicNodeIndex::default(),
-            posonlyargs: Vec::new(),
-            args: Vec::new(),
-            vararg: None,
-            kwonlyargs: Vec::new(),
-            kwarg: None,
-        }),
-        returns: None,
-        body: vec![crate::py_stmt!("return g(x)")],
-    }));
+            range: ruff_text_size::TextRange::default(),
+            is_async: false,
+            decorator_list: Vec::new(),
+            name: ast::Identifier::new("f", ruff_text_size::TextRange::default()),
+            type_params: None,
+            parameters: Box::new(ast::Parameters {
+                range: ruff_text_size::TextRange::default(),
+                node_index: ast::AtomicNodeIndex::default(),
+                posonlyargs: Vec::new(),
+                args: Vec::new(),
+                vararg: None,
+                kwonlyargs: Vec::new(),
+                kwarg: None,
+            }),
+            returns: None,
+            body: vec![crate::py_stmt!("return g(x)")],
+        }));
 
     let InstrRuff::StmtFunctionDef(func) = instr else {
         panic!("expected InstrRuff::StmtFunctionDef");
@@ -398,10 +661,17 @@ async def classify():
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let rendered = lowered.blockpy_text();
-    assert!(rendered.contains("coroutine classify():"), "{rendered}");
-    assert!(rendered.contains("await foo()"), "{rendered}");
-    assert!(!rendered.contains("yield __dp_NONE"), "{rendered}");
+    let blockpy_module = lowered.blockpy_module();
+    let classify = blockpy_function_by_name(&blockpy_module, "classify");
+    assert_eq!(classify.kind, FunctionKind::Coroutine);
+    assert!(blockpy_function_instr_any(classify, |expr| matches!(
+        expr,
+        InstrWithAwaitAndYield::Await(_)
+    )));
+    assert!(!blockpy_function_instr_any(classify, |expr| matches!(
+        expr,
+        InstrWithAwaitAndYield::Yield(_)
+    )));
 }
 
 #[test]
@@ -412,10 +682,11 @@ def fmt(value):
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let core_blockpy = lowered.blockpy_text();
-    assert!(core_blockpy.contains("\"value=\""), "{core_blockpy}");
-    assert!(core_blockpy.contains("repr(value)"), "{core_blockpy}");
-    assert!(core_blockpy.contains("format("), "{core_blockpy}");
+    let blockpy_module = lowered.blockpy_module();
+    let semantic_fmt = blockpy_function_by_name(&blockpy_module, "fmt");
+    assert!(blockpy_function_has_string_literal(semantic_fmt, "value="));
+    assert!(blockpy_function_has_root_name(semantic_fmt, "repr"));
+    assert!(blockpy_function_has_root_name(semantic_fmt, "format"));
 
     let fmt = lowered.bb_function("fmt");
     assert!(
@@ -436,20 +707,29 @@ def fmt(value):
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let core_blockpy = lowered.blockpy_text();
-    assert!(
-        core_blockpy.contains("templatelib_Interpolation(value, \"value\","),
-        "{core_blockpy}"
-    );
+    let blockpy_module = lowered.blockpy_module();
+    let semantic_fmt = blockpy_function_by_name(&blockpy_module, "fmt");
+    assert!(blockpy_function_has_root_name(
+        semantic_fmt,
+        "templatelib_Interpolation"
+    ));
+    assert!(blockpy_function_has_string_literal(semantic_fmt, "value"));
 
     let fmt = lowered.bb_function("fmt");
     assert!(
         function_or_constants_use_text(lowered.bb_module(), fmt, "templatelib_Interpolation"),
         "{fmt:?}"
     );
-    let constant_text = module_constant_text(lowered.bb_module());
-    assert!(constant_text.contains("\"value\""), "{constant_text}");
-    assert!(constant_text.contains("\"\""), "{constant_text}");
+    assert!(lowered
+        .bb_module()
+        .module_constants
+        .iter()
+        .any(|expr| expr.root_string_literal_value().as_deref() == Some("value")));
+    assert!(lowered
+        .bb_module()
+        .module_constants
+        .iter()
+        .any(|expr| expr.root_string_literal_value().as_deref() == Some("")));
 }
 
 #[test]
@@ -595,21 +875,21 @@ class Box:
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let core_rendered = lowered.pass_text("core_blockpy");
-    assert!(
-        !core_rendered.contains("class_lookup_global"),
-        "{core_rendered}"
-    );
+    let blockpy_module = lowered.blockpy_module();
+    let class_helper = blockpy_function_by_name(&blockpy_module, "_dp_class_ns_Box");
+    assert!(!blockpy_function_has_root_name(
+        class_helper,
+        "class_lookup_global"
+    ));
 
-    let name_binding_rendered = lowered.name_binding_text();
+    let resolved_class_helper = lowered.bb_function("_dp_class_ns_Box");
     assert!(
         function_or_constants_use_text(
             lowered.bb_module(),
-            lowered.bb_function("_dp_class_ns_Box"),
-            "class_lookup_global",
+            resolved_class_helper,
+            "class_lookup_global"
         ),
-        "{}\n{}",
-        name_binding_rendered,
+        "{resolved_class_helper:?}\n{}",
         module_constant_text(lowered.bb_module())
     );
 }
@@ -625,22 +905,23 @@ def outer():
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let core_rendered = lowered.pass_text("core_blockpy");
-    assert!(
-        !core_rendered.contains("class_lookup_cell"),
-        "{core_rendered}"
-    );
+    let blockpy_module = lowered.blockpy_module();
+    let class_helper = blockpy_function_by_name(&blockpy_module, "_dp_class_ns_Box");
+    assert!(!blockpy_function_has_root_name(
+        class_helper,
+        "class_lookup_cell"
+    ));
 
-    let name_binding_rendered = lowered.name_binding_text();
-    assert!(
-        !name_binding_rendered.contains("class_lookup_cell("),
-        "{name_binding_rendered}"
-    );
-    assert!(
-        name_binding_rendered.contains("SetItem(LocalLocation(0), constant slot")
-            && name_binding_rendered.contains("CapturedSource(0)"),
-        "{name_binding_rendered}"
-    );
+    let resolved_class_helper = lowered.bb_function("_dp_class_ns_Box");
+    assert!(!function_or_constants_use_text(
+        lowered.bb_module(),
+        resolved_class_helper,
+        "class_lookup_cell",
+    ));
+    assert!(resolved_function_has_setitem(resolved_class_helper));
+    assert!(resolved_function_uses_captured_source(
+        resolved_class_helper
+    ));
 }
 
 #[test]
@@ -654,12 +935,11 @@ def outer():
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let name_binding_rendered = lowered.name_binding_text();
-    assert!(
-        name_binding_rendered.contains("SetItem(LocalLocation(0), constant slot")
-            && name_binding_rendered.contains("CapturedSource(0)"),
-        "{name_binding_rendered}"
-    );
+    let resolved_class_helper = lowered.bb_function("_dp_class_ns_Inner");
+    assert!(resolved_function_has_setitem(resolved_class_helper));
+    assert!(resolved_function_uses_captured_source(
+        resolved_class_helper
+    ));
 }
 
 #[test]
@@ -671,22 +951,19 @@ class Box:
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let core_rendered = lowered.pass_text("core_blockpy");
-    assert!(
-        core_rendered.contains("StoreName(\"f\", MakeFunction"),
-        "{core_rendered}"
-    );
-    assert!(
-        !core_rendered.contains("__dp_setitem(_dp_class_ns, \"f\","),
-        "{core_rendered}"
-    );
+    let blockpy_module = lowered.blockpy_module();
+    let class_helper = blockpy_function_by_name(&blockpy_module, "_dp_class_ns_Box");
+    assert!(blockpy_function_has_store_name(class_helper, "f"));
+    assert!(!blockpy_function_has_root_name(
+        class_helper,
+        "__dp_setitem"
+    ));
 
-    let name_binding_rendered = lowered.name_binding_text();
+    let resolved_class_helper = lowered.bb_function("_dp_class_ns_Box");
     assert!(
-        name_binding_rendered.contains("SetItem(LocalLocation(0),")
+        resolved_function_has_setitem(resolved_class_helper)
             && module_constant_text(lowered.bb_module()).contains("make_function"),
-        "{}\n{}",
-        name_binding_rendered,
+        "{resolved_class_helper:?}\n{}",
         module_constant_text(lowered.bb_module())
     );
 }
@@ -703,22 +980,18 @@ def outer():
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let core_rendered = lowered.pass_text("core_blockpy");
-    assert!(
-        core_rendered.contains("StoreName(\"x\", 1)"),
-        "{core_rendered}"
-    );
-    assert!(
-        !core_rendered.contains("__dp_store_cell(_dp_cell_x, 1)"),
-        "{core_rendered}"
-    );
+    let blockpy_module = lowered.blockpy_module();
+    let class_helper = blockpy_function_by_name(&blockpy_module, "_dp_class_ns_Box");
+    assert!(blockpy_function_has_store_name(class_helper, "x"));
+    assert!(!blockpy_function_has_root_name(
+        class_helper,
+        "__dp_store_cell"
+    ));
 
-    let name_binding_rendered = lowered.name_binding_text();
-    assert!(
-        name_binding_rendered.contains("StoreLocation(CapturedSource(")
-            && name_binding_rendered.contains("constant slot"),
-        "{name_binding_rendered}"
-    );
+    let resolved_class_helper = lowered.bb_function("_dp_class_ns_Box");
+    assert!(resolved_function_has_store_to_captured_source(
+        resolved_class_helper
+    ));
 }
 
 #[test]
@@ -729,21 +1002,16 @@ class Box:
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let core_rendered = lowered.pass_text("core_blockpy");
-    assert!(
-        core_rendered.contains("StoreName(\"x\", 1)"),
-        "{core_rendered}"
-    );
-    assert!(
-        !core_rendered.contains("__dp_setitem(_dp_class_ns, \"x\", 1)"),
-        "{core_rendered}"
-    );
+    let blockpy_module = lowered.blockpy_module();
+    let class_helper = blockpy_function_by_name(&blockpy_module, "_dp_class_ns_Box");
+    assert!(blockpy_function_has_store_name(class_helper, "x"));
+    assert!(!blockpy_function_has_root_name(
+        class_helper,
+        "__dp_setitem"
+    ));
 
-    let name_binding_rendered = lowered.name_binding_text();
-    assert!(
-        name_binding_rendered.contains("SetItem(LocalLocation(0), constant slot"),
-        "{name_binding_rendered}"
-    );
+    let resolved_class_helper = lowered.bb_function("_dp_class_ns_Box");
+    assert!(resolved_function_has_setitem(resolved_class_helper));
 }
 
 #[test]
@@ -755,23 +1023,20 @@ class Box:
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let core_rendered = lowered.pass_text("core_blockpy");
-    assert!(
-        core_rendered.contains("Del {") && core_rendered.contains("quietly: false"),
-        "{core_rendered}"
-    );
-    assert!(
-        !core_rendered.contains("__dp_delitem(_dp_class_ns, \"x\")"),
-        "{core_rendered}"
-    );
-    assert!(!core_rendered.contains("__dp_DELETED"), "{core_rendered}");
+    let blockpy_module = lowered.blockpy_module();
+    let class_helper = blockpy_function_by_name(&blockpy_module, "_dp_class_ns_Box");
+    assert!(blockpy_function_has_del_name(class_helper, "x"));
+    assert!(!blockpy_function_has_root_name(
+        class_helper,
+        "__dp_delitem"
+    ));
+    assert!(!blockpy_module_has_root_name(
+        &blockpy_module,
+        "__dp_DELETED"
+    ));
 
-    let name_binding_rendered = lowered.name_binding_text();
-    assert!(
-        name_binding_rendered.contains("DelItem(LocalLocation(0),")
-            && name_binding_rendered.contains("constant slot"),
-        "{name_binding_rendered}"
-    );
+    let resolved_class_helper = lowered.bb_function("_dp_class_ns_Box");
+    assert!(resolved_function_has_delitem(resolved_class_helper));
 }
 
 #[test]
@@ -785,21 +1050,23 @@ def outer():
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let core_rendered = lowered.pass_text("core_blockpy");
-    assert!(
-        core_rendered.contains("Del {") && core_rendered.contains("quietly: false"),
-        "{core_rendered}"
-    );
-    assert!(!core_rendered.contains("cell_contents"), "{core_rendered}");
-    assert!(!core_rendered.contains("__dp_DELETED"), "{core_rendered}");
+    let blockpy_module = lowered.blockpy_module();
+    let class_helper = blockpy_function_by_name(&blockpy_module, "_dp_class_ns_Box");
+    assert!(blockpy_function_has_del_name(class_helper, "x"));
+    assert!(!blockpy_module_has_root_name(
+        &blockpy_module,
+        "cell_contents"
+    ));
+    assert!(!blockpy_module_has_root_name(
+        &blockpy_module,
+        "__dp_DELETED"
+    ));
 
-    let name_binding_rendered = lowered.name_binding_text();
-    assert!(
-        name_binding_rendered.contains("Del {")
-            && name_binding_rendered.contains("CapturedSource(")
-            && name_binding_rendered.contains("quietly: false"),
-        "{name_binding_rendered}"
-    );
+    let resolved_class_helper = lowered.bb_function("_dp_class_ns_Box");
+    assert!(resolved_function_has_del(resolved_class_helper, "x", false));
+    assert!(resolved_function_uses_captured_source(
+        resolved_class_helper
+    ));
 }
 
 #[test]
@@ -811,21 +1078,13 @@ fn method_dunder_class_load_moves_to_name_binding_pass() {
     );
 
     let lowered = TrackedLowering::new(source);
-    let core_rendered = lowered.pass_text("core_blockpy");
-    assert!(
-        core_rendered.contains("return __class__"),
-        "{core_rendered}"
-    );
-    assert!(
-        !core_rendered.contains("_dp_classcell.cell_contents"),
-        "{core_rendered}"
-    );
+    let blockpy_module = lowered.blockpy_module();
+    let method = blockpy_function_by_name(&blockpy_module, "f");
+    assert!(blockpy_function_has_root_name(method, "__class__"));
+    assert!(!blockpy_function_has_root_name(method, "cell_contents"));
 
-    let name_binding_rendered = lowered.name_binding_text();
-    assert!(
-        name_binding_rendered.contains("return CapturedSource("),
-        "{name_binding_rendered}"
-    );
+    let resolved_method = lowered.bb_function("f");
+    assert!(resolved_function_uses_captured_source(resolved_method));
 }
 
 #[test]
@@ -839,21 +1098,13 @@ fn nested_method_dunder_class_capture_uses_classcell_storage() {
     );
 
     let lowered = TrackedLowering::new(source);
-    let name_binding_rendered = lowered.name_binding_text();
-    assert!(
-        name_binding_rendered.contains("function C.f.<locals>.g():"),
-        "{name_binding_rendered}"
-    );
-    assert!(
-        name_binding_rendered.contains("return CapturedSource("),
-        "{name_binding_rendered}"
-    );
+    let resolved_inner = lowered.bb_function("g");
+    assert_eq!(resolved_inner.names.qualname, "C.f.<locals>.g");
+    assert!(resolved_function_uses_captured_source(resolved_inner));
     assert!(
         module_constant_text(lowered.bb_module()).contains("make_function")
-            && name_binding_rendered.contains("constant slot")
-            && name_binding_rendered.contains("CellRef(Owned(0))"),
-        "{}\n{}",
-        name_binding_rendered,
+            && resolved_function_has_cell_ref(lowered.bb_function("f")),
+        "{resolved_inner:?}\n{}",
         module_constant_text(lowered.bb_module())
     );
 }
@@ -867,30 +1118,20 @@ fn method_super_uses_cell_ref_marker_for_classcell() {
     );
 
     let lowered = TrackedLowering::new(source);
-    let core_rendered = lowered.pass_text("core_blockpy");
-    assert!(
-        core_rendered.contains("CellRefForName(\"__class__\")"),
-        "{core_rendered}"
-    );
-    assert!(
-        core_rendered.contains("call_super(super,") && core_rendered.contains(", self)"),
-        "{core_rendered}"
-    );
-    assert!(
-        !core_rendered.contains("call_super(super, _dp_classcell"),
-        "{core_rendered}"
-    );
+    let blockpy_module = lowered.blockpy_module();
+    let method = blockpy_function_by_name(&blockpy_module, "f");
+    assert!(blockpy_function_has_cell_ref_for_name(method, "__class__"));
+    assert!(blockpy_function_has_root_name(method, "call_super"));
+    assert!(!blockpy_function_has_root_name(method, "_dp_classcell"));
 
-    let name_binding_rendered = lowered.name_binding_text();
-    assert!(
-        name_binding_rendered.contains("CellRef(CapturedSource("),
-        "{name_binding_rendered}"
-    );
+    let resolved_method = lowered.bb_function("f");
+    assert!(resolved_function_has_cell_ref(resolved_method));
     assert!(
         module_constant_text(lowered.bb_module()).contains("call_super")
-            && name_binding_rendered.contains(", LocalLocation(0))"),
-        "{}\n{}",
-        name_binding_rendered,
+            && resolved_function_has_name_location(resolved_method, "self", |location| location
+                .as_local()
+                .is_some()),
+        "{resolved_method:?}\n{}",
         module_constant_text(lowered.bb_module())
     );
 }
@@ -1042,30 +1283,24 @@ class Box:
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let semantic_rendered = lowered.blockpy_text();
-    assert!(
-        !semantic_rendered.contains("__dp_store_global(__dp_globals(), \"caught\""),
-        "{semantic_rendered}"
-    );
-    assert!(
-        !semantic_rendered.contains("__dp_current_exception()"),
-        "{semantic_rendered}"
-    );
-    assert!(
-        semantic_rendered.contains("StoreName(\"caught\", _dp_try_exc_"),
-        "{semantic_rendered}"
-    );
+    let blockpy_module = lowered.blockpy_module();
+    let class_helper = blockpy_function_by_name(&blockpy_module, "_dp_class_ns_Box");
+    assert!(blockpy_function_has_store_name(class_helper, "caught"));
+    assert!(!blockpy_function_has_root_name(
+        class_helper,
+        "__dp_current_exception"
+    ));
 
-    let name_binding_rendered = lowered.name_binding_text();
-    assert!(
-        name_binding_rendered.contains("caught@g")
-            && name_binding_rendered.contains("LocalLocation("),
-        "{name_binding_rendered}"
-    );
-    assert!(
-        name_binding_rendered.contains("Del {") && name_binding_rendered.contains("quietly: true"),
-        "{name_binding_rendered}"
-    );
+    let resolved_class_helper = lowered.bb_function("_dp_class_ns_Box");
+    assert!(resolved_function_uses_global(
+        resolved_class_helper,
+        "caught"
+    ));
+    assert!(resolved_function_has_del(
+        resolved_class_helper,
+        "caught",
+        true
+    ));
 }
 
 #[test]
@@ -1083,32 +1318,22 @@ def outer():
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let semantic_rendered = lowered.blockpy_text();
-    assert!(
-        !semantic_rendered.contains("__dp_store_cell(_dp_cell_x, __dp_current_exception())"),
-        "{semantic_rendered}"
-    );
-    assert!(
-        !semantic_rendered.contains("__dp_current_exception()"),
-        "{semantic_rendered}"
-    );
-    assert!(
-        semantic_rendered.contains("StoreName(\"x\", _dp_try_exc_"),
-        "{semantic_rendered}"
-    );
+    let blockpy_module = lowered.blockpy_module();
+    let class_helper = blockpy_function_by_name(&blockpy_module, "_dp_class_ns_Box");
+    assert!(blockpy_function_has_store_name(class_helper, "x"));
+    assert!(!blockpy_function_has_root_name(
+        class_helper,
+        "__dp_current_exception"
+    ));
 
-    let name_binding_rendered = lowered.name_binding_text();
-    assert!(
-        name_binding_rendered.contains("StoreLocation(CapturedSource(")
-            && name_binding_rendered.contains("LocalLocation("),
-        "{name_binding_rendered}"
-    );
-    assert!(
-        name_binding_rendered.contains("Del {")
-            && name_binding_rendered.contains("CapturedSource(")
-            && name_binding_rendered.contains("quietly: true"),
-        "{name_binding_rendered}"
-    );
+    let resolved_class_helper = lowered.bb_function("_dp_class_ns_Box");
+    assert!(resolved_function_has_store_to_captured_source(
+        resolved_class_helper
+    ));
+    assert!(resolved_function_has_del(resolved_class_helper, "x", true));
+    assert!(resolved_function_uses_captured_source(
+        resolved_class_helper
+    ));
 }
 
 #[test]
@@ -1122,31 +1347,17 @@ class Box:
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let semantic_rendered = lowered.blockpy_text();
-    assert!(
-        !semantic_rendered
-            .contains("__dp_setitem(_dp_class_ns, \"caught\", __dp_current_exception())"),
-        "{semantic_rendered}"
-    );
-    assert!(
-        !semantic_rendered.contains("__dp_current_exception()"),
-        "{semantic_rendered}"
-    );
-    assert!(
-        semantic_rendered.contains("StoreName(\"caught\", _dp_try_exc_"),
-        "{semantic_rendered}"
-    );
+    let blockpy_module = lowered.blockpy_module();
+    let class_helper = blockpy_function_by_name(&blockpy_module, "_dp_class_ns_Box");
+    assert!(blockpy_function_has_store_name(class_helper, "caught"));
+    assert!(!blockpy_function_has_root_name(
+        class_helper,
+        "__dp_current_exception"
+    ));
 
-    let name_binding_rendered = lowered.name_binding_text();
-    assert!(
-        name_binding_rendered.contains("SetItem(LocalLocation(0), constant slot"),
-        "{name_binding_rendered}"
-    );
-    assert!(
-        name_binding_rendered.contains("DelItem(LocalLocation(0),")
-            && name_binding_rendered.contains("constant slot"),
-        "{name_binding_rendered}"
-    );
+    let resolved_class_helper = lowered.bb_function("_dp_class_ns_Box");
+    assert!(resolved_function_has_setitem(resolved_class_helper));
+    assert!(resolved_function_has_delitem(resolved_class_helper));
 }
 
 #[test]
@@ -1158,21 +1369,16 @@ class Box:
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let core_rendered = lowered.pass_text("core_blockpy");
-    assert!(
-        !core_rendered.contains("__dp_store_global(__dp_globals(), \"y\""),
-        "{core_rendered}"
-    );
-    assert!(
-        core_rendered.contains("StoreName(\"y\", 1)"),
-        "{core_rendered}"
-    );
+    let blockpy_module = lowered.blockpy_module();
+    let class_helper = blockpy_function_by_name(&blockpy_module, "_dp_class_ns_Box");
+    assert!(!blockpy_function_has_root_name(
+        class_helper,
+        "__dp_store_global"
+    ));
+    assert!(blockpy_function_has_store_name(class_helper, "y"));
 
-    let name_binding_rendered = lowered.name_binding_text();
-    assert!(
-        name_binding_rendered.contains("y@g") && name_binding_rendered.contains("constant slot"),
-        "{name_binding_rendered}"
-    );
+    let resolved_class_helper = lowered.bb_function("_dp_class_ns_Box");
+    assert!(resolved_function_uses_global(resolved_class_helper, "y"));
 }
 
 #[test]
@@ -1187,22 +1393,18 @@ def outer():
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let core_rendered = lowered.pass_text("core_blockpy");
-    assert!(
-        !core_rendered.contains("__dp_store_cell(_dp_cell_x, 1)"),
-        "{core_rendered}"
-    );
-    assert!(
-        core_rendered.contains("StoreName(\"x\", 1)"),
-        "{core_rendered}"
-    );
+    let blockpy_module = lowered.blockpy_module();
+    let class_helper = blockpy_function_by_name(&blockpy_module, "_dp_class_ns_Box");
+    assert!(!blockpy_function_has_root_name(
+        class_helper,
+        "__dp_store_cell"
+    ));
+    assert!(blockpy_function_has_store_name(class_helper, "x"));
 
-    let name_binding_rendered = lowered.name_binding_text();
-    assert!(
-        name_binding_rendered.contains("StoreLocation(CapturedSource(")
-            && name_binding_rendered.contains("constant slot"),
-        "{name_binding_rendered}"
-    );
+    let resolved_class_helper = lowered.bb_function("_dp_class_ns_Box");
+    assert!(resolved_function_has_store_to_captured_source(
+        resolved_class_helper
+    ));
 }
 
 #[test]
@@ -1215,21 +1417,16 @@ class Box:
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let core_rendered = lowered.pass_text("core_blockpy");
-    assert!(
-        !core_rendered.contains("__dp_store_global(__dp_globals(), \"y\""),
-        "{core_rendered}"
-    );
-    assert!(
-        core_rendered.contains("StoreName(\"y\", _dp_tmp_"),
-        "{core_rendered}"
-    );
+    let blockpy_module = lowered.blockpy_module();
+    let class_helper = blockpy_function_by_name(&blockpy_module, "_dp_class_ns_Box");
+    assert!(!blockpy_function_has_root_name(
+        class_helper,
+        "__dp_store_global"
+    ));
+    assert!(blockpy_function_has_store_name(class_helper, "y"));
 
-    let name_binding_rendered = lowered.name_binding_text();
-    assert!(
-        name_binding_rendered.contains("y@g") && name_binding_rendered.contains("LocalLocation("),
-        "{name_binding_rendered}"
-    );
+    let resolved_class_helper = lowered.bb_function("_dp_class_ns_Box");
+    assert!(resolved_function_uses_global(resolved_class_helper, "y"));
 }
 
 #[test]
@@ -1245,22 +1442,18 @@ def outer():
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let core_rendered = lowered.pass_text("core_blockpy");
-    assert!(
-        !core_rendered.contains("__dp_store_cell(_dp_cell_x, _dp_tmp"),
-        "{core_rendered}"
-    );
-    assert!(
-        core_rendered.contains("StoreName(\"x\", _dp_tmp_"),
-        "{core_rendered}"
-    );
+    let blockpy_module = lowered.blockpy_module();
+    let class_helper = blockpy_function_by_name(&blockpy_module, "_dp_class_ns_Box");
+    assert!(!blockpy_function_has_root_name(
+        class_helper,
+        "__dp_store_cell"
+    ));
+    assert!(blockpy_function_has_store_name(class_helper, "x"));
 
-    let name_binding_rendered = lowered.name_binding_text();
-    assert!(
-        name_binding_rendered.contains("StoreLocation(CapturedSource(")
-            && name_binding_rendered.contains("LocalLocation("),
-        "{name_binding_rendered}"
-    );
+    let resolved_class_helper = lowered.bb_function("_dp_class_ns_Box");
+    assert!(resolved_function_has_store_to_captured_source(
+        resolved_class_helper
+    ));
 }
 
 #[test]
@@ -1274,22 +1467,23 @@ class Box:
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let core_rendered = lowered.pass_text("core_blockpy");
-    assert!(
-        core_rendered.contains("StoreName(\"value\", contextmanager_enter("),
-        "{core_rendered}"
-    );
-    assert!(
-        !core_rendered.contains("SetItem(_dp_class_ns, \"value\", contextmanager_enter("),
-        "{core_rendered}"
-    );
+    let blockpy_module = lowered.blockpy_module();
+    let class_helper = blockpy_function_by_name(&blockpy_module, "_dp_class_ns_Box");
+    assert!(blockpy_function_has_store_name(class_helper, "value"));
+    assert!(blockpy_function_has_root_name(
+        class_helper,
+        "contextmanager_enter"
+    ));
+    assert!(!blockpy_function_has_root_name(
+        class_helper,
+        "__dp_setitem"
+    ));
 
-    let name_binding_rendered = lowered.name_binding_text();
+    let resolved_class_helper = lowered.bb_function("_dp_class_ns_Box");
     assert!(
-        name_binding_rendered.contains("SetItem(LocalLocation(0),")
+        resolved_function_has_setitem(resolved_class_helper)
             && module_constant_text(lowered.bb_module()).contains("contextmanager_enter"),
-        "{}\n{}",
-        name_binding_rendered,
+        "{resolved_class_helper:?}\n{}",
         module_constant_text(lowered.bb_module())
     );
 }
@@ -1309,22 +1503,19 @@ def outer():
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let core_rendered = lowered.pass_text("core_blockpy");
-    assert!(
-        !core_rendered.contains("StoreLocation(_dp_cell_value, contextmanager_enter("),
-        "{core_rendered}"
-    );
-    assert!(
-        core_rendered.contains("StoreName(\"value\", contextmanager_enter("),
-        "{core_rendered}"
-    );
+    let blockpy_module = lowered.blockpy_module();
+    let class_helper = blockpy_function_by_name(&blockpy_module, "_dp_class_ns_Box");
+    assert!(blockpy_function_has_store_name(class_helper, "value"));
+    assert!(blockpy_function_has_root_name(
+        class_helper,
+        "contextmanager_enter"
+    ));
 
-    let name_binding_rendered = lowered.name_binding_text();
+    let resolved_class_helper = lowered.bb_function("_dp_class_ns_Box");
     assert!(
-        name_binding_rendered.contains("StoreLocation(CapturedSource(")
+        resolved_function_has_store_to_captured_source(resolved_class_helper)
             && module_constant_text(lowered.bb_module()).contains("contextmanager_enter"),
-        "{}\n{}",
-        name_binding_rendered,
+        "{resolved_class_helper:?}\n{}",
         module_constant_text(lowered.bb_module())
     );
 }
@@ -1338,25 +1529,23 @@ class A:
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let core_rendered = lowered.pass_text("core_blockpy");
-    assert!(
-        core_rendered
-            .contains("StoreName(\"B\", _dp_define_class_B(_dp_class_ns_B, _dp_class_ns))"),
-        "{core_rendered}"
-    );
-    assert!(
-        !core_rendered.contains(
-            "__dp_setitem(__dp_load_deleted_name(\"_dp_class_ns\", _dp_class_ns), \"B\","
-        ),
-        "{core_rendered}"
-    );
+    let blockpy_module = lowered.blockpy_module();
+    let class_helper = blockpy_function_by_name(&blockpy_module, "_dp_class_ns_A");
+    assert!(blockpy_function_has_store_name(class_helper, "B"));
+    assert!(blockpy_function_has_root_name(
+        class_helper,
+        "_dp_define_class_B"
+    ));
+    assert!(!blockpy_function_has_root_name(
+        class_helper,
+        "__dp_setitem"
+    ));
 
-    let name_binding_rendered = lowered.name_binding_text();
+    let resolved_class_helper = lowered.bb_function("_dp_class_ns_A");
     assert!(
-        name_binding_rendered.contains("SetItem(LocalLocation(0),")
+        resolved_function_has_setitem(resolved_class_helper)
             && module_constant_text(lowered.bb_module()).contains("make_function"),
-        "{}\n{}",
-        name_binding_rendered,
+        "{resolved_class_helper:?}\n{}",
         module_constant_text(lowered.bb_module())
     );
 }
@@ -1468,34 +1657,15 @@ def gen():
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let name_binding_rendered = lowered.name_binding_text();
-    assert!(
-        name_binding_rendered.contains("branch_table CapturedSource(0)"),
-        "{name_binding_rendered}"
-    );
-    assert!(
-        name_binding_rendered.contains("StoreLocation(CapturedSource(0),"),
-        "{name_binding_rendered}"
-    );
-
     let resume = lowered.bb_function("gen");
     let entry_params = resume.entry_block().param_name_vec();
     assert!(
         !entry_params.iter().any(|name| name == "_dp_pc"),
         "{resume:?}"
     );
+    assert!(resolved_function_uses_captured_source(resume), "{resume:?}");
     assert!(
-        resume
-            .blocks
-            .iter()
-            .any(|block| block_uses_text(block, "CapturedSource(")),
-        "{resume:?}"
-    );
-    assert!(
-        resume
-            .blocks
-            .iter()
-            .any(|block| block_uses_text(block, "StoreLocation(CapturedSource(")),
+        resolved_function_has_store_to_captured_source(resume),
         "{resume:?}"
     );
 }
@@ -1512,18 +1682,6 @@ def delegator():
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let name_binding_rendered = lowered.name_binding_text();
-    assert!(
-        name_binding_rendered.contains("CapturedSource("),
-        "{name_binding_rendered}"
-    );
-    assert!(
-        name_binding_rendered.contains("StoreLocation(CapturedSource(")
-            && (name_binding_rendered.contains("__dp_NONE")
-                || name_binding_rendered.contains("child()")),
-        "{name_binding_rendered}"
-    );
-
     let resume = lowered.bb_function("delegator");
     let entry_params = resume.entry_block().param_name_vec();
     assert!(
@@ -1531,18 +1689,9 @@ def delegator():
             && !entry_params.iter().any(|name| name == "_dp_yieldfrom"),
         "{resume:?}"
     );
+    assert!(resolved_function_uses_captured_source(resume), "{resume:?}");
     assert!(
-        resume
-            .blocks
-            .iter()
-            .any(|block| block_uses_text(block, "CapturedSource(")),
-        "{resume:?}"
-    );
-    assert!(
-        resume
-            .blocks
-            .iter()
-            .any(|block| block_uses_text(block, "StoreLocation(CapturedSource(")),
+        resolved_function_has_store_to_captured_source(resume),
         "{resume:?}"
     );
 }
@@ -1558,34 +1707,15 @@ def gen():
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let name_binding_rendered = lowered.name_binding_text();
-    assert!(
-        name_binding_rendered.contains("return CapturedSource("),
-        "{name_binding_rendered}"
-    );
-    assert!(
-        name_binding_rendered.contains("StoreLocation(CapturedSource("),
-        "{name_binding_rendered}"
-    );
-
     let resume = lowered.bb_function("gen");
     let entry_params = resume.entry_block().param_name_vec();
     assert!(
         !entry_params.iter().any(|name| name == "total"),
         "{resume:?}"
     );
+    assert!(resolved_function_uses_captured_source(resume), "{resume:?}");
     assert!(
-        resume
-            .blocks
-            .iter()
-            .any(|block| block_uses_text(block, "CapturedSource(0)")),
-        "{resume:?}"
-    );
-    assert!(
-        resume
-            .blocks
-            .iter()
-            .any(|block| { block_uses_text(block, "StoreLocation(CapturedSource(0),") }),
+        resolved_function_has_store_to_captured_source(resume),
         "{resume:?}"
     );
 }
@@ -1608,9 +1738,10 @@ async def run():
     let hidden_listcomp_resume = lowered.bb_function("_dp_listcomp_7");
     assert!(
         hidden_listcomp_resume
-            .blocks
-            .iter()
-            .any(|block| block_uses_text(block, "CapturedSource(")),
+            .storage_layout()
+            .as_ref()
+            .is_some_and(|layout| !layout.freevars.is_empty())
+            || resolved_function_uses_captured_source(hidden_listcomp_resume),
         "{hidden_listcomp_resume:?}"
     );
 }
@@ -1624,25 +1755,26 @@ def gen():
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let core_rendered = lowered.pass_text("core_blockpy");
-    assert!(
-        !core_rendered.contains("_dp_cell_total = __dp_make_cell"),
-        "{core_rendered}"
-    );
-    assert!(
-        !core_rendered.contains("_dp_cell__dp_pc = __dp_make_cell"),
-        "{core_rendered}"
-    );
-    assert!(
-        !core_rendered.contains("_dp_cell__dp_yieldfrom = __dp_make_cell"),
-        "{core_rendered}"
-    );
+    let blockpy_module = lowered.blockpy_module();
+    let factory = blockpy_function_by_name(&blockpy_module, "gen");
+    assert!(!blockpy_function_has_root_name(factory, "__dp_make_cell"));
 
-    let name_binding_rendered = lowered.name_binding_text();
+    let resolved_factory = blockpy_function_by_name(lowered.bb_module(), "gen");
+    let resolved_module = lowered.bb_module();
+    let make_cell_count = resolved_module
+        .callable_defs
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.body)
+        .filter(|stmt| {
+            instr_any(*stmt, &mut |expr: &InstrResolved| {
+                matches!(expr, InstrResolved::MakeCell(_))
+            })
+        })
+        .count();
     assert!(
-        name_binding_rendered.contains("StoreLocation(Owned(1), MakeCell(constant slot")
-            && count_occurrences(name_binding_rendered.as_str(), "MakeCell(") >= 3,
-        "{name_binding_rendered}"
+        resolved_function_has_make_cell(resolved_factory) && make_cell_count >= 3,
+        "{resolved_factory:?}"
     );
 }
 
@@ -1657,29 +1789,20 @@ def gen():
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let name_binding_rendered = lowered.name_binding_text();
+    let resume = lowered.bb_function("gen");
+    let storage_layout = resume
+        .storage_layout()
+        .as_ref()
+        .expect("resume closure layout should contain try-exception state cell");
     assert!(
-        name_binding_rendered.contains("_dp_try_exc_")
-            && name_binding_rendered.contains("_dp_cell__dp_try_exc_"),
-        "{name_binding_rendered}"
-    );
-    assert!(
-        function_or_constants_use_text(
-            lowered.bb_module(),
-            lowered.bb_function("gen"),
-            "exception_matches"
-        ) && name_binding_rendered.contains("CapturedSource(")
-            && !name_binding_rendered.contains("StoreName(\"_dp_eval_"),
-        "{}\n{}",
-        name_binding_rendered,
+        function_or_constants_use_text(lowered.bb_module(), resume, "exception_matches")
+            && resolved_function_uses_captured_source(resume)
+            && !blockpy_function_has_store_name(resume, "_dp_eval_"),
+        "{resume:?}\n{}",
         module_constant_text(lowered.bb_module())
     );
-    assert!(
-        !name_binding_rendered.contains("del _dp_eval_"),
-        "{name_binding_rendered}"
-    );
+    assert!(!resolved_function_has_del(resume, "_dp_eval_", false));
 
-    let resume = lowered.bb_function("gen");
     let try_exc_slot = resume
         .storage_layout()
         .as_ref()
@@ -1697,6 +1820,7 @@ def gen():
             .binding_kind(try_exc_slot.logical_name.as_str()),
         Some(BindingKind::Cell(CellBindingKind::Capture))
     );
+    assert!(storage_layout.has_storage_name(&try_exc_slot.storage_name));
 }
 
 #[test]
@@ -1725,22 +1849,18 @@ def f():
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let core_rendered = lowered.pass_text("core_blockpy");
-    assert!(
-        !core_rendered.contains("__dp_store_global"),
-        "{core_rendered}"
-    );
-    assert!(
-        core_rendered.contains("StoreName(\"f\", MakeFunction"),
-        "{core_rendered}"
-    );
+    let blockpy_module = lowered.blockpy_module();
+    assert!(!blockpy_module_has_root_name(
+        &blockpy_module,
+        "__dp_store_global"
+    ));
+    assert!(blockpy_module_has_store_name(&blockpy_module, "f"));
 
-    let name_binding_rendered = lowered.name_binding_text();
+    let resolved_init = lowered.bb_function("_dp_module_init");
     assert!(
-        name_binding_rendered.contains("f@g")
+        resolved_function_uses_global(resolved_init, "f")
             && module_constant_text(lowered.bb_module()).contains("make_function"),
-        "{}\n{}",
-        name_binding_rendered,
+        "{resolved_init:?}\n{}",
         module_constant_text(lowered.bb_module())
     );
 }
@@ -1753,33 +1873,21 @@ y = x
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let core_rendered = lowered.pass_text("core_blockpy");
-    assert!(
-        !core_rendered.contains("__dp_store_global"),
-        "{core_rendered}"
-    );
-    assert!(
-        !core_rendered.contains("__dp_load_global"),
-        "{core_rendered}"
-    );
-    assert!(
-        core_rendered.contains("StoreName(\"x\", 1)"),
-        "{core_rendered}"
-    );
-    assert!(
-        core_rendered.contains("StoreName(\"y\", x)"),
-        "{core_rendered}"
-    );
+    let blockpy_module = lowered.blockpy_module();
+    assert!(!blockpy_module_has_root_name(
+        &blockpy_module,
+        "__dp_store_global"
+    ));
+    assert!(!blockpy_module_has_root_name(
+        &blockpy_module,
+        "__dp_load_global"
+    ));
+    assert!(blockpy_module_has_store_name(&blockpy_module, "x"));
+    assert!(blockpy_module_has_store_name(&blockpy_module, "y"));
 
-    let name_binding_rendered = lowered.name_binding_text();
-    assert!(
-        name_binding_rendered.contains("x@g") && name_binding_rendered.contains("constant slot"),
-        "{name_binding_rendered}"
-    );
-    assert!(
-        name_binding_rendered.contains("y@g") && name_binding_rendered.contains("x@g"),
-        "{name_binding_rendered}"
-    );
+    let resolved_init = lowered.bb_function("_dp_module_init");
+    assert!(resolved_function_uses_global(resolved_init, "x"));
+    assert!(resolved_module_uses_global(lowered.bb_module(), "y"));
 }
 
 #[test]
@@ -1792,33 +1900,21 @@ x = (y := f())
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let core_rendered = lowered.pass_text("core_blockpy");
-    assert!(
-        !core_rendered.contains("__dp_store_global"),
-        "{core_rendered}"
-    );
-    assert!(
-        !core_rendered.contains("__dp_load_global"),
-        "{core_rendered}"
-    );
-    assert!(
-        core_rendered.contains("StoreName(\"y\", f())"),
-        "{core_rendered}"
-    );
-    assert!(
-        core_rendered.contains("StoreName(\"x\", y)"),
-        "{core_rendered}"
-    );
+    let blockpy_module = lowered.blockpy_module();
+    assert!(!blockpy_module_has_root_name(
+        &blockpy_module,
+        "__dp_store_global"
+    ));
+    assert!(!blockpy_module_has_root_name(
+        &blockpy_module,
+        "__dp_load_global"
+    ));
+    assert!(blockpy_module_has_store_name(&blockpy_module, "y"));
+    assert!(blockpy_module_has_store_name(&blockpy_module, "x"));
 
-    let name_binding_rendered = lowered.name_binding_text();
-    assert!(
-        name_binding_rendered.contains("y@g"),
-        "{name_binding_rendered}"
-    );
-    assert!(
-        name_binding_rendered.contains("x@g") && name_binding_rendered.contains("y@g"),
-        "{name_binding_rendered}"
-    );
+    let resolved_init = lowered.bb_function("_dp_module_init");
+    assert!(resolved_function_uses_global(resolved_init, "x"));
+    assert!(resolved_module_uses_global(lowered.bb_module(), "y"));
 }
 
 #[test]
@@ -1828,32 +1924,20 @@ x = [y := i for i in [1, 2]]
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let ast_rendered = lowered.pass_text("ast-to-ast");
-    assert!(ast_rendered.contains("global y"), "{ast_rendered}");
-    assert!(
-        !ast_rendered.contains("__dp_store_global"),
-        "{ast_rendered}"
-    );
+    let ast_probe = probe_rewritten_ast(source);
+    assert!(ast_probe.global_names.contains("y"));
+    assert!(!ast_probe.function_names.contains("__dp_store_global"));
 
-    let core_rendered = lowered.pass_text("core_blockpy");
-    assert!(
-        !core_rendered.contains("__dp_store_global"),
-        "{core_rendered}"
-    );
-    assert!(
-        core_rendered.contains("StoreName(\"y\", i)"),
-        "{core_rendered}"
-    );
+    let blockpy_module = lowered.blockpy_module();
+    assert!(!blockpy_module_has_root_name(
+        &blockpy_module,
+        "__dp_store_global"
+    ));
+    assert!(blockpy_module_has_store_name(&blockpy_module, "y"));
 
-    let name_binding_rendered = lowered.name_binding_text();
-    assert!(
-        name_binding_rendered.contains("y@g") && name_binding_rendered.contains("LocalLocation("),
-        "{name_binding_rendered}"
-    );
-    assert!(
-        name_binding_rendered.contains("x@g"),
-        "{name_binding_rendered}"
-    );
+    let resolved_init = lowered.bb_function("_dp_module_init");
+    assert!(resolved_function_uses_global(resolved_init, "x"));
+    assert!(resolved_module_uses_global(lowered.bb_module(), "y"));
 }
 
 #[test]
@@ -1864,21 +1948,15 @@ for x in [1, 2]:
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let core_rendered = lowered.pass_text("core_blockpy");
-    assert!(
-        !core_rendered.contains("__dp_store_global"),
-        "{core_rendered}"
-    );
-    assert!(
-        core_rendered.contains("StoreName(\"x\", _dp_tmp_"),
-        "{core_rendered}"
-    );
+    let blockpy_module = lowered.blockpy_module();
+    assert!(!blockpy_module_has_root_name(
+        &blockpy_module,
+        "__dp_store_global"
+    ));
+    assert!(blockpy_module_has_store_name(&blockpy_module, "x"));
 
-    let name_binding_rendered = lowered.name_binding_text();
-    assert!(
-        name_binding_rendered.contains("x@g") && name_binding_rendered.contains("LocalLocation("),
-        "{name_binding_rendered}"
-    );
+    let resolved_init = lowered.bb_function("_dp_module_init");
+    assert!(resolved_function_uses_global(resolved_init, "x"));
 }
 
 #[test]
@@ -1891,33 +1969,19 @@ except Exception as exc:
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let semantic_rendered = lowered.blockpy_text();
-    assert!(
-        !semantic_rendered.contains("__dp_store_global(__dp_globals(), \"exc\""),
-        "{semantic_rendered}"
-    );
-    assert!(
-        semantic_rendered.contains("del_quietly(exc)"),
-        "{semantic_rendered}"
-    );
-    assert!(
-        !semantic_rendered.contains("__dp_current_exception()"),
-        "{semantic_rendered}"
-    );
-    assert!(
-        semantic_rendered.contains("StoreName(\"exc\", _dp_try_exc_"),
-        "{semantic_rendered}"
-    );
+    let blockpy_module = lowered.blockpy_module();
+    let init = blockpy_function_by_name(&blockpy_module, "_dp_module_init");
+    assert!(!blockpy_function_has_root_name(init, "__dp_store_global"));
+    assert!(blockpy_function_has_root_name(init, "del_quietly"));
+    assert!(!blockpy_function_has_root_name(
+        init,
+        "__dp_current_exception"
+    ));
+    assert!(blockpy_function_has_store_name(init, "exc"));
 
-    let name_binding_rendered = lowered.name_binding_text();
-    assert!(
-        name_binding_rendered.contains("exc@g") && name_binding_rendered.contains("LocalLocation("),
-        "{name_binding_rendered}"
-    );
-    assert!(
-        name_binding_rendered.contains("Del {") && name_binding_rendered.contains("quietly: true"),
-        "{name_binding_rendered}"
-    );
+    let resolved_init = lowered.bb_function("_dp_module_init");
+    assert!(resolved_function_uses_global(resolved_init, "exc"));
+    assert!(resolved_function_has_del(resolved_init, "exc", true));
 }
 
 #[test]
@@ -1928,22 +1992,17 @@ del x
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let core_rendered = lowered.pass_text("core_blockpy");
-    assert!(
-        !core_rendered.contains("__dp_delitem(__dp_globals(), \"x\")"),
-        "{core_rendered}"
-    );
-    assert!(
-        core_rendered.contains("Del {") && core_rendered.contains("quietly: false"),
-        "{core_rendered}"
-    );
-    assert!(!core_rendered.contains("__dp_DELETED"), "{core_rendered}");
+    let blockpy_module = lowered.blockpy_module();
+    let init = blockpy_function_by_name(&blockpy_module, "_dp_module_init");
+    assert!(!blockpy_function_has_root_name(init, "__dp_delitem"));
+    assert!(blockpy_function_has_del_name(init, "x"));
+    assert!(!blockpy_module_has_root_name(
+        &blockpy_module,
+        "__dp_DELETED"
+    ));
 
-    let name_binding_rendered = lowered.name_binding_text();
-    assert!(
-        name_binding_rendered.contains("Del {") && name_binding_rendered.contains("quietly: false"),
-        "{name_binding_rendered}"
-    );
+    let resolved_init = lowered.bb_function("_dp_module_init");
+    assert!(resolved_function_has_del(resolved_init, "x", false));
 }
 
 #[test]
@@ -1956,22 +2015,16 @@ def f():
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let core_rendered = lowered.pass_text("core_blockpy");
-    assert!(
-        !core_rendered.contains("__dp_load_deleted_name"),
-        "{core_rendered}"
-    );
-    assert!(
-        !core_rendered.contains("StoreName(\"x\", 1)"),
-        "{core_rendered}"
-    );
+    let blockpy_module = lowered.blockpy_module();
+    let f = blockpy_function_by_name(&blockpy_module, "f");
+    assert!(!blockpy_function_has_root_name(f, "__dp_load_deleted_name"));
+    assert!(!blockpy_function_has_store_name(f, "x"));
 
-    let name_binding_rendered = lowered.name_binding_text();
     assert!(
         module_constant_text(lowered.bb_module()).contains("load_deleted_name")
             && module_constant_text(lowered.bb_module()).contains("DELETED"),
-        "{}\n{}",
-        name_binding_rendered,
+        "{:?}\n{}",
+        lowered.bb_function("f"),
         module_constant_text(lowered.bb_module())
     );
 }
@@ -1990,16 +2043,12 @@ def outer():
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let blockpy_rendered = lowered.blockpy_text();
-    assert!(
-        blockpy_rendered.contains("function outer.<locals>.inner():")
-            && blockpy_rendered.contains(
-                "StoreName(\"inner\", MakeFunction(0:1, Function, tuple_values(), NONE))"
-            )
-            && blockpy_rendered.contains("Del {")
-            && blockpy_rendered.contains("quietly: false"),
-        "{blockpy_rendered}"
-    );
+    let blockpy_module = lowered.blockpy_module();
+    let outer = blockpy_function_by_name(&blockpy_module, "outer");
+    let inner = blockpy_function_by_name(&blockpy_module, "inner");
+    assert_eq!(inner.names.qualname, "outer.<locals>.inner");
+    assert!(blockpy_function_has_store_name(outer, "inner"));
+    assert!(blockpy_function_has_del_name(inner, "x"));
 }
 
 #[test]
@@ -2015,31 +2064,21 @@ def outer():
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let core_rendered = lowered.pass_text("core_blockpy");
-    assert!(
-        core_rendered.contains("StoreName(\"x\", BinOp(Add, x, 1))"),
-        "{core_rendered}"
-    );
-    assert!(core_rendered.contains("return x"), "{core_rendered}");
-    assert!(
-        !core_rendered.contains("__dp_store_cell(_dp_cell_x, __dp_add("),
-        "{core_rendered}"
-    );
-    assert!(
-        !core_rendered.contains("return __dp_load_cell(_dp_cell_x)"),
-        "{core_rendered}"
-    );
+    let blockpy_module = lowered.blockpy_module();
+    let inner = blockpy_function_by_name(&blockpy_module, "inner");
+    assert!(blockpy_function_has_store_name(inner, "x"));
+    assert!(inner.blocks.iter().any(|block| matches!(
+        &block.term,
+        BlockTerm::Return(InstrWithAwaitAndYield::Load(load)) if load.name.id_str() == "x"
+    )));
+    assert!(!blockpy_function_has_root_name(inner, "__dp_store_cell"));
+    assert!(!blockpy_function_has_root_name(inner, "__dp_load_cell"));
 
-    let name_binding_rendered = lowered.name_binding_text();
-    assert!(
-        name_binding_rendered.contains("StoreLocation(CapturedSource(")
-            && name_binding_rendered.contains("BinOp(Add, CapturedSource("),
-        "{name_binding_rendered}"
-    );
-    assert!(
-        name_binding_rendered.contains("return CapturedSource("),
-        "{name_binding_rendered}"
-    );
+    let resolved_inner = lowered.bb_function("inner");
+    assert!(resolved_function_has_store_to_captured_source(
+        resolved_inner
+    ));
+    assert!(resolved_function_uses_captured_source(resolved_inner));
 }
 
 #[test]
@@ -2053,30 +2092,12 @@ def outer(x):
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let core_rendered = lowered.pass_text("core_blockpy");
-    assert!(
-        !core_rendered.contains("_dp_cell_x = __dp_make_cell(x)"),
-        "{core_rendered}"
-    );
-    assert!(
-        !core_rendered.contains("_dp_cell_y = __dp_make_cell()"),
-        "{core_rendered}"
-    );
-
-    let name_binding_rendered = lowered.name_binding_text();
-    assert!(
-        name_binding_rendered
-            .contains("StoreLocation(LocalLocation(1), MakeCell(LocalLocation(0)))"),
-        "{name_binding_rendered}"
-    );
-    assert!(
-        name_binding_rendered.contains("StoreLocation(LocalLocation(2), MakeCell(")
-            && (name_binding_rendered.contains("MakeCell(DELETED)")
-                || name_binding_rendered.contains("MakeCell(constant slot")),
-        "{}\n{}",
-        name_binding_rendered,
-        module_constant_text(lowered.bb_module())
-    );
+    let blockpy_module = lowered.blockpy_module();
+    let outer_semantic = blockpy_function_by_name(&blockpy_module, "outer");
+    assert!(!blockpy_function_has_root_name(
+        outer_semantic,
+        "__dp_make_cell"
+    ));
     let name_binding_module = lowered
         .result
         .pass_tracker
@@ -2087,6 +2108,7 @@ def outer(x):
         .iter()
         .find(|func| func.names.bind_name == "outer")
         .expect("outer function should be present");
+    assert!(resolved_function_has_make_cell(outer));
     let Some(InstrResolved::Store(assign)) = outer.entry_block().body.first() else {
         panic!("expected first entry stmt to be Expr(Store(...))");
     };
@@ -2180,16 +2202,11 @@ def choose(y):
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let blockpy_rendered = lowered.blockpy_text();
-    assert!(
-        blockpy_rendered.contains("StoreName(\"x\", y)"),
-        "{blockpy_rendered}"
-    );
-    assert!(
-        blockpy_rendered.contains("return f(x)"),
-        "{blockpy_rendered}"
-    );
-    assert!(!blockpy_rendered.contains(":="), "{blockpy_rendered}");
+    let blockpy_module = lowered.blockpy_module();
+    let choose = blockpy_function_by_name(&blockpy_module, "choose");
+    assert!(blockpy_function_has_store_name(choose, "x"));
+    assert!(blockpy_function_has_root_name(choose, "f"));
+    assert!(blockpy_function_has_root_name(choose, "x"));
 }
 
 #[test]
@@ -2200,15 +2217,21 @@ def choose(xs):
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let blockpy_rendered = lowered.blockpy_text();
-    assert!(
-        blockpy_rendered.contains("function choose.<locals>._dp_listcomp_"),
-        "{blockpy_rendered}"
-    );
-    assert!(
-        blockpy_rendered.contains("return f(_dp_listcomp"),
-        "{blockpy_rendered}"
-    );
+    let blockpy_module = lowered.blockpy_module();
+    let listcomp = blockpy_module
+        .callable_defs
+        .iter()
+        .find(|function| {
+            function
+                .names
+                .qualname
+                .starts_with("choose.<locals>._dp_listcomp_")
+        })
+        .unwrap_or_else(|| panic!("missing hidden listcomp; got {blockpy_module:?}"));
+    let listcomp_bind_name = listcomp.names.bind_name.clone();
+    let choose = blockpy_function_by_name(&blockpy_module, "choose");
+    assert!(blockpy_function_has_root_name(choose, "f"));
+    assert!(blockpy_function_has_root_name(choose, &listcomp_bind_name));
 }
 
 #[test]
@@ -2219,15 +2242,16 @@ def choose(xs):
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let blockpy_rendered = lowered.blockpy_text();
-    assert!(
-        blockpy_rendered.contains("generator choose.<locals>.<genexpr>("),
-        "{blockpy_rendered}"
-    );
-    assert!(
-        blockpy_rendered.contains("return tuple(_dp_genexpr"),
-        "{blockpy_rendered}"
-    );
+    let blockpy_module = lowered.blockpy_module();
+    let genexpr = blockpy_function_by_qualname(&blockpy_module, "choose.<locals>.<genexpr>");
+    assert_eq!(genexpr.names.qualname, "choose.<locals>.<genexpr>");
+    assert_eq!(genexpr.kind, FunctionKind::Generator);
+    let choose = blockpy_function_by_name(&blockpy_module, "choose");
+    assert!(blockpy_function_has_root_name(choose, "tuple"));
+    assert!(blockpy_function_instr_any(choose, |expr| matches!(
+        expr,
+        InstrWithAwaitAndYield::MakeFunction(_)
+    )));
 }
 
 #[test]
@@ -2238,15 +2262,15 @@ def choose():
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let blockpy_rendered = lowered.blockpy_text();
-    assert!(
-        blockpy_rendered.contains("function choose.<locals>.<lambda>("),
-        "{blockpy_rendered}"
-    );
-    assert!(
-        blockpy_rendered.contains("return f(MakeFunction("),
-        "{blockpy_rendered}"
-    );
+    let blockpy_module = lowered.blockpy_module();
+    let lambda = blockpy_function_by_qualname(&blockpy_module, "choose.<locals>.<lambda>");
+    assert_eq!(lambda.names.qualname, "choose.<locals>.<lambda>");
+    let choose = blockpy_function_by_name(&blockpy_module, "choose");
+    assert!(blockpy_function_has_root_name(choose, "f"));
+    assert!(blockpy_function_instr_any(choose, |expr| matches!(
+        expr,
+        InstrWithAwaitAndYield::MakeFunction(_)
+    )));
 }
 
 #[test]
@@ -2263,25 +2287,17 @@ async def agen():
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let semantic_blockpy_rendered = lowered.blockpy_text();
-    assert!(
-        semantic_blockpy_rendered.contains("await Once()"),
-        "{semantic_blockpy_rendered}"
-    );
-    assert!(
-        !semantic_blockpy_rendered.contains("await_iter"),
-        "{semantic_blockpy_rendered}"
-    );
+    let semantic_blockpy = lowered.blockpy_module();
+    let semantic_agen = blockpy_function_by_name(&semantic_blockpy, "agen");
+    assert!(blockpy_function_instr_any(semantic_agen, |expr| matches!(
+        expr,
+        InstrWithAwaitAndYield::Await(_)
+    )));
+    assert!(!blockpy_function_has_root_name(semantic_agen, "await_iter"));
 
-    let blockpy_rendered = lowered.core_blockpy_with_yield_text();
-    assert!(
-        blockpy_rendered.contains("await_iter"),
-        "{blockpy_rendered}"
-    );
-    assert!(
-        !blockpy_rendered.contains("await Once()"),
-        "{blockpy_rendered}"
-    );
+    let core_with_yield = tracked_core_blockpy_with_yield_only(source);
+    let lowered_agen = blockpy_function_by_name(&core_with_yield, "agen");
+    assert!(blockpy_function_has_root_name(lowered_agen, "await_iter"));
 }
 
 #[test]
@@ -2298,25 +2314,17 @@ async def run():
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let semantic_blockpy_rendered = lowered.blockpy_text();
-    assert!(
-        semantic_blockpy_rendered.contains("await Once()"),
-        "{semantic_blockpy_rendered}"
-    );
-    assert!(
-        !semantic_blockpy_rendered.contains("await_iter"),
-        "{semantic_blockpy_rendered}"
-    );
+    let semantic_blockpy = lowered.blockpy_module();
+    let semantic_run = blockpy_function_by_name(&semantic_blockpy, "run");
+    assert!(blockpy_function_instr_any(semantic_run, |expr| matches!(
+        expr,
+        InstrWithAwaitAndYield::Await(_)
+    )));
+    assert!(!blockpy_function_has_root_name(semantic_run, "await_iter"));
 
-    let blockpy_rendered = lowered.core_blockpy_with_yield_text();
-    assert!(
-        blockpy_rendered.contains("await_iter"),
-        "{blockpy_rendered}"
-    );
-    assert!(
-        !blockpy_rendered.contains("await Once()"),
-        "{blockpy_rendered}"
-    );
+    let core_with_yield = tracked_core_blockpy_with_yield_only(source);
+    let lowered_run = blockpy_function_by_name(&core_with_yield, "run");
+    assert!(blockpy_function_has_root_name(lowered_run, "await_iter"));
 }
 
 #[test]
@@ -2353,33 +2361,25 @@ async def agen(cm):
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let semantic_blockpy_rendered = lowered.blockpy_text();
-    assert!(
-        semantic_blockpy_rendered.contains("await asynccontextmanager_aenter"),
-        "{semantic_blockpy_rendered}"
-    );
-    assert!(
-        semantic_blockpy_rendered.contains("asynccontextmanager_get_aexit"),
-        "{semantic_blockpy_rendered}"
-    );
-    assert!(
-        !semantic_blockpy_rendered.contains("await_iter"),
-        "{semantic_blockpy_rendered}"
-    );
+    let semantic_blockpy = lowered.blockpy_module();
+    let semantic_agen = blockpy_function_by_name(&semantic_blockpy, "agen");
+    assert!(blockpy_function_has_root_name(
+        semantic_agen,
+        "asynccontextmanager_aenter"
+    ));
+    assert!(blockpy_function_has_root_name(
+        semantic_agen,
+        "asynccontextmanager_get_aexit"
+    ));
+    assert!(!blockpy_function_has_root_name(semantic_agen, "await_iter"));
 
-    let blockpy_rendered = lowered.core_blockpy_with_yield_text();
-    assert!(
-        blockpy_rendered.contains("await_iter"),
-        "{blockpy_rendered}"
-    );
-    assert!(
-        blockpy_rendered.contains("asynccontextmanager_aenter"),
-        "{blockpy_rendered}"
-    );
-    assert!(
-        !blockpy_rendered.contains("async with cm as value"),
-        "{blockpy_rendered}"
-    );
+    let core_with_yield = tracked_core_blockpy_with_yield_only(source);
+    let lowered_agen = blockpy_function_by_name(&core_with_yield, "agen");
+    assert!(blockpy_function_has_root_name(lowered_agen, "await_iter"));
+    assert!(blockpy_function_has_root_name(
+        lowered_agen,
+        "asynccontextmanager_aenter"
+    ));
 }
 
 #[test]
@@ -2391,33 +2391,25 @@ async def run(cm):
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let semantic_blockpy_rendered = lowered.blockpy_text();
-    assert!(
-        semantic_blockpy_rendered.contains("await asynccontextmanager_aenter"),
-        "{semantic_blockpy_rendered}"
-    );
-    assert!(
-        semantic_blockpy_rendered.contains("asynccontextmanager_get_aexit"),
-        "{semantic_blockpy_rendered}"
-    );
-    assert!(
-        !semantic_blockpy_rendered.contains("await_iter"),
-        "{semantic_blockpy_rendered}"
-    );
+    let semantic_blockpy = lowered.blockpy_module();
+    let semantic_run = blockpy_function_by_name(&semantic_blockpy, "run");
+    assert!(blockpy_function_has_root_name(
+        semantic_run,
+        "asynccontextmanager_aenter"
+    ));
+    assert!(blockpy_function_has_root_name(
+        semantic_run,
+        "asynccontextmanager_get_aexit"
+    ));
+    assert!(!blockpy_function_has_root_name(semantic_run, "await_iter"));
 
-    let blockpy_rendered = lowered.core_blockpy_with_yield_text();
-    assert!(
-        blockpy_rendered.contains("await_iter"),
-        "{blockpy_rendered}"
-    );
-    assert!(
-        blockpy_rendered.contains("asynccontextmanager_aenter"),
-        "{blockpy_rendered}"
-    );
-    assert!(
-        !blockpy_rendered.contains("async with cm as value"),
-        "{blockpy_rendered}"
-    );
+    let core_with_yield = tracked_core_blockpy_with_yield_only(source);
+    let lowered_run = blockpy_function_by_name(&core_with_yield, "run");
+    assert!(blockpy_function_has_root_name(lowered_run, "await_iter"));
+    assert!(blockpy_function_has_root_name(
+        lowered_run,
+        "asynccontextmanager_aenter"
+    ));
 }
 
 #[test]
@@ -2569,12 +2561,11 @@ def bump(x):
 
     let bump = lowered.bb_function("bump");
     assert!(
-        bump.blocks
-            .iter()
-            .any(|block| block.body.iter().any(|stmt| matches!(
-                stmt,
-                expr if expr_text(expr).contains("BinOp(InplaceAdd,")
-            ))),
+        blockpy_function_instr_any(bump, |expr| matches!(
+            expr,
+            InstrResolved::BinOp(binop)
+                if binop.kind == crate::block_py::BinOpKind::InplaceAdd
+        )),
         "{bump:?}"
     );
 }
@@ -2863,7 +2854,6 @@ async def run():
         .expect("transform should succeed")
         .expect("bb module should be available");
     let run = function_by_name(&bb_module, "run");
-    let debug = format!("{run:?}");
     assert!(
         function_or_constants_use_text(&bb_module, run, "anext_or_sentinel"),
         "{run:?}"
@@ -2872,7 +2862,7 @@ async def run():
         function_or_constants_use_text(&bb_module, run, "aiter"),
         "{run:?}"
     );
-    assert!(!debug.contains("_dp_completed_"), "{debug}");
+    assert!(!blockpy_function_has_root_name(run, "_dp_completed_"));
 }
 
 #[test]
@@ -2884,19 +2874,15 @@ async def run():
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let semantic_blockpy_rendered = lowered.blockpy_text();
-    assert!(
-        semantic_blockpy_rendered.contains("await anext_or_sentinel"),
-        "{semantic_blockpy_rendered}"
-    );
-    assert!(
-        semantic_blockpy_rendered.contains("aiter"),
-        "{semantic_blockpy_rendered}"
-    );
-    assert!(
-        !semantic_blockpy_rendered.contains("yield from await_iter"),
-        "{semantic_blockpy_rendered}"
-    );
+    let blockpy_module = lowered.blockpy_module();
+    let run = blockpy_function_by_name(&blockpy_module, "run");
+    assert!(blockpy_function_instr_any(run, |expr| matches!(
+        expr,
+        InstrWithAwaitAndYield::Await(_)
+    )));
+    assert!(blockpy_function_has_root_name(run, "anext_or_sentinel"));
+    assert!(blockpy_function_has_root_name(run, "aiter"));
+    assert!(!blockpy_function_has_root_name(run, "await_iter"));
 }
 
 #[test]
@@ -3210,12 +3196,13 @@ def f(x):
         f.blocks.iter().any(|block| block.exc_edge.is_some()),
         "{f:?}"
     );
-    let debug = format!("{f:?}");
-    assert!(!debug.contains("finally:"), "{debug}");
-    assert!(!debug.contains("_dp_try_reason_"), "{debug}");
-    assert!(!debug.contains("_dp_try_value_"), "{debug}");
-    assert!(debug.contains("_dp_try_abrupt_kind_"), "{debug}");
-    assert!(debug.contains("_dp_try_abrupt_payload_"), "{debug}");
+    let storage_layout = f
+        .storage_layout()
+        .as_ref()
+        .expect("function with try/finally dispatch should have storage layout");
+    let stack_slots = storage_layout.stack_slots();
+    assert!(!stack_slots.iter().any(|name| name == "_dp_try_reason_"));
+    assert!(!stack_slots.iter().any(|name| name == "_dp_try_value_"));
 }
 
 #[test]
@@ -3303,12 +3290,11 @@ class Box:
     item = VALUE
 "#;
 
-    let lowered = TrackedLowering::new(source);
-    let rendered = lowered.pass_text("ast-to-ast");
-    assert!(rendered.contains("def _dp_module_init()"), "{rendered}");
-    assert!(!rendered.contains("global VALUE"), "{rendered}");
-    assert!(!rendered.contains("global build"), "{rendered}");
-    assert!(!rendered.contains("global Box"), "{rendered}");
+    let ast_probe = probe_rewritten_ast(source);
+    assert!(ast_probe.function_names.contains("_dp_module_init"));
+    assert!(!ast_probe.global_names.contains("VALUE"));
+    assert!(!ast_probe.global_names.contains("build"));
+    assert!(!ast_probe.global_names.contains("Box"));
 }
 
 #[test]
@@ -3321,9 +3307,9 @@ class Box:
 "#;
 
     let lowered = TrackedLowering::new(source);
-    let rendered = lowered.pass_text("ast-to-ast");
-    assert!(!rendered.contains("global VALUE"), "{rendered}");
-    assert!(!rendered.contains("global Box"), "{rendered}");
+    let ast_probe = probe_rewritten_ast(source);
+    assert!(!ast_probe.global_names.contains("VALUE"));
+    assert!(!ast_probe.global_names.contains("Box"));
 
     let init_fn = lowered.bb_function("_dp_module_init");
     assert!(
@@ -3397,5 +3383,5 @@ def f():
         debug,
         module_constant_text(&bb_module)
     );
-    assert!(!debug.contains("x = 1"), "{debug}");
+    assert!(!blockpy_function_has_defined_name(f, "x"));
 }

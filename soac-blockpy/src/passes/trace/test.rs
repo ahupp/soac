@@ -2,9 +2,14 @@ use super::{
     instrument_bb_module_for_trace, instrument_bb_module_with_global_load_counters,
     parse_trace_config, TraceConfig,
 };
-use crate::block_py::{CounterScope, CounterSite};
+use crate::block_py::{
+    BlockPyFunction, Call, ChildVisitable, CounterScope, CounterSite, InstrCodegen, NameLike,
+    NameLocation, Visit,
+};
 use crate::lower_python_to_blockpy_for_testing;
-use crate::passes::{lower_try_jump_exception_flow, normalize_bb_module_strings};
+use crate::passes::{
+    lower_try_jump_exception_flow, normalize_bb_module_strings, CodegenModuleShape,
+};
 
 fn tracked_name_binding_module(
     source: &str,
@@ -14,6 +19,45 @@ fn tracked_name_binding_module(
         .pass_tracker
         .pass_name_binding()
         .cloned())
+}
+
+fn trace_enter_calls(function: &BlockPyFunction<CodegenModuleShape>) -> Vec<&Call<InstrCodegen>> {
+    function
+        .blocks
+        .iter()
+        .flat_map(|block| block.body.iter())
+        .filter_map(|stmt| {
+            let InstrCodegen::Call(call) = stmt else {
+                return None;
+            };
+            match call.func.as_ref() {
+                InstrCodegen::Load(load) if load.name.is_runtime_symbol("bb_trace_enter") => {
+                    Some(call)
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+struct LocalLoadProbe {
+    found: bool,
+}
+
+impl Visit<InstrCodegen> for LocalLoadProbe {
+    fn visit_instr(&mut self, expr: &InstrCodegen) {
+        self.found |= matches!(
+            expr,
+            InstrCodegen::Load(load) if matches!(load.name.location, NameLocation::Local(_))
+        );
+        expr.visit_children(self);
+    }
+}
+
+fn expr_tree_contains_local_load(expr: &InstrCodegen) -> bool {
+    let mut probe = LocalLoadProbe { found: false };
+    probe.visit_instr(expr);
+    probe.found
 }
 
 #[test]
@@ -67,26 +111,16 @@ fn instruments_matching_function_blocks() {
         .iter()
         .find(|function| function.names.qualname == "g")
         .expect("missing g");
-    let f_trace_stmts = f
-        .blocks
-        .iter()
-        .flat_map(|block| block.body.iter())
-        .map(crate::block_py::pretty::bb_stmt_text)
-        .filter(|stmt| stmt.contains("bb_trace_enter"))
-        .collect::<Vec<_>>();
-    assert!(!f_trace_stmts.is_empty(), "missing trace op in f");
-    assert!(f_trace_stmts
-        .iter()
-        .any(|stmt| stmt.contains("bb_trace_enter")));
-    assert!(f_trace_stmts
-        .iter()
-        .any(|stmt| stmt.contains("LocalLocation(")));
-    let g_has_trace = g
-        .blocks
-        .iter()
-        .flat_map(|block| block.body.iter())
-        .map(crate::block_py::pretty::bb_stmt_text)
-        .any(|stmt| stmt.contains("bb_trace_enter"));
+    let f_trace_calls = trace_enter_calls(f);
+    assert!(!f_trace_calls.is_empty(), "missing trace op in f");
+    assert!(
+        f_trace_calls.iter().any(|call| call
+            .args
+            .iter()
+            .any(|arg| expr_tree_contains_local_load(arg.expr()))),
+        "missing local-load param payload in trace calls"
+    );
+    let g_has_trace = !trace_enter_calls(g).is_empty();
     assert!(!g_has_trace);
 }
 

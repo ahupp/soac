@@ -436,14 +436,6 @@ pub(crate) fn bb_expr_text<N: fmt::Debug>(expr: &N) -> String {
     format!("{expr:?}")
 }
 
-#[cfg(test)]
-pub(crate) fn bb_stmt_text<E>(stmt: &E) -> String
-where
-    E: fmt::Debug + Instr,
-{
-    format!("{stmt:?}")
-}
-
 fn format_parameters(parameters: &ParamSpec) -> String {
     let mut parts = Vec::new();
     let mut saw_kw_separator = false;

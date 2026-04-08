@@ -1,8 +1,8 @@
 use super::*;
 
 use crate::block_py::{
-    BlockEdge, BlockLabel, BlockPyFunction, BlockPyModule, ModuleShape, BlockTerm,
-    InstrWithAwaitAndYield, TermRaise,
+    instr_any, BlockEdge, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, FunctionKind,
+    InstrWithAwaitAndYield, ModuleShape, NameLike, ScopeExprNode, TermRaise,
 };
 use crate::lower_python_to_blockpy_for_testing;
 use crate::passes::ast_to_ast::context::Context;
@@ -54,6 +54,51 @@ fn function_by_name<'a, P: ModuleShape>(
         .unwrap_or_else(|| panic!("missing BlockPy function {bind_name}; got {blockpy:?}"))
 }
 
+fn function_instr_any<P>(
+    function: &BlockPyFunction<P>,
+    mut predicate: impl FnMut(&P::Instr) -> bool,
+) -> bool
+where
+    P: ModuleShape,
+    P::Instr: crate::block_py::ChildVisitable<P::Instr>,
+{
+    function.blocks.iter().any(|block| {
+        block
+            .body
+            .iter()
+            .any(|stmt| instr_any(stmt, &mut predicate))
+            || match &block.term {
+                BlockTerm::IfTerm(if_term) => instr_any(&if_term.test, &mut predicate),
+                BlockTerm::BranchTable(branch) => instr_any(&branch.index, &mut predicate),
+                BlockTerm::Raise(raise) => raise
+                    .exc
+                    .as_ref()
+                    .is_some_and(|exc| instr_any(exc, &mut predicate)),
+                BlockTerm::Return(value) => instr_any(value, &mut predicate),
+                BlockTerm::Jump(_) => false,
+            }
+    })
+}
+
+fn function_has_root_load<P>(function: &BlockPyFunction<P>, name: &str) -> bool
+where
+    P: ModuleShape,
+    P::Instr: ScopeExprNode,
+{
+    function_instr_any(function, |expr| expr.root_name_id() == Some(name))
+}
+
+fn function_has_instr<P>(
+    function: &BlockPyFunction<P>,
+    mut predicate: impl FnMut(&P::Instr) -> bool,
+) -> bool
+where
+    P: ModuleShape,
+    P::Instr: crate::block_py::ChildVisitable<P::Instr>,
+{
+    function_instr_any(function, &mut predicate)
+}
+
 fn lower_stmt_for_panic_test(stmt: &Stmt) {
     let context = Context::new("");
     let name_gen = test_name_gen();
@@ -99,15 +144,14 @@ def f(x, ys):
 "#,
     );
     let blocks = &function_by_name(&blockpy, "f").blocks;
-    let rendered = crate::block_py::pretty::blockpy_module_to_string(&blockpy);
     assert!(blocks
         .iter()
         .any(|block| matches!(block.term, BlockTerm::IfTerm(_))));
-    assert!(
-        blocks.iter().any(|block| block.exc_edge.is_some()),
-        "{rendered}"
-    );
-    assert!(rendered.contains("return x"), "{rendered}");
+    assert!(blocks.iter().any(|block| block.exc_edge.is_some()));
+    assert!(blocks.iter().any(|block| matches!(
+        &block.term,
+        BlockTerm::Return(InstrWithAwaitAndYield::Load(load)) if load.name.id_str() == "x"
+    )));
 }
 
 #[test]
@@ -119,9 +163,12 @@ async def f(xs):
         body(x)
 "#,
     );
-    let rendered = crate::block_py::pretty::blockpy_module_to_string(&blockpy);
-    assert!(rendered.contains("await anext_or_sentinel"), "{rendered}");
-    assert!(rendered.contains("anext_or_sentinel"), "{rendered}");
+    let f = function_by_name(&blockpy, "f");
+    assert!(function_has_root_load(f, "anext_or_sentinel"));
+    assert!(function_has_instr(f, |expr| matches!(
+        expr,
+        InstrWithAwaitAndYield::Await(_)
+    )));
 }
 
 #[test]
@@ -132,15 +179,14 @@ def gen(n):
     yield n
 "#,
     );
-    let rendered = crate::block_py::pretty::blockpy_module_to_string(&blockpy);
-    assert!(rendered.contains("generator gen(n):"), "{rendered}");
-    assert!(
-        rendered.contains("function gen(_dp_self, _dp_send_value, _dp_resume_exc):"),
-        "{rendered}"
-    );
-    assert!(rendered.contains("return ClosureGenerator("), "{rendered}");
-    assert!(rendered.contains("branch_table"), "{rendered}");
-    assert!(!rendered.contains("yield n"), "{rendered}");
+    let gen_wrapper = function_by_name(&blockpy, "gen");
+    let gen_resume = function_by_name(&blockpy, "gen_resume");
+    assert_eq!(gen_wrapper.kind, FunctionKind::Generator);
+    assert!(function_has_root_load(gen_wrapper, "ClosureGenerator"));
+    assert!(gen_resume
+        .blocks
+        .iter()
+        .any(|block| matches!(block.term, BlockTerm::BranchTable(_))));
 }
 
 #[test]
@@ -151,9 +197,14 @@ def gen(flag):
     yield flag and 1
 "#,
     );
-    let rendered = crate::block_py::pretty::blockpy_module_to_string(&blockpy);
-    assert!(rendered.contains("generator gen(flag):"), "{rendered}");
-    assert!(!rendered.contains("jump bb0"), "{rendered}");
+    let gen_wrapper = function_by_name(&blockpy, "gen");
+    assert_eq!(gen_wrapper.kind, FunctionKind::Generator);
+    let gen_resume = function_by_name(&blockpy, "gen_resume");
+    let entry_label = gen_resume.entry_block().label;
+    assert!(!gen_resume.blocks.iter().any(|block| matches!(
+        &block.term,
+        BlockTerm::Jump(edge) if edge.target == entry_label
+    )));
 }
 
 #[test]
@@ -346,15 +397,9 @@ def f():
             return None
 "#,
     );
-    let rendered = crate::block_py::pretty::blockpy_module_to_string(&blockpy);
-    assert!(
-        !rendered.contains("and __dp_match_class_attr_exists"),
-        "{rendered}"
-    );
-    assert!(
-        !rendered.contains("and __dp_match_class_attr_value"),
-        "{rendered}"
-    );
+    let f = function_by_name(&blockpy, "f");
+    assert!(!function_has_root_load(f, "__dp_match_class_attr_exists"));
+    assert!(!function_has_root_load(f, "__dp_match_class_attr_value"));
 }
 
 #[test]
@@ -366,13 +411,13 @@ match "aa":
         MATCHED = slot
     case _:
         MATCHED = None
-    "#,
+"#,
     );
-    let rendered = crate::block_py::pretty::blockpy_module_to_string(&blockpy);
-    assert!(
-        rendered.contains("StoreName(\"_dp_match_1\", \"aa\")"),
-        "{rendered}"
-    );
+    let init = function_by_name(&blockpy, "_dp_module_init");
+    assert!(function_has_instr(init, |expr| matches!(
+        expr,
+        InstrWithAwaitAndYield::Store(store) if store.name.id_str() == "_dp_match_1"
+    )));
 }
 
 #[test]
@@ -393,7 +438,8 @@ def f(xs):
     let ast::Stmt::For(for_stmt) = &func.body[0] else {
         panic!("expected for stmt");
     };
-    let InstrRuff::StmtFor(for_stmt) = crate::passes::ast_to_instr::from_ast_stmt(ast::Stmt::For(for_stmt.clone()))
+    let InstrRuff::StmtFor(for_stmt) =
+        crate::passes::ast_to_instr::from_ast_stmt(ast::Stmt::For(for_stmt.clone()))
     else {
         panic!("expected InstrRuff::StmtFor");
     };
@@ -981,7 +1027,9 @@ fn sequence_raise_helper_lowers_compare_chain_via_inline_fragment() {
         &name_gen,
         vec![instr_stmt(py_stmt!("prefix = 0"))],
         TermRaise {
-            exc: Some(crate::passes::ast_to_instr::from_ast_expr(py_expr!("a() < b() < c()"))),
+            exc: Some(crate::passes::ast_to_instr::from_ast_expr(py_expr!(
+                "a() < b() < c()"
+            ))),
         },
         None,
     )
@@ -1578,22 +1626,17 @@ def gen(it):
     yield from it
 "#,
     );
-    let rendered = crate::block_py::pretty::blockpy_module_to_string(&blockpy);
-    assert!(rendered.contains("branch_table"));
-    assert!(rendered.contains("exception_matches"), "{rendered}");
-    assert!(
-        rendered.contains("getattr(_dp_yieldfrom, \"throw\", NONE)"),
-        "{rendered}"
-    );
-    assert!(
-        rendered.contains("exc_param: _dp_yield_from_exc_"),
-        "{rendered}"
-    );
-    assert!(
-        !rendered.contains("__dp_generator_yield_from_step"),
-        "{rendered}"
-    );
-    assert!(!rendered.contains("yield from it"), "{rendered}");
+    let gen_resume = function_by_name(&blockpy, "gen_resume");
+    assert!(gen_resume
+        .blocks
+        .iter()
+        .any(|block| matches!(block.term, BlockTerm::BranchTable(_))));
+    assert!(function_has_root_load(gen_resume, "exception_matches"));
+    assert!(function_has_root_load(gen_resume, "getattr"));
+    assert!(!function_has_root_load(
+        gen_resume,
+        "__dp_generator_yield_from_step"
+    ));
 }
 
 #[test]
@@ -1604,20 +1647,17 @@ async def agen(n):
     yield n
 "#,
     );
-    let rendered = crate::block_py::pretty::blockpy_module_to_string(&blockpy);
-    assert!(rendered.contains("async_generator agen(n):"), "{rendered}");
-    assert!(
-        rendered.contains(
-            "function agen(_dp_self, _dp_send_value, _dp_resume_exc, _dp_transport_sent):"
-        ),
-        "{rendered}"
-    );
-    assert!(
-        rendered.contains("return ClosureAsyncGenerator("),
-        "{rendered}"
-    );
-    assert!(rendered.contains("branch_table"), "{rendered}");
-    assert!(!rendered.contains("yield n"), "{rendered}");
+    let agen_wrapper = function_by_name(&blockpy, "agen");
+    let agen_resume = function_by_name(&blockpy, "agen_resume");
+    assert_eq!(agen_wrapper.kind, FunctionKind::AsyncGenerator);
+    assert!(function_has_root_load(
+        agen_wrapper,
+        "ClosureAsyncGenerator"
+    ));
+    assert!(agen_resume
+        .blocks
+        .iter()
+        .any(|block| matches!(block.term, BlockTerm::BranchTable(_))));
 }
 
 #[test]

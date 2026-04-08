@@ -2,7 +2,43 @@ use super::super::{lower_instr_for_test, simplify_stmt_ast_once_for_blockpy, Blo
 use super::*;
 use crate::block_py::InstrWithAwaitAndYield;
 use crate::passes::ast_to_ast::context::Context;
+use crate::passes::ast_to_ast::util::is_dp_helper_lookup_expr;
 use crate::passes::ruff_to_blockpy::test_name_gen;
+use crate::transformer::{walk_expr, Transformer};
+use ruff_python_ast::{CmpOp, Expr};
+
+#[derive(Default)]
+struct WithRewriteShapeProbe {
+    has_helper_identity_test: bool,
+    has_native_is_not_none_test: bool,
+}
+
+impl Transformer for WithRewriteShapeProbe {
+    fn visit_expr(&mut self, expr: &mut Expr) {
+        match expr {
+            Expr::Call(call) => {
+                self.has_helper_identity_test |=
+                    is_dp_helper_lookup_expr(call.func.as_ref(), "is_not");
+            }
+            Expr::Compare(compare) => {
+                self.has_native_is_not_none_test |= compare.ops.len() == 1
+                    && compare.ops[0] == CmpOp::IsNot
+                    && matches!(compare.comparators.first(), Some(Expr::NoneLiteral(_)));
+            }
+            _ => {}
+        }
+        walk_expr(self, expr);
+    }
+}
+
+fn probe_rewritten_with_shape(stmts: &[Stmt]) -> WithRewriteShapeProbe {
+    let mut stmts = stmts.to_vec();
+    let mut probe = WithRewriteShapeProbe::default();
+    for stmt in &mut stmts {
+        probe.visit_stmt(stmt);
+    }
+    probe
+}
 
 #[test]
 fn stmt_with_simplify_ast_desugars_before_blockpy_lowering() {
@@ -29,14 +65,10 @@ fn stmt_with_simplify_ast_uses_native_identity_test() {
 
     let context = Context::new("");
     let simplified = simplify_stmt_ast_once_for_blockpy(&context, Stmt::With(with_stmt));
-    let rendered = simplified
-        .iter()
-        .map(crate::ruff_ast_to_string)
-        .collect::<Vec<_>>()
-        .join("\n");
+    let probe = probe_rewritten_with_shape(simplified.as_slice());
 
-    assert!(!rendered.contains("__dp_is_not("), "{rendered}");
-    assert!(rendered.contains(" is not None"), "{rendered}");
+    assert!(!probe.has_helper_identity_test);
+    assert!(probe.has_native_is_not_none_test);
 }
 
 #[test]

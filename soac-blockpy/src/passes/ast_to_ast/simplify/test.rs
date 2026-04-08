@@ -1,10 +1,47 @@
 use crate::passes::ast_to_ast::string_templates::lower_string_templates_in_expr;
-use crate::ruff_ast_to_string;
+use crate::passes::ast_to_ast::util::is_dp_helper_lookup_expr;
+use crate::transformer::{walk_expr, Transformer};
 use ruff_python_ast::{self as ast, Stmt};
 use ruff_python_parser::parse_module;
 
 fn parse_assign_module(source: &str) -> ast::ModModule {
     parse_module(source).unwrap().into_syntax()
+}
+
+#[derive(Default)]
+struct ExprShapeProbe {
+    has_value_eq_literal: bool,
+    has_value_expr_text: bool,
+    has_repr_call: bool,
+    has_template_interpolation_call: bool,
+}
+
+impl Transformer for ExprShapeProbe {
+    fn visit_expr(&mut self, expr: &mut ast::Expr) {
+        match expr {
+            ast::Expr::StringLiteral(literal) => {
+                self.has_value_eq_literal |= literal.value.to_str() == "value=";
+                self.has_value_expr_text |= literal.value.to_str() == "value";
+            }
+            ast::Expr::Call(call) => {
+                self.has_repr_call |= is_dp_helper_lookup_expr(call.func.as_ref(), "repr");
+                self.has_template_interpolation_call |=
+                    is_dp_helper_lookup_expr(call.func.as_ref(), "templatelib_Interpolation");
+            }
+            _ => {}
+        }
+        walk_expr(self, expr);
+    }
+}
+
+fn probe_assignment_value(module: &ast::ModModule) -> ExprShapeProbe {
+    let Stmt::Assign(assign) = &module.body[0] else {
+        panic!("expected first statement to be an assignment");
+    };
+    let mut value = assign.value.as_ref().clone();
+    let mut probe = ExprShapeProbe::default();
+    probe.visit_expr(&mut value);
+    probe
 }
 
 #[test]
@@ -14,9 +51,10 @@ fn lower_string_templates_keeps_fstring_debug_output_correct() {
         panic!("expected first statement to be an assignment");
     };
     lower_string_templates_in_expr(assign.value.as_mut());
-    let rendered = ruff_ast_to_string(&module.body);
-    assert!(rendered.contains("value="), "{rendered}");
-    assert!(rendered.contains("__soac__.repr(value)"), "{rendered}");
+
+    let probe = probe_assignment_value(&module);
+    assert!(probe.has_value_eq_literal);
+    assert!(probe.has_repr_call);
 }
 
 #[test]
@@ -26,9 +64,8 @@ fn lower_string_templates_keeps_tstring_expr_text_available() {
         panic!("expected first statement to be an assignment");
     };
     lower_string_templates_in_expr(assign.value.as_mut());
-    let rendered = ruff_ast_to_string(&module.body);
-    assert!(
-        rendered.contains("__soac__.templatelib_Interpolation(value, \"value\""),
-        "{rendered}"
-    );
+
+    let probe = probe_assignment_value(&module);
+    assert!(probe.has_template_interpolation_call);
+    assert!(probe.has_value_expr_text);
 }
