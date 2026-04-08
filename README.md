@@ -137,7 +137,8 @@ exports are intentionally omitted here.
   Directory used by `DIET_PYTHON_SPECIALIZATION_MODE`. The runtime
   creates the directory when it writes counters. The conventional files
   are `profile.bin` for the specialization input and `verify.bin` for
-  the countered verification pass.
+  the countered verification pass. When this is set, transformed module
+  loads also append timing rows to `<counters-dir>/module_loads.jsonl`.
 
 - `DIET_PYTHON_CALL_TARGET_COUNTERS=1`
   In `fn call_target_counter_instrumentation_enabled`, at

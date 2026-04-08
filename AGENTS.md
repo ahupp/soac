@@ -225,7 +225,9 @@ instance's live working commit.
 - `DIET_PYTHON_COUNTERS_DIR` / `DIET_PYTHON_SPECIALIZATION_MODE`
   Normal specialization runs use one counters directory with conventional
   files: `profile.bin` for specialization input and `verify.bin` for the
-  countered verification pass. Set
+  countered verification pass. Transformed imports also append one
+  JSONL timing row per module load to `module_loads.jsonl` in the same
+  directory. Set
   `DIET_PYTHON_SPECIALIZATION_MODE=profile`, `verify`, or `apply`;
   recipes should pass the same `DIET_PYTHON_COUNTERS_DIR` and change
   only the mode between passes.

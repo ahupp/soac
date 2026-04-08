@@ -7,13 +7,17 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyFunction, PyModule, PyString, PyTuple};
 use soac_blockpy::block_py::{BlockPyFunction, BlockPyModule, FunctionId, FunctionKind, ParamKind};
-use soac_blockpy::lower_python_to_blockpy;
-use soac_blockpy::pass_tracker::NoopPassTracker;
+use soac_blockpy::lower_python_to_blockpy_recorded;
 use soac_blockpy::passes::CodegenModuleShape;
 use soac_jit::module_type::{ModuleInfo, SoacExtModule, hash_module_source};
 use std::collections::{HashMap, VecDeque};
+use std::env;
 use std::fs;
-use std::time::Instant;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 unsafe extern "C" {
     static mut PyCell_Type: ffi::PyTypeObject;
@@ -47,6 +51,232 @@ fn tuple_from_owned_objects<'py>(
 
 type OriginalCodeMap = HashMap<FunctionId, Py<PyAny>>;
 type OriginalCodeByQualname = HashMap<String, VecDeque<Py<PyAny>>>;
+
+#[derive(Clone)]
+struct TimedPhase {
+    name: String,
+    elapsed: Duration,
+}
+
+struct PendingModuleLoadTiming {
+    module_name: String,
+    package_name: String,
+    path: String,
+    source_hash: u64,
+    source_bytes: usize,
+    create_started_at: Instant,
+    create_module_total: Duration,
+    lowering_total: Duration,
+    blockpy_pass_timings: Vec<TimedPhase>,
+    create_timings: Vec<TimedPhase>,
+    function_count: usize,
+    counter_count: usize,
+    global_name_count: usize,
+    original_code_count: usize,
+}
+
+static PENDING_MODULE_LOAD_TIMINGS: OnceLock<Mutex<HashMap<usize, PendingModuleLoadTiming>>> =
+    OnceLock::new();
+
+fn time_phase<T>(
+    timings: &mut Vec<TimedPhase>,
+    name: impl Into<String>,
+    build: impl FnOnce() -> T,
+) -> T {
+    let name = name.into();
+    let start = Instant::now();
+    let value = build();
+    timings.push(TimedPhase {
+        name,
+        elapsed: start.elapsed(),
+    });
+    value
+}
+
+fn elapsed_ms(elapsed: Duration) -> f64 {
+    elapsed.as_secs_f64() * 1000.0
+}
+
+fn push_timing_ms(
+    timings: &mut serde_json::Map<String, serde_json::Value>,
+    name: impl Into<String>,
+    elapsed: Duration,
+) {
+    timings.insert(name.into(), serde_json::json!(elapsed_ms(elapsed)));
+}
+
+fn push_named_timing_ms(
+    timings: &mut serde_json::Map<String, serde_json::Value>,
+    prefix: &str,
+    phase: &TimedPhase,
+) {
+    push_timing_ms(timings, format!("{prefix}.{}", phase.name), phase.elapsed);
+}
+
+fn pending_module_load_timings() -> &'static Mutex<HashMap<usize, PendingModuleLoadTiming>> {
+    PENDING_MODULE_LOAD_TIMINGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn pending_module_load_timing_key(module: *mut ffi::PyObject) -> usize {
+    module as usize
+}
+
+fn store_pending_module_load_timing(module: *mut ffi::PyObject, timing: PendingModuleLoadTiming) {
+    let mut pending = pending_module_load_timings()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    pending.insert(pending_module_load_timing_key(module), timing);
+}
+
+fn take_pending_module_load_timing(module: *mut ffi::PyObject) -> Option<PendingModuleLoadTiming> {
+    let mut pending = pending_module_load_timings()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    pending.remove(&pending_module_load_timing_key(module))
+}
+
+fn trimmed_env_path(name: &str) -> Option<PathBuf> {
+    let raw = env::var_os(name)?;
+    let trimmed = raw.to_string_lossy().trim().to_string();
+    (!trimmed.is_empty()).then(|| trimmed.into())
+}
+
+fn module_load_log_dir() -> Option<PathBuf> {
+    if let Some(dir) = trimmed_env_path("DIET_PYTHON_COUNTERS_DIR") {
+        return Some(dir);
+    }
+    if let Some(file) = trimmed_env_path("DIET_PYTHON_COUNTERS_OUTPUT_FILE") {
+        return Some(
+            file.parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf(),
+        );
+    }
+    let file = trimmed_env_path("DIET_PYTHON_COUNTERS_FILE")?;
+    Some(
+        file.parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf(),
+    )
+}
+
+fn module_load_log_path() -> Option<PathBuf> {
+    Some(module_load_log_dir()?.join("module_loads.jsonl"))
+}
+
+fn append_module_load_json(entry: &serde_json::Value) {
+    let Some(path) = module_load_log_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        if let Err(err) = fs::create_dir_all(parent) {
+            eprintln!(
+                "[soac module-load log] failed to create {}: {err}",
+                parent.display()
+            );
+            return;
+        }
+    }
+    let append_result = (|| -> std::io::Result<()> {
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        serde_json::to_writer(&mut file, entry)?;
+        file.write_all(b"\n")
+    })();
+    if let Err(err) = append_result {
+        eprintln!(
+            "[soac module-load log] failed to append {}: {err}",
+            path.display()
+        );
+    }
+}
+
+fn append_completed_module_load_log(
+    module: *mut ffi::PyObject,
+    exec_module_total: Duration,
+    exec_timings: Vec<TimedPhase>,
+    result: &PyResult<()>,
+) {
+    if module_load_log_path().is_none() {
+        return;
+    }
+    let pending = take_pending_module_load_timing(module);
+    let mut timings = serde_json::Map::new();
+    let mut metadata = serde_json::Map::new();
+    if let Some(pending) = &pending {
+        push_timing_ms(
+            &mut timings,
+            "module_load_total",
+            pending.create_started_at.elapsed(),
+        );
+        push_timing_ms(
+            &mut timings,
+            "create_module_total",
+            pending.create_module_total,
+        );
+        push_timing_ms(&mut timings, "blockpy_total", pending.lowering_total);
+        for phase in &pending.create_timings {
+            push_named_timing_ms(&mut timings, "create_module", phase);
+        }
+        for phase in &pending.blockpy_pass_timings {
+            push_named_timing_ms(&mut timings, "blockpy", phase);
+        }
+        metadata.insert(
+            "module_name".to_string(),
+            serde_json::json!(pending.module_name),
+        );
+        metadata.insert(
+            "package_name".to_string(),
+            serde_json::json!(pending.package_name),
+        );
+        metadata.insert("path".to_string(), serde_json::json!(pending.path));
+        metadata.insert(
+            "source_hash".to_string(),
+            serde_json::json!(pending.source_hash),
+        );
+        metadata.insert(
+            "source_bytes".to_string(),
+            serde_json::json!(pending.source_bytes),
+        );
+        metadata.insert(
+            "function_count".to_string(),
+            serde_json::json!(pending.function_count),
+        );
+        metadata.insert(
+            "counter_count".to_string(),
+            serde_json::json!(pending.counter_count),
+        );
+        metadata.insert(
+            "global_name_count".to_string(),
+            serde_json::json!(pending.global_name_count),
+        );
+        metadata.insert(
+            "original_code_count".to_string(),
+            serde_json::json!(pending.original_code_count),
+        );
+    }
+    push_timing_ms(&mut timings, "exec_module_total", exec_module_total);
+    for phase in &exec_timings {
+        push_named_timing_ms(&mut timings, "exec_module", phase);
+    }
+
+    let error = result.as_ref().err().map(ToString::to_string);
+    let entry = serde_json::json!({
+        "event": "soac.module_load",
+        "status": if result.is_ok() { "ok" } else { "error" },
+        "module": metadata,
+        "timings_ms": timings,
+        "error": error,
+    });
+    append_module_load_json(&entry);
+}
+
+fn module_spec_string_attr(spec: &Bound<'_, PyAny>, attr: &str) -> PyResult<String> {
+    spec.getattr(attr)?
+        .extract::<String>()
+        .map_err(|_| PyTypeError::new_err(format!("expected a module spec with a string {attr:?}")))
+}
 
 fn compile_original_module_code(py: Python<'_>, source: &str, path: &str) -> PyResult<Py<PyAny>> {
     let code = PyModule::import(py, "builtins")?
@@ -765,26 +995,77 @@ fn make_bb_function(
 
 #[pyfunction]
 fn create_module(py: Python<'_>, path: &str, spec: Py<PyAny>) -> PyResult<Py<PyAny>> {
-    let source = fs::read_to_string(path)
-        .map_err(|err| PyOSError::new_err(format!("could not read source for {path}: {err}")))?;
+    let create_started_at = Instant::now();
+    let create_total_start = Instant::now();
+    let mut create_timings = Vec::new();
+    let spec = spec.bind(py);
+    let module_name = module_spec_string_attr(spec.as_any(), "name")?;
+    let package_name = module_spec_string_attr(spec.as_any(), "parent")?;
+    let source = time_phase(&mut create_timings, "source_read", || {
+        fs::read_to_string(path)
+            .map_err(|err| PyOSError::new_err(format!("could not read source for {path}: {err}")))
+    })?;
+    let source_bytes = source.len();
+    let source_hash = hash_module_source(&source);
     let module_info = ModuleInfo {
-        hash: hash_module_source(&source),
+        hash: source_hash,
         indexed_module_keys: Vec::new(),
     };
     let session = soac_jit::CompileSession::new();
-    let output: soac_blockpy::LoweringResult<NoopPassTracker> =
-        lower_python_to_blockpy(&source, session.module_name_gen())
-            .map_err(lowering_error_to_pyerr)?;
-    let module_code = compile_original_module_code(py, &source, path)?;
+    let output = time_phase(&mut create_timings, "lower_blockpy", || {
+        lower_python_to_blockpy_recorded(&source, session.module_name_gen())
+            .map_err(lowering_error_to_pyerr)
+    })?;
+    let lowering_total = output.total_time;
+    let blockpy_pass_timings: Vec<TimedPhase> = output
+        .pass_tracker
+        .pass_timings()
+        .map(|timing| TimedPhase {
+            name: timing.name,
+            elapsed: timing.elapsed,
+        })
+        .collect();
+    let function_count = output.codegen_module.callable_defs.len();
+    let counter_count = output.codegen_module.counter_defs.len();
+    let global_name_count = output.codegen_module.global_names.len();
+    let module_code = time_phase(&mut create_timings, "compile_original_code", || {
+        compile_original_module_code(py, &source, path)
+    })?;
     let original_code_by_function_id =
-        match_original_code_to_functions(py, module_code.bind(py), &output.codegen_module)?;
-    SoacExtModule::new(
-        py,
-        spec.bind(py).as_any(),
-        output.codegen_module,
-        module_info,
-        original_code_by_function_id,
-    )
+        time_phase(&mut create_timings, "match_original_code", || {
+            match_original_code_to_functions(py, module_code.bind(py), &output.codegen_module)
+        })?;
+    let original_code_count = original_code_by_function_id.len();
+    let module = time_phase(&mut create_timings, "soac_ext_module_create", || {
+        SoacExtModule::new(
+            py,
+            spec.as_any(),
+            output.codegen_module,
+            module_info,
+            original_code_by_function_id,
+        )
+    })?;
+    let create_module_total = create_total_start.elapsed();
+    store_pending_module_load_timing(
+        module.as_ptr(),
+        PendingModuleLoadTiming {
+            module_name,
+            package_name,
+            path: path.to_string(),
+            source_hash,
+            source_bytes,
+            create_started_at,
+            create_module_total,
+            lowering_total,
+            blockpy_pass_timings,
+            create_timings,
+            function_count,
+            counter_count,
+            global_name_count,
+            original_code_count,
+        },
+    );
+    Ok(module)
 }
 
 fn ensure_module_builtins(globals: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -807,9 +1088,27 @@ fn ensure_module_builtins(globals: &Bound<'_, PyAny>) -> PyResult<()> {
 #[pyfunction]
 fn exec_module(py: Python<'_>, module: Py<PyAny>) -> PyResult<()> {
     let module = module.bind(py);
-    let module_globals = module.getattr("__dict__")?;
-    ensure_module_builtins(&module_globals)?;
-    SoacExtModule::with_data(module.as_any(), |module_data| {
+    let exec_total_start = Instant::now();
+    let mut exec_timings = Vec::new();
+    let result = exec_module_inner(py, module.as_any(), &mut exec_timings);
+    let exec_module_total = exec_total_start.elapsed();
+    append_completed_module_load_log(module.as_ptr(), exec_module_total, exec_timings, &result);
+    result
+}
+
+fn exec_module_inner(
+    py: Python<'_>,
+    module: &Bound<'_, PyAny>,
+    exec_timings: &mut Vec<TimedPhase>,
+) -> PyResult<()> {
+    let module_globals = time_phase(exec_timings, "get_module_globals", || {
+        module.getattr("__dict__")
+    })?;
+    time_phase(exec_timings, "ensure_builtins", || {
+        ensure_module_builtins(&module_globals)
+    })?;
+    let execute_lowered_start = Instant::now();
+    let result = SoacExtModule::with_data(module.as_any(), |module_data| {
         let module_name = resolve_module_name(&module_globals, "module execution")?;
         assert_eq!(
             module_name, module_data.shared_state.module_name,
@@ -820,13 +1119,15 @@ fn exec_module(py: Python<'_>, module: Py<PyAny>) -> PyResult<()> {
             package_name, module_data.shared_state.package_name,
             "module.__dict__['__package__'] did not match the module spec captured at create_module time"
         );
-        register_blockpy_module_plans(&module_name, &module_data.shared_state.lowered_module)?;
+        time_phase(exec_timings, "register_blockpy_module_plans", || {
+            register_blockpy_module_plans(&module_name, &module_data.shared_state.lowered_module)
+        })?;
         let function =
             lookup_module_init_function(&module_data.shared_state.lowered_module, &module_name)?;
-        let dp = import_dp_module(py)?;
+        let dp = time_phase(exec_timings, "import_soac_runtime", || import_dp_module(py))?;
         let empty = PyTuple::empty(py);
         let none = py.None();
-        let mut module_runtime =
+        let mut module_runtime = time_phase(exec_timings, "build_module_runtime_context", || {
             unsafe { soac_jit::build_module_runtime_context_for_module(module.as_ptr()) }.map_err(
                 |_| {
                     if unsafe { ffi::PyErr_Occurred() }.is_null() {
@@ -837,38 +1138,48 @@ fn exec_module(py: Python<'_>, module: Py<PyAny>) -> PyResult<()> {
                         PyErr::fetch(py)
                     }
                 },
-            )?;
-        let module_init = instantiate_bb_function(
-            py,
-            &dp,
-            &module_name,
-            &function,
-            empty.as_any(),
-            empty.as_any(),
-            &module_globals,
-            none.bind(py),
-            &module_runtime,
-        )?;
-        let result = unsafe {
+            )
+        })?;
+        let module_init = time_phase(exec_timings, "instantiate_module_init", || {
+            instantiate_bb_function(
+                py,
+                &dp,
+                &module_name,
+                &function,
+                empty.as_any(),
+                empty.as_any(),
+                &module_globals,
+                none.bind(py),
+                &module_runtime,
+            )
+        })?;
+        let result = time_phase(exec_timings, "call_module_init", || unsafe {
             soac_jit::with_active_module_runtime_context(
                 std::ptr::addr_of_mut!(module_runtime),
                 || module_init.call0(py),
             )
-        };
+        });
         result?;
-        unsafe { soac_jit::register_function_owner_types_for_module(module.as_ptr()) }.map_err(
-            |_| {
-                if unsafe { ffi::PyErr_Occurred() }.is_null() {
-                    PyRuntimeError::new_err(
-                        "failed to register function owner types for type invalidation",
-                    )
-                } else {
-                    PyErr::fetch(py)
-                }
-            },
-        )?;
+        time_phase(exec_timings, "register_function_owner_types", || {
+            unsafe { soac_jit::register_function_owner_types_for_module(module.as_ptr()) }.map_err(
+                |_| {
+                    if unsafe { ffi::PyErr_Occurred() }.is_null() {
+                        PyRuntimeError::new_err(
+                            "failed to register function owner types for type invalidation",
+                        )
+                    } else {
+                        PyErr::fetch(py)
+                    }
+                },
+            )
+        })?;
         Ok(())
-    })
+    });
+    exec_timings.push(TimedPhase {
+        name: "execute_lowered_module".to_string(),
+        elapsed: execute_lowered_start.elapsed(),
+    });
+    result
 }
 
 #[pyfunction]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import json
 
 from tests._integration import integration_module
 
@@ -32,3 +33,51 @@ def read():
     assert payload_len > 0
     assert header_len + payload_len <= len(data)
     assert len(data) > 64
+
+
+def test_module_load_log_is_written_next_to_counter_dir(tmp_path, monkeypatch):
+    counters_dir = tmp_path / "counters"
+    monkeypatch.setenv("DIET_PYTHON_COUNTERS_DIR", str(counters_dir))
+
+    source = """
+VALUE = 5
+
+def read():
+    return VALUE
+"""
+
+    with integration_module(tmp_path, "module_load_log_case", source, mode="transform") as module:
+        assert module.read() == 5
+
+    log_path = counters_dir / "module_loads.jsonl"
+    rows = [
+        json.loads(line)
+        for line in log_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    row = next(
+        row
+        for row in rows
+        if row["module"]["module_name"].endswith(".module_load_log_case")
+    )
+
+    assert row["event"] == "soac.module_load"
+    assert row["status"] == "ok"
+    assert row["error"] is None
+    assert row["module"]["path"].endswith("module_load_log_case.py")
+    assert row["module"]["function_count"] >= 2
+
+    timings = row["timings_ms"]
+    for name in [
+        "module_load_total",
+        "create_module_total",
+        "create_module.source_read",
+        "create_module.lower_blockpy",
+        "blockpy_total",
+        "blockpy.parse",
+        "blockpy.bb_codegen",
+        "exec_module_total",
+        "exec_module.call_module_init",
+        "exec_module.register_function_owner_types",
+    ]:
+        assert timings[name] >= 0
