@@ -188,23 +188,20 @@ exports are intentionally omitted here.
   provide an explicit advanced override for operator specializations. If
   this is set, it wins over `DIET_PYTHON_COUNTERS_FILE`.
 
-- `DIET_PYTHON_UNSOUND_INDEXED_STORES=1`
-  In `fn unsound_indexed_stores_enabled`, at
+- `SOAC_OPT_UNSOUND=1`
+  Enables compiler/runtime shortcuts that intentionally skip observable
+  CPython semantics. In `fn unsound_indexed_stores_enabled`, at
   [soac-jit/src/jit/mod.rs](/home/adam/project/soac-profile/soac-jit/src/jit/mod.rs),
   enable raw indexed store fast paths for existing indexed module-global
-  and split instance-field slots. This is an intentionally unsound
-  performance experiment: it skips CPython dict/object/type watchers,
-  dict version updates, insertion-order maintenance, and first-insert
-  bookkeeping. Leave unset for correctness tests and ordinary runs.
-
-- `UNSOUND=1`
-  Enables compiler/runtime shortcuts that intentionally skip observable
-  CPython semantics. Today this includes name-binding-time builtin
-  rewriting: undeclared global loads whose names are on the known-builtin
-  allowlist are lowered to `RuntimeName`, lifted into module constant
-  slots, and loaded without checking module globals. The benchmark
-  and pytest correctness recipes default to `UNSOUND=1`; set
-  `UNSOUND=0` to run the compatibility path.
+  and split instance-field slots; these skip CPython dict/object/type
+  watchers, dict version updates, insertion-order maintenance, and
+  first-insert bookkeeping. In `fn
+  unsound_runtime_builtin_names_enabled`, known-builtin global loads
+  that are not statically assigned module globals are lowered to
+  `RuntimeName`, lifted into module constant slots, and loaded without
+  checking module globals. The benchmark and pytest correctness recipes
+  default to `SOAC_OPT_UNSOUND=1`; set `SOAC_OPT_UNSOUND=0` to run the
+  compatibility path.
 
 Notes:
 - In normal workflows set one `DIET_PYTHON_COUNTERS_DIR` for the whole

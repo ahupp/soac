@@ -111,8 +111,10 @@ changes:
 
 # Unsound
 
-`DIET_PYTHON_UNSOUND_INDEXED_STORES=1` is an opt-in performance
-experiment for measuring the cost of semantic global/field stores.
+`SOAC_OPT_UNSOUND=1` enables broad compatibility-skipping performance
+experiments. It is enabled by default in benchmark and pytest
+correctness recipes so ordinary transformed test runs still detect
+unexpected fallout from these experiments.
 
 When enabled, specialized JIT code may call `soac-runtime` helpers that
 overwrite an existing guarded storage slot directly:
@@ -132,13 +134,12 @@ that lives in the normal store path. Use it only in perf runs that
 explicitly want to estimate the upper bound for guarded indexed stores;
 do not enable it for correctness tests or compatibility claims.
 
-`UNSOUND=1` enables broad compatibility-skipping performance
-experiments. It is enabled by default in benchmark and pytest
-correctness recipes so ordinary transformed test runs still detect
-unexpected fallout from these experiments.
-
 Current behavior:
 
+- guarded existing module-global store may replace
+  `PyDictIndexedValues.values[index]` directly
+- guarded existing split instance-field store may replace
+  `PyDictValues.values[index]` directly
 - undeclared known-builtin global loads are rewritten during name
   binding into `RuntimeName` loads; module-constant extraction then
   snapshots the runtime/builtin object in a constant slot

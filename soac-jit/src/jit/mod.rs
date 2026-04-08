@@ -2623,7 +2623,7 @@ fn env_flag_enabled(name: &str) -> bool {
 }
 
 fn unsound_indexed_stores_enabled() -> bool {
-    env_flag_enabled("DIET_PYTHON_UNSOUND_INDEXED_STORES")
+    env_flag_enabled("SOAC_OPT_UNSOUND")
 }
 
 fn counter_dump_input_path_from_env() -> Option<std::path::PathBuf> {

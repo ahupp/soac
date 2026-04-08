@@ -85,12 +85,12 @@ def test_integration_case(tmp_path: Path, case_path: Path, mode: str) -> None:
         pytest.xfail("scope-aware builtin rewriting has been removed")
     if (
         mode == "transform"
-        and _env_flag_enabled("UNSOUND")
+        and _env_flag_enabled("SOAC_OPT_UNSOUND")
         and case_path.stem in {
             "builtin_dynamic_global_shadow",
         }
     ):
-        pytest.xfail("UNSOUND runtime-builtin loads intentionally skip module-global shadowing")
+        pytest.xfail("SOAC_OPT_UNSOUND runtime-builtin loads intentionally skip module-global shadowing")
 
     source, validate_source = split_integration_case(case_path)
     module_name = case_path.stem

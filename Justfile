@@ -554,7 +554,7 @@ _pytest-run *args='': ensure-venv
   fi
 
   export RUST_LOG="${RUST_LOG:-soac_jit=info}"
-  export UNSOUND="${UNSOUND:-1}"
+  export SOAC_OPT_UNSOUND="${SOAC_OPT_UNSOUND:-1}"
   # Repo tests are written around transforming integration modules and the
   # modules they explicitly opt into. Rewriting pytest/stdlib imports here
   # adds noise and teardown-only failures without improving coverage.
@@ -753,7 +753,7 @@ benchmark-verify loops="100000" counters_dir="": (update-venv) (build-extension 
   WARMUP_LOOPS="${WARMUP_LOOPS:-1000}"
   BENCHMARK_CPU="${BENCHMARK_CPU:-}"
   BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS:-0}"
-  UNSOUND="${UNSOUND:-1}"
+  SOAC_OPT_UNSOUND="${SOAC_OPT_UNSOUND:-1}"
   COUNTERS_DIR="{{counters_dir}}"
   if [[ -z "$COUNTERS_DIR" ]]; then
     COUNTERS_DIR="$LAST_BENCHMARK_COUNTERS_DIR"
@@ -767,12 +767,12 @@ benchmark-verify loops="100000" counters_dir="": (update-venv) (build-extension 
   echo "jit transformed verify pass"
   echo "loops: {{loops}}"
   echo "counters dir: $COUNTERS_DIR"
-  echo "unsound optimizations: ${UNSOUND}"
+  echo "unsound optimizations: ${SOAC_OPT_UNSOUND}"
   LOOPS="{{loops}}" \
   WARMUP_LOOPS="${WARMUP_LOOPS}" \
   BENCHMARK_CPU="${BENCHMARK_CPU}" \
   BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
-  UNSOUND="${UNSOUND}" \
+  SOAC_OPT_UNSOUND="${SOAC_OPT_UNSOUND}" \
   DIET_PYTHON_COUNTERS_DIR="$COUNTERS_DIR" \
   DIET_PYTHON_SPECIALIZATION_MODE=verify \
     "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
@@ -785,13 +785,13 @@ benchmark-warm loops="8000000": (update-venv) (build-extension "release")
   WARMUP_LOOPS="${WARMUP_LOOPS:-1000}"
   BENCHMARK_CPU="${BENCHMARK_CPU:-}"
   BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS:-0}"
-  UNSOUND="${UNSOUND:-1}"
+  SOAC_OPT_UNSOUND="${SOAC_OPT_UNSOUND:-1}"
   echo "date: $(date +%F)"
   echo "loops: {{loops}}"
   echo "warmup loops: ${WARMUP_LOOPS}"
   echo "benchmark cpu: ${BENCHMARK_CPU}"
   echo "benchmark constant clocks: ${BENCHMARK_CONSTANT_CLOCKS}"
-  echo "unsound optimizations: ${UNSOUND}"
+  echo "unsound optimizations: ${SOAC_OPT_UNSOUND}"
 
   cd "$REPO_ROOT"
 
@@ -800,7 +800,7 @@ benchmark-warm loops="8000000": (update-venv) (build-extension "release")
   WARMUP_LOOPS="${WARMUP_LOOPS}" \
   BENCHMARK_CPU="${BENCHMARK_CPU}" \
   BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
-  UNSOUND="${UNSOUND}" \
+  SOAC_OPT_UNSOUND="${SOAC_OPT_UNSOUND}" \
     "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
 
   echo "stock cpython"
@@ -818,7 +818,7 @@ benchmark loops="8000000": (update-venv) (build-extension "release")
   PROFILE_LOOPS="100000"
   BENCHMARK_CPU="${BENCHMARK_CPU:-}"
   BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS:-0}"
-  UNSOUND="${UNSOUND:-1}"
+  SOAC_OPT_UNSOUND="${SOAC_OPT_UNSOUND:-1}"
   SPECIALIZED_LOOPS="${BENCHMARK_SPECIALIZED_LOOPS:-1000000}"
   SPECIALIZED_RUNS="${BENCHMARK_SPECIALIZED_RUNS:-3}"
   echo "date: $(date +%F)"
@@ -829,7 +829,7 @@ benchmark loops="8000000": (update-venv) (build-extension "release")
   echo "warmup loops: ${WARMUP_LOOPS}"
   echo "benchmark cpu: ${BENCHMARK_CPU}"
   echo "benchmark constant clocks: ${BENCHMARK_CONSTANT_CLOCKS}"
-  echo "unsound optimizations: ${UNSOUND}"
+  echo "unsound optimizations: ${SOAC_OPT_UNSOUND}"
 
   cd "$REPO_ROOT"
   mkdir -p "$LAST_BENCHMARK_COUNTERS_DIR"
@@ -841,7 +841,7 @@ benchmark loops="8000000": (update-venv) (build-extension "release")
   WARMUP_LOOPS="${WARMUP_LOOPS}" \
   BENCHMARK_CPU="${BENCHMARK_CPU}" \
   BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
-  UNSOUND="${UNSOUND}" \
+  SOAC_OPT_UNSOUND="${SOAC_OPT_UNSOUND}" \
   DIET_PYTHON_COUNTERS_DIR="$LAST_BENCHMARK_COUNTERS_DIR" \
   DIET_PYTHON_SPECIALIZATION_MODE=profile \
     "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
@@ -858,7 +858,7 @@ benchmark loops="8000000": (update-venv) (build-extension "release")
       WARMUP_LOOPS="${WARMUP_LOOPS}" \
       BENCHMARK_CPU="${BENCHMARK_CPU}" \
       BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
-      UNSOUND="${UNSOUND}" \
+      SOAC_OPT_UNSOUND="${SOAC_OPT_UNSOUND}" \
       DIET_PYTHON_COUNTERS_DIR="$LAST_BENCHMARK_COUNTERS_DIR" \
       DIET_PYTHON_SPECIALIZATION_MODE=apply \
         "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
@@ -870,7 +870,7 @@ benchmark loops="8000000": (update-venv) (build-extension "release")
       WARMUP_LOOPS="${WARMUP_LOOPS}" \
       BENCHMARK_CPU="${BENCHMARK_CPU}" \
       BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
-      UNSOUND="${UNSOUND}" \
+      SOAC_OPT_UNSOUND="${SOAC_OPT_UNSOUND}" \
         "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
     done
   fi

@@ -116,7 +116,7 @@ override env var is present:
   increments the fallback counter when enabled and executes the existing
   global load/store slow path.
 - Store fast paths are emitted only when
-  `DIET_PYTHON_UNSOUND_INDEXED_STORES=1`; the helper then performs a raw
+  `SOAC_OPT_UNSOUND=1`; the helper then performs a raw
   overwrite of an existing indexed-values slot.
 
 ### Limitations / Soundness / Extensions
@@ -154,7 +154,7 @@ override env var is present:
   increment the fallback counter when enabled and execute normal CPython
   attribute lookup.
 - `SetAttr` sites use generic attribute set by default.
-- When `DIET_PYTHON_UNSOUND_INDEXED_STORES=1`, constant-string `SetAttr`
+- When `SOAC_OPT_UNSOUND=1`, constant-string `SetAttr`
   sites with a recorded key index get the same exact-owner/version guard
   and then perform a raw overwrite of an existing split-dict or
   inline-values slot.
@@ -166,7 +166,7 @@ override env var is present:
 - Direct field stores are opt-in/unsound. First insert, missing value,
   invalid inline values, promoted dict, and key-index mismatch still
   fall back; an existing value slot may be overwritten without CPython
-  bookkeeping only when `DIET_PYTHON_UNSOUND_INDEXED_STORES=1`.
+  bookkeeping only when `SOAC_OPT_UNSOUND=1`.
 - Class attributes and descriptors are excluded by compile-time owner
   inspection. Runtime type-version guards are the fallback if a later
   class mutation invalidates that inspection.

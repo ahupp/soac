@@ -249,19 +249,14 @@ instance's live working commit.
   is metadata collection, not a hot increment counter: module keys are
   copied from lowered module globals, and type keys are collected through
   the vendored CPython split-key watcher.
-- `DIET_PYTHON_UNSOUND_INDEXED_STORES`
-  Enables the raw indexed-store experiment. This is only for
-  perf-investigation runs: guarded existing global/field slots are
-  overwritten directly by `soac-runtime`, skipping CPython watchers,
-  dict versions, insertion-order maintenance, and first-insert
-  bookkeeping.
-- `UNSOUND`
+- `SOAC_OPT_UNSOUND`
   Enables intentionally unsound performance experiments. The benchmark
   and pytest correctness recipes default this to `1`; xfail tests that
   specifically assert the skipped semantics under this mode. Current
-  behavior includes rewriting undeclared known-builtin global loads to
-  `RuntimeName` module constants in name binding, so module globals are
-  not checked for those names.
+  behavior includes raw indexed module-global stores, raw indexed
+  split-field stores, and rewriting undeclared known-builtin global loads
+  to `RuntimeName` module constants in name binding. These skip some
+  normal CPython dict/object/type bookkeeping or module-global shadowing.
 
 ### CPython-specific notes
 

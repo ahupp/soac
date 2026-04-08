@@ -37,7 +37,7 @@ fn env_flag_enabled(name: &str) -> bool {
 }
 
 fn unsound_runtime_builtin_names_enabled() -> bool {
-    env_flag_enabled("UNSOUND")
+    env_flag_enabled("SOAC_OPT_UNSOUND")
 }
 
 fn is_unsound_runtime_builtin_candidate(name: &str) -> bool {
