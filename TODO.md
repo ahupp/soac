@@ -4,6 +4,12 @@
 - Reserved for user requests that start with `TODO`.
 - Add one entry per request and include any plan or relevant response summary with it.
 
+## Investigate statically linking the SOAC extension against libpython
+
+- Question:
+  - Can we build the Python extension / runtime path against a PGO-built libpython in a way that statically links the
+    needed Python symbols, instead of relying on the dynamic `libpython3.15.so`?
+
 ## Collapse BlockPyPass into a recursive Instr trait
 
 - Planning note:
