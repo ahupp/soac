@@ -84,3 +84,19 @@ benchmarked throughput delta, and the headline pre/post numbers.
 - post-change benchmark:
   - specialized pass, 1M loops x3: `252020`, `251340`, `248906 loops/s`
   - stock CPython: `552461 loops/s`
+
+## 2026-04-08 - Fast-path exact list item helpers
+
+- jj change id: `spsxlton`
+- summary: The existing JIT getitem/setitem helpers now handle exact
+  `list` with exact compact-`int` index directly: decode compact long
+  indexes in Rust, normalize in-range negative indices, use direct
+  `PyList_GET_ITEM` / `PyList_SET_ITEM` access, and fall back to the
+  generic item protocol for mismatched, big-int, or out-of-range cases.
+- throughput: `+3.12%` median
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `308879`, `313589`, `309820 loops/s`
+  - stock CPython: `551629 loops/s`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `319499`, `320812`, `308803 loops/s`
+  - stock CPython: `558357 loops/s`
