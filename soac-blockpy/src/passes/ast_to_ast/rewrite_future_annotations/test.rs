@@ -1,13 +1,14 @@
 use super::rewrite;
+use ruff_python_ast::{Expr, Stmt};
 use ruff_python_parser::parse_module;
 use std::collections::HashSet;
 
-fn rewrite_module(source: &str) -> (HashSet<String>, String) {
+fn rewrite_module(source: &str) -> (HashSet<String>, Vec<Stmt>) {
     let mut module = parse_module(source)
         .expect("parse should succeed")
         .into_syntax();
     let future_features = rewrite(&mut module.body).expect("future imports should be valid");
-    (future_features, crate::ruff_ast_to_string(&module.body))
+    (future_features, module.body)
 }
 
 #[test]
@@ -18,7 +19,7 @@ fn strips_all_future_imports_and_returns_feature_names() {
         "x: Foo = 1\n",
     );
 
-    let (future_features, rendered) = rewrite_module(source);
+    let (future_features, module) = rewrite_module(source);
 
     assert_eq!(
         future_features,
@@ -28,19 +29,29 @@ fn strips_all_future_imports_and_returns_feature_names() {
             "generator_stop".to_string(),
         ])
     );
-    assert!(!rendered.contains("__future__"), "{rendered}");
-    assert!(rendered.contains("x: \"Foo\" = 1"), "{rendered}");
+    let [Stmt::AnnAssign(assign)] = module.as_slice() else {
+        panic!("expected one annotation stmt after future-strip, got {module:?}");
+    };
+    assert!(matches!(
+        assign.annotation.as_ref(),
+        Expr::StringLiteral(annotation) if annotation.value.to_str() == "Foo"
+    ));
 }
 
 #[test]
 fn non_annotations_future_does_not_stringize_annotations() {
     let source = concat!("from __future__ import division\n", "x: Foo = 1\n",);
 
-    let (future_features, rendered) = rewrite_module(source);
+    let (future_features, module) = rewrite_module(source);
 
     assert_eq!(future_features, HashSet::from(["division".to_string()]));
-    assert!(!rendered.contains("__future__"), "{rendered}");
-    assert!(rendered.contains("x: Foo = 1"), "{rendered}");
+    let [Stmt::AnnAssign(assign)] = module.as_slice() else {
+        panic!("expected one annotation stmt after future-strip, got {module:?}");
+    };
+    assert!(matches!(
+        assign.annotation.as_ref(),
+        Expr::Name(annotation) if annotation.id.as_str() == "Foo"
+    ));
 }
 
 #[test]

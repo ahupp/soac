@@ -1,8 +1,21 @@
-use super::super::{lower_instr_for_test, BlockPyStmtBuilder};
+use super::super::{BlockPyStmtBuilder, lower_instr_for_test};
 use super::*;
 use crate::block_py::InstrWithAwaitAndYield;
 use crate::passes::ast_to_ast::context::Context;
 use crate::passes::ruff_to_blockpy::test_name_gen;
+use ruff_python_ast::{Expr, Stmt};
+
+fn is_soac_attr_call(expr: &Expr, expected_attr: &str) -> bool {
+    let Expr::Call(call) = expr else {
+        return false;
+    };
+    matches!(
+        call.func.as_ref(),
+        Expr::Attribute(attr)
+            if matches!(attr.value.as_ref(), Expr::Name(name) if name.id.as_str() == "__soac__")
+                && attr.attr.id.as_str() == expected_attr
+    )
+}
 
 #[test]
 fn stmt_assign_to_blockpy_emits_direct_core_setitem() {
@@ -15,13 +28,10 @@ fn stmt_assign_to_blockpy_emits_direct_core_setitem() {
         .expect("assign lowering should succeed");
 
     let fragment = out.finish();
-    let Some(expr) = fragment.entry.body.last() else {
-        panic!("expected final expr stmt, got {fragment:?}");
-    };
-    let rendered = format!("{expr:?}");
-
-    assert!(rendered.contains("SetItem("), "{rendered}");
-    assert!(!rendered.contains("__dp_setitem"), "{rendered}");
+    assert!(matches!(
+        fragment.entry.body.last(),
+        Some(InstrWithAwaitAndYield::SetItem(_))
+    ));
 }
 
 #[test]
@@ -38,22 +48,25 @@ fn rewrite_assignment_target_unpack_uses_native_subscript_ast() {
 
     rewrite_assignment_target(target, rhs, &mut out, &mut next_temp);
 
-    let rendered = out
-        .iter()
-        .map(crate::ruff_ast_to_string)
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    assert!(!rendered.contains("__dp_getitem("), "{rendered}");
-    assert!(rendered.contains("[0]"), "{rendered}");
-    assert!(rendered.contains("__soac__.list("), "{rendered}");
+    assert!(out.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Assign(assign)
+            if matches!(assign.targets.as_slice(), [Expr::Name(name)] if name.id.as_str() == "a")
+                && matches!(assign.value.as_ref(), Expr::Subscript(_))
+    )));
+    assert!(out.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Assign(assign)
+            if matches!(assign.targets.as_slice(), [Expr::Name(name)] if name.id.as_str() == "b")
+                && is_soac_attr_call(assign.value.as_ref(), "list")
+    )));
 }
 
 #[test]
 fn rewrite_assignment_target_uses_native_store_targets() {
-    let cases = [("obj[idx]", "[idx] = value"), ("obj.attr", ".attr = value")];
+    let cases = ["obj[idx]", "obj.attr"];
 
-    for (target_src, expected) in cases {
+    for target_src in cases {
         let target = *ruff_python_parser::parse_expression(target_src)
             .unwrap()
             .into_syntax()
@@ -69,14 +82,18 @@ fn rewrite_assignment_target_uses_native_store_targets() {
 
         rewrite_assignment_target(target, rhs, &mut out, &mut next_temp);
 
-        let rendered = out
-            .iter()
-            .map(crate::ruff_ast_to_string)
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert!(!rendered.contains("__dp_setitem("), "{rendered}");
-        assert!(!rendered.contains("__dp_setattr("), "{rendered}");
-        assert!(rendered.contains(expected), "{rendered}");
+        let [Stmt::Assign(assign)] = out.as_slice() else {
+            panic!("expected one assignment for {target_src}, got {out:?}");
+        };
+        assert!(
+            matches!(
+                (target_src, assign.targets.as_slice(), assign.value.as_ref()),
+                ("obj[idx]", [Expr::Subscript(_)], Expr::Name(name)) if name.id.as_str() == "value"
+            ) || matches!(
+                (target_src, assign.targets.as_slice(), assign.value.as_ref()),
+                ("obj.attr", [Expr::Attribute(_)], Expr::Name(name)) if name.id.as_str() == "value"
+            ),
+            "unexpected assignment rewrite for {target_src}: {assign:?}",
+        );
     }
 }

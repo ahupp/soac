@@ -1,17 +1,18 @@
 use super::{
-    callable_scope_info, try_lower_function_to_core_blockpy_bundle, BlockPyModuleRewriter,
-    FunctionScopeFrame,
+    BlockPyModuleRewriter, FunctionScopeFrame, callable_scope_info,
+    try_lower_function_to_core_blockpy_bundle,
 };
 use crate::block_py::{
-    compute_make_function_capture_bindings_from_scope, BindingKind, BindingPurpose, BindingTarget,
-    BlockPyModule, ClassBodyFallback, EffectiveBinding, ModuleNameGen,
+    AbruptKind, BindingKind, BindingPurpose, BindingTarget, BlockArg, BlockPyFunction,
+    BlockPyModule, BlockTerm, ClassBodyFallback, EffectiveBinding, InstrWithAwaitAndYield,
+    ModuleNameGen, NameLike, compute_make_function_capture_bindings_from_scope,
 };
 use crate::lower_python_to_blockpy_for_testing;
+use crate::passes::CoreModuleShapeWithAwaitAndYield;
 use crate::passes::ast_to_ast::context::Context;
 use crate::passes::ast_to_ast::semantic::SemanticAstState;
 use crate::passes::ruff_to_blockpy::rewrite_ast_to_core_blockpy_module_with_module;
-use crate::passes::CoreModuleShapeWithAwaitAndYield;
-use ruff_python_ast::Stmt;
+use ruff_python_ast::{Expr, Stmt};
 use ruff_python_parser::parse_module;
 
 fn tracked_core_blockpy_with_await_and_yield(
@@ -42,6 +43,45 @@ fn lower_test_module_plan(
         &semantic_state,
         ModuleNameGen::new(0),
     )
+}
+
+fn function_stores_make_function(
+    function: &BlockPyFunction<CoreModuleShapeWithAwaitAndYield>,
+    name: &str,
+) -> bool {
+    function.blocks.iter().any(|block| {
+        block.body.iter().any(|stmt| {
+            matches!(
+                stmt,
+                InstrWithAwaitAndYield::Store(store)
+                    if store.name.id_str() == name
+                        && matches!(store.value.as_ref(), InstrWithAwaitAndYield::MakeFunction(_))
+            )
+        })
+    })
+}
+
+fn is_soac_attr_call(expr: &Expr, expected_attr: &str) -> bool {
+    let Expr::Call(call) = expr else {
+        return false;
+    };
+    matches!(
+        call.func.as_ref(),
+        Expr::Attribute(attr)
+            if matches!(attr.value.as_ref(), Expr::Name(name) if name.id.as_str() == "__soac__")
+                && attr.attr.id.as_str() == expected_attr
+    )
+}
+
+fn assigns_make_function_to(stmts: &[Stmt], expected_name: &str) -> bool {
+    stmts.iter().any(|stmt| {
+        matches!(
+            stmt,
+            Stmt::Assign(assign)
+                if matches!(assign.targets.as_slice(), [Expr::Name(name)] if name.id.as_str() == expected_name)
+                    && is_soac_attr_call(assign.value.as_ref(), "make_function")
+        )
+    })
 }
 
 #[test]
@@ -172,15 +212,7 @@ fn recursive_local_function_bindings_are_cell_owned_in_parent_scope() {
         ))
     );
     let replacement = rewriter.rewrite_visited_function_def(nested_func, nested_state);
-    let rendered = replacement
-        .iter()
-        .map(crate::ruff_ast_to_string)
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        !rendered.contains("__dp_store_cell(_dp_cell_recurse, recurse)"),
-        "{rendered}"
-    );
+    assert!(assigns_make_function_to(replacement.as_slice(), "recurse"));
 }
 
 #[test]
@@ -451,22 +483,7 @@ fn lowering_recursive_local_function_with_finally_keeps_plain_binding_before_nam
         .iter()
         .find(|callable| callable.names.bind_name == "exercise")
         .expect("missing lowered exercise callable");
-    let rendered =
-        crate::block_py::pretty::blockpy_module_to_string(&crate::block_py::BlockPyModule {
-            module_name_gen: crate::block_py::ModuleNameGen::new(0),
-            global_names: Vec::new(),
-            callable_defs: vec![exercise.clone()],
-            module_constants: Vec::new(),
-            counter_defs: Vec::new(),
-        });
-    assert!(
-        rendered.contains("StoreName(\"recurse\", MakeFunction"),
-        "{rendered}"
-    );
-    assert!(
-        !rendered.contains("__dp_store_cell(_dp_cell_recurse, recurse)"),
-        "{rendered}"
-    );
+    assert!(function_stores_make_function(exercise, "recurse"));
 }
 
 #[test]
@@ -531,23 +548,21 @@ fn lowering_recursive_local_function_finally_return_preserves_liveins() {
         .iter()
         .find(|callable| callable.names.bind_name == "exercise")
         .expect("missing lowered exercise callable");
-    let rendered =
-        crate::block_py::pretty::blockpy_module_to_string(&crate::block_py::BlockPyModule {
-            module_name_gen: crate::block_py::ModuleNameGen::new(0),
-            global_names: Vec::new(),
-            callable_defs: vec![exercise.clone()],
-            module_constants: Vec::new(),
-            counter_defs: Vec::new(),
-        });
-    assert!(
-        rendered.contains("jump ")
-            && rendered.contains("(AbruptKind(Return), Name(\"_dp_try_abrupt_payload_"),
-        "{rendered}"
-    );
-    assert!(
-        !rendered.contains("(None, AbruptKind(Return), Name(\"_dp_try_abrupt_payload_"),
-        "{rendered}"
-    );
+    assert!(exercise.blocks.iter().any(|block| {
+        matches!(
+            &block.term,
+            BlockTerm::Jump(edge)
+                if edge.args.len() >= 2
+                    && edge
+                        .args
+                        .iter()
+                        .any(|arg| matches!(arg, BlockArg::AbruptKind(AbruptKind::Return)))
+                    && edge
+                        .args
+                        .iter()
+                        .any(|arg| matches!(arg, BlockArg::Name(name) if name.starts_with("_dp_try_abrupt_payload_")))
+        )
+    }));
 }
 
 #[test]
@@ -579,17 +594,5 @@ fn lowering_nonlocal_inner_captures_outer_cell() {
         "{:?}",
         inner.storage_layout()
     );
-    let rendered =
-        crate::block_py::pretty::blockpy_module_to_string(&crate::block_py::BlockPyModule {
-            module_name_gen: crate::block_py::ModuleNameGen::new(0),
-            global_names: Vec::new(),
-            callable_defs: vec![outer.clone()],
-            module_constants: Vec::new(),
-            counter_defs: Vec::new(),
-        });
-    assert!(
-        rendered
-            .contains("StoreName(\"inner\", MakeFunction(0:1, Function, tuple_values(), NONE))"),
-        "{rendered}"
-    );
+    assert!(function_stores_make_function(outer, "inner"));
 }

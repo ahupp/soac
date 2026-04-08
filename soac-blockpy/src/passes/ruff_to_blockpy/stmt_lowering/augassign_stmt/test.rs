@@ -1,6 +1,6 @@
-use super::super::{lower_instr_for_test, BlockPyStmtBuilder};
+use super::super::{BlockPyStmtBuilder, lower_instr_for_test};
 use super::*;
-use crate::block_py::InstrWithAwaitAndYield;
+use crate::block_py::{BinOpKind, InstrWithAwaitAndYield};
 use crate::passes::ast_to_ast::context::Context;
 use crate::passes::ruff_to_blockpy::test_name_gen;
 
@@ -28,15 +28,13 @@ fn stmt_augassign_to_blockpy_emits_direct_core_operations() {
         .expect("augassign lowering should succeed");
 
     let fragment = out.finish();
-    let Some(expr) = fragment.entry.body.last() else {
-        panic!("expected final expr stmt, got {fragment:?}");
+    let Some(InstrWithAwaitAndYield::SetItem(setitem)) = fragment.entry.body.last() else {
+        panic!("expected final setitem op, got {fragment:?}");
     };
-    let rendered = format!("{expr:?}");
-
-    assert!(rendered.contains("SetItem("), "{rendered}");
-    assert!(rendered.contains("InplaceAdd"), "{rendered}");
-    assert!(!rendered.contains("__dp_iadd"), "{rendered}");
-    assert!(!rendered.contains("__dp_setitem"), "{rendered}");
+    assert!(matches!(
+        setitem.replacement.as_ref(),
+        InstrWithAwaitAndYield::BinOp(op) if op.kind == BinOpKind::InplaceAdd
+    ));
 }
 
 #[test]
@@ -53,7 +51,8 @@ fn stmt_pow_augassign_to_blockpy_uses_inplace_pow() {
     let Some(InstrWithAwaitAndYield::Store(assign)) = fragment.entry.body.last() else {
         panic!("expected final store expr stmt, got {fragment:?}");
     };
-    let rendered = format!("{:?}", assign.value);
-
-    assert!(rendered.contains("InplacePow"), "{rendered}");
+    assert!(matches!(
+        assign.value.as_ref(),
+        InstrWithAwaitAndYield::BinOp(op) if op.kind == BinOpKind::InplacePow
+    ));
 }

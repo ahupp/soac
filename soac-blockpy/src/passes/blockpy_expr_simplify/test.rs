@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::block_py::{BinOpKind, Literal, NameLike, UnaryOpKind};
+use crate::block_py::{BinOpKind, BlockTerm, Literal, NameLike, UnaryOpKind};
 
 fn lower_semantic_expr_without_setup(expr: &Expr) -> InstrWithAwaitAndYield {
     InstrWithAwaitAndYield::from_ast_expr(expr.clone())
@@ -18,6 +18,28 @@ fn is_raw_load_name_expr(expr: &InstrWithAwaitAndYield, expected: &str) -> bool 
     )
 }
 
+fn contains_runtime_call(expr: &InstrWithAwaitAndYield, expected: &str) -> bool {
+    match expr {
+        InstrWithAwaitAndYield::Load(op) => op.name.is_runtime_symbol(expected),
+        InstrWithAwaitAndYield::Call(call) => {
+            contains_runtime_call(call.func.as_ref(), expected)
+                || call
+                    .args
+                    .iter()
+                    .any(|arg| contains_runtime_call(arg.expr(), expected))
+                || call
+                    .keywords
+                    .iter()
+                    .any(|keyword| contains_runtime_call(keyword.expr(), expected))
+        }
+        InstrWithAwaitAndYield::BinOp(op) => {
+            contains_runtime_call(op.left.as_ref(), expected)
+                || contains_runtime_call(op.right.as_ref(), expected)
+        }
+        _ => false,
+    }
+}
+
 #[test]
 fn expr_simplify_preserves_control_flow_but_reduces_exprs() {
     let source = r#"
@@ -32,10 +54,24 @@ def f(x):
         .pass_core_blockpy_with_await_and_yield()
         .cloned()
         .expect("expected lowered core BlockPy module");
-    let core_rendered = crate::block_py::pretty::blockpy_module_to_string(&core);
+    let function = core
+        .callable_defs
+        .iter()
+        .find(|function| function.names.bind_name == "f")
+        .expect("missing lowered f callable");
 
-    assert!(core_rendered.contains("function f(x):"));
-    assert!(core_rendered.contains("return 1"));
+    assert!(
+        function
+            .blocks
+            .iter()
+            .any(|block| matches!(block.term, BlockTerm::IfTerm(_)))
+    );
+    assert!(
+        function
+            .blocks
+            .iter()
+            .any(|block| matches!(block.term, BlockTerm::Return(_)))
+    );
 }
 
 #[test]
@@ -160,8 +196,7 @@ fn core_blockpy_expr_reuses_shared_tuple_splat_intrinsic_shape() {
         panic!("expected operation-shaped reduced tuple expr");
     };
     assert_eq!(op.kind, BinOpKind::Add);
-    let rendered = format!("{lowered:?}");
-    assert!(rendered.contains("tuple_from_iter(xs)"), "{rendered}");
+    assert!(contains_runtime_call(&lowered, "tuple_from_iter"));
 }
 
 #[test]
@@ -180,8 +215,7 @@ fn core_blockpy_expr_reuses_shared_tuple_splat_for_list_and_set() {
         let [CallArgPositional::Positional(tupleish)] = &call.args[..] else {
             panic!("expected one positional arg for {expr}");
         };
-        let rendered = format!("{tupleish:?}");
-        assert!(rendered.contains("tuple_from_iter(xs)"), "{rendered}");
+        assert!(contains_runtime_call(tupleish, "tuple_from_iter"));
     }
 }
 
@@ -227,9 +261,29 @@ def f(*, d={"metaclass": Meta}, **kw):
         .pass_core_blockpy_with_await_and_yield()
         .cloned()
         .expect("expected lowered core BlockPy module");
-    let rendered = crate::block_py::pretty::blockpy_module_to_string(&blockpy);
+    let function = blockpy
+        .callable_defs
+        .iter()
+        .find(|function| function.names.bind_name == "f")
+        .expect("missing lowered f callable");
+    let module_init = blockpy
+        .callable_defs
+        .iter()
+        .find(|function| function.names.bind_name == "_dp_module_init")
+        .expect("missing lowered module-init callable");
 
-    assert!(rendered.contains("function f(*, d, **kw):"), "{rendered}");
-    assert!(!rendered.contains("function f(*, d={"), "{rendered}");
-    assert!(rendered.contains("MakeFunction("), "{rendered}");
+    assert_eq!(
+        function.params.names(),
+        vec!["d".to_string(), "kw".to_string()]
+    );
+    assert_eq!(function.params.default_count(), 1);
+    assert!(module_init.blocks.iter().any(|block| {
+        block.body.iter().any(|stmt| {
+            matches!(
+                stmt,
+                InstrWithAwaitAndYield::Store(store)
+                    if matches!(store.value.as_ref(), InstrWithAwaitAndYield::MakeFunction(_))
+            )
+        })
+    }));
 }

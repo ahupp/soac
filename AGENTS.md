@@ -101,7 +101,16 @@ current `@`. Do not treat another workspace's live `@` as a dependency.
    If fixing a CPython regression, add a minimal reproducing integration test first.
    If diagnosing a hang, add follow-up instrumentation where practical and leave behind a focused regression or assertion for that hang shape.
 
-6. Keep specialization docs in sync.
+6. Avoid render-as-behavior tests.
+
+   Outside tests for the renderer/pretty-printer itself, avoid testing a
+   compiler behavior by rendering an AST/IR/debug value to text and asserting
+   that an expected string appears. These tests are low signal and create
+   fixup churn on unrelated render changes. Prefer assertions on the actual
+   AST, IR, CFG edge, binding/storage layout, module constant, or other
+   structured output shape.
+
+7. Keep specialization docs in sync.
 
    If you add or materially change a specialization, update
    `docs/SPECIALIZATION.md` in the same logical change. The doc should
@@ -109,14 +118,14 @@ current `@`. Do not treat another workspace's live `@` as a dependency.
    emitted, and the current limitations, soundness boundaries, or likely
    extensions.
 
-7. Keep environment-variable docs in sync.
+8. Keep environment-variable docs in sync.
 
    If you add or materially change an environment variable that controls
    runtime behavior, testing, benchmarking, profiling, or the local web
    tooling, document it in `README.md` and add or update the relevant
    note in `AGENTS.md` in the same logical change.
 
-8. Run the full gate before submitting code changes.
+9. Run the full gate before submitting code changes.
 
 Run `just test-all` before submitting unless the change is docs-only,
 such as `TODO.md`, `AGENTS.md`, or similar documentation-only files.
@@ -124,43 +133,43 @@ Put test output in `logs/`. Summarize the failures, separate expected
 failures from unexpected failures, investigate the root cause, report
 it, then fix it.
 
-9. When a logical set of changes is complete, freeze it before
+10. When a logical set of changes is complete, freeze it before
    integrating it.
 
 Run `jj new` so the finished work is no longer the live working commit.
 Rebase and integrate the finished change, not the live `@`.
 
-10. Try to advance `main` directly to the finished head.
+11. Try to advance `main` directly to the finished head.
 
 Prefer `jj bookmark move main -t <finished-head>` when the finished
 change is already a descendant of the current `main`. This avoids
 unnecessary rebases and duplicate sibling revisions.
 
-11. If advancing `main` fails because the finished head is not a
+12. If advancing `main` fails because the finished head is not a
    descendant of `main`, rebase the finished commit or finished stack
    onto `main`.
 
 Use `jj rebase` on the finished revision or stack root so the completed
 work sits directly on top of the current shared base.
 
-12. Resolve any conflicts and rerun the relevant tests.
+13. Resolve any conflicts and rerun the relevant tests.
 
 The rebased change is not ready to advance `main` until conflicts are
 resolved and the relevant checks have been rerun.
 
-13. Advance `main` to the finished head.
+14. Advance `main` to the finished head.
 
 This is the synchronization point. Once `main` moves, the finished work
 becomes the new shared base for future work.
 
-14. When another agent advances `main`, refresh and continue on top of
+15. When another agent advances `main`, refresh and continue on top of
     it.
 
 Run `jj workspace update-stale` and rebase your live work onto the new
 `main` as needed. Other agents should only depend on `main`, not on a
 peer workspace's live `@`.
 
-15. Report the result: run `jj diff --stat` on the completed change and
+16. Report the result: run `jj diff --stat` on the completed change and
 report its output, then describe the next step. If I did not ask to
 approve each step after the plan, continue with the next step.
 

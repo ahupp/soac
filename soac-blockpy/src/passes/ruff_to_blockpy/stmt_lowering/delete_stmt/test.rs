@@ -1,4 +1,4 @@
-use super::super::{lower_instr_for_test, BlockPyStmtBuilder};
+use super::super::{BlockPyStmtBuilder, lower_instr_for_test};
 use super::*;
 use crate::block_py::InstrWithAwaitAndYield;
 use crate::passes::ast_to_ast::context::Context;
@@ -15,11 +15,8 @@ fn stmt_delete_to_blockpy_emits_direct_core_delitem() {
         .expect("delete lowering should succeed");
 
     let fragment = out.finish();
-    let Some(expr) = fragment.entry.body.last() else {
-        panic!("expected final expr stmt, got {fragment:?}");
-    };
-    let rendered = format!("{expr:?}");
-
-    assert!(rendered.contains("DelItem("), "{rendered}");
-    assert!(!rendered.contains("__dp_delitem"), "{rendered}");
+    assert!(matches!(
+        fragment.entry.body.last(),
+        Some(InstrWithAwaitAndYield::DelItem(_))
+    ));
 }

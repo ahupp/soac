@@ -1,7 +1,7 @@
-use super::{rewrite_with_pass, ExprRewritePass, LoweredExpr};
+use super::{ExprRewritePass, LoweredExpr, rewrite_with_pass};
 use crate::passes::ast_to_ast::context::Context;
 use crate::py_expr;
-use ruff_python_ast::Expr;
+use ruff_python_ast::{Expr, Stmt};
 use ruff_python_parser::parse_module;
 
 struct RenameXExprPass;
@@ -28,6 +28,14 @@ def f():
 
     rewrite_with_pass(&context, None, Some(&RenameXExprPass), &mut module);
 
-    let rendered = crate::ruff_ast_to_string(&module);
-    assert!(rendered.contains("return renamed"), "{rendered}");
+    let Stmt::FunctionDef(func) = &module[0] else {
+        panic!("expected function def, got {module:?}");
+    };
+    let Stmt::Return(ret) = &func.body[0] else {
+        panic!("expected return, got {:?}", func.body);
+    };
+    assert!(matches!(
+        ret.value.as_deref(),
+        Some(Expr::Name(name)) if name.id.as_str() == "renamed"
+    ));
 }
