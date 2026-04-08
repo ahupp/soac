@@ -109,6 +109,14 @@ unsafe extern "C" fn py_vectorcall_hook(
     ) as ObjPtr
 }
 
+unsafe extern "C" fn enter_recursive_call_hook() -> i32 {
+    ffi::Py_EnterRecursiveCall(b" while calling a Python object\0".as_ptr() as *const i8)
+}
+
+unsafe extern "C" fn leave_recursive_call_hook() {
+    ffi::Py_LeaveRecursiveCall();
+}
+
 unsafe extern "C" fn pytype_generic_alloc_hook(type_obj: ObjPtr, nitems: i64) -> ObjPtr {
     if type_obj.is_null() || nitems < 0 {
         ffi::PyErr_SetString(
@@ -154,6 +162,45 @@ unsafe extern "C" fn finish_constructor_init_hook(obj: ObjPtr, init_result: ObjP
     }
     ffi::Py_DECREF(init_result);
     obj as ObjPtr
+}
+
+#[cfg(not(test))]
+unsafe extern "C" fn direct_code_ptr_hook(callable: ObjPtr) -> ObjPtr {
+    if callable.is_null() {
+        ffi::PyErr_SetString(
+            ffi::PyExc_RuntimeError,
+            b"invalid null callable in dp_jit_direct_code_ptr\0".as_ptr() as *const i8,
+        );
+        return ptr::null_mut();
+    }
+    crate::registered_clif_direct_code_ptr(callable as *mut ffi::PyObject)
+        .unwrap_or(ptr::null_mut())
+}
+
+#[cfg(not(test))]
+unsafe extern "C" fn direct_vmctx_hook(callable: ObjPtr) -> ObjPtr {
+    if callable.is_null() {
+        ffi::PyErr_SetString(
+            ffi::PyExc_RuntimeError,
+            b"invalid null callable in dp_jit_direct_vmctx\0".as_ptr() as *const i8,
+        );
+        return ptr::null_mut();
+    }
+    crate::registered_clif_vmctx_ptr(callable as *mut ffi::PyObject)
+        .unwrap_or(ptr::null_mut())
+}
+
+#[cfg(not(test))]
+unsafe extern "C" fn direct_function_data_hook(callable: ObjPtr) -> ObjPtr {
+    if callable.is_null() {
+        ffi::PyErr_SetString(
+            ffi::PyExc_RuntimeError,
+            b"invalid null callable in dp_jit_direct_function_data\0".as_ptr() as *const i8,
+        );
+        return ptr::null_mut();
+    }
+    crate::registered_clif_runtime_objects_ptr(callable as *mut ffi::PyObject)
+        .unwrap_or(ptr::null_mut())
 }
 
 #[cfg(not(test))]
@@ -291,259 +338,6 @@ unsafe fn load_global_obj_impl(
     ffi::PyErr_Clear();
     raise_name_error_for_missing_name(name_obj);
     ptr::null_mut()
-}
-
-#[cfg(not(test))]
-unsafe fn resolve_function_object(callable: ObjPtr) -> ObjPtr {
-    if callable.is_null() {
-        ffi::PyErr_SetString(
-            ffi::PyExc_RuntimeError,
-            b"invalid null callable for JIT function lookup\0".as_ptr() as *const i8,
-        );
-        return ptr::null_mut();
-    }
-    let function = ffi::PyObject_GetAttrString(
-        callable as *mut ffi::PyObject,
-        b"__func__\0".as_ptr() as *const i8,
-    );
-    if !function.is_null() {
-        return function as ObjPtr;
-    }
-    if ffi::PyErr_ExceptionMatches(ffi::PyExc_AttributeError) == 0 {
-        return ptr::null_mut();
-    }
-    ffi::PyErr_Clear();
-    ffi::Py_INCREF(callable as *mut ffi::PyObject);
-    callable
-}
-
-#[cfg(not(test))]
-unsafe fn resolve_function_defaults_owner(callable: ObjPtr) -> ObjPtr {
-    if callable.is_null() {
-        ffi::PyErr_SetString(
-            ffi::PyExc_RuntimeError,
-            b"invalid null callable for JIT function default lookup\0".as_ptr() as *const i8,
-        );
-        return ptr::null_mut();
-    }
-    resolve_function_object(callable)
-}
-
-#[cfg(not(test))]
-unsafe fn raise_missing_function_default_obj(name_obj: *mut ffi::PyObject) {
-    if name_obj.is_null() {
-        ffi::PyErr_SetString(
-            ffi::PyExc_TypeError,
-            b"missing required argument\0".as_ptr() as *const i8,
-        );
-        return;
-    }
-    let repr = ffi::PyObject_Repr(name_obj);
-    if !repr.is_null() {
-        let repr_utf8 = ffi::PyUnicode_AsUTF8(repr);
-        if !repr_utf8.is_null() {
-            let repr_text = std::ffi::CStr::from_ptr(repr_utf8).to_string_lossy();
-            let message = format!("missing required argument {repr_text}");
-            ffi::Py_DECREF(repr);
-            if let Ok(c_msg) = std::ffi::CString::new(message) {
-                ffi::PyErr_SetString(ffi::PyExc_TypeError, c_msg.as_ptr());
-                return;
-            }
-        } else {
-            ffi::PyErr_Clear();
-        }
-        ffi::Py_DECREF(repr);
-    }
-    ffi::PyErr_SetString(
-        ffi::PyExc_TypeError,
-        b"missing required argument\0".as_ptr() as *const i8,
-    );
-}
-
-#[cfg(not(test))]
-unsafe extern "C" fn function_positional_default_obj_hook(
-    callable: ObjPtr,
-    name_obj: ObjPtr,
-    index: i64,
-) -> ObjPtr {
-    if name_obj.is_null() || index < 0 {
-        ffi::PyErr_SetString(
-            ffi::PyExc_RuntimeError,
-            b"invalid arguments to dp_jit_function_positional_default_obj\0".as_ptr() as *const i8,
-        );
-        return ptr::null_mut();
-    }
-    let owner = resolve_function_defaults_owner(callable);
-    if owner.is_null() {
-        return ptr::null_mut();
-    }
-    let defaults = ffi::PyObject_GetAttrString(
-        owner as *mut ffi::PyObject,
-        b"__defaults__\0".as_ptr() as *const i8,
-    );
-    if defaults.is_null() {
-        ffi::Py_DECREF(owner as *mut ffi::PyObject);
-        if ffi::PyErr_ExceptionMatches(ffi::PyExc_AttributeError) != 0 {
-            ffi::PyErr_Clear();
-            raise_missing_function_default_obj(name_obj as *mut ffi::PyObject);
-        }
-        return ptr::null_mut();
-    }
-    if defaults == ffi::Py_None() || ffi::PyTuple_Check(defaults) == 0 {
-        ffi::Py_DECREF(defaults);
-        ffi::Py_DECREF(owner as *mut ffi::PyObject);
-        raise_missing_function_default_obj(name_obj as *mut ffi::PyObject);
-        return ptr::null_mut();
-    }
-    let tuple_len = ffi::PyTuple_GET_SIZE(defaults);
-    if index >= tuple_len as i64 {
-        ffi::Py_DECREF(defaults);
-        ffi::Py_DECREF(owner as *mut ffi::PyObject);
-        raise_missing_function_default_obj(name_obj as *mut ffi::PyObject);
-        return ptr::null_mut();
-    }
-    let value = ffi::PyTuple_GetItem(defaults, index as ffi::Py_ssize_t);
-    if value.is_null() {
-        ffi::Py_DECREF(defaults);
-        ffi::Py_DECREF(owner as *mut ffi::PyObject);
-        return ptr::null_mut();
-    }
-    ffi::Py_INCREF(value);
-    ffi::Py_DECREF(defaults);
-    ffi::Py_DECREF(owner as *mut ffi::PyObject);
-    value as ObjPtr
-}
-
-#[cfg(not(test))]
-unsafe extern "C" fn function_kwonly_default_obj_hook(
-    callable: ObjPtr,
-    name_obj: ObjPtr,
-) -> ObjPtr {
-    if name_obj.is_null() {
-        ffi::PyErr_SetString(
-            ffi::PyExc_RuntimeError,
-            b"invalid arguments to dp_jit_function_kwonly_default_obj\0".as_ptr() as *const i8,
-        );
-        return ptr::null_mut();
-    }
-    let owner = resolve_function_defaults_owner(callable);
-    if owner.is_null() {
-        return ptr::null_mut();
-    }
-    let kwdefaults = ffi::PyObject_GetAttrString(
-        owner as *mut ffi::PyObject,
-        b"__kwdefaults__\0".as_ptr() as *const i8,
-    );
-    if kwdefaults.is_null() {
-        ffi::Py_DECREF(owner as *mut ffi::PyObject);
-        if ffi::PyErr_ExceptionMatches(ffi::PyExc_AttributeError) != 0 {
-            ffi::PyErr_Clear();
-            raise_missing_function_default_obj(name_obj as *mut ffi::PyObject);
-        }
-        return ptr::null_mut();
-    }
-    if kwdefaults == ffi::Py_None() || ffi::PyDict_Check(kwdefaults) == 0 {
-        ffi::Py_DECREF(kwdefaults);
-        ffi::Py_DECREF(owner as *mut ffi::PyObject);
-        raise_missing_function_default_obj(name_obj as *mut ffi::PyObject);
-        return ptr::null_mut();
-    }
-    let value = ffi::PyObject_GetItem(kwdefaults, name_obj as *mut ffi::PyObject);
-    if value.is_null() {
-        if ffi::PyErr_ExceptionMatches(ffi::PyExc_KeyError) != 0 {
-            ffi::PyErr_Clear();
-            ffi::Py_DECREF(kwdefaults);
-            ffi::Py_DECREF(owner as *mut ffi::PyObject);
-            raise_missing_function_default_obj(name_obj as *mut ffi::PyObject);
-            return ptr::null_mut();
-        }
-        ffi::Py_DECREF(kwdefaults);
-        ffi::Py_DECREF(owner as *mut ffi::PyObject);
-        return ptr::null_mut();
-    }
-    ffi::Py_DECREF(kwdefaults);
-    ffi::Py_DECREF(owner as *mut ffi::PyObject);
-    value as ObjPtr
-}
-
-#[cfg(not(test))]
-unsafe extern "C" fn function_closure_cell_hook(callable: ObjPtr, slot: i64) -> ObjPtr {
-    unsafe fn closure_tuple_for_owner(owner: ObjPtr) -> Result<Option<*mut ffi::PyObject>, ()> {
-        let closure = ffi::PyObject_GetAttrString(
-            owner as *mut ffi::PyObject,
-            b"__closure__\0".as_ptr() as *const i8,
-        );
-        if closure.is_null() {
-            if ffi::PyErr_ExceptionMatches(ffi::PyExc_AttributeError) != 0 {
-                ffi::PyErr_Clear();
-                return Ok(None);
-            }
-            return Err(());
-        }
-        if closure == ffi::Py_None() {
-            ffi::Py_DECREF(closure);
-            return Ok(None);
-        }
-        if ffi::PyTuple_Check(closure) == 0 {
-            ffi::Py_DECREF(closure);
-            return Ok(None);
-        }
-        Ok(Some(closure))
-    }
-
-    if slot < 0 {
-        ffi::PyErr_SetString(
-            ffi::PyExc_RuntimeError,
-            b"dp_jit_function_closure_cell requires a non-negative slot\0".as_ptr() as *const i8,
-        );
-        return ptr::null_mut();
-    }
-    let function = resolve_function_object(callable);
-    if function.is_null() {
-        return ptr::null_mut();
-    }
-    let (closure_owner, closure) = match closure_tuple_for_owner(function) {
-        Ok(Some(closure)) => (function, closure),
-        Ok(None) => {
-            ffi::Py_DECREF(function as *mut ffi::PyObject);
-            ffi::PyErr_SetString(
-                ffi::PyExc_RuntimeError,
-                b"callable has no closure cells\0".as_ptr() as *const i8,
-            );
-            return ptr::null_mut();
-        }
-        Err(()) => {
-            ffi::Py_DECREF(function as *mut ffi::PyObject);
-            return ptr::null_mut();
-        }
-    };
-    let resolved_slot = slot as ffi::Py_ssize_t;
-    let closure_len = ffi::PyTuple_GET_SIZE(closure);
-    if resolved_slot < 0 || resolved_slot >= closure_len {
-        ffi::Py_DECREF(closure);
-        ffi::Py_DECREF(closure_owner as *mut ffi::PyObject);
-        ffi::PyErr_SetString(
-            ffi::PyExc_IndexError,
-            b"closure slot out of range\0".as_ptr() as *const i8,
-        );
-        return ptr::null_mut();
-    }
-    let cell = ffi::PyTuple_GetItem(closure, resolved_slot);
-    if cell.is_null() {
-        ffi::Py_DECREF(closure);
-        ffi::Py_DECREF(closure_owner as *mut ffi::PyObject);
-        return ptr::null_mut();
-    }
-    if !is_cell_object(cell) {
-        ffi::Py_DECREF(closure);
-        ffi::Py_DECREF(closure_owner as *mut ffi::PyObject);
-        raise_expected_cell("dp_jit_function_closure_cell", cell);
-        return ptr::null_mut();
-    }
-    ffi::Py_INCREF(cell);
-    ffi::Py_DECREF(closure);
-    ffi::Py_DECREF(closure_owner as *mut ffi::PyObject);
-    cell as ObjPtr
 }
 
 #[cfg(not(test))]
@@ -1022,13 +816,6 @@ mod test_only_export_stubs {
         index: i64
     ));
     panic_obj_export!(dp_jit_load_runtime_obj(name: ObjPtr));
-    panic_obj_export!(dp_jit_function_closure_cell(callable: ObjPtr, slot: i64));
-    panic_obj_export!(dp_jit_function_positional_default_obj(
-        callable: ObjPtr,
-        name: ObjPtr,
-        index: i64,
-    ));
-    panic_obj_export!(dp_jit_function_kwonly_default_obj(callable: ObjPtr, name: ObjPtr));
     panic_obj_export!(dp_jit_pyobject_getattr(obj: ObjPtr, attr: ObjPtr));
     panic_obj_export!(dp_jit_pyobject_setattr(obj: ObjPtr, attr: ObjPtr, value: ObjPtr));
     panic_obj_export!(dp_jit_pyobject_getitem(obj: ObjPtr, key: ObjPtr));
@@ -1189,25 +976,18 @@ pub unsafe extern "C" fn dp_jit_load_runtime_obj(name: ObjPtr) -> ObjPtr {
 }
 
 #[cfg(not(test))]
-pub unsafe extern "C" fn dp_jit_function_closure_cell(callable: ObjPtr, slot: i64) -> ObjPtr {
-    function_closure_cell_hook(callable, slot)
+pub unsafe extern "C" fn dp_jit_direct_code_ptr(callable: ObjPtr) -> ObjPtr {
+    direct_code_ptr_hook(callable)
 }
 
 #[cfg(not(test))]
-pub unsafe extern "C" fn dp_jit_function_positional_default_obj(
-    callable: ObjPtr,
-    name: ObjPtr,
-    index: i64,
-) -> ObjPtr {
-    function_positional_default_obj_hook(callable, name, index)
+pub unsafe extern "C" fn dp_jit_direct_vmctx(callable: ObjPtr) -> ObjPtr {
+    direct_vmctx_hook(callable)
 }
 
 #[cfg(not(test))]
-pub unsafe extern "C" fn dp_jit_function_kwonly_default_obj(
-    callable: ObjPtr,
-    name: ObjPtr,
-) -> ObjPtr {
-    function_kwonly_default_obj_hook(callable, name)
+pub unsafe extern "C" fn dp_jit_direct_function_data(callable: ObjPtr) -> ObjPtr {
+    direct_function_data_hook(callable)
 }
 
 #[cfg(not(test))]
@@ -1789,6 +1569,14 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
         ),
     );
     builder.symbol(
+        "dp_jit_enter_recursive_call",
+        enter_recursive_call_hook as *const u8,
+    );
+    builder.symbol(
+        "dp_jit_leave_recursive_call",
+        leave_recursive_call_hook as *const u8,
+    );
+    builder.symbol(
         "dp_jit_pytype_generic_alloc",
         pytype_generic_alloc_hook as *const u8,
     );
@@ -1822,16 +1610,16 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
         dp_jit_load_runtime_obj as *const u8,
     );
     builder.symbol(
-        "dp_jit_function_closure_cell",
-        dp_jit_function_closure_cell as *const u8,
+        "dp_jit_direct_code_ptr",
+        dp_jit_direct_code_ptr as *const u8,
     );
     builder.symbol(
-        "dp_jit_function_positional_default_obj",
-        dp_jit_function_positional_default_obj as *const u8,
+        "dp_jit_direct_vmctx",
+        dp_jit_direct_vmctx as *const u8,
     );
     builder.symbol(
-        "dp_jit_function_kwonly_default_obj",
-        dp_jit_function_kwonly_default_obj as *const u8,
+        "dp_jit_direct_function_data",
+        dp_jit_direct_function_data as *const u8,
     );
     builder.symbol(
         "dp_jit_pyobject_getattr",

@@ -48,6 +48,9 @@ unsafe extern "C" {
     ) -> i32;
     fn PyFunction_GetSoacMetadata(function: *mut ffi::PyObject) -> *mut c_void;
     fn PyFunction_GetSoacFunctionId(function: *mut ffi::PyObject) -> u64;
+    fn PyFunction_GetDefaults(function: *mut ffi::PyObject) -> *mut ffi::PyObject;
+    fn PyFunction_GetKwDefaults(function: *mut ffi::PyObject) -> *mut ffi::PyObject;
+    fn PyFunction_GetClosure(function: *mut ffi::PyObject) -> *mut ffi::PyObject;
     fn PyType_SetSoacMetadata(
         type_obj: *mut ffi::PyObject,
         soac_function_id: u64,
@@ -111,6 +114,18 @@ unsafe extern "C" fn function_owner_type_watcher_callback(
         | PY_FUNCTION_EVENT_MODIFY_DEFAULTS
         | PY_FUNCTION_EVENT_MODIFY_KWDEFAULTS
         | PY_FUNCTION_EVENT_MODIFY_QUALNAME => {
+            if event == PY_FUNCTION_EVENT_MODIFY_DEFAULTS
+                || event == PY_FUNCTION_EVENT_MODIFY_KWDEFAULTS
+            {
+                let metadata = unsafe { PyFunction_GetSoacMetadata(func as *mut ffi::PyObject) };
+                if !metadata.is_null() {
+                    let data = unsafe { &mut *(metadata as *mut ClifFunctionData) };
+                    if unsafe { data.refresh_runtime_objects(func as *mut ffi::PyObject) }.is_err()
+                    {
+                        return -1;
+                    }
+                }
+            }
             let weakrefs = match registry.registered_owner_types_by_function.lock() {
                 Ok(owner_types_by_function) => owner_types_by_function
                     .get(&(func as usize))
@@ -212,12 +227,68 @@ thread_local! {
     };
 }
 
+struct FunctionRuntimeObjectBlock {
+    values: Box<[*mut ffi::PyObject]>,
+}
+
+impl FunctionRuntimeObjectBlock {
+    fn new(values: Box<[*mut ffi::PyObject]>) -> Self {
+        Self { values }
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut *mut ffi::PyObject {
+        self.values.as_mut_ptr()
+    }
+
+    unsafe fn replace_values(
+        &mut self,
+        mut new_values: Box<[*mut ffi::PyObject]>,
+    ) -> Result<(), ()> {
+        if new_values.len() != self.values.len() {
+            unsafe { cleanup_state_values(&mut new_values) };
+            return Err(());
+        }
+        for (slot, new_value) in self.values.iter_mut().zip(new_values.iter_mut()) {
+            let old_value = *slot;
+            *slot = *new_value;
+            *new_value = std::ptr::null_mut();
+            if !old_value.is_null() {
+                unsafe { ffi::Py_DECREF(old_value) };
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for FunctionRuntimeObjectBlock {
+    fn drop(&mut self) {
+        unsafe { cleanup_state_values(&mut self.values) };
+    }
+}
+
+#[repr(C)]
 struct ClifFunctionData {
+    runtime_objects: *mut *mut ffi::PyObject,
     function: soac_blockpy::block_py::BlockPyFunction<CodegenModuleShape>,
     module_runtime: jit::ModuleRuntimeContext,
+    runtime_object_owner: FunctionRuntimeObjectBlock,
     compiled_handle: *mut c_void,
     compiled_vectorcall_handle: *mut c_void,
     compiled_vectorcall_entry: Option<jit::VectorcallEntryFn>,
+}
+
+impl ClifFunctionData {
+    fn runtime_objects_ptr(&self) -> *mut c_void {
+        self.runtime_objects as *mut c_void
+    }
+
+    unsafe fn refresh_runtime_objects(&mut self, callable: *mut ffi::PyObject) -> Result<(), ()> {
+        let layout = jit::FunctionRuntimeDataLayout::from_function(&self.function);
+        let values = unsafe { collect_function_runtime_objects(callable, &layout)? };
+        unsafe { self.runtime_object_owner.replace_values(values)? };
+        self.runtime_objects = self.runtime_object_owner.as_mut_ptr();
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -292,6 +363,64 @@ unsafe fn py_string(obj: *mut ffi::PyObject) -> Result<String, ()> {
     }
     let bytes = std::slice::from_raw_parts(ptr as *const u8, len as usize);
     Ok(String::from_utf8_lossy(bytes).into_owned())
+}
+
+unsafe fn collect_function_runtime_objects(
+    callable: *mut ffi::PyObject,
+    layout: &jit::FunctionRuntimeDataLayout,
+) -> Result<Box<[*mut ffi::PyObject]>, ()> {
+    if callable.is_null() || ffi::PyFunction_Check(callable) == 0 {
+        return set_type_error("expected Python function while collecting CLIF function data");
+    }
+
+    let mut values = vec![ptr::null_mut(); layout.total_len()].into_boxed_slice();
+
+    let defaults = unsafe { PyFunction_GetDefaults(callable) };
+    for default_index in 0..layout.positional_default_count() {
+        let value = if defaults.is_null() || ffi::PyTuple_Check(defaults) == 0 {
+            ptr::null_mut()
+        } else if default_index >= unsafe { ffi::PyTuple_GET_SIZE(defaults) } as usize {
+            ptr::null_mut()
+        } else {
+            unsafe { ffi::PyTuple_GetItem(defaults, default_index as ffi::Py_ssize_t) }
+        };
+        if !value.is_null() {
+            unsafe { ffi::Py_INCREF(value) };
+        }
+        values[layout.positional_default_slot(default_index)] = value;
+    }
+
+    let kwdefaults = unsafe { PyFunction_GetKwDefaults(callable) };
+    for (name, slot) in layout.kwonly_default_slots() {
+        let Ok(name) = CString::new(name) else {
+            continue;
+        };
+        let value = if kwdefaults.is_null() || ffi::PyDict_Check(kwdefaults) == 0 {
+            ptr::null_mut()
+        } else {
+            unsafe { ffi::PyDict_GetItemString(kwdefaults, name.as_ptr()) }
+        };
+        if !value.is_null() {
+            unsafe { ffi::Py_INCREF(value) };
+        }
+        values[slot] = value;
+    }
+    let closure = unsafe { PyFunction_GetClosure(callable) };
+    for closure_slot in 0..layout.closure_len() {
+        let value = if closure.is_null() || ffi::PyTuple_Check(closure) == 0 {
+            ptr::null_mut()
+        } else if closure_slot >= unsafe { ffi::PyTuple_GET_SIZE(closure) } as usize {
+            ptr::null_mut()
+        } else {
+            unsafe { ffi::PyTuple_GetItem(closure, closure_slot as ffi::Py_ssize_t) }
+        };
+        if !value.is_null() {
+            unsafe { ffi::Py_INCREF(value) };
+        }
+        values[layout.closure_cell_slot(closure_slot)] = value;
+    }
+
+    Ok(values)
 }
 
 unsafe fn lookup_deleted_sentinel() -> Result<*mut ffi::PyObject, ()> {
@@ -465,7 +594,7 @@ pub unsafe fn build_module_runtime_context_for_module(
 }
 
 unsafe fn make_clif_function_data(
-    _callable: *mut ffi::PyObject,
+    callable: *mut ffi::PyObject,
     function_id: FunctionId,
     module_runtime: jit::ModuleRuntimeContext,
 ) -> Result<*mut c_void, ()> {
@@ -491,9 +620,16 @@ unsafe fn make_clif_function_data(
         }
         return Err(());
     };
+    let runtime_data_layout = jit::FunctionRuntimeDataLayout::from_function(&blockpy_function);
+    let runtime_object_values =
+        unsafe { collect_function_runtime_objects(callable, &runtime_data_layout)? };
+    let mut runtime_object_owner = FunctionRuntimeObjectBlock::new(runtime_object_values);
+    let runtime_objects = runtime_object_owner.as_mut_ptr();
     let clif_data = Box::new(ClifFunctionData {
+        runtime_objects,
         function: blockpy_function,
         module_runtime,
+        runtime_object_owner,
         compiled_handle: ptr::null_mut(),
         compiled_vectorcall_handle: ptr::null_mut(),
         compiled_vectorcall_entry: None,
@@ -529,6 +665,39 @@ pub unsafe fn registered_clif_function_id(
         return Ok(None);
     }
     Ok(Some(FunctionId::from_packed(packed)))
+}
+
+pub unsafe fn registered_clif_direct_code_ptr(
+    function: *mut ffi::PyObject,
+) -> Result<*mut c_void, ()> {
+    unsafe { compile_clif_vectorcall(function)? };
+    let data = unsafe { clif_vectorcall_data(function)? };
+    crate::jit::compiled_direct_code_ptr(data.compiled_handle).map_err(|err| {
+        if let Ok(msg) = CString::new(err) {
+            unsafe { ffi::PyErr_SetString(ffi::PyExc_RuntimeError, msg.as_ptr()) };
+        } else {
+            unsafe {
+                ffi::PyErr_SetString(
+                    ffi::PyExc_RuntimeError,
+                    b"missing CLIF direct entry\0".as_ptr() as *const i8,
+                )
+            };
+        }
+    })
+}
+
+pub unsafe fn registered_clif_vmctx_ptr(function: *mut ffi::PyObject) -> Result<*mut c_void, ()> {
+    unsafe { compile_clif_vectorcall(function)? };
+    let data = unsafe { clif_vectorcall_data(function)? };
+    Ok(ptr::addr_of!(data.module_runtime.vmctx) as *mut c_void)
+}
+
+pub unsafe fn registered_clif_runtime_objects_ptr(
+    function: *mut ffi::PyObject,
+) -> Result<*mut c_void, ()> {
+    unsafe { compile_clif_vectorcall(function)? };
+    let data = unsafe { clif_vectorcall_data(function)? };
+    Ok(data.runtime_objects_ptr())
 }
 
 pub unsafe fn registered_clif_type_function_id(
@@ -1135,6 +1304,7 @@ unsafe fn ensure_clif_vectorcall_compiled(
         let (handle, entry) = match jit::compile_cranelift_vectorcall_direct_trampoline(
             bind_direct_args_from_vectorcall,
             data as *mut ClifFunctionData as *mut c_void,
+            data.runtime_objects_ptr(),
             ptr::addr_of!(data.module_runtime.vmctx) as *mut c_void,
             data.compiled_handle,
             &vectorcall_symbol,
@@ -1500,18 +1670,6 @@ unsafe extern "C" fn lazy_vectorcall(
             );
             return ptr::null_mut();
         };
-        if ffi::Py_EnterRecursiveCall(b" while calling a Python object\0".as_ptr() as *const i8)
-            != 0
-        {
-            return ptr::null_mut();
-        }
-        struct RecursiveCallGuard;
-        impl Drop for RecursiveCallGuard {
-            fn drop(&mut self) {
-                unsafe { ffi::Py_LeaveRecursiveCall() };
-            }
-        }
-        let _recursive_call_guard = RecursiveCallGuard;
         unsafe {
             let runtime = std::ptr::addr_of_mut!(data.module_runtime);
             with_active_module_runtime_context(runtime, || {
@@ -1560,6 +1718,7 @@ pub unsafe fn register_clif_vectorcall(
         PyFunction_SetVectorcall(func, lazy_vectorcall);
         return Ok(());
     }
+    let _watcher = function_owner_type_registry()?;
 
     let data_ptr = make_clif_function_data(function, function_id, module_runtime)?;
     if PyFunction_SetSoacMetadata(

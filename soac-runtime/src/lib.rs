@@ -78,6 +78,11 @@ struct PyMethodObject {
     vectorcall: *mut c_void,
 }
 
+#[repr(C)]
+struct ClifFunctionData {
+    runtime_objects: *mut c_void,
+}
+
 unsafe extern "C" {
     fn _Py_Dealloc(obj: *mut PyObject);
     static mut PyFunction_Type: c_void;
@@ -172,7 +177,8 @@ pub unsafe extern "C" fn soac_runtime_callee_function_id(callable: *mut c_void) 
     if callable.is_null() {
         return i64::MIN;
     }
-    let function = if unsafe { (*callable).ob_type } == (&raw mut PyFunction_Type).cast::<c_void>() {
+    let function = if unsafe { (*callable).ob_type } == (&raw mut PyFunction_Type).cast::<c_void>()
+    {
         callable
     } else if unsafe { (*callable).ob_type } == (&raw mut PyMethod_Type).cast::<c_void>() {
         unsafe { (*(callable as *mut PyMethodObject)).im_func }
@@ -187,4 +193,28 @@ pub unsafe extern "C" fn soac_runtime_callee_function_id(callable: *mut c_void) 
         return 0;
     }
     packed as i64
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soac_runtime_function_data_block(callable: *mut c_void) -> *mut c_void {
+    let callable = callable.cast::<PyObject>();
+    if callable.is_null() {
+        return core::ptr::null_mut();
+    }
+    let function = if unsafe { (*callable).ob_type } == (&raw mut PyFunction_Type).cast::<c_void>()
+    {
+        callable
+    } else if unsafe { (*callable).ob_type } == (&raw mut PyMethod_Type).cast::<c_void>() {
+        unsafe { (*(callable as *mut PyMethodObject)).im_func }
+    } else {
+        return core::ptr::null_mut();
+    };
+    if function.is_null() {
+        return core::ptr::null_mut();
+    }
+    let metadata = unsafe { (*(function as *mut PyFunctionObject)).func_soac_metadata };
+    if metadata.is_null() {
+        return core::ptr::null_mut();
+    }
+    unsafe { (*(metadata as *mut ClifFunctionData)).runtime_objects }
 }

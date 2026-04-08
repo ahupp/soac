@@ -890,6 +890,7 @@ mod tests {
                 test_bind_direct_args_stub,
                 1usize as ObjPtr,
                 1usize as ObjPtr,
+                1usize as ObjPtr,
                 compiled_handle,
                 "jit_runtime_support_vectorcall_smoke",
             );
@@ -1198,7 +1199,7 @@ def f(x):
             constants.module_constants,
         );
         assert!(
-            rendered.contains("; block jit_entry(vmctx: i64, callable: i64)"),
+            rendered.contains("; block jit_entry(vmctx: i64, function_data: i64)"),
             "rendered CLIF should include named typed params on surviving post-opt block headers:\n{rendered}"
         );
         assert!(
@@ -1601,9 +1602,10 @@ def f(x):
         set_stack_slots(&mut function, &["x"]);
         let rendered = render_test_jit_function(&function, &blocks);
         assert!(
-            rendered.contains("call dp_jit_function_closure_cell")
+            !rendered.contains("call dp_jit_function_closure_cell")
+                && rendered.contains("load.i64")
                 && rendered.contains("call dp_jit_load_cell"),
-            "closure located names should load through callable-rooted closure cells:\n{rendered}"
+            "closure located names should load through the function-data object block:\n{rendered}"
         );
     }
 
@@ -1620,8 +1622,9 @@ def f(x):
         set_stack_slots(&mut function, &["x"]);
         let rendered = render_test_jit_function(&function, &blocks);
         assert!(
-            rendered.contains("call dp_jit_function_closure_cell"),
-            "cell_ref intrinsic should use callable-rooted closure cells:\n{rendered}"
+            !rendered.contains("call dp_jit_function_closure_cell")
+                && rendered.contains("load.i64"),
+            "cell_ref intrinsic should use the function-data object block:\n{rendered}"
         );
         assert!(
             !rendered.contains("call dp_jit_load_cell"),
@@ -1664,8 +1667,9 @@ def f(x):
         set_stack_slots(&mut function, &["_dp_classcell"]);
         let rendered = render_test_jit_function(&function, &blocks);
         assert!(
-            rendered.contains("call dp_jit_function_closure_cell"),
-            "captured cell sources should resolve through the callable closure:\n{rendered}"
+            !rendered.contains("call dp_jit_function_closure_cell")
+                && rendered.contains("load.i64"),
+            "captured cell sources should resolve through the function-data object block:\n{rendered}"
         );
         assert!(
             !rendered.contains("call dp_jit_load_cell"),
@@ -1741,8 +1745,9 @@ def f(x):
         set_stack_slots(&mut function, &["x", "y"]);
         let rendered = render_test_jit_function(&function, &blocks);
         assert!(
-            rendered.contains("call dp_jit_function_positional_default_obj"),
-            "direct entry lowering should source omitted positional defaults from the callable:\n{rendered}"
+            !rendered.contains("call dp_jit_function_positional_default_obj")
+                && rendered.contains("load.i64"),
+            "direct entry lowering should source omitted positional defaults from the function-data object block:\n{rendered}"
         );
     }
 
@@ -1761,8 +1766,9 @@ def f(x):
         set_stack_slots(&mut function, &["x"]);
         let rendered = render_test_jit_function(&function, &blocks);
         assert!(
-            rendered.contains("call dp_jit_function_kwonly_default_obj"),
-            "direct entry lowering should source omitted kwonly defaults from the callable:\n{rendered}"
+            !rendered.contains("call dp_jit_function_kwonly_default_obj")
+                && rendered.contains("load.i64"),
+            "direct entry lowering should source omitted kwonly defaults from the function-data object block:\n{rendered}"
         );
     }
 

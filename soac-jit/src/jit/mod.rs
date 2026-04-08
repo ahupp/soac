@@ -179,6 +179,10 @@ static DP_JIT_PY_VECTORCALL_IMPORT: ImportSpec = ImportSpec::new(
     ],
     &[SigType::Pointer],
 );
+static DP_JIT_ENTER_RECURSIVE_CALL_IMPORT: ImportSpec =
+    ImportSpec::new("dp_jit_enter_recursive_call", &[], &[SigType::I32]);
+static DP_JIT_LEAVE_RECURSIVE_CALL_IMPORT: ImportSpec =
+    ImportSpec::new("dp_jit_leave_recursive_call", &[], &[]);
 static DP_JIT_PY_CALL_WITH_KW_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_py_call_with_kw",
     &[SigType::Pointer, SigType::Pointer, SigType::Pointer],
@@ -211,19 +215,19 @@ static DP_JIT_LOAD_RUNTIME_OBJ_IMPORT: ImportSpec = ImportSpec::new(
     &[SigType::Pointer],
     &[SigType::Pointer],
 );
-static DP_JIT_FUNCTION_CLOSURE_CELL_IMPORT: ImportSpec = ImportSpec::new(
-    "dp_jit_function_closure_cell",
-    &[SigType::Pointer, SigType::I64],
+static DP_JIT_DIRECT_CODE_PTR_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_direct_code_ptr",
+    &[SigType::Pointer],
     &[SigType::Pointer],
 );
-static DP_JIT_FUNCTION_POSITIONAL_DEFAULT_OBJ_IMPORT: ImportSpec = ImportSpec::new(
-    "dp_jit_function_positional_default_obj",
-    &[SigType::Pointer, SigType::Pointer, SigType::I64],
+static DP_JIT_DIRECT_VMCTX_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_direct_vmctx",
+    &[SigType::Pointer],
     &[SigType::Pointer],
 );
-static DP_JIT_FUNCTION_KWONLY_DEFAULT_OBJ_IMPORT: ImportSpec = ImportSpec::new(
-    "dp_jit_function_kwonly_default_obj",
-    &[SigType::Pointer, SigType::Pointer],
+static DP_JIT_DIRECT_FUNCTION_DATA_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_direct_function_data",
+    &[SigType::Pointer],
     &[SigType::Pointer],
 );
 static DP_JIT_PYOBJECT_GETATTR_IMPORT: ImportSpec = ImportSpec::new(
@@ -688,6 +692,125 @@ fn load_vmctx_obj(
         .load(ptr_ty, ir::MemFlags::trusted(), vmctx_value, offset)
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct FunctionRuntimeDataLayout {
+    positional_default_count: usize,
+    kwonly_default_slots: HashMap<String, usize>,
+    closure_start: usize,
+    closure_len: usize,
+    total_len: usize,
+}
+
+impl FunctionRuntimeDataLayout {
+    pub(crate) fn from_function(function: &BlockPyFunction<CodegenModuleShape>) -> Self {
+        let positional_default_count = function
+            .params
+            .iter_with_default_sources()
+            .filter_map(|(_, source)| match source {
+                Some(ParamDefaultSource::Positional(index)) => Some(index + 1),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        let mut kwonly_default_slots = HashMap::new();
+        for (_, source) in function.params.iter_with_default_sources() {
+            if let Some(ParamDefaultSource::KeywordOnly(name)) = source {
+                let slot = positional_default_count + kwonly_default_slots.len();
+                kwonly_default_slots.insert(name.to_string(), slot);
+            }
+        }
+        let closure_start = positional_default_count + kwonly_default_slots.len();
+        let storage_layout_closure_len = function
+            .storage_layout()
+            .as_ref()
+            .map(|layout| layout.freevars.len())
+            .unwrap_or(0);
+        let closure_len =
+            storage_layout_closure_len.max(max_referenced_function_closure_slot(function));
+        let total_len = closure_start + closure_len;
+        Self {
+            positional_default_count,
+            kwonly_default_slots,
+            closure_start,
+            closure_len,
+            total_len,
+        }
+    }
+
+    pub(crate) fn positional_default_count(&self) -> usize {
+        self.positional_default_count
+    }
+
+    pub(crate) fn positional_default_slot(&self, default_index: usize) -> usize {
+        debug_assert!(default_index < self.positional_default_count);
+        default_index
+    }
+
+    pub(crate) fn kwonly_default_slot(&self, name: &str) -> Option<usize> {
+        self.kwonly_default_slots.get(name).copied()
+    }
+
+    pub(crate) fn kwonly_default_slots(&self) -> impl Iterator<Item = (&str, usize)> {
+        self.kwonly_default_slots
+            .iter()
+            .map(|(name, slot)| (name.as_str(), *slot))
+    }
+
+    pub(crate) fn closure_len(&self) -> usize {
+        self.closure_len
+    }
+
+    pub(crate) fn closure_cell_slot(&self, closure_slot: usize) -> usize {
+        debug_assert!(closure_slot < self.closure_len);
+        self.closure_start + closure_slot
+    }
+
+    pub(crate) fn total_len(&self) -> usize {
+        self.total_len
+    }
+}
+
+fn max_referenced_function_closure_slot(function: &BlockPyFunction<CodegenModuleShape>) -> usize {
+    #[derive(Default)]
+    struct Collector {
+        max_slot_plus_one: usize,
+    }
+
+    impl Collector {
+        fn visit_cell_location(&mut self, location: CellLocation) {
+            match location {
+                CellLocation::Closure(slot) | CellLocation::CapturedSource(slot) => {
+                    self.max_slot_plus_one = self.max_slot_plus_one.max(slot as usize + 1);
+                }
+                CellLocation::Owned(_) => {}
+            }
+        }
+
+        fn visit_name(&mut self, name: &ResolvedName) {
+            if let Some(location) = name.cell_location() {
+                self.visit_cell_location(location);
+            }
+        }
+    }
+
+    impl Visit<InstrCodegen> for Collector {
+        fn visit_instr(&mut self, expr: &InstrCodegen) {
+            match expr {
+                InstrCodegen::Load(op) => self.visit_name(&op.name),
+                InstrCodegen::Store(op) => self.visit_name(&op.name),
+                InstrCodegen::Del(op) => self.visit_name(&op.name),
+                InstrCodegen::CellRef(op) => self.visit_cell_location(op.location),
+                _ => {}
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut collector = Collector::default();
+    collector.visit_fn(function);
+    collector.max_slot_plus_one
+}
+
 struct JitEmitConsts {
     step_null_block: ir::Block,
     step_null_args: Vec<ir::Value>,
@@ -695,7 +818,7 @@ struct JitEmitConsts {
     i64_ty: ir::Type,
     i32_ty: ir::Type,
     vmctx_value: ir::Value,
-    callable_value: ir::Value,
+    function_data_value: ir::Value,
     none_const: ir::Value,
     true_const: ir::Value,
     false_const: ir::Value,
@@ -718,6 +841,7 @@ struct JitEmitCtx<'mc> {
     module_constant_ptrs: &'mc [*mut ffi::PyObject],
     counter_ptrs: &'mc [*mut u64],
     storage_layout: Option<StorageLayout>,
+    function_runtime_data_layout: &'mc FunctionRuntimeDataLayout,
     incref_ref: ir::FuncRef,
     decref_ref: ir::FuncRef,
     py_call_positional_three_ref: ir::FuncRef,
@@ -727,7 +851,11 @@ struct JitEmitCtx<'mc> {
     consts: JitEmitConsts,
     load_global_obj_ref: ir::FuncRef,
     load_runtime_obj_ref: ir::FuncRef,
-    function_closure_cell_ref: ir::FuncRef,
+    direct_code_ptr_ref: ir::FuncRef,
+    direct_vmctx_ref: ir::FuncRef,
+    direct_function_data_ref: ir::FuncRef,
+    enter_recursive_ref: ir::FuncRef,
+    leave_recursive_ref: ir::FuncRef,
     pyobject_getattr_ref: ir::FuncRef,
     pyobject_setattr_ref: ir::FuncRef,
     pyobject_getitem_ref: ir::FuncRef,
@@ -1319,7 +1447,6 @@ fn emit_raw_cell_object_for_location(
     ctx: &JitEmitCtx<'_>,
 ) -> ir::Value {
     let ptr_ty = ctx.consts.ptr_ty;
-    let i64_ty = ctx.consts.i64_ty;
     let null_ptr = fb.ins().iconst(ptr_ty, 0);
 
     match location {
@@ -1364,12 +1491,15 @@ fn emit_raw_cell_object_for_location(
             );
         }
         CellLocation::Closure(slot) | CellLocation::CapturedSource(slot) => {
-            let slot_value = fb.ins().iconst(i64_ty, slot as i64);
-            let raw_cell_inst = fb.ins().call(
-                ctx.function_closure_cell_ref,
-                &[ctx.consts.callable_value, slot_value],
+            let data_slot = ctx
+                .function_runtime_data_layout
+                .closure_cell_slot(slot as usize);
+            let raw_cell_value = emit_function_data_slot_borrowed(
+                fb,
+                ctx.consts.function_data_value,
+                data_slot,
+                ptr_ty,
             );
-            let raw_cell_value = fb.inst_results(raw_cell_inst)[0];
             let raw_cell_is_null =
                 fb.ins()
                     .icmp(ir::condcodes::IntCC::Equal, raw_cell_value, null_ptr);
@@ -1383,9 +1513,54 @@ fn emit_raw_cell_object_for_location(
                 &[ir::BlockArg::Value(raw_cell_value)],
             );
             fb.switch_to_block(raw_cell_ok_block);
-            fb.block_params(raw_cell_ok_block)[0]
+            let raw_cell_value = fb.block_params(raw_cell_ok_block)[0];
+            fb.ins().call(ctx.incref_ref, &[raw_cell_value]);
+            raw_cell_value
         }
     }
+}
+
+fn emit_function_data_slot_borrowed(
+    fb: &mut FunctionBuilder<'_>,
+    function_data: ir::Value,
+    slot: usize,
+    ptr_ty: ir::Type,
+) -> ir::Value {
+    let offset = slot
+        .checked_mul(std::mem::size_of::<usize>())
+        .and_then(|offset| i32::try_from(offset).ok())
+        .expect("function runtime object slot offset should fit in i32");
+    fb.ins()
+        .load(ptr_ty, ir::MemFlags::trusted(), function_data, offset)
+}
+
+fn emit_function_data_slot_owned_or_null(
+    fb: &mut FunctionBuilder<'_>,
+    function_data: ir::Value,
+    slot: usize,
+    ptr_ty: ir::Type,
+    incref_ref: ir::FuncRef,
+) -> ir::Value {
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let borrowed = emit_function_data_slot_borrowed(fb, function_data, slot, ptr_ty);
+    let is_null = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, borrowed, null_ptr);
+    let null_block = fb.create_block();
+    let owned_block = fb.create_block();
+    let done_block = fb.create_block();
+    fb.append_block_param(done_block, ptr_ty);
+    fb.ins().brif(is_null, null_block, &[], owned_block, &[]);
+
+    fb.switch_to_block(null_block);
+    fb.ins().jump(done_block, &[ir::BlockArg::Value(null_ptr)]);
+
+    fb.switch_to_block(owned_block);
+    fb.ins().call(incref_ref, &[borrowed]);
+    fb.ins().jump(done_block, &[ir::BlockArg::Value(borrowed)]);
+
+    fb.switch_to_block(done_block);
+    fb.block_params(done_block)[0]
 }
 
 fn emit_pack_current_values_tuple(
@@ -2360,18 +2535,60 @@ fn emit_direct_call_resolved_raw_with_arg_values(
     arg_values: Vec<ir::Value>,
     arg_borrowed: Vec<bool>,
     target_function: &BlockPyFunction<CodegenModuleShape>,
-    target_code_ptr: ObjPtr,
+    _target_code_ptr: ObjPtr,
     ctx: &JitEmitCtx<'_>,
     jit_module: &mut JITModule,
 ) -> ir::Value {
     debug_assert_eq!(arg_values.len(), target_function.params.len());
     let ptr_ty = ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+
+    let callee_ptr_inst = fb.ins().call(ctx.direct_code_ptr_ref, &[callable]);
+    let callee_ptr = fb.inst_results(callee_ptr_inst)[0];
+    let callee_ptr_is_null = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, callee_ptr, null_ptr);
+    let callee_ptr_ok_block = fb.create_block();
+    fb.ins().brif(
+        callee_ptr_is_null,
+        ctx.consts.step_null_block,
+        &step_null_block_args(ctx),
+        callee_ptr_ok_block,
+        &[],
+    );
+    fb.switch_to_block(callee_ptr_ok_block);
+
+    let function_data_inst = fb.ins().call(ctx.direct_function_data_ref, &[callable]);
+    let function_data = fb.inst_results(function_data_inst)[0];
+    let function_data_is_null = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, function_data, null_ptr);
+    let function_data_ok_block = fb.create_block();
+    fb.ins().brif(
+        function_data_is_null,
+        ctx.consts.step_null_block,
+        &step_null_block_args(ctx),
+        function_data_ok_block,
+        &[],
+    );
+    fb.switch_to_block(function_data_ok_block);
+    let callee_vmctx_inst = fb.ins().call(ctx.direct_vmctx_ref, &[callable]);
+    let callee_vmctx = fb.inst_results(callee_vmctx_inst)[0];
+    let callee_vmctx_is_null = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, callee_vmctx, null_ptr);
+    let callee_vmctx_ok_block = fb.create_block();
+    fb.ins().brif(
+        callee_vmctx_is_null,
+        ctx.consts.step_null_block,
+        &step_null_block_args(ctx),
+        callee_vmctx_ok_block,
+        &[],
+    );
+    fb.switch_to_block(callee_vmctx_ok_block);
 
     let mut direct_sig = jit_module.make_signature();
-    direct_sig.params.push(ir::AbiParam::special(
-        ptr_ty,
-        ir::ArgumentPurpose::VMContext,
-    ));
+    direct_sig.params.push(ir::AbiParam::new(ptr_ty));
     direct_sig.params.push(ir::AbiParam::new(ptr_ty));
     for _ in target_function.params.iter() {
         direct_sig.params.push(ir::AbiParam::new(ptr_ty));
@@ -2379,16 +2596,30 @@ fn emit_direct_call_resolved_raw_with_arg_values(
     direct_sig.returns.push(ir::AbiParam::new(ptr_ty));
     let direct_sig_ref = fb.import_signature(direct_sig);
 
-    let mut call_args = Vec::with_capacity(arg_values.len() + 2);
-    call_args.push(ctx.consts.vmctx_value);
-    call_args.push(callable);
-    call_args.extend(arg_values.iter().copied());
+    let enter_inst = fb.ins().call(ctx.enter_recursive_ref, &[]);
+    let enter_status = fb.inst_results(enter_inst)[0];
+    let enter_failed = fb
+        .ins()
+        .icmp_imm(ir::condcodes::IntCC::NotEqual, enter_status, 0);
+    let entered_block = fb.create_block();
+    fb.ins().brif(
+        enter_failed,
+        ctx.consts.step_null_block,
+        &step_null_block_args(ctx),
+        entered_block,
+        &[],
+    );
+    fb.switch_to_block(entered_block);
 
-    let callee_ptr = fb.ins().iconst(ptr_ty, target_code_ptr as i64);
+    let mut call_args = Vec::with_capacity(arg_values.len() + 2);
+    call_args.push(callee_vmctx);
+    call_args.push(function_data);
+    call_args.extend(arg_values.iter().copied());
     let call_inst = fb
         .ins()
         .call_indirect(direct_sig_ref, callee_ptr, &call_args);
     let call_value = fb.inst_results(call_inst)[0];
+    fb.ins().call(ctx.leave_recursive_ref, &[]);
 
     for (value, borrowed_arg) in arg_values.into_iter().zip(arg_borrowed.into_iter()) {
         if !borrowed_arg {
@@ -4950,6 +5181,7 @@ impl RuntimeSupportInliner {
                 SOAC_RUNTIME_INCREF_SYMBOL
                     | SOAC_RUNTIME_DECREF_SYMBOL
                     | SOAC_RUNTIME_CALLEE_FUNCTION_ID_SYMBOL
+                    | SOAC_RUNTIME_FUNCTION_DATA_BLOCK_SYMBOL
             ) {
                 continue;
             }
@@ -5063,6 +5295,7 @@ pub(crate) const JIT_PYTHON_PERF_SYMBOL_KIND_VECTORCALL: &str = "v";
 pub(crate) const SOAC_RUNTIME_INCREF_SYMBOL: &str = "soac_runtime_incref";
 pub(crate) const SOAC_RUNTIME_DECREF_SYMBOL: &str = "soac_runtime_decref";
 pub(crate) const SOAC_RUNTIME_CALLEE_FUNCTION_ID_SYMBOL: &str = "soac_runtime_callee_function_id";
+pub(crate) const SOAC_RUNTIME_FUNCTION_DATA_BLOCK_SYMBOL: &str = "soac_runtime_function_data_block";
 
 pub(crate) fn jit_python_perf_symbol_name(kind: &str, qualname: &str) -> String {
     format!("py:{kind}:{qualname}")
@@ -5605,6 +5838,7 @@ fn build_cranelift_run_bb_specialized_function(
         }
         None => HashMap::new(),
     };
+    let function_runtime_data_layout = FunctionRuntimeDataLayout::from_function(function);
 
     let mut direct_call_targets = collect_call_direct_targets(function);
     for targets in call_target_specializations.values() {
@@ -5688,7 +5922,7 @@ fn build_cranelift_run_bb_specialized_function(
             "jit_entry",
             vec![
                 "vmctx".into(),
-                "callable".into(),
+                "function_data".into(),
                 "entry_args".into(),
                 "ambient_args".into(),
             ],
@@ -5740,7 +5974,7 @@ fn build_cranelift_run_bb_specialized_function(
         fb.switch_to_block(entry_block);
         let entry_block_params = fb.block_params(entry_block).to_vec();
         let vmctx_value = entry_block_params[0];
-        let callable = entry_block_params[1];
+        let function_data_value = entry_block_params[1];
         let direct_entry_args = entry_block_params[2..].to_vec();
         let mut func_imports = FuncBuildImports::new(&mut module_imports);
         let incref_ref = if let Some(incref_func_id) = counted_refcount_helpers.incref_func_id {
@@ -5764,6 +5998,16 @@ fn build_cranelift_run_bb_specialized_function(
             func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_PY_VECTORCALL_IMPORT);
         let py_call_with_kw_ref =
             func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_PY_CALL_WITH_KW_IMPORT);
+        let direct_code_ptr_ref =
+            func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_DIRECT_CODE_PTR_IMPORT);
+        let direct_vmctx_ref =
+            func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_DIRECT_VMCTX_IMPORT);
+        let direct_function_data_ref =
+            func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_DIRECT_FUNCTION_DATA_IMPORT);
+        let enter_recursive_ref =
+            func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_ENTER_RECURSIVE_CALL_IMPORT);
+        let leave_recursive_ref =
+            func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_LEAVE_RECURSIVE_CALL_IMPORT);
         let pytype_generic_alloc_ref = func_imports.get_or_panic(
             jit_module,
             &mut fb.func,
@@ -5787,21 +6031,6 @@ fn build_cranelift_run_bb_specialized_function(
             func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_IS_TRUE_IMPORT);
         let raise_exc_ref =
             func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_RAISE_FROM_EXC_IMPORT);
-        let function_closure_cell_ref = func_imports.get_or_panic(
-            jit_module,
-            &mut fb.func,
-            &DP_JIT_FUNCTION_CLOSURE_CELL_IMPORT,
-        );
-        let function_positional_default_ref = func_imports.get_or_panic(
-            jit_module,
-            &mut fb.func,
-            &DP_JIT_FUNCTION_POSITIONAL_DEFAULT_OBJ_IMPORT,
-        );
-        let function_kwonly_default_ref = func_imports.get_or_panic(
-            jit_module,
-            &mut fb.func,
-            &DP_JIT_FUNCTION_KWONLY_DEFAULT_OBJ_IMPORT,
-        );
         let pyobject_getattr_ref =
             func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_PYOBJECT_GETATTR_IMPORT);
         let pyobject_setattr_ref =
@@ -5864,19 +6093,15 @@ fn build_cranelift_run_bb_specialized_function(
                         .brif(arg_is_null, use_default_block, &[], use_arg_block, &[]);
 
                     fb.switch_to_block(use_default_block);
-                    let name_obj = emit_owned_module_constant_from_parts(
+                    let default_slot =
+                        function_runtime_data_layout.positional_default_slot(default_index);
+                    let default_value = emit_function_data_slot_owned_or_null(
                         &mut fb,
-                        module_constants.require_unicode_constant_id(param.name.as_str()),
-                        module_constant_ptrs,
+                        function_data_value,
+                        default_slot,
                         ptr_ty,
+                        incref_ref,
                     );
-                    let default_index_val = fb.ins().iconst(i64_ty, default_index as i64);
-                    let default_inst = fb.ins().call(
-                        function_positional_default_ref,
-                        &[callable, name_obj, default_index_val],
-                    );
-                    fb.ins().call(decref_ref, &[name_obj]);
-                    let default_value = fb.inst_results(default_inst)[0];
                     let default_is_null =
                         fb.ins()
                             .icmp(ir::condcodes::IntCC::Equal, default_value, null_ptr);
@@ -5928,17 +6153,16 @@ fn build_cranelift_run_bb_specialized_function(
                         .brif(arg_is_null, use_default_block, &[], use_arg_block, &[]);
 
                     fb.switch_to_block(use_default_block);
-                    let name_obj = emit_owned_module_constant_from_parts(
+                    let default_slot = function_runtime_data_layout
+                        .kwonly_default_slot(default_name)
+                        .expect("kwonly default param should have a runtime-data slot");
+                    let default_value = emit_function_data_slot_owned_or_null(
                         &mut fb,
-                        module_constants.require_unicode_constant_id(default_name),
-                        module_constant_ptrs,
+                        function_data_value,
+                        default_slot,
                         ptr_ty,
+                        incref_ref,
                     );
-                    let default_inst = fb
-                        .ins()
-                        .call(function_kwonly_default_ref, &[callable, name_obj]);
-                    fb.ins().call(decref_ref, &[name_obj]);
-                    let default_value = fb.inst_results(default_inst)[0];
                     let default_is_null =
                         fb.ins()
                             .icmp(ir::condcodes::IntCC::Equal, default_value, null_ptr);
@@ -6061,6 +6285,7 @@ fn build_cranelift_run_bb_specialized_function(
                 module_constant_ptrs,
                 counter_ptrs,
                 storage_layout: function.storage_layout().clone(),
+                function_runtime_data_layout: &function_runtime_data_layout,
                 incref_ref,
                 decref_ref,
                 py_call_positional_three_ref,
@@ -6074,7 +6299,7 @@ fn build_cranelift_run_bb_specialized_function(
                     i64_ty,
                     i32_ty: ir::types::I32,
                     vmctx_value,
-                    callable_value: callable,
+                    function_data_value,
                     none_const,
                     true_const,
                     false_const,
@@ -6091,7 +6316,11 @@ fn build_cranelift_run_bb_specialized_function(
                 },
                 load_global_obj_ref,
                 load_runtime_obj_ref,
-                function_closure_cell_ref,
+                direct_code_ptr_ref,
+                direct_vmctx_ref,
+                direct_function_data_ref,
+                enter_recursive_ref,
+                leave_recursive_ref,
                 pyobject_getattr_ref,
                 pyobject_setattr_ref,
                 pyobject_getitem_ref,
@@ -6453,6 +6682,7 @@ pub unsafe fn compile_cranelift_vectorcall_direct_trampoline(
         i64,
     ) -> i32,
     data_ptr: ObjPtr,
+    function_data_ptr: ObjPtr,
     vmctx_ptr: ObjPtr,
     compiled_handle: ObjPtr,
     symbol_name: &str,
@@ -6462,6 +6692,9 @@ pub unsafe fn compile_cranelift_vectorcall_direct_trampoline(
     }
     if vmctx_ptr.is_null() {
         return Err("invalid null vectorcall vmctx pointer".to_string());
+    }
+    if function_data_ptr.is_null() {
+        return Err("invalid null vectorcall function data pointer".to_string());
     }
     let (direct_code_ptr, param_count) = compiled_direct_runner_info(compiled_handle)?;
 
@@ -6517,11 +6750,37 @@ pub unsafe fn compile_cranelift_vectorcall_direct_trampoline(
             &mut fb.func,
             &DP_JIT_VECTORCALL_BIND_DIRECT_ARGS_IMPORT,
         );
+        let enter_recursive_ref = func_imports.get_or_panic(
+            &mut jit_module,
+            &mut fb.func,
+            &DP_JIT_ENTER_RECURSIVE_CALL_IMPORT,
+        );
+        let leave_recursive_ref = func_imports.get_or_panic(
+            &mut jit_module,
+            &mut fb.func,
+            &DP_JIT_LEAVE_RECURSIVE_CALL_IMPORT,
+        );
         let decref_ref =
             func_imports.get_or_panic(&mut jit_module, &mut fb.func, &DP_JIT_DECREF_IMPORT);
 
-        let data_const = fb.ins().iconst(ptr_ty, data_ptr as i64);
         let null_ptr = fb.ins().iconst(ptr_ty, 0);
+        let enter_inst = fb.ins().call(enter_recursive_ref, &[]);
+        let enter_status = fb.inst_results(enter_inst)[0];
+        let enter_failed = fb
+            .ins()
+            .icmp_imm(ir::condcodes::IntCC::NotEqual, enter_status, 0);
+        let recursion_fail_block = fb.create_block();
+        let bind_block = fb.create_block();
+        fb.ins()
+            .brif(enter_failed, recursion_fail_block, &[], bind_block, &[]);
+        fb.seal_block(recursion_fail_block);
+        fb.seal_block(bind_block);
+
+        fb.switch_to_block(recursion_fail_block);
+        fb.ins().return_(&[null_ptr]);
+
+        fb.switch_to_block(bind_block);
+        let data_const = fb.ins().iconst(ptr_ty, data_ptr as i64);
         let bound_args_slot = if param_count == 0 {
             None
         } else {
@@ -6558,6 +6817,7 @@ pub unsafe fn compile_cranelift_vectorcall_direct_trampoline(
         fb.seal_block(ok_block);
 
         fb.switch_to_block(fail_block);
+        fb.ins().call(leave_recursive_ref, &[]);
         fb.ins().return_(&[null_ptr]);
 
         fb.switch_to_block(ok_block);
@@ -6565,7 +6825,8 @@ pub unsafe fn compile_cranelift_vectorcall_direct_trampoline(
         let mut call_args = Vec::with_capacity(param_count + 2);
         let vmctx_const = fb.ins().iconst(ptr_ty, vmctx_ptr as i64);
         call_args.push(vmctx_const);
-        call_args.push(callable_val);
+        let function_data_const = fb.ins().iconst(ptr_ty, function_data_ptr as i64);
+        call_args.push(function_data_const);
         let mut owned_args = Vec::with_capacity(param_count);
         if let Some(slot) = bound_args_slot {
             for index in 0..param_count {
@@ -6584,6 +6845,7 @@ pub unsafe fn compile_cranelift_vectorcall_direct_trampoline(
         for value in owned_args {
             fb.ins().call(decref_ref, &[value]);
         }
+        fb.ins().call(leave_recursive_ref, &[]);
         fb.ins().return_(&[result]);
         fb.seal_all_blocks();
         fb.finalize();
