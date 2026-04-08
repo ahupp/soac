@@ -68,6 +68,75 @@ For each optimization attempt:
    before/after, relative change, and the reason a candidate was
    abandoned.
 
+8. For an abandoned candidate, also record the transferable lesson in
+   this file before picking the next candidate. Include why the original
+   hypothesis was incomplete: for example, the hotspot was split across
+   several parents, the generated fast path expanded too much CLIF, the
+   optimized helper was below the benchmark's noise floor, or the change
+   optimized the consumer when the allocation / dispatch cost came from
+   the producer.
+
+
+## Lessons From Abandoned Attempts
+
+### Exact-list item access after helper specialization
+
+After the exact-list getitem/setitem helper optimization, the remaining
+`exact_list_index` cost looked tempting but was already small and split
+between operations. The specialized pystone perf sample attributed about
+`2.28%` to `exact_list_index`, with roughly `1.00%` under
+`dp_jit_pyobject_getitem` and `0.86%` under `dp_jit_pyobject_setitem`.
+
+An attempted generated getitem-only fast path was benchmark-negative:
+median specialized throughput changed `319499 -> 314717 loops/s`
+(`-1.50%`). The rendered fast path replaced the helper call on the
+getitem hit path, but added exact-type guards, compact-long decoding,
+negative-index normalization, bounds checks, direct item loads, incref /
+decref work, hit/result/fallback merge blocks, and still kept the
+generic helper on the miss path. That CLIF/body expansion outweighed the
+small part of the helper that belonged to getitem.
+
+A direct `ob_type` check inside the helper was inconclusive: median
+specialized throughput changed `319499 -> 320632 loops/s` (`+0.35%`),
+which is in the observed run-to-run noise for this benchmark.
+
+Lesson: before inlining a helper, separate self time from each parent
+operation and estimate the part that the candidate actually removes.
+For list subscripts, prefer a broader plan that covers both load and
+store or removes allocation/refcount traffic around the subscript.
+Treat one or two type-check instructions inside an already-small helper
+as below the landing threshold unless repeated benchmarks show a clear
+win.
+
+### Truth tests after rich comparisons
+
+The profile showed `dp_jit_is_true` at about `1.43%` self, but
+`PyObject_IsTrue` itself was only about `0.62%` self. For pystone's
+branch conditions, a larger cost is the producer side: rich comparisons
+allocate / return the `True` or `False` singleton as an owned
+`PyObject *`; then control-flow lowering calls `dp_jit_is_true` and
+decrefs that bool.
+
+A generated singleton-truth fast path before `dp_jit_is_true` was
+benchmark-negative: median specialized throughput changed
+`319499 -> 307591 loops/s` (`-3.73%`). In rendered CLIF, each optimized
+truth test grew into pointer comparisons against `True`, `False`, and
+`None`, several extra `brif`s, dedicated true/false/fallback blocks, and
+a result merge; the fallback `dp_jit_is_true` call remained present.
+
+A singleton fast path inside `dp_jit_is_true` was also negative: median
+specialized throughput changed `319499 -> 304941 loops/s` (`-4.56%`).
+It only targeted the already-small consumer helper and did not remove
+the `PyObject_RichCompare` call, bool-object result, decref, or the
+helper call frame itself.
+
+Lesson: optimize branch-producing comparisons as comparisons, not as
+owned-bool objects followed by generic truth. A better hypothesis would
+lower branch-context exact-int, identity, or Unicode/string comparisons
+to an `i32` / CLIF condition directly, or call an appropriate
+rich-compare-bool style helper, while preserving the owned-object
+compare result when Python code actually consumes that bool.
+
 
 ## Candidate Backlog
 
