@@ -23,7 +23,39 @@ Use the specialized pass, not the profiling pass, as the transformed
 benchmark headline. The profile counter dump is written to
 `logs/last_benchmark_counters/profile.bin`.
 
-2. **Record perf using the exact benchmark counter dump**
+2. **Sanity-check that expected specializations are still reached**
+
+Run the verify-mode pass before perf analysis. It applies
+`profile.bin`, records the specialization-input counters again, and writes
+`verify.bin`.
+
+```bash
+set -o pipefail
+BENCHMARK_CONSTANT_CLOCKS=0 just benchmark-verify 100000 \
+  2>&1 | tee logs/benchmark_specialization_verify.log
+
+cargo run -p soac-inspector --bin inspect_counters -- \
+  --specializations logs/last_benchmark_counters/profile.bin \
+  > logs/profile_call_target_specializations.txt
+
+cargo run -p soac-inspector --bin inspect_counters -- \
+  --specializations logs/last_benchmark_counters/verify.bin \
+  > logs/verify_call_target_specializations.txt
+```
+
+Compare profile and verify at the **site / target level**, not by raw counter
+counts or dump size. Expected hot call/operator sites from the profile should
+either appear in the verify dump or have an understood reason for disappearing
+such as a deliberately bypassed operation or a too-small verify loop count.
+
+Do this before trusting perf conclusions:
+
+- Check that `logs/last_benchmark_counters/verify.bin` exists and is non-empty.
+- Check that expected hot call targets are present in the verify specialization summary.
+- Render specialized CLIF and grep for the expected fast-path shape.
+- Investigate missing expected sites as “specialization may not be running” before ranking deeper codegen issues.
+
+3. **Record perf using the exact benchmark counter dump**
 
 ```bash
 DIET_PYTHON_COUNTERS_DIR="$PWD/logs/last_benchmark_counters" \
@@ -38,7 +70,7 @@ Prefer the paired `just run-and-view-speedscope` / `just
 perf-pystone-jit-warm` recipes over ad-hoc `perf` commands, because they set up
 the warmed / stopped process protocol and write the standard report set.
 
-3. **Read the perf artifacts**
+4. **Read the perf artifacts**
 
 For prefix `logs/pystone_jit_perf_specialized_from_benchmark`, inspect:
 
@@ -54,7 +86,7 @@ dictionary lookup from global helpers, generic attr access, exact-long helpers,
 metadata lookup for direct calls, PyNumber fallbacks, rich-compare fallbacks,
 and refcount / deallocation clusters.
 
-4. **Dump and translate the specializations**
+5. **Dump and translate the specializations**
 
 ```bash
 cargo run -p soac-inspector --bin inspect_counters -- \
@@ -73,7 +105,7 @@ specialized plan for a function that should be hot, translate the
 specialization env vars from benchmark ids to the function ids reported by the
 renderer / counter dump before rendering.
 
-5. **Render specialized CLIF for hot functions**
+6. **Render specialized CLIF for hot functions**
 
 ```bash
 cargo run -p soac-inspector --bin render_jit_clif -- \
@@ -85,7 +117,7 @@ Start with functions that appear as `[JIT] py:d:<name>` in perf, then add callee
 whose helpers dominate the callgraph. For pystone this is usually `Proc0`,
 `Proc1`, `Proc8`, `Func2`, and the procs/functions reached from `Proc0`.
 
-6. **Correlate perf to CLIF and source**
+7. **Correlate perf to CLIF and source**
 
 Use `rg` over the rendered CLIF for the helper or import names seen in perf.
 Count helper calls when the scale matters:
