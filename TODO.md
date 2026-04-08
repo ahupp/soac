@@ -2,6 +2,7 @@
 ## Codex TODO Intake
 
  * Complete migration of ast-to-instr pass
+ * If caching BlockPy before codegen, recover FunctionNameGen.next_tmp_id from generated `_dp_*` names.
 
 
 ## Perf-to-investigate
@@ -62,4 +63,3 @@
 - Compute `ClosureLayout` in `name_binding`, and keep all closure data semantic before that.
 - Add a pass for specific storage decisions, closure slot offsets, and stack offsets.
 - Use Ruff for scope analysis and see if it can be computed once and preserved through transform layers.
-
