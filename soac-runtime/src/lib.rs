@@ -266,9 +266,29 @@ unsafe fn indexed_value(values: *mut RawPyDictIndexedValues, index: isize) -> *m
 }
 
 #[inline(always)]
+unsafe fn set_indexed_value(
+    values: *mut RawPyDictIndexedValues,
+    index: isize,
+    value: *mut RawPyObject,
+) {
+    let values_ptr = unsafe { (&raw mut (*values).values).cast::<*mut RawPyObject>() };
+    unsafe { *values_ptr.offset(index) = value };
+}
+
+#[inline(always)]
 unsafe fn split_value(values: *mut RawPyDictSplitValues, index: isize) -> *mut RawPyObject {
     let values_ptr = unsafe { (&raw const (*values).values).cast::<*mut RawPyObject>() };
     unsafe { *values_ptr.offset(index) }
+}
+
+#[inline(always)]
+unsafe fn set_split_value(
+    values: *mut RawPyDictSplitValues,
+    index: isize,
+    value: *mut RawPyObject,
+) {
+    let values_ptr = unsafe { (&raw mut (*values).values).cast::<*mut RawPyObject>() };
+    unsafe { *values_ptr.offset(index) = value };
 }
 
 macro_rules! load_indexed_dict_value_owned {
@@ -372,12 +392,22 @@ pub unsafe extern "C" fn soac_runtime_store_global_indexed(
     if unsafe { dict_guarded_index(dict_obj, index) } < 0 {
         return core::ptr::null_mut();
     }
-    let rc = unsafe { _PyDict_SetIndexedItem(dict, index, value) };
-    if rc != 0 {
+    let values = unsafe { (*dict_obj).ma_values.cast::<RawPyDictIndexedValues>() };
+    let old_value = unsafe { indexed_value(values, index) };
+    if old_value.is_null()
+        || old_value.cast::<c_void>() == (&raw mut _PyDict_IndexedValueTombstone)
+    {
         return core::ptr::null_mut();
     }
-    unsafe { incref_impl(value.cast::<RawPyObject>()) };
-    value
+
+    // Unsound fast store: only valid for overwrite of an existing profiled slot.
+    // This intentionally skips dict watchers, insertion order, and version updates.
+    let value = value.cast::<RawPyObject>();
+    unsafe { incref_impl(value) };
+    unsafe { set_indexed_value(values, index, value) };
+    unsafe { decref_impl(old_value) };
+    unsafe { incref_impl(value) };
+    value.cast::<c_void>()
 }
 
 #[unsafe(no_mangle)]
@@ -451,12 +481,29 @@ pub unsafe extern "C" fn soac_runtime_store_field_indexed(
     debug_assert!(!value.is_null());
     debug_assert!(index >= 0);
 
-    let _ = (obj, key, index, value);
+    let dict = unsafe { object_dict(obj) };
+    if dict.is_null() {
+        return core::ptr::null_mut();
+    }
+    let old_value = load_split_dict_value_owned!(dict, key, index).cast::<RawPyObject>();
+    if old_value.is_null() {
+        return core::ptr::null_mut();
+    }
+    unsafe { decref_impl(old_value) };
 
-    // Split-dict stores are more than an indexed pointer write: CPython must update
-    // ma_used, split-values insertion order, dict/object watchers, and promotion state.
-    // Keep stores on the generic attribute path until that bookkeeping is exposed here.
-    core::ptr::null_mut()
+    // Unsound fast store: the guard above proves this is an existing split-dict
+    // value slot. New-key stores, missing values, and promoted dicts use fallback.
+    let values = unsafe { (*dict).ma_values.cast::<RawPyDictSplitValues>() };
+    let value = value.cast::<RawPyObject>();
+    let old_value = unsafe { split_value(values, index) };
+    if old_value.is_null() {
+        return core::ptr::null_mut();
+    }
+    unsafe { incref_impl(value) };
+    unsafe { set_split_value(values, index, value) };
+    unsafe { decref_impl(old_value) };
+    unsafe { incref_impl(value) };
+    value.cast::<c_void>()
 }
 
 #[unsafe(no_mangle)]

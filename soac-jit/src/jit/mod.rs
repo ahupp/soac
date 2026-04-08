@@ -1014,6 +1014,7 @@ struct JitEmitCtx<'mc> {
     field_indexed_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
     field_indexed_fallback_counter_ids: &'mc HashMap<InstrId, CounterId>,
     field_index_specializations: &'mc HashMap<String, Vec<FieldIndexSpecialization>>,
+    unsound_indexed_stores: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -2478,6 +2479,23 @@ fn specialization_mode_from_env() -> Option<String> {
 
 fn specialization_mode_is_profile() -> bool {
     specialization_mode_from_env().as_deref() == Some("profile")
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    env::var(name)
+        .map(|raw| {
+            let trimmed = raw.trim();
+            !(trimmed.is_empty()
+                || trimmed == "0"
+                || trimmed.eq_ignore_ascii_case("false")
+                || trimmed.eq_ignore_ascii_case("no")
+                || trimmed.eq_ignore_ascii_case("off"))
+        })
+        .unwrap_or(false)
+}
+
+fn unsound_indexed_stores_enabled() -> bool {
+    env_flag_enabled("DIET_PYTHON_UNSOUND_INDEXED_STORES")
 }
 
 fn counter_dump_input_path_from_env() -> Option<std::path::PathBuf> {
@@ -6061,6 +6079,7 @@ fn build_cranelift_run_bb_specialized_function(
         Some(shared_state) => load_field_index_specializations(shared_state.module_name.as_str())?,
         None => HashMap::new(),
     };
+    let unsound_indexed_stores = unsound_indexed_stores_enabled();
     let function_runtime_data_layout = FunctionRuntimeDataLayout::from_function(function);
 
     let mut direct_call_targets = collect_call_direct_targets(function);
@@ -6599,6 +6618,7 @@ fn build_cranelift_run_bb_specialized_function(
                 field_indexed_hit_counter_ids: &field_indexed_hit_counter_ids,
                 field_indexed_fallback_counter_ids: &field_indexed_fallback_counter_ids,
                 field_index_specializations: &field_index_specializations,
+                unsound_indexed_stores,
             };
             let block = &function.blocks[index];
             let mut local_names = Vec::new();

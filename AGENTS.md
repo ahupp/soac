@@ -240,6 +240,12 @@ instance's live working commit.
   is metadata collection, not a hot increment counter: module keys are
   copied from lowered module globals, and type keys are collected through
   the vendored CPython split-key watcher.
+- `DIET_PYTHON_UNSOUND_INDEXED_STORES`
+  Enables the raw indexed-store experiment. This is only for
+  perf-investigation runs: guarded existing global/field slots are
+  overwritten directly by `soac-runtime`, skipping CPython watchers,
+  dict versions, insertion-order maintenance, and first-insert
+  bookkeeping.
 
 ### CPython-specific notes
 

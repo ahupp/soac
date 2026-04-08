@@ -522,6 +522,10 @@ fn emit_specialized_setattr<'fb>(
     op: &blockpy_intrinsics::SetAttr<InstrCodegen>,
     state: &mut impl OperationEmitState<'fb, InstrCodegen>,
 ) -> Option<ir::Value> {
+    if !state.ctx().unsound_indexed_stores {
+        return None;
+    }
+
     let instr_id = op.meta().instr_id?;
     let attr_name = codegen_constant_string_value(state.ctx().module, op.attr.as_ref())?;
     let specialization = *state
@@ -1278,6 +1282,7 @@ fn emit_store<'fb>(
             .ctx()
             .global_indexed_hit_counter_ids
             .contains_key(&instr_id)
+        && state.ctx().unsound_indexed_stores
     {
         let ptr_ty = state.ctx().consts.ptr_ty;
         let null_ptr = state.fb().ins().iconst(ptr_ty, 0);

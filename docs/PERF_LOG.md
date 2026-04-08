@@ -108,3 +108,26 @@ changes:
   hot callsites:     22
 
   Specialized baseline is ~32.5% of stock.
+
+# Unsound
+
+`DIET_PYTHON_UNSOUND_INDEXED_STORES=1` is an opt-in performance
+experiment for measuring the cost of semantic global/field stores.
+
+When enabled, specialized JIT code may call `soac-runtime` helpers that
+overwrite an existing guarded storage slot directly:
+
+- indexed module-global store: replace `PyDictIndexedValues.values[index]`
+- split instance-field store: replace `PyDictValues.values[index]`
+
+The helper still returns null and uses the ordinary slow path for
+first-insert stores, missing value slots, global tombstones,
+promoted/combined instance dictionaries, guard misses, type-version
+misses, and split-key index mismatches.
+
+This is not CPython-compatible. The raw store skips dict/object/type
+watchers, dict version updates, insertion-order maintenance,
+`ma_used`/first-insert bookkeeping, and any future CPython bookkeeping
+that lives in the normal store path. Use it only in perf runs that
+explicitly want to estimate the upper bound for guarded indexed stores;
+do not enable it for correctness tests or compatibility claims.

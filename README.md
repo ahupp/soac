@@ -188,6 +188,15 @@ exports are intentionally omitted here.
   provide an explicit advanced override for operator specializations. If
   this is set, it wins over `DIET_PYTHON_COUNTERS_FILE`.
 
+- `DIET_PYTHON_UNSOUND_INDEXED_STORES=1`
+  In `fn unsound_indexed_stores_enabled`, at
+  [soac-jit/src/jit/mod.rs](/home/adam/project/soac-profile/soac-jit/src/jit/mod.rs),
+  enable raw indexed store fast paths for existing indexed module-global
+  and split instance-field slots. This is an intentionally unsound
+  performance experiment: it skips CPython dict/object/type watchers,
+  dict version updates, insertion-order maintenance, and first-insert
+  bookkeeping. Leave unset for correctness tests and ordinary runs.
+
 Notes:
 - In normal workflows set one `DIET_PYTHON_COUNTERS_DIR` for the whole
   multi-pass run and change only `DIET_PYTHON_SPECIALIZATION_MODE`.

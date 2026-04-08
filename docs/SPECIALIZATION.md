@@ -115,6 +115,9 @@ override env var is present:
 - On guard miss, tombstone, absent value, or store failure, codegen
   increments the fallback counter when enabled and executes the existing
   global load/store slow path.
+- Store fast paths are emitted only when
+  `DIET_PYTHON_UNSOUND_INDEXED_STORES=1`; the helper then performs a raw
+  overwrite of an existing indexed-values slot.
 
 ### Limitations / Soundness / Extensions
 
@@ -148,16 +151,19 @@ override env var is present:
 - Missing values, promoted/combined dicts, key-index mismatch, type
   guard miss, or type-version miss increment the fallback counter when
   enabled and execute normal CPython attribute lookup.
-- `SetAttr` sites currently use the guarded/direct probe only as a
-  conservative miss-producing helper and then run generic attribute set.
+- `SetAttr` sites use generic attribute set by default.
+- When `DIET_PYTHON_UNSOUND_INDEXED_STORES=1`, constant-string `SetAttr`
+  sites with a recorded key index get the same exact-owner/version guard
+  and then perform a raw overwrite of an existing split-dict value slot.
 
 ### Limitations / Soundness / Extensions
 
 - The owner guard is exact-type today; it is sound but does not yet keep
   base-class field fast paths active on subclasses.
-- Direct field stores intentionally fall back for now. A direct store
-  needs CPython split-dict bookkeeping for `ma_used`, insertion order,
-  watchers, promotion, and resize.
+- Direct field stores are opt-in/unsound. First insert, missing value,
+  promoted dict, and key-index mismatch still fall back; an existing
+  value slot may be overwritten without CPython bookkeeping only when
+  `DIET_PYTHON_UNSOUND_INDEXED_STORES=1`.
 - Class attributes and descriptors are excluded by compile-time owner
   inspection. Runtime type-version guards are the fallback if a later
   class mutation invalidates that inspection.
