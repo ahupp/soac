@@ -5,28 +5,27 @@ pub(crate) mod blockpy_expr_simplify;
 mod blockpy_generators;
 pub mod blockpy_to_bb;
 pub(crate) mod core_await_lower;
+mod global_index;
 mod instr_id;
 mod instrument;
-mod global_index;
 mod name_binding;
 pub mod ruff_to_blockpy;
 mod trace;
 
 use crate::block_py::{
-    cfg::relabel_blockpy_blocks_dense, Await, BinOp, BlockPyModule, ModuleShape, Call,
-    CallArgKeyword, CallArgPositional, CallDirect,
-    CalleeFunctionId, CellRef, CellRefForName, ChildVisitable, Del, DelItem, ExprAttribute,
-    ExprBoolOp, ExprBooleanLiteral, ExprBytesLiteral, ExprCompare, ExprDict, ExprDictComp,
-    ExprEllipsisLiteral, ExprFString, ExprGenerator, ExprIf, ExprIpyEscapeCommand, ExprLambda,
-    ExprList, ExprListComp, ExprName, ExprNamed, ExprNoneLiteral, ExprNumberLiteral, ExprSet,
-    ExprSetComp, ExprSlice, ExprStarred, ExprStringLiteral, ExprSubscript, ExprTString, ExprTuple,
-    GetAttr, GetItem, HasMeta, IncrementCounter, Instr, LiteralValue, Load, MakeCell, MakeFunction,
-    MapInstr, Mappable, Meta, NameLike, ResolvedName, SetAttr, SetItem, StmtAnnAssign,
-    StmtAssert, StmtAssign, StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue, StmtDelete,
-    StmtExpr, StmtFor, StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom,
-    StmtIpyEscapeCommand, StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry,
-    StmtTypeAlias, StmtWhile, StmtWith, Store, TryMapInstr, UnaryOp, UnresolvedName, WithMeta,
-    Yield, YieldFrom, runtime_name_load,
+    cfg::relabel_blockpy_blocks_dense, runtime_name_load, Await, BinOp, BlockPyModule, Call,
+    CallArgKeyword, CallArgPositional, CallDirect, CalleeFunctionId, CellRef, CellRefForName,
+    ChildVisitable, Del, DelItem, ExprAttribute, ExprBoolOp, ExprBooleanLiteral, ExprBytesLiteral,
+    ExprCompare, ExprDict, ExprDictComp, ExprEllipsisLiteral, ExprFString, ExprGenerator, ExprIf,
+    ExprIpyEscapeCommand, ExprLambda, ExprList, ExprListComp, ExprName, ExprNamed, ExprNoneLiteral,
+    ExprNumberLiteral, ExprSet, ExprSetComp, ExprSlice, ExprStarred, ExprStringLiteral,
+    ExprSubscript, ExprTString, ExprTuple, GetAttr, GetItem, HasMeta, IncrementCounter, Instr,
+    LiteralValue, Load, MakeCell, MakeFunction, MapInstr, Mappable, Meta, ModuleShape, NameLike,
+    ResolvedName, SetAttr, SetItem, StmtAnnAssign, StmtAssert, StmtAssign, StmtAugAssign,
+    StmtBreak, StmtClassDef, StmtContinue, StmtDelete, StmtExpr, StmtFor, StmtFunctionDef,
+    StmtGlobal, StmtIf, StmtImport, StmtImportFrom, StmtIpyEscapeCommand, StmtMatch, StmtNonlocal,
+    StmtPass, StmtRaise, StmtReturn, StmtTry, StmtTypeAlias, StmtWhile, StmtWith, Store,
+    TryMapInstr, UnaryOp, UnresolvedName, WithMeta, Yield, YieldFrom,
 };
 use ruff_python_ast::{self as ast};
 use soac_macros::{enum_broadcast, DelegateMatchDefault};
@@ -280,8 +279,8 @@ pub use trace::{
     instrument_bb_module_with_global_load_counters, instrument_bb_module_with_refcount_counters,
 };
 
-pub(crate) use name_binding::lower_name_binding_in_core_blockpy_module;
 pub(crate) use global_index::lower_global_index_in_resolved_module_default;
+pub(crate) use name_binding::lower_name_binding_in_core_blockpy_module;
 pub(crate) use trace::{
     call_target_counter_instrumentation_enabled, global_load_counter_instrumentation_enabled,
     instrument_bb_module_for_trace, parse_trace_env,

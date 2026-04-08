@@ -1,4 +1,4 @@
-use super::{ExprRewritePass, LoweredExpr, rewrite_with_pass};
+use super::{rewrite_with_pass, ExprRewritePass, LoweredExpr};
 use crate::passes::ast_to_ast::context::Context;
 use crate::py_expr;
 use ruff_python_ast::{Expr, Stmt};

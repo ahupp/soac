@@ -21,7 +21,9 @@ fn cfg_block_new_sets_explicit_term() {
 fn cfg_block_from_fragment_without_term_uses_implicit_none_return_value() {
     let block = Block::from_builder(
         BlockLabel::from_index(0),
-        BlockBuilder::from_stmts(vec![crate::passes::ast_to_instr::from_ast_expr(py_expr!("x"))]),
+        BlockBuilder::from_stmts(vec![crate::passes::ast_to_instr::from_ast_expr(py_expr!(
+            "x"
+        ))]),
         Vec::new(),
         None,
         None,
@@ -62,9 +64,9 @@ fn cfg_block_can_replace_fallthrough_target() {
 fn stmt_fragment_can_carry_optional_term() {
     let fragment: BlockBuilder<InstrRuff> = BlockBuilder::with_term(
         vec![crate::passes::ast_to_instr::from_ast_expr(py_expr!("x"))],
-        Some(BlockTerm::Return(crate::passes::ast_to_instr::from_ast_expr(py_expr!(
-            "None"
-        )))),
+        Some(BlockTerm::Return(
+            crate::passes::ast_to_instr::from_ast_expr(py_expr!("None")),
+        )),
     );
 
     assert_eq!(fragment.body.len(), 1);

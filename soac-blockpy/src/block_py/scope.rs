@@ -1,7 +1,7 @@
 use super::{
-    is_internal_symbol, walk_block, walk_expr, Block, BlockPyFunction, ModuleShape, Call,
-    CallArgPositional, ChildVisitable, FunctionName, Instr, InstrLow, InstrRuff,
-    InstrWithAwaitAndYield, InstrWithYield, Literal, NameLike,
+    is_internal_symbol, walk_block, walk_expr, Block, BlockPyFunction, Call, CallArgPositional,
+    ChildVisitable, FunctionName, Instr, InstrLow, InstrRuff, InstrWithAwaitAndYield,
+    InstrWithYield, Literal, ModuleShape, NameLike,
 };
 use crate::passes::ast_to_ast::scope_helpers::cell_name;
 use ruff_python_ast::{self as ast};

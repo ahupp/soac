@@ -1,6 +1,6 @@
 use crate::block_py::{
     compute_storage_layout_from_scope, Block, BlockArg, BlockEdge, BlockLabel, BlockParam,
-    BlockPyFunction, BlockPyModule, ModuleShape, BlockTerm, ScopeExprNode,
+    BlockPyFunction, BlockPyModule, BlockTerm, ModuleShape, ScopeExprNode,
 };
 
 pub(crate) fn validate_module<P: ModuleShape>(module: &BlockPyModule<P>) -> Result<(), String>

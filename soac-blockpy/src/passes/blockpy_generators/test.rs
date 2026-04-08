@@ -88,7 +88,9 @@ fn build_closure_backed_generator_factory_block(
         BlockLabel::from_index(0),
         BlockBuilder::with_term(
             Vec::new(),
-            Some(BlockTerm::Return(crate::passes::ast_to_instr::from_ast_expr(return_value))),
+            Some(BlockTerm::Return(
+                crate::passes::ast_to_instr::from_ast_expr(return_value),
+            )),
         ),
         Vec::new(),
         None,

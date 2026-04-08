@@ -72,7 +72,10 @@ pub fn lower_global_index_in_resolved_module(
 ) -> BlockPyModule<ResolvedStorageModuleShape> {
     let mut indexer = GlobalIndexer {
         global_slots: ModuleGlobalSlots::with_preferred_names(
-            module.global_names.into_iter().chain(preferred_global_names),
+            module
+                .global_names
+                .into_iter()
+                .chain(preferred_global_names),
         ),
     };
     let mut lowered = BlockPyModule {

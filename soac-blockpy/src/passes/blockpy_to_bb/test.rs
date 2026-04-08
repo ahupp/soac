@@ -124,9 +124,7 @@ fn exception_edges_seed_hidden_try_exception_locals_from_current_exception() {
         crate::block_py::Block {
             label: BlockLabel::from_index(0),
             body: Vec::new(),
-            term: BlockTerm::<InstrResolved>::Return(
-                InstrResolved::constant_none(),
-            ),
+            term: BlockTerm::<InstrResolved>::Return(InstrResolved::constant_none()),
             params: vec![crate::block_py::BlockParam {
                 name: "_dp_outer_exc".to_string(),
                 role: crate::block_py::BlockParamRole::Exception,
@@ -158,9 +156,7 @@ fn exception_edges_seed_hidden_try_exception_locals_from_current_exception() {
         crate::block_py::Block {
             label: BlockLabel::from_index(2),
             body: Vec::new(),
-            term: BlockTerm::<InstrResolved>::Return(
-                InstrResolved::constant_none(),
-            ),
+            term: BlockTerm::<InstrResolved>::Return(InstrResolved::constant_none()),
             params: Vec::new(),
             exc_edge: None,
         },

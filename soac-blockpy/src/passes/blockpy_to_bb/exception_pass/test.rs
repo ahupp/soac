@@ -67,9 +67,7 @@ def f(x):
         function.blocks.push(ResolvedStorageBlock {
             label: body_label.clone(),
             body: vec![],
-            term: BlockTerm::<InstrResolved>::Return(
-                InstrResolved::constant_none(),
-            ),
+            term: BlockTerm::<InstrResolved>::Return(InstrResolved::constant_none()),
             params: vec![crate::block_py::BlockParam {
                 name: "_dp_try_exc_manual".to_string(),
                 role: crate::block_py::BlockParamRole::Exception,
@@ -79,9 +77,7 @@ def f(x):
         function.blocks.push(ResolvedStorageBlock {
             label: except_label.clone(),
             body: vec![],
-            term: BlockTerm::<InstrResolved>::Return(
-                InstrResolved::constant_none(),
-            ),
+            term: BlockTerm::<InstrResolved>::Return(InstrResolved::constant_none()),
             params: Vec::new(),
             exc_edge: None,
         });
@@ -220,9 +216,7 @@ def f():
     function.blocks.push(CodegenBlock {
         label: target,
         body: vec![],
-        term: BlockTerm::<InstrCodegen>::Return(
-            InstrCodegen::constant_none(),
-        ),
+        term: BlockTerm::<InstrCodegen>::Return(InstrCodegen::constant_none()),
         params: vec![BlockParam {
             name: "_dp_try_exc".to_string(),
             role: BlockParamRole::Exception,
@@ -303,9 +297,7 @@ def f():
     function.blocks.push(ResolvedStorageBlock {
         label: except_label.clone(),
         body: vec![],
-        term: BlockTerm::<InstrResolved>::Return(
-            InstrResolved::constant_none(),
-        ),
+        term: BlockTerm::<InstrResolved>::Return(InstrResolved::constant_none()),
         params: Vec::new(),
         exc_edge: None,
     });
@@ -371,9 +363,7 @@ def f():
     function.blocks.push(ResolvedStorageBlock {
         label: except_label.clone(),
         body: vec![],
-        term: BlockTerm::<InstrResolved>::Return(
-            InstrResolved::constant_none(),
-        ),
+        term: BlockTerm::<InstrResolved>::Return(InstrResolved::constant_none()),
         params: Vec::new(),
         exc_edge: None,
     });

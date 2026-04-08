@@ -1,7 +1,7 @@
 use super::*;
 use crate::block_py::{
-    Await, Block, BlockEdge, BlockLabel, BlockTerm, Call, CallArgPositional, ExprAttribute,
-    Instr, TermIf, TermRaise, WithMeta,
+    Await, Block, BlockEdge, BlockLabel, BlockTerm, Call, CallArgPositional, ExprAttribute, Instr,
+    TermIf, TermRaise, WithMeta,
 };
 use crate::passes::ast_to_ast::context::Context;
 use crate::passes::ruff_to_blockpy::expr_lowering::{

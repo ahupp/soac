@@ -77,9 +77,10 @@ where
     for value in values {
         let test = match op {
             ast::BoolOp::And => load_name(&target),
-            ast::BoolOp::Or => {
-                crate::passes::ast_to_instr::from_ast_expr(py_expr!("not {target:id}", target = target.as_str()))
-            }
+            ast::BoolOp::Or => crate::passes::ast_to_instr::from_ast_expr(py_expr!(
+                "not {target:id}",
+                target = target.as_str()
+            )),
         };
         let (next_entry, value) = bridge
             .try_lower_inline_value::<E, InstrRuff>(name_gen, |structured| {

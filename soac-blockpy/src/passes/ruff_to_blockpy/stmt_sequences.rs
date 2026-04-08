@@ -380,7 +380,10 @@ where
                 let loop_continue_label = loop_check_label.clone();
                 let assign_body = build_for_target_assign_body(
                     *for_stmt.target.clone(),
-                    crate::passes::ast_to_instr::from_ast_expr(py_expr!("{name:id}", name = tmp_name.as_str())),
+                    crate::passes::ast_to_instr::from_ast_expr(py_expr!(
+                        "{name:id}",
+                        name = tmp_name.as_str()
+                    )),
                     tmp_name.as_str(),
                 );
                 return lower_for_stmt_sequence_head(

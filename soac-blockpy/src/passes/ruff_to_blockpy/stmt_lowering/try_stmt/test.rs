@@ -2,7 +2,7 @@ use super::super::simplify_stmt_ast_once_for_blockpy;
 use super::*;
 use crate::passes::ast_to_ast::context::Context;
 use crate::passes::ast_to_ast::util::is_dp_helper_lookup_expr;
-use crate::transformer::{Transformer, walk_expr};
+use crate::transformer::{walk_expr, Transformer};
 use ruff_python_ast::Expr;
 use std::collections::HashSet;
 

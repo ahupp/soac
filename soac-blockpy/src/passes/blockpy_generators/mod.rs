@@ -5,15 +5,14 @@ use crate::block_py::cfg::RelabelBlockTargets;
 use crate::block_py::param_specs::{Param, ParamKind, ParamSpec};
 use crate::block_py::{
     compute_storage_layout_from_scope, core_call_expr_with_meta, core_runtime_name_expr_with_meta,
-    core_runtime_positional_call_expr_with_meta, literal_expr, BindingKind, Block, BlockArg,
-    BlockBuilder, BlockEdge, BlockLabel, BlockParam, BlockParamRole, BlockPyFunction,
-    BlockPyModule, BlockTerm, CallArgKeyword, CallArgPositional, CallableScopeInfo,
-    CellBindingKind, CellRefForName, ClosureInit, ClosureSlot, FunctionId, FunctionKind,
-    FunctionName, FunctionNameGen, GetAttr, Instr, InstrUnresolved,
-    InstrWithYield, Load, MakeFunction, map_module_functions, Mappable, ModuleNameGen, NameLike,
-    NumberLiteral, NumberLiteralValue, ScopeExprNode, StorageLayout, Store, StringLiteral,
-    TermBranchTable, TermIf, TermRaise, TryMapFunction, TryMapInstr, TryMapTerm, UnaryOp,
-    UnaryOpKind, UnresolvedName,
+    core_runtime_positional_call_expr_with_meta, literal_expr, map_module_functions, BindingKind,
+    Block, BlockArg, BlockBuilder, BlockEdge, BlockLabel, BlockParam, BlockParamRole,
+    BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword, CallArgPositional,
+    CallableScopeInfo, CellBindingKind, CellRefForName, ClosureInit, ClosureSlot, FunctionId,
+    FunctionKind, FunctionName, FunctionNameGen, GetAttr, Instr, InstrUnresolved, InstrWithYield,
+    Load, MakeFunction, Mappable, ModuleNameGen, NameLike, NumberLiteral, NumberLiteralValue,
+    ScopeExprNode, StorageLayout, Store, StringLiteral, TermBranchTable, TermIf, TermRaise,
+    TryMapFunction, TryMapInstr, TryMapTerm, UnaryOp, UnaryOpKind, UnresolvedName,
 };
 use crate::passes::ast_to_ast::scope_helpers::is_internal_symbol;
 use crate::passes::ruff_to_blockpy::{attach_exception_edges_to_blocks, lowered_exception_edges};
@@ -677,7 +676,9 @@ enum YieldSite {
 
 fn stmt_yield_site(stmt: &LinearYieldStmt) -> Option<YieldSite> {
     match stmt {
-        InstrWithYield::Yield(yield_expr) => Some(YieldSite::ExprYield(yield_expr.value.as_ref().clone())),
+        InstrWithYield::Yield(yield_expr) => {
+            Some(YieldSite::ExprYield(yield_expr.value.as_ref().clone()))
+        }
         InstrWithYield::YieldFrom(yield_from) => {
             Some(YieldSite::ExprYieldFrom((*yield_from.value).clone()))
         }

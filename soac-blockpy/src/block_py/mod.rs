@@ -26,13 +26,13 @@ use ruff_python_ast::{self as ast};
 use std::fmt;
 
 pub(crate) mod cfg;
+mod counters;
+mod literal;
 mod map;
 mod meta;
 mod name_gen;
 pub mod operation;
 mod operation_macro;
-mod counters;
-mod literal;
 pub(crate) mod param_specs;
 pub mod pretty;
 pub(crate) mod scope;
@@ -43,6 +43,7 @@ pub use crate::passes::{
     InstrWithYield,
 };
 pub use counters::{CounterDef, CounterId, CounterScope, CounterSite, IncrementCounter};
+pub(crate) use literal::literal_expr;
 pub use literal::{
     BytesLiteral, Literal, LiteralValue, NumberLiteral, NumberLiteralValue, StringLiteral,
 };
@@ -52,7 +53,6 @@ pub(crate) use map::{
     TryMapBlock, TryMapFunction, TryMapModule, TryMapTerm,
 };
 pub use map::{MapInstr, Mappable, TryMapInstr};
-pub(crate) use literal::literal_expr;
 pub use name_gen::{BlockLabel, FunctionId, FunctionNameGen, ModuleNameGen};
 pub(crate) use validate::validate_module;
 #[allow(unused_imports)]
@@ -388,8 +388,7 @@ impl<I: Instr> Block<I> {
         params: Vec<BlockParam>,
         exc_edge: Option<BlockEdge>,
         fallthrough_target: Option<BlockLabel>,
-    ) -> Self
-    {
+    ) -> Self {
         Self::new(
             label,
             builder.body,

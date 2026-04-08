@@ -383,10 +383,9 @@ pub(crate) fn emit_finally_abrupt_dispatch_blocks<E>(
         name_gen,
         finally_return_label.clone(),
         Vec::new(),
-        BlockTerm::Return(E::from_lowered_expr(crate::passes::ast_to_instr::from_ast_expr(py_expr!(
-            "{name:id}",
-            name = payload_name
-        )))),
+        BlockTerm::Return(E::from_lowered_expr(
+            crate::passes::ast_to_instr::from_ast_expr(py_expr!("{name:id}", name = payload_name)),
+        )),
         active_exc_target.as_ref(),
     ));
     blocks.push(compat_block_from_blockpy_with_exc_target_and_expr(
@@ -395,10 +394,12 @@ pub(crate) fn emit_finally_abrupt_dispatch_blocks<E>(
         finally_raise_label.clone(),
         Vec::new(),
         BlockTerm::Raise(TermRaise {
-            exc: Some(E::from_lowered_expr(crate::passes::ast_to_instr::from_ast_expr(py_expr!(
-                "{name:id}",
-                name = payload_name
-            )))),
+            exc: Some(E::from_lowered_expr(
+                crate::passes::ast_to_instr::from_ast_expr(py_expr!(
+                    "{name:id}",
+                    name = payload_name
+                )),
+            )),
         }),
         active_exc_target.as_ref(),
     ));

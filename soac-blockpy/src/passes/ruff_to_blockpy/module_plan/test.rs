@@ -1,17 +1,17 @@
 use super::{
-    BlockPyModuleRewriter, FunctionScopeFrame, callable_scope_info,
-    try_lower_function_to_core_blockpy_bundle,
+    callable_scope_info, try_lower_function_to_core_blockpy_bundle, BlockPyModuleRewriter,
+    FunctionScopeFrame,
 };
 use crate::block_py::{
-    AbruptKind, BindingKind, BindingPurpose, BindingTarget, BlockArg, BlockPyFunction,
-    BlockPyModule, BlockTerm, ClassBodyFallback, EffectiveBinding, InstrWithAwaitAndYield,
-    ModuleNameGen, NameLike, compute_make_function_capture_bindings_from_scope,
+    compute_make_function_capture_bindings_from_scope, AbruptKind, BindingKind, BindingPurpose,
+    BindingTarget, BlockArg, BlockPyFunction, BlockPyModule, BlockTerm, ClassBodyFallback,
+    EffectiveBinding, InstrWithAwaitAndYield, ModuleNameGen, NameLike,
 };
 use crate::lower_python_to_blockpy_for_testing;
-use crate::passes::CoreModuleShapeWithAwaitAndYield;
 use crate::passes::ast_to_ast::context::Context;
 use crate::passes::ast_to_ast::semantic::SemanticAstState;
 use crate::passes::ruff_to_blockpy::rewrite_ast_to_core_blockpy_module_with_module;
+use crate::passes::CoreModuleShapeWithAwaitAndYield;
 use ruff_python_ast::{Expr, Stmt};
 use ruff_python_parser::parse_module;
 

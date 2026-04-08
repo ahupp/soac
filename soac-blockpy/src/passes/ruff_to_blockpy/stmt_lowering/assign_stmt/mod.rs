@@ -7,15 +7,15 @@ fn rhs_temp_name(name: &str) -> ast::name::Name {
     name.into()
 }
 
-pub(super) fn temp_load_expr<E: RuffToBlockPyExpr>(
-    name: &str,
-) -> E {
-    E::from_lowered_expr(crate::passes::ast_to_instr::from_ast_expr(Expr::Name(ast::ExprName {
-        id: rhs_temp_name(name),
-        ctx: ast::ExprContext::Load,
-        range: Default::default(),
-        node_index: Default::default(),
-    })))
+pub(super) fn temp_load_expr<E: RuffToBlockPyExpr>(name: &str) -> E {
+    E::from_lowered_expr(crate::passes::ast_to_instr::from_ast_expr(Expr::Name(
+        ast::ExprName {
+            id: rhs_temp_name(name),
+            ctx: ast::ExprContext::Load,
+            range: Default::default(),
+            node_index: Default::default(),
+        },
+    )))
 }
 
 pub(super) fn bind_temp<E: RuffToBlockPyExpr>(
@@ -29,18 +29,13 @@ pub(super) fn bind_temp<E: RuffToBlockPyExpr>(
     temp_load_expr(&name)
 }
 
-fn delete_temp<E: RuffToBlockPyExpr>(
-    out: &mut BlockPyStmtBuilder<E>,
-    name: String,
-) {
+fn delete_temp<E: RuffToBlockPyExpr>(out: &mut BlockPyStmtBuilder<E>, name: String) {
     let target = rhs_temp_name(&name);
     let meta = Meta::synthetic();
     out.push_stmt(Del::new(target, false).with_meta(meta).into());
 }
 
-pub(super) fn lower_target_object_with_setup<
-    E: RuffToBlockPyExpr,
->(
+pub(super) fn lower_target_object_with_setup<E: RuffToBlockPyExpr>(
     target_value: InstrRuff,
     out: &mut BlockPyStmtBuilder<E>,
     loop_ctx: Option<&LoopContext>,
@@ -178,10 +173,9 @@ where
     let unpacked_temp = bind_temp(out, unpacked_name.clone(), unpacked_value);
 
     for (index, elt) in elts.into_iter().enumerate() {
-        let index_expr = E::from_lowered_expr(crate::passes::ast_to_instr::from_ast_expr(py_expr!(
-            "{index:literal}",
-            index = index as i64
-        )));
+        let index_expr = E::from_lowered_expr(crate::passes::ast_to_instr::from_ast_expr(
+            py_expr!("{index:literal}", index = index as i64),
+        ));
         match elt {
             InstrRuff::ExprStarred(starred) => {
                 let item_expr = E::get_item(

@@ -1,7 +1,7 @@
 use crate::block_py::param_specs::{collect_param_spec_and_defaults, param_defaults_to_expr};
 use crate::block_py::{
-    BindingKind, BlockPyFunction, BlockPyModule, ModuleShape, CallableScopeInfo, CellBindingKind,
-    FunctionKind, FunctionNameGen, ModuleNameGen,
+    BindingKind, BlockPyFunction, BlockPyModule, CallableScopeInfo, CellBindingKind, FunctionKind,
+    FunctionNameGen, ModuleNameGen, ModuleShape,
 };
 use crate::passes::ast_to_ast::body::{split_docstring, Suite};
 use crate::passes::ast_to_ast::context::Context;

@@ -3,9 +3,8 @@ use crate::block_py::cfg::{
 };
 use crate::block_py::param_specs::ParamSpec;
 use crate::block_py::{
-    Block, BlockBuilder, BlockEdge, BlockLabel, BlockPyFunction,
-    BlockPyModule, BlockTerm, CallableScopeInfo, FunctionKind, FunctionName, FunctionNameGen,
-    Instr,
+    Block, BlockBuilder, BlockEdge, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm,
+    CallableScopeInfo, FunctionKind, FunctionName, FunctionNameGen, Instr,
 };
 use crate::namegen::fresh_name;
 use crate::passes::ast_to_ast::context::Context;
@@ -86,8 +85,7 @@ impl<I: Instr> InlineBlockBuilder<I> {
         }
     }
 
-    pub(crate) fn push_stmt(&mut self, stmt: I)
-    {
+    pub(crate) fn push_stmt(&mut self, stmt: I) {
         self.current_block.push_stmt(stmt);
     }
 

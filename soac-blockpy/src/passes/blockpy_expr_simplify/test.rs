@@ -60,18 +60,14 @@ def f(x):
         .find(|function| function.names.bind_name == "f")
         .expect("missing lowered f callable");
 
-    assert!(
-        function
-            .blocks
-            .iter()
-            .any(|block| matches!(block.term, BlockTerm::IfTerm(_)))
-    );
-    assert!(
-        function
-            .blocks
-            .iter()
-            .any(|block| matches!(block.term, BlockTerm::Return(_)))
-    );
+    assert!(function
+        .blocks
+        .iter()
+        .any(|block| matches!(block.term, BlockTerm::IfTerm(_))));
+    assert!(function
+        .blocks
+        .iter()
+        .any(|block| matches!(block.term, BlockTerm::Return(_))));
 }
 
 #[test]

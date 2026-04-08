@@ -1,4 +1,4 @@
-use super::super::{BlockPyStmtBuilder, lower_instr_for_test};
+use super::super::{lower_instr_for_test, BlockPyStmtBuilder};
 use super::*;
 use crate::block_py::{BinOpKind, InstrWithAwaitAndYield};
 use crate::passes::ast_to_ast::context::Context;

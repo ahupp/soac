@@ -1,7 +1,7 @@
 use super::{
-    instr_any, map_function_blocks, Block, BlockLabel, BlockPyFunction, BlockTerm,
-    ChildVisitable, Del, Instr, Load, MapInstr, MapTerm, ModuleShape, Mappable, Meta, Store,
-    UnresolvedName, WithMeta,
+    instr_any, map_function_blocks, Block, BlockLabel, BlockPyFunction, BlockTerm, ChildVisitable,
+    Del, Instr, Load, MapInstr, MapTerm, Mappable, Meta, ModuleShape, Store, UnresolvedName,
+    WithMeta,
 };
 use crate::namegen::fresh_name;
 use ruff_python_ast as ast;
