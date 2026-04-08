@@ -400,10 +400,10 @@ Notes:
   governor to `performance`, locking `scaling_min_freq` and
   `scaling_max_freq` to the hardware max frequency, and disabling boost
   when the kernel exposes a `boost` knob. The benchmark recipes default
-  this to `1`, and the wrapper restores the previous settings on exit.
-  When direct writes are not permitted, the wrapper uses `sudo`
-  automatically for the sysfs write and restore path. Set
-  `BENCHMARK_CONSTANT_CLOCKS=0` to opt out.
+  this to `0`, and the wrapper restores previous settings on exit when
+  constant-clock mode is enabled. When direct writes are not permitted,
+  the wrapper uses `sudo` automatically for the sysfs write and restore
+  path. Set `BENCHMARK_CONSTANT_CLOCKS=1` to opt in.
 
 - `SPECIALIZATION_PROFILE_LOOPS=<int>`
   In recipe `perf-pystone-jit-specialized`, at

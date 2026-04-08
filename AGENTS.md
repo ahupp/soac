@@ -193,11 +193,11 @@ instance's live working commit.
   The benchmark recipes use
   [scripts/run_benchmark_with_cpu_mode.sh](/home/adam/project/soac-profile/scripts/run_benchmark_with_cpu_mode.sh)
   to pin runs to a specific CPU. The benchmark recipes default to
-  `BENCHMARK_CONSTANT_CLOCKS=1`, which uses `sudo` as needed to request
-  steadier clocks by temporarily changing `cpufreq` settings; use
-  `BENCHMARK_CONSTANT_CLOCKS=0` to opt out. If you add or change
-  benchmark-stability knobs, document them in `README.md` and in this
-  appendix note.
+  `BENCHMARK_CONSTANT_CLOCKS=0`; use `BENCHMARK_CONSTANT_CLOCKS=1` to
+  request steadier clocks by temporarily changing `cpufreq` settings.
+  That opt-in path uses `sudo` when direct writes are not permitted. If
+  you add or change benchmark-stability knobs, document them in
+  `README.md` and in this appendix note.
 - `PERF_CALL_GRAPH`
   The perf profiling recipes default to `PERF_CALL_GRAPH=dwarf,65528`
   rather than a shallower stack dump, because the larger DWARF capture
