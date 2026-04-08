@@ -121,11 +121,30 @@ exports are intentionally omitted here.
 
 ## Counters And Specialization
 
+- `DIET_PYTHON_SPECIALIZATION_MODE=profile|verify|apply`
+  Select the runtime specialization phase:
+  - `profile`: run unspecialized, instrument specialization input
+    counters, and write `<counters-dir>/profile.bin`.
+  - `verify`: read `<counters-dir>/profile.bin`, apply its
+    specializations, instrument specialization input counters again, and
+    write `<counters-dir>/verify.bin`.
+  - `apply`: read `<counters-dir>/profile.bin`, apply its
+    specializations, and emit no specialization counters.
+  Leave unset for the ordinary unspecialized/no-counter path, or when
+  using the low-level override environment variables below.
+
+- `DIET_PYTHON_COUNTERS_DIR=/path/to/counters-dir`
+  Directory used by `DIET_PYTHON_SPECIALIZATION_MODE`. The runtime
+  creates the directory when it writes counters. The conventional files
+  are `profile.bin` for the specialization input and `verify.bin` for
+  the countered verification pass.
+
 - `DIET_PYTHON_CALL_TARGET_COUNTERS=1`
   In `fn call_target_counter_instrumentation_enabled`, at
   [soac-blockpy/src/passes/trace/mod.rs:27](/home/adam/project/soac-profile/soac-blockpy/src/passes/trace/mod.rs#L27),
-  enable runtime call-target profiling. This is the first-pass input for
-  call-target and operator specialization.
+  enable runtime call-target profiling. Prefer
+  `DIET_PYTHON_SPECIALIZATION_MODE=profile` for normal multi-pass
+  specialization runs.
 
 - `DIET_PYTHON_GLOBAL_LOAD_COUNTERS=1`
   In `fn global_load_counter_instrumentation_enabled`, at
@@ -145,13 +164,16 @@ exports are intentionally omitted here.
 - `DIET_PYTHON_COUNTERS_OUTPUT_FILE=/path/to/dump.bin`
   In `fn counter_dump_file_from_env`, at
   [soac-jit/src/module_type.rs:570](/home/adam/project/soac-profile/soac-jit/src/module_type.rs#L570),
-  write a counter dump on process exit.
+  write a counter dump on process exit. This is a low-level file
+  override; prefer `DIET_PYTHON_COUNTERS_DIR` plus
+  `DIET_PYTHON_SPECIALIZATION_MODE=profile|verify` for normal runs.
 
 - `DIET_PYTHON_COUNTERS_FILE=/path/to/dump.bin`
   In `fn load_call_target_specializations`, at
   [soac-jit/src/jit/mod.rs:1968](/home/adam/project/soac-profile/soac-jit/src/jit/mod.rs#L1968),
-  read an existing counter dump and derive specializations in-process.
-  This is input-only; it is not rewritten on exit.
+  read an existing counter dump and derive specializations in-process,
+  overriding the mode-derived `<counters-dir>/profile.bin` input. This
+  is input-only; it is not rewritten on exit.
 
 - `DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS=...`
   In `fn parse_call_target_specializations_env`, at
@@ -167,12 +189,14 @@ exports are intentionally omitted here.
   this is set, it wins over `DIET_PYTHON_COUNTERS_FILE`.
 
 Notes:
-- If `DIET_PYTHON_CALL_TARGET_COUNTERS` is enabled for the current run,
-  specialization loading is disabled for that run and the process stays
-  in profiling mode.
-- In normal workflows you should prefer `DIET_PYTHON_COUNTERS_OUTPUT_FILE`
-  for the profiling pass and `DIET_PYTHON_COUNTERS_FILE` for the
-  specialized pass rather than manually building specialization strings.
+- In normal workflows set one `DIET_PYTHON_COUNTERS_DIR` for the whole
+  multi-pass run and change only `DIET_PYTHON_SPECIALIZATION_MODE`.
+- The low-level `DIET_PYTHON_CALL_TARGET_COUNTERS=1` profiling path
+  still disables specialization loading unless an explicit
+  `DIET_PYTHON_SPECIALIZATION_MODE` is set.
+- In normal workflows prefer `DIET_PYTHON_COUNTERS_DIR` over wiring
+  separate input and output files. Use the file-level env vars for
+  inspector/tests/ad-hoc replay.
 
 ## Perf And Benchmarking
 

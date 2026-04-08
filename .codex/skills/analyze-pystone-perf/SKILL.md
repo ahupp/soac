@@ -20,13 +20,14 @@ BENCHMARK_CONSTANT_CLOCKS=0 just benchmark 2>&1 | tee logs/benchmark_specializat
 ```
 
 Use the specialized pass, not the profiling pass, as the transformed
-benchmark headline. The counter dump is copied to
-`logs/last_benchmark_counters.bin`.
+benchmark headline. The profile counter dump is written to
+`logs/last_benchmark_counters/profile.bin`.
 
 2. **Record perf using the exact benchmark counter dump**
 
 ```bash
-DIET_PYTHON_COUNTERS_FILE="$PWD/logs/last_benchmark_counters.bin" \
+DIET_PYTHON_COUNTERS_DIR="$PWD/logs/last_benchmark_counters" \
+DIET_PYTHON_SPECIALIZATION_MODE=apply \
 BENCHMARK_CONSTANT_CLOCKS=0 \
 PERF_PERCENT_LIMIT=0.2 \
 just perf-pystone-jit-warm 500000 logs/pystone_jit_perf_specialized_from_benchmark \
@@ -57,11 +58,11 @@ and refcount / deallocation clusters.
 
 ```bash
 cargo run -p soac-inspector --bin inspect_counters -- \
-  --dump logs/last_benchmark_counters.bin \
+  --dump logs/last_benchmark_counters/profile.bin \
   > logs/last_benchmark_counters_dump.txt
 
 cargo run -p soac-inspector --bin inspect_counters -- \
-  --specializations logs/last_benchmark_counters.bin \
+  --specializations logs/last_benchmark_counters/profile.bin \
   > logs/last_benchmark_specializations.txt
 ```
 

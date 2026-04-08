@@ -14,7 +14,8 @@ port := env_var_or_default("PORT", "8000")
 host := env_var_or_default("HOST", "127.0.0.1")
 url := "http://" + host + ":" + port
 limit_wrapper := repo_root + "/scripts/run_with_limits.sh"
-last_benchmark_counters := repo_root + "/logs/last_benchmark_counters.bin"
+last_benchmark_counters_dir := repo_root + "/logs/last_benchmark_counters"
+last_benchmark_counters := last_benchmark_counters_dir + "/profile.bin"
 
 export REPO_ROOT := repo_root
 export CPYTHON_BIN := cpython_bin
@@ -31,6 +32,7 @@ export PORT := port
 export HOST := host
 export URL := url
 export LIMIT_WRAPPER := limit_wrapper
+export LAST_BENCHMARK_COUNTERS_DIR := last_benchmark_counters_dir
 export LAST_BENCHMARK_COUNTERS := last_benchmark_counters
 
 [private]
@@ -279,23 +281,25 @@ view-speedscope profile="": build-web-inspector
 
   "$REPO_ROOT/scripts/open_web_url.sh" "$OPEN_URL"
 
-run-and-view-speedscope loops="500000" counters_file="" output_prefix="logs/pystone_jit_perf_warm_specialized_from_benchmark": ensure-cpython
+run-and-view-speedscope loops="500000" counters_dir="" output_prefix="logs/pystone_jit_perf_warm_specialized_from_benchmark": ensure-cpython
   #!/usr/bin/env bash
   set -euo pipefail
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-  COUNTERS_FILE="{{counters_file}}"
+  COUNTERS_DIR="{{counters_dir}}"
 
-  if [[ -z "$COUNTERS_FILE" ]]; then
-    COUNTERS_FILE="$LAST_BENCHMARK_COUNTERS"
+  if [[ -z "$COUNTERS_DIR" ]]; then
+    COUNTERS_DIR="$LAST_BENCHMARK_COUNTERS_DIR"
   fi
+  COUNTERS_FILE="$COUNTERS_DIR/profile.bin"
 
   if [[ ! -f "$COUNTERS_FILE" ]]; then
-    echo "counter dump not found at $COUNTERS_FILE; run 'just benchmark' first or pass counters_file=<path>" >&2
+    echo "counter profile not found at $COUNTERS_FILE; run 'just benchmark' first or pass counters_dir=<dir>" >&2
     exit 1
   fi
 
   cd "$REPO_ROOT"
-  DIET_PYTHON_COUNTERS_FILE="$COUNTERS_FILE" \
+  DIET_PYTHON_COUNTERS_DIR="$COUNTERS_DIR" \
+  DIET_PYTHON_SPECIALIZATION_MODE=apply \
     just perf-pystone-jit-warm "{{loops}}" "{{output_prefix}}"
 
   just view-speedscope "{{output_prefix}}_speedscope.json"
@@ -520,16 +524,17 @@ perf-pystone-jit-specialized loops="500000" output_prefix="logs/pystone_jit_perf
   SPECIALIZATION_PROFILE_LOOPS="${SPECIALIZATION_PROFILE_LOOPS:-8000000}"
 
   cd "$REPO_ROOT"
-  counter_dump_path="$(mktemp "${TMPDIR:-/tmp}/soac_perf_call_targets_XXXXXX.bin")"
-  trap 'rm -f "$counter_dump_path"' EXIT
+  counters_dir="$(mktemp -d "${TMPDIR:-/tmp}/soac_perf_counters_XXXXXX")"
+  trap 'rm -rf "$counters_dir"' EXIT
 
   LOOPS="${SPECIALIZATION_PROFILE_LOOPS}" \
   WARMUP_LOOPS="${WARMUP_LOOPS}" \
-  DIET_PYTHON_CALL_TARGET_COUNTERS=1 \
-  DIET_PYTHON_COUNTERS_OUTPUT_FILE="$counter_dump_path" \
+  DIET_PYTHON_COUNTERS_DIR="$counters_dir" \
+  DIET_PYTHON_SPECIALIZATION_MODE=profile \
     "$REPO_ROOT/.venv/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)' >/tmp/soac_perf_specialization_profile.out 2>&1
 
-  DIET_PYTHON_COUNTERS_FILE="$counter_dump_path" \
+  DIET_PYTHON_COUNTERS_DIR="$counters_dir" \
+  DIET_PYTHON_SPECIALIZATION_MODE=apply \
     just perf-pystone-jit-warm "{{loops}}" "{{output_prefix}}"
 
 [private]
@@ -740,6 +745,35 @@ _call-target-specializations-from-dump dump_path:
   cd "$REPO_ROOT"
   cargo run -p soac-inspector --bin inspect_counters -- --specializations "{{dump_path}}"
 
+benchmark-verify loops="100000" counters_dir="": (update-venv) (build-extension "release")
+  #!/usr/bin/env bash
+  set -euo pipefail
+  export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  WARMUP_LOOPS="${WARMUP_LOOPS:-1000}"
+  BENCHMARK_CPU="${BENCHMARK_CPU:-}"
+  BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS:-0}"
+  COUNTERS_DIR="{{counters_dir}}"
+  if [[ -z "$COUNTERS_DIR" ]]; then
+    COUNTERS_DIR="$LAST_BENCHMARK_COUNTERS_DIR"
+  fi
+  if [[ ! -f "$COUNTERS_DIR/profile.bin" ]]; then
+    echo "counter profile not found at $COUNTERS_DIR/profile.bin; run 'just benchmark' first or pass counters_dir=<dir>" >&2
+    exit 1
+  fi
+  rm -f "$COUNTERS_DIR/verify.bin"
+
+  echo "jit transformed verify pass"
+  echo "loops: {{loops}}"
+  echo "counters dir: $COUNTERS_DIR"
+  LOOPS="{{loops}}" \
+  WARMUP_LOOPS="${WARMUP_LOOPS}" \
+  BENCHMARK_CPU="${BENCHMARK_CPU}" \
+  BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
+  DIET_PYTHON_COUNTERS_DIR="$COUNTERS_DIR" \
+  DIET_PYTHON_SPECIALIZATION_MODE=verify \
+    "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
+  echo "verification counters: $COUNTERS_DIR/verify.bin"
+
 benchmark-warm loops="8000000": (update-venv) (build-extension "release")
   #!/usr/bin/env bash
   set -euo pipefail
@@ -785,21 +819,21 @@ benchmark loops="8000000": (update-venv) (build-extension "release")
   echo "benchmark constant clocks: ${BENCHMARK_CONSTANT_CLOCKS}"
 
   cd "$REPO_ROOT"
-  mkdir -p "$REPO_ROOT/logs"
-  counter_dump_path="$(mktemp "${TMPDIR:-/tmp}/soac_benchmark_call_targets_XXXXXX.bin")"
-  trap 'rm -f "$counter_dump_path"' EXIT
+  mkdir -p "$LAST_BENCHMARK_COUNTERS_DIR"
+  counter_dump_path="$LAST_BENCHMARK_COUNTERS_DIR/profile.bin"
+  rm -f "$LAST_BENCHMARK_COUNTERS_DIR/profile.bin" "$LAST_BENCHMARK_COUNTERS_DIR/verify.bin"
 
   echo "jit transformed profile pass"
   LOOPS="${PROFILE_LOOPS}" \
   WARMUP_LOOPS="${WARMUP_LOOPS}" \
   BENCHMARK_CPU="${BENCHMARK_CPU}" \
   BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
-  DIET_PYTHON_CALL_TARGET_COUNTERS=1 \
-  DIET_PYTHON_COUNTERS_OUTPUT_FILE="$counter_dump_path" \
+  DIET_PYTHON_COUNTERS_DIR="$LAST_BENCHMARK_COUNTERS_DIR" \
+  DIET_PYTHON_SPECIALIZATION_MODE=profile \
     "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
 
-  cp "$counter_dump_path" "$LAST_BENCHMARK_COUNTERS"
-  echo "last benchmark counters: $LAST_BENCHMARK_COUNTERS"
+  echo "last benchmark counters dir: $LAST_BENCHMARK_COUNTERS_DIR"
+  echo "last benchmark profile counters: $LAST_BENCHMARK_COUNTERS"
   echo "run speedscope from these counters: just run-and-view-speedscope"
 
   site_count="$(just _call-target-specializations-from-dump "$counter_dump_path" | awk -F';' 'NF { print NF }')"
@@ -809,7 +843,8 @@ benchmark loops="8000000": (update-venv) (build-extension "release")
     WARMUP_LOOPS="${WARMUP_LOOPS}" \
     BENCHMARK_CPU="${BENCHMARK_CPU}" \
     BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
-    DIET_PYTHON_COUNTERS_FILE="$counter_dump_path" \
+    DIET_PYTHON_COUNTERS_DIR="$LAST_BENCHMARK_COUNTERS_DIR" \
+    DIET_PYTHON_SPECIALIZATION_MODE=apply \
       "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
   else
     echo "jit transformed specialized pass (no hot callsites recorded)"

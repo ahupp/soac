@@ -2149,20 +2149,18 @@ fn load_call_target_specializations(
     if env::var("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS").is_ok() {
         return parse_call_target_specializations_env(module_name, function_id);
     }
-    if env::var("DIET_PYTHON_CALL_TARGET_COUNTERS")
-        .ok()
-        .is_some_and(|raw| !raw.trim().is_empty())
+    if specialization_mode_is_profile()
+        || (specialization_mode_from_env().is_none()
+            && env::var("DIET_PYTHON_CALL_TARGET_COUNTERS")
+                .ok()
+                .is_some_and(|raw| !raw.trim().is_empty()))
     {
         return Ok(HashMap::new());
     }
-    let Some(path) = env::var("DIET_PYTHON_COUNTERS_FILE")
-        .ok()
-        .map(|raw| raw.trim().to_string())
-        .filter(|raw| !raw.is_empty())
-    else {
+    let Some(path) = counter_dump_input_path_from_env() else {
         return Ok(HashMap::new());
     };
-    let path = std::path::Path::new(path.as_str());
+    let path = path.as_path();
     if !path.exists() {
         return Ok(HashMap::new());
     }
@@ -2252,24 +2250,55 @@ fn load_operator_specializations(
     if env::var("DIET_PYTHON_OPERATOR_SPECIALIZATIONS").is_ok() {
         return parse_operator_specializations_env(module_name, function_id);
     }
-    if env::var("DIET_PYTHON_CALL_TARGET_COUNTERS")
-        .ok()
-        .is_some_and(|raw| !raw.trim().is_empty())
+    if specialization_mode_is_profile()
+        || (specialization_mode_from_env().is_none()
+            && env::var("DIET_PYTHON_CALL_TARGET_COUNTERS")
+                .ok()
+                .is_some_and(|raw| !raw.trim().is_empty()))
     {
         return Ok(HashMap::new());
     }
-    let Some(path) = env::var("DIET_PYTHON_COUNTERS_FILE")
-        .ok()
-        .map(|raw| raw.trim().to_string())
-        .filter(|raw| !raw.is_empty())
-    else {
+    let Some(path) = counter_dump_input_path_from_env() else {
         return Ok(HashMap::new());
     };
-    let path = std::path::Path::new(path.as_str());
+    let path = path.as_path();
     if !path.exists() {
         return Ok(HashMap::new());
     }
     read_operator_specializations_from_file(path, module_name, function_id)
+}
+
+fn specialization_mode_from_env() -> Option<String> {
+    env::var("DIET_PYTHON_SPECIALIZATION_MODE")
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+}
+
+fn specialization_mode_is_profile() -> bool {
+    specialization_mode_from_env().as_deref() == Some("profile")
+}
+
+fn counter_dump_input_path_from_env() -> Option<std::path::PathBuf> {
+    if let Some(path) = env::var("DIET_PYTHON_COUNTERS_FILE")
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+    {
+        return Some(path.into());
+    }
+    match specialization_mode_from_env().as_deref() {
+        Some("verify" | "apply") => {
+            let dir = env::var("DIET_PYTHON_COUNTERS_DIR").ok()?;
+            let dir: std::path::PathBuf = dir.trim().into();
+            if dir.as_os_str().is_empty() {
+                None
+            } else {
+                Some(dir.join("profile.bin"))
+            }
+        }
+        _ => None,
+    }
 }
 
 fn emit_callee_function_id_checked(

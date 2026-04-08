@@ -13,7 +13,7 @@ use soac_blockpy::passes::CodegenModuleShape;
 use std::collections::HashMap;
 use std::env;
 use std::ffi::{c_char, c_int, c_void};
-use std::fs::OpenOptions;
+use std::fs::{OpenOptions, create_dir_all};
 use std::io::Write;
 use std::mem::MaybeUninit;
 use std::path::Path;
@@ -597,8 +597,21 @@ impl SoacExtModuleState {
 }
 
 pub fn key_layout_counter_enabled() -> bool {
+    if specialization_mode_records_counters() {
+        return true;
+    }
     env_flag_enabled("DIET_PYTHON_KEY_LAYOUT_COUNTERS")
         || env_flag_enabled("DIET_PYTHON_CALL_TARGET_COUNTERS")
+}
+
+fn specialization_mode_records_counters() -> bool {
+    matches!(
+        env::var("DIET_PYTHON_SPECIALIZATION_MODE")
+            .ok()
+            .as_deref()
+            .map(str::trim),
+        Some("profile" | "verify")
+    )
 }
 
 fn env_flag_enabled(name: &str) -> bool {
@@ -666,6 +679,9 @@ fn snapshot_type_key_layout_events_bound(
 }
 
 fn counter_dump_file_from_env() -> Option<std::path::PathBuf> {
+    if let Some(path) = counter_dump_file_from_mode_env() {
+        return Some(path);
+    }
     let raw = env::var("DIET_PYTHON_COUNTERS_OUTPUT_FILE").ok()?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -673,6 +689,28 @@ fn counter_dump_file_from_env() -> Option<std::path::PathBuf> {
     } else {
         Some(trimmed.into())
     }
+}
+
+fn counter_dump_file_from_mode_env() -> Option<std::path::PathBuf> {
+    let mode = env::var("DIET_PYTHON_SPECIALIZATION_MODE").ok()?;
+    let filename = match mode.trim() {
+        "profile" => "profile.bin",
+        "verify" => "verify.bin",
+        _ => return None,
+    };
+    let dir = env::var("DIET_PYTHON_COUNTERS_DIR").ok()?;
+    let dir: std::path::PathBuf = dir.trim().into();
+    if dir.as_os_str().is_empty() {
+        return None;
+    }
+    if let Err(err) = create_dir_all(dir.as_path()) {
+        eprintln!(
+            "[soac counters] failed to create counter dump directory {}: {err}",
+            dir.display()
+        );
+        return None;
+    }
+    Some(dir.join(filename))
 }
 
 unsafe extern "C" fn soac_ext_module_clear(module: *mut ffi::PyObject) -> c_int {

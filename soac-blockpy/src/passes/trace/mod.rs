@@ -28,11 +28,20 @@ pub(crate) fn global_load_counter_instrumentation_enabled() -> bool {
 }
 
 pub(crate) fn call_target_counter_instrumentation_enabled() -> bool {
+    if specialization_mode_instruments_top_values() {
+        return true;
+    }
     env::var("DIET_PYTHON_CALL_TARGET_COUNTERS")
         .map(|raw| {
             let trimmed = raw.trim();
             !(trimmed.is_empty() || trimmed == "0")
         })
+        .unwrap_or(false)
+}
+
+fn specialization_mode_instruments_top_values() -> bool {
+    env::var("DIET_PYTHON_SPECIALIZATION_MODE")
+        .map(|raw| matches!(raw.trim(), "profile" | "verify"))
         .unwrap_or(false)
 }
 

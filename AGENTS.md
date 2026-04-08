@@ -207,6 +207,13 @@ instance's live working commit.
   against stock CPython. Report the specialized second-pass throughput
   as the transformed result unless I explicitly ask for the warm
   unspecialized baseline.
+- `DIET_PYTHON_COUNTERS_DIR` / `DIET_PYTHON_SPECIALIZATION_MODE`
+  Normal specialization runs use one counters directory with conventional
+  files: `profile.bin` for specialization input and `verify.bin` for the
+  countered verification pass. Set
+  `DIET_PYTHON_SPECIALIZATION_MODE=profile`, `verify`, or `apply`;
+  recipes should pass the same `DIET_PYTHON_COUNTERS_DIR` and change
+  only the mode between passes.
 - `BENCHMARK_CPU` / `BENCHMARK_CONSTANT_CLOCKS`
   The benchmark recipes use
   [scripts/run_benchmark_with_cpu_mode.sh](/home/adam/project/soac-profile/scripts/run_benchmark_with_cpu_mode.sh)

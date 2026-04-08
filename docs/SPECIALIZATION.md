@@ -60,8 +60,27 @@ still uses the expected shared-key layout, and load the value slot by the
 recorded key index. That pass must still provide a normal CPython
 attribute-lookup fallback.
 
-The JIT loads both hot kinds from `DIET_PYTHON_COUNTERS_FILE` unless an
-explicit override env var is present:
+Normal multi-pass runs use one counters directory and one mode:
+
+- `DIET_PYTHON_COUNTERS_DIR=/path/to/dir`
+- `DIET_PYTHON_SPECIALIZATION_MODE=profile`
+  - run unspecialized
+  - instrument specialization-input counters
+  - write `/path/to/dir/profile.bin`
+- `DIET_PYTHON_SPECIALIZATION_MODE=verify`
+  - read `/path/to/dir/profile.bin`
+  - apply specializations
+  - instrument specialization-input counters
+  - write `/path/to/dir/verify.bin`
+- `DIET_PYTHON_SPECIALIZATION_MODE=apply`
+  - read `/path/to/dir/profile.bin`
+  - apply specializations
+  - emit no specialization-input counters
+
+The JIT also supports the low-level file override
+`DIET_PYTHON_COUNTERS_FILE`. It loads both hot kinds from that file, or
+from the mode-derived `profile.bin`, unless an explicit specialization
+override env var is present:
 
 - `load_call_target_specializations`, at
   `soac-jit/src/jit/mod.rs:1966`
