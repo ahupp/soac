@@ -1,9 +1,8 @@
 use super::operation_macro::define_operation;
 use super::*;
-use ruff_python_ast::{self as ast};
 use std::fmt;
 
-#[derive(Clone, derive_more::From)]
+#[derive(Clone, derive_more::From, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum Literal {
     StringLiteral(StringLiteral),
     BytesLiteral(BytesLiteral),
@@ -47,7 +46,7 @@ where
     E::from(literal_value(literal, meta))
 }
 
-#[derive(Clone)]
+#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct StringLiteral {
     pub value: String,
 }
@@ -58,7 +57,7 @@ impl fmt::Debug for StringLiteral {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct BytesLiteral {
     pub value: Vec<u8>,
 }
@@ -69,7 +68,7 @@ impl fmt::Debug for BytesLiteral {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct NumberLiteral {
     pub value: NumberLiteralValue,
 }
@@ -80,9 +79,9 @@ impl fmt::Debug for NumberLiteral {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum NumberLiteralValue {
-    Int(ast::Int),
+    Int(IntLiteral),
     Float(f64),
 }
 
@@ -92,5 +91,48 @@ impl fmt::Debug for NumberLiteralValue {
             Self::Int(value) => write!(f, "{value}"),
             Self::Float(value) => write!(f, "{value:?}"),
         }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct IntLiteral {
+    decimal: String,
+}
+
+impl IntLiteral {
+    pub fn from_decimal(decimal: impl Into<String>) -> Self {
+        Self {
+            decimal: decimal.into(),
+        }
+    }
+
+    pub fn from_i64(value: i64) -> Self {
+        Self::from_decimal(value.to_string())
+    }
+
+    pub fn as_decimal(&self) -> &str {
+        &self.decimal
+    }
+
+    pub fn as_i64(&self) -> Option<i64> {
+        self.decimal.parse().ok()
+    }
+}
+
+impl From<ruff_python_ast::Int> for IntLiteral {
+    fn from(value: ruff_python_ast::Int) -> Self {
+        Self::from_decimal(value.to_string())
+    }
+}
+
+impl fmt::Debug for IntLiteral {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_decimal())
+    }
+}
+
+impl fmt::Display for IntLiteral {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_decimal())
     }
 }

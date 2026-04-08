@@ -499,7 +499,7 @@ impl InstrWithAwaitAndYield {
                 literal_expr(
                     NumberLiteral {
                         value: match node.value {
-                            ast::Number::Int(value) => NumberLiteralValue::Int(value),
+                            ast::Number::Int(value) => NumberLiteralValue::Int(value.into()),
                             ast::Number::Float(value) => NumberLiteralValue::Float(value),
                             ast::Number::Complex { .. } => {
                                 panic!("complex literal reached late core BlockPy boundary")
@@ -624,7 +624,7 @@ impl InstrWithAwaitAndYield {
             Expr::NumberLiteral(node) => literal_expr(
                 NumberLiteral {
                     value: match node.value {
-                        ast::Number::Int(value) => NumberLiteralValue::Int(value),
+                        ast::Number::Int(value) => NumberLiteralValue::Int(value.into()),
                         ast::Number::Float(value) => NumberLiteralValue::Float(value),
                         ast::Number::Complex { .. } => {
                             panic!("complex literal reached late core BlockPy boundary")

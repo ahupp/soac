@@ -1,4 +1,4 @@
-use super::operation_macro::define_operation;
+use super::operation_macro::{define_operation, define_ruff_operation};
 use super::{
     CallArgKeyword, CallArgPositional, CellLocation, ChildVisitable, FunctionId, FunctionKind,
     HasMeta, Instr, MapInstr, Mappable, Meta, NameLike, TryMapInstr, WithMeta,
@@ -6,7 +6,9 @@ use super::{
 use ruff_python_ast::{self as ast};
 use std::fmt;
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+#[derive(
+    Debug, Clone, Copy, Eq, PartialEq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub enum BinOpKind {
     Add,
     Sub,
@@ -101,7 +103,9 @@ impl BinOpKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+#[derive(
+    Debug, Clone, Copy, Eq, PartialEq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub enum UnaryOpKind {
     Pos,
     Neg,
@@ -145,7 +149,7 @@ define_operation! {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct Call<E> {
     _meta: Meta,
     pub func: Box<E>,
@@ -292,7 +296,7 @@ define_operation! {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct CallDirect<E> {
     _meta: Meta,
     pub callable: Box<E>,
@@ -468,7 +472,7 @@ define_operation! {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct Load<I: Instr> {
     _meta: Meta,
     pub name: I::Name,
@@ -545,7 +549,7 @@ impl<I: Instr> Mappable<I> for Load<I> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct Store<I: Instr> {
     _meta: Meta,
     pub name: I::Name,
@@ -637,7 +641,7 @@ impl<I: Instr> Mappable<I> for Store<I> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct Del<I: Instr> {
     _meta: Meta,
     pub name: I::Name,
@@ -766,28 +770,28 @@ define_operation! {
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct ExprBoolOp<E> {
         op: ast::BoolOp,
         values: Vec<E>,
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct ExprNamed<E> {
         target: Box<E>,
         value: Box<E>,
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct ExprLambda<E> {
         parameters: Option<Box<ast::Parameters>>,
         body: Box<E>,
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct ExprIf<E> {
         test: Box<E>,
         body: Box<E>,
@@ -795,33 +799,33 @@ define_operation! {
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct ExprDict {
         items: Vec<ast::DictItem>,
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct ExprSet<E> {
         elts: Vec<E>,
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct ExprListComp<E> {
         elt: Box<E>,
         generators: Vec<ast::Comprehension>,
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct ExprSetComp<E> {
         elt: Box<E>,
         generators: Vec<ast::Comprehension>,
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct ExprDictComp<E> {
         key: Box<E>,
         value: Box<E>,
@@ -829,7 +833,7 @@ define_operation! {
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct ExprGenerator<E> {
         elt: Box<E>,
         generators: Vec<ast::Comprehension>,
@@ -837,7 +841,7 @@ define_operation! {
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct ExprCompare<E> {
         left: Box<E>,
         ops: Vec<ast::CmpOp>,
@@ -845,53 +849,53 @@ define_operation! {
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct ExprFString {
         value: ast::FStringValue,
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct ExprTString {
         value: ast::TStringValue,
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct ExprStringLiteral {
         value: ast::StringLiteralValue,
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct ExprBytesLiteral {
         value: ast::BytesLiteralValue,
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct ExprNumberLiteral {
         value: ast::Number,
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct ExprBooleanLiteral {
         value: bool,
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct ExprNoneLiteral {
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct ExprEllipsisLiteral {
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct ExprAttribute<E> {
         value: Box<E>,
         attr: ast::Identifier,
@@ -899,7 +903,7 @@ define_operation! {
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct ExprSubscript<E> {
         value: Box<E>,
         slice: Box<E>,
@@ -907,28 +911,28 @@ define_operation! {
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct ExprStarred<E> {
         value: Box<E>,
         ctx: ast::ExprContext,
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct ExprName {
         id: ast::name::Name,
         ctx: ast::ExprContext,
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct ExprList<E> {
         elts: Vec<E>,
         ctx: ast::ExprContext,
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct ExprTuple<E> {
         elts: Vec<E>,
         ctx: ast::ExprContext,
@@ -936,7 +940,7 @@ define_operation! {
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct ExprSlice<E> {
         lower: Option<Box<E>>,
         upper: Option<Box<E>>,
@@ -944,14 +948,14 @@ define_operation! {
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct ExprIpyEscapeCommand {
         kind: ast::IpyEscapeKind,
         value: Box<str>,
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct StmtFunctionDef<E> {
         is_async: bool,
         decorator_list: Vec<ast::Decorator>,
@@ -963,7 +967,7 @@ define_operation! {
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct StmtClassDef<E> {
         decorator_list: Vec<ast::Decorator>,
         name: ast::Identifier,
@@ -973,19 +977,19 @@ define_operation! {
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct StmtReturn<E> {
         value: Box<E>,
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct StmtDelete<E> {
         targets: Vec<E>,
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct StmtTypeAlias<E> {
         name: Box<E>,
         type_params: Option<Box<ast::TypeParams>>,
@@ -993,14 +997,14 @@ define_operation! {
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct StmtAssign<E> {
         targets: Vec<E>,
         value: Box<E>,
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct StmtAugAssign<E> {
         target: Box<E>,
         op: ast::Operator,
@@ -1008,7 +1012,7 @@ define_operation! {
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct StmtAnnAssign<E> {
         target: Box<E>,
         annotation: Box<E>,
@@ -1017,7 +1021,7 @@ define_operation! {
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct StmtFor<E> {
         is_async: bool,
         target: Box<E>,
@@ -1027,7 +1031,7 @@ define_operation! {
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct StmtWhile<E> {
         test: Box<E>,
         body: Vec<E>,
@@ -1035,7 +1039,7 @@ define_operation! {
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct StmtIf<E> {
         test: Box<E>,
         body: Vec<E>,
@@ -1043,7 +1047,7 @@ define_operation! {
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct StmtWith<E> {
         is_async: bool,
         items: Vec<ast::WithItem>,
@@ -1051,21 +1055,21 @@ define_operation! {
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct StmtMatch<E> {
         subject: Box<E>,
         cases: Vec<ast::MatchCase>,
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct StmtRaise<E> {
         exc: Option<Box<E>>,
         cause: Option<Box<E>>,
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct StmtTry<E> {
         body: Vec<E>,
         handlers: Vec<ast::ExceptHandler>,
@@ -1075,20 +1079,20 @@ define_operation! {
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct StmtAssert<E> {
         test: Box<E>,
         msg: Option<Box<E>>,
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct StmtImport {
         names: Vec<ast::Alias>,
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct StmtImportFrom {
         module: Option<ast::Identifier>,
         names: Vec<ast::Alias>,
@@ -1096,40 +1100,40 @@ define_operation! {
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct StmtGlobal {
         names: Vec<ast::Identifier>,
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct StmtNonlocal {
         names: Vec<ast::Identifier>,
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct StmtExpr<E> {
         value: Box<E>,
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct StmtPass {
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct StmtBreak {
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct StmtContinue {
     }
 }
 
-define_operation! {
+define_ruff_operation! {
     pub struct StmtIpyEscapeCommand {
         kind: ast::IpyEscapeKind,
         value: Box<str>,

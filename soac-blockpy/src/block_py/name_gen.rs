@@ -3,7 +3,18 @@ use std::fmt;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct FunctionId(u64);
 
 impl FunctionId {
@@ -46,7 +57,19 @@ impl fmt::Display for FunctionId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct BlockLabel {
     index: u32,
 }
@@ -103,11 +126,15 @@ struct FunctionNameGenState {
 
 impl FunctionNameGen {
     fn new(function_id: FunctionId) -> Self {
+        Self::recovered(function_id, 0, 0)
+    }
+
+    pub fn recovered(function_id: FunctionId, next_block_id: u32, next_tmp_id: usize) -> Self {
         Self {
             state: Arc::new(FunctionNameGenState {
                 function_id,
-                next_block_id: AtomicUsize::new(0),
-                next_tmp_id: AtomicUsize::new(0),
+                next_block_id: AtomicUsize::new(next_block_id as usize),
+                next_tmp_id: AtomicUsize::new(next_tmp_id),
             }),
         }
     }
@@ -146,9 +173,13 @@ pub struct ModuleNameGen {
 
 impl ModuleNameGen {
     pub fn new(module_id: u32) -> Self {
+        Self::recovered(module_id, 1)
+    }
+
+    pub fn recovered(module_id: u32, next_function_id: u32) -> Self {
         Self {
             module_id,
-            state: Arc::new(AtomicU32::new(1)),
+            state: Arc::new(AtomicU32::new(next_function_id)),
         }
     }
 
@@ -175,5 +206,11 @@ impl Clone for ModuleNameGen {
 impl Default for ModuleNameGen {
     fn default() -> Self {
         Self::new(0)
+    }
+}
+
+impl Default for FunctionNameGen {
+    fn default() -> Self {
+        Self::recovered(FunctionId::global(), 0, 0)
     }
 }

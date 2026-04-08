@@ -21,6 +21,7 @@ ruff_text_size = { workspace = true }
 ruff_source_file = { workspace = true }
 regex = "1"
 serde_json = "1"
+rkyv = { version = "0.8", default-features = false, features = ["std", "bytecheck"] }
 similar = "2"
 log = "0.4"
 env_logger = "0.11"

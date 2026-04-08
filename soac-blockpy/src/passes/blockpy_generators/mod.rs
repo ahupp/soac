@@ -295,10 +295,7 @@ fn core_literal_int(value: usize) -> InstrUnresolved {
     let text = value.to_string();
     literal_expr(
         NumberLiteral {
-            value: NumberLiteralValue::Int(
-                ast::Int::from_str_radix(text.as_str(), 10, text.as_str())
-                    .expect("usize decimal literal should always parse"),
-            ),
+            value: NumberLiteralValue::Int(crate::block_py::IntLiteral::from_decimal(text)),
         },
         Default::default(),
     )
@@ -341,7 +338,7 @@ fn core_call_expr(
         keywords
             .into_iter()
             .map(|(arg, value)| CallArgKeyword::Named {
-                arg: ast::Identifier::new(arg, Default::default()),
+                arg: arg.into(),
                 value,
             })
             .collect(),

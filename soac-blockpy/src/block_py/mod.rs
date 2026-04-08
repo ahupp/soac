@@ -45,7 +45,8 @@ pub use crate::passes::{
 pub use counters::{CounterDef, CounterId, CounterScope, CounterSite, IncrementCounter};
 pub(crate) use literal::literal_expr;
 pub use literal::{
-    BytesLiteral, Literal, LiteralValue, NumberLiteral, NumberLiteralValue, StringLiteral,
+    BytesLiteral, IntLiteral, Literal, LiteralValue, NumberLiteral, NumberLiteralValue,
+    StringLiteral,
 };
 #[allow(unused_imports)]
 pub(crate) use map::{
@@ -66,7 +67,9 @@ fn is_internal_symbol(name: &str) -> bool {
     name.starts_with("_dp_") || name == "__soac__"
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct LocalLocation(pub u32);
 
 impl LocalLocation {
@@ -75,7 +78,9 @@ impl LocalLocation {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct GlobalSlot(pub u32);
 
 impl GlobalSlot {
@@ -84,7 +89,9 @@ impl GlobalSlot {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub enum CellLocation {
     Owned(u32),
     Closure(u32),
@@ -111,7 +118,9 @@ impl CellLocation {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub enum NameLocation {
     Local(LocalLocation),
     GlobalName,
@@ -242,10 +251,53 @@ pub trait Instr: Clone + fmt::Debug + Sized {
     fn constant_none() -> Self;
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct BlockPyName {
+    id: String,
+}
+
+impl BlockPyName {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self { id: id.into() }
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.id.as_str()
+    }
+
+    pub fn into_ast_name(self) -> ast::name::Name {
+        ast::name::Name::new(self.id)
+    }
+}
+
+impl fmt::Display for BlockPyName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<&str> for BlockPyName {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<String> for BlockPyName {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<ast::name::Name> for BlockPyName {
+    fn from(value: ast::name::Name) -> Self {
+        Self::new(value.as_str())
+    }
+}
+
+#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum UnresolvedName {
-    SourceName(ast::name::Name),
-    RuntimeName(ast::name::Name),
+    SourceName(BlockPyName),
+    RuntimeName(BlockPyName),
 }
 
 impl fmt::Debug for UnresolvedName {
@@ -270,23 +322,26 @@ impl NameLike for UnresolvedName {
     }
 }
 
-impl From<ast::name::Name> for UnresolvedName {
-    fn from(value: ast::name::Name) -> Self {
-        Self::SourceName(value)
+impl<T> From<T> for UnresolvedName
+where
+    T: Into<BlockPyName>,
+{
+    fn from(value: T) -> Self {
+        Self::SourceName(value.into())
     }
 }
 
 impl UnresolvedName {
     pub fn name(self) -> ast::name::Name {
         match self {
-            Self::SourceName(name) | Self::RuntimeName(name) => name,
+            Self::SourceName(name) | Self::RuntimeName(name) => name.into_ast_name(),
         }
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct ResolvedName {
-    pub id: ruff_python_ast::name::Name,
+    pub id: BlockPyName,
     pub location: NameLocation,
 }
 
@@ -326,7 +381,7 @@ impl NameLike for ResolvedName {
 
     fn runtime_name(name: &str) -> Self {
         Self {
-            id: name.into(),
+            id: BlockPyName::new(name),
             location: NameLocation::RuntimeName,
         }
     }
@@ -340,7 +395,7 @@ impl NameLike for ResolvedName {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum FunctionKind {
     Function,
     Coroutine,
@@ -348,7 +403,7 @@ pub enum FunctionKind {
     AsyncGenerator,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct Block<I: Instr> {
     pub label: BlockLabel,
     pub body: Vec<I>,
@@ -459,8 +514,9 @@ impl<I: Instr> Block<I> {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct BlockPyModule<P: ModuleShape> {
+    #[rkyv(with = rkyv::with::Skip)]
     pub module_name_gen: ModuleNameGen,
     pub global_names: Vec<String>,
     pub callable_defs: Vec<BlockPyFunction<P>>,
@@ -537,7 +593,7 @@ where
     )
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum CallArgPositional<E> {
     Positional(E),
     Starred(E),
@@ -581,9 +637,52 @@ impl<E> CallArgPositional<E> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct KeywordName {
+    id: String,
+}
+
+impl KeywordName {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self { id: id.into() }
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.id.as_str()
+    }
+
+    pub fn into_ast_identifier(self, range: ruff_text_size::TextRange) -> ast::Identifier {
+        ast::Identifier::new(self.id, range)
+    }
+}
+
+impl fmt::Display for KeywordName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<&str> for KeywordName {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<String> for KeywordName {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<ast::Identifier> for KeywordName {
+    fn from(value: ast::Identifier) -> Self {
+        Self::new(value.id.as_str())
+    }
+}
+
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum CallArgKeyword<E> {
-    Named { arg: ast::Identifier, value: E },
+    Named { arg: KeywordName, value: E },
     Starred(E),
 }
 
@@ -594,7 +693,7 @@ impl<E> CallArgKeyword<E> {
     ) -> Self {
         match keyword.arg {
             Some(arg) => Self::Named {
-                arg,
+                arg: arg.into(),
                 value: lower(keyword.value),
             },
             None => Self::Starred(lower(keyword.value)),
@@ -636,7 +735,7 @@ impl<E> CallArgKeyword<E> {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct FunctionName {
     pub bind_name: String,
     pub fn_name: String,
@@ -660,9 +759,10 @@ impl FunctionName {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct BlockPyFunction<P: ModuleShape> {
     pub function_id: FunctionId,
+    #[rkyv(with = rkyv::with::Skip)]
     pub name_gen: FunctionNameGen,
     pub names: FunctionName,
     pub kind: FunctionKind,
@@ -714,7 +814,7 @@ pub trait ModuleShape: Clone + fmt::Debug {
 pub type ResolvedStorageBlock = Block<InstrResolved>;
 pub type CodegenBlock = Block<InstrCodegen>;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct BlockBuilder<I: Instr> {
     pub body: Vec<I>,
     pub term: Option<BlockTerm<I>>,
@@ -781,7 +881,7 @@ impl<I: Instr> BlockBuilder<I> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum BlockTerm<I: Instr> {
     Jump(BlockEdge),
     IfTerm(TermIf<I>),
@@ -840,26 +940,26 @@ impl<I: Instr> BlockTerm<I> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct TermIf<I: Instr> {
     pub test: I,
     pub then_label: BlockLabel,
     pub else_label: BlockLabel,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct TermBranchTable<I: Instr> {
     pub index: I,
     pub targets: Vec<BlockLabel>,
     pub default_label: BlockLabel,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct TermRaise<I: Instr> {
     pub exc: Option<I>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct BlockEdge {
     pub target: BlockLabel,
     pub args: Vec<BlockArg>,
@@ -878,7 +978,7 @@ impl BlockEdge {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum BlockArg {
     Name(String),
     None,
@@ -886,7 +986,7 @@ pub enum BlockArg {
     AbruptKind(AbruptKind),
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum AbruptKind {
     Fallthrough,
     Return,
@@ -895,14 +995,14 @@ pub enum AbruptKind {
     Continue,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum BlockParamRole {
     Exception,
     AbruptKind,
     AbruptPayload,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct BlockParam {
     pub name: String,
     pub role: BlockParamRole,

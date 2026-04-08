@@ -251,8 +251,6 @@ mod tests {
     };
     use crate::passes::InstrRuff;
     use crate::py_expr;
-    use ruff_python_ast::name::Name;
-
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct CallHotTargetsCounterSpec {
         function_id: FunctionId,
@@ -387,7 +385,7 @@ mod tests {
 
     fn runtime_name_expr(name: &str, meta: Meta) -> InstrCodegen {
         Load::new(ResolvedName {
-            id: Name::new(name),
+            id: name.into(),
             location: NameLocation::RuntimeName,
         })
         .with_meta(meta)

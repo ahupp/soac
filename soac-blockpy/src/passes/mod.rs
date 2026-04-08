@@ -108,26 +108,34 @@ impl Instr for InstrRuff {
     }
 }
 
-#[derive(Clone, derive_more::From)]
+#[derive(Clone, derive_more::From, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[rkyv(serialize_bounds(
+    __S: rkyv::ser::Writer + rkyv::ser::Allocator,
+    __S::Error: rkyv::rancor::Source,
+))]
+#[rkyv(deserialize_bounds(__D::Error: rkyv::rancor::Source))]
+#[rkyv(bytecheck(bounds(
+    __C: rkyv::validation::ArchiveContext,
+)))]
 #[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, Debug)]
 pub enum InstrCodegen {
-    BinOp(BinOp<Self>),
-    UnaryOp(UnaryOp<Self>),
-    CalleeFunctionId(CalleeFunctionId<Self>),
-    Call(Call<Self>),
-    CallDirect(CallDirect<Self>),
-    GetAttr(GetAttr<Self>),
-    SetAttr(SetAttr<Self>),
-    GetItem(GetItem<Self>),
-    SetItem(SetItem<Self>),
-    DelItem(DelItem<Self>),
-    Load(Load<Self>),
-    Store(Store<Self>),
-    Del(Del<Self>),
-    MakeCell(MakeCell<Self>),
+    BinOp(#[rkyv(omit_bounds)] BinOp<Self>),
+    UnaryOp(#[rkyv(omit_bounds)] UnaryOp<Self>),
+    CalleeFunctionId(#[rkyv(omit_bounds)] CalleeFunctionId<Self>),
+    Call(#[rkyv(omit_bounds)] Call<Self>),
+    CallDirect(#[rkyv(omit_bounds)] CallDirect<Self>),
+    GetAttr(#[rkyv(omit_bounds)] GetAttr<Self>),
+    SetAttr(#[rkyv(omit_bounds)] SetAttr<Self>),
+    GetItem(#[rkyv(omit_bounds)] GetItem<Self>),
+    SetItem(#[rkyv(omit_bounds)] SetItem<Self>),
+    DelItem(#[rkyv(omit_bounds)] DelItem<Self>),
+    Load(#[rkyv(omit_bounds)] Load<Self>),
+    Store(#[rkyv(omit_bounds)] Store<Self>),
+    Del(#[rkyv(omit_bounds)] Del<Self>),
+    MakeCell(#[rkyv(omit_bounds)] MakeCell<Self>),
     IncrementCounter(IncrementCounter),
     CellRef(CellRef),
-    MakeFunction(MakeFunction<Self>),
+    MakeFunction(#[rkyv(omit_bounds)] MakeFunction<Self>),
 }
 
 impl Instr for InstrCodegen {
@@ -201,25 +209,46 @@ impl Instr for InstrWithYield {
     }
 }
 
-#[derive(Clone, derive_more::From, DelegateMatchDefault)]
+#[derive(
+    Clone,
+    derive_more::From,
+    DelegateMatchDefault,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+#[rkyv(archive_bounds(N: rkyv::Archive))]
+#[rkyv(serialize_bounds(
+    N: rkyv::Serialize<__S>,
+    __S: rkyv::ser::Writer + rkyv::ser::Allocator,
+    __S::Error: rkyv::rancor::Source,
+))]
+#[rkyv(deserialize_bounds(
+    rkyv::Archived<N>: rkyv::Deserialize<N, __D>,
+    __D::Error: rkyv::rancor::Source,
+))]
+#[rkyv(bytecheck(bounds(
+    __C: rkyv::validation::ArchiveContext,
+    rkyv::Archived<N>: rkyv::bytecheck::CheckBytes<__C>,
+)))]
 #[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, Debug)]
 pub enum InstrLow<N: NameLike> {
     Literal(LiteralValue),
-    BinOp(BinOp<Self>),
-    UnaryOp(UnaryOp<Self>),
-    Call(Call<Self>),
-    GetAttr(GetAttr<Self>),
-    SetAttr(SetAttr<Self>),
-    GetItem(GetItem<Self>),
-    SetItem(SetItem<Self>),
-    DelItem(DelItem<Self>),
-    Load(Load<Self>),
-    Store(Store<Self>),
-    Del(Del<Self>),
-    MakeCell(MakeCell<Self>),
+    BinOp(#[rkyv(omit_bounds)] BinOp<Self>),
+    UnaryOp(#[rkyv(omit_bounds)] UnaryOp<Self>),
+    Call(#[rkyv(omit_bounds)] Call<Self>),
+    GetAttr(#[rkyv(omit_bounds)] GetAttr<Self>),
+    SetAttr(#[rkyv(omit_bounds)] SetAttr<Self>),
+    GetItem(#[rkyv(omit_bounds)] GetItem<Self>),
+    SetItem(#[rkyv(omit_bounds)] SetItem<Self>),
+    DelItem(#[rkyv(omit_bounds)] DelItem<Self>),
+    Load(#[rkyv(omit_bounds)] Load<Self>),
+    Store(#[rkyv(omit_bounds)] Store<Self>),
+    Del(#[rkyv(omit_bounds)] Del<Self>),
+    MakeCell(#[rkyv(omit_bounds)] MakeCell<Self>),
     CellRefForName(CellRefForName),
     CellRef(CellRef),
-    MakeFunction(MakeFunction<Self>),
+    MakeFunction(#[rkyv(omit_bounds)] MakeFunction<Self>),
 }
 
 impl<N: NameLike> Instr for InstrLow<N> {
@@ -254,14 +283,14 @@ impl ModuleShape for CoreModuleShape {
     type Instr = InstrLow<UnresolvedName>;
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct ResolvedStorageModuleShape;
 
 impl ModuleShape for ResolvedStorageModuleShape {
     type Instr = InstrLow<ResolvedName>;
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct CodegenModuleShape;
 
 impl ModuleShape for CodegenModuleShape {

@@ -1,11 +1,16 @@
 macro_rules! define_operation {
     (
+        $(#[$attrs:meta])*
         $vis:vis struct $name:ident<$expr_ty:ident> {
             $($fields:tt)*
         }
     ) => {
         define_operation!(
             @collect_fields
+            [
+                #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+                $(#[$attrs])*
+            ]
             [$vis]
             [$name]
             [$expr_ty]
@@ -18,6 +23,7 @@ macro_rules! define_operation {
     };
     (
         @collect_fields
+        [$($attrs:tt)*]
         [$vis:vis]
         [$name:ident]
         [$expr_ty:ident]
@@ -27,6 +33,7 @@ macro_rules! define_operation {
         [$($ctor_init:tt)*]
     ) => {
         #[derive(Clone)]
+        $($attrs)*
         $vis struct $name<$expr_ty: Instr> {
             _meta: Meta,
             $($struct_fields)*
@@ -113,12 +120,17 @@ macro_rules! define_operation {
         }
     };
     (
+        $(#[$attrs:meta])*
         $vis:vis struct $name:ident {
             $($fields:tt)*
         }
     ) => {
         define_operation!(
             @collect_value_fields
+            [
+                #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+                $(#[$attrs])*
+            ]
             [$vis]
             [$name]
             []
@@ -130,6 +142,7 @@ macro_rules! define_operation {
     };
     (
         @collect_value_fields
+        [$($attrs:tt)*]
         [$vis:vis]
         [$name:ident]
         [$($raw_fields:tt)*]
@@ -138,6 +151,7 @@ macro_rules! define_operation {
         [$($ctor_init:tt)*]
     ) => {
         #[derive(Clone)]
+        $($attrs)*
         $vis struct $name {
             _meta: Meta,
             $($struct_fields)*
@@ -216,6 +230,7 @@ macro_rules! define_operation {
     };
     (
         @collect_value_fields
+        [$($attrs:tt)*]
         [$vis:vis]
         [$name:ident]
         [$($raw_fields:tt)*]
@@ -227,6 +242,7 @@ macro_rules! define_operation {
     ) => {
         define_operation!(
             @collect_value_fields
+            [$($attrs)*]
             [$vis]
             [$name]
             [$($raw_fields)* $field: $ty,]
@@ -238,6 +254,7 @@ macro_rules! define_operation {
     };
     (
         @collect_value_fields
+        [$($attrs:tt)*]
         [$vis:vis]
         [$name:ident]
         [$($raw_fields:tt)*]
@@ -248,6 +265,7 @@ macro_rules! define_operation {
     ) => {
         define_operation!(
             @collect_value_fields
+            [$($attrs)*]
             [$vis]
             [$name]
             [$($raw_fields)* $field: $ty,]
@@ -258,6 +276,7 @@ macro_rules! define_operation {
     };
     (
         @collect_fields
+        [$($attrs:tt)*]
         [$vis:vis]
         [$name:ident]
         [$expr_ty:ident]
@@ -270,6 +289,7 @@ macro_rules! define_operation {
     ) => {
         define_operation!(
             @collect_fields
+            [$($attrs)*]
             [$vis]
             [$name]
             [$expr_ty]
@@ -282,6 +302,7 @@ macro_rules! define_operation {
     };
     (
         @collect_fields
+        [$($attrs:tt)*]
         [$vis:vis]
         [$name:ident]
         [$expr_ty:ident]
@@ -294,6 +315,7 @@ macro_rules! define_operation {
     ) => {
         define_operation!(
             @collect_fields
+            [$($attrs)*]
             [$vis]
             [$name]
             [$expr_ty]
@@ -306,6 +328,7 @@ macro_rules! define_operation {
     };
     (
         @collect_fields
+        [$($attrs:tt)*]
         [$vis:vis]
         [$name:ident]
         [$expr_ty:ident]
@@ -317,6 +340,7 @@ macro_rules! define_operation {
     ) => {
         define_operation!(
             @collect_fields
+            [$($attrs)*]
             [$vis]
             [$name]
             [$expr_ty]
@@ -328,6 +352,7 @@ macro_rules! define_operation {
     };
     (
         @collect_fields
+        [$($attrs:tt)*]
         [$vis:vis]
         [$name:ident]
         [$expr_ty:ident]
@@ -340,6 +365,7 @@ macro_rules! define_operation {
     ) => {
         define_operation!(
             @collect_fields
+            [$($attrs)*]
             [$vis]
             [$name]
             [$expr_ty]
@@ -352,6 +378,7 @@ macro_rules! define_operation {
     };
     (
         @collect_fields
+        [$($attrs:tt)*]
         [$vis:vis]
         [$name:ident]
         [$expr_ty:ident]
@@ -363,6 +390,7 @@ macro_rules! define_operation {
     ) => {
         define_operation!(
             @collect_fields
+            [$($attrs)*]
             [$vis]
             [$name]
             [$expr_ty]
@@ -374,6 +402,7 @@ macro_rules! define_operation {
     };
     (
         @collect_fields
+        [$($attrs:tt)*]
         [$vis:vis]
         [$name:ident]
         [$expr_ty:ident]
@@ -385,6 +414,7 @@ macro_rules! define_operation {
     ) => {
         define_operation!(
             @collect_fields
+            [$($attrs)*]
             [$vis]
             [$name]
             [$expr_ty]
@@ -396,6 +426,7 @@ macro_rules! define_operation {
     };
     (
         @collect_fields
+        [$($attrs:tt)*]
         [$vis:vis]
         [$name:ident]
         [$expr_ty:ident]
@@ -408,6 +439,7 @@ macro_rules! define_operation {
     ) => {
         define_operation!(
             @collect_fields
+            [$($attrs)*]
             [$vis]
             [$name]
             [$expr_ty]
@@ -420,6 +452,7 @@ macro_rules! define_operation {
     };
     (
         @collect_fields
+        [$($attrs:tt)*]
         [$vis:vis]
         [$name:ident]
         [$expr_ty:ident]
@@ -431,6 +464,7 @@ macro_rules! define_operation {
     ) => {
         define_operation!(
             @collect_fields
+            [$($attrs)*]
             [$vis]
             [$name]
             [$expr_ty]
@@ -774,4 +808,45 @@ macro_rules! define_operation {
     };
 }
 
+macro_rules! define_ruff_operation {
+    (
+        $(#[$attrs:meta])*
+        $vis:vis struct $name:ident<$expr_ty:ident> {
+            $($fields:tt)*
+        }
+    ) => {
+        define_operation!(
+            @collect_fields
+            [$(#[$attrs])*]
+            [$vis]
+            [$name]
+            [$expr_ty]
+            [$($fields)*]
+            []
+            []
+            []
+            $($fields)*
+        );
+    };
+    (
+        $(#[$attrs:meta])*
+        $vis:vis struct $name:ident {
+            $($fields:tt)*
+        }
+    ) => {
+        define_operation!(
+            @collect_value_fields
+            [$(#[$attrs])*]
+            [$vis]
+            [$name]
+            []
+            []
+            []
+            []
+            $($fields)*
+        );
+    };
+}
+
 pub(crate) use define_operation;
+pub(crate) use define_ruff_operation;

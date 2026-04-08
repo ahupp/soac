@@ -1,7 +1,7 @@
 use crate::passes::ast_to_ast::expr_utils::make_dp_tuple;
 use ruff_python_ast::{self as ast, Expr};
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum ParamKind {
     Any,
     PosOnly,
@@ -10,7 +10,7 @@ pub enum ParamKind {
     KwArg,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct Param {
     pub name: String,
     pub kind: ParamKind,
@@ -23,7 +23,9 @@ pub enum ParamDefaultSource<'a> {
     KeywordOnly(&'a str),
 }
 
-#[derive(Debug, Clone, Default, Eq, PartialEq)]
+#[derive(
+    Debug, Clone, Default, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct ParamSpec {
     pub params: Vec<Param>,
 }

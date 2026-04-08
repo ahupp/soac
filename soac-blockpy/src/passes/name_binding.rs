@@ -5,10 +5,10 @@ use crate::block_py::{
     BlockTerm, Call, CallArgPositional, CallableScopeInfo, CallableScopeKind, CellBindingKind,
     CellCaptureBinding, CellLocation, CellRef, CellRefForName, ChildVisitable, ClassBodyFallback,
     ClosureInit, ClosureSlot, Del, DelItem, EffectiveBinding, FunctionId, FunctionKind, HasMeta,
-    InstrLow, InstrResolved, InstrUnresolved, Load, LocalLocation, MakeCell, MakeFunction,
-    MapFunction, MapInstr, Mappable, NameLike, NameLocation, NumberLiteral, NumberLiteralValue,
-    ResolvedName, SetItem, StorageLayout, Store, StringLiteral, UnresolvedName, Visit, VisitMut,
-    WithMeta,
+    InstrLow, InstrResolved, InstrUnresolved, IntLiteral, Load, LocalLocation, MakeCell,
+    MakeFunction, MapFunction, MapInstr, Mappable, NameLike, NameLocation, NumberLiteral,
+    NumberLiteralValue, ResolvedName, SetItem, StorageLayout, Store, StringLiteral, UnresolvedName,
+    Visit, VisitMut, WithMeta,
 };
 use crate::passes::ruff_to_blockpy::{
     populate_exception_edge_args, rewrite_current_exception_in_core_blocks,
@@ -219,10 +219,7 @@ fn core_int_expr(
     let text = value.to_string();
     literal_expr(
         NumberLiteral {
-            value: NumberLiteralValue::Int(
-                ast::Int::from_str_radix(text.as_str(), 10, text.as_str())
-                    .expect("function id should round-trip through Int"),
-            ),
+            value: NumberLiteralValue::Int(IntLiteral::from_decimal(text)),
         },
         crate::block_py::Meta::new(node_index, range),
     )
@@ -903,16 +900,13 @@ fn closure_slot_init_expr(slot: &ClosureSlot) -> InstrUnresolved {
         ClosureInit::DeletedSentinel => deleted_sentinel_expr(node_index, range),
         ClosureInit::RuntimePcUnstarted => literal_expr(
             NumberLiteral {
-                value: NumberLiteralValue::Int(ast::Int::ONE),
+                value: NumberLiteralValue::Int(IntLiteral::from_i64(1)),
             },
             crate::block_py::Meta::new(node_index, range),
         ),
         ClosureInit::RuntimeAbruptKindFallthrough => literal_expr(
             NumberLiteral {
-                value: NumberLiteralValue::Int(
-                    ast::Int::from_str_radix("0", 10, "0")
-                        .expect("zero should parse as an integer literal"),
-                ),
+                value: NumberLiteralValue::Int(IntLiteral::from_i64(0)),
             },
             crate::block_py::Meta::new(node_index, range),
         ),
@@ -1186,14 +1180,14 @@ impl MapInstr<InstrUnresolved, InstrUnresolved> for NameBindingMapper<'_> {
                 } else if let UnresolvedName::SourceName(name) = op.name {
                     if resolve_cell_storage_name(self.scope, name.as_str()).is_some() {
                         rewrite_raw_cell_storage_name_load(
-                            name.clone(),
+                            name.clone().into_ast_name(),
                             meta.clone(),
                             self.scope,
                             self,
                         )
                         .expect("raw cell-storage load guard should ensure rewrite target")
                     } else if should_rewrite_raw_name_load(name.as_str(), self.scope) {
-                        rewrite_name_load(name, meta, self.scope, self)
+                        rewrite_name_load(name.into_ast_name(), meta, self.scope, self)
                     } else {
                         Load::new(name).with_meta(meta).into()
                     }
@@ -1424,7 +1418,12 @@ fn rewrite_raw_cell_loads_in_expr(
                         scope.binding_kind(name.as_str()),
                         Some(BindingKind::Cell(_))
                     ) {
-                        *expr = rewrite_cell_name_load(name.clone(), op.meta(), scope, resolver);
+                        *expr = rewrite_cell_name_load(
+                            name.clone().into_ast_name(),
+                            op.meta(),
+                            scope,
+                            resolver,
+                        );
                         return;
                     }
                 }
@@ -2020,7 +2019,7 @@ impl NameLocator<'_> {
         self.resolve_raw_cell_location(source_name.as_str())
     }
 
-    fn locate_name(&mut self, name: ast::name::Name) -> ResolvedName {
+    fn locate_name(&mut self, name: crate::block_py::BlockPyName) -> ResolvedName {
         let name_text = name.to_string();
         let location = if self.exception_param_names.contains(name_text.as_str()) {
             let slot = self

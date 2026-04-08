@@ -66,7 +66,8 @@ mod tests {
         let literal = Literal::NumberLiteral(NumberLiteral {
             value: NumberLiteralValue::Int(
                 ast::Int::from_str_radix(value_str.as_str(), 10, value_str.as_str())
-                    .expect("test integer literal should parse"),
+                    .expect("test integer literal should parse")
+                    .into(),
             ),
         });
         InstrResolved::Literal(LiteralValue::new(literal))
@@ -576,13 +577,30 @@ mod tests {
     }
 
     fn assert_inlined_indexed_global_guard(rendered: &str, message: &str) {
+        let globals_base = i64_load_bases_for_offset(rendered, 40);
+        let indexed_names_base = i64_load_bases_for_offset(rendered, 32);
+        let loads_indexed_globals_and_names = globals_base
+            .iter()
+            .any(|base| indexed_names_base.iter().any(|other| other == base));
         assert!(
-            rendered.contains("load.i64 notrap v7+40")
-                && rendered.contains("load.i64 notrap v7+32")
+            loads_indexed_globals_and_names
                 && rendered.contains("load.i8 notrap")
                 && rendered.contains("iconst.i64 -1"),
             "{message}:\n{rendered}"
         );
+    }
+
+    fn i64_load_bases_for_offset(rendered: &str, offset: usize) -> Vec<&str> {
+        let offset_suffix = format!("+{offset}");
+        rendered
+            .lines()
+            .filter_map(|line| {
+                let load_arg = line.split_once("load.i64 notrap ")?.1;
+                let load_arg = load_arg.strip_prefix("aligned ").unwrap_or(load_arg);
+                let (base, _) = load_arg.split_once(offset_suffix.as_str())?;
+                Some(base.trim())
+            })
+            .collect()
     }
 
     fn vendored_python_home() -> std::path::PathBuf {

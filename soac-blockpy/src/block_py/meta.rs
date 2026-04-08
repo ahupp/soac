@@ -3,7 +3,19 @@ use ruff_python_ast::{self as ast, HasNodeIndex};
 use ruff_text_size::{Ranged, TextRange};
 use std::fmt;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct InstrId {
     block_label: BlockLabel,
     instr_index_in_block: u32,
@@ -32,10 +44,12 @@ impl fmt::Display for InstrId {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct Meta {
+    #[rkyv(with = rkyv::with::Skip)]
     pub node_index: ast::AtomicNodeIndex,
     pub instr_id: Option<InstrId>,
+    #[rkyv(with = rkyv::with::Skip)]
     pub range: TextRange,
 }
 

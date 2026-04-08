@@ -247,7 +247,7 @@ impl InstrRuffAstExt for InstrRuff {
                             CallArgKeyword::Named { arg, value } => ast::Keyword {
                                 range: value.meta().range,
                                 node_index: value.meta().node_index,
-                                arg: Some(arg),
+                                arg: Some(arg.into_ast_identifier(value.meta().range)),
                                 value: value.into_ast_expr(),
                             },
                             CallArgKeyword::Starred(value) => ast::Keyword {

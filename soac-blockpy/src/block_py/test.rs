@@ -103,7 +103,7 @@ fn call_and_keyword_arg_expr_helpers_preserve_shape() {
     assert!(matches!(starred, CallArgPositional::Starred(_)));
 
     let keyword = CallArgKeyword::Named {
-        arg: ast::Identifier::new("value", ruff_text_size::TextRange::default()),
+        arg: ast::Identifier::new("value", ruff_text_size::TextRange::default()).into(),
         value: py_expr!("a"),
     }
     .try_map_instr(|expr| -> Result<Expr, &'static str> {

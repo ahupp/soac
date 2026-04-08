@@ -7,20 +7,22 @@ use crate::passes::ast_to_ast::scope_helpers::cell_name;
 use ruff_python_ast::{self as ast};
 use std::collections::{HashMap, HashSet};
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum BindingTarget {
     Local,
     ModuleGlobal,
     ClassNamespace,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum CellBindingKind {
     Owner,
     Capture,
 }
 
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+#[derive(
+    Debug, Clone, Copy, Default, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub enum BindingKind {
     #[default]
     Local,
@@ -28,7 +30,9 @@ pub enum BindingKind {
     Cell(CellBindingKind),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Default, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct StorageLayout {
     pub freevars: Vec<ClosureSlot>,
     pub cellvars: Vec<ClosureSlot>,
@@ -94,14 +98,14 @@ impl StorageLayout {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct ClosureSlot {
     pub logical_name: String,
     pub storage_name: String,
     pub init: ClosureInit,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum ClosureInit {
     InheritedCapture,
     Parameter,
@@ -112,7 +116,9 @@ pub enum ClosureInit {
     Deferred,
 }
 
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+#[derive(
+    Debug, Clone, Copy, Default, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub enum CallableScopeKind {
     #[default]
     Function,
@@ -120,13 +126,13 @@ pub enum CallableScopeKind {
     Module,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum ClassBodyFallback {
     Global,
     Cell,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum EffectiveBinding {
     Local,
     Global,
@@ -140,13 +146,13 @@ pub enum BindingPurpose {
     Store,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct CellCaptureBinding {
     pub logical_name: String,
     pub source_name: String,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct CallableScopeInfo {
     pub names: FunctionName,
     pub scope_kind: CallableScopeKind,

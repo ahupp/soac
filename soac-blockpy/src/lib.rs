@@ -12,6 +12,7 @@ use std::sync::Once;
 use std::time::{Duration, Instant};
 
 pub mod block_py;
+pub mod codegen_cache;
 mod driver;
 pub mod fixture;
 mod namegen;
