@@ -274,7 +274,7 @@ fn module_globals_from_runtime<'py>(
     module_runtime: &soac_jit::ModuleRuntimeContext,
     operation: &str,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let globals_ptr = module_runtime.vmctx.globals_obj as *mut ffi::PyObject;
+    let globals_ptr = module_runtime.mod_ctx.globals_obj as *mut ffi::PyObject;
     if globals_ptr.is_null() {
         return Err(PyRuntimeError::new_err(format!(
             "JIT basic-block {operation} requires module runtime globals"

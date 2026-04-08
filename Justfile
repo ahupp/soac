@@ -811,9 +811,13 @@ benchmark loops="8000000": (update-venv) (build-extension "release")
   PROFILE_LOOPS="100000"
   BENCHMARK_CPU="${BENCHMARK_CPU:-}"
   BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS:-0}"
+  SPECIALIZED_LOOPS="${BENCHMARK_SPECIALIZED_LOOPS:-1000000}"
+  SPECIALIZED_RUNS="${BENCHMARK_SPECIALIZED_RUNS:-3}"
   echo "date: $(date +%F)"
   echo "loops: {{loops}}"
   echo "profile loops: ${PROFILE_LOOPS}"
+  echo "specialized loops: ${SPECIALIZED_LOOPS}"
+  echo "specialized runs: ${SPECIALIZED_RUNS}"
   echo "warmup loops: ${WARMUP_LOOPS}"
   echo "benchmark cpu: ${BENCHMARK_CPU}"
   echo "benchmark constant clocks: ${BENCHMARK_CONSTANT_CLOCKS}"
@@ -838,21 +842,25 @@ benchmark loops="8000000": (update-venv) (build-extension "release")
 
   site_count="$(just _call-target-specializations-from-dump "$counter_dump_path" | awk -F';' 'NF { print NF }')"
   if [[ -n "$site_count" && "$site_count" != "0" ]]; then
-    echo "jit transformed specialized pass (${site_count} callsites)"
-    LOOPS="{{loops}}" \
-    WARMUP_LOOPS="${WARMUP_LOOPS}" \
-    BENCHMARK_CPU="${BENCHMARK_CPU}" \
-    BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
-    DIET_PYTHON_COUNTERS_DIR="$LAST_BENCHMARK_COUNTERS_DIR" \
-    DIET_PYTHON_SPECIALIZATION_MODE=apply \
-      "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
+    for run in $(seq 1 "$SPECIALIZED_RUNS"); do
+      echo "jit transformed specialized pass (${site_count} callsites, run ${run}/${SPECIALIZED_RUNS})"
+      LOOPS="${SPECIALIZED_LOOPS}" \
+      WARMUP_LOOPS="${WARMUP_LOOPS}" \
+      BENCHMARK_CPU="${BENCHMARK_CPU}" \
+      BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
+      DIET_PYTHON_COUNTERS_DIR="$LAST_BENCHMARK_COUNTERS_DIR" \
+      DIET_PYTHON_SPECIALIZATION_MODE=apply \
+        "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
+    done
   else
-    echo "jit transformed specialized pass (no hot callsites recorded)"
-    LOOPS="{{loops}}" \
-    WARMUP_LOOPS="${WARMUP_LOOPS}" \
-    BENCHMARK_CPU="${BENCHMARK_CPU}" \
-    BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
-      "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
+    for run in $(seq 1 "$SPECIALIZED_RUNS"); do
+      echo "jit transformed specialized pass (no hot callsites recorded, run ${run}/${SPECIALIZED_RUNS})"
+      LOOPS="${SPECIALIZED_LOOPS}" \
+      WARMUP_LOOPS="${WARMUP_LOOPS}" \
+      BENCHMARK_CPU="${BENCHMARK_CPU}" \
+      BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
+        "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
+    done
   fi
 
   echo "stock cpython"

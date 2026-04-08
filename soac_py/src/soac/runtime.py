@@ -5,6 +5,7 @@ ELLIPSIS = Ellipsis
 TRUE = True
 FALSE = False
 NONE = None
+EMPTY_TUPLE = ()
 _SOAC_RUNTIME_READY = False
 
 from asyncio import coroutines as _coroutines

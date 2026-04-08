@@ -268,6 +268,31 @@ static DP_JIT_EXACT_LONG_BINARY_OP_IMPORT: ImportSpec = ImportSpec::new(
     &[SigType::I64, SigType::Pointer, SigType::Pointer],
     &[SigType::Pointer],
 );
+define_owned_import_spec!(
+    DP_JIT_EXACT_LONG_ADD_SLOT_IMPORT,
+    "dp_jit_exact_long_add_slot",
+    &[SigType::Pointer, SigType::Pointer]
+);
+define_owned_import_spec!(
+    DP_JIT_EXACT_LONG_SUB_SLOT_IMPORT,
+    "dp_jit_exact_long_sub_slot",
+    &[SigType::Pointer, SigType::Pointer]
+);
+define_owned_import_spec!(
+    DP_JIT_EXACT_LONG_MUL_SLOT_IMPORT,
+    "dp_jit_exact_long_mul_slot",
+    &[SigType::Pointer, SigType::Pointer]
+);
+define_owned_import_spec!(
+    DP_JIT_EXACT_LONG_TRUE_DIV_SLOT_IMPORT,
+    "dp_jit_exact_long_true_div_slot",
+    &[SigType::Pointer, SigType::Pointer]
+);
+define_owned_import_spec!(
+    DP_JIT_EXACT_LONG_RICHCOMPARE_SLOT_IMPORT,
+    "dp_jit_exact_long_richcompare_slot",
+    &[SigType::Pointer, SigType::Pointer, SigType::I32]
+);
 static DP_JIT_EXACT_LONG_UNARY_OP_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_exact_long_unary_op",
     &[SigType::I64, SigType::Pointer],
@@ -461,11 +486,10 @@ fn emit_specialized_getattr<'fb>(
         &[arg_values[0].0, arg_values[1].0, expected_index],
     );
     let direct_value = state.fb().inst_results(direct_inst)[0];
-    let direct_is_null =
-        state
-            .fb()
-            .ins()
-            .icmp(ir::condcodes::IntCC::Equal, direct_value, null_ptr);
+    let direct_is_null = state
+        .fb()
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, direct_value, null_ptr);
     state.fb().ins().brif(
         direct_is_null,
         fallback_block,
@@ -596,18 +620,14 @@ fn emit_specialized_setattr<'fb>(
         ],
     );
     let direct_result = state.fb().inst_results(direct_inst)[0];
-    let direct_missed =
-        state
-            .fb()
-            .ins()
-            .icmp(ir::condcodes::IntCC::Equal, direct_result, zero_i32);
-    state.fb().ins().brif(
-        direct_missed,
-        fallback_block,
-        &[],
-        direct_block,
-        &[],
-    );
+    let direct_missed = state
+        .fb()
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, direct_result, zero_i32);
+    state
+        .fb()
+        .ins()
+        .brif(direct_missed, fallback_block, &[], direct_block, &[]);
 
     state.fb().switch_to_block(direct_block);
     increment_counter_ptr_with_state(state, hit_counter_ptr);
@@ -704,13 +724,56 @@ fn emit_exact_long_binary_op<'fb, E>(
     state: &mut impl OperationEmitState<'fb, E>,
     arg_values: &[(ir::Value, bool)],
 ) -> ir::Value {
-    let func_ref = state.import_func(&DP_JIT_EXACT_LONG_BINARY_OP_IMPORT);
-    let i64_ty = state.ctx().consts.i64_ty;
-    let kind_value = state.fb().ins().iconst(i64_ty, kind as i64);
-    let call_inst = state
-        .fb()
-        .ins()
-        .call(func_ref, &[kind_value, arg_values[0].0, arg_values[1].0]);
+    let call_inst = match kind {
+        ExactIntBinaryOpKind::Add
+        | ExactIntBinaryOpKind::Sub
+        | ExactIntBinaryOpKind::Mul
+        | ExactIntBinaryOpKind::TrueDiv => {
+            let spec = match kind {
+                ExactIntBinaryOpKind::Add => &DP_JIT_EXACT_LONG_ADD_SLOT_IMPORT,
+                ExactIntBinaryOpKind::Sub => &DP_JIT_EXACT_LONG_SUB_SLOT_IMPORT,
+                ExactIntBinaryOpKind::Mul => &DP_JIT_EXACT_LONG_MUL_SLOT_IMPORT,
+                ExactIntBinaryOpKind::TrueDiv => &DP_JIT_EXACT_LONG_TRUE_DIV_SLOT_IMPORT,
+                _ => unreachable!(),
+            };
+            let func_ref = state.import_func(spec);
+            state
+                .fb()
+                .ins()
+                .call(func_ref, &[arg_values[0].0, arg_values[1].0])
+        }
+        ExactIntBinaryOpKind::Eq
+        | ExactIntBinaryOpKind::Ne
+        | ExactIntBinaryOpKind::Lt
+        | ExactIntBinaryOpKind::Le
+        | ExactIntBinaryOpKind::Gt
+        | ExactIntBinaryOpKind::Ge => {
+            let op = match kind {
+                ExactIntBinaryOpKind::Eq => ffi::Py_EQ,
+                ExactIntBinaryOpKind::Ne => ffi::Py_NE,
+                ExactIntBinaryOpKind::Lt => ffi::Py_LT,
+                ExactIntBinaryOpKind::Le => ffi::Py_LE,
+                ExactIntBinaryOpKind::Gt => ffi::Py_GT,
+                ExactIntBinaryOpKind::Ge => ffi::Py_GE,
+                _ => unreachable!(),
+            };
+            let func_ref = state.import_func(&DP_JIT_EXACT_LONG_RICHCOMPARE_SLOT_IMPORT);
+            let compare_op = state.fb().ins().iconst(ir::types::I32, op as i64);
+            state
+                .fb()
+                .ins()
+                .call(func_ref, &[arg_values[0].0, arg_values[1].0, compare_op])
+        }
+        _ => {
+            let func_ref = state.import_func(&DP_JIT_EXACT_LONG_BINARY_OP_IMPORT);
+            let i64_ty = state.ctx().consts.i64_ty;
+            let kind_value = state.fb().ins().iconst(i64_ty, kind as i64);
+            state
+                .fb()
+                .ins()
+                .call(func_ref, &[kind_value, arg_values[0].0, arg_values[1].0])
+        }
+    };
     state.release_arg_values(arg_values);
     let result = state.fb().inst_results(call_inst)[0];
     state.finish_owned_result(result)
@@ -907,8 +970,6 @@ fn emit_specialized_binop<'fb>(
     let instr_id = op.meta().instr_id?;
     let ptr_ty = state.ctx().consts.ptr_ty;
     let i64_ty = state.ctx().consts.i64_ty;
-    let vmctx_value = state.ctx().consts.vmctx_value;
-    let record_top_value_sample_ref = state.ctx().record_top_value_sample_ref;
     let counter_id = state
         .ctx()
         .operator_shape_counter_ids
@@ -941,11 +1002,20 @@ fn emit_specialized_binop<'fb>(
     let arg_values = state.emit_arg_values(&[op.left.as_ref(), op.right.as_ref()]);
     let shape = emit_binary_operator_shape_from_values(state, &arg_values);
     if let Some(counter_id) = counter_id {
-        let counter_id_value = state.fb().ins().iconst(i64_ty, counter_id.0 as i64);
-        state.fb().ins().call(
-            record_top_value_sample_ref,
-            &[vmctx_value, counter_id_value, shape],
-        );
+        if let Some(counter_ptr) = state
+            .ctx()
+            .top_value_counter_ptrs
+            .get(counter_id.0)
+            .copied()
+            .filter(|ptr| !ptr.is_null())
+        {
+            let record_top_value_sample_ref = state.ctx().record_top_value_sample_ref;
+            let counter_value = state.fb().ins().iconst(ptr_ty, counter_ptr as i64);
+            state
+                .fb()
+                .ins()
+                .call(record_top_value_sample_ref, &[counter_value, shape]);
+        }
     }
 
     let Some(exact_int_kind) = ExactIntBinaryOpKind::from_binop_kind(op.kind) else {
@@ -1005,8 +1075,6 @@ fn emit_specialized_unary_op<'fb>(
     let instr_id = op.meta().instr_id?;
     let ptr_ty = state.ctx().consts.ptr_ty;
     let i64_ty = state.ctx().consts.i64_ty;
-    let vmctx_value = state.ctx().consts.vmctx_value;
-    let record_top_value_sample_ref = state.ctx().record_top_value_sample_ref;
     let counter_id = state
         .ctx()
         .operator_shape_counter_ids
@@ -1039,11 +1107,20 @@ fn emit_specialized_unary_op<'fb>(
     let arg_values = state.emit_arg_values(&[op.operand.as_ref()]);
     let shape = emit_unary_operator_shape_from_values(state, &arg_values);
     if let Some(counter_id) = counter_id {
-        let counter_id_value = state.fb().ins().iconst(i64_ty, counter_id.0 as i64);
-        state.fb().ins().call(
-            record_top_value_sample_ref,
-            &[vmctx_value, counter_id_value, shape],
-        );
+        if let Some(counter_ptr) = state
+            .ctx()
+            .top_value_counter_ptrs
+            .get(counter_id.0)
+            .copied()
+            .filter(|ptr| !ptr.is_null())
+        {
+            let record_top_value_sample_ref = state.ctx().record_top_value_sample_ref;
+            let counter_value = state.fb().ins().iconst(ptr_ty, counter_ptr as i64);
+            state
+                .fb()
+                .ins()
+                .call(record_top_value_sample_ref, &[counter_value, shape]);
+        }
     }
 
     let exact_int_kind = ExactIntUnaryOpKind::from_unary_op_kind(op.kind);
@@ -1132,16 +1209,15 @@ fn emit_indexed_global_load_with_state<'fb>(
     let direct_block = state.fb().create_block();
     state.fb().append_block_param(direct_block, ptr_ty);
 
-    let direct_inst = state
+    let direct_inst = state.fb().ins().call(
+        load_global_indexed_ref,
+        &[globals_obj, name_obj, slot_index],
+    );
+    let direct_value = state.fb().inst_results(direct_inst)[0];
+    let direct_is_null = state
         .fb()
         .ins()
-        .call(load_global_indexed_ref, &[globals_obj, name_obj, slot_index]);
-    let direct_value = state.fb().inst_results(direct_inst)[0];
-    let direct_is_null =
-        state
-            .fb()
-            .ins()
-            .icmp(ir::condcodes::IntCC::Equal, direct_value, null_ptr);
+        .icmp(ir::condcodes::IntCC::Equal, direct_value, null_ptr);
     state.fb().ins().brif(
         direct_is_null,
         fallback_block,

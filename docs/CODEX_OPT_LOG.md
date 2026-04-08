@@ -1,12 +1,71 @@
 # Codex Optimization Log
 
+Chronological log of finalized performance changes made by Codex agents.
+Keep entries succinct: what changed, which jj change id carried it, the
+benchmarked throughput delta, and the headline pre/post numbers.
+
 ## 2026-04-08 - Inline runtime guard and indexed-field helpers
 
-- `kkoolpkp` inlines exact type/version guards into soac-runtime, replaces the
-  `_PyObject_GetDictPtr` call with direct dict/inline-values access in indexed
-  field helpers, and makes unsound indexed field stores return hit/miss status
-  instead of an owned temporary.
-- 100k pystone, default specialized: `154514 -> 160710 loops/s`.
-- 100k pystone, unsound indexed stores: `142627 -> 159810 loops/s`.
-- Headline after: default specialized `160710 loops/s`, opt-in unsound stores
-  `159810 loops/s`, same-run stock CPython about `555k loops/s`.
+- jj change id: `kkoolpkp`
+- summary: Type/version guards now inline through soac-runtime, indexed
+  field helpers use direct dict/inline-values access instead of
+  `_PyObject_GetDictPtr`, and the opt-in unsound indexed field-store path
+  reports hit/miss status instead of returning an owned temporary.
+- throughput: `+4.01%` 100k default-specialized pystone; `+12.03%`
+  100k opt-in unsound indexed-store pystone
+- pre-change benchmark:
+  - default specialized: `154514 loops/s`
+  - opt-in unsound indexed stores: `142627 loops/s`
+- post-change benchmark:
+  - default specialized: `160710 loops/s`
+  - opt-in unsound indexed stores: `159810 loops/s`
+  - same-run stock CPython: about `555k loops/s`
+
+## 2026-04-08 - Call PyLong slots directly for exact-int specialization
+
+- jj change id: `tuyrzlpu`
+- summary: Exact-`int` binary operator specialization now emits imports
+  for the profiled `PyLong_Type` number slots and rich-compare slot
+  instead of calling the generic Rust `dp_jit_exact_long_binary_op`
+  dispatch helper. The runtime JIT symbol table binds those imports to
+  CPython's `PyLong_Type.tp_as_number` / `tp_richcompare` function
+  pointers at registration time.
+- throughput: `+3.39%` median
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `154501`, `155750`, `141058 loops/s`
+  - stock CPython: `541272 loops/s`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `158845`, `159744`, `160164 loops/s`
+  - stock CPython: `550585 loops/s`
+
+## 2026-04-08 - Reuse the direct-call entry pointer load
+
+- jj change id: `tuyrzlpu`
+- summary: Direct-call codegen now carries `FunctionEnv.direct_code_ptr`
+  out of the metadata / lazy-compile check and reuses it for
+  `call_indirect`, removing the duplicate direct-code-pointer load and
+  null check from the fast path.
+- throughput: `+1.48%` median
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `158845`, `159744`, `160164 loops/s`
+  - stock CPython: `550585 loops/s`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `156111`, `162114`, `163148 loops/s`
+  - stock CPython: `551829 loops/s`
+
+## 2026-04-08 - Inline next-or-sentinel iterator progress
+
+- jj change id: `tuyrzlpu`
+- summary: Codegen now recognizes transformed calls to
+  `__soac__.next_or_sentinel(iterator)` and emits a native iterator
+  helper call instead of vectorcalling the transformed Python runtime
+  helper. The helper calls `PyIter_NextItem`, returns the module's
+  `ITER_COMPLETE` singleton when the iterator is exhausted, and leaves
+  real iterator errors on the existing null-return exception path.
+- throughput: `+8.06%` median
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `156111`, `162114`, `163148 loops/s`
+  - stock CPython: `551829 loops/s`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `175180`, `159439`, `178348 loops/s`
+  - stock CPython: `568659 loops/s`

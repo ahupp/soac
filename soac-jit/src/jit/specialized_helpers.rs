@@ -34,6 +34,8 @@ unsafe extern "C" {
         type_obj: *mut ffi::PyTypeObject,
         nitems: ffi::Py_ssize_t,
     ) -> *mut ffi::PyObject;
+    #[cfg(not(test))]
+    fn PyIter_NextItem(iterator: *mut ffi::PyObject, item: *mut *mut ffi::PyObject) -> libc::c_int;
 }
 
 #[cfg(not(test))]
@@ -120,6 +122,26 @@ unsafe extern "C" fn py_vectorcall_hook(
     ) as ObjPtr
 }
 
+#[cfg(not(test))]
+unsafe extern "C" fn next_or_sentinel_hook(iterator: ObjPtr, sentinel: ObjPtr) -> ObjPtr {
+    if iterator.is_null() || sentinel.is_null() {
+        ffi::PyErr_SetString(
+            ffi::PyExc_RuntimeError,
+            b"invalid arguments to dp_jit_next_or_sentinel\0".as_ptr() as *const i8,
+        );
+        return ptr::null_mut();
+    }
+    let mut item: *mut ffi::PyObject = ptr::null_mut();
+    match PyIter_NextItem(iterator as *mut ffi::PyObject, ptr::addr_of_mut!(item)) {
+        1 => item as ObjPtr,
+        0 => {
+            ffi::Py_INCREF(sentinel as *mut ffi::PyObject);
+            sentinel
+        }
+        _ => ptr::null_mut(),
+    }
+}
+
 unsafe extern "C" fn enter_recursive_call_hook() -> i32 {
     ffi::Py_EnterRecursiveCall(b" while calling a Python object\0".as_ptr() as *const i8)
 }
@@ -176,41 +198,21 @@ unsafe extern "C" fn finish_constructor_init_hook(obj: ObjPtr, init_result: ObjP
 }
 
 #[cfg(not(test))]
-unsafe extern "C" fn direct_code_ptr_hook(callable: ObjPtr) -> ObjPtr {
+unsafe extern "C" fn direct_function_context_hook(callable: ObjPtr) -> ObjPtr {
     if callable.is_null() {
         ffi::PyErr_SetString(
             ffi::PyExc_RuntimeError,
-            b"invalid null callable in dp_jit_direct_code_ptr\0".as_ptr() as *const i8,
+            b"invalid null callable in dp_jit_direct_function_context\0".as_ptr() as *const i8,
         );
         return ptr::null_mut();
     }
-    crate::registered_clif_direct_code_ptr(callable as *mut ffi::PyObject)
+    crate::registered_clif_function_context_ptr(callable as *mut ffi::PyObject)
         .unwrap_or(ptr::null_mut())
 }
 
 #[cfg(not(test))]
-unsafe extern "C" fn direct_vmctx_hook(callable: ObjPtr) -> ObjPtr {
-    if callable.is_null() {
-        ffi::PyErr_SetString(
-            ffi::PyExc_RuntimeError,
-            b"invalid null callable in dp_jit_direct_vmctx\0".as_ptr() as *const i8,
-        );
-        return ptr::null_mut();
-    }
-    crate::registered_clif_vmctx_ptr(callable as *mut ffi::PyObject).unwrap_or(ptr::null_mut())
-}
-
-#[cfg(not(test))]
-unsafe extern "C" fn direct_function_data_hook(callable: ObjPtr) -> ObjPtr {
-    if callable.is_null() {
-        ffi::PyErr_SetString(
-            ffi::PyExc_RuntimeError,
-            b"invalid null callable in dp_jit_direct_function_data\0".as_ptr() as *const i8,
-        );
-        return ptr::null_mut();
-    }
-    crate::registered_clif_runtime_objects_ptr(callable as *mut ffi::PyObject)
-        .unwrap_or(ptr::null_mut())
+unsafe extern "C" fn py_thread_state_get_hook() -> ObjPtr {
+    ffi::PyThreadState_Get().cast::<c_void>()
 }
 
 #[cfg(not(test))]
@@ -247,26 +249,16 @@ unsafe extern "C" fn py_call_with_kw_hook(
 }
 
 #[cfg(not(test))]
-unsafe extern "C" fn record_top_value_sample_hook(vmctx: ObjPtr, counter_id: i64, value: i64) {
-    if vmctx.is_null() || counter_id < 0 || value < 0 {
+unsafe extern "C" fn record_top_value_sample_hook(counter: ObjPtr, value: i64) {
+    if counter.is_null() || value < 0 {
         ffi::PyErr_SetString(
             ffi::PyExc_RuntimeError,
             b"invalid arguments to dp_jit_record_top_value_sample\0".as_ptr() as *const i8,
         );
         return;
     }
-    let vmctx = &*(vmctx as *const super::vmctx::JitModuleVmCtx);
-    let Some(shared_state) = vmctx.shared_module_state.as_ref() else {
-        ffi::PyErr_SetString(
-            ffi::PyExc_RuntimeError,
-            b"missing shared module state for top-value profiling\0".as_ptr() as *const i8,
-        );
-        return;
-    };
-    if let Err(err) = shared_state.record_top_value_sample(
-        soac_blockpy::block_py::CounterId(counter_id as usize),
-        value as u64,
-    ) {
+    if let Err(err) = crate::module_type::record_top_value_sample_counter_ptr(counter, value as u64)
+    {
         if let Ok(message) = std::ffi::CString::new(err) {
             ffi::PyErr_SetString(ffi::PyExc_RuntimeError, message.as_ptr());
         } else {
@@ -861,6 +853,10 @@ mod test_only_export_stubs {
         nargsf: ObjPtr,
         kwnames: ObjPtr
     ));
+    panic_dual_obj_export!(dp_jit_next_or_sentinel, dp_jit_next_or_sentinel_with_frame(
+        iterator: ObjPtr,
+        sentinel: ObjPtr
+    ));
     panic_dual_obj_export!(dp_jit_py_call_with_kw, dp_jit_py_call_with_kw_with_frame(
         callable: ObjPtr,
         args: ObjPtr,
@@ -871,15 +867,14 @@ mod test_only_export_stubs {
         expected_type: ObjPtr,
         expected_version: i64
     ));
-    panic_unit_export!(dp_jit_record_top_value_sample(vmctx: ObjPtr, counter_id: i64, value: i64));
+    panic_unit_export!(dp_jit_record_top_value_sample(counter: ObjPtr, value: i64));
     panic_dual_obj_export!(dp_jit_get_arg_item, dp_jit_get_arg_item_with_frame(
         args: ObjPtr,
         index: i64
     ));
     panic_obj_export!(dp_jit_load_runtime_obj(name: ObjPtr));
-    panic_obj_export!(dp_jit_direct_code_ptr(callable: ObjPtr));
-    panic_obj_export!(dp_jit_direct_vmctx(callable: ObjPtr));
-    panic_obj_export!(dp_jit_direct_function_data(callable: ObjPtr));
+    panic_obj_export!(dp_jit_direct_function_context(callable: ObjPtr));
+    panic_obj_export!(dp_jit_py_thread_state_get());
     panic_obj_export!(dp_jit_pyobject_getattr(obj: ObjPtr, attr: ObjPtr));
     panic_obj_export!(dp_jit_pyobject_setattr(obj: ObjPtr, attr: ObjPtr, value: ObjPtr));
     panic_obj_export!(dp_jit_pyobject_getitem(obj: ObjPtr, key: ObjPtr));
@@ -923,6 +918,11 @@ mod test_only_export_stubs {
         lhs: ObjPtr,
         rhs: ObjPtr
     ));
+    panic_obj_export!(dp_jit_exact_long_add_slot(lhs: ObjPtr, rhs: ObjPtr));
+    panic_obj_export!(dp_jit_exact_long_sub_slot(lhs: ObjPtr, rhs: ObjPtr));
+    panic_obj_export!(dp_jit_exact_long_mul_slot(lhs: ObjPtr, rhs: ObjPtr));
+    panic_obj_export!(dp_jit_exact_long_true_div_slot(lhs: ObjPtr, rhs: ObjPtr));
+    panic_obj_export!(dp_jit_exact_long_richcompare_slot(lhs: ObjPtr, rhs: ObjPtr, op: i32));
     panic_dual_obj_export!(dp_jit_exact_long_unary_op, dp_jit_exact_long_unary_op_with_frame(
         kind: i64,
         operand: ObjPtr
@@ -1003,6 +1003,13 @@ define_perf_toggle_export!(
 #[cfg(not(test))]
 define_perf_toggle_export!(
     ObjPtr,
+    dp_jit_next_or_sentinel,
+    dp_jit_next_or_sentinel_with_frame(iterator: ObjPtr, sentinel: ObjPtr) => next_or_sentinel_hook(iterator, sentinel)
+);
+
+#[cfg(not(test))]
+define_perf_toggle_export!(
+    ObjPtr,
     dp_jit_py_call_with_kw,
     dp_jit_py_call_with_kw_with_frame(callable: ObjPtr, args: ObjPtr, kw: ObjPtr) => py_call_with_kw_hook(callable, args, kw)
 );
@@ -1019,12 +1026,8 @@ define_perf_toggle_export!(
 );
 
 #[cfg(not(test))]
-pub unsafe extern "C" fn dp_jit_record_top_value_sample(
-    vmctx: ObjPtr,
-    counter_id: i64,
-    value: i64,
-) {
-    record_top_value_sample_hook(vmctx, counter_id, value)
+pub unsafe extern "C" fn dp_jit_record_top_value_sample(counter: ObjPtr, value: i64) {
+    record_top_value_sample_hook(counter, value)
 }
 
 #[cfg(not(test))]
@@ -1041,18 +1044,13 @@ pub unsafe extern "C" fn dp_jit_load_runtime_obj(name: ObjPtr) -> ObjPtr {
 }
 
 #[cfg(not(test))]
-pub unsafe extern "C" fn dp_jit_direct_code_ptr(callable: ObjPtr) -> ObjPtr {
-    direct_code_ptr_hook(callable)
+pub unsafe extern "C" fn dp_jit_direct_function_context(callable: ObjPtr) -> ObjPtr {
+    direct_function_context_hook(callable)
 }
 
 #[cfg(not(test))]
-pub unsafe extern "C" fn dp_jit_direct_vmctx(callable: ObjPtr) -> ObjPtr {
-    direct_vmctx_hook(callable)
-}
-
-#[cfg(not(test))]
-pub unsafe extern "C" fn dp_jit_direct_function_data(callable: ObjPtr) -> ObjPtr {
-    direct_function_data_hook(callable)
+pub unsafe extern "C" fn dp_jit_py_thread_state_get() -> ObjPtr {
+    py_thread_state_get_hook()
 }
 
 #[cfg(not(test))]
@@ -1613,6 +1611,56 @@ fn chosen_helper_symbol(fast: *const u8, with_frame: *const u8) -> *const u8 {
     }
 }
 
+#[cfg(not(test))]
+unsafe fn exact_long_number_slot_symbol(
+    slot_name: &str,
+    slot: Option<
+        unsafe extern "C" fn(*mut ffi::PyObject, *mut ffi::PyObject) -> *mut ffi::PyObject,
+    >,
+) -> *const u8 {
+    slot.unwrap_or_else(|| panic!("PyLong_Type is missing required number slot {slot_name}"))
+        as *const u8
+}
+
+#[cfg(not(test))]
+unsafe fn exact_long_richcompare_slot_symbol() -> *const u8 {
+    let long_type = std::ptr::addr_of_mut!(PyLong_Type);
+    (*long_type)
+        .tp_richcompare
+        .expect("PyLong_Type is missing required tp_richcompare slot") as *const u8
+}
+
+#[cfg(not(test))]
+unsafe fn register_exact_long_slot_symbols(builder: &mut JITBuilder) {
+    let long_type = std::ptr::addr_of_mut!(PyLong_Type);
+    let number = (*long_type).tp_as_number;
+    assert!(
+        !number.is_null(),
+        "PyLong_Type is missing required tp_as_number table"
+    );
+
+    builder.symbol(
+        "dp_jit_exact_long_add_slot",
+        exact_long_number_slot_symbol("nb_add", (*number).nb_add),
+    );
+    builder.symbol(
+        "dp_jit_exact_long_sub_slot",
+        exact_long_number_slot_symbol("nb_subtract", (*number).nb_subtract),
+    );
+    builder.symbol(
+        "dp_jit_exact_long_mul_slot",
+        exact_long_number_slot_symbol("nb_multiply", (*number).nb_multiply),
+    );
+    builder.symbol(
+        "dp_jit_exact_long_true_div_slot",
+        exact_long_number_slot_symbol("nb_true_divide", (*number).nb_true_divide),
+    );
+    builder.symbol(
+        "dp_jit_exact_long_richcompare_slot",
+        exact_long_richcompare_slot_symbol(),
+    );
+}
+
 pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol(
         "PyFunction_Type",
@@ -1641,6 +1689,13 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
         chosen_helper_symbol(
             dp_jit_py_vectorcall as *const u8,
             dp_jit_py_vectorcall_with_frame as *const u8,
+        ),
+    );
+    builder.symbol(
+        "dp_jit_next_or_sentinel",
+        chosen_helper_symbol(
+            dp_jit_next_or_sentinel as *const u8,
+            dp_jit_next_or_sentinel_with_frame as *const u8,
         ),
     );
     builder.symbol(
@@ -1678,13 +1733,12 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
         dp_jit_load_runtime_obj as *const u8,
     );
     builder.symbol(
-        "dp_jit_direct_code_ptr",
-        dp_jit_direct_code_ptr as *const u8,
+        "dp_jit_direct_function_context",
+        dp_jit_direct_function_context as *const u8,
     );
-    builder.symbol("dp_jit_direct_vmctx", dp_jit_direct_vmctx as *const u8);
     builder.symbol(
-        "dp_jit_direct_function_data",
-        dp_jit_direct_function_data as *const u8,
+        "dp_jit_py_thread_state_get",
+        dp_jit_py_thread_state_get as *const u8,
     );
     builder.symbol(
         "dp_jit_pyobject_getattr",
@@ -1775,6 +1829,33 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
             dp_jit_exact_long_binary_op_with_frame as *const u8,
         ),
     );
+    #[cfg(not(test))]
+    unsafe {
+        register_exact_long_slot_symbols(builder);
+    }
+    #[cfg(test)]
+    {
+        builder.symbol(
+            "dp_jit_exact_long_add_slot",
+            dp_jit_exact_long_add_slot as *const u8,
+        );
+        builder.symbol(
+            "dp_jit_exact_long_sub_slot",
+            dp_jit_exact_long_sub_slot as *const u8,
+        );
+        builder.symbol(
+            "dp_jit_exact_long_mul_slot",
+            dp_jit_exact_long_mul_slot as *const u8,
+        );
+        builder.symbol(
+            "dp_jit_exact_long_true_div_slot",
+            dp_jit_exact_long_true_div_slot as *const u8,
+        );
+        builder.symbol(
+            "dp_jit_exact_long_richcompare_slot",
+            dp_jit_exact_long_richcompare_slot as *const u8,
+        );
+    }
     builder.symbol(
         "dp_jit_exact_long_unary_op",
         chosen_helper_symbol(

@@ -140,7 +140,16 @@ current `@`. Do not treat another workspace's live `@` as a dependency.
    tooling, document it in `README.md` and add or update the relevant
    note in `AGENTS.md` in the same logical change.
 
-9. Run the full gate before submitting code changes.
+9. Record finalized performance changes.
+
+When a performance change is complete enough that you intend to keep it,
+append an entry to `docs/CODEX_OPT_LOG.md` in the same logical change.
+Keep entries succinct: include the jj change id, a short summary of the
+optimization, the benchmarked throughput delta, and the before/after
+headline numbers. Do not paste validation checklists, full command lines,
+or long run logs.
+
+10. Run the full gate before submitting code changes.
 
 Run `just test-all` before submitting unless the change is docs-only,
 such as `TODO.md`, `AGENTS.md`, or similar documentation-only files.
@@ -148,43 +157,43 @@ Put test output in `logs/`. Summarize the failures, separate expected
 failures from unexpected failures, investigate the root cause, report
 it, then fix it.
 
-10. When a logical set of changes is complete, freeze it before
+11. When a logical set of changes is complete, freeze it before
    integrating it.
 
 Run `jj new` so the finished work is no longer the live working commit.
 Rebase and integrate the finished change, not the live `@`.
 
-11. Try to advance `main` directly to the finished head.
+12. Try to advance `main` directly to the finished head.
 
 Prefer `jj bookmark move main -t <finished-head>` when the finished
 change is already a descendant of the current `main`. This avoids
 unnecessary rebases and duplicate sibling revisions.
 
-12. If advancing `main` fails because the finished head is not a
+13. If advancing `main` fails because the finished head is not a
    descendant of `main`, rebase the finished commit or finished stack
    onto `main`.
 
 Use `jj rebase` on the finished revision or stack root so the completed
 work sits directly on top of the current shared base.
 
-13. Resolve any conflicts and rerun the relevant tests.
+14. Resolve any conflicts and rerun the relevant tests.
 
 The rebased change is not ready to advance `main` until conflicts are
 resolved and the relevant checks have been rerun.
 
-14. Advance `main` to the finished head.
+15. Advance `main` to the finished head.
 
 This is the synchronization point. Once `main` moves, the finished work
 becomes the new shared base for future work.
 
-15. When another agent advances `main`, refresh and continue on top of
+16. When another agent advances `main`, refresh and continue on top of
     it.
 
 Run `jj workspace update-stale` and rebase your live work onto the new
 `main` as needed. Other agents should only depend on `main`, not on a
 peer workspace's live `@`.
 
-16. Report the result: run `jj diff --stat` on the completed change and
+17. Report the result: run `jj diff --stat` on the completed change and
 report its output, then describe the next step. If I did not ask to
 approve each step after the plan, continue with the next step.
 

@@ -117,6 +117,18 @@ impl SharedModuleState {
             .collect()
     }
 
+    pub(crate) fn top_value_counter_ptrs(&self) -> Vec<*mut c_void> {
+        self.counter_slots_by_id
+            .iter()
+            .map(|slot| match slot {
+                CounterRuntimeSlot::TopValues(slot) => {
+                    &self.top_value_counters[*slot] as *const Mutex<Counter<2, u64>> as *mut c_void
+                }
+                CounterRuntimeSlot::Scalar(_) => ptr::null_mut(),
+            })
+            .collect()
+    }
+
     pub fn counter_values(&self) -> &[u64] {
         &self.counter_values
     }
@@ -131,35 +143,6 @@ impl SharedModuleState {
             }
             CounterRuntimeSlot::TopValues(_) => 0,
         }
-    }
-
-    #[cfg_attr(test, allow(dead_code))]
-    pub(crate) fn record_top_value_sample(
-        &self,
-        counter_id: CounterId,
-        value: u64,
-    ) -> Result<(), String> {
-        let Some(slot) = self.counter_slots_by_id.get(counter_id.0).copied() else {
-            return Err(format!(
-                "missing counter slot for counter id {}",
-                counter_id.0
-            ));
-        };
-        let CounterRuntimeSlot::TopValues(slot) = slot else {
-            return Err(format!(
-                "counter id {} is not a top-value counter",
-                counter_id.0
-            ));
-        };
-        let counter = self
-            .top_value_counters
-            .get(slot)
-            .ok_or_else(|| format!("missing top-value counter slot {}", slot))?;
-        let mut counter = counter
-            .lock()
-            .map_err(|_| "top-value counter lock poisoned".to_string())?;
-        counter.record(value);
-        Ok(())
     }
 
     fn top_values_counter_snapshot(&self, counter_id: CounterId) -> Option<Vec<CounterEntry<u64>>> {
@@ -382,6 +365,22 @@ impl Drop for SharedModuleState {
             }
         }
     }
+}
+
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) unsafe fn record_top_value_sample_counter_ptr(
+    counter: *mut c_void,
+    value: u64,
+) -> Result<(), String> {
+    if counter.is_null() {
+        return Err("missing direct top-value counter pointer".to_string());
+    }
+    let counter = unsafe { &*(counter as *const Mutex<Counter<2, u64>>) };
+    let mut counter = counter
+        .lock()
+        .map_err(|_| "top-value counter lock poisoned".to_string())?;
+    counter.record(value);
+    Ok(())
 }
 
 fn counter_scope_name(scope: CounterScope) -> &'static str {

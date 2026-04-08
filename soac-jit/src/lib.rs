@@ -4,7 +4,7 @@
 include!(concat!(env!("OUT_DIR"), "/soac_runtime_clif.rs"));
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 mod jit;
 pub(crate) mod operator_specialization;
@@ -27,14 +27,15 @@ pub(crate) fn python_runtime_test_lock() -> &'static Mutex<()> {
 use log::info;
 use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::types::PyTuple;
 use soac_blockpy::block_py::{FunctionId, ParamKind};
 use soac_blockpy::passes::CodegenModuleShape;
+use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::any::Any;
 use std::cell::RefCell;
 use std::ffi::{CString, c_char, c_void};
+use std::mem;
 use std::panic::{self, AssertUnwindSafe};
-use std::ptr;
+use std::ptr::{self, NonNull};
 use std::time::Instant;
 
 unsafe extern "C" {
@@ -123,7 +124,7 @@ unsafe extern "C" fn function_owner_type_watcher_callback(
             {
                 let metadata = unsafe { PyFunction_GetSoacMetadata(func as *mut ffi::PyObject) };
                 if !metadata.is_null() {
-                    let data = unsafe { &mut *(metadata as *mut ClifFunctionData) };
+                    let data = unsafe { &mut *(metadata as *mut PyFunctionJitExtra) };
                     if unsafe { data.refresh_runtime_objects(func as *mut ffi::PyObject) }.is_err()
                     {
                         return -1;
@@ -231,31 +232,152 @@ thread_local! {
     };
 }
 
-struct FunctionRuntimeObjectBlock {
-    values: Box<[*mut ffi::PyObject]>,
+#[repr(C)]
+struct FunctionEnvAbiHeader {
+    direct_code_ptr: *const u8,
+    globals_obj: *mut ffi::PyObject,
 }
 
-impl FunctionRuntimeObjectBlock {
-    fn new(values: Box<[*mut ffi::PyObject]>) -> Self {
-        Self { values }
+struct FunctionEnv {
+    abi: NonNull<FunctionEnvAbiHeader>,
+    runtime_object_len: usize,
+    compiled_function: Option<Arc<CompiledFunctionHandle>>,
+}
+
+#[repr(C)]
+struct PyFunctionJitExtra {
+    function_env_ptr: *mut c_void,
+    function_id: FunctionId,
+    function_env: Box<FunctionEnv>,
+    module_state: Arc<module_type::SharedModuleState>,
+    compiled_vectorcall: Option<CompiledVectorcallTrampoline>,
+    compiled_vectorcall_entry: Option<jit::VectorcallEntryFn>,
+}
+
+struct CompiledFunctionHandle {
+    handle: *mut c_void,
+}
+
+impl Drop for CompiledFunctionHandle {
+    fn drop(&mut self) {
+        unsafe { jit::free_cranelift_run_bb_specialized_cached(self.handle) };
+        self.handle = ptr::null_mut();
+    }
+}
+
+struct CompiledVectorcallTrampoline {
+    handle: *mut c_void,
+}
+
+impl Drop for CompiledVectorcallTrampoline {
+    fn drop(&mut self) {
+        unsafe { jit::free_cranelift_vectorcall_trampoline(self.handle) };
+        self.handle = ptr::null_mut();
+    }
+}
+
+impl FunctionEnv {
+    fn runtime_objects_offset() -> usize {
+        mem::size_of::<FunctionEnvAbiHeader>()
     }
 
-    fn as_mut_ptr(&mut self) -> *mut *mut ffi::PyObject {
-        self.values.as_mut_ptr()
+    fn allocation_layout(runtime_object_len: usize) -> Layout {
+        let header_size = mem::size_of::<FunctionEnvAbiHeader>();
+        let runtime_object_size = runtime_object_len
+            .checked_mul(mem::size_of::<*mut ffi::PyObject>())
+            .expect("function runtime object block is too large");
+        let size = header_size
+            .checked_add(runtime_object_size)
+            .expect("function env allocation is too large");
+        Layout::from_size_align(size.max(1), mem::align_of::<FunctionEnvAbiHeader>())
+            .expect("function env allocation layout should be valid")
     }
 
-    unsafe fn replace_values(
+    unsafe fn new(
+        globals_obj: *mut ffi::PyObject,
+        mut runtime_object_values: Box<[*mut ffi::PyObject]>,
+    ) -> Result<Self, ()> {
+        if globals_obj.is_null() {
+            unsafe { cleanup_state_values(&mut runtime_object_values) };
+            return set_runtime_error("missing globals while creating JIT function environment");
+        }
+        unsafe { ffi::Py_INCREF(globals_obj) };
+        let runtime_object_len = runtime_object_values.len();
+        let layout = Self::allocation_layout(runtime_object_len);
+        let raw = unsafe { alloc(layout) };
+        let Some(abi) = NonNull::new(raw as *mut FunctionEnvAbiHeader) else {
+            handle_alloc_error(layout);
+        };
+        unsafe {
+            abi.as_ptr().write(FunctionEnvAbiHeader {
+                direct_code_ptr: ptr::null(),
+                globals_obj,
+            });
+            let runtime_objects =
+                raw.add(Self::runtime_objects_offset()) as *mut *mut ffi::PyObject;
+            ptr::copy_nonoverlapping(
+                runtime_object_values.as_ptr(),
+                runtime_objects,
+                runtime_object_len,
+            );
+        }
+        runtime_object_values.fill(ptr::null_mut());
+        Ok(Self {
+            abi,
+            runtime_object_len,
+            compiled_function: None,
+        })
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut c_void {
+        self.abi.as_ptr() as *mut c_void
+    }
+
+    fn header(&self) -> &FunctionEnvAbiHeader {
+        unsafe { self.abi.as_ref() }
+    }
+
+    fn header_mut(&mut self) -> &mut FunctionEnvAbiHeader {
+        unsafe { self.abi.as_mut() }
+    }
+
+    fn globals_obj(&self) -> *mut ffi::PyObject {
+        self.header().globals_obj
+    }
+
+    fn direct_code_ptr(&self) -> *const u8 {
+        self.header().direct_code_ptr
+    }
+
+    fn set_direct_code_ptr(&mut self, direct_code_ptr: *const u8) {
+        self.header_mut().direct_code_ptr = direct_code_ptr;
+    }
+
+    fn runtime_objects_mut(&mut self) -> &mut [*mut ffi::PyObject] {
+        unsafe {
+            let base = self.abi.as_ptr() as *mut u8;
+            let runtime_objects =
+                base.add(Self::runtime_objects_offset()) as *mut *mut ffi::PyObject;
+            std::slice::from_raw_parts_mut(runtime_objects, self.runtime_object_len)
+        }
+    }
+
+    unsafe fn replace_runtime_objects(
         &mut self,
         mut new_values: Box<[*mut ffi::PyObject]>,
     ) -> Result<(), ()> {
-        if new_values.len() != self.values.len() {
+        if new_values.len() != self.runtime_object_len {
             unsafe { cleanup_state_values(&mut new_values) };
             return Err(());
         }
-        for (slot, new_value) in self.values.iter_mut().zip(new_values.iter_mut()) {
+        for (slot, new_value) in self
+            .runtime_objects_mut()
+            .iter_mut()
+            .zip(new_values.iter_mut())
+        {
             let old_value = *slot;
             *slot = *new_value;
-            *new_value = std::ptr::null_mut();
+            *new_value = ptr::null_mut();
             if !old_value.is_null() {
                 unsafe { ffi::Py_DECREF(old_value) };
             }
@@ -264,33 +386,41 @@ impl FunctionRuntimeObjectBlock {
     }
 }
 
-impl Drop for FunctionRuntimeObjectBlock {
+impl Drop for FunctionEnv {
     fn drop(&mut self) {
-        unsafe { cleanup_state_values(&mut self.values) };
+        unsafe { cleanup_state_values(self.runtime_objects_mut()) };
+        let globals_obj = self.globals_obj();
+        if !globals_obj.is_null() {
+            unsafe { ffi::Py_DECREF(globals_obj) };
+            self.header_mut().globals_obj = ptr::null_mut();
+        }
+        let layout = Self::allocation_layout(self.runtime_object_len);
+        unsafe { dealloc(self.abi.as_ptr() as *mut u8, layout) };
     }
 }
 
-#[repr(C)]
-struct ClifFunctionData {
-    runtime_objects: *mut *mut ffi::PyObject,
-    function: soac_blockpy::block_py::BlockPyFunction<CodegenModuleShape>,
-    module_runtime: jit::ModuleRuntimeContext,
-    runtime_object_owner: FunctionRuntimeObjectBlock,
-    compiled_handle: *mut c_void,
-    compiled_vectorcall_handle: *mut c_void,
-    compiled_vectorcall_entry: Option<jit::VectorcallEntryFn>,
-}
+impl PyFunctionJitExtra {
+    fn function(&self) -> Result<&soac_blockpy::block_py::BlockPyFunction<CodegenModuleShape>, ()> {
+        self.module_state
+            .lookup_function(self.function_id)
+            .ok_or_else(|| unsafe {
+                ffi::PyErr_SetString(
+                    ffi::PyExc_RuntimeError,
+                    c"missing JIT function in registered module state".as_ptr(),
+                );
+            })
+    }
 
-impl ClifFunctionData {
-    fn runtime_objects_ptr(&self) -> *mut c_void {
-        self.runtime_objects as *mut c_void
+    fn runtime_data_layout(&self) -> Result<jit::FunctionRuntimeDataLayout, ()> {
+        Ok(jit::FunctionRuntimeDataLayout::from_function(
+            self.function()?,
+        ))
     }
 
     unsafe fn refresh_runtime_objects(&mut self, callable: *mut ffi::PyObject) -> Result<(), ()> {
-        let layout = jit::FunctionRuntimeDataLayout::from_function(&self.function);
+        let layout = self.runtime_data_layout()?;
         let values = unsafe { collect_function_runtime_objects(callable, &layout)? };
-        unsafe { self.runtime_object_owner.replace_values(values)? };
-        self.runtime_objects = self.runtime_object_owner.as_mut_ptr();
+        unsafe { self.function_env.replace_runtime_objects(values)? };
         Ok(())
     }
 }
@@ -357,9 +487,7 @@ unsafe extern "C" fn free_clif_function_data(ptr: *mut c_void) {
     if ptr.is_null() {
         return;
     }
-    let data = unsafe { Box::from_raw(ptr as *mut ClifFunctionData) };
-    unsafe { jit::free_cranelift_run_bb_specialized_cached(data.compiled_handle) };
-    unsafe { jit::free_cranelift_vectorcall_trampoline(data.compiled_vectorcall_handle) };
+    drop(unsafe { Box::from_raw(ptr as *mut PyFunctionJitExtra) });
 }
 
 unsafe fn py_string(obj: *mut ffi::PyObject) -> Result<String, ()> {
@@ -433,21 +561,6 @@ unsafe fn collect_function_runtime_objects(
     Ok(values)
 }
 
-unsafe fn lookup_deleted_sentinel() -> Result<*mut ffi::PyObject, ()> {
-    let runtime = ffi::PyImport_ImportModule(c"soac.runtime".as_ptr());
-    if runtime.is_null() {
-        return set_runtime_error(
-            "failed to import soac.runtime while resolving CLIF deleted sentinel",
-        );
-    }
-    let deleted_obj = ffi::PyObject_GetAttrString(runtime, c"DELETED".as_ptr());
-    ffi::Py_DECREF(runtime);
-    if deleted_obj.is_null() {
-        return set_runtime_error("missing soac.runtime.DELETED while registering CLIF vectorcall");
-    }
-    Ok(deleted_obj)
-}
-
 struct ActiveModuleVmCtxGuard;
 
 impl Drop for ActiveModuleVmCtxGuard {
@@ -491,37 +604,36 @@ pub unsafe fn with_current_module_runtime_context<R>(
 pub unsafe fn clone_module_runtime_context(
     runtime: &jit::ModuleRuntimeContext,
 ) -> Result<jit::ModuleRuntimeContext, ()> {
-    if runtime.vmctx.shared_module_state.is_null()
-        || runtime.vmctx.globals_obj.is_null()
-        || runtime.vmctx.true_obj.is_null()
-        || runtime.vmctx.false_obj.is_null()
-        || runtime.vmctx.none_obj.is_null()
-        || runtime.vmctx.deleted_obj.is_null()
-        || runtime.vmctx.empty_tuple_obj.is_null()
-    {
+    if runtime.mod_ctx.shared_module_state.is_null() || runtime.mod_ctx.globals_obj.is_null() {
         return set_runtime_error("cannot clone incomplete module runtime context");
     }
     unsafe {
-        ffi::Py_INCREF(runtime.vmctx.globals_obj as *mut ffi::PyObject);
-        ffi::Py_INCREF(runtime.vmctx.true_obj as *mut ffi::PyObject);
-        ffi::Py_INCREF(runtime.vmctx.false_obj as *mut ffi::PyObject);
-        ffi::Py_INCREF(runtime.vmctx.none_obj as *mut ffi::PyObject);
-        ffi::Py_INCREF(runtime.vmctx.deleted_obj as *mut ffi::PyObject);
-        ffi::Py_INCREF(runtime.vmctx.empty_tuple_obj as *mut ffi::PyObject);
+        ffi::Py_INCREF(runtime.mod_ctx.globals_obj as *mut ffi::PyObject);
     }
     let shared_module_state_owner = runtime.shared_module_state_owner.clone();
     Ok(jit::ModuleRuntimeContext {
-        vmctx: jit::JitModuleVmCtx {
+        mod_ctx: jit::ModuleJitContext {
             shared_module_state: std::sync::Arc::as_ptr(&shared_module_state_owner),
-            current_exception_slot: jit::vmctx_current_thread_raised_exception_slot(),
-            globals_obj: runtime.vmctx.globals_obj,
-            true_obj: runtime.vmctx.true_obj,
-            false_obj: runtime.vmctx.false_obj,
-            none_obj: runtime.vmctx.none_obj,
-            deleted_obj: runtime.vmctx.deleted_obj,
-            empty_tuple_obj: runtime.vmctx.empty_tuple_obj,
+            globals_obj: runtime.mod_ctx.globals_obj,
         },
         shared_module_state_owner,
+    })
+}
+
+unsafe fn build_module_runtime_context_from_parts(
+    shared_module_state: Arc<module_type::SharedModuleState>,
+    globals_obj: *mut ffi::PyObject,
+) -> Result<jit::ModuleRuntimeContext, ()> {
+    if globals_obj.is_null() {
+        return set_runtime_error("cannot build module runtime context without globals");
+    }
+    unsafe { ffi::Py_INCREF(globals_obj) };
+    Ok(jit::ModuleRuntimeContext {
+        mod_ctx: jit::ModuleJitContext {
+            shared_module_state: Arc::as_ptr(&shared_module_state),
+            globals_obj: globals_obj as *mut c_void,
+        },
+        shared_module_state_owner: shared_module_state,
     })
 }
 
@@ -547,41 +659,10 @@ pub unsafe fn build_module_runtime_context_for_module(
         return Err(());
     };
     unsafe { ffi::Py_INCREF(globals_obj) };
-    let true_obj = unsafe { ffi::PyBool_FromLong(1) };
-    if true_obj.is_null() {
-        return Err(());
-    }
-    let false_obj = unsafe { ffi::PyBool_FromLong(0) };
-    if false_obj.is_null() {
-        unsafe { ffi::Py_DECREF(true_obj) };
-        return Err(());
-    }
-    let none_obj = py.None().as_ptr();
-    unsafe { ffi::Py_INCREF(none_obj) };
-    let deleted_obj = match unsafe { lookup_deleted_sentinel() } {
-        Ok(value) => value,
-        Err(()) => {
-            unsafe {
-                ffi::Py_DECREF(true_obj);
-                ffi::Py_DECREF(false_obj);
-                ffi::Py_DECREF(none_obj);
-                ffi::Py_DECREF(globals_obj);
-            }
-            return Err(());
-        }
-    };
-    let empty_tuple_obj = PyTuple::empty(py).as_ptr();
-    unsafe { ffi::Py_INCREF(empty_tuple_obj) };
     Ok(jit::ModuleRuntimeContext {
-        vmctx: jit::JitModuleVmCtx {
+        mod_ctx: jit::ModuleJitContext {
             shared_module_state: std::sync::Arc::as_ptr(&shared_module_state),
-            current_exception_slot: jit::vmctx_current_thread_raised_exception_slot(),
             globals_obj: globals_obj as *mut c_void,
-            true_obj: true_obj as *mut c_void,
-            false_obj: false_obj as *mut c_void,
-            none_obj: none_obj as *mut c_void,
-            deleted_obj: deleted_obj as *mut c_void,
-            empty_tuple_obj: empty_tuple_obj as *mut c_void,
         },
         shared_module_state_owner: shared_module_state,
     })
@@ -592,15 +673,9 @@ unsafe fn make_clif_function_data(
     function_id: FunctionId,
     module_runtime: jit::ModuleRuntimeContext,
 ) -> Result<*mut c_void, ()> {
-    let Some(blockpy_function) = module_runtime
-        .shared_module_state_owner
-        .lookup_function(function_id)
-        .cloned()
-    else {
-        let module_name = module_runtime
-            .shared_module_state_owner
-            .module_name
-            .as_str();
+    let module_state = module_runtime.shared_module_state_owner.clone();
+    let Some(blockpy_function) = module_state.lookup_function(function_id).cloned() else {
+        let module_name = module_state.module_name.as_str();
         let msg = format!(
             "no specialized JIT plan found: module={module_name:?} function_id={function_id:?}"
         );
@@ -617,23 +692,27 @@ unsafe fn make_clif_function_data(
     let runtime_data_layout = jit::FunctionRuntimeDataLayout::from_function(&blockpy_function);
     let runtime_object_values =
         unsafe { collect_function_runtime_objects(callable, &runtime_data_layout)? };
-    let mut runtime_object_owner = FunctionRuntimeObjectBlock::new(runtime_object_values);
-    let runtime_objects = runtime_object_owner.as_mut_ptr();
-    let clif_data = Box::new(ClifFunctionData {
-        runtime_objects,
-        function: blockpy_function,
-        module_runtime,
-        runtime_object_owner,
-        compiled_handle: ptr::null_mut(),
-        compiled_vectorcall_handle: ptr::null_mut(),
+    let mut function_env = unsafe {
+        Box::new(FunctionEnv::new(
+            module_runtime.mod_ctx.globals_obj as *mut ffi::PyObject,
+            runtime_object_values,
+        )?)
+    };
+    let function_env_ptr = function_env.as_mut_ptr();
+    let py_function_extra = Box::new(PyFunctionJitExtra {
+        function_env_ptr,
+        function_id,
+        function_env,
+        module_state,
+        compiled_vectorcall: None,
         compiled_vectorcall_entry: None,
     });
-    Ok(Box::into_raw(clif_data) as *mut c_void)
+    Ok(Box::into_raw(py_function_extra) as *mut c_void)
 }
 
-unsafe fn clif_vectorcall_data(
+unsafe fn py_function_jit_extra(
     function: *mut ffi::PyObject,
-) -> Result<&'static mut ClifFunctionData, ()> {
+) -> Result<&'static mut PyFunctionJitExtra, ()> {
     if ffi::PyFunction_Check(function) == 0 {
         ffi::PyErr_SetString(
             ffi::PyExc_TypeError,
@@ -645,7 +724,7 @@ unsafe fn clif_vectorcall_data(
     if ptr.is_null() {
         return set_runtime_error("missing CLIF vectorcall metadata");
     }
-    Ok(&mut *(ptr as *mut ClifFunctionData))
+    Ok(&mut *(ptr as *mut PyFunctionJitExtra))
 }
 
 pub unsafe fn registered_clif_function_id(
@@ -661,37 +740,12 @@ pub unsafe fn registered_clif_function_id(
     Ok(Some(FunctionId::from_packed(packed)))
 }
 
-pub unsafe fn registered_clif_direct_code_ptr(
+pub unsafe fn registered_clif_function_context_ptr(
     function: *mut ffi::PyObject,
 ) -> Result<*mut c_void, ()> {
     unsafe { compile_clif_vectorcall(function)? };
-    let data = unsafe { clif_vectorcall_data(function)? };
-    crate::jit::compiled_direct_code_ptr(data.compiled_handle).map_err(|err| {
-        if let Ok(msg) = CString::new(err) {
-            unsafe { ffi::PyErr_SetString(ffi::PyExc_RuntimeError, msg.as_ptr()) };
-        } else {
-            unsafe {
-                ffi::PyErr_SetString(
-                    ffi::PyExc_RuntimeError,
-                    b"missing CLIF direct entry\0".as_ptr() as *const i8,
-                )
-            };
-        }
-    })
-}
-
-pub unsafe fn registered_clif_vmctx_ptr(function: *mut ffi::PyObject) -> Result<*mut c_void, ()> {
-    unsafe { compile_clif_vectorcall(function)? };
-    let data = unsafe { clif_vectorcall_data(function)? };
-    Ok(ptr::addr_of!(data.module_runtime.vmctx) as *mut c_void)
-}
-
-pub unsafe fn registered_clif_runtime_objects_ptr(
-    function: *mut ffi::PyObject,
-) -> Result<*mut c_void, ()> {
-    unsafe { compile_clif_vectorcall(function)? };
-    let data = unsafe { clif_vectorcall_data(function)? };
-    Ok(data.runtime_objects_ptr())
+    let data = unsafe { py_function_jit_extra(function)? };
+    Ok(data.function_env_ptr)
 }
 
 pub unsafe fn registered_clif_type_function_id(
@@ -1051,7 +1105,7 @@ unsafe fn current_module_type_from_owner_name(
 
     let global_name_c = CString::new(global_name).map_err(|_| ())?;
     let mut current = ffi::PyDict_GetItemString(
-        runtime.vmctx.globals_obj as *mut ffi::PyObject,
+        runtime.mod_ctx.globals_obj as *mut ffi::PyObject,
         global_name_c.as_ptr(),
     );
     if current.is_null() {
@@ -1124,7 +1178,10 @@ pub unsafe fn lookup_exact_owner_type_for_field(
         std::ptr::fn_addr_eq(
             getattr,
             ffi::PyObject_GenericGetAttr
-                as unsafe extern "C" fn(*mut ffi::PyObject, *mut ffi::PyObject) -> *mut ffi::PyObject,
+                as unsafe extern "C" fn(
+                    *mut ffi::PyObject,
+                    *mut ffi::PyObject,
+                ) -> *mut ffi::PyObject,
         )
     });
     let has_generic_setattr = unsafe { (*owner_type).tp_setattro }.is_some_and(|setattr| {
@@ -1175,7 +1232,7 @@ unsafe fn maybe_register_current_module_owner_types() {
             return;
         }
         let result = register_function_owner_types_for_globals(
-            runtime.vmctx.globals_obj as *mut ffi::PyObject,
+            runtime.mod_ctx.globals_obj as *mut ffi::PyObject,
             module_name_obj,
         );
         ffi::Py_DECREF(module_name_obj);
@@ -1373,32 +1430,25 @@ pub unsafe fn register_function_owner_types_for_module(
 unsafe fn ensure_clif_vectorcall_compiled(
     _py: Python<'_>,
     callable: *mut ffi::PyObject,
-    data: &mut ClifFunctionData,
+    data: &mut PyFunctionJitExtra,
 ) -> Result<(), ()> {
-    if data.compiled_handle.is_null() {
+    let function = data
+        .function()
+        .map(soac_blockpy::block_py::BlockPyFunction::clone)?;
+    if data.function_env.compiled_function.is_none() {
         let compile_start = Instant::now();
-        let block_ptrs = vec![ptr::null_mut::<c_void>(); data.function.blocks.len()];
-        let module_constant_ptrs = data
-            .module_runtime
-            .shared_module_state_owner
-            .module_constant_ptrs();
-        let counter_ptrs = data.module_runtime.shared_module_state_owner.counter_ptrs();
-        data.compiled_handle = match jit::compile_cranelift_run_bb_specialized_cached(
+        let block_ptrs = vec![ptr::null_mut::<c_void>(); function.blocks.len()];
+        let module_constant_ptrs = data.module_state.module_constant_ptrs();
+        let counter_ptrs = data.module_state.counter_ptrs();
+        let compiled_handle = match jit::compile_cranelift_run_bb_specialized_cached(
             block_ptrs.as_slice(),
-            &data.module_runtime.shared_module_state_owner.lowered_module,
-            &data.function,
-            &data
-                .module_runtime
-                .shared_module_state_owner
-                .codegen_constants,
-            &data
-                .module_runtime
-                .shared_module_state_owner
-                .lowered_module
-                .counter_defs,
+            &data.module_state.lowered_module,
+            &function,
+            &data.module_state.codegen_constants,
+            &data.module_state.lowered_module.counter_defs,
             &module_constant_ptrs,
             &counter_ptrs,
-            Some(data.module_runtime.shared_module_state_owner.as_ref()),
+            Some(data.module_state.as_ref()),
         ) {
             Ok(handle) => handle,
             Err(err) => {
@@ -1413,25 +1463,62 @@ unsafe fn ensure_clif_vectorcall_compiled(
                 return Err(());
             }
         };
+        let direct_code_ptr =
+            match jit::compiled_direct_code_ptr(compiled_handle).map(|ptr| ptr as *const u8) {
+                Ok(ptr) => ptr,
+                Err(err) => {
+                    unsafe { jit::free_cranelift_run_bb_specialized_cached(compiled_handle) };
+                    if let Ok(c_msg) = CString::new(err) {
+                        ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
+                    } else {
+                        ffi::PyErr_SetString(
+                            ffi::PyExc_RuntimeError,
+                            b"missing CLIF direct entry\0".as_ptr() as *const i8,
+                        );
+                    }
+                    return Err(());
+                }
+            };
+        data.function_env.set_direct_code_ptr(direct_code_ptr);
+        data.function_env.compiled_function = Some(Arc::new(CompiledFunctionHandle {
+            handle: compiled_handle,
+        }));
         let elapsed_ms = compile_start.elapsed().as_secs_f64() * 1000.0;
         info!(
             "soac_jit_precompile module={} qualname={} blocks={} elapsed_ms={elapsed_ms:.3}",
-            data.module_runtime.shared_module_state_owner.module_name,
-            data.function.names.qualname,
-            data.function.blocks.len(),
+            data.module_state.module_name,
+            function.names.qualname,
+            function.blocks.len(),
         );
     }
-    if data.compiled_vectorcall_handle.is_null() {
+    if data.function_env.direct_code_ptr().is_null() {
+        ffi::PyErr_SetString(
+            ffi::PyExc_RuntimeError,
+            b"compiled CLIF function is missing a direct entry pointer\0".as_ptr() as *const i8,
+        );
+        return Err(());
+    }
+    if data.compiled_vectorcall.is_none() {
         let vectorcall_symbol = jit::jit_python_perf_symbol_name(
             jit::JIT_PYTHON_PERF_SYMBOL_KIND_VECTORCALL,
-            data.function.names.qualname.as_str(),
+            function.names.qualname.as_str(),
         );
+        let compiled_handle = data
+            .function_env
+            .compiled_function
+            .as_ref()
+            .ok_or_else(|| unsafe {
+                ffi::PyErr_SetString(
+                    ffi::PyExc_RuntimeError,
+                    c"compiled CLIF function handle missing".as_ptr(),
+                );
+            })?
+            .handle;
         let (handle, entry) = match jit::compile_cranelift_vectorcall_direct_trampoline(
             bind_direct_args_from_vectorcall,
-            data as *mut ClifFunctionData as *mut c_void,
-            data.runtime_objects_ptr(),
-            ptr::addr_of!(data.module_runtime.vmctx) as *mut c_void,
-            data.compiled_handle,
+            data as *mut PyFunctionJitExtra as *mut c_void,
+            data.function_env.as_mut_ptr(),
+            compiled_handle,
             &vectorcall_symbol,
         ) {
             Ok(value) => value,
@@ -1448,7 +1535,7 @@ unsafe fn ensure_clif_vectorcall_compiled(
                 return Err(());
             }
         };
-        data.compiled_vectorcall_handle = handle;
+        data.compiled_vectorcall = Some(CompiledVectorcallTrampoline { handle });
         data.compiled_vectorcall_entry = Some(entry);
         let vectorcall_entry: ffi::vectorcallfunc = std::mem::transmute(entry);
         PyFunction_SetVectorcall(callable as *mut ffi::PyFunctionObject, vectorcall_entry);
@@ -1734,14 +1821,17 @@ unsafe extern "C" fn bind_direct_args_from_vectorcall(
             );
             return 0;
         }
-        let data = &mut *(data_ptr as *mut ClifFunctionData);
-        data.module_runtime.vmctx.refresh_current_exception_slot();
+        let data = &mut *(data_ptr as *mut PyFunctionJitExtra);
+        let function = match data.function() {
+            Ok(value) => value,
+            Err(()) => return 0,
+        };
         let bound_args = match build_function_bound_args(
             callable as *mut ffi::PyObject,
             args as *const *mut ffi::PyObject,
             nargsf,
             kwnames as *mut ffi::PyObject,
-            &data.function,
+            function,
         ) {
             Ok(value) => value,
             Err(()) => return 0,
@@ -1782,7 +1872,7 @@ unsafe extern "C" fn lazy_vectorcall(
 ) -> *mut ffi::PyObject {
     match panic::catch_unwind(AssertUnwindSafe(|| {
         let py = Python::assume_attached();
-        let data = match clif_vectorcall_data(callable) {
+        let data = match py_function_jit_extra(callable) {
             Ok(value) => value,
             Err(()) => return ptr::null_mut(),
         };
@@ -1797,7 +1887,14 @@ unsafe extern "C" fn lazy_vectorcall(
             return ptr::null_mut();
         };
         unsafe {
-            let runtime = std::ptr::addr_of_mut!(data.module_runtime);
+            let mut runtime = match build_module_runtime_context_from_parts(
+                data.module_state.clone(),
+                data.function_env.globals_obj(),
+            ) {
+                Ok(value) => value,
+                Err(()) => return ptr::null_mut(),
+            };
+            let runtime = std::ptr::addr_of_mut!(runtime);
             with_active_module_runtime_context(runtime, || {
                 entry(
                     callable as *mut c_void,
@@ -1870,7 +1967,7 @@ pub unsafe fn compile_clif_vectorcall(function: *mut ffi::PyObject) -> Result<()
         return Err(());
     }
     let py = Python::assume_attached();
-    let data = clif_vectorcall_data(function)?;
+    let data = py_function_jit_extra(function)?;
     ensure_clif_vectorcall_compiled(py, function, data)
 }
 

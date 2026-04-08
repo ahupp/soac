@@ -597,7 +597,7 @@ mod tests {
     }
 
     unsafe fn build_test_module_runtime(
-        py: Python<'_>,
+        _py: Python<'_>,
         shared_state: std::sync::Arc<crate::module_type::SharedModuleState>,
     ) -> crate::jit::ModuleRuntimeContext {
         let globals_obj = ffi::PyDict_New().cast::<c_void>();
@@ -605,27 +605,23 @@ mod tests {
             !globals_obj.is_null(),
             "PyDict_New should produce globals for test runtime"
         );
-        let true_obj = ffi::PyBool_FromLong(1).cast::<c_void>();
-        let false_obj = ffi::PyBool_FromLong(0).cast::<c_void>();
-        let none_obj = py.None().as_ptr().cast::<c_void>();
-        ffi::Py_INCREF(none_obj.cast());
-        let deleted_obj = py.None().as_ptr().cast::<c_void>();
-        ffi::Py_INCREF(deleted_obj.cast());
-        let empty_tuple_obj = pyo3::types::PyTuple::empty(py).as_ptr().cast::<c_void>();
-        ffi::Py_INCREF(empty_tuple_obj.cast());
         crate::jit::ModuleRuntimeContext {
-            vmctx: crate::jit::JitModuleVmCtx {
+            mod_ctx: crate::jit::ModuleJitContext {
                 shared_module_state: std::sync::Arc::as_ptr(&shared_state),
-                current_exception_slot: crate::jit::vmctx_current_thread_raised_exception_slot(),
                 globals_obj,
-                true_obj,
-                false_obj,
-                none_obj,
-                deleted_obj,
-                empty_tuple_obj,
             },
             shared_module_state_owner: shared_state,
         }
+    }
+
+    fn test_function_jit_context(
+        runtime: &crate::jit::ModuleRuntimeContext,
+        runtime_objects: *mut c_void,
+    ) -> [*mut c_void; 2] {
+        [
+            std::ptr::addr_of!(runtime.mod_ctx).cast_mut().cast(),
+            runtime_objects,
+        ]
     }
 
     unsafe extern "C" fn test_bind_direct_args_stub(
@@ -950,8 +946,7 @@ mod tests {
             let result = compile_cranelift_vectorcall_direct_trampoline(
                 test_bind_direct_args_stub,
                 1usize as ObjPtr,
-                1usize as ObjPtr,
-                1usize as ObjPtr,
+                2usize as ObjPtr,
                 compiled_handle,
                 "jit_runtime_support_vectorcall_smoke",
             );
@@ -1061,14 +1056,17 @@ def f():
                 assert_eq!(param_count, 0, "test function should not take direct args");
                 let entry: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
                     std::mem::transmute(code_ptr);
+                let mut function_context =
+                    test_function_jit_context(&runtime, std::ptr::null_mut());
+                let thread_state = ffi::PyThreadState_Get().cast::<c_void>();
 
                 let result1 = entry(
-                    std::ptr::addr_of!(runtime.vmctx).cast_mut().cast(),
-                    std::ptr::null_mut(),
+                    std::ptr::addr_of_mut!(function_context).cast(),
+                    thread_state,
                 );
                 let result2 = entry(
-                    std::ptr::addr_of!(runtime.vmctx).cast_mut().cast(),
-                    std::ptr::null_mut(),
+                    std::ptr::addr_of_mut!(function_context).cast(),
+                    thread_state,
                 );
 
                 assert_eq!(
@@ -1194,17 +1192,20 @@ def f(x):
                     *mut c_void,
                     *mut c_void,
                 ) -> *mut c_void = std::mem::transmute(code_ptr);
+                let mut function_context =
+                    test_function_jit_context(&runtime, std::ptr::null_mut());
+                let thread_state = ffi::PyThreadState_Get().cast::<c_void>();
 
                 let result1 = entry(
-                    std::ptr::addr_of!(runtime.vmctx).cast_mut().cast(),
-                    std::ptr::null_mut(),
+                    std::ptr::addr_of_mut!(function_context).cast(),
+                    thread_state,
                     ffi::PyLong_FromLong(7).cast(),
                 );
                 let incref_after_first = shared_state.counter_value(incref_counter_id);
                 let decref_after_first = shared_state.counter_value(decref_counter_id);
                 let result2 = entry(
-                    std::ptr::addr_of!(runtime.vmctx).cast_mut().cast(),
-                    std::ptr::null_mut(),
+                    std::ptr::addr_of_mut!(function_context).cast(),
+                    thread_state,
                     ffi::PyLong_FromLong(11).cast(),
                 );
 
@@ -1260,7 +1261,7 @@ def f(x):
             constants.module_constants,
         );
         assert!(
-            rendered.contains("; block jit_entry(vmctx: i64, function_data: i64)"),
+            rendered.contains("; block jit_entry(func_ctx: i64, tstate: i64)"),
             "rendered CLIF should include named typed params on surviving post-opt block headers:\n{rendered}"
         );
         assert!(
@@ -1397,8 +1398,8 @@ def f():
             )],
         );
         assert!(
-            rendered.contains("call dp_jit_exact_long_binary_op"),
-            "exact-int binop specialization should call the direct helper:\n{rendered}"
+            rendered.contains("call dp_jit_exact_long_add_slot"),
+            "exact-int binop specialization should call the profiled PyLong number slot:\n{rendered}"
         );
         assert!(
             rendered.contains("iconst.i64 257"),
@@ -1441,8 +1442,8 @@ def f():
             )],
         );
         assert!(
-            rendered.contains("call dp_jit_exact_long_binary_op"),
-            "exact-int compare specialization should call the direct helper:\n{rendered}"
+            rendered.contains("call dp_jit_exact_long_richcompare_slot"),
+            "exact-int compare specialization should call the profiled PyLong richcompare slot:\n{rendered}"
         );
         assert!(
             rendered.contains("iconst.i64 257"),
@@ -1646,7 +1647,7 @@ def f():
         assert!(
             !rendered.contains("call dp_jit_function_globals")
                 && !rendered.contains("call dp_jit_load_module_constant"),
-            "global located names should use vmctx-backed globals and module constant names:\n{rendered}"
+            "global located names should use mod_ctx-backed globals and module constant names:\n{rendered}"
         );
         assert_inlined_indexed_global_guard(
             &rendered,
@@ -2178,7 +2179,7 @@ def f():
                 let mut runtime = build_test_module_runtime(py, shared_state.clone());
                 let globals = pyo3::Bound::<pyo3::PyAny>::from_borrowed_ptr(
                     py,
-                    runtime.vmctx.globals_obj.cast(),
+                    runtime.mod_ctx.globals_obj.cast(),
                 )
                 .cast_into::<pyo3::types::PyDict>()
                 .expect("runtime globals should be a dict");

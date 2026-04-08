@@ -24,6 +24,8 @@ const ALWAYS_REQUIRED_UNICODE_CONSTANTS: &[&str] = &[
     "extend",
     "update",
 ];
+const ALWAYS_REQUIRED_RUNTIME_NAME_CONSTANTS: &[&str] =
+    &["TRUE", "FALSE", "NONE", "DELETED", "EMPTY_TUPLE"];
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct ModuleConstantId(pub usize);
@@ -53,6 +55,11 @@ impl ModuleCodegenConstants {
         for name in ALWAYS_REQUIRED_UNICODE_CONSTANTS {
             collector.constants.intern_unicode_bytes(name.as_bytes());
         }
+        for name in ALWAYS_REQUIRED_RUNTIME_NAME_CONSTANTS {
+            collector
+                .constants
+                .intern_runtime_name_bytes(name.as_bytes());
+        }
         for function in &module.callable_defs {
             collector.collect_function(function);
         }
@@ -65,6 +72,11 @@ impl ModuleCodegenConstants {
         let mut collector = ModuleConstantCollector::default();
         for name in ALWAYS_REQUIRED_UNICODE_CONSTANTS {
             collector.constants.intern_unicode_bytes(name.as_bytes());
+        }
+        for name in ALWAYS_REQUIRED_RUNTIME_NAME_CONSTANTS {
+            collector
+                .constants
+                .intern_runtime_name_bytes(name.as_bytes());
         }
         for function in functions {
             collector.collect_function(function);
@@ -153,6 +165,13 @@ impl ModuleCodegenConstants {
     pub fn require_float_constant_id(&self, value: f64) -> ModuleConstantId {
         self.lookup_id(&ModuleConstantValue::FloatBits(value.to_bits()))
             .unwrap_or_else(|| panic!("missing module float constant in codegen pool: {value}"))
+    }
+
+    pub fn require_runtime_name_constant_id(&self, value: &str) -> ModuleConstantId {
+        self.lookup_id(&ModuleConstantValue::RuntimeName(value.as_bytes().to_vec()))
+            .unwrap_or_else(|| {
+                panic!("missing runtime-name module constant in codegen pool: {value}")
+            })
     }
 
     pub fn constant_bytes_value(&self, constant_id: ModuleConstantId) -> Option<&[u8]> {
@@ -252,6 +271,10 @@ impl ModuleCodegenConstants {
 
     fn intern_unicode_bytes(&mut self, value: &[u8]) -> ModuleConstantId {
         self.intern(ModuleConstantValue::Unicode(value.to_vec()))
+    }
+
+    fn intern_runtime_name_bytes(&mut self, value: &[u8]) -> ModuleConstantId {
+        self.intern(ModuleConstantValue::RuntimeName(value.to_vec()))
     }
 
     fn intern_int(&mut self, value: i64) -> ModuleConstantId {
