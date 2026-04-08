@@ -1027,7 +1027,8 @@ fn create_soac_indexed_module_type(py: Python<'_>) -> PyResult<Py<PyAny>> {
             flags: (ffi::Py_TPFLAGS_DEFAULT | ffi::Py_TPFLAGS_BASETYPE) as _,
             slots: slots.as_mut_ptr(),
         };
-        Py::from_owned_ptr_or_err(py, ffi::PyType_FromSpecWithBases(&mut spec, bases.as_ptr()))
+        Bound::from_owned_ptr_or_err(py, ffi::PyType_FromSpecWithBases(&mut spec, bases.as_ptr()))
+            .map(Bound::unbind)
     }
 }
 
