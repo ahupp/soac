@@ -554,6 +554,7 @@ mod tests {
         crate::jit::ModuleRuntimeContext {
             vmctx: crate::jit::JitModuleVmCtx {
                 shared_module_state: std::sync::Arc::as_ptr(&shared_state),
+                current_exception_slot: crate::jit::vmctx_current_thread_raised_exception_slot(),
                 globals_obj,
                 global_slots: global_cache.slots_ptr().cast::<c_void>(),
                 true_obj,
@@ -1209,6 +1210,43 @@ def f(x):
         assert!(
             rendered.contains("block0(v0: i64, v1: i64):"),
             "rendered CLIF should keep the real Cranelift block header for round-tripping:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn render_specialized_jit_exception_dispatch_takes_raised_exception_directly() {
+        let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+            r#"
+def f():
+    try:
+        raise ValueError("boom")
+    except ValueError:
+        return 1
+    return 0
+"#,
+        )
+        .expect("lowering try/except test source should succeed")
+        .codegen_module;
+
+        let codegen_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&lowered);
+        let function = lowered
+            .callable_defs
+            .iter()
+            .find(|function| function.names.bind_name == "f")
+            .expect("missing lowered function f")
+            .clone();
+        let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
+        let rendered = render_test_jit_function_with_constants(
+            &lowered,
+            &function,
+            &blocks,
+            &codegen_constants,
+        );
+
+        assert!(
+            !rendered.contains("dp_jit_get_raised_exception"),
+            "exception dispatch should no longer import/call the raised-exception helper:\n{rendered}"
         );
     }
 

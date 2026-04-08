@@ -269,11 +269,6 @@ unsafe extern "C" fn record_counter_value_hook(vmctx: ObjPtr, counter_id: i64, v
 }
 
 #[cfg(not(test))]
-unsafe extern "C" fn py_get_raised_exception_hook() -> ObjPtr {
-    ffi::PyErr_GetRaisedException() as ObjPtr
-}
-
-#[cfg(not(test))]
 unsafe extern "C" fn get_arg_item_hook(args: ObjPtr, index: i64) -> ObjPtr {
     if args.is_null() {
         return ptr::null_mut();
@@ -807,10 +802,6 @@ mod test_only_export_stubs {
         expected_version: i64
     ));
     panic_unit_export!(dp_jit_record_counter_value(vmctx: ObjPtr, counter_id: i64, value: i64));
-    panic_dual_obj_export!(
-        dp_jit_get_raised_exception,
-        dp_jit_get_raised_exception_with_frame()
-    );
     panic_dual_obj_export!(dp_jit_get_arg_item, dp_jit_get_arg_item_with_frame(
         args: ObjPtr,
         index: i64
@@ -954,13 +945,6 @@ define_perf_toggle_export!(
 pub unsafe extern "C" fn dp_jit_record_counter_value(vmctx: ObjPtr, counter_id: i64, value: i64) {
     record_counter_value_hook(vmctx, counter_id, value)
 }
-
-#[cfg(not(test))]
-define_perf_toggle_export!(
-    ObjPtr,
-    dp_jit_get_raised_exception,
-    dp_jit_get_raised_exception_with_frame() => py_get_raised_exception_hook()
-);
 
 #[cfg(not(test))]
 define_perf_toggle_export!(
@@ -1589,13 +1573,6 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
         chosen_helper_symbol(
             dp_jit_py_call_with_kw as *const u8,
             dp_jit_py_call_with_kw_with_frame as *const u8,
-        ),
-    );
-    builder.symbol(
-        "dp_jit_get_raised_exception",
-        chosen_helper_symbol(
-            dp_jit_get_raised_exception as *const u8,
-            dp_jit_get_raised_exception_with_frame as *const u8,
         ),
     );
     builder.symbol(

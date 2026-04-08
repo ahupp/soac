@@ -50,9 +50,10 @@ pub use planning::{
 };
 pub use specialized_helpers::ObjPtr;
 use specialized_helpers::register_specialized_jit_symbols;
+pub(crate) use vmctx::current_thread_raised_exception_slot as vmctx_current_thread_raised_exception_slot;
 use vmctx::{
-    DELETED_OBJ_OFFSET, EMPTY_TUPLE_OBJ_OFFSET, FALSE_OBJ_OFFSET, GLOBAL_SLOTS_OFFSET,
-    GLOBALS_OBJ_OFFSET, NONE_OBJ_OFFSET, TRUE_OBJ_OFFSET,
+    CURRENT_EXCEPTION_SLOT_OFFSET, DELETED_OBJ_OFFSET, EMPTY_TUPLE_OBJ_OFFSET, FALSE_OBJ_OFFSET,
+    GLOBAL_SLOTS_OFFSET, GLOBALS_OBJ_OFFSET, NONE_OBJ_OFFSET, TRUE_OBJ_OFFSET,
 };
 pub use vmctx::{JitModuleVmCtx, ModuleRuntimeContext};
 
@@ -198,8 +199,6 @@ static DP_JIT_FINISH_CONSTRUCTOR_INIT_IMPORT: ImportSpec = ImportSpec::new(
     &[SigType::Pointer, SigType::Pointer],
     &[SigType::Pointer],
 );
-static DP_JIT_GET_RAISED_EXCEPTION_IMPORT: ImportSpec =
-    ImportSpec::new("dp_jit_get_raised_exception", &[], &[SigType::Pointer]);
 static DP_JIT_LOAD_GLOBAL_OBJ_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_load_global_obj",
     &[
@@ -690,6 +689,22 @@ fn load_vmctx_obj(
 ) -> ir::Value {
     fb.ins()
         .load(ptr_ty, ir::MemFlags::trusted(), vmctx_value, offset)
+}
+
+fn emit_take_current_raised_exception(
+    fb: &mut FunctionBuilder<'_>,
+    ptr_ty: ir::Type,
+    vmctx_value: ir::Value,
+) -> ir::Value {
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let current_exception_slot =
+        load_vmctx_obj(fb, ptr_ty, vmctx_value, CURRENT_EXCEPTION_SLOT_OFFSET);
+    let raised_exc = fb
+        .ins()
+        .load(ptr_ty, ir::MemFlags::trusted(), current_exception_slot, 0);
+    fb.ins()
+        .store(ir::MemFlags::trusted(), null_ptr, current_exception_slot, 0);
+    raised_exc
 }
 
 #[derive(Clone, Debug)]
@@ -6018,11 +6033,6 @@ fn build_cranelift_run_bb_specialized_function(
             &mut fb.func,
             &DP_JIT_FINISH_CONSTRUCTOR_INIT_IMPORT,
         );
-        let get_raised_exception_ref = func_imports.get_or_panic(
-            jit_module,
-            &mut fb.func,
-            &DP_JIT_GET_RAISED_EXCEPTION_IMPORT,
-        );
         let load_global_obj_ref =
             func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_LOAD_GLOBAL_OBJ_IMPORT);
         let load_runtime_obj_ref =
@@ -6394,8 +6404,7 @@ fn build_cranelift_run_bb_specialized_function(
             let none_const = load_vmctx_obj(&mut fb, ptr_ty, vmctx_value, NONE_OBJ_OFFSET);
             let dispatch_step_null_args = Vec::new();
 
-            let raised_exc_inst = fb.ins().call(get_raised_exception_ref, &[]);
-            let raised_exc = fb.inst_results(raised_exc_inst)[0];
+            let raised_exc = emit_take_current_raised_exception(&mut fb, ptr_ty, vmctx_value);
             let raised_exc_null = fb
                 .ins()
                 .icmp(ir::condcodes::IntCC::Equal, raised_exc, null_ptr);

@@ -505,6 +505,7 @@ pub unsafe fn clone_module_runtime_context(
     Ok(jit::ModuleRuntimeContext {
         vmctx: jit::JitModuleVmCtx {
             shared_module_state: std::sync::Arc::as_ptr(&shared_module_state_owner),
+            current_exception_slot: jit::vmctx_current_thread_raised_exception_slot(),
             globals_obj: runtime.vmctx.globals_obj,
             global_slots: runtime.vmctx.global_slots,
             true_obj: runtime.vmctx.true_obj,
@@ -580,6 +581,7 @@ pub unsafe fn build_module_runtime_context_for_module(
     Ok(jit::ModuleRuntimeContext {
         vmctx: jit::JitModuleVmCtx {
             shared_module_state: std::sync::Arc::as_ptr(&shared_module_state),
+            current_exception_slot: jit::vmctx_current_thread_raised_exception_slot(),
             globals_obj: globals_obj as *mut c_void,
             global_slots: global_cache.slots_ptr() as *mut c_void,
             true_obj: true_obj as *mut c_void,
@@ -1610,6 +1612,7 @@ unsafe extern "C" fn bind_direct_args_from_vectorcall(
             return 0;
         }
         let data = &mut *(data_ptr as *mut ClifFunctionData);
+        data.module_runtime.vmctx.refresh_current_exception_slot();
         let bound_args = match build_function_bound_args(
             callable as *mut ffi::PyObject,
             args as *const *mut ffi::PyObject,
