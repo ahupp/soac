@@ -134,6 +134,12 @@ update-venv: ensure-cpython
       uv sync --project "$REPO_ROOT/soac_py" --group dev --frozen --active
   )
 
+setup-dev-env:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cargo install --locked inferno
+  echo 'Run "apt update && apt install -y gdb"'
+
 build-extension build="debug": ensure-cpython
   #!/usr/bin/env bash
   set -euo pipefail
