@@ -10,7 +10,7 @@ use soac_blockpy::block_py::{BlockPyFunction, BlockPyModule, FunctionId, Functio
 use soac_blockpy::lower_python_to_blockpy;
 use soac_blockpy::pass_tracker::NoopPassTracker;
 use soac_blockpy::passes::CodegenModuleShape;
-use soac_jit::module_type::{hash_module_source, ModuleInfo, SoacExtModule};
+use soac_jit::module_type::{ModuleInfo, SoacExtModule, hash_module_source};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::time::Instant;
