@@ -428,34 +428,27 @@ Notes:
   [Justfile:274](/home/adam/project/soac-profile/Justfile#L274), control
   the threshold used when rendering perf text reports.
 
-## Resource Limits And Test Wrappers
+## Resource Limits
 
 - `DIET_PYTHON_MEMORY_LIMIT_MB=<int>`
   In [scripts/run_with_limits.sh](/home/adam/project/soac-profile/scripts/run_with_limits.sh),
-  set the cgroup memory cap in MiB. `0` disables the memory cap.
+  set the cgroup memory cap in MiB for recipes that intentionally call
+  the limit wrapper, such as `run-cpython-tests`. `0` disables the
+  memory cap.
 
 - `DIET_PYTHON_TIMEOUT_SECS=<int>`
   In [scripts/run_with_limits.sh](/home/adam/project/soac-profile/scripts/run_with_limits.sh),
-  set the cgroup wall-clock timeout in seconds. `0` disables the timeout.
+  set the cgroup wall-clock timeout in seconds for limit-wrapper runs.
+  `0` disables the timeout.
 
 - `DIET_PYTHON_CPUSET=<cpuset>`
   In [scripts/run_with_limits.sh](/home/adam/project/soac-profile/scripts/run_with_limits.sh),
-  restrict build/test execution to a Linux cpuset such as `0-7`. An
-  empty value disables CPU pinning.
+  restrict a limit-wrapper run to a Linux cpuset such as `0-7`. An empty
+  value disables CPU pinning.
 
 - `DIET_PYTHON_SYSTEMD_RUNTIME_DIR=/run/user/<uid>`
   In [scripts/run_with_limits.sh](/home/adam/project/soac-profile/scripts/run_with_limits.sh),
   override the runtime dir used to reach the user systemd bus.
-
-- `DIET_PYTHON_LIMITS_ALREADY_APPLIED=1`
-  In [scripts/run_pytest_parallel.py](/home/adam/project/soac-profile/scripts/run_pytest_parallel.py),
-  mark that the process is already running under the limit wrapper so it
-  does not re-wrap itself.
-
-- `DIET_PYTHON_TEST_ALL_TIMEOUT_SECS=<int>`
-  In recipe `test-all`, at
-  [Justfile:687](/home/adam/project/soac-profile/Justfile#L687), override
-  the wall-clock timeout used by the full test gate. `0` disables it.
 
 - `SKIP_EXPECTED_FAILURES=1`
   In [scripts/collect_cpython_skip_ids.sh](/home/adam/project/soac-profile/scripts/collect_cpython_skip_ids.sh),

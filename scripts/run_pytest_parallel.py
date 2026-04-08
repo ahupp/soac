@@ -12,7 +12,6 @@ from pathlib import Path
 
 REPO_ROOT = Path(os.environ["REPO_ROOT"])
 VENV_PYTHON = Path(os.environ["VENV_DIR"]) / "bin" / "python"
-LIMIT_WRAPPER = Path(os.environ["LIMIT_WRAPPER"])
 
 
 @dataclass
@@ -73,7 +72,7 @@ def collect_test_files(args: list[str]) -> tuple[int, list[str], str]:
 
 
 def pytest_cmd(args: list[str]) -> list[str]:
-    pytest = [
+    return [
         str(VENV_PYTHON),
         "-m",
         "pytest",
@@ -81,17 +80,6 @@ def pytest_cmd(args: list[str]) -> list[str]:
         "--durations=0",
         *args,
     ]
-    if os.environ.get("DIET_PYTHON_LIMITS_ALREADY_APPLIED") == "1":
-        # Keep the per-test wall-clock timeout, but avoid stacking another
-        # cpu/memory wrapper inside the already-limited top-level test job.
-        return [
-            "env",
-            "DIET_PYTHON_MEMORY_LIMIT_MB=0",
-            "DIET_PYTHON_CPUSET=",
-            str(LIMIT_WRAPPER),
-            *pytest,
-        ]
-    return [str(LIMIT_WRAPPER), *pytest]
 
 
 def run_pytest(args: list[str], selector: str) -> RunResult:

@@ -555,7 +555,6 @@ _pytest-run *args='': ensure-venv
 
   set +e
   TIMEFORMAT='[diet-python timing] pytest_s=%3R'
-  DIET_PYTHON_TIMEOUT_SECS="${DIET_PYTHON_TIMEOUT_SECS:-45}" \
   time "${TEST_CMD[@]}" 2>&1 | tee "$TMP_PYTEST_OUTPUT"
   TEST_STATUS=${PIPESTATUS[0]}
   set -e
@@ -714,10 +713,7 @@ test-all:
     exit "$status"
   fi
   TIMEFORMAT='[diet-python timing] test_phase_s=%3R'
-  if time DIET_PYTHON_LIMITS_ALREADY_APPLIED=1 \
-    DIET_PYTHON_TIMEOUT_SECS="${DIET_PYTHON_TEST_ALL_TIMEOUT_SECS:-0}" \
-    "$LIMIT_WRAPPER" \
-    just _test-all-test-phase; then
+  if time just _test-all-test-phase; then
     :
   else
     status=$?
