@@ -1,3 +1,60 @@
+# Plan
+
+
+Python is a surprisingly complicated language, and to run it fast it first needs
+to be made into a smaller language.  There are a few phases here:
+
+python -> python:
+  * Strip annotated assignments ("x : int = 1"), and emit as `__annotate__` / `__annotate_func__`.
+  * Rewrite "private" names in classes like `__foo` -> `_{classname}_foo`.
+  * `assert` -> `if __debug__`
+  * `if..elif` into a chain of `if..else`
+  * type aliases and parameters into calls to `TypeVar` / `TypeParam` etc.
+  * multi-target assign and delete to single target + temporaries
+  * f-strings to explicit string formatting
+  * augassign and operators -> explicit function calls
+
+python -> bb python
+  * flow control: for/while/with
+
+
+
+# diet-python
+
+This repository includes a small Rust utility for transforming Python source
+code. It parses a file with Ruff's parser and rewrites binary operations and
+augmented assignments (e.g., `+=`) into calls to the corresponding functions in
+the standard library's `operator` module. The transformation is idempotent, so
+re-running it on already rewritten code leaves the output unchanged.
+
+
+Run it with:
+
+```
+cargo run --bin diet-python -- path/to/file.py
+```
+
+## Python import hook
+
+To apply the transform automatically when modules are imported, install the
+provided import hook:
+
+```python
+from soac import import_hook
+import_hook.install()
+```
+
+After calling `install()`, any subsequent imports will be rewritten using the
+`diet-python` transform before execution.
+
+Run the included example to see the hook in action:
+
+```
+python example_usage.py
+```
+
+The script installs the hook, imports `example_module`, and asserts that its
+bytecode calls `operator.add` instead of using `BINARY_OP`.
 
 ## Regenerating transform fixtures
 
@@ -6,6 +63,13 @@ outputs with:
 
 ```
 cargo run --bin regen_snapshots
+```
+
+# CLIF
+
+```
+$ rustup component add rustc-codegen-cranelift-preview --toolchain nightly
+$ ./rust-clif-dist/rustc-clif --out-dir=clif-out/ --crate-type=rlib fastadd.rs -Cdebuginfo=0 --emit link,llvm-ir
 ```
 
 # Log
@@ -153,8 +217,15 @@ changes:
   - specialized transformed is about 0.341x stock
   - stock CPython is about 2.93x faster
 
+# Design
 
-# Principles
+Dropping to basic block format:
+
+ - gave control over name binding for functions
+ - significantly improved fidelity to flow control, made generators easier, and reduced JIT surface area
+
+
+ # Principles
 
   * Locality: for any specific concept, it's better to handle it in one place.
     e.g, prefer to handle different kinds of load/store (global, nonlocal,
@@ -168,35 +239,34 @@ changes:
 
 # Optimizations
 
- * Value tracing (types, escape analysis)
-   * If a local is always set, skip DELETED checks
-   * Make closure cells function constants if they are never written after capture
-   * Stack allocate values if they don't escape
-   * unbocked ints when possible and convert at border
-
  * Inlining
    * Is there only one caller?
-   * Is there only one implementation?
    * Is it below < size?
    * Does it unlock other optimizations?
+ * Specialization
+    * Known cell address
+    * Call fastpath knowing exact sig of target
+    * Unboxing
+
+ * Can we skip deleted checks on this value?
 
  * Minimize refcounting
  * Code size/locality
-   * Counters pass on block entry or perf / last-branch, annotate with cold/unlikely
-   
- * Use registers for locals
+ * Maximize register use
  * Avoid constant exception checking
- * Converte exceptions to jumps
- * Compile-time symbolic execution
+ * Flow control exceptions to jumps
+ * Compile-time computation
  * Known subclasses
    * No overrides to function
  * Type hints enforcement
+ * Escape analysis, stack allocate
+   * Inline closure cells
  * Green threads for async
- * Guard elision
-   * No shadowed attributes
-   * No externally writable modules
-   * Immutable builtins
 
+## Facts
+ * Constant
+ * ReadOnly
+ * ExactTypes(...)
 
 # Environment Variables
 
