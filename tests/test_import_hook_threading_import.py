@@ -28,3 +28,23 @@ def test_import_hook_entry_module_bootstraps_runtime():
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "1"
+
+
+def test_import_hook_transforms_resolvable_frozen_module_source():
+    code = "\n".join(
+        [
+            "from soac import import_hook",
+            "import_hook.install()",
+            "import __phello__.ham.eggs as eggs",
+            "print(type(eggs.__spec__.loader).__name__)",
+            'print(eggs.__spec__.origin.endswith("/Lib/__phello__/ham/eggs.py"))',
+            'print(eggs.__file__.endswith("/Lib/__phello__/ham/eggs.py"))',
+        ]
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    assert result.stdout.splitlines() == ["DietPythonLoader", "True", "True"]

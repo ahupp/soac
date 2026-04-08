@@ -86,6 +86,28 @@ def _should_transform(path: str) -> bool:
         return False
 
 
+def _source_path_for_frozen_spec(spec):
+    loader_state = getattr(spec, "loader_state", None)
+    filename = getattr(loader_state, "filename", None)
+    if filename:
+        return filename
+
+    origname = getattr(loader_state, "origname", spec.name)
+    candidates = [
+        REPO_ROOT / "vendor" / "cpython" / "Lib" / f"{origname.replace('.', os.sep)}.py",
+        REPO_ROOT
+        / "vendor"
+        / "cpython"
+        / "Lib"
+        / origname.replace(".", os.sep)
+        / "__init__.py",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
 class DietPythonLoader(importlib.machinery.SourceFileLoader):
     """Loader that applies the diet-python transform before executing a module."""
 
@@ -102,7 +124,9 @@ class DietPythonFinder(importlib.machinery.PathFinder):
 
     @classmethod
     def find_spec(cls, fullname, path=None, target=None):
-        spec = super().find_spec(fullname, path, target)
+        spec = importlib.machinery.FrozenImporter.find_spec(fullname, path, target)
+        if spec is None:
+            spec = super().find_spec(fullname, path, target)
         return cls.wrap_spec(spec)
 
     @classmethod
@@ -118,6 +142,17 @@ class DietPythonFinder(importlib.machinery.PathFinder):
             and _should_transform(spec.origin)
         ):
             spec.loader = DietPythonLoader(fullname, spec.origin)
+        elif (
+            fullname != "encodings"
+            and not fullname.startswith("encodings.")
+            and spec.loader is importlib.machinery.FrozenImporter
+            and spec.origin == "frozen"
+        ):
+            source_path = _source_path_for_frozen_spec(spec)
+            if source_path and _should_transform(source_path):
+                spec.origin = source_path
+                spec.has_location = True
+                spec.loader = DietPythonLoader(fullname, source_path)
         return spec
 
 
@@ -133,7 +168,10 @@ def install():
         return
 
     for index, finder in enumerate(sys.meta_path):
-        if finder is importlib.machinery.PathFinder:
+        if finder in {
+            importlib.machinery.FrozenImporter,
+            importlib.machinery.PathFinder,
+        }:
             sys.meta_path.insert(index, DietPythonFinder)
             break
     else:
