@@ -264,9 +264,9 @@ instance's live working commit.
   Optional comma-separated import-hook allow-list. Entries currently
   use `path:<file-or-directory>` and are resolved before matching. When
   set, `SoacLoader` only wraps source imports whose resolved source
-  path is inside one of the listed roots. The `test-fast` recipe sets
-  this to the repo `tests/` tree and installs the import hook so pytest
-  test modules are transformed while stdlib/pytest stay untransformed.
+  path is inside one of the listed roots. Test recipes intentionally do
+  not set or change this variable; they inherit the caller environment
+  unchanged.
 
 ### CPython-specific notes
 

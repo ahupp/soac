@@ -583,7 +583,6 @@ test-fast *args='tests/': ensure-venv
   #!/usr/bin/env bash
   set -euo pipefail
   export DIET_PYTHON_INSTALL_HOOK=1
-  export SOAC_MODULE_ENABLED="${SOAC_MODULE_ENABLED:-path:$REPO_ROOT/tests}"
   just _pytest-run "$@"
 
 py *args='': build-all
