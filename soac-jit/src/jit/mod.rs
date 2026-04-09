@@ -2951,10 +2951,7 @@ fn emit_direct_call_resolved_raw_with_arg_values(
     fb.switch_to_block(function_env_ok_block);
 
     let mut direct_sig = jit_module.make_signature();
-    direct_sig.params.push(ir::AbiParam::special(
-        ptr_ty,
-        ir::ArgumentPurpose::VMContext,
-    ));
+    direct_sig.params.push(ir::AbiParam::new(ptr_ty));
     direct_sig.params.push(ir::AbiParam::new(ptr_ty));
     for _ in target_function.params.iter() {
         direct_sig.params.push(ir::AbiParam::new(ptr_ty));
@@ -6357,10 +6354,7 @@ fn build_cranelift_run_bb_specialized_function(
     let mut module_imports = ModuleFuncImports::new();
 
     let mut main_sig = jit_module.make_signature();
-    main_sig.params.push(ir::AbiParam::special(
-        ptr_ty,
-        ir::ArgumentPurpose::VMContext,
-    ));
+    main_sig.params.push(ir::AbiParam::new(ptr_ty));
     main_sig.params.push(ir::AbiParam::new(ptr_ty));
     for _ in function.params.iter() {
         main_sig.params.push(ir::AbiParam::new(ptr_ty));
@@ -6417,7 +6411,7 @@ fn build_cranelift_run_bb_specialized_function(
             entry_block,
             "jit_entry",
             vec![
-                "func_ctx".into(),
+                "fn_env".into(),
                 "tstate".into(),
                 "mod_ctx".into(),
                 "function_data".into(),
@@ -6471,18 +6465,17 @@ fn build_cranelift_run_bb_specialized_function(
 
         fb.switch_to_block(entry_block);
         let entry_block_params = fb.block_params(entry_block).to_vec();
-        let function_env_value = entry_block_params[0];
+        let fn_env_value = entry_block_params[0];
         let thread_state_value = entry_block_params[1];
         let globals_value = load_function_env_obj(
             &mut fb,
             ptr_ty,
-            function_env_value,
+            fn_env_value,
             FUNCTION_ENV_GLOBALS_OBJ_OFFSET,
         );
-        let function_data_value = fb.ins().iadd_imm(
-            function_env_value,
-            i64::from(FUNCTION_ENV_RUNTIME_OBJECTS_OFFSET),
-        );
+        let function_data_value = fb
+            .ins()
+            .iadd_imm(fn_env_value, i64::from(FUNCTION_ENV_RUNTIME_OBJECTS_OFFSET));
         let direct_entry_args = entry_block_params[2..].to_vec();
         let mut func_imports = FuncBuildImports::new(&mut module_imports);
         let incref_ref = if let Some(incref_func_id) = counted_refcount_helpers.incref_func_id {
@@ -7312,10 +7305,7 @@ pub unsafe fn compile_cranelift_vectorcall_direct_trampoline(
     let main_id = declare_local_fn(&mut jit_module, symbol_name, &main_sig)?;
 
     let mut direct_sig = jit_module.make_signature();
-    direct_sig.params.push(ir::AbiParam::special(
-        ptr_ty,
-        ir::ArgumentPurpose::VMContext,
-    ));
+    direct_sig.params.push(ir::AbiParam::new(ptr_ty));
     direct_sig.params.push(ir::AbiParam::new(ptr_ty));
     for _ in 0..param_count {
         direct_sig.params.push(ir::AbiParam::new(ptr_ty));
