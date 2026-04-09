@@ -1,5 +1,5 @@
-snapshot_class::class_with_method: blockpy=10, clif=10
-snapshot_class::class_method_named_open_calls_builtin: blockpy=4, clif=4
+snapshot_class::class_with_method: blockpy=14, clif=14
+snapshot_class::class_method_named_open_calls_builtin: blockpy=15, clif=15
 snapshot_class::class_with_base: blockpy=3, clif=3
 snapshot_class::class_scope_inner_capture: blockpy=4, clif=4
 snapshot_class::class_super_empty_classcell: blockpy=4, clif=4
@@ -41,7 +41,7 @@ snapshot_stmt::assign_subscript: blockpy=1, clif=1
 snapshot_stmt::assign_tuple_unpack: blockpy=1, clif=1
 snapshot_stmt::assign_star_unpack: blockpy=1, clif=1
 snapshot_stmt::assign_multi_targets: blockpy=1, clif=1
-snapshot_stmt::ann_assign_simple: blockpy=7, clif=7
+snapshot_stmt::ann_assign_simple: blockpy=11, clif=11
 snapshot_stmt::ann_assign_attr: blockpy=1, clif=1
 snapshot_stmt::aug_assign_attr: blockpy=1, clif=1
 snapshot_stmt::delete_mixed: blockpy=1, clif=1

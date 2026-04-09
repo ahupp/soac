@@ -6,6 +6,7 @@ use crate::block_py::{
 use crate::passes::ast_to_ast::body::{split_docstring, Suite};
 use crate::passes::ast_to_ast::context::Context;
 use crate::passes::ast_to_ast::rewrite_stmt;
+use crate::passes::ast_to_ast::rewrite_stmt::annotation::FUNCTION_ANNOTATE_PREFIX;
 use crate::passes::ast_to_ast::semantic::{SemanticAstState, SemanticScope};
 use crate::passes::CoreModuleShapeWithAwaitAndYield;
 use crate::transformer::{walk_expr, walk_stmt, Transformer};
@@ -22,12 +23,18 @@ struct FunctionScopeFrame {
     hoisted_to_parent: Vec<Stmt>,
 }
 
+struct PendingAnnotationHelper {
+    target_name: String,
+    make_function_expr: Expr,
+}
+
 struct BlockPyModuleRewriter<'a, P: ModuleShape> {
     context: &'a Context,
     semantic_state: SemanticAstState,
     module_name_gen: ModuleNameGen,
     function_scope_stack: Vec<FunctionScopeFrame>,
     callable_defs: Vec<BlockPyFunction<P>>,
+    pending_annotation_helpers: Vec<PendingAnnotationHelper>,
     lower_function_to_blockpy: fn(
         &Context,
         &ast::StmtFunctionDef,
@@ -54,6 +61,7 @@ pub(crate) fn rewrite_ast_to_core_blockpy_module_plan_with_module(
         module_name_gen,
         function_scope_stack: Vec::new(),
         callable_defs: Vec::new(),
+        pending_annotation_helpers: Vec::new(),
         lower_function_to_blockpy: try_lower_function_to_core_blockpy_bundle,
     };
     let module_init =
@@ -168,6 +176,7 @@ fn rewrite_function_def_stmt_via_blockpy_with_pass<P: ModuleShape>(
     function_hoisted: Vec<Stmt>,
     module_name_gen: &mut ModuleNameGen,
     callable_defs: &mut Vec<BlockPyFunction<P>>,
+    annotate_fn_expr: Expr,
     lower_function_to_blockpy: fn(
         &Context,
         &ast::StmtFunctionDef,
@@ -183,7 +192,7 @@ fn rewrite_function_def_stmt_via_blockpy_with_pass<P: ModuleShape>(
         lowered_plan.function_id,
         rewrite_stmt::decorator::collect_exprs(&func.decorator_list),
         &param_defaults,
-        py_expr!("None"),
+        annotate_fn_expr,
         lowered_plan.kind,
     );
     let binding_stmt = vec![py_stmt!(
@@ -332,6 +341,7 @@ def {func:id}():
         func: &mut ast::StmtFunctionDef,
         state: FunctionScopeFrame,
     ) -> Vec<Stmt> {
+        let annotate_fn_expr = self.consume_pending_annotation_helper(func);
         let parent_frame = self
             .function_scope_stack
             .last_mut()
@@ -345,8 +355,64 @@ def {func:id}():
             state.hoisted_to_parent,
             &mut self.module_name_gen,
             &mut self.callable_defs,
+            annotate_fn_expr,
             self.lower_function_to_blockpy,
         )
+    }
+
+    fn pending_annotation_helper_target_name(&self, func: &ast::StmtFunctionDef) -> Option<String> {
+        func.name
+            .id
+            .as_str()
+            .strip_prefix(FUNCTION_ANNOTATE_PREFIX)
+            .map(str::to_string)
+    }
+
+    fn lower_pending_annotation_helper(
+        &mut self,
+        func: &mut ast::StmtFunctionDef,
+        target_name: String,
+    ) {
+        let state = self.walk_function_def_with_scope(func);
+        assert!(
+            state.hoisted_to_parent.is_empty(),
+            "function annotation helper should not hoist child functions"
+        );
+        let lowered_plan = (self.lower_function_to_blockpy)(
+            self.context,
+            func,
+            &state.callable_scope,
+            self.module_name_gen.next_function_name_gen(),
+        );
+        let (_, param_defaults) = collect_param_spec_and_defaults(&func.parameters);
+        let make_function_expr = build_lowered_function_instantiation_expr(
+            lowered_plan.function_id,
+            Vec::new(),
+            &param_defaults,
+            py_expr!("None"),
+            lowered_plan.kind,
+        );
+        self.callable_defs.push(lowered_plan);
+        self.pending_annotation_helpers
+            .push(PendingAnnotationHelper {
+                target_name,
+                make_function_expr,
+            });
+    }
+
+    fn consume_pending_annotation_helper(&mut self, func: &ast::StmtFunctionDef) -> Expr {
+        let func_name = func.name.id.as_str();
+        if let Some(index) = self
+            .pending_annotation_helpers
+            .iter()
+            .rposition(|pending| pending.target_name == func_name)
+        {
+            return self
+                .pending_annotation_helpers
+                .remove(index)
+                .make_function_expr;
+        }
+        py_expr!("None")
     }
 }
 
@@ -356,6 +422,10 @@ impl<P: ModuleShape> Transformer for BlockPyModuleRewriter<'_, P> {
         for stmt in std::mem::take(body) {
             let mut stmt = stmt;
             if let Stmt::FunctionDef(func) = &mut stmt {
+                if let Some(target_name) = self.pending_annotation_helper_target_name(func) {
+                    self.lower_pending_annotation_helper(func, target_name);
+                    continue;
+                }
                 let state = self.walk_function_def_with_scope(func);
                 let replacement = self.rewrite_visited_function_def(func, state);
                 rewritten.extend(replacement);

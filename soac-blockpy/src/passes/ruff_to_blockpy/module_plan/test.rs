@@ -189,6 +189,7 @@ fn recursive_local_function_bindings_are_cell_owned_in_parent_scope() {
             hoisted_to_parent: Vec::new(),
         }],
         callable_defs: Vec::new(),
+        pending_annotation_helpers: Vec::new(),
         lower_function_to_blockpy: try_lower_function_to_core_blockpy_bundle,
     };
     let nested_stmt = &mut outer

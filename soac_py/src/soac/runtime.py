@@ -712,6 +712,18 @@ def make_function(
 
     return func
 
+
+def annotation_forwardref_value(thunk, source, module_name):
+    try:
+        value = thunk()
+    except Exception:
+        value = DELETED
+    if value is not DELETED:
+        return value
+    annotationlib = _builtins.__import__("annotationlib")
+    return annotationlib.ForwardRef(source, module=module_name)
+
+
 def create_class(
     name,
     namespace_fn,

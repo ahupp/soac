@@ -15,53 +15,67 @@ class C:
 #     block bb1:
 #         return GetAttr(self, "x")
 
-# function C.__annotate_func__(_dp_format, __soac__):
+# function C.__annotate_func__.<locals>.<lambda>():
 #     function_id: 0:2
-#     block bb5:
+#     display_name: <lambda>
+#     block bb1:
+#         return int
+
+# function C.__annotate_func__(_dp_format, __soac__):
+#     function_id: 0:3
+#     block bb8:
 #         if_term eq(_dp_format, 4):
 #             then:
-#                 block bb6:
+#                 block bb9:
 #                     return dict(tuple_values(tuple_values("x", "int")))
 #             else:
-#                 block bb7:
-#                     jump bb2
-#                     block bb2:
-#                         if_term gt(_dp_format, 2):
+#                 block bb10:
+#                     jump bb5
+#                     block bb5:
+#                         if_term eq(_dp_format, 3):
 #                             then:
-#                                 block bb3:
-#                                     raise GetAttr(builtins, "NotImplementedError")
+#                                 block bb6:
+#                                     return dict(tuple_values(tuple_values("x", annotation_forwardref_value(MakeFunction(0:2, Function, tuple_values(), NONE), "int", __name__))))
 #                             else:
-#                                 block bb4:
-#                                     return dict(tuple_values(tuple_values("x", int)))
+#                                 block bb7:
+#                                     jump bb2
+#                                     block bb2:
+#                                         if_term gt(_dp_format, 2):
+#                                             then:
+#                                                 block bb3:
+#                                                     raise GetAttr(builtins, "NotImplementedError")
+#                                             else:
+#                                                 block bb4:
+#                                                     return dict(tuple_values(tuple_values("x", int)))
 
 # function _dp_class_ns_C(_dp_class_ns, _dp_classcell_arg):
-#     function_id: 0:3
+#     function_id: 0:4
 #     block bb1:
 #         StoreName("_dp_classcell", _dp_classcell_arg)
-#         StoreName("_dp_assign_value_1", __name__)
-#         StoreName("_dp_assign_obj_2", load_deleted_name("_dp_class_ns", _dp_class_ns))
-#         StoreName("_dp_assign_index_3", "__module__")
-#         SetItem(_dp_assign_obj_2, _dp_assign_index_3, _dp_assign_value_1)
-#         StoreName("_dp_assign_value_4", "C")
-#         StoreName("_dp_assign_obj_5", load_deleted_name("_dp_class_ns", _dp_class_ns))
-#         StoreName("_dp_assign_index_6", "__qualname__")
-#         SetItem(_dp_assign_obj_5, _dp_assign_index_6, _dp_assign_value_4)
+#         StoreName("_dp_assign_value_2", __name__)
+#         StoreName("_dp_assign_obj_3", load_deleted_name("_dp_class_ns", _dp_class_ns))
+#         StoreName("_dp_assign_index_4", "__module__")
+#         SetItem(_dp_assign_obj_3, _dp_assign_index_4, _dp_assign_value_2)
+#         StoreName("_dp_assign_value_5", "C")
+#         StoreName("_dp_assign_obj_6", load_deleted_name("_dp_class_ns", _dp_class_ns))
+#         StoreName("_dp_assign_index_7", "__qualname__")
+#         SetItem(_dp_assign_obj_6, _dp_assign_index_7, _dp_assign_value_5)
 #         StoreName("x", 1)
 #         StoreName("m", MakeFunction(0:1, Function, tuple_values(), NONE))
-#         StoreName("__annotate_func__", MakeFunction(0:2, Function, tuple_values(__import__("soac.runtime", globals(), dict(), tuple_values("runtime"), 0)), NONE))
+#         StoreName("__annotate_func__", MakeFunction(0:3, Function, tuple_values(__import__("soac.runtime", globals(), dict(), tuple_values("runtime"), 0)), NONE))
 #         return NONE
 
 # function _dp_define_class_C(_dp_class_ns_fn, _dp_class_ns_outer, _dp_prepare_dict):
-#     function_id: 0:4
-#     block bb1:
-#         StoreName("_dp_class_ns", _dp_class_ns_outer)
-#         return create_class("C", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 2, tuple_values())
-
-# function _dp_module_init():
 #     function_id: 0:5
 #     block bb1:
-#         StoreName("_dp_class_ns_C", MakeFunction(0:3, Function, tuple_values(), NONE))
-#         StoreName("_dp_define_class_C", MakeFunction(0:4, Function, tuple_values(NONE), NONE))
+#         StoreName("_dp_class_ns", _dp_class_ns_outer)
+#         return create_class("C", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 3, tuple_values())
+
+# function _dp_module_init():
+#     function_id: 0:6
+#     block bb1:
+#         StoreName("_dp_class_ns_C", MakeFunction(0:4, Function, tuple_values(), NONE))
+#         StoreName("_dp_define_class_C", MakeFunction(0:5, Function, tuple_values(NONE), NONE))
 #         StoreName("C", _dp_define_class_C(_dp_class_ns_C, globals()))
 #         return NONE
 
@@ -75,37 +89,76 @@ class Wrapper:
 
 # ==
 
-# function Wrapper.open(self, mode, *, encoding):
+# function Wrapper._dp_annotate_func_open.<locals>.<lambda>():
 #     function_id: 0:1
+#     display_name: <lambda>
+#     block bb1:
+#         return str
+
+# function Wrapper._dp_annotate_func_open.<locals>.<lambda>():
+#     function_id: 0:2
+#     display_name: <lambda>
+#     block bb1:
+#         return str
+
+# function Wrapper._dp_annotate_func_open(_dp_format, __soac__):
+#     function_id: 0:3
+#     block bb8:
+#         if_term eq(_dp_format, 4):
+#             then:
+#                 block bb9:
+#                     return dict(tuple_values(tuple_values("mode", "str"), tuple_values("encoding", "str")))
+#             else:
+#                 block bb10:
+#                     jump bb5
+#                     block bb5:
+#                         if_term eq(_dp_format, 3):
+#                             then:
+#                                 block bb6:
+#                                     return dict(tuple_values(tuple_values("mode", annotation_forwardref_value(MakeFunction(0:1, Function, tuple_values(), NONE), "str", __name__)), tuple_values("encoding", annotation_forwardref_value(MakeFunction(0:2, Function, tuple_values(), NONE), "str", __name__))))
+#                             else:
+#                                 block bb7:
+#                                     jump bb2
+#                                     block bb2:
+#                                         if_term gt(_dp_format, 2):
+#                                             then:
+#                                                 block bb3:
+#                                                     raise GetAttr(builtins, "NotImplementedError")
+#                                             else:
+#                                                 block bb4:
+#                                                     return dict(tuple_values(tuple_values("mode", str), tuple_values("encoding", str)))
+
+# function Wrapper.open(self, mode, *, encoding):
+#     function_id: 0:4
 #     block bb1:
 #         return open(mode, encoding=encoding)
 
 # function _dp_class_ns_Wrapper(_dp_class_ns, _dp_classcell_arg):
-#     function_id: 0:2
+#     function_id: 0:5
 #     block bb1:
 #         StoreName("_dp_classcell", _dp_classcell_arg)
-#         StoreName("_dp_assign_value_1", __name__)
-#         StoreName("_dp_assign_obj_2", load_deleted_name("_dp_class_ns", _dp_class_ns))
-#         StoreName("_dp_assign_index_3", "__module__")
-#         SetItem(_dp_assign_obj_2, _dp_assign_index_3, _dp_assign_value_1)
-#         StoreName("_dp_assign_value_4", "Wrapper")
-#         StoreName("_dp_assign_obj_5", load_deleted_name("_dp_class_ns", _dp_class_ns))
-#         StoreName("_dp_assign_index_6", "__qualname__")
-#         SetItem(_dp_assign_obj_5, _dp_assign_index_6, _dp_assign_value_4)
-#         StoreName("open", MakeFunction(0:1, Function, tuple_values("r", "utf8"), NONE))
+#         StoreName("_dp_assign_value_3", __name__)
+#         StoreName("_dp_assign_obj_4", load_deleted_name("_dp_class_ns", _dp_class_ns))
+#         StoreName("_dp_assign_index_5", "__module__")
+#         SetItem(_dp_assign_obj_4, _dp_assign_index_5, _dp_assign_value_3)
+#         StoreName("_dp_assign_value_6", "Wrapper")
+#         StoreName("_dp_assign_obj_7", load_deleted_name("_dp_class_ns", _dp_class_ns))
+#         StoreName("_dp_assign_index_8", "__qualname__")
+#         SetItem(_dp_assign_obj_7, _dp_assign_index_8, _dp_assign_value_6)
+#         StoreName("open", MakeFunction(0:4, Function, tuple_values("r", "utf8"), MakeFunction(0:3, Function, tuple_values(__import__("soac.runtime", globals(), dict(), tuple_values("runtime"), 0)), NONE)))
 #         return NONE
 
 # function _dp_define_class_Wrapper(_dp_class_ns_fn, _dp_class_ns_outer, _dp_prepare_dict):
-#     function_id: 0:3
+#     function_id: 0:6
 #     block bb1:
 #         StoreName("_dp_class_ns", _dp_class_ns_outer)
-#         return create_class("Wrapper", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 2, tuple_values())
+#         return create_class("Wrapper", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 3, tuple_values())
 
 # function _dp_module_init():
-#     function_id: 0:4
+#     function_id: 0:7
 #     block bb1:
-#         StoreName("_dp_class_ns_Wrapper", MakeFunction(0:2, Function, tuple_values(), NONE))
-#         StoreName("_dp_define_class_Wrapper", MakeFunction(0:3, Function, tuple_values(NONE), NONE))
+#         StoreName("_dp_class_ns_Wrapper", MakeFunction(0:5, Function, tuple_values(), NONE))
+#         StoreName("_dp_define_class_Wrapper", MakeFunction(0:6, Function, tuple_values(NONE), NONE))
 #         StoreName("Wrapper", _dp_define_class_Wrapper(_dp_class_ns_Wrapper, globals()))
 #         return NONE
 
@@ -136,7 +189,7 @@ class D(Base):
 #     function_id: 0:2
 #     block bb1:
 #         StoreName("_dp_class_ns", _dp_class_ns_outer)
-#         return create_class("D", _dp_class_ns_fn, tuple_values(Base), _dp_prepare_dict, FALSE, 2, tuple_values())
+#         return create_class("D", _dp_class_ns_fn, tuple_values(Base), _dp_prepare_dict, FALSE, 3, tuple_values())
 
 # function _dp_module_init():
 #     function_id: 0:3
@@ -179,7 +232,7 @@ def outer():
 #     function_id: 0:2
 #     block bb1:
 #         StoreName("_dp_class_ns", _dp_class_ns_outer)
-#         return create_class("Inner", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 5, tuple_values())
+#         return create_class("Inner", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 6, tuple_values())
 
 # function outer():
 #     function_id: 0:3
@@ -234,7 +287,7 @@ class X:
 #     function_id: 0:3
 #     block bb1:
 #         StoreName("_dp_class_ns", _dp_class_ns_outer)
-#         return create_class("X", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, TRUE, 2, tuple_values())
+#         return create_class("X", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, TRUE, 3, tuple_values())
 
 # function _dp_module_init():
 #     function_id: 0:4
@@ -272,7 +325,7 @@ class A:
 #     function_id: 0:2
 #     block bb1:
 #         StoreName("_dp_class_ns", _dp_class_ns_outer)
-#         return create_class("B", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 3, tuple_values())
+#         return create_class("B", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 4, tuple_values())
 
 # function _dp_class_ns_A(_dp_class_ns, _dp_classcell_arg):
 #     function_id: 0:3
@@ -295,7 +348,7 @@ class A:
 #     function_id: 0:4
 #     block bb1:
 #         StoreName("_dp_class_ns", _dp_class_ns_outer)
-#         return create_class("A", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 2, tuple_values())
+#         return create_class("A", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 3, tuple_values())
 
 # function _dp_module_init():
 #     function_id: 0:5
@@ -336,7 +389,7 @@ def foo():
 #     function_id: 0:2
 #     block bb1:
 #         StoreName("_dp_class_ns", _dp_class_ns_outer)
-#         return create_class("B", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 6, tuple_values())
+#         return create_class("B", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 7, tuple_values())
 
 # function foo.<locals>._dp_class_ns_A(_dp_class_ns, _dp_classcell_arg):
 #     function_id: 0:3
@@ -359,7 +412,7 @@ def foo():
 #     function_id: 0:4
 #     block bb1:
 #         StoreName("_dp_class_ns", _dp_class_ns_outer)
-#         return create_class("A", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 3, tuple_values())
+#         return create_class("A", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 4, tuple_values())
 
 # function foo():
 #     function_id: 0:5
