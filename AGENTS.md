@@ -225,9 +225,7 @@ instance's live working commit.
 - `DIET_PYTHON_COUNTERS_DIR` / `DIET_PYTHON_SPECIALIZATION_MODE`
   Normal specialization runs use one counters directory with conventional
   files: `profile.bin` for specialization input and `verify.bin` for the
-  countered verification pass. Transformed imports also append one
-  JSONL timing row per module load to `module_loads.jsonl` in the same
-  directory. Set
+  countered verification pass. Set
   `DIET_PYTHON_SPECIALIZATION_MODE=profile`, `verify`, or `apply`;
   recipes should pass the same `DIET_PYTHON_COUNTERS_DIR` and change
   only the mode between passes.
@@ -246,6 +244,14 @@ instance's live working commit.
   materially reduces truncated mixed JIT/CPython stacks in the exported
   profiles. If you change that default or add related perf-stack knobs,
   document them in `README.md` and in this appendix note.
+- `SOAC_LOG`
+  Controls SOAC Rust diagnostics through `tracing-subscriber` filter
+  syntax. Use focused targets such as `SOAC_LOG=soac_jit=info` or
+  `SOAC_LOG=soac_blockpy=trace`; append
+  `;json=/path/to/events.jsonl` to write tracing JSONL there instead
+  of formatted stderr. Module-load timing is emitted by the
+  `soac_module_load` target; JIT-codegen timing is emitted by
+  `soac_jit_codegen`.
 - `DIET_PYTHON_KEY_LAYOUT_COUNTERS`
   Enables cold module/type key-layout records in the counter dump. This
   is metadata collection, not a hot increment counter: module keys are

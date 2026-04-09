@@ -1,8 +1,8 @@
 use std::{backtrace::Backtrace, collections::HashSet, mem::take};
 
-use log::{log_enabled, trace, Level};
 use ruff_python_ast::{self as ast, Expr, Stmt};
 use ruff_text_size::{Ranged, TextRange};
+use tracing::{enabled, trace, Level};
 
 use crate::passes::ast_to_ast::body::Suite;
 use crate::passes::ast_to_ast::scope_helpers::ScopeKind;
@@ -70,7 +70,7 @@ pub fn rewrite_with_pass<'a>(
     let mut iteration = 0usize;
     loop {
         iteration += 1;
-        if log_enabled!(Level::Trace) {
+        if enabled!(Level::TRACE) {
             trace!(
                 "rewrite_with_pass iteration {} start: {}",
                 iteration,
@@ -79,7 +79,7 @@ pub fn rewrite_with_pass<'a>(
         }
         let modified = rewrite_once_with_pass(context, stmt_pass, expr_pass, body);
 
-        if log_enabled!(Level::Trace) {
+        if enabled!(Level::TRACE) {
             trace!(
                 "rewrite_with_pass iteration {} end: {} modified={}",
                 iteration,
@@ -186,7 +186,7 @@ impl<'a> RewriteLoop<'a> {
         for stmt in initial.into_iter() {
             if let Some(stmt_pass) = self.stmt_pass {
                 let mut before = None;
-                if log_enabled!(Level::Trace) {
+                if enabled!(Level::TRACE) {
                     before = Some(crate::ruff_ast_to_string(&stmt));
                 }
                 let res = stmt_pass.lower_stmt(self.context, stmt);
@@ -195,7 +195,7 @@ impl<'a> RewriteLoop<'a> {
                         self.flush_buffered(stmt, &mut output);
                     }
                     Rewrite::Walk(stmts) => {
-                        if log_enabled!(Level::Trace) {
+                        if enabled!(Level::TRACE) {
                             trace!(
                                 "rewrite before: \n{} after: \n{}",
                                 before.unwrap_or_default(),
@@ -239,7 +239,7 @@ impl<'a> Transformer for RewriteLoop<'a> {
         loop {
             iteration += 1;
             let mut log_input = None;
-            if log_enabled!(Level::Trace) {
+            if enabled!(Level::TRACE) {
                 log_input = Some(ruff_ast_to_string(&current).trim_end().to_string());
             }
             lowered = expr_pass.lower_expr(self.context, current);
@@ -249,7 +249,7 @@ impl<'a> Transformer for RewriteLoop<'a> {
                 expr,
                 modified,
             } = lowered;
-            if log_enabled!(Level::Trace) {
+            if enabled!(Level::TRACE) {
                 trace!(
                     "lower_expr iteration={} modified={} \ninput: {}\noutput: \n{}\nstmt: \n{}",
                     iteration,

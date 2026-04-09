@@ -1,9 +1,9 @@
 use super::*;
 use crate::passes::ast_to_ast::body::Suite;
-use log::{log_enabled, trace, Level};
 use ruff_python_ast::{self as ast, name::Name, Expr, Pattern, Stmt};
 use ruff_python_parser::parse_expression;
 use ruff_text_size::TextRange;
+use tracing::{enabled, trace, Level};
 
 use crate::{py_expr, py_stmt, ruff_ast_to_string};
 
@@ -37,7 +37,7 @@ fn integer_expr(value: usize) -> Expr {
 }
 
 fn trace_expr(label: &str, expr: &Expr) {
-    if !log_enabled!(Level::Trace) {
+    if !enabled!(Level::TRACE) {
         return;
     }
     let stmt = Stmt::Expr(ast::StmtExpr {
@@ -53,7 +53,7 @@ fn test_for_pattern(pattern: &Pattern, subject: Expr) -> PatternTest {
         PatternMatchOr, PatternMatchSequence, PatternMatchSingleton, PatternMatchValue, Singleton,
     };
     use PatternTest::*;
-    if log_enabled!(Level::Trace) {
+    if enabled!(Level::TRACE) {
         trace!("match_case test_for_pattern pattern={pattern:?}");
         trace_expr("match_case subject", &subject);
     }

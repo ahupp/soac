@@ -5,11 +5,11 @@ use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use log::{log_enabled, trace, Level};
 use soac_blockpy::block_py::BlockPyModule;
 use soac_blockpy::fixture::{parse_fixture, render_fixture, FixtureBlock};
 use soac_blockpy::passes::CodegenModuleShape;
 use soac_blockpy::{init_logging, lower_python_to_blockpy_for_testing};
+use tracing::{enabled, trace, Level};
 
 struct SnapshotSummaryRow {
     case_name: String,
@@ -19,7 +19,7 @@ struct SnapshotSummaryRow {
 }
 
 fn collect_fixtures(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
-    if log_enabled!(Level::Trace) {
+    if enabled!(Level::TRACE) {
         trace!("collect_fixtures: entering {}", root.display());
     }
     let entries = fs::read_dir(root)
@@ -33,7 +33,7 @@ fn collect_fixtures(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
             name.to_string_lossy().starts_with("snapshot_")
                 && path.extension().is_some_and(|ext| ext == "py")
         }) {
-            if log_enabled!(Level::Trace) {
+            if enabled!(Level::TRACE) {
                 trace!("collect_fixtures: found {}", path.display());
             }
             out.push(path);
@@ -281,19 +281,19 @@ fn load_fixture_blocks(path: &Path, contents: &str) -> Result<Vec<FixtureBlock>,
 }
 
 fn regenerate_fixture(path: &Path, summary: &mut Vec<SnapshotSummaryRow>) -> Result<(), String> {
-    if log_enabled!(Level::Trace) {
+    if enabled!(Level::TRACE) {
         trace!("regenerate_fixture: start {}", path.display());
     }
     let contents =
         fs::read_to_string(path).map_err(|err| format!("{}: {}", path.display(), err))?;
     let mut blocks = load_fixture_blocks(path, &contents)?;
-    if log_enabled!(Level::Trace) {
+    if enabled!(Level::TRACE) {
         trace!("regenerate_fixture: parsed {} blocks", blocks.len());
     }
 
     let mut snapshot_blocks = Vec::with_capacity(blocks.len());
     for block in &blocks {
-        if log_enabled!(Level::Trace) {
+        if enabled!(Level::TRACE) {
             trace!("regenerate_fixture: transforming {}", block.name);
         }
         let case_name = qualified_case_name(path, block)?;

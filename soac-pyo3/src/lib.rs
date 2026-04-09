@@ -2,10 +2,10 @@
 
 mod jit_runtime;
 
-use log::trace;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 use soac_blockpy::{lower_python_to_blockpy_for_testing, ruff_ast_to_string};
+use tracing::trace;
 
 #[cfg(test)]
 mod test;

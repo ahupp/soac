@@ -555,7 +555,11 @@ _pytest-run *args='': ensure-venv
     exit 0
   fi
 
-  export RUST_LOG="${RUST_LOG:-soac_jit=info}"
+  SOAC_PYTEST_EVENTS_LOG="$REPO_ROOT/logs/pytest_soac_events.jsonl"
+  if [[ -z "${SOAC_LOG:-}" ]]; then
+    rm -f "$SOAC_PYTEST_EVENTS_LOG"
+    export SOAC_LOG="soac_jit=info,soac_module_load=info,soac_jit_codegen=info;json=$SOAC_PYTEST_EVENTS_LOG"
+  fi
   export SOAC_OPT_UNSOUND="${SOAC_OPT_UNSOUND:-1}"
   PYTEST_TB=native
 
@@ -577,6 +581,12 @@ _pytest-run *args='': ensure-venv
 
 pytest *args='': build-all
   #!/usr/bin/env bash
+  just _pytest-run "$@"
+
+test-fast *args='tests/': ensure-venv
+  #!/usr/bin/env bash
+  set -euo pipefail
+  export DIET_PYTHON_INSTALL_HOOK=1
   just _pytest-run "$@"
 
 py *args='': build-all
@@ -760,6 +770,11 @@ benchmark-verify loops="100000" counters_dir="": (update-venv) (build-extension 
     echo "counter profile not found at $COUNTERS_DIR/profile.bin; run 'just benchmark' first or pass counters_dir=<dir>" >&2
     exit 1
   fi
+  SOAC_VERIFY_EVENTS_LOG="$COUNTERS_DIR/verify_soac_events.jsonl"
+  if [[ -z "${SOAC_LOG:-}" ]]; then
+    rm -f "$SOAC_VERIFY_EVENTS_LOG"
+    export SOAC_LOG="soac_jit=info,soac_module_load=info,soac_jit_codegen=info;json=$SOAC_VERIFY_EVENTS_LOG"
+  fi
   rm -f "$COUNTERS_DIR/verify.bin"
 
   echo "jit transformed verify pass"
@@ -794,6 +809,11 @@ benchmark-warm loops="8000000": (update-venv) (build-extension "release")
   cd "$REPO_ROOT"
 
   echo "jit transformed warm"
+  SOAC_WARM_EVENTS_LOG="$REPO_ROOT/logs/benchmark_warm_soac_events.jsonl"
+  if [[ -z "${SOAC_LOG:-}" ]]; then
+    rm -f "$SOAC_WARM_EVENTS_LOG"
+    export SOAC_LOG="soac_jit=info,soac_module_load=info,soac_jit_codegen=info;json=$SOAC_WARM_EVENTS_LOG"
+  fi
   LOOPS="{{loops}}" \
   WARMUP_LOOPS="${WARMUP_LOOPS}" \
   BENCHMARK_CPU="${BENCHMARK_CPU}" \
@@ -831,6 +851,11 @@ benchmark loops="8000000": (update-venv) (build-extension "release")
 
   cd "$REPO_ROOT"
   mkdir -p "$LAST_BENCHMARK_COUNTERS_DIR"
+  SOAC_BENCHMARK_EVENTS_LOG="$LAST_BENCHMARK_COUNTERS_DIR/soac_events.jsonl"
+  if [[ -z "${SOAC_LOG:-}" ]]; then
+    rm -f "$SOAC_BENCHMARK_EVENTS_LOG"
+    export SOAC_LOG="soac_jit=info,soac_module_load=info,soac_jit_codegen=info;json=$SOAC_BENCHMARK_EVENTS_LOG"
+  fi
   counter_dump_path="$LAST_BENCHMARK_COUNTERS_DIR/profile.bin"
   rm -f "$LAST_BENCHMARK_COUNTERS_DIR/profile.bin" "$LAST_BENCHMARK_COUNTERS_DIR/verify.bin"
 
@@ -846,6 +871,7 @@ benchmark loops="8000000": (update-venv) (build-extension "release")
 
   echo "last benchmark counters dir: $LAST_BENCHMARK_COUNTERS_DIR"
   echo "last benchmark profile counters: $LAST_BENCHMARK_COUNTERS"
+  echo "last benchmark SOAC events log: $SOAC_BENCHMARK_EVENTS_LOG"
   echo "run speedscope from these counters: just run-and-view-speedscope"
 
   site_count="$(just _call-target-specializations-from-dump "$counter_dump_path" | awk -F';' 'NF { print NF }')"

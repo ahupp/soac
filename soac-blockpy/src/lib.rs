@@ -9,8 +9,11 @@ use ruff_python_codegen::{Generator, Indentation};
 pub use ruff_python_parser::ParseError;
 use ruff_source_file::LineEnding;
 use ruff_text_size::TextRange;
-use std::sync::Once;
+use std::fs::{self, OpenOptions};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 pub mod block_py;
 pub mod codegen_cache;
@@ -62,17 +65,75 @@ impl From<AnyhowError> for LoweringError {
     }
 }
 
-static INIT_LOGGER: Once = Once::new();
+struct SoacLogConfig {
+    filter: EnvFilter,
+    json_path: Option<PathBuf>,
+}
+
+fn parse_soac_log_env() -> SoacLogConfig {
+    let raw = std::env::var("SOAC_LOG").unwrap_or_default();
+    let mut filter_segments = Vec::new();
+    let mut json_path = None;
+    for segment in raw.split(';') {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+        if let Some(path) = segment.strip_prefix("json=") {
+            let path = path.trim();
+            if !path.is_empty() {
+                json_path = Some(PathBuf::from(path));
+            }
+        } else {
+            filter_segments.push(segment);
+        }
+    }
+    let filter = EnvFilter::builder()
+        .parse(filter_segments.join(","))
+        .unwrap_or_else(|_| EnvFilter::new(""));
+    SoacLogConfig { filter, json_path }
+}
+
+fn open_soac_log_file(path: &Path) -> std::io::Result<Arc<std::fs::File>> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map(Arc::new)
+}
 
 pub fn init_logging() {
-    INIT_LOGGER.call_once(|| {
-        let mut builder =
-            env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(""));
-        if cfg!(test) {
-            builder.is_test(true);
+    let SoacLogConfig { filter, json_path } = parse_soac_log_env();
+    let registry = tracing_subscriber::registry().with(filter);
+    if let Some(json_path) = json_path {
+        match open_soac_log_file(&json_path) {
+            Ok(json_file) => {
+                let json_layer = fmt::layer()
+                    .json()
+                    .flatten_event(true)
+                    .with_writer(move || {
+                        json_file
+                            .try_clone()
+                            .expect("failed to clone SOAC_LOG json file")
+                    });
+                let _ = registry.with(json_layer).try_init();
+            }
+            Err(err) => {
+                eprintln!(
+                    "[soac logging] failed to open SOAC_LOG json file {}: {err}",
+                    json_path.display()
+                );
+            }
         }
-        let _ = builder.try_init();
-    });
+    } else {
+        let fmt_layer = fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_ansi(!cfg!(test));
+        let _ = registry.with(fmt_layer).try_init();
+    }
 }
 
 pub struct LoweringResult<P = RecordingPassTracker> {

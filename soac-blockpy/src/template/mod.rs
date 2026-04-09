@@ -63,8 +63,8 @@ macro_rules! py_expr {
         match stmt {
             Stmt::Expr(ast::StmtExpr { value, .. }) => *value,
             other => {
-                if log::log_enabled!(log::Level::Trace) {
-                    log::trace!(
+                if tracing::enabled!(tracing::Level::TRACE) {
+                    tracing::trace!(
                         "py_expr expected expression statement from template `{}`; got {:?}",
                         $template,
                         other

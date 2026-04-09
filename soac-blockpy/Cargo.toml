@@ -23,8 +23,8 @@ regex = "1"
 serde_json = "1"
 rkyv = { version = "0.8", default-features = false, features = ["std", "bytecheck"] }
 similar = "2"
-log = "0.4"
-env_logger = "0.11"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 anyhow = { version = "1.0.100", features = ["backtrace"] }
 derive_more = { version = "2", features = ["from"] }
 soac-macros = { path = "../soac-macros" }

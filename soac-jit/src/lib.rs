@@ -24,7 +24,6 @@ pub(crate) fn python_runtime_test_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-use log::info;
 use pyo3::ffi;
 use pyo3::prelude::*;
 use soac_blockpy::block_py::{FunctionId, ParamKind};
@@ -37,6 +36,7 @@ use std::mem;
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr::{self, NonNull};
 use std::time::Instant;
+use tracing::info;
 
 unsafe extern "C" {
     fn PyFunction_SetVectorcall(func: *mut ffi::PyFunctionObject, vectorcall: ffi::vectorcallfunc);

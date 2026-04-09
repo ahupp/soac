@@ -114,6 +114,16 @@ exports are intentionally omitted here.
   print debug logging for direct-method and owner-type specialization
   registration.
 
+- `SOAC_LOG=<tracing-filter>`
+  Controls SOAC Rust diagnostic logging. The filter portion uses
+  `tracing-subscriber` syntax, for example `SOAC_LOG=trace` or
+  `SOAC_LOG=soac_jit=info,soac_blockpy=trace`. Append
+  `;json=/path/to/events.jsonl` to write tracing JSONL to that file
+  instead of formatted stderr. Module-load timings are emitted as
+  `soac_module_load` tracing events, and JIT-codegen timing is emitted
+  through `soac_jit_codegen`; enable them with
+  `SOAC_LOG=soac_module_load=info,soac_jit_codegen=info`.
+
 ## Counters And Specialization
 
 - `DIET_PYTHON_SPECIALIZATION_MODE=profile|verify|apply`
@@ -132,8 +142,8 @@ exports are intentionally omitted here.
   Directory used by `DIET_PYTHON_SPECIALIZATION_MODE`. The runtime
   creates the directory when it writes counters. The conventional files
   are `profile.bin` for the specialization input and `verify.bin` for
-  the countered verification pass. When this is set, transformed module
-  loads also append timing rows to `<counters-dir>/module_loads.jsonl`.
+  the countered verification pass. Use `SOAC_LOG` to collect
+  module-load timing events.
 
 - `DIET_PYTHON_CALL_TARGET_COUNTERS=1`
   In `fn call_target_counter_instrumentation_enabled`, at

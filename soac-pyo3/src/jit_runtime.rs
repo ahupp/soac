@@ -1,5 +1,4 @@
 use crate::lowering_error_to_pyerr;
-use log::info;
 use pyo3::exceptions::{
     PyAttributeError, PyNotImplementedError, PyOSError, PyRuntimeError, PyTypeError, PyValueError,
 };
@@ -11,13 +10,10 @@ use soac_blockpy::passes::CodegenModuleShape;
 use soac_blockpy::{LoweringOptions, lower_python_to_blockpy_recorded_with_options};
 use soac_jit::module_type::{ModuleInfo, SharedModuleState, SoacExtModule, hash_module_source};
 use std::collections::{HashMap, VecDeque};
-use std::env;
 use std::fs;
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use tracing::info;
 
 unsafe extern "C" {
     static mut PyCell_Type: ffi::PyTypeObject;
@@ -151,24 +147,12 @@ fn time_phase<T>(
     value
 }
 
-fn elapsed_ms(elapsed: Duration) -> f64 {
-    elapsed.as_secs_f64() * 1000.0
+fn elapsed_us(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
 }
 
-fn push_timing_ms(
-    timings: &mut serde_json::Map<String, serde_json::Value>,
-    name: impl Into<String>,
-    elapsed: Duration,
-) {
-    timings.insert(name.into(), serde_json::json!(elapsed_ms(elapsed)));
-}
-
-fn push_named_timing_ms(
-    timings: &mut serde_json::Map<String, serde_json::Value>,
-    prefix: &str,
-    phase: &TimedPhase,
-) {
-    push_timing_ms(timings, format!("{prefix}.{}", phase.name), phase.elapsed);
+fn source_hash_hex(source_hash: u64) -> String {
+    format!("0x{source_hash:016x}")
 }
 
 fn pending_module_load_timings() -> &'static Mutex<HashMap<usize, PendingModuleLoadTiming>> {
@@ -193,61 +177,16 @@ fn take_pending_module_load_timing(module: *mut ffi::PyObject) -> Option<Pending
     pending.remove(&pending_module_load_timing_key(module))
 }
 
-fn trimmed_env_path(name: &str) -> Option<PathBuf> {
-    let raw = env::var_os(name)?;
-    let trimmed = raw.to_string_lossy().trim().to_string();
-    (!trimmed.is_empty()).then(|| trimmed.into())
-}
-
-fn module_load_log_dir() -> Option<PathBuf> {
-    if let Some(dir) = trimmed_env_path("DIET_PYTHON_COUNTERS_DIR") {
-        return Some(dir);
-    }
-    if let Some(file) = trimmed_env_path("DIET_PYTHON_COUNTERS_OUTPUT_FILE") {
-        return Some(
-            file.parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf(),
-        );
-    }
-    let file = trimmed_env_path("DIET_PYTHON_COUNTERS_FILE")?;
-    Some(
-        file.parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf(),
-    )
-}
-
-fn module_load_log_path() -> Option<PathBuf> {
-    Some(module_load_log_dir()?.join("module_loads.jsonl"))
-}
-
-fn append_module_load_json(entry: &serde_json::Value) {
-    let Some(path) = module_load_log_path() else {
-        return;
-    };
-    if let Some(parent) = path.parent() {
-        if let Err(err) = fs::create_dir_all(parent) {
-            eprintln!(
-                "[soac module-load log] failed to create {}: {err}",
-                parent.display()
-            );
-            return;
-        }
-    }
-    let append_result = (|| -> std::io::Result<()> {
-        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-        serde_json::to_writer(&mut file, entry)?;
-        file.write_all(b"\n")
-    })();
-    if let Err(err) = append_result {
-        eprintln!(
-            "[soac module-load log] failed to append {}: {err}",
-            path.display()
-        );
-    }
+fn trace_module_load_phase(module_name: &str, path: &str, prefix: &str, phase: &TimedPhase) {
+    info!(
+        target: "soac_module_load",
+        event = "soac.module_load.phase",
+        module_name,
+        path,
+        phase = format_args!("{prefix}.{}", phase.name),
+        elapsed_us = elapsed_us(phase.elapsed),
+        "module_load_phase",
+    );
 }
 
 fn append_completed_module_load_log(
@@ -256,78 +195,49 @@ fn append_completed_module_load_log(
     exec_timings: Vec<TimedPhase>,
     result: &PyResult<()>,
 ) {
-    if module_load_log_path().is_none() {
-        return;
-    }
     let pending = take_pending_module_load_timing(module);
-    let mut timings = serde_json::Map::new();
-    let mut metadata = serde_json::Map::new();
     if let Some(pending) = &pending {
-        push_timing_ms(
-            &mut timings,
-            "module_load_total",
-            pending.create_started_at.elapsed(),
-        );
-        push_timing_ms(
-            &mut timings,
-            "create_module_total",
-            pending.create_module_total,
-        );
-        push_timing_ms(&mut timings, "blockpy_total", pending.lowering_total);
         for phase in &pending.create_timings {
-            push_named_timing_ms(&mut timings, "create_module", phase);
+            trace_module_load_phase(&pending.module_name, &pending.path, "create_module", phase);
         }
         for phase in &pending.blockpy_pass_timings {
-            push_named_timing_ms(&mut timings, "blockpy", phase);
+            trace_module_load_phase(&pending.module_name, &pending.path, "blockpy", phase);
         }
-        metadata.insert(
-            "module_name".to_string(),
-            serde_json::json!(pending.module_name),
+        for phase in &exec_timings {
+            trace_module_load_phase(&pending.module_name, &pending.path, "exec_module", phase);
+        }
+        let error = result.as_ref().err().map(ToString::to_string);
+        info!(
+            target: "soac_module_load",
+            event = "soac.module_load",
+            status = if result.is_ok() { "ok" } else { "error" },
+            error = error.as_deref().unwrap_or(""),
+            module_name = pending.module_name,
+            package_name = pending.package_name,
+            path = pending.path,
+            source_hash = source_hash_hex(pending.source_hash),
+            source_bytes = pending.source_bytes,
+            function_count = pending.function_count,
+            counter_count = pending.counter_count,
+            global_name_count = pending.global_name_count,
+            original_code_count = pending.original_code_count,
+            module_load_total_us = elapsed_us(pending.create_started_at.elapsed()),
+            create_module_total_us = elapsed_us(pending.create_module_total),
+            blockpy_total_us = elapsed_us(pending.lowering_total),
+            exec_module_total_us = elapsed_us(exec_module_total),
+            "module_load",
         );
-        metadata.insert(
-            "package_name".to_string(),
-            serde_json::json!(pending.package_name),
-        );
-        metadata.insert("path".to_string(), serde_json::json!(pending.path));
-        metadata.insert(
-            "source_hash".to_string(),
-            serde_json::json!(pending.source_hash),
-        );
-        metadata.insert(
-            "source_bytes".to_string(),
-            serde_json::json!(pending.source_bytes),
-        );
-        metadata.insert(
-            "function_count".to_string(),
-            serde_json::json!(pending.function_count),
-        );
-        metadata.insert(
-            "counter_count".to_string(),
-            serde_json::json!(pending.counter_count),
-        );
-        metadata.insert(
-            "global_name_count".to_string(),
-            serde_json::json!(pending.global_name_count),
-        );
-        metadata.insert(
-            "original_code_count".to_string(),
-            serde_json::json!(pending.original_code_count),
+    } else {
+        let error = result.as_ref().err().map(ToString::to_string);
+        info!(
+            target: "soac_module_load",
+            event = "soac.module_load",
+            status = if result.is_ok() { "ok" } else { "error" },
+            error = error.as_deref().unwrap_or(""),
+            exec_module_total_us = elapsed_us(exec_module_total),
+            "module_load",
         );
     }
-    push_timing_ms(&mut timings, "exec_module_total", exec_module_total);
-    for phase in &exec_timings {
-        push_named_timing_ms(&mut timings, "exec_module", phase);
-    }
-
-    let error = result.as_ref().err().map(ToString::to_string);
-    let entry = serde_json::json!({
-        "event": "soac.module_load",
-        "status": if result.is_ok() { "ok" } else { "error" },
-        "module": metadata,
-        "timings_ms": timings,
-        "error": error,
-    });
-    append_module_load_json(&entry);
 }
 
 fn module_spec_string_attr(spec: &Bound<'_, PyAny>, attr: &str) -> PyResult<String> {

@@ -16,11 +16,12 @@ use std::ffi::{c_char, c_int, c_void};
 use std::fs::{OpenOptions, create_dir_all};
 use std::io::Write;
 use std::mem::MaybeUninit;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::ptr;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
+use tracing::info;
 
 unsafe extern "C" {
     fn _PyDict_WatchSplitKeysForType(type_obj: *mut ffi::PyObject) -> c_int;
@@ -689,63 +690,6 @@ fn env_flag_enabled(name: &str) -> bool {
     }
 }
 
-fn trimmed_env_path(name: &str) -> Option<PathBuf> {
-    let raw = env::var_os(name)?;
-    let trimmed = raw.to_string_lossy().trim().to_string();
-    (!trimmed.is_empty()).then(|| trimmed.into())
-}
-
-fn module_load_log_dir() -> Option<PathBuf> {
-    if let Some(dir) = trimmed_env_path("DIET_PYTHON_COUNTERS_DIR") {
-        return Some(dir);
-    }
-    if let Some(file) = trimmed_env_path("DIET_PYTHON_COUNTERS_OUTPUT_FILE") {
-        return Some(
-            file.parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf(),
-        );
-    }
-    let file = trimmed_env_path("DIET_PYTHON_COUNTERS_FILE")?;
-    Some(
-        file.parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf(),
-    )
-}
-
-fn module_load_log_path() -> Option<PathBuf> {
-    Some(module_load_log_dir()?.join("module_loads.jsonl"))
-}
-
-fn append_module_load_json(entry: &serde_json::Value) {
-    let Some(path) = module_load_log_path() else {
-        return;
-    };
-    if let Some(parent) = path.parent() {
-        if let Err(err) = create_dir_all(parent) {
-            eprintln!(
-                "[soac module-load log] failed to create {}: {err}",
-                parent.display()
-            );
-            return;
-        }
-    }
-    let append_result = (|| -> std::io::Result<()> {
-        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-        serde_json::to_writer(&mut file, entry)?;
-        file.write_all(b"\n")
-    })();
-    if let Err(err) = append_result {
-        eprintln!(
-            "[soac module-load log] failed to append {}: {err}",
-            path.display()
-        );
-    }
-}
-
 fn append_jit_codegen_log(
     module_state: &SharedModuleState,
     function: &BlockPyFunction<CodegenModuleShape>,
@@ -754,28 +698,20 @@ fn append_jit_codegen_log(
     status: &str,
     error: Option<&str>,
 ) {
-    if module_load_log_path().is_none() {
-        return;
-    }
-    let entry = serde_json::json!({
-        "event": "soac.jit_codegen",
-        "status": status,
-        "module": {
-            "module_name": module_state.module_name,
-            "package_name": module_state.package_name,
-        },
-        "function": {
-            "function_id": function.function_id.to_string(),
-            "qualname": function.names.qualname,
-            "block_count": function.blocks.len(),
-            "entry_kind": entry_kind,
-        },
-        "timings_ms": {
-            "jit_codegen_total": elapsed.as_secs_f64() * 1000.0,
-        },
-        "error": error,
-    });
-    append_module_load_json(&entry);
+    info!(
+        target: "soac_jit_codegen",
+        event = "soac.jit_codegen",
+        status,
+        error = error.unwrap_or(""),
+        module_name = module_state.module_name,
+        package_name = module_state.package_name,
+        function_id = function.function_id.to_string(),
+        function_qualname = function.names.qualname,
+        function_block_count = function.blocks.len(),
+        function_entry_kind = entry_kind,
+        jit_codegen_total_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+        "jit_codegen",
+    );
 }
 
 pub unsafe fn watch_split_keys_for_type(type_obj: *mut ffi::PyObject) -> Result<(), ()> {
