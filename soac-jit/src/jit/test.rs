@@ -1279,7 +1279,7 @@ def f(x):
             constants.module_constants,
         );
         assert!(
-            rendered.contains("; block jit_entry(func_ctx: i64, tstate: i64)"),
+            rendered.contains("; block jit_entry(fn_env: i64, tstate: i64)"),
             "rendered CLIF should include named typed params on surviving post-opt block headers:\n{rendered}"
         );
         assert!(
