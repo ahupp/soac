@@ -87,11 +87,12 @@ exports are intentionally omitted here.
   install the transformed import hook automatically at interpreter
   startup.
 
-- `DIET_PYTHON_INTEGRATION_ONLY=1`
-  In `def _integration_only_enabled`, at
-  [soac_py/src/soac/import_hook.py:18](/home/adam/project/soac-profile/soac_py/src/soac/import_hook.py#L18),
-  restrict transformed imports to integration-test modules instead of
-  transforming arbitrary imports.
+- `SOAC_MODULE_ENABLED=path:/absolute/or/relative/root[,path:/another/root]`
+  In `def _module_is_enabled`, at
+  [soac_py/src/soac/import_hook.py:39](/home/adam/project/soac-profile/soac_py/src/soac/import_hook.py#L39),
+  restrict the import hook to resolved source paths under the listed
+  file-tree roots. When unset, an installed import hook attempts to
+  transform every transformable Python source import.
 
 - `DIET_PYTHON_JIT_COMPILE_MODE=eager`
   In `fn eager_clif_compile_requested`, at

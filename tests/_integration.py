@@ -137,6 +137,23 @@ def _disable_import_hook() -> Iterator[None]:
 
 
 @contextmanager
+def _enable_transform_paths(*paths: Path) -> Iterator[None]:
+    prior_enabled_modules = os.environ.get("SOAC_MODULE_ENABLED")
+    entries = [f"path:{path.resolve()}" for path in paths]
+    if prior_enabled_modules:
+        os.environ["SOAC_MODULE_ENABLED"] = ",".join([prior_enabled_modules, *entries])
+    else:
+        os.environ["SOAC_MODULE_ENABLED"] = ",".join(entries)
+    try:
+        yield
+    finally:
+        if prior_enabled_modules is None:
+            os.environ.pop("SOAC_MODULE_ENABLED", None)
+        else:
+            os.environ["SOAC_MODULE_ENABLED"] = prior_enabled_modules
+
+
+@contextmanager
 def _load_module(
     tmp_path: Path, module_name: str, source: str, *, mode: str
 ) -> Iterator[ModuleType]:
@@ -152,28 +169,27 @@ def _load_module(
     package_root = str(tmp_path)
     sys.path.insert(0, package_root)
     prior_mode = os.environ.get("DIET_PYTHON_MODE")
-    prior_integration_only = os.environ.get("DIET_PYTHON_INTEGRATION_ONLY")
 
     full_name = f"{package_name}.{module_name}"
 
     try:
         if mode == "transform":
             os.environ["DIET_PYTHON_MODE"] = "transform"
-            if prior_integration_only is None:
-                os.environ["DIET_PYTHON_INTEGRATION_ONLY"] = "1"
             import_hook.install()
             sys.modules.pop(full_name, None)
             sys.modules.pop(package_name, None)
-            module = importlib.import_module(full_name)
+            with _enable_transform_paths(package_dir):
+                module = importlib.import_module(full_name)
+                yield module
         elif mode == "stock":
             os.environ.pop("DIET_PYTHON_MODE", None)
             with _disable_import_hook():
                 sys.modules.pop(full_name, None)
                 sys.modules.pop(package_name, None)
                 module = importlib.import_module(full_name)
+                yield module
         else:
             raise ValueError(f"unsupported integration mode: {mode!r}")
-        yield module
     except Exception:
         _print_integration_failure_context(module_path, mode=mode)
         raise
@@ -191,10 +207,6 @@ def _load_module(
             os.environ.pop("DIET_PYTHON_MODE", None)
         else:
             os.environ["DIET_PYTHON_MODE"] = prior_mode
-        if prior_integration_only is None:
-            os.environ.pop("DIET_PYTHON_INTEGRATION_ONLY", None)
-        else:
-            os.environ["DIET_PYTHON_INTEGRATION_ONLY"] = prior_integration_only
 
 
 @contextmanager

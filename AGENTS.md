@@ -260,6 +260,13 @@ instance's live working commit.
   observers. Implementation today: raw indexed module-global stores, raw
   indexed split-field stores, and rewriting undeclared known-builtin
   global loads to `RuntimeName` module constants in name binding.
+- `SOAC_MODULE_ENABLED`
+  Optional comma-separated import-hook allow-list. Entries currently
+  use `path:<file-or-directory>` and are resolved before matching. When
+  set, `SoacLoader` only wraps source imports whose resolved source
+  path is inside one of the listed roots. The `test-fast` recipe sets
+  this to the repo `tests/` tree and installs the import hook so pytest
+  test modules are transformed while stdlib/pytest stay untransformed.
 
 ### CPython-specific notes
 

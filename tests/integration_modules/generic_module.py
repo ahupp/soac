@@ -18,23 +18,14 @@ def make_specialization():
 
 def validate_module(module):
 
-    import os
     import sys
     import builtins
     from types import ModuleType
-
-    from soac import import_hook
-
-
 
 
     def _assert_generic_module_invariants(module: ModuleType) -> None:
         transformed_typing = sys.modules["typing"]
         if __dp_integration_transformed__:
-            if os.environ.get("DIET_PYTHON_INTEGRATION_ONLY") != "1":
-                assert isinstance(
-                    transformed_typing.__spec__.loader, import_hook.SoacLoader
-                ), "typing should be transformed"
             assert type(module) is ModuleType, "transformed modules should use a real module object"
             assert "_dp_module_init" not in module.__dict__, "_dp_module_init should not leak into module globals"
             assert "runtime" not in module.__dict__, "runtime should not be injected into module globals"

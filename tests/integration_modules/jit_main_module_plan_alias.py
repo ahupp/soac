@@ -23,7 +23,11 @@ def validate_module(module):
         encoding="utf-8",
     )
 
-    prev_integration_only = os.environ.pop("DIET_PYTHON_INTEGRATION_ONLY", None)
+    prev_enabled_modules = os.environ.get("SOAC_MODULE_ENABLED")
+    entry = f"path:{tmp.resolve()}"
+    os.environ["SOAC_MODULE_ENABLED"] = (
+        f"{prev_enabled_modules},{entry}" if prev_enabled_modules else entry
+    )
     sys.path.insert(0, str(tmp))
     sys.modules.pop("__main__", None)
     try:
@@ -38,7 +42,7 @@ def validate_module(module):
                 sys.path.remove(str(tmp))
             except ValueError:
                 pass
-        if prev_integration_only is None:
-            os.environ.pop("DIET_PYTHON_INTEGRATION_ONLY", None)
+        if prev_enabled_modules is None:
+            os.environ.pop("SOAC_MODULE_ENABLED", None)
         else:
-            os.environ["DIET_PYTHON_INTEGRATION_ONLY"] = prev_integration_only
+            os.environ["SOAC_MODULE_ENABLED"] = prev_enabled_modules

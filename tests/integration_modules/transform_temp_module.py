@@ -1,4 +1,5 @@
 import importlib
+import os
 import sys
 import textwrap
 from pathlib import Path
@@ -34,4 +35,15 @@ def validate_module(module):
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_path = Path(tmp_dir)
-        assert module.import_temp_module(tmp_path) is True
+        prior_enabled_modules = os.environ.get("SOAC_MODULE_ENABLED")
+        entry = f"path:{tmp_path.resolve()}"
+        os.environ["SOAC_MODULE_ENABLED"] = (
+            f"{prior_enabled_modules},{entry}" if prior_enabled_modules else entry
+        )
+        try:
+            assert module.import_temp_module(tmp_path) is True
+        finally:
+            if prior_enabled_modules is None:
+                os.environ.pop("SOAC_MODULE_ENABLED", None)
+            else:
+                os.environ["SOAC_MODULE_ENABLED"] = prior_enabled_modules

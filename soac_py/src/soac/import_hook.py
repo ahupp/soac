@@ -13,9 +13,23 @@ from . import _soac_ext
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
-def _integration_only_enabled() -> bool:
-    # Read dynamically so tests can toggle this per import context.
-    return os.environ.get("DIET_PYTHON_INTEGRATION_ONLY") == "1"
+def _enabled_module_roots() -> list[Path] | None:
+    raw_spec = os.environ.get("SOAC_MODULE_ENABLED")
+    if raw_spec is None:
+        return None
+
+    roots: list[Path] = []
+    for raw_entry in raw_spec.split(","):
+        entry = raw_entry.strip()
+        if not entry:
+            continue
+        kind, separator, value = entry.partition(":")
+        if kind != "path" or separator != ":" or not value:
+            raise ValueError(
+                "SOAC_MODULE_ENABLED entries must be path:<file-or-directory>"
+            )
+        roots.append(Path(value).expanduser().resolve())
+    return roots
 
 
 def _runtime_bootstrap_in_progress() -> bool:
@@ -35,16 +49,11 @@ def _create_module_from_path(path: str, spec):
         raise ImportError(f"diet-python failed for {absolute_path}: {err}") from err
 
 
-def _is_integration_module(resolved: Path) -> bool:
-    try:
-        resolved.relative_to(REPO_ROOT / "tests" / "integration_modules")
+def _module_is_enabled(resolved: Path) -> bool:
+    roots = _enabled_module_roots()
+    if roots is None:
         return True
-    except (OSError, ValueError):
-        pass
-    for parent in resolved.parents:
-        if parent.name.startswith("_dp_integration_"):
-            return True
-    return False
+    return any(resolved.is_relative_to(root) for root in roots)
 
 
 def _should_transform(path: str) -> bool:
@@ -55,7 +64,7 @@ def _should_transform(path: str) -> bool:
         resolved = Path(path).resolve()
     except OSError:
         return False
-    if _integration_only_enabled() and not _is_integration_module(resolved):
+    if not _module_is_enabled(resolved):
         return False
     return True
 

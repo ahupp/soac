@@ -557,10 +557,6 @@ _pytest-run *args='': ensure-venv
 
   export RUST_LOG="${RUST_LOG:-soac_jit=info}"
   export SOAC_OPT_UNSOUND="${SOAC_OPT_UNSOUND:-1}"
-  # Repo tests are written around transforming integration modules and the
-  # modules they explicitly opt into. Rewriting pytest/stdlib imports here
-  # adds noise and teardown-only failures without improving coverage.
-  export DIET_PYTHON_INTEGRATION_ONLY="${DIET_PYTHON_INTEGRATION_ONLY:-1}"
   PYTEST_TB=native
 
   TMP_PYTEST_OUTPUT="$(mktemp -t diet-python-pytest.XXXXXX.log)"
@@ -581,6 +577,13 @@ _pytest-run *args='': ensure-venv
 
 pytest *args='': build-all
   #!/usr/bin/env bash
+  just _pytest-run "$@"
+
+test-fast *args='tests/': ensure-venv
+  #!/usr/bin/env bash
+  set -euo pipefail
+  export DIET_PYTHON_INSTALL_HOOK=1
+  export SOAC_MODULE_ENABLED="${SOAC_MODULE_ENABLED:-path:$REPO_ROOT/tests}"
   just _pytest-run "$@"
 
 py *args='': build-all
