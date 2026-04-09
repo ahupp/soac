@@ -1,10 +1,7 @@
-use std::cell::RefCell;
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 thread_local! {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
-    static CLASS_NS_GLOBAL: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
 }
 
 pub(crate) fn fresh_name(prefix: &str) -> String {
