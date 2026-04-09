@@ -8,7 +8,6 @@ from pathlib import Path
 from types import ModuleType
 
 os.environ.setdefault("DIET_PYTHON_VALIDATE_MIN_AST", "1")
-os.environ.setdefault("SOAC_OPT_UNSOUND", "1")
 
 ROOT = Path(__file__).resolve().parent.parent
 PYTHON_SRC = ROOT / "soac_py" / "src"

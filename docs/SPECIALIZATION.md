@@ -157,9 +157,10 @@ apply/verify mode:
 - On guard miss, tombstone, absent value, or store failure, codegen
   increments the fallback counter when enabled and executes the existing
   global load/store slow path.
-- Store fast paths are emitted only when
-  `SOAC_OPT_UNSOUND=1`; the helper then performs a raw
-  overwrite of an existing indexed-values slot.
+- In `apply` mode, store fast paths can be emitted for non-module-scope
+  code. The helper then performs a raw store into the expected
+  indexed-values slot, including null first-insert slots or tombstone
+  slots that CPython would normally treat as deleted/absent.
 
 ### Limitations / Soundness / Extensions
 
@@ -195,20 +196,20 @@ apply/verify mode:
   dicts, key-index mismatch, type guard miss, or type-version miss
   increment the fallback counter when enabled and execute normal CPython
   attribute lookup.
-- `SetAttr` sites use generic attribute set by default.
-- When `SOAC_OPT_UNSOUND=1`, constant-string `SetAttr`
-  sites with a recorded key index get the same exact-owner/version guard
-  and then perform a raw overwrite of an existing split-dict or
-  inline-values slot.
+- `SetAttr` sites use generic attribute set in profile/verify mode.
+- In `apply` mode, constant-string `SetAttr` sites with a recorded key
+  index get the same exact-owner/version guard and then perform a raw
+  store into the expected split-dict or inline-values slot, including
+  null first-insert slots.
 
 ### Limitations / Soundness / Extensions
 
 - The owner guard is exact-type today; it is sound but does not yet keep
   base-class field fast paths active on subclasses.
-- Direct field stores are opt-in/unsound. First insert, missing value,
-  invalid inline values, promoted dict, and key-index mismatch still
-  fall back; an existing value slot may be overwritten without CPython
-  bookkeeping only when `SOAC_OPT_UNSOUND=1`.
+- Direct field stores are an apply-mode behavior change. Invalid inline values,
+  promoted dicts, unavailable split/inline value storage, and key-index
+  mismatch still fall back; a guarded value slot may be written without CPython
+  insertion-order, `ma_used`, watcher, or version bookkeeping.
 - Class attributes and descriptors are excluded by compile-time owner
   inspection. Runtime type-version guards are the fallback if a later
   class mutation invalidates that inspection.

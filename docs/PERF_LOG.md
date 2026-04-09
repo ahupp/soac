@@ -109,50 +109,53 @@ changes:
 
   Specialized baseline is ~32.5% of stock.
 
-# Unsound
+# Behavior Changes
 
-`SOAC_OPT_UNSOUND=1` enables broad compatibility-skipping performance
-experiments. It is enabled by default in benchmark and pytest
-correctness recipes so ordinary transformed test runs still detect
-unexpected fallout from these experiments.
+`BEHAVIOR_CHANGE` source comments mark compatibility-skipping
+performance experiments. These are intentional behavior changes, not
+CPython compatibility claims.
 
 User-visible summary: Python code may stop seeing module-global
 mutations that should shadow builtin names, and external observers of a
 module or object dictionary may stop seeing updates from optimized
-stores. Treat results from this mode as a cost-model experiment, not a
+stores. Treat results from these paths as a cost-model experiment, not a
 CPython compatibility claim.
 
 Current behavior:
 
-- guarded existing module-global store may replace
+- guarded module-global store may replace
   `PyDictIndexedValues.values[index]` directly
-- guarded existing split instance-field store may replace
+- guarded split instance-field store may replace
   `PyDictValues.values[index]` directly
 - undeclared known-builtin global loads are rewritten during name
   binding into `RuntimeName` loads; module-constant extraction then
   snapshots the runtime/builtin object in a constant slot
 
-When enabled, specialized JIT code may call `soac-runtime` helpers that
-overwrite an existing guarded storage slot directly:
+In `apply` mode, specialized JIT code may call `soac-runtime` helpers
+that overwrite an existing guarded storage slot directly:
 
-- indexed module-global store: replace `PyDictIndexedValues.values[index]`
-- split instance-field store: replace `PyDictValues.values[index]`
+- indexed module-global store: replace `PyDictIndexedValues.values[index]`,
+  including a null first-insert slot or a tombstone slot
+- split instance-field store: replace `PyDictValues.values[index]`,
+  including a null first-insert slot
 
-The helper still returns null and uses the ordinary slow path for
-first-insert stores, missing value slots, global tombstones,
-promoted/combined instance dictionaries, guard misses, type-version
-misses, and split-key index mismatches.
+The helper still returns null and uses the ordinary slow path when the
+indexed/split values array itself is unavailable, for promoted/combined
+instance dictionaries, guard misses, type-version misses, and split-key
+index mismatches.
 
 This is not CPython-compatible. The raw store skips dict/object/type
 watchers, dict version updates, insertion-order maintenance,
 `ma_used`/first-insert bookkeeping, and any future CPython bookkeeping
-that lives in the normal store path. Use it only in perf runs that
-explicitly want to estimate the upper bound for guarded indexed stores;
-do not enable it for correctness tests or compatibility claims.
+that lives in the normal store path. A raw first insert writes the
+profiled value slot but deliberately does not update CPython's dict or
+split-values insertion-order arrays. The multi-pass pipeline leaves this
+off in the profiling pass because normal dict/object/type side effects
+are profiling inputs.
 
 This is not CPython-compatible. A module can install or mutate a global
 named `len`, `range`, `print`, etc. through `globals()`, `exec`, custom
 module initialization, or ordinary code that this static declaration
 check does not see. That mutation should shadow builtins for normal
-Python global lookup, but the unsound runtime-name path does not check
+Python global lookup, but the runtime-name path does not check
 module globals.

@@ -17,27 +17,9 @@ use crate::passes::{CoreModuleShape, ResolvedStorageModuleShape};
 use ruff_python_ast::{self as ast};
 use soac_macros::match_default;
 use std::collections::{HashMap, HashSet};
-use std::env;
 
 fn is_internal_symbol(name: &str) -> bool {
     name.starts_with("_dp_") || name == "__soac__"
-}
-
-fn env_flag_enabled(name: &str) -> bool {
-    env::var(name)
-        .map(|value| {
-            let trimmed = value.trim();
-            !trimmed.is_empty()
-                && trimmed != "0"
-                && !trimmed.eq_ignore_ascii_case("false")
-                && !trimmed.eq_ignore_ascii_case("no")
-                && !trimmed.eq_ignore_ascii_case("off")
-        })
-        .unwrap_or(false)
-}
-
-fn unsound_runtime_builtin_names_enabled() -> bool {
-    env_flag_enabled("SOAC_OPT_UNSOUND")
 }
 
 fn is_unsound_runtime_builtin_candidate(name: &str) -> bool {
@@ -2891,6 +2873,8 @@ impl UnsoundBuiltinRuntimeNameRewriter<'_> {
         {
             return;
         }
+        // BEHAVIOR_CHANGE: runtime builtins are loaded from SOAC runtime constants,
+        // not by re-checking module globals for a later shadowing store.
         name.location = NameLocation::RuntimeName;
     }
 }
@@ -3005,7 +2989,7 @@ pub(crate) fn lower_name_binding_in_core_blockpy_module_with_options(
 ) -> BlockPyModule<ResolvedStorageModuleShape> {
     lower_name_binding_in_core_blockpy_module_with_unsound_runtime_builtins(
         module,
-        unsound_runtime_builtin_names_enabled(),
+        true,
         runtime_names_as_globals,
     )
 }

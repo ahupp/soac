@@ -546,7 +546,7 @@ fn emit_specialized_setattr<'fb>(
     op: &blockpy_intrinsics::SetAttr<InstrCodegen>,
     state: &mut impl OperationEmitState<'fb, InstrCodegen>,
 ) -> Option<ir::Value> {
-    if !state.ctx().unsound_indexed_stores {
+    if !state.ctx().behavior_change_indexed_stores {
         return None;
     }
 
@@ -1348,26 +1348,25 @@ fn emit_store<'fb>(
             .iconst(ir::types::I64, i64::from(slot.slot())),
         _ => unreachable!("emit_store only applies to global names"),
     };
-    let result = if let Some(instr_id) = op.meta().instr_id
-        && state
-            .ctx()
-            .global_indexed_hit_counter_ids
-            .contains_key(&instr_id)
-        && state.ctx().unsound_indexed_stores
-    {
+    let result = if state.ctx().behavior_change_indexed_stores {
+        let instr_id = op.meta().instr_id;
         let ptr_ty = state.ctx().consts.ptr_ty;
         let null_ptr = state.fb().ins().iconst(ptr_ty, 0);
         let store_global_indexed_ref = state.ctx().store_global_indexed_ref;
-        let hit_counter_ptr = state
-            .ctx()
-            .global_indexed_hit_counter_ids
-            .get(&instr_id)
-            .map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
-        let fallback_counter_ptr = state
-            .ctx()
-            .global_indexed_fallback_counter_ids
-            .get(&instr_id)
-            .map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
+        let hit_counter_ptr = instr_id.and_then(|instr_id| {
+            state
+                .ctx()
+                .global_indexed_hit_counter_ids
+                .get(&instr_id)
+                .map(|counter_id| state.ctx().counter_ptrs[counter_id.0])
+        });
+        let fallback_counter_ptr = instr_id.and_then(|instr_id| {
+            state
+                .ctx()
+                .global_indexed_fallback_counter_ids
+                .get(&instr_id)
+                .map(|counter_id| state.ctx().counter_ptrs[counter_id.0])
+        });
         let result_block = state.fb().create_block();
         state.fb().append_block_param(result_block, ptr_ty);
         let fallback_block = state.fb().create_block();

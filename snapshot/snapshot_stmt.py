@@ -37,11 +37,9 @@ from pkg.mod import name as alias
 
 # decorator_function
 
-
 @dec
 def f():
     pass
-
 
 # ==
 
@@ -420,11 +418,9 @@ with cm as x:
 
 # function_local_ann_assign
 
-
 def inner():
     value: int = 1
     return value
-
 
 # ==
 
@@ -539,10 +535,8 @@ zs = {k: v for k, v in items}
 
 # comprehension_in_function
 
-
 def f():
     return [x for x in it if x > 0]
-
 
 # ==
 
@@ -589,10 +583,8 @@ def f():
 
 # comprehension_in_class_body
 
-
 class C:
     xs = [x for x in it]
-
 
 # ==
 
@@ -639,7 +631,7 @@ class C:
 #     function_id: 0:3
 #     block bb1:
 #         StoreName("_dp_class_ns", _dp_class_ns_outer)
-#         return create_class("C", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 3, tuple_values())
+#         return create_class("C", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 2, tuple_values())
 
 # function _dp_module_init():
 #     function_id: 0:4
@@ -761,11 +753,9 @@ with a as x, b as y:
 
 # async_for
 
-
 async def run():
     async for x in ait:
         body()
-
 
 # ==
 
@@ -798,11 +788,9 @@ async def run():
 
 # async_with
 
-
 async def run():
     async with cm as x:
         body()
-
 
 # ==
 
@@ -911,10 +899,8 @@ match value:
 
 # generator_yield
 
-
 def gen():
     yield 1
-
 
 # ==
 
@@ -932,10 +918,8 @@ def gen():
 
 # yield_from
 
-
 def gen():
     yield from it
-
 
 # ==
 
@@ -1018,7 +1002,6 @@ with Suppress():
 
 # closure_cell_simple
 
-
 def outer():
     x = 5
 
@@ -1026,7 +1009,6 @@ def outer():
         return x
 
     return inner()
-
 
 # ==
 
@@ -1050,14 +1032,12 @@ def outer():
 
 # bb_if_else_function
 
-
 def choose(a, b):
     total = a + b
     if total > 5:
         return a
     else:
         return b
-
 
 # ==
 
@@ -1083,7 +1063,6 @@ def choose(a, b):
 
 # closure_cell_nonlocal
 
-
 def outer():
     x = 5
 
@@ -1093,7 +1072,6 @@ def outer():
         return x
 
     return inner()
-
 
 # ==
 
@@ -1149,7 +1127,6 @@ except Exception:
 
 # complicated generator
 
-
 def complicated(a):
     for i in a:
         try:
@@ -1159,7 +1136,6 @@ def complicated(a):
             print("oops")
     else:
         print("finsihed")
-
 
 # ==
 

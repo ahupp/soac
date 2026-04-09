@@ -160,3 +160,17 @@ benchmarked throughput delta, and the headline pre/post numbers.
 - runtime-helper Fast benchmark:
   - specialized pass, 1M loops x3: `316166`, `312062`, `309037 loops/s`
   - stock CPython: `550054 loops/s`
+
+## 2026-04-09 - Apply-mode raw indexed stores
+
+- jj change id: `qrutwqnr`
+- summary: Apply mode now emits raw indexed stores for specialized
+  module-global and split instance-field writes, bypassing CPython
+  dict/object/type observer and insertion-order maintenance on guarded hits.
+- throughput: `+10.29%` specialized pystone median
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `250439`, `249170`, `247683 loops/s`
+  - perf-context run: `247131 loops/s`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `274809`, `279150`, `253522 loops/s`
+  - perf-context run: `255713 loops/s`

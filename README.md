@@ -137,26 +137,13 @@ exports are intentionally omitted here.
   Set `SOAC_WORK_DIR` for any mode that reads or writes counters. Leave
   `SOAC_OPT_MODE` unset for the ordinary unspecialized/no-counter path.
 
-- `SOAC_OPT_UNSOUND=1`
-  Enables compiler/runtime shortcuts that intentionally skip observable
-  CPython behavior. A Python program may stop seeing later mutations
-  that shadow builtin names in module globals, and external observers
-  may stop seeing dict/object/type updates for optimized stores. The
-  benchmark and pytest correctness recipes default to
-  `SOAC_OPT_UNSOUND=1`; set `SOAC_OPT_UNSOUND=0` to run the
-  compatibility path.
-
-  Details: in `fn unsound_indexed_stores_enabled`, at
-  [soac-jit/src/jit/mod.rs](/home/adam/project/soac-profile/soac-jit/src/jit/mod.rs),
-  enable raw indexed store fast paths for existing indexed module-global
-  and split instance-field slots; these skip CPython dict/object/type
-  watchers, dict version updates, insertion-order maintenance, and
-  first-insert bookkeeping. In `fn
-  unsound_runtime_builtin_names_enabled`, known-builtin global loads
-  that are not statically assigned module globals are lowered to
-  `RuntimeName`, lifted into module constant slots, and loaded without
-  checking module globals.
-
+Notes:
+- In normal workflows set one `SOAC_WORK_DIR` for the whole multi-pass
+  run and change only `SOAC_OPT_MODE`.
+- The `apply` phase may emit explicitly marked `BEHAVIOR_CHANGE`
+  fast paths. Today that includes raw indexed module-global / instance
+  field stores outside module-init code, and undeclared known-builtin
+  loads lowered to `RuntimeName` constants.
 ## Perf And Benchmarking
 
 - `SOAC_JIT_PERF_HELPER_FRAMES=1`

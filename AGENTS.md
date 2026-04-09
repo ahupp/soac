@@ -217,11 +217,12 @@ instance's live working commit.
 - `just regen-snapshots`
   Regenerates fixture snapshots.
 - `just benchmark`
-  Default benchmark for performance requests. This is the two-pass run:
-  a profiling pass followed by a specialized transformed pass, compared
-  against stock CPython. Report the specialized second-pass throughput
-  as the transformed result unless I explicitly ask for the warm
-  unspecialized baseline.
+  Default benchmark for performance requests. This is the artifact-producing
+  pystone workflow: profile, verify, specialized apply benchmark, textual
+  counter/specialization dumps, and perf for the specialized apply run. It
+  prints `benchmark result: bench/{change_id}_{commit_id}`; report the
+  specialized apply-pass median from that directory's `benchmark.txt` unless I
+  explicitly ask for the warm unspecialized baseline.
 - `SOAC_WORK_DIR` / `SOAC_OPT_MODE`
   Normal specialization runs use one work directory with conventional
   files: `profile.bin` for specialization input, `verify.bin` for the
@@ -253,15 +254,12 @@ instance's live working commit.
   `soac_module_load` target; JIT-codegen timing is emitted by
   `soac_jit_codegen`. When `SOAC_LOG` is unset and `SOAC_WORK_DIR` is
   set, the default event log is `$SOAC_WORK_DIR/events.jsonl`.
-- `SOAC_OPT_UNSOUND`
-  Enables intentionally unsound performance experiments. The benchmark
-  and pytest correctness recipes default this to `1`; xfail tests that
-  specifically assert the skipped semantics under this mode. User-visible
-  risks: later module-global shadowing of a builtin name may be ignored,
-  and optimized stores may not notify CPython-level dict/object/type
-  observers. Implementation today: raw indexed module-global stores, raw
-  indexed split-field stores, and rewriting undeclared known-builtin
-  global loads to `RuntimeName` module constants in name binding.
+- `BEHAVIOR_CHANGE`
+  Source comments with this exact tag mark intentional CPython-visible
+  compatibility changes. Current examples: apply-mode raw indexed
+  stores may skip dict/object/type observers, and undeclared
+  known-builtin loads are lowered to `RuntimeName` constants rather than
+  re-checking later module-global shadowing.
 - `SOAC_MODULE_ENABLED`
   Optional comma-separated import-hook allow-list. Entries currently
   use `path:<file-or-directory>` and are resolved before matching. When

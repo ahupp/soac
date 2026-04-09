@@ -226,7 +226,10 @@ const MANAGED_DICT_OFFSET: isize = -3 * (core::mem::size_of::<*mut c_void>() as 
 
 #[inline(always)]
 unsafe fn dict_unicode_entries(keys: *mut RawPyDictKeysObject) -> *mut RawPyDictUnicodeEntry {
-    let indices = unsafe { keys.cast::<u8>().add(core::mem::size_of::<RawPyDictKeysObject>()) };
+    let indices = unsafe {
+        keys.cast::<u8>()
+            .add(core::mem::size_of::<RawPyDictKeysObject>())
+    };
     let entries = unsafe { indices.add(1usize << (*keys).dk_log2_index_bytes) };
     entries.cast::<RawPyDictUnicodeEntry>()
 }
@@ -337,10 +340,7 @@ pub unsafe extern "C" fn soac_runtime_guard_type_version(
 }
 
 #[inline(always)]
-unsafe fn dict_guarded_index(
-    dict: *mut RawPyDictObject,
-    index: isize,
-) -> i64 {
+unsafe fn dict_guarded_index(dict: *mut RawPyDictObject, index: isize) -> i64 {
     const DICT_KEYS_INDEXED_UNICODE: u8 = 3;
 
     let keys = unsafe { (*dict).ma_keys };
@@ -396,8 +396,7 @@ macro_rules! load_indexed_dict_value_owned {
         } else {
             let values = unsafe { (*$dict).ma_values.cast::<RawPyDictIndexedValues>() };
             let value = unsafe { indexed_value(values, $index) };
-            if value.is_null()
-                || value.cast::<c_void>() == (&raw mut _PyDict_IndexedValueTombstone)
+            if value.is_null() || value.cast::<c_void>() == (&raw mut _PyDict_IndexedValueTombstone)
             {
                 core::ptr::null_mut()
             } else {
@@ -501,18 +500,17 @@ pub unsafe extern "C" fn soac_runtime_store_global_indexed(
     }
     let values = unsafe { (*dict_obj).ma_values.cast::<RawPyDictIndexedValues>() };
     let old_value = unsafe { indexed_value(values, index) };
-    if old_value.is_null()
-        || old_value.cast::<c_void>() == (&raw mut _PyDict_IndexedValueTombstone)
-    {
-        return core::ptr::null_mut();
-    }
 
-    // Unsound fast store: only valid for overwrite of an existing profiled slot.
-    // This intentionally skips dict watchers, insertion order, and version updates.
+    // BEHAVIOR_CHANGE: this is a raw slot store for apply-mode JIT code.
+    // First insert, insertion order, ma_used, watchers, and versions are skipped.
     let value = value.cast::<RawPyObject>();
     unsafe { incref_impl(value) };
     unsafe { set_indexed_value(values, index, value) };
-    unsafe { decref_impl(old_value) };
+    if !old_value.is_null()
+        && old_value.cast::<c_void>() != (&raw mut _PyDict_IndexedValueTombstone)
+    {
+        unsafe { decref_impl(old_value) };
+    }
     unsafe { incref_impl(value) };
     value.cast::<c_void>()
 }
@@ -587,9 +585,7 @@ macro_rules! inline_values {
 }
 
 macro_rules! cached_keys {
-    ($obj_type:expr) => {{
-        unsafe { (*$obj_type.cast::<RawPyHeapTypeObject>()).ht_cached_keys }
-    }};
+    ($obj_type:expr) => {{ unsafe { (*$obj_type.cast::<RawPyHeapTypeObject>()).ht_cached_keys } }};
 }
 
 macro_rules! load_field_value_owned {
@@ -660,10 +656,9 @@ pub unsafe extern "C" fn soac_runtime_store_field_indexed(
         }
         (cached_keys!(obj_type), values)
     } else {
-        (
-            unsafe { (*dict).ma_keys },
-            unsafe { (*dict).ma_values.cast::<RawPyDictSplitValues>() },
-        )
+        (unsafe { (*dict).ma_keys }, unsafe {
+            (*dict).ma_values.cast::<RawPyDictSplitValues>()
+        })
     };
     if keys.is_null()
         || values.is_null()
@@ -675,16 +670,15 @@ pub unsafe extern "C" fn soac_runtime_store_field_indexed(
         return 0;
     }
     let old_value = unsafe { split_value(values, index) };
-    if old_value.is_null() {
-        return 0;
-    }
 
-    // Unsound fast store: the guard above proves this is an existing split-dict
-    // value slot. New-key stores, missing values, and promoted dicts use fallback.
+    // BEHAVIOR_CHANGE: this is a raw slot store for apply-mode JIT code.
+    // First insert, insertion order, ma_used, watchers, and versions are skipped.
     let value = value.cast::<RawPyObject>();
     unsafe { incref_impl(value) };
     unsafe { set_split_value(values, index, value) };
-    unsafe { decref_impl(old_value) };
+    if !old_value.is_null() {
+        unsafe { decref_impl(old_value) };
+    }
     1
 }
 

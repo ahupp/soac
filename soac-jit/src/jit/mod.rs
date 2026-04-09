@@ -20,9 +20,9 @@ use cranelift_reader::parse_functions;
 use pyo3::ffi;
 use soac_blockpy::block_py::{
     AbruptKind, BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword,
-    CallArgPositional, CellLocation, ChildVisitable, CodegenBlock, CounterDef, CounterId,
-    CounterScope, CounterSite, FunctionId, HasMeta, InstrCodegen, InstrId, Literal, LocalLocation,
-    NameLocation, ParamDefaultSource, ResolvedName, StorageLayout, Visit, WithMeta,
+    CallArgPositional, CallableScopeKind, CellLocation, ChildVisitable, CodegenBlock, CounterDef,
+    CounterId, CounterScope, CounterSite, FunctionId, HasMeta, InstrCodegen, InstrId, Literal,
+    LocalLocation, NameLocation, ParamDefaultSource, ResolvedName, StorageLayout, Visit, WithMeta,
     operation as blockpy_intrinsics,
 };
 use soac_blockpy::passes::{CodegenModuleShape, InstrResolved};
@@ -1137,7 +1137,7 @@ struct JitEmitCtx<'mc> {
     field_indexed_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
     field_indexed_fallback_counter_ids: &'mc HashMap<InstrId, CounterId>,
     field_index_specializations: &'mc HashMap<String, Vec<FieldIndexSpecialization>>,
-    unsound_indexed_stores: bool,
+    behavior_change_indexed_stores: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -2412,21 +2412,8 @@ fn specialization_mode_is_profile() -> bool {
     specialization_mode_from_env().as_deref() == Some("profile")
 }
 
-fn env_flag_enabled(name: &str) -> bool {
-    env::var(name)
-        .map(|raw| {
-            let trimmed = raw.trim();
-            !(trimmed.is_empty()
-                || trimmed == "0"
-                || trimmed.eq_ignore_ascii_case("false")
-                || trimmed.eq_ignore_ascii_case("no")
-                || trimmed.eq_ignore_ascii_case("off"))
-        })
-        .unwrap_or(false)
-}
-
-fn unsound_indexed_stores_enabled() -> bool {
-    env_flag_enabled("SOAC_OPT_UNSOUND")
+fn behavior_change_indexed_stores_enabled() -> bool {
+    specialization_mode_from_env().as_deref() == Some("apply")
 }
 
 fn counter_dump_input_path_from_env() -> Option<std::path::PathBuf> {
@@ -6097,7 +6084,8 @@ fn build_cranelift_run_bb_specialized_function(
         }
         None => HashMap::new(),
     };
-    let unsound_indexed_stores = unsound_indexed_stores_enabled();
+    let behavior_change_indexed_stores = behavior_change_indexed_stores_enabled()
+        && function.scope.scope_kind != CallableScopeKind::Module;
     let function_runtime_data_layout = FunctionRuntimeDataLayout::from_function(function);
     let true_constant_id = module_constants.require_runtime_name_constant_id("TRUE");
     let false_constant_id = module_constants.require_runtime_name_constant_id("FALSE");
@@ -6678,7 +6666,7 @@ fn build_cranelift_run_bb_specialized_function(
                 branch_outcome_counter_ids: &branch_outcome_counter_ids,
                 branch_prefer_true: &branch_prefer_true,
                 field_index_specializations: &field_index_specializations,
-                unsound_indexed_stores,
+                behavior_change_indexed_stores,
             };
             let block = &function.blocks[index];
             let mut local_names = Vec::new();

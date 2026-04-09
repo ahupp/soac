@@ -53,30 +53,35 @@ The recipe does not run the stock CPython benchmark.
 
 ## Find An Existing Result
 
-When asked to compare jj revs / change ids, first resolve each requested rev to
-its short change id and reuse any existing result with that change-id prefix:
+When asked to compare jj revs, first resolve each requested rev to its short
+change id and short commit id. Reuse only an exact
+`bench/{change_id}_{commit_id}` directory for that resolved revision:
 
 ```bash
 change_id="$(jj --ignore-working-copy log -r "<jj-rev>" --no-graph -T 'change_id.short()')"
-find bench -maxdepth 1 -type d -name "${change_id}_*" | sort
+commit_id="$(jj --ignore-working-copy log -r "<jj-rev>" --no-graph -T 'commit_id.short()')"
+result_dir="bench/${change_id}_${commit_id}"
+test -d "$result_dir" && printf '%s\n' "$result_dir"
 ```
 
-If one or more directories match, use the newest complete result by default.
+Do not reuse a directory that only matches the change id. Rebased jj changes can
+keep the same change id while changing code, dependencies, or benchmark recipe
+behavior, so prefix reuse can silently compare against stale artifacts. If the
+exact `{change_id}_{commit_id}` directory is absent, re-run `just benchmark` for
+that revision and create the exact directory for the current commit id.
+
 A result is complete enough for comparison when it has `benchmark.txt`,
 `counters/profile.bin`, `counters/verify.bin`, `verify_counters.txt`,
 `profile_specializations.txt`, `verify_specializations.txt`, `perf.log`, and
 `perf_callgraph.txt`. Prefer results that also have `clif/functions.tsv` and
-`clif/*.clif`; if an older result is otherwise useful but lacks CLIF, say so and
-re-run `just benchmark` for that side only if the CLIF difference is needed.
-
-Reusing by change id is intentional: it lets benchmark artifacts survive rebases
-that change commit ids but keep the jj change id.
+`clif/*.clif`; if the exact result exists but lacks CLIF, say so and re-run
+`just benchmark` for that side only if the CLIF difference is needed.
 
 ## Create A Missing Result For Another Rev
 
-If no complete `bench/{change_id}_*` result exists for a requested jj rev, create
-a temporary side workspace and run the result producer there. Always write
-results back into the original repo's `bench/` directory:
+If no complete exact `bench/{change_id}_{commit_id}` result exists for a
+requested jj rev, create a temporary side workspace and run the result producer
+there. Always write results back into the original repo's `bench/` directory:
 
 ```bash
 original_repo="$PWD"
