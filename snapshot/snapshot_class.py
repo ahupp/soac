@@ -1,10 +1,12 @@
 # class_with_method
 
+
 class C:
     x: int = 1
 
     def m(self):
         return self.x
+
 
 # ==
 
@@ -79,9 +81,11 @@ class C:
 
 # class_method_named_open_calls_builtin
 
+
 class Wrapper:
     def open(self, mode: str = "r", *, encoding: str = "utf8"):
         return open(mode, encoding=encoding)
+
 
 # ==
 
@@ -160,8 +164,10 @@ class Wrapper:
 
 # class_with_base
 
+
 class D(Base):
     pass
+
 
 # ==
 
@@ -195,6 +201,7 @@ class D(Base):
 
 # class_scope_inner_capture
 
+
 def outer():
     x = "outer"
 
@@ -202,6 +209,7 @@ def outer():
         y = x
 
     return Inner.y
+
 
 # ==
 
@@ -243,11 +251,13 @@ def outer():
 
 # class_super_empty_classcell
 
+
 class X:
     def f(x):
         nonlocal __class__
         del __class__
         super()
+
 
 # ==
 
@@ -289,9 +299,11 @@ class X:
 
 # nested classes
 
+
 class A:
     class B:
         pass
+
 
 # ==
 
@@ -348,12 +360,14 @@ class A:
 
 # nested classes with weird scoping
 
+
 def foo():
     class A:
         global B
 
         class B:
             pass
+
 
 # ==
 

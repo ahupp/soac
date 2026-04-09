@@ -298,7 +298,7 @@ view-speedscope profile="": build-web-inspector
 
   "$REPO_ROOT/scripts/open_web_url.sh" "$OPEN_URL"
 
-run-and-view-speedscope loops="500000" counters_dir="" output_prefix="logs/pystone_jit_perf_warm_specialized_from_benchmark": ensure-cpython
+run-and-view-speedscope loops="10000000" counters_dir="" output_prefix="logs/pystone_jit_perf_warm_specialized_from_benchmark": ensure-cpython
   #!/usr/bin/env bash
   set -euo pipefail
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -321,7 +321,7 @@ run-and-view-speedscope loops="500000" counters_dir="" output_prefix="logs/pysto
 
   just view-speedscope "{{output_prefix}}_speedscope.json"
 
-perf-pystone-jit-warm loops="500000" output_prefix="logs/pystone_jit_perf_warm": ensure-cpython
+perf-pystone-jit-warm loops="10000000" output_prefix="logs/pystone_jit_perf_warm": ensure-cpython
   #!/usr/bin/env bash
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
   mkdir -p logs
@@ -530,7 +530,7 @@ perf-pystone-jit-warm loops="500000" output_prefix="logs/pystone_jit_perf_warm":
   echo "finished"
   echo "view speedscope: just view-speedscope ${VIEW_SPEEDSCOPE_PROFILE@Q}"
 
-perf-pystone-jit-specialized loops="500000" output_prefix="logs/pystone_jit_perf_warm_specialized": ensure-cpython (update-venv) (build-extension "release")
+perf-pystone-jit-specialized loops="10000000" output_prefix="logs/pystone_jit_perf_warm_specialized": ensure-cpython (update-venv) (build-extension "release")
   #!/usr/bin/env bash
   set -euo pipefail
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -824,7 +824,7 @@ benchmark-warm loops="8000000": (update-venv) (build-extension "release")
   BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
     "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
 
-benchmark benchmark_loops="1000000" verify_loops="100000" perf_loops="500000" results_root="bench" result_rev="@": (update-venv) (build-extension "release")
+benchmark benchmark_loops="1000000" verify_loops="100000" perf_loops="10000000" results_root="bench" result_rev="@": (update-venv) (build-extension "release")
   #!/usr/bin/env bash
   set -euo pipefail
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"

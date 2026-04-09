@@ -20,6 +20,9 @@ The first positional argument is the specialized apply-pass loop count:
 just benchmark 1000000
 ```
 
+The benchmark recipe uses 10M loops for the perf-recorded specialized apply
+run by default, so perf reports have enough samples for hotspot attribution.
+
 `just benchmark` runs:
 
 - transformed profile pass

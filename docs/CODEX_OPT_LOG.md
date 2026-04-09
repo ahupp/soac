@@ -174,3 +174,15 @@ benchmarked throughput delta, and the headline pre/post numbers.
 - post-change benchmark:
   - specialized pass, 1M loops x3: `274809`, `279150`, `253522 loops/s`
   - perf-context run: `255713 loops/s`
+
+## 2026-04-10 - Upgrade Cranelift to 0.130.1
+
+- jj change id: `vyqwvlks`
+- summary: Upgraded the Cranelift dependency family from `0.125` to
+  `0.130.1`, aligned the direct `gimli` dependency with Cranelift's
+  unwind types, and kept the regenerated snapshot formatting changes.
+- throughput: `+1.94%` specialized pystone median
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `273439`, `267436`, `275214 loops/s`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `278749`, `281497`, `276426 loops/s`

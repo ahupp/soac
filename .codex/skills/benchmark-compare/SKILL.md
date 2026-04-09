@@ -46,7 +46,7 @@ Useful shorter run while iterating:
 
 ```bash
 BENCHMARK_SPECIALIZED_RUNS=3 \
-just benchmark 1000000 100000 500000
+just benchmark 1000000 100000 10000000
 ```
 
 The recipe does not run the stock CPython benchmark.
@@ -98,7 +98,7 @@ fi
 
 (
   cd "$ws"
-  just benchmark 1000000 100000 500000 "$original_repo/bench" @-
+  just benchmark 1000000 100000 10000000 "$original_repo/bench" @-
 )
 
 jj workspace forget "$workspace_name"

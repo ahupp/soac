@@ -12,14 +12,14 @@ soac-blockpy = { path = "../soac-blockpy" }
 ruff_python_ast = { workspace = true }
 pyo3 = { workspace = true, features = ["extension-module"] }
 tracing = "0.1"
-cranelift-codegen = { version = "0.125", features = ["incremental-cache"] }
-cranelift-control = "0.125"
-cranelift-frontend = "0.125"
-cranelift-jit = "0.125"
-cranelift-module = "0.125"
-cranelift-native = "0.125"
-cranelift-reader = "0.125"
-gimli = "0.32"
+cranelift-codegen = { version = "0.130.1", features = ["incremental-cache"] }
+cranelift-control = "0.130.1"
+cranelift-frontend = "0.130.1"
+cranelift-jit = "0.130.1"
+cranelift-module = "0.130.1"
+cranelift-native = "0.130.1"
+cranelift-reader = "0.130.1"
+gimli = "0.33.1"
 libc = "0.2"
 memmap2 = "0.9"
 rkyv = { version = "0.8", features = ["alloc"] }

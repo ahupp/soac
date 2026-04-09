@@ -12,7 +12,7 @@ Use `scripts/perf_pystone_jit_warm.sh` from the repo root. The script builds the
 Use the warmed default unless the user requests something else:
 
 ```bash
-./scripts/perf_pystone_jit_warm.sh 500000 logs/pystone_jit_perf_warm_run
+just perf-pystone-jit-warm 10000000 logs/pystone_jit_perf_warm_run
 ```
 
 For a quick smoke test after changing the profiler script:
