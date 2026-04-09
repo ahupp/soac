@@ -579,12 +579,6 @@ pytest *args='': build-all
   #!/usr/bin/env bash
   just _pytest-run "$@"
 
-test-fast *args='tests/': ensure-venv
-  #!/usr/bin/env bash
-  set -euo pipefail
-  export DIET_PYTHON_INSTALL_HOOK=1
-  just _pytest-run "$@"
-
 py *args='': build-all
   #!/usr/bin/env bash
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
