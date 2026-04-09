@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import statistics  # noqa: F401 - preload before transform import hooks installed by other tests
 import sys
 from pathlib import Path
 
@@ -36,50 +37,74 @@ def test_summarize_log_reports_load_phase_and_jit_codegen_max(tmp_path, capsys):
             {
                 "event": "soac.module_load",
                 "status": "ok",
-                "module": {"module_name": "fast"},
-                "timings_ms": {
-                    "module_load_total": 10.0,
-                    "blockpy.parse": 1.0,
-                    "blockpy.name_binding": 4.0,
-                },
+                "module_name": "fast",
+                "module_load_total_us": 10_000,
+                "create_module_total_us": 9_000,
+                "blockpy_total_us": 8_000,
             },
             {
                 "event": "soac.module_load",
                 "status": "ok",
-                "module": {"module_name": "slow"},
-                "timings_ms": {
-                    "module_load_total": 30.0,
-                    "blockpy.parse": 3.0,
-                    "blockpy.name_binding": 8.0,
-                },
+                "module_name": "slow",
+                "module_load_total_us": 30_000,
+                "create_module_total_us": 25_000,
+                "blockpy_total_us": 20_000,
+            },
+            {
+                "event": "soac.module_load.phase",
+                "status": "ok",
+                "module_name": "fast",
+                "phase": "blockpy.parse",
+                "elapsed_us": 1_000,
+            },
+            {
+                "event": "soac.module_load.phase",
+                "status": "ok",
+                "module_name": "slow",
+                "phase": "blockpy.parse",
+                "elapsed_us": 3_000,
+            },
+            {
+                "event": "soac.module_load.phase",
+                "status": "ok",
+                "module_name": "fast",
+                "phase": "blockpy.name_binding",
+                "elapsed_us": 4_000,
+            },
+            {
+                "event": "soac.module_load.phase",
+                "status": "ok",
+                "module_name": "slow",
+                "phase": "blockpy.name_binding",
+                "elapsed_us": 8_000,
             },
             {
                 "event": "soac.jit_codegen",
                 "status": "ok",
-                "module": {"module_name": "fast"},
-                "function": {
-                    "qualname": "small",
-                    "entry_kind": "vectorcall_function_body",
-                },
-                "timings_ms": {"jit_codegen_total": 2.0},
+                "module_name": "fast",
+                "function_qualname": "small",
+                "function_entry_kind": "vectorcall_function_body",
+                "jit_codegen_total_us": 2_000,
             },
             {
                 "event": "soac.jit_codegen",
                 "status": "ok",
-                "module": {"module_name": "slow"},
-                "function": {
-                    "qualname": "expensive",
-                    "entry_kind": "direct_function_body",
-                },
-                "timings_ms": {"jit_codegen_total": 7.0},
+                "module_name": "slow",
+                "function_qualname": "expensive",
+                "function_entry_kind": "direct_function_body",
+                "jit_codegen_total_us": 7_000,
             },
         ],
     )
 
     summary = summary_script.summarize_log(log_path)
     assert summary.cumulative_module_load_ms == 40.0
+    assert summary.module_timing_stats["module_load_total"].cumulative_ms == 40.0
+    assert summary.module_timing_stats["create_module_total"].cumulative_ms == 34.0
+    assert summary.module_timing_stats["blockpy_total"].cumulative_ms == 28.0
     assert summary.module_timing_stats["blockpy.parse"].median_ms == 2.0
     assert summary.module_timing_stats["blockpy.name_binding"].max_ms == 8.0
+    assert summary.module_timing_stats["blockpy.name_binding"].cumulative_ms == 12.0
     assert summary.module_timing_stats["blockpy.name_binding"].max_owner == "slow"
     assert summary.cumulative_jit_codegen_ms == 9.0
     assert summary.max_jit_codegen.qualname == "expensive"

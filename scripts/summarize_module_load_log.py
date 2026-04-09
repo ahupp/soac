@@ -12,6 +12,7 @@ from typing import Any
 
 DEFAULT_LOG = Path("logs/last_benchmark_counters/module_loads.jsonl")
 MODULE_LOAD_EVENT = "soac.module_load"
+MODULE_LOAD_PHASE_EVENT = "soac.module_load.phase"
 JIT_CODEGEN_EVENT = "soac.jit_codegen"
 JIT_CODEGEN_TIMING = "jit_codegen_total"
 MODULE_LOAD_TIMING = "module_load_total"
@@ -20,6 +21,7 @@ MODULE_LOAD_TIMING = "module_load_total"
 @dataclass(frozen=True)
 class TimingStats:
     count: int
+    cumulative_ms: float
     median_ms: float
     max_ms: float
     max_owner: str
@@ -77,10 +79,14 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def numeric_timings(entry: dict[str, Any]) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for name, value in entry.items():
+        if isinstance(name, str) and name.endswith("_us") and isinstance(value, int | float):
+            out[name.removesuffix("_us")] = float(value) / 1000.0
+
     raw_timings = entry.get("timings_ms", {})
     if not isinstance(raw_timings, dict):
-        return {}
-    out: dict[str, float] = {}
+        return out
     for name, value in raw_timings.items():
         if isinstance(name, str) and isinstance(value, int | float):
             out[name] = float(value)
@@ -88,6 +94,13 @@ def numeric_timings(entry: dict[str, Any]) -> dict[str, float]:
 
 
 def module_name(entry: dict[str, Any]) -> str:
+    raw_flat_name = entry.get("module_name")
+    if isinstance(raw_flat_name, str) and raw_flat_name:
+        return raw_flat_name
+    raw_flat_path = entry.get("path")
+    if isinstance(raw_flat_path, str) and raw_flat_path:
+        return raw_flat_path
+
     raw_module = entry.get("module", {})
     if not isinstance(raw_module, dict):
         return "<unknown>"
@@ -101,6 +114,14 @@ def module_name(entry: dict[str, Any]) -> str:
 
 
 def function_name(entry: dict[str, Any]) -> tuple[str, str, str]:
+    raw_flat_qualname = entry.get("function_qualname")
+    if isinstance(raw_flat_qualname, str) and raw_flat_qualname:
+        return (
+            module_name(entry),
+            raw_flat_qualname,
+            str(entry.get("function_entry_kind", "<unknown>")),
+        )
+
     raw_module = entry.get("module", {})
     module = raw_module.get("module_name", "<unknown>") if isinstance(raw_module, dict) else "<unknown>"
     raw_function = entry.get("function", {})
@@ -125,6 +146,7 @@ def timing_stats(
         max_value, max_owner = max(samples, key=lambda sample: sample[0])
         stats[timing_name] = TimingStats(
             count=len(values),
+            cumulative_ms=sum(values),
             median_ms=statistics.median(values),
             max_ms=max_value,
             max_owner=max_owner,
@@ -134,6 +156,7 @@ def timing_stats(
 
 def summarize_entries(path: Path, entries: list[dict[str, Any]]) -> LogSummary:
     module_events = [entry for entry in entries if entry.get("event") == MODULE_LOAD_EVENT]
+    module_phase_events = [entry for entry in entries if entry.get("event") == MODULE_LOAD_PHASE_EVENT]
     jit_events = [entry for entry in entries if entry.get("event") == JIT_CODEGEN_EVENT]
 
     module_timing_values: dict[str, list[tuple[float, str]]] = defaultdict(list)
@@ -144,6 +167,12 @@ def summarize_entries(path: Path, entries: list[dict[str, Any]]) -> LogSummary:
         cumulative_module_load_ms += timings.get(MODULE_LOAD_TIMING, 0.0)
         for timing_name, value in timings.items():
             module_timing_values[timing_name].append((value, owner))
+
+    for entry in module_phase_events:
+        phase = entry.get("phase")
+        elapsed = entry.get("elapsed_us")
+        if isinstance(phase, str) and isinstance(elapsed, int | float):
+            module_timing_values[phase].append((float(elapsed) / 1000.0, module_name(entry)))
 
     cumulative_jit_codegen_ms = 0.0
     max_jit_codegen: JitMax | None = None
@@ -191,12 +220,13 @@ def print_summary(summary: LogSummary) -> None:
     print(f"cumulative {MODULE_LOAD_TIMING}: {fmt_ms(summary.cumulative_module_load_ms)} ms")
     print()
     print("module timing medians/maxima:")
-    print(f"{'timing':56} {'n':>5} {'median_ms':>10} {'max_ms':>10} max_module")
+    print(f"{'timing':56} {'n':>5} {'total_ms':>10} {'median_ms':>10} {'max_ms':>10} max_module")
     for timing_name in sorted(summary.module_timing_stats):
         stats = summary.module_timing_stats[timing_name]
         print(
             f"{timing_name:56} {stats.count:5d} "
-            f"{fmt_ms(stats.median_ms)} {fmt_ms(stats.max_ms)} {stats.max_owner}"
+            f"{fmt_ms(stats.cumulative_ms)} {fmt_ms(stats.median_ms)} "
+            f"{fmt_ms(stats.max_ms)} {stats.max_owner}"
         )
 
     print()
