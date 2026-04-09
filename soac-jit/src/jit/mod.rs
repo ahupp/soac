@@ -27,10 +27,12 @@ use soac_blockpy::block_py::{
 };
 use soac_blockpy::passes::{CodegenModuleShape, InstrResolved};
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::cell::Cell;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::mem::offset_of;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 unsafe extern "C" {
@@ -60,6 +62,10 @@ use specialized_helpers::register_specialized_jit_symbols;
 static INCREMENTAL_CLIF_CACHE: OnceLock<Mutex<HashMap<Vec<u8>, Vec<u8>>>> = OnceLock::new();
 static RUNTIME_SUPPORT_LIBRARY: OnceLock<Result<RuntimeSupportLibrary, String>> = OnceLock::new();
 static NEXT_IMPORT_SPEC_ID: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    static PROCESS_JIT_COMPILE_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
 
 unsafe extern "C" {
     fn _Py_Dealloc(obj: *mut ffi::PyObject);
@@ -466,13 +472,75 @@ type ClifBlockDisplayAnnotations = HashMap<String, ClifBlockDisplayAnnotation>;
 struct BuiltSpecializedFunction {
     ctx: cranelift_codegen::Context,
     main_id: cranelift_module::FuncId,
+    main_symbol: String,
     import_id_to_symbol: HashMap<u32, &'static str>,
     block_annotations: ClifBlockDisplayAnnotations,
 }
 
+#[derive(Clone)]
+struct DeclaredJitFunction {
+    func_id: FuncId,
+    symbol: String,
+}
+
+struct DefinedJitFunction {
+    function_id: FunctionId,
+    param_count: usize,
+    main_id: FuncId,
+    main_symbol: String,
+    artifact: DefinedFunctionArtifact,
+}
+
+pub(crate) struct ProcessJitEngine {
+    jit_module: Mutex<JITModule>,
+    next_compile_id: AtomicU64,
+}
+
+struct ProcessJitCompileGuard;
+
 struct CompiledSpecializedRunner {
-    _jit_module: JITModule,
+    _owner: CompiledRunnerOwner,
     entry: Option<CompiledRunnerEntry>,
+}
+
+pub(crate) struct CompiledFunctionHandle {
+    handle: ObjPtr,
+}
+
+// The handle points to an immutable compiled runner after construction. The code memory is kept
+// alive by the runner owner, and the raw handle is freed only when the final Arc drops this wrapper.
+unsafe impl Send for CompiledFunctionHandle {}
+unsafe impl Sync for CompiledFunctionHandle {}
+
+impl CompiledFunctionHandle {
+    pub(crate) fn from_raw(handle: ObjPtr) -> Result<Self, String> {
+        if handle.is_null() {
+            return Err("invalid null compiled function handle".to_string());
+        }
+        Ok(Self { handle })
+    }
+
+    pub(crate) fn raw(&self) -> ObjPtr {
+        self.handle
+    }
+
+    pub(crate) fn direct_code_ptr(&self) -> Result<ObjPtr, String> {
+        compiled_direct_code_ptr(self.handle)
+    }
+}
+
+impl Drop for CompiledFunctionHandle {
+    fn drop(&mut self) {
+        unsafe { free_cranelift_run_bb_specialized_cached(self.handle) };
+        self.handle = std::ptr::null_mut();
+    }
+}
+
+enum CompiledRunnerOwner {
+    LegacyJitModule(JITModule),
+    CompileSession {
+        _session: Arc<crate::session::CompileSession>,
+    },
 }
 
 pub type VectorcallEntryFn = unsafe extern "C" fn(ObjPtr, *const ObjPtr, usize, ObjPtr) -> ObjPtr;
@@ -839,6 +907,7 @@ fn emit_direct_function_env_load_or_slow_path(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
     ctx: &JitEmitCtx<'_>,
+    require_code_ptr: bool,
 ) -> DirectFunctionEnvLoad {
     let ptr_ty = ctx.consts.ptr_ty;
     let null_ptr = fb.ins().iconst(ptr_ty, 0);
@@ -869,17 +938,24 @@ fn emit_direct_function_env_load_or_slow_path(
         .brif(env_is_null, slow_block, &[], env_ok_block, &[]);
 
     fb.switch_to_block(env_ok_block);
-    let code_ptr = load_function_env_obj(fb, ptr_ty, env, FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET);
-    let code_ptr_is_null = fb
-        .ins()
-        .icmp(ir::condcodes::IntCC::Equal, code_ptr, null_ptr);
-    fb.ins().brif(
-        code_ptr_is_null,
-        slow_block,
-        &[],
-        done_block,
-        &[ir::BlockArg::Value(env), ir::BlockArg::Value(code_ptr)],
-    );
+    if require_code_ptr {
+        let code_ptr = load_function_env_obj(fb, ptr_ty, env, FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET);
+        let code_ptr_is_null = fb
+            .ins()
+            .icmp(ir::condcodes::IntCC::Equal, code_ptr, null_ptr);
+        fb.ins().brif(
+            code_ptr_is_null,
+            slow_block,
+            &[],
+            done_block,
+            &[ir::BlockArg::Value(env), ir::BlockArg::Value(code_ptr)],
+        );
+    } else {
+        fb.ins().jump(
+            done_block,
+            &[ir::BlockArg::Value(env), ir::BlockArg::Value(null_ptr)],
+        );
+    }
 
     fb.switch_to_block(slow_block);
     let slow_inst = fb.ins().call(ctx.direct_function_context_ref, &[callable]);
@@ -897,21 +973,28 @@ fn emit_direct_function_env_load_or_slow_path(
     );
 
     fb.switch_to_block(slow_env_ok_block);
-    let slow_code_ptr =
-        load_function_env_obj(fb, ptr_ty, slow_env, FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET);
-    let slow_code_ptr_is_null = fb
-        .ins()
-        .icmp(ir::condcodes::IntCC::Equal, slow_code_ptr, null_ptr);
-    fb.ins().brif(
-        slow_code_ptr_is_null,
-        done_block,
-        &[ir::BlockArg::Value(null_ptr), ir::BlockArg::Value(null_ptr)],
-        done_block,
-        &[
-            ir::BlockArg::Value(slow_env),
-            ir::BlockArg::Value(slow_code_ptr),
-        ],
-    );
+    if require_code_ptr {
+        let slow_code_ptr =
+            load_function_env_obj(fb, ptr_ty, slow_env, FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET);
+        let slow_code_ptr_is_null =
+            fb.ins()
+                .icmp(ir::condcodes::IntCC::Equal, slow_code_ptr, null_ptr);
+        fb.ins().brif(
+            slow_code_ptr_is_null,
+            done_block,
+            &[ir::BlockArg::Value(null_ptr), ir::BlockArg::Value(null_ptr)],
+            done_block,
+            &[
+                ir::BlockArg::Value(slow_env),
+                ir::BlockArg::Value(slow_code_ptr),
+            ],
+        );
+    } else {
+        fb.ins().jump(
+            done_block,
+            &[ir::BlockArg::Value(slow_env), ir::BlockArg::Value(null_ptr)],
+        );
+    }
 
     fb.switch_to_block(done_block);
     DirectFunctionEnvLoad {
@@ -1122,6 +1205,7 @@ struct JitEmitCtx<'mc> {
     tuple_set_item_ref: ir::FuncRef,
     stack_slots: StackSlots,
     direct_call_code_ptrs: &'mc HashMap<FunctionId, ObjPtr>,
+    direct_call_functions: &'mc HashMap<FunctionId, DeclaredJitFunction>,
     call_target_counter_ids: &'mc HashMap<InstrId, CounterId>,
     call_target_specializations: &'mc HashMap<InstrId, Vec<FunctionId>>,
     call_direct_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
@@ -1633,14 +1717,19 @@ fn build_counted_runtime_refcount_helpers(
     function: &BlockPyFunction<CodegenModuleShape>,
     counter_defs: &[CounterDef],
     counter_ptrs: &[*mut u64],
+    symbol_scope: Option<&str>,
 ) -> Result<CountedRefcountHelpers, String> {
     let incref_func_id =
         lookup_runtime_counter_id(counter_defs, function.function_id, "runtime_incref")
             .map(|counter_id| {
                 let counter_ptr = counter_ptr_for_id(counter_ptrs, counter_id)?;
+                let symbol = scoped_jit_symbol(
+                    &format!("py:rc:incref:{}", function.names.qualname),
+                    symbol_scope,
+                );
                 build_counted_runtime_refcount_helper(
                     jit_module,
-                    &format!("py:rc:incref:{}", function.names.qualname),
+                    &symbol,
                     &DP_JIT_INCREF_IMPORT,
                     counter_ptr,
                 )
@@ -1651,9 +1740,13 @@ fn build_counted_runtime_refcount_helpers(
         lookup_runtime_counter_id(counter_defs, function.function_id, "runtime_decref")
             .map(|counter_id| {
                 let counter_ptr = counter_ptr_for_id(counter_ptrs, counter_id)?;
+                let symbol = scoped_jit_symbol(
+                    &format!("py:rc:decref:{}", function.names.qualname),
+                    symbol_scope,
+                );
                 build_counted_runtime_refcount_helper(
                     jit_module,
-                    &format!("py:rc:decref:{}", function.names.qualname),
+                    &symbol,
                     &DP_JIT_DECREF_IMPORT,
                     counter_ptr,
                 )
@@ -2697,8 +2790,13 @@ fn emit_direct_call_resolved_raw_with_arg_values(
     debug_assert_eq!(arg_values.len(), target_function.params.len());
     let ptr_ty = ctx.consts.ptr_ty;
     let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let direct_func_id = ctx
+        .direct_call_functions
+        .get(&target_function.function_id)
+        .map(|function| function.func_id);
 
-    let direct_load = emit_direct_function_env_load_or_slow_path(fb, callable, ctx);
+    let direct_load =
+        emit_direct_function_env_load_or_slow_path(fb, callable, ctx, direct_func_id.is_none());
     let function_env_is_null =
         fb.ins()
             .icmp(ir::condcodes::IntCC::Equal, direct_load.env, null_ptr);
@@ -2740,9 +2838,13 @@ fn emit_direct_call_resolved_raw_with_arg_values(
     call_args.push(direct_load.env);
     call_args.push(ctx.consts.thread_state_value);
     call_args.extend(arg_values.iter().copied());
-    let call_inst = fb
-        .ins()
-        .call_indirect(direct_sig_ref, direct_load.code_ptr, &call_args);
+    let call_inst = if let Some(func_id) = direct_func_id {
+        let func_ref = jit_module.declare_func_in_func(func_id, &mut fb.func);
+        fb.ins().call(func_ref, &call_args)
+    } else {
+        fb.ins()
+            .call_indirect(direct_sig_ref, direct_load.code_ptr, &call_args)
+    };
     let call_value = fb.inst_results(call_inst)[0];
     fb.ins().call(ctx.leave_recursive_ref, &[]);
 
@@ -5317,6 +5419,191 @@ fn new_jit_module() -> Result<JITModule, String> {
     Ok(jit_module)
 }
 
+fn process_jit_is_currently_compiling() -> bool {
+    PROCESS_JIT_COMPILE_DEPTH.with(|depth| depth.get() > 0)
+}
+
+impl ProcessJitCompileGuard {
+    fn enter() -> Self {
+        PROCESS_JIT_COMPILE_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        Self
+    }
+}
+
+impl Drop for ProcessJitCompileGuard {
+    fn drop(&mut self) {
+        PROCESS_JIT_COMPILE_DEPTH.with(|depth| {
+            let current = depth.get();
+            debug_assert!(current > 0);
+            depth.set(current.saturating_sub(1));
+        });
+    }
+}
+
+fn collect_process_jit_batch_functions(
+    root: &BlockPyFunction<CodegenModuleShape>,
+    direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
+) -> Result<Vec<BlockPyFunction<CodegenModuleShape>>, String> {
+    let Some(shared_state) = direct_call_resolver else {
+        return Ok(vec![root.clone()]);
+    };
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut queue = VecDeque::new();
+    seen.insert(root.function_id);
+    queue.push_back(root.clone());
+    while let Some(function) = queue.pop_front() {
+        let mut direct_targets = collect_call_direct_targets(&function);
+        for targets in load_call_target_specializations(
+            shared_state.module_name.as_str(),
+            function.function_id,
+        )?
+        .values()
+        {
+            direct_targets.extend(targets.iter().copied());
+        }
+        for function_id in direct_targets {
+            if !seen.insert(function_id) {
+                continue;
+            }
+            if let Some(function) = shared_state.lookup_function(function_id) {
+                queue.push_back(function.clone());
+            }
+        }
+        out.push(function);
+    }
+    Ok(out)
+}
+
+impl ProcessJitEngine {
+    pub(crate) fn new() -> Result<Self, String> {
+        Ok(Self {
+            jit_module: Mutex::new(new_jit_module()?),
+            next_compile_id: AtomicU64::new(0),
+        })
+    }
+
+    pub(crate) unsafe fn compile_direct_function(
+        &self,
+        session: &Arc<crate::session::CompileSession>,
+        blocks: &[ObjPtr],
+        module: &BlockPyModule<CodegenModuleShape>,
+        function: &BlockPyFunction<CodegenModuleShape>,
+        module_constants: &ModuleCodegenConstants,
+        counter_defs: &[CounterDef],
+        module_constant_ptrs: &[*mut ffi::PyObject],
+        counter_ptrs: &[*mut u64],
+        direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
+    ) -> Result<ObjPtr, String> {
+        let compile_id = self.next_compile_id.fetch_add(1, Ordering::Relaxed);
+        let symbol_scope = format!("process:{compile_id}");
+        let batch_functions = collect_process_jit_batch_functions(function, direct_call_resolver)?;
+        let mut jit_module = self
+            .jit_module
+            .lock()
+            .map_err(|_| "process JIT module lock poisoned".to_string())?;
+        let _guard = ProcessJitCompileGuard::enter();
+        let mut predeclared = HashMap::new();
+        for function in &batch_functions {
+            let (_sig, declared) =
+                declare_direct_function(&mut jit_module, function, Some(symbol_scope.as_str()))?;
+            predeclared.insert(function.function_id, declared);
+        }
+
+        let mut defined_functions = Vec::with_capacity(batch_functions.len());
+        for function in &batch_functions {
+            let placeholder_blocks;
+            let function_blocks = if function.function_id == batch_functions[0].function_id {
+                blocks
+            } else {
+                placeholder_blocks =
+                    vec![std::ptr::null_mut::<std::ffi::c_void>(); function.blocks.len()];
+                placeholder_blocks.as_slice()
+            };
+            let built = build_cranelift_run_bb_specialized_function(
+                &mut jit_module,
+                function_blocks,
+                module,
+                function,
+                module_constants,
+                counter_defs,
+                module_constant_ptrs,
+                counter_ptrs,
+                direct_call_resolver,
+                Some(symbol_scope.as_str()),
+                Some(&predeclared),
+            )
+            .map_err(|err| {
+                format!(
+                    "{err} [function={} id={}]",
+                    function.names.qualname, function.function_id
+                )
+            })?;
+            let mut ctx = built.ctx;
+            let main_id = built.main_id;
+            let main_symbol = built.main_symbol;
+            let artifact = define_function_with_incremental_cache(
+                &mut jit_module,
+                main_id,
+                &mut ctx,
+                "failed to define specialized jit run_bb function",
+            )
+            .map_err(|err| {
+                format!(
+                    "{err} [function={} id={}]",
+                    function.names.qualname, function.function_id
+                )
+            })?;
+            jit_module.clear_context(&mut ctx);
+            defined_functions.push(DefinedJitFunction {
+                function_id: function.function_id,
+                param_count: function.params.len(),
+                main_id,
+                main_symbol,
+                artifact,
+            });
+        }
+
+        jit_module
+            .finalize_definitions()
+            .map_err(|err| format!("failed to finalize specialized jit run_bb function: {err}"))?;
+        let mut root_handle = None;
+        for defined in defined_functions {
+            let code_ptr = jit_module.get_finalized_function(defined.main_id);
+            jitdump::record_code_load(
+                &defined.main_symbol,
+                code_ptr.cast::<u8>(),
+                defined.artifact.code_size,
+                jit_module.isa(),
+                defined.artifact.systemv_unwind_info.as_ref(),
+            )?;
+            let compiled = Box::new(CompiledSpecializedRunner {
+                _owner: CompiledRunnerOwner::CompileSession {
+                    _session: Arc::clone(session),
+                },
+                entry: Some(CompiledRunnerEntry::Direct {
+                    code_ptr,
+                    param_count: defined.param_count,
+                }),
+            });
+            let handle = Box::into_raw(compiled) as ObjPtr;
+            if defined.function_id == function.function_id {
+                root_handle = Some(handle);
+            } else if let Some(shared_state) = direct_call_resolver {
+                shared_state.store_compiled_direct_runner_handle(defined.function_id, handle)?;
+            } else {
+                free_cranelift_run_bb_specialized_cached(handle);
+            }
+        }
+        root_handle.ok_or_else(|| {
+            format!(
+                "process JIT batch did not define root function {} id={}",
+                function.names.qualname, function.function_id
+            )
+        })
+    }
+}
+
 #[derive(Debug)]
 struct DefinedFunctionArtifact {
     code_size: usize,
@@ -5490,6 +5777,48 @@ fn declare_local_fn(
     jit_module
         .declare_function(symbol, Linkage::Local, sig)
         .map_err(|err| format!("failed to declare local {symbol} function: {err}"))
+}
+
+fn make_direct_function_signature(
+    jit_module: &JITModule,
+    function: &BlockPyFunction<CodegenModuleShape>,
+) -> ir::Signature {
+    let ptr_ty = jit_module.target_config().pointer_type();
+    let mut sig = jit_module.make_signature();
+    sig.params.push(ir::AbiParam::new(ptr_ty));
+    sig.params.push(ir::AbiParam::new(ptr_ty));
+    for _ in function.params.iter() {
+        sig.params.push(ir::AbiParam::new(ptr_ty));
+    }
+    sig.returns.push(ir::AbiParam::new(ptr_ty));
+    sig
+}
+
+fn direct_function_symbol(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    symbol_scope: Option<&str>,
+) -> String {
+    let base =
+        jit_python_perf_symbol_name(JIT_PYTHON_PERF_SYMBOL_KIND_DIRECT, &function.names.qualname);
+    scoped_jit_symbol(&base, symbol_scope)
+}
+
+fn declare_direct_function(
+    jit_module: &mut JITModule,
+    function: &BlockPyFunction<CodegenModuleShape>,
+    symbol_scope: Option<&str>,
+) -> Result<(ir::Signature, DeclaredJitFunction), String> {
+    let sig = make_direct_function_signature(jit_module, function);
+    let symbol = direct_function_symbol(function, symbol_scope);
+    let func_id = declare_local_fn(jit_module, &symbol, &sig)?;
+    Ok((sig, DeclaredJitFunction { func_id, symbol }))
+}
+
+fn scoped_jit_symbol(base: &str, symbol_scope: Option<&str>) -> String {
+    match symbol_scope {
+        Some(scope) => format!("{base}:{scope}"),
+        None => base.to_string(),
+    }
 }
 
 fn is_clif_ident_byte(byte: u8) -> bool {
@@ -5983,6 +6312,8 @@ fn build_cranelift_run_bb_specialized_function(
     module_constant_ptrs: &[*mut ffi::PyObject],
     counter_ptrs: &[*mut u64],
     direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
+    symbol_scope: Option<&str>,
+    predeclared_direct_functions: Option<&HashMap<FunctionId, DeclaredJitFunction>>,
 ) -> Result<BuiltSpecializedFunction, String> {
     let block_count = function.blocks.len();
     if block_count == 0 {
@@ -6098,8 +6429,15 @@ fn build_cranelift_run_bb_specialized_function(
         direct_call_targets.extend(targets.iter().copied());
     }
 
+    let empty_direct_functions = HashMap::new();
+    let direct_call_functions = predeclared_direct_functions.unwrap_or(&empty_direct_functions);
+
     let mut direct_call_code_ptrs = HashMap::new();
     for function_id in direct_call_targets {
+        if direct_call_functions.contains_key(&function_id) {
+            direct_call_code_ptrs.insert(function_id, 1usize as ObjPtr);
+            continue;
+        }
         let maybe_code_ptr = match direct_call_resolver {
             Some(shared_state) => shared_state.lookup_or_compile_direct_code_ptr(function_id)?,
             None => None,
@@ -6116,19 +6454,26 @@ fn build_cranelift_run_bb_specialized_function(
     let i64_ty = ir::types::I64;
     let mut module_imports = ModuleFuncImports::new();
 
-    let mut main_sig = jit_module.make_signature();
-    main_sig.params.push(ir::AbiParam::new(ptr_ty));
-    main_sig.params.push(ir::AbiParam::new(ptr_ty));
-    for _ in function.params.iter() {
-        main_sig.params.push(ir::AbiParam::new(ptr_ty));
-    }
-    main_sig.returns.push(ir::AbiParam::new(ptr_ty));
-
-    let main_symbol =
-        jit_python_perf_symbol_name(JIT_PYTHON_PERF_SYMBOL_KIND_DIRECT, &function.names.qualname);
-    let main_id = declare_local_fn(jit_module, &main_symbol, &main_sig)?;
-    let counted_refcount_helpers =
-        build_counted_runtime_refcount_helpers(jit_module, function, counter_defs, counter_ptrs)?;
+    let (main_sig, main_id, main_symbol) = match predeclared_direct_functions
+        .and_then(|functions| functions.get(&function.function_id))
+    {
+        Some(declared) => (
+            make_direct_function_signature(jit_module, function),
+            declared.func_id,
+            declared.symbol.clone(),
+        ),
+        None => {
+            let (sig, declared) = declare_direct_function(jit_module, function, symbol_scope)?;
+            (sig, declared.func_id, declared.symbol)
+        }
+    };
+    let counted_refcount_helpers = build_counted_runtime_refcount_helpers(
+        jit_module,
+        function,
+        counter_defs,
+        counter_ptrs,
+        symbol_scope,
+    )?;
 
     let mut ctx = jit_module.make_context();
     ctx.func.signature = main_sig;
@@ -6650,6 +6995,7 @@ fn build_cranelift_run_bb_specialized_function(
                 tuple_set_item_ref,
                 stack_slots: stack_slots.clone(),
                 direct_call_code_ptrs: &direct_call_code_ptrs,
+                direct_call_functions,
                 call_target_counter_ids: &call_target_counter_ids,
                 call_target_specializations: &call_target_specializations,
                 call_direct_hit_counter_ids: &call_direct_hit_counter_ids,
@@ -6810,6 +7156,7 @@ fn build_cranelift_run_bb_specialized_function(
     Ok(BuiltSpecializedFunction {
         ctx,
         main_id,
+        main_symbol,
         import_id_to_symbol: module_imports.debug_symbols().clone(),
         block_annotations,
     })
@@ -6877,6 +7224,8 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
         &module_constant_ptrs,
         &counter_ptrs,
         runtime_state,
+        None,
+        None,
     )?;
     let mut out = String::new();
     out.push_str("; import fn aliases (Cranelift display id -> symbol)\n");
@@ -6940,6 +7289,7 @@ fn render_compiled_clif_and_vcode_disasm(
 }
 
 pub unsafe fn compile_cranelift_run_bb_specialized_cached(
+    compile_session: &Arc<crate::session::CompileSession>,
     blocks: &[ObjPtr],
     module: &BlockPyModule<CodegenModuleShape>,
     function: &soac_blockpy::block_py::BlockPyFunction<CodegenModuleShape>,
@@ -6949,12 +7299,31 @@ pub unsafe fn compile_cranelift_run_bb_specialized_cached(
     counter_ptrs: &[*mut u64],
     direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
 ) -> Result<ObjPtr, String> {
+    if !process_jit_is_currently_compiling() {
+        return unsafe {
+            compile_session.process_jit()?.compile_direct_function(
+                compile_session,
+                blocks,
+                module,
+                function,
+                module_constants,
+                counter_defs,
+                module_constant_ptrs,
+                counter_ptrs,
+                direct_call_resolver,
+            )
+        };
+    }
+
     let mut compiled = Box::new(CompiledSpecializedRunner {
-        _jit_module: new_jit_module()?,
+        _owner: CompiledRunnerOwner::LegacyJitModule(new_jit_module()?),
         entry: None,
     });
+    let CompiledRunnerOwner::LegacyJitModule(jit_module) = &mut compiled._owner else {
+        unreachable!("legacy fallback should own a private JITModule")
+    };
     let built = build_cranelift_run_bb_specialized_function(
-        &mut compiled._jit_module,
+        jit_module,
         blocks,
         module,
         function,
@@ -6963,6 +7332,8 @@ pub unsafe fn compile_cranelift_run_bb_specialized_cached(
         module_constant_ptrs,
         counter_ptrs,
         direct_call_resolver,
+        None,
+        None,
     )
     .map_err(|err| {
         format!(
@@ -6972,8 +7343,9 @@ pub unsafe fn compile_cranelift_run_bb_specialized_cached(
     })?;
     let mut ctx = built.ctx;
     let main_id = built.main_id;
+    let main_symbol = built.main_symbol;
     let main_artifact = define_function_with_incremental_cache(
-        &mut compiled._jit_module,
+        jit_module,
         main_id,
         &mut ctx,
         "failed to define specialized jit run_bb function",
@@ -6984,19 +7356,16 @@ pub unsafe fn compile_cranelift_run_bb_specialized_cached(
             function.names.qualname, function.function_id
         )
     })?;
-    compiled._jit_module.clear_context(&mut ctx);
-    compiled
-        ._jit_module
+    jit_module.clear_context(&mut ctx);
+    jit_module
         .finalize_definitions()
         .map_err(|err| format!("failed to finalize specialized jit run_bb function: {err}"))?;
-    let code_ptr = compiled._jit_module.get_finalized_function(main_id);
-    let main_symbol =
-        jit_python_perf_symbol_name(JIT_PYTHON_PERF_SYMBOL_KIND_DIRECT, &function.names.qualname);
+    let code_ptr = jit_module.get_finalized_function(main_id);
     jitdump::record_code_load(
         &main_symbol,
         code_ptr.cast::<u8>(),
         main_artifact.code_size,
-        compiled._jit_module.isa(),
+        jit_module.isa(),
         main_artifact.systemv_unwind_info.as_ref(),
     )?;
     compiled.entry = Some(CompiledRunnerEntry::Direct {

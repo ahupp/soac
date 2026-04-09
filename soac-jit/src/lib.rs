@@ -248,7 +248,7 @@ struct FunctionEnvAbiHeader {
 struct FunctionEnv {
     abi: NonNull<FunctionEnvAbiHeader>,
     runtime_object_len: usize,
-    compiled_function: Option<Arc<CompiledFunctionHandle>>,
+    compiled_function: Option<Arc<jit::CompiledFunctionHandle>>,
 }
 
 #[repr(C)]
@@ -256,20 +256,10 @@ struct PyFunctionJitExtra {
     function_env_ptr: *mut c_void,
     function_id: FunctionId,
     function_env: Box<FunctionEnv>,
+    compile_session: Arc<CompileSession>,
     module_state: Arc<module_type::SharedModuleState>,
     compiled_vectorcall: Option<CompiledVectorcallTrampoline>,
     compiled_vectorcall_entry: Option<jit::VectorcallEntryFn>,
-}
-
-struct CompiledFunctionHandle {
-    handle: *mut c_void,
-}
-
-impl Drop for CompiledFunctionHandle {
-    fn drop(&mut self) {
-        unsafe { jit::free_cranelift_run_bb_specialized_cached(self.handle) };
-        self.handle = ptr::null_mut();
-    }
 }
 
 struct CompiledVectorcallTrampoline {
@@ -636,16 +626,19 @@ pub unsafe fn clone_module_runtime_context(
         ffi::Py_INCREF(runtime.mod_ctx.globals_obj as *mut ffi::PyObject);
     }
     let shared_module_state_owner = runtime.shared_module_state_owner.clone();
+    let compile_session = runtime.compile_session.clone();
     Ok(jit::ModuleRuntimeContext {
         mod_ctx: jit::ModuleJitContext {
             shared_module_state: std::sync::Arc::as_ptr(&shared_module_state_owner),
             globals_obj: runtime.mod_ctx.globals_obj,
         },
+        compile_session,
         shared_module_state_owner,
     })
 }
 
 unsafe fn build_module_runtime_context_from_parts(
+    compile_session: Arc<CompileSession>,
     shared_module_state: Arc<module_type::SharedModuleState>,
     globals_obj: *mut ffi::PyObject,
 ) -> Result<jit::ModuleRuntimeContext, ()> {
@@ -658,6 +651,7 @@ unsafe fn build_module_runtime_context_from_parts(
             shared_module_state: Arc::as_ptr(&shared_module_state),
             globals_obj: globals_obj as *mut c_void,
         },
+        compile_session,
         shared_module_state_owner: shared_module_state,
     })
 }
@@ -674,6 +668,7 @@ pub unsafe fn build_module_runtime_context_for_module(
         crate::module_type::SoacExtModule::clone_shared_state(module.as_any()).map_err(|err| {
             err.restore(py);
         })?;
+    let compile_session = CompileSession::process();
     let globals_obj = unsafe { ffi::PyModule_GetDict(module.as_ptr()) };
     if globals_obj.is_null() {
         if unsafe { ffi::PyErr_Occurred() }.is_null() {
@@ -689,6 +684,7 @@ pub unsafe fn build_module_runtime_context_for_module(
             shared_module_state: std::sync::Arc::as_ptr(&shared_module_state),
             globals_obj: globals_obj as *mut c_void,
         },
+        compile_session,
         shared_module_state_owner: shared_module_state,
     })
 }
@@ -728,6 +724,7 @@ unsafe fn make_clif_function_data(
         function_env_ptr,
         function_id,
         function_env,
+        compile_session: module_runtime.compile_session.clone(),
         module_state,
         compiled_vectorcall: None,
         compiled_vectorcall_entry: None,
@@ -1407,38 +1404,72 @@ unsafe fn ensure_clif_vectorcall_compiled(
         .map(soac_blockpy::block_py::BlockPyFunction::clone)?;
     if data.function_env.compiled_function.is_none() {
         let compile_start = Instant::now();
-        let block_ptrs = vec![ptr::null_mut::<c_void>(); function.blocks.len()];
-        let module_constant_ptrs = data.module_state.module_constant_ptrs();
-        let counter_ptrs = data.module_state.counter_ptrs();
-        let compile_result = jit::compile_cranelift_run_bb_specialized_cached(
-            block_ptrs.as_slice(),
-            &data.module_state.lowered_module,
-            &function,
-            &data.module_state.codegen_constants,
-            &data.module_state.lowered_module.counter_defs,
-            &module_constant_ptrs,
-            &counter_ptrs,
-            Some(data.module_state.as_ref()),
-        );
-        let compiled_handle = match compile_result {
-            Ok(handle) => {
-                data.module_state.append_jit_codegen_log(
+        let compiled_function = match data
+            .module_state
+            .lookup_or_compile_direct_function_handle(function.function_id)
+        {
+            Ok(Some(handle)) => handle,
+            Ok(None) => {
+                let block_ptrs = vec![ptr::null_mut::<c_void>(); function.blocks.len()];
+                let module_constant_ptrs = data.module_state.module_constant_ptrs();
+                let counter_ptrs = data.module_state.counter_ptrs();
+                let compile_result = jit::compile_cranelift_run_bb_specialized_cached(
+                    &data.compile_session,
+                    block_ptrs.as_slice(),
+                    &data.module_state.lowered_module,
                     &function,
-                    "vectorcall_function_body",
-                    compile_start.elapsed(),
-                    "ok",
-                    None,
+                    &data.module_state.codegen_constants,
+                    &data.module_state.lowered_module.counter_defs,
+                    &module_constant_ptrs,
+                    &counter_ptrs,
+                    Some(data.module_state.as_ref()),
                 );
-                handle
+                match compile_result {
+                    Ok(handle) => {
+                        data.module_state.append_jit_codegen_log(
+                            &function,
+                            "vectorcall_function_body",
+                            compile_start.elapsed(),
+                            "ok",
+                            None,
+                        );
+                        match jit::CompiledFunctionHandle::from_raw(handle) {
+                            Ok(handle) => Arc::new(handle),
+                            Err(err) => {
+                                if let Ok(c_msg) = CString::new(err) {
+                                    ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
+                                } else {
+                                    ffi::PyErr_SetString(
+                                        ffi::PyExc_RuntimeError,
+                                        b"invalid compiled CLIF function handle\0".as_ptr()
+                                            as *const i8,
+                                    );
+                                }
+                                return Err(());
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        data.module_state.append_jit_codegen_log(
+                            &function,
+                            "vectorcall_function_body",
+                            compile_start.elapsed(),
+                            "error",
+                            Some(&err),
+                        );
+                        if let Ok(c_msg) = CString::new(err) {
+                            ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
+                        } else {
+                            ffi::PyErr_SetString(
+                                ffi::PyExc_RuntimeError,
+                                b"failed to compile CLIF function body\0".as_ptr() as *const i8,
+                            );
+                        }
+                        return Err(());
+                    }
+                }
             }
             Err(err) => {
-                data.module_state.append_jit_codegen_log(
-                    &function,
-                    "vectorcall_function_body",
-                    compile_start.elapsed(),
-                    "error",
-                    Some(&err),
-                );
                 if let Ok(c_msg) = CString::new(err) {
                     ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
                 } else {
@@ -1450,26 +1481,25 @@ unsafe fn ensure_clif_vectorcall_compiled(
                 return Err(());
             }
         };
-        let direct_code_ptr =
-            match jit::compiled_direct_code_ptr(compiled_handle).map(|ptr| ptr as *const u8) {
-                Ok(ptr) => ptr,
-                Err(err) => {
-                    unsafe { jit::free_cranelift_run_bb_specialized_cached(compiled_handle) };
-                    if let Ok(c_msg) = CString::new(err) {
-                        ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
-                    } else {
-                        ffi::PyErr_SetString(
-                            ffi::PyExc_RuntimeError,
-                            b"missing CLIF direct entry\0".as_ptr() as *const i8,
-                        );
-                    }
-                    return Err(());
+        let direct_code_ptr = match compiled_function
+            .direct_code_ptr()
+            .map(|ptr| ptr as *const u8)
+        {
+            Ok(ptr) => ptr,
+            Err(err) => {
+                if let Ok(c_msg) = CString::new(err) {
+                    ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
+                } else {
+                    ffi::PyErr_SetString(
+                        ffi::PyExc_RuntimeError,
+                        b"missing CLIF direct entry\0".as_ptr() as *const i8,
+                    );
                 }
-            };
+                return Err(());
+            }
+        };
         data.function_env.set_direct_code_ptr(direct_code_ptr);
-        data.function_env.compiled_function = Some(Arc::new(CompiledFunctionHandle {
-            handle: compiled_handle,
-        }));
+        data.function_env.compiled_function = Some(compiled_function);
         let elapsed_ms = compile_start.elapsed().as_secs_f64() * 1000.0;
         info!(
             "soac_jit_precompile module={} qualname={} blocks={} elapsed_ms={elapsed_ms:.3}",
@@ -1500,7 +1530,7 @@ unsafe fn ensure_clif_vectorcall_compiled(
                     c"compiled CLIF function handle missing".as_ptr(),
                 );
             })?
-            .handle;
+            .raw();
         let (handle, entry) = match jit::compile_cranelift_vectorcall_direct_trampoline(
             bind_direct_args_from_vectorcall,
             data as *mut PyFunctionJitExtra as *mut c_void,
@@ -1875,6 +1905,7 @@ unsafe extern "C" fn lazy_vectorcall(
         };
         unsafe {
             let mut runtime = match build_module_runtime_context_from_parts(
+                data.compile_session.clone(),
                 data.module_state.clone(),
                 data.function_env.globals_obj(),
             ) {

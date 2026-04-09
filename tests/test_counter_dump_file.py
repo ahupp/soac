@@ -130,7 +130,7 @@ def read():
     )
     assert jit_row["status"] == "ok"
     assert jit_row["error"] == ""
-    assert jit_row["function_entry_kind"] == "vectorcall_function_body"
+    assert jit_row["function_entry_kind"] == "direct_function_body"
     assert jit_row["jit_codegen_total_us"] >= 0
     assert isinstance(jit_row["jit_codegen_total_us"], int)
 

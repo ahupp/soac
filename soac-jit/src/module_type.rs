@@ -68,10 +68,10 @@ pub struct SharedModuleState {
     compiled_direct_runner_handles: Mutex<HashMap<FunctionId, DirectRunnerCacheEntry>>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum DirectRunnerCacheEntry {
     InProgress,
-    Ready(*mut c_void),
+    Ready(Arc<crate::jit::CompiledFunctionHandle>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -174,14 +174,25 @@ impl SharedModuleState {
         &self,
         function_id: FunctionId,
     ) -> Result<Option<*mut c_void>, String> {
+        self.lookup_or_compile_direct_function_handle(function_id)
+            .and_then(|handle| match handle {
+                Some(handle) => handle.direct_code_ptr().map(Some),
+                None => Ok(None),
+            })
+    }
+
+    pub(crate) fn lookup_or_compile_direct_function_handle(
+        &self,
+        function_id: FunctionId,
+    ) -> Result<Option<Arc<crate::jit::CompiledFunctionHandle>>, String> {
         {
             let mut cache = self
                 .compiled_direct_runner_handles
                 .lock()
                 .map_err(|_| "compiled direct runner cache lock poisoned".to_string())?;
-            match cache.get(&function_id).copied() {
+            match cache.get(&function_id).cloned() {
                 Some(DirectRunnerCacheEntry::Ready(handle)) => {
-                    return crate::jit::compiled_direct_code_ptr(handle).map(Some);
+                    return Ok(Some(handle));
                 }
                 Some(DirectRunnerCacheEntry::InProgress) => return Ok(None),
                 None => {
@@ -197,8 +208,10 @@ impl SharedModuleState {
         let module_constant_ptrs = self.module_constant_ptrs();
         let counter_ptrs = self.counter_ptrs();
         let compile_start = std::time::Instant::now();
+        let compile_session = crate::session::CompileSession::process();
         let compile_result = unsafe {
             crate::jit::compile_cranelift_run_bb_specialized_cached(
+                &compile_session,
                 blocks.as_slice(),
                 &self.lowered_module,
                 &function,
@@ -234,8 +247,8 @@ impl SharedModuleState {
                 ));
             }
         };
-        let code_ptr = match crate::jit::compiled_direct_code_ptr(handle) {
-            Ok(code_ptr) => code_ptr,
+        let handle_owner = match crate::jit::CompiledFunctionHandle::from_raw(handle) {
+            Ok(handle_owner) => Arc::new(handle_owner),
             Err(err) => {
                 let mut cache = self
                     .compiled_direct_runner_handles
@@ -249,8 +262,36 @@ impl SharedModuleState {
             .compiled_direct_runner_handles
             .lock()
             .map_err(|_| "compiled direct runner cache lock poisoned".to_string())?;
-        cache.insert(function_id, DirectRunnerCacheEntry::Ready(handle));
-        Ok(Some(code_ptr))
+        cache.insert(
+            function_id,
+            DirectRunnerCacheEntry::Ready(Arc::clone(&handle_owner)),
+        );
+        Ok(Some(handle_owner))
+    }
+
+    pub(crate) fn store_compiled_direct_runner_handle(
+        &self,
+        function_id: FunctionId,
+        handle: *mut c_void,
+    ) -> Result<Arc<crate::jit::CompiledFunctionHandle>, String> {
+        let handle_owner = Arc::new(crate::jit::CompiledFunctionHandle::from_raw(handle)?);
+        let mut cache = self
+            .compiled_direct_runner_handles
+            .lock()
+            .map_err(|_| "compiled direct runner cache lock poisoned".to_string())?;
+        match cache.get(&function_id).cloned() {
+            Some(DirectRunnerCacheEntry::Ready(existing)) => {
+                drop(handle_owner);
+                Ok(existing)
+            }
+            Some(DirectRunnerCacheEntry::InProgress) | None => {
+                cache.insert(
+                    function_id,
+                    DirectRunnerCacheEntry::Ready(Arc::clone(&handle_owner)),
+                );
+                Ok(handle_owner)
+            }
+        }
     }
 
     pub fn append_jit_codegen_log(
@@ -404,11 +445,7 @@ impl Drop for SharedModuleState {
             .compiled_direct_runner_handles
             .get_mut()
             .expect("compiled direct runner cache lock should not be poisoned during drop");
-        for handle in cache.drain().map(|(_, handle)| handle) {
-            if let DirectRunnerCacheEntry::Ready(handle) = handle {
-                unsafe { crate::jit::free_cranelift_run_bb_specialized_cached(handle) };
-            }
-        }
+        cache.clear();
     }
 }
 
@@ -581,6 +618,7 @@ impl SoacExtModuleState {
     unsafe fn init(
         &mut self,
         py: Python<'_>,
+        compile_session: &Arc<crate::session::CompileSession>,
         lowered_module: BlockPyModule<CodegenModuleShape>,
         original_code_by_function_id: HashMap<FunctionId, Py<PyAny>>,
         module_name: String,
@@ -604,7 +642,7 @@ impl SoacExtModuleState {
         } else {
             codegen_constants.build_python_constants(py)?
         };
-        self.shared_state.write(Arc::new(SharedModuleState {
+        let shared_state = Arc::new(SharedModuleState {
             lowered_module,
             module_name,
             package_name,
@@ -616,7 +654,11 @@ impl SoacExtModuleState {
             counter_values,
             top_value_counters,
             compiled_direct_runner_handles: Mutex::new(HashMap::new()),
-        }));
+        });
+        compile_session
+            .retain_shared_module_state(shared_state.clone())
+            .map_err(PyRuntimeError::new_err)?;
+        self.shared_state.write(shared_state);
         self.initialized = true;
         Ok(())
     }
@@ -1131,6 +1173,7 @@ impl SoacExtModule {
     pub fn new(
         py: Python<'_>,
         spec: &Bound<'_, PyAny>,
+        compile_session: &Arc<crate::session::CompileSession>,
         mut lowered_module: BlockPyModule<CodegenModuleShape>,
         mut module_info: ModuleInfo,
         original_code_by_function_id: HashMap<FunctionId, Py<PyAny>>,
@@ -1159,6 +1202,7 @@ impl SoacExtModule {
         unsafe {
             (*state).init(
                 py,
+                compile_session,
                 lowered_module,
                 original_code_by_function_id,
                 module_name,

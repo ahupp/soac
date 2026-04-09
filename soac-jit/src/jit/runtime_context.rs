@@ -1,5 +1,6 @@
 use super::ObjPtr;
 use crate::module_type::SharedModuleState;
+use crate::session::CompileSession;
 use pyo3::ffi;
 use std::ffi::c_void;
 use std::mem::{offset_of, size_of};
@@ -51,6 +52,7 @@ struct PyFunctionJitExtraPrefix {
 
 pub struct ModuleRuntimeContext {
     pub mod_ctx: ModuleJitContext,
+    pub compile_session: Arc<CompileSession>,
     pub shared_module_state_owner: Arc<SharedModuleState>,
 }
 

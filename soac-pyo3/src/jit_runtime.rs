@@ -959,7 +959,7 @@ fn create_module(py: Python<'_>, path: &str, spec: Py<PyAny>) -> PyResult<Py<PyA
         hash: source_hash,
         indexed_module_keys: Vec::new(),
     };
-    let session = soac_jit::CompileSession::new();
+    let session = soac_jit::CompileSession::process();
     let lowering_options = LoweringOptions {
         runtime_names_as_globals: module_name == "soac.runtime",
     };
@@ -995,6 +995,7 @@ fn create_module(py: Python<'_>, path: &str, spec: Py<PyAny>) -> PyResult<Py<PyA
         SoacExtModule::new(
             py,
             spec.as_any(),
+            &session,
             output.codegen_module,
             module_info,
             original_code_by_function_id,

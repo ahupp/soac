@@ -330,6 +330,8 @@ mod tests {
                     &module_constant_ptrs,
                     &counter_ptrs,
                     Some(shared_state.as_ref()),
+                    None,
+                    None,
                 )
                 .expect("specialized JIT build should succeed");
                 let (clif, _cfg_dot, _vcode_disasm) = render_compiled_clif_and_vcode_disasm(
@@ -449,6 +451,8 @@ mod tests {
                     &module_constant_ptrs,
                     &counter_ptrs,
                     Some(shared_state.as_ref()),
+                    None,
+                    None,
                 )
                 .expect("specialized JIT build should succeed");
                 let (clif, _cfg_dot, _vcode_disasm) = render_compiled_clif_and_vcode_disasm(
@@ -515,6 +519,8 @@ mod tests {
                 &module_constant_ptrs,
                 &counter_ptrs,
                 None,
+                None,
+                None,
             )
             .expect("specialized JIT build should succeed");
             let (clif, _cfg_dot, _vcode_disasm) = render_compiled_clif_and_vcode_disasm(
@@ -547,6 +553,8 @@ mod tests {
                 &[],
                 &module_constant_ptrs,
                 &counter_ptrs,
+                None,
+                None,
                 None,
             )
             .expect("specialized JIT build should succeed");
@@ -637,6 +645,7 @@ mod tests {
                 shared_module_state: std::sync::Arc::as_ptr(&shared_state),
                 globals_obj,
             },
+            compile_session: crate::session::CompileSession::process(),
             shared_module_state_owner: shared_state,
         }
     }
@@ -963,7 +972,9 @@ mod tests {
     fn jit_vectorcall_trampoline_can_link_runtime_decref_clif() {
         unsafe {
             let compiled = Box::new(CompiledSpecializedRunner {
-                _jit_module: new_jit_module().expect("compiled runner jit module should construct"),
+                _owner: CompiledRunnerOwner::LegacyJitModule(
+                    new_jit_module().expect("compiled runner jit module should construct"),
+                ),
                 entry: Some(CompiledRunnerEntry::Direct {
                     code_ptr: std::ptr::null(),
                     param_count: 0,
@@ -1067,7 +1078,9 @@ def f():
                 let module_constant_ptrs = shared_state.module_constant_ptrs();
                 let counter_ptrs = shared_state.counter_ptrs();
                 let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
+                let compile_session = crate::session::CompileSession::process();
                 let compiled_handle = compile_cranelift_run_bb_specialized_cached(
+                    &compile_session,
                     &blocks,
                     &shared_state.lowered_module,
                     &function,
@@ -1200,7 +1213,9 @@ def f(x):
                 let module_constant_ptrs = shared_state.module_constant_ptrs();
                 let counter_ptrs = shared_state.counter_ptrs();
                 let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
+                let compile_session = crate::session::CompileSession::process();
                 let compiled_handle = compile_cranelift_run_bb_specialized_cached(
+                    &compile_session,
                     &blocks,
                     &shared_state.lowered_module,
                     &function,
@@ -2275,6 +2290,8 @@ def f():
                         &module_constant_ptrs,
                         &counter_ptrs,
                         Some(shared_state.as_ref()),
+                        None,
+                        None,
                     )
                     .expect("specialized JIT build should succeed");
                     let (clif, _cfg_dot, _vcode_disasm) = render_compiled_clif_and_vcode_disasm(
