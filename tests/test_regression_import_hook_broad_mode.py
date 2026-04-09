@@ -65,11 +65,11 @@ def test_import_hook_does_not_transform_reload_of_existing_plain_module(monkeypa
     monkeypatch.setenv("DIET_PYTHON_INTEGRATION_ONLY", "0")
     import_hook.install()
 
-    assert not isinstance(dataclasses.__spec__.loader, import_hook.DietPythonLoader)
+    assert not isinstance(dataclasses.__spec__.loader, import_hook.SoacLoader)
     reloaded = importlib.reload(dataclasses)
 
     assert reloaded is dataclasses
-    assert not isinstance(reloaded.__spec__.loader, import_hook.DietPythonLoader)
+    assert not isinstance(reloaded.__spec__.loader, import_hook.SoacLoader)
 
 
 def test_import_hook_can_transform_stdlib_typing_in_fresh_process(monkeypatch, tmp_path):
@@ -83,7 +83,7 @@ from soac import import_hook
 import_hook.install()
 import typing
 
-assert isinstance(typing.__spec__.loader, import_hook.DietPythonLoader)
+assert isinstance(typing.__spec__.loader, import_hook.SoacLoader)
 assert typing.Callable[..., typing.Any].__args__[-1] is typing.Any
 """
     result = subprocess.run(
@@ -116,8 +116,8 @@ import_hook.install()
 import string.templatelib as templatelib
 import encodings.idna as idna
 
-assert isinstance(templatelib.__spec__.loader, import_hook.DietPythonLoader)
-assert isinstance(idna.__spec__.loader, import_hook.DietPythonLoader)
+assert isinstance(templatelib.__spec__.loader, import_hook.SoacLoader)
+assert isinstance(idna.__spec__.loader, import_hook.SoacLoader)
 assert templatelib.convert("value", "s") == "value"
 """
     result = subprocess.run(
@@ -147,7 +147,7 @@ import_hook.install()
 import soac.runtime as runtime
 
 assert runtime._SOAC_RUNTIME_READY is True
-assert isinstance(runtime.__spec__.loader, import_hook.DietPythonLoader)
+assert isinstance(runtime.__spec__.loader, import_hook.SoacLoader)
 assert runtime.DELETED is runtime.DELETED
 assert runtime.ITER_COMPLETE is runtime.ITER_COMPLETE
 """
@@ -194,7 +194,6 @@ assert isinstance(runtime.AsyncGenComplete(), Exception)
 
 
 def test_import_hook_can_reload_transformed_temp_module(monkeypatch, tmp_path):
-    monkeypatch.setenv("DIET_PYTHON_ALLOW_TEMP", "1")
     monkeypatch.setenv("DIET_PYTHON_INTEGRATION_ONLY", "0")
     import_hook.install()
 
@@ -215,11 +214,11 @@ VALUE = transformed_helper.VALUE + 1
     sys.path.insert(0, str(tmp_path))
     try:
         helper = importlib.import_module("transformed_helper")
-        assert isinstance(helper.__spec__.loader, import_hook.DietPythonLoader)
+        assert isinstance(helper.__spec__.loader, import_hook.SoacLoader)
 
         module = importlib.import_module("reload_probe")
         assert module.VALUE == 2
-        assert isinstance(module.__spec__.loader, import_hook.DietPythonLoader)
+        assert isinstance(module.__spec__.loader, import_hook.SoacLoader)
     finally:
         sys.path.remove(str(tmp_path))
         sys.modules.pop("reload_probe", None)

@@ -33,7 +33,7 @@ def validate_module(module):
         if __dp_integration_transformed__:
             if os.environ.get("DIET_PYTHON_INTEGRATION_ONLY") != "1":
                 assert isinstance(
-                    transformed_typing.__spec__.loader, import_hook.DietPythonLoader
+                    transformed_typing.__spec__.loader, import_hook.SoacLoader
                 ), "typing should be transformed"
             assert type(module) is ModuleType, "transformed modules should use a real module object"
             assert "_dp_module_init" not in module.__dict__, "_dp_module_init should not leak into module globals"

@@ -126,14 +126,14 @@ def render_transformed_source(module_path: Path) -> str:
 def _disable_import_hook() -> Iterator[None]:
     removed_indexes: list[int] = []
     for index in range(len(sys.meta_path) - 1, -1, -1):
-        if sys.meta_path[index] is import_hook.DietPythonFinder:
+        if sys.meta_path[index] is import_hook.SoacFinder:
             removed_indexes.append(index)
             sys.meta_path.pop(index)
     try:
         yield
     finally:
         for index in reversed(removed_indexes):
-            sys.meta_path.insert(index, import_hook.DietPythonFinder)
+            sys.meta_path.insert(index, import_hook.SoacFinder)
 
 
 @contextmanager
@@ -151,8 +151,6 @@ def _load_module(
 
     package_root = str(tmp_path)
     sys.path.insert(0, package_root)
-    prior_allow_temp = os.environ.get("DIET_PYTHON_ALLOW_TEMP")
-    os.environ["DIET_PYTHON_ALLOW_TEMP"] = "1"
     prior_mode = os.environ.get("DIET_PYTHON_MODE")
     prior_integration_only = os.environ.get("DIET_PYTHON_INTEGRATION_ONLY")
 
@@ -189,10 +187,6 @@ def _load_module(
                 sys.path.remove(package_root)
             except ValueError:
                 pass
-        if prior_allow_temp is None:
-            os.environ.pop("DIET_PYTHON_ALLOW_TEMP", None)
-        else:
-            os.environ["DIET_PYTHON_ALLOW_TEMP"] = prior_allow_temp
         if prior_mode is None:
             os.environ.pop("DIET_PYTHON_MODE", None)
         else:

@@ -5,7 +5,6 @@ import importlib.machinery
 import importlib.util
 import os
 import sys
-import tempfile
 from pathlib import Path
 
 from . import _soac_ext
@@ -58,18 +57,7 @@ def _should_transform(path: str) -> bool:
         return False
     if _integration_only_enabled() and not _is_integration_module(resolved):
         return False
-    if os.environ.get("DIET_PYTHON_ALLOW_TEMP") != "1":
-        try:
-            resolved.relative_to(Path(tempfile.gettempdir()).resolve())
-        except (OSError, ValueError):
-            pass
-        else:
-            return False
-    try:
-        with open(path, "rb") as file:
-            return b"diet-python: disable" not in file.read()
-    except OSError:
-        return False
+    return True
 
 
 def _source_path_for_frozen_spec(spec):
@@ -94,8 +82,8 @@ def _source_path_for_frozen_spec(spec):
     return None
 
 
-class DietPythonLoader(importlib.machinery.SourceFileLoader):
-    """Loader that applies the diet-python transform before executing a module."""
+class SoacLoader(importlib.machinery.SourceFileLoader):
+    """Loader that applies the SOAC transform before executing a module."""
 
     def create_module(self, spec):
         return _create_module_from_path(self.path, spec)
@@ -105,8 +93,8 @@ class DietPythonLoader(importlib.machinery.SourceFileLoader):
         return None
 
 
-class DietPythonFinder(importlib.machinery.PathFinder):
-    """Finder that wraps loaders to apply diet-python transformations."""
+class SoacFinder(importlib.machinery.PathFinder):
+    """Finder that wraps loaders to apply SOAC transformations."""
 
     @classmethod
     def find_spec(cls, fullname, path=None, target=None):
@@ -121,7 +109,7 @@ class DietPythonFinder(importlib.machinery.PathFinder):
             return None
         if target is not None:
             loader = getattr(getattr(target, "__spec__", None), "loader", None)
-            if not isinstance(loader, DietPythonLoader):
+            if not isinstance(loader, SoacLoader):
                 return spec
         fullname = spec.name
         if (
@@ -129,7 +117,7 @@ class DietPythonFinder(importlib.machinery.PathFinder):
             and spec.origin
             and _should_transform(spec.origin)
         ):
-            spec.loader = DietPythonLoader(fullname, spec.origin)
+            spec.loader = SoacLoader(fullname, spec.origin)
         elif (
             spec.loader is importlib.machinery.FrozenImporter
             and spec.origin == "frozen"
@@ -138,13 +126,13 @@ class DietPythonFinder(importlib.machinery.PathFinder):
             if source_path and _should_transform(source_path):
                 spec.origin = source_path
                 spec.has_location = True
-                spec.loader = DietPythonLoader(fullname, source_path)
+                spec.loader = SoacLoader(fullname, source_path)
         return spec
 
 
 def install():
-    """Install the diet-python import hook."""
-    if any(finder is DietPythonFinder for finder in sys.meta_path):
+    """Install the SOAC import hook."""
+    if any(finder is SoacFinder for finder in sys.meta_path):
         return
 
     for index, finder in enumerate(sys.meta_path):
@@ -152,10 +140,10 @@ def install():
             importlib.machinery.FrozenImporter,
             importlib.machinery.PathFinder,
         }:
-            sys.meta_path.insert(index, DietPythonFinder)
+            sys.meta_path.insert(index, SoacFinder)
             break
     else:
-        sys.meta_path.insert(0, DietPythonFinder)
+        sys.meta_path.insert(0, SoacFinder)
 
 
 def _resolve_target(target: str) -> importlib.machinery.ModuleSpec:
@@ -193,7 +181,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("args", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
 
-    spec = DietPythonFinder.wrap_spec(_resolve_target(args.module))
+    spec = SoacFinder.wrap_spec(_resolve_target(args.module))
     assert spec is not None
     path = Path(spec.origin).resolve()
 

@@ -4,13 +4,12 @@ import textwrap
 from pathlib import Path
 
 
-def import_without_transform(tmp_path: Path) -> bool:
-    module_name = "dp_disable_temp"
+def import_temp_module(tmp_path: Path) -> bool:
+    module_name = "dp_transform_temp"
     module_path = tmp_path / f"{module_name}.py"
     module_path.write_text(
         textwrap.dedent(
             """\
-            # diet-python: disable
             VALUE = 1
             """
         ),
@@ -35,4 +34,4 @@ def validate_module(module):
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_path = Path(tmp_dir)
-        assert module.import_without_transform(tmp_path) is False
+        assert module.import_temp_module(tmp_path) is True

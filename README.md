@@ -93,12 +93,6 @@ exports are intentionally omitted here.
   restrict transformed imports to integration-test modules instead of
   transforming arbitrary imports.
 
-- `DIET_PYTHON_ALLOW_TEMP=1`
-  In `def _should_transform`, at
-  [soac_py/src/soac/import_hook.py:57](/home/adam/project/soac-profile/soac_py/src/soac/import_hook.py#L57),
-  allow the import hook to transform modules loaded from the system temp
-  directory. By default temp files are skipped.
-
 - `DIET_PYTHON_JIT_COMPILE_MODE=eager`
   In `fn eager_clif_compile_requested`, at
   [soac-pyo3/src/jit_runtime.rs:96](/home/adam/project/soac-profile/soac-pyo3/src/jit_runtime.rs#L96),

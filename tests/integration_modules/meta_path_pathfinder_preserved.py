@@ -21,7 +21,6 @@ def import_with_filtered_meta_path() -> bool:
             module_path.write_text(
                 textwrap.dedent(
                     """\
-                    # diet-python: disable
                     VALUE = 1
                     """
                 ),

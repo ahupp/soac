@@ -51,4 +51,4 @@ def test_import_hook_transforms_resolvable_frozen_module_source():
         capture_output=True,
         env=env,
     )
-    assert result.stdout.splitlines() == ["DietPythonLoader", "True", "True"]
+    assert result.stdout.splitlines() == ["SoacLoader", "True", "True"]
