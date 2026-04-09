@@ -1468,7 +1468,7 @@ unsafe fn ensure_clif_vectorcall_compiled(
         let block_ptrs = vec![ptr::null_mut::<c_void>(); function.blocks.len()];
         let module_constant_ptrs = data.module_state.module_constant_ptrs();
         let counter_ptrs = data.module_state.counter_ptrs();
-        let compiled_handle = match jit::compile_cranelift_run_bb_specialized_cached(
+        let compile_result = jit::compile_cranelift_run_bb_specialized_cached(
             block_ptrs.as_slice(),
             &data.module_state.lowered_module,
             &function,
@@ -1477,9 +1477,26 @@ unsafe fn ensure_clif_vectorcall_compiled(
             &module_constant_ptrs,
             &counter_ptrs,
             Some(data.module_state.as_ref()),
-        ) {
-            Ok(handle) => handle,
+        );
+        let compiled_handle = match compile_result {
+            Ok(handle) => {
+                data.module_state.append_jit_codegen_log(
+                    &function,
+                    "vectorcall_function_body",
+                    compile_start.elapsed(),
+                    "ok",
+                    None,
+                );
+                handle
+            }
             Err(err) => {
+                data.module_state.append_jit_codegen_log(
+                    &function,
+                    "vectorcall_function_body",
+                    compile_start.elapsed(),
+                    "error",
+                    Some(&err),
+                );
                 if let Ok(c_msg) = CString::new(err) {
                     ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
                 } else {

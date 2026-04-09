@@ -1849,6 +1849,7 @@ dependencies = [
  "pyo3-build-config",
  "rkyv",
  "ruff_python_ast",
+ "serde_json",
  "soac-blockpy",
 ]
 

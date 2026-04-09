@@ -58,7 +58,8 @@ def read():
     row = next(
         row
         for row in rows
-        if row["module"]["module_name"].endswith(".module_load_log_case")
+        if row["event"] == "soac.module_load"
+        and row["module"]["module_name"].endswith(".module_load_log_case")
     )
 
     assert row["event"] == "soac.module_load"
@@ -81,3 +82,15 @@ def read():
         "exec_module.register_function_owner_types",
     ]:
         assert timings[name] >= 0
+
+    jit_row = next(
+        row
+        for row in rows
+        if row["event"] == "soac.jit_codegen"
+        and row["module"]["module_name"].endswith(".module_load_log_case")
+        and row["function"]["qualname"] == "read"
+    )
+    assert jit_row["status"] == "ok"
+    assert jit_row["error"] is None
+    assert jit_row["function"]["entry_kind"] == "vectorcall_function_body"
+    assert jit_row["timings_ms"]["jit_codegen_total"] >= 0

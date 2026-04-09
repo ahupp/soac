@@ -16,10 +16,11 @@ use std::ffi::{c_char, c_int, c_void};
 use std::fs::{OpenOptions, create_dir_all};
 use std::io::Write;
 use std::mem::MaybeUninit;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 
 unsafe extern "C" {
     fn _PyDict_WatchSplitKeysForType(type_obj: *mut ffi::PyObject) -> c_int;
@@ -194,7 +195,8 @@ impl SharedModuleState {
         let blocks = vec![ptr::null_mut::<c_void>(); function.blocks.len()];
         let module_constant_ptrs = self.module_constant_ptrs();
         let counter_ptrs = self.counter_ptrs();
-        let handle = unsafe {
+        let compile_start = std::time::Instant::now();
+        let compile_result = unsafe {
             crate::jit::compile_cranelift_run_bb_specialized_cached(
                 blocks.as_slice(),
                 &self.lowered_module,
@@ -205,12 +207,31 @@ impl SharedModuleState {
                 &counter_ptrs,
                 Some(self),
             )
-            .map_err(|err| {
-                format!(
+        };
+        let handle = match compile_result {
+            Ok(handle) => {
+                self.append_jit_codegen_log(
+                    &function,
+                    "direct_function_body",
+                    compile_start.elapsed(),
+                    "ok",
+                    None,
+                );
+                handle
+            }
+            Err(err) => {
+                self.append_jit_codegen_log(
+                    &function,
+                    "direct_function_body",
+                    compile_start.elapsed(),
+                    "error",
+                    Some(&err),
+                );
+                return Err(format!(
                     "{err} [direct_target={} id={}]",
                     function.names.qualname, function.function_id
-                )
-            })?
+                ));
+            }
         };
         let code_ptr = match crate::jit::compiled_direct_code_ptr(handle) {
             Ok(code_ptr) => code_ptr,
@@ -229,6 +250,17 @@ impl SharedModuleState {
             .map_err(|_| "compiled direct runner cache lock poisoned".to_string())?;
         cache.insert(function_id, DirectRunnerCacheEntry::Ready(handle));
         Ok(Some(code_ptr))
+    }
+
+    pub fn append_jit_codegen_log(
+        &self,
+        function: &BlockPyFunction<CodegenModuleShape>,
+        entry_kind: &str,
+        elapsed: Duration,
+        status: &str,
+        error: Option<&str>,
+    ) {
+        append_jit_codegen_log(self, function, entry_kind, elapsed, status, error);
     }
 
     pub fn counter_dump_record(&self) -> Option<CounterDumpRecord> {
@@ -655,6 +687,95 @@ fn env_flag_enabled(name: &str) -> bool {
             )
         }
     }
+}
+
+fn trimmed_env_path(name: &str) -> Option<PathBuf> {
+    let raw = env::var_os(name)?;
+    let trimmed = raw.to_string_lossy().trim().to_string();
+    (!trimmed.is_empty()).then(|| trimmed.into())
+}
+
+fn module_load_log_dir() -> Option<PathBuf> {
+    if let Some(dir) = trimmed_env_path("DIET_PYTHON_COUNTERS_DIR") {
+        return Some(dir);
+    }
+    if let Some(file) = trimmed_env_path("DIET_PYTHON_COUNTERS_OUTPUT_FILE") {
+        return Some(
+            file.parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf(),
+        );
+    }
+    let file = trimmed_env_path("DIET_PYTHON_COUNTERS_FILE")?;
+    Some(
+        file.parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf(),
+    )
+}
+
+fn module_load_log_path() -> Option<PathBuf> {
+    Some(module_load_log_dir()?.join("module_loads.jsonl"))
+}
+
+fn append_module_load_json(entry: &serde_json::Value) {
+    let Some(path) = module_load_log_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        if let Err(err) = create_dir_all(parent) {
+            eprintln!(
+                "[soac module-load log] failed to create {}: {err}",
+                parent.display()
+            );
+            return;
+        }
+    }
+    let append_result = (|| -> std::io::Result<()> {
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        serde_json::to_writer(&mut file, entry)?;
+        file.write_all(b"\n")
+    })();
+    if let Err(err) = append_result {
+        eprintln!(
+            "[soac module-load log] failed to append {}: {err}",
+            path.display()
+        );
+    }
+}
+
+fn append_jit_codegen_log(
+    module_state: &SharedModuleState,
+    function: &BlockPyFunction<CodegenModuleShape>,
+    entry_kind: &str,
+    elapsed: Duration,
+    status: &str,
+    error: Option<&str>,
+) {
+    if module_load_log_path().is_none() {
+        return;
+    }
+    let entry = serde_json::json!({
+        "event": "soac.jit_codegen",
+        "status": status,
+        "module": {
+            "module_name": module_state.module_name,
+            "package_name": module_state.package_name,
+        },
+        "function": {
+            "function_id": function.function_id.to_string(),
+            "qualname": function.names.qualname,
+            "block_count": function.blocks.len(),
+            "entry_kind": entry_kind,
+        },
+        "timings_ms": {
+            "jit_codegen_total": elapsed.as_secs_f64() * 1000.0,
+        },
+        "error": error,
+    });
+    append_module_load_json(&entry);
 }
 
 pub unsafe fn watch_split_keys_for_type(type_obj: *mut ffi::PyObject) -> Result<(), ()> {
