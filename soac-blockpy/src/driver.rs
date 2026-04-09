@@ -217,11 +217,22 @@ pub(crate) fn rewrite_module_with_tracker(
             bb_counted
         };
 
+    let bb_locality_counted: BlockPyModule<CodegenModuleShape> =
+        if passes::locality_counter_instrumentation_enabled() {
+            pass_tracker.run_pass("bb_locality_counters", || {
+                let mut counted = bb_call_target_counted;
+                passes::instrument_bb_module_with_locality_counters(&mut counted);
+                counted
+            })
+        } else {
+            bb_call_target_counted
+        };
+
     pass_tracker.record_timing("validate", || {
-        crate::block_py::validate_module(&bb_call_target_counted).map_err(anyhow::Error::msg)
+        crate::block_py::validate_module(&bb_locality_counted).map_err(anyhow::Error::msg)
     })?;
 
-    Ok(bb_call_target_counted)
+    Ok(bb_locality_counted)
 }
 
 pub(crate) fn wrap_module_init(semantic_state: &mut SemanticAstState, module: &mut Suite) {

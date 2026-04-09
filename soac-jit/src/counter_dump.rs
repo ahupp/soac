@@ -566,6 +566,48 @@ pub fn collect_operator_specializations_for_function(
     Ok(out)
 }
 
+pub fn collect_branch_preferences_for_function(
+    records: &[CounterDumpRecordView<'_>],
+    module_name: &str,
+    function_id: FunctionId,
+) -> Result<HashMap<InstrId, bool>, String> {
+    let mut counts = HashMap::<InstrId, [u64; 2]>::new();
+    for record in records {
+        if record.module_name()? != module_name {
+            continue;
+        }
+        for row_index in 0..record.row_count() {
+            let row = record.row(row_index)?;
+            if row.kind != "branch_outcomes" || row.function_id != Some(function_id) {
+                continue;
+            }
+            let Some(instr_id) = row.instr_id else {
+                continue;
+            };
+            let Some(observed_value) = row.observed_value else {
+                continue;
+            };
+            let Some(slot) = usize::try_from(observed_value)
+                .ok()
+                .filter(|slot| *slot < 2)
+            else {
+                continue;
+            };
+            counts.entry(instr_id).or_default()[slot] =
+                counts.entry(instr_id).or_default()[slot].saturating_add(row.value);
+        }
+    }
+
+    let mut out = HashMap::new();
+    for (instr_id, [false_count, true_count]) in counts {
+        if false_count == 0 && true_count == 0 {
+            continue;
+        }
+        out.insert(instr_id, true_count >= false_count);
+    }
+    Ok(out)
+}
+
 pub fn collect_module_key_layouts(
     records: &[CounterDumpRecordView<'_>],
 ) -> Result<HashMap<String, Vec<CollectedKeyLayout>>, String> {
@@ -623,6 +665,16 @@ pub fn read_operator_specializations_from_file(
     let dump = CounterDumpFile::open(path)?;
     let records = dump.records()?;
     collect_operator_specializations_for_function(records.as_slice(), module_name, function_id)
+}
+
+pub fn read_branch_preferences_from_file(
+    path: &Path,
+    module_name: &str,
+    function_id: FunctionId,
+) -> Result<HashMap<InstrId, bool>, String> {
+    let dump = CounterDumpFile::open(path)?;
+    let records = dump.records()?;
+    collect_branch_preferences_for_function(records.as_slice(), module_name, function_id)
 }
 
 fn align_up(offset: usize, align: usize) -> usize {
@@ -1142,5 +1194,71 @@ mod tests {
             !collected.contains_key(&InstrId::new(BlockLabel::from_index(3), 1)),
             "operator specializations should filter other functions"
         );
+    }
+
+    #[test]
+    fn collect_branch_preferences_compares_false_and_true_counts() {
+        let hot_false_site = InstrId::new(BlockLabel::from_index(2), 4);
+        let hot_true_site = InstrId::new(BlockLabel::from_index(3), 5);
+        let record = CounterDumpRecord {
+            module_name: "mod".to_string(),
+            package_name: None,
+            module_keys: Vec::new(),
+            type_keys: Vec::new(),
+            rows: vec![
+                CounterDumpRow {
+                    counter_id: 1,
+                    scope: "this".to_string(),
+                    kind: "branch_outcomes".to_string(),
+                    site_kind: "runtime".to_string(),
+                    function_id: Some(FunctionId::new(1, 7)),
+                    current_function_id: Some(FunctionId::new(1, 7)),
+                    instr_id: Some(hot_false_site),
+                    function_qualname: Some("pkg.mod.f".to_string()),
+                    block_label: None,
+                    value: 20,
+                    observed_value: Some(0),
+                    max_overcount: Some(0),
+                },
+                CounterDumpRow {
+                    counter_id: 2,
+                    scope: "this".to_string(),
+                    kind: "branch_outcomes".to_string(),
+                    site_kind: "runtime".to_string(),
+                    function_id: Some(FunctionId::new(1, 7)),
+                    current_function_id: Some(FunctionId::new(1, 7)),
+                    instr_id: Some(hot_false_site),
+                    function_qualname: Some("pkg.mod.f".to_string()),
+                    block_label: None,
+                    value: 3,
+                    observed_value: Some(1),
+                    max_overcount: Some(0),
+                },
+                CounterDumpRow {
+                    counter_id: 3,
+                    scope: "this".to_string(),
+                    kind: "branch_outcomes".to_string(),
+                    site_kind: "runtime".to_string(),
+                    function_id: Some(FunctionId::new(1, 7)),
+                    current_function_id: Some(FunctionId::new(1, 7)),
+                    instr_id: Some(hot_true_site),
+                    function_qualname: Some("pkg.mod.f".to_string()),
+                    block_label: None,
+                    value: 9,
+                    observed_value: Some(1),
+                    max_overcount: Some(0),
+                },
+            ],
+        };
+
+        let bytes = record.encode().expect("counter dump should encode");
+        let records =
+            parse_counter_dump_records(bytes.as_slice()).expect("counter dump should parse");
+        let collected =
+            collect_branch_preferences_for_function(&records, "mod", FunctionId::new(1, 7))
+                .expect("branch preferences should collect");
+
+        assert_eq!(collected.get(&hot_false_site), Some(&false));
+        assert_eq!(collected.get(&hot_true_site), Some(&true));
     }
 }

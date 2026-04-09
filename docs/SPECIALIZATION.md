@@ -36,6 +36,16 @@ The hot streams consumed by the current replay path are:
     `collect_operator_specializations_for_function`, at
     `soac-jit/src/counter_dump.rs:789`.
 
+- `branch_outcomes`
+  - Instrumented for `IfTerm` terminators, keyed by the conditional
+    test expression's `InstrId`.
+  - Records the boolean result consumed by specialized JIT branch
+    lowering: observed value `1` is the `then` edge, and observed
+    value `0` is the `else` edge.
+  - Consumed from the binary counter dump in
+    `collect_branch_preferences_for_function`, then replayed as a
+    per-site preference for true-hot or false-hot lowering.
+
 The cold metadata stream records dictionary-key layouts for replay:
 
 - `module_keys`
@@ -83,14 +93,49 @@ Normal multi-pass runs use one counters directory and one mode:
   - emit no specialization-input counters
 
 The JIT also supports the low-level file override
-`DIET_PYTHON_COUNTERS_FILE`. It loads both hot kinds from that file, or
-from the mode-derived `profile.bin`, unless an explicit specialization
-override env var is present:
+`DIET_PYTHON_COUNTERS_FILE`. It loads hot profile input from that file,
+or from the mode-derived `profile.bin`, unless an explicit
+specialization override env var is present:
 
 - `load_call_target_specializations`, at
   `soac-jit/src/jit/mod.rs:1966`
 - `load_operator_specializations`, at
   `soac-jit/src/jit/mod.rs:2057`
+- `load_branch_preferences`, at `soac-jit/src/jit/mod.rs`
+
+
+## Profiled Branch Locality
+
+### Counted Input
+
+- Source input is `branch_outcomes`.
+- A counter definition is attached to each `IfTerm` test instruction
+  while profile/verify instrumentation is enabled.
+- Specialized JIT code records the post-truthiness boolean immediately
+  before lowering the terminator. This avoids conflating Python objects
+  that were truth-tested differently.
+
+### Codegen
+
+- In apply/verify mode, counter replay compares false and true sample
+  counts for each conditional test `InstrId`.
+- If true is at least as hot as false, codegen emits the normal
+  `brif(is_true, then_arm, else_arm)` shape.
+- If false is hotter, codegen inverts the Cranelift predicate and emits
+  the else arm as the first branch:
+  `brif(is_false, else_arm, then_arm)`.
+
+### Limitations / Soundness / Extensions
+
+- This is a layout / branch-shape hint only. It does not rewrite
+  BlockPy control flow and does not change which Python block each
+  outcome reaches.
+- The current profile input is for conditional terminators. It does not
+  yet record a uniform "source block -> destination block" stream for
+  unconditional jumps or branch tables.
+- Counts come from the top-two heavy-hitter storage. That exactly covers
+  boolean branches, but a future branch-table locality profile needs a
+  wider representation or per-edge scalar counters.
 
 
 ## Indexed Globals

@@ -1,7 +1,7 @@
 use crate::SOAC_RUNTIME_CLIF;
 use crate::counter_dump::{
-    CollectedKeyLayout, collect_type_key_layouts, read_call_target_specializations_from_file,
-    read_operator_specializations_from_file,
+    CollectedKeyLayout, collect_type_key_layouts, read_branch_preferences_from_file,
+    read_call_target_specializations_from_file, read_operator_specializations_from_file,
 };
 use crate::module_constants::{ModuleCodegenConstants, ModuleConstantId};
 use crate::module_type::SharedModuleState;
@@ -1133,6 +1133,8 @@ struct JitEmitCtx<'mc> {
     operator_specializations: &'mc HashMap<InstrId, Vec<u64>>,
     operator_specialized_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
     operator_specialized_fallback_counter_ids: &'mc HashMap<InstrId, CounterId>,
+    branch_outcome_counter_ids: &'mc HashMap<InstrId, CounterId>,
+    branch_prefer_true: &'mc HashMap<InstrId, bool>,
     global_indexed_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
     global_indexed_fallback_counter_ids: &'mc HashMap<InstrId, CounterId>,
     field_indexed_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
@@ -2538,6 +2540,23 @@ fn load_operator_specializations(
     read_operator_specializations_from_file(path, module_name, function_id)
 }
 
+fn load_branch_preferences(
+    module_name: &str,
+    function_id: FunctionId,
+) -> Result<HashMap<InstrId, bool>, String> {
+    if specialization_mode_is_profile() {
+        return Ok(HashMap::new());
+    }
+    let Some(path) = counter_dump_input_path_from_env() else {
+        return Ok(HashMap::new());
+    };
+    let path = path.as_path();
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    read_branch_preferences_from_file(path, module_name, function_id)
+}
+
 fn type_layout_is_for_module_owner(module_name: &str, layout: &CollectedKeyLayout) -> bool {
     layout.owner == module_name
         || layout
@@ -2890,6 +2909,16 @@ fn emit_record_call_target_sample(
     ctx: &JitEmitCtx<'_>,
 ) {
     emit_record_top_value_sample(fb, counter_id, callee_id, ctx);
+}
+
+fn emit_record_branch_outcome_sample(
+    fb: &mut FunctionBuilder<'_>,
+    counter_id: CounterId,
+    is_true: ir::Value,
+    ctx: &JitEmitCtx<'_>,
+) {
+    let observed_value = fb.ins().uextend(ctx.consts.i64_ty, is_true);
+    emit_record_top_value_sample(fb, counter_id, observed_value, ctx);
 }
 
 fn emit_direct_call_resolved_raw_with_arg_values(
@@ -5095,6 +5124,53 @@ fn emit_codegen_ops(
     Ok(())
 }
 
+fn emit_codegen_if_target_arm(
+    fb: &mut FunctionBuilder<'_>,
+    block_label: &str,
+    arm_name: &str,
+    branch_block: ir::Block,
+    target_label: BlockLabel,
+    exec_blocks: &[ir::Block],
+    runtime_block_param_names: &[Vec<String>],
+    local_names: &mut Vec<String>,
+    local_values: &mut Vec<ir::Value>,
+    emit_ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<(), String> {
+    fb.switch_to_block(branch_block);
+    let target_index = target_label.index();
+    let target_params = &runtime_block_param_names[target_index];
+    let mut jump_args = Vec::with_capacity(target_params.len());
+    jump_args.extend(
+        emit_prepare_target_args_codegen(
+            fb,
+            target_params,
+            None,
+            None,
+            local_names,
+            local_values,
+            emit_ctx,
+            jit_module,
+            func_imports,
+        )
+        .ok_or_else(|| {
+            format!(
+                "missing local mapping for {arm_name}-branch block params in block {block_label}"
+            )
+        })?,
+    );
+    emit_decref_unforwarded_locals(
+        fb,
+        local_values,
+        local_names,
+        target_params,
+        emit_ctx.decref_ref,
+    );
+    fb.ins().jump(exec_blocks[target_index], &jump_args);
+    Ok(())
+}
+
 fn emit_codegen_term(
     fb: &mut FunctionBuilder<'_>,
     block_label: &str,
@@ -5163,6 +5239,7 @@ fn emit_codegen_term(
             fb.ins().jump(exec_blocks[target_index], &jump_args);
         }
         BlockTerm::IfTerm(if_term) => {
+            let test_instr_id = if_term.test.meta().instr_id;
             let test_value = emit_codegen_expr(
                 fb,
                 &if_term.test,
@@ -5182,60 +5259,57 @@ fn emit_codegen_term(
                 &emit_ctx.consts.step_null_args,
                 i32_ty,
             );
+            if let Some(counter_id) = test_instr_id
+                .and_then(|instr_id| emit_ctx.branch_outcome_counter_ids.get(&instr_id).copied())
+            {
+                emit_record_branch_outcome_sample(fb, counter_id, is_true, emit_ctx);
+            }
 
-            let then_branch = fb.create_block();
-            let else_branch = fb.create_block();
-            fb.ins().brif(is_true, then_branch, &[], else_branch, &[]);
+            let prefer_true = test_instr_id
+                .and_then(|instr_id| emit_ctx.branch_prefer_true.get(&instr_id).copied())
+                .unwrap_or(true);
+            let hot_cond = if prefer_true {
+                is_true
+            } else {
+                fb.ins().icmp_imm(ir::condcodes::IntCC::Equal, is_true, 0)
+            };
+            let hot_branch = fb.create_block();
+            let cold_branch = fb.create_block();
+            fb.ins().brif(hot_cond, hot_branch, &[], cold_branch, &[]);
 
-            fb.switch_to_block(then_branch);
-            let then_index = if_term.then_label.index();
-            let then_params = &runtime_block_param_names[then_index];
-            let mut then_jump_args = Vec::with_capacity(then_params.len());
-            then_jump_args.extend(
-                emit_prepare_target_args_codegen(
-                    fb,
-                    then_params,
-                    None,
-                    None,
-                    local_names,
-                    local_values,
-                    emit_ctx,
-                    jit_module,
-                    func_imports,
-                )
-                .ok_or_else(|| {
-                    format!(
-                        "missing local mapping for then-branch block params in block {block_label}"
-                    )
-                })?,
-            );
-            emit_decref_unforwarded_locals(fb, local_values, local_names, then_params, decref_ref);
-            fb.ins().jump(exec_blocks[then_index], &then_jump_args);
-
-            fb.switch_to_block(else_branch);
-            let else_index = if_term.else_label.index();
-            let else_params = &runtime_block_param_names[else_index];
-            let mut else_jump_args = Vec::with_capacity(else_params.len());
-            else_jump_args.extend(
-                emit_prepare_target_args_codegen(
-                    fb,
-                    else_params,
-                    None,
-                    None,
-                    local_names,
-                    local_values,
-                    emit_ctx,
-                    jit_module,
-                    func_imports,
-                )
-                .ok_or_else(|| {
-                    format!(
-                        "missing local mapping for else-branch block params in block {block_label}"
-                    )
-                })?,
-            );
-            emit_decref_unforwarded_locals(fb, local_values, local_names, else_params, decref_ref);
-            fb.ins().jump(exec_blocks[else_index], &else_jump_args);
+            let (hot_name, hot_label, cold_name, cold_label) = if prefer_true {
+                ("then", if_term.then_label, "else", if_term.else_label)
+            } else {
+                ("else", if_term.else_label, "then", if_term.then_label)
+            };
+            emit_codegen_if_target_arm(
+                fb,
+                block_label,
+                hot_name,
+                hot_branch,
+                hot_label,
+                exec_blocks,
+                runtime_block_param_names,
+                local_names,
+                local_values,
+                emit_ctx,
+                jit_module,
+                func_imports,
+            )?;
+            emit_codegen_if_target_arm(
+                fb,
+                block_label,
+                cold_name,
+                cold_branch,
+                cold_label,
+                exec_blocks,
+                runtime_block_param_names,
+                local_names,
+                local_values,
+                emit_ctx,
+                jit_module,
+                func_imports,
+            )?;
         }
         BlockTerm::BranchTable(branch) => {
             let index_i64 = emit_branch_index_i64(
@@ -6226,6 +6300,8 @@ fn build_cranelift_run_bb_specialized_function(
         function.function_id,
         "field_indexed_fallback",
     );
+    let branch_outcome_counter_ids =
+        collect_runtime_counter_ids_by_kind(counter_defs, function.function_id, "branch_outcomes");
     let call_target_specializations = match direct_call_resolver {
         Some(shared_state) => load_call_target_specializations(
             shared_state.module_name.as_str(),
@@ -6241,6 +6317,12 @@ fn build_cranelift_run_bb_specialized_function(
     };
     let field_index_specializations = match direct_call_resolver {
         Some(shared_state) => load_field_index_specializations(shared_state.module_name.as_str())?,
+        None => HashMap::new(),
+    };
+    let branch_prefer_true = match direct_call_resolver {
+        Some(shared_state) => {
+            load_branch_preferences(shared_state.module_name.as_str(), function.function_id)?
+        }
         None => HashMap::new(),
     };
     let unsound_indexed_stores = unsound_indexed_stores_enabled();
@@ -6825,6 +6907,8 @@ fn build_cranelift_run_bb_specialized_function(
                 global_indexed_fallback_counter_ids: &global_indexed_fallback_counter_ids,
                 field_indexed_hit_counter_ids: &field_indexed_hit_counter_ids,
                 field_indexed_fallback_counter_ids: &field_indexed_fallback_counter_ids,
+                branch_outcome_counter_ids: &branch_outcome_counter_ids,
+                branch_prefer_true: &branch_prefer_true,
                 field_index_specializations: &field_index_specializations,
                 unsound_indexed_stores,
             };

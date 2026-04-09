@@ -120,3 +120,21 @@ benchmarked throughput delta, and the headline pre/post numbers.
     `319499 -> 304941 loops/s`, `-4.56%`
   - branch-context richcompare-truth helper: median
     `319499 -> 306582 loops/s`, `-4.04%`
+
+## 2026-04-09 - Profile conditional branch locality
+
+- jj change id: `wvotvvly`
+- summary: Profile/apply mode now records each conditional terminator's
+  post-truthiness boolean as a `branch_outcomes` top-value counter, replays
+  false-vs-true counts from `profile.bin`, and inverts false-hot specialized
+  JIT branches so the hotter edge is the Cranelift true / first edge.
+- throughput: `+0.15%` median versus the first parent run; repeat
+  parent run was lower, so treat the measured change as benchmark noise
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `310384`, `315461`, `313523 loops/s`
+  - repeat specialized pass, 1M loops x3: `299188`, `313244`,
+    `308169 loops/s`
+  - stock CPython: `550680 loops/s`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `313980`, `319739`, `310154 loops/s`
+  - stock CPython: `552602 loops/s`

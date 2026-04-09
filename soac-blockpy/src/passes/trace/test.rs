@@ -1,6 +1,6 @@
 use super::{
     instrument_bb_module_for_trace, instrument_bb_module_with_global_load_counters,
-    parse_trace_config, TraceConfig,
+    instrument_bb_module_with_locality_counters, parse_trace_config, TraceConfig,
 };
 use crate::block_py::{
     BlockPyFunction, Call, ChildVisitable, CounterScope, CounterSite, InstrCodegen, NameLike,
@@ -8,7 +8,8 @@ use crate::block_py::{
 };
 use crate::lower_python_to_blockpy_for_testing;
 use crate::passes::{
-    lower_try_jump_exception_flow, normalize_bb_module_strings, CodegenModuleShape,
+    assign_module_instr_ids, lower_try_jump_exception_flow, normalize_bb_module_strings,
+    CodegenModuleShape,
 };
 
 fn tracked_name_binding_module(
@@ -156,4 +157,34 @@ fn adds_named_global_load_counters_once() {
                     instr_id: None,
                 }
     }));
+}
+
+#[test]
+fn adds_branch_outcome_counters_for_conditional_terms() {
+    let source = "def f(x):\n    if x:\n        return 1\n    return 0\n";
+    let bb_module = tracked_name_binding_module(source)
+        .expect("transform should succeed")
+        .expect("bb module should be available");
+    let prepared = lower_try_jump_exception_flow(&bb_module);
+    let mut normalized = normalize_bb_module_strings(&prepared);
+    assign_module_instr_ids(&mut normalized);
+    instrument_bb_module_with_locality_counters(&mut normalized);
+
+    let counters = normalized
+        .counter_defs
+        .iter()
+        .filter(|counter| counter.kind == "branch_outcomes")
+        .collect::<Vec<_>>();
+    assert_eq!(counters.len(), 1);
+    assert_eq!(counters[0].scope, CounterScope::This);
+    assert!(
+        matches!(
+            counters[0].site,
+            CounterSite::Runtime {
+                function_id: Some(_),
+                instr_id: Some(_),
+            }
+        ),
+        "branch outcome counter should point at the conditional test instruction"
+    );
 }

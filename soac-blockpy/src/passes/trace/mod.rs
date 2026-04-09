@@ -1,7 +1,8 @@
 use crate::block_py::{
-    core_call_expr_with_meta, literal_expr, BlockPyFunction, BlockPyModule, CallArgPositional,
-    ChildVisitable, CounterScope, CounterSite, HasMeta, IncrementCounter, InstrCodegen,
-    InstrResolved, Load, Meta, NameLocation, ResolvedName, StringLiteral, Visit, WithMeta,
+    core_call_expr_with_meta, literal_expr, BlockPyFunction, BlockPyModule, BlockTerm,
+    CallArgPositional, ChildVisitable, CounterScope, CounterSite, HasMeta, IncrementCounter,
+    InstrCodegen, InstrResolved, Load, Meta, NameLocation, ResolvedName, StringLiteral, Visit,
+    WithMeta,
 };
 use crate::passes::{CodegenModuleShape, CounterBuilder};
 use std::collections::HashMap;
@@ -37,6 +38,10 @@ pub(crate) fn call_target_counter_instrumentation_enabled() -> bool {
             !(trimmed.is_empty() || trimmed == "0")
         })
         .unwrap_or(false)
+}
+
+pub(crate) fn locality_counter_instrumentation_enabled() -> bool {
+    specialization_mode_instruments_top_values()
 }
 
 fn specialization_mode_instruments_top_values() -> bool {
@@ -356,6 +361,30 @@ pub fn instrument_bb_module_with_call_target_counters(
             counters: &mut counters,
         };
         collector.visit_fn(function);
+    }
+}
+
+pub fn instrument_bb_module_with_locality_counters(module: &mut BlockPyModule<CodegenModuleShape>) {
+    let mut counters = CounterBuilder::new(&mut module.counter_defs);
+    for function in &module.callable_defs {
+        for block in &function.blocks {
+            let BlockTerm::IfTerm(if_term) = &block.term else {
+                continue;
+            };
+            let instr_id = if_term
+                .test
+                .meta()
+                .instr_id
+                .expect("branch outcome counters require preassigned InstrId");
+            counters.define_if_missing(
+                CounterScope::This,
+                "branch_outcomes",
+                CounterSite::Runtime {
+                    function_id: Some(function.function_id),
+                    instr_id: Some(instr_id),
+                },
+            );
+        }
     }
 }
 

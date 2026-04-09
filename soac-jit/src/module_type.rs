@@ -410,7 +410,7 @@ fn counter_storage_key(counter: &CounterDef) -> PyResult<CounterStorageKey> {
 fn counter_uses_call_target_storage(counter: &CounterDef) -> bool {
     matches!(
         counter.kind.as_str(),
-        "call_hot_targets" | "operator_hot_shapes"
+        "branch_outcomes" | "call_hot_targets" | "operator_hot_shapes"
     )
 }
 
