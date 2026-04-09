@@ -138,3 +138,25 @@ benchmarked throughput delta, and the headline pre/post numbers.
 - post-change benchmark:
   - specialized pass, 1M loops x3: `313980`, `319739`, `310154 loops/s`
   - stock CPython: `552602 loops/s`
+
+## 2026-04-09 - Not landed: Cranelift Fast calling-convention experiments
+
+- jj change id: not landed
+- summary: Tried Cranelift `CallConv::Fast` on SOAC-internal ABIs. The
+  direct-body variant changed the compiled transformed-Python body and
+  matching indirect-call signatures. The runtime-helper variant changed only
+  local `soac_runtime_*` CLIF helper definitions and matching local imports.
+  Neither produced a benchmark-visible pystone win.
+- attempts:
+  - direct transformed-Python body ABI: median `313500 -> 308959 loops/s`,
+    `-1.45%`
+  - runtime CLIF helper ABI: median `313500 -> 312062 loops/s`, `-0.46%`
+- baseline benchmark:
+  - specialized pass, 1M loops x3: `313500`, `297235`, `317124 loops/s`
+  - stock CPython: `544436 loops/s`
+- direct-body Fast benchmark:
+  - specialized pass, 1M loops x3: `308959`, `318225`, `291427 loops/s`
+  - stock CPython: `523614 loops/s`
+- runtime-helper Fast benchmark:
+  - specialized pass, 1M loops x3: `316166`, `312062`, `309037 loops/s`
+  - stock CPython: `550054 loops/s`
