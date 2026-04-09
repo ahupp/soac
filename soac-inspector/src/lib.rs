@@ -7,13 +7,13 @@ use pyo3::prelude::*;
 use pyo3::types::{PyList, PyModule};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use soac_blockpy::block_py::{BlockPyFunction, FunctionId};
+use soac_blockpy::block_py::{BlockPyFunction, BlockPyModule, FunctionId};
 use soac_blockpy::passes::CodegenModuleShape;
 use soac_jit::module_constants::ModuleCodegenConstants;
 use soac_jit::module_type::build_shared_state_for_inspection;
 use soac_jit::{
-    exc_dispatch_plan, jit_param_names_for_block, lookup_blockpy_function, lookup_blockpy_module,
-    register_clif_module_plans, render_cranelift_run_bb_specialized_with_runtime_state_and_cfg,
+    exc_dispatch_plan, jit_param_names_for_block,
+    render_cranelift_run_bb_specialized_with_runtime_state_and_cfg,
 };
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
@@ -261,19 +261,18 @@ fn render_inspector_payload(source: &str, output: &soac_blockpy::LoweringResult)
     })
 }
 
-pub fn register_named_plans_from_source(source: &str, module_name: &str) -> Result<(), String> {
+pub fn lower_source_to_codegen_module(
+    source: &str,
+) -> Result<BlockPyModule<CodegenModuleShape>, String> {
     let output = lower_source_recorded(source).map_err(|err| err.error)?;
-    register_clif_module_plans(module_name, &output.codegen_module)?;
-    Ok(())
+    Ok(output.codegen_module)
 }
 
-fn register_plans_from_source(source: &str) -> Result<String, ApiError> {
-    let module_name = format!(
+fn next_web_module_name() -> String {
+    format!(
         "_dp_web_{:016x}",
         NEXT_WEB_MODULE_ID.fetch_add(1, Ordering::Relaxed)
-    );
-    register_named_plans_from_source(source, module_name.as_str()).map_err(ApiError::internal)?;
-    Ok(module_name)
+    )
 }
 
 fn inspect_pipeline_payload(source: &str) -> Result<Value, ApiError> {
@@ -281,8 +280,16 @@ fn inspect_pipeline_payload(source: &str) -> Result<Value, ApiError> {
     Ok(render_inspector_payload(source, &output))
 }
 
-pub fn jit_debug_plan(module_name: &str, function_id: FunctionId) -> Result<String, String> {
-    let Some(function) = lookup_blockpy_function(module_name, function_id) else {
+pub fn jit_debug_plan(
+    module_name: &str,
+    module: &BlockPyModule<CodegenModuleShape>,
+    function_id: FunctionId,
+) -> Result<String, String> {
+    let Some(function) = module
+        .callable_defs
+        .iter()
+        .find(|function| function.function_id == function_id)
+    else {
         return Err(format!(
             "no specialized JIT plan for {module_name}.fn#{function_id}"
         ));
@@ -294,7 +301,7 @@ pub fn jit_debug_plan(module_name: &str, function_id: FunctionId) -> Result<Stri
             (
                 block.label.to_string(),
                 jit_param_names_for_block(block),
-                exc_dispatch_plan(&function, block),
+                exc_dispatch_plan(function, block),
             )
         })
         .collect::<Vec<_>>();
@@ -303,34 +310,35 @@ pub fn jit_debug_plan(module_name: &str, function_id: FunctionId) -> Result<Stri
     ))
 }
 
-pub fn render_registered_jit_clif(
+pub fn render_jit_clif_for_module(
     repo_root: &Path,
     module_name: &str,
+    module: &BlockPyModule<CodegenModuleShape>,
     function_id: FunctionId,
 ) -> Result<JitClifResponse, String> {
-    render_registered_jit_clif_with_options(
+    render_jit_clif_for_module_with_options(
         repo_root,
         module_name,
+        module,
         function_id,
         JitClifRenderOptions::default(),
     )
 }
 
-pub fn render_registered_jit_clif_with_options(
+pub fn render_jit_clif_for_module_with_options(
     repo_root: &Path,
     module_name: &str,
+    module: &BlockPyModule<CodegenModuleShape>,
     function_id: FunctionId,
     options: JitClifRenderOptions,
 ) -> Result<JitClifResponse, String> {
-    let module = lookup_blockpy_module(module_name)
-        .ok_or_else(|| format!("no specialized JIT plan for {module_name}"))?;
     let function = module
         .callable_defs
         .iter()
         .find(|function| function.function_id == function_id)
         .cloned()
         .ok_or_else(|| format!("no specialized JIT plan for {module_name}.fn#{function_id}"))?;
-    let module_constants = ModuleCodegenConstants::collect_from_module(&module);
+    let module_constants = ModuleCodegenConstants::collect_from_module(module);
     prepare_python();
     let rendered = Python::attach(|py| {
         ensure_python_support_paths(py, repo_root).map_err(|err| err.error)?;
@@ -346,7 +354,7 @@ pub fn render_registered_jit_clif_with_options(
         unsafe {
             render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
                 &vec![std::ptr::null_mut::<c_void>(); function.blocks.len()],
-                &module,
+                module,
                 &function,
                 &module_constants,
                 runtime_state.as_deref(),
@@ -378,9 +386,11 @@ fn render_jit_clif(
     qualname: Option<&str>,
     entry_label: &str,
 ) -> Result<JitClifResponse, ApiError> {
-    let module_name = register_plans_from_source(source)?;
-    let mut rendered = render_registered_jit_clif(repo_root, module_name.as_str(), function_id)
-        .map_err(ApiError::internal)?;
+    let module_name = next_web_module_name();
+    let module = lower_source_to_codegen_module(source).map_err(ApiError::internal)?;
+    let mut rendered =
+        render_jit_clif_for_module(repo_root, module_name.as_str(), &module, function_id)
+            .map_err(ApiError::internal)?;
     rendered.resolved_entry = format!(
         "{}::__dp_fn_{}::{}",
         qualname.unwrap_or("<unknown>"),

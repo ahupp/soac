@@ -47,10 +47,7 @@ mod planning;
 mod runtime_context;
 mod specialized_helpers;
 
-pub use planning::{
-    BlockExcDispatchPlan, exc_dispatch_plan, jit_param_names_for_block, lookup_blockpy_function,
-    lookup_blockpy_module, register_clif_module_plans,
-};
+pub use planning::{BlockExcDispatchPlan, exc_dispatch_plan, jit_param_names_for_block};
 use runtime_context::{
     FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET, FUNCTION_ENV_GLOBALS_OBJ_OFFSET,
     FUNCTION_ENV_RUNTIME_OBJECTS_OFFSET, PY_FUNCTION_JIT_EXTRA_FUNCTION_ENV_OFFSET,

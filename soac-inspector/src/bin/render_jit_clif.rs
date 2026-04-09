@@ -1,7 +1,7 @@
 use soac_blockpy::block_py::FunctionId;
 use soac_inspector::{
-    JitClifRenderOptions, jit_debug_plan, register_named_plans_from_source,
-    render_registered_jit_clif_with_options,
+    JitClifRenderOptions, jit_debug_plan, lower_source_to_codegen_module,
+    render_jit_clif_for_module_with_options,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -107,15 +107,19 @@ fn main() -> Result<(), String> {
             .unwrap_or("render_jit_clif")
             .to_string()
     });
-    register_named_plans_from_source(&source, &module_name)?;
+    let module = lower_source_to_codegen_module(&source)?;
 
     if args.debug_plan {
-        eprintln!("{}", jit_debug_plan(&module_name, args.function_id)?);
+        eprintln!(
+            "{}",
+            jit_debug_plan(&module_name, &module, args.function_id)?
+        );
     }
 
-    let rendered = render_registered_jit_clif_with_options(
+    let rendered = render_jit_clif_for_module_with_options(
         &soac_inspector::repo_root(),
         &module_name,
+        &module,
         args.function_id,
         JitClifRenderOptions {
             load_runtime_specializations: args.specialized,

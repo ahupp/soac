@@ -69,7 +69,7 @@ class C:
 #     function_id: 0:5
 #     block bb1:
 #         StoreName("_dp_class_ns", _dp_class_ns_outer)
-#         return create_class("C", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 2, tuple_values())
+#         return create_class("C", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 3, tuple_values())
 
 # function _dp_module_init():
 #     function_id: 0:6
@@ -152,7 +152,7 @@ class Wrapper:
 #     function_id: 0:6
 #     block bb1:
 #         StoreName("_dp_class_ns", _dp_class_ns_outer)
-#         return create_class("Wrapper", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 2, tuple_values())
+#         return create_class("Wrapper", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 3, tuple_values())
 
 # function _dp_module_init():
 #     function_id: 0:7
@@ -189,7 +189,7 @@ class D(Base):
 #     function_id: 0:2
 #     block bb1:
 #         StoreName("_dp_class_ns", _dp_class_ns_outer)
-#         return create_class("D", _dp_class_ns_fn, tuple_values(Base), _dp_prepare_dict, FALSE, 2, tuple_values())
+#         return create_class("D", _dp_class_ns_fn, tuple_values(Base), _dp_prepare_dict, FALSE, 3, tuple_values())
 
 # function _dp_module_init():
 #     function_id: 0:3
@@ -232,7 +232,7 @@ def outer():
 #     function_id: 0:2
 #     block bb1:
 #         StoreName("_dp_class_ns", _dp_class_ns_outer)
-#         return create_class("Inner", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 5, tuple_values())
+#         return create_class("Inner", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 6, tuple_values())
 
 # function outer():
 #     function_id: 0:3
@@ -287,7 +287,7 @@ class X:
 #     function_id: 0:3
 #     block bb1:
 #         StoreName("_dp_class_ns", _dp_class_ns_outer)
-#         return create_class("X", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, TRUE, 2, tuple_values())
+#         return create_class("X", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, TRUE, 3, tuple_values())
 
 # function _dp_module_init():
 #     function_id: 0:4
@@ -325,7 +325,7 @@ class A:
 #     function_id: 0:2
 #     block bb1:
 #         StoreName("_dp_class_ns", _dp_class_ns_outer)
-#         return create_class("B", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 3, tuple_values())
+#         return create_class("B", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 4, tuple_values())
 
 # function _dp_class_ns_A(_dp_class_ns, _dp_classcell_arg):
 #     function_id: 0:3
@@ -348,7 +348,7 @@ class A:
 #     function_id: 0:4
 #     block bb1:
 #         StoreName("_dp_class_ns", _dp_class_ns_outer)
-#         return create_class("A", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 2, tuple_values())
+#         return create_class("A", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 3, tuple_values())
 
 # function _dp_module_init():
 #     function_id: 0:5
@@ -389,7 +389,7 @@ def foo():
 #     function_id: 0:2
 #     block bb1:
 #         StoreName("_dp_class_ns", _dp_class_ns_outer)
-#         return create_class("B", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 6, tuple_values())
+#         return create_class("B", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 7, tuple_values())
 
 # function foo.<locals>._dp_class_ns_A(_dp_class_ns, _dp_classcell_arg):
 #     function_id: 0:3
@@ -412,7 +412,7 @@ def foo():
 #     function_id: 0:4
 #     block bb1:
 #         StoreName("_dp_class_ns", _dp_class_ns_outer)
-#         return create_class("A", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 3, tuple_values())
+#         return create_class("A", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 4, tuple_values())
 
 # function foo():
 #     function_id: 0:5

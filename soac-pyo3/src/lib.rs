@@ -38,7 +38,6 @@ fn transform_source_with_name(source: &str, module_name: &str) -> PyResult<Strin
     let preview = source.get(..100).unwrap_or(source);
     trace!("transform_source_with_name({module_name}): {}", preview);
     let output = lower_source(source)?;
-    jit_runtime::register_lowered_module_plans(&output, module_name)?;
     Ok(rendered_ast_to_ast_source(source, &output))
 }
 

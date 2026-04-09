@@ -312,32 +312,6 @@ fn match_original_code_to_functions(
     Ok(code_by_function_id)
 }
 
-pub(crate) fn register_lowered_module_plans<P>(
-    output: &soac_blockpy::LoweringResult<P>,
-    module_name: &str,
-) -> PyResult<()> {
-    register_blockpy_module_plans(module_name, &output.codegen_module)
-}
-
-fn register_blockpy_module_plans(
-    module_name: &str,
-    module: &BlockPyModule<CodegenModuleShape>,
-) -> PyResult<()> {
-    soac_jit::register_clif_module_plans(module_name, module).map_err(|err| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!(
-            "failed to register BB plans for {module_name}: {err}"
-        ))
-    })?;
-    if module_name.ends_with(".__main__") && module_name != "__main__" {
-        soac_jit::register_clif_module_plans("__main__", module).map_err(|err| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "failed to register BB plans alias for __main__ from {module_name}: {err}"
-            ))
-        })?;
-    }
-    Ok(())
-}
-
 fn make_lazy_clif_entry<'py>(
     py: Python<'py>,
     dp: &Bound<'py, PyModule>,
@@ -1100,9 +1074,6 @@ fn exec_module_inner(
             package_name, module_data.shared_state.package_name,
             "module.__dict__['__package__'] did not match the module spec captured at create_module time"
         );
-        time_phase(exec_timings, "register_blockpy_module_plans", || {
-            register_blockpy_module_plans(&module_name, &module_data.shared_state.lowered_module)
-        })?;
         let function =
             lookup_module_init_function(&module_data.shared_state.lowered_module, &module_name)?;
         let is_soac_runtime = module_name == "soac.runtime";

@@ -2,9 +2,8 @@ use pyo3::prelude::*;
 use pyo3::types::PyModule;
 use soac_blockpy::block_py::FunctionKind;
 use soac_jit::{
-    exc_dispatch_plan, jit_param_names_for_block, lookup_blockpy_function,
+    exc_dispatch_plan, jit_param_names_for_block,
     module_type::{hash_module_source, indexed_module_info},
-    register_clif_module_plans,
 };
 use std::any::Any;
 use std::collections::HashSet;
@@ -112,15 +111,11 @@ def outer(scale):
     "#;
     let result = parse_and_lower(source).expect("lowering should succeed");
     let normalized = result.codegen_module.clone();
-    let module_name = "jit_plan_slot_inventory_test";
-    register_clif_module_plans(module_name, &normalized).expect("plan registration should succeed");
     let inner_function = normalized
         .callable_defs
         .iter()
         .find(|function| function.names.bind_name == "inner")
         .expect("missing lowered inner function");
-    let registered_function = lookup_blockpy_function(module_name, inner_function.function_id)
-        .expect("registered plan should exist");
     let storage_layout = inner_function
         .storage_layout()
         .as_ref()
@@ -168,7 +163,6 @@ def outer(scale):
         "slot inventory should not duplicate names: {:?}",
         slot_names
     );
-    assert_eq!(registered_function.params, inner_function.params);
 }
 
 #[test]
@@ -330,15 +324,12 @@ def exercise():
     "#;
     let result = parse_and_lower_runtime_style(source).expect("lowering should succeed");
     let normalized = result.codegen_module.clone();
-    let module_name = "jit_plan_generator_throw_handler_param_test";
-    register_clif_module_plans(module_name, &normalized).expect("plan registration should succeed");
     let gen_function = normalized
         .callable_defs
         .iter()
         .find(|function| function.names.bind_name == "gen_resume")
         .expect("missing lowered generator resume function");
-    let registered_function = lookup_blockpy_function(module_name, gen_function.function_id)
-        .expect("registered plan should exist");
+    let registered_function = gen_function;
     let plan_runtime_param_names = registered_function
         .blocks
         .iter()
@@ -347,7 +338,7 @@ def exercise():
     let plan_exc_dispatches = registered_function
         .blocks
         .iter()
-        .map(|block| exc_dispatch_plan(&registered_function, block))
+        .map(|block| exc_dispatch_plan(registered_function, block))
         .collect::<Vec<_>>();
 
     let handler_entry_targets = plan_runtime_param_names
