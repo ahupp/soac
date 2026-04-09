@@ -12,9 +12,8 @@ from tests._integration import integration_module
 def test_counter_dump_file_is_written_on_module_exit(tmp_path, monkeypatch):
     work_dir = tmp_path / "soac-work"
     dump_path = work_dir / "profile.bin"
-    monkeypatch.setenv("DIET_PYTHON_GLOBAL_LOAD_COUNTERS", "1")
-    monkeypatch.setenv("SOAC_MODE", "profile")
     monkeypatch.setenv("SOAC_WORK_DIR", str(work_dir))
+    monkeypatch.setenv("SOAC_OPT_MODE", "profile")
 
     source = """
 VALUE = 7
@@ -138,7 +137,7 @@ def read():
 
 def test_soac_work_dir_is_default_event_log_dir(tmp_path):
     work_dir = tmp_path / "soac-work"
-    log_path = work_dir / "soac_events.jsonl"
+    log_path = work_dir / "events.jsonl"
     module_path = tmp_path / "work_dir_log_case.py"
     module_path.write_text("def read():\n    return 11\n", encoding="utf-8")
     env = {

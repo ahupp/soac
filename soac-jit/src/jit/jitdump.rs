@@ -92,12 +92,11 @@ mod imp {
 
     unsafe impl Send for JitDumpSession {}
 
-    static JITDUMP_SESSION: OnceLock<Result<Option<Mutex<JitDumpSession>>, String>> =
-        OnceLock::new();
+    static JITDUMP_SESSION: OnceLock<Result<Mutex<JitDumpSession>, String>> = OnceLock::new();
 
     impl JitDumpSession {
         fn new() -> Result<Self, String> {
-            let dump_dir = env::var_os("SOAC_JIT_JITDUMP_DIR")
+            let dump_dir = env::var_os("SOAC_WORK_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/tmp"));
             Self::new_in_dir(&dump_dir)
@@ -259,15 +258,10 @@ mod imp {
         isa: &dyn TargetIsa,
         unwind_info: Option<&SystemVUnwindInfo>,
     ) -> Result<(), String> {
-        let session = JITDUMP_SESSION.get_or_init(|| {
-            if env::var_os("PERF_BUILDID_DIR").is_none() {
-                return Ok(None);
-            }
-            Ok(Some(Mutex::new(JitDumpSession::new()?)))
-        });
-        let Some(session) = session.as_ref().map_err(|err| err.clone())? else {
-            return Ok(());
-        };
+        let session = JITDUMP_SESSION
+            .get_or_init(|| Ok(Mutex::new(JitDumpSession::new()?)))
+            .as_ref()
+            .map_err(|err| err.clone())?;
         let mut session = session
             .lock()
             .map_err(|_| "jitdump session lock poisoned".to_string())?;

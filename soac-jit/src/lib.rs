@@ -1314,36 +1314,6 @@ unsafe fn register_owner_types_from_type(
     let mut value = ptr::null_mut();
     while ffi::PyDict_Next(dict, &mut pos, &mut key, &mut value) != 0 {
         if ffi::PyFunction_Check(value) != 0 {
-            if std::env::var_os("DIET_PYTHON_DEBUG_DIRECT_METHOD_SPECIALIZATIONS").is_some() {
-                let key_repr = ffi::PyObject_Repr(key);
-                let key_text = if key_repr.is_null() {
-                    "<repr error>".to_string()
-                } else {
-                    let text = std::ffi::CStr::from_ptr(ffi::PyUnicode_AsUTF8(key_repr))
-                        .to_string_lossy()
-                        .into_owned();
-                    ffi::Py_DECREF(key_repr);
-                    text
-                };
-                let owner_repr = ffi::PyObject_Repr(owner_type as *mut ffi::PyObject);
-                let owner_text = if owner_repr.is_null() {
-                    "<repr error>".to_string()
-                } else {
-                    let text = std::ffi::CStr::from_ptr(ffi::PyUnicode_AsUTF8(owner_repr))
-                        .to_string_lossy()
-                        .into_owned();
-                    ffi::Py_DECREF(owner_repr);
-                    text
-                };
-                let function_id = registered_clif_function_id(value)
-                    .ok()
-                    .flatten()
-                    .map(|id| id.to_string())
-                    .unwrap_or_else(|| "<none>".to_string());
-                eprintln!(
-                    "direct-method-register owner={owner_text} method={key_text} function_id={function_id}"
-                );
-            }
             if ffi::PyUnicode_Check(key) != 0
                 && ffi::PyUnicode_CompareWithASCIIString(key, c"__init__".as_ptr()) == 0
             {
@@ -1376,8 +1346,6 @@ unsafe fn register_function_owner_types_for_globals(
     globals: *mut ffi::PyObject,
     module_name: *mut ffi::PyObject,
 ) -> Result<(), ()> {
-    let debug_direct_methods =
-        std::env::var_os("DIET_PYTHON_DEBUG_DIRECT_METHOD_SPECIALIZATIONS").is_some();
     if globals.is_null() {
         if ffi::PyErr_Occurred().is_null() {
             ffi::PyErr_SetString(
@@ -1394,38 +1362,12 @@ unsafe fn register_function_owner_types_for_globals(
         );
         return Err(());
     }
-    if debug_direct_methods {
-        let module_name_repr = ffi::PyObject_Repr(module_name);
-        let module_name_text = if module_name_repr.is_null() {
-            "<repr error>".to_string()
-        } else {
-            let text = std::ffi::CStr::from_ptr(ffi::PyUnicode_AsUTF8(module_name_repr))
-                .to_string_lossy()
-                .into_owned();
-            ffi::Py_DECREF(module_name_repr);
-            text
-        };
-        eprintln!("direct-method-register module={module_name_text}");
-    }
     let mut visited_types = HashSet::new();
     let mut pos: ffi::Py_ssize_t = 0;
     let mut key = ptr::null_mut();
     let mut value = ptr::null_mut();
     while ffi::PyDict_Next(globals, &mut pos, &mut key, &mut value) != 0 {
         if ffi::PyType_Check(value) != 0 {
-            if debug_direct_methods {
-                let type_repr = ffi::PyObject_Repr(value);
-                let type_text = if type_repr.is_null() {
-                    "<repr error>".to_string()
-                } else {
-                    let text = std::ffi::CStr::from_ptr(ffi::PyUnicode_AsUTF8(type_repr))
-                        .to_string_lossy()
-                        .into_owned();
-                    ffi::Py_DECREF(type_repr);
-                    text
-                };
-                eprintln!("direct-method-register found-type {type_text}");
-            }
             register_owner_types_from_type(
                 value as *mut ffi::PyTypeObject,
                 module_name,

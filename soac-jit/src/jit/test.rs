@@ -12,6 +12,7 @@ use soac_blockpy::passes::{
 };
 mod tests {
     use super::*;
+    use crate::counter_dump::{CounterDumpRecord, CounterDumpRow, write_counter_dump_records};
     use pyo3::types::PyAnyMethods;
     use pyo3::{Python, ffi};
     use ruff_python_ast as ast;
@@ -150,6 +151,11 @@ mod tests {
         staging_dir
     }
 
+    fn write_test_counter_dump(path: &Path, record: &CounterDumpRecord) {
+        write_counter_dump_records(path, std::iter::once(record))
+            .expect("test counter dump should be writable");
+    }
+
     fn assign_stmt(target: ResolvedName, value: InstrCodegen) -> InstrCodegen {
         expr_stmt(op_expr(Store::new(target, value)))
     }
@@ -251,26 +257,39 @@ mod tests {
         specializations: &[(InstrId, FunctionId)],
     ) -> String {
         let module_name = "counter_test";
-        let function_id = function.function_id.packed();
-        let specialization_value = specializations
-            .iter()
-            .map(|(instr_id, target_function_id)| {
-                format!(
-                    "{module_name}|{function_id}|{}|{}={}",
-                    instr_id.block_label().as_u32(),
-                    instr_id.instr_index_in_block(),
-                    target_function_id.packed(),
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(";");
+        let soac_work_dir = ensure_test_extension_staging_dir();
+        write_test_counter_dump(
+            soac_work_dir.join("profile.bin").as_path(),
+            &CounterDumpRecord {
+                module_name: module_name.to_string(),
+                package_name: None,
+                rows: specializations
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (instr_id, target_function_id))| CounterDumpRow {
+                        counter_id: u32::try_from(index)
+                            .expect("test specialization count should fit in u32"),
+                        scope: "this".to_string(),
+                        kind: "call_hot_targets".to_string(),
+                        site_kind: "runtime".to_string(),
+                        function_id: Some(function.function_id),
+                        current_function_id: Some(function.function_id),
+                        instr_id: Some(*instr_id),
+                        function_qualname: Some(function.names.qualname.clone()),
+                        block_label: None,
+                        value: 1,
+                        observed_value: Some(target_function_id.packed()),
+                        max_overcount: Some(0),
+                    })
+                    .collect(),
+                module_keys: Vec::new(),
+                type_keys: Vec::new(),
+            },
+        );
 
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        let old_call_target_specializations =
-            std::env::var_os("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS");
-        let old_operator_specializations = std::env::var_os("DIET_PYTHON_OPERATOR_SPECIALIZATIONS");
         let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
-        let old_call_target_counters = std::env::var_os("DIET_PYTHON_CALL_TARGET_COUNTERS");
+        let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
         let old_pythonhome = std::env::var_os("PYTHONHOME");
         let old_pythonpath = std::env::var_os("PYTHONPATH");
         let python_home = vendored_python_home();
@@ -278,16 +297,12 @@ mod tests {
             python_home.join("Lib"),
             vendored_python_build_lib_dir(),
             repo_root().join("soac_py").join("src"),
+            soac_work_dir.clone(),
         ])
         .expect("test PYTHONPATH should join");
         unsafe {
-            std::env::set_var(
-                "DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS",
-                specialization_value.as_str(),
-            );
-            std::env::remove_var("DIET_PYTHON_OPERATOR_SPECIALIZATIONS");
-            std::env::remove_var("SOAC_WORK_DIR");
-            std::env::remove_var("DIET_PYTHON_CALL_TARGET_COUNTERS");
+            std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
+            std::env::set_var("SOAC_OPT_MODE", "apply");
             std::env::set_var("PYTHONHOME", &python_home);
             std::env::set_var("PYTHONPATH", python_path);
         }
@@ -329,21 +344,13 @@ mod tests {
         };
 
         unsafe {
-            match old_call_target_specializations {
-                Some(value) => std::env::set_var("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS", value),
-                None => std::env::remove_var("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS"),
-            }
-            match old_operator_specializations {
-                Some(value) => std::env::set_var("DIET_PYTHON_OPERATOR_SPECIALIZATIONS", value),
-                None => std::env::remove_var("DIET_PYTHON_OPERATOR_SPECIALIZATIONS"),
-            }
             match old_soac_work_dir {
                 Some(value) => std::env::set_var("SOAC_WORK_DIR", value),
                 None => std::env::remove_var("SOAC_WORK_DIR"),
             }
-            match old_call_target_counters {
-                Some(value) => std::env::set_var("DIET_PYTHON_CALL_TARGET_COUNTERS", value),
-                None => std::env::remove_var("DIET_PYTHON_CALL_TARGET_COUNTERS"),
+            match old_soac_opt_mode {
+                Some(value) => std::env::set_var("SOAC_OPT_MODE", value),
+                None => std::env::remove_var("SOAC_OPT_MODE"),
             }
             match old_pythonhome {
                 Some(value) => std::env::set_var("PYTHONHOME", value),
@@ -365,25 +372,39 @@ mod tests {
         operator_specializations: &[(InstrId, u64)],
     ) -> String {
         let module_name = "counter_test";
-        let function_id = function.function_id.packed();
-        let specialization_value = operator_specializations
-            .iter()
-            .map(|(instr_id, shape)| {
-                format!(
-                    "{module_name}|{function_id}|{}|{}={shape}",
-                    instr_id.block_label().as_u32(),
-                    instr_id.instr_index_in_block(),
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(";");
+        let soac_work_dir = ensure_test_extension_staging_dir();
+        write_test_counter_dump(
+            soac_work_dir.join("profile.bin").as_path(),
+            &CounterDumpRecord {
+                module_name: module_name.to_string(),
+                package_name: None,
+                rows: operator_specializations
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (instr_id, shape))| CounterDumpRow {
+                        counter_id: u32::try_from(index)
+                            .expect("test specialization count should fit in u32"),
+                        scope: "this".to_string(),
+                        kind: "operator_hot_shapes".to_string(),
+                        site_kind: "runtime".to_string(),
+                        function_id: Some(function.function_id),
+                        current_function_id: Some(function.function_id),
+                        instr_id: Some(*instr_id),
+                        function_qualname: Some(function.names.qualname.clone()),
+                        block_label: None,
+                        value: 1,
+                        observed_value: Some(*shape),
+                        max_overcount: Some(0),
+                    })
+                    .collect(),
+                module_keys: Vec::new(),
+                type_keys: Vec::new(),
+            },
+        );
 
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        let old_operator_specializations = std::env::var_os("DIET_PYTHON_OPERATOR_SPECIALIZATIONS");
-        let old_call_target_specializations =
-            std::env::var_os("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS");
         let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
-        let old_call_target_counters = std::env::var_os("DIET_PYTHON_CALL_TARGET_COUNTERS");
+        let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
         let old_pythonhome = std::env::var_os("PYTHONHOME");
         let old_pythonpath = std::env::var_os("PYTHONPATH");
         let python_home = vendored_python_home();
@@ -391,16 +412,12 @@ mod tests {
             python_home.join("Lib"),
             vendored_python_build_lib_dir(),
             repo_root().join("soac_py").join("src"),
+            soac_work_dir.clone(),
         ])
         .expect("test PYTHONPATH should join");
         unsafe {
-            std::env::set_var(
-                "DIET_PYTHON_OPERATOR_SPECIALIZATIONS",
-                specialization_value.as_str(),
-            );
-            std::env::remove_var("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS");
-            std::env::remove_var("SOAC_WORK_DIR");
-            std::env::remove_var("DIET_PYTHON_CALL_TARGET_COUNTERS");
+            std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
+            std::env::set_var("SOAC_OPT_MODE", "apply");
             std::env::set_var("PYTHONHOME", &python_home);
             std::env::set_var("PYTHONPATH", python_path);
         }
@@ -446,21 +463,13 @@ mod tests {
         };
 
         unsafe {
-            match old_operator_specializations {
-                Some(value) => std::env::set_var("DIET_PYTHON_OPERATOR_SPECIALIZATIONS", value),
-                None => std::env::remove_var("DIET_PYTHON_OPERATOR_SPECIALIZATIONS"),
-            }
-            match old_call_target_specializations {
-                Some(value) => std::env::set_var("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS", value),
-                None => std::env::remove_var("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS"),
-            }
             match old_soac_work_dir {
                 Some(value) => std::env::set_var("SOAC_WORK_DIR", value),
                 None => std::env::remove_var("SOAC_WORK_DIR"),
             }
-            match old_call_target_counters {
-                Some(value) => std::env::set_var("DIET_PYTHON_CALL_TARGET_COUNTERS", value),
-                None => std::env::remove_var("DIET_PYTHON_CALL_TARGET_COUNTERS"),
+            match old_soac_opt_mode {
+                Some(value) => std::env::set_var("SOAC_OPT_MODE", value),
+                None => std::env::remove_var("SOAC_OPT_MODE"),
             }
             match old_pythonhome {
                 Some(value) => std::env::set_var("PYTHONHOME", value),
@@ -2070,22 +2079,22 @@ def f():
     #[test]
     fn render_specialized_jit_type_constructors_use_constructor_fast_path() {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        let old_call_target_specializations =
-            std::env::var_os("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS");
         let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
-        let old_call_target_counters = std::env::var_os("DIET_PYTHON_CALL_TARGET_COUNTERS");
+        let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
         let old_pythonhome = std::env::var_os("PYTHONHOME");
         let old_pythonpath = std::env::var_os("PYTHONPATH");
         let python_home = vendored_python_home();
+        let soac_work_dir = ensure_test_extension_staging_dir();
         let python_path = std::env::join_paths([
             python_home.join("Lib"),
             vendored_python_build_lib_dir(),
             repo_root().join("soac_py").join("src"),
+            soac_work_dir.clone(),
         ])
         .expect("test PYTHONPATH should join");
         unsafe {
-            std::env::remove_var("SOAC_WORK_DIR");
-            std::env::remove_var("DIET_PYTHON_CALL_TARGET_COUNTERS");
+            std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
+            std::env::set_var("SOAC_OPT_MODE", "apply");
             std::env::set_var("PYTHONHOME", &python_home);
             std::env::set_var("PYTHONPATH", python_path);
         }
@@ -2175,16 +2184,28 @@ def f():
                     module_constants: constants.module_constants,
                     counter_defs: Vec::new(),
                 };
-                let specialization_value = format!(
-                    "counter_test|{}|{}|{}={}",
-                    caller_function.function_id.packed(),
-                    call_instr_id.block_label().as_u32(),
-                    call_instr_id.instr_index_in_block(),
-                    init_function.function_id.packed(),
-                );
-                std::env::set_var(
-                    "DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS",
-                    specialization_value,
+                write_test_counter_dump(
+                    soac_work_dir.join("profile.bin").as_path(),
+                    &CounterDumpRecord {
+                        module_name: "counter_test".to_string(),
+                        package_name: None,
+                        rows: vec![CounterDumpRow {
+                            counter_id: 0,
+                            scope: "this".to_string(),
+                            kind: "call_hot_targets".to_string(),
+                            site_kind: "runtime".to_string(),
+                            function_id: Some(caller_function.function_id),
+                            current_function_id: Some(caller_function.function_id),
+                            instr_id: Some(call_instr_id),
+                            function_qualname: Some(caller_function.names.qualname.clone()),
+                            block_label: None,
+                            value: 1,
+                            observed_value: Some(init_function.function_id.packed()),
+                            max_overcount: Some(0),
+                        }],
+                        module_keys: Vec::new(),
+                        type_keys: Vec::new(),
+                    },
                 );
 
                 let shared_state = crate::module_type::build_shared_state_for_testing(
@@ -2268,19 +2289,13 @@ def f():
             })
         };
 
-        match old_call_target_specializations {
-            Some(value) => unsafe {
-                std::env::set_var("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS", value)
-            },
-            None => unsafe { std::env::remove_var("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS") },
-        }
         match old_soac_work_dir {
             Some(value) => unsafe { std::env::set_var("SOAC_WORK_DIR", value) },
             None => unsafe { std::env::remove_var("SOAC_WORK_DIR") },
         }
-        match old_call_target_counters {
-            Some(value) => unsafe { std::env::set_var("DIET_PYTHON_CALL_TARGET_COUNTERS", value) },
-            None => unsafe { std::env::remove_var("DIET_PYTHON_CALL_TARGET_COUNTERS") },
+        match old_soac_opt_mode {
+            Some(value) => unsafe { std::env::set_var("SOAC_OPT_MODE", value) },
+            None => unsafe { std::env::remove_var("SOAC_OPT_MODE") },
         }
         match old_pythonhome {
             Some(value) => unsafe { std::env::set_var("PYTHONHOME", value) },

@@ -222,11 +222,11 @@ instance's live working commit.
   against stock CPython. Report the specialized second-pass throughput
   as the transformed result unless I explicitly ask for the warm
   unspecialized baseline.
-- `SOAC_WORK_DIR` / `SOAC_MODE`
+- `SOAC_WORK_DIR` / `SOAC_OPT_MODE`
   Normal specialization runs use one work directory with conventional
   files: `profile.bin` for specialization input, `verify.bin` for the
-  countered verification pass, and `soac_events.jsonl` for default JSON
-  tracing output. Set `SOAC_MODE=profile`, `verify`, or `apply`; recipes
+  countered verification pass, and `events.jsonl` for default JSON
+  tracing output. Set `SOAC_OPT_MODE=profile`, `verify`, or `apply`; recipes
   should pass the same `SOAC_WORK_DIR` and change only the mode between
   passes.
 - `BENCHMARK_CPU` / `BENCHMARK_CONSTANT_CLOCKS`
@@ -252,12 +252,7 @@ instance's live working commit.
   of formatted stderr. Module-load timing is emitted by the
   `soac_module_load` target; JIT-codegen timing is emitted by
   `soac_jit_codegen`. When `SOAC_LOG` is unset and `SOAC_WORK_DIR` is
-  set, the default event log is `$SOAC_WORK_DIR/soac_events.jsonl`.
-- `DIET_PYTHON_KEY_LAYOUT_COUNTERS`
-  Enables cold module/type key-layout records in the counter dump. This
-  is metadata collection, not a hot increment counter: module keys are
-  copied from lowered module globals, and type keys are collected through
-  the vendored CPython split-key watcher.
+  set, the default event log is `$SOAC_WORK_DIR/events.jsonl`.
 - `SOAC_OPT_UNSOUND`
   Enables intentionally unsound performance experiments. The benchmark
   and pytest correctness recipes default this to `1`; xfail tests that

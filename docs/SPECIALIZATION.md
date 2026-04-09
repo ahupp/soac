@@ -49,8 +49,7 @@ The hot streams consumed by the current replay path are:
 The cold metadata stream records dictionary-key layouts for replay:
 
 - `module_keys`
-  - Recorded when `DIET_PYTHON_KEY_LAYOUT_COUNTERS=1`, or implicitly
-    when `DIET_PYTHON_CALL_TARGET_COUNTERS=1`.
+  - Recorded in `SOAC_OPT_MODE=profile|verify`.
   - Contains the lowered module global-name table as
     `(module_name, key, index)` entries.
   - Consumed from the binary counter dump with
@@ -78,23 +77,22 @@ Verify-mode indexed-storage counters are scalar per-site counters:
 Normal multi-pass runs use one work directory and one mode:
 
 - `SOAC_WORK_DIR=/path/to/dir`
-- `SOAC_MODE=profile`
+- `SOAC_OPT_MODE=profile`
   - run unspecialized
   - instrument specialization-input counters
   - write `/path/to/dir/profile.bin`
-- `SOAC_MODE=verify`
+- `SOAC_OPT_MODE=verify`
   - read `/path/to/dir/profile.bin`
   - apply specializations
   - instrument specialization-input counters
   - write `/path/to/dir/verify.bin`
-- `SOAC_MODE=apply`
+- `SOAC_OPT_MODE=apply`
   - read `/path/to/dir/profile.bin`
   - apply specializations
   - emit no specialization-input counters
 
 The JIT loads hot profile input from `$SOAC_WORK_DIR/profile.bin` in
-apply/verify mode unless an explicit specialization override env var is
-present:
+apply/verify mode:
 
 - `load_call_target_specializations`, at
   `soac-jit/src/jit/mod.rs:1966`

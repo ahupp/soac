@@ -76,7 +76,7 @@ fn print_usage() {
         "usage: render_jit_clif <source> <function_id> [--module-name NAME] [--cfg-dot-out PATH] [--debug-plan] [--specialized]"
     );
     eprintln!(
-        "       --specialized renders the second-pass shape using SOAC_WORK_DIR + SOAC_MODE=apply or explicit specialization env"
+        "       --specialized renders the second-pass shape using SOAC_WORK_DIR + SOAC_OPT_MODE=apply"
     );
 }
 

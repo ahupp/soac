@@ -19,25 +19,8 @@ pub(crate) fn parse_trace_env() -> Option<TraceConfig> {
     parse_trace_config(raw.as_str())
 }
 
-pub(crate) fn global_load_counter_instrumentation_enabled() -> bool {
-    env::var("DIET_PYTHON_GLOBAL_LOAD_COUNTERS")
-        .map(|raw| {
-            let trimmed = raw.trim();
-            !(trimmed.is_empty() || trimmed == "0")
-        })
-        .unwrap_or(false)
-}
-
 pub(crate) fn call_target_counter_instrumentation_enabled() -> bool {
-    if specialization_mode_instruments_top_values() {
-        return true;
-    }
-    env::var("DIET_PYTHON_CALL_TARGET_COUNTERS")
-        .map(|raw| {
-            let trimmed = raw.trim();
-            !(trimmed.is_empty() || trimmed == "0")
-        })
-        .unwrap_or(false)
+    specialization_mode_instruments_top_values()
 }
 
 pub(crate) fn locality_counter_instrumentation_enabled() -> bool {
@@ -45,7 +28,7 @@ pub(crate) fn locality_counter_instrumentation_enabled() -> bool {
 }
 
 fn specialization_mode_instruments_top_values() -> bool {
-    env::var("SOAC_MODE")
+    env::var("SOAC_OPT_MODE")
         .map(|raw| matches!(raw.trim(), "profile" | "verify"))
         .unwrap_or(false)
 }

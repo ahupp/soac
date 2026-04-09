@@ -99,7 +99,7 @@ fn parse_soac_log_env() -> SoacLogConfig {
     }
     if raw.trim().is_empty() {
         if let Some(work_dir) = soac_work_dir_from_env() {
-            json_path = Some(work_dir.join("soac_events.jsonl"));
+            json_path = Some(work_dir.join("events.jsonl"));
             filter_segments.push(DEFAULT_SOAC_JSON_LOG_FILTER);
         }
     }

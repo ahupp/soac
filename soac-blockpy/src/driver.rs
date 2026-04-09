@@ -210,26 +210,15 @@ pub(crate) fn rewrite_module_with_tracker_with_options(
             bb_codegen
         };
 
-    let bb_counted: BlockPyModule<CodegenModuleShape> =
-        if passes::global_load_counter_instrumentation_enabled() {
-            pass_tracker.run_pass("bb_global_load_counters", || {
-                let mut counted = bb_traced;
-                passes::instrument_bb_module_with_global_load_counters(&mut counted);
-                counted
-            })
-        } else {
-            bb_traced
-        };
-
     let bb_call_target_counted: BlockPyModule<CodegenModuleShape> =
         if passes::call_target_counter_instrumentation_enabled() {
             pass_tracker.run_pass("bb_call_target_counters", || {
-                let mut counted = bb_counted;
+                let mut counted = bb_traced;
                 passes::instrument_bb_module_with_call_target_counters(&mut counted);
                 counted
             })
         } else {
-            bb_counted
+            bb_traced
         };
 
     let bb_locality_counted: BlockPyModule<CodegenModuleShape> =

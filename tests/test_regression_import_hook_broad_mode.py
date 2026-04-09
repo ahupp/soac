@@ -199,7 +199,7 @@ assert isinstance(runtime.AsyncGenComplete(), Exception)
         env={
             **env,
             "SOAC_WORK_DIR": str(tmp_path / "runtime-profile-counters"),
-            "SOAC_MODE": "profile",
+            "SOAC_OPT_MODE": "profile",
         },
         text=True,
     )

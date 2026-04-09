@@ -298,7 +298,7 @@ run-and-view-speedscope loops="500000" counters_dir="" output_prefix="logs/pysto
 
   cd "$REPO_ROOT"
   SOAC_WORK_DIR="$COUNTERS_DIR" \
-  SOAC_MODE=apply \
+  SOAC_OPT_MODE=apply \
     just perf-pystone-jit-warm "{{loops}}" "{{output_prefix}}"
 
   just view-speedscope "{{output_prefix}}_speedscope.json"
@@ -316,10 +316,7 @@ perf-pystone-jit-warm loops="500000" output_prefix="logs/pystone_jit_perf_warm":
   PERF_CALL_GRAPH="${PERF_CALL_GRAPH:-dwarf,65528}"
   PERF_PERCENT_LIMIT="${PERF_PERCENT_LIMIT:-0.5}"
   PERF_HELPER_FRAMES="${SOAC_JIT_PERF_HELPER_FRAMES:-1}"
-  PERF_BUILDID_DIR="${PERF_BUILDID_DIR:-$REPO_ROOT/tmp/perf-buildid}"
   SOAC_OPT_UNSOUND="${SOAC_OPT_UNSOUND:-1}"
-
-  mkdir -p "${PERF_BUILDID_DIR}"
 
   PERF_DATA_BASENAME="$(basename "${OUTPUT_PREFIX}").data"
   PERF_DATA="$REPO_ROOT/tmp/${PERF_DATA_BASENAME}"
@@ -371,7 +368,6 @@ perf-pystone-jit-warm loops="500000" output_prefix="logs/pystone_jit_perf_warm":
   echo "report by dso/symbol: ${REPORT_DSO_SYMBOLS}"
   echo "report callgraph: ${REPORT_CALLGRAPH}"
   echo "report speedscope: ${REPORT_SPEEDSCOPE}"
-  echo "perf buildid dir: ${PERF_BUILDID_DIR}"
   echo "perf helper frames: ${PERF_HELPER_FRAMES}"
 
   cd "$REPO_ROOT"
@@ -388,7 +384,6 @@ perf-pystone-jit-warm loops="500000" output_prefix="logs/pystone_jit_perf_warm":
   env \
     LOOPS="${LOOPS}" \
     WARMUP_LOOPS="${WARMUP_LOOPS}" \
-    PERF_BUILDID_DIR="${PERF_BUILDID_DIR}" \
     SOAC_OPT_UNSOUND="${SOAC_OPT_UNSOUND}" \
     SOAC_JIT_PERF_HELPER_FRAMES="${PERF_HELPER_FRAMES}" \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -531,11 +526,11 @@ perf-pystone-jit-specialized loops="500000" output_prefix="logs/pystone_jit_perf
   LOOPS="${SPECIALIZATION_PROFILE_LOOPS}" \
   WARMUP_LOOPS="${WARMUP_LOOPS}" \
   SOAC_WORK_DIR="$counters_dir" \
-  SOAC_MODE=profile \
+  SOAC_OPT_MODE=profile \
     "$REPO_ROOT/.venv/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)' >/tmp/soac_perf_specialization_profile.out 2>&1
 
   SOAC_WORK_DIR="$counters_dir" \
-  SOAC_MODE=apply \
+  SOAC_OPT_MODE=apply \
     just perf-pystone-jit-warm "{{loops}}" "{{output_prefix}}"
 
 [private]
@@ -554,7 +549,7 @@ _pytest-run *args='': ensure-venv
     exit 0
   fi
 
-  SOAC_PYTEST_EVENTS_LOG="$REPO_ROOT/logs/pytest_soac_events.jsonl"
+  SOAC_PYTEST_EVENTS_LOG="$REPO_ROOT/logs/pytest_events.jsonl"
   if [[ -z "${SOAC_LOG:-}" ]]; then
     rm -f "$SOAC_PYTEST_EVENTS_LOG"
     export SOAC_LOG="soac_jit=info,soac_module_load=info,soac_jit_codegen=info;json=$SOAC_PYTEST_EVENTS_LOG"
@@ -763,7 +758,7 @@ benchmark-verify loops="100000" counters_dir="": (update-venv) (build-extension 
     echo "counter profile not found at $COUNTERS_DIR/profile.bin; run 'just benchmark' first or pass counters_dir=<dir>" >&2
     exit 1
   fi
-  rm -f "$COUNTERS_DIR/soac_events.jsonl"
+  rm -f "$COUNTERS_DIR/events.jsonl"
   rm -f "$COUNTERS_DIR/verify.bin"
 
   echo "jit transformed verify pass"
@@ -776,10 +771,10 @@ benchmark-verify loops="100000" counters_dir="": (update-venv) (build-extension 
   BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
   SOAC_OPT_UNSOUND="${SOAC_OPT_UNSOUND}" \
   SOAC_WORK_DIR="$COUNTERS_DIR" \
-  SOAC_MODE=verify \
+  SOAC_OPT_MODE=verify \
     "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
   echo "verification counters: $COUNTERS_DIR/verify.bin"
-  echo "SOAC events log: $COUNTERS_DIR/soac_events.jsonl"
+  echo "SOAC events log: $COUNTERS_DIR/events.jsonl"
 
 benchmark-warm loops="8000000": (update-venv) (build-extension "release")
   #!/usr/bin/env bash
@@ -799,7 +794,7 @@ benchmark-warm loops="8000000": (update-venv) (build-extension "release")
   cd "$REPO_ROOT"
 
   echo "jit transformed warm"
-  SOAC_WARM_EVENTS_LOG="$REPO_ROOT/logs/benchmark_warm_soac_events.jsonl"
+  SOAC_WARM_EVENTS_LOG="$REPO_ROOT/logs/benchmark_warm_events.jsonl"
   if [[ -z "${SOAC_LOG:-}" ]]; then
     rm -f "$SOAC_WARM_EVENTS_LOG"
     export SOAC_LOG="soac_jit=info,soac_module_load=info,soac_jit_codegen=info;json=$SOAC_WARM_EVENTS_LOG"
@@ -841,7 +836,7 @@ benchmark loops="8000000": (update-venv) (build-extension "release")
 
   cd "$REPO_ROOT"
   mkdir -p "$LAST_BENCHMARK_COUNTERS_DIR"
-  SOAC_BENCHMARK_EVENTS_LOG="$LAST_BENCHMARK_COUNTERS_DIR/soac_events.jsonl"
+  SOAC_BENCHMARK_EVENTS_LOG="$LAST_BENCHMARK_COUNTERS_DIR/events.jsonl"
   counter_dump_path="$LAST_BENCHMARK_COUNTERS_DIR/profile.bin"
   rm -f "$LAST_BENCHMARK_COUNTERS_DIR/profile.bin" "$LAST_BENCHMARK_COUNTERS_DIR/verify.bin" "$SOAC_BENCHMARK_EVENTS_LOG"
 
@@ -852,7 +847,7 @@ benchmark loops="8000000": (update-venv) (build-extension "release")
   BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
   SOAC_OPT_UNSOUND="${SOAC_OPT_UNSOUND}" \
   SOAC_WORK_DIR="$LAST_BENCHMARK_COUNTERS_DIR" \
-  SOAC_MODE=profile \
+  SOAC_OPT_MODE=profile \
     "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
 
   echo "last benchmark counters dir: $LAST_BENCHMARK_COUNTERS_DIR"
@@ -870,7 +865,7 @@ benchmark loops="8000000": (update-venv) (build-extension "release")
       BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
       SOAC_OPT_UNSOUND="${SOAC_OPT_UNSOUND}" \
       SOAC_WORK_DIR="$LAST_BENCHMARK_COUNTERS_DIR" \
-      SOAC_MODE=apply \
+      SOAC_OPT_MODE=apply \
         "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
     done
   else

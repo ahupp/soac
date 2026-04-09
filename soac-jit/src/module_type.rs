@@ -660,31 +660,14 @@ impl SoacExtModuleState {
 }
 
 pub fn key_layout_counter_enabled() -> bool {
-    if specialization_mode_records_counters() {
-        return true;
-    }
-    env_flag_enabled("DIET_PYTHON_KEY_LAYOUT_COUNTERS")
-        || env_flag_enabled("DIET_PYTHON_CALL_TARGET_COUNTERS")
+    specialization_mode_records_counters()
 }
 
 fn specialization_mode_records_counters() -> bool {
     matches!(
-        env::var("SOAC_MODE").ok().as_deref().map(str::trim),
+        env::var("SOAC_OPT_MODE").ok().as_deref().map(str::trim),
         Some("profile" | "verify")
     )
-}
-
-fn env_flag_enabled(name: &str) -> bool {
-    match env::var_os(name) {
-        None => false,
-        Some(value) => {
-            let raw = value.to_string_lossy();
-            !matches!(
-                raw.as_ref(),
-                "" | "0" | "false" | "False" | "FALSE" | "no" | "No" | "NO" | "off" | "Off" | "OFF"
-            )
-        }
-    }
 }
 
 fn append_jit_codegen_log(
@@ -766,7 +749,7 @@ fn snapshot_type_key_layout_events_bound(
 }
 
 fn counter_dump_file_from_env() -> Option<std::path::PathBuf> {
-    let mode = env::var("SOAC_MODE").ok()?;
+    let mode = env::var("SOAC_OPT_MODE").ok()?;
     let filename = match mode.trim() {
         "profile" => "profile.bin",
         "verify" => "verify.bin",

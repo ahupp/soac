@@ -2152,47 +2152,19 @@ fn direct_method_specializations_for_call_site(
     call: &blockpy_intrinsics::Call<InstrCodegen>,
     ctx: &JitEmitCtx<'_>,
 ) -> Vec<DirectMethodSpecialization> {
-    let debug_direct_methods =
-        env::var_os("DIET_PYTHON_DEBUG_DIRECT_METHOD_SPECIALIZATIONS").is_some();
-    let debug_site = || {
-        format!(
-            "instr_id={}",
-            call.meta()
-                .instr_id
-                .map(|instr_id| instr_id.to_string())
-                .unwrap_or_else(|| "-".to_string())
-        )
-    };
     if ctx.shared_state.is_none() {
-        if debug_direct_methods {
-            eprintln!("direct-method-skip no-shared-state {}", debug_site());
-        }
         return Vec::new();
     }
     let InstrCodegen::GetAttr(getattr) = call.func.as_ref() else {
-        if debug_direct_methods {
-            eprintln!("direct-method-skip non-getattr {}", debug_site());
-        }
         return Vec::new();
     };
     let Some(method_name) = codegen_constant_string_value(ctx.module, getattr.attr.as_ref()) else {
-        if debug_direct_methods {
-            eprintln!("direct-method-skip non-constant-attr {}", debug_site());
-        }
         return Vec::new();
     };
     let Some(instr_id) = call.meta().instr_id else {
-        if debug_direct_methods {
-            eprintln!("direct-method-skip missing-instr-id method={method_name}");
-        }
         return Vec::new();
     };
     let Some(targets) = ctx.call_target_specializations.get(&instr_id) else {
-        if debug_direct_methods {
-            eprintln!(
-                "direct-method-skip no-site-targets method={method_name} instr_id={instr_id}"
-            );
-        }
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -2214,19 +2186,8 @@ fn direct_method_specializations_for_call_site(
         let Ok(owner_types) =
             (unsafe { crate::lookup_exact_owner_types_for_method(function_id, method_name) })
         else {
-            if debug_direct_methods {
-                eprintln!(
-                    "direct-method-skip owner-query-error method={method_name} function_id={function_id} instr_id={instr_id}"
-                );
-            }
             continue;
         };
-        if debug_direct_methods {
-            eprintln!(
-                "direct-method-candidates method={method_name} function_id={function_id} instr_id={instr_id} owners={}",
-                owner_types.len()
-            );
-        }
         out.extend(
             owner_types
                 .into_iter()
@@ -2332,101 +2293,11 @@ fn collect_runtime_counter_ids_by_kind(
         .collect()
 }
 
-fn parse_call_target_specializations_env(
-    module_name: &str,
-    function_id: FunctionId,
-) -> Result<HashMap<InstrId, Vec<FunctionId>>, String> {
-    let Ok(raw) = env::var("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS") else {
-        return Ok(HashMap::new());
-    };
-    let mut out = HashMap::new();
-    for entry in raw
-        .split(';')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-    {
-        let Some((site, targets)) = entry.split_once('=') else {
-            return Err(format!("invalid call target specialization entry: {entry}"));
-        };
-        let mut site_parts = site.split('|');
-        let Some(entry_module_name) = site_parts.next() else {
-            return Err(format!("missing module in specialization entry: {entry}"));
-        };
-        let Some(entry_function_id) = site_parts.next() else {
-            return Err(format!(
-                "missing function_id in specialization entry: {entry}"
-            ));
-        };
-        let Some(entry_block_label) = site_parts.next() else {
-            return Err(format!(
-                "missing block label in specialization entry: {entry}"
-            ));
-        };
-        let Some(entry_instr_index) = site_parts.next() else {
-            return Err(format!(
-                "missing instr index in specialization entry: {entry}"
-            ));
-        };
-        if site_parts.next().is_some() {
-            return Err(format!(
-                "too many site fields in specialization entry: {entry}"
-            ));
-        }
-        if entry_module_name != module_name {
-            continue;
-        }
-        let parsed_function_id = entry_function_id
-            .parse::<u64>()
-            .map(FunctionId::from_packed)
-            .map_err(|err| format!("invalid function_id in specialization entry {entry}: {err}"))?;
-        if parsed_function_id != function_id {
-            continue;
-        }
-        let block_label = entry_block_label
-            .parse::<u32>()
-            .map_err(|err| format!("invalid block label in specialization entry {entry}: {err}"))?;
-        let instr_index = entry_instr_index
-            .parse::<u32>()
-            .map_err(|err| format!("invalid instr index in specialization entry {entry}: {err}"))?;
-        let targets = targets
-            .split(',')
-            .map(str::trim)
-            .filter(|target| !target.is_empty())
-            .map(|target| {
-                target
-                    .parse::<u64>()
-                    .map(FunctionId::from_packed)
-                    .map_err(|err| {
-                        format!(
-                            "invalid hot target function id in specialization entry {entry}: {err}"
-                        )
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if targets.is_empty() {
-            continue;
-        }
-        out.insert(
-            InstrId::new(BlockLabel::from_index(block_label as usize), instr_index),
-            targets,
-        );
-    }
-    Ok(out)
-}
-
 fn load_call_target_specializations(
     module_name: &str,
     function_id: FunctionId,
 ) -> Result<HashMap<InstrId, Vec<FunctionId>>, String> {
-    if env::var("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS").is_ok() {
-        return parse_call_target_specializations_env(module_name, function_id);
-    }
-    if specialization_mode_is_profile()
-        || (specialization_mode_from_env().is_none()
-            && env::var("DIET_PYTHON_CALL_TARGET_COUNTERS")
-                .ok()
-                .is_some_and(|raw| !raw.trim().is_empty()))
-    {
+    if specialization_mode_is_profile() {
         return Ok(HashMap::new());
     }
     let Some(path) = counter_dump_input_path_from_env() else {
@@ -2439,95 +2310,11 @@ fn load_call_target_specializations(
     read_call_target_specializations_from_file(path, module_name, function_id)
 }
 
-fn parse_operator_specializations_env(
-    module_name: &str,
-    function_id: FunctionId,
-) -> Result<HashMap<InstrId, Vec<u64>>, String> {
-    let Ok(raw) = env::var("DIET_PYTHON_OPERATOR_SPECIALIZATIONS") else {
-        return Ok(HashMap::new());
-    };
-    let mut out = HashMap::new();
-    for entry in raw
-        .split(';')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-    {
-        let Some((site, targets)) = entry.split_once('=') else {
-            return Err(format!("invalid operator specialization entry: {entry}"));
-        };
-        let mut site_parts = site.split('|').map(str::trim);
-        let Some(site_module) = site_parts.next() else {
-            return Err(format!(
-                "missing module in operator specialization entry: {entry}"
-            ));
-        };
-        let Some(site_function_id_raw) = site_parts.next() else {
-            return Err(format!(
-                "missing function_id in operator specialization entry: {entry}"
-            ));
-        };
-        let Some(block_label_raw) = site_parts.next() else {
-            return Err(format!(
-                "missing block label in operator specialization entry: {entry}"
-            ));
-        };
-        let Some(instr_index_raw) = site_parts.next() else {
-            return Err(format!(
-                "missing instr index in operator specialization entry: {entry}"
-            ));
-        };
-        if site_parts.next().is_some() {
-            return Err(format!(
-                "too many site fields in operator specialization entry: {entry}"
-            ));
-        }
-        let site_function_id = site_function_id_raw
-            .parse::<u64>()
-            .map(FunctionId::from_packed)
-            .map_err(|err| {
-                format!("invalid function_id in operator specialization entry {entry}: {err}")
-            })?;
-        let block_label = block_label_raw.parse::<u32>().map_err(|err| {
-            format!("invalid block label in operator specialization entry {entry}: {err}")
-        })?;
-        let instr_index = instr_index_raw.parse::<u32>().map_err(|err| {
-            format!("invalid instr index in operator specialization entry {entry}: {err}")
-        })?;
-        if site_module != module_name || site_function_id != function_id {
-            continue;
-        }
-        let instr_id = InstrId::new(BlockLabel::from_index(block_label as usize), instr_index);
-        let shapes = targets
-            .split(',')
-            .map(str::trim)
-            .filter(|target| !target.is_empty())
-            .map(|target| {
-                target.parse::<u64>().map_err(|err| {
-                    format!("invalid operator specialization target in entry {entry}: {err}")
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if shapes.is_empty() {
-            continue;
-        }
-        out.insert(instr_id, shapes);
-    }
-    Ok(out)
-}
-
 fn load_operator_specializations(
     module_name: &str,
     function_id: FunctionId,
 ) -> Result<HashMap<InstrId, Vec<u64>>, String> {
-    if env::var("DIET_PYTHON_OPERATOR_SPECIALIZATIONS").is_ok() {
-        return parse_operator_specializations_env(module_name, function_id);
-    }
-    if specialization_mode_is_profile()
-        || (specialization_mode_from_env().is_none()
-            && env::var("DIET_PYTHON_CALL_TARGET_COUNTERS")
-                .ok()
-                .is_some_and(|raw| !raw.trim().is_empty()))
-    {
+    if specialization_mode_is_profile() {
         return Ok(HashMap::new());
     }
     let Some(path) = counter_dump_input_path_from_env() else {
@@ -2618,7 +2405,7 @@ fn load_field_index_specializations(
 }
 
 fn specialization_mode_from_env() -> Option<String> {
-    env::var("SOAC_MODE")
+    env::var("SOAC_OPT_MODE")
         .ok()
         .map(|raw| raw.trim().to_string())
         .filter(|raw| !raw.is_empty())
