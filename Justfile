@@ -318,6 +318,7 @@ perf-pystone-jit-warm loops="500000" output_prefix="logs/pystone_jit_perf_warm":
   PERF_PERCENT_LIMIT="${PERF_PERCENT_LIMIT:-0.5}"
   PERF_HELPER_FRAMES="${SOAC_JIT_PERF_HELPER_FRAMES:-1}"
   PERF_BUILDID_DIR="${PERF_BUILDID_DIR:-$REPO_ROOT/tmp/perf-buildid}"
+  SOAC_OPT_UNSOUND="${SOAC_OPT_UNSOUND:-1}"
 
   mkdir -p "${PERF_BUILDID_DIR}"
 
@@ -389,6 +390,7 @@ perf-pystone-jit-warm loops="500000" output_prefix="logs/pystone_jit_perf_warm":
     LOOPS="${LOOPS}" \
     WARMUP_LOOPS="${WARMUP_LOOPS}" \
     PERF_BUILDID_DIR="${PERF_BUILDID_DIR}" \
+    SOAC_OPT_UNSOUND="${SOAC_OPT_UNSOUND}" \
     SOAC_JIT_PERF_HELPER_FRAMES="${PERF_HELPER_FRAMES}" \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH="${PYTHONPATH_PREFIX}${PYTHONPATH:+:${PYTHONPATH}}" \
