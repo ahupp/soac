@@ -1,4 +1,5 @@
 target/
+bench
 cpython-venv
 /web/pkg
 *.pyc

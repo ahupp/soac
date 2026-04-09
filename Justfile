@@ -127,6 +127,24 @@ install-extension build="debug": ensure-venv ensure-cpython
 setup-dev-env: ensure-cpython
   #!/usr/bin/env bash
   set -euo pipefail
+  shared_bench="$REPO_ROOT/../soac-bench"
+  mkdir -p "$shared_bench"
+  if [[ -L "$REPO_ROOT/bench" ]]; then
+    link_target="$(readlink "$REPO_ROOT/bench")"
+    if [[ "$link_target" != "../soac-bench" && "$link_target" != "$shared_bench" ]]; then
+      rm "$REPO_ROOT/bench"
+      ln -s ../soac-bench "$REPO_ROOT/bench"
+    fi
+  elif [[ -d "$REPO_ROOT/bench" ]]; then
+    cp -a --no-clobber "$REPO_ROOT/bench/." "$shared_bench/"
+    rm -rf "$REPO_ROOT/bench"
+    ln -s ../soac-bench "$REPO_ROOT/bench"
+  elif [[ -e "$REPO_ROOT/bench" ]]; then
+    echo "cannot create bench symlink: $REPO_ROOT/bench exists and is not a directory or symlink" >&2
+    exit 1
+  else
+    ln -s ../soac-bench "$REPO_ROOT/bench"
+  fi
   rustup toolchain install nightly
   rustup component add rustc-codegen-cranelift-preview --toolchain nightly
   cargo install --locked inferno
@@ -316,7 +334,7 @@ perf-pystone-jit-warm loops="500000" output_prefix="logs/pystone_jit_perf_warm":
   PERF_CALL_GRAPH="${PERF_CALL_GRAPH:-dwarf,65528}"
   PERF_PERCENT_LIMIT="${PERF_PERCENT_LIMIT:-0.5}"
   PERF_HELPER_FRAMES="${SOAC_JIT_PERF_HELPER_FRAMES:-1}"
-  SOAC_OPT_UNSOUND="${SOAC_OPT_UNSOUND:-1}"
+  PERF_BUILDID_DIR="${PERF_BUILDID_DIR:-$REPO_ROOT/tmp/perf-buildid}"
 
   PERF_DATA_BASENAME="$(basename "${OUTPUT_PREFIX}").data"
   PERF_DATA="$REPO_ROOT/tmp/${PERF_DATA_BASENAME}"
@@ -384,7 +402,7 @@ perf-pystone-jit-warm loops="500000" output_prefix="logs/pystone_jit_perf_warm":
   env \
     LOOPS="${LOOPS}" \
     WARMUP_LOOPS="${WARMUP_LOOPS}" \
-    SOAC_OPT_UNSOUND="${SOAC_OPT_UNSOUND}" \
+    PERF_BUILDID_DIR="${PERF_BUILDID_DIR}" \
     SOAC_JIT_PERF_HELPER_FRAMES="${PERF_HELPER_FRAMES}" \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH="${PYTHONPATH_PREFIX}${PYTHONPATH:+:${PYTHONPATH}}" \
@@ -554,7 +572,6 @@ _pytest-run *args='': ensure-venv
     rm -f "$SOAC_PYTEST_EVENTS_LOG"
     export SOAC_LOG="soac_jit=info,soac_module_load=info,soac_jit_codegen=info;json=$SOAC_PYTEST_EVENTS_LOG"
   fi
-  export SOAC_OPT_UNSOUND="${SOAC_OPT_UNSOUND:-1}"
   PYTEST_TB=native
 
   TMP_PYTEST_OUTPUT="$(mktemp -t diet-python-pytest.XXXXXX.log)"
@@ -749,7 +766,6 @@ benchmark-verify loops="100000" counters_dir="": (update-venv) (build-extension 
   WARMUP_LOOPS="${WARMUP_LOOPS:-1000}"
   BENCHMARK_CPU="${BENCHMARK_CPU:-}"
   BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS:-0}"
-  SOAC_OPT_UNSOUND="${SOAC_OPT_UNSOUND:-1}"
   COUNTERS_DIR="{{counters_dir}}"
   if [[ -z "$COUNTERS_DIR" ]]; then
     COUNTERS_DIR="$LAST_BENCHMARK_COUNTERS_DIR"
@@ -764,12 +780,10 @@ benchmark-verify loops="100000" counters_dir="": (update-venv) (build-extension 
   echo "jit transformed verify pass"
   echo "loops: {{loops}}"
   echo "counters dir: $COUNTERS_DIR"
-  echo "unsound optimizations: ${SOAC_OPT_UNSOUND}"
   LOOPS="{{loops}}" \
   WARMUP_LOOPS="${WARMUP_LOOPS}" \
   BENCHMARK_CPU="${BENCHMARK_CPU}" \
   BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
-  SOAC_OPT_UNSOUND="${SOAC_OPT_UNSOUND}" \
   SOAC_WORK_DIR="$COUNTERS_DIR" \
   SOAC_OPT_MODE=verify \
     "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
@@ -783,13 +797,11 @@ benchmark-warm loops="8000000": (update-venv) (build-extension "release")
   WARMUP_LOOPS="${WARMUP_LOOPS:-1000}"
   BENCHMARK_CPU="${BENCHMARK_CPU:-}"
   BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS:-0}"
-  SOAC_OPT_UNSOUND="${SOAC_OPT_UNSOUND:-1}"
   echo "date: $(date +%F)"
   echo "loops: {{loops}}"
   echo "warmup loops: ${WARMUP_LOOPS}"
   echo "benchmark cpu: ${BENCHMARK_CPU}"
   echo "benchmark constant clocks: ${BENCHMARK_CONSTANT_CLOCKS}"
-  echo "unsound optimizations: ${SOAC_OPT_UNSOUND}"
 
   cd "$REPO_ROOT"
 
@@ -803,7 +815,6 @@ benchmark-warm loops="8000000": (update-venv) (build-extension "release")
   WARMUP_LOOPS="${WARMUP_LOOPS}" \
   BENCHMARK_CPU="${BENCHMARK_CPU}" \
   BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
-  SOAC_OPT_UNSOUND="${SOAC_OPT_UNSOUND}" \
     "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
 
   echo "stock cpython"
@@ -813,76 +824,136 @@ benchmark-warm loops="8000000": (update-venv) (build-extension "release")
   BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
     "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
 
-benchmark loops="8000000": (update-venv) (build-extension "release")
+benchmark benchmark_loops="1000000" verify_loops="100000" perf_loops="500000" results_root="bench" result_rev="@": (update-venv) (build-extension "release")
   #!/usr/bin/env bash
   set -euo pipefail
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-  WARMUP_LOOPS="${WARMUP_LOOPS:-1000}"
+
+  BENCHMARK_LOOPS="{{benchmark_loops}}"
+  VERIFY_LOOPS="{{verify_loops}}"
+  PERF_LOOPS="{{perf_loops}}"
+  RESULT_REV="{{result_rev}}"
   PROFILE_LOOPS="100000"
+  SPECIALIZED_RUNS="${BENCHMARK_SPECIALIZED_RUNS:-3}"
+  RESULTS_ROOT="{{results_root}}"
+  if [[ "$RESULTS_ROOT" != /* ]]; then
+    RESULTS_ROOT="$REPO_ROOT/$RESULTS_ROOT"
+  fi
+  WARMUP_LOOPS="${WARMUP_LOOPS:-1000}"
   BENCHMARK_CPU="${BENCHMARK_CPU:-}"
   BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS:-0}"
-  SOAC_OPT_UNSOUND="${SOAC_OPT_UNSOUND:-1}"
-  SPECIALIZED_LOOPS="${BENCHMARK_SPECIALIZED_LOOPS:-1000000}"
-  SPECIALIZED_RUNS="${BENCHMARK_SPECIALIZED_RUNS:-3}"
-  echo "date: $(date +%F)"
-  echo "loops: {{loops}}"
-  echo "profile loops: ${PROFILE_LOOPS}"
-  echo "specialized loops: ${SPECIALIZED_LOOPS}"
-  echo "specialized runs: ${SPECIALIZED_RUNS}"
-  echo "warmup loops: ${WARMUP_LOOPS}"
-  echo "benchmark cpu: ${BENCHMARK_CPU}"
-  echo "benchmark constant clocks: ${BENCHMARK_CONSTANT_CLOCKS}"
-  echo "unsound optimizations: ${SOAC_OPT_UNSOUND}"
 
-  cd "$REPO_ROOT"
-  mkdir -p "$LAST_BENCHMARK_COUNTERS_DIR"
-  SOAC_BENCHMARK_EVENTS_LOG="$LAST_BENCHMARK_COUNTERS_DIR/events.jsonl"
-  counter_dump_path="$LAST_BENCHMARK_COUNTERS_DIR/profile.bin"
-  rm -f "$LAST_BENCHMARK_COUNTERS_DIR/profile.bin" "$LAST_BENCHMARK_COUNTERS_DIR/verify.bin" "$SOAC_BENCHMARK_EVENTS_LOG"
+  # Snapshot the invoking jj workspace before creating side workspaces.
+  jj status --no-pager >/dev/null
 
-  echo "jit transformed profile pass"
-  LOOPS="${PROFILE_LOOPS}" \
-  WARMUP_LOOPS="${WARMUP_LOOPS}" \
-  BENCHMARK_CPU="${BENCHMARK_CPU}" \
-  BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
-  SOAC_OPT_UNSOUND="${SOAC_OPT_UNSOUND}" \
-  SOAC_WORK_DIR="$LAST_BENCHMARK_COUNTERS_DIR" \
-  SOAC_OPT_MODE=profile \
-    "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
+  change_id="$(jj --ignore-working-copy log -r "$RESULT_REV" --no-graph -T 'change_id.short()')"
+  commit_id="$(jj --ignore-working-copy log -r "$RESULT_REV" --no-graph -T 'commit_id.short()')"
+  result_name="${change_id}_${commit_id}"
+  result_dir="$RESULTS_ROOT/$result_name"
+  counters_dir="$result_dir/counters"
+  clif_dir="$result_dir/clif"
+  report="$result_dir/benchmark.txt"
 
-  echo "last benchmark counters dir: $LAST_BENCHMARK_COUNTERS_DIR"
-  echo "last benchmark profile counters: $LAST_BENCHMARK_COUNTERS"
-  echo "last benchmark SOAC events log: $SOAC_BENCHMARK_EVENTS_LOG"
-  echo "run speedscope from these counters: just run-and-view-speedscope"
+  rm -rf "$result_dir"
+  mkdir -p "$counters_dir" "$clif_dir"
+  SOAC_BENCHMARK_EVENTS_LOG="$counters_dir/events.jsonl"
+  rm -f "$SOAC_BENCHMARK_EVENTS_LOG"
 
-  site_count="$(just _call-target-specializations-from-dump "$counter_dump_path" | awk -F';' 'NF { print NF }')"
-  if [[ -n "$site_count" && "$site_count" != "0" ]]; then
+  {
+    echo "result dir: $result_dir"
+    echo "revision:"
+    jj --ignore-working-copy log -r "$RESULT_REV" --no-graph \
+      -T '"change_id " ++ change_id ++ "\ncommit_id " ++ commit_id ++ "\ndescription " ++ description.first_line() ++ "\n"'
+    echo
+    echo "date: $(date +%F)"
+    echo "profile loops: $PROFILE_LOOPS"
+    echo "benchmark loops: $BENCHMARK_LOOPS"
+    echo "verify loops: $VERIFY_LOOPS"
+    echo "perf loops: $PERF_LOOPS"
+    echo "specialized runs: $SPECIALIZED_RUNS"
+    echo "warmup loops: $WARMUP_LOOPS"
+    echo "benchmark cpu: $BENCHMARK_CPU"
+    echo "benchmark constant clocks: $BENCHMARK_CONSTANT_CLOCKS"
+    echo
+
+    echo "jit transformed profile pass"
+    LOOPS="$PROFILE_LOOPS" \
+    WARMUP_LOOPS="$WARMUP_LOOPS" \
+    BENCHMARK_CPU="$BENCHMARK_CPU" \
+    BENCHMARK_CONSTANT_CLOCKS="$BENCHMARK_CONSTANT_CLOCKS" \
+    SOAC_WORK_DIR="$counters_dir" \
+    SOAC_OPT_MODE=profile \
+      "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
+
+    echo
+    echo "jit transformed verify pass"
+    LOOPS="$VERIFY_LOOPS" \
+    WARMUP_LOOPS="$WARMUP_LOOPS" \
+    BENCHMARK_CPU="$BENCHMARK_CPU" \
+    BENCHMARK_CONSTANT_CLOCKS="$BENCHMARK_CONSTANT_CLOCKS" \
+    SOAC_WORK_DIR="$counters_dir" \
+    SOAC_OPT_MODE=verify \
+      "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
+
+    site_count="$(just _call-target-specializations-from-dump "$counters_dir/profile.bin" | awk -F';' 'NF { print NF }')"
+    echo
+    echo "jit transformed specialized apply pass (${site_count:-0} callsites)"
     for run in $(seq 1 "$SPECIALIZED_RUNS"); do
-      echo "jit transformed specialized pass (${site_count} callsites, run ${run}/${SPECIALIZED_RUNS})"
-      LOOPS="${SPECIALIZED_LOOPS}" \
-      WARMUP_LOOPS="${WARMUP_LOOPS}" \
-      BENCHMARK_CPU="${BENCHMARK_CPU}" \
-      BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
-      SOAC_OPT_UNSOUND="${SOAC_OPT_UNSOUND}" \
-      SOAC_WORK_DIR="$LAST_BENCHMARK_COUNTERS_DIR" \
+      echo "specialized run $run/$SPECIALIZED_RUNS"
+      LOOPS="$BENCHMARK_LOOPS" \
+      WARMUP_LOOPS="$WARMUP_LOOPS" \
+      BENCHMARK_CPU="$BENCHMARK_CPU" \
+      BENCHMARK_CONSTANT_CLOCKS="$BENCHMARK_CONSTANT_CLOCKS" \
+      SOAC_WORK_DIR="$counters_dir" \
       SOAC_OPT_MODE=apply \
         "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
     done
-  else
-    for run in $(seq 1 "$SPECIALIZED_RUNS"); do
-      echo "jit transformed specialized pass (no hot callsites recorded, run ${run}/${SPECIALIZED_RUNS})"
-      LOOPS="${SPECIALIZED_LOOPS}" \
-      WARMUP_LOOPS="${WARMUP_LOOPS}" \
-      BENCHMARK_CPU="${BENCHMARK_CPU}" \
-      BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
-      SOAC_OPT_UNSOUND="${SOAC_OPT_UNSOUND}" \
-        "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
-    done
-  fi
+  } 2>&1 | tee "$report"
 
-  echo "stock cpython"
-  LOOPS="{{loops}}" \
-  WARMUP_LOOPS="${WARMUP_LOOPS}" \
-  BENCHMARK_CPU="${BENCHMARK_CPU}" \
-  BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
-    "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
+  cargo run -p soac-inspector --bin inspect_counters -- \
+    "$counters_dir/profile.bin" > "$result_dir/profile_counters.txt"
+  cargo run -p soac-inspector --bin inspect_counters -- \
+    "$counters_dir/verify.bin" > "$result_dir/verify_counters.txt"
+  cargo run -p soac-inspector --bin inspect_counters -- \
+    --specializations "$counters_dir/profile.bin" > "$result_dir/profile_specializations.txt"
+  cargo run -p soac-inspector --bin inspect_counters -- \
+    --specializations "$counters_dir/verify.bin" > "$result_dir/verify_specializations.txt"
+
+  cargo run -q -p soac-inspector --bin list_jit_functions -- scripts/pystone.py \
+    > "$clif_dir/functions.tsv"
+  translated_call_targets="$(awk -F'[|=]' '
+    function local_id(packed) { return packed % 4294967296 }
+    NF >= 5 {
+      site = $1 "|" local_id($2) "|" $3 "|" $4
+      split($5, targets, ",")
+      printf "%s%s=", sep, site
+      sep = ";"
+      for (i = 1; i <= length(targets); i++) {
+        if (i > 1) {
+          printf ","
+        }
+        printf "%d", local_id(targets[i])
+      }
+    }
+  ' "$result_dir/profile_specializations.txt")"
+  while IFS=$'\t' read -r function_id qualname; do
+    safe_qualname="$(printf '%s' "$qualname" | tr -cs '[:alnum:]_.' '_')"
+    output_base="$clif_dir/fn_${function_id}_${safe_qualname}"
+    SOAC_WORK_DIR="$counters_dir" \
+    SOAC_OPT_MODE=apply \
+      cargo run -q -p soac-inspector --bin render_jit_clif -- \
+        --specialized --module-name pystone \
+        --cfg-dot-out "$output_base.cfg.dot" \
+        scripts/pystone.py "$function_id" \
+        > "$output_base.clif"
+  done < "$clif_dir/functions.tsv"
+
+  SOAC_WORK_DIR="$counters_dir" \
+  SOAC_OPT_MODE=apply \
+  PERF_PERCENT_LIMIT="${PERF_PERCENT_LIMIT:-0.2}" \
+    just perf-pystone-jit-warm "$PERF_LOOPS" "$result_dir/perf" \
+    > "$result_dir/perf.just.log" 2>&1
+  cp -f "$REPO_ROOT/tmp/perf.data" "$result_dir/perf.data" 2>/dev/null || true
+  cp -f "$REPO_ROOT/tmp/perf.injected.data" "$result_dir/perf.injected.data" 2>/dev/null || true
+
+  echo "benchmark result: $result_dir"
