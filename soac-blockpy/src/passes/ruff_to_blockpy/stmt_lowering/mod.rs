@@ -419,7 +419,10 @@ where
         }
         InstrRuff::StmtRaise(stmt) => {
             if stmt.cause.is_some() {
-                panic!("raise-from should be lowered before Ruff AST -> BlockPy conversion");
+                return lower_simplified(
+                    simplify_instr_head_for_blockpy(context, InstrRuff::StmtRaise(stmt.clone())),
+                    out,
+                );
             }
             let exc = stmt
                 .exc

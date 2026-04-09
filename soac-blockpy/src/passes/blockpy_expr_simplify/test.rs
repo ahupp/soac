@@ -143,6 +143,13 @@ fn core_blockpy_expr_reduces_add_to_structured_intrinsic() {
 }
 
 #[test]
+fn core_blockpy_expr_reduces_complex_literal_to_runtime_constructor() {
+    let lowered = InstrWithAwaitAndYield::from_ast_expr(py_expr!("1j"));
+
+    assert!(contains_runtime_call(&lowered, "complex_from_parts"));
+}
+
+#[test]
 fn core_blockpy_expr_reduces_operator_helper_families_to_intrinsics() {
     for expr in ["obj.attr", "obj[idx]", "-x", "x < y", "x in y", "x is y"] {
         let parsed = *parse_expression(expr).unwrap().into_syntax().body;

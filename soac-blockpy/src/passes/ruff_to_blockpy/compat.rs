@@ -105,7 +105,7 @@ where
     with_exc_meta(block, exc_target)
 }
 
-fn emit_lowered_builder_fragment_with_exc_target_and_expr<E>(
+pub(crate) fn emit_lowered_builder_fragment_with_exc_target_and_expr<E>(
     blocks: &mut Vec<LoweredBlockPyBlock<E>>,
     builder: InlineBlockBuilder<E>,
     term: BlockTerm<E>,
@@ -124,6 +124,73 @@ where
         ));
     }
     entry_ref
+}
+
+pub(crate) fn emit_lowered_builder_fragment_with_preferred_linear_entry_and_expr<E>(
+    blocks: &mut Vec<LoweredBlockPyBlock<E>>,
+    builder: InlineBlockBuilder<E>,
+    preferred_label: BlockLabel,
+    term: BlockTerm<E>,
+    fallthrough_target: BlockLabel,
+    exc_target: Option<&BlockLabel>,
+) -> InlineBlockRef
+where
+    E: RuffToBlockPyExpr,
+{
+    if builder.can_finish_linear_block() {
+        let block = builder
+            .finish_linear_block(preferred_label.clone(), term)
+            .expect("linear-compatible builder should finish as a linear block");
+        blocks.push(compat_block_from_inline_with_exc_target_and_expr(
+            block,
+            fallthrough_target,
+            exc_target,
+        ));
+        InlineBlockRef::from_label(preferred_label)
+    } else {
+        emit_lowered_builder_fragment_with_exc_target_and_expr(
+            blocks,
+            builder,
+            term,
+            fallthrough_target,
+            exc_target,
+        )
+    }
+}
+
+pub(crate) fn emit_lowered_builder_fragment_with_required_entry_and_expr<E>(
+    blocks: &mut Vec<LoweredBlockPyBlock<E>>,
+    builder: InlineBlockBuilder<E>,
+    required_label: BlockLabel,
+    term: BlockTerm<E>,
+    fallthrough_target: BlockLabel,
+    exc_target: Option<&BlockLabel>,
+) -> InlineBlockRef
+where
+    E: RuffToBlockPyExpr,
+{
+    let entry = emit_lowered_builder_fragment_with_preferred_linear_entry_and_expr(
+        blocks,
+        builder,
+        required_label.clone(),
+        term,
+        fallthrough_target,
+        exc_target,
+    );
+    if entry.label() == required_label {
+        return entry;
+    }
+    blocks.push(with_exc_meta(
+        Block::new(
+            required_label.clone(),
+            Vec::new(),
+            BlockTerm::Jump(BlockEdge::new(entry.label())),
+            Vec::new(),
+            None,
+        ),
+        exc_target,
+    ));
+    InlineBlockRef::from_label(required_label)
 }
 
 pub(crate) fn set_region_exc_param<E: Instr>(
@@ -548,12 +615,15 @@ where
             .unwrap_or_else(|err| {
                 panic!("failed to lower for-loop target assignment through production path: {err}")
             });
-    blocks.push(compat_block_from_lowered_builder_with_exc_target_and_expr(
-        assign_label.clone(),
+    let assign_entry = emit_lowered_builder_fragment_with_preferred_linear_entry_and_expr(
+        blocks,
         lowered_assign,
-        BlockTerm::Jump(BlockEdge::new(body_entry)),
+        assign_label,
+        BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())),
+        body_entry,
         exc_target,
-    ));
+    )
+    .label();
 
     let exhausted_test = crate::passes::ast_to_instr::from_ast_expr(py_expr!(
         "{tmp:id} is __soac__.ITER_COMPLETE",
@@ -593,16 +663,18 @@ where
             .unwrap_or_else(|err| {
                 panic!("failed to lower for-loop next step through production path: {err}")
             });
-    blocks.push(compat_block_from_lowered_builder_with_exc_target_and_expr(
-        loop_check_label.clone(),
+    emit_lowered_builder_fragment_with_required_entry_and_expr(
+        blocks,
         lowered_check,
+        loop_check_label.clone(),
         BlockTerm::IfTerm(TermIf {
             test: E::from_lowered_expr(exhausted_test),
             then_label: exhausted_entry,
-            else_label: assign_label.clone(),
+            else_label: assign_entry,
         }),
+        loop_check_label,
         exc_target,
-    ));
+    );
 
     let iter_helper = if is_async { "aiter" } else { "iter" };
     let mut setup_body = linear;
@@ -628,11 +700,13 @@ where
             .unwrap_or_else(|err| {
                 panic!("failed to lower for-loop setup through production path: {err}")
             });
-    blocks.push(compat_block_from_lowered_builder_with_exc_target_and_expr(
-        setup_label.clone(),
+    let setup_entry = emit_lowered_builder_fragment_with_preferred_linear_entry_and_expr(
+        blocks,
         lowered_setup,
-        BlockTerm::Jump(BlockEdge::new(loop_continue_label)),
+        setup_label,
+        BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())),
+        loop_continue_label,
         exc_target,
-    ));
-    setup_label
+    );
+    setup_entry.label()
 }

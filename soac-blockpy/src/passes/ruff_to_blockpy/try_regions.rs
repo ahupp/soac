@@ -6,6 +6,7 @@ use crate::block_py::{
 };
 use crate::passes::ast_to_ast::body::Suite;
 use crate::passes::ast_to_ast::context::Context;
+use crate::passes::ruff_to_blockpy::stmt_sequences::lower_stmts_to_blockpy_stmts_with_context;
 
 fn expr_name(id: &str) -> ast::name::Name {
     ast::name::Name::new(id)
@@ -435,18 +436,22 @@ pub(crate) fn emit_try_jump_entry<E>(
 where
     E: RuffToBlockPyExpr,
 {
-    blocks.push(compat_block_from_blockpy_with_exc_target_and_expr(
-        &Context::new(""),
-        name_gen,
-        label.clone(),
-        linear
-            .into_iter()
-            .map(crate::passes::ast_to_instr::from_ast_stmt)
-            .collect(),
-        BlockTerm::Jump(BlockEdge::new(body_label)),
+    let context = Context::new("");
+    let body = linear
+        .into_iter()
+        .map(crate::passes::ast_to_instr::from_ast_stmt)
+        .collect::<Vec<_>>();
+    let lowered = lower_stmts_to_blockpy_stmts_with_context::<E>(&context, &body, name_gen)
+        .unwrap_or_else(|err| panic!("failed to convert try-entry setup to BlockPy: {err}"));
+    super::compat::emit_lowered_builder_fragment_with_preferred_linear_entry_and_expr(
+        blocks,
+        lowered,
+        label,
+        BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())),
+        body_label,
         active_exc_target.as_ref(),
-    ));
-    label
+    )
+    .label()
 }
 
 pub(crate) fn block_references_label<E: Instr>(

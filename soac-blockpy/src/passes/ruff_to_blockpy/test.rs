@@ -657,13 +657,44 @@ fn expanded_stmt_helper_emits_linear_jump_prefix() {
         },
     );
 
-    assert_eq!(entry, label(10));
     assert_eq!(blocks.len(), 1);
-    assert_eq!(blocks[0].label, label(10));
+    assert_eq!(entry, blocks[0].label);
     assert!(matches!(
         &blocks[0].term,
         BlockTerm::Jump(edge) if edge.target == label(11)
     ));
+}
+
+#[test]
+fn expanded_stmt_helper_emits_fragment_for_branching_linear_prefix() {
+    let mut blocks = Vec::new();
+    let context = Context::new("");
+    let name_gen = test_name_gen();
+    let entry = lower_expanded_stmt_sequence(
+        &context,
+        &name_gen,
+        vec![instr_stmt(py_stmt!("pass"))],
+        &[],
+        RegionTargets::new(label(99), None),
+        vec![instr_stmt(py_stmt!("x = a if cond else b"))],
+        &mut blocks,
+        Some(label(10)),
+        &mut |_expanded: &[InstrRuff], _targets: RegionTargets, _blocks: &mut Vec<TestBlock>| {
+            label(11)
+        },
+    );
+
+    assert!(blocks.iter().any(|block| block.label == entry));
+    assert!(
+        blocks
+            .iter()
+            .any(|block| matches!(&block.term, BlockTerm::Jump(edge) if edge.target == label(11))),
+        "{blocks:#?}"
+    );
+    assert!(
+        blocks.len() > 1,
+        "branching prefix should emit its inline dependency blocks: {blocks:#?}"
+    );
 }
 
 #[test]
@@ -1918,8 +1949,7 @@ def f():
 }
 
 #[test]
-#[should_panic(expected = "raise-from should be lowered before Ruff AST -> BlockPy conversion")]
-fn panics_if_raise_from_reaches_blockpy() {
+fn lowers_raise_from_if_it_reaches_blockpy_stmt_lowering() {
     let module = ruff_python_parser::parse_module(
         r#"
 def f():
@@ -1932,7 +1962,20 @@ def f():
     let ast::Stmt::FunctionDef(func) = &module[0] else {
         panic!("expected function def");
     };
-    lower_stmt_for_panic_test(&func.body[0]);
+    let context = test_context();
+    let name_gen = test_name_gen();
+    let mut out = crate::passes::ruff_to_blockpy::InlineBlockBuilder::<InstrWithAwaitAndYield>::new(
+        &name_gen,
+    );
+    let stmt = crate::passes::ast_to_instr::from_ast_stmt(func.body[0].clone());
+    lower_instr_for_test(&context, &stmt, &name_gen, &mut out, None)
+        .expect("raise-from lowering should succeed");
+
+    let fragment = out.finish();
+    assert!(matches!(
+        fragment.entry.term,
+        BlockTerm::Raise(TermRaise { exc: Some(_) })
+    ));
 }
 
 #[test]

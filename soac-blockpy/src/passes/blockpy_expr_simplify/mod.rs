@@ -14,6 +14,35 @@ fn core_builtin_name(id: &str) -> InstrWithAwaitAndYield {
     core_runtime_name_expr_with_meta(id, Default::default(), Default::default())
 }
 
+fn number_literal_expr_with_meta(
+    value: NumberLiteralValue,
+    node_index: ast::AtomicNodeIndex,
+    range: ruff_text_size::TextRange,
+) -> InstrWithAwaitAndYield {
+    literal_expr(NumberLiteral { value }, Meta::new(node_index, range))
+}
+
+fn complex_literal_expr_with_meta(
+    real: f64,
+    imag: f64,
+    node_index: ast::AtomicNodeIndex,
+    range: ruff_text_size::TextRange,
+) -> InstrWithAwaitAndYield {
+    core_runtime_positional_call_expr_with_meta(
+        "complex_from_parts",
+        node_index.clone(),
+        range,
+        vec![
+            number_literal_expr_with_meta(
+                NumberLiteralValue::Float(real),
+                node_index.clone(),
+                range,
+            ),
+            number_literal_expr_with_meta(NumberLiteralValue::Float(imag), node_index, range),
+        ],
+    )
+}
+
 fn reduce_core_blockpy_dict(items: Box<[ast::DictItem]>) -> InstrWithAwaitAndYield {
     let mut segments: Vec<InstrWithAwaitAndYield> = Vec::new();
     let mut keyed_pairs = Vec::new();
@@ -496,18 +525,21 @@ impl InstrWithAwaitAndYield {
             ),
             InstrRuff::ExprNumberLiteral(node) => {
                 let meta = node.meta();
-                literal_expr(
-                    NumberLiteral {
-                        value: match node.value {
-                            ast::Number::Int(value) => NumberLiteralValue::Int(value.into()),
-                            ast::Number::Float(value) => NumberLiteralValue::Float(value),
-                            ast::Number::Complex { .. } => {
-                                panic!("complex literal reached late core BlockPy boundary")
-                            }
-                        },
-                    },
-                    Meta::new(meta.node_index, meta.range),
-                )
+                match node.value {
+                    ast::Number::Int(value) => number_literal_expr_with_meta(
+                        NumberLiteralValue::Int(value.into()),
+                        meta.node_index,
+                        meta.range,
+                    ),
+                    ast::Number::Float(value) => number_literal_expr_with_meta(
+                        NumberLiteralValue::Float(value),
+                        meta.node_index,
+                        meta.range,
+                    ),
+                    ast::Number::Complex { real, imag } => {
+                        complex_literal_expr_with_meta(real, imag, meta.node_index, meta.range)
+                    }
+                }
             }
             InstrRuff::ExprBooleanLiteral(node) => {
                 if node.value {
@@ -621,18 +653,21 @@ impl InstrWithAwaitAndYield {
                 },
                 Meta::new(node.node_index, node.range),
             ),
-            Expr::NumberLiteral(node) => literal_expr(
-                NumberLiteral {
-                    value: match node.value {
-                        ast::Number::Int(value) => NumberLiteralValue::Int(value.into()),
-                        ast::Number::Float(value) => NumberLiteralValue::Float(value),
-                        ast::Number::Complex { .. } => {
-                            panic!("complex literal reached late core BlockPy boundary")
-                        }
-                    },
-                },
-                Meta::new(node.node_index, node.range),
-            ),
+            Expr::NumberLiteral(node) => match node.value {
+                ast::Number::Int(value) => number_literal_expr_with_meta(
+                    NumberLiteralValue::Int(value.into()),
+                    node.node_index,
+                    node.range,
+                ),
+                ast::Number::Float(value) => number_literal_expr_with_meta(
+                    NumberLiteralValue::Float(value),
+                    node.node_index,
+                    node.range,
+                ),
+                ast::Number::Complex { real, imag } => {
+                    complex_literal_expr_with_meta(real, imag, node.node_index, node.range)
+                }
+            },
             Expr::BooleanLiteral(node) => {
                 if node.value {
                     core_builtin_name("TRUE")

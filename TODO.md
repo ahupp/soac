@@ -3,6 +3,7 @@
 
  * Complete migration of ast-to-instr pass
  * If caching BlockPy before codegen, recover FunctionNameGen.next_tmp_id from generated `_dp_*` names.
+ * Add mutation watchers for `f.__defaults__` and `f.__kwdefaults__` so direct/JIT default slots stay fresh after in-place edits.
 
 
 ## Perf-to-investigate

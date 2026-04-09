@@ -52,15 +52,9 @@ def _should_transform(path: str) -> bool:
     """Return ``True`` if ``path`` should be passed through the transform."""
     if _runtime_bootstrap_in_progress():
         return False
-    if path.endswith(os.path.join("encodings", "__init__.py")):
-        return False
     try:
         resolved = Path(path).resolve()
     except OSError:
-        return False
-    if resolved.name == "__init__.py" and resolved.parent.name == "encodings":
-        return False
-    if resolved.name == "templatelib.py" and resolved.parent.name == "string":
         return False
     if _integration_only_enabled() and not _is_integration_module(resolved):
         return False
@@ -119,25 +113,25 @@ class DietPythonFinder(importlib.machinery.PathFinder):
         spec = importlib.machinery.FrozenImporter.find_spec(fullname, path, target)
         if spec is None:
             spec = super().find_spec(fullname, path, target)
-        return cls.wrap_spec(spec)
+        return cls.wrap_spec(spec, target)
 
     @classmethod
-    def wrap_spec(cls, spec):
+    def wrap_spec(cls, spec, target=None):
         if spec is None:
             return None
+        if target is not None:
+            loader = getattr(getattr(target, "__spec__", None), "loader", None)
+            if not isinstance(loader, DietPythonLoader):
+                return spec
         fullname = spec.name
         if (
-            fullname != "encodings"
-            and not fullname.startswith("encodings.")
-            and isinstance(spec.loader, importlib.machinery.SourceFileLoader)
+            isinstance(spec.loader, importlib.machinery.SourceFileLoader)
             and spec.origin
             and _should_transform(spec.origin)
         ):
             spec.loader = DietPythonLoader(fullname, spec.origin)
         elif (
-            fullname != "encodings"
-            and not fullname.startswith("encodings.")
-            and spec.loader is importlib.machinery.FrozenImporter
+            spec.loader is importlib.machinery.FrozenImporter
             and spec.origin == "frozen"
         ):
             source_path = _source_path_for_frozen_spec(spec)
@@ -150,12 +144,6 @@ class DietPythonFinder(importlib.machinery.PathFinder):
 
 def install():
     """Install the diet-python import hook."""
-    existing_typing = sys.modules.get("typing")
-    if existing_typing is not None:
-        loader = getattr(getattr(existing_typing, "__spec__", None), "loader", None)
-        if not isinstance(loader, DietPythonLoader):
-            sys.modules.pop("typing", None)
-
     if any(finder is DietPythonFinder for finder in sys.meta_path):
         return
 

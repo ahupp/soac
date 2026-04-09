@@ -30,7 +30,7 @@ snapshot_expr::dict_comp: blockpy=6, clif=6
 snapshot_expr::attribute_non_chain: blockpy=1, clif=1
 snapshot_expr::fstring_simple: blockpy=1, clif=1
 snapshot_expr::tstring_simple: blockpy=1, clif=1
-snapshot_expr::complex_literal: ERROR snapshot regeneration failed | panic: complex literal reached late core BlockPy boundary
+snapshot_expr::complex_literal: blockpy=1, clif=1
 snapshot_expr::float_literal_long: blockpy=1, clif=1
 snapshot_stmt::import_simple: blockpy=1, clif=1
 snapshot_stmt::import_dotted_alias: blockpy=1, clif=1

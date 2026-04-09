@@ -1,5 +1,7 @@
-# diet-python: disabled
-DELETED = object()
+try:
+    DELETED
+except NameError:
+    DELETED = object()
 NO_DEFAULT = object()
 ELLIPSIS = Ellipsis
 TRUE = True
@@ -18,7 +20,6 @@ import threading as _threading
 import types as _types
 import typing as _typing
 import warnings as _warnings
-import string.templatelib as _templatelib
 
 from . import _soac_ext
 from .sim import (
@@ -107,8 +108,21 @@ typing_TypeVarTuple = _typing.TypeVarTuple
 typing_ParamSpec = _typing.ParamSpec
 typing_TypeAliasType = _typing.TypeAliasType
 typing_Unpack = _typing.Unpack
-templatelib_Template = _templatelib.Template
-templatelib_Interpolation = _templatelib.Interpolation
+
+# eval() gives us a native t-string without having this runtime bootstrap
+# expression rewritten back into a __soac__.templatelib_Template call.
+_templatelib_probe = _builtins.eval('t"{0}"')
+_templatelib_Template_type = type(_templatelib_probe)
+_templatelib_Interpolation_type = type(_templatelib_probe.interpolations[0])
+del _templatelib_probe
+
+
+def templatelib_Template(*parts):
+    return _templatelib_Template_type(*parts)
+
+
+def templatelib_Interpolation(value, expr_text, conversion, format_spec):
+    return _templatelib_Interpolation_type(value, expr_text, conversion, format_spec)
 
 
 def load_deleted_name(name, value):
@@ -456,6 +470,10 @@ class AsyncGenSend:
 def float_from_literal(literal):
     # Preserve CPython's literal parsing for values that Rust rounds differently.
     return float(literal.replace("_", ""))
+
+
+def complex_from_parts(real, imag):
+    return _builtins.complex(real, imag)
 
 
 def class_lookup_cell(class_ns, name, cell):
@@ -836,7 +854,10 @@ def await_iter(awaitable):
     return iterator
 
 
-ITER_COMPLETE = object()
+try:
+    ITER_COMPLETE
+except NameError:
+    ITER_COMPLETE = object()
 
 
 async def anext_or_sentinel(iterator):

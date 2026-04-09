@@ -168,6 +168,10 @@ impl<I: Instr> InlineBlockBuilder<I> {
         ))
     }
 
+    pub(crate) fn can_finish_linear_block(&self) -> bool {
+        self.deps.is_empty()
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.deps.is_empty()
             && self.current_block.body.is_empty()

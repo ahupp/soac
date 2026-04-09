@@ -24,6 +24,11 @@ pub(crate) struct AstToAstPassResult {
     semantic_state: SemanticAstState,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LoweringOptions {
+    pub runtime_names_as_globals: bool,
+}
+
 impl BlockPyPrettyPrint for AstToAstPassResult {
     fn pretty_print(&self) -> String {
         crate::ruff_ast_to_string(&self.module)
@@ -65,10 +70,11 @@ fn rewrite_ast_to_ast_module(context: &Context, mut module: Suite) -> AstToAstPa
     }
 }
 
-pub(crate) fn rewrite_module_with_tracker(
+pub(crate) fn rewrite_module_with_tracker_with_options(
     source: &str,
     module_name_gen: ModuleNameGen,
     pass_tracker: &mut impl PassTracker,
+    options: LoweringOptions,
 ) -> Result<BlockPyModule<CodegenModuleShape>> {
     let module =
         pass_tracker.record_timing("parse", || -> std::result::Result<_, ParseError> {
@@ -163,9 +169,18 @@ pub(crate) fn rewrite_module_with_tracker(
        - locals are assigned stack slots, and become LoadLocation / StoreLocation / DelLocation with local-slot locations.
 
     */
-    let name_binding: BlockPyModule<ResolvedStorageModuleShape> = pass_tracker
-        .run_pass("name_binding", || {
-            passes::lower_name_binding_in_core_blockpy_module(core_blockpy_without_await_or_yield)
+    let name_binding: BlockPyModule<ResolvedStorageModuleShape> =
+        pass_tracker.run_pass("name_binding", || {
+            if options.runtime_names_as_globals {
+                passes::lower_name_binding_in_core_blockpy_module_with_options(
+                    core_blockpy_without_await_or_yield,
+                    true,
+                )
+            } else {
+                passes::lower_name_binding_in_core_blockpy_module(
+                    core_blockpy_without_await_or_yield,
+                )
+            }
         });
 
     let global_index: BlockPyModule<ResolvedStorageModuleShape> = pass_tracker
@@ -233,6 +248,19 @@ pub(crate) fn rewrite_module_with_tracker(
     })?;
 
     Ok(bb_locality_counted)
+}
+
+pub(crate) fn rewrite_module_with_tracker(
+    source: &str,
+    module_name_gen: ModuleNameGen,
+    pass_tracker: &mut impl PassTracker,
+) -> Result<BlockPyModule<CodegenModuleShape>> {
+    rewrite_module_with_tracker_with_options(
+        source,
+        module_name_gen,
+        pass_tracker,
+        LoweringOptions::default(),
+    )
 }
 
 pub(crate) fn wrap_module_init(semantic_state: &mut SemanticAstState, module: &mut Suite) {

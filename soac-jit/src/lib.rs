@@ -108,7 +108,7 @@ fn panic_payload_to_string(payload: Box<dyn Any + Send>) -> String {
 unsafe extern "C" fn function_owner_type_watcher_callback(
     event: PyFunctionWatchEvent,
     func: *mut ffi::PyFunctionObject,
-    _new_value: *mut ffi::PyObject,
+    new_value: *mut ffi::PyObject,
 ) -> i32 {
     let Some(Ok(registry)) = FUNCTION_OWNER_TYPE_REGISTRY.get() else {
         return 0;
@@ -125,7 +125,14 @@ unsafe extern "C" fn function_owner_type_watcher_callback(
                 let metadata = unsafe { PyFunction_GetSoacMetadata(func as *mut ffi::PyObject) };
                 if !metadata.is_null() {
                     let data = unsafe { &mut *(metadata as *mut PyFunctionJitExtra) };
-                    if unsafe { data.refresh_runtime_objects(func as *mut ffi::PyObject) }.is_err()
+                    if unsafe {
+                        data.refresh_runtime_objects_after_function_update(
+                            func as *mut ffi::PyObject,
+                            event,
+                            new_value,
+                        )
+                    }
+                    .is_err()
                     {
                         return -1;
                     }
@@ -417,9 +424,24 @@ impl PyFunctionJitExtra {
         ))
     }
 
-    unsafe fn refresh_runtime_objects(&mut self, callable: *mut ffi::PyObject) -> Result<(), ()> {
+    unsafe fn refresh_runtime_objects_after_function_update(
+        &mut self,
+        callable: *mut ffi::PyObject,
+        event: PyFunctionWatchEvent,
+        new_value: *mut ffi::PyObject,
+    ) -> Result<(), ()> {
         let layout = self.runtime_data_layout()?;
-        let values = unsafe { collect_function_runtime_objects(callable, &layout)? };
+        let defaults_override = (event == PY_FUNCTION_EVENT_MODIFY_DEFAULTS).then_some(new_value);
+        let kwdefaults_override =
+            (event == PY_FUNCTION_EVENT_MODIFY_KWDEFAULTS).then_some(new_value);
+        let values = unsafe {
+            collect_function_runtime_objects(
+                callable,
+                &layout,
+                defaults_override,
+                kwdefaults_override,
+            )?
+        };
         unsafe { self.function_env.replace_runtime_objects(values)? };
         Ok(())
     }
@@ -506,6 +528,8 @@ unsafe fn py_string(obj: *mut ffi::PyObject) -> Result<String, ()> {
 unsafe fn collect_function_runtime_objects(
     callable: *mut ffi::PyObject,
     layout: &jit::FunctionRuntimeDataLayout,
+    defaults_override: Option<*mut ffi::PyObject>,
+    kwdefaults_override: Option<*mut ffi::PyObject>,
 ) -> Result<Box<[*mut ffi::PyObject]>, ()> {
     if callable.is_null() || ffi::PyFunction_Check(callable) == 0 {
         return set_type_error("expected Python function while collecting CLIF function data");
@@ -513,7 +537,7 @@ unsafe fn collect_function_runtime_objects(
 
     let mut values = vec![ptr::null_mut(); layout.total_len()].into_boxed_slice();
 
-    let defaults = unsafe { PyFunction_GetDefaults(callable) };
+    let defaults = defaults_override.unwrap_or_else(|| unsafe { PyFunction_GetDefaults(callable) });
     for default_index in 0..layout.positional_default_count() {
         let value = if defaults.is_null() || ffi::PyTuple_Check(defaults) == 0 {
             ptr::null_mut()
@@ -528,7 +552,8 @@ unsafe fn collect_function_runtime_objects(
         values[layout.positional_default_slot(default_index)] = value;
     }
 
-    let kwdefaults = unsafe { PyFunction_GetKwDefaults(callable) };
+    let kwdefaults =
+        kwdefaults_override.unwrap_or_else(|| unsafe { PyFunction_GetKwDefaults(callable) });
     for (name, slot) in layout.kwonly_default_slots() {
         let Ok(name) = CString::new(name) else {
             continue;
@@ -691,7 +716,7 @@ unsafe fn make_clif_function_data(
     };
     let runtime_data_layout = jit::FunctionRuntimeDataLayout::from_function(&blockpy_function);
     let runtime_object_values =
-        unsafe { collect_function_runtime_objects(callable, &runtime_data_layout)? };
+        unsafe { collect_function_runtime_objects(callable, &runtime_data_layout, None, None)? };
     let mut function_env = unsafe {
         Box::new(FunctionEnv::new(
             module_runtime.mod_ctx.globals_obj as *mut ffi::PyObject,
@@ -1268,6 +1293,9 @@ unsafe fn register_owner_types_from_type(
     visited_types: &mut HashSet<usize>,
 ) -> Result<(), ()> {
     if owner_type.is_null() || !visited_types.insert(owner_type as usize) {
+        return Ok(());
+    }
+    if ((*owner_type).tp_flags & ffi::Py_TPFLAGS_HEAPTYPE) == 0 {
         return Ok(());
     }
     if !type_is_defined_in_module(owner_type, module_name) {
@@ -2376,6 +2404,30 @@ mod tests {
                 "owner type registration should decode the attached constructor id"
             );
             ffi::Py_DECREF(init_function);
+        });
+    }
+
+    #[test]
+    fn owner_type_registration_ignores_static_module_types() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        initialize_test_python();
+        Python::attach(|py| {
+            let module = PyModule::new(py, "typing").expect("module should allocate");
+            let typing = py.import("typing").expect("typing should import");
+            module
+                .dict()
+                .set_item(
+                    "Union",
+                    typing
+                        .getattr("Union")
+                        .expect("typing should expose static Union type"),
+                )
+                .expect("module globals should accept a static type");
+
+            unsafe {
+                register_function_owner_types_for_module(module.as_ptr())
+                    .expect("owner type registration should skip unsupported static types");
+            }
         });
     }
 

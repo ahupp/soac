@@ -528,13 +528,15 @@ where
         .unwrap_or_else(|err| {
             panic!("failed to lower expanded-sequence jump prefix through production path: {err}")
         });
-    blocks.push(crate::passes::ruff_to_blockpy::compat::compat_block_from_lowered_builder_with_exc_target_and_expr(
-        jump_label.clone(),
+    let entry = crate::passes::ruff_to_blockpy::compat::emit_lowered_builder_fragment_with_preferred_linear_entry_and_expr(
+        blocks,
         lowered_linear,
-        BlockTerm::Jump(BlockEdge::new(expanded_entry)),
+        jump_label,
+        BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())),
+        expanded_entry,
         active_exc.as_ref(),
-    ));
-    jump_label
+    );
+    entry.label()
 }
 
 pub(crate) fn lower_if_stmt_sequence<F, E>(

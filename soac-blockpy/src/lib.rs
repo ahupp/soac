@@ -1,5 +1,6 @@
 use crate::block_py::{BlockPyModule, ModuleNameGen};
-use crate::driver::rewrite_module_with_tracker;
+pub use crate::driver::LoweringOptions;
+use crate::driver::{rewrite_module_with_tracker, rewrite_module_with_tracker_with_options};
 use crate::pass_tracker::{NoopPassTracker, PassTracker, RecordingPassTracker};
 use crate::passes::CodegenModuleShape;
 use anyhow::Error as AnyhowError;
@@ -83,7 +84,24 @@ pub struct LoweringResult<P = RecordingPassTracker> {
 fn lower_python_to_blockpy_with_tracker<P>(
     source: &str,
     module_name_gen: ModuleNameGen,
+    pass_tracker: P,
+) -> Result<LoweringResult<P>>
+where
+    P: PassTracker,
+{
+    lower_python_to_blockpy_with_tracker_and_options(
+        source,
+        module_name_gen,
+        pass_tracker,
+        LoweringOptions::default(),
+    )
+}
+
+fn lower_python_to_blockpy_with_tracker_and_options<P>(
+    source: &str,
+    module_name_gen: ModuleNameGen,
     mut pass_tracker: P,
+    options: LoweringOptions,
 ) -> Result<LoweringResult<P>>
 where
     P: PassTracker,
@@ -92,7 +110,16 @@ where
     namegen::reset_namegen_state();
     let total_start = Instant::now();
 
-    let codegen_module = rewrite_module_with_tracker(source, module_name_gen, &mut pass_tracker)?;
+    let codegen_module = if options == LoweringOptions::default() {
+        rewrite_module_with_tracker(source, module_name_gen, &mut pass_tracker)?
+    } else {
+        rewrite_module_with_tracker_with_options(
+            source,
+            module_name_gen,
+            &mut pass_tracker,
+            options,
+        )?
+    };
 
     Ok(LoweringResult {
         total_time: total_start.elapsed(),
@@ -117,6 +144,19 @@ pub fn lower_python_to_blockpy_recorded(
     module_name_gen: ModuleNameGen,
 ) -> Result<LoweringResult<RecordingPassTracker>> {
     lower_python_to_blockpy_with_tracker(source, module_name_gen, RecordingPassTracker::new())
+}
+
+pub fn lower_python_to_blockpy_recorded_with_options(
+    source: &str,
+    module_name_gen: ModuleNameGen,
+    options: LoweringOptions,
+) -> Result<LoweringResult<RecordingPassTracker>> {
+    lower_python_to_blockpy_with_tracker_and_options(
+        source,
+        module_name_gen,
+        RecordingPassTracker::new(),
+        options,
+    )
 }
 
 pub trait ToRuffAst {

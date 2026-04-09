@@ -468,8 +468,11 @@ x = 1j
 
 # ==
 
-# snapshot regeneration failed
-# panic: complex literal reached late core BlockPy boundary
+# function _dp_module_init():
+#     function_id: 0:1
+#     block bb1:
+#         StoreName("x", complex_from_parts(0.0, 1.0))
+#         return NONE
 
 # float_literal_long
 

@@ -7,9 +7,9 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyFunction, PyModule, PyString, PyTuple};
 use soac_blockpy::block_py::{BlockPyFunction, BlockPyModule, FunctionId, FunctionKind, ParamKind};
-use soac_blockpy::lower_python_to_blockpy_recorded;
 use soac_blockpy::passes::CodegenModuleShape;
-use soac_jit::module_type::{ModuleInfo, SoacExtModule, hash_module_source};
+use soac_blockpy::{LoweringOptions, lower_python_to_blockpy_recorded_with_options};
+use soac_jit::module_type::{ModuleInfo, SharedModuleState, SoacExtModule, hash_module_source};
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs;
@@ -30,6 +30,64 @@ fn is_cell_object(obj: *mut ffi::PyObject) -> bool {
 
 fn import_dp_module<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyModule>> {
     PyModule::import(py, "soac.runtime")
+}
+
+fn install_soac_runtime_bootstrap_sentinel<'py>(
+    py: Python<'py>,
+    globals: &Bound<'py, PyDict>,
+    shared_state: &SharedModuleState,
+    name: &str,
+) -> PyResult<Bound<'py, PyAny>> {
+    let id = shared_state
+        .codegen_constants
+        .require_runtime_name_constant_id(name);
+    let obj = shared_state.module_constant_obj(id).ok_or_else(|| {
+        PyRuntimeError::new_err(format!("missing runtime bootstrap constant {name:?}"))
+    })?;
+    let obj = obj.bind(py).clone();
+    globals.set_item(name, &obj)?;
+    Ok(obj)
+}
+
+struct SoacRuntimeBootstrapGlobals {
+    helpers: Vec<(&'static str, Py<PyAny>)>,
+}
+
+impl SoacRuntimeBootstrapGlobals {
+    fn restore(&self, py: Python<'_>, globals: &Bound<'_, PyDict>) -> PyResult<()> {
+        for (name, value) in &self.helpers {
+            globals.set_item(*name, value.bind(py))?;
+        }
+        Ok(())
+    }
+}
+
+fn install_soac_runtime_bootstrap_globals(
+    py: Python<'_>,
+    globals: &Bound<'_, PyDict>,
+    shared_state: &SharedModuleState,
+) -> PyResult<SoacRuntimeBootstrapGlobals> {
+    let bootstrap = soac_jit::module_constants::build_soac_runtime_bootstrap_module(py)?;
+    let deleted = install_soac_runtime_bootstrap_sentinel(py, globals, shared_state, "DELETED")?;
+    install_soac_runtime_bootstrap_sentinel(py, globals, shared_state, "ITER_COMPLETE")?;
+    bootstrap.setattr("DELETED", deleted)?;
+    let mut helpers = Vec::new();
+    for name in [
+        "_entry_template",
+        "code_with_freevars",
+        "tuple_values",
+        "make_function",
+        "create_class",
+        "import_",
+        "import_attr",
+        "class_lookup_global",
+        "class_lookup_cell",
+    ] {
+        let helper = bootstrap.getattr(name)?;
+        globals.set_item(name, &helper)?;
+        helpers.push((name, helper.unbind()));
+    }
+    Ok(SoacRuntimeBootstrapGlobals { helpers })
 }
 
 fn tuple_from_owned_objects<'py>(
@@ -310,6 +368,7 @@ fn original_code_lookup_key(function: &BlockPyFunction<CodegenModuleShape>) -> O
     if qualname == "_dp_module_init"
         || qualname == "__annotate__"
         || qualname.ends_with(".__annotate_func__")
+        || function.names.fn_name == "_dp_resume"
         || function.names.bind_name.starts_with("_dp_class_ns_")
         || function.names.bind_name.starts_with("_dp_define_class_")
     {
@@ -913,7 +972,7 @@ fn instantiate_bb_function(
 fn instantiate_closure_backed_entry<'py>(
     py: Python<'py>,
     dp: &Bound<'py, PyModule>,
-    _module_name: &str,
+    module_name: &str,
     function: &BlockPyFunction<CodegenModuleShape>,
     captures: &Bound<'py, PyAny>,
     module_globals: &Bound<'py, PyAny>,
@@ -946,7 +1005,12 @@ fn instantiate_closure_backed_entry<'py>(
             original_code.as_ref().map(|code| code.as_any()),
         )?
     };
-    register_lazy_vectorcall(py, &entry, function.function_id, module_runtime)?;
+    // soac.runtime's source helpers are the runtime ABI for other transformed
+    // modules.  Running them through lazy_vectorcall would push a soac.runtime
+    // context while the caller's module context must remain current.
+    if !(module_name == "soac.runtime" && original_code.is_some()) {
+        register_lazy_vectorcall(py, &entry, function.function_id, module_runtime)?;
+    }
     Ok(entry)
 }
 
@@ -1012,9 +1076,16 @@ fn create_module(py: Python<'_>, path: &str, spec: Py<PyAny>) -> PyResult<Py<PyA
         indexed_module_keys: Vec::new(),
     };
     let session = soac_jit::CompileSession::new();
+    let lowering_options = LoweringOptions {
+        runtime_names_as_globals: module_name == "soac.runtime",
+    };
     let output = time_phase(&mut create_timings, "lower_blockpy", || {
-        lower_python_to_blockpy_recorded(&source, session.module_name_gen())
-            .map_err(lowering_error_to_pyerr)
+        lower_python_to_blockpy_recorded_with_options(
+            &source,
+            session.module_name_gen(),
+            lowering_options,
+        )
+        .map_err(lowering_error_to_pyerr)
     })?;
     let lowering_total = output.total_time;
     let blockpy_pass_timings: Vec<TimedPhase> = output
@@ -1124,7 +1195,22 @@ fn exec_module_inner(
         })?;
         let function =
             lookup_module_init_function(&module_data.shared_state.lowered_module, &module_name)?;
-        let dp = time_phase(exec_timings, "import_soac_runtime", || import_dp_module(py))?;
+        let is_soac_runtime = module_name == "soac.runtime";
+        let soac_runtime_bootstrap = if is_soac_runtime {
+            let globals = module_globals.cast::<PyDict>()?;
+            Some(time_phase(
+                exec_timings,
+                "install_soac_runtime_bootstrap",
+                || install_soac_runtime_bootstrap_globals(py, globals, &module_data.shared_state),
+            )?)
+        } else {
+            None
+        };
+        let dp = if is_soac_runtime {
+            module.cast::<PyModule>()?.clone()
+        } else {
+            time_phase(exec_timings, "import_soac_runtime", || import_dp_module(py))?
+        };
         let empty = PyTuple::empty(py);
         let none = py.None();
         let mut module_runtime = time_phase(exec_timings, "build_module_runtime_context", || {
@@ -1160,6 +1246,12 @@ fn exec_module_inner(
             )
         });
         result?;
+        if let Some(bootstrap) = &soac_runtime_bootstrap {
+            let globals = module_globals.cast::<PyDict>()?;
+            time_phase(exec_timings, "restore_soac_runtime_bootstrap", || {
+                bootstrap.restore(py, globals)
+            })?;
+        }
         time_phase(exec_timings, "register_function_owner_types", || {
             unsafe { soac_jit::register_function_owner_types_for_module(module.as_ptr()) }.map_err(
                 |_| {

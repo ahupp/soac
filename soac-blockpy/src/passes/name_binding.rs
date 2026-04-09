@@ -2925,9 +2925,49 @@ fn rewrite_unsound_builtin_loads_as_runtime_names(
     module
 }
 
+struct RuntimeNameGlobalNameRewriter;
+
+fn should_keep_runtime_bootstrap_name_as_constant(name: &ResolvedName) -> bool {
+    name.is_runtime_symbol("TRUE")
+        || name.is_runtime_symbol("FALSE")
+        || name.is_runtime_symbol("NONE")
+        || name.is_runtime_symbol("ELLIPSIS")
+        || name.is_runtime_symbol("EMPTY_TUPLE")
+        || name.is_runtime_symbol("ITER_COMPLETE")
+        || name.is_runtime_symbol("tuple_values")
+        || name.is_runtime_symbol("make_function")
+        || name.is_runtime_symbol("create_class")
+        || name.is_runtime_symbol("import_")
+        || name.is_runtime_symbol("import_attr")
+        || name.is_runtime_symbol("class_lookup_global")
+        || name.is_runtime_symbol("class_lookup_cell")
+}
+
+impl crate::block_py::VisitMut<InstrResolved> for RuntimeNameGlobalNameRewriter {
+    fn visit_instr_mut(&mut self, expr: &mut InstrResolved) {
+        if let InstrResolved::Load(op) = expr {
+            if op.name.location.is_runtime_name()
+                && !should_keep_runtime_bootstrap_name_as_constant(&op.name)
+            {
+                op.name.location = NameLocation::global_name();
+            }
+        }
+        expr.visit_children_mut(self);
+    }
+}
+
+fn rewrite_runtime_name_loads_as_global_names(
+    mut module: BlockPyModule<ResolvedStorageModuleShape>,
+) -> BlockPyModule<ResolvedStorageModuleShape> {
+    let mut rewriter = RuntimeNameGlobalNameRewriter;
+    crate::block_py::walk_module_mut(&mut rewriter, &mut module);
+    module
+}
+
 pub(crate) fn lower_name_binding_in_core_blockpy_module_with_unsound_runtime_builtins(
     module: BlockPyModule<CoreModuleShape>,
     unsound_runtime_builtin_names: bool,
+    runtime_names_as_globals: bool,
 ) -> BlockPyModule<ResolvedStorageModuleShape> {
     let callable_defs = ensure_module_storage_layouts(module.callable_defs);
     let callee_make_function_capture_names =
@@ -2947,14 +2987,25 @@ pub(crate) fn lower_name_binding_in_core_blockpy_module_with_unsound_runtime_bui
     if unsound_runtime_builtin_names {
         module = rewrite_unsound_builtin_loads_as_runtime_names(module);
     }
+    if runtime_names_as_globals {
+        module = rewrite_runtime_name_loads_as_global_names(module);
+    }
     ModuleConstantExtractor::default().extract_module(module)
 }
 
 pub(crate) fn lower_name_binding_in_core_blockpy_module(
     module: BlockPyModule<CoreModuleShape>,
 ) -> BlockPyModule<ResolvedStorageModuleShape> {
+    lower_name_binding_in_core_blockpy_module_with_options(module, false)
+}
+
+pub(crate) fn lower_name_binding_in_core_blockpy_module_with_options(
+    module: BlockPyModule<CoreModuleShape>,
+    runtime_names_as_globals: bool,
+) -> BlockPyModule<ResolvedStorageModuleShape> {
     lower_name_binding_in_core_blockpy_module_with_unsound_runtime_builtins(
         module,
         unsound_runtime_builtin_names_enabled(),
+        runtime_names_as_globals,
     )
 }

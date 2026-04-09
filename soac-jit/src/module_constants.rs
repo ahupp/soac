@@ -1,5 +1,7 @@
+use pyo3::exceptions::PyRuntimeError;
 use pyo3::ffi;
 use pyo3::prelude::*;
+use pyo3::types::{PyModule, PyTuple};
 use soac_blockpy::block_py::{
     AbruptKind, BlockArg, BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword,
     ChildVisitable, InstrCodegen, InstrResolved, Literal, NameLike, NumberLiteralValue,
@@ -24,8 +26,23 @@ const ALWAYS_REQUIRED_UNICODE_CONSTANTS: &[&str] = &[
     "extend",
     "update",
 ];
-const ALWAYS_REQUIRED_RUNTIME_NAME_CONSTANTS: &[&str] =
-    &["TRUE", "FALSE", "NONE", "DELETED", "EMPTY_TUPLE"];
+const ALWAYS_REQUIRED_RUNTIME_NAME_CONSTANTS: &[&str] = &[
+    "TRUE",
+    "FALSE",
+    "NONE",
+    "DELETED",
+    "EMPTY_TUPLE",
+    "ITER_COMPLETE",
+];
+const SOAC_RUNTIME_BOOTSTRAP_HELPER_NAMES: &[&str] = &[
+    "tuple_values",
+    "make_function",
+    "create_class",
+    "import_",
+    "import_attr",
+    "class_lookup_global",
+    "class_lookup_cell",
+];
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct ModuleConstantId(pub usize);
@@ -40,6 +57,12 @@ enum ModuleConstantValue {
     RuntimeName(Vec<u8>),
 }
 
+#[derive(Debug, Clone, Copy)]
+enum RuntimeNameConstantMode {
+    ImportRuntime,
+    BootstrapSoacRuntime,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ModuleCodegenConstants {
     values: Vec<ModuleConstantValue>,
@@ -48,6 +71,17 @@ pub struct ModuleCodegenConstants {
 
 impl ModuleCodegenConstants {
     pub fn collect_from_module(module: &BlockPyModule<CodegenModuleShape>) -> Self {
+        Self::collect_from_module_with_runtime_prelude(module, true)
+    }
+
+    pub fn collect_from_runtime_module(module: &BlockPyModule<CodegenModuleShape>) -> Self {
+        Self::collect_from_module_with_runtime_prelude(module, true)
+    }
+
+    fn collect_from_module_with_runtime_prelude(
+        module: &BlockPyModule<CodegenModuleShape>,
+        include_runtime_name_prelude: bool,
+    ) -> Self {
         let mut collector = ModuleConstantCollector::default();
         for expr in &module.module_constants {
             collector.constants.push_explicit_constant_expr(expr);
@@ -55,10 +89,12 @@ impl ModuleCodegenConstants {
         for name in ALWAYS_REQUIRED_UNICODE_CONSTANTS {
             collector.constants.intern_unicode_bytes(name.as_bytes());
         }
-        for name in ALWAYS_REQUIRED_RUNTIME_NAME_CONSTANTS {
-            collector
-                .constants
-                .intern_runtime_name_bytes(name.as_bytes());
+        if include_runtime_name_prelude {
+            for name in ALWAYS_REQUIRED_RUNTIME_NAME_CONSTANTS {
+                collector
+                    .constants
+                    .intern_runtime_name_bytes(name.as_bytes());
+            }
         }
         for function in &module.callable_defs {
             collector.collect_function(function);
@@ -85,6 +121,24 @@ impl ModuleCodegenConstants {
     }
 
     pub fn build_python_constants(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
+        self.build_python_constants_with_runtime_names(py, RuntimeNameConstantMode::ImportRuntime)
+    }
+
+    pub fn build_python_constants_for_soac_runtime(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<Vec<Py<PyAny>>> {
+        self.build_python_constants_with_runtime_names(
+            py,
+            RuntimeNameConstantMode::BootstrapSoacRuntime,
+        )
+    }
+
+    fn build_python_constants_with_runtime_names(
+        &self,
+        py: Python<'_>,
+        runtime_name_mode: RuntimeNameConstantMode,
+    ) -> PyResult<Vec<Py<PyAny>>> {
         let mut out = Vec::with_capacity(self.values.len());
         for value in &self.values {
             out.push(match value {
@@ -118,10 +172,7 @@ impl ModuleCodegenConstants {
                     bound.unbind()
                 }
                 ModuleConstantValue::RuntimeName(bytes) => {
-                    let name = build_unicode_constant(py, bytes)?;
-                    let ptr = unsafe { load_runtime_name_owned(name.as_ptr()) };
-                    let bound: Bound<'_, PyAny> = unsafe { Bound::from_owned_ptr_or_err(py, ptr)? };
-                    bound.unbind()
+                    build_runtime_name_constant(py, bytes, runtime_name_mode)?
                 }
             });
         }
@@ -297,6 +348,223 @@ fn build_unicode_constant<'py>(py: Python<'py>, bytes: &[u8]) -> PyResult<Bound<
         ffi::PyUnicode_InternInPlace(&mut ptr);
         Bound::from_owned_ptr_or_err(py, ptr)
     }
+}
+
+fn build_runtime_name_constant(
+    py: Python<'_>,
+    bytes: &[u8],
+    mode: RuntimeNameConstantMode,
+) -> PyResult<Py<PyAny>> {
+    if matches!(mode, RuntimeNameConstantMode::BootstrapSoacRuntime) {
+        return build_soac_runtime_bootstrap_runtime_name(py, bytes);
+    }
+    let name = build_unicode_constant(py, bytes)?;
+    let ptr = unsafe { load_runtime_name_owned(name.as_ptr()) };
+    let bound: Bound<'_, PyAny> = unsafe { Bound::from_owned_ptr_or_err(py, ptr)? };
+    Ok(bound.unbind())
+}
+
+fn build_soac_runtime_bootstrap_runtime_name(py: Python<'_>, bytes: &[u8]) -> PyResult<Py<PyAny>> {
+    let name = std::str::from_utf8(bytes)
+        .map_err(|_| PyRuntimeError::new_err("runtime-name constant is not UTF-8"))?;
+    if SOAC_RUNTIME_BOOTSTRAP_HELPER_NAMES.contains(&name) {
+        return Ok(build_soac_runtime_bootstrap_module(py)?
+            .getattr(name)?
+            .unbind());
+    }
+    match name {
+        "TRUE" => {
+            let ptr = unsafe { ffi::PyBool_FromLong(1) };
+            let bound: Bound<'_, PyAny> = unsafe { Bound::from_owned_ptr_or_err(py, ptr)? };
+            Ok(bound.unbind())
+        }
+        "FALSE" => {
+            let ptr = unsafe { ffi::PyBool_FromLong(0) };
+            let bound: Bound<'_, PyAny> = unsafe { Bound::from_owned_ptr_or_err(py, ptr)? };
+            Ok(bound.unbind())
+        }
+        "NONE" => Ok(py.None().into_any()),
+        "ELLIPSIS" => Ok(PyModule::import(py, "builtins")?
+            .getattr("Ellipsis")?
+            .unbind()),
+        "EMPTY_TUPLE" => Ok(PyTuple::empty(py).clone().into_any().unbind()),
+        "DELETED" | "ITER_COMPLETE" => Ok(PyModule::import(py, "builtins")?
+            .getattr("object")?
+            .call0()?
+            .unbind()),
+        other => Err(PyRuntimeError::new_err(format!(
+            "soac.runtime bootstrap cannot build runtime-name constant {other:?}; \
+             it should have been lowered as a global name"
+        ))),
+    }
+}
+
+pub fn build_soac_runtime_bootstrap_module<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyModule>> {
+    PyModule::from_code(
+        py,
+        c"
+import builtins as _builtins
+from soac import _soac_ext
+import sys as _sys
+import types as _types
+
+DELETED = object()
+
+def _entry_template(*args, **kwargs):
+    raise RuntimeError('SOAC runtime bootstrap entry template executed')
+
+_DP_CODE_WITH_FREEVARS_CACHE = {}
+_CLIF_ENTRY_RUNTIME_ERROR = 'CLIF entry executed without vectorcall interception'
+_PYTHON_KEYWORDS = frozenset((
+    'False', 'None', 'True', 'and', 'as', 'assert', 'async', 'await',
+    'break', 'class', 'continue', 'def', 'del', 'elif', 'else',
+    'except', 'finally', 'for', 'from', 'global', 'if', 'import',
+    'in', 'is', 'lambda', 'nonlocal', 'not', 'or', 'pass', 'raise',
+    'return', 'try', 'while', 'with', 'yield',
+))
+
+def code_with_freevars(names, is_async, is_generator):
+    names = tuple(names)
+    is_async = bool(is_async)
+    is_generator = bool(is_generator)
+    cache_key = (names, is_async, is_generator)
+    cached = _DP_CODE_WITH_FREEVARS_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    for name in names:
+        if not isinstance(name, str):
+            raise TypeError(f'freevar names must be str, got {type(name)!r}')
+        if not name.isidentifier() or name in _PYTHON_KEYWORDS:
+            raise ValueError(f'invalid freevar name: {name!r}')
+    if len(set(names)) != len(names):
+        raise ValueError('freevar names must be unique')
+
+    outer_lines = ['def __dp_make_code():']
+    for name in names:
+        outer_lines.append(f'    {name} = None')
+    if is_async:
+        outer_lines.append('    async def wrapped(*args, **kwargs):')
+    else:
+        outer_lines.append('    def wrapped(*args, **kwargs):')
+    if names:
+        outer_lines.append('        if False:')
+        for name in names:
+            outer_lines.append(f'            {name}')
+    if is_async and is_generator:
+        outer_lines.append('        if False:')
+        outer_lines.append('            yield None')
+    elif is_generator:
+        outer_lines.append('        if False:')
+        outer_lines.append('            yield None')
+    outer_lines.append(f'        raise RuntimeError({_CLIF_ENTRY_RUNTIME_ERROR!r})')
+    outer_lines.append('    return wrapped.__code__')
+
+    ns = {}
+    exec('\\n'.join(outer_lines), {}, ns)
+    code = ns['__dp_make_code']()
+    if code.co_freevars != names:
+        code = code.replace(co_freevars=names)
+    _DP_CODE_WITH_FREEVARS_CACHE[cache_key] = code
+    return code
+
+def tuple_values(*values):
+    return tuple(values)
+
+def make_function(function_id, kind, captures, param_defaults, annotate_fn=None):
+    func = _soac_ext.make_bb_function(function_id, captures, param_defaults, annotate_fn)
+    if kind == 'coroutine':
+        from asyncio import coroutines as _coroutines
+        func._is_coroutine = _coroutines._is_coroutine
+    return func
+
+def create_class(
+    name,
+    namespace_fn,
+    bases,
+    kwds,
+    requires_class_cell,
+    firstlineno=None,
+    static_attributes=(),
+):
+    resolved_bases = _types.resolve_bases(bases)
+    meta, ns, meta_kwds = _types.prepare_class(name, resolved_bases, kwds)
+    class_cell = ns.get('__classcell__', None)
+    if requires_class_cell and class_cell is None:
+        class_cell = _types.CellType()
+        ns['__classcell__'] = class_cell
+    namespace_fn(ns, class_cell)
+    if '__firstlineno__' not in ns and firstlineno is not None:
+        ns['__firstlineno__'] = firstlineno
+    if '__static_attributes__' not in ns:
+        ns['__static_attributes__'] = static_attributes
+    if resolved_bases is not bases and '__orig_bases__' not in ns:
+        ns['__orig_bases__'] = bases
+    cls = meta(name, resolved_bases, ns, **meta_kwds)
+    if cls is not None:
+        ns.pop('__classcell__', None)
+        if class_cell is not None:
+            if isinstance(class_cell, _types.CellType):
+                class_cell.cell_contents = cls
+            else:
+                raise TypeError('__classcell__ must be a cell')
+        _soac_ext.profile_watch_type_key_layout(cls)
+    return cls
+
+def import_(name, spec, fromlist=None, level=0):
+    if fromlist is None:
+        fromlist = []
+    globals_dict = {'__spec__': spec}
+    if spec is not None:
+        package = spec.parent
+        if not package and getattr(spec, 'submodule_search_locations', None):
+            package = spec.name
+        globals_dict['__package__'] = package
+        globals_dict['__name__'] = spec.name
+    return _builtins.__import__(name, globals_dict, {}, fromlist, level)
+
+def import_attr(module, attr):
+    try:
+        return getattr(module, attr)
+    except AttributeError:
+        module_name = getattr(module, '__name__', None)
+        if module_name:
+            submodule = _sys.modules.get(f'{module_name}.{attr}')
+            if submodule is not None:
+                return submodule
+        raise
+
+def class_lookup_global(class_ns, name, globals_dict):
+    try:
+        return class_ns[name]
+    except KeyError:
+        try:
+            return globals_dict[name]
+        except KeyError:
+            try:
+                return _builtins.__dict__[name]
+            except KeyError as exc:
+                raise NameError(f'name {name!r} is not defined') from exc
+
+def class_lookup_cell(class_ns, name, cell):
+    try:
+        return class_ns[name]
+    except KeyError:
+        pass
+    try:
+        value = cell.cell_contents
+    except ValueError as exc:
+        raise NameError(
+            f'cannot access free variable {name!r} where it is not associated with a value in enclosing scope'
+        ) from exc
+    if value is DELETED:
+        raise NameError(
+            f'cannot access free variable {name!r} where it is not associated with a value in enclosing scope'
+        )
+    return value
+",
+        c"<soac.runtime bootstrap>",
+        c"soac.runtime._bootstrap",
+    )
 }
 
 fn mark_constants_immortal(constants: &[Py<PyAny>]) {

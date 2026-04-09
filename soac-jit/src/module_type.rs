@@ -110,6 +110,13 @@ impl SharedModuleState {
             .collect()
     }
 
+    pub fn module_constant_obj(
+        &self,
+        id: crate::module_constants::ModuleConstantId,
+    ) -> Option<&Py<PyAny>> {
+        self.module_constant_objs.get(id.0)
+    }
+
     pub(crate) fn counter_ptrs(&self) -> Vec<*mut u64> {
         self.counter_slots_by_id
             .iter()
@@ -478,8 +485,16 @@ pub fn build_shared_state_for_inspection(
     let function_index_by_id = build_function_index_by_id(&lowered_module)?;
     let (counter_slots_by_id, counter_values, top_value_counters) =
         build_counter_storage(&lowered_module.counter_defs)?;
-    let codegen_constants = ModuleCodegenConstants::collect_from_module(&lowered_module);
-    let module_constant_objs = codegen_constants.build_python_constants(py)?;
+    let codegen_constants = if module_name == "soac.runtime" {
+        ModuleCodegenConstants::collect_from_runtime_module(&lowered_module)
+    } else {
+        ModuleCodegenConstants::collect_from_module(&lowered_module)
+    };
+    let module_constant_objs = if module_name == "soac.runtime" {
+        codegen_constants.build_python_constants_for_soac_runtime(py)?
+    } else {
+        codegen_constants.build_python_constants(py)?
+    };
     Ok(Arc::new(SharedModuleState {
         lowered_module,
         module_name: module_name.to_string(),
@@ -546,8 +561,16 @@ impl SoacExtModuleState {
         let function_index_by_id = build_function_index_by_id(&lowered_module)?;
         let (counter_slots_by_id, counter_values, top_value_counters) =
             build_counter_storage(&lowered_module.counter_defs)?;
-        let codegen_constants = ModuleCodegenConstants::collect_from_module(&lowered_module);
-        let module_constant_objs = codegen_constants.build_python_constants(py)?;
+        let codegen_constants = if module_name == "soac.runtime" {
+            ModuleCodegenConstants::collect_from_runtime_module(&lowered_module)
+        } else {
+            ModuleCodegenConstants::collect_from_module(&lowered_module)
+        };
+        let module_constant_objs = if module_name == "soac.runtime" {
+            codegen_constants.build_python_constants_for_soac_runtime(py)?
+        } else {
+            codegen_constants.build_python_constants(py)?
+        };
         self.shared_state.write(Arc::new(SharedModuleState {
             lowered_module,
             module_name,
@@ -641,11 +664,14 @@ pub unsafe fn watch_split_keys_for_type(type_obj: *mut ffi::PyObject) -> Result<
     if type_obj.is_null() {
         return Err(());
     }
-    if unsafe { _PyDict_WatchSplitKeysForType(type_obj) } < 0 {
-        Err(())
-    } else {
-        Ok(())
+    if unsafe { _PyDict_WatchSplitKeysForType(type_obj) } == 0 {
+        return Ok(());
     }
+    if unsafe { ffi::PyErr_ExceptionMatches(ffi::PyExc_TypeError) } != 0 {
+        unsafe { ffi::PyErr_Clear() };
+        return Ok(());
+    }
+    Err(())
 }
 
 fn snapshot_type_key_layout_events(module_name: &str) -> Vec<CounterDumpKeyLayout> {

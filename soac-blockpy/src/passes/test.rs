@@ -162,6 +162,7 @@ fn unsound_runtime_builtin_name_binding_module(
     super::name_binding::lower_name_binding_in_core_blockpy_module_with_unsound_runtime_builtins(
         core_blockpy,
         true,
+        false,
     )
 }
 
