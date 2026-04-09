@@ -222,13 +222,13 @@ instance's live working commit.
   against stock CPython. Report the specialized second-pass throughput
   as the transformed result unless I explicitly ask for the warm
   unspecialized baseline.
-- `DIET_PYTHON_COUNTERS_DIR` / `DIET_PYTHON_SPECIALIZATION_MODE`
-  Normal specialization runs use one counters directory with conventional
-  files: `profile.bin` for specialization input and `verify.bin` for the
-  countered verification pass. Set
-  `DIET_PYTHON_SPECIALIZATION_MODE=profile`, `verify`, or `apply`;
-  recipes should pass the same `DIET_PYTHON_COUNTERS_DIR` and change
-  only the mode between passes.
+- `SOAC_WORK_DIR` / `SOAC_MODE`
+  Normal specialization runs use one work directory with conventional
+  files: `profile.bin` for specialization input, `verify.bin` for the
+  countered verification pass, and `soac_events.jsonl` for default JSON
+  tracing output. Set `SOAC_MODE=profile`, `verify`, or `apply`; recipes
+  should pass the same `SOAC_WORK_DIR` and change only the mode between
+  passes.
 - `BENCHMARK_CPU` / `BENCHMARK_CONSTANT_CLOCKS`
   The benchmark recipes use
   [scripts/run_benchmark_with_cpu_mode.sh](/home/adam/project/soac-profile/scripts/run_benchmark_with_cpu_mode.sh)
@@ -251,7 +251,8 @@ instance's live working commit.
   `;json=/path/to/events.jsonl` to write tracing JSONL there instead
   of formatted stderr. Module-load timing is emitted by the
   `soac_module_load` target; JIT-codegen timing is emitted by
-  `soac_jit_codegen`.
+  `soac_jit_codegen`. When `SOAC_LOG` is unset and `SOAC_WORK_DIR` is
+  set, the default event log is `$SOAC_WORK_DIR/soac_events.jsonl`.
 - `DIET_PYTHON_KEY_LAYOUT_COUNTERS`
   Enables cold module/type key-layout records in the counter dump. This
   is metadata collection, not a hot increment counter: module keys are
@@ -290,7 +291,7 @@ instance's live working commit.
 
 - To inspect transformed output quickly, run `cargo run --bin diet-python <file.py>`.
 - For BB/JIT inspection, `cargo run -p soac-inspector --bin render_jit_clif -- <source> <function_id>`.
-- To trace BB execution, set `DIET_PYTHON_BB_TRACE` to `all`, `all:params`, `<exact-qualname>`, or `<exact-qualname>:params`.
+- To trace BB execution, set `SOAC_EXEC_TRACE` to `all`, `all:params`, `<exact-qualname>`, or `<exact-qualname>:params`.
 
 
 ### Jujutsu conventions

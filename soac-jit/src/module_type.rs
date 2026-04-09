@@ -669,10 +669,7 @@ pub fn key_layout_counter_enabled() -> bool {
 
 fn specialization_mode_records_counters() -> bool {
     matches!(
-        env::var("DIET_PYTHON_SPECIALIZATION_MODE")
-            .ok()
-            .as_deref()
-            .map(str::trim),
+        env::var("SOAC_MODE").ok().as_deref().map(str::trim),
         Some("profile" | "verify")
     )
 }
@@ -769,38 +766,27 @@ fn snapshot_type_key_layout_events_bound(
 }
 
 fn counter_dump_file_from_env() -> Option<std::path::PathBuf> {
-    if let Some(path) = counter_dump_file_from_mode_env() {
-        return Some(path);
-    }
-    let raw = env::var("DIET_PYTHON_COUNTERS_OUTPUT_FILE").ok()?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.into())
-    }
-}
-
-fn counter_dump_file_from_mode_env() -> Option<std::path::PathBuf> {
-    let mode = env::var("DIET_PYTHON_SPECIALIZATION_MODE").ok()?;
+    let mode = env::var("SOAC_MODE").ok()?;
     let filename = match mode.trim() {
         "profile" => "profile.bin",
         "verify" => "verify.bin",
         _ => return None,
     };
-    let dir = env::var("DIET_PYTHON_COUNTERS_DIR").ok()?;
-    let dir: std::path::PathBuf = dir.trim().into();
-    if dir.as_os_str().is_empty() {
-        return None;
-    }
-    if let Err(err) = create_dir_all(dir.as_path()) {
+    let dir = soac_work_dir_from_env()?;
+    if let Err(err) = create_dir_all(&dir) {
         eprintln!(
-            "[soac counters] failed to create counter dump directory {}: {err}",
+            "[soac counters] failed to create SOAC_WORK_DIR {}: {err}",
             dir.display()
         );
         return None;
     }
     Some(dir.join(filename))
+}
+
+fn soac_work_dir_from_env() -> Option<std::path::PathBuf> {
+    env::var_os("SOAC_WORK_DIR")
+        .map(std::path::PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
 }
 
 unsafe extern "C" fn soac_ext_module_clear(module: *mut ffi::PyObject) -> c_int {

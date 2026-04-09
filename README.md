@@ -82,11 +82,6 @@ exports are intentionally omitted here.
 
 ## Import Hook And Runtime Behavior
 
-- `DIET_PYTHON_INSTALL_HOOK=1`
-  Have the repo-root [`sitecustomize.py`](/home/adam/project/soac-profile/sitecustomize.py)
-  install the transformed import hook automatically at interpreter
-  startup.
-
 - `SOAC_MODULE_ENABLED=path:/absolute/or/relative/root[,path:/another/root]`
   In `def _module_is_enabled`, at
   [soac_py/src/soac/import_hook.py:39](/home/adam/project/soac-profile/soac_py/src/soac/import_hook.py#L39),
@@ -94,13 +89,13 @@ exports are intentionally omitted here.
   file-tree roots. When unset, an installed import hook attempts to
   transform every transformable Python source import.
 
-- `DIET_PYTHON_JIT_COMPILE_MODE=eager`
+- `SOAC_COMPILE_MODE=eager`
   In `fn eager_clif_compile_requested`, at
   [soac-pyo3/src/jit_runtime.rs:96](/home/adam/project/soac-profile/soac-pyo3/src/jit_runtime.rs#L96),
   eagerly compile lazy CLIF/JIT entries as they are registered instead
   of waiting for first execution.
 
-- `DIET_PYTHON_BB_TRACE=<selector>`
+- `SOAC_EXEC_TRACE=<selector>`
   In `fn parse_trace_env`, at
   [soac-blockpy/src/passes/trace/mod.rs:15](/home/adam/project/soac-profile/soac-blockpy/src/passes/trace/mod.rs#L15),
   enable basic-block tracing. Accepted forms are:
@@ -123,34 +118,38 @@ exports are intentionally omitted here.
   `soac_module_load` tracing events, and JIT-codegen timing is emitted
   through `soac_jit_codegen`; enable them with
   `SOAC_LOG=soac_module_load=info,soac_jit_codegen=info`.
+  When `SOAC_LOG` is unset and `SOAC_WORK_DIR` is set, SOAC writes
+  default JSON events to `$SOAC_WORK_DIR/soac_events.jsonl`.
 
 ## Counters And Specialization
 
-- `DIET_PYTHON_SPECIALIZATION_MODE=profile|verify|apply`
+- `SOAC_WORK_DIR=/path/to/work-dir`
+  Runtime work directory for generated process-local output. In normal
+  specialization workflows this directory contains:
+  - `profile.bin`: specialization input recorded by the profile pass.
+  - `verify.bin`: countered output recorded by the verify pass.
+  - `soac_events.jsonl`: default tracing JSONL when `SOAC_LOG` is not
+    set.
+
+- `SOAC_MODE=profile|verify|apply`
   Select the runtime specialization phase:
   - `profile`: run unspecialized, instrument specialization input
-    counters, and write `<counters-dir>/profile.bin`.
-  - `verify`: read `<counters-dir>/profile.bin`, apply its
+    counters, and write `$SOAC_WORK_DIR/profile.bin`.
+  - `verify`: read `$SOAC_WORK_DIR/profile.bin`, apply its
     specializations, instrument specialization input counters again, and
-    write `<counters-dir>/verify.bin`.
-  - `apply`: read `<counters-dir>/profile.bin`, apply its
+    write `$SOAC_WORK_DIR/verify.bin`.
+  - `apply`: read `$SOAC_WORK_DIR/profile.bin`, apply its
     specializations, and emit no specialization counters.
-  Leave unset for the ordinary unspecialized/no-counter path, or when
-  using the low-level override environment variables below.
-
-- `DIET_PYTHON_COUNTERS_DIR=/path/to/counters-dir`
-  Directory used by `DIET_PYTHON_SPECIALIZATION_MODE`. The runtime
-  creates the directory when it writes counters. The conventional files
-  are `profile.bin` for the specialization input and `verify.bin` for
-  the countered verification pass. Use `SOAC_LOG` to collect
-  module-load timing events.
+  Set `SOAC_WORK_DIR` for any mode that reads or writes counters. Leave
+  `SOAC_MODE` unset for the ordinary unspecialized/no-counter path, or
+  when using the low-level override environment variables below.
 
 - `DIET_PYTHON_CALL_TARGET_COUNTERS=1`
   In `fn call_target_counter_instrumentation_enabled`, at
   [soac-blockpy/src/passes/trace/mod.rs:27](/home/adam/project/soac-profile/soac-blockpy/src/passes/trace/mod.rs#L27),
   enable runtime call-target profiling. Prefer
-  `DIET_PYTHON_SPECIALIZATION_MODE=profile` for normal multi-pass
-  specialization runs.
+  `SOAC_MODE=profile` plus `SOAC_WORK_DIR=/path/to/work-dir` for normal
+  multi-pass specialization runs.
 
 - `DIET_PYTHON_GLOBAL_LOAD_COUNTERS=1`
   In `fn global_load_counter_instrumentation_enabled`, at
@@ -167,32 +166,18 @@ exports are intentionally omitted here.
   environment variable when you want key-layout metadata without
   call-target probes.
 
-- `DIET_PYTHON_COUNTERS_OUTPUT_FILE=/path/to/dump.bin`
-  In `fn counter_dump_file_from_env`, at
-  [soac-jit/src/module_type.rs:570](/home/adam/project/soac-profile/soac-jit/src/module_type.rs#L570),
-  write a counter dump on process exit. This is a low-level file
-  override; prefer `DIET_PYTHON_COUNTERS_DIR` plus
-  `DIET_PYTHON_SPECIALIZATION_MODE=profile|verify` for normal runs.
-
-- `DIET_PYTHON_COUNTERS_FILE=/path/to/dump.bin`
-  In `fn load_call_target_specializations`, at
-  [soac-jit/src/jit/mod.rs:1968](/home/adam/project/soac-profile/soac-jit/src/jit/mod.rs#L1968),
-  read an existing counter dump and derive specializations in-process,
-  overriding the mode-derived `<counters-dir>/profile.bin` input. This
-  is input-only; it is not rewritten on exit.
-
 - `DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS=...`
   In `fn parse_call_target_specializations_env`, at
   [soac-jit/src/jit/mod.rs:1888](/home/adam/project/soac-profile/soac-jit/src/jit/mod.rs#L1888),
   provide an explicit advanced override for call-target
-  specializations. If this is set, it wins over
-  `DIET_PYTHON_COUNTERS_FILE`.
+  specializations. If this is set, it wins over profile-derived
+  specialization input.
 
 - `DIET_PYTHON_OPERATOR_SPECIALIZATIONS=...`
   In `fn parse_operator_specializations_env`, at
   [soac-jit/src/jit/mod.rs:1989](/home/adam/project/soac-profile/soac-jit/src/jit/mod.rs#L1989),
   provide an explicit advanced override for operator specializations. If
-  this is set, it wins over `DIET_PYTHON_COUNTERS_FILE`.
+  this is set, it wins over profile-derived specialization input.
 
 - `SOAC_OPT_UNSOUND=1`
   Enables compiler/runtime shortcuts that intentionally skip observable
@@ -215,14 +200,11 @@ exports are intentionally omitted here.
   checking module globals.
 
 Notes:
-- In normal workflows set one `DIET_PYTHON_COUNTERS_DIR` for the whole
-  multi-pass run and change only `DIET_PYTHON_SPECIALIZATION_MODE`.
+- In normal workflows set one `SOAC_WORK_DIR` for the whole multi-pass
+  run and change only `SOAC_MODE`.
 - The low-level `DIET_PYTHON_CALL_TARGET_COUNTERS=1` profiling path
   still disables specialization loading unless an explicit
-  `DIET_PYTHON_SPECIALIZATION_MODE` is set.
-- In normal workflows prefer `DIET_PYTHON_COUNTERS_DIR` over wiring
-  separate input and output files. Use the file-level env vars for
-  inspector/tests/ad-hoc replay.
+  `SOAC_MODE` is set.
 
 ## Perf And Benchmarking
 
@@ -236,13 +218,16 @@ Notes:
 - `SOAC_JIT_JITDUMP_DIR=/path/to/dir`
   In `fn new`, at
   [soac-jit/src/jit/jitdump.rs:98](/home/adam/project/soac-profile/soac-jit/src/jit/jitdump.rs#L98),
-  choose where `soac-jit` writes `jit-$PID.dump`.
+  choose where `soac-jit` writes `jit-$PID.dump`. This does not enable
+  jitdump recording by itself.
 
 - `PERF_BUILDID_DIR=/path/to/dir`
   Used by the perf recipes in [Justfile](/home/adam/project/soac-profile/Justfile)
   and checked in `fn serialize_unwind_info`, at
   [soac-jit/src/jit/jitdump.rs:262](/home/adam/project/soac-profile/soac-jit/src/jit/jitdump.rs#L262),
-  to control where perf build-id artifacts are written.
+  to control where perf build-id artifacts are written. Today this also
+  gates SOAC jitdump recording: if `PERF_BUILDID_DIR` is unset, SOAC
+  does not open a `jit-$PID.dump` file.
 
 - `WARMUP_LOOPS=<int>`
   In recipe `perf-pystone-jit-warm`, at

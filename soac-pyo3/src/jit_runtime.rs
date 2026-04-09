@@ -389,7 +389,7 @@ fn register_clif_vectorcall_raw(
 }
 
 fn eager_clif_compile_requested() -> bool {
-    std::env::var("DIET_PYTHON_JIT_COMPILE_MODE")
+    std::env::var("SOAC_COMPILE_MODE")
         .ok()
         .map(|value| value.trim().eq_ignore_ascii_case("eager"))
         .unwrap_or(false)

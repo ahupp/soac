@@ -70,6 +70,15 @@ struct SoacLogConfig {
     json_path: Option<PathBuf>,
 }
 
+const DEFAULT_SOAC_JSON_LOG_FILTER: &str =
+    "soac_jit=info,soac_module_load=info,soac_jit_codegen=info";
+
+fn soac_work_dir_from_env() -> Option<PathBuf> {
+    std::env::var_os("SOAC_WORK_DIR")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
 fn parse_soac_log_env() -> SoacLogConfig {
     let raw = std::env::var("SOAC_LOG").unwrap_or_default();
     let mut filter_segments = Vec::new();
@@ -86,6 +95,12 @@ fn parse_soac_log_env() -> SoacLogConfig {
             }
         } else {
             filter_segments.push(segment);
+        }
+    }
+    if raw.trim().is_empty() {
+        if let Some(work_dir) = soac_work_dir_from_env() {
+            json_path = Some(work_dir.join("soac_events.jsonl"));
+            filter_segments.push(DEFAULT_SOAC_JSON_LOG_FILTER);
         }
     }
     let filter = EnvFilter::builder()

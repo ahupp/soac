@@ -15,7 +15,7 @@ pub(crate) struct TraceConfig {
 }
 
 pub(crate) fn parse_trace_env() -> Option<TraceConfig> {
-    let raw = env::var("DIET_PYTHON_BB_TRACE").ok()?;
+    let raw = env::var("SOAC_EXEC_TRACE").ok()?;
     parse_trace_config(raw.as_str())
 }
 
@@ -45,7 +45,7 @@ pub(crate) fn locality_counter_instrumentation_enabled() -> bool {
 }
 
 fn specialization_mode_instruments_top_values() -> bool {
-    env::var("DIET_PYTHON_SPECIALIZATION_MODE")
+    env::var("SOAC_MODE")
         .map(|raw| matches!(raw.trim(), "profile" | "verify"))
         .unwrap_or(false)
 }

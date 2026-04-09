@@ -6,8 +6,13 @@ from pathlib import Path
 
 def test_utf8_mode_cmd_line_with_hook():
     repo_root = Path(__file__).resolve().parents[1]
+    script = (
+        "from soac.import_hook import install; "
+        "install(); "
+        "import encodings; "
+        "print('ok')"
+    )
     env = os.environ.copy()
-    env["DIET_PYTHON_INSTALL_HOOK"] = "1"
     env["LC_ALL"] = "C"
     pythonpath = env.get("PYTHONPATH", "")
     if pythonpath:
@@ -15,7 +20,7 @@ def test_utf8_mode_cmd_line_with_hook():
     else:
         env["PYTHONPATH"] = str(repo_root)
     result = subprocess.run(
-        [sys.executable, "-X", "utf8=0", "-c", "import encodings; print('ok')"],
+        [sys.executable, "-X", "utf8=0", "-c", script],
         env=env,
         text=True,
         capture_output=True,

@@ -269,7 +269,7 @@ mod tests {
         let old_call_target_specializations =
             std::env::var_os("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS");
         let old_operator_specializations = std::env::var_os("DIET_PYTHON_OPERATOR_SPECIALIZATIONS");
-        let old_counters_file = std::env::var_os("DIET_PYTHON_COUNTERS_FILE");
+        let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
         let old_call_target_counters = std::env::var_os("DIET_PYTHON_CALL_TARGET_COUNTERS");
         let old_pythonhome = std::env::var_os("PYTHONHOME");
         let old_pythonpath = std::env::var_os("PYTHONPATH");
@@ -286,7 +286,7 @@ mod tests {
                 specialization_value.as_str(),
             );
             std::env::remove_var("DIET_PYTHON_OPERATOR_SPECIALIZATIONS");
-            std::env::remove_var("DIET_PYTHON_COUNTERS_FILE");
+            std::env::remove_var("SOAC_WORK_DIR");
             std::env::remove_var("DIET_PYTHON_CALL_TARGET_COUNTERS");
             std::env::set_var("PYTHONHOME", &python_home);
             std::env::set_var("PYTHONPATH", python_path);
@@ -337,9 +337,9 @@ mod tests {
                 Some(value) => std::env::set_var("DIET_PYTHON_OPERATOR_SPECIALIZATIONS", value),
                 None => std::env::remove_var("DIET_PYTHON_OPERATOR_SPECIALIZATIONS"),
             }
-            match old_counters_file {
-                Some(value) => std::env::set_var("DIET_PYTHON_COUNTERS_FILE", value),
-                None => std::env::remove_var("DIET_PYTHON_COUNTERS_FILE"),
+            match old_soac_work_dir {
+                Some(value) => std::env::set_var("SOAC_WORK_DIR", value),
+                None => std::env::remove_var("SOAC_WORK_DIR"),
             }
             match old_call_target_counters {
                 Some(value) => std::env::set_var("DIET_PYTHON_CALL_TARGET_COUNTERS", value),
@@ -382,7 +382,7 @@ mod tests {
         let old_operator_specializations = std::env::var_os("DIET_PYTHON_OPERATOR_SPECIALIZATIONS");
         let old_call_target_specializations =
             std::env::var_os("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS");
-        let old_counters_file = std::env::var_os("DIET_PYTHON_COUNTERS_FILE");
+        let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
         let old_call_target_counters = std::env::var_os("DIET_PYTHON_CALL_TARGET_COUNTERS");
         let old_pythonhome = std::env::var_os("PYTHONHOME");
         let old_pythonpath = std::env::var_os("PYTHONPATH");
@@ -399,7 +399,7 @@ mod tests {
                 specialization_value.as_str(),
             );
             std::env::remove_var("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS");
-            std::env::remove_var("DIET_PYTHON_COUNTERS_FILE");
+            std::env::remove_var("SOAC_WORK_DIR");
             std::env::remove_var("DIET_PYTHON_CALL_TARGET_COUNTERS");
             std::env::set_var("PYTHONHOME", &python_home);
             std::env::set_var("PYTHONPATH", python_path);
@@ -454,9 +454,9 @@ mod tests {
                 Some(value) => std::env::set_var("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS", value),
                 None => std::env::remove_var("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS"),
             }
-            match old_counters_file {
-                Some(value) => std::env::set_var("DIET_PYTHON_COUNTERS_FILE", value),
-                None => std::env::remove_var("DIET_PYTHON_COUNTERS_FILE"),
+            match old_soac_work_dir {
+                Some(value) => std::env::set_var("SOAC_WORK_DIR", value),
+                None => std::env::remove_var("SOAC_WORK_DIR"),
             }
             match old_call_target_counters {
                 Some(value) => std::env::set_var("DIET_PYTHON_CALL_TARGET_COUNTERS", value),
@@ -2072,7 +2072,7 @@ def f():
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         let old_call_target_specializations =
             std::env::var_os("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS");
-        let old_counters_file = std::env::var_os("DIET_PYTHON_COUNTERS_FILE");
+        let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
         let old_call_target_counters = std::env::var_os("DIET_PYTHON_CALL_TARGET_COUNTERS");
         let old_pythonhome = std::env::var_os("PYTHONHOME");
         let old_pythonpath = std::env::var_os("PYTHONPATH");
@@ -2084,7 +2084,7 @@ def f():
         ])
         .expect("test PYTHONPATH should join");
         unsafe {
-            std::env::remove_var("DIET_PYTHON_COUNTERS_FILE");
+            std::env::remove_var("SOAC_WORK_DIR");
             std::env::remove_var("DIET_PYTHON_CALL_TARGET_COUNTERS");
             std::env::set_var("PYTHONHOME", &python_home);
             std::env::set_var("PYTHONPATH", python_path);
@@ -2274,9 +2274,9 @@ def f():
             },
             None => unsafe { std::env::remove_var("DIET_PYTHON_CALL_TARGET_SPECIALIZATIONS") },
         }
-        match old_counters_file {
-            Some(value) => unsafe { std::env::set_var("DIET_PYTHON_COUNTERS_FILE", value) },
-            None => unsafe { std::env::remove_var("DIET_PYTHON_COUNTERS_FILE") },
+        match old_soac_work_dir {
+            Some(value) => unsafe { std::env::set_var("SOAC_WORK_DIR", value) },
+            None => unsafe { std::env::remove_var("SOAC_WORK_DIR") },
         }
         match old_call_target_counters {
             Some(value) => unsafe { std::env::set_var("DIET_PYTHON_CALL_TARGET_COUNTERS", value) },

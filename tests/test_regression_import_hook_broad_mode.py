@@ -114,7 +114,7 @@ assert typing.Callable[..., typing.Any].__args__[-1] is typing.Any
         [sys.executable, "-c", script],
         check=False,
         capture_output=True,
-        env={**env, "DIET_PYTHON_COUNTERS_DIR": str(tmp_path / "typing-counters")},
+        env={**env, "SOAC_WORK_DIR": str(tmp_path / "typing-counters")},
         text=True,
     )
 
@@ -145,7 +145,7 @@ assert templatelib.convert("value", "s") == "value"
         [sys.executable, "-c", script],
         check=False,
         capture_output=True,
-        env={**env, "DIET_PYTHON_COUNTERS_DIR": str(tmp_path / "stdlib-edge-counters")},
+        env={**env, "SOAC_WORK_DIR": str(tmp_path / "stdlib-edge-counters")},
         text=True,
     )
 
@@ -173,7 +173,7 @@ assert runtime.ITER_COMPLETE is runtime.ITER_COMPLETE
         [sys.executable, "-c", script],
         check=False,
         capture_output=True,
-        env={**env, "DIET_PYTHON_COUNTERS_DIR": str(tmp_path / "runtime-counters")},
+        env={**env, "SOAC_WORK_DIR": str(tmp_path / "runtime-counters")},
         text=True,
     )
 
@@ -198,8 +198,8 @@ assert isinstance(runtime.AsyncGenComplete(), Exception)
         capture_output=True,
         env={
             **env,
-            "DIET_PYTHON_COUNTERS_DIR": str(tmp_path / "runtime-profile-counters"),
-            "DIET_PYTHON_SPECIALIZATION_MODE": "profile",
+            "SOAC_WORK_DIR": str(tmp_path / "runtime-profile-counters"),
+            "SOAC_MODE": "profile",
         },
         text=True,
     )

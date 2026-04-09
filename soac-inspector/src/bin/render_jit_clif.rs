@@ -76,7 +76,7 @@ fn print_usage() {
         "usage: render_jit_clif <source> <function_id> [--module-name NAME] [--cfg-dot-out PATH] [--debug-plan] [--specialized]"
     );
     eprintln!(
-        "       --specialized renders the second-pass shape using DIET_PYTHON_COUNTERS_DIR + DIET_PYTHON_SPECIALIZATION_MODE=apply, DIET_PYTHON_COUNTERS_FILE, or explicit specialization env"
+        "       --specialized renders the second-pass shape using SOAC_WORK_DIR + SOAC_MODE=apply or explicit specialization env"
     );
 }
 

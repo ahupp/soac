@@ -2618,7 +2618,7 @@ fn load_field_index_specializations(
 }
 
 fn specialization_mode_from_env() -> Option<String> {
-    env::var("DIET_PYTHON_SPECIALIZATION_MODE")
+    env::var("SOAC_MODE")
         .ok()
         .map(|raw| raw.trim().to_string())
         .filter(|raw| !raw.is_empty())
@@ -2646,25 +2646,16 @@ fn unsound_indexed_stores_enabled() -> bool {
 }
 
 fn counter_dump_input_path_from_env() -> Option<std::path::PathBuf> {
-    if let Some(path) = env::var("DIET_PYTHON_COUNTERS_FILE")
-        .ok()
-        .map(|raw| raw.trim().to_string())
-        .filter(|raw| !raw.is_empty())
-    {
-        return Some(path.into());
-    }
     match specialization_mode_from_env().as_deref() {
-        Some("verify" | "apply") => {
-            let dir = env::var("DIET_PYTHON_COUNTERS_DIR").ok()?;
-            let dir: std::path::PathBuf = dir.trim().into();
-            if dir.as_os_str().is_empty() {
-                None
-            } else {
-                Some(dir.join("profile.bin"))
-            }
-        }
+        Some("verify" | "apply") => soac_work_dir_from_env().map(|dir| dir.join("profile.bin")),
         _ => None,
     }
+}
+
+fn soac_work_dir_from_env() -> Option<std::path::PathBuf> {
+    env::var_os("SOAC_WORK_DIR")
+        .map(std::path::PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
 }
 
 fn emit_callee_function_id_checked(

@@ -10,9 +10,11 @@ from tests._integration import integration_module
 
 
 def test_counter_dump_file_is_written_on_module_exit(tmp_path, monkeypatch):
-    dump_path = tmp_path / "counters.bin"
+    work_dir = tmp_path / "soac-work"
+    dump_path = work_dir / "profile.bin"
     monkeypatch.setenv("DIET_PYTHON_GLOBAL_LOAD_COUNTERS", "1")
-    monkeypatch.setenv("DIET_PYTHON_COUNTERS_OUTPUT_FILE", str(dump_path))
+    monkeypatch.setenv("SOAC_MODE", "profile")
+    monkeypatch.setenv("SOAC_WORK_DIR", str(work_dir))
 
     source = """
 VALUE = 7
@@ -132,3 +134,46 @@ def read():
     assert jit_row["function_entry_kind"] == "vectorcall_function_body"
     assert jit_row["jit_codegen_total_us"] >= 0
     assert isinstance(jit_row["jit_codegen_total_us"], int)
+
+
+def test_soac_work_dir_is_default_event_log_dir(tmp_path):
+    work_dir = tmp_path / "soac-work"
+    log_path = work_dir / "soac_events.jsonl"
+    module_path = tmp_path / "work_dir_log_case.py"
+    module_path.write_text("def read():\n    return 11\n", encoding="utf-8")
+    env = {
+        **os.environ,
+        "SOAC_WORK_DIR": str(work_dir),
+    }
+    env.pop("SOAC_LOG", None)
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                f"sys.path.insert(0, {str(tmp_path)!r}); "
+                "from soac.import_hook import install; "
+                "install(); "
+                "import work_dir_log_case; "
+                "assert work_dir_log_case.read() == 11"
+            ),
+        ],
+        check=True,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    rows = [
+        json.loads(line)
+        for line in log_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert any(
+        row.get("event") == "soac.module_load"
+        and row["module_name"].endswith("work_dir_log_case")
+        for row in rows
+    )
