@@ -52,7 +52,10 @@ mod planning;
 mod runtime_context;
 mod specialized_helpers;
 
-pub use planning::{BlockExcDispatchPlan, exc_dispatch_plan, jit_param_names_for_block};
+pub use planning::{
+    BlockExcDispatchPlan, BlockLocalPlan, FunctionLocalPlan, LocalRefKind, PlannedLocalBinding,
+    exc_dispatch_plan, jit_param_names_for_block, plan_function_locals,
+};
 use runtime_context::{
     FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET, FUNCTION_ENV_GLOBALS_OBJ_OFFSET,
     FUNCTION_ENV_RUNTIME_OBJECTS_OFFSET, PY_FUNCTION_JIT_EXTRA_FUNCTION_ENV_OFFSET,
@@ -1363,6 +1366,7 @@ struct JitEmitCtx<'mc> {
     module_constants: &'mc ModuleCodegenConstants,
     module_constant_ptrs: &'mc [*mut ffi::PyObject],
     value_facts: &'mc FactStore,
+    local_plan: &'mc FunctionLocalPlan,
     counter_ptrs: &'mc [*mut u64],
     top_value_counter_ptrs: &'mc [ObjPtr],
     storage_layout: Option<StorageLayout>,
@@ -6790,6 +6794,7 @@ fn build_cranelift_run_bb_specialized_function(
     let empty_direct_functions = HashMap::new();
     let direct_call_functions = predeclared_direct_functions.unwrap_or(&empty_direct_functions);
     let value_facts = infer_jit_value_facts(module);
+    let local_plan = plan_function_locals(function, &value_facts);
 
     let mut direct_call_code_ptrs = HashMap::new();
     let mut direct_call_target_functions = HashMap::new();
@@ -7322,6 +7327,7 @@ fn build_cranelift_run_bb_specialized_function(
                 module_constants,
                 module_constant_ptrs,
                 value_facts: &value_facts,
+                local_plan: &local_plan,
                 counter_ptrs,
                 top_value_counter_ptrs: &top_value_counter_ptrs,
                 storage_layout: function.storage_layout().clone(),
@@ -7398,6 +7404,7 @@ fn build_cranelift_run_bb_specialized_function(
                 behavior_change_indexed_stores,
             };
             let block = &function.blocks[index];
+            let _block_local_plan = emit_ctx.local_plan.block(block.label);
             let mut local_env = LocalEnv::default();
             let (local_names, local_values) = local_env.as_parts_mut();
 

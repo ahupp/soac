@@ -244,3 +244,6 @@ Started:
 - A first `LocalEnv` wrapper exists at the JIT per-block emission boundary. It
   still delegates to the existing parallel local-name/local-value vectors, so it
   does not change ownership or generated code yet.
+- A first `FunctionLocalPlan` exists in JIT planning. It records per-block entry
+  bindings from the storage layout, annotates them with available `EnvFacts`,
+  and classifies known immortal locals without changing generated code.
