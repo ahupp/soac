@@ -332,13 +332,13 @@ Started:
   cleanup actions before instrumentation or JIT codegen can consume the module.
 - JIT planning now computes the same verified per-function ownership plan beside
   `FunctionLocalPlan` and makes it available through `JitEmitCtx`.
-- JIT edge-release consumption has started. Normal CFG edges now consume
-  verified ownership-plan releases by clearing stack slots only when target
-  liveness/params do not preserve the local. Exception-edge releases are still
-  blocked on failure cleanup consuming `LocalEnv` directly.
-- The current JIT refcount-plan consistency check reports exception-edge
-  releases as explicit gaps. This is intentional until semantic Python local
-  ownership moves out of function-wide stack slots and into an
+- JIT edge-release consumption has started. Normal CFG edges and exception
+  dispatch edges now consume verified ownership-plan releases by clearing stack
+  slots only when target liveness/params do not preserve the local. No-handler
+  failure cleanup still uses the existing whole-stack cleanup path.
+- The current JIT refcount-plan consistency check no longer reports edge
+  release gaps for stack-slot-backed locals. The remaining transition is to move
+  semantic Python local ownership out of function-wide stack slots and into an
   edge-transfer-aware SSA/`LocalEnv` representation for failure paths.
 - JIT physical stack slots now use `NULL` for unbound or released local state
   instead of the runtime `DELETED` sentinel. Stack-slot loads raise the deleted

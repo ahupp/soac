@@ -173,7 +173,6 @@ pub fn check_refcount_plan_against_current_jit(
                         }
                         RefcountReleaseReason::ExceptionEdge { .. } => {
                             check.exception_edge_stack_slot_releases += 1;
-                            check.exception_edge_release_gaps += 1;
                         }
                     }
                 }
@@ -439,7 +438,7 @@ def f(flag):
     }
 
     #[test]
-    fn refcount_plan_check_reports_exception_edge_release_gap() {
+    fn refcount_plan_check_maps_exception_edge_releases_to_stack_slot_cleanup() {
         let (lowered, function_index) = lowered_function(
             r#"
 def f():
@@ -465,8 +464,10 @@ def f():
         );
         assert_eq!(
             check.exception_edge_release_gaps,
-            check.exception_edge_stack_slot_releases
+            0,
+            "exception edges are now consumed by planned stack-slot releases"
         );
-        assert!(check.has_edge_release_gaps());
+        assert_eq!(check.normal_edge_release_gaps, 0);
+        assert!(!check.has_edge_release_gaps());
     }
 }

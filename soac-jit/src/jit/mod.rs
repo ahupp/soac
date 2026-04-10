@@ -6524,6 +6524,7 @@ fn emit_planned_stack_slot_releases_for_reason_from_parts(
             | RefcountReleaseReason::IfElse { .. }
             | RefcountReleaseReason::BranchCase { .. }
             | RefcountReleaseReason::BranchDefault { .. }
+            | RefcountReleaseReason::ExceptionEdge { .. }
     ) {
         return Ok(());
     }
