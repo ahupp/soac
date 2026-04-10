@@ -215,3 +215,18 @@ benchmarked throughput delta, and the headline pre/post numbers.
 - post-change benchmark:
   - specialized pass, 1M loops x3: `114328`, `107795`, `113621 loops/s`
   - perf-context run: `95269 loops/s`
+
+## 2026-04-10 - Enable direct field-index specialization
+
+- jj change id: `vytxokyr`
+- summary: Same-module direct-function compilation now receives module globals,
+  so apply/verify mode can resolve profiled split-dict owner layouts and emit
+  field-indexed instance load/store fast paths. Also removed the leftover
+  `SOAC_BIND_TRACE` argument-binding debug path.
+- throughput: `+6.20%` specialized pystone median
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `85166`, `114419`, `115642 loops/s`
+  - perf-context run: `107731 loops/s`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `115465`, `123032`, `121511 loops/s`
+  - perf-context run: `117328 loops/s`

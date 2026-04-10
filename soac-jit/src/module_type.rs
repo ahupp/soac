@@ -190,6 +190,7 @@ impl SharedModuleState {
         &self,
         compile_session: &Arc<crate::session::CompileSession>,
         function_id: FunctionId,
+        module_globals: Option<*mut c_void>,
     ) -> Result<Option<Arc<crate::jit::CompiledFunctionHandle>>, String> {
         if function_id == FunctionId::global() {
             return Ok(None);
@@ -200,8 +201,11 @@ impl SharedModuleState {
             else {
                 return Ok(None);
             };
-            return shared_state
-                .lookup_or_compile_direct_function_handle(compile_session, function_id);
+            return shared_state.lookup_or_compile_direct_function_handle(
+                compile_session,
+                function_id,
+                None,
+            );
         }
         if crate::jit::process_jit_is_currently_compiling() {
             return Ok(None);
@@ -225,7 +229,7 @@ impl SharedModuleState {
                 &module_constant_ptrs,
                 &counter_ptrs,
                 Some(self),
-                None,
+                module_globals,
             )
         };
         match compile_result {
