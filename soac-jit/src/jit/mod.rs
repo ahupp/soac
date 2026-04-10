@@ -827,55 +827,27 @@ fn emit_codegen_local_name_load(
     panic!("missing local {name} in direct JIT state");
 }
 
-fn emit_codegen_located_name_load(
+fn emit_codegen_non_local_name_load(
     fb: &mut FunctionBuilder<'_>,
     name: &ResolvedName,
     load_instr_id: InstrId,
-    local_names: &mut Vec<String>,
-    local_values: &mut Vec<ir::Value>,
     ctx: &JitEmitCtx<'_>,
     borrowed: bool,
-) -> ir::Value {
+) -> Option<ir::Value> {
     let ptr_ty = ctx.consts.ptr_ty;
     let null_ptr = fb.ins().iconst(ptr_ty, 0);
 
     match name.location {
-        NameLocation::Local(location) => {
-            emit_codegen_local_name_load(fb, location, local_names, local_values, ctx, borrowed)
-        }
-        NameLocation::Cell(location)
-            if location.is_owned() || location.is_closure() || location.is_captured_source() =>
-        {
-            assert!(
-                !borrowed,
-                "cell-backed name loads must produce owned references"
-            );
-            let cell_obj = emit_raw_cell_object_for_name(fb, name, local_names, local_values, ctx);
-            let value_inst = fb.ins().call(ctx.load_cell_ref, &[cell_obj]);
-            let value = fb.inst_results(value_inst)[0];
-            fb.ins().call(ctx.decref_ref, &[cell_obj]);
-            let value_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, value, null_ptr);
-            let value_ok_block = fb.create_block();
-            fb.append_block_param(value_ok_block, ptr_ty);
-            fb.ins().brif(
-                value_is_null,
-                ctx.consts.step_null_block,
-                &step_null_block_args(ctx),
-                value_ok_block,
-                &[ir::BlockArg::Value(value)],
-            );
-            fb.switch_to_block(value_ok_block);
-            fb.block_params(value_ok_block)[0]
-        }
         NameLocation::Constant(index) => {
             assert!(
                 !borrowed,
                 "constant-backed name loads must produce owned references"
             );
-            emit_owned_module_constant(fb, ModuleConstantId(index as usize), ctx)
-        }
-        NameLocation::Cell(_) => {
-            unreachable!("all cell location cases should be handled above");
+            Some(emit_owned_module_constant(
+                fb,
+                ModuleConstantId(index as usize),
+                ctx,
+            ))
         }
         NameLocation::GlobalName => {
             panic!("symbolic global name reached JIT codegen without the global_index pass");
@@ -921,7 +893,7 @@ fn emit_codegen_located_name_load(
             );
 
             fb.switch_to_block(value_ok_block);
-            fb.block_params(value_ok_block)[0]
+            Some(fb.block_params(value_ok_block)[0])
         }
         NameLocation::RuntimeName => {
             let name_obj = emit_owned_module_constant(
@@ -944,7 +916,61 @@ fn emit_codegen_located_name_load(
                 &[ir::BlockArg::Value(value)],
             );
             fb.switch_to_block(value_ok_block);
+            Some(fb.block_params(value_ok_block)[0])
+        }
+        NameLocation::Local(_) | NameLocation::Cell(_) => None,
+    }
+}
+
+fn emit_codegen_located_name_load(
+    fb: &mut FunctionBuilder<'_>,
+    name: &ResolvedName,
+    load_instr_id: InstrId,
+    local_names: &mut Vec<String>,
+    local_values: &mut Vec<ir::Value>,
+    ctx: &JitEmitCtx<'_>,
+    borrowed: bool,
+) -> ir::Value {
+    let ptr_ty = ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+
+    match name.location {
+        NameLocation::Local(location) => {
+            emit_codegen_local_name_load(fb, location, local_names, local_values, ctx, borrowed)
+        }
+        NameLocation::Cell(location)
+            if location.is_owned() || location.is_closure() || location.is_captured_source() =>
+        {
+            assert!(
+                !borrowed,
+                "cell-backed name loads must produce owned references"
+            );
+            let cell_obj = emit_raw_cell_object_for_name(fb, name, local_names, local_values, ctx);
+            let value_inst = fb.ins().call(ctx.load_cell_ref, &[cell_obj]);
+            let value = fb.inst_results(value_inst)[0];
+            fb.ins().call(ctx.decref_ref, &[cell_obj]);
+            let value_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, value, null_ptr);
+            let value_ok_block = fb.create_block();
+            fb.append_block_param(value_ok_block, ptr_ty);
+            fb.ins().brif(
+                value_is_null,
+                ctx.consts.step_null_block,
+                &step_null_block_args(ctx),
+                value_ok_block,
+                &[ir::BlockArg::Value(value)],
+            );
+            fb.switch_to_block(value_ok_block);
             fb.block_params(value_ok_block)[0]
+        }
+        NameLocation::Constant(_)
+        | NameLocation::GlobalName
+        | NameLocation::Global(_)
+        | NameLocation::RuntimeName => {
+            emit_codegen_non_local_name_load(fb, name, load_instr_id, ctx, borrowed)
+                .expect("non-local load helper should handle non-local name locations")
+        }
+        NameLocation::Cell(_) => {
+            unreachable!("all cell location cases should be handled above");
         }
     }
 }
@@ -6769,6 +6795,15 @@ fn emit_codegen_expr_with_local_env(
     func_imports: &mut FuncBuildImports<'_>,
 ) -> ir::Value {
     if let InstrCodegen::Load(op) = expr {
+        if let Some(value) = emit_codegen_non_local_name_load(
+            fb,
+            &op.name,
+            op.semantic_instr_id(),
+            emit_ctx,
+            borrowed,
+        ) {
+            return value;
+        }
         if let Some(location) = op.name.local_location() {
             let layout = emit_ctx
                 .storage_layout
