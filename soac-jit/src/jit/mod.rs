@@ -2118,6 +2118,40 @@ impl LocalEnv {
         }
     }
 
+    fn store_name(
+        &mut self,
+        fb: &mut FunctionBuilder<'_>,
+        name: &str,
+        value: ir::Value,
+        stack_slots: &StackSlots,
+        ptr_ty: ir::Type,
+        incref_ref: ir::FuncRef,
+        decref_ref: ir::FuncRef,
+    ) {
+        let previous_entry = self
+            .entry_index_for_name(name)
+            .map(|existing_index| self.entries.remove(existing_index));
+        if stack_slots.has_name(name) {
+            stack_slots
+                .replace_cloned_value(fb, name, value, ptr_ty, incref_ref, decref_ref)
+                .expect("slot-backed local missing from stack slots");
+            fb.ins().call(decref_ref, &[value]);
+        } else {
+            self.entries.push(LocalEnvEntry {
+                key: LocalEnvKey::legacy_name(name),
+                name: name.to_string(),
+                value,
+                ref_kind: LocalRefKind::Owned,
+                storage: LocalEnvStorage::LocalOnly,
+            });
+        }
+        if let Some(previous) = previous_entry {
+            if transient_local_needs_decref(previous.ref_kind) {
+                fb.ins().call(decref_ref, &[previous.value]);
+            }
+        }
+    }
+
     fn delete_location(
         &mut self,
         fb: &mut FunctionBuilder<'_>,
@@ -7120,6 +7154,144 @@ fn emit_codegen_expr_with_local_env(
         if let Some(value) = intrinsics::emit_operation(expr, &mut intrinsic_state) {
             return value;
         }
+    }
+    if let InstrCodegen::Store(op) = expr {
+        if let Some(location) = op.name.local_location() {
+            let layout = emit_ctx
+                .storage_layout
+                .as_ref()
+                .expect("Store local slot should have storage layout during codegen");
+            let name = local_name_for_location(layout, location);
+            let value = emit_codegen_expr_with_local_env(
+                fb,
+                &op.value,
+                local_env,
+                emit_ctx,
+                false,
+                jit_module,
+                func_imports,
+            );
+            local_env.store_location(
+                fb,
+                location,
+                name,
+                value,
+                &emit_ctx.stack_slots,
+                emit_ctx.consts.ptr_ty,
+                emit_ctx.incref_ref,
+                emit_ctx.decref_ref,
+            );
+            fb.ins()
+                .call(emit_ctx.incref_ref, &[emit_ctx.consts.none_const]);
+            return emit_ctx.consts.none_const;
+        }
+        let Some(location) = op.name.cell_location() else {
+            panic!("Store should be resolved before codegen: {op:?}");
+        };
+        if location.is_owned() && matches!(op.value.as_ref(), InstrCodegen::MakeCell(_)) {
+            let layout = emit_ctx
+                .storage_layout
+                .as_ref()
+                .expect("Store owned cell slot should have storage layout during codegen");
+            let closure_slot = layout.local_cell_slot(location.slot()).unwrap_or_else(|| {
+                panic!(
+                    "missing owned cell slot mapping for owned cell location {}",
+                    location.slot()
+                )
+            });
+            let value = emit_codegen_expr_with_local_env(
+                fb,
+                &op.value,
+                local_env,
+                emit_ctx,
+                false,
+                jit_module,
+                func_imports,
+            );
+            local_env.store_name(
+                fb,
+                closure_slot.storage_name.as_str(),
+                value,
+                &emit_ctx.stack_slots,
+                emit_ctx.consts.ptr_ty,
+                emit_ctx.incref_ref,
+                emit_ctx.decref_ref,
+            );
+            fb.ins()
+                .call(emit_ctx.incref_ref, &[emit_ctx.consts.none_const]);
+            return emit_ctx.consts.none_const;
+        }
+        let raw_cell = emit_raw_cell_object_for_location_with_local_env(
+            fb, location, "Store", local_env, emit_ctx,
+        );
+        let value_borrowed = codegen_expr_is_borrowable_from_local_env(
+            &op.value,
+            local_env,
+            &emit_ctx.stack_slots,
+            emit_ctx.storage_layout.as_ref(),
+        );
+        let value = emit_codegen_expr_with_local_env(
+            fb,
+            &op.value,
+            local_env,
+            emit_ctx,
+            value_borrowed,
+            jit_module,
+            func_imports,
+        );
+        let call_inst = fb.ins().call(emit_ctx.store_cell_ref, &[raw_cell, value]);
+        fb.ins().call(emit_ctx.decref_ref, &[raw_cell]);
+        if !value_borrowed {
+            fb.ins().call(emit_ctx.decref_ref, &[value]);
+        }
+        let call_value = fb.inst_results(call_inst)[0];
+        let mut intrinsic_state = LocalEnvCodegenIntrinsicEmitState {
+            fb,
+            local_env,
+            ctx: emit_ctx,
+            jit_module,
+            func_imports,
+        };
+        return intrinsics::OperationEmitState::finish_owned_result(
+            &mut intrinsic_state,
+            call_value,
+        );
+    }
+    if let InstrCodegen::Del(op) = expr {
+        if let Some(location) = op.name.local_location() {
+            let layout = emit_ctx
+                .storage_layout
+                .as_ref()
+                .expect("Del local slot should have storage layout during codegen");
+            let name = local_name_for_location(layout, location);
+            local_env
+                .delete_location(
+                    fb,
+                    location,
+                    name,
+                    &emit_ctx.stack_slots,
+                    emit_ctx.consts.ptr_ty,
+                    emit_ctx.decref_ref,
+                )
+                .unwrap_or_else(|error| panic!("{error}"));
+            fb.ins()
+                .call(emit_ctx.incref_ref, &[emit_ctx.consts.none_const]);
+            return emit_ctx.consts.none_const;
+        }
+        let Some(location) = op.name.cell_location() else {
+            panic!("Del should be resolved before codegen: {op:?}");
+        };
+        let raw_cell = emit_raw_cell_object_for_location_with_local_env(
+            fb, location, "Del", local_env, emit_ctx,
+        );
+        let mut intrinsic_state = LocalEnvCodegenIntrinsicEmitState {
+            fb,
+            local_env,
+            ctx: emit_ctx,
+            jit_module,
+            func_imports,
+        };
+        return intrinsics::emit_del_deref_raw_cell(raw_cell, op.quietly, &mut intrinsic_state);
     }
     let mut local_parts = local_env.to_legacy_parts();
     let value = emit_codegen_expr(
