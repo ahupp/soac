@@ -60,7 +60,7 @@ pub use planning::{
 use runtime_context::{
     FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET, FUNCTION_ENV_GLOBALS_OBJ_OFFSET,
     FUNCTION_ENV_RUNTIME_OBJECTS_OFFSET, PY_FUNCTION_JIT_EXTRA_FUNCTION_ENV_OFFSET,
-    PY_FUNCTION_JIT_EXTRA_FUNCTION_ID_OFFSET, PY_THREAD_STATE_CURRENT_EXCEPTION_OFFSET,
+    PY_THREAD_STATE_CURRENT_EXCEPTION_OFFSET,
 };
 pub use runtime_context::{ModuleJitContext, ModuleRuntimeContext};
 pub use specialized_helpers::ObjPtr;
@@ -367,11 +367,6 @@ static DP_JIT_VECTORCALL_FUNCTION_ENV_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_vectorcall_function_env",
     &[SigType::Pointer, SigType::Pointer],
     &[SigType::Pointer],
-);
-static DP_JIT_TRACE_DIRECT_ENTRY_ARGS_IMPORT: ImportSpec = ImportSpec::new(
-    "dp_jit_trace_direct_entry_args",
-    &[SigType::I64, SigType::Pointer, SigType::Pointer],
-    &[],
 );
 struct ModuleFuncImports {
     func_ids_by_internal_id: Vec<Option<FuncId>>,
@@ -9003,11 +8998,6 @@ fn build_cranelift_run_bb_specialized_function(
             &mut fb.func,
             &DP_JIT_DIRECT_FUNCTION_CONTEXT_IMPORT,
         );
-        let trace_direct_entry_args_ref = func_imports.get_or_panic(
-            jit_module,
-            &mut fb.func,
-            &DP_JIT_TRACE_DIRECT_ENTRY_ARGS_IMPORT,
-        );
         let enter_recursive_ref = func_imports.get_or_panic(
             jit_module,
             &mut fb.func,
@@ -9214,44 +9204,6 @@ fn build_cranelift_run_bb_specialized_function(
 
             fb.switch_to_block(after_block);
         }
-        let trace_arg0 = function
-            .params
-            .params
-            .first()
-            .and_then(|param| {
-                load_stack_slot_value(
-                    &mut fb,
-                    &stack_slots,
-                    param.name.as_str(),
-                    ptr_ty,
-                    true,
-                    incref_ref,
-                )
-            })
-            .unwrap_or(null_ptr);
-        let trace_arg1 = function
-            .params
-            .params
-            .get(1)
-            .and_then(|param| {
-                load_stack_slot_value(
-                    &mut fb,
-                    &stack_slots,
-                    param.name.as_str(),
-                    ptr_ty,
-                    true,
-                    incref_ref,
-                )
-            })
-            .unwrap_or(null_ptr);
-        let trace_function_id = fb
-            .ins()
-            .iconst(i64_ty, function.function_id.packed() as i64);
-        fb.ins().call(
-            trace_direct_entry_args_ref,
-            &[trace_function_id, trace_arg0, trace_arg1],
-        );
-
         let mut entry_jump_args = Vec::with_capacity(runtime_block_param_names[0].len());
         for param_name in &runtime_block_param_names[0] {
             let value =
@@ -9941,11 +9893,6 @@ fn define_shared_vectorcall_trampoline(
             &mut fb.func,
             &DP_JIT_VECTORCALL_FUNCTION_ENV_IMPORT,
         );
-        let trace_direct_entry_args_ref = func_imports.get_or_panic(
-            jit_module,
-            &mut fb.func,
-            &DP_JIT_TRACE_DIRECT_ENTRY_ARGS_IMPORT,
-        );
         let set_raised_exception_ref = func_imports.get_or_panic(
             jit_module,
             &mut fb.func,
@@ -10069,18 +10016,6 @@ fn define_shared_vectorcall_trampoline(
                 call_args.push(value);
             }
         }
-        let function_id_value = fb.ins().load(
-            i64_ty,
-            ir::MemFlags::trusted(),
-            function_extra_val,
-            PY_FUNCTION_JIT_EXTRA_FUNCTION_ID_OFFSET,
-        );
-        let trace_arg0 = owned_args.first().copied().unwrap_or(null_ptr);
-        let trace_arg1 = owned_args.get(1).copied().unwrap_or(null_ptr);
-        fb.ins().call(
-            trace_direct_entry_args_ref,
-            &[function_id_value, trace_arg0, trace_arg1],
-        );
         let callee_ptr = load_function_env_obj(
             &mut fb,
             ptr_ty,

@@ -201,3 +201,17 @@ benchmarked throughput delta, and the headline pre/post numbers.
 - post-change benchmark:
   - specialized pass, 1M loops x3: `247158`, `240873`, `241731 loops/s`
   - perf-context run: `227895 loops/s`
+
+## 2026-04-10 - Remove direct-entry tracing from generated code
+
+- jj change id: `oxqvnxtl`
+- summary: Removed the generated direct-entry trace helper import and calls,
+  the runtime symbol binding, and the helper that checked the process
+  environment on every direct JIT entry.
+- throughput: `+25.43%` specialized pystone median
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `90588`, `89972`, `92372 loops/s`
+  - perf-context run: `88371 loops/s`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `114328`, `107795`, `113621 loops/s`
+  - perf-context run: `95269 loops/s`

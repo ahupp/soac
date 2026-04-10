@@ -1990,10 +1990,6 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
         crate::vectorcall_function_env as *const u8,
     );
     builder.symbol(
-        "dp_jit_trace_direct_entry_args",
-        crate::trace_direct_entry_args as *const u8,
-    );
-    builder.symbol(
         "dp_jit_py_thread_state_get",
         dp_jit_py_thread_state_get as *const u8,
     );

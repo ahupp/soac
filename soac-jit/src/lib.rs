@@ -1875,21 +1875,6 @@ unsafe fn debug_pyobject_repr(value: *mut ffi::PyObject) -> String {
     out
 }
 
-pub unsafe extern "C" fn trace_direct_entry_args(
-    function_id: u64,
-    arg0: *mut c_void,
-    arg1: *mut c_void,
-) {
-    if std::env::var_os("SOAC_DIRECT_ENTRY_TRACE").is_none() {
-        return;
-    }
-    eprintln!(
-        "[direct-entry] function_id={function_id} arg0={} arg1={}",
-        debug_pyobject_repr(arg0.cast()),
-        debug_pyobject_repr(arg1.cast())
-    );
-}
-
 unsafe fn write_owned_bound_args_to_buffer(
     mut bound_args: Vec<*mut ffi::PyObject>,
     out_args: *mut *mut ffi::PyObject,
