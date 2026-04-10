@@ -6930,9 +6930,7 @@ fn emit_codegen_if_target_arm(
     current_exception_name: Option<&str>,
     exec_blocks: &[ir::Block],
     runtime_block_param_names: &[Vec<String>],
-    local_names: &mut Vec<String>,
-    local_values: &mut Vec<ir::Value>,
-    local_ref_kinds: &[LocalRefKind],
+    local_env: &LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     jit_module: &mut JITModule,
     func_imports: &mut FuncBuildImports<'_>,
@@ -6942,14 +6940,12 @@ fn emit_codegen_if_target_arm(
     let target_params = &runtime_block_param_names[target_index];
     let mut jump_args = Vec::with_capacity(target_params.len());
     jump_args.extend(
-        emit_prepare_target_args_codegen(
+        emit_prepare_target_args_codegen_from_local_env(
             fb,
             target_params,
             None,
             None,
-            local_names,
-            local_values,
-            local_ref_kinds,
+            local_env,
             emit_ctx,
             jit_module,
             func_imports,
@@ -6960,14 +6956,7 @@ fn emit_codegen_if_target_arm(
             )
         })?,
     );
-    emit_decref_unforwarded_locals(
-        fb,
-        local_values,
-        local_names,
-        local_ref_kinds,
-        target_params,
-        emit_ctx.decref_ref,
-    );
+    emit_decref_unforwarded_local_env(fb, local_env, target_params, emit_ctx.decref_ref);
     emit_planned_stack_slot_releases_for_reason(fb, source_label, &release_reason, emit_ctx)?;
     emit_pop_handled_exception_if_leaving(fb, current_exception_name, target_params, emit_ctx);
     fb.ins().jump(exec_blocks[target_index], &jump_args);
@@ -7048,15 +7037,11 @@ fn emit_codegen_term(
             fb.ins().jump(exec_blocks[target_index], &jump_args);
         }
         BlockTerm::IfTerm(if_term) => {
-            let mut local_parts = local_env.to_legacy_parts();
-            let local_names = &mut local_parts.names;
-            let local_values = &mut local_parts.values;
             let test_instr_id = if_term.test.semantic_instr_id();
-            let test_value = emit_codegen_expr(
+            let test_value = emit_codegen_expr_with_local_env(
                 fb,
                 &if_term.test,
-                local_names,
-                local_values,
+                local_env,
                 emit_ctx,
                 false,
                 jit_module,
@@ -7090,7 +7075,6 @@ fn emit_codegen_term(
             } else {
                 ("else", if_term.else_label, "then", if_term.then_label)
             };
-            let local_ref_kinds = local_env.ref_kinds_for_legacy_parts(local_names, local_values);
             emit_codegen_if_target_arm(
                 fb,
                 source_label,
@@ -7105,9 +7089,7 @@ fn emit_codegen_term(
                 current_exception_name,
                 exec_blocks,
                 runtime_block_param_names,
-                local_names,
-                local_values,
-                &local_ref_kinds,
+                local_env,
                 emit_ctx,
                 jit_module,
                 func_imports,
@@ -7126,9 +7108,7 @@ fn emit_codegen_term(
                 current_exception_name,
                 exec_blocks,
                 runtime_block_param_names,
-                local_names,
-                local_values,
-                &local_ref_kinds,
+                local_env,
                 emit_ctx,
                 jit_module,
                 func_imports,
