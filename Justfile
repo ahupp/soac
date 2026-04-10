@@ -115,10 +115,11 @@ install-extension build="debug": ensure-venv ensure-cpython
   fi
 
   if [[ "$BUILD" == "release" ]]; then
-    ARTIFACT_DIR="$REPO_ROOT/target/release"
+    PROFILE_DIR="release-ext"
   else
-    ARTIFACT_DIR="$REPO_ROOT/target/debug"
+    PROFILE_DIR="debug-ext"
   fi
+  ARTIFACT_DIR="$REPO_ROOT/target/$PROFILE_DIR"
 
   SOURCE_EXT="$ARTIFACT_DIR/lib_soac_ext.so"
   if [[ ! -f "$SOURCE_EXT" ]]; then
@@ -198,9 +199,9 @@ build-extension build="debug": ensure-cpython
   fi
 
   if [[ "$BUILD" == "release" ]]; then
-    BUILD_ARGS=(--release)
+    BUILD_ARGS=(--profile release-ext)
   else
-    BUILD_ARGS=()
+    BUILD_ARGS=(--profile debug-ext)
   fi
 
   (
@@ -265,6 +266,7 @@ run-cpython-tests jobs="0" *args='': build-all ensure-cpython ensure-venv
     )
 
     PYTHONDONTWRITEBYTECODE=1 \
+    SOAC_CRANELIFT_OPT_LEVEL="${SOAC_CRANELIFT_OPT_LEVEL:-none}" \
     PYTHONPATH="$PYTHONPATH_PREFIX${PYTHONPATH:+:$PYTHONPATH}" \
     "${TEST_CMD[@]}"
   )

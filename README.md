@@ -122,6 +122,13 @@ exports are intentionally omitted here.
   are emitted through the `soac_jit_compile_cache` tracing target. The
   cache is disabled by default.
 
+- `SOAC_CRANELIFT_OPT_LEVEL=none|speed|speed_and_size`
+  Override the Cranelift optimization level used by the process JIT.
+  Normal runtime and benchmark runs default to `speed`. The
+  `run-cpython-tests` recipe defaults this to `none` unless the caller
+  already set it, because correctness tests are latency-sensitive and
+  should not spend cold-start time optimizing import-time helper code.
+
 ## Counters And Specialization
 
 - `SOAC_WORK_DIR=/path/to/work-dir`

@@ -676,9 +676,13 @@ mod tests {
                 .retain_shared_module_state(callee_state)
                 .expect("callee state should be retained");
 
-            let batch =
-                collect_process_jit_batch_functions(&session, &caller, Some(caller_state.as_ref()))
-                    .expect("cross-module process JIT batch should collect");
+            let batch = collect_process_jit_batch_functions(
+                &session,
+                &caller,
+                &caller_state.codegen_constants,
+                Some(caller_state.as_ref()),
+            )
+            .expect("cross-module process JIT batch should collect");
             let function_ids = batch
                 .iter()
                 .map(|batch_function| batch_function.function.function_id)
@@ -717,8 +721,12 @@ mod tests {
         );
 
         let session = std::sync::Arc::new(crate::session::CompileSession::new());
-        let batch = collect_process_jit_batch_functions(&session, &function, None)
-            .expect("recursive process JIT batch should collect");
+        let module = test_module(module_name_gen, vec![function.clone()]);
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let batch =
+            collect_process_jit_batch_functions(&session, &function, &module_constants, None)
+                .expect("recursive process JIT batch should collect");
         let function_ids = batch
             .iter()
             .map(|batch_function| batch_function.function.function_id)
@@ -2568,7 +2576,7 @@ def f():
                 set_stack_slots(&mut init_function, &["self", "x"]);
 
                 let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
-                let mut caller_function = BlockPyFunction {
+                let caller_function = BlockPyFunction {
                     function_id: caller_function_id,
                     name_gen: caller_name_gen,
                     names: FunctionName::new(

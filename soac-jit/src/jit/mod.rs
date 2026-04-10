@@ -60,7 +60,7 @@ pub use planning::{
 use runtime_context::{
     FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET, FUNCTION_ENV_GLOBALS_OBJ_OFFSET,
     FUNCTION_ENV_RUNTIME_OBJECTS_OFFSET, PY_FUNCTION_JIT_EXTRA_FUNCTION_ENV_OFFSET,
-    PY_THREAD_STATE_CURRENT_EXCEPTION_OFFSET,
+    PY_FUNCTION_JIT_EXTRA_FUNCTION_ID_OFFSET, PY_THREAD_STATE_CURRENT_EXCEPTION_OFFSET,
 };
 pub use runtime_context::{ModuleJitContext, ModuleRuntimeContext};
 pub use specialized_helpers::ObjPtr;
@@ -372,6 +372,11 @@ static DP_JIT_VECTORCALL_FUNCTION_ENV_IMPORT: ImportSpec = ImportSpec::new(
     &[SigType::Pointer, SigType::Pointer],
     &[SigType::Pointer],
 );
+static DP_JIT_TRACE_DIRECT_ENTRY_ARGS_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_trace_direct_entry_args",
+    &[SigType::I64, SigType::Pointer, SigType::Pointer],
+    &[],
+);
 static DP_JIT_TAKE_ERROR_BEFORE_NULL_CLEANUP_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_take_error_before_null_cleanup",
     &[SigType::I64, SigType::I64],
@@ -521,6 +526,7 @@ struct ProcessJitBatchFunction<'a> {
     source: ProcessJitBatchFunctionSource<'a>,
 }
 
+#[derive(Clone)]
 enum ProcessJitBatchFunctionSource<'a> {
     ExplicitInputs,
     BorrowedSharedState(&'a crate::module_type::SharedModuleState),
@@ -3379,6 +3385,56 @@ fn collect_call_direct_targets(
     let mut collector = CallDirectTargetCollector { out: &mut out };
     collector.visit_fn(function);
     out
+}
+
+fn codegen_expr_const_u64(
+    expr: &InstrCodegen,
+    module_constants: &ModuleCodegenConstants,
+) -> Option<u64> {
+    match expr {
+        InstrCodegen::Load(op) => op.name.location.as_constant().and_then(|index| {
+            module_constants.constant_u64_value(ModuleConstantId(index as usize))
+        }),
+        _ => None,
+    }
+}
+
+fn collect_make_function_targets(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    module_constants: &ModuleCodegenConstants,
+) -> HashSet<FunctionId> {
+    struct MakeFunctionTargetCollector<'a> {
+        module_constants: &'a ModuleCodegenConstants,
+        out: &'a mut HashSet<FunctionId>,
+    }
+
+    impl Visit<InstrCodegen> for MakeFunctionTargetCollector<'_> {
+        fn visit_instr(&mut self, expr: &InstrCodegen) {
+            if let InstrCodegen::Call(call) = expr
+                && codegen_expr_helper_name(call.func.as_ref(), self.module_constants)
+                    == Some("make_function")
+                && let Some(CallArgPositional::Positional(function_id_expr)) = call.args.first()
+                && let Some(packed_function_id) =
+                    codegen_expr_const_u64(function_id_expr, self.module_constants)
+            {
+                self.out.insert(FunctionId::from_packed(packed_function_id));
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut out = HashSet::new();
+    let mut collector = MakeFunctionTargetCollector {
+        module_constants,
+        out: &mut out,
+    };
+    collector.visit_fn(function);
+    out
+}
+
+fn is_synthetic_class_helper_function(function: &BlockPyFunction<CodegenModuleShape>) -> bool {
+    function.names.bind_name.starts_with("_dp_class_ns_")
+        || function.names.bind_name.starts_with("_dp_define_class_")
 }
 
 fn collect_runtime_counter_ids_by_kind(
@@ -6959,8 +7015,9 @@ fn emit_codegen_term(
 
 fn new_jit_builder() -> Result<JITBuilder, String> {
     let mut flag_builder = settings::builder();
+    let opt_level = env::var("SOAC_CRANELIFT_OPT_LEVEL").unwrap_or_else(|_| "speed".to_string());
     flag_builder
-        .set("opt_level", "speed")
+        .set("opt_level", opt_level.as_str())
         .map_err(|err| format!("failed to configure Cranelift flags: {err}"))?;
     flag_builder
         .set("is_pic", "false")
@@ -7015,6 +7072,7 @@ impl Drop for ProcessJitCompileGuard {
 fn collect_process_jit_batch_functions<'a>(
     session: &Arc<crate::session::CompileSession>,
     root: &BlockPyFunction<CodegenModuleShape>,
+    module_constants: &ModuleCodegenConstants,
     direct_call_resolver: Option<&'a crate::module_type::SharedModuleState>,
 ) -> Result<Vec<ProcessJitBatchFunction<'a>>, String> {
     let mut out = Vec::new();
@@ -7047,6 +7105,26 @@ fn collect_process_jit_batch_functions<'a>(
                 resolve_process_jit_batch_function(session, direct_call_resolver, function_id)?
             {
                 queue.push_back(function);
+            }
+        }
+        let batch_module_constants = batch_function
+            .source
+            .shared_state()
+            .map(|shared_state| &shared_state.codegen_constants)
+            .unwrap_or(module_constants);
+        for function_id in
+            collect_make_function_targets(&batch_function.function, batch_module_constants)
+        {
+            if seen.contains(&function_id) {
+                continue;
+            }
+            if let Some(function) =
+                resolve_process_jit_batch_function(session, direct_call_resolver, function_id)?
+            {
+                if is_synthetic_class_helper_function(&function.function) {
+                    seen.insert(function_id);
+                    queue.push_back(function);
+                }
             }
         }
         out.push(batch_function);
@@ -7127,8 +7205,12 @@ impl ProcessJitEngine {
         direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
         module_globals: Option<ObjPtr>,
     ) -> Result<DirectFunctionCompileResult, String> {
-        let batch_functions =
-            collect_process_jit_batch_functions(session, function, direct_call_resolver)?;
+        let batch_functions = collect_process_jit_batch_functions(
+            session,
+            function,
+            module_constants,
+            direct_call_resolver,
+        )?;
         let root_function_id = function.function_id;
         let mut state = self
             .state
@@ -8327,7 +8409,7 @@ fn build_cranelift_run_bb_specialized_function(
                 &mut block_annotations,
                 *block,
                 format!("cleanup_null::{}", function.blocks[index].label),
-                vec!["value".into()],
+                vec!["error".into()],
             );
         }
         register_block_display_annotation(
@@ -8352,6 +8434,9 @@ fn build_cranelift_run_bb_specialized_function(
         fb.append_block_param(step_null_block, ptr_ty); // args
         fb.append_block_param(raise_exc_direct_block, ptr_ty); // args
         fb.append_block_param(raise_exc_direct_block, ptr_ty); // exc
+        for block in &cleanup_null_blocks {
+            fb.append_block_param(*block, ptr_ty); // error
+        }
 
         fb.switch_to_block(entry_block);
         let entry_block_params = fb.block_params(entry_block).to_vec();
@@ -8393,6 +8478,11 @@ fn build_cranelift_run_bb_specialized_function(
             jit_module,
             &mut fb.func,
             &DP_JIT_DIRECT_FUNCTION_CONTEXT_IMPORT,
+        );
+        let trace_direct_entry_args_ref = func_imports.get_or_panic(
+            jit_module,
+            &mut fb.func,
+            &DP_JIT_TRACE_DIRECT_ENTRY_ARGS_IMPORT,
         );
         let enter_recursive_ref = func_imports.get_or_panic(
             jit_module,
@@ -8667,6 +8757,43 @@ fn build_cranelift_run_bb_specialized_function(
                 }
             }
         }
+        let trace_arg0 = function
+            .params
+            .params
+            .first()
+            .and_then(|param| {
+                load_stack_slot_value(
+                    &mut fb,
+                    &stack_slots,
+                    param.name.as_str(),
+                    ptr_ty,
+                    true,
+                    incref_ref,
+                )
+            })
+            .unwrap_or(null_ptr);
+        let trace_arg1 = function
+            .params
+            .params
+            .get(1)
+            .and_then(|param| {
+                load_stack_slot_value(
+                    &mut fb,
+                    &stack_slots,
+                    param.name.as_str(),
+                    ptr_ty,
+                    true,
+                    incref_ref,
+                )
+            })
+            .unwrap_or(null_ptr);
+        let trace_function_id = fb
+            .ins()
+            .iconst(i64_ty, function.function_id.packed() as i64);
+        fb.ins().call(
+            trace_direct_entry_args_ref,
+            &[trace_function_id, trace_arg0, trace_arg1],
+        );
 
         let mut entry_jump_args = Vec::with_capacity(runtime_block_param_names[0].len());
         for param_name in &runtime_block_param_names[0] {
@@ -8973,12 +9100,25 @@ fn build_cranelift_run_bb_specialized_function(
 
         for (index, block) in pre_cleanup_null_blocks.iter().enumerate() {
             fb.switch_to_block(*block);
-            fb.ins().jump(cleanup_null_blocks[index], &[]);
+            let function_id_value = fb
+                .ins()
+                .iconst(i64_ty, function.function_id.packed() as i64);
+            let block_index_value = fb.ins().iconst(i64_ty, index as i64);
+            let error_inst = fb.ins().call(
+                take_error_before_null_cleanup_ref,
+                &[function_id_value, block_index_value],
+            );
+            let error_value = fb.inst_results(error_inst)[0];
+            fb.ins().jump(
+                cleanup_null_blocks[index],
+                &[ir::BlockArg::Value(error_value)],
+            );
         }
 
         for (index, block) in cleanup_null_blocks.iter().enumerate() {
             fb.switch_to_block(*block);
-            let cleanup_args = fb.block_params(*block).to_vec();
+            let error_value = fb.block_params(*block)[0];
+            let cleanup_args = fb.block_params(*block)[1..].to_vec();
             for value in cleanup_args {
                 fb.ins().call(decref_ref, &[value]);
             }
@@ -8993,14 +9133,27 @@ fn build_cranelift_run_bb_specialized_function(
                 }
             }
             stack_slots.decref_all(&mut fb, ptr_ty, decref_ref);
+            fb.ins()
+                .call(restore_error_after_null_cleanup_ref, &[error_value]);
             let null_ptr = fb.ins().iconst(ptr_ty, 0);
             fb.ins().return_(&[null_ptr]);
         }
 
         fb.switch_to_block(step_null_block);
         let step_null_args = fb.block_params(step_null_block)[0];
+        let function_id_value = fb
+            .ins()
+            .iconst(i64_ty, function.function_id.packed() as i64);
+        let block_index_value = fb.ins().iconst(i64_ty, -1);
+        let error_inst = fb.ins().call(
+            take_error_before_null_cleanup_ref,
+            &[function_id_value, block_index_value],
+        );
+        let error_value = fb.inst_results(error_inst)[0];
         stack_slots.decref_all(&mut fb, ptr_ty, decref_ref);
         fb.ins().call(decref_ref, &[step_null_args]);
+        fb.ins()
+            .call(restore_error_after_null_cleanup_ref, &[error_value]);
         let null_ptr = fb.ins().iconst(ptr_ty, 0);
         fb.ins().return_(&[null_ptr]);
 
@@ -9304,6 +9457,11 @@ fn define_shared_vectorcall_trampoline(
             &mut fb.func,
             &DP_JIT_VECTORCALL_FUNCTION_ENV_IMPORT,
         );
+        let trace_direct_entry_args_ref = func_imports.get_or_panic(
+            jit_module,
+            &mut fb.func,
+            &DP_JIT_TRACE_DIRECT_ENTRY_ARGS_IMPORT,
+        );
         let take_error_before_null_cleanup_ref = func_imports.get_or_panic(
             jit_module,
             &mut fb.func,
@@ -9432,6 +9590,18 @@ fn define_shared_vectorcall_trampoline(
                 call_args.push(value);
             }
         }
+        let function_id_value = fb.ins().load(
+            i64_ty,
+            ir::MemFlags::trusted(),
+            function_extra_val,
+            PY_FUNCTION_JIT_EXTRA_FUNCTION_ID_OFFSET,
+        );
+        let trace_arg0 = owned_args.first().copied().unwrap_or(null_ptr);
+        let trace_arg1 = owned_args.get(1).copied().unwrap_or(null_ptr);
+        fb.ins().call(
+            trace_direct_entry_args_ref,
+            &[function_id_value, trace_arg0, trace_arg1],
+        );
         let callee_ptr = load_function_env_obj(
             &mut fb,
             ptr_ty,
@@ -9451,7 +9621,6 @@ fn define_shared_vectorcall_trampoline(
         fb.seal_block(direct_ok_block);
 
         fb.switch_to_block(direct_null_block);
-        let function_id_value = fb.ins().iconst(i64_ty, 0);
         let block_index_value = fb.ins().iconst(i64_ty, -3);
         let error_inst = fb.ins().call(
             take_error_before_null_cleanup_ref,

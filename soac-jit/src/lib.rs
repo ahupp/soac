@@ -30,7 +30,7 @@ use soac_blockpy::block_py::{FunctionId, ParamKind};
 use soac_blockpy::passes::CodegenModuleShape;
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::any::Any;
-use std::ffi::{CString, c_char, c_void};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::mem;
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr::{self, NonNull};
@@ -1690,7 +1690,62 @@ unsafe fn build_function_bound_args(
             }
         }
     }
+    if std::env::var_os("SOAC_BIND_TRACE").is_some()
+        && function.names.qualname.contains("__annotate_func__")
+    {
+        eprintln!(
+            "[bind] {} nargs={} nkw={} params={:?}",
+            function.names.qualname,
+            nargs,
+            nkw,
+            params.names()
+        );
+        for index in 0..nargs {
+            eprintln!(
+                "[bind] raw_arg[{index}]={}",
+                debug_pyobject_repr(*args.add(index))
+            );
+        }
+        for (index, value) in bound_args.iter().enumerate() {
+            eprintln!("[bind] bound[{index}]={}", debug_pyobject_repr(*value));
+        }
+    }
     Ok(bound_args)
+}
+
+unsafe fn debug_pyobject_repr(value: *mut ffi::PyObject) -> String {
+    if value.is_null() {
+        return "<null>".to_string();
+    }
+    let repr = ffi::PyObject_Repr(value);
+    if repr.is_null() {
+        ffi::PyErr_Clear();
+        return "<repr failed>".to_string();
+    }
+    let raw = ffi::PyUnicode_AsUTF8(repr);
+    let out = if raw.is_null() {
+        ffi::PyErr_Clear();
+        "<utf8 failed>".to_string()
+    } else {
+        CStr::from_ptr(raw).to_string_lossy().into_owned()
+    };
+    ffi::Py_DECREF(repr);
+    out
+}
+
+pub unsafe extern "C" fn trace_direct_entry_args(
+    function_id: u64,
+    arg0: *mut c_void,
+    arg1: *mut c_void,
+) {
+    if std::env::var_os("SOAC_DIRECT_ENTRY_TRACE").is_none() {
+        return;
+    }
+    eprintln!(
+        "[direct-entry] function_id={function_id} arg0={} arg1={}",
+        debug_pyobject_repr(arg0.cast()),
+        debug_pyobject_repr(arg1.cast())
+    );
 }
 
 unsafe fn write_owned_bound_args_to_buffer(

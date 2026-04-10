@@ -13,6 +13,7 @@ _SOAC_RUNTIME_READY = False
 from asyncio import coroutines as _coroutines
 import collections.abc as _abc
 import keyword as _keyword
+import os as _os
 import reprlib as _reprlib
 import sys as _sys
 import builtins as _builtins
@@ -761,7 +762,11 @@ def create_class(
         class_cell = _types.CellType()
         ns["__classcell__"] = class_cell
 
+    if _os.environ.get("SOAC_CLASS_TRACE"):
+        print(f"[class] {name}: namespace start", file=_sys.stderr, flush=True)
     namespace_fn(ns, class_cell)
+    if _os.environ.get("SOAC_CLASS_TRACE"):
+        print(f"[class] {name}: namespace done", file=_sys.stderr, flush=True)
     if "__firstlineno__" not in ns and firstlineno is not None:
         ns["__firstlineno__"] = firstlineno
     if "__static_attributes__" not in ns:
@@ -769,7 +774,11 @@ def create_class(
 
     if resolved_bases is not bases and "__orig_bases__" not in ns:
         ns["__orig_bases__"] = bases
+    if _os.environ.get("SOAC_CLASS_TRACE"):
+        print(f"[class] {name}: meta start", file=_sys.stderr, flush=True)
     cls = meta(name, resolved_bases, ns, **meta_kwds)
+    if _os.environ.get("SOAC_CLASS_TRACE"):
+        print(f"[class] {name}: meta done", file=_sys.stderr, flush=True)
 
     if cls is not None:
         ns.pop("__classcell__", None)
@@ -779,7 +788,11 @@ def create_class(
                 class_cell.cell_contents = cls
             else:
                 raise TypeError("__classcell__ must be a cell")
+        if _os.environ.get("SOAC_CLASS_TRACE"):
+            print(f"[class] {name}: watch start", file=_sys.stderr, flush=True)
         _soac_ext.profile_watch_type_key_layout(cls)
+        if _os.environ.get("SOAC_CLASS_TRACE"):
+            print(f"[class] {name}: watch done", file=_sys.stderr, flush=True)
 
     return cls
 

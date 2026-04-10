@@ -13,7 +13,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tracing::info;
+use tracing::{info, trace};
 
 unsafe extern "C" {
     static mut PyCell_Type: ffi::PyTypeObject;
@@ -273,14 +273,18 @@ fn collect_original_code_objects(
     Ok(())
 }
 
+fn is_synthetic_class_helper(function: &BlockPyFunction<CodegenModuleShape>) -> bool {
+    function.names.bind_name.starts_with("_dp_class_ns_")
+        || function.names.bind_name.starts_with("_dp_define_class_")
+}
+
 fn original_code_lookup_key(function: &BlockPyFunction<CodegenModuleShape>) -> Option<&str> {
     let qualname = function.names.qualname.as_str();
     if qualname == "_dp_module_init"
         || qualname == "__annotate__"
         || qualname.ends_with(".__annotate_func__")
         || function.names.fn_name == "_dp_resume"
-        || function.names.bind_name.starts_with("_dp_class_ns_")
-        || function.names.bind_name.starts_with("_dp_define_class_")
+        || is_synthetic_class_helper(function)
     {
         return None;
     }
@@ -917,6 +921,14 @@ fn make_bb_function(
                 "JIT basic-block function instantiation failed to resolve static function metadata for fn#{function_id}"
             ))
         })?;
+    trace!(
+        target: "soac_function_create",
+        event = "soac.function_create",
+        module_name = shared_state.module_name.as_str(),
+        function_id = %function.function_id,
+        function_qualname = function.names.qualname.as_str(),
+        "make_bb_function"
+    );
     let module_globals = module_globals.bind(py);
     module_globals.cast::<PyDict>().map_err(|_| {
         PyTypeError::new_err("JIT basic-block function instantiation requires module globals dict")

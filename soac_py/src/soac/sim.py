@@ -1,5 +1,6 @@
 # diet-python: disabled
 
+import os as _os
 import sys as _sys
 
 _MISSING = object()
@@ -262,6 +263,25 @@ def le(lhs, rhs):
 
 
 def gt(lhs, rhs):
+    if _os.environ.get("SOAC_GT_TRACE"):
+        matches = []
+        for module_name, attr_name in (
+            ("soac.runtime", "NO_DEFAULT"),
+            ("soac.runtime", "DELETED"),
+            ("annotationlib", "_sentinel"),
+            ("dataclasses", "MISSING"),
+            ("dataclasses", "_HAS_DEFAULT_FACTORY"),
+            ("dataclasses", "_ANY_MARKER"),
+        ):
+            module = _sys.modules.get(module_name)
+            if module is not None and getattr(module, attr_name, None) is lhs:
+                matches.append(f"{module_name}.{attr_name}")
+        print(
+            f"[gt] lhs={lhs!r} type={type(lhs)!r} id={id(lhs):#x} "
+            f"matches={matches!r} rhs={rhs!r} type={type(rhs)!r}",
+            file=_sys.stderr,
+            flush=True,
+        )
     return _rich_compare_error("__gt__", "__lt__", lhs, rhs)
 
 

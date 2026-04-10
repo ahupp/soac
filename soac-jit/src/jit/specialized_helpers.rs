@@ -692,7 +692,7 @@ unsafe extern "C" fn store_global_hook(
         ffi::Py_INCREF(value as *mut ffi::PyObject);
         value
     } else {
-        ptr::null_mut()
+        ensure_null_result_has_runtime_error(ptr::null_mut(), "dp_jit_store_global")
     }
 }
 
@@ -1955,6 +1955,10 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol(
         "dp_jit_vectorcall_function_env",
         crate::vectorcall_function_env as *const u8,
+    );
+    builder.symbol(
+        "dp_jit_trace_direct_entry_args",
+        crate::trace_direct_entry_args as *const u8,
     );
     builder.symbol(
         "dp_jit_take_error_before_null_cleanup",

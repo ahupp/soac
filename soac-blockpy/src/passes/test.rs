@@ -1345,6 +1345,53 @@ fn nested_class_closure_capture_does_not_turn_owner_cell_into_outer_freevar() {
 }
 
 #[test]
+fn nested_class_base_capture_keeps_method_local_cell_owned_by_method() {
+    let source = concat!(
+        "class Tests:\n",
+        "    def run(self):\n",
+        "        class Base:\n",
+        "            pass\n",
+        "        class Child[T](Base):\n",
+        "            pass\n",
+        "        return Child\n",
+    );
+    let bb_module = tracked_name_binding_module(source)
+        .expect("transform should succeed")
+        .expect("bb module should be available");
+
+    let class_ns = function_by_name(&bb_module, "_dp_class_ns_Tests");
+    assert!(
+        class_ns
+            .storage_layout()
+            .as_ref()
+            .is_none_or(|layout| layout.freevars.is_empty()),
+        "{class_ns:?}"
+    );
+
+    let run = function_by_name(&bb_module, "run");
+    let run_layout = run
+        .storage_layout()
+        .as_ref()
+        .expect("method should own a cell for Base");
+    assert!(
+        run_layout.freevars.is_empty(),
+        "method-local Base must not become an inherited freevar: {run_layout:?}"
+    );
+    let base_slot = slot_by_name(&run_layout.cellvars, "Base");
+    assert_eq!(base_slot.storage_name, "_dp_cell_Base");
+
+    let child_ns = function_by_name(&bb_module, "_dp_class_ns_Child");
+    let _child_base_slot = slot_by_name(
+        &child_ns
+            .storage_layout()
+            .as_ref()
+            .expect("nested class helper should capture Base")
+            .freevars,
+        "Base",
+    );
+}
+
+#[test]
 fn class_global_dunder_class_does_not_leak_synthetic_classcell_outward() {
     let source = concat!(
         "def exercise():\n",

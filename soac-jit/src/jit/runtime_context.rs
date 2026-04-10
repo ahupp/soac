@@ -48,6 +48,7 @@ struct FunctionEnvPrefix {
 #[repr(C)]
 struct PyFunctionJitExtraPrefix {
     function_env: ObjPtr,
+    function_id: u64,
 }
 
 pub struct ModuleRuntimeContext {
@@ -78,5 +79,7 @@ pub const FUNCTION_ENV_GLOBALS_OBJ_OFFSET: i32 = offset_of!(FunctionEnvPrefix, g
 pub const FUNCTION_ENV_RUNTIME_OBJECTS_OFFSET: i32 = size_of::<FunctionEnvPrefix>() as i32;
 pub const PY_FUNCTION_JIT_EXTRA_FUNCTION_ENV_OFFSET: i32 =
     offset_of!(PyFunctionJitExtraPrefix, function_env) as i32;
+pub const PY_FUNCTION_JIT_EXTRA_FUNCTION_ID_OFFSET: i32 =
+    offset_of!(PyFunctionJitExtraPrefix, function_id) as i32;
 pub const PY_THREAD_STATE_CURRENT_EXCEPTION_OFFSET: i32 =
     offset_of!(PyThreadStateCurrentExceptionPrefix, current_exception) as i32;

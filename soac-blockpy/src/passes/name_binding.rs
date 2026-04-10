@@ -2376,6 +2376,13 @@ fn compute_callable_storage_layout_for_name_binding(
                 .collect::<HashSet<_>>()
         })
         .unwrap_or_default();
+    let param_name_set = callable.params.names().into_iter().collect::<HashSet<_>>();
+    let mut local_cell_slots = callable
+        .scope
+        .owned_cell_storage_names()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut local_cell_slot_names = local_cell_slots.iter().cloned().collect::<HashSet<_>>();
     if let Some(callee_ids) = make_function_callees.get(&function_id) {
         for callee_id in callee_ids {
             let Some(callee_layout) = compute_callable_storage_layout_for_name_binding(
@@ -2396,18 +2403,23 @@ fn compute_callable_storage_layout_for_name_binding(
                 {
                     continue;
                 }
+                if callable
+                    .scope
+                    .local_defs
+                    .contains(slot.logical_name.as_str())
+                    || param_name_set.contains(slot.logical_name.as_str())
+                {
+                    if local_cell_slot_names.insert(capture_source_name.clone()) {
+                        local_cell_slots.push(capture_source_name);
+                    }
+                    continue;
+                }
                 capture_names.push(slot.logical_name.clone());
             }
         }
     }
     visiting.remove(&function_id);
 
-    let param_name_set = callable.params.names().into_iter().collect::<HashSet<_>>();
-    let mut local_cell_slots = callable
-        .scope
-        .owned_cell_storage_names()
-        .into_iter()
-        .collect::<Vec<_>>();
     local_cell_slots.sort();
     let layout = build_storage_layout_from_capture_names(
         callable,
@@ -2556,6 +2568,7 @@ fn compute_module_make_function_capture_names(
                         .cell_capture_source_name(logical_name.as_str());
                     if base_owned_logical_names.contains(logical_name.as_str())
                         || base_owned_storage_names.contains(source_name.as_str())
+                        || callable.scope.local_defs.contains(logical_name.as_str())
                     {
                         continue;
                     }
