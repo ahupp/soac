@@ -14,6 +14,7 @@ cpython_full_test_run_summary.txt
 /.uv/
 /.uv-cache/
 /.xdg/
+.cl-cache/
 /web/history_metrics.html
 
 # coverage artifacts

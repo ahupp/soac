@@ -718,12 +718,14 @@ def make_function(
     captures,
     param_defaults,
     annotate_fn=None,
+    module_globals=None,
 ):
     func = _jit_make_bb_function(
         function_id,
         captures,
         param_defaults,
         annotate_fn,
+        module_globals,
     )
     if kind == "coroutine":
         func._is_coroutine = _coroutines._is_coroutine

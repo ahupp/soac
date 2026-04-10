@@ -470,8 +470,8 @@ def code_with_freevars(names, is_async, is_generator):
 def tuple_values(*values):
     return tuple(values)
 
-def make_function(function_id, kind, captures, param_defaults, annotate_fn=None):
-    func = _soac_ext.make_bb_function(function_id, captures, param_defaults, annotate_fn)
+def make_function(function_id, kind, captures, param_defaults, annotate_fn=None, module_globals=None):
+    func = _soac_ext.make_bb_function(function_id, captures, param_defaults, annotate_fn, module_globals)
     if kind == 'coroutine':
         from asyncio import coroutines as _coroutines
         func._is_coroutine = _coroutines._is_coroutine

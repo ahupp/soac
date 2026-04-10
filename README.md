@@ -115,6 +115,13 @@ exports are intentionally omitted here.
   When `SOAC_LOG` is unset and `SOAC_WORK_DIR` is set, SOAC writes
   default JSON events to `$SOAC_WORK_DIR/events.jsonl`.
 
+- `SOAC_CRANELIFT_COMPILE_CACHE=1`
+  Opt into the experimental filesystem-backed Cranelift incremental
+  compile cache. When enabled, cache values are stored in `.cl-cache`
+  under filenames derived from Cranelift's cache keys, and cache hits
+  are emitted through the `soac_jit_compile_cache` tracing target. The
+  cache is disabled by default.
+
 ## Counters And Specialization
 
 - `SOAC_WORK_DIR=/path/to/work-dir`

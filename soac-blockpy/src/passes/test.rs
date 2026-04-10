@@ -1237,6 +1237,29 @@ fn method_explicit_super_records_classcell_capture_for_original_code_shape() {
 }
 
 #[test]
+fn module_function_explicit_super_does_not_record_classcell_capture() {
+    let source = concat!("def f(cls):\n", "    return super(Generic, cls).f()\n",);
+
+    let lowered = TrackedLowering::new(source);
+    let resolved_function = lowered.bb_function("f");
+    let has_class_freevar = resolved_function
+        .storage_layout
+        .as_ref()
+        .is_some_and(|layout| {
+            layout
+                .freevars
+                .iter()
+                .any(|slot| slot.logical_name == "__class__")
+        });
+
+    assert!(
+        !has_class_freevar,
+        "{resolved_function:?}\n{}",
+        lowered.name_binding_text(),
+    );
+}
+
+#[test]
 fn nested_method_dunder_class_capture_does_not_leak_classcell_to_enclosing_scopes() {
     let source = concat!(
         "def exercise():\n",

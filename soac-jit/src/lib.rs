@@ -1411,7 +1411,7 @@ unsafe fn ensure_clif_vectorcall_compiled(
         let entry = match data
             .compile_session
             .process_jit()
-            .and_then(|engine| engine.vectorcall_trampoline(param_count))
+            .and_then(|engine| engine.vectorcall_trampoline(&data.compile_session, param_count))
         {
             Ok(value) => value,
             Err(err) => {
@@ -1812,7 +1812,9 @@ pub unsafe fn register_clif_vectorcall(
         let entry = data
             .compile_session
             .process_jit()
-            .and_then(|engine| engine.vectorcall_trampoline(function.params.len()))
+            .and_then(|engine| {
+                engine.vectorcall_trampoline(&data.compile_session, function.params.len())
+            })
             .map_err(|err| {
                 if let Ok(c_msg) = CString::new(err) {
                     ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
@@ -1842,7 +1844,12 @@ pub unsafe fn register_clif_vectorcall(
     let entry = module_runtime
         .compile_session
         .process_jit()
-        .and_then(|engine| engine.vectorcall_trampoline(blockpy_function.params.len()))
+        .and_then(|engine| {
+            engine.vectorcall_trampoline(
+                &module_runtime.compile_session,
+                blockpy_function.params.len(),
+            )
+        })
         .map_err(|err| {
             if let Ok(c_msg) = CString::new(err) {
                 ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());

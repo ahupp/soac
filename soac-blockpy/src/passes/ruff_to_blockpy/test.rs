@@ -556,6 +556,7 @@ def f():
     let mut blocks = Vec::new();
     let name_gen = test_name_gen();
     let try_plan = build_try_plan(&name_gen, false, false);
+    let entry_label = name_gen.next_block_name();
     let entry = lower_try_stmt_sequence(
         match crate::passes::ast_to_instr::from_ast_stmt(Stmt::Try(try_stmt.clone())) {
             InstrRuff::StmtTry(try_stmt) => try_stmt,
@@ -566,7 +567,7 @@ def f():
         Vec::new(),
         &mut blocks,
         &name_gen,
-        label(0),
+        entry_label,
         try_plan,
         &mut |_expanded: &[InstrRuff], targets: RegionTargets, blocks: &mut Vec<TestBlock>| {
             let label = BlockLabel::from_index(100 + blocks.len());

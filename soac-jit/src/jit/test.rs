@@ -372,7 +372,9 @@ mod tests {
 
     #[test]
     fn process_jit_registry_does_not_reuse_colliding_function_ids_with_different_shapes() {
-        let mut state = ProcessJitState::new().expect("process JIT state should initialize");
+        let compile_session = crate::session::CompileSession::new();
+        let mut state =
+            ProcessJitState::new(&compile_session).expect("process JIT state should initialize");
         let first = test_function();
         let mut second = test_function();
         second.params.params.push(Param {
@@ -558,7 +560,8 @@ mod tests {
                 .retain_shared_module_state(std::sync::Arc::clone(&shared_state))
                 .expect("shared state should be retained");
 
-            let engine = ProcessJitEngine::new().expect("process JIT should construct");
+            let engine =
+                ProcessJitEngine::new(session.as_ref()).expect("process JIT should construct");
             let module_constant_ptrs = shared_state.module_constant_ptrs();
             let counter_ptrs = shared_state.counter_ptrs();
             let blocks = vec![std::ptr::null_mut::<c_void>(); first.blocks.len()];
@@ -692,10 +695,11 @@ mod tests {
                 let shared_state =
                     crate::module_type::build_shared_state_for_testing(py, module, module_name, "")
                         .expect("shared state should build");
-                let mut jit_module = new_jit_module().expect("test jit module should construct");
+                let compile_session = crate::session::CompileSession::new();
+                let mut jit_module =
+                    new_jit_module(&compile_session).expect("test jit module should construct");
                 let module_constant_ptrs = shared_state.module_constant_ptrs();
                 let counter_ptrs = shared_state.counter_ptrs();
-                let compile_session = crate::session::CompileSession::new();
                 let built = build_cranelift_run_bb_specialized_function(
                     &mut jit_module,
                     blocks,
@@ -752,7 +756,9 @@ mod tests {
         module_constants: &crate::module_constants::ModuleCodegenConstants,
     ) -> String {
         unsafe {
-            let mut jit_module = new_jit_module().expect("test jit module should construct");
+            let compile_session = crate::session::CompileSession::new();
+            let mut jit_module =
+                new_jit_module(&compile_session).expect("test jit module should construct");
             let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
             let counter_ptrs = placeholder_counter_ptrs(
                 function
@@ -766,7 +772,6 @@ mod tests {
                     .max()
                     .map_or(0, |max_counter_id| max_counter_id + 1),
             );
-            let compile_session = crate::session::CompileSession::new();
             let built = build_cranelift_run_bb_specialized_function(
                 &mut jit_module,
                 blocks,
@@ -801,10 +806,11 @@ mod tests {
         module_constants: &crate::module_constants::ModuleCodegenConstants,
     ) -> String {
         unsafe {
-            let mut jit_module = new_jit_module().expect("test jit module should construct");
+            let compile_session = crate::session::CompileSession::new();
+            let mut jit_module =
+                new_jit_module(&compile_session).expect("test jit module should construct");
             let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
             let counter_ptrs = placeholder_counter_ptrs(0);
-            let compile_session = crate::session::CompileSession::new();
             let mut built = build_cranelift_run_bb_specialized_function(
                 &mut jit_module,
                 blocks,
@@ -968,12 +974,15 @@ mod tests {
     }
 
     unsafe fn build_runtime_refcount_smoke_context() -> (
+        crate::session::CompileSession,
         JITModule,
         cranelift_codegen::Context,
         FuncId,
         [ir::UserExternalName; 2],
     ) {
-        let mut jit_module = new_jit_module().expect("test jit module should construct");
+        let compile_session = crate::session::CompileSession::new();
+        let mut jit_module =
+            new_jit_module(&compile_session).expect("test jit module should construct");
         let ptr_ty = jit_module.target_config().pointer_type();
 
         let mut refcount_signature = jit_module.make_signature();
@@ -1024,6 +1033,7 @@ mod tests {
         }
 
         (
+            compile_session,
             jit_module,
             ctx,
             wrapper_id,
@@ -1036,9 +1046,11 @@ mod tests {
 
     unsafe fn build_runtime_refcount_smoke_wrapper()
     -> unsafe extern "C" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void {
-        let (mut jit_module, mut ctx, wrapper_id, _) = build_runtime_refcount_smoke_context();
+        let (compile_session, mut jit_module, mut ctx, wrapper_id, _) =
+            build_runtime_refcount_smoke_context();
 
         define_function_with_incremental_cache(
+            &compile_session,
             &mut jit_module,
             wrapper_id,
             &mut ctx,
@@ -1058,7 +1070,9 @@ mod tests {
     }
 
     unsafe fn build_runtime_decref_wrapper() -> unsafe extern "C" fn(*mut std::ffi::c_void) {
-        let mut jit_module = new_jit_module().expect("test jit module should construct");
+        let compile_session = crate::session::CompileSession::new();
+        let mut jit_module =
+            new_jit_module(&compile_session).expect("test jit module should construct");
         let ptr_ty = jit_module.target_config().pointer_type();
 
         let mut refcount_signature = jit_module.make_signature();
@@ -1100,6 +1114,7 @@ mod tests {
         }
 
         define_function_with_incremental_cache(
+            &compile_session,
             &mut jit_module,
             wrapper_id,
             &mut ctx,
@@ -1131,7 +1146,7 @@ mod tests {
 
     #[test]
     fn jit_runtime_support_inliner_removes_direct_refcount_calls_from_caller() {
-        let (mut jit_module, mut ctx, _wrapper_id, helper_names) =
+        let (_compile_session, mut jit_module, mut ctx, _wrapper_id, helper_names) =
             unsafe { build_runtime_refcount_smoke_context() };
         let before = count_direct_calls_to_runtime_helpers(&ctx.func, &helper_names);
         assert_eq!(
@@ -1237,9 +1252,11 @@ mod tests {
 
     #[test]
     fn jit_vectorcall_trampoline_can_link_runtime_decref_clif() {
-        let engine = ProcessJitEngine::new().expect("process jit engine should construct");
+        let compile_session = crate::session::CompileSession::new();
+        let engine =
+            ProcessJitEngine::new(&compile_session).expect("process jit engine should construct");
         engine
-            .vectorcall_trampoline(0)
+            .vectorcall_trampoline(&compile_session, 0)
             .expect("vectorcall trampoline should link runtime CLIF refcount helpers");
     }
 
@@ -1549,10 +1566,11 @@ def f(x):
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
         unsafe {
-            let mut jit_module = new_jit_module().expect("test jit module should construct");
+            let compile_session = crate::session::CompileSession::new();
+            let mut jit_module =
+                new_jit_module(&compile_session).expect("test jit module should construct");
             let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
             let counter_ptrs = placeholder_counter_ptrs(0);
-            let compile_session = crate::session::CompileSession::new();
             let built = build_cranelift_run_bb_specialized_function(
                 &mut jit_module,
                 &blocks,
@@ -2480,7 +2498,8 @@ def f():
                     .expect("owner types should register from explicit test module");
                 ffi::Py_DECREF(module_obj);
 
-                let mut jit_module = new_jit_module().expect("test jit module should construct");
+                let mut jit_module = new_jit_module(runtime.compile_session.as_ref())
+                    .expect("test jit module should construct");
                 let (_init_sig, declared_init) =
                     declare_direct_function(&mut jit_module, &init_function, None)
                         .expect("test __init__ direct function should declare");

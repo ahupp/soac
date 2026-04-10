@@ -1089,6 +1089,7 @@ impl NameBindingMapper<'_> {
                 captures_expr,
                 self.map_instr(*op.param_defaults),
                 self.map_instr(*op.annotate_fn),
+                globals_expr(meta.node_index.clone(), meta.range),
             ],
         )
     }

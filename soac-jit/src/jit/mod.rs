@@ -6,7 +6,6 @@ use crate::counter_dump::{
 use crate::module_constants::{ModuleCodegenConstants, ModuleConstantId};
 use crate::module_type::SharedModuleState;
 use cranelift_codegen::cfg_printer::CFGPrinter;
-use cranelift_codegen::incremental_cache::CacheKvStore;
 use cranelift_codegen::inline::{Inline, InlineCommand};
 use cranelift_codegen::ir;
 use cranelift_codegen::ir::InstBuilder;
@@ -66,7 +65,6 @@ pub use runtime_context::{ModuleJitContext, ModuleRuntimeContext};
 pub use specialized_helpers::ObjPtr;
 use specialized_helpers::register_specialized_jit_symbols;
 
-static INCREMENTAL_CLIF_CACHE: OnceLock<Mutex<HashMap<Vec<u8>, Vec<u8>>>> = OnceLock::new();
 static RUNTIME_SUPPORT_LIBRARY: OnceLock<Result<RuntimeSupportLibrary, String>> = OnceLock::new();
 static NEXT_IMPORT_SPEC_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -82,10 +80,6 @@ fn py_dealloc_symbol() -> *const u8 {
     _Py_Dealloc as *const u8
 }
 
-fn incremental_clif_cache() -> &'static Mutex<HashMap<Vec<u8>, Vec<u8>>> {
-    INCREMENTAL_CLIF_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 fn runtime_support_library() -> Result<&'static RuntimeSupportLibrary, String> {
     match RUNTIME_SUPPORT_LIBRARY.get_or_init(|| {
         if let Some(error) = runtime_support_clif_compatibility_error() {
@@ -96,10 +90,6 @@ fn runtime_support_library() -> Result<&'static RuntimeSupportLibrary, String> {
         Ok(library) => Ok(library),
         Err(error) => Err(error.clone()),
     }
-}
-
-struct GlobalIncrementalCacheStore<'a> {
-    map: &'a Mutex<HashMap<Vec<u8>, Vec<u8>>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -460,19 +450,6 @@ impl<'a> FuncBuildImports<'a> {
     }
 }
 
-impl CacheKvStore for GlobalIncrementalCacheStore<'_> {
-    fn get(&self, key: &[u8]) -> Option<Cow<'_, [u8]>> {
-        let map = self.map.lock().ok()?;
-        map.get(key).map(|value| Cow::Owned(value.clone()))
-    }
-
-    fn insert(&mut self, key: &[u8], val: Vec<u8>) {
-        if let Ok(mut map) = self.map.lock() {
-            map.insert(key.to_vec(), val);
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct RenderedSpecializedClif {
     pub clif: String,
@@ -598,9 +575,9 @@ impl ProcessJitFunctionEntry {
 }
 
 impl ProcessJitState {
-    fn new() -> Result<Self, String> {
+    fn new(compile_session: &crate::session::CompileSession) -> Result<Self, String> {
         Ok(Self {
-            jit_module: new_jit_module()?,
+            jit_module: new_jit_module(compile_session)?,
             direct_functions: HashMap::new(),
             next_direct_symbol_id: 0,
         })
@@ -2195,6 +2172,7 @@ fn counter_ptr_for_id(
 }
 
 fn build_counted_runtime_refcount_helper(
+    compile_session: &crate::session::CompileSession,
     jit_module: &mut JITModule,
     symbol_name: &str,
     runtime_import: &'static ImportSpec,
@@ -2232,6 +2210,7 @@ fn build_counted_runtime_refcount_helper(
     }
 
     let _ = define_function_with_incremental_cache(
+        compile_session,
         jit_module,
         helper_id,
         &mut ctx,
@@ -2242,6 +2221,7 @@ fn build_counted_runtime_refcount_helper(
 }
 
 fn build_counted_runtime_refcount_helpers(
+    compile_session: &crate::session::CompileSession,
     jit_module: &mut JITModule,
     function: &BlockPyFunction<CodegenModuleShape>,
     counter_defs: &[CounterDef],
@@ -2257,6 +2237,7 @@ fn build_counted_runtime_refcount_helpers(
                     symbol_scope,
                 );
                 build_counted_runtime_refcount_helper(
+                    compile_session,
                     jit_module,
                     &symbol,
                     &DP_JIT_INCREF_IMPORT,
@@ -2274,6 +2255,7 @@ fn build_counted_runtime_refcount_helpers(
                     symbol_scope,
                 );
                 build_counted_runtime_refcount_helper(
+                    compile_session,
                     jit_module,
                     &symbol,
                     &DP_JIT_DECREF_IMPORT,
@@ -6105,9 +6087,9 @@ fn new_jit_builder() -> Result<JITBuilder, String> {
     Ok(builder)
 }
 
-fn new_jit_module() -> Result<JITModule, String> {
+fn new_jit_module(compile_session: &crate::session::CompileSession) -> Result<JITModule, String> {
     let mut jit_module = JITModule::new(new_jit_builder()?);
-    load_runtime_support_clif(&mut jit_module)?;
+    load_runtime_support_clif(compile_session, &mut jit_module)?;
     Ok(jit_module)
 }
 
@@ -6199,15 +6181,16 @@ fn resolve_process_jit_batch_function<'a>(
 }
 
 impl ProcessJitEngine {
-    pub(crate) fn new() -> Result<Self, String> {
+    pub(crate) fn new(compile_session: &crate::session::CompileSession) -> Result<Self, String> {
         Ok(Self {
-            state: Mutex::new(ProcessJitState::new()?),
+            state: Mutex::new(ProcessJitState::new(compile_session)?),
             vectorcall_trampolines: Mutex::new(HashMap::new()),
         })
     }
 
     pub(crate) fn vectorcall_trampoline(
         &self,
+        compile_session: &crate::session::CompileSession,
         param_count: usize,
     ) -> Result<VectorcallEntryFn, String> {
         let mut trampolines = self
@@ -6223,8 +6206,12 @@ impl ProcessJitEngine {
             .lock()
             .map_err(|_| "process JIT module lock poisoned".to_string())?;
         let symbol = format!("__soac_vectorcall_arity_{param_count}");
-        let entry =
-            define_shared_vectorcall_trampoline(&mut state.jit_module, param_count, &symbol)?;
+        let entry = define_shared_vectorcall_trampoline(
+            compile_session,
+            &mut state.jit_module,
+            param_count,
+            &symbol,
+        )?;
         trampolines.insert(param_count, entry);
         Ok(entry)
     }
@@ -6339,6 +6326,7 @@ impl ProcessJitEngine {
             let main_id = built.main_id;
             let main_symbol = built.main_symbol;
             let artifact = define_function_with_incremental_cache(
+                session.as_ref(),
                 &mut state.jit_module,
                 main_id,
                 &mut ctx,
@@ -6414,6 +6402,7 @@ struct DefinedFunctionArtifact {
 }
 
 fn define_function_with_incremental_cache(
+    compile_session: &crate::session::CompileSession,
     jit_module: &mut JITModule,
     func_id: FuncId,
     ctx: &mut cranelift_codegen::Context,
@@ -6421,13 +6410,28 @@ fn define_function_with_incremental_cache(
 ) -> Result<DefinedFunctionArtifact, String> {
     inline_runtime_support_calls(jit_module, ctx, err_prefix)?;
     let func_for_relocs = ctx.func.clone();
+    let func_name = ctx.func.name.clone();
     let mut ctrl_plane = ControlPlane::default();
-    let mut cache_store = GlobalIncrementalCacheStore {
-        map: incremental_clif_cache(),
+    let compiled = if compile_session.cranelift_compile_cache().is_enabled() {
+        let mut cache_store = compile_session.cranelift_compile_cache().store();
+        let (compiled, cache_hit) = ctx
+            .compile_with_cache(jit_module.isa(), &mut cache_store, &mut ctrl_plane)
+            .map_err(|err| format!("{err_prefix}: {err:?}"))?;
+        if cache_hit {
+            info!(
+                target: "soac_jit_compile_cache",
+                function = ?func_name,
+                func_id = func_id.as_u32(),
+                request = %err_prefix,
+                code_size = compiled.code_buffer().len(),
+                "Cranelift compile cache hit"
+            );
+        }
+        compiled
+    } else {
+        ctx.compile(jit_module.isa(), &mut ctrl_plane)
+            .map_err(|err| format!("{err_prefix}: {err:?}"))?
     };
-    let (compiled, _cache_hit) = ctx
-        .compile_with_cache(jit_module.isa(), &mut cache_store, &mut ctrl_plane)
-        .map_err(|err| format!("{err_prefix}: {err:?}"))?;
     let (code_bb_offsets, code_bb_edges) = compiled.get_code_bb_layout();
     let alignment = compiled.buffer.alignment as u64;
     let relocs = compiled
@@ -6919,7 +6923,10 @@ fn remap_runtime_clif_extern_user_names(
     Ok(())
 }
 
-fn load_runtime_support_clif(jit_module: &mut JITModule) -> Result<(), String> {
+fn load_runtime_support_clif(
+    compile_session: &crate::session::CompileSession,
+    jit_module: &mut JITModule,
+) -> Result<(), String> {
     let library = runtime_support_library()?;
     let mut import_func_ids = HashMap::new();
     let mut import_data_ids = HashMap::new();
@@ -6944,6 +6951,7 @@ fn load_runtime_support_clif(jit_module: &mut JITModule) -> Result<(), String> {
         let mut ctx = jit_module.make_context();
         ctx.func = function;
         let _ = define_function_with_incremental_cache(
+            compile_session,
             jit_module,
             func_id,
             &mut ctx,
@@ -7112,7 +7120,8 @@ pub fn run_cranelift_smoke(module: &BlockPyModule<CodegenModuleShape>) -> Result
         .sum::<i64>();
     let sentinel = (function_count << 32) ^ block_count;
 
-    let mut jit_module = new_jit_module()?;
+    let compile_session = crate::session::CompileSession::new();
+    let mut jit_module = new_jit_module(&compile_session)?;
     let mut ctx = jit_module.make_context();
     ctx.func
         .signature
@@ -7131,6 +7140,7 @@ pub fn run_cranelift_smoke(module: &BlockPyModule<CodegenModuleShape>) -> Result
 
     let function_id = declare_local_fn(&mut jit_module, "dp_jit_smoke", &ctx.func.signature)?;
     let _ = define_function_with_incremental_cache(
+        &compile_session,
         &mut jit_module,
         function_id,
         &mut ctx,
@@ -7329,6 +7339,7 @@ fn build_cranelift_run_bb_specialized_function(
         }
     };
     let counted_refcount_helpers = build_counted_runtime_refcount_helpers(
+        compile_session,
         jit_module,
         function,
         counter_defs,
@@ -7571,7 +7582,6 @@ fn build_cranelift_run_bb_specialized_function(
             func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_TUPLE_NEW_IMPORT);
         let tuple_set_item_ref =
             func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_TUPLE_SET_ITEM_IMPORT);
-
         let entry_deleted_const = emit_owned_module_constant_from_parts(
             &mut fb,
             deleted_constant_id,
@@ -8258,6 +8268,7 @@ pub(crate) fn compiled_direct_code_ptr(compiled_handle: ObjPtr) -> Result<ObjPtr
 }
 
 fn define_shared_vectorcall_trampoline(
+    compile_session: &crate::session::CompileSession,
     jit_module: &mut JITModule,
     param_count: usize,
     symbol_name: &str,
@@ -8463,6 +8474,7 @@ fn define_shared_vectorcall_trampoline(
     }
 
     let main_artifact = define_function_with_incremental_cache(
+        compile_session,
         jit_module,
         main_id,
         &mut ctx,

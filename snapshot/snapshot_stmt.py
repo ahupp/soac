@@ -301,50 +301,52 @@ except:
 # function _dp_module_init():
 #     function_id: 0:1
 #     block bb1:
-#         jump bb17
-#         block bb17:
+#         jump bb18
+#         block bb18:
 #             f()
-#             return NONE
-#     block bb0:
+#             jump bb0
+#             block bb0:
+#                 return NONE
+#     block bb2:
 #         return NONE
-#     block bb3(_dp_try_exc_0_1_0: Exception):
-#         exc_param: _dp_try_exc_0_1_0
-#         branch_table _dp_try_abrupt_kind_0_1_2 -> [bb0, bb4, bb5] default bb0
 #     block bb4(_dp_try_exc_0_1_0: Exception):
 #         exc_param: _dp_try_exc_0_1_0
-#         return _dp_try_abrupt_payload_0_1_3
+#         branch_table _dp_try_abrupt_kind_0_1_2 -> [bb2, bb5, bb6] default bb2
 #     block bb5(_dp_try_exc_0_1_0: Exception):
 #         exc_param: _dp_try_exc_0_1_0
-#         raise _dp_try_abrupt_payload_0_1_3
+#         return _dp_try_abrupt_payload_0_1_3
 #     block bb6(_dp_try_exc_0_1_0: Exception):
 #         exc_param: _dp_try_exc_0_1_0
+#         raise _dp_try_abrupt_payload_0_1_3
+#     block bb7(_dp_try_exc_0_1_0: Exception):
+#         exc_param: _dp_try_exc_0_1_0
 #         StoreName("e", _dp_try_exc_0_1_0)
-#         jump bb13
-#     block bb7(_dp_try_exc_0_1_0: Exception, _dp_try_abrupt_kind_0_1_2: AbruptKind, _dp_try_abrupt_payload_0_1_3: AbruptPayload):
+#         jump bb14
+#     block bb8(_dp_try_exc_0_1_0: Exception, _dp_try_abrupt_kind_0_1_2: AbruptKind, _dp_try_abrupt_payload_0_1_3: AbruptPayload):
 #         exc_param: _dp_try_exc_0_1_0
 #         del_quietly(e)
-#         jump bb3
-#     block bb8(_dp_try_exc_0_1_0: Exception):
-#         exc_param: _dp_try_exc_0_1_0
-#         jump bb7(AbruptKind(Fallthrough), None)
+#         jump bb4
 #     block bb9(_dp_try_exc_0_1_0: Exception):
 #         exc_param: _dp_try_exc_0_1_0
-#         jump bb7(AbruptKind(Exception), Name("_dp_try_exc_0_1_0"))
-#     block bb13(_dp_try_exc_0_1_0: Exception):
+#         jump bb8(AbruptKind(Fallthrough), None)
+#     block bb10(_dp_try_exc_0_1_0: Exception):
+#         exc_param: _dp_try_exc_0_1_0
+#         jump bb8(AbruptKind(Exception), Name("_dp_try_exc_0_1_0"))
+#     block bb14(_dp_try_exc_0_1_0: Exception):
 #         exc_param: _dp_try_exc_0_1_0
 #         g(e)
-#         jump bb8
-#     block bb15(_dp_try_exc_0_1_0: Exception):
+#         jump bb9
+#     block bb16(_dp_try_exc_0_1_0: Exception):
 #         exc_param: _dp_try_exc_0_1_0
 #         h()
-#         return NONE
-#     block bb16(_dp_try_exc_0_1_0: Exception):
+#         jump bb2
+#     block bb17(_dp_try_exc_0_1_0: Exception):
 #         exc_param: _dp_try_exc_0_1_0
 #         if_term exception_matches(_dp_try_exc_0_1_0, E):
 #             then:
-#                 jump bb6
+#                 jump bb7
 #             else:
-#                 jump bb15
+#                 jump bb16
 
 # for_else
 
@@ -414,8 +416,8 @@ with cm as x:
 #         StoreName("_dp_with_exit_1", contextmanager_get_exit(cm))
 #         StoreName("x", contextmanager_enter(cm))
 #         StoreName("_dp_with_ok_2", TRUE)
-#         jump bb17
-#         block bb17:
+#         jump bb18
+#         block bb18:
 #             body()
 #             jump bb9
 #             block bb9:
@@ -447,19 +449,21 @@ with cm as x:
 #     block bb10(_dp_try_exc_0_1_0: Exception):
 #         exc_param: _dp_try_exc_0_1_0
 #         jump bb6(AbruptKind(Exception), Name("_dp_try_exc_0_1_0"))
-#     block bb14(_dp_try_exc_0_1_0: Exception):
+#     block bb14:
+#         jump bb9
+#     block bb15(_dp_try_exc_0_1_0: Exception):
 #         exc_param: _dp_try_exc_0_1_0
 #         if_term exception_matches(_dp_try_exc_0_1_0, BaseException):
 #             then:
-#                 jump bb15
-#             else:
 #                 jump bb16
-#     block bb15(_dp_try_exc_0_1_0: Exception):
+#             else:
+#                 jump bb17
+#     block bb16(_dp_try_exc_0_1_0: Exception):
 #         exc_param: _dp_try_exc_0_1_0
 #         StoreName("_dp_with_ok_2", FALSE)
 #         contextmanager_exit(_dp_with_exit_1, _dp_try_exc_0_1_0)
-#         jump bb9
-#     block bb16(_dp_try_exc_0_1_0: Exception):
+#         jump bb14
+#     block bb17(_dp_try_exc_0_1_0: Exception):
 #         exc_param: _dp_try_exc_0_1_0
 #         raise _dp_try_exc_0_1_0
 
@@ -707,35 +711,35 @@ with a as x, b as y:
 #         StoreName("_dp_with_exit_4", contextmanager_get_exit(a))
 #         StoreName("x", contextmanager_enter(a))
 #         StoreName("_dp_with_ok_5", TRUE)
-#         jump bb20
-#         block bb20:
+#         jump bb21
+#         block bb21:
 #             StoreName("_dp_with_exit_1", contextmanager_get_exit(b))
 #             StoreName("y", contextmanager_enter(b))
 #             StoreName("_dp_with_ok_2", TRUE)
-#             jump bb33
-#             block bb33:
+#             jump bb35
+#             block bb35:
 #                 body()
-#                 jump bb25
-#                 block bb25:
-#                     jump bb22(AbruptKind(Fallthrough), None)
-#                     block bb22(_dp_try_exc_0_1_3: Exception, _dp_try_abrupt_kind_0_1_4: AbruptKind, _dp_try_abrupt_payload_0_1_5: AbruptPayload):
+#                 jump bb26
+#                 block bb26:
+#                     jump bb23(AbruptKind(Fallthrough), None)
+#                     block bb23(_dp_try_exc_0_1_3: Exception, _dp_try_abrupt_kind_0_1_4: AbruptKind, _dp_try_abrupt_payload_0_1_5: AbruptPayload):
 #                         exc_param: _dp_try_exc_0_1_3
 #                         if_term _dp_with_ok_2:
 #                             then:
-#                                 block bb23(_dp_try_exc_0_1_3: Exception):
-#                                     exc_param: _dp_try_exc_0_1_3
-#                                     contextmanager_exit(_dp_with_exit_1, NONE)
-#                                     jump bb21
-#                             else:
 #                                 block bb24(_dp_try_exc_0_1_3: Exception):
 #                                     exc_param: _dp_try_exc_0_1_3
-#                                     jump bb21
-#                         block bb21(_dp_try_exc_0_1_3: Exception):
+#                                     contextmanager_exit(_dp_with_exit_1, NONE)
+#                                     jump bb22
+#                             else:
+#                                 block bb25(_dp_try_exc_0_1_3: Exception):
+#                                     exc_param: _dp_try_exc_0_1_3
+#                                     jump bb22
+#                         block bb22(_dp_try_exc_0_1_3: Exception):
 #                             exc_param: _dp_try_exc_0_1_3
 #                             StoreName("_dp_with_exit_1", NONE)
-#                             jump bb17
-#                             block bb17:
-#                                 branch_table _dp_try_abrupt_kind_0_1_4 -> [bb9, bb18, bb19] default bb9
+#                             jump bb18
+#                             block bb18:
+#                                 branch_table _dp_try_abrupt_kind_0_1_4 -> [bb9, bb19, bb20] default bb9
 #                                 block bb6(_dp_try_exc_0_1_0: Exception, _dp_try_abrupt_kind_0_1_1: AbruptKind, _dp_try_abrupt_payload_0_1_2: AbruptPayload):
 #                                     exc_param: _dp_try_exc_0_1_0
 #                                     if_term _dp_with_ok_5:
@@ -762,45 +766,49 @@ with a as x, b as y:
 #                                                 raise _dp_try_abrupt_payload_0_1_2
 #                                 block bb9:
 #                                     jump bb6(AbruptKind(Fallthrough), None)
-#                                 block bb18:
+#                                 block bb19:
 #                                     StoreName("_dp_try_abrupt_payload_0_1_2", _dp_try_abrupt_payload_0_1_5)
 #                                     jump bb6(AbruptKind(Return), Name("_dp_try_abrupt_payload_0_1_2"))
-#                                 block bb19:
+#                                 block bb20:
 #                                     raise _dp_try_abrupt_payload_0_1_5
 #     block bb10(_dp_try_exc_0_1_0: Exception):
 #         exc_param: _dp_try_exc_0_1_0
 #         jump bb6(AbruptKind(Exception), Name("_dp_try_exc_0_1_0"))
-#     block bb14(_dp_try_exc_0_1_0: Exception):
+#     block bb14:
+#         jump bb9
+#     block bb15(_dp_try_exc_0_1_0: Exception):
 #         exc_param: _dp_try_exc_0_1_0
 #         if_term exception_matches(_dp_try_exc_0_1_0, BaseException):
 #             then:
-#                 jump bb15
-#             else:
 #                 jump bb16
-#     block bb15(_dp_try_exc_0_1_0: Exception):
+#             else:
+#                 jump bb17
+#     block bb16(_dp_try_exc_0_1_0: Exception):
 #         exc_param: _dp_try_exc_0_1_0
 #         StoreName("_dp_with_ok_5", FALSE)
 #         contextmanager_exit(_dp_with_exit_4, _dp_try_exc_0_1_0)
-#         jump bb9
-#     block bb16(_dp_try_exc_0_1_0: Exception):
+#         jump bb14
+#     block bb17(_dp_try_exc_0_1_0: Exception):
 #         exc_param: _dp_try_exc_0_1_0
 #         raise _dp_try_exc_0_1_0
-#     block bb26(_dp_try_exc_0_1_3: Exception):
+#     block bb27(_dp_try_exc_0_1_3: Exception):
 #         exc_param: _dp_try_exc_0_1_3
-#         jump bb22(AbruptKind(Exception), Name("_dp_try_exc_0_1_3"))
-#     block bb30(_dp_try_exc_0_1_3: Exception):
+#         jump bb23(AbruptKind(Exception), Name("_dp_try_exc_0_1_3"))
+#     block bb31:
+#         jump bb26
+#     block bb32(_dp_try_exc_0_1_3: Exception):
 #         exc_param: _dp_try_exc_0_1_3
 #         if_term exception_matches(_dp_try_exc_0_1_3, BaseException):
 #             then:
-#                 jump bb31
+#                 jump bb33
 #             else:
-#                 jump bb32
-#     block bb31(_dp_try_exc_0_1_3: Exception):
+#                 jump bb34
+#     block bb33(_dp_try_exc_0_1_3: Exception):
 #         exc_param: _dp_try_exc_0_1_3
 #         StoreName("_dp_with_ok_2", FALSE)
 #         contextmanager_exit(_dp_with_exit_1, _dp_try_exc_0_1_3)
-#         jump bb25
-#     block bb32(_dp_try_exc_0_1_3: Exception):
+#         jump bb31
+#     block bb34(_dp_try_exc_0_1_3: Exception):
 #         exc_param: _dp_try_exc_0_1_3
 #         raise _dp_try_exc_0_1_3
 
@@ -857,8 +865,8 @@ async def run():
 #         StoreName("_dp_with_exit_1", asynccontextmanager_get_aexit(cm))
 #         StoreName("x", await asynccontextmanager_aenter(cm))
 #         StoreName("_dp_with_ok_2", TRUE)
-#         jump bb21
-#         block bb21:
+#         jump bb22
+#         block bb22:
 #             body()
 #             jump bb9
 #             block bb9:
@@ -890,35 +898,37 @@ async def run():
 #     block bb10(_dp_try_exc_0_1_0: Exception):
 #         exc_param: _dp_try_exc_0_1_0
 #         jump bb6(AbruptKind(Exception), Name("_dp_try_exc_0_1_0"))
-#     block bb14(_dp_try_exc_0_1_0: Exception):
+#     block bb14:
+#         jump bb9
+#     block bb15(_dp_try_exc_0_1_0: Exception):
 #         exc_param: _dp_try_exc_0_1_0
 #         if_term exception_matches(current_exception(), BaseException):
 #             then:
-#                 jump bb15
+#                 jump bb16
 #             else:
-#                 jump bb20
-#     block bb15(_dp_try_exc_0_1_0: Exception):
+#                 jump bb21
+#     block bb16(_dp_try_exc_0_1_0: Exception):
 #         exc_param: _dp_try_exc_0_1_0
 #         StoreName("_dp_with_ok_2", FALSE)
 #         StoreName("_dp_with_reraise_3", await asynccontextmanager_exit(_dp_with_exit_1, current_exception()))
-#         jump bb16
-#     block bb16(_dp_try_exc_0_1_0: Exception):
+#         jump bb17
+#     block bb17(_dp_try_exc_0_1_0: Exception):
 #         exc_param: _dp_try_exc_0_1_0
 #         if_term UnaryOp(Not, BinOp(Is, _dp_with_reraise_3, NONE)):
 #             then:
-#                 jump bb17
-#             else:
 #                 jump bb18
-#     block bb17(_dp_try_exc_0_1_0: Exception):
-#         exc_param: _dp_try_exc_0_1_0
-#         raise _dp_with_reraise_3
+#             else:
+#                 jump bb19
 #     block bb18(_dp_try_exc_0_1_0: Exception):
 #         exc_param: _dp_try_exc_0_1_0
-#         jump bb19
+#         raise _dp_with_reraise_3
 #     block bb19(_dp_try_exc_0_1_0: Exception):
 #         exc_param: _dp_try_exc_0_1_0
-#         jump bb9
+#         jump bb20
 #     block bb20(_dp_try_exc_0_1_0: Exception):
+#         exc_param: _dp_try_exc_0_1_0
+#         jump bb14
+#     block bb21(_dp_try_exc_0_1_0: Exception):
 #         exc_param: _dp_try_exc_0_1_0
 #         raise
 
@@ -1010,8 +1020,8 @@ with Suppress():
 #         StoreName("_dp_with_exit_1", contextmanager_get_exit(_dp_tmp_4))
 #         contextmanager_enter(_dp_tmp_4)
 #         StoreName("_dp_with_ok_2", TRUE)
-#         jump bb17
-#         block bb17:
+#         jump bb18
+#         block bb18:
 #             raise RuntimeError("boom")
 #     block bb0:
 #         return NONE
@@ -1045,19 +1055,21 @@ with Suppress():
 #     block bb10(_dp_try_exc_0_1_0: Exception):
 #         exc_param: _dp_try_exc_0_1_0
 #         jump bb6(AbruptKind(Exception), Name("_dp_try_exc_0_1_0"))
-#     block bb14(_dp_try_exc_0_1_0: Exception):
+#     block bb14:
+#         jump bb9
+#     block bb15(_dp_try_exc_0_1_0: Exception):
 #         exc_param: _dp_try_exc_0_1_0
 #         if_term exception_matches(_dp_try_exc_0_1_0, BaseException):
 #             then:
-#                 jump bb15
-#             else:
 #                 jump bb16
-#     block bb15(_dp_try_exc_0_1_0: Exception):
+#             else:
+#                 jump bb17
+#     block bb16(_dp_try_exc_0_1_0: Exception):
 #         exc_param: _dp_try_exc_0_1_0
 #         StoreName("_dp_with_ok_2", FALSE)
 #         contextmanager_exit(_dp_with_exit_1, _dp_try_exc_0_1_0)
-#         jump bb9
-#     block bb16(_dp_try_exc_0_1_0: Exception):
+#         jump bb14
+#     block bb17(_dp_try_exc_0_1_0: Exception):
 #         exc_param: _dp_try_exc_0_1_0
 #         raise _dp_try_exc_0_1_0
 
@@ -1173,22 +1185,26 @@ except Exception:
 # function _dp_module_init():
 #     function_id: 0:1
 #     block bb1:
-#         jump bb5
-#         block bb5:
+#         jump bb6
+#         block bb6:
 #             print(1)
-#             return NONE
-#     block bb2(_dp_try_exc_0_1_0: Exception):
+#             jump bb0
+#             block bb0:
+#                 return NONE
+#     block bb2:
+#         return NONE
+#     block bb3(_dp_try_exc_0_1_0: Exception):
 #         exc_param: _dp_try_exc_0_1_0
 #         if_term exception_matches(_dp_try_exc_0_1_0, Exception):
 #             then:
-#                 jump bb3
-#             else:
 #                 jump bb4
-#     block bb3(_dp_try_exc_0_1_0: Exception):
+#             else:
+#                 jump bb5
+#     block bb4(_dp_try_exc_0_1_0: Exception):
 #         exc_param: _dp_try_exc_0_1_0
 #         print(2)
-#         return NONE
-#     block bb4(_dp_try_exc_0_1_0: Exception):
+#         jump bb2
+#     block bb5(_dp_try_exc_0_1_0: Exception):
 #         exc_param: _dp_try_exc_0_1_0
 #         raise _dp_try_exc_0_1_0
 
@@ -1227,23 +1243,25 @@ def complicated(a):
 #                         Del { name: "_dp_tmp_0_1_1", quietly: false }
 #                         jump bb5
 #                         block bb5:
-#                             jump bb9
-#                             block bb9:
+#                             jump bb10
+#                             block bb10:
 #                                 StoreName("j", BinOp(Add, i, 1))
 #                                 yield j
 #                                 jump bb1
-#     block bb6(_dp_try_exc_0_1_2: Exception):
+#     block bb6:
+#         jump bb1
+#     block bb7(_dp_try_exc_0_1_2: Exception):
 #         exc_param: _dp_try_exc_0_1_2
 #         if_term exception_matches(current_exception(), Exception):
 #             then:
-#                 jump bb7
-#             else:
 #                 jump bb8
-#     block bb7(_dp_try_exc_0_1_2: Exception):
+#             else:
+#                 jump bb9
+#     block bb8(_dp_try_exc_0_1_2: Exception):
 #         exc_param: _dp_try_exc_0_1_2
 #         print("oops")
-#         jump bb1
-#     block bb8(_dp_try_exc_0_1_2: Exception):
+#         jump bb6
+#     block bb9(_dp_try_exc_0_1_2: Exception):
 #         exc_param: _dp_try_exc_0_1_2
 #         raise
 

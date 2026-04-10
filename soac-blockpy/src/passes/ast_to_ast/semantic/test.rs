@@ -321,6 +321,16 @@ fn semantic_state_marks_method_dunder_class_as_nonlocal_cell_capture() {
 }
 
 #[test]
+fn semantic_state_does_not_create_classcell_for_module_level_explicit_super() {
+    let mut body = parse_module_body(concat!("def f(cls):\n", "    return super(Generic, cls)\n",));
+    let semantic_state = SemanticAstState::from_ruff(&mut body);
+    let function_scope = function_scope(&semantic_state, find_function(&body, "f"));
+
+    assert_eq!(function_scope.binding_in_current_scope("__class__"), None);
+    assert_eq!(function_scope.cell_storage_name("__class__"), None);
+}
+
+#[test]
 fn semantic_state_propagates_method_dunder_class_binding_to_nested_functions() {
     let mut body = parse_module_body(concat!(
         "class C:\n",

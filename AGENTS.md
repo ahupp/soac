@@ -261,6 +261,12 @@ instance's live working commit.
   `soac_module_load` target; JIT-codegen timing is emitted by
   `soac_jit_codegen`. When `SOAC_LOG` is unset and `SOAC_WORK_DIR` is
   set, the default event log is `$SOAC_WORK_DIR/events.jsonl`.
+- `SOAC_CRANELIFT_COMPILE_CACHE`
+  Set to `1`, `true`, `yes`, or `on` to enable the experimental
+  filesystem-backed Cranelift incremental compile cache. It writes
+  entries to `.cl-cache` using key-derived filenames and logs cache hits
+  through the `soac_jit_compile_cache` tracing target. The cache is
+  disabled by default.
 - `BEHAVIOR_CHANGE`
   Source comments with this exact tag mark intentional CPython-visible
   compatibility changes. Current examples: apply-mode raw indexed

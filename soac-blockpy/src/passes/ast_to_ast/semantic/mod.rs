@@ -744,14 +744,13 @@ impl RuffSemanticSnapshotBuilder {
             }
         }
 
-        if self.current_scope_is_function()
+        let should_synthesize_class_cell = self.current_scope_is_function()
             && uses_class_cell
-            && !bindings.contains_key("__class__")
-        {
+            && self.current_scope_has_class_ancestor();
+        if should_synthesize_class_cell && !bindings.contains_key("__class__") {
             set_semantic_binding(&mut bindings, "__class__", SemanticBindingKind::Nonlocal);
             cell_storage_names.insert("__class__".to_string(), "_dp_classcell".to_string());
-        } else if self.current_scope_is_function()
-            && uses_class_cell
+        } else if should_synthesize_class_cell
             && matches!(
                 bindings.get("__class__"),
                 Some(SemanticBindingKind::Nonlocal)
@@ -773,6 +772,19 @@ impl RuffSemanticSnapshotBuilder {
             self.semantic.current_scope().kind,
             RuffScopeKind::Function(_) | RuffScopeKind::Lambda(_)
         )
+    }
+
+    fn current_scope_has_class_ancestor(&self) -> bool {
+        let mut current = Some(self.current_ids().0);
+        while let Some(scope_id) = current {
+            let scope = self.snapshot.scope(scope_id);
+            match scope.kind {
+                SemanticScopeKind::Class => return true,
+                SemanticScopeKind::Module => return false,
+                SemanticScopeKind::Function => current = scope.parent,
+            }
+        }
+        false
     }
 
     fn enclosing_function_capture_storage_name(&self, name: &str) -> Option<Option<String>> {

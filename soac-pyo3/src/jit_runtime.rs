@@ -520,24 +520,6 @@ fn resolve_module_package(module_globals: &Bound<'_, PyAny>, operation: &str) ->
     })
 }
 
-fn module_globals_from_shared_state<'py>(
-    py: Python<'py>,
-    shared_state: &SharedModuleState,
-    operation: &str,
-) -> PyResult<Bound<'py, PyAny>> {
-    let sys = PyModule::import(py, "sys")?;
-    let modules = sys.getattr("modules")?.cast_into::<PyDict>()?;
-    let module = modules
-        .get_item(shared_state.module_name.as_str())?
-        .ok_or_else(|| {
-            PyRuntimeError::new_err(format!(
-                "JIT basic-block {operation} failed to find loaded module {}",
-                shared_state.module_name
-            ))
-        })?;
-    module.getattr("__dict__")
-}
-
 fn module_runtime_from_shared_state(
     compile_session: Arc<soac_jit::CompileSession>,
     shared_state: Arc<SharedModuleState>,
@@ -596,10 +578,37 @@ fn build_capture_map<'py>(
             .extract::<String>()
             .map_err(|_| PyTypeError::new_err(format!("invalid bb capture payload: {item:?}")))?;
         let value = item.get_item(1)?;
+        let value = normalize_class_cell_capture(name.as_str(), value)?;
         closure_values.set_item(name.as_str(), &value)?;
         captured_names.push(name);
     }
     Ok((captured_names, closure_values))
+}
+
+fn normalize_class_cell_capture<'py>(
+    name: &str,
+    value: Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    if !matches!(name, "__class__" | "_dp_classcell") || !is_cell_object(value.as_ptr()) {
+        return Ok(value);
+    }
+    let py = value.py();
+    let cell_contents = match value.getattr("cell_contents") {
+        Ok(cell_contents) => cell_contents,
+        Err(err)
+            if err
+                .matches(py, py.get_type::<PyValueError>())
+                .unwrap_or(false) =>
+        {
+            return Ok(value);
+        }
+        Err(err) => return Err(err),
+    };
+    if is_cell_object(cell_contents.as_ptr()) {
+        Ok(cell_contents)
+    } else {
+        Ok(value)
+    }
 }
 
 fn split_param_defaults<'py>(
@@ -895,6 +904,7 @@ fn make_bb_function(
     captures: Py<PyAny>,
     param_defaults: Py<PyAny>,
     annotate_fn: Py<PyAny>,
+    module_globals: Py<PyAny>,
 ) -> PyResult<Py<PyAny>> {
     let dp = import_dp_module(py)?;
     let function_id = FunctionId::from_packed(function_id);
@@ -907,8 +917,10 @@ fn make_bb_function(
                 "JIT basic-block function instantiation failed to resolve static function metadata for fn#{function_id}"
             ))
         })?;
-    let module_globals =
-        module_globals_from_shared_state(py, &shared_state, "function instantiation")?;
+    let module_globals = module_globals.bind(py);
+    module_globals.cast::<PyDict>().map_err(|_| {
+        PyTypeError::new_err("JIT basic-block function instantiation requires module globals dict")
+    })?;
     let module_name = shared_state.module_name.clone();
     let module_runtime =
         module_runtime_from_shared_state(compile_session, shared_state, &module_globals);
