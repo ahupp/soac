@@ -1,6 +1,6 @@
 ---
 name: benchmark-compare
-description: Compare two SOAC pystone benchmark directories. Use when Codex needs to create missing bench/{change_id}_{commit_id} results for jj revisions, compare specialized benchmark throughput, verify specialization counters, and inspect paired perf profiles.
+description: Compare two SOAC pystone benchmark directories. Use when Codex needs to create missing one-off bench/{change_id}_{commit_id} results for jj revisions, compare specialized benchmark throughput, verify specialization counters, and inspect paired perf profiles.
 ---
 
 # Benchmark Compare
@@ -11,11 +11,14 @@ directory for a revision, then compare two such directories.
 ## Result Layout
 
 Results live under the ignored repo-root `bench/` directory. Each result
-directory is named:
+directory used for comparison is named:
 
 ```text
 bench/{change_id}_{commit_id}/
 ```
+
+This commit-qualified layout is for one-off comparison runs. Finalized
+benchmarks for changes being merged to `main` use `bench/{change_id}` instead.
 
 Important files:
 

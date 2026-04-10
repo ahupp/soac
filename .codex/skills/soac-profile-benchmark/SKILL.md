@@ -1,18 +1,35 @@
 ---
-name: run-pystone-benchmark
-description: Run this repo's pystone benchmark recipe and summarize its bench/{change_id}_{commit_id} result directory. Use when Codex needs to benchmark transformed/JIT pystone, capture profile/verify/specialized counters, run perf for the specialized apply run, or summarize the artifact-producing benchmark output.
+name: soac-profile-benchmark
+description: Run SOAC's artifact-producing pystone profile benchmark and summarize its result directory. Use when Codex needs to benchmark transformed/JIT pystone, capture profile/verify/specialized counters, run perf for the specialized apply run, or summarize benchmark artifacts.
 ---
 
-# Run Pystone Benchmark
+# SOAC Profile Benchmark
 
 Use the artifact-producing `Justfile` benchmark recipe from the repo root.
-It writes one result directory under the ignored `bench/` tree.
+It writes one result directory under the ignored shared `bench/` tree.
 
 ## Run
+
+For one-off test benchmarks while iterating, run:
 
 ```bash
 just benchmark
 ```
+
+This writes `bench/{change_id}_{commit_id}` so rebased or amended jj changes do
+not accidentally reuse stale results.
+
+When a change is finalized for merge to `main`, rebase the finished change onto
+`main` first, then run the benchmark in finalized mode against the exact revision
+that will be merged:
+
+```bash
+just benchmark 1000000 100000 10000000 bench <jj-rev> finalized
+```
+
+This writes `bench/{change_id}`. If the finished change is still the current
+working commit, use `@` for `<jj-rev>`; if you already froze it with `jj new`,
+use the frozen revision such as `@-`.
 
 The first positional argument is the specialized apply-pass loop count:
 

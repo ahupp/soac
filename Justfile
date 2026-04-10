@@ -190,7 +190,7 @@ setup-dev-env:
   if [[ -f "$REPO_ROOT/.jj/repo" ]]; then
     if [[ -z "${SOAC_PARENT_REPO:-}" ]]; then
       echo "setup-dev-env: this checkout is a jj worktree, but SOAC_PARENT_REPO is not set" >&2
-      echo "set SOAC_PARENT_REPO to the parent checkout that owns vendor/cpython and shared offline caches" >&2
+      echo "set SOAC_PARENT_REPO to the parent checkout that owns vendor/cpython, bench, and shared offline caches" >&2
       exit 1
     fi
 
@@ -212,6 +212,7 @@ setup-dev-env:
     fi
 
     mkdir -p \
+      "$parent_repo/bench" \
       "$parent_repo/.uv-cache" \
       "$parent_repo/.uv/tools" \
       "$parent_repo/.uv/bin" \
@@ -220,10 +221,17 @@ setup-dev-env:
       "$parent_repo/tmp/cargo-home"
 
     link_shared_dir "$REPO_ROOT/vendor/cpython" "$parent_repo/vendor/cpython" "vendor/cpython"
+    link_shared_dir "$REPO_ROOT/bench" "$parent_repo/bench" "bench" 1
     link_shared_dir "$REPO_ROOT/.uv-cache" "$parent_repo/.uv-cache" ".uv-cache" 1
     link_shared_dir "$REPO_ROOT/.uv" "$parent_repo/.uv" ".uv" 1
     link_shared_dir "$REPO_ROOT/.xdg" "$parent_repo/.xdg" ".xdg" 1
     link_shared_dir "$REPO_ROOT/tmp/cargo-home" "$parent_repo/tmp/cargo-home" "tmp/cargo-home" 1
+  else
+    if [[ -L "$REPO_ROOT/bench" ]]; then
+      echo "bench is a symlink in the parent checkout; replace it with a regular directory before running setup-dev-env" >&2
+      exit 1
+    fi
+    mkdir -p "$REPO_ROOT/bench"
   fi
 
   mkdir -p \
@@ -239,24 +247,6 @@ setup-dev-env:
     exit 1
   fi
 
-  shared_bench="$REPO_ROOT/../soac-bench"
-  mkdir -p "$shared_bench"
-  if [[ -L "$REPO_ROOT/bench" ]]; then
-    link_target="$(readlink "$REPO_ROOT/bench")"
-    if [[ "$link_target" != "../soac-bench" && "$link_target" != "$shared_bench" ]]; then
-      rm "$REPO_ROOT/bench"
-      ln -s ../soac-bench "$REPO_ROOT/bench"
-    fi
-  elif [[ -d "$REPO_ROOT/bench" ]]; then
-    cp -a --no-clobber "$REPO_ROOT/bench/." "$shared_bench/"
-    rm -rf "$REPO_ROOT/bench"
-    ln -s ../soac-bench "$REPO_ROOT/bench"
-  elif [[ -e "$REPO_ROOT/bench" ]]; then
-    echo "cannot create bench symlink: $REPO_ROOT/bench exists and is not a directory or symlink" >&2
-    exit 1
-  else
-    ln -s ../soac-bench "$REPO_ROOT/bench"
-  fi
   rustup toolchain install nightly
   rustup component add rustc-codegen-cranelift-preview --toolchain nightly
   cargo install --locked inferno
@@ -943,7 +933,7 @@ benchmark-warm loops="8000000": (update-venv-offline) (build-extension "release"
   BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
     "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
 
-benchmark benchmark_loops="1000000" verify_loops="100000" perf_loops="10000000" results_root="bench" result_rev="@": (update-venv-offline) (build-extension "release")
+benchmark benchmark_loops="1000000" verify_loops="100000" perf_loops="10000000" results_root="bench" result_rev="@" result_mode="one-off": (update-venv-offline) (build-extension "release")
   #!/usr/bin/env bash
   set -euo pipefail
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -955,6 +945,7 @@ benchmark benchmark_loops="1000000" verify_loops="100000" perf_loops="10000000" 
   PROFILE_LOOPS="100000"
   SPECIALIZED_RUNS="${BENCHMARK_SPECIALIZED_RUNS:-3}"
   RESULTS_ROOT="{{results_root}}"
+  RESULT_MODE="{{result_mode}}"
   if [[ "$RESULTS_ROOT" != /* ]]; then
     RESULTS_ROOT="$REPO_ROOT/$RESULTS_ROOT"
   fi
@@ -967,7 +958,19 @@ benchmark benchmark_loops="1000000" verify_loops="100000" perf_loops="10000000" 
 
   change_id="$(jj --ignore-working-copy log -r "$RESULT_REV" --no-graph -T 'change_id.short()')"
   commit_id="$(jj --ignore-working-copy log -r "$RESULT_REV" --no-graph -T 'commit_id.short()')"
-  result_name="${change_id}_${commit_id}"
+  case "$RESULT_MODE" in
+    one-off)
+      result_name="${change_id}_${commit_id}"
+      ;;
+    finalized)
+      result_name="$change_id"
+      ;;
+    *)
+      echo "unknown benchmark result mode: $RESULT_MODE" >&2
+      echo "expected one-off or finalized" >&2
+      exit 1
+      ;;
+  esac
   result_dir="$RESULTS_ROOT/$result_name"
   counters_dir="$result_dir/counters"
   clif_dir="$result_dir/clif"
@@ -989,6 +992,7 @@ benchmark benchmark_loops="1000000" verify_loops="100000" perf_loops="10000000" 
     echo "benchmark loops: $BENCHMARK_LOOPS"
     echo "verify loops: $VERIFY_LOOPS"
     echo "perf loops: $PERF_LOOPS"
+    echo "result mode: $RESULT_MODE"
     echo "specialized runs: $SPECIALIZED_RUNS"
     echo "warmup loops: $WARMUP_LOOPS"
     echo "benchmark cpu: $BENCHMARK_CPU"

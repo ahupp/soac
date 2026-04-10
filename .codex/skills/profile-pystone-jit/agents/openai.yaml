@@ -1,4 +1,0 @@
-interface:
-  display_name: "Profile JIT Perf"
-  short_description: "Profile warmed JIT pystone with perf"
-  default_prompt: "Use this skill when you need to run the warmed pystone JIT path in this repo under perf record, dump perf reports into logs/, and summarize hotspots and where time is spent."

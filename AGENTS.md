@@ -149,11 +149,14 @@ workflow unless there is a specific reason to use a narrower measurement, and
 report both headline throughput and relative delta.
 
 When a performance change is complete enough that you intend to keep it,
+rebase the finished change onto `main`, run `$soac-profile-benchmark`, write the
+finalized benchmark result to `bench/{change_id}`, and
 append an entry to `docs/CODEX_OPT_LOG.md` in the same logical change.
-Keep entries succinct: include the jj change id, a short summary of the
-optimization, the benchmarked throughput delta, and the before/after
-headline numbers. Do not paste validation checklists, full command lines,
-or long run logs.
+Use `bench/{change_id}_{commit_id}` only for one-off test benchmarks while
+iterating. Keep log entries succinct: include the jj change id, a short summary
+of the optimization, the benchmarked throughput delta, and the before/after
+headline numbers. Do not paste validation checklists, full command lines, or
+long run logs.
 
 10. Run the full gate before submitting code changes.
 
@@ -262,13 +265,16 @@ anything non-code affected the run. If there were no such issues, say
   Use for vendored CPython regrtest runs.
 - `just regen-snapshots`
   Regenerates fixture snapshots.
-- `just benchmark`
-  Default benchmark for performance requests. This is the artifact-producing
-  pystone workflow: profile, verify, specialized apply benchmark, textual
-  counter/specialization dumps, and perf for the specialized apply run. It
-  prints `benchmark result: bench/{change_id}_{commit_id}`; report the
-  specialized apply-pass median from that directory's `benchmark.txt` unless I
-  explicitly ask for the warm unspecialized baseline.
+- `$soac-profile-benchmark`
+  Default skill for performance benchmark requests. This uses the
+  artifact-producing pystone workflow: profile, verify, specialized apply
+  benchmark, textual counter/specialization dumps, and perf for the specialized
+  apply run. One-off test benchmarks write
+  `bench/{change_id}_{commit_id}`. Finalized benchmarks for changes that are
+  being merged to `main` must run after rebasing onto `main` and write
+  `bench/{change_id}`. Report the specialized apply-pass median from the result
+  directory's `benchmark.txt` unless I explicitly ask for the warm
+  unspecialized baseline.
 - Repo-local uv state
   `.envrc` and `Justfile` keep uv and XDG state under the repo with
   `UV_CACHE_DIR`, `UV_TOOL_DIR`, `UV_TOOL_BIN_DIR`, `XDG_CACHE_HOME`,
@@ -279,10 +285,13 @@ anything non-code affected the run. If there were no such issues, say
   dependency changes intentionally require network access.
 - `SOAC_PARENT_REPO`
   Required for `just setup-dev-env` in a jj worktree. Set it to the parent
-  checkout that owns shared offline state. The setup recipe symlinks
-  `vendor/cpython`, `.uv-cache`, `.uv/`, `.xdg/`, and `tmp/cargo-home` from
-  that parent into the worktree, and errors instead of creating isolated empty
-  offline caches when the variable is unset.
+  checkout that owns shared offline state and `bench/` as a regular directory.
+  The setup recipe symlinks `vendor/cpython`, `bench/`, `.uv-cache`, `.uv/`,
+  `.xdg/`, and `tmp/cargo-home` from that parent into the worktree, and errors
+  instead of creating isolated empty offline caches when the variable is unset.
+  When sandboxing would otherwise block shared benchmark writes, run Codex with
+  the worktree and parent checkout as writable roots, for example
+  `--add-dir ../main-repo .`.
 - `SOAC_WORK_DIR` / `SOAC_OPT_MODE`
   Normal specialization runs use one work directory with conventional
   files: `profile.bin` for specialization input, `verify.bin` for the

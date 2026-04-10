@@ -5,13 +5,14 @@ description: End-to-end workflow for SOAC pystone performance analysis. Use when
 
 # Analyze Pystone Perf
 
-Run the artifact-producing `just benchmark` flow, then connect the resulting
-perf hotspots to the specialized CLIF that produced them.
+Run the artifact-producing `$soac-profile-benchmark` flow, then connect the
+resulting perf hotspots to the specialized CLIF that produced them.
 
 ## Workflow
 
-Run steps from the repo root. Benchmark, counter, perf, and rendered CLIF
-artifacts are created under `bench/{change_id}_{commit_id}/`.
+Run steps from the repo root. One-off benchmark, counter, perf, and rendered
+CLIF artifacts are created under `bench/{change_id}_{commit_id}/`; finalized
+benchmarks for changes being merged to `main` use `bench/{change_id}/`.
 
 1. **Generate benchmark/counter/perf artifacts**
 

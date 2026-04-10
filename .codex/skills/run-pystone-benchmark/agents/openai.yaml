@@ -1,4 +1,0 @@
-interface:
-  display_name: "Run Benchmark"
-  short_description: "Run benchmark.sh and capture logs"
-  default_prompt: "Use this skill when you need to run this repo benchmark script, capture output under logs/, compare transformed and stock throughput, and summarize the result."
