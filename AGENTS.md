@@ -207,6 +207,46 @@ The goal of the `jj` workflow is to keep `main` as the clear shared
 synchronization point without letting one codex instance rewrite another
 instance's live working commit.
 
+### Continuous workflow improvement
+
+Treat every task as a chance to improve the project workflow, not just the
+immediate code. At the end of each turn or substantial pass, do a brief
+internal retro:
+
+- Did I hit an avoidable environment, tooling, sandbox, dependency, cache,
+  workspace, test, benchmark, or missing-artifact problem?
+- Did I use an awkward manual sequence that should be a Justfile recipe,
+  script, preflight check, or documented convention?
+- Did I make an assumption that caused rework, or did the user correct a
+  misunderstanding that should become a reusable rule?
+- Did a test failure, xfail, log gap, panic message, or benchmark artifact make
+  diagnosis harder than it should have been?
+- Did I notice project behavior that is surprising, underdocumented, or likely
+  to trip up the next agent?
+
+If the answer is yes and the fix is concrete, report it under
+`Workflow improvement` or `Project feedback`. Include what happened, why it
+cost time or risked correctness, the specific proposed change, and where it
+belongs: `AGENTS.md`, `README.md`, `Justfile`, a script, a test, code
+instrumentation, or user workflow. If the user request is missing a detail that
+predictably affects validation, runtime mode, workspace ownership, benchmark
+interpretation, or conflict resolution, surface that early. When the likely
+default is clear, proceed with that default and state it. When the choice
+changes the meaning of the result, ask before doing expensive work.
+
+Do not silently absorb recurring setup failures, missing-extension errors,
+sandbox denials, stale-workspace problems, accidental tool misuse, file-lock
+waits, perf sample loss, cache misses, or large unexpected artifact generation.
+Prefer durable project-native fixes over reminders: Justfile preflights,
+clearer recipes, deterministic cache/output directories, better
+panic/source-location messages, smaller repro tests, log summaries,
+environment-variable docs, and removing obsolete or misleading tests. If there
+is no actionable improvement, say nothing about it.
+
+When reporting a completed pass, include a short `Environment notes` line if
+anything non-code affected the run. If there were no such issues, say
+`Environment notes: none`.
+
 
 ## APPENDIX
 
