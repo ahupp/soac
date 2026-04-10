@@ -1489,11 +1489,29 @@ struct CodegenIntrinsicEmitState<'a, 'b, 'mc, 'c, 'd> {
 struct LocalEnv {
     names: Vec<String>,
     values: Vec<ir::Value>,
+    ref_kinds: Vec<LocalRefKind>,
 }
 
 impl LocalEnv {
     fn as_parts_mut(&mut self) -> (&mut Vec<String>, &mut Vec<ir::Value>) {
         (&mut self.names, &mut self.values)
+    }
+
+    fn refresh_transient_ref_kinds(&mut self) {
+        debug_assert_eq!(
+            self.names.len(),
+            self.values.len(),
+            "JIT transient local names and values must stay parallel"
+        );
+        self.ref_kinds.clear();
+        self.ref_kinds
+            .resize(self.values.len(), LocalRefKind::Owned);
+        debug_assert!(
+            self.ref_kinds
+                .iter()
+                .all(|ref_kind| *ref_kind == LocalRefKind::Owned),
+            "transient JIT locals currently carry owned references"
+        );
     }
 }
 
@@ -7418,6 +7436,8 @@ fn build_cranelift_run_bb_specialized_function(
                 jit_module,
                 &mut func_imports,
             )?;
+            local_env.refresh_transient_ref_kinds();
+            let (local_names, local_values) = local_env.as_parts_mut();
 
             emit_codegen_term(
                 &mut fb,
@@ -7435,6 +7455,7 @@ fn build_cranelift_run_bb_specialized_function(
                 pyobject_to_i64_ref,
                 raise_exc_ref,
             )?;
+            local_env.refresh_transient_ref_kinds();
             continue;
         }
 

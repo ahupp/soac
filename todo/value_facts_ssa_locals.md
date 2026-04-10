@@ -247,3 +247,6 @@ Started:
 - A first `FunctionLocalPlan` exists in JIT planning. It records per-block entry
   bindings from the storage layout, annotates them with available `EnvFacts`,
   and classifies known immortal locals without changing generated code.
+- `LocalEnv` now carries a transient local `LocalRefKind` side table. The first
+  refresh point records the current invariant that transient JIT locals are
+  owned references; stack-slot-backed locals still use the old path.
