@@ -1724,7 +1724,6 @@ struct CodegenIntrinsicEmitState<'a, 'b, 'mc, 'c, 'd> {
     func_imports: &'a mut FuncBuildImports<'d>,
 }
 
-#[derive(Clone)]
 struct LocalEnvEntry {
     name: String,
     value: ir::Value,
@@ -1736,48 +1735,43 @@ struct LocalEnv {
     entries: Vec<LocalEnvEntry>,
 }
 
+struct LocalEnvLegacyParts {
+    names: Vec<String>,
+    values: Vec<ir::Value>,
+    ref_kinds: Vec<LocalRefKind>,
+}
+
 impl LocalEnv {
-    fn legacy_ref_kinds(&self) -> Vec<LocalRefKind> {
-        self.entries.iter().map(|entry| entry.ref_kind).collect()
+    fn to_legacy_parts(&self) -> LocalEnvLegacyParts {
+        LocalEnvLegacyParts {
+            names: self
+                .entries
+                .iter()
+                .map(|entry| entry.name.clone())
+                .collect(),
+            values: self.entries.iter().map(|entry| entry.value).collect(),
+            ref_kinds: self.entries.iter().map(|entry| entry.ref_kind).collect(),
+        }
     }
 
-    fn with_legacy_parts_mut<R>(
-        &mut self,
-        emit: impl FnOnce(&mut Vec<String>, &mut Vec<ir::Value>) -> R,
-    ) -> R {
-        let mut names = self
-            .entries
-            .iter()
-            .map(|entry| entry.name.clone())
-            .collect::<Vec<_>>();
-        let mut values = self
-            .entries
-            .iter()
-            .map(|entry| entry.value)
-            .collect::<Vec<_>>();
-
-        let result = emit(&mut names, &mut values);
-
+    fn replace_from_legacy_parts(&mut self, parts: LocalEnvLegacyParts) {
         debug_assert_eq!(
-            names.len(),
-            values.len(),
+            parts.names.len(),
+            parts.values.len(),
             "JIT transient local names and values must stay parallel"
         );
+        let LocalEnvLegacyParts {
+            names,
+            values,
+            ref_kinds: _,
+        } = parts;
         self.entries = names
             .into_iter()
             .zip(values)
-            .map(|(name, value)| {
-                let ref_kind = self
-                    .entries
-                    .iter()
-                    .find(|entry| entry.name == name && entry.value == value)
-                    .map(|entry| entry.ref_kind)
-                    .unwrap_or(LocalRefKind::Owned);
-                LocalEnvEntry {
-                    name,
-                    value,
-                    ref_kind,
-                }
+            .map(|(name, value)| LocalEnvEntry {
+                name,
+                value,
+                ref_kind: LocalRefKind::Owned,
             })
             .collect();
         debug_assert!(
@@ -1786,8 +1780,6 @@ impl LocalEnv {
                 .all(|entry| entry.ref_kind == LocalRefKind::Owned),
             "transient JIT locals currently carry owned references"
         );
-
-        result
     }
 }
 
@@ -8253,41 +8245,39 @@ fn build_cranelift_run_bb_specialized_function(
             let _block_local_plan = emit_ctx.local_plan.block(block.label);
             let _block_refcount_plan = emit_ctx.refcount_plan.block(block.label);
             let mut local_env = LocalEnv::default();
+            let mut local_parts = local_env.to_legacy_parts();
 
-            local_env.with_legacy_parts_mut(|local_names, local_values| {
-                emit_codegen_ops(
-                    &mut fb,
-                    &block.body,
-                    local_names,
-                    local_values,
-                    &stack_slots,
-                    &emit_ctx,
-                    jit_module,
-                    &mut func_imports,
-                )
-            })?;
-            let local_ref_kinds = local_env.legacy_ref_kinds();
+            emit_codegen_ops(
+                &mut fb,
+                &block.body,
+                &mut local_parts.names,
+                &mut local_parts.values,
+                &stack_slots,
+                &emit_ctx,
+                jit_module,
+                &mut func_imports,
+            )?;
+            local_env.replace_from_legacy_parts(local_parts);
+            let mut local_parts = local_env.to_legacy_parts();
 
-            local_env.with_legacy_parts_mut(|local_names, local_values| {
-                emit_codegen_term(
-                    &mut fb,
-                    block.label.to_string().as_str(),
-                    &block.term,
-                    &exec_blocks,
-                    &runtime_block_param_names,
-                    &full_block_param_names,
-                    local_names,
-                    local_values,
-                    &local_ref_kinds,
-                    &emit_ctx,
-                    jit_module,
-                    &mut func_imports,
-                    is_true_ref,
-                    pyobject_to_i64_ref,
-                    raise_exc_ref,
-                    block.exception_param(),
-                )
-            })?;
+            emit_codegen_term(
+                &mut fb,
+                block.label.to_string().as_str(),
+                &block.term,
+                &exec_blocks,
+                &runtime_block_param_names,
+                &full_block_param_names,
+                &mut local_parts.names,
+                &mut local_parts.values,
+                &local_parts.ref_kinds,
+                &emit_ctx,
+                jit_module,
+                &mut func_imports,
+                is_true_ref,
+                pyobject_to_i64_ref,
+                raise_exc_ref,
+                block.exception_param(),
+            )?;
             continue;
         }
 
