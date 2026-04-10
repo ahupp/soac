@@ -6384,6 +6384,13 @@ fn emit_codegen_term(
                 &[],
                 decref_ref,
             );
+            let release_reason = RefcountReleaseReason::Return;
+            emit_planned_stack_slot_releases_for_reason(
+                fb,
+                source_label,
+                &release_reason,
+                emit_ctx,
+            )?;
             emit_pop_handled_exception_if_leaving(fb, current_exception_name, &[], emit_ctx);
             emit_ctx.stack_slots.decref_all(fb, ptr_ty, decref_ref);
             fb.ins().return_(&[ret_value]);
@@ -6483,6 +6490,13 @@ fn emit_codegen_term(
                 &[],
                 decref_ref,
             );
+            let release_reason = RefcountReleaseReason::Raise;
+            emit_planned_stack_slot_releases_for_reason(
+                fb,
+                source_label,
+                &release_reason,
+                emit_ctx,
+            )?;
             emit_pop_handled_exception_if_leaving(fb, current_exception_name, &[], emit_ctx);
             fb.ins().jump(
                 emit_ctx.consts.step_null_block,

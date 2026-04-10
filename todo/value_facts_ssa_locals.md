@@ -303,9 +303,7 @@ Started:
   codegen block and validates store/delete transitions plus edge and return
   cleanup actions before instrumentation or JIT codegen can consume the module.
 - JIT planning now computes the same verified per-function `RefcountPlan` beside
-  `FunctionLocalPlan` and makes it available through `JitEmitCtx`. Emission still
-  ignores terminal releases, so stack-slot cleanup remains the runtime behavior
-  there.
+  `FunctionLocalPlan` and makes it available through `JitEmitCtx`.
 - JIT codegen has started consuming normal-edge `RefcountPlan` releases by
   replacing unforwarded stack-slot locals with the deleted sentinel before the
   edge jump. This preserves the current terminal stack-slot cleanup model while
@@ -313,3 +311,7 @@ Started:
 - JIT exception dispatch now consumes exception-edge `RefcountPlan` releases the
   same way, after writing forwarded exception-target slots and before jumping to
   the handler block.
+- JIT return and successful explicit-raise terminals now also consume terminal
+  `RefcountPlan` releases with the same deleted-sentinel replacement. Legacy
+  `stack_slots.decref_all` still runs afterward, so the next step is to shrink
+  terminal cleanup to the explicit plan rather than scanning every stack slot.
