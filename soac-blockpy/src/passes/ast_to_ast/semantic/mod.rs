@@ -362,6 +362,12 @@ impl Transformer for ImplicitClassCellUseDetector {
                 if let Some(arguments) = class_def.arguments.as_mut() {
                     self.visit_arguments(arguments);
                 }
+                for stmt in &mut class_def.body {
+                    if matches!(stmt, ast::Stmt::FunctionDef(_)) {
+                        continue;
+                    }
+                    self.visit_stmt(stmt);
+                }
                 return;
             }
             ast::Stmt::Delete(ast::StmtDelete { targets, .. }) => {
@@ -634,6 +640,27 @@ impl RuffSemanticSnapshotBuilder {
         let collector = collect_scope_expr_bindings(expr);
         let uses_class_cell = expr_uses_implicit_class_cell(expr);
         self.prepare_scope_from_collector(collector, uses_class_cell, parameters)
+    }
+
+    fn visit_function_definition_exprs(&mut self, func_def: &mut ast::StmtFunctionDef) {
+        for decorator in &mut func_def.decorator_list {
+            self.visit_decorator(decorator);
+        }
+        for param in &mut func_def.parameters.posonlyargs {
+            if let Some(default) = &mut param.default {
+                self.visit_expr(default);
+            }
+        }
+        for param in &mut func_def.parameters.args {
+            if let Some(default) = &mut param.default {
+                self.visit_expr(default);
+            }
+        }
+        for param in &mut func_def.parameters.kwonlyargs {
+            if let Some(default) = &mut param.default {
+                self.visit_expr(default);
+            }
+        }
     }
 
     fn prepare_scope_from_collector(
@@ -933,6 +960,7 @@ impl Transformer for RuffSemanticSnapshotBuilder {
     fn visit_stmt(&mut self, stmt: &mut ast::Stmt) {
         match stmt {
             ast::Stmt::FunctionDef(func_def) => {
+                self.visit_function_definition_exprs(func_def);
                 let node_index = self.ensure_node_index(func_def);
                 let leaked_func = Box::leak(Box::new(func_def.clone()));
                 self.semantic

@@ -7,6 +7,7 @@ use crate::passes::ast_to_ast::rewrite_class_def;
 use crate::passes::ast_to_ast::rewrite_expr::ScopedHelperExprPass;
 use crate::passes::ast_to_ast::{
     body::Suite, rewrite_future_annotations, rewrite_stmt, semantic::SemanticAstState,
+    string_templates,
 };
 use crate::passes::core_await_lower::lower_awaits_in_core_blockpy_module;
 use crate::passes::ruff_to_blockpy::rewrite_ast_to_core_blockpy_module_with_module;
@@ -43,6 +44,8 @@ fn rewrite_ast_to_ast_module(context: &Context, mut module: Suite) -> AstToAstPa
     // and either drop the annotations (in functions) or generate an
     // __annotate__ function (in modules and classes)
     rewrite_stmt::annotation::rewrite_ann_assign_to_dunder_annotate(context, &mut module);
+
+    string_templates::rewrite_surrogate_escape_string_literals(context, &mut module);
 
     // Lower helper-scoped expressions that synthesize nested defs for Python
     // scoping semantics before the more direct BlockPy expr lowering boundary.

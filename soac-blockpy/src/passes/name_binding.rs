@@ -1,14 +1,14 @@
 use crate::block_py::{
     build_storage_layout_from_capture_names, compute_make_function_capture_bindings_from_scope,
-    compute_storage_layout_from_scope, core_runtime_positional_call_expr_with_meta, literal_expr,
-    BindingKind, BindingPurpose, BindingTarget, BlockArg, BlockPyFunction, BlockPyModule,
-    BlockTerm, Call, CallArgPositional, CallableScopeInfo, CallableScopeKind, CellBindingKind,
-    CellCaptureBinding, CellLocation, CellRef, CellRefForName, ChildVisitable, ClassBodyFallback,
-    ClosureInit, ClosureSlot, Del, DelItem, EffectiveBinding, FunctionId, FunctionKind, HasMeta,
-    InstrLow, InstrResolved, InstrUnresolved, IntLiteral, Load, LocalLocation, MakeCell,
-    MakeFunction, MapFunction, MapInstr, Mappable, NameLike, NameLocation, NumberLiteral,
-    NumberLiteralValue, ResolvedName, SetItem, StorageLayout, Store, StringLiteral, UnresolvedName,
-    Visit, VisitMut, WithMeta,
+    compute_storage_layout_from_scope, core_runtime_positional_call_expr_with_meta,
+    is_runtime_closure_name, literal_expr, BindingKind, BindingPurpose, BindingTarget, BlockArg,
+    BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgPositional, CallableScopeInfo,
+    CallableScopeKind, CellBindingKind, CellCaptureBinding, CellLocation, CellRef, CellRefForName,
+    ChildVisitable, ClassBodyFallback, ClosureInit, ClosureSlot, Del, DelItem, EffectiveBinding,
+    FunctionId, FunctionKind, HasMeta, InstrLow, InstrResolved, InstrUnresolved, IntLiteral, Load,
+    LocalLocation, MakeCell, MakeFunction, MapFunction, MapInstr, Mappable, NameLike, NameLocation,
+    NumberLiteral, NumberLiteralValue, ResolvedName, SetItem, StorageLayout, Store, StringLiteral,
+    UnresolvedName, Visit, VisitMut, WithMeta,
 };
 use crate::passes::ruff_to_blockpy::{
     populate_exception_edge_args, rewrite_current_exception_in_core_blocks,
@@ -170,7 +170,6 @@ fn is_unsound_runtime_builtin_candidate(name: &str) -> bool {
             | "staticmethod"
             | "str"
             | "sum"
-            | "super"
             | "tuple"
             | "type"
             | "vars"
@@ -923,23 +922,16 @@ fn build_closure_slot_cell_init_assign(slot: &ClosureSlot) -> CoreStmt {
 fn prepend_owned_cell_init_preamble(callable: &mut BlockPyFunction<CoreModuleShape>) {
     let init_stmts = match callable.kind {
         FunctionKind::Function => {
-            let mut storage_names = callable
-                .scope
-                .owned_cell_storage_names()
-                .into_iter()
-                .collect::<Vec<_>>();
-            if storage_names.is_empty() {
+            let mut storage_bindings = collect_owned_cell_storage_bindings(callable);
+            if storage_bindings.is_empty() {
                 return;
             }
-            storage_names.sort();
+            storage_bindings
+                .sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
             let param_names = callable.params.names().into_iter().collect::<HashSet<_>>();
-            storage_names
+            storage_bindings
                 .into_iter()
-                .map(|storage_name| {
-                    let logical_name = callable
-                        .scope
-                        .logical_name_for_cell_storage(storage_name.as_str())
-                        .unwrap_or_else(|| storage_name.clone());
+                .map(|(logical_name, storage_name)| {
                     build_local_cell_init_assign(
                         storage_name.as_str(),
                         logical_name.as_str(),
@@ -1501,38 +1493,71 @@ fn normal_predecessor_exc_param_names(
     predecessors
 }
 
-fn sync_exception_param_cell_in_block(
+fn sync_block_param_cell_in_block(
+    param: &crate::block_py::BlockParam,
+    should_sync: bool,
+    scope: &CallableScopeInfo,
+    resolver: &NameBindingMapper<'_>,
+) -> Option<CoreStmt> {
+    if !should_sync {
+        return None;
+    }
+    if !matches!(
+        param.role,
+        crate::block_py::BlockParamRole::Exception
+            | crate::block_py::BlockParamRole::AbruptKind
+            | crate::block_py::BlockParamRole::AbruptPayload
+    ) {
+        return None;
+    }
+    if !matches!(
+        scope.binding_kind(param.name.as_str()),
+        Some(BindingKind::Cell(CellBindingKind::Capture))
+    ) {
+        return None;
+    }
+
+    let node_index = compat_node_index();
+    let range = compat_range();
+    let target_name = scope.cell_capture_source_name(param.name.as_str());
+    let param_load = ast::name::Name::new(param.name.clone());
+    let meta = crate::block_py::Meta::new(node_index.clone(), range);
+    Some(op_stmt(
+        Store::new(
+            ast::name::Name::new(target_name),
+            Box::new(rewrite_local_name_load(param_load, meta.clone(), resolver)),
+        )
+        .with_meta(crate::block_py::Meta::new(node_index, range)),
+    ))
+}
+
+fn sync_cell_backed_block_params_in_block(
     block: &mut crate::block_py::Block<InstrUnresolved>,
     normal_predecessor_exc_names: &[Option<String>],
     scope: &CallableScopeInfo,
     resolver: &NameBindingMapper<'_>,
 ) {
-    let Some(exc_name) = block.exception_param() else {
-        return;
-    };
-    if !matches!(scope.binding_kind(exc_name), Some(BindingKind::Cell(_))) {
+    let active_exception_name = block.exception_param().map(ToString::to_string);
+    let should_sync_exception = active_exception_name.as_deref().is_some_and(|exc_name| {
+        !normal_predecessor_exc_names.iter().any(|pred_exc_name| {
+            pred_exc_name
+                .as_deref()
+                .is_some_and(|pred_exc_name| pred_exc_name != exc_name)
+        })
+    });
+    let sync_stmts = block
+        .params
+        .iter()
+        .filter_map(|param| {
+            let should_sync =
+                param.role != crate::block_py::BlockParamRole::Exception || should_sync_exception;
+            sync_block_param_cell_in_block(param, should_sync, scope, resolver)
+        })
+        .collect::<Vec<_>>();
+    if sync_stmts.is_empty() {
         return;
     }
-    if normal_predecessor_exc_names.iter().any(|pred_exc_name| {
-        pred_exc_name
-            .as_deref()
-            .is_some_and(|pred_exc_name| pred_exc_name != exc_name)
-    }) {
-        return;
-    }
-
-    let node_index = compat_node_index();
-    let range = compat_range();
-    let exc_load = ast::name::Name::new(exc_name);
-    let meta = crate::block_py::Meta::new(node_index.clone(), range);
-    let sync_stmt = op_stmt(
-        Store::new(
-            ast::name::Name::new(exc_name),
-            Box::new(rewrite_local_name_load(exc_load, meta.clone(), resolver)),
-        )
-        .with_meta(crate::block_py::Meta::new(node_index, range)),
-    );
-    block.body.insert(0, sync_stmt);
+    block.body.splice(0..0, sync_stmts);
 }
 
 fn collect_deleted_names_in_blocks(
@@ -1944,7 +1969,7 @@ fn ensure_storage_layout_covers_block_params<P: crate::block_py::ModuleShape>(
 
 struct NameLocator<'a> {
     scope: &'a CallableScopeInfo,
-    exception_param_names: HashSet<String>,
+    block_param_names: HashSet<String>,
     local_slots: HashMap<String, u32>,
     captured_cell_slots: HashMap<String, u32>,
     owned_cell_slots: HashMap<String, u32>,
@@ -1953,6 +1978,15 @@ struct NameLocator<'a> {
 
 impl NameLocator<'_> {
     fn resolve_raw_cell_location(&self, name_text: &str) -> CellLocation {
+        if let Some(slot) = self.owned_cell_slots.get(name_text).copied() {
+            return CellLocation::Owned(slot);
+        }
+        if let Some(storage_name) = name_text.strip_prefix("_dp_cell_") {
+            if let Some(slot) = self.owned_cell_slots.get(storage_name).copied() {
+                return CellLocation::Owned(slot);
+            }
+        }
+
         if let Some(storage_name) = resolve_captured_cell_source_storage_name(self.scope, name_text)
         {
             let slot = self
@@ -1996,7 +2030,13 @@ impl NameLocator<'_> {
             };
         }
 
-        panic!("raw cell target {name_text} did not resolve to a cell-backed location");
+        panic!(
+            "raw cell target {name_text} did not resolve to a cell-backed location in {}; owned={:?}; captured={:?}; bindings={:?}",
+            self.scope.names.qualname,
+            self.owned_cell_slots,
+            self.captured_cell_slots,
+            self.cell_bindings
+        );
     }
 
     fn resolve_cell_ref_location(&self, logical_name: &str) -> CellLocation {
@@ -2011,13 +2051,13 @@ impl NameLocator<'_> {
 
     fn locate_name(&mut self, name: crate::block_py::BlockPyName) -> ResolvedName {
         let name_text = name.to_string();
-        let location = if self.exception_param_names.contains(name_text.as_str()) {
+        let location = if self.block_param_names.contains(name_text.as_str()) {
             let slot = self
                 .local_slots
                 .get(name_text.as_str())
                 .copied()
                 .unwrap_or_else(|| {
-                    panic!("missing local slot for exception param {name_text}");
+                    panic!("missing local slot for block param {name_text}");
                 });
             NameLocation::local(slot)
         } else if let Some(storage_name) =
@@ -2246,10 +2286,10 @@ fn locate_names_in_callable(
     callable: BlockPyFunction<CoreModuleShape>,
 ) -> BlockPyFunction<ResolvedStorageModuleShape> {
     let scope = callable.scope.clone();
-    let exception_param_names = callable
+    let block_param_names = callable
         .blocks
         .iter()
-        .filter_map(|block| block.exception_param().map(ToString::to_string))
+        .flat_map(|block| block.param_names().map(ToString::to_string))
         .collect::<HashSet<_>>();
     let local_slots = collect_local_slot_locations(&callable);
     let captured_cell_slots = collect_captured_cell_slot_locations(&callable);
@@ -2257,7 +2297,7 @@ fn locate_names_in_callable(
     let cell_bindings = collect_cell_bindings(&callable);
     let mut mapper = NameLocator {
         scope: &scope,
-        exception_param_names,
+        block_param_names,
         local_slots,
         captured_cell_slots,
         owned_cell_slots,
@@ -2337,15 +2377,14 @@ fn compute_callable_storage_layout_for_name_binding(
     let callable = callable_by_id
         .get(&function_id)
         .unwrap_or_else(|| panic!("missing callable for function id {:?}", function_id));
-    if let Some(layout) = callable.storage_layout.clone() {
-        memo.insert(function_id, Some(layout.clone()));
-        return Some(layout);
-    }
+    let explicit_layout = callable.storage_layout.clone();
     if !visiting.insert(function_id) {
         return compute_storage_layout_from_scope(callable);
     }
 
-    let base_layout = compute_storage_layout_from_scope(callable);
+    let base_layout = explicit_layout
+        .clone()
+        .or_else(|| compute_storage_layout_from_scope(callable));
     let mut capture_names = base_layout
         .as_ref()
         .map(|layout| {
@@ -2377,12 +2416,28 @@ fn compute_callable_storage_layout_for_name_binding(
         })
         .unwrap_or_default();
     let param_name_set = callable.params.names().into_iter().collect::<HashSet<_>>();
-    let mut local_cell_slots = callable
-        .scope
-        .owned_cell_storage_names()
-        .into_iter()
-        .collect::<Vec<_>>();
+    let mut local_cell_slots = base_layout
+        .as_ref()
+        .map(|layout| {
+            layout
+                .cellvars
+                .iter()
+                .chain(layout.runtime_cells.iter())
+                .map(|slot| slot.storage_name.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| {
+            let mut storage_names = callable
+                .scope
+                .owned_cell_storage_names()
+                .into_iter()
+                .collect::<Vec<_>>();
+            storage_names.sort();
+            storage_names
+        });
     let mut local_cell_slot_names = local_cell_slots.iter().cloned().collect::<HashSet<_>>();
+    let mut base_cellvar_names = base_cellvar_names;
+    let mut base_cellvar_storage_names = base_cellvar_storage_names;
     if let Some(callee_ids) = make_function_callees.get(&function_id) {
         for callee_id in callee_ids {
             let Some(callee_layout) = compute_callable_storage_layout_for_name_binding(
@@ -2398,7 +2453,11 @@ fn compute_callable_storage_layout_for_name_binding(
                 let capture_source_name = callable
                     .scope
                     .cell_capture_source_name(slot.logical_name.as_str());
-                if base_cellvar_names.contains(slot.logical_name.as_str())
+                let capture_storage_name =
+                    callable.scope.cell_storage_name(slot.logical_name.as_str());
+                if (slot.logical_name == "__class__"
+                    && base_cellvar_storage_names.contains("_dp_classcell"))
+                    || base_cellvar_names.contains(slot.logical_name.as_str())
                     || base_cellvar_storage_names.contains(capture_source_name.as_str())
                 {
                     continue;
@@ -2409,8 +2468,18 @@ fn compute_callable_storage_layout_for_name_binding(
                     .contains(slot.logical_name.as_str())
                     || param_name_set.contains(slot.logical_name.as_str())
                 {
-                    if local_cell_slot_names.insert(capture_source_name.clone()) {
-                        local_cell_slots.push(capture_source_name);
+                    let local_storage_name = if callable.scope.scope_kind
+                        == CallableScopeKind::Function
+                        && callable.scope.has_local_def(slot.logical_name.as_str())
+                    {
+                        capture_storage_name
+                    } else {
+                        capture_source_name
+                    };
+                    base_cellvar_names.insert(slot.logical_name.clone());
+                    base_cellvar_storage_names.insert(local_storage_name.clone());
+                    if local_cell_slot_names.insert(local_storage_name.clone()) {
+                        local_cell_slots.push(local_storage_name);
                     }
                     continue;
                 }
@@ -2421,12 +2490,52 @@ fn compute_callable_storage_layout_for_name_binding(
     visiting.remove(&function_id);
 
     local_cell_slots.sort();
-    let layout = build_storage_layout_from_capture_names(
-        callable,
-        capture_names,
-        &param_name_set,
-        &local_cell_slots,
-    );
+    local_cell_slots.dedup();
+    let layout = if let Some(mut layout) = explicit_layout {
+        for storage_name in local_cell_slots {
+            if layout.has_storage_name(storage_name.as_str()) {
+                continue;
+            }
+            let logical_name = callable
+                .scope
+                .logical_name_for_cell_storage(storage_name.as_str())
+                .unwrap_or_else(|| storage_name.clone());
+            let init = if param_name_set.contains(logical_name.as_str()) {
+                ClosureInit::Parameter
+            } else {
+                ClosureInit::DeletedSentinel
+            };
+            layout.cellvars.push(ClosureSlot {
+                logical_name,
+                storage_name,
+                init,
+            });
+        }
+        capture_names.sort();
+        capture_names.dedup();
+        for logical_name in capture_names {
+            if is_runtime_closure_name(logical_name.as_str()) {
+                continue;
+            }
+            let storage_name = callable.scope.cell_storage_name(logical_name.as_str());
+            if layout.has_storage_name(storage_name.as_str()) {
+                continue;
+            }
+            layout.freevars.push(ClosureSlot {
+                logical_name,
+                storage_name,
+                init: ClosureInit::InheritedCapture,
+            });
+        }
+        Some(layout)
+    } else {
+        build_storage_layout_from_capture_names(
+            callable,
+            capture_names,
+            &param_name_set,
+            &local_cell_slots,
+        )
+    };
     memo.insert(function_id, layout.clone());
     layout
 }
@@ -2465,11 +2574,12 @@ fn ensure_module_storage_layouts(
     callable_defs
         .into_iter()
         .map(|mut callable| {
-            if callable.storage_layout.is_none() {
-                callable.storage_layout = computed_layouts
-                    .get(&callable.function_id)
-                    .cloned()
-                    .flatten();
+            if let Some(layout) = computed_layouts
+                .get(&callable.function_id)
+                .cloned()
+                .flatten()
+            {
+                callable.storage_layout = Some(layout);
             }
             callable
         })
@@ -2479,6 +2589,49 @@ fn ensure_module_storage_layouts(
 fn compute_module_make_function_capture_names(
     callable_defs: &[BlockPyFunction<CoreModuleShape>],
 ) -> HashMap<FunctionId, Vec<CellCaptureBinding>> {
+    fn make_function_capture_source_name(scope: &CallableScopeInfo, logical_name: &str) -> String {
+        if scope.binding_kind(logical_name).is_some()
+            || scope
+                .logical_name_for_cell_capture_source(logical_name)
+                .is_some()
+            || scope.logical_name_for_cell_storage(logical_name).is_some()
+        {
+            return scope.cell_capture_source_name(logical_name);
+        }
+        logical_name.to_string()
+    }
+
+    fn owned_cell_logical_names(callable: &BlockPyFunction<CoreModuleShape>) -> HashSet<String> {
+        if let Some(layout) = callable.storage_layout.as_ref() {
+            return layout
+                .cellvars
+                .iter()
+                .chain(layout.runtime_cells.iter())
+                .map(|slot| slot.logical_name.clone())
+                .collect();
+        }
+        callable
+            .scope
+            .bindings
+            .iter()
+            .filter_map(|(name, binding)| {
+                matches!(binding, BindingKind::Cell(CellBindingKind::Owner)).then(|| name.clone())
+            })
+            .collect()
+    }
+
+    fn owned_cell_storage_names(callable: &BlockPyFunction<CoreModuleShape>) -> HashSet<String> {
+        if let Some(layout) = callable.storage_layout.as_ref() {
+            return layout
+                .cellvars
+                .iter()
+                .chain(layout.runtime_cells.iter())
+                .map(|slot| slot.storage_name.clone())
+                .collect();
+        }
+        callable.scope.owned_cell_storage_names()
+    }
+
     fn compute_callable_make_function_capture_bindings_for_name_binding(
         function_id: FunctionId,
         callable_by_id: &HashMap<FunctionId, &BlockPyFunction<CoreModuleShape>>,
@@ -2503,9 +2656,10 @@ fn compute_module_make_function_capture_names(
                         .iter()
                         .map(|slot| CellCaptureBinding {
                             logical_name: slot.logical_name.clone(),
-                            source_name: callable
-                                .scope
-                                .cell_capture_source_name(slot.logical_name.as_str()),
+                            source_name: make_function_capture_source_name(
+                                &callable.scope,
+                                slot.logical_name.as_str(),
+                            ),
                         })
                         .collect::<Vec<_>>()
                 })
@@ -2526,15 +2680,8 @@ fn compute_module_make_function_capture_names(
         }
 
         let mut captures = compute_make_function_capture_bindings_from_scope(callable);
-        let base_owned_logical_names = callable
-            .scope
-            .bindings
-            .iter()
-            .filter_map(|(name, binding)| {
-                matches!(binding, BindingKind::Cell(CellBindingKind::Owner)).then(|| name.clone())
-            })
-            .collect::<HashSet<_>>();
-        let base_owned_storage_names = callable.scope.owned_cell_storage_names();
+        let base_owned_logical_names = owned_cell_logical_names(callable);
+        let base_owned_storage_names = owned_cell_storage_names(callable);
 
         if let Some(callee_ids) = make_function_callees.get(&function_id) {
             for callee_id in callee_ids {
@@ -2548,6 +2695,7 @@ fn compute_module_make_function_capture_names(
                     );
                 for capture in callee_captures {
                     let mut logical_name = capture.logical_name;
+                    let requested_source_name = capture.source_name;
                     loop {
                         let next = callable
                             .scope
@@ -2563,12 +2711,16 @@ fn compute_module_make_function_capture_names(
                         }
                         logical_name = next;
                     }
-                    let source_name = callable
-                        .scope
-                        .cell_capture_source_name(logical_name.as_str());
-                    if base_owned_logical_names.contains(logical_name.as_str())
+                    let source_name =
+                        make_function_capture_source_name(&callable.scope, logical_name.as_str());
+                    if (logical_name == "__class__"
+                        && base_owned_storage_names.contains("_dp_classcell"))
+                        || base_owned_logical_names.contains(logical_name.as_str())
                         || base_owned_storage_names.contains(source_name.as_str())
                         || callable.scope.local_defs.contains(logical_name.as_str())
+                        || base_owned_storage_names.contains(requested_source_name.as_str())
+                        || (callable.scope.scope_kind == CallableScopeKind::Function
+                            && callable.scope.has_local_def(logical_name.as_str()))
                     {
                         continue;
                     }
@@ -2628,9 +2780,10 @@ fn compute_module_make_function_capture_names(
                             .iter()
                             .map(|slot| CellCaptureBinding {
                                 logical_name: slot.logical_name.clone(),
-                                source_name: callable
-                                    .scope
-                                    .cell_capture_source_name(slot.logical_name.as_str()),
+                                source_name: make_function_capture_source_name(
+                                    &callable.scope,
+                                    slot.logical_name.as_str(),
+                                ),
                             })
                             .collect::<Vec<_>>()
                     })
@@ -2780,7 +2933,7 @@ fn lower_name_binding_callable(
             .get(&block.label)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        sync_exception_param_cell_in_block(block, predecessor_exc_names, &scope, &mapper);
+        sync_cell_backed_block_params_in_block(block, predecessor_exc_names, &scope, &mapper);
         for stmt in &mut block.body {
             rewrite_raw_cell_loads_in_stmt(stmt, &scope, &mapper);
         }

@@ -91,6 +91,19 @@ def _source_path_for_frozen_spec(spec):
     return None
 
 
+def _is_cpython_frozen_fixture(spec) -> bool:
+    """CPython's frozen test fixtures assert the public FrozenImporter loader."""
+    loader_state = getattr(spec, "loader_state", None)
+    origname = getattr(loader_state, "origname", spec.name)
+    fixture_roots = (
+        "__hello__",
+        "__hello_alias__",
+        "__phello__",
+        "__phello_alias__",
+    )
+    return any(origname == root or origname.startswith(f"{root}.") for root in fixture_roots)
+
+
 class SoacLoader(importlib.machinery.SourceFileLoader):
     """Loader that applies the SOAC transform before executing a module."""
 
@@ -130,6 +143,7 @@ class SoacFinder(importlib.machinery.PathFinder):
         elif (
             spec.loader is importlib.machinery.FrozenImporter
             and spec.origin == "frozen"
+            and not _is_cpython_frozen_fixture(spec)
         ):
             source_path = _source_path_for_frozen_spec(spec)
             if source_path and _should_transform(source_path):

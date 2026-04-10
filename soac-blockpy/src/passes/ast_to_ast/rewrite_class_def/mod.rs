@@ -18,7 +18,7 @@ fn class_def_to_create_class_fn<'a>(
     class_def: &mut ast::StmtClassDef,
     class_qualname: String,
     needs_class_cell: bool,
-) -> (ast::StmtFunctionDef, ast::StmtFunctionDef) {
+) -> (ast::StmtFunctionDef, ast::StmtFunctionDef, Expr, Expr) {
     let ast::StmtClassDef {
         name,
         body,
@@ -146,13 +146,13 @@ def _dp_class_ns_{class_name:id}(_dp_class_ns, _dp_classcell_arg):
 
     let define_class_fn: ast::StmtFunctionDef = py_stmt_typed!(
         r#"
-def _dp_define_class_{class_name:id}(_dp_class_ns_fn, _dp_class_ns_outer, _dp_prepare_dict={prepare_dict:expr}):
+def _dp_define_class_{class_name:id}(_dp_class_ns_fn, _dp_class_ns_outer, _dp_class_bases, _dp_prepare_dict):
     _dp_class_ns = _dp_class_ns_outer
     {type_param_bindings:stmt}
     return __soac__.create_class(
       {class_name:literal}, 
       _dp_class_ns_fn, 
-      {bases:expr}, 
+      _dp_class_bases, 
       _dp_prepare_dict,
       {requires_class_cell:literal},
       {firstlineno:literal},
@@ -164,21 +164,19 @@ def _dp_define_class_{class_name:id}(_dp_class_ns_fn, _dp_class_ns_outer, _dp_pr
         requires_class_cell = needs_class_cell,
         type_param_bindings = type_param_bindings,
         firstlineno = class_firstlineno,
-        bases = bases_tuple.clone(),
-        prepare_dict = prepare_dict.clone(),
     );
 
-    (class_ns_def, define_class_fn)
+    (class_ns_def, define_class_fn, bases_tuple, prepare_dict)
 }
 
-struct TypeParamInfo {
-    bindings: Vec<Stmt>,
-    param_names: Vec<String>,
-    type_params_tuple: Option<Expr>,
-    generic_params: Vec<Expr>,
+pub(crate) struct TypeParamInfo {
+    pub(crate) bindings: Vec<Stmt>,
+    pub(crate) param_names: Vec<String>,
+    pub(crate) type_params_tuple: Option<Expr>,
+    pub(crate) generic_params: Vec<Expr>,
 }
 
-fn make_type_param_info(type_params: ast::TypeParams) -> TypeParamInfo {
+pub(crate) fn make_type_param_info(type_params: ast::TypeParams) -> TypeParamInfo {
     // TODO
     //    rewriter.visit_type_params(&mut type_params);
 

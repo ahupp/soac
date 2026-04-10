@@ -90,12 +90,13 @@ impl<'a> ClassBodyScopeRewriter<'a> {
         class_rewriter.visit_body(&mut class_def.body);
         let mut hoisted = class_rewriter.take_hoisted();
 
-        let (class_ns_def, define_class_fn) = class_def_to_create_class_fn(
-            self.context,
-            &mut class_def,
-            class_scope.qualname().to_string(),
-            needs_class_cell,
-        );
+        let (class_ns_def, define_class_fn, bases_tuple, prepare_dict) =
+            class_def_to_create_class_fn(
+                self.context,
+                &mut class_def,
+                class_scope.qualname().to_string(),
+                needs_class_cell,
+            );
         self.semantic_state
             .register_function_scope_override(&class_ns_def, class_scope.clone());
         self.semantic_state
@@ -121,10 +122,12 @@ impl<'a> ClassBodyScopeRewriter<'a> {
         let decorated_class = rewrite_stmt::decorator::rewrite(
             decorator_list,
             py_expr!(
-                r"{define_class_fn:id}({class_ns_fn:id}, {class_ns_outer:expr})",
+                r"{define_class_fn:id}({class_ns_fn:id}, {class_ns_outer:expr}, {bases:expr}, {prepare_dict:expr})",
                 define_class_fn = define_class_fn.name.id.as_str(),
                 class_ns_fn = class_ns_def.name.id.as_str(),
                 class_ns_outer = class_ns_outer,
+                bases = bases_tuple,
+                prepare_dict = prepare_dict,
             ),
         );
 

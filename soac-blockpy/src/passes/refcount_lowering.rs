@@ -1,6 +1,7 @@
 use crate::block_py::{
-    Block, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, FunctionId, HasSemanticInstrId,
-    InstrCodegen, InstrKey, LocalLocation, NameLike,
+    Block, BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, CallArgPositional,
+    CellLocation, ChildVisitable, FunctionId, HasSemanticInstrId, InstrCodegen, InstrKey,
+    LocalLocation, NameLike, Visit,
 };
 use crate::passes::{CodegenModuleShape, FactStore, InstrResolved, PyObjFacts, ValueFacts};
 use std::collections::{HashMap, HashSet};
@@ -102,13 +103,19 @@ pub fn lower_refcount_ownership(
     facts: &FactStore,
 ) -> RefcountPlan {
     let deleted_sentinel_constants = deleted_sentinel_constant_slots(module);
+    let module_constant_runtime_names = module_constant_runtime_name_slots(module);
     let functions = module
         .callable_defs
         .iter()
         .map(|function| {
             (
                 function.function_id,
-                plan_function_refcounts(function, facts, &deleted_sentinel_constants),
+                plan_function_refcounts(
+                    function,
+                    facts,
+                    &deleted_sentinel_constants,
+                    &module_constant_runtime_names,
+                ),
             )
         })
         .collect();
@@ -122,6 +129,7 @@ pub fn validate_refcount_plan(
 ) -> Result<(), String> {
     let mut errors = Vec::new();
     let deleted_sentinel_constants = deleted_sentinel_constant_slots(module);
+    let module_constant_runtime_names = module_constant_runtime_name_slots(module);
     let function_ids = module
         .callable_defs
         .iter()
@@ -142,6 +150,7 @@ pub fn validate_refcount_plan(
             facts,
             plan,
             &deleted_sentinel_constants,
+            &module_constant_runtime_names,
             &mut errors,
         );
     }
@@ -158,6 +167,7 @@ fn validate_function_refcount_plan(
     facts: &FactStore,
     plan: &RefcountPlan,
     deleted_sentinel_constants: &HashSet<u32>,
+    module_constant_runtime_names: &HashMap<u32, String>,
     errors: &mut Vec<String>,
 ) {
     let Some(function_plan) = plan.function(function.function_id) else {
@@ -202,6 +212,8 @@ fn validate_function_refcount_plan(
         .iter()
         .map(|block| (block.label, block.param_name_vec()))
         .collect::<HashMap<_, _>>();
+    let local_liveness =
+        compute_local_liveness(function, &location_by_name, module_constant_runtime_names);
     let block_labels = function
         .blocks
         .iter()
@@ -234,6 +246,7 @@ fn validate_function_refcount_plan(
             &locals,
             &location_by_name,
             &target_params,
+            &local_liveness,
             deleted_sentinel_constants,
             block.label == entry_label,
             errors,
@@ -245,6 +258,7 @@ fn plan_function_refcounts(
     function: &BlockPyFunction<CodegenModuleShape>,
     facts: &FactStore,
     deleted_sentinel_constants: &HashSet<u32>,
+    module_constant_runtime_names: &HashMap<u32, String>,
 ) -> FunctionRefcountPlan {
     let Some(storage_layout) = function.storage_layout().as_ref() else {
         return FunctionRefcountPlan::default();
@@ -275,6 +289,8 @@ fn plan_function_refcounts(
         .iter()
         .map(|block| (block.label, block.param_name_vec()))
         .collect::<HashMap<_, _>>();
+    let local_liveness =
+        compute_local_liveness(function, &location_by_name, module_constant_runtime_names);
 
     let blocks = function
         .blocks
@@ -289,6 +305,7 @@ fn plan_function_refcounts(
                     &locals,
                     &location_by_name,
                     &target_params,
+                    &local_liveness,
                     deleted_sentinel_constants,
                     block.label == entry_label,
                 ),
@@ -305,6 +322,7 @@ fn plan_block_refcounts(
     locals: &HashMap<LocalLocation, RefcountLocal>,
     location_by_name: &HashMap<String, LocalLocation>,
     target_params: &HashMap<BlockLabel, Vec<String>>,
+    local_liveness: &LocalLiveness,
     deleted_sentinel_constants: &HashSet<u32>,
     is_entry_block: bool,
 ) -> BlockRefcountPlan {
@@ -377,7 +395,7 @@ fn plan_block_refcounts(
             block.label,
             &env,
             locals,
-            forwarded_locations(edge.target, target_params, location_by_name),
+            preserved_locations(edge.target, local_liveness, target_params, location_by_name),
             RefcountReleaseReason::ExceptionEdge {
                 target: edge.target,
             },
@@ -391,7 +409,7 @@ fn plan_block_refcounts(
             block.label,
             &env,
             locals,
-            forwarded_locations(edge.target, target_params, location_by_name),
+            preserved_locations(edge.target, local_liveness, target_params, location_by_name),
             RefcountReleaseReason::Jump {
                 target: edge.target,
             },
@@ -403,7 +421,12 @@ fn plan_block_refcounts(
                 block.label,
                 &env,
                 locals,
-                forwarded_locations(if_term.then_label, target_params, location_by_name),
+                preserved_locations(
+                    if_term.then_label,
+                    local_liveness,
+                    target_params,
+                    location_by_name,
+                ),
                 RefcountReleaseReason::IfThen {
                     target: if_term.then_label,
                 },
@@ -414,7 +437,12 @@ fn plan_block_refcounts(
                 block.label,
                 &env,
                 locals,
-                forwarded_locations(if_term.else_label, target_params, location_by_name),
+                preserved_locations(
+                    if_term.else_label,
+                    local_liveness,
+                    target_params,
+                    location_by_name,
+                ),
                 RefcountReleaseReason::IfElse {
                     target: if_term.else_label,
                 },
@@ -428,7 +456,7 @@ fn plan_block_refcounts(
                     block.label,
                     &env,
                     locals,
-                    forwarded_locations(*target, target_params, location_by_name),
+                    preserved_locations(*target, local_liveness, target_params, location_by_name),
                     RefcountReleaseReason::BranchCase { target: *target },
                     &mut actions,
                 );
@@ -438,7 +466,12 @@ fn plan_block_refcounts(
                 block.label,
                 &env,
                 locals,
-                forwarded_locations(branch.default_label, target_params, location_by_name),
+                preserved_locations(
+                    branch.default_label,
+                    local_liveness,
+                    target_params,
+                    location_by_name,
+                ),
                 RefcountReleaseReason::BranchDefault {
                     target: branch.default_label,
                 },
@@ -478,6 +511,7 @@ fn validate_block_refcount_plan(
     locals: &HashMap<LocalLocation, RefcountLocal>,
     location_by_name: &HashMap<String, LocalLocation>,
     target_params: &HashMap<BlockLabel, Vec<String>>,
+    local_liveness: &LocalLiveness,
     deleted_sentinel_constants: &HashSet<u32>,
     is_entry_block: bool,
     errors: &mut Vec<String>,
@@ -623,7 +657,7 @@ fn validate_block_refcount_plan(
             &mut term_actions,
             &env,
             locals,
-            forwarded_locations(edge.target, target_params, location_by_name),
+            preserved_locations(edge.target, local_liveness, target_params, location_by_name),
             RefcountReleaseReason::ExceptionEdge {
                 target: edge.target,
             },
@@ -638,7 +672,7 @@ fn validate_block_refcount_plan(
             &mut term_actions,
             &env,
             locals,
-            forwarded_locations(edge.target, target_params, location_by_name),
+            preserved_locations(edge.target, local_liveness, target_params, location_by_name),
             RefcountReleaseReason::Jump {
                 target: edge.target,
             },
@@ -651,7 +685,12 @@ fn validate_block_refcount_plan(
                 &mut term_actions,
                 &env,
                 locals,
-                forwarded_locations(if_term.then_label, target_params, location_by_name),
+                preserved_locations(
+                    if_term.then_label,
+                    local_liveness,
+                    target_params,
+                    location_by_name,
+                ),
                 RefcountReleaseReason::IfThen {
                     target: if_term.then_label,
                 },
@@ -663,7 +702,12 @@ fn validate_block_refcount_plan(
                 &mut term_actions,
                 &env,
                 locals,
-                forwarded_locations(if_term.else_label, target_params, location_by_name),
+                preserved_locations(
+                    if_term.else_label,
+                    local_liveness,
+                    target_params,
+                    location_by_name,
+                ),
                 RefcountReleaseReason::IfElse {
                     target: if_term.else_label,
                 },
@@ -678,7 +722,7 @@ fn validate_block_refcount_plan(
                     &mut term_actions,
                     &env,
                     locals,
-                    forwarded_locations(*target, target_params, location_by_name),
+                    preserved_locations(*target, local_liveness, target_params, location_by_name),
                     RefcountReleaseReason::BranchCase { target: *target },
                     errors,
                 );
@@ -689,7 +733,12 @@ fn validate_block_refcount_plan(
                 &mut term_actions,
                 &env,
                 locals,
-                forwarded_locations(branch.default_label, target_params, location_by_name),
+                preserved_locations(
+                    branch.default_label,
+                    local_liveness,
+                    target_params,
+                    location_by_name,
+                ),
                 RefcountReleaseReason::BranchDefault {
                     target: branch.default_label,
                 },
@@ -811,12 +860,423 @@ fn deleted_sentinel_constant_slots(module: &BlockPyModule<CodegenModuleShape>) -
         .collect()
 }
 
+fn module_constant_runtime_name_slots(
+    module: &BlockPyModule<CodegenModuleShape>,
+) -> HashMap<u32, String> {
+    module
+        .module_constants
+        .iter()
+        .enumerate()
+        .filter_map(|(index, constant)| match constant {
+            InstrResolved::Load(op) if op.name.is_runtime_name() => Some((
+                u32::try_from(index).expect("module constant index should fit in u32"),
+                op.name.id_str().to_string(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
 fn state_for_py_facts(facts: PyObjFacts) -> LocalRefState {
     if facts.is_immortal() {
         LocalRefState::Immortal
     } else {
         LocalRefState::Owned
     }
+}
+
+#[derive(Clone, Debug, Default)]
+struct LocalLiveness {
+    live_in_by_block: HashMap<BlockLabel, HashSet<LocalLocation>>,
+}
+
+impl LocalLiveness {
+    fn live_in(&self, label: BlockLabel) -> Option<&HashSet<LocalLocation>> {
+        self.live_in_by_block.get(&label)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct BlockLocalEffects {
+    uses: HashSet<LocalLocation>,
+    defs: HashSet<LocalLocation>,
+}
+
+fn compute_local_liveness(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    location_by_name: &HashMap<String, LocalLocation>,
+    module_constant_runtime_names: &HashMap<u32, String>,
+) -> LocalLiveness {
+    let owned_cell_locations = owned_cell_locations(function, location_by_name);
+    let effects_by_block = function
+        .blocks
+        .iter()
+        .map(|block| {
+            (
+                block.label,
+                block_local_effects(
+                    block,
+                    location_by_name,
+                    &owned_cell_locations,
+                    module_constant_runtime_names,
+                ),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let successors_by_block = function
+        .blocks
+        .iter()
+        .map(|block| (block.label, block_successors(block)))
+        .collect::<HashMap<_, _>>();
+    let mut live_in_by_block = function
+        .blocks
+        .iter()
+        .map(|block| (block.label, HashSet::new()))
+        .collect::<HashMap<_, _>>();
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in function.blocks.iter().rev() {
+            let effects = effects_by_block
+                .get(&block.label)
+                .expect("liveness effects should exist for every block");
+            let mut live_out = HashSet::new();
+            for successor in successors_by_block
+                .get(&block.label)
+                .expect("successors should exist for every block")
+            {
+                if let Some(successor_live_in) = live_in_by_block.get(successor) {
+                    live_out.extend(successor_live_in.iter().copied());
+                }
+            }
+
+            let mut new_live_in = effects.uses.clone();
+            new_live_in.extend(
+                live_out
+                    .into_iter()
+                    .filter(|location| !effects.defs.contains(location)),
+            );
+            let entry = live_in_by_block
+                .get_mut(&block.label)
+                .expect("live-in should exist for every block");
+            if *entry != new_live_in {
+                *entry = new_live_in;
+                changed = true;
+            }
+        }
+    }
+
+    LocalLiveness { live_in_by_block }
+}
+
+fn block_local_effects(
+    block: &Block<InstrCodegen>,
+    location_by_name: &HashMap<String, LocalLocation>,
+    owned_cell_locations: &HashMap<u32, LocalLocation>,
+    module_constant_runtime_names: &HashMap<u32, String>,
+) -> BlockLocalEffects {
+    let mut effects = BlockLocalEffects::default();
+    for name in block.param_names() {
+        if let Some(location) = location_by_name.get(name) {
+            effects.defs.insert(*location);
+        }
+    }
+
+    for instr in &block.body {
+        collect_local_reads(
+            instr,
+            &effects.defs,
+            location_by_name,
+            owned_cell_locations,
+            module_constant_runtime_names,
+            &mut effects.uses,
+        );
+        match instr {
+            InstrCodegen::Store(op) => {
+                if let Some(location) = op.name.local_location() {
+                    effects.defs.insert(location);
+                }
+            }
+            InstrCodegen::Del(op) => {
+                if let Some(location) = op.name.local_location() {
+                    effects.defs.insert(location);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    collect_term_local_reads(
+        &block.term,
+        &effects.defs,
+        location_by_name,
+        owned_cell_locations,
+        module_constant_runtime_names,
+        &mut effects.uses,
+    );
+    effects
+}
+
+fn owned_cell_locations(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    location_by_name: &HashMap<String, LocalLocation>,
+) -> HashMap<u32, LocalLocation> {
+    let Some(storage_layout) = function.storage_layout().as_ref() else {
+        return HashMap::new();
+    };
+    storage_layout
+        .cellvars
+        .iter()
+        .chain(storage_layout.runtime_cells.iter())
+        .enumerate()
+        .filter_map(|(slot, cell)| {
+            let location = location_by_name.get(cell.storage_name.as_str()).copied()?;
+            let slot = u32::try_from(slot).expect("owned cell slot should fit in u32");
+            Some((slot, location))
+        })
+        .collect()
+}
+
+fn mark_local_use(
+    location: LocalLocation,
+    defs: &HashSet<LocalLocation>,
+    uses: &mut HashSet<LocalLocation>,
+) {
+    if !defs.contains(&location) {
+        uses.insert(location);
+    }
+}
+
+fn mark_cell_use(
+    cell_location: CellLocation,
+    defs: &HashSet<LocalLocation>,
+    owned_cell_locations: &HashMap<u32, LocalLocation>,
+    uses: &mut HashSet<LocalLocation>,
+) {
+    if let CellLocation::Owned(slot) = cell_location {
+        if let Some(location) = owned_cell_locations.get(&slot) {
+            mark_local_use(*location, defs, uses);
+        }
+    }
+}
+
+fn should_include_in_locals_snapshot(name: &str) -> bool {
+    !name.starts_with("_dp_") && name != "__soac__"
+}
+
+fn codegen_expr_helper_name<'a>(
+    expr: &'a InstrCodegen,
+    module_constant_runtime_names: &'a HashMap<u32, String>,
+) -> Option<&'a str> {
+    match expr {
+        InstrCodegen::Load(op)
+            if op.name.location.is_global()
+                || op.name.location.is_global_name()
+                || op.name.location.is_runtime_name() =>
+        {
+            Some(op.name.id_str())
+        }
+        InstrCodegen::Load(op) => op.name.location.as_constant().and_then(|index| {
+            module_constant_runtime_names
+                .get(&index)
+                .map(String::as_str)
+        }),
+        _ => None,
+    }
+}
+
+fn is_current_scope_locals_snapshot_call(
+    expr: &InstrCodegen,
+    module_constant_runtime_names: &HashMap<u32, String>,
+) -> bool {
+    let InstrCodegen::Call(call) = expr else {
+        return false;
+    };
+    if !call.keywords.is_empty()
+        || call
+            .args
+            .iter()
+            .any(|arg| matches!(arg, CallArgPositional::Starred(_)))
+    {
+        return false;
+    }
+    match codegen_expr_helper_name(call.func.as_ref(), module_constant_runtime_names) {
+        Some("locals") => call.args.is_empty(),
+        Some("eval" | "exec") => call.args.len() == 1,
+        _ => false,
+    }
+}
+
+fn mark_current_scope_locals_snapshot_uses(
+    defs: &HashSet<LocalLocation>,
+    location_by_name: &HashMap<String, LocalLocation>,
+    uses: &mut HashSet<LocalLocation>,
+) {
+    for (name, location) in location_by_name {
+        if should_include_in_locals_snapshot(name) {
+            mark_local_use(*location, defs, uses);
+        }
+    }
+}
+
+fn collect_local_reads(
+    expr: &InstrCodegen,
+    defs: &HashSet<LocalLocation>,
+    location_by_name: &HashMap<String, LocalLocation>,
+    owned_cell_locations: &HashMap<u32, LocalLocation>,
+    module_constant_runtime_names: &HashMap<u32, String>,
+    uses: &mut HashSet<LocalLocation>,
+) {
+    struct LocalReadCollector<'a> {
+        defs: &'a HashSet<LocalLocation>,
+        location_by_name: &'a HashMap<String, LocalLocation>,
+        owned_cell_locations: &'a HashMap<u32, LocalLocation>,
+        module_constant_runtime_names: &'a HashMap<u32, String>,
+        uses: &'a mut HashSet<LocalLocation>,
+    }
+
+    impl Visit<InstrCodegen> for LocalReadCollector<'_> {
+        fn visit_instr(&mut self, expr: &InstrCodegen)
+        where
+            InstrCodegen: ChildVisitable<InstrCodegen>,
+        {
+            if is_current_scope_locals_snapshot_call(expr, self.module_constant_runtime_names) {
+                mark_current_scope_locals_snapshot_uses(
+                    self.defs,
+                    self.location_by_name,
+                    self.uses,
+                );
+            }
+            match expr {
+                InstrCodegen::Load(op) => {
+                    if let Some(location) = op.name.local_location() {
+                        mark_local_use(location, self.defs, self.uses);
+                    }
+                    if let Some(cell_location) = op.name.cell_location() {
+                        mark_cell_use(
+                            cell_location,
+                            self.defs,
+                            self.owned_cell_locations,
+                            self.uses,
+                        );
+                    }
+                }
+                InstrCodegen::Store(op) => {
+                    if let Some(cell_location) = op.name.cell_location() {
+                        mark_cell_use(
+                            cell_location,
+                            self.defs,
+                            self.owned_cell_locations,
+                            self.uses,
+                        );
+                    }
+                }
+                InstrCodegen::Del(op) => {
+                    if let Some(cell_location) = op.name.cell_location() {
+                        mark_cell_use(
+                            cell_location,
+                            self.defs,
+                            self.owned_cell_locations,
+                            self.uses,
+                        );
+                    }
+                }
+                InstrCodegen::CellRef(op) => {
+                    mark_cell_use(op.location, self.defs, self.owned_cell_locations, self.uses)
+                }
+                _ => {}
+            }
+            expr.visit_children(self);
+        }
+
+        fn visit_block_arg(&mut self, arg: &BlockArg) {
+            if let BlockArg::Name(name) = arg {
+                if let Some(location) = self.location_by_name.get(name) {
+                    mark_local_use(*location, self.defs, self.uses);
+                }
+            }
+        }
+    }
+
+    LocalReadCollector {
+        defs,
+        location_by_name,
+        owned_cell_locations,
+        module_constant_runtime_names,
+        uses,
+    }
+    .visit_instr(expr);
+}
+
+fn collect_term_local_reads(
+    term: &BlockTerm<InstrCodegen>,
+    defs: &HashSet<LocalLocation>,
+    location_by_name: &HashMap<String, LocalLocation>,
+    owned_cell_locations: &HashMap<u32, LocalLocation>,
+    module_constant_runtime_names: &HashMap<u32, String>,
+    uses: &mut HashSet<LocalLocation>,
+) {
+    struct TermReadCollector<'a> {
+        defs: &'a HashSet<LocalLocation>,
+        location_by_name: &'a HashMap<String, LocalLocation>,
+        owned_cell_locations: &'a HashMap<u32, LocalLocation>,
+        module_constant_runtime_names: &'a HashMap<u32, String>,
+        uses: &'a mut HashSet<LocalLocation>,
+    }
+
+    impl Visit<InstrCodegen> for TermReadCollector<'_> {
+        fn visit_instr(&mut self, expr: &InstrCodegen)
+        where
+            InstrCodegen: ChildVisitable<InstrCodegen>,
+        {
+            collect_local_reads(
+                expr,
+                self.defs,
+                self.location_by_name,
+                self.owned_cell_locations,
+                self.module_constant_runtime_names,
+                self.uses,
+            );
+        }
+
+        fn visit_block_arg(&mut self, arg: &BlockArg) {
+            if let BlockArg::Name(name) = arg {
+                if let Some(location) = self.location_by_name.get(name) {
+                    mark_local_use(*location, self.defs, self.uses);
+                }
+            }
+        }
+    }
+
+    TermReadCollector {
+        defs,
+        location_by_name,
+        owned_cell_locations,
+        module_constant_runtime_names,
+        uses,
+    }
+    .visit_term(term);
+}
+
+fn block_successors(block: &Block<InstrCodegen>) -> Vec<BlockLabel> {
+    let mut successors = Vec::new();
+    if let Some(edge) = &block.exc_edge {
+        successors.push(edge.target);
+    }
+    match &block.term {
+        BlockTerm::Jump(edge) => successors.push(edge.target),
+        BlockTerm::IfTerm(if_term) => {
+            successors.push(if_term.then_label);
+            successors.push(if_term.else_label);
+        }
+        BlockTerm::BranchTable(branch) => {
+            successors.extend(branch.targets.iter().copied());
+            successors.push(branch.default_label);
+        }
+        BlockTerm::Raise(_) | BlockTerm::Return(_) => {}
+    }
+    successors
 }
 
 fn forwarded_locations(
@@ -830,6 +1290,19 @@ fn forwarded_locations(
         .flat_map(|params| params.iter())
         .filter_map(|name| location_by_name.get(name).copied())
         .collect()
+}
+
+fn preserved_locations(
+    target: BlockLabel,
+    local_liveness: &LocalLiveness,
+    target_params: &HashMap<BlockLabel, Vec<String>>,
+    location_by_name: &HashMap<String, LocalLocation>,
+) -> HashSet<LocalLocation> {
+    let mut preserved = forwarded_locations(target, target_params, location_by_name);
+    if let Some(live_in) = local_liveness.live_in(target) {
+        preserved.extend(live_in.iter().copied());
+    }
+    preserved
 }
 
 fn release_unforwarded_locals(
@@ -1005,9 +1478,9 @@ mod tests {
         lower_refcount_ownership, validate_refcount_plan, LocalRefState, RefcountActionKind,
         RefcountReleaseReason,
     };
-    use crate::block_py::BlockTerm;
+    use crate::block_py::{BlockTerm, NameLike};
     use crate::lower_python_to_blockpy_for_testing;
-    use crate::passes::infer_module_value_facts;
+    use crate::passes::{infer_module_value_facts, InstrCodegen};
 
     fn refcount_actions_for_function(
         source: &str,
@@ -1182,6 +1655,102 @@ def f(flag):
             block_actions, 0,
             "branch block {} should forward x to both return targets instead of releasing it",
             branch_block.label
+        );
+    }
+
+    #[test]
+    fn refcount_plan_keeps_loop_iterator_live_across_check_jump() {
+        let (_function, actions) = refcount_actions_for_function(
+            r#"
+def f(cls):
+    for item in cls.__mro__:
+        item.__name__
+"#,
+        );
+
+        assert!(
+            !actions.iter().any(|action| matches!(
+                action,
+                RefcountActionKind::ReleaseLocal {
+                    local,
+                    reason: RefcountReleaseReason::Jump { .. },
+                    ..
+                } if local.name.starts_with("_dp_iter_")
+            )),
+            "loop iterator slot should stay live across jumps back to the loop check: {actions:#?}"
+        );
+    }
+
+    #[test]
+    fn refcount_plan_keeps_owned_cell_live_across_cell_backed_condition() {
+        let (_function, actions) = refcount_actions_for_function(
+            r#"
+def f(reason):
+    def decorator(test_item):
+        return reason
+
+    if isinstance(reason, int):
+        return decorator(reason)
+    return decorator
+"#,
+        );
+
+        assert!(
+            !actions.iter().any(|action| matches!(
+                action,
+                RefcountActionKind::ReleaseLocal {
+                    local,
+                    reason: RefcountReleaseReason::Jump { .. },
+                    ..
+                } if local.name == "_dp_cell_reason"
+            )),
+            "owned cell backing slot must stay live for later cell-backed reads: {actions:#?}"
+        );
+    }
+
+    #[test]
+    fn refcount_plan_keeps_loop_target_live_for_eval_locals_snapshot() {
+        let lowered = lower_python_to_blockpy_for_testing(
+            r#"
+def f():
+    for item in [[]]:
+        marker = "value"
+        eval("item")
+"#,
+        )
+        .expect("transform should succeed")
+        .codegen_module;
+        let facts = infer_module_value_facts(&lowered);
+        let plan = lower_refcount_ownership(&lowered, &facts);
+        let function = lowered
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "f")
+            .expect("missing lowered function f");
+        let item_store_block = function
+            .blocks
+            .iter()
+            .find(|block| {
+                block.body.iter().any(
+                    |instr| matches!(instr, InstrCodegen::Store(op) if op.name.id_str() == "item"),
+                )
+            })
+            .expect("expected a block that stores the for-loop target");
+        let block_plan = plan
+            .function(function.function_id)
+            .and_then(|function_plan| function_plan.block(item_store_block.label))
+            .expect("missing block refcount plan");
+
+        assert!(
+            !block_plan.actions.iter().any(|action| matches!(
+                &action.kind,
+                RefcountActionKind::ReleaseLocal {
+                    local,
+                    reason: RefcountReleaseReason::Jump { .. },
+                    ..
+                } if local.name == "item"
+            )),
+            "for-loop target must stay live across the jump into eval's locals snapshot: {block_plan:#?}"
         );
     }
 

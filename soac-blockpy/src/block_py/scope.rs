@@ -406,6 +406,9 @@ impl CallableScopeInfo {
     }
 
     pub fn logical_name_for_cell_storage(&self, storage_name: &str) -> Option<String> {
+        if self.owned_cell_source_names.contains(storage_name) {
+            return Some(storage_name.to_string());
+        }
         if let Some(logical_name) = storage_name.strip_prefix("_dp_cell_") {
             return Some(logical_name.to_string());
         }
@@ -882,7 +885,7 @@ where
     }
 }
 
-fn is_runtime_closure_name(name: &str) -> bool {
+pub(crate) fn is_runtime_closure_name(name: &str) -> bool {
     matches!(name, "_dp_pc" | "_dp_yieldfrom" | "_dp_throw_context")
         || name.starts_with("_dp_try_abrupt_kind_")
 }
@@ -931,12 +934,15 @@ where
             .filter(|logical_name| !is_runtime_closure_name(logical_name.as_str()))
             .filter(|logical_name| !param_name_set.contains(logical_name.as_str()))
             .filter(|logical_name| {
-                !owned_cell_slot_names.contains(
-                    callable_def
-                        .scope
-                        .cell_capture_source_name(logical_name.as_str())
-                        .as_str(),
-                )
+                let source_name = callable_def
+                    .scope
+                    .cell_capture_source_name(logical_name.as_str());
+                if owned_cell_slot_names.contains("_dp_classcell")
+                    && (logical_name == "__class__" || source_name == "_dp_classcell")
+                {
+                    return false;
+                }
+                !owned_cell_slot_names.contains(source_name.as_str())
             })
             .map(|logical_name| CellCaptureBinding {
                 source_name: callable_def

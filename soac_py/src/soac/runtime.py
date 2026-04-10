@@ -59,7 +59,6 @@ from .sim import (
     not_,
     or_,
     pos,
-    pow,
     rshift,
     sub,
     truth,
@@ -86,7 +85,10 @@ ascii = _builtins.ascii
 repr = _builtins.repr
 str = _builtins.str
 format = _builtins.format
+pow = _builtins.pow
 AssertionError = _builtins.AssertionError
+AttributeError = _builtins.AttributeError
+ImportError = _builtins.ImportError
 
 
 def tuple_values(*values):
@@ -96,6 +98,10 @@ def tuple_values(*values):
 
 def tuple_from_iter(value):
     return _builtins.tuple(value)
+
+
+def eval_string_literal(source):
+    return _builtins.eval(f"({source})", {"__builtins__": {}}, {})
 
 
 def __deepcopy__(memo):
@@ -593,7 +599,9 @@ def call_super(super_fn, cls, instance_or_cls):
                 cls_value = cls.cell_contents
             except ValueError:
                 raise RuntimeError("super(): empty __class__ cell")
-            return _builtins.super(cls_value, instance_or_cls)
+            cls = cls_value
+        if instance_or_cls is DELETED:
+            raise RuntimeError("super(): arg[0] deleted")
         return _builtins.super(cls, instance_or_cls)
     return super_fn()
 
@@ -785,7 +793,17 @@ def create_class(
 
         if class_cell is not None:
             if isinstance(class_cell, _types.CellType):
-                class_cell.cell_contents = cls
+                try:
+                    class_cell_value = class_cell.cell_contents
+                except ValueError:
+                    raise RuntimeError(
+                        f"__class__ not set defining {name!r}; "
+                        "__classcell__ propagated to type.__new__?"
+                    )
+                if class_cell_value is not cls:
+                    raise TypeError(
+                        f"__class__ set to {class_cell_value!r} defining {name!r} as {cls!r}"
+                    )
             else:
                 raise TypeError("__classcell__ must be a cell")
         if _os.environ.get("SOAC_CLASS_TRACE"):
@@ -970,48 +988,58 @@ def import_(name, spec, fromlist=None, level=0):
 
 
 def import_attr(module, attr):
-    try:
-        return getattr(module, attr)
-    except AttributeError as exc:
-        module_name = getattr(module, "__name__", None)
-        if module_name:
-            submodule = _sys.modules.get(f"{module_name}.{attr}")
-            if submodule is not None:
-                try:
-                    setattr(module, attr, submodule)
-                except Exception:
-                    _warnings.warn(
-                        f"cannot set attribute {attr!r} on {module_name!r}",
-                        ImportWarning,
-                        stacklevel=2,
-                    )
-                return submodule
-        module_spec = getattr(module, "__spec__", None)
-        if (
-            module_name
-            and module_spec is not None
-            and getattr(module_spec, "_initializing", False)
-        ):
-            message = (
-                f"cannot import name {attr!r} from partially initialized module "
-                f"{module_name!r} (most likely due to a circular import)"
-            )
-            import_error = ImportError(message, name=module_name)
-            raise import_error.with_traceback(exc.__traceback__) from None
-        module_name = module_name or "<unknown module name>"
-        module_file = getattr(module, "__file__", None)
-        message = f"cannot import name {attr!r} from {module_name!r}"
-        if module_file is not None:
-            message = f"{message} ({module_file})"
-        else:
-            message = f"{message} (unknown location)"
-        import_error = ImportError(message, name=module_name, path=module_file)
+    value = getattr(module, attr, _MISSING)
+    if value is not _MISSING:
+        return value
 
-        raise import_error.with_traceback(exc.__traceback__) from None
+    module_name = getattr(module, "__name__", None)
+    if module_name:
+        submodule = _sys.modules.get(f"{module_name}.{attr}")
+        if submodule is not None:
+            try:
+                setattr(module, attr, submodule)
+            except Exception:
+                _warnings.warn(
+                    f"cannot set attribute {attr!r} on {module_name!r}",
+                    ImportWarning,
+                    stacklevel=2,
+                )
+            return submodule
+    module_spec = getattr(module, "__spec__", None)
+    if (
+        module_name
+        and module_spec is not None
+        and getattr(module_spec, "_initializing", False)
+    ):
+        message = (
+            f"cannot import name {attr!r} from partially initialized module "
+            f"{module_name!r} (most likely due to a circular import)"
+        )
+        raise ImportError(message, name=module_name) from None
+    module_name = module_name or "<unknown module name>"
+    module_file = getattr(module, "__file__", None)
+    message = f"cannot import name {attr!r} from {module_name!r}"
+    if module_file is not None:
+        message = f"{message} ({module_file})"
+    else:
+        message = f"{message} (unknown location)"
+    raise ImportError(message, name=module_name, path=module_file) from None
 
 
 def import_star(name, spec, globals_dict, level=0):
     module = import_(name, spec, ["*"], level)
+    if (
+        level
+        and name
+        and spec is not None
+        and getattr(spec, "submodule_search_locations", None) is not None
+    ):
+        root_name = name.split(".", 1)[0]
+        package_module = _sys.modules.get(spec.name)
+        if package_module is not None:
+            root_module = getattr(package_module, root_name, _MISSING)
+            if root_module is not _MISSING:
+                globals_dict[root_name] = root_module
     try:
         names = getattr(module, "__all__", None)
     except Exception:
@@ -1097,14 +1125,15 @@ def contextmanager_exit(exit_fn, exc):
             suppress = exit_fn(*exc_info)
             if suppress:
                 exc.__traceback__ = None
-                return
-            raise exc
+                return None
+            return exc
         finally:
             # Clear the reference for GC in long-lived frames.
             exc_info = None
             exc = None
     else:
         exit_fn(None, None, None)
+        return None
 
 
 def _ensure_awaitable(awaitable, method_name: str, *, suppress_context: bool = True):

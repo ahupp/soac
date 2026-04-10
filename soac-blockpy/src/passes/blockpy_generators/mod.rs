@@ -6,14 +6,14 @@ use crate::block_py::param_specs::{Param, ParamKind, ParamSpec};
 use crate::block_py::{
     compute_storage_layout_from_scope, core_call_expr_with_meta, core_runtime_name_expr_with_meta,
     core_runtime_positional_call_expr_with_meta, literal_expr, map_module_functions, BindingKind,
-    Block, BlockArg, BlockBuilder, BlockEdge, BlockLabel, BlockParam, BlockParamRole,
-    BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword, CallArgPositional,
-    CallableScopeInfo, CellBindingKind, CellRefForName, ClosureInit, ClosureSlot, FunctionId,
-    FunctionKind, FunctionName, FunctionNameGen, GetAttr, Instr, InstrUnresolved,
-    InstrWithConstantNone, InstrWithYield, Load, MakeFunction, Mappable, ModuleNameGen, NameLike,
-    NumberLiteral, NumberLiteralValue, ScopeExprNode, StorageLayout, Store, StringLiteral,
-    TermBranchTable, TermIf, TermRaise, TryMapFunction, TryMapInstr, TryMapTerm, UnaryOp,
-    UnaryOpKind, UnresolvedName,
+    BindingPurpose, BindingTarget, Block, BlockArg, BlockBuilder, BlockEdge, BlockLabel,
+    BlockParam, BlockParamRole, BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword,
+    CallArgPositional, CallableScopeInfo, CellBindingKind, CellRefForName, ClosureInit,
+    ClosureSlot, FunctionId, FunctionKind, FunctionName, FunctionNameGen, GetAttr, Instr,
+    InstrUnresolved, InstrWithConstantNone, InstrWithYield, Load, MakeFunction, Mappable,
+    ModuleNameGen, NameLike, NumberLiteral, NumberLiteralValue, ScopeExprNode, StorageLayout,
+    Store, StringLiteral, TermBranchTable, TermIf, TermRaise, TryMapFunction, TryMapInstr,
+    TryMapTerm, UnaryOp, UnaryOpKind, UnresolvedName,
 };
 use crate::passes::ast_to_ast::scope_helpers::is_internal_symbol;
 use crate::passes::ruff_to_blockpy::{attach_exception_edges_to_blocks, lowered_exception_edges};
@@ -208,7 +208,11 @@ where
     Load::new(name).into()
 }
 
-fn collect_state_vars<E>(param_names: &[String], blocks: &[Block<E>]) -> Vec<String>
+fn collect_state_vars<E>(
+    scope: &CallableScopeInfo,
+    param_names: &[String],
+    blocks: &[Block<E>],
+) -> Vec<String>
 where
     E: ScopeExprNode + Instr,
 {
@@ -225,12 +229,22 @@ where
         }
         for stmt in &block.body {
             for name in assigned_names_in_linear_stmt(stmt) {
+                if scope.binding_target_for_name(name.as_str(), BindingPurpose::Store)
+                    != BindingTarget::Local
+                {
+                    continue;
+                }
                 if !state.iter().any(|existing| existing == &name) {
                     state.push(name);
                 }
             }
         }
         for name in assigned_names_in_term(&block.term) {
+            if scope.binding_target_for_name(name.as_str(), BindingPurpose::Store)
+                != BindingTarget::Local
+            {
+                continue;
+            }
             if !state.iter().any(|existing| existing == &name) {
                 state.push(name);
             }
@@ -431,7 +445,7 @@ fn build_generator_storage_layout(
         .map(|slot| slot.storage_name.clone())
         .collect::<Vec<_>>();
 
-    let mut state_vars = collect_state_vars(&param_names, &callable.blocks);
+    let mut state_vars = collect_state_vars(&callable.scope, &param_names, &callable.blocks);
     for capture_name in &capture_names {
         if !state_vars.iter().any(|existing| existing == capture_name) {
             state_vars.push(capture_name.clone());

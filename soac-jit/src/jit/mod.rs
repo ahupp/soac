@@ -13,16 +13,16 @@ use cranelift_codegen::settings;
 use cranelift_codegen::settings::Configurable;
 use cranelift_control::ControlPlane;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch};
-use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{FuncId, Linkage, Module, ModuleReloc};
+use cranelift_jit::{ArenaMemoryProvider, JITBuilder, JITModule};
+use cranelift_module::{DataDescription, FuncId, Linkage, Module, ModuleReloc};
 use cranelift_reader::parse_functions;
 use pyo3::ffi;
 use soac_blockpy::block_py::{
     AbruptKind, BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword,
     CallArgPositional, CallableScopeKind, CellLocation, ChildVisitable, CodegenBlock, CounterDef,
     CounterId, CounterScope, CounterSite, FunctionId, HasMeta, HasSemanticInstrId, InstrCodegen,
-    InstrId, InstrKey, Literal, LocalLocation, NameLocation, ParamDefaultSource, ParamKind,
-    ResolvedName, StorageLayout, Visit, WithMeta, operation as blockpy_intrinsics,
+    InstrId, InstrKey, Literal, LocalLocation, NameLocation, ParamKind, ResolvedName,
+    StorageLayout, Visit, WithMeta, operation as blockpy_intrinsics,
 };
 use soac_blockpy::passes::{
     CodegenModuleShape, FactStore, FunctionRefcountPlan, InstrResolved, RefcountActionKind,
@@ -68,6 +68,8 @@ use specialized_helpers::register_specialized_jit_symbols;
 
 static RUNTIME_SUPPORT_LIBRARY: OnceLock<Result<RuntimeSupportLibrary, String>> = OnceLock::new();
 static NEXT_IMPORT_SPEC_ID: AtomicUsize = AtomicUsize::new(0);
+static NEXT_IMPORT_TRAMPOLINE_ID: AtomicUsize = AtomicUsize::new(0);
+const JIT_ARENA_BYTES: usize = 256 * 1024 * 1024;
 
 thread_local! {
     static PROCESS_JIT_COMPILE_DEPTH: Cell<usize> = const { Cell::new(0) };
@@ -333,6 +335,13 @@ static DP_JIT_TUPLE_SET_ITEM_IMPORT: ImportSpec = ImportSpec::new(
     &[SigType::Pointer, SigType::I64, SigType::Pointer],
     &[SigType::I32],
 );
+static DP_JIT_DICT_NEW_IMPORT: ImportSpec =
+    ImportSpec::new("dp_jit_dict_new", &[], &[SigType::Pointer]);
+static DP_JIT_DICT_SET_ITEM_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_dict_set_item",
+    &[SigType::Pointer, SigType::Pointer, SigType::Pointer],
+    &[SigType::I32],
+);
 static DP_JIT_IS_TRUE_IMPORT: ImportSpec =
     ImportSpec::new("dp_jit_is_true", &[SigType::Pointer], &[SigType::I32]);
 static DP_JIT_RAISE_FROM_EXC_IMPORT: ImportSpec = ImportSpec::new(
@@ -418,7 +427,7 @@ impl ModuleFuncImports {
         }
         let sig = lower_static_signature(jit_module, spec.signature);
         let func_id = match spec.linkage {
-            Linkage::Import => declare_import_fn(jit_module, spec.symbol, &sig)?,
+            Linkage::Import => define_import_trampoline_fn(jit_module, spec.symbol, &sig)?,
             Linkage::Local => declare_local_fn(jit_module, spec.symbol, &sig)?,
             linkage => {
                 return Err(format!(
@@ -1066,6 +1075,314 @@ fn codegen_expr_runtime_helper(
         })
 }
 
+fn should_include_in_locals_snapshot(name: &str) -> bool {
+    !name.starts_with("_dp_") && name != "__soac__"
+}
+
+fn emit_codegen_locals_snapshot(fb: &mut FunctionBuilder<'_>, ctx: &JitEmitCtx<'_>) -> ir::Value {
+    let ptr_ty = ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let locals_inst = fb.ins().call(ctx.dict_new_ref, &[]);
+    let locals_value = fb.inst_results(locals_inst)[0];
+    let locals_is_null = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, locals_value, null_ptr);
+    let locals_ok_block = fb.create_block();
+    fb.append_block_param(locals_ok_block, ptr_ty);
+    fb.ins().brif(
+        locals_is_null,
+        ctx.consts.step_null_block,
+        &step_null_block_args(ctx),
+        locals_ok_block,
+        &[ir::BlockArg::Value(locals_value)],
+    );
+    fb.switch_to_block(locals_ok_block);
+    let locals_value = fb.block_params(locals_ok_block)[0];
+
+    let slot_names = ctx
+        .storage_layout
+        .as_ref()
+        .map(|layout| {
+            layout
+                .stack_slots()
+                .iter()
+                .filter(|name| should_include_in_locals_snapshot(name))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    for name in slot_names {
+        let Some(value) = load_stack_slot_value(
+            fb,
+            &ctx.stack_slots,
+            name.as_str(),
+            ptr_ty,
+            true,
+            ctx.incref_ref,
+        ) else {
+            continue;
+        };
+        let value_is_deleted =
+            fb.ins()
+                .icmp(ir::condcodes::IntCC::Equal, value, ctx.consts.deleted_const);
+        let skip_block = fb.create_block();
+        let set_block = fb.create_block();
+        let after_block = fb.create_block();
+        fb.ins()
+            .brif(value_is_deleted, skip_block, &[], set_block, &[]);
+
+        fb.switch_to_block(set_block);
+        let name_obj = emit_owned_module_constant(
+            fb,
+            ctx.module_constants
+                .require_unicode_constant_id(name.as_str()),
+            ctx,
+        );
+        let set_inst = fb
+            .ins()
+            .call(ctx.dict_set_item_ref, &[locals_value, name_obj, value]);
+        fb.ins().call(ctx.decref_ref, &[name_obj]);
+        let set_result = fb.inst_results(set_inst)[0];
+        let set_failed = fb
+            .ins()
+            .icmp_imm(ir::condcodes::IntCC::SignedLessThan, set_result, 0);
+        let set_failed_block = fb.create_block();
+        fb.ins()
+            .brif(set_failed, set_failed_block, &[], after_block, &[]);
+
+        fb.switch_to_block(set_failed_block);
+        fb.ins().call(ctx.decref_ref, &[locals_value]);
+        fb.ins()
+            .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
+
+        fb.switch_to_block(skip_block);
+        fb.ins().jump(after_block, &[]);
+
+        fb.switch_to_block(after_block);
+    }
+
+    locals_value
+}
+
+fn emit_codegen_current_scope_builtin_call(
+    fb: &mut FunctionBuilder<'_>,
+    callable_expr: &InstrCodegen,
+    arg: &InstrCodegen,
+    local_names: &mut Vec<String>,
+    local_values: &mut Vec<ir::Value>,
+    ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> ir::Value {
+    let ptr_ty = ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let callable_is_borrowed = codegen_expr_is_borrowable(
+        callable_expr,
+        local_names,
+        &ctx.stack_slots,
+        ctx.storage_layout.as_ref(),
+    );
+    let callable = emit_codegen_expr(
+        fb,
+        callable_expr,
+        local_names,
+        local_values,
+        ctx,
+        callable_is_borrowed,
+        jit_module,
+        func_imports,
+    );
+
+    let arg_is_borrowed = codegen_expr_is_borrowable(
+        arg,
+        local_names,
+        &ctx.stack_slots,
+        ctx.storage_layout.as_ref(),
+    );
+    let arg_value = emit_codegen_expr(
+        fb,
+        arg,
+        local_names,
+        local_values,
+        ctx,
+        arg_is_borrowed,
+        jit_module,
+        func_imports,
+    );
+    let locals_value = emit_codegen_locals_snapshot(fb, ctx);
+    let call_inst = fb.ins().call(
+        ctx.py_call_positional_three_ref,
+        &[
+            callable,
+            arg_value,
+            ctx.consts.block_const,
+            locals_value,
+            null_ptr,
+        ],
+    );
+    fb.ins().call(ctx.decref_ref, &[locals_value]);
+    if !arg_is_borrowed {
+        fb.ins().call(ctx.decref_ref, &[arg_value]);
+    }
+    if !callable_is_borrowed {
+        fb.ins().call(ctx.decref_ref, &[callable]);
+    }
+
+    let call_value = fb.inst_results(call_inst)[0];
+    let call_is_null = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, call_value, null_ptr);
+    let call_ok_block = fb.create_block();
+    fb.append_block_param(call_ok_block, ptr_ty);
+    fb.ins().brif(
+        call_is_null,
+        ctx.consts.step_null_block,
+        &step_null_block_args(ctx),
+        call_ok_block,
+        &[ir::BlockArg::Value(call_value)],
+    );
+    fb.switch_to_block(call_ok_block);
+    fb.block_params(call_ok_block)[0]
+}
+
+fn super_instance_arg_without_deleted_guard<'a>(
+    expr: &'a InstrCodegen,
+    module_constants: &'a ModuleCodegenConstants,
+) -> &'a InstrCodegen {
+    let InstrCodegen::Call(call) = expr else {
+        return expr;
+    };
+    if !call.keywords.is_empty() || call.args.len() != 2 {
+        return expr;
+    }
+    if codegen_expr_helper_name(call.func.as_ref(), module_constants) != Some("load_deleted_name") {
+        return expr;
+    }
+    let CallArgPositional::Positional(value) = &call.args[1] else {
+        return expr;
+    };
+    value
+}
+
+fn emit_codegen_super_helper_call(
+    fb: &mut FunctionBuilder<'_>,
+    callable_expr: &InstrCodegen,
+    super_fn_expr: &InstrCodegen,
+    cls_expr: &InstrCodegen,
+    instance_expr: &InstrCodegen,
+    local_names: &mut Vec<String>,
+    local_values: &mut Vec<ir::Value>,
+    ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> ir::Value {
+    let ptr_ty = ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let callable_is_borrowed = codegen_expr_is_borrowable(
+        callable_expr,
+        local_names,
+        &ctx.stack_slots,
+        ctx.storage_layout.as_ref(),
+    );
+    let callable = emit_codegen_expr(
+        fb,
+        callable_expr,
+        local_names,
+        local_values,
+        ctx,
+        callable_is_borrowed,
+        jit_module,
+        func_imports,
+    );
+
+    let super_fn_is_borrowed = codegen_expr_is_borrowable(
+        super_fn_expr,
+        local_names,
+        &ctx.stack_slots,
+        ctx.storage_layout.as_ref(),
+    );
+    let super_fn = emit_codegen_expr(
+        fb,
+        super_fn_expr,
+        local_names,
+        local_values,
+        ctx,
+        super_fn_is_borrowed,
+        jit_module,
+        func_imports,
+    );
+
+    let cls_is_borrowed = codegen_expr_is_borrowable(
+        cls_expr,
+        local_names,
+        &ctx.stack_slots,
+        ctx.storage_layout.as_ref(),
+    );
+    let cls = emit_codegen_expr(
+        fb,
+        cls_expr,
+        local_names,
+        local_values,
+        ctx,
+        cls_is_borrowed,
+        jit_module,
+        func_imports,
+    );
+
+    let instance_expr =
+        super_instance_arg_without_deleted_guard(instance_expr, ctx.module_constants);
+    let instance_is_borrowed = codegen_expr_is_borrowable(
+        instance_expr,
+        local_names,
+        &ctx.stack_slots,
+        ctx.storage_layout.as_ref(),
+    );
+    let instance = emit_codegen_expr(
+        fb,
+        instance_expr,
+        local_names,
+        local_values,
+        ctx,
+        instance_is_borrowed,
+        jit_module,
+        func_imports,
+    );
+
+    let call_inst = fb.ins().call(
+        ctx.py_call_positional_three_ref,
+        &[callable, super_fn, cls, instance, null_ptr],
+    );
+    if !instance_is_borrowed {
+        fb.ins().call(ctx.decref_ref, &[instance]);
+    }
+    if !cls_is_borrowed {
+        fb.ins().call(ctx.decref_ref, &[cls]);
+    }
+    if !super_fn_is_borrowed {
+        fb.ins().call(ctx.decref_ref, &[super_fn]);
+    }
+    if !callable_is_borrowed {
+        fb.ins().call(ctx.decref_ref, &[callable]);
+    }
+
+    let call_value = fb.inst_results(call_inst)[0];
+    let call_is_null = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, call_value, null_ptr);
+    let call_ok_block = fb.create_block();
+    fb.append_block_param(call_ok_block, ptr_ty);
+    fb.ins().brif(
+        call_is_null,
+        ctx.consts.step_null_block,
+        &step_null_block_args(ctx),
+        call_ok_block,
+        &[ir::BlockArg::Value(call_value)],
+    );
+    fb.switch_to_block(call_ok_block);
+    fb.block_params(call_ok_block)[0]
+}
+
 fn load_function_env_obj(
     fb: &mut FunctionBuilder<'_>,
     ptr_ty: ir::Type,
@@ -1193,6 +1510,7 @@ fn emit_take_current_raised_exception(
 #[derive(Clone, Debug)]
 pub(crate) struct FunctionRuntimeDataLayout {
     positional_default_count: usize,
+    positional_default_slots_by_param_index: HashMap<usize, usize>,
     kwonly_default_slots: HashMap<String, usize>,
     closure_start: usize,
     closure_len: usize,
@@ -1201,20 +1519,26 @@ pub(crate) struct FunctionRuntimeDataLayout {
 
 impl FunctionRuntimeDataLayout {
     pub(crate) fn from_function(function: &BlockPyFunction<CodegenModuleShape>) -> Self {
-        let positional_default_count = function
+        let positional_param_indices = function
             .params
-            .iter_with_default_sources()
-            .filter_map(|(_, source)| match source {
-                Some(ParamDefaultSource::Positional(index)) => Some(index + 1),
-                _ => None,
+            .params
+            .iter()
+            .enumerate()
+            .filter_map(|(index, param)| {
+                matches!(param.kind, ParamKind::PosOnly | ParamKind::Any).then_some(index)
             })
-            .max()
-            .unwrap_or(0);
+            .collect::<Vec<_>>();
+        let positional_default_count = positional_param_indices.len();
+        let positional_default_slots_by_param_index = positional_param_indices
+            .into_iter()
+            .enumerate()
+            .map(|(slot, param_index)| (param_index, slot))
+            .collect::<HashMap<_, _>>();
         let mut kwonly_default_slots = HashMap::new();
-        for (_, source) in function.params.iter_with_default_sources() {
-            if let Some(ParamDefaultSource::KeywordOnly(name)) = source {
+        for param in function.params.iter() {
+            if param.kind == ParamKind::KwOnly {
                 let slot = positional_default_count + kwonly_default_slots.len();
-                kwonly_default_slots.insert(name.to_string(), slot);
+                kwonly_default_slots.insert(param.name.to_string(), slot);
             }
         }
         let closure_start = positional_default_count + kwonly_default_slots.len();
@@ -1228,6 +1552,7 @@ impl FunctionRuntimeDataLayout {
         let total_len = closure_start + closure_len;
         Self {
             positional_default_count,
+            positional_default_slots_by_param_index,
             kwonly_default_slots,
             closure_start,
             closure_len,
@@ -1242,6 +1567,15 @@ impl FunctionRuntimeDataLayout {
     pub(crate) fn positional_default_slot(&self, default_index: usize) -> usize {
         debug_assert!(default_index < self.positional_default_count);
         default_index
+    }
+
+    pub(crate) fn positional_default_slot_for_param_index(
+        &self,
+        param_index: usize,
+    ) -> Option<usize> {
+        self.positional_default_slots_by_param_index
+            .get(&param_index)
+            .copied()
     }
 
     pub(crate) fn kwonly_default_slot(&self, name: &str) -> Option<usize> {
@@ -1376,6 +1710,8 @@ struct JitEmitCtx<'mc> {
     tuple_set_item_ref: ir::FuncRef,
     take_error_before_null_cleanup_ref: ir::FuncRef,
     restore_error_after_null_cleanup_ref: ir::FuncRef,
+    dict_new_ref: ir::FuncRef,
+    dict_set_item_ref: ir::FuncRef,
     stack_slots: StackSlots,
     exception_state_slots: ExceptionStateSlots,
     pop_handled_exception_ref: ir::FuncRef,
@@ -2158,11 +2494,13 @@ fn emit_decref_if_not_null(
 #[derive(Clone)]
 struct ExceptionStateSlots {
     previous_handled_by_name: HashMap<String, ir::StackSlot>,
+    previous_handled_is_pushed_by_name: HashMap<String, ir::StackSlot>,
 }
 
 impl ExceptionStateSlots {
     fn new(fb: &mut FunctionBuilder<'_>, function: &BlockPyFunction<CodegenModuleShape>) -> Self {
         let mut previous_handled_by_name = HashMap::new();
+        let mut previous_handled_is_pushed_by_name = HashMap::new();
         for block in &function.blocks {
             let Some(name) = block.exception_param() else {
                 continue;
@@ -2176,9 +2514,19 @@ impl ExceptionStateSlots {
                         0,
                     ))
                 });
+            previous_handled_is_pushed_by_name
+                .entry(name.to_string())
+                .or_insert_with(|| {
+                    fb.create_sized_stack_slot(ir::StackSlotData::new(
+                        ir::StackSlotKind::ExplicitSlot,
+                        std::mem::size_of::<u64>() as u32,
+                        0,
+                    ))
+                });
         }
         Self {
             previous_handled_by_name,
+            previous_handled_is_pushed_by_name,
         }
     }
 
@@ -2187,10 +2535,17 @@ impl ExceptionStateSlots {
         for slot in self.previous_handled_by_name.values() {
             fb.ins().stack_store(null_ptr, *slot, 0);
         }
+        let not_pushed = fb.ins().iconst(ir::types::I64, 0);
+        for slot in self.previous_handled_is_pushed_by_name.values() {
+            fb.ins().stack_store(not_pushed, *slot, 0);
+        }
     }
 
-    fn slot_for_exception(&self, name: &str) -> Option<ir::StackSlot> {
-        self.previous_handled_by_name.get(name).copied()
+    fn slots_for_exception(&self, name: &str) -> Option<(ir::StackSlot, ir::StackSlot)> {
+        Some((
+            self.previous_handled_by_name.get(name).copied()?,
+            self.previous_handled_is_pushed_by_name.get(name).copied()?,
+        ))
     }
 }
 
@@ -4597,6 +4952,59 @@ fn emit_codegen_expr(
 
             if !has_unpack
                 && simple_keywords.is_empty()
+                && simple_args.is_empty()
+                && matches!(
+                    codegen_expr_helper_name(call.func.as_ref(), ctx.module_constants),
+                    Some("locals")
+                )
+            {
+                return emit_codegen_locals_snapshot(fb, ctx);
+            }
+
+            if !has_unpack
+                && simple_keywords.is_empty()
+                && simple_args.len() == 1
+                && matches!(
+                    codegen_expr_helper_name(call.func.as_ref(), ctx.module_constants),
+                    Some("eval" | "exec")
+                )
+            {
+                return emit_codegen_current_scope_builtin_call(
+                    fb,
+                    call.func.as_ref(),
+                    simple_args[0],
+                    local_names,
+                    local_values,
+                    ctx,
+                    jit_module,
+                    func_imports,
+                );
+            }
+
+            if !has_unpack
+                && simple_keywords.is_empty()
+                && simple_args.len() == 3
+                && matches!(
+                    codegen_expr_helper_name(call.func.as_ref(), ctx.module_constants),
+                    Some("call_super")
+                )
+            {
+                return emit_codegen_super_helper_call(
+                    fb,
+                    call.func.as_ref(),
+                    simple_args[0],
+                    simple_args[1],
+                    simple_args[2],
+                    local_names,
+                    local_values,
+                    ctx,
+                    jit_module,
+                    func_imports,
+                );
+            }
+
+            if !has_unpack
+                && simple_keywords.is_empty()
                 && codegen_expr_runtime_helper(call.func.as_ref(), ctx)
                     == Some(RuntimeHelperId::Str)
                 && simple_args.len() == 1
@@ -6205,13 +6613,30 @@ fn emit_pop_handled_exception(
     exception_name: &str,
     ctx: &JitEmitCtx<'_>,
 ) {
-    let Some(previous_slot) = ctx.exception_state_slots.slot_for_exception(exception_name) else {
+    let Some((previous_slot, is_pushed_slot)) = ctx
+        .exception_state_slots
+        .slots_for_exception(exception_name)
+    else {
         return;
     };
+    let is_pushed = fb.ins().stack_load(ir::types::I64, is_pushed_slot, 0);
+    let should_pop = fb
+        .ins()
+        .icmp_imm(ir::condcodes::IntCC::NotEqual, is_pushed, 0);
+    let pop_block = fb.create_block();
+    let done_block = fb.create_block();
+    fb.ins().brif(should_pop, pop_block, &[], done_block, &[]);
+
+    fb.switch_to_block(pop_block);
     let previous = fb.ins().stack_load(ctx.consts.ptr_ty, previous_slot, 0);
     fb.ins().call(ctx.pop_handled_exception_ref, &[previous]);
     let null_ptr = fb.ins().iconst(ctx.consts.ptr_ty, 0);
     fb.ins().stack_store(null_ptr, previous_slot, 0);
+    let not_pushed = fb.ins().iconst(ir::types::I64, 0);
+    fb.ins().stack_store(not_pushed, is_pushed_slot, 0);
+    fb.ins().jump(done_block, &[]);
+
+    fb.switch_to_block(done_block);
 }
 
 fn emit_pop_handled_exception_if_leaving(
@@ -7033,6 +7458,9 @@ fn new_jit_builder() -> Result<JITBuilder, String> {
         .finish(settings::Flags::new(flag_builder))
         .map_err(|err| format!("failed to finish ISA: {err}"))?;
     let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+    if let Ok(provider) = ArenaMemoryProvider::new_with_size(JIT_ARENA_BYTES) {
+        builder.memory_provider(Box::new(provider));
+    }
     builder.symbol("_Py_Dealloc", py_dealloc_symbol());
     builder.symbol(
         "_PyDict_IndexedValueTombstone",
@@ -7598,6 +8026,59 @@ fn declare_import_fn(
     jit_module
         .declare_function(symbol, Linkage::Import, sig)
         .map_err(|err| format!("failed to declare imported {symbol} symbol: {err}"))
+}
+
+fn define_import_trampoline_fn(
+    jit_module: &mut JITModule,
+    symbol: &str,
+    sig: &ir::Signature,
+) -> Result<FuncId, String> {
+    let import_id = declare_import_fn(jit_module, symbol, sig)?;
+    let symbol_suffix = symbol.replace(|ch: char| !ch.is_ascii_alphanumeric(), "_");
+    let trampoline_index = NEXT_IMPORT_TRAMPOLINE_ID.fetch_add(1, Ordering::Relaxed);
+    let data_symbol = format!("__soac_import_target_{symbol_suffix}_{trampoline_index}");
+    let data_id = jit_module
+        .declare_data(&data_symbol, Linkage::Local, false, false)
+        .map_err(|err| format!("failed to declare import target data for {symbol}: {err}"))?;
+    let mut data = DataDescription::new();
+    data.define_zeroinit(std::mem::size_of::<usize>());
+    data.set_align(std::mem::align_of::<usize>() as u64);
+    let import_ref = jit_module.declare_func_in_data(import_id, &mut data);
+    data.write_function_addr(0, import_ref);
+    jit_module
+        .define_data(data_id, &data)
+        .map_err(|err| format!("failed to define import target data for {symbol}: {err}"))?;
+
+    let trampoline_symbol = format!("__soac_import_trampoline_{symbol_suffix}_{trampoline_index}");
+    let trampoline_id = declare_local_fn(jit_module, &trampoline_symbol, sig)?;
+    let ptr_ty = jit_module.target_config().pointer_type();
+    let mut ctx = jit_module.make_context();
+    ctx.func.signature = sig.clone();
+    let mut builder_ctx = FunctionBuilderContext::new();
+    {
+        let mut fb = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+        let entry = fb.create_block();
+        fb.append_block_params_for_function_params(entry);
+        fb.switch_to_block(entry);
+        fb.seal_block(entry);
+
+        let target_data = jit_module.declare_data_in_func(data_id, &mut fb.func);
+        let target_slot = fb.ins().global_value(ptr_ty, target_data);
+        let target = fb
+            .ins()
+            .load(ptr_ty, ir::MemFlags::trusted(), target_slot, 0);
+        let sig_ref = fb.import_signature(sig.clone());
+        let args = fb.block_params(entry).to_vec();
+        let call_inst = fb.ins().call_indirect(sig_ref, target, &args);
+        let results = fb.inst_results(call_inst).to_vec();
+        fb.ins().return_(&results);
+        fb.finalize();
+    }
+    jit_module
+        .define_function(trampoline_id, &mut ctx)
+        .map_err(|err| format!("failed to define import trampoline for {symbol}: {err}"))?;
+    jit_module.clear_context(&mut ctx);
+    Ok(trampoline_id)
 }
 
 fn declare_local_fn(
@@ -8597,6 +9078,10 @@ fn build_cranelift_run_bb_specialized_function(
             &mut fb.func,
             &DP_JIT_RESTORE_ERROR_AFTER_NULL_CLEANUP_IMPORT,
         );
+        let dict_new_ref =
+            func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_DICT_NEW_IMPORT);
+        let dict_set_item_ref =
+            func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_DICT_SET_ITEM_IMPORT);
         let fallthrough_abrupt_kind_const = stack_slots.has_try_abrupt_kind_name().then(|| {
             emit_owned_module_constant_from_parts(
                 &mut fb,
@@ -8616,146 +9101,89 @@ fn build_cranelift_run_bb_specialized_function(
             function.params.len(),
             "direct JIT entry arity does not match entry params",
         );
-        for ((param, default_source), value) in function
+        for (param_index, (param, value)) in function
             .params
-            .iter_with_default_sources()
+            .iter()
             .zip(direct_entry_args.iter())
+            .enumerate()
         {
-            match default_source {
-                Some(ParamDefaultSource::Positional(default_index)) => {
-                    let arg_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, *value, null_ptr);
-                    let use_default_block = fb.create_block();
-                    let use_arg_block = fb.create_block();
-                    let after_block = fb.create_block();
-                    fb.ins()
-                        .brif(arg_is_null, use_default_block, &[], use_arg_block, &[]);
+            let default_slot = match param.kind {
+                ParamKind::PosOnly | ParamKind::Any => function_runtime_data_layout
+                    .positional_default_slot_for_param_index(param_index),
+                ParamKind::KwOnly => function_runtime_data_layout.kwonly_default_slot(&param.name),
+                ParamKind::VarArg | ParamKind::KwArg => None,
+            };
 
-                    fb.switch_to_block(use_default_block);
-                    let default_slot =
-                        function_runtime_data_layout.positional_default_slot(default_index);
-                    let default_value = emit_function_data_slot_owned_or_null(
+            let Some(default_slot) = default_slot else {
+                stack_slots
+                    .replace_cloned_value(
                         &mut fb,
-                        function_data_value,
-                        default_slot,
+                        param.name.as_str(),
+                        *value,
                         ptr_ty,
                         incref_ref,
-                    );
-                    let default_is_null =
-                        fb.ins()
-                            .icmp(ir::condcodes::IntCC::Equal, default_value, null_ptr);
-                    let default_ok_block = fb.create_block();
-                    fb.append_block_param(default_ok_block, ptr_ty);
-                    fb.ins().brif(
-                        default_is_null,
-                        entry_failure_block,
-                        &block_arg_values(&entry_failure_args),
-                        default_ok_block,
-                        &[ir::BlockArg::Value(default_value)],
-                    );
-                    fb.switch_to_block(default_ok_block);
-                    let default_value = fb.block_params(default_ok_block)[0];
-                    stack_slots
-                        .replace_cloned_value(
-                            &mut fb,
-                            param.name.as_str(),
-                            default_value,
-                            ptr_ty,
-                            incref_ref,
-                            decref_ref,
-                        )
-                        .expect("entry slot missing from stack slots");
-                    fb.ins().call(decref_ref, &[default_value]);
-                    fb.ins().jump(after_block, &[]);
+                        decref_ref,
+                    )
+                    .expect("entry slot missing from stack slots");
+                continue;
+            };
 
-                    fb.switch_to_block(use_arg_block);
-                    stack_slots
-                        .replace_cloned_value(
-                            &mut fb,
-                            param.name.as_str(),
-                            *value,
-                            ptr_ty,
-                            incref_ref,
-                            decref_ref,
-                        )
-                        .expect("entry slot missing from stack slots");
-                    fb.ins().jump(after_block, &[]);
+            let arg_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, *value, null_ptr);
+            let use_default_block = fb.create_block();
+            let use_arg_block = fb.create_block();
+            let after_block = fb.create_block();
+            fb.ins()
+                .brif(arg_is_null, use_default_block, &[], use_arg_block, &[]);
 
-                    fb.switch_to_block(after_block);
-                }
-                Some(ParamDefaultSource::KeywordOnly(default_name)) => {
-                    let arg_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, *value, null_ptr);
-                    let use_default_block = fb.create_block();
-                    let use_arg_block = fb.create_block();
-                    let after_block = fb.create_block();
-                    fb.ins()
-                        .brif(arg_is_null, use_default_block, &[], use_arg_block, &[]);
+            fb.switch_to_block(use_default_block);
+            let default_value = emit_function_data_slot_owned_or_null(
+                &mut fb,
+                function_data_value,
+                default_slot,
+                ptr_ty,
+                incref_ref,
+            );
+            let default_is_null =
+                fb.ins()
+                    .icmp(ir::condcodes::IntCC::Equal, default_value, null_ptr);
+            let default_ok_block = fb.create_block();
+            fb.append_block_param(default_ok_block, ptr_ty);
+            fb.ins().brif(
+                default_is_null,
+                entry_failure_block,
+                &block_arg_values(&entry_failure_args),
+                default_ok_block,
+                &[ir::BlockArg::Value(default_value)],
+            );
+            fb.switch_to_block(default_ok_block);
+            let default_value = fb.block_params(default_ok_block)[0];
+            stack_slots
+                .replace_cloned_value(
+                    &mut fb,
+                    param.name.as_str(),
+                    default_value,
+                    ptr_ty,
+                    incref_ref,
+                    decref_ref,
+                )
+                .expect("entry slot missing from stack slots");
+            fb.ins().call(decref_ref, &[default_value]);
+            fb.ins().jump(after_block, &[]);
 
-                    fb.switch_to_block(use_default_block);
-                    let default_slot = function_runtime_data_layout
-                        .kwonly_default_slot(default_name)
-                        .expect("kwonly default param should have a runtime-data slot");
-                    let default_value = emit_function_data_slot_owned_or_null(
-                        &mut fb,
-                        function_data_value,
-                        default_slot,
-                        ptr_ty,
-                        incref_ref,
-                    );
-                    let default_is_null =
-                        fb.ins()
-                            .icmp(ir::condcodes::IntCC::Equal, default_value, null_ptr);
-                    let default_ok_block = fb.create_block();
-                    fb.append_block_param(default_ok_block, ptr_ty);
-                    fb.ins().brif(
-                        default_is_null,
-                        entry_failure_block,
-                        &block_arg_values(&entry_failure_args),
-                        default_ok_block,
-                        &[ir::BlockArg::Value(default_value)],
-                    );
-                    fb.switch_to_block(default_ok_block);
-                    let default_value = fb.block_params(default_ok_block)[0];
-                    stack_slots
-                        .replace_cloned_value(
-                            &mut fb,
-                            param.name.as_str(),
-                            default_value,
-                            ptr_ty,
-                            incref_ref,
-                            decref_ref,
-                        )
-                        .expect("entry slot missing from stack slots");
-                    fb.ins().call(decref_ref, &[default_value]);
-                    fb.ins().jump(after_block, &[]);
+            fb.switch_to_block(use_arg_block);
+            stack_slots
+                .replace_cloned_value(
+                    &mut fb,
+                    param.name.as_str(),
+                    *value,
+                    ptr_ty,
+                    incref_ref,
+                    decref_ref,
+                )
+                .expect("entry slot missing from stack slots");
+            fb.ins().jump(after_block, &[]);
 
-                    fb.switch_to_block(use_arg_block);
-                    stack_slots
-                        .replace_cloned_value(
-                            &mut fb,
-                            param.name.as_str(),
-                            *value,
-                            ptr_ty,
-                            incref_ref,
-                            decref_ref,
-                        )
-                        .expect("entry slot missing from stack slots");
-                    fb.ins().jump(after_block, &[]);
-
-                    fb.switch_to_block(after_block);
-                }
-                None => {
-                    stack_slots
-                        .replace_cloned_value(
-                            &mut fb,
-                            param.name.as_str(),
-                            *value,
-                            ptr_ty,
-                            incref_ref,
-                            decref_ref,
-                        )
-                        .expect("entry slot missing from stack slots");
-                }
-            }
+            fb.switch_to_block(after_block);
         }
         let trace_arg0 = function
             .params
@@ -8963,6 +9391,8 @@ fn build_cranelift_run_bb_specialized_function(
                 tuple_set_item_ref,
                 take_error_before_null_cleanup_ref,
                 restore_error_after_null_cleanup_ref,
+                dict_new_ref,
+                dict_set_item_ref,
                 stack_slots: stack_slots.clone(),
                 exception_state_slots: exception_state_slots.clone(),
                 pop_handled_exception_ref,
@@ -9056,12 +9486,14 @@ fn build_cranelift_run_bb_specialized_function(
             if let Some(exception_name) =
                 function.blocks[dispatch_plan.target_index].exception_param()
             {
-                if let Some(previous_slot) =
-                    exception_state_slots.slot_for_exception(exception_name)
+                if let Some((previous_slot, is_pushed_slot)) =
+                    exception_state_slots.slots_for_exception(exception_name)
                 {
                     let previous_inst = fb.ins().call(push_handled_exception_ref, &[dispatch_exc]);
                     let previous = fb.inst_results(previous_inst)[0];
                     fb.ins().stack_store(previous, previous_slot, 0);
+                    let is_pushed = fb.ins().iconst(ir::types::I64, 1);
+                    fb.ins().stack_store(is_pushed, is_pushed_slot, 0);
                 }
             }
             emit_exception_dispatch_slot_writes(
@@ -9123,13 +9555,27 @@ fn build_cranelift_run_bb_specialized_function(
                 fb.ins().call(decref_ref, &[value]);
             }
             if let Some(exception_name) = function.blocks[index].exception_param() {
-                if let Some(previous_slot) =
-                    exception_state_slots.slot_for_exception(exception_name)
+                if let Some((previous_slot, is_pushed_slot)) =
+                    exception_state_slots.slots_for_exception(exception_name)
                 {
+                    let is_pushed = fb.ins().stack_load(ir::types::I64, is_pushed_slot, 0);
+                    let should_pop =
+                        fb.ins()
+                            .icmp_imm(ir::condcodes::IntCC::NotEqual, is_pushed, 0);
+                    let pop_block = fb.create_block();
+                    let done_block = fb.create_block();
+                    fb.ins().brif(should_pop, pop_block, &[], done_block, &[]);
+
+                    fb.switch_to_block(pop_block);
                     let previous = fb.ins().stack_load(ptr_ty, previous_slot, 0);
                     fb.ins().call(pop_handled_exception_ref, &[previous]);
                     let null_ptr = fb.ins().iconst(ptr_ty, 0);
                     fb.ins().stack_store(null_ptr, previous_slot, 0);
+                    let not_pushed = fb.ins().iconst(ir::types::I64, 0);
+                    fb.ins().stack_store(not_pushed, is_pushed_slot, 0);
+                    fb.ins().jump(done_block, &[]);
+
+                    fb.switch_to_block(done_block);
                 }
             }
             stack_slots.decref_all(&mut fb, ptr_ty, decref_ref);

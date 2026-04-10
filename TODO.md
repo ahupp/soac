@@ -7,6 +7,8 @@
  * Consider replacing the internal deleted local sentinel object with `NULL` so leaked sentinel state fails loudly.
  * Simplify class-cell capture by unconditionally treating `super()` as capturing `__class__`.
  * Consider moving `LocalEnvEntry` construction into a name-binding-like BlockPy pass so local ownership/storage entries are decided before JIT codegen.
+ * Replace the function-instantiation fallback for `co_freevars`/capture mismatches with a cleaner explicit closure entry/code-object alignment.
+ * Track slow CPython fast-suite cases that pass with longer timeouts, including `test_dataclasses` and `test_bytes -m test_count`.
 
 
 ## Perf-to-investigate

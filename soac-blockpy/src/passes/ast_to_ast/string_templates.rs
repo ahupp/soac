@@ -1,8 +1,11 @@
 use crate::block_py::{HasMeta, Mappable};
+use crate::passes::ast_to_ast::body::Suite;
+use crate::passes::ast_to_ast::context::Context;
 use crate::passes::InstrRuff;
 use crate::transformer::{walk_expr, Transformer};
 use crate::{passes::ast_to_ast::expr_utils::make_tuple, py_expr};
 use ruff_python_ast::{self as ast, Expr};
+use ruff_text_size::{Ranged, TextRange};
 
 fn join_parts(parts: Vec<Expr>, force_join: bool) -> Expr {
     match parts.len() {
@@ -200,6 +203,93 @@ impl Transformer for StringTemplateLowerer {
 
 pub fn lower_string_templates_in_expr(expr: &mut Expr) {
     StringTemplateLowerer.visit_expr(expr);
+}
+
+fn source_slice(source: &str, range: TextRange) -> &str {
+    &source[range.start().to_usize()..range.end().to_usize()]
+}
+
+fn hex_value(ch: u8) -> Option<u32> {
+    match ch {
+        b'0'..=b'9' => Some((ch - b'0') as u32),
+        b'a'..=b'f' => Some((ch - b'a' + 10) as u32),
+        b'A'..=b'F' => Some((ch - b'A' + 10) as u32),
+        _ => None,
+    }
+}
+
+fn parse_hex_escape(bytes: &[u8], offset: usize, len: usize) -> Option<u32> {
+    let end = offset.checked_add(len)?;
+    if end > bytes.len() {
+        return None;
+    }
+    let mut value = 0u32;
+    for byte in &bytes[offset..end] {
+        value = (value << 4) | hex_value(*byte)?;
+    }
+    Some(value)
+}
+
+fn has_active_surrogate_escape(content: &str) -> bool {
+    let bytes = content.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] != b'\\' {
+            index += 1;
+            continue;
+        }
+
+        let run_start = index;
+        while index < bytes.len() && bytes[index] == b'\\' {
+            index += 1;
+        }
+        let run_len = index - run_start;
+        if run_len % 2 == 0 || index >= bytes.len() {
+            continue;
+        }
+
+        let value = match bytes[index] {
+            b'u' => parse_hex_escape(bytes, index + 1, 4),
+            b'U' => parse_hex_escape(bytes, index + 1, 8),
+            _ => None,
+        };
+        if matches!(value, Some(0xD800..=0xDFFF)) {
+            return true;
+        }
+    }
+    false
+}
+
+fn string_literal_needs_source_eval(context: &Context, value: &ast::StringLiteralValue) -> bool {
+    value.iter().any(|part| {
+        !part.flags.prefix().is_raw()
+            && has_active_surrogate_escape(source_slice(&context.source, part.content_range()))
+    })
+}
+
+struct SurrogateStringLiteralLowerer<'a> {
+    context: &'a Context,
+}
+
+impl Transformer for SurrogateStringLiteralLowerer<'_> {
+    fn visit_expr(&mut self, expr: &mut Expr) {
+        match expr {
+            Expr::StringLiteral(node)
+                if string_literal_needs_source_eval(self.context, &node.value) =>
+            {
+                let literal_source = source_slice(&self.context.source, node.range()).to_string();
+                *expr = py_expr!(
+                    "__soac__.eval_string_literal({source:literal})",
+                    source = literal_source
+                );
+            }
+            _ => walk_expr(self, expr),
+        }
+    }
+}
+
+pub fn rewrite_surrogate_escape_string_literals(context: &Context, body: &mut Suite) {
+    SurrogateStringLiteralLowerer { context }.visit_body(body);
 }
 
 pub fn lower_string_templates_in_instr_ruff(expr: InstrRuff) -> InstrRuff {

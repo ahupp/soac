@@ -231,11 +231,10 @@ pub(super) fn callable_scope_info(
         Some(BindingKind::Cell(CellBindingKind::Capture))
     ) {
         info.cell_capture_source_names
-            .insert("__class__".to_string(), "__class__".to_string());
+            .entry("__class__".to_string())
+            .or_insert_with(|| "__class__".to_string());
     }
     if callable_owns_synthetic_classcell(func) {
-        info.cell_capture_source_names
-            .insert("__class__".to_string(), "_dp_classcell".to_string());
         info.owned_cell_source_names
             .insert("_dp_classcell".to_string());
         if !info.bindings.contains_key("__class__") {
@@ -246,6 +245,12 @@ pub(super) fn callable_scope_info(
                 false,
                 Some("_dp_classcell".to_string()),
             );
+        } else if matches!(
+            info.bindings.get("__class__"),
+            Some(BindingKind::Cell(CellBindingKind::Owner))
+        ) {
+            info.cell_capture_source_names
+                .insert("__class__".to_string(), "_dp_classcell".to_string());
         }
     }
     info

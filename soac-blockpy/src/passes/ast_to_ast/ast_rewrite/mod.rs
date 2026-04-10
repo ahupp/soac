@@ -162,9 +162,10 @@ impl<'a> RewriteLoop<'a> {
             }
             Stmt::While(while_stmt) => {
                 // In BB mode, `while` is lowered structurally in Ruff AST -> BlockPy.
-                // Keep the raw test expression intact until that phase so any
-                // expression lowering needed for the test is emitted in the loop's
-                // dedicated test block and therefore re-evaluates on each iteration.
+                // Keep control-flow-sensitive test lowering for that phase, but still
+                // let helper-scoped expression rewrites synthesize reusable helper
+                // functions for comprehensions used by the test expression.
+                self.visit_expr(&mut while_stmt.test);
                 self.visit_body(&mut while_stmt.body);
                 self.visit_body(&mut while_stmt.orelse);
             }

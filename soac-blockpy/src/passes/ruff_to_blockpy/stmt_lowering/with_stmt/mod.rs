@@ -103,7 +103,9 @@ try:
     {body:stmt}
 except BaseException:
     {ok_name:id} = False
-    __soac__.contextmanager_exit({exit_name:id}, __soac__.current_exception())
+    {reraise_name:id} = __soac__.contextmanager_exit({exit_name:id}, __soac__.current_exception())
+    if {reraise_name:id} is not None:
+        raise {reraise_name:id}
 finally:
     if {ok_name:id}:
         __soac__.contextmanager_exit({exit_name:id}, None)
@@ -116,6 +118,7 @@ finally:
                 body = lowered_body,
                 exit_name = exit_name.as_str(),
                 ok_name = ok_name.as_str(),
+                reraise_name = reraise_name.as_str(),
                 ctx_cleanup = ctx_cleanup,
             )
         };

@@ -38,7 +38,10 @@ use std::time::Instant;
 use tracing::info;
 
 unsafe extern "C" {
-    fn PyFunction_SetVectorcall(func: *mut ffi::PyFunctionObject, vectorcall: ffi::vectorcallfunc);
+    fn PyFunction_SetVectorcall(
+        func: *mut ffi::PyFunctionObject,
+        vectorcall: Option<ffi::vectorcallfunc>,
+    );
     fn PyFunction_SetSoacMetadata(
         function: *mut ffi::PyObject,
         soac_function_id: u64,
@@ -120,6 +123,13 @@ unsafe extern "C" fn function_owner_type_watcher_callback(
         | PY_FUNCTION_EVENT_MODIFY_DEFAULTS
         | PY_FUNCTION_EVENT_MODIFY_KWDEFAULTS
         | PY_FUNCTION_EVENT_MODIFY_QUALNAME => {
+            if event == PY_FUNCTION_EVENT_MODIFY_CODE {
+                let metadata = unsafe { PyFunction_GetSoacMetadata(func as *mut ffi::PyObject) };
+                if !metadata.is_null() {
+                    let data = unsafe { &mut *(metadata as *mut PyFunctionJitExtra) };
+                    unsafe { PyFunction_SetVectorcall(func, data.previous_vectorcall) };
+                }
+            }
             if event == PY_FUNCTION_EVENT_MODIFY_DEFAULTS
                 || event == PY_FUNCTION_EVENT_MODIFY_KWDEFAULTS
             {
@@ -254,6 +264,7 @@ struct PyFunctionJitExtra {
     compile_session: Arc<CompileSession>,
     module_state: Arc<module_type::SharedModuleState>,
     compiled_vectorcall_entry: Option<jit::VectorcallEntryFn>,
+    previous_vectorcall: Option<ffi::vectorcallfunc>,
 }
 
 impl FunctionEnv {
@@ -511,18 +522,29 @@ unsafe fn collect_function_runtime_objects(
     let mut values = vec![ptr::null_mut(); layout.total_len()].into_boxed_slice();
 
     let defaults = defaults_override.unwrap_or_else(|| unsafe { PyFunction_GetDefaults(callable) });
-    for default_index in 0..layout.positional_default_count() {
-        let value = if defaults.is_null() || ffi::PyTuple_Check(defaults) == 0 {
-            ptr::null_mut()
-        } else if default_index >= unsafe { ffi::PyTuple_GET_SIZE(defaults) } as usize {
+    let default_len = if defaults.is_null() || ffi::PyTuple_Check(defaults) == 0 {
+        0
+    } else {
+        unsafe { ffi::PyTuple_GET_SIZE(defaults) as usize }
+    };
+    let positional_count = layout.positional_default_count();
+    let first_default_slot = positional_count.saturating_sub(default_len);
+    let default_tuple_start = default_len.saturating_sub(positional_count);
+    for default_slot in 0..positional_count {
+        let value = if default_slot < first_default_slot || default_len == 0 {
             ptr::null_mut()
         } else {
-            unsafe { ffi::PyTuple_GetItem(defaults, default_index as ffi::Py_ssize_t) }
+            let tuple_index = default_tuple_start + default_slot - first_default_slot;
+            if tuple_index >= default_len {
+                ptr::null_mut()
+            } else {
+                unsafe { ffi::PyTuple_GetItem(defaults, tuple_index as ffi::Py_ssize_t) }
+            }
         };
         if !value.is_null() {
             unsafe { ffi::Py_INCREF(value) };
         }
-        values[layout.positional_default_slot(default_index)] = value;
+        values[layout.positional_default_slot(default_slot)] = value;
     }
 
     let kwdefaults =
@@ -651,6 +673,7 @@ unsafe fn make_clif_function_data(
         compile_session: module_runtime.compile_session.clone(),
         module_state,
         compiled_vectorcall_entry: None,
+        previous_vectorcall: unsafe { (*(callable as *mut ffi::PyFunctionObject)).vectorcall },
     });
     Ok(Box::into_raw(py_function_extra) as *mut c_void)
 }
@@ -1461,7 +1484,10 @@ unsafe fn ensure_clif_vectorcall_compiled(
         };
         data.compiled_vectorcall_entry = Some(entry);
         let vectorcall_entry: ffi::vectorcallfunc = std::mem::transmute(entry);
-        PyFunction_SetVectorcall(callable as *mut ffi::PyFunctionObject, vectorcall_entry);
+        PyFunction_SetVectorcall(
+            callable as *mut ffi::PyFunctionObject,
+            Some(vectorcall_entry),
+        );
     }
     Ok(())
 }
@@ -1490,6 +1516,56 @@ unsafe fn bound_arg_value_from_owned(
     value: *mut ffi::PyObject,
 ) {
     bound_args[param_index] = value;
+}
+
+unsafe fn function_has_live_positional_default(
+    callable: *mut ffi::PyObject,
+    param_index: usize,
+    positional_param_indices: &[usize],
+) -> bool {
+    let Some(position) = positional_param_indices
+        .iter()
+        .position(|candidate| *candidate == param_index)
+    else {
+        return false;
+    };
+    let defaults = PyFunction_GetDefaults(callable);
+    if defaults.is_null() || ffi::PyTuple_Check(defaults) == 0 {
+        return false;
+    }
+    let default_len = ffi::PyTuple_GET_SIZE(defaults) as usize;
+    if default_len == 0 {
+        return false;
+    }
+    let positional_count = positional_param_indices.len();
+    let first_default_position = positional_count.saturating_sub(default_len);
+    position >= first_default_position
+}
+
+unsafe fn function_has_live_kwonly_default(callable: *mut ffi::PyObject, name: &str) -> bool {
+    let kwdefaults = PyFunction_GetKwDefaults(callable);
+    if kwdefaults.is_null() || ffi::PyDict_Check(kwdefaults) == 0 {
+        return false;
+    }
+    let Ok(name) = CString::new(name) else {
+        return false;
+    };
+    !ffi::PyDict_GetItemString(kwdefaults, name.as_ptr()).is_null()
+}
+
+unsafe fn function_param_has_live_default(
+    callable: *mut ffi::PyObject,
+    param_index: usize,
+    param: &soac_blockpy::block_py::Param,
+    positional_param_indices: &[usize],
+) -> bool {
+    match param.kind {
+        ParamKind::PosOnly | ParamKind::Any => unsafe {
+            function_has_live_positional_default(callable, param_index, positional_param_indices)
+        },
+        ParamKind::KwOnly => unsafe { function_has_live_kwonly_default(callable, &param.name) },
+        ParamKind::VarArg | ParamKind::KwArg => false,
+    }
 }
 
 unsafe fn build_function_bound_args(
@@ -1676,7 +1752,14 @@ unsafe fn build_function_bound_args(
         match param.kind {
             ParamKind::VarArg | ParamKind::KwArg => {}
             _ => {
-                if param.has_default {
+                if unsafe {
+                    function_param_has_live_default(
+                        callable,
+                        param_index,
+                        param,
+                        &positional_param_indices,
+                    )
+                } {
                     assigned[param_index] = true;
                     continue;
                 }
@@ -1956,7 +2039,7 @@ pub unsafe fn register_clif_vectorcall(
             })?;
         data.compiled_vectorcall_entry = Some(entry);
         let vectorcall_entry: ffi::vectorcallfunc = std::mem::transmute(entry);
-        PyFunction_SetVectorcall(func, vectorcall_entry);
+        PyFunction_SetVectorcall(func, Some(vectorcall_entry));
         return Ok(());
     }
     let _watcher = function_owner_type_registry()?;
@@ -2003,7 +2086,7 @@ pub unsafe fn register_clif_vectorcall(
         return Err(());
     }
     let vectorcall_entry: ffi::vectorcallfunc = std::mem::transmute(entry);
-    PyFunction_SetVectorcall(func, vectorcall_entry);
+    PyFunction_SetVectorcall(func, Some(vectorcall_entry));
     Ok(())
 }
 

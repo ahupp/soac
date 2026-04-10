@@ -86,14 +86,16 @@ where
         InstrRuff::ExprSubscript(target) => {
             let meta = target.meta();
             let object_value = lower_target_object_with_setup(*target.value, out, loop_ctx)?;
-            let object_temp = bind_temp(out, context.fresh("assign_obj"), object_value);
+            let object_temp_name = context.fresh("assign_obj");
+            let object_temp = bind_temp(out, object_temp_name.clone(), object_value);
             let index_value =
                 crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
                     *target.slice,
                     out,
                     loop_ctx,
                 )?;
-            let index_temp = bind_temp(out, context.fresh("assign_index"), index_value);
+            let index_temp_name = context.fresh("assign_index");
+            let index_temp = bind_temp(out, index_temp_name.clone(), index_value);
             out.push_stmt(E::set_item(
                 meta.node_index,
                 meta.range,
@@ -101,12 +103,15 @@ where
                 index_temp,
                 rhs,
             ));
+            delete_temp(out, index_temp_name);
+            delete_temp(out, object_temp_name);
             Ok(())
         }
         InstrRuff::ExprAttribute(target) => {
             let meta = target.meta();
             let object_value = lower_target_object_with_setup(*target.value, out, loop_ctx)?;
-            let object_temp = bind_temp(out, context.fresh("assign_obj"), object_value);
+            let object_temp_name = context.fresh("assign_obj");
+            let object_temp = bind_temp(out, object_temp_name.clone(), object_value);
             out.push_stmt(E::set_attr(
                 meta.node_index,
                 meta.range,
@@ -114,6 +119,7 @@ where
                 target.attr.to_string(),
                 rhs,
             ));
+            delete_temp(out, object_temp_name);
             Ok(())
         }
         InstrRuff::ExprName(name) => {
@@ -236,12 +242,17 @@ where
         loop_ctx,
     )?;
 
-    if should_bind_assignment_value(&stmt.targets) {
-        value = bind_temp(out, context.fresh("assign_value"), value);
-    }
+    let value_temp_name = should_bind_assignment_value(&stmt.targets).then(|| {
+        let name = context.fresh("assign_value");
+        value = bind_temp(out, name.clone(), value.clone());
+        name
+    });
 
     for target in stmt.targets.iter().cloned() {
         lower_assignment_target_into(context, target, value.clone(), out, loop_ctx)?;
+    }
+    if let Some(name) = value_temp_name {
+        delete_temp(out, name);
     }
 
     Ok(())

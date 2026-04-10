@@ -14,7 +14,10 @@ struct MethodRewriteSuperClasscell {
 impl Transformer for MethodRewriteSuperClasscell {
     fn visit_stmt(&mut self, stmt: &mut Stmt) {
         match stmt {
-            Stmt::FunctionDef(_) => return,
+            Stmt::FunctionDef(func_def) => {
+                rewrite_method(func_def);
+                return;
+            }
             Stmt::Delete(ast::StmtDelete { targets, .. }) => {
                 if targets.iter().any(|target| {
                     matches!(

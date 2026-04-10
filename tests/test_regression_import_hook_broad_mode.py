@@ -6,6 +6,8 @@ import os
 import subprocess
 import sys
 
+import pytest
+
 from soac import import_hook
 from tests._integration import transformed_module
 
@@ -59,6 +61,443 @@ except RuntimeError as exc:
 def test_transformed_complex_literal_uses_literal_value(tmp_path):
     with transformed_module(tmp_path, "complex_literal", "VALUE = 1j\n") as module:
         assert module.VALUE == 1j
+
+
+def test_transformed_builtin_pow_accepts_mod_argument(tmp_path):
+    with transformed_module(tmp_path, "pow_mod_argument", "VALUE = pow(2, 5, 7)\n") as module:
+        assert module.VALUE == 4
+
+
+def test_transformed_missing_from_import_attribute_raises_import_error(tmp_path):
+    source = """
+try:
+    from math import __soac_missing_attr__
+except ImportError as exc:
+    VALUE = exc.name
+else:
+    VALUE = "imported"
+"""
+
+    with transformed_module(tmp_path, "missing_from_import_attr", source) as module:
+        assert module.VALUE == "math"
+
+
+def test_transformed_package_relative_import_star_binds_submodule_name(
+    monkeypatch, tmp_path
+):
+    package_dir = tmp_path / "relative_star_pkg"
+    package_dir.mkdir()
+    (package_dir / "child.py").write_text(
+        '__all__ = ["EXPORTED"]\nMARKER = "child"\nEXPORTED = 3\n',
+        encoding="utf-8",
+    )
+    (package_dir / "__init__.py").write_text(
+        "from .child import *\nVALUE = child.MARKER\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("SOAC_MODULE_ENABLED", f"path:{package_dir}")
+    import_hook.install()
+    sys.path.insert(0, str(tmp_path))
+    try:
+        module = importlib.import_module("relative_star_pkg")
+        assert isinstance(module.__spec__.loader, import_hook.SoacLoader)
+        assert module.VALUE == "child"
+        assert module.EXPORTED == 3
+    finally:
+        sys.path.remove(str(tmp_path))
+        sys.modules.pop("relative_star_pkg", None)
+        sys.modules.pop("relative_star_pkg.child", None)
+
+
+def test_transformed_function_locals_reflect_recent_assignment(tmp_path):
+    source = """
+def value():
+    optdict = {"verbose": ""}
+    expected_opts = {"verbose": ""}
+    args = []
+    return "%(optdict)s %(expected_opts)s %(args)s" % locals()
+"""
+
+    with transformed_module(tmp_path, "locals_recent_assignment", source) as module:
+        assert module.value() == "{'verbose': ''} {'verbose': ''} []"
+
+
+def test_transformed_eval_uses_current_function_locals(tmp_path):
+    source = """
+def value():
+    left = 3
+    right = 4
+    return eval("left + right")
+"""
+
+    with transformed_module(tmp_path, "eval_current_locals", source) as module:
+        assert module.value() == 7
+
+
+def test_transformed_eval_sees_for_loop_target_local(tmp_path):
+    source = """
+def value():
+    for item in [12]:
+        bad_format_spec = "%M"
+        try:
+            eval("f'xx{item:{bad_format_spec}}yy'")
+        except ValueError as exc:
+            return "Invalid format specifier" in str(exc)
+    return False
+"""
+
+    with transformed_module(tmp_path, "eval_for_loop_target_local", source) as module:
+        assert module.value() is True
+
+
+def test_transformed_nested_coroutine_nonlocal_capture_in_method(tmp_path):
+    source = """
+def build():
+    cancelled = False
+
+    class Test:
+        async def test_leaking_task(self):
+            async def coro():
+                nonlocal cancelled
+                cancelled = True
+
+            await coro()
+
+        def was_cancelled(self):
+            return cancelled
+
+    return Test()
+"""
+
+    with transformed_module(tmp_path, "nested_coroutine_nonlocal_method", source) as module:
+        instance = module.build()
+        coroutine = instance.test_leaking_task()
+        try:
+            coroutine.send(None)
+        except StopIteration as exc:
+            assert exc.value is None
+        else:
+            raise AssertionError("coroutine should finish without suspension")
+        assert instance.was_cancelled() is True
+
+
+def test_transformed_lambda_in_function_decorator_is_lowered(tmp_path):
+    source = """
+def keep(value):
+    def decorator(func):
+        return value
+    return decorator
+
+sentinel = object()
+
+@keep(lambda: sentinel)
+def chosen():
+    return None
+
+VALUE = chosen()
+"""
+
+    with transformed_module(tmp_path, "lambda_function_decorator", source) as module:
+        assert module.VALUE is module.sentinel
+
+
+def test_transformed_coroutine_global_store_updates_module(tmp_path):
+    source = """
+flag = False
+
+async def set_flag():
+    global flag
+    flag = True
+
+def value():
+    coroutine = set_flag()
+    try:
+        coroutine.send(None)
+    except StopIteration as exc:
+        assert exc.value is None
+    else:
+        raise AssertionError("coroutine should finish without suspension")
+    return flag
+"""
+
+    with transformed_module(tmp_path, "coroutine_global_store", source) as module:
+        assert module.value() is True
+        assert module.flag is True
+
+
+def test_transformed_function_uses_updated_positional_defaults(tmp_path):
+    source = """
+def first_func(a, b):
+    return a + b
+
+first_func.__defaults__ = (1, 2)
+VALUE = first_func()
+"""
+
+    with transformed_module(tmp_path, "updated_positional_defaults", source) as module:
+        assert module.VALUE == 3
+
+
+def test_transformed_dict_value_can_use_conditional_expression(tmp_path):
+    source = 'VALUE = {"flags": tuple([1]) if True else None}\n'
+
+    with transformed_module(tmp_path, "dict_conditional_value", source) as module:
+        assert module.VALUE == {"flags": (1,)}
+
+
+def test_transformed_while_condition_can_use_generator_expression(tmp_path):
+    source = """
+class Worker:
+    def is_alive(self):
+        return True
+
+def value():
+    count = 0
+    workers = [Worker()]
+    while count < 1 and all(worker.is_alive() for worker in workers):
+        count += 1
+    return count
+"""
+
+    with transformed_module(tmp_path, "while_generator_condition", source) as module:
+        assert module.value() == 1
+
+
+def test_transformed_nested_class_base_uses_enclosing_function_local(tmp_path):
+    source = """
+def value():
+    class A:
+        pass
+
+    class B:
+        pass
+
+    class C(B):
+        pass
+
+    C.__bases__ = (A,)
+    return C.__bases__[0].__name__
+"""
+
+    with transformed_module(tmp_path, "nested_class_base_local", source) as module:
+        assert module.value() == "A"
+
+
+def test_transformed_nested_class_nonlocal_classcell_keeps_inner_method_classcell(tmp_path):
+    source = """
+class Outer:
+    def value(self):
+        class Inner:
+            nonlocal __class__
+            __class__ = 42
+
+            def cls():
+                return __class__
+
+        outer_classcell_value = __class__
+        return outer_classcell_value, Inner.cls(), Inner
+"""
+
+    with transformed_module(tmp_path, "nested_nonlocal_classcell", source) as module:
+        outer_value, inner_value, inner_cls = module.Outer().value()
+        assert outer_value == 42
+        assert inner_value is inner_cls
+
+
+def test_transformed_nested_class_body_dunder_class_does_not_steal_inner_method_classcell(tmp_path):
+    source = """
+class Host:
+    def value(self):
+        class Inner:
+            outer = __class__
+
+            def cls():
+                return __class__
+
+        return Inner.outer, Inner.cls(), Inner
+"""
+
+    with transformed_module(tmp_path, "nested_class_body_dunder_class", source) as module:
+        outer_value, inner_value, inner_cls = module.Host().value()
+        assert outer_value is module.Host
+        assert inner_value is inner_cls
+
+
+def test_transformed_class_body_dunder_class_assignment_does_not_leak_method_classcell(tmp_path):
+    source = """
+class Base:
+    def marker(self):
+        return "base"
+
+class Host:
+    def value(self):
+        class First(Base):
+            def marker(self):
+                return super().marker()
+
+            __class__ = 413
+
+        class Second:
+            outer = __class__
+
+            def cls():
+                return __class__
+
+        return First().marker(), First().__class__, Second.outer, Second.cls(), Second
+"""
+
+    with transformed_module(tmp_path, "class_body_dunder_class_assignment", source) as module:
+        first_marker, first_class_attr, second_outer, second_value, second_cls = (
+            module.Host().value()
+        )
+        assert first_marker == "base"
+        assert first_class_attr == 413
+        assert second_outer is module.Host
+        assert second_value is second_cls
+
+
+def test_transformed_class_body_dunder_class_assignment_keeps_method_super_classcell(tmp_path):
+    source = """
+class Base:
+    def marker(self):
+        return "base"
+
+def value():
+    class Derived(Base):
+        def marker(self):
+            return super().marker()
+
+        __class__ = 413
+
+    instance = Derived()
+    return instance.marker(), instance.__class__
+"""
+
+    with transformed_module(tmp_path, "assigned_dunder_class_method_super", source) as module:
+        assert module.value() == ("base", 413)
+
+
+def test_transformed_nested_method_super_class_attr_does_not_require_outer_classcell_capture(tmp_path):
+    source = """
+class Host:
+    def value(self):
+        class Inner:
+            def method(self):
+                return super().__class__
+
+        return Inner().method()
+"""
+
+    with transformed_module(tmp_path, "nested_method_super_class_attr", source) as module:
+        assert module.Host().value() is super
+
+
+def test_transformed_init_subclass_for_loop_uses_iterator(tmp_path):
+    source = """
+class Base:
+    def __init_subclass__(cls, /, **kwargs):
+        cls.SEEN = []
+        for item in cls.__mro__:
+            cls.SEEN.append(item.__name__)
+
+class Child(Base):
+    pass
+"""
+
+    with transformed_module(tmp_path, "init_subclass_for_loop", source) as module:
+        assert module.Child.SEEN[:2] == ["Child", "Base"]
+
+
+def test_transformed_classcell_missing_raises_runtime_error(tmp_path):
+    source = """
+def value():
+    class Meta(type):
+        def __new__(cls, name, bases, namespace):
+            namespace.pop("__classcell__", None)
+            return super().__new__(cls, name, bases, namespace)
+
+    class WithClassRef(metaclass=Meta):
+        def f(self):
+            return __class__
+"""
+
+    with transformed_module(tmp_path, "classcell_missing", source) as module:
+        with pytest.raises(RuntimeError, match="__class__ not set.*__classcell__ propagated"):
+            module.value()
+
+
+def test_transformed_classcell_wrong_cell_raises_type_error(tmp_path):
+    source = """
+def value():
+    class Meta(type):
+        def __new__(cls, name, bases, namespace):
+            cls = super().__new__(cls, name, bases, namespace)
+            type("Other", (), namespace)
+            return cls
+
+    class WithClassRef(metaclass=Meta):
+        def f(self):
+            return __class__
+"""
+
+    with transformed_module(tmp_path, "classcell_wrong_cell", source) as module:
+        with pytest.raises(TypeError):
+            module.value()
+
+
+def test_transformed_zero_arg_super_uses_dynamic_global_super(tmp_path):
+    source = """
+class MySuper:
+    msg = "super super"
+
+class C:
+    def method(self):
+        return super().msg
+
+def value():
+    global super
+    previous = super
+    super = MySuper
+    try:
+        return C().method()
+    finally:
+        super = previous
+"""
+
+    with transformed_module(tmp_path, "dynamic_global_super", source) as module:
+        assert module.value() == "super super"
+
+
+def test_transformed_nested_zero_arg_super_without_self_reports_no_arguments(tmp_path):
+    source = """
+class Host:
+    def value(self):
+        def nested():
+            super()
+
+        nested()
+"""
+
+    with transformed_module(tmp_path, "nested_zero_arg_super_no_args", source) as module:
+        with pytest.raises(RuntimeError, match="no arguments"):
+            module.Host().value()
+
+
+def test_transformed_deleted_super_first_arg_reports_arg_deleted(tmp_path):
+    source = """
+class Host:
+    def value(self):
+        def nested(x):
+            del x
+            super()
+
+        nested(self)
+"""
+
+    with transformed_module(tmp_path, "deleted_super_first_arg", source) as module:
+        with pytest.raises(RuntimeError, match=r"arg\[0\] deleted"):
+            module.Host().value()
 
 
 def test_import_hook_does_not_transform_reload_of_existing_plain_module(monkeypatch):
@@ -146,6 +585,38 @@ assert templatelib.convert("value", "s") == "value"
         check=False,
         capture_output=True,
         env={**env, "SOAC_WORK_DIR": str(tmp_path / "stdlib-edge-counters")},
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_import_hook_can_transform_shutil_rmtree_in_fresh_process(tmp_path):
+    target = tmp_path / "to-remove"
+    script = f"""
+import os
+
+root = {str(target)!r}
+os.makedirs(os.path.join(root, "child"))
+with open(os.path.join(root, "child", "marker.txt"), "w", encoding="utf-8") as file:
+    file.write("marker")
+
+from soac import import_hook
+
+import_hook.install()
+import shutil
+
+assert isinstance(shutil.__spec__.loader, import_hook.SoacLoader)
+shutil.rmtree(root)
+assert not os.path.exists(root)
+"""
+    env = os.environ.copy()
+    env.pop("SOAC_MODULE_ENABLED", None)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        env={**env, "SOAC_WORK_DIR": str(tmp_path / "rmtree-counters")},
         text=True,
     )
 
@@ -339,6 +810,160 @@ def f():
         assert module.f() == "expected str, bytes or os.PathLike object, not NoneType"
 
 
+def test_transformed_generator_contextmanager_with_body_reraises_thrown_exception(tmp_path):
+    source = """
+from contextlib import contextmanager
+
+class Manager:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+@contextmanager
+def manager():
+    with Manager():
+        yield
+
+class MarkerError(Exception):
+    pass
+
+def check_exit():
+    cm = manager()
+    cm.__enter__()
+    try:
+        raise MarkerError("boom")
+    except MarkerError as exc:
+        return cm.__exit__(type(exc), exc, exc.__traceback__)
+"""
+
+    with transformed_module(
+        tmp_path, "generator_contextmanager_with_body_reraise", source
+    ) as module:
+        assert module.check_exit() is False
+
+
+def test_transformed_subinterpreter_shared_surrogate_key_raises(tmp_path):
+    source = r"""
+import _interpreters
+
+interp = _interpreters.create()
+try:
+    try:
+        _interpreters.run_string(interp, "a", shared={"\uD82A": 0})
+    except UnicodeEncodeError as exc:
+        VALUE = "surrogates not allowed" in str(exc)
+    else:
+        VALUE = False
+finally:
+    _interpreters.destroy(interp)
+"""
+
+    with transformed_module(
+        tmp_path, "subinterpreter_shared_surrogate_key", source
+    ) as module:
+        assert module.VALUE is True
+
+
+def test_transformed_attribute_assignment_temps_do_not_keep_cycle_alive(tmp_path):
+    source = """
+import ast
+import gc
+import weakref
+
+def value():
+    class X:
+        pass
+    a = ast.AST()
+    a.x = X()
+    a.x.a = a
+    ref = weakref.ref(a.x)
+    del a
+    gc.collect()
+    return ref()
+"""
+
+    with transformed_module(tmp_path, "assignment_temp_gc_cycle", source) as module:
+        assert module.value() is None
+
+
+def test_transformed_except_body_exception_keeps_implicit_context(tmp_path):
+    source = r"""
+import ast
+import unittest
+
+def value():
+    case = unittest.TestCase()
+    try:
+        1 / 0
+    except Exception:
+        with case.assertRaises(SyntaxError) as caught:
+            ast.literal_eval(r"'\U'")
+        return type(caught.exception.__context__).__name__
+    return "missing"
+"""
+
+    with transformed_module(tmp_path, "except_body_implicit_context", source) as module:
+        assert module.value() == "ZeroDivisionError"
+
+
+def test_transformed_try_finally_preserves_callers_handled_exception(tmp_path):
+    source = """
+import sys
+
+def inner():
+    try:
+        pass
+    finally:
+        marker = 1
+    return marker
+
+def value():
+    try:
+        1 / 0
+    except Exception:
+        before = type(sys.exception()).__name__
+        inner()
+        after = sys.exception()
+        return before, type(after).__name__ if after is not None else None
+"""
+
+    with transformed_module(tmp_path, "try_finally_keeps_handled_exception", source) as module:
+        assert module.value() == ("ZeroDivisionError", "ZeroDivisionError")
+
+
+def test_import_hook_broad_assert_raises_keeps_implicit_exception_context(tmp_path):
+    script = r"""
+from soac import import_hook
+
+import_hook.install()
+
+import ast
+import unittest
+
+case = unittest.TestCase()
+try:
+    1 / 0
+except Exception:
+    with case.assertRaises(SyntaxError) as caught:
+        ast.literal_eval(r"'\U'")
+    assert caught.exception.__context__ is not None
+    assert type(caught.exception.__context__).__name__ == "ZeroDivisionError"
+"""
+    env = os.environ.copy()
+    env.pop("SOAC_MODULE_ENABLED", None)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        env={**env, "SOAC_WORK_DIR": str(tmp_path / "assert-raises-context")},
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_transformed_nested_closure_sees_rebound_argument(tmp_path):
     source = """
 def f(value=None):
@@ -352,3 +977,177 @@ def f(value=None):
 
     with transformed_module(tmp_path, "nested_closure_rebound_argument", source) as module:
         assert module.f() == ("updated", "updated")
+
+
+def test_transformed_function_uses_replaced_code_object(tmp_path):
+    source = """
+def replacement():
+    return 3
+
+def target():
+    pass
+
+target.__code__ = replacement.__code__
+VALUE = target()
+"""
+
+    with transformed_module(tmp_path, "function_replaced_code", source) as module:
+        assert module.VALUE == 3
+
+
+def test_transformed_function_dict_starts_empty(tmp_path):
+    source = """
+def value():
+    pass
+
+VALUE = value.__dict__
+"""
+
+    with transformed_module(tmp_path, "function_dict_empty", source) as module:
+        assert module.VALUE == {}
+
+
+def test_transformed_generic_function_exposes_type_params(tmp_path):
+    source = """
+import typing
+
+def generic[T]():
+    pass
+
+T, = generic.__type_params__
+VALUE = isinstance(T, typing.TypeVar), generic.__type_params__
+"""
+
+    with transformed_module(tmp_path, "generic_function_type_params", source) as module:
+        is_type_var, type_params = module.VALUE
+        assert is_type_var is True
+        assert type_params == (type_params[0],)
+
+
+def test_transformed_empty_closure_cell_raises_value_error(tmp_path):
+    source = """
+def value():
+    def f():
+        return a
+
+    try:
+        f.__closure__[0].cell_contents
+    except ValueError:
+        return "empty"
+    else:
+        return "filled"
+
+    a = 12
+"""
+
+    with transformed_module(tmp_path, "empty_closure_cell", source) as module:
+        assert module.value() == "empty"
+
+
+def test_transformed_owned_cell_survives_jump_to_cell_backed_condition(tmp_path):
+    source = """
+def outer(reason):
+    def decorator(test_item):
+        return reason
+
+    if isinstance(reason, int):
+        return decorator(reason)
+    return decorator
+
+VALUE = outer("why")(object)
+"""
+
+    with transformed_module(tmp_path, "owned_cell_condition", source) as module:
+        assert module.VALUE == "why"
+
+
+def test_transformed_empty_cell_comparison_matches_cpython(tmp_path):
+    source = """
+def cell(value):
+    def f():
+        return a
+
+    a = value
+    return f.__closure__[0]
+
+def empty_cell():
+    def f():
+        return a
+
+    if False:
+        a = 1729
+    return f.__closure__[0]
+
+VALUE = empty_cell() < cell("saturday")
+"""
+
+    with transformed_module(tmp_path, "empty_cell_comparison", source) as module:
+        assert module.VALUE is True
+
+
+def test_transformed_mutating_closure_cell_updates_function_and_outer(tmp_path):
+    source = """
+def value():
+    a = 12
+
+    def f():
+        return a
+
+    c = f.__closure__
+    c[0].cell_contents = 9
+    return c[0].cell_contents, f(), a
+"""
+
+    with transformed_module(tmp_path, "mutating_closure_cell", source) as module:
+        assert module.value() == (9, 9, 9)
+
+
+def test_transformed_deleted_closure_cell_raises_name_errors(tmp_path):
+    source = """
+def value():
+    a = 12
+
+    def f():
+        return a
+
+    cell = f.__closure__[0]
+    del cell.cell_contents
+
+    try:
+        f()
+    except NameError:
+        inner = True
+    else:
+        inner = False
+
+    try:
+        a
+    except UnboundLocalError:
+        outer = True
+    else:
+        outer = False
+
+    return inner, outer
+"""
+
+    with transformed_module(tmp_path, "deleted_closure_cell", source) as module:
+        assert module.value() == (True, True)
+
+
+def test_transformed_method_local_class_base_does_not_leak_to_outer_class(tmp_path):
+    source = """
+class Container:
+    def method(self):
+        class RawBase:
+            pass
+
+        class Derived(RawBase):
+            pass
+
+        return Derived.__mro__[1] is RawBase
+
+VALUE = Container().method()
+"""
+
+    with transformed_module(tmp_path, "method_local_class_base", source) as module:
+        assert module.VALUE is True

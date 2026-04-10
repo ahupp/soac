@@ -5,13 +5,16 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SET_GLOB="${CPYTHON_TEST_SETS_GLOB:-$REPO_ROOT/test_sets/*.txt}"
 TEMPDIR_PATH="${CPYTHON_TEST_TEMPDIR:-/tmp/diet-python-cpython-tests}"
 LOG_DIR="${CPYTHON_TEST_LOG_DIR:-$REPO_ROOT/logs}"
+TEST_TIMEOUT_SECONDS=60
 
 usage() {
   cat <<'USAGE'
 Usage: ./scripts/run_cpython_test_sets.sh [--tempdir <path>]
 
 Runs each test set file in test_sets/ sequentially (part_01 -> part_10).
-The wrapper forces single-process regrtest execution via `--single-process`.
+The wrapper forces single-process regrtest execution via `--single-process`
+and uses a 60 second per-test timeout so hangs are reported and the run can
+continue to later tests.
 USAGE
 }
 
@@ -45,7 +48,7 @@ pkill -f "test.libregrtest.worker" >/dev/null 2>&1 || true
 
 SUMMARY_LOG="$LOG_DIR/cpython_jit_test_sets_summary.log"
 : > "$SUMMARY_LOG"
-echo "jit=1 tempdir=$TEMPDIR_PATH jobs=1 single_process=1" | tee -a "$SUMMARY_LOG"
+echo "jit=1 tempdir=$TEMPDIR_PATH jobs=1 single_process=1 timeout_s=$TEST_TIMEOUT_SECONDS" | tee -a "$SUMMARY_LOG"
 
 failed=0
 shopt -s nullglob
@@ -74,6 +77,7 @@ for set_file in "${set_files[@]}"; do
   set +e
   just run-cpython-tests 1 \
     --single-process \
+    --timeout "$TEST_TIMEOUT_SECONDS" \
     --tempdir "$TEMPDIR_PATH" \
     "${test_names[@]}" \
     2>&1 | tee "$set_log"

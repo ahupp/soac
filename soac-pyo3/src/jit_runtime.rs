@@ -666,62 +666,6 @@ fn split_param_defaults<'py>(
     Ok((positional_defaults, kwdefaults))
 }
 
-fn inspect_param_kind<'py>(
-    inspect_module: &Bound<'py, PyModule>,
-    kind: ParamKind,
-) -> PyResult<Bound<'py, PyAny>> {
-    let parameter = inspect_module.getattr("Parameter")?;
-    match kind {
-        ParamKind::PosOnly => parameter.getattr("POSITIONAL_ONLY"),
-        ParamKind::Any => parameter.getattr("POSITIONAL_OR_KEYWORD"),
-        ParamKind::VarArg => parameter.getattr("VAR_POSITIONAL"),
-        ParamKind::KwOnly => parameter.getattr("KEYWORD_ONLY"),
-        ParamKind::KwArg => parameter.getattr("VAR_KEYWORD"),
-    }
-}
-
-fn build_bb_signature<'py>(
-    py: Python<'py>,
-    function: &BlockPyFunction<CodegenModuleShape>,
-    param_defaults: &Bound<'py, PyAny>,
-) -> PyResult<Py<PyAny>> {
-    let inspect_module = PyModule::import(py, "inspect")?;
-    let parameter = inspect_module.getattr("Parameter")?;
-    let signature = inspect_module.getattr("Signature")?;
-    let empty_default = inspect_module.getattr("_empty")?;
-    let defaults = param_defaults.cast::<PyTuple>().map_err(|_| {
-        PyTypeError::new_err(format!(
-            "bb param defaults must be a tuple, got {:?}",
-            param_defaults.get_type()
-        ))
-    })?;
-    let mut default_index = 0usize;
-    let mut signature_params = Vec::with_capacity(function.params.params.len());
-    for param in &function.params.params {
-        let kind = inspect_param_kind(&inspect_module, param.kind)?;
-        let kwargs = PyDict::new(py);
-        kwargs.set_item("name", param.name.as_str())?;
-        kwargs.set_item("kind", &kind)?;
-        if param.has_default {
-            let value = defaults.get_item(default_index).map_err(|_| {
-                PyRuntimeError::new_err("bb param defaults payload is shorter than the param spec")
-            })?;
-            default_index += 1;
-            kwargs.set_item("default", &value)?;
-        } else {
-            kwargs.set_item("default", &empty_default)?;
-        }
-        signature_params.push(parameter.call((), Some(&kwargs))?.unbind());
-    }
-    if default_index != defaults.len() {
-        return Err(PyRuntimeError::new_err(
-            "bb param defaults payload is longer than the param spec",
-        ));
-    }
-    let signature_obj = signature.call1((tuple_from_owned_objects(py, signature_params)?,))?;
-    Ok(signature_obj.unbind())
-}
-
 fn build_closure_shaped_entry<'py>(
     py: Python<'py>,
     dp: &Bound<'py, PyModule>,
@@ -734,22 +678,35 @@ fn build_closure_shaped_entry<'py>(
 ) -> PyResult<Bound<'py, PyAny>> {
     debug_assert!(!captured_names.is_empty());
     let generated_code;
-    let code = match original_code {
-        Some(code) => code.clone(),
-        None => {
-            let (is_async, is_generator) = match function.lowered_kind() {
-                FunctionKind::Function => (false, false),
-                FunctionKind::Coroutine => (true, false),
-                FunctionKind::Generator => (false, true),
-                FunctionKind::AsyncGenerator => (true, true),
-            };
-            generated_code = dp.getattr("code_with_freevars")?.call1((
-                PyTuple::new(py, captured_names)?,
-                is_async,
-                is_generator,
-            ))?;
-            generated_code
+    let original_code_matches_captures = match original_code {
+        Some(code) => {
+            let freevars = code
+                .getattr("co_freevars")?
+                .cast_into::<PyTuple>()?
+                .iter()
+                .map(|name| name.extract::<String>())
+                .collect::<PyResult<Vec<_>>>()?;
+            freevars == captured_names
         }
+        None => false,
+    };
+    let code = if original_code_matches_captures {
+        original_code
+            .expect("original code should exist after matching captured names")
+            .clone()
+    } else {
+        let (is_async, is_generator) = match function.lowered_kind() {
+            FunctionKind::Function => (false, false),
+            FunctionKind::Coroutine => (true, false),
+            FunctionKind::Generator => (false, true),
+            FunctionKind::AsyncGenerator => (true, true),
+        };
+        generated_code = dp.getattr("code_with_freevars")?.call1((
+            PyTuple::new(py, captured_names)?,
+            is_async,
+            is_generator,
+        ))?;
+        generated_code
     };
     let freevars_obj = code.getattr("co_freevars")?;
     let freevars = freevars_obj.cast::<PyTuple>()?;
@@ -824,7 +781,11 @@ fn instantiate_bb_function(
     annotate_fn: &Bound<'_, PyAny>,
     module_runtime: &soac_jit::ModuleRuntimeContext,
 ) -> PyResult<Py<PyAny>> {
-    let signature = build_bb_signature(py, function, param_defaults)?;
+    let keep_source_runtime_helper = module_name == "soac.runtime"
+        && module_runtime
+            .shared_module_state_owner
+            .lookup_original_code(function.function_id)
+            .is_some();
     let entry = instantiate_closure_backed_entry(
         py,
         dp,
@@ -843,7 +804,6 @@ fn instantiate_bb_function(
         positional_defaults.as_ref(),
         kwdefaults.as_ref(),
     )?;
-    entry.setattr("__signature__", signature.bind(py))?;
     update_function_metadata(
         py,
         &entry,
@@ -853,13 +813,19 @@ fn instantiate_bb_function(
         annotate_fn,
     )?;
     entry.setattr("__module__", module_name)?;
+    // soac.runtime's source helpers are the runtime ABI for other transformed
+    // modules. Keep them on their source implementation so calls from generated
+    // code do not switch onto the runtime module's function environment.
+    if !keep_source_runtime_helper {
+        register_jit_vectorcall(py, &entry, function.function_id, module_runtime)?;
+    }
     Ok(entry.unbind())
 }
 
 fn instantiate_closure_backed_entry<'py>(
     py: Python<'py>,
     dp: &Bound<'py, PyModule>,
-    module_name: &str,
+    _module_name: &str,
     function: &BlockPyFunction<CodegenModuleShape>,
     captures: &Bound<'py, PyAny>,
     module_globals: &Bound<'py, PyAny>,
@@ -873,12 +839,20 @@ fn instantiate_closure_backed_entry<'py>(
         .lookup_original_code(function.function_id)
         .map(|code| code.bind(py));
     let entry = if captured_names.is_empty() {
+        let original_code_without_freevars = match original_code.as_ref() {
+            Some(code) => {
+                let freevars_obj = code.getattr("co_freevars")?;
+                let freevars = freevars_obj.cast::<PyTuple>()?;
+                freevars.is_empty().then_some(code.as_any())
+            }
+            None => None,
+        };
         make_lazy_clif_entry(
             py,
             dp,
             entry_name,
             module_globals,
-            original_code.as_ref().map(|code| code.as_any()),
+            original_code_without_freevars,
         )?
     } else {
         build_closure_shaped_entry(
@@ -892,12 +866,6 @@ fn instantiate_closure_backed_entry<'py>(
             original_code.as_ref().map(|code| code.as_any()),
         )?
     };
-    // soac.runtime's source helpers are the runtime ABI for other transformed
-    // modules. Keep them on their source implementation so calls from generated
-    // code do not switch onto the runtime module's function environment.
-    if !(module_name == "soac.runtime" && original_code.is_some()) {
-        register_jit_vectorcall(py, &entry, function.function_id, module_runtime)?;
-    }
     Ok(entry)
 }
 

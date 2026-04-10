@@ -4,7 +4,8 @@ pub use self::meta::{
 pub use self::param_specs::{Param, ParamDefaultSource, ParamKind, ParamSpec};
 pub(crate) use self::scope::{
     build_storage_layout_from_capture_names, compute_make_function_capture_bindings_from_scope,
-    compute_storage_layout_from_scope, derive_effective_binding_for_name, ScopeExprNode,
+    compute_storage_layout_from_scope, derive_effective_binding_for_name, is_runtime_closure_name,
+    ScopeExprNode,
 };
 pub use self::scope::{
     BindingKind, BindingPurpose, BindingTarget, CallableScopeInfo, CallableScopeKind,

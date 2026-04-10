@@ -656,8 +656,20 @@ fn emit_specialized_setattr<'fb>(
 
 fn emit_make_cell<'fb, E>(state: &mut impl OperationEmitState<'fb, E>, args: &[&E]) -> ir::Value {
     let arg_values = state.emit_arg_values(&args);
+    let ptr_ty = state.ctx().consts.ptr_ty;
+    let deleted_const = state.ctx().consts.deleted_const;
+    let null_ptr = state.fb().ins().iconst(ptr_ty, 0);
+    let is_deleted =
+        state
+            .fb()
+            .ins()
+            .icmp(ir::condcodes::IntCC::Equal, arg_values[0].0, deleted_const);
+    let cell_initial_value = state
+        .fb()
+        .ins()
+        .select(is_deleted, null_ptr, arg_values[0].0);
     let make_cell_ref = state.ctx().make_cell_ref;
-    let call_inst = state.fb().ins().call(make_cell_ref, &[arg_values[0].0]);
+    let call_inst = state.fb().ins().call(make_cell_ref, &[cell_initial_value]);
     state.release_arg_values(&arg_values);
     let result = state.fb().inst_results(call_inst)[0];
     state.finish_owned_result(result)

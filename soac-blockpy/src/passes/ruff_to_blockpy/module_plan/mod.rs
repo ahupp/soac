@@ -5,6 +5,7 @@ use crate::block_py::{
 };
 use crate::passes::ast_to_ast::body::{split_docstring, Suite};
 use crate::passes::ast_to_ast::context::Context;
+use crate::passes::ast_to_ast::rewrite_class_def::make_type_param_info;
 use crate::passes::ast_to_ast::rewrite_stmt;
 use crate::passes::ast_to_ast::rewrite_stmt::annotation::FUNCTION_ANNOTATE_PREFIX;
 use crate::passes::ast_to_ast::semantic::{SemanticAstState, SemanticScope};
@@ -195,23 +196,64 @@ fn rewrite_function_def_stmt_via_blockpy_with_pass<P: ModuleShape>(
         annotate_fn_expr,
         lowered_plan.kind,
     );
-    let binding_stmt = vec![py_stmt!(
+    let mut instantiation_stmts = Vec::new();
+    let type_param_info = func
+        .type_params
+        .as_ref()
+        .map(|type_params| make_type_param_info((**type_params).clone()));
+    if let Some(type_param_info) = &type_param_info {
+        instantiation_stmts.extend(type_param_info.bindings.clone());
+    }
+    instantiation_stmts.push(py_stmt!(
         "{name:id} = {value:expr}",
         name = bind_name.as_str(),
         value = decorated
-    )];
+    ));
+    if let Some(type_param_info) = type_param_info {
+        if let Some(type_params_tuple) = type_param_info.type_params_tuple {
+            instantiation_stmts.push(py_stmt!(
+                "{name:id}.__type_params__ = {value:expr}",
+                name = bind_name.as_str(),
+                value = type_params_tuple
+            ));
+        }
+        for type_param_name in type_param_info.param_names {
+            instantiation_stmts.push(py_stmt!("del {name:id}", name = type_param_name.as_str()));
+        }
+    }
     callable_defs.push(lowered_plan);
     if bind_name.starts_with("_dp_class_ns_") || bind_name.starts_with("_dp_define_class_") {
         let mut replacement = function_hoisted;
-        replacement.extend(binding_stmt);
+        replacement.extend(instantiation_stmts);
         replacement
     } else {
         parent_hoisted.extend(function_hoisted);
-        binding_stmt
+        instantiation_stmts
     }
 }
 
 impl<P: ModuleShape> BlockPyModuleRewriter<'_, P> {
+    fn visit_function_definition_exprs(&mut self, func: &mut ast::StmtFunctionDef) {
+        for decorator in &mut func.decorator_list {
+            self.visit_expr(&mut decorator.expression);
+        }
+        for param in &mut func.parameters.posonlyargs {
+            if let Some(default) = &mut param.default {
+                self.visit_expr(default);
+            }
+        }
+        for param in &mut func.parameters.args {
+            if let Some(default) = &mut param.default {
+                self.visit_expr(default);
+            }
+        }
+        for param in &mut func.parameters.kwonlyargs {
+            if let Some(default) = &mut param.default {
+                self.visit_expr(default);
+            }
+        }
+    }
+
     fn lower_lambda_expr(&mut self, lambda: &mut ast::ExprLambda) -> Expr {
         let lambda_scope = self
             .semantic_state
@@ -426,6 +468,7 @@ impl<P: ModuleShape> Transformer for BlockPyModuleRewriter<'_, P> {
                     self.lower_pending_annotation_helper(func, target_name);
                     continue;
                 }
+                self.visit_function_definition_exprs(func);
                 let state = self.walk_function_def_with_scope(func);
                 let replacement = self.rewrite_visited_function_def(func, state);
                 rewritten.extend(replacement);

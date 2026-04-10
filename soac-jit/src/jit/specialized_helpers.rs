@@ -810,8 +810,10 @@ unsafe extern "C" fn load_cell_hook(cell: ObjPtr) -> ObjPtr {
         return ptr::null_mut();
     }
     let value = PyCell_Get(cell as *mut ffi::PyObject);
-    if value.is_null() && ffi::PyErr_ExceptionMatches(ffi::PyExc_ValueError) != 0 {
-        ffi::PyErr_Clear();
+    if value.is_null() {
+        if ffi::PyErr_ExceptionMatches(ffi::PyExc_ValueError) != 0 {
+            ffi::PyErr_Clear();
+        }
         ffi::PyErr_SetString(
             ffi::PyExc_UnboundLocalError,
             b"local variable referenced before assignment\0".as_ptr() as *const i8,
@@ -921,6 +923,27 @@ unsafe extern "C" fn tuple_set_item_hook(tuple_obj: ObjPtr, index: i64, value: O
 }
 
 #[cfg(not(test))]
+unsafe extern "C" fn dict_new_hook() -> ObjPtr {
+    ffi::PyDict_New() as ObjPtr
+}
+
+#[cfg(not(test))]
+unsafe extern "C" fn dict_set_item_hook(dict_obj: ObjPtr, key: ObjPtr, value: ObjPtr) -> i32 {
+    if dict_obj.is_null() || key.is_null() || value.is_null() {
+        ffi::PyErr_SetString(
+            ffi::PyExc_RuntimeError,
+            b"invalid dict_set_item arguments in JIT\0".as_ptr() as *const i8,
+        );
+        return -1;
+    }
+    ffi::PyDict_SetItem(
+        dict_obj as *mut ffi::PyObject,
+        key as *mut ffi::PyObject,
+        value as *mut ffi::PyObject,
+    )
+}
+
+#[cfg(not(test))]
 unsafe extern "C" fn is_true_hook(value: ObjPtr) -> i32 {
     if value.is_null() {
         ffi::PyErr_SetString(
@@ -948,6 +971,43 @@ unsafe extern "C" fn raise_from_exc_hook(exc: ObjPtr) -> i32 {
 }
 
 #[cfg(not(test))]
+unsafe fn attach_implicit_exception_context(exc: *mut ffi::PyObject, previous: *mut ffi::PyObject) {
+    if previous.is_null() || ptr::eq(exc, previous) {
+        return;
+    }
+
+    let suppress = ffi::PyObject_GetAttrString(exc, c"__suppress_context__".as_ptr());
+    if suppress.is_null() {
+        ffi::PyErr_Clear();
+    } else {
+        let is_suppressed = ffi::PyObject_IsTrue(suppress);
+        ffi::Py_DECREF(suppress);
+        if is_suppressed > 0 {
+            return;
+        }
+        if is_suppressed < 0 {
+            ffi::PyErr_Clear();
+            return;
+        }
+    }
+
+    let context = ffi::PyObject_GetAttrString(exc, c"__context__".as_ptr());
+    if context.is_null() {
+        ffi::PyErr_Clear();
+        return;
+    }
+    let has_context = !ptr::eq(context, ffi::Py_None());
+    ffi::Py_DECREF(context);
+    if has_context {
+        return;
+    }
+
+    if ffi::PyObject_SetAttrString(exc, c"__context__".as_ptr(), previous) != 0 {
+        ffi::PyErr_Clear();
+    }
+}
+
+#[cfg(not(test))]
 unsafe extern "C" fn push_handled_exception_hook(exc: ObjPtr) -> ObjPtr {
     if exc.is_null() {
         ffi::PyErr_SetString(
@@ -957,6 +1017,7 @@ unsafe extern "C" fn push_handled_exception_hook(exc: ObjPtr) -> ObjPtr {
         return ptr::null_mut();
     }
     let previous = PyErr_GetHandledException();
+    attach_implicit_exception_context(exc as *mut ffi::PyObject, previous);
     PyErr_SetHandledException(exc as *mut ffi::PyObject);
     previous as ObjPtr
 }
@@ -1111,6 +1172,8 @@ mod test_only_export_stubs {
     panic_obj_export!(dp_jit_del_deref_quietly(cell: ObjPtr));
     panic_obj_export!(dp_jit_tuple_new(size: i64));
     panic_i32_export!(dp_jit_tuple_set_item(tuple_obj: ObjPtr, index: i64, item: ObjPtr));
+    panic_obj_export!(dp_jit_dict_new());
+    panic_i32_export!(dp_jit_dict_set_item(dict_obj: ObjPtr, key: ObjPtr, value: ObjPtr));
     panic_i32_export!(dp_jit_is_true(value: ObjPtr));
     panic_dual_obj_export!(dp_jit_exact_long_binary_op, dp_jit_exact_long_binary_op_with_frame(
         kind: i64,
@@ -1382,6 +1445,16 @@ pub unsafe extern "C" fn dp_jit_tuple_new(size: i64) -> ObjPtr {
 #[cfg(not(test))]
 pub unsafe extern "C" fn dp_jit_tuple_set_item(tuple_obj: ObjPtr, index: i64, item: ObjPtr) -> i32 {
     tuple_set_item_hook(tuple_obj, index, item)
+}
+
+#[cfg(not(test))]
+pub unsafe extern "C" fn dp_jit_dict_new() -> ObjPtr {
+    dict_new_hook()
+}
+
+#[cfg(not(test))]
+pub unsafe extern "C" fn dp_jit_dict_set_item(dict_obj: ObjPtr, key: ObjPtr, value: ObjPtr) -> i32 {
+    dict_set_item_hook(dict_obj, key, value)
 }
 
 #[cfg(not(test))]
@@ -2036,6 +2109,8 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
     );
     builder.symbol("dp_jit_tuple_new", dp_jit_tuple_new as *const u8);
     builder.symbol("dp_jit_tuple_set_item", dp_jit_tuple_set_item as *const u8);
+    builder.symbol("dp_jit_dict_new", dp_jit_dict_new as *const u8);
+    builder.symbol("dp_jit_dict_set_item", dp_jit_dict_set_item as *const u8);
     builder.symbol("dp_jit_is_true", dp_jit_is_true as *const u8);
     builder.symbol(
         "dp_jit_raise_from_exc",

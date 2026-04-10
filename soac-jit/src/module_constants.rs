@@ -434,6 +434,7 @@ _PYTHON_KEYWORDS = frozenset((
     'in', 'is', 'lambda', 'nonlocal', 'not', 'or', 'pass', 'raise',
     'return', 'try', 'while', 'with', 'yield',
 ))
+_MISSING = object()
 
 def code_with_freevars(names, is_async, is_generator):
     names = tuple(names)
@@ -516,7 +517,17 @@ def create_class(
         ns.pop('__classcell__', None)
         if class_cell is not None:
             if isinstance(class_cell, _types.CellType):
-                class_cell.cell_contents = cls
+                try:
+                    class_cell_value = class_cell.cell_contents
+                except ValueError:
+                    raise RuntimeError(
+                        f'__class__ not set defining {name!r}; '
+                        '__classcell__ propagated to type.__new__?'
+                    )
+                if class_cell_value is not cls:
+                    raise TypeError(
+                        f'__class__ set to {class_cell_value!r} defining {name!r} as {cls!r}'
+                    )
             else:
                 raise TypeError('__classcell__ must be a cell')
         _soac_ext.profile_watch_type_key_layout(cls)
@@ -535,15 +546,33 @@ def import_(name, spec, fromlist=None, level=0):
     return _builtins.__import__(name, globals_dict, {}, fromlist, level)
 
 def import_attr(module, attr):
-    try:
-        return getattr(module, attr)
-    except AttributeError:
-        module_name = getattr(module, '__name__', None)
-        if module_name:
-            submodule = _sys.modules.get(f'{module_name}.{attr}')
-            if submodule is not None:
-                return submodule
-        raise
+    value = getattr(module, attr, _MISSING)
+    if value is not _MISSING:
+        return value
+    module_name = getattr(module, '__name__', None)
+    if module_name:
+        submodule = _sys.modules.get(f'{module_name}.{attr}')
+        if submodule is not None:
+            return submodule
+    module_spec = getattr(module, '__spec__', None)
+    if (
+        module_name
+        and module_spec is not None
+        and getattr(module_spec, '_initializing', False)
+    ):
+        message = (
+            f'cannot import name {attr!r} from partially initialized module '
+            f'{module_name!r} (most likely due to a circular import)'
+        )
+        raise ImportError(message, name=module_name) from None
+    module_name = module_name or '<unknown module name>'
+    module_file = getattr(module, '__file__', None)
+    message = f'cannot import name {attr!r} from {module_name!r}'
+    if module_file is not None:
+        message = f'{message} ({module_file})'
+    else:
+        message = f'{message} (unknown location)'
+    raise ImportError(message, name=module_name, path=module_file) from None
 
 def class_lookup_global(class_ns, name, globals_dict):
     try:
@@ -674,8 +703,19 @@ struct ModuleConstantCollector {
     constants: ModuleCodegenConstants,
 }
 
+fn should_include_in_locals_snapshot(name: &str) -> bool {
+    !name.starts_with("_dp_") && name != "__soac__"
+}
+
 impl ModuleConstantCollector {
     fn collect_function(&mut self, function: &BlockPyFunction<CodegenModuleShape>) {
+        if let Some(storage_layout) = function.storage_layout() {
+            for name in storage_layout.stack_slots() {
+                if should_include_in_locals_snapshot(name) {
+                    self.constants.intern_unicode_bytes(name.as_bytes());
+                }
+            }
+        }
         for (param, default_source) in function.params.iter_with_default_sources() {
             match default_source {
                 Some(ParamDefaultSource::Positional(_)) => {

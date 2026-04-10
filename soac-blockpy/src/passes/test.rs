@@ -1392,6 +1392,41 @@ fn nested_class_base_capture_keeps_method_local_cell_owned_by_method() {
 }
 
 #[test]
+fn method_local_class_base_capture_does_not_leak_to_enclosing_class() {
+    let source = concat!(
+        "class Container:\n",
+        "    def method(self):\n",
+        "        class RawBase:\n",
+        "            pass\n",
+        "        class Derived(RawBase):\n",
+        "            pass\n",
+        "        return Derived\n",
+    );
+    let bb_module = tracked_name_binding_module(source)
+        .expect("transform should succeed")
+        .expect("bb module should be available");
+    let outer_class_ns = function_by_name(&bb_module, "_dp_class_ns_Container");
+    assert!(
+        outer_class_ns
+            .storage_layout()
+            .as_ref()
+            .is_none_or(|layout| layout.freevars.is_empty()),
+        "{outer_class_ns:?}"
+    );
+
+    let method = function_by_name(&bb_module, "method");
+    assert!(
+        method.storage_layout().as_ref().is_none_or(|layout| {
+            layout
+                .freevars
+                .iter()
+                .all(|slot| slot.logical_name != "RawBase")
+        }),
+        "{method:?}"
+    );
+}
+
+#[test]
 fn class_global_dunder_class_does_not_leak_synthetic_classcell_outward() {
     let source = concat!(
         "def exercise():\n",
@@ -2444,6 +2479,31 @@ def choose():
 }
 
 #[test]
+fn module_plan_lowers_lambda_in_function_decorator_before_blockpy() {
+    let source = r#"
+def keep(value):
+    def decorator(func):
+        return value
+    return decorator
+
+@keep(lambda: 42)
+def chosen():
+    return 0
+"#;
+
+    let lowered = TrackedLowering::new(source);
+    let blockpy_module = lowered.blockpy_module();
+    let lambda = blockpy_function_by_qualname(&blockpy_module, "<lambda>");
+    assert_eq!(lambda.names.qualname, "<lambda>");
+    let module_init = blockpy_function_by_name(&blockpy_module, "_dp_module_init");
+    assert!(blockpy_function_has_root_name(module_init, "keep"));
+    assert!(blockpy_function_instr_any(module_init, |expr| matches!(
+        expr,
+        InstrWithAwaitAndYield::MakeFunction(_)
+    )));
+}
+
+#[test]
 fn rewritten_ruff_ast_can_keep_async_generator_await_while_blockpy_generator_lowering_handles_it() {
     let source = r#"
 class Once:
@@ -2855,6 +2915,82 @@ def outer(scale):
     assert_eq!(pc.init, ClosureInit::InheritedCapture);
     assert!(layout.cellvars.is_empty(), "{layout:?}");
     assert!(layout.runtime_cells.is_empty(), "{layout:?}");
+}
+
+#[test]
+fn closure_backed_coroutine_propagates_nested_coroutine_nonlocal_capture() {
+    let source = r#"
+def outer():
+    cancelled = False
+    class Test:
+        async def test_leaking_task(self):
+            async def coro():
+                nonlocal cancelled
+                cancelled = True
+            await coro()
+    return Test
+"#;
+    let bb_module = tracked_name_binding_module(source)
+        .expect("transform should succeed")
+        .expect("bb module should be available");
+    let method = function_by_name(&bb_module, "test_leaking_task");
+    let layout = method
+        .storage_layout()
+        .as_ref()
+        .expect("closure-backed coroutine should record closure layout");
+
+    assert!(
+        layout
+            .freevars
+            .iter()
+            .any(|slot| slot.logical_name == "cancelled"),
+        "visible coroutine should capture nonlocals needed by nested coroutine construction: {layout:#?}"
+    );
+}
+
+#[test]
+fn closure_backed_coroutine_global_store_remains_module_global() {
+    let source = r#"
+flag = False
+
+async def set_flag():
+    global flag
+    flag = True
+"#;
+    let bb_module = tracked_name_binding_module(source)
+        .expect("transform should succeed")
+        .expect("bb module should be available");
+    let resume = function_by_name(&bb_module, "set_flag");
+    let layout = resume
+        .storage_layout()
+        .as_ref()
+        .expect("coroutine resume should record closure layout");
+
+    assert!(
+        !layout
+            .freevars
+            .iter()
+            .chain(layout.cellvars.iter())
+            .chain(layout.runtime_cells.iter())
+            .any(|slot| slot.logical_name == "flag"),
+        "global assignment target should not become coroutine state: {layout:#?}"
+    );
+    assert!(
+        resume
+            .blocks
+            .iter()
+            .flat_map(|block| &block.body)
+            .any(|stmt| {
+                matches!(
+                    stmt,
+                    InstrResolved::Store(store)
+                        if store.name.id_str() == "flag"
+                            && (store.name.location.is_global_name()
+                                || store.name.location.is_global())
+                )
+            }),
+        "coroutine resume should store flag through module-global storage: {resume:#?}"
+    );
 }
 
 #[test]
