@@ -339,6 +339,7 @@ pub fn render_jit_clif_for_module_with_options(
         .cloned()
         .ok_or_else(|| format!("no specialized JIT plan for {module_name}.fn#{function_id}"))?;
     let module_constants = ModuleCodegenConstants::collect_from_module(module);
+    let compile_session = soac_jit::CompileSession::new();
     prepare_python();
     let rendered = Python::attach(|py| {
         ensure_python_support_paths(py, repo_root).map_err(|err| err.error)?;
@@ -353,6 +354,7 @@ pub fn render_jit_clif_for_module_with_options(
         };
         unsafe {
             render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
+                &compile_session,
                 &vec![std::ptr::null_mut::<c_void>(); function.blocks.len()],
                 module,
                 &function,

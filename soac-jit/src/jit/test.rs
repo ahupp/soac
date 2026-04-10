@@ -587,6 +587,7 @@ mod tests {
                 let mut jit_module = new_jit_module().expect("test jit module should construct");
                 let module_constant_ptrs = shared_state.module_constant_ptrs();
                 let counter_ptrs = shared_state.counter_ptrs();
+                let compile_session = crate::session::CompileSession::new();
                 let built = build_cranelift_run_bb_specialized_function(
                     &mut jit_module,
                     blocks,
@@ -596,7 +597,7 @@ mod tests {
                     &shared_state.lowered_module.counter_defs,
                     &module_constant_ptrs,
                     &counter_ptrs,
-                    None,
+                    &compile_session,
                     Some(shared_state.as_ref()),
                     None,
                     None,
@@ -656,6 +657,7 @@ mod tests {
                     .max()
                     .map_or(0, |max_counter_id| max_counter_id + 1),
             );
+            let compile_session = crate::session::CompileSession::new();
             let built = build_cranelift_run_bb_specialized_function(
                 &mut jit_module,
                 blocks,
@@ -665,7 +667,7 @@ mod tests {
                 &[],
                 &module_constant_ptrs,
                 &counter_ptrs,
-                None,
+                &compile_session,
                 None,
                 None,
                 None,
@@ -692,6 +694,7 @@ mod tests {
             let mut jit_module = new_jit_module().expect("test jit module should construct");
             let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
             let counter_ptrs = placeholder_counter_ptrs(0);
+            let compile_session = crate::session::CompileSession::new();
             let mut built = build_cranelift_run_bb_specialized_function(
                 &mut jit_module,
                 blocks,
@@ -701,7 +704,7 @@ mod tests {
                 &[],
                 &module_constant_ptrs,
                 &counter_ptrs,
-                None,
+                &compile_session,
                 None,
                 None,
                 None,
@@ -2319,7 +2322,7 @@ def f():
                         &shared_state.lowered_module.counter_defs,
                         &module_constant_ptrs,
                         &counter_ptrs,
-                        None,
+                        runtime.compile_session.as_ref(),
                         Some(shared_state.as_ref()),
                         None,
                         Some(&predeclared),

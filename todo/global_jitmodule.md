@@ -55,13 +55,14 @@ and recursion behavior.
 
 ### 1. Keep compiled-code ownership in `CompileSession`
 
-Status: implemented for production direct function bodies and vectorcall
-trampolines.
+Status: implemented for production direct function bodies, vectorcall
+trampolines, and render/debug JIT builder paths. Production runtime entry
+points acquire the process session, lower JIT codegen takes an explicit
+`CompileSession`, and standalone render wrappers create a fresh non-process
+session so they cannot observe or mutate production process-JIT state.
 
-Remaining cleanup:
+Guardrail:
 
-- keep render/debug-only paths clearly marked as standalone or thread an
-  explicit `CompileSession` through them when they need runtime state
 - avoid adding new direct uses of `CompileSession::process()` below the
   runtime entry boundary
 
@@ -209,10 +210,9 @@ isolated quickly.
 
 ## Next Implementation Slices
 
-1. Finish explicit-session cleanup.
-   - Keep `SharedModuleState` free of hidden process-singleton lookups.
-   - Thread the current `Arc<CompileSession>` into any remaining production
-     compile or direct-target lookup path.
+1. Add direct-call dependency tracking.
+   - Record caller/callee edges, emitted direct calls, deferred edges, and
+     generic fallback reasons in a queryable shared graph.
 
 2. Benchmark before inlining.
    - Measure direct-call heavy workloads before changing the inliner.

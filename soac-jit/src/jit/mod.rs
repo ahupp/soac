@@ -5960,7 +5960,7 @@ impl ProcessJitEngine {
                 function_counter_defs,
                 function_module_constant_ptrs,
                 function_counter_ptrs,
-                Some(session),
+                session.as_ref(),
                 function_direct_call_resolver,
                 None,
                 Some(&predeclared),
@@ -6797,7 +6797,7 @@ fn build_cranelift_run_bb_specialized_function(
     counter_defs: &[CounterDef],
     module_constant_ptrs: &[*mut ffi::PyObject],
     counter_ptrs: &[*mut u64],
-    compile_session: Option<&Arc<crate::session::CompileSession>>,
+    compile_session: &crate::session::CompileSession,
     direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
     symbol_scope: Option<&str>,
     predeclared_direct_functions: Option<&HashMap<FunctionId, DeclaredJitFunction>>,
@@ -6915,14 +6915,6 @@ fn build_cranelift_run_bb_specialized_function(
     for targets in call_target_specializations.values() {
         direct_call_targets.extend(targets.iter().copied());
     }
-    let process_compile_session;
-    let compile_session = if let Some(compile_session) = compile_session {
-        compile_session.as_ref()
-    } else {
-        process_compile_session = crate::session::CompileSession::process();
-        process_compile_session.as_ref()
-    };
-
     let empty_direct_functions = HashMap::new();
     let direct_call_functions = predeclared_direct_functions.unwrap_or(&empty_direct_functions);
     let value_facts = infer_jit_value_facts(module);
@@ -7688,7 +7680,10 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_cfg(
     module_constants: &ModuleCodegenConstants,
 ) -> Result<RenderedSpecializedClif, String> {
     unsafe {
+        // Standalone debug rendering must not observe or mutate the process JIT session.
+        let compile_session = crate::session::CompileSession::new();
         render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
+            &compile_session,
             blocks,
             module,
             function,
@@ -7699,6 +7694,7 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_cfg(
 }
 
 pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
+    compile_session: &crate::session::CompileSession,
     blocks: &[ObjPtr],
     module: &BlockPyModule<CodegenModuleShape>,
     function: &soac_blockpy::block_py::BlockPyFunction<CodegenModuleShape>,
@@ -7742,7 +7738,7 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
         counter_defs,
         &module_constant_ptrs,
         &counter_ptrs,
-        None,
+        compile_session,
         runtime_state,
         None,
         None,
