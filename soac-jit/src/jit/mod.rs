@@ -21,11 +21,14 @@ use pyo3::ffi;
 use soac_blockpy::block_py::{
     AbruptKind, BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword,
     CallArgPositional, CallableScopeKind, CellLocation, ChildVisitable, CodegenBlock, CounterDef,
-    CounterId, CounterScope, CounterSite, FunctionId, HasMeta, InstrCodegen, InstrId, Literal,
-    LocalLocation, NameLocation, ParamDefaultSource, ResolvedName, StorageLayout, Visit, WithMeta,
-    operation as blockpy_intrinsics,
+    CounterId, CounterScope, CounterSite, FunctionId, HasMeta, HasSemanticInstrId, InstrCodegen,
+    InstrId, InstrKey, Literal, LocalLocation, NameLocation, ParamDefaultSource, ResolvedName,
+    StorageLayout, Visit, WithMeta, operation as blockpy_intrinsics,
 };
-use soac_blockpy::passes::{CodegenModuleShape, InstrResolved};
+use soac_blockpy::passes::{
+    CodegenModuleShape, FactStore, InstrResolved, ValueFacts, infer_module_value_facts,
+    validate_codegen_instr_ids,
+};
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1355,9 +1358,11 @@ struct JitEmitConsts {
 
 struct JitEmitCtx<'mc> {
     module: &'mc BlockPyModule<CodegenModuleShape>,
+    function_id: FunctionId,
     shared_state: Option<&'mc crate::module_type::SharedModuleState>,
     module_constants: &'mc ModuleCodegenConstants,
     module_constant_ptrs: &'mc [*mut ffi::PyObject],
+    value_facts: &'mc FactStore,
     counter_ptrs: &'mc [*mut u64],
     top_value_counter_ptrs: &'mc [ObjPtr],
     storage_layout: Option<StorageLayout>,
@@ -1415,6 +1420,22 @@ struct JitEmitCtx<'mc> {
     behavior_change_indexed_stores: bool,
 }
 
+impl JitEmitCtx<'_> {
+    fn value_facts_for_expr(&self, expr: &InstrCodegen) -> Option<ValueFacts> {
+        let instr_id = expr.try_semantic_instr_id()?;
+        self.value_facts
+            .fact_for(InstrKey::new(self.function_id, instr_id))
+    }
+}
+
+fn infer_jit_value_facts(module: &BlockPyModule<CodegenModuleShape>) -> FactStore {
+    if validate_codegen_instr_ids(module).is_ok() {
+        infer_module_value_facts(module)
+    } else {
+        FactStore::default()
+    }
+}
+
 #[derive(Clone, Copy)]
 struct DirectMethodSpecialization {
     function_id: FunctionId,
@@ -1458,6 +1479,18 @@ struct CodegenIntrinsicEmitState<'a, 'b, 'mc, 'c, 'd> {
     ctx: &'c JitEmitCtx<'mc>,
     jit_module: &'a mut JITModule,
     func_imports: &'a mut FuncBuildImports<'d>,
+}
+
+#[derive(Default)]
+struct LocalEnv {
+    names: Vec<String>,
+    values: Vec<ir::Value>,
+}
+
+impl LocalEnv {
+    fn as_parts_mut(&mut self) -> (&mut Vec<String>, &mut Vec<ir::Value>) {
+        (&mut self.names, &mut self.values)
+    }
 }
 
 #[derive(Clone)]
@@ -3320,6 +3353,7 @@ fn emit_codegen_expr(
     jit_module: &mut JITModule,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> ir::Value {
+    let _value_facts = ctx.value_facts_for_expr(expr);
     let incref_ref = ctx.incref_ref;
     let decref_ref = ctx.decref_ref;
     let py_call_ref = ctx.py_call_positional_three_ref;
@@ -6755,6 +6789,7 @@ fn build_cranelift_run_bb_specialized_function(
 
     let empty_direct_functions = HashMap::new();
     let direct_call_functions = predeclared_direct_functions.unwrap_or(&empty_direct_functions);
+    let value_facts = infer_jit_value_facts(module);
 
     let mut direct_call_code_ptrs = HashMap::new();
     let mut direct_call_target_functions = HashMap::new();
@@ -7282,9 +7317,11 @@ fn build_cranelift_run_bb_specialized_function(
             let fast_step_null_args = Vec::new();
             let emit_ctx = JitEmitCtx {
                 module,
+                function_id: function.function_id,
                 shared_state: direct_call_resolver,
                 module_constants,
                 module_constant_ptrs,
+                value_facts: &value_facts,
                 counter_ptrs,
                 top_value_counter_ptrs: &top_value_counter_ptrs,
                 storage_layout: function.storage_layout().clone(),
@@ -7361,14 +7398,14 @@ fn build_cranelift_run_bb_specialized_function(
                 behavior_change_indexed_stores,
             };
             let block = &function.blocks[index];
-            let mut local_names = Vec::new();
-            let mut local_values = Vec::new();
+            let mut local_env = LocalEnv::default();
+            let (local_names, local_values) = local_env.as_parts_mut();
 
             emit_codegen_ops(
                 &mut fb,
                 &block.body,
-                &mut local_names,
-                &mut local_values,
+                local_names,
+                local_values,
                 &stack_slots,
                 &emit_ctx,
                 jit_module,
@@ -7382,8 +7419,8 @@ fn build_cranelift_run_bb_specialized_function(
                 &exec_blocks,
                 &runtime_block_param_names,
                 &full_block_param_names,
-                &mut local_names,
-                &mut local_values,
+                local_names,
+                local_values,
                 &emit_ctx,
                 jit_module,
                 &mut func_imports,

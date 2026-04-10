@@ -1,4 +1,6 @@
-pub use self::meta::{HasMeta, InstrId, Meta, WithMeta};
+pub use self::meta::{
+    HasMeta, HasSemanticInstrId, IdentifiedInstr, InstrId, InstrKey, Meta, WithMeta,
+};
 pub use self::param_specs::{Param, ParamDefaultSource, ParamKind, ParamSpec};
 pub(crate) use self::scope::{
     build_storage_layout_from_capture_names, compute_make_function_capture_bindings_from_scope,
@@ -39,8 +41,8 @@ pub(crate) mod scope;
 pub(crate) mod validate;
 mod visit;
 pub use crate::passes::{
-    InstrCodegen, InstrLow, InstrResolved, InstrRuff, InstrUnresolved, InstrWithAwaitAndYield,
-    InstrWithYield,
+    InstrCodegen, InstrCodegenOp, InstrLow, InstrResolved, InstrRuff, InstrUnresolved,
+    InstrWithAwaitAndYield, InstrWithYield,
 };
 pub use counters::{CounterDef, CounterId, CounterScope, CounterSite, IncrementCounter};
 pub(crate) use literal::literal_expr;
@@ -247,7 +249,9 @@ pub trait NameLike: Clone + fmt::Debug {
 
 pub trait Instr: Clone + fmt::Debug + Sized {
     type Name: NameLike;
+}
 
+pub trait InstrWithConstantNone: Instr {
     fn constant_none() -> Self;
 }
 
@@ -443,7 +447,10 @@ impl<I: Instr> Block<I> {
         params: Vec<BlockParam>,
         exc_edge: Option<BlockEdge>,
         fallthrough_target: Option<BlockLabel>,
-    ) -> Self {
+    ) -> Self
+    where
+        I: InstrWithConstantNone,
+    {
         Self::new(
             label,
             builder.body,
@@ -520,7 +527,7 @@ pub struct BlockPyModule<P: ModuleShape> {
     pub module_name_gen: ModuleNameGen,
     pub global_names: Vec<String>,
     pub callable_defs: Vec<BlockPyFunction<P>>,
-    pub module_constants: Vec<InstrLow<ResolvedName>>,
+    pub module_constants: Vec<InstrResolved>,
     pub counter_defs: Vec<CounterDef>,
 }
 
@@ -894,11 +901,15 @@ impl<I: Instr> BlockTerm<I> {
     pub fn jump_term(target: BlockLabel) -> Self {
         Self::Jump(BlockEdge::new(target))
     }
+}
 
+impl<I: InstrWithConstantNone> BlockTerm<I> {
     pub fn implicit_function_return() -> Self {
         Self::Return(I::constant_none())
     }
+}
 
+impl<I: Instr> BlockTerm<I> {
     pub fn replace_target(&mut self, from: BlockLabel, to: BlockLabel) -> bool {
         match self {
             Self::Jump(edge) => {

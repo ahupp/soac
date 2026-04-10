@@ -1,5 +1,5 @@
 use crate::block_py::{
-    BlockEdge, BlockPyFunction, BlockPyModule, BlockTerm, InstrLow, ResolvedStorageBlock,
+    BlockEdge, BlockPyFunction, BlockPyModule, BlockTerm, InstrResolved, ResolvedStorageBlock,
 };
 use crate::passes::ruff_to_blockpy::populate_exception_edge_args;
 use crate::passes::ResolvedStorageModuleShape;
@@ -94,11 +94,8 @@ fn split_exception_blocks_for_expr_checks(
     function.blocks = out;
 }
 
-fn op_updates_exception_state<N>(op: &InstrLow<N>) -> bool
-where
-    N: crate::block_py::NameLike,
-{
-    matches!(op, InstrLow::Store(_) | InstrLow::Del(_))
+fn op_updates_exception_state(op: &InstrResolved) -> bool {
+    matches!(op, InstrResolved::Store(_) | InstrResolved::Del(_))
 }
 
 #[cfg(test)]

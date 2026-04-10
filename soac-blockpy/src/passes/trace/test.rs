@@ -95,19 +95,21 @@ fn instruments_matching_function_blocks() {
         .expect("bb module should be available");
     let prepared = lower_try_jump_exception_flow(&bb_module);
     let mut normalized = normalize_bb_module_strings(&prepared);
+    crate::passes::relabel_dense_bb_module(&mut normalized);
+    let mut codegen = assign_module_instr_ids(normalized);
     instrument_bb_module_for_trace(
-        &mut normalized,
+        &mut codegen,
         &TraceConfig {
             qualname_filter: Some("f".to_string()),
             include_params: true,
         },
     );
-    let f = normalized
+    let f = codegen
         .callable_defs
         .iter()
         .find(|function| function.names.qualname == "f")
         .expect("missing f");
-    let g = normalized
+    let g = codegen
         .callable_defs
         .iter()
         .find(|function| function.names.qualname == "g")
@@ -133,9 +135,11 @@ fn adds_named_global_load_counters_once() {
         .expect("bb module should be available");
     let prepared = lower_try_jump_exception_flow(&bb_module);
     let mut normalized = normalize_bb_module_strings(&prepared);
-    instrument_bb_module_with_global_load_counters(&mut normalized);
-    instrument_bb_module_with_global_load_counters(&mut normalized);
-    let counters = normalized
+    crate::passes::relabel_dense_bb_module(&mut normalized);
+    let mut codegen = assign_module_instr_ids(normalized);
+    instrument_bb_module_with_global_load_counters(&mut codegen);
+    instrument_bb_module_with_global_load_counters(&mut codegen);
+    let counters = codegen
         .counter_defs
         .iter()
         .filter(|counter| counter.scope == CounterScope::Global)
@@ -167,10 +171,11 @@ fn adds_branch_outcome_counters_for_conditional_terms() {
         .expect("bb module should be available");
     let prepared = lower_try_jump_exception_flow(&bb_module);
     let mut normalized = normalize_bb_module_strings(&prepared);
-    assign_module_instr_ids(&mut normalized);
-    instrument_bb_module_with_locality_counters(&mut normalized);
+    crate::passes::relabel_dense_bb_module(&mut normalized);
+    let mut codegen = assign_module_instr_ids(normalized);
+    instrument_bb_module_with_locality_counters(&mut codegen);
 
-    let counters = normalized
+    let counters = codegen
         .counter_defs
         .iter()
         .filter(|counter| counter.kind == "branch_outcomes")

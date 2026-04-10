@@ -1,6 +1,6 @@
 use crate::block_py::{
-    literal_expr, Block, BlockLabel, BlockTerm, CallArgPositional, GetAttr, Instr, InstrResolved,
-    Literal, NameLocation, ResolvedName, StringLiteral, WithMeta,
+    literal_expr, Block, BlockLabel, BlockTerm, CallArgPositional, GetAttr, InstrResolved,
+    InstrWithConstantNone, Literal, NameLocation, ResolvedName, StringLiteral, WithMeta,
 };
 use crate::passes::ruff_to_blockpy::{
     lower_structured_located_blocks_to_bb_blocks, populate_exception_edge_args,

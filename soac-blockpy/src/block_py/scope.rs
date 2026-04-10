@@ -1,7 +1,7 @@
 use super::{
     is_internal_symbol, walk_block, walk_expr, Block, BlockPyFunction, Call, CallArgPositional,
-    ChildVisitable, FunctionName, Instr, InstrLow, InstrRuff, InstrWithAwaitAndYield,
-    InstrWithYield, Literal, ModuleShape, NameLike,
+    ChildVisitable, FunctionName, Instr, InstrLow, InstrResolved, InstrRuff,
+    InstrWithAwaitAndYield, InstrWithYield, Literal, ModuleShape, NameLike,
 };
 use crate::passes::ast_to_ast::scope_helpers::cell_name;
 use ruff_python_ast::{self as ast};
@@ -747,6 +747,52 @@ where
             _ => {}
         }
     }
+}
+
+impl ScopeExprNode for InstrResolved {
+    fn root_name_id(&self) -> Option<&str> {
+        match self {
+            Self::Call(call) => call.func.as_ref().root_name_id(),
+            Self::Load(op) => Some(op.name.id_str()),
+            _ => None,
+        }
+    }
+
+    fn root_string_literal_value(&self) -> Option<String> {
+        match self {
+            Self::Literal(literal) => match literal.as_literal() {
+                Literal::StringLiteral(literal) => Some(literal.value.clone()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn walk_root_loaded_names(&self, f: &mut impl FnMut(&str)) {
+        match self {
+            Self::Call(call) => {
+                if let Some(name) = call.func.as_ref().root_name_id() {
+                    f(name);
+                }
+            }
+            Self::Load(op) => f(op.name.id_str()),
+            _ => {}
+        }
+    }
+
+    fn walk_root_defined_names(&self, f: &mut impl FnMut(&str)) {
+        if let Self::Store(op) = self {
+            f(op.name.id_str());
+        }
+    }
+
+    fn walk_root_deleted_names(&self, f: &mut impl FnMut(&str)) {
+        if let Self::Del(op) = self {
+            f(op.name.id_str());
+        }
+    }
+
+    fn walk_root_cell_ref_logical_names(&self, _f: &mut impl FnMut(&str)) {}
 }
 
 impl ScopeExprNode for super::InstrCodegen {

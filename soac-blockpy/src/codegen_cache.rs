@@ -196,8 +196,8 @@ mod test {
         PythonModuleCacheSource,
     };
     use crate::block_py::{
-        walk_block, walk_expr, BlockPyModule, ChildVisitable, FunctionId, HasMeta, InstrCodegen,
-        Visit,
+        walk_block, walk_expr, BlockPyModule, ChildVisitable, FunctionId, HasSemanticInstrId,
+        InstrCodegen, Visit,
     };
     use crate::lower_python_to_blockpy_for_testing;
     use crate::passes::CodegenModuleShape;
@@ -231,10 +231,7 @@ mod test {
         where
             InstrCodegen: ChildVisitable<InstrCodegen>,
         {
-            let instr_id = expr
-                .meta()
-                .instr_id
-                .expect("codegen module should have instr ids");
+            let instr_id = expr.semantic_instr_id();
             self.instr_ids.push((
                 instr_id.block_label().as_u32(),
                 instr_id.instr_index_in_block(),

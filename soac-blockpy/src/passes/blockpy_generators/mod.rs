@@ -9,10 +9,11 @@ use crate::block_py::{
     Block, BlockArg, BlockBuilder, BlockEdge, BlockLabel, BlockParam, BlockParamRole,
     BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword, CallArgPositional,
     CallableScopeInfo, CellBindingKind, CellRefForName, ClosureInit, ClosureSlot, FunctionId,
-    FunctionKind, FunctionName, FunctionNameGen, GetAttr, Instr, InstrUnresolved, InstrWithYield,
-    Load, MakeFunction, Mappable, ModuleNameGen, NameLike, NumberLiteral, NumberLiteralValue,
-    ScopeExprNode, StorageLayout, Store, StringLiteral, TermBranchTable, TermIf, TermRaise,
-    TryMapFunction, TryMapInstr, TryMapTerm, UnaryOp, UnaryOpKind, UnresolvedName,
+    FunctionKind, FunctionName, FunctionNameGen, GetAttr, Instr, InstrUnresolved,
+    InstrWithConstantNone, InstrWithYield, Load, MakeFunction, Mappable, ModuleNameGen, NameLike,
+    NumberLiteral, NumberLiteralValue, ScopeExprNode, StorageLayout, Store, StringLiteral,
+    TermBranchTable, TermIf, TermRaise, TryMapFunction, TryMapInstr, TryMapTerm, UnaryOp,
+    UnaryOpKind, UnresolvedName,
 };
 use crate::passes::ast_to_ast::scope_helpers::is_internal_symbol;
 use crate::passes::ruff_to_blockpy::{attach_exception_edges_to_blocks, lowered_exception_edges};

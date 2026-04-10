@@ -11,6 +11,7 @@ mod instrument;
 mod name_binding;
 pub mod ruff_to_blockpy;
 mod trace;
+mod value_facts;
 
 use crate::block_py::{
     cfg::relabel_blockpy_blocks_dense, runtime_name_load, Await, BinOp, BlockPyModule, Call,
@@ -19,13 +20,14 @@ use crate::block_py::{
     ExprCompare, ExprDict, ExprDictComp, ExprEllipsisLiteral, ExprFString, ExprGenerator, ExprIf,
     ExprIpyEscapeCommand, ExprLambda, ExprList, ExprListComp, ExprName, ExprNamed, ExprNoneLiteral,
     ExprNumberLiteral, ExprSet, ExprSetComp, ExprSlice, ExprStarred, ExprStringLiteral,
-    ExprSubscript, ExprTString, ExprTuple, GetAttr, GetItem, HasMeta, IncrementCounter, Instr,
-    LiteralValue, Load, MakeCell, MakeFunction, MapInstr, Mappable, Meta, ModuleShape, NameLike,
-    ResolvedName, SetAttr, SetItem, StmtAnnAssign, StmtAssert, StmtAssign, StmtAugAssign,
-    StmtBreak, StmtClassDef, StmtContinue, StmtDelete, StmtExpr, StmtFor, StmtFunctionDef,
-    StmtGlobal, StmtIf, StmtImport, StmtImportFrom, StmtIpyEscapeCommand, StmtMatch, StmtNonlocal,
-    StmtPass, StmtRaise, StmtReturn, StmtTry, StmtTypeAlias, StmtWhile, StmtWith, Store,
-    TryMapInstr, UnaryOp, UnresolvedName, WithMeta, Yield, YieldFrom,
+    ExprSubscript, ExprTString, ExprTuple, GetAttr, GetItem, HasMeta, IdentifiedInstr,
+    IncrementCounter, Instr, InstrWithConstantNone, LiteralValue, Load, MakeCell, MakeFunction,
+    MapInstr, Mappable, Meta, ModuleShape, NameLike, ResolvedName, SetAttr, SetItem, StmtAnnAssign,
+    StmtAssert, StmtAssign, StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue, StmtDelete,
+    StmtExpr, StmtFor, StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom,
+    StmtIpyEscapeCommand, StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry,
+    StmtTypeAlias, StmtWhile, StmtWith, Store, TryMapInstr, UnaryOp, UnresolvedName, WithMeta,
+    Yield, YieldFrom,
 };
 use ruff_python_ast::{self as ast};
 use soac_macros::{enum_broadcast, DelegateMatchDefault};
@@ -102,7 +104,9 @@ impl ModuleShape for RuffModuleShape {
 
 impl Instr for InstrRuff {
     type Name = UnresolvedName;
+}
 
+impl InstrWithConstantNone for InstrRuff {
     fn constant_none() -> Self {
         ExprNoneLiteral::new().into()
     }
@@ -118,7 +122,7 @@ impl Instr for InstrRuff {
     __C: rkyv::validation::ArchiveContext,
 )))]
 #[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, Debug)]
-pub enum InstrCodegen {
+pub enum InstrCodegenOp {
     BinOp(#[rkyv(omit_bounds)] BinOp<Self>),
     UnaryOp(#[rkyv(omit_bounds)] UnaryOp<Self>),
     CalleeFunctionId(#[rkyv(omit_bounds)] CalleeFunctionId<Self>),
@@ -138,9 +142,20 @@ pub enum InstrCodegen {
     MakeFunction(#[rkyv(omit_bounds)] MakeFunction<Self>),
 }
 
-impl Instr for InstrCodegen {
-    type Name = ResolvedName;
+pub type InstrCodegen = InstrCodegenOp;
 
+impl Instr for InstrCodegenOp {
+    type Name = ResolvedName;
+}
+
+impl<I> Instr for IdentifiedInstr<I>
+where
+    I: Instr,
+{
+    type Name = I::Name;
+}
+
+impl InstrWithConstantNone for InstrCodegenOp {
     fn constant_none() -> Self {
         runtime_name_load("NONE")
     }
@@ -172,7 +187,9 @@ pub enum InstrWithAwaitAndYield {
 
 impl Instr for InstrWithAwaitAndYield {
     type Name = UnresolvedName;
+}
 
+impl InstrWithConstantNone for InstrWithAwaitAndYield {
     fn constant_none() -> Self {
         runtime_name_load("NONE")
     }
@@ -203,7 +220,9 @@ pub enum InstrWithYield {
 
 impl Instr for InstrWithYield {
     type Name = UnresolvedName;
+}
 
+impl InstrWithConstantNone for InstrWithYield {
     fn constant_none() -> Self {
         runtime_name_load("NONE")
     }
@@ -253,14 +272,60 @@ pub enum InstrLow<N: NameLike> {
 
 impl<N: NameLike> Instr for InstrLow<N> {
     type Name = N;
+}
 
+impl<N: NameLike> InstrWithConstantNone for InstrLow<N> {
     fn constant_none() -> Self {
         runtime_name_load("NONE")
     }
 }
 
 pub type InstrUnresolved = InstrLow<UnresolvedName>;
-pub type InstrResolved = InstrLow<ResolvedName>;
+
+#[derive(
+    Clone,
+    derive_more::From,
+    DelegateMatchDefault,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+#[rkyv(serialize_bounds(
+    __S: rkyv::ser::Writer + rkyv::ser::Allocator,
+    __S::Error: rkyv::rancor::Source,
+))]
+#[rkyv(deserialize_bounds(__D::Error: rkyv::rancor::Source))]
+#[rkyv(bytecheck(bounds(
+    __C: rkyv::validation::ArchiveContext,
+)))]
+#[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, Debug)]
+pub enum InstrResolved {
+    Literal(LiteralValue),
+    BinOp(#[rkyv(omit_bounds)] BinOp<Self>),
+    UnaryOp(#[rkyv(omit_bounds)] UnaryOp<Self>),
+    Call(#[rkyv(omit_bounds)] Call<Self>),
+    GetAttr(#[rkyv(omit_bounds)] GetAttr<Self>),
+    SetAttr(#[rkyv(omit_bounds)] SetAttr<Self>),
+    GetItem(#[rkyv(omit_bounds)] GetItem<Self>),
+    SetItem(#[rkyv(omit_bounds)] SetItem<Self>),
+    DelItem(#[rkyv(omit_bounds)] DelItem<Self>),
+    Load(#[rkyv(omit_bounds)] Load<Self>),
+    Store(#[rkyv(omit_bounds)] Store<Self>),
+    Del(#[rkyv(omit_bounds)] Del<Self>),
+    MakeCell(#[rkyv(omit_bounds)] MakeCell<Self>),
+    CellRef(CellRef),
+    MakeFunction(#[rkyv(omit_bounds)] MakeFunction<Self>),
+}
+
+impl Instr for InstrResolved {
+    type Name = ResolvedName;
+}
+
+impl InstrWithConstantNone for InstrResolved {
+    fn constant_none() -> Self {
+        runtime_name_load("NONE")
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct CoreModuleShapeWithAwaitAndYield;
@@ -287,7 +352,7 @@ impl ModuleShape for CoreModuleShape {
 pub struct ResolvedStorageModuleShape;
 
 impl ModuleShape for ResolvedStorageModuleShape {
-    type Instr = InstrLow<ResolvedName>;
+    type Instr = InstrResolved;
 }
 
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -297,9 +362,18 @@ impl ModuleShape for CodegenModuleShape {
     type Instr = InstrCodegen;
 }
 
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct CodegenUnidentifiedModuleShape;
+
+impl ModuleShape for CodegenUnidentifiedModuleShape {
+    type Instr = InstrCodegen;
+}
+
 pub(crate) use blockpy_generators::lower_yield_in_lowered_core_blockpy_module_bundle;
 pub use blockpy_to_bb::{lower_try_jump_exception_flow, normalize_bb_module_strings};
-pub use instr_id::{assign_function_instr_ids, assign_module_instr_ids};
+pub use instr_id::{
+    assign_function_instr_ids, assign_module_instr_ids, validate_codegen_instr_ids,
+};
 pub use instrument::{
     CounterBuilder, CounterHandle, CounterSpec, InstrumentInstr, OptBlock, OptInstr,
 };
@@ -307,6 +381,10 @@ pub use trace::{
     instrument_bb_module_with_block_entry_counters, instrument_bb_module_with_call_target_counters,
     instrument_bb_module_with_global_load_counters, instrument_bb_module_with_locality_counters,
     instrument_bb_module_with_refcount_counters,
+};
+pub use value_facts::{
+    infer_module_value_facts, BoolSingletonFact, EnvFacts, FactStore, NoneFact, ProvenanceFact,
+    PyExactType, PyObjFacts, RefcountFact, RuntimeSingleton, TruthinessFact, TypeFact, ValueFacts,
 };
 
 pub(crate) use global_index::lower_global_index_in_resolved_module_default;
@@ -319,7 +397,7 @@ pub(crate) use trace::{
     locality_counter_instrumentation_enabled, parse_trace_env,
 };
 
-pub fn relabel_dense_bb_module(module: &mut BlockPyModule<CodegenModuleShape>) {
+pub fn relabel_dense_bb_module<P: ModuleShape>(module: &mut BlockPyModule<P>) {
     for callable in &mut module.callable_defs {
         relabel_blockpy_blocks_dense(&mut callable.blocks);
     }

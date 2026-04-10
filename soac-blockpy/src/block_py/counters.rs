@@ -31,6 +31,8 @@ pub enum CounterSite {
         function_id: FunctionId,
         block_label: BlockLabel,
     },
+    // `instr_id` names the semantic instruction site being observed. Synthetic
+    // instrumentation instructions may have no semantic id of their own.
     Runtime {
         function_id: Option<FunctionId>,
         instr_id: Option<InstrId>,

@@ -1,8 +1,8 @@
 use crate::block_py::pretty::BlockPyPrettyPrint;
 use crate::block_py::{
     instr_any, BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional,
-    CallableScopeKind, CellBindingKind, CellLocation, ChildVisitable, FunctionKind, InstrLow,
-    InstrResolved, NameLike, NameLocation, ResolvedName, ResolvedStorageBlock, ScopeExprNode,
+    CallableScopeKind, CellBindingKind, CellLocation, ChildVisitable, FunctionKind, InstrResolved,
+    NameLike, NameLocation, ResolvedStorageBlock, ScopeExprNode,
 };
 use crate::block_py::{BindingKind, ClosureInit, ClosureSlot, ModuleNameGen};
 use crate::passes::ast_to_ast::ast_rewrite::rewrite_with_pass;
@@ -233,7 +233,7 @@ fn slot_by_name<'a>(slots: &'a [ClosureSlot], logical_name: &str) -> &'a Closure
         .unwrap_or_else(|| panic!("missing closure slot {logical_name}; got {slots:?}"))
 }
 
-fn expr_text<N: NameLike>(expr: &InstrLow<N>) -> String {
+fn expr_text(expr: &impl std::fmt::Debug) -> String {
     crate::block_py::pretty::bb_expr_text(expr)
 }
 
@@ -643,9 +643,9 @@ fn function_or_constants_use_text(
 
 fn runtime_call_by_name<'a>(
     module: &'a BlockPyModule<ResolvedStorageModuleShape>,
-    expr: &'a InstrLow<ResolvedName>,
+    expr: &'a InstrResolved,
     name: &str,
-) -> Option<&'a Call<InstrLow<ResolvedName>>> {
+) -> Option<&'a Call<InstrResolved>> {
     let InstrResolved::Call(call) = expr else {
         return None;
     };

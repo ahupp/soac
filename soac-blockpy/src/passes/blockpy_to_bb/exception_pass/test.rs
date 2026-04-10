@@ -1,8 +1,9 @@
 use super::lower_try_jump_exception_flow;
 use crate::block_py::{
     validate_module, AbruptKind, BindingKind, BlockArg, BlockEdge, BlockLabel, BlockParam,
-    BlockParamRole, BlockTerm, CellBindingKind, CodegenBlock, Instr, InstrCodegen, InstrResolved,
-    Literal, NameLocation, NumberLiteral, NumberLiteralValue, ResolvedStorageBlock, StorageLayout,
+    BlockParamRole, BlockTerm, CellBindingKind, CodegenBlock, InstrCodegen, InstrResolved,
+    InstrWithConstantNone, Literal, NameLocation, NumberLiteral, NumberLiteralValue,
+    ResolvedStorageBlock, StorageLayout,
 };
 use crate::lower_python_to_blockpy_for_testing;
 use crate::passes::CodegenModuleShape;
@@ -23,7 +24,7 @@ fn tracked_codegen_module(source: &str) -> crate::block_py::BlockPyModule<Codege
     let lowered = lower_try_jump_exception_flow(&name_binding);
     let mut codegen = crate::passes::normalize_bb_module_strings(&lowered);
     crate::passes::relabel_dense_bb_module(&mut codegen);
-    codegen
+    crate::passes::assign_module_instr_ids(codegen)
 }
 
 fn is_return_of_number_constant(term: &BlockTerm<InstrResolved>) -> bool {

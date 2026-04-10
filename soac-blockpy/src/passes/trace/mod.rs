@@ -1,8 +1,8 @@
+use crate::block_py::HasSemanticInstrId;
 use crate::block_py::{
     core_call_expr_with_meta, literal_expr, BlockPyFunction, BlockPyModule, BlockTerm,
-    CallArgPositional, ChildVisitable, CounterScope, CounterSite, HasMeta, IncrementCounter,
-    InstrCodegen, InstrResolved, Load, Meta, NameLocation, ResolvedName, StringLiteral, Visit,
-    WithMeta,
+    CallArgPositional, ChildVisitable, CounterScope, CounterSite, IncrementCounter, InstrCodegen,
+    InstrResolved, Load, Meta, NameLocation, ResolvedName, StringLiteral, Visit, WithMeta,
 };
 use crate::passes::{CodegenModuleShape, CounterBuilder};
 use std::collections::HashMap;
@@ -241,10 +241,7 @@ pub fn instrument_bb_module_with_call_target_counters(
     impl Visit<InstrCodegen> for SpecializationCandidateCounterCollector<'_, '_> {
         fn visit_instr(&mut self, expr: &InstrCodegen) {
             if is_global_index_candidate(expr) {
-                let instr_id = expr
-                    .meta()
-                    .instr_id
-                    .expect("global index counters require preassigned InstrId");
+                let instr_id = expr.semantic_instr_id();
                 define_indexed_hit_fallback_counters(
                     self.counters,
                     self.function_id,
@@ -254,10 +251,7 @@ pub fn instrument_bb_module_with_call_target_counters(
                 );
             }
             if is_field_index_candidate(expr) {
-                let instr_id = expr
-                    .meta()
-                    .instr_id
-                    .expect("field index counters require preassigned InstrId");
+                let instr_id = expr.semantic_instr_id();
                 define_indexed_hit_fallback_counters(
                     self.counters,
                     self.function_id,
@@ -267,10 +261,7 @@ pub fn instrument_bb_module_with_call_target_counters(
                 );
             }
             if is_operator_specialization_candidate(expr) {
-                let instr_id = expr
-                    .meta()
-                    .instr_id
-                    .expect("operator specialization counters require preassigned InstrId");
+                let instr_id = expr.semantic_instr_id();
                 self.counters.define_if_missing(
                     CounterScope::This,
                     "operator_hot_shapes",
@@ -303,10 +294,7 @@ pub fn instrument_bb_module_with_call_target_counters(
                         .iter()
                         .all(|arg| matches!(arg, CallArgPositional::Positional(_)));
                 if is_candidate {
-                    let instr_id = expr
-                        .meta()
-                        .instr_id
-                        .expect("call target counters require preassigned InstrId");
+                    let instr_id = expr.semantic_instr_id();
                     self.counters.define_if_missing(
                         CounterScope::This,
                         "call_hot_targets",
@@ -354,11 +342,7 @@ pub fn instrument_bb_module_with_locality_counters(module: &mut BlockPyModule<Co
             let BlockTerm::IfTerm(if_term) = &block.term else {
                 continue;
             };
-            let instr_id = if_term
-                .test
-                .meta()
-                .instr_id
-                .expect("branch outcome counters require preassigned InstrId");
+            let instr_id = if_term.test.semantic_instr_id();
             counters.define_if_missing(
                 CounterScope::This,
                 "branch_outcomes",

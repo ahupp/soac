@@ -247,7 +247,8 @@ mod tests {
     use super::*;
     use crate::block_py::{
         BlockEdge, Call, CallArgPositional, CallDirect, CalleeFunctionId, FunctionId, HasMeta,
-        InstrCodegen, InstrId, Load, Meta, NameLocation, ResolvedName, TermBranchTable, WithMeta,
+        HasSemanticInstrId, InstrCodegen, InstrId, InstrWithConstantNone, Load, Meta, NameLocation,
+        ResolvedName, TermBranchTable, WithMeta,
     };
     use crate::passes::InstrRuff;
     use crate::py_expr;
@@ -297,10 +298,7 @@ mod tests {
             };
             Some(CallHotTargetsCounterSpec {
                 function_id: self.function_id,
-                instr_id: instr
-                    .meta()
-                    .instr_id
-                    .expect("example rule requires a preassigned InstrId"),
+                instr_id: instr.semantic_instr_id(),
             })
         }
 

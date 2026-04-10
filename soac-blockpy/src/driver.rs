@@ -11,8 +11,8 @@ use crate::passes::ast_to_ast::{
 use crate::passes::core_await_lower::lower_awaits_in_core_blockpy_module;
 use crate::passes::ruff_to_blockpy::rewrite_ast_to_core_blockpy_module_with_module;
 use crate::passes::{
-    self, CodegenModuleShape, CoreModuleShape, CoreModuleShapeWithAwaitAndYield,
-    CoreModuleShapeWithYield, ResolvedStorageModuleShape,
+    self, CodegenModuleShape, CodegenUnidentifiedModuleShape, CoreModuleShape,
+    CoreModuleShapeWithAwaitAndYield, CoreModuleShapeWithYield, ResolvedStorageModuleShape,
 };
 use crate::{ParseError, Result};
 use ruff_python_ast::{self as ast, Stmt};
@@ -193,10 +193,16 @@ pub(crate) fn rewrite_module_with_tracker_with_options(
             passes::lower_try_jump_exception_flow(&global_index)
         });
     let bb_codegen: BlockPyModule<CodegenModuleShape> = pass_tracker.run_pass("bb_codegen", || {
-        let mut bb_codegen = passes::normalize_bb_module_strings(&bb_prepared);
+        let mut bb_codegen: BlockPyModule<CodegenUnidentifiedModuleShape> =
+            passes::normalize_bb_module_strings(&bb_prepared);
         passes::relabel_dense_bb_module(&mut bb_codegen);
-        passes::assign_module_instr_ids(&mut bb_codegen);
-        bb_codegen
+        passes::assign_module_instr_ids(bb_codegen)
+    });
+    pass_tracker.record_timing("validate_codegen_instr_ids", || {
+        passes::validate_codegen_instr_ids(&bb_codegen).map_err(anyhow::Error::msg)
+    })?;
+    let _value_facts: passes::FactStore = pass_tracker.record_timing("value_facts", || {
+        passes::infer_module_value_facts(&bb_codegen)
     });
 
     let bb_traced: BlockPyModule<CodegenModuleShape> =

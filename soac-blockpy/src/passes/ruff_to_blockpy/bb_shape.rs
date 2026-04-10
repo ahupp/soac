@@ -1,6 +1,6 @@
 use crate::block_py::{
     BlockArg, BlockEdge, BlockTerm, ChildVisitable, FunctionNameGen, Instr, InstrLow,
-    InstrWithAwaitAndYield, Load, Meta, NameLike, UnresolvedName, WithMeta,
+    InstrResolved, InstrWithAwaitAndYield, Load, Meta, NameLike, UnresolvedName, WithMeta,
 };
 use ruff_python_ast::{self as ast};
 use ruff_text_size::TextRange;
@@ -44,6 +44,21 @@ where
         };
         let Some(func_name) = (match call.func.as_ref() {
             InstrLow::Load(op) => Some(op.name.id_str()),
+            _ => None,
+        }) else {
+            return false;
+        };
+        call.args.is_empty() && call.keywords.is_empty() && func_name == "current_exception"
+    }
+}
+
+impl CurrentExceptionExpr for InstrResolved {
+    fn is_current_exception_call(&self) -> bool {
+        let InstrResolved::Call(call) = self else {
+            return false;
+        };
+        let Some(func_name) = (match call.func.as_ref() {
+            InstrResolved::Load(op) => Some(op.name.id_str()),
             _ => None,
         }) else {
             return false;

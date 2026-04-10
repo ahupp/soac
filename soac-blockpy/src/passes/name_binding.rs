@@ -287,6 +287,13 @@ where
     }
 }
 
+fn raw_resolved_load_name(expr: &InstrResolved) -> Option<String> {
+    match expr {
+        InstrResolved::Load(op) => Some(op.name.id_str().to_string()),
+        _ => None,
+    }
+}
+
 fn rewrite_name_load(
     name: ast::name::Name,
     meta: crate::block_py::Meta,
@@ -2119,9 +2126,9 @@ impl NameLocator<'_> {
         }
     }
 
-    fn mark_raw_cell_expr(&self, expr: InstrLow<ResolvedName>) -> InstrLow<ResolvedName> {
+    fn mark_raw_cell_expr(&self, expr: InstrResolved) -> InstrResolved {
         match expr {
-            InstrLow::Load(op) => {
+            InstrResolved::Load(op) => {
                 let meta = op.meta();
                 let name = op.name;
                 let marked = self.mark_raw_cell_name(name);
@@ -2135,8 +2142,8 @@ impl NameLocator<'_> {
     }
 }
 
-impl MapInstr<InstrUnresolved, InstrLow<ResolvedName>> for NameLocator<'_> {
-    fn map_instr(&mut self, expr: InstrUnresolved) -> InstrLow<ResolvedName> {
+impl MapInstr<InstrUnresolved, InstrResolved> for NameLocator<'_> {
+    fn map_instr(&mut self, expr: InstrUnresolved) -> InstrResolved {
         match_default!(expr: crate::passes::InstrLow<UnresolvedName> {
             InstrLow::Literal(literal) => InstrResolved::Literal(literal),
             InstrLow::Load(op) => {
@@ -2178,7 +2185,7 @@ impl MapInstr<InstrUnresolved, InstrLow<ResolvedName>> for NameLocator<'_> {
             InstrLow::Call(call) => {
                 let meta = call.meta();
                 let call = call.map_children(self);
-                if raw_load_name(call.func.as_ref())
+                if raw_resolved_load_name(call.func.as_ref())
                     .as_ref()
                     .is_some_and(|name| name == "class_lookup_cell")
                     && call.args.len() == 3

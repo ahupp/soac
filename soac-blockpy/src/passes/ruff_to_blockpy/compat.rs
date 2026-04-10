@@ -1,7 +1,7 @@
 use super::*;
 use crate::block_py::{
     Await, Block, BlockEdge, BlockLabel, BlockTerm, Call, CallArgPositional, ExprAttribute, Instr,
-    TermIf, TermRaise, WithMeta,
+    InstrWithConstantNone, TermIf, TermRaise, WithMeta,
 };
 use crate::passes::ast_to_ast::context::Context;
 use crate::passes::ruff_to_blockpy::expr_lowering::{
@@ -15,7 +15,7 @@ fn try_lower_direct_expr<E>(
     expr: InstrRuff,
 ) -> Option<Result<LoweredExpr<E, InstrRuff>, String>>
 where
-    E: RuffToBlockPyExpr,
+    E: RuffToBlockPyExpr + InstrWithConstantNone,
 {
     match expr {
         InstrRuff::ExprIf(if_expr) => {

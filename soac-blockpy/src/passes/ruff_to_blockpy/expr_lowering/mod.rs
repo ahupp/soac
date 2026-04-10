@@ -1,7 +1,7 @@
 use crate::block_py::{
     core_runtime_positional_call_expr_with_meta, literal_expr, operation, Del, FunctionId,
-    FunctionKind, HasMeta, Instr, InstrWithAwaitAndYield, Meta, Store, StringLiteral,
-    UnresolvedName, WithMeta,
+    FunctionKind, HasMeta, InstrWithAwaitAndYield, InstrWithConstantNone, Meta, Store,
+    StringLiteral, UnresolvedName, WithMeta,
 };
 use crate::namegen::fresh_name;
 use crate::passes::ast_to_ast::string_templates::lower_string_templates_in_instr_ruff;
@@ -26,7 +26,12 @@ fn string_literal_expr(
 }
 
 pub(crate) trait RuffToBlockPyExpr:
-    From<Store<Self>> + From<Del<Self>> + Instr<Name = UnresolvedName> + std::fmt::Debug + Clone + Sized
+    From<Store<Self>>
+    + From<Del<Self>>
+    + InstrWithConstantNone<Name = UnresolvedName>
+    + std::fmt::Debug
+    + Clone
+    + Sized
 {
     fn from_lowered_expr(expr: InstrRuff) -> Self;
 

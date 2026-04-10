@@ -1,13 +1,13 @@
 use crate::block_py::{
-    BlockPyFunction, BlockPyModule, HasMeta, InstrCodegen, InstrLow, InstrResolved, LiteralValue,
-    Load, MapFunction, MapInstr, Mappable, NameLocation, ResolvedName, WithMeta,
+    BlockPyFunction, BlockPyModule, HasMeta, InstrCodegen, InstrResolved, LiteralValue, Load,
+    MapFunction, MapInstr, Mappable, NameLocation, ResolvedName, WithMeta,
 };
-use crate::passes::{CodegenModuleShape, ResolvedStorageModuleShape};
+use crate::passes::{CodegenUnidentifiedModuleShape, ResolvedStorageModuleShape};
 use soac_macros::match_default;
 
 pub fn normalize_bb_module_strings(
     module: &BlockPyModule<ResolvedStorageModuleShape>,
-) -> BlockPyModule<CodegenModuleShape> {
+) -> BlockPyModule<CodegenUnidentifiedModuleShape> {
     let mut normalizer = CodegenExprNormalizer::default();
     let module = module.clone();
     let mut module_constants = module.module_constants;
@@ -15,7 +15,7 @@ pub fn normalize_bb_module_strings(
         .callable_defs
         .into_iter()
         .map(|function| normalizer.map_fn(function))
-        .collect::<Vec<BlockPyFunction<CodegenModuleShape>>>();
+        .collect::<Vec<BlockPyFunction<CodegenUnidentifiedModuleShape>>>();
     module_constants.extend(normalizer.module_constants);
     BlockPyModule {
         module_name_gen: module.module_name_gen,
@@ -42,7 +42,7 @@ impl CodegenExprNormalizer {
 
 impl MapInstr<InstrResolved, InstrCodegen> for CodegenExprNormalizer {
     fn map_instr(&mut self, expr: InstrResolved) -> InstrCodegen {
-        match_default!(expr: crate::passes::InstrLow<ResolvedName> {
+        match_default!(expr: crate::passes::InstrResolved {
             InstrResolved::Literal(literal) => {
                 let meta = literal.meta();
                 let constant_index = self.push_module_constant(literal);
@@ -52,12 +52,6 @@ impl MapInstr<InstrResolved, InstrCodegen> for CodegenExprNormalizer {
                 })
                 .with_meta(meta)
                 .into()
-            },
-            InstrResolved::CellRefForName(node) => {
-                panic!(
-                    "cell_ref should lower to a resolved cell ref before codegen, got {:?}",
-                    node.logical_name
-                );
             },
             InstrResolved::CellRef(node) => node.into(),
             rest => rest.map_children(self).into(),

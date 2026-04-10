@@ -4,18 +4,15 @@ use super::{
 };
 use crate::block_py::{
     Block, BlockLabel, BlockParam, BlockParamRole, BlockTerm, CallArgPositional, ChildVisitable,
-    InstrLow, InstrResolved, InstrUnresolved, Meta, ModuleNameGen, NameLike, NameLocation,
-    ResolvedName, ResolvedStorageBlock, TermIf, WithMeta,
+    InstrResolved, InstrUnresolved, Meta, ModuleNameGen, NameLike, NameLocation, ResolvedName,
+    ResolvedStorageBlock, TermIf, WithMeta,
 };
 use ruff_python_ast::{self as ast};
 use ruff_text_size::TextRange;
 
-pub(crate) fn lower_structured_core_blocks_to_bb_blocks<N>(
-    blocks: &[Block<InstrLow<N>>],
-) -> Vec<Block<InstrLow<N>>>
-where
-    N: NameLike,
-{
+pub(crate) fn lower_structured_resolved_core_blocks_to_bb_blocks(
+    blocks: &[Block<InstrResolved>],
+) -> Vec<Block<InstrResolved>> {
     let module_name_gen = ModuleNameGen::new(0);
     let name_gen = module_name_gen.next_function_name_gen();
     let normalized_blocks = blocks.to_vec();
@@ -49,7 +46,7 @@ pub(crate) fn lower_structured_unresolved_core_blocks_to_bb_blocks(
 pub(crate) fn lower_structured_located_blocks_to_bb_blocks(
     blocks: &[Block<InstrResolved>],
 ) -> Vec<ResolvedStorageBlock> {
-    let mut lowered = lower_structured_core_blocks_to_bb_blocks(blocks);
+    let mut lowered = lower_structured_resolved_core_blocks_to_bb_blocks(blocks);
     rewrite_current_exception_in_located_core_blocks(&mut lowered);
     lowered
 }
