@@ -3,9 +3,10 @@
 ## Goal
 
 Move from the current "fresh `JITModule` per compiled runner" model to a
-long-lived per-module JIT owner so transformed functions can:
+long-lived process JIT owner rooted in `CompileSession` so transformed
+functions can:
 
-- share stable CLIF symbols across one transformed Python module
+- share stable CLIF symbols across transformed Python modules
 - emit direct CLIF calls to other compiled SOAC functions
 - eventually inline across function boundaries
 
@@ -17,62 +18,69 @@ and recursion behavior.
 
 - Preserve CPython-visible behavior first. If a direct-call path is not
   proven safe, it must fall back rather than guessing.
-- Keep one owner for compiled code. The owner should be
-  `SharedModuleState`, not a process-global singleton.
-- Separate symbol identity from code generation. We need a stable callee
-  symbol before we can compile arbitrary callers against it.
+- Keep one owner for compiled code. `CompileSession` owns the
+  `ProcessJitEngine`; `SharedModuleState` owns transformed module data and
+  is retained by the session so cross-module lookups have a stable root.
+- Pass `Arc<CompileSession>` explicitly through runtime and codegen paths.
+  Avoid hidden `CompileSession::process()` lookups inside `SharedModuleState`
+  helpers or other code that should be scoped to the active session.
+- Separate symbol identity from body code generation. We need a stable callee
+  symbol before we can compile arbitrary callers against it, especially for
+  recursive and mutually-recursive functions.
 - Treat inlining as a later pass over a stable shared call graph, not as
   hidden behavior inside the compilation cache.
 
+## Current Status
+
+- `CompileSession` owns a lazily-created `ProcessJitEngine`.
+- `CompileSession` also owns the retained `SharedModuleState` registry used
+  for cross-module `FunctionId` lookup.
+- `ProcessJitState` owns one Cranelift `JITModule`, the direct-function
+  declaration/ready registry, and shared vectorcall trampolines by arity.
+- Direct function compilation walks reachable `CallDirect` edges and profiled
+  call-target edges, predeclares the batch, defines bodies, finalizes once,
+  and publishes `CompiledFunctionHandle`s.
+- `FunctionEnv.direct_code_ptr` remains the runtime lazy-call fallback for
+  direct edges that cannot use a predeclared CLIF symbol in the current batch.
+- Vectorcall trampolines are process-JIT functions reused by arity.
+
 ## Migration Steps
 
-### 1. Introduce an explicit per-module JIT owner
+### 1. Keep compiled-code ownership in `CompileSession`
 
-Add a long-lived JIT owner under `SharedModuleState` that contains:
+Status: implemented for production direct function bodies and vectorcall
+trampolines.
 
-- one `JITModule`
-- common CLIF/ISA/settings state used to declare and define functions
-- a registry keyed by packed `FunctionId`
+Remaining cleanup:
 
-Suggested shape:
-
-```rust
-struct SharedJitModule {
-    module: JITModule,
-    functions: HashMap<FunctionId, CompiledFunctionState>,
-}
-
-enum CompiledFunctionState {
-    Declared { func_id: cranelift_module::FuncId },
-    Compiling { func_id: cranelift_module::FuncId },
-    Ready {
-        func_id: cranelift_module::FuncId,
-        entry_ptr: *const u8,
-        generation: u32,
-    },
-}
-```
-
-This step should not change call lowering yet. It only moves symbol and
-code ownership into one place.
+- keep render/debug-only paths clearly marked as standalone or thread an
+  explicit `CompileSession` through them when they need runtime state
+- avoid adding new direct uses of `CompileSession::process()` below the
+  runtime entry boundary
 
 ### 2. Split symbol declaration from body compilation
 
-Add an early declaration pass over transformed functions so every
-`FunctionId` gets one stable CLIF `FuncId` before any function body is
-compiled.
+Status: implemented inside each process-JIT compile batch. The batch
+collector finds reachable direct targets, declares all functions first, and
+then defines bodies.
 
-That gives the first hard invariant:
+Next refinement:
 
-- every transformed SOAC function has exactly one declared CLIF symbol in
-  its owning shared module
+- make the collected batch and skipped targets observable so we can explain
+  why an edge used a CLIF direct call, `FunctionEnv.direct_code_ptr`, or the
+  generic Python call fallback
 
-This is the prerequisite for safe recursion and mutual recursion without
-raw-pointer patching.
+The hard invariant should become:
+
+- every transformed SOAC function compiled in a `CompileSession` has at most
+  one declared CLIF symbol for its current validated shape
 
 ### 3. Change `CallDirect` to use CLIF direct calls
 
-Replace the current immediate-pointer `call_indirect` path with:
+Status: mostly implemented for edges that are present in the process-JIT
+predeclared batch.
+
+The intended lowering remains:
 
 - look up the callee's declared `FuncId`
 - import it into the caller IR with `declare_func_in_func`
@@ -89,25 +97,31 @@ let call = fb.ins().call(callee_ref, &args);
 Keep generic `Call(...)` fallback in place until direct-call correctness is
 proven.
 
-### 4. Keep compilation lazy, but make symbols stable
+When a direct edge is not present in the current predeclared batch, the
+temporary fallback is `FunctionEnv.direct_code_ptr` plus `call_indirect`.
+That keeps lazy compilation working while the process-JIT graph is still
+being expanded.
+
+### 4. Keep compilation lazy, but make batch symbols stable
 
 Keep demand-driven body compilation:
 
-- declaration may happen eagerly for all functions in the module
+- declaration happens eagerly for all functions in the current process-JIT
+  batch
 - code generation happens on first need
-- once compiled, the symbol remains module-owned and stable
+- once compiled, the symbol remains session-owned and stable
 
 Caller `A` can force body compilation of callee `B`, but must not need to
 invent a new symbol identity for `B`.
 
 ### 5. Add explicit generation/versioning
 
-A shared module needs an invalidation story before it can safely replace
+A process JIT needs an invalidation story before it can safely replace
 compiled code.
 
 Initial safe policy:
 
-- compile once per transformed module lifetime
+- compile once per transformed function shape in a `CompileSession`
 - do not replace compiled bodies in place yet
 - if invalidation becomes necessary, compile a new generation under an
   explicitly managed policy rather than silently reusing stale callers
@@ -117,7 +131,7 @@ we try aggressive re-specialization.
 
 ### 6. Move direct-call dependency tracking into the shared registry
 
-The current `CallDirect` work already needs to know when a target is:
+The current `CallDirect` work already needs to explain when a target is:
 
 - declared but not compiled
 - compiling recursively
@@ -130,7 +144,7 @@ Track direct-call dependencies explicitly:
 - edge status: emitted direct, deferred, or forced to fallback
 
 That prepares the system for fixed-point recompilation later without
-inventing a second cache beside the shared module.
+inventing a second cache beside the process JIT.
 
 ### 7. Add validation for cross-function call compatibility
 
@@ -188,23 +202,38 @@ Suggested sequence:
 Each stage should be individually switchable so regressions can be
 isolated quickly.
 
-## Suggested First Implementation Slice
+## Next Implementation Slices
 
-- Build `SharedJitModule` under `SharedModuleState`
-- Eagerly declare every transformed function by `FunctionId`
-- Teach `CallDirect` lowering to use declared `FuncId` plus CLIF `call`
-- Keep current specialization policy and generic fallback unchanged
-- Add:
-  - one recursive-call test
-  - one mutually-recursive-call test
-  - one direct-call rendering test showing imported `FuncRef` use instead
-    of immediate code pointers
+1. Finish explicit-session cleanup.
+   - Keep `SharedModuleState` free of hidden process-singleton lookups.
+   - Thread the current `Arc<CompileSession>` into any remaining production
+     compile or direct-target lookup path.
+
+2. Add process-JIT edge observability.
+   - Count edges emitted as CLIF direct calls.
+   - Count edges using `FunctionEnv.direct_code_ptr`.
+   - Count edges falling back to generic Python calls and record the reason.
+
+3. Tighten recursion and cross-module tests.
+   - Recursive direct call in one module.
+   - Mutually-recursive direct calls in one module.
+   - Cross-module direct call where the callee is found through the
+     `CompileSession` retained-state registry.
+
+4. Remove the temporary indirect direct-call path once the batch collector
+   reliably covers all supported direct edges.
+   - After that, supported direct edges should be CLIF `call`; unsupported
+     edges should go through the generic Python call fallback.
+
+5. Benchmark before inlining.
+   - Measure direct-call heavy workloads before changing the inliner.
+   - Record any finalized performance result in `docs/CODEX_OPT_LOG.md`.
 
 ## Challenging Parts
 
 ### Invalidation and replacement
 
-A shared module makes symbol lifetime easier and code replacement harder.
+A process JIT makes symbol lifetime easier and code replacement harder.
 This is the largest architectural risk.
 
 ### Recursive compilation

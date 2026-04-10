@@ -1403,7 +1403,7 @@ unsafe fn ensure_clif_vectorcall_compiled(
         let compile_start = Instant::now();
         let compiled_function = match data
             .module_state
-            .lookup_or_compile_direct_function_handle(function.function_id)
+            .lookup_or_compile_direct_function_handle(&data.compile_session, function.function_id)
         {
             Ok(Some(handle)) => handle,
             Ok(None) => {

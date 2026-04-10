@@ -100,6 +100,7 @@ impl SharedModuleState {
 
     pub(crate) fn lookup_direct_call_target_function(
         &self,
+        compile_session: &crate::session::CompileSession,
         function_id: FunctionId,
     ) -> Result<Option<BlockPyFunction<CodegenModuleShape>>, String> {
         if function_id == FunctionId::global() {
@@ -111,7 +112,7 @@ impl SharedModuleState {
         if function_id.module_id() == self.module_id() {
             return Ok(None);
         }
-        Ok(crate::session::CompileSession::process()
+        Ok(compile_session
             .lookup_shared_function(function_id)?
             .map(|(_shared_state, function)| function))
     }
@@ -187,6 +188,7 @@ impl SharedModuleState {
 
     pub(crate) fn lookup_or_compile_direct_function_handle(
         &self,
+        compile_session: &Arc<crate::session::CompileSession>,
         function_id: FunctionId,
     ) -> Result<Option<Arc<crate::jit::CompiledFunctionHandle>>, String> {
         if function_id == FunctionId::global() {
@@ -194,11 +196,12 @@ impl SharedModuleState {
         }
         if function_id != FunctionId::global() && function_id.module_id() != self.module_id() {
             let Some((shared_state, _function)) =
-                crate::session::CompileSession::process().lookup_shared_function(function_id)?
+                compile_session.lookup_shared_function(function_id)?
             else {
                 return Ok(None);
             };
-            return shared_state.lookup_or_compile_direct_function_handle(function_id);
+            return shared_state
+                .lookup_or_compile_direct_function_handle(compile_session, function_id);
         }
         if crate::jit::process_jit_is_currently_compiling() {
             return Ok(None);
@@ -211,10 +214,9 @@ impl SharedModuleState {
         let module_constant_ptrs = self.module_constant_ptrs();
         let counter_ptrs = self.counter_ptrs();
         let compile_start = std::time::Instant::now();
-        let compile_session = crate::session::CompileSession::process();
         let compile_result = unsafe {
             crate::jit::compile_cranelift_run_bb_specialized_cached(
-                &compile_session,
+                compile_session,
                 blocks.as_slice(),
                 &self.lowered_module,
                 &function,

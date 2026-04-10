@@ -473,6 +473,7 @@ mod tests {
                     &shared_state.lowered_module.counter_defs,
                     &module_constant_ptrs,
                     &counter_ptrs,
+                    None,
                     Some(shared_state.as_ref()),
                     None,
                     None,
@@ -594,6 +595,7 @@ mod tests {
                     &shared_state.lowered_module.counter_defs,
                     &module_constant_ptrs,
                     &counter_ptrs,
+                    None,
                     Some(shared_state.as_ref()),
                     None,
                     None,
@@ -665,6 +667,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .expect("specialized JIT build should succeed");
             let (clif, _cfg_dot, _vcode_disasm) = render_compiled_clif_and_vcode_disasm(
@@ -697,6 +700,7 @@ mod tests {
                 &[],
                 &module_constant_ptrs,
                 &counter_ptrs,
+                None,
                 None,
                 None,
                 None,
@@ -2394,6 +2398,7 @@ def f():
                         &shared_state.lowered_module.counter_defs,
                         &module_constant_ptrs,
                         &counter_ptrs,
+                        None,
                         Some(shared_state.as_ref()),
                         None,
                         None,

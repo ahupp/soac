@@ -1403,7 +1403,6 @@ struct JitEmitCtx<'mc> {
     tuple_new_ref: ir::FuncRef,
     tuple_set_item_ref: ir::FuncRef,
     stack_slots: StackSlots,
-    direct_call_code_ptrs: &'mc HashMap<FunctionId, ObjPtr>,
     direct_call_target_functions: &'mc HashMap<FunctionId, BlockPyFunction<CodegenModuleShape>>,
     direct_call_functions: &'mc HashMap<FunctionId, DeclaredJitFunction>,
     call_target_counter_ids: &'mc HashMap<InstrId, CounterId>,
@@ -1443,7 +1442,6 @@ fn infer_jit_value_facts(module: &BlockPyModule<CodegenModuleShape>) -> FactStor
 #[derive(Clone, Copy)]
 struct DirectMethodSpecialization {
     function_id: FunctionId,
-    target_code_ptr: ObjPtr,
     descriptor_function: ObjPtr,
     owner_type: *mut ffi::PyTypeObject,
     type_version: u32,
@@ -1452,7 +1450,6 @@ struct DirectMethodSpecialization {
 #[derive(Clone, Copy)]
 struct DirectConstructorSpecialization {
     function_id: FunctionId,
-    target_code_ptr: ObjPtr,
     init_function: ObjPtr,
     owner_type: *mut ffi::PyTypeObject,
     type_version: u32,
@@ -2535,9 +2532,6 @@ fn direct_method_specializations_for_call_site(
         if call.args.len() + 1 != target_function.params.len() {
             continue;
         }
-        let Some(&target_code_ptr) = ctx.direct_call_code_ptrs.get(&function_id) else {
-            continue;
-        };
         let Ok(owner_types) =
             (unsafe { crate::lookup_exact_owner_types_for_method(function_id, method_name) })
         else {
@@ -2548,7 +2542,6 @@ fn direct_method_specializations_for_call_site(
                 .into_iter()
                 .map(|owner| DirectMethodSpecialization {
                     function_id,
-                    target_code_ptr,
                     descriptor_function: owner.function_obj as ObjPtr,
                     owner_type: owner.owner_type,
                     type_version: owner.type_version,
@@ -2579,9 +2572,6 @@ fn direct_constructor_specializations_for_call_site(
         if call.args.len() + 1 != target_function.params.len() {
             continue;
         }
-        let Some(&target_code_ptr) = ctx.direct_call_code_ptrs.get(&function_id) else {
-            continue;
-        };
         let Ok(owner_types) =
             (unsafe { crate::lookup_exact_owner_types_for_constructor(function_id) })
         else {
@@ -2592,7 +2582,6 @@ fn direct_constructor_specializations_for_call_site(
                 .into_iter()
                 .map(|owner| DirectConstructorSpecialization {
                     function_id,
-                    target_code_ptr,
                     init_function: owner.init_function_obj as ObjPtr,
                     owner_type: owner.owner_type,
                     type_version: owner.type_version,
@@ -3043,7 +3032,6 @@ fn emit_direct_call_resolved_raw_with_arg_values(
     arg_values: Vec<ir::Value>,
     arg_borrowed: Vec<bool>,
     target_function: &BlockPyFunction<CodegenModuleShape>,
-    _target_code_ptr: ObjPtr,
     ctx: &JitEmitCtx<'_>,
     jit_module: &mut JITModule,
 ) -> ir::Value {
@@ -3127,7 +3115,6 @@ fn emit_direct_call_resolved_with_arg_values(
     arg_values: Vec<ir::Value>,
     arg_borrowed: Vec<bool>,
     target_function: &BlockPyFunction<CodegenModuleShape>,
-    target_code_ptr: ObjPtr,
     ctx: &JitEmitCtx<'_>,
     jit_module: &mut JITModule,
 ) -> ir::Value {
@@ -3140,7 +3127,6 @@ fn emit_direct_call_resolved_with_arg_values(
         arg_values,
         arg_borrowed,
         target_function,
-        target_code_ptr,
         ctx,
         jit_module,
     );
@@ -3220,7 +3206,6 @@ fn emit_direct_constructor_resolved_with_arg_values(
         init_arg_values,
         init_arg_borrowed,
         target_function,
-        specialization.target_code_ptr,
         ctx,
         jit_module,
     );
@@ -3248,7 +3233,6 @@ fn emit_direct_call_resolved(
     callable_is_borrowed: bool,
     args: &[&InstrCodegen],
     target_function: &BlockPyFunction<CodegenModuleShape>,
-    target_code_ptr: ObjPtr,
     local_names: &mut Vec<String>,
     local_values: &mut Vec<ir::Value>,
     ctx: &JitEmitCtx<'_>,
@@ -3283,7 +3267,6 @@ fn emit_direct_call_resolved(
         arg_values,
         arg_borrowed,
         target_function,
-        target_code_ptr,
         ctx,
         jit_module,
     )
@@ -3333,10 +3316,6 @@ fn emit_call_direct_expr(
         return fallback();
     }
 
-    let Some(&target_code_ptr) = ctx.direct_call_code_ptrs.get(&call.function_id) else {
-        return fallback();
-    };
-
     let callable_is_borrowed = codegen_expr_is_borrowable(
         call.callable.as_ref(),
         local_names,
@@ -3369,7 +3348,6 @@ fn emit_call_direct_expr(
         callable_is_borrowed,
         args.as_slice(),
         target_function,
-        target_code_ptr,
         local_names,
         local_values,
         ctx,
@@ -4392,7 +4370,6 @@ fn emit_codegen_expr(
                             arg_values,
                             arg_borrowed,
                             target_function,
-                            specialization.target_code_ptr,
                             ctx,
                             jit_module,
                         );
@@ -4495,9 +4472,7 @@ fn emit_codegen_expr(
                                 if args.len() != target_function.params.len() {
                                     return None;
                                 }
-                                let &target_code_ptr =
-                                    ctx.direct_call_code_ptrs.get(&function_id)?;
-                                Some((function_id, target_code_ptr))
+                                Some(function_id)
                             })
                             .collect::<Vec<_>>()
                     })
@@ -4620,9 +4595,7 @@ fn emit_codegen_expr(
                             if let Some(start_block) = direct_chain_start {
                                 fb.switch_to_block(start_block);
                             }
-                            for (index, &(function_id, target_code_ptr)) in
-                                direct_specializations.iter().enumerate()
-                            {
+                            for (index, &function_id) in direct_specializations.iter().enumerate() {
                                 let direct_block = fb.create_block();
                                 let miss_block = if index + 1 == direct_specializations.len() {
                                     generic_block
@@ -4648,7 +4621,6 @@ fn emit_codegen_expr(
                                     callable_is_borrowed,
                                     args.as_slice(),
                                     target_function,
-                                    target_code_ptr,
                                     local_names,
                                     local_values,
                                     ctx,
@@ -5900,6 +5872,7 @@ impl ProcessJitEngine {
                 function_counter_defs,
                 function_module_constant_ptrs,
                 function_counter_ptrs,
+                Some(session),
                 function_direct_call_resolver,
                 None,
                 Some(&predeclared),
@@ -6736,6 +6709,7 @@ fn build_cranelift_run_bb_specialized_function(
     counter_defs: &[CounterDef],
     module_constant_ptrs: &[*mut ffi::PyObject],
     counter_ptrs: &[*mut u64],
+    compile_session: Option<&Arc<crate::session::CompileSession>>,
     direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
     symbol_scope: Option<&str>,
     predeclared_direct_functions: Option<&HashMap<FunctionId, DeclaredJitFunction>>,
@@ -6853,46 +6827,38 @@ fn build_cranelift_run_bb_specialized_function(
     for targets in call_target_specializations.values() {
         direct_call_targets.extend(targets.iter().copied());
     }
+    let process_compile_session;
+    let compile_session = if let Some(compile_session) = compile_session {
+        compile_session.as_ref()
+    } else {
+        process_compile_session = crate::session::CompileSession::process();
+        process_compile_session.as_ref()
+    };
 
     let empty_direct_functions = HashMap::new();
     let direct_call_functions = predeclared_direct_functions.unwrap_or(&empty_direct_functions);
     let value_facts = infer_jit_value_facts(module);
     let local_plan = plan_function_locals(function, &value_facts);
 
-    let mut direct_call_code_ptrs = HashMap::new();
     let mut direct_call_target_functions = HashMap::new();
     for function_id in direct_call_targets {
-        if direct_call_functions.contains_key(&function_id) {
-            if !module
-                .callable_defs
-                .iter()
-                .any(|function| function.function_id == function_id)
-                && let Some(target_function) = direct_call_resolver
-                    .map(|shared_state| {
-                        shared_state.lookup_direct_call_target_function(function_id)
-                    })
-                    .transpose()?
-                    .flatten()
-            {
-                direct_call_target_functions.insert(function_id, target_function);
-            }
-            direct_call_code_ptrs.insert(function_id, 1usize as ObjPtr);
+        if module
+            .callable_defs
+            .iter()
+            .any(|function| function.function_id == function_id)
+        {
             continue;
         }
         let Some(target_function) = direct_call_resolver
-            .map(|shared_state| shared_state.lookup_direct_call_target_function(function_id))
+            .map(|shared_state| {
+                shared_state.lookup_direct_call_target_function(compile_session, function_id)
+            })
             .transpose()?
             .flatten()
         else {
             continue;
         };
         direct_call_target_functions.insert(function_id, target_function);
-        direct_call_code_ptrs.insert(function_id, 1usize as ObjPtr);
-    }
-    for function_id in direct_call_functions.keys().copied() {
-        if !direct_call_code_ptrs.contains_key(&function_id) {
-            direct_call_code_ptrs.insert(function_id, 1usize as ObjPtr);
-        }
     }
     let top_value_counter_ptrs = direct_call_resolver
         .map(|shared_state| shared_state.top_value_counter_ptrs())
@@ -7445,7 +7411,6 @@ fn build_cranelift_run_bb_specialized_function(
                 tuple_new_ref,
                 tuple_set_item_ref,
                 stack_slots: stack_slots.clone(),
-                direct_call_code_ptrs: &direct_call_code_ptrs,
                 direct_call_target_functions: &direct_call_target_functions,
                 direct_call_functions,
                 call_target_counter_ids: &call_target_counter_ids,
@@ -7681,6 +7646,7 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
         counter_defs,
         &module_constant_ptrs,
         &counter_ptrs,
+        None,
         runtime_state,
         None,
         None,
