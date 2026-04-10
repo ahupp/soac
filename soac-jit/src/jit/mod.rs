@@ -335,13 +335,6 @@ static DP_JIT_TUPLE_SET_ITEM_IMPORT: ImportSpec = ImportSpec::new(
     &[SigType::Pointer, SigType::I64, SigType::Pointer],
     &[SigType::I32],
 );
-static DP_JIT_DICT_NEW_IMPORT: ImportSpec =
-    ImportSpec::new("dp_jit_dict_new", &[], &[SigType::Pointer]);
-static DP_JIT_DICT_SET_ITEM_IMPORT: ImportSpec = ImportSpec::new(
-    "dp_jit_dict_set_item",
-    &[SigType::Pointer, SigType::Pointer, SigType::Pointer],
-    &[SigType::I32],
-);
 static DP_JIT_IS_TRUE_IMPORT: ImportSpec =
     ImportSpec::new("dp_jit_is_true", &[SigType::Pointer], &[SigType::I32]);
 static DP_JIT_RAISE_FROM_EXC_IMPORT: ImportSpec = ImportSpec::new(
@@ -1075,183 +1068,6 @@ fn codegen_expr_runtime_helper(
         })
 }
 
-fn should_include_in_locals_snapshot(name: &str) -> bool {
-    !name.starts_with("_dp_") && name != "__soac__"
-}
-
-fn emit_codegen_locals_snapshot(fb: &mut FunctionBuilder<'_>, ctx: &JitEmitCtx<'_>) -> ir::Value {
-    let ptr_ty = ctx.consts.ptr_ty;
-    let null_ptr = fb.ins().iconst(ptr_ty, 0);
-    let locals_inst = fb.ins().call(ctx.dict_new_ref, &[]);
-    let locals_value = fb.inst_results(locals_inst)[0];
-    let locals_is_null = fb
-        .ins()
-        .icmp(ir::condcodes::IntCC::Equal, locals_value, null_ptr);
-    let locals_ok_block = fb.create_block();
-    fb.append_block_param(locals_ok_block, ptr_ty);
-    fb.ins().brif(
-        locals_is_null,
-        ctx.consts.step_null_block,
-        &step_null_block_args(ctx),
-        locals_ok_block,
-        &[ir::BlockArg::Value(locals_value)],
-    );
-    fb.switch_to_block(locals_ok_block);
-    let locals_value = fb.block_params(locals_ok_block)[0];
-
-    let slot_names = ctx
-        .storage_layout
-        .as_ref()
-        .map(|layout| {
-            layout
-                .stack_slots()
-                .iter()
-                .filter(|name| should_include_in_locals_snapshot(name))
-                .cloned()
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    for name in slot_names {
-        let Some(value) = load_stack_slot_value(
-            fb,
-            &ctx.stack_slots,
-            name.as_str(),
-            ptr_ty,
-            true,
-            ctx.incref_ref,
-        ) else {
-            continue;
-        };
-        let skip_block = fb.create_block();
-        let present_block = fb.create_block();
-        let set_block = fb.create_block();
-        let after_block = fb.create_block();
-        let value_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, value, null_ptr);
-        fb.ins()
-            .brif(value_is_null, skip_block, &[], present_block, &[]);
-
-        fb.switch_to_block(present_block);
-        let value_is_deleted =
-            fb.ins()
-                .icmp(ir::condcodes::IntCC::Equal, value, ctx.consts.deleted_const);
-        fb.ins()
-            .brif(value_is_deleted, skip_block, &[], set_block, &[]);
-
-        fb.switch_to_block(set_block);
-        let name_obj = emit_owned_module_constant(
-            fb,
-            ctx.module_constants
-                .require_unicode_constant_id(name.as_str()),
-            ctx,
-        );
-        let set_inst = fb
-            .ins()
-            .call(ctx.dict_set_item_ref, &[locals_value, name_obj, value]);
-        fb.ins().call(ctx.decref_ref, &[name_obj]);
-        let set_result = fb.inst_results(set_inst)[0];
-        let set_failed = fb
-            .ins()
-            .icmp_imm(ir::condcodes::IntCC::SignedLessThan, set_result, 0);
-        let set_failed_block = fb.create_block();
-        fb.ins()
-            .brif(set_failed, set_failed_block, &[], after_block, &[]);
-
-        fb.switch_to_block(set_failed_block);
-        fb.ins().call(ctx.decref_ref, &[locals_value]);
-        fb.ins()
-            .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
-
-        fb.switch_to_block(skip_block);
-        fb.ins().jump(after_block, &[]);
-
-        fb.switch_to_block(after_block);
-    }
-
-    locals_value
-}
-
-fn emit_codegen_current_scope_builtin_call(
-    fb: &mut FunctionBuilder<'_>,
-    callable_expr: &InstrCodegen,
-    arg: &InstrCodegen,
-    local_names: &mut Vec<String>,
-    local_values: &mut Vec<ir::Value>,
-    ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
-    func_imports: &mut FuncBuildImports<'_>,
-) -> ir::Value {
-    let ptr_ty = ctx.consts.ptr_ty;
-    let null_ptr = fb.ins().iconst(ptr_ty, 0);
-    let callable_is_borrowed = codegen_expr_is_borrowable(
-        callable_expr,
-        local_names,
-        &ctx.stack_slots,
-        ctx.storage_layout.as_ref(),
-    );
-    let callable = emit_codegen_expr(
-        fb,
-        callable_expr,
-        local_names,
-        local_values,
-        ctx,
-        callable_is_borrowed,
-        jit_module,
-        func_imports,
-    );
-
-    let arg_is_borrowed = codegen_expr_is_borrowable(
-        arg,
-        local_names,
-        &ctx.stack_slots,
-        ctx.storage_layout.as_ref(),
-    );
-    let arg_value = emit_codegen_expr(
-        fb,
-        arg,
-        local_names,
-        local_values,
-        ctx,
-        arg_is_borrowed,
-        jit_module,
-        func_imports,
-    );
-    let locals_value = emit_codegen_locals_snapshot(fb, ctx);
-    let call_inst = fb.ins().call(
-        ctx.py_call_positional_three_ref,
-        &[
-            callable,
-            arg_value,
-            ctx.consts.block_const,
-            locals_value,
-            null_ptr,
-        ],
-    );
-    fb.ins().call(ctx.decref_ref, &[locals_value]);
-    if !arg_is_borrowed {
-        fb.ins().call(ctx.decref_ref, &[arg_value]);
-    }
-    if !callable_is_borrowed {
-        fb.ins().call(ctx.decref_ref, &[callable]);
-    }
-
-    let call_value = fb.inst_results(call_inst)[0];
-    let call_is_null = fb
-        .ins()
-        .icmp(ir::condcodes::IntCC::Equal, call_value, null_ptr);
-    let call_ok_block = fb.create_block();
-    fb.append_block_param(call_ok_block, ptr_ty);
-    fb.ins().brif(
-        call_is_null,
-        ctx.consts.step_null_block,
-        &step_null_block_args(ctx),
-        call_ok_block,
-        &[ir::BlockArg::Value(call_value)],
-    );
-    fb.switch_to_block(call_ok_block);
-    fb.block_params(call_ok_block)[0]
-}
-
 fn super_instance_arg_without_deleted_guard<'a>(
     expr: &'a InstrCodegen,
     module_constants: &'a ModuleCodegenConstants,
@@ -1716,8 +1532,6 @@ struct JitEmitCtx<'mc> {
     tuple_set_item_ref: ir::FuncRef,
     take_error_before_null_cleanup_ref: ir::FuncRef,
     restore_error_after_null_cleanup_ref: ir::FuncRef,
-    dict_new_ref: ir::FuncRef,
-    dict_set_item_ref: ir::FuncRef,
     stack_slots: StackSlots,
     exception_state_slots: ExceptionStateSlots,
     pop_handled_exception_ref: ir::FuncRef,
@@ -4986,37 +4800,6 @@ fn emit_codegen_expr(
             {
                 fb.ins().call(incref_ref, &[block_const]);
                 return block_const;
-            }
-
-            if !has_unpack
-                && simple_keywords.is_empty()
-                && simple_args.is_empty()
-                && matches!(
-                    codegen_expr_helper_name(call.func.as_ref(), ctx.module_constants),
-                    Some("locals")
-                )
-            {
-                return emit_codegen_locals_snapshot(fb, ctx);
-            }
-
-            if !has_unpack
-                && simple_keywords.is_empty()
-                && simple_args.len() == 1
-                && matches!(
-                    codegen_expr_helper_name(call.func.as_ref(), ctx.module_constants),
-                    Some("eval" | "exec")
-                )
-            {
-                return emit_codegen_current_scope_builtin_call(
-                    fb,
-                    call.func.as_ref(),
-                    simple_args[0],
-                    local_names,
-                    local_values,
-                    ctx,
-                    jit_module,
-                    func_imports,
-                );
             }
 
             if !has_unpack
@@ -9184,10 +8967,6 @@ fn build_cranelift_run_bb_specialized_function(
             &mut fb.func,
             &DP_JIT_RESTORE_ERROR_AFTER_NULL_CLEANUP_IMPORT,
         );
-        let dict_new_ref =
-            func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_DICT_NEW_IMPORT);
-        let dict_set_item_ref =
-            func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_DICT_SET_ITEM_IMPORT);
         let fallthrough_abrupt_kind_const = stack_slots.has_try_abrupt_kind_name().then(|| {
             emit_owned_module_constant_from_parts(
                 &mut fb,
@@ -9497,8 +9276,6 @@ fn build_cranelift_run_bb_specialized_function(
                 tuple_set_item_ref,
                 take_error_before_null_cleanup_ref,
                 restore_error_after_null_cleanup_ref,
-                dict_new_ref,
-                dict_set_item_ref,
                 stack_slots: stack_slots.clone(),
                 exception_state_slots: exception_state_slots.clone(),
                 pop_handled_exception_ref,
