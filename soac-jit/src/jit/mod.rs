@@ -32,7 +32,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::mem::offset_of;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 unsafe extern "C" {
@@ -508,9 +508,146 @@ struct DefinedJitFunction {
 }
 
 pub(crate) struct ProcessJitEngine {
-    jit_module: Mutex<JITModule>,
+    state: Mutex<ProcessJitState>,
     vectorcall_trampolines: Mutex<HashMap<usize, VectorcallEntryFn>>,
-    next_compile_id: AtomicU64,
+}
+
+struct ProcessJitState {
+    jit_module: JITModule,
+    direct_functions: HashMap<FunctionId, ProcessJitFunctionEntry>,
+    next_direct_symbol_id: u64,
+}
+
+#[derive(Clone)]
+enum ProcessJitFunctionEntry {
+    Declared {
+        declared: DeclaredJitFunction,
+        shape: ProcessJitFunctionShape,
+    },
+    Ready {
+        declared: DeclaredJitFunction,
+        shape: ProcessJitFunctionShape,
+        code_ptr: usize,
+        param_count: usize,
+    },
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct ProcessJitFunctionShape {
+    qualname: String,
+    param_count: usize,
+}
+
+impl ProcessJitFunctionShape {
+    fn for_function(function: &BlockPyFunction<CodegenModuleShape>) -> Self {
+        Self {
+            qualname: function.names.qualname.clone(),
+            param_count: function.params.len(),
+        }
+    }
+}
+
+impl ProcessJitFunctionEntry {
+    fn declared(&self) -> DeclaredJitFunction {
+        match self {
+            Self::Declared { declared, .. } => declared.clone(),
+            Self::Ready { declared, .. } => declared.clone(),
+        }
+    }
+
+    fn shape(&self) -> &ProcessJitFunctionShape {
+        match self {
+            Self::Declared { shape, .. } | Self::Ready { shape, .. } => shape,
+        }
+    }
+
+    fn ready_entry(&self) -> Option<(DeclaredJitFunction, *const u8, usize)> {
+        match self {
+            Self::Ready {
+                declared,
+                code_ptr,
+                param_count,
+                ..
+            } => Some((declared.clone(), *code_ptr as *const u8, *param_count)),
+            Self::Declared { .. } => None,
+        }
+    }
+}
+
+impl ProcessJitState {
+    fn new() -> Result<Self, String> {
+        Ok(Self {
+            jit_module: new_jit_module()?,
+            direct_functions: HashMap::new(),
+            next_direct_symbol_id: 0,
+        })
+    }
+
+    fn declare_direct_function(
+        &mut self,
+        function: &BlockPyFunction<CodegenModuleShape>,
+    ) -> Result<DeclaredJitFunction, String> {
+        let shape = ProcessJitFunctionShape::for_function(function);
+        if let Some(entry) = self.direct_functions.get(&function.function_id) {
+            if entry.shape() == &shape {
+                return Ok(entry.declared());
+            }
+        }
+        let symbol_scope =
+            direct_function_symbol_scope(function.function_id, self.next_direct_symbol_id);
+        self.next_direct_symbol_id = self.next_direct_symbol_id.wrapping_add(1);
+        let (_sig, declared) =
+            declare_direct_function(&mut self.jit_module, function, Some(symbol_scope.as_str()))?;
+        self.direct_functions.insert(
+            function.function_id,
+            ProcessJitFunctionEntry::Declared {
+                declared: declared.clone(),
+                shape,
+            },
+        );
+        Ok(declared)
+    }
+
+    fn is_direct_function_ready(&self, function_id: FunctionId) -> bool {
+        self.direct_functions
+            .get(&function_id)
+            .is_some_and(|entry| entry.ready_entry().is_some())
+    }
+
+    fn ready_direct_function(
+        &self,
+        function: &BlockPyFunction<CodegenModuleShape>,
+    ) -> Option<(DeclaredJitFunction, *const u8, usize)> {
+        let entry = self.direct_functions.get(&function.function_id)?;
+        (entry.shape() == &ProcessJitFunctionShape::for_function(function))
+            .then(|| entry.ready_entry())
+            .flatten()
+    }
+
+    fn mark_direct_function_ready(
+        &mut self,
+        function_id: FunctionId,
+        code_ptr: *const u8,
+        param_count: usize,
+    ) -> Result<(), String> {
+        let Some(entry) = self.direct_functions.get(&function_id) else {
+            return Err(format!(
+                "process JIT function {function_id} was defined before declaration"
+            ));
+        };
+        let declared = entry.declared();
+        let shape = entry.shape().clone();
+        self.direct_functions.insert(
+            function_id,
+            ProcessJitFunctionEntry::Ready {
+                declared,
+                shape,
+                code_ptr: code_ptr as usize,
+                param_count,
+            },
+        );
+        Ok(())
+    }
 }
 
 struct ProcessJitCompileGuard;
@@ -557,6 +694,20 @@ enum CompiledRunnerEntry {
         code_ptr: *const u8,
         param_count: usize,
     },
+}
+
+fn new_compiled_direct_runner_handle(
+    session: &Arc<crate::session::CompileSession>,
+    code_ptr: *const u8,
+    param_count: usize,
+) -> ObjPtr {
+    Box::into_raw(Box::new(CompiledSpecializedRunner {
+        _session: Arc::clone(session),
+        entry: Some(CompiledRunnerEntry::Direct {
+            code_ptr,
+            param_count,
+        }),
+    })) as ObjPtr
 }
 
 fn codegen_expr_is_borrowable(
@@ -5465,9 +5616,8 @@ fn collect_process_jit_batch_functions(
 impl ProcessJitEngine {
     pub(crate) fn new() -> Result<Self, String> {
         Ok(Self {
-            jit_module: Mutex::new(new_jit_module()?),
+            state: Mutex::new(ProcessJitState::new()?),
             vectorcall_trampolines: Mutex::new(HashMap::new()),
-            next_compile_id: AtomicU64::new(0),
         })
     }
 
@@ -5483,12 +5633,13 @@ impl ProcessJitEngine {
             return Ok(entry);
         }
 
-        let mut jit_module = self
-            .jit_module
+        let mut state = self
+            .state
             .lock()
             .map_err(|_| "process JIT module lock poisoned".to_string())?;
         let symbol = format!("__soac_vectorcall_arity_{param_count}");
-        let entry = define_shared_vectorcall_trampoline(&mut jit_module, param_count, &symbol)?;
+        let entry =
+            define_shared_vectorcall_trampoline(&mut state.jit_module, param_count, &symbol)?;
         trampolines.insert(param_count, entry);
         Ok(entry)
     }
@@ -5505,23 +5656,31 @@ impl ProcessJitEngine {
         counter_ptrs: &[*mut u64],
         direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
     ) -> Result<ObjPtr, String> {
-        let compile_id = self.next_compile_id.fetch_add(1, Ordering::Relaxed);
-        let symbol_scope = format!("process:{compile_id}");
         let batch_functions = collect_process_jit_batch_functions(function, direct_call_resolver)?;
-        let mut jit_module = self
-            .jit_module
+        let mut state = self
+            .state
             .lock()
             .map_err(|_| "process JIT module lock poisoned".to_string())?;
+        if let Some((_declared, code_ptr, param_count)) = state.ready_direct_function(function) {
+            return Ok(new_compiled_direct_runner_handle(
+                session,
+                code_ptr,
+                param_count,
+            ));
+        }
         let _guard = ProcessJitCompileGuard::enter();
         let mut predeclared = HashMap::new();
+        let mut functions_to_define = Vec::new();
         for function in &batch_functions {
-            let (_sig, declared) =
-                declare_direct_function(&mut jit_module, function, Some(symbol_scope.as_str()))?;
+            let declared = state.declare_direct_function(function)?;
+            if !state.is_direct_function_ready(function.function_id) {
+                functions_to_define.push(function);
+            }
             predeclared.insert(function.function_id, declared);
         }
 
-        let mut defined_functions = Vec::with_capacity(batch_functions.len());
-        for function in &batch_functions {
+        let mut defined_functions = Vec::with_capacity(functions_to_define.len());
+        for function in functions_to_define {
             let placeholder_blocks;
             let function_blocks = if function.function_id == batch_functions[0].function_id {
                 blocks
@@ -5531,7 +5690,7 @@ impl ProcessJitEngine {
                 placeholder_blocks.as_slice()
             };
             let built = build_cranelift_run_bb_specialized_function(
-                &mut jit_module,
+                &mut state.jit_module,
                 function_blocks,
                 module,
                 function,
@@ -5540,7 +5699,7 @@ impl ProcessJitEngine {
                 module_constant_ptrs,
                 counter_ptrs,
                 direct_call_resolver,
-                Some(symbol_scope.as_str()),
+                None,
                 Some(&predeclared),
             )
             .map_err(|err| {
@@ -5553,7 +5712,7 @@ impl ProcessJitEngine {
             let main_id = built.main_id;
             let main_symbol = built.main_symbol;
             let artifact = define_function_with_incremental_cache(
-                &mut jit_module,
+                &mut state.jit_module,
                 main_id,
                 &mut ctx,
                 "failed to define specialized jit run_bb function",
@@ -5564,7 +5723,7 @@ impl ProcessJitEngine {
                     function.names.qualname, function.function_id
                 )
             })?;
-            jit_module.clear_context(&mut ctx);
+            state.jit_module.clear_context(&mut ctx);
             defined_functions.push(DefinedJitFunction {
                 function_id: function.function_id,
                 function_qualname: function.names.qualname.clone(),
@@ -5575,17 +5734,19 @@ impl ProcessJitEngine {
             });
         }
 
-        jit_module
+        state
+            .jit_module
             .finalize_definitions()
             .map_err(|err| format!("failed to finalize specialized jit run_bb function: {err}"))?;
         let mut root_handle = None;
         for defined in defined_functions {
-            let code_ptr = jit_module.get_finalized_function(defined.main_id);
+            let code_ptr = state.jit_module.get_finalized_function(defined.main_id);
+            state.mark_direct_function_ready(defined.function_id, code_ptr, defined.param_count)?;
             let code_id = jitdump::record_code_load(
                 &defined.main_symbol,
                 code_ptr.cast::<u8>(),
                 defined.artifact.code_size,
-                jit_module.isa(),
+                state.jit_module.isa(),
                 defined.artifact.systemv_unwind_info.as_ref(),
             )?;
             record_jit_bb_map(
@@ -5595,14 +5756,7 @@ impl ProcessJitEngine {
                 defined.function_id,
                 &defined.function_qualname,
             );
-            let compiled = Box::new(CompiledSpecializedRunner {
-                _session: Arc::clone(session),
-                entry: Some(CompiledRunnerEntry::Direct {
-                    code_ptr,
-                    param_count: defined.param_count,
-                }),
-            });
-            let handle = Box::into_raw(compiled) as ObjPtr;
+            let handle = new_compiled_direct_runner_handle(session, code_ptr, defined.param_count);
             if defined.function_id == function.function_id {
                 root_handle = Some(handle);
             } else if let Some(shared_state) = direct_call_resolver {
@@ -5863,6 +6017,10 @@ fn direct_function_symbol(
     let base =
         jit_python_perf_symbol_name(JIT_PYTHON_PERF_SYMBOL_KIND_DIRECT, &function.names.qualname);
     scoped_jit_symbol(&base, symbol_scope)
+}
+
+fn direct_function_symbol_scope(function_id: FunctionId, symbol_id: u64) -> String {
+    format!("fn_{}_{}", function_id.packed(), symbol_id)
 }
 
 fn declare_direct_function(

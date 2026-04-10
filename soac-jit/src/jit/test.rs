@@ -233,6 +233,37 @@ mod tests {
         render_test_jit_function_with_module_constants(function, blocks, Vec::new())
     }
 
+    #[test]
+    fn process_jit_registry_does_not_reuse_colliding_function_ids_with_different_shapes() {
+        let mut state = ProcessJitState::new().expect("process JIT state should initialize");
+        let first = test_function();
+        let mut second = test_function();
+        second.params.params.push(Param {
+            name: "x".into(),
+            kind: ParamKind::Any,
+            has_default: false,
+        });
+
+        let first_decl = state
+            .declare_direct_function(&first)
+            .expect("first function should declare");
+        let first_decl_again = state
+            .declare_direct_function(&first)
+            .expect("same shape should reuse declaration");
+        assert_eq!(first_decl.symbol, first_decl_again.symbol);
+
+        state
+            .mark_direct_function_ready(first.function_id, 1usize as *const u8, first.params.len())
+            .expect("first function should mark ready");
+        assert!(state.ready_direct_function(&first).is_some());
+        assert!(state.ready_direct_function(&second).is_none());
+
+        let second_decl = state
+            .declare_direct_function(&second)
+            .expect("colliding function id with different shape should redeclare");
+        assert_ne!(first_decl.symbol, second_decl.symbol);
+    }
+
     fn render_test_jit_function_with_module_constants(
         function: &BlockPyFunction<CodegenModuleShape>,
         blocks: &[ObjPtr],
