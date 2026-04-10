@@ -31,6 +31,7 @@ run by default, so perf reports have enough samples for hotspot attribution.
 - perf capture of the specialized apply run
 - counter / specialization text dumps
 - rendered post-opt CLIF for every lowered pystone function
+- Cranelift VCode and perf sample attribution for every JIT basic block
 
 ## Summarize
 
@@ -45,8 +46,11 @@ directory, especially:
 - `perf.log`
 - `perf_by_dso_symbol.txt`
 - `perf_callgraph.txt`
+- `perf_cranelift_blocks.tsv`
 - `clif/functions.tsv`
 - `clif/fn_<function_id>_<qualname>.clif`
+- `clif/fn_<function_id>_<qualname>.vcode`
+- `clif/fn_<function_id>_<qualname>.annotated.vcode`
 
 For a default benchmark request, report:
 

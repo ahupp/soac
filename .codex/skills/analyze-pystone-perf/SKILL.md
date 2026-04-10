@@ -52,6 +52,8 @@ For prefix `<result-dir>/perf`, inspect:
 - `<prefix>_by_dso_symbol.txt`: top self-time symbols.
 - `<prefix>_callgraph.txt`: cumulative stacks and helper-call parents.
 - `<prefix>_report.txt`: full report if the condensed reports are ambiguous.
+- `<result-dir>/perf_cranelift_blocks.tsv`: JIT samples attributed to generated
+  Cranelift basic blocks.
 
 Look for SOAC-specific boundaries first: specialized runtime helpers, generic
 CPython hooks reached from helpers, fallback vectorcall / eval-frame stacks,
@@ -69,6 +71,8 @@ and refcount / deallocation clusters.
 - `<result-dir>/verify_specializations.txt`
 - `<result-dir>/clif/functions.tsv`
 - `<result-dir>/clif/fn_<function_id>_<qualname>.clif`
+- `<result-dir>/clif/fn_<function_id>_<qualname>.vcode`
+- `<result-dir>/clif/fn_<function_id>_<qualname>.annotated.vcode`
 
 5. **Read rendered specialized CLIF for hot functions**
 
@@ -78,11 +82,11 @@ rg -n 'soac_runtime_|dp_jit_|PyObject_|PyNumber_|call_indirect' \
   <result-dir>/clif/fn_*_*.clif
 ```
 
-`just benchmark` renders one post-opt CLIF file per lowered pystone function.
-Start with functions that appear as `[JIT] py:d:<name>` in perf, then add
-callees whose helpers dominate the callgraph. For pystone this is usually
-`Proc0`, `Proc1`, `Proc8`, `Func2`, and the procs/functions reached from
-`Proc0`.
+`just benchmark` renders one post-opt CLIF file per lowered pystone function,
+plus raw and perf-annotated VCode. Start with functions that appear as `[JIT]
+py:d:<name>` in perf, then add callees whose helpers dominate the callgraph.
+For pystone this is usually `Proc0`, `Proc1`, `Proc8`, `Func2`, and the
+procs/functions reached from `Proc0`.
 
 6. **Correlate perf to CLIF and source**
 
@@ -97,6 +101,8 @@ rg -n 'dp_jit_py_vectorcall|call_indirect|dp_jit_direct_code_ptr|dp_jit_pyobject
 When reporting a candidate, cite the full chain:
 
 - Perf self/cumulative cost and the owning helper stack.
+- Cranelift block sample count from `perf_cranelift_blocks.tsv`, when the cost
+  is in generated JIT code.
 - The CLIF helper calls / fallback blocks that explain that cost.
 - The Python source shape if it matters.
 - The missing specialization or codegen decision that would remove the cost.

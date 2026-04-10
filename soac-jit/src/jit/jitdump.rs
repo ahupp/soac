@@ -167,7 +167,7 @@ mod imp {
             code_size: usize,
             isa: &dyn TargetIsa,
             unwind_info: Option<&SystemVUnwindInfo>,
-        ) -> Result<(), String> {
+        ) -> Result<u64, String> {
             if let Some(unwind_info) =
                 serialize_unwind_info(isa, code_ptr as usize as u64, code_size, unwind_info)?
             {
@@ -176,6 +176,7 @@ mod imp {
 
             let code_bytes = unsafe { slice::from_raw_parts(code_ptr, code_size) };
             let name_bytes = name.as_bytes();
+            let code_id = self.next_code_id;
             let event = CodeLoadEvent {
                 base: BaseEvent {
                     event: PERF_JIT_CODE_LOAD,
@@ -188,7 +189,7 @@ mod imp {
                 vma: code_ptr as usize as u64,
                 code_address: code_ptr as usize as u64,
                 code_size: code_size as u64,
-                code_id: self.next_code_id,
+                code_id,
             };
             self.next_code_id += 1;
             write_plain(&mut self.file, &event)?;
@@ -204,7 +205,7 @@ mod imp {
             self.file
                 .flush()
                 .map_err(|err| format!("failed to flush jitdump record for {name}: {err}"))?;
-            Ok(())
+            Ok(code_id)
         }
 
         fn record_serialized_unwind_info(
@@ -257,7 +258,7 @@ mod imp {
         code_size: usize,
         isa: &dyn TargetIsa,
         unwind_info: Option<&SystemVUnwindInfo>,
-    ) -> Result<(), String> {
+    ) -> Result<u64, String> {
         let session = JITDUMP_SESSION
             .get_or_init(|| Ok(Mutex::new(JitDumpSession::new()?)))
             .as_ref()
@@ -582,6 +583,6 @@ pub(crate) fn record_code_load(
     _code_size: usize,
     _isa: &dyn cranelift_codegen::isa::TargetIsa,
     _unwind_info: Option<&cranelift_codegen::isa::unwind::systemv::UnwindInfo>,
-) -> Result<(), String> {
-    Ok(())
+) -> Result<u64, String> {
+    Ok(0)
 }

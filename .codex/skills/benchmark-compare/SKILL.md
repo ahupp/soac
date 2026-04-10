@@ -31,8 +31,13 @@ Important files:
 - `perf_by_dso.txt`, `perf_by_dso_symbol.txt`, `perf_callgraph.txt`,
   `perf_report.txt`, and `perf_speedscope.json`: perf outputs for the
   specialized apply-mode run.
-- `clif/functions.tsv` and `clif/fn_<function_id>_<qualname>.clif`: lowered
-  pystone functions and the rendered post-opt CLIF for each one.
+- `perf_cranelift_blocks.tsv`: perf samples attributed to generated Cranelift
+  basic blocks using the JIT block-offset sidecar.
+- `clif/functions.tsv`, `clif/fn_<function_id>_<qualname>.clif`, and
+  `clif/fn_<function_id>_<qualname>.vcode`: lowered pystone functions plus the
+  rendered post-opt CLIF and VCode for each one.
+- `clif/fn_<function_id>_<qualname>.annotated.vcode`: VCode with perf sample
+  counts inserted before sampled block labels.
 
 ## Create The Current Result
 
@@ -73,9 +78,12 @@ that revision and create the exact directory for the current commit id.
 A result is complete enough for comparison when it has `benchmark.txt`,
 `counters/profile.bin`, `counters/verify.bin`, `verify_counters.txt`,
 `profile_specializations.txt`, `verify_specializations.txt`, `perf.log`, and
-`perf_callgraph.txt`. Prefer results that also have `clif/functions.tsv` and
-`clif/*.clif`; if the exact result exists but lacks CLIF, say so and re-run
-`just benchmark` for that side only if the CLIF difference is needed.
+`perf_callgraph.txt`. Prefer results that also have
+`perf_cranelift_blocks.tsv`, `clif/functions.tsv`, `clif/*.clif`, and
+`clif/*.vcode`; prefer `clif/*.annotated.vcode` when comparing JIT block-level
+changes. If the exact result exists but lacks these generated inspection
+artifacts, say so and re-run `just benchmark` for that side only if the missing
+detail is needed.
 
 ## Create A Missing Result For Another Rev
 
@@ -126,7 +134,10 @@ Compare in this order:
 7. Compare `perf.log` loops/sec as a shorter perf-context run.
 8. Compare `perf_by_dso.txt`, `perf_by_dso_symbol.txt`, and `perf_callgraph.txt`
    to explain where time moved.
-9. Compare the relevant `clif/fn_*_*.clif` files for functions whose perf
+9. Compare `perf_cranelift_blocks.tsv` to identify the specific JIT blocks that
+   gained or lost samples.
+10. Compare the relevant `clif/fn_*_*.clif`, `clif/fn_*_*.vcode`, and
+   `clif/fn_*_*.annotated.vcode` files for functions whose perf
    stacks moved materially.
 
 When reporting, include the two result directories, median specialized

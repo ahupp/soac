@@ -500,6 +500,7 @@ struct DeclaredJitFunction {
 
 struct DefinedJitFunction {
     function_id: FunctionId,
+    function_qualname: String,
     param_count: usize,
     main_id: FuncId,
     main_symbol: String,
@@ -5400,6 +5401,9 @@ fn new_jit_builder() -> Result<JITBuilder, String> {
     flag_builder
         .set("preserve_frame_pointers", "true")
         .map_err(|err| format!("failed to configure Cranelift flags: {err}"))?;
+    flag_builder
+        .set("machine_code_cfg_info", "true")
+        .map_err(|err| format!("failed to configure Cranelift flags: {err}"))?;
     let isa_builder = cranelift_native::builder().map_err(|err| format!("{err}"))?;
     let isa = isa_builder
         .finish(settings::Flags::new(flag_builder))
@@ -5581,6 +5585,7 @@ impl ProcessJitEngine {
             jit_module.clear_context(&mut ctx);
             defined_functions.push(DefinedJitFunction {
                 function_id: function.function_id,
+                function_qualname: function.names.qualname.clone(),
                 param_count: function.params.len(),
                 main_id,
                 main_symbol,
@@ -5594,13 +5599,20 @@ impl ProcessJitEngine {
         let mut root_handle = None;
         for defined in defined_functions {
             let code_ptr = jit_module.get_finalized_function(defined.main_id);
-            jitdump::record_code_load(
+            let code_id = jitdump::record_code_load(
                 &defined.main_symbol,
                 code_ptr.cast::<u8>(),
                 defined.artifact.code_size,
                 jit_module.isa(),
                 defined.artifact.systemv_unwind_info.as_ref(),
             )?;
+            record_jit_bb_map(
+                &defined.main_symbol,
+                code_id,
+                &defined.artifact,
+                defined.function_id,
+                &defined.function_qualname,
+            );
             let compiled = Box::new(CompiledSpecializedRunner {
                 _session: Arc::clone(session),
                 entry: Some(CompiledRunnerEntry::Direct {
@@ -5629,6 +5641,8 @@ impl ProcessJitEngine {
 #[derive(Debug)]
 struct DefinedFunctionArtifact {
     code_size: usize,
+    code_bb_offsets: Vec<usize>,
+    code_bb_edges: Vec<(usize, usize)>,
     systemv_unwind_info: Option<cranelift_codegen::isa::unwind::systemv::UnwindInfo>,
 }
 
@@ -5647,6 +5661,7 @@ fn define_function_with_incremental_cache(
     let (compiled, _cache_hit) = ctx
         .compile_with_cache(jit_module.isa(), &mut cache_store, &mut ctrl_plane)
         .map_err(|err| format!("{err_prefix}: {err:?}"))?;
+    let (code_bb_offsets, code_bb_edges) = compiled.get_code_bb_layout();
     let alignment = compiled.buffer.alignment as u64;
     let relocs = compiled
         .buffer
@@ -5666,8 +5681,51 @@ fn define_function_with_incremental_cache(
         .map_err(|err| format!("{err_prefix}: {err}"))?;
     Ok(DefinedFunctionArtifact {
         code_size: compiled.code_buffer().len(),
+        code_bb_offsets,
+        code_bb_edges,
         systemv_unwind_info,
     })
+}
+
+fn record_jit_bb_map(
+    symbol: &str,
+    code_id: u64,
+    artifact: &DefinedFunctionArtifact,
+    function_id: FunctionId,
+    function_qualname: &str,
+) {
+    let Some(dir) = soac_work_dir_from_env() else {
+        return;
+    };
+    let path = dir.join("jit-bb-map.jsonl");
+    let record = serde_json::json!({
+        "process_id": std::process::id(),
+        "code_id": code_id,
+        "symbol": symbol,
+        "code_size": artifact.code_size,
+        "function_id": format!("{function_id}"),
+        "function_qualname": function_qualname,
+        "bb_offsets": &artifact.code_bb_offsets,
+        "bb_edges": &artifact.code_bb_edges,
+    });
+    let result = (|| -> Result<(), String> {
+        std::fs::create_dir_all(&dir)
+            .map_err(|err| format!("failed to create {}: {err}", dir.display()))?;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|err| format!("failed to open {}: {err}", path.display()))?;
+        use std::io::Write;
+        serde_json::to_writer(&mut file, &record)
+            .map_err(|err| format!("failed to serialize {}: {err}", path.display()))?;
+        file.write_all(b"\n")
+            .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+        Ok(())
+    })();
+    if let Err(err) = result {
+        eprintln!("[soac jit bb map] {err}");
+    }
 }
 
 const RUNTIME_SUPPORT_INLINE_MAX_INSTS: usize = 128;
@@ -7279,6 +7337,11 @@ fn render_compiled_clif_and_vcode_disasm(
     import_id_to_symbol: &HashMap<u32, &'static str>,
     block_annotations: &ClifBlockDisplayAnnotations,
 ) -> Result<(String, String, String), String> {
+    inline_runtime_support_calls(
+        jit_module,
+        &mut ctx,
+        "failed to render specialized jit run_bb function",
+    )?;
     let mut ctrl_plane = ControlPlane::default();
     ctx.optimize(jit_module.isa(), &mut ctrl_plane)
         .map_err(|err| format!("failed to optimize specialized jit run_bb function: {err:?}"))?;

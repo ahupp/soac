@@ -13,6 +13,7 @@ struct Args {
     function_id: FunctionId,
     module_name: Option<String>,
     cfg_dot_out: Option<PathBuf>,
+    vcode_out: Option<PathBuf>,
     debug_plan: bool,
     specialized: bool,
 }
@@ -21,6 +22,7 @@ fn parse_args() -> Result<Args, String> {
     let mut positionals = Vec::new();
     let mut module_name = None;
     let mut cfg_dot_out = None;
+    let mut vcode_out = None;
     let mut debug_plan = false;
     let mut specialized = false;
     let mut args = std::env::args().skip(1);
@@ -37,6 +39,12 @@ fn parse_args() -> Result<Args, String> {
                     .next()
                     .ok_or_else(|| "--cfg-dot-out requires a value".to_string())?;
                 cfg_dot_out = Some(PathBuf::from(value));
+            }
+            "--vcode-out" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--vcode-out requires a value".to_string())?;
+                vcode_out = Some(PathBuf::from(value));
             }
             "--debug-plan" => {
                 debug_plan = true;
@@ -66,6 +74,7 @@ fn parse_args() -> Result<Args, String> {
         function_id,
         module_name,
         cfg_dot_out,
+        vcode_out,
         debug_plan,
         specialized,
     })
@@ -73,7 +82,7 @@ fn parse_args() -> Result<Args, String> {
 
 fn print_usage() {
     eprintln!(
-        "usage: render_jit_clif <source> <function_id> [--module-name NAME] [--cfg-dot-out PATH] [--debug-plan] [--specialized]"
+        "usage: render_jit_clif <source> <function_id> [--module-name NAME] [--cfg-dot-out PATH] [--vcode-out PATH] [--debug-plan] [--specialized]"
     );
     eprintln!(
         "       --specialized renders the second-pass shape using SOAC_WORK_DIR + SOAC_OPT_MODE=apply"
@@ -127,6 +136,10 @@ fn main() -> Result<(), String> {
     )?;
     if let Some(path) = args.cfg_dot_out {
         fs::write(&path, rendered.cfg_dot.as_bytes())
+            .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+    }
+    if let Some(path) = args.vcode_out {
+        fs::write(&path, rendered.vcode_disasm.as_bytes())
             .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
     }
     print!("{}", rendered.clif);

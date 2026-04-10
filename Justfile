@@ -944,6 +944,7 @@ benchmark benchmark_loops="1000000" verify_loops="100000" perf_loops="10000000" 
       cargo run -q -p soac-inspector --bin render_jit_clif -- \
         --specialized --module-name pystone \
         --cfg-dot-out "$output_base.cfg.dot" \
+        --vcode-out "$output_base.vcode" \
         scripts/pystone.py "$function_id" \
         > "$output_base.clif"
   done < "$clif_dir/functions.tsv"
@@ -955,5 +956,7 @@ benchmark benchmark_loops="1000000" verify_loops="100000" perf_loops="10000000" 
     > "$result_dir/perf.just.log" 2>&1
   cp -f "$REPO_ROOT/tmp/perf.data" "$result_dir/perf.data" 2>/dev/null || true
   cp -f "$REPO_ROOT/tmp/perf.injected.data" "$result_dir/perf.injected.data" 2>/dev/null || true
+  cargo run -q -p soac-inspector --bin annotate_cranelift_perf -- "$result_dir" \
+    > "$result_dir/perf_cranelift_blocks.tsv"
 
   echo "benchmark result: $result_dir"
