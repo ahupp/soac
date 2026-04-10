@@ -28,9 +28,8 @@ pub(crate) fn locality_counter_instrumentation_enabled() -> bool {
 }
 
 fn specialization_mode_instruments_top_values() -> bool {
-    env::var("SOAC_OPT_MODE")
-        .map(|raw| matches!(raw.trim(), "profile" | "verify"))
-        .unwrap_or(false)
+    let mode = env::var("SOAC_OPT_MODE").unwrap_or_default();
+    matches!(mode.trim(), "profile" | "verify")
 }
 
 pub(crate) fn parse_trace_config(raw: &str) -> Option<TraceConfig> {

@@ -125,8 +125,13 @@ exports are intentionally omitted here.
   - `events.jsonl`: default tracing JSONL when `SOAC_LOG` is not
     set.
 
-- `SOAC_OPT_MODE=profile|verify|apply`
+- `SOAC_OPT_MODE=none|profile|verify|apply`
   Select the runtime specialization phase:
+  - `none`: run the ordinary unspecialized path, do not instrument
+    specialization counters, do not read `$SOAC_WORK_DIR/profile.bin`,
+    and do not write counter dumps. This is equivalent to leaving
+    `SOAC_OPT_MODE` unset, but is useful when a parent environment may
+    already set it.
   - `profile`: run unspecialized, instrument specialization input
     counters, and write `$SOAC_WORK_DIR/profile.bin`.
   - `verify`: read `$SOAC_WORK_DIR/profile.bin`, apply its
@@ -135,7 +140,8 @@ exports are intentionally omitted here.
   - `apply`: read `$SOAC_WORK_DIR/profile.bin`, apply its
     specializations, and emit no specialization counters.
   Set `SOAC_WORK_DIR` for any mode that reads or writes counters. Leave
-  `SOAC_OPT_MODE` unset for the ordinary unspecialized/no-counter path.
+  `SOAC_OPT_MODE` unset, or set it to `none`, for the ordinary
+  unspecialized/no-counter path.
 
 Notes:
 - In normal workflows set one `SOAC_WORK_DIR` for the whole multi-pass
@@ -204,27 +210,7 @@ Notes:
   [Justfile:274](/home/adam/project/soac-profile/Justfile#L274), control
   the threshold used when rendering perf text reports.
 
-## Resource Limits
-
-- `DIET_PYTHON_MEMORY_LIMIT_MB=<int>`
-  In [scripts/run_with_limits.sh](/home/adam/project/soac-profile/scripts/run_with_limits.sh),
-  set the cgroup memory cap in MiB for recipes that intentionally call
-  the limit wrapper, such as `run-cpython-tests`. `0` disables the
-  memory cap.
-
-- `DIET_PYTHON_TIMEOUT_SECS=<int>`
-  In [scripts/run_with_limits.sh](/home/adam/project/soac-profile/scripts/run_with_limits.sh),
-  set the cgroup wall-clock timeout in seconds for limit-wrapper runs.
-  `0` disables the timeout.
-
-- `DIET_PYTHON_CPUSET=<cpuset>`
-  In [scripts/run_with_limits.sh](/home/adam/project/soac-profile/scripts/run_with_limits.sh),
-  restrict a limit-wrapper run to a Linux cpuset such as `0-7`. An empty
-  value disables CPU pinning and is the default.
-
-- `DIET_PYTHON_SYSTEMD_RUNTIME_DIR=/run/user/<uid>`
-  In [scripts/run_with_limits.sh](/home/adam/project/soac-profile/scripts/run_with_limits.sh),
-  override the runtime dir used to reach the user systemd bus.
+## CPython Test Selection
 
 - `SKIP_EXPECTED_FAILURES=1`
   In [scripts/collect_cpython_skip_ids.sh](/home/adam/project/soac-profile/scripts/collect_cpython_skip_ids.sh),

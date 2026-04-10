@@ -584,17 +584,6 @@ fn push_active_module_runtime_context(
     ActiveModuleVmCtxGuard
 }
 
-struct VectorcallModuleRuntimeGuard {
-    active: Option<ActiveModuleVmCtxGuard>,
-    _runtime: Box<jit::ModuleRuntimeContext>,
-}
-
-impl Drop for VectorcallModuleRuntimeGuard {
-    fn drop(&mut self) {
-        self.active.take();
-    }
-}
-
 pub unsafe fn with_active_module_runtime_context<R>(
     runtime: *mut jit::ModuleRuntimeContext,
     f: impl FnOnce() -> R,
@@ -606,13 +595,17 @@ pub unsafe fn with_active_module_runtime_context<R>(
 pub unsafe fn with_current_module_runtime_context<R>(
     f: impl FnOnce(&jit::ModuleRuntimeContext) -> R,
 ) -> Result<R, ()> {
-    ACTIVE_MODULE_RUNTIME_STACK.with(|stack| {
+    let runtime = match ACTIVE_MODULE_RUNTIME_STACK.with(|stack| {
         let stack = stack.borrow();
         let Some(runtime) = stack.last().copied() else {
-            return set_runtime_error("missing active module runtime context");
+            return Err(());
         };
-        Ok(f(unsafe { &*runtime }))
-    })
+        Ok(runtime)
+    }) {
+        Ok(runtime) => runtime,
+        Err(()) => return set_runtime_error("missing active module runtime context"),
+    };
+    Ok(f(unsafe { &*runtime }))
 }
 
 pub unsafe fn clone_module_runtime_context(
@@ -666,24 +659,6 @@ pub unsafe fn build_module_runtime_context_for_module(
         },
         compile_session,
         shared_module_state_owner: shared_module_state,
-    })
-}
-
-unsafe fn build_module_runtime_context_for_function_extra(
-    data: &PyFunctionJitExtra,
-) -> Result<jit::ModuleRuntimeContext, ()> {
-    let globals_obj = data.function_env.globals_obj();
-    if globals_obj.is_null() {
-        return set_runtime_error("missing function globals while building runtime context");
-    }
-    unsafe { ffi::Py_INCREF(globals_obj) };
-    Ok(jit::ModuleRuntimeContext {
-        mod_ctx: jit::ModuleJitContext {
-            shared_module_state: std::sync::Arc::as_ptr(&data.module_state),
-            globals_obj: globals_obj as *mut c_void,
-        },
-        compile_session: data.compile_session.clone(),
-        shared_module_state_owner: data.module_state.clone(),
     })
 }
 
@@ -963,7 +938,6 @@ pub unsafe fn lookup_exact_owner_types_for_method(
     function_id: FunctionId,
     method_name: &str,
 ) -> Result<Vec<DirectMethodOwnerType>, ()> {
-    maybe_register_current_module_owner_types();
     let Ok(registry) = function_owner_type_registry() else {
         return Ok(Vec::new());
     };
@@ -1034,7 +1008,6 @@ pub unsafe fn lookup_exact_owner_types_for_method(
 pub unsafe fn lookup_exact_owner_types_for_constructor(
     function_id: FunctionId,
 ) -> Result<Vec<DirectConstructorOwnerType>, ()> {
-    maybe_register_current_module_owner_types();
     let Ok(registry) = function_owner_type_registry() else {
         return Ok(Vec::new());
     };
@@ -1101,16 +1074,14 @@ pub unsafe fn lookup_exact_owner_types_for_constructor(
     Ok(out)
 }
 
-unsafe fn current_module_type_from_owner_name(
+unsafe fn module_type_from_owner_name_in_globals(
+    globals: *mut ffi::PyObject,
+    module_name: &str,
     owner_name: &str,
 ) -> Result<Option<*mut ffi::PyTypeObject>, ()> {
-    maybe_register_current_module_owner_types();
-    let Some(runtime) = ACTIVE_MODULE_RUNTIME_STACK.with(|stack| stack.borrow().last().copied())
-    else {
+    if globals.is_null() || ffi::PyDict_Check(globals) == 0 {
         return Ok(None);
-    };
-    let runtime = unsafe { &*runtime };
-    let module_name = runtime.shared_module_state_owner.module_name.as_str();
+    }
     let Some(owner_suffix) = owner_name
         .strip_prefix(module_name)
         .and_then(|suffix| suffix.strip_prefix('.'))
@@ -1123,10 +1094,7 @@ unsafe fn current_module_type_from_owner_name(
     };
 
     let global_name_c = CString::new(global_name).map_err(|_| ())?;
-    let mut current = ffi::PyDict_GetItemString(
-        runtime.mod_ctx.globals_obj as *mut ffi::PyObject,
-        global_name_c.as_ptr(),
-    );
+    let mut current = ffi::PyDict_GetItemString(globals, global_name_c.as_ptr());
     if current.is_null() {
         return Ok(None);
     }
@@ -1185,11 +1153,26 @@ unsafe fn owner_type_has_class_binding_for_attr(
     }
 }
 
-pub unsafe fn lookup_exact_owner_type_for_field(
+pub unsafe fn lookup_exact_owner_type_for_field_in_globals(
+    globals: *mut ffi::PyObject,
+    module_name: &str,
     owner_name: &str,
     attr_name: &str,
 ) -> Result<Option<DirectFieldOwnerType>, ()> {
-    let Some(owner_type) = (unsafe { current_module_type_from_owner_name(owner_name)? }) else {
+    let module_name_c = CString::new(module_name).map_err(|_| ())?;
+    let module_name_obj = ffi::PyUnicode_FromString(module_name_c.as_ptr());
+    if module_name_obj.is_null() {
+        return Err(());
+    }
+    let register_result = register_function_owner_types_for_globals(globals, module_name_obj);
+    ffi::Py_DECREF(module_name_obj);
+    if register_result.is_err() {
+        return Err(());
+    }
+
+    let Some(owner_type) =
+        (unsafe { module_type_from_owner_name_in_globals(globals, module_name, owner_name)? })
+    else {
         return Ok(None);
     };
 
@@ -1233,33 +1216,6 @@ pub unsafe fn lookup_exact_owner_type_for_field(
         owner_type,
         type_version,
     }))
-}
-
-unsafe fn maybe_register_current_module_owner_types() {
-    let Some(runtime) = ACTIVE_MODULE_RUNTIME_STACK.with(|stack| stack.borrow().last().copied())
-    else {
-        return;
-    };
-    let result = unsafe {
-        let runtime = &*runtime;
-        let Ok(module_name) = CString::new(runtime.shared_module_state_owner.module_name.as_str())
-        else {
-            return;
-        };
-        let module_name_obj = ffi::PyUnicode_FromString(module_name.as_ptr());
-        if module_name_obj.is_null() {
-            return;
-        }
-        let result = register_function_owner_types_for_globals(
-            runtime.mod_ctx.globals_obj as *mut ffi::PyObject,
-            module_name_obj,
-        );
-        ffi::Py_DECREF(module_name_obj);
-        result
-    };
-    if result.is_err() {
-        ffi::PyErr_Clear();
-    }
 }
 
 unsafe fn type_is_defined_in_module(
@@ -1420,6 +1376,7 @@ unsafe fn ensure_clif_vectorcall_compiled(
                     &module_constant_ptrs,
                     &counter_ptrs,
                     Some(data.module_state.as_ref()),
+                    Some(data.function_env.globals_obj().cast()),
                 );
                 match compile_result {
                     Ok(result) => {
@@ -1825,57 +1782,6 @@ pub(crate) unsafe extern "C" fn vectorcall_function_extra(callable: *mut c_void)
             ptr::null_mut()
         }
     }
-}
-
-pub(crate) unsafe extern "C" fn vectorcall_enter_module_runtime(
-    data_ptr: *mut c_void,
-) -> *mut c_void {
-    match panic::catch_unwind(AssertUnwindSafe(|| {
-        if data_ptr.is_null() {
-            ffi::PyErr_SetString(
-                ffi::PyExc_RuntimeError,
-                b"missing SOAC metadata while entering vectorcall runtime context\0".as_ptr()
-                    as *const i8,
-            );
-            return ptr::null_mut();
-        }
-        let data = &mut *(data_ptr as *mut PyFunctionJitExtra);
-        let mut runtime = match build_module_runtime_context_for_function_extra(data) {
-            Ok(runtime) => Box::new(runtime),
-            Err(()) => return ptr::null_mut(),
-        };
-        let active = push_active_module_runtime_context(runtime.as_mut() as *mut _);
-        Box::into_raw(Box::new(VectorcallModuleRuntimeGuard {
-            active: Some(active),
-            _runtime: runtime,
-        })) as *mut c_void
-    })) {
-        Ok(value) => value,
-        Err(payload) => {
-            let message = format!(
-                "panic in vectorcall_enter_module_runtime: {}",
-                panic_payload_to_string(payload)
-            );
-            if let Ok(c_msg) = CString::new(message) {
-                ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
-            } else {
-                ffi::PyErr_SetString(
-                    ffi::PyExc_RuntimeError,
-                    b"panic in vectorcall_enter_module_runtime\0".as_ptr() as *const i8,
-                );
-            }
-            ptr::null_mut()
-        }
-    }
-}
-
-pub(crate) unsafe extern "C" fn vectorcall_leave_module_runtime(guard: *mut c_void) {
-    let _ = panic::catch_unwind(AssertUnwindSafe(|| {
-        if guard.is_null() {
-            return;
-        }
-        drop(Box::from_raw(guard as *mut VectorcallModuleRuntimeGuard));
-    }));
 }
 
 pub(crate) unsafe extern "C" fn bind_direct_args_from_vectorcall(

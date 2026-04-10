@@ -23,7 +23,7 @@ macro_rules! py_stmt_internal {
         let template = (*TEMPLATE).clone();
         let values = values.into_iter().map(|(name, value)| (name.to_string(), value)).collect();
         let ids = ids.into_iter().map(|(name, value)| (name.to_string(), value)).collect();
-        Stmt::from(template.instantiate(values, ids))
+        Stmt::from(template.instantiate_one($template, file!(), line!(), column!(), values, ids))
     }};
 }
 
@@ -436,15 +436,27 @@ impl SyntaxTemplate {
         self.stmts
     }
 
-    pub(crate) fn instantiate(
+    pub(crate) fn instantiate_one(
         self,
+        template_source: &'static str,
+        call_file: &'static str,
+        call_line: u32,
+        call_column: u32,
         values: HashMap<String, PlaceholderValue>,
         ids: HashMap<String, Value>,
     ) -> Stmt {
         let mut stmts = self.instantiate_suite(values, ids);
         match stmts.len() {
             1 => stmts.remove(0),
-            len => panic!("py_stmt template must produce exactly one statement, got {len}"),
+            len => {
+                let expanded = crate::ruff_ast_to_string(stmts.as_slice());
+                panic!(
+                    "py_stmt template at {call_file}:{call_line}:{call_column} must produce exactly one statement, got {len}\n\
+                     template:\n{template_source}\n\
+                     expanded statements:\n{}",
+                    expanded.trim_end()
+                );
+            }
         }
     }
 }

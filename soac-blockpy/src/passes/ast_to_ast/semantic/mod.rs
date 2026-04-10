@@ -15,7 +15,6 @@ use ruff_text_size::{Ranged, TextRange};
 use crate::passes::ast_symbol_analysis::CurrentScopeNameTraversal;
 use crate::passes::ast_to_ast::body::Suite;
 use crate::passes::ast_to_ast::scope_helpers::is_internal_symbol;
-use crate::passes::ast_to_ast::util::is_noarg_call;
 use crate::transformer::Transformer;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -340,6 +339,16 @@ struct ImplicitClassCellUseDetector {
     uses_class_cell: bool,
 }
 
+fn is_super_call(expr: &ast::Expr) -> bool {
+    let ast::Expr::Call(ast::ExprCall { func, .. }) = expr else {
+        return false;
+    };
+    matches!(
+        func.as_ref(),
+        ast::Expr::Name(ast::ExprName { id, .. }) if id.as_str() == "super"
+    )
+}
+
 impl Transformer for ImplicitClassCellUseDetector {
     fn visit_stmt(&mut self, stmt: &mut ast::Stmt) {
         match stmt {
@@ -387,7 +396,7 @@ impl Transformer for ImplicitClassCellUseDetector {
                 self.uses_class_cell = true;
                 return;
             }
-            ast::Expr::Call(_) if is_noarg_call("super", expr) => {
+            ast::Expr::Call(_) if is_super_call(expr) => {
                 self.uses_class_cell = true;
                 return;
             }

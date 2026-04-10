@@ -232,9 +232,10 @@ instance's live working commit.
   Normal specialization runs use one work directory with conventional
   files: `profile.bin` for specialization input, `verify.bin` for the
   countered verification pass, and `events.jsonl` for default JSON
-  tracing output. Set `SOAC_OPT_MODE=profile`, `verify`, or `apply`; recipes
-  should pass the same `SOAC_WORK_DIR` and change only the mode between
-  passes.
+  tracing output. Set `SOAC_OPT_MODE=none`, `profile`, `verify`, or
+  `apply`; recipes should pass the same `SOAC_WORK_DIR` and change only
+  the mode between passes. `none` is the explicit ordinary
+  unspecialized/no-counter mode and should not read or write counter dumps.
 - `BENCHMARK_CPU` / `BENCHMARK_CONSTANT_CLOCKS`
   The benchmark recipes use
   [scripts/run_benchmark_with_cpu_mode.sh](/home/adam/project/soac-profile/scripts/run_benchmark_with_cpu_mode.sh)

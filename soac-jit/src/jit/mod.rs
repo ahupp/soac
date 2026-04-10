@@ -357,16 +357,6 @@ static DP_JIT_VECTORCALL_FUNCTION_EXTRA_IMPORT: ImportSpec = ImportSpec::new(
     &[SigType::Pointer],
     &[SigType::Pointer],
 );
-static DP_JIT_VECTORCALL_ENTER_MODULE_RUNTIME_IMPORT: ImportSpec = ImportSpec::new(
-    "dp_jit_vectorcall_enter_module_runtime",
-    &[SigType::Pointer],
-    &[SigType::Pointer],
-);
-static DP_JIT_VECTORCALL_LEAVE_MODULE_RUNTIME_IMPORT: ImportSpec = ImportSpec::new(
-    "dp_jit_vectorcall_leave_module_runtime",
-    &[SigType::Pointer],
-    &[],
-);
 struct ModuleFuncImports {
     func_ids_by_internal_id: Vec<Option<FuncId>>,
     import_id_to_symbol: HashMap<u32, &'static str>,
@@ -2768,10 +2758,14 @@ fn type_layout_is_for_module_owner(module_name: &str, layout: &CollectedKeyLayou
 
 fn load_field_index_specializations(
     module_name: &str,
+    module_globals: Option<ObjPtr>,
 ) -> Result<HashMap<String, Vec<FieldIndexSpecialization>>, String> {
     if specialization_mode_is_profile() {
         return Ok(HashMap::new());
     }
+    let Some(module_globals) = module_globals else {
+        return Ok(HashMap::new());
+    };
     let Some(path) = counter_dump_input_path_from_env() else {
         return Ok(HashMap::new());
     };
@@ -2787,9 +2781,15 @@ fn load_field_index_specializations(
             if !type_layout_is_for_module_owner(module_name, layout) {
                 continue;
             }
-            let Ok(Some(owner)) =
-                (unsafe { crate::lookup_exact_owner_type_for_field(&layout.owner, &layout.key) })
-            else {
+            let Ok(Some(owner)) = (unsafe {
+                crate::lookup_exact_owner_type_for_field_in_globals(
+                    module_globals.cast(),
+                    module_name,
+                    &layout.owner,
+                    &layout.key,
+                )
+            }) else {
+                unsafe { ffi::PyErr_Clear() };
                 continue;
             };
             out.entry(layout.key.clone())
@@ -2822,7 +2822,7 @@ fn specialization_mode_from_env() -> Option<String> {
     env::var("SOAC_OPT_MODE")
         .ok()
         .map(|raw| raw.trim().to_string())
-        .filter(|raw| !raw.is_empty())
+        .filter(|raw| !raw.is_empty() && raw != "none")
 }
 
 fn specialization_mode_is_profile() -> bool {
@@ -5884,6 +5884,7 @@ impl ProcessJitEngine {
         module_constant_ptrs: &[*mut ffi::PyObject],
         counter_ptrs: &[*mut u64],
         direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
+        module_globals: Option<ObjPtr>,
     ) -> Result<DirectFunctionCompileResult, String> {
         let batch_functions =
             collect_process_jit_batch_functions(session, function, direct_call_resolver)?;
@@ -5930,9 +5931,13 @@ impl ProcessJitEngine {
                 function_module_constant_ptrs,
                 function_counter_ptrs,
                 function_direct_call_resolver,
+                function_module_globals,
             ) = if let Some(shared_state) = batch_function.source.shared_state() {
                 owned_module_constant_ptrs = shared_state.module_constant_ptrs();
                 owned_counter_ptrs = shared_state.counter_ptrs();
+                let function_module_globals = direct_call_resolver
+                    .filter(|root_state| std::ptr::eq(*root_state, shared_state))
+                    .and(module_globals);
                 (
                     &shared_state.lowered_module,
                     &shared_state.codegen_constants,
@@ -5940,6 +5945,7 @@ impl ProcessJitEngine {
                     owned_module_constant_ptrs.as_slice(),
                     owned_counter_ptrs.as_slice(),
                     Some(shared_state),
+                    function_module_globals,
                 )
             } else {
                 (
@@ -5949,6 +5955,7 @@ impl ProcessJitEngine {
                     module_constant_ptrs,
                     counter_ptrs,
                     None,
+                    module_globals,
                 )
             };
             let built = build_cranelift_run_bb_specialized_function(
@@ -5962,6 +5969,7 @@ impl ProcessJitEngine {
                 function_counter_ptrs,
                 session.as_ref(),
                 function_direct_call_resolver,
+                function_module_globals,
                 None,
                 Some(&predeclared),
             )
@@ -6799,6 +6807,7 @@ fn build_cranelift_run_bb_specialized_function(
     counter_ptrs: &[*mut u64],
     compile_session: &crate::session::CompileSession,
     direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
+    module_globals: Option<ObjPtr>,
     symbol_scope: Option<&str>,
     predeclared_direct_functions: Option<&HashMap<FunctionId, DeclaredJitFunction>>,
 ) -> Result<BuiltSpecializedFunction, String> {
@@ -6893,7 +6902,9 @@ fn build_cranelift_run_bb_specialized_function(
         None => HashMap::new(),
     };
     let field_index_specializations = match direct_call_resolver {
-        Some(shared_state) => load_field_index_specializations(shared_state.module_name.as_str())?,
+        Some(shared_state) => {
+            load_field_index_specializations(shared_state.module_name.as_str(), module_globals)?
+        }
         None => HashMap::new(),
     };
     let branch_prefer_true = match direct_call_resolver {
@@ -7016,8 +7027,6 @@ fn build_cranelift_run_bb_specialized_function(
             vec![
                 "fn_env".into(),
                 "tstate".into(),
-                "mod_ctx".into(),
-                "function_data".into(),
                 "entry_args".into(),
                 "ambient_args".into(),
             ],
@@ -7742,6 +7751,7 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
         runtime_state,
         None,
         None,
+        None,
     )?;
     let mut out = String::new();
     out.push_str("; import fn aliases (Cranelift display id -> symbol)\n");
@@ -7819,6 +7829,7 @@ pub(crate) unsafe fn compile_cranelift_run_bb_specialized_cached(
     module_constant_ptrs: &[*mut ffi::PyObject],
     counter_ptrs: &[*mut u64],
     direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
+    module_globals: Option<ObjPtr>,
 ) -> Result<DirectFunctionCompileResult, String> {
     unsafe {
         compile_session.process_jit()?.compile_direct_function(
@@ -7831,6 +7842,7 @@ pub(crate) unsafe fn compile_cranelift_run_bb_specialized_cached(
             module_constant_ptrs,
             counter_ptrs,
             direct_call_resolver,
+            module_globals,
         )
     }
 }
@@ -7923,16 +7935,6 @@ fn define_shared_vectorcall_trampoline(
             &mut fb.func,
             &DP_JIT_DIRECT_FUNCTION_CONTEXT_IMPORT,
         );
-        let enter_module_runtime_ref = func_imports.get_or_panic(
-            jit_module,
-            &mut fb.func,
-            &DP_JIT_VECTORCALL_ENTER_MODULE_RUNTIME_IMPORT,
-        );
-        let leave_module_runtime_ref = func_imports.get_or_panic(
-            jit_module,
-            &mut fb.func,
-            &DP_JIT_VECTORCALL_LEAVE_MODULE_RUNTIME_IMPORT,
-        );
 
         let null_ptr = fb.ins().iconst(ptr_ty, 0);
         let function_extra_inst = fb.ins().call(function_extra_ref, &[callable_val]);
@@ -7977,29 +7979,6 @@ fn define_shared_vectorcall_trampoline(
         fb.ins().return_(&[null_ptr]);
 
         fb.switch_to_block(function_env_ok);
-        let runtime_guard_inst = fb
-            .ins()
-            .call(enter_module_runtime_ref, &[function_extra_val]);
-        let runtime_guard_val = fb.inst_results(runtime_guard_inst)[0];
-        let runtime_guard_missing =
-            fb.ins()
-                .icmp_imm(ir::condcodes::IntCC::Equal, runtime_guard_val, 0);
-        let runtime_guard_ok = fb.create_block();
-        let runtime_guard_fail_block = fb.create_block();
-        fb.ins().brif(
-            runtime_guard_missing,
-            runtime_guard_fail_block,
-            &[],
-            runtime_guard_ok,
-            &[],
-        );
-        fb.seal_block(runtime_guard_fail_block);
-        fb.seal_block(runtime_guard_ok);
-
-        fb.switch_to_block(runtime_guard_fail_block);
-        fb.ins().return_(&[null_ptr]);
-
-        fb.switch_to_block(runtime_guard_ok);
         let enter_inst = fb.ins().call(enter_recursive_ref, &[]);
         let enter_status = fb.inst_results(enter_inst)[0];
         let enter_failed = fb
@@ -8013,8 +7992,6 @@ fn define_shared_vectorcall_trampoline(
         fb.seal_block(bind_block);
 
         fb.switch_to_block(recursion_fail_block);
-        fb.ins()
-            .call(leave_module_runtime_ref, &[runtime_guard_val]);
         fb.ins().return_(&[null_ptr]);
 
         fb.switch_to_block(bind_block);
@@ -8055,8 +8032,6 @@ fn define_shared_vectorcall_trampoline(
 
         fb.switch_to_block(fail_block);
         fb.ins().call(leave_recursive_ref, &[]);
-        fb.ins()
-            .call(leave_module_runtime_ref, &[runtime_guard_val]);
         fb.ins().return_(&[null_ptr]);
 
         fb.switch_to_block(ok_block);
@@ -8090,8 +8065,6 @@ fn define_shared_vectorcall_trampoline(
             fb.ins().call(decref_ref, &[value]);
         }
         fb.ins().call(leave_recursive_ref, &[]);
-        fb.ins()
-            .call(leave_module_runtime_ref, &[runtime_guard_val]);
         fb.ins().return_(&[result]);
         fb.seal_all_blocks();
         fb.finalize();

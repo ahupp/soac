@@ -5,6 +5,7 @@
  * If caching BlockPy before codegen, recover FunctionNameGen.next_tmp_id from generated `_dp_*` names.
  * Add mutation watchers for `f.__defaults__` and `f.__kwdefaults__` so direct/JIT default slots stay fresh after in-place edits.
  * Consider replacing the internal deleted local sentinel object with `NULL` so leaked sentinel state fails loudly.
+ * Simplify class-cell capture by unconditionally treating `super()` as capturing `__class__`.
 
 
 ## Perf-to-investigate

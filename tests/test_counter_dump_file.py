@@ -39,6 +39,30 @@ def read():
     assert len(data) > 64
 
 
+def test_counter_dump_file_is_not_written_in_none_mode(tmp_path, monkeypatch):
+    work_dir = tmp_path / "soac-work"
+    monkeypatch.setenv("SOAC_WORK_DIR", str(work_dir))
+    monkeypatch.setenv("SOAC_OPT_MODE", "none")
+
+    source = """
+VALUE = 7
+
+def read():
+    return VALUE
+"""
+
+    with integration_module(
+        tmp_path, "counter_dump_none_mode_case", source, mode="transform"
+    ) as module:
+        assert module.read() == 7
+        assert module.read() == 7
+
+    gc.collect()
+
+    assert not (work_dir / "profile.bin").exists()
+    assert not (work_dir / "verify.bin").exists()
+
+
 def test_module_load_event_is_written_to_soac_log_json(tmp_path):
     log_path = tmp_path / "soac-events.jsonl"
     module_path = tmp_path / "module_load_log_case.py"

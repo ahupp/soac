@@ -11,7 +11,7 @@ usage() {
 Usage: ./scripts/run_cpython_test_sets.sh [--tempdir <path>]
 
 Runs each test set file in test_sets/ sequentially (part_01 -> part_10).
-The wrapper forces single-process regrtest execution via DIET_PYTHON_TEST_JOBS=1.
+The wrapper forces single-process regrtest execution via `just run-cpython-tests 1`.
 USAGE
 }
 

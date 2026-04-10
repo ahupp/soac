@@ -228,3 +228,23 @@ fn reports_missing_and_unused_placeholders_together() {
     assert!(msg.contains("expected id or literal for placeholder missing"));
     assert!(msg.contains("unused ids: unused"));
 }
+
+#[test]
+fn reports_py_stmt_multi_statement_template_context() {
+    let expected_file = file!();
+    let expected_line = line!() + 2;
+    let result = std::panic::catch_unwind(|| {
+        let _ = py_stmt!("a = 1\nb = 2");
+    });
+    let err = result.expect_err("expected multi-statement py_stmt template to panic");
+    let msg = err
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| err.downcast_ref::<&str>().copied())
+        .unwrap_or("<non-string panic>");
+
+    assert!(msg.contains("must produce exactly one statement, got 2"));
+    assert!(msg.contains(&format!("{expected_file}:{expected_line}:")));
+    assert!(msg.contains("template:\na = 1\nb = 2"));
+    assert!(msg.contains("expanded statements:\na = 1\nb = 2"));
+}

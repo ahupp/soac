@@ -466,6 +466,7 @@ mod tests {
                     &module_constant_ptrs,
                     &counter_ptrs,
                     Some(shared_state.as_ref()),
+                    None,
                 )
             }
             .expect("mutually-recursive process JIT batch should compile");
@@ -601,6 +602,7 @@ mod tests {
                     Some(shared_state.as_ref()),
                     None,
                     None,
+                    None,
                 )
                 .expect("specialized JIT build should succeed");
                 let (clif, _cfg_dot, _vcode_disasm) = render_compiled_clif_and_vcode_disasm(
@@ -671,6 +673,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .expect("specialized JIT build should succeed");
             let (clif, _cfg_dot, _vcode_disasm) = render_compiled_clif_and_vcode_disasm(
@@ -705,6 +708,7 @@ mod tests {
                 &module_constant_ptrs,
                 &counter_ptrs,
                 &compile_session,
+                None,
                 None,
                 None,
                 None,
@@ -838,6 +842,22 @@ mod tests {
             }
         }
         count
+    }
+
+    fn import_user_names_for_symbols(
+        built: &BuiltSpecializedFunction,
+        symbols: &[&'static str],
+    ) -> Vec<ir::UserExternalName> {
+        built
+            .import_id_to_symbol
+            .iter()
+            .filter_map(|(import_id, symbol)| {
+                symbols
+                    .iter()
+                    .any(|wanted| wanted == symbol)
+                    .then(|| ir::UserExternalName::new(0, *import_id))
+            })
+            .collect()
     }
 
     unsafe fn build_runtime_refcount_smoke_context() -> (
@@ -1200,6 +1220,7 @@ def f():
                     &module_constant_ptrs,
                     &counter_ptrs,
                     Some(shared_state.as_ref()),
+                    Some(runtime.mod_ctx.globals_obj),
                 )
                 .expect("direct counter test function should compile");
                 let (code_ptr, param_count) = compiled_handle
@@ -1336,6 +1357,7 @@ def f(x):
                     &module_constant_ptrs,
                     &counter_ptrs,
                     Some(shared_state.as_ref()),
+                    Some(runtime.mod_ctx.globals_obj),
                 )
                 .expect("direct refcount counter test function should compile");
                 let (code_ptr, param_count) = compiled_handle
@@ -1401,7 +1423,7 @@ def f(x):
     }
 
     #[test]
-    fn render_specialized_jit_clif_annotates_block_headers_with_named_typed_params() {
+    fn specialized_jit_direct_entry_has_fn_env_and_tstate_params() {
         let blocks = [1usize as ObjPtr];
         let mut constants = TestConstantPool::default();
         let mut function = test_function();
@@ -1410,23 +1432,60 @@ def f(x):
         source.ensure_param("current", BlockParamRole::AbruptKind);
         source.ensure_param("acc", BlockParamRole::AbruptPayload);
         let function = with_test_blocks(function, vec![source]);
-        let rendered = render_test_jit_function_with_module_constants(
-            &function,
-            &blocks,
-            constants.module_constants,
-        );
-        assert!(
-            rendered.contains("; block jit_entry(fn_env: i64, tstate: i64)"),
-            "rendered CLIF should include named typed params on surviving post-opt block headers:\n{rendered}"
-        );
-        assert!(
-            rendered.contains("; block bb0()"),
-            "rendered CLIF should still surface the scope name for optimized blocks:\n{rendered}"
-        );
-        assert!(
-            rendered.contains("block0(v0: i64, v1: i64):"),
-            "rendered CLIF should keep the real Cranelift block header for round-tripping:\n{rendered}"
-        );
+        let module = BlockPyModule {
+            module_name_gen: ModuleNameGen::new(0),
+            global_names: Vec::new(),
+            callable_defs: vec![function.clone()],
+            module_constants: constants.module_constants,
+            counter_defs: Vec::new(),
+        };
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        unsafe {
+            let mut jit_module = new_jit_module().expect("test jit module should construct");
+            let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
+            let counter_ptrs = placeholder_counter_ptrs(0);
+            let compile_session = crate::session::CompileSession::new();
+            let built = build_cranelift_run_bb_specialized_function(
+                &mut jit_module,
+                &blocks,
+                &module,
+                &function,
+                &module_constants,
+                &[],
+                &module_constant_ptrs,
+                &counter_ptrs,
+                &compile_session,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("specialized JIT build should succeed");
+            assert_eq!(
+                built
+                    .ctx
+                    .func
+                    .signature
+                    .params
+                    .iter()
+                    .map(|param| param.value_type)
+                    .collect::<Vec<_>>(),
+                vec![ir::types::I64, ir::types::I64],
+                "direct JIT entry should take only fn_env and tstate as hidden params"
+            );
+            let entry_block = built
+                .ctx
+                .func
+                .layout
+                .entry_block()
+                .expect("direct JIT function should have an entry block");
+            assert_eq!(
+                built.ctx.func.dfg.block_params(entry_block).len(),
+                2,
+                "entry block params should match the hidden direct-entry ABI"
+            );
+        }
     }
 
     #[test]
@@ -2121,7 +2180,7 @@ def f():
     }
 
     #[test]
-    fn render_specialized_jit_type_constructors_use_constructor_fast_path() {
+    fn specialized_jit_type_constructors_use_constructor_fast_path() {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
         let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
@@ -2143,7 +2202,7 @@ def f():
             std::env::set_var("PYTHONPATH", python_path);
         }
 
-        let rendered = unsafe {
+        unsafe {
             Python::initialize();
             Python::attach(|py| {
                 let mut constants = TestConstantPool::default();
@@ -2259,7 +2318,7 @@ def f():
                     "",
                 )
                 .expect("shared state should build");
-                let mut runtime = build_test_module_runtime(py, shared_state.clone());
+                let runtime = build_test_module_runtime(py, shared_state.clone());
                 let globals = pyo3::Bound::<pyo3::PyAny>::from_borrowed_ptr(
                     py,
                     runtime.mod_ctx.globals_obj.cast(),
@@ -2303,40 +2362,58 @@ def f():
                 )
                 .expect("registering __init__ vectorcall should succeed");
                 ffi::Py_DECREF(init_function_obj);
+                let module_obj = ffi::PyModule_New(c"counter_test".as_ptr());
+                assert!(!module_obj.is_null(), "test module should allocate");
+                let module_dict = ffi::PyModule_GetDict(module_obj);
+                assert!(
+                    ffi::PyDict_SetItemString(module_dict, c"Record".as_ptr(), cls.as_ptr()) == 0,
+                    "test module should accept Record binding"
+                );
+                crate::register_function_owner_types_for_module(module_obj)
+                    .expect("owner types should register from explicit test module");
+                ffi::Py_DECREF(module_obj);
 
-                crate::with_active_module_runtime_context(&mut runtime, || {
-                    let mut jit_module =
-                        new_jit_module().expect("test jit module should construct");
-                    let (_init_sig, declared_init) =
-                        declare_direct_function(&mut jit_module, &init_function, None)
-                            .expect("test __init__ direct function should declare");
-                    let predeclared = HashMap::from([(init_function.function_id, declared_init)]);
-                    let module_constant_ptrs = shared_state.module_constant_ptrs();
-                    let counter_ptrs = shared_state.counter_ptrs();
-                    let built = build_cranelift_run_bb_specialized_function(
-                        &mut jit_module,
-                        &[1usize as ObjPtr],
-                        &shared_state.lowered_module,
-                        &caller_function,
-                        &shared_state.codegen_constants,
-                        &shared_state.lowered_module.counter_defs,
-                        &module_constant_ptrs,
-                        &counter_ptrs,
-                        runtime.compile_session.as_ref(),
-                        Some(shared_state.as_ref()),
-                        None,
-                        Some(&predeclared),
-                    )
-                    .expect("specialized JIT build should succeed");
-                    let (clif, _cfg_dot, _vcode_disasm) = render_compiled_clif_and_vcode_disasm(
-                        &mut jit_module,
-                        built.ctx,
-                        &built.import_id_to_symbol,
-                        &built.block_annotations,
-                    )
-                    .expect("specialized JIT CLIF render should succeed");
-                    clif
-                })
+                let mut jit_module = new_jit_module().expect("test jit module should construct");
+                let (_init_sig, declared_init) =
+                    declare_direct_function(&mut jit_module, &init_function, None)
+                        .expect("test __init__ direct function should declare");
+                let predeclared = HashMap::from([(init_function.function_id, declared_init)]);
+                let module_constant_ptrs = shared_state.module_constant_ptrs();
+                let counter_ptrs = shared_state.counter_ptrs();
+                let built = build_cranelift_run_bb_specialized_function(
+                    &mut jit_module,
+                    &[1usize as ObjPtr],
+                    &shared_state.lowered_module,
+                    &caller_function,
+                    &shared_state.codegen_constants,
+                    &shared_state.lowered_module.counter_defs,
+                    &module_constant_ptrs,
+                    &counter_ptrs,
+                    runtime.compile_session.as_ref(),
+                    Some(shared_state.as_ref()),
+                    Some(runtime.mod_ctx.globals_obj),
+                    None,
+                    Some(&predeclared),
+                )
+                .expect("specialized JIT build should succeed");
+                let alloc_helpers = import_user_names_for_symbols(
+                    &built,
+                    &[DP_JIT_PYTYPE_GENERIC_ALLOC_IMPORT.symbol],
+                );
+                assert_eq!(
+                    count_direct_calls_to_runtime_helpers(&built.ctx.func, &alloc_helpers),
+                    1,
+                    "constructor specialization should allocate via the constructor fast path",
+                );
+                let finish_helpers = import_user_names_for_symbols(
+                    &built,
+                    &[DP_JIT_FINISH_CONSTRUCTOR_INIT_IMPORT.symbol],
+                );
+                assert_eq!(
+                    count_direct_calls_to_runtime_helpers(&built.ctx.func, &finish_helpers),
+                    1,
+                    "constructor specialization should validate __init__ results in the fast path",
+                );
             })
         };
 
@@ -2356,15 +2433,6 @@ def f():
             Some(value) => unsafe { std::env::set_var("PYTHONPATH", value) },
             None => unsafe { std::env::remove_var("PYTHONPATH") },
         }
-
-        assert!(
-            rendered.contains("call dp_jit_pytype_generic_alloc"),
-            "constructor specialization should allocate via the constructor fast path:\n{rendered}"
-        );
-        assert!(
-            rendered.contains("call dp_jit_finish_constructor_init"),
-            "constructor specialization should validate __init__ results in the fast path:\n{rendered}"
-        );
     }
 
     #[test]

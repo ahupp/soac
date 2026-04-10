@@ -69,6 +69,16 @@ fn is_dp_call(expr: &Expr, name: &str) -> bool {
     is_dp_helper_lookup_expr(func, name)
 }
 
+fn is_super_call(expr: &Expr) -> bool {
+    let Expr::Call(ast::ExprCall { func, .. }) = expr else {
+        return false;
+    };
+    matches!(
+        func.as_ref(),
+        Expr::Name(ast::ExprName { id, .. }) if id.as_str() == "super"
+    )
+}
+
 pub fn rewrite_explicit_super_classcell(class_def: &mut ast::StmtClassDef) -> bool {
     let mut rewriter = MethodExplicitSuperRewriter {
         needs_class_cell: false,
@@ -147,7 +157,7 @@ impl Transformer for FunctionUsesClassCellDetector {
     fn visit_expr(&mut self, expr: &mut Expr) {
         match expr {
             Expr::Call(_) => {
-                if is_noarg_call("super", expr)
+                if is_super_call(expr)
                     || is_dp_call(expr, "call_super")
                     || is_dp_call(expr, "call_super_noargs")
                 {

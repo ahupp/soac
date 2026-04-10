@@ -18,7 +18,6 @@ inspector_bin := repo_root + "/target/debug/soac-inspector"
 port := env_var_or_default("PORT", "8000")
 host := env_var_or_default("HOST", "127.0.0.1")
 url := "http://" + host + ":" + port
-limit_wrapper := repo_root + "/scripts/run_with_limits.sh"
 last_benchmark_counters_dir := repo_root + "/logs/last_benchmark_counters"
 last_benchmark_counters := last_benchmark_counters_dir + "/profile.bin"
 
@@ -43,7 +42,6 @@ export INSPECTOR_BIN := inspector_bin
 export PORT := port
 export HOST := host
 export URL := url
-export LIMIT_WRAPPER := limit_wrapper
 export LAST_BENCHMARK_COUNTERS_DIR := last_benchmark_counters_dir
 export LAST_BENCHMARK_COUNTERS := last_benchmark_counters
 
@@ -242,7 +240,7 @@ run-cpython-tests jobs="0" *args='': build-all ensure-cpython ensure-venv
   # stdlib modules resolve from vendor/cpython/Lib. The extension itself is
   # explicitly installed into the repo venv and added to PYTHONPATH below.
   PYTHON_BIN="$CPYTHON_BIN"
-  PYTHONPATH_PREFIX="$REPO_ROOT/vendor/cpython/Lib:$VENV_SITE_PACKAGES:$REPO_ROOT"
+  PYTHONPATH_PREFIX="$REPO_ROOT/vendor/cpython/Lib:$REPO_ROOT/soac_py/src:$VENV_SITE_PACKAGES:$REPO_ROOT"
   SKIP_ARGS=()
   while IFS= read -r skip_id; do
     [ -n "$skip_id" ] && SKIP_ARGS+=(-x "$skip_id")
@@ -260,7 +258,6 @@ run-cpython-tests jobs="0" *args='': build-all ensure-cpython ensure-venv
     cd "$REPO_ROOT/vendor/cpython"
 
     TEST_CMD=(
-      "$LIMIT_WRAPPER"
       "$PYTHON_BIN"
       -m soac.import_hook test.__main__ "-j$TEST_JOBS" -v
       "${SKIP_ARGS[@]}"

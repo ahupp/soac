@@ -37,6 +37,31 @@ fn rewritten_try_helper_calls(stmts: &[Stmt]) -> HashSet<&'static str> {
     probe.helpers
 }
 
+fn rewritten_call_names(stmts: &[Stmt]) -> HashSet<String> {
+    #[derive(Default)]
+    struct CallNameProbe {
+        names: HashSet<String>,
+    }
+
+    impl Transformer for CallNameProbe {
+        fn visit_expr(&mut self, expr: &mut Expr) {
+            if let Expr::Call(call) = expr {
+                if let Expr::Name(name) = call.func.as_ref() {
+                    self.names.insert(name.id.to_string());
+                }
+            }
+            walk_expr(self, expr);
+        }
+    }
+
+    let mut stmts = stmts.to_vec();
+    let mut probe = CallNameProbe::default();
+    for stmt in &mut stmts {
+        probe.visit_stmt(stmt);
+    }
+    probe.names
+}
+
 #[test]
 fn stmt_try_simplify_ast_rewrites_typed_except_before_blockpy_lowering() {
     let stmt = py_stmt!(
@@ -58,6 +83,34 @@ except ValueError as exc:
     assert!(helper_calls.contains("exception_matches"));
     assert!(helper_calls.contains("current_exception"));
     assert!(helper_calls.contains("del_quietly"));
+}
+
+#[test]
+fn stmt_try_simplify_ast_preserves_multi_stmt_default_handler_after_typed_handler() {
+    let stmt = py_stmt!(
+        r#"
+try:
+    work()
+except ValueError:
+    typed()
+except:
+    cleanup()
+    recover()
+"#
+    );
+    let Stmt::Try(try_stmt) = stmt else {
+        panic!("expected try stmt");
+    };
+
+    let context = Context::new("");
+    let simplified = simplify_stmt_ast_once_for_blockpy(&context, Stmt::Try(try_stmt));
+    let helper_calls = rewritten_try_helper_calls(simplified.as_slice());
+    let call_names = rewritten_call_names(simplified.as_slice());
+
+    assert!(helper_calls.contains("exception_matches"));
+    assert!(call_names.contains("typed"));
+    assert!(call_names.contains("cleanup"));
+    assert!(call_names.contains("recover"));
 }
 
 #[test]

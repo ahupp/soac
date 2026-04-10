@@ -134,9 +134,9 @@ finally:
     }
 
     let base = if has_default_handler(&stmt) {
-        py_stmt!("pass")
+        vec![py_stmt!("pass")]
     } else {
-        py_stmt!("raise")
+        vec![py_stmt!("raise")]
     };
 
     let ast::StmtTry {
@@ -161,14 +161,9 @@ finally:
 
         if type_.is_none() {
             assert!(name.is_none());
-            return py_stmt!(
-                r#"
-{body:stmt}
-{next:stmt}
-"#,
-                body = body,
-                next = acc,
-            );
+            let mut body = body_to_vec(std::mem::take(&mut body));
+            body.extend(acc);
+            return body;
         }
 
         let condition = py_expr!(
@@ -190,7 +185,7 @@ finally:
             (py_stmt!("pass"), body_to_vec(std::mem::take(&mut body)))
         };
 
-        py_stmt!(
+        vec![py_stmt!(
             r#"
 if {condition:expr}:
     {exc_target:stmt}
@@ -202,7 +197,7 @@ else:
             exc_target = exc_target,
             body = body,
             next = acc,
-        )
+        )]
     });
 
     Rewrite::Walk(vec![py_stmt!(

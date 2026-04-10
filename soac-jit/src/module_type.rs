@@ -225,6 +225,7 @@ impl SharedModuleState {
                 &module_constant_ptrs,
                 &counter_ptrs,
                 Some(self),
+                None,
             )
         };
         match compile_result {
@@ -656,10 +657,8 @@ pub fn key_layout_counter_enabled() -> bool {
 }
 
 fn specialization_mode_records_counters() -> bool {
-    matches!(
-        env::var("SOAC_OPT_MODE").ok().as_deref().map(str::trim),
-        Some("profile" | "verify")
-    )
+    let mode = env::var("SOAC_OPT_MODE").unwrap_or_default();
+    matches!(mode.trim(), "profile" | "verify")
 }
 
 fn append_jit_codegen_log(
@@ -743,6 +742,7 @@ fn snapshot_type_key_layout_events_bound(
 fn counter_dump_file_from_env() -> Option<std::path::PathBuf> {
     let mode = env::var("SOAC_OPT_MODE").ok()?;
     let filename = match mode.trim() {
+        "none" => return None,
         "profile" => "profile.bin",
         "verify" => "verify.bin",
         _ => return None,

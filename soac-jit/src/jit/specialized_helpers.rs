@@ -1845,14 +1845,6 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
         crate::vectorcall_function_extra as *const u8,
     );
     builder.symbol(
-        "dp_jit_vectorcall_enter_module_runtime",
-        crate::vectorcall_enter_module_runtime as *const u8,
-    );
-    builder.symbol(
-        "dp_jit_vectorcall_leave_module_runtime",
-        crate::vectorcall_leave_module_runtime as *const u8,
-    );
-    builder.symbol(
         "dp_jit_py_thread_state_get",
         dp_jit_py_thread_state_get as *const u8,
     );

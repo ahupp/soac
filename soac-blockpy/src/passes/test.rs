@@ -1212,6 +1212,31 @@ fn method_super_uses_cell_ref_marker_for_classcell() {
 }
 
 #[test]
+fn method_explicit_super_records_classcell_capture_for_original_code_shape() {
+    let source = concat!(
+        "class C:\n",
+        "    def f(self):\n",
+        "        return super(C, self).f()\n",
+    );
+
+    let lowered = TrackedLowering::new(source);
+    let resolved_method = lowered.bb_function("f");
+    let layout = resolved_method
+        .storage_layout
+        .as_ref()
+        .expect("method should have closure layout for CPython __class__ code object");
+
+    assert!(
+        layout
+            .freevars
+            .iter()
+            .any(|slot| slot.logical_name == "__class__" && slot.storage_name == "__class__"),
+        "{resolved_method:?}\n{}",
+        lowered.name_binding_text(),
+    );
+}
+
+#[test]
 fn nested_method_dunder_class_capture_does_not_leak_classcell_to_enclosing_scopes() {
     let source = concat!(
         "def exercise():\n",

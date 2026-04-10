@@ -5,55 +5,39 @@ description: Run the CPython regression test suite and generate structured summa
 
 # Run CPython tests
 
-## Run the full suite (transform mode)
+## Run the partitioned fast suite
 
-- Run with full permissions, including network.
-- Use a 3-minute per-test timeout and keep parallelism enabled (run_cpython_tests.sh already uses -j0).
-- Capture output to a single log file while preserving the exit status:
-
-```bash
-set -o pipefail
-./scripts/run_cpython_tests.sh --timeout 180 2>&1 | tee logs/cpython_full_test_run.log
-```
-
-## Run the fast suite (transform mode)
-
-- Skip slow tests and keep parallelism enabled.
-- Capture output to a log file while preserving the exit status:
+- Run the checked-in fast test partitions sequentially.
+- Use an explicit tempdir under `/tmp` in sandboxed environments.
 
 ```bash
-set -o pipefail
-./scripts/run_cpython_tests.sh -x slow 2>&1 | tee logs/cpython_fast_test_run.log
+./scripts/run_cpython_test_sets.sh --tempdir /tmp/soac-cpython-fast-tests
 ```
 
-## Run the full suite (eval mode)
+This writes a summary to `logs/cpython_jit_test_sets_summary.log` and one
+`logs/cpython_jit_cpython_fast_tests_part_*.log` file per partition.
 
-- Set DIET_PYTHON_MODE=eval to use the tree-walk evaluator.
-- Capture output to a log file while preserving the exit status:
+## Run one CPython test file
 
 ```bash
+mkdir -p logs
 set -o pipefail
-DIET_PYTHON_MODE=eval ./scripts/run_cpython_tests.sh --timeout 180 2>&1 | tee logs/cpython_full_eval_test_run.log
+just run-cpython-tests 0 -x slow --tempdir /tmp/soac-cpython-single -f /abs/path/to/test_file.py 2>&1 | tee logs/cpython_single_test_file.log
 ```
 
-## Run the fast suite (eval mode)
+`just run-cpython-tests` builds the extension, installs the local package in the
+venv, and executes vendored CPython regrtest through `python -m soac.import_hook
+test.__main__`. Pass an absolute `-f` file path.
 
-- Skip slow tests and keep parallelism enabled.
-- Capture output to a log file while preserving the exit status:
+## Run arbitrary regrtest arguments
 
 ```bash
+mkdir -p logs
 set -o pipefail
-DIET_PYTHON_MODE=eval ./scripts/run_cpython_tests.sh -x slow 2>&1 | tee logs/cpython_fast_eval_test_run.log
+just run-cpython-tests 0 --tempdir /tmp/soac-cpython-tests -x slow 2>&1 | tee logs/cpython_full_test_run.log
 ```
 
-## Run in transform-only mode explicitly (optional)
-
-- Transform mode is the default; this is only needed if the environment is set differently.
-
-```bash
-set -o pipefail
-DIET_PYTHON_MODE=transform ./scripts/run_cpython_tests.sh --timeout 180 2>&1 | tee logs/cpython_full_transform_test_run.log
-```
+Override SOAC environment variables only when explicitly comparing modes.
 
 ## Summarize failures from the log
 
