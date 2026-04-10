@@ -406,7 +406,7 @@ fn maybe_eager_compile_clif_entry(
     }
 }
 
-fn register_lazy_vectorcall(
+fn register_jit_vectorcall(
     py: Python<'_>,
     func: &Bound<'_, PyAny>,
     function_id: FunctionId,
@@ -424,7 +424,7 @@ fn register_lazy_vectorcall(
         Ok(()) => maybe_eager_compile_clif_entry(py, func, module_runtime, function_id),
         Err(err) if err.is_instance_of::<PyNotImplementedError>(py) => Err(err),
         Err(err) => Err(PyRuntimeError::new_err(format!(
-            "failed to register lazy CLIF vectorcall for {module_name} function_id={function_id}: {err}",
+            "failed to register CLIF vectorcall for {module_name} function_id={function_id}: {err}",
             module_name = module_runtime.shared_module_state_owner.module_name,
             function_id = function_id
         ))),
@@ -890,10 +890,10 @@ fn instantiate_closure_backed_entry<'py>(
         )?
     };
     // soac.runtime's source helpers are the runtime ABI for other transformed
-    // modules.  Running them through lazy_vectorcall would push a soac.runtime
-    // context while the caller's module context must remain current.
+    // modules. Keep them on their source implementation so calls from generated
+    // code do not switch onto the runtime module's function environment.
     if !(module_name == "soac.runtime" && original_code.is_some()) {
-        register_lazy_vectorcall(py, &entry, function.function_id, module_runtime)?;
+        register_jit_vectorcall(py, &entry, function.function_id, module_runtime)?;
     }
     Ok(entry)
 }

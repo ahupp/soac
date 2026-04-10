@@ -660,18 +660,6 @@ mod tests {
         ]
     }
 
-    unsafe extern "C" fn test_bind_direct_args_stub(
-        _callable: ObjPtr,
-        _args: *const ObjPtr,
-        _nargsf: usize,
-        _kwnames: ObjPtr,
-        _data_ptr: ObjPtr,
-        _out_args: *mut ObjPtr,
-        _out_len: i64,
-    ) -> i32 {
-        1
-    }
-
     fn count_direct_calls_to_runtime_helpers(
         function: &ir::Function,
         helpers: &[ir::UserExternalName],
@@ -970,39 +958,10 @@ mod tests {
 
     #[test]
     fn jit_vectorcall_trampoline_can_link_runtime_decref_clif() {
-        unsafe {
-            let compiled = Box::new(CompiledSpecializedRunner {
-                _owner: CompiledRunnerOwner::LegacyJitModule(
-                    new_jit_module().expect("compiled runner jit module should construct"),
-                ),
-                entry: Some(CompiledRunnerEntry::Direct {
-                    code_ptr: std::ptr::null(),
-                    param_count: 0,
-                }),
-            });
-            let compiled_handle = Box::into_raw(compiled) as ObjPtr;
-            let result = compile_cranelift_vectorcall_direct_trampoline(
-                test_bind_direct_args_stub,
-                1usize as ObjPtr,
-                2usize as ObjPtr,
-                compiled_handle,
-                "jit_runtime_support_vectorcall_smoke",
-            );
-
-            match result {
-                Ok((trampoline_handle, _entry)) => {
-                    free_cranelift_vectorcall_trampoline(trampoline_handle);
-                }
-                Err(error) => {
-                    free_cranelift_run_bb_specialized_cached(compiled_handle);
-                    panic!(
-                        "vectorcall trampoline should link runtime CLIF refcount helpers: {error}"
-                    );
-                }
-            }
-
-            free_cranelift_run_bb_specialized_cached(compiled_handle);
-        }
+        let engine = ProcessJitEngine::new().expect("process jit engine should construct");
+        engine
+            .vectorcall_trampoline(0)
+            .expect("vectorcall trampoline should link runtime CLIF refcount helpers");
     }
 
     #[test]

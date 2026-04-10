@@ -258,19 +258,7 @@ struct PyFunctionJitExtra {
     function_env: Box<FunctionEnv>,
     compile_session: Arc<CompileSession>,
     module_state: Arc<module_type::SharedModuleState>,
-    compiled_vectorcall: Option<CompiledVectorcallTrampoline>,
     compiled_vectorcall_entry: Option<jit::VectorcallEntryFn>,
-}
-
-struct CompiledVectorcallTrampoline {
-    handle: *mut c_void,
-}
-
-impl Drop for CompiledVectorcallTrampoline {
-    fn drop(&mut self) {
-        unsafe { jit::free_cranelift_vectorcall_trampoline(self.handle) };
-        self.handle = ptr::null_mut();
-    }
 }
 
 impl FunctionEnv {
@@ -596,6 +584,17 @@ fn push_active_module_runtime_context(
     ActiveModuleVmCtxGuard
 }
 
+struct VectorcallModuleRuntimeGuard {
+    active: Option<ActiveModuleVmCtxGuard>,
+    _runtime: Box<jit::ModuleRuntimeContext>,
+}
+
+impl Drop for VectorcallModuleRuntimeGuard {
+    fn drop(&mut self) {
+        self.active.take();
+    }
+}
+
 pub unsafe fn with_active_module_runtime_context<R>(
     runtime: *mut jit::ModuleRuntimeContext,
     f: impl FnOnce() -> R,
@@ -637,25 +636,6 @@ pub unsafe fn clone_module_runtime_context(
     })
 }
 
-unsafe fn build_module_runtime_context_from_parts(
-    compile_session: Arc<CompileSession>,
-    shared_module_state: Arc<module_type::SharedModuleState>,
-    globals_obj: *mut ffi::PyObject,
-) -> Result<jit::ModuleRuntimeContext, ()> {
-    if globals_obj.is_null() {
-        return set_runtime_error("cannot build module runtime context without globals");
-    }
-    unsafe { ffi::Py_INCREF(globals_obj) };
-    Ok(jit::ModuleRuntimeContext {
-        mod_ctx: jit::ModuleJitContext {
-            shared_module_state: Arc::as_ptr(&shared_module_state),
-            globals_obj: globals_obj as *mut c_void,
-        },
-        compile_session,
-        shared_module_state_owner: shared_module_state,
-    })
-}
-
 pub unsafe fn build_module_runtime_context_for_module(
     module: *mut ffi::PyObject,
 ) -> Result<jit::ModuleRuntimeContext, ()> {
@@ -686,6 +666,24 @@ pub unsafe fn build_module_runtime_context_for_module(
         },
         compile_session,
         shared_module_state_owner: shared_module_state,
+    })
+}
+
+unsafe fn build_module_runtime_context_for_function_extra(
+    data: &PyFunctionJitExtra,
+) -> Result<jit::ModuleRuntimeContext, ()> {
+    let globals_obj = data.function_env.globals_obj();
+    if globals_obj.is_null() {
+        return set_runtime_error("missing function globals while building runtime context");
+    }
+    unsafe { ffi::Py_INCREF(globals_obj) };
+    Ok(jit::ModuleRuntimeContext {
+        mod_ctx: jit::ModuleJitContext {
+            shared_module_state: std::sync::Arc::as_ptr(&data.module_state),
+            globals_obj: globals_obj as *mut c_void,
+        },
+        compile_session: data.compile_session.clone(),
+        shared_module_state_owner: data.module_state.clone(),
     })
 }
 
@@ -726,7 +724,6 @@ unsafe fn make_clif_function_data(
         function_env,
         compile_session: module_runtime.compile_session.clone(),
         module_state,
-        compiled_vectorcall: None,
         compiled_vectorcall_entry: None,
     });
     Ok(Box::into_raw(py_function_extra) as *mut c_void)
@@ -1515,29 +1512,12 @@ unsafe fn ensure_clif_vectorcall_compiled(
         );
         return Err(());
     }
-    if data.compiled_vectorcall.is_none() {
-        let vectorcall_symbol = jit::jit_python_perf_symbol_name(
-            jit::JIT_PYTHON_PERF_SYMBOL_KIND_VECTORCALL,
-            function.names.qualname.as_str(),
-        );
-        let compiled_handle = data
-            .function_env
-            .compiled_function
-            .as_ref()
-            .ok_or_else(|| unsafe {
-                ffi::PyErr_SetString(
-                    ffi::PyExc_RuntimeError,
-                    c"compiled CLIF function handle missing".as_ptr(),
-                );
-            })?
-            .raw();
-        let (handle, entry) = match jit::compile_cranelift_vectorcall_direct_trampoline(
-            bind_direct_args_from_vectorcall,
-            data as *mut PyFunctionJitExtra as *mut c_void,
-            data.function_env.as_mut_ptr(),
-            compiled_handle,
-            &vectorcall_symbol,
-        ) {
+    if data.compiled_vectorcall_entry.is_none() {
+        let entry = match data
+            .compile_session
+            .process_jit()
+            .and_then(|engine| engine.vectorcall_trampoline(function.params.len()))
+        {
             Ok(value) => value,
             Err(err) => {
                 if let Ok(c_msg) = CString::new(err) {
@@ -1552,7 +1532,6 @@ unsafe fn ensure_clif_vectorcall_compiled(
                 return Err(());
             }
         };
-        data.compiled_vectorcall = Some(CompiledVectorcallTrampoline { handle });
         data.compiled_vectorcall_entry = Some(entry);
         let vectorcall_entry: ffi::vectorcallfunc = std::mem::transmute(entry);
         PyFunction_SetVectorcall(callable as *mut ffi::PyFunctionObject, vectorcall_entry);
@@ -1821,7 +1800,96 @@ unsafe fn write_owned_bound_args_to_buffer(
     Ok(())
 }
 
-unsafe extern "C" fn bind_direct_args_from_vectorcall(
+pub(crate) unsafe extern "C" fn vectorcall_function_extra(callable: *mut c_void) -> *mut c_void {
+    match panic::catch_unwind(AssertUnwindSafe(|| {
+        if callable.is_null() || ffi::PyFunction_Check(callable as *mut ffi::PyObject) == 0 {
+            ffi::PyErr_SetString(
+                ffi::PyExc_RuntimeError,
+                b"invalid callable in vectorcall function extra lookup\0".as_ptr() as *const i8,
+            );
+            return ptr::null_mut();
+        }
+        let data_ptr = PyFunction_GetSoacMetadata(callable as *mut ffi::PyObject);
+        if data_ptr.is_null() {
+            ffi::PyErr_SetString(
+                ffi::PyExc_RuntimeError,
+                b"missing SOAC metadata in vectorcall function extra lookup\0".as_ptr()
+                    as *const i8,
+            );
+        }
+        data_ptr
+    })) {
+        Ok(value) => value,
+        Err(payload) => {
+            let message = format!(
+                "panic in vectorcall_function_extra: {}",
+                panic_payload_to_string(payload)
+            );
+            if let Ok(c_msg) = CString::new(message) {
+                ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
+            } else {
+                ffi::PyErr_SetString(
+                    ffi::PyExc_RuntimeError,
+                    b"panic in vectorcall_function_extra\0".as_ptr() as *const i8,
+                );
+            }
+            ptr::null_mut()
+        }
+    }
+}
+
+pub(crate) unsafe extern "C" fn vectorcall_enter_module_runtime(
+    data_ptr: *mut c_void,
+) -> *mut c_void {
+    match panic::catch_unwind(AssertUnwindSafe(|| {
+        if data_ptr.is_null() {
+            ffi::PyErr_SetString(
+                ffi::PyExc_RuntimeError,
+                b"missing SOAC metadata while entering vectorcall runtime context\0".as_ptr()
+                    as *const i8,
+            );
+            return ptr::null_mut();
+        }
+        let data = &mut *(data_ptr as *mut PyFunctionJitExtra);
+        let mut runtime = match build_module_runtime_context_for_function_extra(data) {
+            Ok(runtime) => Box::new(runtime),
+            Err(()) => return ptr::null_mut(),
+        };
+        let active = push_active_module_runtime_context(runtime.as_mut() as *mut _);
+        Box::into_raw(Box::new(VectorcallModuleRuntimeGuard {
+            active: Some(active),
+            _runtime: runtime,
+        })) as *mut c_void
+    })) {
+        Ok(value) => value,
+        Err(payload) => {
+            let message = format!(
+                "panic in vectorcall_enter_module_runtime: {}",
+                panic_payload_to_string(payload)
+            );
+            if let Ok(c_msg) = CString::new(message) {
+                ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
+            } else {
+                ffi::PyErr_SetString(
+                    ffi::PyExc_RuntimeError,
+                    b"panic in vectorcall_enter_module_runtime\0".as_ptr() as *const i8,
+                );
+            }
+            ptr::null_mut()
+        }
+    }
+}
+
+pub(crate) unsafe extern "C" fn vectorcall_leave_module_runtime(guard: *mut c_void) {
+    let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+        if guard.is_null() {
+            return;
+        }
+        drop(Box::from_raw(guard as *mut VectorcallModuleRuntimeGuard));
+    }));
+}
+
+pub(crate) unsafe extern "C" fn bind_direct_args_from_vectorcall(
     callable: *mut c_void,
     args: *const *mut c_void,
     nargsf: usize,
@@ -1881,67 +1949,6 @@ unsafe extern "C" fn bind_direct_args_from_vectorcall(
     }
 }
 
-unsafe extern "C" fn lazy_vectorcall(
-    callable: *mut ffi::PyObject,
-    args: *const *mut ffi::PyObject,
-    nargsf: usize,
-    kwnames: *mut ffi::PyObject,
-) -> *mut ffi::PyObject {
-    match panic::catch_unwind(AssertUnwindSafe(|| {
-        let py = Python::assume_attached();
-        let data = match py_function_jit_extra(callable) {
-            Ok(value) => value,
-            Err(()) => return ptr::null_mut(),
-        };
-        if ensure_clif_vectorcall_compiled(py, callable, data).is_err() {
-            return ptr::null_mut();
-        }
-        let Some(entry) = data.compiled_vectorcall_entry else {
-            ffi::PyErr_SetString(
-                ffi::PyExc_RuntimeError,
-                b"missing compiled CLIF vectorcall entry\0".as_ptr() as *const i8,
-            );
-            return ptr::null_mut();
-        };
-        unsafe {
-            let mut runtime = match build_module_runtime_context_from_parts(
-                data.compile_session.clone(),
-                data.module_state.clone(),
-                data.function_env.globals_obj(),
-            ) {
-                Ok(value) => value,
-                Err(()) => return ptr::null_mut(),
-            };
-            let runtime = std::ptr::addr_of_mut!(runtime);
-            with_active_module_runtime_context(runtime, || {
-                entry(
-                    callable as *mut c_void,
-                    args as *const *mut c_void,
-                    nargsf,
-                    kwnames as *mut c_void,
-                ) as *mut ffi::PyObject
-            })
-        }
-    })) {
-        Ok(value) => value,
-        Err(payload) => {
-            let message = format!(
-                "panic in lazy_vectorcall: {}",
-                panic_payload_to_string(payload)
-            );
-            if let Ok(c_msg) = CString::new(message) {
-                ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
-            } else {
-                ffi::PyErr_SetString(
-                    ffi::PyExc_RuntimeError,
-                    b"panic in lazy_vectorcall\0".as_ptr() as *const i8,
-                );
-            }
-            ptr::null_mut()
-        }
-    }
-}
-
 pub unsafe fn register_clif_vectorcall(
     function: *mut ffi::PyObject,
     function_id: FunctionId,
@@ -1956,12 +1963,56 @@ pub unsafe fn register_clif_vectorcall(
     }
     let func = function as *mut ffi::PyFunctionObject;
     if !PyFunction_GetSoacMetadata(function).is_null() {
-        PyFunction_SetVectorcall(func, lazy_vectorcall);
+        let data = unsafe { py_function_jit_extra(function)? };
+        let function = data.function()?;
+        let entry = data
+            .compile_session
+            .process_jit()
+            .and_then(|engine| engine.vectorcall_trampoline(function.params.len()))
+            .map_err(|err| {
+                if let Ok(c_msg) = CString::new(err) {
+                    ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
+                } else {
+                    ffi::PyErr_SetString(
+                        ffi::PyExc_RuntimeError,
+                        b"failed to compile shared CLIF vectorcall trampoline\0".as_ptr()
+                            as *const i8,
+                    );
+                }
+            })?;
+        data.compiled_vectorcall_entry = Some(entry);
+        let vectorcall_entry: ffi::vectorcallfunc = std::mem::transmute(entry);
+        PyFunction_SetVectorcall(func, vectorcall_entry);
         return Ok(());
     }
     let _watcher = function_owner_type_registry()?;
+    let blockpy_function = module_runtime
+        .shared_module_state_owner
+        .lookup_function(function_id)
+        .ok_or_else(|| {
+            ffi::PyErr_SetString(
+                ffi::PyExc_RuntimeError,
+                c"no specialized JIT plan found while registering vectorcall".as_ptr(),
+            );
+        })?;
+    let entry = module_runtime
+        .compile_session
+        .process_jit()
+        .and_then(|engine| engine.vectorcall_trampoline(blockpy_function.params.len()))
+        .map_err(|err| {
+            if let Ok(c_msg) = CString::new(err) {
+                ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
+            } else {
+                ffi::PyErr_SetString(
+                    ffi::PyExc_RuntimeError,
+                    b"failed to compile shared CLIF vectorcall trampoline\0".as_ptr() as *const i8,
+                );
+            }
+        })?;
 
     let data_ptr = make_clif_function_data(function, function_id, module_runtime)?;
+    let data = unsafe { &mut *(data_ptr as *mut PyFunctionJitExtra) };
+    data.compiled_vectorcall_entry = Some(entry);
     if PyFunction_SetSoacMetadata(
         function,
         function_id.packed(),
@@ -1972,7 +2023,8 @@ pub unsafe fn register_clif_vectorcall(
         free_clif_function_data(data_ptr);
         return Err(());
     }
-    PyFunction_SetVectorcall(func, lazy_vectorcall);
+    let vectorcall_entry: ffi::vectorcallfunc = std::mem::transmute(entry);
+    PyFunction_SetVectorcall(func, vectorcall_entry);
     Ok(())
 }
 

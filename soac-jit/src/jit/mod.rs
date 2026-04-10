@@ -345,6 +345,21 @@ static DP_JIT_VECTORCALL_BIND_DIRECT_ARGS_IMPORT: ImportSpec = ImportSpec::new(
     ],
     &[SigType::I32],
 );
+static DP_JIT_VECTORCALL_FUNCTION_EXTRA_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_vectorcall_function_extra",
+    &[SigType::Pointer],
+    &[SigType::Pointer],
+);
+static DP_JIT_VECTORCALL_ENTER_MODULE_RUNTIME_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_vectorcall_enter_module_runtime",
+    &[SigType::Pointer],
+    &[SigType::Pointer],
+);
+static DP_JIT_VECTORCALL_LEAVE_MODULE_RUNTIME_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_vectorcall_leave_module_runtime",
+    &[SigType::Pointer],
+    &[],
+);
 struct ModuleFuncImports {
     func_ids_by_internal_id: Vec<Option<FuncId>>,
     import_id_to_symbol: HashMap<u32, &'static str>,
@@ -493,6 +508,7 @@ struct DefinedJitFunction {
 
 pub(crate) struct ProcessJitEngine {
     jit_module: Mutex<JITModule>,
+    vectorcall_trampolines: Mutex<HashMap<usize, VectorcallEntryFn>>,
     next_compile_id: AtomicU64,
 }
 
@@ -520,10 +536,6 @@ impl CompiledFunctionHandle {
         Ok(Self { handle })
     }
 
-    pub(crate) fn raw(&self) -> ObjPtr {
-        self.handle
-    }
-
     pub(crate) fn direct_code_ptr(&self) -> Result<ObjPtr, String> {
         compiled_direct_code_ptr(self.handle)
     }
@@ -544,10 +556,6 @@ enum CompiledRunnerOwner {
 }
 
 pub type VectorcallEntryFn = unsafe extern "C" fn(ObjPtr, *const ObjPtr, usize, ObjPtr) -> ObjPtr;
-
-struct CompiledVectorcallRunner {
-    _jit_module: JITModule,
-}
 
 #[derive(Clone, Copy)]
 enum CompiledRunnerEntry {
@@ -5479,8 +5487,31 @@ impl ProcessJitEngine {
     pub(crate) fn new() -> Result<Self, String> {
         Ok(Self {
             jit_module: Mutex::new(new_jit_module()?),
+            vectorcall_trampolines: Mutex::new(HashMap::new()),
             next_compile_id: AtomicU64::new(0),
         })
+    }
+
+    pub(crate) fn vectorcall_trampoline(
+        &self,
+        param_count: usize,
+    ) -> Result<VectorcallEntryFn, String> {
+        let mut trampolines = self
+            .vectorcall_trampolines
+            .lock()
+            .map_err(|_| "process JIT vectorcall trampoline cache lock poisoned".to_string())?;
+        if let Some(entry) = trampolines.get(&param_count).copied() {
+            return Ok(entry);
+        }
+
+        let mut jit_module = self
+            .jit_module
+            .lock()
+            .map_err(|_| "process JIT module lock poisoned".to_string())?;
+        let symbol = format!("__soac_vectorcall_arity_{param_count}");
+        let entry = define_shared_vectorcall_trampoline(&mut jit_module, param_count, &symbol)?;
+        trampolines.insert(param_count, entry);
+        Ok(entry)
     }
 
     pub(crate) unsafe fn compile_direct_function(
@@ -5826,7 +5857,6 @@ fn is_clif_ident_byte(byte: u8) -> bool {
 }
 
 pub(crate) const JIT_PYTHON_PERF_SYMBOL_KIND_DIRECT: &str = "d";
-pub(crate) const JIT_PYTHON_PERF_SYMBOL_KIND_VECTORCALL: &str = "v";
 pub(crate) const SOAC_RUNTIME_INCREF_SYMBOL: &str = "soac_runtime_incref";
 pub(crate) const SOAC_RUNTIME_DECREF_SYMBOL: &str = "soac_runtime_decref";
 pub(crate) const SOAC_RUNTIME_CALLEE_FUNCTION_ID_SYMBOL: &str = "soac_runtime_callee_function_id";
@@ -7393,36 +7423,11 @@ pub(crate) fn compiled_direct_code_ptr(compiled_handle: ObjPtr) -> Result<ObjPtr
     compiled_direct_runner_info(compiled_handle).map(|(code_ptr, _)| code_ptr as ObjPtr)
 }
 
-pub unsafe fn compile_cranelift_vectorcall_direct_trampoline(
-    bind_direct_args_fn: unsafe extern "C" fn(
-        ObjPtr,
-        *const ObjPtr,
-        usize,
-        ObjPtr,
-        ObjPtr,
-        *mut ObjPtr,
-        i64,
-    ) -> i32,
-    function_extra_ptr: ObjPtr,
-    function_env_ptr: ObjPtr,
-    compiled_handle: ObjPtr,
+fn define_shared_vectorcall_trampoline(
+    jit_module: &mut JITModule,
+    param_count: usize,
     symbol_name: &str,
-) -> Result<(ObjPtr, VectorcallEntryFn), String> {
-    if function_extra_ptr.is_null() {
-        return Err("invalid null vectorcall function extra pointer".to_string());
-    }
-    if function_env_ptr.is_null() {
-        return Err("invalid null vectorcall function env pointer".to_string());
-    }
-    let (_, param_count) = compiled_direct_runner_info(compiled_handle)?;
-
-    let mut builder = new_jit_builder()?;
-    builder.symbol(
-        "dp_jit_vectorcall_bind_direct_args",
-        bind_direct_args_fn as *const u8,
-    );
-    let mut jit_module = JITModule::new(builder);
-    load_runtime_support_clif(&mut jit_module)?;
+) -> Result<VectorcallEntryFn, String> {
     let ptr_ty = jit_module.target_config().pointer_type();
     let i64_ty = ir::types::I64;
     let mut module_imports = ModuleFuncImports::new();
@@ -7434,7 +7439,7 @@ pub unsafe fn compile_cranelift_vectorcall_direct_trampoline(
     main_sig.params.push(ir::AbiParam::new(ptr_ty));
     main_sig.returns.push(ir::AbiParam::new(ptr_ty));
 
-    let main_id = declare_local_fn(&mut jit_module, symbol_name, &main_sig)?;
+    let main_id = declare_local_fn(jit_module, symbol_name, &main_sig)?;
 
     let mut direct_sig = jit_module.make_signature();
     direct_sig.params.push(ir::AbiParam::new(ptr_ty));
@@ -7461,29 +7466,110 @@ pub unsafe fn compile_cranelift_vectorcall_direct_trampoline(
 
         let mut func_imports = FuncBuildImports::new(&mut module_imports);
         let bind_ref = func_imports.get_or_panic(
-            &mut jit_module,
+            jit_module,
             &mut fb.func,
             &DP_JIT_VECTORCALL_BIND_DIRECT_ARGS_IMPORT,
         );
+        let function_extra_ref = func_imports.get_or_panic(
+            jit_module,
+            &mut fb.func,
+            &DP_JIT_VECTORCALL_FUNCTION_EXTRA_IMPORT,
+        );
         let enter_recursive_ref = func_imports.get_or_panic(
-            &mut jit_module,
+            jit_module,
             &mut fb.func,
             &DP_JIT_ENTER_RECURSIVE_CALL_IMPORT,
         );
         let leave_recursive_ref = func_imports.get_or_panic(
-            &mut jit_module,
+            jit_module,
             &mut fb.func,
             &DP_JIT_LEAVE_RECURSIVE_CALL_IMPORT,
         );
-        let decref_ref =
-            func_imports.get_or_panic(&mut jit_module, &mut fb.func, &DP_JIT_DECREF_IMPORT);
-        let thread_state_get_ref = func_imports.get_or_panic(
-            &mut jit_module,
+        let decref_ref = func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_DECREF_IMPORT);
+        let thread_state_get_ref =
+            func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_PY_THREAD_STATE_GET_IMPORT);
+        let direct_function_context_ref = func_imports.get_or_panic(
+            jit_module,
             &mut fb.func,
-            &DP_JIT_PY_THREAD_STATE_GET_IMPORT,
+            &DP_JIT_DIRECT_FUNCTION_CONTEXT_IMPORT,
+        );
+        let enter_module_runtime_ref = func_imports.get_or_panic(
+            jit_module,
+            &mut fb.func,
+            &DP_JIT_VECTORCALL_ENTER_MODULE_RUNTIME_IMPORT,
+        );
+        let leave_module_runtime_ref = func_imports.get_or_panic(
+            jit_module,
+            &mut fb.func,
+            &DP_JIT_VECTORCALL_LEAVE_MODULE_RUNTIME_IMPORT,
         );
 
         let null_ptr = fb.ins().iconst(ptr_ty, 0);
+        let function_extra_inst = fb.ins().call(function_extra_ref, &[callable_val]);
+        let function_extra_val = fb.inst_results(function_extra_inst)[0];
+        let function_extra_missing =
+            fb.ins()
+                .icmp_imm(ir::condcodes::IntCC::Equal, function_extra_val, 0);
+        let function_extra_ok = fb.create_block();
+        let early_fail_block = fb.create_block();
+        fb.ins().brif(
+            function_extra_missing,
+            early_fail_block,
+            &[],
+            function_extra_ok,
+            &[],
+        );
+        fb.seal_block(early_fail_block);
+        fb.seal_block(function_extra_ok);
+
+        fb.switch_to_block(early_fail_block);
+        fb.ins().return_(&[null_ptr]);
+
+        fb.switch_to_block(function_extra_ok);
+        let function_env_inst = fb.ins().call(direct_function_context_ref, &[callable_val]);
+        let function_env_val = fb.inst_results(function_env_inst)[0];
+        let function_env_missing =
+            fb.ins()
+                .icmp_imm(ir::condcodes::IntCC::Equal, function_env_val, 0);
+        let function_env_ok = fb.create_block();
+        let context_fail_block = fb.create_block();
+        fb.ins().brif(
+            function_env_missing,
+            context_fail_block,
+            &[],
+            function_env_ok,
+            &[],
+        );
+        fb.seal_block(context_fail_block);
+        fb.seal_block(function_env_ok);
+
+        fb.switch_to_block(context_fail_block);
+        fb.ins().return_(&[null_ptr]);
+
+        fb.switch_to_block(function_env_ok);
+        let runtime_guard_inst = fb
+            .ins()
+            .call(enter_module_runtime_ref, &[function_extra_val]);
+        let runtime_guard_val = fb.inst_results(runtime_guard_inst)[0];
+        let runtime_guard_missing =
+            fb.ins()
+                .icmp_imm(ir::condcodes::IntCC::Equal, runtime_guard_val, 0);
+        let runtime_guard_ok = fb.create_block();
+        let runtime_guard_fail_block = fb.create_block();
+        fb.ins().brif(
+            runtime_guard_missing,
+            runtime_guard_fail_block,
+            &[],
+            runtime_guard_ok,
+            &[],
+        );
+        fb.seal_block(runtime_guard_fail_block);
+        fb.seal_block(runtime_guard_ok);
+
+        fb.switch_to_block(runtime_guard_fail_block);
+        fb.ins().return_(&[null_ptr]);
+
+        fb.switch_to_block(runtime_guard_ok);
         let enter_inst = fb.ins().call(enter_recursive_ref, &[]);
         let enter_status = fb.inst_results(enter_inst)[0];
         let enter_failed = fb
@@ -7497,11 +7583,11 @@ pub unsafe fn compile_cranelift_vectorcall_direct_trampoline(
         fb.seal_block(bind_block);
 
         fb.switch_to_block(recursion_fail_block);
+        fb.ins()
+            .call(leave_module_runtime_ref, &[runtime_guard_val]);
         fb.ins().return_(&[null_ptr]);
 
         fb.switch_to_block(bind_block);
-        let function_extra_const = fb.ins().iconst(ptr_ty, function_extra_ptr as i64);
-        let function_env_const = fb.ins().iconst(ptr_ty, function_env_ptr as i64);
         let bound_args_slot = if param_count == 0 {
             None
         } else {
@@ -7524,7 +7610,7 @@ pub unsafe fn compile_cranelift_vectorcall_direct_trampoline(
                 args_val,
                 nargsf_val,
                 kwnames_val,
-                function_extra_const,
+                function_extra_val,
                 bound_args_ptr,
                 out_len,
             ],
@@ -7539,6 +7625,8 @@ pub unsafe fn compile_cranelift_vectorcall_direct_trampoline(
 
         fb.switch_to_block(fail_block);
         fb.ins().call(leave_recursive_ref, &[]);
+        fb.ins()
+            .call(leave_module_runtime_ref, &[runtime_guard_val]);
         fb.ins().return_(&[null_ptr]);
 
         fb.switch_to_block(ok_block);
@@ -7546,7 +7634,7 @@ pub unsafe fn compile_cranelift_vectorcall_direct_trampoline(
         let thread_state_inst = fb.ins().call(thread_state_get_ref, &[]);
         let thread_state_val = fb.inst_results(thread_state_inst)[0];
         let mut call_args = Vec::with_capacity(param_count + 2);
-        call_args.push(function_env_const);
+        call_args.push(function_env_val);
         call_args.push(thread_state_val);
         let mut owned_args = Vec::with_capacity(param_count);
         if let Some(slot) = bound_args_slot {
@@ -7561,7 +7649,7 @@ pub unsafe fn compile_cranelift_vectorcall_direct_trampoline(
         let callee_ptr = load_function_env_obj(
             &mut fb,
             ptr_ty,
-            function_env_const,
+            function_env_val,
             FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET,
         );
         let call_inst = fb
@@ -7572,13 +7660,15 @@ pub unsafe fn compile_cranelift_vectorcall_direct_trampoline(
             fb.ins().call(decref_ref, &[value]);
         }
         fb.ins().call(leave_recursive_ref, &[]);
+        fb.ins()
+            .call(leave_module_runtime_ref, &[runtime_guard_val]);
         fb.ins().return_(&[result]);
         fb.seal_all_blocks();
         fb.finalize();
     }
 
     let main_artifact = define_function_with_incremental_cache(
-        &mut jit_module,
+        jit_module,
         main_id,
         &mut ctx,
         "failed to define direct vectorcall trampoline",
@@ -7596,18 +7686,8 @@ pub unsafe fn compile_cranelift_vectorcall_direct_trampoline(
         jit_module.isa(),
         main_artifact.systemv_unwind_info.as_ref(),
     )?;
-    let entry: VectorcallEntryFn = std::mem::transmute(code_ptr);
-    let compiled = Box::new(CompiledVectorcallRunner {
-        _jit_module: jit_module,
-    });
-    Ok((Box::into_raw(compiled) as ObjPtr, entry))
-}
-
-pub unsafe fn free_cranelift_vectorcall_trampoline(compiled_handle: ObjPtr) {
-    if compiled_handle.is_null() {
-        return;
-    }
-    let _ = Box::from_raw(compiled_handle as *mut CompiledVectorcallRunner);
+    let entry: VectorcallEntryFn = unsafe { std::mem::transmute(code_ptr) };
+    Ok(entry)
 }
 
 pub unsafe fn free_cranelift_run_bb_specialized_cached(compiled_handle: ObjPtr) {
