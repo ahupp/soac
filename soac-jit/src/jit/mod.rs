@@ -25,8 +25,8 @@ use soac_blockpy::block_py::{
     ResolvedName, StorageLayout, Visit, WithMeta, operation as blockpy_intrinsics,
 };
 use soac_blockpy::passes::{
-    CodegenModuleShape, FactStore, FunctionRefcountPlan, InstrResolved, RuntimeHelperId,
-    ValueFacts, infer_module_value_facts,
+    CodegenModuleShape, FactStore, FunctionRefcountPlan, InstrResolved, RefcountActionKind,
+    RefcountReleaseReason, RuntimeHelperId, ValueFacts, infer_module_value_facts,
 };
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -1742,6 +1742,7 @@ struct LocalEnvLegacyParts {
 }
 
 impl LocalEnv {
+    #[cfg(test)]
     fn legacy_ref_kinds(&self) -> Vec<LocalRefKind> {
         self.entries.iter().map(|entry| entry.ref_kind).collect()
     }
@@ -1789,6 +1790,7 @@ impl LocalEnv {
         self.entries = entries;
     }
 
+    #[cfg(test)]
     fn with_legacy_parts_mut<R>(
         &mut self,
         emit: impl FnOnce(&mut Vec<String>, &mut Vec<ir::Value>) -> R,
@@ -5860,6 +5862,47 @@ fn emit_decref_unforwarded_locals(
     }
 }
 
+fn emit_planned_stack_slot_releases_for_reason(
+    fb: &mut FunctionBuilder<'_>,
+    source_label: BlockLabel,
+    reason: &RefcountReleaseReason,
+    emit_ctx: &JitEmitCtx<'_>,
+) -> Result<(), String> {
+    let Some(block_plan) = emit_ctx.refcount_plan.block(source_label) else {
+        return Ok(());
+    };
+    for action in &block_plan.actions {
+        let RefcountActionKind::ReleaseLocal {
+            local,
+            reason: action_reason,
+            ..
+        } = &action.kind
+        else {
+            continue;
+        };
+        if action_reason != reason {
+            continue;
+        }
+        emit_ctx
+            .stack_slots
+            .replace_cloned_value(
+                fb,
+                local.name.as_str(),
+                emit_ctx.consts.deleted_const,
+                emit_ctx.consts.ptr_ty,
+                emit_ctx.incref_ref,
+                emit_ctx.decref_ref,
+            )
+            .ok_or_else(|| {
+                format!(
+                    "refcount plan release for block {source_label} references missing stack slot {:?}",
+                    local.name
+                )
+            })?;
+    }
+    Ok(())
+}
+
 fn emit_truthy_from_owned(
     fb: &mut FunctionBuilder<'_>,
     owned_value: ir::Value,
@@ -5943,10 +5986,11 @@ fn emit_codegen_ops(
 
 fn emit_codegen_if_target_arm(
     fb: &mut FunctionBuilder<'_>,
-    block_label: &str,
+    source_label: BlockLabel,
     arm_name: &str,
     branch_block: ir::Block,
     target_label: BlockLabel,
+    release_reason: RefcountReleaseReason,
     current_exception_name: Option<&str>,
     exec_blocks: &[ir::Block],
     runtime_block_param_names: &[Vec<String>],
@@ -5975,7 +6019,7 @@ fn emit_codegen_if_target_arm(
         )
         .ok_or_else(|| {
             format!(
-                "missing local mapping for {arm_name}-branch block params in block {block_label}"
+                "missing local mapping for {arm_name}-branch block params in block {source_label}"
             )
         })?,
     );
@@ -5987,6 +6031,7 @@ fn emit_codegen_if_target_arm(
         target_params,
         emit_ctx.decref_ref,
     );
+    emit_planned_stack_slot_releases_for_reason(fb, source_label, &release_reason, emit_ctx)?;
     emit_pop_handled_exception_if_leaving(fb, current_exception_name, target_params, emit_ctx);
     fb.ins().jump(exec_blocks[target_index], &jump_args);
     Ok(())
@@ -5994,7 +6039,7 @@ fn emit_codegen_if_target_arm(
 
 fn emit_codegen_term(
     fb: &mut FunctionBuilder<'_>,
-    block_label: &str,
+    source_label: BlockLabel,
     term: &BlockTerm<InstrCodegen>,
     exec_blocks: &[ir::Block],
     runtime_block_param_names: &[Vec<String>],
@@ -6034,7 +6079,7 @@ fn emit_codegen_term(
                 func_imports,
             )
             .ok_or_else(|| {
-                format!("missing local mapping for jump slot updates in block {block_label}")
+                format!("missing local mapping for jump slot updates in block {source_label}")
             })?;
             let mut jump_args = Vec::with_capacity(target_params.len());
             jump_args.extend(
@@ -6050,7 +6095,7 @@ fn emit_codegen_term(
                     func_imports,
                 )
                 .ok_or_else(|| {
-                    format!("missing local mapping for jump block params in block {block_label}")
+                    format!("missing local mapping for jump block params in block {source_label}")
                 })?,
             );
             emit_decref_unforwarded_locals(
@@ -6061,6 +6106,15 @@ fn emit_codegen_term(
                 target_params,
                 decref_ref,
             );
+            let release_reason = RefcountReleaseReason::Jump {
+                target: target_label.target,
+            };
+            emit_planned_stack_slot_releases_for_reason(
+                fb,
+                source_label,
+                &release_reason,
+                emit_ctx,
+            )?;
             emit_pop_handled_exception_if_leaving(
                 fb,
                 current_exception_name,
@@ -6111,10 +6165,15 @@ fn emit_codegen_term(
             };
             emit_codegen_if_target_arm(
                 fb,
-                block_label,
+                source_label,
                 hot_name,
                 hot_branch,
                 hot_label,
+                if hot_label == if_term.then_label {
+                    RefcountReleaseReason::IfThen { target: hot_label }
+                } else {
+                    RefcountReleaseReason::IfElse { target: hot_label }
+                },
                 current_exception_name,
                 exec_blocks,
                 runtime_block_param_names,
@@ -6127,10 +6186,15 @@ fn emit_codegen_term(
             )?;
             emit_codegen_if_target_arm(
                 fb,
-                block_label,
+                source_label,
                 cold_name,
                 cold_branch,
                 cold_label,
+                if cold_label == if_term.then_label {
+                    RefcountReleaseReason::IfThen { target: cold_label }
+                } else {
+                    RefcountReleaseReason::IfElse { target: cold_label }
+                },
                 current_exception_name,
                 exec_blocks,
                 runtime_block_param_names,
@@ -6199,7 +6263,7 @@ fn emit_codegen_term(
                     )
                     .ok_or_else(|| {
                         format!(
-                            "missing local mapping for br_table case block params in block {block_label}"
+                            "missing local mapping for br_table case block params in block {source_label}"
                         )
                     })?,
                 );
@@ -6211,6 +6275,15 @@ fn emit_codegen_term(
                     target_params,
                     decref_ref,
                 );
+                let release_reason = RefcountReleaseReason::BranchCase {
+                    target: *target_label,
+                };
+                emit_planned_stack_slot_releases_for_reason(
+                    fb,
+                    source_label,
+                    &release_reason,
+                    emit_ctx,
+                )?;
                 emit_pop_handled_exception_if_leaving(
                     fb,
                     current_exception_name,
@@ -6238,7 +6311,7 @@ fn emit_codegen_term(
                 )
                 .ok_or_else(|| {
                     format!(
-                        "missing local mapping for br_table default block params in block {block_label}"
+                        "missing local mapping for br_table default block params in block {source_label}"
                     )
                 })?,
             );
@@ -6250,6 +6323,15 @@ fn emit_codegen_term(
                 default_params,
                 decref_ref,
             );
+            let release_reason = RefcountReleaseReason::BranchDefault {
+                target: branch.default_label,
+            };
+            emit_planned_stack_slot_releases_for_reason(
+                fb,
+                source_label,
+                &release_reason,
+                emit_ctx,
+            )?;
             emit_pop_handled_exception_if_leaving(
                 fb,
                 current_exception_name,
@@ -8278,7 +8360,7 @@ fn build_cranelift_run_bb_specialized_function(
 
             emit_codegen_term(
                 &mut fb,
-                block.label.to_string().as_str(),
+                block.label,
                 &block.term,
                 &exec_blocks,
                 &runtime_block_param_names,
