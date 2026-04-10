@@ -3084,6 +3084,9 @@ fn build_counted_runtime_refcount_helper(
         helper_id,
         &mut ctx,
         cache_name,
+        CraneliftCompileCachePolicy::Disabled {
+            reason: "counted refcount helper embeds a per-run counter pointer",
+        },
         "failed to define counted runtime refcount helper",
     )?;
     jit_module.clear_context(&mut ctx);
@@ -7778,6 +7781,9 @@ impl ProcessJitEngine {
                     function.names.qualname,
                     function.params.len()
                 ),
+                CraneliftCompileCachePolicy::Disabled {
+                    reason: "direct function body embeds per-run module constants and counter pointers",
+                },
                 "failed to define specialized jit run_bb function",
             )
             .map_err(|err| {
@@ -7855,6 +7861,7 @@ fn define_function_with_incremental_cache(
     func_id: FuncId,
     ctx: &mut cranelift_codegen::Context,
     cache_name: &str,
+    cache_policy: CraneliftCompileCachePolicy,
     err_prefix: &str,
 ) -> Result<DefinedFunctionArtifact, String> {
     inline_runtime_support_calls(jit_module, ctx, err_prefix)?;
@@ -7862,27 +7869,41 @@ fn define_function_with_incremental_cache(
     let func_for_relocs = ctx.func.clone();
     let func_name = ctx.func.name.clone();
     let mut ctrl_plane = ControlPlane::default();
-    let compiled = if compile_session.cranelift_compile_cache().is_enabled() {
-        let mut cache_store = compile_session.cranelift_compile_cache().store();
-        let (compiled, cache_hit) = ctx
-            .compile_with_cache(jit_module.isa(), &mut cache_store, &mut ctrl_plane)
-            .map_err(|err| format!("{err_prefix}: {err:?}"))?;
-        if cache_hit {
-            info!(
-                target: "soac_jit_compile_cache",
-                function = ?func_name,
-                cache_name,
-                func_id = func_id.as_u32(),
-                request = %err_prefix,
-                code_size = compiled.code_buffer().len(),
-                "Cranelift compile cache hit"
-            );
-        }
-        compiled
-    } else {
-        ctx.compile(jit_module.isa(), &mut ctrl_plane)
-            .map_err(|err| format!("{err_prefix}: {err:?}"))?
-    };
+    let compiled =
+        if compile_session.cranelift_compile_cache().is_enabled() && cache_policy.is_enabled() {
+            let mut cache_store = compile_session.cranelift_compile_cache().store();
+            let (compiled, cache_hit) = ctx
+                .compile_with_cache(jit_module.isa(), &mut cache_store, &mut ctrl_plane)
+                .map_err(|err| format!("{err_prefix}: {err:?}"))?;
+            if cache_hit {
+                info!(
+                    target: "soac_jit_compile_cache",
+                    function = ?func_name,
+                    cache_name,
+                    func_id = func_id.as_u32(),
+                    request = %err_prefix,
+                    code_size = compiled.code_buffer().len(),
+                    "Cranelift compile cache hit"
+                );
+            }
+            compiled
+        } else {
+            if compile_session.cranelift_compile_cache().is_enabled()
+                && let Some(reason) = cache_policy.disabled_reason()
+            {
+                tracing::debug!(
+                    target: "soac_jit_compile_cache",
+                    function = ?func_name,
+                    cache_name,
+                    func_id = func_id.as_u32(),
+                    request = %err_prefix,
+                    reason,
+                    "Cranelift compile cache skipped for function"
+                );
+            }
+            ctx.compile(jit_module.isa(), &mut ctrl_plane)
+                .map_err(|err| format!("{err_prefix}: {err:?}"))?
+        };
     let (code_bb_offsets, code_bb_edges) = compiled.get_code_bb_layout();
     let alignment = compiled.buffer.alignment as u64;
     let relocs = compiled
@@ -7907,6 +7928,25 @@ fn define_function_with_incremental_cache(
         code_bb_edges,
         systemv_unwind_info,
     })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CraneliftCompileCachePolicy {
+    Enabled,
+    Disabled { reason: &'static str },
+}
+
+impl CraneliftCompileCachePolicy {
+    fn is_enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+
+    fn disabled_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Enabled => None,
+            Self::Disabled { reason } => Some(reason),
+        }
+    }
 }
 
 fn stable_cranelift_compile_cache_name(cache_name: &str) -> ir::UserFuncName {
@@ -8476,6 +8516,7 @@ fn load_runtime_support_clif(
             func_id,
             &mut ctx,
             &parsed.symbol,
+            CraneliftCompileCachePolicy::Enabled,
             &format!("failed to define runtime CLIF function {}", parsed.symbol),
         )?;
         jit_module.clear_context(&mut ctx);
@@ -8667,6 +8708,7 @@ pub fn run_cranelift_smoke(module: &BlockPyModule<CodegenModuleShape>) -> Result
         function_id,
         &mut ctx,
         "jit-smoke",
+        CraneliftCompileCachePolicy::Enabled,
         "failed to define Cranelift function",
     )?;
     jit_module.clear_context(&mut ctx);
@@ -10157,6 +10199,7 @@ fn define_shared_vectorcall_trampoline(
         main_id,
         &mut ctx,
         &format!("direct-vectorcall-trampoline:{param_count}"),
+        CraneliftCompileCachePolicy::Enabled,
         "failed to define direct vectorcall trampoline",
     )?;
     jit_module.clear_context(&mut ctx);

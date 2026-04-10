@@ -143,7 +143,9 @@ exports are intentionally omitted here.
   in a process temp directory. Filenames are derived from Cranelift's
   cache keys. Cache configuration, hits, and store failures are emitted
   through the `soac_jit_compile_cache` tracing target. The cache is
-  disabled by default.
+  disabled by default. Direct Python function bodies are currently skipped
+  because their Cranelift input still embeds per-run object and counter
+  pointers.
 
 - `SOAC_COMPILE_CACHE_DIR=/path/to/cache-dir`
   Explicit filesystem root for `SOAC_CRANELIFT_COMPILE_CACHE`. Use this

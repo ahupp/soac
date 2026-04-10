@@ -281,7 +281,8 @@ instance's live working commit.
   or a process temp directory using key-derived filenames, and logs
   cache configuration, hits, and store failures through the
   `soac_jit_compile_cache` tracing target. The cache is disabled by
-  default.
+  default. Direct Python function bodies are currently skipped because
+  their Cranelift input still embeds per-run object and counter pointers.
 - `SOAC_COMPILE_CACHE_DIR`
   Explicit cache directory for `SOAC_CRANELIFT_COMPILE_CACHE`. Prefer
   this for CPython test runs and symlinked/shared checkout workflows so

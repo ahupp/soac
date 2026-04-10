@@ -1206,6 +1206,7 @@ mod tests {
             wrapper_id,
             &mut ctx,
             "test-runtime-refcount-smoke-wrapper",
+            CraneliftCompileCachePolicy::Enabled,
             "test wrapper function should define",
         )
         .expect("wrapper function should compile");
@@ -1271,6 +1272,7 @@ mod tests {
             wrapper_id,
             &mut ctx,
             "test-runtime-refcount-decref-wrapper",
+            CraneliftCompileCachePolicy::Enabled,
             "test wrapper function should define",
         )
         .expect("wrapper function should compile");
