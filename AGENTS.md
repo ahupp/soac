@@ -104,10 +104,8 @@ current `@`. Do not treat another workspace's live `@` as a dependency.
    Use `just py ...`, `just pytest ...`, and `just test-all` for transformed-runtime work unless you are intentionally debugging raw vendored CPython behavior.
    For isolated transformed-runtime repros, prefer `tests._integration.transformed_module(...)`.
 
-4. Regenerate generated artifacts through the standard entrypoints.
-   If fixtures fail, regenerate snapshots with `just regen-snapshots`.
-   Keep real snapshot updates in the same logical change so regressions remain visible in review.
-   Check `snapshot/snapshot_summary.txt` for surprising BlockPy or CLIF count shifts.
+4. Keep generated artifacts out of logical changes unless explicitly requested.
+   The generated `snapshot/` directory is ignored and should not be committed.
 
 5. Add focused regression coverage for real bugs.
    For each CPython regression you fix, add a minimal reproducing integration
@@ -263,8 +261,6 @@ anything non-code affected the run. If there were no such issues, say
   Best entrypoint for ad hoc transformed-runtime repros outside pytest.
 - `just run-cpython-tests ...`
   Use for vendored CPython regrtest runs.
-- `just regen-snapshots`
-  Regenerates fixture snapshots.
 - `$soac-profile-benchmark`
   Default skill for performance benchmark requests. This uses the
   artifact-producing pystone workflow: profile, verify, specialized apply

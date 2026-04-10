@@ -1,13 +1,3 @@
-
-## Regenerating transform fixtures
-
-If a transform change updates the expected desugaring, regenerate the fixture
-outputs with:
-
-```
-cargo run --bin regen_snapshots
-```
-
 # Development Environment
 
 Install the Python-side venv and the nightly Rust codegen backend used by

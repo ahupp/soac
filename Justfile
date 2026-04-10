@@ -770,13 +770,6 @@ fmt-markdown:
 
   npx prettier --write "${markdown_files[@]}"
 
-
-regen-snapshots:
-  #!/usr/bin/env bash
-  cd "$REPO_ROOT"
-  export UV_OFFLINE=1
-  cargo run --bin regen_snapshots
-
 [private]
 _test-all-test-phase:
   #!/usr/bin/env bash
@@ -865,15 +858,6 @@ test-all:
   else
     status=$?
     echo "[diet-python test-all] step failed: build-all (exit $status)" >&2
-    just uninstall-extension
-    exit "$status"
-  fi
-  TIMEFORMAT='[diet-python timing] regen_snapshots_s=%3R'
-  if time just regen-snapshots; then
-    :
-  else
-    status=$?
-    echo "[diet-python test-all] step failed: regen-snapshots (exit $status)" >&2
     just uninstall-extension
     exit "$status"
   fi

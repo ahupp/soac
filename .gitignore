@@ -10,6 +10,7 @@ cpython_test_run.log
 cpython_full_test_run.log
 cpython_full_test_run_summary.txt
 /logs
+/snapshot
 /tmp
 /.uv
 /.uv-cache
