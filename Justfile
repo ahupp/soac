@@ -5,12 +5,12 @@ repo_root := justfile_directory()
 cpython_bin := repo_root + "/vendor/cpython/python"
 cpython_lib_dir := repo_root + "/vendor/cpython"
 venv_dir := repo_root + "/.venv"
-uv_cache_dir := repo_root + "/.uv-cache"
-uv_tool_dir := repo_root + "/.uv/tools"
-uv_tool_bin_dir := repo_root + "/.uv/bin"
-xdg_cache_home := repo_root + "/.xdg/cache"
-xdg_data_home := repo_root + "/.xdg/data"
-xdg_runtime_dir := repo_root + "/tmp"
+uv_cache_dir := env_var_or_default("UV_CACHE_DIR", repo_root + "/.uv-cache")
+uv_tool_dir := env_var_or_default("UV_TOOL_DIR", repo_root + "/.uv/tools")
+uv_tool_bin_dir := env_var_or_default("UV_TOOL_BIN_DIR", repo_root + "/.uv/bin")
+xdg_cache_home := env_var_or_default("XDG_CACHE_HOME", repo_root + "/.xdg/cache")
+xdg_data_home := env_var_or_default("XDG_DATA_HOME", repo_root + "/.xdg/data")
+xdg_runtime_dir := env_var_or_default("XDG_RUNTIME_DIR", repo_root + "/tmp")
 cargo_home := env_var_or_default("CARGO_HOME", repo_root + "/tmp/cargo-home")
 pyo3_python := cpython_bin
 web_dir := repo_root + "/web"
@@ -135,9 +135,97 @@ install-extension build="debug": ensure-venv ensure-cpython
   just uninstall-extension
   ln -sf "$SOURCE_EXT" "$TARGET_EXT"
 
-setup-dev-env: ensure-cpython
+setup-dev-env:
   #!/usr/bin/env bash
   set -euo pipefail
+
+  link_shared_dir() {
+    local local_path="$1"
+    local shared_path="$2"
+    local label="$3"
+    local migrate_existing="${4:-0}"
+
+    if [[ ! -d "$shared_path" ]]; then
+      echo "$label shared directory not found at $shared_path" >&2
+      exit 1
+    fi
+
+    local shared_real
+    shared_real="$(realpath -m "$shared_path")"
+
+    if [[ -L "$local_path" ]]; then
+      local local_real
+      local_real="$(realpath -m "$local_path")"
+      if [[ "$local_real" == "$shared_real" ]]; then
+        return
+      fi
+      echo "$label is a symlink to $(readlink "$local_path"), expected $shared_path" >&2
+      exit 1
+    fi
+
+    if [[ -e "$local_path" ]]; then
+      if [[ -d "$local_path" && -z "$(find "$local_path" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+        rmdir "$local_path"
+      elif [[ "$migrate_existing" == "1" && -d "$local_path" ]]; then
+        case "$local_path" in
+          "$REPO_ROOT"/*) ;;
+          *)
+            echo "refusing to migrate $label outside REPO_ROOT: $local_path" >&2
+            exit 1
+            ;;
+        esac
+        cp -a --no-clobber "$local_path/." "$shared_path/"
+        rm -rf -- "$local_path"
+      else
+        echo "$label exists at $local_path and is not the expected shared-state symlink" >&2
+        echo "move it aside or set SOAC_PARENT_REPO before running setup-dev-env in this worktree" >&2
+        exit 1
+      fi
+    fi
+
+    mkdir -p "$(dirname "$local_path")"
+    ln -s "$shared_path" "$local_path"
+  }
+
+  if [[ -f "$REPO_ROOT/.jj/repo" ]]; then
+    if [[ -z "${SOAC_PARENT_REPO:-}" ]]; then
+      echo "setup-dev-env: this checkout is a jj worktree, but SOAC_PARENT_REPO is not set" >&2
+      echo "set SOAC_PARENT_REPO to the parent checkout that owns vendor/cpython and shared offline caches" >&2
+      exit 1
+    fi
+
+    parent_repo="${SOAC_PARENT_REPO%/}"
+    if [[ ! -d "$parent_repo" ]]; then
+      echo "SOAC_PARENT_REPO does not point to a directory: $SOAC_PARENT_REPO" >&2
+      exit 1
+    fi
+
+    parent_repo="$(cd "$parent_repo" && pwd -P)"
+    if [[ "$parent_repo" == "$(pwd -P)" ]]; then
+      echo "SOAC_PARENT_REPO points at this worktree; set it to the parent checkout" >&2
+      exit 1
+    fi
+
+    if [[ ! -d "$parent_repo/vendor/cpython" ]]; then
+      echo "parent checkout is missing vendor/cpython: $parent_repo/vendor/cpython" >&2
+      exit 1
+    fi
+
+    mkdir -p \
+      "$parent_repo/.uv-cache" \
+      "$parent_repo/.uv/tools" \
+      "$parent_repo/.uv/bin" \
+      "$parent_repo/.xdg/cache" \
+      "$parent_repo/.xdg/data" \
+      "$parent_repo/tmp/cargo-home"
+
+    link_shared_dir "$REPO_ROOT/vendor/cpython" "$parent_repo/vendor/cpython" "vendor/cpython"
+    link_shared_dir "$REPO_ROOT/.uv-cache" "$parent_repo/.uv-cache" ".uv-cache" 1
+    link_shared_dir "$REPO_ROOT/.uv" "$parent_repo/.uv" ".uv" 1
+    link_shared_dir "$REPO_ROOT/.xdg" "$parent_repo/.xdg" ".xdg" 1
+    link_shared_dir "$REPO_ROOT/tmp/cargo-home" "$parent_repo/tmp/cargo-home" "tmp/cargo-home" 1
+  fi
+
   mkdir -p \
     "$UV_CACHE_DIR" \
     "$UV_TOOL_DIR" \
@@ -145,6 +233,12 @@ setup-dev-env: ensure-cpython
     "$XDG_CACHE_HOME" \
     "$XDG_DATA_HOME" \
     "$XDG_RUNTIME_DIR"
+
+  if [[ ! -x "$CPYTHON_BIN" ]]; then
+    echo "python not found in $CPYTHON_BIN; run setup-dev-env in the parent checkout or build Python there first" >&2
+    exit 1
+  fi
+
   shared_bench="$REPO_ROOT/../soac-bench"
   mkdir -p "$shared_bench"
   if [[ -L "$REPO_ROOT/bench" ]]; then

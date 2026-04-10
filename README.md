@@ -22,6 +22,12 @@ state under the working tree (`.uv-cache`, `.uv/`, and `.xdg/`) and puts the
 repo-local uv tool bin directory on `PATH`, so later test and benchmark recipes
 can run uv in offline mode instead of fetching through the sandbox.
 
+For jj worktrees, set `SOAC_PARENT_REPO=/path/to/parent/checkout` before
+running `just setup-dev-env`. The setup recipe then symlinks `vendor/cpython`,
+`.uv-cache`, `.uv/`, `.xdg/`, and `tmp/cargo-home` from the parent checkout so
+temporary worktrees can reuse the already-fetched offline state. Running
+`setup-dev-env` from a jj worktree without `SOAC_PARENT_REPO` is an error.
+
 # CLIF
 
 ```
@@ -89,10 +95,17 @@ exports are intentionally omitted here.
 
 - `UV_CACHE_DIR`, `UV_TOOL_DIR`, `UV_TOOL_BIN_DIR`, `XDG_CACHE_HOME`,
   `XDG_DATA_HOME`, and `XDG_RUNTIME_DIR`
-  The `.envrc` and `Justfile` point these at repo-local directories so uv
-  package cache, installed tools, and XDG state stay under the working tree.
+  The `.envrc` and `Justfile` point these at repo-local directories by default
+  so uv package cache, installed tools, and XDG state stay under the working
+  tree. The `Justfile` also respects pre-set values for these variables, which
+  allows temporary worktrees to use explicit writable shared cache roots.
   `just setup-dev-env` installs `ruff` into the repo-local uv tool bin
   directory.
+
+- `SOAC_PARENT_REPO=/path/to/parent/checkout`
+  Required when running `just setup-dev-env` inside a jj worktree. The parent
+  checkout owns `vendor/cpython` and the shared offline state symlinked into the
+  worktree: `.uv-cache`, `.uv/`, `.xdg/`, and `tmp/cargo-home`.
 
 - `UV_OFFLINE=1`
   Normal test and benchmark recipes set this for uv-backed venv refreshes after
