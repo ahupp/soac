@@ -1943,6 +1943,14 @@ struct CodegenIntrinsicEmitState<'a, 'b, 'mc, 'c, 'd> {
     func_imports: &'a mut FuncBuildImports<'d>,
 }
 
+struct LocalEnvCodegenIntrinsicEmitState<'a, 'b, 'mc, 'c, 'd> {
+    fb: &'a mut FunctionBuilder<'b>,
+    local_env: &'c mut LocalEnv,
+    ctx: &'c JitEmitCtx<'mc>,
+    jit_module: &'a mut JITModule,
+    func_imports: &'a mut FuncBuildImports<'d>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum LocalEnvKey {
     Location(LocalLocation),
@@ -2550,6 +2558,112 @@ impl<'a, 'b, 'mc, 'c, 'd> intrinsics::OperationEmitState<'b, InstrCodegen>
                 arg,
                 &mut *self.local_names,
                 &mut *self.local_values,
+                self.ctx,
+                borrowed_arg,
+                self.jit_module,
+                self.func_imports,
+            );
+            arg_values.push((value, borrowed_arg));
+        }
+        arg_values
+    }
+
+    fn release_arg_values(&mut self, arg_values: &[(ir::Value, bool)]) {
+        for (value, borrowed_arg) in arg_values {
+            if !borrowed_arg {
+                self.fb.ins().call(self.ctx.decref_ref, &[*value]);
+            }
+        }
+    }
+
+    fn finish_owned_result(&mut self, value: ir::Value) -> ir::Value {
+        let null_ptr = self.fb.ins().iconst(self.ctx.consts.ptr_ty, 0);
+        let value_is_null = self
+            .fb
+            .ins()
+            .icmp(ir::condcodes::IntCC::Equal, value, null_ptr);
+        let value_ok_block = self.fb.create_block();
+        self.fb
+            .append_block_param(value_ok_block, self.ctx.consts.ptr_ty);
+        self.fb.ins().brif(
+            value_is_null,
+            self.ctx.consts.step_null_block,
+            &step_null_block_args(self.ctx),
+            value_ok_block,
+            &[ir::BlockArg::Value(value)],
+        );
+        self.fb.switch_to_block(value_ok_block);
+        self.fb.block_params(value_ok_block)[0]
+    }
+
+    fn emit_owned_bool_from_i32_result(&mut self, result: ir::Value) -> ir::Value {
+        emit_owned_bool_from_i32_result(self.fb, result, self.ctx)
+    }
+
+    fn emit_owned_bool_from_cond(&mut self, cond: ir::Value) -> ir::Value {
+        emit_owned_bool_from_cond(self.fb, cond, self.ctx)
+    }
+
+    fn emit_owned_bool_from_pyobject_truthiness(
+        &mut self,
+        value: ir::Value,
+        facts: PyObjFacts,
+        borrowed: bool,
+        invert: bool,
+    ) -> ir::Value {
+        let is_true_ref = self.func_imports.get_or_panic(
+            self.jit_module,
+            &mut self.fb.func,
+            &DP_JIT_IS_TRUE_IMPORT,
+        );
+        emit_owned_bool_from_pyobject_truthiness(
+            self.fb,
+            value,
+            facts,
+            borrowed,
+            invert,
+            is_true_ref,
+            self.ctx,
+        )
+    }
+
+    fn py_facts_for_arg(&self, arg: &InstrCodegen) -> PyObjFacts {
+        self.ctx
+            .value_facts_for_expr(arg)
+            .and_then(ValueFacts::as_pyobj)
+            .unwrap_or_else(PyObjFacts::unknown)
+    }
+}
+
+impl<'a, 'b, 'mc, 'c, 'd> intrinsics::OperationEmitState<'b, InstrCodegen>
+    for LocalEnvCodegenIntrinsicEmitState<'a, 'b, 'mc, 'c, 'd>
+{
+    fn ctx(&self) -> &JitEmitCtx<'mc> {
+        self.ctx
+    }
+
+    fn fb(&mut self) -> &mut FunctionBuilder<'b> {
+        self.fb
+    }
+
+    fn import_func(&mut self, spec: &'static ImportSpec) -> ir::FuncRef {
+        self.func_imports
+            .get_or_panic(self.jit_module, &mut self.fb.func, spec)
+    }
+
+    fn emit_arg_values(&mut self, args: &[&InstrCodegen]) -> Vec<(ir::Value, bool)> {
+        let mut arg_values = Vec::with_capacity(args.len());
+        for arg in args {
+            let borrowed_arg = codegen_expr_is_borrowable_from_local_env(
+                arg,
+                &*self.local_env,
+                &self.ctx.stack_slots,
+                self.ctx.storage_layout.as_ref(),
+            );
+            let value = emit_codegen_expr_with_local_env(
+                self.fb,
+                arg,
+                &mut *self.local_env,
                 self.ctx,
                 borrowed_arg,
                 self.jit_module,
@@ -6977,6 +7091,34 @@ fn emit_codegen_expr_with_local_env(
             local_env,
             emit_ctx,
         );
+    }
+    if matches!(
+        expr,
+        InstrCodegen::BinOp(_)
+            | InstrCodegen::UnaryOp(_)
+            | InstrCodegen::GetAttr(_)
+            | InstrCodegen::SetAttr(_)
+            | InstrCodegen::GetItem(_)
+            | InstrCodegen::SetItem(_)
+            | InstrCodegen::DelItem(_)
+            | InstrCodegen::Store(_)
+            | InstrCodegen::Del(_)
+            | InstrCodegen::MakeCell(_)
+    ) {
+        assert!(
+            !borrowed,
+            "codegen operation expression must not use borrowed result"
+        );
+        let mut intrinsic_state = LocalEnvCodegenIntrinsicEmitState {
+            fb,
+            local_env,
+            ctx: emit_ctx,
+            jit_module,
+            func_imports,
+        };
+        if let Some(value) = intrinsics::emit_operation(expr, &mut intrinsic_state) {
+            return value;
+        }
     }
     let mut local_parts = local_env.to_legacy_parts();
     let value = emit_codegen_expr(
