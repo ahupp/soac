@@ -8231,6 +8231,32 @@ fn emit_codegen_expr_with_local_env(
         );
         return emit_increment_counter(fb, op.counter_id, emit_ctx);
     }
+    if let InstrCodegen::CalleeFunctionId(op) = expr {
+        assert!(
+            !borrowed,
+            "callee_function_id must not request a borrowed result"
+        );
+        let callable_is_borrowed = codegen_expr_is_borrowable_from_local_env(
+            op.value.as_ref(),
+            local_env,
+            &emit_ctx.stack_slots,
+            emit_ctx.storage_layout.as_ref(),
+        );
+        let callable = emit_codegen_expr_with_local_env(
+            fb,
+            op.value.as_ref(),
+            local_env,
+            emit_ctx,
+            callable_is_borrowed,
+            jit_module,
+            func_imports,
+        );
+        let callee_id = emit_callee_function_id_checked(fb, callable, emit_ctx);
+        if !callable_is_borrowed {
+            fb.ins().call(emit_ctx.decref_ref, &[callable]);
+        }
+        return callee_id;
+    }
     if let InstrCodegen::CellRef(op) = expr {
         assert!(
             !borrowed,
@@ -8271,6 +8297,9 @@ fn emit_codegen_expr_with_local_env(
         if let Some(value) = intrinsics::emit_operation(expr, &mut intrinsic_state) {
             return value;
         }
+    }
+    if matches!(expr, InstrCodegen::MakeFunction(_)) {
+        panic!("MakeFunction should lower to a regular call before codegen");
     }
     if let InstrCodegen::Store(op) = expr {
         if let Some(location) = op.name.local_location() {
