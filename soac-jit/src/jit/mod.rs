@@ -7698,10 +7698,10 @@ fn emit_codegen_simple_call_with_local_env(
 
     if !has_unpack && simple_keywords.is_empty() {
         let site_instr_id = call.semantic_instr_id();
-        let has_call_target_counter = emit_ctx
+        let call_target_counter = emit_ctx
             .call_target_counter_ids
             .get(&site_instr_id)
-            .is_some();
+            .copied();
         let has_call_target_specializations = emit_ctx
             .call_target_specializations
             .get(&site_instr_id)
@@ -7710,8 +7710,7 @@ fn emit_codegen_simple_call_with_local_env(
             !direct_constructor_specializations_for_call_site(call, emit_ctx).is_empty();
         let has_method_specializations =
             !direct_method_specializations_for_call_site(call, emit_ctx).is_empty();
-        if !has_call_target_counter
-            && !has_call_target_specializations
+        if !has_call_target_specializations
             && !has_constructor_specializations
             && !has_method_specializations
         {
@@ -7730,6 +7729,10 @@ fn emit_codegen_simple_call_with_local_env(
                 jit_module,
                 func_imports,
             );
+            if let Some(counter_id) = call_target_counter {
+                let callee_id = emit_callee_function_id_checked(fb, callable, emit_ctx);
+                emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
+            }
             return Some(emit_positional_vectorcall_with_local_env(
                 fb,
                 callable,
