@@ -6914,6 +6914,19 @@ fn emit_codegen_expr_with_local_env(
         );
         return emit_increment_counter(fb, op.counter_id, emit_ctx);
     }
+    if let InstrCodegen::CellRef(op) = expr {
+        assert!(
+            !borrowed,
+            "codegen operation expression must not use borrowed result"
+        );
+        return emit_raw_cell_object_for_location_with_local_env(
+            fb,
+            op.location,
+            "cell_ref",
+            local_env,
+            emit_ctx,
+        );
+    }
     let mut local_parts = local_env.to_legacy_parts();
     let value = emit_codegen_expr(
         fb,
