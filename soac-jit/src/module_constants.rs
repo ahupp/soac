@@ -675,6 +675,15 @@ impl ModuleConstantCollector {
                 None => {}
             }
         }
+        if let Some(storage_layout) = function.storage_layout().as_ref() {
+            for name in storage_layout.stack_slots() {
+                self.constants.intern_unicode_bytes(name.as_bytes());
+                if name.starts_with("_dp_try_abrupt_kind_") {
+                    self.constants
+                        .intern_int(abrupt_kind_tag(AbruptKind::Fallthrough));
+                }
+            }
+        }
         for block in &function.blocks {
             for stmt in &block.body {
                 self.collect_stmt(stmt);
@@ -768,6 +777,14 @@ impl ModuleConstantCollector {
             {
                 self.constants
                     .intern_unicode_bytes(op.name.id_str().as_bytes());
+            }
+            InstrCodegen::Load(op) if op.name.local_location().is_some() => {
+                self.constants
+                    .intern_unicode_bytes(op.name.id_str().as_bytes());
+                if op.name.id_str().starts_with("_dp_try_abrupt_kind_") {
+                    self.constants
+                        .intern_int(abrupt_kind_tag(AbruptKind::Fallthrough));
+                }
             }
             InstrCodegen::Load(_) => {}
             InstrCodegen::Store(op) if op.name.location.is_global() => {

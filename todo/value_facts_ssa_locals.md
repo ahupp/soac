@@ -304,14 +304,16 @@ Started:
   cleanup actions before instrumentation or JIT codegen can consume the module.
 - JIT planning now computes the same verified per-function `RefcountPlan` beside
   `FunctionLocalPlan` and makes it available through `JitEmitCtx`.
-- JIT codegen has started consuming normal-edge `RefcountPlan` releases by
-  replacing unforwarded stack-slot locals with the deleted sentinel before the
-  edge jump. This preserves the current terminal stack-slot cleanup model while
-  moving normal-edge destructor timing toward the explicit BlockPy plan.
-- JIT exception dispatch now consumes exception-edge `RefcountPlan` releases the
-  same way, after writing forwarded exception-target slots and before jumping to
-  the handler block.
+- JIT edge-release consumption is blocked on moving locals from function-wide
+  stack slots to SSA environments. The verified `RefcountPlan` records normal
+  and exception edge releases, but JIT stack-slot codegen currently only
+  consumes terminal releases because clearing a function-wide slot on an edge
+  can delete locals still live in a later block.
+- JIT physical stack slots now use `NULL` for unbound or released local state
+  instead of the runtime `DELETED` sentinel. Stack-slot loads raise the deleted
+  name error before exposing `NULL` as a Python value, and stack-slot
+  INCREF/DECREF operations skip `NULL`.
 - JIT return and successful explicit-raise terminals now also consume terminal
-  `RefcountPlan` releases with the same deleted-sentinel replacement. Legacy
-  `stack_slots.decref_all` still runs afterward, so the next step is to shrink
-  terminal cleanup to the explicit plan rather than scanning every stack slot.
+  `RefcountPlan` releases. Returns clear planned stack slots to `NULL` and no
+  longer scan every stack slot; explicit-raise terminals still route through
+  shared failure cleanup that skips already-`NULL` slots.

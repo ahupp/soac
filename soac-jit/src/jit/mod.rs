@@ -805,14 +805,9 @@ fn emit_codegen_local_name_load(
         }
         return slot_value;
     }
-    if let Some(slot_value) = load_stack_slot_value(
-        fb,
-        &ctx.stack_slots,
-        name,
-        ctx.consts.ptr_ty,
-        borrowed,
-        ctx.incref_ref,
-    ) {
+    if let Some(slot_value) =
+        emit_checked_stack_slot_value(fb, &ctx.stack_slots, name, ctx, borrowed)
+    {
         return slot_value;
     }
     panic!("missing local {name} in direct JIT state");
@@ -1861,16 +1856,28 @@ impl StackSlots {
         self.slot_for_name(name).is_some()
     }
 
-    fn initialize_all_to_value(
+    fn initialize_all(
         &self,
         fb: &mut FunctionBuilder<'_>,
-        value: ir::Value,
-        incref_ref: ir::FuncRef,
+        ptr_ty: ir::Type,
+        fallthrough_abrupt_kind_const: Option<ir::Value>,
     ) {
-        for slot in &self.slots {
-            fb.ins().call(incref_ref, &[value]);
+        let null_ptr = fb.ins().iconst(ptr_ty, 0);
+        for (name, slot) in self.names.iter().zip(self.slots.iter()) {
+            let value = if is_try_abrupt_kind_name(name) {
+                fallthrough_abrupt_kind_const
+                    .expect("try abrupt-kind stack slots require a fallthrough constant")
+            } else {
+                null_ptr
+            };
             fb.ins().stack_store(value, *slot, 0);
         }
+    }
+
+    fn has_try_abrupt_kind_name(&self) -> bool {
+        self.names
+            .iter()
+            .any(|name| is_try_abrupt_kind_name(name.as_str()))
     }
 
     fn replace_cloned_value(
@@ -1884,18 +1891,71 @@ impl StackSlots {
     ) -> Option<()> {
         let slot = self.slot_for_name(name)?;
         let previous = fb.ins().stack_load(ptr_ty, slot, 0);
-        fb.ins().call(incref_ref, &[value]);
+        emit_incref_if_not_null(fb, ptr_ty, incref_ref, value);
         fb.ins().stack_store(value, slot, 0);
-        fb.ins().call(decref_ref, &[previous]);
+        emit_decref_if_not_null(fb, ptr_ty, decref_ref, previous);
+        Some(())
+    }
+
+    fn clear_value(
+        &self,
+        fb: &mut FunctionBuilder<'_>,
+        name: &str,
+        ptr_ty: ir::Type,
+        decref_ref: ir::FuncRef,
+    ) -> Option<()> {
+        let slot = self.slot_for_name(name)?;
+        let previous = fb.ins().stack_load(ptr_ty, slot, 0);
+        let null_ptr = fb.ins().iconst(ptr_ty, 0);
+        fb.ins().stack_store(null_ptr, slot, 0);
+        emit_decref_if_not_null(fb, ptr_ty, decref_ref, previous);
         Some(())
     }
 
     fn decref_all(&self, fb: &mut FunctionBuilder<'_>, ptr_ty: ir::Type, decref_ref: ir::FuncRef) {
         for slot in &self.slots {
             let value = fb.ins().stack_load(ptr_ty, *slot, 0);
-            fb.ins().call(decref_ref, &[value]);
+            emit_decref_if_not_null(fb, ptr_ty, decref_ref, value);
         }
     }
+}
+
+fn emit_call_if_not_null(
+    fb: &mut FunctionBuilder<'_>,
+    ptr_ty: ir::Type,
+    func_ref: ir::FuncRef,
+    value: ir::Value,
+) {
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let value_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, value, null_ptr);
+    let call_block = fb.create_block();
+    let done_block = fb.create_block();
+    fb.ins()
+        .brif(value_is_null, done_block, &[], call_block, &[]);
+
+    fb.switch_to_block(call_block);
+    fb.ins().call(func_ref, &[value]);
+    fb.ins().jump(done_block, &[]);
+
+    fb.switch_to_block(done_block);
+}
+
+fn emit_incref_if_not_null(
+    fb: &mut FunctionBuilder<'_>,
+    ptr_ty: ir::Type,
+    incref_ref: ir::FuncRef,
+    value: ir::Value,
+) {
+    emit_call_if_not_null(fb, ptr_ty, incref_ref, value);
+}
+
+fn emit_decref_if_not_null(
+    fb: &mut FunctionBuilder<'_>,
+    ptr_ty: ir::Type,
+    decref_ref: ir::FuncRef,
+    value: ir::Value,
+) {
+    emit_call_if_not_null(fb, ptr_ty, decref_ref, value);
 }
 
 #[derive(Clone)]
@@ -1970,9 +2030,7 @@ fn delete_local_value(
     local_values: &mut Vec<ir::Value>,
     name: &str,
     stack_slots: &StackSlots,
-    deleted_const: ir::Value,
     ptr_ty: ir::Type,
-    incref_ref: ir::FuncRef,
     decref_ref: ir::FuncRef,
 ) -> Result<(), String> {
     if let Some(index) = local_names.iter().position(|candidate| candidate == name) {
@@ -1984,7 +2042,7 @@ fn delete_local_value(
     }
     if stack_slots.has_name(name) {
         stack_slots
-            .replace_cloned_value(fb, name, deleted_const, ptr_ty, incref_ref, decref_ref)
+            .clear_value(fb, name, ptr_ty, decref_ref)
             .expect("slot-backed delete target missing from stack slots");
     }
     Ok(())
@@ -2078,13 +2136,90 @@ fn load_stack_slot_value(
     let slot = stack_slots.slot_for_block_arg_name(name)?;
     let value = fb.ins().stack_load(ptr_ty, slot, 0);
     if !borrowed {
-        fb.ins().call(incref_ref, &[value]);
+        emit_incref_if_not_null(fb, ptr_ty, incref_ref, value);
+    }
+    Some(value)
+}
+
+fn emit_checked_stack_slot_value(
+    fb: &mut FunctionBuilder<'_>,
+    stack_slots: &StackSlots,
+    name: &str,
+    ctx: &JitEmitCtx<'_>,
+    borrowed: bool,
+) -> Option<ir::Value> {
+    let slot = stack_slots.slot_for_block_arg_name(name)?;
+    let value = fb.ins().stack_load(ctx.consts.ptr_ty, slot, 0);
+    if is_try_abrupt_kind_name(name) {
+        let null_ptr = fb.ins().iconst(ctx.consts.ptr_ty, 0);
+        let value_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, value, null_ptr);
+        let fallthrough_block = fb.create_block();
+        let value_ok_block = fb.create_block();
+        let done_block = fb.create_block();
+        fb.append_block_param(done_block, ctx.consts.ptr_ty);
+        fb.ins()
+            .brif(value_is_null, fallthrough_block, &[], value_ok_block, &[]);
+
+        fb.switch_to_block(fallthrough_block);
+        let fallthrough_value = emit_owned_module_constant(
+            fb,
+            ctx.module_constants
+                .require_int_constant_id(abrupt_kind_tag(AbruptKind::Fallthrough)),
+            ctx,
+        );
+        fb.ins()
+            .jump(done_block, &[ir::BlockArg::Value(fallthrough_value)]);
+
+        fb.switch_to_block(value_ok_block);
+        fb.ins().jump(done_block, &[ir::BlockArg::Value(value)]);
+
+        fb.switch_to_block(done_block);
+        let value = fb.block_params(done_block)[0];
+        if !borrowed {
+            emit_incref_if_not_null(fb, ctx.consts.ptr_ty, ctx.incref_ref, value);
+        }
+        return Some(value);
+    }
+    let null_ptr = fb.ins().iconst(ctx.consts.ptr_ty, 0);
+    let value_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, value, null_ptr);
+    let deleted_block = fb.create_block();
+    let value_ok_block = fb.create_block();
+    fb.append_block_param(value_ok_block, ctx.consts.ptr_ty);
+    fb.ins().brif(
+        value_is_null,
+        deleted_block,
+        &[],
+        value_ok_block,
+        &[ir::BlockArg::Value(value)],
+    );
+
+    fb.switch_to_block(deleted_block);
+    let name_obj = emit_owned_module_constant(
+        fb,
+        ctx.module_constants.require_unicode_constant_id(name),
+        ctx,
+    );
+    fb.ins().call(ctx.raise_deleted_name_error_ref, &[name_obj]);
+    let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
+    fb.ins().call(ctx.decref_ref, &[name_obj]);
+    emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
+    fb.ins()
+        .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
+
+    fb.switch_to_block(value_ok_block);
+    let value = fb.block_params(value_ok_block)[0];
+    if !borrowed {
+        fb.ins().call(ctx.incref_ref, &[value]);
     }
     Some(value)
 }
 
 fn is_try_exception_alias_name(name: &str) -> bool {
     name.starts_with("_dp_try_exc_")
+}
+
+fn is_try_abrupt_kind_name(name: &str) -> bool {
+    name.starts_with("_dp_try_abrupt_kind_")
 }
 
 fn local_name_index_for_block_arg(name: &str, local_names: &[String]) -> Option<usize> {
@@ -4131,9 +4266,7 @@ fn emit_codegen_expr(
                             intrinsic_state.local_values,
                             name,
                             &intrinsic_state.ctx.stack_slots,
-                            intrinsic_state.ctx.consts.deleted_const,
                             intrinsic_state.ctx.consts.ptr_ty,
-                            intrinsic_state.ctx.incref_ref,
                             intrinsic_state.ctx.decref_ref,
                         )
                         .unwrap_or_else(|error| panic!("{error}"));
@@ -4819,11 +4952,17 @@ fn emit_codegen_expr(
                                 jit_module,
                                 func_imports,
                             );
-                            let value_is_deleted = fb.ins().icmp(
+                            let value_is_deleted_sentinel = fb.ins().icmp(
                                 ir::condcodes::IntCC::Equal,
                                 value_obj,
                                 deleted_const,
                             );
+                            let null_ptr = fb.ins().iconst(ptr_ty, 0);
+                            let value_is_null =
+                                fb.ins()
+                                    .icmp(ir::condcodes::IntCC::Equal, value_obj, null_ptr);
+                            let value_is_deleted =
+                                fb.ins().bor(value_is_deleted_sentinel, value_is_null);
                             let deleted_block = fb.create_block();
                             let value_ok_block = fb.create_block();
                             fb.append_block_param(value_ok_block, ptr_ty);
@@ -4840,7 +4979,7 @@ fn emit_codegen_expr(
                             let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
                             fb.ins().call(decref_ref, &[name_obj]);
                             if !value_borrowed {
-                                fb.ins().call(decref_ref, &[value_obj]);
+                                emit_decref_if_not_null(fb, ptr_ty, decref_ref, value_obj);
                             }
                             emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
                             fb.ins().jump(step_null_block, &step_null_block_args(ctx));
@@ -5874,9 +6013,7 @@ fn emit_planned_stack_slot_releases_for_reason(
         reason,
         emit_ctx.refcount_plan,
         &emit_ctx.stack_slots,
-        emit_ctx.consts.deleted_const,
         emit_ctx.consts.ptr_ty,
-        emit_ctx.incref_ref,
         emit_ctx.decref_ref,
     )
 }
@@ -5888,11 +6025,15 @@ fn emit_planned_stack_slot_releases_for_reason_from_parts(
     reason: &RefcountReleaseReason,
     refcount_plan: &FunctionRefcountPlan,
     stack_slots: &StackSlots,
-    deleted_const: ir::Value,
     ptr_ty: ir::Type,
-    incref_ref: ir::FuncRef,
     decref_ref: ir::FuncRef,
 ) -> Result<(), String> {
+    if !matches!(
+        reason,
+        RefcountReleaseReason::Return | RefcountReleaseReason::Raise
+    ) {
+        return Ok(());
+    }
     let Some(block_plan) = refcount_plan.block(source_label) else {
         return Ok(());
     };
@@ -5909,14 +6050,7 @@ fn emit_planned_stack_slot_releases_for_reason_from_parts(
             continue;
         }
         stack_slots
-            .replace_cloned_value(
-                fb,
-                local.name.as_str(),
-                deleted_const,
-                ptr_ty,
-                incref_ref,
-                decref_ref,
-            )
+            .clear_value(fb, local.name.as_str(), ptr_ty, decref_ref)
             .ok_or_else(|| {
                 format!(
                     "refcount plan release for block {source_label} references missing stack slot {:?}",
@@ -6392,7 +6526,6 @@ fn emit_codegen_term(
                 emit_ctx,
             )?;
             emit_pop_handled_exception_if_leaving(fb, current_exception_name, &[], emit_ctx);
-            emit_ctx.stack_slots.decref_all(fb, ptr_ty, decref_ref);
             fb.ins().return_(&[ret_value]);
         }
         BlockTerm::Raise(raise_stmt) => {
@@ -8057,13 +8190,15 @@ fn build_cranelift_run_bb_specialized_function(
             &mut fb.func,
             &DP_JIT_RESTORE_ERROR_AFTER_NULL_CLEANUP_IMPORT,
         );
-        let entry_deleted_const = emit_owned_module_constant_from_parts(
-            &mut fb,
-            deleted_constant_id,
-            module_constant_ptrs,
-            ptr_ty,
-        );
-        stack_slots.initialize_all_to_value(&mut fb, entry_deleted_const, incref_ref);
+        let fallthrough_abrupt_kind_const = stack_slots.has_try_abrupt_kind_name().then(|| {
+            emit_owned_module_constant_from_parts(
+                &mut fb,
+                module_constants.require_int_constant_id(abrupt_kind_tag(AbruptKind::Fallthrough)),
+                module_constant_ptrs,
+                ptr_ty,
+            )
+        });
+        stack_slots.initialize_all(&mut fb, ptr_ty, fallthrough_abrupt_kind_const);
         exception_state_slots.initialize_all_to_null(&mut fb, ptr_ty);
 
         let null_ptr = fb.ins().iconst(ptr_ty, 0);
@@ -8431,12 +8566,6 @@ fn build_cranelift_run_bb_specialized_function(
                 module_constant_ptrs,
                 ptr_ty,
             );
-            let deleted_const = emit_owned_module_constant_from_parts(
-                &mut fb,
-                deleted_constant_id,
-                module_constant_ptrs,
-                ptr_ty,
-            );
             let dispatch_step_null_args = Vec::new();
 
             let raised_exc =
@@ -8487,9 +8616,7 @@ fn build_cranelift_run_bb_specialized_function(
                 &release_reason,
                 &refcount_plan,
                 &stack_slots,
-                deleted_const,
                 ptr_ty,
-                incref_ref,
                 decref_ref,
             )?;
             let target_runtime_params = &runtime_block_param_names[dispatch_plan.target_index];
