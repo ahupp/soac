@@ -11,7 +11,7 @@ use soac_blockpy::{LoweringOptions, lower_python_to_blockpy_recorded_with_option
 use soac_jit::module_type::{ModuleInfo, SharedModuleState, SoacExtModule, hash_module_source};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tracing::info;
 
@@ -520,48 +520,38 @@ fn resolve_module_package(module_globals: &Bound<'_, PyAny>, operation: &str) ->
     })
 }
 
-fn module_globals_from_runtime<'py>(
+fn module_globals_from_shared_state<'py>(
     py: Python<'py>,
-    module_runtime: &soac_jit::ModuleRuntimeContext,
+    shared_state: &SharedModuleState,
     operation: &str,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let globals_ptr = module_runtime.mod_ctx.globals_obj as *mut ffi::PyObject;
-    if globals_ptr.is_null() {
-        return Err(PyRuntimeError::new_err(format!(
-            "JIT basic-block {operation} requires module runtime globals"
-        )));
-    }
-    Ok(unsafe { Bound::from_borrowed_ptr(py, globals_ptr) })
+    let sys = PyModule::import(py, "sys")?;
+    let modules = sys.getattr("modules")?.cast_into::<PyDict>()?;
+    let module = modules
+        .get_item(shared_state.module_name.as_str())?
+        .ok_or_else(|| {
+            PyRuntimeError::new_err(format!(
+                "JIT basic-block {operation} failed to find loaded module {}",
+                shared_state.module_name
+            ))
+        })?;
+    module.getattr("__dict__")
 }
 
-fn module_name_from_runtime(
-    module_runtime: &soac_jit::ModuleRuntimeContext,
-    operation: &str,
-) -> PyResult<String> {
-    let module_name = module_runtime
-        .shared_module_state_owner
-        .module_name
-        .as_str();
-    if module_name.is_empty() {
-        return Err(PyRuntimeError::new_err(format!(
-            "JIT basic-block {operation} requires shared module state"
-        )));
+fn module_runtime_from_shared_state(
+    compile_session: Arc<soac_jit::CompileSession>,
+    shared_state: Arc<SharedModuleState>,
+    module_globals: &Bound<'_, PyAny>,
+) -> soac_jit::ModuleRuntimeContext {
+    unsafe { ffi::Py_INCREF(module_globals.as_ptr()) };
+    soac_jit::ModuleRuntimeContext {
+        mod_ctx: soac_jit::ModuleJitContext {
+            shared_module_state: Arc::as_ptr(&shared_state),
+            globals_obj: module_globals.as_ptr().cast(),
+        },
+        compile_session,
+        shared_module_state_owner: shared_state,
     }
-    Ok(module_name.to_string())
-}
-
-fn lookup_bb_function(
-    shared_state: &soac_jit::module_type::SharedModuleState,
-    function_id: FunctionId,
-    operation: &str,
-) -> PyResult<BlockPyFunction<CodegenModuleShape>> {
-    shared_state.lookup_function(function_id).cloned().ok_or_else(|| {
-        PyRuntimeError::new_err(format!(
-            "JIT basic-block {operation} failed to resolve static function metadata for {}.fn#{}",
-            shared_state.module_name,
-            function_id
-        ))
-    })
 }
 
 fn lookup_module_init_function(
@@ -907,38 +897,32 @@ fn make_bb_function(
     annotate_fn: Py<PyAny>,
 ) -> PyResult<Py<PyAny>> {
     let dp = import_dp_module(py)?;
-    unsafe {
-        soac_jit::with_current_module_runtime_context(|module_runtime| {
-            let module_globals =
-                module_globals_from_runtime(py, module_runtime, "function instantiation")?;
-            let module_name = module_name_from_runtime(module_runtime, "function instantiation")?;
-            let function = lookup_bb_function(
-                &module_runtime.shared_module_state_owner,
-                FunctionId::from_packed(function_id),
-                "function instantiation",
-            )?;
-            instantiate_bb_function(
-                py,
-                &dp,
-                &module_name,
-                &function,
-                captures.bind(py).as_any(),
-                param_defaults.bind(py).as_any(),
-                &module_globals,
-                annotate_fn.bind(py),
-                module_runtime,
-            )
-        })
-        .map_err(|_| {
-            if ffi::PyErr_Occurred().is_null() {
-                PyRuntimeError::new_err(
-                    "function instantiation requires an active module runtime context",
-                )
-            } else {
-                PyErr::fetch(py)
-            }
-        })?
-    }
+    let function_id = FunctionId::from_packed(function_id);
+    let compile_session = soac_jit::CompileSession::process();
+    let (shared_state, function) = compile_session
+        .lookup_shared_function(function_id)
+        .map_err(PyRuntimeError::new_err)?
+        .ok_or_else(|| {
+            PyRuntimeError::new_err(format!(
+                "JIT basic-block function instantiation failed to resolve static function metadata for fn#{function_id}"
+            ))
+        })?;
+    let module_globals =
+        module_globals_from_shared_state(py, &shared_state, "function instantiation")?;
+    let module_name = shared_state.module_name.clone();
+    let module_runtime =
+        module_runtime_from_shared_state(compile_session, shared_state, &module_globals);
+    instantiate_bb_function(
+        py,
+        &dp,
+        &module_name,
+        &function,
+        captures.bind(py).as_any(),
+        param_defaults.bind(py).as_any(),
+        &module_globals,
+        annotate_fn.bind(py),
+        &module_runtime,
+    )
 }
 
 #[pyfunction]
@@ -1095,7 +1079,7 @@ fn exec_module_inner(
         };
         let empty = PyTuple::empty(py);
         let none = py.None();
-        let mut module_runtime = time_phase(exec_timings, "build_module_runtime_context", || {
+        let module_runtime = time_phase(exec_timings, "build_module_runtime_context", || {
             unsafe { soac_jit::build_module_runtime_context_for_module(module.as_ptr()) }.map_err(
                 |_| {
                     if unsafe { ffi::PyErr_Occurred() }.is_null() {
@@ -1121,12 +1105,7 @@ fn exec_module_inner(
                 &module_runtime,
             )
         })?;
-        let result = time_phase(exec_timings, "call_module_init", || unsafe {
-            soac_jit::with_active_module_runtime_context(
-                std::ptr::addr_of_mut!(module_runtime),
-                || module_init.call0(py),
-            )
-        });
+        let result = time_phase(exec_timings, "call_module_init", || module_init.call0(py));
         result?;
         if let Some(bootstrap) = &soac_runtime_bootstrap {
             let globals = module_globals.cast::<PyDict>()?;

@@ -30,7 +30,6 @@ use soac_blockpy::block_py::{FunctionId, ParamKind};
 use soac_blockpy::passes::CodegenModuleShape;
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::any::Any;
-use std::cell::RefCell;
 use std::ffi::{CString, c_char, c_void};
 use std::mem;
 use std::panic::{self, AssertUnwindSafe};
@@ -231,12 +230,6 @@ fn set_runtime_error<T>(msg: &str) -> Result<T, ()> {
         ffi::PyErr_SetString(ffi::PyExc_RuntimeError, CString::new(msg).unwrap().as_ptr());
     }
     Err(())
-}
-
-thread_local! {
-    static ACTIVE_MODULE_RUNTIME_STACK: RefCell<Vec<*mut jit::ModuleRuntimeContext>> = const {
-        RefCell::new(Vec::new())
-    };
 }
 
 #[repr(C)]
@@ -562,50 +555,6 @@ unsafe fn collect_function_runtime_objects(
     }
 
     Ok(values)
-}
-
-struct ActiveModuleVmCtxGuard;
-
-impl Drop for ActiveModuleVmCtxGuard {
-    fn drop(&mut self) {
-        ACTIVE_MODULE_RUNTIME_STACK.with(|stack| {
-            stack
-                .borrow_mut()
-                .pop()
-                .expect("active module runtime stack should not underflow");
-        });
-    }
-}
-
-fn push_active_module_runtime_context(
-    runtime: *mut jit::ModuleRuntimeContext,
-) -> ActiveModuleVmCtxGuard {
-    ACTIVE_MODULE_RUNTIME_STACK.with(|stack| stack.borrow_mut().push(runtime));
-    ActiveModuleVmCtxGuard
-}
-
-pub unsafe fn with_active_module_runtime_context<R>(
-    runtime: *mut jit::ModuleRuntimeContext,
-    f: impl FnOnce() -> R,
-) -> R {
-    let _guard = push_active_module_runtime_context(runtime);
-    f()
-}
-
-pub unsafe fn with_current_module_runtime_context<R>(
-    f: impl FnOnce(&jit::ModuleRuntimeContext) -> R,
-) -> Result<R, ()> {
-    let runtime = match ACTIVE_MODULE_RUNTIME_STACK.with(|stack| {
-        let stack = stack.borrow();
-        let Some(runtime) = stack.last().copied() else {
-            return Err(());
-        };
-        Ok(runtime)
-    }) {
-        Ok(runtime) => runtime,
-        Err(()) => return set_runtime_error("missing active module runtime context"),
-    };
-    Ok(f(unsafe { &*runtime }))
 }
 
 pub unsafe fn clone_module_runtime_context(

@@ -237,3 +237,118 @@ VALUE = transformed_helper.VALUE + 1
         sys.path.remove(str(tmp_path))
         sys.modules.pop("reload_probe", None)
         sys.modules.pop("transformed_helper", None)
+
+
+def test_cross_module_nested_function_creation_uses_callee_module_metadata(tmp_path):
+    helper_path = tmp_path / "nested_function_helper.py"
+    helper_path.write_text(
+        """
+def outer():
+    def inner():
+        return 7
+    return inner()
+""",
+        encoding="utf-8",
+    )
+    main_path = tmp_path / "nested_function_main.py"
+    main_path.write_text(
+        """
+import nested_function_helper
+
+VALUE = nested_function_helper.outer()
+""",
+        encoding="utf-8",
+    )
+    script = f"""
+import sys
+from soac import import_hook
+
+sys.path.insert(0, {str(tmp_path)!r})
+import_hook.install()
+import nested_function_main
+
+assert nested_function_main.VALUE == 7
+"""
+    env = os.environ.copy()
+    env["SOAC_MODULE_ENABLED"] = f"path:{tmp_path}"
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        env=env,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_transformed_except_body_sets_cpython_handled_exception(tmp_path):
+    source = """
+import sys
+import traceback
+
+def capture(flag):
+    try:
+        raise ValueError("boom")
+    except:
+        if flag:
+            text = traceback.format_exc()
+            active_type = type(sys.exception()).__name__
+        else:
+            text = "missing"
+            active_type = type(sys.exception()).__name__
+    return "ValueError: boom" in text, active_type, sys.exception()
+"""
+
+    with transformed_module(tmp_path, "except_handled_exception_state", source) as module:
+        assert module.capture(True) == (True, "ValueError", None)
+
+
+def test_transformed_typed_except_catches_return_expression_error(tmp_path):
+    source = """
+def f():
+    try:
+        return {}["x"]
+    except KeyError:
+        return "ok"
+"""
+
+    with transformed_module(tmp_path, "typed_except_return_expr", source) as module:
+        assert module.f() == "ok"
+
+
+def test_transformed_outer_try_catches_exception_from_with_body(tmp_path):
+    source = """
+class Manager:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+def f():
+    try:
+        with Manager():
+            open(None)
+    except TypeError as exc:
+        return str(exc).split(":")[0]
+    return "miss"
+"""
+
+    with transformed_module(tmp_path, "outer_try_with_body_exception", source) as module:
+        assert module.f() == "expected str, bytes or os.PathLike object, not NoneType"
+
+
+def test_transformed_nested_closure_sees_rebound_argument(tmp_path):
+    source = """
+def f(value=None):
+    value = "updated"
+
+    def inner():
+        return value
+
+    return value, inner()
+"""
+
+    with transformed_module(tmp_path, "nested_closure_rebound_argument", source) as module:
+        assert module.f() == ("updated", "updated")

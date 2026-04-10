@@ -110,7 +110,8 @@ current `@`. Do not treat another workspace's live `@` as a dependency.
    Check `snapshot/snapshot_summary.txt` for surprising BlockPy or CLIF count shifts.
 
 5. Add focused regression coverage for real bugs.
-   If fixing a CPython regression, add a minimal reproducing integration test first.
+   For each CPython regression you fix, add a minimal reproducing integration
+   test under `tests/` first.
    If diagnosing a hang, add follow-up instrumentation where practical and leave behind a focused regression or assertion for that hang shape.
    Avoid render-only tests for BlockPy/CLIF/inspector text. Prefer behavior,
    structure, or API tests; exact renderer output changes too often to be a

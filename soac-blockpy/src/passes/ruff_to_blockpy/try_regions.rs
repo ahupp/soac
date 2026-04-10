@@ -233,13 +233,28 @@ where
     };
     let else_region_end = blocks.len();
 
+    let except_cleanup_target = except_body.as_ref().map(|_| {
+        let label = name_gen.next_block_name();
+        blocks.push(Block::from_builder(
+            label.clone(),
+            BlockBuilder::with_term(
+                Vec::new(),
+                Some(BlockTerm::Jump(BlockEdge::new(cleanup_target.clone()))),
+            ),
+            Vec::new(),
+            None,
+            None,
+        ));
+        label
+    });
+
     let except_region_range;
     let except_label = if let Some(except_body) = except_body {
         let except_region_start = blocks.len();
         let except_label = lower_sequence(
             &except_body,
             RegionTargets {
-                normal_cont: cleanup_target,
+                normal_cont: except_cleanup_target.unwrap_or_else(|| cleanup_target.clone()),
                 loop_labels: loop_labels.clone(),
                 active_exc: cleanup_exc_target,
             },

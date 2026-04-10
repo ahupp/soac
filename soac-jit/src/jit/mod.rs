@@ -339,6 +339,13 @@ static DP_JIT_RAISE_FROM_EXC_IMPORT: ImportSpec = ImportSpec::new(
     &[SigType::Pointer],
     &[SigType::I32],
 );
+static DP_JIT_PUSH_HANDLED_EXCEPTION_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_push_handled_exception",
+    &[SigType::Pointer],
+    &[SigType::Pointer],
+);
+static DP_JIT_POP_HANDLED_EXCEPTION_IMPORT: ImportSpec =
+    ImportSpec::new("dp_jit_pop_handled_exception", &[SigType::Pointer], &[]);
 static DP_JIT_VECTORCALL_BIND_DIRECT_ARGS_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_vectorcall_bind_direct_args",
     &[
@@ -1346,6 +1353,8 @@ struct JitEmitCtx<'mc> {
     tuple_new_ref: ir::FuncRef,
     tuple_set_item_ref: ir::FuncRef,
     stack_slots: StackSlots,
+    exception_state_slots: ExceptionStateSlots,
+    pop_handled_exception_ref: ir::FuncRef,
     direct_edge_stats: &'mc DirectEdgeStats,
     direct_call_target_functions: &'mc HashMap<FunctionId, BlockPyFunction<CodegenModuleShape>>,
     direct_call_functions: &'mc HashMap<FunctionId, DeclaredJitFunction>,
@@ -1825,6 +1834,45 @@ impl StackSlots {
             let value = fb.ins().stack_load(ptr_ty, *slot, 0);
             fb.ins().call(decref_ref, &[value]);
         }
+    }
+}
+
+#[derive(Clone)]
+struct ExceptionStateSlots {
+    previous_handled_by_name: HashMap<String, ir::StackSlot>,
+}
+
+impl ExceptionStateSlots {
+    fn new(fb: &mut FunctionBuilder<'_>, function: &BlockPyFunction<CodegenModuleShape>) -> Self {
+        let mut previous_handled_by_name = HashMap::new();
+        for block in &function.blocks {
+            let Some(name) = block.exception_param() else {
+                continue;
+            };
+            previous_handled_by_name
+                .entry(name.to_string())
+                .or_insert_with(|| {
+                    fb.create_sized_stack_slot(ir::StackSlotData::new(
+                        ir::StackSlotKind::ExplicitSlot,
+                        std::mem::size_of::<u64>() as u32,
+                        0,
+                    ))
+                });
+        }
+        Self {
+            previous_handled_by_name,
+        }
+    }
+
+    fn initialize_all_to_null(&self, fb: &mut FunctionBuilder<'_>, ptr_ty: ir::Type) {
+        let null_ptr = fb.ins().iconst(ptr_ty, 0);
+        for slot in self.previous_handled_by_name.values() {
+            fb.ins().stack_store(null_ptr, *slot, 0);
+        }
+    }
+
+    fn slot_for_exception(&self, name: &str) -> Option<ir::StackSlot> {
+        self.previous_handled_by_name.get(name).copied()
     }
 }
 
@@ -5457,6 +5505,35 @@ fn emit_exception_dispatch_slot_writes(
     Ok(())
 }
 
+fn emit_pop_handled_exception(
+    fb: &mut FunctionBuilder<'_>,
+    exception_name: &str,
+    ctx: &JitEmitCtx<'_>,
+) {
+    let Some(previous_slot) = ctx.exception_state_slots.slot_for_exception(exception_name) else {
+        return;
+    };
+    let previous = fb.ins().stack_load(ctx.consts.ptr_ty, previous_slot, 0);
+    fb.ins().call(ctx.pop_handled_exception_ref, &[previous]);
+    let null_ptr = fb.ins().iconst(ctx.consts.ptr_ty, 0);
+    fb.ins().stack_store(null_ptr, previous_slot, 0);
+}
+
+fn emit_pop_handled_exception_if_leaving(
+    fb: &mut FunctionBuilder<'_>,
+    current_exception_name: Option<&str>,
+    target_params: &[String],
+    ctx: &JitEmitCtx<'_>,
+) {
+    let Some(exception_name) = current_exception_name else {
+        return;
+    };
+    if target_params.iter().any(|name| name == exception_name) {
+        return;
+    }
+    emit_pop_handled_exception(fb, exception_name, ctx);
+}
+
 fn emit_decref_unforwarded_locals(
     fb: &mut FunctionBuilder<'_>,
     local_values: &[ir::Value],
@@ -5557,6 +5634,7 @@ fn emit_codegen_if_target_arm(
     arm_name: &str,
     branch_block: ir::Block,
     target_label: BlockLabel,
+    current_exception_name: Option<&str>,
     exec_blocks: &[ir::Block],
     runtime_block_param_names: &[Vec<String>],
     local_names: &mut Vec<String>,
@@ -5596,6 +5674,7 @@ fn emit_codegen_if_target_arm(
         target_params,
         emit_ctx.decref_ref,
     );
+    emit_pop_handled_exception_if_leaving(fb, current_exception_name, target_params, emit_ctx);
     fb.ins().jump(exec_blocks[target_index], &jump_args);
     Ok(())
 }
@@ -5616,6 +5695,7 @@ fn emit_codegen_term(
     is_true_ref: ir::FuncRef,
     pyobject_to_i64_ref: ir::FuncRef,
     raise_exc_ref: ir::FuncRef,
+    current_exception_name: Option<&str>,
 ) -> Result<(), String> {
     let decref_ref = emit_ctx.decref_ref;
     let i64_ty = emit_ctx.consts.i64_ty;
@@ -5666,6 +5746,12 @@ fn emit_codegen_term(
                 local_ref_kinds,
                 target_params,
                 decref_ref,
+            );
+            emit_pop_handled_exception_if_leaving(
+                fb,
+                current_exception_name,
+                target_params,
+                emit_ctx,
             );
             fb.ins().jump(exec_blocks[target_index], &jump_args);
         }
@@ -5719,6 +5805,7 @@ fn emit_codegen_term(
                 hot_name,
                 hot_branch,
                 hot_label,
+                current_exception_name,
                 exec_blocks,
                 runtime_block_param_names,
                 local_names,
@@ -5734,6 +5821,7 @@ fn emit_codegen_term(
                 cold_name,
                 cold_branch,
                 cold_label,
+                current_exception_name,
                 exec_blocks,
                 runtime_block_param_names,
                 local_names,
@@ -5813,6 +5901,12 @@ fn emit_codegen_term(
                     target_params,
                     decref_ref,
                 );
+                emit_pop_handled_exception_if_leaving(
+                    fb,
+                    current_exception_name,
+                    target_params,
+                    emit_ctx,
+                );
                 fb.ins().jump(exec_blocks[target_index], &case_jump_args);
             }
 
@@ -5846,6 +5940,12 @@ fn emit_codegen_term(
                 default_params,
                 decref_ref,
             );
+            emit_pop_handled_exception_if_leaving(
+                fb,
+                current_exception_name,
+                default_params,
+                emit_ctx,
+            );
             fb.ins()
                 .jump(exec_blocks[default_index], &default_jump_args);
         }
@@ -5868,6 +5968,7 @@ fn emit_codegen_term(
                 &[],
                 decref_ref,
             );
+            emit_pop_handled_exception_if_leaving(fb, current_exception_name, &[], emit_ctx);
             emit_ctx.stack_slots.decref_all(fb, ptr_ty, decref_ref);
             fb.ins().return_(&[ret_value]);
         }
@@ -5951,6 +6052,7 @@ fn emit_codegen_term(
                 .brif(raise_ok, raise_rc_ok, &[], raise_rc_fail, &[]);
 
             fb.switch_to_block(raise_rc_fail);
+            emit_pop_handled_exception_if_leaving(fb, current_exception_name, &[], emit_ctx);
             fb.ins().jump(
                 emit_ctx.consts.step_null_block,
                 &step_null_block_args(emit_ctx),
@@ -5965,6 +6067,7 @@ fn emit_codegen_term(
                 &[],
                 decref_ref,
             );
+            emit_pop_handled_exception_if_leaving(fb, current_exception_name, &[], emit_ctx);
             fb.ins().jump(
                 emit_ctx.consts.step_null_block,
                 &step_null_block_args(emit_ctx),
@@ -7272,6 +7375,7 @@ fn build_cranelift_run_bb_specialized_function(
                 .map(|layout| layout.stack_slots())
                 .unwrap_or(&[]),
         );
+        let exception_state_slots = ExceptionStateSlots::new(&mut fb, function);
 
         register_block_display_annotation(
             &mut block_annotations,
@@ -7422,6 +7526,16 @@ fn build_cranelift_run_bb_specialized_function(
             func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_IS_TRUE_IMPORT);
         let raise_exc_ref =
             func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_RAISE_FROM_EXC_IMPORT);
+        let push_handled_exception_ref = func_imports.get_or_panic(
+            jit_module,
+            &mut fb.func,
+            &DP_JIT_PUSH_HANDLED_EXCEPTION_IMPORT,
+        );
+        let pop_handled_exception_ref = func_imports.get_or_panic(
+            jit_module,
+            &mut fb.func,
+            &DP_JIT_POP_HANDLED_EXCEPTION_IMPORT,
+        );
         let pyobject_getattr_ref =
             func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_PYOBJECT_GETATTR_IMPORT);
         let pyobject_setattr_ref =
@@ -7465,6 +7579,7 @@ fn build_cranelift_run_bb_specialized_function(
             ptr_ty,
         );
         stack_slots.initialize_all_to_value(&mut fb, entry_deleted_const, incref_ref);
+        exception_state_slots.initialize_all_to_null(&mut fb, ptr_ty);
 
         let null_ptr = fb.ins().iconst(ptr_ty, 0);
         let entry_failure_block = cleanup_null_blocks[0];
@@ -7754,6 +7869,8 @@ fn build_cranelift_run_bb_specialized_function(
                 tuple_new_ref,
                 tuple_set_item_ref,
                 stack_slots: stack_slots.clone(),
+                exception_state_slots: exception_state_slots.clone(),
+                pop_handled_exception_ref,
                 direct_edge_stats: &direct_edge_stats,
                 direct_call_target_functions: &direct_call_target_functions,
                 direct_call_functions,
@@ -7810,6 +7927,7 @@ fn build_cranelift_run_bb_specialized_function(
                 is_true_ref,
                 pyobject_to_i64_ref,
                 raise_exc_ref,
+                block.exception_param(),
             )?;
             local_env.refresh_transient_ref_kinds();
             continue;
@@ -7850,6 +7968,17 @@ fn build_cranelift_run_bb_specialized_function(
 
             fb.switch_to_block(raised_exc_ok);
             let dispatch_exc = fb.block_params(raised_exc_ok)[0];
+            if let Some(exception_name) =
+                function.blocks[dispatch_plan.target_index].exception_param()
+            {
+                if let Some(previous_slot) =
+                    exception_state_slots.slot_for_exception(exception_name)
+                {
+                    let previous_inst = fb.ins().call(push_handled_exception_ref, &[dispatch_exc]);
+                    let previous = fb.inst_results(previous_inst)[0];
+                    fb.ins().stack_store(previous, previous_slot, 0);
+                }
+            }
             emit_exception_dispatch_slot_writes(
                 &mut fb,
                 &dispatch_plan.slot_writes,
@@ -7871,11 +8000,21 @@ fn build_cranelift_run_bb_specialized_function(
                 .jump(exec_blocks[dispatch_plan.target_index], &target_jump_args);
         }
 
-        for block in &cleanup_null_blocks {
+        for (index, block) in cleanup_null_blocks.iter().enumerate() {
             fb.switch_to_block(*block);
             let cleanup_args = fb.block_params(*block).to_vec();
             for value in cleanup_args {
                 fb.ins().call(decref_ref, &[value]);
+            }
+            if let Some(exception_name) = function.blocks[index].exception_param() {
+                if let Some(previous_slot) =
+                    exception_state_slots.slot_for_exception(exception_name)
+                {
+                    let previous = fb.ins().stack_load(ptr_ty, previous_slot, 0);
+                    fb.ins().call(pop_handled_exception_ref, &[previous]);
+                    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+                    fb.ins().stack_store(null_ptr, previous_slot, 0);
+                }
             }
             stack_slots.decref_all(&mut fb, ptr_ty, decref_ref);
             let null_ptr = fb.ins().iconst(ptr_ty, 0);

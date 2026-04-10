@@ -2037,33 +2037,16 @@ impl NameLocator<'_> {
         {
             match binding_kind {
                 CellBindingKind::Owner => {
-                    if name_text != storage_name {
-                        if let Some(slot) = self.local_slots.get(name_text.as_str()).copied() {
-                            NameLocation::local(slot)
-                        } else {
-                            let slot = self
-                                .owned_cell_slots
-                                .get(storage_name.as_str())
-                                .copied()
-                                .unwrap_or_else(|| {
-                                    panic!(
-                                        "missing owned cell slot for storage name {storage_name} while locating {name_text}"
-                                    )
-                                });
-                            NameLocation::owned_cell(slot)
-                        }
-                    } else {
-                        let slot = self
-                            .owned_cell_slots
-                            .get(storage_name.as_str())
-                            .copied()
-                            .unwrap_or_else(|| {
-                                panic!(
-                                    "missing owned cell slot for storage name {storage_name} while locating {name_text}"
-                                )
-                            });
-                        NameLocation::owned_cell(slot)
-                    }
+                    let slot = self
+                        .owned_cell_slots
+                        .get(storage_name.as_str())
+                        .copied()
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "missing owned cell slot for storage name {storage_name} while locating {name_text}"
+                            )
+                        });
+                    NameLocation::owned_cell(slot)
                 }
                 CellBindingKind::Capture => {
                     let slot = self
@@ -2086,6 +2069,26 @@ impl NameLocator<'_> {
         ResolvedName { id: name, location }
     }
 
+    fn locate_make_cell_initializer_name(
+        &mut self,
+        name: crate::block_py::BlockPyName,
+    ) -> ResolvedName {
+        let name_text = name.to_string();
+        if let Some((storage_name, CellBindingKind::Owner)) =
+            self.cell_bindings.get(name_text.as_str())
+        {
+            if name_text != *storage_name {
+                if let Some(slot) = self.local_slots.get(name_text.as_str()).copied() {
+                    return ResolvedName {
+                        id: name,
+                        location: NameLocation::local(slot),
+                    };
+                }
+            }
+        }
+        self.locate_name(name)
+    }
+
     fn locate_unresolved_name(&mut self, name: UnresolvedName) -> ResolvedName {
         match name {
             UnresolvedName::SourceName(name) => self.locate_name(name),
@@ -2098,12 +2101,31 @@ impl NameLocator<'_> {
 
     fn mark_raw_cell_store_name(&self, name: ResolvedName) -> ResolvedName {
         let name_text = name.id.to_string();
-        if resolve_cell_storage_name(self.scope, name_text.as_str()).is_some() {
+        if self
+            .scope
+            .logical_name_for_cell_storage(name_text.as_str())
+            .is_some()
+        {
             if let Some(slot) = self.local_slots.get(name_text.as_str()).copied() {
                 return name.with_location(NameLocation::local(slot));
             }
         }
         self.mark_raw_cell_name(name)
+    }
+
+    fn map_make_cell_initial_value(&mut self, expr: InstrUnresolved) -> InstrResolved {
+        let InstrUnresolved::Load(op) = expr else {
+            return self.map_instr(expr);
+        };
+        let meta = op.meta();
+        let name = match op.name {
+            UnresolvedName::SourceName(name) => self.locate_make_cell_initializer_name(name),
+            UnresolvedName::RuntimeName(name) => ResolvedName {
+                id: name,
+                location: NameLocation::RuntimeName,
+            },
+        };
+        Load::new(name).with_meta(meta).into()
     }
 
     fn mark_raw_cell_name(&self, name: ResolvedName) -> ResolvedName {
@@ -2144,6 +2166,13 @@ impl NameLocator<'_> {
 
 impl MapInstr<InstrUnresolved, InstrResolved> for NameLocator<'_> {
     fn map_instr(&mut self, expr: InstrUnresolved) -> InstrResolved {
+        if let InstrLow::MakeCell(op) = expr {
+            let meta = op.meta();
+            let initial_value = self.map_make_cell_initial_value(*op.initial_value);
+            return MakeCell::new(Box::new(initial_value))
+                .with_meta(meta)
+                .into();
+        }
         match_default!(expr: crate::passes::InstrLow<UnresolvedName> {
             InstrLow::Literal(literal) => InstrResolved::Literal(literal),
             InstrLow::Load(op) => {

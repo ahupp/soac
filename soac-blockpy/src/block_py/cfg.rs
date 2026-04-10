@@ -28,13 +28,20 @@ where
 {
     let trivial_ret_none_terms: HashMap<BlockLabel, BlockTerm<E>> = blocks
         .iter()
-        .filter(|block| block.body.is_empty() && matches!(&block.term, BlockTerm::Return(_)))
+        .filter(|block| {
+            block.body.is_empty()
+                && block.params.is_empty()
+                && block.exc_edge.is_none()
+                && matches!(&block.term, BlockTerm::Return(_))
+        })
         .map(|block| (block.label.clone(), block.term.clone()))
         .collect();
 
     for block in blocks.iter_mut() {
         let jump_target = match &block.term {
-            BlockTerm::Jump(target) => Some(target.target.clone()),
+            BlockTerm::Jump(target) if target.args.is_empty() && block.exc_edge.is_none() => {
+                Some(target.target.clone())
+            }
             _ => None,
         };
         if let Some(target) = jump_target {
@@ -42,6 +49,49 @@ where
                 block.term = term.clone();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block_py::{BlockEdge, InstrWithAwaitAndYield, InstrWithConstantNone};
+
+    #[test]
+    fn fold_jumps_preserves_exception_scoped_return_blocks() {
+        let entry = BlockLabel::from_index(0);
+        let body = BlockLabel::from_index(1);
+        let handler = BlockLabel::from_index(2);
+        let mut blocks = vec![
+            Block::new(
+                entry,
+                Vec::new(),
+                BlockTerm::Jump(BlockEdge::new(body)),
+                Vec::new(),
+                None,
+            ),
+            Block::new(
+                body,
+                Vec::new(),
+                BlockTerm::Return(InstrWithAwaitAndYield::constant_none()),
+                Vec::new(),
+                Some(BlockEdge::new(handler)),
+            ),
+            Block::new(
+                handler,
+                Vec::new(),
+                BlockTerm::Return(InstrWithAwaitAndYield::constant_none()),
+                Vec::new(),
+                None,
+            ),
+        ];
+
+        fold_jumps_to_trivial_return_blockpy(&mut blocks);
+
+        let BlockTerm::Jump(edge) = &blocks[0].term else {
+            panic!("entry jump should not fold across exception context: {blocks:#?}");
+        };
+        assert_eq!(edge.target, body);
     }
 }
 

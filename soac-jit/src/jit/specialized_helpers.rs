@@ -55,6 +55,8 @@ unsafe extern "C" {
     fn PyCell_New(obj: *mut ffi::PyObject) -> *mut ffi::PyObject;
     fn PyCell_Get(cell: *mut ffi::PyObject) -> *mut ffi::PyObject;
     fn PyCell_Set(cell: *mut ffi::PyObject, value: *mut ffi::PyObject) -> libc::c_int;
+    fn PyErr_GetHandledException() -> *mut ffi::PyObject;
+    fn PyErr_SetHandledException(exc: *mut ffi::PyObject);
     fn PyErr_SetRaisedException(exc: *mut ffi::PyObject);
 }
 
@@ -873,6 +875,29 @@ unsafe extern "C" fn raise_from_exc_hook(exc: ObjPtr) -> i32 {
     0
 }
 
+#[cfg(not(test))]
+unsafe extern "C" fn push_handled_exception_hook(exc: ObjPtr) -> ObjPtr {
+    if exc.is_null() {
+        ffi::PyErr_SetString(
+            ffi::PyExc_RuntimeError,
+            b"missing exception for dp_jit_push_handled_exception\0".as_ptr() as *const i8,
+        );
+        return ptr::null_mut();
+    }
+    let previous = PyErr_GetHandledException();
+    PyErr_SetHandledException(exc as *mut ffi::PyObject);
+    previous as ObjPtr
+}
+
+#[cfg(not(test))]
+unsafe extern "C" fn pop_handled_exception_hook(previous: ObjPtr) {
+    let previous = previous as *mut ffi::PyObject;
+    PyErr_SetHandledException(previous);
+    if !previous.is_null() {
+        ffi::Py_DECREF(previous);
+    }
+}
+
 #[cfg(test)]
 mod test_only_export_stubs {
     use super::*;
@@ -936,6 +961,8 @@ mod test_only_export_stubs {
     panic_dual_i32_export!(dp_jit_raise_from_exc, dp_jit_raise_from_exc_with_frame(
         exc: ObjPtr
     ));
+    panic_obj_export!(dp_jit_push_handled_exception(exc: ObjPtr));
+    panic_unit_export!(dp_jit_pop_handled_exception(previous: ObjPtr));
     panic_dual_obj_export!(dp_jit_py_call_positional_three, dp_jit_py_call_positional_three_with_frame(
         callable: ObjPtr,
         arg1: ObjPtr,
@@ -1919,6 +1946,26 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
             dp_jit_raise_from_exc as *const u8,
             dp_jit_raise_from_exc_with_frame as *const u8,
         ),
+    );
+    #[cfg(not(test))]
+    builder.symbol(
+        "dp_jit_push_handled_exception",
+        push_handled_exception_hook as *const u8,
+    );
+    #[cfg(test)]
+    builder.symbol(
+        "dp_jit_push_handled_exception",
+        dp_jit_push_handled_exception as *const u8,
+    );
+    #[cfg(not(test))]
+    builder.symbol(
+        "dp_jit_pop_handled_exception",
+        pop_handled_exception_hook as *const u8,
+    );
+    #[cfg(test)]
+    builder.symbol(
+        "dp_jit_pop_handled_exception",
+        dp_jit_pop_handled_exception as *const u8,
     );
     builder.symbol(
         "PyObject_RichCompare",

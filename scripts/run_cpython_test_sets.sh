@@ -11,7 +11,7 @@ usage() {
 Usage: ./scripts/run_cpython_test_sets.sh [--tempdir <path>]
 
 Runs each test set file in test_sets/ sequentially (part_01 -> part_10).
-The wrapper forces single-process regrtest execution via `just run-cpython-tests 1`.
+The wrapper forces single-process regrtest execution via `--single-process`.
 USAGE
 }
 
@@ -45,7 +45,7 @@ pkill -f "test.libregrtest.worker" >/dev/null 2>&1 || true
 
 SUMMARY_LOG="$LOG_DIR/cpython_jit_test_sets_summary.log"
 : > "$SUMMARY_LOG"
-echo "jit=1 tempdir=$TEMPDIR_PATH jobs=1" | tee -a "$SUMMARY_LOG"
+echo "jit=1 tempdir=$TEMPDIR_PATH jobs=1 single_process=1" | tee -a "$SUMMARY_LOG"
 
 failed=0
 shopt -s nullglob
@@ -61,13 +61,21 @@ for set_file in "${set_files[@]}"; do
   abs_set="$(realpath "$set_file")"
   set_name="$(basename "$set_file" .txt)"
   set_log="$LOG_DIR/cpython_jit_${set_name}.log"
+  mapfile -t test_names < <(
+    sed 's/#.*//' "$abs_set" |
+      awk 'NF { print $1 }'
+  )
+  if [ "${#test_names[@]}" -eq 0 ]; then
+    echo "no tests found in $abs_set" >&2
+    exit 2
+  fi
 
   echo "=== RUN $abs_set ===" | tee -a "$SUMMARY_LOG"
   set +e
   just run-cpython-tests 1 \
-    -x slow \
+    --single-process \
     --tempdir "$TEMPDIR_PATH" \
-    -f "$abs_set" \
+    "${test_names[@]}" \
     2>&1 | tee "$set_log"
   ec=${PIPESTATUS[0]}
   set -e

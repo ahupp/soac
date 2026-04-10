@@ -95,7 +95,7 @@ impl CompileSession {
         Ok(())
     }
 
-    pub(crate) fn shared_module_state_for_function_id(
+    pub fn shared_module_state_for_function_id(
         &self,
         function_id: FunctionId,
     ) -> Result<Option<Arc<SharedModuleState>>, String> {
@@ -106,7 +106,7 @@ impl CompileSession {
             .for_function_id(function_id))
     }
 
-    pub(crate) fn lookup_shared_function(
+    pub fn lookup_shared_function(
         &self,
         function_id: FunctionId,
     ) -> Result<Option<(Arc<SharedModuleState>, BlockPyFunction<CodegenModuleShape>)>, String> {
