@@ -58,7 +58,6 @@ struct FunctionBlockCount {
 #[derive(Debug)]
 struct FunctionInfo {
     local_id: String,
-    qualname: String,
 }
 
 fn main() -> Result<(), String> {
@@ -290,11 +289,7 @@ fn write_annotated_vcode_files(
         let Some(block_counts) = counts_by_function.get(function.local_id.as_str()) else {
             continue;
         };
-        let input_path = result_dir.join("clif").join(format!(
-            "fn_{}_{}.vcode",
-            function.local_id,
-            safe_qualname(&function.qualname)
-        ));
+        let input_path = find_vcode_path(&result_dir.join("clif"), &function.local_id)?;
         let output_path = input_path.with_extension("annotated.vcode");
         let input = std::fs::read_to_string(&input_path)
             .map_err(|err| format!("failed to read {}: {err}", input_path.display()))?;
@@ -305,6 +300,43 @@ fn write_annotated_vcode_files(
     Ok(())
 }
 
+fn find_vcode_path(clif_dir: &Path, function_local_id: &str) -> Result<PathBuf, String> {
+    let prefix = format!("fn_{function_local_id}_");
+    let mut matches = Vec::new();
+    for entry in std::fs::read_dir(clif_dir)
+        .map_err(|err| format!("failed to read {}: {err}", clif_dir.display()))?
+    {
+        let entry =
+            entry.map_err(|err| format!("failed to read {} entry: {err}", clif_dir.display()))?;
+        let path = entry.path();
+        let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if filename.starts_with(&prefix)
+            && filename.ends_with(".vcode")
+            && !filename.ends_with(".annotated.vcode")
+        {
+            matches.push(path);
+        }
+    }
+    match matches.as_slice() {
+        [path] => Ok(path.clone()),
+        [] => Err(format!(
+            "failed to find VCode file in {} for function id {function_local_id}",
+            clif_dir.display()
+        )),
+        _ => Err(format!(
+            "found multiple VCode files in {} for function id {function_local_id}: {}",
+            clif_dir.display(),
+            matches
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
 fn load_functions(path: &Path) -> Result<Vec<FunctionInfo>, String> {
     let input = std::fs::read_to_string(path)
         .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
@@ -313,7 +345,7 @@ fn load_functions(path: &Path) -> Result<Vec<FunctionInfo>, String> {
         .enumerate()
         .filter(|(_, line)| !line.trim().is_empty())
         .map(|(line_index, line)| {
-            let (local_id, qualname) = line.split_once('\t').ok_or_else(|| {
+            let (local_id, _qualname) = line.split_once('\t').ok_or_else(|| {
                 format!(
                     "failed to parse {} line {} as '<function_id>\\t<qualname>'",
                     path.display(),
@@ -322,7 +354,6 @@ fn load_functions(path: &Path) -> Result<Vec<FunctionInfo>, String> {
             })?;
             Ok(FunctionInfo {
                 local_id: local_id.to_string(),
-                qualname: qualname.to_string(),
             })
         })
         .collect()
@@ -423,21 +454,6 @@ fn function_local_id(function_id: &str) -> &str {
         .map_or(function_id, |(_, local)| local)
 }
 
-fn safe_qualname(qualname: &str) -> String {
-    let mut out = String::new();
-    let mut last_was_replacement = false;
-    for ch in qualname.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '.' {
-            out.push(ch);
-            last_was_replacement = false;
-        } else if !last_was_replacement {
-            out.push('_');
-            last_was_replacement = true;
-        }
-    }
-    out
-}
-
 fn percent(part: usize, total: usize) -> f64 {
     if total == 0 {
         0.0
@@ -500,13 +516,6 @@ mod tests {
     fn extracts_function_local_id() {
         assert_eq!(function_local_id("1:8"), "8");
         assert_eq!(function_local_id("8"), "8");
-    }
-
-    #[test]
-    fn sanitizes_qualnames_like_the_benchmark_recipe() {
-        assert_eq!(safe_qualname("Record.__init__"), "Record.__init__");
-        assert_eq!(safe_qualname("<list comp>"), "_list_comp_");
-        assert_eq!(safe_qualname("a/b:c"), "a_b_c");
     }
 
     #[test]
