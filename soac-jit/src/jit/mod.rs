@@ -922,6 +922,30 @@ fn emit_codegen_non_local_name_load(
     }
 }
 
+fn emit_cell_value_load_from_raw_cell(
+    fb: &mut FunctionBuilder<'_>,
+    cell_obj: ir::Value,
+    ctx: &JitEmitCtx<'_>,
+) -> ir::Value {
+    let ptr_ty = ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let value_inst = fb.ins().call(ctx.load_cell_ref, &[cell_obj]);
+    let value = fb.inst_results(value_inst)[0];
+    fb.ins().call(ctx.decref_ref, &[cell_obj]);
+    let value_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, value, null_ptr);
+    let value_ok_block = fb.create_block();
+    fb.append_block_param(value_ok_block, ptr_ty);
+    fb.ins().brif(
+        value_is_null,
+        ctx.consts.step_null_block,
+        &step_null_block_args(ctx),
+        value_ok_block,
+        &[ir::BlockArg::Value(value)],
+    );
+    fb.switch_to_block(value_ok_block);
+    fb.block_params(value_ok_block)[0]
+}
+
 fn emit_codegen_located_name_load(
     fb: &mut FunctionBuilder<'_>,
     name: &ResolvedName,
@@ -931,9 +955,6 @@ fn emit_codegen_located_name_load(
     ctx: &JitEmitCtx<'_>,
     borrowed: bool,
 ) -> ir::Value {
-    let ptr_ty = ctx.consts.ptr_ty;
-    let null_ptr = fb.ins().iconst(ptr_ty, 0);
-
     match name.location {
         NameLocation::Local(location) => {
             emit_codegen_local_name_load(fb, location, local_names, local_values, ctx, borrowed)
@@ -946,21 +967,7 @@ fn emit_codegen_located_name_load(
                 "cell-backed name loads must produce owned references"
             );
             let cell_obj = emit_raw_cell_object_for_name(fb, name, local_names, local_values, ctx);
-            let value_inst = fb.ins().call(ctx.load_cell_ref, &[cell_obj]);
-            let value = fb.inst_results(value_inst)[0];
-            fb.ins().call(ctx.decref_ref, &[cell_obj]);
-            let value_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, value, null_ptr);
-            let value_ok_block = fb.create_block();
-            fb.append_block_param(value_ok_block, ptr_ty);
-            fb.ins().brif(
-                value_is_null,
-                ctx.consts.step_null_block,
-                &step_null_block_args(ctx),
-                value_ok_block,
-                &[ir::BlockArg::Value(value)],
-            );
-            fb.switch_to_block(value_ok_block);
-            fb.block_params(value_ok_block)[0]
+            emit_cell_value_load_from_raw_cell(fb, cell_obj, ctx)
         }
         NameLocation::Constant(_)
         | NameLocation::GlobalName
@@ -2042,6 +2049,23 @@ impl LocalEnv {
         emit_checked_stack_slot_value(fb, &ctx.stack_slots, name, ctx, borrowed)
     }
 
+    fn load_name(
+        &self,
+        fb: &mut FunctionBuilder<'_>,
+        name: &str,
+        ctx: &JitEmitCtx<'_>,
+        borrowed: bool,
+    ) -> Option<ir::Value> {
+        if let Some(index) = self.entry_index_for_name(name) {
+            let value = self.entries[index].value;
+            if !borrowed {
+                fb.ins().call(ctx.incref_ref, &[value]);
+            }
+            return Some(value);
+        }
+        emit_checked_stack_slot_value(fb, &ctx.stack_slots, name, ctx, borrowed)
+    }
+
     fn store_location(
         &mut self,
         fb: &mut FunctionBuilder<'_>,
@@ -3034,6 +3058,21 @@ fn emit_raw_cell_object_for_name(
     )
 }
 
+fn emit_raw_cell_object_for_name_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    name: &ResolvedName,
+    local_env: &LocalEnv,
+    ctx: &JitEmitCtx<'_>,
+) -> ir::Value {
+    let Some(location) = name.cell_location() else {
+        panic!(
+            "raw cell access should target a cell-backed name, got {} at {:?}",
+            name.id, name.location
+        );
+    };
+    emit_raw_cell_object_for_location_with_local_env(fb, location, name.id.as_str(), local_env, ctx)
+}
+
 fn emit_raw_cell_object_for_location(
     fb: &mut FunctionBuilder<'_>,
     location: CellLocation,
@@ -3042,11 +3081,9 @@ fn emit_raw_cell_object_for_location(
     local_values: &[ir::Value],
     ctx: &JitEmitCtx<'_>,
 ) -> ir::Value {
-    let ptr_ty = ctx.consts.ptr_ty;
-    let null_ptr = fb.ins().iconst(ptr_ty, 0);
-
     match location {
         CellLocation::Owned(slot) => {
+            let ptr_ty = ctx.consts.ptr_ty;
             let closure_slot = ctx
                 .storage_layout
                 .as_ref()
@@ -3087,31 +3124,76 @@ fn emit_raw_cell_object_for_location(
             );
         }
         CellLocation::Closure(slot) | CellLocation::CapturedSource(slot) => {
-            let data_slot = ctx
-                .function_runtime_data_layout
-                .closure_cell_slot(slot as usize);
-            let raw_cell_value = emit_function_data_slot_borrowed(
-                fb,
-                ctx.consts.function_data_value,
-                data_slot,
-                ptr_ty,
+            emit_raw_closure_cell_object_for_slot(fb, slot, ctx)
+        }
+    }
+}
+
+fn emit_raw_closure_cell_object_for_slot(
+    fb: &mut FunctionBuilder<'_>,
+    slot: u32,
+    ctx: &JitEmitCtx<'_>,
+) -> ir::Value {
+    let ptr_ty = ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let data_slot = ctx
+        .function_runtime_data_layout
+        .closure_cell_slot(slot as usize);
+    let raw_cell_value =
+        emit_function_data_slot_borrowed(fb, ctx.consts.function_data_value, data_slot, ptr_ty);
+    let raw_cell_is_null = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, raw_cell_value, null_ptr);
+    let raw_cell_ok_block = fb.create_block();
+    fb.append_block_param(raw_cell_ok_block, ptr_ty);
+    fb.ins().brif(
+        raw_cell_is_null,
+        ctx.consts.step_null_block,
+        &step_null_block_args(ctx),
+        raw_cell_ok_block,
+        &[ir::BlockArg::Value(raw_cell_value)],
+    );
+    fb.switch_to_block(raw_cell_ok_block);
+    let raw_cell_value = fb.block_params(raw_cell_ok_block)[0];
+    fb.ins().call(ctx.incref_ref, &[raw_cell_value]);
+    raw_cell_value
+}
+
+fn emit_raw_cell_object_for_location_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    location: CellLocation,
+    debug_name: &str,
+    local_env: &LocalEnv,
+    ctx: &JitEmitCtx<'_>,
+) -> ir::Value {
+    match location {
+        CellLocation::Owned(slot) => {
+            let closure_slot = ctx
+                .storage_layout
+                .as_ref()
+                .and_then(|layout| layout.local_cell_slot(slot))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing owned cell slot mapping for {} at local cell slot {}",
+                        debug_name, slot
+                    )
+                });
+            let mut candidate_names = vec![closure_slot.storage_name.as_str()];
+            if closure_slot.logical_name != closure_slot.storage_name {
+                candidate_names.push(closure_slot.logical_name.as_str());
+            }
+            for candidate_name in &candidate_names {
+                if let Some(slot_value) = local_env.load_name(fb, candidate_name, ctx, false) {
+                    return slot_value;
+                }
+            }
+            panic!(
+                "missing owned cell {} in direct JIT state via names {:?} (slot {slot})",
+                debug_name, candidate_names
             );
-            let raw_cell_is_null =
-                fb.ins()
-                    .icmp(ir::condcodes::IntCC::Equal, raw_cell_value, null_ptr);
-            let raw_cell_ok_block = fb.create_block();
-            fb.append_block_param(raw_cell_ok_block, ptr_ty);
-            fb.ins().brif(
-                raw_cell_is_null,
-                ctx.consts.step_null_block,
-                &step_null_block_args(ctx),
-                raw_cell_ok_block,
-                &[ir::BlockArg::Value(raw_cell_value)],
-            );
-            fb.switch_to_block(raw_cell_ok_block);
-            let raw_cell_value = fb.block_params(raw_cell_ok_block)[0];
-            fb.ins().call(ctx.incref_ref, &[raw_cell_value]);
-            raw_cell_value
+        }
+        CellLocation::Closure(slot) | CellLocation::CapturedSource(slot) => {
+            emit_raw_closure_cell_object_for_slot(fb, slot, ctx)
         }
     }
 }
@@ -6814,6 +6896,15 @@ fn emit_codegen_expr_with_local_env(
                 return value;
             }
             panic!("missing local {name} in direct JIT state");
+        }
+        if op.name.cell_location().is_some() {
+            assert!(
+                !borrowed,
+                "cell-backed name loads must produce owned references"
+            );
+            let cell_obj =
+                emit_raw_cell_object_for_name_with_local_env(fb, &op.name, local_env, emit_ctx);
+            return emit_cell_value_load_from_raw_cell(fb, cell_obj, emit_ctx);
         }
     }
     if let InstrCodegen::IncrementCounter(op) = expr {
