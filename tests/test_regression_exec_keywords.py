@@ -12,7 +12,7 @@ def test_exec_accepts_locals_keyword(run_integration_module):
 
 def test_exec_accepts_closure_keyword(run_integration_module):
     pytest.xfail(
-        "transform mode wraps lowered functions with synthetic entry parameters; "
+        "SOAC-loaded functions wrap lowered functions with synthetic entry parameters; "
         "exec(code, ..., closure=...) is not yet compatible"
     )
     with run_integration_module("exec_closure_kw") as module:

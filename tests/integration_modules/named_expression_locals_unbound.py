@@ -9,7 +9,7 @@ def named_expr_locals_state():
 # diet-python: validate
 
 def validate_module(module):
-    if __dp_integration_transformed__:
+    if __dp_integration_soac__:
         try:
             module.named_expr_locals_state()
         except NotImplementedError:

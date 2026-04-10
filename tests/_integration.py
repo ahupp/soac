@@ -16,7 +16,7 @@ if str(ROOT) not in sys.path:
 if str(PYTHON_SRC) not in sys.path:
     sys.path.insert(0, str(PYTHON_SRC))
 
-from soac import import_hook
+from soac import _soac_ext, import_hook
 
 _VALIDATE_DELIMITER = "# diet-python: validate"
 
@@ -58,13 +58,15 @@ def split_integration_case(module_path: Path) -> tuple[str, str]:
 
 
 @contextmanager
-def _transform_env_for_mode(mode: str | None) -> Iterator[None]:
+def _soac_env_for_mode(mode: str | None) -> Iterator[None]:
     prior_mode = os.environ.get("DIET_PYTHON_MODE")
     try:
-        if mode == "transform":
+        if mode == "soac":
             os.environ["DIET_PYTHON_MODE"] = "transform"
         elif mode == "stock":
             os.environ.pop("DIET_PYTHON_MODE", None)
+        elif mode is None:
+            pass
         else:
             raise ValueError(f"unsupported integration mode: {mode!r}")
         yield
@@ -84,7 +86,7 @@ def _print_integration_failure_context(module_path: Path, mode: str | None = Non
         source = f"<<failed to read source: {err}>>"
 
     try:
-        with _transform_env_for_mode(mode):
+        with _soac_env_for_mode(mode):
             transformed = render_transformed_source(module_path)
     except Exception as err:
         transformed = f"<<failed to transform source: {err}>>"
@@ -108,9 +110,8 @@ def render_transformed_source(module_path: Path) -> str:
         raise ImportError(
             f"diet-python could not read source for {module_path}: {err}"
         ) from err
-    transformer = import_hook._get_pyo3_transform()
     try:
-        return transformer.transform_source_with_name(
+        return _soac_ext.transform_source_with_name(
             source,
             module_path.stem,
         )
@@ -156,7 +157,7 @@ def _load_module(
     full_name = f"{package_name}.{module_name}"
 
     try:
-        if mode == "transform":
+        if mode == "soac":
             os.environ["DIET_PYTHON_MODE"] = "transform"
             import_hook.install()
             sys.modules.pop(full_name, None)
@@ -192,15 +193,15 @@ def _load_module(
 
 
 @contextmanager
-def transformed_module(
+def soac_module(
     tmp_path: Path, module_name: str, source: str
 ) -> Iterator[ModuleType]:
-    with _load_module(tmp_path, module_name, source, mode="transform") as module:
+    with _load_module(tmp_path, module_name, source, mode="soac") as module:
         yield module
 
 
 @contextmanager
-def untransformed_module(
+def stock_module(
     tmp_path: Path, module_name: str, source: str
 ) -> Iterator[ModuleType]:
     with _load_module(tmp_path, module_name, source, mode="stock") as module:
@@ -210,7 +211,7 @@ def untransformed_module(
 def exec_integration_validation(
     validate_source: str, module: ModuleType, module_path: Path, *, mode: str
 ) -> None:
-    module.__dict__["__dp_integration_transformed__"] = mode != "stock"
+    module.__dict__["__dp_integration_soac__"] = mode == "soac"
     module.__dict__["__dp_integration_mode__"] = mode
     globals_dict = dict(module.__dict__)
     exec(compile(validate_source, str(module_path), "exec"), globals_dict)

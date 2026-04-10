@@ -12,7 +12,7 @@ def has_exception_name():
 
 def validate_module(module):
 
-    if __dp_integration_transformed__:
+    if __dp_integration_soac__:
         try:
             module.has_exception_name()
         except NotImplementedError:

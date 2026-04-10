@@ -29,7 +29,7 @@ EXPECTED_MESSAGE = (
 # diet-python: validate
 
 def validate_module(module):
-    if __dp_integration_transformed__:
+    if __dp_integration_soac__:
         coro = module.make_inner()
         try:
             coro.send(None)

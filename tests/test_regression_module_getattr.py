@@ -9,8 +9,8 @@ from tests._integration import integration_module
 
 @pytest.mark.parametrize(
     "mode",
-    ["stock", "transform"],
-    ids=["stock", "transformed"],
+    ["stock", "soac"],
+    ids=["stock", "soac"],
 )
 def test_module_getattr_lazy_attribute(tmp_path: Path, mode: str) -> None:
     source = """

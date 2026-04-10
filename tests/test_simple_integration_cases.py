@@ -29,8 +29,8 @@ def _case_paths() -> list[Path]:
 @pytest.mark.parametrize("case_path", _case_paths(), ids=lambda path: path.stem)
 @pytest.mark.parametrize(
     "mode",
-    ["stock", "transform"],
-    ids=["stock", "transformed"],
+    ["stock", "soac"],
+    ids=["stock", "soac"],
 )
 def test_simple_integration_case(tmp_path: Path, case_path: Path, mode: str) -> None:
     source, validate_source = split_integration_case(case_path)

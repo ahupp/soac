@@ -9,7 +9,7 @@ def outer():
 
 def validate_module(module):
 
-    if __dp_integration_transformed__:
+    if __dp_integration_soac__:
         try:
             module.outer()
         except NotImplementedError:

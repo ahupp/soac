@@ -6,7 +6,7 @@ import subprocess
 import sys
 
 
-def _run_transformed_module(tmp_path, module_name: str, env: dict[str, str]) -> None:
+def _run_soac_module(tmp_path, module_name: str, env: dict[str, str]) -> None:
     script = f"""
 import sys
 sys.path.insert(0, {str(tmp_path)!r})
@@ -55,7 +55,7 @@ def run():
     )
 
     profile_env = {**base_env, "SOAC_OPT_MODE": "profile"}
-    _run_transformed_module(tmp_path, module_name, profile_env)
+    _run_soac_module(tmp_path, module_name, profile_env)
     assert (work_dir / "profile.bin").exists()
 
     apply_env = {
@@ -63,7 +63,7 @@ def run():
         "SOAC_OPT_MODE": "apply",
         "SOAC_LOG": f"soac_jit_direct_edges=info;json={log_path}",
     }
-    _run_transformed_module(tmp_path, module_name, apply_env)
+    _run_soac_module(tmp_path, module_name, apply_env)
 
     rows = [
         json.loads(line)

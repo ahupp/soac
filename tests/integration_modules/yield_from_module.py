@@ -28,7 +28,7 @@ def validate_module(module):
     import pytest
     import builtins
 
-    if __dp_integration_transformed__:
+    if __dp_integration_soac__:
         assert "runtime" not in module.__dict__
         assert not hasattr(builtins, "runtime")
         assert not hasattr(builtins, "__soac__")

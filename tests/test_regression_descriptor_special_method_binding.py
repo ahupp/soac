@@ -3,7 +3,7 @@ import pytest
 from tests._integration import integration_module
 
 
-@pytest.mark.parametrize("mode", ["transform"])
+@pytest.mark.parametrize("mode", ["soac"])
 def test_special_methods_bind_descriptor_before_call(tmp_path, mode):
     source = """
 class BindingDescriptor:

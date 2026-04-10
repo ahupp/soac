@@ -6,10 +6,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-from tests._integration import transformed_module
+from tests._integration import soac_module
 
 
-def test_transformed_functions_expose_original_code_objects(tmp_path: Path) -> None:
+def test_soac_functions_expose_original_code_objects(tmp_path: Path) -> None:
     source = '''
 def outer(a):
     x = 10
@@ -25,7 +25,7 @@ class Example:
         return 42
 '''
 
-    with transformed_module(tmp_path, "original_code_object", source) as module:
+    with soac_module(tmp_path, "original_code_object", source) as module:
         inner = module.outer(3)
 
         assert module.outer.__code__.co_name == "outer"

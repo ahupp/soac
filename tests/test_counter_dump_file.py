@@ -22,7 +22,7 @@ def read():
     return VALUE
 """
 
-    with integration_module(tmp_path, "counter_dump_file_case", source, mode="transform") as module:
+    with integration_module(tmp_path, "counter_dump_file_case", source, mode="soac") as module:
         assert module.read() == 7
         assert module.read() == 7
 
@@ -52,7 +52,7 @@ def read():
 """
 
     with integration_module(
-        tmp_path, "counter_dump_none_mode_case", source, mode="transform"
+        tmp_path, "counter_dump_none_mode_case", source, mode="soac"
     ) as module:
         assert module.read() == 7
         assert module.read() == 7

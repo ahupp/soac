@@ -29,11 +29,11 @@ def _case_paths() -> list[Path]:
 @pytest.mark.parametrize("case_path", _case_paths(), ids=lambda path: path.stem)
 @pytest.mark.parametrize(
     "mode",
-    ["stock", "transform"],
-    ids=["stock", "transformed"],
+    ["stock", "soac"],
+    ids=["stock", "soac"],
 )
 def test_integration_case(tmp_path: Path, case_path: Path, mode: str) -> None:
-    if case_path.stem == "yield_from_stack_names" and mode == "transform":
+    if case_path.stem == "yield_from_stack_names" and mode == "soac":
         # BB-lowered generators do not preserve CPython frame-name identity for
         # sys._getframe() observations yet.
         pytest.xfail("BB generator frame-name observability not yet CPython-compatible")
@@ -41,7 +41,7 @@ def test_integration_case(tmp_path: Path, case_path: Path, mode: str) -> None:
         # Spawn-mode multiprocessing pickling cannot currently rediscover the
         # helper target function under the generated integration module name.
         pytest.xfail("spawn-mode multiprocessing helper pickling is not yet stable")
-    if mode == "transform" and case_path.stem in {
+    if mode == "soac" and case_path.stem in {
         "exception_refcycle_after_except",
         "exception_refcycle_args_tuple",
         "taskgroup_propagate_cancellation_refcycle",
@@ -51,9 +51,9 @@ def test_integration_case(tmp_path: Path, case_path: Path, mode: str) -> None:
     }:
         # Dict-backed frame locals are currently GC-visible, unlike CPython's
         # fast-locals representation. This changes refcycle/collection behavior
-        # for exception-sensitive cases on the BB transform path.
-        pytest.xfail("exception/refcycle behavior differs in BB transform path")
-    if mode == "transform" and case_path.stem in {
+        # for exception-sensitive cases on the SOAC-loaded path.
+        pytest.xfail("exception/refcycle behavior differs in SOAC-loaded path")
+    if mode == "soac" and case_path.stem in {
         "enum_dynamic_members_vars_update",
         "enum_ignore_dynamic_names",
         "exception_cleanup_name",
@@ -63,7 +63,7 @@ def test_integration_case(tmp_path: Path, case_path: Path, mode: str) -> None:
         "scope_locals",
     }:
         pytest.xfail("scope-aware builtin rewriting has been removed")
-    if mode == "transform" and case_path.stem in {
+    if mode == "soac" and case_path.stem in {
         "builtin_dynamic_global_shadow",
     }:
         pytest.xfail("runtime-builtin loads intentionally skip module-global shadowing")

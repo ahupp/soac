@@ -22,7 +22,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     static CAPSULE_DESTROYED: AtomicBool = AtomicBool::new(false);
-    static NEXT_TEST_EXT_STAGING_ID: AtomicUsize = AtomicUsize::new(0);
+    static NEXT_TEST_WORK_DIR_ID: AtomicUsize = AtomicUsize::new(0);
 
     #[test]
     fn cranelift_compile_cache_name_is_stable_from_logical_cache_name() {
@@ -220,29 +220,16 @@ mod tests {
             .expect("JIT test modules should carry semantic instruction ids");
     }
 
-    fn repo_root() -> &'static Path {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("workspace crate should have a repo-root parent")
-    }
-
-    fn ensure_test_extension_staging_dir() -> PathBuf {
-        let staging_dir = repo_root().join("target").join("debug").join(format!(
-            "test-ext-{}",
-            NEXT_TEST_EXT_STAGING_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        let source_ext = repo_root()
+    fn fresh_test_work_dir(prefix: &str) -> PathBuf {
+        let work_dir = crate::test_repo_root()
             .join("target")
             .join("debug")
-            .join("lib_soac_ext.so");
-        let staged_ext = staging_dir.join("_soac_ext.so");
-        std::fs::create_dir_all(&staging_dir).expect("test extension staging dir should exist");
-        if staged_ext.exists() {
-            std::fs::remove_file(&staged_ext).expect("stale staged _soac_ext should be removable");
-        }
-        std::os::unix::fs::symlink(&source_ext, &staged_ext)
-            .expect("staged _soac_ext symlink should be creatable");
-        staging_dir
+            .join(format!(
+                "{prefix}-{}",
+                NEXT_TEST_WORK_DIR_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+        std::fs::create_dir_all(&work_dir).expect("test work dir should exist");
+        work_dir
     }
 
     fn write_test_counter_dump(path: &Path, record: &CounterDumpRecord) {
@@ -643,22 +630,7 @@ mod tests {
     #[test]
     fn process_jit_batch_collection_resolves_cross_module_targets_from_compile_session() {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        let old_pythonhome = std::env::var_os("PYTHONHOME");
-        let old_pythonpath = std::env::var_os("PYTHONPATH");
-        let python_home = vendored_python_home();
-        let ext_staging_dir = ensure_test_extension_staging_dir();
-        let pythonpath = std::env::join_paths([
-            python_home.join("Lib"),
-            vendored_python_build_lib_dir(),
-            repo_root().join("soac_py").join("src"),
-            ext_staging_dir,
-        ])
-        .expect("test PYTHONPATH should join cleanly");
-        unsafe {
-            std::env::set_var("PYTHONHOME", &python_home);
-            std::env::set_var("PYTHONPATH", pythonpath);
-        }
-        Python::initialize();
+        crate::initialize_test_python();
         let result = Python::attach(|py| {
             let session = std::sync::Arc::new(crate::session::CompileSession::new());
             let caller_module_name_gen = ModuleNameGen::new(91);
@@ -714,16 +686,6 @@ mod tests {
                 "callee_test"
             );
         });
-        unsafe {
-            match old_pythonhome {
-                Some(value) => std::env::set_var("PYTHONHOME", value),
-                None => std::env::remove_var("PYTHONHOME"),
-            }
-            match old_pythonpath {
-                Some(value) => std::env::set_var("PYTHONPATH", value),
-                None => std::env::remove_var("PYTHONPATH"),
-            }
-        }
         result
     }
 
@@ -754,22 +716,7 @@ mod tests {
     #[test]
     fn process_jit_compile_direct_function_handles_mutual_recursion() {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        let old_pythonhome = std::env::var_os("PYTHONHOME");
-        let old_pythonpath = std::env::var_os("PYTHONPATH");
-        let python_home = vendored_python_home();
-        let ext_staging_dir = ensure_test_extension_staging_dir();
-        let pythonpath = std::env::join_paths([
-            python_home.join("Lib"),
-            vendored_python_build_lib_dir(),
-            repo_root().join("soac_py").join("src"),
-            ext_staging_dir,
-        ])
-        .expect("test PYTHONPATH should join cleanly");
-        unsafe {
-            std::env::set_var("PYTHONHOME", &python_home);
-            std::env::set_var("PYTHONPATH", pythonpath);
-        }
-        Python::initialize();
+        crate::initialize_test_python();
         let result = Python::attach(|py| {
             let session = std::sync::Arc::new(crate::session::CompileSession::new());
             let module_name_gen = ModuleNameGen::new(94);
@@ -830,16 +777,6 @@ mod tests {
                 "mutually-recursive callee should be marked ready"
             );
         });
-        unsafe {
-            match old_pythonhome {
-                Some(value) => std::env::set_var("PYTHONHOME", value),
-                None => std::env::remove_var("PYTHONHOME"),
-            }
-            match old_pythonpath {
-                Some(value) => std::env::set_var("PYTHONPATH", value),
-                None => std::env::remove_var("PYTHONPATH"),
-            }
-        }
         result
     }
 
@@ -866,7 +803,7 @@ mod tests {
         module.module_constants = module_constants;
         let function = module.callable_defs[0].clone();
         let module_name = "counter_test";
-        let soac_work_dir = ensure_test_extension_staging_dir();
+        let soac_work_dir = fresh_test_work_dir("test-work");
         write_test_counter_dump(
             soac_work_dir.join("profile.bin").as_path(),
             &CounterDumpRecord {
@@ -899,60 +836,46 @@ mod tests {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
         let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
-        let old_pythonhome = std::env::var_os("PYTHONHOME");
-        let old_pythonpath = std::env::var_os("PYTHONPATH");
-        let python_home = vendored_python_home();
-        let python_path = std::env::join_paths([
-            python_home.join("Lib"),
-            vendored_python_build_lib_dir(),
-            repo_root().join("soac_py").join("src"),
-            soac_work_dir.clone(),
-        ])
-        .expect("test PYTHONPATH should join");
         unsafe {
             std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
             std::env::set_var("SOAC_OPT_MODE", "apply");
-            std::env::set_var("PYTHONHOME", &python_home);
-            std::env::set_var("PYTHONPATH", python_path);
         }
+        crate::initialize_test_python();
 
-        let rendered = unsafe {
-            Python::initialize();
-            Python::attach(|py| {
-                let shared_state =
-                    crate::module_type::build_shared_state_for_testing(py, module, module_name, "")
-                        .expect("shared state should build");
-                let compile_session = crate::session::CompileSession::new();
-                let mut jit_module =
-                    new_jit_module(&compile_session).expect("test jit module should construct");
-                let module_constant_ptrs = shared_state.module_constant_ptrs();
-                let counter_ptrs = shared_state.counter_ptrs();
-                let built = build_cranelift_run_bb_specialized_function(
-                    &mut jit_module,
-                    blocks,
-                    &shared_state.lowered_module,
-                    &function,
-                    &shared_state.codegen_constants,
-                    &shared_state.lowered_module.counter_defs,
-                    &module_constant_ptrs,
-                    &counter_ptrs,
-                    &compile_session,
-                    Some(shared_state.as_ref()),
-                    None,
-                    None,
-                    None,
-                )
-                .expect("specialized JIT build should succeed");
-                let (clif, _cfg_dot, _vcode_disasm) = render_compiled_clif_and_vcode_disasm(
-                    &mut jit_module,
-                    built.ctx,
-                    &built.import_id_to_symbol,
-                    &built.block_annotations,
-                )
-                .expect("specialized JIT CLIF render should succeed");
-                clif
-            })
-        };
+        let rendered = Python::attach(|py| {
+            let shared_state =
+                crate::module_type::build_shared_state_for_testing(py, module, module_name, "")
+                    .expect("shared state should build");
+            let compile_session = crate::session::CompileSession::new();
+            let mut jit_module =
+                new_jit_module(&compile_session).expect("test jit module should construct");
+            let module_constant_ptrs = shared_state.module_constant_ptrs();
+            let counter_ptrs = shared_state.counter_ptrs();
+            let built = build_cranelift_run_bb_specialized_function(
+                &mut jit_module,
+                blocks,
+                &shared_state.lowered_module,
+                &function,
+                &shared_state.codegen_constants,
+                &shared_state.lowered_module.counter_defs,
+                &module_constant_ptrs,
+                &counter_ptrs,
+                &compile_session,
+                Some(shared_state.as_ref()),
+                None,
+                None,
+                None,
+            )
+            .expect("specialized JIT build should succeed");
+            let (clif, _cfg_dot, _vcode_disasm) = render_compiled_clif_and_vcode_disasm(
+                &mut jit_module,
+                built.ctx,
+                &built.import_id_to_symbol,
+                &built.block_annotations,
+            )
+            .expect("specialized JIT CLIF render should succeed");
+            clif
+        });
 
         unsafe {
             match old_soac_work_dir {
@@ -962,14 +885,6 @@ mod tests {
             match old_soac_opt_mode {
                 Some(value) => std::env::set_var("SOAC_OPT_MODE", value),
                 None => std::env::remove_var("SOAC_OPT_MODE"),
-            }
-            match old_pythonhome {
-                Some(value) => std::env::set_var("PYTHONHOME", value),
-                None => std::env::remove_var("PYTHONHOME"),
-            }
-            match old_pythonpath {
-                Some(value) => std::env::set_var("PYTHONPATH", value),
-                None => std::env::remove_var("PYTHONPATH"),
             }
         }
 
@@ -1110,17 +1025,6 @@ mod tests {
                 Some(base.trim())
             })
             .collect()
-    }
-
-    fn vendored_python_home() -> std::path::PathBuf {
-        repo_root().join("vendor").join("cpython")
-    }
-
-    fn vendored_python_build_lib_dir() -> PathBuf {
-        let python_home = vendored_python_home();
-        let rel_build_dir = std::fs::read_to_string(python_home.join("pybuilddir.txt"))
-            .expect("vendored CPython pybuilddir.txt should exist");
-        python_home.join(rel_build_dir.trim())
     }
 
     unsafe fn build_test_module_runtime(
@@ -1402,20 +1306,7 @@ mod tests {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         unsafe {
             let wrapper = build_runtime_refcount_smoke_wrapper();
-            let python_home = vendored_python_home();
-            std::env::set_var("PYTHONHOME", &python_home);
-            let python_path = std::env::join_paths([
-                python_home.join("Lib"),
-                vendored_python_build_lib_dir(),
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .parent()
-                    .expect("workspace crate should have a repo-root parent")
-                    .join("soac_py")
-                    .join("src"),
-            ])
-            .expect("test PYTHONPATH should join");
-            std::env::set_var("PYTHONPATH", python_path);
-            Python::initialize();
+            crate::initialize_test_python();
             Python::attach(|_| {
                 let obj = ffi::PyLong_FromLongLong(123);
                 assert!(
@@ -1440,13 +1331,7 @@ mod tests {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         unsafe {
             let wrapper = build_runtime_decref_wrapper();
-            let python_home = vendored_python_home();
-            std::env::set_var("PYTHONHOME", &python_home);
-            let python_path =
-                std::env::join_paths([python_home.join("Lib"), vendored_python_build_lib_dir()])
-                    .expect("test PYTHONPATH should join");
-            std::env::set_var("PYTHONPATH", python_path);
-            Python::initialize();
+            crate::initialize_test_python();
             Python::attach(|_| {
                 CAPSULE_DESTROYED.store(false, Ordering::SeqCst);
                 let capsule = ffi::PyCapsule_New(
@@ -1489,30 +1374,8 @@ mod tests {
     fn jit_block_entry_counter_updates_shared_state() {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         unsafe {
-            let python_home = vendored_python_home();
-            let repo_root = repo_root();
-            let soac_py_src = repo_root.join("soac_py").join("src");
-            let ext_staging_dir = ensure_test_extension_staging_dir();
-            let pythonpath = std::env::join_paths([
-                python_home.join("Lib"),
-                vendored_python_build_lib_dir(),
-                soac_py_src.clone(),
-                ext_staging_dir.clone(),
-            ])
-            .expect("test PYTHONPATH should join cleanly");
-            std::env::set_var("PYTHONHOME", &python_home);
-            std::env::set_var("PYTHONPATH", pythonpath);
-            Python::initialize();
+            crate::initialize_test_python();
             Python::attach(|py| {
-                let sys = py.import("sys").expect("sys should import");
-                sys.getattr("path")
-                    .expect("sys.path should exist")
-                    .call_method1("insert", (0, ext_staging_dir.to_string_lossy().as_ref()))
-                    .expect("sys.path should accept staged _soac_ext");
-                sys.getattr("path")
-                    .expect("sys.path should exist")
-                    .call_method1("insert", (0, soac_py_src.to_string_lossy().as_ref()))
-                    .expect("sys.path should accept soac_py/src");
                 let mut lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
                     r#"
 def f():
@@ -1608,30 +1471,8 @@ def f():
     fn jit_function_scope_refcount_counters_track_runtime_helpers() {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         unsafe {
-            let python_home = vendored_python_home();
-            let repo_root = repo_root();
-            let soac_py_src = repo_root.join("soac_py").join("src");
-            let ext_staging_dir = ensure_test_extension_staging_dir();
-            let pythonpath = std::env::join_paths([
-                python_home.join("Lib"),
-                vendored_python_build_lib_dir(),
-                soac_py_src.clone(),
-                ext_staging_dir.clone(),
-            ])
-            .expect("test PYTHONPATH should join cleanly");
-            std::env::set_var("PYTHONHOME", &python_home);
-            std::env::set_var("PYTHONPATH", pythonpath);
-            Python::initialize();
+            crate::initialize_test_python();
             Python::attach(|py| {
-                let sys = py.import("sys").expect("sys should import");
-                sys.getattr("path")
-                    .expect("sys.path should exist")
-                    .call_method1("insert", (0, ext_staging_dir.to_string_lossy().as_ref()))
-                    .expect("sys.path should accept staged _soac_ext");
-                sys.getattr("path")
-                    .expect("sys.path should exist")
-                    .call_method1("insert", (0, soac_py_src.to_string_lossy().as_ref()))
-                    .expect("sys.path should accept soac_py/src");
                 let mut lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
                     r#"
 def f(x):
@@ -2529,26 +2370,14 @@ def f():
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
         let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
-        let old_pythonhome = std::env::var_os("PYTHONHOME");
-        let old_pythonpath = std::env::var_os("PYTHONPATH");
-        let python_home = vendored_python_home();
-        let soac_work_dir = ensure_test_extension_staging_dir();
-        let python_path = std::env::join_paths([
-            python_home.join("Lib"),
-            vendored_python_build_lib_dir(),
-            repo_root().join("soac_py").join("src"),
-            soac_work_dir.clone(),
-        ])
-        .expect("test PYTHONPATH should join");
+        let soac_work_dir = fresh_test_work_dir("test-work");
         unsafe {
             std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
             std::env::set_var("SOAC_OPT_MODE", "apply");
-            std::env::set_var("PYTHONHOME", &python_home);
-            std::env::set_var("PYTHONPATH", python_path);
         }
+        crate::initialize_test_python();
 
         unsafe {
-            Python::initialize();
             Python::attach(|py| {
                 let mut constants = TestConstantPool::default();
                 let module_name_gen = ModuleNameGen::new(0);
@@ -2595,7 +2424,7 @@ def f():
                 set_stack_slots(&mut init_function, &["self", "x"]);
 
                 let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
-                let caller_function = BlockPyFunction {
+                let mut caller_function = BlockPyFunction {
                     function_id: caller_function_id,
                     name_gen: caller_name_gen,
                     names: FunctionName::new(
@@ -2624,7 +2453,6 @@ def f():
                     storage_layout: None,
                     scope: Default::default(),
                 };
-                let mut caller_function = caller_function;
                 assign_missing_test_instr_ids(&mut init_function);
                 assign_missing_test_instr_ids(&mut caller_function);
 
@@ -2772,14 +2600,6 @@ def f():
         match old_soac_opt_mode {
             Some(value) => unsafe { std::env::set_var("SOAC_OPT_MODE", value) },
             None => unsafe { std::env::remove_var("SOAC_OPT_MODE") },
-        }
-        match old_pythonhome {
-            Some(value) => unsafe { std::env::set_var("PYTHONHOME", value) },
-            None => unsafe { std::env::remove_var("PYTHONHOME") },
-        }
-        match old_pythonpath {
-            Some(value) => unsafe { std::env::set_var("PYTHONPATH", value) },
-            None => unsafe { std::env::remove_var("PYTHONPATH") },
         }
     }
 

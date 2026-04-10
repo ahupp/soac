@@ -3,7 +3,7 @@ import pytest
 from tests._integration import integration_module
 
 
-@pytest.mark.parametrize("mode", ["transform"])
+@pytest.mark.parametrize("mode", ["soac"])
 def test_basic_block_lowering_if_else(tmp_path, mode):
     source = """
 def foo(a, b):
@@ -24,7 +24,7 @@ def test_basic_block_lowering_preserves_raise(tmp_path):
 def trigger(name):
     raise AttributeError(f"module has no attribute {name!r}")
 """
-    with integration_module(tmp_path, "basic_blocks_raise", source, mode="transform") as module:
+    with integration_module(tmp_path, "basic_blocks_raise", source, mode="soac") as module:
         with pytest.raises(AttributeError, match="module has no attribute"):
             module.trigger("missing")
 
@@ -37,7 +37,7 @@ class Z[T]:
 A = Z.__annotations__
 TP = Z.__type_params__[0]
 """
-    with integration_module(tmp_path, "basic_blocks_annotation_scope", source, mode="transform") as module:
+    with integration_module(tmp_path, "basic_blocks_annotation_scope", source, mode="soac") as module:
         assert module.A["value"] is module.TP
 
 
@@ -50,7 +50,7 @@ def outer():
         yield x + 1
     return list(gen())
 """
-    with integration_module(tmp_path, "basic_blocks_nested_generator_def", source, mode="transform") as module:
+    with integration_module(tmp_path, "basic_blocks_nested_generator_def", source, mode="soac") as module:
         assert module.outer() == [3, 4]
 
 
@@ -73,7 +73,7 @@ def f(mode):
         events.append("finally")
     return 20
 """
-    with integration_module(tmp_path, "basic_blocks_try_except_else_finally", source, mode="transform") as module:
+    with integration_module(tmp_path, "basic_blocks_try_except_else_finally", source, mode="soac") as module:
         assert module.f("ret") == 10
         assert module.events == ["finally"]
         module.events.clear()

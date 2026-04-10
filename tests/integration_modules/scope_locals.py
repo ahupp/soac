@@ -33,7 +33,7 @@ def class_namespace_overrides_closure():
 # diet-python: validate
 
 def validate_module(module):
-    if __dp_integration_transformed__:
+    if __dp_integration_soac__:
         try:
             module.function_locals()
         except NotImplementedError:

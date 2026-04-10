@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import statistics  # noqa: F401 - preload before transform import hooks installed by other tests
+import statistics  # noqa: F401 - preload before SOAC import hooks installed by other tests
 import sys
 from pathlib import Path
 

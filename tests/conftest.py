@@ -52,7 +52,7 @@ def _load_integration_module(tmp_path: Path, module_name: str) -> Iterator[Modul
     source, _ = _integration.split_integration_case(module_path)
     try:
         with _integration.integration_module(
-            tmp_path, module_name, source, mode="transform"
+            tmp_path, module_name, source, mode="soac"
         ) as module:
             yield module
     except Exception:

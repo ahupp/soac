@@ -36,7 +36,7 @@ def validate_module(module):
     8: 13,
     13: 21,
     }
-    if __dp_integration_transformed__:
+    if __dp_integration_soac__:
         try:
             module.genexp_scope_state()
         except NotImplementedError:

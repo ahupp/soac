@@ -8455,14 +8455,15 @@ fn rewrite_import_fn_aliases(
     let mut import_aliases: HashMap<String, String> = HashMap::new();
     for raw_line in clif.lines() {
         let line = raw_line.trim_start();
-        let Some(eq_pos) = line.find(" = u") else {
+        let Some(eq_pos) = line.find(" = ") else {
             continue;
         };
         let alias = &line[..eq_pos];
         if alias.is_empty() {
             continue;
         }
-        let rest = &line[(eq_pos + 4)..];
+        let rest = &line[(eq_pos + 3)..];
+        let rest = rest.strip_prefix("colocated ").unwrap_or(rest);
         let Some(first_token) = rest.split_whitespace().next() else {
             continue;
         };
