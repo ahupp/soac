@@ -1742,6 +1742,10 @@ struct LocalEnvLegacyParts {
 }
 
 impl LocalEnv {
+    fn legacy_ref_kinds(&self) -> Vec<LocalRefKind> {
+        self.entries.iter().map(|entry| entry.ref_kind).collect()
+    }
+
     fn to_legacy_parts(&self) -> LocalEnvLegacyParts {
         LocalEnvLegacyParts {
             names: self
@@ -1765,21 +1769,34 @@ impl LocalEnv {
             values,
             ref_kinds: _,
         } = parts;
-        self.entries = names
+        let entries = names
             .into_iter()
             .zip(values)
-            .map(|(name, value)| LocalEnvEntry {
-                name,
-                value,
-                ref_kind: LocalRefKind::Owned,
+            .map(|(name, value)| {
+                let ref_kind = self
+                    .entries
+                    .iter()
+                    .find(|entry| entry.name == name && entry.value == value)
+                    .map(|entry| entry.ref_kind)
+                    .unwrap_or(LocalRefKind::Owned);
+                LocalEnvEntry {
+                    name,
+                    value,
+                    ref_kind,
+                }
             })
             .collect();
-        debug_assert!(
-            self.entries
-                .iter()
-                .all(|entry| entry.ref_kind == LocalRefKind::Owned),
-            "transient JIT locals currently carry owned references"
-        );
+        self.entries = entries;
+    }
+
+    fn with_legacy_parts_mut<R>(
+        &mut self,
+        emit: impl FnOnce(&mut Vec<String>, &mut Vec<ir::Value>) -> R,
+    ) -> R {
+        let mut local_parts = self.to_legacy_parts();
+        let result = emit(&mut local_parts.names, &mut local_parts.values);
+        self.replace_from_legacy_parts(local_parts);
+        result
     }
 }
 

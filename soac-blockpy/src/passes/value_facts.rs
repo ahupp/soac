@@ -569,17 +569,17 @@ impl FunctionFactInferer<'_> {
         if_term: &crate::block_py::TermIf<InstrCodegen>,
         exit: &EnvFacts,
     ) -> (EnvFacts, EnvFacts) {
-        let Some((location, then_is_none)) = self.infer_none_branch_test(&if_term.test) else {
+        let Some((location, then_fact, else_fact)) = self.infer_branch_local_fact(&if_term.test)
+        else {
             return (exit.clone(), exit.clone());
         };
         let mut then_facts = exit.clone();
         let mut else_facts = exit.clone();
-        if then_is_none {
-            then_facts.set_local_pyobj_fact(location, PyObjFacts::none_singleton());
-            else_facts.set_local_pyobj_fact(location, PyObjFacts::known_not_none());
-        } else {
-            then_facts.set_local_pyobj_fact(location, PyObjFacts::known_not_none());
-            else_facts.set_local_pyobj_fact(location, PyObjFacts::none_singleton());
+        if let Some(fact) = then_fact {
+            then_facts.set_local_pyobj_fact(location, fact);
+        }
+        if let Some(fact) = else_fact {
+            else_facts.set_local_pyobj_fact(location, fact);
         }
         (then_facts, else_facts)
     }
@@ -615,14 +615,17 @@ impl FunctionFactInferer<'_> {
         entries
     }
 
-    fn infer_none_branch_test(&self, test: &InstrCodegen) -> Option<(LocalLocation, bool)> {
+    fn infer_branch_local_fact(
+        &self,
+        test: &InstrCodegen,
+    ) -> Option<(LocalLocation, Option<PyObjFacts>, Option<PyObjFacts>)> {
         match test {
             InstrCodegen::BinOp(op) if op.kind == BinOpKind::Is => {
-                infer_local_is_none_comparison(&op.left, &op.right, self)
+                infer_local_is_singleton_comparison(&op.left, &op.right, self)
             }
             InstrCodegen::UnaryOp(op) if op.kind == UnaryOpKind::Not => self
-                .infer_none_branch_test(&op.operand)
-                .map(|(location, then_is_none)| (location, !then_is_none)),
+                .infer_branch_local_fact(&op.operand)
+                .map(|(location, then_fact, else_fact)| (location, else_fact, then_fact)),
             _ => None,
         }
     }
@@ -669,24 +672,38 @@ fn infer_function_value_facts(
     inferer.store
 }
 
-fn infer_local_is_none_comparison(
+fn infer_local_is_singleton_comparison(
     left: &InstrCodegen,
     right: &InstrCodegen,
     inferer: &FunctionFactInferer<'_>,
-) -> Option<(LocalLocation, bool)> {
-    if expr_is_none(right, inferer) {
-        local_load_location(left).map(|location| (location, true))
-    } else if expr_is_none(left, inferer) {
-        local_load_location(right).map(|location| (location, true))
+) -> Option<(LocalLocation, Option<PyObjFacts>, Option<PyObjFacts>)> {
+    if let Some((then_fact, else_fact)) = expr_singleton_branch_facts(right, inferer) {
+        local_load_location(left).map(|location| (location, then_fact, else_fact))
+    } else if let Some((then_fact, else_fact)) = expr_singleton_branch_facts(left, inferer) {
+        local_load_location(right).map(|location| (location, then_fact, else_fact))
     } else {
         None
     }
 }
 
-fn expr_is_none(expr: &InstrCodegen, inferer: &FunctionFactInferer<'_>) -> bool {
+fn expr_singleton_branch_facts(
+    expr: &InstrCodegen,
+    inferer: &FunctionFactInferer<'_>,
+) -> Option<(Option<PyObjFacts>, Option<PyObjFacts>)> {
     match inferer.infer_expr_facts(expr) {
-        ValueFacts::PyObj(py_facts) => py_facts.is_none(),
-        ValueFacts::I32(_) | ValueFacts::I64(_) | ValueFacts::Bool(_) => false,
+        ValueFacts::PyObj(py_facts) if py_facts.is_none() => Some((
+            Some(PyObjFacts::none_singleton()),
+            Some(PyObjFacts::known_not_none()),
+        )),
+        ValueFacts::PyObj(py_facts) if py_facts.is_true_singleton() => {
+            Some((Some(PyObjFacts::bool_singleton(true)), None))
+        }
+        ValueFacts::PyObj(py_facts) if py_facts.is_false_singleton() => {
+            Some((Some(PyObjFacts::bool_singleton(false)), None))
+        }
+        ValueFacts::PyObj(_) | ValueFacts::I32(_) | ValueFacts::I64(_) | ValueFacts::Bool(_) => {
+            None
+        }
     }
 }
 
@@ -1013,6 +1030,30 @@ def f(x, flag):
         assert!(then_facts.is_known_not_none());
         assert!(else_facts.is_none());
         assert!(else_facts.is_exact_type(PyExactType::NoneType));
+    }
+
+    #[test]
+    fn narrows_bool_singleton_fact_across_is_true_branch_edge() {
+        let (then_entry, else_entry) = branch_entry_envs("", "x is True");
+
+        let then_facts = sole_local_py_fact(&then_entry);
+        assert!(then_facts.is_true_singleton());
+        assert!(then_facts.is_exact_type(PyExactType::Bool));
+        assert_eq!(then_facts.is_truthy(), Some(true));
+        assert!(then_facts.is_immortal());
+        assert_eq!(local_py_facts(&else_entry).len(), 0);
+    }
+
+    #[test]
+    fn narrows_bool_singleton_fact_across_is_not_false_branch_else_edge() {
+        let (then_entry, else_entry) = branch_entry_envs("", "x is not False");
+
+        assert_eq!(local_py_facts(&then_entry).len(), 0);
+        let else_facts = sole_local_py_fact(&else_entry);
+        assert!(else_facts.is_false_singleton());
+        assert!(else_facts.is_exact_type(PyExactType::Bool));
+        assert_eq!(else_facts.is_truthy(), Some(false));
+        assert!(else_facts.is_immortal());
     }
 
     #[test]

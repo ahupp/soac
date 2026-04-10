@@ -268,6 +268,9 @@ Started:
 - `EnvFacts` can now carry per-local facts at block entries. The first branch
   transfer narrows `if x is None` / `if x is not None` successor entries to
   `x: None` and `x: not None` respectively.
+- Branch transfer also narrows representable bool-singleton identity tests on
+  the exact edge where identity is known, such as `if x is True` and the false
+  edge of `if x is not False`.
 - Block-entry facts are computed by a forward function-level transfer over the
   CFG. Straight-line local stores set facts for the target local, local loads
   can copy known facts to another local, and local deletes remove facts.
