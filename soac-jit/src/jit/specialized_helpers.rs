@@ -1766,6 +1766,24 @@ macro_rules! define_ternary_obj_wrapper {
     };
 }
 
+macro_rules! define_i64_obj_wrapper {
+    ($fn_name:ident, $symbol:literal) => {
+        unsafe extern "C" fn $fn_name(value: i64) -> ObjPtr {
+            type Func = unsafe extern "C" fn(libc::c_longlong) -> *mut ffi::PyObject;
+            static SYMBOL: OnceLock<usize> = OnceLock::new();
+            let symbol = *SYMBOL.get_or_init(|| unsafe {
+                load_python_capi_symbol(concat!($symbol, "\0").as_bytes())
+            });
+            if symbol == 0 {
+                return ptr::null_mut();
+            }
+            let func: Func = unsafe { std::mem::transmute(symbol) };
+            func(value as libc::c_longlong) as ObjPtr
+        }
+    };
+}
+
+define_i64_obj_wrapper!(pylong_from_longlong_wrapper, "PyLong_FromLongLong");
 define_binary_i32_wrapper!(pysequence_contains_wrapper, "PySequence_Contains");
 define_unary_i32_wrapper!(pyobject_not_wrapper, "PyObject_Not");
 define_unary_i32_wrapper!(pyobject_is_true_wrapper, "PyObject_IsTrue");
@@ -2094,6 +2112,10 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol(
         "PySequence_Contains",
         pysequence_contains_wrapper as *const u8,
+    );
+    builder.symbol(
+        "PyLong_FromLongLong",
+        pylong_from_longlong_wrapper as *const u8,
     );
     builder.symbol("PyObject_Not", pyobject_not_wrapper as *const u8);
     builder.symbol("PyObject_IsTrue", pyobject_is_true_wrapper as *const u8);

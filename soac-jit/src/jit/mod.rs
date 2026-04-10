@@ -306,6 +306,8 @@ static DP_JIT_PYOBJECT_TO_I64_IMPORT: ImportSpec = ImportSpec::new(
     &[SigType::Pointer],
     &[SigType::I64],
 );
+static PYLONG_FROM_LONGLONG_IMPORT: ImportSpec =
+    ImportSpec::new("PyLong_FromLongLong", &[SigType::I64], &[SigType::Pointer]);
 static SOAC_RUNTIME_GUARD_TYPE_VERSION_IMPORT: ImportSpec = ImportSpec::local(
     SOAC_RUNTIME_GUARD_TYPE_VERSION_SYMBOL,
     &[SigType::Pointer, SigType::Pointer, SigType::I64],
@@ -1569,6 +1571,7 @@ struct JitEmitCtx<'mc> {
     pyobject_setattr_ref: ir::FuncRef,
     pyobject_getitem_ref: ir::FuncRef,
     pyobject_setitem_ref: ir::FuncRef,
+    py_long_from_i64_ref: ir::FuncRef,
     raise_deleted_name_error_ref: ir::FuncRef,
     make_cell_ref: ir::FuncRef,
     load_cell_ref: ir::FuncRef,
@@ -2660,12 +2663,16 @@ fn emit_checked_stack_slot_value(
             .brif(value_is_null, fallthrough_block, &[], value_ok_block, &[]);
 
         fb.switch_to_block(fallthrough_block);
-        let fallthrough_value = emit_owned_module_constant(
+        let fallthrough_tag = abrupt_kind_tag(AbruptKind::Fallthrough);
+        let fallthrough_i64 = fb.ins().iconst(ctx.consts.i64_ty, fallthrough_tag);
+        let fallthrough_value = emit_to_python_long(
             fb,
-            ctx.module_constants
-                .require_int_constant_id(abrupt_kind_tag(AbruptKind::Fallthrough)),
+            SoacValue::i64(fallthrough_i64, IntFacts::i64_known(fallthrough_tag)),
+            ctx.py_long_from_i64_ref,
             ctx,
-        );
+        )
+        .expect_pyobject("abrupt kind fallthrough materialize")
+        .0;
         fb.ins()
             .jump(done_block, &[ir::BlockArg::Value(fallthrough_value)]);
 
@@ -3514,6 +3521,50 @@ fn emit_to_python_bool(
         .select(is_true, ctx.consts.true_const, ctx.consts.false_const);
     fb.ins().call(ctx.incref_ref, &[bool_value]);
     SoacValue::pyobject(bool_value, PyObjFacts::bool_object())
+}
+
+fn emit_checked_owned_pyobject_result(
+    fb: &mut FunctionBuilder<'_>,
+    value: ir::Value,
+    ctx: &JitEmitCtx<'_>,
+) -> ir::Value {
+    let null_ptr = fb.ins().iconst(ctx.consts.ptr_ty, 0);
+    let value_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, value, null_ptr);
+    let value_ok_block = fb.create_block();
+    fb.append_block_param(value_ok_block, ctx.consts.ptr_ty);
+    fb.ins().brif(
+        value_is_null,
+        ctx.consts.step_null_block,
+        &step_null_block_args(ctx),
+        value_ok_block,
+        &[ir::BlockArg::Value(value)],
+    );
+    fb.switch_to_block(value_ok_block);
+    fb.block_params(value_ok_block)[0]
+}
+
+fn emit_to_python_long(
+    fb: &mut FunctionBuilder<'_>,
+    value: SoacValue,
+    py_long_from_i64_ref: ir::FuncRef,
+    ctx: &JitEmitCtx<'_>,
+) -> SoacValue {
+    match value {
+        pyobject @ SoacValue::PyObject { .. } => pyobject,
+        SoacValue::I64 { value, .. } => {
+            let result_inst = fb.ins().call(py_long_from_i64_ref, &[value]);
+            let result_value = fb.inst_results(result_inst)[0];
+            let result = emit_checked_owned_pyobject_result(fb, result_value, ctx);
+            SoacValue::pyobject(result, PyObjFacts::exact_type(PyExactType::Int))
+        }
+        SoacValue::I32 { value, .. } => {
+            let value_i64 = fb.ins().sextend(ctx.consts.i64_ty, value);
+            let result_inst = fb.ins().call(py_long_from_i64_ref, &[value_i64]);
+            let result_value = fb.inst_results(result_inst)[0];
+            let result = emit_checked_owned_pyobject_result(fb, result_value, ctx);
+            SoacValue::pyobject(result, PyObjFacts::exact_type(PyExactType::Int))
+        }
+    }
 }
 
 fn emit_i32_bool01_not(
@@ -9177,6 +9228,8 @@ fn build_cranelift_run_bb_specialized_function(
             func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_PYOBJECT_SETITEM_IMPORT);
         let pyobject_to_i64_ref =
             func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_PYOBJECT_TO_I64_IMPORT);
+        let py_long_from_i64_ref =
+            func_imports.get_or_panic(jit_module, &mut fb.func, &PYLONG_FROM_LONGLONG_IMPORT);
         let guard_method_type_version_ref = func_imports.get_or_panic(
             jit_module,
             &mut fb.func,
@@ -9465,6 +9518,7 @@ fn build_cranelift_run_bb_specialized_function(
                 pyobject_setattr_ref,
                 pyobject_getitem_ref,
                 pyobject_setitem_ref,
+                py_long_from_i64_ref,
                 raise_deleted_name_error_ref,
                 make_cell_ref,
                 load_cell_ref,
