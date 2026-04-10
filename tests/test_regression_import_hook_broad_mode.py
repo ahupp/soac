@@ -110,7 +110,7 @@ def test_soac_package_relative_import_star_binds_submodule_name(
         sys.modules.pop("relative_star_pkg.child", None)
 
 
-def test_soac_function_locals_reflect_recent_assignment(tmp_path):
+def test_soac_function_locals_fails_explicitly(tmp_path):
     source = """
 def value():
     optdict = {"verbose": ""}
@@ -120,10 +120,11 @@ def value():
 """
 
     with soac_module(tmp_path, "locals_recent_assignment", source) as module:
-        assert module.value() == "{'verbose': ''} {'verbose': ''} []"
+        with pytest.raises(NotImplementedError, match="frame-sensitive locals/eval/exec"):
+            module.value()
 
 
-def test_soac_eval_uses_current_function_locals(tmp_path):
+def test_soac_eval_fails_explicitly(tmp_path):
     source = """
 def value():
     left = 3
@@ -132,10 +133,11 @@ def value():
 """
 
     with soac_module(tmp_path, "eval_current_locals", source) as module:
-        assert module.value() == 7
+        with pytest.raises(NotImplementedError, match="frame-sensitive locals/eval/exec"):
+            module.value()
 
 
-def test_soac_eval_sees_for_loop_target_local(tmp_path):
+def test_soac_eval_in_loop_fails_explicitly(tmp_path):
     source = """
 def value():
     for item in [12]:
@@ -148,7 +150,8 @@ def value():
 """
 
     with soac_module(tmp_path, "eval_for_loop_target_local", source) as module:
-        assert module.value() is True
+        with pytest.raises(NotImplementedError, match="frame-sensitive locals/eval/exec"):
+            module.value()
 
 
 def test_soac_nested_coroutine_nonlocal_capture_in_method(tmp_path):
@@ -637,6 +640,13 @@ assert runtime._SOAC_RUNTIME_READY is True
 assert isinstance(runtime.__spec__.loader, import_hook.SoacLoader)
 assert runtime.DELETED is runtime.DELETED
 assert runtime.ITER_COMPLETE is runtime.ITER_COMPLETE
+for name in ("locals", "eval", "exec"):
+    try:
+        getattr(runtime, name)()
+    except NotImplementedError as exc:
+        assert "frame-sensitive locals/eval/exec" in str(exc)
+    else:
+        raise AssertionError(f"soac.runtime.{name} should fail explicitly")
 """
     env = os.environ.copy()
     env.pop("SOAC_MODULE_ENABLED", None)

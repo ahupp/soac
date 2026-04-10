@@ -35,6 +35,9 @@ const ALWAYS_REQUIRED_RUNTIME_NAME_CONSTANTS: &[&str] = &[
     "ITER_COMPLETE",
 ];
 const SOAC_RUNTIME_BOOTSTRAP_HELPER_NAMES: &[&str] = &[
+    "locals",
+    "eval",
+    "exec",
     "tuple_values",
     "make_function",
     "create_class",
@@ -436,6 +439,13 @@ _PYTHON_KEYWORDS = frozenset((
 ))
 _MISSING = object()
 
+def _unsupported_frame_builtin(*args, **kwargs):
+    raise NotImplementedError('soac.runtime does not support frame-sensitive locals/eval/exec')
+
+locals = _unsupported_frame_builtin
+eval = _unsupported_frame_builtin
+globals()['exec'] = _unsupported_frame_builtin
+
 def code_with_freevars(names, is_async, is_generator):
     names = tuple(names)
     is_async = bool(is_async)
@@ -473,7 +483,7 @@ def code_with_freevars(names, is_async, is_generator):
     outer_lines.append('    return wrapped.__code__')
 
     ns = {}
-    exec('\\n'.join(outer_lines), {}, ns)
+    _builtins.exec('\\n'.join(outer_lines), {}, ns)
     code = ns['__dp_make_code']()
     if code.co_freevars != names:
         code = code.replace(co_freevars=names)

@@ -71,6 +71,9 @@ fn install_soac_runtime_bootstrap_globals(
     for name in [
         "_entry_template",
         "code_with_freevars",
+        "locals",
+        "eval",
+        "exec",
         "tuple_values",
         "make_function",
         "create_class",

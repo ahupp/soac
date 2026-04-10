@@ -91,6 +91,17 @@ AttributeError = _builtins.AttributeError
 ImportError = _builtins.ImportError
 
 
+def _unsupported_frame_builtin(*args, **kwargs):
+    raise _builtins.NotImplementedError(
+        "soac.runtime does not support frame-sensitive locals/eval/exec"
+    )
+
+
+locals = _unsupported_frame_builtin
+eval = _unsupported_frame_builtin
+vars(_sys.modules[__name__])["exec"] = _unsupported_frame_builtin
+
+
 def tuple_values(*values):
     # Strict variadic tuple construction for transformed code.
     return _builtins.tuple(values)
@@ -706,7 +717,7 @@ def code_with_freevars(names, is_async, is_generator):
     outer_lines.append("    return wrapped.__code__")
 
     ns = {}
-    exec("\n".join(outer_lines), {}, ns)
+    _builtins.exec("\n".join(outer_lines), {}, ns)
     code = ns["__dp_make_code"]()
     if code.co_freevars != names:
         code = code.replace(co_freevars=names)
