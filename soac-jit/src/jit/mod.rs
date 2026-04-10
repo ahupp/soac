@@ -1247,6 +1247,119 @@ fn emit_codegen_super_helper_call(
     fb.block_params(call_ok_block)[0]
 }
 
+fn emit_codegen_super_helper_call_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    callable_expr: &InstrCodegen,
+    super_fn_expr: &InstrCodegen,
+    cls_expr: &InstrCodegen,
+    instance_expr: &InstrCodegen,
+    local_env: &mut LocalEnv,
+    ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> ir::Value {
+    let ptr_ty = ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let callable_is_borrowed = codegen_expr_is_borrowable_from_local_env(
+        callable_expr,
+        local_env,
+        &ctx.stack_slots,
+        ctx.storage_layout.as_ref(),
+    );
+    let callable = emit_codegen_expr_with_local_env(
+        fb,
+        callable_expr,
+        local_env,
+        ctx,
+        callable_is_borrowed,
+        jit_module,
+        func_imports,
+    );
+
+    let super_fn_is_borrowed = codegen_expr_is_borrowable_from_local_env(
+        super_fn_expr,
+        local_env,
+        &ctx.stack_slots,
+        ctx.storage_layout.as_ref(),
+    );
+    let super_fn = emit_codegen_expr_with_local_env(
+        fb,
+        super_fn_expr,
+        local_env,
+        ctx,
+        super_fn_is_borrowed,
+        jit_module,
+        func_imports,
+    );
+
+    let cls_is_borrowed = codegen_expr_is_borrowable_from_local_env(
+        cls_expr,
+        local_env,
+        &ctx.stack_slots,
+        ctx.storage_layout.as_ref(),
+    );
+    let cls = emit_codegen_expr_with_local_env(
+        fb,
+        cls_expr,
+        local_env,
+        ctx,
+        cls_is_borrowed,
+        jit_module,
+        func_imports,
+    );
+
+    let instance_expr =
+        super_instance_arg_without_deleted_guard(instance_expr, ctx.module_constants);
+    let instance_is_borrowed = codegen_expr_is_borrowable_from_local_env(
+        instance_expr,
+        local_env,
+        &ctx.stack_slots,
+        ctx.storage_layout.as_ref(),
+    );
+    let instance = emit_codegen_expr_with_local_env(
+        fb,
+        instance_expr,
+        local_env,
+        ctx,
+        instance_is_borrowed,
+        jit_module,
+        func_imports,
+    );
+
+    let call_inst = fb.ins().call(
+        ctx.py_call_positional_three_ref,
+        &[callable, super_fn, cls, instance, null_ptr],
+    );
+    if !instance_is_borrowed {
+        fb.ins().call(ctx.decref_ref, &[instance]);
+    }
+    if !cls_is_borrowed {
+        fb.ins().call(ctx.decref_ref, &[cls]);
+    }
+    if !super_fn_is_borrowed {
+        fb.ins().call(ctx.decref_ref, &[super_fn]);
+    }
+    if !callable_is_borrowed {
+        fb.ins().call(ctx.decref_ref, &[callable]);
+    }
+
+    let call_value = fb.inst_results(call_inst)[0];
+    let call_is_null = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, call_value, null_ptr);
+    let call_ok_block = fb.create_block();
+    fb.append_block_param(call_ok_block, ptr_ty);
+    fb.ins().brif(
+        call_is_null,
+        ctx.consts.step_null_block,
+        &step_null_block_args(ctx),
+        call_ok_block,
+        &[ir::BlockArg::Value(call_value)],
+    );
+    fb.switch_to_block(call_ok_block);
+    fb.block_params(call_ok_block)[0]
+}
+
 fn load_function_env_obj(
     fb: &mut FunctionBuilder<'_>,
     ptr_ty: ir::Type,
@@ -7231,6 +7344,142 @@ fn emit_codegen_expr_value_with_local_env(
     SoacValue::pyobject(value, facts)
 }
 
+fn emit_codegen_simple_call_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    call: &soac_blockpy::block_py::Call<InstrCodegen>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Option<ir::Value> {
+    let ptr_ty = emit_ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let mut simple_args: Vec<&InstrCodegen> = Vec::new();
+    let mut simple_keywords: Vec<(&str, &InstrCodegen)> = Vec::new();
+    let mut has_unpack = false;
+    for arg in &call.args {
+        match arg {
+            CallArgPositional::Positional(value) => simple_args.push(value),
+            CallArgPositional::Starred(_) => has_unpack = true,
+        }
+    }
+    for keyword in &call.keywords {
+        match keyword {
+            CallArgKeyword::Named { arg, value } => simple_keywords.push((arg.as_str(), value)),
+            CallArgKeyword::Starred(_) => has_unpack = true,
+        }
+    }
+
+    if !has_unpack
+        && simple_keywords.is_empty()
+        && simple_args.is_empty()
+        && codegen_expr_runtime_helper(call.func.as_ref(), emit_ctx)
+            == Some(RuntimeHelperId::Globals)
+    {
+        fb.ins()
+            .call(emit_ctx.incref_ref, &[emit_ctx.consts.block_const]);
+        return Some(emit_ctx.consts.block_const);
+    }
+
+    if !has_unpack
+        && simple_keywords.is_empty()
+        && simple_args.len() == 3
+        && matches!(
+            codegen_expr_helper_name(call.func.as_ref(), emit_ctx.module_constants),
+            Some("call_super")
+        )
+    {
+        return Some(emit_codegen_super_helper_call_with_local_env(
+            fb,
+            call.func.as_ref(),
+            simple_args[0],
+            simple_args[1],
+            simple_args[2],
+            local_env,
+            emit_ctx,
+            jit_module,
+            func_imports,
+        ));
+    }
+
+    if !has_unpack
+        && simple_keywords.is_empty()
+        && codegen_expr_runtime_helper(call.func.as_ref(), emit_ctx) == Some(RuntimeHelperId::Str)
+        && simple_args.len() == 1
+    {
+        if let Some(value) = codegen_expr_const_string(simple_args[0], emit_ctx.module_constants) {
+            return Some(emit_owned_module_constant(
+                fb,
+                emit_ctx
+                    .module_constants
+                    .require_unicode_constant_id(value.as_str()),
+                emit_ctx,
+            ));
+        }
+    }
+
+    if !has_unpack
+        && simple_keywords.is_empty()
+        && simple_args.len() == 1
+        && codegen_expr_runtime_helper(call.func.as_ref(), emit_ctx)
+            == Some(RuntimeHelperId::NextOrSentinel)
+    {
+        let iterator_expr = simple_args[0];
+        let iterator_is_borrowed = codegen_expr_is_borrowable_from_local_env(
+            iterator_expr,
+            local_env,
+            &emit_ctx.stack_slots,
+            emit_ctx.storage_layout.as_ref(),
+        );
+        let iterator = emit_codegen_expr_with_local_env(
+            fb,
+            iterator_expr,
+            local_env,
+            emit_ctx,
+            iterator_is_borrowed,
+            jit_module,
+            func_imports,
+        );
+        let sentinel = emit_owned_module_constant(
+            fb,
+            emit_ctx
+                .module_constants
+                .require_runtime_name_constant_id("ITER_COMPLETE"),
+            emit_ctx,
+        );
+        let next_or_sentinel_ref =
+            func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_NEXT_OR_SENTINEL_IMPORT);
+        let next_inst = fb.ins().call(next_or_sentinel_ref, &[iterator, sentinel]);
+        let mut owned_inputs = Vec::with_capacity(2);
+        if !iterator_is_borrowed {
+            owned_inputs.push(iterator);
+        }
+        owned_inputs.push(sentinel);
+        let next_value = emit_decref_owned_inputs_after_nullable_result(
+            fb,
+            emit_ctx,
+            fb.inst_results(next_inst)[0],
+            &owned_inputs,
+        );
+        let value_is_null = fb
+            .ins()
+            .icmp(ir::condcodes::IntCC::Equal, next_value, null_ptr);
+        let value_ok_block = fb.create_block();
+        fb.append_block_param(value_ok_block, ptr_ty);
+        fb.ins().brif(
+            value_is_null,
+            emit_ctx.consts.step_null_block,
+            &step_null_block_args(emit_ctx),
+            value_ok_block,
+            &[ir::BlockArg::Value(next_value)],
+        );
+        fb.switch_to_block(value_ok_block);
+        return Some(fb.block_params(value_ok_block)[0]);
+    }
+
+    None
+}
+
 fn emit_codegen_expr_with_local_env(
     fb: &mut FunctionBuilder<'_>,
     expr: &InstrCodegen,
@@ -7470,6 +7719,22 @@ fn emit_codegen_expr_with_local_env(
             jit_module,
             func_imports,
         );
+    }
+    if let InstrCodegen::Call(call) = expr {
+        assert!(
+            !borrowed,
+            "codegen call expression must not use borrowed result"
+        );
+        if let Some(value) = emit_codegen_simple_call_with_local_env(
+            fb,
+            call,
+            local_env,
+            emit_ctx,
+            jit_module,
+            func_imports,
+        ) {
+            return value;
+        }
     }
     let mut local_parts = local_env.to_legacy_parts();
     let value = emit_codegen_expr(
