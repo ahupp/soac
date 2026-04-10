@@ -4823,6 +4823,58 @@ fn emit_direct_call_resolved_with_arg_plan(
     )
 }
 
+fn emit_direct_call_resolved_with_arg_plan_from_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    callable: ir::Value,
+    callable_is_borrowed: bool,
+    args: &[&InstrCodegen],
+    arg_plan: &DirectCallArgPlan,
+    target_function: &BlockPyFunction<CodegenModuleShape>,
+    local_env: &mut LocalEnv,
+    ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> ir::Value {
+    let ptr_ty = ctx.consts.ptr_ty;
+    let mut provided_arg_values: Vec<ir::Value> = Vec::with_capacity(args.len());
+    let mut provided_arg_borrowed: Vec<bool> = Vec::with_capacity(args.len());
+    for arg in args {
+        let borrowed_arg = codegen_expr_is_borrowable_from_local_env(
+            arg,
+            local_env,
+            &ctx.stack_slots,
+            ctx.storage_layout.as_ref(),
+        );
+        provided_arg_borrowed.push(borrowed_arg);
+        provided_arg_values.push(emit_codegen_expr_with_local_env(
+            fb,
+            arg,
+            local_env,
+            ctx,
+            borrowed_arg,
+            jit_module,
+            func_imports,
+        ));
+    }
+    let (arg_values, arg_borrowed) = emit_direct_call_args_from_plan(
+        fb,
+        arg_plan,
+        provided_arg_values,
+        provided_arg_borrowed,
+        ptr_ty,
+    );
+    emit_direct_call_resolved_with_arg_values(
+        fb,
+        callable,
+        callable_is_borrowed,
+        arg_values,
+        arg_borrowed,
+        target_function,
+        ctx,
+        jit_module,
+    )
+}
+
 fn emit_call_direct_expr(
     fb: &mut FunctionBuilder<'_>,
     call: &soac_blockpy::block_py::CallDirect<InstrCodegen>,
@@ -4915,6 +4967,118 @@ fn emit_call_direct_expr(
         target_function,
         local_names,
         local_values,
+        ctx,
+        jit_module,
+        func_imports,
+    )
+}
+
+fn emit_call_direct_expr_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    call: &soac_blockpy::block_py::CallDirect<InstrCodegen>,
+    local_env: &mut LocalEnv,
+    ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> ir::Value {
+    let fallback_call = || {
+        InstrCodegen::Call(
+            soac_blockpy::block_py::Call::new(
+                (*call.callable).clone(),
+                call.args.clone(),
+                call.keywords.clone(),
+            )
+            .with_meta(call.meta()),
+        )
+    };
+
+    let Some(target_function) = direct_call_target_function(ctx, call.function_id) else {
+        ctx.direct_edge_stats
+            .record_call_direct_missing_target_fallback();
+        let fallback = fallback_call();
+        return emit_codegen_expr_with_local_env(
+            fb,
+            &fallback,
+            local_env,
+            ctx,
+            false,
+            jit_module,
+            func_imports,
+        );
+    };
+
+    let arg_plan = match validate_direct_call_compatibility(
+        target_function,
+        ctx.direct_call_functions,
+        direct_call_positional_arg_count(&call.args),
+        0,
+        direct_call_has_starred_arguments(&call.args, &call.keywords),
+        !call.keywords.is_empty(),
+    ) {
+        Ok(arg_plan) => arg_plan,
+        Err(DirectCallIncompatibility::MissingPredeclared) => {
+            ctx.direct_edge_stats
+                .record_call_direct_missing_predeclared_fallback();
+            let fallback = fallback_call();
+            return emit_codegen_expr_with_local_env(
+                fb,
+                &fallback,
+                local_env,
+                ctx,
+                false,
+                jit_module,
+                func_imports,
+            );
+        }
+        Err(_) => {
+            ctx.direct_edge_stats
+                .record_call_direct_unsupported_shape_fallback();
+            let fallback = fallback_call();
+            return emit_codegen_expr_with_local_env(
+                fb,
+                &fallback,
+                local_env,
+                ctx,
+                false,
+                jit_module,
+                func_imports,
+            );
+        }
+    };
+
+    let callable_is_borrowed = codegen_expr_is_borrowable_from_local_env(
+        call.callable.as_ref(),
+        local_env,
+        &ctx.stack_slots,
+        ctx.storage_layout.as_ref(),
+    );
+    let callable = emit_codegen_expr_with_local_env(
+        fb,
+        call.callable.as_ref(),
+        local_env,
+        ctx,
+        callable_is_borrowed,
+        jit_module,
+        func_imports,
+    );
+    let args = call
+        .args
+        .iter()
+        .map(|arg| match arg {
+            CallArgPositional::Positional(expr) => expr,
+            CallArgPositional::Starred(_) => {
+                unreachable!("starred direct args should have used generic fallback")
+            }
+        })
+        .collect::<Vec<_>>();
+    emit_direct_call_resolved_with_arg_plan_from_local_env(
+        fb,
+        callable,
+        callable_is_borrowed,
+        args.as_slice(),
+        &arg_plan,
+        target_function,
+        local_env,
         ctx,
         jit_module,
         func_imports,
@@ -7292,6 +7456,20 @@ fn emit_codegen_expr_with_local_env(
             func_imports,
         };
         return intrinsics::emit_del_deref_raw_cell(raw_cell, op.quietly, &mut intrinsic_state);
+    }
+    if let InstrCodegen::CallDirect(call) = expr {
+        assert!(
+            !borrowed,
+            "codegen direct-call expression must not use borrowed result"
+        );
+        return emit_call_direct_expr_with_local_env(
+            fb,
+            call,
+            local_env,
+            emit_ctx,
+            jit_module,
+            func_imports,
+        );
     }
     let mut local_parts = local_env.to_legacy_parts();
     let value = emit_codegen_expr(
