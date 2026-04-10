@@ -205,6 +205,14 @@ impl PyObjFacts {
     pub const fn is_false_singleton(self) -> bool {
         matches!(self.bool_singleton, BoolSingletonFact::IsFalse)
     }
+
+    fn is_uninformative_for_local_env(self) -> bool {
+        self.ty == TypeFact::Unknown
+            && self.truthiness == TruthinessFact::Unknown
+            && self.none == NoneFact::Unknown
+            && self.bool_singleton == BoolSingletonFact::Unknown
+            && self.refcount == RefcountFact::Unknown
+    }
 }
 
 const fn none_fact_for_exact_type(exact_type: PyExactType) -> NoneFact {
@@ -245,10 +253,16 @@ impl EnvFacts {
             .map(|(location, facts)| (*location, *facts))
     }
 
-    fn with_local_pyobj_fact(location: LocalLocation, facts: PyObjFacts) -> Self {
-        let mut env = Self::default();
-        env.local_pyobj_facts.insert(location, facts);
-        env
+    fn set_local_pyobj_fact(&mut self, location: LocalLocation, facts: PyObjFacts) {
+        if facts.is_uninformative_for_local_env() {
+            self.local_pyobj_facts.remove(&location);
+        } else {
+            self.local_pyobj_facts.insert(location, facts);
+        }
+    }
+
+    fn remove_local_pyobj_fact(&mut self, location: LocalLocation) {
+        self.local_pyobj_facts.remove(&location);
     }
 
     fn intersect_with(&mut self, other: &Self) {
@@ -285,18 +299,6 @@ impl FactStore {
             .iter()
             .map(|(key, facts)| (*key, facts))
     }
-
-    fn merge_block_entry_facts(
-        &mut self,
-        function_id: FunctionId,
-        label: BlockLabel,
-        facts: EnvFacts,
-    ) {
-        self.block_entry_facts
-            .entry((function_id, label))
-            .and_modify(|existing| existing.intersect_with(&facts))
-            .or_insert(facts);
-    }
 }
 
 struct FunctionFactInferer<'a> {
@@ -321,31 +323,121 @@ impl FunctionFactInferer<'_> {
         }
     }
 
-    fn infer_block_edge_facts(&mut self, block: &Block<InstrCodegen>) {
-        let BlockTerm::IfTerm(if_term) = &block.term else {
-            return;
-        };
+    fn infer_expr_facts_in_env(&self, expr: &InstrCodegen, env: &EnvFacts) -> ValueFacts {
+        match expr {
+            InstrCodegen::Load(op) => op
+                .name
+                .local_location()
+                .and_then(|location| env.local_pyobj_fact(location))
+                .map(ValueFacts::PyObj)
+                .unwrap_or_else(|| self.infer_expr_facts(expr)),
+            _ => self.infer_expr_facts(expr),
+        }
+    }
+
+    fn transfer_block_env(&self, block: &Block<InstrCodegen>, entry: &EnvFacts) -> EnvFacts {
+        let mut env = entry.clone();
+        for instr in &block.body {
+            self.transfer_instr_env(instr, &mut env);
+        }
+        env
+    }
+
+    fn transfer_instr_env(&self, instr: &InstrCodegen, env: &mut EnvFacts) {
+        match instr {
+            InstrCodegen::Store(op) => {
+                let Some(location) = op.name.local_location() else {
+                    return;
+                };
+                let ValueFacts::PyObj(py_facts) = self.infer_expr_facts_in_env(&op.value, env);
+                env.set_local_pyobj_fact(location, py_facts);
+            }
+            InstrCodegen::Del(op) => {
+                if let Some(location) = op.name.local_location() {
+                    env.remove_local_pyobj_fact(location);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn successor_envs(
+        &self,
+        block: &Block<InstrCodegen>,
+        exit: &EnvFacts,
+    ) -> Vec<(BlockLabel, EnvFacts)> {
+        match &block.term {
+            BlockTerm::Jump(edge) => vec![(edge.target, exit.clone())],
+            BlockTerm::IfTerm(if_term) => {
+                let (then_facts, else_facts) = self.infer_if_edge_facts(if_term, exit);
+                vec![
+                    (if_term.then_label, then_facts),
+                    (if_term.else_label, else_facts),
+                ]
+            }
+            BlockTerm::BranchTable(branch) => {
+                let mut out = branch
+                    .targets
+                    .iter()
+                    .copied()
+                    .map(|target| (target, exit.clone()))
+                    .collect::<Vec<_>>();
+                out.push((branch.default_label, exit.clone()));
+                out
+            }
+            BlockTerm::Raise(_) | BlockTerm::Return(_) => Vec::new(),
+        }
+    }
+
+    fn infer_if_edge_facts(
+        &self,
+        if_term: &crate::block_py::TermIf<InstrCodegen>,
+        exit: &EnvFacts,
+    ) -> (EnvFacts, EnvFacts) {
         let Some((location, then_is_none)) = self.infer_none_branch_test(&if_term.test) else {
-            return;
+            return (exit.clone(), exit.clone());
         };
-        let none_facts = EnvFacts::with_local_pyobj_fact(location, PyObjFacts::none_singleton());
-        let not_none_facts =
-            EnvFacts::with_local_pyobj_fact(location, PyObjFacts::known_not_none());
-        let (then_facts, else_facts) = if then_is_none {
-            (none_facts, not_none_facts)
+        let mut then_facts = exit.clone();
+        let mut else_facts = exit.clone();
+        if then_is_none {
+            then_facts.set_local_pyobj_fact(location, PyObjFacts::none_singleton());
+            else_facts.set_local_pyobj_fact(location, PyObjFacts::known_not_none());
         } else {
-            (not_none_facts, none_facts)
+            then_facts.set_local_pyobj_fact(location, PyObjFacts::known_not_none());
+            else_facts.set_local_pyobj_fact(location, PyObjFacts::none_singleton());
+        }
+        (then_facts, else_facts)
+    }
+
+    fn infer_block_entry_facts(&self) -> HashMap<BlockLabel, EnvFacts> {
+        let Some(entry_block) = self.function.blocks.first() else {
+            return HashMap::new();
         };
-        self.store.merge_block_entry_facts(
-            self.function.function_id,
-            if_term.then_label,
-            then_facts,
-        );
-        self.store.merge_block_entry_facts(
-            self.function.function_id,
-            if_term.else_label,
-            else_facts,
-        );
+        let mut entries = HashMap::from([(entry_block.label, EnvFacts::default())]);
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for block in &self.function.blocks {
+                let Some(entry) = entries.get(&block.label).cloned() else {
+                    continue;
+                };
+                let exit = self.transfer_block_env(block, &entry);
+                for (target, incoming) in self.successor_envs(block, &exit) {
+                    match entries.get_mut(&target) {
+                        Some(existing) => {
+                            let before = existing.clone();
+                            existing.intersect_with(&incoming);
+                            changed |= *existing != before;
+                        }
+                        None => {
+                            entries.insert(target, incoming);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        entries
     }
 
     fn infer_none_branch_test(&self, test: &InstrCodegen) -> Option<(LocalLocation, bool)> {
@@ -384,14 +476,16 @@ fn infer_function_value_facts(
     };
     for block in &function.blocks {
         inferer.visit_block(block);
-        inferer.infer_block_edge_facts(block);
     }
+    let block_entry_facts = inferer.infer_block_entry_facts();
     for block in &function.blocks {
-        inferer
-            .store
-            .block_entry_facts
-            .entry((function.function_id, block.label))
-            .or_insert_with(EnvFacts::default);
+        inferer.store.block_entry_facts.insert(
+            (function.function_id, block.label),
+            block_entry_facts
+                .get(&block.label)
+                .cloned()
+                .unwrap_or_default(),
+        );
     }
     inferer.store
 }
@@ -559,11 +653,16 @@ def f():
         py_facts
     }
 
-    fn branch_entry_py_facts(condition: &str) -> (PyObjFacts, PyObjFacts) {
+    fn branch_entry_envs(prefix: &str, condition: &str) -> (EnvFacts, EnvFacts) {
+        let prefix = prefix
+            .lines()
+            .map(|line| format!("    {line}\n"))
+            .collect::<String>();
         let lowered = lower_python_to_blockpy_for_testing(
             format!(
                 r#"
-def f(x):
+def f(x, flag):
+{prefix}
     if {condition}:
         return 1
     return 2
@@ -581,10 +680,11 @@ def f(x):
         let if_term = function
             .blocks
             .iter()
-            .find_map(|block| match &block.term {
+            .filter_map(|block| match &block.term {
                 BlockTerm::IfTerm(if_term) => Some(if_term),
                 _ => None,
             })
+            .last()
             .expect("expected lowered conditional branch");
         let facts = infer_module_value_facts(&lowered);
         let then_entry = facts
@@ -593,9 +693,14 @@ def f(x):
         let else_entry = facts
             .block_entry_fact(function.function_id, if_term.else_label)
             .expect("missing else-entry facts");
+        (then_entry.clone(), else_entry.clone())
+    }
+
+    fn branch_entry_py_facts(condition: &str) -> (PyObjFacts, PyObjFacts) {
+        let (then_entry, else_entry) = branch_entry_envs("", condition);
         (
-            sole_local_py_fact(then_entry),
-            sole_local_py_fact(else_entry),
+            sole_local_py_fact(&then_entry),
+            sole_local_py_fact(&else_entry),
         )
     }
 
@@ -609,6 +714,12 @@ def f(x):
             "expected exactly one local fact for test"
         );
         fact
+    }
+
+    fn local_py_facts(env: &EnvFacts) -> Vec<PyObjFacts> {
+        env.local_pyobj_facts()
+            .map(|(_, facts)| facts)
+            .collect::<Vec<_>>()
     }
 
     #[test]
@@ -680,5 +791,35 @@ def f(x):
         assert!(then_facts.is_known_not_none());
         assert!(else_facts.is_none());
         assert!(else_facts.is_exact_type(PyExactType::NoneType));
+    }
+
+    #[test]
+    fn transfers_local_store_facts_to_successor_entries() {
+        let (then_entry, else_entry) = branch_entry_envs("x = None", "flag");
+
+        assert!(sole_local_py_fact(&then_entry).is_none());
+        assert!(sole_local_py_fact(&else_entry).is_none());
+    }
+
+    #[test]
+    fn transfers_local_load_copy_facts_to_successor_entries() {
+        let (then_entry, else_entry) = branch_entry_envs("x = None\ny = x", "flag");
+
+        let then_facts = local_py_facts(&then_entry);
+        let else_facts = local_py_facts(&else_entry);
+        assert_eq!(then_facts.len(), 2);
+        assert_eq!(else_facts.len(), 2);
+        assert!(then_facts.iter().all(|facts| facts.is_none()));
+        assert!(else_facts.iter().all(|facts| facts.is_none()));
+    }
+
+    #[test]
+    fn local_delete_removes_facts_from_successor_entries() {
+        let (then_entry, else_entry) = branch_entry_envs("x = None\ndel x", "flag");
+
+        let then_facts = local_py_facts(&then_entry);
+        let else_facts = local_py_facts(&else_entry);
+        assert_eq!(then_facts.len(), 0, "{then_facts:?}");
+        assert_eq!(else_facts.len(), 0, "{else_facts:?}");
     }
 }

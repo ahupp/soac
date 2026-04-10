@@ -235,6 +235,9 @@ Started:
 - `EnvFacts` can now carry per-local facts at block entries. The first branch
   transfer narrows `if x is None` / `if x is not None` successor entries to
   `x: None` and `x: not None` respectively.
+- Block-entry facts are computed by a forward function-level transfer over the
+  CFG. Straight-line local stores set facts for the target local, local loads
+  can copy known facts to another local, and local deletes remove facts.
 - JIT codegen now computes the read-only `FactStore` once per lowered module and
   exposes expression fact lookup through `JitEmitCtx`. Generated code does not
   use the facts yet.
