@@ -6,6 +6,11 @@ cpython_bin := repo_root + "/vendor/cpython/python"
 cpython_lib_dir := repo_root + "/vendor/cpython"
 venv_dir := repo_root + "/.venv"
 uv_cache_dir := repo_root + "/.uv-cache"
+uv_tool_dir := repo_root + "/.uv/tools"
+uv_tool_bin_dir := repo_root + "/.uv/bin"
+xdg_cache_home := repo_root + "/.xdg/cache"
+xdg_data_home := repo_root + "/.xdg/data"
+xdg_runtime_dir := repo_root + "/tmp"
 cargo_home := env_var_or_default("CARGO_HOME", repo_root + "/tmp/cargo-home")
 pyo3_python := cpython_bin
 web_dir := repo_root + "/web"
@@ -22,10 +27,17 @@ export CPYTHON_BIN := cpython_bin
 export CPYTHON_LIB_DIR := cpython_lib_dir
 export VENV_DIR := venv_dir
 export UV_CACHE_DIR := uv_cache_dir
+export UV_TOOL_DIR := uv_tool_dir
+export UV_TOOL_BIN_DIR := uv_tool_bin_dir
+export UV_PYTHON_DOWNLOADS := "never"
 export UV_PYTHON := cpython_bin
+export XDG_CACHE_HOME := xdg_cache_home
+export XDG_DATA_HOME := xdg_data_home
+export XDG_RUNTIME_DIR := xdg_runtime_dir
 export PYO3_PYTHON := pyo3_python
 export PYO3_PYTHON_REAL := pyo3_python
 export CARGO_HOME := cargo_home
+export PATH := uv_tool_bin_dir + ":" + env_var_or_default("PATH", "")
 export WEB_DIR := web_dir
 export INSPECTOR_BIN := inspector_bin
 export PORT := port
@@ -127,6 +139,13 @@ install-extension build="debug": ensure-venv ensure-cpython
 setup-dev-env: ensure-cpython
   #!/usr/bin/env bash
   set -euo pipefail
+  mkdir -p \
+    "$UV_CACHE_DIR" \
+    "$UV_TOOL_DIR" \
+    "$UV_TOOL_BIN_DIR" \
+    "$XDG_CACHE_HOME" \
+    "$XDG_DATA_HOME" \
+    "$XDG_RUNTIME_DIR"
   shared_bench="$REPO_ROOT/../soac-bench"
   mkdir -p "$shared_bench"
   if [[ -L "$REPO_ROOT/bench" ]]; then
@@ -148,8 +167,9 @@ setup-dev-env: ensure-cpython
   rustup toolchain install nightly
   rustup component add rustc-codegen-cranelift-preview --toolchain nightly
   cargo install --locked inferno
+  env -u UV_OFFLINE uv tool install ruff
   echo 'Run "apt update && apt install -y gdb"'
-  just update-venv
+  env -u UV_OFFLINE just update-venv
 
 update-venv: ensure-cpython
   #!/usr/bin/env bash
@@ -162,6 +182,11 @@ update-venv: ensure-cpython
     VIRTUAL_ENV="$VENV_DIR" PATH="$VENV_DIR/bin:$PATH" \
       uv sync --project "$REPO_ROOT/soac_py" --group dev --frozen --active
   )
+
+[private]
+update-venv-offline:
+  #!/usr/bin/env bash
+  UV_OFFLINE=1 just update-venv
 
 build-extension build="debug": ensure-cpython
   #!/usr/bin/env bash
@@ -186,7 +211,7 @@ build-extension build="debug": ensure-cpython
   )
   just install-extension "$BUILD"
 
-build-all: (update-venv) ensure-cpython ensure-shared-python
+build-all: (update-venv-offline) ensure-cpython ensure-shared-python
   #!/usr/bin/env bash
   set -euo pipefail
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -530,7 +555,7 @@ perf-pystone-jit-warm loops="10000000" output_prefix="logs/pystone_jit_perf_warm
   echo "finished"
   echo "view speedscope: just view-speedscope ${VIEW_SPEEDSCOPE_PROFILE@Q}"
 
-perf-pystone-jit-specialized loops="10000000" output_prefix="logs/pystone_jit_perf_warm_specialized": ensure-cpython (update-venv) (build-extension "release")
+perf-pystone-jit-specialized loops="10000000" output_prefix="logs/pystone_jit_perf_warm_specialized": ensure-cpython (update-venv-offline) (build-extension "release")
   #!/usr/bin/env bash
   set -euo pipefail
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -638,6 +663,7 @@ fmt-markdown:
 regen-snapshots:
   #!/usr/bin/env bash
   cd "$REPO_ROOT"
+  export UV_OFFLINE=1
   cargo run --bin regen_snapshots
 
 [private]
@@ -759,7 +785,7 @@ _call-target-specializations-from-dump dump_path:
   cd "$REPO_ROOT"
   cargo run -p soac-inspector --bin inspect_counters -- --specializations "{{dump_path}}"
 
-benchmark-verify loops="100000" counters_dir="": (update-venv) (build-extension "release")
+benchmark-verify loops="100000" counters_dir="": (update-venv-offline) (build-extension "release")
   #!/usr/bin/env bash
   set -euo pipefail
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -790,7 +816,7 @@ benchmark-verify loops="100000" counters_dir="": (update-venv) (build-extension 
   echo "verification counters: $COUNTERS_DIR/verify.bin"
   echo "SOAC events log: $COUNTERS_DIR/events.jsonl"
 
-benchmark-warm loops="8000000": (update-venv) (build-extension "release")
+benchmark-warm loops="8000000": (update-venv-offline) (build-extension "release")
   #!/usr/bin/env bash
   set -euo pipefail
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -824,7 +850,7 @@ benchmark-warm loops="8000000": (update-venv) (build-extension "release")
   BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
     "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
 
-benchmark benchmark_loops="1000000" verify_loops="100000" perf_loops="10000000" results_root="bench" result_rev="@": (update-venv) (build-extension "release")
+benchmark benchmark_loops="1000000" verify_loops="100000" perf_loops="10000000" results_root="bench" result_rev="@": (update-venv-offline) (build-extension "release")
   #!/usr/bin/env bash
   set -euo pipefail
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
