@@ -3729,6 +3729,101 @@ fn emit_positional_vectorcall(
     fb.block_params(call_ok_block)[0]
 }
 
+fn emit_positional_vectorcall_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    callable: ir::Value,
+    callable_is_borrowed: bool,
+    args: &[&InstrCodegen],
+    local_env: &mut LocalEnv,
+    ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> ir::Value {
+    let ptr_ty = ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let mut arg_values: Vec<ir::Value> = Vec::with_capacity(args.len());
+    let mut arg_borrowed: Vec<bool> = Vec::with_capacity(args.len());
+    for arg in args {
+        let borrowed_arg = codegen_expr_is_borrowable_from_local_env(
+            arg,
+            local_env,
+            &ctx.stack_slots,
+            ctx.storage_layout.as_ref(),
+        );
+        arg_borrowed.push(borrowed_arg);
+        arg_values.push(emit_codegen_expr_with_local_env(
+            fb,
+            arg,
+            local_env,
+            ctx,
+            borrowed_arg,
+            jit_module,
+            func_imports,
+        ));
+    }
+    let args_ptr = if arg_values.is_empty() {
+        null_ptr
+    } else {
+        let args_slot = fb.create_sized_stack_slot(ir::StackSlotData::new(
+            ir::StackSlotKind::ExplicitSlot,
+            (arg_values.len() * std::mem::size_of::<u64>()) as u32,
+            0,
+        ));
+        for (index, value) in arg_values.iter().copied().enumerate() {
+            fb.ins().stack_store(
+                value,
+                args_slot,
+                (index * std::mem::size_of::<u64>()) as i32,
+            );
+        }
+        fb.ins().stack_addr(ptr_ty, args_slot, 0)
+    };
+    let nargsf = fb.ins().iconst(ptr_ty, arg_values.len() as i64);
+    let call_inst = fb.ins().call(
+        ctx.py_vectorcall_ref,
+        &[callable, args_ptr, nargsf, null_ptr],
+    );
+    let call_value = fb.inst_results(call_inst)[0];
+    let call_is_null = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, call_value, null_ptr);
+    let call_null_block = fb.create_block();
+    let call_ok_block = fb.create_block();
+    fb.append_block_param(call_ok_block, ptr_ty);
+    fb.ins().brif(
+        call_is_null,
+        call_null_block,
+        &[],
+        call_ok_block,
+        &[ir::BlockArg::Value(call_value)],
+    );
+
+    fb.switch_to_block(call_null_block);
+    let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
+    for (value, borrowed_arg) in arg_values.iter().copied().zip(arg_borrowed.iter().copied()) {
+        if !borrowed_arg {
+            fb.ins().call(ctx.decref_ref, &[value]);
+        }
+    }
+    if !callable_is_borrowed {
+        fb.ins().call(ctx.decref_ref, &[callable]);
+    }
+    emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
+    fb.ins()
+        .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
+
+    fb.switch_to_block(call_ok_block);
+    for (value, borrowed_arg) in arg_values.into_iter().zip(arg_borrowed.into_iter()) {
+        if !borrowed_arg {
+            fb.ins().call(ctx.decref_ref, &[value]);
+        }
+    }
+    if !callable_is_borrowed {
+        fb.ins().call(ctx.decref_ref, &[callable]);
+    }
+    fb.block_params(call_ok_block)[0]
+}
+
 fn emit_owned_bool_from_cond(
     fb: &mut FunctionBuilder<'_>,
     cond: ir::Value,
@@ -7598,6 +7693,53 @@ fn emit_codegen_simple_call_with_local_env(
                 "cell_ref should target a cell-backed name, got {} at {:?}",
                 cell_name.name.id, cell_name.name.location
             );
+        }
+    }
+
+    if !has_unpack && simple_keywords.is_empty() {
+        let site_instr_id = call.semantic_instr_id();
+        let has_call_target_counter = emit_ctx
+            .call_target_counter_ids
+            .get(&site_instr_id)
+            .is_some();
+        let has_call_target_specializations = emit_ctx
+            .call_target_specializations
+            .get(&site_instr_id)
+            .is_some_and(|targets| !targets.is_empty());
+        let has_constructor_specializations =
+            !direct_constructor_specializations_for_call_site(call, emit_ctx).is_empty();
+        let has_method_specializations =
+            !direct_method_specializations_for_call_site(call, emit_ctx).is_empty();
+        if !has_call_target_counter
+            && !has_call_target_specializations
+            && !has_constructor_specializations
+            && !has_method_specializations
+        {
+            let callable_is_borrowed = codegen_expr_is_borrowable_from_local_env(
+                call.func.as_ref(),
+                local_env,
+                &emit_ctx.stack_slots,
+                emit_ctx.storage_layout.as_ref(),
+            );
+            let callable = emit_codegen_expr_with_local_env(
+                fb,
+                call.func.as_ref(),
+                local_env,
+                emit_ctx,
+                callable_is_borrowed,
+                jit_module,
+                func_imports,
+            );
+            return Some(emit_positional_vectorcall_with_local_env(
+                fb,
+                callable,
+                callable_is_borrowed,
+                simple_args.as_slice(),
+                local_env,
+                emit_ctx,
+                jit_module,
+                func_imports,
+            ));
         }
     }
 
