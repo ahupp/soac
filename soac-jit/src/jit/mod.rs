@@ -9216,19 +9216,7 @@ fn emit_codegen_expr_with_local_env(
             return value;
         }
     }
-    let mut local_parts = local_env.to_legacy_parts();
-    let value = emit_codegen_expr(
-        fb,
-        expr,
-        &mut local_parts.names,
-        &mut local_parts.values,
-        emit_ctx,
-        borrowed,
-        jit_module,
-        func_imports,
-    );
-    local_env.replace_from_legacy_parts(local_parts);
-    value
+    panic!("operation {expr:?} should have been handled by LocalEnv direct emitter")
 }
 
 fn emit_codegen_stmt_with_local_env(
