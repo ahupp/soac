@@ -13,6 +13,7 @@ use cranelift_codegen::ir::InstBuilder;
 use cranelift_frontend::FunctionBuilder;
 use pyo3::ffi;
 use soac_blockpy::block_py::{HasSemanticInstrId, Instr, InstrCodegen, NameLike, NameLocation};
+use soac_blockpy::passes::PyObjFacts;
 use std::mem::offset_of;
 
 pub(super) trait OperationEmitState<'fb, E> {
@@ -24,6 +25,14 @@ pub(super) trait OperationEmitState<'fb, E> {
     fn finish_owned_result(&mut self, value: ir::Value) -> ir::Value;
     fn emit_owned_bool_from_i32_result(&mut self, result: ir::Value) -> ir::Value;
     fn emit_owned_bool_from_cond(&mut self, cond: ir::Value) -> ir::Value;
+    fn emit_owned_bool_from_pyobject_truthiness(
+        &mut self,
+        value: ir::Value,
+        facts: PyObjFacts,
+        borrowed: bool,
+        invert: bool,
+    ) -> ir::Value;
+    fn py_facts_for_arg(&self, arg: &E) -> PyObjFacts;
 
     fn emit_owned_string_constant(&mut self, value: &str) -> ir::Value {
         let constant_id = self
@@ -966,13 +975,41 @@ fn emit_unary_op_with_arg_values<'fb, E>(
     }
 }
 
+fn emit_unary_op_with_arg_and_values<'fb, E>(
+    kind: blockpy_intrinsics::UnaryOpKind,
+    state: &mut impl OperationEmitState<'fb, E>,
+    arg: &E,
+    arg_values: &[(ir::Value, bool)],
+) -> ir::Value {
+    match kind {
+        blockpy_intrinsics::UnaryOpKind::Not | blockpy_intrinsics::UnaryOpKind::Truth => {
+            let [(value, borrowed)] = arg_values else {
+                panic!(
+                    "unary truth operation received unsupported arity {}",
+                    arg_values.len()
+                );
+            };
+            state.emit_owned_bool_from_pyobject_truthiness(
+                *value,
+                state.py_facts_for_arg(arg),
+                *borrowed,
+                matches!(kind, blockpy_intrinsics::UnaryOpKind::Not),
+            )
+        }
+        _ => emit_unary_op_with_arg_values(kind, state, arg_values),
+    }
+}
+
 fn emit_unary_op<'fb, E>(
     kind: blockpy_intrinsics::UnaryOpKind,
     state: &mut impl OperationEmitState<'fb, E>,
     args: &[&E],
 ) -> ir::Value {
     let arg_values = state.emit_arg_values(args);
-    emit_unary_op_with_arg_values(kind, state, &arg_values)
+    let [arg] = args else {
+        panic!("unary operation received unsupported arity {}", args.len());
+    };
+    emit_unary_op_with_arg_and_values(kind, state, *arg, &arg_values)
 }
 
 fn emit_specialized_binop<'fb>(
@@ -1141,7 +1178,12 @@ fn emit_specialized_unary_op<'fb>(
         .into_iter()
         .any(|shape| unpack_unary_shape(shape) == Some(ExactTypeTag::Int));
     if !supports_exact_int {
-        return Some(emit_unary_op_with_arg_values(op.kind, state, &arg_values));
+        return Some(emit_unary_op_with_arg_and_values(
+            op.kind,
+            state,
+            op.operand.as_ref(),
+            &arg_values,
+        ));
     }
 
     let result_block = state.fb().create_block();
@@ -1172,7 +1214,8 @@ fn emit_specialized_unary_op<'fb>(
     if let Some(counter_ptr) = specialized_fallback_counter_ptr {
         emit_increment_counter_ptr(state.fb(), ptr_ty, counter_ptr);
     }
-    let generic_result = emit_unary_op_with_arg_values(op.kind, state, &arg_values);
+    let generic_result =
+        emit_unary_op_with_arg_and_values(op.kind, state, op.operand.as_ref(), &arg_values);
     state
         .fb()
         .ins()
