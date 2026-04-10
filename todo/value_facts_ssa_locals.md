@@ -290,6 +290,9 @@ Started:
   alongside legacy scratch-name entries. Straight-line block-body local
   load/store/delete emission can use location-aware `LocalEnv` operations while
   complex expression lowering still passes through the temporary legacy adapter.
+- Runtime block params now enter `LocalEnv` as owned `LocalLocation` bindings at
+  block entry. They are still mirrored into stack slots until failure cleanup
+  can consume `LocalEnv` directly.
 - A first `FunctionLocalPlan` exists in JIT planning. It records per-block entry
   bindings from the storage layout, annotates them with available `EnvFacts`,
   and classifies known immortal locals without changing generated code.

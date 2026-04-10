@@ -1751,6 +1751,25 @@ struct LocalEnvLegacyParts {
 }
 
 impl LocalEnv {
+    fn bind_entry_location(
+        &mut self,
+        location: LocalLocation,
+        name: &str,
+        value: ir::Value,
+        ref_kind: LocalRefKind,
+    ) {
+        debug_assert!(
+            self.entry_index_for_location(location).is_none(),
+            "block-entry LocalEnv location should be bound once"
+        );
+        self.entries.push(LocalEnvEntry {
+            key: LocalEnvKey::Location(location),
+            name: name.to_string(),
+            value,
+            ref_kind,
+        });
+    }
+
     fn entry_index_for_location(&self, location: LocalLocation) -> Option<usize> {
         self.entries
             .iter()
@@ -1905,6 +1924,24 @@ impl LocalEnv {
         self.replace_from_legacy_parts(local_parts);
         result
     }
+}
+
+fn planned_entry_binding_for_block_arg_name<'a>(
+    block_plan: Option<&'a BlockLocalPlan>,
+    name: &str,
+) -> Option<&'a PlannedLocalBinding> {
+    let entry_locals = &block_plan?.entry_locals;
+    entry_locals
+        .iter()
+        .find(|binding| binding.name == name)
+        .or_else(|| {
+            if !is_try_exception_alias_name(name) {
+                return None;
+            }
+            entry_locals
+                .iter()
+                .find(|binding| is_try_exception_alias_name(binding.name.as_str()))
+        })
 }
 
 fn transient_local_needs_decref(ref_kind: LocalRefKind) -> bool {
@@ -8594,22 +8631,47 @@ fn build_cranelift_run_bb_specialized_function(
 
         for (index, block) in exec_blocks.iter().enumerate() {
             fb.switch_to_block(*block);
+            let codegen_block = &function.blocks[index];
+            let block_local_plan = local_plan.block(codegen_block.label);
+            let mut local_env = LocalEnv::default();
             let block_param_values = fb.block_params(*block).to_vec();
             for (param_name, param_value) in runtime_block_param_names[index]
                 .iter()
                 .zip(block_param_values.iter())
             {
-                stack_slots
-                    .replace_cloned_value(
-                        &mut fb,
-                        param_name,
+                if let Some(binding) =
+                    planned_entry_binding_for_block_arg_name(block_local_plan, param_name)
+                {
+                    local_env.bind_entry_location(
+                        binding.location,
+                        binding.name.as_str(),
                         *param_value,
-                        ptr_ty,
-                        incref_ref,
-                        decref_ref,
-                    )
-                    .expect("runtime block param missing from stack slots");
-                fb.ins().call(decref_ref, &[*param_value]);
+                        binding.ref_kind,
+                    );
+                    // Keep a stack-slot mirror until failure cleanup consumes LocalEnv directly.
+                    stack_slots
+                        .replace_cloned_value(
+                            &mut fb,
+                            binding.name.as_str(),
+                            *param_value,
+                            ptr_ty,
+                            incref_ref,
+                            decref_ref,
+                        )
+                        .expect("runtime block param missing from stack slots");
+                } else {
+                    stack_slots
+                        .replace_cloned_value(
+                            &mut fb,
+                            param_name,
+                            *param_value,
+                            ptr_ty,
+                            incref_ref,
+                            decref_ref,
+                        )
+                        .expect("runtime block param missing from stack slots");
+                    fb.ins().call(decref_ref, &[*param_value]);
+                }
             }
             let block_const = globals_value;
             let none_const = emit_owned_module_constant_from_parts(
@@ -8734,14 +8796,11 @@ fn build_cranelift_run_bb_specialized_function(
                 field_index_specializations: &field_index_specializations,
                 behavior_change_indexed_stores,
             };
-            let block = &function.blocks[index];
-            let _block_local_plan = emit_ctx.local_plan.block(block.label);
-            let _block_refcount_plan = emit_ctx.refcount_plan.block(block.label);
-            let mut local_env = LocalEnv::default();
+            let _block_refcount_plan = emit_ctx.refcount_plan.block(codegen_block.label);
 
             emit_codegen_ops(
                 &mut fb,
-                &block.body,
+                &codegen_block.body,
                 &mut local_env,
                 &stack_slots,
                 &emit_ctx,
@@ -8751,8 +8810,8 @@ fn build_cranelift_run_bb_specialized_function(
 
             emit_codegen_term(
                 &mut fb,
-                block.label,
-                &block.term,
+                codegen_block.label,
+                &codegen_block.term,
                 &exec_blocks,
                 &runtime_block_param_names,
                 &full_block_param_names,
@@ -8763,7 +8822,7 @@ fn build_cranelift_run_bb_specialized_function(
                 is_true_ref,
                 pyobject_to_i64_ref,
                 raise_exc_ref,
-                block.exception_param(),
+                codegen_block.exception_param(),
             )?;
             continue;
         }
