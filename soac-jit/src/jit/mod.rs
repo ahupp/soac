@@ -37,6 +37,7 @@ use std::mem::offset_of;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
+use tracing::info;
 
 unsafe extern "C" {
     static mut PyFunction_Type: ffi::PyTypeObject;
@@ -1403,6 +1404,7 @@ struct JitEmitCtx<'mc> {
     tuple_new_ref: ir::FuncRef,
     tuple_set_item_ref: ir::FuncRef,
     stack_slots: StackSlots,
+    direct_edge_stats: &'mc DirectEdgeStats,
     direct_call_target_functions: &'mc HashMap<FunctionId, BlockPyFunction<CodegenModuleShape>>,
     direct_call_functions: &'mc HashMap<FunctionId, DeclaredJitFunction>,
     call_target_counter_ids: &'mc HashMap<InstrId, CounterId>,
@@ -1453,6 +1455,95 @@ struct DirectConstructorSpecialization {
     init_function: ObjPtr,
     owner_type: *mut ffi::PyTypeObject,
     type_version: u32,
+}
+
+#[derive(Default)]
+struct DirectEdgeStats {
+    clif_direct_edges: Cell<usize>,
+    function_env_indirect_edges: Cell<usize>,
+    call_direct_missing_target_fallbacks: Cell<usize>,
+    call_direct_unsupported_shape_fallbacks: Cell<usize>,
+    guarded_generic_fallback_blocks: Cell<usize>,
+    profiled_missing_target_candidates: Cell<usize>,
+    profiled_arity_mismatch_candidates: Cell<usize>,
+}
+
+impl DirectEdgeStats {
+    fn increment(cell: &Cell<usize>) {
+        cell.set(cell.get() + 1);
+    }
+
+    fn record_resolved_direct_edge(&self, uses_clif_direct_call: bool) {
+        if uses_clif_direct_call {
+            Self::increment(&self.clif_direct_edges);
+        } else {
+            Self::increment(&self.function_env_indirect_edges);
+        }
+    }
+
+    fn record_call_direct_missing_target_fallback(&self) {
+        Self::increment(&self.call_direct_missing_target_fallbacks);
+    }
+
+    fn record_call_direct_unsupported_shape_fallback(&self) {
+        Self::increment(&self.call_direct_unsupported_shape_fallbacks);
+    }
+
+    fn record_guarded_generic_fallback_block(&self) {
+        Self::increment(&self.guarded_generic_fallback_blocks);
+    }
+
+    fn record_profiled_missing_target_candidate(&self) {
+        Self::increment(&self.profiled_missing_target_candidates);
+    }
+
+    fn record_profiled_arity_mismatch_candidate(&self) {
+        Self::increment(&self.profiled_arity_mismatch_candidates);
+    }
+
+    fn total(&self) -> usize {
+        self.clif_direct_edges.get()
+            + self.function_env_indirect_edges.get()
+            + self.call_direct_missing_target_fallbacks.get()
+            + self.call_direct_unsupported_shape_fallbacks.get()
+            + self.guarded_generic_fallback_blocks.get()
+            + self.profiled_missing_target_candidates.get()
+            + self.profiled_arity_mismatch_candidates.get()
+    }
+
+    fn emit_trace(&self, module_name: &str, function: &BlockPyFunction<CodegenModuleShape>) {
+        if self.total() == 0 {
+            return;
+        }
+        let clif_direct_edges = self.clif_direct_edges.get();
+        let function_env_indirect_edges = self.function_env_indirect_edges.get();
+        let call_direct_missing_target_fallbacks = self.call_direct_missing_target_fallbacks.get();
+        let call_direct_unsupported_shape_fallbacks =
+            self.call_direct_unsupported_shape_fallbacks.get();
+        let guarded_generic_fallback_blocks = self.guarded_generic_fallback_blocks.get();
+        let profiled_missing_target_candidates = self.profiled_missing_target_candidates.get();
+        let profiled_arity_mismatch_candidates = self.profiled_arity_mismatch_candidates.get();
+        let generic_fallback_edges = call_direct_missing_target_fallbacks
+            + call_direct_unsupported_shape_fallbacks
+            + guarded_generic_fallback_blocks
+            + profiled_missing_target_candidates
+            + profiled_arity_mismatch_candidates;
+        info!(
+            target: "soac_jit_direct_edges",
+            module = module_name,
+            function_id = %function.function_id,
+            qualname = %function.names.qualname,
+            clif_direct_edges,
+            function_env_indirect_edges,
+            generic_fallback_edges,
+            call_direct_missing_target_fallbacks,
+            call_direct_unsupported_shape_fallbacks,
+            guarded_generic_fallback_blocks,
+            profiled_missing_target_candidates,
+            profiled_arity_mismatch_candidates,
+            "soac_jit_direct_edges"
+        );
+    }
 }
 
 fn direct_call_target_function<'a>(
@@ -2527,9 +2618,13 @@ fn direct_method_specializations_for_call_site(
     let mut out = Vec::new();
     for function_id in targets.iter().copied() {
         let Some(target_function) = direct_call_target_function(ctx, function_id) else {
+            ctx.direct_edge_stats
+                .record_profiled_missing_target_candidate();
             continue;
         };
         if call.args.len() + 1 != target_function.params.len() {
+            ctx.direct_edge_stats
+                .record_profiled_arity_mismatch_candidate();
             continue;
         }
         let Ok(owner_types) =
@@ -2567,9 +2662,13 @@ fn direct_constructor_specializations_for_call_site(
     let mut out = Vec::new();
     for function_id in targets.iter().copied() {
         let Some(target_function) = direct_call_target_function(ctx, function_id) else {
+            ctx.direct_edge_stats
+                .record_profiled_missing_target_candidate();
             continue;
         };
         if call.args.len() + 1 != target_function.params.len() {
+            ctx.direct_edge_stats
+                .record_profiled_arity_mismatch_candidate();
             continue;
         }
         let Ok(owner_types) =
@@ -3042,6 +3141,8 @@ fn emit_direct_call_resolved_raw_with_arg_values(
         .direct_call_functions
         .get(&target_function.function_id)
         .map(|function| function.func_id);
+    ctx.direct_edge_stats
+        .record_resolved_direct_edge(direct_func_id.is_some());
 
     let direct_load =
         emit_direct_function_env_load_or_slow_path(fb, callable, ctx, direct_func_id.is_none());
@@ -3303,6 +3404,8 @@ fn emit_call_direct_expr(
     };
 
     let Some(target_function) = direct_call_target_function(ctx, call.function_id) else {
+        ctx.direct_edge_stats
+            .record_call_direct_missing_target_fallback();
         return fallback();
     };
 
@@ -3313,6 +3416,8 @@ fn emit_call_direct_expr(
             .iter()
             .all(|arg| matches!(arg, CallArgPositional::Positional(_)));
     if !supports_direct_call {
+        ctx.direct_edge_stats
+            .record_call_direct_unsupported_shape_fallback();
         return fallback();
     }
 
@@ -4467,9 +4572,16 @@ fn emit_codegen_expr(
                             .iter()
                             .copied()
                             .filter_map(|function_id| {
-                                let target_function =
-                                    direct_call_target_function(ctx, function_id)?;
+                                let Some(target_function) =
+                                    direct_call_target_function(ctx, function_id)
+                                else {
+                                    ctx.direct_edge_stats
+                                        .record_profiled_missing_target_candidate();
+                                    return None;
+                                };
                                 if args.len() != target_function.params.len() {
+                                    ctx.direct_edge_stats
+                                        .record_profiled_arity_mismatch_candidate();
                                     return None;
                                 }
                                 Some(function_id)
@@ -4636,6 +4748,8 @@ fn emit_codegen_expr(
                         }
 
                         fb.switch_to_block(generic_block);
+                        ctx.direct_edge_stats
+                            .record_guarded_generic_fallback_block();
                         if let Some(counter_id) = direct_fallback_counter_id {
                             let _ = emit_increment_counter(fb, counter_id, ctx);
                         }
@@ -6893,6 +7007,7 @@ fn build_cranelift_run_bb_specialized_function(
     ctx.func.signature = main_sig;
     let mut builder_ctx = FunctionBuilderContext::new();
     let mut block_annotations = ClifBlockDisplayAnnotations::new();
+    let direct_edge_stats = DirectEdgeStats::default();
     {
         let mut fb = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
         let entry_block = fb.create_block();
@@ -7411,6 +7526,7 @@ fn build_cranelift_run_bb_specialized_function(
                 tuple_new_ref,
                 tuple_set_item_ref,
                 stack_slots: stack_slots.clone(),
+                direct_edge_stats: &direct_edge_stats,
                 direct_call_target_functions: &direct_call_target_functions,
                 direct_call_functions,
                 call_target_counter_ids: &call_target_counter_ids,
@@ -7575,6 +7691,12 @@ fn build_cranelift_run_bb_specialized_function(
         fb.seal_all_blocks();
         fb.finalize();
     }
+    direct_edge_stats.emit_trace(
+        direct_call_resolver
+            .map(|shared_state| shared_state.module_name.as_str())
+            .unwrap_or("<standalone>"),
+        function,
+    );
 
     Ok(BuiltSpecializedFunction {
         ctx,

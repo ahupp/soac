@@ -43,6 +43,9 @@ and recursion behavior.
 - `FunctionEnv.direct_code_ptr` remains the runtime lazy-call fallback for
   direct edges that cannot use a predeclared CLIF symbol in the current batch.
 - Vectorcall trampolines are process-JIT functions reused by arity.
+- Codegen emits `soac_jit_direct_edges` tracing summaries for direct-edge
+  decisions: CLIF direct calls, `FunctionEnv.direct_code_ptr` indirect calls,
+  and generic-fallback reasons.
 
 ## Migration Steps
 
@@ -64,11 +67,10 @@ Status: implemented inside each process-JIT compile batch. The batch
 collector finds reachable direct targets, declares all functions first, and
 then defines bodies.
 
-Next refinement:
+Implemented refinement:
 
-- make the collected batch and skipped targets observable so we can explain
-  why an edge used a CLIF direct call, `FunctionEnv.direct_code_ptr`, or the
-  generic Python call fallback
+- compile-time tracing now explains why an edge used a CLIF direct call,
+  `FunctionEnv.direct_code_ptr`, or the generic Python call fallback
 
 The hard invariant should become:
 
@@ -209,23 +211,18 @@ isolated quickly.
    - Thread the current `Arc<CompileSession>` into any remaining production
      compile or direct-target lookup path.
 
-2. Add process-JIT edge observability.
-   - Count edges emitted as CLIF direct calls.
-   - Count edges using `FunctionEnv.direct_code_ptr`.
-   - Count edges falling back to generic Python calls and record the reason.
-
-3. Tighten recursion and cross-module tests.
+2. Tighten recursion and cross-module tests.
    - Recursive direct call in one module.
    - Mutually-recursive direct calls in one module.
    - Cross-module direct call where the callee is found through the
      `CompileSession` retained-state registry.
 
-4. Remove the temporary indirect direct-call path once the batch collector
+3. Remove the temporary indirect direct-call path once the batch collector
    reliably covers all supported direct edges.
    - After that, supported direct edges should be CLIF `call`; unsupported
      edges should go through the generic Python call fallback.
 
-5. Benchmark before inlining.
+4. Benchmark before inlining.
    - Measure direct-call heavy workloads before changing the inliner.
    - Record any finalized performance result in `docs/CODEX_OPT_LOG.md`.
 
