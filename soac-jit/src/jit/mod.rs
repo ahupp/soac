@@ -3643,8 +3643,6 @@ fn emit_positional_vectorcall(
     jit_module: &mut JITModule,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> ir::Value {
-    let ptr_ty = ctx.consts.ptr_ty;
-    let null_ptr = fb.ins().iconst(ptr_ty, 0);
     let mut arg_values: Vec<ir::Value> = Vec::with_capacity(args.len());
     let mut arg_borrowed: Vec<bool> = Vec::with_capacity(args.len());
     for arg in args {
@@ -3666,67 +3664,14 @@ fn emit_positional_vectorcall(
             func_imports,
         ));
     }
-    let args_ptr = if arg_values.is_empty() {
-        null_ptr
-    } else {
-        let args_slot = fb.create_sized_stack_slot(ir::StackSlotData::new(
-            ir::StackSlotKind::ExplicitSlot,
-            (arg_values.len() * std::mem::size_of::<u64>()) as u32,
-            0,
-        ));
-        for (index, value) in arg_values.iter().copied().enumerate() {
-            fb.ins().stack_store(
-                value,
-                args_slot,
-                (index * std::mem::size_of::<u64>()) as i32,
-            );
-        }
-        fb.ins().stack_addr(ptr_ty, args_slot, 0)
-    };
-    let nargsf = fb.ins().iconst(ptr_ty, arg_values.len() as i64);
-    let call_inst = fb.ins().call(
-        ctx.py_vectorcall_ref,
-        &[callable, args_ptr, nargsf, null_ptr],
-    );
-    let call_value = fb.inst_results(call_inst)[0];
-    let call_is_null = fb
-        .ins()
-        .icmp(ir::condcodes::IntCC::Equal, call_value, null_ptr);
-    let call_null_block = fb.create_block();
-    let call_ok_block = fb.create_block();
-    fb.append_block_param(call_ok_block, ptr_ty);
-    fb.ins().brif(
-        call_is_null,
-        call_null_block,
-        &[],
-        call_ok_block,
-        &[ir::BlockArg::Value(call_value)],
-    );
-
-    fb.switch_to_block(call_null_block);
-    let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
-    for (value, borrowed_arg) in arg_values.iter().copied().zip(arg_borrowed.iter().copied()) {
-        if !borrowed_arg {
-            fb.ins().call(ctx.decref_ref, &[value]);
-        }
-    }
-    if !callable_is_borrowed {
-        fb.ins().call(ctx.decref_ref, &[callable]);
-    }
-    emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
-    fb.ins()
-        .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
-
-    fb.switch_to_block(call_ok_block);
-    for (value, borrowed_arg) in arg_values.into_iter().zip(arg_borrowed.into_iter()) {
-        if !borrowed_arg {
-            fb.ins().call(ctx.decref_ref, &[value]);
-        }
-    }
-    if !callable_is_borrowed {
-        fb.ins().call(ctx.decref_ref, &[callable]);
-    }
-    fb.block_params(call_ok_block)[0]
+    emit_positional_vectorcall_with_arg_values(
+        fb,
+        callable,
+        callable_is_borrowed,
+        arg_values,
+        arg_borrowed,
+        ctx,
+    )
 }
 
 fn emit_positional_vectorcall_with_local_env(
@@ -3739,8 +3684,6 @@ fn emit_positional_vectorcall_with_local_env(
     jit_module: &mut JITModule,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> ir::Value {
-    let ptr_ty = ctx.consts.ptr_ty;
-    let null_ptr = fb.ins().iconst(ptr_ty, 0);
     let mut arg_values: Vec<ir::Value> = Vec::with_capacity(args.len());
     let mut arg_borrowed: Vec<bool> = Vec::with_capacity(args.len());
     for arg in args {
@@ -3761,6 +3704,27 @@ fn emit_positional_vectorcall_with_local_env(
             func_imports,
         ));
     }
+    emit_positional_vectorcall_with_arg_values(
+        fb,
+        callable,
+        callable_is_borrowed,
+        arg_values,
+        arg_borrowed,
+        ctx,
+    )
+}
+
+fn emit_positional_vectorcall_with_arg_values(
+    fb: &mut FunctionBuilder<'_>,
+    callable: ir::Value,
+    callable_is_borrowed: bool,
+    arg_values: Vec<ir::Value>,
+    arg_borrowed: Vec<bool>,
+    ctx: &JitEmitCtx<'_>,
+) -> ir::Value {
+    debug_assert_eq!(arg_values.len(), arg_borrowed.len());
+    let ptr_ty = ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
     let args_ptr = if arg_values.is_empty() {
         null_ptr
     } else {
