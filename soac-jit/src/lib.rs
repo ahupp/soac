@@ -1422,29 +1422,17 @@ unsafe fn ensure_clif_vectorcall_compiled(
                     Some(data.module_state.as_ref()),
                 );
                 match compile_result {
-                    Ok(handle) => {
-                        data.module_state.append_jit_codegen_log(
-                            &function,
-                            "vectorcall_function_body",
-                            compile_start.elapsed(),
-                            "ok",
-                            None,
-                        );
-                        match jit::CompiledFunctionHandle::from_raw(handle) {
-                            Ok(handle) => Arc::new(handle),
-                            Err(err) => {
-                                if let Ok(c_msg) = CString::new(err) {
-                                    ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
-                                } else {
-                                    ffi::PyErr_SetString(
-                                        ffi::PyExc_RuntimeError,
-                                        b"invalid compiled CLIF function handle\0".as_ptr()
-                                            as *const i8,
-                                    );
-                                }
-                                return Err(());
-                            }
+                    Ok(result) => {
+                        if result.compiled {
+                            data.module_state.append_jit_codegen_log(
+                                &function,
+                                "vectorcall_function_body",
+                                compile_start.elapsed(),
+                                "ok",
+                                None,
+                            );
                         }
+                        result.handle
                     }
                     Err(err) => {
                         data.module_state.append_jit_codegen_log(

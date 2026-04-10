@@ -252,10 +252,19 @@ mod tests {
             .expect("same shape should reuse declaration");
         assert_eq!(first_decl.symbol, first_decl_again.symbol);
 
-        state
-            .mark_direct_function_ready(first.function_id, 1usize as *const u8, first.params.len())
+        let session = std::sync::Arc::new(crate::session::CompileSession::new());
+        let first_handle = state
+            .mark_direct_function_ready(
+                &session,
+                first.function_id,
+                1usize as *const u8,
+                first.params.len(),
+            )
             .expect("first function should mark ready");
-        assert!(state.ready_direct_function(&first).is_some());
+        let ready_handle = state
+            .ready_direct_function(&first)
+            .expect("first function should be ready");
+        assert!(std::sync::Arc::ptr_eq(&first_handle, &ready_handle));
         assert!(state.ready_direct_function(&second).is_none());
 
         let second_decl = state
@@ -1081,7 +1090,9 @@ def f():
                     Some(shared_state.as_ref()),
                 )
                 .expect("direct counter test function should compile");
-                let (code_ptr, param_count) = compiled_direct_runner_info(compiled_handle)
+                let (code_ptr, param_count) = compiled_handle
+                    .handle
+                    .direct_runner_info()
                     .expect("compiled direct runner should expose entrypoint");
                 assert_eq!(param_count, 0, "test function should not take direct args");
                 let entry: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
@@ -1107,7 +1118,6 @@ def f():
 
                 ffi::Py_DECREF(result1.cast());
                 ffi::Py_DECREF(result2.cast());
-                free_cranelift_run_bb_specialized_cached(compiled_handle);
             });
         }
     }
@@ -1216,7 +1226,9 @@ def f(x):
                     Some(shared_state.as_ref()),
                 )
                 .expect("direct refcount counter test function should compile");
-                let (code_ptr, param_count) = compiled_direct_runner_info(compiled_handle)
+                let (code_ptr, param_count) = compiled_handle
+                    .handle
+                    .direct_runner_info()
                     .expect("compiled direct runner should expose entrypoint");
                 assert_eq!(param_count, 1, "test function should take one direct arg");
                 let entry: unsafe extern "C" fn(
@@ -1252,7 +1264,6 @@ def f(x):
 
                 ffi::Py_DECREF(result1.cast());
                 ffi::Py_DECREF(result2.cast());
-                free_cranelift_run_bb_specialized_cached(compiled_handle);
             });
         }
     }

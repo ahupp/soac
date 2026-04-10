@@ -527,8 +527,7 @@ enum ProcessJitFunctionEntry {
     Ready {
         declared: DeclaredJitFunction,
         shape: ProcessJitFunctionShape,
-        code_ptr: usize,
-        param_count: usize,
+        compiled_handle: Arc<CompiledFunctionHandle>,
     },
 }
 
@@ -561,14 +560,13 @@ impl ProcessJitFunctionEntry {
         }
     }
 
-    fn ready_entry(&self) -> Option<(DeclaredJitFunction, *const u8, usize)> {
+    fn ready_entry(&self) -> Option<(DeclaredJitFunction, Arc<CompiledFunctionHandle>)> {
         match self {
             Self::Ready {
                 declared,
-                code_ptr,
-                param_count,
+                compiled_handle,
                 ..
-            } => Some((declared.clone(), *code_ptr as *const u8, *param_count)),
+            } => Some((declared.clone(), Arc::clone(compiled_handle))),
             Self::Declared { .. } => None,
         }
     }
@@ -617,19 +615,20 @@ impl ProcessJitState {
     fn ready_direct_function(
         &self,
         function: &BlockPyFunction<CodegenModuleShape>,
-    ) -> Option<(DeclaredJitFunction, *const u8, usize)> {
+    ) -> Option<Arc<CompiledFunctionHandle>> {
         let entry = self.direct_functions.get(&function.function_id)?;
         (entry.shape() == &ProcessJitFunctionShape::for_function(function))
-            .then(|| entry.ready_entry())
+            .then(|| entry.ready_entry().map(|(_, handle)| handle))
             .flatten()
     }
 
     fn mark_direct_function_ready(
         &mut self,
+        session: &Arc<crate::session::CompileSession>,
         function_id: FunctionId,
         code_ptr: *const u8,
         param_count: usize,
-    ) -> Result<(), String> {
+    ) -> Result<Arc<CompiledFunctionHandle>, String> {
         let Some(entry) = self.direct_functions.get(&function_id) else {
             return Err(format!(
                 "process JIT function {function_id} was defined before declaration"
@@ -637,16 +636,20 @@ impl ProcessJitState {
         };
         let declared = entry.declared();
         let shape = entry.shape().clone();
+        let compiled_handle = Arc::new(CompiledFunctionHandle::from_direct_entry(
+            session,
+            code_ptr,
+            param_count,
+        ));
         self.direct_functions.insert(
             function_id,
             ProcessJitFunctionEntry::Ready {
                 declared,
                 shape,
-                code_ptr: code_ptr as usize,
-                param_count,
+                compiled_handle: Arc::clone(&compiled_handle),
             },
         );
-        Ok(())
+        Ok(compiled_handle)
     }
 }
 
@@ -661,17 +664,30 @@ pub(crate) struct CompiledFunctionHandle {
     handle: ObjPtr,
 }
 
+pub(crate) struct DirectFunctionCompileResult {
+    pub(crate) handle: Arc<CompiledFunctionHandle>,
+    pub(crate) compiled: bool,
+}
+
 // The handle points to an immutable compiled runner after construction. The code memory is kept
 // alive by the runner owner, and the raw handle is freed only when the final Arc drops this wrapper.
 unsafe impl Send for CompiledFunctionHandle {}
 unsafe impl Sync for CompiledFunctionHandle {}
 
 impl CompiledFunctionHandle {
-    pub(crate) fn from_raw(handle: ObjPtr) -> Result<Self, String> {
-        if handle.is_null() {
-            return Err("invalid null compiled function handle".to_string());
+    fn from_direct_entry(
+        session: &Arc<crate::session::CompileSession>,
+        code_ptr: *const u8,
+        param_count: usize,
+    ) -> Self {
+        Self {
+            handle: new_compiled_direct_runner_handle(session, code_ptr, param_count),
         }
-        Ok(Self { handle })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn direct_runner_info(&self) -> Result<(*const u8, usize), String> {
+        compiled_direct_runner_info(self.handle)
     }
 
     pub(crate) fn direct_code_ptr(&self) -> Result<ObjPtr, String> {
@@ -5655,18 +5671,17 @@ impl ProcessJitEngine {
         module_constant_ptrs: &[*mut ffi::PyObject],
         counter_ptrs: &[*mut u64],
         direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
-    ) -> Result<ObjPtr, String> {
+    ) -> Result<DirectFunctionCompileResult, String> {
         let batch_functions = collect_process_jit_batch_functions(function, direct_call_resolver)?;
         let mut state = self
             .state
             .lock()
             .map_err(|_| "process JIT module lock poisoned".to_string())?;
-        if let Some((_declared, code_ptr, param_count)) = state.ready_direct_function(function) {
-            return Ok(new_compiled_direct_runner_handle(
-                session,
-                code_ptr,
-                param_count,
-            ));
+        if let Some(compiled_handle) = state.ready_direct_function(function) {
+            return Ok(DirectFunctionCompileResult {
+                handle: compiled_handle,
+                compiled: false,
+            });
         }
         let _guard = ProcessJitCompileGuard::enter();
         let mut predeclared = HashMap::new();
@@ -5741,7 +5756,12 @@ impl ProcessJitEngine {
         let mut root_handle = None;
         for defined in defined_functions {
             let code_ptr = state.jit_module.get_finalized_function(defined.main_id);
-            state.mark_direct_function_ready(defined.function_id, code_ptr, defined.param_count)?;
+            let compiled_handle = state.mark_direct_function_ready(
+                session,
+                defined.function_id,
+                code_ptr,
+                defined.param_count,
+            )?;
             let code_id = jitdump::record_code_load(
                 &defined.main_symbol,
                 code_ptr.cast::<u8>(),
@@ -5756,20 +5776,19 @@ impl ProcessJitEngine {
                 defined.function_id,
                 &defined.function_qualname,
             );
-            let handle = new_compiled_direct_runner_handle(session, code_ptr, defined.param_count);
             if defined.function_id == function.function_id {
-                root_handle = Some(handle);
-            } else if let Some(shared_state) = direct_call_resolver {
-                shared_state.store_compiled_direct_runner_handle(defined.function_id, handle)?;
-            } else {
-                free_cranelift_run_bb_specialized_cached(handle);
+                root_handle = Some(compiled_handle);
             }
         }
-        root_handle.ok_or_else(|| {
+        let handle = root_handle.ok_or_else(|| {
             format!(
                 "process JIT batch did not define root function {} id={}",
                 function.names.qualname, function.function_id
             )
+        })?;
+        Ok(DirectFunctionCompileResult {
+            handle,
+            compiled: true,
         })
     }
 }
@@ -7521,7 +7540,7 @@ fn render_compiled_clif_and_vcode_disasm(
     Ok((clif, cfg_dot, vcode_disasm))
 }
 
-pub unsafe fn compile_cranelift_run_bb_specialized_cached(
+pub(crate) unsafe fn compile_cranelift_run_bb_specialized_cached(
     compile_session: &Arc<crate::session::CompileSession>,
     blocks: &[ObjPtr],
     module: &BlockPyModule<CodegenModuleShape>,
@@ -7531,7 +7550,7 @@ pub unsafe fn compile_cranelift_run_bb_specialized_cached(
     module_constant_ptrs: &[*mut ffi::PyObject],
     counter_ptrs: &[*mut u64],
     direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
-) -> Result<ObjPtr, String> {
+) -> Result<DirectFunctionCompileResult, String> {
     unsafe {
         compile_session.process_jit()?.compile_direct_function(
             compile_session,

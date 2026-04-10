@@ -65,13 +65,6 @@ pub struct SharedModuleState {
     counter_slots_by_id: Box<[CounterRuntimeSlot]>,
     counter_values: Box<[u64]>,
     top_value_counters: Box<[Mutex<Counter<2, u64>>]>,
-    compiled_direct_runner_handles: Mutex<HashMap<FunctionId, DirectRunnerCacheEntry>>,
-}
-
-#[derive(Clone)]
-enum DirectRunnerCacheEntry {
-    InProgress,
-    Ready(Arc<crate::jit::CompiledFunctionHandle>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -199,6 +192,9 @@ impl SharedModuleState {
         &self,
         function_id: FunctionId,
     ) -> Result<Option<Arc<crate::jit::CompiledFunctionHandle>>, String> {
+        if function_id == FunctionId::global() {
+            return Ok(None);
+        }
         if function_id != FunctionId::global() && function_id.module_id() != self.module_id() {
             let Some(shared_state) = crate::session::CompileSession::process()
                 .shared_module_state_for_function_id(function_id)?
@@ -207,23 +203,8 @@ impl SharedModuleState {
             };
             return shared_state.lookup_or_compile_direct_function_handle(function_id);
         }
-        {
-            let mut cache = self
-                .compiled_direct_runner_handles
-                .lock()
-                .map_err(|_| "compiled direct runner cache lock poisoned".to_string())?;
-            match cache.get(&function_id).cloned() {
-                Some(DirectRunnerCacheEntry::Ready(handle)) => {
-                    return Ok(Some(handle));
-                }
-                Some(DirectRunnerCacheEntry::InProgress) => return Ok(None),
-                None => {
-                    if crate::jit::process_jit_is_currently_compiling() {
-                        return Ok(None);
-                    }
-                    cache.insert(function_id, DirectRunnerCacheEntry::InProgress);
-                }
-            }
+        if crate::jit::process_jit_is_currently_compiling() {
+            return Ok(None);
         }
         let function = self
             .lookup_function(function_id)
@@ -247,23 +228,20 @@ impl SharedModuleState {
                 Some(self),
             )
         };
-        let handle = match compile_result {
-            Ok(handle) => {
-                self.append_jit_codegen_log(
-                    &function,
-                    "direct_function_body",
-                    compile_start.elapsed(),
-                    "ok",
-                    None,
-                );
-                handle
+        match compile_result {
+            Ok(result) => {
+                if result.compiled {
+                    self.append_jit_codegen_log(
+                        &function,
+                        "direct_function_body",
+                        compile_start.elapsed(),
+                        "ok",
+                        None,
+                    );
+                }
+                Ok(Some(result.handle))
             }
             Err(err) => {
-                let mut cache = self
-                    .compiled_direct_runner_handles
-                    .lock()
-                    .map_err(|_| "compiled direct runner cache lock poisoned".to_string())?;
-                cache.remove(&function_id);
                 self.append_jit_codegen_log(
                     &function,
                     "direct_function_body",
@@ -275,51 +253,6 @@ impl SharedModuleState {
                     "{err} [direct_target={} id={}]",
                     function.names.qualname, function.function_id
                 ));
-            }
-        };
-        let handle_owner = match crate::jit::CompiledFunctionHandle::from_raw(handle) {
-            Ok(handle_owner) => Arc::new(handle_owner),
-            Err(err) => {
-                let mut cache = self
-                    .compiled_direct_runner_handles
-                    .lock()
-                    .map_err(|_| "compiled direct runner cache lock poisoned".to_string())?;
-                cache.remove(&function_id);
-                return Err(err);
-            }
-        };
-        let mut cache = self
-            .compiled_direct_runner_handles
-            .lock()
-            .map_err(|_| "compiled direct runner cache lock poisoned".to_string())?;
-        cache.insert(
-            function_id,
-            DirectRunnerCacheEntry::Ready(Arc::clone(&handle_owner)),
-        );
-        Ok(Some(handle_owner))
-    }
-
-    pub(crate) fn store_compiled_direct_runner_handle(
-        &self,
-        function_id: FunctionId,
-        handle: *mut c_void,
-    ) -> Result<Arc<crate::jit::CompiledFunctionHandle>, String> {
-        let handle_owner = Arc::new(crate::jit::CompiledFunctionHandle::from_raw(handle)?);
-        let mut cache = self
-            .compiled_direct_runner_handles
-            .lock()
-            .map_err(|_| "compiled direct runner cache lock poisoned".to_string())?;
-        match cache.get(&function_id).cloned() {
-            Some(DirectRunnerCacheEntry::Ready(existing)) => {
-                drop(handle_owner);
-                Ok(existing)
-            }
-            Some(DirectRunnerCacheEntry::InProgress) | None => {
-                cache.insert(
-                    function_id,
-                    DirectRunnerCacheEntry::Ready(Arc::clone(&handle_owner)),
-                );
-                Ok(handle_owner)
             }
         }
     }
@@ -469,16 +402,6 @@ impl SharedModuleState {
     }
 }
 
-impl Drop for SharedModuleState {
-    fn drop(&mut self) {
-        let cache = self
-            .compiled_direct_runner_handles
-            .get_mut()
-            .expect("compiled direct runner cache lock should not be poisoned during drop");
-        cache.clear();
-    }
-}
-
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) unsafe fn record_top_value_sample_counter_ptr(
     counter: *mut c_void,
@@ -606,7 +529,6 @@ pub fn build_shared_state_for_inspection(
         counter_slots_by_id,
         counter_values,
         top_value_counters,
-        compiled_direct_runner_handles: Mutex::new(HashMap::new()),
     }))
 }
 
@@ -683,7 +605,6 @@ impl SoacExtModuleState {
             counter_slots_by_id,
             counter_values,
             top_value_counters,
-            compiled_direct_runner_handles: Mutex::new(HashMap::new()),
         });
         compile_session
             .retain_shared_module_state(shared_state.clone())
@@ -1297,7 +1218,6 @@ def f():
             lowered_module: lowered,
             module_name: "counter_test".to_string(),
             package_name: String::new(),
-            compiled_direct_runner_handles: Mutex::new(HashMap::new()),
             original_code_by_function_id: HashMap::new(),
         };
 
@@ -1412,7 +1332,6 @@ def f():
             lowered_module: lowered,
             module_name: "counter_test".to_string(),
             package_name: "pkg".to_string(),
-            compiled_direct_runner_handles: Mutex::new(HashMap::new()),
             original_code_by_function_id: HashMap::new(),
         };
 
