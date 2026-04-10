@@ -408,6 +408,7 @@ x = {k: v for k, v in it}
 #                         StoreName("k", GetItem(_dp_unpack_10, 0))
 #                         StoreName("v", GetItem(_dp_unpack_10, 1))
 #                         Del { name: "_dp_unpack_10", quietly: false }
+#                         Del { name: "_dp_assign_value_9", quietly: false }
 #                         Del { name: "_dp_tmp_0_1_1", quietly: false }
 #                         jump bb5
 #                         block bb5:
@@ -417,6 +418,9 @@ x = {k: v for k, v in it}
 #                             StoreName("_dp_assign_obj_7", load_deleted_name("_dp_tmp_1", _dp_tmp_1))
 #                             StoreName("_dp_assign_index_8", _dp_dictcomp_key_2)
 #                             SetItem(_dp_assign_obj_7, _dp_assign_index_8, _dp_assign_value_6)
+#                             Del { name: "_dp_assign_index_8", quietly: false }
+#                             Del { name: "_dp_assign_obj_7", quietly: false }
+#                             Del { name: "_dp_assign_value_6", quietly: false }
 #                             jump bb1
 
 # function _dp_module_init():

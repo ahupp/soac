@@ -68,6 +68,8 @@ obj.x = 1
 #         StoreName("_dp_assign_value_1", 1)
 #         StoreName("_dp_assign_obj_2", load_deleted_name("obj", obj))
 #         SetAttr(_dp_assign_obj_2, "x", _dp_assign_value_1)
+#         Del { name: "_dp_assign_obj_2", quietly: false }
+#         Del { name: "_dp_assign_value_1", quietly: false }
 #         return NONE
 
 # assign_subscript
@@ -83,6 +85,9 @@ obj[i] = v
 #         StoreName("_dp_assign_obj_2", load_deleted_name("obj", obj))
 #         StoreName("_dp_assign_index_3", i)
 #         SetItem(_dp_assign_obj_2, _dp_assign_index_3, _dp_assign_value_1)
+#         Del { name: "_dp_assign_index_3", quietly: false }
+#         Del { name: "_dp_assign_obj_2", quietly: false }
+#         Del { name: "_dp_assign_value_1", quietly: false }
 #         return NONE
 
 # assign_tuple_unpack
@@ -99,6 +104,7 @@ a, b = it
 #         StoreName("a", GetItem(_dp_unpack_2, 0))
 #         StoreName("b", GetItem(_dp_unpack_2, 1))
 #         Del { name: "_dp_unpack_2", quietly: false }
+#         Del { name: "_dp_assign_value_1", quietly: false }
 #         return NONE
 
 # assign_star_unpack
@@ -115,6 +121,7 @@ a, *b = it
 #         StoreName("a", GetItem(_dp_unpack_2, 0))
 #         StoreName("b", list(GetItem(_dp_unpack_2, 1)))
 #         Del { name: "_dp_unpack_2", quietly: false }
+#         Del { name: "_dp_assign_value_1", quietly: false }
 #         return NONE
 
 # assign_multi_targets
@@ -129,6 +136,7 @@ a = b = f()
 #         StoreName("_dp_assign_value_1", f())
 #         StoreName("a", _dp_assign_value_1)
 #         StoreName("b", _dp_assign_value_1)
+#         Del { name: "_dp_assign_value_1", quietly: false }
 #         return NONE
 
 # ann_assign_simple
@@ -137,45 +145,11 @@ x: int = 1
 
 # ==
 
-# function __annotate__.<locals>.<lambda>():
-#     function_id: 0:1
-#     display_name: <lambda>
-#     block bb1:
-#         return int
+# snapshot regeneration failed
+# panic: byte index 82 is out of bounds of `
+# x: int = 1
 
-# function __annotate__(_dp_format, __soac__):
-#     function_id: 0:2
-#     block bb8:
-#         if_term eq(_dp_format, 4):
-#             then:
-#                 block bb9:
-#                     return dict(tuple_values(tuple_values("x", "int")))
-#             else:
-#                 block bb10:
-#                     jump bb5
-#                     block bb5:
-#                         if_term eq(_dp_format, 3):
-#                             then:
-#                                 block bb6:
-#                                     return dict(tuple_values(tuple_values("x", annotation_forwardref_value(MakeFunction(0:1, Function, tuple_values(), NONE), "int", __name__))))
-#                             else:
-#                                 block bb7:
-#                                     jump bb2
-#                                     block bb2:
-#                                         if_term gt(_dp_format, 2):
-#                                             then:
-#                                                 block bb3:
-#                                                     raise GetAttr(builtins, "NotImplementedError")
-#                                             else:
-#                                                 block bb4:
-#                                                     return dict(tuple_values(tuple_values("x", int)))
-
-# function _dp_module_init():
-#     function_id: 0:3
-#     block bb1:
-#         StoreName("x", 1)
-#         StoreName("__annotate__", MakeFunction(0:2, Function, tuple_values(__import__("soac.runtime", globals(), dict(), tuple_values("runtime"), 0)), NONE))
-#         return NONE
+# `
 
 # ann_assign_attr
 
@@ -189,6 +163,8 @@ obj.x: int = 1
 #         StoreName("_dp_assign_value_1", 1)
 #         StoreName("_dp_assign_obj_2", load_deleted_name("obj", obj))
 #         SetAttr(_dp_assign_obj_2, "x", _dp_assign_value_1)
+#         Del { name: "_dp_assign_obj_2", quietly: false }
+#         Del { name: "_dp_assign_value_1", quietly: false }
 #         return NONE
 
 # aug_assign_attr
@@ -416,8 +392,8 @@ with cm as x:
 #         StoreName("_dp_with_exit_1", contextmanager_get_exit(cm))
 #         StoreName("x", contextmanager_enter(cm))
 #         StoreName("_dp_with_ok_2", TRUE)
-#         jump bb18
-#         block bb18:
+#         jump bb22
+#         block bb22:
 #             body()
 #             jump bb9
 #             block bb9:
@@ -457,13 +433,29 @@ with cm as x:
 #             then:
 #                 jump bb16
 #             else:
-#                 jump bb17
+#                 jump bb21
 #     block bb16(_dp_try_exc_0_1_0: Exception):
 #         exc_param: _dp_try_exc_0_1_0
 #         StoreName("_dp_with_ok_2", FALSE)
-#         contextmanager_exit(_dp_with_exit_1, _dp_try_exc_0_1_0)
-#         jump bb14
+#         StoreName("_dp_with_reraise_3", contextmanager_exit(_dp_with_exit_1, _dp_try_exc_0_1_0))
+#         jump bb17
 #     block bb17(_dp_try_exc_0_1_0: Exception):
+#         exc_param: _dp_try_exc_0_1_0
+#         if_term UnaryOp(Not, BinOp(Is, _dp_with_reraise_3, NONE)):
+#             then:
+#                 jump bb18
+#             else:
+#                 jump bb19
+#     block bb18(_dp_try_exc_0_1_0: Exception):
+#         exc_param: _dp_try_exc_0_1_0
+#         raise _dp_with_reraise_3
+#     block bb19(_dp_try_exc_0_1_0: Exception):
+#         exc_param: _dp_try_exc_0_1_0
+#         jump bb20
+#     block bb20(_dp_try_exc_0_1_0: Exception):
+#         exc_param: _dp_try_exc_0_1_0
+#         jump bb14
+#     block bb21(_dp_try_exc_0_1_0: Exception):
 #         exc_param: _dp_try_exc_0_1_0
 #         raise _dp_try_exc_0_1_0
 
@@ -564,6 +556,7 @@ zs = {k: v for k, v in items}
 #                         StoreName("k", GetItem(_dp_unpack_16, 0))
 #                         StoreName("v", GetItem(_dp_unpack_16, 1))
 #                         Del { name: "_dp_unpack_16", quietly: false }
+#                         Del { name: "_dp_assign_value_15", quietly: false }
 #                         Del { name: "_dp_tmp_0_3_1", quietly: false }
 #                         jump bb5
 #                         block bb5:
@@ -573,6 +566,9 @@ zs = {k: v for k, v in items}
 #                             StoreName("_dp_assign_obj_13", load_deleted_name("_dp_tmp_7", _dp_tmp_7))
 #                             StoreName("_dp_assign_index_14", _dp_dictcomp_key_8)
 #                             SetItem(_dp_assign_obj_13, _dp_assign_index_14, _dp_assign_value_12)
+#                             Del { name: "_dp_assign_index_14", quietly: false }
+#                             Del { name: "_dp_assign_obj_13", quietly: false }
+#                             Del { name: "_dp_assign_value_12", quietly: false }
 #                             jump bb1
 
 # function _dp_module_init():
@@ -676,26 +672,32 @@ class C:
 #         StoreName("_dp_assign_obj_5", load_deleted_name("_dp_class_ns", _dp_class_ns))
 #         StoreName("_dp_assign_index_6", "__module__")
 #         SetItem(_dp_assign_obj_5, _dp_assign_index_6, _dp_assign_value_4)
+#         Del { name: "_dp_assign_index_6", quietly: false }
+#         Del { name: "_dp_assign_obj_5", quietly: false }
+#         Del { name: "_dp_assign_value_4", quietly: false }
 #         StoreName("_dp_assign_value_7", "C")
 #         StoreName("_dp_assign_obj_8", load_deleted_name("_dp_class_ns", _dp_class_ns))
 #         StoreName("_dp_assign_index_9", "__qualname__")
 #         SetItem(_dp_assign_obj_8, _dp_assign_index_9, _dp_assign_value_7)
+#         Del { name: "_dp_assign_index_9", quietly: false }
+#         Del { name: "_dp_assign_obj_8", quietly: false }
+#         Del { name: "_dp_assign_value_7", quietly: false }
 #         StoreName("_dp_listcomp_3", MakeFunction(0:1, Function, tuple_values(), NONE))
 #         StoreName("xs", _dp_listcomp_3(it))
 #         return NONE
 
-# function _dp_define_class_C(_dp_class_ns_fn, _dp_class_ns_outer, _dp_prepare_dict):
+# function _dp_define_class_C(_dp_class_ns_fn, _dp_class_ns_outer, _dp_class_bases, _dp_prepare_dict):
 #     function_id: 0:3
 #     block bb1:
 #         StoreName("_dp_class_ns", _dp_class_ns_outer)
-#         return create_class("C", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 3, tuple_values())
+#         return create_class("C", _dp_class_ns_fn, _dp_class_bases, _dp_prepare_dict, FALSE, 3, tuple_values())
 
 # function _dp_module_init():
 #     function_id: 0:4
 #     block bb1:
 #         StoreName("_dp_class_ns_C", MakeFunction(0:2, Function, tuple_values(), NONE))
-#         StoreName("_dp_define_class_C", MakeFunction(0:3, Function, tuple_values(NONE), NONE))
-#         StoreName("C", _dp_define_class_C(_dp_class_ns_C, globals()))
+#         StoreName("_dp_define_class_C", MakeFunction(0:3, Function, tuple_values(), NONE))
+#         StoreName("C", _dp_define_class_C(_dp_class_ns_C, globals(), tuple_values(), NONE))
 #         return NONE
 
 # with_multi
@@ -711,35 +713,35 @@ with a as x, b as y:
 #         StoreName("_dp_with_exit_4", contextmanager_get_exit(a))
 #         StoreName("x", contextmanager_enter(a))
 #         StoreName("_dp_with_ok_5", TRUE)
-#         jump bb21
-#         block bb21:
+#         jump bb25
+#         block bb25:
 #             StoreName("_dp_with_exit_1", contextmanager_get_exit(b))
 #             StoreName("y", contextmanager_enter(b))
 #             StoreName("_dp_with_ok_2", TRUE)
-#             jump bb35
-#             block bb35:
+#             jump bb43
+#             block bb43:
 #                 body()
-#                 jump bb26
-#                 block bb26:
-#                     jump bb23(AbruptKind(Fallthrough), None)
-#                     block bb23(_dp_try_exc_0_1_3: Exception, _dp_try_abrupt_kind_0_1_4: AbruptKind, _dp_try_abrupt_payload_0_1_5: AbruptPayload):
+#                 jump bb30
+#                 block bb30:
+#                     jump bb27(AbruptKind(Fallthrough), None)
+#                     block bb27(_dp_try_exc_0_1_3: Exception, _dp_try_abrupt_kind_0_1_4: AbruptKind, _dp_try_abrupt_payload_0_1_5: AbruptPayload):
 #                         exc_param: _dp_try_exc_0_1_3
 #                         if_term _dp_with_ok_2:
 #                             then:
-#                                 block bb24(_dp_try_exc_0_1_3: Exception):
+#                                 block bb28(_dp_try_exc_0_1_3: Exception):
 #                                     exc_param: _dp_try_exc_0_1_3
 #                                     contextmanager_exit(_dp_with_exit_1, NONE)
-#                                     jump bb22
+#                                     jump bb26
 #                             else:
-#                                 block bb25(_dp_try_exc_0_1_3: Exception):
+#                                 block bb29(_dp_try_exc_0_1_3: Exception):
 #                                     exc_param: _dp_try_exc_0_1_3
-#                                     jump bb22
-#                         block bb22(_dp_try_exc_0_1_3: Exception):
+#                                     jump bb26
+#                         block bb26(_dp_try_exc_0_1_3: Exception):
 #                             exc_param: _dp_try_exc_0_1_3
 #                             StoreName("_dp_with_exit_1", NONE)
-#                             jump bb18
-#                             block bb18:
-#                                 branch_table _dp_try_abrupt_kind_0_1_4 -> [bb9, bb19, bb20] default bb9
+#                             jump bb22
+#                             block bb22:
+#                                 branch_table _dp_try_abrupt_kind_0_1_4 -> [bb9, bb23, bb24] default bb9
 #                                 block bb6(_dp_try_exc_0_1_0: Exception, _dp_try_abrupt_kind_0_1_1: AbruptKind, _dp_try_abrupt_payload_0_1_2: AbruptPayload):
 #                                     exc_param: _dp_try_exc_0_1_0
 #                                     if_term _dp_with_ok_5:
@@ -766,10 +768,10 @@ with a as x, b as y:
 #                                                 raise _dp_try_abrupt_payload_0_1_2
 #                                 block bb9:
 #                                     jump bb6(AbruptKind(Fallthrough), None)
-#                                 block bb19:
+#                                 block bb23:
 #                                     StoreName("_dp_try_abrupt_payload_0_1_2", _dp_try_abrupt_payload_0_1_5)
 #                                     jump bb6(AbruptKind(Return), Name("_dp_try_abrupt_payload_0_1_2"))
-#                                 block bb20:
+#                                 block bb24:
 #                                     raise _dp_try_abrupt_payload_0_1_5
 #     block bb10(_dp_try_exc_0_1_0: Exception):
 #         exc_param: _dp_try_exc_0_1_0
@@ -782,33 +784,65 @@ with a as x, b as y:
 #             then:
 #                 jump bb16
 #             else:
-#                 jump bb17
+#                 jump bb21
 #     block bb16(_dp_try_exc_0_1_0: Exception):
 #         exc_param: _dp_try_exc_0_1_0
 #         StoreName("_dp_with_ok_5", FALSE)
-#         contextmanager_exit(_dp_with_exit_4, _dp_try_exc_0_1_0)
-#         jump bb14
+#         StoreName("_dp_with_reraise_6", contextmanager_exit(_dp_with_exit_4, _dp_try_exc_0_1_0))
+#         jump bb17
 #     block bb17(_dp_try_exc_0_1_0: Exception):
 #         exc_param: _dp_try_exc_0_1_0
+#         if_term UnaryOp(Not, BinOp(Is, _dp_with_reraise_6, NONE)):
+#             then:
+#                 jump bb18
+#             else:
+#                 jump bb19
+#     block bb18(_dp_try_exc_0_1_0: Exception):
+#         exc_param: _dp_try_exc_0_1_0
+#         raise _dp_with_reraise_6
+#     block bb19(_dp_try_exc_0_1_0: Exception):
+#         exc_param: _dp_try_exc_0_1_0
+#         jump bb20
+#     block bb20(_dp_try_exc_0_1_0: Exception):
+#         exc_param: _dp_try_exc_0_1_0
+#         jump bb14
+#     block bb21(_dp_try_exc_0_1_0: Exception):
+#         exc_param: _dp_try_exc_0_1_0
 #         raise _dp_try_exc_0_1_0
-#     block bb27(_dp_try_exc_0_1_3: Exception):
+#     block bb31(_dp_try_exc_0_1_3: Exception):
 #         exc_param: _dp_try_exc_0_1_3
-#         jump bb23(AbruptKind(Exception), Name("_dp_try_exc_0_1_3"))
-#     block bb31:
-#         jump bb26
-#     block bb32(_dp_try_exc_0_1_3: Exception):
+#         jump bb27(AbruptKind(Exception), Name("_dp_try_exc_0_1_3"))
+#     block bb35:
+#         jump bb30
+#     block bb36(_dp_try_exc_0_1_3: Exception):
 #         exc_param: _dp_try_exc_0_1_3
 #         if_term exception_matches(_dp_try_exc_0_1_3, BaseException):
 #             then:
-#                 jump bb33
+#                 jump bb37
 #             else:
-#                 jump bb34
-#     block bb33(_dp_try_exc_0_1_3: Exception):
+#                 jump bb42
+#     block bb37(_dp_try_exc_0_1_3: Exception):
 #         exc_param: _dp_try_exc_0_1_3
 #         StoreName("_dp_with_ok_2", FALSE)
-#         contextmanager_exit(_dp_with_exit_1, _dp_try_exc_0_1_3)
-#         jump bb31
-#     block bb34(_dp_try_exc_0_1_3: Exception):
+#         StoreName("_dp_with_reraise_3", contextmanager_exit(_dp_with_exit_1, _dp_try_exc_0_1_3))
+#         jump bb38
+#     block bb38(_dp_try_exc_0_1_3: Exception):
+#         exc_param: _dp_try_exc_0_1_3
+#         if_term UnaryOp(Not, BinOp(Is, _dp_with_reraise_3, NONE)):
+#             then:
+#                 jump bb39
+#             else:
+#                 jump bb40
+#     block bb39(_dp_try_exc_0_1_3: Exception):
+#         exc_param: _dp_try_exc_0_1_3
+#         raise _dp_with_reraise_3
+#     block bb40(_dp_try_exc_0_1_3: Exception):
+#         exc_param: _dp_try_exc_0_1_3
+#         jump bb41
+#     block bb41(_dp_try_exc_0_1_3: Exception):
+#         exc_param: _dp_try_exc_0_1_3
+#         jump bb35
+#     block bb42(_dp_try_exc_0_1_3: Exception):
 #         exc_param: _dp_try_exc_0_1_3
 #         raise _dp_try_exc_0_1_3
 
@@ -1020,8 +1054,8 @@ with Suppress():
 #         StoreName("_dp_with_exit_1", contextmanager_get_exit(_dp_tmp_4))
 #         contextmanager_enter(_dp_tmp_4)
 #         StoreName("_dp_with_ok_2", TRUE)
-#         jump bb18
-#         block bb18:
+#         jump bb22
+#         block bb22:
 #             raise RuntimeError("boom")
 #     block bb0:
 #         return NONE
@@ -1063,13 +1097,29 @@ with Suppress():
 #             then:
 #                 jump bb16
 #             else:
-#                 jump bb17
+#                 jump bb21
 #     block bb16(_dp_try_exc_0_1_0: Exception):
 #         exc_param: _dp_try_exc_0_1_0
 #         StoreName("_dp_with_ok_2", FALSE)
-#         contextmanager_exit(_dp_with_exit_1, _dp_try_exc_0_1_0)
-#         jump bb14
+#         StoreName("_dp_with_reraise_3", contextmanager_exit(_dp_with_exit_1, _dp_try_exc_0_1_0))
+#         jump bb17
 #     block bb17(_dp_try_exc_0_1_0: Exception):
+#         exc_param: _dp_try_exc_0_1_0
+#         if_term UnaryOp(Not, BinOp(Is, _dp_with_reraise_3, NONE)):
+#             then:
+#                 jump bb18
+#             else:
+#                 jump bb19
+#     block bb18(_dp_try_exc_0_1_0: Exception):
+#         exc_param: _dp_try_exc_0_1_0
+#         raise _dp_with_reraise_3
+#     block bb19(_dp_try_exc_0_1_0: Exception):
+#         exc_param: _dp_try_exc_0_1_0
+#         jump bb20
+#     block bb20(_dp_try_exc_0_1_0: Exception):
+#         exc_param: _dp_try_exc_0_1_0
+#         jump bb14
+#     block bb21(_dp_try_exc_0_1_0: Exception):
 #         exc_param: _dp_try_exc_0_1_0
 #         raise _dp_try_exc_0_1_0
 

@@ -578,6 +578,9 @@ def class_lookup_global(class_ns, name, globals_dict):
     try:
         return class_ns[name]
     except KeyError:
+        for type_param in class_ns.get('__type_params__', ()):
+            if getattr(type_param, '__name__', None) == name:
+                return type_param
         try:
             return globals_dict[name]
         except KeyError:

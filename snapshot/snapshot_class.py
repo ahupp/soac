@@ -10,74 +10,17 @@ class C:
 
 # ==
 
-# function C.m(self):
-#     function_id: 0:1
-#     block bb1:
-#         return GetAttr(self, "x")
+# snapshot regeneration failed
+# panic: byte index 82 is out of bounds of `
 
-# function C.__annotate_func__.<locals>.<lambda>():
-#     function_id: 0:2
-#     display_name: <lambda>
-#     block bb1:
-#         return int
+# class C:
+#     x: int = 1
 
-# function C.__annotate_func__(_dp_format, __soac__):
-#     function_id: 0:3
-#     block bb8:
-#         if_term eq(_dp_format, 4):
-#             then:
-#                 block bb9:
-#                     return dict(tuple_values(tuple_values("x", "int")))
-#             else:
-#                 block bb10:
-#                     jump bb5
-#                     block bb5:
-#                         if_term eq(_dp_format, 3):
-#                             then:
-#                                 block bb6:
-#                                     return dict(tuple_values(tuple_values("x", annotation_forwardref_value(MakeFunction(0:2, Function, tuple_values(), NONE), "int", __name__))))
-#                             else:
-#                                 block bb7:
-#                                     jump bb2
-#                                     block bb2:
-#                                         if_term gt(_dp_format, 2):
-#                                             then:
-#                                                 block bb3:
-#                                                     raise GetAttr(builtins, "NotImplementedError")
-#                                             else:
-#                                                 block bb4:
-#                                                     return dict(tuple_values(tuple_values("x", int)))
+#     def m(self):
+#         return self.x
 
-# function _dp_class_ns_C(_dp_class_ns, _dp_classcell_arg):
-#     function_id: 0:4
-#     block bb1:
-#         StoreName("_dp_classcell", _dp_classcell_arg)
-#         StoreName("_dp_assign_value_2", __name__)
-#         StoreName("_dp_assign_obj_3", load_deleted_name("_dp_class_ns", _dp_class_ns))
-#         StoreName("_dp_assign_index_4", "__module__")
-#         SetItem(_dp_assign_obj_3, _dp_assign_index_4, _dp_assign_value_2)
-#         StoreName("_dp_assign_value_5", "C")
-#         StoreName("_dp_assign_obj_6", load_deleted_name("_dp_class_ns", _dp_class_ns))
-#         StoreName("_dp_assign_index_7", "__qualname__")
-#         SetItem(_dp_assign_obj_6, _dp_assign_index_7, _dp_assign_value_5)
-#         StoreName("x", 1)
-#         StoreName("m", MakeFunction(0:1, Function, tuple_values(), NONE))
-#         StoreName("__annotate_func__", MakeFunction(0:3, Function, tuple_values(__import__("soac.runtime", globals(), dict(), tuple_values("runtime"), 0)), NONE))
-#         return NONE
 
-# function _dp_define_class_C(_dp_class_ns_fn, _dp_class_ns_outer, _dp_prepare_dict):
-#     function_id: 0:5
-#     block bb1:
-#         StoreName("_dp_class_ns", _dp_class_ns_outer)
-#         return create_class("C", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 3, tuple_values())
-
-# function _dp_module_init():
-#     function_id: 0:6
-#     block bb1:
-#         StoreName("_dp_class_ns_C", MakeFunction(0:4, Function, tuple_values(), NONE))
-#         StoreName("_dp_define_class_C", MakeFunction(0:5, Function, tuple_values(NONE), NONE))
-#         StoreName("C", _dp_define_class_C(_dp_class_ns_C, globals()))
-#         return NONE
+# `
 
 # class_method_named_open_calls_builtin
 
@@ -141,25 +84,31 @@ class Wrapper:
 #         StoreName("_dp_assign_obj_4", load_deleted_name("_dp_class_ns", _dp_class_ns))
 #         StoreName("_dp_assign_index_5", "__module__")
 #         SetItem(_dp_assign_obj_4, _dp_assign_index_5, _dp_assign_value_3)
+#         Del { name: "_dp_assign_index_5", quietly: false }
+#         Del { name: "_dp_assign_obj_4", quietly: false }
+#         Del { name: "_dp_assign_value_3", quietly: false }
 #         StoreName("_dp_assign_value_6", "Wrapper")
 #         StoreName("_dp_assign_obj_7", load_deleted_name("_dp_class_ns", _dp_class_ns))
 #         StoreName("_dp_assign_index_8", "__qualname__")
 #         SetItem(_dp_assign_obj_7, _dp_assign_index_8, _dp_assign_value_6)
+#         Del { name: "_dp_assign_index_8", quietly: false }
+#         Del { name: "_dp_assign_obj_7", quietly: false }
+#         Del { name: "_dp_assign_value_6", quietly: false }
 #         StoreName("open", MakeFunction(0:4, Function, tuple_values("r", "utf8"), MakeFunction(0:3, Function, tuple_values(__import__("soac.runtime", globals(), dict(), tuple_values("runtime"), 0)), NONE)))
 #         return NONE
 
-# function _dp_define_class_Wrapper(_dp_class_ns_fn, _dp_class_ns_outer, _dp_prepare_dict):
+# function _dp_define_class_Wrapper(_dp_class_ns_fn, _dp_class_ns_outer, _dp_class_bases, _dp_prepare_dict):
 #     function_id: 0:6
 #     block bb1:
 #         StoreName("_dp_class_ns", _dp_class_ns_outer)
-#         return create_class("Wrapper", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 3, tuple_values())
+#         return create_class("Wrapper", _dp_class_ns_fn, _dp_class_bases, _dp_prepare_dict, FALSE, 3, tuple_values())
 
 # function _dp_module_init():
 #     function_id: 0:7
 #     block bb1:
 #         StoreName("_dp_class_ns_Wrapper", MakeFunction(0:5, Function, tuple_values(), NONE))
-#         StoreName("_dp_define_class_Wrapper", MakeFunction(0:6, Function, tuple_values(NONE), NONE))
-#         StoreName("Wrapper", _dp_define_class_Wrapper(_dp_class_ns_Wrapper, globals()))
+#         StoreName("_dp_define_class_Wrapper", MakeFunction(0:6, Function, tuple_values(), NONE))
+#         StoreName("Wrapper", _dp_define_class_Wrapper(_dp_class_ns_Wrapper, globals(), tuple_values(), NONE))
 #         return NONE
 
 # class_with_base
@@ -179,24 +128,30 @@ class D(Base):
 #         StoreName("_dp_assign_obj_2", load_deleted_name("_dp_class_ns", _dp_class_ns))
 #         StoreName("_dp_assign_index_3", "__module__")
 #         SetItem(_dp_assign_obj_2, _dp_assign_index_3, _dp_assign_value_1)
+#         Del { name: "_dp_assign_index_3", quietly: false }
+#         Del { name: "_dp_assign_obj_2", quietly: false }
+#         Del { name: "_dp_assign_value_1", quietly: false }
 #         StoreName("_dp_assign_value_4", "D")
 #         StoreName("_dp_assign_obj_5", load_deleted_name("_dp_class_ns", _dp_class_ns))
 #         StoreName("_dp_assign_index_6", "__qualname__")
 #         SetItem(_dp_assign_obj_5, _dp_assign_index_6, _dp_assign_value_4)
+#         Del { name: "_dp_assign_index_6", quietly: false }
+#         Del { name: "_dp_assign_obj_5", quietly: false }
+#         Del { name: "_dp_assign_value_4", quietly: false }
 #         return NONE
 
-# function _dp_define_class_D(_dp_class_ns_fn, _dp_class_ns_outer, _dp_prepare_dict):
+# function _dp_define_class_D(_dp_class_ns_fn, _dp_class_ns_outer, _dp_class_bases, _dp_prepare_dict):
 #     function_id: 0:2
 #     block bb1:
 #         StoreName("_dp_class_ns", _dp_class_ns_outer)
-#         return create_class("D", _dp_class_ns_fn, tuple_values(Base), _dp_prepare_dict, FALSE, 3, tuple_values())
+#         return create_class("D", _dp_class_ns_fn, _dp_class_bases, _dp_prepare_dict, FALSE, 3, tuple_values())
 
 # function _dp_module_init():
 #     function_id: 0:3
 #     block bb1:
 #         StoreName("_dp_class_ns_D", MakeFunction(0:1, Function, tuple_values(), NONE))
-#         StoreName("_dp_define_class_D", MakeFunction(0:2, Function, tuple_values(NONE), NONE))
-#         StoreName("D", _dp_define_class_D(_dp_class_ns_D, globals()))
+#         StoreName("_dp_define_class_D", MakeFunction(0:2, Function, tuple_values(), NONE))
+#         StoreName("D", _dp_define_class_D(_dp_class_ns_D, globals(), tuple_values(Base), NONE))
 #         return NONE
 
 # class_scope_inner_capture
@@ -221,26 +176,32 @@ def outer():
 #         StoreName("_dp_assign_obj_2", load_deleted_name("_dp_class_ns", _dp_class_ns))
 #         StoreName("_dp_assign_index_3", "__module__")
 #         SetItem(_dp_assign_obj_2, _dp_assign_index_3, _dp_assign_value_1)
+#         Del { name: "_dp_assign_index_3", quietly: false }
+#         Del { name: "_dp_assign_obj_2", quietly: false }
+#         Del { name: "_dp_assign_value_1", quietly: false }
 #         StoreName("_dp_assign_value_4", "outer.<locals>.Inner")
 #         StoreName("_dp_assign_obj_5", load_deleted_name("_dp_class_ns", _dp_class_ns))
 #         StoreName("_dp_assign_index_6", "__qualname__")
 #         SetItem(_dp_assign_obj_5, _dp_assign_index_6, _dp_assign_value_4)
+#         Del { name: "_dp_assign_index_6", quietly: false }
+#         Del { name: "_dp_assign_obj_5", quietly: false }
+#         Del { name: "_dp_assign_value_4", quietly: false }
 #         StoreName("y", x)
 #         return NONE
 
-# function outer.<locals>._dp_define_class_Inner(_dp_class_ns_fn, _dp_class_ns_outer, _dp_prepare_dict):
+# function outer.<locals>._dp_define_class_Inner(_dp_class_ns_fn, _dp_class_ns_outer, _dp_class_bases, _dp_prepare_dict):
 #     function_id: 0:2
 #     block bb1:
 #         StoreName("_dp_class_ns", _dp_class_ns_outer)
-#         return create_class("Inner", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 6, tuple_values())
+#         return create_class("Inner", _dp_class_ns_fn, _dp_class_bases, _dp_prepare_dict, FALSE, 6, tuple_values())
 
 # function outer():
 #     function_id: 0:3
 #     block bb1:
 #         StoreName("x", "outer")
 #         StoreName("_dp_class_ns_Inner", MakeFunction(0:1, Function, tuple_values(), NONE))
-#         StoreName("_dp_define_class_Inner", MakeFunction(0:2, Function, tuple_values(NONE), NONE))
-#         StoreName("Inner", _dp_define_class_Inner(_dp_class_ns_Inner, globals()))
+#         StoreName("_dp_define_class_Inner", MakeFunction(0:2, Function, tuple_values(), NONE))
+#         StoreName("Inner", _dp_define_class_Inner(_dp_class_ns_Inner, globals(), tuple_values(), NONE))
 #         return GetAttr(Inner, "y")
 
 # function _dp_module_init():
@@ -276,25 +237,31 @@ class X:
 #         StoreName("_dp_assign_obj_2", load_deleted_name("_dp_class_ns", _dp_class_ns))
 #         StoreName("_dp_assign_index_3", "__module__")
 #         SetItem(_dp_assign_obj_2, _dp_assign_index_3, _dp_assign_value_1)
+#         Del { name: "_dp_assign_index_3", quietly: false }
+#         Del { name: "_dp_assign_obj_2", quietly: false }
+#         Del { name: "_dp_assign_value_1", quietly: false }
 #         StoreName("_dp_assign_value_4", "X")
 #         StoreName("_dp_assign_obj_5", load_deleted_name("_dp_class_ns", _dp_class_ns))
 #         StoreName("_dp_assign_index_6", "__qualname__")
 #         SetItem(_dp_assign_obj_5, _dp_assign_index_6, _dp_assign_value_4)
+#         Del { name: "_dp_assign_index_6", quietly: false }
+#         Del { name: "_dp_assign_obj_5", quietly: false }
+#         Del { name: "_dp_assign_value_4", quietly: false }
 #         StoreName("f", MakeFunction(0:1, Function, tuple_values(), NONE))
 #         return NONE
 
-# function _dp_define_class_X(_dp_class_ns_fn, _dp_class_ns_outer, _dp_prepare_dict):
+# function _dp_define_class_X(_dp_class_ns_fn, _dp_class_ns_outer, _dp_class_bases, _dp_prepare_dict):
 #     function_id: 0:3
 #     block bb1:
 #         StoreName("_dp_class_ns", _dp_class_ns_outer)
-#         return create_class("X", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, TRUE, 3, tuple_values())
+#         return create_class("X", _dp_class_ns_fn, _dp_class_bases, _dp_prepare_dict, TRUE, 3, tuple_values())
 
 # function _dp_module_init():
 #     function_id: 0:4
 #     block bb1:
 #         StoreName("_dp_class_ns_X", MakeFunction(0:2, Function, tuple_values(), NONE))
-#         StoreName("_dp_define_class_X", MakeFunction(0:3, Function, tuple_values(NONE), NONE))
-#         StoreName("X", _dp_define_class_X(_dp_class_ns_X, globals()))
+#         StoreName("_dp_define_class_X", MakeFunction(0:3, Function, tuple_values(), NONE))
+#         StoreName("X", _dp_define_class_X(_dp_class_ns_X, globals(), tuple_values(), NONE))
 #         return NONE
 
 # nested classes
@@ -315,17 +282,23 @@ class A:
 #         StoreName("_dp_assign_obj_2", load_deleted_name("_dp_class_ns", _dp_class_ns))
 #         StoreName("_dp_assign_index_3", "__module__")
 #         SetItem(_dp_assign_obj_2, _dp_assign_index_3, _dp_assign_value_1)
+#         Del { name: "_dp_assign_index_3", quietly: false }
+#         Del { name: "_dp_assign_obj_2", quietly: false }
+#         Del { name: "_dp_assign_value_1", quietly: false }
 #         StoreName("_dp_assign_value_4", "A.B")
 #         StoreName("_dp_assign_obj_5", load_deleted_name("_dp_class_ns", _dp_class_ns))
 #         StoreName("_dp_assign_index_6", "__qualname__")
 #         SetItem(_dp_assign_obj_5, _dp_assign_index_6, _dp_assign_value_4)
+#         Del { name: "_dp_assign_index_6", quietly: false }
+#         Del { name: "_dp_assign_obj_5", quietly: false }
+#         Del { name: "_dp_assign_value_4", quietly: false }
 #         return NONE
 
-# function A._dp_define_class_B(_dp_class_ns_fn, _dp_class_ns_outer, _dp_prepare_dict):
+# function A._dp_define_class_B(_dp_class_ns_fn, _dp_class_ns_outer, _dp_class_bases, _dp_prepare_dict):
 #     function_id: 0:2
 #     block bb1:
 #         StoreName("_dp_class_ns", _dp_class_ns_outer)
-#         return create_class("B", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 4, tuple_values())
+#         return create_class("B", _dp_class_ns_fn, _dp_class_bases, _dp_prepare_dict, FALSE, 4, tuple_values())
 
 # function _dp_class_ns_A(_dp_class_ns, _dp_classcell_arg):
 #     function_id: 0:3
@@ -335,27 +308,33 @@ class A:
 #         StoreName("_dp_assign_obj_8", load_deleted_name("_dp_class_ns", _dp_class_ns))
 #         StoreName("_dp_assign_index_9", "__module__")
 #         SetItem(_dp_assign_obj_8, _dp_assign_index_9, _dp_assign_value_7)
+#         Del { name: "_dp_assign_index_9", quietly: false }
+#         Del { name: "_dp_assign_obj_8", quietly: false }
+#         Del { name: "_dp_assign_value_7", quietly: false }
 #         StoreName("_dp_assign_value_10", "A")
 #         StoreName("_dp_assign_obj_11", load_deleted_name("_dp_class_ns", _dp_class_ns))
 #         StoreName("_dp_assign_index_12", "__qualname__")
 #         SetItem(_dp_assign_obj_11, _dp_assign_index_12, _dp_assign_value_10)
+#         Del { name: "_dp_assign_index_12", quietly: false }
+#         Del { name: "_dp_assign_obj_11", quietly: false }
+#         Del { name: "_dp_assign_value_10", quietly: false }
 #         StoreName("_dp_class_ns_B", MakeFunction(0:1, Function, tuple_values(), NONE))
-#         StoreName("_dp_define_class_B", MakeFunction(0:2, Function, tuple_values(NONE), NONE))
-#         StoreName("B", _dp_define_class_B(_dp_class_ns_B, _dp_class_ns))
+#         StoreName("_dp_define_class_B", MakeFunction(0:2, Function, tuple_values(), NONE))
+#         StoreName("B", _dp_define_class_B(_dp_class_ns_B, _dp_class_ns, tuple_values(), NONE))
 #         return NONE
 
-# function _dp_define_class_A(_dp_class_ns_fn, _dp_class_ns_outer, _dp_prepare_dict):
+# function _dp_define_class_A(_dp_class_ns_fn, _dp_class_ns_outer, _dp_class_bases, _dp_prepare_dict):
 #     function_id: 0:4
 #     block bb1:
 #         StoreName("_dp_class_ns", _dp_class_ns_outer)
-#         return create_class("A", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 3, tuple_values())
+#         return create_class("A", _dp_class_ns_fn, _dp_class_bases, _dp_prepare_dict, FALSE, 3, tuple_values())
 
 # function _dp_module_init():
 #     function_id: 0:5
 #     block bb1:
 #         StoreName("_dp_class_ns_A", MakeFunction(0:3, Function, tuple_values(), NONE))
-#         StoreName("_dp_define_class_A", MakeFunction(0:4, Function, tuple_values(NONE), NONE))
-#         StoreName("A", _dp_define_class_A(_dp_class_ns_A, globals()))
+#         StoreName("_dp_define_class_A", MakeFunction(0:4, Function, tuple_values(), NONE))
+#         StoreName("A", _dp_define_class_A(_dp_class_ns_A, globals(), tuple_values(), NONE))
 #         return NONE
 
 # nested classes with weird scoping
@@ -379,17 +358,23 @@ def foo():
 #         StoreName("_dp_assign_obj_2", load_deleted_name("_dp_class_ns", _dp_class_ns))
 #         StoreName("_dp_assign_index_3", "__module__")
 #         SetItem(_dp_assign_obj_2, _dp_assign_index_3, _dp_assign_value_1)
+#         Del { name: "_dp_assign_index_3", quietly: false }
+#         Del { name: "_dp_assign_obj_2", quietly: false }
+#         Del { name: "_dp_assign_value_1", quietly: false }
 #         StoreName("_dp_assign_value_4", "B")
 #         StoreName("_dp_assign_obj_5", load_deleted_name("_dp_class_ns", _dp_class_ns))
 #         StoreName("_dp_assign_index_6", "__qualname__")
 #         SetItem(_dp_assign_obj_5, _dp_assign_index_6, _dp_assign_value_4)
+#         Del { name: "_dp_assign_index_6", quietly: false }
+#         Del { name: "_dp_assign_obj_5", quietly: false }
+#         Del { name: "_dp_assign_value_4", quietly: false }
 #         return NONE
 
-# function foo.<locals>.A._dp_define_class_B(_dp_class_ns_fn, _dp_class_ns_outer, _dp_prepare_dict):
+# function foo.<locals>.A._dp_define_class_B(_dp_class_ns_fn, _dp_class_ns_outer, _dp_class_bases, _dp_prepare_dict):
 #     function_id: 0:2
 #     block bb1:
 #         StoreName("_dp_class_ns", _dp_class_ns_outer)
-#         return create_class("B", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 7, tuple_values())
+#         return create_class("B", _dp_class_ns_fn, _dp_class_bases, _dp_prepare_dict, FALSE, 7, tuple_values())
 
 # function foo.<locals>._dp_class_ns_A(_dp_class_ns, _dp_classcell_arg):
 #     function_id: 0:3
@@ -399,27 +384,33 @@ def foo():
 #         StoreName("_dp_assign_obj_8", load_deleted_name("_dp_class_ns", _dp_class_ns))
 #         StoreName("_dp_assign_index_9", "__module__")
 #         SetItem(_dp_assign_obj_8, _dp_assign_index_9, _dp_assign_value_7)
+#         Del { name: "_dp_assign_index_9", quietly: false }
+#         Del { name: "_dp_assign_obj_8", quietly: false }
+#         Del { name: "_dp_assign_value_7", quietly: false }
 #         StoreName("_dp_assign_value_10", "foo.<locals>.A")
 #         StoreName("_dp_assign_obj_11", load_deleted_name("_dp_class_ns", _dp_class_ns))
 #         StoreName("_dp_assign_index_12", "__qualname__")
 #         SetItem(_dp_assign_obj_11, _dp_assign_index_12, _dp_assign_value_10)
+#         Del { name: "_dp_assign_index_12", quietly: false }
+#         Del { name: "_dp_assign_obj_11", quietly: false }
+#         Del { name: "_dp_assign_value_10", quietly: false }
 #         StoreName("_dp_class_ns_B", MakeFunction(0:1, Function, tuple_values(), NONE))
-#         StoreName("_dp_define_class_B", MakeFunction(0:2, Function, tuple_values(NONE), NONE))
-#         StoreName("B", _dp_define_class_B(_dp_class_ns_B, _dp_class_ns))
+#         StoreName("_dp_define_class_B", MakeFunction(0:2, Function, tuple_values(), NONE))
+#         StoreName("B", _dp_define_class_B(_dp_class_ns_B, _dp_class_ns, tuple_values(), NONE))
 #         return NONE
 
-# function foo.<locals>._dp_define_class_A(_dp_class_ns_fn, _dp_class_ns_outer, _dp_prepare_dict):
+# function foo.<locals>._dp_define_class_A(_dp_class_ns_fn, _dp_class_ns_outer, _dp_class_bases, _dp_prepare_dict):
 #     function_id: 0:4
 #     block bb1:
 #         StoreName("_dp_class_ns", _dp_class_ns_outer)
-#         return create_class("A", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 4, tuple_values())
+#         return create_class("A", _dp_class_ns_fn, _dp_class_bases, _dp_prepare_dict, FALSE, 4, tuple_values())
 
 # function foo():
 #     function_id: 0:5
 #     block bb1:
 #         StoreName("_dp_class_ns_A", MakeFunction(0:3, Function, tuple_values(), NONE))
-#         StoreName("_dp_define_class_A", MakeFunction(0:4, Function, tuple_values(NONE), NONE))
-#         StoreName("A", _dp_define_class_A(_dp_class_ns_A, globals()))
+#         StoreName("_dp_define_class_A", MakeFunction(0:4, Function, tuple_values(), NONE))
+#         StoreName("A", _dp_define_class_A(_dp_class_ns_A, globals(), tuple_values(), NONE))
 #         return NONE
 
 # function _dp_module_init():

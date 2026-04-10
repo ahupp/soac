@@ -28,10 +28,11 @@ fn stmt_assign_to_blockpy_emits_direct_core_setitem() {
         .expect("assign lowering should succeed");
 
     let fragment = out.finish();
-    assert!(matches!(
-        fragment.entry.body.last(),
-        Some(InstrWithAwaitAndYield::SetItem(_))
-    ));
+    assert!(fragment
+        .entry
+        .body
+        .iter()
+        .any(|instr| matches!(instr, InstrWithAwaitAndYield::SetItem(_))));
 }
 
 #[test]

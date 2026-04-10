@@ -1123,12 +1123,18 @@ fn emit_codegen_locals_snapshot(fb: &mut FunctionBuilder<'_>, ctx: &JitEmitCtx<'
         ) else {
             continue;
         };
+        let skip_block = fb.create_block();
+        let present_block = fb.create_block();
+        let set_block = fb.create_block();
+        let after_block = fb.create_block();
+        let value_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, value, null_ptr);
+        fb.ins()
+            .brif(value_is_null, skip_block, &[], present_block, &[]);
+
+        fb.switch_to_block(present_block);
         let value_is_deleted =
             fb.ins()
                 .icmp(ir::condcodes::IntCC::Equal, value, ctx.consts.deleted_const);
-        let skip_block = fb.create_block();
-        let set_block = fb.create_block();
-        let after_block = fb.create_block();
         fb.ins()
             .brif(value_is_deleted, skip_block, &[], set_block, &[]);
 

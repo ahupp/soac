@@ -122,7 +122,7 @@ fn callable_semantic_info_uses_logical_storage_for_cell_captures() {
 }
 
 #[test]
-fn callable_semantic_info_maps_classcell_capture_source_back_to_dunder_class() {
+fn callable_semantic_info_uses_synthetic_classcell_capture_source() {
     let source = concat!(
         "class C:\n",
         "    def f(self):\n",
@@ -142,16 +142,20 @@ fn callable_semantic_info_maps_classcell_capture_source_back_to_dunder_class() {
         Some(BindingKind::Cell(crate::block_py::CellBindingKind::Capture))
     );
     assert_eq!(f.scope.cell_storage_name("__class__"), "__class__");
-    assert_eq!(f.scope.cell_capture_source_name("__class__"), "__class__");
+    assert_eq!(
+        f.scope.cell_capture_source_name("__class__"),
+        "_dp_classcell"
+    );
     assert_eq!(
         f.scope.captured_cell_bindings(),
         vec![crate::block_py::CellCaptureBinding {
             logical_name: "__class__".to_string(),
-            source_name: "__class__".to_string(),
+            source_name: "_dp_classcell".to_string(),
         }]
     );
     assert_eq!(
-        f.scope.logical_name_for_cell_capture_source("__class__"),
+        f.scope
+            .logical_name_for_cell_capture_source("_dp_classcell"),
         Some("__class__".to_string())
     );
 }
