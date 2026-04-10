@@ -411,6 +411,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn local_env_legacy_adapter_tracks_owned_transient_entries() {
+        let mut env = LocalEnv::default();
+        let first = ir::Value::from_u32(1);
+        let second = ir::Value::from_u32(2);
+
+        env.with_legacy_parts_mut(|names, values| {
+            names.push("x".to_string());
+            values.push(first);
+        });
+        assert_eq!(env.entries.len(), 1);
+        assert_eq!(env.entries[0].name, "x");
+        assert_eq!(env.entries[0].value, first);
+        assert_eq!(env.entries[0].ref_kind, LocalRefKind::Owned);
+
+        env.with_legacy_parts_mut(|names, values| {
+            values[0] = second;
+            names.push("y".to_string());
+            values.push(first);
+        });
+        assert_eq!(
+            env.entries
+                .iter()
+                .map(|entry| (entry.name.as_str(), entry.value, entry.ref_kind))
+                .collect::<Vec<_>>(),
+            vec![
+                ("x", second, LocalRefKind::Owned),
+                ("y", first, LocalRefKind::Owned),
+            ]
+        );
+        assert_eq!(
+            env.legacy_ref_kinds(),
+            vec![LocalRefKind::Owned, LocalRefKind::Owned]
+        );
+    }
+
     fn render_test_jit_function(
         function: &BlockPyFunction<CodegenModuleShape>,
         blocks: &[ObjPtr],

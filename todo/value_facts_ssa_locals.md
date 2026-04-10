@@ -278,9 +278,11 @@ Started:
 - JIT codegen now computes the read-only `FactStore` once per lowered module and
   exposes expression fact lookup through `JitEmitCtx`. Generated code does not
   use the facts yet.
-- A first `LocalEnv` wrapper exists at the JIT per-block emission boundary. It
-  still delegates to the existing parallel local-name/local-value vectors, so it
-  does not change ownership or generated code yet.
+- A first `LocalEnv` wrapper exists at the JIT per-block emission boundary.
+  It now owns `LocalEnvEntry { name, value, ref_kind }` internally, while
+  exposing a narrow legacy adapter to the older expression emitter. This keeps
+  generated code unchanged but gives the refcount/ownership work a single
+  transient-local value space to grow into.
 - A first `FunctionLocalPlan` exists in JIT planning. It records per-block entry
   bindings from the storage layout, annotates them with available `EnvFacts`,
   and classifies known immortal locals without changing generated code.
