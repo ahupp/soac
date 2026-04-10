@@ -476,10 +476,6 @@ mod tests {
                 ("y", first, LocalRefKind::Owned),
             ]
         );
-        assert_eq!(
-            env.legacy_ref_kinds(),
-            vec![LocalRefKind::Owned, LocalRefKind::Owned]
-        );
     }
 
     #[test]
@@ -671,30 +667,6 @@ mod tests {
         assert_eq!(
             local_ref_kind_for_stack_mirror(LocalRefKind::Immortal),
             LocalRefKind::Immortal
-        );
-    }
-
-    #[test]
-    fn local_env_recomputes_legacy_ref_kinds_from_current_values() {
-        let old_value = ir::Value::from_u32(1);
-        let new_value = ir::Value::from_u32(2);
-        let env = LocalEnv {
-            entries: vec![LocalEnvEntry {
-                key: LocalEnvKey::Location(LocalLocation(0)),
-                name: "x".to_string(),
-                value: old_value,
-                ref_kind: LocalRefKind::Borrowed,
-                storage: LocalEnvStorage::StackMirror,
-            }],
-        };
-
-        assert_eq!(
-            env.ref_kinds_for_legacy_parts(&["x".to_string()], &[old_value]),
-            vec![LocalRefKind::Borrowed]
-        );
-        assert_eq!(
-            env.ref_kinds_for_legacy_parts(&["x".to_string()], &[new_value]),
-            vec![LocalRefKind::Owned]
         );
     }
 

@@ -2058,11 +2058,6 @@ impl LocalEnv {
         Ok(())
     }
 
-    #[cfg(test)]
-    fn legacy_ref_kinds(&self) -> Vec<LocalRefKind> {
-        self.entries.iter().map(|entry| entry.ref_kind).collect()
-    }
-
     fn local_only_cleanup_values(&self) -> Vec<ir::Value> {
         self.entries
             .iter()
@@ -2071,27 +2066,6 @@ impl LocalEnv {
                     && transient_local_needs_decref(entry.ref_kind)
             })
             .map(|entry| entry.value)
-            .collect()
-    }
-
-    fn ref_kinds_for_legacy_parts(
-        &self,
-        names: &[String],
-        values: &[ir::Value],
-    ) -> Vec<LocalRefKind> {
-        debug_assert_eq!(
-            names.len(),
-            values.len(),
-            "JIT transient local names and values must stay parallel"
-        );
-        names
-            .iter()
-            .zip(values.iter())
-            .map(|(name, value)| {
-                self.unchanged_entry_for_legacy_part(name, *value)
-                    .map(|entry| entry.ref_kind)
-                    .unwrap_or(LocalRefKind::Owned)
-            })
             .collect()
     }
 
@@ -6458,39 +6432,6 @@ fn emit_pop_handled_exception_if_leaving(
     emit_pop_handled_exception(fb, exception_name, ctx);
 }
 
-fn emit_decref_unforwarded_locals(
-    fb: &mut FunctionBuilder<'_>,
-    local_values: &[ir::Value],
-    local_names: &[String],
-    local_ref_kinds: &[LocalRefKind],
-    target_params: &[String],
-    decref_ref: ir::FuncRef,
-) {
-    debug_assert_eq!(
-        local_values.len(),
-        local_ref_kinds.len(),
-        "JIT transient local values and ref kinds must stay parallel"
-    );
-    let mut forwarded_local_indices = HashMap::new();
-    for name in target_params {
-        if let Some(index) = local_names.iter().position(|candidate| candidate == name) {
-            *forwarded_local_indices.entry(index).or_insert(0usize) += 1;
-        }
-    }
-    for (index, value) in local_values.iter().enumerate() {
-        if forwarded_local_indices.contains_key(&index) {
-            continue;
-        }
-        let ref_kind = local_ref_kinds
-            .get(index)
-            .copied()
-            .unwrap_or(LocalRefKind::Unknown);
-        if transient_local_needs_decref(ref_kind) {
-            fb.ins().call(decref_ref, &[*value]);
-        }
-    }
-}
-
 fn emit_planned_stack_slot_releases_for_reason(
     fb: &mut FunctionBuilder<'_>,
     source_label: BlockLabel,
@@ -7107,9 +7048,6 @@ fn emit_codegen_term(
             fb.ins().return_(&[ret_value]);
         }
         BlockTerm::Raise(raise_stmt) => {
-            let mut local_parts = local_env.to_legacy_parts();
-            let local_names = &mut local_parts.names;
-            let local_values = &mut local_parts.values;
             let raise_name_obj = emit_owned_module_constant(
                 fb,
                 emit_ctx
@@ -7138,11 +7076,10 @@ fn emit_codegen_term(
             fb.switch_to_block(raise_fn_ok);
             let rfo_raise_fn = fb.block_params(raise_fn_ok)[0];
             let exc_value = if let Some(exc_expr) = raise_stmt.exc.as_ref() {
-                emit_codegen_expr(
+                emit_codegen_expr_with_local_env(
                     fb,
                     exc_expr,
-                    local_names,
-                    local_values,
+                    local_env,
                     emit_ctx,
                     false,
                     jit_module,
@@ -7196,15 +7133,7 @@ fn emit_codegen_term(
             );
 
             fb.switch_to_block(raise_rc_ok);
-            let local_ref_kinds = local_env.ref_kinds_for_legacy_parts(local_names, local_values);
-            emit_decref_unforwarded_locals(
-                fb,
-                local_values,
-                local_names,
-                &local_ref_kinds,
-                &[],
-                decref_ref,
-            );
+            emit_decref_unforwarded_local_env(fb, local_env, &[], decref_ref);
             let release_reason = RefcountReleaseReason::Raise;
             emit_planned_stack_slot_releases_for_reason(
                 fb,
