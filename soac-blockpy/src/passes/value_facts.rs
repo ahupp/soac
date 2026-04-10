@@ -815,8 +815,8 @@ pub fn infer_module_value_facts(module: &BlockPyModule<CodegenModuleShape>) -> F
 #[cfg(test)]
 mod test {
     use super::{
-        BoolSingletonFact, CallableFact, EnvFacts, PyExactType, PyObjFacts, RefcountFact,
-        RuntimeHelperId, ThrowSpec, ValueFacts, infer_module_value_facts,
+        infer_module_value_facts, BoolSingletonFact, CallableFact, EnvFacts, PyExactType,
+        PyObjFacts, RefcountFact, RuntimeHelperId, ThrowSpec, ValueFacts,
     };
     use crate::block_py::{BlockTerm, ChildVisitable, HasSemanticInstrId, InstrCodegen, Visit};
     use crate::lower_python_to_blockpy_for_testing;

@@ -2724,7 +2724,10 @@ fn compute_module_make_function_capture_names(
                         || base_owned_storage_names.contains(source_name.as_str())
                         || (callable.scope.scope_kind == CallableScopeKind::Function
                             && callable.scope.has_local_def(logical_name.as_str()))
-                        || callable.scope.type_param_names.contains(logical_name.as_str())
+                        || callable
+                            .scope
+                            .type_param_names
+                            .contains(logical_name.as_str())
                         || base_owned_storage_names.contains(requested_source_name.as_str())
                     {
                         continue;

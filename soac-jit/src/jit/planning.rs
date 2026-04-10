@@ -463,8 +463,7 @@ def f():
             "expected the plan to expose exception-edge stack-slot releases: {check:#?}"
         );
         assert_eq!(
-            check.exception_edge_release_gaps,
-            0,
+            check.exception_edge_release_gaps, 0,
             "exception edges are now consumed by planned stack-slot releases"
         );
         assert_eq!(check.normal_edge_release_gaps, 0);
