@@ -23,8 +23,8 @@ use tower_http::services::ServeDir;
 
 pub use soac_jit::counter_dump::{
     CollectedKeyLayout, CounterDumpFile, CounterDumpKeyLayoutView, CounterDumpRecordView,
-    CounterDumpRowView, collect_module_key_layouts, collect_type_key_layouts,
-    parse_counter_dump_records,
+    CounterDumpRowView, CounterDumpTypeKeyLayoutView, collect_module_key_layouts,
+    collect_type_key_layouts, parse_counter_dump_records,
 };
 
 static NEXT_WEB_MODULE_ID: AtomicU64 = AtomicU64::new(1);

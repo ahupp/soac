@@ -71,7 +71,7 @@ struct SoacLogConfig {
 }
 
 const DEFAULT_SOAC_JSON_LOG_FILTER: &str =
-    "soac_jit=info,soac_module_load=info,soac_jit_codegen=info";
+    "soac_jit=info,soac_module_load=info,soac_jit_codegen=info,soac_specialization_runtime=info";
 
 fn soac_work_dir_from_env() -> Option<PathBuf> {
     std::env::var_os("SOAC_WORK_DIR")

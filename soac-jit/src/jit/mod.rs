@@ -1,6 +1,7 @@
 use crate::SOAC_RUNTIME_CLIF;
 use crate::counter_dump::{
-    CollectedKeyLayout, collect_type_key_layouts, read_branch_preferences_from_file,
+    CollectedTypeKeyLayout, CounterDumpFile, CounterDumpTypeKey, collect_type_key_layouts,
+    collect_type_table, read_branch_preferences_from_file,
     read_call_target_specializations_from_file, read_operator_specializations_from_file,
 };
 use crate::module_constants::{ModuleCodegenConstants, ModuleConstantId};
@@ -33,6 +34,7 @@ use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
+use std::ffi::CString;
 use std::mem::offset_of;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -45,6 +47,11 @@ unsafe extern "C" {
     static mut PyType_Type: ffi::PyTypeObject;
     static mut PyLong_Type: ffi::PyTypeObject;
     static mut _PyDict_IndexedValueTombstone: i8;
+    fn PyUnstable_Type_AssignVersionTag(type_obj: *mut ffi::PyTypeObject) -> i32;
+    fn _PyType_LookupRef(
+        type_obj: *mut ffi::PyTypeObject,
+        name: *mut ffi::PyObject,
+    ) -> *mut ffi::PyObject;
 }
 
 mod intrinsics;
@@ -4794,72 +4801,247 @@ fn load_branch_preferences(
     read_branch_preferences_from_file(path, module_name, function_id)
 }
 
-fn type_layout_is_for_module_owner(module_name: &str, layout: &CollectedKeyLayout) -> bool {
-    layout.owner == module_name
-        || layout
-            .owner
-            .strip_prefix(module_name)
-            .is_some_and(|suffix| suffix.starts_with('.'))
+fn resolve_type_key_to_type(
+    type_key: &CounterDumpTypeKey,
+) -> Result<Option<*mut ffi::PyTypeObject>, String> {
+    if type_key.module_name.is_empty()
+        || type_key.qualname.is_empty()
+        || type_key.qualname.split('.').any(|part| part == "<locals>")
+    {
+        return Ok(None);
+    }
+
+    let module_name = CString::new(type_key.module_name.as_str())
+        .map_err(|_| format!("type key module contains NUL: {:?}", type_key.module_name))?;
+    let modules = unsafe { ffi::PyImport_GetModuleDict() };
+    if modules.is_null() {
+        if unsafe { !ffi::PyErr_Occurred().is_null() } {
+            return Err("failed to read sys.modules while resolving type key".to_string());
+        }
+        return Ok(None);
+    }
+    let mut current = unsafe { ffi::PyDict_GetItemString(modules, module_name.as_ptr()) };
+    if current.is_null() {
+        return Ok(None);
+    }
+    unsafe { ffi::Py_INCREF(current) };
+
+    for part in type_key.qualname.split('.') {
+        if part.is_empty() {
+            unsafe { ffi::Py_DECREF(current) };
+            return Ok(None);
+        }
+        let part = CString::new(part)
+            .map_err(|_| format!("type key qualname contains NUL: {:?}", type_key.qualname))?;
+        let next = unsafe { ffi::PyObject_GetAttrString(current, part.as_ptr()) };
+        unsafe { ffi::Py_DECREF(current) };
+        if next.is_null() {
+            unsafe { ffi::PyErr_Clear() };
+            return Ok(None);
+        }
+        current = next;
+    }
+
+    if unsafe { ffi::PyType_Check(current) } == 0 {
+        unsafe { ffi::Py_DECREF(current) };
+        return Ok(None);
+    }
+    let owner_type = current as *mut ffi::PyTypeObject;
+    unsafe { ffi::Py_DECREF(current) };
+    Ok(Some(owner_type))
 }
 
-fn load_field_index_specializations(
-    module_name: &str,
-    module_globals: Option<ObjPtr>,
-) -> Result<HashMap<String, Vec<FieldIndexSpecialization>>, String> {
+fn owner_type_has_class_binding_for_attr(
+    owner_type: *mut ffi::PyTypeObject,
+    attr_name: &str,
+) -> Result<bool, String> {
+    let attr_name = CString::new(attr_name)
+        .map_err(|_| format!("field specialization attr contains NUL: {attr_name:?}"))?;
+    let attr_obj = unsafe { ffi::PyUnicode_FromString(attr_name.as_ptr()) };
+    if attr_obj.is_null() {
+        return Err("failed to allocate field specialization attr name".to_string());
+    }
+    let descriptor = unsafe { _PyType_LookupRef(owner_type, attr_obj) };
+    unsafe { ffi::Py_DECREF(attr_obj) };
+    if descriptor.is_null() {
+        if unsafe { !ffi::PyErr_Occurred().is_null() } {
+            return Err("failed while checking owner type class binding".to_string());
+        }
+        Ok(false)
+    } else {
+        unsafe { ffi::Py_DECREF(descriptor) };
+        Ok(true)
+    }
+}
+
+unsafe fn owner_type_supports_field_layout_priming(owner_type: *mut ffi::PyTypeObject) -> bool {
+    const PY_TPFLAGS_MANAGED_DICT_SOAC: u64 = 1 << 4;
+    const PY_TPFLAGS_INLINE_VALUES_SOAC: u64 = 1 << 2;
+
+    if owner_type.is_null() {
+        return false;
+    }
+    if ((*owner_type).tp_flags & ffi::Py_TPFLAGS_HEAPTYPE) == 0
+        || ((*owner_type).tp_flags & PY_TPFLAGS_INLINE_VALUES_SOAC) == 0
+        || ((*owner_type).tp_flags & PY_TPFLAGS_MANAGED_DICT_SOAC) == 0
+    {
+        return false;
+    }
+    if ffi::Py_TYPE(owner_type as *mut ffi::PyObject) != std::ptr::addr_of_mut!(ffi::PyType_Type) {
+        return false;
+    }
+    let Some(owner_tp_alloc) = (*owner_type).tp_alloc else {
+        return false;
+    };
+    let generic_alloc: unsafe extern "C" fn(
+        *mut ffi::PyTypeObject,
+        ffi::Py_ssize_t,
+    ) -> *mut ffi::PyObject = ffi::PyType_GenericAlloc;
+    std::ptr::fn_addr_eq(owner_tp_alloc, generic_alloc)
+}
+
+unsafe fn owner_type_has_safe_zero_arg_priming_constructor(
+    owner_type: *mut ffi::PyTypeObject,
+) -> bool {
+    if !owner_type_supports_field_layout_priming(owner_type)
+        || ((*owner_type).tp_flags & ffi::Py_TPFLAGS_IS_ABSTRACT) != 0
+    {
+        return false;
+    }
+    let class_dict = (*owner_type).tp_dict;
+    if class_dict.is_null() {
+        return false;
+    }
+    unsafe { ffi::PyDict_GetItemString(class_dict, c"__init__".as_ptr()) }.is_null()
+        && unsafe { ffi::PyDict_GetItemString(class_dict, c"__new__".as_ptr()) }.is_null()
+}
+
+fn prime_field_index_layout(
+    owner_type: *mut ffi::PyTypeObject,
+    layouts: &[CollectedTypeKeyLayout],
+) -> Result<(), String> {
+    if layouts.is_empty() || !unsafe { owner_type_supports_field_layout_priming(owner_type) } {
+        return Ok(());
+    }
+    let Some(owner_tp_alloc) = (unsafe { (*owner_type).tp_alloc }) else {
+        return Ok(());
+    };
+    let mut temp_instance =
+        if unsafe { owner_type_has_safe_zero_arg_priming_constructor(owner_type) } {
+            unsafe { ffi::PyObject_CallNoArgs(owner_type.cast()) }
+        } else {
+            std::ptr::null_mut()
+        };
+    if temp_instance.is_null() {
+        unsafe { ffi::PyErr_Clear() };
+        temp_instance = unsafe { owner_tp_alloc(owner_type, 0) };
+    }
+    if temp_instance.is_null() {
+        unsafe { ffi::PyErr_Clear() };
+        return Ok(());
+    }
+    let none = unsafe { ffi::Py_None() };
+    for layout in layouts {
+        let key = CString::new(layout.key.as_str())
+            .map_err(|_| format!("field specialization attr contains NUL: {:?}", layout.key))?;
+        if unsafe { ffi::PyObject_SetAttrString(temp_instance, key.as_ptr(), none) } != 0 {
+            unsafe {
+                ffi::Py_DECREF(temp_instance);
+                ffi::PyErr_Clear();
+            }
+            return Ok(());
+        }
+    }
+    unsafe { ffi::Py_DECREF(temp_instance) };
+    Ok(())
+}
+
+fn field_index_specialization_for_type(
+    owner_type: *mut ffi::PyTypeObject,
+    attr_name: &str,
+    expected_index: u32,
+) -> Result<Option<FieldIndexSpecialization>, String> {
+    if owner_type.is_null() {
+        return Ok(None);
+    }
+    if unsafe { ((*owner_type).tp_flags & ffi::Py_TPFLAGS_HEAPTYPE) == 0 } {
+        return Ok(None);
+    }
+    let has_generic_getattr = unsafe { (*owner_type).tp_getattro }.is_some_and(|getattr| {
+        std::ptr::fn_addr_eq(
+            getattr,
+            ffi::PyObject_GenericGetAttr
+                as unsafe extern "C" fn(
+                    *mut ffi::PyObject,
+                    *mut ffi::PyObject,
+                ) -> *mut ffi::PyObject,
+        )
+    });
+    let has_generic_setattr = unsafe { (*owner_type).tp_setattro }.is_some_and(|setattr| {
+        std::ptr::fn_addr_eq(
+            setattr,
+            ffi::PyObject_GenericSetAttr
+                as unsafe extern "C" fn(
+                    *mut ffi::PyObject,
+                    *mut ffi::PyObject,
+                    *mut ffi::PyObject,
+                ) -> i32,
+        )
+    });
+    if !has_generic_getattr
+        || !has_generic_setattr
+        || owner_type_has_class_binding_for_attr(owner_type, attr_name)?
+    {
+        return Ok(None);
+    }
+
+    if unsafe { (*owner_type).tp_version_tag } == 0 {
+        let _ = unsafe { PyUnstable_Type_AssignVersionTag(owner_type) };
+    }
+    let type_version = unsafe { (*owner_type).tp_version_tag };
+    if type_version == 0 {
+        return Ok(None);
+    }
+
+    Ok(Some(FieldIndexSpecialization {
+        expected_index,
+        owner_type,
+        type_version,
+    }))
+}
+
+fn load_field_index_specializations()
+-> Result<HashMap<String, Vec<FieldIndexSpecialization>>, String> {
     if specialization_mode_is_profile() {
         return Ok(HashMap::new());
     }
-    let Some(module_globals) = module_globals else {
-        return Ok(HashMap::new());
-    };
     let Some(path) = counter_dump_input_path_from_env() else {
         return Ok(HashMap::new());
     };
+    let path = path.as_path();
     if !path.exists() {
         return Ok(HashMap::new());
     }
-    let dump = crate::counter_dump::CounterDumpFile::open(path.as_path())?;
+    let dump = CounterDumpFile::open(path)?;
     let records = dump.records()?;
-    let type_keys = collect_type_key_layouts(records.as_slice())?;
+    let type_table = collect_type_table(records.as_slice())?;
+    let type_key_layouts = collect_type_key_layouts(records.as_slice())?;
     let mut out = HashMap::<String, Vec<FieldIndexSpecialization>>::new();
-    for layouts in type_keys.values() {
+    for (type_id, layouts) in type_key_layouts {
+        let Some(type_key) = type_table.get(&type_id) else {
+            continue;
+        };
+        let Some(owner_type) = resolve_type_key_to_type(type_key)? else {
+            continue;
+        };
+        prime_field_index_layout(owner_type, layouts.as_slice())?;
         for layout in layouts {
-            if !type_layout_is_for_module_owner(module_name, layout) {
-                continue;
+            if let Some(specialization) =
+                field_index_specialization_for_type(owner_type, layout.key.as_str(), layout.index)?
+            {
+                out.entry(layout.key).or_default().push(specialization);
             }
-            let Ok(Some(owner)) = (unsafe {
-                crate::lookup_exact_owner_type_for_field_in_globals(
-                    module_globals.cast(),
-                    module_name,
-                    &layout.owner,
-                    &layout.key,
-                )
-            }) else {
-                unsafe { ffi::PyErr_Clear() };
-                continue;
-            };
-            out.entry(layout.key.clone())
-                .or_default()
-                .push(FieldIndexSpecialization {
-                    expected_index: layout.index,
-                    owner_type: owner.owner_type,
-                    type_version: owner.type_version,
-                });
         }
-    }
-    for specializations in out.values_mut() {
-        specializations.sort_by_key(|specialization| {
-            (
-                specialization.owner_type as usize,
-                specialization.expected_index,
-            )
-        });
-        specializations.dedup_by_key(|specialization| {
-            (
-                specialization.owner_type as usize,
-                specialization.expected_index,
-            )
-        });
     }
     Ok(out)
 }
@@ -9742,7 +9924,6 @@ impl ProcessJitEngine {
         module_constant_ptrs: &[*mut ffi::PyObject],
         counter_ptrs: &[*mut u64],
         direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
-        module_globals: Option<ObjPtr>,
     ) -> Result<DirectFunctionCompileResult, String> {
         let batch_functions = collect_process_jit_batch_functions(
             session,
@@ -9793,13 +9974,9 @@ impl ProcessJitEngine {
                 function_module_constant_ptrs,
                 function_counter_ptrs,
                 function_direct_call_resolver,
-                function_module_globals,
             ) = if let Some(shared_state) = batch_function.source.shared_state() {
                 owned_module_constant_ptrs = shared_state.module_constant_ptrs();
                 owned_counter_ptrs = shared_state.counter_ptrs();
-                let function_module_globals = direct_call_resolver
-                    .filter(|root_state| std::ptr::eq(*root_state, shared_state))
-                    .and(module_globals);
                 (
                     &shared_state.lowered_module,
                     &shared_state.codegen_constants,
@@ -9807,7 +9984,6 @@ impl ProcessJitEngine {
                     owned_module_constant_ptrs.as_slice(),
                     owned_counter_ptrs.as_slice(),
                     Some(shared_state),
-                    function_module_globals,
                 )
             } else {
                 (
@@ -9817,7 +9993,6 @@ impl ProcessJitEngine {
                     module_constant_ptrs,
                     counter_ptrs,
                     None,
-                    module_globals,
                 )
             };
             let built = build_cranelift_run_bb_specialized_function(
@@ -9831,7 +10006,6 @@ impl ProcessJitEngine {
                 function_counter_ptrs,
                 session.as_ref(),
                 function_direct_call_resolver,
-                function_module_globals,
                 None,
                 Some(&predeclared),
             )
@@ -10811,7 +10985,6 @@ fn build_cranelift_run_bb_specialized_function(
     counter_ptrs: &[*mut u64],
     compile_session: &crate::session::CompileSession,
     direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
-    module_globals: Option<ObjPtr>,
     symbol_scope: Option<&str>,
     predeclared_direct_functions: Option<&HashMap<FunctionId, DeclaredJitFunction>>,
 ) -> Result<BuiltSpecializedFunction, String> {
@@ -10905,12 +11078,7 @@ fn build_cranelift_run_bb_specialized_function(
         }
         None => HashMap::new(),
     };
-    let field_index_specializations = match direct_call_resolver {
-        Some(shared_state) => {
-            load_field_index_specializations(shared_state.module_name.as_str(), module_globals)?
-        }
-        None => HashMap::new(),
-    };
+    let field_index_specializations = load_field_index_specializations()?;
     let branch_prefer_true = match direct_call_resolver {
         Some(shared_state) => {
             load_branch_preferences(shared_state.module_name.as_str(), function.function_id)?
@@ -11847,7 +12015,6 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
         runtime_state,
         None,
         None,
-        None,
     )?;
     let mut out = String::new();
     out.push_str("; import fn aliases (Cranelift display id -> symbol)\n");
@@ -11925,7 +12092,6 @@ pub(crate) unsafe fn compile_cranelift_run_bb_specialized_cached(
     module_constant_ptrs: &[*mut ffi::PyObject],
     counter_ptrs: &[*mut u64],
     direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
-    module_globals: Option<ObjPtr>,
 ) -> Result<DirectFunctionCompileResult, String> {
     unsafe {
         compile_session.process_jit()?.compile_direct_function(
@@ -11938,7 +12104,6 @@ pub(crate) unsafe fn compile_cranelift_run_bb_specialized_cached(
             module_constant_ptrs,
             counter_ptrs,
             direct_call_resolver,
-            module_globals,
         )
     }
 }

@@ -431,29 +431,22 @@ fn emit_specialized_getattr<'fb>(
 ) -> Option<ir::Value> {
     let instr_id = op.semantic_instr_id();
     let attr_name = codegen_constant_string_value(state.ctx().module, op.attr.as_ref())?;
-    let specialization = *state
+    let specializations = state
         .ctx()
         .field_index_specializations
         .get(attr_name)?
-        .first()?;
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    if specializations.is_empty() {
+        return None;
+    }
     let arg_values = state.emit_arg_values(&[op.value.as_ref(), op.attr.as_ref()]);
     let ptr_ty = state.ctx().consts.ptr_ty;
     let i64_ty = state.ctx().consts.i64_ty;
     let i32_ty = state.ctx().consts.i32_ty;
     let null_ptr = state.fb().ins().iconst(ptr_ty, 0);
     let zero_i32 = state.fb().ins().iconst(i32_ty, 0);
-    let owner_type = state
-        .fb()
-        .ins()
-        .iconst(ptr_ty, specialization.owner_type as i64);
-    let expected_version = state
-        .fb()
-        .ins()
-        .iconst(i64_ty, i64::from(specialization.type_version));
-    let expected_index = state
-        .fb()
-        .ins()
-        .iconst(i64_ty, i64::from(specialization.expected_index));
     let load_field_indexed_ref = state.ctx().load_field_indexed_ref;
     let guard_type_version_ref = state.ctx().guard_method_type_version_ref;
     let hit_counter_ptr = state
@@ -469,52 +462,76 @@ fn emit_specialized_getattr<'fb>(
 
     let result_block = state.fb().create_block();
     state.fb().append_block_param(result_block, ptr_ty);
-    let maybe_direct_block = state.fb().create_block();
-    let direct_block = state.fb().create_block();
-    state.fb().append_block_param(direct_block, ptr_ty);
     let fallback_block = state.fb().create_block();
+    for (index, specialization) in specializations.iter().enumerate() {
+        let maybe_direct_block = state.fb().create_block();
+        let direct_block = state.fb().create_block();
+        state.fb().append_block_param(direct_block, ptr_ty);
+        let next_guard_block = if index + 1 == specializations.len() {
+            fallback_block
+        } else {
+            state.fb().create_block()
+        };
 
-    let guard_inst = state.fb().ins().call(
-        guard_type_version_ref,
-        &[arg_values[0].0, owner_type, expected_version],
-    );
-    let guard_result = state.fb().inst_results(guard_inst)[0];
-    let type_matches =
+        let owner_type = state
+            .fb()
+            .ins()
+            .iconst(ptr_ty, specialization.owner_type as i64);
+        let expected_version = state
+            .fb()
+            .ins()
+            .iconst(i64_ty, i64::from(specialization.type_version));
+        let expected_index = state
+            .fb()
+            .ins()
+            .iconst(i64_ty, i64::from(specialization.expected_index));
+        let guard_inst = state.fb().ins().call(
+            guard_type_version_ref,
+            &[arg_values[0].0, owner_type, expected_version],
+        );
+        let guard_result = state.fb().inst_results(guard_inst)[0];
+        let type_matches =
+            state
+                .fb()
+                .ins()
+                .icmp(ir::condcodes::IntCC::NotEqual, guard_result, zero_i32);
         state
             .fb()
             .ins()
-            .icmp(ir::condcodes::IntCC::NotEqual, guard_result, zero_i32);
-    state
-        .fb()
-        .ins()
-        .brif(type_matches, maybe_direct_block, &[], fallback_block, &[]);
+            .brif(type_matches, maybe_direct_block, &[], next_guard_block, &[]);
 
-    state.fb().switch_to_block(maybe_direct_block);
-    let direct_inst = state.fb().ins().call(
-        load_field_indexed_ref,
-        &[arg_values[0].0, arg_values[1].0, expected_index],
-    );
-    let direct_value = state.fb().inst_results(direct_inst)[0];
-    let direct_is_null = state
-        .fb()
-        .ins()
-        .icmp(ir::condcodes::IntCC::Equal, direct_value, null_ptr);
-    state.fb().ins().brif(
-        direct_is_null,
-        fallback_block,
-        &[],
-        direct_block,
-        &[ir::BlockArg::Value(direct_value)],
-    );
+        state.fb().switch_to_block(maybe_direct_block);
+        let direct_inst = state.fb().ins().call(
+            load_field_indexed_ref,
+            &[arg_values[0].0, arg_values[1].0, expected_index],
+        );
+        let direct_value = state.fb().inst_results(direct_inst)[0];
+        let direct_is_null =
+            state
+                .fb()
+                .ins()
+                .icmp(ir::condcodes::IntCC::Equal, direct_value, null_ptr);
+        state.fb().ins().brif(
+            direct_is_null,
+            fallback_block,
+            &[],
+            direct_block,
+            &[ir::BlockArg::Value(direct_value)],
+        );
 
-    state.fb().switch_to_block(direct_block);
-    let direct_value = state.fb().block_params(direct_block)[0];
-    increment_counter_ptr_with_state(state, hit_counter_ptr);
-    state.release_arg_values(&arg_values);
-    state
-        .fb()
-        .ins()
-        .jump(result_block, &[ir::BlockArg::Value(direct_value)]);
+        state.fb().switch_to_block(direct_block);
+        let direct_value = state.fb().block_params(direct_block)[0];
+        increment_counter_ptr_with_state(state, hit_counter_ptr);
+        state.release_arg_values(&arg_values);
+        state
+            .fb()
+            .ins()
+            .jump(result_block, &[ir::BlockArg::Value(direct_value)]);
+
+        if index + 1 != specializations.len() {
+            state.fb().switch_to_block(next_guard_block);
+        }
+    }
 
     state.fb().switch_to_block(fallback_block);
     increment_counter_ptr_with_state(state, fallback_counter_ptr);
@@ -561,29 +578,22 @@ fn emit_specialized_setattr<'fb>(
 
     let instr_id = op.semantic_instr_id();
     let attr_name = codegen_constant_string_value(state.ctx().module, op.attr.as_ref())?;
-    let specialization = *state
+    let specializations = state
         .ctx()
         .field_index_specializations
         .get(attr_name)?
-        .first()?;
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    if specializations.is_empty() {
+        return None;
+    }
     let arg_values =
         state.emit_arg_values(&[op.value.as_ref(), op.attr.as_ref(), op.replacement.as_ref()]);
     let ptr_ty = state.ctx().consts.ptr_ty;
     let i64_ty = state.ctx().consts.i64_ty;
     let i32_ty = state.ctx().consts.i32_ty;
     let zero_i32 = state.fb().ins().iconst(i32_ty, 0);
-    let owner_type = state
-        .fb()
-        .ins()
-        .iconst(ptr_ty, specialization.owner_type as i64);
-    let expected_version = state
-        .fb()
-        .ins()
-        .iconst(i64_ty, i64::from(specialization.type_version));
-    let expected_index = state
-        .fb()
-        .ins()
-        .iconst(i64_ty, i64::from(specialization.expected_index));
     let store_field_indexed_ref = state.ctx().store_field_indexed_ref;
     let guard_type_version_ref = state.ctx().guard_method_type_version_ref;
     let hit_counter_ptr = state
@@ -599,57 +609,81 @@ fn emit_specialized_setattr<'fb>(
 
     let result_block = state.fb().create_block();
     state.fb().append_block_param(result_block, ptr_ty);
-    let maybe_direct_block = state.fb().create_block();
-    let direct_block = state.fb().create_block();
     let fallback_block = state.fb().create_block();
+    for (index, specialization) in specializations.iter().enumerate() {
+        let maybe_direct_block = state.fb().create_block();
+        let direct_block = state.fb().create_block();
+        let next_guard_block = if index + 1 == specializations.len() {
+            fallback_block
+        } else {
+            state.fb().create_block()
+        };
 
-    let guard_inst = state.fb().ins().call(
-        guard_type_version_ref,
-        &[arg_values[0].0, owner_type, expected_version],
-    );
-    let guard_result = state.fb().inst_results(guard_inst)[0];
-    let type_matches =
+        let owner_type = state
+            .fb()
+            .ins()
+            .iconst(ptr_ty, specialization.owner_type as i64);
+        let expected_version = state
+            .fb()
+            .ins()
+            .iconst(i64_ty, i64::from(specialization.type_version));
+        let expected_index = state
+            .fb()
+            .ins()
+            .iconst(i64_ty, i64::from(specialization.expected_index));
+        let guard_inst = state.fb().ins().call(
+            guard_type_version_ref,
+            &[arg_values[0].0, owner_type, expected_version],
+        );
+        let guard_result = state.fb().inst_results(guard_inst)[0];
+        let type_matches =
+            state
+                .fb()
+                .ins()
+                .icmp(ir::condcodes::IntCC::NotEqual, guard_result, zero_i32);
         state
             .fb()
             .ins()
-            .icmp(ir::condcodes::IntCC::NotEqual, guard_result, zero_i32);
-    state
-        .fb()
-        .ins()
-        .brif(type_matches, maybe_direct_block, &[], fallback_block, &[]);
+            .brif(type_matches, maybe_direct_block, &[], next_guard_block, &[]);
 
-    state.fb().switch_to_block(maybe_direct_block);
-    let thread_state_value = state.ctx().consts.thread_state_value;
-    let direct_inst = state.fb().ins().call(
-        store_field_indexed_ref,
-        &[
-            thread_state_value,
-            arg_values[0].0,
-            arg_values[1].0,
-            expected_index,
-            arg_values[2].0,
-        ],
-    );
-    let direct_result = state.fb().inst_results(direct_inst)[0];
-    let direct_missed = state
-        .fb()
-        .ins()
-        .icmp(ir::condcodes::IntCC::Equal, direct_result, zero_i32);
-    state
-        .fb()
-        .ins()
-        .brif(direct_missed, fallback_block, &[], direct_block, &[]);
+        state.fb().switch_to_block(maybe_direct_block);
+        let thread_state_value = state.ctx().consts.thread_state_value;
+        let direct_inst = state.fb().ins().call(
+            store_field_indexed_ref,
+            &[
+                thread_state_value,
+                arg_values[0].0,
+                arg_values[1].0,
+                expected_index,
+                arg_values[2].0,
+            ],
+        );
+        let direct_result = state.fb().inst_results(direct_inst)[0];
+        let direct_missed =
+            state
+                .fb()
+                .ins()
+                .icmp(ir::condcodes::IntCC::Equal, direct_result, zero_i32);
+        state
+            .fb()
+            .ins()
+            .brif(direct_missed, fallback_block, &[], direct_block, &[]);
 
-    state.fb().switch_to_block(direct_block);
-    increment_counter_ptr_with_state(state, hit_counter_ptr);
-    let none_const = state.ctx().consts.none_const;
-    let incref_ref = state.ctx().incref_ref;
-    state.fb().ins().call(incref_ref, &[none_const]);
-    state.release_arg_values(&arg_values);
-    state
-        .fb()
-        .ins()
-        .jump(result_block, &[ir::BlockArg::Value(none_const)]);
+        state.fb().switch_to_block(direct_block);
+        increment_counter_ptr_with_state(state, hit_counter_ptr);
+        let none_const = state.ctx().consts.none_const;
+        let incref_ref = state.ctx().incref_ref;
+        state.fb().ins().call(incref_ref, &[none_const]);
+        state.release_arg_values(&arg_values);
+        state
+            .fb()
+            .ins()
+            .jump(result_block, &[ir::BlockArg::Value(none_const)]);
+
+        if index + 1 != specializations.len() {
+            state.fb().switch_to_block(next_guard_block);
+        }
+    }
 
     state.fb().switch_to_block(fallback_block);
     increment_counter_ptr_with_state(state, fallback_counter_ptr);

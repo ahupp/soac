@@ -11,7 +11,7 @@ use std::io::Write;
 use std::path::Path;
 
 pub const COUNTER_DUMP_MAGIC: [u8; 8] = *b"SOACRKV1";
-pub const COUNTER_DUMP_VERSION: u16 = 1;
+pub const COUNTER_DUMP_VERSION: u16 = 2;
 const COUNTER_DUMP_FRAME_HEADER_LEN: usize = 32;
 const COUNTER_DUMP_FRAME_ALIGN: usize = 16;
 pub const COUNTER_DUMP_NONE_U64: u64 = u64::MAX;
@@ -39,7 +39,8 @@ pub struct CounterDumpRecord {
     pub package_name: Option<String>,
     pub rows: Vec<CounterDumpRow>,
     pub module_keys: Vec<CounterDumpKeyLayout>,
-    pub type_keys: Vec<CounterDumpKeyLayout>,
+    pub type_keys: Vec<CounterDumpTypeKeyLayout>,
+    pub type_table: Vec<CounterDumpTypeTableEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +48,25 @@ pub struct CounterDumpKeyLayout {
     pub owner: String,
     pub key: String,
     pub index: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CounterDumpTypeKeyLayout {
+    pub owner_type_id: u64,
+    pub key: String,
+    pub index: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CounterDumpTypeKey {
+    pub module_name: String,
+    pub qualname: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CounterDumpTypeTableEntry {
+    pub type_id: u64,
+    pub key: CounterDumpTypeKey,
 }
 
 pub struct CounterDumpFile {
@@ -79,6 +99,18 @@ pub struct CounterDumpKeyLayoutView<'a> {
     pub index: u32,
 }
 
+pub struct CounterDumpTypeKeyLayoutView<'a> {
+    pub owner_type_id: u64,
+    pub key: &'a str,
+    pub index: u32,
+}
+
+pub struct CounterDumpTypeTableEntryView<'a> {
+    pub type_id: u64,
+    pub module_name: &'a str,
+    pub qualname: &'a str,
+}
+
 #[derive(Archive, Deserialize, Serialize, Debug)]
 #[rkyv(derive(Debug))]
 struct CounterDumpRecordArchive {
@@ -86,7 +118,8 @@ struct CounterDumpRecordArchive {
     package_name: String,
     rows: Vec<CounterDumpRowArchive>,
     module_keys: Vec<CounterDumpKeyLayoutArchive>,
-    type_keys: Vec<CounterDumpKeyLayoutArchive>,
+    type_keys: Vec<CounterDumpTypeKeyLayoutArchive>,
+    type_table: Vec<CounterDumpTypeTableEntryArchive>,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug)]
@@ -118,6 +151,22 @@ struct CounterDumpKeyLayoutArchive {
     index: u32,
 }
 
+#[derive(Archive, Deserialize, Serialize, Debug)]
+#[rkyv(derive(Debug))]
+struct CounterDumpTypeKeyLayoutArchive {
+    owner_type_id: u64,
+    key: String,
+    index: u32,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug)]
+#[rkyv(derive(Debug))]
+struct CounterDumpTypeTableEntryArchive {
+    type_id: u64,
+    module_name: String,
+    qualname: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CallTargetSpecializationEntry {
     module_name: String,
@@ -129,6 +178,13 @@ struct CallTargetSpecializationEntry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CollectedKeyLayout {
     pub owner: String,
+    pub key: String,
+    pub index: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CollectedTypeKeyLayout {
+    pub owner_type_id: u64,
     pub key: String,
     pub index: u32,
 }
@@ -176,7 +232,12 @@ impl CounterDumpRecordArchive {
             type_keys: record
                 .type_keys
                 .iter()
-                .map(CounterDumpKeyLayoutArchive::from_key_layout)
+                .map(CounterDumpTypeKeyLayoutArchive::from_type_key_layout)
+                .collect(),
+            type_table: record
+                .type_table
+                .iter()
+                .map(CounterDumpTypeTableEntryArchive::from_entry)
                 .collect(),
         }
     }
@@ -222,6 +283,26 @@ impl CounterDumpKeyLayoutArchive {
             owner: layout.owner.clone(),
             key: layout.key.clone(),
             index: layout.index,
+        }
+    }
+}
+
+impl CounterDumpTypeKeyLayoutArchive {
+    fn from_type_key_layout(layout: &CounterDumpTypeKeyLayout) -> Self {
+        Self {
+            owner_type_id: layout.owner_type_id,
+            key: layout.key.clone(),
+            index: layout.index,
+        }
+    }
+}
+
+impl CounterDumpTypeTableEntryArchive {
+    fn from_entry(entry: &CounterDumpTypeTableEntry) -> Self {
+        Self {
+            type_id: entry.type_id,
+            module_name: entry.key.module_name.clone(),
+            qualname: entry.key.qualname.clone(),
         }
     }
 }
@@ -320,17 +401,38 @@ impl<'a> CounterDumpRecordView<'a> {
         self.record.type_keys.len()
     }
 
-    pub fn type_key(&self, index: usize) -> Result<CounterDumpKeyLayoutView<'a>, String> {
+    pub fn type_key(&self, index: usize) -> Result<CounterDumpTypeKeyLayoutView<'a>, String> {
         let layout = self.record.type_keys.get(index).ok_or_else(|| {
             format!(
                 "counter dump type key {index} is out of bounds for {} keys",
                 self.type_key_count()
             )
         })?;
-        Ok(CounterDumpKeyLayoutView {
-            owner: layout.owner.as_str(),
+        Ok(CounterDumpTypeKeyLayoutView {
+            owner_type_id: layout.owner_type_id.into(),
             key: layout.key.as_str(),
             index: layout.index.into(),
+        })
+    }
+
+    pub fn type_table_count(&self) -> usize {
+        self.record.type_table.len()
+    }
+
+    pub fn type_table_entry(
+        &self,
+        index: usize,
+    ) -> Result<CounterDumpTypeTableEntryView<'a>, String> {
+        let entry = self.record.type_table.get(index).ok_or_else(|| {
+            format!(
+                "counter dump type table entry {index} is out of bounds for {} entries",
+                self.type_table_count()
+            )
+        })?;
+        Ok(CounterDumpTypeTableEntryView {
+            type_id: entry.type_id.into(),
+            module_name: entry.module_name.as_str(),
+            qualname: entry.qualname.as_str(),
         })
     }
 }
@@ -611,36 +713,11 @@ pub fn collect_branch_preferences_for_function(
 pub fn collect_module_key_layouts(
     records: &[CounterDumpRecordView<'_>],
 ) -> Result<HashMap<String, Vec<CollectedKeyLayout>>, String> {
-    collect_key_layouts(records, KeyLayoutRecordKind::Module)
-}
-
-pub fn collect_type_key_layouts(
-    records: &[CounterDumpRecordView<'_>],
-) -> Result<HashMap<String, Vec<CollectedKeyLayout>>, String> {
-    collect_key_layouts(records, KeyLayoutRecordKind::Type)
-}
-
-enum KeyLayoutRecordKind {
-    Module,
-    Type,
-}
-
-fn collect_key_layouts(
-    records: &[CounterDumpRecordView<'_>],
-    kind: KeyLayoutRecordKind,
-) -> Result<HashMap<String, Vec<CollectedKeyLayout>>, String> {
     let mut out = HashMap::<String, Vec<CollectedKeyLayout>>::new();
     let mut seen = HashSet::<(String, String, u32)>::new();
     for record in records {
-        let key_count = match kind {
-            KeyLayoutRecordKind::Module => record.module_key_count(),
-            KeyLayoutRecordKind::Type => record.type_key_count(),
-        };
-        for key_index in 0..key_count {
-            let key = match kind {
-                KeyLayoutRecordKind::Module => record.module_key(key_index)?,
-                KeyLayoutRecordKind::Type => record.type_key(key_index)?,
-            };
+        for key_index in 0..record.module_key_count() {
+            let key = record.module_key(key_index)?;
             let seen_key = (key.owner.to_string(), key.key.to_string(), key.index);
             if !seen.insert(seen_key.clone()) {
                 continue;
@@ -653,6 +730,66 @@ fn collect_key_layouts(
     }
     for layouts in out.values_mut() {
         layouts.sort_by_key(|layout| layout.index);
+    }
+    Ok(out)
+}
+
+pub fn collect_type_key_layouts(
+    records: &[CounterDumpRecordView<'_>],
+) -> Result<HashMap<u64, Vec<CollectedTypeKeyLayout>>, String> {
+    let mut out = HashMap::<u64, Vec<CollectedTypeKeyLayout>>::new();
+    let mut seen = HashSet::<(u64, String, u32)>::new();
+    for record in records {
+        for key_index in 0..record.type_key_count() {
+            let key = record.type_key(key_index)?;
+            let seen_key = (key.owner_type_id, key.key.to_string(), key.index);
+            if !seen.insert(seen_key.clone()) {
+                continue;
+            }
+            let (owner_type_id, key, index) = seen_key;
+            out.entry(owner_type_id)
+                .or_default()
+                .push(CollectedTypeKeyLayout {
+                    owner_type_id,
+                    key,
+                    index,
+                });
+        }
+    }
+    for layouts in out.values_mut() {
+        layouts.sort_by_key(|layout| layout.index);
+    }
+    Ok(out)
+}
+
+pub fn collect_type_table(
+    records: &[CounterDumpRecordView<'_>],
+) -> Result<HashMap<u64, CounterDumpTypeKey>, String> {
+    let mut out = HashMap::<u64, CounterDumpTypeKey>::new();
+    for record in records {
+        for index in 0..record.type_table_count() {
+            let entry = record.type_table_entry(index)?;
+            let key = CounterDumpTypeKey {
+                module_name: entry.module_name.to_string(),
+                qualname: entry.qualname.to_string(),
+            };
+            match out.get(&entry.type_id) {
+                Some(existing) if existing != &key => {
+                    return Err(format!(
+                        "counter dump type id {} has conflicting keys {}.{} and {}.{}",
+                        entry.type_id,
+                        existing.module_name,
+                        existing.qualname,
+                        key.module_name,
+                        key.qualname
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    out.insert(entry.type_id, key);
+                }
+            }
+        }
     }
     Ok(out)
 }
@@ -769,6 +906,20 @@ mod tests {
             .collect()
     }
 
+    fn type_key_names_by_owner(
+        layouts: HashMap<u64, Vec<CollectedTypeKeyLayout>>,
+    ) -> HashMap<u64, Vec<String>> {
+        layouts
+            .into_iter()
+            .map(|(owner, layouts)| {
+                (
+                    owner,
+                    layouts.into_iter().map(|layout| layout.key).collect(),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn encodes_length_delimited_rkyv_record() {
         let record = CounterDumpRecord {
@@ -779,10 +930,17 @@ mod tests {
                 key: "module_value".to_string(),
                 index: 0,
             }],
-            type_keys: vec![CounterDumpKeyLayout {
-                owner: "counter_test.Point".to_string(),
+            type_keys: vec![CounterDumpTypeKeyLayout {
+                owner_type_id: 17,
                 key: "x".to_string(),
                 index: 1,
+            }],
+            type_table: vec![CounterDumpTypeTableEntry {
+                type_id: 17,
+                key: CounterDumpTypeKey {
+                    module_name: "counter_test".to_string(),
+                    qualname: "Point".to_string(),
+                },
             }],
             rows: vec![
                 CounterDumpRow {
@@ -854,9 +1012,13 @@ mod tests {
         assert_eq!(module_key.key, "module_value");
         assert_eq!(module_key.index, 0);
         let type_key = record.type_key(0).expect("type key");
-        assert_eq!(type_key.owner, "counter_test.Point");
+        assert_eq!(type_key.owner_type_id, 17);
         assert_eq!(type_key.key, "x");
         assert_eq!(type_key.index, 1);
+        let type_table_entry = record.type_table_entry(0).expect("type table entry");
+        assert_eq!(type_table_entry.type_id, 17);
+        assert_eq!(type_table_entry.module_name, "counter_test");
+        assert_eq!(type_table_entry.qualname, "Point");
     }
 
     #[test]
@@ -866,6 +1028,7 @@ mod tests {
             package_name: Some("pkg".to_string()),
             module_keys: Vec::new(),
             type_keys: Vec::new(),
+            type_table: Vec::new(),
             rows: vec![CounterDumpRow {
                 counter_id: 1,
                 scope: "this".to_string(),
@@ -886,6 +1049,7 @@ mod tests {
             package_name: None,
             module_keys: Vec::new(),
             type_keys: Vec::new(),
+            type_table: Vec::new(),
             rows: vec![CounterDumpRow {
                 counter_id: 3,
                 scope: "global".to_string(),
@@ -978,17 +1142,18 @@ mod tests {
                 },
             ],
             type_keys: vec![
-                CounterDumpKeyLayout {
-                    owner: "mod.Point".to_string(),
+                CounterDumpTypeKeyLayout {
+                    owner_type_id: 7,
                     key: "y".to_string(),
                     index: 1,
                 },
-                CounterDumpKeyLayout {
-                    owner: "mod.Point".to_string(),
+                CounterDumpTypeKeyLayout {
+                    owner_type_id: 7,
                     key: "x".to_string(),
                     index: 0,
                 },
             ],
+            type_table: Vec::new(),
             rows: Vec::new(),
         };
         let bytes = record.encode().expect("counter dump should encode");
@@ -1005,12 +1170,96 @@ mod tests {
             HashMap::from([("mod".to_string(), vec!["a".to_string(), "b".to_string()])])
         );
         assert_eq!(
-            key_names_by_owner(type_keys),
-            HashMap::from([(
-                "mod.Point".to_string(),
-                vec!["x".to_string(), "y".to_string()]
-            )])
+            type_key_names_by_owner(type_keys),
+            HashMap::from([(7, vec!["x".to_string(), "y".to_string()])])
         );
+    }
+
+    #[test]
+    fn collects_type_table_by_id() {
+        let record = CounterDumpRecord {
+            module_name: "mod".to_string(),
+            package_name: None,
+            module_keys: Vec::new(),
+            type_keys: Vec::new(),
+            type_table: vec![
+                CounterDumpTypeTableEntry {
+                    type_id: 10,
+                    key: CounterDumpTypeKey {
+                        module_name: "mod".to_string(),
+                        qualname: "Point".to_string(),
+                    },
+                },
+                CounterDumpTypeTableEntry {
+                    type_id: 10,
+                    key: CounterDumpTypeKey {
+                        module_name: "mod".to_string(),
+                        qualname: "Point".to_string(),
+                    },
+                },
+                CounterDumpTypeTableEntry {
+                    type_id: 11,
+                    key: CounterDumpTypeKey {
+                        module_name: "other".to_string(),
+                        qualname: "Box".to_string(),
+                    },
+                },
+            ],
+            rows: Vec::new(),
+        };
+
+        let bytes = record.encode().expect("counter dump should encode");
+        let records =
+            parse_counter_dump_records(bytes.as_slice()).expect("counter dump should parse");
+        let table = collect_type_table(&records).expect("type table should collect");
+
+        assert_eq!(
+            table.get(&10),
+            Some(&CounterDumpTypeKey {
+                module_name: "mod".to_string(),
+                qualname: "Point".to_string(),
+            })
+        );
+        assert_eq!(
+            table.get(&11),
+            Some(&CounterDumpTypeKey {
+                module_name: "other".to_string(),
+                qualname: "Box".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_conflicting_type_table_ids() {
+        let record = CounterDumpRecord {
+            module_name: "mod".to_string(),
+            package_name: None,
+            module_keys: Vec::new(),
+            type_keys: Vec::new(),
+            type_table: vec![
+                CounterDumpTypeTableEntry {
+                    type_id: 10,
+                    key: CounterDumpTypeKey {
+                        module_name: "mod".to_string(),
+                        qualname: "Point".to_string(),
+                    },
+                },
+                CounterDumpTypeTableEntry {
+                    type_id: 10,
+                    key: CounterDumpTypeKey {
+                        module_name: "other".to_string(),
+                        qualname: "Point".to_string(),
+                    },
+                },
+            ],
+            rows: Vec::new(),
+        };
+
+        let bytes = record.encode().expect("counter dump should encode");
+        let records =
+            parse_counter_dump_records(bytes.as_slice()).expect("counter dump should parse");
+        let err = collect_type_table(&records).expect_err("conflicting type ids should fail");
+        assert!(err.contains("conflicting keys"));
     }
 
     #[test]
@@ -1020,6 +1269,7 @@ mod tests {
             package_name: None,
             module_keys: Vec::new(),
             type_keys: Vec::new(),
+            type_table: Vec::new(),
             rows: vec![
                 CounterDumpRow {
                     counter_id: 1,
@@ -1106,6 +1356,7 @@ mod tests {
             package_name: None,
             module_keys: Vec::new(),
             type_keys: Vec::new(),
+            type_table: Vec::new(),
             rows: vec![
                 CounterDumpRow {
                     counter_id: 1,
@@ -1205,6 +1456,7 @@ mod tests {
             package_name: None,
             module_keys: Vec::new(),
             type_keys: Vec::new(),
+            type_table: Vec::new(),
             rows: vec![
                 CounterDumpRow {
                     counter_id: 1,

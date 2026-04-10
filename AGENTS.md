@@ -238,6 +238,13 @@ changes the meaning of the result, ask before doing expensive work.
 Do not silently absorb recurring setup failures, missing-extension errors,
 sandbox denials, stale-workspace problems, accidental tool misuse, file-lock
 waits, perf sample loss, cache misses, or large unexpected artifact generation.
+Treat "no parallel Cargo without separate target dirs" as a hard rule: do not
+run multiple `cargo` commands in parallel unless each uses an explicitly
+separate target directory, because shared artifact/package locks add noise and
+turn focused validation into avoidable waiting. Likewise, if `just py` or
+`just pytest` repeatedly pays the full unchanged-environment venv/native build
+setup cost, report that as workflow debt and prefer or propose a lighter fast
+path for focused checks instead of silently absorbing the rebuild tax.
 Prefer durable project-native fixes over reminders: Justfile preflights,
 clearer recipes, deterministic cache/output directories, better
 panic/source-location messages, smaller repro tests, log summaries,
@@ -297,7 +304,10 @@ anything non-code affected the run. If there were no such issues, say
   tracing output. Set `SOAC_OPT_MODE=none`, `profile`, `verify`, or
   `apply`; recipes should pass the same `SOAC_WORK_DIR` and change only
   the mode between passes. `none` is the explicit ordinary
-  unspecialized/no-counter mode and should not read or write counter dumps.
+  unspecialized/no-counter mode and should not read or write counter
+  dumps. `apply` still skips counter dump files, but when event logging
+  is enabled it records indexed specialization hit/fallback counts long
+  enough to emit `soac_specialization_runtime` summary events.
 - `BENCHMARK_CPU` / `BENCHMARK_CONSTANT_CLOCKS`
   The benchmark recipes use
   [scripts/run_benchmark_with_cpu_mode.sh](/home/adam/project/soac-profile/scripts/run_benchmark_with_cpu_mode.sh)
@@ -320,8 +330,11 @@ anything non-code affected the run. If there were no such issues, say
   `;json=/path/to/events.jsonl` to write tracing JSONL there instead
   of formatted stderr. Module-load timing is emitted by the
   `soac_module_load` target; JIT-codegen timing is emitted by
-  `soac_jit_codegen`. When `SOAC_LOG` is unset and `SOAC_WORK_DIR` is
-  set, the default event log is `$SOAC_WORK_DIR/events.jsonl`.
+  `soac_jit_codegen`; apply-mode indexed specialization hit/fallback
+  summaries are emitted by `soac_specialization_runtime`. When
+  `SOAC_LOG` is unset and `SOAC_WORK_DIR` is set, the default event log
+  is `$SOAC_WORK_DIR/events.jsonl` and includes
+  `soac_specialization_runtime`.
 - `SOAC_PYTEST_TRACE` / `SOAC_PYTEST_EVENTS_LOG`
   `just pytest ...` and `just test-all` do not write the verbose JSON module
   load/JIT-codegen trace by default. Set `SOAC_PYTEST_TRACE=1` to enable it

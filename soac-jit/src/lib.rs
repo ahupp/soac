@@ -156,11 +156,6 @@ unsafe extern "C" {
     fn PyFunction_AddWatcher(callback: PyFunctionWatchCallback) -> i32;
     fn PyType_Modified(type_obj: *mut ffi::PyTypeObject);
     fn PyUnstable_Type_AssignVersionTag(type_obj: *mut ffi::PyTypeObject) -> i32;
-    fn _PyType_LookupRef(
-        type_obj: *mut ffi::PyTypeObject,
-        name: *mut ffi::PyObject,
-        out: *mut *mut ffi::PyObject,
-    ) -> i32;
     static mut PyType_Type: ffi::PyTypeObject;
     static mut PyBaseObject_Type: ffi::PyTypeObject;
     fn PyType_GenericAlloc(
@@ -561,12 +556,6 @@ pub struct DirectMethodOwnerType {
 #[derive(Clone, Copy, Debug)]
 pub struct DirectConstructorOwnerType {
     pub init_function_obj: *mut ffi::PyObject,
-    pub owner_type: *mut ffi::PyTypeObject,
-    pub type_version: u32,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct DirectFieldOwnerType {
     pub owner_type: *mut ffi::PyTypeObject,
     pub type_version: u32,
 }
@@ -1137,150 +1126,6 @@ pub unsafe fn lookup_exact_owner_types_for_constructor(
     Ok(out)
 }
 
-unsafe fn module_type_from_owner_name_in_globals(
-    globals: *mut ffi::PyObject,
-    module_name: &str,
-    owner_name: &str,
-) -> Result<Option<*mut ffi::PyTypeObject>, ()> {
-    if globals.is_null() || ffi::PyDict_Check(globals) == 0 {
-        return Ok(None);
-    }
-    let Some(owner_suffix) = owner_name
-        .strip_prefix(module_name)
-        .and_then(|suffix| suffix.strip_prefix('.'))
-    else {
-        return Ok(None);
-    };
-    let mut owner_parts = owner_suffix.split('.');
-    let Some(global_name) = owner_parts.next().filter(|name| !name.is_empty()) else {
-        return Ok(None);
-    };
-
-    let global_name_c = CString::new(global_name).map_err(|_| ())?;
-    let mut current = ffi::PyDict_GetItemString(globals, global_name_c.as_ptr());
-    if current.is_null() {
-        return Ok(None);
-    }
-    ffi::Py_INCREF(current);
-
-    for owner_part in owner_parts {
-        let owner_part_c = match CString::new(owner_part) {
-            Ok(owner_part_c) => owner_part_c,
-            Err(_) => {
-                ffi::Py_DECREF(current);
-                return Err(());
-            }
-        };
-        let next = ffi::PyObject_GetAttrString(current, owner_part_c.as_ptr());
-        ffi::Py_DECREF(current);
-        if next.is_null() {
-            ffi::PyErr_Clear();
-            return Ok(None);
-        }
-        current = next;
-    }
-
-    let owner_type = if ffi::PyType_Check(current) != 0 {
-        current as *mut ffi::PyTypeObject
-    } else {
-        ptr::null_mut()
-    };
-    ffi::Py_DECREF(current);
-    if owner_type.is_null() {
-        Ok(None)
-    } else {
-        Ok(Some(owner_type))
-    }
-}
-
-unsafe fn owner_type_has_class_binding_for_attr(
-    owner_type: *mut ffi::PyTypeObject,
-    attr_name: &str,
-) -> Result<bool, ()> {
-    let attr_name_c = CString::new(attr_name).map_err(|_| ())?;
-    let attr_obj = ffi::PyUnicode_FromString(attr_name_c.as_ptr());
-    if attr_obj.is_null() {
-        return Err(());
-    }
-    let mut descriptor = ptr::null_mut();
-    let rc = _PyType_LookupRef(owner_type, attr_obj, &mut descriptor);
-    ffi::Py_DECREF(attr_obj);
-    if rc < 0 {
-        return Err(());
-    }
-    if descriptor.is_null() {
-        Ok(false)
-    } else {
-        ffi::Py_DECREF(descriptor);
-        Ok(true)
-    }
-}
-
-pub unsafe fn lookup_exact_owner_type_for_field_in_globals(
-    globals: *mut ffi::PyObject,
-    module_name: &str,
-    owner_name: &str,
-    attr_name: &str,
-) -> Result<Option<DirectFieldOwnerType>, ()> {
-    let module_name_c = CString::new(module_name).map_err(|_| ())?;
-    let module_name_obj = ffi::PyUnicode_FromString(module_name_c.as_ptr());
-    if module_name_obj.is_null() {
-        return Err(());
-    }
-    let register_result = register_function_owner_types_for_globals(globals, module_name_obj);
-    ffi::Py_DECREF(module_name_obj);
-    if register_result.is_err() {
-        return Err(());
-    }
-
-    let Some(owner_type) =
-        (unsafe { module_type_from_owner_name_in_globals(globals, module_name, owner_name)? })
-    else {
-        return Ok(None);
-    };
-
-    let has_generic_getattr = unsafe { (*owner_type).tp_getattro }.is_some_and(|getattr| {
-        std::ptr::fn_addr_eq(
-            getattr,
-            ffi::PyObject_GenericGetAttr
-                as unsafe extern "C" fn(
-                    *mut ffi::PyObject,
-                    *mut ffi::PyObject,
-                ) -> *mut ffi::PyObject,
-        )
-    });
-    let has_generic_setattr = unsafe { (*owner_type).tp_setattro }.is_some_and(|setattr| {
-        std::ptr::fn_addr_eq(
-            setattr,
-            ffi::PyObject_GenericSetAttr
-                as unsafe extern "C" fn(
-                    *mut ffi::PyObject,
-                    *mut ffi::PyObject,
-                    *mut ffi::PyObject,
-                ) -> i32,
-        )
-    });
-    if !has_generic_getattr
-        || !has_generic_setattr
-        || unsafe { owner_type_has_class_binding_for_attr(owner_type, attr_name)? }
-    {
-        return Ok(None);
-    }
-
-    if unsafe { (*owner_type).tp_version_tag } == 0 {
-        let _ = unsafe { PyUnstable_Type_AssignVersionTag(owner_type) };
-    }
-    let type_version = unsafe { (*owner_type).tp_version_tag };
-    if type_version == 0 {
-        return Ok(None);
-    }
-
-    Ok(Some(DirectFieldOwnerType {
-        owner_type,
-        type_version,
-    }))
-}
-
 unsafe fn type_is_defined_in_module(
     owner_type: *mut ffi::PyTypeObject,
     module_name: *mut ffi::PyObject,
@@ -1420,11 +1265,10 @@ unsafe fn ensure_clif_vectorcall_compiled(
             .function()
             .map(soac_blockpy::block_py::BlockPyFunction::clone)?;
         let compile_start = Instant::now();
-        let compiled_function = match data.module_state.lookup_or_compile_direct_function_handle(
-            &data.compile_session,
-            function.function_id,
-            Some(data.function_env.globals_obj().cast()),
-        ) {
+        let compiled_function = match data
+            .module_state
+            .lookup_or_compile_direct_function_handle(&data.compile_session, function.function_id)
+        {
             Ok(Some(handle)) => handle,
             Ok(None) => {
                 let block_ptrs = vec![ptr::null_mut::<c_void>(); function.blocks.len()];
@@ -1440,7 +1284,6 @@ unsafe fn ensure_clif_vectorcall_compiled(
                     &module_constant_ptrs,
                     &counter_ptrs,
                     Some(data.module_state.as_ref()),
-                    Some(data.function_env.globals_obj().cast()),
                 );
                 match compile_result {
                     Ok(result) => {

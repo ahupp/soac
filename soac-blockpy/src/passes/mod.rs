@@ -386,7 +386,7 @@ pub use ownership_effects::{
 pub use trace::{
     instrument_bb_module_with_block_entry_counters, instrument_bb_module_with_call_target_counters,
     instrument_bb_module_with_global_load_counters, instrument_bb_module_with_locality_counters,
-    instrument_bb_module_with_refcount_counters,
+    instrument_bb_module_with_refcount_counters, specialization_runtime_logging_enabled,
 };
 pub use value_facts::{
     infer_module_value_facts, BoolFacts, BoolSingletonFact, CallableFact, EnvFacts, FactStore,

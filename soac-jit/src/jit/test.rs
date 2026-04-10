@@ -9,20 +9,42 @@ use soac_blockpy::block_py::{
 };
 use soac_blockpy::passes::{
     CodegenModuleShape, instrument_bb_module_with_block_entry_counters,
-    instrument_bb_module_with_refcount_counters, validate_codegen_instr_ids,
+    instrument_bb_module_with_call_target_counters, instrument_bb_module_with_refcount_counters,
+    validate_codegen_instr_ids,
 };
 mod tests {
     use super::*;
-    use crate::counter_dump::{CounterDumpRecord, CounterDumpRow, write_counter_dump_records};
-    use pyo3::types::PyAnyMethods;
+    use crate::counter_dump::{
+        CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey, CounterDumpTypeKeyLayout,
+        CounterDumpTypeTableEntry, write_counter_dump_records,
+    };
+    use pyo3::types::{PyAnyMethods, PyDictMethods, PyModule};
     use pyo3::{Python, ffi};
     use ruff_python_ast as ast;
     use std::ffi::c_void;
+    use std::mem::size_of;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     static CAPSULE_DESTROYED: AtomicBool = AtomicBool::new(false);
     static NEXT_TEST_WORK_DIR_ID: AtomicUsize = AtomicUsize::new(0);
+
+    #[repr(C)]
+    struct RawPyDictKeysObject {
+        dk_refcnt: isize,
+        dk_log2_size: u8,
+        dk_log2_index_bytes: u8,
+        dk_kind: u8,
+        dk_version: u32,
+        dk_usable: isize,
+        dk_nentries: isize,
+    }
+
+    #[repr(C)]
+    struct RawPyDictUnicodeEntry {
+        me_key: *mut ffi::PyObject,
+        me_value: *mut ffi::PyObject,
+    }
 
     #[test]
     fn cranelift_compile_cache_name_is_stable_from_logical_cache_name() {
@@ -235,6 +257,42 @@ mod tests {
     fn write_test_counter_dump(path: &Path, record: &CounterDumpRecord) {
         write_counter_dump_records(path, std::iter::once(record))
             .expect("test counter dump should be writable");
+    }
+
+    fn cached_split_key_layout(
+        py: Python<'_>,
+        owner_type: *mut ffi::PyTypeObject,
+    ) -> Vec<(String, u32)> {
+        const DICT_KEYS_SPLIT: u8 = 2;
+
+        let heap_type = owner_type.cast::<ffi::PyHeapTypeObject>();
+        if heap_type.is_null() {
+            return Vec::new();
+        }
+        let keys = unsafe { (*heap_type).ht_cached_keys.cast::<RawPyDictKeysObject>() };
+        if keys.is_null() || unsafe { (*keys).dk_kind } != DICT_KEYS_SPLIT {
+            return Vec::new();
+        }
+        let entries = unsafe {
+            keys.cast::<u8>()
+                .add(size_of::<RawPyDictKeysObject>() + (1usize << (*keys).dk_log2_index_bytes))
+                .cast::<RawPyDictUnicodeEntry>()
+        };
+        let mut out = Vec::new();
+        let nentries = unsafe { (*keys).dk_nentries };
+        for index in 0..nentries {
+            let key = unsafe { (*entries.add(index as usize)).me_key };
+            if key.is_null() {
+                continue;
+            }
+            out.push((
+                unsafe { pyo3::Bound::from_borrowed_ptr(py, key) }
+                    .extract()
+                    .expect("split-key entry should be a Python string"),
+                u32::try_from(index).expect("split-key index should fit in u32"),
+            ));
+        }
+        out
     }
 
     fn assign_stmt(target: ResolvedName, value: InstrCodegen) -> InstrCodegen {
@@ -902,7 +960,6 @@ mod tests {
                     &module_constant_ptrs,
                     &counter_ptrs,
                     Some(shared_state.as_ref()),
-                    None,
                 )
             }
             .expect("mutually-recursive process JIT batch should compile");
@@ -973,6 +1030,7 @@ mod tests {
                     .collect(),
                 module_keys: Vec::new(),
                 type_keys: Vec::new(),
+                type_table: Vec::new(),
             },
         );
 
@@ -1007,7 +1065,6 @@ mod tests {
                 Some(shared_state.as_ref()),
                 None,
                 None,
-                None,
             )
             .expect("specialized JIT build should succeed");
             let (clif, _cfg_dot, _vcode_disasm) = render_compiled_clif_and_vcode_disasm(
@@ -1032,6 +1089,405 @@ mod tests {
         }
 
         rendered
+    }
+
+    #[test]
+    fn field_index_specializations_resolve_type_key_without_module_globals() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
+        let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
+        let soac_work_dir = fresh_test_work_dir("test-work");
+        unsafe {
+            std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
+            std::env::set_var("SOAC_OPT_MODE", "verify");
+        }
+        crate::initialize_test_python();
+
+        Python::attach(|py| {
+            let module = PyModule::from_code(
+                py,
+                c"
+class Point:
+    pass
+",
+                c"field_type_test.py",
+                c"field_type_test",
+            )
+            .expect("test module should execute");
+            let sys = PyModule::import(py, "sys").expect("sys should import");
+            let modules = sys
+                .getattr("modules")
+                .expect("sys.modules should exist")
+                .cast_into::<pyo3::types::PyDict>()
+                .expect("sys.modules should be a dict");
+            modules
+                .set_item("field_type_test", module.as_any())
+                .expect("test module should be registered");
+            let owner_type = module
+                .getattr("Point")
+                .expect("Point should exist")
+                .as_ptr() as *mut ffi::PyTypeObject;
+
+            write_test_counter_dump(
+                soac_work_dir.join("profile.bin").as_path(),
+                &CounterDumpRecord {
+                    module_name: "counter_test".to_string(),
+                    package_name: None,
+                    rows: Vec::new(),
+                    module_keys: Vec::new(),
+                    type_keys: vec![CounterDumpTypeKeyLayout {
+                        owner_type_id: 7,
+                        key: "x".to_string(),
+                        index: 0,
+                    }],
+                    type_table: vec![CounterDumpTypeTableEntry {
+                        type_id: 7,
+                        key: CounterDumpTypeKey {
+                            module_name: "field_type_test".to_string(),
+                            qualname: "Point".to_string(),
+                        },
+                    }],
+                },
+            );
+
+            let specializations = load_field_index_specializations()
+                .expect("field specializations should load from type table");
+            let x_specializations = specializations
+                .get("x")
+                .expect("x specialization should be present");
+            assert_eq!(x_specializations.len(), 1);
+            assert_eq!(x_specializations[0].owner_type, owner_type);
+            assert_eq!(x_specializations[0].expected_index, 0);
+            assert_ne!(x_specializations[0].type_version, 0);
+
+            modules
+                .del_item("field_type_test")
+                .expect("test module should be removed");
+        });
+
+        unsafe {
+            match old_soac_work_dir {
+                Some(value) => std::env::set_var("SOAC_WORK_DIR", value),
+                None => std::env::remove_var("SOAC_WORK_DIR"),
+            }
+            match old_soac_opt_mode {
+                Some(value) => std::env::set_var("SOAC_OPT_MODE", value),
+                None => std::env::remove_var("SOAC_OPT_MODE"),
+            }
+        }
+    }
+
+    #[test]
+    fn field_index_specializations_prime_owner_type_key_layouts() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+
+        Python::attach(|py| {
+            let module = PyModule::from_code(
+                py,
+                c"
+class Point:
+    pass
+",
+                c"field_type_test.py",
+                c"field_type_test",
+            )
+            .expect("test module should execute");
+            let sys = PyModule::import(py, "sys").expect("sys should import");
+            let modules = sys
+                .getattr("modules")
+                .expect("sys.modules should exist")
+                .cast_into::<pyo3::types::PyDict>()
+                .expect("sys.modules should be a dict");
+            modules
+                .set_item("field_type_test", module.as_any())
+                .expect("test module should be registered");
+            let owner_type = module
+                .getattr("Point")
+                .expect("Point should exist")
+                .as_ptr() as *mut ffi::PyTypeObject;
+
+            assert!(
+                unsafe { owner_type_supports_field_layout_priming(owner_type) },
+                "expected Point to support field-layout priming"
+            );
+            assert_eq!(
+                cached_split_key_layout(py, owner_type),
+                Vec::<(String, u32)>::new()
+            );
+
+            prime_field_index_layout(
+                owner_type,
+                &[
+                    CollectedTypeKeyLayout {
+                        owner_type_id: 7,
+                        key: "x".to_string(),
+                        index: 0,
+                    },
+                    CollectedTypeKeyLayout {
+                        owner_type_id: 7,
+                        key: "y".to_string(),
+                        index: 1,
+                    },
+                ],
+            )
+            .expect("field-layout priming should succeed");
+
+            assert!(
+                cached_split_key_layout(py, owner_type)
+                    .starts_with(&[("x".to_string(), 0), ("y".to_string(), 1)]),
+                "expected priming to recreate Point split-key layout"
+            );
+
+            modules
+                .del_item("field_type_test")
+                .expect("test module should be removed");
+        });
+    }
+
+    #[test]
+    fn field_index_specialized_setattr_hits_apply_mode_first_insert() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
+        let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
+        let soac_work_dir = fresh_test_work_dir("test-work");
+        unsafe {
+            std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
+            std::env::set_var("SOAC_OPT_MODE", "apply");
+        }
+        crate::initialize_test_python();
+
+        Python::attach(|py| {
+            let owner_module = PyModule::from_code(
+                py,
+                c"
+class Point:
+    pass
+",
+                c"field_type_test.py",
+                c"field_type_test",
+            )
+            .expect("owner module should execute");
+            let sys = PyModule::import(py, "sys").expect("sys should import");
+            let modules = sys
+                .getattr("modules")
+                .expect("sys.modules should exist")
+                .cast_into::<pyo3::types::PyDict>()
+                .expect("sys.modules should be a dict");
+            modules
+                .set_item("field_type_test", owner_module.as_any())
+                .expect("owner module should be registered");
+
+            write_test_counter_dump(
+                soac_work_dir.join("profile.bin").as_path(),
+                &CounterDumpRecord {
+                    module_name: "counter_test".to_string(),
+                    package_name: None,
+                    rows: Vec::new(),
+                    module_keys: Vec::new(),
+                    type_keys: vec![CounterDumpTypeKeyLayout {
+                        owner_type_id: 7,
+                        key: "x".to_string(),
+                        index: 0,
+                    }],
+                    type_table: vec![CounterDumpTypeTableEntry {
+                        type_id: 7,
+                        key: CounterDumpTypeKey {
+                            module_name: "field_type_test".to_string(),
+                            qualname: "Point".to_string(),
+                        },
+                    }],
+                },
+            );
+
+            let mut lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+                r#"
+def write_point(point, value):
+    point.x = value
+    return point.x
+"#,
+            )
+            .expect("lowering should succeed")
+            .codegen_module;
+            instrument_bb_module_with_call_target_counters(&mut lowered);
+            let function = lowered
+                .callable_defs
+                .iter()
+                .find(|function| function.names.bind_name == "write_point")
+                .expect("missing lowered function write_point")
+                .clone();
+            let setattr_instr_id = function
+                .blocks
+                .iter()
+                .flat_map(|block| block.body.iter())
+                .find_map(|expr| match expr {
+                    InstrCodegen::SetAttr(_) => Some(expr.semantic_instr_id()),
+                    _ => None,
+                })
+                .expect("write_point should contain a SetAttr");
+            let field_counter_sites = lowered
+                .counter_defs
+                .iter()
+                .filter_map(|counter| match &counter.site {
+                    CounterSite::Runtime {
+                        function_id: Some(counter_function_id),
+                        instr_id: Some(counter_instr_id),
+                    } if *counter_function_id == function.function_id
+                        && counter.kind.starts_with("field_indexed") =>
+                    {
+                        Some(format!("{}@{:?}", counter.kind, counter_instr_id))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let hit_counter_id = lowered
+                .counter_defs
+                .iter()
+                .find_map(|counter| match &counter.site {
+                    CounterSite::Runtime {
+                        function_id: Some(counter_function_id),
+                        instr_id: Some(counter_instr_id),
+                    } if counter.kind == "field_indexed_hit"
+                        && *counter_function_id == function.function_id
+                        && *counter_instr_id == setattr_instr_id =>
+                    {
+                        Some(counter.id)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing field_indexed_hit counter for SetAttr {:?} in {:?}",
+                        setattr_instr_id,
+                        field_counter_sites
+                    )
+                });
+            let fallback_counter_id = lowered
+                .counter_defs
+                .iter()
+                .find_map(|counter| match &counter.site {
+                    CounterSite::Runtime {
+                        function_id: Some(counter_function_id),
+                        instr_id: Some(counter_instr_id),
+                    } if counter.kind == "field_indexed_fallback"
+                        && *counter_function_id == function.function_id
+                        && *counter_instr_id == setattr_instr_id =>
+                    {
+                        Some(counter.id)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing field_indexed_fallback counter for SetAttr {:?} in {:?}",
+                        setattr_instr_id,
+                        field_counter_sites
+                    )
+                });
+
+            let shared_state = crate::module_type::build_shared_state_for_testing(
+                py,
+                lowered,
+                "counter_test",
+                "",
+            )
+            .expect("shared state should build");
+            let runtime = unsafe { build_test_module_runtime(py, shared_state.clone()) };
+            let module_constant_ptrs = shared_state.module_constant_ptrs();
+            let counter_ptrs = shared_state.counter_ptrs();
+            let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
+            let compile_session = crate::session::CompileSession::process();
+            let compiled_handle = unsafe {
+                compile_cranelift_run_bb_specialized_cached(
+                    &compile_session,
+                    &blocks,
+                    &shared_state.lowered_module,
+                    &function,
+                    &shared_state.codegen_constants,
+                    &shared_state.lowered_module.counter_defs,
+                    &module_constant_ptrs,
+                    &counter_ptrs,
+                    Some(shared_state.as_ref()),
+                )
+            }
+            .expect("specialized write_point should compile");
+            let (code_ptr, param_count) = compiled_handle
+                .handle
+                .direct_runner_info()
+                .expect("compiled direct runner should expose entrypoint");
+            assert_eq!(param_count, 2, "write_point should take two direct args");
+            let entry: unsafe extern "C" fn(
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+            ) -> *mut c_void = unsafe { std::mem::transmute(code_ptr) };
+
+            let point_type = owner_module
+                .getattr("Point")
+                .expect("Point should exist on owner module");
+            let point = unsafe { ffi::PyObject_CallNoArgs(point_type.as_ptr()) };
+            assert!(!point.is_null(), "Point() should create a test instance");
+            unsafe { ffi::Py_INCREF(point) };
+            let value = unsafe { ffi::PyLong_FromLong(1_234_567) };
+            assert!(!value.is_null(), "test value should allocate");
+
+            let mut function_context =
+                test_function_jit_context(&runtime, std::ptr::null_mut());
+            let thread_state = unsafe { ffi::PyThreadState_Get() }.cast::<c_void>();
+            let result = unsafe {
+                entry(
+                    std::ptr::addr_of_mut!(function_context).cast(),
+                    thread_state,
+                    point.cast(),
+                    value.cast(),
+                )
+            };
+            assert!(!result.is_null(), "write_point should return the stored value");
+
+            assert_eq!(
+                shared_state.counter_value(hit_counter_id),
+                1,
+                "apply-mode SetAttr should take the indexed-store fast path"
+            );
+            assert_eq!(
+                shared_state.counter_value(fallback_counter_id),
+                0,
+                "apply-mode SetAttr should avoid the generic setattr fallback"
+            );
+
+            let point_obj = unsafe { pyo3::Bound::from_borrowed_ptr(py, point) };
+            let stored = point_obj
+                .getattr("x")
+                .expect("Point instance should now expose x");
+            assert_eq!(
+                stored.extract::<i64>().expect("stored x should be an int"),
+                1_234_567
+            );
+            let result_obj = unsafe { pyo3::Bound::from_owned_ptr(py, result.cast()) };
+            assert_eq!(
+                result_obj
+                    .extract::<i64>()
+                    .expect("write_point result should be an int"),
+                1_234_567
+            );
+
+            unsafe { ffi::Py_DECREF(point) };
+            modules
+                .del_item("field_type_test")
+                .expect("owner module should be removed");
+        });
+
+        unsafe {
+            match old_soac_work_dir {
+                Some(value) => std::env::set_var("SOAC_WORK_DIR", value),
+                None => std::env::remove_var("SOAC_WORK_DIR"),
+            }
+            match old_soac_opt_mode {
+                Some(value) => std::env::set_var("SOAC_OPT_MODE", value),
+                None => std::env::remove_var("SOAC_OPT_MODE"),
+            }
+        }
     }
 
     fn render_test_jit_function_with_constants(
@@ -1070,7 +1526,6 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
             )
             .expect("specialized JIT build should succeed");
             let (clif, _cfg_dot, _vcode_disasm) = render_compiled_clif_and_vcode_disasm(
@@ -1106,7 +1561,6 @@ mod tests {
                 &module_constant_ptrs,
                 &counter_ptrs,
                 &compile_session,
-                None,
                 None,
                 None,
                 None,
@@ -1577,7 +2031,6 @@ def f():
                     &module_constant_ptrs,
                     &counter_ptrs,
                     Some(shared_state.as_ref()),
-                    Some(runtime.mod_ctx.globals_obj),
                 )
                 .expect("direct counter test function should compile");
                 let (code_ptr, param_count) = compiled_handle
@@ -1692,7 +2145,6 @@ def f(x):
                     &module_constant_ptrs,
                     &counter_ptrs,
                     Some(shared_state.as_ref()),
-                    Some(runtime.mod_ctx.globals_obj),
                 )
                 .expect("direct refcount counter test function should compile");
                 let (code_ptr, param_count) = compiled_handle
@@ -1792,7 +2244,6 @@ def f(x):
                 &module_constant_ptrs,
                 &counter_ptrs,
                 &compile_session,
-                None,
                 None,
                 None,
                 None,
@@ -2628,6 +3079,7 @@ def f():
                         }],
                         module_keys: Vec::new(),
                         type_keys: Vec::new(),
+                        type_table: Vec::new(),
                     },
                 );
 
@@ -2664,7 +3116,10 @@ def f():
                     "class definition should execute in test globals"
                 );
                 ffi::Py_DECREF(run_result);
-                let cls = globals.get_item("Record").expect("class should exist");
+                let cls = globals
+                    .get_item("Record")
+                    .expect("class lookup should not error")
+                    .expect("class should exist");
                 let owner_type = cls.as_ptr() as *mut ffi::PyTypeObject;
                 let init_function_obj =
                     ffi::PyDict_GetItemString((*owner_type).tp_dict, c"__init__".as_ptr());
@@ -2712,7 +3167,6 @@ def f():
                     &counter_ptrs,
                     runtime.compile_session.as_ref(),
                     Some(shared_state.as_ref()),
-                    Some(runtime.mod_ctx.globals_obj),
                     None,
                     Some(&predeclared),
                 )

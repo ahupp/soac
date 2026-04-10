@@ -27,9 +27,22 @@ pub(crate) fn locality_counter_instrumentation_enabled() -> bool {
     specialization_mode_instruments_top_values()
 }
 
+pub fn specialization_runtime_logging_enabled() -> bool {
+    let mode = env::var("SOAC_OPT_MODE").unwrap_or_default();
+    if mode.trim() != "apply" {
+        return false;
+    }
+    env::var_os("SOAC_LOG")
+        .map(|value| !value.is_empty())
+        .unwrap_or(false)
+        || env::var_os("SOAC_WORK_DIR")
+            .map(|value| !value.is_empty())
+            .unwrap_or(false)
+}
+
 fn specialization_mode_instruments_top_values() -> bool {
     let mode = env::var("SOAC_OPT_MODE").unwrap_or_default();
-    matches!(mode.trim(), "profile" | "verify")
+    matches!(mode.trim(), "profile" | "verify") || specialization_runtime_logging_enabled()
 }
 
 pub(crate) fn parse_trace_config(raw: &str) -> Option<TraceConfig> {

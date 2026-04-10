@@ -1,17 +1,21 @@
+use serde_json::json;
 use soac_blockpy::block_py::FunctionId;
 use soac_inspector::CounterDumpFile;
 use soac_inspector::CounterDumpKeyLayoutView;
 use soac_inspector::CounterDumpRowView;
+use soac_inspector::CounterDumpTypeKeyLayoutView;
 use soac_jit::counter_dump::render_call_target_specializations;
 use std::path::PathBuf;
 
 struct Args {
     emit_specializations: bool,
+    emit_json: bool,
     path: PathBuf,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut emit_specializations = false;
+    let mut emit_json = false;
     let mut positionals = Vec::new();
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
@@ -21,6 +25,9 @@ fn parse_args() -> Result<Args, String> {
             }
             "--specializations" => {
                 emit_specializations = true;
+            }
+            "--json" => {
+                emit_json = true;
             }
             _ if arg.starts_with('-') => {
                 return Err(format!("unknown option: {arg}"));
@@ -33,12 +40,13 @@ fn parse_args() -> Result<Args, String> {
     }
     Ok(Args {
         emit_specializations,
+        emit_json,
         path: PathBuf::from(&positionals[0]),
     })
 }
 
 fn print_usage() {
-    eprintln!("usage: inspect_counters [--specializations] <counter-dump-file>");
+    eprintln!("usage: inspect_counters [--json | --specializations] <counter-dump-file>");
 }
 
 fn format_counter_row(row: &CounterDumpRowView<'_>) -> String {
@@ -86,23 +94,102 @@ fn format_key_layout_row(kind: &str, row: &CounterDumpKeyLayoutView<'_>) -> Stri
     )
 }
 
+fn format_type_key_layout_row(row: &CounterDumpTypeKeyLayoutView<'_>) -> String {
+    format!(
+        "  type_key owner_type_id={} key={} index={}",
+        row.owner_type_id, row.key, row.index
+    )
+}
+
 fn main() -> Result<(), String> {
     let args = parse_args().inspect_err(|_| print_usage())?;
+    if args.emit_json && args.emit_specializations {
+        return Err("--json and --specializations are mutually exclusive".to_string());
+    }
     let dump = CounterDumpFile::open(args.path.as_path())?;
     let records = dump.records()?;
     if args.emit_specializations {
         println!("{}", render_call_target_specializations(&records)?);
         return Ok(());
     }
+    if args.emit_json {
+        let mut json_records = Vec::new();
+        for record in records.iter() {
+            let mut module_keys = Vec::new();
+            for key_index in 0..record.module_key_count() {
+                let key = record.module_key(key_index)?;
+                module_keys.push(json!({
+                    "owner": key.owner,
+                    "key": key.key,
+                    "index": key.index,
+                }));
+            }
+
+            let mut type_keys = Vec::new();
+            for key_index in 0..record.type_key_count() {
+                let key = record.type_key(key_index)?;
+                type_keys.push(json!({
+                    "owner_type_id": key.owner_type_id,
+                    "key": key.key,
+                    "index": key.index,
+                }));
+            }
+
+            let mut type_table = Vec::new();
+            for entry_index in 0..record.type_table_count() {
+                let entry = record.type_table_entry(entry_index)?;
+                type_table.push(json!({
+                    "type_id": entry.type_id,
+                    "module_name": entry.module_name,
+                    "qualname": entry.qualname,
+                }));
+            }
+
+            let mut rows = Vec::new();
+            for row_index in 0..record.row_count() {
+                let row = record.row(row_index)?;
+                rows.push(json!({
+                    "counter_id": row.counter_id,
+                    "scope": row.scope,
+                    "kind": row.kind,
+                    "site_kind": row.site_kind,
+                    "function_id": row.function_id.map(|function_id| function_id.packed()),
+                    "current_function_id": row.current_function_id.map(|function_id| function_id.packed()),
+                    "instr_id": row.instr_id.map(|instr_id| instr_id.to_string()),
+                    "function_qualname": row.function_qualname,
+                    "block_label": row.block_label,
+                    "value": row.value,
+                    "observed_value": row.observed_value,
+                    "max_overcount": row.max_overcount,
+                }));
+            }
+
+            json_records.push(json!({
+                "module_name": record.module_name()?,
+                "package_name": record.package_name()?,
+                "module_keys": module_keys,
+                "type_keys": type_keys,
+                "type_table": type_table,
+                "rows": rows,
+            }));
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "records": json_records }))
+                .map_err(|err| format!("failed to encode counter dump JSON: {err}"))?
+        );
+        return Ok(());
+    }
     for (record_index, record) in records.iter().enumerate() {
         println!(
-            "record={} module={} package={} rows={} module_keys={} type_keys={}",
+            "record={} module={} package={} rows={} module_keys={} type_keys={} type_table={}",
             record_index,
             record.module_name()?,
             record.package_name()?.unwrap_or("-"),
             record.row_count(),
             record.module_key_count(),
-            record.type_key_count()
+            record.type_key_count(),
+            record.type_table_count()
         );
         for key_index in 0..record.module_key_count() {
             let key = record.module_key(key_index)?;
@@ -110,7 +197,14 @@ fn main() -> Result<(), String> {
         }
         for key_index in 0..record.type_key_count() {
             let key = record.type_key(key_index)?;
-            println!("{}", format_key_layout_row("type", &key));
+            println!("{}", format_type_key_layout_row(&key));
+        }
+        for entry_index in 0..record.type_table_count() {
+            let entry = record.type_table_entry(entry_index)?;
+            println!(
+                "  type_table type_id={} module={} qualname={}",
+                entry.type_id, entry.module_name, entry.qualname
+            );
         }
         for row_index in 0..record.row_count() {
             let row = record.row(row_index)?;
@@ -223,6 +317,7 @@ mod tests {
             package_name: None,
             module_keys: Vec::new(),
             type_keys: Vec::new(),
+            type_table: Vec::new(),
             rows: vec![
                 CounterDumpRow {
                     counter_id: 1,

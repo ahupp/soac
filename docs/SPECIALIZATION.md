@@ -198,18 +198,25 @@ apply/verify mode:
   attribute lookup.
 - `SetAttr` sites use generic attribute set in profile/verify mode.
 - In `apply` mode, constant-string `SetAttr` sites with a recorded key
-  index get the same exact-owner/version guard and then perform a raw
-  store into the expected split-dict or inline-values slot, including
-  null first-insert slots.
+  index get the same exact-owner/version guard.
+- When loading those specializations, SOAC best-effort primes the owner
+  type's shared-key layout from the recorded `type_keys` stream so fresh
+  instances in apply/verify mode already have the expected split-key
+  slots.
+- After the guard, the local-runtime helper stores directly into the
+  expected split-dict or inline-values slot. First inserts update the
+  split-values insertion order and split-dict `ma_used` when the class
+  layout has already been primed.
 
 ### Limitations / Soundness / Extensions
 
 - The owner guard is exact-type today; it is sound but does not yet keep
   base-class field fast paths active on subclasses.
-- Direct field stores are an apply-mode behavior change. Invalid inline values,
-  promoted dicts, unavailable split/inline value storage, and key-index
-  mismatch still fall back; a guarded value slot may be written without CPython
-  insertion-order, `ma_used`, watcher, or version bookkeeping.
+- Direct field stores remain an apply-mode behavior change. They still
+  bypass CPython watcher and version bookkeeping on the raw slot-store
+  path, and owner types that cannot be safely primed still fall back on
+  the first store until normal CPython execution establishes the shared
+  key layout.
 - Class attributes and descriptors are excluded by compile-time owner
   inspection. Runtime type-version guards are the fallback if a later
   class mutation invalidates that inspection.

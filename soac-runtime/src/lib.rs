@@ -502,6 +502,28 @@ unsafe fn set_split_value(
     unsafe { *values_ptr.offset(index) = value };
 }
 
+#[inline(always)]
+unsafe fn split_values_insertion_order_array(values: *mut RawPyDictSplitValues) -> *mut u8 {
+    let values_ptr = unsafe { (&raw mut (*values).values).cast::<*mut RawPyObject>() };
+    unsafe { values_ptr.offset((*values).capacity.into()).cast::<u8>() }
+}
+
+#[inline(always)]
+unsafe fn add_split_value_to_insertion_order(
+    values: *mut RawPyDictSplitValues,
+    index: isize,
+) -> bool {
+    let size = unsafe { (*values).size };
+    let capacity = unsafe { (*values).capacity };
+    if size >= capacity || index < 0 || index > u8::MAX as isize {
+        return false;
+    }
+    let order = unsafe { split_values_insertion_order_array(values) };
+    unsafe { *order.add(size.into()) = index as u8 };
+    unsafe { (*values).size = size + 1 };
+    true
+}
+
 macro_rules! load_indexed_dict_value_owned {
     ($dict:expr, $key:expr, $index:expr) => {{
         let _ = $key;
@@ -777,23 +799,40 @@ pub unsafe extern "C" fn soac_runtime_store_field_indexed(
             (*dict).ma_values.cast::<RawPyDictSplitValues>()
         })
     };
+
     if keys.is_null()
         || values.is_null()
         || unsafe { (*keys).dk_kind } != DICT_KEYS_SPLIT
-        || index < 0
         || unsafe { index >= (*values).capacity.into() }
         || unsafe { indexed_key(keys, index) } != key
     {
         return 0;
     }
-    let old_value = unsafe { split_value(values, index) };
 
-    // BEHAVIOR_CHANGE: this is a raw slot store for apply-mode JIT code.
-    // First insert, insertion order, ma_used, watchers, and versions are skipped.
+    let old_value = unsafe { split_value(values, index) };
     let value = value.cast::<RawPyObject>();
+    if old_value.is_null() {
+        let size = unsafe { (*values).size };
+        let capacity = unsafe { (*values).capacity };
+        if size >= capacity || index > u8::MAX as isize {
+            return 0;
+        }
+    }
+
+    // BEHAVIOR_CHANGE: this is a raw split-slot store for apply-mode JIT code.
+    // Existing values skip CPython watcher/version bookkeeping. First inserts
+    // keep split-value insertion order and split-dict ma_used in sync once the
+    // class shared-key layout has already been established.
     unsafe { incref_impl(value) };
     unsafe { set_split_value(values, index, value) };
-    if !old_value.is_null() {
+    if old_value.is_null() {
+        if !unsafe { add_split_value_to_insertion_order(values, index) } {
+            return 0;
+        }
+        if !dict.is_null() {
+            unsafe { (*dict).ma_used += 1 };
+        }
+    } else {
         decref_raw_with_tstate!(tstate, old_value);
     }
     1

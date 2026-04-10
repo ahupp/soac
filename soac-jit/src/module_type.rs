@@ -1,5 +1,8 @@
 use crate::counter::{Counter, CounterEntry};
-use crate::counter_dump::{CounterDumpKeyLayout, CounterDumpRecord, CounterDumpRow};
+use crate::counter_dump::{
+    CounterDumpKeyLayout, CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey,
+    CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry,
+};
 use crate::module_constants::ModuleCodegenConstants;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::ffi;
@@ -10,7 +13,8 @@ use soac_blockpy::block_py::{
     BlockPyFunction, BlockPyModule, CounterDef, CounterId, CounterScope, CounterSite, FunctionId,
 };
 use soac_blockpy::passes::CodegenModuleShape;
-use std::collections::HashMap;
+use soac_blockpy::passes::specialization_runtime_logging_enabled;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::{c_char, c_int, c_void};
 use std::fs::{OpenOptions, create_dir_all};
@@ -18,8 +22,7 @@ use std::io::Write;
 use std::mem::MaybeUninit;
 use std::path::Path;
 use std::ptr;
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tracing::info;
 
@@ -190,7 +193,6 @@ impl SharedModuleState {
         &self,
         compile_session: &Arc<crate::session::CompileSession>,
         function_id: FunctionId,
-        module_globals: Option<*mut c_void>,
     ) -> Result<Option<Arc<crate::jit::CompiledFunctionHandle>>, String> {
         if function_id == FunctionId::global() {
             return Ok(None);
@@ -201,11 +203,8 @@ impl SharedModuleState {
             else {
                 return Ok(None);
             };
-            return shared_state.lookup_or_compile_direct_function_handle(
-                compile_session,
-                function_id,
-                None,
-            );
+            return shared_state
+                .lookup_or_compile_direct_function_handle(compile_session, function_id);
         }
         if crate::jit::process_jit_is_currently_compiling() {
             return Ok(None);
@@ -229,7 +228,6 @@ impl SharedModuleState {
                 &module_constant_ptrs,
                 &counter_ptrs,
                 Some(self),
-                module_globals,
             )
         };
         match compile_result {
@@ -272,9 +270,62 @@ impl SharedModuleState {
         append_jit_codegen_log(self, function, entry_kind, elapsed, status, error);
     }
 
+    pub fn append_specialization_runtime_log(&self) {
+        if !specialization_runtime_logging_enabled() {
+            return;
+        }
+        for counter in &self.lowered_module.counter_defs {
+            let kind = counter.kind.as_str();
+            if !matches!(
+                kind,
+                "global_indexed_hit"
+                    | "global_indexed_fallback"
+                    | "field_indexed_hit"
+                    | "field_indexed_fallback"
+            ) {
+                continue;
+            }
+            let value = self.counter_value(counter.id);
+            if value == 0 {
+                continue;
+            }
+            let (function_id, instr_id, function_qualname) = match &counter.site {
+                CounterSite::BlockEntry { .. } => (String::new(), String::new(), String::new()),
+                CounterSite::Runtime {
+                    function_id,
+                    instr_id,
+                } => (
+                    function_id
+                        .map(|function_id| function_id.to_string())
+                        .unwrap_or_default(),
+                    instr_id.map(|instr_id| instr_id.to_string()).unwrap_or_default(),
+                    function_id
+                        .and_then(|function_id| {
+                            self.lookup_function(function_id)
+                                .map(|function| function.names.qualname.clone())
+                        })
+                        .unwrap_or_default(),
+                ),
+            };
+            info!(
+                target: "soac_specialization_runtime",
+                event = "soac.specialization_runtime",
+                module_name = self.module_name,
+                package_name = self.package_name,
+                kind,
+                scope = counter_scope_name(counter.scope),
+                function_id,
+                function_qualname,
+                instr_id,
+                value,
+                "specialization_runtime",
+            );
+        }
+    }
+
     pub fn counter_dump_record(&self) -> Option<CounterDumpRecord> {
         let module_keys = self.counter_dump_module_keys();
-        let type_keys = self.counter_dump_type_keys();
+        let (type_keys, type_table) = self.counter_dump_type_key_layouts();
 
         let mut rows = Vec::new();
         for counter in &self.lowered_module.counter_defs {
@@ -355,7 +406,11 @@ impl SharedModuleState {
             }
         }
 
-        if rows.is_empty() && module_keys.is_empty() && type_keys.is_empty() {
+        if rows.is_empty()
+            && module_keys.is_empty()
+            && type_keys.is_empty()
+            && type_table.is_empty()
+        {
             return None;
         }
 
@@ -365,6 +420,7 @@ impl SharedModuleState {
             rows,
             module_keys,
             type_keys,
+            type_table,
         })
     }
 
@@ -384,11 +440,16 @@ impl SharedModuleState {
             .collect()
     }
 
-    fn counter_dump_type_keys(&self) -> Vec<CounterDumpKeyLayout> {
+    fn counter_dump_type_key_layouts(
+        &self,
+    ) -> (
+        Vec<CounterDumpTypeKeyLayout>,
+        Vec<CounterDumpTypeTableEntry>,
+    ) {
         if !key_layout_counter_enabled() {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
-        snapshot_type_key_layout_events(self.module_name.as_str())
+        snapshot_type_key_layout_events()
     }
 
     pub fn append_counter_dump_file(&self, path: &Path) -> Result<(), String> {
@@ -623,6 +684,7 @@ impl SoacExtModuleState {
             return;
         }
         let shared_state = unsafe { self.shared_state.assume_init_ref().as_ref() };
+        shared_state.append_specialization_runtime_log();
         if let Some(path) = counter_dump_file_from_env() {
             if let Err(err) = shared_state.append_counter_dump_file(path.as_path()) {
                 eprintln!(
@@ -706,41 +768,95 @@ pub unsafe fn watch_split_keys_for_type(type_obj: *mut ffi::PyObject) -> Result<
     Err(())
 }
 
-fn snapshot_type_key_layout_events(module_name: &str) -> Vec<CounterDumpKeyLayout> {
+#[derive(Default)]
+struct ProfileTypeRegistry {
+    next_id: u64,
+    by_type: HashMap<usize, u64>,
+    entries: Vec<CounterDumpTypeTableEntry>,
+}
+
+impl ProfileTypeRegistry {
+    fn id_for_type(&mut self, owner_ptr: usize, key: CounterDumpTypeKey) -> PyResult<u64> {
+        if let Some(type_id) = self.by_type.get(&owner_ptr).copied() {
+            return Ok(type_id);
+        }
+        let type_id = self.next_id.max(1);
+        self.next_id = type_id
+            .checked_add(1)
+            .ok_or_else(|| PyRuntimeError::new_err("profile type id space exhausted"))?;
+        self.by_type.insert(owner_ptr, type_id);
+        self.entries
+            .push(CounterDumpTypeTableEntry { type_id, key });
+        Ok(type_id)
+    }
+
+    fn entries_for_ids(&self, used_ids: &HashSet<u64>) -> Vec<CounterDumpTypeTableEntry> {
+        self.entries
+            .iter()
+            .filter(|entry| used_ids.contains(&entry.type_id))
+            .cloned()
+            .collect()
+    }
+}
+
+static PROFILE_TYPE_REGISTRY: OnceLock<Mutex<ProfileTypeRegistry>> = OnceLock::new();
+
+fn profile_type_registry() -> &'static Mutex<ProfileTypeRegistry> {
+    PROFILE_TYPE_REGISTRY.get_or_init(|| Mutex::new(ProfileTypeRegistry::default()))
+}
+
+fn snapshot_type_key_layout_events() -> (
+    Vec<CounterDumpTypeKeyLayout>,
+    Vec<CounterDumpTypeTableEntry>,
+) {
     let events = unsafe { _PyDict_GetKeyLayoutEvents() };
     if events.is_null() {
         unsafe { ffi::PyErr_Clear() };
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
     let py = unsafe { Python::assume_attached() };
     let events = unsafe { Bound::from_owned_ptr(py, events) };
-    snapshot_type_key_layout_events_bound(events.as_any(), module_name).unwrap_or_default()
+    snapshot_type_key_layout_events_bound(events.as_any()).unwrap_or_default()
 }
 
 fn snapshot_type_key_layout_events_bound(
     events: &Bound<'_, PyAny>,
-    module_name: &str,
-) -> PyResult<Vec<CounterDumpKeyLayout>> {
+) -> PyResult<(
+    Vec<CounterDumpTypeKeyLayout>,
+    Vec<CounterDumpTypeTableEntry>,
+)> {
     let events = events.cast::<PyList>()?;
     let mut out = Vec::new();
+    let mut used_type_ids = HashSet::new();
     for event in events.iter() {
         let event = event.cast::<PyTuple>()?;
         let owner = event.get_item(0)?;
         let key: String = event.get_item(1)?.extract()?;
         let index: u32 = event.get_item(2)?.extract()?;
-        let owner_module: String = owner.getattr("__module__")?.extract()?;
-        if owner_module != module_name {
-            continue;
-        }
-        let owner_qualname: String = owner.getattr("__qualname__")?.extract()?;
-        out.push(CounterDumpKeyLayout {
-            owner: format!("{owner_module}.{owner_qualname}"),
+        let owner_ptr = owner.as_ptr() as usize;
+        let type_key = CounterDumpTypeKey {
+            module_name: owner.getattr("__module__")?.extract()?,
+            qualname: owner.getattr("__qualname__")?.extract()?,
+        };
+        let owner_type_id = {
+            let mut registry = profile_type_registry()
+                .lock()
+                .map_err(|_| PyRuntimeError::new_err("profile type registry lock was poisoned"))?;
+            registry.id_for_type(owner_ptr, type_key)?
+        };
+        used_type_ids.insert(owner_type_id);
+        out.push(CounterDumpTypeKeyLayout {
+            owner_type_id,
             key,
             index,
         });
     }
-    Ok(out)
+    let type_table = profile_type_registry()
+        .lock()
+        .map_err(|_| PyRuntimeError::new_err("profile type registry lock was poisoned"))?
+        .entries_for_ids(&used_type_ids);
+    Ok((out, type_table))
 }
 
 fn counter_dump_file_from_env() -> Option<std::path::PathBuf> {
@@ -1184,6 +1300,7 @@ impl SoacExtModule {
 mod test {
     use super::*;
     use crate::counter_dump::COUNTER_DUMP_MAGIC;
+    use pyo3::types::PyModule;
     use soac_blockpy::lower_python_to_blockpy_for_testing;
     use soac_blockpy::passes::instrument_bb_module_with_block_entry_counters;
     use std::fs;
@@ -1307,6 +1424,48 @@ def f():
         assert_ne!(slots_by_id[0], slots_by_id[2]);
         assert_ne!(slots_by_id[0], slots_by_id[4]);
         assert_ne!(slots_by_id[2], slots_by_id[4]);
+    }
+
+    #[test]
+    fn type_key_layout_events_use_profile_type_ids() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let module = PyModule::from_code(
+                py,
+                c"
+class Point:
+    pass
+
+events = [(Point, 'x', 0), (Point, 'y', 1)]
+",
+                c"type_events.py",
+                c"type_event_test",
+            )
+            .expect("test module should execute");
+            let events = module.getattr("events").expect("events should exist");
+            let (layouts, type_table) = snapshot_type_key_layout_events_bound(events.as_any())
+                .expect("type key layout events should snapshot");
+
+            assert_eq!(layouts.len(), 2);
+            let owner_type_id = layouts[0].owner_type_id;
+            assert_ne!(owner_type_id, 0);
+            assert!(
+                layouts
+                    .iter()
+                    .all(|layout| layout.owner_type_id == owner_type_id),
+                "all events for the same owner type should use one profile type id"
+            );
+            assert_eq!(layouts[0].key, "x");
+            assert_eq!(layouts[0].index, 0);
+            assert_eq!(layouts[1].key, "y");
+            assert_eq!(layouts[1].index, 1);
+
+            assert_eq!(type_table.len(), 1);
+            assert_eq!(type_table[0].type_id, owner_type_id);
+            assert_eq!(type_table[0].key.module_name, "type_event_test");
+            assert_eq!(type_table[0].key.qualname, "Point");
+        });
     }
 
     #[test]

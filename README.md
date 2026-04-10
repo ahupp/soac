@@ -138,10 +138,13 @@ exports are intentionally omitted here.
   `;json=/path/to/events.jsonl` to write tracing JSONL to that file
   instead of formatted stderr. Module-load timings are emitted as
   `soac_module_load` tracing events, and JIT-codegen timing is emitted
-  through `soac_jit_codegen`; enable them with
-  `SOAC_LOG=soac_module_load=info,soac_jit_codegen=info`.
+  through `soac_jit_codegen`. Apply-mode indexed specialization hit and
+  fallback summaries are emitted through `soac_specialization_runtime`.
+  Enable them with
+  `SOAC_LOG=soac_module_load=info,soac_jit_codegen=info,soac_specialization_runtime=info`.
   When `SOAC_LOG` is unset and `SOAC_WORK_DIR` is set, SOAC writes
-  default JSON events to `$SOAC_WORK_DIR/events.jsonl`.
+  default JSON events to `$SOAC_WORK_DIR/events.jsonl`, including the
+  `soac_specialization_runtime` target.
 
 - `SOAC_PYTEST_TRACE=1`
   Enables the verbose pytest module-load and JIT-codegen JSON trace for
@@ -206,7 +209,11 @@ exports are intentionally omitted here.
     specializations, instrument specialization input counters again, and
     write `$SOAC_WORK_DIR/verify.bin`.
   - `apply`: read `$SOAC_WORK_DIR/profile.bin`, apply its
-    specializations, and emit no specialization counters.
+    specializations, and emit no specialization counter dump files.
+    When event logging is enabled through `SOAC_LOG` or the default
+    `$SOAC_WORK_DIR/events.jsonl`, apply mode still records in-process
+    indexed specialization hit/fallback counts long enough to emit
+    `soac_specialization_runtime` summary events at module teardown.
   Set `SOAC_WORK_DIR` for any mode that reads or writes counters. Leave
   `SOAC_OPT_MODE` unset, or set it to `none`, for the ordinary
   unspecialized/no-counter path.
