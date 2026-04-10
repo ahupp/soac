@@ -116,6 +116,10 @@ result before returning `NoValue`.
 
 ## Implementation Order
 
+Status: step 1 has the initial codegen-local `ResultDemand`, `ValueOwnership`,
+and `EmitResult` wrappers in `soac-jit/src/jit/typed_value.rs`. They are not
+wired into expression emission yet.
+
 1. Add `ResultDemand::{EffectOnly, PyObject { borrowed_ok }}` and an `EmitResult`
    wrapper near the existing `SoacValue`/LocalEnv codegen types.
 2. Thread demand through `emit_codegen_expr_with_local_env` first, keeping a

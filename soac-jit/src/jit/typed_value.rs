@@ -187,6 +187,151 @@ impl SoacValue {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResultDemand {
+    EffectOnly,
+    PyObject { borrowed_ok: bool },
+}
+
+impl ResultDemand {
+    pub const PYOBJECT_OWNED: Self = Self::PyObject { borrowed_ok: false };
+    pub const PYOBJECT_BORROWED_OK: Self = Self::PyObject { borrowed_ok: true };
+
+    pub const fn needs_value(self) -> bool {
+        matches!(self, Self::PyObject { .. })
+    }
+
+    pub const fn borrowed_ok(self) -> bool {
+        match self {
+            Self::EffectOnly => false,
+            Self::PyObject { borrowed_ok } => borrowed_ok,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ValueOwnership {
+    Owned,
+    Borrowed,
+    Immortal,
+}
+
+impl ValueOwnership {
+    pub const fn is_owned(self) -> bool {
+        matches!(self, Self::Owned)
+    }
+
+    pub const fn can_satisfy_pyobject_demand(self, demand: ResultDemand) -> bool {
+        match demand {
+            ResultDemand::EffectOnly => false,
+            ResultDemand::PyObject { borrowed_ok } => {
+                borrowed_ok || matches!(self, Self::Owned | Self::Immortal)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EmitResult {
+    NoValue,
+    PyObject {
+        value: ir::Value,
+        ownership: ValueOwnership,
+        facts: PyObjFacts,
+    },
+    I32 {
+        value: ir::Value,
+        facts: IntFacts,
+    },
+    I64 {
+        value: ir::Value,
+        facts: IntFacts,
+    },
+}
+
+impl EmitResult {
+    pub const fn no_value() -> Self {
+        Self::NoValue
+    }
+
+    pub fn pyobject(value: ir::Value, ownership: ValueOwnership, facts: PyObjFacts) -> Self {
+        Self::PyObject {
+            value,
+            ownership,
+            facts,
+        }
+    }
+
+    pub fn owned_pyobject(value: ir::Value, facts: PyObjFacts) -> Self {
+        Self::pyobject(value, ValueOwnership::Owned, facts)
+    }
+
+    pub fn borrowed_pyobject(value: ir::Value, facts: PyObjFacts) -> Self {
+        Self::pyobject(value, ValueOwnership::Borrowed, facts)
+    }
+
+    pub fn immortal_pyobject(value: ir::Value, facts: PyObjFacts) -> Self {
+        Self::pyobject(value, ValueOwnership::Immortal, facts)
+    }
+
+    pub fn i32(value: ir::Value, facts: IntFacts) -> Self {
+        assert_eq!(facts.width, IntWidth::I32, "I32 EmitResult needs I32 facts");
+        Self::I32 { value, facts }
+    }
+
+    pub fn i64(value: ir::Value, facts: IntFacts) -> Self {
+        assert_eq!(facts.width, IntWidth::I64, "I64 EmitResult needs I64 facts");
+        Self::I64 { value, facts }
+    }
+
+    pub const fn has_value(self) -> bool {
+        !matches!(self, Self::NoValue)
+    }
+
+    pub const fn as_pyobject(self) -> Option<(ir::Value, ValueOwnership, PyObjFacts)> {
+        match self {
+            Self::PyObject {
+                value,
+                ownership,
+                facts,
+            } => Some((value, ownership, facts)),
+            Self::NoValue | Self::I32 { .. } | Self::I64 { .. } => None,
+        }
+    }
+
+    pub const fn as_i32(self) -> Option<(ir::Value, IntFacts)> {
+        match self {
+            Self::I32 { value, facts } => Some((value, facts)),
+            Self::NoValue | Self::PyObject { .. } | Self::I64 { .. } => None,
+        }
+    }
+
+    pub const fn as_i64(self) -> Option<(ir::Value, IntFacts)> {
+        match self {
+            Self::I64 { value, facts } => Some((value, facts)),
+            Self::NoValue | Self::PyObject { .. } | Self::I32 { .. } => None,
+        }
+    }
+
+    #[track_caller]
+    pub fn expect_pyobject(self, context: &str) -> (ir::Value, ValueOwnership, PyObjFacts) {
+        self.as_pyobject()
+            .unwrap_or_else(|| panic!("{context}: expected PyObject result, got {self:?}"))
+    }
+
+    #[track_caller]
+    pub fn expect_i32_bool01(self, context: &str) -> ir::Value {
+        let (value, facts) = self
+            .as_i32()
+            .unwrap_or_else(|| panic!("{context}: expected I32 result, got {self:?}"));
+        assert!(
+            facts.is_i32_bool01(),
+            "{context}: expected normalized I32 0/1 result, got {facts:?}"
+        );
+        value
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,5 +424,93 @@ mod tests {
     #[should_panic(expected = "expected PyObject value")]
     fn expect_pyobject_rejects_i32() {
         SoacValue::i32(value(7), IntFacts::i32_bool01()).expect_pyobject("python boundary");
+    }
+
+    #[test]
+    fn result_demand_records_whether_consumers_need_a_value() {
+        assert!(!ResultDemand::EffectOnly.needs_value());
+        assert!(!ResultDemand::EffectOnly.borrowed_ok());
+        assert!(ResultDemand::PYOBJECT_OWNED.needs_value());
+        assert!(!ResultDemand::PYOBJECT_OWNED.borrowed_ok());
+        assert!(ResultDemand::PYOBJECT_BORROWED_OK.needs_value());
+        assert!(ResultDemand::PYOBJECT_BORROWED_OK.borrowed_ok());
+    }
+
+    #[test]
+    fn value_ownership_checks_pyobject_demand_compatibility() {
+        assert!(ValueOwnership::Owned.is_owned());
+        assert!(!ValueOwnership::Borrowed.is_owned());
+        assert!(ValueOwnership::Owned.can_satisfy_pyobject_demand(ResultDemand::PYOBJECT_OWNED));
+        assert!(ValueOwnership::Immortal.can_satisfy_pyobject_demand(ResultDemand::PYOBJECT_OWNED));
+        assert!(
+            !ValueOwnership::Borrowed.can_satisfy_pyobject_demand(ResultDemand::PYOBJECT_OWNED)
+        );
+        assert!(
+            ValueOwnership::Borrowed
+                .can_satisfy_pyobject_demand(ResultDemand::PYOBJECT_BORROWED_OK)
+        );
+        assert!(!ValueOwnership::Owned.can_satisfy_pyobject_demand(ResultDemand::EffectOnly));
+    }
+
+    #[test]
+    fn emit_result_preserves_value_representation_and_ownership() {
+        let py = EmitResult::owned_pyobject(value(8), PyObjFacts::bool_object());
+        let borrowed_py = EmitResult::borrowed_pyobject(value(9), PyObjFacts::unknown());
+        let immortal_py = EmitResult::immortal_pyobject(value(10), PyObjFacts::none_singleton());
+        let i32_value = EmitResult::i32(value(11), IntFacts::i32_bool01());
+        let i64_value = EmitResult::i64(value(12), IntFacts::i64_known(99));
+
+        assert!(py.has_value());
+        assert!(!EmitResult::no_value().has_value());
+        assert_eq!(
+            py.as_pyobject(),
+            Some((value(8), ValueOwnership::Owned, PyObjFacts::bool_object()))
+        );
+        assert_eq!(
+            borrowed_py.expect_pyobject("borrowed result"),
+            (value(9), ValueOwnership::Borrowed, PyObjFacts::unknown())
+        );
+        assert_eq!(
+            immortal_py.as_pyobject(),
+            Some((
+                value(10),
+                ValueOwnership::Immortal,
+                PyObjFacts::none_singleton()
+            ))
+        );
+        assert_eq!(
+            i32_value.as_i32(),
+            Some((value(11), IntFacts::i32_bool01()))
+        );
+        assert_eq!(
+            i64_value.as_i64(),
+            Some((value(12), IntFacts::i64_known(99)))
+        );
+        assert_eq!(EmitResult::no_value().as_pyobject(), None);
+    }
+
+    #[test]
+    fn emit_result_expect_i32_bool01_returns_normalized_truth_value() {
+        let truth = EmitResult::i32(value(13), IntFacts::i32_bool01());
+
+        assert_eq!(truth.expect_i32_bool01("branch demand"), value(13));
+    }
+
+    #[test]
+    #[should_panic(expected = "I32 EmitResult needs I32 facts")]
+    fn emit_result_i32_constructor_rejects_i64_facts() {
+        EmitResult::i32(value(14), IntFacts::i64_unknown());
+    }
+
+    #[test]
+    #[should_panic(expected = "expected PyObject result")]
+    fn emit_result_expect_pyobject_rejects_no_value() {
+        EmitResult::no_value().expect_pyobject("return boundary");
+    }
+
+    #[test]
+    #[should_panic(expected = "expected normalized I32 0/1 result")]
+    fn emit_result_expect_i32_bool01_rejects_unknown_i32() {
+        EmitResult::i32(value(15), IntFacts::i32_unknown()).expect_i32_bool01("branch demand");
     }
 }
