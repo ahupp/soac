@@ -293,6 +293,13 @@ Started:
 - Runtime block params now enter `LocalEnv` as owned `LocalLocation` bindings at
   block entry. They are still mirrored into stack slots until failure cleanup
   can consume `LocalEnv` directly.
+- `LocalEnvEntry` records whether a value is local-only or mirrored into a
+  stack slot, so explicit cleanup can avoid double-decrefing transitional
+  stack-slot mirrors.
+- Stack-mirrored runtime block params are represented as borrowed `LocalEnv`
+  entries after cloning into the stack slot. Forwarding borrowed locals to a
+  successor now emits the required INCREF, so stack-slot cleanup owns the
+  mirrored reference and `LocalEnv` does not leak an extra block-param owner.
 - A first `FunctionLocalPlan` exists in JIT planning. It records per-block entry
   bindings from the storage layout, annotates them with available `EnvFacts`,
   and classifies known immortal locals without changing generated code.

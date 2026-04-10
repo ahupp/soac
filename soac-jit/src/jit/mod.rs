@@ -1737,6 +1737,13 @@ struct LocalEnvEntry {
     name: String,
     value: ir::Value,
     ref_kind: LocalRefKind,
+    storage: LocalEnvStorage,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalEnvStorage {
+    LocalOnly,
+    StackMirror,
 }
 
 #[derive(Default)]
@@ -1757,6 +1764,7 @@ impl LocalEnv {
         name: &str,
         value: ir::Value,
         ref_kind: LocalRefKind,
+        storage: LocalEnvStorage,
     ) {
         debug_assert!(
             self.entry_index_for_location(location).is_none(),
@@ -1767,6 +1775,7 @@ impl LocalEnv {
             name: name.to_string(),
             value,
             ref_kind,
+            storage,
         });
     }
 
@@ -1832,6 +1841,7 @@ impl LocalEnv {
                 name: name.to_string(),
                 value,
                 ref_kind: LocalRefKind::Owned,
+                storage: LocalEnvStorage::LocalOnly,
             });
         }
     }
@@ -1869,6 +1879,18 @@ impl LocalEnv {
         self.entries.iter().map(|entry| entry.ref_kind).collect()
     }
 
+    #[cfg(test)]
+    fn local_only_cleanup_values(&self) -> Vec<ir::Value> {
+        self.entries
+            .iter()
+            .filter(|entry| {
+                entry.storage == LocalEnvStorage::LocalOnly
+                    && transient_local_needs_decref(entry.ref_kind)
+            })
+            .map(|entry| entry.value)
+            .collect()
+    }
+
     fn to_legacy_parts(&self) -> LocalEnvLegacyParts {
         LocalEnvLegacyParts {
             names: self
@@ -1901,6 +1923,9 @@ impl LocalEnv {
                     .filter(|entry| entry.value == value)
                     .map(|entry| entry.ref_kind)
                     .unwrap_or(LocalRefKind::Owned);
+                let storage = existing_entry
+                    .map(|entry| entry.storage)
+                    .unwrap_or(LocalEnvStorage::LocalOnly);
                 LocalEnvEntry {
                     key: existing_entry
                         .map(|entry| entry.key.clone())
@@ -1908,6 +1933,7 @@ impl LocalEnv {
                     name,
                     value,
                     ref_kind,
+                    storage,
                 }
             })
             .collect();
@@ -1948,6 +1974,24 @@ fn transient_local_needs_decref(ref_kind: LocalRefKind) -> bool {
     match ref_kind {
         LocalRefKind::Owned | LocalRefKind::Unknown => true,
         LocalRefKind::Borrowed | LocalRefKind::Immortal | LocalRefKind::Unbound => false,
+    }
+}
+
+fn local_ref_kind_needs_incref_for_forward(ref_kind: LocalRefKind, forwarded_count: usize) -> bool {
+    match ref_kind {
+        LocalRefKind::Owned | LocalRefKind::Unknown => forwarded_count > 0,
+        LocalRefKind::Borrowed | LocalRefKind::Unbound => true,
+        LocalRefKind::Immortal => false,
+    }
+}
+
+fn local_ref_kind_for_stack_mirror(ref_kind: LocalRefKind) -> LocalRefKind {
+    match ref_kind {
+        LocalRefKind::Immortal => LocalRefKind::Immortal,
+        LocalRefKind::Unbound => LocalRefKind::Unbound,
+        LocalRefKind::Owned | LocalRefKind::Borrowed | LocalRefKind::Unknown => {
+            LocalRefKind::Borrowed
+        }
     }
 }
 
@@ -5891,10 +5935,16 @@ fn emit_prepare_target_args_codegen(
     explicit_args: Option<&[BlockArg]>,
     local_names: &[String],
     local_values: &[ir::Value],
+    local_ref_kinds: &[LocalRefKind],
     ctx: &JitEmitCtx<'_>,
     _jit_module: &mut JITModule,
     _func_imports: &mut FuncBuildImports<'_>,
 ) -> Option<Vec<ir::BlockArg>> {
+    debug_assert_eq!(
+        local_values.len(),
+        local_ref_kinds.len(),
+        "JIT transient local values and ref kinds must stay parallel"
+    );
     let mut args = Vec::with_capacity(target_params.len());
     let mut forwarded_local_indices = HashMap::new();
     let explicit_arg_offsets = match (full_target_params, explicit_args) {
@@ -5925,7 +5975,11 @@ fn emit_prepare_target_args_codegen(
                         let value = local_values[value_index];
                         let forwarded_count =
                             forwarded_local_indices.entry(value_index).or_insert(0usize);
-                        if *forwarded_count > 0 {
+                        let ref_kind = local_ref_kinds
+                            .get(value_index)
+                            .copied()
+                            .unwrap_or(LocalRefKind::Unknown);
+                        if local_ref_kind_needs_incref_for_forward(ref_kind, *forwarded_count) {
                             fb.ins().call(ctx.incref_ref, &[value]);
                         }
                         *forwarded_count += 1;
@@ -5961,7 +6015,11 @@ fn emit_prepare_target_args_codegen(
         if let Some(value_index) = local_names.iter().position(|candidate| candidate == name) {
             let value = local_values[value_index];
             let forwarded_count = forwarded_local_indices.entry(value_index).or_insert(0usize);
-            if *forwarded_count > 0 {
+            let ref_kind = local_ref_kinds
+                .get(value_index)
+                .copied()
+                .unwrap_or(LocalRefKind::Unknown);
+            if local_ref_kind_needs_incref_for_forward(ref_kind, *forwarded_count) {
                 fb.ins().call(ctx.incref_ref, &[value]);
             }
             *forwarded_count += 1;
@@ -6426,6 +6484,7 @@ fn emit_codegen_if_target_arm(
             None,
             local_names,
             local_values,
+            local_ref_kinds,
             emit_ctx,
             jit_module,
             func_imports,
@@ -6503,6 +6562,7 @@ fn emit_codegen_term(
                     Some(&target_label.args),
                     local_names,
                     local_values,
+                    local_ref_kinds,
                     emit_ctx,
                     jit_module,
                     func_imports,
@@ -6670,6 +6730,7 @@ fn emit_codegen_term(
                         None,
                         local_names,
                         local_values,
+                        local_ref_kinds,
                         emit_ctx,
                         jit_module,
                         func_imports,
@@ -6718,6 +6779,7 @@ fn emit_codegen_term(
                     None,
                     local_names,
                     local_values,
+                    local_ref_kinds,
                     emit_ctx,
                     jit_module,
                     func_imports,
@@ -8646,7 +8708,8 @@ fn build_cranelift_run_bb_specialized_function(
                         binding.location,
                         binding.name.as_str(),
                         *param_value,
-                        binding.ref_kind,
+                        local_ref_kind_for_stack_mirror(binding.ref_kind),
+                        LocalEnvStorage::StackMirror,
                     );
                     // Keep a stack-slot mirror until failure cleanup consumes LocalEnv directly.
                     stack_slots
@@ -8659,6 +8722,7 @@ fn build_cranelift_run_bb_specialized_function(
                             decref_ref,
                         )
                         .expect("runtime block param missing from stack slots");
+                    fb.ins().call(decref_ref, &[*param_value]);
                 } else {
                     stack_slots
                         .replace_cloned_value(

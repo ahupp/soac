@@ -488,6 +488,7 @@ mod tests {
                 name: "x".to_string(),
                 value: first,
                 ref_kind: LocalRefKind::Immortal,
+                storage: LocalEnvStorage::StackMirror,
             }],
         };
 
@@ -500,6 +501,77 @@ mod tests {
         assert_eq!(env.entries[0].name, "x");
         assert_eq!(env.entries[0].value, second);
         assert_eq!(env.entries[0].ref_kind, LocalRefKind::Owned);
+        assert_eq!(env.entries[0].storage, LocalEnvStorage::StackMirror);
+    }
+
+    #[test]
+    fn local_env_cleanup_values_exclude_stack_mirrors_and_immortals() {
+        let owned_local = ir::Value::from_u32(1);
+        let owned_mirror = ir::Value::from_u32(2);
+        let immortal_local = ir::Value::from_u32(3);
+        let env = LocalEnv {
+            entries: vec![
+                LocalEnvEntry {
+                    key: LocalEnvKey::legacy_name("local"),
+                    name: "local".to_string(),
+                    value: owned_local,
+                    ref_kind: LocalRefKind::Owned,
+                    storage: LocalEnvStorage::LocalOnly,
+                },
+                LocalEnvEntry {
+                    key: LocalEnvKey::Location(LocalLocation(0)),
+                    name: "mirror".to_string(),
+                    value: owned_mirror,
+                    ref_kind: LocalRefKind::Owned,
+                    storage: LocalEnvStorage::StackMirror,
+                },
+                LocalEnvEntry {
+                    key: LocalEnvKey::legacy_name("immortal"),
+                    name: "immortal".to_string(),
+                    value: immortal_local,
+                    ref_kind: LocalRefKind::Immortal,
+                    storage: LocalEnvStorage::LocalOnly,
+                },
+            ],
+        };
+
+        assert_eq!(env.local_only_cleanup_values(), vec![owned_local]);
+    }
+
+    #[test]
+    fn local_ref_forwarding_increfs_borrowed_and_duplicate_owned_values() {
+        assert!(!local_ref_kind_needs_incref_for_forward(
+            LocalRefKind::Owned,
+            0
+        ));
+        assert!(local_ref_kind_needs_incref_for_forward(
+            LocalRefKind::Owned,
+            1
+        ));
+        assert!(local_ref_kind_needs_incref_for_forward(
+            LocalRefKind::Borrowed,
+            0
+        ));
+        assert!(!local_ref_kind_needs_incref_for_forward(
+            LocalRefKind::Immortal,
+            0
+        ));
+    }
+
+    #[test]
+    fn stack_mirror_local_ref_kind_borrows_non_immortal_values() {
+        assert_eq!(
+            local_ref_kind_for_stack_mirror(LocalRefKind::Owned),
+            LocalRefKind::Borrowed
+        );
+        assert_eq!(
+            local_ref_kind_for_stack_mirror(LocalRefKind::Unknown),
+            LocalRefKind::Borrowed
+        );
+        assert_eq!(
+            local_ref_kind_for_stack_mirror(LocalRefKind::Immortal),
+            LocalRefKind::Immortal
+        );
     }
 
     fn render_test_jit_function(
