@@ -1459,6 +1459,7 @@ fn max_referenced_function_closure_slot(function: &BlockPyFunction<CodegenModule
     collector.max_slot_plus_one
 }
 
+#[derive(Clone)]
 struct JitEmitConsts {
     step_null_block: ir::Block,
     step_null_args: Vec<ir::Value>,
@@ -1479,6 +1480,7 @@ struct JitEmitConsts {
     py_long_type_ptr: *mut ffi::PyTypeObject,
 }
 
+#[derive(Clone)]
 struct JitEmitCtx<'mc> {
     module: &'mc BlockPyModule<CodegenModuleShape>,
     function_id: FunctionId,
@@ -1553,6 +1555,17 @@ impl JitEmitCtx<'_> {
         let instr_id = expr.try_semantic_instr_id()?;
         self.value_facts
             .fact_for(InstrKey::new(self.function_id, instr_id))
+    }
+
+    fn with_step_null_target(
+        &self,
+        step_null_block: ir::Block,
+        step_null_args: Vec<ir::Value>,
+    ) -> Self {
+        let mut ctx = self.clone();
+        ctx.consts.step_null_block = step_null_block;
+        ctx.consts.step_null_args = step_null_args;
+        ctx
     }
 }
 
@@ -2036,7 +2049,6 @@ impl LocalEnv {
         self.entries.iter().map(|entry| entry.ref_kind).collect()
     }
 
-    #[cfg(test)]
     fn local_only_cleanup_values(&self) -> Vec<ir::Value> {
         self.entries
             .iter()
@@ -2638,6 +2650,11 @@ fn local_name_index_for_block_arg(name: &str, local_names: &[String]) -> Option<
 
 fn block_arg_values(values: &[ir::Value]) -> Vec<ir::BlockArg> {
     values.iter().copied().map(ir::BlockArg::Value).collect()
+}
+
+struct PendingLocalFailureCleanup {
+    block: ir::Block,
+    cleanup_null_block: ir::Block,
 }
 
 fn step_null_block_args(ctx: &JitEmitCtx<'_>) -> Vec<ir::BlockArg> {
@@ -6708,21 +6725,60 @@ fn emit_codegen_stmt_with_local_env(
     )
 }
 
+fn local_failure_cleanup_emit_ctx<'mc>(
+    fb: &mut FunctionBuilder<'_>,
+    emit_ctx: &JitEmitCtx<'mc>,
+    local_env: &LocalEnv,
+    pre_cleanup_null_block: ir::Block,
+    cleanup_null_block: ir::Block,
+    pending_local_failure_cleanups: &mut Vec<PendingLocalFailureCleanup>,
+) -> Option<JitEmitCtx<'mc>> {
+    if emit_ctx.consts.step_null_block != pre_cleanup_null_block {
+        return None;
+    }
+    let cleanup_values = local_env.local_only_cleanup_values();
+    if cleanup_values.is_empty() {
+        return None;
+    }
+
+    let cleanup_block = fb.create_block();
+    for _ in &cleanup_values {
+        fb.append_block_param(cleanup_block, emit_ctx.consts.ptr_ty);
+    }
+    pending_local_failure_cleanups.push(PendingLocalFailureCleanup {
+        block: cleanup_block,
+        cleanup_null_block,
+    });
+    Some(emit_ctx.with_step_null_target(cleanup_block, cleanup_values))
+}
+
 fn emit_codegen_ops(
     fb: &mut FunctionBuilder<'_>,
     ops: &[InstrCodegen],
     local_env: &mut LocalEnv,
     _stack_slots: &StackSlots,
     emit_ctx: &JitEmitCtx<'_>,
+    pre_cleanup_null_block: ir::Block,
+    cleanup_null_block: ir::Block,
+    pending_local_failure_cleanups: &mut Vec<PendingLocalFailureCleanup>,
     jit_module: &mut JITModule,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<(), String> {
     for expr in ops {
+        let stmt_emit_ctx = local_failure_cleanup_emit_ctx(
+            fb,
+            emit_ctx,
+            local_env,
+            pre_cleanup_null_block,
+            cleanup_null_block,
+            pending_local_failure_cleanups,
+        );
+        let stmt_emit_ctx = stmt_emit_ctx.as_ref().unwrap_or(emit_ctx);
         let value = emit_codegen_stmt_with_local_env(
             fb,
             expr,
             local_env,
-            emit_ctx,
+            stmt_emit_ctx,
             jit_module,
             func_imports,
         );
@@ -9082,6 +9138,7 @@ fn build_cranelift_run_bb_specialized_function(
         fb.ins().jump(exec_blocks[0], &entry_jump_args);
 
         let mut exception_dispatch_blocks: Vec<Option<ir::Block>> = vec![None; exec_blocks.len()];
+        let mut pending_local_failure_cleanups = Vec::new();
         for (index, maybe_dispatch) in exc_dispatches.iter().enumerate() {
             if maybe_dispatch.is_some() {
                 let dispatch_block = fb.create_block();
@@ -9270,10 +9327,22 @@ fn build_cranelift_run_bb_specialized_function(
                 &mut local_env,
                 &stack_slots,
                 &emit_ctx,
+                pre_cleanup_null_blocks[index],
+                cleanup_null_blocks[index],
+                &mut pending_local_failure_cleanups,
                 jit_module,
                 &mut func_imports,
             )?;
 
+            let term_emit_ctx = local_failure_cleanup_emit_ctx(
+                &mut fb,
+                &emit_ctx,
+                &local_env,
+                pre_cleanup_null_blocks[index],
+                cleanup_null_blocks[index],
+                &mut pending_local_failure_cleanups,
+            );
+            let term_emit_ctx = term_emit_ctx.as_ref().unwrap_or(&emit_ctx);
             emit_codegen_term(
                 &mut fb,
                 codegen_block.label,
@@ -9282,7 +9351,7 @@ fn build_cranelift_run_bb_specialized_function(
                 &runtime_block_param_names,
                 &full_block_param_names,
                 &mut local_env,
-                &emit_ctx,
+                term_emit_ctx,
                 jit_module,
                 &mut func_imports,
                 is_true_ref,
@@ -9373,6 +9442,20 @@ fn build_cranelift_run_bb_specialized_function(
             }
             fb.ins()
                 .jump(exec_blocks[dispatch_plan.target_index], &target_jump_args);
+        }
+
+        for cleanup in &pending_local_failure_cleanups {
+            fb.switch_to_block(cleanup.block);
+            let error_value =
+                emit_take_current_raised_exception_or_trap(&mut fb, ptr_ty, thread_state_value);
+            let cleanup_values = fb.block_params(cleanup.block).to_vec();
+            for value in cleanup_values {
+                fb.ins().call(decref_ref, &[value]);
+            }
+            fb.ins().jump(
+                cleanup.cleanup_null_block,
+                &[ir::BlockArg::Value(error_value)],
+            );
         }
 
         for (index, block) in pre_cleanup_null_blocks.iter().enumerate() {

@@ -335,11 +335,13 @@ Started:
 - JIT edge-release consumption has started. Normal CFG edges and exception
   dispatch edges now consume verified ownership-plan releases by clearing stack
   slots only when target liveness/params do not preserve the local. No-handler
-  failure cleanup still uses the existing whole-stack cleanup path.
+  failure sites now route current `LocalEnv` local-only owners through per-site
+  cleanup blocks before entering the existing whole-stack cleanup path.
 - The current JIT refcount-plan consistency check no longer reports edge
   release gaps for stack-slot-backed locals. The remaining transition is to move
   semantic Python local ownership out of function-wide stack slots and into an
-  edge-transfer-aware SSA/`LocalEnv` representation for failure paths.
+  edge-transfer-aware SSA/`LocalEnv` representation for handled exception
+  dispatch and other failure paths.
 - JIT physical stack slots now use `NULL` for unbound or released local state
   instead of the runtime `DELETED` sentinel. Stack-slot loads raise the deleted
   name error before exposing `NULL` as a Python value, and stack-slot
