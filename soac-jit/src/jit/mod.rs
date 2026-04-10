@@ -2641,27 +2641,6 @@ fn is_try_abrupt_kind_name(name: &str) -> bool {
     name.starts_with("_dp_try_abrupt_kind_")
 }
 
-fn local_name_index_for_block_arg(name: &str, local_names: &[String]) -> Option<usize> {
-    local_names
-        .iter()
-        .position(|candidate| candidate == name)
-        .or_else(|| {
-            if !is_try_exception_alias_name(name) {
-                return None;
-            }
-            let mut matches = local_names
-                .iter()
-                .enumerate()
-                .filter(|(_, candidate)| is_try_exception_alias_name(candidate));
-            let first = matches.next().map(|(index, _)| index);
-            debug_assert!(
-                matches.next().is_none(),
-                "expected at most one current-exception block param"
-            );
-            first
-        })
-}
-
 fn block_arg_values(values: &[ir::Value]) -> Vec<ir::BlockArg> {
     values.iter().copied().map(ir::BlockArg::Value).collect()
 }
@@ -3377,8 +3356,7 @@ fn emit_owned_bool_from_i32_result(
 fn emit_branch_index_i64(
     fb: &mut FunctionBuilder<'_>,
     expr: &InstrCodegen,
-    local_names: &mut Vec<String>,
-    local_values: &mut Vec<ir::Value>,
+    local_env: &mut LocalEnv,
     ctx: &JitEmitCtx<'_>,
     jit_module: &mut JITModule,
     func_imports: &mut FuncBuildImports<'_>,
@@ -3386,34 +3364,24 @@ fn emit_branch_index_i64(
 ) -> ir::Value {
     match expr {
         InstrCodegen::CalleeFunctionId(op) => {
-            let callable_is_borrowed = codegen_expr_is_borrowable(
-                op.value.as_ref(),
-                local_names,
-                &ctx.stack_slots,
-                ctx.storage_layout.as_ref(),
-            );
-            let callable = emit_codegen_expr(
+            let callable = emit_codegen_expr_with_local_env(
                 fb,
                 op.value.as_ref(),
-                local_names,
-                local_values,
+                local_env,
                 ctx,
-                callable_is_borrowed,
+                false,
                 jit_module,
                 func_imports,
             );
             let callee_id = emit_callee_function_id_checked(fb, callable, ctx);
-            if !callable_is_borrowed {
-                fb.ins().call(ctx.decref_ref, &[callable]);
-            }
+            fb.ins().call(ctx.decref_ref, &[callable]);
             callee_id
         }
         _ => {
-            let index_obj = emit_codegen_expr(
+            let index_obj = emit_codegen_expr_with_local_env(
                 fb,
                 expr,
-                local_names,
-                local_values,
+                local_env,
                 ctx,
                 false,
                 jit_module,
@@ -6224,121 +6192,6 @@ fn abrupt_kind_tag(kind: AbruptKind) -> i64 {
     }
 }
 
-fn emit_prepare_target_args_codegen(
-    fb: &mut FunctionBuilder<'_>,
-    target_params: &[String],
-    full_target_params: Option<&[String]>,
-    explicit_args: Option<&[BlockArg]>,
-    local_names: &[String],
-    local_values: &[ir::Value],
-    local_ref_kinds: &[LocalRefKind],
-    ctx: &JitEmitCtx<'_>,
-    _jit_module: &mut JITModule,
-    _func_imports: &mut FuncBuildImports<'_>,
-) -> Option<Vec<ir::BlockArg>> {
-    debug_assert_eq!(
-        local_values.len(),
-        local_ref_kinds.len(),
-        "JIT transient local values and ref kinds must stay parallel"
-    );
-    let mut args = Vec::with_capacity(target_params.len());
-    let mut forwarded_local_indices = HashMap::new();
-    let explicit_arg_offsets = match (full_target_params, explicit_args) {
-        (Some(full_target_params), Some(explicit_args)) => {
-            let explicit_start = full_target_params.len().saturating_sub(explicit_args.len());
-            Some(
-                full_target_params[explicit_start..]
-                    .iter()
-                    .enumerate()
-                    .map(|(offset, name)| (name.as_str(), offset))
-                    .collect::<HashMap<_, _>>(),
-            )
-        }
-        _ => None,
-    };
-    for name in target_params {
-        if let Some(explicit_arg) = explicit_args.and_then(|args| {
-            explicit_arg_offsets
-                .as_ref()
-                .and_then(|offsets| offsets.get(name.as_str()).copied())
-                .and_then(|offset| args.get(offset))
-        }) {
-            let value = match explicit_arg {
-                BlockArg::Name(source_name) => {
-                    if let Some(value_index) =
-                        local_name_index_for_block_arg(source_name, local_names)
-                    {
-                        let value = local_values[value_index];
-                        let forwarded_count =
-                            forwarded_local_indices.entry(value_index).or_insert(0usize);
-                        let ref_kind = local_ref_kinds
-                            .get(value_index)
-                            .copied()
-                            .unwrap_or(LocalRefKind::Unknown);
-                        if local_ref_kind_needs_incref_for_forward(ref_kind, *forwarded_count) {
-                            fb.ins().call(ctx.incref_ref, &[value]);
-                        }
-                        *forwarded_count += 1;
-                        value
-                    } else if let Some(value) = load_stack_slot_value(
-                        fb,
-                        &ctx.stack_slots,
-                        source_name,
-                        ctx.consts.ptr_ty,
-                        false,
-                        ctx.incref_ref,
-                    ) {
-                        value
-                    } else {
-                        return None;
-                    }
-                }
-                BlockArg::None => {
-                    fb.ins().call(ctx.incref_ref, &[ctx.consts.none_const]);
-                    ctx.consts.none_const
-                }
-                BlockArg::CurrentException => return None,
-                BlockArg::AbruptKind(kind) => emit_owned_module_constant(
-                    fb,
-                    ctx.module_constants
-                        .require_int_constant_id(abrupt_kind_tag(*kind)),
-                    ctx,
-                ),
-            };
-            args.push(ir::BlockArg::Value(value));
-            continue;
-        }
-        if let Some(value_index) = local_names.iter().position(|candidate| candidate == name) {
-            let value = local_values[value_index];
-            let forwarded_count = forwarded_local_indices.entry(value_index).or_insert(0usize);
-            let ref_kind = local_ref_kinds
-                .get(value_index)
-                .copied()
-                .unwrap_or(LocalRefKind::Unknown);
-            if local_ref_kind_needs_incref_for_forward(ref_kind, *forwarded_count) {
-                fb.ins().call(ctx.incref_ref, &[value]);
-            }
-            *forwarded_count += 1;
-            args.push(ir::BlockArg::Value(value));
-            continue;
-        }
-        if let Some(value) = load_stack_slot_value(
-            fb,
-            &ctx.stack_slots,
-            name,
-            ctx.consts.ptr_ty,
-            false,
-            ctx.incref_ref,
-        ) {
-            args.push(ir::BlockArg::Value(value));
-            continue;
-        }
-        fb.ins().call(ctx.incref_ref, &[ctx.consts.none_const]);
-        args.push(ir::BlockArg::Value(ctx.consts.none_const));
-    }
-    Some(args)
-}
-
 fn emit_prepare_target_args_codegen_from_local_env(
     fb: &mut FunctionBuilder<'_>,
     target_params: &[String],
@@ -7115,14 +6968,10 @@ fn emit_codegen_term(
             )?;
         }
         BlockTerm::BranchTable(branch) => {
-            let mut local_parts = local_env.to_legacy_parts();
-            let local_names = &mut local_parts.names;
-            let local_values = &mut local_parts.values;
             let index_i64 = emit_branch_index_i64(
                 fb,
                 &branch.index,
-                local_names,
-                local_values,
+                local_env,
                 emit_ctx,
                 jit_module,
                 func_imports,
@@ -7141,7 +6990,6 @@ fn emit_codegen_term(
                 dispatch_block,
                 &[ir::BlockArg::Value(index_i64)],
             );
-            let local_ref_kinds = local_env.ref_kinds_for_legacy_parts(local_names, local_values);
 
             let default_block = fb.create_block();
             let mut switch = Switch::new();
@@ -7162,14 +7010,12 @@ fn emit_codegen_term(
                 let target_params = &runtime_block_param_names[target_index];
                 let mut case_jump_args = Vec::with_capacity(target_params.len());
                 case_jump_args.extend(
-                    emit_prepare_target_args_codegen(
+                    emit_prepare_target_args_codegen_from_local_env(
                         fb,
                         target_params,
                         None,
                         None,
-                        local_names,
-                        local_values,
-                        &local_ref_kinds,
+                        local_env,
                         emit_ctx,
                         jit_module,
                         func_imports,
@@ -7180,14 +7026,7 @@ fn emit_codegen_term(
                         )
                     })?,
                 );
-                emit_decref_unforwarded_locals(
-                    fb,
-                    local_values,
-                    local_names,
-                    &local_ref_kinds,
-                    target_params,
-                    decref_ref,
-                );
+                emit_decref_unforwarded_local_env(fb, local_env, target_params, decref_ref);
                 let release_reason = RefcountReleaseReason::BranchCase {
                     target: *target_label,
                 };
@@ -7211,14 +7050,12 @@ fn emit_codegen_term(
             let default_params = &runtime_block_param_names[default_index];
             let mut default_jump_args = Vec::with_capacity(default_params.len());
             default_jump_args.extend(
-                emit_prepare_target_args_codegen(
+                emit_prepare_target_args_codegen_from_local_env(
                     fb,
                     default_params,
                     None,
                     None,
-                    local_names,
-                    local_values,
-                    &local_ref_kinds,
+                    local_env,
                     emit_ctx,
                     jit_module,
                     func_imports,
@@ -7229,14 +7066,7 @@ fn emit_codegen_term(
                     )
                 })?,
             );
-            emit_decref_unforwarded_locals(
-                fb,
-                local_values,
-                local_names,
-                &local_ref_kinds,
-                default_params,
-                decref_ref,
-            );
+            emit_decref_unforwarded_local_env(fb, local_env, default_params, decref_ref);
             let release_reason = RefcountReleaseReason::BranchDefault {
                 target: branch.default_label,
             };
