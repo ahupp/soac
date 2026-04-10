@@ -22,8 +22,8 @@ use soac_blockpy::block_py::{
     AbruptKind, BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword,
     CallArgPositional, CallableScopeKind, CellLocation, ChildVisitable, CodegenBlock, CounterDef,
     CounterId, CounterScope, CounterSite, FunctionId, HasMeta, HasSemanticInstrId, InstrCodegen,
-    InstrId, InstrKey, Literal, LocalLocation, NameLocation, ParamDefaultSource, ResolvedName,
-    StorageLayout, Visit, WithMeta, operation as blockpy_intrinsics,
+    InstrId, InstrKey, Literal, LocalLocation, NameLocation, ParamDefaultSource, ParamKind,
+    ResolvedName, StorageLayout, Visit, WithMeta, operation as blockpy_intrinsics,
 };
 use soac_blockpy::passes::{
     CodegenModuleShape, FactStore, InstrResolved, ValueFacts, infer_module_value_facts,
@@ -1383,20 +1383,55 @@ fn infer_jit_value_facts(module: &BlockPyModule<CodegenModuleShape>) -> FactStor
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct DirectMethodSpecialization {
     function_id: FunctionId,
     descriptor_function: ObjPtr,
     owner_type: *mut ffi::PyTypeObject,
     type_version: u32,
+    arg_plan: DirectCallArgPlan,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct DirectConstructorSpecialization {
     function_id: FunctionId,
     init_function: ObjPtr,
     owner_type: *mut ffi::PyTypeObject,
     type_version: u32,
+    arg_plan: DirectCallArgPlan,
+}
+
+#[derive(Clone)]
+struct DirectFunctionSpecialization {
+    function_id: FunctionId,
+    arg_plan: DirectCallArgPlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectCallArgPlan {
+    sources: Vec<DirectCallArgSource>,
+}
+
+impl DirectCallArgPlan {
+    fn len(&self) -> usize {
+        self.sources.len()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectCallArgSource {
+    Provided(usize),
+    DefaultSentinel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectCallIncompatibility {
+    MissingPredeclared,
+    StarredArguments,
+    Keywords,
+    UnsupportedParameterKind { kind: ParamKind },
+    MissingRequiredArgument,
+    TooManyPositionalArguments { provided: usize, accepted: usize },
 }
 
 #[derive(Default)]
@@ -1408,6 +1443,7 @@ struct DirectEdgeStats {
     guarded_generic_fallback_blocks: Cell<usize>,
     profiled_missing_target_candidates: Cell<usize>,
     profiled_arity_mismatch_candidates: Cell<usize>,
+    profiled_unsupported_shape_candidates: Cell<usize>,
     profiled_missing_predeclared_candidates: Cell<usize>,
 }
 
@@ -1444,6 +1480,10 @@ impl DirectEdgeStats {
         Self::increment(&self.profiled_arity_mismatch_candidates);
     }
 
+    fn record_profiled_unsupported_shape_candidate(&self) {
+        Self::increment(&self.profiled_unsupported_shape_candidates);
+    }
+
     fn record_profiled_missing_predeclared_candidate(&self) {
         Self::increment(&self.profiled_missing_predeclared_candidates);
     }
@@ -1456,6 +1496,7 @@ impl DirectEdgeStats {
             + self.guarded_generic_fallback_blocks.get()
             + self.profiled_missing_target_candidates.get()
             + self.profiled_arity_mismatch_candidates.get()
+            + self.profiled_unsupported_shape_candidates.get()
             + self.profiled_missing_predeclared_candidates.get()
     }
 
@@ -1473,6 +1514,8 @@ impl DirectEdgeStats {
         let guarded_generic_fallback_blocks = self.guarded_generic_fallback_blocks.get();
         let profiled_missing_target_candidates = self.profiled_missing_target_candidates.get();
         let profiled_arity_mismatch_candidates = self.profiled_arity_mismatch_candidates.get();
+        let profiled_unsupported_shape_candidates =
+            self.profiled_unsupported_shape_candidates.get();
         let profiled_missing_predeclared_candidates =
             self.profiled_missing_predeclared_candidates.get();
         let generic_fallback_edges = call_direct_missing_target_fallbacks
@@ -1481,6 +1524,7 @@ impl DirectEdgeStats {
             + guarded_generic_fallback_blocks
             + profiled_missing_target_candidates
             + profiled_arity_mismatch_candidates
+            + profiled_unsupported_shape_candidates
             + profiled_missing_predeclared_candidates;
         info!(
             target: "soac_jit_direct_edges",
@@ -1496,6 +1540,7 @@ impl DirectEdgeStats {
             guarded_generic_fallback_blocks,
             profiled_missing_target_candidates,
             profiled_arity_mismatch_candidates,
+            profiled_unsupported_shape_candidates,
             profiled_missing_predeclared_candidates,
             "soac_jit_direct_edges"
         );
@@ -1511,6 +1556,128 @@ fn direct_call_target_function<'a>(
         .iter()
         .find(|function| function.function_id == function_id)
         .or_else(|| ctx.direct_call_target_functions.get(&function_id))
+}
+
+fn direct_call_positional_arg_count(args: &[CallArgPositional<InstrCodegen>]) -> usize {
+    args.iter()
+        .filter(|arg| matches!(arg, CallArgPositional::Positional(_)))
+        .count()
+}
+
+fn direct_call_has_starred_arguments(
+    args: &[CallArgPositional<InstrCodegen>],
+    keywords: &[CallArgKeyword<InstrCodegen>],
+) -> bool {
+    args.iter()
+        .any(|arg| matches!(arg, CallArgPositional::Starred(_)))
+        || keywords
+            .iter()
+            .any(|keyword| matches!(keyword, CallArgKeyword::Starred(_)))
+}
+
+fn plan_direct_call_args_for_target(
+    target_function: &BlockPyFunction<CodegenModuleShape>,
+    explicit_positional_arg_count: usize,
+    implicit_positional_arg_count: usize,
+    has_starred_arguments: bool,
+    has_keywords: bool,
+) -> Result<DirectCallArgPlan, DirectCallIncompatibility> {
+    if has_starred_arguments {
+        return Err(DirectCallIncompatibility::StarredArguments);
+    }
+    if has_keywords {
+        return Err(DirectCallIncompatibility::Keywords);
+    }
+
+    for param in target_function.params.iter() {
+        if matches!(param.kind, ParamKind::VarArg | ParamKind::KwArg) {
+            return Err(DirectCallIncompatibility::UnsupportedParameterKind { kind: param.kind });
+        }
+    }
+
+    let provided_positional_arg_count =
+        implicit_positional_arg_count + explicit_positional_arg_count;
+    let accepted_positional_arg_count = target_function
+        .params
+        .iter()
+        .filter(|param| matches!(param.kind, ParamKind::PosOnly | ParamKind::Any))
+        .count();
+    if provided_positional_arg_count > accepted_positional_arg_count {
+        return Err(DirectCallIncompatibility::TooManyPositionalArguments {
+            provided: provided_positional_arg_count,
+            accepted: accepted_positional_arg_count,
+        });
+    }
+
+    let mut sources = Vec::with_capacity(target_function.params.len());
+    let mut next_provided_arg = 0usize;
+    for param in target_function.params.iter() {
+        match param.kind {
+            ParamKind::PosOnly | ParamKind::Any => {
+                if next_provided_arg < provided_positional_arg_count {
+                    sources.push(DirectCallArgSource::Provided(next_provided_arg));
+                    next_provided_arg += 1;
+                } else if param.has_default {
+                    sources.push(DirectCallArgSource::DefaultSentinel);
+                } else {
+                    return Err(DirectCallIncompatibility::MissingRequiredArgument);
+                }
+            }
+            ParamKind::KwOnly => {
+                if param.has_default {
+                    sources.push(DirectCallArgSource::DefaultSentinel);
+                } else {
+                    return Err(DirectCallIncompatibility::MissingRequiredArgument);
+                }
+            }
+            ParamKind::VarArg | ParamKind::KwArg => unreachable!(
+                "unsupported variadic params should be rejected before planning direct-call args"
+            ),
+        }
+    }
+    debug_assert_eq!(next_provided_arg, provided_positional_arg_count);
+    Ok(DirectCallArgPlan { sources })
+}
+
+fn validate_direct_call_compatibility(
+    target_function: &BlockPyFunction<CodegenModuleShape>,
+    direct_call_functions: &HashMap<FunctionId, DeclaredJitFunction>,
+    explicit_positional_arg_count: usize,
+    implicit_positional_arg_count: usize,
+    has_starred_arguments: bool,
+    has_keywords: bool,
+) -> Result<DirectCallArgPlan, DirectCallIncompatibility> {
+    let arg_plan = plan_direct_call_args_for_target(
+        target_function,
+        explicit_positional_arg_count,
+        implicit_positional_arg_count,
+        has_starred_arguments,
+        has_keywords,
+    )?;
+    if !direct_call_functions.contains_key(&target_function.function_id) {
+        return Err(DirectCallIncompatibility::MissingPredeclared);
+    }
+    Ok(arg_plan)
+}
+
+fn record_profiled_direct_call_incompatibility(
+    stats: &DirectEdgeStats,
+    incompatibility: DirectCallIncompatibility,
+) {
+    match incompatibility {
+        DirectCallIncompatibility::MissingPredeclared => {
+            stats.record_profiled_missing_predeclared_candidate();
+        }
+        DirectCallIncompatibility::MissingRequiredArgument
+        | DirectCallIncompatibility::TooManyPositionalArguments { .. } => {
+            stats.record_profiled_arity_mismatch_candidate();
+        }
+        DirectCallIncompatibility::StarredArguments
+        | DirectCallIncompatibility::Keywords
+        | DirectCallIncompatibility::UnsupportedParameterKind { .. } => {
+            stats.record_profiled_unsupported_shape_candidate();
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2571,6 +2738,9 @@ fn direct_method_specializations_for_call_site(
     let Some(targets) = ctx.call_target_specializations.get(&instr_id) else {
         return Vec::new();
     };
+    let explicit_positional_arg_count = direct_call_positional_arg_count(&call.args);
+    let has_starred_arguments = direct_call_has_starred_arguments(&call.args, &call.keywords);
+    let has_keywords = !call.keywords.is_empty();
     let mut out = Vec::new();
     for function_id in targets.iter().copied() {
         let Some(target_function) = direct_call_target_function(ctx, function_id) else {
@@ -2578,16 +2748,20 @@ fn direct_method_specializations_for_call_site(
                 .record_profiled_missing_target_candidate();
             continue;
         };
-        if call.args.len() + 1 != target_function.params.len() {
-            ctx.direct_edge_stats
-                .record_profiled_arity_mismatch_candidate();
-            continue;
-        }
-        if !ctx.direct_call_functions.contains_key(&function_id) {
-            ctx.direct_edge_stats
-                .record_profiled_missing_predeclared_candidate();
-            continue;
-        }
+        let arg_plan = match validate_direct_call_compatibility(
+            target_function,
+            ctx.direct_call_functions,
+            explicit_positional_arg_count,
+            1,
+            has_starred_arguments,
+            has_keywords,
+        ) {
+            Ok(arg_plan) => arg_plan,
+            Err(incompatibility) => {
+                record_profiled_direct_call_incompatibility(ctx.direct_edge_stats, incompatibility);
+                continue;
+            }
+        };
         let Ok(owner_types) =
             (unsafe { crate::lookup_exact_owner_types_for_method(function_id, method_name) })
         else {
@@ -2601,6 +2775,7 @@ fn direct_method_specializations_for_call_site(
                     descriptor_function: owner.function_obj as ObjPtr,
                     owner_type: owner.owner_type,
                     type_version: owner.type_version,
+                    arg_plan: arg_plan.clone(),
                 }),
         );
     }
@@ -2620,6 +2795,9 @@ fn direct_constructor_specializations_for_call_site(
     let Some(targets) = ctx.call_target_specializations.get(&instr_id) else {
         return Vec::new();
     };
+    let explicit_positional_arg_count = direct_call_positional_arg_count(&call.args);
+    let has_starred_arguments = direct_call_has_starred_arguments(&call.args, &call.keywords);
+    let has_keywords = !call.keywords.is_empty();
     let mut out = Vec::new();
     for function_id in targets.iter().copied() {
         let Some(target_function) = direct_call_target_function(ctx, function_id) else {
@@ -2627,16 +2805,20 @@ fn direct_constructor_specializations_for_call_site(
                 .record_profiled_missing_target_candidate();
             continue;
         };
-        if call.args.len() + 1 != target_function.params.len() {
-            ctx.direct_edge_stats
-                .record_profiled_arity_mismatch_candidate();
-            continue;
-        }
-        if !ctx.direct_call_functions.contains_key(&function_id) {
-            ctx.direct_edge_stats
-                .record_profiled_missing_predeclared_candidate();
-            continue;
-        }
+        let arg_plan = match validate_direct_call_compatibility(
+            target_function,
+            ctx.direct_call_functions,
+            explicit_positional_arg_count,
+            1,
+            has_starred_arguments,
+            has_keywords,
+        ) {
+            Ok(arg_plan) => arg_plan,
+            Err(incompatibility) => {
+                record_profiled_direct_call_incompatibility(ctx.direct_edge_stats, incompatibility);
+                continue;
+            }
+        };
         let Ok(owner_types) =
             (unsafe { crate::lookup_exact_owner_types_for_constructor(function_id) })
         else {
@@ -2650,6 +2832,7 @@ fn direct_constructor_specializations_for_call_site(
                     init_function: owner.init_function_obj as ObjPtr,
                     owner_type: owner.owner_type,
                     type_version: owner.type_version,
+                    arg_plan: arg_plan.clone(),
                 }),
         );
     }
@@ -3214,7 +3397,7 @@ fn emit_direct_constructor_resolved_with_arg_values(
     callable_is_borrowed: bool,
     arg_values: Vec<ir::Value>,
     arg_borrowed: Vec<bool>,
-    specialization: DirectConstructorSpecialization,
+    specialization: &DirectConstructorSpecialization,
     target_function: &BlockPyFunction<CodegenModuleShape>,
     ctx: &JitEmitCtx<'_>,
     jit_module: &mut JITModule,
@@ -3254,12 +3437,19 @@ fn emit_direct_constructor_resolved_with_arg_values(
 
     fb.switch_to_block(alloc_ok);
     let allocated = fb.block_params(alloc_ok)[0];
-    let mut init_arg_values = Vec::with_capacity(arg_values.len() + 1);
-    let mut init_arg_borrowed = Vec::with_capacity(arg_borrowed.len() + 1);
-    init_arg_values.push(allocated);
-    init_arg_borrowed.push(true);
-    init_arg_values.extend(arg_values);
-    init_arg_borrowed.extend(arg_borrowed);
+    let mut provided_arg_values = Vec::with_capacity(arg_values.len() + 1);
+    let mut provided_arg_borrowed = Vec::with_capacity(arg_borrowed.len() + 1);
+    provided_arg_values.push(allocated);
+    provided_arg_borrowed.push(true);
+    provided_arg_values.extend(arg_values);
+    provided_arg_borrowed.extend(arg_borrowed);
+    let (init_arg_values, init_arg_borrowed) = emit_direct_call_args_from_plan(
+        fb,
+        &specialization.arg_plan,
+        provided_arg_values,
+        provided_arg_borrowed,
+        ptr_ty,
+    );
     let init_callable = fb.ins().iconst(ptr_ty, specialization.init_function as i64);
     let init_result = emit_direct_call_resolved_raw_with_arg_values(
         fb,
@@ -3289,11 +3479,45 @@ fn emit_direct_constructor_resolved_with_arg_values(
     fb.block_params(result_ok_block)[0]
 }
 
-fn emit_direct_call_resolved(
+fn emit_direct_call_args_from_plan(
+    fb: &mut FunctionBuilder<'_>,
+    arg_plan: &DirectCallArgPlan,
+    provided_arg_values: Vec<ir::Value>,
+    provided_arg_borrowed: Vec<bool>,
+    ptr_ty: ir::Type,
+) -> (Vec<ir::Value>, Vec<bool>) {
+    debug_assert_eq!(provided_arg_values.len(), provided_arg_borrowed.len());
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let mut arg_values = Vec::with_capacity(arg_plan.len());
+    let mut arg_borrowed = Vec::with_capacity(arg_plan.len());
+    let mut used_provided_args = 0usize;
+    for source in &arg_plan.sources {
+        match *source {
+            DirectCallArgSource::Provided(index) => {
+                debug_assert_eq!(
+                    index, used_provided_args,
+                    "direct-call arg plans should consume provided args in order"
+                );
+                arg_values.push(provided_arg_values[index]);
+                arg_borrowed.push(provided_arg_borrowed[index]);
+                used_provided_args += 1;
+            }
+            DirectCallArgSource::DefaultSentinel => {
+                arg_values.push(null_ptr);
+                arg_borrowed.push(true);
+            }
+        }
+    }
+    debug_assert_eq!(used_provided_args, provided_arg_values.len());
+    (arg_values, arg_borrowed)
+}
+
+fn emit_direct_call_resolved_with_arg_plan(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
     callable_is_borrowed: bool,
     args: &[&InstrCodegen],
+    arg_plan: &DirectCallArgPlan,
     target_function: &BlockPyFunction<CodegenModuleShape>,
     local_names: &mut Vec<String>,
     local_values: &mut Vec<ir::Value>,
@@ -3301,8 +3525,9 @@ fn emit_direct_call_resolved(
     jit_module: &mut JITModule,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> ir::Value {
-    let mut arg_values: Vec<ir::Value> = Vec::with_capacity(args.len());
-    let mut arg_borrowed: Vec<bool> = Vec::with_capacity(args.len());
+    let ptr_ty = ctx.consts.ptr_ty;
+    let mut provided_arg_values: Vec<ir::Value> = Vec::with_capacity(args.len());
+    let mut provided_arg_borrowed: Vec<bool> = Vec::with_capacity(args.len());
     for arg in args {
         let borrowed_arg = codegen_expr_is_borrowable(
             arg,
@@ -3310,8 +3535,8 @@ fn emit_direct_call_resolved(
             &ctx.stack_slots,
             ctx.storage_layout.as_ref(),
         );
-        arg_borrowed.push(borrowed_arg);
-        arg_values.push(emit_codegen_expr(
+        provided_arg_borrowed.push(borrowed_arg);
+        provided_arg_values.push(emit_codegen_expr(
             fb,
             arg,
             local_names,
@@ -3322,6 +3547,13 @@ fn emit_direct_call_resolved(
             func_imports,
         ));
     }
+    let (arg_values, arg_borrowed) = emit_direct_call_args_from_plan(
+        fb,
+        arg_plan,
+        provided_arg_values,
+        provided_arg_borrowed,
+        ptr_ty,
+    );
     emit_direct_call_resolved_with_arg_values(
         fb,
         callable,
@@ -3370,25 +3602,26 @@ fn emit_call_direct_expr(
         return fallback();
     };
 
-    let supports_direct_call = call.keywords.is_empty()
-        && call.args.len() <= target_function.params.len()
-        && call
-            .args
-            .iter()
-            .all(|arg| matches!(arg, CallArgPositional::Positional(_)));
-    if !supports_direct_call {
-        ctx.direct_edge_stats
-            .record_call_direct_unsupported_shape_fallback();
-        return fallback();
-    }
-    if !ctx
-        .direct_call_functions
-        .contains_key(&target_function.function_id)
-    {
-        ctx.direct_edge_stats
-            .record_call_direct_missing_predeclared_fallback();
-        return fallback();
-    }
+    let arg_plan = match validate_direct_call_compatibility(
+        target_function,
+        ctx.direct_call_functions,
+        direct_call_positional_arg_count(&call.args),
+        0,
+        direct_call_has_starred_arguments(&call.args, &call.keywords),
+        !call.keywords.is_empty(),
+    ) {
+        Ok(arg_plan) => arg_plan,
+        Err(DirectCallIncompatibility::MissingPredeclared) => {
+            ctx.direct_edge_stats
+                .record_call_direct_missing_predeclared_fallback();
+            return fallback();
+        }
+        Err(_) => {
+            ctx.direct_edge_stats
+                .record_call_direct_unsupported_shape_fallback();
+            return fallback();
+        }
+    };
 
     let callable_is_borrowed = codegen_expr_is_borrowable(
         call.callable.as_ref(),
@@ -3412,15 +3645,16 @@ fn emit_call_direct_expr(
         .map(|arg| match arg {
             CallArgPositional::Positional(expr) => expr,
             CallArgPositional::Starred(_) => {
-                unreachable!("non-positional direct args should have used generic fallback")
+                unreachable!("starred direct args should have used generic fallback")
             }
         })
         .collect::<Vec<_>>();
-    emit_direct_call_resolved(
+    emit_direct_call_resolved_with_arg_plan(
         fb,
         callable,
         callable_is_borrowed,
         args.as_slice(),
+        &arg_plan,
         target_function,
         local_names,
         local_values,
@@ -4219,7 +4453,7 @@ fn emit_codegen_expr(
                     fb.ins().call(incref_ref, &[block_const]);
                     return block_const;
                 }
-                if keywords.is_empty() {
+                if !has_unpack && keywords.is_empty() {
                     if func_name == "tuple_values" {
                         let mut arg_values: Vec<ir::Value> = Vec::with_capacity(args.len());
                         let mut borrowed_args: Vec<bool> = Vec::with_capacity(args.len());
@@ -4372,8 +4606,7 @@ fn emit_codegen_expr(
                     let result_block = fb.create_block();
                     fb.append_block_param(result_block, ptr_ty);
                     let generic_block = fb.create_block();
-                    for (index, specialization) in
-                        direct_method_specializations.iter().copied().enumerate()
+                    for (index, specialization) in direct_method_specializations.iter().enumerate()
                     {
                         let direct_block = fb.create_block();
                         let miss_block = if index + 1 == direct_method_specializations.len() {
@@ -4411,10 +4644,10 @@ fn emit_codegen_expr(
                         if let Some(counter_id) = direct_hit_counter_id {
                             let _ = emit_increment_counter(fb, counter_id, ctx);
                         }
-                        let mut arg_values = Vec::with_capacity(call.args.len() + 1);
-                        let mut arg_borrowed = Vec::with_capacity(call.args.len() + 1);
-                        arg_values.push(receiver);
-                        arg_borrowed.push(receiver_is_borrowed);
+                        let mut provided_arg_values = Vec::with_capacity(args.len() + 1);
+                        let mut provided_arg_borrowed = Vec::with_capacity(args.len() + 1);
+                        provided_arg_values.push(receiver);
+                        provided_arg_borrowed.push(receiver_is_borrowed);
                         for arg in args.as_slice() {
                             let borrowed_arg = codegen_expr_is_borrowable(
                                 arg,
@@ -4422,8 +4655,8 @@ fn emit_codegen_expr(
                                 &ctx.stack_slots,
                                 ctx.storage_layout.as_ref(),
                             );
-                            arg_borrowed.push(borrowed_arg);
-                            arg_values.push(emit_codegen_expr(
+                            provided_arg_borrowed.push(borrowed_arg);
+                            provided_arg_values.push(emit_codegen_expr(
                                 fb,
                                 arg,
                                 local_names,
@@ -4434,6 +4667,13 @@ fn emit_codegen_expr(
                                 func_imports,
                             ));
                         }
+                        let (arg_values, arg_borrowed) = emit_direct_call_args_from_plan(
+                            fb,
+                            &specialization.arg_plan,
+                            provided_arg_values,
+                            provided_arg_borrowed,
+                            ptr_ty,
+                        );
                         let callable = fb
                             .ins()
                             .iconst(ptr_ty, specialization.descriptor_function as i64);
@@ -4548,17 +4788,27 @@ fn emit_codegen_expr(
                                         .record_profiled_missing_target_candidate();
                                     return None;
                                 };
-                                if args.len() != target_function.params.len() {
-                                    ctx.direct_edge_stats
-                                        .record_profiled_arity_mismatch_candidate();
-                                    return None;
-                                }
-                                if !ctx.direct_call_functions.contains_key(&function_id) {
-                                    ctx.direct_edge_stats
-                                        .record_profiled_missing_predeclared_candidate();
-                                    return None;
-                                }
-                                Some(function_id)
+                                let arg_plan = match validate_direct_call_compatibility(
+                                    target_function,
+                                    ctx.direct_call_functions,
+                                    args.len(),
+                                    0,
+                                    has_unpack,
+                                    !call.keywords.is_empty(),
+                                ) {
+                                    Ok(arg_plan) => arg_plan,
+                                    Err(incompatibility) => {
+                                        record_profiled_direct_call_incompatibility(
+                                            ctx.direct_edge_stats,
+                                            incompatibility,
+                                        );
+                                        return None;
+                                    }
+                                };
+                                Some(DirectFunctionSpecialization {
+                                    function_id,
+                                    arg_plan,
+                                })
                             })
                             .collect::<Vec<_>>()
                     })
@@ -4581,7 +4831,7 @@ fn emit_codegen_expr(
                         if !constructor_specializations.is_empty() {
                             let mut next_miss_block = fb.create_block();
                             for (index, specialization) in
-                                constructor_specializations.iter().copied().enumerate()
+                                constructor_specializations.iter().enumerate()
                             {
                                 let type_match_block = fb.create_block();
                                 let direct_block = fb.create_block();
@@ -4681,7 +4931,8 @@ fn emit_codegen_expr(
                             if let Some(start_block) = direct_chain_start {
                                 fb.switch_to_block(start_block);
                             }
-                            for (index, &function_id) in direct_specializations.iter().enumerate() {
+                            for (index, specialization) in direct_specializations.iter().enumerate()
+                            {
                                 let direct_block = fb.create_block();
                                 let miss_block = if index + 1 == direct_specializations.len() {
                                     generic_block
@@ -4691,21 +4942,23 @@ fn emit_codegen_expr(
                                 let is_match = fb.ins().icmp_imm(
                                     ir::condcodes::IntCC::Equal,
                                     callee_id,
-                                    function_id.packed() as i64,
+                                    specialization.function_id.packed() as i64,
                                 );
                                 fb.ins().brif(is_match, direct_block, &[], miss_block, &[]);
 
                                 fb.switch_to_block(direct_block);
-                                let target_function = direct_call_target_function(ctx, function_id)
-                                    .expect("direct specialization target should exist");
+                                let target_function =
+                                    direct_call_target_function(ctx, specialization.function_id)
+                                        .expect("direct specialization target should exist");
                                 if let Some(counter_id) = direct_hit_counter_id {
                                     let _ = emit_increment_counter(fb, counter_id, ctx);
                                 }
-                                let direct_result = emit_direct_call_resolved(
+                                let direct_result = emit_direct_call_resolved_with_arg_plan(
                                     fb,
                                     callable,
                                     callable_is_borrowed,
                                     args.as_slice(),
+                                    &specialization.arg_plan,
                                     target_function,
                                     local_names,
                                     local_values,

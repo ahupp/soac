@@ -256,6 +256,113 @@ mod tests {
         ))
     }
 
+    fn test_param(name: &str, kind: ParamKind, has_default: bool) -> Param {
+        Param {
+            name: name.into(),
+            kind,
+            has_default,
+        }
+    }
+
+    #[test]
+    fn direct_call_arg_plan_binds_defaults_to_parameter_slots() {
+        let mut target = test_function();
+        target.params.params = vec![
+            test_param("x", ParamKind::Any, false),
+            test_param("y", ParamKind::Any, true),
+            test_param("z", ParamKind::KwOnly, true),
+        ];
+
+        let plan = plan_direct_call_args_for_target(&target, 1, 0, false, false)
+            .expect("defaulted parameters should use sentinel direct args");
+        assert_eq!(
+            plan.sources,
+            vec![
+                DirectCallArgSource::Provided(0),
+                DirectCallArgSource::DefaultSentinel,
+                DirectCallArgSource::DefaultSentinel,
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_call_arg_plan_accounts_for_bound_receiver() {
+        let mut target = test_function();
+        target.params.params = vec![
+            test_param("self", ParamKind::Any, false),
+            test_param("value", ParamKind::Any, false),
+        ];
+
+        let plan = plan_direct_call_args_for_target(&target, 1, 1, false, false)
+            .expect("bound receiver should count as a provided direct arg");
+        assert_eq!(
+            plan.sources,
+            vec![
+                DirectCallArgSource::Provided(0),
+                DirectCallArgSource::Provided(1),
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_call_arg_plan_rejects_unsupported_call_shapes() {
+        let mut target = test_function();
+        target.params.params = vec![test_param("x", ParamKind::Any, false)];
+
+        assert_eq!(
+            plan_direct_call_args_for_target(&target, 1, 0, true, false),
+            Err(DirectCallIncompatibility::StarredArguments)
+        );
+        assert_eq!(
+            plan_direct_call_args_for_target(&target, 1, 0, false, true),
+            Err(DirectCallIncompatibility::Keywords)
+        );
+
+        let mut vararg_target = test_function();
+        vararg_target.params.params = vec![test_param("args", ParamKind::VarArg, false)];
+        assert_eq!(
+            plan_direct_call_args_for_target(&vararg_target, 0, 0, false, false),
+            Err(DirectCallIncompatibility::UnsupportedParameterKind {
+                kind: ParamKind::VarArg,
+            })
+        );
+    }
+
+    #[test]
+    fn direct_call_arg_plan_rejects_incompatible_arity() {
+        let mut target = test_function();
+        target.params.params = vec![test_param("x", ParamKind::Any, false)];
+
+        assert_eq!(
+            plan_direct_call_args_for_target(&target, 0, 0, false, false),
+            Err(DirectCallIncompatibility::MissingRequiredArgument)
+        );
+        assert_eq!(
+            plan_direct_call_args_for_target(&target, 2, 0, false, false),
+            Err(DirectCallIncompatibility::TooManyPositionalArguments {
+                provided: 2,
+                accepted: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn direct_call_compatibility_requires_predeclared_target() {
+        let target = test_function();
+
+        assert_eq!(
+            validate_direct_call_compatibility(
+                &target,
+                &std::collections::HashMap::new(),
+                0,
+                0,
+                false,
+                false,
+            ),
+            Err(DirectCallIncompatibility::MissingPredeclared)
+        );
+    }
+
     fn render_test_jit_function(
         function: &BlockPyFunction<CodegenModuleShape>,
         blocks: &[ObjPtr],

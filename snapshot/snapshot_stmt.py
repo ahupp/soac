@@ -298,8 +298,53 @@ except:
 
 # ==
 
-# snapshot regeneration failed
-# panic: py_stmt template must produce exactly one statement, got 2
+# function _dp_module_init():
+#     function_id: 0:1
+#     block bb1:
+#         jump bb17
+#         block bb17:
+#             f()
+#             return NONE
+#     block bb0:
+#         return NONE
+#     block bb3(_dp_try_exc_0_1_0: Exception):
+#         exc_param: _dp_try_exc_0_1_0
+#         branch_table _dp_try_abrupt_kind_0_1_2 -> [bb0, bb4, bb5] default bb0
+#     block bb4(_dp_try_exc_0_1_0: Exception):
+#         exc_param: _dp_try_exc_0_1_0
+#         return _dp_try_abrupt_payload_0_1_3
+#     block bb5(_dp_try_exc_0_1_0: Exception):
+#         exc_param: _dp_try_exc_0_1_0
+#         raise _dp_try_abrupt_payload_0_1_3
+#     block bb6(_dp_try_exc_0_1_0: Exception):
+#         exc_param: _dp_try_exc_0_1_0
+#         StoreName("e", _dp_try_exc_0_1_0)
+#         jump bb13
+#     block bb7(_dp_try_exc_0_1_0: Exception, _dp_try_abrupt_kind_0_1_2: AbruptKind, _dp_try_abrupt_payload_0_1_3: AbruptPayload):
+#         exc_param: _dp_try_exc_0_1_0
+#         del_quietly(e)
+#         jump bb3
+#     block bb8(_dp_try_exc_0_1_0: Exception):
+#         exc_param: _dp_try_exc_0_1_0
+#         jump bb7(AbruptKind(Fallthrough), None)
+#     block bb9(_dp_try_exc_0_1_0: Exception):
+#         exc_param: _dp_try_exc_0_1_0
+#         jump bb7(AbruptKind(Exception), Name("_dp_try_exc_0_1_0"))
+#     block bb13(_dp_try_exc_0_1_0: Exception):
+#         exc_param: _dp_try_exc_0_1_0
+#         g(e)
+#         jump bb8
+#     block bb15(_dp_try_exc_0_1_0: Exception):
+#         exc_param: _dp_try_exc_0_1_0
+#         h()
+#         return NONE
+#     block bb16(_dp_try_exc_0_1_0: Exception):
+#         exc_param: _dp_try_exc_0_1_0
+#         if_term exception_matches(_dp_try_exc_0_1_0, E):
+#             then:
+#                 jump bb6
+#             else:
+#                 jump bb15
 
 # for_else
 

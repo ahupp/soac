@@ -222,40 +222,44 @@ apply/verify mode:
 - Source input is `call_hot_targets`.
 - The observed value is the callee `FunctionId` recovered by
   `emit_callee_function_id_checked`, at
-  `soac-jit/src/jit/mod.rs:2084`.
+  `soac-jit/src/jit/mod.rs:3032`.
 - This only applies to `Call` sites with:
   - no keywords
-  - only positional arguments
+  - no starred / unpacked arguments
+  - a target signature that can be bound to direct-entry parameter
+    slots using positional inputs plus default sentinels
 
 ### Codegen
 
 - The generic direct-call specialization path lives in the `Call`
   lowering branch in `emit_codegen_expr`, at
-  `soac-jit/src/jit/mod.rs:3720`.
+  `soac-jit/src/jit/mod.rs:4777`.
 - On the hot path it:
   - computes the callee `FunctionId`
   - compares it against profiled targets
-  - emits a direct `call_indirect` to the already-compiled specialized
+  - builds a direct argument plan for the target entry ABI, including
+    null sentinels for omitted defaulted parameters
+  - emits a direct Cranelift `call` to the already-compiled specialized
     runner for that function via
-    `emit_direct_call_resolved_with_arg_values`, at
-    `soac-jit/src/jit/mod.rs:2378`
+    `emit_direct_call_resolved_with_arg_plan`, at
+    `soac-jit/src/jit/mod.rs:3515`
 - On miss it falls back to normal Python vectorcall lowering.
 
 ### Limitations / Soundness / Extensions
 
 - Current limitations:
   - keywords are excluded
-  - starred args are excluded
-  - argument count must exactly match the target function parameter
-    count
+  - starred / unpacked args are excluded
+  - variadic target params are excluded
+  - required keyword-only target params are excluded unless they have a
+    default value
 - Soundness boundary:
   - this is sound as long as the `FunctionId` metadata attached to
     transformed Python functions stays correct
   - the specialization is guarded by exact callee identity, so misses
     fall back cleanly
 - Natural extensions:
-  - omitted-default direct calls
-  - keyword-only/default argument handling for profiled call sites
+  - keyword argument binding for profiled call sites
   - richer support for more Python callable shapes that still map to a
     transformed function body
 
@@ -267,24 +271,24 @@ apply/verify mode:
 - Source input is also `call_hot_targets`.
 - This specialization is only considered when the call target is a
   `GetAttr`, in `direct_method_specializations_for_call_site`, at
-  `soac-jit/src/jit/mod.rs:1723`.
+  `soac-jit/src/jit/mod.rs:2722`.
 - The profiled hot target is still the method function's `FunctionId`.
 - The specialization then refines that with owner-type metadata from
   `lookup_exact_owner_types_for_method`, called from
   `direct_method_specializations_for_call_site`, at
-  `soac-jit/src/jit/mod.rs:1780`.
+  `soac-jit/src/jit/mod.rs:2766`.
 
 ### Codegen
 
 - Method specialization is emitted in `emit_codegen_expr`, at
-  `soac-jit/src/jit/mod.rs:3530`.
+  `soac-jit/src/jit/mod.rs:4584`.
 - The fast path:
   - evaluates the receiver once
   - guards exact owner type and owner type version via the inlineable
     `soac_runtime_guard_type_version`
   - uses the descriptor function object directly
   - prepends the receiver as arg0
-  - emits a direct `call_indirect` to the compiled target function
+  - emits a direct Cranelift `call` to the compiled target function
 - On miss it falls back to ordinary attribute lookup plus generic call
   lowering.
 
@@ -292,8 +296,9 @@ apply/verify mode:
 
 - Current limitations:
   - only constant-string `GetAttr` call targets
-  - no keywords / only positional args
-  - exact-arity match only
+  - no keywords or starred / unpacked args
+  - explicit args plus the implicit receiver must bind to the target's
+    direct-entry parameter slots
   - only methods backed by transformed Python functions with registered
     owner-type metadata
 - Soundness boundary:
@@ -301,7 +306,7 @@ apply/verify mode:
   - if owner-type invalidation misses a real semantic mutation, this
     path could become unsound
 - Natural extensions:
-  - omitted defaults and kwargs
+  - keyword argument binding
   - broader descriptor families
   - more precise subtype-friendly guards where exact owner type is too
     strict but still provably safe
@@ -316,17 +321,17 @@ apply/verify mode:
   observed `FunctionId` for the hot transformed `__init__` target.
 - The constructor-specific refinement happens in
   `direct_constructor_specializations_for_call_site`, at
-  `soac-jit/src/jit/mod.rs:1813`, which uses
+  `soac-jit/src/jit/mod.rs:2785`, which uses
   `lookup_exact_owner_types_for_constructor`, at
-  `soac-jit/src/lib.rs:795`.
+  `soac-jit/src/lib.rs:1008`.
 
 ### Codegen
 
 - Constructor specialization is emitted from the `Call` lowering path
-  in `emit_codegen_expr`, at `soac-jit/src/jit/mod.rs:3718`.
+  in `emit_codegen_expr`, at `soac-jit/src/jit/mod.rs:4775`.
 - The actual constructor fast path is
   `emit_direct_constructor_resolved_with_arg_values`, at
-  `soac-jit/src/jit/mod.rs:2422`.
+  `soac-jit/src/jit/mod.rs:3394`.
 - The fast path:
   - guards exact callee object identity against the profiled owner type
   - guards the owner type version
@@ -345,8 +350,9 @@ apply/verify mode:
 - Current limitations:
   - only heap types with a simple default constructor shape
   - exact callee type object match
-  - exact-arity positional calls only
-  - no kwargs
+  - no keywords or starred / unpacked args
+  - explicit args plus the allocated instance must bind to the target's
+    direct-entry parameter slots
   - no custom metaclass `__call__`
   - no custom `tp_new`
   - no custom allocator
@@ -360,8 +366,7 @@ apply/verify mode:
     because class calls are not generally equivalent to direct
     `__init__` calls
 - Natural extensions:
-  - omitted-default constructor args
-  - kwargs
+  - keyword argument binding
   - explicit support for selected builtin constructors
   - broader safe subsets of heap types, if we can prove the constructor
     protocol remains equivalent to the fast path

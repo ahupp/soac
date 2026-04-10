@@ -48,7 +48,7 @@ snapshot_stmt::delete_mixed: blockpy=1, clif=1
 snapshot_stmt::assert_no_msg: blockpy=7, clif=7
 snapshot_stmt::assert_with_msg: blockpy=7, clif=7
 snapshot_stmt::raise_from: blockpy=1, clif=1
-snapshot_stmt::try_except_typed: ERROR snapshot regeneration failed | panic: py_stmt template must produce exactly one statement, got 2
+snapshot_stmt::try_except_typed: blockpy=13, clif=13
 snapshot_stmt::for_else: blockpy=5, clif=5
 snapshot_stmt::while_else: blockpy=4, clif=4
 snapshot_stmt::with_as: blockpy=15, clif=16
