@@ -144,6 +144,20 @@ to an `i32` / CLIF condition directly, or call an appropriate
 rich-compare-bool style helper, while preserving the owned-object
 compare result when Python code actually consumes that bool.
 
+### Exact-int truth helper splitting
+
+An attempted split of exact-`int` `not` / internal truth unary operations into a
+new `nb_bool`-returning helper was benchmark-negative: median specialized
+throughput changed `126471 -> 125195 loops/s` (`-1.01%`). The specialization set
+did not change, and the baseline exact-long unary helper path was only about
+`0.05%` in the perf symbol report.
+
+Lesson: do not split tiny object-returning helpers into separate out-of-line
+truth helpers as a standalone optimization. For typed truth to pay off, it needs
+to remove a larger producer/consumer chain or stay in generated code through a
+consumer that actually wants machine truth, such as branch lowering or
+result-demand-aware statement lowering.
+
 
 ## Candidate Backlog
 

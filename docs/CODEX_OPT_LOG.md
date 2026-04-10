@@ -245,3 +245,19 @@ benchmarked throughput delta, and the headline pre/post numbers.
 - post-change benchmark:
   - specialized pass, 1M loops x3: `131076`, `121536`, `125865 loops/s`
   - perf-context run: `116351 loops/s`
+
+## 2026-04-10 - Not landed: split exact-int truth helper
+
+- jj change id: not landed (`voqqtors`)
+- summary: Tried routing exact-`int` `not` / internal truth unary
+  specialization through a new helper returning raw `nb_bool` as `i32`, then
+  materializing `Py_True` / `Py_False` through the typed bool path. The
+  specialization set did not change, and the removed object-returning exact-long
+  unary helper path was too small in pystone to justify the extra split.
+- throughput: `-1.01%` specialized pystone median
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `126977`, `126471`, `123701 loops/s`
+  - perf-context run: `125578 loops/s`
+- attempted benchmark:
+  - specialized pass, 1M loops x3: `124219`, `127264`, `125195 loops/s`
+  - perf-context run: `120165 loops/s`
