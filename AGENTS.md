@@ -327,6 +327,11 @@ anything non-code affected the run. If there were no such issues, say
   load/JIT-codegen trace by default. Set `SOAC_PYTEST_TRACE=1` to enable it
   when `SOAC_LOG` is unset. `SOAC_PYTEST_EVENTS_LOG` overrides the output path,
   which defaults to `logs/pytest_events.jsonl`.
+- `SOAC_RUN_SLOW_TESTS`
+  `just pytest ...` and `just test-all` deselect pytest tests marked `slow` by
+  default. Set `SOAC_RUN_SLOW_TESTS=1` to include intentionally expensive tests
+  such as broad import-hook coverage. Direct pytest invocations can also pass
+  `--run-slow`.
 - `SOAC_CRANELIFT_OPT_LEVEL`
   Optional Cranelift process-JIT optimization level override:
   `none`, `speed`, or `speed_and_size`. Normal runtime and benchmark

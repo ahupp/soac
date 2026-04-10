@@ -152,6 +152,12 @@ exports are intentionally omitted here.
 - `SOAC_PYTEST_EVENTS_LOG=/path/to/events.jsonl`
   Overrides the pytest trace output path used when `SOAC_PYTEST_TRACE=1`.
 
+- `SOAC_RUN_SLOW_TESTS=1`
+  Includes pytest tests marked `slow` in `just pytest ...` and `just test-all`.
+  Slow tests are deselected by default so ordinary green runs skip intentionally
+  expensive broad-mode coverage. When invoking pytest directly, pass
+  `--run-slow` to include the same tests.
+
 - `SOAC_CRANELIFT_COMPILE_CACHE=1`
   Opt into the experimental filesystem-backed Cranelift incremental
   compile cache. When enabled, cache values are stored in

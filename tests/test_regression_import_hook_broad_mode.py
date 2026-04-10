@@ -11,6 +11,10 @@ import pytest
 from soac import import_hook
 from tests._integration import soac_module
 
+BROAD_MODE_SLOW = pytest.mark.slow(
+    reason="broad import-hook mode transforms stdlib dependency graphs in fresh processes"
+)
+
 
 def test_soac_keyword_only_default_is_used_when_omitted(tmp_path):
     source = """
@@ -551,6 +555,7 @@ def test_module_enabled_path_filter_only_transforms_matching_tree(monkeypatch, t
         sys.modules.pop("skipped_probe", None)
 
 
+@BROAD_MODE_SLOW
 def test_import_hook_can_transform_stdlib_typing_in_fresh_process(monkeypatch, tmp_path):
     script = """
 import sys
@@ -577,6 +582,7 @@ assert typing.Callable[..., typing.Any].__args__[-1] is typing.Any
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@BROAD_MODE_SLOW
 def test_import_hook_can_transform_stdlib_import_edge_cases_in_fresh_process(
     monkeypatch, tmp_path
 ):
@@ -608,6 +614,7 @@ assert templatelib.convert("value", "s") == "value"
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@BROAD_MODE_SLOW
 def test_import_hook_can_transform_shutil_rmtree_in_fresh_process(tmp_path):
     target = tmp_path / "to-remove"
     script = f"""
@@ -640,6 +647,7 @@ assert not os.path.exists(root)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@BROAD_MODE_SLOW
 def test_import_hook_can_transform_soac_runtime_in_fresh_process(monkeypatch, tmp_path):
     script = """
 import sys
@@ -675,6 +683,7 @@ for name in ("locals", "eval", "exec"):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@BROAD_MODE_SLOW
 def test_import_hook_can_transform_soac_runtime_in_profile_mode(monkeypatch, tmp_path):
     script = """
 from soac import import_hook
@@ -957,6 +966,7 @@ def value():
         assert module.value() == ("ZeroDivisionError", "ZeroDivisionError")
 
 
+@BROAD_MODE_SLOW
 def test_import_hook_broad_assert_raises_keeps_implicit_exception_context(tmp_path):
     script = r"""
 from soac import import_hook

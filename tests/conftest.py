@@ -20,6 +20,7 @@ from tests import _integration
 import pytest
 
 _MODULES_DIR = Path(__file__).resolve().parent / "integration_modules"
+_TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 
 
 def _print_integration_failure_context(module_path: Path) -> None:
@@ -60,8 +61,47 @@ def _load_integration_module(tmp_path: Path, module_name: str) -> Iterator[Modul
         raise
 
 
+def pytest_addoption(parser):
+    parser.addoption(
+        "--run-slow",
+        action="store_true",
+        default=False,
+        help="include tests marked slow; normal correctness runs deselect them",
+    )
+
+
 def pytest_configure(config):
-    config.addinivalue_line("markers", "integration: mark a test as using integration modules")
+    config.addinivalue_line(
+        "markers", "integration: mark a test as using integration modules"
+    )
+    config.addinivalue_line(
+        "markers", "slow: mark tests that are too expensive for default green runs"
+    )
+
+
+def _slow_tests_enabled(config) -> bool:
+    if config.getoption("--run-slow"):
+        return True
+    if getattr(config.option, "markexpr", ""):
+        return True
+    return os.environ.get("SOAC_RUN_SLOW_TESTS", "").lower() in _TRUE_ENV_VALUES
+
+
+def pytest_collection_modifyitems(config, items):
+    if _slow_tests_enabled(config):
+        return
+
+    selected = []
+    deselected = []
+    for item in items:
+        if item.get_closest_marker("slow") is None:
+            selected.append(item)
+        else:
+            deselected.append(item)
+
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
+        items[:] = selected
 
 
 def _is_unsupported_exception(exc: BaseException, longrepr_text: str | None = None) -> bool:
