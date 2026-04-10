@@ -191,6 +191,18 @@ impl PyObjFacts {
         }
     }
 
+    pub const fn bool_object() -> Self {
+        Self {
+            ty: TypeFact::Exact(PyExactType::Bool),
+            truthiness: TruthinessFact::Unknown,
+            none: NoneFact::IsNotNone,
+            bool_singleton: BoolSingletonFact::Unknown,
+            refcount: RefcountFact::Immortal,
+            provenance: ProvenanceFact::Unknown,
+            callable: CallableFact::Unknown,
+        }
+    }
+
     pub const fn exact_type(exact_type: PyExactType) -> Self {
         Self {
             ty: TypeFact::Exact(exact_type),
@@ -803,8 +815,8 @@ pub fn infer_module_value_facts(module: &BlockPyModule<CodegenModuleShape>) -> F
 #[cfg(test)]
 mod test {
     use super::{
-        infer_module_value_facts, BoolSingletonFact, CallableFact, EnvFacts, PyExactType,
-        PyObjFacts, RefcountFact, RuntimeHelperId, ThrowSpec, ValueFacts,
+        BoolSingletonFact, CallableFact, EnvFacts, PyExactType, PyObjFacts, RefcountFact,
+        RuntimeHelperId, ThrowSpec, ValueFacts, infer_module_value_facts,
     };
     use crate::block_py::{BlockTerm, ChildVisitable, HasSemanticInstrId, InstrCodegen, Visit};
     use crate::lower_python_to_blockpy_for_testing;
@@ -948,6 +960,17 @@ def f(x, flag):
         assert_eq!(py_facts.bool_singleton, BoolSingletonFact::IsFalse);
         assert_eq!(py_facts.refcount, RefcountFact::Immortal);
         assert_eq!(py_facts.is_truthy(), Some(false));
+    }
+
+    #[test]
+    fn bool_object_facts_are_immortal_without_known_value() {
+        let py_facts = PyObjFacts::bool_object();
+
+        assert!(py_facts.is_exact_type(PyExactType::Bool));
+        assert!(py_facts.is_known_not_none());
+        assert_eq!(py_facts.bool_singleton, BoolSingletonFact::Unknown);
+        assert_eq!(py_facts.is_truthy(), None);
+        assert!(py_facts.is_immortal());
     }
 
     #[test]

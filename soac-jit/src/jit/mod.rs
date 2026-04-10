@@ -3345,12 +3345,26 @@ fn emit_to_python_bool(
     ctx: &JitEmitCtx<'_>,
 ) -> SoacValue {
     let truth_i32 = value.expect_i32_bool01("emit_to_python_bool");
-    let is_true = fb.ins().icmp_imm(ir::condcodes::IntCC::NotEqual, truth_i32, 0);
+    let is_true = fb
+        .ins()
+        .icmp_imm(ir::condcodes::IntCC::NotEqual, truth_i32, 0);
     let bool_value = fb
         .ins()
         .select(is_true, ctx.consts.true_const, ctx.consts.false_const);
     fb.ins().call(ctx.incref_ref, &[bool_value]);
-    SoacValue::pyobject(bool_value, PyObjFacts::exact_type(PyExactType::Bool))
+    SoacValue::pyobject(bool_value, PyObjFacts::bool_object())
+}
+
+fn emit_release_owned_pyobject(
+    fb: &mut FunctionBuilder<'_>,
+    value: ir::Value,
+    facts: Option<PyObjFacts>,
+    ctx: &JitEmitCtx<'_>,
+) {
+    if facts.is_some_and(PyObjFacts::is_immortal) {
+        return;
+    }
+    fb.ins().call(ctx.decref_ref, &[value]);
 }
 
 fn emit_owned_bool_from_i32_result(
@@ -6552,13 +6566,14 @@ fn emit_truthy_from_owned(
     is_true_ref: ir::FuncRef,
     ctx: &JitEmitCtx<'_>,
 ) -> SoacValue {
-    if let Some(py_facts) = value_facts.and_then(ValueFacts::as_pyobj) {
+    let py_facts = value_facts.and_then(ValueFacts::as_pyobj);
+    if let Some(py_facts) = py_facts {
         if py_facts.is_none() || py_facts.is_false_singleton() {
-            fb.ins().call(ctx.decref_ref, &[owned_value]);
+            emit_release_owned_pyobject(fb, owned_value, Some(py_facts), ctx);
             return emit_i32_bool01_const(fb, false, ctx);
         }
         if py_facts.is_true_singleton() {
-            fb.ins().call(ctx.decref_ref, &[owned_value]);
+            emit_release_owned_pyobject(fb, owned_value, Some(py_facts), ctx);
             return emit_i32_bool01_const(fb, true, ctx);
         }
         if py_facts.is_exact_type(PyExactType::Bool) {
@@ -6567,7 +6582,7 @@ fn emit_truthy_from_owned(
                 owned_value,
                 ctx.consts.true_const,
             );
-            fb.ins().call(ctx.decref_ref, &[owned_value]);
+            emit_release_owned_pyobject(fb, owned_value, Some(py_facts), ctx);
             return emit_i32_bool01_from_cond(fb, is_true, ctx);
         }
     }
@@ -6591,14 +6606,14 @@ fn emit_truthy_from_owned(
 
     fb.switch_to_block(truth_error_block);
     let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
-    fb.ins().call(ctx.decref_ref, &[owned_value]);
+    emit_release_owned_pyobject(fb, owned_value, py_facts, ctx);
     emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
     fb.ins()
         .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
 
     fb.switch_to_block(truth_ok_block);
     let truth_ok_value = fb.block_params(truth_ok_block)[0];
-    fb.ins().call(ctx.decref_ref, &[owned_value]);
+    emit_release_owned_pyobject(fb, owned_value, py_facts, ctx);
     emit_i32_bool01_from_i32_result(fb, truth_ok_value, ctx)
 }
 
@@ -6923,8 +6938,7 @@ fn emit_codegen_term(
                 fb.ins()
                     .icmp_imm(ir::condcodes::IntCC::NotEqual, truth_i32, 0)
             } else {
-                fb.ins()
-                    .icmp_imm(ir::condcodes::IntCC::Equal, truth_i32, 0)
+                fb.ins().icmp_imm(ir::condcodes::IntCC::Equal, truth_i32, 0)
             };
             let hot_branch = fb.create_block();
             let cold_branch = fb.create_block();
