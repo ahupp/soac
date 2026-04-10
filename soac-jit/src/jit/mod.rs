@@ -2168,15 +2168,14 @@ impl LocalEnv {
         incref_ref: ir::FuncRef,
         decref_ref: ir::FuncRef,
     ) {
-        if let Some(existing_index) = self
+        let previous_entry = if let Some(existing_index) = self
             .entry_index_for_location(location)
             .or_else(|| self.entry_index_for_name(name))
         {
-            let previous = self.entries.remove(existing_index);
-            if transient_local_needs_decref(previous.ref_kind) {
-                fb.ins().call(decref_ref, &[previous.value]);
-            }
-        }
+            Some(self.entries.remove(existing_index))
+        } else {
+            None
+        };
         if stack_slots.has_name(name) {
             stack_slots
                 .replace_cloned_value(fb, name, value, ptr_ty, incref_ref, decref_ref)
@@ -2190,6 +2189,11 @@ impl LocalEnv {
                 ref_kind: LocalRefKind::Owned,
                 storage: LocalEnvStorage::LocalOnly,
             });
+        }
+        if let Some(previous) = previous_entry {
+            if transient_local_needs_decref(previous.ref_kind) {
+                fb.ins().call(decref_ref, &[previous.value]);
+            }
         }
     }
 

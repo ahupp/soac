@@ -542,6 +542,102 @@ mod tests {
         assert_eq!(env.local_only_cleanup_values(), vec![owned_local]);
     }
 
+    fn local_env_store_test_state() -> (LocalEnv, String) {
+        let compile_session = crate::session::CompileSession::new();
+        let mut jit_module =
+            new_jit_module(&compile_session).expect("test jit module should construct");
+        let ptr_ty = jit_module.target_config().pointer_type();
+
+        let mut refcount_signature = jit_module.make_signature();
+        refcount_signature.params.push(ir::AbiParam::new(ptr_ty));
+
+        let mut wrapper_signature = jit_module.make_signature();
+        wrapper_signature.params.push(ir::AbiParam::new(ptr_ty));
+        wrapper_signature.params.push(ir::AbiParam::new(ptr_ty));
+        wrapper_signature.returns.push(ir::AbiParam::new(ptr_ty));
+
+        let wrapper_id = declare_local_fn(
+            &mut jit_module,
+            "local_env_store_test",
+            &wrapper_signature,
+        )
+        .expect("wrapper function should declare");
+        let incref_id = declare_local_fn(
+            &mut jit_module,
+            "local_env_store_test_incref",
+            &refcount_signature,
+        )
+        .expect("incref helper should declare");
+        let decref_id = declare_local_fn(
+            &mut jit_module,
+            "local_env_store_test_decref",
+            &refcount_signature,
+        )
+        .expect("decref helper should declare");
+
+        let mut ctx = jit_module.make_context();
+        ctx.func.name = ir::UserFuncName::user(0, wrapper_id.as_u32());
+        ctx.func.signature = wrapper_signature;
+
+        let mut env = LocalEnv::default();
+        let mut builder_ctx = FunctionBuilderContext::new();
+        {
+            let mut fb = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+            let entry = fb.create_block();
+            fb.append_block_params_for_function_params(entry);
+            fb.switch_to_block(entry);
+            fb.seal_block(entry);
+
+            let old_value = fb.block_params(entry)[0];
+            let new_value = fb.block_params(entry)[1];
+            let incref_ref = jit_module.declare_func_in_func(incref_id, &mut fb.func);
+            let decref_ref = jit_module.declare_func_in_func(decref_id, &mut fb.func);
+            env.entries.push(LocalEnvEntry {
+                key: LocalEnvKey::Location(LocalLocation(0)),
+                name: "x".to_string(),
+                value: old_value,
+                ref_kind: LocalRefKind::Owned,
+                storage: LocalEnvStorage::LocalOnly,
+            });
+            let stack_slots = StackSlots {
+                names: Vec::new(),
+                slots: Vec::new(),
+            };
+
+            env.store_location(
+                &mut fb,
+                LocalLocation(0),
+                "x",
+                new_value,
+                &stack_slots,
+                ptr_ty,
+                incref_ref,
+                decref_ref,
+            );
+            fb.ins().return_(&[new_value]);
+            fb.seal_all_blocks();
+            fb.finalize();
+        }
+
+        let rendered = ctx.func.display().to_string();
+        (env, rendered)
+    }
+
+    #[test]
+    fn local_env_store_keeps_new_local_binding_after_rebind() {
+        let (env, rendered) = local_env_store_test_state();
+
+        assert_eq!(env.entries.len(), 1, "{rendered}");
+        assert_eq!(env.entries[0].key, LocalEnvKey::Location(LocalLocation(0)));
+        assert_eq!(env.entries[0].name, "x");
+        assert_eq!(env.entries[0].ref_kind, LocalRefKind::Owned);
+        assert_eq!(env.entries[0].storage, LocalEnvStorage::LocalOnly);
+        assert!(
+            rendered.contains("call"),
+            "owned previous local should still be released after rebinding:\n{rendered}"
+        );
+    }
+
     #[test]
     fn local_ref_forwarding_increfs_borrowed_and_duplicate_owned_values() {
         assert!(!local_ref_kind_needs_incref_for_forward(

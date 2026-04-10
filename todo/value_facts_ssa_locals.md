@@ -345,3 +345,6 @@ Started:
   ownership-plan releases. Returns clear planned stack slots to `NULL` and no
   longer scan every stack slot; explicit-raise terminals still route through
   shared failure cleanup that skips already-`NULL` slots.
+- `LocalEnv` store lowering now installs the new binding before releasing any
+  previous local-only owner, preserving CPython destructor-visible rebinding
+  order.
