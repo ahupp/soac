@@ -444,6 +444,7 @@ def _unsupported_frame_builtin(*args, **kwargs):
 
 locals = _unsupported_frame_builtin
 eval = _unsupported_frame_builtin
+# `exec` is a keyword, so expose soac.runtime.exec through the module dict.
 globals()['exec'] = _unsupported_frame_builtin
 
 def code_with_freevars(names, is_async, is_generator):

@@ -99,6 +99,7 @@ def _unsupported_frame_builtin(*args, **kwargs):
 
 locals = _unsupported_frame_builtin
 eval = _unsupported_frame_builtin
+# `exec` is a keyword, so expose soac.runtime.exec through the module dict.
 vars(_sys.modules[__name__])["exec"] = _unsupported_frame_builtin
 
 
