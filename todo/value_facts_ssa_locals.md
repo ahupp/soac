@@ -309,6 +309,10 @@ Started:
 - The temporary legacy `LocalEnv` adapter preserves stack-mirror storage only
   when the value itself is unchanged. If legacy expression emission replaces a
   value, the new entry becomes local-only ownership state.
+- JIT terminal lowering recomputes legacy-vector ref kinds from the current
+  LocalEnv values after terminal expression emission. Successor block-param
+  forwarding and terminal cleanup no longer rely on a stale ref-kind snapshot
+  taken at block entry.
 - A first `FunctionLocalPlan` exists in JIT planning. It records per-block entry
   bindings from the storage layout, annotates them with available `EnvFacts`,
   and classifies known immortal locals without changing generated code.

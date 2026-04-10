@@ -2096,7 +2096,6 @@ struct LocalEnv {
 struct LocalEnvLegacyParts {
     names: Vec<String>,
     values: Vec<ir::Value>,
-    ref_kinds: Vec<LocalRefKind>,
 }
 
 impl LocalEnv {
@@ -2233,6 +2232,37 @@ impl LocalEnv {
             .collect()
     }
 
+    fn ref_kinds_for_legacy_parts(
+        &self,
+        names: &[String],
+        values: &[ir::Value],
+    ) -> Vec<LocalRefKind> {
+        debug_assert_eq!(
+            names.len(),
+            values.len(),
+            "JIT transient local names and values must stay parallel"
+        );
+        names
+            .iter()
+            .zip(values.iter())
+            .map(|(name, value)| {
+                self.unchanged_entry_for_legacy_part(name, *value)
+                    .map(|entry| entry.ref_kind)
+                    .unwrap_or(LocalRefKind::Owned)
+            })
+            .collect()
+    }
+
+    fn unchanged_entry_for_legacy_part(
+        &self,
+        name: &str,
+        value: ir::Value,
+    ) -> Option<&LocalEnvEntry> {
+        self.entries
+            .iter()
+            .find(|entry| entry.name == name && entry.value == value)
+    }
+
     fn to_legacy_parts(&self) -> LocalEnvLegacyParts {
         LocalEnvLegacyParts {
             names: self
@@ -2241,7 +2271,6 @@ impl LocalEnv {
                 .map(|entry| entry.name.clone())
                 .collect(),
             values: self.entries.iter().map(|entry| entry.value).collect(),
-            ref_kinds: self.entries.iter().map(|entry| entry.ref_kind).collect(),
         }
     }
 
@@ -2251,17 +2280,13 @@ impl LocalEnv {
             parts.values.len(),
             "JIT transient local names and values must stay parallel"
         );
-        let LocalEnvLegacyParts {
-            names,
-            values,
-            ref_kinds: _,
-        } = parts;
+        let LocalEnvLegacyParts { names, values } = parts;
         let entries = names
             .into_iter()
             .zip(values)
             .map(|(name, value)| {
                 let existing_entry = self.entries.iter().find(|entry| entry.name == name);
-                let unchanged_entry = existing_entry.filter(|entry| entry.value == value);
+                let unchanged_entry = self.unchanged_entry_for_legacy_part(name.as_str(), value);
                 let ref_kind = unchanged_entry
                     .map(|entry| entry.ref_kind)
                     .unwrap_or(LocalRefKind::Owned);
@@ -7013,7 +7038,6 @@ fn emit_codegen_term(
     let mut local_parts = local_env.to_legacy_parts();
     let local_names = &mut local_parts.names;
     let local_values = &mut local_parts.values;
-    let local_ref_kinds = &local_parts.ref_kinds;
 
     match term {
         BlockTerm::Jump(target_label) => {
@@ -7034,6 +7058,7 @@ fn emit_codegen_term(
             .ok_or_else(|| {
                 format!("missing local mapping for jump slot updates in block {source_label}")
             })?;
+            let local_ref_kinds = local_env.ref_kinds_for_legacy_parts(local_names, local_values);
             let mut jump_args = Vec::with_capacity(target_params.len());
             jump_args.extend(
                 emit_prepare_target_args_codegen(
@@ -7043,7 +7068,7 @@ fn emit_codegen_term(
                     Some(&target_label.args),
                     local_names,
                     local_values,
-                    local_ref_kinds,
+                    &local_ref_kinds,
                     emit_ctx,
                     jit_module,
                     func_imports,
@@ -7056,7 +7081,7 @@ fn emit_codegen_term(
                 fb,
                 local_values,
                 local_names,
-                local_ref_kinds,
+                &local_ref_kinds,
                 target_params,
                 decref_ref,
             );
@@ -7117,6 +7142,7 @@ fn emit_codegen_term(
             } else {
                 ("else", if_term.else_label, "then", if_term.then_label)
             };
+            let local_ref_kinds = local_env.ref_kinds_for_legacy_parts(local_names, local_values);
             emit_codegen_if_target_arm(
                 fb,
                 source_label,
@@ -7133,7 +7159,7 @@ fn emit_codegen_term(
                 runtime_block_param_names,
                 local_names,
                 local_values,
-                local_ref_kinds,
+                &local_ref_kinds,
                 emit_ctx,
                 jit_module,
                 func_imports,
@@ -7154,7 +7180,7 @@ fn emit_codegen_term(
                 runtime_block_param_names,
                 local_names,
                 local_values,
-                local_ref_kinds,
+                &local_ref_kinds,
                 emit_ctx,
                 jit_module,
                 func_imports,
@@ -7184,6 +7210,7 @@ fn emit_codegen_term(
                 dispatch_block,
                 &[ir::BlockArg::Value(index_i64)],
             );
+            let local_ref_kinds = local_env.ref_kinds_for_legacy_parts(local_names, local_values);
 
             let default_block = fb.create_block();
             let mut switch = Switch::new();
@@ -7211,7 +7238,7 @@ fn emit_codegen_term(
                         None,
                         local_names,
                         local_values,
-                        local_ref_kinds,
+                        &local_ref_kinds,
                         emit_ctx,
                         jit_module,
                         func_imports,
@@ -7226,7 +7253,7 @@ fn emit_codegen_term(
                     fb,
                     local_values,
                     local_names,
-                    local_ref_kinds,
+                    &local_ref_kinds,
                     target_params,
                     decref_ref,
                 );
@@ -7260,7 +7287,7 @@ fn emit_codegen_term(
                     None,
                     local_names,
                     local_values,
-                    local_ref_kinds,
+                    &local_ref_kinds,
                     emit_ctx,
                     jit_module,
                     func_imports,
@@ -7275,7 +7302,7 @@ fn emit_codegen_term(
                 fb,
                 local_values,
                 local_names,
-                local_ref_kinds,
+                &local_ref_kinds,
                 default_params,
                 decref_ref,
             );
@@ -7308,11 +7335,12 @@ fn emit_codegen_term(
                 jit_module,
                 func_imports,
             );
+            let local_ref_kinds = local_env.ref_kinds_for_legacy_parts(local_names, local_values);
             emit_decref_unforwarded_locals(
                 fb,
                 local_values,
                 local_names,
-                local_ref_kinds,
+                &local_ref_kinds,
                 &[],
                 decref_ref,
             );
@@ -7413,11 +7441,12 @@ fn emit_codegen_term(
             );
 
             fb.switch_to_block(raise_rc_ok);
+            let local_ref_kinds = local_env.ref_kinds_for_legacy_parts(local_names, local_values);
             emit_decref_unforwarded_locals(
                 fb,
                 local_values,
                 local_names,
-                local_ref_kinds,
+                &local_ref_kinds,
                 &[],
                 decref_ref,
             );
