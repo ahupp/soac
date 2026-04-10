@@ -12,7 +12,7 @@ use cranelift_codegen::ir;
 use cranelift_codegen::ir::InstBuilder;
 use cranelift_frontend::FunctionBuilder;
 use pyo3::ffi;
-use soac_blockpy::block_py::{HasMeta, Instr, InstrCodegen, NameLike, NameLocation};
+use soac_blockpy::block_py::{HasSemanticInstrId, Instr, InstrCodegen, NameLike, NameLocation};
 use std::mem::offset_of;
 
 pub(super) trait OperationEmitState<'fb, E> {
@@ -420,7 +420,7 @@ fn emit_specialized_getattr<'fb>(
     op: &blockpy_intrinsics::GetAttr<InstrCodegen>,
     state: &mut impl OperationEmitState<'fb, InstrCodegen>,
 ) -> Option<ir::Value> {
-    let instr_id = op.meta().instr_id?;
+    let instr_id = op.semantic_instr_id();
     let attr_name = codegen_constant_string_value(state.ctx().module, op.attr.as_ref())?;
     let specialization = *state
         .ctx()
@@ -550,7 +550,7 @@ fn emit_specialized_setattr<'fb>(
         return None;
     }
 
-    let instr_id = op.meta().instr_id?;
+    let instr_id = op.semantic_instr_id();
     let attr_name = codegen_constant_string_value(state.ctx().module, op.attr.as_ref())?;
     let specialization = *state
         .ctx()
@@ -967,7 +967,7 @@ fn emit_specialized_binop<'fb>(
     op: &blockpy_intrinsics::BinOp<InstrCodegen>,
     state: &mut impl OperationEmitState<'fb, InstrCodegen>,
 ) -> Option<ir::Value> {
-    let instr_id = op.meta().instr_id?;
+    let instr_id = op.semantic_instr_id();
     let ptr_ty = state.ctx().consts.ptr_ty;
     let i64_ty = state.ctx().consts.i64_ty;
     let counter_id = state
@@ -1072,7 +1072,7 @@ fn emit_specialized_unary_op<'fb>(
     op: &blockpy_intrinsics::UnaryOp<InstrCodegen>,
     state: &mut impl OperationEmitState<'fb, InstrCodegen>,
 ) -> Option<ir::Value> {
-    let instr_id = op.meta().instr_id?;
+    let instr_id = op.semantic_instr_id();
     let ptr_ty = state.ctx().consts.ptr_ty;
     let i64_ty = state.ctx().consts.i64_ty;
     let counter_id = state
@@ -1276,11 +1276,11 @@ fn emit_load<'fb>(
                 .fb()
                 .ins()
                 .iconst(ir::types::I64, i64::from(slot.slot()));
-            let slow_value = if let Some(instr_id) = op.meta().instr_id
-                && state
-                    .ctx()
-                    .global_indexed_hit_counter_ids
-                    .contains_key(&instr_id)
+            let instr_id = op.semantic_instr_id();
+            let slow_value = if state
+                .ctx()
+                .global_indexed_hit_counter_ids
+                .contains_key(&instr_id)
             {
                 emit_indexed_global_load_with_state(
                     state,
@@ -1349,24 +1349,20 @@ fn emit_store<'fb>(
         _ => unreachable!("emit_store only applies to global names"),
     };
     let result = if state.ctx().behavior_change_indexed_stores {
-        let instr_id = op.meta().instr_id;
+        let instr_id = op.semantic_instr_id();
         let ptr_ty = state.ctx().consts.ptr_ty;
         let null_ptr = state.fb().ins().iconst(ptr_ty, 0);
         let store_global_indexed_ref = state.ctx().store_global_indexed_ref;
-        let hit_counter_ptr = instr_id.and_then(|instr_id| {
-            state
-                .ctx()
-                .global_indexed_hit_counter_ids
-                .get(&instr_id)
-                .map(|counter_id| state.ctx().counter_ptrs[counter_id.0])
-        });
-        let fallback_counter_ptr = instr_id.and_then(|instr_id| {
-            state
-                .ctx()
-                .global_indexed_fallback_counter_ids
-                .get(&instr_id)
-                .map(|counter_id| state.ctx().counter_ptrs[counter_id.0])
-        });
+        let hit_counter_ptr = state
+            .ctx()
+            .global_indexed_hit_counter_ids
+            .get(&instr_id)
+            .map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
+        let fallback_counter_ptr = state
+            .ctx()
+            .global_indexed_fallback_counter_ids
+            .get(&instr_id)
+            .map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
         let result_block = state.fb().create_block();
         state.fb().append_block_param(result_block, ptr_ty);
         let fallback_block = state.fb().create_block();
@@ -1495,7 +1491,7 @@ pub(super) fn emit_operation<'fb>(
             if let Some(value) = emit_specialized_getattr(op, state) {
                 Some(value)
             } else {
-                let instr_id = op.meta().instr_id;
+                let instr_id = Some(op.semantic_instr_id());
                 let arg_values = state.emit_arg_values(&[op.value.as_ref(), op.attr.as_ref()]);
                 let result = emit_counted_getattr_fallback(state, instr_id, &arg_values);
                 state.release_arg_values(&arg_values);
@@ -1506,7 +1502,7 @@ pub(super) fn emit_operation<'fb>(
             if let Some(value) = emit_specialized_setattr(op, state) {
                 Some(value)
             } else {
-                let instr_id = op.meta().instr_id;
+                let instr_id = Some(op.semantic_instr_id());
                 let arg_values = state.emit_arg_values(&[
                     op.value.as_ref(),
                     op.attr.as_ref(),

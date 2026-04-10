@@ -1,11 +1,11 @@
 use super::*;
 use soac_blockpy::block_py::{
     BinOp, BinOpKind, BlockLabel, BlockParamRole, BlockPyFunction, BlockPyModule, BlockTerm, Call,
-    CallArgKeyword, CallArgPositional, CallDirect, CellLocation, ClosureInit, ClosureSlot,
-    CodegenBlock, CounterSite, Del, DelItem, FunctionId, FunctionName, InstrCodegen, InstrResolved,
-    Literal, LiteralValue, Load, Meta, ModuleNameGen, NameLocation, NumberLiteral,
-    NumberLiteralValue, Param, ParamKind, ParamSpec, ResolvedName, StorageLayout, Store,
-    StringLiteral, WithMeta,
+    CallArgKeyword, CallArgPositional, CallDirect, CellLocation, ChildVisitable, ClosureInit,
+    ClosureSlot, CodegenBlock, CounterSite, Del, DelItem, FunctionId, FunctionName, HasMeta,
+    InstrCodegen, InstrResolved, Literal, LiteralValue, Load, Meta, ModuleNameGen, NameLocation,
+    NumberLiteral, NumberLiteralValue, Param, ParamKind, ParamSpec, ResolvedName, StorageLayout,
+    Store, StringLiteral, VisitMut, WithMeta,
 };
 use soac_blockpy::passes::{
     CodegenModuleShape, instrument_bb_module_with_block_entry_counters,
@@ -127,6 +127,48 @@ mod tests {
         })
     }
 
+    struct MissingTestInstrIdAssigner {
+        block_label: BlockLabel,
+        next_instr_index_in_block: u32,
+    }
+
+    impl VisitMut<InstrCodegen> for MissingTestInstrIdAssigner {
+        fn visit_instr_mut(&mut self, expr: &mut InstrCodegen)
+        where
+            InstrCodegen: ChildVisitable<InstrCodegen>,
+        {
+            let instr_id = InstrId::new(self.block_label, self.next_instr_index_in_block);
+            self.next_instr_index_in_block = self
+                .next_instr_index_in_block
+                .checked_add(1)
+                .expect("test instruction count should fit in u32");
+
+            if expr.meta().instr_id.is_none() {
+                let mut meta = expr.meta();
+                meta.instr_id = Some(instr_id);
+                *expr = expr.clone().with_meta(meta);
+            }
+            expr.visit_children_mut(self);
+        }
+    }
+
+    fn assign_missing_test_instr_ids(block: &mut CodegenBlock) {
+        MissingTestInstrIdAssigner {
+            block_label: block.label,
+            next_instr_index_in_block: 0,
+        }
+        .visit_block_mut(block);
+    }
+
+    fn with_missing_test_instr_ids(
+        mut function: BlockPyFunction<CodegenModuleShape>,
+    ) -> BlockPyFunction<CodegenModuleShape> {
+        for block in &mut function.blocks {
+            assign_missing_test_instr_ids(block);
+        }
+        function
+    }
+
     fn repo_root() -> &'static Path {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -217,7 +259,10 @@ mod tests {
         BlockPyModule {
             module_name_gen,
             global_names: Vec::new(),
-            callable_defs,
+            callable_defs: callable_defs
+                .into_iter()
+                .map(with_missing_test_instr_ids)
+                .collect(),
             module_constants: Vec::new(),
             counter_defs: Vec::new(),
         }
@@ -225,8 +270,11 @@ mod tests {
 
     fn with_test_blocks(
         mut function: BlockPyFunction<CodegenModuleShape>,
-        blocks: Vec<CodegenBlock>,
+        mut blocks: Vec<CodegenBlock>,
     ) -> BlockPyFunction<CodegenModuleShape> {
+        for block in &mut blocks {
+            assign_missing_test_instr_ids(block);
+        }
         function.blocks = blocks;
         function
     }
@@ -612,6 +660,7 @@ mod tests {
         blocks: &[ObjPtr],
         module_constants: Vec<InstrResolved>,
     ) -> String {
+        let function = with_missing_test_instr_ids(function.clone());
         let module = BlockPyModule {
             module_name_gen: ModuleNameGen::new(0),
             global_names: Vec::new(),
@@ -630,6 +679,7 @@ mod tests {
         module_constants: Vec<InstrResolved>,
         operator_specializations: &[(InstrId, u64)],
     ) -> String {
+        let function = with_missing_test_instr_ids(function.clone());
         let module_name = "counter_test";
         let soac_work_dir = ensure_test_extension_staging_dir();
         write_test_counter_dump(
@@ -704,7 +754,7 @@ mod tests {
                     &mut jit_module,
                     blocks,
                     &shared_state.lowered_module,
-                    function,
+                    &function,
                     &shared_state.codegen_constants,
                     &shared_state.lowered_module.counter_defs,
                     &module_constant_ptrs,
@@ -845,6 +895,7 @@ mod tests {
         blocks: &[ObjPtr],
         module_constants: Vec<InstrResolved>,
     ) -> String {
+        let function = with_missing_test_instr_ids(function.clone());
         let module = BlockPyModule {
             module_name_gen: ModuleNameGen::new(0),
             global_names: Vec::new(),
@@ -856,7 +907,7 @@ mod tests {
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
         render_test_jit_function_with_constants_and_runtime_inline(
             &module,
-            function,
+            &function,
             blocks,
             &module_constants,
         )
@@ -2404,6 +2455,8 @@ def f():
                     storage_layout: None,
                     scope: Default::default(),
                 };
+                let init_function = with_missing_test_instr_ids(init_function);
+                let caller_function = with_missing_test_instr_ids(caller_function);
 
                 let module = BlockPyModule {
                     module_name_gen: ModuleNameGen::new(0),

@@ -287,3 +287,8 @@ Started:
 - `LocalEnv` now carries a transient local `LocalRefKind` side table. The first
   refresh point records the current invariant that transient JIT locals are
   owned references; stack-slot-backed locals still use the old path.
+- JIT specialization and counter lookup paths now require semantic instruction
+  IDs for semantic codegen operations instead of silently disabling the
+  optimization when an ID is missing. Synthetic test builders fill missing IDs
+  explicitly, and value-fact inference ignores ID-less synthetic trace/counter
+  instrumentation rather than assigning fake semantic identities.

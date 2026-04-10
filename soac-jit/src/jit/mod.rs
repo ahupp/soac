@@ -26,7 +26,7 @@ use soac_blockpy::block_py::{
 };
 use soac_blockpy::passes::{
     CodegenModuleShape, FactStore, InstrResolved, RuntimeHelperId, ValueFacts,
-    infer_module_value_facts, validate_codegen_instr_ids,
+    infer_module_value_facts,
 };
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -301,7 +301,12 @@ static SOAC_RUNTIME_GUARD_TYPE_VERSION_IMPORT: ImportSpec = ImportSpec::local(
 );
 static SOAC_RUNTIME_ENSURE_I32_SENTINEL_HAS_RUNTIME_ERROR_IMPORT: ImportSpec = ImportSpec::local(
     SOAC_RUNTIME_ENSURE_I32_SENTINEL_HAS_RUNTIME_ERROR_SYMBOL,
-    &[SigType::Pointer, SigType::I32, SigType::I32, SigType::Pointer],
+    &[
+        SigType::Pointer,
+        SigType::I32,
+        SigType::I32,
+        SigType::Pointer,
+    ],
     &[SigType::I32],
 );
 static DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT: ImportSpec = ImportSpec::new(
@@ -815,7 +820,7 @@ fn emit_codegen_local_name_load(
 fn emit_codegen_located_name_load(
     fb: &mut FunctionBuilder<'_>,
     name: &ResolvedName,
-    load_instr_id: Option<InstrId>,
+    load_instr_id: InstrId,
     local_names: &mut Vec<String>,
     local_values: &mut Vec<ir::Value>,
     ctx: &JitEmitCtx<'_>,
@@ -874,15 +879,16 @@ fn emit_codegen_located_name_load(
                 ctx,
             );
             let slot_index = fb.ins().iconst(ir::types::I64, i64::from(slot.slot()));
-            let value = if let Some(instr_id) = load_instr_id
-                && ctx.global_indexed_hit_counter_ids.contains_key(&instr_id)
+            let value = if ctx
+                .global_indexed_hit_counter_ids
+                .contains_key(&load_instr_id)
             {
                 emit_codegen_indexed_global_load(
                     fb,
                     globals_obj,
                     name_obj,
                     slot_index,
-                    instr_id,
+                    load_instr_id,
                     ctx,
                 )
             } else {
@@ -1400,11 +1406,7 @@ impl JitEmitCtx<'_> {
 }
 
 fn infer_jit_value_facts(module: &BlockPyModule<CodegenModuleShape>) -> FactStore {
-    if validate_codegen_instr_ids(module).is_ok() {
-        infer_module_value_facts(module)
-    } else {
-        FactStore::default()
-    }
+    infer_module_value_facts(module)
 }
 
 #[derive(Clone)]
@@ -2884,9 +2886,7 @@ fn direct_method_specializations_for_call_site(
     let Some(method_name) = codegen_constant_string_value(ctx.module, getattr.attr.as_ref()) else {
         return Vec::new();
     };
-    let Some(instr_id) = call.meta().instr_id else {
-        return Vec::new();
-    };
+    let instr_id = call.semantic_instr_id();
     let Some(targets) = ctx.call_target_specializations.get(&instr_id) else {
         return Vec::new();
     };
@@ -2941,9 +2941,7 @@ fn direct_constructor_specializations_for_call_site(
     if ctx.shared_state.is_none() {
         return Vec::new();
     }
-    let Some(instr_id) = call.meta().instr_id else {
-        return Vec::new();
-    };
+    let instr_id = call.semantic_instr_id();
     let Some(targets) = ctx.call_target_specializations.get(&instr_id) else {
         return Vec::new();
     };
@@ -3541,9 +3539,10 @@ fn emit_direct_call_resolved_with_arg_values(
         &[ir::BlockArg::Value(call_value)],
     );
     fb.switch_to_block(call_fail_block);
-    let target_function_id = fb
-        .ins()
-        .iconst(ctx.consts.i64_ty, target_function.function_id.packed() as i64);
+    let target_function_id = fb.ins().iconst(
+        ctx.consts.i64_ty,
+        target_function.function_id.packed() as i64,
+    );
     let direct_call_block_index = fb.ins().iconst(ctx.consts.i64_ty, -4);
     let error_inst = fb.ins().call(
         ctx.take_error_before_null_cleanup_ref,
@@ -3646,9 +3645,10 @@ fn emit_direct_constructor_resolved_with_arg_values(
     );
 
     fb.switch_to_block(init_fail_block);
-    let target_function_id = fb
-        .ins()
-        .iconst(ctx.consts.i64_ty, target_function.function_id.packed() as i64);
+    let target_function_id = fb.ins().iconst(
+        ctx.consts.i64_ty,
+        target_function.function_id.packed() as i64,
+    );
     let direct_init_block_index = fb.ins().iconst(ctx.consts.i64_ty, -5);
     let error_inst = fb.ins().call(
         ctx.take_error_before_null_cleanup_ref,
@@ -3899,7 +3899,7 @@ fn emit_codegen_expr(
             return emit_codegen_located_name_load(
                 fb,
                 &op.name,
-                op.meta().instr_id,
+                op.semantic_instr_id(),
                 local_names,
                 local_values,
                 ctx,
@@ -4173,7 +4173,8 @@ fn emit_codegen_expr(
 
             if !has_unpack
                 && simple_keywords.is_empty()
-                && codegen_expr_runtime_helper(call.func.as_ref(), ctx) == Some(RuntimeHelperId::Str)
+                && codegen_expr_runtime_helper(call.func.as_ref(), ctx)
+                    == Some(RuntimeHelperId::Str)
                 && simple_args.len() == 1
             {
                 if let Some(value) = codegen_expr_const_string(simple_args[0], ctx.module_constants)
@@ -4654,8 +4655,10 @@ fn emit_codegen_expr(
                 let call_args_tuple = fb.block_params(call_args_tuple_ok)[0];
 
                 let call_inst = if let Some(kwargs_obj) = kwargs_obj {
-                    fb.ins()
-                        .call(py_call_with_kw_ref, &[callable, call_args_tuple, kwargs_obj])
+                    fb.ins().call(
+                        py_call_with_kw_ref,
+                        &[callable, call_args_tuple, kwargs_obj],
+                    )
                 } else {
                     fb.ins()
                         .call(py_call_object_ref, &[callable, call_args_tuple])
@@ -4834,14 +4837,14 @@ fn emit_codegen_expr(
             }
 
             if keywords.is_empty() {
-                let site_instr_id = call.meta().instr_id;
-                let counter_id = site_instr_id
-                    .and_then(|instr_id| ctx.call_target_counter_ids.get(&instr_id).copied());
-                let direct_hit_counter_id = site_instr_id
-                    .and_then(|instr_id| ctx.call_direct_hit_counter_ids.get(&instr_id).copied());
-                let direct_fallback_counter_id = site_instr_id.and_then(|instr_id| {
-                    ctx.call_direct_fallback_counter_ids.get(&instr_id).copied()
-                });
+                let site_instr_id = call.semantic_instr_id();
+                let counter_id = ctx.call_target_counter_ids.get(&site_instr_id).copied();
+                let direct_hit_counter_id =
+                    ctx.call_direct_hit_counter_ids.get(&site_instr_id).copied();
+                let direct_fallback_counter_id = ctx
+                    .call_direct_fallback_counter_ids
+                    .get(&site_instr_id)
+                    .copied();
                 let direct_method_specializations =
                     direct_method_specializations_for_call_site(call, ctx);
                 if !direct_method_specializations.is_empty() {
@@ -5041,8 +5044,9 @@ fn emit_codegen_expr(
                 );
                 let constructor_specializations =
                     direct_constructor_specializations_for_call_site(call, ctx);
-                let direct_specializations = site_instr_id
-                    .and_then(|instr_id| ctx.call_target_specializations.get(&instr_id))
+                let direct_specializations = ctx
+                    .call_target_specializations
+                    .get(&site_instr_id)
                     .map(|targets| {
                         targets
                             .iter()
@@ -5965,7 +5969,6 @@ fn emit_codegen_term(
 ) -> Result<(), String> {
     let decref_ref = emit_ctx.decref_ref;
     let i64_ty = emit_ctx.consts.i64_ty;
-    let i32_ty = ir::types::I32;
     let ptr_ty = emit_ctx.consts.ptr_ty;
     let null_ptr = fb.ins().iconst(ptr_ty, 0);
 
@@ -6022,7 +6025,7 @@ fn emit_codegen_term(
             fb.ins().jump(exec_blocks[target_index], &jump_args);
         }
         BlockTerm::IfTerm(if_term) => {
-            let test_instr_id = if_term.test.meta().instr_id;
+            let test_instr_id = if_term.test.semantic_instr_id();
             let test_value = emit_codegen_expr(
                 fb,
                 &if_term.test,
@@ -6033,20 +6036,19 @@ fn emit_codegen_term(
                 jit_module,
                 func_imports,
             );
-            let is_true = emit_truthy_from_owned(
-                fb,
-                test_value,
-                is_true_ref,
-                emit_ctx,
-            );
-            if let Some(counter_id) = test_instr_id
-                .and_then(|instr_id| emit_ctx.branch_outcome_counter_ids.get(&instr_id).copied())
+            let is_true = emit_truthy_from_owned(fb, test_value, is_true_ref, emit_ctx);
+            if let Some(counter_id) = emit_ctx
+                .branch_outcome_counter_ids
+                .get(&test_instr_id)
+                .copied()
             {
                 emit_record_branch_outcome_sample(fb, counter_id, is_true, emit_ctx);
             }
 
-            let prefer_true = test_instr_id
-                .and_then(|instr_id| emit_ctx.branch_prefer_true.get(&instr_id).copied())
+            let prefer_true = emit_ctx
+                .branch_prefer_true
+                .get(&test_instr_id)
+                .copied()
                 .unwrap_or(true);
             let hot_cond = if prefer_true {
                 is_true
@@ -8790,18 +8792,11 @@ fn define_shared_vectorcall_trampoline(
             .ins()
             .call_indirect(direct_sig_ref, callee_ptr, &call_args);
         let result = fb.inst_results(call_inst)[0];
-        let result_is_null = fb
-            .ins()
-            .icmp(ir::condcodes::IntCC::Equal, result, null_ptr);
+        let result_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, result, null_ptr);
         let direct_null_block = fb.create_block();
         let direct_ok_block = fb.create_block();
-        fb.ins().brif(
-            result_is_null,
-            direct_null_block,
-            &[],
-            direct_ok_block,
-            &[],
-        );
+        fb.ins()
+            .brif(result_is_null, direct_null_block, &[], direct_ok_block, &[]);
         fb.seal_block(direct_null_block);
         fb.seal_block(direct_ok_block);
 

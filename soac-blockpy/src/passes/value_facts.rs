@@ -354,10 +354,7 @@ impl ValueFacts {
                 callable: CallableFact::RuntimeHelper(helper),
                 ..
             }) => Some(helper),
-            Self::PyObj(_)
-            | Self::I32(_)
-            | Self::I64(_)
-            | Self::Bool(_) => None,
+            Self::PyObj(_) | Self::I32(_) | Self::I64(_) | Self::Bool(_) => None,
         }
     }
 }
@@ -636,9 +633,13 @@ impl Visit<InstrCodegen> for FunctionFactInferer<'_> {
     where
         InstrCodegen: ChildVisitable<InstrCodegen>,
     {
-        let key = expr.semantic_instr_key(self.function.function_id);
-        let facts = self.infer_expr_facts(expr);
-        self.store.expr_facts.insert(key, facts);
+        // Synthetic trace/counter instrumentation is inserted after semantic ID
+        // assignment. It should not receive fake expression facts of its own.
+        if let Some(instr_id) = expr.try_semantic_instr_id() {
+            let key = InstrKey::new(self.function.function_id, instr_id);
+            let facts = self.infer_expr_facts(expr);
+            self.store.expr_facts.insert(key, facts);
+        }
         crate::block_py::walk_expr(self, expr);
     }
 }
