@@ -5868,7 +5868,32 @@ fn emit_planned_stack_slot_releases_for_reason(
     reason: &RefcountReleaseReason,
     emit_ctx: &JitEmitCtx<'_>,
 ) -> Result<(), String> {
-    let Some(block_plan) = emit_ctx.refcount_plan.block(source_label) else {
+    emit_planned_stack_slot_releases_for_reason_from_parts(
+        fb,
+        source_label,
+        reason,
+        emit_ctx.refcount_plan,
+        &emit_ctx.stack_slots,
+        emit_ctx.consts.deleted_const,
+        emit_ctx.consts.ptr_ty,
+        emit_ctx.incref_ref,
+        emit_ctx.decref_ref,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_planned_stack_slot_releases_for_reason_from_parts(
+    fb: &mut FunctionBuilder<'_>,
+    source_label: BlockLabel,
+    reason: &RefcountReleaseReason,
+    refcount_plan: &FunctionRefcountPlan,
+    stack_slots: &StackSlots,
+    deleted_const: ir::Value,
+    ptr_ty: ir::Type,
+    incref_ref: ir::FuncRef,
+    decref_ref: ir::FuncRef,
+) -> Result<(), String> {
+    let Some(block_plan) = refcount_plan.block(source_label) else {
         return Ok(());
     };
     for action in &block_plan.actions {
@@ -5883,15 +5908,14 @@ fn emit_planned_stack_slot_releases_for_reason(
         if action_reason != reason {
             continue;
         }
-        emit_ctx
-            .stack_slots
+        stack_slots
             .replace_cloned_value(
                 fb,
                 local.name.as_str(),
-                emit_ctx.consts.deleted_const,
-                emit_ctx.consts.ptr_ty,
-                emit_ctx.incref_ref,
-                emit_ctx.decref_ref,
+                deleted_const,
+                ptr_ty,
+                incref_ref,
+                decref_ref,
             )
             .ok_or_else(|| {
                 format!(
@@ -8393,6 +8417,12 @@ fn build_cranelift_run_bb_specialized_function(
                 module_constant_ptrs,
                 ptr_ty,
             );
+            let deleted_const = emit_owned_module_constant_from_parts(
+                &mut fb,
+                deleted_constant_id,
+                module_constant_ptrs,
+                ptr_ty,
+            );
             let dispatch_step_null_args = Vec::new();
 
             let raised_exc =
@@ -8430,6 +8460,21 @@ fn build_cranelift_run_bb_specialized_function(
                 &stack_slots,
                 ptr_ty,
                 none_const,
+                incref_ref,
+                decref_ref,
+            )?;
+            let source_label = function.blocks[index].label;
+            let release_reason = RefcountReleaseReason::ExceptionEdge {
+                target: function.blocks[dispatch_plan.target_index].label,
+            };
+            emit_planned_stack_slot_releases_for_reason_from_parts(
+                &mut fb,
+                source_label,
+                &release_reason,
+                &refcount_plan,
+                &stack_slots,
+                deleted_const,
+                ptr_ty,
                 incref_ref,
                 decref_ref,
             )?;

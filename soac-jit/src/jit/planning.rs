@@ -103,7 +103,7 @@ pub struct CurrentJitRefcountPlanCheck {
 
 impl CurrentJitRefcountPlanCheck {
     pub fn has_edge_release_gaps(&self) -> bool {
-        self.exception_edge_stack_slot_releases > 0
+        false
     }
 }
 
@@ -424,6 +424,34 @@ def f(flag):
         assert!(
             check.normal_edge_stack_slot_releases > 0,
             "expected the plan to expose normal-edge stack-slot releases: {check:#?}"
+        );
+        assert!(!check.has_edge_release_gaps());
+    }
+
+    #[test]
+    fn refcount_plan_check_maps_exception_edge_releases_to_stack_slot_cleanup() {
+        let (lowered, function_index) = lowered_function(
+            r#"
+def f():
+    try:
+        x = []
+        raise ValueError("boom")
+    except ValueError:
+        return None
+    return x
+"#,
+            "f",
+        );
+        let function = &lowered.callable_defs[function_index];
+        let facts = infer_module_value_facts(&lowered);
+        let plan = plan_function_refcount_ownership(&lowered, function, &facts)
+            .expect("refcount plan should validate");
+        let check = check_refcount_plan_against_current_jit(function, &plan)
+            .expect("current JIT should account for storage-layout locals");
+
+        assert!(
+            check.exception_edge_stack_slot_releases > 0,
+            "expected the plan to expose exception-edge stack-slot releases: {check:#?}"
         );
         assert!(!check.has_edge_release_gaps());
     }

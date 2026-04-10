@@ -304,9 +304,12 @@ Started:
   cleanup actions before instrumentation or JIT codegen can consume the module.
 - JIT planning now computes the same verified per-function `RefcountPlan` beside
   `FunctionLocalPlan` and makes it available through `JitEmitCtx`. Emission still
-  ignores terminal and exception-edge releases, so stack-slot cleanup remains the
-  runtime behavior there.
+  ignores terminal releases, so stack-slot cleanup remains the runtime behavior
+  there.
 - JIT codegen has started consuming normal-edge `RefcountPlan` releases by
   replacing unforwarded stack-slot locals with the deleted sentinel before the
   edge jump. This preserves the current terminal stack-slot cleanup model while
   moving normal-edge destructor timing toward the explicit BlockPy plan.
+- JIT exception dispatch now consumes exception-edge `RefcountPlan` releases the
+  same way, after writing forwarded exception-target slots and before jumping to
+  the handler block.
