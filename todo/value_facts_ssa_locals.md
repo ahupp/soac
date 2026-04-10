@@ -10,13 +10,16 @@ explicit enough that refcount timing remains CPython-compatible.
 The boundary should be:
 
 ```text
-BlockPy passes decide names, globals, control flow, and stable semantic
-instruction identity.
+BlockPy passes decide names, globals, control flow, stable semantic instruction
+identity, and explicit Python ownership/refcount operations.
 
 Value facts analyze codegen-shaped BlockPy as a read-only sidecar.
 
-JIT planning decides SSA ownership, Cranelift block params, cleanup edges, and
-stack-slot materialization.
+Refcount lowering consumes value facts and rewrites implicit Python ownership
+effects into explicit transfers, increfs, decrefs, and cleanup requirements.
+
+JIT planning consumes explicit ownership/refcount operations and decides
+Cranelift block params, cleanup edges, and stack-slot materialization.
 ```
 
 ## Pass Placement
@@ -32,6 +35,7 @@ name_binding
    - dense block labels
    - stable semantic instruction ids
 -> value_facts analysis sidecar
+-> refcount ownership lowering
 -> optional trace/counter instrumentation
 -> validate
 -> JIT codegen with FactStore + SSA LocalEnv
@@ -131,6 +135,33 @@ built-in constants across such operations.
 
 TODO: Replace stringly typed runtime singleton names like `NONE`/`TRUE`/`FALSE` with a typed runtime-symbol enum.
 
+## Refcount Lowering
+
+Refcounting should become explicit in BlockPy before the JIT. The pass should
+consume codegen-shaped BlockPy plus `FactStore` and produce a representation
+where ownership is carried by IR values and release/transfer points are explicit:
+
+```rust
+enum OwnershipEffect {
+    TransferOwned { value: Value },
+    Incref { value: Value },
+    Decref { value: Value },
+    ReleaseIfOwned { value: Value },
+}
+```
+
+The exact type shape can change, but the important boundary is that codegen
+should no longer rediscover refcount policy from ad hoc local vectors. The JIT
+may still choose how to encode the operations, fold immortal decrefs, or route
+cleanup through Cranelift blocks, but semantic refcount timing belongs to the
+BlockPy pass.
+
+The pass needs to model normal and exceptional edges. For local stores, it must
+preserve CPython's order of operations by evaluating the RHS, installing the new
+binding, and only then decrefing the old binding. For calls and other failing
+operations, it must attach cleanup requirements to the failure edge using the
+live owned values at that point.
+
 ## SSA Locals
 
 Semantic Python local state should become an SSA environment:
@@ -195,12 +226,14 @@ exceptional path.
 5. Add branch transfer/narrowing for `IfTerm.test`.
 6. Thread read-only `FactStore` into JIT codegen.
 7. Introduce `LocalEnv` in JIT codegen without changing generated behavior.
-8. Add a JIT-local planning phase for SSA ownership decisions.
-9. Convert straight-line local load/store to SSA ownership.
-10. Move block params to ownership-carrying SSA values.
-11. Replace stack-slot cleanup with environment cleanup at returns and failure
+8. Add a temporary JIT-local planning phase for SSA ownership observations.
+9. Introduce a BlockPy refcount ownership lowering pass that emits explicit
+   ownership transfers and cleanup requirements.
+10. Convert straight-line local load/store to SSA ownership in the BlockPy pass.
+11. Move block params to ownership-carrying SSA values.
+12. Replace stack-slot cleanup with explicit environment cleanup at returns and failure
     edges.
-12. Add the ownership verifier and only then expand fact-driven codegen.
+13. Add the ownership verifier and only then expand fact-driven codegen.
 
 ## Current Status
 
@@ -238,6 +271,10 @@ Started:
 - Block-entry facts are computed by a forward function-level transfer over the
   CFG. Straight-line local stores set facts for the target local, local loads
   can copy known facts to another local, and local deletes remove facts.
+- A temporary JIT-side `LocalRefKind` cleanup consumer is being added so cleanup
+  paths stop assuming every transient local is owned by construction. This is
+  intentionally a bridge to the BlockPy refcount lowering pass, not the final
+  home for refcount policy.
 - JIT codegen now computes the read-only `FactStore` once per lowered module and
   exposes expression fact lookup through `JitEmitCtx`. Generated code does not
   use the facts yet.

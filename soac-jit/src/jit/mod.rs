@@ -1497,6 +1497,12 @@ impl LocalEnv {
         (&mut self.names, &mut self.values)
     }
 
+    fn as_parts_and_ref_kinds_mut(
+        &mut self,
+    ) -> (&mut Vec<String>, &mut Vec<ir::Value>, &[LocalRefKind]) {
+        (&mut self.names, &mut self.values, &self.ref_kinds)
+    }
+
     fn refresh_transient_ref_kinds(&mut self) {
         debug_assert_eq!(
             self.names.len(),
@@ -1512,6 +1518,13 @@ impl LocalEnv {
                 .all(|ref_kind| *ref_kind == LocalRefKind::Owned),
             "transient JIT locals currently carry owned references"
         );
+    }
+}
+
+fn transient_local_needs_decref(ref_kind: LocalRefKind) -> bool {
+    match ref_kind {
+        LocalRefKind::Owned | LocalRefKind::Unknown => true,
+        LocalRefKind::Borrowed | LocalRefKind::Immortal | LocalRefKind::Unbound => false,
     }
 }
 
@@ -5135,9 +5148,15 @@ fn emit_decref_unforwarded_locals(
     fb: &mut FunctionBuilder<'_>,
     local_values: &[ir::Value],
     local_names: &[String],
+    local_ref_kinds: &[LocalRefKind],
     target_params: &[String],
     decref_ref: ir::FuncRef,
 ) {
+    debug_assert_eq!(
+        local_values.len(),
+        local_ref_kinds.len(),
+        "JIT transient local values and ref kinds must stay parallel"
+    );
     let mut forwarded_local_indices = HashMap::new();
     for name in target_params {
         if let Some(index) = local_names.iter().position(|candidate| candidate == name) {
@@ -5148,7 +5167,13 @@ fn emit_decref_unforwarded_locals(
         if forwarded_local_indices.contains_key(&index) {
             continue;
         }
-        fb.ins().call(decref_ref, &[*value]);
+        let ref_kind = local_ref_kinds
+            .get(index)
+            .copied()
+            .unwrap_or(LocalRefKind::Unknown);
+        if transient_local_needs_decref(ref_kind) {
+            fb.ins().call(decref_ref, &[*value]);
+        }
     }
 }
 
@@ -5223,6 +5248,7 @@ fn emit_codegen_if_target_arm(
     runtime_block_param_names: &[Vec<String>],
     local_names: &mut Vec<String>,
     local_values: &mut Vec<ir::Value>,
+    local_ref_kinds: &[LocalRefKind],
     emit_ctx: &JitEmitCtx<'_>,
     jit_module: &mut JITModule,
     func_imports: &mut FuncBuildImports<'_>,
@@ -5253,6 +5279,7 @@ fn emit_codegen_if_target_arm(
         fb,
         local_values,
         local_names,
+        local_ref_kinds,
         target_params,
         emit_ctx.decref_ref,
     );
@@ -5269,6 +5296,7 @@ fn emit_codegen_term(
     full_block_param_names: &[Vec<String>],
     local_names: &mut Vec<String>,
     local_values: &mut Vec<ir::Value>,
+    local_ref_kinds: &[LocalRefKind],
     emit_ctx: &JitEmitCtx<'_>,
     jit_module: &mut JITModule,
     func_imports: &mut FuncBuildImports<'_>,
@@ -5322,6 +5350,7 @@ fn emit_codegen_term(
                 fb,
                 local_values,
                 local_names,
+                local_ref_kinds,
                 target_params,
                 decref_ref,
             );
@@ -5381,6 +5410,7 @@ fn emit_codegen_term(
                 runtime_block_param_names,
                 local_names,
                 local_values,
+                local_ref_kinds,
                 emit_ctx,
                 jit_module,
                 func_imports,
@@ -5395,6 +5425,7 @@ fn emit_codegen_term(
                 runtime_block_param_names,
                 local_names,
                 local_values,
+                local_ref_kinds,
                 emit_ctx,
                 jit_module,
                 func_imports,
@@ -5465,6 +5496,7 @@ fn emit_codegen_term(
                     fb,
                     local_values,
                     local_names,
+                    local_ref_kinds,
                     target_params,
                     decref_ref,
                 );
@@ -5497,6 +5529,7 @@ fn emit_codegen_term(
                 fb,
                 local_values,
                 local_names,
+                local_ref_kinds,
                 default_params,
                 decref_ref,
             );
@@ -5514,9 +5547,14 @@ fn emit_codegen_term(
                 jit_module,
                 func_imports,
             );
-            for value in local_values {
-                fb.ins().call(decref_ref, &[*value]);
-            }
+            emit_decref_unforwarded_locals(
+                fb,
+                local_values,
+                local_names,
+                local_ref_kinds,
+                &[],
+                decref_ref,
+            );
             emit_ctx.stack_slots.decref_all(fb, ptr_ty, decref_ref);
             fb.ins().return_(&[ret_value]);
         }
@@ -5606,7 +5644,14 @@ fn emit_codegen_term(
             );
 
             fb.switch_to_block(raise_rc_ok);
-            emit_decref_unforwarded_locals(fb, local_values, local_names, &[], decref_ref);
+            emit_decref_unforwarded_locals(
+                fb,
+                local_values,
+                local_names,
+                local_ref_kinds,
+                &[],
+                decref_ref,
+            );
             fb.ins().jump(
                 emit_ctx.consts.step_null_block,
                 &step_null_block_args(emit_ctx),
@@ -7437,7 +7482,8 @@ fn build_cranelift_run_bb_specialized_function(
                 &mut func_imports,
             )?;
             local_env.refresh_transient_ref_kinds();
-            let (local_names, local_values) = local_env.as_parts_mut();
+            let (local_names, local_values, local_ref_kinds) =
+                local_env.as_parts_and_ref_kinds_mut();
 
             emit_codegen_term(
                 &mut fb,
@@ -7448,6 +7494,7 @@ fn build_cranelift_run_bb_specialized_function(
                 &full_block_param_names,
                 local_names,
                 local_values,
+                local_ref_kinds,
                 &emit_ctx,
                 jit_module,
                 &mut func_imports,
