@@ -35,7 +35,7 @@ name_binding
    - dense block labels
    - stable semantic instruction ids
 -> value_facts analysis sidecar
--> refcount ownership lowering
+-> ownership_effects analysis sidecar
 -> optional trace/counter instrumentation
 -> validate
 -> JIT codegen with FactStore + SSA LocalEnv
@@ -135,26 +135,32 @@ built-in constants across such operations.
 
 TODO: Replace stringly typed runtime singleton names like `NONE`/`TRUE`/`FALSE` with a typed runtime-symbol enum.
 
-## Refcount Lowering
+## Ownership Effects
 
-Refcounting should become explicit in BlockPy before the JIT. The pass should
+Python ownership should become explicit before the JIT, but BlockPy should not
+insert physical `INCREF`/`DECREF` calls. The ownership-effects pass should
 consume codegen-shaped BlockPy plus `FactStore` and produce a representation
-where ownership is carried by IR values and release/transfer points are explicit:
+where ownership is carried by IR values and release/transfer obligations are
+explicit:
 
 ```rust
 enum OwnershipEffect {
-    TransferOwned { value: Value },
-    Incref { value: Value },
-    Decref { value: Value },
-    ReleaseIfOwned { value: Value },
+    ProducesOwned { value: Value },
+    ProducesBorrowed { value: Value },
+    RebindLocal { local: LocalLocation, new_value: Value },
+    DeleteLocal { local: LocalLocation },
+    TransferToSuccessor { target: BlockLabel, value: Value },
+    CleanupOnFailure { live_owned: Vec<Value> },
 }
 ```
 
 The exact type shape can change, but the important boundary is that codegen
 should no longer rediscover refcount policy from ad hoc local vectors. The JIT
-may still choose how to encode the operations, fold immortal decrefs, or route
-cleanup through Cranelift blocks, but semantic refcount timing belongs to the
-BlockPy pass.
+lowers ownership effects to concrete calls after representation choices are
+known: SSA block params versus stack-slot mirrors, borrowed helper results,
+runtime constants, immortal values, and nullable-result cleanup block shape.
+Semantic refcount timing belongs to the BlockPy pass; concrete refcount calls
+belong to backend lowering.
 
 The pass needs to model normal and exceptional edges. For local stores, it must
 preserve CPython's order of operations by evaluating the RHS, installing the new
@@ -227,8 +233,8 @@ exceptional path.
 6. Thread read-only `FactStore` into JIT codegen.
 7. Introduce `LocalEnv` in JIT codegen without changing generated behavior.
 8. Add a temporary JIT-local planning phase for SSA ownership observations.
-9. Introduce a BlockPy refcount ownership lowering pass that emits explicit
-   ownership transfers and cleanup requirements.
+9. Introduce a BlockPy ownership-effects pass that records semantic ownership
+   transfers and cleanup requirements without emitting physical refcount calls.
 10. Convert straight-line local load/store to SSA ownership in the BlockPy pass.
 11. Move block params to ownership-carrying SSA values.
 12. Replace stack-slot cleanup with explicit environment cleanup at returns and failure
@@ -300,6 +306,9 @@ Started:
   entries after cloning into the stack slot. Forwarding borrowed locals to a
   successor now emits the required INCREF, so stack-slot cleanup owns the
   mirrored reference and `LocalEnv` does not leak an extra block-param owner.
+- The temporary legacy `LocalEnv` adapter preserves stack-mirror storage only
+  when the value itself is unchanged. If legacy expression emission replaces a
+  value, the new entry becomes local-only ownership state.
 - A first `FunctionLocalPlan` exists in JIT planning. It records per-block entry
   bindings from the storage layout, annotates them with available `EnvFacts`,
   and classifies known immortal locals without changing generated code.
@@ -308,18 +317,19 @@ Started:
   optimization when an ID is missing. Synthetic test builders fill missing IDs
   explicitly, and value-fact inference ignores ID-less synthetic trace/counter
   instrumentation rather than assigning fake semantic identities.
-- A first BlockPy `RefcountPlan` sidecar exists and is computed after
+- A first BlockPy ownership-effects sidecar exists and is computed after
   `value_facts` in the lowering driver. It records local rebind, delete, and
   cleanup ownership effects from codegen-shaped BlockPy, including stores of
-  the runtime `DELETED` sentinel and immortal local facts. Generated code does
-  not consume the plan yet.
-- The `RefcountPlan` has a verifier that replays local ownership through each
+  the runtime `DELETED` sentinel and immortal local facts. The Rust types still
+  use the transitional `RefcountPlan` names internally, but the pass entrypoint
+  and timing label are now `ownership_effects`.
+- The ownership-effects plan has a verifier that replays local ownership through each
   codegen block and validates store/delete transitions plus edge and return
   cleanup actions before instrumentation or JIT codegen can consume the module.
-- JIT planning now computes the same verified per-function `RefcountPlan` beside
+- JIT planning now computes the same verified per-function ownership plan beside
   `FunctionLocalPlan` and makes it available through `JitEmitCtx`.
 - JIT edge-release consumption is blocked on moving locals from function-wide
-  stack slots to SSA environments. The verified `RefcountPlan` records normal
+  stack slots to SSA environments. The verified ownership plan records normal
   and exception edge releases, but JIT stack-slot codegen currently only
   consumes terminal releases because clearing a function-wide slot on an edge
   can delete locals still live in a later block.
@@ -328,6 +338,6 @@ Started:
   name error before exposing `NULL` as a Python value, and stack-slot
   INCREF/DECREF operations skip `NULL`.
 - JIT return and successful explicit-raise terminals now also consume terminal
-  `RefcountPlan` releases. Returns clear planned stack slots to `NULL` and no
+  ownership-plan releases. Returns clear planned stack slots to `NULL` and no
   longer scan every stack slot; explicit-raise terminals still route through
   shared failure cleanup that skips already-`NULL` slots.

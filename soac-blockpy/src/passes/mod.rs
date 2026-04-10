@@ -9,7 +9,7 @@ mod global_index;
 mod instr_id;
 mod instrument;
 mod name_binding;
-mod refcount_lowering;
+mod ownership_effects;
 pub mod ruff_to_blockpy;
 mod trace;
 mod value_facts;
@@ -378,8 +378,8 @@ pub use instr_id::{
 pub use instrument::{
     CounterBuilder, CounterHandle, CounterSpec, InstrumentInstr, OptBlock, OptInstr,
 };
-pub use refcount_lowering::{
-    lower_refcount_ownership, validate_refcount_plan, BlockRefcountPlan, FunctionRefcountPlan,
+pub use ownership_effects::{
+    plan_ownership_effects, validate_ownership_effects, BlockRefcountPlan, FunctionRefcountPlan,
     LocalRefState, RefcountAction, RefcountActionKind, RefcountLocal, RefcountPlan,
     RefcountReleaseReason, RefcountSite,
 };

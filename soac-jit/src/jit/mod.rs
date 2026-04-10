@@ -2261,11 +2261,11 @@ impl LocalEnv {
             .zip(values)
             .map(|(name, value)| {
                 let existing_entry = self.entries.iter().find(|entry| entry.name == name);
-                let ref_kind = existing_entry
-                    .filter(|entry| entry.value == value)
+                let unchanged_entry = existing_entry.filter(|entry| entry.value == value);
+                let ref_kind = unchanged_entry
                     .map(|entry| entry.ref_kind)
                     .unwrap_or(LocalRefKind::Owned);
-                let storage = existing_entry
+                let storage = unchanged_entry
                     .map(|entry| entry.storage)
                     .unwrap_or(LocalEnvStorage::LocalOnly);
                 LocalEnvEntry {

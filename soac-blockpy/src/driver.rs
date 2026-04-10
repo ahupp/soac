@@ -207,12 +207,12 @@ pub(crate) fn rewrite_module_with_tracker_with_options(
     let value_facts: passes::FactStore = pass_tracker.record_timing("value_facts", || {
         passes::infer_module_value_facts(&bb_codegen)
     });
-    let refcount_plan: passes::RefcountPlan = pass_tracker
-        .record_timing("refcount_lowering", || {
-            passes::lower_refcount_ownership(&bb_codegen, &value_facts)
+    let ownership_plan: passes::RefcountPlan = pass_tracker
+        .record_timing("ownership_effects", || {
+            passes::plan_ownership_effects(&bb_codegen, &value_facts)
         });
-    pass_tracker.record_timing("validate_refcount_plan", || {
-        passes::validate_refcount_plan(&bb_codegen, &value_facts, &refcount_plan)
+    pass_tracker.record_timing("validate_ownership_effects", || {
+        passes::validate_ownership_effects(&bb_codegen, &value_facts, &ownership_plan)
             .map_err(anyhow::Error::msg)
     })?;
 

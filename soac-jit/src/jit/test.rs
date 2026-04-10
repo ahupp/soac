@@ -505,7 +505,7 @@ mod tests {
         assert_eq!(env.entries[0].name, "x");
         assert_eq!(env.entries[0].value, second);
         assert_eq!(env.entries[0].ref_kind, LocalRefKind::Owned);
-        assert_eq!(env.entries[0].storage, LocalEnvStorage::StackMirror);
+        assert_eq!(env.entries[0].storage, LocalEnvStorage::LocalOnly);
     }
 
     #[test]

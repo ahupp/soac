@@ -1,3 +1,11 @@
+//! Semantic Python ownership planning.
+//!
+//! This pass intentionally does not insert physical INCREF/DECREF calls into
+//! BlockPy. It records ownership effects: local rebinds, deletes, transfers,
+//! and cleanup obligations. Backends lower those effects to concrete refcount
+//! operations once representation choices such as SSA block params, stack-slot
+//! mirrors, borrowed helper results, and immortal constants are known.
+
 use crate::block_py::{
     Block, BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, CallArgPositional,
     CellLocation, ChildVisitable, FunctionId, HasSemanticInstrId, InstrCodegen, InstrKey,
@@ -98,7 +106,7 @@ impl RefcountPlan {
     }
 }
 
-pub fn lower_refcount_ownership(
+pub fn plan_ownership_effects(
     module: &BlockPyModule<CodegenModuleShape>,
     facts: &FactStore,
 ) -> RefcountPlan {
@@ -122,7 +130,7 @@ pub fn lower_refcount_ownership(
     RefcountPlan { functions }
 }
 
-pub fn validate_refcount_plan(
+pub fn validate_ownership_effects(
     module: &BlockPyModule<CodegenModuleShape>,
     facts: &FactStore,
     plan: &RefcountPlan,
@@ -1475,7 +1483,7 @@ fn expected_release_actions(
 #[cfg(test)]
 mod tests {
     use super::{
-        lower_refcount_ownership, validate_refcount_plan, LocalRefState, RefcountActionKind,
+        plan_ownership_effects, validate_ownership_effects, LocalRefState, RefcountActionKind,
         RefcountReleaseReason,
     };
     use crate::block_py::{BlockTerm, NameLike};
@@ -1498,7 +1506,7 @@ mod tests {
             .expect("missing lowered function f")
             .clone();
         let facts = infer_module_value_facts(&lowered);
-        let plan = lower_refcount_ownership(&lowered, &facts);
+        let plan = plan_ownership_effects(&lowered, &facts);
         let function_plan = plan
             .function(function.function_id)
             .expect("missing function refcount plan");
@@ -1721,7 +1729,7 @@ def f():
         .expect("transform should succeed")
         .codegen_module;
         let facts = infer_module_value_facts(&lowered);
-        let plan = lower_refcount_ownership(&lowered, &facts);
+        let plan = plan_ownership_effects(&lowered, &facts);
         let function = lowered
             .callable_defs
             .iter()
@@ -1769,9 +1777,9 @@ def f(flag):
         .expect("transform should succeed")
         .codegen_module;
         let facts = infer_module_value_facts(&lowered);
-        let plan = lower_refcount_ownership(&lowered, &facts);
+        let plan = plan_ownership_effects(&lowered, &facts);
 
-        validate_refcount_plan(&lowered, &facts, &plan).expect("lowered plan should validate");
+        validate_ownership_effects(&lowered, &facts, &plan).expect("lowered plan should validate");
     }
 
     #[test]
@@ -1786,7 +1794,7 @@ def f():
         .expect("transform should succeed")
         .codegen_module;
         let facts = infer_module_value_facts(&lowered);
-        let mut plan = lower_refcount_ownership(&lowered, &facts);
+        let mut plan = plan_ownership_effects(&lowered, &facts);
         let function = lowered
             .callable_defs
             .iter()
@@ -1811,7 +1819,7 @@ def f():
             });
         }
 
-        let err = validate_refcount_plan(&lowered, &facts, &plan)
+        let err = validate_ownership_effects(&lowered, &facts, &plan)
             .expect_err("missing release should fail validation");
         assert!(
             err.contains("missing refcount release"),

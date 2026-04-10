@@ -3,7 +3,7 @@ use soac_blockpy::block_py::{
 };
 use soac_blockpy::passes::{
     CodegenModuleShape, FactStore, FunctionRefcountPlan, PyObjFacts, RefcountActionKind,
-    RefcountReleaseReason, lower_refcount_ownership, validate_refcount_plan,
+    RefcountReleaseReason, plan_ownership_effects, validate_ownership_effects,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -84,8 +84,8 @@ pub fn plan_function_refcount_ownership(
     function: &BlockPyFunction<CodegenModuleShape>,
     facts: &FactStore,
 ) -> Result<FunctionRefcountPlan, String> {
-    let plan = lower_refcount_ownership(module, facts);
-    validate_refcount_plan(module, facts, &plan)?;
+    let plan = plan_ownership_effects(module, facts);
+    validate_ownership_effects(module, facts, &plan)?;
     Ok(plan
         .function(function.function_id)
         .cloned()
