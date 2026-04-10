@@ -142,6 +142,11 @@ current `@`. Do not treat another workspace's live `@` as a dependency.
 
 9. Record finalized performance changes.
 
+When a change is expected to affect performance, validate it with a before/after
+benchmark before treating it as complete. Use the repo benchmark comparison
+workflow unless there is a specific reason to use a narrower measurement, and
+report both headline throughput and relative delta.
+
 When a performance change is complete enough that you intend to keep it,
 append an entry to `docs/CODEX_OPT_LOG.md` in the same logical change.
 Keep entries succinct: include the jj change id, a short summary of the
