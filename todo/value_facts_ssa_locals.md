@@ -286,6 +286,10 @@ Started:
   exposing a narrow legacy adapter to the older expression emitter. This keeps
   generated code unchanged but gives the refcount/ownership work a single
   transient-local value space to grow into.
+- `LocalEnv` now has a typed `LocalLocation` key for semantic Python locals
+  alongside legacy scratch-name entries. Straight-line block-body local
+  load/store/delete emission can use location-aware `LocalEnv` operations while
+  complex expression lowering still passes through the temporary legacy adapter.
 - A first `FunctionLocalPlan` exists in JIT planning. It records per-block entry
   bindings from the storage layout, annotates them with available `EnvFacts`,
   and classifies known immortal locals without changing generated code.

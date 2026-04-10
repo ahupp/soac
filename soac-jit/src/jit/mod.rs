@@ -1719,7 +1719,21 @@ struct CodegenIntrinsicEmitState<'a, 'b, 'mc, 'c, 'd> {
     func_imports: &'a mut FuncBuildImports<'d>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum LocalEnvKey {
+    Location(LocalLocation),
+    Name(String),
+}
+
+impl LocalEnvKey {
+    fn legacy_name(name: &str) -> Self {
+        Self::Name(name.to_string())
+    }
+}
+
+#[derive(Clone)]
 struct LocalEnvEntry {
+    key: LocalEnvKey,
     name: String,
     value: ir::Value,
     ref_kind: LocalRefKind,
@@ -1737,6 +1751,100 @@ struct LocalEnvLegacyParts {
 }
 
 impl LocalEnv {
+    fn entry_index_for_location(&self, location: LocalLocation) -> Option<usize> {
+        self.entries
+            .iter()
+            .position(|entry| entry.key == LocalEnvKey::Location(location))
+    }
+
+    fn entry_index_for_name(&self, name: &str) -> Option<usize> {
+        self.entries.iter().position(|entry| entry.name == name)
+    }
+
+    fn load_location(
+        &self,
+        fb: &mut FunctionBuilder<'_>,
+        location: LocalLocation,
+        name: &str,
+        ctx: &JitEmitCtx<'_>,
+        borrowed: bool,
+    ) -> Option<ir::Value> {
+        if let Some(index) = self
+            .entry_index_for_location(location)
+            .or_else(|| self.entry_index_for_name(name))
+        {
+            let value = self.entries[index].value;
+            if !borrowed {
+                fb.ins().call(ctx.incref_ref, &[value]);
+            }
+            return Some(value);
+        }
+        emit_checked_stack_slot_value(fb, &ctx.stack_slots, name, ctx, borrowed)
+    }
+
+    fn store_location(
+        &mut self,
+        fb: &mut FunctionBuilder<'_>,
+        location: LocalLocation,
+        name: &str,
+        value: ir::Value,
+        stack_slots: &StackSlots,
+        ptr_ty: ir::Type,
+        incref_ref: ir::FuncRef,
+        decref_ref: ir::FuncRef,
+    ) {
+        if let Some(existing_index) = self
+            .entry_index_for_location(location)
+            .or_else(|| self.entry_index_for_name(name))
+        {
+            let previous = self.entries.remove(existing_index);
+            if transient_local_needs_decref(previous.ref_kind) {
+                fb.ins().call(decref_ref, &[previous.value]);
+            }
+        }
+        if stack_slots.has_name(name) {
+            stack_slots
+                .replace_cloned_value(fb, name, value, ptr_ty, incref_ref, decref_ref)
+                .expect("slot-backed local missing from stack slots");
+            fb.ins().call(decref_ref, &[value]);
+        } else {
+            self.entries.push(LocalEnvEntry {
+                key: LocalEnvKey::Location(location),
+                name: name.to_string(),
+                value,
+                ref_kind: LocalRefKind::Owned,
+            });
+        }
+    }
+
+    fn delete_location(
+        &mut self,
+        fb: &mut FunctionBuilder<'_>,
+        location: LocalLocation,
+        name: &str,
+        stack_slots: &StackSlots,
+        ptr_ty: ir::Type,
+        decref_ref: ir::FuncRef,
+    ) -> Result<(), String> {
+        if let Some(index) = self
+            .entry_index_for_location(location)
+            .or_else(|| self.entry_index_for_name(name))
+        {
+            let previous = self.entries.remove(index);
+            if transient_local_needs_decref(previous.ref_kind) {
+                fb.ins().call(decref_ref, &[previous.value]);
+            }
+        } else if !stack_slots.has_name(name) {
+            return Err(format!("missing local binding for delete target: {name}"));
+        }
+        if stack_slots.has_name(name) {
+            stack_slots
+                .clear_value(fb, name, ptr_ty, decref_ref)
+                .expect("slot-backed delete target missing from stack slots");
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     fn legacy_ref_kinds(&self) -> Vec<LocalRefKind> {
         self.entries.iter().map(|entry| entry.ref_kind).collect()
@@ -1769,13 +1877,15 @@ impl LocalEnv {
             .into_iter()
             .zip(values)
             .map(|(name, value)| {
-                let ref_kind = self
-                    .entries
-                    .iter()
-                    .find(|entry| entry.name == name && entry.value == value)
+                let existing_entry = self.entries.iter().find(|entry| entry.name == name);
+                let ref_kind = existing_entry
+                    .filter(|entry| entry.value == value)
                     .map(|entry| entry.ref_kind)
                     .unwrap_or(LocalRefKind::Owned);
                 LocalEnvEntry {
+                    key: existing_entry
+                        .map(|entry| entry.key.clone())
+                        .unwrap_or_else(|| LocalEnvKey::legacy_name(name.as_str())),
                     name,
                     value,
                     ref_kind,
@@ -6115,6 +6225,118 @@ fn emit_truthy_from_owned(
     )
 }
 
+fn emit_codegen_expr_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    expr: &InstrCodegen,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    borrowed: bool,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> ir::Value {
+    if let InstrCodegen::Load(op) = expr {
+        if let Some(location) = op.name.local_location() {
+            let layout = emit_ctx
+                .storage_layout
+                .as_ref()
+                .expect("Load local slot should have storage layout during codegen");
+            let name = local_name_for_location(layout, location);
+            if let Some(value) = local_env.load_location(fb, location, name, emit_ctx, borrowed) {
+                return value;
+            }
+            panic!("missing local {name} in direct JIT state");
+        }
+    }
+    let mut local_parts = local_env.to_legacy_parts();
+    let value = emit_codegen_expr(
+        fb,
+        expr,
+        &mut local_parts.names,
+        &mut local_parts.values,
+        emit_ctx,
+        borrowed,
+        jit_module,
+        func_imports,
+    );
+    local_env.replace_from_legacy_parts(local_parts);
+    value
+}
+
+fn emit_codegen_stmt_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    expr: &InstrCodegen,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> ir::Value {
+    match expr {
+        InstrCodegen::Store(op) => {
+            if let Some(location) = op.name.local_location() {
+                let layout = emit_ctx
+                    .storage_layout
+                    .as_ref()
+                    .expect("Store local slot should have storage layout during codegen");
+                let name = local_name_for_location(layout, location);
+                let value = emit_codegen_expr_with_local_env(
+                    fb,
+                    &op.value,
+                    local_env,
+                    emit_ctx,
+                    false,
+                    jit_module,
+                    func_imports,
+                );
+                local_env.store_location(
+                    fb,
+                    location,
+                    name,
+                    value,
+                    &emit_ctx.stack_slots,
+                    emit_ctx.consts.ptr_ty,
+                    emit_ctx.incref_ref,
+                    emit_ctx.decref_ref,
+                );
+                fb.ins()
+                    .call(emit_ctx.incref_ref, &[emit_ctx.consts.none_const]);
+                return emit_ctx.consts.none_const;
+            }
+        }
+        InstrCodegen::Del(op) => {
+            if let Some(location) = op.name.local_location() {
+                let layout = emit_ctx
+                    .storage_layout
+                    .as_ref()
+                    .expect("Del local slot should have storage layout during codegen");
+                let name = local_name_for_location(layout, location);
+                local_env
+                    .delete_location(
+                        fb,
+                        location,
+                        name,
+                        &emit_ctx.stack_slots,
+                        emit_ctx.consts.ptr_ty,
+                        emit_ctx.decref_ref,
+                    )
+                    .unwrap_or_else(|error| panic!("{error}"));
+                fb.ins()
+                    .call(emit_ctx.incref_ref, &[emit_ctx.consts.none_const]);
+                return emit_ctx.consts.none_const;
+            }
+        }
+        _ => {}
+    }
+    emit_codegen_expr_with_local_env(
+        fb,
+        expr,
+        local_env,
+        emit_ctx,
+        false,
+        jit_module,
+        func_imports,
+    )
+}
+
 fn emit_codegen_ops(
     fb: &mut FunctionBuilder<'_>,
     ops: &[InstrCodegen],
@@ -6124,21 +6346,17 @@ fn emit_codegen_ops(
     jit_module: &mut JITModule,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<(), String> {
-    let mut local_parts = local_env.to_legacy_parts();
     for expr in ops {
-        let value = emit_codegen_expr(
+        let value = emit_codegen_stmt_with_local_env(
             fb,
             expr,
-            &mut local_parts.names,
-            &mut local_parts.values,
+            local_env,
             emit_ctx,
-            false,
             jit_module,
             func_imports,
         );
         fb.ins().call(emit_ctx.decref_ref, &[value]);
     }
-    local_env.replace_from_legacy_parts(local_parts);
     Ok(())
 }
 

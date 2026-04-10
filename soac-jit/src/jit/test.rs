@@ -3,9 +3,9 @@ use soac_blockpy::block_py::{
     BinOp, BinOpKind, BlockLabel, BlockParamRole, BlockPyFunction, BlockPyModule, BlockTerm, Call,
     CallArgKeyword, CallArgPositional, CallDirect, CellLocation, ChildVisitable, ClosureInit,
     ClosureSlot, CodegenBlock, CounterSite, Del, DelItem, FunctionId, FunctionName, HasMeta,
-    HasSemanticInstrId, InstrCodegen, InstrResolved, Literal, LiteralValue, Load, Meta,
-    ModuleNameGen, NameLocation, NumberLiteral, NumberLiteralValue, Param, ParamKind, ParamSpec,
-    ResolvedName, StorageLayout, Store, StringLiteral, Visit, VisitMut, WithMeta,
+    HasSemanticInstrId, InstrCodegen, InstrResolved, Literal, LiteralValue, Load, LocalLocation,
+    Meta, ModuleNameGen, NameLocation, NumberLiteral, NumberLiteralValue, Param, ParamKind,
+    ParamSpec, ResolvedName, StorageLayout, Store, StringLiteral, Visit, VisitMut, WithMeta,
 };
 use soac_blockpy::passes::{
     CodegenModuleShape, instrument_bb_module_with_block_entry_counters,
@@ -476,6 +476,30 @@ mod tests {
             env.legacy_ref_kinds(),
             vec![LocalRefKind::Owned, LocalRefKind::Owned]
         );
+    }
+
+    #[test]
+    fn local_env_legacy_adapter_preserves_location_keys_by_name() {
+        let first = ir::Value::from_u32(1);
+        let second = ir::Value::from_u32(2);
+        let mut env = LocalEnv {
+            entries: vec![LocalEnvEntry {
+                key: LocalEnvKey::Location(LocalLocation(7)),
+                name: "x".to_string(),
+                value: first,
+                ref_kind: LocalRefKind::Immortal,
+            }],
+        };
+
+        env.with_legacy_parts_mut(|_names, values| {
+            values[0] = second;
+        });
+
+        assert_eq!(env.entries.len(), 1);
+        assert_eq!(env.entries[0].key, LocalEnvKey::Location(LocalLocation(7)));
+        assert_eq!(env.entries[0].name, "x");
+        assert_eq!(env.entries[0].value, second);
+        assert_eq!(env.entries[0].ref_kind, LocalRefKind::Owned);
     }
 
     fn render_test_jit_function(
