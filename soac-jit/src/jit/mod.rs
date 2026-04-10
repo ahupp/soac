@@ -6816,6 +6816,13 @@ fn emit_codegen_expr_with_local_env(
             panic!("missing local {name} in direct JIT state");
         }
     }
+    if let InstrCodegen::IncrementCounter(op) = expr {
+        assert!(
+            !borrowed,
+            "increment_counter must not request a borrowed result"
+        );
+        return emit_increment_counter(fb, op.counter_id, emit_ctx);
+    }
     let mut local_parts = local_env.to_legacy_parts();
     let value = emit_codegen_expr(
         fb,
