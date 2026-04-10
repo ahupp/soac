@@ -1396,10 +1396,10 @@ unsafe fn ensure_clif_vectorcall_compiled(
     callable: *mut ffi::PyObject,
     data: &mut PyFunctionJitExtra,
 ) -> Result<(), ()> {
-    let function = data
-        .function()
-        .map(soac_blockpy::block_py::BlockPyFunction::clone)?;
     if data.function_env.compiled_function.is_none() {
+        let function = data
+            .function()
+            .map(soac_blockpy::block_py::BlockPyFunction::clone)?;
         let compile_start = Instant::now();
         let compiled_function = match data
             .module_state
@@ -1501,10 +1501,11 @@ unsafe fn ensure_clif_vectorcall_compiled(
         return Err(());
     }
     if data.compiled_vectorcall_entry.is_none() {
+        let param_count = data.function()?.params.len();
         let entry = match data
             .compile_session
             .process_jit()
-            .and_then(|engine| engine.vectorcall_trampoline(function.params.len()))
+            .and_then(|engine| engine.vectorcall_trampoline(param_count))
         {
             Ok(value) => value,
             Err(err) => {

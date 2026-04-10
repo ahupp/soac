@@ -186,3 +186,18 @@ benchmarked throughput delta, and the headline pre/post numbers.
   - specialized pass, 1M loops x3: `273439`, `267436`, `275214 loops/s`
 - post-change benchmark:
   - specialized pass, 1M loops x3: `278749`, `281497`, `276426 loops/s`
+
+## 2026-04-10 - Use process-JIT direct calls for SOAC function targets
+
+- jj change id: `wwosynst`
+- summary: Process-JIT batches now predeclare reachable SOAC functions and
+  emit CLIF direct `call`s for supported direct edges. Unsupported edges use
+  the generic Python call fallback, and warmed direct-context lookups avoid
+  cloning the lowered `BlockPyFunction` after compilation.
+- throughput: `+179.55%` median
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `89790`, `86473`, `86037 loops/s`
+  - perf-context run: `83929 loops/s`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `247158`, `240873`, `241731 loops/s`
+  - perf-context run: `227895 loops/s`

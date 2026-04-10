@@ -40,12 +40,13 @@ and recursion behavior.
 - Direct function compilation walks reachable `CallDirect` edges and profiled
   call-target edges, predeclares the batch, defines bodies, finalizes once,
   and publishes `CompiledFunctionHandle`s.
-- `FunctionEnv.direct_code_ptr` remains the runtime lazy-call fallback for
-  direct edges that cannot use a predeclared CLIF symbol in the current batch.
+- `FunctionEnv.direct_code_ptr` remains the vectorcall entry pointer, but
+  SOAC-to-SOAC direct-call lowering no longer emits a `call_indirect` through
+  it. Supported direct edges must have a predeclared process-JIT symbol;
+  unsupported edges use the generic Python call fallback.
 - Vectorcall trampolines are process-JIT functions reused by arity.
 - Codegen emits `soac_jit_direct_edges` tracing summaries for direct-edge
-  decisions: CLIF direct calls, `FunctionEnv.direct_code_ptr` indirect calls,
-  and generic-fallback reasons.
+  decisions: CLIF direct calls and generic-fallback reasons.
 - Focused tests cover recursive batch collection, mutually-recursive batch
   compilation, and cross-module batch collection through the retained
   `CompileSession` shared-state registry.
@@ -72,8 +73,8 @@ then defines bodies.
 
 Implemented refinement:
 
-- compile-time tracing now explains why an edge used a CLIF direct call,
-  `FunctionEnv.direct_code_ptr`, or the generic Python call fallback
+- compile-time tracing now explains why an edge used a CLIF direct call or the
+  generic Python call fallback
 
 The hard invariant should become:
 
@@ -103,9 +104,8 @@ Keep generic `Call(...)` fallback in place until direct-call correctness is
 proven.
 
 When a direct edge is not present in the current predeclared batch, the
-temporary fallback is `FunctionEnv.direct_code_ptr` plus `call_indirect`.
-That keeps lazy compilation working while the process-JIT graph is still
-being expanded.
+fallback is the generic Python call path. This avoids carrying a second
+SOAC-to-SOAC call convention beside the process-JIT symbol path.
 
 ### 4. Keep compilation lazy, but make batch symbols stable
 
@@ -214,12 +214,7 @@ isolated quickly.
    - Thread the current `Arc<CompileSession>` into any remaining production
      compile or direct-target lookup path.
 
-2. Remove the temporary indirect direct-call path once the batch collector
-   reliably covers all supported direct edges.
-   - After that, supported direct edges should be CLIF `call`; unsupported
-     edges should go through the generic Python call fallback.
-
-3. Benchmark before inlining.
+2. Benchmark before inlining.
    - Measure direct-call heavy workloads before changing the inliner.
    - Record any finalized performance result in `docs/CODEX_OPT_LOG.md`.
 

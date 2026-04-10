@@ -513,124 +513,6 @@ mod tests {
         render_test_jit_function_with_constants(&module, &function, blocks, &module_constants)
     }
 
-    fn render_test_jit_function_with_call_target_specializations(
-        module: &BlockPyModule<CodegenModuleShape>,
-        function: &BlockPyFunction<CodegenModuleShape>,
-        blocks: &[ObjPtr],
-        specializations: &[(InstrId, FunctionId)],
-    ) -> String {
-        let module_name = "counter_test";
-        let soac_work_dir = ensure_test_extension_staging_dir();
-        write_test_counter_dump(
-            soac_work_dir.join("profile.bin").as_path(),
-            &CounterDumpRecord {
-                module_name: module_name.to_string(),
-                package_name: None,
-                rows: specializations
-                    .iter()
-                    .enumerate()
-                    .map(|(index, (instr_id, target_function_id))| CounterDumpRow {
-                        counter_id: u32::try_from(index)
-                            .expect("test specialization count should fit in u32"),
-                        scope: "this".to_string(),
-                        kind: "call_hot_targets".to_string(),
-                        site_kind: "runtime".to_string(),
-                        function_id: Some(function.function_id),
-                        current_function_id: Some(function.function_id),
-                        instr_id: Some(*instr_id),
-                        function_qualname: Some(function.names.qualname.clone()),
-                        block_label: None,
-                        value: 1,
-                        observed_value: Some(target_function_id.packed()),
-                        max_overcount: Some(0),
-                    })
-                    .collect(),
-                module_keys: Vec::new(),
-                type_keys: Vec::new(),
-            },
-        );
-
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
-        let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
-        let old_pythonhome = std::env::var_os("PYTHONHOME");
-        let old_pythonpath = std::env::var_os("PYTHONPATH");
-        let python_home = vendored_python_home();
-        let python_path = std::env::join_paths([
-            python_home.join("Lib"),
-            vendored_python_build_lib_dir(),
-            repo_root().join("soac_py").join("src"),
-            soac_work_dir.clone(),
-        ])
-        .expect("test PYTHONPATH should join");
-        unsafe {
-            std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
-            std::env::set_var("SOAC_OPT_MODE", "apply");
-            std::env::set_var("PYTHONHOME", &python_home);
-            std::env::set_var("PYTHONPATH", python_path);
-        }
-
-        let rendered = unsafe {
-            Python::initialize();
-            Python::attach(|py| {
-                let shared_state = crate::module_type::build_shared_state_for_testing(
-                    py,
-                    module.clone(),
-                    module_name,
-                    "",
-                )
-                .expect("shared state should build");
-                let mut jit_module = new_jit_module().expect("test jit module should construct");
-                let module_constant_ptrs = shared_state.module_constant_ptrs();
-                let counter_ptrs = shared_state.counter_ptrs();
-                let built = build_cranelift_run_bb_specialized_function(
-                    &mut jit_module,
-                    blocks,
-                    &shared_state.lowered_module,
-                    function,
-                    &shared_state.codegen_constants,
-                    &shared_state.lowered_module.counter_defs,
-                    &module_constant_ptrs,
-                    &counter_ptrs,
-                    None,
-                    Some(shared_state.as_ref()),
-                    None,
-                    None,
-                )
-                .expect("specialized JIT build should succeed");
-                let (clif, _cfg_dot, _vcode_disasm) = render_compiled_clif_and_vcode_disasm(
-                    &mut jit_module,
-                    built.ctx,
-                    &built.import_id_to_symbol,
-                    &built.block_annotations,
-                )
-                .expect("specialized JIT CLIF render should succeed");
-                clif
-            })
-        };
-
-        unsafe {
-            match old_soac_work_dir {
-                Some(value) => std::env::set_var("SOAC_WORK_DIR", value),
-                None => std::env::remove_var("SOAC_WORK_DIR"),
-            }
-            match old_soac_opt_mode {
-                Some(value) => std::env::set_var("SOAC_OPT_MODE", value),
-                None => std::env::remove_var("SOAC_OPT_MODE"),
-            }
-            match old_pythonhome {
-                Some(value) => std::env::set_var("PYTHONHOME", value),
-                None => std::env::remove_var("PYTHONHOME"),
-            }
-            match old_pythonpath {
-                Some(value) => std::env::set_var("PYTHONPATH", value),
-                None => std::env::remove_var("PYTHONPATH"),
-            }
-        }
-
-        rendered
-    }
-
     fn render_test_jit_function_with_operator_specializations(
         function: &BlockPyFunction<CodegenModuleShape>,
         blocks: &[ObjPtr],
@@ -2236,90 +2118,6 @@ def f():
     }
 
     #[test]
-    fn render_specialized_jit_direct_function_calls_use_direct_call_path() {
-        let blocks = [1usize as ObjPtr];
-        let mut constants = TestConstantPool::default();
-        let module_name_gen = ModuleNameGen::new(0);
-        let callee_name_gen = module_name_gen.next_function_name_gen();
-        let caller_name_gen = module_name_gen.next_function_name_gen();
-
-        let mut callee_function = BlockPyFunction {
-            function_id: callee_name_gen.function_id(),
-            name_gen: callee_name_gen,
-            names: FunctionName::new("callee", "callee", "callee", "callee"),
-            kind: soac_blockpy::block_py::FunctionKind::Function,
-            params: ParamSpec {
-                params: vec![Param {
-                    name: "x".into(),
-                    kind: ParamKind::Any,
-                    has_default: false,
-                }],
-            },
-            blocks: vec![CodegenBlock {
-                label: BlockLabel::from_index(0),
-                body: vec![],
-                term: ret_term(name_expr(test_name("x"))),
-                params: vec![],
-                exc_edge: None,
-            }],
-            doc: None,
-            storage_layout: None,
-            scope: Default::default(),
-        };
-        set_stack_slots(&mut callee_function, &["x"]);
-
-        let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
-        let caller_function = BlockPyFunction {
-            function_id: caller_name_gen.function_id(),
-            name_gen: caller_name_gen,
-            names: FunctionName::new("caller", "caller", "caller", "caller"),
-            kind: soac_blockpy::block_py::FunctionKind::Function,
-            params: ParamSpec::default(),
-            blocks: vec![CodegenBlock {
-                label: BlockLabel::from_index(0),
-                body: vec![],
-                term: ret_term(with_instr_id(
-                    op_expr(Call::new(
-                        name_expr(test_global_name("callee")),
-                        vec![CallArgPositional::Positional(constants.int_expr(1))],
-                        vec![],
-                    )),
-                    call_instr_id,
-                )),
-                params: vec![],
-                exc_edge: None,
-            }],
-            doc: None,
-            storage_layout: None,
-            scope: Default::default(),
-        };
-
-        let module = BlockPyModule {
-            module_name_gen: ModuleNameGen::new(0),
-            global_names: vec!["callee".into()],
-            callable_defs: vec![callee_function.clone(), caller_function.clone()],
-            module_constants: constants.module_constants,
-            counter_defs: Vec::new(),
-        };
-        let rendered = render_test_jit_function_with_call_target_specializations(
-            &module,
-            &caller_function,
-            &blocks,
-            &[(call_instr_id, callee_function.function_id)],
-        );
-
-        assert!(
-            rendered.contains("call_indirect"),
-            "direct call specialization should emit an indirect call to the compiled target:\n{rendered}"
-        );
-        assert!(
-            rendered
-                .contains(format!("iconst.i64 {}", callee_function.function_id.packed()).as_str()),
-            "direct call specialization should compare against the profiled target function id:\n{rendered}"
-        );
-    }
-
-    #[test]
     fn render_specialized_jit_type_constructors_use_constructor_fast_path() {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
@@ -2506,6 +2304,10 @@ def f():
                 crate::with_active_module_runtime_context(&mut runtime, || {
                     let mut jit_module =
                         new_jit_module().expect("test jit module should construct");
+                    let (_init_sig, declared_init) =
+                        declare_direct_function(&mut jit_module, &init_function, None)
+                            .expect("test __init__ direct function should declare");
+                    let predeclared = HashMap::from([(init_function.function_id, declared_init)]);
                     let module_constant_ptrs = shared_state.module_constant_ptrs();
                     let counter_ptrs = shared_state.counter_ptrs();
                     let built = build_cranelift_run_bb_specialized_function(
@@ -2520,7 +2322,7 @@ def f():
                         None,
                         Some(shared_state.as_ref()),
                         None,
-                        None,
+                        Some(&predeclared),
                     )
                     .expect("specialized JIT build should succeed");
                     let (clif, _cfg_dot, _vcode_disasm) = render_compiled_clif_and_vcode_disasm(

@@ -1095,17 +1095,11 @@ fn load_py_function_soac_metadata_obj(
     )
 }
 
-struct DirectFunctionEnvLoad {
-    env: ir::Value,
-    code_ptr: ir::Value,
-}
-
 fn emit_direct_function_env_load_or_slow_path(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
     ctx: &JitEmitCtx<'_>,
-    require_code_ptr: bool,
-) -> DirectFunctionEnvLoad {
+) -> ir::Value {
     let ptr_ty = ctx.consts.ptr_ty;
     let null_ptr = fb.ins().iconst(ptr_ty, 0);
 
@@ -1117,7 +1111,6 @@ fn emit_direct_function_env_load_or_slow_path(
     let load_env_block = fb.create_block();
     let env_ok_block = fb.create_block();
     let done_block = fb.create_block();
-    fb.append_block_param(done_block, ptr_ty);
     fb.append_block_param(done_block, ptr_ty);
 
     fb.ins()
@@ -1135,24 +1128,7 @@ fn emit_direct_function_env_load_or_slow_path(
         .brif(env_is_null, slow_block, &[], env_ok_block, &[]);
 
     fb.switch_to_block(env_ok_block);
-    if require_code_ptr {
-        let code_ptr = load_function_env_obj(fb, ptr_ty, env, FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET);
-        let code_ptr_is_null = fb
-            .ins()
-            .icmp(ir::condcodes::IntCC::Equal, code_ptr, null_ptr);
-        fb.ins().brif(
-            code_ptr_is_null,
-            slow_block,
-            &[],
-            done_block,
-            &[ir::BlockArg::Value(env), ir::BlockArg::Value(code_ptr)],
-        );
-    } else {
-        fb.ins().jump(
-            done_block,
-            &[ir::BlockArg::Value(env), ir::BlockArg::Value(null_ptr)],
-        );
-    }
+    fb.ins().jump(done_block, &[ir::BlockArg::Value(env)]);
 
     fb.switch_to_block(slow_block);
     let slow_inst = fb.ins().call(ctx.direct_function_context_ref, &[callable]);
@@ -1164,40 +1140,16 @@ fn emit_direct_function_env_load_or_slow_path(
     fb.ins().brif(
         slow_env_is_null,
         done_block,
-        &[ir::BlockArg::Value(null_ptr), ir::BlockArg::Value(null_ptr)],
+        &[ir::BlockArg::Value(null_ptr)],
         slow_env_ok_block,
         &[],
     );
 
     fb.switch_to_block(slow_env_ok_block);
-    if require_code_ptr {
-        let slow_code_ptr =
-            load_function_env_obj(fb, ptr_ty, slow_env, FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET);
-        let slow_code_ptr_is_null =
-            fb.ins()
-                .icmp(ir::condcodes::IntCC::Equal, slow_code_ptr, null_ptr);
-        fb.ins().brif(
-            slow_code_ptr_is_null,
-            done_block,
-            &[ir::BlockArg::Value(null_ptr), ir::BlockArg::Value(null_ptr)],
-            done_block,
-            &[
-                ir::BlockArg::Value(slow_env),
-                ir::BlockArg::Value(slow_code_ptr),
-            ],
-        );
-    } else {
-        fb.ins().jump(
-            done_block,
-            &[ir::BlockArg::Value(slow_env), ir::BlockArg::Value(null_ptr)],
-        );
-    }
+    fb.ins().jump(done_block, &[ir::BlockArg::Value(slow_env)]);
 
     fb.switch_to_block(done_block);
-    DirectFunctionEnvLoad {
-        env: fb.block_params(done_block)[0],
-        code_ptr: fb.block_params(done_block)[1],
-    }
+    fb.block_params(done_block)[0]
 }
 
 fn emit_take_current_raised_exception(
@@ -1460,12 +1412,13 @@ struct DirectConstructorSpecialization {
 #[derive(Default)]
 struct DirectEdgeStats {
     clif_direct_edges: Cell<usize>,
-    function_env_indirect_edges: Cell<usize>,
     call_direct_missing_target_fallbacks: Cell<usize>,
     call_direct_unsupported_shape_fallbacks: Cell<usize>,
+    call_direct_missing_predeclared_fallbacks: Cell<usize>,
     guarded_generic_fallback_blocks: Cell<usize>,
     profiled_missing_target_candidates: Cell<usize>,
     profiled_arity_mismatch_candidates: Cell<usize>,
+    profiled_missing_predeclared_candidates: Cell<usize>,
 }
 
 impl DirectEdgeStats {
@@ -1473,12 +1426,8 @@ impl DirectEdgeStats {
         cell.set(cell.get() + 1);
     }
 
-    fn record_resolved_direct_edge(&self, uses_clif_direct_call: bool) {
-        if uses_clif_direct_call {
-            Self::increment(&self.clif_direct_edges);
-        } else {
-            Self::increment(&self.function_env_indirect_edges);
-        }
+    fn record_resolved_direct_edge(&self) {
+        Self::increment(&self.clif_direct_edges);
     }
 
     fn record_call_direct_missing_target_fallback(&self) {
@@ -1487,6 +1436,10 @@ impl DirectEdgeStats {
 
     fn record_call_direct_unsupported_shape_fallback(&self) {
         Self::increment(&self.call_direct_unsupported_shape_fallbacks);
+    }
+
+    fn record_call_direct_missing_predeclared_fallback(&self) {
+        Self::increment(&self.call_direct_missing_predeclared_fallbacks);
     }
 
     fn record_guarded_generic_fallback_block(&self) {
@@ -1501,14 +1454,19 @@ impl DirectEdgeStats {
         Self::increment(&self.profiled_arity_mismatch_candidates);
     }
 
+    fn record_profiled_missing_predeclared_candidate(&self) {
+        Self::increment(&self.profiled_missing_predeclared_candidates);
+    }
+
     fn total(&self) -> usize {
         self.clif_direct_edges.get()
-            + self.function_env_indirect_edges.get()
             + self.call_direct_missing_target_fallbacks.get()
             + self.call_direct_unsupported_shape_fallbacks.get()
+            + self.call_direct_missing_predeclared_fallbacks.get()
             + self.guarded_generic_fallback_blocks.get()
             + self.profiled_missing_target_candidates.get()
             + self.profiled_arity_mismatch_candidates.get()
+            + self.profiled_missing_predeclared_candidates.get()
     }
 
     fn emit_trace(&self, module_name: &str, function: &BlockPyFunction<CodegenModuleShape>) {
@@ -1516,18 +1474,24 @@ impl DirectEdgeStats {
             return;
         }
         let clif_direct_edges = self.clif_direct_edges.get();
-        let function_env_indirect_edges = self.function_env_indirect_edges.get();
+        let function_env_indirect_edges = 0usize;
         let call_direct_missing_target_fallbacks = self.call_direct_missing_target_fallbacks.get();
         let call_direct_unsupported_shape_fallbacks =
             self.call_direct_unsupported_shape_fallbacks.get();
+        let call_direct_missing_predeclared_fallbacks =
+            self.call_direct_missing_predeclared_fallbacks.get();
         let guarded_generic_fallback_blocks = self.guarded_generic_fallback_blocks.get();
         let profiled_missing_target_candidates = self.profiled_missing_target_candidates.get();
         let profiled_arity_mismatch_candidates = self.profiled_arity_mismatch_candidates.get();
+        let profiled_missing_predeclared_candidates =
+            self.profiled_missing_predeclared_candidates.get();
         let generic_fallback_edges = call_direct_missing_target_fallbacks
             + call_direct_unsupported_shape_fallbacks
+            + call_direct_missing_predeclared_fallbacks
             + guarded_generic_fallback_blocks
             + profiled_missing_target_candidates
-            + profiled_arity_mismatch_candidates;
+            + profiled_arity_mismatch_candidates
+            + profiled_missing_predeclared_candidates;
         info!(
             target: "soac_jit_direct_edges",
             module = module_name,
@@ -1538,9 +1502,11 @@ impl DirectEdgeStats {
             generic_fallback_edges,
             call_direct_missing_target_fallbacks,
             call_direct_unsupported_shape_fallbacks,
+            call_direct_missing_predeclared_fallbacks,
             guarded_generic_fallback_blocks,
             profiled_missing_target_candidates,
             profiled_arity_mismatch_candidates,
+            profiled_missing_predeclared_candidates,
             "soac_jit_direct_edges"
         );
     }
@@ -2627,6 +2593,11 @@ fn direct_method_specializations_for_call_site(
                 .record_profiled_arity_mismatch_candidate();
             continue;
         }
+        if !ctx.direct_call_functions.contains_key(&function_id) {
+            ctx.direct_edge_stats
+                .record_profiled_missing_predeclared_candidate();
+            continue;
+        }
         let Ok(owner_types) =
             (unsafe { crate::lookup_exact_owner_types_for_method(function_id, method_name) })
         else {
@@ -2669,6 +2640,11 @@ fn direct_constructor_specializations_for_call_site(
         if call.args.len() + 1 != target_function.params.len() {
             ctx.direct_edge_stats
                 .record_profiled_arity_mismatch_candidate();
+            continue;
+        }
+        if !ctx.direct_call_functions.contains_key(&function_id) {
+            ctx.direct_edge_stats
+                .record_profiled_missing_predeclared_candidate();
             continue;
         }
         let Ok(owner_types) =
@@ -3140,15 +3116,14 @@ fn emit_direct_call_resolved_raw_with_arg_values(
     let direct_func_id = ctx
         .direct_call_functions
         .get(&target_function.function_id)
-        .map(|function| function.func_id);
-    ctx.direct_edge_stats
-        .record_resolved_direct_edge(direct_func_id.is_some());
+        .map(|function| function.func_id)
+        .expect("direct call emission requires a predeclared process-JIT function symbol");
+    ctx.direct_edge_stats.record_resolved_direct_edge();
 
-    let direct_load =
-        emit_direct_function_env_load_or_slow_path(fb, callable, ctx, direct_func_id.is_none());
-    let function_env_is_null =
-        fb.ins()
-            .icmp(ir::condcodes::IntCC::Equal, direct_load.env, null_ptr);
+    let function_env = emit_direct_function_env_load_or_slow_path(fb, callable, ctx);
+    let function_env_is_null = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, function_env, null_ptr);
     let function_env_ok_block = fb.create_block();
     fb.ins().brif(
         function_env_is_null,
@@ -3158,15 +3133,6 @@ fn emit_direct_call_resolved_raw_with_arg_values(
         &[],
     );
     fb.switch_to_block(function_env_ok_block);
-
-    let mut direct_sig = jit_module.make_signature();
-    direct_sig.params.push(ir::AbiParam::new(ptr_ty));
-    direct_sig.params.push(ir::AbiParam::new(ptr_ty));
-    for _ in target_function.params.iter() {
-        direct_sig.params.push(ir::AbiParam::new(ptr_ty));
-    }
-    direct_sig.returns.push(ir::AbiParam::new(ptr_ty));
-    let direct_sig_ref = fb.import_signature(direct_sig);
 
     let enter_inst = fb.ins().call(ctx.enter_recursive_ref, &[]);
     let enter_status = fb.inst_results(enter_inst)[0];
@@ -3184,16 +3150,11 @@ fn emit_direct_call_resolved_raw_with_arg_values(
     fb.switch_to_block(entered_block);
 
     let mut call_args = Vec::with_capacity(arg_values.len() + 2);
-    call_args.push(direct_load.env);
+    call_args.push(function_env);
     call_args.push(ctx.consts.thread_state_value);
     call_args.extend(arg_values.iter().copied());
-    let call_inst = if let Some(func_id) = direct_func_id {
-        let func_ref = jit_module.declare_func_in_func(func_id, &mut fb.func);
-        fb.ins().call(func_ref, &call_args)
-    } else {
-        fb.ins()
-            .call_indirect(direct_sig_ref, direct_load.code_ptr, &call_args)
-    };
+    let func_ref = jit_module.declare_func_in_func(direct_func_id, &mut fb.func);
+    let call_inst = fb.ins().call(func_ref, &call_args);
     let call_value = fb.inst_results(call_inst)[0];
     fb.ins().call(ctx.leave_recursive_ref, &[]);
 
@@ -3418,6 +3379,14 @@ fn emit_call_direct_expr(
     if !supports_direct_call {
         ctx.direct_edge_stats
             .record_call_direct_unsupported_shape_fallback();
+        return fallback();
+    }
+    if !ctx
+        .direct_call_functions
+        .contains_key(&target_function.function_id)
+    {
+        ctx.direct_edge_stats
+            .record_call_direct_missing_predeclared_fallback();
         return fallback();
     }
 
@@ -4582,6 +4551,11 @@ fn emit_codegen_expr(
                                 if args.len() != target_function.params.len() {
                                     ctx.direct_edge_stats
                                         .record_profiled_arity_mismatch_candidate();
+                                    return None;
+                                }
+                                if !ctx.direct_call_functions.contains_key(&function_id) {
+                                    ctx.direct_edge_stats
+                                        .record_profiled_missing_predeclared_candidate();
                                     return None;
                                 }
                                 Some(function_id)
