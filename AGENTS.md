@@ -277,9 +277,15 @@ instance's live working commit.
 - `SOAC_CRANELIFT_COMPILE_CACHE`
   Set to `1`, `true`, `yes`, or `on` to enable the experimental
   filesystem-backed Cranelift incremental compile cache. It writes
-  entries to `.cl-cache` using key-derived filenames and logs cache hits
-  through the `soac_jit_compile_cache` tracing target. The cache is
-  disabled by default.
+  entries to `SOAC_COMPILE_CACHE_DIR`, `$SOAC_WORK_DIR/compile-cache`,
+  or a process temp directory using key-derived filenames, and logs
+  cache configuration, hits, and store failures through the
+  `soac_jit_compile_cache` tracing target. The cache is disabled by
+  default.
+- `SOAC_COMPILE_CACHE_DIR`
+  Explicit cache directory for `SOAC_CRANELIFT_COMPILE_CACHE`. Prefer
+  this for CPython test runs and symlinked/shared checkout workflows so
+  cache writes do not depend on the process current directory.
 - `BEHAVIOR_CHANGE`
   Source comments with this exact tag mark intentional CPython-visible
   compatibility changes. Current examples: apply-mode raw indexed

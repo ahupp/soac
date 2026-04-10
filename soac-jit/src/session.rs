@@ -14,6 +14,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 static NEXT_COMPILE_SESSION_ID: AtomicU32 = AtomicU32::new(1);
 static PROCESS_COMPILE_SESSION: OnceLock<Arc<CompileSession>> = OnceLock::new();
+const SOAC_COMPILE_CACHE_DIR_ENV: &str = "SOAC_COMPILE_CACHE_DIR";
+const SOAC_WORK_DIR_ENV: &str = "SOAC_WORK_DIR";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct CompileSessionId(u32);
@@ -55,20 +57,29 @@ impl CraneliftCompileCache {
     }
 
     fn from_env() -> Self {
-        Self::new(
-            CraneliftCompileCache::default_root(),
-            parse_cranelift_compile_cache_enabled(
-                std::env::var("SOAC_CRANELIFT_COMPILE_CACHE")
-                    .ok()
-                    .as_deref(),
-            ),
-        )
-    }
-
-    fn default_root() -> PathBuf {
-        find_repo_root_for_compile_cache()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".cl-cache")
+        let enabled = parse_cranelift_compile_cache_enabled(
+            std::env::var("SOAC_CRANELIFT_COMPILE_CACHE")
+                .ok()
+                .as_deref(),
+        );
+        let (root, root_source) = compile_cache_root_from_env();
+        let cache = Self::new(root, enabled);
+        if enabled {
+            tracing::info!(
+                target: "soac_jit_compile_cache",
+                cache_root = %cache.root.display(),
+                cache_root_source = root_source.as_str(),
+                "Cranelift compile cache enabled"
+            );
+        } else {
+            tracing::debug!(
+                target: "soac_jit_compile_cache",
+                cache_root = %cache.root.display(),
+                cache_root_source = root_source.as_str(),
+                "Cranelift compile cache disabled"
+            );
+        }
+        cache
     }
 
     pub(crate) fn store(&self) -> CraneliftCompileCacheStore<'_> {
@@ -126,7 +137,7 @@ impl CacheKvStore for CraneliftCompileCacheStore<'_> {
 
     fn insert(&mut self, key: &[u8], val: Vec<u8>) {
         if let Err(err) = self.cache.write(key, val) {
-            tracing::debug!(
+            tracing::warn!(
                 target: "soac_jit_compile_cache",
                 cache_root = %self.cache.root.display(),
                 error = %err,
@@ -146,14 +157,47 @@ fn hex_cache_key(key: &[u8]) -> String {
     out
 }
 
-fn find_repo_root_for_compile_cache() -> Option<PathBuf> {
-    let start = std::env::current_dir().ok()?;
-    for candidate in start.ancestors() {
-        if candidate.join("Justfile").is_file() && candidate.join("soac-jit").is_dir() {
-            return Some(candidate.to_path_buf());
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompileCacheRootSource {
+    ExplicitDir,
+    WorkDir,
+    TempDir,
+}
+
+impl CompileCacheRootSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            CompileCacheRootSource::ExplicitDir => SOAC_COMPILE_CACHE_DIR_ENV,
+            CompileCacheRootSource::WorkDir => SOAC_WORK_DIR_ENV,
+            CompileCacheRootSource::TempDir => "std::env::temp_dir",
         }
     }
-    Some(start)
+}
+
+fn compile_cache_root_from_env() -> (PathBuf, CompileCacheRootSource) {
+    compile_cache_root_from_values(
+        std::env::var(SOAC_COMPILE_CACHE_DIR_ENV).ok().as_deref(),
+        std::env::var(SOAC_WORK_DIR_ENV).ok().as_deref(),
+    )
+}
+
+fn compile_cache_root_from_values(
+    explicit_dir: Option<&str>,
+    work_dir: Option<&str>,
+) -> (PathBuf, CompileCacheRootSource) {
+    if let Some(raw_dir) = explicit_dir.map(str::trim).filter(|raw| !raw.is_empty()) {
+        return (PathBuf::from(raw_dir), CompileCacheRootSource::ExplicitDir);
+    }
+    if let Some(raw_dir) = work_dir.map(str::trim).filter(|raw| !raw.is_empty()) {
+        return (
+            PathBuf::from(raw_dir).join("compile-cache"),
+            CompileCacheRootSource::WorkDir,
+        );
+    }
+    (
+        std::env::temp_dir().join("soac-compile-cache"),
+        CompileCacheRootSource::TempDir,
+    )
 }
 
 #[derive(Default)]
@@ -280,12 +324,12 @@ impl fmt::Debug for CompileSession {
 #[cfg(test)]
 mod test {
     use super::{
-        CompileSession, CraneliftCompileCache, allocate_compile_session_id,
-        parse_cranelift_compile_cache_enabled,
+        CompileCacheRootSource, CompileSession, CraneliftCompileCache, allocate_compile_session_id,
+        compile_cache_root_from_values, parse_cranelift_compile_cache_enabled,
     };
     use cranelift_codegen::incremental_cache::CacheKvStore;
     use std::fs;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -349,13 +393,36 @@ mod test {
     }
 
     #[test]
-    fn compile_session_carries_cranelift_compile_cache_root() {
-        let session = CompileSession::new();
+    fn cranelift_compile_cache_root_prefers_explicit_dir() {
+        let (root, source) =
+            compile_cache_root_from_values(Some("/tmp/explicit-cache"), Some("/tmp/work"));
 
-        let path = session
-            .cranelift_compile_cache()
-            .path_for_key(&[0xab, 0xcd]);
-        assert!(path.ends_with(Path::new(".cl-cache").join("abcd")));
+        assert_eq!(root, PathBuf::from("/tmp/explicit-cache"));
+        assert_eq!(source, CompileCacheRootSource::ExplicitDir);
+    }
+
+    #[test]
+    fn cranelift_compile_cache_root_falls_back_to_work_dir() {
+        let (root, source) = compile_cache_root_from_values(None, Some("/tmp/work"));
+
+        assert_eq!(root, PathBuf::from("/tmp/work").join("compile-cache"));
+        assert_eq!(source, CompileCacheRootSource::WorkDir);
+    }
+
+    #[test]
+    fn cranelift_compile_cache_root_ignores_blank_values() {
+        let (root, source) = compile_cache_root_from_values(Some("  "), Some("/tmp/work"));
+
+        assert_eq!(root, PathBuf::from("/tmp/work").join("compile-cache"));
+        assert_eq!(source, CompileCacheRootSource::WorkDir);
+    }
+
+    #[test]
+    fn cranelift_compile_cache_root_uses_temp_dir_without_env() {
+        let (root, source) = compile_cache_root_from_values(None, None);
+
+        assert!(root.ends_with("soac-compile-cache"));
+        assert_eq!(source, CompileCacheRootSource::TempDir);
     }
 
     #[test]

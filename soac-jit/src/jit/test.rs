@@ -24,6 +24,23 @@ mod tests {
     static CAPSULE_DESTROYED: AtomicBool = AtomicBool::new(false);
     static NEXT_TEST_EXT_STAGING_ID: AtomicUsize = AtomicUsize::new(0);
 
+    #[test]
+    fn cranelift_compile_cache_name_is_stable_from_logical_cache_name() {
+        assert_eq!(
+            stable_compile_cache_hash(b""),
+            0xcbf29ce484222325,
+            "empty FNV-1a hash should stay stable"
+        );
+        assert_eq!(
+            stable_cranelift_compile_cache_name("direct:pkg.mod.fn:2"),
+            stable_cranelift_compile_cache_name("direct:pkg.mod.fn:2")
+        );
+        assert_ne!(
+            stable_cranelift_compile_cache_name("direct:pkg.mod.fn:2"),
+            stable_cranelift_compile_cache_name("direct:pkg.mod.fn:3")
+        );
+    }
+
     unsafe extern "C" fn test_capsule_destructor(_capsule: *mut ffi::PyObject) {
         CAPSULE_DESTROYED.store(true, Ordering::SeqCst);
     }
@@ -1260,6 +1277,7 @@ mod tests {
             &mut jit_module,
             wrapper_id,
             &mut ctx,
+            "test-runtime-refcount-smoke-wrapper",
             "test wrapper function should define",
         )
         .expect("wrapper function should compile");
@@ -1324,6 +1342,7 @@ mod tests {
             &mut jit_module,
             wrapper_id,
             &mut ctx,
+            "test-runtime-refcount-decref-wrapper",
             "test wrapper function should define",
         )
         .expect("wrapper function should compile");

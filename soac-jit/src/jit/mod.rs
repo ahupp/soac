@@ -3012,6 +3012,7 @@ fn build_counted_runtime_refcount_helper(
     compile_session: &crate::session::CompileSession,
     jit_module: &mut JITModule,
     symbol_name: &str,
+    cache_name: &str,
     runtime_import: &'static ImportSpec,
     counter_ptr: *mut u64,
 ) -> Result<FuncId, String> {
@@ -3051,6 +3052,7 @@ fn build_counted_runtime_refcount_helper(
         jit_module,
         helper_id,
         &mut ctx,
+        cache_name,
         "failed to define counted runtime refcount helper",
     )?;
     jit_module.clear_context(&mut ctx);
@@ -3069,14 +3071,13 @@ fn build_counted_runtime_refcount_helpers(
         lookup_runtime_counter_id(counter_defs, function.function_id, "runtime_incref")
             .map(|counter_id| {
                 let counter_ptr = counter_ptr_for_id(counter_ptrs, counter_id)?;
-                let symbol = scoped_jit_symbol(
-                    &format!("py:rc:incref:{}", function.names.qualname),
-                    symbol_scope,
-                );
+                let cache_name = format!("py:rc:incref:{}", function.names.qualname);
+                let symbol = scoped_jit_symbol(&cache_name, symbol_scope);
                 build_counted_runtime_refcount_helper(
                     compile_session,
                     jit_module,
                     &symbol,
+                    &cache_name,
                     &DP_JIT_INCREF_IMPORT,
                     counter_ptr,
                 )
@@ -3087,14 +3088,13 @@ fn build_counted_runtime_refcount_helpers(
         lookup_runtime_counter_id(counter_defs, function.function_id, "runtime_decref")
             .map(|counter_id| {
                 let counter_ptr = counter_ptr_for_id(counter_ptrs, counter_id)?;
-                let symbol = scoped_jit_symbol(
-                    &format!("py:rc:decref:{}", function.names.qualname),
-                    symbol_scope,
-                );
+                let cache_name = format!("py:rc:decref:{}", function.names.qualname);
+                let symbol = scoped_jit_symbol(&cache_name, symbol_scope);
                 build_counted_runtime_refcount_helper(
                     compile_session,
                     jit_module,
                     &symbol,
+                    &cache_name,
                     &DP_JIT_DECREF_IMPORT,
                     counter_ptr,
                 )
@@ -7738,6 +7738,11 @@ impl ProcessJitEngine {
                 &mut state.jit_module,
                 main_id,
                 &mut ctx,
+                &format!(
+                    "direct:{}:{}",
+                    function.names.qualname,
+                    function.params.len()
+                ),
                 "failed to define specialized jit run_bb function",
             )
             .map_err(|err| {
@@ -7814,9 +7819,11 @@ fn define_function_with_incremental_cache(
     jit_module: &mut JITModule,
     func_id: FuncId,
     ctx: &mut cranelift_codegen::Context,
+    cache_name: &str,
     err_prefix: &str,
 ) -> Result<DefinedFunctionArtifact, String> {
     inline_runtime_support_calls(jit_module, ctx, err_prefix)?;
+    ctx.func.name = stable_cranelift_compile_cache_name(cache_name);
     let func_for_relocs = ctx.func.clone();
     let func_name = ctx.func.name.clone();
     let mut ctrl_plane = ControlPlane::default();
@@ -7829,6 +7836,7 @@ fn define_function_with_incremental_cache(
             info!(
                 target: "soac_jit_compile_cache",
                 function = ?func_name,
+                cache_name,
                 func_id = func_id.as_u32(),
                 request = %err_prefix,
                 code_size = compiled.code_buffer().len(),
@@ -7864,6 +7872,20 @@ fn define_function_with_incremental_cache(
         code_bb_edges,
         systemv_unwind_info,
     })
+}
+
+fn stable_cranelift_compile_cache_name(cache_name: &str) -> ir::UserFuncName {
+    let hash = stable_compile_cache_hash(cache_name.as_bytes());
+    ir::UserFuncName::user((hash >> 32) as u32, hash as u32)
+}
+
+fn stable_compile_cache_hash(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 fn record_jit_bb_map(
@@ -8418,6 +8440,7 @@ fn load_runtime_support_clif(
             jit_module,
             func_id,
             &mut ctx,
+            &parsed.symbol,
             &format!("failed to define runtime CLIF function {}", parsed.symbol),
         )?;
         jit_module.clear_context(&mut ctx);
@@ -8607,6 +8630,7 @@ pub fn run_cranelift_smoke(module: &BlockPyModule<CodegenModuleShape>) -> Result
         &mut jit_module,
         function_id,
         &mut ctx,
+        "jit-smoke",
         "failed to define Cranelift function",
     )?;
     jit_module.clear_context(&mut ctx);
@@ -10096,6 +10120,7 @@ fn define_shared_vectorcall_trampoline(
         jit_module,
         main_id,
         &mut ctx,
+        &format!("direct-vectorcall-trampoline:{param_count}"),
         "failed to define direct vectorcall trampoline",
     )?;
     jit_module.clear_context(&mut ctx);

@@ -137,10 +137,18 @@ exports are intentionally omitted here.
 
 - `SOAC_CRANELIFT_COMPILE_CACHE=1`
   Opt into the experimental filesystem-backed Cranelift incremental
-  compile cache. When enabled, cache values are stored in `.cl-cache`
-  under filenames derived from Cranelift's cache keys, and cache hits
-  are emitted through the `soac_jit_compile_cache` tracing target. The
-  cache is disabled by default.
+  compile cache. When enabled, cache values are stored in
+  `SOAC_COMPILE_CACHE_DIR` if set, otherwise in
+  `$SOAC_WORK_DIR/compile-cache` when `SOAC_WORK_DIR` is set, otherwise
+  in a process temp directory. Filenames are derived from Cranelift's
+  cache keys. Cache configuration, hits, and store failures are emitted
+  through the `soac_jit_compile_cache` tracing target. The cache is
+  disabled by default.
+
+- `SOAC_COMPILE_CACHE_DIR=/path/to/cache-dir`
+  Explicit filesystem root for `SOAC_CRANELIFT_COMPILE_CACHE`. Use this
+  when running from symlinked or shared checkouts so cache writes do not
+  depend on the process current directory.
 
 - `SOAC_CRANELIFT_OPT_LEVEL=none|speed|speed_and_size`
   Override the Cranelift optimization level used by the process JIT.
