@@ -619,9 +619,11 @@ fn emit_specialized_setattr<'fb>(
         .brif(type_matches, maybe_direct_block, &[], fallback_block, &[]);
 
     state.fb().switch_to_block(maybe_direct_block);
+    let thread_state_value = state.ctx().consts.thread_state_value;
     let direct_inst = state.fb().ins().call(
         store_field_indexed_ref,
         &[
+            thread_state_value,
             arg_values[0].0,
             arg_values[1].0,
             expected_index,

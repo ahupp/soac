@@ -214,6 +214,7 @@ static SOAC_RUNTIME_STORE_FIELD_INDEXED_IMPORT: ImportSpec = ImportSpec::local(
     &[
         SigType::Pointer,
         SigType::Pointer,
+        SigType::Pointer,
         SigType::I64,
         SigType::Pointer,
     ],

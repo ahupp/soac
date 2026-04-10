@@ -744,13 +744,16 @@ pub unsafe extern "C" fn soac_runtime_load_field_indexed(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soac_runtime_store_field_indexed(
+    tstate: *mut c_void,
     obj: *mut c_void,
     key: *mut c_void,
     index: isize,
     value: *mut c_void,
 ) -> i32 {
+    let tstate = tstate.cast::<RawPyThreadState>();
     let obj = obj.cast::<RawPyObject>();
     let key = key.cast::<RawPyObject>();
+    debug_assert!(!tstate.is_null());
     debug_assert!(!obj.is_null());
     debug_assert!(!key.is_null());
     debug_assert!(!value.is_null());
@@ -791,7 +794,7 @@ pub unsafe extern "C" fn soac_runtime_store_field_indexed(
     unsafe { incref_impl(value) };
     unsafe { set_split_value(values, index, value) };
     if !old_value.is_null() {
-        decref_raw!(old_value);
+        decref_raw_with_tstate!(tstate, old_value);
     }
     1
 }

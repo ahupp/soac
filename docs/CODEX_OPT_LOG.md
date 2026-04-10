@@ -230,3 +230,18 @@ benchmarked throughput delta, and the headline pre/post numbers.
 - post-change benchmark:
   - specialized pass, 1M loops x3: `115465`, `123032`, `121511 loops/s`
   - perf-context run: `117328 loops/s`
+
+## 2026-04-10 - Pass thread state to indexed field stores
+
+- jj change id: `xuwyyrwr`
+- summary: The indexed field-store runtime helper now receives the generated
+  function's existing `PyThreadState` pointer and uses it when decrefing a
+  replaced field value, avoiding one helper-local TLS lookup on successful raw
+  field stores.
+- throughput: `+3.58%` specialized pystone median
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `115465`, `123032`, `121511 loops/s`
+  - perf-context run: `117328 loops/s`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `131076`, `121536`, `125865 loops/s`
+  - perf-context run: `116351 loops/s`
