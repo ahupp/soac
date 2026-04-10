@@ -3,6 +3,7 @@
 
  * Complete migration of ast-to-instr pass
  * If caching BlockPy before codegen, recover FunctionNameGen.next_tmp_id from generated `_dp_*` names.
+ * Revisit Cranelift compile caching by relocating constant values instead of embedding per-run object/counter pointers in CLIF.
  * Add mutation watchers for `f.__defaults__` and `f.__kwdefaults__` so direct/JIT default slots stay fresh after in-place edits.
  * Consider replacing the internal deleted local sentinel object with `NULL` so leaked sentinel state fails loudly.
  * Simplify class-cell capture by unconditionally treating `super()` as capturing `__class__`.
