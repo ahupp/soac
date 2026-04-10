@@ -1955,6 +1955,25 @@ impl LocalEnv {
         self.entries.iter().position(|entry| entry.name == name)
     }
 
+    fn entry_index_for_block_arg_name(&self, name: &str) -> Option<usize> {
+        self.entry_index_for_name(name).or_else(|| {
+            if !is_try_exception_alias_name(name) {
+                return None;
+            }
+            let mut matches = self
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| is_try_exception_alias_name(entry.name.as_str()));
+            let first = matches.next().map(|(index, _)| index);
+            debug_assert!(
+                matches.next().is_none(),
+                "expected at most one current-exception LocalEnv entry"
+            );
+            first
+        })
+    }
+
     fn load_location(
         &self,
         fb: &mut FunctionBuilder<'_>,
@@ -6325,13 +6344,112 @@ fn emit_prepare_target_args_codegen(
     Some(args)
 }
 
-fn emit_explicit_target_slot_writes_codegen(
+fn emit_prepare_target_args_codegen_from_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    target_params: &[String],
+    full_target_params: Option<&[String]>,
+    explicit_args: Option<&[BlockArg]>,
+    local_env: &LocalEnv,
+    ctx: &JitEmitCtx<'_>,
+    _jit_module: &mut JITModule,
+    _func_imports: &mut FuncBuildImports<'_>,
+) -> Option<Vec<ir::BlockArg>> {
+    let mut args = Vec::with_capacity(target_params.len());
+    let mut forwarded_local_indices = HashMap::new();
+    let explicit_arg_offsets = match (full_target_params, explicit_args) {
+        (Some(full_target_params), Some(explicit_args)) => {
+            let explicit_start = full_target_params.len().saturating_sub(explicit_args.len());
+            Some(
+                full_target_params[explicit_start..]
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, name)| (name.as_str(), offset))
+                    .collect::<HashMap<_, _>>(),
+            )
+        }
+        _ => None,
+    };
+    for name in target_params {
+        if let Some(explicit_arg) = explicit_args.and_then(|args| {
+            explicit_arg_offsets
+                .as_ref()
+                .and_then(|offsets| offsets.get(name.as_str()).copied())
+                .and_then(|offset| args.get(offset))
+        }) {
+            let value = match explicit_arg {
+                BlockArg::Name(source_name) => {
+                    if let Some(value_index) = local_env.entry_index_for_block_arg_name(source_name)
+                    {
+                        let entry = &local_env.entries[value_index];
+                        let forwarded_count =
+                            forwarded_local_indices.entry(value_index).or_insert(0usize);
+                        if local_ref_kind_needs_incref_for_forward(entry.ref_kind, *forwarded_count)
+                        {
+                            fb.ins().call(ctx.incref_ref, &[entry.value]);
+                        }
+                        *forwarded_count += 1;
+                        entry.value
+                    } else if let Some(value) = load_stack_slot_value(
+                        fb,
+                        &ctx.stack_slots,
+                        source_name,
+                        ctx.consts.ptr_ty,
+                        false,
+                        ctx.incref_ref,
+                    ) {
+                        value
+                    } else {
+                        return None;
+                    }
+                }
+                BlockArg::None => {
+                    fb.ins().call(ctx.incref_ref, &[ctx.consts.none_const]);
+                    ctx.consts.none_const
+                }
+                BlockArg::CurrentException => return None,
+                BlockArg::AbruptKind(kind) => emit_owned_module_constant(
+                    fb,
+                    ctx.module_constants
+                        .require_int_constant_id(abrupt_kind_tag(*kind)),
+                    ctx,
+                ),
+            };
+            args.push(ir::BlockArg::Value(value));
+            continue;
+        }
+        if let Some(value_index) = local_env.entry_index_for_block_arg_name(name) {
+            let entry = &local_env.entries[value_index];
+            let forwarded_count = forwarded_local_indices.entry(value_index).or_insert(0usize);
+            if local_ref_kind_needs_incref_for_forward(entry.ref_kind, *forwarded_count) {
+                fb.ins().call(ctx.incref_ref, &[entry.value]);
+            }
+            *forwarded_count += 1;
+            args.push(ir::BlockArg::Value(entry.value));
+            continue;
+        }
+        if let Some(value) = load_stack_slot_value(
+            fb,
+            &ctx.stack_slots,
+            name,
+            ctx.consts.ptr_ty,
+            false,
+            ctx.incref_ref,
+        ) {
+            args.push(ir::BlockArg::Value(value));
+            continue;
+        }
+        fb.ins().call(ctx.incref_ref, &[ctx.consts.none_const]);
+        args.push(ir::BlockArg::Value(ctx.consts.none_const));
+    }
+    Some(args)
+}
+
+fn emit_explicit_target_slot_writes_codegen_from_local_env(
     fb: &mut FunctionBuilder<'_>,
     full_target_params: &[String],
     runtime_target_params: &[String],
     explicit_args: &[BlockArg],
-    local_names: &[String],
-    local_values: &[ir::Value],
+    local_env: &LocalEnv,
     ctx: &JitEmitCtx<'_>,
     _jit_module: &mut JITModule,
     _func_imports: &mut FuncBuildImports<'_>,
@@ -6344,8 +6462,8 @@ fn emit_explicit_target_slot_writes_codegen(
         }
         let (value, owned_value) = match arg {
             BlockArg::Name(source_name) => {
-                if let Some(index) = local_name_index_for_block_arg(source_name, local_names) {
-                    (local_values[index], false)
+                if let Some(index) = local_env.entry_index_for_block_arg_name(source_name) {
+                    (local_env.entries[index].value, false)
                 } else if let Some(value) = load_stack_slot_value(
                     fb,
                     &ctx.stack_slots,
@@ -6386,6 +6504,26 @@ fn emit_explicit_target_slot_writes_codegen(
         }
     }
     Some(())
+}
+
+fn emit_decref_unforwarded_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    local_env: &LocalEnv,
+    target_params: &[String],
+    decref_ref: ir::FuncRef,
+) {
+    let forwarded_local_indices = target_params
+        .iter()
+        .filter_map(|name| local_env.entry_index_for_block_arg_name(name))
+        .collect::<HashSet<_>>();
+    for (index, entry) in local_env.entries.iter().enumerate() {
+        if forwarded_local_indices.contains(&index) {
+            continue;
+        }
+        if transient_local_needs_decref(entry.ref_kind) {
+            fb.ins().call(decref_ref, &[entry.value]);
+        }
+    }
 }
 
 fn emit_exception_dispatch_slot_writes(
@@ -6861,22 +6999,18 @@ fn emit_codegen_term(
     let i64_ty = emit_ctx.consts.i64_ty;
     let ptr_ty = emit_ctx.consts.ptr_ty;
     let null_ptr = fb.ins().iconst(ptr_ty, 0);
-    let mut local_parts = local_env.to_legacy_parts();
-    let local_names = &mut local_parts.names;
-    let local_values = &mut local_parts.values;
 
     match term {
         BlockTerm::Jump(target_label) => {
             let target_index = target_label.target.index();
             let target_params = &runtime_block_param_names[target_index];
             let full_target_params = &full_block_param_names[target_index];
-            emit_explicit_target_slot_writes_codegen(
+            emit_explicit_target_slot_writes_codegen_from_local_env(
                 fb,
                 full_target_params,
                 target_params,
                 &target_label.args,
-                local_names,
-                local_values,
+                local_env,
                 emit_ctx,
                 jit_module,
                 func_imports,
@@ -6884,17 +7018,14 @@ fn emit_codegen_term(
             .ok_or_else(|| {
                 format!("missing local mapping for jump slot updates in block {source_label}")
             })?;
-            let local_ref_kinds = local_env.ref_kinds_for_legacy_parts(local_names, local_values);
             let mut jump_args = Vec::with_capacity(target_params.len());
             jump_args.extend(
-                emit_prepare_target_args_codegen(
+                emit_prepare_target_args_codegen_from_local_env(
                     fb,
                     target_params,
                     Some(full_target_params),
                     Some(&target_label.args),
-                    local_names,
-                    local_values,
-                    &local_ref_kinds,
+                    local_env,
                     emit_ctx,
                     jit_module,
                     func_imports,
@@ -6903,14 +7034,7 @@ fn emit_codegen_term(
                     format!("missing local mapping for jump block params in block {source_label}")
                 })?,
             );
-            emit_decref_unforwarded_locals(
-                fb,
-                local_values,
-                local_names,
-                &local_ref_kinds,
-                target_params,
-                decref_ref,
-            );
+            emit_decref_unforwarded_local_env(fb, local_env, target_params, decref_ref);
             let release_reason = RefcountReleaseReason::Jump {
                 target: target_label.target,
             };
@@ -6929,6 +7053,9 @@ fn emit_codegen_term(
             fb.ins().jump(exec_blocks[target_index], &jump_args);
         }
         BlockTerm::IfTerm(if_term) => {
+            let mut local_parts = local_env.to_legacy_parts();
+            let local_names = &mut local_parts.names;
+            let local_values = &mut local_parts.values;
             let test_instr_id = if_term.test.semantic_instr_id();
             let test_value = emit_codegen_expr(
                 fb,
@@ -7013,6 +7140,9 @@ fn emit_codegen_term(
             )?;
         }
         BlockTerm::BranchTable(branch) => {
+            let mut local_parts = local_env.to_legacy_parts();
+            let local_names = &mut local_parts.names;
+            let local_values = &mut local_parts.values;
             let index_i64 = emit_branch_index_i64(
                 fb,
                 &branch.index,
@@ -7151,25 +7281,16 @@ fn emit_codegen_term(
                 .jump(exec_blocks[default_index], &default_jump_args);
         }
         BlockTerm::Return(value) => {
-            let ret_value = emit_codegen_expr(
+            let ret_value = emit_codegen_expr_with_local_env(
                 fb,
                 value,
-                local_names,
-                local_values,
+                local_env,
                 emit_ctx,
                 false,
                 jit_module,
                 func_imports,
             );
-            let local_ref_kinds = local_env.ref_kinds_for_legacy_parts(local_names, local_values);
-            emit_decref_unforwarded_locals(
-                fb,
-                local_values,
-                local_names,
-                &local_ref_kinds,
-                &[],
-                decref_ref,
-            );
+            emit_decref_unforwarded_local_env(fb, local_env, &[], decref_ref);
             let release_reason = RefcountReleaseReason::Return;
             emit_planned_stack_slot_releases_for_reason(
                 fb,
@@ -7181,6 +7302,9 @@ fn emit_codegen_term(
             fb.ins().return_(&[ret_value]);
         }
         BlockTerm::Raise(raise_stmt) => {
+            let mut local_parts = local_env.to_legacy_parts();
+            let local_names = &mut local_parts.names;
+            let local_values = &mut local_parts.values;
             let raise_name_obj = emit_owned_module_constant(
                 fb,
                 emit_ctx
