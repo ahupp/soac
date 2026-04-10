@@ -3320,6 +3320,16 @@ fn emit_i32_bool01_from_cond(
     SoacValue::i32(truth_i32, IntFacts::i32_bool01())
 }
 
+fn emit_i32_bool01_const(
+    fb: &mut FunctionBuilder<'_>,
+    value: bool,
+    ctx: &JitEmitCtx<'_>,
+) -> SoacValue {
+    let raw = i32::from(value);
+    let truth_i32 = fb.ins().iconst(ctx.consts.i32_ty, i64::from(raw));
+    SoacValue::i32(truth_i32, IntFacts::i32_known(raw))
+}
+
 fn emit_i32_bool01_from_i32_result(
     fb: &mut FunctionBuilder<'_>,
     result: ir::Value,
@@ -6538,9 +6548,30 @@ fn emit_planned_stack_slot_releases_for_reason_from_parts(
 fn emit_truthy_from_owned(
     fb: &mut FunctionBuilder<'_>,
     owned_value: ir::Value,
+    value_facts: Option<ValueFacts>,
     is_true_ref: ir::FuncRef,
     ctx: &JitEmitCtx<'_>,
 ) -> SoacValue {
+    if let Some(py_facts) = value_facts.and_then(ValueFacts::as_pyobj) {
+        if py_facts.is_none() || py_facts.is_false_singleton() {
+            fb.ins().call(ctx.decref_ref, &[owned_value]);
+            return emit_i32_bool01_const(fb, false, ctx);
+        }
+        if py_facts.is_true_singleton() {
+            fb.ins().call(ctx.decref_ref, &[owned_value]);
+            return emit_i32_bool01_const(fb, true, ctx);
+        }
+        if py_facts.is_exact_type(PyExactType::Bool) {
+            let is_true = fb.ins().icmp(
+                ir::condcodes::IntCC::Equal,
+                owned_value,
+                ctx.consts.true_const,
+            );
+            fb.ins().call(ctx.decref_ref, &[owned_value]);
+            return emit_i32_bool01_from_cond(fb, is_true, ctx);
+        }
+    }
+
     let truth_inst = fb.ins().call(is_true_ref, &[owned_value]);
     let truth_value = fb.inst_results(truth_inst)[0];
     let truth_error = fb.ins().iconst(ctx.consts.i32_ty, -1);
@@ -6863,6 +6894,7 @@ fn emit_codegen_term(
         }
         BlockTerm::IfTerm(if_term) => {
             let test_instr_id = if_term.test.semantic_instr_id();
+            let test_facts = emit_ctx.value_facts_for_expr(&if_term.test);
             let test_value = emit_codegen_expr_with_local_env(
                 fb,
                 &if_term.test,
@@ -6872,7 +6904,7 @@ fn emit_codegen_term(
                 jit_module,
                 func_imports,
             );
-            let truth = emit_truthy_from_owned(fb, test_value, is_true_ref, emit_ctx);
+            let truth = emit_truthy_from_owned(fb, test_value, test_facts, is_true_ref, emit_ctx);
             let truth_i32 = truth.expect_i32_bool01("if condition truthiness");
             if let Some(counter_id) = emit_ctx
                 .branch_outcome_counter_ids
