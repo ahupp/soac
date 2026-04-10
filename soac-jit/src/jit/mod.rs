@@ -5128,6 +5128,63 @@ fn emit_direct_constructor_resolved_with_args_from_local_env(
     )
 }
 
+fn emit_direct_method_resolved_with_args_from_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    receiver: ir::Value,
+    receiver_is_borrowed: bool,
+    args: &[&InstrCodegen],
+    specialization: &DirectMethodSpecialization,
+    target_function: &BlockPyFunction<CodegenModuleShape>,
+    local_env: &mut LocalEnv,
+    ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> ir::Value {
+    let ptr_ty = ctx.consts.ptr_ty;
+    let mut provided_arg_values = Vec::with_capacity(args.len() + 1);
+    let mut provided_arg_borrowed = Vec::with_capacity(args.len() + 1);
+    provided_arg_values.push(receiver);
+    provided_arg_borrowed.push(receiver_is_borrowed);
+    for arg in args {
+        let borrowed_arg = codegen_expr_is_borrowable_from_local_env(
+            arg,
+            local_env,
+            &ctx.stack_slots,
+            ctx.storage_layout.as_ref(),
+        );
+        provided_arg_borrowed.push(borrowed_arg);
+        provided_arg_values.push(emit_codegen_expr_with_local_env(
+            fb,
+            arg,
+            local_env,
+            ctx,
+            borrowed_arg,
+            jit_module,
+            func_imports,
+        ));
+    }
+    let (arg_values, arg_borrowed) = emit_direct_call_args_from_plan(
+        fb,
+        &specialization.arg_plan,
+        provided_arg_values,
+        provided_arg_borrowed,
+        ptr_ty,
+    );
+    let callable = fb
+        .ins()
+        .iconst(ptr_ty, specialization.descriptor_function as i64);
+    emit_direct_call_resolved_with_arg_values(
+        fb,
+        callable,
+        true,
+        arg_values,
+        arg_borrowed,
+        target_function,
+        ctx,
+        jit_module,
+    )
+}
+
 fn emit_call_direct_expr(
     fb: &mut FunctionBuilder<'_>,
     call: &soac_blockpy::block_py::CallDirect<InstrCodegen>,
@@ -7798,180 +7855,302 @@ fn emit_codegen_simple_call_with_local_env(
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let has_method_specializations =
-            !direct_method_specializations_for_call_site(call, emit_ctx).is_empty();
-        if !has_method_specializations {
-            let callable_is_borrowed = codegen_expr_is_borrowable_from_local_env(
-                call.func.as_ref(),
+        let direct_method_specializations =
+            direct_method_specializations_for_call_site(call, emit_ctx);
+        if !direct_method_specializations.is_empty() {
+            let InstrCodegen::GetAttr(getattr) = call.func.as_ref() else {
+                unreachable!("direct method specializations require GetAttr call target");
+            };
+            let receiver_is_borrowed = codegen_expr_is_borrowable_from_local_env(
+                getattr.value.as_ref(),
                 local_env,
                 &emit_ctx.stack_slots,
                 emit_ctx.storage_layout.as_ref(),
             );
-            let callable = emit_codegen_expr_with_local_env(
+            let receiver = emit_codegen_expr_with_local_env(
                 fb,
-                call.func.as_ref(),
+                getattr.value.as_ref(),
                 local_env,
                 emit_ctx,
-                callable_is_borrowed,
+                receiver_is_borrowed,
                 jit_module,
                 func_imports,
             );
-            let should_emit_callee_id = call_target_counter.is_some()
-                || !constructor_specializations.is_empty()
-                || !direct_specializations.is_empty();
-            let callee_id = should_emit_callee_id
-                .then(|| emit_callee_function_id_checked(fb, callable, emit_ctx));
-            if let Some(counter_id) = call_target_counter {
-                let callee_id = callee_id.expect("callee id should exist for call target counter");
-                emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
-            }
-            if !constructor_specializations.is_empty() || !direct_specializations.is_empty() {
-                let result_block = fb.create_block();
-                fb.append_block_param(result_block, ptr_ty);
-                let generic_block = fb.create_block();
-                let mut direct_chain_start = None;
-                if !constructor_specializations.is_empty() {
-                    let mut next_miss_block = fb.create_block();
-                    for (index, specialization) in constructor_specializations.iter().enumerate() {
-                        let type_match_block = fb.create_block();
-                        let direct_block = fb.create_block();
-                        let miss_block = if index + 1 == constructor_specializations.len() {
-                            if direct_specializations.is_empty() {
-                                generic_block
-                            } else {
-                                fb.create_block()
-                            }
-                        } else {
-                            fb.create_block()
-                        };
-                        let expected_type =
-                            fb.ins().iconst(ptr_ty, specialization.owner_type as i64);
-                        let is_exact_type =
-                            fb.ins()
-                                .icmp(ir::condcodes::IntCC::Equal, callable, expected_type);
-                        fb.ins()
-                            .brif(is_exact_type, type_match_block, &[], miss_block, &[]);
+            let result_block = fb.create_block();
+            fb.append_block_param(result_block, ptr_ty);
+            let generic_block = fb.create_block();
+            for (index, specialization) in direct_method_specializations.iter().enumerate() {
+                let direct_block = fb.create_block();
+                let miss_block = if index + 1 == direct_method_specializations.len() {
+                    generic_block
+                } else {
+                    fb.create_block()
+                };
+                let expected_type = fb.ins().iconst(ptr_ty, specialization.owner_type as i64);
+                let expected_version = fb
+                    .ins()
+                    .iconst(emit_ctx.consts.i64_ty, specialization.type_version as i64);
+                let guard_inst = fb.ins().call(
+                    emit_ctx.guard_method_type_version_ref,
+                    &[receiver, expected_type, expected_version],
+                );
+                let guard_result =
+                    emit_checked_i32_result(fb, fb.inst_results(guard_inst)[0], emit_ctx);
+                let is_match = fb
+                    .ins()
+                    .icmp_imm(ir::condcodes::IntCC::NotEqual, guard_result, 0);
+                fb.ins().brif(is_match, direct_block, &[], miss_block, &[]);
 
-                        fb.switch_to_block(type_match_block);
-                        let type_version = fb.ins().load(
-                            ir::types::I32,
-                            ir::MemFlags::trusted(),
-                            callable,
-                            offset_of!(ffi::PyTypeObject, tp_version_tag) as i32,
-                        );
-                        let version_matches = fb.ins().icmp_imm(
-                            ir::condcodes::IntCC::Equal,
-                            type_version,
-                            specialization.type_version as i64,
-                        );
-                        fb.ins()
-                            .brif(version_matches, direct_block, &[], miss_block, &[]);
-
-                        fb.switch_to_block(direct_block);
-                        let target_function =
-                            direct_call_target_function(emit_ctx, specialization.function_id)
-                                .expect("direct constructor specialization target should exist");
-                        if let Some(counter_id) = direct_hit_counter_id {
-                            let _ = emit_increment_counter(fb, counter_id, emit_ctx);
-                        }
-                        let direct_result =
-                            emit_direct_constructor_resolved_with_args_from_local_env(
-                                fb,
-                                callable,
-                                callable_is_borrowed,
-                                simple_args.as_slice(),
-                                specialization,
-                                target_function,
-                                local_env,
-                                emit_ctx,
-                                jit_module,
-                                func_imports,
-                            );
-                        fb.ins()
-                            .jump(result_block, &[ir::BlockArg::Value(direct_result)]);
-                        if index + 1 != constructor_specializations.len() {
-                            fb.switch_to_block(miss_block);
-                        } else {
-                            next_miss_block = miss_block;
-                        }
-                    }
-                    direct_chain_start = Some(next_miss_block);
+                fb.switch_to_block(direct_block);
+                let target_function =
+                    direct_call_target_function(emit_ctx, specialization.function_id)
+                        .expect("direct method specialization target should exist");
+                if let Some(counter_id) = call_target_counter {
+                    let callee_id = fb.ins().iconst(
+                        emit_ctx.consts.i64_ty,
+                        specialization.function_id.packed() as i64,
+                    );
+                    emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
                 }
-
-                if !direct_specializations.is_empty() {
-                    if let Some(start_block) = direct_chain_start {
-                        fb.switch_to_block(start_block);
-                    }
-                    let callee_id =
-                        callee_id.expect("callee id should exist for direct call guards");
-                    for (index, specialization) in direct_specializations.iter().enumerate() {
-                        let direct_block = fb.create_block();
-                        let miss_block = if index + 1 == direct_specializations.len() {
-                            generic_block
-                        } else {
-                            fb.create_block()
-                        };
-                        let is_match = fb.ins().icmp_imm(
-                            ir::condcodes::IntCC::Equal,
-                            callee_id,
-                            specialization.function_id.packed() as i64,
-                        );
-                        fb.ins().brif(is_match, direct_block, &[], miss_block, &[]);
-
-                        fb.switch_to_block(direct_block);
-                        let target_function =
-                            direct_call_target_function(emit_ctx, specialization.function_id)
-                                .expect("direct specialization target should exist");
-                        if let Some(counter_id) = direct_hit_counter_id {
-                            let _ = emit_increment_counter(fb, counter_id, emit_ctx);
-                        }
-                        let direct_result = emit_direct_call_resolved_with_arg_plan_from_local_env(
-                            fb,
-                            callable,
-                            callable_is_borrowed,
-                            simple_args.as_slice(),
-                            &specialization.arg_plan,
-                            target_function,
-                            local_env,
-                            emit_ctx,
-                            jit_module,
-                            func_imports,
-                        );
-                        fb.ins()
-                            .jump(result_block, &[ir::BlockArg::Value(direct_result)]);
-                        if index + 1 != direct_specializations.len() {
-                            fb.switch_to_block(miss_block);
-                        }
-                    }
-                }
-
-                fb.switch_to_block(generic_block);
-                emit_ctx
-                    .direct_edge_stats
-                    .record_guarded_generic_fallback_block();
-                if let Some(counter_id) = direct_fallback_counter_id {
+                if let Some(counter_id) = direct_hit_counter_id {
                     let _ = emit_increment_counter(fb, counter_id, emit_ctx);
                 }
-                let generic_result = emit_positional_vectorcall_with_local_env(
+                let direct_result = emit_direct_method_resolved_with_args_from_local_env(
                     fb,
-                    callable,
-                    callable_is_borrowed,
+                    receiver,
+                    receiver_is_borrowed,
                     simple_args.as_slice(),
+                    specialization,
+                    target_function,
                     local_env,
                     emit_ctx,
                     jit_module,
                     func_imports,
                 );
                 fb.ins()
-                    .jump(result_block, &[ir::BlockArg::Value(generic_result)]);
-                fb.switch_to_block(result_block);
-                return Some(fb.block_params(result_block)[0]);
+                    .jump(result_block, &[ir::BlockArg::Value(direct_result)]);
+                if index + 1 != direct_method_specializations.len() {
+                    fb.switch_to_block(miss_block);
+                }
             }
+
+            fb.switch_to_block(generic_block);
+            let attr_is_borrowed = codegen_expr_is_borrowable_from_local_env(
+                getattr.attr.as_ref(),
+                local_env,
+                &emit_ctx.stack_slots,
+                emit_ctx.storage_layout.as_ref(),
+            );
+            let attr = emit_codegen_expr_with_local_env(
+                fb,
+                getattr.attr.as_ref(),
+                local_env,
+                emit_ctx,
+                attr_is_borrowed,
+                jit_module,
+                func_imports,
+            );
+            let getattr_inst = fb
+                .ins()
+                .call(emit_ctx.pyobject_getattr_ref, &[receiver, attr]);
+            let mut owned_inputs = Vec::with_capacity(2);
+            if !attr_is_borrowed {
+                owned_inputs.push(attr);
+            }
+            if !receiver_is_borrowed {
+                owned_inputs.push(receiver);
+            }
+            let callable = emit_decref_owned_inputs_after_nullable_result(
+                fb,
+                emit_ctx,
+                fb.inst_results(getattr_inst)[0],
+                &owned_inputs,
+            );
+            let callable_is_null = fb
+                .ins()
+                .icmp(ir::condcodes::IntCC::Equal, callable, null_ptr);
+            let callable_ok_block = fb.create_block();
+            fb.append_block_param(callable_ok_block, ptr_ty);
+            fb.ins().brif(
+                callable_is_null,
+                emit_ctx.consts.step_null_block,
+                &step_null_block_args(emit_ctx),
+                callable_ok_block,
+                &[ir::BlockArg::Value(callable)],
+            );
+            fb.switch_to_block(callable_ok_block);
+            let callable = fb.block_params(callable_ok_block)[0];
             if let Some(counter_id) = call_target_counter {
-                let callee_id = callee_id.expect("callee id should exist for call target counter");
+                let callee_id = emit_callee_function_id_checked(fb, callable, emit_ctx);
                 emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
             }
-            return Some(emit_positional_vectorcall_with_local_env(
+            if let Some(counter_id) = direct_fallback_counter_id {
+                let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+            }
+            let generic_result = emit_positional_vectorcall_with_local_env(
+                fb,
+                callable,
+                false,
+                simple_args.as_slice(),
+                local_env,
+                emit_ctx,
+                jit_module,
+                func_imports,
+            );
+            fb.ins()
+                .jump(result_block, &[ir::BlockArg::Value(generic_result)]);
+            fb.switch_to_block(result_block);
+            return Some(fb.block_params(result_block)[0]);
+        }
+        let callable_is_borrowed = codegen_expr_is_borrowable_from_local_env(
+            call.func.as_ref(),
+            local_env,
+            &emit_ctx.stack_slots,
+            emit_ctx.storage_layout.as_ref(),
+        );
+        let callable = emit_codegen_expr_with_local_env(
+            fb,
+            call.func.as_ref(),
+            local_env,
+            emit_ctx,
+            callable_is_borrowed,
+            jit_module,
+            func_imports,
+        );
+        let should_emit_callee_id = call_target_counter.is_some()
+            || !constructor_specializations.is_empty()
+            || !direct_specializations.is_empty();
+        let callee_id =
+            should_emit_callee_id.then(|| emit_callee_function_id_checked(fb, callable, emit_ctx));
+        if let Some(counter_id) = call_target_counter {
+            let callee_id = callee_id.expect("callee id should exist for call target counter");
+            emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
+        }
+        if !constructor_specializations.is_empty() || !direct_specializations.is_empty() {
+            let result_block = fb.create_block();
+            fb.append_block_param(result_block, ptr_ty);
+            let generic_block = fb.create_block();
+            let mut direct_chain_start = None;
+            if !constructor_specializations.is_empty() {
+                let mut next_miss_block = fb.create_block();
+                for (index, specialization) in constructor_specializations.iter().enumerate() {
+                    let type_match_block = fb.create_block();
+                    let direct_block = fb.create_block();
+                    let miss_block = if index + 1 == constructor_specializations.len() {
+                        if direct_specializations.is_empty() {
+                            generic_block
+                        } else {
+                            fb.create_block()
+                        }
+                    } else {
+                        fb.create_block()
+                    };
+                    let expected_type = fb.ins().iconst(ptr_ty, specialization.owner_type as i64);
+                    let is_exact_type =
+                        fb.ins()
+                            .icmp(ir::condcodes::IntCC::Equal, callable, expected_type);
+                    fb.ins()
+                        .brif(is_exact_type, type_match_block, &[], miss_block, &[]);
+
+                    fb.switch_to_block(type_match_block);
+                    let type_version = fb.ins().load(
+                        ir::types::I32,
+                        ir::MemFlags::trusted(),
+                        callable,
+                        offset_of!(ffi::PyTypeObject, tp_version_tag) as i32,
+                    );
+                    let version_matches = fb.ins().icmp_imm(
+                        ir::condcodes::IntCC::Equal,
+                        type_version,
+                        specialization.type_version as i64,
+                    );
+                    fb.ins()
+                        .brif(version_matches, direct_block, &[], miss_block, &[]);
+
+                    fb.switch_to_block(direct_block);
+                    let target_function =
+                        direct_call_target_function(emit_ctx, specialization.function_id)
+                            .expect("direct constructor specialization target should exist");
+                    if let Some(counter_id) = direct_hit_counter_id {
+                        let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+                    }
+                    let direct_result = emit_direct_constructor_resolved_with_args_from_local_env(
+                        fb,
+                        callable,
+                        callable_is_borrowed,
+                        simple_args.as_slice(),
+                        specialization,
+                        target_function,
+                        local_env,
+                        emit_ctx,
+                        jit_module,
+                        func_imports,
+                    );
+                    fb.ins()
+                        .jump(result_block, &[ir::BlockArg::Value(direct_result)]);
+                    if index + 1 != constructor_specializations.len() {
+                        fb.switch_to_block(miss_block);
+                    } else {
+                        next_miss_block = miss_block;
+                    }
+                }
+                direct_chain_start = Some(next_miss_block);
+            }
+
+            if !direct_specializations.is_empty() {
+                if let Some(start_block) = direct_chain_start {
+                    fb.switch_to_block(start_block);
+                }
+                let callee_id = callee_id.expect("callee id should exist for direct call guards");
+                for (index, specialization) in direct_specializations.iter().enumerate() {
+                    let direct_block = fb.create_block();
+                    let miss_block = if index + 1 == direct_specializations.len() {
+                        generic_block
+                    } else {
+                        fb.create_block()
+                    };
+                    let is_match = fb.ins().icmp_imm(
+                        ir::condcodes::IntCC::Equal,
+                        callee_id,
+                        specialization.function_id.packed() as i64,
+                    );
+                    fb.ins().brif(is_match, direct_block, &[], miss_block, &[]);
+
+                    fb.switch_to_block(direct_block);
+                    let target_function =
+                        direct_call_target_function(emit_ctx, specialization.function_id)
+                            .expect("direct specialization target should exist");
+                    if let Some(counter_id) = direct_hit_counter_id {
+                        let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+                    }
+                    let direct_result = emit_direct_call_resolved_with_arg_plan_from_local_env(
+                        fb,
+                        callable,
+                        callable_is_borrowed,
+                        simple_args.as_slice(),
+                        &specialization.arg_plan,
+                        target_function,
+                        local_env,
+                        emit_ctx,
+                        jit_module,
+                        func_imports,
+                    );
+                    fb.ins()
+                        .jump(result_block, &[ir::BlockArg::Value(direct_result)]);
+                    if index + 1 != direct_specializations.len() {
+                        fb.switch_to_block(miss_block);
+                    }
+                }
+            }
+
+            fb.switch_to_block(generic_block);
+            emit_ctx
+                .direct_edge_stats
+                .record_guarded_generic_fallback_block();
+            if let Some(counter_id) = direct_fallback_counter_id {
+                let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+            }
+            let generic_result = emit_positional_vectorcall_with_local_env(
                 fb,
                 callable,
                 callable_is_borrowed,
@@ -7980,8 +8159,26 @@ fn emit_codegen_simple_call_with_local_env(
                 emit_ctx,
                 jit_module,
                 func_imports,
-            ));
+            );
+            fb.ins()
+                .jump(result_block, &[ir::BlockArg::Value(generic_result)]);
+            fb.switch_to_block(result_block);
+            return Some(fb.block_params(result_block)[0]);
         }
+        if let Some(counter_id) = call_target_counter {
+            let callee_id = callee_id.expect("callee id should exist for call target counter");
+            emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
+        }
+        return Some(emit_positional_vectorcall_with_local_env(
+            fb,
+            callable,
+            callable_is_borrowed,
+            simple_args.as_slice(),
+            local_env,
+            emit_ctx,
+            jit_module,
+            func_imports,
+        ));
     }
 
     None
