@@ -2,8 +2,8 @@ use soac_blockpy::block_py::{
     BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, CodegenBlock, LocalLocation,
 };
 use soac_blockpy::passes::{
-    CodegenModuleShape, FactStore, FunctionRefcountPlan, PyObjFacts, lower_refcount_ownership,
-    validate_refcount_plan,
+    CodegenModuleShape, FactStore, FunctionRefcountPlan, PyObjFacts, RefcountActionKind,
+    RefcountReleaseReason, lower_refcount_ownership, validate_refcount_plan,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -90,6 +90,115 @@ pub fn plan_function_refcount_ownership(
         .function(function.function_id)
         .cloned()
         .unwrap_or_default())
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CurrentJitRefcountPlanCheck {
+    pub local_rebinds: usize,
+    pub local_deletes: usize,
+    pub terminal_stack_slot_releases: usize,
+    pub normal_edge_stack_slot_releases: usize,
+    pub exception_edge_stack_slot_releases: usize,
+}
+
+impl CurrentJitRefcountPlanCheck {
+    pub fn has_edge_release_gaps(&self) -> bool {
+        self.normal_edge_stack_slot_releases > 0 || self.exception_edge_stack_slot_releases > 0
+    }
+}
+
+pub fn check_refcount_plan_against_current_jit(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    plan: &FunctionRefcountPlan,
+) -> Result<CurrentJitRefcountPlanCheck, String> {
+    let stack_slot_names = function
+        .storage_layout()
+        .as_ref()
+        .map(|layout| layout.stack_slots().iter().cloned().collect::<HashSet<_>>())
+        .unwrap_or_default();
+    let block_labels = function
+        .blocks
+        .iter()
+        .map(|block| block.label)
+        .collect::<HashSet<_>>();
+    let mut check = CurrentJitRefcountPlanCheck::default();
+    let mut errors = Vec::new();
+
+    for (block_label, block_plan) in &plan.blocks {
+        if !block_labels.contains(block_label) {
+            errors.push(format!(
+                "refcount plan for function {} ({}) contains unknown block {block_label}",
+                function.function_id, function.names.qualname
+            ));
+        }
+        for action in &block_plan.actions {
+            match &action.kind {
+                RefcountActionKind::RebindLocal { local, .. } => {
+                    check_local_has_stack_slot(
+                        function,
+                        &stack_slot_names,
+                        &local.name,
+                        &mut errors,
+                    );
+                    check.local_rebinds += 1;
+                }
+                RefcountActionKind::DeleteLocal { local, .. } => {
+                    check_local_has_stack_slot(
+                        function,
+                        &stack_slot_names,
+                        &local.name,
+                        &mut errors,
+                    );
+                    check.local_deletes += 1;
+                }
+                RefcountActionKind::ReleaseLocal { local, reason, .. } => {
+                    check_local_has_stack_slot(
+                        function,
+                        &stack_slot_names,
+                        &local.name,
+                        &mut errors,
+                    );
+                    match reason {
+                        RefcountReleaseReason::Return | RefcountReleaseReason::Raise => {
+                            check.terminal_stack_slot_releases += 1;
+                        }
+                        RefcountReleaseReason::Jump { .. }
+                        | RefcountReleaseReason::IfThen { .. }
+                        | RefcountReleaseReason::IfElse { .. }
+                        | RefcountReleaseReason::BranchCase { .. }
+                        | RefcountReleaseReason::BranchDefault { .. } => {
+                            check.normal_edge_stack_slot_releases += 1;
+                        }
+                        RefcountReleaseReason::ExceptionEdge { .. } => {
+                            check.exception_edge_stack_slot_releases += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(check)
+    } else {
+        Err(errors.join("\n"))
+    }
+}
+
+fn check_local_has_stack_slot(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    stack_slot_names: &HashSet<String>,
+    local_name: &str,
+    errors: &mut Vec<String>,
+) {
+    if stack_slot_names.contains(local_name) {
+        return;
+    }
+    errors.push(format!(
+        "refcount plan action for function {} ({}) references local {local_name:?}, \
+         but the current JIT cleanup model only tracks storage-layout stack slots",
+        function.function_id, function.names.qualname
+    ));
 }
 
 fn local_ref_kind_for_facts(facts: Option<PyObjFacts>) -> LocalRefKind {
@@ -267,5 +376,55 @@ def f():
                 )
             })
         }));
+    }
+
+    #[test]
+    fn refcount_plan_check_maps_terminal_releases_to_stack_slot_cleanup() {
+        let (lowered, function_index) = lowered_function(
+            r#"
+def f():
+    x = []
+    return None
+"#,
+            "f",
+        );
+        let function = &lowered.callable_defs[function_index];
+        let facts = infer_module_value_facts(&lowered);
+        let plan = plan_function_refcount_ownership(&lowered, function, &facts)
+            .expect("refcount plan should validate");
+        let check = check_refcount_plan_against_current_jit(function, &plan)
+            .expect("current JIT should account for storage-layout locals");
+
+        assert_eq!(check.local_rebinds, 1);
+        assert_eq!(check.terminal_stack_slot_releases, 1);
+        assert_eq!(check.normal_edge_stack_slot_releases, 0);
+        assert_eq!(check.exception_edge_stack_slot_releases, 0);
+        assert!(!check.has_edge_release_gaps());
+    }
+
+    #[test]
+    fn refcount_plan_check_reports_normal_edge_release_gaps() {
+        let (lowered, function_index) = lowered_function(
+            r#"
+def f(flag):
+    x = []
+    if flag:
+        return None
+    return None
+"#,
+            "f",
+        );
+        let function = &lowered.callable_defs[function_index];
+        let facts = infer_module_value_facts(&lowered);
+        let plan = plan_function_refcount_ownership(&lowered, function, &facts)
+            .expect("refcount plan should validate");
+        let check = check_refcount_plan_against_current_jit(function, &plan)
+            .expect("current JIT should account for storage-layout locals");
+
+        assert!(
+            check.normal_edge_stack_slot_releases > 0,
+            "expected the plan to expose stack-slot releases that current normal-edge code does not emit: {check:#?}"
+        );
+        assert!(check.has_edge_release_gaps());
     }
 }

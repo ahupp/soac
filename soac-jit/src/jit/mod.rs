@@ -53,9 +53,9 @@ mod runtime_context;
 mod specialized_helpers;
 
 pub use planning::{
-    BlockExcDispatchPlan, BlockLocalPlan, FunctionLocalPlan, LocalRefKind, PlannedLocalBinding,
-    exc_dispatch_plan, jit_param_names_for_block, plan_function_locals,
-    plan_function_refcount_ownership,
+    BlockExcDispatchPlan, BlockLocalPlan, CurrentJitRefcountPlanCheck, FunctionLocalPlan,
+    LocalRefKind, PlannedLocalBinding, check_refcount_plan_against_current_jit, exc_dispatch_plan,
+    jit_param_names_for_block, plan_function_locals, plan_function_refcount_ownership,
 };
 use runtime_context::{
     FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET, FUNCTION_ENV_GLOBALS_OBJ_OFFSET,
@@ -7615,6 +7615,7 @@ fn build_cranelift_run_bb_specialized_function(
     let value_facts = infer_jit_value_facts(module);
     let local_plan = plan_function_locals(function, &value_facts);
     let refcount_plan = plan_function_refcount_ownership(module, function, &value_facts)?;
+    let _refcount_plan_check = check_refcount_plan_against_current_jit(function, &refcount_plan)?;
 
     let mut direct_call_target_functions = HashMap::new();
     for function_id in direct_call_targets {
