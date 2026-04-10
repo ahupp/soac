@@ -337,6 +337,11 @@ instance's live working commit.
   stale or conflicted working copy and the `jj log` command above prints
   nothing.
 
+- For routine before/after validation, including benchmark comparisons, prefer
+  changing the current workspace's `@` directly rather than creating a
+  temporary jj workspace. Use a temporary workspace only when isolation is
+  specifically needed or requested.
+
   The revset flags four invalid states:
   - `divergent()`: there is unresolved divergence in visible changes.
   - `conflicts() & working_copies()`: a live workspace is currently conflicted.

@@ -99,11 +99,13 @@ pub struct CurrentJitRefcountPlanCheck {
     pub terminal_stack_slot_releases: usize,
     pub normal_edge_stack_slot_releases: usize,
     pub exception_edge_stack_slot_releases: usize,
+    pub normal_edge_release_gaps: usize,
+    pub exception_edge_release_gaps: usize,
 }
 
 impl CurrentJitRefcountPlanCheck {
     pub fn has_edge_release_gaps(&self) -> bool {
-        false
+        self.normal_edge_release_gaps > 0 || self.exception_edge_release_gaps > 0
     }
 }
 
@@ -168,9 +170,11 @@ pub fn check_refcount_plan_against_current_jit(
                         | RefcountReleaseReason::BranchCase { .. }
                         | RefcountReleaseReason::BranchDefault { .. } => {
                             check.normal_edge_stack_slot_releases += 1;
+                            check.normal_edge_release_gaps += 1;
                         }
                         RefcountReleaseReason::ExceptionEdge { .. } => {
                             check.exception_edge_stack_slot_releases += 1;
+                            check.exception_edge_release_gaps += 1;
                         }
                     }
                 }
@@ -399,11 +403,13 @@ def f():
         assert_eq!(check.terminal_stack_slot_releases, 1);
         assert_eq!(check.normal_edge_stack_slot_releases, 0);
         assert_eq!(check.exception_edge_stack_slot_releases, 0);
+        assert_eq!(check.normal_edge_release_gaps, 0);
+        assert_eq!(check.exception_edge_release_gaps, 0);
         assert!(!check.has_edge_release_gaps());
     }
 
     #[test]
-    fn refcount_plan_check_maps_normal_edge_releases_to_stack_slot_cleanup() {
+    fn refcount_plan_check_reports_normal_edge_release_gap() {
         let (lowered, function_index) = lowered_function(
             r#"
 def f(flag):
@@ -425,11 +431,16 @@ def f(flag):
             check.normal_edge_stack_slot_releases > 0,
             "expected the plan to expose normal-edge stack-slot releases: {check:#?}"
         );
-        assert!(!check.has_edge_release_gaps());
+        assert_eq!(
+            check.normal_edge_release_gaps,
+            check.normal_edge_stack_slot_releases
+        );
+        assert_eq!(check.exception_edge_release_gaps, 0);
+        assert!(check.has_edge_release_gaps());
     }
 
     #[test]
-    fn refcount_plan_check_maps_exception_edge_releases_to_stack_slot_cleanup() {
+    fn refcount_plan_check_reports_exception_edge_release_gap() {
         let (lowered, function_index) = lowered_function(
             r#"
 def f():
@@ -453,6 +464,10 @@ def f():
             check.exception_edge_stack_slot_releases > 0,
             "expected the plan to expose exception-edge stack-slot releases: {check:#?}"
         );
-        assert!(!check.has_edge_release_gaps());
+        assert_eq!(
+            check.exception_edge_release_gaps,
+            check.exception_edge_stack_slot_releases
+        );
+        assert!(check.has_edge_release_gaps());
     }
 }

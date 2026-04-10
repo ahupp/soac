@@ -337,6 +337,10 @@ Started:
   and exception edge releases, but JIT stack-slot codegen currently only
   consumes terminal releases because clearing a function-wide slot on an edge
   can delete locals still live in a later block.
+- The current JIT refcount-plan consistency check reports normal and exception
+  edge releases as explicit gaps. This is intentional until semantic Python
+  local ownership moves out of function-wide stack slots and into an
+  edge-transfer-aware SSA/`LocalEnv` representation.
 - JIT physical stack slots now use `NULL` for unbound or released local state
   instead of the runtime `DELETED` sentinel. Stack-slot loads raise the deleted
   name error before exposing `NULL` as a Python value, and stack-slot
