@@ -9,6 +9,7 @@ mod global_index;
 mod instr_id;
 mod instrument;
 mod name_binding;
+mod refcount_lowering;
 pub mod ruff_to_blockpy;
 mod trace;
 mod value_facts;
@@ -376,6 +377,11 @@ pub use instr_id::{
 };
 pub use instrument::{
     CounterBuilder, CounterHandle, CounterSpec, InstrumentInstr, OptBlock, OptInstr,
+};
+pub use refcount_lowering::{
+    lower_refcount_ownership, validate_refcount_plan, BlockRefcountPlan, FunctionRefcountPlan,
+    LocalRefState, RefcountAction, RefcountActionKind, RefcountLocal, RefcountPlan,
+    RefcountReleaseReason, RefcountSite,
 };
 pub use trace::{
     instrument_bb_module_with_block_entry_counters, instrument_bb_module_with_call_target_counters,

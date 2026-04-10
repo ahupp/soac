@@ -111,6 +111,10 @@ impl Visit<InstrCodegen> for CodegenInstrIdValidator<'_> {
         InstrCodegen: ChildVisitable<InstrCodegen>,
     {
         let Some(instr_id) = expr.try_semantic_instr_id() else {
+            if matches!(expr, InstrCodegen::IncrementCounter(_)) {
+                crate::block_py::walk_expr(self, expr);
+                return;
+            }
             self.errors.push(format!(
                 "missing codegen instruction id in function {} ({})",
                 self.function.names.qualname, self.function.function_id
@@ -156,7 +160,7 @@ mod test {
         VisitMut, WithMeta,
     };
     use crate::lower_python_to_blockpy_for_testing;
-    use crate::passes::CodegenModuleShape;
+    use crate::passes::{instrument_bb_module_with_block_entry_counters, CodegenModuleShape};
     use std::collections::HashMap;
 
     struct InstrIdCollector {
@@ -319,6 +323,23 @@ def f(x):
         let err = validate_codegen_instr_ids(&lowered)
             .expect_err("missing semantic codegen ids should fail validation");
         assert!(err.contains("missing codegen instruction id"));
+    }
+
+    #[test]
+    fn allows_unidentified_synthetic_counter_instrs() {
+        let mut lowered = lower_python_to_blockpy_for_testing(
+            r#"
+def f(x):
+    return x + 1
+"#,
+        )
+        .expect("transform should succeed")
+        .codegen_module;
+
+        instrument_bb_module_with_block_entry_counters(&mut lowered);
+
+        validate_codegen_instr_ids(&lowered)
+            .expect("synthetic counter instrumentation should not require semantic ids");
     }
 
     #[test]

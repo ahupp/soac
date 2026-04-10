@@ -25,8 +25,8 @@ use soac_blockpy::block_py::{
     ResolvedName, StorageLayout, Visit, WithMeta, operation as blockpy_intrinsics,
 };
 use soac_blockpy::passes::{
-    CodegenModuleShape, FactStore, InstrResolved, RuntimeHelperId, ValueFacts,
-    infer_module_value_facts,
+    CodegenModuleShape, FactStore, FunctionRefcountPlan, InstrResolved, RuntimeHelperId,
+    ValueFacts, infer_module_value_facts,
 };
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -55,6 +55,7 @@ mod specialized_helpers;
 pub use planning::{
     BlockExcDispatchPlan, BlockLocalPlan, FunctionLocalPlan, LocalRefKind, PlannedLocalBinding,
     exc_dispatch_plan, jit_param_names_for_block, plan_function_locals,
+    plan_function_refcount_ownership,
 };
 use runtime_context::{
     FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET, FUNCTION_ENV_GLOBALS_OBJ_OFFSET,
@@ -1335,6 +1336,7 @@ struct JitEmitCtx<'mc> {
     module_constant_ptrs: &'mc [*mut ffi::PyObject],
     value_facts: &'mc FactStore,
     local_plan: &'mc FunctionLocalPlan,
+    refcount_plan: &'mc FunctionRefcountPlan,
     counter_ptrs: &'mc [*mut u64],
     top_value_counter_ptrs: &'mc [ObjPtr],
     storage_layout: Option<StorageLayout>,
@@ -7612,6 +7614,7 @@ fn build_cranelift_run_bb_specialized_function(
     let direct_call_functions = predeclared_direct_functions.unwrap_or(&empty_direct_functions);
     let value_facts = infer_jit_value_facts(module);
     let local_plan = plan_function_locals(function, &value_facts);
+    let refcount_plan = plan_function_refcount_ownership(module, function, &value_facts)?;
 
     let mut direct_call_target_functions = HashMap::new();
     for function_id in direct_call_targets {
@@ -8164,6 +8167,7 @@ fn build_cranelift_run_bb_specialized_function(
                 module_constant_ptrs,
                 value_facts: &value_facts,
                 local_plan: &local_plan,
+                refcount_plan: &refcount_plan,
                 counter_ptrs,
                 top_value_counter_ptrs: &top_value_counter_ptrs,
                 storage_layout: function.storage_layout().clone(),
@@ -8246,6 +8250,7 @@ fn build_cranelift_run_bb_specialized_function(
             };
             let block = &function.blocks[index];
             let _block_local_plan = emit_ctx.local_plan.block(block.label);
+            let _block_refcount_plan = emit_ctx.refcount_plan.block(block.label);
             let mut local_env = LocalEnv::default();
 
             local_env.with_legacy_parts_mut(|local_names, local_values| {

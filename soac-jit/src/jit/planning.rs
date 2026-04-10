@@ -1,5 +1,10 @@
-use soac_blockpy::block_py::{BlockArg, BlockLabel, BlockPyFunction, CodegenBlock, LocalLocation};
-use soac_blockpy::passes::{CodegenModuleShape, FactStore, PyObjFacts};
+use soac_blockpy::block_py::{
+    BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, CodegenBlock, LocalLocation,
+};
+use soac_blockpy::passes::{
+    CodegenModuleShape, FactStore, FunctionRefcountPlan, PyObjFacts, lower_refcount_ownership,
+    validate_refcount_plan,
+};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,6 +79,19 @@ pub fn plan_function_locals(
     FunctionLocalPlan { blocks }
 }
 
+pub fn plan_function_refcount_ownership(
+    module: &BlockPyModule<CodegenModuleShape>,
+    function: &BlockPyFunction<CodegenModuleShape>,
+    facts: &FactStore,
+) -> Result<FunctionRefcountPlan, String> {
+    let plan = lower_refcount_ownership(module, facts);
+    validate_refcount_plan(module, facts, &plan)?;
+    Ok(plan
+        .function(function.function_id)
+        .cloned()
+        .unwrap_or_default())
+}
+
 fn local_ref_kind_for_facts(facts: Option<PyObjFacts>) -> LocalRefKind {
     match facts {
         Some(facts) if facts.is_immortal() => LocalRefKind::Immortal,
@@ -134,7 +152,9 @@ mod tests {
     use super::*;
     use soac_blockpy::block_py::BlockTerm;
     use soac_blockpy::lower_python_to_blockpy_for_testing;
-    use soac_blockpy::passes::infer_module_value_facts;
+    use soac_blockpy::passes::{
+        RefcountActionKind, RefcountReleaseReason, infer_module_value_facts,
+    };
 
     fn lowered_function(
         source: &str,
@@ -218,5 +238,34 @@ def f(x):
         let x = binding_for_name(block_plan, "x");
         assert_eq!(x.ref_kind, LocalRefKind::Unknown);
         assert_eq!(x.facts, None);
+    }
+
+    #[test]
+    fn refcount_plan_is_available_to_jit_planning() {
+        let (lowered, function_index) = lowered_function(
+            r#"
+def f():
+    x = []
+    return None
+"#,
+            "f",
+        );
+        let function = &lowered.callable_defs[function_index];
+        let facts = infer_module_value_facts(&lowered);
+        let plan = plan_function_refcount_ownership(&lowered, function, &facts)
+            .expect("JIT planning should accept the verified BlockPy refcount plan");
+
+        assert!(plan.blocks.values().any(|block| {
+            block.actions.iter().any(|action| {
+                matches!(
+                    &action.kind,
+                    RefcountActionKind::ReleaseLocal {
+                        local,
+                        reason: RefcountReleaseReason::Return,
+                        ..
+                    } if local.name == "x"
+                )
+            })
+        }));
     }
 }

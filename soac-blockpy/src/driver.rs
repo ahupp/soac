@@ -201,9 +201,17 @@ pub(crate) fn rewrite_module_with_tracker_with_options(
     pass_tracker.record_timing("validate_codegen_instr_ids", || {
         passes::validate_codegen_instr_ids(&bb_codegen).map_err(anyhow::Error::msg)
     })?;
-    let _value_facts: passes::FactStore = pass_tracker.record_timing("value_facts", || {
+    let value_facts: passes::FactStore = pass_tracker.record_timing("value_facts", || {
         passes::infer_module_value_facts(&bb_codegen)
     });
+    let refcount_plan: passes::RefcountPlan = pass_tracker
+        .record_timing("refcount_lowering", || {
+            passes::lower_refcount_ownership(&bb_codegen, &value_facts)
+        });
+    pass_tracker.record_timing("validate_refcount_plan", || {
+        passes::validate_refcount_plan(&bb_codegen, &value_facts, &refcount_plan)
+            .map_err(anyhow::Error::msg)
+    })?;
 
     let bb_traced: BlockPyModule<CodegenModuleShape> =
         if let Some(config) = passes::parse_trace_env() {

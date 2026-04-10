@@ -286,11 +286,19 @@ Started:
 - A first `FunctionLocalPlan` exists in JIT planning. It records per-block entry
   bindings from the storage layout, annotates them with available `EnvFacts`,
   and classifies known immortal locals without changing generated code.
-- `LocalEnv` now carries a transient local `LocalRefKind` side table. The first
-  refresh point records the current invariant that transient JIT locals are
-  owned references; stack-slot-backed locals still use the old path.
 - JIT specialization and counter lookup paths now require semantic instruction
   IDs for semantic codegen operations instead of silently disabling the
   optimization when an ID is missing. Synthetic test builders fill missing IDs
   explicitly, and value-fact inference ignores ID-less synthetic trace/counter
   instrumentation rather than assigning fake semantic identities.
+- A first BlockPy `RefcountPlan` sidecar exists and is computed after
+  `value_facts` in the lowering driver. It records local rebind, delete, and
+  cleanup ownership effects from codegen-shaped BlockPy, including stores of
+  the runtime `DELETED` sentinel and immortal local facts. Generated code does
+  not consume the plan yet.
+- The `RefcountPlan` has a verifier that replays local ownership through each
+  codegen block and validates store/delete transitions plus edge and return
+  cleanup actions before instrumentation or JIT codegen can consume the module.
+- JIT planning now computes the same verified per-function `RefcountPlan` beside
+  `FunctionLocalPlan` and makes it available through `JitEmitCtx`. Emission still
+  ignores it, so stack-slot cleanup remains the runtime behavior.
