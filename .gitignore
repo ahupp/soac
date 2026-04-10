@@ -11,9 +11,9 @@ cpython_full_test_run.log
 cpython_full_test_run_summary.txt
 /logs
 /tmp
-/.uv/
-/.uv-cache/
-/.xdg/
+/.uv
+/.uv-cache
+/.xdg
 .cl-cache/
 /web/history_metrics.html
 

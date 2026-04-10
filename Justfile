@@ -159,8 +159,13 @@ setup-dev-env:
       if [[ "$local_real" == "$shared_real" ]]; then
         return
       fi
-      echo "$label is a symlink to $(readlink "$local_path"), expected $shared_path" >&2
-      exit 1
+      if [[ "$migrate_existing" == "1" && -d "$local_path" ]]; then
+        cp -a --no-clobber "$local_path/." "$shared_path/"
+        rm -- "$local_path"
+      else
+        echo "$label is a symlink to $(readlink "$local_path"), expected $shared_path" >&2
+        exit 1
+      fi
     fi
 
     if [[ -e "$local_path" ]]; then
@@ -175,6 +180,7 @@ setup-dev-env:
             ;;
         esac
         cp -a --no-clobber "$local_path/." "$shared_path/"
+        chmod -R u+w "$local_path"
         rm -rf -- "$local_path"
       else
         echo "$label exists at $local_path and is not the expected shared-state symlink" >&2
@@ -188,21 +194,43 @@ setup-dev-env:
   }
 
   if [[ -f "$REPO_ROOT/.jj/repo" ]]; then
-    if [[ -z "${SOAC_PARENT_REPO:-}" ]]; then
-      echo "setup-dev-env: this checkout is a jj worktree, but SOAC_PARENT_REPO is not set" >&2
-      echo "set SOAC_PARENT_REPO to the parent checkout that owns vendor/cpython, bench, and shared offline caches" >&2
-      exit 1
+    parent_repo="${SOAC_PARENT_REPO:-}"
+    parent_repo_source="SOAC_PARENT_REPO"
+    if [[ -z "$parent_repo" ]]; then
+      parent_repo_source="$REPO_ROOT/.jj/repo"
+      jj_repo_path="$(head -n 1 "$REPO_ROOT/.jj/repo")"
+      if [[ -z "$jj_repo_path" ]]; then
+        echo "setup-dev-env: cannot infer parent checkout from empty $REPO_ROOT/.jj/repo" >&2
+        echo "set SOAC_PARENT_REPO to the parent checkout that owns vendor/cpython, bench, and shared offline caches" >&2
+        exit 1
+      fi
+
+      case "$jj_repo_path" in
+        /*) jj_repo_real="$jj_repo_path" ;;
+        *) jj_repo_real="$REPO_ROOT/.jj/$jj_repo_path" ;;
+      esac
+      jj_repo_real="$(realpath -m "$jj_repo_real")"
+
+      case "$jj_repo_real" in
+        */.jj/repo) parent_repo="${jj_repo_real%/.jj/repo}" ;;
+        *)
+          echo "setup-dev-env: cannot infer parent checkout from $REPO_ROOT/.jj/repo" >&2
+          echo ".jj/repo points to $jj_repo_real, not a checkout-local .jj/repo directory" >&2
+          echo "set SOAC_PARENT_REPO to the parent checkout that owns vendor/cpython, bench, and shared offline caches" >&2
+          exit 1
+          ;;
+      esac
     fi
 
-    parent_repo="${SOAC_PARENT_REPO%/}"
+    parent_repo="${parent_repo%/}"
     if [[ ! -d "$parent_repo" ]]; then
-      echo "SOAC_PARENT_REPO does not point to a directory: $SOAC_PARENT_REPO" >&2
+      echo "$parent_repo_source does not identify a directory: $parent_repo" >&2
       exit 1
     fi
 
     parent_repo="$(cd "$parent_repo" && pwd -P)"
     if [[ "$parent_repo" == "$(pwd -P)" ]]; then
-      echo "SOAC_PARENT_REPO points at this worktree; set it to the parent checkout" >&2
+      echo "$parent_repo_source identifies this worktree; set SOAC_PARENT_REPO to the parent checkout" >&2
       exit 1
     fi
 

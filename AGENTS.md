@@ -284,11 +284,13 @@ anything non-code affected the run. If there were no such issues, say
   refreshes; use `just update-venv` or rerun `just setup-dev-env` when
   dependency changes intentionally require network access.
 - `SOAC_PARENT_REPO`
-  Required for `just setup-dev-env` in a jj worktree. Set it to the parent
-  checkout that owns shared offline state and `bench/` as a regular directory.
-  The setup recipe symlinks `vendor/cpython`, `bench/`, `.uv-cache`, `.uv/`,
-  `.xdg/`, and `tmp/cargo-home` from that parent into the worktree, and errors
-  instead of creating isolated empty offline caches when the variable is unset.
+  Optional override for `just setup-dev-env` in a jj worktree. The setup recipe
+  normally infers the parent checkout from a file-backed `.jj/repo`; the parent
+  owns shared offline state and `bench/` as a regular directory. The setup
+  recipe symlinks `vendor/cpython`, `bench/`, `.uv-cache`, `.uv/`, `.xdg/`, and
+  `tmp/cargo-home` from that parent into the worktree, and errors instead of
+  creating isolated empty offline caches when neither inference nor the override
+  can identify the parent.
   When sandboxing would otherwise block shared benchmark writes, run Codex with
   the worktree and parent checkout as writable roots, for example
   `--add-dir ../main-repo .`.
