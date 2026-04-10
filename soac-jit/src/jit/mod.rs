@@ -6558,32 +6558,49 @@ fn emit_planned_stack_slot_releases_for_reason_from_parts(
     Ok(())
 }
 
-fn emit_truthy_from_owned(
+fn emit_truthy_from_owned_value(
     fb: &mut FunctionBuilder<'_>,
-    owned_value: ir::Value,
-    value_facts: Option<ValueFacts>,
+    owned_value: SoacValue,
     is_true_ref: ir::FuncRef,
     ctx: &JitEmitCtx<'_>,
 ) -> SoacValue {
-    let py_facts = value_facts.and_then(ValueFacts::as_pyobj);
-    if let Some(py_facts) = py_facts {
-        if py_facts.is_none() || py_facts.is_false_singleton() {
-            emit_release_owned_pyobject(fb, owned_value, Some(py_facts), ctx);
-            return emit_i32_bool01_const(fb, false, ctx);
+    match owned_value {
+        SoacValue::I32 { value, facts } if facts.is_i32_bool01() => SoacValue::i32(value, facts),
+        SoacValue::I32 { value, .. } => emit_i32_bool01_from_i32_result(fb, value, ctx),
+        SoacValue::I64 { value, .. } => {
+            let is_true = fb.ins().icmp_imm(ir::condcodes::IntCC::NotEqual, value, 0);
+            emit_i32_bool01_from_cond(fb, is_true, ctx)
         }
-        if py_facts.is_true_singleton() {
-            emit_release_owned_pyobject(fb, owned_value, Some(py_facts), ctx);
-            return emit_i32_bool01_const(fb, true, ctx);
-        }
-        if py_facts.is_exact_type(PyExactType::Bool) {
-            let is_true = fb.ins().icmp(
-                ir::condcodes::IntCC::Equal,
-                owned_value,
-                ctx.consts.true_const,
-            );
-            emit_release_owned_pyobject(fb, owned_value, Some(py_facts), ctx);
-            return emit_i32_bool01_from_cond(fb, is_true, ctx);
-        }
+        SoacValue::PyObject {
+            value: owned_value,
+            facts: py_facts,
+        } => emit_truthy_from_owned_pyobject(fb, owned_value, py_facts, is_true_ref, ctx),
+    }
+}
+
+fn emit_truthy_from_owned_pyobject(
+    fb: &mut FunctionBuilder<'_>,
+    owned_value: ir::Value,
+    py_facts: PyObjFacts,
+    is_true_ref: ir::FuncRef,
+    ctx: &JitEmitCtx<'_>,
+) -> SoacValue {
+    if py_facts.is_none() || py_facts.is_false_singleton() {
+        emit_release_owned_pyobject(fb, owned_value, Some(py_facts), ctx);
+        return emit_i32_bool01_const(fb, false, ctx);
+    }
+    if py_facts.is_true_singleton() {
+        emit_release_owned_pyobject(fb, owned_value, Some(py_facts), ctx);
+        return emit_i32_bool01_const(fb, true, ctx);
+    }
+    if py_facts.is_exact_type(PyExactType::Bool) {
+        let is_true = fb.ins().icmp(
+            ir::condcodes::IntCC::Equal,
+            owned_value,
+            ctx.consts.true_const,
+        );
+        emit_release_owned_pyobject(fb, owned_value, Some(py_facts), ctx);
+        return emit_i32_bool01_from_cond(fb, is_true, ctx);
     }
 
     let truth_inst = fb.ins().call(is_true_ref, &[owned_value]);
@@ -6605,15 +6622,40 @@ fn emit_truthy_from_owned(
 
     fb.switch_to_block(truth_error_block);
     let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
-    emit_release_owned_pyobject(fb, owned_value, py_facts, ctx);
+    emit_release_owned_pyobject(fb, owned_value, Some(py_facts), ctx);
     emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
     fb.ins()
         .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
 
     fb.switch_to_block(truth_ok_block);
     let truth_ok_value = fb.block_params(truth_ok_block)[0];
-    emit_release_owned_pyobject(fb, owned_value, py_facts, ctx);
+    emit_release_owned_pyobject(fb, owned_value, Some(py_facts), ctx);
     emit_i32_bool01_from_i32_result(fb, truth_ok_value, ctx)
+}
+
+fn emit_codegen_expr_value_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    expr: &InstrCodegen,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    borrowed: bool,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> SoacValue {
+    let facts = emit_ctx
+        .value_facts_for_expr(expr)
+        .and_then(ValueFacts::as_pyobj)
+        .unwrap_or_else(PyObjFacts::unknown);
+    let value = emit_codegen_expr_with_local_env(
+        fb,
+        expr,
+        local_env,
+        emit_ctx,
+        borrowed,
+        jit_module,
+        func_imports,
+    );
+    SoacValue::pyobject(value, facts)
 }
 
 fn emit_codegen_expr_with_local_env(
@@ -6908,8 +6950,7 @@ fn emit_codegen_term(
         }
         BlockTerm::IfTerm(if_term) => {
             let test_instr_id = if_term.test.semantic_instr_id();
-            let test_facts = emit_ctx.value_facts_for_expr(&if_term.test);
-            let test_value = emit_codegen_expr_with_local_env(
+            let test_value = emit_codegen_expr_value_with_local_env(
                 fb,
                 &if_term.test,
                 local_env,
@@ -6918,7 +6959,7 @@ fn emit_codegen_term(
                 jit_module,
                 func_imports,
             );
-            let truth = emit_truthy_from_owned(fb, test_value, test_facts, is_true_ref, emit_ctx);
+            let truth = emit_truthy_from_owned_value(fb, test_value, is_true_ref, emit_ctx);
             let truth_i32 = truth.expect_i32_bool01("if condition truthiness");
             if let Some(counter_id) = emit_ctx
                 .branch_outcome_counter_ids
