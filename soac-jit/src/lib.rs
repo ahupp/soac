@@ -144,8 +144,6 @@ unsafe extern "C" {
     fn PyFunction_GetDefaults(function: *mut ffi::PyObject) -> *mut ffi::PyObject;
     fn PyFunction_GetKwDefaults(function: *mut ffi::PyObject) -> *mut ffi::PyObject;
     fn PyFunction_GetClosure(function: *mut ffi::PyObject) -> *mut ffi::PyObject;
-    fn PyErr_GetRaisedException() -> *mut ffi::PyObject;
-    fn PyErr_SetRaisedException(exc: *mut ffi::PyObject);
     fn PyType_SetSoacMetadata(
         type_obj: *mut ffi::PyObject,
         soac_function_id: u64,
@@ -767,36 +765,6 @@ unsafe fn make_clif_function_data(
         previous_vectorcall: unsafe { (*(callable as *mut ffi::PyFunctionObject)).vectorcall },
     });
     Ok(Box::into_raw(py_function_extra) as *mut c_void)
-}
-
-pub(crate) unsafe extern "C" fn take_error_before_jit_null_cleanup(
-    function_id: i64,
-    block_index: i64,
-) -> *mut c_void {
-    if unsafe { ffi::PyErr_Occurred() }.is_null() {
-        let msg = format!(
-            "JIT function returned NULL without setting an exception: \
-             function_id={function_id} block_index={block_index}"
-        );
-        if let Ok(c_msg) = CString::new(msg) {
-            unsafe { ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr()) };
-        } else {
-            unsafe {
-                ffi::PyErr_SetString(
-                    ffi::PyExc_RuntimeError,
-                    b"JIT function returned NULL without setting an exception\0".as_ptr()
-                        as *const i8,
-                )
-            };
-        }
-    }
-    unsafe { PyErr_GetRaisedException() as *mut c_void }
-}
-
-pub(crate) unsafe extern "C" fn restore_error_after_jit_null_cleanup(error: *mut c_void) {
-    if !error.is_null() {
-        unsafe { PyErr_SetRaisedException(error as *mut ffi::PyObject) };
-    }
 }
 
 unsafe fn py_function_jit_extra(

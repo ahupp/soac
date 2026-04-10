@@ -1,9 +1,6 @@
 #![no_std]
 
-use core::{
-    ffi::{c_char, c_void},
-    ptr,
-};
+use core::{ffi::c_void, ptr};
 
 #[repr(C)]
 #[cfg(all(target_pointer_width = "64", target_endian = "little"))]
@@ -231,10 +228,7 @@ struct ClifFunctionData {
 
 unsafe extern "C" {
     fn _Py_Dealloc(obj: *mut RawPyObject);
-    fn PyErr_GetRaisedException() -> *mut c_void;
-    fn PyErr_SetRaisedException(exc: *mut c_void);
     fn PyThreadState_GetUnchecked() -> *mut RawPyThreadState;
-    fn soac_runtime_set_runtime_error_static(message: *const c_char);
     fn _PyDict_SetIndexedItem(dict: *mut c_void, index: isize, value: *mut c_void) -> i32;
     fn soac_runtime_load_global_slow(
         dict: *mut c_void,
@@ -267,16 +261,11 @@ unsafe fn py_err_is_set_direct(tstate: *mut RawPyThreadState) -> bool {
 }
 
 #[inline(always)]
-unsafe fn ensure_i32_sentinel_has_runtime_error(
-    tstate: *mut RawPyThreadState,
-    result: i32,
-    sentinel: i32,
-    message: *const c_char,
-) -> i32 {
-    if result == sentinel && !unsafe { py_err_is_set_direct(tstate) } {
-        unsafe { soac_runtime_set_runtime_error_static(message) };
-    }
-    result
+unsafe fn take_raised_exception_direct(tstate: *mut RawPyThreadState) -> *mut RawPyObject {
+    debug_assert!(!tstate.is_null());
+    let exc = unsafe { (*tstate).current_exception };
+    unsafe { (*tstate).current_exception = ptr::null_mut() };
+    exc
 }
 
 #[inline(always)]
@@ -325,6 +314,55 @@ unsafe fn can_skip_decref(obj: *mut RawPyObject) -> bool {
 
 macro_rules! decref_raw {
     ($obj:expr) => {{
+        let tstate = unsafe { PyThreadState_GetUnchecked() };
+        decref_raw_with_tstate!(tstate, $obj);
+    }};
+}
+
+macro_rules! decref_raw_without_error_preservation {
+    ($obj:expr) => {{
+        #[allow(unused_unsafe)]
+        {
+            let obj: *mut RawPyObject = $obj;
+            if !obj.is_null() && !unsafe { can_skip_decref(obj) } {
+                #[cfg(target_pointer_width = "64")]
+                unsafe {
+                    let next_refcnt = (*obj).ob_refcnt.refcnt_and_flags.ob_refcnt.wrapping_sub(1);
+                    (*obj).ob_refcnt.refcnt_and_flags.ob_refcnt = next_refcnt;
+                    if next_refcnt == 0 {
+                        _Py_Dealloc(obj);
+                    }
+                }
+
+                #[cfg(target_pointer_width = "32")]
+                unsafe {
+                    let next_refcnt = (*obj).ob_refcnt.wrapping_sub(1);
+                    (*obj).ob_refcnt = next_refcnt;
+                    if next_refcnt == 0 {
+                        _Py_Dealloc(obj);
+                    }
+                }
+            }
+        }
+    }};
+}
+
+macro_rules! set_raised_exception_direct {
+    ($tstate:expr, $exc:expr) => {{
+        #[allow(unused_unsafe)]
+        {
+            let tstate: *mut RawPyThreadState = $tstate;
+            debug_assert!(!tstate.is_null());
+            let old_exc = unsafe { (*tstate).current_exception };
+            unsafe { (*tstate).current_exception = $exc };
+            decref_raw_without_error_preservation!(old_exc);
+        }
+    }};
+}
+
+macro_rules! decref_raw_with_tstate {
+    ($tstate:expr, $obj:expr) => {{
+        let tstate: *mut RawPyThreadState = $tstate;
         let obj: *mut RawPyObject = $obj;
         if !obj.is_null() && !unsafe { can_skip_decref(obj) } {
             #[cfg(target_pointer_width = "64")]
@@ -332,14 +370,14 @@ macro_rules! decref_raw {
                 let next_refcnt = (*obj).ob_refcnt.refcnt_and_flags.ob_refcnt.wrapping_sub(1);
                 (*obj).ob_refcnt.refcnt_and_flags.ob_refcnt = next_refcnt;
                 if next_refcnt == 0 {
-                    let saved_error = if py_err_is_set_direct(PyThreadState_GetUnchecked()) {
-                        PyErr_GetRaisedException()
+                    let saved_error = if py_err_is_set_direct(tstate) {
+                        take_raised_exception_direct(tstate)
                     } else {
                         ptr::null_mut()
                     };
                     _Py_Dealloc(obj);
                     if !saved_error.is_null() {
-                        PyErr_SetRaisedException(saved_error);
+                        set_raised_exception_direct!(tstate, saved_error);
                     }
                 }
             }
@@ -349,14 +387,14 @@ macro_rules! decref_raw {
                 let next_refcnt = (*obj).ob_refcnt.wrapping_sub(1);
                 (*obj).ob_refcnt = next_refcnt;
                 if next_refcnt == 0 {
-                    let saved_error = if py_err_is_set_direct(PyThreadState_GetUnchecked()) {
-                        PyErr_GetRaisedException()
+                    let saved_error = if py_err_is_set_direct(tstate) {
+                        take_raised_exception_direct(tstate)
                     } else {
                         ptr::null_mut()
                     };
                     _Py_Dealloc(obj);
                     if !saved_error.is_null() {
-                        PyErr_SetRaisedException(saved_error);
+                        set_raised_exception_direct!(tstate, saved_error);
                     }
                 }
             }
@@ -393,20 +431,8 @@ pub unsafe extern "C" fn soac_runtime_incref(obj: *mut c_void) {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soac_runtime_ensure_i32_sentinel_has_runtime_error(
-    tstate: *mut c_void,
-    result: i32,
-    sentinel: i32,
-    message: *const c_char,
-) -> i32 {
-    unsafe {
-        ensure_i32_sentinel_has_runtime_error(
-            tstate.cast::<RawPyThreadState>(),
-            result,
-            sentinel,
-            message,
-        )
-    }
+pub unsafe extern "C" fn soac_runtime_set_raised_exception(tstate: *mut c_void, exc: *mut c_void) {
+    set_raised_exception_direct!(tstate.cast::<RawPyThreadState>(), exc.cast());
 }
 
 #[unsafe(no_mangle)]

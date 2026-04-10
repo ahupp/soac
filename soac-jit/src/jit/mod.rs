@@ -70,6 +70,7 @@ static RUNTIME_SUPPORT_LIBRARY: OnceLock<Result<RuntimeSupportLibrary, String>> 
 static NEXT_IMPORT_SPEC_ID: AtomicUsize = AtomicUsize::new(0);
 static NEXT_IMPORT_TRAMPOLINE_ID: AtomicUsize = AtomicUsize::new(0);
 const JIT_ARENA_BYTES: usize = 256 * 1024 * 1024;
+const MISSING_PYTHON_EXCEPTION_TRAP: ir::TrapCode = ir::TrapCode::unwrap_user(1);
 
 thread_local! {
     static PROCESS_JIT_COMPILE_DEPTH: Cell<usize> = const { Cell::new(0) };
@@ -160,6 +161,11 @@ static DP_JIT_INCREF_IMPORT: ImportSpec =
     ImportSpec::local(SOAC_RUNTIME_INCREF_SYMBOL, &[SigType::Pointer], &[]);
 static DP_JIT_DECREF_IMPORT: ImportSpec =
     ImportSpec::local(SOAC_RUNTIME_DECREF_SYMBOL, &[SigType::Pointer], &[]);
+static SOAC_RUNTIME_SET_RAISED_EXCEPTION_IMPORT: ImportSpec = ImportSpec::local(
+    SOAC_RUNTIME_SET_RAISED_EXCEPTION_SYMBOL,
+    &[SigType::Pointer, SigType::Pointer],
+    &[],
+);
 static SOAC_RUNTIME_LOAD_GLOBAL_IMPORT: ImportSpec = ImportSpec::local(
     SOAC_RUNTIME_LOAD_GLOBAL_SYMBOL,
     &[SigType::Pointer, SigType::Pointer, SigType::I64],
@@ -302,16 +308,6 @@ static SOAC_RUNTIME_GUARD_TYPE_VERSION_IMPORT: ImportSpec = ImportSpec::local(
     &[SigType::Pointer, SigType::Pointer, SigType::I64],
     &[SigType::I32],
 );
-static SOAC_RUNTIME_ENSURE_I32_SENTINEL_HAS_RUNTIME_ERROR_IMPORT: ImportSpec = ImportSpec::local(
-    SOAC_RUNTIME_ENSURE_I32_SENTINEL_HAS_RUNTIME_ERROR_SYMBOL,
-    &[
-        SigType::Pointer,
-        SigType::I32,
-        SigType::I32,
-        SigType::Pointer,
-    ],
-    &[SigType::I32],
-);
 static DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_record_top_value_sample",
     &[SigType::Pointer, SigType::I64],
@@ -349,8 +345,6 @@ static DP_JIT_PUSH_HANDLED_EXCEPTION_IMPORT: ImportSpec = ImportSpec::new(
 );
 static DP_JIT_POP_HANDLED_EXCEPTION_IMPORT: ImportSpec =
     ImportSpec::new("dp_jit_pop_handled_exception", &[SigType::Pointer], &[]);
-static DP_JIT_IS_TRUE_SENTINEL_MESSAGE: &[u8] =
-    b"dp_jit_is_true returned error sentinel without setting an exception\0";
 static DP_JIT_VECTORCALL_BIND_DIRECT_ARGS_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_vectorcall_bind_direct_args",
     &[
@@ -377,16 +371,6 @@ static DP_JIT_VECTORCALL_FUNCTION_ENV_IMPORT: ImportSpec = ImportSpec::new(
 static DP_JIT_TRACE_DIRECT_ENTRY_ARGS_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_trace_direct_entry_args",
     &[SigType::I64, SigType::Pointer, SigType::Pointer],
-    &[],
-);
-static DP_JIT_TAKE_ERROR_BEFORE_NULL_CLEANUP_IMPORT: ImportSpec = ImportSpec::new(
-    "dp_jit_take_error_before_null_cleanup",
-    &[SigType::I64, SigType::I64],
-    &[SigType::Pointer],
-);
-static DP_JIT_RESTORE_ERROR_AFTER_NULL_CLEANUP_IMPORT: ImportSpec = ImportSpec::new(
-    "dp_jit_restore_error_after_null_cleanup",
-    &[SigType::Pointer],
     &[],
 );
 struct ModuleFuncImports {
@@ -1329,6 +1313,16 @@ fn emit_take_current_raised_exception(
     raised_exc
 }
 
+fn emit_take_current_raised_exception_or_trap(
+    fb: &mut FunctionBuilder<'_>,
+    ptr_ty: ir::Type,
+    thread_state_value: ir::Value,
+) -> ir::Value {
+    let raised_exc = emit_take_current_raised_exception(fb, ptr_ty, thread_state_value);
+    fb.ins().trapz(raised_exc, MISSING_PYTHON_EXCEPTION_TRAP);
+    raised_exc
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct FunctionRuntimeDataLayout {
     positional_default_count: usize,
@@ -1526,12 +1520,10 @@ struct JitEmitCtx<'mc> {
     py_call_object_ref: ir::FuncRef,
     py_call_with_kw_ref: ir::FuncRef,
     guard_method_type_version_ref: ir::FuncRef,
-    ensure_i32_sentinel_has_runtime_error_ref: ir::FuncRef,
     record_top_value_sample_ref: ir::FuncRef,
     tuple_new_ref: ir::FuncRef,
     tuple_set_item_ref: ir::FuncRef,
-    take_error_before_null_cleanup_ref: ir::FuncRef,
-    restore_error_after_null_cleanup_ref: ir::FuncRef,
+    set_raised_exception_ref: ir::FuncRef,
     stack_slots: StackSlots,
     exception_state_slots: ExceptionStateSlots,
     pop_handled_exception_ref: ir::FuncRef,
@@ -2656,15 +2648,7 @@ fn emit_take_error_before_local_null_cleanup(
     fb: &mut FunctionBuilder<'_>,
     ctx: &JitEmitCtx<'_>,
 ) -> ir::Value {
-    let function_id_value = fb
-        .ins()
-        .iconst(ctx.consts.i64_ty, ctx.function_id.packed() as i64);
-    let block_index_value = fb.ins().iconst(ctx.consts.i64_ty, -2);
-    let error_inst = fb.ins().call(
-        ctx.take_error_before_null_cleanup_ref,
-        &[function_id_value, block_index_value],
-    );
-    fb.inst_results(error_inst)[0]
+    emit_take_current_raised_exception_or_trap(fb, ctx.consts.ptr_ty, ctx.consts.thread_state_value)
 }
 
 fn emit_restore_error_after_local_null_cleanup(
@@ -2672,8 +2656,10 @@ fn emit_restore_error_after_local_null_cleanup(
     ctx: &JitEmitCtx<'_>,
     error_value: ir::Value,
 ) {
-    fb.ins()
-        .call(ctx.restore_error_after_null_cleanup_ref, &[error_value]);
+    fb.ins().call(
+        ctx.set_raised_exception_ref,
+        &[ctx.consts.thread_state_value, error_value],
+    );
 }
 
 fn emit_decref_owned_input_after_nullable_result(
@@ -4172,18 +4158,15 @@ fn emit_direct_call_resolved_with_arg_values(
         &[ir::BlockArg::Value(call_value)],
     );
     fb.switch_to_block(call_fail_block);
-    let target_function_id = fb.ins().iconst(
-        ctx.consts.i64_ty,
-        target_function.function_id.packed() as i64,
+    let error_value = emit_take_current_raised_exception_or_trap(
+        fb,
+        ctx.consts.ptr_ty,
+        ctx.consts.thread_state_value,
     );
-    let direct_call_block_index = fb.ins().iconst(ctx.consts.i64_ty, -4);
-    let error_inst = fb.ins().call(
-        ctx.take_error_before_null_cleanup_ref,
-        &[target_function_id, direct_call_block_index],
+    fb.ins().call(
+        ctx.set_raised_exception_ref,
+        &[ctx.consts.thread_state_value, error_value],
     );
-    let error_value = fb.inst_results(error_inst)[0];
-    fb.ins()
-        .call(ctx.restore_error_after_null_cleanup_ref, &[error_value]);
     fb.ins()
         .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
 
@@ -4278,19 +4261,16 @@ fn emit_direct_constructor_resolved_with_arg_values(
     );
 
     fb.switch_to_block(init_fail_block);
-    let target_function_id = fb.ins().iconst(
-        ctx.consts.i64_ty,
-        target_function.function_id.packed() as i64,
+    let error_value = emit_take_current_raised_exception_or_trap(
+        fb,
+        ctx.consts.ptr_ty,
+        ctx.consts.thread_state_value,
     );
-    let direct_init_block_index = fb.ins().iconst(ctx.consts.i64_ty, -5);
-    let error_inst = fb.ins().call(
-        ctx.take_error_before_null_cleanup_ref,
-        &[target_function_id, direct_init_block_index],
-    );
-    let error_value = fb.inst_results(error_inst)[0];
     fb.ins().call(ctx.decref_ref, &[allocated]);
-    fb.ins()
-        .call(ctx.restore_error_after_null_cleanup_ref, &[error_value]);
+    fb.ins().call(
+        ctx.set_raised_exception_ref,
+        &[ctx.consts.thread_state_value, error_value],
+    );
     fb.ins()
         .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
 
@@ -6592,19 +6572,6 @@ fn emit_truthy_from_owned(
     );
 
     fb.switch_to_block(truth_error_block);
-    let sentinel_message = fb.ins().iconst(
-        ctx.consts.ptr_ty,
-        DP_JIT_IS_TRUE_SENTINEL_MESSAGE.as_ptr() as i64,
-    );
-    fb.ins().call(
-        ctx.ensure_i32_sentinel_has_runtime_error_ref,
-        &[
-            ctx.consts.thread_state_value,
-            truth_value,
-            truth_error,
-            sentinel_message,
-        ],
-    );
     let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
     fb.ins().call(ctx.decref_ref, &[owned_value]);
     emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
@@ -8028,6 +7995,8 @@ fn is_clif_ident_byte(byte: u8) -> bool {
 pub(crate) const JIT_PYTHON_PERF_SYMBOL_KIND_DIRECT: &str = "d";
 pub(crate) const SOAC_RUNTIME_INCREF_SYMBOL: &str = "soac_runtime_incref";
 pub(crate) const SOAC_RUNTIME_DECREF_SYMBOL: &str = "soac_runtime_decref";
+pub(crate) const SOAC_RUNTIME_SET_RAISED_EXCEPTION_SYMBOL: &str =
+    "soac_runtime_set_raised_exception";
 pub(crate) const SOAC_RUNTIME_CALLEE_FUNCTION_ID_SYMBOL: &str = "soac_runtime_callee_function_id";
 pub(crate) const SOAC_RUNTIME_FUNCTION_DATA_BLOCK_SYMBOL: &str = "soac_runtime_function_data_block";
 pub(crate) const SOAC_RUNTIME_LOAD_GLOBAL_SYMBOL: &str = "soac_runtime_load_global";
@@ -8038,8 +8007,6 @@ pub(crate) const SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL: &str =
 pub(crate) const SOAC_RUNTIME_LOAD_FIELD_INDEXED_SYMBOL: &str = "soac_runtime_load_field_indexed";
 pub(crate) const SOAC_RUNTIME_STORE_FIELD_INDEXED_SYMBOL: &str = "soac_runtime_store_field_indexed";
 pub(crate) const SOAC_RUNTIME_GUARD_TYPE_VERSION_SYMBOL: &str = "soac_runtime_guard_type_version";
-pub(crate) const SOAC_RUNTIME_ENSURE_I32_SENTINEL_HAS_RUNTIME_ERROR_SYMBOL: &str =
-    "soac_runtime_ensure_i32_sentinel_has_runtime_error";
 
 pub(crate) fn jit_python_perf_symbol_name(kind: &str, qualname: &str) -> String {
     format!("py:{kind}:{qualname}")
@@ -8932,11 +8899,6 @@ fn build_cranelift_run_bb_specialized_function(
             &mut fb.func,
             &SOAC_RUNTIME_GUARD_TYPE_VERSION_IMPORT,
         );
-        let ensure_i32_sentinel_has_runtime_error_ref = func_imports.get_or_panic(
-            jit_module,
-            &mut fb.func,
-            &SOAC_RUNTIME_ENSURE_I32_SENTINEL_HAS_RUNTIME_ERROR_IMPORT,
-        );
         let record_top_value_sample_ref = func_imports.get_or_panic(
             jit_module,
             &mut fb.func,
@@ -8957,15 +8919,10 @@ fn build_cranelift_run_bb_specialized_function(
             func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_TUPLE_NEW_IMPORT);
         let tuple_set_item_ref =
             func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_TUPLE_SET_ITEM_IMPORT);
-        let take_error_before_null_cleanup_ref = func_imports.get_or_panic(
+        let set_raised_exception_ref = func_imports.get_or_panic(
             jit_module,
             &mut fb.func,
-            &DP_JIT_TAKE_ERROR_BEFORE_NULL_CLEANUP_IMPORT,
-        );
-        let restore_error_after_null_cleanup_ref = func_imports.get_or_panic(
-            jit_module,
-            &mut fb.func,
-            &DP_JIT_RESTORE_ERROR_AFTER_NULL_CLEANUP_IMPORT,
+            &SOAC_RUNTIME_SET_RAISED_EXCEPTION_IMPORT,
         );
         let fallthrough_abrupt_kind_const = stack_slots.has_try_abrupt_kind_name().then(|| {
             emit_owned_module_constant_from_parts(
@@ -9270,12 +9227,10 @@ fn build_cranelift_run_bb_specialized_function(
                 py_call_object_ref,
                 py_call_with_kw_ref,
                 guard_method_type_version_ref,
-                ensure_i32_sentinel_has_runtime_error_ref,
                 record_top_value_sample_ref,
                 tuple_new_ref,
                 tuple_set_item_ref,
-                take_error_before_null_cleanup_ref,
-                restore_error_after_null_cleanup_ref,
+                set_raised_exception_ref,
                 stack_slots: stack_slots.clone(),
                 exception_state_slots: exception_state_slots.clone(),
                 pop_handled_exception_ref,
@@ -9415,15 +9370,8 @@ fn build_cranelift_run_bb_specialized_function(
 
         for (index, block) in pre_cleanup_null_blocks.iter().enumerate() {
             fb.switch_to_block(*block);
-            let function_id_value = fb
-                .ins()
-                .iconst(i64_ty, function.function_id.packed() as i64);
-            let block_index_value = fb.ins().iconst(i64_ty, index as i64);
-            let error_inst = fb.ins().call(
-                take_error_before_null_cleanup_ref,
-                &[function_id_value, block_index_value],
-            );
-            let error_value = fb.inst_results(error_inst)[0];
+            let error_value =
+                emit_take_current_raised_exception_or_trap(&mut fb, ptr_ty, thread_state_value);
             fb.ins().jump(
                 cleanup_null_blocks[index],
                 &[ir::BlockArg::Value(error_value)],
@@ -9463,26 +9411,19 @@ fn build_cranelift_run_bb_specialized_function(
             }
             stack_slots.decref_all(&mut fb, ptr_ty, decref_ref);
             fb.ins()
-                .call(restore_error_after_null_cleanup_ref, &[error_value]);
+                .call(set_raised_exception_ref, &[thread_state_value, error_value]);
             let null_ptr = fb.ins().iconst(ptr_ty, 0);
             fb.ins().return_(&[null_ptr]);
         }
 
         fb.switch_to_block(step_null_block);
         let step_null_args = fb.block_params(step_null_block)[0];
-        let function_id_value = fb
-            .ins()
-            .iconst(i64_ty, function.function_id.packed() as i64);
-        let block_index_value = fb.ins().iconst(i64_ty, -1);
-        let error_inst = fb.ins().call(
-            take_error_before_null_cleanup_ref,
-            &[function_id_value, block_index_value],
-        );
-        let error_value = fb.inst_results(error_inst)[0];
+        let error_value =
+            emit_take_current_raised_exception_or_trap(&mut fb, ptr_ty, thread_state_value);
         stack_slots.decref_all(&mut fb, ptr_ty, decref_ref);
         fb.ins().call(decref_ref, &[step_null_args]);
         fb.ins()
-            .call(restore_error_after_null_cleanup_ref, &[error_value]);
+            .call(set_raised_exception_ref, &[thread_state_value, error_value]);
         let null_ptr = fb.ins().iconst(ptr_ty, 0);
         fb.ins().return_(&[null_ptr]);
 
@@ -9791,15 +9732,10 @@ fn define_shared_vectorcall_trampoline(
             &mut fb.func,
             &DP_JIT_TRACE_DIRECT_ENTRY_ARGS_IMPORT,
         );
-        let take_error_before_null_cleanup_ref = func_imports.get_or_panic(
+        let set_raised_exception_ref = func_imports.get_or_panic(
             jit_module,
             &mut fb.func,
-            &DP_JIT_TAKE_ERROR_BEFORE_NULL_CLEANUP_IMPORT,
-        );
-        let restore_error_after_null_cleanup_ref = func_imports.get_or_panic(
-            jit_module,
-            &mut fb.func,
-            &DP_JIT_RESTORE_ERROR_AFTER_NULL_CLEANUP_IMPORT,
+            &SOAC_RUNTIME_SET_RAISED_EXCEPTION_IMPORT,
         );
 
         let null_ptr = fb.ins().iconst(ptr_ty, 0);
@@ -9950,18 +9886,14 @@ fn define_shared_vectorcall_trampoline(
         fb.seal_block(direct_ok_block);
 
         fb.switch_to_block(direct_null_block);
-        let block_index_value = fb.ins().iconst(i64_ty, -3);
-        let error_inst = fb.ins().call(
-            take_error_before_null_cleanup_ref,
-            &[function_id_value, block_index_value],
-        );
-        let error_value = fb.inst_results(error_inst)[0];
+        let error_value =
+            emit_take_current_raised_exception_or_trap(&mut fb, ptr_ty, thread_state_val);
         for value in owned_args.iter().copied() {
             fb.ins().call(decref_ref, &[value]);
         }
         fb.ins().call(leave_recursive_ref, &[]);
         fb.ins()
-            .call(restore_error_after_null_cleanup_ref, &[error_value]);
+            .call(set_raised_exception_ref, &[thread_state_val, error_value]);
         fb.ins().return_(&[result]);
 
         fb.switch_to_block(direct_ok_block);
