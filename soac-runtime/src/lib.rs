@@ -1,6 +1,9 @@
 #![no_std]
 
-use core::ffi::c_void;
+use core::{
+    ffi::{c_char, c_void},
+    ptr,
+};
 
 #[repr(C)]
 #[cfg(all(target_pointer_width = "64", target_endian = "little"))]
@@ -196,12 +199,42 @@ struct RawPyMethodObject {
 }
 
 #[repr(C)]
+struct RawPyThreadState {
+    prev: *mut c_void,
+    next: *mut c_void,
+    interp: *mut c_void,
+    eval_breaker: usize,
+    status: u32,
+    holds_gil: i32,
+    gil_requested: i32,
+    whence: i32,
+    state: i32,
+    py_recursion_remaining: i32,
+    py_recursion_limit: i32,
+    recursion_headroom: i32,
+    tracing: i32,
+    what_event: i32,
+    current_frame: *mut c_void,
+    base_frame: *mut c_void,
+    last_profiled_frame: *mut c_void,
+    c_profilefunc: *mut c_void,
+    c_tracefunc: *mut c_void,
+    c_profileobj: *mut RawPyObject,
+    c_traceobj: *mut RawPyObject,
+    current_exception: *mut RawPyObject,
+}
+
+#[repr(C)]
 struct ClifFunctionData {
     runtime_objects: *mut c_void,
 }
 
 unsafe extern "C" {
     fn _Py_Dealloc(obj: *mut RawPyObject);
+    fn PyErr_GetRaisedException() -> *mut c_void;
+    fn PyErr_SetRaisedException(exc: *mut c_void);
+    fn PyThreadState_GetUnchecked() -> *mut RawPyThreadState;
+    fn soac_runtime_set_runtime_error_static(message: *const c_char);
     fn _PyDict_SetIndexedItem(dict: *mut c_void, index: isize, value: *mut c_void) -> i32;
     fn soac_runtime_load_global_slow(
         dict: *mut c_void,
@@ -223,6 +256,28 @@ const PY_TPFLAGS_MANAGED_DICT: usize = 1 << 4;
 const PY_TPFLAGS_INLINE_VALUES: usize = 1 << 2;
 
 const MANAGED_DICT_OFFSET: isize = -3 * (core::mem::size_of::<*mut c_void>() as isize);
+
+#[inline(always)]
+unsafe fn py_err_is_set_direct(tstate: *mut RawPyThreadState) -> bool {
+    debug_assert!(!tstate.is_null());
+    if tstate.is_null() {
+        return false;
+    }
+    !unsafe { (*tstate).current_exception }.is_null()
+}
+
+#[inline(always)]
+unsafe fn ensure_i32_sentinel_has_runtime_error(
+    tstate: *mut RawPyThreadState,
+    result: i32,
+    sentinel: i32,
+    message: *const c_char,
+) -> i32 {
+    if result == sentinel && !unsafe { py_err_is_set_direct(tstate) } {
+        unsafe { soac_runtime_set_runtime_error_static(message) };
+    }
+    result
+}
 
 #[inline(always)]
 unsafe fn dict_unicode_entries(keys: *mut RawPyDictKeysObject) -> *mut RawPyDictUnicodeEntry {
@@ -268,6 +323,47 @@ unsafe fn can_skip_decref(obj: *mut RawPyObject) -> bool {
     }
 }
 
+macro_rules! decref_raw {
+    ($obj:expr) => {{
+        let obj: *mut RawPyObject = $obj;
+        if !obj.is_null() && !unsafe { can_skip_decref(obj) } {
+            #[cfg(target_pointer_width = "64")]
+            unsafe {
+                let next_refcnt = (*obj).ob_refcnt.refcnt_and_flags.ob_refcnt.wrapping_sub(1);
+                (*obj).ob_refcnt.refcnt_and_flags.ob_refcnt = next_refcnt;
+                if next_refcnt == 0 {
+                    let saved_error = if py_err_is_set_direct(PyThreadState_GetUnchecked()) {
+                        PyErr_GetRaisedException()
+                    } else {
+                        ptr::null_mut()
+                    };
+                    _Py_Dealloc(obj);
+                    if !saved_error.is_null() {
+                        PyErr_SetRaisedException(saved_error);
+                    }
+                }
+            }
+
+            #[cfg(target_pointer_width = "32")]
+            unsafe {
+                let next_refcnt = (*obj).ob_refcnt.wrapping_sub(1);
+                (*obj).ob_refcnt = next_refcnt;
+                if next_refcnt == 0 {
+                    let saved_error = if py_err_is_set_direct(PyThreadState_GetUnchecked()) {
+                        PyErr_GetRaisedException()
+                    } else {
+                        ptr::null_mut()
+                    };
+                    _Py_Dealloc(obj);
+                    if !saved_error.is_null() {
+                        PyErr_SetRaisedException(saved_error);
+                    }
+                }
+            }
+        }
+    }};
+}
+
 #[inline(always)]
 unsafe fn incref_impl(obj: *mut RawPyObject) {
     if obj.is_null() || unsafe { can_skip_incref(obj) } {
@@ -286,29 +382,9 @@ unsafe fn incref_impl(obj: *mut RawPyObject) {
     }
 }
 
-#[inline(always)]
-unsafe fn decref_impl(obj: *mut RawPyObject) {
-    if obj.is_null() || unsafe { can_skip_decref(obj) } {
-        return;
-    }
-
-    #[cfg(target_pointer_width = "64")]
-    unsafe {
-        let next_refcnt = (*obj).ob_refcnt.refcnt_and_flags.ob_refcnt.wrapping_sub(1);
-        (*obj).ob_refcnt.refcnt_and_flags.ob_refcnt = next_refcnt;
-        if next_refcnt == 0 {
-            _Py_Dealloc(obj);
-        }
-    }
-
-    #[cfg(target_pointer_width = "32")]
-    unsafe {
-        let next_refcnt = (*obj).ob_refcnt.wrapping_sub(1);
-        (*obj).ob_refcnt = next_refcnt;
-        if next_refcnt == 0 {
-            _Py_Dealloc(obj);
-        }
-    }
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soac_runtime_decref(obj: *mut c_void) {
+    decref_raw!(obj.cast::<RawPyObject>());
 }
 
 #[unsafe(no_mangle)]
@@ -317,8 +393,20 @@ pub unsafe extern "C" fn soac_runtime_incref(obj: *mut c_void) {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soac_runtime_decref(obj: *mut c_void) {
-    unsafe { decref_impl(obj.cast::<RawPyObject>()) };
+pub unsafe extern "C" fn soac_runtime_ensure_i32_sentinel_has_runtime_error(
+    tstate: *mut c_void,
+    result: i32,
+    sentinel: i32,
+    message: *const c_char,
+) -> i32 {
+    unsafe {
+        ensure_i32_sentinel_has_runtime_error(
+            tstate.cast::<RawPyThreadState>(),
+            result,
+            sentinel,
+            message,
+        )
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -509,7 +597,7 @@ pub unsafe extern "C" fn soac_runtime_store_global_indexed(
     if !old_value.is_null()
         && old_value.cast::<c_void>() != (&raw mut _PyDict_IndexedValueTombstone)
     {
-        unsafe { decref_impl(old_value) };
+        decref_raw!(old_value);
     }
     unsafe { incref_impl(value) };
     value.cast::<c_void>()
@@ -677,7 +765,7 @@ pub unsafe extern "C" fn soac_runtime_store_field_indexed(
     unsafe { incref_impl(value) };
     unsafe { set_split_value(values, index, value) };
     if !old_value.is_null() {
-        unsafe { decref_impl(old_value) };
+        decref_raw!(old_value);
     }
     1
 }

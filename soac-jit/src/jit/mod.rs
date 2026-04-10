@@ -25,8 +25,8 @@ use soac_blockpy::block_py::{
     ResolvedName, StorageLayout, Visit, WithMeta, operation as blockpy_intrinsics,
 };
 use soac_blockpy::passes::{
-    CodegenModuleShape, FactStore, InstrResolved, ValueFacts, infer_module_value_facts,
-    validate_codegen_instr_ids,
+    CodegenModuleShape, FactStore, InstrResolved, RuntimeHelperId, ValueFacts,
+    infer_module_value_facts, validate_codegen_instr_ids,
 };
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -299,6 +299,11 @@ static SOAC_RUNTIME_GUARD_TYPE_VERSION_IMPORT: ImportSpec = ImportSpec::local(
     &[SigType::Pointer, SigType::Pointer, SigType::I64],
     &[SigType::I32],
 );
+static SOAC_RUNTIME_ENSURE_I32_SENTINEL_HAS_RUNTIME_ERROR_IMPORT: ImportSpec = ImportSpec::local(
+    SOAC_RUNTIME_ENSURE_I32_SENTINEL_HAS_RUNTIME_ERROR_SYMBOL,
+    &[SigType::Pointer, SigType::I32, SigType::I32, SigType::Pointer],
+    &[SigType::I32],
+);
 static DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_record_top_value_sample",
     &[SigType::Pointer, SigType::I64],
@@ -336,6 +341,8 @@ static DP_JIT_PUSH_HANDLED_EXCEPTION_IMPORT: ImportSpec = ImportSpec::new(
 );
 static DP_JIT_POP_HANDLED_EXCEPTION_IMPORT: ImportSpec =
     ImportSpec::new("dp_jit_pop_handled_exception", &[SigType::Pointer], &[]);
+static DP_JIT_IS_TRUE_SENTINEL_MESSAGE: &[u8] =
+    b"dp_jit_is_true returned error sentinel without setting an exception\0";
 static DP_JIT_VECTORCALL_BIND_DIRECT_ARGS_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_vectorcall_bind_direct_args",
     &[
@@ -353,6 +360,21 @@ static DP_JIT_VECTORCALL_FUNCTION_EXTRA_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_vectorcall_function_extra",
     &[SigType::Pointer],
     &[SigType::Pointer],
+);
+static DP_JIT_VECTORCALL_FUNCTION_ENV_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_vectorcall_function_env",
+    &[SigType::Pointer, SigType::Pointer],
+    &[SigType::Pointer],
+);
+static DP_JIT_TAKE_ERROR_BEFORE_NULL_CLEANUP_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_take_error_before_null_cleanup",
+    &[SigType::I64, SigType::I64],
+    &[SigType::Pointer],
+);
+static DP_JIT_RESTORE_ERROR_AFTER_NULL_CLEANUP_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_restore_error_after_null_cleanup",
+    &[SigType::Pointer],
+    &[],
 );
 struct ModuleFuncImports {
     func_ids_by_internal_id: Vec<Option<FuncId>>,
@@ -868,8 +890,8 @@ fn emit_codegen_located_name_load(
                     ctx.load_global_fast_ref,
                     &[globals_obj, name_obj, slot_index],
                 );
-                fb.ins().call(ctx.decref_ref, &[name_obj]);
-                fb.inst_results(value_inst)[0]
+                let value = fb.inst_results(value_inst)[0];
+                emit_decref_owned_input_after_nullable_result(fb, ctx, value, name_obj)
             };
             let value_ok_block = fb.create_block();
             fb.append_block_param(value_ok_block, ptr_ty);
@@ -893,8 +915,8 @@ fn emit_codegen_located_name_load(
                 ctx,
             );
             let value_inst = fb.ins().call(ctx.load_runtime_obj_ref, &[name_obj]);
-            fb.ins().call(ctx.decref_ref, &[name_obj]);
             let value = fb.inst_results(value_inst)[0];
+            let value = emit_decref_owned_input_after_nullable_result(fb, ctx, value, name_obj);
             let value_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, value, null_ptr);
             let value_ok_block = fb.create_block();
             fb.append_block_param(value_ok_block, ptr_ty);
@@ -974,7 +996,8 @@ fn emit_codegen_indexed_global_load(
         &[globals_obj, name_obj, slot_index],
     );
     let fallback_value = fb.inst_results(fallback_inst)[0];
-    fb.ins().call(ctx.decref_ref, &[name_obj]);
+    let fallback_value =
+        emit_decref_owned_input_after_nullable_result(fb, ctx, fallback_value, name_obj);
     fb.ins()
         .jump(result_block, &[ir::BlockArg::Value(fallback_value)]);
 
@@ -1021,6 +1044,18 @@ fn codegen_expr_helper_name<'a>(
         }),
         _ => None,
     }
+}
+
+fn codegen_expr_runtime_helper(
+    expr: &InstrCodegen,
+    ctx: &JitEmitCtx<'_>,
+) -> Option<RuntimeHelperId> {
+    ctx.value_facts_for_expr(expr)
+        .and_then(ValueFacts::runtime_helper)
+        .or_else(|| {
+            codegen_expr_helper_name(expr, ctx.module_constants)
+                .and_then(RuntimeHelperId::from_runtime_symbol)
+        })
 }
 
 fn load_function_env_obj(
@@ -1326,9 +1361,12 @@ struct JitEmitCtx<'mc> {
     py_call_object_ref: ir::FuncRef,
     py_call_with_kw_ref: ir::FuncRef,
     guard_method_type_version_ref: ir::FuncRef,
+    ensure_i32_sentinel_has_runtime_error_ref: ir::FuncRef,
     record_top_value_sample_ref: ir::FuncRef,
     tuple_new_ref: ir::FuncRef,
     tuple_set_item_ref: ir::FuncRef,
+    take_error_before_null_cleanup_ref: ir::FuncRef,
+    restore_error_after_null_cleanup_ref: ir::FuncRef,
     stack_slots: StackSlots,
     exception_state_slots: ExceptionStateSlots,
     pop_handled_exception_ref: ir::FuncRef,
@@ -2032,6 +2070,72 @@ fn step_null_block_args(ctx: &JitEmitCtx<'_>) -> Vec<ir::BlockArg> {
     block_arg_values(&ctx.consts.step_null_args)
 }
 
+fn emit_take_error_before_local_null_cleanup(
+    fb: &mut FunctionBuilder<'_>,
+    ctx: &JitEmitCtx<'_>,
+) -> ir::Value {
+    let function_id_value = fb
+        .ins()
+        .iconst(ctx.consts.i64_ty, ctx.function_id.packed() as i64);
+    let block_index_value = fb.ins().iconst(ctx.consts.i64_ty, -2);
+    let error_inst = fb.ins().call(
+        ctx.take_error_before_null_cleanup_ref,
+        &[function_id_value, block_index_value],
+    );
+    fb.inst_results(error_inst)[0]
+}
+
+fn emit_restore_error_after_local_null_cleanup(
+    fb: &mut FunctionBuilder<'_>,
+    ctx: &JitEmitCtx<'_>,
+    error_value: ir::Value,
+) {
+    fb.ins()
+        .call(ctx.restore_error_after_null_cleanup_ref, &[error_value]);
+}
+
+fn emit_decref_owned_input_after_nullable_result(
+    fb: &mut FunctionBuilder<'_>,
+    ctx: &JitEmitCtx<'_>,
+    result: ir::Value,
+    owned_input: ir::Value,
+) -> ir::Value {
+    emit_decref_owned_inputs_after_nullable_result(fb, ctx, result, &[owned_input])
+}
+
+fn emit_decref_owned_inputs_after_nullable_result(
+    fb: &mut FunctionBuilder<'_>,
+    ctx: &JitEmitCtx<'_>,
+    result: ir::Value,
+    owned_inputs: &[ir::Value],
+) -> ir::Value {
+    let null_ptr = fb.ins().iconst(ctx.consts.ptr_ty, 0);
+    let result_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, result, null_ptr);
+    let null_block = fb.create_block();
+    let ok_block = fb.create_block();
+    let done_block = fb.create_block();
+    fb.append_block_param(done_block, ctx.consts.ptr_ty);
+    fb.ins()
+        .brif(result_is_null, null_block, &[], ok_block, &[]);
+
+    fb.switch_to_block(null_block);
+    let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
+    for owned_input in owned_inputs {
+        fb.ins().call(ctx.decref_ref, &[*owned_input]);
+    }
+    emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
+    fb.ins().jump(done_block, &[ir::BlockArg::Value(result)]);
+
+    fb.switch_to_block(ok_block);
+    for owned_input in owned_inputs {
+        fb.ins().call(ctx.decref_ref, &[*owned_input]);
+    }
+    fb.ins().jump(done_block, &[ir::BlockArg::Value(result)]);
+
+    fb.switch_to_block(done_block);
+    fb.block_params(done_block)[0]
+}
+
 fn emit_owned_module_constant_from_parts(
     fb: &mut FunctionBuilder<'_>,
     constant_id: ModuleConstantId,
@@ -2530,7 +2634,9 @@ fn emit_pack_current_values_tuple(
 
     fb.switch_to_block(set_fail_block);
     let failed_tuple = fb.block_params(set_fail_block)[0];
+    let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
     fb.ins().call(ctx.decref_ref, &[failed_tuple]);
+    emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
     fb.ins()
         .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
 
@@ -2594,6 +2700,36 @@ fn emit_positional_vectorcall(
         ctx.py_vectorcall_ref,
         &[callable, args_ptr, nargsf, null_ptr],
     );
+    let call_value = fb.inst_results(call_inst)[0];
+    let call_is_null = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, call_value, null_ptr);
+    let call_null_block = fb.create_block();
+    let call_ok_block = fb.create_block();
+    fb.append_block_param(call_ok_block, ptr_ty);
+    fb.ins().brif(
+        call_is_null,
+        call_null_block,
+        &[],
+        call_ok_block,
+        &[ir::BlockArg::Value(call_value)],
+    );
+
+    fb.switch_to_block(call_null_block);
+    let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
+    for (value, borrowed_arg) in arg_values.iter().copied().zip(arg_borrowed.iter().copied()) {
+        if !borrowed_arg {
+            fb.ins().call(ctx.decref_ref, &[value]);
+        }
+    }
+    if !callable_is_borrowed {
+        fb.ins().call(ctx.decref_ref, &[callable]);
+    }
+    emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
+    fb.ins()
+        .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
+
+    fb.switch_to_block(call_ok_block);
     for (value, borrowed_arg) in arg_values.into_iter().zip(arg_borrowed.into_iter()) {
         if !borrowed_arg {
             fb.ins().call(ctx.decref_ref, &[value]);
@@ -2602,20 +2738,6 @@ fn emit_positional_vectorcall(
     if !callable_is_borrowed {
         fb.ins().call(ctx.decref_ref, &[callable]);
     }
-    let call_value = fb.inst_results(call_inst)[0];
-    let call_is_null = fb
-        .ins()
-        .icmp(ir::condcodes::IntCC::Equal, call_value, null_ptr);
-    let call_ok_block = fb.create_block();
-    fb.append_block_param(call_ok_block, ptr_ty);
-    fb.ins().brif(
-        call_is_null,
-        ctx.consts.step_null_block,
-        &step_null_block_args(ctx),
-        call_ok_block,
-        &[ir::BlockArg::Value(call_value)],
-    );
-    fb.switch_to_block(call_ok_block);
     fb.block_params(call_ok_block)[0]
 }
 
@@ -3408,15 +3530,31 @@ fn emit_direct_call_resolved_with_arg_values(
     let call_is_null = fb
         .ins()
         .icmp(ir::condcodes::IntCC::Equal, call_value, null_ptr);
+    let call_fail_block = fb.create_block();
     let call_ok_block = fb.create_block();
     fb.append_block_param(call_ok_block, ptr_ty);
     fb.ins().brif(
         call_is_null,
-        ctx.consts.step_null_block,
-        &step_null_block_args(ctx),
+        call_fail_block,
+        &[],
         call_ok_block,
         &[ir::BlockArg::Value(call_value)],
     );
+    fb.switch_to_block(call_fail_block);
+    let target_function_id = fb
+        .ins()
+        .iconst(ctx.consts.i64_ty, target_function.function_id.packed() as i64);
+    let direct_call_block_index = fb.ins().iconst(ctx.consts.i64_ty, -4);
+    let error_inst = fb.ins().call(
+        ctx.take_error_before_null_cleanup_ref,
+        &[target_function_id, direct_call_block_index],
+    );
+    let error_value = fb.inst_results(error_inst)[0];
+    fb.ins()
+        .call(ctx.restore_error_after_null_cleanup_ref, &[error_value]);
+    fb.ins()
+        .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
+
     fb.switch_to_block(call_ok_block);
     fb.block_params(call_ok_block)[0]
 }
@@ -3457,11 +3595,13 @@ fn emit_direct_constructor_resolved_with_arg_values(
     );
 
     fb.switch_to_block(alloc_failed);
+    let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
     for (value, borrowed_arg) in arg_values.iter().copied().zip(arg_borrowed.iter().copied()) {
         if !borrowed_arg {
             fb.ins().call(ctx.decref_ref, &[value]);
         }
     }
+    emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
     fb.ins()
         .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
 
@@ -3491,6 +3631,38 @@ fn emit_direct_constructor_resolved_with_arg_values(
         ctx,
         jit_module,
     );
+    let init_failed = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, init_result, null_ptr);
+    let init_fail_block = fb.create_block();
+    let init_ok_block = fb.create_block();
+    fb.append_block_param(init_ok_block, ptr_ty);
+    fb.ins().brif(
+        init_failed,
+        init_fail_block,
+        &[],
+        init_ok_block,
+        &[ir::BlockArg::Value(init_result)],
+    );
+
+    fb.switch_to_block(init_fail_block);
+    let target_function_id = fb
+        .ins()
+        .iconst(ctx.consts.i64_ty, target_function.function_id.packed() as i64);
+    let direct_init_block_index = fb.ins().iconst(ctx.consts.i64_ty, -5);
+    let error_inst = fb.ins().call(
+        ctx.take_error_before_null_cleanup_ref,
+        &[target_function_id, direct_init_block_index],
+    );
+    let error_value = fb.inst_results(error_inst)[0];
+    fb.ins().call(ctx.decref_ref, &[allocated]);
+    fb.ins()
+        .call(ctx.restore_error_after_null_cleanup_ref, &[error_value]);
+    fb.ins()
+        .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
+
+    fb.switch_to_block(init_ok_block);
+    let init_result = fb.block_params(init_ok_block)[0];
     let finish_inst = fb
         .ins()
         .call(ctx.finish_constructor_init_ref, &[allocated, init_result]);
@@ -3992,10 +4164,8 @@ fn emit_codegen_expr(
             if !has_unpack
                 && simple_keywords.is_empty()
                 && simple_args.is_empty()
-                && matches!(
-                    codegen_expr_helper_name(call.func.as_ref(), ctx.module_constants),
-                    Some("globals")
-                )
+                && codegen_expr_runtime_helper(call.func.as_ref(), ctx)
+                    == Some(RuntimeHelperId::Globals)
             {
                 fb.ins().call(incref_ref, &[block_const]);
                 return block_const;
@@ -4003,7 +4173,7 @@ fn emit_codegen_expr(
 
             if !has_unpack
                 && simple_keywords.is_empty()
-                && codegen_expr_helper_name(call.func.as_ref(), ctx.module_constants) == Some("str")
+                && codegen_expr_runtime_helper(call.func.as_ref(), ctx) == Some(RuntimeHelperId::Str)
                 && simple_args.len() == 1
             {
                 if let Some(value) = codegen_expr_const_string(simple_args[0], ctx.module_constants)
@@ -4020,10 +4190,8 @@ fn emit_codegen_expr(
             if !has_unpack
                 && simple_keywords.is_empty()
                 && simple_args.len() == 1
-                && matches!(
-                    codegen_expr_helper_name(call.func.as_ref(), ctx.module_constants),
-                    Some("next_or_sentinel")
-                )
+                && codegen_expr_runtime_helper(call.func.as_ref(), ctx)
+                    == Some(RuntimeHelperId::NextOrSentinel)
             {
                 let iterator_expr = simple_args[0];
                 let iterator_is_borrowed = codegen_expr_is_borrowable(
@@ -4054,11 +4222,17 @@ fn emit_codegen_expr(
                     &DP_JIT_NEXT_OR_SENTINEL_IMPORT,
                 );
                 let next_inst = fb.ins().call(next_or_sentinel_ref, &[iterator, sentinel]);
+                let mut owned_inputs = Vec::with_capacity(2);
                 if !iterator_is_borrowed {
-                    fb.ins().call(decref_ref, &[iterator]);
+                    owned_inputs.push(iterator);
                 }
-                fb.ins().call(decref_ref, &[sentinel]);
-                let next_value = fb.inst_results(next_inst)[0];
+                owned_inputs.push(sentinel);
+                let next_value = emit_decref_owned_inputs_after_nullable_result(
+                    fb,
+                    ctx,
+                    fb.inst_results(next_inst)[0],
+                    &owned_inputs,
+                );
                 let value_is_null =
                     fb.ins()
                         .icmp(ir::condcodes::IntCC::Equal, next_value, null_ptr);
@@ -4098,8 +4272,12 @@ fn emit_codegen_expr(
                     ctx,
                 );
                 let list_callable_inst = fb.ins().call(ctx.load_runtime_obj_ref, &[list_name_obj]);
-                fb.ins().call(decref_ref, &[list_name_obj]);
-                let list_callable = fb.inst_results(list_callable_inst)[0];
+                let list_callable = emit_decref_owned_input_after_nullable_result(
+                    fb,
+                    ctx,
+                    fb.inst_results(list_callable_inst)[0],
+                    list_name_obj,
+                );
                 let list_callable_is_null =
                     fb.ins()
                         .icmp(ir::condcodes::IntCC::Equal, list_callable, null_ptr);
@@ -4117,8 +4295,12 @@ fn emit_codegen_expr(
                 let args_list_inst = fb
                     .ins()
                     .call(py_call_object_ref, &[list_callable, empty_tuple_const]);
-                fb.ins().call(decref_ref, &[list_callable]);
-                let args_list = fb.inst_results(args_list_inst)[0];
+                let args_list = emit_decref_owned_input_after_nullable_result(
+                    fb,
+                    ctx,
+                    fb.inst_results(args_list_inst)[0],
+                    list_callable,
+                );
                 let args_list_is_null =
                     fb.ins()
                         .icmp(ir::condcodes::IntCC::Equal, args_list, null_ptr);
@@ -4143,8 +4325,12 @@ fn emit_codegen_expr(
                     );
                     let dict_callable_inst =
                         fb.ins().call(ctx.load_runtime_obj_ref, &[dict_name_obj]);
-                    fb.ins().call(decref_ref, &[dict_name_obj]);
-                    let dict_callable = fb.inst_results(dict_callable_inst)[0];
+                    let dict_callable = emit_decref_owned_input_after_nullable_result(
+                        fb,
+                        ctx,
+                        fb.inst_results(dict_callable_inst)[0],
+                        dict_name_obj,
+                    );
                     let dict_callable_is_null =
                         fb.ins()
                             .icmp(ir::condcodes::IntCC::Equal, dict_callable, null_ptr);
@@ -4162,8 +4348,12 @@ fn emit_codegen_expr(
                     let kwargs_inst = fb
                         .ins()
                         .call(py_call_object_ref, &[dict_callable, empty_tuple_const]);
-                    fb.ins().call(decref_ref, &[dict_callable]);
-                    let kwargs_obj = fb.inst_results(kwargs_inst)[0];
+                    let kwargs_obj = emit_decref_owned_input_after_nullable_result(
+                        fb,
+                        ctx,
+                        fb.inst_results(kwargs_inst)[0],
+                        dict_callable,
+                    );
                     let kwargs_is_null =
                         fb.ins()
                             .icmp(ir::condcodes::IntCC::Equal, kwargs_obj, null_ptr);
@@ -4200,8 +4390,12 @@ fn emit_codegen_expr(
                     let method_inst = fb
                         .ins()
                         .call(pyobject_getattr_ref, &[args_list, method_name_obj]);
-                    fb.ins().call(decref_ref, &[method_name_obj]);
-                    let method_obj = fb.inst_results(method_inst)[0];
+                    let method_obj = emit_decref_owned_input_after_nullable_result(
+                        fb,
+                        ctx,
+                        fb.inst_results(method_inst)[0],
+                        method_name_obj,
+                    );
                     let method_is_null =
                         fb.ins()
                             .icmp(ir::condcodes::IntCC::Equal, method_obj, null_ptr);
@@ -4236,11 +4430,17 @@ fn emit_codegen_expr(
                         py_call_ref,
                         &[method_obj, value_obj, null_ptr, null_ptr, null_ptr],
                     );
+                    let mut owned_inputs = Vec::with_capacity(2);
                     if !value_borrowed {
-                        fb.ins().call(decref_ref, &[value_obj]);
+                        owned_inputs.push(value_obj);
                     }
-                    fb.ins().call(decref_ref, &[method_obj]);
-                    let call_value = fb.inst_results(call_inst)[0];
+                    owned_inputs.push(method_obj);
+                    let call_value = emit_decref_owned_inputs_after_nullable_result(
+                        fb,
+                        ctx,
+                        fb.inst_results(call_inst)[0],
+                        &owned_inputs,
+                    );
                     let call_is_null =
                         fb.ins()
                             .icmp(ir::condcodes::IntCC::Equal, call_value, null_ptr);
@@ -4308,11 +4508,13 @@ fn emit_codegen_expr(
                             );
                             fb.switch_to_block(set_fail);
                             let failed_kwargs = fb.block_params(set_fail)[0];
+                            let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
                             fb.ins().call(decref_ref, &[failed_kwargs]);
                             fb.ins().call(decref_ref, &[args_list]);
                             if !callable_is_borrowed {
                                 fb.ins().call(decref_ref, &[callable]);
                             }
+                            emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
                             fb.ins().jump(step_null_block, &step_null_block_args(ctx));
                             fb.switch_to_block(set_ok);
                             fb.ins().call(decref_ref, &[set_value]);
@@ -4328,8 +4530,12 @@ fn emit_codegen_expr(
                             let update_inst = fb
                                 .ins()
                                 .call(pyobject_getattr_ref, &[kwargs_obj, update_name_obj]);
-                            fb.ins().call(decref_ref, &[update_name_obj]);
-                            let update_obj = fb.inst_results(update_inst)[0];
+                            let update_obj = emit_decref_owned_input_after_nullable_result(
+                                fb,
+                                ctx,
+                                fb.inst_results(update_inst)[0],
+                                update_name_obj,
+                            );
                             let update_is_null =
                                 fb.ins()
                                     .icmp(ir::condcodes::IntCC::Equal, update_obj, null_ptr);
@@ -4364,11 +4570,17 @@ fn emit_codegen_expr(
                                 py_call_ref,
                                 &[update_obj, value_obj, null_ptr, null_ptr, null_ptr],
                             );
+                            let mut owned_inputs = Vec::with_capacity(2);
                             if !value_borrowed {
-                                fb.ins().call(decref_ref, &[value_obj]);
+                                owned_inputs.push(value_obj);
                             }
-                            fb.ins().call(decref_ref, &[update_obj]);
-                            let call_value = fb.inst_results(call_inst)[0];
+                            owned_inputs.push(update_obj);
+                            let call_value = emit_decref_owned_inputs_after_nullable_result(
+                                fb,
+                                ctx,
+                                fb.inst_results(call_inst)[0],
+                                &owned_inputs,
+                            );
                             let call_is_null =
                                 fb.ins()
                                     .icmp(ir::condcodes::IntCC::Equal, call_value, null_ptr);
@@ -4396,8 +4608,12 @@ fn emit_codegen_expr(
                 );
                 let tuple_callable_inst =
                     fb.ins().call(ctx.load_runtime_obj_ref, &[tuple_name_obj]);
-                fb.ins().call(decref_ref, &[tuple_name_obj]);
-                let tuple_callable = fb.inst_results(tuple_callable_inst)[0];
+                let tuple_callable = emit_decref_owned_input_after_nullable_result(
+                    fb,
+                    ctx,
+                    fb.inst_results(tuple_callable_inst)[0],
+                    tuple_name_obj,
+                );
                 let tuple_callable_is_null =
                     fb.ins()
                         .icmp(ir::condcodes::IntCC::Equal, tuple_callable, null_ptr);
@@ -4416,9 +4632,12 @@ fn emit_codegen_expr(
                     py_call_ref,
                     &[tuple_callable, args_list, null_ptr, null_ptr, null_ptr],
                 );
-                fb.ins().call(decref_ref, &[tuple_callable]);
-                fb.ins().call(decref_ref, &[args_list]);
-                let call_args_tuple = fb.inst_results(tuple_call_inst)[0];
+                let call_args_tuple = emit_decref_owned_inputs_after_nullable_result(
+                    fb,
+                    ctx,
+                    fb.inst_results(tuple_call_inst)[0],
+                    &[tuple_callable, args_list],
+                );
                 let call_args_tuple_is_null =
                     fb.ins()
                         .icmp(ir::condcodes::IntCC::Equal, call_args_tuple, null_ptr);
@@ -4435,41 +4654,51 @@ fn emit_codegen_expr(
                 let call_args_tuple = fb.block_params(call_args_tuple_ok)[0];
 
                 let call_inst = if let Some(kwargs_obj) = kwargs_obj {
-                    let call_inst = fb.ins().call(
-                        py_call_with_kw_ref,
-                        &[callable, call_args_tuple, kwargs_obj],
-                    );
-                    fb.ins().call(decref_ref, &[kwargs_obj]);
-                    call_inst
+                    fb.ins()
+                        .call(py_call_with_kw_ref, &[callable, call_args_tuple, kwargs_obj])
                 } else {
                     fb.ins()
                         .call(py_call_object_ref, &[callable, call_args_tuple])
                 };
-                fb.ins().call(decref_ref, &[call_args_tuple]);
-                if !callable_is_borrowed {
-                    fb.ins().call(decref_ref, &[callable]);
-                }
                 let call_value = fb.inst_results(call_inst)[0];
                 let call_is_null = fb
                     .ins()
                     .icmp(ir::condcodes::IntCC::Equal, call_value, null_ptr);
+                let call_fail_block = fb.create_block();
                 let call_ok_block = fb.create_block();
                 fb.append_block_param(call_ok_block, ptr_ty);
                 fb.ins().brif(
                     call_is_null,
-                    step_null_block,
-                    &step_null_block_args(ctx),
+                    call_fail_block,
+                    &[],
                     call_ok_block,
                     &[ir::BlockArg::Value(call_value)],
                 );
+                fb.switch_to_block(call_fail_block);
+                let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
+                if let Some(kwargs_obj) = kwargs_obj {
+                    fb.ins().call(decref_ref, &[kwargs_obj]);
+                }
+                fb.ins().call(decref_ref, &[call_args_tuple]);
+                if !callable_is_borrowed {
+                    fb.ins().call(decref_ref, &[callable]);
+                }
+                emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
+                fb.ins().jump(step_null_block, &step_null_block_args(ctx));
+
                 fb.switch_to_block(call_ok_block);
+                if let Some(kwargs_obj) = kwargs_obj {
+                    fb.ins().call(decref_ref, &[kwargs_obj]);
+                }
+                fb.ins().call(decref_ref, &[call_args_tuple]);
+                if !callable_is_borrowed {
+                    fb.ins().call(decref_ref, &[callable]);
+                }
                 return fb.block_params(call_ok_block)[0];
             }
 
-            if let Some(func_name) =
-                codegen_expr_helper_name(call.func.as_ref(), ctx.module_constants)
-            {
-                if keywords.is_empty() && func_name == "str" && args.len() == 1 {
+            if let Some(helper_id) = codegen_expr_runtime_helper(call.func.as_ref(), ctx) {
+                if keywords.is_empty() && helper_id == RuntimeHelperId::Str && args.len() == 1 {
                     if let Some(value) = codegen_expr_const_string(args[0], ctx.module_constants) {
                         return emit_owned_module_constant(
                             fb,
@@ -4479,12 +4708,12 @@ fn emit_codegen_expr(
                         );
                     }
                 }
-                if keywords.is_empty() && args.is_empty() && func_name == "globals" {
+                if keywords.is_empty() && args.is_empty() && helper_id == RuntimeHelperId::Globals {
                     fb.ins().call(incref_ref, &[block_const]);
                     return block_const;
                 }
                 if !has_unpack && keywords.is_empty() {
-                    if func_name == "tuple_values" {
+                    if helper_id == RuntimeHelperId::TupleValues {
                         let mut arg_values: Vec<ir::Value> = Vec::with_capacity(args.len());
                         let mut borrowed_args: Vec<bool> = Vec::with_capacity(args.len());
                         for arg in &args {
@@ -4518,7 +4747,7 @@ fn emit_codegen_expr(
                         }
                         return tuple_value;
                     }
-                    if func_name == "load_deleted_name" && args.len() == 2 {
+                    if helper_id == RuntimeHelperId::LoadDeletedName && args.len() == 2 {
                         if let Some(name) = codegen_expr_const_string(args[0], ctx.module_constants)
                         {
                             let name_obj = emit_owned_module_constant(
@@ -4561,10 +4790,12 @@ fn emit_codegen_expr(
 
                             fb.switch_to_block(deleted_block);
                             fb.ins().call(raise_deleted_name_error_ref, &[name_obj]);
+                            let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
                             fb.ins().call(decref_ref, &[name_obj]);
                             if !value_borrowed {
                                 fb.ins().call(decref_ref, &[value_obj]);
                             }
+                            emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
                             fb.ins().jump(step_null_block, &step_null_block_args(ctx));
 
                             fb.switch_to_block(value_ok_block);
@@ -4576,7 +4807,7 @@ fn emit_codegen_expr(
                             return value_obj;
                         }
                     }
-                    if func_name == "cell_ref" && args.len() == 1 {
+                    if helper_id == RuntimeHelperId::CellRef && args.len() == 1 {
                         let cell_expr = &args[0];
                         let InstrCodegen::Load(cell_name) = cell_expr else {
                             panic!(
@@ -4742,13 +4973,19 @@ fn emit_codegen_expr(
                         func_imports,
                     );
                     let getattr_inst = fb.ins().call(ctx.pyobject_getattr_ref, &[receiver, attr]);
+                    let mut owned_inputs = Vec::with_capacity(2);
                     if !attr_is_borrowed {
-                        fb.ins().call(ctx.decref_ref, &[attr]);
+                        owned_inputs.push(attr);
                     }
                     if !receiver_is_borrowed {
-                        fb.ins().call(ctx.decref_ref, &[receiver]);
+                        owned_inputs.push(receiver);
                     }
-                    let callable = fb.inst_results(getattr_inst)[0];
+                    let callable = emit_decref_owned_inputs_after_nullable_result(
+                        fb,
+                        ctx,
+                        fb.inst_results(getattr_inst)[0],
+                        &owned_inputs,
+                    );
                     let callable_is_null =
                         fb.ins()
                             .icmp(ir::condcodes::IntCC::Equal, callable, null_ptr);
@@ -5119,10 +5356,13 @@ fn emit_codegen_expr(
                 );
                 fb.switch_to_block(set_fail_block);
                 let failed_tuple = fb.block_params(set_fail_block)[0];
+                let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
                 fb.ins().call(decref_ref, &[failed_tuple]);
+                emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
                 fb.ins().jump(step_null_block, &step_null_block_args(ctx));
                 fb.switch_to_block(set_ok_block);
             }
+            let mut call_kwargs_obj = None;
             let call_inst = if keywords.is_empty() {
                 fb.ins()
                     .call(py_call_object_ref, &[callable, call_args_tuple])
@@ -5133,8 +5373,12 @@ fn emit_codegen_expr(
                     ctx,
                 );
                 let dict_callable_inst = fb.ins().call(ctx.load_runtime_obj_ref, &[dict_name_obj]);
-                fb.ins().call(decref_ref, &[dict_name_obj]);
-                let dict_callable = fb.inst_results(dict_callable_inst)[0];
+                let dict_callable = emit_decref_owned_input_after_nullable_result(
+                    fb,
+                    ctx,
+                    fb.inst_results(dict_callable_inst)[0],
+                    dict_name_obj,
+                );
                 let dict_callable_is_null =
                     fb.ins()
                         .icmp(ir::condcodes::IntCC::Equal, dict_callable, null_ptr);
@@ -5171,9 +5415,12 @@ fn emit_codegen_expr(
                 let kwargs_inst = fb
                     .ins()
                     .call(py_call_object_ref, &[dict_callable, empty_tuple]);
-                fb.ins().call(decref_ref, &[empty_tuple]);
-                fb.ins().call(decref_ref, &[dict_callable]);
-                let kwargs_obj = fb.inst_results(kwargs_inst)[0];
+                let kwargs_obj = emit_decref_owned_inputs_after_nullable_result(
+                    fb,
+                    ctx,
+                    fb.inst_results(kwargs_inst)[0],
+                    &[empty_tuple, dict_callable],
+                );
                 let kwargs_is_null =
                     fb.ins()
                         .icmp(ir::condcodes::IntCC::Equal, kwargs_obj, null_ptr);
@@ -5235,11 +5482,13 @@ fn emit_codegen_expr(
                     );
                     fb.switch_to_block(set_fail);
                     let failed_kwargs = fb.block_params(set_fail)[0];
+                    let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
                     fb.ins().call(decref_ref, &[failed_kwargs]);
                     fb.ins().call(decref_ref, &[call_args_tuple]);
                     if !callable_is_borrowed {
                         fb.ins().call(decref_ref, &[callable]);
                     }
+                    emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
                     fb.ins().jump(step_null_block, &step_null_block_args(ctx));
                     fb.switch_to_block(set_ok);
                     fb.ins().call(decref_ref, &[set_value]);
@@ -5249,27 +5498,43 @@ fn emit_codegen_expr(
                     py_call_with_kw_ref,
                     &[callable, call_args_tuple, kwargs_obj],
                 );
-                fb.ins().call(decref_ref, &[kwargs_obj]);
+                call_kwargs_obj = Some(kwargs_obj);
                 call_inst
             };
-            fb.ins().call(decref_ref, &[call_args_tuple]);
-            if !callable_is_borrowed {
-                fb.ins().call(decref_ref, &[callable]);
-            }
             let call_value = fb.inst_results(call_inst)[0];
             let call_is_null = fb
                 .ins()
                 .icmp(ir::condcodes::IntCC::Equal, call_value, null_ptr);
+            let call_fail_block = fb.create_block();
             let call_ok_block = fb.create_block();
             fb.append_block_param(call_ok_block, ptr_ty);
             fb.ins().brif(
                 call_is_null,
-                step_null_block,
-                &step_null_block_args(ctx),
+                call_fail_block,
+                &[],
                 call_ok_block,
                 &[ir::BlockArg::Value(call_value)],
             );
+            fb.switch_to_block(call_fail_block);
+            let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
+            if let Some(kwargs_obj) = call_kwargs_obj {
+                fb.ins().call(decref_ref, &[kwargs_obj]);
+            }
+            fb.ins().call(decref_ref, &[call_args_tuple]);
+            if !callable_is_borrowed {
+                fb.ins().call(decref_ref, &[callable]);
+            }
+            emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
+            fb.ins().jump(step_null_block, &step_null_block_args(ctx));
+
             fb.switch_to_block(call_ok_block);
+            if let Some(kwargs_obj) = call_kwargs_obj {
+                fb.ins().call(decref_ref, &[kwargs_obj]);
+            }
+            fb.ins().call(decref_ref, &[call_args_tuple]);
+            if !callable_is_borrowed {
+                fb.ins().call(decref_ref, &[callable]);
+            }
             fb.block_params(call_ok_block)[0]
         }
     }
@@ -5553,30 +5818,49 @@ fn emit_truthy_from_owned(
     fb: &mut FunctionBuilder<'_>,
     owned_value: ir::Value,
     is_true_ref: ir::FuncRef,
-    decref_ref: ir::FuncRef,
-    step_null_block: ir::Block,
-    step_null_args: &[ir::Value],
-    i32_ty: ir::Type,
+    ctx: &JitEmitCtx<'_>,
 ) -> ir::Value {
     let truth_inst = fb.ins().call(is_true_ref, &[owned_value]);
     let truth_value = fb.inst_results(truth_inst)[0];
-    fb.ins().call(decref_ref, &[owned_value]);
-    let truth_error = fb.ins().iconst(i32_ty, -1);
+    let truth_error = fb.ins().iconst(ctx.consts.i32_ty, -1);
     let is_error = fb
         .ins()
         .icmp(ir::condcodes::IntCC::Equal, truth_value, truth_error);
+    let truth_error_block = fb.create_block();
     let truth_ok_block = fb.create_block();
-    fb.append_block_param(truth_ok_block, i32_ty);
+    fb.append_block_param(truth_ok_block, ctx.consts.i32_ty);
     fb.ins().brif(
         is_error,
-        step_null_block,
-        &block_arg_values(step_null_args),
+        truth_error_block,
+        &[],
         truth_ok_block,
         &[ir::BlockArg::Value(truth_value)],
     );
+
+    fb.switch_to_block(truth_error_block);
+    let sentinel_message = fb.ins().iconst(
+        ctx.consts.ptr_ty,
+        DP_JIT_IS_TRUE_SENTINEL_MESSAGE.as_ptr() as i64,
+    );
+    fb.ins().call(
+        ctx.ensure_i32_sentinel_has_runtime_error_ref,
+        &[
+            ctx.consts.thread_state_value,
+            truth_value,
+            truth_error,
+            sentinel_message,
+        ],
+    );
+    let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
+    fb.ins().call(ctx.decref_ref, &[owned_value]);
+    emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
+    fb.ins()
+        .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
+
     fb.switch_to_block(truth_ok_block);
     let truth_ok_value = fb.block_params(truth_ok_block)[0];
-    let zero_i32 = fb.ins().iconst(i32_ty, 0);
+    fb.ins().call(ctx.decref_ref, &[owned_value]);
+    let zero_i32 = fb.ins().iconst(ctx.consts.i32_ty, 0);
     fb.ins().icmp(
         ir::condcodes::IntCC::SignedGreaterThan,
         truth_ok_value,
@@ -5753,10 +6037,7 @@ fn emit_codegen_term(
                 fb,
                 test_value,
                 is_true_ref,
-                decref_ref,
-                emit_ctx.consts.step_null_block,
-                &emit_ctx.consts.step_null_args,
-                i32_ty,
+                emit_ctx,
             );
             if let Some(counter_id) = test_instr_id
                 .and_then(|instr_id| emit_ctx.branch_outcome_counter_ids.get(&instr_id).copied())
@@ -6693,6 +6974,8 @@ pub(crate) const SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL: &str =
 pub(crate) const SOAC_RUNTIME_LOAD_FIELD_INDEXED_SYMBOL: &str = "soac_runtime_load_field_indexed";
 pub(crate) const SOAC_RUNTIME_STORE_FIELD_INDEXED_SYMBOL: &str = "soac_runtime_store_field_indexed";
 pub(crate) const SOAC_RUNTIME_GUARD_TYPE_VERSION_SYMBOL: &str = "soac_runtime_guard_type_version";
+pub(crate) const SOAC_RUNTIME_ENSURE_I32_SENTINEL_HAS_RUNTIME_ERROR_SYMBOL: &str =
+    "soac_runtime_ensure_i32_sentinel_has_runtime_error";
 
 pub(crate) fn jit_python_perf_symbol_name(kind: &str, qualname: &str) -> String {
     format!("py:{kind}:{qualname}")
@@ -7371,9 +7654,11 @@ fn build_cranelift_run_bb_specialized_function(
             .iter()
             .map(|block| exc_dispatch_plan(function, block))
             .collect::<Vec<_>>();
+        let mut pre_cleanup_null_blocks = Vec::with_capacity(block_count);
         let mut cleanup_null_blocks = Vec::with_capacity(block_count);
         for _ in 0..block_count {
             exec_blocks.push(fb.create_block());
+            pre_cleanup_null_blocks.push(fb.create_block());
             cleanup_null_blocks.push(fb.create_block());
         }
         let step_null_block = fb.create_block();
@@ -7413,6 +7698,12 @@ fn build_cranelift_run_bb_specialized_function(
             );
         }
         for (index, block) in cleanup_null_blocks.iter().enumerate() {
+            register_block_display_annotation(
+                &mut block_annotations,
+                pre_cleanup_null_blocks[index],
+                format!("pre_cleanup_null::{}", function.blocks[index].label),
+                Vec::new(),
+            );
             register_block_display_annotation(
                 &mut block_annotations,
                 *block,
@@ -7562,6 +7853,11 @@ fn build_cranelift_run_bb_specialized_function(
             &mut fb.func,
             &SOAC_RUNTIME_GUARD_TYPE_VERSION_IMPORT,
         );
+        let ensure_i32_sentinel_has_runtime_error_ref = func_imports.get_or_panic(
+            jit_module,
+            &mut fb.func,
+            &SOAC_RUNTIME_ENSURE_I32_SENTINEL_HAS_RUNTIME_ERROR_IMPORT,
+        );
         let record_top_value_sample_ref = func_imports.get_or_panic(
             jit_module,
             &mut fb.func,
@@ -7582,6 +7878,16 @@ fn build_cranelift_run_bb_specialized_function(
             func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_TUPLE_NEW_IMPORT);
         let tuple_set_item_ref =
             func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_TUPLE_SET_ITEM_IMPORT);
+        let take_error_before_null_cleanup_ref = func_imports.get_or_panic(
+            jit_module,
+            &mut fb.func,
+            &DP_JIT_TAKE_ERROR_BEFORE_NULL_CLEANUP_IMPORT,
+        );
+        let restore_error_after_null_cleanup_ref = func_imports.get_or_panic(
+            jit_module,
+            &mut fb.func,
+            &DP_JIT_RESTORE_ERROR_AFTER_NULL_CLEANUP_IMPORT,
+        );
         let entry_deleted_const = emit_owned_module_constant_from_parts(
             &mut fb,
             deleted_constant_id,
@@ -7592,7 +7898,7 @@ fn build_cranelift_run_bb_specialized_function(
         exception_state_slots.initialize_all_to_null(&mut fb, ptr_ty);
 
         let null_ptr = fb.ins().iconst(ptr_ty, 0);
-        let entry_failure_block = cleanup_null_blocks[0];
+        let entry_failure_block = pre_cleanup_null_blocks[0];
         let entry_failure_args = Vec::new();
         assert_eq!(
             direct_entry_args.len(),
@@ -7815,7 +8121,7 @@ fn build_cranelift_run_bb_specialized_function(
                 ptr_ty,
             );
             let fast_step_null_block =
-                exception_dispatch_blocks[index].unwrap_or(cleanup_null_blocks[index]);
+                exception_dispatch_blocks[index].unwrap_or(pre_cleanup_null_blocks[index]);
             let fast_step_null_args = Vec::new();
             let emit_ctx = JitEmitCtx {
                 module,
@@ -7875,9 +8181,12 @@ fn build_cranelift_run_bb_specialized_function(
                 py_call_object_ref,
                 py_call_with_kw_ref,
                 guard_method_type_version_ref,
+                ensure_i32_sentinel_has_runtime_error_ref,
                 record_top_value_sample_ref,
                 tuple_new_ref,
                 tuple_set_item_ref,
+                take_error_before_null_cleanup_ref,
+                restore_error_after_null_cleanup_ref,
                 stack_slots: stack_slots.clone(),
                 exception_state_slots: exception_state_slots.clone(),
                 pop_handled_exception_ref,
@@ -7970,7 +8279,7 @@ fn build_cranelift_run_bb_specialized_function(
             fb.append_block_param(raised_exc_ok, ptr_ty);
             fb.ins().brif(
                 raised_exc_null,
-                cleanup_null_blocks[index],
+                pre_cleanup_null_blocks[index],
                 &dispatch_step_null_args,
                 raised_exc_ok,
                 &[ir::BlockArg::Value(raised_exc)],
@@ -8008,6 +8317,11 @@ fn build_cranelift_run_bb_specialized_function(
             }
             fb.ins()
                 .jump(exec_blocks[dispatch_plan.target_index], &target_jump_args);
+        }
+
+        for (index, block) in pre_cleanup_null_blocks.iter().enumerate() {
+            fb.switch_to_block(*block);
+            fb.ins().jump(cleanup_null_blocks[index], &[]);
         }
 
         for (index, block) in cleanup_null_blocks.iter().enumerate() {
@@ -8333,10 +8647,20 @@ fn define_shared_vectorcall_trampoline(
         let decref_ref = func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_DECREF_IMPORT);
         let thread_state_get_ref =
             func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_PY_THREAD_STATE_GET_IMPORT);
-        let direct_function_context_ref = func_imports.get_or_panic(
+        let function_env_ref = func_imports.get_or_panic(
             jit_module,
             &mut fb.func,
-            &DP_JIT_DIRECT_FUNCTION_CONTEXT_IMPORT,
+            &DP_JIT_VECTORCALL_FUNCTION_ENV_IMPORT,
+        );
+        let take_error_before_null_cleanup_ref = func_imports.get_or_panic(
+            jit_module,
+            &mut fb.func,
+            &DP_JIT_TAKE_ERROR_BEFORE_NULL_CLEANUP_IMPORT,
+        );
+        let restore_error_after_null_cleanup_ref = func_imports.get_or_panic(
+            jit_module,
+            &mut fb.func,
+            &DP_JIT_RESTORE_ERROR_AFTER_NULL_CLEANUP_IMPORT,
         );
 
         let null_ptr = fb.ins().iconst(ptr_ty, 0);
@@ -8361,7 +8685,9 @@ fn define_shared_vectorcall_trampoline(
         fb.ins().return_(&[null_ptr]);
 
         fb.switch_to_block(function_extra_ok);
-        let function_env_inst = fb.ins().call(direct_function_context_ref, &[callable_val]);
+        let function_env_inst = fb
+            .ins()
+            .call(function_env_ref, &[callable_val, function_extra_val]);
         let function_env_val = fb.inst_results(function_env_inst)[0];
         let function_env_missing =
             fb.ins()
@@ -8464,6 +8790,38 @@ fn define_shared_vectorcall_trampoline(
             .ins()
             .call_indirect(direct_sig_ref, callee_ptr, &call_args);
         let result = fb.inst_results(call_inst)[0];
+        let result_is_null = fb
+            .ins()
+            .icmp(ir::condcodes::IntCC::Equal, result, null_ptr);
+        let direct_null_block = fb.create_block();
+        let direct_ok_block = fb.create_block();
+        fb.ins().brif(
+            result_is_null,
+            direct_null_block,
+            &[],
+            direct_ok_block,
+            &[],
+        );
+        fb.seal_block(direct_null_block);
+        fb.seal_block(direct_ok_block);
+
+        fb.switch_to_block(direct_null_block);
+        let function_id_value = fb.ins().iconst(i64_ty, 0);
+        let block_index_value = fb.ins().iconst(i64_ty, -3);
+        let error_inst = fb.ins().call(
+            take_error_before_null_cleanup_ref,
+            &[function_id_value, block_index_value],
+        );
+        let error_value = fb.inst_results(error_inst)[0];
+        for value in owned_args.iter().copied() {
+            fb.ins().call(decref_ref, &[value]);
+        }
+        fb.ins().call(leave_recursive_ref, &[]);
+        fb.ins()
+            .call(restore_error_after_null_cleanup_ref, &[error_value]);
+        fb.ins().return_(&[result]);
+
+        fb.switch_to_block(direct_ok_block);
         for value in owned_args {
             fb.ins().call(decref_ref, &[value]);
         }

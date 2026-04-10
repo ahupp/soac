@@ -383,8 +383,10 @@ pub use trace::{
     instrument_bb_module_with_refcount_counters,
 };
 pub use value_facts::{
-    infer_module_value_facts, BoolSingletonFact, EnvFacts, FactStore, NoneFact, ProvenanceFact,
-    PyExactType, PyObjFacts, RefcountFact, RuntimeSingleton, TruthinessFact, TypeFact, ValueFacts,
+    infer_module_value_facts, BoolFacts, BoolSingletonFact, CallableFact, EnvFacts, FactStore,
+    I32Facts, I64Facts, NoneFact, ProvenanceFact, PyExactType, PyObjFacts, RefcountFact,
+    RuntimeHelperId, RuntimeHelperSignature, RuntimeSingleton, ThrowSpec, TruthinessFact, TypeFact,
+    ValueFacts,
 };
 
 pub(crate) use global_index::lower_global_index_in_resolved_module_default;

@@ -1,7 +1,7 @@
 use cranelift_jit::JITBuilder;
 use libc;
 use pyo3::ffi;
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void};
 use std::ptr;
 use std::sync::OnceLock;
 
@@ -34,6 +34,7 @@ unsafe extern "C" {
         type_obj: *mut ffi::PyTypeObject,
         nitems: ffi::Py_ssize_t,
     ) -> *mut ffi::PyObject;
+    fn PyThreadState_GetUnchecked() -> *mut ffi::PyThreadState;
     #[cfg(not(test))]
     fn PyDict_GetItemRef(
         dict: *mut ffi::PyObject,
@@ -100,6 +101,45 @@ unsafe fn object_type_name(obj: *mut ffi::PyObject) -> String {
 }
 
 #[cfg(not(test))]
+unsafe fn ensure_null_result_has_runtime_error(result: ObjPtr, where_name: &str) -> ObjPtr {
+    if result.is_null() && ffi::PyErr_Occurred().is_null() {
+        let message = format!("{where_name} returned NULL without setting an exception");
+        if let Ok(c_message) = std::ffi::CString::new(message) {
+            ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_message.as_ptr());
+        } else {
+            ffi::PyErr_SetString(
+                ffi::PyExc_RuntimeError,
+                b"JIT helper returned NULL without setting an exception\0".as_ptr() as *const i8,
+            );
+        }
+    }
+    result
+}
+
+#[cfg(not(test))]
+unsafe fn ensure_error_result_has_runtime_error(result: i32, where_name: &str) -> i32 {
+    if result != 0 && ffi::PyErr_Occurred().is_null() {
+        let message = format!("{where_name} returned an error without setting an exception");
+        if let Ok(c_message) = std::ffi::CString::new(message) {
+            ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_message.as_ptr());
+        } else {
+            ffi::PyErr_SetString(
+                ffi::PyExc_RuntimeError,
+                b"JIT helper returned an error without setting an exception\0".as_ptr()
+                    as *const i8,
+            );
+        }
+    }
+    result
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "C" fn soac_runtime_set_runtime_error_static(message: *const c_char) {
+    ffi::PyErr_SetString(ffi::PyExc_RuntimeError, message);
+}
+
+#[cfg(not(test))]
 unsafe fn raise_expected_cell(where_name: &str, obj: *mut ffi::PyObject) {
     let type_name = object_type_name(obj);
     let message = format!("{where_name} expected cell object, got {type_name}");
@@ -120,18 +160,22 @@ unsafe extern "C" fn py_call_positional_three_hook(
     arg2: ObjPtr,
     arg3: ObjPtr,
 ) -> ObjPtr {
-    ffi::PyObject_CallFunctionObjArgs(
+    let result = ffi::PyObject_CallFunctionObjArgs(
         callable as *mut ffi::PyObject,
         arg1 as *mut ffi::PyObject,
         arg2 as *mut ffi::PyObject,
         arg3 as *mut ffi::PyObject,
         ptr::null_mut::<ffi::PyObject>(),
-    ) as ObjPtr
+    ) as ObjPtr;
+    ensure_null_result_has_runtime_error(result, "dp_jit_py_call_positional_three")
 }
 
 #[cfg(not(test))]
 unsafe extern "C" fn py_call_object_hook(callable: ObjPtr, args: ObjPtr) -> ObjPtr {
-    ffi::PyObject_CallObject(callable as *mut ffi::PyObject, args as *mut ffi::PyObject) as ObjPtr
+    let result =
+        ffi::PyObject_CallObject(callable as *mut ffi::PyObject, args as *mut ffi::PyObject)
+            as ObjPtr;
+    ensure_null_result_has_runtime_error(result, "dp_jit_py_call_object")
 }
 
 #[cfg(not(test))]
@@ -141,12 +185,13 @@ unsafe extern "C" fn py_vectorcall_hook(
     nargsf: ObjPtr,
     kwnames: ObjPtr,
 ) -> ObjPtr {
-    ffi::PyObject_Vectorcall(
+    let result = ffi::PyObject_Vectorcall(
         callable as *mut ffi::PyObject,
         args as *const *mut ffi::PyObject,
         nargsf as usize,
         kwnames as *mut ffi::PyObject,
-    ) as ObjPtr
+    ) as ObjPtr;
+    ensure_null_result_has_runtime_error(result, "dp_jit_py_vectorcall")
 }
 
 #[cfg(not(test))]
@@ -268,11 +313,12 @@ unsafe extern "C" fn py_call_with_kw_hook(
     args: ObjPtr,
     kwargs: ObjPtr,
 ) -> ObjPtr {
-    ffi::PyObject_Call(
+    let result = ffi::PyObject_Call(
         callable as *mut ffi::PyObject,
         args as *mut ffi::PyObject,
         kwargs as *mut ffi::PyObject,
-    ) as ObjPtr
+    ) as ObjPtr;
+    ensure_null_result_has_runtime_error(result, "dp_jit_py_call_with_kw")
 }
 
 #[cfg(not(test))]
@@ -335,6 +381,14 @@ unsafe fn load_global_obj_impl(
         }
     }
     load_global_slow(globals_obj as *mut ffi::PyObject, name_obj) as ObjPtr
+}
+
+#[cfg(not(test))]
+unsafe fn ensure_global_load_error(result: ObjPtr, name_obj: *mut ffi::PyObject) -> ObjPtr {
+    if result.is_null() && ffi::PyErr_Occurred().is_null() {
+        raise_name_error_for_missing_name(name_obj);
+    }
+    result
 }
 
 #[cfg(not(test))]
@@ -459,7 +513,9 @@ unsafe extern "C" fn pyobject_getattr_hook(obj: ObjPtr, attr: ObjPtr) -> ObjPtr 
         );
         return ptr::null_mut();
     }
-    ffi::PyObject_GetAttr(obj as *mut ffi::PyObject, attr as *mut ffi::PyObject) as ObjPtr
+    let result =
+        ffi::PyObject_GetAttr(obj as *mut ffi::PyObject, attr as *mut ffi::PyObject) as ObjPtr;
+    ensure_null_result_has_runtime_error(result, "dp_jit_pyobject_getattr")
 }
 
 #[cfg(not(test))]
@@ -481,6 +537,7 @@ unsafe extern "C" fn pyobject_setattr_hook(obj: ObjPtr, attr: ObjPtr, value: Obj
         ffi::Py_INCREF(none);
         none as ObjPtr
     } else {
+        ensure_error_result_has_runtime_error(rc, "dp_jit_pyobject_setattr");
         ptr::null_mut()
     }
 }
@@ -548,7 +605,8 @@ unsafe extern "C" fn pyobject_getitem_hook(obj: ObjPtr, key: ObjPtr) -> ObjPtr {
     if let Some(index) = exact_list_index(obj, key) {
         return ffi::Py_NewRef(ffi::PyList_GET_ITEM(obj, index)) as ObjPtr;
     }
-    ffi::PyObject_GetItem(obj, key) as ObjPtr
+    let result = ffi::PyObject_GetItem(obj, key) as ObjPtr;
+    ensure_null_result_has_runtime_error(result, "dp_jit_pyobject_getitem")
 }
 
 #[cfg(not(test))]
@@ -571,7 +629,12 @@ unsafe extern "C" fn pyobject_setitem_hook(obj: ObjPtr, key: ObjPtr, value: ObjP
     }
 
     let rc = ffi::PyObject_SetItem(obj, key, value);
-    if rc == 0 { new_none() } else { ptr::null_mut() }
+    if rc == 0 {
+        new_none()
+    } else {
+        ensure_error_result_has_runtime_error(rc, "dp_jit_pyobject_setitem");
+        ptr::null_mut()
+    }
 }
 
 #[cfg(not(test))]
@@ -589,6 +652,7 @@ unsafe extern "C" fn pyobject_delitem_hook(obj: ObjPtr, key: ObjPtr) -> ObjPtr {
         ffi::Py_INCREF(none);
         none as ObjPtr
     } else {
+        ensure_error_result_has_runtime_error(rc, "dp_jit_pyobject_delitem");
         ptr::null_mut()
     }
 }
@@ -821,7 +885,9 @@ unsafe extern "C" fn load_global_obj_hook(
     name: ObjPtr,
     slot_index: i64,
 ) -> ObjPtr {
-    load_global_obj_impl(globals_obj, name as *mut ffi::PyObject, slot_index)
+    let name_obj = name as *mut ffi::PyObject;
+    let result = load_global_obj_impl(globals_obj, name_obj, slot_index);
+    ensure_global_load_error(result, name_obj)
 }
 
 #[cfg(not(test))]
@@ -833,7 +899,8 @@ unsafe extern "C" fn tuple_new_hook(size: i64) -> ObjPtr {
         );
         return ptr::null_mut();
     }
-    ffi::PyTuple_New(size as ffi::Py_ssize_t) as ObjPtr
+    let result = ffi::PyTuple_New(size as ffi::Py_ssize_t) as ObjPtr;
+    ensure_null_result_has_runtime_error(result, "dp_jit_tuple_new")
 }
 
 #[cfg(not(test))]
@@ -845,16 +912,21 @@ unsafe extern "C" fn tuple_set_item_hook(tuple_obj: ObjPtr, index: i64, value: O
         );
         return -1;
     }
-    ffi::PyTuple_SetItem(
+    let result = ffi::PyTuple_SetItem(
         tuple_obj as *mut ffi::PyObject,
         index as ffi::Py_ssize_t,
         value as *mut ffi::PyObject,
-    )
+    );
+    ensure_error_result_has_runtime_error(result, "dp_jit_tuple_set_item")
 }
 
 #[cfg(not(test))]
 unsafe extern "C" fn is_true_hook(value: ObjPtr) -> i32 {
     if value.is_null() {
+        ffi::PyErr_SetString(
+            ffi::PyExc_RuntimeError,
+            b"invalid null value for dp_jit_is_true\0".as_ptr() as *const i8,
+        );
         return -1;
     }
     ffi::PyObject_IsTrue(value as *mut ffi::PyObject)
@@ -1230,7 +1302,8 @@ pub unsafe extern "C" fn soac_runtime_load_global_slow(
 ) -> ObjPtr {
     let name_obj = name as *mut ffi::PyObject;
     let slot_index = guarded_indexed_global_slot(globals_obj, name_obj, expected_index);
-    load_global_obj_hook(globals_obj, name, slot_index)
+    let result = load_global_obj_impl(globals_obj, name_obj, slot_index);
+    ensure_global_load_error(result, name_obj)
 }
 
 #[cfg(not(test))]
@@ -1798,6 +1871,14 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
         std::ptr::addr_of_mut!(PyMethod_Type) as *const u8,
     );
     builder.symbol(
+        "PyThreadState_GetUnchecked",
+        PyThreadState_GetUnchecked as *const u8,
+    );
+    builder.symbol(
+        "soac_runtime_set_runtime_error_static",
+        soac_runtime_set_runtime_error_static as *const u8,
+    );
+    builder.symbol(
         "dp_jit_py_call_positional_three",
         chosen_helper_symbol(
             dp_jit_py_call_positional_three as *const u8,
@@ -1870,6 +1951,18 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol(
         "dp_jit_vectorcall_function_extra",
         crate::vectorcall_function_extra as *const u8,
+    );
+    builder.symbol(
+        "dp_jit_vectorcall_function_env",
+        crate::vectorcall_function_env as *const u8,
+    );
+    builder.symbol(
+        "dp_jit_take_error_before_null_cleanup",
+        crate::take_error_before_jit_null_cleanup as *const u8,
+    );
+    builder.symbol(
+        "dp_jit_restore_error_after_null_cleanup",
+        crate::restore_error_after_jit_null_cleanup as *const u8,
     );
     builder.symbol(
         "dp_jit_py_thread_state_get",

@@ -64,6 +64,74 @@ pub enum ProvenanceFact {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum RuntimeHelperId {
+    Globals,
+    Str,
+    TupleValues,
+    LoadDeletedName,
+    CellRef,
+    NextOrSentinel,
+    TupleFromIter,
+    MakeFunction,
+    CreateClass,
+    Import,
+    ImportAttr,
+    ClassLookupGlobal,
+    ClassLookupCell,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ThrowSpec {
+    Never,
+    ThrowsOnNullPyObj,
+    ThrowsOnI32Sentinel(i32),
+    ThrowsOnI64Sentinel(i64),
+    ThrowsOnNonZeroI32,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct RuntimeHelperSignature {
+    pub helper: RuntimeHelperId,
+    pub result: ValueFacts,
+    pub throws: ThrowSpec,
+}
+
+impl RuntimeHelperId {
+    pub fn from_runtime_symbol(name: &str) -> Option<Self> {
+        match name.as_bytes() {
+            b"globals" => Some(Self::Globals),
+            b"str" => Some(Self::Str),
+            b"tuple_values" => Some(Self::TupleValues),
+            b"load_deleted_name" => Some(Self::LoadDeletedName),
+            b"cell_ref" => Some(Self::CellRef),
+            b"next_or_sentinel" => Some(Self::NextOrSentinel),
+            b"tuple_from_iter" => Some(Self::TupleFromIter),
+            b"make_function" => Some(Self::MakeFunction),
+            b"create_class" => Some(Self::CreateClass),
+            b"import_" => Some(Self::Import),
+            b"import_attr" => Some(Self::ImportAttr),
+            b"class_lookup_global" => Some(Self::ClassLookupGlobal),
+            b"class_lookup_cell" => Some(Self::ClassLookupCell),
+            _ => None,
+        }
+    }
+
+    pub const fn signature(self) -> RuntimeHelperSignature {
+        RuntimeHelperSignature {
+            helper: self,
+            result: runtime_helper_result(self),
+            throws: runtime_helper_throw_spec(self),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum CallableFact {
+    Unknown,
+    RuntimeHelper(RuntimeHelperId),
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct PyObjFacts {
     pub ty: TypeFact,
     pub truthiness: TruthinessFact,
@@ -71,6 +139,7 @@ pub struct PyObjFacts {
     pub bool_singleton: BoolSingletonFact,
     pub refcount: RefcountFact,
     pub provenance: ProvenanceFact,
+    pub callable: CallableFact,
 }
 
 impl PyObjFacts {
@@ -82,6 +151,7 @@ impl PyObjFacts {
             bool_singleton: BoolSingletonFact::Unknown,
             refcount: RefcountFact::Unknown,
             provenance: ProvenanceFact::Unknown,
+            callable: CallableFact::Unknown,
         }
     }
 
@@ -93,6 +163,7 @@ impl PyObjFacts {
             bool_singleton: BoolSingletonFact::Unknown,
             refcount: RefcountFact::Immortal,
             provenance: ProvenanceFact::RuntimeSingleton(RuntimeSingleton::None),
+            callable: CallableFact::Unknown,
         }
     }
 
@@ -116,6 +187,7 @@ impl PyObjFacts {
             } else {
                 RuntimeSingleton::False
             }),
+            callable: CallableFact::Unknown,
         }
     }
 
@@ -127,6 +199,7 @@ impl PyObjFacts {
             bool_singleton: BoolSingletonFact::Unknown,
             refcount: RefcountFact::Unknown,
             provenance: ProvenanceFact::Unknown,
+            callable: CallableFact::Unknown,
         }
     }
 
@@ -141,6 +214,7 @@ impl PyObjFacts {
             bool_singleton: BoolSingletonFact::Unknown,
             refcount: RefcountFact::Unknown,
             provenance: ProvenanceFact::Unknown,
+            callable: CallableFact::Unknown,
         }
     }
 
@@ -152,12 +226,25 @@ impl PyObjFacts {
             bool_singleton: BoolSingletonFact::Unknown,
             refcount: RefcountFact::Unknown,
             provenance: ProvenanceFact::ModuleConstant(index),
+            callable: CallableFact::Unknown,
         }
     }
 
     pub const fn with_module_constant(mut self, index: u32) -> Self {
         self.provenance = ProvenanceFact::ModuleConstant(index);
         self
+    }
+
+    pub const fn runtime_helper(helper: RuntimeHelperId) -> Self {
+        Self {
+            ty: TypeFact::Unknown,
+            truthiness: TruthinessFact::AlwaysTrue,
+            none: NoneFact::IsNotNone,
+            bool_singleton: BoolSingletonFact::Unknown,
+            refcount: RefcountFact::Unknown,
+            provenance: ProvenanceFact::Unknown,
+            callable: CallableFact::RuntimeHelper(helper),
+        }
     }
 
     pub const fn known_not_none() -> Self {
@@ -168,6 +255,7 @@ impl PyObjFacts {
             bool_singleton: BoolSingletonFact::Unknown,
             refcount: RefcountFact::Unknown,
             provenance: ProvenanceFact::Unknown,
+            callable: CallableFact::Unknown,
         }
     }
 
@@ -212,6 +300,7 @@ impl PyObjFacts {
             && self.none == NoneFact::Unknown
             && self.bool_singleton == BoolSingletonFact::Unknown
             && self.refcount == RefcountFact::Unknown
+            && self.callable == CallableFact::Unknown
     }
 }
 
@@ -227,13 +316,85 @@ const fn none_fact_for_exact_type(exact_type: PyExactType) -> NoneFact {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct I32Facts {
+    pub sentinel: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct I64Facts {
+    pub sentinel: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct BoolFacts;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ValueFacts {
     PyObj(PyObjFacts),
+    I32(I32Facts),
+    I64(I64Facts),
+    Bool(BoolFacts),
 }
 
 impl ValueFacts {
     pub const fn unknown_pyobj() -> Self {
         Self::PyObj(PyObjFacts::unknown())
+    }
+
+    pub const fn as_pyobj(self) -> Option<PyObjFacts> {
+        match self {
+            Self::PyObj(py_facts) => Some(py_facts),
+            Self::I32(_) | Self::I64(_) | Self::Bool(_) => None,
+        }
+    }
+
+    pub const fn runtime_helper(self) -> Option<RuntimeHelperId> {
+        match self {
+            Self::PyObj(PyObjFacts {
+                callable: CallableFact::RuntimeHelper(helper),
+                ..
+            }) => Some(helper),
+            Self::PyObj(_)
+            | Self::I32(_)
+            | Self::I64(_)
+            | Self::Bool(_) => None,
+        }
+    }
+}
+
+const fn runtime_helper_result(helper: RuntimeHelperId) -> ValueFacts {
+    match helper {
+        RuntimeHelperId::Str => ValueFacts::PyObj(PyObjFacts::exact_type(PyExactType::Str)),
+        RuntimeHelperId::Globals
+        | RuntimeHelperId::TupleValues
+        | RuntimeHelperId::LoadDeletedName
+        | RuntimeHelperId::CellRef
+        | RuntimeHelperId::NextOrSentinel
+        | RuntimeHelperId::TupleFromIter
+        | RuntimeHelperId::MakeFunction
+        | RuntimeHelperId::CreateClass
+        | RuntimeHelperId::Import
+        | RuntimeHelperId::ImportAttr
+        | RuntimeHelperId::ClassLookupGlobal
+        | RuntimeHelperId::ClassLookupCell => ValueFacts::PyObj(PyObjFacts::known_not_none()),
+    }
+}
+
+const fn runtime_helper_throw_spec(helper: RuntimeHelperId) -> ThrowSpec {
+    match helper {
+        RuntimeHelperId::Globals | RuntimeHelperId::TupleValues | RuntimeHelperId::CellRef => {
+            ThrowSpec::Never
+        }
+        RuntimeHelperId::Str
+        | RuntimeHelperId::LoadDeletedName
+        | RuntimeHelperId::NextOrSentinel
+        | RuntimeHelperId::TupleFromIter
+        | RuntimeHelperId::MakeFunction
+        | RuntimeHelperId::CreateClass
+        | RuntimeHelperId::Import
+        | RuntimeHelperId::ImportAttr
+        | RuntimeHelperId::ClassLookupGlobal
+        | RuntimeHelperId::ClassLookupCell => ThrowSpec::ThrowsOnNullPyObj,
     }
 }
 
@@ -319,6 +480,21 @@ impl FunctionFactInferer<'_> {
                         .unwrap_or_else(ValueFacts::unknown_pyobj)
                 })
             }
+            InstrCodegen::Call(op) => {
+                if op.keywords.is_empty()
+                    && op
+                        .args
+                        .iter()
+                        .all(|arg| matches!(arg, crate::block_py::CallArgPositional::Positional(_)))
+                {
+                    self.infer_expr_facts(op.func.as_ref())
+                        .runtime_helper()
+                        .map(|helper| helper.signature().result)
+                        .unwrap_or_else(ValueFacts::unknown_pyobj)
+                } else {
+                    ValueFacts::unknown_pyobj()
+                }
+            }
             _ => ValueFacts::unknown_pyobj(),
         }
     }
@@ -349,8 +525,10 @@ impl FunctionFactInferer<'_> {
                 let Some(location) = op.name.local_location() else {
                     return;
                 };
-                let ValueFacts::PyObj(py_facts) = self.infer_expr_facts_in_env(&op.value, env);
-                env.set_local_pyobj_fact(location, py_facts);
+                match self.infer_expr_facts_in_env(&op.value, env).as_pyobj() {
+                    Some(py_facts) => env.set_local_pyobj_fact(location, py_facts),
+                    None => env.remove_local_pyobj_fact(location),
+                }
             }
             InstrCodegen::Del(op) => {
                 if let Some(location) = op.name.local_location() {
@@ -507,6 +685,7 @@ fn infer_local_is_none_comparison(
 fn expr_is_none(expr: &InstrCodegen, inferer: &FunctionFactInferer<'_>) -> bool {
     match inferer.infer_expr_facts(expr) {
         ValueFacts::PyObj(py_facts) => py_facts.is_none(),
+        ValueFacts::I32(_) | ValueFacts::I64(_) | ValueFacts::Bool(_) => false,
     }
 }
 
@@ -524,6 +703,10 @@ fn infer_runtime_name_load_facts(name: &impl NameLike) -> Option<ValueFacts> {
         Some(ValueFacts::PyObj(PyObjFacts::bool_singleton(true)))
     } else if name.is_runtime_symbol("FALSE") {
         Some(ValueFacts::PyObj(PyObjFacts::bool_singleton(false)))
+    } else if name.is_runtime_name() {
+        RuntimeHelperId::from_runtime_symbol(name.id_str())
+            .map(PyObjFacts::runtime_helper)
+            .map(ValueFacts::PyObj)
     } else {
         None
     }
@@ -535,6 +718,7 @@ fn module_constant_load_fact(index: u32, module_constant_facts: &[ValueFacts]) -
         .copied()
         .map(|facts| match facts {
             ValueFacts::PyObj(py_facts) => ValueFacts::PyObj(py_facts.with_module_constant(index)),
+            ValueFacts::I32(_) | ValueFacts::I64(_) | ValueFacts::Bool(_) => facts,
         })
         .unwrap_or_else(|| ValueFacts::PyObj(PyObjFacts::module_constant(index)))
 }
@@ -601,8 +785,8 @@ pub fn infer_module_value_facts(module: &BlockPyModule<CodegenModuleShape>) -> F
 #[cfg(test)]
 mod test {
     use super::{
-        infer_module_value_facts, BoolSingletonFact, EnvFacts, PyExactType, PyObjFacts,
-        RefcountFact, ValueFacts,
+        infer_module_value_facts, BoolSingletonFact, CallableFact, EnvFacts, PyExactType,
+        PyObjFacts, RefcountFact, RuntimeHelperId, ThrowSpec, ValueFacts,
     };
     use crate::block_py::{BlockTerm, ChildVisitable, HasSemanticInstrId, InstrCodegen, Visit};
     use crate::lower_python_to_blockpy_for_testing;
@@ -772,6 +956,43 @@ def f(x, flag):
 
         let py_facts = returned_py_facts("0.5");
         assert_eq!(py_facts.is_truthy(), Some(true));
+    }
+
+    #[test]
+    fn runtime_helper_facts_mark_helpers_as_callable_py_objects() {
+        let py_facts = PyObjFacts::runtime_helper(RuntimeHelperId::TupleValues);
+        assert!(py_facts.is_known_not_none());
+        assert_eq!(py_facts.is_truthy(), Some(true));
+        assert_eq!(
+            py_facts.callable,
+            CallableFact::RuntimeHelper(RuntimeHelperId::TupleValues)
+        );
+    }
+
+    #[test]
+    fn runtime_helper_ids_are_resolved_from_runtime_symbols() {
+        assert_eq!(
+            RuntimeHelperId::from_runtime_symbol("next_or_sentinel"),
+            Some(RuntimeHelperId::NextOrSentinel)
+        );
+        assert_eq!(RuntimeHelperId::from_runtime_symbol("not_a_helper"), None);
+    }
+
+    #[test]
+    fn runtime_helper_signatures_declare_result_and_throw_policy() {
+        let signature = RuntimeHelperId::NextOrSentinel.signature();
+        assert_eq!(signature.throws, ThrowSpec::ThrowsOnNullPyObj);
+        let ValueFacts::PyObj(result_facts) = signature.result else {
+            panic!("next_or_sentinel should return a Python object");
+        };
+        assert!(result_facts.is_known_not_none());
+
+        let signature = RuntimeHelperId::Str.signature();
+        assert_eq!(signature.throws, ThrowSpec::ThrowsOnNullPyObj);
+        let ValueFacts::PyObj(result_facts) = signature.result else {
+            panic!("str should return a Python object");
+        };
+        assert!(result_facts.is_exact_type(PyExactType::Str));
     }
 
     #[test]

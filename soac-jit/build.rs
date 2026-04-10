@@ -121,6 +121,10 @@ fn build_runtime_clif(
     runtime_src: &Path,
     clif_out_dir: &Path,
 ) -> Result<BuildOutput, Box<dyn Error>> {
+    let clif_dir = clif_output_dir(clif_out_dir);
+    if clif_dir.exists() {
+        fs::remove_dir_all(&clif_dir)?;
+    }
     let output = Command::new("rustup")
         .arg("run")
         .arg("nightly")

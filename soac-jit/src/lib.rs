@@ -50,6 +50,8 @@ unsafe extern "C" {
     fn PyFunction_GetDefaults(function: *mut ffi::PyObject) -> *mut ffi::PyObject;
     fn PyFunction_GetKwDefaults(function: *mut ffi::PyObject) -> *mut ffi::PyObject;
     fn PyFunction_GetClosure(function: *mut ffi::PyObject) -> *mut ffi::PyObject;
+    fn PyErr_GetRaisedException() -> *mut ffi::PyObject;
+    fn PyErr_SetRaisedException(exc: *mut ffi::PyObject);
     fn PyType_SetSoacMetadata(
         type_obj: *mut ffi::PyObject,
         soac_function_id: u64,
@@ -651,6 +653,36 @@ unsafe fn make_clif_function_data(
         compiled_vectorcall_entry: None,
     });
     Ok(Box::into_raw(py_function_extra) as *mut c_void)
+}
+
+pub(crate) unsafe extern "C" fn take_error_before_jit_null_cleanup(
+    function_id: i64,
+    block_index: i64,
+) -> *mut c_void {
+    if unsafe { ffi::PyErr_Occurred() }.is_null() {
+        let msg = format!(
+            "JIT function returned NULL without setting an exception: \
+             function_id={function_id} block_index={block_index}"
+        );
+        if let Ok(c_msg) = CString::new(msg) {
+            unsafe { ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr()) };
+        } else {
+            unsafe {
+                ffi::PyErr_SetString(
+                    ffi::PyExc_RuntimeError,
+                    b"JIT function returned NULL without setting an exception\0".as_ptr()
+                        as *const i8,
+                )
+            };
+        }
+    }
+    unsafe { PyErr_GetRaisedException() as *mut c_void }
+}
+
+pub(crate) unsafe extern "C" fn restore_error_after_jit_null_cleanup(error: *mut c_void) {
+    if !error.is_null() {
+        unsafe { PyErr_SetRaisedException(error as *mut ffi::PyObject) };
+    }
 }
 
 unsafe fn py_function_jit_extra(
@@ -1726,6 +1758,47 @@ pub(crate) unsafe extern "C" fn vectorcall_function_extra(callable: *mut c_void)
                 ffi::PyErr_SetString(
                     ffi::PyExc_RuntimeError,
                     b"panic in vectorcall_function_extra\0".as_ptr() as *const i8,
+                );
+            }
+            ptr::null_mut()
+        }
+    }
+}
+
+pub(crate) unsafe extern "C" fn vectorcall_function_env(
+    callable: *mut c_void,
+    data_ptr: *mut c_void,
+) -> *mut c_void {
+    match panic::catch_unwind(AssertUnwindSafe(|| {
+        if callable.is_null()
+            || data_ptr.is_null()
+            || ffi::PyFunction_Check(callable as *mut ffi::PyObject) == 0
+        {
+            ffi::PyErr_SetString(
+                ffi::PyExc_RuntimeError,
+                b"invalid vectorcall function env lookup\0".as_ptr() as *const i8,
+            );
+            return ptr::null_mut();
+        }
+        let py = Python::assume_attached();
+        let data = &mut *(data_ptr as *mut PyFunctionJitExtra);
+        match ensure_clif_vectorcall_compiled(py, callable as *mut ffi::PyObject, data) {
+            Ok(()) => data.function_env_ptr,
+            Err(()) => ptr::null_mut(),
+        }
+    })) {
+        Ok(value) => value,
+        Err(payload) => {
+            let message = format!(
+                "panic in vectorcall_function_env: {}",
+                panic_payload_to_string(payload)
+            );
+            if let Ok(c_msg) = CString::new(message) {
+                ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
+            } else {
+                ffi::PyErr_SetString(
+                    ffi::PyExc_RuntimeError,
+                    b"panic in vectorcall_function_env\0".as_ptr() as *const i8,
                 );
             }
             ptr::null_mut()
