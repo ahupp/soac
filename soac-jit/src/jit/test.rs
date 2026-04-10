@@ -1,10 +1,11 @@
 use super::*;
 use soac_blockpy::block_py::{
     BinOp, BinOpKind, BlockLabel, BlockParamRole, BlockPyFunction, BlockPyModule, BlockTerm, Call,
-    CallArgPositional, CellLocation, ClosureInit, ClosureSlot, CodegenBlock, CounterSite, Del,
-    DelItem, FunctionId, FunctionName, InstrCodegen, InstrResolved, Literal, LiteralValue, Load,
-    Meta, ModuleNameGen, NameLocation, NumberLiteral, NumberLiteralValue, Param, ParamKind,
-    ParamSpec, ResolvedName, StorageLayout, Store, StringLiteral, WithMeta,
+    CallArgKeyword, CallArgPositional, CallDirect, CellLocation, ClosureInit, ClosureSlot,
+    CodegenBlock, CounterSite, Del, DelItem, FunctionId, FunctionName, InstrCodegen, InstrResolved,
+    Literal, LiteralValue, Load, Meta, ModuleNameGen, NameLocation, NumberLiteral,
+    NumberLiteralValue, Param, ParamKind, ParamSpec, ResolvedName, StorageLayout, Store,
+    StringLiteral, WithMeta,
 };
 use soac_blockpy::passes::{
     CodegenModuleShape, instrument_bb_module_with_block_entry_counters,
@@ -188,17 +189,37 @@ mod tests {
 
     fn test_function() -> BlockPyFunction<CodegenModuleShape> {
         let module_name_gen = ModuleNameGen::new(0);
+        test_function_in_module(&module_name_gen, "test")
+    }
+
+    fn test_function_in_module(
+        module_name_gen: &ModuleNameGen,
+        name: &str,
+    ) -> BlockPyFunction<CodegenModuleShape> {
         let name_gen = module_name_gen.next_function_name_gen();
         BlockPyFunction {
             function_id: name_gen.function_id(),
             name_gen,
-            names: FunctionName::new("test", "test", "test", "test"),
+            names: FunctionName::new(name, name, name, name),
             kind: soac_blockpy::block_py::FunctionKind::Function,
             params: ParamSpec::default(),
             blocks: vec![],
             doc: None,
             storage_layout: None,
             scope: Default::default(),
+        }
+    }
+
+    fn test_module(
+        module_name_gen: ModuleNameGen,
+        callable_defs: Vec<BlockPyFunction<CodegenModuleShape>>,
+    ) -> BlockPyModule<CodegenModuleShape> {
+        BlockPyModule {
+            module_name_gen,
+            global_names: Vec::new(),
+            callable_defs,
+            module_constants: Vec::new(),
+            counter_defs: Vec::new(),
         }
     }
 
@@ -271,6 +292,89 @@ mod tests {
             .declare_direct_function(&second)
             .expect("colliding function id with different shape should redeclare");
         assert_ne!(first_decl.symbol, second_decl.symbol);
+    }
+
+    #[test]
+    fn process_jit_batch_collection_resolves_cross_module_targets_from_compile_session() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        let old_pythonhome = std::env::var_os("PYTHONHOME");
+        let old_pythonpath = std::env::var_os("PYTHONPATH");
+        let python_home = vendored_python_home();
+        let ext_staging_dir = ensure_test_extension_staging_dir();
+        let pythonpath = std::env::join_paths([
+            python_home.join("Lib"),
+            vendored_python_build_lib_dir(),
+            repo_root().join("soac_py").join("src"),
+            ext_staging_dir,
+        ])
+        .expect("test PYTHONPATH should join cleanly");
+        unsafe {
+            std::env::set_var("PYTHONHOME", &python_home);
+            std::env::set_var("PYTHONPATH", pythonpath);
+        }
+        Python::initialize();
+        let result = Python::attach(|py| {
+            let session = std::sync::Arc::new(crate::session::CompileSession::new());
+            let caller_module_name_gen = ModuleNameGen::new(91);
+            let callee_module_name_gen = ModuleNameGen::new(92);
+            let callee = test_function_in_module(&callee_module_name_gen, "callee");
+            let caller = test_function_in_module(&caller_module_name_gen, "caller");
+            let direct_call = InstrCodegen::CallDirect(CallDirect::new(
+                none_expr(),
+                callee.function_id,
+                Vec::<CallArgPositional<InstrCodegen>>::new(),
+                Vec::<CallArgKeyword<InstrCodegen>>::new(),
+            ));
+            let caller = with_single_test_block(caller, vec![direct_call], ret_term(none_expr()));
+            let caller_state = crate::module_type::build_shared_state_for_testing(
+                py,
+                test_module(caller_module_name_gen, vec![caller.clone()]),
+                "caller_test",
+                "",
+            )
+            .expect("caller shared state should build");
+            let callee_state = crate::module_type::build_shared_state_for_testing(
+                py,
+                test_module(callee_module_name_gen, vec![callee.clone()]),
+                "callee_test",
+                "",
+            )
+            .expect("callee shared state should build");
+            session
+                .retain_shared_module_state(std::sync::Arc::clone(&caller_state))
+                .expect("caller state should be retained");
+            session
+                .retain_shared_module_state(callee_state)
+                .expect("callee state should be retained");
+
+            let batch =
+                collect_process_jit_batch_functions(&session, &caller, Some(caller_state.as_ref()))
+                    .expect("cross-module process JIT batch should collect");
+            let function_ids = batch
+                .iter()
+                .map(|batch_function| batch_function.function.function_id)
+                .collect::<Vec<_>>();
+            assert_eq!(function_ids, vec![caller.function_id, callee.function_id]);
+            assert_eq!(
+                batch[1]
+                    .source
+                    .shared_state()
+                    .expect("cross-module callee should carry its owning shared state")
+                    .module_name,
+                "callee_test"
+            );
+        });
+        unsafe {
+            match old_pythonhome {
+                Some(value) => std::env::set_var("PYTHONHOME", value),
+                None => std::env::remove_var("PYTHONHOME"),
+            }
+            match old_pythonpath {
+                Some(value) => std::env::set_var("PYTHONPATH", value),
+                None => std::env::remove_var("PYTHONPATH"),
+            }
+        }
+        result
     }
 
     fn render_test_jit_function_with_module_constants(

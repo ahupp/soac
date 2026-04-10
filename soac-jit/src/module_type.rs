@@ -111,12 +111,9 @@ impl SharedModuleState {
         if function_id.module_id() == self.module_id() {
             return Ok(None);
         }
-        let Some(shared_state) = crate::session::CompileSession::process()
-            .shared_module_state_for_function_id(function_id)?
-        else {
-            return Ok(None);
-        };
-        Ok(shared_state.lookup_function(function_id).cloned())
+        Ok(crate::session::CompileSession::process()
+            .lookup_shared_function(function_id)?
+            .map(|(_shared_state, function)| function))
     }
 
     pub fn lookup_original_code(&self, function_id: FunctionId) -> Option<&Py<PyAny>> {
@@ -196,8 +193,8 @@ impl SharedModuleState {
             return Ok(None);
         }
         if function_id != FunctionId::global() && function_id.module_id() != self.module_id() {
-            let Some(shared_state) = crate::session::CompileSession::process()
-                .shared_module_state_for_function_id(function_id)?
+            let Some((shared_state, _function)) =
+                crate::session::CompileSession::process().lookup_shared_function(function_id)?
             else {
                 return Ok(None);
             };

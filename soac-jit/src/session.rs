@@ -1,6 +1,7 @@
 use crate::jit::ProcessJitEngine;
 use crate::module_type::SharedModuleState;
-use soac_blockpy::block_py::{FunctionId, ModuleNameGen};
+use soac_blockpy::block_py::{BlockPyFunction, FunctionId, ModuleNameGen};
+use soac_blockpy::passes::CodegenModuleShape;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -103,6 +104,22 @@ impl CompileSession {
             .lock()
             .map_err(|_| "compile session shared module state lock poisoned".to_string())?
             .for_function_id(function_id))
+    }
+
+    pub(crate) fn lookup_shared_function(
+        &self,
+        function_id: FunctionId,
+    ) -> Result<Option<(Arc<SharedModuleState>, BlockPyFunction<CodegenModuleShape>)>, String> {
+        if function_id == FunctionId::global() {
+            return Ok(None);
+        }
+        let Some(shared_state) = self.shared_module_state_for_function_id(function_id)? else {
+            return Ok(None);
+        };
+        let Some(function) = shared_state.lookup_function(function_id).cloned() else {
+            return Ok(None);
+        };
+        Ok(Some((shared_state, function)))
     }
 
     #[cfg(test)]

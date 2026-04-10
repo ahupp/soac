@@ -507,6 +507,27 @@ struct DefinedJitFunction {
     artifact: DefinedFunctionArtifact,
 }
 
+struct ProcessJitBatchFunction<'a> {
+    function: BlockPyFunction<CodegenModuleShape>,
+    source: ProcessJitBatchFunctionSource<'a>,
+}
+
+enum ProcessJitBatchFunctionSource<'a> {
+    ExplicitInputs,
+    BorrowedSharedState(&'a crate::module_type::SharedModuleState),
+    OwnedSharedState(Arc<crate::module_type::SharedModuleState>),
+}
+
+impl ProcessJitBatchFunctionSource<'_> {
+    fn shared_state(&self) -> Option<&crate::module_type::SharedModuleState> {
+        match self {
+            Self::ExplicitInputs => None,
+            Self::BorrowedSharedState(shared_state) => Some(shared_state),
+            Self::OwnedSharedState(shared_state) => Some(shared_state.as_ref()),
+        }
+    }
+}
+
 pub(crate) struct ProcessJitEngine {
     state: Mutex<ProcessJitState>,
     vectorcall_trampolines: Mutex<HashMap<usize, VectorcallEntryFn>>,
@@ -5594,39 +5615,70 @@ impl Drop for ProcessJitCompileGuard {
     }
 }
 
-fn collect_process_jit_batch_functions(
+fn collect_process_jit_batch_functions<'a>(
+    session: &Arc<crate::session::CompileSession>,
     root: &BlockPyFunction<CodegenModuleShape>,
-    direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
-) -> Result<Vec<BlockPyFunction<CodegenModuleShape>>, String> {
-    let Some(shared_state) = direct_call_resolver else {
-        return Ok(vec![root.clone()]);
-    };
+    direct_call_resolver: Option<&'a crate::module_type::SharedModuleState>,
+) -> Result<Vec<ProcessJitBatchFunction<'a>>, String> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     let mut queue = VecDeque::new();
     seen.insert(root.function_id);
-    queue.push_back(root.clone());
-    while let Some(function) = queue.pop_front() {
-        let mut direct_targets = collect_call_direct_targets(&function);
-        for targets in load_call_target_specializations(
-            shared_state.module_name.as_str(),
-            function.function_id,
-        )?
-        .values()
-        {
-            direct_targets.extend(targets.iter().copied());
+    queue.push_back(ProcessJitBatchFunction {
+        function: root.clone(),
+        source: direct_call_resolver
+            .map(ProcessJitBatchFunctionSource::BorrowedSharedState)
+            .unwrap_or(ProcessJitBatchFunctionSource::ExplicitInputs),
+    });
+    while let Some(batch_function) = queue.pop_front() {
+        let mut direct_targets = collect_call_direct_targets(&batch_function.function);
+        if let Some(shared_state) = batch_function.source.shared_state() {
+            for targets in load_call_target_specializations(
+                shared_state.module_name.as_str(),
+                batch_function.function.function_id,
+            )?
+            .values()
+            {
+                direct_targets.extend(targets.iter().copied());
+            }
         }
         for function_id in direct_targets {
             if !seen.insert(function_id) {
                 continue;
             }
-            if let Some(function) = shared_state.lookup_function(function_id) {
-                queue.push_back(function.clone());
+            if let Some(function) =
+                resolve_process_jit_batch_function(session, direct_call_resolver, function_id)?
+            {
+                queue.push_back(function);
             }
         }
-        out.push(function);
+        out.push(batch_function);
     }
     Ok(out)
+}
+
+fn resolve_process_jit_batch_function<'a>(
+    session: &Arc<crate::session::CompileSession>,
+    direct_call_resolver: Option<&'a crate::module_type::SharedModuleState>,
+    function_id: FunctionId,
+) -> Result<Option<ProcessJitBatchFunction<'a>>, String> {
+    if function_id == FunctionId::global() {
+        return Ok(None);
+    }
+    if let Some(shared_state) = direct_call_resolver
+        && let Some(function) = shared_state.lookup_function(function_id).cloned()
+    {
+        return Ok(Some(ProcessJitBatchFunction {
+            function,
+            source: ProcessJitBatchFunctionSource::BorrowedSharedState(shared_state),
+        }));
+    }
+    Ok(session
+        .lookup_shared_function(function_id)?
+        .map(|(shared_state, function)| ProcessJitBatchFunction {
+            function,
+            source: ProcessJitBatchFunctionSource::OwnedSharedState(shared_state),
+        }))
 }
 
 impl ProcessJitEngine {
@@ -5672,7 +5724,9 @@ impl ProcessJitEngine {
         counter_ptrs: &[*mut u64],
         direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
     ) -> Result<DirectFunctionCompileResult, String> {
-        let batch_functions = collect_process_jit_batch_functions(function, direct_call_resolver)?;
+        let batch_functions =
+            collect_process_jit_batch_functions(session, function, direct_call_resolver)?;
+        let root_function_id = function.function_id;
         let mut state = self
             .state
             .lock()
@@ -5686,34 +5740,66 @@ impl ProcessJitEngine {
         let _guard = ProcessJitCompileGuard::enter();
         let mut predeclared = HashMap::new();
         let mut functions_to_define = Vec::new();
-        for function in &batch_functions {
+        for batch_function in &batch_functions {
+            let function = &batch_function.function;
             let declared = state.declare_direct_function(function)?;
             if !state.is_direct_function_ready(function.function_id) {
-                functions_to_define.push(function);
+                functions_to_define.push(batch_function);
             }
             predeclared.insert(function.function_id, declared);
         }
 
         let mut defined_functions = Vec::with_capacity(functions_to_define.len());
-        for function in functions_to_define {
+        for batch_function in functions_to_define {
+            let function = &batch_function.function;
             let placeholder_blocks;
-            let function_blocks = if function.function_id == batch_functions[0].function_id {
+            let function_blocks = if function.function_id == root_function_id {
                 blocks
             } else {
                 placeholder_blocks =
                     vec![std::ptr::null_mut::<std::ffi::c_void>(); function.blocks.len()];
                 placeholder_blocks.as_slice()
             };
+            let owned_module_constant_ptrs;
+            let owned_counter_ptrs;
+            let (
+                function_module,
+                function_module_constants,
+                function_counter_defs,
+                function_module_constant_ptrs,
+                function_counter_ptrs,
+                function_direct_call_resolver,
+            ) = if let Some(shared_state) = batch_function.source.shared_state() {
+                owned_module_constant_ptrs = shared_state.module_constant_ptrs();
+                owned_counter_ptrs = shared_state.counter_ptrs();
+                (
+                    &shared_state.lowered_module,
+                    &shared_state.codegen_constants,
+                    shared_state.lowered_module.counter_defs.as_slice(),
+                    owned_module_constant_ptrs.as_slice(),
+                    owned_counter_ptrs.as_slice(),
+                    Some(shared_state),
+                )
+            } else {
+                (
+                    module,
+                    module_constants,
+                    counter_defs,
+                    module_constant_ptrs,
+                    counter_ptrs,
+                    None,
+                )
+            };
             let built = build_cranelift_run_bb_specialized_function(
                 &mut state.jit_module,
                 function_blocks,
-                module,
+                function_module,
                 function,
-                module_constants,
-                counter_defs,
-                module_constant_ptrs,
-                counter_ptrs,
-                direct_call_resolver,
+                function_module_constants,
+                function_counter_defs,
+                function_module_constant_ptrs,
+                function_counter_ptrs,
+                function_direct_call_resolver,
                 None,
                 Some(&predeclared),
             )
@@ -6674,6 +6760,19 @@ fn build_cranelift_run_bb_specialized_function(
     let mut direct_call_target_functions = HashMap::new();
     for function_id in direct_call_targets {
         if direct_call_functions.contains_key(&function_id) {
+            if !module
+                .callable_defs
+                .iter()
+                .any(|function| function.function_id == function_id)
+                && let Some(target_function) = direct_call_resolver
+                    .map(|shared_state| {
+                        shared_state.lookup_direct_call_target_function(function_id)
+                    })
+                    .transpose()?
+                    .flatten()
+            {
+                direct_call_target_functions.insert(function_id, target_function);
+            }
             direct_call_code_ptrs.insert(function_id, 1usize as ObjPtr);
             continue;
         }
