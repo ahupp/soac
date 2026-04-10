@@ -5900,19 +5900,19 @@ fn emit_truthy_from_owned(
 fn emit_codegen_ops(
     fb: &mut FunctionBuilder<'_>,
     ops: &[InstrCodegen],
-    local_names: &mut Vec<String>,
-    local_values: &mut Vec<ir::Value>,
+    local_env: &mut LocalEnv,
     _stack_slots: &StackSlots,
     emit_ctx: &JitEmitCtx<'_>,
     jit_module: &mut JITModule,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<(), String> {
+    let mut local_parts = local_env.to_legacy_parts();
     for expr in ops {
         let value = emit_codegen_expr(
             fb,
             expr,
-            local_names,
-            local_values,
+            &mut local_parts.names,
+            &mut local_parts.values,
             emit_ctx,
             false,
             jit_module,
@@ -5920,6 +5920,7 @@ fn emit_codegen_ops(
         );
         fb.ins().call(emit_ctx.decref_ref, &[value]);
     }
+    local_env.replace_from_legacy_parts(local_parts);
     Ok(())
 }
 
@@ -5981,9 +5982,7 @@ fn emit_codegen_term(
     exec_blocks: &[ir::Block],
     runtime_block_param_names: &[Vec<String>],
     full_block_param_names: &[Vec<String>],
-    local_names: &mut Vec<String>,
-    local_values: &mut Vec<ir::Value>,
-    local_ref_kinds: &[LocalRefKind],
+    local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     jit_module: &mut JITModule,
     func_imports: &mut FuncBuildImports<'_>,
@@ -5996,6 +5995,10 @@ fn emit_codegen_term(
     let i64_ty = emit_ctx.consts.i64_ty;
     let ptr_ty = emit_ctx.consts.ptr_ty;
     let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let mut local_parts = local_env.to_legacy_parts();
+    let local_names = &mut local_parts.names;
+    let local_values = &mut local_parts.values;
+    let local_ref_kinds = &local_parts.ref_kinds;
 
     match term {
         BlockTerm::Jump(target_label) => {
@@ -8245,20 +8248,16 @@ fn build_cranelift_run_bb_specialized_function(
             let _block_local_plan = emit_ctx.local_plan.block(block.label);
             let _block_refcount_plan = emit_ctx.refcount_plan.block(block.label);
             let mut local_env = LocalEnv::default();
-            let mut local_parts = local_env.to_legacy_parts();
 
             emit_codegen_ops(
                 &mut fb,
                 &block.body,
-                &mut local_parts.names,
-                &mut local_parts.values,
+                &mut local_env,
                 &stack_slots,
                 &emit_ctx,
                 jit_module,
                 &mut func_imports,
             )?;
-            local_env.replace_from_legacy_parts(local_parts);
-            let mut local_parts = local_env.to_legacy_parts();
 
             emit_codegen_term(
                 &mut fb,
@@ -8267,9 +8266,7 @@ fn build_cranelift_run_bb_specialized_function(
                 &exec_blocks,
                 &runtime_block_param_names,
                 &full_block_param_names,
-                &mut local_parts.names,
-                &mut local_parts.values,
-                &local_parts.ref_kinds,
+                &mut local_env,
                 &emit_ctx,
                 jit_module,
                 &mut func_imports,
