@@ -1,6 +1,7 @@
 use crate::jit::ProcessJitEngine;
 use crate::module_type::SharedModuleState;
-use soac_blockpy::block_py::ModuleNameGen;
+use soac_blockpy::block_py::{FunctionId, ModuleNameGen};
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -24,8 +25,33 @@ pub fn allocate_compile_session_id() -> CompileSessionId {
 pub struct CompileSession {
     id: CompileSessionId,
     next_module_id: AtomicU32,
-    shared_module_states: Mutex<Vec<Arc<SharedModuleState>>>,
+    shared_module_states: Mutex<SharedModuleStateRegistry>,
     process_jit: OnceLock<Result<ProcessJitEngine, String>>,
+}
+
+#[derive(Default)]
+struct SharedModuleStateRegistry {
+    retained: Vec<Arc<SharedModuleState>>,
+    by_module_id: HashMap<u32, usize>,
+}
+
+impl SharedModuleStateRegistry {
+    fn retain(&mut self, shared_state: Arc<SharedModuleState>) {
+        let module_id = shared_state.lowered_module.module_name_gen.module_id();
+        let index = self.retained.len();
+        self.retained.push(shared_state);
+        self.by_module_id.insert(module_id, index);
+    }
+
+    fn for_function_id(&self, function_id: FunctionId) -> Option<Arc<SharedModuleState>> {
+        let index = self.by_module_id.get(&function_id.module_id()).copied()?;
+        self.retained.get(index).cloned()
+    }
+
+    #[cfg(test)]
+    fn retained_len(&self) -> usize {
+        self.retained.len()
+    }
 }
 
 impl CompileSession {
@@ -33,7 +59,7 @@ impl CompileSession {
         Self {
             id: allocate_compile_session_id(),
             next_module_id: AtomicU32::new(1),
-            shared_module_states: Mutex::new(Vec::new()),
+            shared_module_states: Mutex::new(SharedModuleStateRegistry::default()),
             process_jit: OnceLock::new(),
         }
     }
@@ -64,8 +90,34 @@ impl CompileSession {
         self.shared_module_states
             .lock()
             .map_err(|_| "compile session shared module state lock poisoned".to_string())?
-            .push(shared_state);
+            .retain(shared_state);
         Ok(())
+    }
+
+    pub(crate) fn shared_module_state_for_function_id(
+        &self,
+        function_id: FunctionId,
+    ) -> Result<Option<Arc<SharedModuleState>>, String> {
+        Ok(self
+            .shared_module_states
+            .lock()
+            .map_err(|_| "compile session shared module state lock poisoned".to_string())?
+            .for_function_id(function_id))
+    }
+
+    #[cfg(test)]
+    fn retained_shared_module_state_count(&self) -> Result<usize, String> {
+        Ok(self
+            .shared_module_states
+            .lock()
+            .map_err(|_| "compile session shared module state lock poisoned".to_string())?
+            .retained_len())
+    }
+}
+
+impl Default for CompileSession {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -109,5 +161,18 @@ mod test {
         let second = session.module_name_gen();
 
         assert_eq!(second.module_id(), first.module_id() + 1);
+    }
+
+    #[test]
+    fn compile_session_starts_with_empty_shared_module_registry() {
+        let session = CompileSession::new();
+
+        assert_eq!(session.retained_shared_module_state_count().unwrap(), 0);
+        assert!(
+            session
+                .shared_module_state_for_function_id(soac_blockpy::block_py::FunctionId::new(7, 1))
+                .unwrap()
+                .is_none()
+        );
     }
 }

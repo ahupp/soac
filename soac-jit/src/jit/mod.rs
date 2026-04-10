@@ -1207,6 +1207,7 @@ struct JitEmitCtx<'mc> {
     tuple_set_item_ref: ir::FuncRef,
     stack_slots: StackSlots,
     direct_call_code_ptrs: &'mc HashMap<FunctionId, ObjPtr>,
+    direct_call_target_functions: &'mc HashMap<FunctionId, BlockPyFunction<CodegenModuleShape>>,
     direct_call_functions: &'mc HashMap<FunctionId, DeclaredJitFunction>,
     call_target_counter_ids: &'mc HashMap<InstrId, CounterId>,
     call_target_specializations: &'mc HashMap<InstrId, Vec<FunctionId>>,
@@ -1242,6 +1243,17 @@ struct DirectConstructorSpecialization {
     init_function: ObjPtr,
     owner_type: *mut ffi::PyTypeObject,
     type_version: u32,
+}
+
+fn direct_call_target_function<'a>(
+    ctx: &'a JitEmitCtx<'_>,
+    function_id: FunctionId,
+) -> Option<&'a BlockPyFunction<CodegenModuleShape>> {
+    ctx.module
+        .callable_defs
+        .iter()
+        .find(|function| function.function_id == function_id)
+        .or_else(|| ctx.direct_call_target_functions.get(&function_id))
 }
 
 #[derive(Clone, Copy)]
@@ -2261,12 +2273,7 @@ fn direct_method_specializations_for_call_site(
     };
     let mut out = Vec::new();
     for function_id in targets.iter().copied() {
-        let Some(target_function) = ctx
-            .module
-            .callable_defs
-            .iter()
-            .find(|function| function.function_id == function_id)
-        else {
+        let Some(target_function) = direct_call_target_function(ctx, function_id) else {
             continue;
         };
         if call.args.len() + 1 != target_function.params.len() {
@@ -2310,12 +2317,7 @@ fn direct_constructor_specializations_for_call_site(
     };
     let mut out = Vec::new();
     for function_id in targets.iter().copied() {
-        let Some(target_function) = ctx
-            .module
-            .callable_defs
-            .iter()
-            .find(|function| function.function_id == function_id)
-        else {
+        let Some(target_function) = direct_call_target_function(ctx, function_id) else {
             continue;
         };
         if call.args.len() + 1 != target_function.params.len() {
@@ -3061,12 +3063,7 @@ fn emit_call_direct_expr(
         )
     };
 
-    let Some(target_function) = ctx
-        .module
-        .callable_defs
-        .iter()
-        .find(|function| function.function_id == call.function_id)
-    else {
+    let Some(target_function) = direct_call_target_function(ctx, call.function_id) else {
         return fallback();
     };
 
@@ -4092,12 +4089,9 @@ fn emit_codegen_expr(
                         fb.ins().brif(is_match, direct_block, &[], miss_block, &[]);
 
                         fb.switch_to_block(direct_block);
-                        let target_function = ctx
-                            .module
-                            .callable_defs
-                            .iter()
-                            .find(|function| function.function_id == specialization.function_id)
-                            .expect("direct method specialization target should exist");
+                        let target_function =
+                            direct_call_target_function(ctx, specialization.function_id)
+                                .expect("direct method specialization target should exist");
                         if let Some(counter_id) = counter_id {
                             let callee_id = fb.ins().iconst(
                                 ctx.consts.i64_ty,
@@ -4239,11 +4233,8 @@ fn emit_codegen_expr(
                             .iter()
                             .copied()
                             .filter_map(|function_id| {
-                                let target_function = ctx
-                                    .module
-                                    .callable_defs
-                                    .iter()
-                                    .find(|function| function.function_id == function_id)?;
+                                let target_function =
+                                    direct_call_target_function(ctx, function_id)?;
                                 if args.len() != target_function.params.len() {
                                     return None;
                                 }
@@ -4316,16 +4307,11 @@ fn emit_codegen_expr(
                                     .brif(version_matches, direct_block, &[], miss_block, &[]);
 
                                 fb.switch_to_block(direct_block);
-                                let target_function = ctx
-                                    .module
-                                    .callable_defs
-                                    .iter()
-                                    .find(|function| {
-                                        function.function_id == specialization.function_id
-                                    })
-                                    .expect(
-                                        "direct constructor specialization target should exist",
-                                    );
+                                let target_function =
+                                    direct_call_target_function(ctx, specialization.function_id)
+                                        .expect(
+                                            "direct constructor specialization target should exist",
+                                        );
                                 if let Some(counter_id) = direct_hit_counter_id {
                                     let _ = emit_increment_counter(fb, counter_id, ctx);
                                 }
@@ -4394,11 +4380,7 @@ fn emit_codegen_expr(
                                 fb.ins().brif(is_match, direct_block, &[], miss_block, &[]);
 
                                 fb.switch_to_block(direct_block);
-                                let target_function = ctx
-                                    .module
-                                    .callable_defs
-                                    .iter()
-                                    .find(|function| function.function_id == function_id)
+                                let target_function = direct_call_target_function(ctx, function_id)
                                     .expect("direct specialization target should exist");
                                 if let Some(counter_id) = direct_hit_counter_id {
                                     let _ = emit_increment_counter(fb, counter_id, ctx);
@@ -6512,17 +6494,25 @@ fn build_cranelift_run_bb_specialized_function(
     let direct_call_functions = predeclared_direct_functions.unwrap_or(&empty_direct_functions);
 
     let mut direct_call_code_ptrs = HashMap::new();
+    let mut direct_call_target_functions = HashMap::new();
     for function_id in direct_call_targets {
         if direct_call_functions.contains_key(&function_id) {
             direct_call_code_ptrs.insert(function_id, 1usize as ObjPtr);
             continue;
         }
-        let maybe_code_ptr = match direct_call_resolver {
-            Some(shared_state) => shared_state.lookup_or_compile_direct_code_ptr(function_id)?,
-            None => None,
+        let Some(target_function) = direct_call_resolver
+            .map(|shared_state| shared_state.lookup_direct_call_target_function(function_id))
+            .transpose()?
+            .flatten()
+        else {
+            continue;
         };
-        if let Some(code_ptr) = maybe_code_ptr {
-            direct_call_code_ptrs.insert(function_id, code_ptr);
+        direct_call_target_functions.insert(function_id, target_function);
+        direct_call_code_ptrs.insert(function_id, 1usize as ObjPtr);
+    }
+    for function_id in direct_call_functions.keys().copied() {
+        if !direct_call_code_ptrs.contains_key(&function_id) {
+            direct_call_code_ptrs.insert(function_id, 1usize as ObjPtr);
         }
     }
     let top_value_counter_ptrs = direct_call_resolver
@@ -7074,6 +7064,7 @@ fn build_cranelift_run_bb_specialized_function(
                 tuple_set_item_ref,
                 stack_slots: stack_slots.clone(),
                 direct_call_code_ptrs: &direct_call_code_ptrs,
+                direct_call_target_functions: &direct_call_target_functions,
                 direct_call_functions,
                 call_target_counter_ids: &call_target_counter_ids,
                 call_target_specializations: &call_target_specializations,

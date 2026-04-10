@@ -91,6 +91,10 @@ enum CounterRuntimeSlot {
 }
 
 impl SharedModuleState {
+    pub fn module_id(&self) -> u32 {
+        self.lowered_module.module_name_gen.module_id()
+    }
+
     pub fn lookup_function(
         &self,
         function_id: FunctionId,
@@ -99,6 +103,27 @@ impl SharedModuleState {
         let function = self.lowered_module.callable_defs.get(function_index)?;
         assert_eq!(function.function_id, function_id);
         Some(function)
+    }
+
+    pub(crate) fn lookup_direct_call_target_function(
+        &self,
+        function_id: FunctionId,
+    ) -> Result<Option<BlockPyFunction<CodegenModuleShape>>, String> {
+        if function_id == FunctionId::global() {
+            return Ok(None);
+        }
+        if let Some(function) = self.lookup_function(function_id) {
+            return Ok(Some(function.clone()));
+        }
+        if function_id.module_id() == self.module_id() {
+            return Ok(None);
+        }
+        let Some(shared_state) = crate::session::CompileSession::process()
+            .shared_module_state_for_function_id(function_id)?
+        else {
+            return Ok(None);
+        };
+        Ok(shared_state.lookup_function(function_id).cloned())
     }
 
     pub fn lookup_original_code(&self, function_id: FunctionId) -> Option<&Py<PyAny>> {
@@ -170,21 +195,18 @@ impl SharedModuleState {
         Some(counter.snapshot())
     }
 
-    pub(crate) fn lookup_or_compile_direct_code_ptr(
-        &self,
-        function_id: FunctionId,
-    ) -> Result<Option<*mut c_void>, String> {
-        self.lookup_or_compile_direct_function_handle(function_id)
-            .and_then(|handle| match handle {
-                Some(handle) => handle.direct_code_ptr().map(Some),
-                None => Ok(None),
-            })
-    }
-
     pub(crate) fn lookup_or_compile_direct_function_handle(
         &self,
         function_id: FunctionId,
     ) -> Result<Option<Arc<crate::jit::CompiledFunctionHandle>>, String> {
+        if function_id != FunctionId::global() && function_id.module_id() != self.module_id() {
+            let Some(shared_state) = crate::session::CompileSession::process()
+                .shared_module_state_for_function_id(function_id)?
+            else {
+                return Ok(None);
+            };
+            return shared_state.lookup_or_compile_direct_function_handle(function_id);
+        }
         {
             let mut cache = self
                 .compiled_direct_runner_handles
