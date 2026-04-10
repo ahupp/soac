@@ -247,6 +247,15 @@ mod tests {
         with_test_blocks(function, vec![block])
     }
 
+    fn direct_call_expr(function_id: FunctionId) -> InstrCodegen {
+        InstrCodegen::CallDirect(CallDirect::new(
+            none_expr(),
+            function_id,
+            Vec::<CallArgPositional<InstrCodegen>>::new(),
+            Vec::<CallArgKeyword<InstrCodegen>>::new(),
+        ))
+    }
+
     fn render_test_jit_function(
         function: &BlockPyFunction<CodegenModuleShape>,
         blocks: &[ObjPtr],
@@ -362,6 +371,116 @@ mod tests {
                     .expect("cross-module callee should carry its owning shared state")
                     .module_name,
                 "callee_test"
+            );
+        });
+        unsafe {
+            match old_pythonhome {
+                Some(value) => std::env::set_var("PYTHONHOME", value),
+                None => std::env::remove_var("PYTHONHOME"),
+            }
+            match old_pythonpath {
+                Some(value) => std::env::set_var("PYTHONPATH", value),
+                None => std::env::remove_var("PYTHONPATH"),
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn process_jit_batch_collection_handles_recursive_direct_call() {
+        let module_name_gen = ModuleNameGen::new(93);
+        let function = test_function_in_module(&module_name_gen, "recursive");
+        let function = with_single_test_block(
+            function.clone(),
+            vec![direct_call_expr(function.function_id)],
+            ret_term(none_expr()),
+        );
+
+        let session = std::sync::Arc::new(crate::session::CompileSession::new());
+        let batch = collect_process_jit_batch_functions(&session, &function, None)
+            .expect("recursive process JIT batch should collect");
+        let function_ids = batch
+            .iter()
+            .map(|batch_function| batch_function.function.function_id)
+            .collect::<Vec<_>>();
+        assert_eq!(function_ids, vec![function.function_id]);
+    }
+
+    #[test]
+    fn process_jit_compile_direct_function_handles_mutual_recursion() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        let old_pythonhome = std::env::var_os("PYTHONHOME");
+        let old_pythonpath = std::env::var_os("PYTHONPATH");
+        let python_home = vendored_python_home();
+        let ext_staging_dir = ensure_test_extension_staging_dir();
+        let pythonpath = std::env::join_paths([
+            python_home.join("Lib"),
+            vendored_python_build_lib_dir(),
+            repo_root().join("soac_py").join("src"),
+            ext_staging_dir,
+        ])
+        .expect("test PYTHONPATH should join cleanly");
+        unsafe {
+            std::env::set_var("PYTHONHOME", &python_home);
+            std::env::set_var("PYTHONPATH", pythonpath);
+        }
+        Python::initialize();
+        let result = Python::attach(|py| {
+            let session = std::sync::Arc::new(crate::session::CompileSession::new());
+            let module_name_gen = ModuleNameGen::new(94);
+            let first = test_function_in_module(&module_name_gen, "first");
+            let second = test_function_in_module(&module_name_gen, "second");
+            let first = with_single_test_block(
+                first.clone(),
+                vec![direct_call_expr(second.function_id)],
+                ret_term(none_expr()),
+            );
+            let second = with_single_test_block(
+                second.clone(),
+                vec![direct_call_expr(first.function_id)],
+                ret_term(none_expr()),
+            );
+            let shared_state = crate::module_type::build_shared_state_for_testing(
+                py,
+                test_module(module_name_gen, vec![first.clone(), second.clone()]),
+                "mutual_recursion_test",
+                "",
+            )
+            .expect("shared state should build");
+            session
+                .retain_shared_module_state(std::sync::Arc::clone(&shared_state))
+                .expect("shared state should be retained");
+
+            let engine = ProcessJitEngine::new().expect("process JIT should construct");
+            let module_constant_ptrs = shared_state.module_constant_ptrs();
+            let counter_ptrs = shared_state.counter_ptrs();
+            let blocks = vec![std::ptr::null_mut::<c_void>(); first.blocks.len()];
+            let compiled = unsafe {
+                engine.compile_direct_function(
+                    &session,
+                    blocks.as_slice(),
+                    &shared_state.lowered_module,
+                    &first,
+                    &shared_state.codegen_constants,
+                    &shared_state.lowered_module.counter_defs,
+                    &module_constant_ptrs,
+                    &counter_ptrs,
+                    Some(shared_state.as_ref()),
+                )
+            }
+            .expect("mutually-recursive process JIT batch should compile");
+            assert!(compiled.compiled);
+            let state = engine
+                .state
+                .lock()
+                .expect("process JIT state lock should not be poisoned");
+            assert!(
+                state.ready_direct_function(&first).is_some(),
+                "root function should be marked ready"
+            );
+            assert!(
+                state.ready_direct_function(&second).is_some(),
+                "mutually-recursive callee should be marked ready"
             );
         });
         unsafe {

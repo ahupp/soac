@@ -46,6 +46,9 @@ and recursion behavior.
 - Codegen emits `soac_jit_direct_edges` tracing summaries for direct-edge
   decisions: CLIF direct calls, `FunctionEnv.direct_code_ptr` indirect calls,
   and generic-fallback reasons.
+- Focused tests cover recursive batch collection, mutually-recursive batch
+  compilation, and cross-module batch collection through the retained
+  `CompileSession` shared-state registry.
 
 ## Migration Steps
 
@@ -211,18 +214,12 @@ isolated quickly.
    - Thread the current `Arc<CompileSession>` into any remaining production
      compile or direct-target lookup path.
 
-2. Tighten recursion and cross-module tests.
-   - Recursive direct call in one module.
-   - Mutually-recursive direct calls in one module.
-   - Cross-module direct call where the callee is found through the
-     `CompileSession` retained-state registry.
-
-3. Remove the temporary indirect direct-call path once the batch collector
+2. Remove the temporary indirect direct-call path once the batch collector
    reliably covers all supported direct edges.
    - After that, supported direct edges should be CLIF `call`; unsupported
      edges should go through the generic Python call fallback.
 
-4. Benchmark before inlining.
+3. Benchmark before inlining.
    - Measure direct-call heavy workloads before changing the inliner.
    - Record any finalized performance result in `docs/CODEX_OPT_LOG.md`.
 
