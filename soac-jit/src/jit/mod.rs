@@ -6517,7 +6517,13 @@ fn emit_planned_stack_slot_releases_for_reason_from_parts(
 ) -> Result<(), String> {
     if !matches!(
         reason,
-        RefcountReleaseReason::Return | RefcountReleaseReason::Raise
+        RefcountReleaseReason::Return
+            | RefcountReleaseReason::Raise
+            | RefcountReleaseReason::Jump { .. }
+            | RefcountReleaseReason::IfThen { .. }
+            | RefcountReleaseReason::IfElse { .. }
+            | RefcountReleaseReason::BranchCase { .. }
+            | RefcountReleaseReason::BranchDefault { .. }
     ) {
         return Ok(());
     }

@@ -170,7 +170,6 @@ pub fn check_refcount_plan_against_current_jit(
                         | RefcountReleaseReason::BranchCase { .. }
                         | RefcountReleaseReason::BranchDefault { .. } => {
                             check.normal_edge_stack_slot_releases += 1;
-                            check.normal_edge_release_gaps += 1;
                         }
                         RefcountReleaseReason::ExceptionEdge { .. } => {
                             check.exception_edge_stack_slot_releases += 1;
@@ -409,7 +408,7 @@ def f():
     }
 
     #[test]
-    fn refcount_plan_check_reports_normal_edge_release_gap() {
+    fn refcount_plan_check_maps_normal_edge_releases_to_stack_slot_cleanup() {
         let (lowered, function_index) = lowered_function(
             r#"
 def f(flag):
@@ -432,11 +431,11 @@ def f(flag):
             "expected the plan to expose normal-edge stack-slot releases: {check:#?}"
         );
         assert_eq!(
-            check.normal_edge_release_gaps,
-            check.normal_edge_stack_slot_releases
+            check.normal_edge_release_gaps, 0,
+            "normal edges are now consumed by planned stack-slot releases"
         );
         assert_eq!(check.exception_edge_release_gaps, 0);
-        assert!(check.has_edge_release_gaps());
+        assert!(!check.has_edge_release_gaps());
     }
 
     #[test]
