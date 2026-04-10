@@ -639,7 +639,7 @@ class C:
 #     function_id: 0:3
 #     block bb1:
 #         StoreName("_dp_class_ns", _dp_class_ns_outer)
-#         return create_class("C", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 2, tuple_values())
+#         return create_class("C", _dp_class_ns_fn, tuple_values(), _dp_prepare_dict, FALSE, 3, tuple_values())
 
 # function _dp_module_init():
 #     function_id: 0:4

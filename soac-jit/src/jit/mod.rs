@@ -515,7 +515,7 @@ pub(crate) struct ProcessJitEngine {
 struct ProcessJitCompileGuard;
 
 struct CompiledSpecializedRunner {
-    _owner: CompiledRunnerOwner,
+    _session: Arc<crate::session::CompileSession>,
     entry: Option<CompiledRunnerEntry>,
 }
 
@@ -546,13 +546,6 @@ impl Drop for CompiledFunctionHandle {
         unsafe { free_cranelift_run_bb_specialized_cached(self.handle) };
         self.handle = std::ptr::null_mut();
     }
-}
-
-enum CompiledRunnerOwner {
-    LegacyJitModule(JITModule),
-    CompileSession {
-        _session: Arc<crate::session::CompileSession>,
-    },
 }
 
 pub type VectorcallEntryFn = unsafe extern "C" fn(ObjPtr, *const ObjPtr, usize, ObjPtr) -> ObjPtr;
@@ -5427,7 +5420,7 @@ fn new_jit_module() -> Result<JITModule, String> {
     Ok(jit_module)
 }
 
-fn process_jit_is_currently_compiling() -> bool {
+pub(crate) fn process_jit_is_currently_compiling() -> bool {
     PROCESS_JIT_COMPILE_DEPTH.with(|depth| depth.get() > 0)
 }
 
@@ -5609,9 +5602,7 @@ impl ProcessJitEngine {
                 defined.artifact.systemv_unwind_info.as_ref(),
             )?;
             let compiled = Box::new(CompiledSpecializedRunner {
-                _owner: CompiledRunnerOwner::CompileSession {
-                    _session: Arc::clone(session),
-                },
+                _session: Arc::clone(session),
                 entry: Some(CompiledRunnerEntry::Direct {
                     code_ptr,
                     param_count: defined.param_count,
@@ -7329,80 +7320,19 @@ pub unsafe fn compile_cranelift_run_bb_specialized_cached(
     counter_ptrs: &[*mut u64],
     direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
 ) -> Result<ObjPtr, String> {
-    if !process_jit_is_currently_compiling() {
-        return unsafe {
-            compile_session.process_jit()?.compile_direct_function(
-                compile_session,
-                blocks,
-                module,
-                function,
-                module_constants,
-                counter_defs,
-                module_constant_ptrs,
-                counter_ptrs,
-                direct_call_resolver,
-            )
-        };
+    unsafe {
+        compile_session.process_jit()?.compile_direct_function(
+            compile_session,
+            blocks,
+            module,
+            function,
+            module_constants,
+            counter_defs,
+            module_constant_ptrs,
+            counter_ptrs,
+            direct_call_resolver,
+        )
     }
-
-    let mut compiled = Box::new(CompiledSpecializedRunner {
-        _owner: CompiledRunnerOwner::LegacyJitModule(new_jit_module()?),
-        entry: None,
-    });
-    let CompiledRunnerOwner::LegacyJitModule(jit_module) = &mut compiled._owner else {
-        unreachable!("legacy fallback should own a private JITModule")
-    };
-    let built = build_cranelift_run_bb_specialized_function(
-        jit_module,
-        blocks,
-        module,
-        function,
-        module_constants,
-        counter_defs,
-        module_constant_ptrs,
-        counter_ptrs,
-        direct_call_resolver,
-        None,
-        None,
-    )
-    .map_err(|err| {
-        format!(
-            "{err} [function={} id={}]",
-            function.names.qualname, function.function_id
-        )
-    })?;
-    let mut ctx = built.ctx;
-    let main_id = built.main_id;
-    let main_symbol = built.main_symbol;
-    let main_artifact = define_function_with_incremental_cache(
-        jit_module,
-        main_id,
-        &mut ctx,
-        "failed to define specialized jit run_bb function",
-    )
-    .map_err(|err| {
-        format!(
-            "{err} [function={} id={}]",
-            function.names.qualname, function.function_id
-        )
-    })?;
-    jit_module.clear_context(&mut ctx);
-    jit_module
-        .finalize_definitions()
-        .map_err(|err| format!("failed to finalize specialized jit run_bb function: {err}"))?;
-    let code_ptr = jit_module.get_finalized_function(main_id);
-    jitdump::record_code_load(
-        &main_symbol,
-        code_ptr.cast::<u8>(),
-        main_artifact.code_size,
-        jit_module.isa(),
-        main_artifact.systemv_unwind_info.as_ref(),
-    )?;
-    compiled.entry = Some(CompiledRunnerEntry::Direct {
-        code_ptr,
-        param_count: function.params.len(),
-    });
-    Ok(Box::into_raw(compiled) as ObjPtr)
 }
 
 fn compiled_direct_runner_info(compiled_handle: ObjPtr) -> Result<(*const u8, usize), String> {

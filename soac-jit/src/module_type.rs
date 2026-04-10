@@ -196,6 +196,9 @@ impl SharedModuleState {
                 }
                 Some(DirectRunnerCacheEntry::InProgress) => return Ok(None),
                 None => {
+                    if crate::jit::process_jit_is_currently_compiling() {
+                        return Ok(None);
+                    }
                     cache.insert(function_id, DirectRunnerCacheEntry::InProgress);
                 }
             }
@@ -234,6 +237,11 @@ impl SharedModuleState {
                 handle
             }
             Err(err) => {
+                let mut cache = self
+                    .compiled_direct_runner_handles
+                    .lock()
+                    .map_err(|_| "compiled direct runner cache lock poisoned".to_string())?;
+                cache.remove(&function_id);
                 self.append_jit_codegen_log(
                     &function,
                     "direct_function_body",
