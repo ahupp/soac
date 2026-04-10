@@ -7477,6 +7477,130 @@ fn emit_codegen_simple_call_with_local_env(
         return Some(fb.block_params(value_ok_block)[0]);
     }
 
+    if !has_unpack
+        && simple_keywords.is_empty()
+        && let Some(helper_id) = codegen_expr_runtime_helper(call.func.as_ref(), emit_ctx)
+    {
+        if helper_id == RuntimeHelperId::TupleValues {
+            let mut arg_values: Vec<ir::Value> = Vec::with_capacity(simple_args.len());
+            let mut borrowed_args: Vec<bool> = Vec::with_capacity(simple_args.len());
+            for arg in &simple_args {
+                let borrowed_arg = codegen_expr_is_borrowable_from_local_env(
+                    arg,
+                    local_env,
+                    &emit_ctx.stack_slots,
+                    emit_ctx.storage_layout.as_ref(),
+                );
+                let value = emit_codegen_expr_with_local_env(
+                    fb,
+                    arg,
+                    local_env,
+                    emit_ctx,
+                    borrowed_arg,
+                    jit_module,
+                    func_imports,
+                );
+                arg_values.push(value);
+                borrowed_args.push(borrowed_arg);
+            }
+            let tuple_value = emit_pack_current_values_tuple(fb, arg_values.as_slice(), emit_ctx);
+            for (value, borrowed_arg) in arg_values.into_iter().zip(borrowed_args.into_iter()) {
+                if !borrowed_arg {
+                    fb.ins().call(emit_ctx.decref_ref, &[value]);
+                }
+            }
+            return Some(tuple_value);
+        }
+        if helper_id == RuntimeHelperId::LoadDeletedName
+            && simple_args.len() == 2
+            && let Some(name) = codegen_expr_const_string(simple_args[0], emit_ctx.module_constants)
+        {
+            let name_obj = emit_owned_module_constant(
+                fb,
+                emit_ctx
+                    .module_constants
+                    .require_unicode_constant_id(name.as_str()),
+                emit_ctx,
+            );
+            let value_borrowed = codegen_expr_is_borrowable_from_local_env(
+                simple_args[1],
+                local_env,
+                &emit_ctx.stack_slots,
+                emit_ctx.storage_layout.as_ref(),
+            );
+            let value_obj = emit_codegen_expr_with_local_env(
+                fb,
+                simple_args[1],
+                local_env,
+                emit_ctx,
+                value_borrowed,
+                jit_module,
+                func_imports,
+            );
+            let value_is_deleted_sentinel = fb.ins().icmp(
+                ir::condcodes::IntCC::Equal,
+                value_obj,
+                emit_ctx.consts.deleted_const,
+            );
+            let value_is_null = fb
+                .ins()
+                .icmp(ir::condcodes::IntCC::Equal, value_obj, null_ptr);
+            let value_is_deleted = fb.ins().bor(value_is_deleted_sentinel, value_is_null);
+            let deleted_block = fb.create_block();
+            let value_ok_block = fb.create_block();
+            fb.append_block_param(value_ok_block, ptr_ty);
+            fb.ins().brif(
+                value_is_deleted,
+                deleted_block,
+                &[],
+                value_ok_block,
+                &[ir::BlockArg::Value(value_obj)],
+            );
+
+            fb.switch_to_block(deleted_block);
+            fb.ins()
+                .call(emit_ctx.raise_deleted_name_error_ref, &[name_obj]);
+            let error_value = emit_take_error_before_local_null_cleanup(fb, emit_ctx);
+            fb.ins().call(emit_ctx.decref_ref, &[name_obj]);
+            if !value_borrowed {
+                emit_decref_if_not_null(fb, emit_ctx.consts.ptr_ty, emit_ctx.decref_ref, value_obj);
+            }
+            emit_restore_error_after_local_null_cleanup(fb, emit_ctx, error_value);
+            fb.ins().jump(
+                emit_ctx.consts.step_null_block,
+                &step_null_block_args(emit_ctx),
+            );
+
+            fb.switch_to_block(value_ok_block);
+            let value_obj = fb.block_params(value_ok_block)[0];
+            fb.ins().call(emit_ctx.decref_ref, &[name_obj]);
+            if value_borrowed {
+                fb.ins().call(emit_ctx.incref_ref, &[value_obj]);
+            }
+            return Some(value_obj);
+        }
+        if helper_id == RuntimeHelperId::CellRef && simple_args.len() == 1 {
+            let InstrCodegen::Load(cell_name) = simple_args[0] else {
+                panic!(
+                    "cell_ref should lower to a located load arg, got {:?}",
+                    simple_args[0]
+                );
+            };
+            if cell_name.name.cell_location().is_some() {
+                return Some(emit_raw_cell_object_for_name_with_local_env(
+                    fb,
+                    &cell_name.name,
+                    local_env,
+                    emit_ctx,
+                ));
+            }
+            panic!(
+                "cell_ref should target a cell-backed name, got {} at {:?}",
+                cell_name.name.id, cell_name.name.location
+            );
+        }
+    }
+
     None
 }
 
