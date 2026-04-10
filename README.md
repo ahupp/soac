@@ -17,6 +17,11 @@ Install the Python-side venv and the nightly Rust codegen backend used by
 just setup-dev-env
 ```
 
+`setup-dev-env` also installs the `ruff` command with uv. The repo keeps uv
+state under the working tree (`.uv-cache`, `.uv/`, and `.xdg/`) and puts the
+repo-local uv tool bin directory on `PATH`, so later test and benchmark recipes
+can run uv in offline mode instead of fetching through the sandbox.
+
 # CLIF
 
 ```
@@ -79,6 +84,21 @@ below is the user-facing set that changes runtime behavior, profiling,
 benchmarking, test wrappers, or the local web UI. Pure `Justfile`
 plumbing such as `REPO_ROOT`, `VENV_DIR`, `WEB_DIR`, and similar helper
 exports are intentionally omitted here.
+
+## Local Tooling
+
+- `UV_CACHE_DIR`, `UV_TOOL_DIR`, `UV_TOOL_BIN_DIR`, `XDG_CACHE_HOME`,
+  `XDG_DATA_HOME`, and `XDG_RUNTIME_DIR`
+  The `.envrc` and `Justfile` point these at repo-local directories so uv
+  package cache, installed tools, and XDG state stay under the working tree.
+  `just setup-dev-env` installs `ruff` into the repo-local uv tool bin
+  directory.
+
+- `UV_OFFLINE=1`
+  Normal test and benchmark recipes set this for uv-backed venv refreshes after
+  `setup-dev-env` has populated the repo-local cache and installed tools. Use
+  plain `just update-venv` or rerun `just setup-dev-env` when dependency changes
+  intentionally require network access.
 
 ## Import Hook And Runtime Behavior
 

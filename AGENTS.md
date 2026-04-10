@@ -229,6 +229,13 @@ instance's live working commit.
   prints `benchmark result: bench/{change_id}_{commit_id}`; report the
   specialized apply-pass median from that directory's `benchmark.txt` unless I
   explicitly ask for the warm unspecialized baseline.
+- Repo-local uv state
+  `.envrc` and `Justfile` keep uv and XDG state under the repo with
+  `UV_CACHE_DIR`, `UV_TOOL_DIR`, `UV_TOOL_BIN_DIR`, `XDG_CACHE_HOME`,
+  `XDG_DATA_HOME`, and `XDG_RUNTIME_DIR`. `just setup-dev-env` installs the
+  repo-local `ruff` command. Test and benchmark recipes use `UV_OFFLINE=1` for
+  uv-backed venv refreshes; use `just update-venv` or rerun `just setup-dev-env`
+  when dependency changes intentionally require network access.
 - `SOAC_WORK_DIR` / `SOAC_OPT_MODE`
   Normal specialization runs use one work directory with conventional
   files: `profile.bin` for specialization input, `verify.bin` for the
