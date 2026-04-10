@@ -5,10 +5,6 @@ default-members = ["soac-blockpy", "soac-pyo3", "soac-jit", "soac-inspector"]
 exclude = ["soac-runtime"]
 resolver = "2"
 
-[profile.debug-ext]
-inherits = "dev"
-panic = "abort"
-
 [profile.release-ext]
 inherits = "release"
 panic = "abort"

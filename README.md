@@ -143,6 +143,15 @@ exports are intentionally omitted here.
   When `SOAC_LOG` is unset and `SOAC_WORK_DIR` is set, SOAC writes
   default JSON events to `$SOAC_WORK_DIR/events.jsonl`.
 
+- `SOAC_PYTEST_TRACE=1`
+  Enables the verbose pytest module-load and JIT-codegen JSON trace for
+  `just pytest ...` and `just test-all` when `SOAC_LOG` is unset. The trace is
+  disabled by default for green correctness runs. It writes to
+  `SOAC_PYTEST_EVENTS_LOG` when set, otherwise `logs/pytest_events.jsonl`.
+
+- `SOAC_PYTEST_EVENTS_LOG=/path/to/events.jsonl`
+  Overrides the pytest trace output path used when `SOAC_PYTEST_TRACE=1`.
+
 - `SOAC_CRANELIFT_COMPILE_CACHE=1`
   Opt into the experimental filesystem-backed Cranelift incremental
   compile cache. When enabled, cache values are stored in
@@ -163,9 +172,10 @@ exports are intentionally omitted here.
 - `SOAC_CRANELIFT_OPT_LEVEL=none|speed|speed_and_size`
   Override the Cranelift optimization level used by the process JIT.
   Normal runtime and benchmark runs default to `speed`. The
-  `run-cpython-tests` recipe defaults this to `none` unless the caller
-  already set it, because correctness tests are latency-sensitive and
-  should not spend cold-start time optimizing import-time helper code.
+  `just pytest`, `just test-all`, and `just run-cpython-tests` recipes default
+  this to `none` unless the caller already set it, because correctness tests are
+  latency-sensitive and should not spend cold-start time optimizing import-time
+  helper code.
 
 ## Counters And Specialization
 

@@ -82,6 +82,20 @@ else:
         assert module.VALUE == "math"
 
 
+def test_soac_module_helper_does_not_transform_stdlib_imports_by_default(tmp_path):
+    source = """
+import sys
+
+sys.modules.pop("colorsys", None)
+import colorsys
+
+VALUE = type(colorsys.__spec__.loader).__name__
+"""
+
+    with soac_module(tmp_path, "helper_scoped_to_temp_module", source) as module:
+        assert module.VALUE != "SoacLoader"
+
+
 def test_soac_package_relative_import_star_binds_submodule_name(
     monkeypatch, tmp_path
 ):

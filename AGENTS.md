@@ -322,12 +322,18 @@ anything non-code affected the run. If there were no such issues, say
   `soac_module_load` target; JIT-codegen timing is emitted by
   `soac_jit_codegen`. When `SOAC_LOG` is unset and `SOAC_WORK_DIR` is
   set, the default event log is `$SOAC_WORK_DIR/events.jsonl`.
+- `SOAC_PYTEST_TRACE` / `SOAC_PYTEST_EVENTS_LOG`
+  `just pytest ...` and `just test-all` do not write the verbose JSON module
+  load/JIT-codegen trace by default. Set `SOAC_PYTEST_TRACE=1` to enable it
+  when `SOAC_LOG` is unset. `SOAC_PYTEST_EVENTS_LOG` overrides the output path,
+  which defaults to `logs/pytest_events.jsonl`.
 - `SOAC_CRANELIFT_OPT_LEVEL`
   Optional Cranelift process-JIT optimization level override:
   `none`, `speed`, or `speed_and_size`. Normal runtime and benchmark
-  runs default to `speed`; `just run-cpython-tests` defaults to
-  `none` unless the caller already set it, so correctness runs do not
-  spend cold-start time optimizing import-time helper code.
+  runs default to `speed`; `just pytest`, `just test-all`, and
+  `just run-cpython-tests` default to `none` unless the caller already set it,
+  so correctness runs do not spend cold-start time optimizing import-time helper
+  code.
 - `SOAC_CRANELIFT_COMPILE_CACHE`
   Set to `1`, `true`, `yes`, or `on` to enable the experimental
   filesystem-backed Cranelift incremental compile cache. It writes

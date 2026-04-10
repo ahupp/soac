@@ -117,7 +117,7 @@ install-extension build="debug": ensure-venv ensure-cpython
   if [[ "$BUILD" == "release" ]]; then
     PROFILE_DIR="release-ext"
   else
-    PROFILE_DIR="debug-ext"
+    PROFILE_DIR="debug"
   fi
   ARTIFACT_DIR="$REPO_ROOT/target/$PROFILE_DIR"
 
@@ -313,7 +313,7 @@ build-extension build="debug": ensure-cpython
   if [[ "$BUILD" == "release" ]]; then
     BUILD_ARGS=(--profile release-ext)
   else
-    BUILD_ARGS=(--profile debug-ext)
+    BUILD_ARGS=()
   fi
 
   (
@@ -322,18 +322,24 @@ build-extension build="debug": ensure-cpython
   )
   just install-extension "$BUILD"
 
-build-all: (update-venv-offline) ensure-cpython ensure-shared-python
+build-test-runtime: (update-venv-offline) ensure-cpython ensure-shared-python
+  #!/usr/bin/env bash
+  set -euo pipefail
+  export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  cd "$REPO_ROOT"
+  just build-extension debug
+
+build-all: build-test-runtime
   #!/usr/bin/env bash
   set -euo pipefail
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
   cd "$REPO_ROOT"
   cargo build --workspace --tests
-  just build-extension debug
   just build-web-inspector-server
 
 
 
-run-cpython-tests jobs="0" *args='': build-all ensure-cpython ensure-venv
+run-cpython-tests jobs="0" *args='': build-test-runtime ensure-cpython ensure-venv
   #!/usr/bin/env bash
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
   cd "$REPO_ROOT"
@@ -703,8 +709,9 @@ _pytest-run *args='': ensure-venv
     exit 0
   fi
 
-  SOAC_PYTEST_EVENTS_LOG="$REPO_ROOT/logs/pytest_events.jsonl"
-  if [[ -z "${SOAC_LOG:-}" ]]; then
+  export SOAC_CRANELIFT_OPT_LEVEL="${SOAC_CRANELIFT_OPT_LEVEL:-none}"
+  SOAC_PYTEST_EVENTS_LOG="${SOAC_PYTEST_EVENTS_LOG:-$REPO_ROOT/logs/pytest_events.jsonl}"
+  if [[ -z "${SOAC_LOG:-}" && "${SOAC_PYTEST_TRACE:-0}" =~ ^(1|true|yes|on)$ ]]; then
     rm -f "$SOAC_PYTEST_EVENTS_LOG"
     export SOAC_LOG="soac_jit=info,soac_module_load=info,soac_jit_codegen=info;json=$SOAC_PYTEST_EVENTS_LOG"
   fi
@@ -726,11 +733,11 @@ _pytest-run *args='': ensure-venv
   rm -f "$TMP_PYTEST_OUTPUT"
   exit "$TEST_STATUS"
 
-pytest *args='': build-all
+pytest *args='': build-test-runtime
   #!/usr/bin/env bash
   just _pytest-run "$@"
 
-py *args='': build-all
+py *args='': build-test-runtime
   #!/usr/bin/env bash
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
   cd "$REPO_ROOT"
@@ -852,12 +859,12 @@ test-all:
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
   cd "$REPO_ROOT"
   just uninstall-extension
-  TIMEFORMAT='[diet-python timing] build_all_s=%3R'
-  if time just build-all; then
+  TIMEFORMAT='[diet-python timing] build_test_runtime_s=%3R'
+  if time just build-test-runtime; then
     :
   else
     status=$?
-    echo "[diet-python test-all] step failed: build-all (exit $status)" >&2
+    echo "[diet-python test-all] step failed: build-test-runtime (exit $status)" >&2
     just uninstall-extension
     exit "$status"
   fi

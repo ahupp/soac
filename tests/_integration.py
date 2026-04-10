@@ -153,12 +153,15 @@ def _load_module(
     package_root = str(tmp_path)
     sys.path.insert(0, package_root)
     prior_mode = os.environ.get("DIET_PYTHON_MODE")
+    prior_enabled_modules = os.environ.get("SOAC_MODULE_ENABLED")
 
     full_name = f"{package_name}.{module_name}"
 
     try:
         if mode == "soac":
             os.environ["DIET_PYTHON_MODE"] = "transform"
+            if prior_enabled_modules is None:
+                os.environ["SOAC_MODULE_ENABLED"] = f"path:{package_dir}"
             import_hook.install()
             sys.modules.pop(full_name, None)
             sys.modules.pop(package_name, None)
@@ -190,6 +193,10 @@ def _load_module(
             os.environ.pop("DIET_PYTHON_MODE", None)
         else:
             os.environ["DIET_PYTHON_MODE"] = prior_mode
+        if prior_enabled_modules is None:
+            os.environ.pop("SOAC_MODULE_ENABLED", None)
+        else:
+            os.environ["SOAC_MODULE_ENABLED"] = prior_enabled_modules
 
 
 @contextmanager
