@@ -51,6 +51,7 @@ mod jitdump;
 mod planning;
 mod runtime_context;
 mod specialized_helpers;
+mod typed_value;
 
 pub use planning::{
     BlockExcDispatchPlan, BlockLocalPlan, CurrentJitRefcountPlanCheck, FunctionLocalPlan,
@@ -65,6 +66,7 @@ use runtime_context::{
 pub use runtime_context::{ModuleJitContext, ModuleRuntimeContext};
 pub use specialized_helpers::ObjPtr;
 use specialized_helpers::register_specialized_jit_symbols;
+pub use typed_value::{IntFacts, IntRange, IntWidth, SoacRepr, SoacValue};
 
 static RUNTIME_SUPPORT_LIBRARY: OnceLock<Result<RuntimeSupportLibrary, String>> = OnceLock::new();
 static NEXT_IMPORT_SPEC_ID: AtomicUsize = AtomicUsize::new(0);
@@ -4018,10 +4020,10 @@ fn emit_record_call_target_sample(
 fn emit_record_branch_outcome_sample(
     fb: &mut FunctionBuilder<'_>,
     counter_id: CounterId,
-    is_true: ir::Value,
+    truth_i32: ir::Value,
     ctx: &JitEmitCtx<'_>,
 ) {
-    let observed_value = fb.ins().uextend(ctx.consts.i64_ty, is_true);
+    let observed_value = fb.ins().uextend(ctx.consts.i64_ty, truth_i32);
     emit_record_top_value_sample(fb, counter_id, observed_value, ctx);
 }
 
@@ -6504,7 +6506,7 @@ fn emit_truthy_from_owned(
     owned_value: ir::Value,
     is_true_ref: ir::FuncRef,
     ctx: &JitEmitCtx<'_>,
-) -> ir::Value {
+) -> SoacValue {
     let truth_inst = fb.ins().call(is_true_ref, &[owned_value]);
     let truth_value = fb.inst_results(truth_inst)[0];
     let truth_error = fb.ins().iconst(ctx.consts.i32_ty, -1);
@@ -6533,11 +6535,12 @@ fn emit_truthy_from_owned(
     let truth_ok_value = fb.block_params(truth_ok_block)[0];
     fb.ins().call(ctx.decref_ref, &[owned_value]);
     let zero_i32 = fb.ins().iconst(ctx.consts.i32_ty, 0);
-    fb.ins().icmp(
-        ir::condcodes::IntCC::SignedGreaterThan,
-        truth_ok_value,
-        zero_i32,
-    )
+    let one_i32 = fb.ins().iconst(ctx.consts.i32_ty, 1);
+    let is_true = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::NotEqual, truth_ok_value, zero_i32);
+    let truth_i32 = fb.ins().select(is_true, one_i32, zero_i32);
+    SoacValue::i32(truth_i32, IntFacts::i32_bool01())
 }
 
 fn emit_codegen_expr_with_local_env(
@@ -6841,13 +6844,14 @@ fn emit_codegen_term(
                 jit_module,
                 func_imports,
             );
-            let is_true = emit_truthy_from_owned(fb, test_value, is_true_ref, emit_ctx);
+            let truth = emit_truthy_from_owned(fb, test_value, is_true_ref, emit_ctx);
+            let truth_i32 = truth.expect_i32_bool01("if condition truthiness");
             if let Some(counter_id) = emit_ctx
                 .branch_outcome_counter_ids
                 .get(&test_instr_id)
                 .copied()
             {
-                emit_record_branch_outcome_sample(fb, counter_id, is_true, emit_ctx);
+                emit_record_branch_outcome_sample(fb, counter_id, truth_i32, emit_ctx);
             }
 
             let prefer_true = emit_ctx
@@ -6856,9 +6860,11 @@ fn emit_codegen_term(
                 .copied()
                 .unwrap_or(true);
             let hot_cond = if prefer_true {
-                is_true
+                fb.ins()
+                    .icmp_imm(ir::condcodes::IntCC::NotEqual, truth_i32, 0)
             } else {
-                fb.ins().icmp_imm(ir::condcodes::IntCC::Equal, is_true, 0)
+                fb.ins()
+                    .icmp_imm(ir::condcodes::IntCC::Equal, truth_i32, 0)
             };
             let hot_branch = fb.create_block();
             let cold_branch = fb.create_block();
