@@ -25,8 +25,9 @@ use soac_blockpy::block_py::{
     StorageLayout, Visit, WithMeta, operation as blockpy_intrinsics,
 };
 use soac_blockpy::passes::{
-    CodegenModuleShape, FactStore, FunctionRefcountPlan, InstrResolved, RefcountActionKind,
-    RefcountReleaseReason, RuntimeHelperId, ValueFacts, infer_module_value_facts,
+    CodegenModuleShape, FactStore, FunctionRefcountPlan, InstrResolved, PyExactType, PyObjFacts,
+    RefcountActionKind, RefcountReleaseReason, RuntimeHelperId, ValueFacts,
+    infer_module_value_facts,
 };
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -3303,11 +3304,43 @@ fn emit_owned_bool_from_cond(
     cond: ir::Value,
     ctx: &JitEmitCtx<'_>,
 ) -> ir::Value {
+    let truth = emit_i32_bool01_from_cond(fb, cond, ctx);
+    let (bool_value, _) = emit_to_python_bool(fb, truth, ctx).expect_pyobject("bool materialize");
+    bool_value
+}
+
+fn emit_i32_bool01_from_cond(
+    fb: &mut FunctionBuilder<'_>,
+    cond: ir::Value,
+    ctx: &JitEmitCtx<'_>,
+) -> SoacValue {
+    let zero_i32 = fb.ins().iconst(ctx.consts.i32_ty, 0);
+    let one_i32 = fb.ins().iconst(ctx.consts.i32_ty, 1);
+    let truth_i32 = fb.ins().select(cond, one_i32, zero_i32);
+    SoacValue::i32(truth_i32, IntFacts::i32_bool01())
+}
+
+fn emit_i32_bool01_from_i32_result(
+    fb: &mut FunctionBuilder<'_>,
+    result: ir::Value,
+    ctx: &JitEmitCtx<'_>,
+) -> SoacValue {
+    let is_true = fb.ins().icmp_imm(ir::condcodes::IntCC::NotEqual, result, 0);
+    emit_i32_bool01_from_cond(fb, is_true, ctx)
+}
+
+fn emit_to_python_bool(
+    fb: &mut FunctionBuilder<'_>,
+    value: SoacValue,
+    ctx: &JitEmitCtx<'_>,
+) -> SoacValue {
+    let truth_i32 = value.expect_i32_bool01("emit_to_python_bool");
+    let is_true = fb.ins().icmp_imm(ir::condcodes::IntCC::NotEqual, truth_i32, 0);
     let bool_value = fb
         .ins()
-        .select(cond, ctx.consts.true_const, ctx.consts.false_const);
+        .select(is_true, ctx.consts.true_const, ctx.consts.false_const);
     fb.ins().call(ctx.incref_ref, &[bool_value]);
-    bool_value
+    SoacValue::pyobject(bool_value, PyObjFacts::exact_type(PyExactType::Bool))
 }
 
 fn emit_owned_bool_from_i32_result(
@@ -3325,8 +3358,9 @@ fn emit_owned_bool_from_i32_result(
         &[],
     );
     fb.switch_to_block(ok_block);
-    let is_true = fb.ins().icmp_imm(ir::condcodes::IntCC::NotEqual, result, 0);
-    emit_owned_bool_from_cond(fb, is_true, ctx)
+    let truth = emit_i32_bool01_from_i32_result(fb, result, ctx);
+    let (bool_value, _) = emit_to_python_bool(fb, truth, ctx).expect_pyobject("bool materialize");
+    bool_value
 }
 
 fn emit_branch_index_i64(
@@ -6534,13 +6568,7 @@ fn emit_truthy_from_owned(
     fb.switch_to_block(truth_ok_block);
     let truth_ok_value = fb.block_params(truth_ok_block)[0];
     fb.ins().call(ctx.decref_ref, &[owned_value]);
-    let zero_i32 = fb.ins().iconst(ctx.consts.i32_ty, 0);
-    let one_i32 = fb.ins().iconst(ctx.consts.i32_ty, 1);
-    let is_true = fb
-        .ins()
-        .icmp(ir::condcodes::IntCC::NotEqual, truth_ok_value, zero_i32);
-    let truth_i32 = fb.ins().select(is_true, one_i32, zero_i32);
-    SoacValue::i32(truth_i32, IntFacts::i32_bool01())
+    emit_i32_bool01_from_i32_result(fb, truth_ok_value, ctx)
 }
 
 fn emit_codegen_expr_with_local_env(
