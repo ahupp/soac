@@ -538,6 +538,60 @@ mod tests {
         assert_eq!(env.local_only_cleanup_values(), vec![owned_local]);
     }
 
+    #[test]
+    fn local_env_borrowability_uses_location_entries() {
+        let env = LocalEnv {
+            entries: vec![LocalEnvEntry {
+                key: LocalEnvKey::Location(LocalLocation(0)),
+                name: "x".to_string(),
+                value: ir::Value::from_u32(1),
+                ref_kind: LocalRefKind::Owned,
+                storage: LocalEnvStorage::LocalOnly,
+            }],
+        };
+        let stack_slots = StackSlots {
+            names: Vec::new(),
+            slots: Vec::new(),
+        };
+
+        assert!(codegen_expr_is_borrowable_from_local_env(
+            &name_expr(test_name("x")),
+            &env,
+            &stack_slots,
+            None,
+        ));
+    }
+
+    #[test]
+    fn local_env_borrowability_uses_storage_layout_name_entries() {
+        let env = LocalEnv {
+            entries: vec![LocalEnvEntry {
+                key: LocalEnvKey::legacy_name("x"),
+                name: "x".to_string(),
+                value: ir::Value::from_u32(1),
+                ref_kind: LocalRefKind::Owned,
+                storage: LocalEnvStorage::LocalOnly,
+            }],
+        };
+        let stack_slots = StackSlots {
+            names: Vec::new(),
+            slots: Vec::new(),
+        };
+        let storage_layout = StorageLayout {
+            freevars: Vec::new(),
+            cellvars: Vec::new(),
+            runtime_cells: Vec::new(),
+            stack_slots: vec!["x".to_string()],
+        };
+
+        assert!(codegen_expr_is_borrowable_from_local_env(
+            &name_expr(test_name("x")),
+            &env,
+            &stack_slots,
+            Some(&storage_layout),
+        ));
+    }
+
     fn local_env_store_test_state() -> (LocalEnv, String) {
         let compile_session = crate::session::CompileSession::new();
         let mut jit_module =
@@ -552,12 +606,9 @@ mod tests {
         wrapper_signature.params.push(ir::AbiParam::new(ptr_ty));
         wrapper_signature.returns.push(ir::AbiParam::new(ptr_ty));
 
-        let wrapper_id = declare_local_fn(
-            &mut jit_module,
-            "local_env_store_test",
-            &wrapper_signature,
-        )
-        .expect("wrapper function should declare");
+        let wrapper_id =
+            declare_local_fn(&mut jit_module, "local_env_store_test", &wrapper_signature)
+                .expect("wrapper function should declare");
         let incref_id = declare_local_fn(
             &mut jit_module,
             "local_env_store_test_incref",

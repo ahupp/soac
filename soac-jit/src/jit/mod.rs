@@ -764,6 +764,30 @@ fn codegen_expr_is_borrowable(
     }
 }
 
+fn codegen_expr_is_borrowable_from_local_env(
+    expr: &InstrCodegen,
+    local_env: &LocalEnv,
+    stack_slots: &StackSlots,
+    storage_layout: Option<&StorageLayout>,
+) -> bool {
+    match expr {
+        InstrCodegen::Load(op) => {
+            let Some(location) = op.name.local_location() else {
+                return false;
+            };
+            if local_env.entry_index_for_location(location).is_some() {
+                return true;
+            }
+            storage_layout
+                .and_then(|layout| layout.stack_slots().get(location.slot() as usize))
+                .is_some_and(|name| {
+                    local_env.entry_index_for_name(name).is_some() || stack_slots.has_name(name)
+                })
+        }
+        _ => false,
+    }
+}
+
 fn local_name_for_location<'a>(
     storage_layout: &'a StorageLayout,
     location: LocalLocation,
@@ -3397,17 +3421,25 @@ fn emit_branch_index_i64(
 ) -> ir::Value {
     match expr {
         InstrCodegen::CalleeFunctionId(op) => {
+            let callable_is_borrowed = codegen_expr_is_borrowable_from_local_env(
+                op.value.as_ref(),
+                local_env,
+                &ctx.stack_slots,
+                ctx.storage_layout.as_ref(),
+            );
             let callable = emit_codegen_expr_with_local_env(
                 fb,
                 op.value.as_ref(),
                 local_env,
                 ctx,
-                false,
+                callable_is_borrowed,
                 jit_module,
                 func_imports,
             );
             let callee_id = emit_callee_function_id_checked(fb, callable, ctx);
-            fb.ins().call(ctx.decref_ref, &[callable]);
+            if !callable_is_borrowed {
+                fb.ins().call(ctx.decref_ref, &[callable]);
+            }
             callee_id
         }
         _ => {
