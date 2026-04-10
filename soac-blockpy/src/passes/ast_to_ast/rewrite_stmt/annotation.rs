@@ -1,4 +1,7 @@
-use ruff_python_ast::{self as ast, Expr, Parameter, Stmt};
+use ruff_python_ast::{
+    self as ast, Expr, Parameter, Stmt, TypeParam, TypeParamParamSpec, TypeParamTypeVar,
+    TypeParamTypeVarTuple,
+};
 use ruff_python_codegen::{Generator, Indentation};
 use ruff_source_file::LineEnding;
 
@@ -25,13 +28,22 @@ pub fn rewrite_ann_assign_to_dunder_annotate(_context: &Context, stmt: &mut Suit
 struct AnnotationStripper {
     entries: Vec<(String, Expr, String)>,
     indent: Indentation,
+    capture_names: Vec<String>,
 }
 
 impl AnnotationStripper {
     fn strip(stmt: &mut Suite) -> Vec<(String, Expr, String)> {
+        Self::strip_with_captures(stmt, Vec::new())
+    }
+
+    fn strip_with_captures(
+        stmt: &mut Suite,
+        capture_names: Vec<String>,
+    ) -> Vec<(String, Expr, String)> {
         let mut collector = AnnotationStripper {
             entries: Vec::new(),
             indent: Indentation::new("    ".to_string()),
+            capture_names,
         };
         collector.visit_body(stmt);
         collector.entries
@@ -96,11 +108,103 @@ impl AnnotationStripper {
         if entries.is_empty() {
             return None;
         }
-        Some(build_annotate_fn(
+        let mut capture_values = capture_name_values(&self.capture_names);
+        capture_values.extend(type_param_capture_values(func_def.type_params.as_deref()));
+        Some(build_annotate_fn_with_capture_values(
             entries,
             &format!("{}{}", FUNCTION_ANNOTATE_PREFIX, func_def.name.id),
+            capture_values,
         ))
     }
+}
+
+fn type_param_names(type_params: Option<&ast::TypeParams>) -> Vec<String> {
+    type_params
+        .into_iter()
+        .flat_map(|type_params| type_params.type_params.iter())
+        .map(|type_param| match type_param {
+            TypeParam::TypeVar(param) => param.name.id.to_string(),
+            TypeParam::TypeVarTuple(param) => param.name.id.to_string(),
+            TypeParam::ParamSpec(param) => param.name.id.to_string(),
+        })
+        .collect()
+}
+
+fn capture_name_values(names: &[String]) -> Vec<(String, Expr)> {
+    names
+        .iter()
+        .map(|name| (name.clone(), py_expr!("{name:id}", name = name.as_str())))
+        .collect()
+}
+
+fn type_param_capture_values(type_params: Option<&ast::TypeParams>) -> Vec<(String, Expr)> {
+    type_params
+        .into_iter()
+        .flat_map(|type_params| type_params.type_params.iter())
+        .map(|type_param| match type_param {
+            TypeParam::TypeVar(TypeParamTypeVar {
+                name,
+                bound,
+                default,
+                ..
+            }) => {
+                let param_name = name.as_str().to_string();
+                let (constraints, bound_expr) = match bound.as_deref().cloned() {
+                    Some(Expr::Tuple(ast::ExprTuple { elts, .. })) => {
+                        (Some(make_tuple(elts)), None)
+                    }
+                    Some(other) => (None, Some(other)),
+                    None => (None, None),
+                };
+                let bound_expr = bound_expr.unwrap_or_else(|| py_expr!("None"));
+                let default_expr = default
+                    .as_deref()
+                    .cloned()
+                    .unwrap_or_else(|| py_expr!("None"));
+                let constraints_expr = constraints.unwrap_or_else(|| py_expr!("None"));
+                (
+                    param_name.clone(),
+                    py_expr!(
+                        "__soac__.typing_TypeVar({name_literal:literal}, {bound:expr}, {default:expr}, {constraints:expr})",
+                        name_literal = param_name.as_str(),
+                        bound = bound_expr,
+                        default = default_expr,
+                        constraints = constraints_expr,
+                    ),
+                )
+            }
+            TypeParam::TypeVarTuple(TypeParamTypeVarTuple { name, default, .. }) => {
+                let param_name = name.as_str().to_string();
+                let value = match default.as_deref().cloned() {
+                    Some(default_expr) => py_expr!(
+                        "__soac__.typing_TypeVarTuple({name_literal:literal}, default={default:expr})",
+                        name_literal = param_name.as_str(),
+                        default = default_expr,
+                    ),
+                    None => py_expr!(
+                        "__soac__.typing_TypeVarTuple({name_literal:literal})",
+                        name_literal = param_name.as_str(),
+                    ),
+                };
+                (param_name, value)
+            }
+            TypeParam::ParamSpec(TypeParamParamSpec { name, default, .. }) => {
+                let param_name = name.as_str().to_string();
+                let value = match default.as_deref().cloned() {
+                    Some(default_expr) => py_expr!(
+                        "__soac__.typing_ParamSpec({name_literal:literal}, default={default:expr})",
+                        name_literal = param_name.as_str(),
+                        default = default_expr,
+                    ),
+                    None => py_expr!(
+                        "__soac__.typing_ParamSpec({name_literal:literal})",
+                        name_literal = param_name.as_str(),
+                    ),
+                };
+                (param_name, value)
+            }
+        })
+        .collect()
 }
 
 impl Transformer for AnnotationStripper {
@@ -129,11 +233,19 @@ impl Transformer for AnnotationStripper {
                 // drop the collected annotations
             }
             Stmt::ClassDef(class_def) => {
-                let entries = AnnotationStripper::strip(&mut class_def.body);
+                let capture_names = type_param_names(class_def.type_params.as_deref());
+                let entries = AnnotationStripper::strip_with_captures(
+                    &mut class_def.body,
+                    capture_names.clone(),
+                );
                 if !entries.is_empty() {
                     // CPython stores class annotation thunks under __annotate_func__,
                     // and exposes __annotate__ via type-level descriptor logic.
-                    let ds = build_annotate_fn(entries, "__annotate_func__");
+                    let ds = build_annotate_fn_with_capture_values(
+                        entries,
+                        "__annotate_func__",
+                        capture_name_values(&capture_names),
+                    );
                     class_def.body.push(ds);
                 }
             }
@@ -173,6 +285,31 @@ impl Transformer for AnnotationStripper {
 }
 
 pub(crate) fn build_annotate_fn(entries: Vec<(String, Expr, String)>, name: &str) -> Stmt {
+    build_annotate_fn_with_capture_values(entries, name, Vec::new())
+}
+
+pub(crate) fn build_annotate_fn_with_capture_values(
+    entries: Vec<(String, Expr, String)>,
+    name: &str,
+    capture_values: Vec<(String, Expr)>,
+) -> Stmt {
+    let capture_tuple = make_tuple(
+        capture_values
+            .iter()
+            .map(|(_, value)| value.clone())
+            .collect(),
+    );
+    let capture_bindings = capture_values
+        .iter()
+        .enumerate()
+        .map(|(index, (name, _))| {
+            py_stmt!(
+                "{name:id} = __soac_type_params__[{index:literal}]",
+                name = name.as_str(),
+                index = index,
+            )
+        })
+        .collect::<Vec<_>>();
     let value_pairs = entries
         .into_iter()
         .map(|(key, value, source)| {
@@ -234,7 +371,9 @@ pub(crate) fn build_annotate_fn(entries: Vec<(String, Expr, String)>, name: &str
 def {annotate_name:id}(
     _dp_format,
     __soac__=__import__("soac.runtime", globals(), dict(), ("runtime",), 0),
+    __soac_type_params__={capture_tuple:expr},
 ):
+    {capture_bindings:stmt}
     if __soac__.eq(_dp_format, 4):
         return {string_dict:expr}
     if __soac__.eq(_dp_format, 3):
@@ -244,6 +383,8 @@ def {annotate_name:id}(
     return {value_dict:expr}
 "#,
         annotate_name = name,
+        capture_tuple = capture_tuple,
+        capture_bindings = capture_bindings,
         forwardref_dict = forwardref_dict,
         string_dict = string_dict,
         value_dict = value_dict,

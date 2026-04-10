@@ -145,11 +145,45 @@ x: int = 1
 
 # ==
 
-# snapshot regeneration failed
-# panic: byte index 82 is out of bounds of `
-# x: int = 1
+# function __annotate__.<locals>.<lambda>():
+#     function_id: 0:1
+#     display_name: <lambda>
+#     block bb1:
+#         return int
 
-# `
+# function __annotate__(_dp_format, __soac__, __soac_type_params__):
+#     function_id: 0:2
+#     block bb8:
+#         if_term eq(_dp_format, 4):
+#             then:
+#                 block bb9:
+#                     return dict(tuple_values(tuple_values("x", "int")))
+#             else:
+#                 block bb10:
+#                     jump bb5
+#                     block bb5:
+#                         if_term eq(_dp_format, 3):
+#                             then:
+#                                 block bb6:
+#                                     return dict(tuple_values(tuple_values("x", annotation_forwardref_value(MakeFunction(0:1, Function, tuple_values(), NONE), "int", __name__))))
+#                             else:
+#                                 block bb7:
+#                                     jump bb2
+#                                     block bb2:
+#                                         if_term gt(_dp_format, 2):
+#                                             then:
+#                                                 block bb3:
+#                                                     raise GetAttr(builtins, "NotImplementedError")
+#                                             else:
+#                                                 block bb4:
+#                                                     return dict(tuple_values(tuple_values("x", int)))
+
+# function _dp_module_init():
+#     function_id: 0:3
+#     block bb1:
+#         StoreName("x", 1)
+#         StoreName("__annotate__", MakeFunction(0:2, Function, tuple_values(__import__("soac.runtime", globals(), dict(), tuple_values("runtime"), 0), tuple_values()), NONE))
+#         return NONE
 
 # ann_assign_attr
 

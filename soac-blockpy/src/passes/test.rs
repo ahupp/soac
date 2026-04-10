@@ -1345,6 +1345,80 @@ fn nested_class_closure_capture_does_not_turn_owner_cell_into_outer_freevar() {
 }
 
 #[test]
+fn class_body_local_does_not_satisfy_nested_method_capture() {
+    let source = concat!(
+        "def outer():\n",
+        "    x = \"outer\"\n",
+        "    class Inner:\n",
+        "        x = \"class\"\n",
+        "        def read():\n",
+        "            return x\n",
+        "    return Inner.read()\n",
+    );
+    let bb_module = tracked_name_binding_module(source)
+        .expect("transform should succeed")
+        .expect("bb module should be available");
+    let class_ns = function_by_name(&bb_module, "_dp_class_ns_Inner");
+    let class_layout = class_ns
+        .storage_layout()
+        .as_ref()
+        .expect("class helper should capture outer x for nested method");
+    let captured_x = slot_by_name(&class_layout.freevars, "x");
+    assert_eq!(captured_x.storage_name, "_dp_cell_x");
+    assert!(
+        class_layout
+            .cellvars
+            .iter()
+            .all(|slot| slot.logical_name != "x"),
+        "class namespace local must not become a closure owner: {class_layout:?}"
+    );
+
+    let read = function_by_name(&bb_module, "read");
+    let read_layout = read
+        .storage_layout()
+        .as_ref()
+        .expect("nested method should capture x");
+    let _read_x = slot_by_name(&read_layout.freevars, "x");
+}
+
+#[test]
+fn class_body_local_does_not_satisfy_nested_class_capture() {
+    let source = concat!(
+        "def outer():\n",
+        "    z2 = \"outer\"\n",
+        "    class Inner:\n",
+        "        z2 = \"inner\"\n",
+        "        class InnerClosure:\n",
+        "            y = z2\n",
+        "    return Inner.InnerClosure.y\n",
+    );
+    let bb_module = tracked_name_binding_module(source)
+        .expect("transform should succeed")
+        .expect("bb module should be available");
+    let outer_class_ns = function_by_name(&bb_module, "_dp_class_ns_Inner");
+    let outer_class_layout = outer_class_ns
+        .storage_layout()
+        .as_ref()
+        .expect("outer class helper should capture outer z2 for nested class");
+    let captured_z2 = slot_by_name(&outer_class_layout.freevars, "z2");
+    assert_eq!(captured_z2.storage_name, "_dp_cell_z2");
+    assert!(
+        outer_class_layout
+            .cellvars
+            .iter()
+            .all(|slot| slot.logical_name != "z2"),
+        "class namespace local must not become a closure owner: {outer_class_layout:?}"
+    );
+
+    let inner_class_ns = function_by_name(&bb_module, "_dp_class_ns_InnerClosure");
+    let inner_class_layout = inner_class_ns
+        .storage_layout()
+        .as_ref()
+        .expect("nested class helper should capture z2");
+    let _inner_z2 = slot_by_name(&inner_class_layout.freevars, "z2");
+}
+
+#[test]
 fn nested_class_base_capture_keeps_method_local_cell_owned_by_method() {
     let source = concat!(
         "class Tests:\n",

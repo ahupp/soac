@@ -2462,10 +2462,15 @@ fn compute_callable_storage_layout_for_name_binding(
                 {
                     continue;
                 }
-                if callable
+                let local_def_provides_capture = callable.scope.scope_kind
+                    == CallableScopeKind::Function
+                    && callable.scope.has_local_def(slot.logical_name.as_str());
+                let type_param_provides_capture = callable
                     .scope
-                    .local_defs
-                    .contains(slot.logical_name.as_str())
+                    .type_param_names
+                    .contains(slot.logical_name.as_str());
+                if local_def_provides_capture
+                    || type_param_provides_capture
                     || param_name_set.contains(slot.logical_name.as_str())
                 {
                     let local_storage_name = if callable.scope.scope_kind
@@ -2717,10 +2722,10 @@ fn compute_module_make_function_capture_names(
                         && base_owned_storage_names.contains("_dp_classcell"))
                         || base_owned_logical_names.contains(logical_name.as_str())
                         || base_owned_storage_names.contains(source_name.as_str())
-                        || callable.scope.local_defs.contains(logical_name.as_str())
-                        || base_owned_storage_names.contains(requested_source_name.as_str())
                         || (callable.scope.scope_kind == CallableScopeKind::Function
                             && callable.scope.has_local_def(logical_name.as_str()))
+                        || callable.scope.type_param_names.contains(logical_name.as_str())
+                        || base_owned_storage_names.contains(requested_source_name.as_str())
                     {
                         continue;
                     }

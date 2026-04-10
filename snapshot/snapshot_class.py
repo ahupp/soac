@@ -10,17 +10,80 @@ class C:
 
 # ==
 
-# snapshot regeneration failed
-# panic: byte index 82 is out of bounds of `
+# function C.m(self):
+#     function_id: 0:1
+#     block bb1:
+#         return GetAttr(self, "x")
 
-# class C:
-#     x: int = 1
+# function C.__annotate_func__.<locals>.<lambda>():
+#     function_id: 0:2
+#     display_name: <lambda>
+#     block bb1:
+#         return int
 
-#     def m(self):
-#         return self.x
+# function C.__annotate_func__(_dp_format, __soac__, __soac_type_params__):
+#     function_id: 0:3
+#     block bb8:
+#         if_term eq(_dp_format, 4):
+#             then:
+#                 block bb9:
+#                     return dict(tuple_values(tuple_values("x", "int")))
+#             else:
+#                 block bb10:
+#                     jump bb5
+#                     block bb5:
+#                         if_term eq(_dp_format, 3):
+#                             then:
+#                                 block bb6:
+#                                     return dict(tuple_values(tuple_values("x", annotation_forwardref_value(MakeFunction(0:2, Function, tuple_values(), NONE), "int", __name__))))
+#                             else:
+#                                 block bb7:
+#                                     jump bb2
+#                                     block bb2:
+#                                         if_term gt(_dp_format, 2):
+#                                             then:
+#                                                 block bb3:
+#                                                     raise GetAttr(builtins, "NotImplementedError")
+#                                             else:
+#                                                 block bb4:
+#                                                     return dict(tuple_values(tuple_values("x", int)))
 
+# function _dp_class_ns_C(_dp_class_ns, _dp_classcell_arg):
+#     function_id: 0:4
+#     block bb1:
+#         StoreName("_dp_classcell", _dp_classcell_arg)
+#         StoreName("_dp_assign_value_2", __name__)
+#         StoreName("_dp_assign_obj_3", load_deleted_name("_dp_class_ns", _dp_class_ns))
+#         StoreName("_dp_assign_index_4", "__module__")
+#         SetItem(_dp_assign_obj_3, _dp_assign_index_4, _dp_assign_value_2)
+#         Del { name: "_dp_assign_index_4", quietly: false }
+#         Del { name: "_dp_assign_obj_3", quietly: false }
+#         Del { name: "_dp_assign_value_2", quietly: false }
+#         StoreName("_dp_assign_value_5", "C")
+#         StoreName("_dp_assign_obj_6", load_deleted_name("_dp_class_ns", _dp_class_ns))
+#         StoreName("_dp_assign_index_7", "__qualname__")
+#         SetItem(_dp_assign_obj_6, _dp_assign_index_7, _dp_assign_value_5)
+#         Del { name: "_dp_assign_index_7", quietly: false }
+#         Del { name: "_dp_assign_obj_6", quietly: false }
+#         Del { name: "_dp_assign_value_5", quietly: false }
+#         StoreName("x", 1)
+#         StoreName("m", MakeFunction(0:1, Function, tuple_values(), NONE))
+#         StoreName("__annotate_func__", MakeFunction(0:3, Function, tuple_values(__import__("soac.runtime", globals(), dict(), tuple_values("runtime"), 0), tuple_values()), NONE))
+#         return NONE
 
-# `
+# function _dp_define_class_C(_dp_class_ns_fn, _dp_class_ns_outer, _dp_class_bases, _dp_prepare_dict):
+#     function_id: 0:5
+#     block bb1:
+#         StoreName("_dp_class_ns", _dp_class_ns_outer)
+#         return create_class("C", _dp_class_ns_fn, _dp_class_bases, _dp_prepare_dict, FALSE, 3, tuple_values())
+
+# function _dp_module_init():
+#     function_id: 0:6
+#     block bb1:
+#         StoreName("_dp_class_ns_C", MakeFunction(0:4, Function, tuple_values(), NONE))
+#         StoreName("_dp_define_class_C", MakeFunction(0:5, Function, tuple_values(), NONE))
+#         StoreName("C", _dp_define_class_C(_dp_class_ns_C, globals(), tuple_values(), NONE))
+#         return NONE
 
 # class_method_named_open_calls_builtin
 
@@ -44,7 +107,7 @@ class Wrapper:
 #     block bb1:
 #         return str
 
-# function Wrapper._dp_annotate_func_open(_dp_format, __soac__):
+# function Wrapper._dp_annotate_func_open(_dp_format, __soac__, __soac_type_params__):
 #     function_id: 0:3
 #     block bb8:
 #         if_term eq(_dp_format, 4):
@@ -94,7 +157,7 @@ class Wrapper:
 #         Del { name: "_dp_assign_index_8", quietly: false }
 #         Del { name: "_dp_assign_obj_7", quietly: false }
 #         Del { name: "_dp_assign_value_6", quietly: false }
-#         StoreName("open", MakeFunction(0:4, Function, tuple_values("r", "utf8"), MakeFunction(0:3, Function, tuple_values(__import__("soac.runtime", globals(), dict(), tuple_values("runtime"), 0)), NONE)))
+#         StoreName("open", MakeFunction(0:4, Function, tuple_values("r", "utf8"), MakeFunction(0:3, Function, tuple_values(__import__("soac.runtime", globals(), dict(), tuple_values("runtime"), 0), tuple_values()), NONE)))
 #         return NONE
 
 # function _dp_define_class_Wrapper(_dp_class_ns_fn, _dp_class_ns_outer, _dp_class_bases, _dp_prepare_dict):

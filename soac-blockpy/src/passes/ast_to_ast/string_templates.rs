@@ -205,8 +205,8 @@ pub fn lower_string_templates_in_expr(expr: &mut Expr) {
     StringTemplateLowerer.visit_expr(expr);
 }
 
-fn source_slice(source: &str, range: TextRange) -> &str {
-    &source[range.start().to_usize()..range.end().to_usize()]
+fn source_slice(source: &str, range: TextRange) -> Option<&str> {
+    source.get(range.start().to_usize()..range.end().to_usize())
 }
 
 fn hex_value(ch: u8) -> Option<u32> {
@@ -263,7 +263,8 @@ fn has_active_surrogate_escape(content: &str) -> bool {
 fn string_literal_needs_source_eval(context: &Context, value: &ast::StringLiteralValue) -> bool {
     value.iter().any(|part| {
         !part.flags.prefix().is_raw()
-            && has_active_surrogate_escape(source_slice(&context.source, part.content_range()))
+            && source_slice(&context.source, part.content_range())
+                .is_some_and(has_active_surrogate_escape)
     })
 }
 
@@ -277,7 +278,9 @@ impl Transformer for SurrogateStringLiteralLowerer<'_> {
             Expr::StringLiteral(node)
                 if string_literal_needs_source_eval(self.context, &node.value) =>
             {
-                let literal_source = source_slice(&self.context.source, node.range()).to_string();
+                let literal_source = source_slice(&self.context.source, node.range())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| crate::ruff_ast_to_string(&*expr));
                 *expr = py_expr!(
                     "__soac__.eval_string_literal({source:literal})",
                     source = literal_source
