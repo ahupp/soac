@@ -3063,6 +3063,23 @@ fn emit_decref_owned_inputs_after_nullable_result(
     fb.block_params(done_block)[0]
 }
 
+fn emit_checked_owned_pyobject_call_with_cleanup(
+    fb: &mut FunctionBuilder<'_>,
+    ctx: &JitEmitCtx<'_>,
+    func_ref: ir::FuncRef,
+    args: &[ir::Value],
+    owned_inputs: &[ir::Value],
+) -> ir::Value {
+    let call_inst = fb.ins().call(func_ref, args);
+    let value = emit_decref_owned_inputs_after_nullable_result(
+        fb,
+        ctx,
+        fb.inst_results(call_inst)[0],
+        owned_inputs,
+    );
+    emit_checked_owned_pyobject_result(fb, value, ctx)
+}
+
 fn emit_owned_module_constant_from_parts(
     fb: &mut FunctionBuilder<'_>,
     constant_id: ModuleConstantId,
@@ -3844,54 +3861,29 @@ fn emit_object_call_with_tuple_args(
     kwargs_obj: Option<ir::Value>,
     ctx: &JitEmitCtx<'_>,
 ) -> ir::Value {
-    let ptr_ty = ctx.consts.ptr_ty;
-    let null_ptr = fb.ins().iconst(ptr_ty, 0);
-    let call_inst = if let Some(kwargs_obj) = kwargs_obj {
-        fb.ins().call(
+    let mut owned_inputs = Vec::with_capacity(3);
+    if let Some(kwargs_obj) = kwargs_obj {
+        owned_inputs.push(kwargs_obj);
+    }
+    owned_inputs.push(call_args_tuple);
+    if !callable_is_borrowed {
+        owned_inputs.push(callable);
+    }
+    let (func_ref, args): (ir::FuncRef, Vec<ir::Value>) = if let Some(kwargs_obj) = kwargs_obj {
+        (
             ctx.py_call_with_kw_ref,
-            &[callable, call_args_tuple, kwargs_obj],
+            vec![callable, call_args_tuple, kwargs_obj],
         )
     } else {
-        fb.ins()
-            .call(ctx.py_call_object_ref, &[callable, call_args_tuple])
+        (ctx.py_call_object_ref, vec![callable, call_args_tuple])
     };
-    let call_value = fb.inst_results(call_inst)[0];
-    let call_is_null = fb
-        .ins()
-        .icmp(ir::condcodes::IntCC::Equal, call_value, null_ptr);
-    let call_fail_block = fb.create_block();
-    let call_ok_block = fb.create_block();
-    fb.append_block_param(call_ok_block, ptr_ty);
-    fb.ins().brif(
-        call_is_null,
-        call_fail_block,
-        &[],
-        call_ok_block,
-        &[ir::BlockArg::Value(call_value)],
-    );
-
-    fb.switch_to_block(call_fail_block);
-    let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
-    if let Some(kwargs_obj) = kwargs_obj {
-        fb.ins().call(ctx.decref_ref, &[kwargs_obj]);
-    }
-    fb.ins().call(ctx.decref_ref, &[call_args_tuple]);
-    if !callable_is_borrowed {
-        fb.ins().call(ctx.decref_ref, &[callable]);
-    }
-    emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
-    fb.ins()
-        .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
-
-    fb.switch_to_block(call_ok_block);
-    if let Some(kwargs_obj) = kwargs_obj {
-        fb.ins().call(ctx.decref_ref, &[kwargs_obj]);
-    }
-    fb.ins().call(ctx.decref_ref, &[call_args_tuple]);
-    if !callable_is_borrowed {
-        fb.ins().call(ctx.decref_ref, &[callable]);
-    }
-    fb.block_params(call_ok_block)[0]
+    emit_checked_owned_pyobject_call_with_cleanup(
+        fb,
+        ctx,
+        func_ref,
+        args.as_slice(),
+        owned_inputs.as_slice(),
+    )
 }
 
 fn emit_checked_runtime_name_object(
@@ -3904,14 +3896,13 @@ fn emit_checked_runtime_name_object(
         ctx.module_constants.require_unicode_constant_id(name),
         ctx,
     );
-    let value_inst = fb.ins().call(ctx.load_runtime_obj_ref, &[name_obj]);
-    let value = emit_decref_owned_input_after_nullable_result(
+    emit_checked_owned_pyobject_call_with_cleanup(
         fb,
         ctx,
-        fb.inst_results(value_inst)[0],
-        name_obj,
-    );
-    emit_checked_owned_pyobject_result(fb, value, ctx)
+        ctx.load_runtime_obj_ref,
+        &[name_obj],
+        &[name_obj],
+    )
 }
 
 fn emit_empty_dict_with_args_tuple(
@@ -3921,21 +3912,18 @@ fn emit_empty_dict_with_args_tuple(
     ctx: &JitEmitCtx<'_>,
 ) -> ir::Value {
     let dict_callable = emit_checked_runtime_name_object(fb, "dict", ctx);
-    let kwargs_inst = fb
-        .ins()
-        .call(ctx.py_call_object_ref, &[dict_callable, empty_args_tuple]);
     let mut owned_inputs = Vec::with_capacity(2);
     if !empty_args_tuple_is_borrowed {
         owned_inputs.push(empty_args_tuple);
     }
     owned_inputs.push(dict_callable);
-    let kwargs_obj = emit_decref_owned_inputs_after_nullable_result(
+    emit_checked_owned_pyobject_call_with_cleanup(
         fb,
         ctx,
-        fb.inst_results(kwargs_inst)[0],
-        &owned_inputs,
-    );
-    emit_checked_owned_pyobject_result(fb, kwargs_obj, ctx)
+        ctx.py_call_object_ref,
+        &[dict_callable, empty_args_tuple],
+        owned_inputs.as_slice(),
+    )
 }
 
 fn emit_one_arg_method_call_and_discard(
@@ -3953,32 +3941,25 @@ fn emit_one_arg_method_call_and_discard(
             .require_unicode_constant_id_for_bytes(method_name),
         ctx,
     );
-    let method_inst = fb
-        .ins()
-        .call(ctx.pyobject_getattr_ref, &[receiver, method_name_obj]);
-    let method_obj = emit_decref_owned_input_after_nullable_result(
+    let method_obj = emit_checked_owned_pyobject_call_with_cleanup(
         fb,
         ctx,
-        fb.inst_results(method_inst)[0],
-        method_name_obj,
-    );
-    let method_obj = emit_checked_owned_pyobject_result(fb, method_obj, ctx);
-    let call_inst = fb.ins().call(
-        ctx.py_call_positional_three_ref,
-        &[method_obj, value_obj, null_ptr, null_ptr, null_ptr],
+        ctx.pyobject_getattr_ref,
+        &[receiver, method_name_obj],
+        &[method_name_obj],
     );
     let mut owned_inputs = Vec::with_capacity(2);
     if !value_borrowed {
         owned_inputs.push(value_obj);
     }
     owned_inputs.push(method_obj);
-    let call_value = emit_decref_owned_inputs_after_nullable_result(
+    let call_value = emit_checked_owned_pyobject_call_with_cleanup(
         fb,
         ctx,
-        fb.inst_results(call_inst)[0],
-        &owned_inputs,
+        ctx.py_call_positional_three_ref,
+        &[method_obj, value_obj, null_ptr, null_ptr, null_ptr],
+        owned_inputs.as_slice(),
     );
-    let call_value = emit_checked_owned_pyobject_result(fb, call_value, ctx);
     fb.ins().call(ctx.decref_ref, &[call_value]);
 }
 
@@ -4131,17 +4112,13 @@ fn emit_unpack_call_with_local_env(
     let null_ptr = fb.ins().iconst(ptr_ty, 0);
 
     let list_callable = emit_checked_runtime_name_object(fb, "list", ctx);
-    let args_list_inst = fb.ins().call(
-        ctx.py_call_object_ref,
-        &[list_callable, ctx.consts.empty_tuple_const],
-    );
-    let args_list = emit_decref_owned_input_after_nullable_result(
+    let args_list = emit_checked_owned_pyobject_call_with_cleanup(
         fb,
         ctx,
-        fb.inst_results(args_list_inst)[0],
-        list_callable,
+        ctx.py_call_object_ref,
+        &[list_callable, ctx.consts.empty_tuple_const],
+        &[list_callable],
     );
-    let args_list = emit_checked_owned_pyobject_result(fb, args_list, ctx);
 
     let kwargs_obj = if keywords.is_empty() {
         None
@@ -4254,17 +4231,13 @@ fn emit_unpack_call_with_local_env(
     }
 
     let tuple_callable = emit_checked_runtime_name_object(fb, "tuple_from_iter", ctx);
-    let tuple_call_inst = fb.ins().call(
-        ctx.py_call_positional_three_ref,
-        &[tuple_callable, args_list, null_ptr, null_ptr, null_ptr],
-    );
-    let call_args_tuple = emit_decref_owned_inputs_after_nullable_result(
+    let call_args_tuple = emit_checked_owned_pyobject_call_with_cleanup(
         fb,
         ctx,
-        fb.inst_results(tuple_call_inst)[0],
+        ctx.py_call_positional_three_ref,
+        &[tuple_callable, args_list, null_ptr, null_ptr, null_ptr],
         &[tuple_callable, args_list],
     );
-    let call_args_tuple = emit_checked_owned_pyobject_result(fb, call_args_tuple, ctx);
 
     emit_object_call_with_tuple_args(
         fb,
