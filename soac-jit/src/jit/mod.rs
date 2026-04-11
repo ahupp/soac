@@ -3930,6 +3930,50 @@ fn emit_empty_dict_with_args_tuple(
     emit_checked_owned_pyobject_result(fb, kwargs_obj, ctx)
 }
 
+fn emit_one_arg_method_call_and_discard(
+    fb: &mut FunctionBuilder<'_>,
+    receiver: ir::Value,
+    method_name: &[u8],
+    value_obj: ir::Value,
+    value_borrowed: bool,
+    ctx: &JitEmitCtx<'_>,
+) {
+    let null_ptr = fb.ins().iconst(ctx.consts.ptr_ty, 0);
+    let method_name_obj = emit_owned_module_constant(
+        fb,
+        ctx.module_constants
+            .require_unicode_constant_id_for_bytes(method_name),
+        ctx,
+    );
+    let method_inst = fb
+        .ins()
+        .call(ctx.pyobject_getattr_ref, &[receiver, method_name_obj]);
+    let method_obj = emit_decref_owned_input_after_nullable_result(
+        fb,
+        ctx,
+        fb.inst_results(method_inst)[0],
+        method_name_obj,
+    );
+    let method_obj = emit_checked_owned_pyobject_result(fb, method_obj, ctx);
+    let call_inst = fb.ins().call(
+        ctx.py_call_positional_three_ref,
+        &[method_obj, value_obj, null_ptr, null_ptr, null_ptr],
+    );
+    let mut owned_inputs = Vec::with_capacity(2);
+    if !value_borrowed {
+        owned_inputs.push(value_obj);
+    }
+    owned_inputs.push(method_obj);
+    let call_value = emit_decref_owned_inputs_after_nullable_result(
+        fb,
+        ctx,
+        fb.inst_results(call_inst)[0],
+        &owned_inputs,
+    );
+    let call_value = emit_checked_owned_pyobject_result(fb, call_value, ctx);
+    fb.ins().call(ctx.decref_ref, &[call_value]);
+}
+
 fn emit_keyword_call_with_local_env(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
@@ -4093,22 +4137,6 @@ fn emit_unpack_call_with_local_env(
             CallArgPositional::Positional(value_expr) => (value_expr, b"append".as_slice()),
             CallArgPositional::Starred(value_expr) => (value_expr, b"extend".as_slice()),
         };
-        let method_name_obj = emit_owned_module_constant(
-            fb,
-            ctx.module_constants
-                .require_unicode_constant_id_for_bytes(method_name),
-            ctx,
-        );
-        let method_inst = fb
-            .ins()
-            .call(ctx.pyobject_getattr_ref, &[args_list, method_name_obj]);
-        let method_obj = emit_decref_owned_input_after_nullable_result(
-            fb,
-            ctx,
-            fb.inst_results(method_inst)[0],
-            method_name_obj,
-        );
-        let method_obj = emit_checked_owned_pyobject_result(fb, method_obj, ctx);
         let value_borrowed = codegen_expr_is_borrowable_from_local_env(
             value_expr,
             local_env,
@@ -4124,23 +4152,14 @@ fn emit_unpack_call_with_local_env(
             jit_module,
             func_imports,
         );
-        let call_inst = fb.ins().call(
-            ctx.py_call_positional_three_ref,
-            &[method_obj, value_obj, null_ptr, null_ptr, null_ptr],
-        );
-        let mut owned_inputs = Vec::with_capacity(2);
-        if !value_borrowed {
-            owned_inputs.push(value_obj);
-        }
-        owned_inputs.push(method_obj);
-        let call_value = emit_decref_owned_inputs_after_nullable_result(
+        emit_one_arg_method_call_and_discard(
             fb,
+            args_list,
+            method_name,
+            value_obj,
+            value_borrowed,
             ctx,
-            fb.inst_results(call_inst)[0],
-            &owned_inputs,
         );
-        let call_value = emit_checked_owned_pyobject_result(fb, call_value, ctx);
-        fb.ins().call(ctx.decref_ref, &[call_value]);
     }
 
     for keyword in keywords {
@@ -4205,21 +4224,6 @@ fn emit_unpack_call_with_local_env(
             }
             CallArgKeyword::Starred(value_expr) => {
                 let kwargs_obj = kwargs_obj.expect("kwargs object must exist for kwstar part");
-                let update_name_obj = emit_owned_module_constant(
-                    fb,
-                    ctx.module_constants.require_unicode_constant_id("update"),
-                    ctx,
-                );
-                let update_inst = fb
-                    .ins()
-                    .call(ctx.pyobject_getattr_ref, &[kwargs_obj, update_name_obj]);
-                let update_obj = emit_decref_owned_input_after_nullable_result(
-                    fb,
-                    ctx,
-                    fb.inst_results(update_inst)[0],
-                    update_name_obj,
-                );
-                let update_obj = emit_checked_owned_pyobject_result(fb, update_obj, ctx);
                 let value_borrowed = codegen_expr_is_borrowable_from_local_env(
                     value_expr,
                     local_env,
@@ -4235,23 +4239,14 @@ fn emit_unpack_call_with_local_env(
                     jit_module,
                     func_imports,
                 );
-                let call_inst = fb.ins().call(
-                    ctx.py_call_positional_three_ref,
-                    &[update_obj, value_obj, null_ptr, null_ptr, null_ptr],
-                );
-                let mut owned_inputs = Vec::with_capacity(2);
-                if !value_borrowed {
-                    owned_inputs.push(value_obj);
-                }
-                owned_inputs.push(update_obj);
-                let call_value = emit_decref_owned_inputs_after_nullable_result(
+                emit_one_arg_method_call_and_discard(
                     fb,
+                    kwargs_obj,
+                    b"update",
+                    value_obj,
+                    value_borrowed,
                     ctx,
-                    fb.inst_results(call_inst)[0],
-                    &owned_inputs,
                 );
-                let call_value = emit_checked_owned_pyobject_result(fb, call_value, ctx);
-                fb.ins().call(ctx.decref_ref, &[call_value]);
             }
         }
     }
