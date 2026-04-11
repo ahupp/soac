@@ -27,9 +27,10 @@ use soac_blockpy::block_py::{
     StorageLayout, Store, Visit, WithMeta, operation as blockpy_intrinsics,
 };
 use soac_blockpy::passes::{
-    CodegenModuleShape, FactStore, FunctionRefcountPlan, InstrResolved, LocalRefState, PyExactType,
-    PyObjFacts, RefcountActionKind, RefcountReleaseReason, RefcountSite, RuntimeHelperId,
-    ValueFacts, infer_module_value_facts,
+    CodegenModuleShape, FactStore, FunctionRefcountPlan, InstrResolved, InstrTyped, LocalRefState,
+    PyExactType, PyObjFacts, RefcountActionKind, RefcountReleaseReason, RefcountSite,
+    RuntimeHelperId, ValueFacts, infer_module_value_facts, lower_codegen_function_to_typed,
+    lower_typed_function_if_tests_to_truthy, try_lower_typed_instr_to_codegen_legacy,
 };
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -720,6 +721,7 @@ struct DefinedJitFunction {
     param_count: usize,
     main_id: FuncId,
     main_symbol: String,
+    stats: JitCodegenStats,
     artifact: DefinedFunctionArtifact,
 }
 
@@ -1030,6 +1032,16 @@ pub(crate) struct CompiledFunctionHandle {
 pub(crate) struct DirectFunctionCompileResult {
     pub(crate) handle: Arc<CompiledFunctionHandle>,
     pub(crate) compiled: bool,
+    pub(crate) stats: Option<JitCodegenStats>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct JitCodegenStats {
+    pub(crate) clif_block_count: usize,
+    pub(crate) clif_inst_count: usize,
+    pub(crate) machine_code_size_bytes: usize,
+    pub(crate) machine_code_block_count: usize,
+    pub(crate) machine_code_edge_count: usize,
 }
 
 // The handle points to an immutable compiled runner after construction. The code memory is kept
@@ -1127,7 +1139,7 @@ fn local_name_for_location<'a>(
 fn emit_codegen_non_local_name_load(
     fb: &mut FunctionBuilder<'_>,
     name: &ResolvedName,
-    load_instr_id: InstrId,
+    load_instr_id: Option<InstrId>,
     ctx: &JitEmitCtx<'_>,
     borrowed: bool,
 ) -> Option<ir::Value> {
@@ -1158,10 +1170,10 @@ fn emit_codegen_non_local_name_load(
                 ctx,
             );
             let slot_index = fb.ins().iconst(ir::types::I64, i64::from(slot.slot()));
-            let value = if ctx
-                .global_indexed_hit_counter_ids
-                .contains_key(&load_instr_id)
-            {
+            let value = if let Some(load_instr_id) = load_instr_id.filter(|load_instr_id| {
+                ctx.global_indexed_hit_counter_ids
+                    .contains_key(load_instr_id)
+            }) {
                 emit_codegen_indexed_global_load(
                     fb,
                     globals_obj,
@@ -1377,23 +1389,99 @@ fn codegen_expr_runtime_helper(
         })
 }
 
-fn super_instance_arg_without_deleted_guard<'a>(
+fn load_deleted_name_arg<'a>(
     expr: &'a InstrCodegen,
     module_constants: &'a ModuleCodegenConstants,
-) -> &'a InstrCodegen {
+) -> Option<&'a InstrCodegen> {
     let InstrCodegen::Call(call) = expr else {
-        return expr;
+        return None;
     };
     if !call.keywords.is_empty() || call.args.len() != 2 {
-        return expr;
+        return None;
     }
     if codegen_expr_helper_name(call.func.as_ref(), module_constants) != Some("load_deleted_name") {
-        return expr;
+        return None;
     }
     let CallArgPositional::Positional(value) = &call.args[1] else {
-        return expr;
+        return None;
     };
-    value
+    Some(value)
+}
+
+fn emit_owned_local_value_or_deleted_sentinel_for_super(
+    fb: &mut FunctionBuilder<'_>,
+    expr: &InstrCodegen,
+    local_env: &LocalEnv,
+    ctx: &JitEmitCtx<'_>,
+) -> Option<ir::Value> {
+    let InstrCodegen::Load(op) = expr else {
+        return None;
+    };
+    let location = op.name.local_location()?;
+    let layout = ctx
+        .storage_layout
+        .as_ref()
+        .expect("Load local slot should have storage layout during codegen");
+    let name = local_name_for_location(layout, location);
+    let value = if let Some(index) = local_env
+        .entry_index_for_location(location)
+        .or_else(|| local_env.entry_index_for_name(name))
+    {
+        local_env.entries[index].value
+    } else {
+        let slot = ctx.stack_slots.slot_for_block_arg_name(name)?;
+        fb.ins().stack_load(ctx.consts.ptr_ty, slot, 0)
+    };
+    let null_ptr = fb.ins().iconst(ctx.consts.ptr_ty, 0);
+    let value_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, value, null_ptr);
+    let selected = fb
+        .ins()
+        .select(value_is_null, ctx.consts.deleted_const, value);
+    fb.ins().call(ctx.incref_ref, &[selected]);
+    Some(selected)
+}
+
+fn emit_super_instance_arg_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    instance_expr: &InstrCodegen,
+    local_env: &mut LocalEnv,
+    ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> (ir::Value, bool) {
+    if let Some(value_expr) = load_deleted_name_arg(instance_expr, ctx.module_constants) {
+        if let Some(value) =
+            emit_owned_local_value_or_deleted_sentinel_for_super(fb, value_expr, local_env, ctx)
+        {
+            return (value, false);
+        }
+        let value = emit_codegen_expr_with_local_env(
+            fb,
+            value_expr,
+            local_env,
+            ctx,
+            false,
+            jit_module,
+            func_imports,
+        );
+        return (value, false);
+    }
+    let instance_is_borrowed = codegen_expr_is_borrowable_from_local_env(
+        instance_expr,
+        local_env,
+        &ctx.stack_slots,
+        ctx.storage_layout.as_ref(),
+    );
+    let instance = emit_codegen_expr_with_local_env(
+        fb,
+        instance_expr,
+        local_env,
+        ctx,
+        instance_is_borrowed,
+        jit_module,
+        func_imports,
+    );
+    (instance, instance_is_borrowed)
 }
 
 fn emit_codegen_super_helper_call_with_local_env(
@@ -1457,20 +1545,11 @@ fn emit_codegen_super_helper_call_with_local_env(
         func_imports,
     );
 
-    let instance_expr =
-        super_instance_arg_without_deleted_guard(instance_expr, ctx.module_constants);
-    let instance_is_borrowed = codegen_expr_is_borrowable_from_local_env(
-        instance_expr,
-        local_env,
-        &ctx.stack_slots,
-        ctx.storage_layout.as_ref(),
-    );
-    let instance = emit_codegen_expr_with_local_env(
+    let (instance, instance_is_borrowed) = emit_super_instance_arg_with_local_env(
         fb,
         instance_expr,
         local_env,
         ctx,
-        instance_is_borrowed,
         jit_module,
         func_imports,
     );
@@ -1885,10 +1964,14 @@ struct JitEmitCtx<'mc> {
 }
 
 impl JitEmitCtx<'_> {
-    fn value_facts_for_expr(&self, expr: &InstrCodegen) -> Option<ValueFacts> {
-        let instr_id = expr.try_semantic_instr_id()?;
+    fn value_facts_for_instr_id(&self, instr_id: InstrId) -> Option<ValueFacts> {
         self.value_facts
             .fact_for(InstrKey::new(self.function_id, instr_id))
+    }
+
+    fn value_facts_for_expr(&self, expr: &InstrCodegen) -> Option<ValueFacts> {
+        let instr_id = expr.try_semantic_instr_id()?;
+        self.value_facts_for_instr_id(instr_id)
     }
 
     fn with_step_null_target(
@@ -2221,8 +2304,9 @@ struct LocalEnvCodegenIntrinsicEmitState<'a, 'b, 'mc, 'c, 'd> {
 
 #[derive(Clone)]
 struct LocalEnvEntry {
-    location: LocalLocation,
+    location: Option<LocalLocation>,
     name: String,
+    aliases: Vec<String>,
     value: ir::Value,
     ref_kind: LocalRefKind,
     storage: LocalEnvStorage,
@@ -2235,16 +2319,17 @@ enum LocalEnvStorage {
     StackMirror,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct LocalEnv {
     entries: Vec<LocalEnvEntry>,
 }
 
 impl LocalEnv {
-    fn bind_entry_location(
+    fn bind_entry_location_with_aliases(
         &mut self,
         location: LocalLocation,
         name: &str,
+        aliases: Vec<String>,
         value: ir::Value,
         ref_kind: LocalRefKind,
         storage: LocalEnvStorage,
@@ -2255,8 +2340,9 @@ impl LocalEnv {
             "block-entry LocalEnv location should be bound once"
         );
         self.entries.push(LocalEnvEntry {
-            location,
+            location: Some(location),
             name: name.to_string(),
+            aliases,
             value,
             ref_kind,
             storage,
@@ -2267,11 +2353,13 @@ impl LocalEnv {
     fn entry_index_for_location(&self, location: LocalLocation) -> Option<usize> {
         self.entries
             .iter()
-            .position(|entry| entry.location == location)
+            .position(|entry| entry.location == Some(location))
     }
 
     fn entry_index_for_name(&self, name: &str) -> Option<usize> {
-        self.entries.iter().position(|entry| entry.name == name)
+        self.entries
+            .iter()
+            .position(|entry| entry.name == name || entry.aliases.iter().any(|alias| alias == name))
     }
 
     fn entry_index_for_block_arg_name(&self, name: &str) -> Option<usize> {
@@ -2371,7 +2459,7 @@ impl LocalEnv {
         };
         let should_mirror_stack_slot = stack_slots.has_name(name)
             && match previous_entry.as_ref().map(|entry| entry.storage) {
-                Some(LocalEnvStorage::LocalOnly) => false,
+                Some(LocalEnvStorage::LocalOnly) => !allow_local_only_slot_backed_store,
                 Some(LocalEnvStorage::StackMirror) => true,
                 None => !allow_local_only_slot_backed_store,
             };
@@ -2389,11 +2477,17 @@ impl LocalEnv {
                 .expect("slot-backed local missing from stack slots");
             fb.ins().call(decref_ref, &[thread_state_value, value]);
             self.entries.push(LocalEnvEntry {
-                location: previous_entry
-                    .as_ref()
-                    .map(|entry| entry.location)
-                    .unwrap_or(location),
+                location: Some(
+                    previous_entry
+                        .as_ref()
+                        .and_then(|entry| entry.location)
+                        .unwrap_or(location),
+                ),
                 name: name.to_string(),
+                aliases: previous_entry
+                    .as_ref()
+                    .map(|entry| entry.aliases.clone())
+                    .unwrap_or_default(),
                 value,
                 ref_kind: local_ref_kind_for_stack_mirror(value_ref_kind),
                 storage: LocalEnvStorage::StackMirror,
@@ -2404,8 +2498,12 @@ impl LocalEnv {
             });
         } else {
             self.entries.push(LocalEnvEntry {
-                location,
+                location: Some(location),
                 name: name.to_string(),
+                aliases: previous_entry
+                    .as_ref()
+                    .map(|entry| entry.aliases.clone())
+                    .unwrap_or_default(),
                 value,
                 ref_kind: value_ref_kind,
                 storage: LocalEnvStorage::LocalOnly,
@@ -2415,6 +2513,38 @@ impl LocalEnv {
                 ),
             });
         }
+        if let Some(previous) = previous_entry {
+            if transient_local_needs_decref(previous.ref_kind) {
+                emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, previous.value);
+            }
+        }
+    }
+
+    fn store_name(
+        &mut self,
+        fb: &mut FunctionBuilder<'_>,
+        name: &str,
+        value: ir::Value,
+        value_ref_kind: LocalRefKind,
+        ptr_ty: ir::Type,
+        thread_state_value: ir::Value,
+        decref_ref: ir::FuncRef,
+    ) {
+        let previous_entry = self
+            .entry_index_for_name(name)
+            .map(|existing_index| self.entries.remove(existing_index));
+        self.entries.push(LocalEnvEntry {
+            location: None,
+            name: name.to_string(),
+            aliases: Vec::new(),
+            value,
+            ref_kind: value_ref_kind,
+            storage: LocalEnvStorage::LocalOnly,
+            binding_facts: local_binding_facts_for_storage(
+                LocalEnvStorage::LocalOnly,
+                value_ref_kind,
+            ),
+        });
         if let Some(previous) = previous_entry {
             if transient_local_needs_decref(previous.ref_kind) {
                 emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, previous.value);
@@ -2461,9 +2591,13 @@ impl LocalEnv {
         self.entries.push(LocalEnvEntry {
             location: removed_entry
                 .as_ref()
-                .map(|entry| entry.location)
-                .unwrap_or(location),
+                .and_then(|entry| entry.location)
+                .or(Some(location)),
             name: name.to_string(),
+            aliases: removed_entry
+                .as_ref()
+                .map(|entry| entry.aliases.clone())
+                .unwrap_or_default(),
             value: null_ptr,
             ref_kind: LocalRefKind::Unbound,
             storage: unbound_storage,
@@ -2521,12 +2655,16 @@ impl LocalEnv {
     fn transient_semantic_cleanup_names_excluding(
         &self,
         forwarded_indices: &HashSet<usize>,
+        preserved_values: &[ir::Value],
     ) -> Vec<String> {
         self.entries
             .iter()
             .enumerate()
             .filter(|(index, entry)| {
-                !forwarded_indices.contains(index) && transient_local_needs_decref(entry.ref_kind)
+                entry.location.is_some()
+                    && !forwarded_indices.contains(index)
+                    && !preserved_values.contains(&entry.value)
+                    && transient_local_needs_decref(entry.ref_kind)
             })
             .map(|(_, entry)| entry.name.clone())
             .collect()
@@ -2581,9 +2719,10 @@ fn bind_planned_stack_slot_entries_at_block_entry(
                 )
             })?;
         let value = fb.ins().stack_load(ptr_ty, slot, 0);
-        local_env.bind_entry_location(
+        local_env.bind_entry_location_with_aliases(
             binding.location,
             binding.name.as_str(),
+            Vec::new(),
             value,
             local_ref_kind_for_stack_mirror(binding.ref_kind),
             LocalEnvStorage::StackMirror,
@@ -2763,7 +2902,15 @@ fn emit_local_store_with_local_env(
         .storage_layout
         .as_ref()
         .expect("Store owned cell slot should have storage layout during codegen");
-    let (backing_location, backing_name) = owned_cell_backing_local(layout, location.slot())
+    let backing = owned_cell_backing_local(layout, location.slot());
+    let backing_name = backing
+        .as_ref()
+        .map(|(_, name)| *name)
+        .or_else(|| {
+            layout
+                .local_cell_slot(location.slot())
+                .map(|slot| slot.storage_name.as_str())
+        })
         .unwrap_or_else(|| {
             panic!(
                 "missing owned cell slot mapping for owned cell location {}",
@@ -2780,24 +2927,36 @@ fn emit_local_store_with_local_env(
         func_imports,
     );
     let default_ref_kind = local_ref_kind_for_stored_value(&op.value, emit_ctx);
-    let value_ref_kind = match planned_local_store_effect(expr, backing_location, emit_ctx) {
-        Some(PlannedLocalStoreEffect::Rebind(ref_kind)) => ref_kind,
-        Some(PlannedLocalStoreEffect::Delete) => unreachable!(),
-        None => default_ref_kind,
-    };
-    local_env.store_location(
-        fb,
-        backing_location,
-        backing_name,
-        value,
-        value_ref_kind,
-        emit_ctx.allow_local_only_slot_backed_stores,
-        &emit_ctx.stack_slots,
-        emit_ctx.consts.ptr_ty,
-        emit_ctx.consts.thread_state_value,
-        emit_ctx.incref_ref,
-        emit_ctx.decref_ref,
-    );
+    if let Some((backing_location, _)) = backing {
+        let value_ref_kind = match planned_local_store_effect(expr, backing_location, emit_ctx) {
+            Some(PlannedLocalStoreEffect::Rebind(ref_kind)) => ref_kind,
+            Some(PlannedLocalStoreEffect::Delete) => unreachable!(),
+            None => default_ref_kind,
+        };
+        local_env.store_location(
+            fb,
+            backing_location,
+            backing_name,
+            value,
+            value_ref_kind,
+            emit_ctx.allow_local_only_slot_backed_stores,
+            &emit_ctx.stack_slots,
+            emit_ctx.consts.ptr_ty,
+            emit_ctx.consts.thread_state_value,
+            emit_ctx.incref_ref,
+            emit_ctx.decref_ref,
+        );
+    } else {
+        local_env.store_name(
+            fb,
+            backing_name,
+            value,
+            default_ref_kind,
+            emit_ctx.consts.ptr_ty,
+            emit_ctx.consts.thread_state_value,
+            emit_ctx.decref_ref,
+        );
+    }
     fb.ins()
         .call(emit_ctx.incref_ref, &[emit_ctx.consts.none_const]);
     Some(emit_ctx.consts.none_const)
@@ -4952,7 +5111,9 @@ fn direct_method_specializations_for_call_site(
     let Some(method_name) = codegen_constant_string_value(ctx.module, getattr.attr.as_ref()) else {
         return Vec::new();
     };
-    let instr_id = call.semantic_instr_id();
+    let Some(instr_id) = call.try_semantic_instr_id() else {
+        return Vec::new();
+    };
     let Some(targets) = ctx.call_target_specializations.get(&instr_id) else {
         return Vec::new();
     };
@@ -5007,7 +5168,9 @@ fn direct_constructor_specializations_for_call_site(
     if ctx.shared_state.is_none() {
         return Vec::new();
     }
-    let instr_id = call.semantic_instr_id();
+    let Some(instr_id) = call.try_semantic_instr_id() else {
+        return Vec::new();
+    };
     let Some(targets) = ctx.call_target_specializations.get(&instr_id) else {
         return Vec::new();
     };
@@ -6471,14 +6634,15 @@ fn emit_decref_unforwarded_local_env(
     fb: &mut FunctionBuilder<'_>,
     local_env: &LocalEnv,
     target_params: &[String],
+    preserved_values: &[ir::Value],
     thread_state_value: ir::Value,
     decref_ref: ir::FuncRef,
 ) {
     let forwarded_local_indices = local_env.forwarded_entry_indices_for_names(target_params);
     #[cfg(debug_assertions)]
     {
-        let residual_semantic =
-            local_env.transient_semantic_cleanup_names_excluding(&forwarded_local_indices);
+        let residual_semantic = local_env
+            .transient_semantic_cleanup_names_excluding(&forwarded_local_indices, preserved_values);
         debug_assert!(
             residual_semantic.is_empty(),
             "planned edge cleanup left semantic locals for generic LocalEnv cleanup: {:?}",
@@ -6487,6 +6651,9 @@ fn emit_decref_unforwarded_local_env(
     }
     for (index, entry) in local_env.entries.iter().enumerate() {
         if forwarded_local_indices.contains(&index) {
+            continue;
+        }
+        if preserved_values.contains(&entry.value) {
             continue;
         }
         if transient_local_needs_decref(entry.ref_kind) {
@@ -6710,6 +6877,34 @@ fn emit_planned_local_releases_for_reason_with_local_env(
         if action_reason != reason {
             continue;
         }
+        if matches!(reason, RefcountReleaseReason::Raise)
+            && emit_ctx
+                .exception_forwarded_local_names
+                .is_some_and(|names| {
+                    names.iter().any(|name| {
+                        name == &local.name
+                            || local_env
+                                .entry_index_for_block_arg_name(name)
+                                .and_then(|index| local_env.entries[index].location)
+                                == Some(local.location)
+                    })
+                })
+        {
+            continue;
+        }
+        if matches!(reason, RefcountReleaseReason::Raise)
+            && local_env
+                .entry_index_for_location(local.location)
+                .or_else(|| local_env.entry_index_for_name(&local.name))
+                .is_some_and(|index| {
+                    emit_ctx
+                        .consts
+                        .step_null_args
+                        .contains(&local_env.entries[index].value)
+                })
+        {
+            continue;
+        }
         if let Some(previous) = local_env.remove_location_or_name(local.location, &local.name)
             && transient_local_needs_decref(previous.ref_kind)
         {
@@ -6888,6 +7083,64 @@ fn emit_codegen_expr_value_with_local_env(
         func_imports,
     );
     SoacValue::pyobject(value, facts)
+}
+
+#[allow(dead_code)]
+fn emit_typed_codegen_expr_value_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    expr: &InstrTyped,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    borrowed: bool,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<SoacValue, String> {
+    if let InstrTyped::Load(op) = expr {
+        let facts = op
+            .try_semantic_instr_id()
+            .and_then(|instr_id| emit_ctx.value_facts_for_instr_id(instr_id))
+            .and_then(ValueFacts::as_pyobj)
+            .unwrap_or_else(PyObjFacts::unknown);
+        let value = emit_resolved_name_load_with_local_env(
+            fb,
+            &op.name,
+            op.try_semantic_instr_id(),
+            local_env,
+            emit_ctx,
+            borrowed,
+        );
+        return Ok(SoacValue::pyobject(value, facts));
+    }
+
+    if let InstrTyped::Truthy(op) = expr {
+        let value = emit_typed_codegen_expr_value_with_local_env(
+            fb,
+            op.value(),
+            local_env,
+            emit_ctx,
+            false,
+            jit_module,
+            func_imports,
+        )?;
+        let is_true_ref = func_imports.get(jit_module, &mut fb.func, &DP_JIT_IS_TRUE_IMPORT)?;
+        return Ok(emit_truthy_from_owned_value(
+            fb,
+            value,
+            is_true_ref,
+            emit_ctx,
+        ));
+    }
+
+    let legacy_expr = try_lower_typed_instr_to_codegen_legacy(expr.clone())?;
+    Ok(emit_codegen_expr_value_with_local_env(
+        fb,
+        &legacy_expr,
+        local_env,
+        emit_ctx,
+        borrowed,
+        jit_module,
+        func_imports,
+    ))
 }
 
 fn emit_codegen_simple_call_with_local_env(
@@ -7192,24 +7445,24 @@ fn emit_codegen_simple_call_with_local_env(
     }
 
     if !has_unpack && simple_keywords.is_empty() {
-        let site_instr_id = call.semantic_instr_id();
-        let call_target_counter = emit_ctx
-            .call_target_counter_ids
-            .get(&site_instr_id)
+        let site_instr_id = call.try_semantic_instr_id();
+        let call_target_counter = site_instr_id
+            .and_then(|site_instr_id| emit_ctx.call_target_counter_ids.get(&site_instr_id))
             .copied();
-        let direct_hit_counter_id = emit_ctx
-            .call_direct_hit_counter_ids
-            .get(&site_instr_id)
+        let direct_hit_counter_id = site_instr_id
+            .and_then(|site_instr_id| emit_ctx.call_direct_hit_counter_ids.get(&site_instr_id))
             .copied();
-        let direct_fallback_counter_id = emit_ctx
-            .call_direct_fallback_counter_ids
-            .get(&site_instr_id)
+        let direct_fallback_counter_id = site_instr_id
+            .and_then(|site_instr_id| {
+                emit_ctx
+                    .call_direct_fallback_counter_ids
+                    .get(&site_instr_id)
+            })
             .copied();
         let constructor_specializations =
             direct_constructor_specializations_for_call_site(call, emit_ctx);
-        let direct_specializations = emit_ctx
-            .call_target_specializations
-            .get(&site_instr_id)
+        let direct_specializations = site_instr_id
+            .and_then(|site_instr_id| emit_ctx.call_target_specializations.get(&site_instr_id))
             .map(|targets| {
                 targets
                     .iter()
@@ -7615,35 +7868,14 @@ fn emit_codegen_expr_with_local_env(
     func_imports: &mut FuncBuildImports<'_>,
 ) -> ir::Value {
     if let InstrCodegen::Load(op) = expr {
-        if let Some(value) = emit_codegen_non_local_name_load(
+        return emit_resolved_name_load_with_local_env(
             fb,
             &op.name,
-            op.semantic_instr_id(),
+            op.try_semantic_instr_id(),
+            local_env,
             emit_ctx,
             borrowed,
-        ) {
-            return value;
-        }
-        if let Some(location) = op.name.local_location() {
-            let layout = emit_ctx
-                .storage_layout
-                .as_ref()
-                .expect("Load local slot should have storage layout during codegen");
-            let name = local_name_for_location(layout, location);
-            if let Some(value) = local_env.load_location(fb, location, name, emit_ctx, borrowed) {
-                return value;
-            }
-            panic!("missing local {name} in direct JIT state");
-        }
-        if op.name.cell_location().is_some() {
-            assert!(
-                !borrowed,
-                "cell-backed name loads must produce owned references"
-            );
-            let cell_obj =
-                emit_raw_cell_object_for_name_with_local_env(fb, &op.name, local_env, emit_ctx);
-            return emit_cell_value_load_from_raw_cell(fb, cell_obj, emit_ctx);
-        }
+        );
     }
     if let InstrCodegen::IncrementCounter(op) = expr {
         assert!(
@@ -7834,6 +8066,86 @@ fn emit_codegen_expr_with_local_env(
     panic!("operation {expr:?} should have been handled by LocalEnv direct emitter")
 }
 
+fn emit_resolved_name_load_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    name: &ResolvedName,
+    instr_id: Option<InstrId>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    borrowed: bool,
+) -> ir::Value {
+    if let Some(value) = emit_codegen_non_local_name_load(fb, name, instr_id, emit_ctx, borrowed) {
+        return value;
+    }
+    if let Some(location) = name.local_location() {
+        let layout = emit_ctx
+            .storage_layout
+            .as_ref()
+            .expect("Load local slot should have storage layout during codegen");
+        let name = local_name_for_location(layout, location);
+        if let Some(value) = local_env.load_location(fb, location, name, emit_ctx, borrowed) {
+            return value;
+        }
+        panic!("missing local {name} in direct JIT state");
+    }
+    if name.cell_location().is_some() {
+        assert!(
+            !borrowed,
+            "cell-backed name loads must produce owned references"
+        );
+        let cell_obj = emit_raw_cell_object_for_name_with_local_env(fb, name, local_env, emit_ctx);
+        return emit_cell_value_load_from_raw_cell(fb, cell_obj, emit_ctx);
+    }
+    panic!("Load should be resolved before codegen: {name:?}");
+}
+
+#[allow(dead_code)]
+fn emit_typed_codegen_expr_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    expr: &InstrTyped,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    borrowed: bool,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<ir::Value, String> {
+    let value = emit_typed_codegen_expr_value_with_local_env(
+        fb,
+        expr,
+        local_env,
+        emit_ctx,
+        borrowed,
+        jit_module,
+        func_imports,
+    )?;
+    Ok(match value {
+        SoacValue::PyObject { value, .. } => value,
+        SoacValue::I32 {
+            value: truth_i32,
+            facts,
+        } if facts.is_i32_bool01() => {
+            let is_true = fb
+                .ins()
+                .icmp_imm(ir::condcodes::IntCC::NotEqual, truth_i32, 0);
+            let bool_value = fb.ins().select(
+                is_true,
+                emit_ctx.consts.true_const,
+                emit_ctx.consts.false_const,
+            );
+            if !borrowed {
+                fb.ins().call(emit_ctx.incref_ref, &[bool_value]);
+            }
+            bool_value
+        }
+        SoacValue::I32 { .. } | SoacValue::I64 { .. } => {
+            return Err(format!(
+                "typed expression produced {:?} without a PyObject materializer",
+                value.repr()
+            ));
+        }
+    })
+}
+
 fn emit_codegen_stmt_with_local_env(
     fb: &mut FunctionBuilder<'_>,
     expr: &InstrCodegen,
@@ -7872,6 +8184,38 @@ fn emit_codegen_stmt_with_local_env(
         jit_module,
         func_imports,
     )
+}
+
+#[allow(dead_code)]
+fn emit_typed_codegen_stmt_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    expr: &InstrTyped,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<ir::Value, String> {
+    if matches!(expr, InstrTyped::Truthy(_) | InstrTyped::Load(_)) {
+        return emit_typed_codegen_expr_with_local_env(
+            fb,
+            expr,
+            local_env,
+            emit_ctx,
+            false,
+            jit_module,
+            func_imports,
+        );
+    }
+
+    let legacy_expr = try_lower_typed_instr_to_codegen_legacy(expr.clone())?;
+    Ok(emit_codegen_stmt_with_local_env(
+        fb,
+        &legacy_expr,
+        local_env,
+        emit_ctx,
+        jit_module,
+        func_imports,
+    ))
 }
 
 fn local_failure_cleanup_emit_ctx<'mc>(
@@ -7930,7 +8274,7 @@ fn local_failure_cleanup_emit_ctx<'mc>(
 
 fn emit_typed_codegen_ops(
     fb: &mut FunctionBuilder<'_>,
-    ops: &[InstrCodegen],
+    ops: &[InstrTyped],
     local_env: &mut LocalEnv,
     _stack_slots: &StackSlots,
     emit_ctx: &JitEmitCtx<'_>,
@@ -7948,14 +8292,14 @@ fn emit_typed_codegen_ops(
             pending_local_failure_cleanups,
         );
         let stmt_emit_ctx = stmt_emit_ctx.as_ref().unwrap_or(emit_ctx);
-        let value = emit_codegen_stmt_with_local_env(
+        let value = emit_typed_codegen_stmt_with_local_env(
             fb,
             expr,
             local_env,
             stmt_emit_ctx,
             jit_module,
             func_imports,
-        );
+        )?;
         fb.ins().call(
             emit_ctx.decref_ref,
             &[emit_ctx.consts.thread_state_value, value],
@@ -8011,6 +8355,7 @@ fn emit_codegen_if_target_arm(
         fb,
         local_env,
         target_params,
+        &[],
         emit_ctx.consts.thread_state_value,
         emit_ctx.decref_ref,
     );
@@ -8089,6 +8434,7 @@ fn emit_codegen_term(
                 fb,
                 local_env,
                 target_params,
+                &[],
                 emit_ctx.consts.thread_state_value,
                 decref_ref,
             );
@@ -8101,7 +8447,7 @@ fn emit_codegen_term(
             fb.ins().jump(exec_blocks[target_index], &jump_args);
         }
         BlockTerm::IfTerm(if_term) => {
-            let test_instr_id = if_term.test.semantic_instr_id();
+            let test_instr_id = if_term.test.try_semantic_instr_id();
             let test_value = emit_codegen_expr_value_with_local_env(
                 fb,
                 &if_term.test,
@@ -8113,18 +8459,18 @@ fn emit_codegen_term(
             );
             let truth = emit_truthy_from_owned_value(fb, test_value, is_true_ref, emit_ctx);
             let truth_i32 = truth.expect_i32_bool01("if condition truthiness");
-            if let Some(counter_id) = emit_ctx
-                .branch_outcome_counter_ids
-                .get(&test_instr_id)
-                .copied()
-            {
-                emit_record_branch_outcome_sample(fb, counter_id, truth_i32, emit_ctx);
+            if let Some(test_instr_id) = test_instr_id {
+                if let Some(counter_id) = emit_ctx
+                    .branch_outcome_counter_ids
+                    .get(&test_instr_id)
+                    .copied()
+                {
+                    emit_record_branch_outcome_sample(fb, counter_id, truth_i32, emit_ctx);
+                }
             }
 
-            let prefer_true = emit_ctx
-                .branch_prefer_true
-                .get(&test_instr_id)
-                .copied()
+            let prefer_true = test_instr_id
+                .and_then(|test_instr_id| emit_ctx.branch_prefer_true.get(&test_instr_id).copied())
                 .unwrap_or(true);
             let hot_cond = if prefer_true {
                 fb.ins()
@@ -8141,6 +8487,7 @@ fn emit_codegen_term(
             } else {
                 ("else", if_term.else_label, "then", if_term.then_label)
             };
+            let mut hot_local_env = local_env.clone();
             emit_codegen_if_target_arm(
                 fb,
                 source_label,
@@ -8155,11 +8502,12 @@ fn emit_codegen_term(
                 current_exception_name,
                 exec_blocks,
                 runtime_block_param_names,
-                local_env,
+                &mut hot_local_env,
                 emit_ctx,
                 jit_module,
                 func_imports,
             )?;
+            let mut cold_local_env = local_env.clone();
             emit_codegen_if_target_arm(
                 fb,
                 source_label,
@@ -8174,7 +8522,7 @@ fn emit_codegen_term(
                 current_exception_name,
                 exec_blocks,
                 runtime_block_param_names,
-                local_env,
+                &mut cold_local_env,
                 emit_ctx,
                 jit_module,
                 func_imports,
@@ -8219,6 +8567,7 @@ fn emit_codegen_term(
 
             for (target_label, case_block) in branch.targets.iter().zip(case_blocks.iter()) {
                 fb.switch_to_block(*case_block);
+                let mut case_local_env = local_env.clone();
                 let target_index = target_label.index();
                 let target_params = &runtime_block_param_names[target_index];
                 let mut case_jump_args = Vec::with_capacity(target_params.len());
@@ -8228,7 +8577,7 @@ fn emit_codegen_term(
                         target_params,
                         None,
                         None,
-                        local_env,
+                        &mut case_local_env,
                         emit_ctx,
                         jit_module,
                         func_imports,
@@ -8246,13 +8595,14 @@ fn emit_codegen_term(
                     fb,
                     source_label,
                     &release_reason,
-                    local_env,
+                    &mut case_local_env,
                     emit_ctx,
                 )?;
                 emit_decref_unforwarded_local_env(
                     fb,
-                    local_env,
+                    &mut case_local_env,
                     target_params,
+                    &[],
                     emit_ctx.consts.thread_state_value,
                     decref_ref,
                 );
@@ -8266,6 +8616,7 @@ fn emit_codegen_term(
             }
 
             fb.switch_to_block(default_block);
+            let mut default_local_env = local_env.clone();
             let default_index = branch.default_label.index();
             let default_params = &runtime_block_param_names[default_index];
             let mut default_jump_args = Vec::with_capacity(default_params.len());
@@ -8275,7 +8626,7 @@ fn emit_codegen_term(
                     default_params,
                     None,
                     None,
-                    local_env,
+                    &mut default_local_env,
                     emit_ctx,
                     jit_module,
                     func_imports,
@@ -8293,13 +8644,14 @@ fn emit_codegen_term(
                 fb,
                 source_label,
                 &release_reason,
-                local_env,
+                &mut default_local_env,
                 emit_ctx,
             )?;
             emit_decref_unforwarded_local_env(
                 fb,
-                local_env,
+                &mut default_local_env,
                 default_params,
+                &[],
                 emit_ctx.consts.thread_state_value,
                 decref_ref,
             );
@@ -8333,6 +8685,7 @@ fn emit_codegen_term(
             emit_decref_unforwarded_local_env(
                 fb,
                 local_env,
+                &[],
                 &[],
                 emit_ctx.consts.thread_state_value,
                 decref_ref,
@@ -8428,9 +8781,15 @@ fn emit_codegen_term(
             let raise_ok = fb.ins().icmp_imm(ir::condcodes::IntCC::Equal, raise_rc, 0);
             fb.ins()
                 .brif(raise_ok, raise_rc_ok, &[], raise_rc_fail, &[]);
+            let exception_forwarded_names = emit_ctx.exception_forwarded_local_names.unwrap_or(&[]);
 
             fb.switch_to_block(raise_rc_fail);
-            emit_pop_handled_exception_if_leaving(fb, current_exception_name, &[], emit_ctx);
+            emit_pop_handled_exception_if_leaving(
+                fb,
+                current_exception_name,
+                exception_forwarded_names,
+                emit_ctx,
+            );
             fb.ins().jump(
                 emit_ctx.consts.step_null_block,
                 &step_null_block_args(emit_ctx),
@@ -8448,11 +8807,17 @@ fn emit_codegen_term(
             emit_decref_unforwarded_local_env(
                 fb,
                 local_env,
-                &[],
+                exception_forwarded_names,
+                &emit_ctx.consts.step_null_args,
                 emit_ctx.consts.thread_state_value,
                 decref_ref,
             );
-            emit_pop_handled_exception_if_leaving(fb, current_exception_name, &[], emit_ctx);
+            emit_pop_handled_exception_if_leaving(
+                fb,
+                current_exception_name,
+                exception_forwarded_names,
+                emit_ctx,
+            );
             fb.ins().jump(
                 emit_ctx.consts.step_null_block,
                 &step_null_block_args(emit_ctx),
@@ -8671,6 +9036,7 @@ impl ProcessJitEngine {
             return Ok(DirectFunctionCompileResult {
                 handle: compiled_handle,
                 compiled: false,
+                stats: None,
             });
         }
         let _guard = ProcessJitCompileGuard::enter();
@@ -8813,6 +9179,8 @@ impl ProcessJitEngine {
             let mut ctx = built.ctx;
             let main_id = built.main_id;
             let main_symbol = built.main_symbol;
+            let clif_block_count = ctx.func.layout.blocks().count();
+            let clif_inst_count = ctx.func.dfg.num_insts();
             let artifact = define_function_with_incremental_cache(
                 session.as_ref(),
                 &mut state.jit_module,
@@ -8841,6 +9209,13 @@ impl ProcessJitEngine {
                 param_count: function.params.len(),
                 main_id,
                 main_symbol,
+                stats: JitCodegenStats {
+                    clif_block_count,
+                    clif_inst_count,
+                    machine_code_size_bytes: artifact.code_size,
+                    machine_code_block_count: artifact.code_bb_offsets.len(),
+                    machine_code_edge_count: artifact.code_bb_edges.len(),
+                },
                 artifact,
             });
         }
@@ -8850,6 +9225,7 @@ impl ProcessJitEngine {
             .finalize_definitions()
             .map_err(|err| format!("failed to finalize specialized jit run_bb function: {err}"))?;
         let mut root_handle = None;
+        let mut root_stats = None;
         for defined in defined_functions {
             let code_ptr = state.jit_module.get_finalized_function(defined.main_id);
             let compiled_handle = state.mark_direct_function_ready(
@@ -8874,6 +9250,7 @@ impl ProcessJitEngine {
             );
             if defined.function_id == function.function_id {
                 root_handle = Some(compiled_handle);
+                root_stats = Some(defined.stats);
             }
         }
         let handle = root_handle.ok_or_else(|| {
@@ -8885,6 +9262,7 @@ impl ProcessJitEngine {
         Ok(DirectFunctionCompileResult {
             handle,
             compiled: true,
+            stats: root_stats,
         })
     }
 }
@@ -9808,6 +10186,15 @@ fn build_cranelift_run_bb_specialized_function(
             }
         }
     }
+    let typed_function =
+        lower_typed_function_if_tests_to_truthy(lower_codegen_function_to_typed(function.clone()));
+    if typed_function.blocks.len() != function.blocks.len() {
+        return Err(format!(
+            "typed specialized JIT function block count mismatch: {} != {}",
+            typed_function.blocks.len(),
+            function.blocks.len()
+        ));
+    }
 
     let call_target_counter_ids =
         collect_runtime_counter_ids_by_kind(counter_defs, function.function_id, "call_hot_targets");
@@ -10405,9 +10792,15 @@ fn build_cranelift_run_bb_specialized_function(
                             LocalEnvStorage::StackMirror,
                         )
                     };
-                    local_env.bind_entry_location(
+                    let aliases = if param_name == &binding.name {
+                        Vec::new()
+                    } else {
+                        vec![param_name.clone()]
+                    };
+                    local_env.bind_entry_location_with_aliases(
                         binding.location,
                         binding.name.as_str(),
+                        aliases,
                         *param_value,
                         entry_ref_kind,
                         entry_storage,
@@ -10591,7 +10984,7 @@ fn build_cranelift_run_bb_specialized_function(
 
             emit_typed_codegen_ops(
                 &mut fb,
-                &codegen_block.body,
+                &typed_function.blocks[index].body,
                 &mut local_env,
                 &stack_slots,
                 &emit_ctx,

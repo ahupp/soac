@@ -3,6 +3,7 @@ use crate::counter_dump::{
     CounterDumpKeyLayout, CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey,
     CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry,
 };
+use crate::jit::JitCodegenStats;
 use crate::module_constants::ModuleCodegenConstants;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::ffi;
@@ -237,6 +238,7 @@ impl SharedModuleState {
                         compile_start.elapsed(),
                         "ok",
                         None,
+                        result.stats.as_ref(),
                     );
                 }
                 Ok(Some(result.handle))
@@ -248,6 +250,7 @@ impl SharedModuleState {
                     compile_start.elapsed(),
                     "error",
                     Some(&err),
+                    None,
                 );
                 return Err(format!(
                     "{err} [direct_target={} id={}]",
@@ -257,15 +260,16 @@ impl SharedModuleState {
         }
     }
 
-    pub fn append_jit_codegen_log(
+    pub(crate) fn append_jit_codegen_log(
         &self,
         function: &BlockPyFunction<CodegenModuleShape>,
         entry_kind: &str,
         elapsed: Duration,
         status: &str,
         error: Option<&str>,
+        stats: Option<&JitCodegenStats>,
     ) {
-        append_jit_codegen_log(self, function, entry_kind, elapsed, status, error);
+        append_jit_codegen_log(self, function, entry_kind, elapsed, status, error, stats);
     }
 
     pub fn append_specialization_runtime_log(&self) {
@@ -750,7 +754,9 @@ fn append_jit_codegen_log(
     elapsed: Duration,
     status: &str,
     error: Option<&str>,
+    stats: Option<&JitCodegenStats>,
 ) {
+    let stats = stats.copied().unwrap_or_default();
     info!(
         target: "soac_jit_codegen",
         event = "soac.jit_codegen",
@@ -763,6 +769,11 @@ fn append_jit_codegen_log(
         function_block_count = function.blocks.len(),
         function_entry_kind = entry_kind,
         jit_codegen_total_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+        jit_clif_block_count = u64::try_from(stats.clif_block_count).unwrap_or(u64::MAX),
+        jit_clif_inst_count = u64::try_from(stats.clif_inst_count).unwrap_or(u64::MAX),
+        jit_machine_code_size_bytes = u64::try_from(stats.machine_code_size_bytes).unwrap_or(u64::MAX),
+        jit_machine_code_block_count = u64::try_from(stats.machine_code_block_count).unwrap_or(u64::MAX),
+        jit_machine_code_edge_count = u64::try_from(stats.machine_code_edge_count).unwrap_or(u64::MAX),
         "jit_codegen",
     );
 }

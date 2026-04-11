@@ -393,6 +393,40 @@ mod tests {
         with_test_blocks(function, vec![block])
     }
 
+    fn build_test_specialized_function(
+        blocks: &[ObjPtr],
+        module: &BlockPyModule<CodegenModuleShape>,
+        function: &BlockPyFunction<CodegenModuleShape>,
+        module_constants: &crate::module_constants::ModuleCodegenConstants,
+    ) -> BuiltSpecializedFunction {
+        let compile_session = crate::session::CompileSession::new();
+        let mut jit_module =
+            new_jit_module(&compile_session).expect("test jit module should construct");
+        let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
+        let module_constant_table_data_id =
+            define_module_constant_table_data(&mut jit_module, module, &module_constant_ptrs)
+                .expect("module constant table data should define");
+        let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
+            define_test_counter_storage(&mut jit_module, module, &module.counter_defs);
+        build_cranelift_run_bb_specialized_function(
+            &mut jit_module,
+            blocks,
+            module,
+            function,
+            module_constants,
+            &module.counter_defs,
+            module_constant_table_data_id,
+            counter_slots_by_id.as_ref(),
+            scalar_counter_data_id,
+            top_value_counter_data_id,
+            &compile_session,
+            None,
+            None,
+            None,
+        )
+        .expect("test specialized JIT function should build")
+    }
+
     #[test]
     fn specialized_jit_branch_terms_compile_via_typed_truthiness() {
         let mut constants = TestConstantPool::default();
@@ -435,38 +469,12 @@ mod tests {
         };
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
-        unsafe {
-            let compile_session = crate::session::CompileSession::new();
-            let mut jit_module =
-                new_jit_module(&compile_session).expect("test jit module should construct");
-            let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
-            let module_constant_table_data_id =
-                define_module_constant_table_data(&mut jit_module, &module, &module_constant_ptrs)
-                    .expect("module constant table data should define");
-            let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
-                define_test_counter_storage(
-                    &mut jit_module,
-                    &module,
-                    module.counter_defs.as_slice(),
-                );
-            build_cranelift_run_bb_specialized_function(
-                &mut jit_module,
-                &[1usize as ObjPtr, 2usize as ObjPtr, 3usize as ObjPtr],
-                &module,
-                &function,
-                &module_constants,
-                module.counter_defs.as_slice(),
-                module_constant_table_data_id,
-                counter_slots_by_id.as_ref(),
-                scalar_counter_data_id,
-                top_value_counter_data_id,
-                &compile_session,
-                None,
-                None,
-                None,
-            )
-            .expect("branch function should build through typed truthiness emission");
-        }
+        build_test_specialized_function(
+            &[1usize as ObjPtr, 2usize as ObjPtr, 3usize as ObjPtr],
+            &module,
+            &function,
+            &module_constants,
+        );
     }
 
     #[test]
@@ -489,38 +497,7 @@ mod tests {
         };
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
-        unsafe {
-            let compile_session = crate::session::CompileSession::new();
-            let mut jit_module =
-                new_jit_module(&compile_session).expect("test jit module should construct");
-            let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
-            let module_constant_table_data_id =
-                define_module_constant_table_data(&mut jit_module, &module, &module_constant_ptrs)
-                    .expect("module constant table data should define");
-            let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
-                define_test_counter_storage(
-                    &mut jit_module,
-                    &module,
-                    module.counter_defs.as_slice(),
-                );
-            build_cranelift_run_bb_specialized_function(
-                &mut jit_module,
-                &[1usize as ObjPtr],
-                &module,
-                &function,
-                &module_constants,
-                module.counter_defs.as_slice(),
-                module_constant_table_data_id,
-                counter_slots_by_id.as_ref(),
-                scalar_counter_data_id,
-                top_value_counter_data_id,
-                &compile_session,
-                None,
-                None,
-                None,
-            )
-            .expect("raise function should build through typed exception expression emission");
-        }
+        build_test_specialized_function(&[1usize as ObjPtr], &module, &function, &module_constants);
     }
     #[test]
     fn specialized_jit_branch_table_terms_compile_via_typed_index_expr() {
@@ -564,38 +541,12 @@ mod tests {
         };
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
-        unsafe {
-            let compile_session = crate::session::CompileSession::new();
-            let mut jit_module =
-                new_jit_module(&compile_session).expect("test jit module should construct");
-            let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
-            let module_constant_table_data_id =
-                define_module_constant_table_data(&mut jit_module, &module, &module_constant_ptrs)
-                    .expect("module constant table data should define");
-            let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
-                define_test_counter_storage(
-                    &mut jit_module,
-                    &module,
-                    module.counter_defs.as_slice(),
-                );
-            build_cranelift_run_bb_specialized_function(
-                &mut jit_module,
-                &[1usize as ObjPtr, 2usize as ObjPtr, 3usize as ObjPtr],
-                &module,
-                &function,
-                &module_constants,
-                module.counter_defs.as_slice(),
-                module_constant_table_data_id,
-                counter_slots_by_id.as_ref(),
-                scalar_counter_data_id,
-                top_value_counter_data_id,
-                &compile_session,
-                None,
-                None,
-                None,
-            )
-            .expect("branch-table function should build through typed index expression emission");
-        }
+        build_test_specialized_function(
+            &[1usize as ObjPtr, 2usize as ObjPtr, 3usize as ObjPtr],
+            &module,
+            &function,
+            &module_constants,
+        );
     }
     #[test]
     fn specialized_jit_body_statements_compile_via_typed_ops() {
@@ -614,38 +565,7 @@ mod tests {
         };
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
-        unsafe {
-            let compile_session = crate::session::CompileSession::new();
-            let mut jit_module =
-                new_jit_module(&compile_session).expect("test jit module should construct");
-            let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
-            let module_constant_table_data_id =
-                define_module_constant_table_data(&mut jit_module, &module, &module_constant_ptrs)
-                    .expect("module constant table data should define");
-            let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
-                define_test_counter_storage(
-                    &mut jit_module,
-                    &module,
-                    module.counter_defs.as_slice(),
-                );
-            build_cranelift_run_bb_specialized_function(
-                &mut jit_module,
-                &[1usize as ObjPtr],
-                &module,
-                &function,
-                &module_constants,
-                module.counter_defs.as_slice(),
-                module_constant_table_data_id,
-                counter_slots_by_id.as_ref(),
-                scalar_counter_data_id,
-                top_value_counter_data_id,
-                &compile_session,
-                None,
-                None,
-                None,
-            )
-            .expect("body statement function should build through typed statement emission");
-        }
+        build_test_specialized_function(&[1usize as ObjPtr], &module, &function, &module_constants);
     }
     fn direct_call_expr(function_id: FunctionId) -> InstrCodegen {
         InstrCodegen::CallDirect(CallDirect::new(
@@ -771,8 +691,9 @@ mod tests {
         let env = LocalEnv {
             entries: vec![
                 LocalEnvEntry {
-                    location: LocalLocation(0),
+                    location: Some(LocalLocation(0)),
                     name: "local".to_string(),
+                    aliases: Vec::new(),
                     value: owned_local,
                     ref_kind: LocalRefKind::Owned,
                     storage: LocalEnvStorage::LocalOnly,
@@ -782,8 +703,9 @@ mod tests {
                     ),
                 },
                 LocalEnvEntry {
-                    location: LocalLocation(1),
+                    location: Some(LocalLocation(1)),
                     name: "mirror".to_string(),
+                    aliases: Vec::new(),
                     value: owned_mirror,
                     ref_kind: LocalRefKind::Owned,
                     storage: LocalEnvStorage::StackMirror,
@@ -793,8 +715,9 @@ mod tests {
                     ),
                 },
                 LocalEnvEntry {
-                    location: LocalLocation(2),
+                    location: Some(LocalLocation(2)),
                     name: "immortal".to_string(),
+                    aliases: Vec::new(),
                     value: immortal_local,
                     ref_kind: LocalRefKind::Immortal,
                     storage: LocalEnvStorage::LocalOnly,
@@ -814,8 +737,9 @@ mod tests {
         let env = LocalEnv {
             entries: vec![
                 LocalEnvEntry {
-                    location: LocalLocation(0),
+                    location: Some(LocalLocation(0)),
                     name: "x".to_string(),
+                    aliases: Vec::new(),
                     value: ir::Value::from_u32(1),
                     ref_kind: LocalRefKind::Owned,
                     storage: LocalEnvStorage::LocalOnly,
@@ -825,8 +749,9 @@ mod tests {
                     ),
                 },
                 LocalEnvEntry {
-                    location: LocalLocation(1),
+                    location: Some(LocalLocation(1)),
                     name: "y".to_string(),
+                    aliases: Vec::new(),
                     value: ir::Value::from_u32(2),
                     ref_kind: LocalRefKind::Owned,
                     storage: LocalEnvStorage::LocalOnly,
@@ -836,8 +761,9 @@ mod tests {
                     ),
                 },
                 LocalEnvEntry {
-                    location: LocalLocation(2),
+                    location: Some(LocalLocation(2)),
                     name: "tmp".to_string(),
+                    aliases: Vec::new(),
                     value: ir::Value::from_u32(3),
                     ref_kind: LocalRefKind::Borrowed,
                     storage: LocalEnvStorage::LocalOnly,
@@ -847,8 +773,9 @@ mod tests {
                     ),
                 },
                 LocalEnvEntry {
-                    location: LocalLocation(3),
+                    location: Some(LocalLocation(3)),
                     name: "immortal".to_string(),
+                    aliases: Vec::new(),
                     value: ir::Value::from_u32(4),
                     ref_kind: LocalRefKind::Immortal,
                     storage: LocalEnvStorage::LocalOnly,
@@ -862,7 +789,7 @@ mod tests {
         let forwarded = HashSet::from([1usize]);
 
         assert_eq!(
-            env.transient_semantic_cleanup_names_excluding(&forwarded),
+            env.transient_semantic_cleanup_names_excluding(&forwarded, &[]),
             vec!["x".to_string()]
         );
     }
@@ -910,8 +837,9 @@ mod tests {
             let decref_ref = jit_module.declare_func_in_func(decref_id, &mut fb.func);
             let env = LocalEnv {
                 entries: vec![LocalEnvEntry {
-                    location: LocalLocation(0),
+                    location: Some(LocalLocation(0)),
                     name: "x".to_string(),
+                    aliases: Vec::new(),
                     value: fb.block_params(entry)[0],
                     ref_kind: LocalRefKind::Owned,
                     storage: LocalEnvStorage::LocalOnly,
@@ -921,7 +849,7 @@ mod tests {
                     ),
                 }],
             };
-            emit_decref_unforwarded_local_env(&mut fb, &env, &[], null_tstate, decref_ref);
+            emit_decref_unforwarded_local_env(&mut fb, &env, &[], &[], null_tstate, decref_ref);
         }));
 
         assert!(
@@ -972,8 +900,9 @@ mod tests {
             let decref_ref = jit_module.declare_func_in_func(decref_id, &mut fb.func);
             let env = LocalEnv {
                 entries: vec![LocalEnvEntry {
-                    location: LocalLocation(0),
+                    location: Some(LocalLocation(0)),
                     name: "x".to_string(),
+                    aliases: Vec::new(),
                     value: fb.block_params(entry)[0],
                     ref_kind: LocalRefKind::Owned,
                     storage: LocalEnvStorage::LocalOnly,
@@ -987,6 +916,7 @@ mod tests {
                 &mut fb,
                 &env,
                 &["x".to_string()],
+                &[],
                 null_tstate,
                 decref_ref,
             );
@@ -1000,8 +930,9 @@ mod tests {
     fn local_env_borrowability_uses_location_entries() {
         let env = LocalEnv {
             entries: vec![LocalEnvEntry {
-                location: LocalLocation(0),
+                location: Some(LocalLocation(0)),
                 name: "x".to_string(),
+                aliases: Vec::new(),
                 value: ir::Value::from_u32(1),
                 ref_kind: LocalRefKind::Owned,
                 storage: LocalEnvStorage::LocalOnly,
@@ -1028,8 +959,9 @@ mod tests {
     fn local_env_borrowability_uses_storage_layout_name_entries() {
         let env = LocalEnv {
             entries: vec![LocalEnvEntry {
-                location: LocalLocation(9),
+                location: Some(LocalLocation(9)),
                 name: "x".to_string(),
+                aliases: Vec::new(),
                 value: ir::Value::from_u32(1),
                 ref_kind: LocalRefKind::Owned,
                 storage: LocalEnvStorage::LocalOnly,
@@ -1113,8 +1045,9 @@ mod tests {
             let incref_ref = jit_module.declare_func_in_func(incref_id, &mut fb.func);
             let decref_ref = jit_module.declare_func_in_func(decref_id, &mut fb.func);
             env.entries.push(LocalEnvEntry {
-                location: LocalLocation(0),
+                location: Some(LocalLocation(0)),
                 name: "x".to_string(),
+                aliases: Vec::new(),
                 value: old_value,
                 ref_kind: LocalRefKind::Owned,
                 storage: initial_storage,
@@ -1240,7 +1173,7 @@ mod tests {
         let (env, rendered) = local_env_store_test_state(&[], LocalEnvStorage::LocalOnly);
 
         assert_eq!(env.entries.len(), 1, "{rendered}");
-        assert_eq!(env.entries[0].location, LocalLocation(0));
+        assert_eq!(env.entries[0].location, Some(LocalLocation(0)));
         assert_eq!(env.entries[0].name, "x");
         assert_eq!(env.entries[0].ref_kind, LocalRefKind::Owned);
         assert_eq!(env.entries[0].storage, LocalEnvStorage::LocalOnly);
@@ -3163,37 +3096,9 @@ def f():
             .map(|block| block.label)
             .expect("expected matching exception edge source block");
         let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
-        unsafe {
-            let compile_session = crate::session::CompileSession::new();
-            let mut jit_module =
-                new_jit_module(&compile_session).expect("test jit module should construct");
-            let module_constant_ptrs = placeholder_module_constant_ptrs(codegen_constants.len());
-            let module_constant_table_data_id =
-                define_module_constant_table_data(&mut jit_module, &lowered, &module_constant_ptrs)
-                    .expect("module constant table data should define");
-            let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
-                define_test_counter_storage(
-                    &mut jit_module,
-                    &lowered,
-                    lowered.counter_defs.as_slice(),
-                );
-            let built = build_cranelift_run_bb_specialized_function(
-                &mut jit_module,
-                &blocks,
-                &lowered,
-                &function,
-                &codegen_constants,
-                lowered.counter_defs.as_slice(),
-                module_constant_table_data_id,
-                counter_slots_by_id.as_ref(),
-                scalar_counter_data_id,
-                top_value_counter_data_id,
-                &compile_session,
-                None,
-                None,
-                None,
-            )
-            .expect("specialized JIT build should succeed");
+        {
+            let built =
+                build_test_specialized_function(&blocks, &lowered, &function, &codegen_constants);
 
             let expected_name = format!("exc_dispatch::{source_label}");
             let (dispatch_block_name, dispatch_annotation) = built

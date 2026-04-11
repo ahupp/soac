@@ -1022,6 +1022,7 @@ unsafe extern "C" fn push_handled_exception_hook(exc: ObjPtr) -> ObjPtr {
     }
     let previous = PyErr_GetHandledException();
     attach_implicit_exception_context(exc as *mut ffi::PyObject, previous);
+    ffi::Py_INCREF(exc as *mut ffi::PyObject);
     PyErr_SetHandledException(exc as *mut ffi::PyObject);
     previous as ObjPtr
 }

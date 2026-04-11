@@ -1,9 +1,11 @@
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 use soac_blockpy::block_py::FunctionKind;
+use soac_blockpy::passes::infer_module_value_facts;
 use soac_jit::{
-    exc_dispatch_plan, jit_param_names_for_block,
+    exc_dispatch_plan,
     module_type::{hash_module_source, indexed_module_info},
+    plan_function_locals, planned_jit_param_names_for_block,
 };
 use std::any::Any;
 use std::collections::HashSet;
@@ -330,15 +332,24 @@ def exercise():
         .find(|function| function.names.bind_name == "gen_resume")
         .expect("missing lowered generator resume function");
     let registered_function = gen_function;
+    let value_facts = infer_module_value_facts(&normalized);
+    let local_plan = plan_function_locals(registered_function, &value_facts);
     let plan_runtime_param_names = registered_function
         .blocks
         .iter()
-        .map(jit_param_names_for_block)
+        .map(|block| planned_jit_param_names_for_block(block, local_plan.block(block.label)))
         .collect::<Vec<_>>();
     let plan_exc_dispatches = registered_function
         .blocks
         .iter()
-        .map(|block| exc_dispatch_plan(registered_function, block))
+        .map(|block| {
+            let runtime_target_params = block
+                .exc_edge
+                .as_ref()
+                .map(|edge| plan_runtime_param_names[edge.target.index()].as_slice())
+                .unwrap_or(&[]);
+            exc_dispatch_plan(registered_function, block, runtime_target_params)
+        })
         .collect::<Vec<_>>();
 
     let handler_entry_targets = plan_runtime_param_names
