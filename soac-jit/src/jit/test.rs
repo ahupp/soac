@@ -10,7 +10,7 @@ use soac_blockpy::block_py::{
 use soac_blockpy::passes::{
     CodegenModuleShape, instrument_bb_module_with_block_entry_counters,
     instrument_bb_module_with_call_target_counters, instrument_bb_module_with_refcount_counters,
-    validate_codegen_instr_ids,
+    lower_codegen_module_to_typed, validate_codegen_instr_ids,
 };
 mod tests {
     use super::*;
@@ -64,6 +64,18 @@ mod tests {
             stable_cranelift_compile_cache_name("direct:pkg.mod.fn:2"),
             stable_cranelift_compile_cache_name("direct:pkg.mod.fn:3")
         );
+    }
+
+    #[test]
+    fn typed_legacy_cranelift_smoke_accepts_typed_module() {
+        let lowered =
+            soac_blockpy::lower_python_to_blockpy_for_testing("def f(a, b):\n    return a + b\n")
+                .expect("source should lower")
+                .codegen_module;
+        let typed = lower_codegen_module_to_typed(lowered);
+
+        run_typed_legacy_cranelift_smoke(&typed)
+            .expect("typed legacy module should pass JIT smoke");
     }
 
     unsafe extern "C" fn test_capsule_destructor(_capsule: *mut ffi::PyObject) {
@@ -1366,8 +1378,7 @@ def write_point(point, value):
                 .unwrap_or_else(|| {
                     panic!(
                         "missing field_indexed_hit counter for SetAttr {:?} in {:?}",
-                        setattr_instr_id,
-                        field_counter_sites
+                        setattr_instr_id, field_counter_sites
                     )
                 });
             let fallback_counter_id = lowered
@@ -1388,8 +1399,7 @@ def write_point(point, value):
                 .unwrap_or_else(|| {
                     panic!(
                         "missing field_indexed_fallback counter for SetAttr {:?} in {:?}",
-                        setattr_instr_id,
-                        field_counter_sites
+                        setattr_instr_id, field_counter_sites
                     )
                 });
 
@@ -1440,8 +1450,7 @@ def write_point(point, value):
             let value = unsafe { ffi::PyLong_FromLong(1_234_567) };
             assert!(!value.is_null(), "test value should allocate");
 
-            let mut function_context =
-                test_function_jit_context(&runtime, std::ptr::null_mut());
+            let mut function_context = test_function_jit_context(&runtime, std::ptr::null_mut());
             let thread_state = unsafe { ffi::PyThreadState_Get() }.cast::<c_void>();
             let result = unsafe {
                 entry(
@@ -1451,7 +1460,10 @@ def write_point(point, value):
                     value.cast(),
                 )
             };
-            assert!(!result.is_null(), "write_point should return the stored value");
+            assert!(
+                !result.is_null(),
+                "write_point should return the stored value"
+            );
 
             assert_eq!(
                 shared_state.counter_value(hit_counter_id),

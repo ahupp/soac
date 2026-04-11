@@ -27,8 +27,9 @@ use soac_blockpy::block_py::{
 };
 use soac_blockpy::passes::{
     CodegenModuleShape, FactStore, FunctionRefcountPlan, InstrResolved, InstrTyped, PyExactType,
-    PyObjFacts, RefcountActionKind, RefcountReleaseReason, RuntimeHelperId, ValueFacts,
-    infer_module_value_facts, try_lower_typed_instr_to_codegen_legacy,
+    PyObjFacts, RefcountActionKind, RefcountReleaseReason, RuntimeHelperId,
+    TypedCodegenModuleShape, ValueFacts, infer_module_value_facts,
+    try_lower_typed_instr_to_codegen_legacy, try_lower_typed_module_to_codegen_legacy,
 };
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -11304,6 +11305,13 @@ pub fn run_cranelift_smoke(module: &BlockPyModule<CodegenModuleShape>) -> Result
         ));
     }
     Ok(())
+}
+
+pub fn run_typed_legacy_cranelift_smoke(
+    module: &BlockPyModule<TypedCodegenModuleShape>,
+) -> Result<(), String> {
+    let legacy_module = try_lower_typed_module_to_codegen_legacy(module.clone())?;
+    run_cranelift_smoke(&legacy_module)
 }
 
 fn build_cranelift_run_bb_specialized_function(
