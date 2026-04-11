@@ -8227,6 +8227,25 @@ fn emit_typed_codegen_expr_value_with_local_env(
     jit_module: &mut JITModule,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<SoacValue, String> {
+    if let InstrTyped::Truthy(op) = expr {
+        let value = emit_typed_codegen_expr_value_with_local_env(
+            fb,
+            op.value(),
+            local_env,
+            emit_ctx,
+            false,
+            jit_module,
+            func_imports,
+        )?;
+        let is_true_ref = func_imports.get(jit_module, &mut fb.func, &DP_JIT_IS_TRUE_IMPORT)?;
+        return Ok(emit_truthy_from_owned_value(
+            fb,
+            value,
+            is_true_ref,
+            emit_ctx,
+        ));
+    }
+
     let legacy_expr = try_lower_typed_instr_to_codegen_legacy(expr.clone())?;
     Ok(emit_codegen_expr_value_with_local_env(
         fb,
@@ -9264,16 +9283,41 @@ fn emit_typed_codegen_expr_with_local_env(
     jit_module: &mut JITModule,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<ir::Value, String> {
-    let legacy_expr = try_lower_typed_instr_to_codegen_legacy(expr.clone())?;
-    Ok(emit_codegen_expr_with_local_env(
+    let value = emit_typed_codegen_expr_value_with_local_env(
         fb,
-        &legacy_expr,
+        expr,
         local_env,
         emit_ctx,
         borrowed,
         jit_module,
         func_imports,
-    ))
+    )?;
+    Ok(match value {
+        SoacValue::PyObject { value, .. } => value,
+        SoacValue::I32 {
+            value: truth_i32,
+            facts,
+        } if facts.is_i32_bool01() => {
+            let is_true = fb
+                .ins()
+                .icmp_imm(ir::condcodes::IntCC::NotEqual, truth_i32, 0);
+            let bool_value = fb.ins().select(
+                is_true,
+                emit_ctx.consts.true_const,
+                emit_ctx.consts.false_const,
+            );
+            if !borrowed {
+                fb.ins().call(emit_ctx.incref_ref, &[bool_value]);
+            }
+            bool_value
+        }
+        SoacValue::I32 { .. } | SoacValue::I64 { .. } => {
+            return Err(format!(
+                "typed expression produced {:?} without a PyObject materializer",
+                value.repr()
+            ));
+        }
+    })
 }
 
 fn emit_codegen_stmt_with_local_env(
@@ -9362,6 +9406,18 @@ fn emit_typed_codegen_stmt_with_local_env(
     jit_module: &mut JITModule,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<ir::Value, String> {
+    if matches!(expr, InstrTyped::Truthy(_)) {
+        return emit_typed_codegen_expr_with_local_env(
+            fb,
+            expr,
+            local_env,
+            emit_ctx,
+            false,
+            jit_module,
+            func_imports,
+        );
+    }
+
     let legacy_expr = try_lower_typed_instr_to_codegen_legacy(expr.clone())?;
     Ok(emit_codegen_stmt_with_local_env(
         fb,
