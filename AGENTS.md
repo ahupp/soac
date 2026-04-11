@@ -275,14 +275,15 @@ anything non-code affected the run. If there were no such issues, say
   Use for vendored CPython regrtest runs.
 - `$soac-profile-benchmark`
   Default skill for performance benchmark requests. This uses the
-  artifact-producing pystone workflow: profile, verify, specialized apply
-  benchmark, textual counter/specialization dumps, and rendered CLIF/VCode.
-  Perf remains a separate follow-on step when needed. One-off test benchmarks write
-  `bench/{change_id}_{commit_id}`. Finalized benchmarks for changes that are
-  being merged to `main` must run after rebasing onto `main` and write
-  `bench/{change_id}`. Report the specialized apply-pass median from the result
-  directory's `benchmark.txt` unless I explicitly ask for the warm
-  unspecialized baseline.
+  default pystone workflow: profile, verify, and specialized apply benchmark.
+  One-off test benchmarks write `bench/{change_id}_{commit_id}`. Finalized
+  benchmarks for changes that are being merged to `main` must run after rebasing
+  onto `main` and write `bench/{change_id}`. Use `just benchmark-deep-profile`
+  when the user explicitly wants inspector/CLIF artifacts or perf capture, and
+  use `just benchmark-deep-profile-from-profile <result-dir>` to extend an
+  existing `counters/profile.bin` result without rerunning the profile pass.
+  Report the specialized apply-pass median from the result directory's
+  `benchmark.txt` unless I explicitly ask for the warm unspecialized baseline.
 - Repo-local uv state
   `.envrc` and `Justfile` keep uv and XDG state under the repo with
   `UV_CACHE_DIR`, `UV_TOOL_DIR`, `UV_TOOL_BIN_DIR`, `XDG_CACHE_HOME`,

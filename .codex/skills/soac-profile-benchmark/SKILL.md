@@ -1,12 +1,12 @@
 ---
 name: soac-profile-benchmark
-description: Run SOAC's artifact-producing pystone profile benchmark and summarize its result directory. Use when Codex needs to benchmark transformed/JIT pystone, capture profile/verify/specialized counters, render specialized CLIF, or summarize benchmark artifacts.
+description: Run SOAC's pystone benchmark and summarize its result directory. Use when Codex needs to benchmark transformed/JIT pystone, capture profile/verify/apply results, or extend an existing profile run with CLIF/perf artifacts.
 ---
 
 # SOAC Profile Benchmark
 
-Use the artifact-producing `Justfile` benchmark recipe from the repo root.
-It writes one result directory under the ignored shared `bench/` tree.
+Use the repo `Justfile` benchmark recipes from the repo root. They write one
+result directory under the ignored shared `bench/` tree.
 
 ## Run
 
@@ -42,9 +42,20 @@ just benchmark 1000000
 - transformed profile pass
 - transformed verify pass
 - transformed specialized apply pass
+
+If the user explicitly wants the heavy follow-on artifacts, use one of:
+
+```bash
+just benchmark-deep-profile
+just benchmark-deep-profile-from-profile <result-dir>
+```
+
+These add:
+
 - counter / specialization text dumps
 - rendered post-opt CLIF for every lowered pystone function
-- rendered Cranelift VCode for every lowered pystone function
+- rendered Cranelift VCode / CFG for every lowered pystone function
+- perf capture and perf-annotated VCode
 
 ## Summarize
 
@@ -52,27 +63,33 @@ just benchmark 1000000
 directory, especially:
 
 - `benchmark.txt`
+- `counters/profile.bin`
+- `counters/verify.bin`
+- `counters/events.jsonl`
+
+If the deep-profile recipe was used, also read:
+
+- `deep_profile.txt`
 - `profile_counters.txt`
 - `verify_counters.txt`
 - `profile_specializations.txt`
 - `verify_specializations.txt`
+- `perf.data`
+- `perf.injected.data`
 - `clif/functions.tsv`
 - `clif/fn_<function_id>_<qualname>.clif`
 - `clif/fn_<function_id>_<qualname>.vcode`
+- `clif/fn_<function_id>_<qualname>.annotated.vcode`
 
 For a default benchmark request, report:
 
 - result directory
 - specialized apply-pass loops per second from `benchmark.txt`
 - verify-mode loops per second
-- any specialization-summary or verify-counter surprises
+- any obvious benchmark/runtime surprises
 
 If helpful, you may also mention the profiling-pass throughput, but do not use it
 as the headline result.
-
-If the user asks for perf data after the benchmark run, collect it as a separate
-follow-on step with the dedicated perf recipes or the `analyze-pystone-perf`
-skill.
 
 If the user asks for a warmed unspecialized comparison, use `just benchmark-warm`
 and label it clearly as the warm baseline rather than the artifact-producing

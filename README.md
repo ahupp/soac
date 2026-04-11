@@ -228,12 +228,23 @@ Notes:
 ## Perf And Benchmarking
 
 - `just benchmark`
-  The artifact-producing benchmark recipe runs the transformed profile,
-  verify, and specialized apply passes, then writes counter dumps and
-  rendered CLIF/VCode under `bench/{change_id}_{commit_id}` for one-off
-  runs or `bench/{change_id}` for finalized runs. It does not run
-  `perf`; collect perf separately with the dedicated perf recipes when
-  you need sampling data.
+  The default benchmark recipe runs the transformed profile, verify,
+  and specialized apply passes and writes the raw result directory under
+  `bench/{change_id}_{commit_id}` for one-off runs or `bench/{change_id}`
+  for finalized runs. By default it keeps only the benchmark log and raw
+  counter files (`profile.bin`, `verify.bin`, `events.jsonl`); it does
+  not run `perf` and it does not build inspector-based counter/CLIF
+  artifacts.
+
+- `just benchmark-deep-profile`
+  Run `just benchmark`, then add the heavier follow-on artifacts in the
+  same result directory: counter/specialization text dumps, rendered
+  specialized CLIF/VCode/CFG, `perf` capture, and perf-annotated VCode.
+
+- `just benchmark-deep-profile-from-profile <result-dir>`
+  Start from an existing result directory with `counters/profile.bin`,
+  rerun only the verify pass to produce `verify.bin`, then add the same
+  deep-profile artifacts without rerunning the profile pass.
 
 - `SOAC_JIT_PERF_HELPER_FRAMES=1`
   In `fn should_preserve_perf_helper_frames`, at

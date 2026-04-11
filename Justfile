@@ -991,11 +991,10 @@ benchmark benchmark_loops="1000000" verify_loops="100000" results_root="bench" r
   esac
   result_dir="$RESULTS_ROOT/$result_name"
   counters_dir="$result_dir/counters"
-  clif_dir="$result_dir/clif"
   report="$result_dir/benchmark.txt"
 
   rm -rf "$result_dir"
-  mkdir -p "$counters_dir" "$clif_dir"
+  mkdir -p "$counters_dir"
   SOAC_BENCHMARK_EVENTS_LOG="$counters_dir/events.jsonl"
   rm -f "$SOAC_BENCHMARK_EVENTS_LOG"
 
@@ -1050,36 +1049,48 @@ benchmark benchmark_loops="1000000" verify_loops="100000" results_root="bench" r
     done
   } 2>&1 | tee "$report"
 
+  echo "benchmark result: $result_dir"
+
+[private]
+_benchmark-export-specialized-artifacts result_dir:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cd "$REPO_ROOT"
+
+  RESULT_DIR="{{result_dir}}"
+  if [[ "$RESULT_DIR" != /* ]]; then
+    RESULT_DIR="$REPO_ROOT/$RESULT_DIR"
+  fi
+  COUNTERS_DIR="$RESULT_DIR/counters"
+  CLIF_DIR="$RESULT_DIR/clif"
+
+  if [[ ! -f "$COUNTERS_DIR/profile.bin" ]]; then
+    echo "counter profile not found at $COUNTERS_DIR/profile.bin; run 'just benchmark' first or pass result_dir=<dir>" >&2
+    exit 1
+  fi
+  if [[ ! -f "$COUNTERS_DIR/verify.bin" ]]; then
+    echo "verification counters not found at $COUNTERS_DIR/verify.bin; run 'just benchmark-verify' or 'just benchmark-deep-profile-from-profile' first" >&2
+    exit 1
+  fi
+
+  rm -rf "$CLIF_DIR"
+  mkdir -p "$CLIF_DIR"
+
   cargo run -p soac-inspector --bin inspect_counters -- \
-    "$counters_dir/profile.bin" > "$result_dir/profile_counters.txt"
+    "$COUNTERS_DIR/profile.bin" > "$RESULT_DIR/profile_counters.txt"
   cargo run -p soac-inspector --bin inspect_counters -- \
-    "$counters_dir/verify.bin" > "$result_dir/verify_counters.txt"
+    "$COUNTERS_DIR/verify.bin" > "$RESULT_DIR/verify_counters.txt"
   cargo run -p soac-inspector --bin inspect_counters -- \
-    --specializations "$counters_dir/profile.bin" > "$result_dir/profile_specializations.txt"
+    --specializations "$COUNTERS_DIR/profile.bin" > "$RESULT_DIR/profile_specializations.txt"
   cargo run -p soac-inspector --bin inspect_counters -- \
-    --specializations "$counters_dir/verify.bin" > "$result_dir/verify_specializations.txt"
+    --specializations "$COUNTERS_DIR/verify.bin" > "$RESULT_DIR/verify_specializations.txt"
 
   cargo run -q -p soac-inspector --bin list_jit_functions -- scripts/pystone.py \
-    > "$clif_dir/functions.tsv"
-  translated_call_targets="$(awk -F'[|=]' '
-    function local_id(packed) { return packed % 4294967296 }
-    NF >= 5 {
-      site = $1 "|" local_id($2) "|" $3 "|" $4
-      split($5, targets, ",")
-      printf "%s%s=", sep, site
-      sep = ";"
-      for (i = 1; i <= length(targets); i++) {
-        if (i > 1) {
-          printf ","
-        }
-        printf "%d", local_id(targets[i])
-      }
-    }
-  ' "$result_dir/profile_specializations.txt")"
+    > "$CLIF_DIR/functions.tsv"
   while IFS=$'\t' read -r function_id qualname; do
     safe_qualname="$(printf '%s' "$qualname" | tr -cs '[:alnum:]_.' '_')"
-    output_base="$clif_dir/fn_${function_id}_${safe_qualname}"
-    SOAC_WORK_DIR="$counters_dir" \
+    output_base="$CLIF_DIR/fn_${function_id}_${safe_qualname}"
+    SOAC_WORK_DIR="$COUNTERS_DIR" \
     SOAC_OPT_MODE=apply \
       cargo run -q -p soac-inspector --bin render_jit_clif -- \
         --specialized --module-name pystone \
@@ -1087,6 +1098,121 @@ benchmark benchmark_loops="1000000" verify_loops="100000" results_root="bench" r
         --vcode-out "$output_base.vcode" \
         scripts/pystone.py "$function_id" \
         > "$output_base.clif"
-  done < "$clif_dir/functions.tsv"
+  done < "$CLIF_DIR/functions.tsv"
 
-  echo "benchmark result: $result_dir"
+[private]
+_benchmark-run-specialized-perf result_dir perf_loops="10000000": ensure-cpython
+  #!/usr/bin/env bash
+  set -euo pipefail
+  export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  cd "$REPO_ROOT"
+
+  RESULT_DIR="{{result_dir}}"
+  if [[ "$RESULT_DIR" != /* ]]; then
+    RESULT_DIR="$REPO_ROOT/$RESULT_DIR"
+  fi
+  COUNTERS_DIR="$RESULT_DIR/counters"
+  if [[ ! -f "$COUNTERS_DIR/profile.bin" ]]; then
+    echo "counter profile not found at $COUNTERS_DIR/profile.bin; run 'just benchmark' first or pass result_dir=<dir>" >&2
+    exit 1
+  fi
+
+  OUTPUT_PREFIX="$RESULT_DIR/$(basename "$RESULT_DIR")_perf"
+  SOAC_WORK_DIR="$COUNTERS_DIR" \
+  SOAC_OPT_MODE=apply \
+    just perf-pystone-jit-warm "{{perf_loops}}" "$OUTPUT_PREFIX"
+
+  PERF_DATA_SOURCE="$REPO_ROOT/tmp/$(basename "$OUTPUT_PREFIX").data"
+  PERF_INJECTED_SOURCE="$REPO_ROOT/tmp/$(basename "$OUTPUT_PREFIX").injected.data"
+  if [[ ! -f "$PERF_DATA_SOURCE" ]]; then
+    echo "perf data not found at $PERF_DATA_SOURCE" >&2
+    exit 1
+  fi
+  if [[ ! -f "$PERF_INJECTED_SOURCE" ]]; then
+    echo "injected perf data not found at $PERF_INJECTED_SOURCE" >&2
+    exit 1
+  fi
+
+  cp -f "$PERF_DATA_SOURCE" "$RESULT_DIR/perf.data"
+  cp -f "$PERF_INJECTED_SOURCE" "$RESULT_DIR/perf.injected.data"
+
+[private]
+_benchmark-add-deep-profile-artifacts result_dir perf_loops="10000000": ensure-cpython
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cd "$REPO_ROOT"
+
+  RESULT_DIR="{{result_dir}}"
+  if [[ "$RESULT_DIR" != /* ]]; then
+    RESULT_DIR="$REPO_ROOT/$RESULT_DIR"
+  fi
+  COUNTERS_DIR="$RESULT_DIR/counters"
+  if [[ ! -f "$COUNTERS_DIR/profile.bin" ]]; then
+    echo "counter profile not found at $COUNTERS_DIR/profile.bin; run 'just benchmark' first or pass result_dir=<dir>" >&2
+    exit 1
+  fi
+  if [[ ! -f "$COUNTERS_DIR/verify.bin" ]]; then
+    echo "verification counters not found at $COUNTERS_DIR/verify.bin; run 'just benchmark-verify' or 'just benchmark-deep-profile-from-profile' first" >&2
+    exit 1
+  fi
+
+  just _benchmark-export-specialized-artifacts "$RESULT_DIR"
+  just _benchmark-run-specialized-perf "$RESULT_DIR" "{{perf_loops}}"
+  cargo run -q -p soac-inspector --bin annotate_cranelift_perf -- "$RESULT_DIR"
+
+benchmark-deep-profile-from-profile result_dir verify_loops="100000" perf_loops="10000000": (update-venv-offline) (build-extension "release")
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cd "$REPO_ROOT"
+
+  RESULT_DIR="{{result_dir}}"
+  if [[ "$RESULT_DIR" != /* ]]; then
+    RESULT_DIR="$REPO_ROOT/$RESULT_DIR"
+  fi
+  COUNTERS_DIR="$RESULT_DIR/counters"
+  REPORT="$RESULT_DIR/deep_profile.txt"
+  if [[ ! -f "$COUNTERS_DIR/profile.bin" ]]; then
+    echo "counter profile not found at $COUNTERS_DIR/profile.bin; run a profile pass first or pass result_dir=<dir>" >&2
+    exit 1
+  fi
+
+  {
+    echo "result dir: $RESULT_DIR"
+    echo "date: $(date +%F)"
+    echo "verify loops: {{verify_loops}}"
+    echo "perf loops: {{perf_loops}}"
+    echo "starting point: $COUNTERS_DIR/profile.bin"
+    echo
+    just benchmark-verify "{{verify_loops}}" "$COUNTERS_DIR"
+    just _benchmark-add-deep-profile-artifacts "$RESULT_DIR" "{{perf_loops}}"
+    echo
+    echo "deep profile result: $RESULT_DIR"
+  } 2>&1 | tee "$REPORT"
+
+benchmark-deep-profile benchmark_loops="1000000" verify_loops="100000" perf_loops="10000000" results_root="bench" result_rev="@" result_mode="one-off": (update-venv-offline) (build-extension "release")
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cd "$REPO_ROOT"
+
+  benchmark_log="$(mktemp "${TMPDIR:-/tmp}/soac_benchmark_deep_profile.XXXXXX")"
+  trap 'rm -f "$benchmark_log"' EXIT
+
+  just benchmark "{{benchmark_loops}}" "{{verify_loops}}" "{{results_root}}" "{{result_rev}}" "{{result_mode}}" \
+    2>&1 | tee "$benchmark_log"
+
+  RESULT_DIR="$(sed -n 's/^benchmark result: //p' "$benchmark_log" | tail -n 1)"
+  if [[ -z "$RESULT_DIR" ]]; then
+    echo "failed to determine benchmark result directory from just benchmark output" >&2
+    exit 1
+  fi
+
+  REPORT="$RESULT_DIR/deep_profile.txt"
+  {
+    echo "result dir: $RESULT_DIR"
+    echo "date: $(date +%F)"
+    echo "perf loops: {{perf_loops}}"
+    echo
+    just _benchmark-add-deep-profile-artifacts "$RESULT_DIR" "{{perf_loops}}"
+    echo
+    echo "deep profile result: $RESULT_DIR"
+  } 2>&1 | tee "$REPORT"
