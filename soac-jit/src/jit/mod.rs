@@ -3894,25 +3894,33 @@ fn emit_object_call_with_tuple_args(
     fb.block_params(call_ok_block)[0]
 }
 
+fn emit_checked_runtime_name_object(
+    fb: &mut FunctionBuilder<'_>,
+    name: &str,
+    ctx: &JitEmitCtx<'_>,
+) -> ir::Value {
+    let name_obj = emit_owned_module_constant(
+        fb,
+        ctx.module_constants.require_unicode_constant_id(name),
+        ctx,
+    );
+    let value_inst = fb.ins().call(ctx.load_runtime_obj_ref, &[name_obj]);
+    let value = emit_decref_owned_input_after_nullable_result(
+        fb,
+        ctx,
+        fb.inst_results(value_inst)[0],
+        name_obj,
+    );
+    emit_checked_owned_pyobject_result(fb, value, ctx)
+}
+
 fn emit_empty_dict_with_args_tuple(
     fb: &mut FunctionBuilder<'_>,
     empty_args_tuple: ir::Value,
     empty_args_tuple_is_borrowed: bool,
     ctx: &JitEmitCtx<'_>,
 ) -> ir::Value {
-    let dict_name_obj = emit_owned_module_constant(
-        fb,
-        ctx.module_constants.require_unicode_constant_id("dict"),
-        ctx,
-    );
-    let dict_callable_inst = fb.ins().call(ctx.load_runtime_obj_ref, &[dict_name_obj]);
-    let dict_callable = emit_decref_owned_input_after_nullable_result(
-        fb,
-        ctx,
-        fb.inst_results(dict_callable_inst)[0],
-        dict_name_obj,
-    );
-    let dict_callable = emit_checked_owned_pyobject_result(fb, dict_callable, ctx);
+    let dict_callable = emit_checked_runtime_name_object(fb, "dict", ctx);
     let kwargs_inst = fb
         .ins()
         .call(ctx.py_call_object_ref, &[dict_callable, empty_args_tuple]);
@@ -4122,19 +4130,7 @@ fn emit_unpack_call_with_local_env(
     let ptr_ty = ctx.consts.ptr_ty;
     let null_ptr = fb.ins().iconst(ptr_ty, 0);
 
-    let list_name_obj = emit_owned_module_constant(
-        fb,
-        ctx.module_constants.require_unicode_constant_id("list"),
-        ctx,
-    );
-    let list_callable_inst = fb.ins().call(ctx.load_runtime_obj_ref, &[list_name_obj]);
-    let list_callable = emit_decref_owned_input_after_nullable_result(
-        fb,
-        ctx,
-        fb.inst_results(list_callable_inst)[0],
-        list_name_obj,
-    );
-    let list_callable = emit_checked_owned_pyobject_result(fb, list_callable, ctx);
+    let list_callable = emit_checked_runtime_name_object(fb, "list", ctx);
     let args_list_inst = fb.ins().call(
         ctx.py_call_object_ref,
         &[list_callable, ctx.consts.empty_tuple_const],
@@ -4257,20 +4253,7 @@ fn emit_unpack_call_with_local_env(
         }
     }
 
-    let tuple_name_obj = emit_owned_module_constant(
-        fb,
-        ctx.module_constants
-            .require_unicode_constant_id("tuple_from_iter"),
-        ctx,
-    );
-    let tuple_callable_inst = fb.ins().call(ctx.load_runtime_obj_ref, &[tuple_name_obj]);
-    let tuple_callable = emit_decref_owned_input_after_nullable_result(
-        fb,
-        ctx,
-        fb.inst_results(tuple_callable_inst)[0],
-        tuple_name_obj,
-    );
-    let tuple_callable = emit_checked_owned_pyobject_result(fb, tuple_callable, ctx);
+    let tuple_callable = emit_checked_runtime_name_object(fb, "tuple_from_iter", ctx);
     let tuple_call_inst = fb.ins().call(
         ctx.py_call_positional_three_ref,
         &[tuple_callable, args_list, null_ptr, null_ptr, null_ptr],
