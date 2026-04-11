@@ -221,6 +221,10 @@ exports are intentionally omitted here.
 Notes:
 - In normal workflows set one `SOAC_WORK_DIR` for the whole multi-pass
   run and change only `SOAC_OPT_MODE`.
+- `SOAC_ENABLE_PROFILED_COLD_BLOCKS=1` replays `block_entry` counters
+  from `$SOAC_WORK_DIR/profile.bin` as Cranelift `cold` block hints in
+  `verify`/`apply`. This stays disabled by default; profiling still
+  records the underlying `block_entry` counters either way.
 - The `apply` phase may emit explicitly marked `BEHAVIOR_CHANGE`
   fast paths. Today that includes raw indexed module-global / instance
   field stores outside module-init code, and undeclared known-builtin

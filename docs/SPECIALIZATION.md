@@ -157,10 +157,13 @@ apply/verify mode:
 
 ### Codegen
 
-- In apply/verify mode, non-entry blocks visited at most 1% as often as
-  the function entry block are marked `cold` in Cranelift IR.
+- When `SOAC_ENABLE_PROFILED_COLD_BLOCKS=1`, apply/verify mode replays
+  `block_entry` counters and marks non-entry blocks visited at most 1%
+  as often as the function entry block as `cold` in Cranelift IR.
 - This is a block-placement/layout hint only. It does not change Python
   semantics or skip code generation for those blocks.
+- The `block_entry` counters are still recorded in profile/verify even
+  when the replay hint stays disabled.
 
 ### Limits
 

@@ -5,6 +5,18 @@ optimization attempts made by Codex agents. Keep entries succinct: what
 changed or was tried, which jj change id carried it when landed, the
 benchmarked throughput delta, and the headline pre/post numbers.
 
+## 2026-04-11 - Disable profiled cold-block hints by default
+
+- jj change id: `lwnxlmrx`
+- summary: Kept the `block_entry` profiling pipeline and the apply/verify
+  cold-block replay path, but gated the replay behind
+  `SOAC_ENABLE_PROFILED_COLD_BLOCKS=1` so normal runs keep recording the
+  counters without changing code layout.
+- throughput: default path now matches the pre-replay baseline; the prior
+  threshold experiments for the opt-in replay path stayed neutral to
+  slightly negative (`166579` baseline median, `166428` at 50%, `162351`
+  at 80%), so the hint now ships opt-in only
+
 ## 2026-04-11 - Mark rarely visited profiled blocks cold
 
 - jj change id: `oxrtzwlp`

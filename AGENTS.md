@@ -314,6 +314,11 @@ anything non-code affected the run. If there were no such issues, say
   dumps. `apply` still skips counter dump files, but when event logging
   is enabled it records indexed specialization hit/fallback counts long
   enough to emit `soac_specialization_runtime` summary events.
+- `SOAC_ENABLE_PROFILED_COLD_BLOCKS`
+  Optional opt-in for replaying `block_entry` counters from
+  `$SOAC_WORK_DIR/profile.bin` as Cranelift `cold` block hints during
+  `verify`/`apply`. This is disabled by default; the counters remain
+  recorded in `profile`/`verify` either way.
 - `BENCHMARK_CPU` / `BENCHMARK_CONSTANT_CLOCKS`
   The benchmark recipes use
   [scripts/run_benchmark_with_cpu_mode.sh](/home/adam/project/soac-profile/scripts/run_benchmark_with_cpu_mode.sh)
