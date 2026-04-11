@@ -579,6 +579,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn specialized_jit_body_statements_compile_via_typed_ops() {
+        let mut constants = TestConstantPool::default();
+        let function = with_single_test_block(
+            test_function(),
+            vec![expr_stmt(constants.int_expr(1))],
+            ret_term(constants.int_expr(2)),
+        );
+        let module = BlockPyModule {
+            module_name_gen: ModuleNameGen::new(0),
+            global_names: Vec::new(),
+            callable_defs: vec![function.clone()],
+            module_constants: constants.module_constants,
+            counter_defs: Vec::new(),
+        };
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        unsafe {
+            let compile_session = crate::session::CompileSession::new();
+            let mut jit_module =
+                new_jit_module(&compile_session).expect("test jit module should construct");
+            let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
+            let counter_ptrs = placeholder_counter_ptrs(0);
+            build_cranelift_run_bb_specialized_function(
+                &mut jit_module,
+                &[1usize as ObjPtr],
+                &module,
+                &function,
+                &module_constants,
+                &[],
+                &module_constant_ptrs,
+                &counter_ptrs,
+                &compile_session,
+                None,
+                None,
+                None,
+            )
+            .expect("body statement function should build through typed statement emission");
+        }
+    }
+
     fn direct_call_expr(function_id: FunctionId) -> InstrCodegen {
         InstrCodegen::CallDirect(CallDirect::new(
             none_expr(),

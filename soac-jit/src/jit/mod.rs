@@ -9504,9 +9504,9 @@ fn local_failure_cleanup_emit_ctx<'mc>(
     Some(emit_ctx.with_step_null_target(cleanup_block, cleanup_values))
 }
 
-fn emit_codegen_ops(
+fn emit_typed_codegen_ops(
     fb: &mut FunctionBuilder<'_>,
-    ops: &[InstrCodegen],
+    ops: &[InstrTyped],
     local_env: &mut LocalEnv,
     _stack_slots: &StackSlots,
     emit_ctx: &JitEmitCtx<'_>,
@@ -9526,14 +9526,14 @@ fn emit_codegen_ops(
             pending_local_failure_cleanups,
         );
         let stmt_emit_ctx = stmt_emit_ctx.as_ref().unwrap_or(emit_ctx);
-        let value = emit_codegen_stmt_with_local_env(
+        let value = emit_typed_codegen_stmt_with_local_env(
             fb,
             expr,
             local_env,
             stmt_emit_ctx,
             jit_module,
             func_imports,
-        );
+        )?;
         fb.ins().call(
             emit_ctx.decref_ref,
             &[emit_ctx.consts.thread_state_value, value],
@@ -12214,9 +12214,9 @@ fn build_cranelift_run_bb_specialized_function(
             };
             let _block_refcount_plan = emit_ctx.refcount_plan.block(codegen_block.label);
 
-            emit_codegen_ops(
+            emit_typed_codegen_ops(
                 &mut fb,
-                &codegen_block.body,
+                &typed_function.blocks[index].body,
                 &mut local_env,
                 &stack_slots,
                 &emit_ctx,
