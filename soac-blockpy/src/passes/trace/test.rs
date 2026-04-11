@@ -11,6 +11,8 @@ use crate::passes::{
     assign_module_instr_ids, lower_try_jump_exception_flow, normalize_bb_module_strings,
     CodegenModuleShape,
 };
+use std::ffi::OsString;
+use std::sync::{Mutex, OnceLock};
 
 fn tracked_name_binding_module(
     source: &str,
@@ -59,6 +61,37 @@ fn expr_tree_contains_local_load(expr: &InstrCodegen) -> bool {
     let mut probe = LocalLoadProbe { found: false };
     probe.visit_instr(expr);
     probe.found
+}
+
+fn profile_env_test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+struct EnvVarGuard {
+    key: &'static str,
+    old_value: Option<OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let old_value = std::env::var_os(key);
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, old_value }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match self.old_value.as_ref() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 }
 
 #[test]
@@ -191,5 +224,44 @@ fn adds_branch_outcome_counters_for_conditional_terms() {
             }
         ),
         "branch outcome counter should point at the conditional test instruction"
+    );
+}
+
+#[test]
+fn lowering_profile_mode_adds_block_entry_counters() {
+    let _guard = profile_env_test_lock().lock().unwrap();
+    let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "profile");
+    let source = "def f(x):\n    if x:\n        return 1\n    return 0\n";
+    let lowered = lower_python_to_blockpy_for_testing(source)
+        .expect("transform should succeed")
+        .codegen_module;
+
+    let block_entry_counters = lowered
+        .counter_defs
+        .iter()
+        .filter(|counter| counter.kind == "block_entry")
+        .collect::<Vec<_>>();
+    let total_blocks = lowered
+        .callable_defs
+        .iter()
+        .map(|function| function.blocks.len())
+        .sum::<usize>();
+    assert_eq!(
+        block_entry_counters.len(),
+        total_blocks,
+        "profile lowering should attach one block_entry counter per lowered block"
+    );
+    assert!(block_entry_counters.iter().all(|counter| {
+        counter.scope == CounterScope::This
+            && matches!(counter.site, CounterSite::BlockEntry { .. })
+    }));
+    assert_eq!(
+        lowered
+            .counter_defs
+            .iter()
+            .filter(|counter| counter.kind == "branch_outcomes")
+            .count(),
+        1,
+        "profile lowering should still add branch_outcomes counters"
     );
 }

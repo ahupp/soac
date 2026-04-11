@@ -242,6 +242,7 @@ pub(crate) fn rewrite_module_with_tracker_with_options(
         if passes::locality_counter_instrumentation_enabled() {
             pass_tracker.run_pass("bb_locality_counters", || {
                 let mut counted = bb_call_target_counted;
+                passes::instrument_bb_module_with_block_entry_counters(&mut counted);
                 passes::instrument_bb_module_with_locality_counters(&mut counted);
                 counted
             })
