@@ -81,3 +81,29 @@ pub const PY_FUNCTION_JIT_EXTRA_FUNCTION_ENV_OFFSET: i32 =
     offset_of!(PyFunctionJitExtraPrefix, function_env) as i32;
 pub const PY_THREAD_STATE_CURRENT_EXCEPTION_OFFSET: i32 =
     offset_of!(PyThreadStateCurrentExceptionPrefix, current_exception) as i32;
+
+pub(crate) unsafe fn current_exception_slot(tstate: ObjPtr) -> *mut *mut ffi::PyObject {
+    debug_assert!(!tstate.is_null());
+    unsafe {
+        tstate
+            .cast::<u8>()
+            .add(PY_THREAD_STATE_CURRENT_EXCEPTION_OFFSET as usize)
+            .cast::<*mut ffi::PyObject>()
+    }
+}
+
+pub(crate) unsafe fn take_raised_exception_direct(tstate: ObjPtr) -> *mut ffi::PyObject {
+    let slot = unsafe { current_exception_slot(tstate) };
+    let exc = unsafe { *slot };
+    unsafe { *slot = ptr::null_mut() };
+    exc
+}
+
+pub(crate) unsafe fn set_raised_exception_direct(tstate: ObjPtr, exc: *mut ffi::PyObject) {
+    let slot = unsafe { current_exception_slot(tstate) };
+    let old_exc = unsafe { *slot };
+    unsafe { *slot = exc };
+    if !old_exc.is_null() {
+        unsafe { ffi::Py_DECREF(old_exc) };
+    }
+}

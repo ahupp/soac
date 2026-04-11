@@ -169,8 +169,11 @@ impl ImportSpec {
 
 static DP_JIT_INCREF_IMPORT: ImportSpec =
     ImportSpec::local(SOAC_RUNTIME_INCREF_SYMBOL, &[SigType::Pointer], &[]);
-static DP_JIT_DECREF_IMPORT: ImportSpec =
-    ImportSpec::local(SOAC_RUNTIME_DECREF_SYMBOL, &[SigType::Pointer], &[]);
+static DP_JIT_DECREF_IMPORT: ImportSpec = ImportSpec::local(
+    SOAC_RUNTIME_DECREF_SYMBOL,
+    &[SigType::Pointer, SigType::Pointer],
+    &[],
+);
 static SOAC_RUNTIME_SET_RAISED_EXCEPTION_IMPORT: ImportSpec = ImportSpec::local(
     SOAC_RUNTIME_SET_RAISED_EXCEPTION_SYMBOL,
     &[SigType::Pointer, SigType::Pointer],
@@ -206,6 +209,7 @@ static SOAC_RUNTIME_STORE_GLOBAL_INDEXED_IMPORT: ImportSpec = ImportSpec::local(
     &[
         SigType::Pointer,
         SigType::Pointer,
+        SigType::Pointer,
         SigType::I64,
         SigType::Pointer,
     ],
@@ -235,6 +239,7 @@ static DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT: ImportSpec = ImportSpec::new(
         SigType::Pointer,
         SigType::Pointer,
         SigType::Pointer,
+        SigType::Pointer,
     ],
     &[SigType::Pointer],
 );
@@ -250,6 +255,7 @@ static DP_JIT_PY_VECTORCALL_IMPORT: ImportSpec = ImportSpec::new(
         SigType::Pointer,
         SigType::Pointer,
         SigType::Pointer,
+        SigType::Pointer,
     ],
     &[SigType::Pointer],
 );
@@ -258,10 +264,13 @@ static DP_JIT_NEXT_OR_SENTINEL_IMPORT: ImportSpec = ImportSpec::new(
     &[SigType::Pointer, SigType::Pointer],
     &[SigType::Pointer],
 );
-static DP_JIT_ENTER_RECURSIVE_CALL_IMPORT: ImportSpec =
-    ImportSpec::new("dp_jit_enter_recursive_call", &[], &[SigType::I32]);
+static DP_JIT_ENTER_RECURSIVE_CALL_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_enter_recursive_call",
+    &[SigType::Pointer],
+    &[SigType::I32],
+);
 static DP_JIT_LEAVE_RECURSIVE_CALL_IMPORT: ImportSpec =
-    ImportSpec::new("dp_jit_leave_recursive_call", &[], &[]);
+    ImportSpec::new("dp_jit_leave_recursive_call", &[SigType::Pointer], &[]);
 static DP_JIT_PY_THREAD_STATE_GET_IMPORT: ImportSpec =
     ImportSpec::new("dp_jit_py_thread_state_get", &[], &[SigType::Pointer]);
 static DP_JIT_PY_CALL_WITH_KW_IMPORT: ImportSpec = ImportSpec::new(
@@ -941,7 +950,8 @@ fn emit_cell_value_load_from_raw_cell(
     let null_ptr = fb.ins().iconst(ptr_ty, 0);
     let value_inst = fb.ins().call(ctx.load_cell_ref, &[cell_obj]);
     let value = fb.inst_results(value_inst)[0];
-    fb.ins().call(ctx.decref_ref, &[cell_obj]);
+    fb.ins()
+        .call(ctx.decref_ref, &[ctx.consts.thread_state_value, cell_obj]);
     let value_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, value, null_ptr);
     let value_ok_block = fb.create_block();
     fb.append_block_param(value_ok_block, ptr_ty);
@@ -1039,7 +1049,8 @@ fn emit_codegen_indexed_global_load(
     fb.switch_to_block(direct_block);
     let direct_value = fb.block_params(direct_block)[0];
     emit_optional_counter_increment_for_kind(fb, ctx, ctx.global_indexed_hit_counter_ids, instr_id);
-    fb.ins().call(ctx.decref_ref, &[name_obj]);
+    fb.ins()
+        .call(ctx.decref_ref, &[ctx.consts.thread_state_value, name_obj]);
     fb.ins()
         .jump(result_block, &[ir::BlockArg::Value(direct_value)]);
 
@@ -1222,19 +1233,30 @@ fn emit_codegen_super_helper_call(
 
     let call_inst = fb.ins().call(
         ctx.py_call_positional_three_ref,
-        &[callable, super_fn, cls, instance, null_ptr],
+        &[
+            ctx.consts.thread_state_value,
+            callable,
+            super_fn,
+            cls,
+            instance,
+            null_ptr,
+        ],
     );
     if !instance_is_borrowed {
-        fb.ins().call(ctx.decref_ref, &[instance]);
+        fb.ins()
+            .call(ctx.decref_ref, &[ctx.consts.thread_state_value, instance]);
     }
     if !cls_is_borrowed {
-        fb.ins().call(ctx.decref_ref, &[cls]);
+        fb.ins()
+            .call(ctx.decref_ref, &[ctx.consts.thread_state_value, cls]);
     }
     if !super_fn_is_borrowed {
-        fb.ins().call(ctx.decref_ref, &[super_fn]);
+        fb.ins()
+            .call(ctx.decref_ref, &[ctx.consts.thread_state_value, super_fn]);
     }
     if !callable_is_borrowed {
-        fb.ins().call(ctx.decref_ref, &[callable]);
+        fb.ins()
+            .call(ctx.decref_ref, &[ctx.consts.thread_state_value, callable]);
     }
 
     let call_value = fb.inst_results(call_inst)[0];
@@ -1335,19 +1357,30 @@ fn emit_codegen_super_helper_call_with_local_env(
 
     let call_inst = fb.ins().call(
         ctx.py_call_positional_three_ref,
-        &[callable, super_fn, cls, instance, null_ptr],
+        &[
+            ctx.consts.thread_state_value,
+            callable,
+            super_fn,
+            cls,
+            instance,
+            null_ptr,
+        ],
     );
     if !instance_is_borrowed {
-        fb.ins().call(ctx.decref_ref, &[instance]);
+        fb.ins()
+            .call(ctx.decref_ref, &[ctx.consts.thread_state_value, instance]);
     }
     if !cls_is_borrowed {
-        fb.ins().call(ctx.decref_ref, &[cls]);
+        fb.ins()
+            .call(ctx.decref_ref, &[ctx.consts.thread_state_value, cls]);
     }
     if !super_fn_is_borrowed {
-        fb.ins().call(ctx.decref_ref, &[super_fn]);
+        fb.ins()
+            .call(ctx.decref_ref, &[ctx.consts.thread_state_value, super_fn]);
     }
     if !callable_is_borrowed {
-        fb.ins().call(ctx.decref_ref, &[callable]);
+        fb.ins()
+            .call(ctx.decref_ref, &[ctx.consts.thread_state_value, callable]);
     }
 
     let call_value = fb.inst_results(call_inst)[0];
@@ -2206,6 +2239,7 @@ impl LocalEnv {
         value: ir::Value,
         stack_slots: &StackSlots,
         ptr_ty: ir::Type,
+        thread_state_value: ir::Value,
         incref_ref: ir::FuncRef,
         decref_ref: ir::FuncRef,
     ) {
@@ -2219,9 +2253,17 @@ impl LocalEnv {
         };
         if stack_slots.has_name(name) {
             stack_slots
-                .replace_cloned_value(fb, name, value, ptr_ty, incref_ref, decref_ref)
+                .replace_cloned_value(
+                    fb,
+                    name,
+                    value,
+                    ptr_ty,
+                    thread_state_value,
+                    incref_ref,
+                    decref_ref,
+                )
                 .expect("slot-backed local missing from stack slots");
-            fb.ins().call(decref_ref, &[value]);
+            fb.ins().call(decref_ref, &[thread_state_value, value]);
         } else {
             self.entries.push(LocalEnvEntry {
                 key: LocalEnvKey::Location(location),
@@ -2233,7 +2275,8 @@ impl LocalEnv {
         }
         if let Some(previous) = previous_entry {
             if transient_local_needs_decref(previous.ref_kind) {
-                fb.ins().call(decref_ref, &[previous.value]);
+                fb.ins()
+                    .call(decref_ref, &[thread_state_value, previous.value]);
             }
         }
     }
@@ -2245,6 +2288,7 @@ impl LocalEnv {
         value: ir::Value,
         stack_slots: &StackSlots,
         ptr_ty: ir::Type,
+        thread_state_value: ir::Value,
         incref_ref: ir::FuncRef,
         decref_ref: ir::FuncRef,
     ) {
@@ -2253,9 +2297,17 @@ impl LocalEnv {
             .map(|existing_index| self.entries.remove(existing_index));
         if stack_slots.has_name(name) {
             stack_slots
-                .replace_cloned_value(fb, name, value, ptr_ty, incref_ref, decref_ref)
+                .replace_cloned_value(
+                    fb,
+                    name,
+                    value,
+                    ptr_ty,
+                    thread_state_value,
+                    incref_ref,
+                    decref_ref,
+                )
                 .expect("slot-backed local missing from stack slots");
-            fb.ins().call(decref_ref, &[value]);
+            fb.ins().call(decref_ref, &[thread_state_value, value]);
         } else {
             self.entries.push(LocalEnvEntry {
                 key: LocalEnvKey::legacy_name(name),
@@ -2267,7 +2319,8 @@ impl LocalEnv {
         }
         if let Some(previous) = previous_entry {
             if transient_local_needs_decref(previous.ref_kind) {
-                fb.ins().call(decref_ref, &[previous.value]);
+                fb.ins()
+                    .call(decref_ref, &[thread_state_value, previous.value]);
             }
         }
     }
@@ -2279,6 +2332,7 @@ impl LocalEnv {
         name: &str,
         stack_slots: &StackSlots,
         ptr_ty: ir::Type,
+        thread_state_value: ir::Value,
         decref_ref: ir::FuncRef,
     ) -> Result<(), String> {
         if let Some(index) = self
@@ -2287,14 +2341,15 @@ impl LocalEnv {
         {
             let previous = self.entries.remove(index);
             if transient_local_needs_decref(previous.ref_kind) {
-                fb.ins().call(decref_ref, &[previous.value]);
+                fb.ins()
+                    .call(decref_ref, &[thread_state_value, previous.value]);
             }
         } else if !stack_slots.has_name(name) {
             return Err(format!("missing local binding for delete target: {name}"));
         }
         if stack_slots.has_name(name) {
             stack_slots
-                .clear_value(fb, name, ptr_ty, decref_ref)
+                .clear_value(fb, name, ptr_ty, thread_state_value, decref_ref)
                 .expect("slot-backed delete target missing from stack slots");
         }
         Ok(())
@@ -2502,6 +2557,7 @@ impl StackSlots {
         name: &str,
         value: ir::Value,
         ptr_ty: ir::Type,
+        thread_state_value: ir::Value,
         incref_ref: ir::FuncRef,
         decref_ref: ir::FuncRef,
     ) -> Option<()> {
@@ -2509,7 +2565,7 @@ impl StackSlots {
         let previous = fb.ins().stack_load(ptr_ty, slot, 0);
         emit_incref_if_not_null(fb, ptr_ty, incref_ref, value);
         fb.ins().stack_store(value, slot, 0);
-        emit_decref_if_not_null(fb, ptr_ty, decref_ref, previous);
+        emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, previous);
         Some(())
     }
 
@@ -2518,20 +2574,27 @@ impl StackSlots {
         fb: &mut FunctionBuilder<'_>,
         name: &str,
         ptr_ty: ir::Type,
+        thread_state_value: ir::Value,
         decref_ref: ir::FuncRef,
     ) -> Option<()> {
         let slot = self.slot_for_name(name)?;
         let previous = fb.ins().stack_load(ptr_ty, slot, 0);
         let null_ptr = fb.ins().iconst(ptr_ty, 0);
         fb.ins().stack_store(null_ptr, slot, 0);
-        emit_decref_if_not_null(fb, ptr_ty, decref_ref, previous);
+        emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, previous);
         Some(())
     }
 
-    fn decref_all(&self, fb: &mut FunctionBuilder<'_>, ptr_ty: ir::Type, decref_ref: ir::FuncRef) {
+    fn decref_all(
+        &self,
+        fb: &mut FunctionBuilder<'_>,
+        ptr_ty: ir::Type,
+        thread_state_value: ir::Value,
+        decref_ref: ir::FuncRef,
+    ) {
         for slot in &self.slots {
             let value = fb.ins().stack_load(ptr_ty, *slot, 0);
-            emit_decref_if_not_null(fb, ptr_ty, decref_ref, value);
+            emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, value);
         }
     }
 }
@@ -2569,9 +2632,21 @@ fn emit_decref_if_not_null(
     fb: &mut FunctionBuilder<'_>,
     ptr_ty: ir::Type,
     decref_ref: ir::FuncRef,
+    thread_state_value: ir::Value,
     value: ir::Value,
 ) {
-    emit_call_if_not_null(fb, ptr_ty, decref_ref, value);
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let value_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, value, null_ptr);
+    let call_block = fb.create_block();
+    let done_block = fb.create_block();
+    fb.ins()
+        .brif(value_is_null, done_block, &[], call_block, &[]);
+
+    fb.switch_to_block(call_block);
+    fb.ins().call(decref_ref, &[thread_state_value, value]);
+    fb.ins().jump(done_block, &[]);
+
+    fb.switch_to_block(done_block);
 }
 
 #[derive(Clone)]
@@ -2640,19 +2715,28 @@ fn bind_local_value(
     value: ir::Value,
     stack_slots: &StackSlots,
     ptr_ty: ir::Type,
+    thread_state_value: ir::Value,
     incref_ref: ir::FuncRef,
     decref_ref: ir::FuncRef,
 ) {
     if let Some(existing_index) = local_names.iter().position(|candidate| candidate == name) {
         let previous = local_values.remove(existing_index);
         local_names.remove(existing_index);
-        fb.ins().call(decref_ref, &[previous]);
+        fb.ins().call(decref_ref, &[thread_state_value, previous]);
     }
     if stack_slots.has_name(name) {
         stack_slots
-            .replace_cloned_value(fb, name, value, ptr_ty, incref_ref, decref_ref)
+            .replace_cloned_value(
+                fb,
+                name,
+                value,
+                ptr_ty,
+                thread_state_value,
+                incref_ref,
+                decref_ref,
+            )
             .expect("slot-backed local missing from stack slots");
-        fb.ins().call(decref_ref, &[value]);
+        fb.ins().call(decref_ref, &[thread_state_value, value]);
     } else {
         local_names.push(name.to_string());
         local_values.push(value);
@@ -2666,18 +2750,19 @@ fn delete_local_value(
     name: &str,
     stack_slots: &StackSlots,
     ptr_ty: ir::Type,
+    thread_state_value: ir::Value,
     decref_ref: ir::FuncRef,
 ) -> Result<(), String> {
     if let Some(index) = local_names.iter().position(|candidate| candidate == name) {
         let previous = local_values.remove(index);
         local_names.remove(index);
-        fb.ins().call(decref_ref, &[previous]);
+        fb.ins().call(decref_ref, &[thread_state_value, previous]);
     } else if !stack_slots.has_name(name) {
         return Err(format!("missing local binding for delete target: {name}"));
     }
     if stack_slots.has_name(name) {
         stack_slots
-            .clear_value(fb, name, ptr_ty, decref_ref)
+            .clear_value(fb, name, ptr_ty, thread_state_value, decref_ref)
             .expect("slot-backed delete target missing from stack slots");
     }
     Ok(())
@@ -2726,7 +2811,10 @@ impl<'a, 'b, 'mc, 'c, 'd> intrinsics::OperationEmitState<'b, InstrCodegen>
     fn release_arg_values(&mut self, arg_values: &[(ir::Value, bool)]) {
         for (value, borrowed_arg) in arg_values {
             if !borrowed_arg {
-                self.fb.ins().call(self.ctx.decref_ref, &[*value]);
+                self.fb.ins().call(
+                    self.ctx.decref_ref,
+                    &[self.ctx.consts.thread_state_value, *value],
+                );
             }
         }
     }
@@ -2832,7 +2920,10 @@ impl<'a, 'b, 'mc, 'c, 'd> intrinsics::OperationEmitState<'b, InstrCodegen>
     fn release_arg_values(&mut self, arg_values: &[(ir::Value, bool)]) {
         for (value, borrowed_arg) in arg_values {
             if !borrowed_arg {
-                self.fb.ins().call(self.ctx.decref_ref, &[*value]);
+                self.fb.ins().call(
+                    self.ctx.decref_ref,
+                    &[self.ctx.consts.thread_state_value, *value],
+                );
             }
         }
     }
@@ -2976,7 +3067,8 @@ fn emit_checked_stack_slot_value(
     );
     fb.ins().call(ctx.raise_deleted_name_error_ref, &[name_obj]);
     let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
-    fb.ins().call(ctx.decref_ref, &[name_obj]);
+    fb.ins()
+        .call(ctx.decref_ref, &[ctx.consts.thread_state_value, name_obj]);
     emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
     fb.ins()
         .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
@@ -3055,14 +3147,20 @@ fn emit_decref_owned_inputs_after_nullable_result(
     fb.switch_to_block(null_block);
     let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
     for owned_input in owned_inputs {
-        fb.ins().call(ctx.decref_ref, &[*owned_input]);
+        fb.ins().call(
+            ctx.decref_ref,
+            &[ctx.consts.thread_state_value, *owned_input],
+        );
     }
     emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
     fb.ins().jump(done_block, &[ir::BlockArg::Value(result)]);
 
     fb.switch_to_block(ok_block);
     for owned_input in owned_inputs {
-        fb.ins().call(ctx.decref_ref, &[*owned_input]);
+        fb.ins().call(
+            ctx.decref_ref,
+            &[ctx.consts.thread_state_value, *owned_input],
+        );
     }
     fb.ins().jump(done_block, &[ir::BlockArg::Value(result)]);
 
@@ -3249,7 +3347,9 @@ fn build_counted_runtime_refcount_helper(
 ) -> Result<FuncId, String> {
     let ptr_ty = jit_module.target_config().pointer_type();
     let mut sig = jit_module.make_signature();
-    sig.params.push(ir::AbiParam::new(ptr_ty));
+    for _ in runtime_import.signature.params {
+        sig.params.push(ir::AbiParam::new(ptr_ty));
+    }
     let helper_id = declare_local_fn(jit_module, symbol_name, &sig)?;
 
     let mut ctx = jit_module.make_context();
@@ -3260,7 +3360,7 @@ fn build_counted_runtime_refcount_helper(
         let entry_block = fb.create_block();
         fb.append_block_params_for_function_params(entry_block);
         fb.switch_to_block(entry_block);
-        let obj = fb.block_params(entry_block)[0];
+        let args = fb.block_params(entry_block).to_vec();
         let counter_addr = fb.ins().iconst(ptr_ty, counter_ptr as i64);
         let old_value = fb
             .ins()
@@ -3272,7 +3372,7 @@ fn build_counted_runtime_refcount_helper(
         let mut module_imports = ModuleFuncImports::new();
         let mut func_imports = FuncBuildImports::new(&mut module_imports);
         let runtime_ref = func_imports.get_or_panic(jit_module, &mut fb.func, runtime_import);
-        fb.ins().call(runtime_ref, &[obj]);
+        fb.ins().call(runtime_ref, &args);
         fb.ins().return_(&[]);
         fb.seal_all_blocks();
         fb.finalize();
@@ -3660,7 +3760,10 @@ fn emit_pack_current_values_tuple(
     fb.switch_to_block(set_fail_block);
     let failed_tuple = fb.block_params(set_fail_block)[0];
     let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
-    fb.ins().call(ctx.decref_ref, &[failed_tuple]);
+    fb.ins().call(
+        ctx.decref_ref,
+        &[ctx.consts.thread_state_value, failed_tuple],
+    );
     emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
     fb.ins()
         .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
@@ -3707,7 +3810,10 @@ fn emit_call_args_tuple_from_values(
         fb.switch_to_block(set_fail_block);
         let failed_tuple = fb.block_params(set_fail_block)[0];
         let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
-        fb.ins().call(ctx.decref_ref, &[failed_tuple]);
+        fb.ins().call(
+            ctx.decref_ref,
+            &[ctx.consts.thread_state_value, failed_tuple],
+        );
         emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
         fb.ins()
             .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
@@ -3830,7 +3936,13 @@ fn emit_positional_vectorcall_with_arg_values(
     let nargsf = fb.ins().iconst(ptr_ty, arg_values.len() as i64);
     let call_inst = fb.ins().call(
         ctx.py_vectorcall_ref,
-        &[callable, args_ptr, nargsf, null_ptr],
+        &[
+            ctx.consts.thread_state_value,
+            callable,
+            args_ptr,
+            nargsf,
+            null_ptr,
+        ],
     );
     let call_value = fb.inst_results(call_inst)[0];
     let call_is_null = fb
@@ -3851,11 +3963,13 @@ fn emit_positional_vectorcall_with_arg_values(
     let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
     for (value, borrowed_arg) in arg_values.iter().copied().zip(arg_borrowed.iter().copied()) {
         if !borrowed_arg {
-            fb.ins().call(ctx.decref_ref, &[value]);
+            fb.ins()
+                .call(ctx.decref_ref, &[ctx.consts.thread_state_value, value]);
         }
     }
     if !callable_is_borrowed {
-        fb.ins().call(ctx.decref_ref, &[callable]);
+        fb.ins()
+            .call(ctx.decref_ref, &[ctx.consts.thread_state_value, callable]);
     }
     emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
     fb.ins()
@@ -3864,11 +3978,13 @@ fn emit_positional_vectorcall_with_arg_values(
     fb.switch_to_block(call_ok_block);
     for (value, borrowed_arg) in arg_values.into_iter().zip(arg_borrowed.into_iter()) {
         if !borrowed_arg {
-            fb.ins().call(ctx.decref_ref, &[value]);
+            fb.ins()
+                .call(ctx.decref_ref, &[ctx.consts.thread_state_value, value]);
         }
     }
     if !callable_is_borrowed {
-        fb.ins().call(ctx.decref_ref, &[callable]);
+        fb.ins()
+            .call(ctx.decref_ref, &[ctx.consts.thread_state_value, callable]);
     }
     fb.block_params(call_ok_block)[0]
 }
@@ -3977,10 +4093,18 @@ fn emit_one_arg_method_call_and_discard(
         fb,
         ctx,
         ctx.py_call_positional_three_ref,
-        &[method_obj, value_obj, null_ptr, null_ptr, null_ptr],
+        &[
+            ctx.consts.thread_state_value,
+            method_obj,
+            value_obj,
+            null_ptr,
+            null_ptr,
+            null_ptr,
+        ],
         owned_inputs.as_slice(),
     );
-    fb.ins().call(ctx.decref_ref, &[call_value]);
+    fb.ins()
+        .call(ctx.decref_ref, &[ctx.consts.thread_state_value, call_value]);
 }
 
 fn emit_kwargs_setitem_or_cleanup(
@@ -3997,9 +4121,11 @@ fn emit_kwargs_setitem_or_cleanup(
     let set_inst = fb
         .ins()
         .call(ctx.pyobject_setitem_ref, &[kwargs_obj, key_obj, value_obj]);
-    fb.ins().call(ctx.decref_ref, &[key_obj]);
+    fb.ins()
+        .call(ctx.decref_ref, &[ctx.consts.thread_state_value, key_obj]);
     if !value_borrowed {
-        fb.ins().call(ctx.decref_ref, &[value_obj]);
+        fb.ins()
+            .call(ctx.decref_ref, &[ctx.consts.thread_state_value, value_obj]);
     }
     let set_value = fb.inst_results(set_inst)[0];
     let set_failed = fb
@@ -4018,15 +4144,20 @@ fn emit_kwargs_setitem_or_cleanup(
     fb.switch_to_block(set_fail);
     let failed_kwargs = fb.block_params(set_fail)[0];
     let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
-    fb.ins().call(ctx.decref_ref, &[failed_kwargs]);
+    fb.ins().call(
+        ctx.decref_ref,
+        &[ctx.consts.thread_state_value, failed_kwargs],
+    );
     for value in cleanup_on_error {
-        fb.ins().call(ctx.decref_ref, &[*value]);
+        fb.ins()
+            .call(ctx.decref_ref, &[ctx.consts.thread_state_value, *value]);
     }
     emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
     fb.ins()
         .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
     fb.switch_to_block(set_ok);
-    fb.ins().call(ctx.decref_ref, &[set_value]);
+    fb.ins()
+        .call(ctx.decref_ref, &[ctx.consts.thread_state_value, set_value]);
 }
 
 fn emit_keyword_call_with_local_env(
@@ -4040,9 +4171,6 @@ fn emit_keyword_call_with_local_env(
     jit_module: &mut JITModule,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> ir::Value {
-    let ptr_ty = ctx.consts.ptr_ty;
-    let null_ptr = fb.ins().iconst(ptr_ty, 0);
-
     let mut tuple_items: Vec<(ir::Value, bool)> = Vec::with_capacity(args.len());
     for arg in args {
         let borrowed_arg = codegen_expr_is_borrowable_from_local_env(
@@ -4255,7 +4383,14 @@ fn emit_unpack_call_with_local_env(
         fb,
         ctx,
         ctx.py_call_positional_three_ref,
-        &[tuple_callable, args_list, null_ptr, null_ptr, null_ptr],
+        &[
+            ctx.consts.thread_state_value,
+            tuple_callable,
+            args_list,
+            null_ptr,
+            null_ptr,
+            null_ptr,
+        ],
         &[tuple_callable, args_list],
     );
 
@@ -4394,7 +4529,8 @@ fn emit_release_owned_pyobject(
     if facts.is_some_and(PyObjFacts::is_immortal) {
         return;
     }
-    fb.ins().call(ctx.decref_ref, &[value]);
+    fb.ins()
+        .call(ctx.decref_ref, &[ctx.consts.thread_state_value, value]);
 }
 
 fn emit_release_pyobject_if_owned(
@@ -4475,7 +4611,8 @@ fn emit_branch_index_i64(
             );
             let callee_id = emit_callee_function_id_checked(fb, callable, ctx);
             if !callable_is_borrowed {
-                fb.ins().call(ctx.decref_ref, &[callable]);
+                fb.ins()
+                    .call(ctx.decref_ref, &[ctx.consts.thread_state_value, callable]);
             }
             callee_id
         }
@@ -4491,7 +4628,8 @@ fn emit_branch_index_i64(
             );
             let index_i64_inst = fb.ins().call(pyobject_to_i64_ref, &[index_obj]);
             let index_i64 = fb.inst_results(index_i64_inst)[0];
-            fb.ins().call(ctx.decref_ref, &[index_obj]);
+            fb.ins()
+                .call(ctx.decref_ref, &[ctx.consts.thread_state_value, index_obj]);
             index_i64
         }
     }
@@ -5362,7 +5500,9 @@ fn emit_direct_call_resolved_raw_with_arg_values(
     );
     fb.switch_to_block(function_env_ok_block);
 
-    let enter_inst = fb.ins().call(ctx.enter_recursive_ref, &[]);
+    let enter_inst = fb
+        .ins()
+        .call(ctx.enter_recursive_ref, &[ctx.consts.thread_state_value]);
     let enter_status = fb.inst_results(enter_inst)[0];
     let enter_failed = fb
         .ins()
@@ -5384,15 +5524,18 @@ fn emit_direct_call_resolved_raw_with_arg_values(
     let func_ref = jit_module.declare_func_in_func(direct_func_id, &mut fb.func);
     let call_inst = fb.ins().call(func_ref, &call_args);
     let call_value = fb.inst_results(call_inst)[0];
-    fb.ins().call(ctx.leave_recursive_ref, &[]);
+    fb.ins()
+        .call(ctx.leave_recursive_ref, &[ctx.consts.thread_state_value]);
 
     for (value, borrowed_arg) in arg_values.into_iter().zip(arg_borrowed.into_iter()) {
         if !borrowed_arg {
-            fb.ins().call(ctx.decref_ref, &[value]);
+            fb.ins()
+                .call(ctx.decref_ref, &[ctx.consts.thread_state_value, value]);
         }
     }
     if !callable_is_borrowed {
-        fb.ins().call(ctx.decref_ref, &[callable]);
+        fb.ins()
+            .call(ctx.decref_ref, &[ctx.consts.thread_state_value, callable]);
     }
 
     call_value
@@ -5469,7 +5612,8 @@ fn emit_direct_constructor_resolved_with_arg_values(
         .call(ctx.pytype_generic_alloc_ref, &[callable, zero]);
     let allocated = fb.inst_results(alloc_inst)[0];
     if !callable_is_borrowed {
-        fb.ins().call(ctx.decref_ref, &[callable]);
+        fb.ins()
+            .call(ctx.decref_ref, &[ctx.consts.thread_state_value, callable]);
     }
     let alloc_is_null = fb
         .ins()
@@ -5489,7 +5633,8 @@ fn emit_direct_constructor_resolved_with_arg_values(
     let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
     for (value, borrowed_arg) in arg_values.iter().copied().zip(arg_borrowed.iter().copied()) {
         if !borrowed_arg {
-            fb.ins().call(ctx.decref_ref, &[value]);
+            fb.ins()
+                .call(ctx.decref_ref, &[ctx.consts.thread_state_value, value]);
         }
     }
     emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
@@ -5542,7 +5687,8 @@ fn emit_direct_constructor_resolved_with_arg_values(
         ctx.consts.ptr_ty,
         ctx.consts.thread_state_value,
     );
-    fb.ins().call(ctx.decref_ref, &[allocated]);
+    fb.ins()
+        .call(ctx.decref_ref, &[ctx.consts.thread_state_value, allocated]);
     fb.ins().call(
         ctx.set_raised_exception_ref,
         &[ctx.consts.thread_state_value, error_value],
@@ -6034,6 +6180,7 @@ fn emit_codegen_expr(
     let _value_facts = ctx.value_facts_for_expr(expr);
     let incref_ref = ctx.incref_ref;
     let decref_ref = ctx.decref_ref;
+    let thread_state_value = ctx.consts.thread_state_value;
     let py_call_ref = ctx.py_call_positional_three_ref;
     let step_null_block = ctx.consts.step_null_block;
     let ptr_ty = ctx.consts.ptr_ty;
@@ -6133,6 +6280,7 @@ fn emit_codegen_expr(
                             value_obj,
                             &intrinsic_state.ctx.stack_slots,
                             intrinsic_state.ctx.consts.ptr_ty,
+                            intrinsic_state.ctx.consts.thread_state_value,
                             intrinsic_state.ctx.incref_ref,
                             intrinsic_state.ctx.decref_ref,
                         );
@@ -6175,6 +6323,7 @@ fn emit_codegen_expr(
                             value_obj,
                             &intrinsic_state.ctx.stack_slots,
                             intrinsic_state.ctx.consts.ptr_ty,
+                            intrinsic_state.ctx.consts.thread_state_value,
                             intrinsic_state.ctx.incref_ref,
                             intrinsic_state.ctx.decref_ref,
                         );
@@ -6212,15 +6361,15 @@ fn emit_codegen_expr(
                         .fb
                         .ins()
                         .call(intrinsic_state.ctx.store_cell_ref, &[raw_cell, value_obj]);
-                    intrinsic_state
-                        .fb
-                        .ins()
-                        .call(intrinsic_state.ctx.decref_ref, &[raw_cell]);
+                    intrinsic_state.fb.ins().call(
+                        intrinsic_state.ctx.decref_ref,
+                        &[intrinsic_state.ctx.consts.thread_state_value, raw_cell],
+                    );
                     if !value_borrowed {
-                        intrinsic_state
-                            .fb
-                            .ins()
-                            .call(intrinsic_state.ctx.decref_ref, &[value_obj]);
+                        intrinsic_state.fb.ins().call(
+                            intrinsic_state.ctx.decref_ref,
+                            &[intrinsic_state.ctx.consts.thread_state_value, value_obj],
+                        );
                     }
                     let call_value = intrinsic_state.fb.inst_results(call_inst)[0];
                     intrinsics::OperationEmitState::finish_owned_result(
@@ -6243,6 +6392,7 @@ fn emit_codegen_expr(
                             name,
                             &intrinsic_state.ctx.stack_slots,
                             intrinsic_state.ctx.consts.ptr_ty,
+                            intrinsic_state.ctx.consts.thread_state_value,
                             intrinsic_state.ctx.decref_ref,
                         )
                         .unwrap_or_else(|error| panic!("{error}"));
@@ -6604,7 +6754,14 @@ fn emit_codegen_expr(
                     );
                     let call_inst = fb.ins().call(
                         py_call_ref,
-                        &[method_obj, value_obj, null_ptr, null_ptr, null_ptr],
+                        &[
+                            ctx.consts.thread_state_value,
+                            method_obj,
+                            value_obj,
+                            null_ptr,
+                            null_ptr,
+                            null_ptr,
+                        ],
                     );
                     let mut owned_inputs = Vec::with_capacity(2);
                     if !value_borrowed {
@@ -6631,7 +6788,7 @@ fn emit_codegen_expr(
                     );
                     fb.switch_to_block(call_ok);
                     let call_value = fb.block_params(call_ok)[0];
-                    fb.ins().call(decref_ref, &[call_value]);
+                    fb.ins().call(decref_ref, &[thread_state_value, call_value]);
                 }
 
                 for keyword in &call.keywords {
@@ -6664,9 +6821,9 @@ fn emit_codegen_expr(
                             let set_inst = fb
                                 .ins()
                                 .call(pyobject_setitem_ref, &[kwargs_obj, key_obj, value_obj]);
-                            fb.ins().call(decref_ref, &[key_obj]);
+                            fb.ins().call(decref_ref, &[thread_state_value, key_obj]);
                             if !value_borrowed {
-                                fb.ins().call(decref_ref, &[value_obj]);
+                                fb.ins().call(decref_ref, &[thread_state_value, value_obj]);
                             }
                             let set_value = fb.inst_results(set_inst)[0];
                             let set_failed =
@@ -6685,15 +6842,16 @@ fn emit_codegen_expr(
                             fb.switch_to_block(set_fail);
                             let failed_kwargs = fb.block_params(set_fail)[0];
                             let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
-                            fb.ins().call(decref_ref, &[failed_kwargs]);
-                            fb.ins().call(decref_ref, &[args_list]);
+                            fb.ins()
+                                .call(decref_ref, &[thread_state_value, failed_kwargs]);
+                            fb.ins().call(decref_ref, &[thread_state_value, args_list]);
                             if !callable_is_borrowed {
-                                fb.ins().call(decref_ref, &[callable]);
+                                fb.ins().call(decref_ref, &[thread_state_value, callable]);
                             }
                             emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
                             fb.ins().jump(step_null_block, &step_null_block_args(ctx));
                             fb.switch_to_block(set_ok);
-                            fb.ins().call(decref_ref, &[set_value]);
+                            fb.ins().call(decref_ref, &[thread_state_value, set_value]);
                         }
                         CallArgKeyword::Starred(value_expr) => {
                             let kwargs_obj =
@@ -6744,7 +6902,14 @@ fn emit_codegen_expr(
                             );
                             let call_inst = fb.ins().call(
                                 py_call_ref,
-                                &[update_obj, value_obj, null_ptr, null_ptr, null_ptr],
+                                &[
+                                    ctx.consts.thread_state_value,
+                                    update_obj,
+                                    value_obj,
+                                    null_ptr,
+                                    null_ptr,
+                                    null_ptr,
+                                ],
                             );
                             let mut owned_inputs = Vec::with_capacity(2);
                             if !value_borrowed {
@@ -6771,7 +6936,7 @@ fn emit_codegen_expr(
                             );
                             fb.switch_to_block(call_ok);
                             let call_value = fb.block_params(call_ok)[0];
-                            fb.ins().call(decref_ref, &[call_value]);
+                            fb.ins().call(decref_ref, &[thread_state_value, call_value]);
                         }
                     }
                 }
@@ -6806,7 +6971,14 @@ fn emit_codegen_expr(
                 let tuple_callable = fb.block_params(tuple_callable_ok)[0];
                 let tuple_call_inst = fb.ins().call(
                     py_call_ref,
-                    &[tuple_callable, args_list, null_ptr, null_ptr, null_ptr],
+                    &[
+                        ctx.consts.thread_state_value,
+                        tuple_callable,
+                        args_list,
+                        null_ptr,
+                        null_ptr,
+                        null_ptr,
+                    ],
                 );
                 let call_args_tuple = emit_decref_owned_inputs_after_nullable_result(
                     fb,
@@ -6855,22 +7027,24 @@ fn emit_codegen_expr(
                 fb.switch_to_block(call_fail_block);
                 let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
                 if let Some(kwargs_obj) = kwargs_obj {
-                    fb.ins().call(decref_ref, &[kwargs_obj]);
+                    fb.ins().call(decref_ref, &[thread_state_value, kwargs_obj]);
                 }
-                fb.ins().call(decref_ref, &[call_args_tuple]);
+                fb.ins()
+                    .call(decref_ref, &[thread_state_value, call_args_tuple]);
                 if !callable_is_borrowed {
-                    fb.ins().call(decref_ref, &[callable]);
+                    fb.ins().call(decref_ref, &[thread_state_value, callable]);
                 }
                 emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
                 fb.ins().jump(step_null_block, &step_null_block_args(ctx));
 
                 fb.switch_to_block(call_ok_block);
                 if let Some(kwargs_obj) = kwargs_obj {
-                    fb.ins().call(decref_ref, &[kwargs_obj]);
+                    fb.ins().call(decref_ref, &[thread_state_value, kwargs_obj]);
                 }
-                fb.ins().call(decref_ref, &[call_args_tuple]);
+                fb.ins()
+                    .call(decref_ref, &[thread_state_value, call_args_tuple]);
                 if !callable_is_borrowed {
-                    fb.ins().call(decref_ref, &[callable]);
+                    fb.ins().call(decref_ref, &[thread_state_value, callable]);
                 }
                 return fb.block_params(call_ok_block)[0];
             }
@@ -6920,7 +7094,7 @@ fn emit_codegen_expr(
                             arg_values.into_iter().zip(borrowed_args.into_iter())
                         {
                             if !borrowed_arg {
-                                fb.ins().call(decref_ref, &[value]);
+                                fb.ins().call(decref_ref, &[thread_state_value, value]);
                             }
                         }
                         return tuple_value;
@@ -6975,16 +7149,22 @@ fn emit_codegen_expr(
                             fb.switch_to_block(deleted_block);
                             fb.ins().call(raise_deleted_name_error_ref, &[name_obj]);
                             let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
-                            fb.ins().call(decref_ref, &[name_obj]);
+                            fb.ins().call(decref_ref, &[thread_state_value, name_obj]);
                             if !value_borrowed {
-                                emit_decref_if_not_null(fb, ptr_ty, decref_ref, value_obj);
+                                emit_decref_if_not_null(
+                                    fb,
+                                    ptr_ty,
+                                    decref_ref,
+                                    thread_state_value,
+                                    value_obj,
+                                );
                             }
                             emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
                             fb.ins().jump(step_null_block, &step_null_block_args(ctx));
 
                             fb.switch_to_block(value_ok_block);
                             let value_obj = fb.block_params(value_ok_block)[0];
-                            fb.ins().call(decref_ref, &[name_obj]);
+                            fb.ins().call(decref_ref, &[thread_state_value, name_obj]);
                             if value_borrowed {
                                 fb.ins().call(incref_ref, &[value_obj]);
                             }
@@ -7542,7 +7722,8 @@ fn emit_codegen_expr(
                 fb.switch_to_block(set_fail_block);
                 let failed_tuple = fb.block_params(set_fail_block)[0];
                 let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
-                fb.ins().call(decref_ref, &[failed_tuple]);
+                fb.ins()
+                    .call(decref_ref, &[thread_state_value, failed_tuple]);
                 emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
                 fb.ins().jump(step_null_block, &step_null_block_args(ctx));
                 fb.switch_to_block(set_ok_block);
@@ -7647,9 +7828,9 @@ fn emit_codegen_expr(
                     let set_inst = fb
                         .ins()
                         .call(pyobject_setitem_ref, &[kwargs_obj, key_obj, value_obj]);
-                    fb.ins().call(decref_ref, &[key_obj]);
+                    fb.ins().call(decref_ref, &[thread_state_value, key_obj]);
                     if !value_borrowed {
-                        fb.ins().call(decref_ref, &[value_obj]);
+                        fb.ins().call(decref_ref, &[thread_state_value, value_obj]);
                     }
                     let set_value = fb.inst_results(set_inst)[0];
                     let set_failed =
@@ -7668,15 +7849,17 @@ fn emit_codegen_expr(
                     fb.switch_to_block(set_fail);
                     let failed_kwargs = fb.block_params(set_fail)[0];
                     let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
-                    fb.ins().call(decref_ref, &[failed_kwargs]);
-                    fb.ins().call(decref_ref, &[call_args_tuple]);
+                    fb.ins()
+                        .call(decref_ref, &[thread_state_value, failed_kwargs]);
+                    fb.ins()
+                        .call(decref_ref, &[thread_state_value, call_args_tuple]);
                     if !callable_is_borrowed {
-                        fb.ins().call(decref_ref, &[callable]);
+                        fb.ins().call(decref_ref, &[thread_state_value, callable]);
                     }
                     emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
                     fb.ins().jump(step_null_block, &step_null_block_args(ctx));
                     fb.switch_to_block(set_ok);
-                    fb.ins().call(decref_ref, &[set_value]);
+                    fb.ins().call(decref_ref, &[thread_state_value, set_value]);
                 }
 
                 let call_inst = fb.ins().call(
@@ -7703,22 +7886,24 @@ fn emit_codegen_expr(
             fb.switch_to_block(call_fail_block);
             let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
             if let Some(kwargs_obj) = call_kwargs_obj {
-                fb.ins().call(decref_ref, &[kwargs_obj]);
+                fb.ins().call(decref_ref, &[thread_state_value, kwargs_obj]);
             }
-            fb.ins().call(decref_ref, &[call_args_tuple]);
+            fb.ins()
+                .call(decref_ref, &[thread_state_value, call_args_tuple]);
             if !callable_is_borrowed {
-                fb.ins().call(decref_ref, &[callable]);
+                fb.ins().call(decref_ref, &[thread_state_value, callable]);
             }
             emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
             fb.ins().jump(step_null_block, &step_null_block_args(ctx));
 
             fb.switch_to_block(call_ok_block);
             if let Some(kwargs_obj) = call_kwargs_obj {
-                fb.ins().call(decref_ref, &[kwargs_obj]);
+                fb.ins().call(decref_ref, &[thread_state_value, kwargs_obj]);
             }
-            fb.ins().call(decref_ref, &[call_args_tuple]);
+            fb.ins()
+                .call(decref_ref, &[thread_state_value, call_args_tuple]);
             if !callable_is_borrowed {
-                fb.ins().call(decref_ref, &[callable]);
+                fb.ins().call(decref_ref, &[thread_state_value, callable]);
             }
             fb.block_params(call_ok_block)[0]
         }
@@ -7886,12 +8071,14 @@ fn emit_explicit_target_slot_writes_codegen_from_local_env(
                 target_name,
                 value,
                 ctx.consts.ptr_ty,
+                ctx.consts.thread_state_value,
                 ctx.incref_ref,
                 ctx.decref_ref,
             )
             .expect("explicit edge slot target missing from stack slots");
         if owned_value {
-            fb.ins().call(ctx.decref_ref, &[value]);
+            fb.ins()
+                .call(ctx.decref_ref, &[ctx.consts.thread_state_value, value]);
         }
     }
     Some(())
@@ -7901,6 +8088,7 @@ fn emit_decref_unforwarded_local_env(
     fb: &mut FunctionBuilder<'_>,
     local_env: &LocalEnv,
     target_params: &[String],
+    thread_state_value: ir::Value,
     decref_ref: ir::FuncRef,
 ) {
     let forwarded_local_indices = target_params
@@ -7912,7 +8100,8 @@ fn emit_decref_unforwarded_local_env(
             continue;
         }
         if transient_local_needs_decref(entry.ref_kind) {
-            fb.ins().call(decref_ref, &[entry.value]);
+            fb.ins()
+                .call(decref_ref, &[thread_state_value, entry.value]);
         }
     }
 }
@@ -7923,6 +8112,7 @@ fn emit_exception_dispatch_slot_writes(
     dispatch_exc: ir::Value,
     stack_slots: &StackSlots,
     ptr_ty: ir::Type,
+    thread_state_value: ir::Value,
     none_const: ir::Value,
     incref_ref: ir::FuncRef,
     decref_ref: ir::FuncRef,
@@ -7949,7 +8139,15 @@ fn emit_exception_dispatch_slot_writes(
             }
         };
         stack_slots
-            .replace_cloned_value(fb, target_name, value, ptr_ty, incref_ref, decref_ref)
+            .replace_cloned_value(
+                fb,
+                target_name,
+                value,
+                ptr_ty,
+                thread_state_value,
+                incref_ref,
+                decref_ref,
+            )
             .expect("exception dispatch slot target missing from stack slots");
     }
     Ok(())
@@ -8014,6 +8212,7 @@ fn emit_planned_stack_slot_releases_for_reason(
         emit_ctx.refcount_plan,
         &emit_ctx.stack_slots,
         emit_ctx.consts.ptr_ty,
+        emit_ctx.consts.thread_state_value,
         emit_ctx.decref_ref,
     )
 }
@@ -8026,6 +8225,7 @@ fn emit_planned_stack_slot_releases_for_reason_from_parts(
     refcount_plan: &FunctionRefcountPlan,
     stack_slots: &StackSlots,
     ptr_ty: ir::Type,
+    thread_state_value: ir::Value,
     decref_ref: ir::FuncRef,
 ) -> Result<(), String> {
     if !matches!(
@@ -8057,7 +8257,7 @@ fn emit_planned_stack_slot_releases_for_reason_from_parts(
             continue;
         }
         stack_slots
-            .clear_value(fb, local.name.as_str(), ptr_ty, decref_ref)
+            .clear_value(fb, local.name.as_str(), ptr_ty, thread_state_value, decref_ref)
             .ok_or_else(|| {
                 format!(
                     "refcount plan release for block {source_label} references missing stack slot {:?}",
@@ -8358,7 +8558,10 @@ fn emit_codegen_simple_call_with_local_env(
             let tuple_value = emit_pack_current_values_tuple(fb, arg_values.as_slice(), emit_ctx);
             for (value, borrowed_arg) in arg_values.into_iter().zip(borrowed_args.into_iter()) {
                 if !borrowed_arg {
-                    fb.ins().call(emit_ctx.decref_ref, &[value]);
+                    fb.ins().call(
+                        emit_ctx.decref_ref,
+                        &[emit_ctx.consts.thread_state_value, value],
+                    );
                 }
             }
             return Some(tuple_value);
@@ -8413,9 +8616,18 @@ fn emit_codegen_simple_call_with_local_env(
             fb.ins()
                 .call(emit_ctx.raise_deleted_name_error_ref, &[name_obj]);
             let error_value = emit_take_error_before_local_null_cleanup(fb, emit_ctx);
-            fb.ins().call(emit_ctx.decref_ref, &[name_obj]);
+            fb.ins().call(
+                emit_ctx.decref_ref,
+                &[emit_ctx.consts.thread_state_value, name_obj],
+            );
             if !value_borrowed {
-                emit_decref_if_not_null(fb, emit_ctx.consts.ptr_ty, emit_ctx.decref_ref, value_obj);
+                emit_decref_if_not_null(
+                    fb,
+                    emit_ctx.consts.ptr_ty,
+                    emit_ctx.decref_ref,
+                    emit_ctx.consts.thread_state_value,
+                    value_obj,
+                );
             }
             emit_restore_error_after_local_null_cleanup(fb, emit_ctx, error_value);
             fb.ins().jump(
@@ -8425,7 +8637,10 @@ fn emit_codegen_simple_call_with_local_env(
 
             fb.switch_to_block(value_ok_block);
             let value_obj = fb.block_params(value_ok_block)[0];
-            fb.ins().call(emit_ctx.decref_ref, &[name_obj]);
+            fb.ins().call(
+                emit_ctx.decref_ref,
+                &[emit_ctx.consts.thread_state_value, name_obj],
+            );
             if value_borrowed {
                 fb.ins().call(emit_ctx.incref_ref, &[value_obj]);
             }
@@ -8936,7 +9151,10 @@ fn emit_codegen_expr_with_local_env(
         );
         let callee_id = emit_callee_function_id_checked(fb, callable, emit_ctx);
         if !callable_is_borrowed {
-            fb.ins().call(emit_ctx.decref_ref, &[callable]);
+            fb.ins().call(
+                emit_ctx.decref_ref,
+                &[emit_ctx.consts.thread_state_value, callable],
+            );
         }
         return callee_id;
     }
@@ -9007,6 +9225,7 @@ fn emit_codegen_expr_with_local_env(
                 value,
                 &emit_ctx.stack_slots,
                 emit_ctx.consts.ptr_ty,
+                emit_ctx.consts.thread_state_value,
                 emit_ctx.incref_ref,
                 emit_ctx.decref_ref,
             );
@@ -9043,6 +9262,7 @@ fn emit_codegen_expr_with_local_env(
                 value,
                 &emit_ctx.stack_slots,
                 emit_ctx.consts.ptr_ty,
+                emit_ctx.consts.thread_state_value,
                 emit_ctx.incref_ref,
                 emit_ctx.decref_ref,
             );
@@ -9069,9 +9289,15 @@ fn emit_codegen_expr_with_local_env(
             func_imports,
         );
         let call_inst = fb.ins().call(emit_ctx.store_cell_ref, &[raw_cell, value]);
-        fb.ins().call(emit_ctx.decref_ref, &[raw_cell]);
+        fb.ins().call(
+            emit_ctx.decref_ref,
+            &[emit_ctx.consts.thread_state_value, raw_cell],
+        );
         if !value_borrowed {
-            fb.ins().call(emit_ctx.decref_ref, &[value]);
+            fb.ins().call(
+                emit_ctx.decref_ref,
+                &[emit_ctx.consts.thread_state_value, value],
+            );
         }
         let call_value = fb.inst_results(call_inst)[0];
         let mut intrinsic_state = LocalEnvCodegenIntrinsicEmitState {
@@ -9100,6 +9326,7 @@ fn emit_codegen_expr_with_local_env(
                     name,
                     &emit_ctx.stack_slots,
                     emit_ctx.consts.ptr_ty,
+                    emit_ctx.consts.thread_state_value,
                     emit_ctx.decref_ref,
                 )
                 .unwrap_or_else(|error| panic!("{error}"));
@@ -9187,6 +9414,7 @@ fn emit_codegen_stmt_with_local_env(
                     value,
                     &emit_ctx.stack_slots,
                     emit_ctx.consts.ptr_ty,
+                    emit_ctx.consts.thread_state_value,
                     emit_ctx.incref_ref,
                     emit_ctx.decref_ref,
                 );
@@ -9209,6 +9437,7 @@ fn emit_codegen_stmt_with_local_env(
                         name,
                         &emit_ctx.stack_slots,
                         emit_ctx.consts.ptr_ty,
+                        emit_ctx.consts.thread_state_value,
                         emit_ctx.decref_ref,
                     )
                     .unwrap_or_else(|error| panic!("{error}"));
@@ -9287,7 +9516,10 @@ fn emit_codegen_ops(
             jit_module,
             func_imports,
         );
-        fb.ins().call(emit_ctx.decref_ref, &[value]);
+        fb.ins().call(
+            emit_ctx.decref_ref,
+            &[emit_ctx.consts.thread_state_value, value],
+        );
     }
     Ok(())
 }
@@ -9328,7 +9560,13 @@ fn emit_codegen_if_target_arm(
             )
         })?,
     );
-    emit_decref_unforwarded_local_env(fb, local_env, target_params, emit_ctx.decref_ref);
+    emit_decref_unforwarded_local_env(
+        fb,
+        local_env,
+        target_params,
+        emit_ctx.consts.thread_state_value,
+        emit_ctx.decref_ref,
+    );
     emit_planned_stack_slot_releases_for_reason(fb, source_label, &release_reason, emit_ctx)?;
     emit_pop_handled_exception_if_leaving(fb, current_exception_name, target_params, emit_ctx);
     fb.ins().jump(exec_blocks[target_index], &jump_args);
@@ -9352,6 +9590,7 @@ fn emit_codegen_term(
     current_exception_name: Option<&str>,
 ) -> Result<(), String> {
     let decref_ref = emit_ctx.decref_ref;
+    let thread_state_value = emit_ctx.consts.thread_state_value;
     let i64_ty = emit_ctx.consts.i64_ty;
     let ptr_ty = emit_ctx.consts.ptr_ty;
     let null_ptr = fb.ins().iconst(ptr_ty, 0);
@@ -9390,7 +9629,13 @@ fn emit_codegen_term(
                     format!("missing local mapping for jump block params in block {source_label}")
                 })?,
             );
-            emit_decref_unforwarded_local_env(fb, local_env, target_params, decref_ref);
+            emit_decref_unforwarded_local_env(
+                fb,
+                local_env,
+                target_params,
+                thread_state_value,
+                decref_ref,
+            );
             let release_reason = RefcountReleaseReason::Jump {
                 target: target_label.target,
             };
@@ -9547,7 +9792,13 @@ fn emit_codegen_term(
                         )
                     })?,
                 );
-                emit_decref_unforwarded_local_env(fb, local_env, target_params, decref_ref);
+                emit_decref_unforwarded_local_env(
+                    fb,
+                    local_env,
+                    target_params,
+                    thread_state_value,
+                    decref_ref,
+                );
                 let release_reason = RefcountReleaseReason::BranchCase {
                     target: *target_label,
                 };
@@ -9587,7 +9838,13 @@ fn emit_codegen_term(
                     )
                 })?,
             );
-            emit_decref_unforwarded_local_env(fb, local_env, default_params, decref_ref);
+            emit_decref_unforwarded_local_env(
+                fb,
+                local_env,
+                default_params,
+                thread_state_value,
+                decref_ref,
+            );
             let release_reason = RefcountReleaseReason::BranchDefault {
                 target: branch.default_label,
             };
@@ -9616,7 +9873,7 @@ fn emit_codegen_term(
                 jit_module,
                 func_imports,
             );
-            emit_decref_unforwarded_local_env(fb, local_env, &[], decref_ref);
+            emit_decref_unforwarded_local_env(fb, local_env, &[], thread_state_value, decref_ref);
             let release_reason = RefcountReleaseReason::Return;
             emit_planned_stack_slot_releases_for_reason(
                 fb,
@@ -9638,7 +9895,8 @@ fn emit_codegen_term(
             let raise_fn_inst = fb
                 .ins()
                 .call(emit_ctx.load_runtime_obj_ref, &[raise_name_obj]);
-            fb.ins().call(decref_ref, &[raise_name_obj]);
+            fb.ins()
+                .call(decref_ref, &[thread_state_value, raise_name_obj]);
             let raise_fn = fb.inst_results(raise_fn_inst)[0];
             let raise_fn_null = fb
                 .ins()
@@ -9675,12 +9933,21 @@ fn emit_codegen_term(
             let cause_value = emit_ctx.consts.none_const;
             let raise_call_inst = fb.ins().call(
                 emit_ctx.py_call_positional_three_ref,
-                &[rfo_raise_fn, exc_value, cause_value, null_ptr, null_ptr],
+                &[
+                    emit_ctx.consts.thread_state_value,
+                    rfo_raise_fn,
+                    exc_value,
+                    cause_value,
+                    null_ptr,
+                    null_ptr,
+                ],
             );
             let raise_exc_obj = fb.inst_results(raise_call_inst)[0];
-            fb.ins().call(decref_ref, &[cause_value]);
-            fb.ins().call(decref_ref, &[exc_value]);
-            fb.ins().call(decref_ref, &[rfo_raise_fn]);
+            fb.ins()
+                .call(decref_ref, &[thread_state_value, cause_value]);
+            fb.ins().call(decref_ref, &[thread_state_value, exc_value]);
+            fb.ins()
+                .call(decref_ref, &[thread_state_value, rfo_raise_fn]);
             let raise_exc_null =
                 fb.ins()
                     .icmp(ir::condcodes::IntCC::Equal, raise_exc_obj, null_ptr);
@@ -9698,7 +9965,8 @@ fn emit_codegen_term(
             let reo_exc_obj = fb.block_params(raise_exc_ok)[0];
             let raise_inst = fb.ins().call(raise_exc_ref, &[reo_exc_obj]);
             let raise_rc = fb.inst_results(raise_inst)[0];
-            fb.ins().call(decref_ref, &[reo_exc_obj]);
+            fb.ins()
+                .call(decref_ref, &[thread_state_value, reo_exc_obj]);
             let raise_rc_fail = fb.create_block();
             let raise_rc_ok = fb.create_block();
             let raise_ok = fb.ins().icmp_imm(ir::condcodes::IntCC::Equal, raise_rc, 0);
@@ -9713,7 +9981,7 @@ fn emit_codegen_term(
             );
 
             fb.switch_to_block(raise_rc_ok);
-            emit_decref_unforwarded_local_env(fb, local_env, &[], decref_ref);
+            emit_decref_unforwarded_local_env(fb, local_env, &[], thread_state_value, decref_ref);
             let release_reason = RefcountReleaseReason::Raise;
             emit_planned_stack_slot_releases_for_reason(
                 fb,
@@ -11447,6 +11715,7 @@ fn build_cranelift_run_bb_specialized_function(
                         param.name.as_str(),
                         *value,
                         ptr_ty,
+                        thread_state_value,
                         incref_ref,
                         decref_ref,
                     )
@@ -11489,11 +11758,13 @@ fn build_cranelift_run_bb_specialized_function(
                     param.name.as_str(),
                     default_value,
                     ptr_ty,
+                    thread_state_value,
                     incref_ref,
                     decref_ref,
                 )
                 .expect("entry slot missing from stack slots");
-            fb.ins().call(decref_ref, &[default_value]);
+            fb.ins()
+                .call(decref_ref, &[thread_state_value, default_value]);
             fb.ins().jump(after_block, &[]);
 
             fb.switch_to_block(use_arg_block);
@@ -11503,6 +11774,7 @@ fn build_cranelift_run_bb_specialized_function(
                     param.name.as_str(),
                     *value,
                     ptr_ty,
+                    thread_state_value,
                     incref_ref,
                     decref_ref,
                 )
@@ -11562,11 +11834,13 @@ fn build_cranelift_run_bb_specialized_function(
                             binding.name.as_str(),
                             *param_value,
                             ptr_ty,
+                            thread_state_value,
                             incref_ref,
                             decref_ref,
                         )
                         .expect("runtime block param missing from stack slots");
-                    fb.ins().call(decref_ref, &[*param_value]);
+                    fb.ins()
+                        .call(decref_ref, &[thread_state_value, *param_value]);
                 } else {
                     stack_slots
                         .replace_cloned_value(
@@ -11574,11 +11848,13 @@ fn build_cranelift_run_bb_specialized_function(
                             param_name,
                             *param_value,
                             ptr_ty,
+                            thread_state_value,
                             incref_ref,
                             decref_ref,
                         )
                         .expect("runtime block param missing from stack slots");
-                    fb.ins().call(decref_ref, &[*param_value]);
+                    fb.ins()
+                        .call(decref_ref, &[thread_state_value, *param_value]);
                 }
             }
             let block_const = globals_value;
@@ -11799,6 +12075,7 @@ fn build_cranelift_run_bb_specialized_function(
                 dispatch_exc,
                 &stack_slots,
                 ptr_ty,
+                thread_state_value,
                 none_const,
                 incref_ref,
                 decref_ref,
@@ -11814,12 +12091,14 @@ fn build_cranelift_run_bb_specialized_function(
                 &refcount_plan,
                 &stack_slots,
                 ptr_ty,
+                thread_state_value,
                 decref_ref,
             )?;
             let target_runtime_params = &runtime_block_param_names[dispatch_plan.target_index];
             let mut target_jump_args = Vec::with_capacity(target_runtime_params.len());
             if target_runtime_params.is_empty() {
-                fb.ins().call(decref_ref, &[dispatch_exc]);
+                fb.ins()
+                    .call(decref_ref, &[thread_state_value, dispatch_exc]);
             } else {
                 target_jump_args.push(ir::BlockArg::Value(dispatch_exc));
             }
@@ -11833,7 +12112,7 @@ fn build_cranelift_run_bb_specialized_function(
                 emit_take_current_raised_exception_or_trap(&mut fb, ptr_ty, thread_state_value);
             let cleanup_values = fb.block_params(cleanup.block).to_vec();
             for value in cleanup_values {
-                fb.ins().call(decref_ref, &[value]);
+                fb.ins().call(decref_ref, &[thread_state_value, value]);
             }
             fb.ins().jump(
                 cleanup.cleanup_null_block,
@@ -11856,7 +12135,7 @@ fn build_cranelift_run_bb_specialized_function(
             let error_value = fb.block_params(*block)[0];
             let cleanup_args = fb.block_params(*block)[1..].to_vec();
             for value in cleanup_args {
-                fb.ins().call(decref_ref, &[value]);
+                fb.ins().call(decref_ref, &[thread_state_value, value]);
             }
             if let Some(exception_name) = function.blocks[index].exception_param() {
                 if let Some((previous_slot, is_pushed_slot)) =
@@ -11882,7 +12161,7 @@ fn build_cranelift_run_bb_specialized_function(
                     fb.switch_to_block(done_block);
                 }
             }
-            stack_slots.decref_all(&mut fb, ptr_ty, decref_ref);
+            stack_slots.decref_all(&mut fb, ptr_ty, thread_state_value, decref_ref);
             fb.ins()
                 .call(set_raised_exception_ref, &[thread_state_value, error_value]);
             let null_ptr = fb.ins().iconst(ptr_ty, 0);
@@ -11893,8 +12172,9 @@ fn build_cranelift_run_bb_specialized_function(
         let step_null_args = fb.block_params(step_null_block)[0];
         let error_value =
             emit_take_current_raised_exception_or_trap(&mut fb, ptr_ty, thread_state_value);
-        stack_slots.decref_all(&mut fb, ptr_ty, decref_ref);
-        fb.ins().call(decref_ref, &[step_null_args]);
+        stack_slots.decref_all(&mut fb, ptr_ty, thread_state_value, decref_ref);
+        fb.ins()
+            .call(decref_ref, &[thread_state_value, step_null_args]);
         fb.ins()
             .call(set_raised_exception_ref, &[thread_state_value, error_value]);
         let null_ptr = fb.ins().iconst(ptr_ty, 0);
@@ -11920,11 +12200,12 @@ fn build_cranelift_run_bb_specialized_function(
         fb.switch_to_block(red_set_block);
         let red_set_exc = fb.block_params(red_set_block)[0];
         let _ = fb.ins().call(raise_exc_ref, &[red_set_exc]);
-        fb.ins().call(decref_ref, &[red_set_exc]);
+        fb.ins()
+            .call(decref_ref, &[thread_state_value, red_set_exc]);
         fb.ins().jump(red_done_block, &[]);
         fb.switch_to_block(red_done_block);
-        fb.ins().call(decref_ref, &[red_args]);
-        stack_slots.decref_all(&mut fb, ptr_ty, decref_ref);
+        fb.ins().call(decref_ref, &[thread_state_value, red_args]);
+        stack_slots.decref_all(&mut fb, ptr_ty, thread_state_value, decref_ref);
         fb.ins().return_(&[red_null]);
 
         fb.seal_all_blocks();
@@ -12248,7 +12529,9 @@ fn define_shared_vectorcall_trampoline(
         fb.ins().return_(&[null_ptr]);
 
         fb.switch_to_block(function_env_ok);
-        let enter_inst = fb.ins().call(enter_recursive_ref, &[]);
+        let thread_state_inst = fb.ins().call(thread_state_get_ref, &[]);
+        let thread_state_val = fb.inst_results(thread_state_inst)[0];
+        let enter_inst = fb.ins().call(enter_recursive_ref, &[thread_state_val]);
         let enter_status = fb.inst_results(enter_inst)[0];
         let enter_failed = fb
             .ins()
@@ -12300,13 +12583,11 @@ fn define_shared_vectorcall_trampoline(
         fb.seal_block(ok_block);
 
         fb.switch_to_block(fail_block);
-        fb.ins().call(leave_recursive_ref, &[]);
+        fb.ins().call(leave_recursive_ref, &[thread_state_val]);
         fb.ins().return_(&[null_ptr]);
 
         fb.switch_to_block(ok_block);
         let direct_sig_ref = fb.import_signature(direct_sig);
-        let thread_state_inst = fb.ins().call(thread_state_get_ref, &[]);
-        let thread_state_val = fb.inst_results(thread_state_inst)[0];
         let mut call_args = Vec::with_capacity(param_count + 2);
         call_args.push(function_env_val);
         call_args.push(thread_state_val);
@@ -12342,18 +12623,18 @@ fn define_shared_vectorcall_trampoline(
         let error_value =
             emit_take_current_raised_exception_or_trap(&mut fb, ptr_ty, thread_state_val);
         for value in owned_args.iter().copied() {
-            fb.ins().call(decref_ref, &[value]);
+            fb.ins().call(decref_ref, &[thread_state_val, value]);
         }
-        fb.ins().call(leave_recursive_ref, &[]);
+        fb.ins().call(leave_recursive_ref, &[thread_state_val]);
         fb.ins()
             .call(set_raised_exception_ref, &[thread_state_val, error_value]);
         fb.ins().return_(&[result]);
 
         fb.switch_to_block(direct_ok_block);
         for value in owned_args {
-            fb.ins().call(decref_ref, &[value]);
+            fb.ins().call(decref_ref, &[thread_state_val, value]);
         }
-        fb.ins().call(leave_recursive_ref, &[]);
+        fb.ins().call(leave_recursive_ref, &[thread_state_val]);
         fb.ins().return_(&[result]);
         fb.seal_all_blocks();
         fb.finalize();

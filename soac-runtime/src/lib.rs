@@ -1,9 +1,11 @@
 #![no_std]
 
-use core::{ffi::c_void, ptr};
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!("soac-runtime raw CPython layout support requires a 64-bit target");
+
+use core::ffi::c_void;
 
 #[repr(C)]
-#[cfg(all(target_pointer_width = "64", target_endian = "little"))]
 #[derive(Clone, Copy)]
 union PyObjectObRefcnt {
     ob_refcnt_full: i64,
@@ -11,15 +13,7 @@ union PyObjectObRefcnt {
 }
 
 #[repr(C)]
-#[cfg(all(target_pointer_width = "64", target_endian = "big"))]
-#[derive(Clone, Copy)]
-union PyObjectObRefcnt {
-    ob_refcnt_full: i64,
-    refcnt_and_flags: PyObjectObFlagsAndRefcnt,
-}
-
-#[repr(C)]
-#[cfg(all(target_pointer_width = "64", target_endian = "little"))]
+#[cfg(target_endian = "little")]
 #[derive(Clone, Copy)]
 struct PyObjectObFlagsAndRefcnt {
     ob_refcnt: u32,
@@ -28,7 +22,7 @@ struct PyObjectObFlagsAndRefcnt {
 }
 
 #[repr(C)]
-#[cfg(all(target_pointer_width = "64", target_endian = "big"))]
+#[cfg(target_endian = "big")]
 #[derive(Clone, Copy)]
 struct PyObjectObFlagsAndRefcnt {
     ob_flags: u16,
@@ -38,10 +32,7 @@ struct PyObjectObFlagsAndRefcnt {
 
 #[repr(C)]
 struct RawPyObject {
-    #[cfg(target_pointer_width = "64")]
     ob_refcnt: PyObjectObRefcnt,
-    #[cfg(target_pointer_width = "32")]
-    ob_refcnt: isize,
     ob_type: *mut c_void,
 }
 
@@ -228,7 +219,10 @@ struct ClifFunctionData {
 
 unsafe extern "C" {
     fn _Py_Dealloc(obj: *mut RawPyObject);
-    fn PyThreadState_GetUnchecked() -> *mut RawPyThreadState;
+    fn soac_runtime_decref_dealloc_preserving_error(
+        tstate: *mut RawPyThreadState,
+        obj: *mut RawPyObject,
+    );
     fn _PyDict_SetIndexedItem(dict: *mut c_void, index: isize, value: *mut c_void) -> i32;
     fn soac_runtime_load_global_slow(
         dict: *mut c_void,
@@ -252,23 +246,6 @@ const PY_TPFLAGS_INLINE_VALUES: usize = 1 << 2;
 const MANAGED_DICT_OFFSET: isize = -3 * (core::mem::size_of::<*mut c_void>() as isize);
 
 #[inline(always)]
-unsafe fn py_err_is_set_direct(tstate: *mut RawPyThreadState) -> bool {
-    debug_assert!(!tstate.is_null());
-    if tstate.is_null() {
-        return false;
-    }
-    !unsafe { (*tstate).current_exception }.is_null()
-}
-
-#[inline(always)]
-unsafe fn take_raised_exception_direct(tstate: *mut RawPyThreadState) -> *mut RawPyObject {
-    debug_assert!(!tstate.is_null());
-    let exc = unsafe { (*tstate).current_exception };
-    unsafe { (*tstate).current_exception = ptr::null_mut() };
-    exc
-}
-
-#[inline(always)]
 unsafe fn dict_unicode_entries(keys: *mut RawPyDictKeysObject) -> *mut RawPyDictUnicodeEntry {
     let indices = unsafe {
         keys.cast::<u8>()
@@ -285,38 +262,13 @@ unsafe fn indexed_key(keys: *mut RawPyDictKeysObject, index: isize) -> *mut RawP
 
 #[inline(always)]
 unsafe fn can_skip_incref(obj: *mut RawPyObject) -> bool {
-    #[cfg(target_pointer_width = "64")]
-    {
-        const PY_IMMORTAL_INITIAL_REFCNT: u32 = 3u32 << 30;
-        unsafe { (*obj).ob_refcnt.refcnt_and_flags.ob_refcnt >= PY_IMMORTAL_INITIAL_REFCNT }
-    }
-
-    #[cfg(target_pointer_width = "32")]
-    {
-        const PY_IMMORTAL_MINIMUM_REFCNT: isize = 1isize << 30;
-        unsafe { (*obj).ob_refcnt >= PY_IMMORTAL_MINIMUM_REFCNT }
-    }
+    const PY_IMMORTAL_INITIAL_REFCNT: u32 = 3u32 << 30;
+    unsafe { (*obj).ob_refcnt.refcnt_and_flags.ob_refcnt >= PY_IMMORTAL_INITIAL_REFCNT }
 }
 
 #[inline(always)]
 unsafe fn can_skip_decref(obj: *mut RawPyObject) -> bool {
-    #[cfg(target_pointer_width = "64")]
-    {
-        unsafe { ((*obj).ob_refcnt.refcnt_and_flags.ob_refcnt as i32) < 0 }
-    }
-
-    #[cfg(target_pointer_width = "32")]
-    {
-        const PY_IMMORTAL_MINIMUM_REFCNT: isize = 1isize << 30;
-        unsafe { (*obj).ob_refcnt >= PY_IMMORTAL_MINIMUM_REFCNT }
-    }
-}
-
-macro_rules! decref_raw {
-    ($obj:expr) => {{
-        let tstate = unsafe { PyThreadState_GetUnchecked() };
-        decref_raw_with_tstate!(tstate, $obj);
-    }};
+    unsafe { ((*obj).ob_refcnt.refcnt_and_flags.ob_refcnt as i32) < 0 }
 }
 
 macro_rules! decref_raw_without_error_preservation {
@@ -325,19 +277,9 @@ macro_rules! decref_raw_without_error_preservation {
         {
             let obj: *mut RawPyObject = $obj;
             if !obj.is_null() && !unsafe { can_skip_decref(obj) } {
-                #[cfg(target_pointer_width = "64")]
                 unsafe {
                     let next_refcnt = (*obj).ob_refcnt.refcnt_and_flags.ob_refcnt.wrapping_sub(1);
                     (*obj).ob_refcnt.refcnt_and_flags.ob_refcnt = next_refcnt;
-                    if next_refcnt == 0 {
-                        _Py_Dealloc(obj);
-                    }
-                }
-
-                #[cfg(target_pointer_width = "32")]
-                unsafe {
-                    let next_refcnt = (*obj).ob_refcnt.wrapping_sub(1);
-                    (*obj).ob_refcnt = next_refcnt;
                     if next_refcnt == 0 {
                         _Py_Dealloc(obj);
                     }
@@ -365,37 +307,11 @@ macro_rules! decref_raw_with_tstate {
         let tstate: *mut RawPyThreadState = $tstate;
         let obj: *mut RawPyObject = $obj;
         if !obj.is_null() && !unsafe { can_skip_decref(obj) } {
-            #[cfg(target_pointer_width = "64")]
             unsafe {
                 let next_refcnt = (*obj).ob_refcnt.refcnt_and_flags.ob_refcnt.wrapping_sub(1);
                 (*obj).ob_refcnt.refcnt_and_flags.ob_refcnt = next_refcnt;
                 if next_refcnt == 0 {
-                    let saved_error = if py_err_is_set_direct(tstate) {
-                        take_raised_exception_direct(tstate)
-                    } else {
-                        ptr::null_mut()
-                    };
-                    _Py_Dealloc(obj);
-                    if !saved_error.is_null() {
-                        set_raised_exception_direct!(tstate, saved_error);
-                    }
-                }
-            }
-
-            #[cfg(target_pointer_width = "32")]
-            unsafe {
-                let next_refcnt = (*obj).ob_refcnt.wrapping_sub(1);
-                (*obj).ob_refcnt = next_refcnt;
-                if next_refcnt == 0 {
-                    let saved_error = if py_err_is_set_direct(tstate) {
-                        take_raised_exception_direct(tstate)
-                    } else {
-                        ptr::null_mut()
-                    };
-                    _Py_Dealloc(obj);
-                    if !saved_error.is_null() {
-                        set_raised_exception_direct!(tstate, saved_error);
-                    }
+                    soac_runtime_decref_dealloc_preserving_error(tstate, obj);
                 }
             }
         }
@@ -408,21 +324,15 @@ unsafe fn incref_impl(obj: *mut RawPyObject) {
         return;
     }
 
-    #[cfg(target_pointer_width = "64")]
     unsafe {
         let cur_refcnt = (*obj).ob_refcnt.refcnt_and_flags.ob_refcnt;
         (*obj).ob_refcnt.refcnt_and_flags.ob_refcnt = cur_refcnt.wrapping_add(1);
     }
-
-    #[cfg(target_pointer_width = "32")]
-    unsafe {
-        (*obj).ob_refcnt = (*obj).ob_refcnt.wrapping_add(1);
-    }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soac_runtime_decref(obj: *mut c_void) {
-    decref_raw!(obj.cast::<RawPyObject>());
+pub unsafe extern "C" fn soac_runtime_decref(tstate: *mut c_void, obj: *mut c_void) {
+    decref_raw_with_tstate!(tstate.cast::<RawPyThreadState>(), obj.cast::<RawPyObject>());
 }
 
 #[unsafe(no_mangle)]
@@ -619,6 +529,7 @@ pub unsafe extern "C" fn soac_runtime_load_global(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soac_runtime_store_global_indexed(
+    tstate: *mut c_void,
     dict: *mut c_void,
     key: *mut c_void,
     index: isize,
@@ -645,7 +556,7 @@ pub unsafe extern "C" fn soac_runtime_store_global_indexed(
     if !old_value.is_null()
         && old_value.cast::<c_void>() != (&raw mut _PyDict_IndexedValueTombstone)
     {
-        decref_raw!(old_value);
+        decref_raw_with_tstate!(tstate.cast::<RawPyThreadState>(), old_value);
     }
     unsafe { incref_impl(value) };
     value.cast::<c_void>()

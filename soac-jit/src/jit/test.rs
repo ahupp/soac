@@ -46,6 +46,9 @@ mod tests {
         me_value: *mut ffi::PyObject,
     }
 
+    unsafe extern "C" {
+        fn PyThreadState_GetUnchecked() -> *mut ffi::PyThreadState;
+    }
     #[test]
     fn cranelift_compile_cache_name_is_stable_from_logical_cache_name() {
         assert_eq!(
@@ -658,6 +661,9 @@ mod tests {
 
         let mut refcount_signature = jit_module.make_signature();
         refcount_signature.params.push(ir::AbiParam::new(ptr_ty));
+        let mut decref_signature = jit_module.make_signature();
+        decref_signature.params.push(ir::AbiParam::new(ptr_ty));
+        decref_signature.params.push(ir::AbiParam::new(ptr_ty));
 
         let mut wrapper_signature = jit_module.make_signature();
         wrapper_signature.params.push(ir::AbiParam::new(ptr_ty));
@@ -695,6 +701,7 @@ mod tests {
 
             let old_value = fb.block_params(entry)[0];
             let new_value = fb.block_params(entry)[1];
+            let null_tstate = fb.ins().iconst(ptr_ty, 0);
             let incref_ref = jit_module.declare_func_in_func(incref_id, &mut fb.func);
             let decref_ref = jit_module.declare_func_in_func(decref_id, &mut fb.func);
             env.entries.push(LocalEnvEntry {
@@ -716,6 +723,7 @@ mod tests {
                 new_value,
                 &stack_slots,
                 ptr_ty,
+                null_tstate,
                 incref_ref,
                 decref_ref,
             );
@@ -1711,6 +1719,9 @@ def write_point(point, value):
 
         let mut refcount_signature = jit_module.make_signature();
         refcount_signature.params.push(ir::AbiParam::new(ptr_ty));
+        let mut decref_signature = jit_module.make_signature();
+        decref_signature.params.push(ir::AbiParam::new(ptr_ty));
+        decref_signature.params.push(ir::AbiParam::new(ptr_ty));
 
         let mut wrapper_signature = jit_module.make_signature();
         wrapper_signature.params.push(ir::AbiParam::new(ptr_ty));
@@ -1731,7 +1742,7 @@ def write_point(point, value):
         let decref_id = declare_local_fn(
             &mut jit_module,
             SOAC_RUNTIME_DECREF_SYMBOL,
-            &refcount_signature,
+            &decref_signature,
         )
         .expect("runtime decref support function should be available");
 
@@ -1750,8 +1761,9 @@ def write_point(point, value):
             let incref_ref = jit_module.declare_func_in_func(incref_id, &mut fb.func);
             let decref_ref = jit_module.declare_func_in_func(decref_id, &mut fb.func);
             let arg = fb.block_params(entry)[0];
+            let null_tstate = fb.ins().iconst(ptr_ty, 0);
             fb.ins().call(incref_ref, &[arg]);
-            fb.ins().call(decref_ref, &[arg]);
+            fb.ins().call(decref_ref, &[null_tstate, arg]);
             fb.ins().return_(&[arg]);
             fb.finalize();
         }
@@ -1795,7 +1807,8 @@ def write_point(point, value):
         compiled
     }
 
-    unsafe fn build_runtime_decref_wrapper() -> unsafe extern "C" fn(*mut std::ffi::c_void) {
+    unsafe fn build_runtime_decref_wrapper()
+    -> unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) {
         let compile_session = crate::session::CompileSession::new();
         let mut jit_module =
             new_jit_module(&compile_session).expect("test jit module should construct");
@@ -1803,8 +1816,10 @@ def write_point(point, value):
 
         let mut refcount_signature = jit_module.make_signature();
         refcount_signature.params.push(ir::AbiParam::new(ptr_ty));
+        refcount_signature.params.push(ir::AbiParam::new(ptr_ty));
 
         let mut wrapper_signature = jit_module.make_signature();
+        wrapper_signature.params.push(ir::AbiParam::new(ptr_ty));
         wrapper_signature.params.push(ir::AbiParam::new(ptr_ty));
 
         let wrapper_id = declare_local_fn(
@@ -1833,8 +1848,9 @@ def write_point(point, value):
             fb.seal_block(entry);
 
             let decref_ref = jit_module.declare_func_in_func(decref_id, &mut fb.func);
-            let arg = fb.block_params(entry)[0];
-            fb.ins().call(decref_ref, &[arg]);
+            let tstate = fb.block_params(entry)[0];
+            let arg = fb.block_params(entry)[1];
+            fb.ins().call(decref_ref, &[tstate, arg]);
             fb.ins().return_(&[]);
             fb.finalize();
         }
@@ -1855,7 +1871,8 @@ def write_point(point, value):
             .expect("jit module should finalize");
 
         let code_ptr = jit_module.get_finalized_function(wrapper_id);
-        let compiled: unsafe extern "C" fn(*mut std::ffi::c_void) = std::mem::transmute(code_ptr);
+        let compiled: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) =
+            std::mem::transmute(code_ptr);
         Box::leak(Box::new(jit_module));
         compiled
     }
@@ -1948,7 +1965,8 @@ def write_point(point, value):
                     "capsule should start with a unique owned reference"
                 );
 
-                wrapper(capsule.cast());
+                let tstate = PyThreadState_GetUnchecked();
+                wrapper(tstate.cast(), capsule.cast());
                 let after = ffi::Py_REFCNT(capsule);
 
                 assert!(

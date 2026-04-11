@@ -1,3 +1,4 @@
+use super::runtime_context::{set_raised_exception_direct, take_raised_exception_direct};
 use cranelift_jit::JITBuilder;
 use libc;
 use pyo3::ffi;
@@ -26,6 +27,7 @@ unsafe extern "C" {
         index: ffi::Py_ssize_t,
         value: *mut ffi::PyObject,
     ) -> libc::c_int;
+    fn _Py_Dealloc(obj: *mut ffi::PyObject);
     fn _PyDict_IndexedKeyIndex(
         dict: *mut ffi::PyObject,
         key: *mut ffi::PyObject,
@@ -34,7 +36,6 @@ unsafe extern "C" {
         type_obj: *mut ffi::PyTypeObject,
         nitems: ffi::Py_ssize_t,
     ) -> *mut ffi::PyObject;
-    fn PyThreadState_GetUnchecked() -> *mut ffi::PyThreadState;
     #[cfg(not(test))]
     fn PyDict_GetItemRef(
         dict: *mut ffi::PyObject,
@@ -62,6 +63,20 @@ unsafe extern "C" {
 }
 
 pub type ObjPtr = *mut c_void;
+
+#[cold]
+#[inline(never)]
+unsafe extern "C" fn soac_runtime_decref_dealloc_preserving_error(tstate: ObjPtr, obj: ObjPtr) {
+    if tstate.is_null() {
+        unsafe { _Py_Dealloc(obj.cast::<ffi::PyObject>()) };
+        return;
+    }
+    let saved_error = unsafe { take_raised_exception_direct(tstate) };
+    unsafe { _Py_Dealloc(obj.cast::<ffi::PyObject>()) };
+    if !saved_error.is_null() {
+        unsafe { set_raised_exception_direct(tstate, saved_error) };
+    }
+}
 
 #[cfg(not(test))]
 #[repr(C)]
@@ -122,19 +137,39 @@ unsafe fn raise_expected_cell(where_name: &str, obj: *mut ffi::PyObject) {
 
 #[cfg(not(test))]
 unsafe extern "C" fn py_call_positional_three_hook(
+    tstate: ObjPtr,
     callable: ObjPtr,
     arg1: ObjPtr,
     arg2: ObjPtr,
     arg3: ObjPtr,
 ) -> ObjPtr {
-    let result = ffi::PyObject_CallFunctionObjArgs(
-        callable as *mut ffi::PyObject,
+    if tstate.is_null() {
+        ffi::PyErr_SetString(
+            ffi::PyExc_RuntimeError,
+            b"invalid null tstate in dp_jit_py_call_positional_three\0".as_ptr() as *const i8,
+        );
+        return ptr::null_mut();
+    }
+    let args = [
         arg1 as *mut ffi::PyObject,
         arg2 as *mut ffi::PyObject,
         arg3 as *mut ffi::PyObject,
-        ptr::null_mut::<ffi::PyObject>(),
-    ) as ObjPtr;
-    result
+    ];
+    let nargs = args
+        .iter()
+        .position(|arg| arg.is_null())
+        .unwrap_or(args.len());
+    ffi::_PyObject_VectorcallTstate(
+        tstate as *mut ffi::PyThreadState,
+        callable as *mut ffi::PyObject,
+        if nargs == 0 {
+            ptr::null()
+        } else {
+            args.as_ptr()
+        },
+        nargs,
+        ptr::null_mut(),
+    ) as ObjPtr
 }
 
 #[cfg(not(test))]
@@ -147,12 +182,21 @@ unsafe extern "C" fn py_call_object_hook(callable: ObjPtr, args: ObjPtr) -> ObjP
 
 #[cfg(not(test))]
 unsafe extern "C" fn py_vectorcall_hook(
+    tstate: ObjPtr,
     callable: ObjPtr,
     args: ObjPtr,
     nargsf: ObjPtr,
     kwnames: ObjPtr,
 ) -> ObjPtr {
-    let result = ffi::PyObject_Vectorcall(
+    if tstate.is_null() {
+        ffi::PyErr_SetString(
+            ffi::PyExc_RuntimeError,
+            b"invalid null tstate in dp_jit_py_vectorcall\0".as_ptr() as *const i8,
+        );
+        return ptr::null_mut();
+    }
+    let result = ffi::_PyObject_VectorcallTstate(
+        tstate as *mut ffi::PyThreadState,
         callable as *mut ffi::PyObject,
         args as *const *mut ffi::PyObject,
         nargsf as usize,
@@ -181,11 +225,11 @@ unsafe extern "C" fn next_or_sentinel_hook(iterator: ObjPtr, sentinel: ObjPtr) -
     }
 }
 
-unsafe extern "C" fn enter_recursive_call_hook() -> i32 {
+unsafe extern "C" fn enter_recursive_call_hook(_tstate: ObjPtr) -> i32 {
     ffi::Py_EnterRecursiveCall(b" while calling a Python object\0".as_ptr() as *const i8)
 }
 
-unsafe extern "C" fn leave_recursive_call_hook() {
+unsafe extern "C" fn leave_recursive_call_hook(_tstate: ObjPtr) {
     ffi::Py_LeaveRecursiveCall();
 }
 
@@ -1057,6 +1101,7 @@ mod test_only_export_stubs {
     panic_obj_export!(dp_jit_push_handled_exception(exc: ObjPtr));
     panic_unit_export!(dp_jit_pop_handled_exception(previous: ObjPtr));
     panic_dual_obj_export!(dp_jit_py_call_positional_three, dp_jit_py_call_positional_three_with_frame(
+        tstate: ObjPtr,
         callable: ObjPtr,
         arg1: ObjPtr,
         arg2: ObjPtr,
@@ -1068,6 +1113,7 @@ mod test_only_export_stubs {
         args: ObjPtr
     ));
     panic_dual_obj_export!(dp_jit_py_vectorcall, dp_jit_py_vectorcall_with_frame(
+        tstate: ObjPtr,
         callable: ObjPtr,
         args: ObjPtr,
         nargsf: ObjPtr,
@@ -1195,12 +1241,13 @@ define_perf_toggle_export!(
     ObjPtr,
     dp_jit_py_call_positional_three,
     dp_jit_py_call_positional_three_with_frame(
+        tstate: ObjPtr,
         callable: ObjPtr,
         arg1: ObjPtr,
         arg2: ObjPtr,
         arg3: ObjPtr,
         _sentinel: ObjPtr
-    ) => py_call_positional_three_hook(callable, arg1, arg2, arg3)
+    ) => py_call_positional_three_hook(tstate, callable, arg1, arg2, arg3)
 );
 
 #[cfg(not(test))]
@@ -1215,11 +1262,12 @@ define_perf_toggle_export!(
     ObjPtr,
     dp_jit_py_vectorcall,
     dp_jit_py_vectorcall_with_frame(
+        tstate: ObjPtr,
         callable: ObjPtr,
         args: ObjPtr,
         nargsf: ObjPtr,
         kwnames: ObjPtr
-    ) => py_vectorcall_hook(callable, args, nargsf, kwnames)
+    ) => py_vectorcall_hook(tstate, callable, args, nargsf, kwnames)
 );
 
 #[cfg(not(test))]
@@ -1922,12 +1970,12 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
         std::ptr::addr_of_mut!(PyMethod_Type) as *const u8,
     );
     builder.symbol(
-        "PyThreadState_GetUnchecked",
-        PyThreadState_GetUnchecked as *const u8,
-    );
-    builder.symbol(
         "soac_runtime_set_runtime_error_static",
         soac_runtime_set_runtime_error_static as *const u8,
+    );
+    builder.symbol(
+        "soac_runtime_decref_dealloc_preserving_error",
+        soac_runtime_decref_dealloc_preserving_error as *const u8,
     );
     builder.symbol(
         "dp_jit_py_call_positional_three",
