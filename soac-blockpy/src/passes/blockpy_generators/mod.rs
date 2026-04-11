@@ -495,6 +495,27 @@ fn persistent_generator_state_order(layout: &StorageLayout) -> Vec<String> {
     order
 }
 
+fn generator_cleanup_cell_logical_names(
+    callable: &BlockPyFunction<CoreModuleShapeWithYield>,
+    layout: &StorageLayout,
+) -> Vec<String> {
+    let semantic_cellvars = compute_storage_layout_from_scope(callable)
+        .map(|layout| {
+            layout
+                .cellvars
+                .into_iter()
+                .map(|slot| slot.logical_name)
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    layout
+        .cellvars
+        .iter()
+        .filter(|slot| !semantic_cellvars.contains(slot.logical_name.as_str()))
+        .map(|slot| slot.logical_name.clone())
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResumeClosureBindings {
     runtime_state_bindings: Vec<(String, String)>,
@@ -576,12 +597,20 @@ fn build_factory_block(
     visible_names: &FunctionName,
     resume_function_id: FunctionId,
     kind: FunctionKind,
+    cleanup_cell_names: &[String],
 ) -> LinearCoreBlock {
     let resume_entry = core_make_function(
         resume_function_id,
         FunctionKind::Function,
         core_call("tuple_values", Vec::new()),
         core_none(),
+    );
+    let cleanup_cells = core_call(
+        "tuple_values",
+        cleanup_cell_names
+            .iter()
+            .map(|name| core_cell_ref(name.as_str()))
+            .collect(),
     );
     let generator = match kind {
         FunctionKind::Generator | FunctionKind::Coroutine => core_call_expr(
@@ -607,6 +636,7 @@ fn build_factory_block(
                 ),
                 ("yieldfrom_cell", core_cell_ref("_dp_yieldfrom")),
                 ("throw_context_cell", core_cell_ref("_dp_throw_context")),
+                ("cleanup_cells", cleanup_cells.clone()),
             ],
         ),
         FunctionKind::AsyncGenerator => core_call_expr(
@@ -632,6 +662,7 @@ fn build_factory_block(
                 ),
                 ("yieldfrom_cell", core_cell_ref("_dp_yieldfrom")),
                 ("throw_context_cell", core_cell_ref("_dp_throw_context")),
+                ("cleanup_cells", cleanup_cells),
             ],
         ),
         FunctionKind::Function => {
@@ -1701,6 +1732,7 @@ pub(crate) fn lower_generator_like_function(
     let resume_function_id = resume_name_gen.function_id();
     let storage_layout = build_generator_storage_layout(&callable);
     let persistent_state_order = persistent_generator_state_order(&storage_layout);
+    let cleanup_cell_names = generator_cleanup_cell_logical_names(&callable, &storage_layout);
     let resume_binding_logical_names =
         ordered_resume_binding_logical_names(&callable, &persistent_state_order);
     let (resume_blocks, _resume_exception_edges, _resume_entry_label) =
@@ -1718,7 +1750,7 @@ pub(crate) fn lower_generator_like_function(
         ..
     } = callable;
 
-    let factory_block = build_factory_block(&names, resume_function_id, kind);
+    let factory_block = build_factory_block(&names, resume_function_id, kind, &cleanup_cell_names);
 
     let mut resume_semantic = scope.clone();
     augment_resume_semantic_for_standard_name_binding(&mut resume_semantic, &closure_bindings);

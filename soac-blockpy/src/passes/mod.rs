@@ -16,19 +16,20 @@ mod value_facts;
 
 use crate::block_py::{
     cfg::relabel_blockpy_blocks_dense, runtime_name_load, Await, BinOp, BlockPyFunction,
-    BlockPyModule, Call, CallArgKeyword, CallArgPositional, CallDirect, CalleeFunctionId, CellRef,
-    CellRefForName, ChildVisitable, Del, DelItem, ExprAttribute, ExprBoolOp, ExprBooleanLiteral,
-    ExprBytesLiteral, ExprCompare, ExprDict, ExprDictComp, ExprEllipsisLiteral, ExprFString,
-    ExprGenerator, ExprIf, ExprIpyEscapeCommand, ExprLambda, ExprList, ExprListComp, ExprName,
-    ExprNamed, ExprNoneLiteral, ExprNumberLiteral, ExprSet, ExprSetComp, ExprSlice, ExprStarred,
-    ExprStringLiteral, ExprSubscript, ExprTString, ExprTuple, GetAttr, GetItem, HasMeta,
-    IdentifiedInstr, IncrementCounter, Instr, InstrWithConstantNone, LiteralValue, Load, MakeCell,
-    MakeFunction, MapFunction, MapInstr, MapModule, Mappable, Meta, ModuleShape, NameLike,
-    ResolvedName, SetAttr, SetItem, StmtAnnAssign, StmtAssert, StmtAssign, StmtAugAssign,
-    StmtBreak, StmtClassDef, StmtContinue, StmtDelete, StmtExpr, StmtFor, StmtFunctionDef,
-    StmtGlobal, StmtIf, StmtImport, StmtImportFrom, StmtIpyEscapeCommand, StmtMatch, StmtNonlocal,
-    StmtPass, StmtRaise, StmtReturn, StmtTry, StmtTypeAlias, StmtWhile, StmtWith, Store,
-    TryMapInstr, TryMapModule, UnaryOp, UnresolvedName, WithMeta, Yield, YieldFrom,
+    BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional, CallDirect,
+    CalleeFunctionId, CellRef, CellRefForName, ChildVisitable, Del, DelItem, ExprAttribute,
+    ExprBoolOp, ExprBooleanLiteral, ExprBytesLiteral, ExprCompare, ExprDict, ExprDictComp,
+    ExprEllipsisLiteral, ExprFString, ExprGenerator, ExprIf, ExprIpyEscapeCommand, ExprLambda,
+    ExprList, ExprListComp, ExprName, ExprNamed, ExprNoneLiteral, ExprNumberLiteral, ExprSet,
+    ExprSetComp, ExprSlice, ExprStarred, ExprStringLiteral, ExprSubscript, ExprTString, ExprTuple,
+    GetAttr, GetItem, HasMeta, IdentifiedInstr, IncrementCounter, Instr, InstrWithConstantNone,
+    LiteralValue, Load, MakeCell, MakeFunction, MapFunction, MapInstr, MapModule, Mappable, Meta,
+    ModuleShape, NameLike, ResolvedName, SetAttr, SetItem, StmtAnnAssign, StmtAssert, StmtAssign,
+    StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue, StmtDelete, StmtExpr, StmtFor,
+    StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom, StmtIpyEscapeCommand,
+    StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry, StmtTypeAlias, StmtWhile,
+    StmtWith, Store, TryMapInstr, TryMapModule, TryMapTerm, UnaryOp, UnresolvedName, WithMeta,
+    Yield, YieldFrom,
 };
 use ruff_python_ast::{self as ast};
 use soac_macros::{enum_broadcast, DelegateMatchDefault};
@@ -241,7 +242,7 @@ impl<E: Instr> Mappable<E> for TypedTruthy<E> {
 pub enum InstrTyped {
     Truthy(TypedTruthy<Self>),
     Load(Load<Self>),
-    LegacyBinOp(BinOp<Self>),
+    BinOp(BinOp<Self>),
     LegacyUnaryOp(UnaryOp<Self>),
     LegacyCalleeFunctionId(CalleeFunctionId<Self>),
     LegacyCall(Call<Self>),
@@ -265,8 +266,7 @@ impl InstrTyped {
     pub fn is_legacy(&self) -> bool {
         matches!(
             self,
-            Self::LegacyBinOp(_)
-                | Self::LegacyUnaryOp(_)
+            Self::LegacyUnaryOp(_)
                 | Self::LegacyCalleeFunctionId(_)
                 | Self::LegacyCall(_)
                 | Self::LegacyCallDirect(_)
@@ -300,7 +300,7 @@ struct CodegenToTyped;
 impl MapInstr<InstrCodegen, InstrTyped> for CodegenToTyped {
     fn map_instr(&mut self, instr: InstrCodegen) -> InstrTyped {
         match instr {
-            InstrCodegenOp::BinOp(op) => InstrTyped::LegacyBinOp(op.map_children(self)),
+            InstrCodegenOp::BinOp(op) => InstrTyped::BinOp(op.map_children(self)),
             InstrCodegenOp::UnaryOp(op) => InstrTyped::LegacyUnaryOp(op.map_children(self)),
             InstrCodegenOp::CalleeFunctionId(op) => {
                 InstrTyped::LegacyCalleeFunctionId(op.map_children(self))
@@ -379,7 +379,7 @@ impl TryMapInstr<InstrTyped, InstrCodegen, String> for TypedToCodegen {
                 );
             }
             InstrTyped::Load(op) => InstrCodegenOp::Load(op.try_map_children(self)?),
-            InstrTyped::LegacyBinOp(op) => InstrCodegenOp::BinOp(op.try_map_children(self)?),
+            InstrTyped::BinOp(op) => InstrCodegenOp::BinOp(op.try_map_children(self)?),
             InstrTyped::LegacyUnaryOp(op) => InstrCodegenOp::UnaryOp(op.try_map_children(self)?),
             InstrTyped::LegacyCalleeFunctionId(op) => {
                 InstrCodegenOp::CalleeFunctionId(op.try_map_children(self)?)
@@ -411,6 +411,12 @@ impl TryMapInstr<InstrTyped, InstrCodegen, String> for TypedToCodegen {
 
 pub fn try_lower_typed_instr_to_codegen_legacy(instr: InstrTyped) -> Result<InstrCodegen, String> {
     TypedToCodegen.try_map_instr(instr)
+}
+
+pub fn try_lower_typed_term_to_codegen_legacy(
+    term: BlockTerm<InstrTyped>,
+) -> Result<BlockTerm<InstrCodegen>, String> {
+    TypedToCodegen.try_map_term(term)
 }
 
 pub fn try_lower_typed_module_to_codegen_legacy(
@@ -715,7 +721,7 @@ mod typed_codegen_tests {
             if !expr.is_legacy() {
                 self.non_legacy += 1;
             }
-            if matches!(expr, InstrTyped::LegacyBinOp(_)) {
+            if matches!(expr, InstrTyped::BinOp(_)) {
                 self.binops += 1;
             }
             expr.visit_children(self);
@@ -781,7 +787,7 @@ mod typed_codegen_tests {
         assert!(counter.binops > 0);
         assert!(counter.loads > 0);
         assert_eq!(counter.truthy, 0);
-        assert_eq!(counter.non_legacy, counter.loads);
+        assert_eq!(counter.non_legacy, counter.loads + counter.binops);
     }
 
     #[test]
@@ -818,6 +824,10 @@ mod typed_codegen_tests {
                         matches!(if_term.test, InstrTyped::Truthy(_)),
                         "typed if test should be wrapped in an explicit truthiness op"
                     );
+                    assert!(
+                        try_lower_typed_term_to_codegen_legacy(block.term.clone()).is_err(),
+                        "typed truthiness terms should require typed term emission"
+                    );
                 }
                 for instr in &block.body {
                     counter.visit_instr(instr);
@@ -828,7 +838,10 @@ mod typed_codegen_tests {
 
         assert!(counter.truthy > 0);
         assert!(counter.loads > 0);
-        assert_eq!(counter.non_legacy, counter.truthy + counter.loads);
+        assert_eq!(
+            counter.non_legacy,
+            counter.truthy + counter.loads + counter.binops
+        );
         assert!(
             try_lower_typed_module_to_codegen_legacy(typed).is_err(),
             "typed truthiness should not silently lower through the legacy adapter"

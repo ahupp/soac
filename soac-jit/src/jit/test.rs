@@ -10,8 +10,7 @@ use soac_blockpy::block_py::{
 };
 use soac_blockpy::passes::{
     CodegenModuleShape, instrument_bb_module_with_block_entry_counters,
-    instrument_bb_module_with_call_target_counters, instrument_bb_module_with_refcount_counters,
-    validate_codegen_instr_ids,
+    instrument_bb_module_with_call_target_counters, validate_codegen_instr_ids,
 };
 mod tests {
     use super::*;
@@ -94,6 +93,48 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first, "706b672e6d6f64_0000000000001234");
         assert_ne!(first, different_hash);
+    }
+
+    #[test]
+    fn shared_module_instance_symbols_separate_duplicate_module_identities() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+                r#"
+def f():
+    return None
+"#,
+            )
+            .expect("lowering should succeed")
+            .codegen_module;
+            let first = crate::module_type::build_shared_state_for_testing(
+                py,
+                lowered.clone(),
+                "counter_test",
+                "",
+            )
+            .expect("first shared state should build");
+            let second =
+                crate::module_type::build_shared_state_for_testing(py, lowered, "counter_test", "")
+                    .expect("second shared state should build");
+
+            assert_ne!(first.storage_instance_key(), second.storage_instance_key());
+            assert_ne!(
+                module_constant_table_symbol_for_shared_state(first.as_ref()),
+                module_constant_table_symbol_for_shared_state(second.as_ref())
+            );
+            assert_ne!(
+                direct_function_symbol_scope_for_shared_state(
+                    first.as_ref(),
+                    FunctionId::new(0, 1)
+                ),
+                direct_function_symbol_scope_for_shared_state(
+                    second.as_ref(),
+                    FunctionId::new(0, 1)
+                )
+            );
+        });
     }
 
     #[test]
@@ -610,6 +651,31 @@ mod tests {
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
         build_test_specialized_function(&[1usize as ObjPtr], &module, &function, &module_constants);
     }
+
+    #[test]
+    fn specialized_jit_body_binops_compile_via_typed_ops() {
+        let mut constants = TestConstantPool::default();
+        let function = with_single_test_block(
+            test_function(),
+            vec![expr_stmt(op_expr(BinOp::new(
+                BinOpKind::Add,
+                constants.int_expr(1),
+                constants.int_expr(2),
+            )))],
+            ret_term(constants.int_expr(3)),
+        );
+        let module = BlockPyModule {
+            module_name_gen: ModuleNameGen::new(0),
+            global_names: Vec::new(),
+            callable_defs: vec![function.clone()],
+            module_constants: constants.module_constants,
+            counter_defs: Vec::new(),
+        };
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        build_test_specialized_function(&[1usize as ObjPtr], &module, &function, &module_constants);
+    }
+
     fn direct_call_expr(function_id: FunctionId) -> InstrCodegen {
         InstrCodegen::CallDirect(CallDirect::new(
             none_expr(),
@@ -2831,6 +2897,185 @@ def write_point(point, value):
         compiled
     }
 
+    unsafe fn build_counted_runtime_incref_wrapper() -> (
+        unsafe extern "C" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void,
+        *const u64,
+    ) {
+        let compile_session = crate::session::CompileSession::new();
+        let mut jit_module =
+            new_jit_module(&compile_session).expect("test jit module should construct");
+        let ptr_ty = jit_module.target_config().pointer_type();
+
+        let scalar_counter_data_id = define_scalar_counter_storage_data_for_symbol(
+            &mut jit_module,
+            "test_counted_runtime_incref_counter",
+            1,
+        )
+        .expect("scalar counter storage should define");
+        let counted_incref_id = build_counted_runtime_refcount_helper(
+            &compile_session,
+            &mut jit_module,
+            "test_counted_runtime_incref",
+            "test-counted-runtime-incref",
+            CraneliftCompileCachePolicy::Enabled,
+            &DP_JIT_INCREF_IMPORT,
+            &SOAC_RUNTIME_INCREF_APPLIED_IMPORT,
+            scalar_counter_data_id,
+            0,
+        )
+        .expect("counted incref helper should build");
+
+        let mut wrapper_signature = jit_module.make_signature();
+        wrapper_signature.params.push(ir::AbiParam::new(ptr_ty));
+        wrapper_signature.returns.push(ir::AbiParam::new(ptr_ty));
+
+        let wrapper_id = declare_local_fn(
+            &mut jit_module,
+            "jit_counted_runtime_incref_wrapper",
+            &wrapper_signature,
+        )
+        .expect("wrapper function should declare");
+
+        let mut ctx = jit_module.make_context();
+        ctx.func.name = ir::UserFuncName::user(0, wrapper_id.as_u32());
+        ctx.func.signature = wrapper_signature;
+
+        let mut builder_ctx = FunctionBuilderContext::new();
+        {
+            let mut fb = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+            let entry = fb.create_block();
+            fb.append_block_params_for_function_params(entry);
+            fb.switch_to_block(entry);
+            fb.seal_block(entry);
+
+            let counted_incref_ref =
+                jit_module.declare_func_in_func(counted_incref_id, &mut fb.func);
+            let arg = fb.block_params(entry)[0];
+            fb.ins().call(counted_incref_ref, &[arg]);
+            fb.ins().return_(&[arg]);
+            fb.finalize();
+        }
+
+        define_function_with_incremental_cache(
+            &compile_session,
+            &mut jit_module,
+            wrapper_id,
+            &mut ctx,
+            "test-counted-runtime-incref-wrapper",
+            CraneliftCompileCachePolicy::Enabled,
+            "counted incref wrapper should define",
+        )
+        .expect("wrapper function should compile");
+        jit_module.clear_context(&mut ctx);
+        jit_module
+            .finalize_definitions()
+            .expect("jit module should finalize");
+
+        let code_ptr = jit_module.get_finalized_function(wrapper_id);
+        let compiled: unsafe extern "C" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void =
+            std::mem::transmute(code_ptr);
+        let (counter_ptr, counter_size) = jit_module.get_finalized_data(scalar_counter_data_id);
+        assert_eq!(
+            counter_size,
+            std::mem::size_of::<u64>(),
+            "counted incref test should expose exactly one scalar counter"
+        );
+        let counter_ptr = counter_ptr.cast::<u64>();
+
+        Box::leak(Box::new(jit_module));
+        (compiled, counter_ptr)
+    }
+
+    unsafe fn build_counted_runtime_decref_wrapper() -> (
+        unsafe extern "C" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void,
+        *const u64,
+    ) {
+        let compile_session = crate::session::CompileSession::new();
+        let mut jit_module =
+            new_jit_module(&compile_session).expect("test jit module should construct");
+        let ptr_ty = jit_module.target_config().pointer_type();
+
+        let scalar_counter_data_id = define_scalar_counter_storage_data_for_symbol(
+            &mut jit_module,
+            "test_counted_runtime_decref_counter",
+            1,
+        )
+        .expect("scalar counter storage should define");
+        let counted_decref_id = build_counted_runtime_refcount_helper(
+            &compile_session,
+            &mut jit_module,
+            "test_counted_runtime_decref",
+            "test-counted-runtime-decref",
+            CraneliftCompileCachePolicy::Enabled,
+            &DP_JIT_DECREF_IMPORT,
+            &SOAC_RUNTIME_DECREF_APPLIED_IMPORT,
+            scalar_counter_data_id,
+            0,
+        )
+        .expect("counted decref helper should build");
+
+        let mut wrapper_signature = jit_module.make_signature();
+        wrapper_signature.params.push(ir::AbiParam::new(ptr_ty));
+        wrapper_signature.returns.push(ir::AbiParam::new(ptr_ty));
+
+        let wrapper_id = declare_local_fn(
+            &mut jit_module,
+            "jit_counted_runtime_decref_wrapper",
+            &wrapper_signature,
+        )
+        .expect("wrapper function should declare");
+
+        let mut ctx = jit_module.make_context();
+        ctx.func.name = ir::UserFuncName::user(0, wrapper_id.as_u32());
+        ctx.func.signature = wrapper_signature;
+
+        let mut builder_ctx = FunctionBuilderContext::new();
+        {
+            let mut fb = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+            let entry = fb.create_block();
+            fb.append_block_params_for_function_params(entry);
+            fb.switch_to_block(entry);
+            fb.seal_block(entry);
+
+            let counted_decref_ref =
+                jit_module.declare_func_in_func(counted_decref_id, &mut fb.func);
+            let arg = fb.block_params(entry)[0];
+            let null_tstate = fb.ins().iconst(ptr_ty, 0);
+            fb.ins().call(counted_decref_ref, &[null_tstate, arg]);
+            fb.ins().return_(&[arg]);
+            fb.finalize();
+        }
+
+        define_function_with_incremental_cache(
+            &compile_session,
+            &mut jit_module,
+            wrapper_id,
+            &mut ctx,
+            "test-counted-runtime-decref-wrapper",
+            CraneliftCompileCachePolicy::Enabled,
+            "counted decref wrapper should define",
+        )
+        .expect("wrapper function should compile");
+        jit_module.clear_context(&mut ctx);
+        jit_module
+            .finalize_definitions()
+            .expect("jit module should finalize");
+
+        let code_ptr = jit_module.get_finalized_function(wrapper_id);
+        let compiled: unsafe extern "C" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void =
+            std::mem::transmute(code_ptr);
+        let (counter_ptr, counter_size) = jit_module.get_finalized_data(scalar_counter_data_id);
+        assert_eq!(
+            counter_size,
+            std::mem::size_of::<u64>(),
+            "counted decref test should expose exactly one scalar counter"
+        );
+        let counter_ptr = counter_ptr.cast::<u64>();
+
+        Box::leak(Box::new(jit_module));
+        (compiled, counter_ptr)
+    }
+
     #[test]
     fn jit_can_call_runtime_support_clif_function() {
         unsafe {
@@ -2878,11 +3123,12 @@ def write_point(point, value):
             let wrapper = build_runtime_refcount_smoke_wrapper();
             crate::initialize_test_python();
             Python::attach(|_| {
-                let obj = ffi::PyLong_FromLongLong(123);
-                assert!(
-                    !obj.is_null(),
-                    "PyLong_FromLongLong should produce a test object"
+                let obj = ffi::PyCapsule_New(
+                    std::ptr::dangling_mut::<c_void>(),
+                    c"soac.runtime.counted_incref".as_ptr(),
+                    None,
                 );
+                assert!(!obj.is_null(), "PyCapsule_New should produce a test object");
                 let before = ffi::Py_REFCNT(obj);
                 let result = wrapper(obj.cast());
                 let after = ffi::Py_REFCNT(obj);
@@ -2927,6 +3173,92 @@ def write_point(point, value):
                     CAPSULE_DESTROYED.load(Ordering::SeqCst),
                     "runtime CLIF decref should drive PyCapsule destruction through _Py_Dealloc; refcnt after wrapper = {after}"
                 );
+            });
+        }
+    }
+
+    #[test]
+    fn jit_counted_runtime_incref_counter_tracks_only_applied_refcount_ops() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        unsafe {
+            let (wrapper, counter_ptr) = build_counted_runtime_incref_wrapper();
+            crate::initialize_test_python();
+            Python::attach(|_| {
+                let obj = ffi::PyCapsule_New(
+                    std::ptr::dangling_mut::<c_void>(),
+                    c"soac.runtime.counted_decref".as_ptr(),
+                    None,
+                );
+                assert!(!obj.is_null(), "PyCapsule_New should produce a test object");
+
+                assert_eq!(
+                    *counter_ptr, 0,
+                    "counted incref helper should start with a zeroed scalar counter"
+                );
+                let result = wrapper(obj.cast());
+                assert_eq!(
+                    result,
+                    obj.cast(),
+                    "wrapper should preserve the input pointer"
+                );
+                assert_eq!(
+                    *counter_ptr, 1,
+                    "heap object incref should increment the counter"
+                );
+
+                let none = ffi::Py_None();
+                let none_result = wrapper(none.cast());
+                assert_eq!(none_result, none.cast(), "wrapper should preserve Py_None");
+                assert_eq!(
+                    *counter_ptr, 1,
+                    "immortal skipped incref should not increment the applied counter"
+                );
+
+                ffi::Py_DECREF(obj);
+                ffi::Py_DECREF(obj);
+            });
+        }
+    }
+
+    #[test]
+    fn jit_counted_runtime_decref_counter_tracks_only_applied_refcount_ops() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        unsafe {
+            let (wrapper, counter_ptr) = build_counted_runtime_decref_wrapper();
+            crate::initialize_test_python();
+            Python::attach(|_| {
+                let obj = ffi::PyCapsule_New(
+                    std::ptr::dangling_mut::<c_void>(),
+                    c"soac.runtime.counted_decref".as_ptr(),
+                    None,
+                );
+                assert!(!obj.is_null(), "PyCapsule_New should produce a test object");
+                ffi::Py_INCREF(obj);
+
+                assert_eq!(
+                    *counter_ptr, 0,
+                    "counted decref helper should start with a zeroed scalar counter"
+                );
+                let result = wrapper(obj.cast());
+                assert_eq!(
+                    result,
+                    obj.cast(),
+                    "wrapper should preserve the input pointer"
+                );
+                assert_eq!(
+                    *counter_ptr, 1,
+                    "heap object decref should increment the counter"
+                );
+
+                let none = ffi::Py_None();
+                let none_result = wrapper(none.cast());
+                assert_eq!(none_result, none.cast(), "wrapper should preserve Py_None");
+                assert_eq!(
+                    *counter_ptr, 1,
+                    "immortal skipped decref should not increment the applied counter"
+                );
+
+                ffi::Py_DECREF(obj);
             });
         }
     }
@@ -3027,128 +3359,6 @@ def f():
                     shared_state.counter_value(entry_counter_id),
                     2,
                     "entry counter should reflect the number of completed direct JIT calls"
-                );
-
-                ffi::Py_DECREF(result1.cast());
-                ffi::Py_DECREF(result2.cast());
-            });
-        }
-    }
-
-    #[test]
-    fn jit_function_scope_refcount_counters_track_runtime_helpers() {
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        unsafe {
-            crate::initialize_test_python();
-            Python::attach(|py| {
-                let mut lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
-                    r#"
-def f(x):
-    y = x
-    del y
-    return None
-"#,
-                )
-                .expect("lowering should succeed")
-                .codegen_module;
-                instrument_bb_module_with_refcount_counters(&mut lowered, CounterScope::Function)
-                    .expect("function-scoped refcount counters should instrument");
-
-                let function = lowered
-                    .callable_defs
-                    .iter()
-                    .find(|function| function.names.bind_name == "f")
-                    .expect("missing lowered function f")
-                    .clone();
-                let incref_counter_id = lowered
-                    .counter_defs
-                    .iter()
-                    .find_map(|counter| match &counter.site {
-                        CounterSite::Runtime {
-                            function_id: Some(counter_function_id),
-                            instr_id: None,
-                        } if counter.scope == CounterScope::Function
-                            && counter.kind == "runtime_incref"
-                            && *counter_function_id == function.function_id =>
-                        {
-                            Some(counter.id)
-                        }
-                        _ => None,
-                    })
-                    .expect("missing function-scoped incref counter for lowered function f");
-                let decref_counter_id = lowered
-                    .counter_defs
-                    .iter()
-                    .find_map(|counter| match &counter.site {
-                        CounterSite::Runtime {
-                            function_id: Some(counter_function_id),
-                            instr_id: None,
-                        } if counter.scope == CounterScope::Function
-                            && counter.kind == "runtime_decref"
-                            && *counter_function_id == function.function_id =>
-                        {
-                            Some(counter.id)
-                        }
-                        _ => None,
-                    })
-                    .expect("missing function-scoped decref counter for lowered function f");
-
-                let shared_state = crate::module_type::build_shared_state_for_testing(
-                    py,
-                    lowered,
-                    "counter_test",
-                    "",
-                )
-                .expect("shared state should build");
-                let runtime = build_test_module_runtime(py, shared_state.clone());
-                let module_constant_ptrs = shared_state.module_constant_ptrs();
-                let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
-                let compile_session = crate::session::CompileSession::process();
-                let compiled_handle = compile_cranelift_run_bb_specialized_cached(
-                    &compile_session,
-                    &blocks,
-                    &shared_state.lowered_module,
-                    &function,
-                    &shared_state.codegen_constants,
-                    &shared_state.lowered_module.counter_defs,
-                    &module_constant_ptrs,
-                    Some(shared_state.as_ref()),
-                )
-                .expect("direct refcount counter test function should compile");
-                let (code_ptr, param_count) = compiled_handle
-                    .handle
-                    .direct_runner_info()
-                    .expect("compiled direct runner should expose entrypoint");
-                assert_eq!(param_count, 1, "test function should take one direct arg");
-                let entry: unsafe extern "C" fn(
-                    *mut c_void,
-                    *mut c_void,
-                    *mut c_void,
-                ) -> *mut c_void = std::mem::transmute(code_ptr);
-                let mut function_context =
-                    test_function_jit_context(&runtime, std::ptr::null_mut());
-                let thread_state = ffi::PyThreadState_Get().cast::<c_void>();
-
-                let result1 = entry(
-                    std::ptr::addr_of_mut!(function_context).cast(),
-                    thread_state,
-                    ffi::PyLong_FromLong(7).cast(),
-                );
-                let incref_after_first = shared_state.counter_value(incref_counter_id);
-                let decref_after_first = shared_state.counter_value(decref_counter_id);
-                let result2 = entry(
-                    std::ptr::addr_of_mut!(function_context).cast(),
-                    thread_state,
-                    ffi::PyLong_FromLong(11).cast(),
-                );
-
-                assert!(
-                    shared_state.counter_value(incref_counter_id) > incref_after_first,
-                    "function-scoped incref counter should increase after another direct JIT call"
-                );
-                assert!(
-                    shared_state.counter_value(decref_counter_id) > decref_after_first,
-                    "function-scoped decref counter should increase after another direct JIT call"
                 );
 
                 ffi::Py_DECREF(result1.cast());

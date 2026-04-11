@@ -197,7 +197,20 @@ def _reraise_control_flow(exc):
     raise exc
 
 
+def _clear_cell(cell):
+    try:
+        del cell.cell_contents
+    except ValueError:
+        pass
+
+
 def _mark_closed(owner):
+    cleanup_cells = owner._cleanup_cells
+    owner._cleanup_cells = ()
+    for cell in cleanup_cells:
+        _clear_cell(cell)
+    _clear_cell(owner._yield_from_cell)
+    _clear_cell(owner._throw_context_cell)
     owner._is_closed = True
     owner._resume_fn = None
 
@@ -214,12 +227,14 @@ def _normalize_throw_exc(typ, val=None, tb=None, *, where, throw_context=None):
 def _current_throw_context(owner):
     return _yieldfrom_cell_value(owner._throw_context_cell)
 
+
 class ClosureGenerator:
     __slots__ = (
         "_resume_fn",
         "_is_closed",
         "_yield_from_cell",
         "_throw_context_cell",
+        "_cleanup_cells",
         "__name__",
         "__qualname__",
         "gi_code",
@@ -234,11 +249,13 @@ class ClosureGenerator:
         code,
         yieldfrom_cell,
         throw_context_cell,
+        cleanup_cells=(),
     ):
         self._resume_fn = resume
         self._is_closed = False
         self._yield_from_cell = yieldfrom_cell
         self._throw_context_cell = throw_context_cell
+        self._cleanup_cells = tuple(cleanup_cells)
         self.__name__ = name
         self.__qualname__ = qualname
         self.gi_code = code
@@ -337,6 +354,7 @@ class ClosureAsyncGenerator:
         "_is_closed",
         "_yield_from_cell",
         "_throw_context_cell",
+        "_cleanup_cells",
         "__name__",
         "__qualname__",
         "ag_code",
@@ -351,11 +369,13 @@ class ClosureAsyncGenerator:
         code,
         yieldfrom_cell,
         throw_context_cell,
+        cleanup_cells=(),
     ):
         self._resume_fn = resume
         self._is_closed = False
         self._yield_from_cell = yieldfrom_cell
         self._throw_context_cell = throw_context_cell
+        self._cleanup_cells = tuple(cleanup_cells)
         self.__name__ = name
         self.__qualname__ = qualname
         self.ag_code = code

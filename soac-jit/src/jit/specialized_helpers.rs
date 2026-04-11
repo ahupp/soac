@@ -1,18 +1,15 @@
+#![cfg_attr(test, allow(dead_code, unused_imports))]
+
 use super::runtime_context::{set_raised_exception_direct, take_raised_exception_direct};
+use crate::module_constants::load_runtime_name_owned;
+use crate::module_constants::raise_name_error_for_missing_name;
+use crate::operator_specialization::{ExactIntBinaryOpKind, ExactIntUnaryOpKind};
 use cranelift_jit::JITBuilder;
 use libc;
 use pyo3::ffi;
 use std::ffi::{c_char, c_void};
 use std::ptr;
 use std::sync::OnceLock;
-
-#[cfg(not(test))]
-use crate::operator_specialization::{ExactIntBinaryOpKind, ExactIntUnaryOpKind};
-
-#[cfg(not(test))]
-use crate::module_constants::load_runtime_name_owned;
-#[cfg(not(test))]
-use crate::module_constants::raise_name_error_for_missing_name;
 
 unsafe extern "C" {
     static mut PyFunction_Type: ffi::PyTypeObject;
@@ -36,22 +33,16 @@ unsafe extern "C" {
         type_obj: *mut ffi::PyTypeObject,
         nitems: ffi::Py_ssize_t,
     ) -> *mut ffi::PyObject;
-    #[cfg(not(test))]
     fn PyDict_GetItemRef(
         dict: *mut ffi::PyObject,
         key: *mut ffi::PyObject,
         result: *mut *mut ffi::PyObject,
     ) -> libc::c_int;
-    #[cfg(not(test))]
     fn PyIter_NextItem(iterator: *mut ffi::PyObject, item: *mut *mut ffi::PyObject) -> libc::c_int;
 }
-
-#[cfg(not(test))]
 unsafe extern "C" {
     static mut PyLong_Type: ffi::PyTypeObject;
 }
-
-#[cfg(not(test))]
 unsafe extern "C" {
     static mut PyCell_Type: ffi::PyTypeObject;
     fn PyCell_New(obj: *mut ffi::PyObject) -> *mut ffi::PyObject;
@@ -67,37 +58,28 @@ pub type ObjPtr = *mut c_void;
 #[cold]
 #[inline(never)]
 unsafe extern "C" fn soac_runtime_decref_dealloc_preserving_error(tstate: ObjPtr, obj: ObjPtr) {
-    if tstate.is_null() {
-        unsafe { _Py_Dealloc(obj.cast::<ffi::PyObject>()) };
-        return;
-    }
+    assert!(
+        !tstate.is_null(),
+        "soac_runtime_decref_dealloc_preserving_error requires a non-null PyThreadState"
+    );
     let saved_error = unsafe { take_raised_exception_direct(tstate) };
     unsafe { _Py_Dealloc(obj.cast::<ffi::PyObject>()) };
     if !saved_error.is_null() {
         unsafe { set_raised_exception_direct(tstate, saved_error) };
     }
 }
-
-#[cfg(not(test))]
 #[repr(C)]
 struct SoacPyLongValue {
     lv_tag: usize,
     ob_digit: [u32; 1],
 }
-
-#[cfg(not(test))]
 #[repr(C)]
 struct SoacPyLongObject {
     ob_base: ffi::PyObject,
     long_value: SoacPyLongValue,
 }
-
-#[cfg(not(test))]
 const PY_LONG_SIGN_MASK: usize = 3;
-#[cfg(not(test))]
 const PY_LONG_NON_SIZE_BITS: usize = 3;
-
-#[cfg(not(test))]
 unsafe fn is_cell_object(obj: *mut ffi::PyObject) -> bool {
     !obj.is_null() && ffi::Py_TYPE(obj) == std::ptr::addr_of_mut!(PyCell_Type)
 }
@@ -120,8 +102,6 @@ unsafe fn object_type_name(obj: *mut ffi::PyObject) -> String {
 unsafe extern "C" fn soac_runtime_set_runtime_error_static(message: *const c_char) {
     ffi::PyErr_SetString(ffi::PyExc_RuntimeError, message);
 }
-
-#[cfg(not(test))]
 unsafe fn raise_expected_cell(where_name: &str, obj: *mut ffi::PyObject) {
     let type_name = object_type_name(obj);
     let message = format!("{where_name} expected cell object, got {type_name}");
@@ -134,8 +114,6 @@ unsafe fn raise_expected_cell(where_name: &str, obj: *mut ffi::PyObject) {
         );
     }
 }
-
-#[cfg(not(test))]
 unsafe extern "C" fn py_call_positional_three_hook(
     tstate: ObjPtr,
     callable: ObjPtr,
@@ -171,16 +149,12 @@ unsafe extern "C" fn py_call_positional_three_hook(
         ptr::null_mut(),
     ) as ObjPtr
 }
-
-#[cfg(not(test))]
 unsafe extern "C" fn py_call_object_hook(callable: ObjPtr, args: ObjPtr) -> ObjPtr {
     let result =
         ffi::PyObject_CallObject(callable as *mut ffi::PyObject, args as *mut ffi::PyObject)
             as ObjPtr;
     result
 }
-
-#[cfg(not(test))]
 unsafe extern "C" fn py_vectorcall_hook(
     tstate: ObjPtr,
     callable: ObjPtr,
@@ -204,8 +178,6 @@ unsafe extern "C" fn py_vectorcall_hook(
     ) as ObjPtr;
     result
 }
-
-#[cfg(not(test))]
 unsafe extern "C" fn next_or_sentinel_hook(iterator: ObjPtr, sentinel: ObjPtr) -> ObjPtr {
     if iterator.is_null() || sentinel.is_null() {
         ffi::PyErr_SetString(
@@ -279,8 +251,6 @@ unsafe extern "C" fn finish_constructor_init_hook(obj: ObjPtr, init_result: ObjP
     ffi::Py_DECREF(init_result);
     obj as ObjPtr
 }
-
-#[cfg(not(test))]
 unsafe extern "C" fn direct_function_context_hook(callable: ObjPtr) -> ObjPtr {
     if callable.is_null() {
         ffi::PyErr_SetString(
@@ -292,13 +262,9 @@ unsafe extern "C" fn direct_function_context_hook(callable: ObjPtr) -> ObjPtr {
     crate::registered_clif_function_context_ptr(callable as *mut ffi::PyObject)
         .unwrap_or(ptr::null_mut())
 }
-
-#[cfg(not(test))]
 unsafe extern "C" fn py_thread_state_get_hook() -> ObjPtr {
     ffi::PyThreadState_Get().cast::<c_void>()
 }
-
-#[cfg(not(test))]
 unsafe extern "C" fn guard_method_type_version_hook(
     receiver: ObjPtr,
     expected_type: ObjPtr,
@@ -317,8 +283,6 @@ unsafe extern "C" fn guard_method_type_version_hook(
     }
     ((*receiver_type).tp_version_tag == expected_version as u32) as i32
 }
-
-#[cfg(not(test))]
 unsafe extern "C" fn py_call_with_kw_hook(
     callable: ObjPtr,
     args: ObjPtr,
@@ -331,8 +295,6 @@ unsafe extern "C" fn py_call_with_kw_hook(
     ) as ObjPtr;
     result
 }
-
-#[cfg(not(test))]
 unsafe extern "C" fn record_top_value_sample_hook(counter: ObjPtr, value: i64) {
     if counter.is_null() || value < 0 {
         ffi::PyErr_SetString(
@@ -353,16 +315,12 @@ unsafe extern "C" fn record_top_value_sample_hook(counter: ObjPtr, value: i64) {
         }
     }
 }
-
-#[cfg(not(test))]
 unsafe extern "C" fn get_arg_item_hook(args: ObjPtr, index: i64) -> ObjPtr {
     if args.is_null() {
         return ptr::null_mut();
     }
     ffi::PySequence_GetItem(args as *mut ffi::PyObject, index as ffi::Py_ssize_t) as ObjPtr
 }
-
-#[cfg(not(test))]
 unsafe fn load_global_obj_impl(
     globals_obj: ObjPtr,
     name_obj: *mut ffi::PyObject,
@@ -393,16 +351,12 @@ unsafe fn load_global_obj_impl(
     }
     load_global_slow(globals_obj as *mut ffi::PyObject, name_obj) as ObjPtr
 }
-
-#[cfg(not(test))]
 unsafe fn ensure_global_load_error(result: ObjPtr, name_obj: *mut ffi::PyObject) -> ObjPtr {
     if result.is_null() && ffi::PyErr_Occurred().is_null() {
         raise_name_error_for_missing_name(name_obj);
     }
     result
 }
-
-#[cfg(not(test))]
 unsafe fn guarded_indexed_global_slot(
     globals_obj: ObjPtr,
     name_obj: *mut ffi::PyObject,
@@ -420,8 +374,6 @@ unsafe fn guarded_indexed_global_slot(
     }
     -1
 }
-
-#[cfg(not(test))]
 unsafe fn globals_builtins_owned(globals_obj: *mut ffi::PyObject) -> *mut ffi::PyObject {
     if ffi::PyDict_Check(globals_obj) != 0 {
         let builtins = ffi::PyDict_GetItemString(globals_obj, c"__builtins__".as_ptr());
@@ -456,8 +408,6 @@ unsafe fn globals_builtins_owned(globals_obj: *mut ffi::PyObject) -> *mut ffi::P
         builtins
     }
 }
-
-#[cfg(not(test))]
 unsafe fn load_global_slow(
     globals_obj: *mut ffi::PyObject,
     name_obj: *mut ffi::PyObject,
@@ -514,8 +464,6 @@ unsafe fn load_global_slow(
     raise_name_error_for_missing_name(name_obj);
     ptr::null_mut()
 }
-
-#[cfg(not(test))]
 unsafe extern "C" fn pyobject_getattr_hook(obj: ObjPtr, attr: ObjPtr) -> ObjPtr {
     if obj.is_null() || attr.is_null() {
         ffi::PyErr_SetString(
@@ -528,8 +476,6 @@ unsafe extern "C" fn pyobject_getattr_hook(obj: ObjPtr, attr: ObjPtr) -> ObjPtr 
         ffi::PyObject_GetAttr(obj as *mut ffi::PyObject, attr as *mut ffi::PyObject) as ObjPtr;
     result
 }
-
-#[cfg(not(test))]
 unsafe extern "C" fn pyobject_setattr_hook(obj: ObjPtr, attr: ObjPtr, value: ObjPtr) -> ObjPtr {
     if obj.is_null() || attr.is_null() || value.is_null() {
         ffi::PyErr_SetString(
@@ -551,8 +497,6 @@ unsafe extern "C" fn pyobject_setattr_hook(obj: ObjPtr, attr: ObjPtr, value: Obj
         ptr::null_mut()
     }
 }
-
-#[cfg(not(test))]
 unsafe fn exact_compact_long_value(obj: *mut ffi::PyObject) -> Option<ffi::Py_ssize_t> {
     if ffi::PyLong_CheckExact(obj) == 0 {
         return None;
@@ -566,8 +510,6 @@ unsafe fn exact_compact_long_value(obj: *mut ffi::PyObject) -> Option<ffi::Py_ss
     let sign = 1isize - (long_value.lv_tag & PY_LONG_SIGN_MASK) as isize;
     Some(sign * long_value.ob_digit[0] as ffi::Py_ssize_t)
 }
-
-#[cfg(not(test))]
 unsafe fn exact_list_index(
     obj: *mut ffi::PyObject,
     key: *mut ffi::PyObject,
@@ -593,15 +535,11 @@ unsafe fn exact_list_index(
     }
     (0 <= index && index < len).then_some(index)
 }
-
-#[cfg(not(test))]
 unsafe fn new_none() -> ObjPtr {
     let none = ffi::Py_None();
     ffi::Py_INCREF(none);
     none as ObjPtr
 }
-
-#[cfg(not(test))]
 unsafe extern "C" fn pyobject_getitem_hook(obj: ObjPtr, key: ObjPtr) -> ObjPtr {
     if obj.is_null() || key.is_null() {
         ffi::PyErr_SetString(
@@ -618,8 +556,6 @@ unsafe extern "C" fn pyobject_getitem_hook(obj: ObjPtr, key: ObjPtr) -> ObjPtr {
     let result = ffi::PyObject_GetItem(obj, key) as ObjPtr;
     result
 }
-
-#[cfg(not(test))]
 unsafe extern "C" fn pyobject_setitem_hook(obj: ObjPtr, key: ObjPtr, value: ObjPtr) -> ObjPtr {
     if obj.is_null() || key.is_null() || value.is_null() {
         ffi::PyErr_SetString(
@@ -641,8 +577,6 @@ unsafe extern "C" fn pyobject_setitem_hook(obj: ObjPtr, key: ObjPtr, value: ObjP
     let rc = ffi::PyObject_SetItem(obj, key, value);
     if rc == 0 { new_none() } else { ptr::null_mut() }
 }
-
-#[cfg(not(test))]
 unsafe extern "C" fn pyobject_delitem_hook(obj: ObjPtr, key: ObjPtr) -> ObjPtr {
     if obj.is_null() || key.is_null() {
         ffi::PyErr_SetString(
@@ -660,8 +594,6 @@ unsafe extern "C" fn pyobject_delitem_hook(obj: ObjPtr, key: ObjPtr) -> ObjPtr {
         ptr::null_mut()
     }
 }
-
-#[cfg(not(test))]
 unsafe extern "C" fn store_global_hook(
     globals_obj: ObjPtr,
     name: ObjPtr,
@@ -699,8 +631,6 @@ unsafe extern "C" fn store_global_hook(
         ptr::null_mut()
     }
 }
-
-#[cfg(not(test))]
 unsafe extern "C" fn del_quietly_hook(obj: ObjPtr, key: ObjPtr) -> ObjPtr {
     if obj.is_null() || key.is_null() {
         ffi::PyErr_SetString(
@@ -722,8 +652,6 @@ unsafe extern "C" fn del_quietly_hook(obj: ObjPtr, key: ObjPtr) -> ObjPtr {
     ffi::Py_INCREF(none);
     none as ObjPtr
 }
-
-#[cfg(not(test))]
 unsafe extern "C" fn del_global_hook(
     globals_obj: ObjPtr,
     key: ObjPtr,
@@ -746,8 +674,6 @@ unsafe extern "C" fn del_global_hook(
     }
     pyobject_delitem_hook(globals_obj, key)
 }
-
-#[cfg(not(test))]
 unsafe extern "C" fn pyobject_to_i64_hook(value: ObjPtr) -> i64 {
     if value.is_null() {
         ffi::PyErr_SetString(
@@ -768,8 +694,6 @@ unsafe extern "C" fn pyobject_to_i64_hook(value: ObjPtr) -> i64 {
         out as i64
     }
 }
-
-#[cfg(not(test))]
 unsafe extern "C" fn raise_deleted_name_error_hook(name_obj: ObjPtr) {
     if name_obj.is_null() {
         ffi::PyErr_SetString(
@@ -801,13 +725,9 @@ unsafe extern "C" fn raise_deleted_name_error_hook(name_obj: ObjPtr) {
         b"cannot access local variable before assignment\0".as_ptr() as *const i8,
     );
 }
-
-#[cfg(not(test))]
 unsafe extern "C" fn make_cell_hook(value: ObjPtr) -> ObjPtr {
     PyCell_New(value as *mut ffi::PyObject) as ObjPtr
 }
-
-#[cfg(not(test))]
 unsafe extern "C" fn load_cell_hook(cell: ObjPtr) -> ObjPtr {
     if !is_cell_object(cell as *mut ffi::PyObject) {
         raise_expected_cell("dp_jit_load_cell", cell as *mut ffi::PyObject);
@@ -822,13 +742,9 @@ unsafe extern "C" fn load_cell_hook(cell: ObjPtr) -> ObjPtr {
             ffi::PyExc_UnboundLocalError,
             b"local variable referenced before assignment\0".as_ptr() as *const i8,
         );
-    } else {
-        ffi::Py_INCREF(value);
     }
     value as ObjPtr
 }
-
-#[cfg(not(test))]
 unsafe extern "C" fn store_cell_hook(cell: ObjPtr, value: ObjPtr) -> ObjPtr {
     if !is_cell_object(cell as *mut ffi::PyObject) {
         raise_expected_cell("dp_jit_store_cell", cell as *mut ffi::PyObject);
@@ -837,11 +753,10 @@ unsafe extern "C" fn store_cell_hook(cell: ObjPtr, value: ObjPtr) -> ObjPtr {
     if PyCell_Set(cell as *mut ffi::PyObject, value as *mut ffi::PyObject) < 0 {
         return ptr::null_mut();
     }
-    ffi::Py_INCREF(value as *mut ffi::PyObject);
-    value
+    let none = ffi::Py_None();
+    ffi::Py_INCREF(none);
+    none as ObjPtr
 }
-
-#[cfg(not(test))]
 unsafe extern "C" fn del_deref_hook(cell: ObjPtr) -> ObjPtr {
     if !is_cell_object(cell as *mut ffi::PyObject) {
         raise_expected_cell("dp_jit_del_deref", cell as *mut ffi::PyObject);
@@ -865,8 +780,6 @@ unsafe extern "C" fn del_deref_hook(cell: ObjPtr) -> ObjPtr {
     }
     ptr::null_mut()
 }
-
-#[cfg(not(test))]
 unsafe extern "C" fn del_deref_quietly_hook(cell: ObjPtr) -> ObjPtr {
     if !is_cell_object(cell as *mut ffi::PyObject) {
         raise_expected_cell("dp_jit_del_deref_quietly", cell as *mut ffi::PyObject);
@@ -886,8 +799,6 @@ unsafe extern "C" fn del_deref_quietly_hook(cell: ObjPtr) -> ObjPtr {
     ffi::Py_INCREF(none);
     none as ObjPtr
 }
-
-#[cfg(not(test))]
 unsafe extern "C" fn load_global_obj_hook(
     globals_obj: ObjPtr,
     name: ObjPtr,
@@ -897,8 +808,6 @@ unsafe extern "C" fn load_global_obj_hook(
     let result = load_global_obj_impl(globals_obj, name_obj, slot_index);
     ensure_global_load_error(result, name_obj)
 }
-
-#[cfg(not(test))]
 unsafe extern "C" fn tuple_new_hook(size: i64) -> ObjPtr {
     if size < 0 {
         ffi::PyErr_SetString(
@@ -910,8 +819,6 @@ unsafe extern "C" fn tuple_new_hook(size: i64) -> ObjPtr {
     let result = ffi::PyTuple_New(size as ffi::Py_ssize_t) as ObjPtr;
     result
 }
-
-#[cfg(not(test))]
 unsafe extern "C" fn tuple_set_item_hook(tuple_obj: ObjPtr, index: i64, value: ObjPtr) -> i32 {
     if tuple_obj.is_null() || value.is_null() || index < 0 {
         ffi::PyErr_SetString(
@@ -927,13 +834,9 @@ unsafe extern "C" fn tuple_set_item_hook(tuple_obj: ObjPtr, index: i64, value: O
     );
     result
 }
-
-#[cfg(not(test))]
 unsafe extern "C" fn dict_new_hook() -> ObjPtr {
     ffi::PyDict_New() as ObjPtr
 }
-
-#[cfg(not(test))]
 unsafe extern "C" fn dict_set_item_hook(dict_obj: ObjPtr, key: ObjPtr, value: ObjPtr) -> i32 {
     if dict_obj.is_null() || key.is_null() || value.is_null() {
         ffi::PyErr_SetString(
@@ -948,8 +851,6 @@ unsafe extern "C" fn dict_set_item_hook(dict_obj: ObjPtr, key: ObjPtr, value: Ob
         value as *mut ffi::PyObject,
     )
 }
-
-#[cfg(not(test))]
 unsafe extern "C" fn is_true_hook(value: ObjPtr) -> i32 {
     if value.is_null() {
         ffi::PyErr_SetString(
@@ -960,8 +861,6 @@ unsafe extern "C" fn is_true_hook(value: ObjPtr) -> i32 {
     }
     ffi::PyObject_IsTrue(value as *mut ffi::PyObject)
 }
-
-#[cfg(not(test))]
 unsafe extern "C" fn raise_from_exc_hook(exc: ObjPtr) -> i32 {
     if exc.is_null() {
         ffi::PyErr_SetString(
@@ -975,8 +874,6 @@ unsafe extern "C" fn raise_from_exc_hook(exc: ObjPtr) -> i32 {
     PyErr_SetRaisedException(exc_obj);
     0
 }
-
-#[cfg(not(test))]
 unsafe fn attach_implicit_exception_context(exc: *mut ffi::PyObject, previous: *mut ffi::PyObject) {
     if previous.is_null() || ptr::eq(exc, previous) {
         return;
@@ -1012,8 +909,6 @@ unsafe fn attach_implicit_exception_context(exc: *mut ffi::PyObject, previous: *
         ffi::PyErr_Clear();
     }
 }
-
-#[cfg(not(test))]
 unsafe extern "C" fn push_handled_exception_hook(exc: ObjPtr) -> ObjPtr {
     if exc.is_null() {
         ffi::PyErr_SetString(
@@ -1028,8 +923,6 @@ unsafe extern "C" fn push_handled_exception_hook(exc: ObjPtr) -> ObjPtr {
     PyErr_SetHandledException(exc as *mut ffi::PyObject);
     previous as ObjPtr
 }
-
-#[cfg(not(test))]
 unsafe extern "C" fn pop_handled_exception_hook(previous: ObjPtr) {
     let previous = previous as *mut ffi::PyObject;
     PyErr_SetHandledException(previous);
@@ -1200,12 +1093,8 @@ mod test_only_export_stubs {
     ));
 }
 
-#[cfg(test)]
-pub use test_only_export_stubs::*;
-
 // Keep thin exported helpers as real call/return wrappers so perf can attribute
 // time to them instead of tail-collapsing directly into the C API callee.
-#[cfg(not(test))]
 macro_rules! preserve_helper_frame {
     ($expr:expr) => {{
         let result = $expr;
@@ -1213,8 +1102,6 @@ macro_rules! preserve_helper_frame {
         result
     }};
 }
-
-#[cfg(not(test))]
 macro_rules! define_perf_toggle_export {
     (
         $ret:ty,
@@ -1231,15 +1118,11 @@ macro_rules! define_perf_toggle_export {
         }
     };
 }
-
-#[cfg(not(test))]
 define_perf_toggle_export!(
     i32,
     dp_jit_raise_from_exc,
     dp_jit_raise_from_exc_with_frame(exc: ObjPtr) => raise_from_exc_hook(exc)
 );
-
-#[cfg(not(test))]
 define_perf_toggle_export!(
     ObjPtr,
     dp_jit_py_call_positional_three,
@@ -1252,15 +1135,11 @@ define_perf_toggle_export!(
         _sentinel: ObjPtr
     ) => py_call_positional_three_hook(tstate, callable, arg1, arg2, arg3)
 );
-
-#[cfg(not(test))]
 define_perf_toggle_export!(
     ObjPtr,
     dp_jit_py_call_object,
     dp_jit_py_call_object_with_frame(callable: ObjPtr, args: ObjPtr) => py_call_object_hook(callable, args)
 );
-
-#[cfg(not(test))]
 define_perf_toggle_export!(
     ObjPtr,
     dp_jit_py_vectorcall,
@@ -1272,22 +1151,16 @@ define_perf_toggle_export!(
         kwnames: ObjPtr
     ) => py_vectorcall_hook(tstate, callable, args, nargsf, kwnames)
 );
-
-#[cfg(not(test))]
 define_perf_toggle_export!(
     ObjPtr,
     dp_jit_next_or_sentinel,
     dp_jit_next_or_sentinel_with_frame(iterator: ObjPtr, sentinel: ObjPtr) => next_or_sentinel_hook(iterator, sentinel)
 );
-
-#[cfg(not(test))]
 define_perf_toggle_export!(
     ObjPtr,
     dp_jit_py_call_with_kw,
     dp_jit_py_call_with_kw_with_frame(callable: ObjPtr, args: ObjPtr, kw: ObjPtr) => py_call_with_kw_hook(callable, args, kw)
 );
-
-#[cfg(not(test))]
 define_perf_toggle_export!(
     i32,
     dp_jit_guard_method_type_version,
@@ -1297,41 +1170,27 @@ define_perf_toggle_export!(
         expected_version: i64
     ) => guard_method_type_version_hook(receiver, expected_type, expected_version)
 );
-
-#[cfg(not(test))]
 pub unsafe extern "C" fn dp_jit_record_top_value_sample(counter: ObjPtr, value: i64) {
     record_top_value_sample_hook(counter, value)
 }
-
-#[cfg(not(test))]
 define_perf_toggle_export!(
     ObjPtr,
     dp_jit_get_arg_item,
     dp_jit_get_arg_item_with_frame(args: ObjPtr, index: i64) => get_arg_item_hook(args, index)
 );
-
-#[cfg(not(test))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_load_runtime_obj(name: ObjPtr) -> ObjPtr {
     load_runtime_name_owned(name as *mut ffi::PyObject) as ObjPtr
 }
-
-#[cfg(not(test))]
 pub unsafe extern "C" fn dp_jit_direct_function_context(callable: ObjPtr) -> ObjPtr {
     direct_function_context_hook(callable)
 }
-
-#[cfg(not(test))]
 pub unsafe extern "C" fn dp_jit_py_thread_state_get() -> ObjPtr {
     py_thread_state_get_hook()
 }
-
-#[cfg(not(test))]
 pub unsafe extern "C" fn dp_jit_pyobject_getattr(obj: ObjPtr, attr: ObjPtr) -> ObjPtr {
     pyobject_getattr_hook(obj, attr)
 }
-
-#[cfg(not(test))]
 pub unsafe extern "C" fn dp_jit_pyobject_setattr(
     obj: ObjPtr,
     attr: ObjPtr,
@@ -1339,13 +1198,9 @@ pub unsafe extern "C" fn dp_jit_pyobject_setattr(
 ) -> ObjPtr {
     pyobject_setattr_hook(obj, attr, value)
 }
-
-#[cfg(not(test))]
 pub unsafe extern "C" fn dp_jit_pyobject_getitem(obj: ObjPtr, key: ObjPtr) -> ObjPtr {
     pyobject_getitem_hook(obj, key)
 }
-
-#[cfg(not(test))]
 pub unsafe extern "C" fn dp_jit_pyobject_setitem(
     obj: ObjPtr,
     key: ObjPtr,
@@ -1353,13 +1208,9 @@ pub unsafe extern "C" fn dp_jit_pyobject_setitem(
 ) -> ObjPtr {
     pyobject_setitem_hook(obj, key, value)
 }
-
-#[cfg(not(test))]
 pub unsafe extern "C" fn dp_jit_pyobject_delitem(obj: ObjPtr, key: ObjPtr) -> ObjPtr {
     pyobject_delitem_hook(obj, key)
 }
-
-#[cfg(not(test))]
 pub unsafe extern "C" fn dp_jit_load_global_obj(
     globals_obj: ObjPtr,
     name: ObjPtr,
@@ -1367,8 +1218,6 @@ pub unsafe extern "C" fn dp_jit_load_global_obj(
 ) -> ObjPtr {
     load_global_obj_hook(globals_obj, name, slot_index)
 }
-
-#[cfg(not(test))]
 pub unsafe extern "C" fn soac_runtime_load_global_slow(
     globals_obj: ObjPtr,
     name: ObjPtr,
@@ -1379,8 +1228,6 @@ pub unsafe extern "C" fn soac_runtime_load_global_slow(
     let result = load_global_obj_impl(globals_obj, name_obj, slot_index);
     ensure_global_load_error(result, name_obj)
 }
-
-#[cfg(not(test))]
 pub unsafe extern "C" fn dp_jit_store_global(
     globals_obj: ObjPtr,
     name: ObjPtr,
@@ -1389,8 +1236,6 @@ pub unsafe extern "C" fn dp_jit_store_global(
 ) -> ObjPtr {
     store_global_hook(globals_obj, name, slot_index, value)
 }
-
-#[cfg(not(test))]
 pub unsafe extern "C" fn dp_jit_del_global(
     globals_obj: ObjPtr,
     key: ObjPtr,
@@ -1398,8 +1243,6 @@ pub unsafe extern "C" fn dp_jit_del_global(
 ) -> ObjPtr {
     del_global_hook(globals_obj, key, slot_index, false)
 }
-
-#[cfg(not(test))]
 pub unsafe extern "C" fn dp_jit_del_global_quietly(
     globals_obj: ObjPtr,
     key: ObjPtr,
@@ -1407,68 +1250,42 @@ pub unsafe extern "C" fn dp_jit_del_global_quietly(
 ) -> ObjPtr {
     del_global_hook(globals_obj, key, slot_index, true)
 }
-
-#[cfg(not(test))]
 pub unsafe extern "C" fn dp_jit_del_quietly(obj: ObjPtr, key: ObjPtr) -> ObjPtr {
     del_quietly_hook(obj, key)
 }
-
-#[cfg(not(test))]
 pub unsafe extern "C" fn dp_jit_pyobject_to_i64(value: ObjPtr) -> i64 {
     pyobject_to_i64_hook(value)
 }
-
-#[cfg(not(test))]
 pub unsafe extern "C" fn dp_jit_make_cell(value: ObjPtr) -> ObjPtr {
     make_cell_hook(value)
 }
-
-#[cfg(not(test))]
 pub unsafe extern "C" fn dp_jit_raise_deleted_name_error(name: ObjPtr) {
     raise_deleted_name_error_hook(name)
 }
-
-#[cfg(not(test))]
 pub unsafe extern "C" fn dp_jit_load_cell(cell: ObjPtr) -> ObjPtr {
     load_cell_hook(cell)
 }
-
-#[cfg(not(test))]
 pub unsafe extern "C" fn dp_jit_store_cell(cell: ObjPtr, value: ObjPtr) -> ObjPtr {
     store_cell_hook(cell, value)
 }
-
-#[cfg(not(test))]
 pub unsafe extern "C" fn dp_jit_del_deref(cell: ObjPtr) -> ObjPtr {
     del_deref_hook(cell)
 }
-
-#[cfg(not(test))]
 pub unsafe extern "C" fn dp_jit_del_deref_quietly(cell: ObjPtr) -> ObjPtr {
     del_deref_quietly_hook(cell)
 }
-
-#[cfg(not(test))]
 pub unsafe extern "C" fn dp_jit_tuple_new(size: i64) -> ObjPtr {
     tuple_new_hook(size)
 }
-
-#[cfg(not(test))]
 pub unsafe extern "C" fn dp_jit_tuple_set_item(tuple_obj: ObjPtr, index: i64, item: ObjPtr) -> i32 {
     tuple_set_item_hook(tuple_obj, index, item)
 }
-
-#[cfg(not(test))]
 pub unsafe extern "C" fn dp_jit_dict_new() -> ObjPtr {
     dict_new_hook()
 }
-
-#[cfg(not(test))]
 pub unsafe extern "C" fn dp_jit_dict_set_item(dict_obj: ObjPtr, key: ObjPtr, value: ObjPtr) -> i32 {
     dict_set_item_hook(dict_obj, key, value)
 }
-
-#[cfg(not(test))]
 pub unsafe extern "C" fn dp_jit_is_true(value: ObjPtr) -> i32 {
     is_true_hook(value)
 }
@@ -1512,24 +1329,18 @@ macro_rules! define_unary_obj_wrapper {
         }
     };
 }
-
-#[cfg(not(test))]
 unsafe fn exact_long_type_mismatch_error() {
     ffi::PyErr_SetString(
         ffi::PyExc_RuntimeError,
         c"exact long specialization received a non-int operand".as_ptr(),
     );
 }
-
-#[cfg(not(test))]
 unsafe fn exact_long_missing_slot_error() {
     ffi::PyErr_SetString(
         ffi::PyExc_RuntimeError,
         c"exact long specialization missing slot".as_ptr(),
     );
 }
-
-#[cfg(not(test))]
 #[inline(never)]
 unsafe extern "C" fn exact_long_binary_op_hook(kind: i64, lhs: ObjPtr, rhs: ObjPtr) -> ObjPtr {
     let lhs = lhs as *mut ffi::PyObject;
@@ -1651,15 +1462,11 @@ unsafe extern "C" fn exact_long_binary_op_hook(kind: i64, lhs: ObjPtr, rhs: ObjP
     };
     result as ObjPtr
 }
-
-#[cfg(not(test))]
 define_perf_toggle_export!(
     ObjPtr,
     dp_jit_exact_long_binary_op,
     dp_jit_exact_long_binary_op_with_frame(kind: i64, lhs: ObjPtr, rhs: ObjPtr) => exact_long_binary_op_hook(kind, lhs, rhs)
 );
-
-#[cfg(not(test))]
 #[inline(never)]
 unsafe extern "C" fn exact_long_unary_op_hook(kind: i64, operand: ObjPtr) -> ObjPtr {
     let operand = operand as *mut ffi::PyObject;
@@ -1720,8 +1527,6 @@ unsafe extern "C" fn exact_long_unary_op_hook(kind: i64, operand: ObjPtr) -> Obj
         }
     }
 }
-
-#[cfg(not(test))]
 define_perf_toggle_export!(
     ObjPtr,
     dp_jit_exact_long_unary_op,
@@ -1899,21 +1704,16 @@ fn should_preserve_perf_helper_frames() -> bool {
     env_flag_enabled("SOAC_JIT_PERF_HELPER_FRAMES")
 }
 
-#[cfg(test)]
-fn chosen_helper_symbol(fast: *const u8, _with_frame: *const u8) -> *const u8 {
-    fast
-}
-
-#[cfg(not(test))]
 fn chosen_helper_symbol(fast: *const u8, with_frame: *const u8) -> *const u8 {
+    if cfg!(test) {
+        return fast;
+    }
     if should_preserve_perf_helper_frames() {
         with_frame
     } else {
         fast
     }
 }
-
-#[cfg(not(test))]
 unsafe fn exact_long_number_slot_symbol(
     slot_name: &str,
     slot: Option<
@@ -1923,16 +1723,12 @@ unsafe fn exact_long_number_slot_symbol(
     slot.unwrap_or_else(|| panic!("PyLong_Type is missing required number slot {slot_name}"))
         as *const u8
 }
-
-#[cfg(not(test))]
 unsafe fn exact_long_richcompare_slot_symbol() -> *const u8 {
     let long_type = std::ptr::addr_of_mut!(PyLong_Type);
     (*long_type)
         .tp_richcompare
         .expect("PyLong_Type is missing required tp_richcompare slot") as *const u8
 }
-
-#[cfg(not(test))]
 unsafe fn register_exact_long_slot_symbols(builder: &mut JITBuilder) {
     let long_type = std::ptr::addr_of_mut!(PyLong_Type);
     let number = (*long_type).tp_as_number;
@@ -2136,25 +1932,13 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
             dp_jit_raise_from_exc_with_frame as *const u8,
         ),
     );
-    #[cfg(not(test))]
     builder.symbol(
         "dp_jit_push_handled_exception",
         push_handled_exception_hook as *const u8,
     );
-    #[cfg(test)]
-    builder.symbol(
-        "dp_jit_push_handled_exception",
-        dp_jit_push_handled_exception as *const u8,
-    );
-    #[cfg(not(test))]
     builder.symbol(
         "dp_jit_pop_handled_exception",
         pop_handled_exception_hook as *const u8,
-    );
-    #[cfg(test)]
-    builder.symbol(
-        "dp_jit_pop_handled_exception",
-        dp_jit_pop_handled_exception as *const u8,
     );
     builder.symbol(
         "PyObject_RichCompare",
@@ -2177,32 +1961,8 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
             dp_jit_exact_long_binary_op_with_frame as *const u8,
         ),
     );
-    #[cfg(not(test))]
     unsafe {
         register_exact_long_slot_symbols(builder);
-    }
-    #[cfg(test)]
-    {
-        builder.symbol(
-            "dp_jit_exact_long_add_slot",
-            dp_jit_exact_long_add_slot as *const u8,
-        );
-        builder.symbol(
-            "dp_jit_exact_long_sub_slot",
-            dp_jit_exact_long_sub_slot as *const u8,
-        );
-        builder.symbol(
-            "dp_jit_exact_long_mul_slot",
-            dp_jit_exact_long_mul_slot as *const u8,
-        );
-        builder.symbol(
-            "dp_jit_exact_long_true_div_slot",
-            dp_jit_exact_long_true_div_slot as *const u8,
-        );
-        builder.symbol(
-            "dp_jit_exact_long_richcompare_slot",
-            dp_jit_exact_long_richcompare_slot as *const u8,
-        );
     }
     builder.symbol(
         "dp_jit_exact_long_unary_op",

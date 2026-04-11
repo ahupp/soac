@@ -306,38 +306,65 @@ macro_rules! decref_raw_with_tstate {
     ($tstate:expr, $obj:expr) => {{
         let tstate: *mut RawPyThreadState = $tstate;
         let obj: *mut RawPyObject = $obj;
-        if !obj.is_null() && !unsafe { can_skip_decref(obj) } {
-            unsafe {
-                let next_refcnt = (*obj).ob_refcnt.refcnt_and_flags.ob_refcnt.wrapping_sub(1);
-                (*obj).ob_refcnt.refcnt_and_flags.ob_refcnt = next_refcnt;
-                if next_refcnt == 0 {
-                    soac_runtime_decref_dealloc_preserving_error(tstate, obj);
-                }
-            }
-        }
+        let _ = unsafe { decref_impl(tstate, obj) };
     }};
 }
 
 #[inline(always)]
-unsafe fn incref_impl(obj: *mut RawPyObject) {
+unsafe fn decref_impl(tstate: *mut RawPyThreadState, obj: *mut RawPyObject) -> bool {
+    if obj.is_null() || unsafe { can_skip_decref(obj) } {
+        return false;
+    }
+
+    unsafe {
+        let next_refcnt = (*obj).ob_refcnt.refcnt_and_flags.ob_refcnt.wrapping_sub(1);
+        (*obj).ob_refcnt.refcnt_and_flags.ob_refcnt = next_refcnt;
+        if next_refcnt == 0 {
+            soac_runtime_decref_dealloc_preserving_error(tstate.cast(), obj.cast());
+        }
+    }
+    true
+}
+
+#[inline(always)]
+unsafe fn incref_impl(obj: *mut RawPyObject) -> bool {
     if obj.is_null() || unsafe { can_skip_incref(obj) } {
-        return;
+        return false;
     }
 
     unsafe {
         let cur_refcnt = (*obj).ob_refcnt.refcnt_and_flags.ob_refcnt;
         (*obj).ob_refcnt.refcnt_and_flags.ob_refcnt = cur_refcnt.wrapping_add(1);
     }
+    true
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soac_runtime_decref(tstate: *mut c_void, obj: *mut c_void) {
-    decref_raw_with_tstate!(tstate.cast::<RawPyThreadState>(), obj.cast::<RawPyObject>());
+    let _ = unsafe { decref_impl(tstate.cast::<RawPyThreadState>(), obj.cast::<RawPyObject>()) };
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soac_runtime_incref(obj: *mut c_void) {
-    unsafe { incref_impl(obj.cast::<RawPyObject>()) };
+    let _ = unsafe { incref_impl(obj.cast::<RawPyObject>()) };
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soac_runtime_decref_applied(tstate: *mut c_void, obj: *mut c_void) -> i32 {
+    if unsafe { decref_impl(tstate.cast::<RawPyThreadState>(), obj.cast::<RawPyObject>()) } {
+        1
+    } else {
+        0
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soac_runtime_incref_applied(obj: *mut c_void) -> i32 {
+    if unsafe { incref_impl(obj.cast::<RawPyObject>()) } {
+        1
+    } else {
+        0
+    }
 }
 
 #[unsafe(no_mangle)]

@@ -31,6 +31,7 @@ use soac_blockpy::passes::{
     PyExactType, PyObjFacts, RefcountActionKind, RefcountReleaseReason, RefcountSite,
     RuntimeHelperId, ValueFacts, infer_module_value_facts, lower_codegen_function_to_typed,
     lower_typed_function_if_tests_to_truthy, try_lower_typed_instr_to_codegen_legacy,
+    try_lower_typed_term_to_codegen_legacy,
 };
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -224,33 +225,31 @@ fn push_shared_module_symbol_identity(out: &mut String, module_name: &str, sourc
     out.push_str(format!("{source_hash:016x}").as_str());
 }
 
-fn module_constant_table_symbol_for_shared_state(shared_state: &SharedModuleState) -> String {
-    let mut symbol = String::from("__soac_module_constants_shared_");
+fn push_shared_module_instance_symbol_identity(out: &mut String, shared_state: &SharedModuleState) {
     push_shared_module_symbol_identity(
-        &mut symbol,
+        out,
         shared_state.module_name.as_str(),
         shared_state.source_hash(),
     );
+    out.push_str("_instance_");
+    out.push_str(format!("{:x}", shared_state.storage_instance_key()).as_str());
+}
+
+fn module_constant_table_symbol_for_shared_state(shared_state: &SharedModuleState) -> String {
+    let mut symbol = String::from("__soac_module_constants_shared_");
+    push_shared_module_instance_symbol_identity(&mut symbol, shared_state);
     symbol
 }
 
 fn scalar_counter_storage_symbol_for_shared_state(shared_state: &SharedModuleState) -> String {
     let mut symbol = String::from("__soac_scalar_counters_shared_");
-    push_shared_module_symbol_identity(
-        &mut symbol,
-        shared_state.module_name.as_str(),
-        shared_state.source_hash(),
-    );
+    push_shared_module_instance_symbol_identity(&mut symbol, shared_state);
     symbol
 }
 
 fn top_value_counter_storage_symbol_for_shared_state(shared_state: &SharedModuleState) -> String {
     let mut symbol = String::from("__soac_top_value_counters_shared_");
-    push_shared_module_symbol_identity(
-        &mut symbol,
-        shared_state.module_name.as_str(),
-        shared_state.source_hash(),
-    );
+    push_shared_module_instance_symbol_identity(&mut symbol, shared_state);
     symbol
 }
 
@@ -259,11 +258,7 @@ fn direct_function_symbol_scope_for_shared_state(
     function_id: FunctionId,
 ) -> String {
     let mut scope = String::from("shared_");
-    push_shared_module_symbol_identity(
-        &mut scope,
-        shared_state.module_name.as_str(),
-        shared_state.source_hash(),
-    );
+    push_shared_module_instance_symbol_identity(&mut scope, shared_state);
     scope.push_str("_fn_");
     scope.push_str(function_id.packed().to_string().as_str());
     scope
@@ -483,6 +478,16 @@ static DP_JIT_DECREF_IMPORT: ImportSpec = ImportSpec::local(
     SOAC_RUNTIME_DECREF_SYMBOL,
     &[SigType::Pointer, SigType::Pointer],
     &[],
+);
+static SOAC_RUNTIME_INCREF_APPLIED_IMPORT: ImportSpec = ImportSpec::local(
+    SOAC_RUNTIME_INCREF_APPLIED_SYMBOL,
+    &[SigType::Pointer],
+    &[SigType::I32],
+);
+static SOAC_RUNTIME_DECREF_APPLIED_IMPORT: ImportSpec = ImportSpec::local(
+    SOAC_RUNTIME_DECREF_APPLIED_SYMBOL,
+    &[SigType::Pointer, SigType::Pointer],
+    &[SigType::I32],
 );
 static SOAC_RUNTIME_SET_RAISED_EXCEPTION_IMPORT: ImportSpec = ImportSpec::local(
     SOAC_RUNTIME_SET_RAISED_EXCEPTION_SYMBOL,
@@ -3977,12 +3982,13 @@ fn build_counted_runtime_refcount_helper(
     symbol_name: &str,
     cache_name: &str,
     cache_policy: CraneliftCompileCachePolicy,
-    runtime_import: &'static ImportSpec,
+    wrapper_import: &'static ImportSpec,
+    applied_import: &'static ImportSpec,
     scalar_counter_data_id: DataId,
     counter_slot: usize,
 ) -> Result<FuncId, String> {
     let ptr_ty = jit_module.target_config().pointer_type();
-    let sig = lower_static_signature(jit_module, runtime_import.signature);
+    let sig = lower_static_signature(jit_module, wrapper_import.signature);
     let helper_id = declare_local_fn(jit_module, symbol_name, &sig)?;
 
     let mut ctx = jit_module.make_context();
@@ -3994,6 +4000,11 @@ fn build_counted_runtime_refcount_helper(
         fb.append_block_params_for_function_params(entry_block);
         fb.switch_to_block(entry_block);
         let call_args = fb.block_params(entry_block).to_vec();
+        let mut module_imports = ModuleFuncImports::new();
+        let mut func_imports = FuncBuildImports::new(&mut module_imports);
+        let runtime_ref = func_imports.get_or_panic(jit_module, &mut fb.func, applied_import);
+        let runtime_call = fb.ins().call(runtime_ref, &call_args);
+        let applied = fb.inst_results(runtime_call)[0];
         let counter_data = jit_module.declare_data_in_func(scalar_counter_data_id, &mut fb.func);
         let scalar_counter_base_value = fb.ins().global_value(ptr_ty, counter_data);
         let (counter_addr, counter_offset) =
@@ -4004,18 +4015,14 @@ fn build_counted_runtime_refcount_helper(
             counter_addr,
             counter_offset,
         );
-        let new_value = fb.ins().iadd_imm(old_value, 1);
+        let applied_i64 = fb.ins().uextend(ir::types::I64, applied);
+        let new_value = fb.ins().iadd(old_value, applied_i64);
         fb.ins().store(
             ir::MemFlags::trusted(),
             new_value,
             counter_addr,
             counter_offset,
         );
-
-        let mut module_imports = ModuleFuncImports::new();
-        let mut func_imports = FuncBuildImports::new(&mut module_imports);
-        let runtime_ref = func_imports.get_or_panic(jit_module, &mut fb.func, runtime_import);
-        fb.ins().call(runtime_ref, &call_args);
         fb.ins().return_(&[]);
         fb.seal_all_blocks();
         fb.finalize();
@@ -4076,6 +4083,7 @@ fn build_counted_runtime_refcount_helpers(
                     &cache_name,
                     counted_runtime_refcount_helper_cache_policy(symbol_scope),
                     &DP_JIT_INCREF_IMPORT,
+                    &SOAC_RUNTIME_INCREF_APPLIED_IMPORT,
                     scalar_counter_data_id,
                     counter_slot,
                 )
@@ -4103,6 +4111,7 @@ fn build_counted_runtime_refcount_helpers(
                     &cache_name,
                     counted_runtime_refcount_helper_cache_policy(symbol_scope),
                     &DP_JIT_DECREF_IMPORT,
+                    &SOAC_RUNTIME_DECREF_APPLIED_IMPORT,
                     scalar_counter_data_id,
                     counter_slot,
                 )
@@ -7262,6 +7271,13 @@ fn emit_pop_handled_exception(
     fb.switch_to_block(pop_block);
     let previous = fb.ins().stack_load(ctx.consts.ptr_ty, previous_slot, 0);
     fb.ins().call(ctx.pop_handled_exception_ref, &[previous]);
+    let _ = ctx.stack_slots.clear_value(
+        fb,
+        exception_name,
+        ctx.consts.ptr_ty,
+        ctx.consts.thread_state_value,
+        ctx.decref_ref,
+    );
     let null_ptr = fb.ins().iconst(ctx.consts.ptr_ty, 0);
     fb.ins().stack_store(null_ptr, previous_slot, 0);
     let not_pushed = fb.ins().iconst(ir::types::I64, 0);
@@ -7577,6 +7593,19 @@ fn emit_typed_codegen_expr_value_with_local_env(
             value,
             is_true_ref,
             emit_ctx,
+        ));
+    }
+
+    if let InstrTyped::BinOp(_) = expr {
+        let legacy_expr = try_lower_typed_instr_to_codegen_legacy(expr.clone())?;
+        return Ok(emit_codegen_expr_value_with_local_env(
+            fb,
+            &legacy_expr,
+            local_env,
+            emit_ctx,
+            borrowed,
+            jit_module,
+            func_imports,
         ));
     }
 
@@ -8664,7 +8693,10 @@ fn emit_typed_codegen_stmt_with_local_env(
     jit_module: &mut JITModule,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<ir::Value, String> {
-    if matches!(expr, InstrTyped::Truthy(_) | InstrTyped::Load(_)) {
+    if matches!(
+        expr,
+        InstrTyped::Truthy(_) | InstrTyped::Load(_) | InstrTyped::BinOp(_)
+    ) {
         return emit_typed_codegen_expr_with_local_env(
             fb,
             expr,
@@ -8839,6 +8871,92 @@ fn emit_codegen_if_target_arm(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn emit_codegen_if_truth_i32(
+    fb: &mut FunctionBuilder<'_>,
+    source_label: BlockLabel,
+    test_instr_id: Option<InstrId>,
+    truth_i32: ir::Value,
+    then_label: BlockLabel,
+    else_label: BlockLabel,
+    current_exception_name: Option<&str>,
+    exec_blocks: &[ir::Block],
+    runtime_block_param_names: &[Vec<String>],
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<(), String> {
+    if let Some(test_instr_id) = test_instr_id {
+        if let Some(counter_id) = emit_ctx
+            .branch_outcome_counter_ids
+            .get(&test_instr_id)
+            .copied()
+        {
+            emit_record_branch_outcome_sample(fb, counter_id, truth_i32, emit_ctx);
+        }
+    }
+
+    let prefer_true = test_instr_id
+        .and_then(|test_instr_id| emit_ctx.branch_prefer_true.get(&test_instr_id).copied())
+        .unwrap_or(true);
+    let hot_cond = if prefer_true {
+        fb.ins()
+            .icmp_imm(ir::condcodes::IntCC::NotEqual, truth_i32, 0)
+    } else {
+        fb.ins().icmp_imm(ir::condcodes::IntCC::Equal, truth_i32, 0)
+    };
+    let hot_branch = fb.create_block();
+    let cold_branch = fb.create_block();
+    fb.ins().brif(hot_cond, hot_branch, &[], cold_branch, &[]);
+
+    let (hot_name, hot_label, cold_name, cold_label) = if prefer_true {
+        ("then", then_label, "else", else_label)
+    } else {
+        ("else", else_label, "then", then_label)
+    };
+    let mut hot_local_env = local_env.clone();
+    emit_codegen_if_target_arm(
+        fb,
+        source_label,
+        hot_name,
+        hot_branch,
+        hot_label,
+        if hot_label == then_label {
+            RefcountReleaseReason::IfThen { target: hot_label }
+        } else {
+            RefcountReleaseReason::IfElse { target: hot_label }
+        },
+        current_exception_name,
+        exec_blocks,
+        runtime_block_param_names,
+        &mut hot_local_env,
+        emit_ctx,
+        jit_module,
+        func_imports,
+    )?;
+    let mut cold_local_env = local_env.clone();
+    emit_codegen_if_target_arm(
+        fb,
+        source_label,
+        cold_name,
+        cold_branch,
+        cold_label,
+        if cold_label == then_label {
+            RefcountReleaseReason::IfThen { target: cold_label }
+        } else {
+            RefcountReleaseReason::IfElse { target: cold_label }
+        },
+        current_exception_name,
+        exec_blocks,
+        runtime_block_param_names,
+        &mut cold_local_env,
+        emit_ctx,
+        jit_module,
+        func_imports,
+    )
+}
+
 fn emit_codegen_term(
     fb: &mut FunctionBuilder<'_>,
     source_label: BlockLabel,
@@ -8939,70 +9057,17 @@ fn emit_codegen_term(
             );
             let truth = emit_truthy_from_owned_value(fb, test_value, is_true_ref, emit_ctx);
             let truth_i32 = truth.expect_i32_bool01("if condition truthiness");
-            if let Some(test_instr_id) = test_instr_id {
-                if let Some(counter_id) = emit_ctx
-                    .branch_outcome_counter_ids
-                    .get(&test_instr_id)
-                    .copied()
-                {
-                    emit_record_branch_outcome_sample(fb, counter_id, truth_i32, emit_ctx);
-                }
-            }
-
-            let prefer_true = test_instr_id
-                .and_then(|test_instr_id| emit_ctx.branch_prefer_true.get(&test_instr_id).copied())
-                .unwrap_or(true);
-            let hot_cond = if prefer_true {
-                fb.ins()
-                    .icmp_imm(ir::condcodes::IntCC::NotEqual, truth_i32, 0)
-            } else {
-                fb.ins().icmp_imm(ir::condcodes::IntCC::Equal, truth_i32, 0)
-            };
-            let hot_branch = fb.create_block();
-            let cold_branch = fb.create_block();
-            fb.ins().brif(hot_cond, hot_branch, &[], cold_branch, &[]);
-
-            let (hot_name, hot_label, cold_name, cold_label) = if prefer_true {
-                ("then", if_term.then_label, "else", if_term.else_label)
-            } else {
-                ("else", if_term.else_label, "then", if_term.then_label)
-            };
-            let mut hot_local_env = local_env.clone();
-            emit_codegen_if_target_arm(
+            emit_codegen_if_truth_i32(
                 fb,
                 source_label,
-                hot_name,
-                hot_branch,
-                hot_label,
-                if hot_label == if_term.then_label {
-                    RefcountReleaseReason::IfThen { target: hot_label }
-                } else {
-                    RefcountReleaseReason::IfElse { target: hot_label }
-                },
+                test_instr_id,
+                truth_i32,
+                if_term.then_label,
+                if_term.else_label,
                 current_exception_name,
                 exec_blocks,
                 runtime_block_param_names,
-                &mut hot_local_env,
-                emit_ctx,
-                jit_module,
-                func_imports,
-            )?;
-            let mut cold_local_env = local_env.clone();
-            emit_codegen_if_target_arm(
-                fb,
-                source_label,
-                cold_name,
-                cold_branch,
-                cold_label,
-                if cold_label == if_term.then_label {
-                    RefcountReleaseReason::IfThen { target: cold_label }
-                } else {
-                    RefcountReleaseReason::IfElse { target: cold_label }
-                },
-                current_exception_name,
-                exec_blocks,
-                runtime_block_param_names,
-                &mut cold_local_env,
+                local_env,
                 emit_ctx,
                 jit_module,
                 func_imports,
@@ -9311,6 +9376,71 @@ fn emit_codegen_term(
         }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_typed_codegen_term(
+    fb: &mut FunctionBuilder<'_>,
+    source_label: BlockLabel,
+    term: &BlockTerm<InstrTyped>,
+    exec_blocks: &[ir::Block],
+    runtime_block_param_names: &[Vec<String>],
+    full_block_param_names: &[Vec<String>],
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+    is_true_ref: ir::FuncRef,
+    pyobject_to_i64_ref: ir::FuncRef,
+    raise_exc_ref: ir::FuncRef,
+    current_exception_name: Option<&str>,
+) -> Result<(), String> {
+    if let BlockTerm::IfTerm(if_term) = term {
+        let test_instr_id = if_term.test.try_semantic_instr_id();
+        let truth = emit_typed_codegen_expr_value_with_local_env(
+            fb,
+            &if_term.test,
+            local_env,
+            emit_ctx,
+            false,
+            jit_module,
+            func_imports,
+        )?;
+        let truth_i32 = truth.expect_i32_bool01("typed if condition truthiness");
+        return emit_codegen_if_truth_i32(
+            fb,
+            source_label,
+            test_instr_id,
+            truth_i32,
+            if_term.then_label,
+            if_term.else_label,
+            current_exception_name,
+            exec_blocks,
+            runtime_block_param_names,
+            local_env,
+            emit_ctx,
+            jit_module,
+            func_imports,
+        );
+    }
+
+    let legacy_term = try_lower_typed_term_to_codegen_legacy(term.clone())?;
+    emit_codegen_term(
+        fb,
+        source_label,
+        &legacy_term,
+        exec_blocks,
+        runtime_block_param_names,
+        full_block_param_names,
+        local_env,
+        emit_ctx,
+        jit_module,
+        func_imports,
+        is_true_ref,
+        pyobject_to_i64_ref,
+        raise_exc_ref,
+        current_exception_name,
+    )
 }
 
 fn new_jit_builder() -> Result<JITBuilder, String> {
@@ -10208,6 +10338,8 @@ fn is_clif_ident_byte(byte: u8) -> bool {
 pub(crate) const JIT_PYTHON_PERF_SYMBOL_KIND_DIRECT: &str = "d";
 pub(crate) const SOAC_RUNTIME_INCREF_SYMBOL: &str = "soac_runtime_incref";
 pub(crate) const SOAC_RUNTIME_DECREF_SYMBOL: &str = "soac_runtime_decref";
+pub(crate) const SOAC_RUNTIME_INCREF_APPLIED_SYMBOL: &str = "soac_runtime_incref_applied";
+pub(crate) const SOAC_RUNTIME_DECREF_APPLIED_SYMBOL: &str = "soac_runtime_decref_applied";
 pub(crate) const SOAC_RUNTIME_SET_RAISED_EXCEPTION_SYMBOL: &str =
     "soac_runtime_set_raised_exception";
 pub(crate) const SOAC_RUNTIME_CALLEE_FUNCTION_ID_SYMBOL: &str = "soac_runtime_callee_function_id";
@@ -11582,10 +11714,10 @@ fn build_cranelift_run_bb_specialized_function(
                 &mut pending_local_failure_cleanups,
             )?;
             let term_emit_ctx = term_emit_ctx.as_ref().unwrap_or(&emit_ctx);
-            emit_codegen_term(
+            emit_typed_codegen_term(
                 &mut fb,
                 codegen_block.label,
-                &codegen_block.term,
+                &typed_function.blocks[index].term,
                 &exec_blocks,
                 &runtime_block_param_names,
                 &full_block_param_names,
