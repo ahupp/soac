@@ -1,4 +1,4 @@
-use crate::counter::{Counter, CounterEntry};
+use crate::counter::{CounterEntry, GilTopValueCounter, TopValueCounter};
 use crate::counter_dump::{
     CounterDumpKeyLayout, CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey,
     CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry,
@@ -22,6 +22,7 @@ use std::io::Write;
 use std::mem::MaybeUninit;
 use std::path::Path;
 use std::ptr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tracing::info;
@@ -62,12 +63,13 @@ pub struct SharedModuleState {
     pub module_name: String,
     pub package_name: String,
     pub codegen_constants: ModuleCodegenConstants,
+    storage_instance_key: usize,
     function_index_by_id: HashMap<FunctionId, usize>,
     original_code_by_function_id: HashMap<FunctionId, Py<PyAny>>,
     module_constant_objs: Vec<Py<PyAny>>,
     counter_slots_by_id: Box<[CounterRuntimeSlot]>,
     counter_values: Box<[u64]>,
-    top_value_counters: Box<[Mutex<Counter<2, u64>>]>,
+    top_value_counters: Box<[GilTopValueCounter]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -81,12 +83,16 @@ enum CounterStorageKey {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CounterRuntimeSlot {
+pub(crate) enum CounterRuntimeSlot {
     Scalar(usize),
     TopValues(usize),
 }
 
 impl SharedModuleState {
+    pub(crate) fn storage_instance_key(&self) -> usize {
+        self.storage_instance_key
+    }
+
     pub fn module_id(&self) -> u32 {
         self.lowered_module.module_name_gen.module_id()
     }
@@ -138,28 +144,23 @@ impl SharedModuleState {
         self.module_constant_objs.get(id.0)
     }
 
-    pub(crate) fn counter_ptrs(&self) -> Vec<*mut u64> {
-        self.counter_slots_by_id
-            .iter()
-            .map(|slot| match slot {
-                CounterRuntimeSlot::Scalar(slot) => {
-                    &self.counter_values[*slot] as *const u64 as *mut u64
-                }
-                CounterRuntimeSlot::TopValues(_) => ptr::null_mut(),
-            })
-            .collect()
+    pub(crate) fn counter_slots_by_id(&self) -> &[CounterRuntimeSlot] {
+        &self.counter_slots_by_id
     }
 
-    pub(crate) fn top_value_counter_ptrs(&self) -> Vec<*mut c_void> {
-        self.counter_slots_by_id
-            .iter()
-            .map(|slot| match slot {
-                CounterRuntimeSlot::TopValues(slot) => {
-                    &self.top_value_counters[*slot] as *const Mutex<Counter<2, u64>> as *mut c_void
-                }
-                CounterRuntimeSlot::Scalar(_) => ptr::null_mut(),
-            })
-            .collect()
+    pub(crate) fn scalar_counter_values_ptr(&self) -> *mut u64 {
+        if self.counter_values.is_empty() {
+            ptr::null_mut()
+        } else {
+            self.counter_values.as_ptr() as *mut u64
+        }
+    }
+
+    pub(crate) fn top_value_counter_values_ptr(&self) -> *mut TopValueCounter {
+        self.top_value_counters
+            .first()
+            .map(GilTopValueCounter::as_raw_ptr)
+            .unwrap_or(ptr::null_mut())
     }
 
     pub fn counter_values(&self) -> &[u64] {
@@ -185,8 +186,7 @@ impl SharedModuleState {
             return None;
         };
         let counter = self.top_value_counters.get(slot)?;
-        let counter = counter.lock().ok()?;
-        Some(counter.snapshot())
+        Some(unsafe { counter.snapshot_with_gil() })
     }
 
     pub(crate) fn lookup_or_compile_direct_function_handle(
@@ -215,7 +215,6 @@ impl SharedModuleState {
             .ok_or_else(|| format!("missing direct-call target for function_id={function_id}"))?;
         let blocks = vec![ptr::null_mut::<c_void>(); function.blocks.len()];
         let module_constant_ptrs = self.module_constant_ptrs();
-        let counter_ptrs = self.counter_ptrs();
         let compile_start = std::time::Instant::now();
         let compile_result = unsafe {
             crate::jit::compile_cranelift_run_bb_specialized_cached(
@@ -226,7 +225,6 @@ impl SharedModuleState {
                 &self.codegen_constants,
                 &self.lowered_module.counter_defs,
                 &module_constant_ptrs,
-                &counter_ptrs,
                 Some(self),
             )
         };
@@ -469,6 +467,12 @@ impl SharedModuleState {
     }
 }
 
+static NEXT_SHARED_MODULE_STATE_STORAGE_KEY: AtomicUsize = AtomicUsize::new(1);
+
+fn allocate_shared_module_state_storage_key() -> usize {
+    NEXT_SHARED_MODULE_STATE_STORAGE_KEY.fetch_add(1, Ordering::Relaxed)
+}
+
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) unsafe fn record_top_value_sample_counter_ptr(
     counter: *mut c_void,
@@ -477,10 +481,7 @@ pub(crate) unsafe fn record_top_value_sample_counter_ptr(
     if counter.is_null() {
         return Err("missing direct top-value counter pointer".to_string());
     }
-    let counter = unsafe { &*(counter as *const Mutex<Counter<2, u64>>) };
-    let mut counter = counter
-        .lock()
-        .map_err(|_| "top-value counter lock poisoned".to_string())?;
+    let counter = unsafe { &mut *(counter as *mut TopValueCounter) };
     counter.record(value);
     Ok(())
 }
@@ -493,7 +494,7 @@ fn counter_scope_name(scope: CounterScope) -> &'static str {
     }
 }
 
-fn counter_storage_key(counter: &CounterDef) -> PyResult<CounterStorageKey> {
+fn counter_storage_key(counter: &CounterDef) -> Result<CounterStorageKey, String> {
     match counter.scope {
         CounterScope::This => Ok(CounterStorageKey::This(counter.id)),
         CounterScope::Function | CounterScope::Global => Ok(CounterStorageKey::Shared {
@@ -511,33 +512,26 @@ fn counter_uses_call_target_storage(counter: &CounterDef) -> bool {
     )
 }
 
-fn build_counter_storage(
+pub(crate) fn build_counter_storage_layout(
     counter_defs: &[CounterDef],
-) -> PyResult<(
-    Box<[CounterRuntimeSlot]>,
-    Box<[u64]>,
-    Box<[Mutex<Counter<2, u64>>]>,
-)> {
+) -> Result<(Box<[CounterRuntimeSlot]>, usize, usize), String> {
     let mut slots_by_id = vec![None; counter_defs.len()];
     let mut scalar_slot_by_key = HashMap::new();
     let mut top_values_slot_by_key = HashMap::new();
-    let mut counter_values = Vec::new();
-    let mut top_value_counters = Vec::new();
     for counter in counter_defs {
         if counter.id.0 >= slots_by_id.len() {
-            return Err(PyRuntimeError::new_err(format!(
+            return Err(format!(
                 "counter id {} is out of range for {} counter defs",
                 counter.id.0,
                 counter_defs.len()
-            )));
+            ));
         }
         let key = counter_storage_key(counter)?;
         let slot = if counter_uses_call_target_storage(counter) {
             let slot = if let Some(slot) = top_values_slot_by_key.get(&key).copied() {
                 slot
             } else {
-                let slot = top_value_counters.len();
-                top_value_counters.push(Mutex::new(Counter::new()));
+                let slot = top_values_slot_by_key.len();
                 top_values_slot_by_key.insert(key, slot);
                 slot
             };
@@ -546,8 +540,7 @@ fn build_counter_storage(
             let slot = if let Some(slot) = scalar_slot_by_key.get(&key).copied() {
                 slot
             } else {
-                let slot = counter_values.len();
-                counter_values.push(0);
+                let slot = scalar_slot_by_key.len();
                 scalar_slot_by_key.insert(key, slot);
                 slot
             };
@@ -561,8 +554,27 @@ fn build_counter_storage(
             .map(|slot| slot.expect("every counter id should map to a runtime counter slot"))
             .collect::<Vec<_>>()
             .into_boxed_slice(),
-        counter_values.into_boxed_slice(),
-        top_value_counters.into_boxed_slice(),
+        scalar_slot_by_key.len(),
+        top_values_slot_by_key.len(),
+    ))
+}
+
+fn build_counter_storage(
+    counter_defs: &[CounterDef],
+) -> PyResult<(
+    Box<[CounterRuntimeSlot]>,
+    Box<[u64]>,
+    Box<[GilTopValueCounter]>,
+)> {
+    let (slots_by_id, scalar_count, top_value_count) =
+        build_counter_storage_layout(counter_defs).map_err(PyRuntimeError::new_err)?;
+    Ok((
+        slots_by_id,
+        vec![0; scalar_count].into_boxed_slice(),
+        (0..top_value_count)
+            .map(|_| GilTopValueCounter::new())
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
     ))
 }
 
@@ -590,6 +602,7 @@ pub fn build_shared_state_for_inspection(
         module_name: module_name.to_string(),
         package_name: package_name.to_string(),
         codegen_constants,
+        storage_instance_key: allocate_shared_module_state_storage_key(),
         function_index_by_id,
         original_code_by_function_id: HashMap::new(),
         module_constant_objs,
@@ -666,6 +679,7 @@ impl SoacExtModuleState {
             module_name,
             package_name,
             codegen_constants,
+            storage_instance_key: allocate_shared_module_state_storage_key(),
             function_index_by_id,
             original_code_by_function_id,
             module_constant_objs,
@@ -1333,6 +1347,7 @@ def f():
             function_index_by_id: build_function_index_by_id(&lowered)
                 .expect("function index should build"),
             codegen_constants: ModuleCodegenConstants::collect_from_module(&lowered),
+            storage_instance_key: allocate_shared_module_state_storage_key(),
             module_constant_objs: Vec::new(),
             counter_slots_by_id: vec![CounterRuntimeSlot::Scalar(0)].into_boxed_slice(),
             counter_values: vec![3].into_boxed_slice(),
@@ -1488,6 +1503,7 @@ def f():
             function_index_by_id: build_function_index_by_id(&lowered)
                 .expect("function index should build"),
             codegen_constants: ModuleCodegenConstants::collect_from_module(&lowered),
+            storage_instance_key: allocate_shared_module_state_storage_key(),
             module_constant_objs: Vec::new(),
             counter_slots_by_id: vec![CounterRuntimeSlot::Scalar(0), CounterRuntimeSlot::Scalar(1)]
                 .into_boxed_slice(),

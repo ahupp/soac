@@ -1,6 +1,6 @@
 use super::{
     ImportSpec, JitEmitCtx, SOAC_RUNTIME_LOAD_GLOBAL_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_IMPORT,
-    SigType, codegen_constant_string_value, emit_increment_counter_ptr,
+    SigType, codegen_constant_string_value, emit_increment_counter_slot,
     emit_owned_module_constant_from_parts,
 };
 use crate::jit::blockpy_intrinsics;
@@ -12,7 +12,9 @@ use cranelift_codegen::ir;
 use cranelift_codegen::ir::InstBuilder;
 use cranelift_frontend::FunctionBuilder;
 use pyo3::ffi;
-use soac_blockpy::block_py::{HasSemanticInstrId, Instr, InstrCodegen, NameLike, NameLocation};
+use soac_blockpy::block_py::{
+    CounterId, HasSemanticInstrId, Instr, InstrCodegen, NameLike, NameLocation,
+};
 use soac_blockpy::passes::PyObjFacts;
 use std::mem::offset_of;
 
@@ -46,13 +48,14 @@ pub(super) trait OperationEmitState<'fb, E> {
         &mut self,
         constant_id: crate::module_constants::ModuleConstantId,
     ) -> ir::Value {
-        let module_constant_ptrs_ptr = self.ctx().module_constant_ptrs.as_ptr();
-        let module_constant_ptrs_len = self.ctx().module_constant_ptrs.len();
         let ptr_ty = self.ctx().consts.ptr_ty;
-        let module_constant_ptrs = unsafe {
-            std::slice::from_raw_parts(module_constant_ptrs_ptr, module_constant_ptrs_len)
-        };
-        emit_owned_module_constant_from_parts(self.fb(), constant_id, module_constant_ptrs, ptr_ty)
+        let module_constant_table_value = self.ctx().consts.module_constant_table_value;
+        emit_owned_module_constant_from_parts(
+            self.fb(),
+            constant_id,
+            module_constant_table_value,
+            ptr_ty,
+        )
     }
 
     fn emit_owned_func_call(&mut self, func_ref: ir::FuncRef, args: &[&E]) -> ir::Value {
@@ -410,12 +413,12 @@ fn emit_counted_getattr_fallback<'fb, E: Instr>(
     arg_values: &[(ir::Value, bool)],
 ) -> ir::Value {
     if let Some(instr_id) = instr_id {
-        let counter_ptr = state
+        let counter_id = state
             .ctx()
             .field_indexed_fallback_counter_ids
             .get(&instr_id)
-            .map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
-        increment_counter_ptr_with_state(state, counter_ptr);
+            .copied();
+        increment_counter_with_state(state, counter_id);
     }
     let pyobject_getattr_ref = state.ctx().pyobject_getattr_ref;
     let call_inst = state
@@ -449,16 +452,16 @@ fn emit_specialized_getattr<'fb>(
     let zero_i32 = state.fb().ins().iconst(i32_ty, 0);
     let load_field_indexed_ref = state.ctx().load_field_indexed_ref;
     let guard_type_version_ref = state.ctx().guard_method_type_version_ref;
-    let hit_counter_ptr = state
+    let hit_counter_id = state
         .ctx()
         .field_indexed_hit_counter_ids
         .get(&instr_id)
-        .map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
-    let fallback_counter_ptr = state
+        .copied();
+    let fallback_counter_id = state
         .ctx()
         .field_indexed_fallback_counter_ids
         .get(&instr_id)
-        .map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
+        .copied();
 
     let result_block = state.fb().create_block();
     state.fb().append_block_param(result_block, ptr_ty);
@@ -521,7 +524,7 @@ fn emit_specialized_getattr<'fb>(
 
         state.fb().switch_to_block(direct_block);
         let direct_value = state.fb().block_params(direct_block)[0];
-        increment_counter_ptr_with_state(state, hit_counter_ptr);
+        increment_counter_with_state(state, hit_counter_id);
         state.release_arg_values(&arg_values);
         state
             .fb()
@@ -534,7 +537,7 @@ fn emit_specialized_getattr<'fb>(
     }
 
     state.fb().switch_to_block(fallback_block);
-    increment_counter_ptr_with_state(state, fallback_counter_ptr);
+    increment_counter_with_state(state, fallback_counter_id);
     let fallback_value = emit_counted_getattr_fallback(state, None, &arg_values);
     state.release_arg_values(&arg_values);
     state
@@ -553,12 +556,12 @@ fn emit_setattr_fallback<'fb>(
     arg_values: &[(ir::Value, bool)],
 ) -> ir::Value {
     if let Some(instr_id) = instr_id {
-        let counter_ptr = state
+        let counter_id = state
             .ctx()
             .field_indexed_fallback_counter_ids
             .get(&instr_id)
-            .map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
-        increment_counter_ptr_with_state(state, counter_ptr);
+            .copied();
+        increment_counter_with_state(state, counter_id);
     }
     let pyobject_setattr_ref = state.ctx().pyobject_setattr_ref;
     let call_inst = state.fb().ins().call(
@@ -596,16 +599,16 @@ fn emit_specialized_setattr<'fb>(
     let zero_i32 = state.fb().ins().iconst(i32_ty, 0);
     let store_field_indexed_ref = state.ctx().store_field_indexed_ref;
     let guard_type_version_ref = state.ctx().guard_method_type_version_ref;
-    let hit_counter_ptr = state
+    let hit_counter_id = state
         .ctx()
         .field_indexed_hit_counter_ids
         .get(&instr_id)
-        .map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
-    let fallback_counter_ptr = state
+        .copied();
+    let fallback_counter_id = state
         .ctx()
         .field_indexed_fallback_counter_ids
         .get(&instr_id)
-        .map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
+        .copied();
 
     let result_block = state.fb().create_block();
     state.fb().append_block_param(result_block, ptr_ty);
@@ -670,7 +673,7 @@ fn emit_specialized_setattr<'fb>(
             .brif(direct_missed, fallback_block, &[], direct_block, &[]);
 
         state.fb().switch_to_block(direct_block);
-        increment_counter_ptr_with_state(state, hit_counter_ptr);
+        increment_counter_with_state(state, hit_counter_id);
         let none_const = state.ctx().consts.none_const;
         let incref_ref = state.ctx().incref_ref;
         state.fb().ins().call(incref_ref, &[none_const]);
@@ -686,7 +689,7 @@ fn emit_specialized_setattr<'fb>(
     }
 
     state.fb().switch_to_block(fallback_block);
-    increment_counter_ptr_with_state(state, fallback_counter_ptr);
+    increment_counter_with_state(state, fallback_counter_id);
     let fallback_value = emit_setattr_fallback(state, None, &arg_values);
     state.release_arg_values(&arg_values);
     state
@@ -1076,10 +1079,8 @@ fn emit_specialized_binop<'fb>(
         .get(&instr_id)
         .cloned()
         .unwrap_or_default();
-    let specialized_hit_counter_ptr =
-        specialized_hit_counter_id.map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
-    let specialized_fallback_counter_ptr =
-        specialized_fallback_counter_id.map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
+    let specialized_hit_counter_id = specialized_hit_counter_id;
+    let specialized_fallback_counter_id = specialized_fallback_counter_id;
     if counter_id.is_none() && hot_shapes.is_empty() {
         return None;
     }
@@ -1087,20 +1088,27 @@ fn emit_specialized_binop<'fb>(
     let arg_values = state.emit_arg_values(&[op.left.as_ref(), op.right.as_ref()]);
     let shape = emit_binary_operator_shape_from_values(state, &arg_values);
     if let Some(counter_id) = counter_id {
-        if let Some(counter_ptr) = state
+        let counter_slot =
+            super::top_value_counter_slot_for_id(state.ctx().counter_slots_by_id, counter_id)
+                .unwrap_or_else(|err| panic!("{err}"));
+        let top_value_counter_base_value = state
             .ctx()
-            .top_value_counter_ptrs
-            .get(counter_id.0)
-            .copied()
-            .filter(|ptr| !ptr.is_null())
-        {
-            let record_top_value_sample_ref = state.ctx().record_top_value_sample_ref;
-            let counter_value = state.fb().ins().iconst(ptr_ty, counter_ptr as i64);
-            state
-                .fb()
-                .ins()
-                .call(record_top_value_sample_ref, &[counter_value, shape]);
-        }
+            .consts
+            .top_value_counter_base_value
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing top-value counter base for counter id {}",
+                    counter_id.0
+                )
+            });
+        let record_top_value_sample_ref = state.ctx().record_top_value_sample_ref;
+        super::emit_record_top_value_counter_slot(
+            state.fb(),
+            top_value_counter_base_value,
+            counter_slot,
+            shape,
+            record_top_value_sample_ref,
+        );
     }
 
     let Some(exact_int_kind) = ExactIntBinaryOpKind::from_binop_kind(op.kind) else {
@@ -1130,9 +1138,7 @@ fn emit_specialized_binop<'fb>(
         .brif(is_match, direct_block, &[], generic_block, &[]);
 
     state.fb().switch_to_block(direct_block);
-    if let Some(counter_ptr) = specialized_hit_counter_ptr {
-        emit_increment_counter_ptr(state.fb(), ptr_ty, counter_ptr);
-    }
+    increment_counter_with_state(state, specialized_hit_counter_id);
     let direct_result = emit_exact_long_binary_op(exact_int_kind, state, &arg_values);
     state
         .fb()
@@ -1140,9 +1146,7 @@ fn emit_specialized_binop<'fb>(
         .jump(result_block, &[ir::BlockArg::Value(direct_result)]);
 
     state.fb().switch_to_block(generic_block);
-    if let Some(counter_ptr) = specialized_fallback_counter_ptr {
-        emit_increment_counter_ptr(state.fb(), ptr_ty, counter_ptr);
-    }
+    increment_counter_with_state(state, specialized_fallback_counter_id);
     let generic_result = emit_binop_with_arg_values(op.kind, state, &arg_values);
     state
         .fb()
@@ -1181,10 +1185,8 @@ fn emit_specialized_unary_op<'fb>(
         .get(&instr_id)
         .cloned()
         .unwrap_or_default();
-    let specialized_hit_counter_ptr =
-        specialized_hit_counter_id.map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
-    let specialized_fallback_counter_ptr =
-        specialized_fallback_counter_id.map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
+    let specialized_hit_counter_id = specialized_hit_counter_id;
+    let specialized_fallback_counter_id = specialized_fallback_counter_id;
     if counter_id.is_none() && hot_shapes.is_empty() {
         return None;
     }
@@ -1192,20 +1194,27 @@ fn emit_specialized_unary_op<'fb>(
     let arg_values = state.emit_arg_values(&[op.operand.as_ref()]);
     let shape = emit_unary_operator_shape_from_values(state, &arg_values);
     if let Some(counter_id) = counter_id {
-        if let Some(counter_ptr) = state
+        let counter_slot =
+            super::top_value_counter_slot_for_id(state.ctx().counter_slots_by_id, counter_id)
+                .unwrap_or_else(|err| panic!("{err}"));
+        let top_value_counter_base_value = state
             .ctx()
-            .top_value_counter_ptrs
-            .get(counter_id.0)
-            .copied()
-            .filter(|ptr| !ptr.is_null())
-        {
-            let record_top_value_sample_ref = state.ctx().record_top_value_sample_ref;
-            let counter_value = state.fb().ins().iconst(ptr_ty, counter_ptr as i64);
-            state
-                .fb()
-                .ins()
-                .call(record_top_value_sample_ref, &[counter_value, shape]);
-        }
+            .consts
+            .top_value_counter_base_value
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing top-value counter base for counter id {}",
+                    counter_id.0
+                )
+            });
+        let record_top_value_sample_ref = state.ctx().record_top_value_sample_ref;
+        super::emit_record_top_value_counter_slot(
+            state.fb(),
+            top_value_counter_base_value,
+            counter_slot,
+            shape,
+            record_top_value_sample_ref,
+        );
     }
 
     let exact_int_kind = ExactIntUnaryOpKind::from_unary_op_kind(op.kind);
@@ -1237,9 +1246,7 @@ fn emit_specialized_unary_op<'fb>(
         .brif(is_match, direct_block, &[], generic_block, &[]);
 
     state.fb().switch_to_block(direct_block);
-    if let Some(counter_ptr) = specialized_hit_counter_ptr {
-        emit_increment_counter_ptr(state.fb(), ptr_ty, counter_ptr);
-    }
+    increment_counter_with_state(state, specialized_hit_counter_id);
     let direct_result = emit_exact_long_unary_op(exact_int_kind, state, &arg_values);
     state
         .fb()
@@ -1247,9 +1254,7 @@ fn emit_specialized_unary_op<'fb>(
         .jump(result_block, &[ir::BlockArg::Value(direct_result)]);
 
     state.fb().switch_to_block(generic_block);
-    if let Some(counter_ptr) = specialized_fallback_counter_ptr {
-        emit_increment_counter_ptr(state.fb(), ptr_ty, counter_ptr);
-    }
+    increment_counter_with_state(state, specialized_fallback_counter_id);
     let generic_result =
         emit_unary_op_with_arg_and_values(op.kind, state, op.operand.as_ref(), &arg_values);
     state
@@ -1261,15 +1266,28 @@ fn emit_specialized_unary_op<'fb>(
     Some(state.fb().block_params(result_block)[0])
 }
 
-fn increment_counter_ptr_with_state<'fb, E>(
+fn increment_counter_with_state<'fb, E>(
     state: &mut impl OperationEmitState<'fb, E>,
-    counter_ptr: Option<*mut u64>,
+    counter_id: Option<CounterId>,
 ) {
-    let Some(counter_ptr) = counter_ptr else {
+    let Some(counter_id) = counter_id else {
         return;
     };
-    let ptr_ty = state.ctx().consts.ptr_ty;
-    emit_increment_counter_ptr(state.fb(), ptr_ty, counter_ptr);
+    let scalar_counter_slot =
+        super::scalar_counter_slot_for_id(state.ctx().counter_slots_by_id, counter_id)
+            .unwrap_or_else(|err| panic!("{err}"));
+    let scalar_counter_base_value =
+        state
+            .ctx()
+            .consts
+            .scalar_counter_base_value
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing scalar counter base for counter id {}",
+                    counter_id.0
+                )
+            });
+    emit_increment_counter_slot(state.fb(), scalar_counter_base_value, scalar_counter_slot);
 }
 
 fn emit_indexed_global_load_with_state<'fb>(
@@ -1285,16 +1303,16 @@ fn emit_indexed_global_load_with_state<'fb>(
     let load_global_slow_ref = state.ctx().load_global_slow_ref;
     let decref_ref = state.ctx().decref_ref;
     let thread_state_value = state.ctx().consts.thread_state_value;
-    let hit_counter_ptr = state
+    let hit_counter_id = state
         .ctx()
         .global_indexed_hit_counter_ids
         .get(&instr_id)
-        .map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
-    let fallback_counter_ptr = state
+        .copied();
+    let fallback_counter_id = state
         .ctx()
         .global_indexed_fallback_counter_ids
         .get(&instr_id)
-        .map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
+        .copied();
     let result_block = state.fb().create_block();
     state.fb().append_block_param(result_block, ptr_ty);
     let fallback_block = state.fb().create_block();
@@ -1320,7 +1338,7 @@ fn emit_indexed_global_load_with_state<'fb>(
 
     state.fb().switch_to_block(direct_block);
     let direct_value = state.fb().block_params(direct_block)[0];
-    increment_counter_ptr_with_state(state, hit_counter_ptr);
+    increment_counter_with_state(state, hit_counter_id);
     state
         .fb()
         .ins()
@@ -1331,7 +1349,7 @@ fn emit_indexed_global_load_with_state<'fb>(
         .jump(result_block, &[ir::BlockArg::Value(direct_value)]);
 
     state.fb().switch_to_block(fallback_block);
-    increment_counter_ptr_with_state(state, fallback_counter_ptr);
+    increment_counter_with_state(state, fallback_counter_id);
     let fallback_inst = state
         .fb()
         .ins()
@@ -1459,16 +1477,16 @@ fn emit_store<'fb>(
         let ptr_ty = state.ctx().consts.ptr_ty;
         let null_ptr = state.fb().ins().iconst(ptr_ty, 0);
         let store_global_indexed_ref = state.ctx().store_global_indexed_ref;
-        let hit_counter_ptr = state
+        let hit_counter_id = state
             .ctx()
             .global_indexed_hit_counter_ids
             .get(&instr_id)
-            .map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
-        let fallback_counter_ptr = state
+            .copied();
+        let fallback_counter_id = state
             .ctx()
             .global_indexed_fallback_counter_ids
             .get(&instr_id)
-            .map(|counter_id| state.ctx().counter_ptrs[counter_id.0]);
+            .copied();
         let result_block = state.fb().create_block();
         state.fb().append_block_param(result_block, ptr_ty);
         let fallback_block = state.fb().create_block();
@@ -1500,7 +1518,7 @@ fn emit_store<'fb>(
 
         state.fb().switch_to_block(direct_block);
         let direct_value = state.fb().block_params(direct_block)[0];
-        increment_counter_ptr_with_state(state, hit_counter_ptr);
+        increment_counter_with_state(state, hit_counter_id);
         state.release_arg_values(&arg_values);
         state
             .fb()
@@ -1512,7 +1530,7 @@ fn emit_store<'fb>(
             .jump(result_block, &[ir::BlockArg::Value(direct_value)]);
 
         state.fb().switch_to_block(fallback_block);
-        increment_counter_ptr_with_state(state, fallback_counter_ptr);
+        increment_counter_with_state(state, fallback_counter_id);
         let fallback_inst = state.fb().ins().call(
             func_ref,
             &[globals_obj, name_obj, slot_index, arg_values[0].0],

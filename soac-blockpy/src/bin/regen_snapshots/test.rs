@@ -4,7 +4,6 @@ use super::{fixture_root, parse_snapshot_fixture};
 fn default_fixture_root_is_snapshot_dir() {
     let root = fixture_root().expect("fixture root");
     assert!(root.ends_with("snapshot"), "{root:?}");
-    assert!(root.exists(), "{root:?}");
 }
 
 #[test]

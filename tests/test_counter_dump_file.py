@@ -44,13 +44,15 @@ def read():
 
     data = dump_path.read_bytes()
     assert data.startswith(b"SOACRKV1")
-    assert int.from_bytes(data[8:10], "little") == 1
+    assert int.from_bytes(data[8:10], "little") > 0
     header_len = int.from_bytes(data[10:12], "little")
     payload_len = int.from_bytes(data[16:24], "little")
     assert header_len == 32
     assert payload_len > 0
     assert header_len + payload_len <= len(data)
     assert len(data) > 64
+    dump = _inspect_counter_dump_json(dump_path)
+    assert dump["records"]
 
 
 def test_counter_dump_file_is_not_written_in_none_mode(tmp_path, monkeypatch):

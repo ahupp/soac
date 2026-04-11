@@ -1,3 +1,5 @@
+use std::cell::UnsafeCell;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CounterEntry<T> {
     pub value: T,
@@ -138,9 +140,138 @@ impl<const N: usize, T: Eq> Counter<N, T> {
     }
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TopValueCounterSlot {
+    occupied: u64,
+    value: u64,
+    approx_count: u64,
+    max_overcount: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TopValueCounter {
+    slots: [TopValueCounterSlot; 2],
+}
+
+impl Default for TopValueCounter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TopValueCounter {
+    pub const fn new() -> Self {
+        Self {
+            slots: [TopValueCounterSlot {
+                occupied: 0,
+                value: 0,
+                approx_count: 0,
+                max_overcount: 0,
+            }; 2],
+        }
+    }
+
+    pub const fn capacity(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.iter().all(|slot| slot.occupied == 0)
+    }
+
+    pub fn snapshot(&self) -> Vec<CounterEntry<u64>> {
+        let mut entries = self
+            .slots
+            .iter()
+            .filter(|slot| slot.occupied != 0)
+            .map(|slot| CounterEntry {
+                value: slot.value,
+                approx_count: slot.approx_count,
+                max_overcount: slot.max_overcount,
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|lhs, rhs| rhs.approx_count.cmp(&lhs.approx_count));
+        entries
+    }
+
+    fn min_slot_index(&self) -> Option<usize> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.occupied != 0)
+            .min_by_key(|(_, slot)| slot.approx_count)
+            .map(|(index, _)| index)
+    }
+
+    pub fn record(&mut self, value: u64) {
+        if let Some(slot) = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.occupied != 0 && slot.value == value)
+        {
+            slot.approx_count += 1;
+            return;
+        }
+
+        if let Some(empty_slot) = self.slots.iter_mut().find(|slot| slot.occupied == 0) {
+            *empty_slot = TopValueCounterSlot {
+                occupied: 1,
+                value,
+                approx_count: 1,
+                max_overcount: 0,
+            };
+            return;
+        }
+
+        let Some(index) = self.min_slot_index() else {
+            return;
+        };
+        let displaced_count = self.slots[index].approx_count;
+        self.slots[index] = TopValueCounterSlot {
+            occupied: 1,
+            value,
+            approx_count: displaced_count + 1,
+            max_overcount: displaced_count,
+        };
+    }
+}
+
+#[repr(transparent)]
+#[derive(Debug)]
+pub struct GilTopValueCounter {
+    inner: UnsafeCell<TopValueCounter>,
+}
+
+impl Default for GilTopValueCounter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GilTopValueCounter {
+    pub const fn new() -> Self {
+        Self {
+            inner: UnsafeCell::new(TopValueCounter::new()),
+        }
+    }
+
+    pub fn as_raw_ptr(&self) -> *mut TopValueCounter {
+        self.inner.get()
+    }
+
+    pub unsafe fn snapshot_with_gil(&self) -> Vec<CounterEntry<u64>> {
+        unsafe { (*self.inner.get()).snapshot() }
+    }
+}
+
+unsafe impl Send for GilTopValueCounter {}
+unsafe impl Sync for GilTopValueCounter {}
+
 #[cfg(test)]
 mod tests {
-    use super::{Counter, CounterEntry};
+    use super::{Counter, CounterEntry, TopValueCounter};
 
     #[test]
     fn records_distinct_values_until_capacity() {
@@ -255,5 +386,30 @@ mod tests {
         assert!(counter.is_empty());
         assert!(counter.entries().is_empty());
         assert_eq!(counter.approx_count(&"alpha"), None);
+    }
+
+    #[test]
+    fn top_value_counter_keeps_heavy_hitters() {
+        let mut counter = TopValueCounter::new();
+        for value in [11, 12, 11, 13, 11, 12, 12] {
+            counter.record(value);
+        }
+
+        let snapshot = counter.snapshot();
+        assert_eq!(snapshot.len(), 2);
+        assert!(snapshot.iter().any(|entry| {
+            entry.value == 11 && entry.approx_count == 3 && entry.max_overcount == 0
+        }));
+        assert!(snapshot.iter().any(|entry| {
+            entry.value == 12 && entry.approx_count == 4 && entry.max_overcount == 2
+        }));
+    }
+
+    #[test]
+    fn top_value_counter_zero_init_is_empty() {
+        let counter = TopValueCounter::new();
+        assert_eq!(counter.capacity(), 2);
+        assert!(counter.is_empty());
+        assert!(counter.snapshot().is_empty());
     }
 }

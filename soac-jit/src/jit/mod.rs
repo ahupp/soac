@@ -1,11 +1,12 @@
 use crate::SOAC_RUNTIME_CLIF;
+use crate::counter::TopValueCounter;
 use crate::counter_dump::{
     CollectedTypeKeyLayout, CounterDumpFile, CounterDumpTypeKey, collect_type_key_layouts,
     collect_type_table, read_branch_preferences_from_file,
     read_call_target_specializations_from_file, read_operator_specializations_from_file,
 };
 use crate::module_constants::{ModuleCodegenConstants, ModuleConstantId};
-use crate::module_type::SharedModuleState;
+use crate::module_type::{CounterRuntimeSlot, SharedModuleState, build_counter_storage_layout};
 use cranelift_codegen::cfg_printer::CFGPrinter;
 use cranelift_codegen::inline::{Inline, InlineCommand};
 use cranelift_codegen::ir;
@@ -15,7 +16,7 @@ use cranelift_codegen::settings::Configurable;
 use cranelift_control::ControlPlane;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch};
 use cranelift_jit::{ArenaMemoryProvider, JITBuilder, JITModule};
-use cranelift_module::{DataDescription, FuncId, Linkage, Module, ModuleReloc};
+use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module, ModuleReloc};
 use cranelift_reader::parse_functions;
 use pyo3::ffi;
 use soac_blockpy::block_py::{
@@ -81,6 +82,7 @@ pub use typed_value::{IntFacts, IntRange, IntWidth, SoacRepr, SoacValue};
 static RUNTIME_SUPPORT_LIBRARY: OnceLock<Result<RuntimeSupportLibrary, String>> = OnceLock::new();
 static NEXT_IMPORT_SPEC_ID: AtomicUsize = AtomicUsize::new(0);
 static NEXT_IMPORT_TRAMPOLINE_ID: AtomicUsize = AtomicUsize::new(0);
+static JIT_DATA_SYMBOLS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
 const JIT_ARENA_BYTES: usize = 256 * 1024 * 1024;
 const MISSING_PYTHON_EXCEPTION_TRAP: ir::TrapCode = ir::TrapCode::unwrap_user(1);
 
@@ -94,6 +96,199 @@ unsafe extern "C" {
 
 fn py_dealloc_symbol() -> *const u8 {
     _Py_Dealloc as *const u8
+}
+
+fn jit_data_symbols() -> &'static Mutex<HashMap<String, usize>> {
+    JIT_DATA_SYMBOLS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_jit_data_symbol(symbol: &str, ptr: *const u8) {
+    let mut symbols = jit_data_symbols()
+        .lock()
+        .expect("JIT data symbol registry lock poisoned");
+    symbols.insert(symbol.to_string(), ptr as usize);
+}
+
+fn lookup_registered_jit_data_symbol(symbol: &str) -> Option<*const u8> {
+    let symbols = jit_data_symbols()
+        .lock()
+        .expect("JIT data symbol registry lock poisoned");
+    symbols.get(symbol).copied().map(|ptr| ptr as *const u8)
+}
+
+fn module_constant_table_symbol(module: &BlockPyModule<CodegenModuleShape>) -> String {
+    format!(
+        "__soac_module_constants_{}",
+        module.module_name_gen.module_id()
+    )
+}
+
+fn module_constant_table_symbol_for_instance(
+    module: &BlockPyModule<CodegenModuleShape>,
+    instance_key: usize,
+) -> String {
+    format!("{}_{}", module_constant_table_symbol(module), instance_key)
+}
+
+fn scalar_counter_storage_symbol(module: &BlockPyModule<CodegenModuleShape>) -> String {
+    format!(
+        "__soac_scalar_counters_{}",
+        module.module_name_gen.module_id()
+    )
+}
+
+fn scalar_counter_storage_symbol_for_instance(
+    module: &BlockPyModule<CodegenModuleShape>,
+    instance_key: usize,
+) -> String {
+    format!("{}_{}", scalar_counter_storage_symbol(module), instance_key)
+}
+
+fn top_value_counter_storage_symbol(module: &BlockPyModule<CodegenModuleShape>) -> String {
+    format!(
+        "__soac_top_value_counters_{}",
+        module.module_name_gen.module_id()
+    )
+}
+
+fn top_value_counter_storage_symbol_for_instance(
+    module: &BlockPyModule<CodegenModuleShape>,
+    instance_key: usize,
+) -> String {
+    format!(
+        "{}_{}",
+        top_value_counter_storage_symbol(module),
+        instance_key
+    )
+}
+
+fn module_constant_table_bytes(module_constant_ptrs: &[*mut ffi::PyObject]) -> Box<[u8]> {
+    let mut bytes = Vec::with_capacity(module_constant_ptrs.len() * std::mem::size_of::<usize>());
+    for &ptr in module_constant_ptrs {
+        bytes.extend_from_slice(&(ptr as usize).to_ne_bytes());
+    }
+    bytes.into_boxed_slice()
+}
+
+fn define_module_constant_table_data_for_symbol(
+    jit_module: &mut JITModule,
+    symbol: &str,
+    module_constant_ptrs: &[*mut ffi::PyObject],
+) -> Result<DataId, String> {
+    let data_id = jit_module
+        .declare_data(symbol, Linkage::Local, false, false)
+        .map_err(|err| format!("failed to declare module constant table {symbol}: {err}"))?;
+    let mut data = DataDescription::new();
+    data.define(module_constant_table_bytes(module_constant_ptrs));
+    data.set_align(std::mem::size_of::<usize>() as u64);
+    jit_module
+        .define_data(data_id, &data)
+        .map_err(|err| format!("failed to define module constant table {symbol}: {err}"))?;
+    Ok(data_id)
+}
+
+fn define_module_constant_table_data(
+    jit_module: &mut JITModule,
+    module: &BlockPyModule<CodegenModuleShape>,
+    module_constant_ptrs: &[*mut ffi::PyObject],
+) -> Result<DataId, String> {
+    define_module_constant_table_data_for_symbol(
+        jit_module,
+        module_constant_table_symbol(module).as_str(),
+        module_constant_ptrs,
+    )
+}
+
+fn define_scalar_counter_storage_data_for_symbol(
+    jit_module: &mut JITModule,
+    symbol: &str,
+    scalar_counter_count: usize,
+) -> Result<DataId, String> {
+    let data_id = jit_module
+        .declare_data(symbol, Linkage::Local, true, false)
+        .map_err(|err| format!("failed to declare scalar counter storage {symbol}: {err}"))?;
+    let mut data = DataDescription::new();
+    data.define_zeroinit(
+        scalar_counter_count
+            .checked_mul(std::mem::size_of::<u64>())
+            .ok_or_else(|| {
+                format!("scalar counter storage size overflow for {symbol}: {scalar_counter_count}")
+            })?,
+    );
+    data.set_align(std::mem::align_of::<u64>() as u64);
+    jit_module
+        .define_data(data_id, &data)
+        .map_err(|err| format!("failed to define scalar counter storage {symbol}: {err}"))?;
+    Ok(data_id)
+}
+
+fn define_scalar_counter_storage_data(
+    jit_module: &mut JITModule,
+    module: &BlockPyModule<CodegenModuleShape>,
+    scalar_counter_count: usize,
+) -> Result<DataId, String> {
+    define_scalar_counter_storage_data_for_symbol(
+        jit_module,
+        scalar_counter_storage_symbol(module).as_str(),
+        scalar_counter_count,
+    )
+}
+
+fn declare_scalar_counter_storage_import(
+    jit_module: &mut JITModule,
+    symbol: &str,
+) -> Result<DataId, String> {
+    jit_module
+        .declare_data(symbol, Linkage::Import, true, false)
+        .map_err(|err| format!("failed to declare imported scalar counter storage {symbol}: {err}"))
+}
+
+fn define_top_value_counter_storage_data_for_symbol(
+    jit_module: &mut JITModule,
+    symbol: &str,
+    top_value_counter_count: usize,
+) -> Result<DataId, String> {
+    let data_id = jit_module
+        .declare_data(symbol, Linkage::Local, true, false)
+        .map_err(|err| format!("failed to declare top-value counter storage {symbol}: {err}"))?;
+    let mut data = DataDescription::new();
+    data.define_zeroinit(
+        top_value_counter_count
+            .checked_mul(std::mem::size_of::<TopValueCounter>())
+            .ok_or_else(|| {
+                format!(
+                    "top-value counter storage size overflow for {symbol}: {top_value_counter_count}"
+                )
+            })?,
+    );
+    data.set_align(std::mem::align_of::<TopValueCounter>() as u64);
+    jit_module
+        .define_data(data_id, &data)
+        .map_err(|err| format!("failed to define top-value counter storage {symbol}: {err}"))?;
+    Ok(data_id)
+}
+
+fn define_top_value_counter_storage_data(
+    jit_module: &mut JITModule,
+    module: &BlockPyModule<CodegenModuleShape>,
+    top_value_counter_count: usize,
+) -> Result<DataId, String> {
+    define_top_value_counter_storage_data_for_symbol(
+        jit_module,
+        top_value_counter_storage_symbol(module).as_str(),
+        top_value_counter_count,
+    )
+}
+
+fn declare_top_value_counter_storage_import(
+    jit_module: &mut JITModule,
+    symbol: &str,
+) -> Result<DataId, String> {
+    jit_module
+        .declare_data(symbol, Linkage::Import, true, false)
+        .map_err(|err| {
+            format!("failed to declare imported top-value counter storage {symbol}: {err}")
+        })
 }
 
 fn runtime_support_library() -> Result<&'static RuntimeSupportLibrary, String> {
@@ -556,7 +751,28 @@ pub(crate) struct ProcessJitEngine {
 struct ProcessJitState {
     jit_module: JITModule,
     direct_functions: HashMap<FunctionId, ProcessJitFunctionEntry>,
+    module_constant_tables: HashMap<usize, ModuleConstantTableBinding>,
+    scalar_counter_storage: HashMap<usize, ScalarCounterStorageBinding>,
+    top_value_counter_storage: HashMap<usize, TopValueCounterStorageBinding>,
     next_direct_symbol_id: u64,
+}
+
+#[derive(Clone, Copy)]
+struct ModuleConstantTableBinding {
+    data_id: DataId,
+    entry_count: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ScalarCounterStorageBinding {
+    data_id: DataId,
+    scalar_count: usize,
+}
+
+#[derive(Clone, Copy)]
+struct TopValueCounterStorageBinding {
+    data_id: DataId,
+    top_value_count: usize,
 }
 
 #[derive(Clone)]
@@ -618,8 +834,112 @@ impl ProcessJitState {
         Ok(Self {
             jit_module: new_jit_module(compile_session)?,
             direct_functions: HashMap::new(),
+            module_constant_tables: HashMap::new(),
+            scalar_counter_storage: HashMap::new(),
+            top_value_counter_storage: HashMap::new(),
             next_direct_symbol_id: 0,
         })
+    }
+
+    fn ensure_module_constant_table(
+        &mut self,
+        module: &BlockPyModule<CodegenModuleShape>,
+        module_constant_ptrs: &[*mut ffi::PyObject],
+        instance_key: usize,
+    ) -> Result<DataId, String> {
+        if let Some(binding) = self.module_constant_tables.get(&instance_key).copied() {
+            if binding.entry_count != module_constant_ptrs.len() {
+                return Err(format!(
+                    "module constant table length mismatch for module instance {}: {} != {}",
+                    instance_key,
+                    binding.entry_count,
+                    module_constant_ptrs.len()
+                ));
+            }
+            return Ok(binding.data_id);
+        }
+        let symbol = module_constant_table_symbol_for_instance(module, instance_key);
+        let data_id = define_module_constant_table_data_for_symbol(
+            &mut self.jit_module,
+            symbol.as_str(),
+            module_constant_ptrs,
+        )?;
+        self.module_constant_tables.insert(
+            instance_key,
+            ModuleConstantTableBinding {
+                data_id,
+                entry_count: module_constant_ptrs.len(),
+            },
+        );
+        Ok(data_id)
+    }
+
+    fn ensure_local_scalar_counter_storage(
+        &mut self,
+        module: &BlockPyModule<CodegenModuleShape>,
+        scalar_counter_count: usize,
+        instance_key: usize,
+    ) -> Result<Option<DataId>, String> {
+        if scalar_counter_count == 0 {
+            return Ok(None);
+        }
+        if let Some(binding) = self.scalar_counter_storage.get(&instance_key).copied() {
+            if binding.scalar_count != scalar_counter_count {
+                return Err(format!(
+                    "scalar counter storage length mismatch for module instance {}: {} != {}",
+                    instance_key, binding.scalar_count, scalar_counter_count
+                ));
+            }
+            return Ok(Some(binding.data_id));
+        }
+        let symbol = scalar_counter_storage_symbol_for_instance(module, instance_key);
+        let data_id = define_scalar_counter_storage_data_for_symbol(
+            &mut self.jit_module,
+            symbol.as_str(),
+            scalar_counter_count,
+        )?;
+        self.scalar_counter_storage.insert(
+            instance_key,
+            ScalarCounterStorageBinding {
+                data_id,
+                scalar_count: scalar_counter_count,
+            },
+        );
+        Ok(Some(data_id))
+    }
+
+    fn ensure_local_top_value_counter_storage(
+        &mut self,
+        module: &BlockPyModule<CodegenModuleShape>,
+        top_value_counter_count: usize,
+        instance_key: usize,
+    ) -> Result<Option<DataId>, String> {
+        if top_value_counter_count == 0 {
+            return Ok(None);
+        }
+        if let Some(binding) = self.top_value_counter_storage.get(&instance_key).copied() {
+            if binding.top_value_count != top_value_counter_count {
+                return Err(format!(
+                    "top-value counter storage length mismatch for module instance {}: {} != {}",
+                    instance_key, binding.top_value_count, top_value_counter_count
+                ));
+            }
+            return Ok(Some(binding.data_id));
+        }
+        let symbol = top_value_counter_storage_symbol_for_instance(module, instance_key);
+        let data_id = define_top_value_counter_storage_data_for_symbol(
+            &mut self.jit_module,
+            symbol.as_str(),
+            top_value_counter_count,
+        )?;
+        self.top_value_counter_storage.insert(
+            instance_key,
+            TopValueCounterStorageBinding {
+                data_id,
+                top_value_count: top_value_counter_count,
+            },
+        );
+        Ok(Some(data_id))
     }
 
     fn declare_direct_function(
@@ -929,8 +1249,15 @@ fn emit_optional_counter_increment_for_kind(
     instr_id: InstrId,
 ) {
     if let Some(counter_id) = counters.get(&instr_id).copied() {
-        let counter_ptr = ctx.counter_ptrs[counter_id.0];
-        emit_increment_counter_ptr(fb, ctx.consts.ptr_ty, counter_ptr);
+        let counter_slot = scalar_counter_slot_for_id(ctx.counter_slots_by_id, counter_id)
+            .unwrap_or_else(|err| panic!("{err}"));
+        let scalar_counter_base_value = ctx.consts.scalar_counter_base_value.unwrap_or_else(|| {
+            panic!(
+                "missing scalar counter base for counter id {}",
+                counter_id.0
+            )
+        });
+        emit_increment_counter_slot(fb, scalar_counter_base_value, counter_slot);
     }
 }
 
@@ -1469,6 +1796,9 @@ struct JitEmitConsts {
     i64_ty: ir::Type,
     i32_ty: ir::Type,
     function_data_value: ir::Value,
+    module_constant_table_value: ir::Value,
+    scalar_counter_base_value: Option<ir::Value>,
+    top_value_counter_base_value: Option<ir::Value>,
     thread_state_value: ir::Value,
     none_const: ir::Value,
     true_const: ir::Value,
@@ -1488,11 +1818,9 @@ struct JitEmitCtx<'mc> {
     function_id: FunctionId,
     shared_state: Option<&'mc crate::module_type::SharedModuleState>,
     module_constants: &'mc ModuleCodegenConstants,
-    module_constant_ptrs: &'mc [*mut ffi::PyObject],
     value_facts: &'mc FactStore,
     refcount_plan: &'mc FunctionRefcountPlan,
-    counter_ptrs: &'mc [*mut u64],
-    top_value_counter_ptrs: &'mc [ObjPtr],
+    counter_slots_by_id: &'mc [CounterRuntimeSlot],
     storage_layout: Option<StorageLayout>,
     function_runtime_data_layout: &'mc FunctionRuntimeDataLayout,
     incref_ref: ir::FuncRef,
@@ -3084,19 +3412,31 @@ fn emit_checked_owned_pyobject_call_value_with_cleanup(
 fn emit_owned_module_constant_from_parts(
     fb: &mut FunctionBuilder<'_>,
     constant_id: ModuleConstantId,
-    module_constant_ptrs: &[*mut ffi::PyObject],
+    module_constant_table_value: ir::Value,
     ptr_ty: ir::Type,
 ) -> ir::Value {
-    let constant_ptr = module_constant_ptrs
-        .get(constant_id.0)
-        .copied()
+    let byte_offset = constant_id
+        .0
+        .checked_mul(std::mem::size_of::<*mut ffi::PyObject>())
         .unwrap_or_else(|| {
             panic!(
-                "missing module constant pointer for constant id {}",
+                "module constant byte offset overflow for constant id {}",
                 constant_id.0
             )
         });
-    fb.ins().iconst(ptr_ty, constant_ptr as i64)
+    if let Ok(offset) = i32::try_from(byte_offset) {
+        fb.ins().load(
+            ptr_ty,
+            ir::MemFlags::trusted(),
+            module_constant_table_value,
+            offset,
+        )
+    } else {
+        let slot_addr = fb
+            .ins()
+            .iadd_imm(module_constant_table_value, byte_offset as i64);
+        fb.ins().load(ptr_ty, ir::MemFlags::trusted(), slot_addr, 0)
+    }
 }
 
 fn emit_owned_module_constant(
@@ -3107,7 +3447,7 @@ fn emit_owned_module_constant(
     emit_owned_module_constant_from_parts(
         fb,
         constant_id,
-        ctx.module_constant_ptrs,
+        ctx.consts.module_constant_table_value,
         ctx.consts.ptr_ty,
     )
 }
@@ -3118,14 +3458,58 @@ fn placeholder_module_constant_ptrs(count: usize) -> Vec<*mut ffi::PyObject> {
         .collect()
 }
 
-fn placeholder_counter_ptrs(count: usize) -> Vec<*mut u64> {
-    (0..count)
-        .map(|index| (0x2000usize + index * 0x10) as *mut u64)
-        .collect()
+fn scalar_counter_slot_for_id(
+    counter_slots_by_id: &[CounterRuntimeSlot],
+    counter_id: CounterId,
+) -> Result<usize, String> {
+    match counter_slots_by_id.get(counter_id.0).copied() {
+        Some(CounterRuntimeSlot::Scalar(slot)) => Ok(slot),
+        Some(CounterRuntimeSlot::TopValues(_)) => Err(format!(
+            "counter id {} uses top-value storage where a scalar counter was required",
+            counter_id.0
+        )),
+        None => Err(format!(
+            "missing scalar counter slot for counter id {}",
+            counter_id.0
+        )),
+    }
 }
 
-fn placeholder_top_value_counter_ptrs(count: usize) -> Vec<ObjPtr> {
-    vec![std::ptr::null_mut(); count]
+pub(super) fn top_value_counter_slot_for_id(
+    counter_slots_by_id: &[CounterRuntimeSlot],
+    counter_id: CounterId,
+) -> Result<usize, String> {
+    match counter_slots_by_id.get(counter_id.0).copied() {
+        Some(CounterRuntimeSlot::TopValues(slot)) => Ok(slot),
+        Some(CounterRuntimeSlot::Scalar(_)) => Err(format!(
+            "counter id {} uses scalar storage where a top-value counter was required",
+            counter_id.0
+        )),
+        None => Err(format!(
+            "missing top-value counter slot for counter id {}",
+            counter_id.0
+        )),
+    }
+}
+
+fn scalar_counter_byte_offset(counter_slot: usize) -> i64 {
+    counter_slot
+        .checked_mul(std::mem::size_of::<u64>())
+        .and_then(|offset| i64::try_from(offset).ok())
+        .unwrap_or_else(|| panic!("scalar counter byte offset overflow for slot {counter_slot}"))
+}
+
+fn scalar_counter_addr(
+    fb: &mut FunctionBuilder<'_>,
+    scalar_counter_base_value: ir::Value,
+    counter_slot: usize,
+) -> (ir::Value, i32) {
+    let byte_offset = scalar_counter_byte_offset(counter_slot);
+    if let Ok(offset) = i32::try_from(byte_offset) {
+        (scalar_counter_base_value, offset)
+    } else {
+        (fb.ins().iadd_imm(scalar_counter_base_value, byte_offset), 0)
+    }
 }
 
 fn emit_increment_counter(
@@ -3133,36 +3517,77 @@ fn emit_increment_counter(
     counter_id: CounterId,
     ctx: &JitEmitCtx<'_>,
 ) -> ir::Value {
-    let counter_ptr = ctx
-        .counter_ptrs
-        .get(counter_id.0)
-        .copied()
-        .unwrap_or_else(|| panic!("missing counter pointer for counter id {}", counter_id.0));
-    let counter_addr = fb.ins().iconst(ctx.consts.ptr_ty, counter_ptr as i64);
-    let old_value = fb
-        .ins()
-        .load(ir::types::I64, ir::MemFlags::trusted(), counter_addr, 0);
+    let counter_slot = scalar_counter_slot_for_id(ctx.counter_slots_by_id, counter_id)
+        .unwrap_or_else(|err| panic!("{err}"));
+    let scalar_counter_base_value = ctx.consts.scalar_counter_base_value.unwrap_or_else(|| {
+        panic!(
+            "missing scalar counter base for counter id {}",
+            counter_id.0
+        )
+    });
+    let (counter_addr, counter_offset) =
+        scalar_counter_addr(fb, scalar_counter_base_value, counter_slot);
+    let old_value = fb.ins().load(
+        ir::types::I64,
+        ir::MemFlags::trusted(),
+        counter_addr,
+        counter_offset,
+    );
     let new_value = fb.ins().iadd_imm(old_value, 1);
-    fb.ins()
-        .store(ir::MemFlags::trusted(), new_value, counter_addr, 0);
+    fb.ins().store(
+        ir::MemFlags::trusted(),
+        new_value,
+        counter_addr,
+        counter_offset,
+    );
     // TODO: Split codegen instructions into value-producing vs non-value-producing ops
     // and elide retain/release work when a statement result is not consumed.
     fb.ins().call(ctx.incref_ref, &[ctx.consts.none_const]);
     ctx.consts.none_const
 }
 
-pub(super) fn emit_increment_counter_ptr(
+pub(super) fn emit_increment_counter_slot(
     fb: &mut FunctionBuilder<'_>,
-    ptr_ty: ir::Type,
-    counter_ptr: *mut u64,
+    scalar_counter_base_value: ir::Value,
+    counter_slot: usize,
 ) {
-    let counter_addr = fb.ins().iconst(ptr_ty, counter_ptr as i64);
-    let old_value = fb
-        .ins()
-        .load(ir::types::I64, ir::MemFlags::trusted(), counter_addr, 0);
+    let (counter_addr, counter_offset) =
+        scalar_counter_addr(fb, scalar_counter_base_value, counter_slot);
+    let old_value = fb.ins().load(
+        ir::types::I64,
+        ir::MemFlags::trusted(),
+        counter_addr,
+        counter_offset,
+    );
     let new_value = fb.ins().iadd_imm(old_value, 1);
+    fb.ins().store(
+        ir::MemFlags::trusted(),
+        new_value,
+        counter_addr,
+        counter_offset,
+    );
+}
+
+fn top_value_counter_byte_offset(counter_slot: usize) -> i64 {
+    counter_slot
+        .checked_mul(std::mem::size_of::<TopValueCounter>())
+        .and_then(|offset| i64::try_from(offset).ok())
+        .unwrap_or_else(|| panic!("top-value counter byte offset overflow for slot {counter_slot}"))
+}
+
+pub(super) fn emit_record_top_value_counter_slot(
+    fb: &mut FunctionBuilder<'_>,
+    top_value_counter_base_value: ir::Value,
+    counter_slot: usize,
+    observed_value: ir::Value,
+    record_top_value_sample_ref: ir::FuncRef,
+) {
+    let counter_addr = fb.ins().iadd_imm(
+        top_value_counter_base_value,
+        top_value_counter_byte_offset(counter_slot),
+    );
     fb.ins()
-        .store(ir::MemFlags::trusted(), new_value, counter_addr, 0);
+        .call(record_top_value_sample_ref, &[counter_addr, observed_value]);
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3210,23 +3635,14 @@ fn lookup_runtime_counter_id(
     })
 }
 
-fn counter_ptr_for_id(
-    counter_ptrs: &[*mut u64],
-    counter_id: CounterId,
-) -> Result<*mut u64, String> {
-    counter_ptrs
-        .get(counter_id.0)
-        .copied()
-        .ok_or_else(|| format!("missing counter pointer for counter id {}", counter_id.0))
-}
-
 fn build_counted_runtime_refcount_helper(
     compile_session: &crate::session::CompileSession,
     jit_module: &mut JITModule,
     symbol_name: &str,
     cache_name: &str,
     runtime_import: &'static ImportSpec,
-    counter_ptr: *mut u64,
+    scalar_counter_data_id: DataId,
+    counter_slot: usize,
 ) -> Result<FuncId, String> {
     let ptr_ty = jit_module.target_config().pointer_type();
     let sig = lower_static_signature(jit_module, runtime_import.signature);
@@ -3241,13 +3657,23 @@ fn build_counted_runtime_refcount_helper(
         fb.append_block_params_for_function_params(entry_block);
         fb.switch_to_block(entry_block);
         let call_args = fb.block_params(entry_block).to_vec();
-        let counter_addr = fb.ins().iconst(ptr_ty, counter_ptr as i64);
-        let old_value = fb
-            .ins()
-            .load(ir::types::I64, ir::MemFlags::trusted(), counter_addr, 0);
+        let counter_data = jit_module.declare_data_in_func(scalar_counter_data_id, &mut fb.func);
+        let scalar_counter_base_value = fb.ins().global_value(ptr_ty, counter_data);
+        let (counter_addr, counter_offset) =
+            scalar_counter_addr(&mut fb, scalar_counter_base_value, counter_slot);
+        let old_value = fb.ins().load(
+            ir::types::I64,
+            ir::MemFlags::trusted(),
+            counter_addr,
+            counter_offset,
+        );
         let new_value = fb.ins().iadd_imm(old_value, 1);
-        fb.ins()
-            .store(ir::MemFlags::trusted(), new_value, counter_addr, 0);
+        fb.ins().store(
+            ir::MemFlags::trusted(),
+            new_value,
+            counter_addr,
+            counter_offset,
+        );
 
         let mut module_imports = ModuleFuncImports::new();
         let mut func_imports = FuncBuildImports::new(&mut module_imports);
@@ -3265,7 +3691,7 @@ fn build_counted_runtime_refcount_helper(
         &mut ctx,
         cache_name,
         CraneliftCompileCachePolicy::Disabled {
-            reason: "counted refcount helper embeds a per-run counter pointer",
+            reason: "counted refcount helper depends on module-specific scalar counter storage",
         },
         "failed to define counted runtime refcount helper",
     )?;
@@ -3278,13 +3704,20 @@ fn build_counted_runtime_refcount_helpers(
     jit_module: &mut JITModule,
     function: &BlockPyFunction<CodegenModuleShape>,
     counter_defs: &[CounterDef],
-    counter_ptrs: &[*mut u64],
+    counter_slots_by_id: &[CounterRuntimeSlot],
+    scalar_counter_data_id: Option<DataId>,
     symbol_scope: Option<&str>,
 ) -> Result<CountedRefcountHelpers, String> {
     let incref_func_id =
         lookup_runtime_counter_id(counter_defs, function.function_id, "runtime_incref")
             .map(|counter_id| {
-                let counter_ptr = counter_ptr_for_id(counter_ptrs, counter_id)?;
+                let counter_slot = scalar_counter_slot_for_id(counter_slots_by_id, counter_id)?;
+                let scalar_counter_data_id = scalar_counter_data_id.ok_or_else(|| {
+                    format!(
+                        "missing scalar counter storage for runtime incref counter {}",
+                        counter_id.0
+                    )
+                })?;
                 let cache_name = format!("py:rc:incref:{}", function.names.qualname);
                 let symbol = scoped_jit_symbol(&cache_name, symbol_scope);
                 build_counted_runtime_refcount_helper(
@@ -3293,7 +3726,8 @@ fn build_counted_runtime_refcount_helpers(
                     &symbol,
                     &cache_name,
                     &DP_JIT_INCREF_IMPORT,
-                    counter_ptr,
+                    scalar_counter_data_id,
+                    counter_slot,
                 )
             })
             .transpose()?;
@@ -3301,7 +3735,13 @@ fn build_counted_runtime_refcount_helpers(
     let decref_func_id =
         lookup_runtime_counter_id(counter_defs, function.function_id, "runtime_decref")
             .map(|counter_id| {
-                let counter_ptr = counter_ptr_for_id(counter_ptrs, counter_id)?;
+                let counter_slot = scalar_counter_slot_for_id(counter_slots_by_id, counter_id)?;
+                let scalar_counter_data_id = scalar_counter_data_id.ok_or_else(|| {
+                    format!(
+                        "missing scalar counter storage for runtime decref counter {}",
+                        counter_id.0
+                    )
+                })?;
                 let cache_name = format!("py:rc:decref:{}", function.names.qualname);
                 let symbol = scoped_jit_symbol(&cache_name, symbol_scope);
                 build_counted_runtime_refcount_helper(
@@ -3310,7 +3750,8 @@ fn build_counted_runtime_refcount_helpers(
                     &symbol,
                     &cache_name,
                     &DP_JIT_DECREF_IMPORT,
-                    counter_ptr,
+                    scalar_counter_data_id,
+                    counter_slot,
                 )
             })
             .transpose()?;
@@ -5196,16 +5637,21 @@ fn emit_record_top_value_sample(
     observed_value: ir::Value,
     ctx: &JitEmitCtx<'_>,
 ) {
-    let Some(&counter_ptr) = ctx.top_value_counter_ptrs.get(counter_id.0) else {
-        return;
-    };
-    if counter_ptr.is_null() {
-        return;
-    }
-    let counter_value = fb.ins().iconst(ctx.consts.ptr_ty, counter_ptr as i64);
-    fb.ins().call(
+    let counter_slot = top_value_counter_slot_for_id(ctx.counter_slots_by_id, counter_id)
+        .unwrap_or_else(|err| panic!("{err}"));
+    let top_value_counter_base_value =
+        ctx.consts.top_value_counter_base_value.unwrap_or_else(|| {
+            panic!(
+                "missing top-value counter base for counter id {}",
+                counter_id.0
+            )
+        });
+    emit_record_top_value_counter_slot(
+        fb,
+        top_value_counter_base_value,
+        counter_slot,
+        observed_value,
         ctx.record_top_value_sample_ref,
-        &[counter_value, observed_value],
     );
 }
 
@@ -7953,6 +8399,7 @@ fn new_jit_builder() -> Result<JITBuilder, String> {
         "_PyDict_IndexedValueTombstone",
         std::ptr::addr_of_mut!(_PyDict_IndexedValueTombstone).cast::<u8>(),
     );
+    builder.symbol_lookup_fn(Box::new(lookup_registered_jit_data_symbol));
     register_specialized_jit_symbols(&mut builder);
     Ok(builder)
 }
@@ -8116,7 +8563,6 @@ impl ProcessJitEngine {
         module_constants: &ModuleCodegenConstants,
         counter_defs: &[CounterDef],
         module_constant_ptrs: &[*mut ffi::PyObject],
-        counter_ptrs: &[*mut u64],
         direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
     ) -> Result<DirectFunctionCompileResult, String> {
         let batch_functions = collect_process_jit_batch_functions(
@@ -8160,35 +8606,97 @@ impl ProcessJitEngine {
                 placeholder_blocks.as_slice()
             };
             let owned_module_constant_ptrs;
-            let owned_counter_ptrs;
+            let owned_counter_slots_by_id;
             let (
                 function_module,
                 function_module_constants,
                 function_counter_defs,
                 function_module_constant_ptrs,
-                function_counter_ptrs,
+                function_counter_slots_by_id,
+                function_scalar_counter_data_id,
+                function_top_value_counter_data_id,
                 function_direct_call_resolver,
+                function_module_constant_table_instance_key,
             ) = if let Some(shared_state) = batch_function.source.shared_state() {
                 owned_module_constant_ptrs = shared_state.module_constant_ptrs();
-                owned_counter_ptrs = shared_state.counter_ptrs();
+                let instance_key = shared_state.storage_instance_key();
+                let scalar_counter_symbol = scalar_counter_storage_symbol_for_instance(
+                    &shared_state.lowered_module,
+                    instance_key,
+                );
+                let scalar_counter_base_ptr = shared_state.scalar_counter_values_ptr();
+                let scalar_counter_data_id = if scalar_counter_base_ptr.is_null() {
+                    None
+                } else {
+                    register_jit_data_symbol(
+                        scalar_counter_symbol.as_str(),
+                        scalar_counter_base_ptr.cast::<u8>(),
+                    );
+                    Some(declare_scalar_counter_storage_import(
+                        &mut state.jit_module,
+                        scalar_counter_symbol.as_str(),
+                    )?)
+                };
+                let top_value_counter_symbol = top_value_counter_storage_symbol_for_instance(
+                    &shared_state.lowered_module,
+                    instance_key,
+                );
+                let top_value_counter_base_ptr = shared_state.top_value_counter_values_ptr();
+                let top_value_counter_data_id = if top_value_counter_base_ptr.is_null() {
+                    None
+                } else {
+                    register_jit_data_symbol(
+                        top_value_counter_symbol.as_str(),
+                        top_value_counter_base_ptr.cast::<u8>(),
+                    );
+                    Some(declare_top_value_counter_storage_import(
+                        &mut state.jit_module,
+                        top_value_counter_symbol.as_str(),
+                    )?)
+                };
                 (
                     &shared_state.lowered_module,
                     &shared_state.codegen_constants,
                     shared_state.lowered_module.counter_defs.as_slice(),
                     owned_module_constant_ptrs.as_slice(),
-                    owned_counter_ptrs.as_slice(),
+                    shared_state.counter_slots_by_id(),
+                    scalar_counter_data_id,
+                    top_value_counter_data_id,
                     Some(shared_state),
+                    instance_key,
                 )
             } else {
+                let (counter_slots_by_id, scalar_counter_count, top_value_count) =
+                    build_counter_storage_layout(counter_defs)?;
+                let instance_key = module as *const BlockPyModule<CodegenModuleShape> as usize;
+                let scalar_counter_data_id = state.ensure_local_scalar_counter_storage(
+                    module,
+                    scalar_counter_count,
+                    instance_key,
+                )?;
+                let top_value_counter_data_id = state.ensure_local_top_value_counter_storage(
+                    module,
+                    top_value_count,
+                    instance_key,
+                )?;
+                owned_counter_slots_by_id = counter_slots_by_id;
                 (
                     module,
                     module_constants,
                     counter_defs,
                     module_constant_ptrs,
-                    counter_ptrs,
+                    owned_counter_slots_by_id.as_ref(),
+                    scalar_counter_data_id,
+                    top_value_counter_data_id,
                     None,
+                    instance_key,
                 )
             };
+            let function_module_constant_table_data_id = state.ensure_module_constant_table(
+                function_module,
+                function_module_constant_ptrs,
+                function_module_constant_table_instance_key,
+            )?;
             let built = build_cranelift_run_bb_specialized_function(
                 &mut state.jit_module,
                 function_blocks,
@@ -8196,8 +8704,10 @@ impl ProcessJitEngine {
                 function,
                 function_module_constants,
                 function_counter_defs,
-                function_module_constant_ptrs,
-                function_counter_ptrs,
+                function_module_constant_table_data_id,
+                function_counter_slots_by_id,
+                function_scalar_counter_data_id,
+                function_top_value_counter_data_id,
                 session.as_ref(),
                 function_direct_call_resolver,
                 None,
@@ -8223,7 +8733,7 @@ impl ProcessJitEngine {
                     function.params.len()
                 ),
                 CraneliftCompileCachePolicy::Disabled {
-                    reason: "direct function body embeds per-run module constants and counter pointers",
+                    reason: "direct function body embeds per-run specialization addresses",
                 },
                 "failed to define specialized jit run_bb function",
             )
@@ -9175,8 +9685,10 @@ fn build_cranelift_run_bb_specialized_function(
     function: &BlockPyFunction<CodegenModuleShape>,
     module_constants: &ModuleCodegenConstants,
     counter_defs: &[CounterDef],
-    module_constant_ptrs: &[*mut ffi::PyObject],
-    counter_ptrs: &[*mut u64],
+    module_constant_table_data_id: DataId,
+    counter_slots_by_id: &[CounterRuntimeSlot],
+    scalar_counter_data_id: Option<DataId>,
+    top_value_counter_data_id: Option<DataId>,
     compile_session: &crate::session::CompileSession,
     direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
     symbol_scope: Option<&str>,
@@ -9193,19 +9705,12 @@ fn build_cranelift_run_bb_specialized_function(
             block_count
         ));
     }
-    if module_constant_ptrs.len() != module_constants.len() {
-        return Err(format!(
-            "specialized JIT module constant pointer length mismatch: {} != {}",
-            module_constant_ptrs.len(),
-            module_constants.len()
-        ));
-    }
     for block in &function.blocks {
         for expr in &block.body {
             if let InstrCodegen::IncrementCounter(op) = expr {
-                if op.counter_id.0 >= counter_ptrs.len() {
+                if scalar_counter_slot_for_id(counter_slots_by_id, op.counter_id).is_err() {
                     return Err(format!(
-                        "specialized JIT counter pointer length mismatch: missing counter id {} for function {}",
+                        "specialized JIT scalar counter layout is missing counter id {} for function {}",
                         op.counter_id.0, function.names.qualname
                     ));
                 }
@@ -9259,6 +9764,27 @@ fn build_cranelift_run_bb_specialized_function(
     );
     let branch_outcome_counter_ids =
         collect_runtime_counter_ids_by_kind(counter_defs, function.function_id, "branch_outcomes");
+    for counter_id in call_target_counter_ids
+        .values()
+        .chain(operator_shape_counter_ids.values())
+        .chain(branch_outcome_counter_ids.values())
+    {
+        top_value_counter_slot_for_id(counter_slots_by_id, *counter_id).map_err(|_| {
+            format!(
+                "specialized JIT top-value counter layout is missing counter id {} for function {}",
+                counter_id.0, function.names.qualname
+            )
+        })?;
+    }
+    let requires_top_value_counters = !call_target_counter_ids.is_empty()
+        || !operator_shape_counter_ids.is_empty()
+        || !branch_outcome_counter_ids.is_empty();
+    if requires_top_value_counters && top_value_counter_data_id.is_none() {
+        return Err(format!(
+            "missing top-value counter storage for function {}",
+            function.names.qualname
+        ));
+    }
     let call_target_specializations = match direct_call_resolver {
         Some(shared_state) => load_call_target_specializations(
             shared_state.module_name.as_str(),
@@ -9322,10 +9848,6 @@ fn build_cranelift_run_bb_specialized_function(
         };
         direct_call_target_functions.insert(function_id, target_function);
     }
-    let top_value_counter_ptrs = direct_call_resolver
-        .map(|shared_state| shared_state.top_value_counter_ptrs())
-        .unwrap_or_else(|| placeholder_top_value_counter_ptrs(counter_ptrs.len()));
-
     let ptr_ty = jit_module.target_config().pointer_type();
     let i64_ty = ir::types::I64;
     let mut module_imports = ModuleFuncImports::new();
@@ -9348,7 +9870,8 @@ fn build_cranelift_run_bb_specialized_function(
         jit_module,
         function,
         counter_defs,
-        counter_ptrs,
+        counter_slots_by_id,
+        scalar_counter_data_id,
         symbol_scope,
     )?;
 
@@ -9612,11 +10135,22 @@ fn build_cranelift_run_bb_specialized_function(
             &mut fb.func,
             &SOAC_RUNTIME_SET_RAISED_EXCEPTION_IMPORT,
         );
+        let module_constant_table_data =
+            jit_module.declare_data_in_func(module_constant_table_data_id, &mut fb.func);
+        let module_constant_table_value = fb.ins().global_value(ptr_ty, module_constant_table_data);
+        let scalar_counter_base_value = scalar_counter_data_id.map(|data_id| {
+            let counter_data = jit_module.declare_data_in_func(data_id, &mut fb.func);
+            fb.ins().global_value(ptr_ty, counter_data)
+        });
+        let top_value_counter_base_value = top_value_counter_data_id.map(|data_id| {
+            let counter_data = jit_module.declare_data_in_func(data_id, &mut fb.func);
+            fb.ins().global_value(ptr_ty, counter_data)
+        });
         let fallthrough_abrupt_kind_const = stack_slots.has_try_abrupt_kind_name().then(|| {
             emit_owned_module_constant_from_parts(
                 &mut fb,
                 module_constants.require_int_constant_id(abrupt_kind_tag(AbruptKind::Fallthrough)),
-                module_constant_ptrs,
+                module_constant_table_value,
                 ptr_ty,
             )
         });
@@ -9822,31 +10356,31 @@ fn build_cranelift_run_bb_specialized_function(
             let none_const = emit_owned_module_constant_from_parts(
                 &mut fb,
                 none_constant_id,
-                module_constant_ptrs,
+                module_constant_table_value,
                 ptr_ty,
             );
             let true_const = emit_owned_module_constant_from_parts(
                 &mut fb,
                 true_constant_id,
-                module_constant_ptrs,
+                module_constant_table_value,
                 ptr_ty,
             );
             let false_const = emit_owned_module_constant_from_parts(
                 &mut fb,
                 false_constant_id,
-                module_constant_ptrs,
+                module_constant_table_value,
                 ptr_ty,
             );
             let deleted_const = emit_owned_module_constant_from_parts(
                 &mut fb,
                 deleted_constant_id,
-                module_constant_ptrs,
+                module_constant_table_value,
                 ptr_ty,
             );
             let empty_tuple_const = emit_owned_module_constant_from_parts(
                 &mut fb,
                 empty_tuple_constant_id,
-                module_constant_ptrs,
+                module_constant_table_value,
                 ptr_ty,
             );
             let fast_step_null_block =
@@ -9857,11 +10391,9 @@ fn build_cranelift_run_bb_specialized_function(
                 function_id: function.function_id,
                 shared_state: direct_call_resolver,
                 module_constants,
-                module_constant_ptrs,
                 value_facts: &value_facts,
                 refcount_plan: &refcount_plan,
-                counter_ptrs,
-                top_value_counter_ptrs: &top_value_counter_ptrs,
+                counter_slots_by_id,
                 storage_layout: function.storage_layout().clone(),
                 function_runtime_data_layout: &function_runtime_data_layout,
                 incref_ref,
@@ -9877,6 +10409,9 @@ fn build_cranelift_run_bb_specialized_function(
                     i64_ty,
                     i32_ty: ir::types::I32,
                     function_data_value,
+                    module_constant_table_value,
+                    scalar_counter_base_value,
+                    top_value_counter_base_value,
                     thread_state_value,
                     none_const,
                     true_const,
@@ -9998,7 +10533,7 @@ fn build_cranelift_run_bb_specialized_function(
             let none_const = emit_owned_module_constant_from_parts(
                 &mut fb,
                 none_constant_id,
-                module_constant_ptrs,
+                module_constant_table_value,
                 ptr_ty,
             );
             let dispatch_step_null_args = Vec::new();
@@ -10271,25 +10806,40 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
     let module_constant_ptrs = runtime_state
         .map(SharedModuleState::module_constant_ptrs)
         .unwrap_or_else(|| placeholder_module_constant_ptrs(module_constants.len()));
-    let counter_ptrs = runtime_state
-        .map(SharedModuleState::counter_ptrs)
-        .unwrap_or_else(|| {
-            placeholder_counter_ptrs(
-                function
-                    .blocks
-                    .iter()
-                    .flat_map(|block| block.body.iter())
-                    .filter_map(|expr| match expr {
-                        InstrCodegen::IncrementCounter(op) => Some(op.counter_id.0),
-                        _ => None,
-                    })
-                    .max()
-                    .map_or(0, |max_counter_id| max_counter_id + 1),
-            )
-        });
     let counter_defs = runtime_state
         .map(|state| state.lowered_module.counter_defs.as_slice())
-        .unwrap_or(&[]);
+        .unwrap_or(module.counter_defs.as_slice());
+    let (counter_slots_by_id, scalar_counter_count, top_value_counter_count) =
+        build_counter_storage_layout(counter_defs)?;
+    let module_constant_table_data_id =
+        define_module_constant_table_data(&mut jit_module, module, &module_constant_ptrs)?;
+    let scalar_counter_data_id = if scalar_counter_count == 0 {
+        None
+    } else {
+        Some(define_scalar_counter_storage_data(
+            &mut jit_module,
+            module,
+            scalar_counter_count,
+        )?)
+    };
+    let top_value_counter_data_id = if top_value_counter_count == 0 {
+        None
+    } else if let Some(shared_state) = runtime_state {
+        Some(declare_top_value_counter_storage_import(
+            &mut jit_module,
+            top_value_counter_storage_symbol_for_instance(
+                &shared_state.lowered_module,
+                shared_state.storage_instance_key(),
+            )
+            .as_str(),
+        )?)
+    } else {
+        Some(define_top_value_counter_storage_data(
+            &mut jit_module,
+            module,
+            top_value_counter_count,
+        )?)
+    };
     let built = build_cranelift_run_bb_specialized_function(
         &mut jit_module,
         blocks,
@@ -10297,8 +10847,10 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
         function,
         module_constants,
         counter_defs,
-        &module_constant_ptrs,
-        &counter_ptrs,
+        module_constant_table_data_id,
+        counter_slots_by_id.as_ref(),
+        scalar_counter_data_id,
+        top_value_counter_data_id,
         compile_session,
         runtime_state,
         None,
@@ -10378,7 +10930,6 @@ pub(crate) unsafe fn compile_cranelift_run_bb_specialized_cached(
     module_constants: &ModuleCodegenConstants,
     counter_defs: &[CounterDef],
     module_constant_ptrs: &[*mut ffi::PyObject],
-    counter_ptrs: &[*mut u64],
     direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
 ) -> Result<DirectFunctionCompileResult, String> {
     unsafe {
@@ -10390,7 +10941,6 @@ pub(crate) unsafe fn compile_cranelift_run_bb_specialized_cached(
             module_constants,
             counter_defs,
             module_constant_ptrs,
-            counter_ptrs,
             direct_call_resolver,
         )
     }

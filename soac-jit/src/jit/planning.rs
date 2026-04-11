@@ -602,7 +602,8 @@ def f(flag):
         assert!(
             non_entry_x_bindings
                 .iter()
-                .all(|binding| binding.provenance == ParamProvenance::ForwardedLocal(binding.location)),
+                .all(|binding| binding.provenance
+                    == ParamProvenance::ForwardedLocal(binding.location)),
             "maybe-unbound live-ins should preserve forwarded-local provenance: {non_entry_x_bindings:?}"
         );
     }

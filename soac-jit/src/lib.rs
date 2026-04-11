@@ -1303,7 +1303,6 @@ unsafe fn ensure_clif_vectorcall_compiled(
             Ok(None) => {
                 let block_ptrs = vec![ptr::null_mut::<c_void>(); function.blocks.len()];
                 let module_constant_ptrs = data.module_state.module_constant_ptrs();
-                let counter_ptrs = data.module_state.counter_ptrs();
                 let compile_result = jit::compile_cranelift_run_bb_specialized_cached(
                     &data.compile_session,
                     block_ptrs.as_slice(),
@@ -1312,7 +1311,6 @@ unsafe fn ensure_clif_vectorcall_compiled(
                     &data.module_state.codegen_constants,
                     &data.module_state.lowered_module.counter_defs,
                     &module_constant_ptrs,
-                    &counter_ptrs,
                     Some(data.module_state.as_ref()),
                 );
                 match compile_result {

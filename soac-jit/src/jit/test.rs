@@ -2,10 +2,11 @@ use super::*;
 use soac_blockpy::block_py::{
     BinOp, BinOpKind, BlockLabel, BlockParamRole, BlockPyFunction, BlockPyModule, BlockTerm, Call,
     CallArgKeyword, CallArgPositional, CallDirect, CellLocation, ChildVisitable, ClosureInit,
-    ClosureSlot, CodegenBlock, CounterSite, Del, DelItem, FunctionId, FunctionName, HasMeta,
-    HasSemanticInstrId, InstrCodegen, InstrResolved, Literal, LiteralValue, Load, LocalLocation,
-    Meta, ModuleNameGen, NameLocation, NumberLiteral, NumberLiteralValue, Param, ParamKind,
-    ParamSpec, ResolvedName, StorageLayout, Store, StringLiteral, Visit, VisitMut, WithMeta,
+    ClosureSlot, CodegenBlock, CounterDef, CounterSite, Del, DelItem, FunctionId, FunctionName,
+    HasMeta, HasSemanticInstrId, InstrCodegen, InstrResolved, Literal, LiteralValue, Load,
+    LocalLocation, Meta, ModuleNameGen, NameLocation, NumberLiteral, NumberLiteralValue, Param,
+    ParamKind, ParamSpec, ResolvedName, StorageLayout, Store, StringLiteral, Visit, VisitMut,
+    WithMeta,
 };
 use soac_blockpy::passes::{
     CodegenModuleShape, instrument_bb_module_with_block_entry_counters,
@@ -1449,7 +1450,6 @@ mod tests {
             let engine =
                 ProcessJitEngine::new(session.as_ref()).expect("process JIT should construct");
             let module_constant_ptrs = shared_state.module_constant_ptrs();
-            let counter_ptrs = shared_state.counter_ptrs();
             let blocks = vec![std::ptr::null_mut::<c_void>(); first.blocks.len()];
             let compiled = unsafe {
                 engine.compile_direct_function(
@@ -1460,7 +1460,6 @@ mod tests {
                     &shared_state.codegen_constants,
                     &shared_state.lowered_module.counter_defs,
                     &module_constant_ptrs,
-                    &counter_ptrs,
                     Some(shared_state.as_ref()),
                 )
             }
@@ -1553,7 +1552,22 @@ mod tests {
             let mut jit_module =
                 new_jit_module(&compile_session).expect("test jit module should construct");
             let module_constant_ptrs = shared_state.module_constant_ptrs();
-            let counter_ptrs = shared_state.counter_ptrs();
+            let module_constant_table_data_id = define_module_constant_table_data(
+                &mut jit_module,
+                &shared_state.lowered_module,
+                &module_constant_ptrs,
+            )
+            .expect("module constant table data should define");
+            let (counter_slots_by_id, scalar_counter_data_id, _top_value_counter_data_id) =
+                define_test_counter_storage(
+                    &mut jit_module,
+                    &shared_state.lowered_module,
+                    &shared_state.lowered_module.counter_defs,
+                );
+            let top_value_counter_data_id = declare_shared_state_top_value_counter_storage(
+                &mut jit_module,
+                shared_state.as_ref(),
+            );
             let built = build_cranelift_run_bb_specialized_function(
                 &mut jit_module,
                 blocks,
@@ -1561,8 +1575,10 @@ mod tests {
                 &function,
                 &shared_state.codegen_constants,
                 &shared_state.lowered_module.counter_defs,
-                &module_constant_ptrs,
-                &counter_ptrs,
+                module_constant_table_data_id,
+                counter_slots_by_id.as_ref(),
+                scalar_counter_data_id,
+                top_value_counter_data_id,
                 &compile_session,
                 Some(shared_state.as_ref()),
                 None,
@@ -1902,7 +1918,6 @@ def write_point(point, value):
                     .expect("shared state should build");
             let runtime = unsafe { build_test_module_runtime(py, shared_state.clone()) };
             let module_constant_ptrs = shared_state.module_constant_ptrs();
-            let counter_ptrs = shared_state.counter_ptrs();
             let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
             let compile_session = crate::session::CompileSession::process();
             let compiled_handle = unsafe {
@@ -1914,7 +1929,6 @@ def write_point(point, value):
                     &shared_state.codegen_constants,
                     &shared_state.lowered_module.counter_defs,
                     &module_constant_ptrs,
-                    &counter_ptrs,
                     Some(shared_state.as_ref()),
                 )
             }
@@ -2011,27 +2025,26 @@ def write_point(point, value):
             let mut jit_module =
                 new_jit_module(&compile_session).expect("test jit module should construct");
             let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
-            let counter_ptrs = placeholder_counter_ptrs(
-                function
-                    .blocks
-                    .iter()
-                    .flat_map(|block| block.body.iter())
-                    .filter_map(|expr| match expr {
-                        InstrCodegen::IncrementCounter(op) => Some(op.counter_id.0),
-                        _ => None,
-                    })
-                    .max()
-                    .map_or(0, |max_counter_id| max_counter_id + 1),
-            );
+            let module_constant_table_data_id =
+                define_module_constant_table_data(&mut jit_module, module, &module_constant_ptrs)
+                    .expect("module constant table data should define");
+            let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
+                define_test_counter_storage(
+                    &mut jit_module,
+                    module,
+                    module.counter_defs.as_slice(),
+                );
             let built = build_cranelift_run_bb_specialized_function(
                 &mut jit_module,
                 blocks,
                 module,
                 function,
                 module_constants,
-                &[],
-                &module_constant_ptrs,
-                &counter_ptrs,
+                module.counter_defs.as_slice(),
+                module_constant_table_data_id,
+                counter_slots_by_id.as_ref(),
+                scalar_counter_data_id,
+                top_value_counter_data_id,
                 &compile_session,
                 None,
                 None,
@@ -2049,6 +2062,99 @@ def write_point(point, value):
         }
     }
 
+    fn define_test_counter_storage(
+        jit_module: &mut JITModule,
+        module: &BlockPyModule<CodegenModuleShape>,
+        counter_defs: &[CounterDef],
+    ) -> (Box<[CounterRuntimeSlot]>, Option<DataId>, Option<DataId>) {
+        let (counter_slots_by_id, scalar_counter_count, top_value_counter_count) =
+            build_counter_storage_layout(counter_defs)
+                .expect("counter storage layout should build");
+        let scalar_counter_data_id = if scalar_counter_count == 0 {
+            None
+        } else {
+            Some(
+                define_scalar_counter_storage_data(jit_module, module, scalar_counter_count)
+                    .expect("scalar counter storage data should define"),
+            )
+        };
+        let top_value_counter_data_id = if top_value_counter_count == 0 {
+            None
+        } else {
+            Some(
+                define_top_value_counter_storage_data(jit_module, module, top_value_counter_count)
+                    .expect("top-value counter storage data should define"),
+            )
+        };
+        (
+            counter_slots_by_id,
+            scalar_counter_data_id,
+            top_value_counter_data_id,
+        )
+    }
+
+    fn declare_shared_state_top_value_counter_storage(
+        jit_module: &mut JITModule,
+        shared_state: &crate::module_type::SharedModuleState,
+    ) -> Option<DataId> {
+        let top_value_counter_base_ptr = shared_state.top_value_counter_values_ptr();
+        if top_value_counter_base_ptr.is_null() {
+            None
+        } else {
+            Some(
+                declare_top_value_counter_storage_import(
+                    jit_module,
+                    top_value_counter_storage_symbol_for_instance(
+                        &shared_state.lowered_module,
+                        shared_state.storage_instance_key(),
+                    )
+                    .as_str(),
+                )
+                .expect("top-value counter storage import should declare"),
+            )
+        }
+    }
+
+    fn build_test_jit_function_with_constants(
+        module: &BlockPyModule<CodegenModuleShape>,
+        function: &BlockPyFunction<CodegenModuleShape>,
+        blocks: &[ObjPtr],
+        module_constants: &crate::module_constants::ModuleCodegenConstants,
+    ) -> BuiltSpecializedFunction {
+        unsafe {
+            let compile_session = crate::session::CompileSession::new();
+            let mut jit_module =
+                new_jit_module(&compile_session).expect("test jit module should construct");
+            let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
+            let module_constant_table_data_id =
+                define_module_constant_table_data(&mut jit_module, module, &module_constant_ptrs)
+                    .expect("module constant table data should define");
+            let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
+                define_test_counter_storage(
+                    &mut jit_module,
+                    module,
+                    module.counter_defs.as_slice(),
+                );
+            build_cranelift_run_bb_specialized_function(
+                &mut jit_module,
+                blocks,
+                module,
+                function,
+                module_constants,
+                module.counter_defs.as_slice(),
+                module_constant_table_data_id,
+                counter_slots_by_id.as_ref(),
+                scalar_counter_data_id,
+                top_value_counter_data_id,
+                &compile_session,
+                None,
+                None,
+                None,
+            )
+            .expect("specialized JIT build should succeed")
+        }
+    }
+
     fn render_test_jit_function_with_constants_and_runtime_inline(
         module: &BlockPyModule<CodegenModuleShape>,
         function: &BlockPyFunction<CodegenModuleShape>,
@@ -2060,16 +2166,26 @@ def write_point(point, value):
             let mut jit_module =
                 new_jit_module(&compile_session).expect("test jit module should construct");
             let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
-            let counter_ptrs = placeholder_counter_ptrs(0);
+            let module_constant_table_data_id =
+                define_module_constant_table_data(&mut jit_module, module, &module_constant_ptrs)
+                    .expect("module constant table data should define");
+            let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
+                define_test_counter_storage(
+                    &mut jit_module,
+                    module,
+                    module.counter_defs.as_slice(),
+                );
             let mut built = build_cranelift_run_bb_specialized_function(
                 &mut jit_module,
                 blocks,
                 module,
                 function,
                 module_constants,
-                &[],
-                &module_constant_ptrs,
-                &counter_ptrs,
+                module.counter_defs.as_slice(),
+                module_constant_table_data_id,
+                counter_slots_by_id.as_ref(),
+                scalar_counter_data_id,
+                top_value_counter_data_id,
                 &compile_session,
                 None,
                 None,
@@ -2189,6 +2305,26 @@ def write_point(point, value):
             }
         }
         count
+    }
+
+    fn function_contains_iconst_imm(function: &ir::Function, expected_imm: i64) -> bool {
+        function.layout.blocks().any(|block| {
+            function.layout.block_insts(block).any(|inst| {
+                matches!(
+                    function.dfg.insts[inst],
+                    ir::InstructionData::UnaryImm { opcode: ir::Opcode::Iconst, imm }
+                        if imm.bits() == expected_imm
+                )
+            })
+        })
+    }
+
+    fn count_symbolic_global_values(function: &ir::Function) -> usize {
+        function
+            .global_values
+            .values()
+            .filter(|global_value| matches!(global_value, ir::GlobalValueData::Symbol { .. }))
+            .count()
     }
 
     fn import_user_names_for_symbols(
@@ -2538,7 +2674,6 @@ def f():
                 .expect("shared state should build");
                 let runtime = build_test_module_runtime(py, shared_state.clone());
                 let module_constant_ptrs = shared_state.module_constant_ptrs();
-                let counter_ptrs = shared_state.counter_ptrs();
                 let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
                 let compile_session = crate::session::CompileSession::process();
                 let compiled_handle = compile_cranelift_run_bb_specialized_cached(
@@ -2549,7 +2684,6 @@ def f():
                     &shared_state.codegen_constants,
                     &shared_state.lowered_module.counter_defs,
                     &module_constant_ptrs,
-                    &counter_ptrs,
                     Some(shared_state.as_ref()),
                 )
                 .expect("direct counter test function should compile");
@@ -2652,7 +2786,6 @@ def f(x):
                 .expect("shared state should build");
                 let runtime = build_test_module_runtime(py, shared_state.clone());
                 let module_constant_ptrs = shared_state.module_constant_ptrs();
-                let counter_ptrs = shared_state.counter_ptrs();
                 let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
                 let compile_session = crate::session::CompileSession::process();
                 let compiled_handle = compile_cranelift_run_bb_specialized_cached(
@@ -2663,7 +2796,6 @@ def f(x):
                     &shared_state.codegen_constants,
                     &shared_state.lowered_module.counter_defs,
                     &module_constant_ptrs,
-                    &counter_ptrs,
                     Some(shared_state.as_ref()),
                 )
                 .expect("direct refcount counter test function should compile");
@@ -2753,16 +2885,26 @@ def f(x):
             let mut jit_module =
                 new_jit_module(&compile_session).expect("test jit module should construct");
             let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
-            let counter_ptrs = placeholder_counter_ptrs(0);
+            let module_constant_table_data_id =
+                define_module_constant_table_data(&mut jit_module, &module, &module_constant_ptrs)
+                    .expect("module constant table data should define");
+            let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
+                define_test_counter_storage(
+                    &mut jit_module,
+                    &module,
+                    module.counter_defs.as_slice(),
+                );
             let built = build_cranelift_run_bb_specialized_function(
                 &mut jit_module,
                 &blocks,
                 &module,
                 &function,
                 &module_constants,
-                &[],
-                &module_constant_ptrs,
-                &counter_ptrs,
+                module.counter_defs.as_slice(),
+                module_constant_table_data_id,
+                counter_slots_by_id.as_ref(),
+                scalar_counter_data_id,
+                top_value_counter_data_id,
                 &compile_session,
                 None,
                 None,
@@ -3137,7 +3279,7 @@ def f(x):
     }
 
     #[test]
-    fn render_specialized_jit_string_literals_use_module_constant_loader() {
+    fn specialized_jit_string_literals_load_from_module_constant_table_symbol() {
         let blocks = [1usize as ObjPtr];
         let mut constants = TestConstantPool::default();
         let function = with_single_test_block(
@@ -3145,27 +3287,25 @@ def f(x):
             vec![],
             ret_term(constants.string_expr("hello")),
         );
-        let rendered = render_test_jit_function_with_module_constants(
-            &function,
-            &blocks,
-            constants.module_constants,
+        let mut module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
+        module.module_constants = constants.module_constants;
+        let function = module.callable_defs[0].clone();
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let built =
+            build_test_jit_function_with_constants(&module, &function, &blocks, &module_constants);
+        assert!(
+            !function_contains_iconst_imm(&built.ctx.func, 0x1000),
+            "string literal lowering should not bake the placeholder module constant pointer into the function body"
         );
         assert!(
-            !rendered.contains("call dp_jit_load_module_constant"),
-            "string literal lowering should not call the module constant hook anymore:\n{rendered}"
-        );
-        assert!(
-            rendered.contains("iconst.i64 4096"),
-            "string literal lowering should embed the immortal module constant pointer directly:\n{rendered}"
-        );
-        assert!(
-            !rendered.contains("call dp_jit_decode_literal_bytes"),
-            "string literal lowering should not decode literal bytes directly anymore:\n{rendered}"
+            count_symbolic_global_values(&built.ctx.func) > 0,
+            "string literal lowering should reference a symbolic module constant table"
         );
     }
 
     #[test]
-    fn render_specialized_jit_constant_locations_use_module_constant_loader() {
+    fn specialized_jit_constant_locations_load_from_module_constant_table_symbol() {
         let blocks = [1usize as ObjPtr];
         let function = with_single_test_block(
             test_function(),
@@ -3176,16 +3316,251 @@ def f(x):
         module.module_constants = vec![int_literal(7)];
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
-        let rendered =
-            render_test_jit_function_with_constants(&module, &function, &blocks, &module_constants);
+        let built =
+            build_test_jit_function_with_constants(&module, &function, &blocks, &module_constants);
         assert!(
-            !rendered.contains("call dp_jit_load_module_constant"),
-            "constant slot lowering should not call the module constant hook anymore:\n{rendered}"
+            !function_contains_iconst_imm(&built.ctx.func, 0x1000),
+            "constant slot lowering should not bake the placeholder module constant pointer into the function body"
         );
         assert!(
-            rendered.contains("iconst.i64 4096"),
-            "constant slot lowering should embed the immortal module constant pointer directly:\n{rendered}"
+            count_symbolic_global_values(&built.ctx.func) > 0,
+            "constant slot lowering should reference a symbolic module constant table"
         );
+    }
+
+    #[test]
+    fn specialized_jit_scalar_counters_load_from_counter_table_symbol() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        unsafe {
+            crate::initialize_test_python();
+            Python::attach(|py| {
+                let source = r#"
+def f():
+    return None
+"#;
+                let mut baseline = soac_blockpy::lower_python_to_blockpy_for_testing(source)
+                    .expect("lowering should succeed")
+                    .codegen_module;
+                let baseline_function = baseline
+                    .callable_defs
+                    .iter()
+                    .find(|function| function.names.bind_name == "f")
+                    .expect("missing lowered function f")
+                    .clone();
+                let baseline_blocks =
+                    vec![std::ptr::null_mut::<c_void>(); baseline_function.blocks.len()];
+                let baseline_module_constants =
+                    crate::module_constants::ModuleCodegenConstants::collect_from_module(&baseline);
+                let baseline_built = build_test_jit_function_with_constants(
+                    &baseline,
+                    &baseline_function,
+                    baseline_blocks.as_slice(),
+                    &baseline_module_constants,
+                );
+                let baseline_symbolic_globals =
+                    count_symbolic_global_values(&baseline_built.ctx.func);
+
+                instrument_bb_module_with_block_entry_counters(&mut baseline);
+
+                let shared_state = crate::module_type::build_shared_state_for_testing(
+                    py,
+                    baseline,
+                    "counter_test",
+                    "",
+                )
+                .expect("shared state should build");
+                let function = shared_state
+                    .lowered_module
+                    .callable_defs
+                    .iter()
+                    .find(|function| function.names.bind_name == "f")
+                    .expect("missing instrumented function f")
+                    .clone();
+                let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
+                let compile_session = crate::session::CompileSession::new();
+                let mut jit_module =
+                    new_jit_module(&compile_session).expect("test jit module should construct");
+                let module_constant_ptrs = shared_state.module_constant_ptrs();
+                let module_constant_table_data_id = define_module_constant_table_data(
+                    &mut jit_module,
+                    &shared_state.lowered_module,
+                    &module_constant_ptrs,
+                )
+                .expect("module constant table data should define");
+                let scalar_counter_ptr = shared_state.scalar_counter_values_ptr() as i64;
+                assert_ne!(
+                    scalar_counter_ptr, 0,
+                    "instrumented module should allocate scalar counter storage"
+                );
+                let scalar_counter_symbol = scalar_counter_storage_symbol_for_instance(
+                    &shared_state.lowered_module,
+                    shared_state.storage_instance_key(),
+                );
+                let scalar_counter_data_id = Some(
+                    declare_scalar_counter_storage_import(
+                        &mut jit_module,
+                        scalar_counter_symbol.as_str(),
+                    )
+                    .expect("scalar counter storage import should declare"),
+                );
+                let top_value_counter_data_id = declare_shared_state_top_value_counter_storage(
+                    &mut jit_module,
+                    shared_state.as_ref(),
+                );
+                let built = build_cranelift_run_bb_specialized_function(
+                    &mut jit_module,
+                    blocks.as_slice(),
+                    &shared_state.lowered_module,
+                    &function,
+                    &shared_state.codegen_constants,
+                    &shared_state.lowered_module.counter_defs,
+                    module_constant_table_data_id,
+                    shared_state.counter_slots_by_id(),
+                    scalar_counter_data_id,
+                    top_value_counter_data_id,
+                    &compile_session,
+                    Some(shared_state.as_ref()),
+                    None,
+                    None,
+                )
+                .expect("specialized JIT build should succeed");
+
+                assert!(
+                    count_symbolic_global_values(&built.ctx.func) >= baseline_symbolic_globals + 1,
+                    "scalar counter lowering should add a symbolic counter table reference"
+                );
+                assert!(
+                    !function_contains_iconst_imm(&built.ctx.func, scalar_counter_ptr),
+                    "scalar counter lowering should not bake the shared-state counter base pointer into the function body"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn specialized_jit_top_value_counters_load_from_counter_table_symbol() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        unsafe {
+            crate::initialize_test_python();
+            Python::attach(|py| {
+                let source = r#"
+def f(x, y):
+    return x + y
+"#;
+                let baseline = soac_blockpy::lower_python_to_blockpy_for_testing(source)
+                    .expect("lowering should succeed")
+                    .codegen_module;
+                let baseline_function = baseline
+                    .callable_defs
+                    .iter()
+                    .find(|function| function.names.bind_name == "f")
+                    .expect("missing lowered function f")
+                    .clone();
+                let baseline_blocks =
+                    vec![std::ptr::null_mut::<c_void>(); baseline_function.blocks.len()];
+                let baseline_module_constants =
+                    crate::module_constants::ModuleCodegenConstants::collect_from_module(&baseline);
+                let baseline_built = build_test_jit_function_with_constants(
+                    &baseline,
+                    &baseline_function,
+                    baseline_blocks.as_slice(),
+                    &baseline_module_constants,
+                );
+                let baseline_symbolic_globals =
+                    count_symbolic_global_values(&baseline_built.ctx.func);
+
+                let mut instrumented = soac_blockpy::lower_python_to_blockpy_for_testing(source)
+                    .expect("lowering should succeed")
+                    .codegen_module;
+                instrument_bb_module_with_call_target_counters(&mut instrumented);
+                let shared_state = crate::module_type::build_shared_state_for_testing(
+                    py,
+                    instrumented,
+                    "counter_test",
+                    "",
+                )
+                .expect("shared state should build");
+                let function = shared_state
+                    .lowered_module
+                    .callable_defs
+                    .iter()
+                    .find(|function| function.names.bind_name == "f")
+                    .expect("missing instrumented function f")
+                    .clone();
+                let operator_counter = shared_state
+                    .lowered_module
+                    .counter_defs
+                    .iter()
+                    .find(|counter| {
+                        counter.kind == "operator_hot_shapes"
+                            && matches!(
+                                counter.site,
+                                CounterSite::Runtime {
+                                    function_id: Some(id),
+                                    ..
+                                } if id == function.function_id
+                            )
+                    })
+                    .expect("instrumented module should have operator hot-shape counter");
+                let CounterRuntimeSlot::TopValues(counter_slot) =
+                    shared_state.counter_slots_by_id()[operator_counter.id.0]
+                else {
+                    panic!("operator hot-shape counter should use top-value storage");
+                };
+
+                let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
+                let compile_session = crate::session::CompileSession::new();
+                let mut jit_module =
+                    new_jit_module(&compile_session).expect("test jit module should construct");
+                let module_constant_ptrs = shared_state.module_constant_ptrs();
+                let module_constant_table_data_id = define_module_constant_table_data(
+                    &mut jit_module,
+                    &shared_state.lowered_module,
+                    &module_constant_ptrs,
+                )
+                .expect("module constant table data should define");
+                let top_value_counter_base_ptr = shared_state.top_value_counter_values_ptr();
+                assert!(
+                    !top_value_counter_base_ptr.is_null(),
+                    "instrumented module should allocate top-value counter storage"
+                );
+                let top_value_counter_ptr = top_value_counter_base_ptr.cast::<u8>().wrapping_add(
+                    counter_slot
+                        .checked_mul(size_of::<crate::counter::TopValueCounter>())
+                        .expect("top-value counter byte offset should fit"),
+                ) as i64;
+                let top_value_counter_data_id = declare_shared_state_top_value_counter_storage(
+                    &mut jit_module,
+                    shared_state.as_ref(),
+                );
+                let built = build_cranelift_run_bb_specialized_function(
+                    &mut jit_module,
+                    blocks.as_slice(),
+                    &shared_state.lowered_module,
+                    &function,
+                    &shared_state.codegen_constants,
+                    &shared_state.lowered_module.counter_defs,
+                    module_constant_table_data_id,
+                    shared_state.counter_slots_by_id(),
+                    None,
+                    top_value_counter_data_id,
+                    &compile_session,
+                    Some(shared_state.as_ref()),
+                    None,
+                    None,
+                )
+                .expect("specialized JIT build should succeed");
+
+                assert!(
+                    count_symbolic_global_values(&built.ctx.func) >= baseline_symbolic_globals + 1,
+                    "top-value counter lowering should add a symbolic counter table reference"
+                );
+                assert!(
+                    !function_contains_iconst_imm(&built.ctx.func, top_value_counter_ptr),
+                    "top-value counter lowering should not bake the shared-state counter slot pointer into the function body"
+                );
+            });
+        }
     }
 
     #[test]
@@ -3888,7 +4263,22 @@ def f(x):
                         .expect("test __init__ direct function should declare");
                 let predeclared = HashMap::from([(init_function.function_id, declared_init)]);
                 let module_constant_ptrs = shared_state.module_constant_ptrs();
-                let counter_ptrs = shared_state.counter_ptrs();
+                let module_constant_table_data_id = define_module_constant_table_data(
+                    &mut jit_module,
+                    &shared_state.lowered_module,
+                    &module_constant_ptrs,
+                )
+                .expect("module constant table data should define");
+                let (counter_slots_by_id, scalar_counter_data_id, _top_value_counter_data_id) =
+                    define_test_counter_storage(
+                        &mut jit_module,
+                        &shared_state.lowered_module,
+                        &shared_state.lowered_module.counter_defs,
+                    );
+                let top_value_counter_data_id = declare_shared_state_top_value_counter_storage(
+                    &mut jit_module,
+                    shared_state.as_ref(),
+                );
                 let built = build_cranelift_run_bb_specialized_function(
                     &mut jit_module,
                     &[1usize as ObjPtr],
@@ -3896,8 +4286,10 @@ def f(x):
                     &caller_function,
                     &shared_state.codegen_constants,
                     &shared_state.lowered_module.counter_defs,
-                    &module_constant_ptrs,
-                    &counter_ptrs,
+                    module_constant_table_data_id,
+                    counter_slots_by_id.as_ref(),
+                    scalar_counter_data_id,
+                    top_value_counter_data_id,
                     runtime.compile_session.as_ref(),
                     Some(shared_state.as_ref()),
                     None,
