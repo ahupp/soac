@@ -413,9 +413,9 @@ anything non-code affected the run. If there were no such issues, say
   Even read-only repo-state commands such as `jj status`, `jj workspace update-stale`,
   and `jj log` can race on snapshotting or auto-recovery in agent workflows. Run
   them serially, wait for completion, then inspect the next command's fresh output.
-- For one-off revision checks, switch the current worktree in-place instead of
-  creating a temporary worktree. Create a new empty working-copy child at the
-  revision you need:
+- For one-off revision checks, switch the current workspace in-place instead of
+  creating another workspace or ad hoc temporary worktree. Create a new empty
+  working-copy child at the revision you need:
 
   ```sh
   jj new <rev>
@@ -440,10 +440,17 @@ anything non-code affected the run. If there were no such issues, say
   stale or conflicted working copy and the `jj log` command above prints
   nothing.
 
-- For routine before/after validation, including benchmark comparisons, prefer
-  changing the current workspace's `@` directly rather than creating a
-  temporary jj workspace. Use a temporary workspace only when isolation is
-  specifically needed or requested.
+- Default to the current workspace. For routine before/after validation,
+  benchmark comparisons, and small isolated fixes, change the current
+  workspace's `@` directly rather than creating a temporary jj workspace.
+  Do not create ad hoc extra workspaces just to dodge unrelated local changes;
+  prefer `jj new`, `jj edit`, `jj split`, or `jj diff` to keep the intended
+  change isolated. Use a separate workspace only when concurrent active work,
+  destructive experimentation, or strict isolation is actually required.
+- If a separate workspace is genuinely required, make its setup explicit before
+  validation that depends on vendored CPython, shared caches, or a staged
+  `_soac_ext`. Run `just setup-dev-env` there first rather than assuming the
+  sibling workspace is already provisioned.
 
   The revset flags four invalid states:
   - `divergent()`: there is unresolved divergence in visible changes.

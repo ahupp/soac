@@ -416,3 +416,16 @@ Started:
 - `LocalEnv` store lowering now installs the new binding before releasing any
   previous local-only owner, preserving CPython destructor-visible rebinding
   order.
+- Planned stack-slot entry bindings are now also materialized into `LocalEnv`
+  at block entry as borrowed stack mirrors. Normal block-body loads and
+  forwarding paths can consult `LocalEnv` first instead of rediscovering those
+  locals only through stack-slot fallback loads.
+- Ordinary local-location loads now require a `LocalEnv` binding and no longer
+  fall back to raw stack-slot loads. The remaining stack-slot fallback surface
+  is limited to name-based helper and exceptional-edge transport paths.
+- Local deletes now leave an explicit unbound `LocalEnv` binding instead of
+  dropping the entry outright, so same-block post-delete loads keep deleted-name
+  semantics without reintroducing raw stack-slot fallback for ordinary locals.
+- Exception-dispatch slot writes and runtime target-arg forwarding now require
+  their named sources to be present in the forwarded block-param set instead of
+  reloading those semantic locals from stack slots in the dispatch block.

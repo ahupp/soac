@@ -440,16 +440,22 @@ mod tests {
             let mut jit_module =
                 new_jit_module(&compile_session).expect("test jit module should construct");
             let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
-            let counter_ptrs = placeholder_counter_ptrs(0);
+            let module_constant_table_data_id =
+                define_module_constant_table_data(&mut jit_module, &module, &module_constant_ptrs)
+                    .expect("module constant table data should define");
+            let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
+                define_test_counter_storage(&mut jit_module, &module, module.counter_defs.as_slice());
             build_cranelift_run_bb_specialized_function(
                 &mut jit_module,
                 &[1usize as ObjPtr, 2usize as ObjPtr, 3usize as ObjPtr],
                 &module,
                 &function,
                 &module_constants,
-                &[],
-                &module_constant_ptrs,
-                &counter_ptrs,
+                module.counter_defs.as_slice(),
+                module_constant_table_data_id,
+                counter_slots_by_id.as_ref(),
+                scalar_counter_data_id,
+                top_value_counter_data_id,
                 &compile_session,
                 None,
                 None,
@@ -484,16 +490,22 @@ mod tests {
             let mut jit_module =
                 new_jit_module(&compile_session).expect("test jit module should construct");
             let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
-            let counter_ptrs = placeholder_counter_ptrs(0);
+            let module_constant_table_data_id =
+                define_module_constant_table_data(&mut jit_module, &module, &module_constant_ptrs)
+                    .expect("module constant table data should define");
+            let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
+                define_test_counter_storage(&mut jit_module, &module, module.counter_defs.as_slice());
             build_cranelift_run_bb_specialized_function(
                 &mut jit_module,
                 &[1usize as ObjPtr],
                 &module,
                 &function,
                 &module_constants,
-                &[],
-                &module_constant_ptrs,
-                &counter_ptrs,
+                module.counter_defs.as_slice(),
+                module_constant_table_data_id,
+                counter_slots_by_id.as_ref(),
+                scalar_counter_data_id,
+                top_value_counter_data_id,
                 &compile_session,
                 None,
                 None,
@@ -549,16 +561,22 @@ mod tests {
             let mut jit_module =
                 new_jit_module(&compile_session).expect("test jit module should construct");
             let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
-            let counter_ptrs = placeholder_counter_ptrs(0);
+            let module_constant_table_data_id =
+                define_module_constant_table_data(&mut jit_module, &module, &module_constant_ptrs)
+                    .expect("module constant table data should define");
+            let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
+                define_test_counter_storage(&mut jit_module, &module, module.counter_defs.as_slice());
             build_cranelift_run_bb_specialized_function(
                 &mut jit_module,
                 &[1usize as ObjPtr, 2usize as ObjPtr, 3usize as ObjPtr],
                 &module,
                 &function,
                 &module_constants,
-                &[],
-                &module_constant_ptrs,
-                &counter_ptrs,
+                module.counter_defs.as_slice(),
+                module_constant_table_data_id,
+                counter_slots_by_id.as_ref(),
+                scalar_counter_data_id,
+                top_value_counter_data_id,
                 &compile_session,
                 None,
                 None,
@@ -589,16 +607,22 @@ mod tests {
             let mut jit_module =
                 new_jit_module(&compile_session).expect("test jit module should construct");
             let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
-            let counter_ptrs = placeholder_counter_ptrs(0);
+            let module_constant_table_data_id =
+                define_module_constant_table_data(&mut jit_module, &module, &module_constant_ptrs)
+                    .expect("module constant table data should define");
+            let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
+                define_test_counter_storage(&mut jit_module, &module, module.counter_defs.as_slice());
             build_cranelift_run_bb_specialized_function(
                 &mut jit_module,
                 &[1usize as ObjPtr],
                 &module,
                 &function,
                 &module_constants,
-                &[],
-                &module_constant_ptrs,
-                &counter_ptrs,
+                module.counter_defs.as_slice(),
+                module_constant_table_data_id,
+                counter_slots_by_id.as_ref(),
+                scalar_counter_data_id,
+                top_value_counter_data_id,
                 &compile_session,
                 None,
                 None,
@@ -3002,16 +3026,26 @@ def f():
             let mut jit_module =
                 new_jit_module(&compile_session).expect("test jit module should construct");
             let module_constant_ptrs = placeholder_module_constant_ptrs(codegen_constants.len());
-            let counter_ptrs = placeholder_counter_ptrs(0);
+            let module_constant_table_data_id =
+                define_module_constant_table_data(&mut jit_module, &lowered, &module_constant_ptrs)
+                    .expect("module constant table data should define");
+            let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
+                define_test_counter_storage(
+                    &mut jit_module,
+                    &lowered,
+                    lowered.counter_defs.as_slice(),
+                );
             let built = build_cranelift_run_bb_specialized_function(
                 &mut jit_module,
                 &blocks,
                 &lowered,
                 &function,
                 &codegen_constants,
-                &[],
-                &module_constant_ptrs,
-                &counter_ptrs,
+                lowered.counter_defs.as_slice(),
+                module_constant_table_data_id,
+                counter_slots_by_id.as_ref(),
+                scalar_counter_data_id,
+                top_value_counter_data_id,
                 &compile_session,
                 None,
                 None,

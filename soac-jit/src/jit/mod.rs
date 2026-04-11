@@ -2317,7 +2317,7 @@ impl LocalEnv {
             }
             return Some(value);
         }
-        emit_checked_stack_slot_value(fb, &ctx.stack_slots, name, ctx, borrowed)
+        None
     }
 
     fn load_name(
@@ -2430,6 +2430,7 @@ impl LocalEnv {
         thread_state_value: ir::Value,
         decref_ref: ir::FuncRef,
     ) -> Result<(), String> {
+        let had_stack_slot = stack_slots.has_name(name);
         let removed_entry = if let Some(index) = self
             .entry_index_for_location(location)
             .or_else(|| self.entry_index_for_name(name))
@@ -2439,20 +2440,36 @@ impl LocalEnv {
                 emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, previous.value);
             }
             Some(previous)
-        } else if !stack_slots.has_name(name) {
+        } else if !had_stack_slot {
             return Err(format!("missing local binding for delete target: {name}"));
         } else {
             None
         };
-        let should_clear_stack_slot = stack_slots.has_name(name)
-            && removed_entry
-                .as_ref()
-                .is_none_or(|entry| entry.storage == LocalEnvStorage::StackMirror);
-        if should_clear_stack_slot {
+        if had_stack_slot {
             stack_slots
                 .clear_value(fb, name, ptr_ty, thread_state_value, decref_ref)
                 .expect("slot-backed delete target missing from stack slots");
         }
+        let null_ptr = fb.ins().iconst(ptr_ty, 0);
+        let unbound_storage = if had_stack_slot {
+            LocalEnvStorage::StackMirror
+        } else {
+            LocalEnvStorage::LocalOnly
+        };
+        self.entries.push(LocalEnvEntry {
+            location: removed_entry
+                .as_ref()
+                .map(|entry| entry.location)
+                .unwrap_or(location),
+            name: name.to_string(),
+            value: null_ptr,
+            ref_kind: LocalRefKind::Unbound,
+            storage: unbound_storage,
+            binding_facts: local_binding_facts_for_storage(
+                unbound_storage,
+                LocalRefKind::Unbound,
+            ),
+        });
         Ok(())
     }
 
@@ -2533,6 +2550,48 @@ fn planned_entry_binding_for_block_arg_name<'a>(
                 .iter()
                 .find(|binding| is_try_exception_alias_name(binding.name.as_str()))
         })
+}
+
+fn bind_planned_stack_slot_entries_at_block_entry(
+    fb: &mut FunctionBuilder<'_>,
+    block_plan: Option<&BlockLocalPlan>,
+    local_env: &mut LocalEnv,
+    stack_slots: &StackSlots,
+    ptr_ty: ir::Type,
+) -> Result<(), String> {
+    let Some(block_plan) = block_plan else {
+        return Ok(());
+    };
+    for binding in &block_plan.entry_locals {
+        if binding.storage != PlannedLocalStorage::StackSlot {
+            continue;
+        }
+        if local_env
+            .entry_index_for_location(binding.location)
+            .or_else(|| local_env.entry_index_for_name(binding.name.as_str()))
+            .is_some()
+        {
+            continue;
+        }
+        let slot = stack_slots
+            .slot_for_block_arg_name(binding.name.as_str())
+            .ok_or_else(|| {
+                format!(
+                    "planned stack-slot entry binding for {} is missing stack storage",
+                    binding.name
+                )
+            })?;
+        let value = fb.ins().stack_load(ptr_ty, slot, 0);
+        local_env.bind_entry_location(
+            binding.location,
+            binding.name.as_str(),
+            value,
+            local_ref_kind_for_stack_mirror(binding.ref_kind),
+            LocalEnvStorage::StackMirror,
+            binding.binding_facts,
+        );
+    }
+    Ok(())
 }
 
 fn transient_local_needs_decref(ref_kind: LocalRefKind) -> bool {
@@ -6439,18 +6498,14 @@ fn emit_exception_dispatch_slot_writes(
         .collect::<HashMap<_, _>>();
     for (target_name, source) in slot_writes {
         let value = match source {
-            BlockArg::Name(source_name) => {
-                if let Some(value) = forwarded_locals_by_name.get(source_name.as_str()).copied() {
-                    value
-                } else {
-                    load_stack_slot_value(fb, stack_slots, source_name, ptr_ty, true, incref_ref)
-                        .ok_or_else(|| {
-                            format!(
-                                "missing exception dispatch slot source {source_name} for target {target_name}"
-                            )
-                        })?
-                }
-            }
+            BlockArg::Name(source_name) => forwarded_locals_by_name
+                .get(source_name.as_str())
+                .copied()
+                .ok_or_else(|| {
+                    format!(
+                        "missing forwarded exception dispatch slot source {source_name} for target {target_name}"
+                    )
+                })?,
             BlockArg::CurrentException => dispatch_exc,
             BlockArg::None => none_const,
             BlockArg::AbruptKind(_) => {
@@ -6479,9 +6534,8 @@ fn emit_exception_dispatch_target_args(
     forwarded_local_names: &[String],
     forwarded_local_values: &[ir::Value],
     dispatch_exc: ir::Value,
-    stack_slots: &StackSlots,
     module_constants: &ModuleCodegenConstants,
-    module_constant_ptrs: &[*mut ffi::PyObject],
+    module_constant_table_value: ir::Value,
     ptr_ty: ir::Type,
     thread_state_value: ir::Value,
     none_const: ir::Value,
@@ -6499,30 +6553,22 @@ fn emit_exception_dispatch_target_args(
     for (target_name, source) in target_args {
         let value = match source {
             BlockArg::Name(source_name) => {
-                if let Some(value) = forwarded_locals_by_name.get(source_name.as_str()).copied() {
-                    let forwarded_count = forwarded_local_counts
-                        .entry(source_name.as_str())
-                        .or_insert(0usize);
-                    if *forwarded_count > 0 {
-                        emit_incref_if_not_null(fb, ptr_ty, incref_ref, value);
-                    }
-                    *forwarded_count += 1;
-                    value
-                } else {
-                    load_stack_slot_value(
-                        fb,
-                        stack_slots,
-                        source_name,
-                        ptr_ty,
-                        false,
-                        incref_ref,
-                    )
+                let value = forwarded_locals_by_name
+                    .get(source_name.as_str())
+                    .copied()
                     .ok_or_else(|| {
                         format!(
-                            "missing exception dispatch block-param source {source_name} for target {target_name}"
+                            "missing forwarded exception dispatch block-param source {source_name} for target {target_name}"
                         )
-                    })?
+                    })?;
+                let forwarded_count = forwarded_local_counts
+                    .entry(source_name.as_str())
+                    .or_insert(0usize);
+                if *forwarded_count > 0 {
+                    emit_incref_if_not_null(fb, ptr_ty, incref_ref, value);
                 }
+                *forwarded_count += 1;
+                value
             }
             BlockArg::CurrentException => {
                 if dispatch_exc_forward_count > 0 {
@@ -6538,7 +6584,7 @@ fn emit_exception_dispatch_target_args(
             BlockArg::AbruptKind(kind) => emit_owned_module_constant_from_parts(
                 fb,
                 module_constants.require_int_constant_id(abrupt_kind_tag(*kind)),
-                module_constant_ptrs,
+                module_constant_table_value,
                 ptr_ty,
             ),
         };
@@ -10352,6 +10398,13 @@ fn build_cranelift_run_bb_specialized_function(
                     );
                 }
             }
+            bind_planned_stack_slot_entries_at_block_entry(
+                &mut fb,
+                block_local_plan,
+                &mut local_env,
+                &stack_slots,
+                ptr_ty,
+            )?;
             let block_const = globals_value;
             let none_const = emit_owned_module_constant_from_parts(
                 &mut fb,
@@ -10601,9 +10654,8 @@ fn build_cranelift_run_bb_specialized_function(
                 &dispatch_plan.forwarded_local_names,
                 &forwarded_local_values,
                 dispatch_exc,
-                &stack_slots,
                 module_constants,
-                module_constant_ptrs,
+                module_constant_table_value,
                 ptr_ty,
                 thread_state_value,
                 none_const,
