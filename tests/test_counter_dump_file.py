@@ -5,7 +5,9 @@ import json
 import os
 import subprocess
 import sys
+import textwrap
 
+import pytest
 from tests._integration import integration_module
 
 
@@ -21,6 +23,88 @@ def _read_jsonl(path):
         for line in path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
+
+
+def _soac_subprocess_env(module_root, *, work_dir=None, extra_env=None):
+    env = dict(os.environ)
+    env["SOAC_MODULE_ENABLED"] = f"path:{module_root}"
+    if work_dir is not None:
+        env["SOAC_WORK_DIR"] = str(work_dir)
+    else:
+        env.pop("SOAC_WORK_DIR", None)
+    env.pop("SOAC_LOG", None)
+    if extra_env:
+        env.update(extra_env)
+    return env
+
+
+def _run_soac_subprocess(script, *, env):
+    return subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        env=env,
+        text=True,
+    )
+
+
+def _assert_subprocess_ok(result):
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _import_and_run_script(module_root, import_stmt, body):
+    body_lines = textwrap.dedent(body).strip().splitlines()
+    return "\n".join(
+        [
+            "import sys",
+            f"sys.path.insert(0, {str(module_root)!r})",
+            "from soac.import_hook import install",
+            "install()",
+            import_stmt,
+            *body_lines,
+            "",
+        ]
+    )
+
+
+@pytest.fixture(scope="module")
+def profiled_specialization_runtime_case(tmp_path_factory):
+    base_dir = tmp_path_factory.mktemp("counter-dump-specialization-runtime")
+    module_name = "specialization_runtime_case"
+    (base_dir / f"{module_name}.py").write_text(
+        """
+VALUE = 9
+
+class Point:
+    pass
+
+def run():
+    point = Point()
+    point.x = 33
+    return point.x + VALUE
+""",
+        encoding="utf-8",
+    )
+    work_dir = base_dir / "soac-work"
+    script = _import_and_run_script(
+        base_dir,
+        f"import {module_name} as module",
+        "assert module.run() == 42",
+    )
+    base_env = _soac_subprocess_env(base_dir, work_dir=work_dir)
+    profile_result = _run_soac_subprocess(
+        script,
+        env={**base_env, "SOAC_OPT_MODE": "profile"},
+    )
+    _assert_subprocess_ok(profile_result)
+    assert (work_dir / "profile.bin").exists()
+    return {
+        "base_dir": base_dir,
+        "module_name": module_name,
+        "script": script,
+        "work_dir": work_dir,
+        "base_env": base_env,
+    }
 
 
 def test_counter_dump_file_is_written_on_module_exit(tmp_path, monkeypatch):
@@ -89,33 +173,20 @@ def read():
     return VALUE
 """
     module_path.write_text(source, encoding="utf-8")
-    env = {
-        **os.environ,
-        "DIET_PYTHON_ALLOW_TEMP": "1",
-        "DIET_PYTHON_INTEGRATION_ONLY": "0",
-        "DIET_PYTHON_MODE": "transform",
-        "SOAC_LOG": f"soac_module_load=info,soac_jit_codegen=info;json={log_path}",
-    }
-
-    subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import sys; "
-                f"sys.path.insert(0, {str(tmp_path)!r}); "
-                "from soac.import_hook import install; "
-                "install(); "
-                "import module_load_log_case; "
-                "assert module_load_log_case.read() == 5"
-            ),
-        ],
-        check=True,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
+    result = _run_soac_subprocess(
+        _import_and_run_script(
+            tmp_path,
+            "import module_load_log_case",
+            "assert module_load_log_case.read() == 5",
+        ),
+        env=_soac_subprocess_env(
+            tmp_path,
+            extra_env={
+                "SOAC_LOG": f"soac_module_load=info,soac_jit_codegen=info;json={log_path}",
+            },
+        ),
     )
+    _assert_subprocess_ok(result)
 
     rows = [
         json.loads(line)
@@ -192,31 +263,15 @@ def test_soac_work_dir_is_default_event_log_dir(tmp_path):
     log_path = work_dir / "events.jsonl"
     module_path = tmp_path / "work_dir_log_case.py"
     module_path.write_text("def read():\n    return 11\n", encoding="utf-8")
-    env = {
-        **os.environ,
-        "SOAC_WORK_DIR": str(work_dir),
-    }
-    env.pop("SOAC_LOG", None)
-
-    subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import sys; "
-                f"sys.path.insert(0, {str(tmp_path)!r}); "
-                "from soac.import_hook import install; "
-                "install(); "
-                "import work_dir_log_case; "
-                "assert work_dir_log_case.read() == 11"
-            ),
-        ],
-        check=True,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
+    result = _run_soac_subprocess(
+        _import_and_run_script(
+            tmp_path,
+            "import work_dir_log_case",
+            "assert work_dir_log_case.read() == 11",
+        ),
+        env=_soac_subprocess_env(tmp_path, work_dir=work_dir),
     )
+    _assert_subprocess_ok(result)
 
     rows = _read_jsonl(log_path)
     assert any(
@@ -226,62 +281,20 @@ def test_soac_work_dir_is_default_event_log_dir(tmp_path):
     )
 
 
-def test_apply_mode_specialization_runtime_logs_indexed_hits(tmp_path):
-    log_path = tmp_path / "apply-events.jsonl"
-    module_path = tmp_path / "specialization_runtime_case.py"
-    module_path.write_text(
-        """
-VALUE = 9
+def test_apply_mode_specialization_runtime_logs_indexed_hits(
+    profiled_specialization_runtime_case,
+):
+    log_path = profiled_specialization_runtime_case["base_dir"] / "apply-events.jsonl"
 
-class Point:
-    pass
-
-def run():
-    point = Point()
-    point.x = 33
-    return point.x + VALUE
-""",
-        encoding="utf-8",
-    )
-    work_dir = tmp_path / "soac-work"
-    base_env = {
-        **os.environ,
-        "SOAC_WORK_DIR": str(work_dir),
-    }
-    base_env.pop("SOAC_LOG", None)
-
-    script = f"""
-import sys
-sys.path.insert(0, {str(tmp_path)!r})
-from soac.import_hook import install
-install()
-import specialization_runtime_case as module
-for _ in range(20):
-    assert module.run() == 42
-"""
-
-    subprocess.run(
-        [sys.executable, "-c", script],
-        check=True,
-        env={**base_env, "SOAC_OPT_MODE": "profile"},
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    assert (work_dir / "profile.bin").exists()
-
-    subprocess.run(
-        [sys.executable, "-c", script],
-        check=True,
+    result = _run_soac_subprocess(
+        profiled_specialization_runtime_case["script"],
         env={
-            **base_env,
+            **profiled_specialization_runtime_case["base_env"],
             "SOAC_OPT_MODE": "apply",
             "SOAC_LOG": f"soac_specialization_runtime=info;json={log_path}",
         },
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
     )
+    _assert_subprocess_ok(result)
 
     rows = _read_jsonl(log_path)
     runtime_rows = [
@@ -309,65 +322,26 @@ for _ in range(20):
     ), runtime_rows
 
 
-def test_apply_mode_default_event_log_includes_specialization_runtime(tmp_path):
-    module_path = tmp_path / "specialization_runtime_default_case.py"
-    module_path.write_text(
-        """
-VALUE = 9
+def test_apply_mode_default_event_log_includes_specialization_runtime(
+    profiled_specialization_runtime_case,
+):
+    log_path = profiled_specialization_runtime_case["work_dir"] / "events.jsonl"
 
-class Point:
-    pass
-
-def run():
-    point = Point()
-    point.x = 33
-    return point.x + VALUE
-""",
-        encoding="utf-8",
+    result = _run_soac_subprocess(
+        profiled_specialization_runtime_case["script"],
+        env={
+            **profiled_specialization_runtime_case["base_env"],
+            "SOAC_OPT_MODE": "apply",
+        },
     )
-    work_dir = tmp_path / "soac-work"
-    log_path = work_dir / "events.jsonl"
-    base_env = {
-        **os.environ,
-        "SOAC_WORK_DIR": str(work_dir),
-    }
-    base_env.pop("SOAC_LOG", None)
-
-    script = f"""
-import sys
-sys.path.insert(0, {str(tmp_path)!r})
-from soac.import_hook import install
-install()
-import specialization_runtime_default_case as module
-for _ in range(20):
-    assert module.run() == 42
-"""
-
-    subprocess.run(
-        [sys.executable, "-c", script],
-        check=True,
-        env={**base_env, "SOAC_OPT_MODE": "profile"},
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    assert (work_dir / "profile.bin").exists()
-
-    subprocess.run(
-        [sys.executable, "-c", script],
-        check=True,
-        env={**base_env, "SOAC_OPT_MODE": "apply"},
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    _assert_subprocess_ok(result)
 
     rows = _read_jsonl(log_path)
     runtime_rows = [
         row
         for row in rows
         if row.get("event") == "soac.specialization_runtime"
-        and row["module_name"].endswith("specialization_runtime_default_case")
+        and row["module_name"].endswith("specialization_runtime_case")
     ]
     assert any(
         row["kind"] == "global_indexed_hit"
@@ -430,34 +404,23 @@ def write_field():
     )
     work_dir = tmp_path / "soac-work"
 
-    script = f"""
-import sys
-sys.path.insert(0, {str(tmp_path)!r})
-from soac.import_hook import install
-install()
-import field_user_case
-for _ in range(20):
-    assert field_user_case.read_fields() == 84
-    assert field_user_case.write_field() == 84
-"""
-    base_env = os.environ.copy()
-    base_env.pop("SOAC_LOG", None)
-    base_env.pop("SOAC_MODULE_ENABLED", None)
-    base_env.update(
-        {
-            "DIET_PYTHON_MODE": "transform",
-            "SOAC_WORK_DIR": str(work_dir),
-        }
+    script = _import_and_run_script(
+        tmp_path,
+        "import field_user_case",
+        textwrap.dedent(
+            """
+            assert field_user_case.read_fields() == 84
+            assert field_user_case.write_field() == 84
+            """
+        ).strip(),
     )
+    base_env = _soac_subprocess_env(tmp_path, work_dir=work_dir)
 
-    profile_result = subprocess.run(
-        [sys.executable, "-c", script],
-        check=False,
-        capture_output=True,
+    profile_result = _run_soac_subprocess(
+        script,
         env={**base_env, "SOAC_OPT_MODE": "profile"},
-        text=True,
     )
-    assert profile_result.returncode == 0, profile_result.stdout + profile_result.stderr
+    _assert_subprocess_ok(profile_result)
     profile_dump_path = work_dir / "profile.bin"
     assert profile_dump_path.exists()
 
@@ -487,14 +450,11 @@ for _ in range(20):
     }
     assert keys_by_owner == {"Point": {"x", "y"}, "Vector": {"x", "y"}}
 
-    verify_result = subprocess.run(
-        [sys.executable, "-c", script],
-        check=False,
-        capture_output=True,
+    verify_result = _run_soac_subprocess(
+        script,
         env={**base_env, "SOAC_OPT_MODE": "verify"},
-        text=True,
     )
-    assert verify_result.returncode == 0, verify_result.stdout + verify_result.stderr
+    _assert_subprocess_ok(verify_result)
     verify_dump_path = work_dir / "verify.bin"
     assert verify_dump_path.exists()
 

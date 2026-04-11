@@ -221,37 +221,50 @@ fn top_value_counter_storage_symbol_for_instance(
     )
 }
 
-fn push_shared_module_symbol_identity(out: &mut String, module_name: &str, source_hash: u64) {
+fn push_shared_module_symbol_identity(
+    out: &mut String,
+    module_name: &str,
+    source_hash: u64,
+    fallback_instance_key: Option<usize>,
+) {
     push_symbol_component_hex(out, module_name);
     out.push('_');
     out.push_str(format!("{source_hash:016x}").as_str());
+    if source_hash == 0 {
+        if let Some(instance_key) = fallback_instance_key {
+            out.push_str("_inst_");
+            out.push_str(instance_key.to_string().as_str());
+        }
+    }
 }
 
-fn push_shared_module_instance_symbol_identity(out: &mut String, shared_state: &SharedModuleState) {
+fn push_shared_module_symbol_identity_for_shared_state(
+    out: &mut String,
+    shared_state: &SharedModuleState,
+) {
     push_shared_module_symbol_identity(
         out,
         shared_state.module_name.as_str(),
         shared_state.source_hash(),
+        Some(shared_state.storage_instance_key()),
     );
-    out.push_str("_instance_");
-    out.push_str(format!("{:x}", shared_state.storage_instance_key()).as_str());
 }
 
 fn module_constant_table_symbol_for_shared_state(shared_state: &SharedModuleState) -> String {
     let mut symbol = String::from("__soac_module_constants_shared_");
-    push_shared_module_instance_symbol_identity(&mut symbol, shared_state);
+    push_shared_module_symbol_identity_for_shared_state(&mut symbol, shared_state);
     symbol
 }
 
 fn scalar_counter_storage_symbol_for_shared_state(shared_state: &SharedModuleState) -> String {
     let mut symbol = String::from("__soac_scalar_counters_shared_");
-    push_shared_module_instance_symbol_identity(&mut symbol, shared_state);
+    push_shared_module_symbol_identity_for_shared_state(&mut symbol, shared_state);
     symbol
 }
 
 fn top_value_counter_storage_symbol_for_shared_state(shared_state: &SharedModuleState) -> String {
     let mut symbol = String::from("__soac_top_value_counters_shared_");
-    push_shared_module_instance_symbol_identity(&mut symbol, shared_state);
+    push_shared_module_symbol_identity_for_shared_state(&mut symbol, shared_state);
     symbol
 }
 
@@ -260,7 +273,7 @@ fn direct_function_symbol_scope_for_shared_state(
     function_id: FunctionId,
 ) -> String {
     let mut scope = String::from("shared_");
-    push_shared_module_instance_symbol_identity(&mut scope, shared_state);
+    push_shared_module_symbol_identity_for_shared_state(&mut scope, shared_state);
     scope.push_str("_fn_");
     scope.push_str(function_id.packed().to_string().as_str());
     scope

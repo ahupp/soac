@@ -85,14 +85,21 @@ mod tests {
     #[test]
     fn shared_module_symbol_identity_is_stable() {
         let mut first = String::new();
-        push_shared_module_symbol_identity(&mut first, "pkg.mod", 0x1234);
+        push_shared_module_symbol_identity(&mut first, "pkg.mod", 0x1234, None);
         let mut second = String::new();
-        push_shared_module_symbol_identity(&mut second, "pkg.mod", 0x1234);
+        push_shared_module_symbol_identity(&mut second, "pkg.mod", 0x1234, None);
         let mut different_hash = String::new();
-        push_shared_module_symbol_identity(&mut different_hash, "pkg.mod", 0x1235);
+        push_shared_module_symbol_identity(&mut different_hash, "pkg.mod", 0x1235, None);
+        let mut zero_hash_first = String::new();
+        push_shared_module_symbol_identity(&mut zero_hash_first, "pkg.mod", 0, Some(7));
+        let mut zero_hash_second = String::new();
+        push_shared_module_symbol_identity(&mut zero_hash_second, "pkg.mod", 0, Some(8));
         assert_eq!(first, second);
         assert_eq!(first, "706b672e6d6f64_0000000000001234");
         assert_ne!(first, different_hash);
+        assert_eq!(zero_hash_first, "706b672e6d6f64_0000000000000000_inst_7");
+        assert_eq!(zero_hash_second, "706b672e6d6f64_0000000000000000_inst_8");
+        assert_ne!(zero_hash_first, zero_hash_second);
     }
 
     #[test]
