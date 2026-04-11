@@ -4718,24 +4718,25 @@ fn emit_owned_bool_from_pyobject_truthiness(
     bool_value
 }
 
-fn emit_branch_index_i64(
+fn emit_typed_branch_index_i64(
     fb: &mut FunctionBuilder<'_>,
-    expr: &InstrCodegen,
+    expr: &InstrTyped,
     local_env: &mut LocalEnv,
     ctx: &JitEmitCtx<'_>,
     jit_module: &mut JITModule,
     func_imports: &mut FuncBuildImports<'_>,
     pyobject_to_i64_ref: ir::FuncRef,
-) -> ir::Value {
+) -> Result<ir::Value, String> {
     match expr {
-        InstrCodegen::CalleeFunctionId(op) => {
+        InstrTyped::LegacyCalleeFunctionId(op) => {
+            let legacy_value = try_lower_typed_instr_to_codegen_legacy((*op.value).clone())?;
             let callable_is_borrowed = codegen_expr_is_borrowable_from_local_env(
-                op.value.as_ref(),
+                &legacy_value,
                 local_env,
                 &ctx.stack_slots,
                 ctx.storage_layout.as_ref(),
             );
-            let callable = emit_codegen_expr_with_local_env(
+            let callable = emit_typed_codegen_expr_with_local_env(
                 fb,
                 op.value.as_ref(),
                 local_env,
@@ -4743,16 +4744,16 @@ fn emit_branch_index_i64(
                 callable_is_borrowed,
                 jit_module,
                 func_imports,
-            );
+            )?;
             let callee_id = emit_callee_function_id_checked(fb, callable, ctx);
             if !callable_is_borrowed {
                 fb.ins()
                     .call(ctx.decref_ref, &[ctx.consts.thread_state_value, callable]);
             }
-            callee_id
+            Ok(callee_id)
         }
         _ => {
-            let index_obj = emit_codegen_expr_with_local_env(
+            let index_value = emit_typed_codegen_expr_value_with_local_env(
                 fb,
                 expr,
                 local_env,
@@ -4760,12 +4761,18 @@ fn emit_branch_index_i64(
                 false,
                 jit_module,
                 func_imports,
-            );
-            let index_i64_inst = fb.ins().call(pyobject_to_i64_ref, &[index_obj]);
-            let index_i64 = fb.inst_results(index_i64_inst)[0];
-            fb.ins()
-                .call(ctx.decref_ref, &[ctx.consts.thread_state_value, index_obj]);
-            index_i64
+            )?;
+            match index_value {
+                SoacValue::I64 { value, .. } => Ok(value),
+                SoacValue::I32 { value, .. } => Ok(fb.ins().sextend(ctx.consts.i64_ty, value)),
+                SoacValue::PyObject { value, .. } => {
+                    let index_i64_inst = fb.ins().call(pyobject_to_i64_ref, &[value]);
+                    let index_i64 = fb.inst_results(index_i64_inst)[0];
+                    fb.ins()
+                        .call(ctx.decref_ref, &[ctx.consts.thread_state_value, value]);
+                    Ok(index_i64)
+                }
+            }
         }
     }
 }
@@ -9893,15 +9900,27 @@ fn emit_codegen_term(
             )?;
         }
         BlockTerm::BranchTable(branch) => {
-            let index_i64 = emit_branch_index_i64(
+            let BlockTerm::BranchTable(typed_branch) = typed_term else {
+                return Err(format!(
+                    "typed term kind mismatch for BranchTable in block {source_label}"
+                ));
+            };
+            if typed_branch.targets != branch.targets
+                || typed_branch.default_label != branch.default_label
+            {
+                return Err(format!(
+                    "typed BranchTable target mismatch in block {source_label}"
+                ));
+            }
+            let index_i64 = emit_typed_branch_index_i64(
                 fb,
-                &branch.index,
+                &typed_branch.index,
                 local_env,
                 emit_ctx,
                 jit_module,
                 func_imports,
                 pyobject_to_i64_ref,
-            );
+            )?;
             let index_error = fb.ins().iconst(i64_ty, i64::MIN);
             let is_error = fb
                 .ins()

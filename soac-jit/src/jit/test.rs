@@ -513,6 +513,72 @@ mod tests {
         }
     }
 
+    #[test]
+    fn specialized_jit_branch_table_terms_compile_via_typed_index_expr() {
+        let mut constants = TestConstantPool::default();
+        let function = test_function();
+        let entry_label = function.name_gen.next_block_name();
+        let case_label = function.name_gen.next_block_name();
+        let default_label = function.name_gen.next_block_name();
+        let entry = CodegenBlock {
+            label: entry_label,
+            body: vec![],
+            term: BlockTerm::BranchTable(soac_blockpy::block_py::TermBranchTable {
+                index: constants.int_expr(0),
+                targets: vec![case_label],
+                default_label,
+            }),
+            params: vec![],
+            exc_edge: None,
+        };
+        let case_block = CodegenBlock {
+            label: case_label,
+            body: vec![],
+            term: ret_term(constants.int_expr(1)),
+            params: vec![],
+            exc_edge: None,
+        };
+        let default_block = CodegenBlock {
+            label: default_label,
+            body: vec![],
+            term: ret_term(constants.int_expr(2)),
+            params: vec![],
+            exc_edge: None,
+        };
+        let function = with_test_blocks(function, vec![entry, case_block, default_block]);
+        let module = BlockPyModule {
+            module_name_gen: ModuleNameGen::new(0),
+            global_names: Vec::new(),
+            callable_defs: vec![function.clone()],
+            module_constants: constants.module_constants,
+            counter_defs: Vec::new(),
+        };
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        unsafe {
+            let compile_session = crate::session::CompileSession::new();
+            let mut jit_module =
+                new_jit_module(&compile_session).expect("test jit module should construct");
+            let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
+            let counter_ptrs = placeholder_counter_ptrs(0);
+            build_cranelift_run_bb_specialized_function(
+                &mut jit_module,
+                &[1usize as ObjPtr, 2usize as ObjPtr, 3usize as ObjPtr],
+                &module,
+                &function,
+                &module_constants,
+                &[],
+                &module_constant_ptrs,
+                &counter_ptrs,
+                &compile_session,
+                None,
+                None,
+                None,
+            )
+            .expect("branch-table function should build through typed index expression emission");
+        }
+    }
+
     fn direct_call_expr(function_id: FunctionId) -> InstrCodegen {
         InstrCodegen::CallDirect(CallDirect::new(
             none_expr(),
