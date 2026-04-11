@@ -28,8 +28,9 @@ use soac_blockpy::block_py::{
 use soac_blockpy::passes::{
     CodegenModuleShape, FactStore, FunctionRefcountPlan, InstrResolved, InstrTyped, PyExactType,
     PyObjFacts, RefcountActionKind, RefcountReleaseReason, RuntimeHelperId,
-    TypedCodegenModuleShape, ValueFacts, infer_module_value_facts,
-    try_lower_typed_instr_to_codegen_legacy, try_lower_typed_module_to_codegen_legacy,
+    TypedCodegenModuleShape, TypedTruthy, ValueFacts, infer_module_value_facts,
+    lower_codegen_instr_to_typed, try_lower_typed_instr_to_codegen_legacy,
+    try_lower_typed_module_to_codegen_legacy,
 };
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -9543,6 +9544,170 @@ fn emit_codegen_if_target_arm(
     Ok(())
 }
 
+fn emit_codegen_if_from_truth_value(
+    fb: &mut FunctionBuilder<'_>,
+    source_label: BlockLabel,
+    test_instr_id: InstrId,
+    truth: SoacValue,
+    then_label: BlockLabel,
+    else_label: BlockLabel,
+    current_exception_name: Option<&str>,
+    exec_blocks: &[ir::Block],
+    runtime_block_param_names: &[Vec<String>],
+    local_env: &LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<(), String> {
+    let truth_i32 = truth.expect_i32_bool01("if condition truthiness");
+    if let Some(counter_id) = emit_ctx
+        .branch_outcome_counter_ids
+        .get(&test_instr_id)
+        .copied()
+    {
+        emit_record_branch_outcome_sample(fb, counter_id, truth_i32, emit_ctx);
+    }
+
+    let prefer_true = emit_ctx
+        .branch_prefer_true
+        .get(&test_instr_id)
+        .copied()
+        .unwrap_or(true);
+    let hot_cond = if prefer_true {
+        fb.ins()
+            .icmp_imm(ir::condcodes::IntCC::NotEqual, truth_i32, 0)
+    } else {
+        fb.ins().icmp_imm(ir::condcodes::IntCC::Equal, truth_i32, 0)
+    };
+    let hot_branch = fb.create_block();
+    let cold_branch = fb.create_block();
+    fb.ins().brif(hot_cond, hot_branch, &[], cold_branch, &[]);
+
+    let (hot_name, hot_label, cold_name, cold_label) = if prefer_true {
+        ("then", then_label, "else", else_label)
+    } else {
+        ("else", else_label, "then", then_label)
+    };
+    emit_codegen_if_target_arm(
+        fb,
+        source_label,
+        hot_name,
+        hot_branch,
+        hot_label,
+        if hot_label == then_label {
+            RefcountReleaseReason::IfThen { target: hot_label }
+        } else {
+            RefcountReleaseReason::IfElse { target: hot_label }
+        },
+        current_exception_name,
+        exec_blocks,
+        runtime_block_param_names,
+        local_env,
+        emit_ctx,
+        jit_module,
+        func_imports,
+    )?;
+    emit_codegen_if_target_arm(
+        fb,
+        source_label,
+        cold_name,
+        cold_branch,
+        cold_label,
+        if cold_label == then_label {
+            RefcountReleaseReason::IfThen { target: cold_label }
+        } else {
+            RefcountReleaseReason::IfElse { target: cold_label }
+        },
+        current_exception_name,
+        exec_blocks,
+        runtime_block_param_names,
+        local_env,
+        emit_ctx,
+        jit_module,
+        func_imports,
+    )
+}
+
+fn emit_typed_codegen_if_term(
+    fb: &mut FunctionBuilder<'_>,
+    source_label: BlockLabel,
+    if_term: &soac_blockpy::block_py::TermIf<InstrTyped>,
+    exec_blocks: &[ir::Block],
+    runtime_block_param_names: &[Vec<String>],
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+    is_true_ref: ir::FuncRef,
+    current_exception_name: Option<&str>,
+) -> Result<(), String> {
+    let test_instr_id = if_term.test.semantic_instr_id();
+    let test_value = emit_typed_codegen_expr_value_with_local_env(
+        fb,
+        &if_term.test,
+        local_env,
+        emit_ctx,
+        false,
+        jit_module,
+        func_imports,
+    )?;
+    let truth = match test_value {
+        SoacValue::I32 { facts, .. } if facts.is_i32_bool01() => test_value,
+        value => emit_truthy_from_owned_value(fb, value, is_true_ref, emit_ctx),
+    };
+    emit_codegen_if_from_truth_value(
+        fb,
+        source_label,
+        test_instr_id,
+        truth,
+        if_term.then_label,
+        if_term.else_label,
+        current_exception_name,
+        exec_blocks,
+        runtime_block_param_names,
+        local_env,
+        emit_ctx,
+        jit_module,
+        func_imports,
+    )
+}
+
+fn emit_codegen_if_term_via_typed_truthy(
+    fb: &mut FunctionBuilder<'_>,
+    source_label: BlockLabel,
+    if_term: &soac_blockpy::block_py::TermIf<InstrCodegen>,
+    exec_blocks: &[ir::Block],
+    runtime_block_param_names: &[Vec<String>],
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+    is_true_ref: ir::FuncRef,
+    current_exception_name: Option<&str>,
+) -> Result<(), String> {
+    let typed_test = lower_codegen_instr_to_typed(if_term.test.clone());
+    let typed_test =
+        InstrTyped::Truthy(TypedTruthy::new(typed_test).with_meta(if_term.test.meta()));
+    let typed_if_term = soac_blockpy::block_py::TermIf {
+        test: typed_test,
+        then_label: if_term.then_label,
+        else_label: if_term.else_label,
+    };
+    emit_typed_codegen_if_term(
+        fb,
+        source_label,
+        &typed_if_term,
+        exec_blocks,
+        runtime_block_param_names,
+        local_env,
+        emit_ctx,
+        jit_module,
+        func_imports,
+        is_true_ref,
+        current_exception_name,
+    )
+}
+
 fn emit_codegen_term(
     fb: &mut FunctionBuilder<'_>,
     source_label: BlockLabel,
@@ -9624,83 +9789,18 @@ fn emit_codegen_term(
             fb.ins().jump(exec_blocks[target_index], &jump_args);
         }
         BlockTerm::IfTerm(if_term) => {
-            let test_instr_id = if_term.test.semantic_instr_id();
-            let test_value = emit_codegen_expr_value_with_local_env(
-                fb,
-                &if_term.test,
-                local_env,
-                emit_ctx,
-                false,
-                jit_module,
-                func_imports,
-            );
-            let truth = emit_truthy_from_owned_value(fb, test_value, is_true_ref, emit_ctx);
-            let truth_i32 = truth.expect_i32_bool01("if condition truthiness");
-            if let Some(counter_id) = emit_ctx
-                .branch_outcome_counter_ids
-                .get(&test_instr_id)
-                .copied()
-            {
-                emit_record_branch_outcome_sample(fb, counter_id, truth_i32, emit_ctx);
-            }
-
-            let prefer_true = emit_ctx
-                .branch_prefer_true
-                .get(&test_instr_id)
-                .copied()
-                .unwrap_or(true);
-            let hot_cond = if prefer_true {
-                fb.ins()
-                    .icmp_imm(ir::condcodes::IntCC::NotEqual, truth_i32, 0)
-            } else {
-                fb.ins().icmp_imm(ir::condcodes::IntCC::Equal, truth_i32, 0)
-            };
-            let hot_branch = fb.create_block();
-            let cold_branch = fb.create_block();
-            fb.ins().brif(hot_cond, hot_branch, &[], cold_branch, &[]);
-
-            let (hot_name, hot_label, cold_name, cold_label) = if prefer_true {
-                ("then", if_term.then_label, "else", if_term.else_label)
-            } else {
-                ("else", if_term.else_label, "then", if_term.then_label)
-            };
-            emit_codegen_if_target_arm(
+            emit_codegen_if_term_via_typed_truthy(
                 fb,
                 source_label,
-                hot_name,
-                hot_branch,
-                hot_label,
-                if hot_label == if_term.then_label {
-                    RefcountReleaseReason::IfThen { target: hot_label }
-                } else {
-                    RefcountReleaseReason::IfElse { target: hot_label }
-                },
-                current_exception_name,
+                if_term,
                 exec_blocks,
                 runtime_block_param_names,
                 local_env,
                 emit_ctx,
                 jit_module,
                 func_imports,
-            )?;
-            emit_codegen_if_target_arm(
-                fb,
-                source_label,
-                cold_name,
-                cold_branch,
-                cold_label,
-                if cold_label == if_term.then_label {
-                    RefcountReleaseReason::IfThen { target: cold_label }
-                } else {
-                    RefcountReleaseReason::IfElse { target: cold_label }
-                },
+                is_true_ref,
                 current_exception_name,
-                exec_blocks,
-                runtime_block_param_names,
-                local_env,
-                emit_ctx,
-                jit_module,
-                func_imports,
             )?;
         }
         BlockTerm::BranchTable(branch) => {

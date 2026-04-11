@@ -336,6 +336,10 @@ pub fn lower_codegen_module_to_typed(
     CodegenToTyped.map_module(module)
 }
 
+pub fn lower_codegen_instr_to_typed(instr: InstrCodegen) -> InstrTyped {
+    CodegenToTyped.map_instr(instr)
+}
+
 pub fn lower_typed_if_tests_to_truthy(
     mut module: BlockPyModule<TypedCodegenModuleShape>,
 ) -> BlockPyModule<TypedCodegenModuleShape> {

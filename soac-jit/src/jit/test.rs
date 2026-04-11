@@ -403,6 +403,72 @@ mod tests {
         with_test_blocks(function, vec![block])
     }
 
+    #[test]
+    fn specialized_jit_branch_terms_compile_via_typed_truthiness() {
+        let mut constants = TestConstantPool::default();
+        let function = test_function();
+        let entry_label = function.name_gen.next_block_name();
+        let then_label = function.name_gen.next_block_name();
+        let else_label = function.name_gen.next_block_name();
+        let entry = CodegenBlock {
+            label: entry_label,
+            body: vec![],
+            term: BlockTerm::IfTerm(soac_blockpy::block_py::TermIf {
+                test: name_expr(test_runtime_name("TRUE")),
+                then_label,
+                else_label,
+            }),
+            params: vec![],
+            exc_edge: None,
+        };
+        let then_block = CodegenBlock {
+            label: then_label,
+            body: vec![],
+            term: ret_term(constants.int_expr(1)),
+            params: vec![],
+            exc_edge: None,
+        };
+        let else_block = CodegenBlock {
+            label: else_label,
+            body: vec![],
+            term: ret_term(constants.int_expr(0)),
+            params: vec![],
+            exc_edge: None,
+        };
+        let function = with_test_blocks(function, vec![entry, then_block, else_block]);
+        let module = BlockPyModule {
+            module_name_gen: ModuleNameGen::new(0),
+            global_names: Vec::new(),
+            callable_defs: vec![function.clone()],
+            module_constants: constants.module_constants,
+            counter_defs: Vec::new(),
+        };
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        unsafe {
+            let compile_session = crate::session::CompileSession::new();
+            let mut jit_module =
+                new_jit_module(&compile_session).expect("test jit module should construct");
+            let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
+            let counter_ptrs = placeholder_counter_ptrs(0);
+            build_cranelift_run_bb_specialized_function(
+                &mut jit_module,
+                &[1usize as ObjPtr, 2usize as ObjPtr, 3usize as ObjPtr],
+                &module,
+                &function,
+                &module_constants,
+                &[],
+                &module_constant_ptrs,
+                &counter_ptrs,
+                &compile_session,
+                None,
+                None,
+                None,
+            )
+            .expect("branch function should build through typed truthiness emission");
+        }
+    }
+
     fn direct_call_expr(function_id: FunctionId) -> InstrCodegen {
         InstrCodegen::CallDirect(CallDirect::new(
             none_expr(),
@@ -1403,13 +1469,9 @@ def write_point(point, value):
                     )
                 });
 
-            let shared_state = crate::module_type::build_shared_state_for_testing(
-                py,
-                lowered,
-                "counter_test",
-                "",
-            )
-            .expect("shared state should build");
+            let shared_state =
+                crate::module_type::build_shared_state_for_testing(py, lowered, "counter_test", "")
+                    .expect("shared state should build");
             let runtime = unsafe { build_test_module_runtime(py, shared_state.clone()) };
             let module_constant_ptrs = shared_state.module_constant_ptrs();
             let counter_ptrs = shared_state.counter_ptrs();
