@@ -3080,6 +3080,19 @@ fn emit_checked_owned_pyobject_call_with_cleanup(
     emit_checked_owned_pyobject_result(fb, value, ctx)
 }
 
+fn emit_checked_owned_pyobject_call_value_with_cleanup(
+    fb: &mut FunctionBuilder<'_>,
+    ctx: &JitEmitCtx<'_>,
+    func_ref: ir::FuncRef,
+    args: &[ir::Value],
+    owned_inputs: &[ir::Value],
+    facts: PyObjFacts,
+) -> SoacValue {
+    let value =
+        emit_checked_owned_pyobject_call_with_cleanup(fb, ctx, func_ref, args, owned_inputs);
+    SoacValue::pyobject(value, facts)
+}
+
 fn emit_owned_module_constant_from_parts(
     fb: &mut FunctionBuilder<'_>,
     constant_id: ModuleConstantId,
@@ -4333,18 +4346,24 @@ fn emit_to_python_long(
 ) -> SoacValue {
     match value {
         pyobject @ SoacValue::PyObject { .. } => pyobject,
-        SoacValue::I64 { value, .. } => {
-            let result_inst = fb.ins().call(py_long_from_i64_ref, &[value]);
-            let result_value = fb.inst_results(result_inst)[0];
-            let result = emit_checked_owned_pyobject_result(fb, result_value, ctx);
-            SoacValue::pyobject(result, PyObjFacts::exact_type(PyExactType::Int))
-        }
+        SoacValue::I64 { value, .. } => emit_checked_owned_pyobject_call_value_with_cleanup(
+            fb,
+            ctx,
+            py_long_from_i64_ref,
+            &[value],
+            &[],
+            PyObjFacts::exact_type(PyExactType::Int),
+        ),
         SoacValue::I32 { value, .. } => {
             let value_i64 = fb.ins().sextend(ctx.consts.i64_ty, value);
-            let result_inst = fb.ins().call(py_long_from_i64_ref, &[value_i64]);
-            let result_value = fb.inst_results(result_inst)[0];
-            let result = emit_checked_owned_pyobject_result(fb, result_value, ctx);
-            SoacValue::pyobject(result, PyObjFacts::exact_type(PyExactType::Int))
+            emit_checked_owned_pyobject_call_value_with_cleanup(
+                fb,
+                ctx,
+                py_long_from_i64_ref,
+                &[value_i64],
+                &[],
+                PyObjFacts::exact_type(PyExactType::Int),
+            )
         }
     }
 }
