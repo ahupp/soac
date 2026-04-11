@@ -10034,7 +10034,12 @@ fn emit_codegen_term(
                 current_exception_name,
             )?;
         }
-        BlockTerm::Raise(raise_stmt) => {
+        BlockTerm::Raise(_) => {
+            let BlockTerm::Raise(typed_raise_stmt) = typed_term else {
+                return Err(format!(
+                    "typed term kind mismatch for Raise in block {source_label}"
+                ));
+            };
             let raise_name_obj = emit_owned_module_constant(
                 fb,
                 emit_ctx
@@ -10063,8 +10068,8 @@ fn emit_codegen_term(
 
             fb.switch_to_block(raise_fn_ok);
             let rfo_raise_fn = fb.block_params(raise_fn_ok)[0];
-            let exc_value = if let Some(exc_expr) = raise_stmt.exc.as_ref() {
-                emit_codegen_expr_with_local_env(
+            let exc_value = if let Some(exc_expr) = typed_raise_stmt.exc.as_ref() {
+                emit_typed_codegen_expr_with_local_env(
                     fb,
                     exc_expr,
                     local_env,
@@ -10072,7 +10077,7 @@ fn emit_codegen_term(
                     false,
                     jit_module,
                     func_imports,
-                )
+                )?
             } else {
                 fb.ins()
                     .call(emit_ctx.incref_ref, &[emit_ctx.consts.none_const]);
