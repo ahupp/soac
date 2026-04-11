@@ -149,9 +149,97 @@ impl Instr for InstrCodegenOp {
     type Name = ResolvedName;
 }
 
+#[derive(Clone)]
+pub struct TypedTruthy<E: Instr> {
+    _meta: Meta,
+    value: Box<E>,
+}
+
+impl<E: Instr> TypedTruthy<E> {
+    pub fn new(value: impl Into<Box<E>>) -> Self {
+        Self {
+            _meta: Meta::default(),
+            value: value.into(),
+        }
+    }
+
+    pub fn value(&self) -> &E {
+        &self.value
+    }
+
+    pub fn into_value(self) -> E {
+        *self.value
+    }
+}
+
+impl<E: Instr + std::fmt::Debug> std::fmt::Debug for TypedTruthy<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("TypedTruthy").field(&self.value).finish()
+    }
+}
+
+impl<E: Instr> HasMeta for TypedTruthy<E> {
+    fn meta(&self) -> Meta {
+        self._meta.clone()
+    }
+}
+
+impl<E: Instr> WithMeta for TypedTruthy<E> {
+    fn with_meta(mut self, meta: Meta) -> Self {
+        self._meta = meta;
+        self
+    }
+}
+
+impl<E> ChildVisitable<E> for TypedTruthy<E>
+where
+    E: Instr + ChildVisitable<E>,
+{
+    fn visit_children<V>(&self, visitor: &mut V)
+    where
+        V: crate::block_py::Visit<E> + ?Sized,
+    {
+        visitor.visit_instr(&self.value);
+    }
+
+    fn visit_children_mut<V>(&mut self, visitor: &mut V)
+    where
+        V: crate::block_py::VisitMut<E> + ?Sized,
+    {
+        visitor.visit_instr_mut(&mut self.value);
+    }
+}
+
+impl<E: Instr> Mappable<E> for TypedTruthy<E> {
+    type Mapped<T: Instr> = TypedTruthy<T>;
+
+    fn map_children<T, M>(self, map: &mut M) -> Self::Mapped<T>
+    where
+        T: Instr,
+        M: MapInstr<E, T>,
+    {
+        TypedTruthy {
+            _meta: self._meta,
+            value: Box::new(map.map_instr(*self.value)),
+        }
+    }
+
+    fn try_map_children<T, Error, M>(self, map: &mut M) -> Result<Self::Mapped<T>, Error>
+    where
+        T: Instr,
+        M: TryMapInstr<E, T, Error>,
+    {
+        Ok(TypedTruthy {
+            _meta: self._meta,
+            value: Box::new(map.try_map_instr(*self.value)?),
+        })
+    }
+}
+
 #[derive(Clone, derive_more::From, DelegateMatchDefault)]
 #[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, Debug)]
 pub enum InstrTyped {
+    Truthy(TypedTruthy<Self>),
     LegacyBinOp(BinOp<Self>),
     LegacyUnaryOp(UnaryOp<Self>),
     LegacyCalleeFunctionId(CalleeFunctionId<Self>),
@@ -248,11 +336,34 @@ pub fn lower_codegen_module_to_typed(
     CodegenToTyped.map_module(module)
 }
 
+pub fn lower_typed_if_tests_to_truthy(
+    mut module: BlockPyModule<TypedCodegenModuleShape>,
+) -> BlockPyModule<TypedCodegenModuleShape> {
+    for function in &mut module.callable_defs {
+        for block in &mut function.blocks {
+            if let crate::block_py::BlockTerm::IfTerm(if_term) = &mut block.term {
+                if matches!(if_term.test, InstrTyped::Truthy(_)) {
+                    continue;
+                }
+                let old_test = std::mem::replace(&mut if_term.test, InstrTyped::constant_none());
+                let meta = old_test.meta();
+                if_term.test = InstrTyped::Truthy(TypedTruthy::new(old_test).with_meta(meta));
+            }
+        }
+    }
+    module
+}
+
 struct TypedToCodegen;
 
 impl TryMapInstr<InstrTyped, InstrCodegen, String> for TypedToCodegen {
     fn try_map_instr(&mut self, instr: InstrTyped) -> Result<InstrCodegen, String> {
         Ok(match instr {
+            InstrTyped::Truthy(_) => {
+                return Err(
+                    "typed truthiness instruction requires typed codegen emission".to_string(),
+                );
+            }
             InstrTyped::LegacyBinOp(op) => InstrCodegenOp::BinOp(op.try_map_children(self)?),
             InstrTyped::LegacyUnaryOp(op) => InstrCodegenOp::UnaryOp(op.try_map_children(self)?),
             InstrTyped::LegacyCalleeFunctionId(op) => {
@@ -571,6 +682,7 @@ mod typed_codegen_tests {
     #[derive(Default)]
     struct LegacyInstrCounter {
         total: usize,
+        truthy: usize,
         binops: usize,
         non_legacy: usize,
     }
@@ -578,6 +690,9 @@ mod typed_codegen_tests {
     impl Visit<InstrTyped> for LegacyInstrCounter {
         fn visit_instr(&mut self, expr: &InstrTyped) {
             self.total += 1;
+            if matches!(expr, InstrTyped::Truthy(_)) {
+                self.truthy += 1;
+            }
             if !expr.is_legacy() {
                 self.non_legacy += 1;
             }
@@ -645,6 +760,7 @@ mod typed_codegen_tests {
 
         assert!(counter.total > 0);
         assert!(counter.binops > 0);
+        assert_eq!(counter.truthy, 0);
         assert_eq!(counter.non_legacy, 0);
     }
 
@@ -662,6 +778,40 @@ mod typed_codegen_tests {
         assert_eq!(count_codegen_instrs(&round_tripped), original_counts);
         assert!(original_counts.binops > 0);
         assert!(original_counts.calls > 0);
+    }
+
+    #[test]
+    fn lower_typed_if_tests_to_truthy_wraps_branch_conditions() {
+        let lowered = crate::lower_python_to_blockpy_for_testing(
+            "def f(x):\n    if x:\n        return 1\n    return 0\n",
+        )
+        .expect("source should lower");
+        let typed = lower_codegen_module_to_typed(lowered.codegen_module);
+
+        let typed = lower_typed_if_tests_to_truthy(typed);
+
+        let mut counter = LegacyInstrCounter::default();
+        for function in &typed.callable_defs {
+            for block in &function.blocks {
+                if let crate::block_py::BlockTerm::IfTerm(if_term) = &block.term {
+                    assert!(
+                        matches!(if_term.test, InstrTyped::Truthy(_)),
+                        "typed if test should be wrapped in an explicit truthiness op"
+                    );
+                }
+                for instr in &block.body {
+                    counter.visit_instr(instr);
+                }
+                counter.visit_term(&block.term);
+            }
+        }
+
+        assert!(counter.truthy > 0);
+        assert_eq!(counter.non_legacy, counter.truthy);
+        assert!(
+            try_lower_typed_module_to_codegen_legacy(typed).is_err(),
+            "non-legacy typed truthiness should not silently lower through the legacy adapter"
+        );
     }
 }
 
