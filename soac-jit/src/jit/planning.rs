@@ -43,21 +43,55 @@ pub enum ParamProvenance {
     StackSlot(LocalLocation),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeBlockParamEntryStorage {
+    LocalOnly,
+    StackMirror,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockParamFacts {
+    pub value: Option<PyObjFacts>,
+    pub binding: ParamBindingFacts,
+    pub provenance: ParamProvenance,
+    pub ownership: LocalRefKind,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlannedLocalBinding {
     pub name: String,
     pub location: LocalLocation,
-    pub ref_kind: LocalRefKind,
-    pub facts: Option<PyObjFacts>,
     pub storage: PlannedLocalStorage,
-    pub binding_facts: ParamBindingFacts,
-    pub provenance: ParamProvenance,
+    pub param_facts: BlockParamFacts,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlockLocalPlan {
     pub label: BlockLabel,
     pub entry_locals: Vec<PlannedLocalBinding>,
+}
+
+fn is_try_exception_alias_name(name: &str) -> bool {
+    name.starts_with("_dp_try_exc_")
+}
+
+impl BlockLocalPlan {
+    pub fn binding_for_name(&self, name: &str) -> Option<&PlannedLocalBinding> {
+        self.entry_locals
+            .iter()
+            .find(|binding| binding.name == name)
+    }
+
+    pub fn binding_for_block_arg_name(&self, name: &str) -> Option<&PlannedLocalBinding> {
+        self.binding_for_name(name).or_else(|| {
+            if !is_try_exception_alias_name(name) {
+                return None;
+            }
+            self.entry_locals
+                .iter()
+                .find(|binding| is_try_exception_alias_name(binding.name.as_str()))
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -129,18 +163,20 @@ pub fn plan_function_locals(
                 PlannedLocalBinding {
                     name: name.clone(),
                     location,
-                    ref_kind: local_ref_kind_for_block_entry(
-                        function,
-                        block.label == entry_label,
-                        name,
-                        explicit_param_names.contains(name.as_str()),
-                        is_must_bound_on_entry,
-                        py_facts,
-                    ),
-                    facts: py_facts,
                     storage,
-                    binding_facts,
-                    provenance,
+                    param_facts: BlockParamFacts {
+                        value: py_facts,
+                        binding: binding_facts,
+                        provenance,
+                        ownership: local_ref_kind_for_block_entry(
+                            function,
+                            block.label == entry_label,
+                            name,
+                            explicit_param_names.contains(name.as_str()),
+                            is_must_bound_on_entry,
+                            py_facts,
+                        ),
+                    },
                 }
             })
             .collect();
@@ -312,33 +348,138 @@ pub struct BlockExcDispatchPlan {
     pub forwarded_local_names: Vec<String>,
 }
 
-pub fn jit_param_names_for_block(block: &CodegenBlock) -> Vec<String> {
-    block.bb_param_names().map(ToString::to_string).collect()
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeBlockParamPlan {
+    pub arg_name: String,
+    pub binding: PlannedLocalBinding,
+    pub entry_aliases: Vec<String>,
+    pub entry_ref_kind: LocalRefKind,
+    pub entry_storage: RuntimeBlockParamEntryStorage,
+    pub stack_seed_ref_kind: LocalRefKind,
 }
 
-pub fn planned_jit_param_names_for_block(
-    block: &CodegenBlock,
-    block_plan: Option<&BlockLocalPlan>,
-) -> Vec<String> {
-    let mut names = jit_param_names_for_block(block);
-    if let Some(block_plan) = block_plan {
-        for binding in &block_plan.entry_locals {
-            if binding.storage != PlannedLocalStorage::BlockParam {
-                continue;
-            }
-            if names.iter().any(|name| name == &binding.name) {
-                continue;
-            }
-            names.push(binding.name.clone());
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlannedStackSlotEntrySeed {
+    pub binding: PlannedLocalBinding,
+    pub entry_ref_kind: LocalRefKind,
+}
+
+pub fn local_ref_kind_for_stack_mirror(ref_kind: LocalRefKind) -> LocalRefKind {
+    match ref_kind {
+        LocalRefKind::Immortal => LocalRefKind::Immortal,
+        LocalRefKind::Unbound => LocalRefKind::Unbound,
+        LocalRefKind::Owned | LocalRefKind::Borrowed | LocalRefKind::Unknown => {
+            LocalRefKind::Borrowed
         }
     }
-    names
+}
+
+pub fn planned_jit_params_for_function(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    local_plan: &FunctionLocalPlan,
+) -> Result<Vec<Vec<RuntimeBlockParamPlan>>, String> {
+    function
+        .blocks
+        .iter()
+        .map(|block| {
+            let mut params = Vec::new();
+            let mut seen_names = HashSet::new();
+            let block_plan = local_plan.block(block.label);
+            for name in block.bb_param_names() {
+                let arg_name = name.to_string();
+                seen_names.insert(arg_name.clone());
+                let Some(binding) = block_plan
+                    .and_then(|plan| plan.binding_for_block_arg_name(arg_name.as_str()).cloned())
+                else {
+                    return Err(format!(
+                        "missing runtime block-param binding for function {} ({}) block {} arg {:?}",
+                        function.function_id, function.names.qualname, block.label, arg_name
+                    ));
+                };
+                let entry_storage = match binding.storage {
+                    PlannedLocalStorage::BlockParam => RuntimeBlockParamEntryStorage::LocalOnly,
+                    PlannedLocalStorage::StackSlot => RuntimeBlockParamEntryStorage::StackMirror,
+                };
+                let entry_ref_kind = match entry_storage {
+                    RuntimeBlockParamEntryStorage::LocalOnly => binding.param_facts.ownership,
+                    RuntimeBlockParamEntryStorage::StackMirror => {
+                        local_ref_kind_for_stack_mirror(binding.param_facts.ownership)
+                    }
+                };
+                let entry_aliases = if arg_name == binding.name {
+                    Vec::new()
+                } else {
+                    vec![arg_name.clone()]
+                };
+                params.push(RuntimeBlockParamPlan {
+                    arg_name,
+                    stack_seed_ref_kind: local_ref_kind_for_stack_mirror(
+                        binding.param_facts.ownership,
+                    ),
+                    entry_aliases,
+                    entry_ref_kind,
+                    entry_storage,
+                    binding,
+                });
+            }
+            if let Some(block_plan) = block_plan {
+                for binding in &block_plan.entry_locals {
+                    if binding.storage != PlannedLocalStorage::BlockParam {
+                        continue;
+                    }
+                    if !seen_names.insert(binding.name.clone()) {
+                        continue;
+                    }
+                    params.push(RuntimeBlockParamPlan {
+                        arg_name: binding.name.clone(),
+                        binding: binding.clone(),
+                        entry_aliases: Vec::new(),
+                        entry_ref_kind: binding.param_facts.ownership,
+                        entry_storage: RuntimeBlockParamEntryStorage::LocalOnly,
+                        stack_seed_ref_kind: local_ref_kind_for_stack_mirror(
+                            binding.param_facts.ownership,
+                        ),
+                    });
+                }
+            }
+            Ok(params)
+        })
+        .collect()
+}
+
+pub fn planned_stack_slot_entry_seeds_for_function(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    local_plan: &FunctionLocalPlan,
+) -> Vec<Vec<PlannedStackSlotEntrySeed>> {
+    function
+        .blocks
+        .iter()
+        .map(|block| {
+            local_plan
+                .block(block.label)
+                .map(|block_plan| {
+                    block_plan
+                        .entry_locals
+                        .iter()
+                        .filter(|binding| binding.storage == PlannedLocalStorage::StackSlot)
+                        .cloned()
+                        .map(|binding| PlannedStackSlotEntrySeed {
+                            entry_ref_kind: local_ref_kind_for_stack_mirror(
+                                binding.param_facts.ownership,
+                            ),
+                            binding,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .collect()
 }
 
 pub fn exc_dispatch_plan(
     function: &BlockPyFunction<CodegenModuleShape>,
     block: &CodegenBlock,
-    runtime_target_params: &[String],
+    runtime_target_params: &[RuntimeBlockParamPlan],
 ) -> Option<BlockExcDispatchPlan> {
     let exc_edge = block.exc_edge.as_ref()?;
     let target_index = exc_edge.target.index();
@@ -357,7 +498,7 @@ pub fn exc_dispatch_plan(
         .unwrap_or_default();
     let runtime_param_name_set = runtime_target_params
         .iter()
-        .map(String::as_str)
+        .map(|param| param.arg_name.as_str())
         .collect::<HashSet<_>>();
     let full_target_param_names = target_block.param_name_vec();
     let mut slot_writes = Vec::new();
@@ -376,7 +517,8 @@ pub fn exc_dispatch_plan(
         .collect::<HashMap<_, _>>();
     let target_args: Vec<(String, BlockArg)> = runtime_target_params
         .iter()
-        .map(|name| {
+        .map(|param| {
+            let name = param.arg_name.clone();
             (
                 name.clone(),
                 explicit_args_by_name
@@ -473,12 +615,18 @@ def f(flag):
         for label in [if_term.then_label, if_term.else_label] {
             let block_plan = plan.block(label).expect("missing block local plan");
             let x = binding_for_name(block_plan, "x");
-            assert_eq!(x.ref_kind, LocalRefKind::Immortal);
+            assert_eq!(x.param_facts.ownership, LocalRefKind::Immortal);
             assert_eq!(x.storage, PlannedLocalStorage::BlockParam);
-            assert_eq!(x.binding_facts, ParamBindingFacts::DefinitelyBound);
-            assert_eq!(x.provenance, ParamProvenance::ForwardedLocal(x.location));
+            assert_eq!(x.param_facts.binding, ParamBindingFacts::DefinitelyBound);
+            assert_eq!(
+                x.param_facts.provenance,
+                ParamProvenance::ForwardedLocal(x.location)
+            );
             assert!(
-                x.facts.expect("x should have entry facts").is_none(),
+                x.param_facts
+                    .value
+                    .expect("x should have entry facts")
+                    .is_none(),
                 "x should keep the underlying None singleton fact"
             );
         }
@@ -502,11 +650,14 @@ def f(x):
             .block(entry_block.label)
             .expect("missing entry block local plan");
         let x = binding_for_name(block_plan, "x");
-        assert_eq!(x.ref_kind, LocalRefKind::Owned);
-        assert_eq!(x.facts, None);
+        assert_eq!(x.param_facts.ownership, LocalRefKind::Owned);
+        assert_eq!(x.param_facts.value, None);
         assert_eq!(x.storage, PlannedLocalStorage::BlockParam);
-        assert_eq!(x.binding_facts, ParamBindingFacts::DefinitelyBound);
-        assert_eq!(x.provenance, ParamProvenance::ForwardedLocal(x.location));
+        assert_eq!(x.param_facts.binding, ParamBindingFacts::DefinitelyBound);
+        assert_eq!(
+            x.param_facts.provenance,
+            ParamProvenance::ForwardedLocal(x.location)
+        );
     }
 
     #[test]
@@ -534,18 +685,137 @@ def f(flag):
             .expect("expected lowered conditional branch");
         let facts = infer_module_value_facts(&lowered);
         let plan = plan_function_locals(function, &facts);
+        let runtime_params =
+            planned_jit_params_for_function(function, &plan).expect("runtime params should bind");
 
-        let then_block = &function.blocks[if_term.then_label.index()];
-        let then_params =
-            planned_jit_param_names_for_block(then_block, plan.block(if_term.then_label));
-        assert!(then_params.iter().any(|name| name == "x"));
-        assert!(!then_params.iter().any(|name| name == "y"));
+        let then_params = &runtime_params[if_term.then_label.index()];
+        assert!(then_params.iter().any(|param| param.arg_name == "x"));
+        assert!(!then_params.iter().any(|param| param.arg_name == "y"));
 
-        let else_block = &function.blocks[if_term.else_label.index()];
-        let else_params =
-            planned_jit_param_names_for_block(else_block, plan.block(if_term.else_label));
-        assert!(else_params.iter().any(|name| name == "y"));
-        assert!(!else_params.iter().any(|name| name == "x"));
+        let else_params = &runtime_params[if_term.else_label.index()];
+        assert!(else_params.iter().any(|param| param.arg_name == "y"));
+        assert!(!else_params.iter().any(|param| param.arg_name == "x"));
+    }
+
+    #[test]
+    fn planned_jit_params_keep_binding_metadata_for_forwarded_locals() {
+        let (lowered, function_index) = lowered_function(
+            r#"
+def f(flag):
+    x = None
+    if flag:
+        return x
+    return x
+"#,
+            "f",
+        );
+        let function = &lowered.callable_defs[function_index];
+        let if_term = function
+            .blocks
+            .iter()
+            .filter_map(|block| match &block.term {
+                BlockTerm::IfTerm(if_term) => Some(if_term),
+                _ => None,
+            })
+            .last()
+            .expect("expected lowered conditional branch");
+        let facts = infer_module_value_facts(&lowered);
+        let plan = plan_function_locals(function, &facts);
+        let runtime_params =
+            planned_jit_params_for_function(function, &plan).expect("runtime params should bind");
+        let then_params = &runtime_params[if_term.then_label.index()];
+        let x = then_params
+            .iter()
+            .find(|param| param.arg_name == "x")
+            .expect("expected forwarded x param");
+        let binding = &x.binding;
+        assert_eq!(binding.name, "x");
+        assert_eq!(binding.storage, PlannedLocalStorage::BlockParam);
+        assert_eq!(
+            binding.param_facts.binding,
+            ParamBindingFacts::DefinitelyBound
+        );
+    }
+
+    #[test]
+    fn planned_jit_params_for_function_validate_handler_exception_carriers() {
+        let (lowered, function_index) = lowered_function(
+            r#"
+def f():
+    try:
+        raise ValueError("boom")
+    except ValueError:
+        return 1
+"#,
+            "f",
+        );
+        let function = &lowered.callable_defs[function_index];
+        let facts = infer_module_value_facts(&lowered);
+        let plan = plan_function_locals(function, &facts);
+
+        let runtime_params =
+            planned_jit_params_for_function(function, &plan).expect("runtime params should bind");
+        let handler_params = runtime_params
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| {
+                function.blocks[*index]
+                    .param_names()
+                    .any(|name| name.starts_with("_dp_try_exc_"))
+            })
+            .flat_map(|(_, params)| params.iter())
+            .collect::<Vec<_>>();
+
+        assert!(
+            !handler_params.is_empty(),
+            "expected at least one handler runtime param set"
+        );
+        assert!(
+            handler_params
+                .iter()
+                .all(|param| param.binding.name.starts_with("_dp_try_exc_")
+                    || !param.arg_name.starts_with("_dp_try_exc_")),
+            "validated handler runtime params should preserve bound exception-carrier names: {handler_params:#?}"
+        );
+    }
+
+    #[test]
+    fn planned_stack_slot_entry_seeds_preserve_checked_load_semantics() {
+        let (lowered, function_index) = lowered_function(
+            r#"
+def f(flag):
+    x = 1
+    if flag:
+        return 1
+    return 0
+"#,
+            "f",
+        );
+        let function = &lowered.callable_defs[function_index];
+        let if_term = function
+            .blocks
+            .iter()
+            .filter_map(|block| match &block.term {
+                BlockTerm::IfTerm(if_term) => Some(if_term),
+                _ => None,
+            })
+            .last()
+            .expect("expected lowered conditional branch");
+        let facts = infer_module_value_facts(&lowered);
+        let plan = plan_function_locals(function, &facts);
+        let seeds = planned_stack_slot_entry_seeds_for_function(function, &plan);
+
+        let else_seeds = &seeds[if_term.else_label.index()];
+        let x = else_seeds
+            .iter()
+            .find(|seed| seed.binding.name == "x")
+            .expect("expected planned stack-slot seed for x");
+        assert_eq!(x.binding.storage, PlannedLocalStorage::StackSlot);
+        assert_eq!(
+            x.binding.param_facts.binding,
+            ParamBindingFacts::CheckedLocalValue
+        );
+        assert_eq!(x.entry_ref_kind, LocalRefKind::Borrowed);
     }
 
     #[test]
@@ -563,23 +833,19 @@ def f(flag):
         let facts = infer_module_value_facts(&lowered);
         let plan = plan_function_locals(function, &facts);
         let entry_label = function.entry_block().label;
+        let runtime_params =
+            planned_jit_params_for_function(function, &plan).expect("runtime params should bind");
 
         let non_entry_x_bindings = function
             .blocks
             .iter()
-            .filter(|block| block.label != entry_label)
-            .filter_map(|block| {
-                let runtime_param_names =
-                    planned_jit_param_names_for_block(block, plan.block(block.label));
-                if !runtime_param_names.iter().any(|name| name == "x") {
-                    return None;
-                }
-                plan.block(block.label).and_then(|block_plan| {
-                    block_plan
-                        .entry_locals
-                        .iter()
-                        .find(|binding| binding.name == "x")
-                })
+            .enumerate()
+            .filter(|(_, block)| block.label != entry_label)
+            .filter_map(|(index, _)| {
+                runtime_params[index]
+                    .iter()
+                    .find(|param| param.arg_name == "x")
+                    .map(|param| &param.binding)
             })
             .collect::<Vec<_>>();
 
@@ -596,13 +862,13 @@ def f(flag):
         assert!(
             non_entry_x_bindings
                 .iter()
-                .all(|binding| binding.binding_facts == ParamBindingFacts::MaybeUnbound),
+                .all(|binding| binding.param_facts.binding == ParamBindingFacts::MaybeUnbound),
             "maybe-unbound live-ins should preserve checked local-load semantics: {non_entry_x_bindings:?}"
         );
         assert!(
             non_entry_x_bindings
                 .iter()
-                .all(|binding| binding.provenance
+                .all(|binding| binding.param_facts.provenance
                     == ParamProvenance::ForwardedLocal(binding.location)),
             "maybe-unbound live-ins should preserve forwarded-local provenance: {non_entry_x_bindings:?}"
         );
@@ -655,16 +921,15 @@ def f():
         let function = &lowered.callable_defs[function_index];
         let facts = infer_module_value_facts(&lowered);
         let local_plan = plan_function_locals(function, &facts);
+        let runtime_params = planned_jit_params_for_function(function, &local_plan)
+            .expect("runtime params should bind");
         let source_block = function
             .blocks
             .iter()
             .find(|block| block.exc_edge.is_some())
             .expect("expected exception edge source block");
         let exc_edge = source_block.exc_edge.as_ref().expect("checked above");
-        let runtime_target_params = planned_jit_param_names_for_block(
-            &function.blocks[exc_edge.target.index()],
-            local_plan.block(exc_edge.target),
-        );
+        let runtime_target_params = &runtime_params[exc_edge.target.index()];
         let dispatch_plan = exc_dispatch_plan(function, source_block, &runtime_target_params)
             .expect("expected exception dispatch plan");
 

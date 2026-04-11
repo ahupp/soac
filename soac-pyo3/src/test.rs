@@ -5,7 +5,7 @@ use soac_blockpy::passes::infer_module_value_facts;
 use soac_jit::{
     exc_dispatch_plan,
     module_type::{hash_module_source, indexed_module_info},
-    plan_function_locals, planned_jit_param_names_for_block,
+    plan_function_locals, planned_jit_params_for_function,
 };
 use std::any::Any;
 use std::collections::HashSet;
@@ -334,11 +334,8 @@ def exercise():
     let registered_function = gen_function;
     let value_facts = infer_module_value_facts(&normalized);
     let local_plan = plan_function_locals(registered_function, &value_facts);
-    let plan_runtime_param_names = registered_function
-        .blocks
-        .iter()
-        .map(|block| planned_jit_param_names_for_block(block, local_plan.block(block.label)))
-        .collect::<Vec<_>>();
+    let plan_runtime_params = planned_jit_params_for_function(registered_function, &local_plan)
+        .expect("runtime params should bind");
     let plan_exc_dispatches = registered_function
         .blocks
         .iter()
@@ -346,13 +343,13 @@ def exercise():
             let runtime_target_params = block
                 .exc_edge
                 .as_ref()
-                .map(|edge| plan_runtime_param_names[edge.target.index()].as_slice())
+                .map(|edge| plan_runtime_params[edge.target.index()].as_slice())
                 .unwrap_or(&[]);
             exc_dispatch_plan(registered_function, block, runtime_target_params)
         })
         .collect::<Vec<_>>();
 
-    let handler_entry_targets = plan_runtime_param_names
+    let handler_entry_targets = plan_runtime_params
         .iter()
         .enumerate()
         .filter(|(index, _)| {
@@ -366,7 +363,7 @@ def exercise():
     assert!(
         !handler_entry_targets.is_empty(),
         "expected at least one except handler block with an explicit try-exception carrier: {:?}",
-        plan_runtime_param_names
+        plan_runtime_params
     );
     assert!(
         plan_exc_dispatches
@@ -374,9 +371,9 @@ def exercise():
             .filter_map(|dispatch| dispatch.as_ref())
             .any(|dispatch| {
                 handler_entry_targets.contains(&dispatch.target_index)
-                    && (plan_runtime_param_names[dispatch.target_index]
+                    && (plan_runtime_params[dispatch.target_index]
                         .iter()
-                        .any(|name| name.starts_with("_dp_try_exc_"))
+                        .any(|param| param.arg_name.starts_with("_dp_try_exc_"))
                         || dispatch.slot_writes.iter().any(|(_, source)| {
                             matches!(source, soac_blockpy::block_py::BlockArg::CurrentException)
                         }))

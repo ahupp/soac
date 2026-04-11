@@ -66,10 +66,12 @@ mod specialized_helpers;
 mod typed_value;
 
 pub use planning::{
-    BlockExcDispatchPlan, BlockLocalPlan, CurrentJitRefcountPlanCheck, FunctionLocalPlan,
-    LocalRefKind, ParamBindingFacts, ParamProvenance, PlannedLocalBinding, PlannedLocalStorage,
-    check_refcount_plan_against_current_jit, exc_dispatch_plan, plan_function_locals,
-    plan_function_refcount_ownership, planned_jit_param_names_for_block,
+    BlockExcDispatchPlan, BlockParamFacts, CurrentJitRefcountPlanCheck, FunctionLocalPlan,
+    LocalRefKind, ParamBindingFacts, ParamProvenance, PlannedStackSlotEntrySeed,
+    RuntimeBlockParamEntryStorage, RuntimeBlockParamPlan, check_refcount_plan_against_current_jit,
+    exc_dispatch_plan, local_ref_kind_for_stack_mirror, plan_function_locals,
+    plan_function_refcount_ownership, planned_jit_params_for_function,
+    planned_stack_slot_entry_seeds_for_function,
 };
 use runtime_context::{
     FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET, FUNCTION_ENV_GLOBALS_OBJ_OFFSET,
@@ -2768,10 +2770,7 @@ impl LocalEnv {
                 value,
                 ref_kind: local_ref_kind_for_stack_mirror(value_ref_kind),
                 storage: LocalEnvStorage::StackMirror,
-                binding_facts: local_binding_facts_for_storage(
-                    LocalEnvStorage::StackMirror,
-                    value_ref_kind,
-                ),
+                binding_facts: local_binding_facts_for_stored_value(value_ref_kind),
             });
         } else {
             self.entries.push(LocalEnvEntry {
@@ -2784,10 +2783,7 @@ impl LocalEnv {
                 value,
                 ref_kind: value_ref_kind,
                 storage: LocalEnvStorage::LocalOnly,
-                binding_facts: local_binding_facts_for_storage(
-                    LocalEnvStorage::LocalOnly,
-                    value_ref_kind,
-                ),
+                binding_facts: local_binding_facts_for_stored_value(value_ref_kind),
             });
         }
         if let Some(previous) = previous_entry {
@@ -2817,10 +2813,7 @@ impl LocalEnv {
             value,
             ref_kind: value_ref_kind,
             storage: LocalEnvStorage::LocalOnly,
-            binding_facts: local_binding_facts_for_storage(
-                LocalEnvStorage::LocalOnly,
-                value_ref_kind,
-            ),
+            binding_facts: local_binding_facts_for_stored_value(value_ref_kind),
         });
         if let Some(previous) = previous_entry {
             if transient_local_needs_decref(previous.ref_kind) {
@@ -2878,7 +2871,7 @@ impl LocalEnv {
             value: null_ptr,
             ref_kind: LocalRefKind::Unbound,
             storage: unbound_storage,
-            binding_facts: local_binding_facts_for_storage(unbound_storage, LocalRefKind::Unbound),
+            binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Unbound),
         });
         Ok(())
     }
@@ -2943,38 +2936,15 @@ impl LocalEnv {
     }
 }
 
-fn planned_entry_binding_for_block_arg_name<'a>(
-    block_plan: Option<&'a BlockLocalPlan>,
-    name: &str,
-) -> Option<&'a PlannedLocalBinding> {
-    let entry_locals = &block_plan?.entry_locals;
-    entry_locals
-        .iter()
-        .find(|binding| binding.name == name)
-        .or_else(|| {
-            if !is_try_exception_alias_name(name) {
-                return None;
-            }
-            entry_locals
-                .iter()
-                .find(|binding| is_try_exception_alias_name(binding.name.as_str()))
-        })
-}
-
 fn bind_planned_stack_slot_entries_at_block_entry(
     fb: &mut FunctionBuilder<'_>,
-    block_plan: Option<&BlockLocalPlan>,
+    stack_slot_entry_seeds: &[PlannedStackSlotEntrySeed],
     local_env: &mut LocalEnv,
     stack_slots: &StackSlots,
     ptr_ty: ir::Type,
 ) -> Result<(), String> {
-    let Some(block_plan) = block_plan else {
-        return Ok(());
-    };
-    for binding in &block_plan.entry_locals {
-        if binding.storage != PlannedLocalStorage::StackSlot {
-            continue;
-        }
+    for seed in stack_slot_entry_seeds {
+        let binding = &seed.binding;
         if local_env
             .entry_index_for_location(binding.location)
             .or_else(|| local_env.entry_index_for_name(binding.name.as_str()))
@@ -2996,10 +2966,86 @@ fn bind_planned_stack_slot_entries_at_block_entry(
             binding.name.as_str(),
             Vec::new(),
             value,
-            local_ref_kind_for_stack_mirror(binding.ref_kind),
+            seed.entry_ref_kind,
             LocalEnvStorage::StackMirror,
-            binding.binding_facts,
+            binding.param_facts.binding,
         );
+    }
+    Ok(())
+}
+
+fn bind_runtime_block_params_from_stack(
+    fb: &mut FunctionBuilder<'_>,
+    runtime_params: &[RuntimeBlockParamPlan],
+    local_env: &mut LocalEnv,
+    stack_slots: &StackSlots,
+    ptr_ty: ir::Type,
+) -> Result<(), String> {
+    for param in runtime_params {
+        let binding = &param.binding;
+        let slot = stack_slots
+            .slot_for_block_arg_name(binding.name.as_str())
+            .ok_or_else(|| {
+                format!(
+                    "entry runtime block param {} is missing stack storage",
+                    binding.name
+                )
+            })?;
+        let value = fb.ins().stack_load(ptr_ty, slot, 0);
+        local_env.bind_entry_location_with_aliases(
+            binding.location,
+            binding.name.as_str(),
+            Vec::new(),
+            value,
+            param.stack_seed_ref_kind,
+            LocalEnvStorage::StackMirror,
+            binding.param_facts.binding,
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bind_runtime_block_param_values_at_block_entry(
+    fb: &mut FunctionBuilder<'_>,
+    runtime_params: &[RuntimeBlockParamPlan],
+    block_param_values: &[ir::Value],
+    local_env: &mut LocalEnv,
+    stack_slots: &StackSlots,
+    ptr_ty: ir::Type,
+    thread_state_value: ir::Value,
+    incref_ref: ir::FuncRef,
+    decref_ref: ir::FuncRef,
+) -> Result<(), String> {
+    for (param, param_value) in runtime_params.iter().zip(block_param_values.iter()) {
+        let binding = &param.binding;
+        let entry_storage = match param.entry_storage {
+            RuntimeBlockParamEntryStorage::LocalOnly => LocalEnvStorage::LocalOnly,
+            RuntimeBlockParamEntryStorage::StackMirror => LocalEnvStorage::StackMirror,
+        };
+        local_env.bind_entry_location_with_aliases(
+            binding.location,
+            binding.name.as_str(),
+            param.entry_aliases.clone(),
+            *param_value,
+            param.entry_ref_kind,
+            entry_storage,
+            binding.param_facts.binding,
+        );
+        if entry_storage == LocalEnvStorage::StackMirror {
+            stack_slots
+                .replace_cloned_value(
+                    fb,
+                    binding.name.as_str(),
+                    *param_value,
+                    ptr_ty,
+                    thread_state_value,
+                    incref_ref,
+                    decref_ref,
+                )
+                .expect("runtime block param missing from stack slots");
+            emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, *param_value);
+        }
     }
     Ok(())
 }
@@ -3016,16 +3062,6 @@ fn local_ref_kind_needs_incref_for_forward(ref_kind: LocalRefKind, forwarded_cou
         LocalRefKind::Owned | LocalRefKind::Unknown => forwarded_count > 0,
         LocalRefKind::Borrowed | LocalRefKind::Unbound => true,
         LocalRefKind::Immortal => false,
-    }
-}
-
-fn local_ref_kind_for_stack_mirror(ref_kind: LocalRefKind) -> LocalRefKind {
-    match ref_kind {
-        LocalRefKind::Immortal => LocalRefKind::Immortal,
-        LocalRefKind::Unbound => LocalRefKind::Unbound,
-        LocalRefKind::Owned | LocalRefKind::Borrowed | LocalRefKind::Unknown => {
-            LocalRefKind::Borrowed
-        }
     }
 }
 
@@ -3809,17 +3845,11 @@ impl<'a, 'b, 'mc, 'c, 'd> intrinsics::OperationEmitState<'b, InstrCodegen>
     }
 }
 
-fn local_binding_facts_for_storage(
-    storage: LocalEnvStorage,
-    ref_kind: LocalRefKind,
-) -> ParamBindingFacts {
+fn local_binding_facts_for_stored_value(ref_kind: LocalRefKind) -> ParamBindingFacts {
     if ref_kind == LocalRefKind::Unbound {
         return ParamBindingFacts::MaybeUnbound;
     }
-    match storage {
-        LocalEnvStorage::LocalOnly => ParamBindingFacts::DefinitelyBound,
-        LocalEnvStorage::StackMirror => ParamBindingFacts::CheckedLocalValue,
-    }
+    ParamBindingFacts::DefinitelyBound
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7234,7 +7264,7 @@ fn abrupt_kind_tag(kind: AbruptKind) -> i64 {
 
 fn emit_prepare_target_args_codegen_from_local_env(
     fb: &mut FunctionBuilder<'_>,
-    target_params: &[String],
+    target_params: &[RuntimeBlockParamPlan],
     full_target_params: Option<&[String]>,
     explicit_args: Option<&[BlockArg]>,
     local_env: &LocalEnv,
@@ -7258,11 +7288,12 @@ fn emit_prepare_target_args_codegen_from_local_env(
         }
         _ => None,
     };
-    for name in target_params {
+    for target_param in target_params {
+        let name = target_param.arg_name.as_str();
         if let Some(explicit_arg) = explicit_args.and_then(|args| {
             explicit_arg_offsets
                 .as_ref()
-                .and_then(|offsets| offsets.get(name.as_str()).copied())
+                .and_then(|offsets| offsets.get(name).copied())
                 .and_then(|offset| args.get(offset))
         }) {
             let value = match explicit_arg {
@@ -7318,7 +7349,7 @@ fn emit_prepare_target_args_codegen_from_local_env(
 fn emit_explicit_target_slot_writes_codegen_from_local_env(
     fb: &mut FunctionBuilder<'_>,
     full_target_params: &[String],
-    runtime_target_params: &[String],
+    runtime_target_params: &[RuntimeBlockParamPlan],
     explicit_args: &[BlockArg],
     local_env: &LocalEnv,
     ctx: &JitEmitCtx<'_>,
@@ -7328,7 +7359,10 @@ fn emit_explicit_target_slot_writes_codegen_from_local_env(
     let explicit_start = full_target_params.len().saturating_sub(explicit_args.len());
     for (offset, arg) in explicit_args.iter().enumerate() {
         let target_name = &full_target_params[explicit_start + offset];
-        if runtime_target_params.iter().any(|name| name == target_name) {
+        if runtime_target_params
+            .iter()
+            .any(|param| param.arg_name.as_str() == target_name.as_str())
+        {
             continue;
         }
         let (value, owned_value) = match arg {
@@ -7404,31 +7438,55 @@ fn emit_decref_unforwarded_local_env(
     }
 }
 
+fn emit_forward_named_values_from_local_env_with_refcount<'a, I>(
+    fb: &mut FunctionBuilder<'_>,
+    source_names: I,
+    local_env: &LocalEnv,
+    ptr_ty: ir::Type,
+    incref_ref: ir::FuncRef,
+) -> Result<(Vec<ir::Value>, HashSet<LocalLocation>), LocalEnvEdgePrepError>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let source_names = source_names.into_iter().collect::<Vec<_>>();
+    let mut values = Vec::with_capacity(source_names.len());
+    let mut forwarded_local_locations = HashSet::new();
+    let mut forwarded_local_counts = HashMap::new();
+    for source_name in source_names {
+        if let Some(value_index) = local_env.entry_index_for_block_arg_name(source_name) {
+            let entry = &local_env.entries[value_index];
+            let value = entry.value;
+            let forwarded_count = forwarded_local_counts.entry(value_index).or_insert(0usize);
+            if local_ref_kind_needs_incref_for_forward(entry.ref_kind, *forwarded_count) {
+                emit_incref_if_not_null(fb, ptr_ty, incref_ref, value);
+            }
+            *forwarded_count += 1;
+            if let Some(location) = entry.location {
+                forwarded_local_locations.insert(location);
+            }
+            values.push(value);
+            continue;
+        }
+        return Err(LocalEnvEdgePrepError::MissingSourceBinding {
+            source_name: source_name.to_string(),
+        });
+    }
+    Ok((values, forwarded_local_locations))
+}
+
 fn emit_forward_named_values_from_local_env(
     fb: &mut FunctionBuilder<'_>,
     source_names: &[String],
     local_env: &LocalEnv,
     ctx: &JitEmitCtx<'_>,
 ) -> Result<(Vec<ir::Value>, HashSet<LocalLocation>), LocalEnvEdgePrepError> {
-    let mut values = Vec::with_capacity(source_names.len());
-    let mut forwarded_local_locations = HashSet::new();
-    let mut forwarded_local_counts = HashMap::new();
-    for source_name in source_names {
-        let (value, maybe_value_index) = emit_forwarded_block_arg_source_value(
-            fb,
-            source_name,
-            local_env,
-            ctx,
-            &mut forwarded_local_counts,
-        )?;
-        if let Some(value_index) = maybe_value_index
-            && let Some(location) = local_env.entries[value_index].location
-        {
-            forwarded_local_locations.insert(location);
-        }
-        values.push(value);
-    }
-    Ok((values, forwarded_local_locations))
+    emit_forward_named_values_from_local_env_with_refcount(
+        fb,
+        source_names.iter().map(String::as_str),
+        local_env,
+        ctx.consts.ptr_ty,
+        ctx.incref_ref,
+    )
 }
 
 fn emit_exception_dispatch_slot_writes(
@@ -7588,16 +7646,18 @@ fn emit_pop_handled_exception(
     fb.switch_to_block(done_block);
 }
 
-fn emit_pop_handled_exception_if_leaving(
+fn emit_pop_handled_exception_if_leaving<'a, I>(
     fb: &mut FunctionBuilder<'_>,
     current_exception_name: Option<&str>,
-    target_params: &[String],
+    target_params: I,
     ctx: &JitEmitCtx<'_>,
-) {
+) where
+    I: IntoIterator<Item = &'a str>,
+{
     let Some(exception_name) = current_exception_name else {
         return;
     };
-    if target_params.iter().any(|name| name == exception_name) {
+    if target_params.into_iter().any(|name| name == exception_name) {
         return;
     }
     emit_pop_handled_exception(fb, exception_name, ctx);
@@ -9386,7 +9446,7 @@ fn emit_codegen_if_target_arm(
     release_reason: RefcountReleaseReason,
     current_exception_name: Option<&str>,
     exec_blocks: &[ir::Block],
-    runtime_block_param_names: &[Vec<String>],
+    runtime_block_params: &[Vec<RuntimeBlockParamPlan>],
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     jit_module: &mut JITModule,
@@ -9394,7 +9454,7 @@ fn emit_codegen_if_target_arm(
 ) -> Result<(), String> {
     fb.switch_to_block(branch_block);
     let target_index = target_label.index();
-    let target_params = &runtime_block_param_names[target_index];
+    let target_params = &runtime_block_params[target_index];
     let mut jump_args = Vec::with_capacity(target_params.len());
     let (prepared_args, forwarded_locations) = emit_prepare_target_args_codegen_from_local_env(
         fb,
@@ -9428,7 +9488,12 @@ fn emit_codegen_if_target_arm(
         emit_ctx.consts.thread_state_value,
         emit_ctx.decref_ref,
     );
-    emit_pop_handled_exception_if_leaving(fb, current_exception_name, target_params, emit_ctx);
+    emit_pop_handled_exception_if_leaving(
+        fb,
+        current_exception_name,
+        target_params.iter().map(|param| param.arg_name.as_str()),
+        emit_ctx,
+    );
     fb.ins().jump(exec_blocks[target_index], &jump_args);
     Ok(())
 }
@@ -9443,7 +9508,7 @@ fn emit_codegen_if_truth_i32(
     else_label: BlockLabel,
     current_exception_name: Option<&str>,
     exec_blocks: &[ir::Block],
-    runtime_block_param_names: &[Vec<String>],
+    runtime_block_params: &[Vec<RuntimeBlockParamPlan>],
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     jit_module: &mut JITModule,
@@ -9491,7 +9556,7 @@ fn emit_codegen_if_truth_i32(
         },
         current_exception_name,
         exec_blocks,
-        runtime_block_param_names,
+        runtime_block_params,
         &mut hot_local_env,
         emit_ctx,
         jit_module,
@@ -9511,7 +9576,7 @@ fn emit_codegen_if_truth_i32(
         },
         current_exception_name,
         exec_blocks,
-        runtime_block_param_names,
+        runtime_block_params,
         &mut cold_local_env,
         emit_ctx,
         jit_module,
@@ -9545,7 +9610,12 @@ fn emit_codegen_return_pyobject(
         emit_ctx.consts.thread_state_value,
         emit_ctx.decref_ref,
     );
-    emit_pop_handled_exception_if_leaving(fb, current_exception_name, &[], emit_ctx);
+    emit_pop_handled_exception_if_leaving(
+        fb,
+        current_exception_name,
+        std::iter::empty::<&str>(),
+        emit_ctx,
+    );
     fb.ins().return_(&[ret_value]);
     Ok(())
 }
@@ -9558,7 +9628,7 @@ fn emit_codegen_branch_table_from_i64(
     default_label: BlockLabel,
     index_i64: ir::Value,
     exec_blocks: &[ir::Block],
-    runtime_block_param_names: &[Vec<String>],
+    runtime_block_params: &[Vec<RuntimeBlockParamPlan>],
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     jit_module: &mut JITModule,
@@ -9596,7 +9666,7 @@ fn emit_codegen_branch_table_from_i64(
     for (target_label, case_block) in targets.iter().zip(case_blocks.iter()) {
         fb.switch_to_block(*case_block);
         let target_index = target_label.index();
-        let target_params = &runtime_block_param_names[target_index];
+        let target_params = &runtime_block_params[target_index];
         let mut case_local_env = local_env.clone();
         let mut case_jump_args = Vec::with_capacity(target_params.len());
         let (prepared_args, forwarded_locations) = emit_prepare_target_args_codegen_from_local_env(
@@ -9634,13 +9704,18 @@ fn emit_codegen_branch_table_from_i64(
             emit_ctx.consts.thread_state_value,
             emit_ctx.decref_ref,
         );
-        emit_pop_handled_exception_if_leaving(fb, current_exception_name, target_params, emit_ctx);
+        emit_pop_handled_exception_if_leaving(
+            fb,
+            current_exception_name,
+            target_params.iter().map(|param| param.arg_name.as_str()),
+            emit_ctx,
+        );
         fb.ins().jump(exec_blocks[target_index], &case_jump_args);
     }
 
     fb.switch_to_block(default_block);
     let default_index = default_label.index();
-    let default_params = &runtime_block_param_names[default_index];
+    let default_params = &runtime_block_params[default_index];
     let mut default_local_env = local_env.clone();
     let mut default_jump_args = Vec::with_capacity(default_params.len());
     let (prepared_args, forwarded_locations) = emit_prepare_target_args_codegen_from_local_env(
@@ -9678,7 +9753,12 @@ fn emit_codegen_branch_table_from_i64(
         emit_ctx.consts.thread_state_value,
         emit_ctx.decref_ref,
     );
-    emit_pop_handled_exception_if_leaving(fb, current_exception_name, default_params, emit_ctx);
+    emit_pop_handled_exception_if_leaving(
+        fb,
+        current_exception_name,
+        default_params.iter().map(|param| param.arg_name.as_str()),
+        emit_ctx,
+    );
     fb.ins()
         .jump(exec_blocks[default_index], &default_jump_args);
     Ok(())
@@ -9790,7 +9870,7 @@ fn emit_codegen_raise_exception_from_function(
     emit_pop_handled_exception_if_leaving(
         fb,
         current_exception_name,
-        exception_forwarded_names,
+        exception_forwarded_names.iter().map(String::as_str),
         emit_ctx,
     );
     fb.ins().jump(
@@ -9820,7 +9900,7 @@ fn emit_codegen_raise_exception_from_function(
     emit_pop_handled_exception_if_leaving(
         fb,
         current_exception_name,
-        exception_forwarded_names,
+        exception_forwarded_names.iter().map(String::as_str),
         emit_ctx,
     );
     fb.ins().jump(
@@ -9835,7 +9915,7 @@ fn emit_codegen_term(
     source_label: BlockLabel,
     term: &BlockTerm<InstrCodegen>,
     exec_blocks: &[ir::Block],
-    runtime_block_param_names: &[Vec<String>],
+    runtime_block_params: &[Vec<RuntimeBlockParamPlan>],
     full_block_param_names: &[Vec<String>],
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
@@ -9851,7 +9931,7 @@ fn emit_codegen_term(
     match term {
         BlockTerm::Jump(target_label) => {
             let target_index = target_label.target.index();
-            let target_params = &runtime_block_param_names[target_index];
+            let target_params = &runtime_block_params[target_index];
             let full_target_params = &full_block_param_names[target_index];
             emit_explicit_target_slot_writes_codegen_from_local_env(
                 fb,
@@ -9908,7 +9988,7 @@ fn emit_codegen_term(
             emit_pop_handled_exception_if_leaving(
                 fb,
                 current_exception_name,
-                target_params,
+                target_params.iter().map(|param| param.arg_name.as_str()),
                 emit_ctx,
             );
             fb.ins().jump(exec_blocks[target_index], &jump_args);
@@ -9935,7 +10015,7 @@ fn emit_codegen_term(
                 if_term.else_label,
                 current_exception_name,
                 exec_blocks,
-                runtime_block_param_names,
+                runtime_block_params,
                 local_env,
                 emit_ctx,
                 jit_module,
@@ -9959,7 +10039,7 @@ fn emit_codegen_term(
                 branch.default_label,
                 index_i64,
                 exec_blocks,
-                runtime_block_param_names,
+                runtime_block_params,
                 local_env,
                 emit_ctx,
                 jit_module,
@@ -10025,7 +10105,7 @@ fn emit_typed_codegen_term(
     source_label: BlockLabel,
     term: &BlockTerm<InstrTyped>,
     exec_blocks: &[ir::Block],
-    runtime_block_param_names: &[Vec<String>],
+    runtime_block_params: &[Vec<RuntimeBlockParamPlan>],
     full_block_param_names: &[Vec<String>],
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
@@ -10066,7 +10146,7 @@ fn emit_typed_codegen_term(
             if_term.else_label,
             current_exception_name,
             exec_blocks,
-            runtime_block_param_names,
+            runtime_block_params,
             local_env,
             emit_ctx,
             jit_module,
@@ -10192,7 +10272,7 @@ fn emit_typed_codegen_term(
             branch.default_label,
             index_i64,
             exec_blocks,
-            runtime_block_param_names,
+            runtime_block_params,
             local_env,
             emit_ctx,
             jit_module,
@@ -10207,7 +10287,7 @@ fn emit_typed_codegen_term(
         source_label,
         &legacy_term,
         exec_blocks,
-        runtime_block_param_names,
+        runtime_block_params,
         full_block_param_names,
         local_env,
         emit_ctx,
@@ -11825,11 +11905,9 @@ fn build_cranelift_run_bb_specialized_function(
         let mut fb = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
         let entry_block = fb.create_block();
         let mut exec_blocks = Vec::with_capacity(block_count);
-        let runtime_block_param_names = function
-            .blocks
-            .iter()
-            .map(|block| planned_jit_param_names_for_block(block, local_plan.block(block.label)))
-            .collect::<Vec<_>>();
+        let runtime_block_params = planned_jit_params_for_function(function, &local_plan)?;
+        let planned_stack_slot_entry_seeds =
+            planned_stack_slot_entry_seeds_for_function(function, &local_plan);
         let full_block_param_names = function
             .blocks
             .iter()
@@ -11842,7 +11920,7 @@ fn build_cranelift_run_bb_specialized_function(
                 let runtime_target_params = block
                     .exc_edge
                     .as_ref()
-                    .map(|edge| runtime_block_param_names[edge.target.index()].as_slice())
+                    .map(|edge| runtime_block_params[edge.target.index()].as_slice())
                     .unwrap_or(&[]);
                 exc_dispatch_plan(function, block, runtime_target_params)
             })
@@ -11883,10 +11961,13 @@ fn build_cranelift_run_bb_specialized_function(
             ],
         );
         for (index, block) in exec_blocks.iter().enumerate() {
-            let param_names = if runtime_block_param_names[index].is_empty() {
+            let param_names = if runtime_block_params[index].is_empty() {
                 full_block_param_names[index].clone()
             } else {
-                runtime_block_param_names[index].clone()
+                runtime_block_params[index]
+                    .iter()
+                    .map(|param| param.arg_name.clone())
+                    .collect()
             };
             register_block_display_annotation(
                 &mut block_annotations,
@@ -11924,7 +12005,7 @@ fn build_cranelift_run_bb_specialized_function(
 
         fb.append_block_params_for_function_params(entry_block);
         for (index, block) in exec_blocks.iter().enumerate() {
-            for _ in &runtime_block_param_names[index] {
+            for _ in &runtime_block_params[index] {
                 fb.append_block_param(*block, ptr_ty);
             }
         }
@@ -12200,47 +12281,27 @@ fn build_cranelift_run_bb_specialized_function(
             fb.switch_to_block(after_block);
         }
         let mut entry_local_env = LocalEnv::default();
-        let entry_block_plan = local_plan.block(function.entry_block().label);
-        for param_name in &runtime_block_param_names[0] {
-            let binding = planned_entry_binding_for_block_arg_name(entry_block_plan, param_name)
-                .ok_or_else(|| {
-                    format!("missing entry local binding for runtime block param {param_name}")
-                })?;
-            let slot = stack_slots
-                .slot_for_block_arg_name(binding.name.as_str())
-                .ok_or_else(|| {
-                    format!(
-                        "entry runtime block param {} is missing stack storage",
-                        binding.name
-                    )
-                })?;
-            let value = fb.ins().stack_load(ptr_ty, slot, 0);
-            entry_local_env.bind_entry_location_with_aliases(
-                binding.location,
-                binding.name.as_str(),
-                Vec::new(),
-                value,
-                local_ref_kind_for_stack_mirror(binding.ref_kind),
-                LocalEnvStorage::StackMirror,
-                binding.binding_facts,
-            );
-        }
-        let mut entry_jump_args = Vec::with_capacity(runtime_block_param_names[0].len());
-        let mut forwarded_local_counts = HashMap::new();
-        for param_name in &runtime_block_param_names[0] {
-            let value_index = entry_local_env
-                .entry_index_for_block_arg_name(param_name)
-                .ok_or_else(|| {
-                    format!("missing entry local mapping for runtime block param {param_name}")
-                })?;
-            let entry = &entry_local_env.entries[value_index];
-            let forwarded_count = forwarded_local_counts.entry(value_index).or_insert(0usize);
-            if local_ref_kind_needs_incref_for_forward(entry.ref_kind, *forwarded_count) {
-                emit_incref_if_not_null(&mut fb, ptr_ty, incref_ref, entry.value);
-            }
-            *forwarded_count += 1;
-            entry_jump_args.push(ir::BlockArg::Value(entry.value));
-        }
+        bind_runtime_block_params_from_stack(
+            &mut fb,
+            &runtime_block_params[0],
+            &mut entry_local_env,
+            &stack_slots,
+            ptr_ty,
+        )?;
+        let (entry_jump_values, _) = emit_forward_named_values_from_local_env_with_refcount(
+            &mut fb,
+            runtime_block_params[0]
+                .iter()
+                .map(|param| param.arg_name.as_str()),
+            &entry_local_env,
+            ptr_ty,
+            incref_ref,
+        )
+        .map_err(|err| format!("missing entry local mapping for runtime block params: {err}"))?;
+        let entry_jump_args = entry_jump_values
+            .into_iter()
+            .map(ir::BlockArg::Value)
+            .collect::<Vec<_>>();
         fb.ins().jump(exec_blocks[0], &entry_jump_args);
 
         let mut exception_dispatch_blocks: Vec<Option<ir::Block>> = vec![None; exec_blocks.len()];
@@ -12264,84 +12325,22 @@ fn build_cranelift_run_bb_specialized_function(
         for (index, block) in exec_blocks.iter().enumerate() {
             fb.switch_to_block(*block);
             let codegen_block = &function.blocks[index];
-            let block_local_plan = local_plan.block(codegen_block.label);
             let mut local_env = LocalEnv::default();
             let block_param_values = fb.block_params(*block).to_vec();
-            for (param_name, param_value) in runtime_block_param_names[index]
-                .iter()
-                .zip(block_param_values.iter())
-            {
-                if let Some(binding) =
-                    planned_entry_binding_for_block_arg_name(block_local_plan, param_name)
-                {
-                    let block_param_is_local_only =
-                        binding.storage == PlannedLocalStorage::BlockParam;
-                    let (entry_ref_kind, entry_storage) = if block_param_is_local_only {
-                        (binding.ref_kind, LocalEnvStorage::LocalOnly)
-                    } else {
-                        (
-                            local_ref_kind_for_stack_mirror(binding.ref_kind),
-                            LocalEnvStorage::StackMirror,
-                        )
-                    };
-                    let aliases = if param_name == &binding.name {
-                        Vec::new()
-                    } else {
-                        vec![param_name.clone()]
-                    };
-                    local_env.bind_entry_location_with_aliases(
-                        binding.location,
-                        binding.name.as_str(),
-                        aliases,
-                        *param_value,
-                        entry_ref_kind,
-                        entry_storage,
-                        binding.binding_facts,
-                    );
-                    if entry_storage == LocalEnvStorage::StackMirror {
-                        stack_slots
-                            .replace_cloned_value(
-                                &mut fb,
-                                binding.name.as_str(),
-                                *param_value,
-                                ptr_ty,
-                                thread_state_value,
-                                incref_ref,
-                                decref_ref,
-                            )
-                            .expect("runtime block param missing from stack slots");
-                        emit_decref_if_not_null(
-                            &mut fb,
-                            ptr_ty,
-                            decref_ref,
-                            thread_state_value,
-                            *param_value,
-                        );
-                    }
-                } else {
-                    stack_slots
-                        .replace_cloned_value(
-                            &mut fb,
-                            param_name,
-                            *param_value,
-                            ptr_ty,
-                            thread_state_value,
-                            incref_ref,
-                            decref_ref,
-                        )
-                        .expect("runtime block param missing from stack slots");
-                    emit_decref_if_not_null(
-                        &mut fb,
-                        ptr_ty,
-                        decref_ref,
-                        thread_state_value,
-                        *param_value,
-                    );
-                }
-            }
+            bind_runtime_block_param_values_at_block_entry(
+                &mut fb,
+                &runtime_block_params[index],
+                &block_param_values,
+                &mut local_env,
+                &stack_slots,
+                ptr_ty,
+                thread_state_value,
+                incref_ref,
+                decref_ref,
+            )?;
             bind_planned_stack_slot_entries_at_block_entry(
                 &mut fb,
-                block_local_plan,
+                &planned_stack_slot_entry_seeds[index],
                 &mut local_env,
                 &stack_slots,
                 ptr_ty,
@@ -12498,7 +12497,7 @@ fn build_cranelift_run_bb_specialized_function(
                 codegen_block.label,
                 &typed_function.blocks[index].term,
                 &exec_blocks,
-                &runtime_block_param_names,
+                &runtime_block_params,
                 &full_block_param_names,
                 &mut local_env,
                 term_emit_ctx,

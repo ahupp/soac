@@ -158,6 +158,30 @@ def f():
         );
     }
 
+    #[test]
+    fn stored_local_binding_facts_only_require_checks_for_unbound_values() {
+        assert_eq!(
+            local_binding_facts_for_stored_value(LocalRefKind::Owned),
+            ParamBindingFacts::DefinitelyBound
+        );
+        assert_eq!(
+            local_binding_facts_for_stored_value(LocalRefKind::Borrowed),
+            ParamBindingFacts::DefinitelyBound
+        );
+        assert_eq!(
+            local_binding_facts_for_stored_value(LocalRefKind::Immortal),
+            ParamBindingFacts::DefinitelyBound
+        );
+        assert_eq!(
+            local_binding_facts_for_stored_value(LocalRefKind::Unknown),
+            ParamBindingFacts::DefinitelyBound
+        );
+        assert_eq!(
+            local_binding_facts_for_stored_value(LocalRefKind::Unbound),
+            ParamBindingFacts::MaybeUnbound
+        );
+    }
+
     unsafe extern "C" fn test_capsule_destructor(_capsule: *mut ffi::PyObject) {
         CAPSULE_DESTROYED.store(true, Ordering::SeqCst);
     }
@@ -1256,10 +1280,7 @@ def f():
                     value: owned_local,
                     ref_kind: LocalRefKind::Owned,
                     storage: LocalEnvStorage::LocalOnly,
-                    binding_facts: local_binding_facts_for_storage(
-                        LocalEnvStorage::LocalOnly,
-                        LocalRefKind::Owned,
-                    ),
+                    binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Owned),
                 },
                 LocalEnvEntry {
                     location: Some(LocalLocation(1)),
@@ -1268,10 +1289,7 @@ def f():
                     value: owned_mirror,
                     ref_kind: LocalRefKind::Owned,
                     storage: LocalEnvStorage::StackMirror,
-                    binding_facts: local_binding_facts_for_storage(
-                        LocalEnvStorage::StackMirror,
-                        LocalRefKind::Owned,
-                    ),
+                    binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Owned),
                 },
                 LocalEnvEntry {
                     location: Some(LocalLocation(2)),
@@ -1280,10 +1298,7 @@ def f():
                     value: immortal_local,
                     ref_kind: LocalRefKind::Immortal,
                     storage: LocalEnvStorage::LocalOnly,
-                    binding_facts: local_binding_facts_for_storage(
-                        LocalEnvStorage::LocalOnly,
-                        LocalRefKind::Immortal,
-                    ),
+                    binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Immortal),
                 },
             ],
         };
@@ -1302,10 +1317,7 @@ def f():
                     value: ir::Value::from_u32(1),
                     ref_kind: LocalRefKind::Owned,
                     storage: LocalEnvStorage::LocalOnly,
-                    binding_facts: local_binding_facts_for_storage(
-                        LocalEnvStorage::LocalOnly,
-                        LocalRefKind::Owned,
-                    ),
+                    binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Owned),
                 },
                 LocalEnvEntry {
                     location: Some(LocalLocation(1)),
@@ -1314,10 +1326,7 @@ def f():
                     value: ir::Value::from_u32(2),
                     ref_kind: LocalRefKind::Owned,
                     storage: LocalEnvStorage::LocalOnly,
-                    binding_facts: local_binding_facts_for_storage(
-                        LocalEnvStorage::LocalOnly,
-                        LocalRefKind::Owned,
-                    ),
+                    binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Owned),
                 },
                 LocalEnvEntry {
                     location: Some(LocalLocation(2)),
@@ -1326,10 +1335,7 @@ def f():
                     value: ir::Value::from_u32(3),
                     ref_kind: LocalRefKind::Borrowed,
                     storage: LocalEnvStorage::LocalOnly,
-                    binding_facts: local_binding_facts_for_storage(
-                        LocalEnvStorage::LocalOnly,
-                        LocalRefKind::Borrowed,
-                    ),
+                    binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Borrowed),
                 },
                 LocalEnvEntry {
                     location: Some(LocalLocation(3)),
@@ -1338,10 +1344,7 @@ def f():
                     value: ir::Value::from_u32(4),
                     ref_kind: LocalRefKind::Immortal,
                     storage: LocalEnvStorage::LocalOnly,
-                    binding_facts: local_binding_facts_for_storage(
-                        LocalEnvStorage::LocalOnly,
-                        LocalRefKind::Immortal,
-                    ),
+                    binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Immortal),
                 },
             ],
         };
@@ -1402,10 +1405,7 @@ def f():
                     value: fb.block_params(entry)[0],
                     ref_kind: LocalRefKind::Owned,
                     storage: LocalEnvStorage::LocalOnly,
-                    binding_facts: local_binding_facts_for_storage(
-                        LocalEnvStorage::LocalOnly,
-                        LocalRefKind::Owned,
-                    ),
+                    binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Owned),
                 }],
             };
             let forwarded = HashSet::new();
@@ -1473,10 +1473,7 @@ def f():
                     value: fb.block_params(entry)[0],
                     ref_kind: LocalRefKind::Owned,
                     storage: LocalEnvStorage::LocalOnly,
-                    binding_facts: local_binding_facts_for_storage(
-                        LocalEnvStorage::LocalOnly,
-                        LocalRefKind::Owned,
-                    ),
+                    binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Owned),
                 }],
             };
             let forwarded = HashSet::from([LocalLocation(0)]);
@@ -1504,10 +1501,7 @@ def f():
                 value: ir::Value::from_u32(1),
                 ref_kind: LocalRefKind::Owned,
                 storage: LocalEnvStorage::LocalOnly,
-                binding_facts: local_binding_facts_for_storage(
-                    LocalEnvStorage::LocalOnly,
-                    LocalRefKind::Owned,
-                ),
+                binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Owned),
             }],
         };
         let stack_slots = StackSlots {
@@ -1533,10 +1527,7 @@ def f():
                 value: ir::Value::from_u32(1),
                 ref_kind: LocalRefKind::Owned,
                 storage: LocalEnvStorage::LocalOnly,
-                binding_facts: local_binding_facts_for_storage(
-                    LocalEnvStorage::LocalOnly,
-                    LocalRefKind::Owned,
-                ),
+                binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Owned),
             }],
         };
         let stack_slots = StackSlots {
@@ -1619,10 +1610,7 @@ def f():
                 value: old_value,
                 ref_kind: LocalRefKind::Owned,
                 storage: initial_storage,
-                binding_facts: local_binding_facts_for_storage(
-                    initial_storage,
-                    LocalRefKind::Owned,
-                ),
+                binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Owned),
             });
             let stack_slots = StackSlots::new(
                 &mut fb,

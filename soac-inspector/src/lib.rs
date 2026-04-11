@@ -12,7 +12,7 @@ use soac_blockpy::passes::{CodegenModuleShape, infer_module_value_facts};
 use soac_jit::module_constants::ModuleCodegenConstants;
 use soac_jit::module_type::build_shared_state_for_inspection;
 use soac_jit::{
-    exc_dispatch_plan, plan_function_locals, planned_jit_param_names_for_block,
+    exc_dispatch_plan, plan_function_locals, planned_jit_params_for_function,
     render_cranelift_run_bb_specialized_with_runtime_state_and_cfg,
 };
 use std::ffi::c_void;
@@ -296,16 +296,21 @@ pub fn jit_debug_plan(
         ));
     };
     let local_plan = plan_function_locals(function, &facts);
+    let runtime_params =
+        planned_jit_params_for_function(function, &local_plan).map_err(|err| err.to_string())?;
     let block_info = function
         .blocks
         .iter()
-        .map(|block| {
-            let runtime_param_names =
-                planned_jit_param_names_for_block(block, local_plan.block(block.label));
+        .enumerate()
+        .map(|(index, block)| {
+            let block_runtime_params = &runtime_params[index];
             (
                 block.label.to_string(),
-                runtime_param_names.clone(),
-                exc_dispatch_plan(function, block, runtime_param_names.as_slice()),
+                block_runtime_params
+                    .iter()
+                    .map(|param| param.arg_name.clone())
+                    .collect::<Vec<_>>(),
+                exc_dispatch_plan(function, block, block_runtime_params.as_slice()),
             )
         })
         .collect::<Vec<_>>();

@@ -264,6 +264,14 @@ The important separation is:
 - `BlockParamFacts` describes how safe it is to consume the incoming param as a
   Python local.
 
+Recommended re-landing order:
+
+1. Introduce `BlockParamFacts` as a planner/runtime data shape only, with no
+   behavioral change.
+2. Move existing planner consumers to read `binding.param_facts`.
+3. Only after that, start changing LocalEnv/codegen behavior to rely on those
+   facts instead of stack-slot fallback semantics.
+
 The consumer should be able to distinguish:
 
 - `DefinitelyBound + CheckedLocalValue`
