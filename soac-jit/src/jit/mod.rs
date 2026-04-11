@@ -79,7 +79,9 @@ use runtime_context::{
 pub use runtime_context::{ModuleJitContext, ModuleRuntimeContext};
 pub use specialized_helpers::ObjPtr;
 use specialized_helpers::register_specialized_jit_symbols;
-pub use typed_value::{IntFacts, IntRange, IntWidth, SoacRepr, SoacValue};
+pub use typed_value::{
+    EmitResult, IntFacts, IntRange, IntWidth, ResultDemand, SoacRepr, SoacValue, ValueOwnership,
+};
 
 static RUNTIME_SUPPORT_LIBRARY: OnceLock<Result<RuntimeSupportLibrary, String>> = OnceLock::new();
 static NEXT_IMPORT_SPEC_ID: AtomicUsize = AtomicUsize::new(0);
@@ -8564,6 +8566,50 @@ fn emit_codegen_expr_with_local_env(
     panic!("operation {expr:?} should have been handled by LocalEnv direct emitter")
 }
 
+fn discard_emit_result(
+    fb: &mut FunctionBuilder<'_>,
+    result: EmitResult,
+    emit_ctx: &JitEmitCtx<'_>,
+) -> Result<(), String> {
+    match result {
+        EmitResult::NoValue | EmitResult::I32 { .. } | EmitResult::I64 { .. } => Ok(()),
+        EmitResult::PyObject {
+            value, ownership, ..
+        } => {
+            if ownership.is_owned() {
+                fb.ins().call(
+                    emit_ctx.decref_ref,
+                    &[emit_ctx.consts.thread_state_value, value],
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+fn emit_codegen_stmt_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    expr: &InstrCodegen,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<EmitResult, String> {
+    let value =
+        emit_codegen_stmt_with_local_env(fb, expr, local_env, emit_ctx, jit_module, func_imports);
+    Ok(match demand {
+        ResultDemand::EffectOnly => {
+            fb.ins().call(
+                emit_ctx.decref_ref,
+                &[emit_ctx.consts.thread_state_value, value],
+            );
+            EmitResult::no_value()
+        }
+        ResultDemand::PyObject { .. } => EmitResult::owned_pyobject(value, PyObjFacts::unknown()),
+    })
+}
+
 fn emit_resolved_name_load_with_local_env(
     fb: &mut FunctionBuilder<'_>,
     name: &ResolvedName,
@@ -8719,6 +8765,53 @@ fn emit_typed_codegen_stmt_with_local_env(
     ))
 }
 
+fn emit_typed_codegen_stmt_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    expr: &InstrTyped,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<EmitResult, String> {
+    if matches!(
+        expr,
+        InstrTyped::Truthy(_) | InstrTyped::Load(_) | InstrTyped::BinOp(_)
+    ) {
+        let value = emit_typed_codegen_stmt_with_local_env(
+            fb,
+            expr,
+            local_env,
+            emit_ctx,
+            jit_module,
+            func_imports,
+        )?;
+        return Ok(match demand {
+            ResultDemand::EffectOnly => {
+                fb.ins().call(
+                    emit_ctx.decref_ref,
+                    &[emit_ctx.consts.thread_state_value, value],
+                );
+                EmitResult::no_value()
+            }
+            ResultDemand::PyObject { .. } => {
+                EmitResult::owned_pyobject(value, PyObjFacts::unknown())
+            }
+        });
+    }
+
+    let legacy_expr = try_lower_typed_instr_to_codegen_legacy(expr.clone())?;
+    emit_codegen_stmt_result_with_local_env(
+        fb,
+        &legacy_expr,
+        local_env,
+        emit_ctx,
+        demand,
+        jit_module,
+        func_imports,
+    )
+}
+
 fn local_failure_cleanup_emit_ctx<'mc>(
     fb: &mut FunctionBuilder<'_>,
     emit_ctx: &JitEmitCtx<'mc>,
@@ -8799,18 +8892,16 @@ fn emit_typed_codegen_ops(
             pending_local_failure_cleanups,
         )?;
         let stmt_emit_ctx = stmt_emit_ctx.as_ref().unwrap_or(emit_ctx);
-        let value = emit_typed_codegen_stmt_with_local_env(
+        let result = emit_typed_codegen_stmt_result_with_local_env(
             fb,
             expr,
             local_env,
             stmt_emit_ctx,
+            ResultDemand::EffectOnly,
             jit_module,
             func_imports,
         )?;
-        fb.ins().call(
-            emit_ctx.decref_ref,
-            &[emit_ctx.consts.thread_state_value, value],
-        );
+        discard_emit_result(fb, result, emit_ctx)?;
     }
     Ok(())
 }
