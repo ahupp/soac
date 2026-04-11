@@ -3863,21 +3863,8 @@ fn emit_keyword_call_with_local_env(
 
     let tuple_len = fb.ins().iconst(i64_ty, args.len() as i64);
     let tuple_inst = fb.ins().call(ctx.tuple_new_ref, &[tuple_len]);
-    let call_args_tuple = fb.inst_results(tuple_inst)[0];
-    let tuple_is_null = fb
-        .ins()
-        .icmp(ir::condcodes::IntCC::Equal, call_args_tuple, null_ptr);
-    let tuple_ok_block = fb.create_block();
-    fb.append_block_param(tuple_ok_block, ptr_ty);
-    fb.ins().brif(
-        tuple_is_null,
-        ctx.consts.step_null_block,
-        &step_null_block_args(ctx),
-        tuple_ok_block,
-        &[ir::BlockArg::Value(call_args_tuple)],
-    );
-    fb.switch_to_block(tuple_ok_block);
-    let call_args_tuple = fb.block_params(tuple_ok_block)[0];
+    let call_args_tuple =
+        emit_checked_owned_pyobject_result(fb, fb.inst_results(tuple_inst)[0], ctx);
 
     let mut tuple_items: Vec<(ir::Value, bool)> = Vec::with_capacity(args.len());
     for arg in args {
@@ -3943,38 +3930,12 @@ fn emit_keyword_call_with_local_env(
         fb.inst_results(dict_callable_inst)[0],
         dict_name_obj,
     );
-    let dict_callable_is_null = fb
-        .ins()
-        .icmp(ir::condcodes::IntCC::Equal, dict_callable, null_ptr);
-    let dict_callable_ok = fb.create_block();
-    fb.append_block_param(dict_callable_ok, ptr_ty);
-    fb.ins().brif(
-        dict_callable_is_null,
-        ctx.consts.step_null_block,
-        &step_null_block_args(ctx),
-        dict_callable_ok,
-        &[ir::BlockArg::Value(dict_callable)],
-    );
-    fb.switch_to_block(dict_callable_ok);
-    let dict_callable = fb.block_params(dict_callable_ok)[0];
+    let dict_callable = emit_checked_owned_pyobject_result(fb, dict_callable, ctx);
 
     let empty_tuple_len = fb.ins().iconst(i64_ty, 0);
     let empty_tuple_inst = fb.ins().call(ctx.tuple_new_ref, &[empty_tuple_len]);
-    let empty_tuple = fb.inst_results(empty_tuple_inst)[0];
-    let empty_tuple_is_null = fb
-        .ins()
-        .icmp(ir::condcodes::IntCC::Equal, empty_tuple, null_ptr);
-    let empty_tuple_ok = fb.create_block();
-    fb.append_block_param(empty_tuple_ok, ptr_ty);
-    fb.ins().brif(
-        empty_tuple_is_null,
-        ctx.consts.step_null_block,
-        &step_null_block_args(ctx),
-        empty_tuple_ok,
-        &[ir::BlockArg::Value(empty_tuple)],
-    );
-    fb.switch_to_block(empty_tuple_ok);
-    let empty_tuple = fb.block_params(empty_tuple_ok)[0];
+    let empty_tuple =
+        emit_checked_owned_pyobject_result(fb, fb.inst_results(empty_tuple_inst)[0], ctx);
 
     let kwargs_inst = fb
         .ins()
@@ -3985,20 +3946,7 @@ fn emit_keyword_call_with_local_env(
         fb.inst_results(kwargs_inst)[0],
         &[empty_tuple, dict_callable],
     );
-    let kwargs_is_null = fb
-        .ins()
-        .icmp(ir::condcodes::IntCC::Equal, kwargs_obj, null_ptr);
-    let kwargs_ok = fb.create_block();
-    fb.append_block_param(kwargs_ok, ptr_ty);
-    fb.ins().brif(
-        kwargs_is_null,
-        ctx.consts.step_null_block,
-        &step_null_block_args(ctx),
-        kwargs_ok,
-        &[ir::BlockArg::Value(kwargs_obj)],
-    );
-    fb.switch_to_block(kwargs_ok);
-    let kwargs_obj = fb.block_params(kwargs_ok)[0];
+    let kwargs_obj = emit_checked_owned_pyobject_result(fb, kwargs_obj, ctx);
 
     for (name, value_expr) in keywords {
         let key_obj = emit_owned_module_constant(
@@ -4093,20 +4041,7 @@ fn emit_unpack_call_with_local_env(
         fb.inst_results(list_callable_inst)[0],
         list_name_obj,
     );
-    let list_callable_is_null = fb
-        .ins()
-        .icmp(ir::condcodes::IntCC::Equal, list_callable, null_ptr);
-    let list_callable_ok = fb.create_block();
-    fb.append_block_param(list_callable_ok, ptr_ty);
-    fb.ins().brif(
-        list_callable_is_null,
-        ctx.consts.step_null_block,
-        &step_null_block_args(ctx),
-        list_callable_ok,
-        &[ir::BlockArg::Value(list_callable)],
-    );
-    fb.switch_to_block(list_callable_ok);
-    let list_callable = fb.block_params(list_callable_ok)[0];
+    let list_callable = emit_checked_owned_pyobject_result(fb, list_callable, ctx);
     let args_list_inst = fb.ins().call(
         ctx.py_call_object_ref,
         &[list_callable, ctx.consts.empty_tuple_const],
@@ -4117,20 +4052,7 @@ fn emit_unpack_call_with_local_env(
         fb.inst_results(args_list_inst)[0],
         list_callable,
     );
-    let args_list_is_null = fb
-        .ins()
-        .icmp(ir::condcodes::IntCC::Equal, args_list, null_ptr);
-    let args_list_ok = fb.create_block();
-    fb.append_block_param(args_list_ok, ptr_ty);
-    fb.ins().brif(
-        args_list_is_null,
-        ctx.consts.step_null_block,
-        &step_null_block_args(ctx),
-        args_list_ok,
-        &[ir::BlockArg::Value(args_list)],
-    );
-    fb.switch_to_block(args_list_ok);
-    let args_list = fb.block_params(args_list_ok)[0];
+    let args_list = emit_checked_owned_pyobject_result(fb, args_list, ctx);
 
     let kwargs_obj = if keywords.is_empty() {
         None
@@ -4147,20 +4069,7 @@ fn emit_unpack_call_with_local_env(
             fb.inst_results(dict_callable_inst)[0],
             dict_name_obj,
         );
-        let dict_callable_is_null =
-            fb.ins()
-                .icmp(ir::condcodes::IntCC::Equal, dict_callable, null_ptr);
-        let dict_callable_ok = fb.create_block();
-        fb.append_block_param(dict_callable_ok, ptr_ty);
-        fb.ins().brif(
-            dict_callable_is_null,
-            ctx.consts.step_null_block,
-            &step_null_block_args(ctx),
-            dict_callable_ok,
-            &[ir::BlockArg::Value(dict_callable)],
-        );
-        fb.switch_to_block(dict_callable_ok);
-        let dict_callable = fb.block_params(dict_callable_ok)[0];
+        let dict_callable = emit_checked_owned_pyobject_result(fb, dict_callable, ctx);
         let kwargs_inst = fb.ins().call(
             ctx.py_call_object_ref,
             &[dict_callable, ctx.consts.empty_tuple_const],
@@ -4171,20 +4080,7 @@ fn emit_unpack_call_with_local_env(
             fb.inst_results(kwargs_inst)[0],
             dict_callable,
         );
-        let kwargs_is_null = fb
-            .ins()
-            .icmp(ir::condcodes::IntCC::Equal, kwargs_obj, null_ptr);
-        let kwargs_ok = fb.create_block();
-        fb.append_block_param(kwargs_ok, ptr_ty);
-        fb.ins().brif(
-            kwargs_is_null,
-            ctx.consts.step_null_block,
-            &step_null_block_args(ctx),
-            kwargs_ok,
-            &[ir::BlockArg::Value(kwargs_obj)],
-        );
-        fb.switch_to_block(kwargs_ok);
-        Some(fb.block_params(kwargs_ok)[0])
+        Some(emit_checked_owned_pyobject_result(fb, kwargs_obj, ctx))
     };
 
     for arg in args {
@@ -4207,20 +4103,7 @@ fn emit_unpack_call_with_local_env(
             fb.inst_results(method_inst)[0],
             method_name_obj,
         );
-        let method_is_null = fb
-            .ins()
-            .icmp(ir::condcodes::IntCC::Equal, method_obj, null_ptr);
-        let method_ok = fb.create_block();
-        fb.append_block_param(method_ok, ptr_ty);
-        fb.ins().brif(
-            method_is_null,
-            ctx.consts.step_null_block,
-            &step_null_block_args(ctx),
-            method_ok,
-            &[ir::BlockArg::Value(method_obj)],
-        );
-        fb.switch_to_block(method_ok);
-        let method_obj = fb.block_params(method_ok)[0];
+        let method_obj = emit_checked_owned_pyobject_result(fb, method_obj, ctx);
         let value_borrowed = codegen_expr_is_borrowable_from_local_env(
             value_expr,
             local_env,
@@ -4251,20 +4134,7 @@ fn emit_unpack_call_with_local_env(
             fb.inst_results(call_inst)[0],
             &owned_inputs,
         );
-        let call_is_null = fb
-            .ins()
-            .icmp(ir::condcodes::IntCC::Equal, call_value, null_ptr);
-        let call_ok = fb.create_block();
-        fb.append_block_param(call_ok, ptr_ty);
-        fb.ins().brif(
-            call_is_null,
-            ctx.consts.step_null_block,
-            &step_null_block_args(ctx),
-            call_ok,
-            &[ir::BlockArg::Value(call_value)],
-        );
-        fb.switch_to_block(call_ok);
-        let call_value = fb.block_params(call_ok)[0];
+        let call_value = emit_checked_owned_pyobject_result(fb, call_value, ctx);
         fb.ins().call(ctx.decref_ref, &[call_value]);
     }
 
@@ -4344,20 +4214,7 @@ fn emit_unpack_call_with_local_env(
                     fb.inst_results(update_inst)[0],
                     update_name_obj,
                 );
-                let update_is_null =
-                    fb.ins()
-                        .icmp(ir::condcodes::IntCC::Equal, update_obj, null_ptr);
-                let update_ok = fb.create_block();
-                fb.append_block_param(update_ok, ptr_ty);
-                fb.ins().brif(
-                    update_is_null,
-                    ctx.consts.step_null_block,
-                    &step_null_block_args(ctx),
-                    update_ok,
-                    &[ir::BlockArg::Value(update_obj)],
-                );
-                fb.switch_to_block(update_ok);
-                let update_obj = fb.block_params(update_ok)[0];
+                let update_obj = emit_checked_owned_pyobject_result(fb, update_obj, ctx);
                 let value_borrowed = codegen_expr_is_borrowable_from_local_env(
                     value_expr,
                     local_env,
@@ -4388,20 +4245,7 @@ fn emit_unpack_call_with_local_env(
                     fb.inst_results(call_inst)[0],
                     &owned_inputs,
                 );
-                let call_is_null = fb
-                    .ins()
-                    .icmp(ir::condcodes::IntCC::Equal, call_value, null_ptr);
-                let call_ok = fb.create_block();
-                fb.append_block_param(call_ok, ptr_ty);
-                fb.ins().brif(
-                    call_is_null,
-                    ctx.consts.step_null_block,
-                    &step_null_block_args(ctx),
-                    call_ok,
-                    &[ir::BlockArg::Value(call_value)],
-                );
-                fb.switch_to_block(call_ok);
-                let call_value = fb.block_params(call_ok)[0];
+                let call_value = emit_checked_owned_pyobject_result(fb, call_value, ctx);
                 fb.ins().call(ctx.decref_ref, &[call_value]);
             }
         }
@@ -4420,20 +4264,7 @@ fn emit_unpack_call_with_local_env(
         fb.inst_results(tuple_callable_inst)[0],
         tuple_name_obj,
     );
-    let tuple_callable_is_null =
-        fb.ins()
-            .icmp(ir::condcodes::IntCC::Equal, tuple_callable, null_ptr);
-    let tuple_callable_ok = fb.create_block();
-    fb.append_block_param(tuple_callable_ok, ptr_ty);
-    fb.ins().brif(
-        tuple_callable_is_null,
-        ctx.consts.step_null_block,
-        &step_null_block_args(ctx),
-        tuple_callable_ok,
-        &[ir::BlockArg::Value(tuple_callable)],
-    );
-    fb.switch_to_block(tuple_callable_ok);
-    let tuple_callable = fb.block_params(tuple_callable_ok)[0];
+    let tuple_callable = emit_checked_owned_pyobject_result(fb, tuple_callable, ctx);
     let tuple_call_inst = fb.ins().call(
         ctx.py_call_positional_three_ref,
         &[tuple_callable, args_list, null_ptr, null_ptr, null_ptr],
@@ -4444,20 +4275,7 @@ fn emit_unpack_call_with_local_env(
         fb.inst_results(tuple_call_inst)[0],
         &[tuple_callable, args_list],
     );
-    let call_args_tuple_is_null =
-        fb.ins()
-            .icmp(ir::condcodes::IntCC::Equal, call_args_tuple, null_ptr);
-    let call_args_tuple_ok = fb.create_block();
-    fb.append_block_param(call_args_tuple_ok, ptr_ty);
-    fb.ins().brif(
-        call_args_tuple_is_null,
-        ctx.consts.step_null_block,
-        &step_null_block_args(ctx),
-        call_args_tuple_ok,
-        &[ir::BlockArg::Value(call_args_tuple)],
-    );
-    fb.switch_to_block(call_args_tuple_ok);
-    let call_args_tuple = fb.block_params(call_args_tuple_ok)[0];
+    let call_args_tuple = emit_checked_owned_pyobject_result(fb, call_args_tuple, ctx);
 
     emit_object_call_with_tuple_args(
         fb,
