@@ -822,6 +822,8 @@ unsafe extern "C" fn load_cell_hook(cell: ObjPtr) -> ObjPtr {
             ffi::PyExc_UnboundLocalError,
             b"local variable referenced before assignment\0".as_ptr() as *const i8,
         );
+    } else {
+        ffi::Py_INCREF(value);
     }
     value as ObjPtr
 }

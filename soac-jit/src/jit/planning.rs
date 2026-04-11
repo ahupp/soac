@@ -638,6 +638,46 @@ def f():
     }
 
     #[test]
+    fn exc_dispatch_plan_for_handler_preserves_forwarded_live_in_local() {
+        let (lowered, function_index) = lowered_function(
+            r#"
+def f():
+    import builtins
+    original_import = builtins.__import__
+    try:
+        raise ValueError("boom")
+    except ValueError:
+        pass
+    return original_import is builtins.__import__
+"#,
+            "f",
+        );
+        let function = &lowered.callable_defs[function_index];
+        let facts = infer_module_value_facts(&lowered);
+        let local_plan = plan_function_locals(function, &facts);
+        let source_block = function
+            .blocks
+            .iter()
+            .find(|block| block.exc_edge.is_some())
+            .expect("expected exception edge source block");
+        let exc_edge = source_block.exc_edge.as_ref().expect("checked above");
+        let runtime_target_params = planned_jit_param_names_for_block(
+            &function.blocks[exc_edge.target.index()],
+            local_plan.block(exc_edge.target),
+        );
+        let dispatch_plan = exc_dispatch_plan(function, source_block, &runtime_target_params)
+            .expect("expected exception dispatch plan");
+
+        assert!(
+            dispatch_plan
+                .forwarded_local_names
+                .iter()
+                .any(|name| name == "original_import"),
+            "exception dispatch should preserve original_import: {dispatch_plan:#?}"
+        );
+    }
+
+    #[test]
     fn refcount_plan_check_maps_terminal_releases_to_stack_slot_cleanup() {
         let (lowered, function_index) = lowered_function(
             r#"

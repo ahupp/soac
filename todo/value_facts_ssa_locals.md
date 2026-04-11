@@ -191,6 +191,14 @@ normal Python locals. They are still useful for vectorcall scratch buffers,
 address-taken values, frame/debug/deopt materialization, cells and closures, and
 backend spills owned by Cranelift.
 
+Progress note: ordinary CFG-edge forwarding and explicit edge slot writes now
+require an explicit `LocalEnv` binding for the source value instead of falling
+back to semantic stack-slot reloads. Function-entry seeding now first builds a
+`LocalEnv` snapshot from stack-backed entry bindings and then uses the same
+forward/incref rules as ordinary runtime edges. Multi-target terms (`if` and
+`br_table`) now clone that environment per outgoing edge so one arm's release
+plan cannot mutate the sibling arm during codegen.
+
 For assignment, the RHS is fully evaluated before rebinding, and the old binding
 is decref'd after the new binding is installed:
 
@@ -217,6 +225,72 @@ if v == NULL:
     cleanup(env.live_owned_values())
     return NULL
 ```
+
+## Block Param Facts
+
+`ValueFacts` alone is not enough to remove LocalEnv stack mirrors. Expression
+facts answer "what is this value?" The next LocalEnv step needs transport facts
+for CFG edges: "what local semantics still apply to this incoming block param?"
+
+That information should live in JIT planning beside `FunctionLocalPlan`, not in
+the general expression `value_facts` pass:
+
+```rust
+pub struct BlockParamFacts {
+    pub value: Option<PyObjFacts>,
+    pub binding: ParamBindingFacts,
+    pub provenance: ParamProvenance,
+    pub ownership: LocalRefKind,
+}
+
+pub enum ParamBindingFacts {
+    DefinitelyBound,
+    MaybeUnbound,
+    CheckedLocalValue,
+}
+
+pub enum ParamProvenance {
+    ForwardedLocal(LocalLocation),
+    StackSlot(LocalLocation),
+    ExceptionValue,
+    Constant,
+    Unknown,
+}
+```
+
+The important separation is:
+
+- `PyObjFacts` describes the value itself.
+- `BlockParamFacts` describes how safe it is to consume the incoming param as a
+  Python local.
+
+The consumer should be able to distinguish:
+
+- `DefinitelyBound + CheckedLocalValue`
+  Raw fast-path use is allowed.
+- `MaybeUnbound`
+  The consumer must preserve `UnboundLocalError` / deleted-name semantics rather
+  than treating the value as an ordinary `PyObject*`.
+- ownership still independently controls incref/decref policy.
+
+This keeps checking at the consumption boundary instead of forcing the edge
+forwarder to erase maybe-unbound state into a bare pointer-valued block arg.
+
+Suggested placement:
+
+```text
+value_facts
+-> ownership_effects
+-> local liveness / must-bound analysis
+-> block-param planning
+   - choose runtime block params
+   - attach BlockParamFacts
+-> JIT codegen consumes BlockParamFacts
+```
+
+`compute_function_local_must_bound_ins(...)` is already the beginning of this
+story. `BlockParamFacts` is the generalization from a yes/no local property to
+per-edge, per-param transport semantics.
 
 ## Removing Stack Mirrors
 
@@ -246,7 +320,6 @@ The work required is:
    represented in the successor environment.
 
 3. Introduce per-block-param transport facts.
-   This is the missing piece described in `todo/block_param_facts.md`.
    The consumer needs to know whether an incoming block param is:
    - definitely bound
    - maybe unbound
@@ -429,3 +502,6 @@ Started:
 - Exception-dispatch slot writes and runtime target-arg forwarding now require
   their named sources to be present in the forwarded block-param set instead of
   reloading those semantic locals from stack slots in the dispatch block.
+- Name-based `LocalEnv` loads used by owned-cell/local helper paths now also
+  require an explicit `LocalEnv` binding instead of consulting semantic stack
+  slots as a fallback source of truth.

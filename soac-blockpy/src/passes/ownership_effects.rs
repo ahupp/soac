@@ -446,7 +446,13 @@ fn plan_block_refcounts(
             block.label,
             &env,
             locals,
-            preserved_locations(edge.target, local_liveness, target_params, location_by_name),
+            preserved_locations(
+                edge.target,
+                Some(&edge.args),
+                local_liveness,
+                target_params,
+                location_by_name,
+            ),
             RefcountReleaseReason::ExceptionEdge {
                 target: edge.target,
             },
@@ -460,7 +466,13 @@ fn plan_block_refcounts(
             block.label,
             &env,
             locals,
-            preserved_locations(edge.target, local_liveness, target_params, location_by_name),
+            preserved_locations(
+                edge.target,
+                Some(&edge.args),
+                local_liveness,
+                target_params,
+                location_by_name,
+            ),
             RefcountReleaseReason::Jump {
                 target: edge.target,
             },
@@ -474,6 +486,7 @@ fn plan_block_refcounts(
                 locals,
                 preserved_locations(
                     if_term.then_label,
+                    None,
                     local_liveness,
                     target_params,
                     location_by_name,
@@ -490,6 +503,7 @@ fn plan_block_refcounts(
                 locals,
                 preserved_locations(
                     if_term.else_label,
+                    None,
                     local_liveness,
                     target_params,
                     location_by_name,
@@ -507,7 +521,13 @@ fn plan_block_refcounts(
                     block.label,
                     &env,
                     locals,
-                    preserved_locations(*target, local_liveness, target_params, location_by_name),
+                    preserved_locations(
+                        *target,
+                        None,
+                        local_liveness,
+                        target_params,
+                        location_by_name,
+                    ),
                     RefcountReleaseReason::BranchCase { target: *target },
                     &mut actions,
                 );
@@ -519,6 +539,7 @@ fn plan_block_refcounts(
                 locals,
                 preserved_locations(
                     branch.default_label,
+                    None,
                     local_liveness,
                     target_params,
                     location_by_name,
@@ -715,7 +736,13 @@ fn validate_block_refcount_plan(
             &mut term_actions,
             &env,
             locals,
-            preserved_locations(edge.target, local_liveness, target_params, location_by_name),
+            preserved_locations(
+                edge.target,
+                Some(&edge.args),
+                local_liveness,
+                target_params,
+                location_by_name,
+            ),
             RefcountReleaseReason::ExceptionEdge {
                 target: edge.target,
             },
@@ -730,7 +757,13 @@ fn validate_block_refcount_plan(
             &mut term_actions,
             &env,
             locals,
-            preserved_locations(edge.target, local_liveness, target_params, location_by_name),
+            preserved_locations(
+                edge.target,
+                Some(&edge.args),
+                local_liveness,
+                target_params,
+                location_by_name,
+            ),
             RefcountReleaseReason::Jump {
                 target: edge.target,
             },
@@ -745,6 +778,7 @@ fn validate_block_refcount_plan(
                 locals,
                 preserved_locations(
                     if_term.then_label,
+                    None,
                     local_liveness,
                     target_params,
                     location_by_name,
@@ -762,6 +796,7 @@ fn validate_block_refcount_plan(
                 locals,
                 preserved_locations(
                     if_term.else_label,
+                    None,
                     local_liveness,
                     target_params,
                     location_by_name,
@@ -780,7 +815,13 @@ fn validate_block_refcount_plan(
                     &mut term_actions,
                     &env,
                     locals,
-                    preserved_locations(*target, local_liveness, target_params, location_by_name),
+                    preserved_locations(
+                        *target,
+                        None,
+                        local_liveness,
+                        target_params,
+                        location_by_name,
+                    ),
                     RefcountReleaseReason::BranchCase { target: *target },
                     errors,
                 );
@@ -793,6 +834,7 @@ fn validate_block_refcount_plan(
                 locals,
                 preserved_locations(
                     branch.default_label,
+                    None,
                     local_liveness,
                     target_params,
                     location_by_name,
@@ -1431,24 +1473,43 @@ fn block_successors(block: &Block<InstrCodegen>) -> Vec<BlockLabel> {
 
 fn forwarded_locations(
     target: BlockLabel,
+    explicit_args: Option<&[BlockArg]>,
     target_params: &HashMap<BlockLabel, Vec<String>>,
     location_by_name: &HashMap<String, LocalLocation>,
 ) -> HashSet<LocalLocation> {
-    target_params
-        .get(&target)
-        .into_iter()
-        .flat_map(|params| params.iter())
-        .filter_map(|name| location_by_name.get(name).copied())
+    let Some(params) = target_params.get(&target) else {
+        return HashSet::new();
+    };
+    let explicit_start = explicit_args
+        .map(|args| params.len().saturating_sub(args.len()))
+        .unwrap_or(params.len());
+    params
+        .iter()
+        .enumerate()
+        .filter_map(|(index, target_name)| {
+            let arg = explicit_args.and_then(|args| {
+                index
+                    .checked_sub(explicit_start)
+                    .and_then(|offset| args.get(offset))
+            });
+            let source_name = match arg {
+                Some(BlockArg::Name(name)) => name.as_str(),
+                Some(_) => return None,
+                None => target_name.as_str(),
+            };
+            location_by_name.get(source_name).copied()
+        })
         .collect()
 }
 
 fn preserved_locations(
     target: BlockLabel,
+    explicit_args: Option<&[BlockArg]>,
     local_liveness: &LocalLiveness,
     target_params: &HashMap<BlockLabel, Vec<String>>,
     location_by_name: &HashMap<String, LocalLocation>,
 ) -> HashSet<LocalLocation> {
-    let mut preserved = forwarded_locations(target, target_params, location_by_name);
+    let mut preserved = forwarded_locations(target, explicit_args, target_params, location_by_name);
     if let Some(live_in) = local_liveness.live_in(target) {
         preserved.extend(live_in.iter().copied());
     }
@@ -1625,12 +1686,13 @@ fn expected_release_actions(
 #[cfg(test)]
 mod tests {
     use super::{
-        plan_ownership_effects, validate_ownership_effects, LocalRefState, RefcountActionKind,
-        RefcountReleaseReason,
+        forwarded_locations, plan_ownership_effects, validate_ownership_effects, LocalRefState,
+        RefcountActionKind, RefcountReleaseReason,
     };
-    use crate::block_py::BlockTerm;
+    use crate::block_py::{BlockArg, BlockLabel, BlockTerm, LocalLocation};
     use crate::lower_python_to_blockpy_for_testing;
     use crate::passes::infer_module_value_facts;
+    use std::collections::{HashMap, HashSet};
 
     fn refcount_actions_for_function(
         source: &str,
@@ -1902,6 +1964,31 @@ def outer():
                 } if local.name == "x" || local.name == "_dp_cell_x"
             )),
             "owned cell initialization should register a local rebind for the backing slot: {actions:#?}"
+        );
+    }
+
+    #[test]
+    fn forwarded_locations_uses_explicit_edge_source_names() {
+        let target = BlockLabel::from_index(1);
+        let target_params =
+            HashMap::from([(target, vec!["target_x".to_string(), "target_y".to_string()])]);
+        let location_by_name = HashMap::from([
+            ("target_x".to_string(), LocalLocation(10)),
+            ("target_y".to_string(), LocalLocation(11)),
+            ("source_x".to_string(), LocalLocation(3)),
+        ]);
+
+        let forwarded = forwarded_locations(
+            target,
+            Some(&[BlockArg::Name("source_x".to_string())]),
+            &target_params,
+            &location_by_name,
+        );
+
+        assert_eq!(
+            forwarded,
+            HashSet::from([LocalLocation(10), LocalLocation(3)]),
+            "explicit edge args should preserve the source local location rather than the tail target param name",
         );
     }
 

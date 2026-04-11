@@ -885,7 +885,7 @@ mod tests {
                 },
             ],
         };
-        let forwarded = HashSet::from([1usize]);
+        let forwarded = HashSet::from([LocalLocation(1)]);
 
         assert_eq!(
             env.transient_semantic_cleanup_names_excluding(&forwarded, &[]),
@@ -948,7 +948,15 @@ mod tests {
                     ),
                 }],
             };
-            emit_decref_unforwarded_local_env(&mut fb, &env, &[], &[], null_tstate, decref_ref);
+            let forwarded = HashSet::new();
+            emit_decref_unforwarded_local_env(
+                &mut fb,
+                &env,
+                &forwarded,
+                &[],
+                null_tstate,
+                decref_ref,
+            );
         }));
 
         assert!(
@@ -1011,10 +1019,11 @@ mod tests {
                     ),
                 }],
             };
+            let forwarded = HashSet::from([LocalLocation(0)]);
             emit_decref_unforwarded_local_env(
                 &mut fb,
                 &env,
-                &["x".to_string()],
+                &forwarded,
                 &[],
                 null_tstate,
                 decref_ref,
