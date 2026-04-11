@@ -3974,6 +3974,52 @@ fn emit_one_arg_method_call_and_discard(
     fb.ins().call(ctx.decref_ref, &[call_value]);
 }
 
+fn emit_kwargs_setitem_or_cleanup(
+    fb: &mut FunctionBuilder<'_>,
+    kwargs_obj: ir::Value,
+    key_obj: ir::Value,
+    value_obj: ir::Value,
+    value_borrowed: bool,
+    cleanup_on_error: &[ir::Value],
+    ctx: &JitEmitCtx<'_>,
+) {
+    let ptr_ty = ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let set_inst = fb
+        .ins()
+        .call(ctx.pyobject_setitem_ref, &[kwargs_obj, key_obj, value_obj]);
+    fb.ins().call(ctx.decref_ref, &[key_obj]);
+    if !value_borrowed {
+        fb.ins().call(ctx.decref_ref, &[value_obj]);
+    }
+    let set_value = fb.inst_results(set_inst)[0];
+    let set_failed = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, set_value, null_ptr);
+    let set_ok = fb.create_block();
+    let set_fail = fb.create_block();
+    fb.append_block_param(set_fail, ptr_ty);
+    fb.ins().brif(
+        set_failed,
+        set_fail,
+        &[ir::BlockArg::Value(kwargs_obj)],
+        set_ok,
+        &[],
+    );
+    fb.switch_to_block(set_fail);
+    let failed_kwargs = fb.block_params(set_fail)[0];
+    let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
+    fb.ins().call(ctx.decref_ref, &[failed_kwargs]);
+    for value in cleanup_on_error {
+        fb.ins().call(ctx.decref_ref, &[*value]);
+    }
+    emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
+    fb.ins()
+        .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
+    fb.switch_to_block(set_ok);
+    fb.ins().call(ctx.decref_ref, &[set_value]);
+}
+
 fn emit_keyword_call_with_local_env(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
@@ -4036,40 +4082,20 @@ fn emit_keyword_call_with_local_env(
             jit_module,
             func_imports,
         );
-        let set_inst = fb
-            .ins()
-            .call(ctx.pyobject_setitem_ref, &[kwargs_obj, key_obj, value_obj]);
-        fb.ins().call(ctx.decref_ref, &[key_obj]);
-        if !value_borrowed {
-            fb.ins().call(ctx.decref_ref, &[value_obj]);
-        }
-        let set_value = fb.inst_results(set_inst)[0];
-        let set_failed = fb
-            .ins()
-            .icmp(ir::condcodes::IntCC::Equal, set_value, null_ptr);
-        let set_ok = fb.create_block();
-        let set_fail = fb.create_block();
-        fb.append_block_param(set_fail, ptr_ty);
-        fb.ins().brif(
-            set_failed,
-            set_fail,
-            &[ir::BlockArg::Value(kwargs_obj)],
-            set_ok,
-            &[],
-        );
-        fb.switch_to_block(set_fail);
-        let failed_kwargs = fb.block_params(set_fail)[0];
-        let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
-        fb.ins().call(ctx.decref_ref, &[failed_kwargs]);
-        fb.ins().call(ctx.decref_ref, &[call_args_tuple]);
+        let mut cleanup_on_error = Vec::with_capacity(2);
+        cleanup_on_error.push(call_args_tuple);
         if !callable_is_borrowed {
-            fb.ins().call(ctx.decref_ref, &[callable]);
+            cleanup_on_error.push(callable);
         }
-        emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
-        fb.ins()
-            .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
-        fb.switch_to_block(set_ok);
-        fb.ins().call(ctx.decref_ref, &[set_value]);
+        emit_kwargs_setitem_or_cleanup(
+            fb,
+            kwargs_obj,
+            key_obj,
+            value_obj,
+            value_borrowed,
+            cleanup_on_error.as_slice(),
+            ctx,
+        );
     }
 
     emit_object_call_with_tuple_args(
@@ -4187,40 +4213,20 @@ fn emit_unpack_call_with_local_env(
                     jit_module,
                     func_imports,
                 );
-                let set_inst = fb
-                    .ins()
-                    .call(ctx.pyobject_setitem_ref, &[kwargs_obj, key_obj, value_obj]);
-                fb.ins().call(ctx.decref_ref, &[key_obj]);
-                if !value_borrowed {
-                    fb.ins().call(ctx.decref_ref, &[value_obj]);
-                }
-                let set_value = fb.inst_results(set_inst)[0];
-                let set_failed = fb
-                    .ins()
-                    .icmp(ir::condcodes::IntCC::Equal, set_value, null_ptr);
-                let set_ok = fb.create_block();
-                let set_fail = fb.create_block();
-                fb.append_block_param(set_fail, ptr_ty);
-                fb.ins().brif(
-                    set_failed,
-                    set_fail,
-                    &[ir::BlockArg::Value(kwargs_obj)],
-                    set_ok,
-                    &[],
-                );
-                fb.switch_to_block(set_fail);
-                let failed_kwargs = fb.block_params(set_fail)[0];
-                let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
-                fb.ins().call(ctx.decref_ref, &[failed_kwargs]);
-                fb.ins().call(ctx.decref_ref, &[args_list]);
+                let mut cleanup_on_error = Vec::with_capacity(2);
+                cleanup_on_error.push(args_list);
                 if !callable_is_borrowed {
-                    fb.ins().call(ctx.decref_ref, &[callable]);
+                    cleanup_on_error.push(callable);
                 }
-                emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
-                fb.ins()
-                    .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
-                fb.switch_to_block(set_ok);
-                fb.ins().call(ctx.decref_ref, &[set_value]);
+                emit_kwargs_setitem_or_cleanup(
+                    fb,
+                    kwargs_obj,
+                    key_obj,
+                    value_obj,
+                    value_borrowed,
+                    cleanup_on_error.as_slice(),
+                    ctx,
+                );
             }
             CallArgKeyword::Starred(value_expr) => {
                 let kwargs_obj = kwargs_obj.expect("kwargs object must exist for kwstar part");
