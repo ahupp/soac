@@ -3894,6 +3894,42 @@ fn emit_object_call_with_tuple_args(
     fb.block_params(call_ok_block)[0]
 }
 
+fn emit_empty_dict_with_args_tuple(
+    fb: &mut FunctionBuilder<'_>,
+    empty_args_tuple: ir::Value,
+    empty_args_tuple_is_borrowed: bool,
+    ctx: &JitEmitCtx<'_>,
+) -> ir::Value {
+    let dict_name_obj = emit_owned_module_constant(
+        fb,
+        ctx.module_constants.require_unicode_constant_id("dict"),
+        ctx,
+    );
+    let dict_callable_inst = fb.ins().call(ctx.load_runtime_obj_ref, &[dict_name_obj]);
+    let dict_callable = emit_decref_owned_input_after_nullable_result(
+        fb,
+        ctx,
+        fb.inst_results(dict_callable_inst)[0],
+        dict_name_obj,
+    );
+    let dict_callable = emit_checked_owned_pyobject_result(fb, dict_callable, ctx);
+    let kwargs_inst = fb
+        .ins()
+        .call(ctx.py_call_object_ref, &[dict_callable, empty_args_tuple]);
+    let mut owned_inputs = Vec::with_capacity(2);
+    if !empty_args_tuple_is_borrowed {
+        owned_inputs.push(empty_args_tuple);
+    }
+    owned_inputs.push(dict_callable);
+    let kwargs_obj = emit_decref_owned_inputs_after_nullable_result(
+        fb,
+        ctx,
+        fb.inst_results(kwargs_inst)[0],
+        &owned_inputs,
+    );
+    emit_checked_owned_pyobject_result(fb, kwargs_obj, ctx)
+}
+
 fn emit_keyword_call_with_local_env(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
@@ -3929,35 +3965,11 @@ fn emit_keyword_call_with_local_env(
     }
     let call_args_tuple = emit_call_args_tuple_from_values(fb, tuple_items.as_slice(), ctx);
 
-    let dict_name_obj = emit_owned_module_constant(
-        fb,
-        ctx.module_constants.require_unicode_constant_id("dict"),
-        ctx,
-    );
-    let dict_callable_inst = fb.ins().call(ctx.load_runtime_obj_ref, &[dict_name_obj]);
-    let dict_callable = emit_decref_owned_input_after_nullable_result(
-        fb,
-        ctx,
-        fb.inst_results(dict_callable_inst)[0],
-        dict_name_obj,
-    );
-    let dict_callable = emit_checked_owned_pyobject_result(fb, dict_callable, ctx);
-
     let empty_tuple_len = fb.ins().iconst(ctx.consts.i64_ty, 0);
     let empty_tuple_inst = fb.ins().call(ctx.tuple_new_ref, &[empty_tuple_len]);
     let empty_tuple =
         emit_checked_owned_pyobject_result(fb, fb.inst_results(empty_tuple_inst)[0], ctx);
-
-    let kwargs_inst = fb
-        .ins()
-        .call(ctx.py_call_object_ref, &[dict_callable, empty_tuple]);
-    let kwargs_obj = emit_decref_owned_inputs_after_nullable_result(
-        fb,
-        ctx,
-        fb.inst_results(kwargs_inst)[0],
-        &[empty_tuple, dict_callable],
-    );
-    let kwargs_obj = emit_checked_owned_pyobject_result(fb, kwargs_obj, ctx);
+    let kwargs_obj = emit_empty_dict_with_args_tuple(fb, empty_tuple, false, ctx);
 
     for (name, value_expr) in keywords {
         let key_obj = emit_owned_module_constant(
@@ -4068,30 +4080,12 @@ fn emit_unpack_call_with_local_env(
     let kwargs_obj = if keywords.is_empty() {
         None
     } else {
-        let dict_name_obj = emit_owned_module_constant(
+        Some(emit_empty_dict_with_args_tuple(
             fb,
-            ctx.module_constants.require_unicode_constant_id("dict"),
+            ctx.consts.empty_tuple_const,
+            true,
             ctx,
-        );
-        let dict_callable_inst = fb.ins().call(ctx.load_runtime_obj_ref, &[dict_name_obj]);
-        let dict_callable = emit_decref_owned_input_after_nullable_result(
-            fb,
-            ctx,
-            fb.inst_results(dict_callable_inst)[0],
-            dict_name_obj,
-        );
-        let dict_callable = emit_checked_owned_pyobject_result(fb, dict_callable, ctx);
-        let kwargs_inst = fb.ins().call(
-            ctx.py_call_object_ref,
-            &[dict_callable, ctx.consts.empty_tuple_const],
-        );
-        let kwargs_obj = emit_decref_owned_input_after_nullable_result(
-            fb,
-            ctx,
-            fb.inst_results(kwargs_inst)[0],
-            dict_callable,
-        );
-        Some(emit_checked_owned_pyobject_result(fb, kwargs_obj, ctx))
+        ))
     };
 
     for arg in args {
