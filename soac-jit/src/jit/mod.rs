@@ -9757,6 +9757,44 @@ fn emit_codegen_if_term_via_typed_truthy(
     )
 }
 
+fn emit_typed_codegen_return_term(
+    fb: &mut FunctionBuilder<'_>,
+    source_label: BlockLabel,
+    typed_term: &BlockTerm<InstrTyped>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+    current_exception_name: Option<&str>,
+) -> Result<(), String> {
+    let BlockTerm::Return(value) = typed_term else {
+        return Err(format!(
+            "typed term kind mismatch for Return in block {source_label}"
+        ));
+    };
+    let ret_value = emit_typed_codegen_expr_with_local_env(
+        fb,
+        value,
+        local_env,
+        emit_ctx,
+        false,
+        jit_module,
+        func_imports,
+    )?;
+    emit_decref_unforwarded_local_env(
+        fb,
+        local_env,
+        &[],
+        emit_ctx.consts.thread_state_value,
+        emit_ctx.decref_ref,
+    );
+    let release_reason = RefcountReleaseReason::Return;
+    emit_planned_stack_slot_releases_for_reason(fb, source_label, &release_reason, emit_ctx)?;
+    emit_pop_handled_exception_if_leaving(fb, current_exception_name, &[], emit_ctx);
+    fb.ins().return_(&[ret_value]);
+    Ok(())
+}
+
 fn emit_codegen_term(
     fb: &mut FunctionBuilder<'_>,
     source_label: BlockLabel,
@@ -9984,26 +10022,17 @@ fn emit_codegen_term(
             fb.ins()
                 .jump(exec_blocks[default_index], &default_jump_args);
         }
-        BlockTerm::Return(value) => {
-            let ret_value = emit_codegen_expr_with_local_env(
-                fb,
-                value,
-                local_env,
-                emit_ctx,
-                false,
-                jit_module,
-                func_imports,
-            );
-            emit_decref_unforwarded_local_env(fb, local_env, &[], thread_state_value, decref_ref);
-            let release_reason = RefcountReleaseReason::Return;
-            emit_planned_stack_slot_releases_for_reason(
+        BlockTerm::Return(_) => {
+            emit_typed_codegen_return_term(
                 fb,
                 source_label,
-                &release_reason,
+                typed_term,
+                local_env,
                 emit_ctx,
+                jit_module,
+                func_imports,
+                current_exception_name,
             )?;
-            emit_pop_handled_exception_if_leaving(fb, current_exception_name, &[], emit_ctx);
-            fb.ins().return_(&[ret_value]);
         }
         BlockTerm::Raise(raise_stmt) => {
             let raise_name_obj = emit_owned_module_constant(
