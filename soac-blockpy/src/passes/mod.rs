@@ -23,9 +23,9 @@ use crate::block_py::{
     ExprNumberLiteral, ExprSet, ExprSetComp, ExprSlice, ExprStarred, ExprStringLiteral,
     ExprSubscript, ExprTString, ExprTuple, GetAttr, GetItem, HasMeta, IdentifiedInstr,
     IncrementCounter, Instr, InstrWithConstantNone, LiteralValue, Load, MakeCell, MakeFunction,
-    MapInstr, Mappable, Meta, ModuleShape, NameLike, ResolvedName, SetAttr, SetItem, StmtAnnAssign,
-    StmtAssert, StmtAssign, StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue, StmtDelete,
-    StmtExpr, StmtFor, StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom,
+    MapInstr, MapModule, Mappable, Meta, ModuleShape, NameLike, ResolvedName, SetAttr, SetItem,
+    StmtAnnAssign, StmtAssert, StmtAssign, StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue,
+    StmtDelete, StmtExpr, StmtFor, StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom,
     StmtIpyEscapeCommand, StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry,
     StmtTypeAlias, StmtWhile, StmtWith, Store, TryMapInstr, UnaryOp, UnresolvedName, WithMeta,
     Yield, YieldFrom,
@@ -147,6 +147,105 @@ pub type InstrCodegen = InstrCodegenOp;
 
 impl Instr for InstrCodegenOp {
     type Name = ResolvedName;
+}
+
+#[derive(Clone, derive_more::From, DelegateMatchDefault)]
+#[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, Debug)]
+pub enum InstrTyped {
+    LegacyBinOp(BinOp<Self>),
+    LegacyUnaryOp(UnaryOp<Self>),
+    LegacyCalleeFunctionId(CalleeFunctionId<Self>),
+    LegacyCall(Call<Self>),
+    LegacyCallDirect(CallDirect<Self>),
+    LegacyGetAttr(GetAttr<Self>),
+    LegacySetAttr(SetAttr<Self>),
+    LegacyGetItem(GetItem<Self>),
+    LegacySetItem(SetItem<Self>),
+    LegacyDelItem(DelItem<Self>),
+    LegacyLoad(Load<Self>),
+    LegacyStore(Store<Self>),
+    LegacyDel(Del<Self>),
+    LegacyMakeCell(MakeCell<Self>),
+    LegacyIncrementCounter(IncrementCounter),
+    LegacyCellRef(CellRef),
+    LegacyMakeFunction(MakeFunction<Self>),
+}
+
+pub type InstrTypedCodegen = InstrTyped;
+
+impl InstrTyped {
+    pub fn is_legacy(&self) -> bool {
+        matches!(
+            self,
+            Self::LegacyBinOp(_)
+                | Self::LegacyUnaryOp(_)
+                | Self::LegacyCalleeFunctionId(_)
+                | Self::LegacyCall(_)
+                | Self::LegacyCallDirect(_)
+                | Self::LegacyGetAttr(_)
+                | Self::LegacySetAttr(_)
+                | Self::LegacyGetItem(_)
+                | Self::LegacySetItem(_)
+                | Self::LegacyDelItem(_)
+                | Self::LegacyLoad(_)
+                | Self::LegacyStore(_)
+                | Self::LegacyDel(_)
+                | Self::LegacyMakeCell(_)
+                | Self::LegacyIncrementCounter(_)
+                | Self::LegacyCellRef(_)
+                | Self::LegacyMakeFunction(_)
+        )
+    }
+}
+
+impl Instr for InstrTyped {
+    type Name = ResolvedName;
+}
+
+impl InstrWithConstantNone for InstrTyped {
+    fn constant_none() -> Self {
+        runtime_name_load("NONE")
+    }
+}
+
+struct CodegenToTyped;
+
+impl MapInstr<InstrCodegen, InstrTyped> for CodegenToTyped {
+    fn map_instr(&mut self, instr: InstrCodegen) -> InstrTyped {
+        match instr {
+            InstrCodegenOp::BinOp(op) => InstrTyped::LegacyBinOp(op.map_children(self)),
+            InstrCodegenOp::UnaryOp(op) => InstrTyped::LegacyUnaryOp(op.map_children(self)),
+            InstrCodegenOp::CalleeFunctionId(op) => {
+                InstrTyped::LegacyCalleeFunctionId(op.map_children(self))
+            }
+            InstrCodegenOp::Call(op) => InstrTyped::LegacyCall(op.map_children(self)),
+            InstrCodegenOp::CallDirect(op) => InstrTyped::LegacyCallDirect(op.map_children(self)),
+            InstrCodegenOp::GetAttr(op) => InstrTyped::LegacyGetAttr(op.map_children(self)),
+            InstrCodegenOp::SetAttr(op) => InstrTyped::LegacySetAttr(op.map_children(self)),
+            InstrCodegenOp::GetItem(op) => InstrTyped::LegacyGetItem(op.map_children(self)),
+            InstrCodegenOp::SetItem(op) => InstrTyped::LegacySetItem(op.map_children(self)),
+            InstrCodegenOp::DelItem(op) => InstrTyped::LegacyDelItem(op.map_children(self)),
+            InstrCodegenOp::Load(op) => InstrTyped::LegacyLoad(op.map_children(self)),
+            InstrCodegenOp::Store(op) => InstrTyped::LegacyStore(op.map_children(self)),
+            InstrCodegenOp::Del(op) => InstrTyped::LegacyDel(op.map_children(self)),
+            InstrCodegenOp::MakeCell(op) => InstrTyped::LegacyMakeCell(op.map_children(self)),
+            InstrCodegenOp::IncrementCounter(op) => InstrTyped::LegacyIncrementCounter(op),
+            InstrCodegenOp::CellRef(op) => InstrTyped::LegacyCellRef(op),
+            InstrCodegenOp::MakeFunction(op) => {
+                InstrTyped::LegacyMakeFunction(op.map_children(self))
+            }
+        }
+    }
+
+    fn map_name(&mut self, name: ResolvedName) -> ResolvedName {
+        name
+    }
+}
+
+pub fn lower_codegen_module_to_typed(
+    module: BlockPyModule<CodegenModuleShape>,
+) -> BlockPyModule<TypedCodegenModuleShape> {
+    CodegenToTyped.map_module(module)
 }
 
 impl<I> Instr for IdentifiedInstr<I>
@@ -370,6 +469,13 @@ impl ModuleShape for CodegenUnidentifiedModuleShape {
     type Instr = InstrCodegen;
 }
 
+#[derive(Debug, Clone)]
+pub struct TypedCodegenModuleShape;
+
+impl ModuleShape for TypedCodegenModuleShape {
+    type Instr = InstrTyped;
+}
+
 pub(crate) use blockpy_generators::lower_yield_in_lowered_core_blockpy_module_bundle;
 pub use blockpy_to_bb::{lower_try_jump_exception_flow, normalize_bb_module_strings};
 pub use instr_id::{
@@ -408,6 +514,60 @@ pub(crate) use trace::{
 pub fn relabel_dense_bb_module<P: ModuleShape>(module: &mut BlockPyModule<P>) {
     for callable in &mut module.callable_defs {
         relabel_blockpy_blocks_dense(&mut callable.blocks);
+    }
+}
+
+#[cfg(test)]
+mod typed_codegen_tests {
+    use super::*;
+    use crate::block_py::{ChildVisitable, Visit};
+
+    #[derive(Default)]
+    struct LegacyInstrCounter {
+        total: usize,
+        binops: usize,
+        non_legacy: usize,
+    }
+
+    impl Visit<InstrTyped> for LegacyInstrCounter {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            self.total += 1;
+            if !expr.is_legacy() {
+                self.non_legacy += 1;
+            }
+            if matches!(expr, InstrTyped::LegacyBinOp(_)) {
+                self.binops += 1;
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    #[test]
+    fn lower_codegen_module_to_typed_wraps_codegen_instrs_as_legacy() {
+        let lowered =
+            crate::lower_python_to_blockpy_for_testing("def f(a, b):\n    return a + b\n")
+                .expect("source should lower");
+        let function_count = lowered.codegen_module.callable_defs.len();
+        let global_names = lowered.codegen_module.global_names.clone();
+
+        let typed = lower_codegen_module_to_typed(lowered.codegen_module);
+
+        assert_eq!(typed.callable_defs.len(), function_count);
+        assert_eq!(typed.global_names, global_names);
+
+        let mut counter = LegacyInstrCounter::default();
+        for function in &typed.callable_defs {
+            for block in &function.blocks {
+                for instr in &block.body {
+                    counter.visit_instr(instr);
+                }
+                counter.visit_term(&block.term);
+            }
+        }
+
+        assert!(counter.total > 0);
+        assert!(counter.binops > 0);
+        assert_eq!(counter.non_legacy, 0);
     }
 }
 
