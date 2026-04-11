@@ -15,20 +15,20 @@ mod trace;
 mod value_facts;
 
 use crate::block_py::{
-    cfg::relabel_blockpy_blocks_dense, runtime_name_load, Await, BinOp, BlockPyModule, Call,
-    CallArgKeyword, CallArgPositional, CallDirect, CalleeFunctionId, CellRef, CellRefForName,
-    ChildVisitable, Del, DelItem, ExprAttribute, ExprBoolOp, ExprBooleanLiteral, ExprBytesLiteral,
-    ExprCompare, ExprDict, ExprDictComp, ExprEllipsisLiteral, ExprFString, ExprGenerator, ExprIf,
-    ExprIpyEscapeCommand, ExprLambda, ExprList, ExprListComp, ExprName, ExprNamed, ExprNoneLiteral,
-    ExprNumberLiteral, ExprSet, ExprSetComp, ExprSlice, ExprStarred, ExprStringLiteral,
-    ExprSubscript, ExprTString, ExprTuple, GetAttr, GetItem, HasMeta, IdentifiedInstr,
-    IncrementCounter, Instr, InstrWithConstantNone, LiteralValue, Load, MakeCell, MakeFunction,
-    MapInstr, MapModule, Mappable, Meta, ModuleShape, NameLike, ResolvedName, SetAttr, SetItem,
-    StmtAnnAssign, StmtAssert, StmtAssign, StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue,
-    StmtDelete, StmtExpr, StmtFor, StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom,
-    StmtIpyEscapeCommand, StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry,
-    StmtTypeAlias, StmtWhile, StmtWith, Store, TryMapInstr, TryMapModule, UnaryOp, UnresolvedName,
-    WithMeta, Yield, YieldFrom,
+    cfg::relabel_blockpy_blocks_dense, runtime_name_load, Await, BinOp, BlockPyFunction,
+    BlockPyModule, Call, CallArgKeyword, CallArgPositional, CallDirect, CalleeFunctionId, CellRef,
+    CellRefForName, ChildVisitable, Del, DelItem, ExprAttribute, ExprBoolOp, ExprBooleanLiteral,
+    ExprBytesLiteral, ExprCompare, ExprDict, ExprDictComp, ExprEllipsisLiteral, ExprFString,
+    ExprGenerator, ExprIf, ExprIpyEscapeCommand, ExprLambda, ExprList, ExprListComp, ExprName,
+    ExprNamed, ExprNoneLiteral, ExprNumberLiteral, ExprSet, ExprSetComp, ExprSlice, ExprStarred,
+    ExprStringLiteral, ExprSubscript, ExprTString, ExprTuple, GetAttr, GetItem, HasMeta,
+    IdentifiedInstr, IncrementCounter, Instr, InstrWithConstantNone, LiteralValue, Load, MakeCell,
+    MakeFunction, MapFunction, MapInstr, MapModule, Mappable, Meta, ModuleShape, NameLike,
+    ResolvedName, SetAttr, SetItem, StmtAnnAssign, StmtAssert, StmtAssign, StmtAugAssign,
+    StmtBreak, StmtClassDef, StmtContinue, StmtDelete, StmtExpr, StmtFor, StmtFunctionDef,
+    StmtGlobal, StmtIf, StmtImport, StmtImportFrom, StmtIpyEscapeCommand, StmtMatch, StmtNonlocal,
+    StmtPass, StmtRaise, StmtReturn, StmtTry, StmtTypeAlias, StmtWhile, StmtWith, Store,
+    TryMapInstr, TryMapModule, UnaryOp, UnresolvedName, WithMeta, Yield, YieldFrom,
 };
 use ruff_python_ast::{self as ast};
 use soac_macros::{enum_broadcast, DelegateMatchDefault};
@@ -336,25 +336,36 @@ pub fn lower_codegen_module_to_typed(
     CodegenToTyped.map_module(module)
 }
 
-pub fn lower_codegen_instr_to_typed(instr: InstrCodegen) -> InstrTyped {
-    CodegenToTyped.map_instr(instr)
+pub fn lower_codegen_function_to_typed(
+    function: BlockPyFunction<CodegenModuleShape>,
+) -> BlockPyFunction<TypedCodegenModuleShape> {
+    CodegenToTyped.map_fn(function)
+}
+
+pub fn lower_typed_function_if_tests_to_truthy(
+    mut function: BlockPyFunction<TypedCodegenModuleShape>,
+) -> BlockPyFunction<TypedCodegenModuleShape> {
+    for block in &mut function.blocks {
+        if let crate::block_py::BlockTerm::IfTerm(if_term) = &mut block.term {
+            if matches!(if_term.test, InstrTyped::Truthy(_)) {
+                continue;
+            }
+            let old_test = std::mem::replace(&mut if_term.test, InstrTyped::constant_none());
+            let meta = old_test.meta();
+            if_term.test = InstrTyped::Truthy(TypedTruthy::new(old_test).with_meta(meta));
+        }
+    }
+    function
 }
 
 pub fn lower_typed_if_tests_to_truthy(
     mut module: BlockPyModule<TypedCodegenModuleShape>,
 ) -> BlockPyModule<TypedCodegenModuleShape> {
-    for function in &mut module.callable_defs {
-        for block in &mut function.blocks {
-            if let crate::block_py::BlockTerm::IfTerm(if_term) = &mut block.term {
-                if matches!(if_term.test, InstrTyped::Truthy(_)) {
-                    continue;
-                }
-                let old_test = std::mem::replace(&mut if_term.test, InstrTyped::constant_none());
-                let meta = old_test.meta();
-                if_term.test = InstrTyped::Truthy(TypedTruthy::new(old_test).with_meta(meta));
-            }
-        }
-    }
+    module.callable_defs = module
+        .callable_defs
+        .into_iter()
+        .map(lower_typed_function_if_tests_to_truthy)
+        .collect();
     module
 }
 

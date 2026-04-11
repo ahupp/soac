@@ -28,8 +28,8 @@ use soac_blockpy::block_py::{
 use soac_blockpy::passes::{
     CodegenModuleShape, FactStore, FunctionRefcountPlan, InstrResolved, InstrTyped, PyExactType,
     PyObjFacts, RefcountActionKind, RefcountReleaseReason, RuntimeHelperId,
-    TypedCodegenModuleShape, TypedTruthy, ValueFacts, infer_module_value_facts,
-    lower_codegen_instr_to_typed, try_lower_typed_instr_to_codegen_legacy,
+    TypedCodegenModuleShape, ValueFacts, infer_module_value_facts, lower_codegen_function_to_typed,
+    lower_typed_function_if_tests_to_truthy, try_lower_typed_instr_to_codegen_legacy,
     try_lower_typed_module_to_codegen_legacy,
 };
 use std::borrow::Cow;
@@ -9716,6 +9716,7 @@ fn emit_codegen_if_term_via_typed_truthy(
     fb: &mut FunctionBuilder<'_>,
     source_label: BlockLabel,
     if_term: &soac_blockpy::block_py::TermIf<InstrCodegen>,
+    typed_term: &BlockTerm<InstrTyped>,
     exec_blocks: &[ir::Block],
     runtime_block_param_names: &[Vec<String>],
     local_env: &mut LocalEnv,
@@ -9725,18 +9726,26 @@ fn emit_codegen_if_term_via_typed_truthy(
     is_true_ref: ir::FuncRef,
     current_exception_name: Option<&str>,
 ) -> Result<(), String> {
-    let typed_test = lower_codegen_instr_to_typed(if_term.test.clone());
-    let typed_test =
-        InstrTyped::Truthy(TypedTruthy::new(typed_test).with_meta(if_term.test.meta()));
-    let typed_if_term = soac_blockpy::block_py::TermIf {
-        test: typed_test,
-        then_label: if_term.then_label,
-        else_label: if_term.else_label,
+    let BlockTerm::IfTerm(typed_if_term) = typed_term else {
+        return Err(format!(
+            "typed term kind mismatch for IfTerm in block {source_label}"
+        ));
     };
+    if typed_if_term.then_label != if_term.then_label
+        || typed_if_term.else_label != if_term.else_label
+    {
+        return Err(format!(
+            "typed IfTerm target mismatch in block {source_label}: codegen then/else = {}/{}, typed then/else = {}/{}",
+            if_term.then_label,
+            if_term.else_label,
+            typed_if_term.then_label,
+            typed_if_term.else_label
+        ));
+    }
     emit_typed_codegen_if_term(
         fb,
         source_label,
-        &typed_if_term,
+        typed_if_term,
         exec_blocks,
         runtime_block_param_names,
         local_env,
@@ -9752,6 +9761,7 @@ fn emit_codegen_term(
     fb: &mut FunctionBuilder<'_>,
     source_label: BlockLabel,
     term: &BlockTerm<InstrCodegen>,
+    typed_term: &BlockTerm<InstrTyped>,
     exec_blocks: &[ir::Block],
     runtime_block_param_names: &[Vec<String>],
     full_block_param_names: &[Vec<String>],
@@ -9833,6 +9843,7 @@ fn emit_codegen_term(
                 fb,
                 source_label,
                 if_term,
+                typed_term,
                 exec_blocks,
                 runtime_block_param_names,
                 local_env,
@@ -11519,6 +11530,24 @@ fn build_cranelift_run_bb_specialized_function(
     let local_plan = plan_function_locals(function, &value_facts);
     let refcount_plan = plan_function_refcount_ownership(module, function, &value_facts)?;
     let _refcount_plan_check = check_refcount_plan_against_current_jit(function, &refcount_plan)?;
+    let typed_function =
+        lower_typed_function_if_tests_to_truthy(lower_codegen_function_to_typed(function.clone()));
+    if typed_function.blocks.len() != function.blocks.len() {
+        return Err(format!(
+            "typed JIT function block count mismatch for {}: {} != {}",
+            function.names.qualname,
+            typed_function.blocks.len(),
+            function.blocks.len()
+        ));
+    }
+    for (codegen_block, typed_block) in function.blocks.iter().zip(&typed_function.blocks) {
+        if codegen_block.label != typed_block.label {
+            return Err(format!(
+                "typed JIT block label mismatch for {}: {} != {}",
+                function.names.qualname, typed_block.label, codegen_block.label
+            ));
+        }
+    }
 
     let mut direct_call_target_functions = HashMap::new();
     for function_id in direct_call_targets {
@@ -12158,6 +12187,7 @@ fn build_cranelift_run_bb_specialized_function(
                 &mut fb,
                 codegen_block.label,
                 &codegen_block.term,
+                &typed_function.blocks[index].term,
                 &exec_blocks,
                 &runtime_block_param_names,
                 &full_block_param_names,
