@@ -1,7 +1,7 @@
 use super::{
-    ImportSpec, JitEmitCtx, SOAC_RUNTIME_LOAD_GLOBAL_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_IMPORT,
-    SigType, codegen_constant_string_value, emit_increment_counter_slot,
-    emit_owned_module_constant_from_parts,
+    ImportSpec, JitEmitCtx, RelocTypeRef, SOAC_RUNTIME_LOAD_GLOBAL_IMPORT,
+    SOAC_RUNTIME_STORE_GLOBAL_IMPORT, SigType, codegen_constant_string_value,
+    emit_increment_counter_slot, emit_owned_module_constant_from_parts,
 };
 use crate::jit::blockpy_intrinsics;
 use crate::operator_specialization::{
@@ -34,6 +34,7 @@ pub(super) trait OperationEmitState<'fb, E> {
         borrowed: bool,
         invert: bool,
     ) -> ir::Value;
+    fn emit_type_ptr_value(&mut self, owner_type_ref: &RelocTypeRef) -> Option<ir::Value>;
     fn py_facts_for_arg(&self, arg: &E) -> PyObjFacts;
 
     fn emit_owned_string_constant(&mut self, value: &str) -> ir::Value {
@@ -439,7 +440,7 @@ fn emit_specialized_getattr<'fb>(
         .field_index_specializations
         .get(attr_name)?
         .iter()
-        .copied()
+        .cloned()
         .collect::<Vec<_>>();
     if specializations.is_empty() {
         return None;
@@ -467,6 +468,9 @@ fn emit_specialized_getattr<'fb>(
     state.fb().append_block_param(result_block, ptr_ty);
     let fallback_block = state.fb().create_block();
     for (index, specialization) in specializations.iter().enumerate() {
+        let Some(owner_type) = state.emit_type_ptr_value(&specialization.owner_type_ref) else {
+            continue;
+        };
         let maybe_direct_block = state.fb().create_block();
         let direct_block = state.fb().create_block();
         state.fb().append_block_param(direct_block, ptr_ty);
@@ -475,11 +479,6 @@ fn emit_specialized_getattr<'fb>(
         } else {
             state.fb().create_block()
         };
-
-        let owner_type = state
-            .fb()
-            .ins()
-            .iconst(ptr_ty, specialization.owner_type as i64);
         let expected_version = state
             .fb()
             .ins()
@@ -586,7 +585,7 @@ fn emit_specialized_setattr<'fb>(
         .field_index_specializations
         .get(attr_name)?
         .iter()
-        .copied()
+        .cloned()
         .collect::<Vec<_>>();
     if specializations.is_empty() {
         return None;
@@ -614,6 +613,9 @@ fn emit_specialized_setattr<'fb>(
     state.fb().append_block_param(result_block, ptr_ty);
     let fallback_block = state.fb().create_block();
     for (index, specialization) in specializations.iter().enumerate() {
+        let Some(owner_type) = state.emit_type_ptr_value(&specialization.owner_type_ref) else {
+            continue;
+        };
         let maybe_direct_block = state.fb().create_block();
         let direct_block = state.fb().create_block();
         let next_guard_block = if index + 1 == specializations.len() {
@@ -621,11 +623,6 @@ fn emit_specialized_setattr<'fb>(
         } else {
             state.fb().create_block()
         };
-
-        let owner_type = state
-            .fb()
-            .ins()
-            .iconst(ptr_ty, specialization.owner_type as i64);
         let expected_version = state
             .fb()
             .ins()
@@ -737,14 +734,17 @@ fn emit_exact_type_tag_for_value<'fb, E>(
 ) -> ir::Value {
     let ptr_ty = state.ctx().consts.ptr_ty;
     let i64_ty = state.ctx().consts.i64_ty;
-    let py_long_type_ptr = state.ctx().consts.py_long_type_ptr as i64;
+    let py_long_type = state
+        .emit_type_ptr_value(&RelocTypeRef::CpythonTypeSymbol(
+            super::CpythonTypeSymbol::Long,
+        ))
+        .expect("PyLong_Type symbol should bind during JIT codegen");
     let object_type = state.fb().ins().load(
         ptr_ty,
         ir::MemFlags::trusted(),
         value,
         PYOBJECT_OB_TYPE_OFFSET,
     );
-    let py_long_type = state.fb().ins().iconst(ptr_ty, py_long_type_ptr);
     let is_long = state
         .fb()
         .ins()

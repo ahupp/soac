@@ -293,6 +293,7 @@ update-venv: ensure-cpython
     VIRTUAL_ENV="$VENV_DIR" PATH="$VENV_DIR/bin:$PATH" \
       uv sync --project "$REPO_ROOT/soac_py" --group dev --frozen --active
   )
+  touch "$VENV_DIR/.soac-ready"
 
 [private]
 update-venv-offline:
@@ -328,6 +329,55 @@ build-test-runtime: (update-venv-offline) ensure-cpython ensure-shared-python
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
   cd "$REPO_ROOT"
   just build-extension debug
+
+build-test-runtime-fast: ensure-cpython ensure-shared-python
+  #!/usr/bin/env bash
+  set -euo pipefail
+  export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  cd "$REPO_ROOT"
+
+  VENV_STAMP="$VENV_DIR/.soac-ready"
+  needs_venv_refresh=0
+  if [[ ! -x "$VENV_DIR/bin/python" || ! -f "$VENV_STAMP" \
+      || "$CPYTHON_BIN" -nt "$VENV_STAMP" \
+      || "$REPO_ROOT/soac_py/pyproject.toml" -nt "$VENV_STAMP" ]]; then
+    needs_venv_refresh=1
+  elif [[ -f "$REPO_ROOT/uv.lock" && "$REPO_ROOT/uv.lock" -nt "$VENV_STAMP" ]]; then
+    needs_venv_refresh=1
+  fi
+
+  if [[ "$needs_venv_refresh" -eq 1 ]]; then
+    just update-venv-offline
+  fi
+
+  SOURCE_EXT="$REPO_ROOT/target/debug/lib_soac_ext.so"
+  SITE_PACKAGES="$("$VENV_DIR/bin/python" -c 'import sysconfig; print(sysconfig.get_path("platlib"))')"
+  EXT_SUFFIX="$("$VENV_DIR/bin/python" -c 'import importlib.machinery; print(importlib.machinery.EXTENSION_SUFFIXES[0])')"
+  TARGET_EXT="$SITE_PACKAGES/_soac_ext$EXT_SUFFIX"
+
+  needs_build=0
+  if [[ ! -f "$SOURCE_EXT" ]]; then
+    needs_build=1
+  elif find "$REPO_ROOT" \
+      -path "$REPO_ROOT/.jj" -prune -o \
+      -path "$REPO_ROOT/.venv" -prune -o \
+      -path "$REPO_ROOT/target" -prune -o \
+      -path "$REPO_ROOT/vendor" -prune -o \
+      -path "$REPO_ROOT/bench" -prune -o \
+      -path "$REPO_ROOT/logs" -prune -o \
+      \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'build.rs' \) \
+      -newer "$SOURCE_EXT" -print -quit | grep -q .; then
+    needs_build=1
+  fi
+
+  if [[ "$needs_build" -eq 1 ]]; then
+    just build-extension debug
+    exit 0
+  fi
+
+  if [[ ! -L "$TARGET_EXT" || "$(realpath -m "$TARGET_EXT")" != "$(realpath -m "$SOURCE_EXT")" ]]; then
+    just install-extension debug
+  fi
 
 build-all: build-test-runtime
   #!/usr/bin/env bash
@@ -737,6 +787,10 @@ pytest *args='': build-test-runtime
   #!/usr/bin/env bash
   just _pytest-run "$@"
 
+pytest-fast *args='': build-test-runtime-fast
+  #!/usr/bin/env bash
+  just _pytest-run "$@"
+
 py *args='': build-test-runtime
   #!/usr/bin/env bash
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -745,6 +799,18 @@ py *args='': build-test-runtime
   # Authoritative ad-hoc transformed-runtime Python entrypoint.
   # Prefer this over invoking `.venv/bin/python` or `vendor/cpython/python`
   # directly when you need the built extension/import-hook path.
+  set -- {{args}}
+  "$VENV_DIR/bin/python" "$@"
+
+py-fast *args='': build-test-runtime-fast
+  #!/usr/bin/env bash
+  export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  cd "$REPO_ROOT"
+
+  # Fast transformed-runtime Python entrypoint for tight edit/repro loops.
+  # This reuses an existing venv and debug extension when the relevant
+  # dependency and Rust inputs are unchanged, and falls back to the full
+  # build path when they are stale or missing.
   set -- {{args}}
   "$VENV_DIR/bin/python" "$@"
 

@@ -63,6 +63,7 @@ pub struct SharedModuleState {
     pub lowered_module: BlockPyModule<CodegenModuleShape>,
     pub module_name: String,
     pub package_name: String,
+    pub source_hash: u64,
     pub codegen_constants: ModuleCodegenConstants,
     storage_instance_key: usize,
     function_index_by_id: HashMap<FunctionId, usize>,
@@ -96,6 +97,10 @@ impl SharedModuleState {
 
     pub fn module_id(&self) -> u32 {
         self.lowered_module.module_name_gen.module_id()
+    }
+
+    pub fn source_hash(&self) -> u64 {
+        self.source_hash
     }
 
     pub fn lookup_function(
@@ -605,6 +610,7 @@ pub fn build_shared_state_for_inspection(
         lowered_module,
         module_name: module_name.to_string(),
         package_name: package_name.to_string(),
+        source_hash: 0,
         codegen_constants,
         storage_instance_key: allocate_shared_module_state_storage_key(),
         function_index_by_id,
@@ -659,6 +665,7 @@ impl SoacExtModuleState {
         original_code_by_function_id: HashMap<FunctionId, Py<PyAny>>,
         module_name: String,
         package_name: String,
+        source_hash: u64,
     ) -> PyResult<()> {
         if self.initialized {
             return Err(PyRuntimeError::new_err(
@@ -682,6 +689,7 @@ impl SoacExtModuleState {
             lowered_module,
             module_name,
             package_name,
+            source_hash,
             codegen_constants,
             storage_instance_key: allocate_shared_module_state_storage_key(),
             function_index_by_id,
@@ -1277,6 +1285,7 @@ impl SoacExtModule {
     ) -> PyResult<Py<PyAny>> {
         ensure_module_dict_metadata_names(&mut lowered_module.global_names);
         module_info.indexed_module_keys = lowered_module.global_names.clone();
+        let source_hash = module_info.hash;
         let module_name = spec
             .getattr("name")?
             .extract::<String>()
@@ -1304,6 +1313,7 @@ impl SoacExtModule {
                 original_code_by_function_id,
                 module_name,
                 package_name,
+                source_hash,
             )?
         };
         Ok(module.unbind())
@@ -1358,6 +1368,7 @@ def f():
             function_index_by_id: build_function_index_by_id(&lowered)
                 .expect("function index should build"),
             codegen_constants: ModuleCodegenConstants::collect_from_module(&lowered),
+            source_hash: 0,
             storage_instance_key: allocate_shared_module_state_storage_key(),
             module_constant_objs: Vec::new(),
             counter_slots_by_id: vec![CounterRuntimeSlot::Scalar(0)].into_boxed_slice(),
@@ -1514,6 +1525,7 @@ def f():
             function_index_by_id: build_function_index_by_id(&lowered)
                 .expect("function index should build"),
             codegen_constants: ModuleCodegenConstants::collect_from_module(&lowered),
+            source_hash: 0,
             storage_instance_key: allocate_shared_module_state_storage_key(),
             module_constant_objs: Vec::new(),
             counter_slots_by_id: vec![CounterRuntimeSlot::Scalar(0), CounterRuntimeSlot::Scalar(1)]

@@ -33,10 +33,10 @@ use soac_blockpy::passes::{
     lower_typed_function_if_tests_to_truthy, try_lower_typed_instr_to_codegen_legacy,
 };
 use std::borrow::Cow;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::mem::offset_of;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -84,6 +84,8 @@ static RUNTIME_SUPPORT_LIBRARY: OnceLock<Result<RuntimeSupportLibrary, String>> 
 static NEXT_IMPORT_SPEC_ID: AtomicUsize = AtomicUsize::new(0);
 static NEXT_IMPORT_TRAMPOLINE_ID: AtomicUsize = AtomicUsize::new(0);
 static JIT_DATA_SYMBOLS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+static TYPE_KEY_RUNTIME_REGISTRY: OnceLock<Mutex<HashMap<CounterDumpTypeKey, usize>>> =
+    OnceLock::new();
 const JIT_ARENA_BYTES: usize = 256 * 1024 * 1024;
 const MISSING_PYTHON_EXCEPTION_TRAP: ir::TrapCode = ir::TrapCode::unwrap_user(1);
 const COLD_BLOCK_ENTRY_RATE_DENOMINATOR: u64 = 100;
@@ -105,6 +107,10 @@ fn jit_data_symbols() -> &'static Mutex<HashMap<String, usize>> {
     JIT_DATA_SYMBOLS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn type_key_runtime_registry() -> &'static Mutex<HashMap<CounterDumpTypeKey, usize>> {
+    TYPE_KEY_RUNTIME_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn register_jit_data_symbol(symbol: &str, ptr: *const u8) {
     let mut symbols = jit_data_symbols()
         .lock()
@@ -117,6 +123,53 @@ fn lookup_registered_jit_data_symbol(symbol: &str) -> Option<*const u8> {
         .lock()
         .expect("JIT data symbol registry lock poisoned");
     symbols.get(symbol).copied().map(|ptr| ptr as *const u8)
+}
+
+fn cpython_type_symbol_name(symbol: CpythonTypeSymbol) -> &'static str {
+    match symbol {
+        CpythonTypeSymbol::Function => "PyFunction_Type",
+        CpythonTypeSymbol::Method => "PyMethod_Type",
+        CpythonTypeSymbol::Type => "PyType_Type",
+        CpythonTypeSymbol::Long => "PyLong_Type",
+    }
+}
+
+fn push_symbol_component_hex(out: &mut String, component: &str) {
+    for byte in component.as_bytes() {
+        out.push(char::from_digit(u32::from(byte >> 4), 16).expect("upper hex digit should exist"));
+        out.push(
+            char::from_digit(u32::from(byte & 0x0f), 16).expect("lower hex digit should exist"),
+        );
+    }
+}
+
+fn reloc_type_ref_symbol_name(type_ref: &RelocTypeRef) -> Cow<'static, str> {
+    match type_ref {
+        RelocTypeRef::CpythonTypeSymbol(symbol) => Cow::Borrowed(cpython_type_symbol_name(*symbol)),
+        RelocTypeRef::TypeKey(type_key) => {
+            let mut symbol = String::from("__soac_typekey_");
+            push_symbol_component_hex(&mut symbol, type_key.module_name.as_str());
+            symbol.push('_');
+            push_symbol_component_hex(&mut symbol, type_key.qualname.as_str());
+            Cow::Owned(symbol)
+        }
+    }
+}
+
+fn reloc_callable_ref_symbol_name(callable_ref: &RelocCallableRef) -> String {
+    match callable_ref {
+        RelocCallableRef::OwnerAttr {
+            owner_type_ref,
+            attr_name,
+        } => {
+            let mut symbol = String::from("__soac_callable_owner_attr_");
+            let owner_symbol = reloc_type_ref_symbol_name(owner_type_ref);
+            push_symbol_component_hex(&mut symbol, owner_symbol.as_ref());
+            symbol.push('_');
+            push_symbol_component_hex(&mut symbol, attr_name.as_str());
+            symbol
+        }
+    }
 }
 
 fn module_constant_table_symbol(module: &BlockPyModule<CodegenModuleShape>) -> String {
@@ -163,6 +216,57 @@ fn top_value_counter_storage_symbol_for_instance(
         top_value_counter_storage_symbol(module),
         instance_key
     )
+}
+
+fn push_shared_module_symbol_identity(out: &mut String, module_name: &str, source_hash: u64) {
+    push_symbol_component_hex(out, module_name);
+    out.push('_');
+    out.push_str(format!("{source_hash:016x}").as_str());
+}
+
+fn module_constant_table_symbol_for_shared_state(shared_state: &SharedModuleState) -> String {
+    let mut symbol = String::from("__soac_module_constants_shared_");
+    push_shared_module_symbol_identity(
+        &mut symbol,
+        shared_state.module_name.as_str(),
+        shared_state.source_hash(),
+    );
+    symbol
+}
+
+fn scalar_counter_storage_symbol_for_shared_state(shared_state: &SharedModuleState) -> String {
+    let mut symbol = String::from("__soac_scalar_counters_shared_");
+    push_shared_module_symbol_identity(
+        &mut symbol,
+        shared_state.module_name.as_str(),
+        shared_state.source_hash(),
+    );
+    symbol
+}
+
+fn top_value_counter_storage_symbol_for_shared_state(shared_state: &SharedModuleState) -> String {
+    let mut symbol = String::from("__soac_top_value_counters_shared_");
+    push_shared_module_symbol_identity(
+        &mut symbol,
+        shared_state.module_name.as_str(),
+        shared_state.source_hash(),
+    );
+    symbol
+}
+
+fn direct_function_symbol_scope_for_shared_state(
+    shared_state: &SharedModuleState,
+    function_id: FunctionId,
+) -> String {
+    let mut scope = String::from("shared_");
+    push_shared_module_symbol_identity(
+        &mut scope,
+        shared_state.module_name.as_str(),
+        shared_state.source_hash(),
+    );
+    scope.push_str("_fn_");
+    scope.push_str(function_id.packed().to_string().as_str());
+    scope
 }
 
 fn module_constant_table_bytes(module_constant_ptrs: &[*mut ffi::PyObject]) -> Box<[u8]> {
@@ -292,6 +396,12 @@ fn declare_top_value_counter_storage_import(
         .map_err(|err| {
             format!("failed to declare imported top-value counter storage {symbol}: {err}")
         })
+}
+
+fn declare_type_ptr_import(jit_module: &mut JITModule, symbol: &str) -> Result<DataId, String> {
+    jit_module
+        .declare_data(symbol, Linkage::Import, true, false)
+        .map_err(|err| format!("failed to declare imported type symbol {symbol}: {err}"))
 }
 
 fn runtime_support_library() -> Result<&'static RuntimeSupportLibrary, String> {
@@ -847,29 +957,28 @@ impl ProcessJitState {
 
     fn ensure_module_constant_table(
         &mut self,
-        module: &BlockPyModule<CodegenModuleShape>,
         module_constant_ptrs: &[*mut ffi::PyObject],
-        instance_key: usize,
+        binding_key: usize,
+        symbol: &str,
     ) -> Result<DataId, String> {
-        if let Some(binding) = self.module_constant_tables.get(&instance_key).copied() {
+        if let Some(binding) = self.module_constant_tables.get(&binding_key).copied() {
             if binding.entry_count != module_constant_ptrs.len() {
                 return Err(format!(
                     "module constant table length mismatch for module instance {}: {} != {}",
-                    instance_key,
+                    binding_key,
                     binding.entry_count,
                     module_constant_ptrs.len()
                 ));
             }
             return Ok(binding.data_id);
         }
-        let symbol = module_constant_table_symbol_for_instance(module, instance_key);
         let data_id = define_module_constant_table_data_for_symbol(
             &mut self.jit_module,
-            symbol.as_str(),
+            symbol,
             module_constant_ptrs,
         )?;
         self.module_constant_tables.insert(
-            instance_key,
+            binding_key,
             ModuleConstantTableBinding {
                 data_id,
                 entry_count: module_constant_ptrs.len(),
@@ -949,6 +1058,7 @@ impl ProcessJitState {
     fn declare_direct_function(
         &mut self,
         function: &BlockPyFunction<CodegenModuleShape>,
+        symbol_scope: Option<&str>,
     ) -> Result<DeclaredJitFunction, String> {
         let shape = ProcessJitFunctionShape::for_function(function);
         if let Some(entry) = self.direct_functions.get(&function.function_id) {
@@ -956,11 +1066,17 @@ impl ProcessJitState {
                 return Ok(entry.declared());
             }
         }
-        let symbol_scope =
-            direct_function_symbol_scope(function.function_id, self.next_direct_symbol_id);
-        self.next_direct_symbol_id = self.next_direct_symbol_id.wrapping_add(1);
+        let owned_symbol_scope;
+        let symbol_scope = if let Some(symbol_scope) = symbol_scope {
+            symbol_scope
+        } else {
+            owned_symbol_scope =
+                direct_function_symbol_scope(function.function_id, self.next_direct_symbol_id);
+            self.next_direct_symbol_id = self.next_direct_symbol_id.wrapping_add(1);
+            owned_symbol_scope.as_str()
+        };
         let (_sig, declared) =
-            declare_direct_function(&mut self.jit_module, function, Some(symbol_scope.as_str()))?;
+            declare_direct_function(&mut self.jit_module, function, Some(symbol_scope))?;
         self.direct_functions.insert(
             function.function_id,
             ProcessJitFunctionEntry::Declared {
@@ -1887,10 +2003,6 @@ struct JitEmitConsts {
     deleted_const: ir::Value,
     empty_tuple_const: ir::Value,
     block_const: ir::Value,
-    py_function_type_ptr: *mut ffi::PyTypeObject,
-    py_method_type_ptr: *mut ffi::PyTypeObject,
-    py_type_type_ptr: *mut ffi::PyTypeObject,
-    py_long_type_ptr: *mut ffi::PyTypeObject,
 }
 
 #[derive(Clone)]
@@ -1961,6 +2073,8 @@ struct JitEmitCtx<'mc> {
     behavior_change_indexed_stores: bool,
     allow_local_only_slot_backed_stores: bool,
     exception_forwarded_local_names: Option<&'mc [String]>,
+    type_ptr_data_ids: RefCell<HashMap<RelocTypeRef, DataId>>,
+    callable_ptr_data_ids: RefCell<HashMap<RelocCallableRef, DataId>>,
 }
 
 impl JitEmitCtx<'_> {
@@ -1993,8 +2107,8 @@ fn infer_jit_value_facts(module: &BlockPyModule<CodegenModuleShape>) -> FactStor
 #[derive(Clone)]
 struct DirectMethodSpecialization {
     function_id: FunctionId,
-    descriptor_function: ObjPtr,
-    owner_type: *mut ffi::PyTypeObject,
+    descriptor_function_ref: RelocCallableRef,
+    owner_type_ref: RelocTypeRef,
     type_version: u32,
     arg_plan: DirectCallArgPlan,
 }
@@ -2002,8 +2116,8 @@ struct DirectMethodSpecialization {
 #[derive(Clone)]
 struct DirectConstructorSpecialization {
     function_id: FunctionId,
-    init_function: ObjPtr,
-    owner_type: *mut ffi::PyTypeObject,
+    init_function_ref: RelocCallableRef,
+    owner_type_ref: RelocTypeRef,
     type_version: u32,
     arg_plan: DirectCallArgPlan,
 }
@@ -2033,7 +2147,6 @@ enum DirectCallArgSource {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DirectCallIncompatibility {
-    MissingPredeclared,
     StarredArguments,
     Keywords,
     UnsupportedParameterKind { kind: ParamKind },
@@ -2044,14 +2157,13 @@ enum DirectCallIncompatibility {
 #[derive(Default)]
 struct DirectEdgeStats {
     clif_direct_edges: Cell<usize>,
+    function_env_indirect_edges: Cell<usize>,
     call_direct_missing_target_fallbacks: Cell<usize>,
     call_direct_unsupported_shape_fallbacks: Cell<usize>,
-    call_direct_missing_predeclared_fallbacks: Cell<usize>,
     guarded_generic_fallback_blocks: Cell<usize>,
     profiled_missing_target_candidates: Cell<usize>,
     profiled_arity_mismatch_candidates: Cell<usize>,
     profiled_unsupported_shape_candidates: Cell<usize>,
-    profiled_missing_predeclared_candidates: Cell<usize>,
 }
 
 impl DirectEdgeStats {
@@ -2063,16 +2175,16 @@ impl DirectEdgeStats {
         Self::increment(&self.clif_direct_edges);
     }
 
+    fn record_function_env_indirect_edge(&self) {
+        Self::increment(&self.function_env_indirect_edges);
+    }
+
     fn record_call_direct_missing_target_fallback(&self) {
         Self::increment(&self.call_direct_missing_target_fallbacks);
     }
 
     fn record_call_direct_unsupported_shape_fallback(&self) {
         Self::increment(&self.call_direct_unsupported_shape_fallbacks);
-    }
-
-    fn record_call_direct_missing_predeclared_fallback(&self) {
-        Self::increment(&self.call_direct_missing_predeclared_fallbacks);
     }
 
     fn record_guarded_generic_fallback_block(&self) {
@@ -2091,20 +2203,15 @@ impl DirectEdgeStats {
         Self::increment(&self.profiled_unsupported_shape_candidates);
     }
 
-    fn record_profiled_missing_predeclared_candidate(&self) {
-        Self::increment(&self.profiled_missing_predeclared_candidates);
-    }
-
     fn total(&self) -> usize {
         self.clif_direct_edges.get()
+            + self.function_env_indirect_edges.get()
             + self.call_direct_missing_target_fallbacks.get()
             + self.call_direct_unsupported_shape_fallbacks.get()
-            + self.call_direct_missing_predeclared_fallbacks.get()
             + self.guarded_generic_fallback_blocks.get()
             + self.profiled_missing_target_candidates.get()
             + self.profiled_arity_mismatch_candidates.get()
             + self.profiled_unsupported_shape_candidates.get()
-            + self.profiled_missing_predeclared_candidates.get()
     }
 
     fn emit_trace(&self, module_name: &str, function: &BlockPyFunction<CodegenModuleShape>) {
@@ -2112,27 +2219,22 @@ impl DirectEdgeStats {
             return;
         }
         let clif_direct_edges = self.clif_direct_edges.get();
-        let function_env_indirect_edges = 0usize;
+        let function_env_indirect_edges = self.function_env_indirect_edges.get();
         let call_direct_missing_target_fallbacks = self.call_direct_missing_target_fallbacks.get();
         let call_direct_unsupported_shape_fallbacks =
             self.call_direct_unsupported_shape_fallbacks.get();
-        let call_direct_missing_predeclared_fallbacks =
-            self.call_direct_missing_predeclared_fallbacks.get();
         let guarded_generic_fallback_blocks = self.guarded_generic_fallback_blocks.get();
         let profiled_missing_target_candidates = self.profiled_missing_target_candidates.get();
         let profiled_arity_mismatch_candidates = self.profiled_arity_mismatch_candidates.get();
         let profiled_unsupported_shape_candidates =
             self.profiled_unsupported_shape_candidates.get();
-        let profiled_missing_predeclared_candidates =
-            self.profiled_missing_predeclared_candidates.get();
-        let generic_fallback_edges = call_direct_missing_target_fallbacks
+        let generic_fallback_edges = function_env_indirect_edges
+            + call_direct_missing_target_fallbacks
             + call_direct_unsupported_shape_fallbacks
-            + call_direct_missing_predeclared_fallbacks
             + guarded_generic_fallback_blocks
             + profiled_missing_target_candidates
             + profiled_arity_mismatch_candidates
-            + profiled_unsupported_shape_candidates
-            + profiled_missing_predeclared_candidates;
+            + profiled_unsupported_shape_candidates;
         info!(
             target: "soac_jit_direct_edges",
             module = module_name,
@@ -2143,12 +2245,10 @@ impl DirectEdgeStats {
             generic_fallback_edges,
             call_direct_missing_target_fallbacks,
             call_direct_unsupported_shape_fallbacks,
-            call_direct_missing_predeclared_fallbacks,
             guarded_generic_fallback_blocks,
             profiled_missing_target_candidates,
             profiled_arity_mismatch_candidates,
             profiled_unsupported_shape_candidates,
-            profiled_missing_predeclared_candidates,
             "soac_jit_direct_edges"
         );
     }
@@ -2248,23 +2348,19 @@ fn plan_direct_call_args_for_target(
 
 fn validate_direct_call_compatibility(
     target_function: &BlockPyFunction<CodegenModuleShape>,
-    direct_call_functions: &HashMap<FunctionId, DeclaredJitFunction>,
+    _direct_call_functions: &HashMap<FunctionId, DeclaredJitFunction>,
     explicit_positional_arg_count: usize,
     implicit_positional_arg_count: usize,
     has_starred_arguments: bool,
     has_keywords: bool,
 ) -> Result<DirectCallArgPlan, DirectCallIncompatibility> {
-    let arg_plan = plan_direct_call_args_for_target(
+    plan_direct_call_args_for_target(
         target_function,
         explicit_positional_arg_count,
         implicit_positional_arg_count,
         has_starred_arguments,
         has_keywords,
-    )?;
-    if !direct_call_functions.contains_key(&target_function.function_id) {
-        return Err(DirectCallIncompatibility::MissingPredeclared);
-    }
-    Ok(arg_plan)
+    )
 }
 
 fn record_profiled_direct_call_incompatibility(
@@ -2272,9 +2368,6 @@ fn record_profiled_direct_call_incompatibility(
     incompatibility: DirectCallIncompatibility,
 ) {
     match incompatibility {
-        DirectCallIncompatibility::MissingPredeclared => {
-            stats.record_profiled_missing_predeclared_candidate();
-        }
         DirectCallIncompatibility::MissingRequiredArgument
         | DirectCallIncompatibility::TooManyPositionalArguments { .. } => {
             stats.record_profiled_arity_mismatch_candidate();
@@ -2287,11 +2380,33 @@ fn record_profiled_direct_call_incompatibility(
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct FieldIndexSpecialization {
     expected_index: u32,
-    owner_type: *mut ffi::PyTypeObject,
+    owner_type_ref: RelocTypeRef,
     type_version: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum CpythonTypeSymbol {
+    Function,
+    Method,
+    Type,
+    Long,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum RelocTypeRef {
+    CpythonTypeSymbol(CpythonTypeSymbol),
+    TypeKey(CounterDumpTypeKey),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum RelocCallableRef {
+    OwnerAttr {
+        owner_type_ref: RelocTypeRef,
+        attr_name: String,
+    },
 }
 
 struct LocalEnvCodegenIntrinsicEmitState<'a, 'b, 'mc, 'c, 'd> {
@@ -3323,6 +3438,13 @@ impl<'a, 'b, 'mc, 'c, 'd> intrinsics::OperationEmitState<'b, InstrCodegen>
         )
     }
 
+    fn emit_type_ptr_value(&mut self, owner_type_ref: &RelocTypeRef) -> Option<ir::Value> {
+        emit_type_ptr_value_for_ref(self.fb, self.jit_module, self.ctx, owner_type_ref)
+            .unwrap_or_else(|err| {
+                panic!("failed to bind type symbol during JIT codegen: {err}");
+            })
+    }
+
     fn py_facts_for_arg(&self, arg: &InstrCodegen) -> PyObjFacts {
         self.ctx
             .value_facts_for_expr(arg)
@@ -3857,6 +3979,7 @@ fn build_counted_runtime_refcount_helper(
     jit_module: &mut JITModule,
     symbol_name: &str,
     cache_name: &str,
+    cache_policy: CraneliftCompileCachePolicy,
     runtime_import: &'static ImportSpec,
     scalar_counter_data_id: DataId,
     counter_slot: usize,
@@ -3907,13 +4030,23 @@ fn build_counted_runtime_refcount_helper(
         helper_id,
         &mut ctx,
         cache_name,
-        CraneliftCompileCachePolicy::Disabled {
-            reason: "counted refcount helper depends on module-specific scalar counter storage",
-        },
+        cache_policy,
         "failed to define counted runtime refcount helper",
     )?;
     jit_module.clear_context(&mut ctx);
     Ok(helper_id)
+}
+
+fn counted_runtime_refcount_helper_cache_policy(
+    symbol_scope: Option<&str>,
+) -> CraneliftCompileCachePolicy {
+    if symbol_scope.is_some() {
+        CraneliftCompileCachePolicy::Enabled
+    } else {
+        CraneliftCompileCachePolicy::Disabled {
+            reason: "counted refcount helper lacks stable shared-state counter symbols",
+        }
+    }
 }
 
 fn build_counted_runtime_refcount_helpers(
@@ -3935,13 +4068,16 @@ fn build_counted_runtime_refcount_helpers(
                         counter_id.0
                     )
                 })?;
-                let cache_name = format!("py:rc:incref:{}", function.names.qualname);
-                let symbol = scoped_jit_symbol(&cache_name, symbol_scope);
+                let cache_name = scoped_jit_symbol(
+                    format!("py:rc:incref:{}", function.names.qualname).as_str(),
+                    symbol_scope,
+                );
                 build_counted_runtime_refcount_helper(
                     compile_session,
                     jit_module,
-                    &symbol,
                     &cache_name,
+                    &cache_name,
+                    counted_runtime_refcount_helper_cache_policy(symbol_scope),
                     &DP_JIT_INCREF_IMPORT,
                     scalar_counter_data_id,
                     counter_slot,
@@ -3959,13 +4095,16 @@ fn build_counted_runtime_refcount_helpers(
                         counter_id.0
                     )
                 })?;
-                let cache_name = format!("py:rc:decref:{}", function.names.qualname);
-                let symbol = scoped_jit_symbol(&cache_name, symbol_scope);
+                let cache_name = scoped_jit_symbol(
+                    format!("py:rc:decref:{}", function.names.qualname).as_str(),
+                    symbol_scope,
+                );
                 build_counted_runtime_refcount_helper(
                     compile_session,
                     jit_module,
-                    &symbol,
                     &cache_name,
+                    &cache_name,
+                    counted_runtime_refcount_helper_cache_policy(symbol_scope),
                     &DP_JIT_DECREF_IMPORT,
                     scalar_counter_data_id,
                     counter_slot,
@@ -5026,7 +5165,7 @@ fn emit_branch_index_i64(
                 jit_module,
                 func_imports,
             );
-            let callee_id = emit_callee_function_id_checked(fb, callable, ctx);
+            let callee_id = emit_callee_function_id_checked(fb, callable, ctx, jit_module);
             if !callable_is_borrowed {
                 fb.ins()
                     .call(ctx.decref_ref, &[ctx.consts.thread_state_value, callable]);
@@ -5146,17 +5285,21 @@ fn direct_method_specializations_for_call_site(
         else {
             continue;
         };
-        out.extend(
-            owner_types
-                .into_iter()
-                .map(|owner| DirectMethodSpecialization {
-                    function_id,
-                    descriptor_function: owner.function_obj as ObjPtr,
-                    owner_type: owner.owner_type,
-                    type_version: owner.type_version,
-                    arg_plan: arg_plan.clone(),
-                }),
-        );
+        for owner in owner_types {
+            let Ok(Some(owner_type_ref)) = reloc_type_ref_for_type(owner.owner_type) else {
+                continue;
+            };
+            out.push(DirectMethodSpecialization {
+                function_id,
+                descriptor_function_ref: RelocCallableRef::OwnerAttr {
+                    owner_type_ref: owner_type_ref.clone(),
+                    attr_name: method_name.to_string(),
+                },
+                owner_type_ref,
+                type_version: owner.type_version,
+                arg_plan: arg_plan.clone(),
+            });
+        }
     }
     out
 }
@@ -5203,17 +5346,21 @@ fn direct_constructor_specializations_for_call_site(
         else {
             continue;
         };
-        out.extend(
-            owner_types
-                .into_iter()
-                .map(|owner| DirectConstructorSpecialization {
-                    function_id,
-                    init_function: owner.init_function_obj as ObjPtr,
-                    owner_type: owner.owner_type,
-                    type_version: owner.type_version,
-                    arg_plan: arg_plan.clone(),
-                }),
-        );
+        for owner in owner_types {
+            let Ok(Some(owner_type_ref)) = reloc_type_ref_for_type(owner.owner_type) else {
+                continue;
+            };
+            out.push(DirectConstructorSpecialization {
+                function_id,
+                init_function_ref: RelocCallableRef::OwnerAttr {
+                    owner_type_ref: owner_type_ref.clone(),
+                    attr_name: "__init__".to_string(),
+                },
+                owner_type_ref,
+                type_version: owner.type_version,
+                arg_plan: arg_plan.clone(),
+            });
+        }
     }
     out
 }
@@ -5413,6 +5560,257 @@ fn resolve_type_key_to_type(
     Ok(Some(owner_type))
 }
 
+fn cpython_type_symbol_for_type(owner_type: *mut ffi::PyTypeObject) -> Option<CpythonTypeSymbol> {
+    match owner_type {
+        ptr if ptr == std::ptr::addr_of_mut!(PyFunction_Type) => Some(CpythonTypeSymbol::Function),
+        ptr if ptr == std::ptr::addr_of_mut!(PyMethod_Type) => Some(CpythonTypeSymbol::Method),
+        ptr if ptr == std::ptr::addr_of_mut!(PyType_Type) => Some(CpythonTypeSymbol::Type),
+        ptr if ptr == std::ptr::addr_of_mut!(PyLong_Type) => Some(CpythonTypeSymbol::Long),
+        _ => None,
+    }
+}
+
+fn resolve_cpython_type_symbol(symbol: CpythonTypeSymbol) -> *mut ffi::PyTypeObject {
+    match symbol {
+        CpythonTypeSymbol::Function => std::ptr::addr_of_mut!(PyFunction_Type),
+        CpythonTypeSymbol::Method => std::ptr::addr_of_mut!(PyMethod_Type),
+        CpythonTypeSymbol::Type => std::ptr::addr_of_mut!(PyType_Type),
+        CpythonTypeSymbol::Long => std::ptr::addr_of_mut!(PyLong_Type),
+    }
+}
+
+fn py_string_attr_owned(
+    obj: *mut ffi::PyObject,
+    attr_name: &CStr,
+) -> Result<Option<String>, String> {
+    let attr = unsafe { ffi::PyObject_GetAttrString(obj, attr_name.as_ptr()) };
+    if attr.is_null() {
+        unsafe { ffi::PyErr_Clear() };
+        return Ok(None);
+    }
+    if unsafe { ffi::PyUnicode_Check(attr) } == 0 {
+        unsafe { ffi::Py_DECREF(attr) };
+        return Ok(None);
+    }
+    let mut size = 0isize;
+    let data = unsafe { ffi::PyUnicode_AsUTF8AndSize(attr, &mut size) };
+    if data.is_null() {
+        unsafe { ffi::Py_DECREF(attr) };
+        return Err(format!(
+            "failed to read Python string attribute {} as UTF-8",
+            attr_name.to_string_lossy()
+        ));
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), size as usize) };
+    let value = match std::str::from_utf8(bytes) {
+        Ok(value) => value.to_owned(),
+        Err(err) => {
+            unsafe { ffi::Py_DECREF(attr) };
+            return Err(format!(
+                "Python string attribute {} was not valid UTF-8: {err}",
+                attr_name.to_string_lossy()
+            ));
+        }
+    };
+    unsafe { ffi::Py_DECREF(attr) };
+    Ok(Some(value))
+}
+
+fn type_key_for_type(
+    owner_type: *mut ffi::PyTypeObject,
+) -> Result<Option<CounterDumpTypeKey>, String> {
+    if owner_type.is_null() {
+        return Ok(None);
+    }
+    let owner_obj = owner_type.cast::<ffi::PyObject>();
+    let Some(module_name) = py_string_attr_owned(owner_obj, c"__module__")? else {
+        return Ok(None);
+    };
+    let Some(qualname) = py_string_attr_owned(owner_obj, c"__qualname__")? else {
+        return Ok(None);
+    };
+    if module_name.is_empty()
+        || qualname.is_empty()
+        || qualname.split('.').any(|part| part == "<locals>")
+    {
+        return Ok(None);
+    }
+    Ok(Some(CounterDumpTypeKey {
+        module_name,
+        qualname,
+    }))
+}
+
+fn register_runtime_type_for_key(
+    type_key: &CounterDumpTypeKey,
+    owner_type: *mut ffi::PyTypeObject,
+) {
+    let mut registry = type_key_runtime_registry()
+        .lock()
+        .expect("type key runtime registry lock poisoned");
+    registry.insert(type_key.clone(), owner_type as usize);
+}
+
+fn lookup_runtime_type_for_key(type_key: &CounterDumpTypeKey) -> Option<*mut ffi::PyTypeObject> {
+    let registry = type_key_runtime_registry()
+        .lock()
+        .expect("type key runtime registry lock poisoned");
+    registry
+        .get(type_key)
+        .copied()
+        .map(|ptr| ptr as *mut ffi::PyTypeObject)
+}
+
+fn reloc_type_ref_for_type(
+    owner_type: *mut ffi::PyTypeObject,
+) -> Result<Option<RelocTypeRef>, String> {
+    if let Some(symbol) = cpython_type_symbol_for_type(owner_type) {
+        return Ok(Some(RelocTypeRef::CpythonTypeSymbol(symbol)));
+    }
+    let Some(type_key) = type_key_for_type(owner_type)? else {
+        return Ok(None);
+    };
+    register_runtime_type_for_key(&type_key, owner_type);
+    Ok(Some(RelocTypeRef::TypeKey(type_key)))
+}
+
+fn resolve_reloc_type_ref_to_type(
+    owner_type_ref: &RelocTypeRef,
+) -> Result<Option<*mut ffi::PyTypeObject>, String> {
+    match owner_type_ref {
+        RelocTypeRef::CpythonTypeSymbol(symbol) => Ok(Some(resolve_cpython_type_symbol(*symbol))),
+        RelocTypeRef::TypeKey(type_key) => {
+            if let Some(owner_type) = lookup_runtime_type_for_key(type_key) {
+                return Ok(Some(owner_type));
+            }
+            resolve_type_key_to_type(type_key)
+        }
+    }
+}
+
+fn ensure_reloc_type_symbol_registered(owner_type_ref: &RelocTypeRef) -> Result<bool, String> {
+    match owner_type_ref {
+        RelocTypeRef::CpythonTypeSymbol(_) => Ok(true),
+        RelocTypeRef::TypeKey(_) => {
+            let Some(owner_type) = resolve_reloc_type_ref_to_type(owner_type_ref)? else {
+                return Ok(false);
+            };
+            let symbol = reloc_type_ref_symbol_name(owner_type_ref);
+            register_jit_data_symbol(symbol.as_ref(), owner_type.cast::<u8>());
+            Ok(true)
+        }
+    }
+}
+
+fn type_ptr_data_id_for_ref(
+    jit_module: &mut JITModule,
+    ctx: &JitEmitCtx<'_>,
+    owner_type_ref: &RelocTypeRef,
+) -> Result<Option<DataId>, String> {
+    if let Some(data_id) = ctx.type_ptr_data_ids.borrow().get(owner_type_ref).copied() {
+        return Ok(Some(data_id));
+    }
+    if !ensure_reloc_type_symbol_registered(owner_type_ref)? {
+        return Ok(None);
+    }
+    let symbol = reloc_type_ref_symbol_name(owner_type_ref);
+    let data_id = declare_type_ptr_import(jit_module, symbol.as_ref())?;
+    ctx.type_ptr_data_ids
+        .borrow_mut()
+        .insert(owner_type_ref.clone(), data_id);
+    Ok(Some(data_id))
+}
+
+fn emit_type_ptr_value_for_ref(
+    fb: &mut FunctionBuilder<'_>,
+    jit_module: &mut JITModule,
+    ctx: &JitEmitCtx<'_>,
+    owner_type_ref: &RelocTypeRef,
+) -> Result<Option<ir::Value>, String> {
+    let Some(data_id) = type_ptr_data_id_for_ref(jit_module, ctx, owner_type_ref)? else {
+        return Ok(None);
+    };
+    let type_data = jit_module.declare_data_in_func(data_id, &mut fb.func);
+    Ok(Some(fb.ins().global_value(ctx.consts.ptr_ty, type_data)))
+}
+
+fn resolve_reloc_callable_ref_to_object(
+    callable_ref: &RelocCallableRef,
+) -> Result<Option<ObjPtr>, String> {
+    match callable_ref {
+        RelocCallableRef::OwnerAttr {
+            owner_type_ref,
+            attr_name,
+        } => {
+            let Some(owner_type) = resolve_reloc_type_ref_to_type(owner_type_ref)? else {
+                return Ok(None);
+            };
+            let attr_name = CString::new(attr_name.as_str()).map_err(|_| {
+                format!("callable attr contains NUL and cannot be resolved: {attr_name:?}")
+            })?;
+            let dict = unsafe { (*owner_type).tp_dict };
+            if dict.is_null() {
+                return Ok(None);
+            }
+            let value = unsafe { ffi::PyDict_GetItemString(dict, attr_name.as_ptr()) };
+            if value.is_null() || unsafe { ffi::PyFunction_Check(value) } == 0 {
+                return Ok(None);
+            }
+            Ok(Some(value as ObjPtr))
+        }
+    }
+}
+
+fn ensure_reloc_callable_symbol_registered(
+    callable_ref: &RelocCallableRef,
+) -> Result<bool, String> {
+    let Some(callable) = resolve_reloc_callable_ref_to_object(callable_ref)? else {
+        return Ok(false);
+    };
+    let symbol = reloc_callable_ref_symbol_name(callable_ref);
+    register_jit_data_symbol(symbol.as_str(), callable.cast::<u8>());
+    Ok(true)
+}
+
+fn callable_ptr_data_id_for_ref(
+    jit_module: &mut JITModule,
+    ctx: &JitEmitCtx<'_>,
+    callable_ref: &RelocCallableRef,
+) -> Result<Option<DataId>, String> {
+    if let Some(data_id) = ctx
+        .callable_ptr_data_ids
+        .borrow()
+        .get(callable_ref)
+        .copied()
+    {
+        return Ok(Some(data_id));
+    }
+    if !ensure_reloc_callable_symbol_registered(callable_ref)? {
+        return Ok(None);
+    }
+    let symbol = reloc_callable_ref_symbol_name(callable_ref);
+    let data_id = declare_type_ptr_import(jit_module, symbol.as_str())?;
+    ctx.callable_ptr_data_ids
+        .borrow_mut()
+        .insert(callable_ref.clone(), data_id);
+    Ok(Some(data_id))
+}
+
+fn emit_callable_ptr_value_for_ref(
+    fb: &mut FunctionBuilder<'_>,
+    jit_module: &mut JITModule,
+    ctx: &JitEmitCtx<'_>,
+    callable_ref: &RelocCallableRef,
+) -> Result<Option<ir::Value>, String> {
+    let Some(data_id) = callable_ptr_data_id_for_ref(jit_module, ctx, callable_ref)? else {
+        return Ok(None);
+    };
+    let callable_data = jit_module.declare_data_in_func(data_id, &mut fb.func);
+    Ok(Some(
+        fb.ins().global_value(ctx.consts.ptr_ty, callable_data),
+    ))
+}
+
 fn owner_type_has_class_binding_for_attr(
     owner_type: *mut ffi::PyTypeObject,
     attr_name: &str,
@@ -5564,10 +5962,13 @@ fn field_index_specialization_for_type(
     if type_version == 0 {
         return Ok(None);
     }
+    let Some(owner_type_ref) = reloc_type_ref_for_type(owner_type)? else {
+        return Ok(None);
+    };
 
     Ok(Some(FieldIndexSpecialization {
         expected_index,
-        owner_type,
+        owner_type_ref,
         type_version,
     }))
 }
@@ -5686,6 +6087,7 @@ fn emit_callee_function_id_checked(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
     ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
 ) -> ir::Value {
     #[repr(C)]
     struct PyMethodObjectPrefix {
@@ -5779,9 +6181,14 @@ fn emit_callee_function_id_checked(
         callable,
         PYOBJECT_OB_TYPE_OFFSET,
     );
-    let py_function_type = fb
-        .ins()
-        .iconst(ptr_ty, ctx.consts.py_function_type_ptr as i64);
+    let py_function_type = emit_type_ptr_value_for_ref(
+        fb,
+        jit_module,
+        ctx,
+        &RelocTypeRef::CpythonTypeSymbol(CpythonTypeSymbol::Function),
+    )
+    .unwrap_or_else(|err| panic!("failed to bind PyFunction_Type symbol: {err}"))
+    .expect("PyFunction_Type symbol should be available");
     let is_function = fb
         .ins()
         .icmp(ir::condcodes::IntCC::Equal, callable_type, py_function_type);
@@ -5793,9 +6200,14 @@ fn emit_callee_function_id_checked(
         .jump(function_value_block, &[ir::BlockArg::Value(callable)]);
 
     fb.switch_to_block(maybe_method_block);
-    let py_method_type = fb
-        .ins()
-        .iconst(ptr_ty, ctx.consts.py_method_type_ptr as i64);
+    let py_method_type = emit_type_ptr_value_for_ref(
+        fb,
+        jit_module,
+        ctx,
+        &RelocTypeRef::CpythonTypeSymbol(CpythonTypeSymbol::Method),
+    )
+    .unwrap_or_else(|err| panic!("failed to bind PyMethod_Type symbol: {err}"))
+    .expect("PyMethod_Type symbol should be available");
     let is_method = fb
         .ins()
         .icmp(ir::condcodes::IntCC::Equal, callable_type, py_method_type);
@@ -5815,7 +6227,14 @@ fn emit_callee_function_id_checked(
     );
 
     fb.switch_to_block(maybe_type_block);
-    let py_type_type = fb.ins().iconst(ptr_ty, ctx.consts.py_type_type_ptr as i64);
+    let py_type_type = emit_type_ptr_value_for_ref(
+        fb,
+        jit_module,
+        ctx,
+        &RelocTypeRef::CpythonTypeSymbol(CpythonTypeSymbol::Type),
+    )
+    .unwrap_or_else(|err| panic!("failed to bind PyType_Type symbol: {err}"))
+    .expect("PyType_Type symbol should be available");
     let is_type_object = fb
         .ins()
         .icmp(ir::condcodes::IntCC::Equal, callable_type, py_type_type);
@@ -5954,11 +6373,6 @@ fn emit_direct_call_resolved_raw_with_arg_values(
     debug_assert_eq!(arg_values.len(), target_function.params.len());
     let ptr_ty = ctx.consts.ptr_ty;
     let null_ptr = fb.ins().iconst(ptr_ty, 0);
-    let direct_func_id = ctx
-        .direct_call_functions
-        .get(&target_function.function_id)
-        .map(|function| function.func_id)
-        .expect("direct call emission requires a predeclared process-JIT function symbol");
     ctx.direct_edge_stats.record_resolved_direct_edge();
 
     let function_env = emit_direct_function_env_load_or_slow_path(fb, callable, ctx);
@@ -5996,8 +6410,25 @@ fn emit_direct_call_resolved_raw_with_arg_values(
     call_args.push(function_env);
     call_args.push(ctx.consts.thread_state_value);
     call_args.extend(arg_values.iter().copied());
-    let func_ref = jit_module.declare_func_in_func(direct_func_id, &mut fb.func);
-    let call_inst = fb.ins().call(func_ref, &call_args);
+    let call_inst = if let Some(direct_func_id) = ctx
+        .direct_call_functions
+        .get(&target_function.function_id)
+        .map(|function| function.func_id)
+    {
+        let func_ref = jit_module.declare_func_in_func(direct_func_id, &mut fb.func);
+        fb.ins().call(func_ref, &call_args)
+    } else {
+        ctx.direct_edge_stats.record_function_env_indirect_edge();
+        let callee_ptr = load_function_env_obj(
+            fb,
+            ptr_ty,
+            function_env,
+            FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET,
+        );
+        let direct_sig =
+            fb.import_signature(make_direct_function_signature(jit_module, target_function));
+        fb.ins().call_indirect(direct_sig, callee_ptr, &call_args)
+    };
     let call_value = fb.inst_results(call_inst)[0];
     fb.ins()
         .call(ctx.leave_recursive_ref, &[ctx.consts.thread_state_value]);
@@ -6131,7 +6562,10 @@ fn emit_direct_constructor_resolved_with_arg_values(
         provided_arg_borrowed,
         ptr_ty,
     );
-    let init_callable = fb.ins().iconst(ptr_ty, specialization.init_function as i64);
+    let init_callable =
+        emit_callable_ptr_value_for_ref(fb, jit_module, ctx, &specialization.init_function_ref)
+            .unwrap_or_else(|err| panic!("failed to bind constructor callable symbol: {err}"))
+            .expect("constructor callable symbol should be available");
     let init_result = emit_direct_call_resolved_raw_with_arg_values(
         fb,
         init_callable,
@@ -6363,9 +6797,14 @@ fn emit_direct_method_resolved_with_args_from_local_env(
         provided_arg_borrowed,
         ptr_ty,
     );
-    let callable = fb
-        .ins()
-        .iconst(ptr_ty, specialization.descriptor_function as i64);
+    let callable = emit_callable_ptr_value_for_ref(
+        fb,
+        jit_module,
+        ctx,
+        &specialization.descriptor_function_ref,
+    )
+    .unwrap_or_else(|err| panic!("failed to bind direct method callable symbol: {err}"))
+    .expect("direct method callable symbol should be available");
     emit_direct_call_resolved_with_arg_values(
         fb,
         callable,
@@ -6421,20 +6860,6 @@ fn emit_call_direct_expr_with_local_env(
         !call.keywords.is_empty(),
     ) {
         Ok(arg_plan) => arg_plan,
-        Err(DirectCallIncompatibility::MissingPredeclared) => {
-            ctx.direct_edge_stats
-                .record_call_direct_missing_predeclared_fallback();
-            let fallback = fallback_call();
-            return emit_codegen_expr_with_local_env(
-                fb,
-                &fallback,
-                local_env,
-                ctx,
-                false,
-                jit_module,
-                func_imports,
-            );
-        }
         Err(_) => {
             ctx.direct_edge_stats
                 .record_call_direct_unsupported_shape_fallback();
@@ -7526,13 +7951,23 @@ fn emit_codegen_simple_call_with_local_env(
             fb.append_block_param(result_block, ptr_ty);
             let generic_block = fb.create_block();
             for (index, specialization) in direct_method_specializations.iter().enumerate() {
+                let Some(expected_type) = emit_type_ptr_value_for_ref(
+                    fb,
+                    jit_module,
+                    emit_ctx,
+                    &specialization.owner_type_ref,
+                )
+                .unwrap_or_else(|err| {
+                    panic!("failed to bind direct method type symbol: {err}");
+                }) else {
+                    continue;
+                };
                 let direct_block = fb.create_block();
                 let miss_block = if index + 1 == direct_method_specializations.len() {
                     generic_block
                 } else {
                     fb.create_block()
                 };
-                let expected_type = fb.ins().iconst(ptr_ty, specialization.owner_type as i64);
                 let expected_version = fb
                     .ins()
                     .iconst(emit_ctx.consts.i64_ty, specialization.type_version as i64);
@@ -7627,7 +8062,7 @@ fn emit_codegen_simple_call_with_local_env(
             fb.switch_to_block(callable_ok_block);
             let callable = fb.block_params(callable_ok_block)[0];
             if let Some(counter_id) = call_target_counter {
-                let callee_id = emit_callee_function_id_checked(fb, callable, emit_ctx);
+                let callee_id = emit_callee_function_id_checked(fb, callable, emit_ctx, jit_module);
                 emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
             }
             if let Some(counter_id) = direct_fallback_counter_id {
@@ -7666,8 +8101,8 @@ fn emit_codegen_simple_call_with_local_env(
         let should_emit_callee_id = call_target_counter.is_some()
             || !constructor_specializations.is_empty()
             || !direct_specializations.is_empty();
-        let callee_id =
-            should_emit_callee_id.then(|| emit_callee_function_id_checked(fb, callable, emit_ctx));
+        let callee_id = should_emit_callee_id
+            .then(|| emit_callee_function_id_checked(fb, callable, emit_ctx, jit_module));
         if let Some(counter_id) = call_target_counter {
             let callee_id = callee_id.expect("callee id should exist for call target counter");
             emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
@@ -7680,6 +8115,17 @@ fn emit_codegen_simple_call_with_local_env(
             if !constructor_specializations.is_empty() {
                 let mut next_miss_block = fb.create_block();
                 for (index, specialization) in constructor_specializations.iter().enumerate() {
+                    let Some(expected_type) = emit_type_ptr_value_for_ref(
+                        fb,
+                        jit_module,
+                        emit_ctx,
+                        &specialization.owner_type_ref,
+                    )
+                    .unwrap_or_else(|err| {
+                        panic!("failed to bind constructor type symbol: {err}");
+                    }) else {
+                        continue;
+                    };
                     let type_match_block = fb.create_block();
                     let direct_block = fb.create_block();
                     let miss_block = if index + 1 == constructor_specializations.len() {
@@ -7691,7 +8137,6 @@ fn emit_codegen_simple_call_with_local_env(
                     } else {
                         fb.create_block()
                     };
-                    let expected_type = fb.ins().iconst(ptr_ty, specialization.owner_type as i64);
                     let is_exact_type =
                         fb.ins()
                             .icmp(ir::condcodes::IntCC::Equal, callable, expected_type);
@@ -7904,7 +8349,7 @@ fn emit_codegen_expr_with_local_env(
             jit_module,
             func_imports,
         );
-        let callee_id = emit_callee_function_id_checked(fb, callable, emit_ctx);
+        let callee_id = emit_callee_function_id_checked(fb, callable, emit_ctx, jit_module);
         if !callable_is_borrowed {
             fb.ins().call(
                 emit_ctx.decref_ref,
@@ -8852,6 +9297,22 @@ fn new_jit_builder() -> Result<JITBuilder, String> {
     }
     builder.symbol("_Py_Dealloc", py_dealloc_symbol());
     builder.symbol(
+        cpython_type_symbol_name(CpythonTypeSymbol::Function),
+        std::ptr::addr_of_mut!(PyFunction_Type).cast::<u8>(),
+    );
+    builder.symbol(
+        cpython_type_symbol_name(CpythonTypeSymbol::Method),
+        std::ptr::addr_of_mut!(PyMethod_Type).cast::<u8>(),
+    );
+    builder.symbol(
+        cpython_type_symbol_name(CpythonTypeSymbol::Type),
+        std::ptr::addr_of_mut!(PyType_Type).cast::<u8>(),
+    );
+    builder.symbol(
+        cpython_type_symbol_name(CpythonTypeSymbol::Long),
+        std::ptr::addr_of_mut!(PyLong_Type).cast::<u8>(),
+    );
+    builder.symbol(
         "_PyDict_IndexedValueTombstone",
         std::ptr::addr_of_mut!(_PyDict_IndexedValueTombstone).cast::<u8>(),
     );
@@ -8896,6 +9357,7 @@ fn collect_process_jit_batch_functions<'a>(
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     let mut queue = VecDeque::new();
+    let root_module_id = root.function_id.module_id();
     seen.insert(root.function_id);
     queue.push_back(ProcessJitBatchFunction {
         function: root.clone(),
@@ -8922,6 +9384,9 @@ fn collect_process_jit_batch_functions<'a>(
             if let Some(function) =
                 resolve_process_jit_batch_function(session, direct_call_resolver, function_id)?
             {
+                if function.function.function_id.module_id() != root_module_id {
+                    continue;
+                }
                 queue.push_back(function);
             }
         }
@@ -8939,6 +9404,9 @@ fn collect_process_jit_batch_functions<'a>(
             if let Some(function) =
                 resolve_process_jit_batch_function(session, direct_call_resolver, function_id)?
             {
+                if function.function.function_id.module_id() != root_module_id {
+                    continue;
+                }
                 if is_synthetic_class_helper_function(&function.function) {
                     seen.insert(function_id);
                     queue.push_back(function);
@@ -9044,7 +9512,11 @@ impl ProcessJitEngine {
         let mut functions_to_define = Vec::new();
         for batch_function in &batch_functions {
             let function = &batch_function.function;
-            let declared = state.declare_direct_function(function)?;
+            let direct_symbol_scope = batch_function.source.shared_state().map(|shared_state| {
+                direct_function_symbol_scope_for_shared_state(shared_state, function.function_id)
+            });
+            let declared =
+                state.declare_direct_function(function, direct_symbol_scope.as_deref())?;
             if !state.is_direct_function_ready(function.function_id) {
                 functions_to_define.push(batch_function);
             }
@@ -9073,14 +9545,14 @@ impl ProcessJitEngine {
                 function_scalar_counter_data_id,
                 function_top_value_counter_data_id,
                 function_direct_call_resolver,
-                function_module_constant_table_instance_key,
+                function_module_constant_table_binding_key,
+                function_module_constant_table_symbol,
+                function_symbol_scope,
             ) = if let Some(shared_state) = batch_function.source.shared_state() {
                 owned_module_constant_ptrs = shared_state.module_constant_ptrs();
                 let instance_key = shared_state.storage_instance_key();
-                let scalar_counter_symbol = scalar_counter_storage_symbol_for_instance(
-                    &shared_state.lowered_module,
-                    instance_key,
-                );
+                let scalar_counter_symbol =
+                    scalar_counter_storage_symbol_for_shared_state(shared_state);
                 let scalar_counter_base_ptr = shared_state.scalar_counter_values_ptr();
                 let scalar_counter_data_id = if scalar_counter_base_ptr.is_null() {
                     None
@@ -9094,10 +9566,8 @@ impl ProcessJitEngine {
                         scalar_counter_symbol.as_str(),
                     )?)
                 };
-                let top_value_counter_symbol = top_value_counter_storage_symbol_for_instance(
-                    &shared_state.lowered_module,
-                    instance_key,
-                );
+                let top_value_counter_symbol =
+                    top_value_counter_storage_symbol_for_shared_state(shared_state);
                 let top_value_counter_base_ptr = shared_state.top_value_counter_values_ptr();
                 let top_value_counter_data_id = if top_value_counter_base_ptr.is_null() {
                     None
@@ -9121,6 +9591,11 @@ impl ProcessJitEngine {
                     top_value_counter_data_id,
                     Some(shared_state),
                     instance_key,
+                    module_constant_table_symbol_for_shared_state(shared_state),
+                    Some(direct_function_symbol_scope_for_shared_state(
+                        shared_state,
+                        function.function_id,
+                    )),
                 )
             } else {
                 let (counter_slots_by_id, scalar_counter_count, top_value_count) =
@@ -9147,12 +9622,14 @@ impl ProcessJitEngine {
                     top_value_counter_data_id,
                     None,
                     instance_key,
+                    module_constant_table_symbol_for_instance(module, instance_key),
+                    None,
                 )
             };
             let function_module_constant_table_data_id = state.ensure_module_constant_table(
-                function_module,
                 function_module_constant_ptrs,
-                function_module_constant_table_instance_key,
+                function_module_constant_table_binding_key,
+                function_module_constant_table_symbol.as_str(),
             )?;
             let built = build_cranelift_run_bb_specialized_function(
                 &mut state.jit_module,
@@ -9167,7 +9644,7 @@ impl ProcessJitEngine {
                 function_top_value_counter_data_id,
                 session.as_ref(),
                 function_direct_call_resolver,
-                None,
+                function_symbol_scope.as_deref(),
                 Some(&predeclared),
             )
             .map_err(|err| {
@@ -9181,19 +9658,15 @@ impl ProcessJitEngine {
             let main_symbol = built.main_symbol;
             let clif_block_count = ctx.func.layout.blocks().count();
             let clif_inst_count = ctx.func.dfg.num_insts();
+            let cache_name =
+                direct_function_compile_cache_name(function, batch_function.source.shared_state());
             let artifact = define_function_with_incremental_cache(
                 session.as_ref(),
                 &mut state.jit_module,
                 main_id,
                 &mut ctx,
-                &format!(
-                    "direct:{}:{}",
-                    function.names.qualname,
-                    function.params.len()
-                ),
-                CraneliftCompileCachePolicy::Disabled {
-                    reason: "direct function body embeds per-run specialization addresses",
-                },
+                cache_name.as_str(),
+                CraneliftCompileCachePolicy::Enabled,
                 "failed to define specialized jit run_bb function",
             )
             .map_err(|err| {
@@ -9634,6 +10107,39 @@ fn direct_function_symbol(
 
 fn direct_function_symbol_scope(function_id: FunctionId, symbol_id: u64) -> String {
     format!("fn_{}_{}", function_id.packed(), symbol_id)
+}
+
+fn direct_function_compile_cache_name(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    shared_state: Option<&SharedModuleState>,
+) -> String {
+    let mut name = String::from("direct:");
+    match shared_state {
+        Some(shared_state) => push_direct_function_cache_module_identity(
+            &mut name,
+            shared_state.module_name.as_str(),
+            shared_state.source_hash(),
+        ),
+        None => {
+            name.push_str("module_id:");
+            name.push_str(function.function_id.module_id().to_string().as_str());
+        }
+    }
+    name.push(':');
+    name.push_str(function.names.qualname.as_str());
+    name.push(':');
+    name.push_str(function.params.len().to_string().as_str());
+    name
+}
+
+fn push_direct_function_cache_module_identity(
+    out: &mut String,
+    module_name: &str,
+    source_hash: u64,
+) {
+    push_symbol_component_hex(out, module_name);
+    out.push(':');
+    out.push_str(format!("{source_hash:016x}").as_str());
 }
 
 fn declare_direct_function(
@@ -10921,10 +11427,6 @@ fn build_cranelift_run_bb_specialized_function(
                     deleted_const,
                     empty_tuple_const,
                     block_const,
-                    py_function_type_ptr: std::ptr::addr_of_mut!(PyFunction_Type),
-                    py_method_type_ptr: std::ptr::addr_of_mut!(PyMethod_Type),
-                    py_type_type_ptr: std::ptr::addr_of_mut!(PyType_Type),
-                    py_long_type_ptr: std::ptr::addr_of_mut!(PyLong_Type),
                 },
                 load_global_fast_ref,
                 load_global_indexed_ref,
@@ -10979,6 +11481,8 @@ fn build_cranelift_run_bb_specialized_function(
                 exception_forwarded_local_names: exc_dispatches[index]
                     .as_ref()
                     .map(|dispatch| dispatch.forwarded_local_names.as_slice()),
+                type_ptr_data_ids: RefCell::new(HashMap::new()),
+                callable_ptr_data_ids: RefCell::new(HashMap::new()),
             };
             let _block_refcount_plan = emit_ctx.refcount_plan.block(codegen_block.label);
 
@@ -11328,11 +11832,7 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
     } else if let Some(shared_state) = runtime_state {
         Some(declare_top_value_counter_storage_import(
             &mut jit_module,
-            top_value_counter_storage_symbol_for_instance(
-                &shared_state.lowered_module,
-                shared_state.storage_instance_key(),
-            )
-            .as_str(),
+            top_value_counter_storage_symbol_for_shared_state(shared_state).as_str(),
         )?)
     } else {
         Some(define_top_value_counter_storage_data(

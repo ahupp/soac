@@ -269,8 +269,16 @@ anything non-code affected the run. If there were no such issues, say
   Full gate for non-doc changes.
 - `just pytest ...`
   Authoritative transformed-runtime pytest entrypoint.
+- `just pytest-fast ...`
+  Fast transformed-runtime pytest entrypoint for repeated focused checks. It
+  reuses the existing venv and debug extension when `vendor/cpython/python`,
+  `soac_py/pyproject.toml`, `uv.lock`, and workspace Rust inputs are unchanged,
+  and falls back to the full build path when they are stale or missing.
 - `just py ...`
   Best entrypoint for ad hoc transformed-runtime repros outside pytest.
+- `just py-fast ...`
+  Fast transformed-runtime Python entrypoint for tight edit/repro loops. It
+  uses the same unchanged-environment reuse rules as `just pytest-fast ...`.
 - `just run-cpython-tests ...`
   Use for vendored CPython regrtest runs.
 - `$soac-profile-benchmark`
@@ -370,8 +378,12 @@ anything non-code affected the run. If there were no such issues, say
   or a process temp directory using key-derived filenames, and logs
   cache configuration, hits, and store failures through the
   `soac_jit_compile_cache` tracing target. The cache is disabled by
-  default. Direct Python function bodies are currently skipped because
-  their Cranelift input still embeds per-run object and counter pointers.
+  default. Direct Python function bodies now participate using a
+  logical cache key that includes the module identity, and shared-state
+  counted incref/decref helpers also participate when they can bind
+  stable shared counter symbols. Explicit local and inspection builds
+  still skip those helper stubs because their counter storage names
+  remain per-instance.
 - `SOAC_COMPILE_CACHE_DIR`
   Explicit cache directory for `SOAC_CRANELIFT_COMPILE_CACHE`. Prefer
   this for CPython test runs and symlinked/shared checkout workflows so

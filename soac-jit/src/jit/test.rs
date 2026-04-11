@@ -67,6 +67,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn direct_function_cache_module_identity_is_stable() {
+        let mut first = String::new();
+        push_direct_function_cache_module_identity(&mut first, "pkg.mod", 0x1234);
+        let mut second = String::new();
+        push_direct_function_cache_module_identity(&mut second, "pkg.mod", 0x1234);
+        let mut different_hash = String::new();
+        push_direct_function_cache_module_identity(&mut different_hash, "pkg.mod", 0x1235);
+        let mut different_module = String::new();
+        push_direct_function_cache_module_identity(&mut different_module, "pkg.other", 0x1234);
+        assert_eq!(first, second);
+        assert_eq!(first, "706b672e6d6f64:0000000000001234");
+        assert_ne!(first, different_hash);
+        assert_ne!(first, different_module);
+    }
+
+    #[test]
+    fn shared_module_symbol_identity_is_stable() {
+        let mut first = String::new();
+        push_shared_module_symbol_identity(&mut first, "pkg.mod", 0x1234);
+        let mut second = String::new();
+        push_shared_module_symbol_identity(&mut second, "pkg.mod", 0x1234);
+        let mut different_hash = String::new();
+        push_shared_module_symbol_identity(&mut different_hash, "pkg.mod", 0x1235);
+        assert_eq!(first, second);
+        assert_eq!(first, "706b672e6d6f64_0000000000001234");
+        assert_ne!(first, different_hash);
+    }
+
+    #[test]
+    fn counted_refcount_helper_cache_requires_stable_scope() {
+        assert_eq!(
+            counted_runtime_refcount_helper_cache_policy(Some("shared_pkg_fn_7")),
+            CraneliftCompileCachePolicy::Enabled
+        );
+        assert_eq!(
+            counted_runtime_refcount_helper_cache_policy(None),
+            CraneliftCompileCachePolicy::Disabled {
+                reason: "counted refcount helper lacks stable shared-state counter symbols",
+            }
+        );
+    }
+
     unsafe extern "C" fn test_capsule_destructor(_capsule: *mut ffi::PyObject) {
         CAPSULE_DESTROYED.store(true, Ordering::SeqCst);
     }
@@ -667,7 +710,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_call_compatibility_requires_predeclared_target() {
+    fn direct_call_compatibility_accepts_target_without_predeclared_symbol() {
         let target = test_function();
 
         assert_eq!(
@@ -679,7 +722,63 @@ mod tests {
                 false,
                 false,
             ),
-            Err(DirectCallIncompatibility::MissingPredeclared)
+            Ok(DirectCallArgPlan {
+                sources: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn specialized_jit_call_direct_uses_function_env_indirect_call_without_predeclared_symbol() {
+        let blocks = [1usize as ObjPtr];
+        let module_name_gen = ModuleNameGen::new(95);
+        let mut constants = TestConstantPool::default();
+        let callee = with_single_test_block(
+            test_function_in_module(&module_name_gen, "callee"),
+            vec![],
+            ret_term(constants.int_expr(7)),
+        );
+        let caller = with_single_test_block(
+            test_function_in_module(&module_name_gen, "caller"),
+            vec![],
+            ret_term(InstrCodegen::CallDirect(CallDirect::new(
+                name_expr(test_global_name("callee")),
+                callee.function_id,
+                Vec::<CallArgPositional<InstrCodegen>>::new(),
+                Vec::<CallArgKeyword<InstrCodegen>>::new(),
+            ))),
+        );
+        let mut module = test_module(module_name_gen, vec![callee, caller.clone()]);
+        module.global_names = vec!["callee".into()];
+        module.module_constants = constants.module_constants;
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let built =
+            build_test_jit_function_with_constants(&module, &caller, &blocks, &module_constants);
+        assert!(
+            count_indirect_calls(&built.ctx.func) >= 1,
+            "direct-call lowering without a predeclared target should indirect through FunctionEnv.direct_code_ptr",
+        );
+        let slow_path_helpers =
+            import_user_names_for_symbols(&built, &[DP_JIT_DIRECT_FUNCTION_CONTEXT_IMPORT.symbol]);
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &slow_path_helpers),
+            1,
+            "direct-call lowering should keep the FunctionEnv lookup slow path available",
+        );
+        let generic_call_helpers = import_user_names_for_symbols(
+            &built,
+            &[
+                DP_JIT_PY_CALL_OBJECT_IMPORT.symbol,
+                DP_JIT_PY_VECTORCALL_IMPORT.symbol,
+                DP_JIT_PY_CALL_WITH_KW_IMPORT.symbol,
+                DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT.symbol,
+            ],
+        );
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &generic_call_helpers),
+            0,
+            "direct-call lowering should not fall back to the generic Python call helpers",
         );
     }
 
@@ -1276,10 +1375,10 @@ mod tests {
         });
 
         let first_decl = state
-            .declare_direct_function(&first)
+            .declare_direct_function(&first, None)
             .expect("first function should declare");
         let first_decl_again = state
-            .declare_direct_function(&first)
+            .declare_direct_function(&first, None)
             .expect("same shape should reuse declaration");
         assert_eq!(first_decl.symbol, first_decl_again.symbol);
 
@@ -1299,13 +1398,13 @@ mod tests {
         assert!(state.ready_direct_function(&second).is_none());
 
         let second_decl = state
-            .declare_direct_function(&second)
+            .declare_direct_function(&second, None)
             .expect("colliding function id with different shape should redeclare");
         assert_ne!(first_decl.symbol, second_decl.symbol);
     }
 
     #[test]
-    fn process_jit_batch_collection_resolves_cross_module_targets_from_compile_session() {
+    fn process_jit_batch_collection_skips_cross_module_targets_for_lazy_env_lookup() {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
         let result = Python::attach(|py| {
@@ -1353,14 +1452,14 @@ mod tests {
                 .iter()
                 .map(|batch_function| batch_function.function.function_id)
                 .collect::<Vec<_>>();
-            assert_eq!(function_ids, vec![caller.function_id, callee.function_id]);
+            assert_eq!(function_ids, vec![caller.function_id]);
             assert_eq!(
-                batch[1]
-                    .source
-                    .shared_state()
-                    .expect("cross-module callee should carry its owning shared state")
-                    .module_name,
-                "callee_test"
+                caller_state
+                    .lookup_direct_call_target_function(session.as_ref(), callee.function_id)
+                    .expect("cross-module target lookup should succeed")
+                    .expect("cross-module target metadata should resolve")
+                    .function_id,
+                callee.function_id
             );
         });
         result
@@ -1454,6 +1553,76 @@ mod tests {
         result
     }
 
+    #[test]
+    fn process_jit_compile_direct_function_leaves_cross_module_callee_lazy() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        let result = Python::attach(|py| {
+            let session = std::sync::Arc::new(crate::session::CompileSession::new());
+            let caller_module_name_gen = ModuleNameGen::new(96);
+            let callee_module_name_gen = ModuleNameGen::new(97);
+            let callee = test_function_in_module(&callee_module_name_gen, "callee");
+            let caller = test_function_in_module(&caller_module_name_gen, "caller");
+            let caller = with_single_test_block(
+                caller.clone(),
+                vec![direct_call_expr(callee.function_id)],
+                ret_term(none_expr()),
+            );
+            let caller_state = crate::module_type::build_shared_state_for_testing(
+                py,
+                test_module(caller_module_name_gen, vec![caller.clone()]),
+                "caller_test",
+                "",
+            )
+            .expect("caller shared state should build");
+            let callee_state = crate::module_type::build_shared_state_for_testing(
+                py,
+                test_module(callee_module_name_gen, vec![callee.clone()]),
+                "callee_test",
+                "",
+            )
+            .expect("callee shared state should build");
+            session
+                .retain_shared_module_state(std::sync::Arc::clone(&caller_state))
+                .expect("caller state should be retained");
+            session
+                .retain_shared_module_state(callee_state)
+                .expect("callee state should be retained");
+
+            let engine =
+                ProcessJitEngine::new(session.as_ref()).expect("process JIT should construct");
+            let module_constant_ptrs = caller_state.module_constant_ptrs();
+            let blocks = vec![std::ptr::null_mut::<c_void>(); caller.blocks.len()];
+            let compiled = unsafe {
+                engine.compile_direct_function(
+                    &session,
+                    blocks.as_slice(),
+                    &caller_state.lowered_module,
+                    &caller,
+                    &caller_state.codegen_constants,
+                    &caller_state.lowered_module.counter_defs,
+                    &module_constant_ptrs,
+                    Some(caller_state.as_ref()),
+                )
+            }
+            .expect("cross-module caller should compile without precompiling the callee");
+            assert!(compiled.compiled);
+            let state = engine
+                .state
+                .lock()
+                .expect("process JIT state lock should not be poisoned");
+            assert!(
+                state.ready_direct_function(&caller).is_some(),
+                "root function should be marked ready",
+            );
+            assert!(
+                state.ready_direct_function(&callee).is_none(),
+                "cross-module callee should stay lazy until its FunctionEnv is materialized",
+            );
+        });
+        result
+    }
+
     fn render_test_jit_function_with_module_constants(
         function: &BlockPyFunction<CodegenModuleShape>,
         blocks: &[ObjPtr],
@@ -1467,12 +1636,12 @@ mod tests {
         render_test_jit_function_with_constants(&module, &function, blocks, &module_constants)
     }
 
-    fn render_test_jit_function_with_operator_specializations(
+    fn build_test_jit_function_with_operator_specializations(
         function: &BlockPyFunction<CodegenModuleShape>,
         blocks: &[ObjPtr],
         module_constants: Vec<InstrResolved>,
         operator_specializations: &[(InstrId, u64)],
-    ) -> String {
+    ) -> (JITModule, BuiltSpecializedFunction) {
         let mut module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
         module.module_constants = module_constants;
         let function = module.callable_defs[0].clone();
@@ -1517,7 +1686,7 @@ mod tests {
         }
         crate::initialize_test_python();
 
-        let rendered = Python::attach(|py| {
+        let (jit_module, built) = Python::attach(|py| {
             let shared_state =
                 crate::module_type::build_shared_state_for_testing(py, module, module_name, "")
                     .expect("shared state should build");
@@ -1558,14 +1727,7 @@ mod tests {
                 None,
             )
             .expect("specialized JIT build should succeed");
-            let (clif, _cfg_dot, _vcode_disasm) = render_compiled_clif_and_vcode_disasm(
-                &mut jit_module,
-                built.ctx,
-                &built.import_id_to_symbol,
-                &built.block_annotations,
-            )
-            .expect("specialized JIT CLIF render should succeed");
-            clif
+            (jit_module, built)
         });
 
         unsafe {
@@ -1579,7 +1741,7 @@ mod tests {
             }
         }
 
-        rendered
+        (jit_module, built)
     }
 
     fn render_test_jit_function_with_block_entry_counts(
@@ -1779,7 +1941,18 @@ class Point:
                 .get("x")
                 .expect("x specialization should be present");
             assert_eq!(x_specializations.len(), 1);
-            assert_eq!(x_specializations[0].owner_type, owner_type);
+            assert_eq!(
+                x_specializations[0].owner_type_ref,
+                RelocTypeRef::TypeKey(CounterDumpTypeKey {
+                    module_name: "field_type_test".to_string(),
+                    qualname: "Point".to_string(),
+                })
+            );
+            assert_eq!(
+                resolve_reloc_type_ref_to_type(&x_specializations[0].owner_type_ref)
+                    .expect("type key should resolve back to a live type"),
+                Some(owner_type)
+            );
             assert_eq!(x_specializations[0].expected_index, 0);
             assert_ne!(x_specializations[0].type_version, 0);
 
@@ -1798,6 +1971,21 @@ class Point:
                 None => std::env::remove_var("SOAC_OPT_MODE"),
             }
         }
+    }
+
+    #[test]
+    fn reloc_type_ref_uses_cpython_symbols_for_builtin_types() {
+        let long_ref = reloc_type_ref_for_type(std::ptr::addr_of_mut!(PyLong_Type))
+            .expect("builtin type relocation should not error");
+        assert_eq!(
+            long_ref,
+            Some(RelocTypeRef::CpythonTypeSymbol(CpythonTypeSymbol::Long))
+        );
+        assert_eq!(
+            resolve_reloc_type_ref_to_type(long_ref.as_ref().expect("reloc ref should exist"))
+                .expect("builtin symbol should resolve"),
+            Some(std::ptr::addr_of_mut!(PyLong_Type))
+        );
     }
 
     #[test]
@@ -2424,6 +2612,26 @@ def write_point(point, value):
             .values()
             .filter(|global_value| matches!(global_value, ir::GlobalValueData::Symbol { .. }))
             .count()
+    }
+
+    fn count_indirect_calls(function: &ir::Function) -> usize {
+        function
+            .layout
+            .blocks()
+            .map(|block| {
+                function
+                    .layout
+                    .block_insts(block)
+                    .filter(|inst| {
+                        matches!(
+                            function.dfg.insts[*inst],
+                            ir::InstructionData::CallIndirect { .. }
+                                | ir::InstructionData::TryCallIndirect { .. }
+                        )
+                    })
+                    .count()
+            })
+            .sum()
     }
 
     fn import_user_names_for_symbols(
@@ -3216,10 +3424,10 @@ def f(x):
     }
 
     #[test]
-    fn render_specialized_jit_exact_int_binop_uses_operator_fast_path() {
+    fn specialized_jit_exact_int_binop_uses_operator_fast_path() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
-            "render_specialized_jit_exact_int_binop_uses_operator_fast_path",
+            "specialized_jit_exact_int_binop_uses_operator_fast_path",
         ) {
             return;
         }
@@ -3243,7 +3451,19 @@ def f(x):
             exc_edge: None,
         };
         function.blocks = vec![block];
-        let rendered = render_test_jit_function_with_operator_specializations(
+        let mut baseline_module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
+        baseline_module.module_constants = constants.module_constants.clone();
+        let baseline_function = baseline_module.callable_defs[0].clone();
+        let baseline_module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&baseline_module);
+        let baseline_built = build_test_jit_function_with_constants(
+            &baseline_module,
+            &baseline_function,
+            &blocks,
+            &baseline_module_constants,
+        );
+        let baseline_symbolic_globals = count_symbolic_global_values(&baseline_built.ctx.func);
+        let (_jit_module, built) = build_test_jit_function_with_operator_specializations(
             &function,
             &blocks,
             constants.module_constants,
@@ -3255,21 +3475,40 @@ def f(x):
                 ),
             )],
         );
-        assert!(
-            rendered.contains("call dp_jit_exact_long_add_slot"),
-            "exact-int binop specialization should call the profiled PyLong number slot:\n{rendered}"
+        let helper_names = import_user_names_for_symbols(&built, &["dp_jit_exact_long_add_slot"]);
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &helper_names),
+            1,
+            "exact-int binop specialization should call the profiled PyLong number slot",
         );
         assert!(
-            rendered.contains("iconst.i64 257"),
-            "exact-int binop specialization should guard on the profiled exact-int shape:\n{rendered}"
+            function_contains_iconst_imm(
+                &built.ctx.func,
+                crate::operator_specialization::pack_binary_shape(
+                    crate::operator_specialization::ExactTypeTag::Int,
+                    crate::operator_specialization::ExactTypeTag::Int,
+                ) as i64,
+            ),
+            "exact-int binop specialization should guard on the profiled exact-int shape",
+        );
+        assert!(
+            !function_contains_iconst_imm(
+                &built.ctx.func,
+                std::ptr::addr_of_mut!(PyLong_Type) as i64
+            ),
+            "exact-int binop specialization should not bake the PyLong type pointer into the function body",
+        );
+        assert!(
+            count_symbolic_global_values(&built.ctx.func) > baseline_symbolic_globals,
+            "exact-int binop specialization should add a symbolic global for the profiled type guard",
         );
     }
 
     #[test]
-    fn render_specialized_jit_exact_int_compare_uses_operator_fast_path() {
+    fn specialized_jit_exact_int_compare_uses_operator_fast_path() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
-            "render_specialized_jit_exact_int_compare_uses_operator_fast_path",
+            "specialized_jit_exact_int_compare_uses_operator_fast_path",
         ) {
             return;
         }
@@ -3293,7 +3532,19 @@ def f(x):
             exc_edge: None,
         };
         function.blocks = vec![block];
-        let rendered = render_test_jit_function_with_operator_specializations(
+        let mut baseline_module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
+        baseline_module.module_constants = constants.module_constants.clone();
+        let baseline_function = baseline_module.callable_defs[0].clone();
+        let baseline_module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&baseline_module);
+        let baseline_built = build_test_jit_function_with_constants(
+            &baseline_module,
+            &baseline_function,
+            &blocks,
+            &baseline_module_constants,
+        );
+        let baseline_symbolic_globals = count_symbolic_global_values(&baseline_built.ctx.func);
+        let (_jit_module, built) = build_test_jit_function_with_operator_specializations(
             &function,
             &blocks,
             constants.module_constants,
@@ -3305,21 +3556,41 @@ def f(x):
                 ),
             )],
         );
-        assert!(
-            rendered.contains("call dp_jit_exact_long_richcompare_slot"),
-            "exact-int compare specialization should call the profiled PyLong richcompare slot:\n{rendered}"
+        let helper_names =
+            import_user_names_for_symbols(&built, &["dp_jit_exact_long_richcompare_slot"]);
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &helper_names),
+            1,
+            "exact-int compare specialization should call the profiled PyLong richcompare slot",
         );
         assert!(
-            rendered.contains("iconst.i64 257"),
-            "exact-int compare specialization should guard on the profiled exact-int shape:\n{rendered}"
+            function_contains_iconst_imm(
+                &built.ctx.func,
+                crate::operator_specialization::pack_binary_shape(
+                    crate::operator_specialization::ExactTypeTag::Int,
+                    crate::operator_specialization::ExactTypeTag::Int,
+                ) as i64,
+            ),
+            "exact-int compare specialization should guard on the profiled exact-int shape",
+        );
+        assert!(
+            !function_contains_iconst_imm(
+                &built.ctx.func,
+                std::ptr::addr_of_mut!(PyLong_Type) as i64
+            ),
+            "exact-int compare specialization should not bake the PyLong type pointer into the function body",
+        );
+        assert!(
+            count_symbolic_global_values(&built.ctx.func) > baseline_symbolic_globals,
+            "exact-int compare specialization should add a symbolic global for the profiled type guard",
         );
     }
 
     #[test]
-    fn render_specialized_jit_exact_int_unary_uses_operator_fast_path() {
+    fn specialized_jit_exact_int_unary_uses_operator_fast_path() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
-            "render_specialized_jit_exact_int_unary_uses_operator_fast_path",
+            "specialized_jit_exact_int_unary_uses_operator_fast_path",
         ) {
             return;
         }
@@ -3342,7 +3613,19 @@ def f(x):
             exc_edge: None,
         };
         function.blocks = vec![block];
-        let rendered = render_test_jit_function_with_operator_specializations(
+        let mut baseline_module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
+        baseline_module.module_constants = constants.module_constants.clone();
+        let baseline_function = baseline_module.callable_defs[0].clone();
+        let baseline_module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&baseline_module);
+        let baseline_built = build_test_jit_function_with_constants(
+            &baseline_module,
+            &baseline_function,
+            &blocks,
+            &baseline_module_constants,
+        );
+        let baseline_symbolic_globals = count_symbolic_global_values(&baseline_built.ctx.func);
+        let (_jit_module, built) = build_test_jit_function_with_operator_specializations(
             &function,
             &blocks,
             constants.module_constants,
@@ -3353,9 +3636,31 @@ def f(x):
                 ),
             )],
         );
+        let helper_names = import_user_names_for_symbols(&built, &["dp_jit_exact_long_unary_op"]);
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &helper_names),
+            1,
+            "exact-int unary specialization should call the direct helper",
+        );
         assert!(
-            rendered.contains("call dp_jit_exact_long_unary_op"),
-            "exact-int unary specialization should call the direct helper:\n{rendered}"
+            function_contains_iconst_imm(
+                &built.ctx.func,
+                crate::operator_specialization::pack_unary_shape(
+                    crate::operator_specialization::ExactTypeTag::Int,
+                ) as i64,
+            ),
+            "exact-int unary specialization should guard on the profiled exact-int shape",
+        );
+        assert!(
+            !function_contains_iconst_imm(
+                &built.ctx.func,
+                std::ptr::addr_of_mut!(PyLong_Type) as i64
+            ),
+            "exact-int unary specialization should not bake the PyLong type pointer into the function body",
+        );
+        assert!(
+            count_symbolic_global_values(&built.ctx.func) > baseline_symbolic_globals,
+            "exact-int unary specialization should add a symbolic global for the profiled type guard",
         );
     }
 
@@ -4424,6 +4729,7 @@ def f(x, y):
                     !init_function_obj.is_null(),
                     "class dict should contain __init__"
                 );
+                let init_function_ptr = init_function_obj as i64;
                 ffi::Py_INCREF(init_function_obj);
                 let runtime_clone = crate::clone_module_runtime_context(&runtime)
                     .expect("runtime clone should succeed");
@@ -4502,6 +4808,14 @@ def f(x, y):
                     count_direct_calls_to_runtime_helpers(&built.ctx.func, &finish_helpers),
                     1,
                     "constructor specialization should validate __init__ results in the fast path",
+                );
+                assert!(
+                    !function_contains_iconst_imm(&built.ctx.func, owner_type as i64),
+                    "constructor specialization should not bake the owner type pointer into the function body",
+                );
+                assert!(
+                    !function_contains_iconst_imm(&built.ctx.func, init_function_ptr),
+                    "constructor specialization should not bake the __init__ function pointer into the function body",
                 );
             })
         };
