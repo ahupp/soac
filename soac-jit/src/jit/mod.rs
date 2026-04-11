@@ -26,9 +26,9 @@ use soac_blockpy::block_py::{
     StorageLayout, Visit, WithMeta, operation as blockpy_intrinsics,
 };
 use soac_blockpy::passes::{
-    CodegenModuleShape, FactStore, FunctionRefcountPlan, InstrResolved, PyExactType, PyObjFacts,
-    RefcountActionKind, RefcountReleaseReason, RuntimeHelperId, ValueFacts,
-    infer_module_value_facts,
+    CodegenModuleShape, FactStore, FunctionRefcountPlan, InstrResolved, InstrTyped, PyExactType,
+    PyObjFacts, RefcountActionKind, RefcountReleaseReason, RuntimeHelperId, ValueFacts,
+    infer_module_value_facts, try_lower_typed_instr_to_codegen_legacy,
 };
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -8367,6 +8367,28 @@ fn emit_codegen_expr_value_with_local_env(
     SoacValue::pyobject(value, facts)
 }
 
+#[allow(dead_code)]
+fn emit_typed_codegen_expr_value_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    expr: &InstrTyped,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    borrowed: bool,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<SoacValue, String> {
+    let legacy_expr = try_lower_typed_instr_to_codegen_legacy(expr.clone())?;
+    Ok(emit_codegen_expr_value_with_local_env(
+        fb,
+        &legacy_expr,
+        local_env,
+        emit_ctx,
+        borrowed,
+        jit_module,
+        func_imports,
+    ))
+}
+
 fn emit_codegen_simple_call_with_local_env(
     fb: &mut FunctionBuilder<'_>,
     call: &soac_blockpy::block_py::Call<InstrCodegen>,
@@ -9382,6 +9404,28 @@ fn emit_codegen_expr_with_local_env(
     panic!("operation {expr:?} should have been handled by LocalEnv direct emitter")
 }
 
+#[allow(dead_code)]
+fn emit_typed_codegen_expr_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    expr: &InstrTyped,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    borrowed: bool,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<ir::Value, String> {
+    let legacy_expr = try_lower_typed_instr_to_codegen_legacy(expr.clone())?;
+    Ok(emit_codegen_expr_with_local_env(
+        fb,
+        &legacy_expr,
+        local_env,
+        emit_ctx,
+        borrowed,
+        jit_module,
+        func_imports,
+    ))
+}
+
 fn emit_codegen_stmt_with_local_env(
     fb: &mut FunctionBuilder<'_>,
     expr: &InstrCodegen,
@@ -9457,6 +9501,26 @@ fn emit_codegen_stmt_with_local_env(
         jit_module,
         func_imports,
     )
+}
+
+#[allow(dead_code)]
+fn emit_typed_codegen_stmt_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    expr: &InstrTyped,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<ir::Value, String> {
+    let legacy_expr = try_lower_typed_instr_to_codegen_legacy(expr.clone())?;
+    Ok(emit_codegen_stmt_with_local_env(
+        fb,
+        &legacy_expr,
+        local_env,
+        emit_ctx,
+        jit_module,
+        func_imports,
+    ))
 }
 
 fn local_failure_cleanup_emit_ctx<'mc>(

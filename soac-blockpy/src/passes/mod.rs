@@ -27,8 +27,8 @@ use crate::block_py::{
     StmtAnnAssign, StmtAssert, StmtAssign, StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue,
     StmtDelete, StmtExpr, StmtFor, StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom,
     StmtIpyEscapeCommand, StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry,
-    StmtTypeAlias, StmtWhile, StmtWith, Store, TryMapInstr, UnaryOp, UnresolvedName, WithMeta,
-    Yield, YieldFrom,
+    StmtTypeAlias, StmtWhile, StmtWith, Store, TryMapInstr, TryMapModule, UnaryOp, UnresolvedName,
+    WithMeta, Yield, YieldFrom,
 };
 use ruff_python_ast::{self as ast};
 use soac_macros::{enum_broadcast, DelegateMatchDefault};
@@ -246,6 +246,52 @@ pub fn lower_codegen_module_to_typed(
     module: BlockPyModule<CodegenModuleShape>,
 ) -> BlockPyModule<TypedCodegenModuleShape> {
     CodegenToTyped.map_module(module)
+}
+
+struct TypedToCodegen;
+
+impl TryMapInstr<InstrTyped, InstrCodegen, String> for TypedToCodegen {
+    fn try_map_instr(&mut self, instr: InstrTyped) -> Result<InstrCodegen, String> {
+        Ok(match instr {
+            InstrTyped::LegacyBinOp(op) => InstrCodegenOp::BinOp(op.try_map_children(self)?),
+            InstrTyped::LegacyUnaryOp(op) => InstrCodegenOp::UnaryOp(op.try_map_children(self)?),
+            InstrTyped::LegacyCalleeFunctionId(op) => {
+                InstrCodegenOp::CalleeFunctionId(op.try_map_children(self)?)
+            }
+            InstrTyped::LegacyCall(op) => InstrCodegenOp::Call(op.try_map_children(self)?),
+            InstrTyped::LegacyCallDirect(op) => {
+                InstrCodegenOp::CallDirect(op.try_map_children(self)?)
+            }
+            InstrTyped::LegacyGetAttr(op) => InstrCodegenOp::GetAttr(op.try_map_children(self)?),
+            InstrTyped::LegacySetAttr(op) => InstrCodegenOp::SetAttr(op.try_map_children(self)?),
+            InstrTyped::LegacyGetItem(op) => InstrCodegenOp::GetItem(op.try_map_children(self)?),
+            InstrTyped::LegacySetItem(op) => InstrCodegenOp::SetItem(op.try_map_children(self)?),
+            InstrTyped::LegacyDelItem(op) => InstrCodegenOp::DelItem(op.try_map_children(self)?),
+            InstrTyped::LegacyLoad(op) => InstrCodegenOp::Load(op.try_map_children(self)?),
+            InstrTyped::LegacyStore(op) => InstrCodegenOp::Store(op.try_map_children(self)?),
+            InstrTyped::LegacyDel(op) => InstrCodegenOp::Del(op.try_map_children(self)?),
+            InstrTyped::LegacyMakeCell(op) => InstrCodegenOp::MakeCell(op.try_map_children(self)?),
+            InstrTyped::LegacyIncrementCounter(op) => InstrCodegenOp::IncrementCounter(op),
+            InstrTyped::LegacyCellRef(op) => InstrCodegenOp::CellRef(op),
+            InstrTyped::LegacyMakeFunction(op) => {
+                InstrCodegenOp::MakeFunction(op.try_map_children(self)?)
+            }
+        })
+    }
+
+    fn try_map_name(&mut self, name: ResolvedName) -> Result<ResolvedName, String> {
+        Ok(name)
+    }
+}
+
+pub fn try_lower_typed_instr_to_codegen_legacy(instr: InstrTyped) -> Result<InstrCodegen, String> {
+    TypedToCodegen.try_map_instr(instr)
+}
+
+pub fn try_lower_typed_module_to_codegen_legacy(
+    module: BlockPyModule<TypedCodegenModuleShape>,
+) -> Result<BlockPyModule<CodegenModuleShape>, String> {
+    TypedToCodegen.try_map_module(module)
 }
 
 impl<I> Instr for IdentifiedInstr<I>
@@ -542,6 +588,38 @@ mod typed_codegen_tests {
         }
     }
 
+    #[derive(Default, Eq, PartialEq, Debug)]
+    struct CodegenInstrCounter {
+        total: usize,
+        binops: usize,
+        calls: usize,
+    }
+
+    impl Visit<InstrCodegen> for CodegenInstrCounter {
+        fn visit_instr(&mut self, expr: &InstrCodegen) {
+            self.total += 1;
+            match expr {
+                InstrCodegen::BinOp(_) => self.binops += 1,
+                InstrCodegen::Call(_) => self.calls += 1,
+                _ => {}
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    fn count_codegen_instrs(module: &BlockPyModule<CodegenModuleShape>) -> CodegenInstrCounter {
+        let mut counter = CodegenInstrCounter::default();
+        for function in &module.callable_defs {
+            for block in &function.blocks {
+                for instr in &block.body {
+                    counter.visit_instr(instr);
+                }
+                counter.visit_term(&block.term);
+            }
+        }
+        counter
+    }
+
     #[test]
     fn lower_codegen_module_to_typed_wraps_codegen_instrs_as_legacy() {
         let lowered =
@@ -568,6 +646,22 @@ mod typed_codegen_tests {
         assert!(counter.total > 0);
         assert!(counter.binops > 0);
         assert_eq!(counter.non_legacy, 0);
+    }
+
+    #[test]
+    fn typed_legacy_module_round_trips_to_codegen_shape() {
+        let lowered =
+            crate::lower_python_to_blockpy_for_testing("def f(a, b):\n    return g(a + b)\n")
+                .expect("source should lower");
+        let original_counts = count_codegen_instrs(&lowered.codegen_module);
+
+        let typed = lower_codegen_module_to_typed(lowered.codegen_module);
+        let round_tripped = try_lower_typed_module_to_codegen_legacy(typed)
+            .expect("legacy typed module should map");
+
+        assert_eq!(count_codegen_instrs(&round_tripped), original_counts);
+        assert!(original_counts.binops > 0);
+        assert!(original_counts.calls > 0);
     }
 }
 
