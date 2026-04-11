@@ -188,6 +188,11 @@ work sits directly on top of the current shared base.
 The rebased change is not ready to advance `main` until conflicts are
 resolved and the relevant checks have been rerun.
 
+If conflict recovery involved restoring files from a known-good pre-rebase
+revision, inspect `jj diff --summary <good-rev>..main` and restore the entire
+logical file set before validating. Partial restores can leave the change in an
+internally inconsistent state that compiles or fails for misleading reasons.
+
 15. Advance `main` to the finished head.
 
 This is the synchronization point. Once `main` moves, the finished work
@@ -269,13 +274,10 @@ anything non-code affected the run. If there were no such issues, say
 - `just run-cpython-tests ...`
   Use for vendored CPython regrtest runs.
 - `$soac-profile-benchmark`
-  Default skill for performance benchmark requests. `just benchmark`
-  runs the default pystone workflow: profile, verify, specialized
-  apply benchmark, perf capture for the specialized apply run, and the
-  `jit_codegen_summary.txt` compile-shape summary. Use
-  `just benchmark-deep-profile` when you also want the
-  `soac-inspector`-driven counter/specialization dumps, rendered
-  CLIF/VCode, and Cranelift perf block attribution. One-off test benchmarks write
+  Default skill for performance benchmark requests. This uses the
+  artifact-producing pystone workflow: profile, verify, specialized apply
+  benchmark, textual counter/specialization dumps, and rendered CLIF/VCode.
+  Perf remains a separate follow-on step when needed. One-off test benchmarks write
   `bench/{change_id}_{commit_id}`. Finalized benchmarks for changes that are
   being merged to `main` must run after rebasing onto `main` and write
   `bench/{change_id}`. Report the specialized apply-pass median from the result
@@ -453,12 +455,6 @@ anything non-code affected the run. If there were no such issues, say
 - If I say that some approach is bad or distatestful, extract a
   generalizable design principle that captures that decision.  Confirm
   that with me, then add to AGENTS.md
-
-- Do not introduce consumer-demand or result-shape abstractions before
-  typed IR exists. Until typed IR lands, prefer code-size work that
-  simplifies the current explicit CFG and cleanup structure directly
-  over adding partially wired demand-plumbing that is likely to be
-  redesigned.
 
 - When pointing at code, include both the name of the enclosing item
   as well as the file and line number.  e.g don't just refer to a file

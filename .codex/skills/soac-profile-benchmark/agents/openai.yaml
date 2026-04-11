@@ -1,4 +1,4 @@
 interface:
   display_name: "SOAC Profile Benchmark"
   short_description: "Run the SOAC pystone profile benchmark and summarize artifacts"
-  default_prompt: "Use this skill when you need to run SOAC's artifact-producing pystone benchmark, capture profile/verify counters and perf output, and summarize the result directory."
+  default_prompt: "Use this skill when you need to run SOAC's artifact-producing pystone benchmark, capture profile/verify counters and rendered CLIF output, and summarize the result directory."

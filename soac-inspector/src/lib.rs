@@ -8,11 +8,11 @@ use pyo3::types::{PyList, PyModule};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use soac_blockpy::block_py::{BlockPyFunction, BlockPyModule, FunctionId};
-use soac_blockpy::passes::CodegenModuleShape;
+use soac_blockpy::passes::{CodegenModuleShape, infer_module_value_facts};
 use soac_jit::module_constants::ModuleCodegenConstants;
 use soac_jit::module_type::build_shared_state_for_inspection;
 use soac_jit::{
-    exc_dispatch_plan, jit_param_names_for_block,
+    exc_dispatch_plan, plan_function_locals, planned_jit_param_names_for_block,
     render_cranelift_run_bb_specialized_with_runtime_state_and_cfg,
 };
 use std::ffi::c_void;
@@ -285,6 +285,7 @@ pub fn jit_debug_plan(
     module: &BlockPyModule<CodegenModuleShape>,
     function_id: FunctionId,
 ) -> Result<String, String> {
+    let facts = infer_module_value_facts(module);
     let Some(function) = module
         .callable_defs
         .iter()
@@ -294,14 +295,17 @@ pub fn jit_debug_plan(
             "no specialized JIT plan for {module_name}.fn#{function_id}"
         ));
     };
+    let local_plan = plan_function_locals(function, &facts);
     let block_info = function
         .blocks
         .iter()
         .map(|block| {
+            let runtime_param_names =
+                planned_jit_param_names_for_block(block, local_plan.block(block.label));
             (
                 block.label.to_string(),
-                jit_param_names_for_block(block),
-                exc_dispatch_plan(function, block),
+                runtime_param_names.clone(),
+                exc_dispatch_plan(function, block, runtime_param_names.as_slice()),
             )
         })
         .collect::<Vec<_>>();

@@ -2296,6 +2296,12 @@ mod tests {
 
     #[test]
     fn perf_helper_frames_env_respects_falsey_values() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "perf_helper_frames_env_respects_falsey_values",
+        ) {
+            return;
+        }
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         let prior = std::env::var_os("SOAC_JIT_PERF_HELPER_FRAMES");
         unsafe { std::env::remove_var("SOAC_JIT_PERF_HELPER_FRAMES") };

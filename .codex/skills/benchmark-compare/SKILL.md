@@ -1,12 +1,12 @@
 ---
 name: benchmark-compare
-description: Compare two SOAC pystone benchmark directories. Use when Codex needs to create missing one-off bench/{change_id}_{commit_id} results for jj revisions, compare specialized benchmark throughput, verify specialization counters, and inspect paired perf profiles.
+description: Compare two SOAC pystone benchmark directories. Use when Codex needs to create missing one-off bench/{change_id}_{commit_id} results for jj revisions, compare specialized benchmark throughput, verify specialization counters, and inspect rendered CLIF for changed fast paths.
 ---
 
 # Benchmark Compare
 
-Use `just benchmark` to create one complete benchmark/perf artifact
-directory for a revision, then compare two such directories.
+Use `just benchmark` to create one complete benchmark artifact directory for a
+revision, then compare two such directories.
 
 ## Result Layout
 
@@ -30,17 +30,9 @@ Important files:
 - `profile_counters.txt` and `verify_counters.txt`: textual counter dumps.
 - `profile_specializations.txt` and `verify_specializations.txt`:
   specialization summaries.
-- `perf.log`: loops/sec during the perf run.
-- `perf_by_dso.txt`, `perf_by_dso_symbol.txt`, `perf_callgraph.txt`,
-  `perf_report.txt`, and `perf_speedscope.json`: perf outputs for the
-  specialized apply-mode run.
-- `perf_cranelift_blocks.tsv`: perf samples attributed to generated Cranelift
-  basic blocks using the JIT block-offset sidecar.
 - `clif/functions.tsv`, `clif/fn_<function_id>_<qualname>.clif`, and
   `clif/fn_<function_id>_<qualname>.vcode`: lowered pystone functions plus the
   rendered post-opt CLIF and VCode for each one.
-- `clif/fn_<function_id>_<qualname>.annotated.vcode`: VCode with perf sample
-  counts inserted before sampled block labels.
 
 ## Create The Current Result
 
@@ -54,7 +46,7 @@ Useful shorter run while iterating:
 
 ```bash
 BENCHMARK_SPECIALIZED_RUNS=3 \
-just benchmark 1000000 100000 10000000
+just benchmark 1000000 100000
 ```
 
 The recipe does not run the stock CPython benchmark.
@@ -80,13 +72,10 @@ that revision and create the exact directory for the current commit id.
 
 A result is complete enough for comparison when it has `benchmark.txt`,
 `counters/profile.bin`, `counters/verify.bin`, `verify_counters.txt`,
-`profile_specializations.txt`, `verify_specializations.txt`, `perf.log`, and
-`perf_callgraph.txt`. Prefer results that also have
-`perf_cranelift_blocks.tsv`, `clif/functions.tsv`, `clif/*.clif`, and
-`clif/*.vcode`; prefer `clif/*.annotated.vcode` when comparing JIT block-level
-changes. If the exact result exists but lacks these generated inspection
-artifacts, say so and re-run `just benchmark` for that side only if the missing
-detail is needed.
+`profile_specializations.txt`, and `verify_specializations.txt`. Prefer results
+that also have `clif/functions.tsv`, `clif/*.clif`, and `clif/*.vcode`. If the
+exact result exists but lacks these generated inspection artifacts, say so and
+re-run `just benchmark` for that side only if the missing detail is needed.
 
 ## Create A Missing Result For Another Rev
 
@@ -109,7 +98,7 @@ fi
 
 (
   cd "$ws"
-  just benchmark 1000000 100000 10000000 "$original_repo/bench" @-
+  just benchmark 1000000 100000 "$original_repo/bench" @-
 )
 
 jj workspace forget "$workspace_name"
@@ -134,16 +123,11 @@ Compare in this order:
    dominate benchmark throughput.
 6. Compare `verify_counters.txt` hit/fallback totals for direct calls, globals,
    fields, operators, and other expected fast paths.
-7. Compare `perf.log` loops/sec as a shorter perf-context run.
-8. Compare `perf_by_dso.txt`, `perf_by_dso_symbol.txt`, and `perf_callgraph.txt`
-   to explain where time moved.
-9. Compare `perf_cranelift_blocks.tsv` to identify the specific JIT blocks that
-   gained or lost samples.
-10. Compare the relevant `clif/fn_*_*.clif`, `clif/fn_*_*.vcode`, and
-   `clif/fn_*_*.annotated.vcode` files for functions whose perf
-   stacks moved materially.
+7. Compare the relevant `clif/fn_*_*.clif` and `clif/fn_*_*.vcode` files for
+   functions whose specialization sets or verify hits moved materially.
+8. If the benchmark delta still needs explanation, run a separate perf pass for
+   the side(s) of interest and switch to the `analyze-pystone-perf` workflow.
 
 When reporting, include the two result directories, median specialized
 throughput, relative delta, specialization-set delta, verify hit/fallback
-summary, rendered-CLIF paths inspected, and the perf hotspot movement that best
-explains the delta.
+summary, and any rendered-CLIF paths inspected.

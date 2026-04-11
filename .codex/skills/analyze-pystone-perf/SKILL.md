@@ -5,8 +5,9 @@ description: End-to-end workflow for SOAC pystone performance analysis. Use when
 
 # Analyze Pystone Perf
 
-Run the artifact-producing `$soac-profile-benchmark` flow, then connect the
-resulting perf hotspots to the specialized CLIF that produced them.
+Run the artifact-producing `$soac-profile-benchmark` flow, then collect perf as
+a separate step and connect the resulting hotspots to the specialized CLIF that
+produced them.
 
 ## Workflow
 
@@ -14,7 +15,7 @@ Run steps from the repo root. One-off benchmark, counter, perf, and rendered
 CLIF artifacts are created under `bench/{change_id}_{commit_id}/`; finalized
 benchmarks for changes being merged to `main` use `bench/{change_id}/`.
 
-1. **Generate benchmark/counter/perf artifacts**
+1. **Generate benchmark/counter artifacts**
 
 ```bash
 BENCHMARK_CONSTANT_CLOCKS=0 just benchmark
@@ -25,7 +26,18 @@ or verify pass, as the transformed benchmark headline. The recipe prints
 `benchmark result: <result-dir>`. Use that directory for the rest of the
 workflow.
 
-2. **Sanity-check that expected specializations are still reached**
+2. **Collect perf for the specialized apply run**
+
+```bash
+SOAC_WORK_DIR="<result-dir>/counters" \
+SOAC_OPT_MODE=apply \
+PERF_PERCENT_LIMIT="${PERF_PERCENT_LIMIT:-0.2}" \
+just perf-pystone-jit-warm 10000000 "<result-dir>/perf"
+cargo run -q -p soac-inspector --bin annotate_cranelift_perf -- "<result-dir>" \
+  > "<result-dir>/perf_cranelift_blocks.tsv"
+```
+
+3. **Sanity-check that expected specializations are still reached**
 
 `just benchmark` already runs a verify-mode pass and writes
 `<result-dir>/counters/verify.bin`,
@@ -44,7 +56,7 @@ Do this before trusting perf conclusions:
 - Render specialized CLIF and grep for the expected fast-path shape.
 - Investigate missing expected sites as “specialization may not be running” before ranking deeper codegen issues.
 
-3. **Read the perf artifacts**
+4. **Read the perf artifacts**
 
 For prefix `<result-dir>/perf`, inspect:
 
@@ -62,7 +74,7 @@ dictionary lookup from global helpers, generic attr access, exact-long helpers,
 metadata lookup for direct calls, PyNumber fallbacks, rich-compare fallbacks,
 and refcount / deallocation clusters.
 
-4. **Read the counters and specializations**
+5. **Read the counters and specializations**
 
 `just benchmark` writes textual dumps beside the binary counter files:
 
@@ -73,9 +85,9 @@ and refcount / deallocation clusters.
 - `<result-dir>/clif/functions.tsv`
 - `<result-dir>/clif/fn_<function_id>_<qualname>.clif`
 - `<result-dir>/clif/fn_<function_id>_<qualname>.vcode`
-- `<result-dir>/clif/fn_<function_id>_<qualname>.annotated.vcode`
+- `<result-dir>/perf_cranelift_blocks.tsv`
 
-5. **Read rendered specialized CLIF for hot functions**
+6. **Read rendered specialized CLIF for hot functions**
 
 ```bash
 rg -n 'Proc0|Proc1|Proc8|Func2' <result-dir>/clif/functions.tsv
@@ -84,12 +96,12 @@ rg -n 'soac_runtime_|dp_jit_|PyObject_|PyNumber_|call_indirect' \
 ```
 
 `just benchmark` renders one post-opt CLIF file per lowered pystone function,
-plus raw and perf-annotated VCode. Start with functions that appear as `[JIT]
+plus raw VCode. Start with functions that appear as `[JIT]
 py:d:<name>` in perf, then add callees whose helpers dominate the callgraph.
 For pystone this is usually `Proc0`, `Proc1`, `Proc8`, `Func2`, and the
 procs/functions reached from `Proc0`.
 
-6. **Correlate perf to CLIF and source**
+7. **Correlate perf to CLIF and source**
 
 Use `rg` over the rendered CLIF for the helper or import names seen in perf.
 Count helper calls when the scale matters:

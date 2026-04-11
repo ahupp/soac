@@ -10,7 +10,7 @@ use soac_blockpy::block_py::{
 use soac_blockpy::passes::{
     CodegenModuleShape, instrument_bb_module_with_block_entry_counters,
     instrument_bb_module_with_call_target_counters, instrument_bb_module_with_refcount_counters,
-    lower_codegen_module_to_typed, validate_codegen_instr_ids,
+    validate_codegen_instr_ids,
 };
 mod tests {
     use super::*;
@@ -64,18 +64,6 @@ mod tests {
             stable_cranelift_compile_cache_name("direct:pkg.mod.fn:2"),
             stable_cranelift_compile_cache_name("direct:pkg.mod.fn:3")
         );
-    }
-
-    #[test]
-    fn typed_legacy_cranelift_smoke_accepts_typed_module() {
-        let lowered =
-            soac_blockpy::lower_python_to_blockpy_for_testing("def f(a, b):\n    return a + b\n")
-                .expect("source should lower")
-                .codegen_module;
-        let typed = lower_codegen_module_to_typed(lowered);
-
-        run_typed_legacy_cranelift_smoke(&typed)
-            .expect("typed legacy module should pass JIT smoke");
     }
 
     unsafe extern "C" fn test_capsule_destructor(_capsule: *mut ffi::PyObject) {
@@ -262,7 +250,8 @@ mod tests {
             .join("target")
             .join("debug")
             .join(format!(
-                "{prefix}-{}",
+                "{prefix}-{}-{}",
+                std::process::id(),
                 NEXT_TEST_WORK_DIR_ID.fetch_add(1, Ordering::Relaxed)
             ));
         std::fs::create_dir_all(&work_dir).expect("test work dir should exist");
@@ -512,7 +501,6 @@ mod tests {
             .expect("raise function should build through typed exception expression emission");
         }
     }
-
     #[test]
     fn specialized_jit_branch_table_terms_compile_via_typed_index_expr() {
         let mut constants = TestConstantPool::default();
@@ -578,7 +566,6 @@ mod tests {
             .expect("branch-table function should build through typed index expression emission");
         }
     }
-
     #[test]
     fn specialized_jit_body_statements_compile_via_typed_ops() {
         let mut constants = TestConstantPool::default();
@@ -619,7 +606,6 @@ mod tests {
             .expect("body statement function should build through typed statement emission");
         }
     }
-
     fn direct_call_expr(function_id: FunctionId) -> InstrCodegen {
         InstrCodegen::CallDirect(CallDirect::new(
             none_expr(),
@@ -737,64 +723,6 @@ mod tests {
     }
 
     #[test]
-    fn local_env_legacy_adapter_tracks_owned_transient_entries() {
-        let mut env = LocalEnv::default();
-        let first = ir::Value::from_u32(1);
-        let second = ir::Value::from_u32(2);
-
-        env.with_legacy_parts_mut(|names, values| {
-            names.push("x".to_string());
-            values.push(first);
-        });
-        assert_eq!(env.entries.len(), 1);
-        assert_eq!(env.entries[0].name, "x");
-        assert_eq!(env.entries[0].value, first);
-        assert_eq!(env.entries[0].ref_kind, LocalRefKind::Owned);
-
-        env.with_legacy_parts_mut(|names, values| {
-            values[0] = second;
-            names.push("y".to_string());
-            values.push(first);
-        });
-        assert_eq!(
-            env.entries
-                .iter()
-                .map(|entry| (entry.name.as_str(), entry.value, entry.ref_kind))
-                .collect::<Vec<_>>(),
-            vec![
-                ("x", second, LocalRefKind::Owned),
-                ("y", first, LocalRefKind::Owned),
-            ]
-        );
-    }
-
-    #[test]
-    fn local_env_legacy_adapter_preserves_location_keys_by_name() {
-        let first = ir::Value::from_u32(1);
-        let second = ir::Value::from_u32(2);
-        let mut env = LocalEnv {
-            entries: vec![LocalEnvEntry {
-                key: LocalEnvKey::Location(LocalLocation(7)),
-                name: "x".to_string(),
-                value: first,
-                ref_kind: LocalRefKind::Immortal,
-                storage: LocalEnvStorage::StackMirror,
-            }],
-        };
-
-        env.with_legacy_parts_mut(|_names, values| {
-            values[0] = second;
-        });
-
-        assert_eq!(env.entries.len(), 1);
-        assert_eq!(env.entries[0].key, LocalEnvKey::Location(LocalLocation(7)));
-        assert_eq!(env.entries[0].name, "x");
-        assert_eq!(env.entries[0].value, second);
-        assert_eq!(env.entries[0].ref_kind, LocalRefKind::Owned);
-        assert_eq!(env.entries[0].storage, LocalEnvStorage::LocalOnly);
-    }
-
-    #[test]
     fn local_env_cleanup_values_exclude_stack_mirrors_and_immortals() {
         let owned_local = ir::Value::from_u32(1);
         let owned_mirror = ir::Value::from_u32(2);
@@ -802,25 +730,37 @@ mod tests {
         let env = LocalEnv {
             entries: vec![
                 LocalEnvEntry {
-                    key: LocalEnvKey::legacy_name("local"),
+                    location: LocalLocation(0),
                     name: "local".to_string(),
                     value: owned_local,
                     ref_kind: LocalRefKind::Owned,
                     storage: LocalEnvStorage::LocalOnly,
+                    binding_facts: local_binding_facts_for_storage(
+                        LocalEnvStorage::LocalOnly,
+                        LocalRefKind::Owned,
+                    ),
                 },
                 LocalEnvEntry {
-                    key: LocalEnvKey::Location(LocalLocation(0)),
+                    location: LocalLocation(1),
                     name: "mirror".to_string(),
                     value: owned_mirror,
                     ref_kind: LocalRefKind::Owned,
                     storage: LocalEnvStorage::StackMirror,
+                    binding_facts: local_binding_facts_for_storage(
+                        LocalEnvStorage::StackMirror,
+                        LocalRefKind::Owned,
+                    ),
                 },
                 LocalEnvEntry {
-                    key: LocalEnvKey::legacy_name("immortal"),
+                    location: LocalLocation(2),
                     name: "immortal".to_string(),
                     value: immortal_local,
                     ref_kind: LocalRefKind::Immortal,
                     storage: LocalEnvStorage::LocalOnly,
+                    binding_facts: local_binding_facts_for_storage(
+                        LocalEnvStorage::LocalOnly,
+                        LocalRefKind::Immortal,
+                    ),
                 },
             ],
         };
@@ -829,14 +769,205 @@ mod tests {
     }
 
     #[test]
+    fn local_env_semantic_cleanup_names_excluding_only_reports_unforwarded_locations() {
+        let env = LocalEnv {
+            entries: vec![
+                LocalEnvEntry {
+                    location: LocalLocation(0),
+                    name: "x".to_string(),
+                    value: ir::Value::from_u32(1),
+                    ref_kind: LocalRefKind::Owned,
+                    storage: LocalEnvStorage::LocalOnly,
+                    binding_facts: local_binding_facts_for_storage(
+                        LocalEnvStorage::LocalOnly,
+                        LocalRefKind::Owned,
+                    ),
+                },
+                LocalEnvEntry {
+                    location: LocalLocation(1),
+                    name: "y".to_string(),
+                    value: ir::Value::from_u32(2),
+                    ref_kind: LocalRefKind::Owned,
+                    storage: LocalEnvStorage::LocalOnly,
+                    binding_facts: local_binding_facts_for_storage(
+                        LocalEnvStorage::LocalOnly,
+                        LocalRefKind::Owned,
+                    ),
+                },
+                LocalEnvEntry {
+                    location: LocalLocation(2),
+                    name: "tmp".to_string(),
+                    value: ir::Value::from_u32(3),
+                    ref_kind: LocalRefKind::Borrowed,
+                    storage: LocalEnvStorage::LocalOnly,
+                    binding_facts: local_binding_facts_for_storage(
+                        LocalEnvStorage::LocalOnly,
+                        LocalRefKind::Borrowed,
+                    ),
+                },
+                LocalEnvEntry {
+                    location: LocalLocation(3),
+                    name: "immortal".to_string(),
+                    value: ir::Value::from_u32(4),
+                    ref_kind: LocalRefKind::Immortal,
+                    storage: LocalEnvStorage::LocalOnly,
+                    binding_facts: local_binding_facts_for_storage(
+                        LocalEnvStorage::LocalOnly,
+                        LocalRefKind::Immortal,
+                    ),
+                },
+            ],
+        };
+        let forwarded = HashSet::from([1usize]);
+
+        assert_eq!(
+            env.transient_semantic_cleanup_names_excluding(&forwarded),
+            vec!["x".to_string()]
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn emit_decref_unforwarded_local_env_panics_on_residual_semantic_cleanup() {
+        let compile_session = crate::session::CompileSession::new();
+        let mut jit_module =
+            new_jit_module(&compile_session).expect("test jit module should construct");
+        let ptr_ty = jit_module.target_config().pointer_type();
+
+        let mut refcount_signature = jit_module.make_signature();
+        refcount_signature.params.push(ir::AbiParam::new(ptr_ty));
+
+        let mut wrapper_signature = jit_module.make_signature();
+        wrapper_signature.params.push(ir::AbiParam::new(ptr_ty));
+
+        let wrapper_id = declare_local_fn(
+            &mut jit_module,
+            "local_env_residual_semantic_cleanup_test",
+            &wrapper_signature,
+        )
+        .expect("wrapper function should declare");
+        let decref_id = declare_local_fn(
+            &mut jit_module,
+            "local_env_residual_semantic_cleanup_test_decref",
+            &refcount_signature,
+        )
+        .expect("decref helper should declare");
+
+        let mut ctx = jit_module.make_context();
+        ctx.func.name = ir::UserFuncName::user(0, wrapper_id.as_u32());
+        ctx.func.signature = wrapper_signature;
+
+        let mut builder_ctx = FunctionBuilderContext::new();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut fb = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+            let entry = fb.create_block();
+            fb.append_block_params_for_function_params(entry);
+            fb.switch_to_block(entry);
+            fb.seal_block(entry);
+
+            let null_tstate = fb.ins().iconst(ptr_ty, 0);
+            let decref_ref = jit_module.declare_func_in_func(decref_id, &mut fb.func);
+            let env = LocalEnv {
+                entries: vec![LocalEnvEntry {
+                    location: LocalLocation(0),
+                    name: "x".to_string(),
+                    value: fb.block_params(entry)[0],
+                    ref_kind: LocalRefKind::Owned,
+                    storage: LocalEnvStorage::LocalOnly,
+                    binding_facts: local_binding_facts_for_storage(
+                        LocalEnvStorage::LocalOnly,
+                        LocalRefKind::Owned,
+                    ),
+                }],
+            };
+            emit_decref_unforwarded_local_env(&mut fb, &env, &[], null_tstate, decref_ref);
+        }));
+
+        assert!(
+            panic.is_err(),
+            "expected semantic LocalEnv cleanup without a planned release to trip the debug assertion"
+        );
+    }
+
+    #[test]
+    fn emit_decref_unforwarded_local_env_allows_forwarded_semantic_local() {
+        let compile_session = crate::session::CompileSession::new();
+        let mut jit_module =
+            new_jit_module(&compile_session).expect("test jit module should construct");
+        let ptr_ty = jit_module.target_config().pointer_type();
+
+        let mut refcount_signature = jit_module.make_signature();
+        refcount_signature.params.push(ir::AbiParam::new(ptr_ty));
+
+        let mut wrapper_signature = jit_module.make_signature();
+        wrapper_signature.params.push(ir::AbiParam::new(ptr_ty));
+
+        let wrapper_id = declare_local_fn(
+            &mut jit_module,
+            "local_env_forwarded_semantic_cleanup_test",
+            &wrapper_signature,
+        )
+        .expect("wrapper function should declare");
+        let decref_id = declare_local_fn(
+            &mut jit_module,
+            "local_env_forwarded_semantic_cleanup_test_decref",
+            &refcount_signature,
+        )
+        .expect("decref helper should declare");
+
+        let mut ctx = jit_module.make_context();
+        ctx.func.name = ir::UserFuncName::user(0, wrapper_id.as_u32());
+        ctx.func.signature = wrapper_signature;
+
+        let mut builder_ctx = FunctionBuilderContext::new();
+        {
+            let mut fb = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+            let entry = fb.create_block();
+            fb.append_block_params_for_function_params(entry);
+            fb.switch_to_block(entry);
+            fb.seal_block(entry);
+
+            let null_tstate = fb.ins().iconst(ptr_ty, 0);
+            let decref_ref = jit_module.declare_func_in_func(decref_id, &mut fb.func);
+            let env = LocalEnv {
+                entries: vec![LocalEnvEntry {
+                    location: LocalLocation(0),
+                    name: "x".to_string(),
+                    value: fb.block_params(entry)[0],
+                    ref_kind: LocalRefKind::Owned,
+                    storage: LocalEnvStorage::LocalOnly,
+                    binding_facts: local_binding_facts_for_storage(
+                        LocalEnvStorage::LocalOnly,
+                        LocalRefKind::Owned,
+                    ),
+                }],
+            };
+            emit_decref_unforwarded_local_env(
+                &mut fb,
+                &env,
+                &["x".to_string()],
+                null_tstate,
+                decref_ref,
+            );
+            fb.ins().return_(&[]);
+            fb.seal_all_blocks();
+            fb.finalize();
+        }
+    }
+
+    #[test]
     fn local_env_borrowability_uses_location_entries() {
         let env = LocalEnv {
             entries: vec![LocalEnvEntry {
-                key: LocalEnvKey::Location(LocalLocation(0)),
+                location: LocalLocation(0),
                 name: "x".to_string(),
                 value: ir::Value::from_u32(1),
                 ref_kind: LocalRefKind::Owned,
                 storage: LocalEnvStorage::LocalOnly,
+                binding_facts: local_binding_facts_for_storage(
+                    LocalEnvStorage::LocalOnly,
+                    LocalRefKind::Owned,
+                ),
             }],
         };
         let stack_slots = StackSlots {
@@ -856,11 +987,15 @@ mod tests {
     fn local_env_borrowability_uses_storage_layout_name_entries() {
         let env = LocalEnv {
             entries: vec![LocalEnvEntry {
-                key: LocalEnvKey::legacy_name("x"),
+                location: LocalLocation(9),
                 name: "x".to_string(),
                 value: ir::Value::from_u32(1),
                 ref_kind: LocalRefKind::Owned,
                 storage: LocalEnvStorage::LocalOnly,
+                binding_facts: local_binding_facts_for_storage(
+                    LocalEnvStorage::LocalOnly,
+                    LocalRefKind::Owned,
+                ),
             }],
         };
         let stack_slots = StackSlots {
@@ -882,7 +1017,10 @@ mod tests {
         ));
     }
 
-    fn local_env_store_test_state() -> (LocalEnv, String) {
+    fn local_env_store_test_state(
+        stack_slot_names: &[&str],
+        initial_storage: LocalEnvStorage,
+    ) -> (LocalEnv, String) {
         let compile_session = crate::session::CompileSession::new();
         let mut jit_module =
             new_jit_module(&compile_session).expect("test jit module should construct");
@@ -934,22 +1072,113 @@ mod tests {
             let incref_ref = jit_module.declare_func_in_func(incref_id, &mut fb.func);
             let decref_ref = jit_module.declare_func_in_func(decref_id, &mut fb.func);
             env.entries.push(LocalEnvEntry {
-                key: LocalEnvKey::Location(LocalLocation(0)),
+                location: LocalLocation(0),
                 name: "x".to_string(),
                 value: old_value,
                 ref_kind: LocalRefKind::Owned,
-                storage: LocalEnvStorage::LocalOnly,
+                storage: initial_storage,
+                binding_facts: local_binding_facts_for_storage(
+                    initial_storage,
+                    LocalRefKind::Owned,
+                ),
             });
-            let stack_slots = StackSlots {
-                names: Vec::new(),
-                slots: Vec::new(),
-            };
+            let stack_slots = StackSlots::new(
+                &mut fb,
+                &stack_slot_names
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect::<Vec<_>>(),
+            );
 
             env.store_location(
                 &mut fb,
                 LocalLocation(0),
                 "x",
                 new_value,
+                LocalRefKind::Owned,
+                true,
+                &stack_slots,
+                ptr_ty,
+                null_tstate,
+                incref_ref,
+                decref_ref,
+            );
+            fb.ins().return_(&[new_value]);
+            fb.seal_all_blocks();
+            fb.finalize();
+        }
+
+        let rendered = ctx.func.display().to_string();
+        (env, rendered)
+    }
+
+    fn local_env_first_store_test_state(
+        stack_slot_names: &[&str],
+        allow_local_only_slot_backed_store: bool,
+    ) -> (LocalEnv, String) {
+        let compile_session = crate::session::CompileSession::new();
+        let mut jit_module =
+            new_jit_module(&compile_session).expect("test jit module should construct");
+        let ptr_ty = jit_module.target_config().pointer_type();
+
+        let mut refcount_signature = jit_module.make_signature();
+        refcount_signature.params.push(ir::AbiParam::new(ptr_ty));
+
+        let mut wrapper_signature = jit_module.make_signature();
+        wrapper_signature.params.push(ir::AbiParam::new(ptr_ty));
+        wrapper_signature.returns.push(ir::AbiParam::new(ptr_ty));
+
+        let wrapper_id = declare_local_fn(
+            &mut jit_module,
+            "local_env_first_store_test",
+            &wrapper_signature,
+        )
+        .expect("wrapper function should declare");
+        let incref_id = declare_local_fn(
+            &mut jit_module,
+            "local_env_first_store_test_incref",
+            &refcount_signature,
+        )
+        .expect("incref helper should declare");
+        let decref_id = declare_local_fn(
+            &mut jit_module,
+            "local_env_first_store_test_decref",
+            &refcount_signature,
+        )
+        .expect("decref helper should declare");
+
+        let mut ctx = jit_module.make_context();
+        ctx.func.name = ir::UserFuncName::user(0, wrapper_id.as_u32());
+        ctx.func.signature = wrapper_signature;
+
+        let mut env = LocalEnv::default();
+        let mut builder_ctx = FunctionBuilderContext::new();
+        {
+            let mut fb = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+            let entry = fb.create_block();
+            fb.append_block_params_for_function_params(entry);
+            fb.switch_to_block(entry);
+            fb.seal_block(entry);
+
+            let new_value = fb.block_params(entry)[0];
+            let null_tstate = fb.ins().iconst(ptr_ty, 0);
+            let incref_ref = jit_module.declare_func_in_func(incref_id, &mut fb.func);
+            let decref_ref = jit_module.declare_func_in_func(decref_id, &mut fb.func);
+            let stack_slots = StackSlots::new(
+                &mut fb,
+                &stack_slot_names
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect::<Vec<_>>(),
+            );
+
+            env.store_location(
+                &mut fb,
+                LocalLocation(0),
+                "x",
+                new_value,
+                LocalRefKind::Owned,
+                allow_local_only_slot_backed_store,
                 &stack_slots,
                 ptr_ty,
                 null_tstate,
@@ -967,16 +1196,52 @@ mod tests {
 
     #[test]
     fn local_env_store_keeps_new_local_binding_after_rebind() {
-        let (env, rendered) = local_env_store_test_state();
+        let (env, rendered) = local_env_store_test_state(&[], LocalEnvStorage::LocalOnly);
 
         assert_eq!(env.entries.len(), 1, "{rendered}");
-        assert_eq!(env.entries[0].key, LocalEnvKey::Location(LocalLocation(0)));
+        assert_eq!(env.entries[0].location, LocalLocation(0));
         assert_eq!(env.entries[0].name, "x");
         assert_eq!(env.entries[0].ref_kind, LocalRefKind::Owned);
         assert_eq!(env.entries[0].storage, LocalEnvStorage::LocalOnly);
         assert!(
             rendered.contains("call"),
             "owned previous local should still be released after rebinding:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn local_env_store_preserves_local_only_storage_for_slot_backed_name() {
+        let (env, rendered) = local_env_store_test_state(&["x"], LocalEnvStorage::LocalOnly);
+
+        assert_eq!(env.entries.len(), 1, "{rendered}");
+        assert_eq!(env.entries[0].storage, LocalEnvStorage::LocalOnly);
+        assert!(
+            !rendered.contains("stack_store"),
+            "local-only slot-backed rebind should avoid stack-slot mirroring:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn local_env_first_store_uses_local_only_for_slot_backed_name_when_allowed() {
+        let (env, rendered) = local_env_first_store_test_state(&["x"], true);
+
+        assert_eq!(env.entries.len(), 1, "{rendered}");
+        assert_eq!(env.entries[0].storage, LocalEnvStorage::LocalOnly);
+        assert!(
+            !rendered.contains("stack_store"),
+            "first store should avoid stack-slot mirroring when local-only is allowed:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn local_env_first_store_uses_stack_mirror_for_slot_backed_name_when_required() {
+        let (env, rendered) = local_env_first_store_test_state(&["x"], false);
+
+        assert_eq!(env.entries.len(), 1, "{rendered}");
+        assert_eq!(env.entries[0].storage, LocalEnvStorage::StackMirror);
+        assert!(
+            rendered.contains("stack_store"),
+            "first store should keep stack-slot mirroring when local-only is disallowed:\n{rendered}"
         );
     }
 
@@ -1328,106 +1593,14 @@ mod tests {
         rendered
     }
 
-    fn render_test_jit_function_with_block_entry_counts(
-        function: &BlockPyFunction<CodegenModuleShape>,
-        blocks: &[ObjPtr],
-        module_constants: Vec<InstrResolved>,
-        block_entry_counts: &[(BlockLabel, u64)],
-    ) -> String {
-        let mut module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
-        module.module_constants = module_constants;
-        let function = module.callable_defs[0].clone();
-        let module_name = "counter_test";
-        let soac_work_dir = fresh_test_work_dir("test-work");
-        write_test_counter_dump(
-            soac_work_dir.join("profile.bin").as_path(),
-            &CounterDumpRecord {
-                module_name: module_name.to_string(),
-                package_name: None,
-                rows: block_entry_counts
-                    .iter()
-                    .enumerate()
-                    .map(|(index, (block_label, count))| CounterDumpRow {
-                        counter_id: u32::try_from(index)
-                            .expect("test block-entry counter count should fit in u32"),
-                        scope: "this".to_string(),
-                        kind: "block_entry".to_string(),
-                        site_kind: "block_entry".to_string(),
-                        function_id: Some(function.function_id),
-                        current_function_id: Some(function.function_id),
-                        instr_id: None,
-                        function_qualname: Some(function.names.qualname.clone()),
-                        block_label: Some(block_label.to_string()),
-                        value: *count,
-                        observed_value: None,
-                        max_overcount: None,
-                    })
-                    .collect(),
-                module_keys: Vec::new(),
-                type_keys: Vec::new(),
-                type_table: Vec::new(),
-            },
-        );
-
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
-        let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
-        unsafe {
-            std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
-            std::env::set_var("SOAC_OPT_MODE", "apply");
-        }
-        crate::initialize_test_python();
-
-        let rendered = Python::attach(|py| {
-            let shared_state =
-                crate::module_type::build_shared_state_for_testing(py, module, module_name, "")
-                    .expect("shared state should build");
-            let compile_session = crate::session::CompileSession::new();
-            let mut jit_module =
-                new_jit_module(&compile_session).expect("test jit module should construct");
-            let module_constant_ptrs = shared_state.module_constant_ptrs();
-            let counter_ptrs = shared_state.counter_ptrs();
-            let built = build_cranelift_run_bb_specialized_function(
-                &mut jit_module,
-                blocks,
-                &shared_state.lowered_module,
-                &function,
-                &shared_state.codegen_constants,
-                &shared_state.lowered_module.counter_defs,
-                &module_constant_ptrs,
-                &counter_ptrs,
-                &compile_session,
-                Some(shared_state.as_ref()),
-                None,
-                None,
-            )
-            .expect("specialized JIT build should succeed");
-            let (clif, _cfg_dot, _vcode_disasm) = render_compiled_clif_and_vcode_disasm(
-                &mut jit_module,
-                built.ctx,
-                &built.import_id_to_symbol,
-                &built.block_annotations,
-            )
-            .expect("specialized JIT CLIF render should succeed");
-            clif
-        });
-
-        unsafe {
-            match old_soac_work_dir {
-                Some(value) => std::env::set_var("SOAC_WORK_DIR", value),
-                None => std::env::remove_var("SOAC_WORK_DIR"),
-            }
-            match old_soac_opt_mode {
-                Some(value) => std::env::set_var("SOAC_OPT_MODE", value),
-                None => std::env::remove_var("SOAC_OPT_MODE"),
-            }
-        }
-
-        rendered
-    }
-
     #[test]
     fn field_index_specializations_resolve_type_key_without_module_globals() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "field_index_specializations_resolve_type_key_without_module_globals",
+        ) {
+            return;
+        }
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
         let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
@@ -1582,6 +1755,12 @@ class Point:
 
     #[test]
     fn field_index_specialized_setattr_hits_apply_mode_first_insert() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "field_index_specialized_setattr_hits_apply_mode_first_insert",
+        ) {
+            return;
+        }
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
         let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
@@ -2653,6 +2832,114 @@ def f():
         );
     }
 
+    fn assert_exception_dispatch_forwards_live_local(
+        source: &str,
+        source_block_matches: impl Fn(&CodegenBlock) -> bool,
+    ) {
+        let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(source)
+            .expect("lowering try/except local-forwarding test source should succeed")
+            .codegen_module;
+
+        let codegen_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&lowered);
+        let function = lowered
+            .callable_defs
+            .iter()
+            .find(|function| function.names.bind_name == "f")
+            .expect("missing lowered function f")
+            .clone();
+        let source_label = function
+            .blocks
+            .iter()
+            .find(|block| source_block_matches(block))
+            .map(|block| block.label)
+            .expect("expected matching exception edge source block");
+        let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
+        unsafe {
+            let compile_session = crate::session::CompileSession::new();
+            let mut jit_module =
+                new_jit_module(&compile_session).expect("test jit module should construct");
+            let module_constant_ptrs = placeholder_module_constant_ptrs(codegen_constants.len());
+            let counter_ptrs = placeholder_counter_ptrs(0);
+            let built = build_cranelift_run_bb_specialized_function(
+                &mut jit_module,
+                &blocks,
+                &lowered,
+                &function,
+                &codegen_constants,
+                &[],
+                &module_constant_ptrs,
+                &counter_ptrs,
+                &compile_session,
+                None,
+                None,
+                None,
+            )
+            .expect("specialized JIT build should succeed");
+
+            let expected_name = format!("exc_dispatch::{source_label}");
+            let (dispatch_block_name, dispatch_annotation) = built
+                .block_annotations
+                .iter()
+                .find(|(_, annotation)| annotation.semantic_name == expected_name)
+                .expect("missing exception dispatch block annotation");
+            assert_eq!(
+                dispatch_annotation.param_names,
+                vec!["x".to_string()],
+                "exception dispatch annotation should carry forwarded local names"
+            );
+
+            let dispatch_block = built
+                .ctx
+                .func
+                .layout
+                .blocks()
+                .find(|block| block.to_string() == *dispatch_block_name)
+                .expect("annotated exception dispatch block should exist in CLIF");
+            assert_eq!(
+                built.ctx.func.dfg.block_params(dispatch_block).len(),
+                1,
+                "exception dispatch block should take the forwarded local as a block param"
+            );
+        }
+    }
+
+    #[test]
+    fn render_specialized_jit_exception_dispatch_forwards_live_locals_from_call_failure() {
+        assert_exception_dispatch_forwards_live_local(
+            r#"
+def f(x):
+    try:
+        int("bad")
+    except ValueError:
+        return x
+    return 0
+"#,
+            |block| {
+                block.exc_edge.is_some()
+                    && block
+                        .body
+                        .iter()
+                        .any(|instr| matches!(instr, InstrCodegen::Call(_)))
+            },
+        );
+    }
+
+    #[test]
+    fn render_specialized_jit_exception_dispatch_forwards_live_locals_from_explicit_raise() {
+        assert_exception_dispatch_forwards_live_local(
+            r#"
+def f(x):
+    try:
+        raise ValueError("boom")
+    except ValueError:
+        return x
+    return 0
+"#,
+            |block| block.exc_edge.is_some() && matches!(block.term, BlockTerm::Raise(_)),
+        );
+    }
+
     #[test]
     fn render_specialized_jit_operator_calls_use_python_capi() {
         let blocks = [1usize as ObjPtr];
@@ -2707,6 +2994,12 @@ def f():
 
     #[test]
     fn render_specialized_jit_exact_int_binop_uses_operator_fast_path() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "render_specialized_jit_exact_int_binop_uses_operator_fast_path",
+        ) {
+            return;
+        }
         let blocks = [1usize as ObjPtr];
         let mut constants = TestConstantPool::default();
         let mut function = test_function();
@@ -2751,6 +3044,12 @@ def f():
 
     #[test]
     fn render_specialized_jit_exact_int_compare_uses_operator_fast_path() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "render_specialized_jit_exact_int_compare_uses_operator_fast_path",
+        ) {
+            return;
+        }
         let blocks = [1usize as ObjPtr];
         let mut constants = TestConstantPool::default();
         let mut function = test_function();
@@ -2795,6 +3094,12 @@ def f():
 
     #[test]
     fn render_specialized_jit_exact_int_unary_uses_operator_fast_path() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "render_specialized_jit_exact_int_unary_uses_operator_fast_path",
+        ) {
+            return;
+        }
         let blocks = [1usize as ObjPtr];
         let mut constants = TestConstantPool::default();
         let mut function = test_function();
@@ -2947,6 +3252,68 @@ def f():
             rendered.matches("explicit_slot 8").count() >= 2,
             "slot-backed JIT plans should allocate explicit stack slots:\n{rendered}"
         );
+    }
+
+    #[test]
+    fn render_specialized_jit_ignores_field_index_specializations_without_runtime_state() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "render_specialized_jit_ignores_field_index_specializations_without_runtime_state",
+        ) {
+            return;
+        }
+        let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
+        let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
+        let soac_work_dir = fresh_test_work_dir("test-work");
+        unsafe {
+            std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
+            std::env::set_var("SOAC_OPT_MODE", "verify");
+        }
+
+        write_test_counter_dump(
+            soac_work_dir.join("profile.bin").as_path(),
+            &CounterDumpRecord {
+                module_name: "counter_test".to_string(),
+                package_name: None,
+                rows: Vec::new(),
+                module_keys: Vec::new(),
+                type_keys: vec![CounterDumpTypeKeyLayout {
+                    owner_type_id: 7,
+                    key: "x".to_string(),
+                    index: 0,
+                }],
+                type_table: vec![CounterDumpTypeTableEntry {
+                    type_id: 7,
+                    key: CounterDumpTypeKey {
+                        module_name: "field_type_test".to_string(),
+                        qualname: "Point".to_string(),
+                    },
+                }],
+            },
+        );
+
+        let blocks = [1usize as ObjPtr];
+        let mut constants = TestConstantPool::default();
+        let function =
+            with_single_test_block(test_function(), vec![], ret_term(constants.int_expr(7)));
+        let rendered = render_test_jit_function_with_module_constants(
+            &function,
+            &blocks,
+            constants.module_constants,
+        );
+        assert!(
+            rendered.contains("function"),
+            "rendering should succeed without runtime state even when field specializations are configured:\n{rendered}"
+        );
+
+        match old_soac_work_dir {
+            Some(value) => unsafe { std::env::set_var("SOAC_WORK_DIR", value) },
+            None => unsafe { std::env::remove_var("SOAC_WORK_DIR") },
+        }
+        match old_soac_opt_mode {
+            Some(value) => unsafe { std::env::set_var("SOAC_OPT_MODE", value) },
+            None => unsafe { std::env::remove_var("SOAC_OPT_MODE") },
+        }
     }
 
     #[test]
@@ -3244,6 +3611,25 @@ def f():
     }
 
     #[test]
+    fn render_specialized_jit_local_store_of_deleted_sentinel_behaves_like_delete() {
+        let blocks = [1usize as ObjPtr];
+        let mut function = with_single_test_block(
+            test_function(),
+            vec![assign_stmt(
+                test_name("x"),
+                name_expr(test_runtime_name("DELETED")),
+            )],
+            ret_term(name_expr(test_name("x"))),
+        );
+        set_stack_slots(&mut function, &["x"]);
+        let rendered = render_test_jit_function(&function, &blocks);
+        assert!(
+            rendered.contains("call dp_jit_raise_deleted_name_error"),
+            "store of the deleted sentinel should clear the local binding, not keep a local-only DELETED object:\n{rendered}"
+        );
+    }
+
+    #[test]
     fn render_specialized_jit_constant_runtime_helper_calls_still_specialize() {
         let blocks = [1usize as ObjPtr];
         let function = with_single_test_block(
@@ -3266,59 +3652,6 @@ def f():
                 && !rendered.contains("call dp_jit_py_call_object")
                 && !rendered.contains("call dp_jit_py_call_with_kw"),
             "constant-backed runtime helpers should still specialize instead of reloading or generic-calling:\n{rendered}"
-        );
-    }
-
-    #[test]
-    fn render_specialized_jit_marks_rare_profiled_blocks_cold() {
-        let blocks = [1usize as ObjPtr, 2usize as ObjPtr, 3usize as ObjPtr];
-        let mut function = test_function();
-        let entry_label = function.name_gen.next_block_name();
-        let hot_label = function.name_gen.next_block_name();
-        let cold_label = function.name_gen.next_block_name();
-        function.blocks = vec![
-            CodegenBlock {
-                label: entry_label,
-                body: vec![],
-                term: BlockTerm::IfTerm(soac_blockpy::block_py::TermIf {
-                    test: none_expr(),
-                    then_label: hot_label,
-                    else_label: cold_label,
-                }),
-                params: vec![],
-                exc_edge: None,
-            },
-            CodegenBlock {
-                label: hot_label,
-                body: vec![],
-                term: ret_term(none_expr()),
-                params: vec![],
-                exc_edge: None,
-            },
-            CodegenBlock {
-                label: cold_label,
-                body: vec![],
-                term: ret_term(none_expr()),
-                params: vec![],
-                exc_edge: None,
-            },
-        ];
-        assign_missing_test_instr_ids(&mut function);
-
-        let rendered = render_test_jit_function_with_block_entry_counts(
-            &function,
-            &blocks,
-            Vec::new(),
-            &[(entry_label, 10_000), (hot_label, 9_500), (cold_label, 75)],
-        );
-
-        assert!(
-            rendered.contains(&format!(" cold: ; block {cold_label}(")),
-            "rarely visited block should be marked cold in rendered CLIF:\n{rendered}"
-        );
-        assert!(
-            !rendered.contains(&format!(" cold: ; block {hot_label}(")),
-            "frequently visited block should stay hot in rendered CLIF:\n{rendered}"
         );
     }
 
@@ -3357,6 +3690,12 @@ def f():
 
     #[test]
     fn specialized_jit_type_constructors_use_constructor_fast_path() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "specialized_jit_type_constructors_use_constructor_fast_path",
+        ) {
+            return;
+        }
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
         let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");

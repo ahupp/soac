@@ -128,6 +128,36 @@ pub(crate) fn initialize_test_python() {
     });
 }
 
+#[cfg(test)]
+pub(crate) fn run_test_in_isolated_process_if_needed(module_path: &str, test_name: &str) -> bool {
+    let marker_key = format!("SOAC_TEST_ISOLATED_{test_name}");
+    if std::env::var_os(&marker_key).is_some() {
+        return false;
+    }
+
+    let test_module = module_path
+        .split_once("::")
+        .map(|(_, rest)| rest)
+        .unwrap_or(module_path);
+    let full_test_name = format!("{test_module}::{test_name}");
+    let current_exe =
+        std::env::current_exe().expect("isolated test runner should locate current test binary");
+    let status = std::process::Command::new(current_exe)
+        .arg(&full_test_name)
+        .arg("--exact")
+        .arg("--test-threads=1")
+        .env(&marker_key, "1")
+        .status()
+        .unwrap_or_else(|err| {
+            panic!("isolated test runner should spawn child for {full_test_name}: {err}")
+        });
+    assert!(
+        status.success(),
+        "isolated test process failed for {full_test_name} with status {status}"
+    );
+    true
+}
+
 unsafe extern "C" {
     fn PyFunction_SetVectorcall(
         func: *mut ffi::PyFunctionObject,
@@ -1294,7 +1324,6 @@ unsafe fn ensure_clif_vectorcall_compiled(
                                 compile_start.elapsed(),
                                 "ok",
                                 None,
-                                result.metrics,
                             );
                         }
                         result.handle
@@ -1306,7 +1335,6 @@ unsafe fn ensure_clif_vectorcall_compiled(
                             compile_start.elapsed(),
                             "error",
                             Some(&err),
-                            None,
                         );
                         if let Ok(c_msg) = CString::new(err) {
                             ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());

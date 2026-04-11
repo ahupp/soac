@@ -1,12 +1,12 @@
 ---
 name: soac-profile-benchmark
-description: Run SOAC's pystone profile benchmark and summarize its result directory. Use when Codex needs to benchmark transformed/JIT pystone, capture profile/verify/apply results, run perf for the specialized apply run, or collect optional deep-profile artifacts.
+description: Run SOAC's artifact-producing pystone profile benchmark and summarize its result directory. Use when Codex needs to benchmark transformed/JIT pystone, capture profile/verify/specialized counters, render specialized CLIF, or summarize benchmark artifacts.
 ---
 
 # SOAC Profile Benchmark
 
-Use the benchmark `Justfile` recipes from the repo root. They write one result
-directory under the ignored shared `bench/` tree.
+Use the artifact-producing `Justfile` benchmark recipe from the repo root.
+It writes one result directory under the ignored shared `bench/` tree.
 
 ## Run
 
@@ -24,7 +24,7 @@ When a change is finalized for merge to `main`, rebase the finished change onto
 that will be merged:
 
 ```bash
-just benchmark 1000000 100000 10000000 bench <jj-rev> finalized
+just benchmark 1000000 100000 bench <jj-rev> finalized
 ```
 
 This writes `bench/{change_id}`. If the finished change is still the current
@@ -37,28 +37,14 @@ The first positional argument is the specialized apply-pass loop count:
 just benchmark 1000000
 ```
 
-The benchmark recipe uses 10M loops for the perf-recorded specialized apply
-run by default, so perf reports have enough samples for hotspot attribution.
-
 `just benchmark` runs:
 
 - transformed profile pass
 - transformed verify pass
 - transformed specialized apply pass
-- perf capture of the specialized apply run
-- compile-shape summary from `scripts/summarize_module_load_log.py`
-
-When the user explicitly wants the heavier inspector output, run:
-
-```bash
-just benchmark-deep-profile
-```
-
-That adds:
-
 - counter / specialization text dumps
 - rendered post-opt CLIF for every lowered pystone function
-- Cranelift VCode and perf sample attribution for every JIT basic block
+- rendered Cranelift VCode for every lowered pystone function
 
 ## Summarize
 
@@ -66,33 +52,27 @@ That adds:
 directory, especially:
 
 - `benchmark.txt`
-- `jit_codegen_summary.txt`
-- `perf.log`
-- `perf_by_dso_symbol.txt`
-- `perf_callgraph.txt`
-
-For a deep-profile benchmark request, also read:
-
 - `profile_counters.txt`
 - `verify_counters.txt`
 - `profile_specializations.txt`
 - `verify_specializations.txt`
-- `perf_cranelift_blocks.tsv`
 - `clif/functions.tsv`
 - `clif/fn_<function_id>_<qualname>.clif`
 - `clif/fn_<function_id>_<qualname>.vcode`
-- `clif/fn_<function_id>_<qualname>.annotated.vcode`
 
 For a default benchmark request, report:
 
 - result directory
 - specialized apply-pass loops per second from `benchmark.txt`
 - verify-mode loops per second
-- perf-run loops per second from `perf.log`
 - any specialization-summary or verify-counter surprises
 
 If helpful, you may also mention the profiling-pass throughput, but do not use it
 as the headline result.
+
+If the user asks for perf data after the benchmark run, collect it as a separate
+follow-on step with the dedicated perf recipes or the `analyze-pystone-perf`
+skill.
 
 If the user asks for a warmed unspecialized comparison, use `just benchmark-warm`
 and label it clearly as the warm baseline rather than the artifact-producing

@@ -218,6 +218,75 @@ if v == NULL:
     return NULL
 ```
 
+## Removing Stack Mirrors
+
+It should be possible to remove stack-mirrored storage for normal Python locals,
+but that is an architectural follow-on from SSA locals rather than a local
+cleanup. The current split is:
+
+- `LocalEnv` is the semantic local environment used by JIT codegen.
+- `StackSlots` is also used as a second storage location for many Python locals.
+- non-local runtime bookkeeping such as handled-exception state should continue
+  using backend stack slots.
+
+The stack-mirror removal target is therefore:
+
+- keep stack slots for backend/runtime bookkeeping
+- remove stack slots as a second home for ordinary Python locals
+
+The work required is:
+
+1. Make `LocalEnv` the only storage for ordinary Python locals.
+   `load_location`, `load_name`, `store_location`, and `delete_location`
+   should stop depending on mirrored stack slots for local semantics.
+
+2. Carry all live-in locals through explicit block params.
+   JIT planning must stop relying on stack slots as the fallback transport across
+   CFG edges. Every live local that may be read in a successor block should be
+   represented in the successor environment.
+
+3. Introduce per-block-param transport facts.
+   This is the missing piece described in `todo/block_param_facts.md`.
+   The consumer needs to know whether an incoming block param is:
+   - definitely bound
+   - maybe unbound
+   - already checked for deleted/unbound/null
+   - owned, borrowed, or immortal
+   - forwarded from a local binding versus synthesized from another source
+
+4. Remove edge-time stack-slot repair.
+   Exception dispatch and ordinary block jumps currently still repair or
+   materialize local state through stack slots on some paths. That must become
+   explicit block-param transport instead.
+
+Current finding: internal temp locals such as `_dp_tmp_*` still reappear as
+semantic stack-slot loads in loop bodies even when the JIT planning layer shows
+runtime block-param transport. First-store local-only for slot-backed locals is
+still unsafe until those residual block-entry/edge paths stop reading the
+semantic stack slots as the source of truth.
+
+5. Move cleanup fully onto ownership/refcount plans.
+   Generic stack-slot-wide cleanup should not be the source of truth for normal
+   local lifetime. Planned ownership actions should drive decref behavior.
+
+6. Keep exception/runtime scratch state separate.
+   Slots like handled-exception tracking are still fine as backend state; they
+   are not part of the "remove local stack mirrors" goal.
+
+The practical migration order should be:
+
+1. Add `BlockParamFacts`.
+2. Make live-in locals explicit in block-param planning.
+3. Teach local loads to consume block-param facts instead of inferring semantics
+   from `StackMirror` versus `LocalOnly`.
+4. Remove stack-slot fallbacks and edge slot-writes for normal locals.
+5. Delete local stack mirrors once tests and benchmarks hold.
+
+The recent `_dp_iter_*` bug is the concrete proof that this work is necessary:
+the JIT lost loop-carried local state because some locals were still expected to
+be recoverable from stack slots after earlier stores had left them only in the
+semantic local environment.
+
 Add an ownership verifier before broad rewrites. It should check that every
 owned value is released or transferred exactly once on every normal and
 exceptional path.
@@ -288,14 +357,12 @@ Started:
   exposes expression fact lookup through `JitEmitCtx`. Generated code does not
   use the facts yet.
 - A first `LocalEnv` wrapper exists at the JIT per-block emission boundary.
-  It now owns `LocalEnvEntry { name, value, ref_kind }` internally, while
-  exposing a narrow legacy adapter to the older expression emitter. This keeps
-  generated code unchanged but gives the refcount/ownership work a single
-  transient-local value space to grow into.
-- `LocalEnv` now has a typed `LocalLocation` key for semantic Python locals
-  alongside legacy scratch-name entries. Straight-line block-body local
-  load/store/delete emission can use location-aware `LocalEnv` operations while
-  complex expression lowering still passes through the temporary legacy adapter.
+  It now owns typed `LocalEnvEntry { location, name, value, ref_kind, storage }`
+  state directly, and the older pre-`LocalEnv` expression emitter has been
+  removed. JIT local codegen now has one transient-local value space.
+- `LocalEnv` now tracks semantic Python locals by typed `LocalLocation`
+  throughout load/store/delete lowering instead of carrying a parallel
+  scratch-name representation.
 - Runtime block params now enter `LocalEnv` as owned `LocalLocation` bindings at
   block entry. They are still mirrored into stack slots until failure cleanup
   can consume `LocalEnv` directly.
@@ -306,13 +373,9 @@ Started:
   entries after cloning into the stack slot. Forwarding borrowed locals to a
   successor now emits the required INCREF, so stack-slot cleanup owns the
   mirrored reference and `LocalEnv` does not leak an extra block-param owner.
-- The temporary legacy `LocalEnv` adapter preserves stack-mirror storage only
-  when the value itself is unchanged. If legacy expression emission replaces a
-  value, the new entry becomes local-only ownership state.
-- JIT terminal lowering recomputes legacy-vector ref kinds from the current
-  LocalEnv values after terminal expression emission. Successor block-param
-  forwarding and terminal cleanup no longer rely on a stale ref-kind snapshot
-  taken at block entry.
+- JIT terminal lowering now consults the current `LocalEnv` entries after
+  terminal expression emission. Successor block-param forwarding and terminal
+  cleanup no longer rely on a stale ref-kind snapshot taken at block entry.
 - A first `FunctionLocalPlan` exists in JIT planning. It records per-block entry
   bindings from the storage layout, annotates them with available `EnvFacts`,
   and classifies known immortal locals without changing generated code.
