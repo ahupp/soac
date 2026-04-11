@@ -16,6 +16,14 @@ MODULE_LOAD_PHASE_EVENT = "soac.module_load.phase"
 JIT_CODEGEN_EVENT = "soac.jit_codegen"
 JIT_CODEGEN_TIMING = "jit_codegen_total"
 MODULE_LOAD_TIMING = "module_load_total"
+JIT_CODEGEN_COUNTERS = (
+    "function_block_count",
+    "jit_clif_block_count",
+    "jit_clif_inst_count",
+    "jit_machine_code_size_bytes",
+    "jit_machine_code_block_count",
+    "jit_machine_code_edge_count",
+)
 
 
 @dataclass(frozen=True)
@@ -24,6 +32,15 @@ class TimingStats:
     cumulative_ms: float
     median_ms: float
     max_ms: float
+    max_owner: str
+
+
+@dataclass(frozen=True)
+class CounterStats:
+    count: int
+    total: int
+    median: float
+    max: int
     max_owner: str
 
 
@@ -46,11 +63,12 @@ class LogSummary:
     jit_status_counts: Counter[str]
     cumulative_jit_codegen_ms: float
     max_jit_codegen: JitMax | None
+    jit_counter_stats: dict[str, CounterStats]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Summarize SOAC module-load and JIT-codegen timing JSONL."
+        description="Summarize SOAC module-load and JIT-codegen JSONL, including code-size counters."
     )
     parser.add_argument(
         "log",
@@ -137,6 +155,10 @@ def status(entry: dict[str, Any]) -> str:
     return raw_status if isinstance(raw_status, str) and raw_status else "<missing>"
 
 
+def include_in_jit_counter_summary(module: str) -> bool:
+    return module != "soac" and not module.startswith("soac.")
+
+
 def timing_stats(
     timing_values: dict[str, list[tuple[float, str]]],
 ) -> dict[str, TimingStats]:
@@ -149,6 +171,23 @@ def timing_stats(
             cumulative_ms=sum(values),
             median_ms=statistics.median(values),
             max_ms=max_value,
+            max_owner=max_owner,
+        )
+    return stats
+
+
+def jit_counter_stats(
+    counter_values: dict[str, list[tuple[int, str]]],
+) -> dict[str, CounterStats]:
+    stats: dict[str, CounterStats] = {}
+    for counter_name, samples in counter_values.items():
+        values = [value for value, _owner in samples]
+        max_value, max_owner = max(samples, key=lambda sample: sample[0])
+        stats[counter_name] = CounterStats(
+            count=len(values),
+            total=sum(values),
+            median=float(statistics.median(values)),
+            max=max_value,
             max_owner=max_owner,
         )
     return stats
@@ -176,14 +215,23 @@ def summarize_entries(path: Path, entries: list[dict[str, Any]]) -> LogSummary:
 
     cumulative_jit_codegen_ms = 0.0
     max_jit_codegen: JitMax | None = None
+    jit_counter_values: dict[str, list[tuple[int, str]]] = defaultdict(list)
     for entry in jit_events:
         elapsed = numeric_timings(entry).get(JIT_CODEGEN_TIMING)
-        if elapsed is None:
-            continue
-        cumulative_jit_codegen_ms += elapsed
         module, qualname, entry_kind = function_name(entry)
-        if max_jit_codegen is None or elapsed > max_jit_codegen.elapsed_ms:
-            max_jit_codegen = JitMax(elapsed, module, qualname, entry_kind)
+        owner = f"{module}.{qualname} ({entry_kind})"
+        if elapsed is not None:
+            cumulative_jit_codegen_ms += elapsed
+            if max_jit_codegen is None or elapsed > max_jit_codegen.elapsed_ms:
+                max_jit_codegen = JitMax(elapsed, module, qualname, entry_kind)
+        if status(entry) != "ok":
+            continue
+        if not include_in_jit_counter_summary(module):
+            continue
+        for counter_name in JIT_CODEGEN_COUNTERS:
+            value = entry.get(counter_name)
+            if isinstance(value, int | float):
+                jit_counter_values[counter_name].append((int(value), owner))
 
     return LogSummary(
         path=path,
@@ -195,6 +243,7 @@ def summarize_entries(path: Path, entries: list[dict[str, Any]]) -> LogSummary:
         jit_status_counts=Counter(status(entry) for entry in jit_events),
         cumulative_jit_codegen_ms=cumulative_jit_codegen_ms,
         max_jit_codegen=max_jit_codegen,
+        jit_counter_stats=jit_counter_stats(jit_counter_values),
     )
 
 
@@ -243,6 +292,17 @@ def print_summary(summary: LogSummary) -> None:
             f"{max_jit.module_name}.{max_jit.qualname} "
             f"({max_jit.entry_kind})"
         )
+    if summary.jit_counter_stats:
+        print()
+        print("jit-codegen counters (excluding soac.* modules):")
+        print(f"{'counter':32} {'n':>5} {'total':>12} {'median':>12} {'max':>12} max_function")
+        for counter_name in sorted(summary.jit_counter_stats):
+            stats = summary.jit_counter_stats[counter_name]
+            print(
+                f"{counter_name:32} {stats.count:5d} "
+                f"{stats.total:12d} {stats.median:12.1f} "
+                f"{stats.max:12d} {stats.max_owner}"
+            )
 
 
 def main() -> None:

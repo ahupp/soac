@@ -227,6 +227,26 @@ Notes:
   loads lowered to `RuntimeName` constants.
 ## Perf And Benchmarking
 
+The default pystone benchmark is:
+
+```bash
+just benchmark
+```
+
+That records the profile, verify, and specialized apply passes, runs the
+specialized perf capture, and writes `jit_codegen_summary.txt` without building
+`soac-inspector` or rendering CLIF/VCode artifacts.
+
+Use the deeper artifact pass only when you need the inspector outputs:
+
+```bash
+just benchmark-deep-profile
+```
+
+That layers the `soac-inspector`-driven counter and specialization dumps,
+rendered CLIF/VCode/CFG output, and `perf_cranelift_blocks.tsv` onto the
+benchmark result directory.
+
 - `SOAC_JIT_PERF_HELPER_FRAMES=1`
   In `fn should_preserve_perf_helper_frames`, at
   [soac-jit/src/jit/specialized_helpers.rs:1700](/home/adam/project/soac-profile/soac-jit/src/jit/specialized_helpers.rs#L1700),

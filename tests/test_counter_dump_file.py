@@ -169,8 +169,20 @@ def read():
     assert jit_row["status"] == "ok"
     assert jit_row["error"] == ""
     assert jit_row["function_entry_kind"] == "direct_function_body"
-    assert jit_row["jit_codegen_total_us"] >= 0
-    assert isinstance(jit_row["jit_codegen_total_us"], int)
+    for name in [
+        "jit_codegen_total_us",
+        "jit_clif_block_count",
+        "jit_clif_inst_count",
+        "jit_machine_code_size_bytes",
+        "jit_machine_code_block_count",
+        "jit_machine_code_edge_count",
+    ]:
+        assert jit_row[name] >= 0
+        assert isinstance(jit_row[name], int)
+    assert jit_row["jit_clif_block_count"] > 0
+    assert jit_row["jit_clif_inst_count"] > 0
+    assert jit_row["jit_machine_code_size_bytes"] > 0
+    assert jit_row["jit_machine_code_block_count"] > 0
 
 
 def test_soac_work_dir_is_default_event_log_dir(tmp_path):

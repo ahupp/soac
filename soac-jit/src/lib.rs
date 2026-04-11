@@ -1294,6 +1294,7 @@ unsafe fn ensure_clif_vectorcall_compiled(
                                 compile_start.elapsed(),
                                 "ok",
                                 None,
+                                result.metrics,
                             );
                         }
                         result.handle
@@ -1305,6 +1306,7 @@ unsafe fn ensure_clif_vectorcall_compiled(
                             compile_start.elapsed(),
                             "error",
                             Some(&err),
+                            None,
                         );
                         if let Ok(c_msg) = CString::new(err) {
                             ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());

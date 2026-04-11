@@ -1,12 +1,12 @@
 ---
 name: soac-profile-benchmark
-description: Run SOAC's artifact-producing pystone profile benchmark and summarize its result directory. Use when Codex needs to benchmark transformed/JIT pystone, capture profile/verify/specialized counters, run perf for the specialized apply run, or summarize benchmark artifacts.
+description: Run SOAC's pystone profile benchmark and summarize its result directory. Use when Codex needs to benchmark transformed/JIT pystone, capture profile/verify/apply results, run perf for the specialized apply run, or collect optional deep-profile artifacts.
 ---
 
 # SOAC Profile Benchmark
 
-Use the artifact-producing `Justfile` benchmark recipe from the repo root.
-It writes one result directory under the ignored shared `bench/` tree.
+Use the benchmark `Justfile` recipes from the repo root. They write one result
+directory under the ignored shared `bench/` tree.
 
 ## Run
 
@@ -46,6 +46,16 @@ run by default, so perf reports have enough samples for hotspot attribution.
 - transformed verify pass
 - transformed specialized apply pass
 - perf capture of the specialized apply run
+- compile-shape summary from `scripts/summarize_module_load_log.py`
+
+When the user explicitly wants the heavier inspector output, run:
+
+```bash
+just benchmark-deep-profile
+```
+
+That adds:
+
 - counter / specialization text dumps
 - rendered post-opt CLIF for every lowered pystone function
 - Cranelift VCode and perf sample attribution for every JIT basic block
@@ -56,13 +66,17 @@ run by default, so perf reports have enough samples for hotspot attribution.
 directory, especially:
 
 - `benchmark.txt`
+- `jit_codegen_summary.txt`
+- `perf.log`
+- `perf_by_dso_symbol.txt`
+- `perf_callgraph.txt`
+
+For a deep-profile benchmark request, also read:
+
 - `profile_counters.txt`
 - `verify_counters.txt`
 - `profile_specializations.txt`
 - `verify_specializations.txt`
-- `perf.log`
-- `perf_by_dso_symbol.txt`
-- `perf_callgraph.txt`
 - `perf_cranelift_blocks.tsv`
 - `clif/functions.tsv`
 - `clif/fn_<function_id>_<qualname>.clif`

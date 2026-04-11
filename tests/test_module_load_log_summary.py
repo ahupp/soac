@@ -85,6 +85,26 @@ def test_summarize_log_reports_load_phase_and_jit_codegen_max(tmp_path, capsys):
                 "function_qualname": "small",
                 "function_entry_kind": "vectorcall_function_body",
                 "jit_codegen_total_us": 2_000,
+                "function_block_count": 3,
+                "jit_clif_block_count": 5,
+                "jit_clif_inst_count": 40,
+                "jit_machine_code_size_bytes": 128,
+                "jit_machine_code_block_count": 4,
+                "jit_machine_code_edge_count": 3,
+            },
+            {
+                "event": "soac.jit_codegen",
+                "status": "ok",
+                "module_name": "soac.runtime",
+                "function_qualname": "_dp_module_init",
+                "function_entry_kind": "direct_function_body",
+                "jit_codegen_total_us": 10_000,
+                "function_block_count": 99,
+                "jit_clif_block_count": 999,
+                "jit_clif_inst_count": 9_999,
+                "jit_machine_code_size_bytes": 99_999,
+                "jit_machine_code_block_count": 888,
+                "jit_machine_code_edge_count": 777,
             },
             {
                 "event": "soac.jit_codegen",
@@ -93,6 +113,12 @@ def test_summarize_log_reports_load_phase_and_jit_codegen_max(tmp_path, capsys):
                 "function_qualname": "expensive",
                 "function_entry_kind": "direct_function_body",
                 "jit_codegen_total_us": 7_000,
+                "function_block_count": 9,
+                "jit_clif_block_count": 11,
+                "jit_clif_inst_count": 90,
+                "jit_machine_code_size_bytes": 456,
+                "jit_machine_code_block_count": 8,
+                "jit_machine_code_edge_count": 10,
             },
         ],
     )
@@ -106,11 +132,18 @@ def test_summarize_log_reports_load_phase_and_jit_codegen_max(tmp_path, capsys):
     assert summary.module_timing_stats["blockpy.name_binding"].max_ms == 8.0
     assert summary.module_timing_stats["blockpy.name_binding"].cumulative_ms == 12.0
     assert summary.module_timing_stats["blockpy.name_binding"].max_owner == "slow"
-    assert summary.cumulative_jit_codegen_ms == 9.0
-    assert summary.max_jit_codegen.qualname == "expensive"
+    assert summary.cumulative_jit_codegen_ms == 19.0
+    assert summary.max_jit_codegen.qualname == "_dp_module_init"
+    assert summary.jit_counter_stats["jit_machine_code_size_bytes"].total == 584
+    assert summary.jit_counter_stats["jit_machine_code_size_bytes"].max == 456
+    assert summary.jit_counter_stats["jit_machine_code_size_bytes"].max_owner == "slow.expensive (direct_function_body)"
+    assert summary.jit_counter_stats["jit_machine_code_block_count"].total == 12
+    assert summary.jit_counter_stats["function_block_count"].total == 12
 
     summary_script.print_summary(summary)
     out = capsys.readouterr().out
     assert "cumulative module_load_total:" in out
     assert "blockpy.name_binding" in out
     assert "slow.expensive" in out
+    assert "jit-codegen counters (excluding soac.* modules):" in out
+    assert "jit_machine_code_size_bytes" in out

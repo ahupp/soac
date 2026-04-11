@@ -239,6 +239,7 @@ impl SharedModuleState {
                         compile_start.elapsed(),
                         "ok",
                         None,
+                        result.metrics,
                     );
                 }
                 Ok(Some(result.handle))
@@ -250,6 +251,7 @@ impl SharedModuleState {
                     compile_start.elapsed(),
                     "error",
                     Some(&err),
+                    None,
                 );
                 return Err(format!(
                     "{err} [direct_target={} id={}]",
@@ -259,15 +261,16 @@ impl SharedModuleState {
         }
     }
 
-    pub fn append_jit_codegen_log(
+    pub(crate) fn append_jit_codegen_log(
         &self,
         function: &BlockPyFunction<CodegenModuleShape>,
         entry_kind: &str,
         elapsed: Duration,
         status: &str,
         error: Option<&str>,
+        metrics: Option<crate::jit::JitCodegenMetrics>,
     ) {
-        append_jit_codegen_log(self, function, entry_kind, elapsed, status, error);
+        append_jit_codegen_log(self, function, entry_kind, elapsed, status, error, metrics);
     }
 
     pub fn append_specialization_runtime_log(&self) {
@@ -298,7 +301,9 @@ impl SharedModuleState {
                     function_id
                         .map(|function_id| function_id.to_string())
                         .unwrap_or_default(),
-                    instr_id.map(|instr_id| instr_id.to_string()).unwrap_or_default(),
+                    instr_id
+                        .map(|instr_id| instr_id.to_string())
+                        .unwrap_or_default(),
                     function_id
                         .and_then(|function_id| {
                             self.lookup_function(function_id)
@@ -734,6 +739,7 @@ fn append_jit_codegen_log(
     elapsed: Duration,
     status: &str,
     error: Option<&str>,
+    metrics: Option<crate::jit::JitCodegenMetrics>,
 ) {
     info!(
         target: "soac_jit_codegen",
@@ -746,6 +752,21 @@ fn append_jit_codegen_log(
         function_qualname = function.names.qualname,
         function_block_count = function.blocks.len(),
         function_entry_kind = entry_kind,
+        jit_clif_block_count = metrics
+            .map(|metrics| u64::try_from(metrics.clif_block_count).unwrap_or(u64::MAX))
+            .unwrap_or(0),
+        jit_clif_inst_count = metrics
+            .map(|metrics| u64::try_from(metrics.clif_inst_count).unwrap_or(u64::MAX))
+            .unwrap_or(0),
+        jit_machine_code_size_bytes = metrics
+            .map(|metrics| u64::try_from(metrics.machine_code_size_bytes).unwrap_or(u64::MAX))
+            .unwrap_or(0),
+        jit_machine_code_block_count = metrics
+            .map(|metrics| u64::try_from(metrics.machine_code_block_count).unwrap_or(u64::MAX))
+            .unwrap_or(0),
+        jit_machine_code_edge_count = metrics
+            .map(|metrics| u64::try_from(metrics.machine_code_edge_count).unwrap_or(u64::MAX))
+            .unwrap_or(0),
         jit_codegen_total_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
         "jit_codegen",
     );

@@ -992,11 +992,10 @@ benchmark benchmark_loops="1000000" verify_loops="100000" perf_loops="10000000" 
   esac
   result_dir="$RESULTS_ROOT/$result_name"
   counters_dir="$result_dir/counters"
-  clif_dir="$result_dir/clif"
   report="$result_dir/benchmark.txt"
 
   rm -rf "$result_dir"
-  mkdir -p "$counters_dir" "$clif_dir"
+  mkdir -p "$counters_dir"
   SOAC_BENCHMARK_EVENTS_LOG="$counters_dir/events.jsonl"
   rm -f "$SOAC_BENCHMARK_EVENTS_LOG"
 
@@ -1037,9 +1036,8 @@ benchmark benchmark_loops="1000000" verify_loops="100000" perf_loops="10000000" 
     SOAC_OPT_MODE=verify \
       "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
 
-    site_count="$(just _call-target-specializations-from-dump "$counters_dir/profile.bin" | awk -F';' 'NF { print NF }')"
     echo
-    echo "jit transformed specialized apply pass (${site_count:-0} callsites)"
+    echo "jit transformed specialized apply pass"
     for run in $(seq 1 "$SPECIALIZED_RUNS"); do
       echo "specialized run $run/$SPECIALIZED_RUNS"
       LOOPS="$BENCHMARK_LOOPS" \
@@ -1052,6 +1050,55 @@ benchmark benchmark_loops="1000000" verify_loops="100000" perf_loops="10000000" 
     done
   } 2>&1 | tee "$report"
 
+  SOAC_WORK_DIR="$counters_dir" \
+  SOAC_OPT_MODE=apply \
+  PERF_PERCENT_LIMIT="${PERF_PERCENT_LIMIT:-0.2}" \
+    just perf-pystone-jit-warm "$PERF_LOOPS" "$result_dir/perf" \
+    > "$result_dir/perf.just.log" 2>&1
+  cp -f "$REPO_ROOT/tmp/perf.data" "$result_dir/perf.data" 2>/dev/null || true
+  cp -f "$REPO_ROOT/tmp/perf.injected.data" "$result_dir/perf.injected.data" 2>/dev/null || true
+
+  {
+    echo
+    echo "jit/module-load log summary"
+    "$VENV_DIR/bin/python" "$REPO_ROOT/scripts/summarize_module_load_log.py" "$SOAC_BENCHMARK_EVENTS_LOG"
+  } | tee "$result_dir/jit_codegen_summary.txt"
+  cat "$result_dir/jit_codegen_summary.txt" >> "$report"
+
+  echo "benchmark result: $result_dir"
+
+_benchmark-add-deep-profile-artifacts result_dir:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+  result_dir="{{result_dir}}"
+  if [[ "$result_dir" != /* ]]; then
+    result_dir="$REPO_ROOT/$result_dir"
+  fi
+  counters_dir="$result_dir/counters"
+  clif_dir="$result_dir/clif"
+  report="$result_dir/benchmark.txt"
+
+  if [[ ! -d "$result_dir" ]]; then
+    echo "benchmark result directory not found: $result_dir" >&2
+    exit 1
+  fi
+  if [[ ! -f "$counters_dir/profile.bin" ]]; then
+    echo "counter profile not found at $counters_dir/profile.bin; run 'just benchmark' first" >&2
+    exit 1
+  fi
+  if [[ ! -f "$counters_dir/verify.bin" ]]; then
+    echo "verification counters not found at $counters_dir/verify.bin; run 'just benchmark' first" >&2
+    exit 1
+  fi
+  if [[ ! -f "$result_dir/perf.injected.data" ]]; then
+    echo "perf capture not found at $result_dir/perf.injected.data; run 'just benchmark' first" >&2
+    exit 1
+  fi
+
+  mkdir -p "$clif_dir"
+
   cargo run -p soac-inspector --bin inspect_counters -- \
     "$counters_dir/profile.bin" > "$result_dir/profile_counters.txt"
   cargo run -p soac-inspector --bin inspect_counters -- \
@@ -1063,21 +1110,6 @@ benchmark benchmark_loops="1000000" verify_loops="100000" perf_loops="10000000" 
 
   cargo run -q -p soac-inspector --bin list_jit_functions -- scripts/pystone.py \
     > "$clif_dir/functions.tsv"
-  translated_call_targets="$(awk -F'[|=]' '
-    function local_id(packed) { return packed % 4294967296 }
-    NF >= 5 {
-      site = $1 "|" local_id($2) "|" $3 "|" $4
-      split($5, targets, ",")
-      printf "%s%s=", sep, site
-      sep = ";"
-      for (i = 1; i <= length(targets); i++) {
-        if (i > 1) {
-          printf ","
-        }
-        printf "%d", local_id(targets[i])
-      }
-    }
-  ' "$result_dir/profile_specializations.txt")"
   while IFS=$'\t' read -r function_id qualname; do
     safe_qualname="$(printf '%s' "$qualname" | tr -cs '[:alnum:]_.' '_')"
     output_base="$clif_dir/fn_${function_id}_${safe_qualname}"
@@ -1091,14 +1123,45 @@ benchmark benchmark_loops="1000000" verify_loops="100000" perf_loops="10000000" 
         > "$output_base.clif"
   done < "$clif_dir/functions.tsv"
 
-  SOAC_WORK_DIR="$counters_dir" \
-  SOAC_OPT_MODE=apply \
-  PERF_PERCENT_LIMIT="${PERF_PERCENT_LIMIT:-0.2}" \
-    just perf-pystone-jit-warm "$PERF_LOOPS" "$result_dir/perf" \
-    > "$result_dir/perf.just.log" 2>&1
-  cp -f "$REPO_ROOT/tmp/perf.data" "$result_dir/perf.data" 2>/dev/null || true
-  cp -f "$REPO_ROOT/tmp/perf.injected.data" "$result_dir/perf.injected.data" 2>/dev/null || true
   cargo run -q -p soac-inspector --bin annotate_cranelift_perf -- "$result_dir" \
     > "$result_dir/perf_cranelift_blocks.tsv"
 
-  echo "benchmark result: $result_dir"
+  {
+    echo
+    echo "deep profile artifacts"
+    echo "profile counters: $result_dir/profile_counters.txt"
+    echo "verify counters: $result_dir/verify_counters.txt"
+    echo "profile specializations: $result_dir/profile_specializations.txt"
+    echo "verify specializations: $result_dir/verify_specializations.txt"
+    echo "rendered clif dir: $clif_dir"
+    echo "perf cranelift blocks: $result_dir/perf_cranelift_blocks.tsv"
+  } | tee -a "$report"
+
+benchmark-deep-profile benchmark_loops="1000000" verify_loops="100000" perf_loops="10000000" results_root="bench" result_rev="@" result_mode="one-off": (benchmark "{{benchmark_loops}}" "{{verify_loops}}" "{{perf_loops}}" "{{results_root}}" "{{result_rev}}" "{{result_mode}}")
+  #!/usr/bin/env bash
+  set -euo pipefail
+
+  RESULT_REV="{{result_rev}}"
+  RESULTS_ROOT="{{results_root}}"
+  RESULT_MODE="{{result_mode}}"
+  if [[ "$RESULTS_ROOT" != /* ]]; then
+    RESULTS_ROOT="$REPO_ROOT/$RESULTS_ROOT"
+  fi
+
+  change_id="$(jj --ignore-working-copy log -r "$RESULT_REV" --no-graph -T 'change_id.short()')"
+  commit_id="$(jj --ignore-working-copy log -r "$RESULT_REV" --no-graph -T 'commit_id.short()')"
+  case "$RESULT_MODE" in
+    one-off)
+      result_name="${change_id}_${commit_id}"
+      ;;
+    finalized)
+      result_name="$change_id"
+      ;;
+    *)
+      echo "unknown benchmark result mode: $RESULT_MODE" >&2
+      echo "expected one-off or finalized" >&2
+      exit 1
+      ;;
+  esac
+
+  just _benchmark-add-deep-profile-artifacts "$RESULTS_ROOT/$result_name"

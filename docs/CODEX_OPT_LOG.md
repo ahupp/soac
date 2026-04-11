@@ -261,3 +261,18 @@ benchmarked throughput delta, and the headline pre/post numbers.
 - attempted benchmark:
   - specialized pass, 1M loops x3: `124219`, `127264`, `125195 loops/s`
   - perf-context run: `120165 loops/s`
+
+## 2026-04-11 - Thread tstate through hot JIT helpers
+
+- jj change id: `sosmzxqw`
+- summary: Threaded the existing `PyThreadState` parameter through the hot JIT
+  helper paths, including keyword and unpacked-call helper lowering, so those
+  paths stop doing helper-local thread-state/TLS lookups. The specialized and
+  verify specialization sets stayed identical across the before/after runs.
+- throughput: `+69.50%` specialized pystone median
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `101666`, `107664`, `103292 loops/s`
+  - perf-context run: `100400 loops/s`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `175063`, `176168`, `175076 loops/s`
+  - perf-context run: `172766 loops/s`
