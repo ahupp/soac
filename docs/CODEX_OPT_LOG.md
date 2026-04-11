@@ -5,6 +5,23 @@ optimization attempts made by Codex agents. Keep entries succinct: what
 changed or was tried, which jj change id carried it when landed, the
 benchmarked throughput delta, and the headline pre/post numbers.
 
+## 2026-04-11 - Mark rarely visited profiled blocks cold
+
+- jj change id: `oxrtzwlp`
+- summary: Replayed `block_entry` counters during apply/verify JIT
+  lowering and marked non-entry blocks visited at most 1% as often as
+  the function entry block as Cranelift `cold` blocks. This is a layout
+  hint only; the short pystone validation run showed no code-size
+  counter change.
+- throughput: `-0.38%` median specialized pystone in a short
+  100-loop validation run; treated as noise-level / neutral
+- pre-change benchmark:
+  - specialized pass, 100 loops x3: `158967`, `157293`, `155422 loops/s`
+  - machine code size total/max: `1018394` / `120176` bytes
+- post-change benchmark:
+  - specialized pass, 100 loops x3: `156690`, `158210`, `153109 loops/s`
+  - machine code size total/max: `1018394` / `120176` bytes
+
 ## 2026-04-08 - Inline runtime guard and indexed-field helpers
 
 - jj change id: `kkoolpkp`

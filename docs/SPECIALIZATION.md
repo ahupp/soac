@@ -46,6 +46,16 @@ The hot streams consumed by the current replay path are:
     `collect_branch_preferences_for_function`, then replayed as a
     per-site preference for true-hot or false-hot lowering.
 
+- `block_entry`
+  - Instrumented for every lowered basic block in
+    `instrument_bb_module_with_block_entry_counters`, at
+    `soac-blockpy/src/passes/trace/mod.rs:107`.
+  - Records scalar visit counts keyed by `(function_id, block_label)`.
+  - Consumed from the binary counter dump in
+    `collect_block_entry_counts_for_function`, then replayed as
+    conservative cold-block hints for low-frequency non-entry blocks
+    during apply/verify JIT lowering.
+
 The cold metadata stream records dictionary-key layouts for replay:
 
 - `module_keys`
@@ -133,6 +143,32 @@ apply/verify mode:
 - Counts come from the top-two heavy-hitter storage. That exactly covers
   boolean branches, but a future branch-table locality profile needs a
   wider representation or per-edge scalar counters.
+
+
+## Profiled Cold Blocks
+
+### Counted Input
+
+- Source input is `block_entry`.
+- Every lowered basic block gets a scalar entry counter while profiling
+  is enabled.
+- Replay compares each non-entry block's visit count against the
+  function entry block count.
+
+### Codegen
+
+- In apply/verify mode, non-entry blocks visited at most 1% as often as
+  the function entry block are marked `cold` in Cranelift IR.
+- This is a block-placement/layout hint only. It does not change Python
+  semantics or skip code generation for those blocks.
+
+### Limits
+
+- The current heuristic is deliberately conservative for small sample
+  counts: when the function entry count is below 100, only zero-visit
+  non-entry blocks can become cold.
+- Missing or mismatched block-entry rows disable the hint for that
+  function rather than guessing.
 
 
 ## Indexed Globals

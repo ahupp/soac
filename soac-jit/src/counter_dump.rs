@@ -710,6 +710,39 @@ pub fn collect_branch_preferences_for_function(
     Ok(out)
 }
 
+fn parse_block_label_text(text: &str) -> Option<BlockLabel> {
+    let index = text.strip_prefix("bb")?.parse::<usize>().ok()?;
+    Some(BlockLabel::from_index(index))
+}
+
+pub fn collect_block_entry_counts_for_function(
+    records: &[CounterDumpRecordView<'_>],
+    module_name: &str,
+    function_id: FunctionId,
+) -> Result<HashMap<BlockLabel, u64>, String> {
+    let mut out = HashMap::<BlockLabel, u64>::new();
+    for record in records {
+        if record.module_name()? != module_name {
+            continue;
+        }
+        for row_index in 0..record.row_count() {
+            let row = record.row(row_index)?;
+            if row.kind != "block_entry" || row.function_id != Some(function_id) {
+                continue;
+            }
+            let Some(block_label_text) = row.block_label else {
+                continue;
+            };
+            let Some(block_label) = parse_block_label_text(block_label_text) else {
+                continue;
+            };
+            let count = out.entry(block_label).or_default();
+            *count = count.saturating_add(row.value);
+        }
+    }
+    Ok(out)
+}
+
 pub fn collect_module_key_layouts(
     records: &[CounterDumpRecordView<'_>],
 ) -> Result<HashMap<String, Vec<CollectedKeyLayout>>, String> {
@@ -812,6 +845,16 @@ pub fn read_branch_preferences_from_file(
     let dump = CounterDumpFile::open(path)?;
     let records = dump.records()?;
     collect_branch_preferences_for_function(records.as_slice(), module_name, function_id)
+}
+
+pub fn read_block_entry_counts_from_file(
+    path: &Path,
+    module_name: &str,
+    function_id: FunctionId,
+) -> Result<HashMap<BlockLabel, u64>, String> {
+    let dump = CounterDumpFile::open(path)?;
+    let records = dump.records()?;
+    collect_block_entry_counts_for_function(records.as_slice(), module_name, function_id)
 }
 
 fn align_up(offset: usize, align: usize) -> usize {

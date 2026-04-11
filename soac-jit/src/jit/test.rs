@@ -1177,6 +1177,104 @@ mod tests {
         rendered
     }
 
+    fn render_test_jit_function_with_block_entry_counts(
+        function: &BlockPyFunction<CodegenModuleShape>,
+        blocks: &[ObjPtr],
+        module_constants: Vec<InstrResolved>,
+        block_entry_counts: &[(BlockLabel, u64)],
+    ) -> String {
+        let mut module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
+        module.module_constants = module_constants;
+        let function = module.callable_defs[0].clone();
+        let module_name = "counter_test";
+        let soac_work_dir = fresh_test_work_dir("test-work");
+        write_test_counter_dump(
+            soac_work_dir.join("profile.bin").as_path(),
+            &CounterDumpRecord {
+                module_name: module_name.to_string(),
+                package_name: None,
+                rows: block_entry_counts
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (block_label, count))| CounterDumpRow {
+                        counter_id: u32::try_from(index)
+                            .expect("test block-entry counter count should fit in u32"),
+                        scope: "this".to_string(),
+                        kind: "block_entry".to_string(),
+                        site_kind: "block_entry".to_string(),
+                        function_id: Some(function.function_id),
+                        current_function_id: Some(function.function_id),
+                        instr_id: None,
+                        function_qualname: Some(function.names.qualname.clone()),
+                        block_label: Some(block_label.to_string()),
+                        value: *count,
+                        observed_value: None,
+                        max_overcount: None,
+                    })
+                    .collect(),
+                module_keys: Vec::new(),
+                type_keys: Vec::new(),
+                type_table: Vec::new(),
+            },
+        );
+
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
+        let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
+        unsafe {
+            std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
+            std::env::set_var("SOAC_OPT_MODE", "apply");
+        }
+        crate::initialize_test_python();
+
+        let rendered = Python::attach(|py| {
+            let shared_state =
+                crate::module_type::build_shared_state_for_testing(py, module, module_name, "")
+                    .expect("shared state should build");
+            let compile_session = crate::session::CompileSession::new();
+            let mut jit_module =
+                new_jit_module(&compile_session).expect("test jit module should construct");
+            let module_constant_ptrs = shared_state.module_constant_ptrs();
+            let counter_ptrs = shared_state.counter_ptrs();
+            let built = build_cranelift_run_bb_specialized_function(
+                &mut jit_module,
+                blocks,
+                &shared_state.lowered_module,
+                &function,
+                &shared_state.codegen_constants,
+                &shared_state.lowered_module.counter_defs,
+                &module_constant_ptrs,
+                &counter_ptrs,
+                &compile_session,
+                Some(shared_state.as_ref()),
+                None,
+                None,
+            )
+            .expect("specialized JIT build should succeed");
+            let (clif, _cfg_dot, _vcode_disasm) = render_compiled_clif_and_vcode_disasm(
+                &mut jit_module,
+                built.ctx,
+                &built.import_id_to_symbol,
+                &built.block_annotations,
+            )
+            .expect("specialized JIT CLIF render should succeed");
+            clif
+        });
+
+        unsafe {
+            match old_soac_work_dir {
+                Some(value) => std::env::set_var("SOAC_WORK_DIR", value),
+                None => std::env::remove_var("SOAC_WORK_DIR"),
+            }
+            match old_soac_opt_mode {
+                Some(value) => std::env::set_var("SOAC_OPT_MODE", value),
+                None => std::env::remove_var("SOAC_OPT_MODE"),
+            }
+        }
+
+        rendered
+    }
+
     #[test]
     fn field_index_specializations_resolve_type_key_without_module_globals() {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
@@ -3017,6 +3115,59 @@ def f():
                 && !rendered.contains("call dp_jit_py_call_object")
                 && !rendered.contains("call dp_jit_py_call_with_kw"),
             "constant-backed runtime helpers should still specialize instead of reloading or generic-calling:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn render_specialized_jit_marks_rare_profiled_blocks_cold() {
+        let blocks = [1usize as ObjPtr, 2usize as ObjPtr, 3usize as ObjPtr];
+        let mut function = test_function();
+        let entry_label = function.name_gen.next_block_name();
+        let hot_label = function.name_gen.next_block_name();
+        let cold_label = function.name_gen.next_block_name();
+        function.blocks = vec![
+            CodegenBlock {
+                label: entry_label,
+                body: vec![],
+                term: BlockTerm::IfTerm(soac_blockpy::block_py::TermIf {
+                    test: none_expr(),
+                    then_label: hot_label,
+                    else_label: cold_label,
+                }),
+                params: vec![],
+                exc_edge: None,
+            },
+            CodegenBlock {
+                label: hot_label,
+                body: vec![],
+                term: ret_term(none_expr()),
+                params: vec![],
+                exc_edge: None,
+            },
+            CodegenBlock {
+                label: cold_label,
+                body: vec![],
+                term: ret_term(none_expr()),
+                params: vec![],
+                exc_edge: None,
+            },
+        ];
+        assign_missing_test_instr_ids(&mut function);
+
+        let rendered = render_test_jit_function_with_block_entry_counts(
+            &function,
+            &blocks,
+            Vec::new(),
+            &[(entry_label, 10_000), (hot_label, 9_500), (cold_label, 75)],
+        );
+
+        assert!(
+            rendered.contains(&format!(" cold: ; block {cold_label}(")),
+            "rarely visited block should be marked cold in rendered CLIF:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!(" cold: ; block {hot_label}(")),
+            "frequently visited block should stay hot in rendered CLIF:\n{rendered}"
         );
     }
 

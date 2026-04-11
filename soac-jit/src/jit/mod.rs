@@ -1,7 +1,7 @@
 use crate::SOAC_RUNTIME_CLIF;
 use crate::counter_dump::{
     CollectedTypeKeyLayout, CounterDumpFile, CounterDumpTypeKey, collect_type_key_layouts,
-    collect_type_table, read_branch_preferences_from_file,
+    collect_type_table, read_block_entry_counts_from_file, read_branch_preferences_from_file,
     read_call_target_specializations_from_file, read_operator_specializations_from_file,
 };
 use crate::module_constants::{ModuleCodegenConstants, ModuleConstantId};
@@ -83,6 +83,7 @@ static NEXT_IMPORT_SPEC_ID: AtomicUsize = AtomicUsize::new(0);
 static NEXT_IMPORT_TRAMPOLINE_ID: AtomicUsize = AtomicUsize::new(0);
 const JIT_ARENA_BYTES: usize = 256 * 1024 * 1024;
 const MISSING_PYTHON_EXCEPTION_TRAP: ir::TrapCode = ir::TrapCode::unwrap_user(1);
+const COLD_BLOCK_ENTRY_RATE_DENOMINATOR: u64 = 100;
 
 thread_local! {
     static PROCESS_JIT_COMPILE_DEPTH: Cell<usize> = const { Cell::new(0) };
@@ -5071,6 +5072,45 @@ fn load_branch_preferences(
         return Ok(HashMap::new());
     }
     read_branch_preferences_from_file(path, module_name, function_id)
+}
+
+fn collect_cold_block_labels(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    module_name: &str,
+) -> Result<HashSet<BlockLabel>, String> {
+    if specialization_mode_is_profile() {
+        return Ok(HashSet::new());
+    }
+    let Some(path) = counter_dump_input_path_from_env() else {
+        return Ok(HashSet::new());
+    };
+    let path = path.as_path();
+    if !path.exists() {
+        return Ok(HashSet::new());
+    }
+
+    let block_entry_counts =
+        read_block_entry_counts_from_file(path, module_name, function.function_id)?;
+    let entry_label = function.entry_block().label;
+    let Some(entry_count) = block_entry_counts.get(&entry_label).copied() else {
+        return Ok(HashSet::new());
+    };
+    if entry_count == 0 {
+        return Ok(HashSet::new());
+    }
+
+    Ok(function
+        .blocks
+        .iter()
+        .filter_map(|block| {
+            if block.label == entry_label {
+                return None;
+            }
+            let block_count = block_entry_counts.get(&block.label).copied()?;
+            (block_count.saturating_mul(COLD_BLOCK_ENTRY_RATE_DENOMINATOR) <= entry_count)
+                .then_some(block.label)
+        })
+        .collect())
 }
 
 fn resolve_type_key_to_type(
@@ -11454,6 +11494,12 @@ fn build_cranelift_run_bb_specialized_function(
         }
         None => HashMap::new(),
     };
+    let cold_block_labels = match direct_call_resolver {
+        Some(shared_state) => {
+            collect_cold_block_labels(function, shared_state.module_name.as_str())?
+        }
+        None => HashSet::new(),
+    };
     let behavior_change_indexed_stores = behavior_change_indexed_stores_enabled()
         && function.scope.scope_kind != CallableScopeKind::Module;
     let function_runtime_data_layout = FunctionRuntimeDataLayout::from_function(function);
@@ -11554,6 +11600,11 @@ fn build_cranelift_run_bb_specialized_function(
             exec_blocks.push(fb.create_block());
             pre_cleanup_null_blocks.push(fb.create_block());
             cleanup_null_blocks.push(fb.create_block());
+        }
+        for (index, block) in exec_blocks.iter().enumerate() {
+            if cold_block_labels.contains(&function.blocks[index].label) {
+                fb.set_cold_block(*block);
+            }
         }
         let step_null_block = fb.create_block();
         let raise_exc_direct_block = fb.create_block();
