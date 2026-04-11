@@ -3788,6 +3788,64 @@ fn emit_positional_vectorcall_with_arg_values(
     fb.block_params(call_ok_block)[0]
 }
 
+fn emit_object_call_with_tuple_args(
+    fb: &mut FunctionBuilder<'_>,
+    callable: ir::Value,
+    callable_is_borrowed: bool,
+    call_args_tuple: ir::Value,
+    kwargs_obj: Option<ir::Value>,
+    ctx: &JitEmitCtx<'_>,
+) -> ir::Value {
+    let ptr_ty = ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let call_inst = if let Some(kwargs_obj) = kwargs_obj {
+        fb.ins().call(
+            ctx.py_call_with_kw_ref,
+            &[callable, call_args_tuple, kwargs_obj],
+        )
+    } else {
+        fb.ins()
+            .call(ctx.py_call_object_ref, &[callable, call_args_tuple])
+    };
+    let call_value = fb.inst_results(call_inst)[0];
+    let call_is_null = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, call_value, null_ptr);
+    let call_fail_block = fb.create_block();
+    let call_ok_block = fb.create_block();
+    fb.append_block_param(call_ok_block, ptr_ty);
+    fb.ins().brif(
+        call_is_null,
+        call_fail_block,
+        &[],
+        call_ok_block,
+        &[ir::BlockArg::Value(call_value)],
+    );
+
+    fb.switch_to_block(call_fail_block);
+    let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
+    if let Some(kwargs_obj) = kwargs_obj {
+        fb.ins().call(ctx.decref_ref, &[kwargs_obj]);
+    }
+    fb.ins().call(ctx.decref_ref, &[call_args_tuple]);
+    if !callable_is_borrowed {
+        fb.ins().call(ctx.decref_ref, &[callable]);
+    }
+    emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
+    fb.ins()
+        .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
+
+    fb.switch_to_block(call_ok_block);
+    if let Some(kwargs_obj) = kwargs_obj {
+        fb.ins().call(ctx.decref_ref, &[kwargs_obj]);
+    }
+    fb.ins().call(ctx.decref_ref, &[call_args_tuple]);
+    if !callable_is_borrowed {
+        fb.ins().call(ctx.decref_ref, &[callable]);
+    }
+    fb.block_params(call_ok_block)[0]
+}
+
 fn emit_keyword_call_with_local_env(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
@@ -3999,43 +4057,14 @@ fn emit_keyword_call_with_local_env(
         fb.ins().call(ctx.decref_ref, &[set_value]);
     }
 
-    let call_inst = fb.ins().call(
-        ctx.py_call_with_kw_ref,
-        &[callable, call_args_tuple, kwargs_obj],
-    );
-    let call_value = fb.inst_results(call_inst)[0];
-    let call_is_null = fb
-        .ins()
-        .icmp(ir::condcodes::IntCC::Equal, call_value, null_ptr);
-    let call_fail_block = fb.create_block();
-    let call_ok_block = fb.create_block();
-    fb.append_block_param(call_ok_block, ptr_ty);
-    fb.ins().brif(
-        call_is_null,
-        call_fail_block,
-        &[],
-        call_ok_block,
-        &[ir::BlockArg::Value(call_value)],
-    );
-
-    fb.switch_to_block(call_fail_block);
-    let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
-    fb.ins().call(ctx.decref_ref, &[kwargs_obj]);
-    fb.ins().call(ctx.decref_ref, &[call_args_tuple]);
-    if !callable_is_borrowed {
-        fb.ins().call(ctx.decref_ref, &[callable]);
-    }
-    emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
-    fb.ins()
-        .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
-
-    fb.switch_to_block(call_ok_block);
-    fb.ins().call(ctx.decref_ref, &[kwargs_obj]);
-    fb.ins().call(ctx.decref_ref, &[call_args_tuple]);
-    if !callable_is_borrowed {
-        fb.ins().call(ctx.decref_ref, &[callable]);
-    }
-    fb.block_params(call_ok_block)[0]
+    emit_object_call_with_tuple_args(
+        fb,
+        callable,
+        callable_is_borrowed,
+        call_args_tuple,
+        Some(kwargs_obj),
+        ctx,
+    )
 }
 
 fn emit_unpack_call_with_local_env(
@@ -4430,52 +4459,14 @@ fn emit_unpack_call_with_local_env(
     fb.switch_to_block(call_args_tuple_ok);
     let call_args_tuple = fb.block_params(call_args_tuple_ok)[0];
 
-    let call_inst = if let Some(kwargs_obj) = kwargs_obj {
-        fb.ins().call(
-            ctx.py_call_with_kw_ref,
-            &[callable, call_args_tuple, kwargs_obj],
-        )
-    } else {
-        fb.ins()
-            .call(ctx.py_call_object_ref, &[callable, call_args_tuple])
-    };
-    let call_value = fb.inst_results(call_inst)[0];
-    let call_is_null = fb
-        .ins()
-        .icmp(ir::condcodes::IntCC::Equal, call_value, null_ptr);
-    let call_fail_block = fb.create_block();
-    let call_ok_block = fb.create_block();
-    fb.append_block_param(call_ok_block, ptr_ty);
-    fb.ins().brif(
-        call_is_null,
-        call_fail_block,
-        &[],
-        call_ok_block,
-        &[ir::BlockArg::Value(call_value)],
-    );
-
-    fb.switch_to_block(call_fail_block);
-    let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
-    if let Some(kwargs_obj) = kwargs_obj {
-        fb.ins().call(ctx.decref_ref, &[kwargs_obj]);
-    }
-    fb.ins().call(ctx.decref_ref, &[call_args_tuple]);
-    if !callable_is_borrowed {
-        fb.ins().call(ctx.decref_ref, &[callable]);
-    }
-    emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
-    fb.ins()
-        .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
-
-    fb.switch_to_block(call_ok_block);
-    if let Some(kwargs_obj) = kwargs_obj {
-        fb.ins().call(ctx.decref_ref, &[kwargs_obj]);
-    }
-    fb.ins().call(ctx.decref_ref, &[call_args_tuple]);
-    if !callable_is_borrowed {
-        fb.ins().call(ctx.decref_ref, &[callable]);
-    }
-    fb.block_params(call_ok_block)[0]
+    emit_object_call_with_tuple_args(
+        fb,
+        callable,
+        callable_is_borrowed,
+        call_args_tuple,
+        kwargs_obj,
+        ctx,
+    )
 }
 
 fn emit_owned_bool_from_cond(
