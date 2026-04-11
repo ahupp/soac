@@ -3632,6 +3632,54 @@ fn emit_pack_current_values_tuple(
     fb.block_params(done_block)[0]
 }
 
+fn emit_call_args_tuple_from_values(
+    fb: &mut FunctionBuilder<'_>,
+    arg_values: &[(ir::Value, bool)],
+    ctx: &JitEmitCtx<'_>,
+) -> ir::Value {
+    let ptr_ty = ctx.consts.ptr_ty;
+    let i64_ty = ctx.consts.i64_ty;
+    let tuple_len = fb.ins().iconst(i64_ty, arg_values.len() as i64);
+    let tuple_inst = fb.ins().call(ctx.tuple_new_ref, &[tuple_len]);
+    let call_args_tuple =
+        emit_checked_owned_pyobject_result(fb, fb.inst_results(tuple_inst)[0], ctx);
+
+    for (index, (value, borrowed_arg)) in arg_values.iter().enumerate() {
+        if *borrowed_arg {
+            fb.ins().call(ctx.incref_ref, &[*value]);
+        }
+        let item_index = fb.ins().iconst(i64_ty, index as i64);
+        let set_inst = fb.ins().call(
+            ctx.tuple_set_item_ref,
+            &[call_args_tuple, item_index, *value],
+        );
+        let set_result = fb.inst_results(set_inst)[0];
+        let set_failed = fb
+            .ins()
+            .icmp_imm(ir::condcodes::IntCC::NotEqual, set_result, 0);
+        let set_ok_block = fb.create_block();
+        let set_fail_block = fb.create_block();
+        fb.append_block_param(set_fail_block, ptr_ty);
+        fb.ins().brif(
+            set_failed,
+            set_fail_block,
+            &[ir::BlockArg::Value(call_args_tuple)],
+            set_ok_block,
+            &[],
+        );
+        fb.switch_to_block(set_fail_block);
+        let failed_tuple = fb.block_params(set_fail_block)[0];
+        let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
+        fb.ins().call(ctx.decref_ref, &[failed_tuple]);
+        emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
+        fb.ins()
+            .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
+        fb.switch_to_block(set_ok_block);
+    }
+
+    call_args_tuple
+}
+
 fn emit_positional_vectorcall(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
@@ -3858,13 +3906,7 @@ fn emit_keyword_call_with_local_env(
     func_imports: &mut FuncBuildImports<'_>,
 ) -> ir::Value {
     let ptr_ty = ctx.consts.ptr_ty;
-    let i64_ty = ctx.consts.i64_ty;
     let null_ptr = fb.ins().iconst(ptr_ty, 0);
-
-    let tuple_len = fb.ins().iconst(i64_ty, args.len() as i64);
-    let tuple_inst = fb.ins().call(ctx.tuple_new_ref, &[tuple_len]);
-    let call_args_tuple =
-        emit_checked_owned_pyobject_result(fb, fb.inst_results(tuple_inst)[0], ctx);
 
     let mut tuple_items: Vec<(ir::Value, bool)> = Vec::with_capacity(args.len());
     for arg in args {
@@ -3885,38 +3927,7 @@ fn emit_keyword_call_with_local_env(
         );
         tuple_items.push((value, borrowed_arg));
     }
-    for (index, (value, borrowed_arg)) in tuple_items.iter().enumerate() {
-        if *borrowed_arg {
-            fb.ins().call(ctx.incref_ref, &[*value]);
-        }
-        let item_index = fb.ins().iconst(i64_ty, index as i64);
-        let set_inst = fb.ins().call(
-            ctx.tuple_set_item_ref,
-            &[call_args_tuple, item_index, *value],
-        );
-        let set_result = fb.inst_results(set_inst)[0];
-        let set_failed = fb
-            .ins()
-            .icmp_imm(ir::condcodes::IntCC::NotEqual, set_result, 0);
-        let set_ok_block = fb.create_block();
-        let set_fail_block = fb.create_block();
-        fb.append_block_param(set_fail_block, ptr_ty);
-        fb.ins().brif(
-            set_failed,
-            set_fail_block,
-            &[ir::BlockArg::Value(call_args_tuple)],
-            set_ok_block,
-            &[],
-        );
-        fb.switch_to_block(set_fail_block);
-        let failed_tuple = fb.block_params(set_fail_block)[0];
-        let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
-        fb.ins().call(ctx.decref_ref, &[failed_tuple]);
-        emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
-        fb.ins()
-            .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
-        fb.switch_to_block(set_ok_block);
-    }
+    let call_args_tuple = emit_call_args_tuple_from_values(fb, tuple_items.as_slice(), ctx);
 
     let dict_name_obj = emit_owned_module_constant(
         fb,
@@ -3932,7 +3943,7 @@ fn emit_keyword_call_with_local_env(
     );
     let dict_callable = emit_checked_owned_pyobject_result(fb, dict_callable, ctx);
 
-    let empty_tuple_len = fb.ins().iconst(i64_ty, 0);
+    let empty_tuple_len = fb.ins().iconst(ctx.consts.i64_ty, 0);
     let empty_tuple_inst = fb.ins().call(ctx.tuple_new_ref, &[empty_tuple_len]);
     let empty_tuple =
         emit_checked_owned_pyobject_result(fb, fb.inst_results(empty_tuple_inst)[0], ctx);
