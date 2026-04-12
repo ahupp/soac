@@ -727,6 +727,50 @@ def f():
         );
     }
 
+    #[test]
+    fn typed_result_demand_plan_marks_branch_tests_i32_bool01() {
+        let mut constants = TestConstantPool::default();
+        let function = test_function();
+        let entry_label = function.name_gen.next_block_name();
+        let then_label = function.name_gen.next_block_name();
+        let else_label = function.name_gen.next_block_name();
+        let test_instr_id = InstrId::new(entry_label, 0);
+        let entry = CodegenBlock {
+            label: entry_label,
+            body: vec![],
+            term: BlockTerm::IfTerm(soac_blockpy::block_py::TermIf {
+                test: with_instr_id(constants.int_expr(0), test_instr_id),
+                then_label,
+                else_label,
+            }),
+            params: vec![],
+            exc_edge: None,
+        };
+        let then_block = CodegenBlock {
+            label: then_label,
+            body: vec![],
+            term: ret_term(constants.int_expr(1)),
+            params: vec![],
+            exc_edge: None,
+        };
+        let else_block = CodegenBlock {
+            label: else_label,
+            body: vec![],
+            term: ret_term(constants.int_expr(2)),
+            params: vec![],
+            exc_edge: None,
+        };
+        let function = with_test_blocks(function, vec![entry, then_block, else_block]);
+        let typed_function =
+            lower_typed_function_if_tests_to_truthy(lower_codegen_function_to_typed(function));
+        let plan = plan_typed_result_demands(&typed_function);
+
+        assert_eq!(
+            plan.demand_for_instr_id(test_instr_id),
+            Some(ResultDemand::I32_BOOL01)
+        );
+    }
+
     fn direct_call_expr(function_id: FunctionId) -> InstrCodegen {
         InstrCodegen::CallDirect(CallDirect::new(
             none_expr(),

@@ -2056,6 +2056,9 @@ fn plan_typed_result_demands(
         for expr in &block.body {
             plan.insert_instr(expr, ResultDemand::EffectOnly);
         }
+        if let BlockTerm::IfTerm(if_term) = &block.term {
+            plan.insert_instr(&if_term.test, ResultDemand::I32_BOOL01);
+        }
     }
     plan
 }
@@ -3050,6 +3053,9 @@ fn emit_none_for_demand(
             fb.ins()
                 .call(emit_ctx.incref_ref, &[emit_ctx.consts.none_const]);
             EmitResult::owned_pyobject(emit_ctx.consts.none_const, PyObjFacts::none_singleton())
+        }
+        ResultDemand::I32Bool01 => {
+            panic!("owned None materialization cannot satisfy I32Bool01 demand")
         }
     }
 }
@@ -8709,6 +8715,9 @@ fn emit_owned_pyobject_result_for_demand(
             EmitResult::no_value()
         }
         ResultDemand::PyObject { .. } => EmitResult::owned_pyobject(value, facts),
+        ResultDemand::I32Bool01 => {
+            panic!("owned PyObject result helper cannot satisfy I32Bool01 demand")
+        }
     }
 }
 
@@ -8989,6 +8998,16 @@ fn emit_typed_codegen_stmt_result_with_local_env(
         expr,
         InstrTyped::Truthy(_) | InstrTyped::Load(_) | InstrTyped::BinOp(_)
     ) {
+        if demand == ResultDemand::I32_BOOL01 {
+            return emit_typed_codegen_i32_bool01_result_with_local_env(
+                fb,
+                expr,
+                local_env,
+                emit_ctx,
+                jit_module,
+                func_imports,
+            );
+        }
         let value = emit_typed_codegen_stmt_with_local_env(
             fb,
             expr,
@@ -9008,6 +9027,7 @@ fn emit_typed_codegen_stmt_result_with_local_env(
             ResultDemand::PyObject { .. } => {
                 EmitResult::owned_pyobject(value, PyObjFacts::unknown())
             }
+            ResultDemand::I32Bool01 => unreachable!("I32Bool01 handled before PyObject emission"),
         });
     }
 
@@ -9021,6 +9041,29 @@ fn emit_typed_codegen_stmt_result_with_local_env(
         jit_module,
         func_imports,
     )
+}
+
+fn emit_typed_codegen_i32_bool01_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    expr: &InstrTyped,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<EmitResult, String> {
+    let is_true_ref = func_imports.get(jit_module, &mut fb.func, &DP_JIT_IS_TRUE_IMPORT)?;
+    let value = emit_typed_codegen_expr_value_with_local_env(
+        fb,
+        expr,
+        local_env,
+        emit_ctx,
+        false,
+        jit_module,
+        func_imports,
+    )?;
+    let truth = emit_truthy_from_owned_value(fb, value, is_true_ref, emit_ctx);
+    let truth_i32 = truth.expect_i32_bool01("typed I32Bool01 demand");
+    Ok(EmitResult::i32(truth_i32, IntFacts::i32_bool01()))
 }
 
 fn local_failure_cleanup_emit_ctx<'mc>(
@@ -9699,15 +9742,24 @@ fn emit_typed_codegen_term(
 ) -> Result<(), String> {
     if let BlockTerm::IfTerm(if_term) = term {
         let test_instr_id = if_term.test.try_semantic_instr_id();
-        let truth = emit_typed_codegen_expr_value_with_local_env(
-            fb,
-            &if_term.test,
-            local_env,
-            emit_ctx,
-            false,
-            jit_module,
-            func_imports,
-        )?;
+        let demand = test_instr_id
+            .and_then(|instr_id| emit_ctx.result_demand_plan.demand_for_instr_id(instr_id))
+            .unwrap_or(ResultDemand::I32_BOOL01);
+        let truth = match demand {
+            ResultDemand::I32Bool01 => emit_typed_codegen_i32_bool01_result_with_local_env(
+                fb,
+                &if_term.test,
+                local_env,
+                emit_ctx,
+                jit_module,
+                func_imports,
+            )?,
+            other => {
+                return Err(format!(
+                    "typed if condition requires I32Bool01 demand, got {other:?}"
+                ));
+            }
+        };
         let truth_i32 = truth.expect_i32_bool01("typed if condition truthiness");
         return emit_codegen_if_truth_i32(
             fb,

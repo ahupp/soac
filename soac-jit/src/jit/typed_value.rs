@@ -191,19 +191,21 @@ impl SoacValue {
 pub enum ResultDemand {
     EffectOnly,
     PyObject { borrowed_ok: bool },
+    I32Bool01,
 }
 
 impl ResultDemand {
     pub const PYOBJECT_OWNED: Self = Self::PyObject { borrowed_ok: false };
     pub const PYOBJECT_BORROWED_OK: Self = Self::PyObject { borrowed_ok: true };
+    pub const I32_BOOL01: Self = Self::I32Bool01;
 
     pub const fn needs_value(self) -> bool {
-        matches!(self, Self::PyObject { .. })
+        matches!(self, Self::PyObject { .. } | Self::I32Bool01)
     }
 
     pub const fn borrowed_ok(self) -> bool {
         match self {
-            Self::EffectOnly => false,
+            Self::EffectOnly | Self::I32Bool01 => false,
             Self::PyObject { borrowed_ok } => borrowed_ok,
         }
     }
@@ -223,7 +225,7 @@ impl ValueOwnership {
 
     pub const fn can_satisfy_pyobject_demand(self, demand: ResultDemand) -> bool {
         match demand {
-            ResultDemand::EffectOnly => false,
+            ResultDemand::EffectOnly | ResultDemand::I32Bool01 => false,
             ResultDemand::PyObject { borrowed_ok } => {
                 borrowed_ok || matches!(self, Self::Owned | Self::Immortal)
             }
@@ -430,6 +432,8 @@ mod tests {
     fn result_demand_records_whether_consumers_need_a_value() {
         assert!(!ResultDemand::EffectOnly.needs_value());
         assert!(!ResultDemand::EffectOnly.borrowed_ok());
+        assert!(ResultDemand::I32_BOOL01.needs_value());
+        assert!(!ResultDemand::I32_BOOL01.borrowed_ok());
         assert!(ResultDemand::PYOBJECT_OWNED.needs_value());
         assert!(!ResultDemand::PYOBJECT_OWNED.borrowed_ok());
         assert!(ResultDemand::PYOBJECT_BORROWED_OK.needs_value());
@@ -450,6 +454,7 @@ mod tests {
                 .can_satisfy_pyobject_demand(ResultDemand::PYOBJECT_BORROWED_OK)
         );
         assert!(!ValueOwnership::Owned.can_satisfy_pyobject_demand(ResultDemand::EffectOnly));
+        assert!(!ValueOwnership::Owned.can_satisfy_pyobject_demand(ResultDemand::I32_BOOL01));
     }
 
     #[test]
