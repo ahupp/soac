@@ -67,7 +67,9 @@ mod runtime_context;
 mod specialized_helpers;
 mod typed_value;
 
-use direct_abi::{DirectEntry, RuntimePrimitiveId};
+use direct_abi::{
+    DirectCallableDesc, DirectEntry, DirectTargetId, ParamAbi, ResultAbi, RuntimePrimitiveId,
+};
 pub use planning::{
     BlockExcDispatchPlan, BlockParamFacts, CurrentJitRefcountPlanCheck, EdgeTransportPlan,
     FunctionLocalPlan, LocalRefKind, ParamBindingFacts, ParamProvenance, PlannedLocalStorage,
@@ -5730,6 +5732,18 @@ fn codegen_expr_const_u64(
     }
 }
 
+fn codegen_expr_const_i64(
+    expr: &InstrCodegen,
+    module_constants: &ModuleCodegenConstants,
+) -> Option<i64> {
+    match expr {
+        InstrCodegen::Load(op) => op.name.location.as_constant().and_then(|index| {
+            module_constants.constant_i64_value(ModuleConstantId(index as usize))
+        }),
+        _ => None,
+    }
+}
+
 fn collect_make_function_targets(
     function: &BlockPyFunction<CodegenModuleShape>,
     module_constants: &ModuleCodegenConstants,
@@ -8951,22 +8965,47 @@ fn emit_owned_pyobject_result_for_demand(
 fn single_positional_call_arg(
     call: &soac_blockpy::block_py::Call<InstrCodegen>,
 ) -> Option<&InstrCodegen> {
-    if !call.keywords.is_empty() || call.args.len() != 1 {
-        return None;
-    }
-    let CallArgPositional::Positional(arg) = &call.args[0] else {
-        return None;
-    };
-    Some(arg)
+    let args = direct_positional_call_args(call, 1)?;
+    Some(args[0])
 }
 
+fn direct_positional_call_args(
+    call: &soac_blockpy::block_py::Call<InstrCodegen>,
+    param_count: usize,
+) -> Option<Vec<&InstrCodegen>> {
+    if !call.keywords.is_empty() || call.args.len() != param_count {
+        return None;
+    }
+    call.args
+        .iter()
+        .map(|arg| match arg {
+            CallArgPositional::Positional(value) => Some(value),
+            CallArgPositional::Starred(_) => None,
+        })
+        .collect()
+}
+
+#[cfg(test)]
 fn static_runtime_primitive_for_call(
     call: &soac_blockpy::block_py::Call<InstrCodegen>,
     module_constants: &ModuleCodegenConstants,
 ) -> Option<RuntimePrimitiveId> {
-    let _ = single_positional_call_arg(call)?;
+    let desc = static_runtime_primitive_desc_for_call(call, module_constants)?;
+    let DirectTargetId::RuntimePrimitive(primitive) = desc.target else {
+        return None;
+    };
+    Some(primitive)
+}
+
+fn static_runtime_primitive_desc_for_call(
+    call: &soac_blockpy::block_py::Call<InstrCodegen>,
+    module_constants: &ModuleCodegenConstants,
+) -> Option<&'static DirectCallableDesc> {
     let name = codegen_expr_static_runtime_name(call.func.as_ref(), module_constants)?;
-    direct_abi::runtime_primitive_for_builtin_name(name)
+    let primitive = direct_abi::runtime_primitive_for_builtin_name(name)?;
+    let desc = direct_abi::runtime_primitive_desc(primitive);
+    let _ = direct_positional_call_args(call, desc.abi.params.len())?;
+    Some(desc)
 }
 
 fn runtime_primitive_import_spec(primitive: RuntimePrimitiveId) -> &'static ImportSpec {
@@ -8990,13 +9029,44 @@ fn codegen_expr_can_satisfy_i64_demand(
     expr: &InstrCodegen,
     module_constants: &ModuleCodegenConstants,
 ) -> bool {
+    if codegen_expr_const_i64(expr, module_constants).is_some() {
+        return true;
+    }
     match expr {
         InstrCodegen::Call(call) => {
-            static_runtime_primitive_for_call(call, module_constants)
-                == Some(RuntimePrimitiveId::BuiltinOrdI64)
+            let Some(desc) = static_runtime_primitive_desc_for_call(call, module_constants) else {
+                return false;
+            };
+            matches!(desc.abi.result, ResultAbi::I64)
+                && runtime_primitive_call_params_can_satisfy_abi(call, desc, module_constants)
         }
         _ => false,
     }
+}
+
+fn codegen_expr_can_satisfy_param_abi(
+    expr: &InstrCodegen,
+    param: ParamAbi,
+    module_constants: &ModuleCodegenConstants,
+) -> bool {
+    match param {
+        ParamAbi::PyObject { .. } => true,
+        ParamAbi::I64 => codegen_expr_can_satisfy_i64_demand(expr, module_constants),
+        ParamAbi::I32 => false,
+    }
+}
+
+fn runtime_primitive_call_params_can_satisfy_abi(
+    call: &soac_blockpy::block_py::Call<InstrCodegen>,
+    desc: &DirectCallableDesc,
+    module_constants: &ModuleCodegenConstants,
+) -> bool {
+    let Some(args) = direct_positional_call_args(call, desc.abi.params.len()) else {
+        return false;
+    };
+    args.into_iter()
+        .zip(desc.abi.params.iter().copied())
+        .all(|(arg, param)| codegen_expr_can_satisfy_param_abi(arg, param, module_constants))
 }
 
 fn emit_scalar_result_after_current_exception_check_with_cleanup(
@@ -9159,8 +9229,14 @@ fn emit_runtime_builtin_primitive_call_result_with_local_env(
     jit_module: &mut JITModule,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Option<EmitResult> {
-    let primitive = static_runtime_primitive_for_call(call, emit_ctx.module_constants)?;
+    let desc = static_runtime_primitive_desc_for_call(call, emit_ctx.module_constants)?;
+    if !runtime_primitive_call_params_can_satisfy_abi(call, desc, emit_ctx.module_constants) {
+        return None;
+    }
     let arg = single_positional_call_arg(call).expect("primitive call should have one arg");
+    let DirectTargetId::RuntimePrimitive(primitive) = desc.target else {
+        return None;
+    };
     match primitive {
         RuntimePrimitiveId::BuiltinOrdI64 => {
             Some(emit_runtime_builtin_ord_i64_result_with_local_env(
@@ -9174,9 +9250,6 @@ fn emit_runtime_builtin_primitive_call_result_with_local_env(
             ))
         }
         RuntimePrimitiveId::BuiltinChrI64 => {
-            if !codegen_expr_can_satisfy_i64_demand(arg, emit_ctx.module_constants) {
-                return None;
-            }
             Some(emit_runtime_builtin_chr_i64_result_with_local_env(
                 fb,
                 arg,
@@ -9251,6 +9324,19 @@ fn emit_codegen_stmt_result_with_local_env(
     jit_module: &mut JITModule,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<EmitResult, String> {
+    if matches!(demand, ResultDemand::I64 | ResultDemand::I64Index)
+        && let Some(const_value) = codegen_expr_const_i64(expr, emit_ctx.module_constants)
+    {
+        let value = fb.ins().iconst(emit_ctx.consts.i64_ty, const_value);
+        return Ok(emit_i64_result_for_demand(
+            fb,
+            value,
+            IntFacts::i64_known(const_value),
+            emit_ctx,
+            demand,
+        ));
+    }
+
     match expr {
         InstrCodegen::Store(op) => {
             if let Some(result) = emit_local_store_result_with_local_env(

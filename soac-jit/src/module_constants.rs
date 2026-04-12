@@ -275,6 +275,17 @@ impl ModuleCodegenConstants {
         }
     }
 
+    pub fn constant_i64_value(&self, constant_id: ModuleConstantId) -> Option<i64> {
+        match self.values.get(constant_id.0)? {
+            ModuleConstantValue::Int(value) => Some(*value),
+            ModuleConstantValue::BigInt(value) => value.parse().ok(),
+            ModuleConstantValue::Unicode(_)
+            | ModuleConstantValue::Bytes(_)
+            | ModuleConstantValue::FloatBits(_)
+            | ModuleConstantValue::RuntimeName(_) => None,
+        }
+    }
+
     pub fn constant_runtime_name_value(&self, constant_id: ModuleConstantId) -> Option<&str> {
         match self.values.get(constant_id.0)? {
             ModuleConstantValue::RuntimeName(bytes) => std::str::from_utf8(bytes).ok(),

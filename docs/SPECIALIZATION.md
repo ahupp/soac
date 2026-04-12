@@ -567,6 +567,9 @@ apply/verify mode:
 - `chr(ord(x))` can emit `ord_i64(x)` followed by
   `soac_runtime_builtin_chr_i64(tstate, codepoint)`, avoiding a temporary
   `PyLong` between the two builtins.
+- `chr(<i64 module constant>)` can pass the constant directly to
+  `soac_runtime_builtin_chr_i64` instead of first materializing a temporary
+  `PyLong`.
 - Scalar-returning primitive calls check `PyThreadState.current_exception`
   immediately after the call. On error, codegen preserves the exception while
   releasing owned temporaries, then jumps to the normal Python exception path.
@@ -574,9 +577,9 @@ apply/verify mode:
 ### Limitations / Soundness / Extensions
 
 - The current `chr` primitive path is only selected when its argument can
-  already satisfy an `i64` demand, currently the direct `ord(x)` shape. Plain
-  `chr(x)` still uses generic vectorcall unless `x` is itself lowered to an
-  `i64` by another specialization.
+  already satisfy an `i64` demand, currently direct `ord(x)` or an `i64` module
+  constant. Plain `chr(x)` still uses generic vectorcall unless `x` is itself
+  lowered to an `i64` by another specialization.
 - The runtime primitives use checked CPython C-API calls for Unicode handling.
   Direct Unicode layout reads are a later optimization.
 - Error messages are not yet preserved on the checked primitive's explicit

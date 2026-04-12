@@ -131,7 +131,8 @@ Status: steps 1 through 5 have started. The direct ABI descriptor scaffold
 exists in `soac-jit`, checked `soac_runtime_builtin_ord_i64` /
 `soac_runtime_builtin_chr_i64` entry points exist in `soac-runtime`, and static
 runtime-name `ord` calls can emit an `i64`. Static `chr(ord(x))` can consume
-that `i64` without materializing an intermediate `PyLong`.
+that `i64` without materializing an intermediate `PyLong`. Static
+`chr(<i64 module constant>)` can also use the scalar `chr_i64` path.
 
 1. Add compiler-visible direct ABI descriptor scaffolding in `soac-jit`.
 
@@ -156,9 +157,11 @@ that `i64` without materializing an intermediate `PyLong`.
    argument ownership contract, and return an `EmitResult`.
 
    Current first slice: `ord(x)` emits the checked runtime primitive and returns
-   an `EmitResult::I64`; `chr(ord(x))` emits the checked `chr_i64` primitive.
-   The next cleanup is to make emission table-driven from `DirectCallableDesc`
-   rather than matching each primitive manually.
+   an `EmitResult::I64`; `chr(ord(x))` and `chr(<i64 module constant>)` emit
+   the checked `chr_i64` primitive. Primitive applicability now consults the
+   descriptor parameter ABI, but the actual call emission still matches each
+   primitive manually. The next cleanup is to make call emission table-driven
+   from `DirectCallableDesc`.
 
 4. Add coercion emission between typed results and demands.
 

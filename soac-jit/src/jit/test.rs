@@ -927,6 +927,83 @@ def f():
             static_runtime_primitive_for_call(&global_ord_call, &module_constants),
             None
         );
+
+        let wrong_arity_ord_call = Call::new(
+            name_expr(test_runtime_name("ord")),
+            vec![
+                CallArgPositional::Positional(name_expr(test_name("x"))),
+                CallArgPositional::Positional(name_expr(test_name("y"))),
+            ],
+            vec![],
+        );
+        assert_eq!(
+            static_runtime_primitive_for_call(&wrong_arity_ord_call, &module_constants),
+            None
+        );
+    }
+
+    #[test]
+    fn runtime_builtin_i64_demand_accepts_ord_and_i64_constants() {
+        let mut module = test_module(ModuleNameGen::new(0), vec![test_function()]);
+        module
+            .module_constants
+            .push(InstrResolved::Load(Load::new(test_runtime_name("ord"))));
+        module.module_constants.push(int_literal(65));
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let arg = name_expr(test_name("x"));
+        let ord_call = InstrCodegen::Call(Call::new(
+            name_expr(test_constant_name(0)),
+            vec![CallArgPositional::Positional(arg)],
+            vec![],
+        ));
+        let int_constant = name_expr(test_constant_name(1));
+
+        assert!(codegen_expr_can_satisfy_i64_demand(
+            &ord_call,
+            &module_constants
+        ));
+        assert!(codegen_expr_can_satisfy_i64_demand(
+            &int_constant,
+            &module_constants
+        ));
+    }
+
+    #[test]
+    fn runtime_builtin_param_matching_uses_descriptor_abi() {
+        let mut module = test_module(ModuleNameGen::new(0), vec![test_function()]);
+        module
+            .module_constants
+            .push(InstrResolved::Load(Load::new(test_runtime_name("chr"))));
+        module.module_constants.push(int_literal(65));
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+
+        let literal_chr_call = Call::new(
+            name_expr(test_constant_name(0)),
+            vec![CallArgPositional::Positional(name_expr(
+                test_constant_name(1),
+            ))],
+            vec![],
+        );
+        let unknown_chr_call = Call::new(
+            name_expr(test_constant_name(0)),
+            vec![CallArgPositional::Positional(name_expr(test_name("x")))],
+            vec![],
+        );
+        let desc = static_runtime_primitive_desc_for_call(&literal_chr_call, &module_constants)
+            .expect("chr runtime primitive should be recognized");
+
+        assert!(runtime_primitive_call_params_can_satisfy_abi(
+            &literal_chr_call,
+            desc,
+            &module_constants
+        ));
+        assert!(!runtime_primitive_call_params_can_satisfy_abi(
+            &unknown_chr_call,
+            desc,
+            &module_constants
+        ));
     }
 
     #[test]

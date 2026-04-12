@@ -10,11 +10,15 @@ def codepoint(value):
 
 def roundtrip(value):
     return chr(ord(value))
+
+def from_literal():
+    return chr(65)
 """
 
     with soac_module(tmp_path, "runtime_builtin_primitives", source) as module:
         assert module.codepoint("A") == 65
         assert module.roundtrip("Z") == "Z"
+        assert module.from_literal() == "A"
 
 
 def test_ord_chr_runtime_builtin_primitive_errors(tmp_path):
