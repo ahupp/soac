@@ -4047,10 +4047,7 @@ fn emit_checked_local_value_or_deleted(
         ctx,
     );
     fb.ins().call(ctx.raise_deleted_name_error_ref, &[name_obj]);
-    let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
-    fb.ins()
-        .call(ctx.decref_ref, &[ctx.consts.thread_state_value, name_obj]);
-    emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
+    emit_release_owned_inputs(fb, ctx, &[name_obj]);
     fb.ins()
         .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
 
@@ -4094,22 +4091,20 @@ fn step_null_block_args(ctx: &JitEmitCtx<'_>) -> Vec<ir::BlockArg> {
     block_arg_values(&ctx.consts.step_null_args)
 }
 
-fn emit_take_error_before_local_null_cleanup(
+fn emit_release_owned_inputs(
     fb: &mut FunctionBuilder<'_>,
     ctx: &JitEmitCtx<'_>,
-) -> ir::Value {
-    emit_take_current_raised_exception_or_trap(fb, ctx.consts.ptr_ty, ctx.consts.thread_state_value)
-}
-
-fn emit_restore_error_after_local_null_cleanup(
-    fb: &mut FunctionBuilder<'_>,
-    ctx: &JitEmitCtx<'_>,
-    error_value: ir::Value,
+    owned_inputs: &[ir::Value],
 ) {
-    fb.ins().call(
-        ctx.set_raised_exception_ref,
-        &[ctx.consts.thread_state_value, error_value],
-    );
+    // `ctx.decref_ref` lowers to the runtime decref helper, which already preserves the
+    // currently raised exception across any object deallocation it triggers. Error paths can
+    // therefore release owned temporaries directly before jumping to `step_null`.
+    for owned_input in owned_inputs {
+        fb.ins().call(
+            ctx.decref_ref,
+            &[ctx.consts.thread_state_value, *owned_input],
+        );
+    }
 }
 
 fn emit_decref_owned_input_after_nullable_result(
@@ -4127,37 +4122,8 @@ fn emit_decref_owned_inputs_after_nullable_result(
     result: ir::Value,
     owned_inputs: &[ir::Value],
 ) -> ir::Value {
-    let null_ptr = fb.ins().iconst(ctx.consts.ptr_ty, 0);
-    let result_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, result, null_ptr);
-    let null_block = fb.create_block();
-    let ok_block = fb.create_block();
-    let done_block = fb.create_block();
-    fb.append_block_param(done_block, ctx.consts.ptr_ty);
-    fb.ins()
-        .brif(result_is_null, null_block, &[], ok_block, &[]);
-
-    fb.switch_to_block(null_block);
-    let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
-    for owned_input in owned_inputs {
-        fb.ins().call(
-            ctx.decref_ref,
-            &[ctx.consts.thread_state_value, *owned_input],
-        );
-    }
-    emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
-    fb.ins().jump(done_block, &[ir::BlockArg::Value(result)]);
-
-    fb.switch_to_block(ok_block);
-    for owned_input in owned_inputs {
-        fb.ins().call(
-            ctx.decref_ref,
-            &[ctx.consts.thread_state_value, *owned_input],
-        );
-    }
-    fb.ins().jump(done_block, &[ir::BlockArg::Value(result)]);
-
-    fb.switch_to_block(done_block);
-    fb.block_params(done_block)[0]
+    emit_release_owned_inputs(fb, ctx, owned_inputs);
+    result
 }
 
 fn emit_checked_owned_pyobject_call_with_cleanup(
@@ -4803,12 +4769,7 @@ fn emit_pack_current_values_tuple(
 
     fb.switch_to_block(set_fail_block);
     let failed_tuple = fb.block_params(set_fail_block)[0];
-    let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
-    fb.ins().call(
-        ctx.decref_ref,
-        &[ctx.consts.thread_state_value, failed_tuple],
-    );
-    emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
+    emit_release_owned_inputs(fb, ctx, &[failed_tuple]);
     fb.ins()
         .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
 
@@ -4853,12 +4814,7 @@ fn emit_call_args_tuple_from_values(
         );
         fb.switch_to_block(set_fail_block);
         let failed_tuple = fb.block_params(set_fail_block)[0];
-        let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
-        fb.ins().call(
-            ctx.decref_ref,
-            &[ctx.consts.thread_state_value, failed_tuple],
-        );
-        emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
+        emit_release_owned_inputs(fb, ctx, &[failed_tuple]);
         fb.ins()
             .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
         fb.switch_to_block(set_ok_block);
@@ -4943,48 +4899,17 @@ fn emit_positional_vectorcall_with_arg_values(
         ],
     );
     let call_value = fb.inst_results(call_inst)[0];
-    let call_is_null = fb
-        .ins()
-        .icmp(ir::condcodes::IntCC::Equal, call_value, null_ptr);
-    let call_null_block = fb.create_block();
-    let call_ok_block = fb.create_block();
-    fb.append_block_param(call_ok_block, ptr_ty);
-    fb.ins().brif(
-        call_is_null,
-        call_null_block,
-        &[],
-        call_ok_block,
-        &[ir::BlockArg::Value(call_value)],
-    );
-
-    fb.switch_to_block(call_null_block);
-    let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
-    for (value, borrowed_arg) in arg_values.iter().copied().zip(arg_borrowed.iter().copied()) {
-        if !borrowed_arg {
-            fb.ins()
-                .call(ctx.decref_ref, &[ctx.consts.thread_state_value, value]);
-        }
-    }
-    if !callable_is_borrowed {
-        fb.ins()
-            .call(ctx.decref_ref, &[ctx.consts.thread_state_value, callable]);
-    }
-    emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
-    fb.ins()
-        .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
-
-    fb.switch_to_block(call_ok_block);
+    let mut owned_inputs = Vec::with_capacity(arg_values.len() + usize::from(!callable_is_borrowed));
     for (value, borrowed_arg) in arg_values.into_iter().zip(arg_borrowed.into_iter()) {
         if !borrowed_arg {
-            fb.ins()
-                .call(ctx.decref_ref, &[ctx.consts.thread_state_value, value]);
+            owned_inputs.push(value);
         }
     }
     if !callable_is_borrowed {
-        fb.ins()
-            .call(ctx.decref_ref, &[ctx.consts.thread_state_value, callable]);
+        owned_inputs.push(callable);
     }
-    fb.block_params(call_ok_block)[0]
+    let call_value = emit_decref_owned_inputs_after_nullable_result(fb, ctx, call_value, &owned_inputs);
+    emit_checked_owned_pyobject_result(fb, call_value, ctx)
 }
 
 fn emit_object_call_with_tuple_args(
@@ -5141,16 +5066,8 @@ fn emit_kwargs_setitem_or_cleanup(
     );
     fb.switch_to_block(set_fail);
     let failed_kwargs = fb.block_params(set_fail)[0];
-    let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
-    fb.ins().call(
-        ctx.decref_ref,
-        &[ctx.consts.thread_state_value, failed_kwargs],
-    );
-    for value in cleanup_on_error {
-        fb.ins()
-            .call(ctx.decref_ref, &[ctx.consts.thread_state_value, *value]);
-    }
-    emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
+    emit_release_owned_inputs(fb, ctx, &[failed_kwargs]);
+    emit_release_owned_inputs(fb, ctx, cleanup_on_error);
     fb.ins()
         .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
     fb.switch_to_block(set_ok);
@@ -6871,19 +6788,16 @@ fn emit_direct_call_resolved_raw_with_arg_values(
     let call_value = fb.inst_results(call_inst)[0];
     fb.ins()
         .call(ctx.leave_recursive_ref, &[ctx.consts.thread_state_value]);
-
+    let mut owned_inputs = Vec::with_capacity(arg_values.len() + usize::from(!callable_is_borrowed));
     for (value, borrowed_arg) in arg_values.into_iter().zip(arg_borrowed.into_iter()) {
         if !borrowed_arg {
-            fb.ins()
-                .call(ctx.decref_ref, &[ctx.consts.thread_state_value, value]);
+            owned_inputs.push(value);
         }
     }
     if !callable_is_borrowed {
-        fb.ins()
-            .call(ctx.decref_ref, &[ctx.consts.thread_state_value, callable]);
+        owned_inputs.push(callable);
     }
-
-    call_value
+    emit_decref_owned_inputs_after_nullable_result(fb, ctx, call_value, &owned_inputs)
 }
 
 fn emit_direct_call_resolved_with_arg_values(
@@ -6975,14 +6889,13 @@ fn emit_direct_constructor_resolved_with_arg_values(
     );
 
     fb.switch_to_block(alloc_failed);
-    let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
+    let mut owned_inputs = Vec::with_capacity(arg_values.len());
     for (value, borrowed_arg) in arg_values.iter().copied().zip(arg_borrowed.iter().copied()) {
         if !borrowed_arg {
-            fb.ins()
-                .call(ctx.decref_ref, &[ctx.consts.thread_state_value, value]);
+            owned_inputs.push(value);
         }
     }
-    emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
+    emit_release_owned_inputs(fb, ctx, &owned_inputs);
     fb.ins()
         .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
 
@@ -7030,17 +6943,7 @@ fn emit_direct_constructor_resolved_with_arg_values(
     );
 
     fb.switch_to_block(init_fail_block);
-    let error_value = emit_take_current_raised_exception_or_trap(
-        fb,
-        ctx.consts.ptr_ty,
-        ctx.consts.thread_state_value,
-    );
-    fb.ins()
-        .call(ctx.decref_ref, &[ctx.consts.thread_state_value, allocated]);
-    fb.ins().call(
-        ctx.set_raised_exception_ref,
-        &[ctx.consts.thread_state_value, error_value],
-    );
+    emit_release_owned_inputs(fb, ctx, &[allocated]);
     fb.ins()
         .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
 
@@ -7954,9 +7857,7 @@ fn emit_truthy_from_pyobject_value(
     );
 
     fb.switch_to_block(truth_error_block);
-    let error_value = emit_take_error_before_local_null_cleanup(fb, ctx);
     emit_release_pyobject_if_owned(fb, value, py_facts, owned, ctx);
-    emit_restore_error_after_local_null_cleanup(fb, ctx, error_value);
     fb.ins()
         .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
 
@@ -8304,11 +8205,7 @@ fn emit_codegen_simple_call_with_local_env(
             fb.switch_to_block(deleted_block);
             fb.ins()
                 .call(emit_ctx.raise_deleted_name_error_ref, &[name_obj]);
-            let error_value = emit_take_error_before_local_null_cleanup(fb, emit_ctx);
-            fb.ins().call(
-                emit_ctx.decref_ref,
-                &[emit_ctx.consts.thread_state_value, name_obj],
-            );
+            emit_release_owned_inputs(fb, emit_ctx, &[name_obj]);
             if !value_borrowed {
                 emit_decref_if_not_null(
                     fb,
@@ -8318,7 +8215,6 @@ fn emit_codegen_simple_call_with_local_env(
                     value_obj,
                 );
             }
-            emit_restore_error_after_local_null_cleanup(fb, emit_ctx, error_value);
             fb.ins().jump(
                 emit_ctx.consts.step_null_block,
                 &step_null_block_args(emit_ctx),
