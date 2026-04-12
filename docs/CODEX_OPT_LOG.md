@@ -305,3 +305,21 @@ benchmarked throughput delta, and the headline pre/post numbers.
 - post-change benchmark:
   - specialized pass, 1M loops x3: `175063`, `176168`, `175076 loops/s`
   - perf-context run: `172766 loops/s`
+
+## 2026-04-12 - Honor effect-only demand for LocalEnv stores
+
+- jj change id: `xykryxmq`
+- summary: Statement-position LocalEnv store/delete producers now return
+  `NoValue` when the result is not consumed, avoiding owned-`None`
+  materialization for those producer paths. Against the verify-refcount-counter
+  base, specialization sets and verify hit/fallback counters stayed unchanged.
+- throughput: `+9.32%` specialized pystone median; code size `-2.90%`;
+  applied refcount ops unchanged
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `170756`, `172461`, `166913 loops/s`
+  - pystone JIT code bytes: `933661`
+  - pystone verify refcount ops: `20956626`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `185930`, `189987`, `186673 loops/s`
+  - pystone JIT code bytes: `906622`
+  - pystone verify refcount ops: `20956626`
