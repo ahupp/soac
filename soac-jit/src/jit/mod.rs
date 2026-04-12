@@ -2656,6 +2656,31 @@ struct LocalEnv {
     entries: Vec<LocalEnvEntry>,
 }
 
+#[derive(Clone)]
+struct LocalFailureCleanupValue {
+    key: LocalFailureCleanupValueKey,
+    value: ir::Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum LocalFailureCleanupValueKey {
+    Location(LocalLocation),
+    Name(String),
+}
+
+impl LocalFailureCleanupValue {
+    fn from_local_env_entry(entry: &LocalEnvEntry) -> Self {
+        let key = entry
+            .location
+            .map(LocalFailureCleanupValueKey::Location)
+            .unwrap_or_else(|| LocalFailureCleanupValueKey::Name(entry.name.clone()));
+        Self {
+            key,
+            value: entry.value,
+        }
+    }
+}
+
 impl LocalEnv {
     fn bind_entry_location_with_aliases(
         &mut self,
@@ -2971,10 +2996,10 @@ impl LocalEnv {
             .collect()
     }
 
-    fn local_only_cleanup_values_excluding(
+    fn local_only_cleanup_entries_excluding(
         &self,
         forwarded_locations: &HashSet<LocalLocation>,
-    ) -> Vec<ir::Value> {
+    ) -> Vec<LocalFailureCleanupValue> {
         self.entries
             .iter()
             .filter(|entry| {
@@ -2984,7 +3009,7 @@ impl LocalEnv {
                     && entry.storage == LocalEnvStorage::LocalOnly
                     && transient_local_needs_decref(entry.ref_kind)
             })
-            .map(|entry| entry.value)
+            .map(LocalFailureCleanupValue::from_local_env_entry)
             .collect()
     }
 
@@ -4129,10 +4154,47 @@ enum PendingLocalFailureContinuation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct LocalFailureCleanupKey {
-    cleanup_values: Vec<ir::Value>,
-    forwarded_values: Vec<ir::Value>,
-    continuation: PendingLocalFailureContinuation,
+enum LocalFailureCleanupKey {
+    Exact {
+        cleanup_values: Vec<ir::Value>,
+        forwarded_values: Vec<ir::Value>,
+        continuation: PendingLocalFailureContinuation,
+    },
+    CleanupNullLocals {
+        cleanup_keys: Vec<LocalFailureCleanupValueKey>,
+        cleanup_null_block: ir::Block,
+    },
+}
+
+impl LocalFailureCleanupKey {
+    fn new(
+        cleanup_values: &[LocalFailureCleanupValue],
+        forwarded_values: &[ir::Value],
+        continuation: PendingLocalFailureContinuation,
+        share_cleanup_null_by_locals: bool,
+    ) -> LocalFailureCleanupKey {
+        match continuation {
+            PendingLocalFailureContinuation::CleanupNull(cleanup_null_block)
+                if share_cleanup_null_by_locals && forwarded_values.is_empty() =>
+            {
+                LocalFailureCleanupKey::CleanupNullLocals {
+                    cleanup_keys: cleanup_values
+                        .iter()
+                        .map(|cleanup_value| cleanup_value.key.clone())
+                        .collect(),
+                    cleanup_null_block,
+                }
+            }
+            _ => LocalFailureCleanupKey::Exact {
+                cleanup_values: cleanup_values
+                    .iter()
+                    .map(|cleanup_value| cleanup_value.value)
+                    .collect(),
+                forwarded_values: forwarded_values.to_vec(),
+                continuation,
+            },
+        }
+    }
 }
 
 fn step_null_block_args(ctx: &JitEmitCtx<'_>) -> Vec<ir::BlockArg> {
@@ -10038,6 +10100,7 @@ fn local_failure_cleanup_emit_ctx<'mc>(
     cleanup_null_block: ir::Block,
     pending_local_failure_cleanups: &mut Vec<PendingLocalFailureCleanup>,
     local_failure_cleanup_blocks: &mut HashMap<LocalFailureCleanupKey, ir::Block>,
+    share_cleanup_null_by_locals: bool,
 ) -> Result<Option<JitEmitCtx<'mc>>, String> {
     if !emit_ctx.consts.step_null_args.is_empty() {
         return Ok(None);
@@ -10061,24 +10124,25 @@ fn local_failure_cleanup_emit_ctx<'mc>(
                 PendingLocalFailureContinuation::CleanupNull(cleanup_null_block),
             )
         };
-    let cleanup_values = local_env.local_only_cleanup_values_excluding(&forwarded_local_indices);
-    if cleanup_values.is_empty() && forwarded_values.is_empty() {
+    let cleanup_entries = local_env.local_only_cleanup_entries_excluding(&forwarded_local_indices);
+    if cleanup_entries.is_empty() && forwarded_values.is_empty() {
         return Ok(None);
     }
-    if cleanup_values.is_empty() {
+    if cleanup_entries.is_empty() {
         return Ok(Some(emit_ctx.with_step_null_target(
             emit_ctx.consts.step_null_block,
             forwarded_values,
         )));
     }
 
-    let cleanup_arg_count = cleanup_values.len();
+    let cleanup_arg_count = cleanup_entries.len();
     let forwarded_arg_count = forwarded_values.len();
-    let key = LocalFailureCleanupKey {
-        cleanup_values: cleanup_values.clone(),
-        forwarded_values: forwarded_values.clone(),
+    let key = LocalFailureCleanupKey::new(
+        cleanup_entries.as_slice(),
+        forwarded_values.as_slice(),
         continuation,
-    };
+        share_cleanup_null_by_locals,
+    );
     let cleanup_block = if let Some(cleanup_block) = local_failure_cleanup_blocks.get(&key).copied()
     {
         cleanup_block
@@ -10098,7 +10162,7 @@ fn local_failure_cleanup_emit_ctx<'mc>(
         local_failure_cleanup_blocks.insert(key, cleanup_block);
         cleanup_block
     };
-    let mut step_null_args = cleanup_values;
+    let mut step_null_args: Vec<_> = cleanup_entries.iter().map(|entry| entry.value).collect();
     step_null_args.extend(forwarded_values);
     Ok(Some(
         emit_ctx.with_step_null_target(cleanup_block, step_null_args),
@@ -10114,6 +10178,7 @@ fn emit_typed_codegen_ops(
     cleanup_null_block: ir::Block,
     pending_local_failure_cleanups: &mut Vec<PendingLocalFailureCleanup>,
     local_failure_cleanup_blocks: &mut HashMap<LocalFailureCleanupKey, ir::Block>,
+    share_cleanup_null_by_locals: bool,
     jit_module: &mut JITModule,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<(), String> {
@@ -10125,6 +10190,7 @@ fn emit_typed_codegen_ops(
             cleanup_null_block,
             pending_local_failure_cleanups,
             local_failure_cleanup_blocks,
+            share_cleanup_null_by_locals,
         )?;
         let stmt_emit_ctx = stmt_emit_ctx.as_ref().unwrap_or(emit_ctx);
         let result = emit_typed_codegen_stmt_result_with_local_env(
@@ -13107,6 +13173,20 @@ fn build_cranelift_run_bb_specialized_function(
         let mut exception_dispatch_blocks: Vec<Option<ir::Block>> = vec![None; exec_blocks.len()];
         let mut pending_local_failure_cleanups = Vec::new();
         let mut local_failure_cleanup_blocks = HashMap::new();
+        let module_has_generator_runtime_cells = module.callable_defs.iter().any(|function| {
+            function
+                .storage_layout()
+                .as_ref()
+                .is_some_and(|layout| !layout.runtime_cells.is_empty())
+        });
+        // Generator/coroutine modules have cleanup paths that can own objects indirectly through
+        // runtime cells and wrapper functions. Keep those exact until that ownership model is less
+        // implicit; the local-key sharing below is intended for ordinary function locals.
+        let share_cleanup_null_by_locals = function
+            .storage_layout()
+            .as_ref()
+            .is_none_or(|layout| layout.runtime_cells.is_empty())
+            && !module_has_generator_runtime_cells;
         for (index, maybe_dispatch) in exc_dispatches.iter().enumerate() {
             if let Some(dispatch_plan) = maybe_dispatch {
                 let dispatch_block = fb.create_block();
@@ -13276,6 +13356,7 @@ fn build_cranelift_run_bb_specialized_function(
                 cleanup_null_blocks[index],
                 &mut pending_local_failure_cleanups,
                 &mut local_failure_cleanup_blocks,
+                share_cleanup_null_by_locals,
                 jit_module,
                 &mut func_imports,
             )?;
@@ -13287,6 +13368,7 @@ fn build_cranelift_run_bb_specialized_function(
                 cleanup_null_blocks[index],
                 &mut pending_local_failure_cleanups,
                 &mut local_failure_cleanup_blocks,
+                share_cleanup_null_by_locals,
             )?;
             let term_emit_ctx = term_emit_ctx.as_ref().unwrap_or(&emit_ctx);
             emit_typed_codegen_term(

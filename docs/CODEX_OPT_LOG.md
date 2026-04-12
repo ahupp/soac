@@ -455,3 +455,21 @@ benchmarked throughput delta, and the headline pre/post numbers.
   - specialized pass, 1M loops x3: `221766`, `225928`, `228347 loops/s`
 - post-change benchmark:
   - specialized pass, 1M loops x3: `280740`, `287558`, `286068 loops/s`
+
+## 2026-04-12 - Share local failure cleanup blocks by logical locals
+
+- jj change id: `onzmnylr`
+- summary: Cleanup-null failure paths now share cleanup blocks when they release
+  the same ordered logical locals, while passing the current SSA values as
+  block params. Generator/coroutine modules stay on exact cleanup keys until
+  their runtime-cell ownership paths are less implicit.
+- throughput: `-1.65%` specialized pystone median; code size `-9.79%`;
+  machine blocks `-7.96%`
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `284414`, `291437`, `278717 loops/s`
+  - pystone JIT code bytes: `344486`
+  - pystone machine blocks: `21281`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `279717`, `277360`, `281715 loops/s`
+  - pystone JIT code bytes: `310747`
+  - pystone machine blocks: `19587`
