@@ -241,7 +241,7 @@ pub fn check_refcount_plan_against_current_jit(
     function: &BlockPyFunction<CodegenModuleShape>,
     plan: &FunctionRefcountPlan,
 ) -> Result<CurrentJitRefcountPlanCheck, String> {
-    let stack_slot_names = function
+    let storage_layout_local_names = function
         .storage_layout()
         .as_ref()
         .map(|layout| layout.stack_slots().iter().cloned().collect::<HashSet<_>>())
@@ -264,27 +264,27 @@ pub fn check_refcount_plan_against_current_jit(
         for action in &block_plan.actions {
             match &action.kind {
                 RefcountActionKind::RebindLocal { local, .. } => {
-                    check_local_has_stack_slot(
+                    check_local_has_storage_layout_entry(
                         function,
-                        &stack_slot_names,
+                        &storage_layout_local_names,
                         &local.name,
                         &mut errors,
                     );
                     check.local_rebinds += 1;
                 }
                 RefcountActionKind::DeleteLocal { local, .. } => {
-                    check_local_has_stack_slot(
+                    check_local_has_storage_layout_entry(
                         function,
-                        &stack_slot_names,
+                        &storage_layout_local_names,
                         &local.name,
                         &mut errors,
                     );
                     check.local_deletes += 1;
                 }
                 RefcountActionKind::ReleaseLocal { local, reason, .. } => {
-                    check_local_has_stack_slot(
+                    check_local_has_storage_layout_entry(
                         function,
-                        &stack_slot_names,
+                        &storage_layout_local_names,
                         &local.name,
                         &mut errors,
                     );
@@ -315,13 +315,13 @@ pub fn check_refcount_plan_against_current_jit(
     }
 }
 
-fn check_local_has_stack_slot(
+fn check_local_has_storage_layout_entry(
     function: &BlockPyFunction<CodegenModuleShape>,
-    stack_slot_names: &HashSet<String>,
+    storage_layout_local_names: &HashSet<String>,
     local_name: &str,
     errors: &mut Vec<String>,
 ) {
-    if stack_slot_names.contains(local_name) {
+    if storage_layout_local_names.contains(local_name) {
         return;
     }
     errors.push(format!(
@@ -1236,7 +1236,7 @@ def f():
     }
 
     #[test]
-    fn refcount_plan_check_maps_terminal_releases_to_stack_slot_cleanup() {
+    fn refcount_plan_check_maps_terminal_releases_to_local_env_cleanup() {
         let (lowered, function_index) = lowered_function(
             r#"
 def f():
@@ -1262,7 +1262,7 @@ def f():
     }
 
     #[test]
-    fn refcount_plan_check_maps_normal_edge_releases_to_stack_slot_cleanup() {
+    fn refcount_plan_check_maps_normal_edge_releases_to_local_env_cleanup() {
         let (lowered, function_index) = lowered_function(
             r#"
 def f(flag):
