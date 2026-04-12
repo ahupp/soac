@@ -96,6 +96,8 @@ Consumers define what they need from children:
   transfer boundaries.
 - Branch tests use `I32Bool01` demand rather than forcing a Python object and
   then re-lowering truthiness.
+- Return expressions use `PyObject { borrowed_ok: false }` demand because the
+  Python return boundary needs a value that can be returned as an owned object.
 
 ## Store Semantics
 
@@ -144,7 +146,9 @@ it currently preserves existing `EffectOnly` behavior while providing the table
 that later term and typed-value demands can share. Step 7 has started by marking
 branch tests with `I32Bool01` demand in that same table. Step 7 also marks
 branch-table indices with `I64Index` demand and routes typed branch-table term
-emission through the planned integer index result.
+emission through the planned integer index result. Return expressions are now
+planned as owned `PyObject` demand and typed return emission consumes that
+planned result before entering the shared return cleanup path.
 
 1. Add `ResultDemand::{EffectOnly, PyObject { borrowed_ok }}` and an `EmitResult`
    wrapper near the existing `SoacValue`/LocalEnv codegen types.
@@ -159,7 +163,8 @@ emission through the planned integer index result.
 6. Add a later BlockPy demand-planning pass keyed by semantic `InstrId`, after
    name binding / simplification / instrumentation and before JIT planning.
    Started in JIT codegen as a local plan for statement-root demands; this can
-   move earlier once more consumers need planned typed demands.
+   move earlier once more consumers need planned typed demands. Return values are
+   now planned as owned `PyObject` demand.
 7. Extend demand to `I32Bool01` and `I64Index` once the value-space/refcount
    representation can carry non-Python values cleanly. Started with branch-test
    `I32Bool01` demands and branch-table `I64Index` demands.

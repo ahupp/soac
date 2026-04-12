@@ -2062,6 +2062,9 @@ fn plan_typed_result_demands(
         if let BlockTerm::BranchTable(branch) = &block.term {
             plan.insert_instr(&branch.index, ResultDemand::I64_INDEX);
         }
+        if let BlockTerm::Return(value) = &block.term {
+            plan.insert_instr(value, ResultDemand::PYOBJECT_OWNED);
+        }
     }
     plan
 }
@@ -9334,6 +9337,37 @@ fn emit_codegen_if_truth_i32(
     )
 }
 
+fn emit_codegen_return_pyobject(
+    fb: &mut FunctionBuilder<'_>,
+    source_label: BlockLabel,
+    ret_value: ir::Value,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    current_exception_name: Option<&str>,
+) -> Result<(), String> {
+    let forwarded_locations = HashSet::new();
+    let release_reason = RefcountReleaseReason::Return;
+    emit_planned_local_releases_for_reason_with_local_env(
+        fb,
+        source_label,
+        &release_reason,
+        local_env,
+        &forwarded_locations,
+        emit_ctx,
+    )?;
+    emit_decref_unforwarded_local_env(
+        fb,
+        local_env,
+        &forwarded_locations,
+        &[],
+        emit_ctx.consts.thread_state_value,
+        emit_ctx.decref_ref,
+    );
+    emit_pop_handled_exception_if_leaving(fb, current_exception_name, &[], emit_ctx);
+    fb.ins().return_(&[ret_value]);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_codegen_branch_table_from_i64(
     fb: &mut FunctionBuilder<'_>,
@@ -9609,7 +9643,6 @@ fn emit_codegen_term(
             )?;
         }
         BlockTerm::Return(value) => {
-            let forwarded_locations = HashSet::new();
             let ret_value = emit_codegen_expr_with_local_env(
                 fb,
                 value,
@@ -9619,25 +9652,14 @@ fn emit_codegen_term(
                 jit_module,
                 func_imports,
             );
-            let release_reason = RefcountReleaseReason::Return;
-            emit_planned_local_releases_for_reason_with_local_env(
+            emit_codegen_return_pyobject(
                 fb,
                 source_label,
-                &release_reason,
+                ret_value,
                 local_env,
-                &forwarded_locations,
                 emit_ctx,
+                current_exception_name,
             )?;
-            emit_decref_unforwarded_local_env(
-                fb,
-                local_env,
-                &forwarded_locations,
-                &[],
-                emit_ctx.consts.thread_state_value,
-                decref_ref,
-            );
-            emit_pop_handled_exception_if_leaving(fb, current_exception_name, &[], emit_ctx);
-            fb.ins().return_(&[ret_value]);
         }
         BlockTerm::Raise(raise_stmt) => {
             let forwarded_locations = HashSet::new();
@@ -9827,6 +9849,45 @@ fn emit_typed_codegen_term(
             emit_ctx,
             jit_module,
             func_imports,
+        );
+    }
+
+    if let BlockTerm::Return(value) = term {
+        let value_instr_id = value.try_semantic_instr_id();
+        let demand = value_instr_id
+            .and_then(|instr_id| emit_ctx.result_demand_plan.demand_for_instr_id(instr_id))
+            .unwrap_or(ResultDemand::PYOBJECT_OWNED);
+        let result = match demand {
+            ResultDemand::PyObject { borrowed_ok: false } => {
+                emit_typed_codegen_stmt_result_with_local_env(
+                    fb,
+                    value,
+                    local_env,
+                    emit_ctx,
+                    demand,
+                    jit_module,
+                    func_imports,
+                )?
+            }
+            other => {
+                return Err(format!(
+                    "typed return value requires owned PyObject demand, got {other:?}"
+                ));
+            }
+        };
+        let (ret_value, ownership, _) = result.expect_pyobject("typed return value");
+        if !ownership.can_satisfy_pyobject_demand(ResultDemand::PYOBJECT_OWNED) {
+            return Err(format!(
+                "typed return value produced {ownership:?}, but return requires owned PyObject"
+            ));
+        }
+        return emit_codegen_return_pyobject(
+            fb,
+            source_label,
+            ret_value,
+            local_env,
+            emit_ctx,
+            current_exception_name,
         );
     }
 
