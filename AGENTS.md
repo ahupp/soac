@@ -156,6 +156,12 @@ of the optimization, the benchmarked throughput delta, and the before/after
 headline numbers. Do not paste validation checklists, full command lines, or
 long run logs.
 
+The benchmark recipes record and print the actual current `@` revision; they do
+not take a revision argument. To benchmark another revision, switch the
+workspace to that revision first, for example with `jj edit <rev>`. Use
+`jj new <rev>` only when you intentionally want a fresh child revision and
+benchmark artifacts named for that child rather than the existing revision.
+
 10. Run the full gate before submitting code changes.
 
 Run `just test-all` before submitting unless the change is docs-only,
@@ -290,6 +296,9 @@ anything non-code affected the run. If there were no such issues, say
   when the user explicitly wants inspector/CLIF artifacts or perf capture, and
   use `just benchmark-deep-profile-from-profile <result-dir>` to extend an
   existing `counters/profile.bin` result without rerunning the profile pass.
+  `just benchmark` records the actual current `@` revision in the result header
+  and does not accept a revision argument; switch revisions first with `jj edit`
+  or, if you intentionally want a fresh child revision, `jj new`.
   Report the specialized apply-pass median from the result directory's
   `benchmark.txt` unless I explicitly ask for the warm unspecialized baseline.
 - Repo-local uv state

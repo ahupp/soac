@@ -17,19 +17,22 @@ just benchmark
 ```
 
 This writes `bench/{change_id}_{commit_id}` so rebased or amended jj changes do
-not accidentally reuse stale results.
+not accidentally reuse stale results. The recipe records and prints the actual
+current `@` revision that it executed.
 
 When a change is finalized for merge to `main`, rebase the finished change onto
-`main` first, then run the benchmark in finalized mode against the exact revision
-that will be merged:
+`main` first, switch the workspace to the exact revision that will be merged,
+then run the benchmark in finalized mode:
 
 ```bash
-just benchmark 1000000 100000 bench <jj-rev> finalized
+jj edit <jj-rev>
+just benchmark 1000000 100000 bench finalized
 ```
 
-This writes `bench/{change_id}`. If the finished change is still the current
-working commit, use `@` for `<jj-rev>`; if you already froze it with `jj new`,
-use the frozen revision such as `@-`.
+This writes `bench/{change_id}`. If you intentionally want a fresh child
+revision instead of the existing change id, you may switch with `jj new <jj-rev>`
+before running `just benchmark`, but the artifact name will then reflect that
+new child revision because the recipe always uses the current `@`.
 
 The first positional argument is the specialized apply-pass loop count:
 

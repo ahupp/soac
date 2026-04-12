@@ -1062,14 +1062,13 @@ benchmark-warm loops="8000000": (update-venv-offline) (build-extension "release"
   BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
     "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
 
-benchmark benchmark_loops="1000000" verify_loops="100000" results_root="bench" result_rev="@" result_mode="one-off": (update-venv-offline) (build-extension "release")
+benchmark benchmark_loops="1000000" verify_loops="100000" results_root="bench" result_mode="one-off": (update-venv-offline) (build-extension "release")
   #!/usr/bin/env bash
   set -euo pipefail
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
   BENCHMARK_LOOPS="{{benchmark_loops}}"
   VERIFY_LOOPS="{{verify_loops}}"
-  RESULT_REV="{{result_rev}}"
   PROFILE_LOOPS="100000"
   SPECIALIZED_RUNS="${BENCHMARK_SPECIALIZED_RUNS:-3}"
   RESULTS_ROOT="{{results_root}}"
@@ -1082,11 +1081,11 @@ benchmark benchmark_loops="1000000" verify_loops="100000" results_root="bench" r
   BENCHMARK_CPU="${BENCHMARK_CPU:-}"
   BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS:-0}"
 
-  # Snapshot the invoking jj workspace before creating side workspaces.
+  # Snapshot the invoking jj workspace so the benchmark labels the exact tree it executes.
   jj status --no-pager >/dev/null
 
-  change_id="$(jj --ignore-working-copy log -r "$RESULT_REV" --no-graph -T 'change_id.short()')"
-  commit_id="$(jj --ignore-working-copy log -r "$RESULT_REV" --no-graph -T 'commit_id.short()')"
+  change_id="$(jj --ignore-working-copy log -r @ --no-graph -T 'change_id.short()')"
+  commit_id="$(jj --ignore-working-copy log -r @ --no-graph -T 'commit_id.short()')"
   case "$RESULT_MODE" in
     one-off)
       result_name="${change_id}_${commit_id}"
@@ -1111,8 +1110,8 @@ benchmark benchmark_loops="1000000" verify_loops="100000" results_root="bench" r
 
   {
     echo "result dir: $result_dir"
-    echo "revision:"
-    jj --ignore-working-copy log -r "$RESULT_REV" --no-graph \
+    echo "executed revision:"
+    jj --ignore-working-copy log -r @ --no-graph \
       -T '"change_id " ++ change_id ++ "\ncommit_id " ++ commit_id ++ "\ndescription " ++ description.first_line() ++ "\n"'
     echo
     echo "date: $(date +%F)"
@@ -1310,7 +1309,7 @@ benchmark-deep-profile-from-profile result_dir verify_loops="100000" perf_loops=
     echo "deep profile result: $RESULT_DIR"
   } 2>&1 | tee "$REPORT"
 
-benchmark-deep-profile benchmark_loops="1000000" verify_loops="100000" perf_loops="10000000" results_root="bench" result_rev="@" result_mode="one-off": (update-venv-offline) (build-extension "release")
+benchmark-deep-profile benchmark_loops="1000000" verify_loops="100000" perf_loops="10000000" results_root="bench" result_mode="one-off": (update-venv-offline) (build-extension "release")
   #!/usr/bin/env bash
   set -euo pipefail
   cd "$REPO_ROOT"
@@ -1318,7 +1317,7 @@ benchmark-deep-profile benchmark_loops="1000000" verify_loops="100000" perf_loop
   benchmark_log="$(mktemp "${TMPDIR:-/tmp}/soac_benchmark_deep_profile.XXXXXX")"
   trap 'rm -f "$benchmark_log"' EXIT
 
-  just benchmark "{{benchmark_loops}}" "{{verify_loops}}" "{{results_root}}" "{{result_rev}}" "{{result_mode}}" \
+  just benchmark "{{benchmark_loops}}" "{{verify_loops}}" "{{results_root}}" "{{result_mode}}" \
     2>&1 | tee "$benchmark_log"
 
   RESULT_DIR="$(sed -n 's/^benchmark result: //p' "$benchmark_log" | tail -n 1)"

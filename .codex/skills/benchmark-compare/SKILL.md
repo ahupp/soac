@@ -68,7 +68,9 @@ Do not reuse a directory that only matches the change id. Rebased jj changes can
 keep the same change id while changing code, dependencies, or benchmark recipe
 behavior, so prefix reuse can silently compare against stale artifacts. If the
 exact `{change_id}_{commit_id}` directory is absent, re-run `just benchmark` for
-that revision and create the exact directory for the current commit id.
+that revision and create the exact directory for the current commit id. The
+benchmark recipe always records the current `@` revision, so switch the
+workspace to the revision you want before running it.
 
 A result is complete enough for comparison when it has `benchmark.txt`,
 `counters/profile.bin`, `counters/verify.bin`, `verify_counters.txt`,
@@ -98,15 +100,13 @@ fi
 
 (
   cd "$ws"
-  just benchmark 1000000 100000 "$original_repo/bench" @-
+  jj edit "$rev"
+  just benchmark 1000000 100000 "$original_repo/bench"
 )
 
 jj workspace forget "$workspace_name"
 rm -rf "$ws"
 ```
-
-The temporary workspace's `@` is an empty child of the requested revision, so
-pass `@-` as the final `just benchmark` revision argument.
 
 ## Compare
 

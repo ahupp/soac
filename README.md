@@ -238,7 +238,10 @@ Notes:
   The default benchmark recipe runs the transformed profile, verify,
   and specialized apply passes and writes the raw result directory under
   `bench/{change_id}_{commit_id}` for one-off runs or `bench/{change_id}`
-  for finalized runs. By default it keeps only the benchmark log and raw
+  for finalized runs. It always records and prints the actual current `@`
+  revision that it executed, so switch revisions first with `jj edit <rev>` if
+  you want to benchmark some revision other than the current checkout. By
+  default it keeps only the benchmark log and raw
   counter files (`profile.bin`, `verify.bin`, `events.jsonl`); it does
   not run `perf` and it does not build inspector-based counter/CLIF
   artifacts.
