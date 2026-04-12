@@ -12,9 +12,7 @@ use soac_blockpy::passes::{CodegenModuleShape, infer_module_value_facts};
 use soac_jit::module_constants::ModuleCodegenConstants;
 use soac_jit::module_type::build_shared_state_for_inspection;
 use soac_jit::{
-    exc_dispatch_plan, plan_function_locals, plan_function_refcount_ownership,
-    planned_jit_params_for_function,
-    render_cranelift_run_bb_specialized_with_runtime_state_and_cfg,
+    plan_jit_function_locals, render_cranelift_run_bb_specialized_with_runtime_state_and_cfg,
 };
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
@@ -296,28 +294,20 @@ pub fn jit_debug_plan(
             "no specialized JIT plan for {module_name}.fn#{function_id}"
         ));
     };
-    let local_plan = plan_function_locals(function, &facts);
-    let refcount_plan = plan_function_refcount_ownership(module, function, &facts)?;
-    let runtime_params =
-        planned_jit_params_for_function(function, &local_plan).map_err(|err| err.to_string())?;
+    let jit_local_plan = plan_jit_function_locals(module, function, &facts)?;
     let block_info = function
         .blocks
         .iter()
         .enumerate()
         .map(|(index, block)| {
-            let block_runtime_params = &runtime_params[index];
+            let block_runtime_params = &jit_local_plan.runtime_block_params[index];
             (
                 block.label.to_string(),
                 block_runtime_params
                     .iter()
                     .map(|param| param.arg_name.clone())
                     .collect::<Vec<_>>(),
-                exc_dispatch_plan(
-                    function,
-                    block,
-                    block_runtime_params.as_slice(),
-                    &refcount_plan,
-                ),
+                jit_local_plan.exc_dispatches[index].clone(),
             )
         })
         .collect::<Vec<_>>();

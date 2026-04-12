@@ -72,12 +72,12 @@ use direct_abi::{
 };
 pub use planning::{
     BlockExcDispatchPlan, BlockParamFacts, CurrentJitRefcountPlanCheck, EdgeTransportPlan,
-    FunctionLocalPlan, LocalRefKind, ParamBindingFacts, ParamProvenance, PlannedLocalStorage,
-    PlannedStackSlotEntrySeed, RuntimeBlockParamPlan, check_refcount_plan_against_current_jit,
-    exc_dispatch_plan, local_ref_kind_for_stack_mirror, plan_function_locals,
-    plan_function_refcount_ownership, planned_implicit_target_transports_for_function,
-    planned_jit_params_for_function, planned_jump_edge_transports_for_function,
-    planned_stack_slot_entry_seeds_for_function,
+    FunctionLocalPlan, LocalRefKind, ParamBindingFacts, ParamProvenance, PlannedJitFunctionLocals,
+    PlannedLocalStorage, PlannedStackSlotEntrySeed, RuntimeBlockParamPlan,
+    check_refcount_plan_against_current_jit, exc_dispatch_plan, local_ref_kind_for_stack_mirror,
+    plan_function_locals, plan_function_refcount_ownership, plan_jit_function_locals,
+    planned_implicit_target_transports_for_function, planned_jit_params_for_function,
+    planned_jump_edge_transports_for_function, planned_stack_slot_entry_seeds_for_function,
 };
 use runtime_context::{
     FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET, FUNCTION_ENV_GLOBALS_OBJ_OFFSET,
@@ -12146,9 +12146,7 @@ fn build_cranelift_run_bb_specialized_function(
     let empty_direct_functions = HashMap::new();
     let direct_call_functions = predeclared_direct_functions.unwrap_or(&empty_direct_functions);
     let value_facts = infer_jit_value_facts(module);
-    let local_plan = plan_function_locals(function, &value_facts);
-    let refcount_plan = plan_function_refcount_ownership(module, function, &value_facts)?;
-    let _refcount_plan_check = check_refcount_plan_against_current_jit(function, &refcount_plan)?;
+    let jit_local_plan = plan_jit_function_locals(module, function, &value_facts)?;
 
     let mut direct_call_target_functions = HashMap::new();
     for function_id in direct_call_targets {
@@ -12206,29 +12204,16 @@ fn build_cranelift_run_bb_specialized_function(
         let mut fb = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
         let entry_block = fb.create_block();
         let mut exec_blocks = Vec::with_capacity(block_count);
-        let runtime_block_params = planned_jit_params_for_function(function, &local_plan)?;
-        let implicit_target_transports =
-            planned_implicit_target_transports_for_function(function, &runtime_block_params);
-        let jump_edge_transports =
-            planned_jump_edge_transports_for_function(function, &runtime_block_params);
-        let planned_stack_slot_entry_seeds =
-            planned_stack_slot_entry_seeds_for_function(function, &local_plan);
+        let runtime_block_params = &jit_local_plan.runtime_block_params;
+        let implicit_target_transports = &jit_local_plan.implicit_target_transports;
+        let jump_edge_transports = &jit_local_plan.jump_edge_transports;
+        let planned_stack_slot_entry_seeds = &jit_local_plan.stack_slot_entry_seeds;
+        let exc_dispatches = &jit_local_plan.exc_dispatches;
+        let refcount_plan = &jit_local_plan.refcount_plan;
         let full_block_param_names = function
             .blocks
             .iter()
             .map(CodegenBlock::param_name_vec)
-            .collect::<Vec<_>>();
-        let exc_dispatches = function
-            .blocks
-            .iter()
-            .map(|block| {
-                let runtime_target_params = block
-                    .exc_edge
-                    .as_ref()
-                    .map(|edge| runtime_block_params[edge.target.index()].as_slice())
-                    .unwrap_or(&[]);
-                exc_dispatch_plan(function, block, runtime_target_params, &refcount_plan)
-            })
             .collect::<Vec<_>>();
         let mut pre_cleanup_null_blocks = Vec::with_capacity(block_count);
         let mut cleanup_null_blocks = Vec::with_capacity(block_count);
@@ -12246,10 +12231,10 @@ fn build_cranelift_run_bb_specialized_function(
         let raise_exc_direct_block = fb.create_block();
         let required_stack_slot_names = required_stack_slot_names_for_jit(
             function,
-            &refcount_plan,
-            &runtime_block_params,
-            &planned_stack_slot_entry_seeds,
-            &exc_dispatches,
+            refcount_plan,
+            runtime_block_params,
+            planned_stack_slot_entry_seeds,
+            exc_dispatches,
         );
         let stack_slots = StackSlots::new(&mut fb, &required_stack_slot_names);
         let exception_state_slots = ExceptionStateSlots::new(&mut fb, function);
@@ -12743,7 +12728,7 @@ fn build_cranelift_run_bb_specialized_function(
                 module_constants,
                 value_facts: &value_facts,
                 result_demand_plan: &result_demand_plan,
-                refcount_plan: &refcount_plan,
+                refcount_plan,
                 counter_slots_by_id,
                 storage_layout: function.storage_layout().clone(),
                 function_runtime_data_layout: &function_runtime_data_layout,
@@ -12853,8 +12838,8 @@ fn build_cranelift_run_bb_specialized_function(
                 &typed_function.blocks[index].term,
                 function,
                 &exec_blocks,
-                &jump_edge_transports,
-                &implicit_target_transports,
+                jump_edge_transports,
+                implicit_target_transports,
                 &mut local_env,
                 term_emit_ctx,
                 jit_module,
@@ -12954,7 +12939,7 @@ fn build_cranelift_run_bb_specialized_function(
                 source_label,
                 &release_reason,
                 &forwarded_locations,
-                &refcount_plan,
+                refcount_plan,
                 &stack_slots,
                 ptr_ty,
                 thread_state_value,

@@ -385,6 +385,136 @@ pub struct PlannedStackSlotEntrySeed {
     pub entry_ref_kind: LocalRefKind,
 }
 
+#[derive(Clone, Debug)]
+pub struct PlannedJitFunctionLocals {
+    pub local_plan: FunctionLocalPlan,
+    pub refcount_plan: FunctionRefcountPlan,
+    pub runtime_block_params: Vec<Vec<RuntimeBlockParamPlan>>,
+    pub implicit_target_transports: Vec<EdgeTransportPlan>,
+    pub jump_edge_transports: Vec<Option<EdgeTransportPlan>>,
+    pub stack_slot_entry_seeds: Vec<Vec<PlannedStackSlotEntrySeed>>,
+    pub exc_dispatches: Vec<Option<BlockExcDispatchPlan>>,
+}
+
+impl PlannedJitFunctionLocals {
+    pub fn validate_for_function(
+        &self,
+        function: &BlockPyFunction<CodegenModuleShape>,
+    ) -> Result<(), String> {
+        let block_count = function.blocks.len();
+        if self.runtime_block_params.len() != block_count
+            || self.implicit_target_transports.len() != block_count
+            || self.jump_edge_transports.len() != block_count
+            || self.stack_slot_entry_seeds.len() != block_count
+            || self.exc_dispatches.len() != block_count
+        {
+            return Err(format!(
+                "planned JIT local state for function {} ({}) has inconsistent block counts",
+                function.function_id, function.names.qualname
+            ));
+        }
+
+        for (index, block) in function.blocks.iter().enumerate() {
+            let block_plan = self.local_plan.block(block.label);
+            if block_plan.is_none()
+                && (!self.runtime_block_params[index].is_empty()
+                    || !self.stack_slot_entry_seeds[index].is_empty())
+            {
+                return Err(format!(
+                    "planned JIT local state for function {} ({}) is missing block {}",
+                    function.function_id, function.names.qualname, block.label
+                ));
+            }
+            if let Some(block_plan) = block_plan {
+                for param in &self.runtime_block_params[index] {
+                    if block_plan
+                        .binding_for_block_arg_name(param.arg_name.as_str())
+                        .is_none()
+                    {
+                        return Err(format!(
+                            "runtime block param {:?} for function {} ({}) block {} has no local binding",
+                            param.arg_name,
+                            function.function_id,
+                            function.names.qualname,
+                            block.label
+                        ));
+                    }
+                    if param.binding.storage != PlannedLocalStorage::BlockParam {
+                        return Err(format!(
+                            "runtime block param {:?} for function {} ({}) block {} is not block-param backed",
+                            param.arg_name,
+                            function.function_id,
+                            function.names.qualname,
+                            block.label
+                        ));
+                    }
+                }
+            }
+            for seed in &self.stack_slot_entry_seeds[index] {
+                if seed.binding.storage != PlannedLocalStorage::StackSlot {
+                    return Err(format!(
+                        "stack-slot entry seed {:?} for function {} ({}) block {} is not stack-slot backed",
+                        seed.binding.name,
+                        function.function_id,
+                        function.names.qualname,
+                        block.label
+                    ));
+                }
+            }
+
+            let expected_jump = matches!(block.term, BlockTerm::Jump(_));
+            if self.jump_edge_transports[index].is_some() != expected_jump {
+                return Err(format!(
+                    "jump edge transport presence mismatch for function {} ({}) block {}",
+                    function.function_id, function.names.qualname, block.label
+                ));
+            }
+            if self.exc_dispatches[index].is_some() != block.exc_edge.is_some() {
+                return Err(format!(
+                    "exception dispatch presence mismatch for function {} ({}) block {}",
+                    function.function_id, function.names.qualname, block.label
+                ));
+            }
+            if let Some(dispatch) = &self.exc_dispatches[index] {
+                let Some(exc_edge) = block.exc_edge.as_ref() else {
+                    unreachable!("presence checked above");
+                };
+                if dispatch.target_index != exc_edge.target.index() {
+                    return Err(format!(
+                        "exception dispatch target mismatch for function {} ({}) block {}",
+                        function.function_id, function.names.qualname, block.label
+                    ));
+                }
+                if dispatch.target_args.len()
+                    != self.runtime_block_params[dispatch.target_index].len()
+                {
+                    return Err(format!(
+                        "exception dispatch target arg count mismatch for function {} ({}) block {}",
+                        function.function_id, function.names.qualname, block.label
+                    ));
+                }
+                for release_name in &dispatch.release_local_names {
+                    if !dispatch
+                        .forwarded_local_names
+                        .iter()
+                        .any(|name| name == release_name)
+                    {
+                        return Err(format!(
+                            "exception dispatch release local {:?} for function {} ({}) block {} is not forwarded",
+                            release_name,
+                            function.function_id,
+                            function.names.qualname,
+                            block.label
+                        ));
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
 pub fn local_ref_kind_for_stack_mirror(ref_kind: LocalRefKind) -> LocalRefKind {
     match ref_kind {
         LocalRefKind::Immortal => LocalRefKind::Immortal,
@@ -657,6 +787,46 @@ pub fn exc_dispatch_plan(
         forwarded_local_names,
         release_local_names,
     })
+}
+
+pub fn plan_jit_function_locals(
+    module: &BlockPyModule<CodegenModuleShape>,
+    function: &BlockPyFunction<CodegenModuleShape>,
+    facts: &FactStore,
+) -> Result<PlannedJitFunctionLocals, String> {
+    let local_plan = plan_function_locals(function, facts);
+    let refcount_plan = plan_function_refcount_ownership(module, function, facts)?;
+    let _refcount_plan_check = check_refcount_plan_against_current_jit(function, &refcount_plan)?;
+    let runtime_block_params = planned_jit_params_for_function(function, &local_plan)?;
+    let implicit_target_transports =
+        planned_implicit_target_transports_for_function(function, &runtime_block_params);
+    let jump_edge_transports =
+        planned_jump_edge_transports_for_function(function, &runtime_block_params);
+    let stack_slot_entry_seeds = planned_stack_slot_entry_seeds_for_function(function, &local_plan);
+    let exc_dispatches = function
+        .blocks
+        .iter()
+        .map(|block| {
+            let runtime_target_params = block
+                .exc_edge
+                .as_ref()
+                .map(|edge| runtime_block_params[edge.target.index()].as_slice())
+                .unwrap_or(&[]);
+            exc_dispatch_plan(function, block, runtime_target_params, &refcount_plan)
+        })
+        .collect::<Vec<_>>();
+
+    let plan = PlannedJitFunctionLocals {
+        local_plan,
+        refcount_plan,
+        runtime_block_params,
+        implicit_target_transports,
+        jump_edge_transports,
+        stack_slot_entry_seeds,
+        exc_dispatches,
+    };
+    plan.validate_for_function(function)?;
+    Ok(plan)
 }
 
 #[cfg(test)]
@@ -1061,6 +1231,46 @@ def f():
                 )
             })
         }));
+    }
+
+    #[test]
+    fn planned_jit_function_locals_collects_codegen_local_state() {
+        let (lowered, function_index) = lowered_function(
+            r#"
+def f(flag):
+    x = []
+    try:
+        if flag:
+            raise ValueError("boom")
+        return x
+    except ValueError:
+        return None
+"#,
+            "f",
+        );
+        let function = &lowered.callable_defs[function_index];
+        let facts = infer_module_value_facts(&lowered);
+        let plan = plan_jit_function_locals(&lowered, function, &facts)
+            .expect("JIT local state should plan before codegen");
+
+        assert_eq!(plan.local_plan.blocks.len(), function.blocks.len());
+        assert_eq!(plan.runtime_block_params.len(), function.blocks.len());
+        assert_eq!(plan.implicit_target_transports.len(), function.blocks.len());
+        assert_eq!(plan.jump_edge_transports.len(), function.blocks.len());
+        assert_eq!(plan.stack_slot_entry_seeds.len(), function.blocks.len());
+        assert_eq!(plan.exc_dispatches.len(), function.blocks.len());
+        assert!(
+            plan.exc_dispatches.iter().any(Option::is_some),
+            "expected exception dispatches to be represented in the pre-codegen plan"
+        );
+        assert!(
+            plan.refcount_plan
+                .blocks
+                .values()
+                .flat_map(|block| block.actions.iter())
+                .any(|action| matches!(action.kind, RefcountActionKind::ReleaseLocal { .. })),
+            "expected refcount releases to be represented in the pre-codegen plan"
+        );
     }
 
     #[test]

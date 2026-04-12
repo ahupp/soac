@@ -3,9 +3,8 @@ use pyo3::types::PyModule;
 use soac_blockpy::block_py::FunctionKind;
 use soac_blockpy::passes::infer_module_value_facts;
 use soac_jit::{
-    exc_dispatch_plan,
     module_type::{hash_module_source, indexed_module_info},
-    plan_function_locals, plan_function_refcount_ownership, planned_jit_params_for_function,
+    plan_jit_function_locals,
 };
 use std::any::Any;
 use std::collections::HashSet;
@@ -333,31 +332,11 @@ def exercise():
         .expect("missing lowered generator resume function");
     let registered_function = gen_function;
     let value_facts = infer_module_value_facts(&normalized);
-    let local_plan = plan_function_locals(registered_function, &value_facts);
-    let refcount_plan =
-        plan_function_refcount_ownership(&normalized, registered_function, &value_facts)
-            .expect("refcount plan should validate");
-    let plan_runtime_params = planned_jit_params_for_function(registered_function, &local_plan)
-        .expect("runtime params should bind");
-    let plan_exc_dispatches = registered_function
-        .blocks
-        .iter()
-        .map(|block| {
-            let runtime_target_params = block
-                .exc_edge
-                .as_ref()
-                .map(|edge| plan_runtime_params[edge.target.index()].as_slice())
-                .unwrap_or(&[]);
-            exc_dispatch_plan(
-                registered_function,
-                block,
-                runtime_target_params,
-                &refcount_plan,
-            )
-        })
-        .collect::<Vec<_>>();
+    let jit_local_plan = plan_jit_function_locals(&normalized, registered_function, &value_facts)
+        .expect("JIT local plan should validate");
 
-    let handler_entry_targets = plan_runtime_params
+    let handler_entry_targets = jit_local_plan
+        .runtime_block_params
         .iter()
         .enumerate()
         .filter(|(index, _)| {
@@ -371,15 +350,16 @@ def exercise():
     assert!(
         !handler_entry_targets.is_empty(),
         "expected at least one except handler block with an explicit try-exception carrier: {:?}",
-        plan_runtime_params
+        jit_local_plan.runtime_block_params
     );
     assert!(
-        plan_exc_dispatches
+        jit_local_plan
+            .exc_dispatches
             .iter()
             .filter_map(|dispatch| dispatch.as_ref())
             .any(|dispatch| {
                 handler_entry_targets.contains(&dispatch.target_index)
-                    && (plan_runtime_params[dispatch.target_index]
+                    && (jit_local_plan.runtime_block_params[dispatch.target_index]
                         .iter()
                         .any(|param| param.arg_name.starts_with("_dp_try_exc_"))
                         || dispatch.slot_writes.iter().any(|(_, source)| {
@@ -387,7 +367,8 @@ def exercise():
                         }))
             }),
         "expected a dispatch into an except handler target to pass the active exception: {:?}",
-        plan_exc_dispatches
+        jit_local_plan
+            .exc_dispatches
             .iter()
             .enumerate()
             .filter_map(|(index, dispatch)| {
