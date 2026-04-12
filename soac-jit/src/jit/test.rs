@@ -787,6 +787,87 @@ def f():
     }
 
     #[test]
+    fn typed_result_demand_plan_marks_call_inputs_pyobject_borrowed_ok() {
+        let mut constants = TestConstantPool::default();
+        let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+        let func_instr_id = InstrId::new(BlockLabel::from_index(0), 1);
+        let positional_instr_id = InstrId::new(BlockLabel::from_index(0), 2);
+        let keyword_instr_id = InstrId::new(BlockLabel::from_index(0), 3);
+        let call = with_instr_id(
+            op_expr(Call::new(
+                with_instr_id(name_expr(test_runtime_name("tuple_values")), func_instr_id),
+                vec![CallArgPositional::Positional(with_instr_id(
+                    constants.int_expr(1),
+                    positional_instr_id,
+                ))],
+                vec![CallArgKeyword::Named {
+                    arg: "value".into(),
+                    value: with_instr_id(constants.int_expr(2), keyword_instr_id),
+                }],
+            )),
+            call_instr_id,
+        );
+        let function =
+            with_single_test_block(test_function(), vec![call], ret_term(constants.int_expr(3)));
+        let typed_function = lower_codegen_function_to_typed(function);
+        let plan = plan_typed_result_demands(&typed_function);
+
+        assert_eq!(
+            plan.demand_for_instr_id(call_instr_id),
+            Some(ResultDemand::EffectOnly)
+        );
+        assert_eq!(
+            plan.demand_for_instr_id(func_instr_id),
+            Some(ResultDemand::PYOBJECT_BORROWED_OK)
+        );
+        assert_eq!(
+            plan.demand_for_instr_id(positional_instr_id),
+            Some(ResultDemand::PYOBJECT_BORROWED_OK)
+        );
+        assert_eq!(
+            plan.demand_for_instr_id(keyword_instr_id),
+            Some(ResultDemand::PYOBJECT_BORROWED_OK)
+        );
+    }
+
+    #[test]
+    fn typed_result_demand_plan_marks_direct_call_inputs_pyobject_borrowed_ok() {
+        let mut constants = TestConstantPool::default();
+        let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+        let callable_instr_id = InstrId::new(BlockLabel::from_index(0), 1);
+        let positional_instr_id = InstrId::new(BlockLabel::from_index(0), 2);
+        let call = with_instr_id(
+            InstrCodegen::CallDirect(CallDirect::new(
+                with_instr_id(name_expr(test_global_name("callee")), callable_instr_id),
+                FunctionId::new(0, 1),
+                vec![CallArgPositional::Positional(with_instr_id(
+                    constants.int_expr(1),
+                    positional_instr_id,
+                ))],
+                Vec::<CallArgKeyword<InstrCodegen>>::new(),
+            )),
+            call_instr_id,
+        );
+        let function =
+            with_single_test_block(test_function(), vec![call], ret_term(constants.int_expr(2)));
+        let typed_function = lower_codegen_function_to_typed(function);
+        let plan = plan_typed_result_demands(&typed_function);
+
+        assert_eq!(
+            plan.demand_for_instr_id(call_instr_id),
+            Some(ResultDemand::EffectOnly)
+        );
+        assert_eq!(
+            plan.demand_for_instr_id(callable_instr_id),
+            Some(ResultDemand::PYOBJECT_BORROWED_OK)
+        );
+        assert_eq!(
+            plan.demand_for_instr_id(positional_instr_id),
+            Some(ResultDemand::PYOBJECT_BORROWED_OK)
+        );
+    }
+
+    #[test]
     fn typed_result_demand_plan_marks_branch_tests_i32_bool01() {
         let mut constants = TestConstantPool::default();
         let function = test_function();

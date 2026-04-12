@@ -2048,6 +2048,43 @@ impl ResultDemandPlan {
     }
 }
 
+fn insert_call_arg_input_demands(
+    plan: &mut ResultDemandPlan,
+    args: &[CallArgPositional<InstrTyped>],
+    keywords: &[CallArgKeyword<InstrTyped>],
+) {
+    for arg in args {
+        let value = arg.expr();
+        plan.insert_instr(value, ResultDemand::PYOBJECT_BORROWED_OK);
+        insert_typed_child_demands(plan, value);
+    }
+    for keyword in keywords {
+        let value = keyword.expr();
+        plan.insert_instr(value, ResultDemand::PYOBJECT_BORROWED_OK);
+        insert_typed_child_demands(plan, value);
+    }
+}
+
+fn insert_typed_child_demands(plan: &mut ResultDemandPlan, expr: &InstrTyped) {
+    match expr {
+        InstrTyped::LegacyStore(store) => {
+            plan.insert_instr(store.value.as_ref(), ResultDemand::PYOBJECT_OWNED);
+            insert_typed_child_demands(plan, store.value.as_ref());
+        }
+        InstrTyped::LegacyCall(call) => {
+            plan.insert_instr(call.func.as_ref(), ResultDemand::PYOBJECT_BORROWED_OK);
+            insert_typed_child_demands(plan, call.func.as_ref());
+            insert_call_arg_input_demands(plan, call.args.as_slice(), call.keywords.as_slice());
+        }
+        InstrTyped::LegacyCallDirect(call) => {
+            plan.insert_instr(call.callable.as_ref(), ResultDemand::PYOBJECT_BORROWED_OK);
+            insert_typed_child_demands(plan, call.callable.as_ref());
+            insert_call_arg_input_demands(plan, call.args.as_slice(), call.keywords.as_slice());
+        }
+        _ => {}
+    }
+}
+
 fn plan_typed_result_demands(
     function: &BlockPyFunction<TypedCodegenModuleShape>,
 ) -> ResultDemandPlan {
@@ -2055,9 +2092,7 @@ fn plan_typed_result_demands(
     for block in &function.blocks {
         for expr in &block.body {
             plan.insert_instr(expr, ResultDemand::EffectOnly);
-            if let InstrTyped::LegacyStore(store) = expr {
-                plan.insert_instr(store.value.as_ref(), ResultDemand::PYOBJECT_OWNED);
-            }
+            insert_typed_child_demands(&mut plan, expr);
         }
         if let BlockTerm::IfTerm(if_term) = &block.term {
             plan.insert_instr(&if_term.test, ResultDemand::I32_BOOL01);
@@ -2072,6 +2107,13 @@ fn plan_typed_result_demands(
             && let Some(exc) = raise_stmt.exc.as_ref()
         {
             plan.insert_instr(exc, ResultDemand::PYOBJECT_OWNED);
+            insert_typed_child_demands(&mut plan, exc);
+        }
+        match &block.term {
+            BlockTerm::IfTerm(if_term) => insert_typed_child_demands(&mut plan, &if_term.test),
+            BlockTerm::BranchTable(branch) => insert_typed_child_demands(&mut plan, &branch.index),
+            BlockTerm::Return(value) => insert_typed_child_demands(&mut plan, value),
+            BlockTerm::Raise(_) | BlockTerm::Jump(_) => {}
         }
     }
     plan
