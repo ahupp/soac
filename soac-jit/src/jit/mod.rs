@@ -12239,20 +12239,46 @@ fn build_cranelift_run_bb_specialized_function(
             .iter()
             .map(CodegenBlock::param_name_vec)
             .collect::<Vec<_>>();
+        let shared_null_cleanup = function
+            .blocks
+            .iter()
+            .any(|block| block.exception_param().is_none())
+            .then(|| (fb.create_block(), fb.create_block()));
+        let mut per_exception_null_cleanup_blocks = Vec::new();
         let mut pre_cleanup_null_blocks = Vec::with_capacity(block_count);
         let mut cleanup_null_blocks = Vec::with_capacity(block_count);
-        for _ in 0..block_count {
+        for (index, block) in function.blocks.iter().enumerate() {
             exec_blocks.push(fb.create_block());
-            pre_cleanup_null_blocks.push(fb.create_block());
-            cleanup_null_blocks.push(fb.create_block());
+            if block.exception_param().is_none() {
+                let (pre_cleanup, cleanup) =
+                    shared_null_cleanup.expect("shared null cleanup should exist");
+                pre_cleanup_null_blocks.push(pre_cleanup);
+                cleanup_null_blocks.push(cleanup);
+            } else {
+                let pre_cleanup = fb.create_block();
+                let cleanup = fb.create_block();
+                pre_cleanup_null_blocks.push(pre_cleanup);
+                cleanup_null_blocks.push(cleanup);
+                per_exception_null_cleanup_blocks.push((index, pre_cleanup, cleanup));
+            }
         }
         for (index, block) in exec_blocks.iter().enumerate() {
             if cold_block_labels.contains(&function.blocks[index].label) {
                 fb.set_cold_block(*block);
             }
         }
+        if let Some((pre_cleanup, cleanup)) = shared_null_cleanup {
+            fb.set_cold_block(pre_cleanup);
+            fb.set_cold_block(cleanup);
+        }
+        for (_, pre_cleanup, cleanup) in &per_exception_null_cleanup_blocks {
+            fb.set_cold_block(*pre_cleanup);
+            fb.set_cold_block(*cleanup);
+        }
         let step_null_block = fb.create_block();
         let raise_exc_direct_block = fb.create_block();
+        fb.set_cold_block(step_null_block);
+        fb.set_cold_block(raise_exc_direct_block);
         let required_stack_slot_names = required_stack_slot_names_for_jit(
             function,
             refcount_plan,
@@ -12290,17 +12316,31 @@ fn build_cranelift_run_bb_specialized_function(
                 param_names,
             );
         }
-        for (index, block) in cleanup_null_blocks.iter().enumerate() {
+        if let Some((pre_cleanup, cleanup)) = shared_null_cleanup {
             register_block_display_annotation(
                 &mut block_annotations,
-                pre_cleanup_null_blocks[index],
-                format!("pre_cleanup_null::{}", function.blocks[index].label),
+                pre_cleanup,
+                "pre_cleanup_null::shared",
                 Vec::new(),
             );
             register_block_display_annotation(
                 &mut block_annotations,
-                *block,
-                format!("cleanup_null::{}", function.blocks[index].label),
+                cleanup,
+                "cleanup_null::shared",
+                vec!["error".into()],
+            );
+        }
+        for (index, pre_cleanup, cleanup) in &per_exception_null_cleanup_blocks {
+            register_block_display_annotation(
+                &mut block_annotations,
+                *pre_cleanup,
+                format!("pre_cleanup_null::{}", function.blocks[*index].label),
+                Vec::new(),
+            );
+            register_block_display_annotation(
+                &mut block_annotations,
+                *cleanup,
+                format!("cleanup_null::{}", function.blocks[*index].label),
                 vec!["error".into()],
             );
         }
@@ -12326,8 +12366,11 @@ fn build_cranelift_run_bb_specialized_function(
         fb.append_block_param(step_null_block, ptr_ty); // args
         fb.append_block_param(raise_exc_direct_block, ptr_ty); // args
         fb.append_block_param(raise_exc_direct_block, ptr_ty); // exc
-        for block in &cleanup_null_blocks {
-            fb.append_block_param(*block, ptr_ty); // error
+        if let Some((_, cleanup)) = shared_null_cleanup {
+            fb.append_block_param(cleanup, ptr_ty); // error
+        }
+        for (_, _, cleanup) in &per_exception_null_cleanup_blocks {
+            fb.append_block_param(*cleanup, ptr_ty); // error
         }
 
         fb.switch_to_block(entry_block);
@@ -13035,24 +13078,37 @@ fn build_cranelift_run_bb_specialized_function(
             }
         }
 
-        for (index, block) in pre_cleanup_null_blocks.iter().enumerate() {
-            fb.switch_to_block(*block);
+        if let Some((pre_cleanup, cleanup)) = shared_null_cleanup {
+            fb.switch_to_block(pre_cleanup);
             let error_value =
                 emit_take_current_raised_exception_or_trap(&mut fb, ptr_ty, thread_state_value);
-            fb.ins().jump(
-                cleanup_null_blocks[index],
-                &[ir::BlockArg::Value(error_value)],
-            );
+            fb.ins().jump(cleanup, &[ir::BlockArg::Value(error_value)]);
+        }
+        for (_, pre_cleanup, cleanup) in &per_exception_null_cleanup_blocks {
+            fb.switch_to_block(*pre_cleanup);
+            let error_value =
+                emit_take_current_raised_exception_or_trap(&mut fb, ptr_ty, thread_state_value);
+            fb.ins().jump(*cleanup, &[ir::BlockArg::Value(error_value)]);
         }
 
-        for (index, block) in cleanup_null_blocks.iter().enumerate() {
-            fb.switch_to_block(*block);
-            let error_value = fb.block_params(*block)[0];
-            let cleanup_args = fb.block_params(*block)[1..].to_vec();
+        if let Some((_, cleanup)) = shared_null_cleanup {
+            fb.switch_to_block(cleanup);
+            let error_value = fb.block_params(cleanup)[0];
+            stack_slots.decref_all(&mut fb, ptr_ty, thread_state_value, decref_ref);
+            fb.ins()
+                .call(set_raised_exception_ref, &[thread_state_value, error_value]);
+            let null_ptr = fb.ins().iconst(ptr_ty, 0);
+            fb.ins().return_(&[null_ptr]);
+        }
+
+        for (index, _, cleanup) in &per_exception_null_cleanup_blocks {
+            fb.switch_to_block(*cleanup);
+            let error_value = fb.block_params(*cleanup)[0];
+            let cleanup_args = fb.block_params(*cleanup)[1..].to_vec();
             for value in cleanup_args {
                 emit_decref_if_not_null(&mut fb, ptr_ty, decref_ref, thread_state_value, value);
             }
-            if let Some(exception_name) = function.blocks[index].exception_param() {
+            if let Some(exception_name) = function.blocks[*index].exception_param() {
                 if let Some((previous_slot, is_pushed_slot)) =
                     exception_state_slots.slots_for_exception(exception_name)
                 {

@@ -139,26 +139,53 @@ def parse_jit_code_size(jit_bb_map_path: Path) -> dict[str, Any] | None:
     process_id = max(by_process)
     rows = by_process[process_id]
     by_name = {
-        str(row["function_qualname"]): int(row["code_size"])
+        str(row["function_qualname"]): {
+            "code_size_bytes": int(row["code_size"]),
+            "machine_block_count": len(row.get("bb_offsets") or []),
+        }
         for row in rows
     }
-    total = sum(by_name.values())
-    non_dp_total = sum(size for name, size in by_name.items() if not name.startswith("_dp_"))
+    total = sum(row["code_size_bytes"] for row in by_name.values())
+    total_blocks = sum(row["machine_block_count"] for row in by_name.values())
+    non_dp_total = sum(
+        row["code_size_bytes"]
+        for name, row in by_name.items()
+        if not name.startswith("_dp_")
+    )
+    non_dp_blocks = sum(
+        row["machine_block_count"]
+        for name, row in by_name.items()
+        if not name.startswith("_dp_")
+    )
     core_total = sum(
-        size
-        for name, size in by_name.items()
+        row["code_size_bytes"]
+        for name, row in by_name.items()
+        if not name.startswith("_dp_") and name not in {"main", "pystones"}
+    )
+    core_blocks = sum(
+        row["machine_block_count"]
+        for name, row in by_name.items()
         if not name.startswith("_dp_") and name not in {"main", "pystones"}
     )
     top_functions = [
-        {"function_qualname": name, "code_size_bytes": size}
-        for name, size in sorted(by_name.items(), key=lambda item: item[1], reverse=True)[:10]
+        {
+            "function_qualname": name,
+            "code_size_bytes": row["code_size_bytes"],
+            "machine_block_count": row["machine_block_count"],
+        }
+        for name, row in sorted(
+            by_name.items(), key=lambda item: item[1]["code_size_bytes"], reverse=True
+        )[:10]
     ]
     return {
         "latest_process_id": process_id,
         "function_count": len(by_name),
         "total_code_size_bytes": total,
+        "total_machine_block_count": total_blocks,
         "non_dp_code_size_bytes": non_dp_total,
+        "non_dp_machine_block_count": non_dp_blocks,
         "core_code_size_bytes": core_total,
+        "core_machine_block_count": core_blocks,
         "functions_by_name": by_name,
         "top_functions": top_functions,
     }
@@ -195,13 +222,19 @@ def format_summary(summary: dict[str, Any]) -> str:
         [
             f"latest pystone jit process id: {code_size['latest_process_id']}",
             f"pystone total code size bytes: {code_size['total_code_size_bytes']}",
+            f"pystone total machine blocks: {code_size['total_machine_block_count']}",
             f"pystone non-_dp_ code size bytes: {code_size['non_dp_code_size_bytes']}",
+            f"pystone non-_dp_ machine blocks: {code_size['non_dp_machine_block_count']}",
             f"pystone core code size bytes: {code_size['core_code_size_bytes']}",
+            f"pystone core machine blocks: {code_size['core_machine_block_count']}",
             "largest pystone functions by code size:",
         ]
     )
     for entry in code_size["top_functions"]:
-        lines.append(f"  {entry['function_qualname']}: {entry['code_size_bytes']}")
+        lines.append(
+            f"  {entry['function_qualname']}: "
+            f"{entry['code_size_bytes']} bytes, {entry['machine_block_count']} blocks"
+        )
     return "\n".join(lines) + "\n"
 
 
