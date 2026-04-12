@@ -708,6 +708,25 @@ def f():
         build_test_specialized_function(&[1usize as ObjPtr], &module, &function, &module_constants);
     }
 
+    #[test]
+    fn typed_result_demand_plan_marks_statement_roots_effect_only() {
+        let mut constants = TestConstantPool::default();
+        let instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+        let function = with_single_test_block(
+            test_function(),
+            vec![expr_stmt(with_instr_id(constants.int_expr(1), instr_id))],
+            ret_term(constants.int_expr(2)),
+        );
+        let typed_function =
+            lower_typed_function_if_tests_to_truthy(lower_codegen_function_to_typed(function));
+        let plan = plan_typed_result_demands(&typed_function);
+
+        assert_eq!(
+            plan.demand_for_instr_id(instr_id),
+            Some(ResultDemand::EffectOnly)
+        );
+    }
+
     fn direct_call_expr(function_id: FunctionId) -> InstrCodegen {
         InstrCodegen::CallDirect(CallDirect::new(
             none_expr(),

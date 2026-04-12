@@ -29,9 +29,9 @@ use soac_blockpy::block_py::{
 use soac_blockpy::passes::{
     CodegenModuleShape, FactStore, FunctionRefcountPlan, InstrResolved, InstrTyped, LocalRefState,
     PyExactType, PyObjFacts, RefcountActionKind, RefcountReleaseReason, RefcountSite,
-    RuntimeHelperId, ValueFacts, infer_module_value_facts, lower_codegen_function_to_typed,
-    lower_typed_function_if_tests_to_truthy, try_lower_typed_instr_to_codegen_legacy,
-    try_lower_typed_term_to_codegen_legacy,
+    RuntimeHelperId, TypedCodegenModuleShape, ValueFacts, infer_module_value_facts,
+    lower_codegen_function_to_typed, lower_typed_function_if_tests_to_truthy,
+    try_lower_typed_instr_to_codegen_legacy, try_lower_typed_term_to_codegen_legacy,
 };
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -2025,6 +2025,41 @@ struct JitEmitConsts {
     block_const: ir::Value,
 }
 
+#[derive(Clone, Debug, Default)]
+struct ResultDemandPlan {
+    demands_by_instr_id: HashMap<InstrId, ResultDemand>,
+}
+
+impl ResultDemandPlan {
+    fn insert_instr(&mut self, expr: &InstrTyped, demand: ResultDemand) {
+        if let Some(instr_id) = expr.try_semantic_instr_id() {
+            self.demands_by_instr_id.insert(instr_id, demand);
+        }
+    }
+
+    fn demand_for_instr_id(&self, instr_id: InstrId) -> Option<ResultDemand> {
+        self.demands_by_instr_id.get(&instr_id).copied()
+    }
+
+    fn demand_for_typed_stmt(&self, expr: &InstrTyped) -> ResultDemand {
+        expr.try_semantic_instr_id()
+            .and_then(|instr_id| self.demand_for_instr_id(instr_id))
+            .unwrap_or(ResultDemand::EffectOnly)
+    }
+}
+
+fn plan_typed_result_demands(
+    function: &BlockPyFunction<TypedCodegenModuleShape>,
+) -> ResultDemandPlan {
+    let mut plan = ResultDemandPlan::default();
+    for block in &function.blocks {
+        for expr in &block.body {
+            plan.insert_instr(expr, ResultDemand::EffectOnly);
+        }
+    }
+    plan
+}
+
 #[derive(Clone)]
 struct JitEmitCtx<'mc> {
     module: &'mc BlockPyModule<CodegenModuleShape>,
@@ -2032,6 +2067,7 @@ struct JitEmitCtx<'mc> {
     shared_state: Option<&'mc crate::module_type::SharedModuleState>,
     module_constants: &'mc ModuleCodegenConstants,
     value_facts: &'mc FactStore,
+    result_demand_plan: &'mc ResultDemandPlan,
     refcount_plan: &'mc FunctionRefcountPlan,
     counter_slots_by_id: &'mc [CounterRuntimeSlot],
     storage_layout: Option<StorageLayout>,
@@ -9072,7 +9108,7 @@ fn emit_typed_codegen_ops(
             expr,
             local_env,
             stmt_emit_ctx,
-            ResultDemand::EffectOnly,
+            stmt_emit_ctx.result_demand_plan.demand_for_typed_stmt(expr),
             jit_module,
             func_imports,
         )?;
@@ -11140,6 +11176,7 @@ fn build_cranelift_run_bb_specialized_function(
             function.blocks.len()
         ));
     }
+    let result_demand_plan = plan_typed_result_demands(&typed_function);
 
     let call_target_counter_ids =
         collect_runtime_counter_ids_by_kind(counter_defs, function.function_id, "call_hot_targets");
@@ -11874,6 +11911,7 @@ fn build_cranelift_run_bb_specialized_function(
                 shared_state: direct_call_resolver,
                 module_constants,
                 value_facts: &value_facts,
+                result_demand_plan: &result_demand_plan,
                 refcount_plan: &refcount_plan,
                 counter_slots_by_id,
                 storage_layout: function.storage_layout().clone(),

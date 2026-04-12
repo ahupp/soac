@@ -123,7 +123,10 @@ typed result wrapper. LocalEnv-backed `Store` and `Del` producers now honor
 `EffectOnly` directly and return `NoValue`; generic `Call` and `CallDirect`
 statement producers now execute the call and discard owned results at the call
 boundary. Non-local cell/global producers still use the legacy object-producing
-path before the wrapper discards the result.
+path before the wrapper discards the result. Step 6 has started with a
+codegen-local demand plan keyed by semantic instruction id for statement roots;
+it currently preserves existing `EffectOnly` behavior while providing the table
+that later term and typed-value demands can share.
 
 1. Add `ResultDemand::{EffectOnly, PyObject { borrowed_ok }}` and an `EmitResult`
    wrapper near the existing `SoacValue`/LocalEnv codegen types.
@@ -137,6 +140,8 @@ path before the wrapper discards the result.
    work can push demand deeper into individual call specializations.
 6. Add a later BlockPy demand-planning pass keyed by semantic `InstrId`, after
    name binding / simplification / instrumentation and before JIT planning.
+   Started in JIT codegen as a local plan for statement-root demands; this can
+   move earlier once more consumers need planned typed demands.
 7. Extend demand to `TruthValue` and `I64Index` once the value-space/refcount
    representation can carry non-Python values cleanly.
 
