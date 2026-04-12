@@ -4,7 +4,7 @@ use soac_blockpy::block_py::FunctionKind;
 use soac_blockpy::passes::infer_module_value_facts;
 use soac_jit::{
     module_type::{hash_module_source, indexed_module_info},
-    plan_jit_function_locals,
+    plan_jit_module_locals,
 };
 use std::any::Any;
 use std::collections::HashSet;
@@ -332,8 +332,11 @@ def exercise():
         .expect("missing lowered generator resume function");
     let registered_function = gen_function;
     let value_facts = infer_module_value_facts(&normalized);
-    let jit_local_plan = plan_jit_function_locals(&normalized, registered_function, &value_facts)
-        .expect("JIT local plan should validate");
+    let jit_module_local_plan =
+        plan_jit_module_locals(&normalized, &value_facts).expect("JIT local plan should validate");
+    let jit_local_plan = jit_module_local_plan
+        .function(registered_function.function_id)
+        .expect("generator resume function should have a JIT local plan");
 
     let handler_entry_targets = jit_local_plan
         .runtime_block_params

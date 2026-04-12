@@ -1,5 +1,6 @@
 use soac_blockpy::block_py::{
-    BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, CodegenBlock, LocalLocation,
+    BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, CodegenBlock, FunctionId,
+    LocalLocation,
 };
 use soac_blockpy::passes::{
     CodegenModuleShape, FactStore, FunctionRefcountPlan, PyObjFacts, RefcountActionKind,
@@ -396,6 +397,17 @@ pub struct PlannedJitFunctionLocals {
     pub exc_dispatches: Vec<Option<BlockExcDispatchPlan>>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct PlannedJitModuleLocals {
+    pub functions: HashMap<FunctionId, PlannedJitFunctionLocals>,
+}
+
+impl PlannedJitModuleLocals {
+    pub fn function(&self, function_id: FunctionId) -> Option<&PlannedJitFunctionLocals> {
+        self.functions.get(&function_id)
+    }
+}
+
 impl PlannedJitFunctionLocals {
     pub fn validate_for_function(
         &self,
@@ -513,6 +525,26 @@ impl PlannedJitFunctionLocals {
 
         Ok(())
     }
+}
+
+pub fn plan_jit_module_locals(
+    module: &BlockPyModule<CodegenModuleShape>,
+    facts: &FactStore,
+) -> Result<PlannedJitModuleLocals, String> {
+    let mut functions = HashMap::with_capacity(module.callable_defs.len());
+    for function in &module.callable_defs {
+        let function_plan = plan_jit_function_locals(module, function, facts)?;
+        if functions
+            .insert(function.function_id, function_plan)
+            .is_some()
+        {
+            return Err(format!(
+                "duplicate JIT local plan for function id {} ({})",
+                function.function_id, function.names.qualname
+            ));
+        }
+    }
+    Ok(PlannedJitModuleLocals { functions })
 }
 
 pub fn local_ref_kind_for_stack_mirror(ref_kind: LocalRefKind) -> LocalRefKind {
@@ -1271,6 +1303,36 @@ def f(flag):
                 .any(|action| matches!(action.kind, RefcountActionKind::ReleaseLocal { .. })),
             "expected refcount releases to be represented in the pre-codegen plan"
         );
+    }
+
+    #[test]
+    fn planned_jit_module_locals_collects_all_functions() {
+        let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+            r#"
+def f(x):
+    return x
+
+def g(flag):
+    if flag:
+        y = []
+    return None
+"#,
+        )
+        .expect("lowering should succeed")
+        .codegen_module;
+        let facts = infer_module_value_facts(&lowered);
+        let plan = plan_jit_module_locals(&lowered, &facts)
+            .expect("JIT module local state should plan before codegen");
+
+        assert_eq!(plan.functions.len(), lowered.callable_defs.len());
+        for function in &lowered.callable_defs {
+            let function_plan = plan
+                .function(function.function_id)
+                .unwrap_or_else(|| panic!("missing plan for {}", function.names.qualname));
+            function_plan
+                .validate_for_function(function)
+                .expect("module-level function plan should validate");
+        }
     }
 
     #[test]

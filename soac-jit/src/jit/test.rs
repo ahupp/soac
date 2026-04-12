@@ -505,6 +505,52 @@ def f():
         with_test_blocks(function, vec![block])
     }
 
+    fn build_test_cranelift_run_bb_specialized_function(
+        jit_module: &mut JITModule,
+        blocks: &[ObjPtr],
+        module: &BlockPyModule<CodegenModuleShape>,
+        function: &BlockPyFunction<CodegenModuleShape>,
+        module_constants: &crate::module_constants::ModuleCodegenConstants,
+        counter_defs: &[CounterDef],
+        module_constant_table_data_id: DataId,
+        counter_slots_by_id: &[CounterRuntimeSlot],
+        scalar_counter_data_id: Option<DataId>,
+        top_value_counter_data_id: Option<DataId>,
+        compile_session: &crate::session::CompileSession,
+        direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
+        symbol_scope: Option<&str>,
+        predeclared_direct_functions: Option<&HashMap<FunctionId, DeclaredJitFunction>>,
+    ) -> Result<BuiltSpecializedFunction, String> {
+        let value_facts = infer_jit_value_facts(module);
+        let jit_module_local_plan = plan_jit_module_locals(module, &value_facts)?;
+        let jit_local_plan = jit_module_local_plan
+            .function(function.function_id)
+            .ok_or_else(|| {
+                format!(
+                    "missing JIT local plan for function {} ({})",
+                    function.function_id, function.names.qualname
+                )
+            })?;
+        build_cranelift_run_bb_specialized_function(
+            jit_module,
+            blocks,
+            module,
+            function,
+            &value_facts,
+            jit_local_plan,
+            module_constants,
+            counter_defs,
+            module_constant_table_data_id,
+            counter_slots_by_id,
+            scalar_counter_data_id,
+            top_value_counter_data_id,
+            compile_session,
+            direct_call_resolver,
+            symbol_scope,
+            predeclared_direct_functions,
+        )
+    }
+
     fn build_test_specialized_function(
         blocks: &[ObjPtr],
         module: &BlockPyModule<CodegenModuleShape>,
@@ -520,7 +566,7 @@ def f():
                 .expect("module constant table data should define");
         let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
             define_test_counter_storage(&mut jit_module, module, &module.counter_defs);
-        build_cranelift_run_bb_specialized_function(
+        build_test_cranelift_run_bb_specialized_function(
             &mut jit_module,
             blocks,
             module,
@@ -2360,7 +2406,7 @@ def f():
                 &mut jit_module,
                 shared_state.as_ref(),
             );
-            let built = build_cranelift_run_bb_specialized_function(
+            let built = build_test_cranelift_run_bb_specialized_function(
                 &mut jit_module,
                 blocks,
                 &shared_state.lowered_module,
@@ -2475,7 +2521,7 @@ def f():
                 &mut jit_module,
                 shared_state.as_ref(),
             );
-            let built = build_cranelift_run_bb_specialized_function(
+            let built = build_test_cranelift_run_bb_specialized_function(
                 &mut jit_module,
                 blocks,
                 &shared_state.lowered_module,
@@ -3213,7 +3259,7 @@ def read_point(point):
                     module,
                     module.counter_defs.as_slice(),
                 );
-            let built = build_cranelift_run_bb_specialized_function(
+            let built = build_test_cranelift_run_bb_specialized_function(
                 &mut jit_module,
                 blocks,
                 module,
@@ -3314,7 +3360,7 @@ def read_point(point):
                     module,
                     module.counter_defs.as_slice(),
                 );
-            build_cranelift_run_bb_specialized_function(
+            build_test_cranelift_run_bb_specialized_function(
                 &mut jit_module,
                 blocks,
                 module,
@@ -3354,7 +3400,7 @@ def read_point(point):
                     module,
                     module.counter_defs.as_slice(),
                 );
-            let mut built = build_cranelift_run_bb_specialized_function(
+            let mut built = build_test_cranelift_run_bb_specialized_function(
                 &mut jit_module,
                 blocks,
                 module,
@@ -4411,7 +4457,7 @@ def f():
                     &module,
                     module.counter_defs.as_slice(),
                 );
-            let built = build_cranelift_run_bb_specialized_function(
+            let built = build_test_cranelift_run_bb_specialized_function(
                 &mut jit_module,
                 &blocks,
                 &module,
@@ -5149,7 +5195,7 @@ def f():
                     &mut jit_module,
                     shared_state.as_ref(),
                 );
-                let built = build_cranelift_run_bb_specialized_function(
+                let built = build_test_cranelift_run_bb_specialized_function(
                     &mut jit_module,
                     blocks.as_slice(),
                     &shared_state.lowered_module,
@@ -5275,7 +5321,7 @@ def f(x, y):
                     &mut jit_module,
                     shared_state.as_ref(),
                 );
-                let built = build_cranelift_run_bb_specialized_function(
+                let built = build_test_cranelift_run_bb_specialized_function(
                     &mut jit_module,
                     blocks.as_slice(),
                     &shared_state.lowered_module,
@@ -6152,7 +6198,7 @@ def f(x, y):
                     &mut jit_module,
                     shared_state.as_ref(),
                 );
-                let built = build_cranelift_run_bb_specialized_function(
+                let built = build_test_cranelift_run_bb_specialized_function(
                     &mut jit_module,
                     &[1usize as ObjPtr],
                     &shared_state.lowered_module,

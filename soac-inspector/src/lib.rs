@@ -12,7 +12,7 @@ use soac_blockpy::passes::{CodegenModuleShape, infer_module_value_facts};
 use soac_jit::module_constants::ModuleCodegenConstants;
 use soac_jit::module_type::build_shared_state_for_inspection;
 use soac_jit::{
-    plan_jit_function_locals, render_cranelift_run_bb_specialized_with_runtime_state_and_cfg,
+    plan_jit_module_locals, render_cranelift_run_bb_specialized_with_runtime_state_and_cfg,
 };
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
@@ -294,7 +294,10 @@ pub fn jit_debug_plan(
             "no specialized JIT plan for {module_name}.fn#{function_id}"
         ));
     };
-    let jit_local_plan = plan_jit_function_locals(module, function, &facts)?;
+    let jit_module_local_plan = plan_jit_module_locals(module, &facts)?;
+    let jit_local_plan = jit_module_local_plan
+        .function(function.function_id)
+        .ok_or_else(|| format!("missing JIT local plan for {module_name}.fn#{function_id}"))?;
     let block_info = function
         .blocks
         .iter()

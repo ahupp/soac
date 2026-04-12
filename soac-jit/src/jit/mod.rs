@@ -73,11 +73,12 @@ use direct_abi::{
 pub use planning::{
     BlockExcDispatchPlan, BlockParamFacts, CurrentJitRefcountPlanCheck, EdgeTransportPlan,
     FunctionLocalPlan, LocalRefKind, ParamBindingFacts, ParamProvenance, PlannedJitFunctionLocals,
-    PlannedLocalStorage, PlannedStackSlotEntrySeed, RuntimeBlockParamPlan,
+    PlannedJitModuleLocals, PlannedLocalStorage, PlannedStackSlotEntrySeed, RuntimeBlockParamPlan,
     check_refcount_plan_against_current_jit, exc_dispatch_plan, local_ref_kind_for_stack_mirror,
     plan_function_locals, plan_function_refcount_ownership, plan_jit_function_locals,
-    planned_implicit_target_transports_for_function, planned_jit_params_for_function,
-    planned_jump_edge_transports_for_function, planned_stack_slot_entry_seeds_for_function,
+    plan_jit_module_locals, planned_implicit_target_transports_for_function,
+    planned_jit_params_for_function, planned_jump_edge_transports_for_function,
+    planned_stack_slot_entry_seeds_for_function,
 };
 use runtime_context::{
     FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET, FUNCTION_ENV_GLOBALS_OBJ_OFFSET,
@@ -10851,6 +10852,8 @@ impl ProcessJitEngine {
         }
 
         let mut defined_functions = Vec::with_capacity(functions_to_define.len());
+        let mut jit_local_plan_cache: HashMap<usize, (FactStore, PlannedJitModuleLocals)> =
+            HashMap::new();
         for batch_function in functions_to_define {
             let function = &batch_function.function;
             let placeholder_blocks;
@@ -10958,11 +10961,32 @@ impl ProcessJitEngine {
                 function_module_constant_table_binding_key,
                 function_module_constant_table_symbol.as_str(),
             )?;
+            if !jit_local_plan_cache.contains_key(&function_module_constant_table_binding_key) {
+                let value_facts = infer_jit_value_facts(function_module);
+                let jit_module_local_plan = plan_jit_module_locals(function_module, &value_facts)?;
+                jit_local_plan_cache.insert(
+                    function_module_constant_table_binding_key,
+                    (value_facts, jit_module_local_plan),
+                );
+            }
+            let (function_value_facts, function_jit_module_local_plan) = jit_local_plan_cache
+                .get(&function_module_constant_table_binding_key)
+                .expect("JIT local plan cache entry should exist after insertion");
+            let function_jit_local_plan = function_jit_module_local_plan
+                .function(function.function_id)
+                .ok_or_else(|| {
+                    format!(
+                        "missing JIT local plan for function {} ({})",
+                        function.function_id, function.names.qualname
+                    )
+                })?;
             let built = build_cranelift_run_bb_specialized_function(
                 &mut state.jit_module,
                 function_blocks,
                 function_module,
                 function,
+                function_value_facts,
+                function_jit_local_plan,
                 function_module_constants,
                 function_counter_defs,
                 function_module_constant_table_data_id,
@@ -11989,6 +12013,8 @@ fn build_cranelift_run_bb_specialized_function(
     blocks: &[ObjPtr],
     module: &BlockPyModule<CodegenModuleShape>,
     function: &BlockPyFunction<CodegenModuleShape>,
+    value_facts: &FactStore,
+    jit_local_plan: &PlannedJitFunctionLocals,
     module_constants: &ModuleCodegenConstants,
     counter_defs: &[CounterDef],
     module_constant_table_data_id: DataId,
@@ -12145,9 +12171,6 @@ fn build_cranelift_run_bb_specialized_function(
     }
     let empty_direct_functions = HashMap::new();
     let direct_call_functions = predeclared_direct_functions.unwrap_or(&empty_direct_functions);
-    let value_facts = infer_jit_value_facts(module);
-    let jit_local_plan = plan_jit_function_locals(module, function, &value_facts)?;
-
     let mut direct_call_target_functions = HashMap::new();
     for function_id in direct_call_targets {
         if module
@@ -12726,7 +12749,7 @@ fn build_cranelift_run_bb_specialized_function(
                 function_id: function.function_id,
                 shared_state: direct_call_resolver,
                 module_constants,
-                value_facts: &value_facts,
+                value_facts,
                 result_demand_plan: &result_demand_plan,
                 refcount_plan,
                 counter_slots_by_id,
@@ -13185,11 +13208,23 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
             top_value_counter_count,
         )?)
     };
+    let value_facts = infer_jit_value_facts(module);
+    let jit_module_local_plan = plan_jit_module_locals(module, &value_facts)?;
+    let jit_local_plan = jit_module_local_plan
+        .function(function.function_id)
+        .ok_or_else(|| {
+            format!(
+                "missing JIT local plan for function {} ({})",
+                function.function_id, function.names.qualname
+            )
+        })?;
     let built = build_cranelift_run_bb_specialized_function(
         &mut jit_module,
         blocks,
         module,
         function,
+        &value_facts,
+        jit_local_plan,
         module_constants,
         counter_defs,
         module_constant_table_data_id,

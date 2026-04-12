@@ -513,3 +513,7 @@ Started:
 - Name-based `LocalEnv` loads used by owned-cell/local helper paths now also
   require an explicit `LocalEnv` binding instead of consulting semantic stack
   slots as a fallback source of truth.
+- JIT local planning now has a module-level side table keyed by `FunctionId`.
+  Specialized codegen, inspector debug output, and focused PyO3 tests consume
+  that precomputed plan instead of recomputing per-function LocalEnv state inside
+  the Cranelift builder.
