@@ -3015,6 +3015,39 @@ fn bind_planned_stack_slot_entries_at_block_entry(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn bind_planned_local_env_at_block_entry(
+    fb: &mut FunctionBuilder<'_>,
+    jit_local_plan: &PlannedJitFunctionLocals,
+    block_index: usize,
+    block_param_values: &[ir::Value],
+    local_env: &mut LocalEnv,
+    stack_slots: &StackSlots,
+    ptr_ty: ir::Type,
+    thread_state_value: ir::Value,
+    incref_ref: ir::FuncRef,
+    decref_ref: ir::FuncRef,
+) -> Result<(), String> {
+    bind_runtime_block_param_values_at_block_entry(
+        fb,
+        &jit_local_plan.runtime_block_params[block_index],
+        block_param_values,
+        local_env,
+        stack_slots,
+        ptr_ty,
+        thread_state_value,
+        incref_ref,
+        decref_ref,
+    )?;
+    bind_planned_stack_slot_entries_at_block_entry(
+        fb,
+        &jit_local_plan.stack_slot_entry_seeds[block_index],
+        local_env,
+        stack_slots,
+        ptr_ty,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn bind_runtime_block_param_values_at_block_entry(
     fb: &mut FunctionBuilder<'_>,
     runtime_params: &[RuntimeBlockParamPlan],
@@ -12661,9 +12694,10 @@ fn build_cranelift_run_bb_specialized_function(
             let codegen_block = &function.blocks[index];
             let mut local_env = LocalEnv::default();
             let block_param_values = fb.block_params(*block).to_vec();
-            bind_runtime_block_param_values_at_block_entry(
+            bind_planned_local_env_at_block_entry(
                 &mut fb,
-                &runtime_block_params[index],
+                jit_local_plan,
+                index,
                 &block_param_values,
                 &mut local_env,
                 &stack_slots,
@@ -12671,13 +12705,6 @@ fn build_cranelift_run_bb_specialized_function(
                 thread_state_value,
                 incref_ref,
                 decref_ref,
-            )?;
-            bind_planned_stack_slot_entries_at_block_entry(
-                &mut fb,
-                &planned_stack_slot_entry_seeds[index],
-                &mut local_env,
-                &stack_slots,
-                ptr_ty,
             )?;
             let block_const = globals_value;
             let none_const = emit_owned_module_constant_from_parts(

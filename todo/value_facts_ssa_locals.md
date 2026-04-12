@@ -524,3 +524,7 @@ Started:
 - Required physical stack slots for JIT local state are now derived by
   `PlannedJitFunctionLocals` itself. Codegen allocates the requested slots but no
   longer recomputes that requirement from scattered plan fragments.
+- Block-entry `LocalEnv` construction now goes through one materialization helper
+  that takes the `PlannedJitFunctionLocals` and block index, instead of
+  open-coding separate runtime-param and stack-seed binding calls in the main
+  Cranelift block loop.
