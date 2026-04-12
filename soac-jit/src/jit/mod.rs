@@ -8657,6 +8657,66 @@ fn discard_emit_result(
     }
 }
 
+fn emit_owned_pyobject_result_for_demand(
+    fb: &mut FunctionBuilder<'_>,
+    value: ir::Value,
+    facts: PyObjFacts,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+) -> EmitResult {
+    match demand {
+        ResultDemand::EffectOnly => {
+            fb.ins().call(
+                emit_ctx.decref_ref,
+                &[emit_ctx.consts.thread_state_value, value],
+            );
+            EmitResult::no_value()
+        }
+        ResultDemand::PyObject { .. } => EmitResult::owned_pyobject(value, facts),
+    }
+}
+
+fn emit_codegen_call_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    call: &soac_blockpy::block_py::Call<InstrCodegen>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Option<EmitResult> {
+    emit_codegen_simple_call_with_local_env(fb, call, local_env, emit_ctx, jit_module, func_imports)
+        .map(|value| {
+            emit_owned_pyobject_result_for_demand(
+                fb,
+                value,
+                PyObjFacts::unknown(),
+                emit_ctx,
+                demand,
+            )
+        })
+}
+
+fn emit_codegen_call_direct_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    call: &soac_blockpy::block_py::CallDirect<InstrCodegen>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> EmitResult {
+    let value = emit_call_direct_expr_with_local_env(
+        fb,
+        call,
+        local_env,
+        emit_ctx,
+        jit_module,
+        func_imports,
+    );
+    emit_owned_pyobject_result_for_demand(fb, value, PyObjFacts::unknown(), emit_ctx, demand)
+}
+
 fn emit_codegen_stmt_result_with_local_env(
     fb: &mut FunctionBuilder<'_>,
     expr: &InstrCodegen,
@@ -8688,20 +8748,41 @@ fn emit_codegen_stmt_result_with_local_env(
                 return Ok(result);
             }
         }
+        InstrCodegen::CallDirect(call) => {
+            return Ok(emit_codegen_call_direct_result_with_local_env(
+                fb,
+                call,
+                local_env,
+                emit_ctx,
+                demand,
+                jit_module,
+                func_imports,
+            ));
+        }
+        InstrCodegen::Call(call) => {
+            if let Some(result) = emit_codegen_call_result_with_local_env(
+                fb,
+                call,
+                local_env,
+                emit_ctx,
+                demand,
+                jit_module,
+                func_imports,
+            ) {
+                return Ok(result);
+            }
+        }
         _ => {}
     }
     let value =
         emit_codegen_stmt_with_local_env(fb, expr, local_env, emit_ctx, jit_module, func_imports);
-    Ok(match demand {
-        ResultDemand::EffectOnly => {
-            fb.ins().call(
-                emit_ctx.decref_ref,
-                &[emit_ctx.consts.thread_state_value, value],
-            );
-            EmitResult::no_value()
-        }
-        ResultDemand::PyObject { .. } => EmitResult::owned_pyobject(value, PyObjFacts::unknown()),
-    })
+    Ok(emit_owned_pyobject_result_for_demand(
+        fb,
+        value,
+        PyObjFacts::unknown(),
+        emit_ctx,
+        demand,
+    ))
 }
 
 fn emit_resolved_name_load_with_local_env(

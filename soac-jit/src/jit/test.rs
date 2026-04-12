@@ -683,6 +683,31 @@ def f():
         build_test_specialized_function(&[1usize as ObjPtr], &module, &function, &module_constants);
     }
 
+    #[test]
+    fn specialized_jit_body_calls_compile_via_effect_only_typed_ops() {
+        let mut constants = TestConstantPool::default();
+        let call = Call::new(
+            name_expr(test_runtime_name("tuple_values")),
+            vec![CallArgPositional::Positional(constants.int_expr(1))],
+            Vec::<CallArgKeyword<InstrCodegen>>::new(),
+        );
+        let function = with_single_test_block(
+            test_function(),
+            vec![expr_stmt(op_expr(call))],
+            ret_term(constants.int_expr(2)),
+        );
+        let module = BlockPyModule {
+            module_name_gen: ModuleNameGen::new(0),
+            global_names: Vec::new(),
+            callable_defs: vec![function.clone()],
+            module_constants: constants.module_constants,
+            counter_defs: Vec::new(),
+        };
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        build_test_specialized_function(&[1usize as ObjPtr], &module, &function, &module_constants);
+    }
+
     fn direct_call_expr(function_id: FunctionId) -> InstrCodegen {
         InstrCodegen::CallDirect(CallDirect::new(
             none_expr(),

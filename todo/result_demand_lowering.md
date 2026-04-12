@@ -120,9 +120,10 @@ Status: step 1 has the initial codegen-local `ResultDemand`, `ValueOwnership`,
 and `EmitResult` wrappers in `soac-jit/src/jit/typed_value.rs`. Step 2 has
 started: statement-position JIT emission now requests `EffectOnly` through a
 typed result wrapper. LocalEnv-backed `Store` and `Del` producers now honor
-`EffectOnly` directly and return `NoValue`; non-local cell/global producers and
-generic calls still use the legacy object-producing path before the wrapper
-discards the result.
+`EffectOnly` directly and return `NoValue`; generic `Call` and `CallDirect`
+statement producers now execute the call and discard owned results at the call
+boundary. Non-local cell/global producers still use the legacy object-producing
+path before the wrapper discards the result.
 
 1. Add `ResultDemand::{EffectOnly, PyObject { borrowed_ok }}` and an `EmitResult`
    wrapper near the existing `SoacValue`/LocalEnv codegen types.
@@ -132,7 +133,8 @@ discards the result.
 4. Convert `Store` and `Del` LocalEnv emission to skip owned `None` materialization
    when demand is `EffectOnly`.
 5. Convert generic calls so `EffectOnly` calls still execute and then discard the
-   owned result internally.
+   owned result internally. Done for the JIT statement-result boundary; follow-up
+   work can push demand deeper into individual call specializations.
 6. Add a later BlockPy demand-planning pass keyed by semantic `InstrId`, after
    name binding / simplification / instrumentation and before JIT planning.
 7. Extend demand to `TruthValue` and `I64Index` once the value-space/refcount
