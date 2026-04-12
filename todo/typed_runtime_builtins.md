@@ -129,19 +129,25 @@ This requires generic coercion edges:
 
 Status: steps 1 through 5 have started. The direct ABI descriptor scaffold
 exists in `soac-jit`, checked `soac_runtime_builtin_ord_i64` /
-`soac_runtime_builtin_chr_i64` entry points exist in `soac-runtime`, and static
-runtime-name `ord` calls can emit an `i64`. Static `chr(ord(x))` can consume
-that `i64` without materializing an intermediate `PyLong`. Static
-`chr(<i64 module constant>)` can also use the scalar `chr_i64` path.
+`soac_runtime_builtin_chr_i64` / `soac_runtime_builtin_len_i64` entry points
+exist in `soac-runtime`, and static runtime-name `ord` / `len` calls can emit
+an `i64`. Static `chr(ord(x))` can consume that `i64` without materializing an
+intermediate `PyLong`. Static `chr(<i64 module constant>)` can also use the
+scalar `chr_i64` path. Exact `PyLong` facts can satisfy `chr`'s `i64` demand
+through the general `soac_runtime_pylong_as_i64_saturating` coercion, so
+`chr(x)` can use the scalar path when `x` is known/proven to be an exact local
+int while preserving CPython's `chr(huge_int)` `ValueError` behavior.
 
 1. Add compiler-visible direct ABI descriptor scaffolding in `soac-jit`.
 
    This should define `DirectTargetId`, `RuntimePrimitiveId`,
    `DirectCallableDesc`, `DirectCallAbi`, `ParamAbi`, `ResultAbi`, `ErrorAbi`,
    argument ownership, runtime symbol names, and static descriptors for
-   `BuiltinOrdI64` and `BuiltinChrI64`. It should not change generated code yet.
+   `BuiltinOrdI64`, `BuiltinChrI64`, and `BuiltinLenI64`. It should not change
+   generated code yet.
 
-2. Add checked `ord_i64` and `chr_i64` implementations to `soac-runtime`.
+2. Add checked `ord_i64`, `chr_i64`, and `len_i64` implementations to
+   `soac-runtime`.
 
    Keep the implementation raw and ABI-shaped. Prefer direct Unicode layout
    reads where practical, but keep all validation inside the checked primitive.
@@ -156,12 +162,13 @@ that `i64` without materializing an intermediate `PyLong`. Static
    `ErrorAbi::CurrentException`, release owned temporary inputs according to the
    argument ownership contract, and return an `EmitResult`.
 
-   Current first slice: `ord(x)` emits the checked runtime primitive and returns
-   an `EmitResult::I64`; `chr(ord(x))` and `chr(<i64 module constant>)` emit
-   the checked `chr_i64` primitive. Primitive applicability now consults the
-   descriptor parameter ABI, but the actual call emission still matches each
-   primitive manually. The next cleanup is to make call emission table-driven
-   from `DirectCallableDesc`.
+   Current first slice: `ord(x)` and `len(x)` emit checked runtime primitives
+   and return `EmitResult::I64`; `chr(ord(x))`, `chr(<i64 module constant>)`,
+   and `chr(x)` where `x` has exact `PyLong` facts emit the checked `chr_i64`
+   primitive. Primitive applicability and call emission now consult
+   `DirectCallableDesc` for hidden args, parameter representation, result
+   representation, and exception policy. The current special case is the
+   `PyLong -> I64` coercion policy on `ParamAbi::I64`.
 
 4. Add coercion emission between typed results and demands.
 
@@ -171,7 +178,9 @@ that `i64` without materializing an intermediate `PyLong`. Static
    result.
 
    Current first slice: `I64 -> PyObjectOwned` is wired for object-demanded
-   `ord(x)`. `I32Bool01 -> PyObjectOwned` remains a general coercion follow-up.
+   `ord(x)` and `len(x)`, and exact `PyLong` facts can be coerced to `chr`'s
+   `I64` parameter with a checked runtime helper. `I32Bool01 -> PyObjectOwned`
+   remains a general coercion follow-up.
 
 5. Wire static builtin call recognition.
 
@@ -227,10 +236,11 @@ that `i64` without materializing an intermediate `PyLong`. Static
 
 ## Validation
 
-- Unit-test descriptor lookup for `ord` and `chr`.
+- Unit-test descriptor lookup for `ord`, `chr`, and `len`.
 - Unit-test argument ownership and result ABI declarations.
 - Add behavior tests for:
   - `ord("A") == 65`
+  - `len("abc") == 3`
   - `chr(65) == "A"`
   - `ord("AB")` raises the CPython-compatible exception type
   - `ord(1)` raises the CPython-compatible exception type

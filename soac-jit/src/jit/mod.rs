@@ -22,9 +22,9 @@ use pyo3::ffi;
 use soac_blockpy::block_py::{
     AbruptKind, BlockArg, BlockLabel, BlockParamRole, BlockPyFunction, BlockPyModule, BlockTerm,
     CallArgKeyword, CallArgPositional, CallableScopeKind, CellLocation, ChildVisitable,
-    CodegenBlock, CounterDef, CounterId, CounterScope, CounterSite, Del, FunctionId, HasMeta,
-    HasSemanticInstrId, InstrCodegen, InstrId, InstrKey, Literal, LocalLocation, NameLocation,
-    ParamKind, ResolvedName, StorageLayout, Store, Visit, WithMeta,
+    CodegenBlock, CounterDef, CounterId, CounterScope, CounterSite, Del, FunctionId, FunctionKind,
+    HasMeta, HasSemanticInstrId, InstrCodegen, InstrId, InstrKey, Literal, LocalLocation,
+    NameLocation, ParamKind, ResolvedName, StorageLayout, Store, Visit, WithMeta,
     operation as blockpy_intrinsics,
 };
 use soac_blockpy::passes::{
@@ -68,7 +68,8 @@ mod specialized_helpers;
 mod typed_value;
 
 use direct_abi::{
-    DirectCallableDesc, DirectEntry, DirectTargetId, ParamAbi, ResultAbi, RuntimePrimitiveId,
+    ArgOwnership, DirectCallableDesc, DirectEntry, DirectTargetId, ErrorAbi, HiddenArgAbi,
+    ParamAbi, PyLongI64Coercion, ResultAbi,
 };
 pub use planning::{
     BlockExcDispatchPlan, BlockParamFacts, CurrentJitRefcountPlanCheck, EdgeTransportPlan,
@@ -582,6 +583,16 @@ static SOAC_RUNTIME_BUILTIN_CHR_I64_IMPORT: ImportSpec = ImportSpec::local(
     direct_abi::SOAC_RUNTIME_BUILTIN_CHR_I64_SYMBOL,
     &[SigType::Pointer, SigType::I64],
     &[SigType::Pointer],
+);
+static SOAC_RUNTIME_BUILTIN_LEN_I64_IMPORT: ImportSpec = ImportSpec::local(
+    direct_abi::SOAC_RUNTIME_BUILTIN_LEN_I64_SYMBOL,
+    &[SigType::Pointer, SigType::Pointer],
+    &[SigType::I64],
+);
+static SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_IMPORT: ImportSpec = ImportSpec::local(
+    SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_SYMBOL,
+    &[SigType::Pointer, SigType::Pointer],
+    &[SigType::I64],
 );
 static DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_py_call_positional_three",
@@ -2214,6 +2225,7 @@ fn plan_typed_result_demands(
 struct JitEmitCtx<'mc> {
     module: &'mc BlockPyModule<CodegenModuleShape>,
     function_id: FunctionId,
+    function_kind: FunctionKind,
     shared_state: Option<&'mc crate::module_type::SharedModuleState>,
     module_constants: &'mc ModuleCodegenConstants,
     value_facts: &'mc FactStore,
@@ -2630,6 +2642,7 @@ struct LocalEnvEntry {
     ref_kind: LocalRefKind,
     storage: LocalEnvStorage,
     binding_facts: ParamBindingFacts,
+    py_facts: Option<PyObjFacts>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2653,6 +2666,7 @@ impl LocalEnv {
         ref_kind: LocalRefKind,
         storage: LocalEnvStorage,
         binding_facts: ParamBindingFacts,
+        py_facts: Option<PyObjFacts>,
     ) {
         debug_assert!(
             self.entry_index_for_location(location).is_none(),
@@ -2666,6 +2680,7 @@ impl LocalEnv {
             ref_kind,
             storage,
             binding_facts,
+            py_facts,
         });
     }
 
@@ -2698,6 +2713,16 @@ impl LocalEnv {
             );
             first
         })
+    }
+
+    fn py_facts_for_load(&self, name: &ResolvedName) -> Option<PyObjFacts> {
+        name.local_location()
+            .and_then(|location| {
+                self.entry_index_for_location(location)
+                    .or_else(|| self.entry_index_for_name(name.id.as_str()))
+            })
+            .or_else(|| self.entry_index_for_name(name.id.as_str()))
+            .and_then(|index| self.entries[index].py_facts)
     }
 
     fn load_location(
@@ -2761,6 +2786,7 @@ impl LocalEnv {
         name: &str,
         value: ir::Value,
         value_ref_kind: LocalRefKind,
+        py_facts: Option<PyObjFacts>,
         allow_local_only_slot_backed_store: bool,
         stack_slots: &StackSlots,
         ptr_ty: ir::Type,
@@ -2811,6 +2837,7 @@ impl LocalEnv {
                 ref_kind: local_ref_kind_for_stack_mirror(value_ref_kind),
                 storage: LocalEnvStorage::StackMirror,
                 binding_facts: local_binding_facts_for_stored_value(value_ref_kind),
+                py_facts,
             });
         } else {
             self.entries.push(LocalEnvEntry {
@@ -2824,6 +2851,7 @@ impl LocalEnv {
                 ref_kind: value_ref_kind,
                 storage: LocalEnvStorage::LocalOnly,
                 binding_facts: local_binding_facts_for_stored_value(value_ref_kind),
+                py_facts,
             });
         }
         if let Some(previous) = previous_entry {
@@ -2839,6 +2867,7 @@ impl LocalEnv {
         name: &str,
         value: ir::Value,
         value_ref_kind: LocalRefKind,
+        py_facts: Option<PyObjFacts>,
         ptr_ty: ir::Type,
         thread_state_value: ir::Value,
         decref_ref: ir::FuncRef,
@@ -2854,6 +2883,7 @@ impl LocalEnv {
             ref_kind: value_ref_kind,
             storage: LocalEnvStorage::LocalOnly,
             binding_facts: local_binding_facts_for_stored_value(value_ref_kind),
+            py_facts,
         });
         if let Some(previous) = previous_entry {
             if transient_local_needs_decref(previous.ref_kind) {
@@ -2914,6 +2944,7 @@ impl LocalEnv {
             ref_kind: LocalRefKind::Unbound,
             storage: unbound_storage,
             binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Unbound),
+            py_facts: None,
         });
         Ok(())
     }
@@ -2990,9 +3021,15 @@ fn bind_planned_local_env_at_block_entry(
     thread_state_value: ir::Value,
     incref_ref: ir::FuncRef,
     decref_ref: ir::FuncRef,
+    propagate_entry_py_facts: bool,
 ) -> Result<(), String> {
     for entry in &jit_local_plan.entry_materializations[block_index] {
         let binding = &entry.binding;
+        let entry_py_facts = if propagate_entry_py_facts {
+            binding.param_facts.value
+        } else {
+            None
+        };
         match entry.source {
             PlannedLocalEnvEntrySource::BlockParam { param_index } => {
                 let param_value =
@@ -3017,6 +3054,7 @@ fn bind_planned_local_env_at_block_entry(
                     entry.entry_ref_kind,
                     entry_storage,
                     binding.param_facts.binding,
+                    entry_py_facts,
                 );
                 if entry_storage == LocalEnvStorage::StackMirror {
                     stack_slots
@@ -3064,6 +3102,7 @@ fn bind_planned_local_env_at_block_entry(
                     entry.entry_ref_kind,
                     LocalEnvStorage::StackMirror,
                     binding.param_facts.binding,
+                    entry_py_facts,
                 );
             }
         }
@@ -3153,6 +3192,40 @@ fn local_ref_kind_for_stored_value(value: &InstrCodegen, ctx: &JitEmitCtx<'_>) -
         Some(facts) if facts.is_immortal() => LocalRefKind::Immortal,
         _ => LocalRefKind::Owned,
     }
+}
+
+fn py_facts_for_codegen_expr_with_local_env(
+    expr: &InstrCodegen,
+    _local_env: &LocalEnv,
+    ctx: &JitEmitCtx<'_>,
+) -> Option<PyObjFacts> {
+    ctx.value_facts_for_expr(expr)
+        .and_then(ValueFacts::as_pyobj)
+}
+
+fn py_facts_for_typed_expr_with_local_env(
+    expr: &InstrTyped,
+    local_env: &LocalEnv,
+    ctx: &JitEmitCtx<'_>,
+) -> Option<PyObjFacts> {
+    if let InstrTyped::Load(op) = expr {
+        if let Some(py_facts) = local_env.py_facts_for_load(&op.name) {
+            return Some(py_facts);
+        }
+        if op.name.location.as_constant().is_some_and(|index| {
+            ctx.module_constants
+                .constant_is_int(ModuleConstantId(index as usize))
+        }) {
+            return Some(PyObjFacts::exact_type(PyExactType::Int));
+        }
+        return op
+            .try_semantic_instr_id()
+            .and_then(|instr_id| ctx.value_facts_for_instr_id(instr_id))
+            .and_then(ValueFacts::as_pyobj);
+    }
+    expr.try_semantic_instr_id()
+        .and_then(|instr_id| ctx.value_facts_for_instr_id(instr_id))
+        .and_then(ValueFacts::as_pyobj)
 }
 
 fn local_ref_kind_for_typed_stored_value(
@@ -3292,6 +3365,11 @@ fn emit_local_store_result_with_local_env(
                 .unwrap_or_else(|error| panic!("{error}"));
             return Some(emit_none_for_demand(fb, emit_ctx, demand));
         }
+        let value_py_facts = if matches!(emit_ctx.function_kind, FunctionKind::Function) {
+            py_facts_for_codegen_expr_with_local_env(&op.value, local_env, emit_ctx)
+        } else {
+            None
+        };
         let value = emit_codegen_expr_with_local_env(
             fb,
             &op.value,
@@ -3312,6 +3390,7 @@ fn emit_local_store_result_with_local_env(
             name,
             value,
             value_ref_kind,
+            value_py_facts,
             emit_ctx.allow_local_only_slot_backed_stores,
             &emit_ctx.stack_slots,
             emit_ctx.consts.ptr_ty,
@@ -3345,6 +3424,11 @@ fn emit_local_store_result_with_local_env(
                 location.slot()
             )
         });
+    let value_py_facts = if matches!(emit_ctx.function_kind, FunctionKind::Function) {
+        py_facts_for_codegen_expr_with_local_env(&op.value, local_env, emit_ctx)
+    } else {
+        None
+    };
     let value = emit_codegen_expr_with_local_env(
         fb,
         &op.value,
@@ -3367,6 +3451,7 @@ fn emit_local_store_result_with_local_env(
             backing_name,
             value,
             value_ref_kind,
+            value_py_facts,
             emit_ctx.allow_local_only_slot_backed_stores,
             &emit_ctx.stack_slots,
             emit_ctx.consts.ptr_ty,
@@ -3380,6 +3465,7 @@ fn emit_local_store_result_with_local_env(
             backing_name,
             value,
             default_ref_kind,
+            value_py_facts,
             emit_ctx.consts.ptr_ty,
             emit_ctx.consts.thread_state_value,
             emit_ctx.decref_ref,
@@ -3447,7 +3533,13 @@ fn emit_typed_local_store_result_with_local_env(
             ));
         }
     };
-    let (value, ownership, _) = value_result.expect_pyobject("typed local store RHS");
+    let (value, ownership, value_py_facts) = value_result.expect_pyobject("typed local store RHS");
+    let value_py_facts = if matches!(emit_ctx.function_kind, FunctionKind::Function) {
+        py_facts_for_typed_expr_with_local_env(&op.value, local_env, emit_ctx)
+            .unwrap_or(value_py_facts)
+    } else {
+        value_py_facts
+    };
     if !ownership.can_satisfy_pyobject_demand(ResultDemand::PYOBJECT_OWNED) {
         return Err(format!(
             "typed local store RHS produced {ownership:?}, but store requires owned PyObject"
@@ -3464,6 +3556,7 @@ fn emit_typed_local_store_result_with_local_env(
         name,
         value,
         value_ref_kind,
+        Some(value_py_facts),
         emit_ctx.allow_local_only_slot_backed_stores,
         &emit_ctx.stack_slots,
         emit_ctx.consts.ptr_ty,
@@ -7912,9 +8005,7 @@ fn emit_codegen_expr_value_with_local_env(
     jit_module: &mut JITModule,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> SoacValue {
-    let facts = emit_ctx
-        .value_facts_for_expr(expr)
-        .and_then(ValueFacts::as_pyobj)
+    let facts = py_facts_for_codegen_expr_with_local_env(expr, local_env, emit_ctx)
         .unwrap_or_else(PyObjFacts::unknown);
     let value = emit_codegen_expr_with_local_env(
         fb,
@@ -9011,13 +9102,6 @@ fn emit_owned_pyobject_result_for_demand(
     }
 }
 
-fn single_positional_call_arg(
-    call: &soac_blockpy::block_py::Call<InstrCodegen>,
-) -> Option<&InstrCodegen> {
-    let args = direct_positional_call_args(call, 1)?;
-    Some(args[0])
-}
-
 fn direct_positional_call_args(
     call: &soac_blockpy::block_py::Call<InstrCodegen>,
     param_count: usize,
@@ -9038,7 +9122,7 @@ fn direct_positional_call_args(
 fn static_runtime_primitive_for_call(
     call: &soac_blockpy::block_py::Call<InstrCodegen>,
     module_constants: &ModuleCodegenConstants,
-) -> Option<RuntimePrimitiveId> {
+) -> Option<direct_abi::RuntimePrimitiveId> {
     let desc = static_runtime_primitive_desc_for_call(call, module_constants)?;
     let DirectTargetId::RuntimePrimitive(primitive) = desc.target else {
         return None;
@@ -9057,13 +9141,16 @@ fn static_runtime_primitive_desc_for_call(
     Some(desc)
 }
 
-fn runtime_primitive_import_spec(primitive: RuntimePrimitiveId) -> &'static ImportSpec {
-    match direct_abi::runtime_primitive_desc(primitive).entry {
+fn runtime_primitive_import_spec(desc: &DirectCallableDesc) -> &'static ImportSpec {
+    match desc.entry {
         DirectEntry::RuntimeSymbol(direct_abi::SOAC_RUNTIME_BUILTIN_ORD_I64_SYMBOL) => {
             &SOAC_RUNTIME_BUILTIN_ORD_I64_IMPORT
         }
         DirectEntry::RuntimeSymbol(direct_abi::SOAC_RUNTIME_BUILTIN_CHR_I64_SYMBOL) => {
             &SOAC_RUNTIME_BUILTIN_CHR_I64_IMPORT
+        }
+        DirectEntry::RuntimeSymbol(direct_abi::SOAC_RUNTIME_BUILTIN_LEN_I64_SYMBOL) => {
+            &SOAC_RUNTIME_BUILTIN_LEN_I64_IMPORT
         }
         DirectEntry::RuntimeSymbol(symbol) => {
             panic!("missing ImportSpec for runtime primitive symbol {symbol}")
@@ -9076,6 +9163,92 @@ fn runtime_primitive_import_spec(primitive: RuntimePrimitiveId) -> &'static Impo
 
 fn codegen_expr_can_satisfy_i64_demand(
     expr: &InstrCodegen,
+    local_env: &LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+) -> bool {
+    if codegen_expr_const_i64(expr, emit_ctx.module_constants).is_some() {
+        return true;
+    }
+    match expr {
+        InstrCodegen::Call(call) => {
+            let Some(desc) =
+                static_runtime_primitive_desc_for_call(call, emit_ctx.module_constants)
+            else {
+                return false;
+            };
+            matches!(desc.abi.result, ResultAbi::I64)
+                && runtime_primitive_call_params_can_satisfy_abi(call, desc, local_env, emit_ctx)
+        }
+        _ => false,
+    }
+}
+
+fn codegen_expr_has_exact_int_pyobject_facts(
+    expr: &InstrCodegen,
+    local_env: &LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+) -> bool {
+    if !matches!(emit_ctx.function_kind, FunctionKind::Function) {
+        return false;
+    }
+    if let InstrCodegen::Load(op) = expr {
+        if local_env
+            .py_facts_for_load(&op.name)
+            .is_some_and(|py_facts| py_facts.is_exact_type(PyExactType::Int))
+        {
+            return true;
+        }
+        if op.name.location.as_constant().is_some_and(|index| {
+            emit_ctx
+                .module_constants
+                .constant_is_int(ModuleConstantId(index as usize))
+        }) {
+            return true;
+        }
+    }
+    emit_ctx
+        .value_facts_for_expr(expr)
+        .and_then(ValueFacts::as_pyobj)
+        .is_some_and(|py_facts| py_facts.is_exact_type(PyExactType::Int))
+}
+
+fn codegen_expr_can_satisfy_param_abi(
+    expr: &InstrCodegen,
+    param: ParamAbi,
+    local_env: &LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+) -> bool {
+    match param {
+        ParamAbi::PyObject { .. } => true,
+        ParamAbi::I64 { py_long_coercion } => {
+            codegen_expr_can_satisfy_i64_demand(expr, local_env, emit_ctx)
+                || (py_long_coercion.is_some()
+                    && codegen_expr_has_exact_int_pyobject_facts(expr, local_env, emit_ctx))
+        }
+        ParamAbi::I32 => false,
+    }
+}
+
+fn runtime_primitive_call_params_can_satisfy_abi(
+    call: &soac_blockpy::block_py::Call<InstrCodegen>,
+    desc: &DirectCallableDesc,
+    local_env: &LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+) -> bool {
+    let DirectTargetId::RuntimePrimitive(_) = desc.target else {
+        return false;
+    };
+    let Some(args) = direct_positional_call_args(call, desc.abi.params.len()) else {
+        return false;
+    };
+    args.into_iter()
+        .zip(desc.abi.params.iter().copied())
+        .all(|(arg, param)| codegen_expr_can_satisfy_param_abi(arg, param, local_env, emit_ctx))
+}
+
+#[cfg(test)]
+fn codegen_expr_static_can_satisfy_i64_demand(
+    expr: &InstrCodegen,
     module_constants: &ModuleCodegenConstants,
 ) -> bool {
     if codegen_expr_const_i64(expr, module_constants).is_some() {
@@ -9087,25 +9260,18 @@ fn codegen_expr_can_satisfy_i64_demand(
                 return false;
             };
             matches!(desc.abi.result, ResultAbi::I64)
-                && runtime_primitive_call_params_can_satisfy_abi(call, desc, module_constants)
+                && runtime_primitive_call_static_params_can_satisfy_abi(
+                    call,
+                    desc,
+                    module_constants,
+                )
         }
         _ => false,
     }
 }
 
-fn codegen_expr_can_satisfy_param_abi(
-    expr: &InstrCodegen,
-    param: ParamAbi,
-    module_constants: &ModuleCodegenConstants,
-) -> bool {
-    match param {
-        ParamAbi::PyObject { .. } => true,
-        ParamAbi::I64 => codegen_expr_can_satisfy_i64_demand(expr, module_constants),
-        ParamAbi::I32 => false,
-    }
-}
-
-fn runtime_primitive_call_params_can_satisfy_abi(
+#[cfg(test)]
+fn runtime_primitive_call_static_params_can_satisfy_abi(
     call: &soac_blockpy::block_py::Call<InstrCodegen>,
     desc: &DirectCallableDesc,
     module_constants: &ModuleCodegenConstants,
@@ -9115,7 +9281,13 @@ fn runtime_primitive_call_params_can_satisfy_abi(
     };
     args.into_iter()
         .zip(desc.abi.params.iter().copied())
-        .all(|(arg, param)| codegen_expr_can_satisfy_param_abi(arg, param, module_constants))
+        .all(|(arg, param)| match param {
+            ParamAbi::PyObject { .. } => true,
+            ParamAbi::I64 { .. } => {
+                codegen_expr_static_can_satisfy_i64_demand(arg, module_constants)
+            }
+            ParamAbi::I32 => false,
+        })
 }
 
 fn emit_scalar_result_after_current_exception_check_with_cleanup(
@@ -9186,84 +9358,237 @@ fn emit_i64_result_for_demand(
     }
 }
 
-fn emit_runtime_builtin_ord_i64_result_with_local_env(
+fn emit_exact_pylong_as_i64_saturating_result_with_local_env(
     fb: &mut FunctionBuilder<'_>,
-    arg: &InstrCodegen,
+    expr: &InstrCodegen,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     demand: ResultDemand,
     jit_module: &mut JITModule,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> EmitResult {
-    let arg_is_borrowed =
-        codegen_expr_pyobject_input_is_borrowed_from_local_env(arg, local_env, emit_ctx);
-    let arg_value = emit_codegen_expr_with_local_env(
+    let value_is_borrowed =
+        codegen_expr_pyobject_input_is_borrowed_from_local_env(expr, local_env, emit_ctx);
+    let value = emit_codegen_expr_with_local_env(
         fb,
-        arg,
+        expr,
         local_env,
         emit_ctx,
-        arg_is_borrowed,
+        value_is_borrowed,
         jit_module,
         func_imports,
     );
-    let ord_ref = func_imports.get_or_panic(
+    let pylong_as_i64_saturating_ref = func_imports.get_or_panic(
         jit_module,
         &mut fb.func,
-        runtime_primitive_import_spec(RuntimePrimitiveId::BuiltinOrdI64),
+        &SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_IMPORT,
     );
-    let ord_inst = fb
-        .ins()
-        .call(ord_ref, &[emit_ctx.consts.thread_state_value, arg_value]);
-    let ord_i64 = fb.inst_results(ord_inst)[0];
-    let owned_inputs = if arg_is_borrowed {
+    let as_i64_inst = fb.ins().call(
+        pylong_as_i64_saturating_ref,
+        &[emit_ctx.consts.thread_state_value, value],
+    );
+    let raw_i64 = fb.inst_results(as_i64_inst)[0];
+    let owned_inputs = if value_is_borrowed {
         Vec::new()
     } else {
-        vec![arg_value]
+        vec![value]
     };
-    let ord_i64 = emit_scalar_result_after_current_exception_check_with_cleanup(
+    let value_i64 = emit_scalar_result_after_current_exception_check_with_cleanup(
         fb,
-        ord_i64,
+        raw_i64,
         emit_ctx.consts.i64_ty,
         owned_inputs.as_slice(),
         emit_ctx,
     );
-    emit_i64_result_for_demand(fb, ord_i64, IntFacts::i64_unknown(), emit_ctx, demand)
+    emit_i64_result_for_demand(fb, value_i64, IntFacts::i64_unknown(), emit_ctx, demand)
 }
 
-fn emit_runtime_builtin_chr_i64_result_with_local_env(
+fn emit_runtime_primitive_hidden_args(
+    desc: &DirectCallableDesc,
+    emit_ctx: &JitEmitCtx<'_>,
+) -> Vec<ir::Value> {
+    let mut args = Vec::with_capacity(desc.abi.hidden_args.len());
+    for hidden_arg in desc.abi.hidden_args {
+        match hidden_arg {
+            HiddenArgAbi::ThreadState => args.push(emit_ctx.consts.thread_state_value),
+            HiddenArgAbi::FunctionEnv => {
+                panic!("runtime primitive descriptor cannot use a function-env hidden argument")
+            }
+        }
+    }
+    args
+}
+
+fn emit_runtime_primitive_param_value_with_local_env(
     fb: &mut FunctionBuilder<'_>,
-    arg: &InstrCodegen,
+    expr: &InstrCodegen,
+    param: ParamAbi,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> (ir::Value, Option<ir::Value>) {
+    match param {
+        ParamAbi::PyObject {
+            ownership: ArgOwnership::BorrowedOk,
+        } => {
+            let expr_is_borrowed =
+                codegen_expr_pyobject_input_is_borrowed_from_local_env(expr, local_env, emit_ctx);
+            let value = emit_codegen_expr_with_local_env(
+                fb,
+                expr,
+                local_env,
+                emit_ctx,
+                expr_is_borrowed,
+                jit_module,
+                func_imports,
+            );
+            let owned_after_call = if expr_is_borrowed { None } else { Some(value) };
+            (value, owned_after_call)
+        }
+        ParamAbi::PyObject { ownership } => {
+            panic!("runtime primitive PyObject param ownership {ownership:?} is not implemented")
+        }
+        ParamAbi::I64 {
+            py_long_coercion: Some(PyLongI64Coercion::Saturating),
+        } if codegen_expr_const_i64(expr, emit_ctx.module_constants).is_none()
+            && codegen_expr_has_exact_int_pyobject_facts(expr, local_env, emit_ctx) =>
+        {
+            let coerced = emit_exact_pylong_as_i64_saturating_result_with_local_env(
+                fb,
+                expr,
+                local_env,
+                emit_ctx,
+                ResultDemand::I64_VALUE,
+                jit_module,
+                func_imports,
+            );
+            let (value, _) = coerced.expect_i64("runtime primitive PyLong-to-I64 param");
+            (value, None)
+        }
+        ParamAbi::I64 { .. } => {
+            let arg_result = emit_codegen_stmt_result_with_local_env(
+                fb,
+                expr,
+                local_env,
+                emit_ctx,
+                ResultDemand::I64_VALUE,
+                jit_module,
+                func_imports,
+            )
+            .expect("I64-capable runtime builtin argument should emit");
+            let (value, _) = arg_result.expect_i64("runtime primitive I64 param");
+            (value, None)
+        }
+        ParamAbi::I32 => panic!("runtime primitive I32 params are not implemented"),
+    }
+}
+
+fn emit_runtime_primitive_result_for_demand(
+    fb: &mut FunctionBuilder<'_>,
+    desc: &DirectCallableDesc,
+    raw_result: Option<ir::Value>,
+    owned_inputs: &[ir::Value],
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+) -> EmitResult {
+    match desc.abi.result {
+        ResultAbi::I64 => {
+            let raw_result = raw_result.expect("I64 runtime primitive should return a value");
+            let value = match desc.abi.error {
+                ErrorAbi::CurrentException => {
+                    emit_scalar_result_after_current_exception_check_with_cleanup(
+                        fb,
+                        raw_result,
+                        emit_ctx.consts.i64_ty,
+                        owned_inputs,
+                        emit_ctx,
+                    )
+                }
+                ErrorAbi::CannotRaise => {
+                    emit_release_owned_inputs(fb, emit_ctx, owned_inputs);
+                    raw_result
+                }
+            };
+            emit_i64_result_for_demand(fb, value, IntFacts::i64_unknown(), emit_ctx, demand)
+        }
+        ResultAbi::PyObject {
+            ownership: ValueOwnership::Owned,
+            exact_type,
+        } => {
+            let raw_result = raw_result.expect("PyObject runtime primitive should return a value");
+            let value = match desc.abi.error {
+                ErrorAbi::CurrentException => {
+                    let value = emit_decref_owned_inputs_after_nullable_result(
+                        fb,
+                        emit_ctx,
+                        raw_result,
+                        owned_inputs,
+                    );
+                    emit_checked_owned_pyobject_result(fb, value, emit_ctx)
+                }
+                ErrorAbi::CannotRaise => {
+                    emit_release_owned_inputs(fb, emit_ctx, owned_inputs);
+                    raw_result
+                }
+            };
+            let facts = exact_type
+                .map(PyObjFacts::exact_type)
+                .unwrap_or_else(PyObjFacts::unknown);
+            emit_owned_pyobject_result_for_demand(fb, value, facts, emit_ctx, demand)
+        }
+        ResultAbi::PyObject { ownership, .. } => {
+            panic!("runtime primitive PyObject result ownership {ownership:?} is not implemented")
+        }
+        ResultAbi::I32 => panic!("runtime primitive I32 results are not implemented"),
+        ResultAbi::NoValue => {
+            emit_release_owned_inputs(fb, emit_ctx, owned_inputs);
+            EmitResult::no_value()
+        }
+    }
+}
+
+fn emit_runtime_builtin_primitive_desc_call_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    call: &soac_blockpy::block_py::Call<InstrCodegen>,
+    desc: &DirectCallableDesc,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     demand: ResultDemand,
     jit_module: &mut JITModule,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> EmitResult {
-    let arg_result = emit_codegen_stmt_result_with_local_env(
-        fb,
-        arg,
-        local_env,
-        emit_ctx,
-        ResultDemand::I64_VALUE,
-        jit_module,
-        func_imports,
-    )
-    .expect("I64-capable runtime builtin argument should emit");
-    let (arg_i64, _) = arg_result.expect_i64("chr runtime primitive argument");
-    let chr_ref = func_imports.get_or_panic(
+    let args = direct_positional_call_args(call, desc.abi.params.len())
+        .expect("runtime primitive call arity should match descriptor");
+    let mut call_args = emit_runtime_primitive_hidden_args(desc, emit_ctx);
+    let mut owned_inputs = Vec::new();
+    for (arg, param) in args.into_iter().zip(desc.abi.params.iter().copied()) {
+        let (value, owned_after_call) = emit_runtime_primitive_param_value_with_local_env(
+            fb,
+            arg,
+            param,
+            local_env,
+            emit_ctx,
+            jit_module,
+            func_imports,
+        );
+        call_args.push(value);
+        if let Some(owned_after_call) = owned_after_call {
+            owned_inputs.push(owned_after_call);
+        }
+    }
+    let func_ref = func_imports.get_or_panic(
         jit_module,
         &mut fb.func,
-        runtime_primitive_import_spec(RuntimePrimitiveId::BuiltinChrI64),
+        runtime_primitive_import_spec(desc),
     );
-    let chr_inst = fb
-        .ins()
-        .call(chr_ref, &[emit_ctx.consts.thread_state_value, arg_i64]);
-    let chr_raw_value = fb.inst_results(chr_inst)[0];
-    let chr_value = emit_checked_owned_pyobject_result(fb, chr_raw_value, emit_ctx);
-    emit_owned_pyobject_result_for_demand(
+    let call_inst = fb.ins().call(func_ref, call_args.as_slice());
+    let raw_result = fb.inst_results(call_inst).first().copied();
+    emit_runtime_primitive_result_for_demand(
         fb,
-        chr_value,
-        PyObjFacts::exact_type(PyExactType::Str),
+        desc,
+        raw_result,
+        owned_inputs.as_slice(),
         emit_ctx,
         demand,
     )
@@ -9279,37 +9604,24 @@ fn emit_runtime_builtin_primitive_call_result_with_local_env(
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Option<EmitResult> {
     let desc = static_runtime_primitive_desc_for_call(call, emit_ctx.module_constants)?;
-    if !runtime_primitive_call_params_can_satisfy_abi(call, desc, emit_ctx.module_constants) {
+    if !runtime_primitive_call_params_can_satisfy_abi(call, desc, local_env, emit_ctx) {
         return None;
     }
-    let arg = single_positional_call_arg(call).expect("primitive call should have one arg");
-    let DirectTargetId::RuntimePrimitive(primitive) = desc.target else {
+    let DirectTargetId::RuntimePrimitive(_) = desc.target else {
         return None;
     };
-    match primitive {
-        RuntimePrimitiveId::BuiltinOrdI64 => {
-            Some(emit_runtime_builtin_ord_i64_result_with_local_env(
-                fb,
-                arg,
-                local_env,
-                emit_ctx,
-                demand,
-                jit_module,
-                func_imports,
-            ))
-        }
-        RuntimePrimitiveId::BuiltinChrI64 => {
-            Some(emit_runtime_builtin_chr_i64_result_with_local_env(
-                fb,
-                arg,
-                local_env,
-                emit_ctx,
-                demand,
-                jit_module,
-                func_imports,
-            ))
-        }
-    }
+    Some(
+        emit_runtime_builtin_primitive_desc_call_result_with_local_env(
+            fb,
+            call,
+            desc,
+            local_env,
+            emit_ctx,
+            demand,
+            jit_module,
+            func_imports,
+        ),
+    )
 }
 
 fn emit_codegen_call_result_with_local_env(
@@ -9385,7 +9697,6 @@ fn emit_codegen_stmt_result_with_local_env(
             demand,
         ));
     }
-
     match expr {
         InstrCodegen::Store(op) => {
             if let Some(result) = emit_local_store_result_with_local_env(
@@ -11607,6 +11918,10 @@ pub(crate) const SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL: &str =
     "soac_runtime_store_global_indexed";
 pub(crate) const SOAC_RUNTIME_PROBE_FIELD_INDEXED_SYMBOL: &str = "soac_runtime_probe_field_indexed";
 pub(crate) const SOAC_RUNTIME_STORE_FIELD_INDEXED_SYMBOL: &str = "soac_runtime_store_field_indexed";
+#[cfg(test)]
+pub(crate) const SOAC_RUNTIME_PYLONG_AS_I64_SYMBOL: &str = "soac_runtime_pylong_as_i64";
+pub(crate) const SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_SYMBOL: &str =
+    "soac_runtime_pylong_as_i64_saturating";
 
 pub(crate) fn jit_python_perf_symbol_name(kind: &str, qualname: &str) -> String {
     format!("py:{kind}:{qualname}")
@@ -12824,6 +13139,7 @@ fn build_cranelift_run_bb_specialized_function(
                 thread_state_value,
                 incref_ref,
                 decref_ref,
+                matches!(function.kind, FunctionKind::Function),
             )?;
             let block_const = globals_value;
             let none_const = emit_owned_module_constant_from_parts(
@@ -12862,6 +13178,7 @@ fn build_cranelift_run_bb_specialized_function(
             let emit_ctx = JitEmitCtx {
                 module,
                 function_id: function.function_id,
+                function_kind: function.kind,
                 shared_state: direct_call_resolver,
                 module_constants,
                 value_facts,

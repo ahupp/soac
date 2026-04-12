@@ -18,6 +18,7 @@ mod tests {
         CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey, CounterDumpTypeKeyLayout,
         CounterDumpTypeTableEntry, write_counter_dump_records,
     };
+    use crate::jit::direct_abi::RuntimePrimitiveId;
     use cranelift_codegen::cursor::Cursor;
     use pyo3::types::{PyAnyMethods, PyDictMethods, PyModule};
     use pyo3::{Python, ffi};
@@ -1005,11 +1006,11 @@ def f():
         ));
         let int_constant = name_expr(test_constant_name(1));
 
-        assert!(codegen_expr_can_satisfy_i64_demand(
+        assert!(codegen_expr_static_can_satisfy_i64_demand(
             &ord_call,
             &module_constants
         ));
-        assert!(codegen_expr_can_satisfy_i64_demand(
+        assert!(codegen_expr_static_can_satisfy_i64_demand(
             &int_constant,
             &module_constants
         ));
@@ -1040,12 +1041,12 @@ def f():
         let desc = static_runtime_primitive_desc_for_call(&literal_chr_call, &module_constants)
             .expect("chr runtime primitive should be recognized");
 
-        assert!(runtime_primitive_call_params_can_satisfy_abi(
+        assert!(runtime_primitive_call_static_params_can_satisfy_abi(
             &literal_chr_call,
             desc,
             &module_constants
         ));
-        assert!(!runtime_primitive_call_params_can_satisfy_abi(
+        assert!(!runtime_primitive_call_static_params_can_satisfy_abi(
             &unknown_chr_call,
             desc,
             &module_constants
@@ -1442,6 +1443,7 @@ def f():
                     ref_kind: LocalRefKind::Owned,
                     storage: LocalEnvStorage::LocalOnly,
                     binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Owned),
+                    py_facts: None,
                 },
                 LocalEnvEntry {
                     location: Some(LocalLocation(1)),
@@ -1451,6 +1453,7 @@ def f():
                     ref_kind: LocalRefKind::Owned,
                     storage: LocalEnvStorage::StackMirror,
                     binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Owned),
+                    py_facts: None,
                 },
                 LocalEnvEntry {
                     location: Some(LocalLocation(2)),
@@ -1460,6 +1463,7 @@ def f():
                     ref_kind: LocalRefKind::Immortal,
                     storage: LocalEnvStorage::LocalOnly,
                     binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Immortal),
+                    py_facts: None,
                 },
             ],
         };
@@ -1479,6 +1483,7 @@ def f():
                     ref_kind: LocalRefKind::Owned,
                     storage: LocalEnvStorage::LocalOnly,
                     binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Owned),
+                    py_facts: None,
                 },
                 LocalEnvEntry {
                     location: Some(LocalLocation(1)),
@@ -1488,6 +1493,7 @@ def f():
                     ref_kind: LocalRefKind::Owned,
                     storage: LocalEnvStorage::LocalOnly,
                     binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Owned),
+                    py_facts: None,
                 },
                 LocalEnvEntry {
                     location: Some(LocalLocation(2)),
@@ -1497,6 +1503,7 @@ def f():
                     ref_kind: LocalRefKind::Borrowed,
                     storage: LocalEnvStorage::LocalOnly,
                     binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Borrowed),
+                    py_facts: None,
                 },
                 LocalEnvEntry {
                     location: Some(LocalLocation(3)),
@@ -1506,6 +1513,7 @@ def f():
                     ref_kind: LocalRefKind::Immortal,
                     storage: LocalEnvStorage::LocalOnly,
                     binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Immortal),
+                    py_facts: None,
                 },
             ],
         };
@@ -1567,6 +1575,7 @@ def f():
                     ref_kind: LocalRefKind::Owned,
                     storage: LocalEnvStorage::LocalOnly,
                     binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Owned),
+                    py_facts: None,
                 }],
             };
             let forwarded = HashSet::new();
@@ -1635,6 +1644,7 @@ def f():
                     ref_kind: LocalRefKind::Owned,
                     storage: LocalEnvStorage::LocalOnly,
                     binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Owned),
+                    py_facts: None,
                 }],
             };
             let forwarded = HashSet::from([LocalLocation(0)]);
@@ -1663,6 +1673,7 @@ def f():
                 ref_kind: LocalRefKind::Owned,
                 storage: LocalEnvStorage::LocalOnly,
                 binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Owned),
+                py_facts: None,
             }],
         };
         let stack_slots = StackSlots {
@@ -1689,6 +1700,7 @@ def f():
                 ref_kind: LocalRefKind::Owned,
                 storage: LocalEnvStorage::LocalOnly,
                 binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Owned),
+                py_facts: None,
             }],
         };
         let stack_slots = StackSlots {
@@ -1772,6 +1784,7 @@ def f():
                 ref_kind: LocalRefKind::Owned,
                 storage: initial_storage,
                 binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Owned),
+                py_facts: None,
             });
             let stack_slots = StackSlots::new(
                 &mut fb,
@@ -1787,6 +1800,7 @@ def f():
                 "x",
                 new_value,
                 LocalRefKind::Owned,
+                None,
                 true,
                 &stack_slots,
                 ptr_ty,
@@ -1869,6 +1883,7 @@ def f():
                 "x",
                 new_value,
                 LocalRefKind::Owned,
+                None,
                 allow_local_only_slot_backed_store,
                 &stack_slots,
                 ptr_ty,
@@ -1987,6 +2002,7 @@ def f():
                 LocalRefKind::Owned,
                 LocalEnvStorage::LocalOnly,
                 ParamBindingFacts::DefinitelyBound,
+                None,
             );
 
             env.delete_location(
@@ -4141,7 +4157,7 @@ def read_point(point):
     }
 
     #[test]
-    fn runtime_clif_builtin_ord_and_chr_symbols_are_available() {
+    fn runtime_clif_builtin_primitive_symbols_are_available() {
         let ord = parsed_runtime_clif_function(direct_abi::SOAC_RUNTIME_BUILTIN_ORD_I64_SYMBOL);
         assert_eq!(ord.function.signature.params.len(), 2);
         assert_eq!(ord.function.signature.returns.len(), 1);
@@ -4151,6 +4167,28 @@ def read_point(point):
         assert_eq!(chr.function.signature.params.len(), 2);
         assert_eq!(chr.function.signature.returns.len(), 1);
         assert_eq!(chr.function.signature.returns[0].value_type, ir::types::I64);
+
+        let len = parsed_runtime_clif_function(direct_abi::SOAC_RUNTIME_BUILTIN_LEN_I64_SYMBOL);
+        assert_eq!(len.function.signature.params.len(), 2);
+        assert_eq!(len.function.signature.returns.len(), 1);
+        assert_eq!(len.function.signature.returns[0].value_type, ir::types::I64);
+
+        let pylong_as_i64 = parsed_runtime_clif_function(SOAC_RUNTIME_PYLONG_AS_I64_SYMBOL);
+        assert_eq!(pylong_as_i64.function.signature.params.len(), 2);
+        assert_eq!(pylong_as_i64.function.signature.returns.len(), 1);
+        assert_eq!(
+            pylong_as_i64.function.signature.returns[0].value_type,
+            ir::types::I64
+        );
+
+        let pylong_as_i64_saturating =
+            parsed_runtime_clif_function(SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_SYMBOL);
+        assert_eq!(pylong_as_i64_saturating.function.signature.params.len(), 2);
+        assert_eq!(pylong_as_i64_saturating.function.signature.returns.len(), 1);
+        assert_eq!(
+            pylong_as_i64_saturating.function.signature.returns[0].value_type,
+            ir::types::I64
+        );
     }
 
     #[test]

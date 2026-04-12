@@ -286,6 +286,13 @@ impl ModuleCodegenConstants {
         }
     }
 
+    pub fn constant_is_int(&self, constant_id: ModuleConstantId) -> bool {
+        matches!(
+            self.values.get(constant_id.0),
+            Some(ModuleConstantValue::Int(_) | ModuleConstantValue::BigInt(_))
+        )
+    }
+
     pub fn constant_runtime_name_value(&self, constant_id: ModuleConstantId) -> Option<&str> {
         match self.values.get(constant_id.0)? {
             ModuleConstantValue::RuntimeName(bytes) => std::str::from_utf8(bytes).ok(),

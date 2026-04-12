@@ -561,6 +561,9 @@ apply/verify mode:
   `soac_runtime_builtin_ord_i64` primitive. The primitive accepts the argument
   as a borrowed `PyObject*`, performs CPython-compatible validation internally,
   sets `PyThreadState.current_exception` on failure, and returns an `i64`.
+- `len(x)` uses the same scalar-returning runtime primitive shape via
+  `soac_runtime_builtin_len_i64`: borrowed `PyObject*` input, `i64` result, and
+  `PyThreadState.current_exception` error reporting.
 - If the consumer demands a Python object, the `i64` result is boxed through
   the existing `emit_to_python_long` coercion path. If the consumer demands an
   `i64`, the scalar value is used directly.
@@ -570,6 +573,11 @@ apply/verify mode:
 - `chr(<i64 module constant>)` can pass the constant directly to
   `soac_runtime_builtin_chr_i64` instead of first materializing a temporary
   `PyLong`.
+- `chr(x)` can use the same scalar path when local value facts prove that `x`
+  is an exact `PyLong`. Codegen emits the general
+  `soac_runtime_pylong_as_i64_saturating` coercion before calling
+  `soac_runtime_builtin_chr_i64`; huge Python integers become out-of-range
+  scalar codepoints so `chr_i64` still raises CPython-compatible `ValueError`.
 - Scalar-returning primitive calls check `PyThreadState.current_exception`
   immediately after the call. On error, codegen preserves the exception while
   releasing owned temporaries, then jumps to the normal Python exception path.
@@ -577,9 +585,9 @@ apply/verify mode:
 ### Limitations / Soundness / Extensions
 
 - The current `chr` primitive path is only selected when its argument can
-  already satisfy an `i64` demand, currently direct `ord(x)` or an `i64` module
-  constant. Plain `chr(x)` still uses generic vectorcall unless `x` is itself
-  lowered to an `i64` by another specialization.
+  satisfy an `i64` demand: direct `ord(x)`, an `i64` module constant, or an
+  expression/local with exact `PyLong` facts. Plain `chr(x)` still uses generic
+  vectorcall when the argument facts are unknown.
 - The runtime primitives use checked CPython C-API calls for Unicode handling.
   Direct Unicode layout reads are a later optimization.
 - Error messages are not yet preserved on the checked primitive's explicit

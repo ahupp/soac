@@ -3,7 +3,7 @@
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("soac-runtime raw CPython layout support requires a 64-bit target");
 
-use core::ffi::c_void;
+use core::ffi::{c_int, c_void};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -185,6 +185,9 @@ unsafe extern "C" {
     fn PyUnicode_FromOrdinal(ordinal: i32) -> *mut c_void;
     fn PyUnicode_GetLength(unicode: *mut c_void) -> isize;
     fn PyUnicode_ReadChar(unicode: *mut c_void, index: isize) -> u32;
+    fn PyObject_Size(obj: *mut c_void) -> isize;
+    fn PyLong_AsLongLong(obj: *mut c_void) -> i64;
+    fn PyLong_AsLongLongAndOverflow(obj: *mut c_void, overflow: *mut c_int) -> i64;
     fn soac_runtime_decref_dealloc_preserving_error(
         tstate: *mut RawPyThreadState,
         obj: *mut RawPyObject,
@@ -373,6 +376,15 @@ pub unsafe extern "C" fn soac_runtime_builtin_ord_i64(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn soac_runtime_builtin_len_i64(
+    _tstate: *mut c_void,
+    obj: *mut c_void,
+) -> i64 {
+    debug_assert!(!obj.is_null());
+    unsafe { PyObject_Size(obj) as i64 }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn soac_runtime_builtin_chr_i64(
     _tstate: *mut c_void,
     value: i64,
@@ -382,6 +394,36 @@ pub unsafe extern "C" fn soac_runtime_builtin_chr_i64(
         return core::ptr::null_mut();
     }
     unsafe { PyUnicode_FromOrdinal(value as i32) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soac_runtime_pylong_as_i64(_tstate: *mut c_void, obj: *mut c_void) -> i64 {
+    unsafe { PyLong_AsLongLong(obj) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soac_runtime_pylong_as_i64_saturating(
+    tstate: *mut c_void,
+    obj: *mut c_void,
+) -> i64 {
+    let mut overflow = 0;
+    let value = unsafe { PyLong_AsLongLongAndOverflow(obj, &mut overflow) };
+    if value == -1
+        && !unsafe {
+            (*tstate.cast::<RawPyThreadState>())
+                .current_exception
+                .is_null()
+        }
+    {
+        return -1;
+    }
+    if overflow < 0 {
+        return i64::MIN;
+    }
+    if overflow > 0 {
+        return i64::MAX;
+    }
+    value
 }
 
 #[inline(always)]
