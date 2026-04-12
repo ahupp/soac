@@ -43,6 +43,15 @@ enum ResultDemand {
 }
 ```
 
+For Python-object demands, borrowed-vs-owned is part of the demand, not just an
+implementation detail of the producer. A consumer that will only inspect or pass
+through a value may use `PyObject { borrowed_ok: true }`; a consumer that stores,
+returns, or otherwise transfers ownership must request `PyObject { borrowed_ok:
+false }`. Producers should satisfy the requested ownership shape directly when
+possible, and only insert `INCREF`/`DECREF` at the conversion boundary when a
+borrowed result cannot satisfy an owned demand or an owned result is being
+discarded.
+
 Codegen should return an explicit result wrapper instead of always returning an
 `ir::Value`:
 
@@ -79,6 +88,10 @@ Consumers define what they need from children:
   emits the delete and then materializes owned `None`.
 - Call args and callable: keep the current borrowed-ok logic, but derive it from
   consumer demand and facts rather than ad hoc local checks over time.
+- Borrowed/owned Python-object requirements should be planned with the consumer
+  demand, so codegen can avoid manufacturing owned temporaries when a borrowed
+  value is sufficient and can materialize ownership exactly at Python-visible
+  transfer boundaries.
 - Branch tests: eventually use `TruthValue` demand rather than forcing a Python
   object and then re-lowering truthiness.
 
