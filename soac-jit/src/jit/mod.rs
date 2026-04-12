@@ -4056,10 +4056,17 @@ struct PendingLocalFailureCleanup {
     continuation: PendingLocalFailureContinuation,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum PendingLocalFailureContinuation {
     CleanupNull(ir::Block),
     ExceptionDispatch(ir::Block),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct LocalFailureCleanupKey {
+    cleanup_values: Vec<ir::Value>,
+    forwarded_values: Vec<ir::Value>,
+    continuation: PendingLocalFailureContinuation,
 }
 
 fn step_null_block_args(ctx: &JitEmitCtx<'_>) -> Vec<ir::BlockArg> {
@@ -9746,6 +9753,7 @@ fn local_failure_cleanup_emit_ctx<'mc>(
     local_env: &LocalEnv,
     cleanup_null_block: ir::Block,
     pending_local_failure_cleanups: &mut Vec<PendingLocalFailureCleanup>,
+    local_failure_cleanup_blocks: &mut HashMap<LocalFailureCleanupKey, ir::Block>,
 ) -> Result<Option<JitEmitCtx<'mc>>, String> {
     if !emit_ctx.consts.step_null_args.is_empty() {
         return Ok(None);
@@ -9780,21 +9788,34 @@ fn local_failure_cleanup_emit_ctx<'mc>(
         )));
     }
 
-    let cleanup_block = fb.create_block();
-    for _ in &cleanup_values {
-        fb.append_block_param(cleanup_block, emit_ctx.consts.ptr_ty);
-    }
-    for _ in &forwarded_values {
-        fb.append_block_param(cleanup_block, emit_ctx.consts.ptr_ty);
-    }
     let cleanup_arg_count = cleanup_values.len();
+    let forwarded_arg_count = forwarded_values.len();
+    let key = LocalFailureCleanupKey {
+        cleanup_values: cleanup_values.clone(),
+        forwarded_values: forwarded_values.clone(),
+        continuation,
+    };
+    let cleanup_block = if let Some(cleanup_block) = local_failure_cleanup_blocks.get(&key).copied()
+    {
+        cleanup_block
+    } else {
+        let cleanup_block = fb.create_block();
+        for _ in 0..cleanup_arg_count {
+            fb.append_block_param(cleanup_block, emit_ctx.consts.ptr_ty);
+        }
+        for _ in 0..forwarded_arg_count {
+            fb.append_block_param(cleanup_block, emit_ctx.consts.ptr_ty);
+        }
+        pending_local_failure_cleanups.push(PendingLocalFailureCleanup {
+            block: cleanup_block,
+            cleanup_arg_count,
+            continuation,
+        });
+        local_failure_cleanup_blocks.insert(key, cleanup_block);
+        cleanup_block
+    };
     let mut step_null_args = cleanup_values;
     step_null_args.extend(forwarded_values);
-    pending_local_failure_cleanups.push(PendingLocalFailureCleanup {
-        block: cleanup_block,
-        cleanup_arg_count,
-        continuation,
-    });
     Ok(Some(
         emit_ctx.with_step_null_target(cleanup_block, step_null_args),
     ))
@@ -9808,6 +9829,7 @@ fn emit_typed_codegen_ops(
     emit_ctx: &JitEmitCtx<'_>,
     cleanup_null_block: ir::Block,
     pending_local_failure_cleanups: &mut Vec<PendingLocalFailureCleanup>,
+    local_failure_cleanup_blocks: &mut HashMap<LocalFailureCleanupKey, ir::Block>,
     jit_module: &mut JITModule,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<(), String> {
@@ -9818,6 +9840,7 @@ fn emit_typed_codegen_ops(
             local_env,
             cleanup_null_block,
             pending_local_failure_cleanups,
+            local_failure_cleanup_blocks,
         )?;
         let stmt_emit_ctx = stmt_emit_ctx.as_ref().unwrap_or(emit_ctx);
         let result = emit_typed_codegen_stmt_result_with_local_env(
@@ -12792,6 +12815,7 @@ fn build_cranelift_run_bb_specialized_function(
 
         let mut exception_dispatch_blocks: Vec<Option<ir::Block>> = vec![None; exec_blocks.len()];
         let mut pending_local_failure_cleanups = Vec::new();
+        let mut local_failure_cleanup_blocks = HashMap::new();
         for (index, maybe_dispatch) in exc_dispatches.iter().enumerate() {
             if let Some(dispatch_plan) = maybe_dispatch {
                 let dispatch_block = fb.create_block();
@@ -12958,6 +12982,7 @@ fn build_cranelift_run_bb_specialized_function(
                 &emit_ctx,
                 cleanup_null_blocks[index],
                 &mut pending_local_failure_cleanups,
+                &mut local_failure_cleanup_blocks,
                 jit_module,
                 &mut func_imports,
             )?;
@@ -12968,6 +12993,7 @@ fn build_cranelift_run_bb_specialized_function(
                 &local_env,
                 cleanup_null_blocks[index],
                 &mut pending_local_failure_cleanups,
+                &mut local_failure_cleanup_blocks,
             )?;
             let term_emit_ctx = term_emit_ctx.as_ref().unwrap_or(&emit_ctx);
             emit_typed_codegen_term(

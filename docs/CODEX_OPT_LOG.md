@@ -5,6 +5,27 @@ optimization attempts made by Codex agents. Keep entries succinct: what
 changed or was tried, which jj change id carried it when landed, the
 benchmarked throughput delta, and the headline pre/post numbers.
 
+## 2026-04-12 - Deduplicate identical local failure cleanup blocks
+
+- jj change id: `spxzrtuu`
+- summary: Local failure cleanup lowering now reuses pending cleanup blocks
+  when the concrete cleanup value list, forwarded value list, and continuation
+  block are identical. An earlier arity-only sharing attempt reduced code size
+  more aggressively but corrupted async cancellation cleanup, so the landed
+  form keeps sharing limited to identical SSA cleanup inputs.
+- throughput: `+3.68%` specialized pystone median; total pystone code size
+  `-6.97%`; total pystone machine blocks `-6.06%`
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `275808`, `280431`, `273441 loops/s`
+  - verify pass: `156370 loops/s`
+  - total code size: `370500` bytes
+  - total machine blocks: `22652`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `285947`, `279119`, `286187 loops/s`
+  - verify pass: `155688 loops/s`
+  - total code size: `344678` bytes
+  - total machine blocks: `21280`
+
 ## 2026-04-12 - Use fixed-arity fallback calls for small guarded calls
 
 - jj change id: `xqqowksq`
