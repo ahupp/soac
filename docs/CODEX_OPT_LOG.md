@@ -337,3 +337,17 @@ benchmarked throughput delta, and the headline pre/post numbers.
   - specialized pass, 1M loops x3: `185930`, `189987`, `186673 loops/s`
   - pystone JIT code bytes: `906622`
   - pystone verify refcount ops: `20956626`
+
+## 2026-04-12 - Reduce JIT LocalEnv stack mirrors
+
+- jj change id: `mnplvqtw`
+- summary: Direct-entry params and cleanup-only locals now travel through
+  planned block params where possible, and the JIT allocates physical stack
+  slots only for remaining stack-backed paths. This removes entry
+  store/load roundtrips and avoids preserving stack mirrors only for
+  representation compatibility.
+- throughput: `+26.62%` specialized pystone median
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `221766`, `225928`, `228347 loops/s`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `280740`, `287558`, `286068 loops/s`

@@ -20,11 +20,12 @@ use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module, ModuleR
 use cranelift_reader::parse_functions;
 use pyo3::ffi;
 use soac_blockpy::block_py::{
-    AbruptKind, BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword,
-    CallArgPositional, CallableScopeKind, CellLocation, ChildVisitable, CodegenBlock, CounterDef,
-    CounterId, CounterScope, CounterSite, Del, FunctionId, HasMeta, HasSemanticInstrId,
-    InstrCodegen, InstrId, InstrKey, Literal, LocalLocation, NameLocation, ParamKind, ResolvedName,
-    StorageLayout, Store, Visit, WithMeta, operation as blockpy_intrinsics,
+    AbruptKind, BlockArg, BlockLabel, BlockParamRole, BlockPyFunction, BlockPyModule, BlockTerm,
+    CallArgKeyword, CallArgPositional, CallableScopeKind, CellLocation, ChildVisitable,
+    CodegenBlock, CounterDef, CounterId, CounterScope, CounterSite, Del, FunctionId, HasMeta,
+    HasSemanticInstrId, InstrCodegen, InstrId, InstrKey, Literal, LocalLocation, NameLocation,
+    ParamKind, ResolvedName, StorageLayout, Store, Visit, WithMeta,
+    operation as blockpy_intrinsics,
 };
 use soac_blockpy::passes::{
     CodegenModuleShape, FactStore, FunctionRefcountPlan, InstrResolved, InstrTyped, LocalRefState,
@@ -66,11 +67,12 @@ mod specialized_helpers;
 mod typed_value;
 
 pub use planning::{
-    BlockExcDispatchPlan, BlockParamFacts, CurrentJitRefcountPlanCheck, FunctionLocalPlan,
-    LocalRefKind, ParamBindingFacts, ParamProvenance, PlannedStackSlotEntrySeed,
-    RuntimeBlockParamEntryStorage, RuntimeBlockParamPlan, check_refcount_plan_against_current_jit,
+    BlockExcDispatchPlan, BlockParamFacts, CurrentJitRefcountPlanCheck, EdgeTransportPlan,
+    FunctionLocalPlan, LocalRefKind, ParamBindingFacts, ParamProvenance, PlannedLocalStorage,
+    PlannedStackSlotEntrySeed, RuntimeBlockParamPlan, check_refcount_plan_against_current_jit,
     exc_dispatch_plan, local_ref_kind_for_stack_mirror, plan_function_locals,
-    plan_function_refcount_ownership, planned_jit_params_for_function,
+    plan_function_refcount_ownership, planned_implicit_target_transports_for_function,
+    planned_jit_params_for_function, planned_jump_edge_transports_for_function,
     planned_stack_slot_entry_seeds_for_function,
 };
 use runtime_context::{
@@ -2837,18 +2839,20 @@ impl LocalEnv {
                 emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, previous.value);
             }
             Some(previous)
-        } else if !had_stack_slot {
-            return Err(format!("missing local binding for delete target: {name}"));
         } else {
             None
         };
-        if had_stack_slot {
+        let should_clear_stack_slot = removed_entry
+            .as_ref()
+            .map(|entry| entry.storage == LocalEnvStorage::StackMirror)
+            .unwrap_or(had_stack_slot);
+        if should_clear_stack_slot {
             stack_slots
                 .clear_value(fb, name, ptr_ty, thread_state_value, decref_ref)
                 .expect("slot-backed delete target missing from stack slots");
         }
         let null_ptr = fb.ins().iconst(ptr_ty, 0);
-        let unbound_storage = if had_stack_slot {
+        let unbound_storage = if should_clear_stack_slot {
             LocalEnvStorage::StackMirror
         } else {
             LocalEnvStorage::LocalOnly
@@ -2969,37 +2973,6 @@ fn bind_planned_stack_slot_entries_at_block_entry(
     Ok(())
 }
 
-fn bind_runtime_block_params_from_stack(
-    fb: &mut FunctionBuilder<'_>,
-    runtime_params: &[RuntimeBlockParamPlan],
-    local_env: &mut LocalEnv,
-    stack_slots: &StackSlots,
-    ptr_ty: ir::Type,
-) -> Result<(), String> {
-    for param in runtime_params {
-        let binding = &param.binding;
-        let slot = stack_slots
-            .slot_for_block_arg_name(binding.name.as_str())
-            .ok_or_else(|| {
-                format!(
-                    "entry runtime block param {} is missing stack storage",
-                    binding.name
-                )
-            })?;
-        let value = fb.ins().stack_load(ptr_ty, slot, 0);
-        local_env.bind_entry_location_with_aliases(
-            binding.location,
-            binding.name.as_str(),
-            Vec::new(),
-            value,
-            param.stack_seed_ref_kind,
-            LocalEnvStorage::StackMirror,
-            binding.param_facts.binding,
-        );
-    }
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 fn bind_runtime_block_param_values_at_block_entry(
     fb: &mut FunctionBuilder<'_>,
@@ -3014,16 +2987,22 @@ fn bind_runtime_block_param_values_at_block_entry(
 ) -> Result<(), String> {
     for (param, param_value) in runtime_params.iter().zip(block_param_values.iter()) {
         let binding = &param.binding;
-        let entry_storage = match param.entry_storage {
-            RuntimeBlockParamEntryStorage::LocalOnly => LocalEnvStorage::LocalOnly,
-            RuntimeBlockParamEntryStorage::StackMirror => LocalEnvStorage::StackMirror,
+        let entry_storage = match binding.storage {
+            PlannedLocalStorage::BlockParam => LocalEnvStorage::LocalOnly,
+            PlannedLocalStorage::StackSlot => LocalEnvStorage::StackMirror,
+        };
+        let entry_ref_kind = match entry_storage {
+            LocalEnvStorage::LocalOnly => binding.param_facts.ownership,
+            LocalEnvStorage::StackMirror => {
+                local_ref_kind_for_stack_mirror(binding.param_facts.ownership)
+            }
         };
         local_env.bind_entry_location_with_aliases(
             binding.location,
             binding.name.as_str(),
             param.entry_aliases.clone(),
             *param_value,
-            param.entry_ref_kind,
+            entry_ref_kind,
             entry_storage,
             binding.param_facts.binding,
         );
@@ -3615,6 +3594,66 @@ impl StackSlots {
             emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, value);
         }
     }
+}
+
+fn required_stack_slot_names_for_jit(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    runtime_block_params: &[Vec<RuntimeBlockParamPlan>],
+    implicit_target_transports: &[EdgeTransportPlan],
+    jump_edge_transports: &[Option<EdgeTransportPlan>],
+    planned_stack_slot_entry_seeds: &[Vec<PlannedStackSlotEntrySeed>],
+    exc_dispatches: &[Option<BlockExcDispatchPlan>],
+) -> Vec<String> {
+    let mut required = HashSet::new();
+
+    for params in runtime_block_params {
+        for param in params {
+            if param.binding.storage == PlannedLocalStorage::StackSlot {
+                required.insert(param.binding.name.clone());
+            }
+        }
+    }
+
+    for seeds in planned_stack_slot_entry_seeds {
+        for seed in seeds {
+            required.insert(seed.binding.name.clone());
+        }
+    }
+
+    for transport in implicit_target_transports {
+        for (target_name, _) in &transport.slot_writes {
+            required.insert(target_name.clone());
+        }
+    }
+    for transport in jump_edge_transports.iter().flatten() {
+        for (target_name, _) in &transport.slot_writes {
+            required.insert(target_name.clone());
+        }
+    }
+    for dispatch in exc_dispatches.iter().flatten() {
+        for (target_name, _) in &dispatch.slot_writes {
+            required.insert(target_name.clone());
+        }
+    }
+
+    for block in &function.blocks {
+        if let Some(exception_name) = block.exception_param() {
+            required.insert(exception_name.to_string());
+        }
+    }
+
+    function
+        .storage_layout()
+        .as_ref()
+        .map(|layout| {
+            layout
+                .stack_slots()
+                .iter()
+                .filter(|name| required.contains(*name))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn emit_call_if_not_null(
@@ -7274,110 +7313,63 @@ fn abrupt_kind_tag(kind: AbruptKind) -> i64 {
     }
 }
 
-fn emit_prepare_target_args_codegen_from_local_env(
+fn emit_planned_target_args_codegen_from_local_env(
     fb: &mut FunctionBuilder<'_>,
-    target_params: &[RuntimeBlockParamPlan],
-    full_target_params: Option<&[String]>,
-    explicit_args: Option<&[BlockArg]>,
+    target_args: &[(String, BlockArg)],
     local_env: &LocalEnv,
     ctx: &JitEmitCtx<'_>,
     _jit_module: &mut JITModule,
     _func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<(Vec<ir::BlockArg>, HashSet<LocalLocation>), LocalEnvEdgePrepError> {
-    let mut args = Vec::with_capacity(target_params.len());
+    let mut args = Vec::with_capacity(target_args.len());
     let mut forwarded_locations = HashSet::new();
     let mut forwarded_local_counts = HashMap::new();
-    let explicit_arg_offsets = match (full_target_params, explicit_args) {
-        (Some(full_target_params), Some(explicit_args)) => {
-            let explicit_start = full_target_params.len().saturating_sub(explicit_args.len());
-            Some(
-                full_target_params[explicit_start..]
-                    .iter()
-                    .enumerate()
-                    .map(|(offset, name)| (name.as_str(), offset))
-                    .collect::<HashMap<_, _>>(),
-            )
-        }
-        _ => None,
-    };
-    for target_param in target_params {
-        let name = target_param.arg_name.as_str();
-        if let Some(explicit_arg) = explicit_args.and_then(|args| {
-            explicit_arg_offsets
-                .as_ref()
-                .and_then(|offsets| offsets.get(name).copied())
-                .and_then(|offset| args.get(offset))
-        }) {
-            let value = match explicit_arg {
-                BlockArg::Name(source_name) => {
-                    let (value, maybe_index) = emit_forwarded_block_arg_source_value(
-                        fb,
-                        source_name,
-                        local_env,
-                        ctx,
-                        &mut forwarded_local_counts,
-                    )?;
-                    if let Some(index) = maybe_index
-                        && let Some(location) = local_env.entries[index].location
-                    {
-                        forwarded_locations.insert(location);
-                    }
-                    value
-                }
-                BlockArg::None => {
-                    fb.ins().call(ctx.incref_ref, &[ctx.consts.none_const]);
-                    ctx.consts.none_const
-                }
-                BlockArg::CurrentException => {
-                    return Err(LocalEnvEdgePrepError::UnsupportedCurrentExceptionArg);
-                }
-                BlockArg::AbruptKind(kind) => emit_owned_module_constant(
+    for (_, explicit_arg) in target_args {
+        let value = match explicit_arg {
+            BlockArg::Name(source_name) => {
+                let (value, maybe_index) = emit_forwarded_block_arg_source_value(
                     fb,
-                    ctx.module_constants
-                        .require_int_constant_id(abrupt_kind_tag(*kind)),
+                    source_name,
+                    local_env,
                     ctx,
-                ),
-            };
-            args.push(ir::BlockArg::Value(value));
-            continue;
-        }
-        let (value, maybe_index) = emit_forwarded_block_arg_source_value(
-            fb,
-            name,
-            local_env,
-            ctx,
-            &mut forwarded_local_counts,
-        )?;
-        if let Some(index) = maybe_index
-            && let Some(location) = local_env.entries[index].location
-        {
-            forwarded_locations.insert(location);
-        }
+                    &mut forwarded_local_counts,
+                )?;
+                if let Some(index) = maybe_index
+                    && let Some(location) = local_env.entries[index].location
+                {
+                    forwarded_locations.insert(location);
+                }
+                value
+            }
+            BlockArg::None => {
+                fb.ins().call(ctx.incref_ref, &[ctx.consts.none_const]);
+                ctx.consts.none_const
+            }
+            BlockArg::CurrentException => {
+                return Err(LocalEnvEdgePrepError::UnsupportedCurrentExceptionArg);
+            }
+            BlockArg::AbruptKind(kind) => emit_owned_module_constant(
+                fb,
+                ctx.module_constants
+                    .require_int_constant_id(abrupt_kind_tag(*kind)),
+                ctx,
+            ),
+        };
         args.push(ir::BlockArg::Value(value));
     }
     Ok((args, forwarded_locations))
 }
 
-fn emit_explicit_target_slot_writes_codegen_from_local_env(
+fn emit_planned_target_slot_writes_codegen_from_local_env(
     fb: &mut FunctionBuilder<'_>,
-    full_target_params: &[String],
-    runtime_target_params: &[RuntimeBlockParamPlan],
-    explicit_args: &[BlockArg],
+    slot_writes: &[(String, BlockArg)],
     local_env: &LocalEnv,
     ctx: &JitEmitCtx<'_>,
     _jit_module: &mut JITModule,
     _func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<(), LocalEnvEdgePrepError> {
-    let explicit_start = full_target_params.len().saturating_sub(explicit_args.len());
-    for (offset, arg) in explicit_args.iter().enumerate() {
-        let target_name = &full_target_params[explicit_start + offset];
-        if runtime_target_params
-            .iter()
-            .any(|param| param.arg_name.as_str() == target_name.as_str())
-        {
-            continue;
-        }
-        let (value, owned_value) = match arg {
+    for (target_name, source) in slot_writes {
+        let (value, owned_value) = match source {
             BlockArg::Name(source_name) => (
                 emit_raw_block_arg_source_value(fb, source_name, local_env, ctx, true)?,
                 false,
@@ -7406,7 +7398,7 @@ fn emit_explicit_target_slot_writes_codegen_from_local_env(
                 ctx.incref_ref,
                 ctx.decref_ref,
             )
-            .expect("explicit edge slot target missing from stack slots");
+            .expect("planned edge slot target missing from stack slots");
         if owned_value {
             fb.ins()
                 .call(ctx.decref_ref, &[ctx.consts.thread_state_value, value]);
@@ -7727,14 +7719,13 @@ fn emit_planned_local_releases_for_reason_with_local_env(
             continue;
         }
         if forwarded_locations.contains(&local.location) {
-            debug_assert!(
-                false,
-                "ownership plan unexpectedly releases forwarded local {} in block {source_label}",
-                local.name
-            );
+            // Cleanup-only locals may be forwarded as block params even when the semantic
+            // ownership plan releases them on this edge. In that representation the target
+            // block owns the cleanup obligation instead of a source-side stack slot.
             continue;
         }
-        if let Some(previous) = local_env.remove_location_or_name(local.location, &local.name)
+        let removed = local_env.remove_location_or_name(local.location, &local.name);
+        if let Some(previous) = removed.as_ref()
             && transient_local_needs_decref(previous.ref_kind)
         {
             emit_decref_if_not_null(
@@ -7745,21 +7736,27 @@ fn emit_planned_local_releases_for_reason_with_local_env(
                 previous.value,
             );
         }
-        emit_ctx
-            .stack_slots
-            .clear_value(
-                fb,
-                local.name.as_str(),
-                emit_ctx.consts.ptr_ty,
-                emit_ctx.consts.thread_state_value,
-                emit_ctx.decref_ref,
-            )
-            .ok_or_else(|| {
-                format!(
-                    "refcount plan release for block {source_label} references missing stack slot {:?}",
-                    local.name
+        let should_clear_stack_slot = removed
+            .as_ref()
+            .map(|entry| entry.storage == LocalEnvStorage::StackMirror)
+            .unwrap_or(true);
+        if should_clear_stack_slot {
+            emit_ctx
+                .stack_slots
+                .clear_value(
+                    fb,
+                    local.name.as_str(),
+                    emit_ctx.consts.ptr_ty,
+                    emit_ctx.consts.thread_state_value,
+                    emit_ctx.decref_ref,
                 )
-            })?;
+                .ok_or_else(|| {
+                    format!(
+                        "refcount plan release for block {source_label} references missing stack slot {:?}",
+                        local.name
+                    )
+                })?;
+        }
     }
     Ok(())
 }
@@ -7805,11 +7802,8 @@ fn emit_planned_stack_slot_releases_for_reason_from_parts(
             continue;
         }
         if forwarded_locations.contains(&local.location) {
-            debug_assert!(
-                false,
-                "ownership plan unexpectedly clears stack slot for forwarded local {} in block {source_label}",
-                local.name
-            );
+            // The value is carried to the exception target as a block param, so the target
+            // block owns the corresponding cleanup obligation.
             continue;
         }
         stack_slots
@@ -9452,7 +9446,7 @@ fn emit_codegen_if_target_arm(
     release_reason: RefcountReleaseReason,
     current_exception_name: Option<&str>,
     exec_blocks: &[ir::Block],
-    runtime_block_params: &[Vec<RuntimeBlockParamPlan>],
+    implicit_target_transports: &[EdgeTransportPlan],
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     jit_module: &mut JITModule,
@@ -9460,13 +9454,24 @@ fn emit_codegen_if_target_arm(
 ) -> Result<(), String> {
     fb.switch_to_block(branch_block);
     let target_index = target_label.index();
-    let target_params = &runtime_block_params[target_index];
-    let mut jump_args = Vec::with_capacity(target_params.len());
-    let (prepared_args, forwarded_locations) = emit_prepare_target_args_codegen_from_local_env(
+    let edge_transport = &implicit_target_transports[target_index];
+    let mut jump_args = Vec::with_capacity(edge_transport.target_args.len());
+    emit_planned_target_slot_writes_codegen_from_local_env(
         fb,
-        target_params,
-        None,
-        None,
+        &edge_transport.slot_writes,
+        local_env,
+        emit_ctx,
+        jit_module,
+        func_imports,
+    )
+    .map_err(|err| {
+        format!(
+            "missing local mapping for {arm_name}-branch slot updates in block {source_label}: {err}"
+        )
+    })?;
+    let (prepared_args, forwarded_locations) = emit_planned_target_args_codegen_from_local_env(
+        fb,
+        &edge_transport.target_args,
         local_env,
         emit_ctx,
         jit_module,
@@ -9497,7 +9502,10 @@ fn emit_codegen_if_target_arm(
     emit_pop_handled_exception_if_leaving(
         fb,
         current_exception_name,
-        target_params.iter().map(|param| param.arg_name.as_str()),
+        edge_transport
+            .target_args
+            .iter()
+            .map(|(name, _)| name.as_str()),
         emit_ctx,
     );
     fb.ins().jump(exec_blocks[target_index], &jump_args);
@@ -9514,7 +9522,7 @@ fn emit_codegen_if_truth_i32(
     else_label: BlockLabel,
     current_exception_name: Option<&str>,
     exec_blocks: &[ir::Block],
-    runtime_block_params: &[Vec<RuntimeBlockParamPlan>],
+    implicit_target_transports: &[EdgeTransportPlan],
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     jit_module: &mut JITModule,
@@ -9562,7 +9570,7 @@ fn emit_codegen_if_truth_i32(
         },
         current_exception_name,
         exec_blocks,
-        runtime_block_params,
+        implicit_target_transports,
         &mut hot_local_env,
         emit_ctx,
         jit_module,
@@ -9582,7 +9590,7 @@ fn emit_codegen_if_truth_i32(
         },
         current_exception_name,
         exec_blocks,
-        runtime_block_params,
+        implicit_target_transports,
         &mut cold_local_env,
         emit_ctx,
         jit_module,
@@ -9634,7 +9642,7 @@ fn emit_codegen_branch_table_from_i64(
     default_label: BlockLabel,
     index_i64: ir::Value,
     exec_blocks: &[ir::Block],
-    runtime_block_params: &[Vec<RuntimeBlockParamPlan>],
+    implicit_target_transports: &[EdgeTransportPlan],
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     jit_module: &mut JITModule,
@@ -9672,14 +9680,12 @@ fn emit_codegen_branch_table_from_i64(
     for (target_label, case_block) in targets.iter().zip(case_blocks.iter()) {
         fb.switch_to_block(*case_block);
         let target_index = target_label.index();
-        let target_params = &runtime_block_params[target_index];
+        let edge_transport = &implicit_target_transports[target_index];
         let mut case_local_env = local_env.clone();
-        let mut case_jump_args = Vec::with_capacity(target_params.len());
-        let (prepared_args, forwarded_locations) = emit_prepare_target_args_codegen_from_local_env(
+        let mut case_jump_args = Vec::with_capacity(edge_transport.target_args.len());
+        emit_planned_target_slot_writes_codegen_from_local_env(
             fb,
-            target_params,
-            None,
-            None,
+            &edge_transport.slot_writes,
             &case_local_env,
             emit_ctx,
             jit_module,
@@ -9687,9 +9693,23 @@ fn emit_codegen_branch_table_from_i64(
         )
         .map_err(|err| {
             format!(
-                "missing local mapping for br_table case block params in block {source_label}: {err}"
+                "missing local mapping for br_table case slot updates in block {source_label}: {err}"
             )
         })?;
+        let (prepared_args, forwarded_locations) =
+            emit_planned_target_args_codegen_from_local_env(
+                fb,
+                &edge_transport.target_args,
+                &case_local_env,
+                emit_ctx,
+                jit_module,
+                func_imports,
+            )
+            .map_err(|err| {
+                format!(
+                    "missing local mapping for br_table case block params in block {source_label}: {err}"
+                )
+            })?;
         case_jump_args.extend(prepared_args);
         let release_reason = RefcountReleaseReason::BranchCase {
             target: *target_label,
@@ -9713,7 +9733,10 @@ fn emit_codegen_branch_table_from_i64(
         emit_pop_handled_exception_if_leaving(
             fb,
             current_exception_name,
-            target_params.iter().map(|param| param.arg_name.as_str()),
+            edge_transport
+                .target_args
+                .iter()
+                .map(|(name, _)| name.as_str()),
             emit_ctx,
         );
         fb.ins().jump(exec_blocks[target_index], &case_jump_args);
@@ -9721,14 +9744,25 @@ fn emit_codegen_branch_table_from_i64(
 
     fb.switch_to_block(default_block);
     let default_index = default_label.index();
-    let default_params = &runtime_block_params[default_index];
+    let edge_transport = &implicit_target_transports[default_index];
     let mut default_local_env = local_env.clone();
-    let mut default_jump_args = Vec::with_capacity(default_params.len());
-    let (prepared_args, forwarded_locations) = emit_prepare_target_args_codegen_from_local_env(
+    let mut default_jump_args = Vec::with_capacity(edge_transport.target_args.len());
+    emit_planned_target_slot_writes_codegen_from_local_env(
         fb,
-        default_params,
-        None,
-        None,
+        &edge_transport.slot_writes,
+        &default_local_env,
+        emit_ctx,
+        jit_module,
+        func_imports,
+    )
+    .map_err(|err| {
+        format!(
+            "missing local mapping for br_table default slot updates in block {source_label}: {err}"
+        )
+    })?;
+    let (prepared_args, forwarded_locations) = emit_planned_target_args_codegen_from_local_env(
+        fb,
+        &edge_transport.target_args,
         &default_local_env,
         emit_ctx,
         jit_module,
@@ -9762,7 +9796,10 @@ fn emit_codegen_branch_table_from_i64(
     emit_pop_handled_exception_if_leaving(
         fb,
         current_exception_name,
-        default_params.iter().map(|param| param.arg_name.as_str()),
+        edge_transport
+            .target_args
+            .iter()
+            .map(|(name, _)| name.as_str()),
         emit_ctx,
     );
     fb.ins()
@@ -9921,8 +9958,8 @@ fn emit_codegen_term(
     source_label: BlockLabel,
     term: &BlockTerm<InstrCodegen>,
     exec_blocks: &[ir::Block],
-    runtime_block_params: &[Vec<RuntimeBlockParamPlan>],
-    full_block_param_names: &[Vec<String>],
+    jump_edge_transports: &[Option<EdgeTransportPlan>],
+    implicit_target_transports: &[EdgeTransportPlan],
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     jit_module: &mut JITModule,
@@ -9937,13 +9974,12 @@ fn emit_codegen_term(
     match term {
         BlockTerm::Jump(target_label) => {
             let target_index = target_label.target.index();
-            let target_params = &runtime_block_params[target_index];
-            let full_target_params = &full_block_param_names[target_index];
-            emit_explicit_target_slot_writes_codegen_from_local_env(
+            let edge_transport = jump_edge_transports[source_label.index()]
+                .as_ref()
+                .expect("jump term should have a planned edge transport");
+            emit_planned_target_slot_writes_codegen_from_local_env(
                 fb,
-                full_target_params,
-                target_params,
-                &target_label.args,
+                &edge_transport.slot_writes,
                 local_env,
                 emit_ctx,
                 jit_module,
@@ -9954,13 +9990,11 @@ fn emit_codegen_term(
                     "missing local mapping for jump slot updates in block {source_label}: {err}"
                 )
             })?;
-            let mut jump_args = Vec::with_capacity(target_params.len());
+            let mut jump_args = Vec::with_capacity(edge_transport.target_args.len());
             let (prepared_args, forwarded_locations) =
-                emit_prepare_target_args_codegen_from_local_env(
+                emit_planned_target_args_codegen_from_local_env(
                     fb,
-                    target_params,
-                    Some(full_target_params),
-                    Some(&target_label.args),
+                    &edge_transport.target_args,
                     local_env,
                     emit_ctx,
                     jit_module,
@@ -9994,7 +10028,10 @@ fn emit_codegen_term(
             emit_pop_handled_exception_if_leaving(
                 fb,
                 current_exception_name,
-                target_params.iter().map(|param| param.arg_name.as_str()),
+                edge_transport
+                    .target_args
+                    .iter()
+                    .map(|(name, _)| name.as_str()),
                 emit_ctx,
             );
             fb.ins().jump(exec_blocks[target_index], &jump_args);
@@ -10021,7 +10058,7 @@ fn emit_codegen_term(
                 if_term.else_label,
                 current_exception_name,
                 exec_blocks,
-                runtime_block_params,
+                implicit_target_transports,
                 local_env,
                 emit_ctx,
                 jit_module,
@@ -10045,7 +10082,7 @@ fn emit_codegen_term(
                 branch.default_label,
                 index_i64,
                 exec_blocks,
-                runtime_block_params,
+                implicit_target_transports,
                 local_env,
                 emit_ctx,
                 jit_module,
@@ -10111,8 +10148,8 @@ fn emit_typed_codegen_term(
     source_label: BlockLabel,
     term: &BlockTerm<InstrTyped>,
     exec_blocks: &[ir::Block],
-    runtime_block_params: &[Vec<RuntimeBlockParamPlan>],
-    full_block_param_names: &[Vec<String>],
+    jump_edge_transports: &[Option<EdgeTransportPlan>],
+    implicit_target_transports: &[EdgeTransportPlan],
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     jit_module: &mut JITModule,
@@ -10152,7 +10189,7 @@ fn emit_typed_codegen_term(
             if_term.else_label,
             current_exception_name,
             exec_blocks,
-            runtime_block_params,
+            implicit_target_transports,
             local_env,
             emit_ctx,
             jit_module,
@@ -10278,7 +10315,7 @@ fn emit_typed_codegen_term(
             branch.default_label,
             index_i64,
             exec_blocks,
-            runtime_block_params,
+            implicit_target_transports,
             local_env,
             emit_ctx,
             jit_module,
@@ -10293,8 +10330,8 @@ fn emit_typed_codegen_term(
         source_label,
         &legacy_term,
         exec_blocks,
-        runtime_block_params,
-        full_block_param_names,
+        jump_edge_transports,
+        implicit_target_transports,
         local_env,
         emit_ctx,
         jit_module,
@@ -11914,6 +11951,10 @@ fn build_cranelift_run_bb_specialized_function(
         let entry_block = fb.create_block();
         let mut exec_blocks = Vec::with_capacity(block_count);
         let runtime_block_params = planned_jit_params_for_function(function, &local_plan)?;
+        let implicit_target_transports =
+            planned_implicit_target_transports_for_function(function, &runtime_block_params);
+        let jump_edge_transports =
+            planned_jump_edge_transports_for_function(function, &runtime_block_params);
         let planned_stack_slot_entry_seeds =
             planned_stack_slot_entry_seeds_for_function(function, &local_plan);
         let full_block_param_names = function
@@ -11947,14 +11988,15 @@ fn build_cranelift_run_bb_specialized_function(
         }
         let step_null_block = fb.create_block();
         let raise_exc_direct_block = fb.create_block();
-        let stack_slots = StackSlots::new(
-            &mut fb,
-            function
-                .storage_layout()
-                .as_ref()
-                .map(|layout| layout.stack_slots())
-                .unwrap_or(&[]),
+        let required_stack_slot_names = required_stack_slot_names_for_jit(
+            function,
+            &runtime_block_params,
+            &implicit_target_transports,
+            &jump_edge_transports,
+            &planned_stack_slot_entry_seeds,
+            &exc_dispatches,
         );
+        let stack_slots = StackSlots::new(&mut fb, &required_stack_slot_names);
         let exception_state_slots = ExceptionStateSlots::new(&mut fb, function);
 
         register_block_display_annotation(
@@ -12197,12 +12239,24 @@ fn build_cranelift_run_bb_specialized_function(
             function.params.len(),
             "direct JIT entry arity does not match entry params",
         );
+        let entry_runtime_param_names = runtime_block_params[0]
+            .iter()
+            .map(|param| param.binding.name.as_str())
+            .collect::<HashSet<_>>();
+        let entry_stack_seed_param_names = planned_stack_slot_entry_seeds[0]
+            .iter()
+            .map(|seed| seed.binding.name.as_str())
+            .collect::<HashSet<_>>();
+        let mut entry_param_values = HashMap::new();
         for (param_index, (param, value)) in function
             .params
             .iter()
             .zip(direct_entry_args.iter())
             .enumerate()
         {
+            let needs_runtime_arg = entry_runtime_param_names.contains(param.name.as_str());
+            let needs_stack_seed = entry_stack_seed_param_names.contains(param.name.as_str());
+            let needs_owned_value = needs_runtime_arg || needs_stack_seed;
             let default_slot = match param.kind {
                 ParamKind::PosOnly | ParamKind::Any => function_runtime_data_layout
                     .positional_default_slot_for_param_index(param_index),
@@ -12210,103 +12264,136 @@ fn build_cranelift_run_bb_specialized_function(
                 ParamKind::VarArg | ParamKind::KwArg => None,
             };
 
-            let Some(default_slot) = default_slot else {
-                stack_slots
-                    .replace_cloned_value(
-                        &mut fb,
-                        param.name.as_str(),
-                        *value,
-                        ptr_ty,
-                        thread_state_value,
-                        incref_ref,
-                        decref_ref,
-                    )
-                    .expect("entry slot missing from stack slots");
-                continue;
+            let selected_value = if let Some(default_slot) = default_slot {
+                let arg_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, *value, null_ptr);
+                let use_default_block = fb.create_block();
+                let use_arg_block = fb.create_block();
+                let after_block = fb.create_block();
+                if needs_owned_value {
+                    fb.append_block_param(after_block, ptr_ty);
+                }
+                fb.ins()
+                    .brif(arg_is_null, use_default_block, &[], use_arg_block, &[]);
+
+                fb.switch_to_block(use_default_block);
+                let default_value = emit_function_data_slot_owned_or_null(
+                    &mut fb,
+                    function_data_value,
+                    default_slot,
+                    ptr_ty,
+                    incref_ref,
+                );
+                let default_is_null =
+                    fb.ins()
+                        .icmp(ir::condcodes::IntCC::Equal, default_value, null_ptr);
+                let default_ok_block = fb.create_block();
+                fb.append_block_param(default_ok_block, ptr_ty);
+                fb.ins().brif(
+                    default_is_null,
+                    entry_failure_block,
+                    &block_arg_values(&entry_failure_args),
+                    default_ok_block,
+                    &[ir::BlockArg::Value(default_value)],
+                );
+                fb.switch_to_block(default_ok_block);
+                let default_value = fb.block_params(default_ok_block)[0];
+                if needs_owned_value {
+                    fb.ins()
+                        .jump(after_block, &[ir::BlockArg::Value(default_value)]);
+                } else {
+                    fb.ins()
+                        .call(decref_ref, &[thread_state_value, default_value]);
+                    fb.ins().jump(after_block, &[]);
+                }
+
+                fb.switch_to_block(use_arg_block);
+                if needs_owned_value {
+                    emit_incref_if_not_null(&mut fb, ptr_ty, incref_ref, *value);
+                    fb.ins().jump(after_block, &[ir::BlockArg::Value(*value)]);
+                } else {
+                    fb.ins().jump(after_block, &[]);
+                }
+
+                fb.switch_to_block(after_block);
+                needs_owned_value.then(|| fb.block_params(after_block)[0])
+            } else if needs_owned_value {
+                emit_incref_if_not_null(&mut fb, ptr_ty, incref_ref, *value);
+                Some(*value)
+            } else {
+                None
             };
 
-            let arg_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, *value, null_ptr);
-            let use_default_block = fb.create_block();
-            let use_arg_block = fb.create_block();
-            let after_block = fb.create_block();
-            fb.ins()
-                .brif(arg_is_null, use_default_block, &[], use_arg_block, &[]);
-
-            fb.switch_to_block(use_default_block);
-            let default_value = emit_function_data_slot_owned_or_null(
-                &mut fb,
-                function_data_value,
-                default_slot,
-                ptr_ty,
-                incref_ref,
-            );
-            let default_is_null =
-                fb.ins()
-                    .icmp(ir::condcodes::IntCC::Equal, default_value, null_ptr);
-            let default_ok_block = fb.create_block();
-            fb.append_block_param(default_ok_block, ptr_ty);
-            fb.ins().brif(
-                default_is_null,
-                entry_failure_block,
-                &block_arg_values(&entry_failure_args),
-                default_ok_block,
-                &[ir::BlockArg::Value(default_value)],
-            );
-            fb.switch_to_block(default_ok_block);
-            let default_value = fb.block_params(default_ok_block)[0];
-            stack_slots
-                .replace_cloned_value(
-                    &mut fb,
-                    param.name.as_str(),
-                    default_value,
-                    ptr_ty,
-                    thread_state_value,
-                    incref_ref,
-                    decref_ref,
-                )
-                .expect("entry slot missing from stack slots");
-            fb.ins()
-                .call(decref_ref, &[thread_state_value, default_value]);
-            fb.ins().jump(after_block, &[]);
-
-            fb.switch_to_block(use_arg_block);
-            stack_slots
-                .replace_cloned_value(
-                    &mut fb,
-                    param.name.as_str(),
-                    *value,
-                    ptr_ty,
-                    thread_state_value,
-                    incref_ref,
-                    decref_ref,
-                )
-                .expect("entry slot missing from stack slots");
-            fb.ins().jump(after_block, &[]);
-
-            fb.switch_to_block(after_block);
+            if let Some(selected_value) = selected_value {
+                if needs_stack_seed && !needs_runtime_arg {
+                    stack_slots
+                        .replace_cloned_value(
+                            &mut fb,
+                            param.name.as_str(),
+                            selected_value,
+                            ptr_ty,
+                            thread_state_value,
+                            incref_ref,
+                            decref_ref,
+                        )
+                        .expect("entry slot missing from stack slots");
+                    fb.ins()
+                        .call(decref_ref, &[thread_state_value, selected_value]);
+                }
+                if needs_runtime_arg {
+                    entry_param_values.insert(param.name.as_str(), selected_value);
+                }
+            }
         }
-        let mut entry_local_env = LocalEnv::default();
-        bind_runtime_block_params_from_stack(
-            &mut fb,
-            &runtime_block_params[0],
-            &mut entry_local_env,
-            &stack_slots,
-            ptr_ty,
-        )?;
-        let (entry_jump_values, _) = emit_forward_named_values_from_local_env_with_refcount(
-            &mut fb,
-            runtime_block_params[0]
-                .iter()
-                .map(|param| param.arg_name.as_str()),
-            &entry_local_env,
-            ptr_ty,
-            incref_ref,
-        )
-        .map_err(|err| format!("missing entry local mapping for runtime block params: {err}"))?;
-        let entry_jump_args = entry_jump_values
-            .into_iter()
-            .map(ir::BlockArg::Value)
-            .collect::<Vec<_>>();
+        for block_param in function.blocks[0].bb_params() {
+            if !entry_runtime_param_names.contains(block_param.name.as_str())
+                || entry_param_values.contains_key(block_param.name.as_str())
+            {
+                continue;
+            }
+            let value = match block_param.role {
+                BlockParamRole::AbruptKind => {
+                    let fallthrough_tag = abrupt_kind_tag(AbruptKind::Fallthrough);
+                    let fallthrough_i64 = fb.ins().iconst(ir::types::I64, fallthrough_tag);
+                    let value_inst = fb.ins().call(py_long_from_i64_ref, &[fallthrough_i64]);
+                    let value = fb.inst_results(value_inst)[0];
+                    let value_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, value, null_ptr);
+                    let value_ok_block = fb.create_block();
+                    fb.append_block_param(value_ok_block, ptr_ty);
+                    fb.ins().brif(
+                        value_is_null,
+                        entry_failure_block,
+                        &block_arg_values(&entry_failure_args),
+                        value_ok_block,
+                        &[ir::BlockArg::Value(value)],
+                    );
+                    fb.switch_to_block(value_ok_block);
+                    fb.block_params(value_ok_block)[0]
+                }
+                BlockParamRole::AbruptPayload => emit_owned_module_constant_from_parts(
+                    &mut fb,
+                    none_constant_id,
+                    module_constant_table_value,
+                    ptr_ty,
+                ),
+                BlockParamRole::Exception => null_ptr,
+            };
+            entry_param_values.insert(block_param.name.as_str(), value);
+        }
+        let entry_jump_args = runtime_block_params[0]
+            .iter()
+            .map(|param| {
+                entry_param_values
+                    .get(param.binding.name.as_str())
+                    .copied()
+                    .map(ir::BlockArg::Value)
+                    .ok_or_else(|| {
+                        format!(
+                            "missing direct entry value for runtime block param {} ({})",
+                            param.arg_name, param.binding.name
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         fb.ins().jump(exec_blocks[0], &entry_jump_args);
 
         let mut exception_dispatch_blocks: Vec<Option<ir::Block>> = vec![None; exec_blocks.len()];
@@ -12467,7 +12554,7 @@ fn build_cranelift_run_bb_specialized_function(
                 branch_prefer_true: &branch_prefer_true,
                 field_index_specializations: &field_index_specializations,
                 behavior_change_indexed_stores,
-                allow_local_only_slot_backed_stores: false,
+                allow_local_only_slot_backed_stores: true,
                 exception_forwarded_local_names: exc_dispatches[index]
                     .as_ref()
                     .map(|dispatch| dispatch.forwarded_local_names.as_slice()),
@@ -12501,8 +12588,8 @@ fn build_cranelift_run_bb_specialized_function(
                 codegen_block.label,
                 &typed_function.blocks[index].term,
                 &exec_blocks,
-                &runtime_block_params,
-                &full_block_param_names,
+                &jump_edge_transports,
+                &implicit_target_transports,
                 &mut local_env,
                 term_emit_ctx,
                 jit_module,

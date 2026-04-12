@@ -1370,6 +1370,9 @@ fn collect_local_reads(
                     }
                 }
                 InstrCodegen::Del(op) => {
+                    if let Some(location) = op.name.local_location() {
+                        mark_local_use(location, self.defs, self.uses);
+                    }
                     if let Some(cell_location) = op.name.cell_location() {
                         mark_cell_use(
                             cell_location,

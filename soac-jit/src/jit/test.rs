@@ -1777,6 +1777,84 @@ def f():
     }
 
     #[test]
+    fn local_env_delete_preserves_local_only_storage_for_slot_backed_name() {
+        let compile_session = crate::session::CompileSession::new();
+        let mut jit_module =
+            new_jit_module(&compile_session).expect("test jit module should construct");
+        let ptr_ty = jit_module.target_config().pointer_type();
+
+        let mut refcount_signature = jit_module.make_signature();
+        refcount_signature.params.push(ir::AbiParam::new(ptr_ty));
+
+        let mut wrapper_signature = jit_module.make_signature();
+        wrapper_signature.params.push(ir::AbiParam::new(ptr_ty));
+
+        let wrapper_id = declare_local_fn(
+            &mut jit_module,
+            "local_env_delete_local_only_test",
+            &wrapper_signature,
+        )
+        .expect("wrapper function should declare");
+        let decref_id = declare_local_fn(
+            &mut jit_module,
+            "local_env_delete_local_only_test_decref",
+            &refcount_signature,
+        )
+        .expect("decref helper should declare");
+
+        let mut ctx = jit_module.make_context();
+        ctx.func.name = ir::UserFuncName::user(0, wrapper_id.as_u32());
+        ctx.func.signature = wrapper_signature;
+
+        let mut env = LocalEnv::default();
+        let mut builder_ctx = FunctionBuilderContext::new();
+        {
+            let mut fb = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+            let entry = fb.create_block();
+            fb.append_block_params_for_function_params(entry);
+            fb.switch_to_block(entry);
+            fb.seal_block(entry);
+
+            let value = fb.block_params(entry)[0];
+            let null_tstate = fb.ins().iconst(ptr_ty, 0);
+            let decref_ref = jit_module.declare_func_in_func(decref_id, &mut fb.func);
+            let stack_slots = StackSlots::new(&mut fb, &["x".to_string()]);
+            env.bind_entry_location_with_aliases(
+                LocalLocation(0),
+                "x",
+                Vec::new(),
+                value,
+                LocalRefKind::Owned,
+                LocalEnvStorage::LocalOnly,
+                ParamBindingFacts::DefinitelyBound,
+            );
+
+            env.delete_location(
+                &mut fb,
+                LocalLocation(0),
+                "x",
+                &stack_slots,
+                ptr_ty,
+                null_tstate,
+                decref_ref,
+            )
+            .expect("local-only delete should succeed");
+            fb.ins().return_(&[]);
+            fb.seal_all_blocks();
+            fb.finalize();
+        }
+
+        let rendered = ctx.func.display().to_string();
+        assert_eq!(env.entries.len(), 1, "{rendered}");
+        assert_eq!(env.entries[0].storage, LocalEnvStorage::LocalOnly);
+        assert_eq!(env.entries[0].ref_kind, LocalRefKind::Unbound);
+        assert!(
+            !rendered.contains("stack_store") && !rendered.contains("stack_load"),
+            "deleting a local-only slot-backed binding should not touch the stack slot:\n{rendered}"
+        );
+    }
+
+    #[test]
     fn local_ref_forwarding_increfs_borrowed_and_duplicate_owned_values() {
         assert!(!local_ref_kind_needs_incref_for_forward(
             LocalRefKind::Owned,
@@ -5045,7 +5123,7 @@ def f(x, y):
     }
 
     #[test]
-    fn render_specialized_jit_allocates_function_state_slots() {
+    fn render_specialized_jit_skips_unused_function_state_slots() {
         let blocks = [1usize as ObjPtr];
         let mut constants = TestConstantPool::default();
         let mut function =
@@ -5057,8 +5135,8 @@ def f(x, y):
             constants.module_constants,
         );
         assert!(
-            rendered.matches("explicit_slot 8").count() >= 2,
-            "slot-backed JIT plans should allocate explicit stack slots:\n{rendered}"
+            !rendered.contains("explicit_slot 8"),
+            "unused storage-layout locals should not allocate stack slots:\n{rendered}"
         );
     }
 
@@ -5362,6 +5440,28 @@ def f(x, y):
             !rendered.contains("call dp_jit_function_positional_default_obj")
                 && rendered.contains("load.i64"),
             "direct entry lowering should source omitted positional defaults from the function-data object block:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn render_specialized_jit_direct_entry_param_avoids_stack_roundtrip() {
+        let blocks = [1usize as ObjPtr];
+        let mut function =
+            with_single_test_block(test_function(), vec![], ret_term(name_expr(test_name("x"))));
+        function.params = ParamSpec {
+            params: vec![Param {
+                name: "x".into(),
+                kind: ParamKind::Any,
+                has_default: false,
+            }],
+        };
+        set_stack_slots(&mut function, &["x"]);
+        let rendered = render_test_jit_function(&function, &blocks);
+        assert!(
+            !rendered.contains("explicit_slot 8")
+                && !rendered.contains("stack_load")
+                && !rendered.contains("stack_store"),
+            "direct-entry params should travel through block params without stack roundtrips:\n{rendered}"
         );
     }
 
