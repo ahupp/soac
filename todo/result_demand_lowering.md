@@ -150,7 +150,9 @@ emission through the planned integer index result. Return expressions are now
 planned as owned `PyObject` demand and typed return emission consumes that
 planned result before entering the shared return cleanup path. Local store RHS
 expressions are now also planned as owned `PyObject` demand, and typed LocalEnv
-store emission consumes that child demand before installing the value.
+store emission consumes that child demand before installing the value. Raise
+exception expressions are now planned as owned `PyObject` demand and typed raise
+emission consumes that demand before entering the shared raise path.
 
 1. Add `ResultDemand::{EffectOnly, PyObject { borrowed_ok }}` and an `EmitResult`
    wrapper near the existing `SoacValue`/LocalEnv codegen types.
@@ -167,7 +169,9 @@ store emission consumes that child demand before installing the value.
    Started in JIT codegen as a local plan for statement-root demands; this can
    move earlier once more consumers need planned typed demands. Return values are
    now planned as owned `PyObject` demand. Local store RHS values are also
-   planned as owned `PyObject` demand for the typed LocalEnv store path.
+   planned as owned `PyObject` demand for the typed LocalEnv store path. Raise
+   exception values are planned as owned `PyObject` demand for the typed raise
+   path.
 7. Extend demand to `I32Bool01` and `I64Index` once the value-space/refcount
    representation can carry non-Python values cleanly. Started with branch-test
    `I32Bool01` demands and branch-table `I64Index` demands.

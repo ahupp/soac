@@ -891,6 +891,26 @@ def f():
         );
     }
 
+    #[test]
+    fn typed_result_demand_plan_marks_raise_values_pyobject_owned() {
+        let mut constants = TestConstantPool::default();
+        let raise_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+        let function = with_single_test_block(
+            test_function(),
+            vec![],
+            BlockTerm::Raise(soac_blockpy::block_py::TermRaise {
+                exc: Some(with_instr_id(constants.int_expr(2), raise_instr_id)),
+            }),
+        );
+        let typed_function = lower_codegen_function_to_typed(function);
+        let plan = plan_typed_result_demands(&typed_function);
+
+        assert_eq!(
+            plan.demand_for_instr_id(raise_instr_id),
+            Some(ResultDemand::PYOBJECT_OWNED)
+        );
+    }
+
     fn direct_call_expr(function_id: FunctionId) -> InstrCodegen {
         InstrCodegen::CallDirect(CallDirect::new(
             none_expr(),

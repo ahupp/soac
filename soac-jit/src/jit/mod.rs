@@ -2068,6 +2068,11 @@ fn plan_typed_result_demands(
         if let BlockTerm::Return(value) = &block.term {
             plan.insert_instr(value, ResultDemand::PYOBJECT_OWNED);
         }
+        if let BlockTerm::Raise(raise_stmt) = &block.term
+            && let Some(exc) = raise_stmt.exc.as_ref()
+        {
+            plan.insert_instr(exc, ResultDemand::PYOBJECT_OWNED);
+        }
     }
     plan
 }
@@ -9639,6 +9644,152 @@ fn emit_codegen_branch_table_from_i64(
     Ok(())
 }
 
+fn emit_load_raise_from_function(
+    fb: &mut FunctionBuilder<'_>,
+    emit_ctx: &JitEmitCtx<'_>,
+) -> ir::Value {
+    let ptr_ty = emit_ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let raise_name_obj = emit_owned_module_constant(
+        fb,
+        emit_ctx
+            .module_constants
+            .require_unicode_constant_id("raise_from"),
+        emit_ctx,
+    );
+    let raise_fn_inst = fb
+        .ins()
+        .call(emit_ctx.load_runtime_obj_ref, &[raise_name_obj]);
+    fb.ins().call(
+        emit_ctx.decref_ref,
+        &[emit_ctx.consts.thread_state_value, raise_name_obj],
+    );
+    let raise_fn = fb.inst_results(raise_fn_inst)[0];
+    let raise_fn_null = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, raise_fn, null_ptr);
+    let raise_fn_ok = fb.create_block();
+    fb.append_block_param(raise_fn_ok, ptr_ty);
+    fb.ins().brif(
+        raise_fn_null,
+        emit_ctx.consts.step_null_block,
+        &step_null_block_args(emit_ctx),
+        raise_fn_ok,
+        &[ir::BlockArg::Value(raise_fn)],
+    );
+
+    fb.switch_to_block(raise_fn_ok);
+    fb.block_params(raise_fn_ok)[0]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_codegen_raise_exception_from_function(
+    fb: &mut FunctionBuilder<'_>,
+    source_label: BlockLabel,
+    raise_fn: ir::Value,
+    exc_value: ir::Value,
+    exc_ownership: ValueOwnership,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    raise_exc_ref: ir::FuncRef,
+    current_exception_name: Option<&str>,
+) -> Result<(), String> {
+    let ptr_ty = emit_ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let thread_state_value = emit_ctx.consts.thread_state_value;
+    let decref_ref = emit_ctx.decref_ref;
+
+    fb.ins()
+        .call(emit_ctx.incref_ref, &[emit_ctx.consts.none_const]);
+    let cause_value = emit_ctx.consts.none_const;
+    let raise_call_inst = fb.ins().call(
+        emit_ctx.py_call_positional_three_ref,
+        &[
+            thread_state_value,
+            raise_fn,
+            exc_value,
+            cause_value,
+            null_ptr,
+            null_ptr,
+        ],
+    );
+    let raise_exc_obj = fb.inst_results(raise_call_inst)[0];
+    fb.ins()
+        .call(decref_ref, &[thread_state_value, cause_value]);
+    if exc_ownership.is_owned() {
+        fb.ins().call(decref_ref, &[thread_state_value, exc_value]);
+    }
+    fb.ins().call(decref_ref, &[thread_state_value, raise_fn]);
+    let raise_exc_null = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, raise_exc_obj, null_ptr);
+    let raise_exc_ok = fb.create_block();
+    fb.append_block_param(raise_exc_ok, ptr_ty);
+    fb.ins().brif(
+        raise_exc_null,
+        emit_ctx.consts.step_null_block,
+        &step_null_block_args(emit_ctx),
+        raise_exc_ok,
+        &[ir::BlockArg::Value(raise_exc_obj)],
+    );
+
+    fb.switch_to_block(raise_exc_ok);
+    let reo_exc_obj = fb.block_params(raise_exc_ok)[0];
+    let raise_inst = fb.ins().call(raise_exc_ref, &[reo_exc_obj]);
+    let raise_rc = fb.inst_results(raise_inst)[0];
+    fb.ins()
+        .call(decref_ref, &[thread_state_value, reo_exc_obj]);
+    let raise_rc_fail = fb.create_block();
+    let raise_rc_ok = fb.create_block();
+    let raise_ok = fb.ins().icmp_imm(ir::condcodes::IntCC::Equal, raise_rc, 0);
+    fb.ins()
+        .brif(raise_ok, raise_rc_ok, &[], raise_rc_fail, &[]);
+    let exception_forwarded_names = emit_ctx.exception_forwarded_local_names.unwrap_or(&[]);
+
+    fb.switch_to_block(raise_rc_fail);
+    emit_pop_handled_exception_if_leaving(
+        fb,
+        current_exception_name,
+        exception_forwarded_names,
+        emit_ctx,
+    );
+    fb.ins().jump(
+        emit_ctx.consts.step_null_block,
+        &step_null_block_args(emit_ctx),
+    );
+
+    fb.switch_to_block(raise_rc_ok);
+    let forwarded_locations = HashSet::new();
+    let release_reason = RefcountReleaseReason::Raise;
+    emit_planned_local_releases_for_reason_with_local_env(
+        fb,
+        source_label,
+        &release_reason,
+        local_env,
+        &forwarded_locations,
+        emit_ctx,
+    )?;
+    emit_decref_unforwarded_local_env(
+        fb,
+        local_env,
+        &forwarded_locations,
+        &emit_ctx.consts.step_null_args,
+        emit_ctx.consts.thread_state_value,
+        decref_ref,
+    );
+    emit_pop_handled_exception_if_leaving(
+        fb,
+        current_exception_name,
+        exception_forwarded_names,
+        emit_ctx,
+    );
+    fb.ins().jump(
+        emit_ctx.consts.step_null_block,
+        &step_null_block_args(emit_ctx),
+    );
+    Ok(())
+}
+
 fn emit_codegen_term(
     fb: &mut FunctionBuilder<'_>,
     source_label: BlockLabel,
@@ -9656,9 +9807,6 @@ fn emit_codegen_term(
     current_exception_name: Option<&str>,
 ) -> Result<(), String> {
     let decref_ref = emit_ctx.decref_ref;
-    let thread_state_value = emit_ctx.consts.thread_state_value;
-    let ptr_ty = emit_ctx.consts.ptr_ty;
-    let null_ptr = fb.ins().iconst(ptr_ty, 0);
 
     match term {
         BlockTerm::Jump(target_label) => {
@@ -9799,35 +9947,7 @@ fn emit_codegen_term(
             )?;
         }
         BlockTerm::Raise(raise_stmt) => {
-            let forwarded_locations = HashSet::new();
-            let raise_name_obj = emit_owned_module_constant(
-                fb,
-                emit_ctx
-                    .module_constants
-                    .require_unicode_constant_id("raise_from"),
-                emit_ctx,
-            );
-            let raise_fn_inst = fb
-                .ins()
-                .call(emit_ctx.load_runtime_obj_ref, &[raise_name_obj]);
-            fb.ins()
-                .call(decref_ref, &[thread_state_value, raise_name_obj]);
-            let raise_fn = fb.inst_results(raise_fn_inst)[0];
-            let raise_fn_null = fb
-                .ins()
-                .icmp(ir::condcodes::IntCC::Equal, raise_fn, null_ptr);
-            let raise_fn_ok = fb.create_block();
-            fb.append_block_param(raise_fn_ok, ptr_ty);
-            fb.ins().brif(
-                raise_fn_null,
-                emit_ctx.consts.step_null_block,
-                &step_null_block_args(emit_ctx),
-                raise_fn_ok,
-                &[ir::BlockArg::Value(raise_fn)],
-            );
-
-            fb.switch_to_block(raise_fn_ok);
-            let rfo_raise_fn = fb.block_params(raise_fn_ok)[0];
+            let raise_fn = emit_load_raise_from_function(fb, emit_ctx);
             let exc_value = if let Some(exc_expr) = raise_stmt.exc.as_ref() {
                 emit_codegen_expr_with_local_env(
                     fb,
@@ -9843,92 +9963,17 @@ fn emit_codegen_term(
                     .call(emit_ctx.incref_ref, &[emit_ctx.consts.none_const]);
                 emit_ctx.consts.none_const
             };
-            fb.ins()
-                .call(emit_ctx.incref_ref, &[emit_ctx.consts.none_const]);
-            let cause_value = emit_ctx.consts.none_const;
-            let raise_call_inst = fb.ins().call(
-                emit_ctx.py_call_positional_three_ref,
-                &[
-                    thread_state_value,
-                    rfo_raise_fn,
-                    exc_value,
-                    cause_value,
-                    null_ptr,
-                    null_ptr,
-                ],
-            );
-            let raise_exc_obj = fb.inst_results(raise_call_inst)[0];
-            fb.ins()
-                .call(decref_ref, &[thread_state_value, cause_value]);
-            fb.ins().call(decref_ref, &[thread_state_value, exc_value]);
-            fb.ins()
-                .call(decref_ref, &[thread_state_value, rfo_raise_fn]);
-            let raise_exc_null =
-                fb.ins()
-                    .icmp(ir::condcodes::IntCC::Equal, raise_exc_obj, null_ptr);
-            let raise_exc_ok = fb.create_block();
-            fb.append_block_param(raise_exc_ok, ptr_ty);
-            fb.ins().brif(
-                raise_exc_null,
-                emit_ctx.consts.step_null_block,
-                &step_null_block_args(emit_ctx),
-                raise_exc_ok,
-                &[ir::BlockArg::Value(raise_exc_obj)],
-            );
-
-            fb.switch_to_block(raise_exc_ok);
-            let reo_exc_obj = fb.block_params(raise_exc_ok)[0];
-            let raise_inst = fb.ins().call(raise_exc_ref, &[reo_exc_obj]);
-            let raise_rc = fb.inst_results(raise_inst)[0];
-            fb.ins()
-                .call(decref_ref, &[thread_state_value, reo_exc_obj]);
-            let raise_rc_fail = fb.create_block();
-            let raise_rc_ok = fb.create_block();
-            let raise_ok = fb.ins().icmp_imm(ir::condcodes::IntCC::Equal, raise_rc, 0);
-            fb.ins()
-                .brif(raise_ok, raise_rc_ok, &[], raise_rc_fail, &[]);
-            let exception_forwarded_names = emit_ctx.exception_forwarded_local_names.unwrap_or(&[]);
-
-            fb.switch_to_block(raise_rc_fail);
-            emit_pop_handled_exception_if_leaving(
-                fb,
-                current_exception_name,
-                exception_forwarded_names,
-                emit_ctx,
-            );
-            fb.ins().jump(
-                emit_ctx.consts.step_null_block,
-                &step_null_block_args(emit_ctx),
-            );
-
-            fb.switch_to_block(raise_rc_ok);
-            let release_reason = RefcountReleaseReason::Raise;
-            emit_planned_local_releases_for_reason_with_local_env(
+            emit_codegen_raise_exception_from_function(
                 fb,
                 source_label,
-                &release_reason,
+                raise_fn,
+                exc_value,
+                ValueOwnership::Owned,
                 local_env,
-                &forwarded_locations,
                 emit_ctx,
-            )?;
-            emit_decref_unforwarded_local_env(
-                fb,
-                local_env,
-                &forwarded_locations,
-                &emit_ctx.consts.step_null_args,
-                emit_ctx.consts.thread_state_value,
-                decref_ref,
-            );
-            emit_pop_handled_exception_if_leaving(
-                fb,
+                raise_exc_ref,
                 current_exception_name,
-                exception_forwarded_names,
-                emit_ctx,
-            );
-            fb.ins().jump(
-                emit_ctx.consts.step_null_block,
-                &step_null_block_args(emit_ctx),
-            );
+            )?;
         }
     }
     Ok(())
@@ -10024,6 +10069,56 @@ fn emit_typed_codegen_term(
             ret_value,
             local_env,
             emit_ctx,
+            current_exception_name,
+        );
+    }
+
+    if let BlockTerm::Raise(raise_stmt) = term {
+        let raise_fn = emit_load_raise_from_function(fb, emit_ctx);
+        let (exc_value, exc_ownership) = if let Some(exc_expr) = raise_stmt.exc.as_ref() {
+            let exc_instr_id = exc_expr.try_semantic_instr_id();
+            let demand = exc_instr_id
+                .and_then(|instr_id| emit_ctx.result_demand_plan.demand_for_instr_id(instr_id))
+                .unwrap_or(ResultDemand::PYOBJECT_OWNED);
+            let result = match demand {
+                ResultDemand::PyObject { borrowed_ok: false } => {
+                    emit_typed_codegen_stmt_result_with_local_env(
+                        fb,
+                        exc_expr,
+                        local_env,
+                        emit_ctx,
+                        demand,
+                        jit_module,
+                        func_imports,
+                    )?
+                }
+                other => {
+                    return Err(format!(
+                        "typed raise exception requires owned PyObject demand, got {other:?}"
+                    ));
+                }
+            };
+            let (exc_value, ownership, _) = result.expect_pyobject("typed raise exception");
+            if !ownership.can_satisfy_pyobject_demand(ResultDemand::PYOBJECT_OWNED) {
+                return Err(format!(
+                    "typed raise exception produced {ownership:?}, but raise requires owned PyObject"
+                ));
+            }
+            (exc_value, ownership)
+        } else {
+            fb.ins()
+                .call(emit_ctx.incref_ref, &[emit_ctx.consts.none_const]);
+            (emit_ctx.consts.none_const, ValueOwnership::Owned)
+        };
+        return emit_codegen_raise_exception_from_function(
+            fb,
+            source_label,
+            raise_fn,
+            exc_value,
+            exc_ownership,
+            local_env,
+            emit_ctx,
+            raise_exc_ref,
             current_exception_name,
         );
     }
