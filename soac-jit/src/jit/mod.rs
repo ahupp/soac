@@ -2059,6 +2059,9 @@ fn plan_typed_result_demands(
         if let BlockTerm::IfTerm(if_term) = &block.term {
             plan.insert_instr(&if_term.test, ResultDemand::I32_BOOL01);
         }
+        if let BlockTerm::BranchTable(branch) = &block.term {
+            plan.insert_instr(&branch.index, ResultDemand::I64_INDEX);
+        }
     }
     plan
 }
@@ -3056,6 +3059,9 @@ fn emit_none_for_demand(
         }
         ResultDemand::I32Bool01 => {
             panic!("owned None materialization cannot satisfy I32Bool01 demand")
+        }
+        ResultDemand::I64Index => {
+            panic!("owned None materialization cannot satisfy I64Index demand")
         }
     }
 }
@@ -8718,6 +8724,9 @@ fn emit_owned_pyobject_result_for_demand(
         ResultDemand::I32Bool01 => {
             panic!("owned PyObject result helper cannot satisfy I32Bool01 demand")
         }
+        ResultDemand::I64Index => {
+            panic!("owned PyObject result helper cannot satisfy I64Index demand")
+        }
     }
 }
 
@@ -9028,6 +9037,7 @@ fn emit_typed_codegen_stmt_result_with_local_env(
                 EmitResult::owned_pyobject(value, PyObjFacts::unknown())
             }
             ResultDemand::I32Bool01 => unreachable!("I32Bool01 handled before PyObject emission"),
+            ResultDemand::I64Index => unreachable!("I64Index is not a statement demand"),
         });
     }
 
@@ -9064,6 +9074,28 @@ fn emit_typed_codegen_i32_bool01_result_with_local_env(
     let truth = emit_truthy_from_owned_value(fb, value, is_true_ref, emit_ctx);
     let truth_i32 = truth.expect_i32_bool01("typed I32Bool01 demand");
     Ok(EmitResult::i32(truth_i32, IntFacts::i32_bool01()))
+}
+
+fn emit_typed_codegen_i64_index_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    expr: &InstrTyped,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+    pyobject_to_i64_ref: ir::FuncRef,
+) -> Result<EmitResult, String> {
+    let legacy_expr = try_lower_typed_instr_to_codegen_legacy(expr.clone())?;
+    let index_i64 = emit_branch_index_i64(
+        fb,
+        &legacy_expr,
+        local_env,
+        emit_ctx,
+        jit_module,
+        func_imports,
+        pyobject_to_i64_ref,
+    );
+    Ok(EmitResult::i64(index_i64, IntFacts::i64_unknown()))
 }
 
 fn local_failure_cleanup_emit_ctx<'mc>(
@@ -9302,6 +9334,140 @@ fn emit_codegen_if_truth_i32(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+fn emit_codegen_branch_table_from_i64(
+    fb: &mut FunctionBuilder<'_>,
+    source_label: BlockLabel,
+    targets: &[BlockLabel],
+    default_label: BlockLabel,
+    index_i64: ir::Value,
+    exec_blocks: &[ir::Block],
+    runtime_block_param_names: &[Vec<String>],
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+    current_exception_name: Option<&str>,
+) -> Result<(), String> {
+    let i64_ty = emit_ctx.consts.i64_ty;
+    let index_error = fb.ins().iconst(i64_ty, i64::MIN);
+    let is_error = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, index_i64, index_error);
+    let dispatch_block = fb.create_block();
+    fb.append_block_param(dispatch_block, i64_ty);
+    fb.ins().brif(
+        is_error,
+        emit_ctx.consts.step_null_block,
+        &block_arg_values(&emit_ctx.consts.step_null_args),
+        dispatch_block,
+        &[ir::BlockArg::Value(index_i64)],
+    );
+
+    let default_block = fb.create_block();
+    let mut switch = Switch::new();
+    let mut case_blocks = Vec::with_capacity(targets.len());
+    for (case_index, _) in targets.iter().enumerate() {
+        let case_block = fb.create_block();
+        switch.set_entry(case_index as u128, case_block);
+        case_blocks.push(case_block);
+    }
+
+    fb.switch_to_block(dispatch_block);
+    let dispatch_value = fb.block_params(dispatch_block)[0];
+    switch.emit(fb, dispatch_value, default_block);
+
+    for (target_label, case_block) in targets.iter().zip(case_blocks.iter()) {
+        fb.switch_to_block(*case_block);
+        let target_index = target_label.index();
+        let target_params = &runtime_block_param_names[target_index];
+        let mut case_local_env = local_env.clone();
+        let mut case_jump_args = Vec::with_capacity(target_params.len());
+        let (prepared_args, forwarded_locations) = emit_prepare_target_args_codegen_from_local_env(
+            fb,
+            target_params,
+            None,
+            None,
+            &case_local_env,
+            emit_ctx,
+            jit_module,
+            func_imports,
+        )
+        .map_err(|err| {
+            format!(
+                "missing local mapping for br_table case block params in block {source_label}: {err}"
+            )
+        })?;
+        case_jump_args.extend(prepared_args);
+        let release_reason = RefcountReleaseReason::BranchCase {
+            target: *target_label,
+        };
+        emit_planned_local_releases_for_reason_with_local_env(
+            fb,
+            source_label,
+            &release_reason,
+            &mut case_local_env,
+            &forwarded_locations,
+            emit_ctx,
+        )?;
+        emit_decref_unforwarded_local_env(
+            fb,
+            &case_local_env,
+            &forwarded_locations,
+            &[],
+            emit_ctx.consts.thread_state_value,
+            emit_ctx.decref_ref,
+        );
+        emit_pop_handled_exception_if_leaving(fb, current_exception_name, target_params, emit_ctx);
+        fb.ins().jump(exec_blocks[target_index], &case_jump_args);
+    }
+
+    fb.switch_to_block(default_block);
+    let default_index = default_label.index();
+    let default_params = &runtime_block_param_names[default_index];
+    let mut default_local_env = local_env.clone();
+    let mut default_jump_args = Vec::with_capacity(default_params.len());
+    let (prepared_args, forwarded_locations) = emit_prepare_target_args_codegen_from_local_env(
+        fb,
+        default_params,
+        None,
+        None,
+        &default_local_env,
+        emit_ctx,
+        jit_module,
+        func_imports,
+    )
+    .map_err(|err| {
+        format!(
+            "missing local mapping for br_table default block params in block {source_label}: {err}"
+        )
+    })?;
+    default_jump_args.extend(prepared_args);
+    let release_reason = RefcountReleaseReason::BranchDefault {
+        target: default_label,
+    };
+    emit_planned_local_releases_for_reason_with_local_env(
+        fb,
+        source_label,
+        &release_reason,
+        &mut default_local_env,
+        &forwarded_locations,
+        emit_ctx,
+    )?;
+    emit_decref_unforwarded_local_env(
+        fb,
+        &default_local_env,
+        &forwarded_locations,
+        &[],
+        emit_ctx.consts.thread_state_value,
+        emit_ctx.decref_ref,
+    );
+    emit_pop_handled_exception_if_leaving(fb, current_exception_name, default_params, emit_ctx);
+    fb.ins()
+        .jump(exec_blocks[default_index], &default_jump_args);
+    Ok(())
+}
+
 fn emit_codegen_term(
     fb: &mut FunctionBuilder<'_>,
     source_label: BlockLabel,
@@ -9320,7 +9486,6 @@ fn emit_codegen_term(
 ) -> Result<(), String> {
     let decref_ref = emit_ctx.decref_ref;
     let thread_state_value = emit_ctx.consts.thread_state_value;
-    let i64_ty = emit_ctx.consts.i64_ty;
     let ptr_ty = emit_ctx.consts.ptr_ty;
     let null_ptr = fb.ins().iconst(ptr_ty, 0);
 
@@ -9428,133 +9593,20 @@ fn emit_codegen_term(
                 func_imports,
                 pyobject_to_i64_ref,
             );
-            let index_error = fb.ins().iconst(i64_ty, i64::MIN);
-            let is_error = fb
-                .ins()
-                .icmp(ir::condcodes::IntCC::Equal, index_i64, index_error);
-            let dispatch_block = fb.create_block();
-            fb.append_block_param(dispatch_block, i64_ty);
-            fb.ins().brif(
-                is_error,
-                emit_ctx.consts.step_null_block,
-                &block_arg_values(&emit_ctx.consts.step_null_args),
-                dispatch_block,
-                &[ir::BlockArg::Value(index_i64)],
-            );
-
-            let default_block = fb.create_block();
-            let mut switch = Switch::new();
-            let mut case_blocks = Vec::with_capacity(branch.targets.len());
-            for (case_index, _) in branch.targets.iter().enumerate() {
-                let case_block = fb.create_block();
-                switch.set_entry(case_index as u128, case_block);
-                case_blocks.push(case_block);
-            }
-
-            fb.switch_to_block(dispatch_block);
-            let dispatch_value = fb.block_params(dispatch_block)[0];
-            switch.emit(fb, dispatch_value, default_block);
-
-            for (target_label, case_block) in branch.targets.iter().zip(case_blocks.iter()) {
-                fb.switch_to_block(*case_block);
-                let target_index = target_label.index();
-                let target_params = &runtime_block_param_names[target_index];
-                let mut case_local_env = local_env.clone();
-                let mut case_jump_args = Vec::with_capacity(target_params.len());
-                let (prepared_args, forwarded_locations) =
-                    emit_prepare_target_args_codegen_from_local_env(
-                        fb,
-                        target_params,
-                        None,
-                        None,
-                        &case_local_env,
-                        emit_ctx,
-                        jit_module,
-                        func_imports,
-                    )
-                    .map_err(|err| {
-                        format!(
-                            "missing local mapping for br_table case block params in block {source_label}: {err}"
-                        )
-                    })?;
-                case_jump_args.extend(prepared_args);
-                let release_reason = RefcountReleaseReason::BranchCase {
-                    target: *target_label,
-                };
-                emit_planned_local_releases_for_reason_with_local_env(
-                    fb,
-                    source_label,
-                    &release_reason,
-                    &mut case_local_env,
-                    &forwarded_locations,
-                    emit_ctx,
-                )?;
-                emit_decref_unforwarded_local_env(
-                    fb,
-                    &case_local_env,
-                    &forwarded_locations,
-                    &[],
-                    emit_ctx.consts.thread_state_value,
-                    decref_ref,
-                );
-                emit_pop_handled_exception_if_leaving(
-                    fb,
-                    current_exception_name,
-                    target_params,
-                    emit_ctx,
-                );
-                fb.ins().jump(exec_blocks[target_index], &case_jump_args);
-            }
-
-            fb.switch_to_block(default_block);
-            let default_index = branch.default_label.index();
-            let default_params = &runtime_block_param_names[default_index];
-            let mut default_local_env = local_env.clone();
-            let mut default_jump_args = Vec::with_capacity(default_params.len());
-            let (prepared_args, forwarded_locations) =
-                emit_prepare_target_args_codegen_from_local_env(
-                    fb,
-                    default_params,
-                    None,
-                    None,
-                    &default_local_env,
-                    emit_ctx,
-                    jit_module,
-                    func_imports,
-                )
-                .map_err(|err| {
-                    format!(
-                        "missing local mapping for br_table default block params in block {source_label}: {err}"
-                    )
-                })?;
-            default_jump_args.extend(prepared_args);
-            let release_reason = RefcountReleaseReason::BranchDefault {
-                target: branch.default_label,
-            };
-            emit_planned_local_releases_for_reason_with_local_env(
+            emit_codegen_branch_table_from_i64(
                 fb,
                 source_label,
-                &release_reason,
-                &mut default_local_env,
-                &forwarded_locations,
+                &branch.targets,
+                branch.default_label,
+                index_i64,
+                exec_blocks,
+                runtime_block_param_names,
+                local_env,
                 emit_ctx,
-            )?;
-            emit_decref_unforwarded_local_env(
-                fb,
-                &default_local_env,
-                &forwarded_locations,
-                &[],
-                emit_ctx.consts.thread_state_value,
-                decref_ref,
-            );
-            emit_pop_handled_exception_if_leaving(
-                fb,
+                jit_module,
+                func_imports,
                 current_exception_name,
-                default_params,
-                emit_ctx,
-            );
-            fb.ins()
-                .jump(exec_blocks[default_index], &default_jump_args);
+            )?;
         }
         BlockTerm::Return(value) => {
             let forwarded_locations = HashSet::new();
@@ -9775,6 +9827,44 @@ fn emit_typed_codegen_term(
             emit_ctx,
             jit_module,
             func_imports,
+        );
+    }
+
+    if let BlockTerm::BranchTable(branch) = term {
+        let index_instr_id = branch.index.try_semantic_instr_id();
+        let demand = index_instr_id
+            .and_then(|instr_id| emit_ctx.result_demand_plan.demand_for_instr_id(instr_id))
+            .unwrap_or(ResultDemand::I64_INDEX);
+        let index = match demand {
+            ResultDemand::I64Index => emit_typed_codegen_i64_index_result_with_local_env(
+                fb,
+                &branch.index,
+                local_env,
+                emit_ctx,
+                jit_module,
+                func_imports,
+                pyobject_to_i64_ref,
+            )?,
+            other => {
+                return Err(format!(
+                    "typed branch-table index requires I64Index demand, got {other:?}"
+                ));
+            }
+        };
+        let (index_i64, _) = index.expect_i64("typed branch-table index");
+        return emit_codegen_branch_table_from_i64(
+            fb,
+            source_label,
+            &branch.targets,
+            branch.default_label,
+            index_i64,
+            exec_blocks,
+            runtime_block_param_names,
+            local_env,
+            emit_ctx,
+            jit_module,
+            func_imports,
+            current_exception_name,
         );
     }
 

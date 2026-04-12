@@ -142,7 +142,9 @@ path before the wrapper discards the result. Step 6 has started with a
 codegen-local demand plan keyed by semantic instruction id for statement roots;
 it currently preserves existing `EffectOnly` behavior while providing the table
 that later term and typed-value demands can share. Step 7 has started by marking
-branch tests with `I32Bool01` demand in that same table.
+branch tests with `I32Bool01` demand in that same table. Step 7 also marks
+branch-table indices with `I64Index` demand and routes typed branch-table term
+emission through the planned integer index result.
 
 1. Add `ResultDemand::{EffectOnly, PyObject { borrowed_ok }}` and an `EmitResult`
    wrapper near the existing `SoacValue`/LocalEnv codegen types.
@@ -160,7 +162,7 @@ branch tests with `I32Bool01` demand in that same table.
    move earlier once more consumers need planned typed demands.
 7. Extend demand to `I32Bool01` and `I64Index` once the value-space/refcount
    representation can carry non-Python values cleanly. Started with branch-test
-   `I32Bool01` demands.
+   `I32Bool01` demands and branch-table `I64Index` demands.
 
 Production paths should be strict about missing semantic instruction ids. Tests
 should use builders that assign ids instead of silently defaulting demands.

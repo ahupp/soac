@@ -771,6 +771,49 @@ def f():
         );
     }
 
+    #[test]
+    fn typed_result_demand_plan_marks_branch_table_indices_i64_index() {
+        let mut constants = TestConstantPool::default();
+        let function = test_function();
+        let entry_label = function.name_gen.next_block_name();
+        let case_label = function.name_gen.next_block_name();
+        let default_label = function.name_gen.next_block_name();
+        let index_instr_id = InstrId::new(entry_label, 0);
+        let entry = CodegenBlock {
+            label: entry_label,
+            body: vec![],
+            term: BlockTerm::BranchTable(soac_blockpy::block_py::TermBranchTable {
+                index: with_instr_id(constants.int_expr(0), index_instr_id),
+                targets: vec![case_label],
+                default_label,
+            }),
+            params: vec![],
+            exc_edge: None,
+        };
+        let case_block = CodegenBlock {
+            label: case_label,
+            body: vec![],
+            term: ret_term(constants.int_expr(1)),
+            params: vec![],
+            exc_edge: None,
+        };
+        let default_block = CodegenBlock {
+            label: default_label,
+            body: vec![],
+            term: ret_term(constants.int_expr(2)),
+            params: vec![],
+            exc_edge: None,
+        };
+        let function = with_test_blocks(function, vec![entry, case_block, default_block]);
+        let typed_function = lower_codegen_function_to_typed(function);
+        let plan = plan_typed_result_demands(&typed_function);
+
+        assert_eq!(
+            plan.demand_for_instr_id(index_instr_id),
+            Some(ResultDemand::I64_INDEX)
+        );
+    }
+
     fn direct_call_expr(function_id: FunctionId) -> InstrCodegen {
         InstrCodegen::CallDirect(CallDirect::new(
             none_expr(),
