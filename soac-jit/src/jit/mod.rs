@@ -3640,76 +3640,6 @@ impl StackSlots {
     }
 }
 
-fn required_stack_slot_names_for_jit(
-    function: &BlockPyFunction<CodegenModuleShape>,
-    refcount_plan: &FunctionRefcountPlan,
-    runtime_block_params: &[Vec<RuntimeBlockParamPlan>],
-    planned_stack_slot_entry_seeds: &[Vec<PlannedStackSlotEntrySeed>],
-    exc_dispatches: &[Option<BlockExcDispatchPlan>],
-) -> Vec<String> {
-    let mut required = HashSet::new();
-
-    for params in runtime_block_params {
-        for param in params {
-            if param.binding.storage == PlannedLocalStorage::StackSlot {
-                required.insert(param.binding.name.clone());
-            }
-        }
-    }
-
-    for seeds in planned_stack_slot_entry_seeds {
-        for seed in seeds {
-            required.insert(seed.binding.name.clone());
-        }
-    }
-
-    for dispatch in exc_dispatches.iter().flatten() {
-        for (target_name, _) in &dispatch.slot_writes {
-            required.insert(target_name.clone());
-        }
-        for source_name in &dispatch.forwarded_local_names {
-            required.insert(source_name.clone());
-        }
-    }
-
-    for block_plan in refcount_plan.blocks.values() {
-        for action in &block_plan.actions {
-            if let RefcountActionKind::ReleaseLocal { local, reason, .. } = &action.kind {
-                match reason {
-                    RefcountReleaseReason::Return | RefcountReleaseReason::Raise => {}
-                    RefcountReleaseReason::Jump { .. }
-                    | RefcountReleaseReason::IfThen { .. }
-                    | RefcountReleaseReason::IfElse { .. }
-                    | RefcountReleaseReason::BranchCase { .. }
-                    | RefcountReleaseReason::BranchDefault { .. }
-                    | RefcountReleaseReason::ExceptionEdge { .. } => {
-                        required.insert(local.name.clone());
-                    }
-                }
-            }
-        }
-    }
-
-    for block in &function.blocks {
-        if let Some(exception_name) = block.exception_param() {
-            required.insert(exception_name.to_string());
-        }
-    }
-
-    function
-        .storage_layout()
-        .as_ref()
-        .map(|layout| {
-            layout
-                .stack_slots()
-                .iter()
-                .filter(|name| required.contains(*name))
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn emit_call_if_not_null(
     fb: &mut FunctionBuilder<'_>,
     ptr_ty: ir::Type,
@@ -12279,13 +12209,8 @@ fn build_cranelift_run_bb_specialized_function(
         let raise_exc_direct_block = fb.create_block();
         fb.set_cold_block(step_null_block);
         fb.set_cold_block(raise_exc_direct_block);
-        let required_stack_slot_names = required_stack_slot_names_for_jit(
-            function,
-            refcount_plan,
-            runtime_block_params,
-            planned_stack_slot_entry_seeds,
-            exc_dispatches,
-        );
+        let required_stack_slot_names =
+            jit_local_plan.required_stack_slot_names_for_function(function);
         let stack_slots = StackSlots::new(&mut fb, &required_stack_slot_names);
         let exception_state_slots = ExceptionStateSlots::new(&mut fb, function);
 

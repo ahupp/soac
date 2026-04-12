@@ -521,3 +521,6 @@ Started:
   inspector pipeline output includes it as a `jit_local_plan` step. This makes
   block params, stack-slot seeds, and edge transports inspectable without relying
   on ad hoc codegen-only debug structures.
+- Required physical stack slots for JIT local state are now derived by
+  `PlannedJitFunctionLocals` itself. Codegen allocates the requested slots but no
+  longer recomputes that requirement from scattered plan fragments.
