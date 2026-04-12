@@ -13,7 +13,7 @@ def _write(path: Path, source: str) -> None:
     path.write_text(source, encoding="utf-8")
 
 
-def test_circular_relative_import(tmp_path: Path) -> None:
+def test_circular_relative_import(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     pkg = tmp_path / "pkg"
     pkg.mkdir()
 
@@ -21,6 +21,7 @@ def test_circular_relative_import(tmp_path: Path) -> None:
     _write(pkg / "a.py", "from . import b\n")
     _write(pkg / "b.py", "from . import a\n")
 
+    monkeypatch.setenv("SOAC_MODULE_ENABLED", f"path:{pkg}")
     sys.path.insert(0, str(tmp_path))
     import_hook.install()
 

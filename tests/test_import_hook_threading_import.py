@@ -21,11 +21,14 @@ def test_import_hook_entry_module_bootstraps_runtime():
         / "integration_modules"
         / "import_hook_entry_bootstrap.py"
     )
+    env = os.environ.copy()
+    env["SOAC_MODULE_ENABLED"] = f"path:{module_path}"
 
     result = subprocess.run(
         [sys.executable, "-m", "soac.import_hook", str(module_path)],
         text=True,
         capture_output=True,
+        env=env,
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "1"
@@ -33,7 +36,10 @@ def test_import_hook_entry_module_bootstraps_runtime():
 
 def test_import_hook_transforms_resolvable_frozen_module_source():
     env = os.environ.copy()
-    env.pop("SOAC_MODULE_ENABLED", None)
+    ntpath_source = (
+        Path(__file__).resolve().parent.parent / "vendor" / "cpython" / "Lib" / "ntpath.py"
+    )
+    env["SOAC_MODULE_ENABLED"] = f"path:{ntpath_source}"
     code = "\n".join(
         [
             "from soac import import_hook",

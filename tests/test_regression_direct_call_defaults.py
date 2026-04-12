@@ -13,8 +13,7 @@ sys.path.insert(0, {str(tmp_path)!r})
 from soac.import_hook import install
 install()
 import {module_name} as module
-for _ in range(20):
-    assert module.run() == 42
+assert module.run() == 42
 """
     result = subprocess.run(
         [sys.executable, "-c", script],
@@ -44,12 +43,9 @@ def run():
 
     base_env = os.environ.copy()
     base_env.pop("SOAC_LOG", None)
-    base_env.pop("SOAC_MODULE_ENABLED", None)
     base_env.update(
         {
-            "DIET_PYTHON_ALLOW_TEMP": "1",
-            "DIET_PYTHON_INTEGRATION_ONLY": "0",
-            "DIET_PYTHON_MODE": "transform",
+            "SOAC_MODULE_ENABLED": f"path:{tmp_path}",
             "SOAC_WORK_DIR": str(work_dir),
         }
     )

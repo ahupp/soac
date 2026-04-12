@@ -61,9 +61,7 @@ class C{index}:
     module_path.write_text(class_defs, encoding="utf-8")
     env = {
         **os.environ,
-        "DIET_PYTHON_ALLOW_TEMP": "1",
-        "DIET_PYTHON_INTEGRATION_ONLY": "0",
-        "DIET_PYTHON_MODE": "transform",
+        "SOAC_MODULE_ENABLED": f"path:{module_path}",
         "SOAC_LOG": f"soac_jit_codegen=info;json={log_path}",
     }
 
