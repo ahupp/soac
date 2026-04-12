@@ -181,6 +181,10 @@ struct RawPyThreadState {
 
 unsafe extern "C" {
     fn _Py_Dealloc(obj: *mut RawPyObject);
+    fn PyErr_SetString(exception: *mut c_void, string: *const u8);
+    fn PyUnicode_FromOrdinal(ordinal: i32) -> *mut c_void;
+    fn PyUnicode_GetLength(unicode: *mut c_void) -> isize;
+    fn PyUnicode_ReadChar(unicode: *mut c_void, index: isize) -> u32;
     fn soac_runtime_decref_dealloc_preserving_error(
         tstate: *mut RawPyThreadState,
         obj: *mut RawPyObject,
@@ -197,6 +201,8 @@ unsafe extern "C" {
         slot_index: i64,
         value: *mut c_void,
     ) -> *mut c_void;
+    static mut PyExc_TypeError: *mut c_void;
+    static mut PyExc_ValueError: *mut c_void;
     static mut _PyDict_IndexedValueTombstone: c_void;
 }
 
@@ -342,6 +348,50 @@ pub unsafe extern "C" fn soac_runtime_example_known_value_source() -> i64 {
 #[inline(never)]
 pub unsafe extern "C" fn soac_runtime_example_offset_known_value() -> i64 {
     (unsafe { soac_runtime_example_known_value_source() }) + 5
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soac_runtime_builtin_ord_i64(
+    _tstate: *mut c_void,
+    obj: *mut c_void,
+) -> i64 {
+    debug_assert!(!obj.is_null());
+    let length = unsafe { PyUnicode_GetLength(obj) };
+    if length < 0 {
+        return 0;
+    }
+    if length != 1 {
+        unsafe {
+            PyErr_SetString(
+                PyExc_TypeError,
+                b"ord() expected a character, but string length was not 1\0".as_ptr(),
+            )
+        };
+        return 0;
+    }
+
+    let codepoint = unsafe { PyUnicode_ReadChar(obj, 0) };
+    if codepoint == u32::MAX {
+        return 0;
+    }
+    codepoint as i64
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soac_runtime_builtin_chr_i64(
+    _tstate: *mut c_void,
+    value: i64,
+) -> *mut c_void {
+    if !(0..=0x10ffff).contains(&value) {
+        unsafe {
+            PyErr_SetString(
+                PyExc_ValueError,
+                b"chr() arg not in range(0x110000)\0".as_ptr(),
+            )
+        };
+        return core::ptr::null_mut();
+    }
+    unsafe { PyUnicode_FromOrdinal(value as i32) }
 }
 
 #[inline(always)]

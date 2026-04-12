@@ -127,6 +127,11 @@ This requires generic coercion edges:
 
 ## Implementation Order
 
+Status: steps 1 and 2 have started. The direct ABI descriptor scaffold exists
+in `soac-jit`, and checked `soac_runtime_builtin_ord_i64` /
+`soac_runtime_builtin_chr_i64` entry points exist in `soac-runtime` and are
+emitted into the runtime CLIF table.
+
 1. Add compiler-visible direct ABI descriptor scaffolding in `soac-jit`.
 
    This should define `DirectTargetId`, `RuntimePrimitiveId`,

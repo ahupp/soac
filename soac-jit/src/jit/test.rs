@@ -3981,6 +3981,19 @@ def read_point(point):
     }
 
     #[test]
+    fn runtime_clif_builtin_ord_and_chr_symbols_are_available() {
+        let ord = parsed_runtime_clif_function(direct_abi::SOAC_RUNTIME_BUILTIN_ORD_I64_SYMBOL);
+        assert_eq!(ord.function.signature.params.len(), 2);
+        assert_eq!(ord.function.signature.returns.len(), 1);
+        assert_eq!(ord.function.signature.returns[0].value_type, ir::types::I64);
+
+        let chr = parsed_runtime_clif_function(direct_abi::SOAC_RUNTIME_BUILTIN_CHR_I64_SYMBOL);
+        assert_eq!(chr.function.signature.params.len(), 2);
+        assert_eq!(chr.function.signature.returns.len(), 1);
+        assert_eq!(chr.function.signature.returns[0].value_type, ir::types::I64);
+    }
+
+    #[test]
     fn jit_runtime_clif_refcount_roundtrip_preserves_py_long_refcount() {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         unsafe {
