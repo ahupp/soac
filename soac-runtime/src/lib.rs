@@ -112,30 +112,6 @@ struct RawPyHeapTypeObject {
 }
 
 #[repr(C)]
-struct RawPyFunctionObject {
-    ob_base: RawPyObject,
-    func_globals: *mut c_void,
-    func_builtins: *mut c_void,
-    func_name: *mut c_void,
-    func_qualname: *mut c_void,
-    func_code: *mut c_void,
-    func_defaults: *mut c_void,
-    func_kwdefaults: *mut c_void,
-    func_closure: *mut c_void,
-    func_doc: *mut c_void,
-    func_dict: *mut c_void,
-    func_weakreflist: *mut c_void,
-    func_module: *mut c_void,
-    func_annotations: *mut c_void,
-    func_annotate: *mut c_void,
-    func_typeparams: *mut c_void,
-    vectorcall: *mut c_void,
-    func_soac_metadata: *mut c_void,
-    func_soac_metadata_destructor: *mut c_void,
-    func_soac_function_id: u64,
-}
-
-#[repr(C)]
 struct RawPyDictObject {
     ob_base: RawPyObject,
     ma_used: isize,
@@ -178,15 +154,6 @@ struct RawPyDictSplitValues {
 }
 
 #[repr(C)]
-struct RawPyMethodObject {
-    ob_base: RawPyObject,
-    im_func: *mut RawPyObject,
-    im_self: *mut RawPyObject,
-    im_weakreflist: *mut c_void,
-    vectorcall: *mut c_void,
-}
-
-#[repr(C)]
 struct RawPyThreadState {
     prev: *mut c_void,
     next: *mut c_void,
@@ -212,11 +179,6 @@ struct RawPyThreadState {
     current_exception: *mut RawPyObject,
 }
 
-#[repr(C)]
-struct ClifFunctionData {
-    runtime_objects: *mut c_void,
-}
-
 unsafe extern "C" {
     fn _Py_Dealloc(obj: *mut RawPyObject);
     fn soac_runtime_decref_dealloc_preserving_error(
@@ -235,8 +197,6 @@ unsafe extern "C" {
         slot_index: i64,
         value: *mut c_void,
     ) -> *mut c_void;
-    static mut PyFunction_Type: c_void;
-    static mut PyMethod_Type: c_void;
     static mut _PyDict_IndexedValueTombstone: c_void;
 }
 
@@ -373,21 +333,15 @@ pub unsafe extern "C" fn soac_runtime_set_raised_exception(tstate: *mut c_void, 
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soac_runtime_guard_type_version(
-    obj: *mut c_void,
-    expected_type: *mut c_void,
-    expected_version: i64,
-) -> i32 {
-    let obj = obj.cast::<RawPyObject>();
-    debug_assert!(!obj.is_null());
-    debug_assert!(!expected_type.is_null());
+#[inline(never)]
+pub unsafe extern "C" fn soac_runtime_example_known_value_source() -> i64 {
+    core::hint::black_box(7)
+}
 
-    let actual_type = unsafe { (*obj).ob_type };
-    if actual_type != expected_type {
-        return 0;
-    }
-    let actual_version = unsafe { (*(actual_type.cast::<RawPyTypeObject>())).tp_version_tag };
-    (actual_version == expected_version as u32) as i32
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub unsafe extern "C" fn soac_runtime_example_offset_known_value() -> i64 {
+    (unsafe { soac_runtime_example_known_value_source() }) + 5
 }
 
 #[inline(always)]
@@ -461,37 +415,26 @@ unsafe fn add_split_value_to_insertion_order(
     true
 }
 
-macro_rules! load_indexed_dict_value_owned {
-    ($dict:expr, $key:expr, $index:expr) => {{
-        let _ = $key;
-        if unsafe { dict_guarded_index($dict, $index) } < 0 {
+macro_rules! probe_indexed_dict_value {
+    ($dict:expr, $index:expr) => {{
+        let dict = $dict;
+        let index = $index;
+        if unsafe { dict_guarded_index(dict, index) } < 0 {
             core::ptr::null_mut()
         } else {
-            let values = unsafe { (*$dict).ma_values.cast::<RawPyDictIndexedValues>() };
-            let value = unsafe { indexed_value(values, $index) };
+            let values = unsafe { (*dict).ma_values.cast::<RawPyDictIndexedValues>() };
+            let value = unsafe { indexed_value(values, index) };
             if value.is_null() || value.cast::<c_void>() == (&raw mut _PyDict_IndexedValueTombstone)
             {
                 core::ptr::null_mut()
             } else {
-                unsafe { incref_impl(value) };
-                value.cast::<c_void>()
+                value
             }
         }
     }};
 }
 
-macro_rules! load_split_dict_value_owned {
-    ($dict:expr, $key:expr, $index:expr) => {{
-        let dict = $dict;
-        let key = $key;
-        let index = $index;
-        let keys = unsafe { (*dict).ma_keys };
-        let values = unsafe { (*dict).ma_values.cast::<RawPyDictSplitValues>() };
-        load_split_values_owned!(keys, values, key, index)
-    }};
-}
-
-macro_rules! load_split_values_owned {
+macro_rules! probe_split_values {
     ($keys:expr, $values:expr, $key:expr, $index:expr) => {{
         const DICT_KEYS_SPLIT: u8 = 2;
 
@@ -508,19 +451,24 @@ macro_rules! load_split_values_owned {
         {
             core::ptr::null_mut()
         } else {
-            let value = unsafe { split_value(values, index) };
-            if value.is_null() {
-                core::ptr::null_mut()
-            } else {
-                unsafe { incref_impl(value) };
-                value.cast::<c_void>()
-            }
+            unsafe { split_value(values, index) }
         }
     }};
 }
 
+macro_rules! probe_split_dict_value {
+    ($dict:expr, $key:expr, $index:expr) => {{
+        let dict = $dict;
+        let key = $key;
+        let index = $index;
+        let keys = unsafe { (*dict).ma_keys };
+        let values = unsafe { (*dict).ma_values.cast::<RawPyDictSplitValues>() };
+        probe_split_values!(keys, values, key, index)
+    }};
+}
+
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soac_runtime_load_global_indexed(
+pub unsafe extern "C" fn soac_runtime_probe_global_indexed(
     dict: *mut c_void,
     key: *mut c_void,
     index: isize,
@@ -531,7 +479,8 @@ pub unsafe extern "C" fn soac_runtime_load_global_indexed(
     debug_assert!(!key.is_null());
     debug_assert!(index >= 0);
 
-    load_indexed_dict_value_owned!(dict, key, index)
+    let _ = key;
+    probe_indexed_dict_value!(dict, index).cast::<c_void>()
 }
 
 #[unsafe(no_mangle)]
@@ -546,9 +495,10 @@ pub unsafe extern "C" fn soac_runtime_load_global(
     debug_assert!(!key.is_null());
     debug_assert!(index >= 0);
 
-    let value = load_indexed_dict_value_owned!(dict, key, index);
+    let value = probe_indexed_dict_value!(dict, index);
     if !value.is_null() {
-        return value;
+        unsafe { incref_impl(value) };
+        return value.cast::<c_void>();
     }
 
     unsafe { soac_runtime_load_global_slow(dict.cast::<c_void>(), key.cast::<c_void>(), index) }
@@ -662,14 +612,14 @@ macro_rules! cached_keys {
     ($obj_type:expr) => {{ unsafe { (*$obj_type.cast::<RawPyHeapTypeObject>()).ht_cached_keys } }};
 }
 
-macro_rules! load_field_value_owned {
+macro_rules! probe_field_value {
     ($obj:expr, $key:expr, $index:expr) => {{
         let obj = $obj;
         let key = $key;
         let index = $index;
         let dict = object_dict!(obj);
         if !dict.is_null() {
-            load_split_dict_value_owned!(dict, key, index)
+            probe_split_dict_value!(dict, key, index)
         } else {
             let obj_type = unsafe { (*obj).ob_type.cast::<RawPyTypeObject>() };
             if unsafe { (*obj_type).tp_flags } & PY_TPFLAGS_INLINE_VALUES == 0 {
@@ -680,7 +630,7 @@ macro_rules! load_field_value_owned {
                     core::ptr::null_mut()
                 } else {
                     let keys = cached_keys!(obj_type);
-                    load_split_values_owned!(keys, values, key, index)
+                    probe_split_values!(keys, values, key, index)
                 }
             }
         }
@@ -688,7 +638,7 @@ macro_rules! load_field_value_owned {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soac_runtime_load_field_indexed(
+pub unsafe extern "C" fn soac_runtime_probe_field_indexed(
     obj: *mut c_void,
     key: *mut c_void,
     index: isize,
@@ -699,7 +649,7 @@ pub unsafe extern "C" fn soac_runtime_load_field_indexed(
     debug_assert!(!key.is_null());
     debug_assert!(index >= 0);
 
-    load_field_value_owned!(obj, key, index)
+    probe_field_value!(obj, key, index).cast::<c_void>()
 }
 
 #[unsafe(no_mangle)]
@@ -774,52 +724,4 @@ pub unsafe extern "C" fn soac_runtime_store_field_indexed(
         decref_raw_with_tstate!(tstate, old_value);
     }
     1
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn soac_runtime_callee_function_id(callable: *mut c_void) -> i64 {
-    let callable = callable.cast::<RawPyObject>();
-    if callable.is_null() {
-        return i64::MIN;
-    }
-    let function = if unsafe { (*callable).ob_type } == (&raw mut PyFunction_Type).cast::<c_void>()
-    {
-        callable
-    } else if unsafe { (*callable).ob_type } == (&raw mut PyMethod_Type).cast::<c_void>() {
-        unsafe { (*(callable as *mut RawPyMethodObject)).im_func }
-    } else {
-        return 0;
-    };
-    if function.is_null() {
-        return i64::MIN;
-    }
-    let packed = unsafe { (*(function as *mut RawPyFunctionObject)).func_soac_function_id };
-    if packed == 0 {
-        return 0;
-    }
-    packed as i64
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn soac_runtime_function_data_block(callable: *mut c_void) -> *mut c_void {
-    let callable = callable.cast::<RawPyObject>();
-    if callable.is_null() {
-        return core::ptr::null_mut();
-    }
-    let function = if unsafe { (*callable).ob_type } == (&raw mut PyFunction_Type).cast::<c_void>()
-    {
-        callable
-    } else if unsafe { (*callable).ob_type } == (&raw mut PyMethod_Type).cast::<c_void>() {
-        unsafe { (*(callable as *mut RawPyMethodObject)).im_func }
-    } else {
-        return core::ptr::null_mut();
-    };
-    if function.is_null() {
-        return core::ptr::null_mut();
-    }
-    let metadata = unsafe { (*(function as *mut RawPyFunctionObject)).func_soac_metadata };
-    if metadata.is_null() {
-        return core::ptr::null_mut();
-    }
-    unsafe { (*(metadata as *mut ClifFunctionData)).runtime_objects }
 }

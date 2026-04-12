@@ -344,8 +344,8 @@ apply/verify mode:
   `soac-jit/src/jit/mod.rs:4584`.
 - The fast path:
   - evaluates the receiver once
-  - guards exact owner type and owner type version via the inlineable
-    `soac_runtime_guard_type_version`
+  - guards exact owner type and owner type version with direct JIT
+    loads from `PyObject.ob_type` and `PyTypeObject.tp_version_tag`
   - uses the descriptor function object directly
   - prepends the receiver as arg0
   - emits a direct Cranelift `call` to the compiled target function

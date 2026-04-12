@@ -516,8 +516,8 @@ static SOAC_RUNTIME_LOAD_GLOBAL_IMPORT: ImportSpec = ImportSpec::local(
     &[SigType::Pointer, SigType::Pointer, SigType::I64],
     &[SigType::Pointer],
 );
-static SOAC_RUNTIME_LOAD_GLOBAL_INDEXED_IMPORT: ImportSpec = ImportSpec::local(
-    SOAC_RUNTIME_LOAD_GLOBAL_INDEXED_SYMBOL,
+static SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_IMPORT: ImportSpec = ImportSpec::local(
+    SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_SYMBOL,
     &[SigType::Pointer, SigType::Pointer, SigType::I64],
     &[SigType::Pointer],
 );
@@ -547,8 +547,8 @@ static SOAC_RUNTIME_STORE_GLOBAL_INDEXED_IMPORT: ImportSpec = ImportSpec::local(
     ],
     &[SigType::Pointer],
 );
-static SOAC_RUNTIME_LOAD_FIELD_INDEXED_IMPORT: ImportSpec = ImportSpec::local(
-    SOAC_RUNTIME_LOAD_FIELD_INDEXED_SYMBOL,
+static SOAC_RUNTIME_PROBE_FIELD_INDEXED_IMPORT: ImportSpec = ImportSpec::local(
+    SOAC_RUNTIME_PROBE_FIELD_INDEXED_SYMBOL,
     &[SigType::Pointer, SigType::Pointer, SigType::I64],
     &[SigType::Pointer],
 );
@@ -657,11 +657,6 @@ static DP_JIT_PYOBJECT_TO_I64_IMPORT: ImportSpec = ImportSpec::new(
 );
 static PYLONG_FROM_LONGLONG_IMPORT: ImportSpec =
     ImportSpec::new("PyLong_FromLongLong", &[SigType::I64], &[SigType::Pointer]);
-static SOAC_RUNTIME_GUARD_TYPE_VERSION_IMPORT: ImportSpec = ImportSpec::local(
-    SOAC_RUNTIME_GUARD_TYPE_VERSION_SYMBOL,
-    &[SigType::Pointer, SigType::Pointer, SigType::I64],
-    &[SigType::I32],
-);
 static DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_record_top_value_sample",
     &[SigType::Pointer, SigType::I64],
@@ -1458,7 +1453,7 @@ fn emit_codegen_indexed_global_load(
     fb.append_block_param(direct_block, ptr_ty);
 
     let direct_inst = fb.ins().call(
-        ctx.load_global_indexed_ref,
+        ctx.probe_global_indexed_ref,
         &[globals_obj, name_obj, slot_index],
     );
     let direct_value = fb.inst_results(direct_inst)[0];
@@ -1475,6 +1470,7 @@ fn emit_codegen_indexed_global_load(
 
     fb.switch_to_block(direct_block);
     let direct_value = fb.block_params(direct_block)[0];
+    fb.ins().call(ctx.incref_ref, &[direct_value]);
     emit_optional_counter_increment_for_kind(fb, ctx, ctx.global_indexed_hit_counter_ids, instr_id);
     fb.ins()
         .call(ctx.decref_ref, &[ctx.consts.thread_state_value, name_obj]);
@@ -2188,10 +2184,10 @@ struct JitEmitCtx<'mc> {
     finish_constructor_init_ref: ir::FuncRef,
     consts: JitEmitConsts,
     load_global_fast_ref: ir::FuncRef,
-    load_global_indexed_ref: ir::FuncRef,
+    probe_global_indexed_ref: ir::FuncRef,
     load_global_slow_ref: ir::FuncRef,
     store_global_indexed_ref: ir::FuncRef,
-    load_field_indexed_ref: ir::FuncRef,
+    probe_field_indexed_ref: ir::FuncRef,
     store_field_indexed_ref: ir::FuncRef,
     load_runtime_obj_ref: ir::FuncRef,
     direct_function_context_ref: ir::FuncRef,
@@ -2208,8 +2204,7 @@ struct JitEmitCtx<'mc> {
     store_cell_ref: ir::FuncRef,
     py_call_object_ref: ir::FuncRef,
     py_call_with_kw_ref: ir::FuncRef,
-    guard_method_type_version_ref: ir::FuncRef,
-    record_top_value_sample_ref: ir::FuncRef,
+    record_top_value_sample_ref: Option<ir::FuncRef>,
     tuple_new_ref: ir::FuncRef,
     tuple_set_item_ref: ir::FuncRef,
     set_raised_exception_ref: ir::FuncRef,
@@ -5541,25 +5536,6 @@ fn emit_branch_index_i64(
     }
 }
 
-fn emit_checked_i32_result(
-    fb: &mut FunctionBuilder<'_>,
-    result: ir::Value,
-    ctx: &JitEmitCtx<'_>,
-) -> ir::Value {
-    let errored = fb.ins().icmp_imm(ir::condcodes::IntCC::Equal, result, -1);
-    let ok_block = fb.create_block();
-    fb.append_block_param(ok_block, ctx.consts.i32_ty);
-    fb.ins().brif(
-        errored,
-        ctx.consts.step_null_block,
-        &step_null_block_args(ctx),
-        ok_block,
-        &[ir::BlockArg::Value(result)],
-    );
-    fb.switch_to_block(ok_block);
-    fb.block_params(ok_block)[0]
-}
-
 fn module_constant_string_value<'a>(
     module: &'a BlockPyModule<CodegenModuleShape>,
     constant_index: u32,
@@ -6433,6 +6409,36 @@ fn soac_work_dir_from_env() -> Option<std::path::PathBuf> {
         .filter(|path| !path.as_os_str().is_empty())
 }
 
+pub(super) fn emit_exact_type_version_match(
+    fb: &mut FunctionBuilder<'_>,
+    obj: ir::Value,
+    expected_type: ir::Value,
+    expected_version: u32,
+) -> ir::Value {
+    let ptr_ty = fb.func.dfg.value_type(obj);
+    let actual_type = fb.ins().load(
+        ptr_ty,
+        ir::MemFlags::trusted(),
+        obj,
+        offset_of!(ffi::PyObject, ob_type) as i32,
+    );
+    let type_matches = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, actual_type, expected_type);
+    let actual_version = fb.ins().load(
+        ir::types::I32,
+        ir::MemFlags::trusted(),
+        actual_type,
+        offset_of!(ffi::PyTypeObject, tp_version_tag) as i32,
+    );
+    let version_matches = fb.ins().icmp_imm(
+        ir::condcodes::IntCC::Equal,
+        actual_version,
+        i64::from(expected_version),
+    );
+    fb.ins().band(type_matches, version_matches)
+}
+
 fn emit_callee_function_id_checked(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
@@ -6682,12 +6688,18 @@ fn emit_record_top_value_sample(
                 counter_id.0
             )
         });
+    let record_top_value_sample_ref = ctx.record_top_value_sample_ref.unwrap_or_else(|| {
+        panic!(
+            "missing top-value counter helper import for counter id {}",
+            counter_id.0
+        )
+    });
     emit_record_top_value_counter_slot(
         fb,
         top_value_counter_base_value,
         counter_slot,
         observed_value,
-        ctx.record_top_value_sample_ref,
+        record_top_value_sample_ref,
     );
 }
 
@@ -8375,18 +8387,12 @@ fn emit_codegen_simple_call_with_local_env(
                 } else {
                     fb.create_block()
                 };
-                let expected_version = fb
-                    .ins()
-                    .iconst(emit_ctx.consts.i64_ty, specialization.type_version as i64);
-                let guard_inst = fb.ins().call(
-                    emit_ctx.guard_method_type_version_ref,
-                    &[receiver, expected_type, expected_version],
+                let is_match = emit_exact_type_version_match(
+                    fb,
+                    receiver,
+                    expected_type,
+                    specialization.type_version,
                 );
-                let guard_result =
-                    emit_checked_i32_result(fb, fb.inst_results(guard_inst)[0], emit_ctx);
-                let is_match = fb
-                    .ins()
-                    .icmp_imm(ir::condcodes::IntCC::NotEqual, guard_result, 0);
                 fb.ins().brif(is_match, direct_block, &[], miss_block, &[]);
 
                 fb.switch_to_block(direct_block);
@@ -10926,6 +10932,7 @@ fn record_jit_bb_map(
 }
 
 const RUNTIME_SUPPORT_INLINE_MAX_INSTS: usize = 128;
+const SOAC_RUNTIME_EXAMPLE_SYMBOL_PREFIX: &str = "soac_runtime_example_";
 
 #[derive(Debug)]
 struct RuntimeSupportInliner {
@@ -10943,15 +10950,12 @@ impl RuntimeSupportInliner {
                 parsed.symbol.as_str(),
                 SOAC_RUNTIME_INCREF_SYMBOL
                     | SOAC_RUNTIME_DECREF_SYMBOL
-                    | SOAC_RUNTIME_CALLEE_FUNCTION_ID_SYMBOL
-                    | SOAC_RUNTIME_FUNCTION_DATA_BLOCK_SYMBOL
                     | SOAC_RUNTIME_LOAD_GLOBAL_SYMBOL
-                    | SOAC_RUNTIME_LOAD_GLOBAL_INDEXED_SYMBOL
+                    | SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_SYMBOL
                     | SOAC_RUNTIME_STORE_GLOBAL_SYMBOL
                     | SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL
-                    | SOAC_RUNTIME_LOAD_FIELD_INDEXED_SYMBOL
+                    | SOAC_RUNTIME_PROBE_FIELD_INDEXED_SYMBOL
                     | SOAC_RUNTIME_STORE_FIELD_INDEXED_SYMBOL
-                    | SOAC_RUNTIME_GUARD_TYPE_VERSION_SYMBOL
             ) {
                 continue;
             }
@@ -11199,16 +11203,14 @@ pub(crate) const SOAC_RUNTIME_INCREF_APPLIED_SYMBOL: &str = "soac_runtime_incref
 pub(crate) const SOAC_RUNTIME_DECREF_APPLIED_SYMBOL: &str = "soac_runtime_decref_applied";
 pub(crate) const SOAC_RUNTIME_SET_RAISED_EXCEPTION_SYMBOL: &str =
     "soac_runtime_set_raised_exception";
-pub(crate) const SOAC_RUNTIME_CALLEE_FUNCTION_ID_SYMBOL: &str = "soac_runtime_callee_function_id";
-pub(crate) const SOAC_RUNTIME_FUNCTION_DATA_BLOCK_SYMBOL: &str = "soac_runtime_function_data_block";
 pub(crate) const SOAC_RUNTIME_LOAD_GLOBAL_SYMBOL: &str = "soac_runtime_load_global";
-pub(crate) const SOAC_RUNTIME_LOAD_GLOBAL_INDEXED_SYMBOL: &str = "soac_runtime_load_global_indexed";
+pub(crate) const SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_SYMBOL: &str =
+    "soac_runtime_probe_global_indexed";
 pub(crate) const SOAC_RUNTIME_STORE_GLOBAL_SYMBOL: &str = "soac_runtime_store_global";
 pub(crate) const SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL: &str =
     "soac_runtime_store_global_indexed";
-pub(crate) const SOAC_RUNTIME_LOAD_FIELD_INDEXED_SYMBOL: &str = "soac_runtime_load_field_indexed";
+pub(crate) const SOAC_RUNTIME_PROBE_FIELD_INDEXED_SYMBOL: &str = "soac_runtime_probe_field_indexed";
 pub(crate) const SOAC_RUNTIME_STORE_FIELD_INDEXED_SYMBOL: &str = "soac_runtime_store_field_indexed";
-pub(crate) const SOAC_RUNTIME_GUARD_TYPE_VERSION_SYMBOL: &str = "soac_runtime_guard_type_version";
 
 pub(crate) fn jit_python_perf_symbol_name(kind: &str, qualname: &str) -> String {
     format!("py:{kind}:{qualname}")
@@ -11447,6 +11449,12 @@ fn load_runtime_support_clif(
     let mut import_func_ids = HashMap::new();
     let mut import_data_ids = HashMap::new();
     for parsed in library.functions.iter().cloned() {
+        if parsed
+            .symbol
+            .starts_with(SOAC_RUNTIME_EXAMPLE_SYMBOL_PREFIX)
+        {
+            continue;
+        }
         let func_id = jit_module
             .declare_function(&parsed.symbol, Linkage::Local, &parsed.function.signature)
             .map_err(|err| {
@@ -12079,10 +12087,10 @@ fn build_cranelift_run_bb_specialized_function(
         );
         let load_global_fast_ref =
             func_imports.get_or_panic(jit_module, &mut fb.func, &SOAC_RUNTIME_LOAD_GLOBAL_IMPORT);
-        let load_global_indexed_ref = func_imports.get_or_panic(
+        let probe_global_indexed_ref = func_imports.get_or_panic(
             jit_module,
             &mut fb.func,
-            &SOAC_RUNTIME_LOAD_GLOBAL_INDEXED_IMPORT,
+            &SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_IMPORT,
         );
         let load_global_slow_ref = func_imports.get_or_panic(
             jit_module,
@@ -12094,10 +12102,10 @@ fn build_cranelift_run_bb_specialized_function(
             &mut fb.func,
             &SOAC_RUNTIME_STORE_GLOBAL_INDEXED_IMPORT,
         );
-        let load_field_indexed_ref = func_imports.get_or_panic(
+        let probe_field_indexed_ref = func_imports.get_or_panic(
             jit_module,
             &mut fb.func,
-            &SOAC_RUNTIME_LOAD_FIELD_INDEXED_IMPORT,
+            &SOAC_RUNTIME_PROBE_FIELD_INDEXED_IMPORT,
         );
         let store_field_indexed_ref = func_imports.get_or_panic(
             jit_module,
@@ -12132,16 +12140,13 @@ fn build_cranelift_run_bb_specialized_function(
             func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_PYOBJECT_TO_I64_IMPORT);
         let py_long_from_i64_ref =
             func_imports.get_or_panic(jit_module, &mut fb.func, &PYLONG_FROM_LONGLONG_IMPORT);
-        let guard_method_type_version_ref = func_imports.get_or_panic(
-            jit_module,
-            &mut fb.func,
-            &SOAC_RUNTIME_GUARD_TYPE_VERSION_IMPORT,
-        );
-        let record_top_value_sample_ref = func_imports.get_or_panic(
-            jit_module,
-            &mut fb.func,
-            &DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT,
-        );
+        let record_top_value_sample_ref = requires_top_value_counters.then(|| {
+            func_imports.get_or_panic(
+                jit_module,
+                &mut fb.func,
+                &DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT,
+            )
+        });
         let raise_deleted_name_error_ref = func_imports.get_or_panic(
             jit_module,
             &mut fb.func,
@@ -12415,10 +12420,10 @@ fn build_cranelift_run_bb_specialized_function(
                     block_const,
                 },
                 load_global_fast_ref,
-                load_global_indexed_ref,
+                probe_global_indexed_ref,
                 load_global_slow_ref,
                 store_global_indexed_ref,
-                load_field_indexed_ref,
+                probe_field_indexed_ref,
                 store_field_indexed_ref,
                 load_runtime_obj_ref,
                 direct_function_context_ref,
@@ -12435,7 +12440,6 @@ fn build_cranelift_run_bb_specialized_function(
                 store_cell_ref,
                 py_call_object_ref,
                 py_call_with_kw_ref,
-                guard_method_type_version_ref,
                 record_top_value_sample_ref,
                 tuple_new_ref,
                 tuple_set_item_ref,

@@ -1,7 +1,8 @@
 use super::{
     ImportSpec, JitEmitCtx, RelocTypeRef, SOAC_RUNTIME_LOAD_GLOBAL_IMPORT,
     SOAC_RUNTIME_STORE_GLOBAL_IMPORT, SigType, codegen_constant_string_value,
-    emit_increment_counter_slot, emit_owned_module_constant_from_parts,
+    emit_exact_type_version_match, emit_increment_counter_slot,
+    emit_owned_module_constant_from_parts,
 };
 use crate::jit::blockpy_intrinsics;
 use crate::operator_specialization::{
@@ -448,11 +449,9 @@ fn emit_specialized_getattr<'fb>(
     let arg_values = state.emit_arg_values(&[op.value.as_ref(), op.attr.as_ref()]);
     let ptr_ty = state.ctx().consts.ptr_ty;
     let i64_ty = state.ctx().consts.i64_ty;
-    let i32_ty = state.ctx().consts.i32_ty;
     let null_ptr = state.fb().ins().iconst(ptr_ty, 0);
-    let zero_i32 = state.fb().ins().iconst(i32_ty, 0);
-    let load_field_indexed_ref = state.ctx().load_field_indexed_ref;
-    let guard_type_version_ref = state.ctx().guard_method_type_version_ref;
+    let probe_field_indexed_ref = state.ctx().probe_field_indexed_ref;
+    let incref_ref = state.ctx().incref_ref;
     let hit_counter_id = state
         .ctx()
         .field_indexed_hit_counter_ids
@@ -479,24 +478,16 @@ fn emit_specialized_getattr<'fb>(
         } else {
             state.fb().create_block()
         };
-        let expected_version = state
-            .fb()
-            .ins()
-            .iconst(i64_ty, i64::from(specialization.type_version));
         let expected_index = state
             .fb()
             .ins()
             .iconst(i64_ty, i64::from(specialization.expected_index));
-        let guard_inst = state.fb().ins().call(
-            guard_type_version_ref,
-            &[arg_values[0].0, owner_type, expected_version],
+        let type_matches = emit_exact_type_version_match(
+            state.fb(),
+            arg_values[0].0,
+            owner_type,
+            specialization.type_version,
         );
-        let guard_result = state.fb().inst_results(guard_inst)[0];
-        let type_matches =
-            state
-                .fb()
-                .ins()
-                .icmp(ir::condcodes::IntCC::NotEqual, guard_result, zero_i32);
         state
             .fb()
             .ins()
@@ -504,7 +495,7 @@ fn emit_specialized_getattr<'fb>(
 
         state.fb().switch_to_block(maybe_direct_block);
         let direct_inst = state.fb().ins().call(
-            load_field_indexed_ref,
+            probe_field_indexed_ref,
             &[arg_values[0].0, arg_values[1].0, expected_index],
         );
         let direct_value = state.fb().inst_results(direct_inst)[0];
@@ -523,6 +514,7 @@ fn emit_specialized_getattr<'fb>(
 
         state.fb().switch_to_block(direct_block);
         let direct_value = state.fb().block_params(direct_block)[0];
+        state.fb().ins().call(incref_ref, &[direct_value]);
         increment_counter_with_state(state, hit_counter_id);
         state.release_arg_values(&arg_values);
         state
@@ -597,7 +589,6 @@ fn emit_specialized_setattr<'fb>(
     let i32_ty = state.ctx().consts.i32_ty;
     let zero_i32 = state.fb().ins().iconst(i32_ty, 0);
     let store_field_indexed_ref = state.ctx().store_field_indexed_ref;
-    let guard_type_version_ref = state.ctx().guard_method_type_version_ref;
     let hit_counter_id = state
         .ctx()
         .field_indexed_hit_counter_ids
@@ -623,24 +614,16 @@ fn emit_specialized_setattr<'fb>(
         } else {
             state.fb().create_block()
         };
-        let expected_version = state
-            .fb()
-            .ins()
-            .iconst(i64_ty, i64::from(specialization.type_version));
         let expected_index = state
             .fb()
             .ins()
             .iconst(i64_ty, i64::from(specialization.expected_index));
-        let guard_inst = state.fb().ins().call(
-            guard_type_version_ref,
-            &[arg_values[0].0, owner_type, expected_version],
+        let type_matches = emit_exact_type_version_match(
+            state.fb(),
+            arg_values[0].0,
+            owner_type,
+            specialization.type_version,
         );
-        let guard_result = state.fb().inst_results(guard_inst)[0];
-        let type_matches =
-            state
-                .fb()
-                .ins()
-                .icmp(ir::condcodes::IntCC::NotEqual, guard_result, zero_i32);
         state
             .fb()
             .ins()
@@ -1101,7 +1084,13 @@ fn emit_specialized_binop<'fb>(
                     counter_id.0
                 )
             });
-        let record_top_value_sample_ref = state.ctx().record_top_value_sample_ref;
+        let record_top_value_sample_ref =
+            state.ctx().record_top_value_sample_ref.unwrap_or_else(|| {
+                panic!(
+                    "missing top-value counter helper import for counter id {}",
+                    counter_id.0
+                )
+            });
         super::emit_record_top_value_counter_slot(
             state.fb(),
             top_value_counter_base_value,
@@ -1207,7 +1196,13 @@ fn emit_specialized_unary_op<'fb>(
                     counter_id.0
                 )
             });
-        let record_top_value_sample_ref = state.ctx().record_top_value_sample_ref;
+        let record_top_value_sample_ref =
+            state.ctx().record_top_value_sample_ref.unwrap_or_else(|| {
+                panic!(
+                    "missing top-value counter helper import for counter id {}",
+                    counter_id.0
+                )
+            });
         super::emit_record_top_value_counter_slot(
             state.fb(),
             top_value_counter_base_value,
@@ -1299,9 +1294,10 @@ fn emit_indexed_global_load_with_state<'fb>(
 ) -> ir::Value {
     let ptr_ty = state.ctx().consts.ptr_ty;
     let null_ptr = state.fb().ins().iconst(ptr_ty, 0);
-    let load_global_indexed_ref = state.ctx().load_global_indexed_ref;
+    let probe_global_indexed_ref = state.ctx().probe_global_indexed_ref;
     let load_global_slow_ref = state.ctx().load_global_slow_ref;
     let decref_ref = state.ctx().decref_ref;
+    let incref_ref = state.ctx().incref_ref;
     let thread_state_value = state.ctx().consts.thread_state_value;
     let hit_counter_id = state
         .ctx()
@@ -1320,7 +1316,7 @@ fn emit_indexed_global_load_with_state<'fb>(
     state.fb().append_block_param(direct_block, ptr_ty);
 
     let direct_inst = state.fb().ins().call(
-        load_global_indexed_ref,
+        probe_global_indexed_ref,
         &[globals_obj, name_obj, slot_index],
     );
     let direct_value = state.fb().inst_results(direct_inst)[0];
@@ -1338,6 +1334,7 @@ fn emit_indexed_global_load_with_state<'fb>(
 
     state.fb().switch_to_block(direct_block);
     let direct_value = state.fb().block_params(direct_block)[0];
+    state.fb().ins().call(incref_ref, &[direct_value]);
     increment_counter_with_state(state, hit_counter_id);
     state
         .fb()

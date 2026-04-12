@@ -5,6 +5,20 @@ optimization attempts made by Codex agents. Keep entries succinct: what
 changed or was tried, which jj change id carried it when landed, the
 benchmarked throughput delta, and the headline pre/post numbers.
 
+## 2026-04-12 - Remove apply-mode specialization counters
+
+- jj change id: `olrnwpvz`
+- summary: Apply mode no longer lowers specialization profiling counters,
+  no longer emits `dp_jit_record_top_value_sample`, and no longer logs
+  specialization-runtime counter rows just because `SOAC_WORK_DIR` or
+  `SOAC_LOG` is set. Profile and verify still record the same
+  specialization set; only steady-state apply overhead changed.
+- throughput: `+22.74%` specialized pystone median
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `184066`, `187351`, `182357 loops/s`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `221766`, `225928`, `228347 loops/s`
+
 ## 2026-04-11 - Disable profiled cold-block hints by default
 
 - jj change id: `lwnxlmrx`

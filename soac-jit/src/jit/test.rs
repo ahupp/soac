@@ -18,6 +18,7 @@ mod tests {
         CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey, CounterDumpTypeKeyLayout,
         CounterDumpTypeTableEntry, write_counter_dump_records,
     };
+    use cranelift_codegen::cursor::Cursor;
     use pyo3::types::{PyAnyMethods, PyDictMethods, PyModule};
     use pyo3::{Python, ffi};
     use ruff_python_ast as ast;
@@ -2758,6 +2759,248 @@ def write_point(point, value):
         }
     }
 
+    #[test]
+    fn field_index_specialized_getattr_hits_apply_mode_fast_path() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "field_index_specialized_getattr_hits_apply_mode_fast_path",
+        ) {
+            return;
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
+        let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
+        let soac_work_dir = fresh_test_work_dir("test-work");
+        unsafe {
+            std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
+            std::env::set_var("SOAC_OPT_MODE", "apply");
+        }
+        crate::initialize_test_python();
+
+        Python::attach(|py| {
+            let owner_module = PyModule::from_code(
+                py,
+                c"
+class Point:
+    pass
+",
+                c"field_type_test.py",
+                c"field_type_test",
+            )
+            .expect("owner module should execute");
+            let sys = PyModule::import(py, "sys").expect("sys should import");
+            let modules = sys
+                .getattr("modules")
+                .expect("sys.modules should exist")
+                .cast_into::<pyo3::types::PyDict>()
+                .expect("sys.modules should be a dict");
+            modules
+                .set_item("field_type_test", owner_module.as_any())
+                .expect("owner module should be registered");
+
+            write_test_counter_dump(
+                soac_work_dir.join("profile.bin").as_path(),
+                &CounterDumpRecord {
+                    module_name: "counter_test".to_string(),
+                    package_name: None,
+                    rows: Vec::new(),
+                    module_keys: Vec::new(),
+                    type_keys: vec![CounterDumpTypeKeyLayout {
+                        owner_type_id: 7,
+                        key: "x".to_string(),
+                        index: 0,
+                    }],
+                    type_table: vec![CounterDumpTypeTableEntry {
+                        type_id: 7,
+                        key: CounterDumpTypeKey {
+                            module_name: "field_type_test".to_string(),
+                            qualname: "Point".to_string(),
+                        },
+                    }],
+                },
+            );
+
+            let mut lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+                r#"
+def read_point(point):
+    return point.x
+"#,
+            )
+            .expect("lowering should succeed")
+            .codegen_module;
+            instrument_bb_module_with_call_target_counters(&mut lowered);
+            let function = lowered
+                .callable_defs
+                .iter()
+                .find(|function| function.names.bind_name == "read_point")
+                .expect("missing lowered function read_point")
+                .clone();
+            let getattr_instr_id = function
+                .blocks
+                .iter()
+                .find_map(|block| {
+                    block
+                        .body
+                        .iter()
+                        .find_map(|expr| match expr {
+                            InstrCodegen::GetAttr(_) => Some(expr.semantic_instr_id()),
+                            _ => None,
+                        })
+                        .or_else(|| match &block.term {
+                            BlockTerm::Return(InstrCodegen::GetAttr(expr)) => {
+                                Some(expr.semantic_instr_id())
+                            }
+                            _ => None,
+                        })
+                })
+                .expect("read_point should contain a GetAttr");
+            let field_counter_sites = lowered
+                .counter_defs
+                .iter()
+                .filter_map(|counter| match &counter.site {
+                    CounterSite::Runtime {
+                        function_id: Some(counter_function_id),
+                        instr_id: Some(counter_instr_id),
+                    } if *counter_function_id == function.function_id
+                        && counter.kind.starts_with("field_indexed") =>
+                    {
+                        Some(format!("{}@{:?}", counter.kind, counter_instr_id))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let hit_counter_id = lowered
+                .counter_defs
+                .iter()
+                .find_map(|counter| match &counter.site {
+                    CounterSite::Runtime {
+                        function_id: Some(counter_function_id),
+                        instr_id: Some(counter_instr_id),
+                    } if counter.kind == "field_indexed_hit"
+                        && *counter_function_id == function.function_id
+                        && *counter_instr_id == getattr_instr_id =>
+                    {
+                        Some(counter.id)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing field_indexed_hit counter for GetAttr {:?} in {:?}",
+                        getattr_instr_id, field_counter_sites
+                    )
+                });
+            let fallback_counter_id = lowered
+                .counter_defs
+                .iter()
+                .find_map(|counter| match &counter.site {
+                    CounterSite::Runtime {
+                        function_id: Some(counter_function_id),
+                        instr_id: Some(counter_instr_id),
+                    } if counter.kind == "field_indexed_fallback"
+                        && *counter_function_id == function.function_id
+                        && *counter_instr_id == getattr_instr_id =>
+                    {
+                        Some(counter.id)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing field_indexed_fallback counter for GetAttr {:?} in {:?}",
+                        getattr_instr_id, field_counter_sites
+                    )
+                });
+
+            let shared_state =
+                crate::module_type::build_shared_state_for_testing(py, lowered, "counter_test", "")
+                    .expect("shared state should build");
+            let runtime = unsafe { build_test_module_runtime(py, shared_state.clone()) };
+            let module_constant_ptrs = shared_state.module_constant_ptrs();
+            let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
+            let compile_session = crate::session::CompileSession::process();
+            let compiled_handle = unsafe {
+                compile_cranelift_run_bb_specialized_cached(
+                    &compile_session,
+                    &blocks,
+                    &shared_state.lowered_module,
+                    &function,
+                    &shared_state.codegen_constants,
+                    &shared_state.lowered_module.counter_defs,
+                    &module_constant_ptrs,
+                    Some(shared_state.as_ref()),
+                )
+            }
+            .expect("specialized read_point should compile");
+            let (code_ptr, param_count) = compiled_handle
+                .handle
+                .direct_runner_info()
+                .expect("compiled direct runner should expose entrypoint");
+            assert_eq!(param_count, 1, "read_point should take one direct arg");
+            let entry: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void =
+                unsafe { std::mem::transmute(code_ptr) };
+
+            let point_type = owner_module
+                .getattr("Point")
+                .expect("Point should exist on owner module");
+            let point = unsafe { ffi::PyObject_CallNoArgs(point_type.as_ptr()) };
+            assert!(!point.is_null(), "Point() should create a test instance");
+            let point_obj = unsafe { pyo3::Bound::from_borrowed_ptr(py, point) };
+            point_obj
+                .setattr("x", 98_765_i64)
+                .expect("Point instance should accept x");
+
+            let mut function_context = test_function_jit_context(&runtime, std::ptr::null_mut());
+            let thread_state = unsafe { ffi::PyThreadState_Get() }.cast::<c_void>();
+            let result = unsafe {
+                entry(
+                    std::ptr::addr_of_mut!(function_context).cast(),
+                    thread_state,
+                    point.cast(),
+                )
+            };
+            assert!(
+                !result.is_null(),
+                "read_point should return the stored value"
+            );
+
+            assert_eq!(
+                shared_state.counter_value(hit_counter_id),
+                1,
+                "apply-mode GetAttr should take the indexed-load fast path"
+            );
+            assert_eq!(
+                shared_state.counter_value(fallback_counter_id),
+                0,
+                "apply-mode GetAttr should avoid the generic getattr fallback"
+            );
+
+            let result_obj = unsafe { pyo3::Bound::from_owned_ptr(py, result.cast()) };
+            assert_eq!(
+                result_obj
+                    .extract::<i64>()
+                    .expect("read_point result should be an int"),
+                98_765
+            );
+
+            unsafe { ffi::Py_DECREF(point) };
+            modules
+                .del_item("field_type_test")
+                .expect("owner module should be removed");
+        });
+
+        unsafe {
+            match old_soac_work_dir {
+                Some(value) => std::env::set_var("SOAC_WORK_DIR", value),
+                None => std::env::remove_var("SOAC_WORK_DIR"),
+            }
+            match old_soac_opt_mode {
+                Some(value) => std::env::set_var("SOAC_OPT_MODE", value),
+                None => std::env::remove_var("SOAC_OPT_MODE"),
+            }
+        }
+    }
+
     fn render_test_jit_function_with_constants(
         module: &BlockPyModule<CodegenModuleShape>,
         function: &BlockPyFunction<CodegenModuleShape>,
@@ -3051,6 +3294,106 @@ def write_point(point, value):
         count
     }
 
+    fn parsed_runtime_clif_function(symbol: &str) -> ParsedRuntimeClifFunction {
+        parse_runtime_clif_functions()
+            .expect("runtime CLIF should parse")
+            .into_iter()
+            .find(|function| function.symbol == symbol)
+            .unwrap_or_else(|| panic!("missing parsed runtime CLIF function for {symbol}"))
+    }
+
+    fn single_direct_call_callee_name(function: &ir::Function) -> ir::UserExternalName {
+        let mut found = None;
+        for block in function.layout.blocks() {
+            for inst in function.layout.block_insts(block) {
+                let callee = match function.dfg.insts[inst] {
+                    ir::InstructionData::Call { func_ref, .. }
+                    | ir::InstructionData::TryCall { func_ref, .. } => Some(func_ref),
+                    _ => None,
+                };
+                let Some(callee) = callee else {
+                    continue;
+                };
+                let ext_func = &function.dfg.ext_funcs[callee];
+                let ir::ExternalName::User(name_ref) = &ext_func.name else {
+                    continue;
+                };
+                let user_name = function.params.user_named_funcs()[*name_ref].clone();
+                match &found {
+                    None => found = Some(user_name),
+                    Some(previous) if *previous == user_name => {}
+                    Some(previous) => {
+                        panic!("expected one direct call callee, found {previous} and {user_name}")
+                    }
+                }
+            }
+        }
+        found.expect("expected the example function to contain one direct call")
+    }
+
+    fn specialize_runtime_i64_call_to_constant(
+        function: &ir::Function,
+        callee_name: &ir::UserExternalName,
+        known_value: i64,
+    ) -> ir::Function {
+        let mut specialized = function.clone();
+        let mut cursor = cranelift_codegen::cursor::FuncCursor::new(&mut specialized);
+        let mut replaced_calls = 0usize;
+
+        while let Some(_block) = cursor.next_block() {
+            while let Some(inst) = cursor.next_inst() {
+                let func_ref = match cursor.func.dfg.insts[inst] {
+                    ir::InstructionData::Call {
+                        opcode: ir::Opcode::Call,
+                        func_ref,
+                        ..
+                    } => func_ref,
+                    _ => continue,
+                };
+                let ext_func = &cursor.func.dfg.ext_funcs[func_ref];
+                let ir::ExternalName::User(name_ref) = ext_func.name else {
+                    continue;
+                };
+                if &cursor.func.params.user_named_funcs()[name_ref] != callee_name {
+                    continue;
+                }
+                let [result] = cursor.func.dfg.inst_results(inst) else {
+                    panic!("example specialization expects a single-result call");
+                };
+                let result_ty = cursor.func.dfg.value_type(*result);
+                assert_eq!(
+                    result_ty,
+                    ir::types::I64,
+                    "example specialization expects an i64 call result"
+                );
+                cursor.func.dfg.replace(inst).iconst(result_ty, known_value);
+                replaced_calls += 1;
+            }
+        }
+
+        assert_eq!(
+            replaced_calls, 1,
+            "example specialization should replace exactly one helper call"
+        );
+        specialized
+    }
+
+    fn optimize_test_ir_function(function: ir::Function) -> ir::Function {
+        let mut flag_builder = cranelift_codegen::settings::builder();
+        flag_builder
+            .set("opt_level", "speed")
+            .expect("test ISA should accept opt_level");
+        let isa_builder = cranelift_native::builder().expect("test ISA builder should construct");
+        let isa = isa_builder
+            .finish(cranelift_codegen::settings::Flags::new(flag_builder))
+            .expect("test ISA should finish");
+        let mut ctx = cranelift_codegen::Context::for_function(function);
+        let mut ctrl_plane = cranelift_control::ControlPlane::default();
+        ctx.optimize(isa.as_ref(), &mut ctrl_plane)
+            .expect("test IR function should optimize");
+        ctx.func
+    }
+
     fn function_contains_iconst_imm(function: &ir::Function, expected_imm: i64) -> bool {
         function.layout.blocks().any(|block| {
             function.layout.block_insts(block).any(|inst| {
@@ -3105,6 +3448,13 @@ def write_point(point, value):
                     .then(|| ir::UserExternalName::new(0, *import_id))
             })
             .collect()
+    }
+
+    fn imported_symbol_names(built: &BuiltSpecializedFunction) -> Vec<&'static str> {
+        let mut symbols: Vec<&'static str> = built.import_id_to_symbol.values().copied().collect();
+        symbols.sort_unstable();
+        symbols.dedup();
+        symbols
     }
 
     unsafe fn build_runtime_refcount_smoke_context() -> (
@@ -3495,6 +3845,60 @@ def write_point(point, value):
         assert_eq!(
             after, 0,
             "runtime support inliner should remove direct incref/decref calls from the caller"
+        );
+    }
+
+    #[test]
+    fn runtime_clif_example_can_specialize_known_value_call_to_constant() {
+        let source = parsed_runtime_clif_function("soac_runtime_example_known_value_source");
+        assert!(
+            source.function.dfg.num_insts() > 0,
+            "example source helper should load from soac-runtime CLIF as an ir::Function"
+        );
+        let parsed = parsed_runtime_clif_function("soac_runtime_example_offset_known_value");
+        let callee_name = single_direct_call_callee_name(&parsed.function);
+
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(
+                &parsed.function,
+                std::slice::from_ref(&callee_name)
+            ),
+            1,
+            "loaded runtime CLIF example should start with one helper call"
+        );
+        assert!(
+            function_contains_iconst_imm(&parsed.function, 5),
+            "loaded runtime CLIF example should preserve the fixed offset constant"
+        );
+
+        let specialized_true =
+            specialize_runtime_i64_call_to_constant(&parsed.function, &callee_name, 7);
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(
+                &specialized_true,
+                std::slice::from_ref(&callee_name)
+            ),
+            0,
+            "known-value specialization should remove the helper call from the cloned IR"
+        );
+        assert!(
+            function_contains_iconst_imm(&specialized_true, 7),
+            "specialized clone should materialize the known helper result as an iconst"
+        );
+        let specialized_true = optimize_test_ir_function(specialized_true);
+        assert!(
+            function_contains_iconst_imm(&specialized_true, 12),
+            "optimizing the specialized seven clone should fold the helper result plus offset:\n{}",
+            specialized_true.display()
+        );
+
+        let specialized_false =
+            specialize_runtime_i64_call_to_constant(&parsed.function, &callee_name, 9);
+        let specialized_false = optimize_test_ir_function(specialized_false);
+        assert!(
+            function_contains_iconst_imm(&specialized_false, 14),
+            "optimizing the specialized nine clone should fold the helper result plus offset:\n{}",
+            specialized_false.display()
         );
     }
 
@@ -4262,6 +4666,48 @@ def f(x):
         assert!(
             count_symbolic_global_values(&built.ctx.func) > baseline_symbolic_globals,
             "exact-int unary specialization should add a symbolic global for the profiled type guard",
+        );
+    }
+
+    #[test]
+    fn apply_mode_operator_specialization_omits_top_value_counter_helper_imports() {
+        let blocks = [1usize as ObjPtr];
+        let mut constants = TestConstantPool::default();
+        let mut function = test_function();
+        let block_label = function.name_gen.next_block_name();
+        let instr_id = InstrId::new(block_label, 0);
+        function.blocks = vec![CodegenBlock {
+            label: block_label,
+            body: vec![],
+            term: ret_term(with_instr_id(
+                op_expr(BinOp::new(
+                    BinOpKind::Add,
+                    constants.int_expr(1),
+                    constants.int_expr(2),
+                )),
+                instr_id,
+            )),
+            params: vec![],
+            exc_edge: None,
+        }];
+
+        let (_jit_module, built) = build_test_jit_function_with_operator_specializations(
+            &function,
+            &blocks,
+            constants.module_constants,
+            &[(
+                instr_id,
+                crate::operator_specialization::pack_binary_shape(
+                    crate::operator_specialization::ExactTypeTag::Int,
+                    crate::operator_specialization::ExactTypeTag::Int,
+                ),
+            )],
+        );
+        let imported_symbols = imported_symbol_names(&built);
+        assert!(
+            !imported_symbols.contains(&DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT.symbol),
+            "apply-mode specialization should not import top-value counter helpers: {:?}",
+            imported_symbols
         );
     }
 

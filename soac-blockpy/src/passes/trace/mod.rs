@@ -47,7 +47,7 @@ pub fn specialization_runtime_logging_enabled() -> bool {
 
 fn specialization_mode_instruments_top_values() -> bool {
     let mode = env::var("SOAC_OPT_MODE").unwrap_or_default();
-    matches!(mode.trim(), "profile" | "verify") || specialization_runtime_logging_enabled()
+    matches!(mode.trim(), "profile" | "verify")
 }
 
 pub(crate) fn parse_trace_config(raw: &str) -> Option<TraceConfig> {

@@ -281,7 +281,7 @@ def test_soac_work_dir_is_default_event_log_dir(tmp_path):
     )
 
 
-def test_apply_mode_specialization_runtime_logs_indexed_hits(
+def test_apply_mode_does_not_emit_specialization_runtime_counter_logs(
     profiled_specialization_runtime_case,
 ):
     log_path = profiled_specialization_runtime_case["base_dir"] / "apply-events.jsonl"
@@ -303,26 +303,10 @@ def test_apply_mode_specialization_runtime_logs_indexed_hits(
         if row.get("event") == "soac.specialization_runtime"
         and row["module_name"].endswith("specialization_runtime_case")
     ]
-    assert any(
-        row["kind"] == "global_indexed_hit"
-        and row["function_qualname"] == "run"
-        and row["value"] > 0
-        for row in runtime_rows
-    ), runtime_rows
-    assert any(
-        row["kind"] == "field_indexed_hit"
-        and row["function_qualname"] == "run"
-        and row["value"] > 0
-        for row in runtime_rows
-    ), runtime_rows
-    assert not any(
-        row["kind"] in {"global_indexed_fallback", "field_indexed_fallback"}
-        and row["value"] > 0
-        for row in runtime_rows
-    ), runtime_rows
+    assert not runtime_rows, runtime_rows
 
 
-def test_apply_mode_default_event_log_includes_specialization_runtime(
+def test_apply_mode_default_event_log_omits_specialization_runtime_counters(
     profiled_specialization_runtime_case,
 ):
     log_path = profiled_specialization_runtime_case["work_dir"] / "events.jsonl"
@@ -343,23 +327,7 @@ def test_apply_mode_default_event_log_includes_specialization_runtime(
         if row.get("event") == "soac.specialization_runtime"
         and row["module_name"].endswith("specialization_runtime_case")
     ]
-    assert any(
-        row["kind"] == "global_indexed_hit"
-        and row["function_qualname"] == "run"
-        and row["value"] > 0
-        for row in runtime_rows
-    ), runtime_rows
-    assert any(
-        row["kind"] == "field_indexed_hit"
-        and row["function_qualname"] == "run"
-        and row["value"] > 0
-        for row in runtime_rows
-    ), runtime_rows
-    assert not any(
-        row["kind"] in {"global_indexed_fallback", "field_indexed_fallback"}
-        and row["value"] > 0
-        for row in runtime_rows
-    ), runtime_rows
+    assert not runtime_rows, runtime_rows
 
 
 def test_cross_module_field_profile_uses_type_id_table(tmp_path):
