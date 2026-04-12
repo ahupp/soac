@@ -69,6 +69,12 @@ because it should affect engineering decisions:
    `RawPy*` prefix, and keep casts clustered at ABI boundaries so direct
    layout access remains obvious in review.
 
+9. Treat generator and coroutine closure bindings like ordinary closure
+   bindings. If a cleanup, ownership, or specialization path is unsound for
+   generator runtime cells, make the ownership state explicit or use a more
+   precise key; do not add broad generator/module exclusions that hide the
+   binding model.
+
 ## THE DEVELOPMENT LOOP
 
 When I submit a request, if it's a simple, fully-specific or

@@ -4171,11 +4171,10 @@ impl LocalFailureCleanupKey {
         cleanup_values: &[LocalFailureCleanupValue],
         forwarded_values: &[ir::Value],
         continuation: PendingLocalFailureContinuation,
-        share_cleanup_null_by_locals: bool,
     ) -> LocalFailureCleanupKey {
         match continuation {
             PendingLocalFailureContinuation::CleanupNull(cleanup_null_block)
-                if share_cleanup_null_by_locals && forwarded_values.is_empty() =>
+                if forwarded_values.is_empty() =>
             {
                 LocalFailureCleanupKey::CleanupNullLocals {
                     cleanup_keys: cleanup_values
@@ -10100,7 +10099,6 @@ fn local_failure_cleanup_emit_ctx<'mc>(
     cleanup_null_block: ir::Block,
     pending_local_failure_cleanups: &mut Vec<PendingLocalFailureCleanup>,
     local_failure_cleanup_blocks: &mut HashMap<LocalFailureCleanupKey, ir::Block>,
-    share_cleanup_null_by_locals: bool,
 ) -> Result<Option<JitEmitCtx<'mc>>, String> {
     if !emit_ctx.consts.step_null_args.is_empty() {
         return Ok(None);
@@ -10141,7 +10139,6 @@ fn local_failure_cleanup_emit_ctx<'mc>(
         cleanup_entries.as_slice(),
         forwarded_values.as_slice(),
         continuation,
-        share_cleanup_null_by_locals,
     );
     let cleanup_block = if let Some(cleanup_block) = local_failure_cleanup_blocks.get(&key).copied()
     {
@@ -10178,7 +10175,6 @@ fn emit_typed_codegen_ops(
     cleanup_null_block: ir::Block,
     pending_local_failure_cleanups: &mut Vec<PendingLocalFailureCleanup>,
     local_failure_cleanup_blocks: &mut HashMap<LocalFailureCleanupKey, ir::Block>,
-    share_cleanup_null_by_locals: bool,
     jit_module: &mut JITModule,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<(), String> {
@@ -10190,7 +10186,6 @@ fn emit_typed_codegen_ops(
             cleanup_null_block,
             pending_local_failure_cleanups,
             local_failure_cleanup_blocks,
-            share_cleanup_null_by_locals,
         )?;
         let stmt_emit_ctx = stmt_emit_ctx.as_ref().unwrap_or(emit_ctx);
         let result = emit_typed_codegen_stmt_result_with_local_env(
@@ -13173,20 +13168,6 @@ fn build_cranelift_run_bb_specialized_function(
         let mut exception_dispatch_blocks: Vec<Option<ir::Block>> = vec![None; exec_blocks.len()];
         let mut pending_local_failure_cleanups = Vec::new();
         let mut local_failure_cleanup_blocks = HashMap::new();
-        let module_has_generator_runtime_cells = module.callable_defs.iter().any(|function| {
-            function
-                .storage_layout()
-                .as_ref()
-                .is_some_and(|layout| !layout.runtime_cells.is_empty())
-        });
-        // Generator/coroutine modules have cleanup paths that can own objects indirectly through
-        // runtime cells and wrapper functions. Keep those exact until that ownership model is less
-        // implicit; the local-key sharing below is intended for ordinary function locals.
-        let share_cleanup_null_by_locals = function
-            .storage_layout()
-            .as_ref()
-            .is_none_or(|layout| layout.runtime_cells.is_empty())
-            && !module_has_generator_runtime_cells;
         for (index, maybe_dispatch) in exc_dispatches.iter().enumerate() {
             if let Some(dispatch_plan) = maybe_dispatch {
                 let dispatch_block = fb.create_block();
@@ -13356,7 +13337,6 @@ fn build_cranelift_run_bb_specialized_function(
                 cleanup_null_blocks[index],
                 &mut pending_local_failure_cleanups,
                 &mut local_failure_cleanup_blocks,
-                share_cleanup_null_by_locals,
                 jit_module,
                 &mut func_imports,
             )?;
@@ -13368,7 +13348,6 @@ fn build_cranelift_run_bb_specialized_function(
                 cleanup_null_blocks[index],
                 &mut pending_local_failure_cleanups,
                 &mut local_failure_cleanup_blocks,
-                share_cleanup_null_by_locals,
             )?;
             let term_emit_ctx = term_emit_ctx.as_ref().unwrap_or(&emit_ctx);
             emit_typed_codegen_term(

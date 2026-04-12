@@ -461,8 +461,8 @@ benchmarked throughput delta, and the headline pre/post numbers.
 - jj change id: `onzmnylr`
 - summary: Cleanup-null failure paths now share cleanup blocks when they release
   the same ordered logical locals, while passing the current SSA values as
-  block params. Generator/coroutine modules stay on exact cleanup keys until
-  their runtime-cell ownership paths are less implicit.
+  block params. Generator/coroutine closure bindings use the same logical-local
+  cleanup key as ordinary closure bindings.
 - throughput: `-1.65%` specialized pystone median; code size `-9.79%`;
   machine blocks `-7.96%`
 - pre-change benchmark:
