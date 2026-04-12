@@ -910,6 +910,42 @@ def f():
     }
 
     #[test]
+    fn typed_result_demand_plan_marks_intrinsic_inputs_pyobject_borrowed_ok() {
+        let mut constants = TestConstantPool::default();
+        let binop_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+        let left_instr_id = InstrId::new(BlockLabel::from_index(0), 1);
+        let right_instr_id = InstrId::new(BlockLabel::from_index(0), 2);
+        let binop = with_instr_id(
+            op_expr(BinOp::new(
+                BinOpKind::Add,
+                Box::new(with_instr_id(constants.int_expr(1), left_instr_id)),
+                Box::new(with_instr_id(constants.int_expr(2), right_instr_id)),
+            )),
+            binop_instr_id,
+        );
+        let function = with_single_test_block(
+            test_function(),
+            vec![binop],
+            ret_term(constants.int_expr(3)),
+        );
+        let typed_function = lower_codegen_function_to_typed(function);
+        let plan = plan_typed_result_demands(&typed_function);
+
+        assert_eq!(
+            plan.demand_for_instr_id(binop_instr_id),
+            Some(ResultDemand::EffectOnly)
+        );
+        assert_eq!(
+            plan.demand_for_instr_id(left_instr_id),
+            Some(ResultDemand::PYOBJECT_BORROWED_OK)
+        );
+        assert_eq!(
+            plan.demand_for_instr_id(right_instr_id),
+            Some(ResultDemand::PYOBJECT_BORROWED_OK)
+        );
+    }
+
+    #[test]
     fn typed_result_demand_plan_marks_branch_tests_i32_bool01() {
         let mut constants = TestConstantPool::default();
         let function = test_function();

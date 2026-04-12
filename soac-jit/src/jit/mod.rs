@@ -2067,18 +2067,31 @@ fn insert_call_arg_input_demands(
 ) {
     for arg in args {
         let value = arg.expr();
-        plan.insert_instr(value, ResultDemand::PYOBJECT_BORROWED_OK);
-        insert_typed_child_demands(plan, value);
+        insert_pyobject_borrowed_input_demand(plan, value);
     }
     for keyword in keywords {
         let value = keyword.expr();
-        plan.insert_instr(value, ResultDemand::PYOBJECT_BORROWED_OK);
-        insert_typed_child_demands(plan, value);
+        insert_pyobject_borrowed_input_demand(plan, value);
     }
+}
+
+fn insert_pyobject_borrowed_input_demand(plan: &mut ResultDemandPlan, expr: &InstrTyped) {
+    plan.insert_instr(expr, ResultDemand::PYOBJECT_BORROWED_OK);
+    insert_typed_child_demands(plan, expr);
 }
 
 fn insert_typed_child_demands(plan: &mut ResultDemandPlan, expr: &InstrTyped) {
     match expr {
+        InstrTyped::BinOp(op) => {
+            insert_pyobject_borrowed_input_demand(plan, op.left.as_ref());
+            insert_pyobject_borrowed_input_demand(plan, op.right.as_ref());
+        }
+        InstrTyped::LegacyUnaryOp(op) => {
+            insert_pyobject_borrowed_input_demand(plan, op.operand.as_ref());
+        }
+        InstrTyped::LegacyCalleeFunctionId(op) => {
+            insert_pyobject_borrowed_input_demand(plan, op.value.as_ref());
+        }
         InstrTyped::LegacyStore(store) => {
             plan.insert_instr(store.value.as_ref(), ResultDemand::PYOBJECT_OWNED);
             insert_typed_child_demands(plan, store.value.as_ref());
@@ -2092,6 +2105,28 @@ fn insert_typed_child_demands(plan: &mut ResultDemandPlan, expr: &InstrTyped) {
             plan.insert_instr(call.callable.as_ref(), ResultDemand::PYOBJECT_BORROWED_OK);
             insert_typed_child_demands(plan, call.callable.as_ref());
             insert_call_arg_input_demands(plan, call.args.as_slice(), call.keywords.as_slice());
+        }
+        InstrTyped::LegacyGetAttr(op) => {
+            insert_pyobject_borrowed_input_demand(plan, op.value.as_ref());
+            insert_pyobject_borrowed_input_demand(plan, op.attr.as_ref());
+        }
+        InstrTyped::LegacySetAttr(op) => {
+            insert_pyobject_borrowed_input_demand(plan, op.value.as_ref());
+            insert_pyobject_borrowed_input_demand(plan, op.attr.as_ref());
+            insert_pyobject_borrowed_input_demand(plan, op.replacement.as_ref());
+        }
+        InstrTyped::LegacyGetItem(op) => {
+            insert_pyobject_borrowed_input_demand(plan, op.value.as_ref());
+            insert_pyobject_borrowed_input_demand(plan, op.index.as_ref());
+        }
+        InstrTyped::LegacySetItem(op) => {
+            insert_pyobject_borrowed_input_demand(plan, op.value.as_ref());
+            insert_pyobject_borrowed_input_demand(plan, op.index.as_ref());
+            insert_pyobject_borrowed_input_demand(plan, op.replacement.as_ref());
+        }
+        InstrTyped::LegacyDelItem(op) => {
+            insert_pyobject_borrowed_input_demand(plan, op.value.as_ref());
+            insert_pyobject_borrowed_input_demand(plan, op.index.as_ref());
         }
         _ => {}
     }
@@ -3678,11 +3713,10 @@ impl<'a, 'b, 'mc, 'c, 'd> intrinsics::OperationEmitState<'b, InstrCodegen>
     fn emit_arg_values(&mut self, args: &[&InstrCodegen]) -> Vec<(ir::Value, bool)> {
         let mut arg_values = Vec::with_capacity(args.len());
         for arg in args {
-            let borrowed_arg = codegen_expr_is_borrowable_from_local_env(
+            let borrowed_arg = codegen_expr_pyobject_input_is_borrowed_from_local_env(
                 arg,
                 &*self.local_env,
-                &self.ctx.stack_slots,
-                self.ctx.storage_layout.as_ref(),
+                self.ctx,
             );
             let value = emit_codegen_expr_with_local_env(
                 self.fb,
@@ -5437,11 +5471,10 @@ fn emit_branch_index_i64(
 ) -> ir::Value {
     match expr {
         InstrCodegen::CalleeFunctionId(op) => {
-            let callable_is_borrowed = codegen_expr_is_borrowable_from_local_env(
+            let callable_is_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
                 op.value.as_ref(),
                 local_env,
-                &ctx.stack_slots,
-                ctx.storage_layout.as_ref(),
+                ctx,
             );
             let callable = emit_codegen_expr_with_local_env(
                 fb,
@@ -8645,11 +8678,10 @@ fn emit_codegen_expr_with_local_env(
             !borrowed,
             "callee_function_id must not request a borrowed result"
         );
-        let callable_is_borrowed = codegen_expr_is_borrowable_from_local_env(
+        let callable_is_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
             op.value.as_ref(),
             local_env,
-            &emit_ctx.stack_slots,
-            emit_ctx.storage_layout.as_ref(),
+            emit_ctx,
         );
         let callable = emit_codegen_expr_with_local_env(
             fb,

@@ -156,7 +156,9 @@ emission consumes that demand before entering the shared raise path. Generic and
 direct call callable/argument inputs are now planned as borrowed-ok `PyObject`
 demands. Generic/direct call emitters now consult those planned demands before
 requesting borrowed inputs, while still using local borrowability as the
-producer capability check.
+producer capability check. Operator/intrinsic inputs are now also planned as
+borrowed-ok `PyObject` demands and intrinsic argument emission consumes that same
+helper path.
 
 1. Add `ResultDemand::{EffectOnly, PyObject { borrowed_ok }}` and an `EmitResult`
    wrapper near the existing `SoacValue`/LocalEnv codegen types.
@@ -177,7 +179,9 @@ producer capability check.
    exception values are planned as owned `PyObject` demand for the typed raise
    path. Generic and direct call inputs are planned as borrowed-ok `PyObject`
    demand and the generic/direct call emitters consume those demands through a
-   shared call-input borrow helper.
+   shared call-input borrow helper. Operator/intrinsic inputs are planned as
+   borrowed-ok `PyObject` demand and intrinsic argument emission consumes that
+   same helper path.
 7. Extend demand to `I32Bool01` and `I64Index` once the value-space/refcount
    representation can carry non-Python values cleanly. Started with branch-test
    `I32Bool01` demands and branch-table `I64Index` demands.
