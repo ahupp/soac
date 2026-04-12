@@ -3598,6 +3598,7 @@ impl StackSlots {
 
 fn required_stack_slot_names_for_jit(
     function: &BlockPyFunction<CodegenModuleShape>,
+    refcount_plan: &FunctionRefcountPlan,
     runtime_block_params: &[Vec<RuntimeBlockParamPlan>],
     implicit_target_transports: &[EdgeTransportPlan],
     jump_edge_transports: &[Option<EdgeTransportPlan>],
@@ -3633,6 +3634,27 @@ fn required_stack_slot_names_for_jit(
     for dispatch in exc_dispatches.iter().flatten() {
         for (target_name, _) in &dispatch.slot_writes {
             required.insert(target_name.clone());
+        }
+        for source_name in &dispatch.forwarded_local_names {
+            required.insert(source_name.clone());
+        }
+    }
+
+    for block_plan in refcount_plan.blocks.values() {
+        for action in &block_plan.actions {
+            if let RefcountActionKind::ReleaseLocal { local, reason, .. } = &action.kind {
+                match reason {
+                    RefcountReleaseReason::Return | RefcountReleaseReason::Raise => {}
+                    RefcountReleaseReason::Jump { .. }
+                    | RefcountReleaseReason::IfThen { .. }
+                    | RefcountReleaseReason::IfElse { .. }
+                    | RefcountReleaseReason::BranchCase { .. }
+                    | RefcountReleaseReason::BranchDefault { .. }
+                    | RefcountReleaseReason::ExceptionEdge { .. } => {
+                        required.insert(local.name.clone());
+                    }
+                }
+            }
         }
     }
 
@@ -3925,6 +3947,13 @@ fn emit_raw_block_arg_source_value(
         }
         return Ok(entry.value);
     }
+    if let Some(slot) = ctx.stack_slots.slot_for_block_arg_name(source_name) {
+        let value = fb.ins().stack_load(ctx.consts.ptr_ty, slot, 0);
+        if !borrowed {
+            emit_incref_if_not_null(fb, ctx.consts.ptr_ty, ctx.incref_ref, value);
+        }
+        return Ok(value);
+    }
     Err(LocalEnvEdgePrepError::MissingSourceBinding {
         source_name: source_name.to_string(),
     })
@@ -3946,6 +3975,11 @@ fn emit_forwarded_block_arg_source_value(
         }
         *forwarded_count += 1;
         return Ok((value, Some(value_index)));
+    }
+    if let Some(slot) = ctx.stack_slots.slot_for_block_arg_name(source_name) {
+        let value = fb.ins().stack_load(ctx.consts.ptr_ty, slot, 0);
+        emit_incref_if_not_null(fb, ctx.consts.ptr_ty, ctx.incref_ref, value);
+        return Ok((value, None));
     }
     Err(LocalEnvEdgePrepError::MissingSourceBinding {
         source_name: source_name.to_string(),
@@ -4034,6 +4068,10 @@ fn is_try_exception_alias_name(name: &str) -> bool {
 
 fn is_try_abrupt_kind_name(name: &str) -> bool {
     name.starts_with("_dp_try_abrupt_kind_")
+}
+
+fn is_try_abrupt_payload_name(name: &str) -> bool {
+    name.starts_with("_dp_try_abrupt_payload_")
 }
 
 fn block_arg_values(values: &[ir::Value]) -> Vec<ir::BlockArg> {
@@ -7448,6 +7486,7 @@ fn emit_forward_named_values_from_local_env_with_refcount<'a, I>(
     local_env: &LocalEnv,
     ptr_ty: ir::Type,
     incref_ref: ir::FuncRef,
+    ctx: &JitEmitCtx<'_>,
 ) -> Result<(Vec<ir::Value>, HashSet<LocalLocation>), LocalEnvEdgePrepError>
 where
     I: IntoIterator<Item = &'a str>,
@@ -7471,9 +7510,21 @@ where
             values.push(value);
             continue;
         }
-        return Err(LocalEnvEdgePrepError::MissingSourceBinding {
-            source_name: source_name.to_string(),
-        });
+        if is_try_abrupt_kind_name(source_name) {
+            values.push(emit_owned_module_constant(
+                fb,
+                ctx.module_constants
+                    .require_int_constant_id(abrupt_kind_tag(AbruptKind::Fallthrough)),
+                ctx,
+            ));
+            continue;
+        }
+        if is_try_abrupt_payload_name(source_name) {
+            fb.ins().call(incref_ref, &[ctx.consts.none_const]);
+            values.push(ctx.consts.none_const);
+            continue;
+        }
+        values.push(fb.ins().iconst(ptr_ty, 0));
     }
     Ok((values, forwarded_local_locations))
 }
@@ -7490,6 +7541,7 @@ fn emit_forward_named_values_from_local_env(
         local_env,
         ctx.consts.ptr_ty,
         ctx.incref_ref,
+        ctx,
     )
 }
 
@@ -7650,7 +7702,22 @@ fn emit_pop_handled_exception(
     fb.switch_to_block(done_block);
 }
 
-fn emit_pop_handled_exception_if_leaving<'a, I>(
+fn emit_pop_handled_exception_if_leaving(
+    fb: &mut FunctionBuilder<'_>,
+    current_exception_name: Option<&str>,
+    target_exception_name: Option<&str>,
+    ctx: &JitEmitCtx<'_>,
+) {
+    let Some(exception_name) = current_exception_name else {
+        return;
+    };
+    if target_exception_name == Some(exception_name) {
+        return;
+    }
+    emit_pop_handled_exception(fb, exception_name, ctx);
+}
+
+fn emit_pop_handled_exception_if_not_forwarded<'a, I>(
     fb: &mut FunctionBuilder<'_>,
     current_exception_name: Option<&str>,
     target_params: I,
@@ -7665,6 +7732,13 @@ fn emit_pop_handled_exception_if_leaving<'a, I>(
         return;
     }
     emit_pop_handled_exception(fb, exception_name, ctx);
+}
+
+fn block_exception_name(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    label: BlockLabel,
+) -> Option<&str> {
+    function.blocks[label.index()].exception_param()
 }
 
 fn emit_planned_local_releases_for_reason_with_local_env(
@@ -9443,6 +9517,7 @@ fn emit_codegen_if_target_arm(
     arm_name: &str,
     branch_block: ir::Block,
     target_label: BlockLabel,
+    target_exception_name: Option<&str>,
     release_reason: RefcountReleaseReason,
     current_exception_name: Option<&str>,
     exec_blocks: &[ir::Block],
@@ -9502,10 +9577,7 @@ fn emit_codegen_if_target_arm(
     emit_pop_handled_exception_if_leaving(
         fb,
         current_exception_name,
-        edge_transport
-            .target_args
-            .iter()
-            .map(|(name, _)| name.as_str()),
+        target_exception_name,
         emit_ctx,
     );
     fb.ins().jump(exec_blocks[target_index], &jump_args);
@@ -9521,6 +9593,7 @@ fn emit_codegen_if_truth_i32(
     then_label: BlockLabel,
     else_label: BlockLabel,
     current_exception_name: Option<&str>,
+    function: &BlockPyFunction<CodegenModuleShape>,
     exec_blocks: &[ir::Block],
     implicit_target_transports: &[EdgeTransportPlan],
     local_env: &mut LocalEnv,
@@ -9563,6 +9636,7 @@ fn emit_codegen_if_truth_i32(
         hot_name,
         hot_branch,
         hot_label,
+        block_exception_name(function, hot_label),
         if hot_label == then_label {
             RefcountReleaseReason::IfThen { target: hot_label }
         } else {
@@ -9583,6 +9657,7 @@ fn emit_codegen_if_truth_i32(
         cold_name,
         cold_branch,
         cold_label,
+        block_exception_name(function, cold_label),
         if cold_label == then_label {
             RefcountReleaseReason::IfThen { target: cold_label }
         } else {
@@ -9624,12 +9699,7 @@ fn emit_codegen_return_pyobject(
         emit_ctx.consts.thread_state_value,
         emit_ctx.decref_ref,
     );
-    emit_pop_handled_exception_if_leaving(
-        fb,
-        current_exception_name,
-        std::iter::empty::<&str>(),
-        emit_ctx,
-    );
+    emit_pop_handled_exception_if_leaving(fb, current_exception_name, None, emit_ctx);
     fb.ins().return_(&[ret_value]);
     Ok(())
 }
@@ -9641,6 +9711,7 @@ fn emit_codegen_branch_table_from_i64(
     targets: &[BlockLabel],
     default_label: BlockLabel,
     index_i64: ir::Value,
+    function: &BlockPyFunction<CodegenModuleShape>,
     exec_blocks: &[ir::Block],
     implicit_target_transports: &[EdgeTransportPlan],
     local_env: &mut LocalEnv,
@@ -9733,10 +9804,7 @@ fn emit_codegen_branch_table_from_i64(
         emit_pop_handled_exception_if_leaving(
             fb,
             current_exception_name,
-            edge_transport
-                .target_args
-                .iter()
-                .map(|(name, _)| name.as_str()),
+            block_exception_name(function, *target_label),
             emit_ctx,
         );
         fb.ins().jump(exec_blocks[target_index], &case_jump_args);
@@ -9796,10 +9864,7 @@ fn emit_codegen_branch_table_from_i64(
     emit_pop_handled_exception_if_leaving(
         fb,
         current_exception_name,
-        edge_transport
-            .target_args
-            .iter()
-            .map(|(name, _)| name.as_str()),
+        block_exception_name(function, default_label),
         emit_ctx,
     );
     fb.ins()
@@ -9910,7 +9975,7 @@ fn emit_codegen_raise_exception_from_function(
     let exception_forwarded_names = emit_ctx.exception_forwarded_local_names.unwrap_or(&[]);
 
     fb.switch_to_block(raise_rc_fail);
-    emit_pop_handled_exception_if_leaving(
+    emit_pop_handled_exception_if_not_forwarded(
         fb,
         current_exception_name,
         exception_forwarded_names.iter().map(String::as_str),
@@ -9940,7 +10005,7 @@ fn emit_codegen_raise_exception_from_function(
         emit_ctx.consts.thread_state_value,
         decref_ref,
     );
-    emit_pop_handled_exception_if_leaving(
+    emit_pop_handled_exception_if_not_forwarded(
         fb,
         current_exception_name,
         exception_forwarded_names.iter().map(String::as_str),
@@ -9957,6 +10022,7 @@ fn emit_codegen_term(
     fb: &mut FunctionBuilder<'_>,
     source_label: BlockLabel,
     term: &BlockTerm<InstrCodegen>,
+    function: &BlockPyFunction<CodegenModuleShape>,
     exec_blocks: &[ir::Block],
     jump_edge_transports: &[Option<EdgeTransportPlan>],
     implicit_target_transports: &[EdgeTransportPlan],
@@ -10028,10 +10094,7 @@ fn emit_codegen_term(
             emit_pop_handled_exception_if_leaving(
                 fb,
                 current_exception_name,
-                edge_transport
-                    .target_args
-                    .iter()
-                    .map(|(name, _)| name.as_str()),
+                block_exception_name(function, target_label.target),
                 emit_ctx,
             );
             fb.ins().jump(exec_blocks[target_index], &jump_args);
@@ -10057,6 +10120,7 @@ fn emit_codegen_term(
                 if_term.then_label,
                 if_term.else_label,
                 current_exception_name,
+                function,
                 exec_blocks,
                 implicit_target_transports,
                 local_env,
@@ -10081,6 +10145,7 @@ fn emit_codegen_term(
                 &branch.targets,
                 branch.default_label,
                 index_i64,
+                function,
                 exec_blocks,
                 implicit_target_transports,
                 local_env,
@@ -10147,6 +10212,7 @@ fn emit_typed_codegen_term(
     fb: &mut FunctionBuilder<'_>,
     source_label: BlockLabel,
     term: &BlockTerm<InstrTyped>,
+    function: &BlockPyFunction<CodegenModuleShape>,
     exec_blocks: &[ir::Block],
     jump_edge_transports: &[Option<EdgeTransportPlan>],
     implicit_target_transports: &[EdgeTransportPlan],
@@ -10188,6 +10254,7 @@ fn emit_typed_codegen_term(
             if_term.then_label,
             if_term.else_label,
             current_exception_name,
+            function,
             exec_blocks,
             implicit_target_transports,
             local_env,
@@ -10314,6 +10381,7 @@ fn emit_typed_codegen_term(
             &branch.targets,
             branch.default_label,
             index_i64,
+            function,
             exec_blocks,
             implicit_target_transports,
             local_env,
@@ -10329,6 +10397,7 @@ fn emit_typed_codegen_term(
         fb,
         source_label,
         &legacy_term,
+        function,
         exec_blocks,
         jump_edge_transports,
         implicit_target_transports,
@@ -11990,6 +12059,7 @@ fn build_cranelift_run_bb_specialized_function(
         let raise_exc_direct_block = fb.create_block();
         let required_stack_slot_names = required_stack_slot_names_for_jit(
             function,
+            &refcount_plan,
             &runtime_block_params,
             &implicit_target_transports,
             &jump_edge_transports,
@@ -12587,6 +12657,7 @@ fn build_cranelift_run_bb_specialized_function(
                 &mut fb,
                 codegen_block.label,
                 &typed_function.blocks[index].term,
+                function,
                 &exec_blocks,
                 &jump_edge_transports,
                 &implicit_target_transports,

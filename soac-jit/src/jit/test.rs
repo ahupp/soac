@@ -4364,6 +4364,110 @@ def f():
         );
     }
 
+    #[test]
+    fn specialized_jit_try_finally_return_payload_builds_with_refcount_cleanup() {
+        let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+            r#"
+events = []
+
+def f(mode):
+    try:
+        if mode == "ret":
+            return 10
+        if mode == "raise":
+            raise ValueError("boom")
+        events.append("body")
+    except ValueError:
+        events.append("except")
+    else:
+        events.append("else")
+    finally:
+        events.append("finally")
+    return 20
+"#,
+        )
+        .expect("lowering try/except/else/finally source should succeed")
+        .codegen_module;
+
+        let codegen_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&lowered);
+        let function = lowered
+            .callable_defs
+            .iter()
+            .find(|function| function.names.bind_name == "f")
+            .expect("missing lowered function f")
+            .clone();
+        let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
+        build_test_specialized_function(&blocks, &lowered, &function, &codegen_constants);
+    }
+
+    #[test]
+    fn specialized_jit_with_return_payload_failure_cleanup_forwards_stack_slot() {
+        let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+            r#"
+from pathlib import Path
+
+class Wrapper:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def open(self, mode: str = "r", *, encoding: str = "utf8"):
+        path = self.path
+        return open(path, mode, encoding=encoding)
+
+def write_and_read(path: Path) -> str:
+    wrapper = Wrapper(path)
+    with wrapper.open("w", encoding="utf8") as handle:
+        handle.write("payload")
+    with wrapper.open("r", encoding="utf8") as handle:
+        return handle.read()
+"#,
+        )
+        .expect("lowering method_named_open source should succeed")
+        .codegen_module;
+
+        let codegen_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&lowered);
+        let function = lowered
+            .callable_defs
+            .iter()
+            .find(|function| function.names.bind_name == "write_and_read")
+            .expect("missing lowered function write_and_read")
+            .clone();
+        let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
+        build_test_specialized_function(&blocks, &lowered, &function, &codegen_constants);
+    }
+
+    #[test]
+    fn specialized_jit_except_star_failure_cleanup_forwards_unbound_locals() {
+        let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+            r#"
+def run():
+    global caught
+    ok = False
+    try:
+        raise ExceptionGroup("eg", [ValueError("boom")])
+    except* ValueError as caught:
+        value = caught
+        ok = isinstance(value, ExceptionGroup)
+    return ok
+"#,
+        )
+        .expect("lowering except star source should succeed")
+        .codegen_module;
+
+        let codegen_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&lowered);
+        let function = lowered
+            .callable_defs
+            .iter()
+            .find(|function| function.names.bind_name == "run")
+            .expect("missing lowered function run")
+            .clone();
+        let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
+        build_test_specialized_function(&blocks, &lowered, &function, &codegen_constants);
+    }
+
     fn assert_exception_dispatch_forwards_live_local(
         source: &str,
         source_block_matches: impl Fn(&CodegenBlock) -> bool,
