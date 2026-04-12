@@ -1074,6 +1074,7 @@ benchmark benchmark_loops="1000000" verify_loops="100000" results_root="bench" r
   SPECIALIZED_RUNS="${BENCHMARK_SPECIALIZED_RUNS:-3}"
   RESULTS_ROOT="{{results_root}}"
   RESULT_MODE="{{result_mode}}"
+  CRANELIFT_OPT_LEVEL="${SOAC_CRANELIFT_OPT_LEVEL:-speed}"
   if [[ "$RESULTS_ROOT" != /* ]]; then
     RESULTS_ROOT="$REPO_ROOT/$RESULTS_ROOT"
   fi
@@ -1123,6 +1124,7 @@ benchmark benchmark_loops="1000000" verify_loops="100000" results_root="bench" r
     echo "warmup loops: $WARMUP_LOOPS"
     echo "benchmark cpu: $BENCHMARK_CPU"
     echo "benchmark constant clocks: $BENCHMARK_CONSTANT_CLOCKS"
+    echo "cranelift opt level: $CRANELIFT_OPT_LEVEL"
     echo
 
     echo "jit transformed profile pass"
@@ -1131,6 +1133,7 @@ benchmark benchmark_loops="1000000" verify_loops="100000" results_root="bench" r
     BENCHMARK_CPU="$BENCHMARK_CPU" \
     BENCHMARK_CONSTANT_CLOCKS="$BENCHMARK_CONSTANT_CLOCKS" \
     SOAC_WORK_DIR="$counters_dir" \
+    SOAC_CRANELIFT_OPT_LEVEL="$CRANELIFT_OPT_LEVEL" \
     SOAC_OPT_MODE=profile \
       "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
 
@@ -1141,6 +1144,7 @@ benchmark benchmark_loops="1000000" verify_loops="100000" results_root="bench" r
     BENCHMARK_CPU="$BENCHMARK_CPU" \
     BENCHMARK_CONSTANT_CLOCKS="$BENCHMARK_CONSTANT_CLOCKS" \
     SOAC_WORK_DIR="$counters_dir" \
+    SOAC_CRANELIFT_OPT_LEVEL="$CRANELIFT_OPT_LEVEL" \
     SOAC_OPT_MODE=verify \
       "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
 
@@ -1154,10 +1158,17 @@ benchmark benchmark_loops="1000000" verify_loops="100000" results_root="bench" r
       BENCHMARK_CPU="$BENCHMARK_CPU" \
       BENCHMARK_CONSTANT_CLOCKS="$BENCHMARK_CONSTANT_CLOCKS" \
       SOAC_WORK_DIR="$counters_dir" \
+      SOAC_CRANELIFT_OPT_LEVEL="$CRANELIFT_OPT_LEVEL" \
       SOAC_OPT_MODE=apply \
         "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
     done
   } 2>&1 | tee "$report"
+
+  python3 "$REPO_ROOT/scripts/summarize_benchmark_result.py" \
+    "$result_dir" \
+    --json-out "$result_dir/summary.json" \
+    | tee "$result_dir/summary.txt" \
+    | tee -a "$report" >/dev/null
 
   echo "benchmark result: $result_dir"
 

@@ -81,11 +81,18 @@ If the deep-profile recipe was used, also read:
 - `clif/fn_<function_id>_<qualname>.vcode`
 - `clif/fn_<function_id>_<qualname>.annotated.vcode`
 
+Every benchmark result should also have:
+
+- `summary.txt`
+- `summary.json`
+
 For a default benchmark request, report:
 
 - result directory
-- specialized apply-pass loops per second from `benchmark.txt`
+- specialized apply-pass median loops per second from `summary.txt` or `summary.json`
 - verify-mode loops per second
+- Cranelift opt level used for the run
+- latest pystone JIT code size totals from `summary.txt` or `summary.json`
 - any obvious benchmark/runtime surprises
 
 If helpful, you may also mention the profiling-pass throughput, but do not use it
