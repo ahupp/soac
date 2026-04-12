@@ -5,6 +5,26 @@ optimization attempts made by Codex agents. Keep entries succinct: what
 changed or was tried, which jj change id carried it when landed, the
 benchmarked throughput delta, and the headline pre/post numbers.
 
+## 2026-04-12 - Route direct-call null failures through the current step-null path
+
+- jj change id: `quymqrww`
+- summary: Direct-call null failures no longer build a local block that
+  reloads and re-sets the current exception before branching to the
+  active step-null continuation. The change also adds apply-mode
+  regression coverage for direct-call and constructor exception
+  propagation.
+- throughput: `+1.06%` specialized pystone median after rebasing onto
+  `sypsopvxttmk`; verify improved `+4.05%` and total pystone code size
+  shrank by `1072` bytes
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `276181`, `278949`, `272400 loops/s`
+  - verify pass: `160199 loops/s`
+  - total code size: `404019` bytes
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `279120`, `279927`, `274180 loops/s`
+  - verify pass: `166693 loops/s`
+  - total code size: `402947` bytes
+
 ## 2026-04-12 - Elide explicit error save/restore around decref cleanup
 
 - jj change id: `omymzyom`
@@ -12,15 +32,17 @@ benchmarked throughput delta, and the headline pre/post numbers.
   owned-temp decref cleanup and routed those cleanup sites through a shared
   helper instead, relying on the runtime decref path to preserve the active
   Python exception.
-- throughput: `-2.39%` specialized pystone median after rebasing on current
-  `main`; verify improved `+3.13%`, and the final pystone code-size total was
-  unchanged at `405732` bytes
+- throughput: `-2.72%` specialized pystone median relative to `lrktzrpv`,
+  with essentially unchanged verify throughput and a substantially smaller
+  pystone JIT image
 - pre-change benchmark:
-  - specialized pass, 1M loops x3: `284973`, `284270`, `280161 loops/s`
-  - verify pass: `152661 loops/s`
+  - specialized pass, 1M loops x3: `281062`, `281854`, `274855 loops/s`
+  - verify pass: `161242 loops/s`
+  - total code size: `447630` bytes
 - post-change benchmark:
-  - specialized pass, 1M loops x3: `286337`, `277474`, `269739 loops/s`
-  - verify pass: `157436 loops/s`
+  - specialized pass, 1M loops x3: `282617`, `273427`, `271740 loops/s`
+  - verify pass: `161285 loops/s`
+  - total code size: `405732` bytes
 
 ## 2026-04-12 - Remove apply-mode specialization counters
 

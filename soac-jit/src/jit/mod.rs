@@ -2249,7 +2249,6 @@ struct JitEmitCtx<'mc> {
     record_top_value_sample_ref: Option<ir::FuncRef>,
     tuple_new_ref: ir::FuncRef,
     tuple_set_item_ref: ir::FuncRef,
-    set_raised_exception_ref: ir::FuncRef,
     stack_slots: StackSlots,
     exception_state_slots: ExceptionStateSlots,
     pop_handled_exception_ref: ir::FuncRef,
@@ -6851,29 +6850,15 @@ fn emit_direct_call_resolved_with_arg_values(
     let call_is_null = fb
         .ins()
         .icmp(ir::condcodes::IntCC::Equal, call_value, null_ptr);
-    let call_fail_block = fb.create_block();
     let call_ok_block = fb.create_block();
     fb.append_block_param(call_ok_block, ptr_ty);
     fb.ins().brif(
         call_is_null,
-        call_fail_block,
-        &[],
+        ctx.consts.step_null_block,
+        &step_null_block_args(ctx),
         call_ok_block,
         &[ir::BlockArg::Value(call_value)],
     );
-    fb.switch_to_block(call_fail_block);
-    let error_value = emit_take_current_raised_exception_or_trap(
-        fb,
-        ctx.consts.ptr_ty,
-        ctx.consts.thread_state_value,
-    );
-    fb.ins().call(
-        ctx.set_raised_exception_ref,
-        &[ctx.consts.thread_state_value, error_value],
-    );
-    fb.ins()
-        .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
-
     fb.switch_to_block(call_ok_block);
     fb.block_params(call_ok_block)[0]
 }
@@ -12810,7 +12795,6 @@ fn build_cranelift_run_bb_specialized_function(
                 record_top_value_sample_ref,
                 tuple_new_ref,
                 tuple_set_item_ref,
-                set_raised_exception_ref,
                 stack_slots: stack_slots.clone(),
                 exception_state_slots: exception_state_slots.clone(),
                 pop_handled_exception_ref,
