@@ -5,7 +5,7 @@ use soac_blockpy::passes::infer_module_value_facts;
 use soac_jit::{
     exc_dispatch_plan,
     module_type::{hash_module_source, indexed_module_info},
-    plan_function_locals, planned_jit_params_for_function,
+    plan_function_locals, plan_function_refcount_ownership, planned_jit_params_for_function,
 };
 use std::any::Any;
 use std::collections::HashSet;
@@ -334,6 +334,9 @@ def exercise():
     let registered_function = gen_function;
     let value_facts = infer_module_value_facts(&normalized);
     let local_plan = plan_function_locals(registered_function, &value_facts);
+    let refcount_plan =
+        plan_function_refcount_ownership(&normalized, registered_function, &value_facts)
+            .expect("refcount plan should validate");
     let plan_runtime_params = planned_jit_params_for_function(registered_function, &local_plan)
         .expect("runtime params should bind");
     let plan_exc_dispatches = registered_function
@@ -345,7 +348,12 @@ def exercise():
                 .as_ref()
                 .map(|edge| plan_runtime_params[edge.target.index()].as_slice())
                 .unwrap_or(&[]);
-            exc_dispatch_plan(registered_function, block, runtime_target_params)
+            exc_dispatch_plan(
+                registered_function,
+                block,
+                runtime_target_params,
+                &refcount_plan,
+            )
         })
         .collect::<Vec<_>>();
 

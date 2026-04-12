@@ -40,6 +40,7 @@ impl ParamBindingFacts {
 pub enum ParamProvenance {
     ExplicitBlockParam(LocalLocation),
     ForwardedLocal(LocalLocation),
+    SyntheticUnbound(LocalLocation),
     StackSlot(LocalLocation),
 }
 
@@ -67,6 +68,12 @@ pub struct BlockLocalPlan {
 
 fn is_try_exception_alias_name(name: &str) -> bool {
     name.starts_with("_dp_try_exc_")
+}
+
+fn can_release_via_stack_slot_fallback(name: &str) -> bool {
+    name.starts_with("_dp_try_exc_")
+        || name.starts_with("_dp_try_abrupt_kind_")
+        || name.starts_with("_dp_try_abrupt_payload_")
 }
 
 impl BlockLocalPlan {
@@ -136,13 +143,12 @@ pub fn plan_function_locals(
                 let py_facts = entry_facts
                     .and_then(|env| env.local_pyobj_fact(location))
                     .filter(|_| is_must_bound_on_entry);
+                let is_live_in = live_in_locations.contains(&location);
                 let storage = if explicit_param_names.contains(name.as_str()) {
                     PlannedLocalStorage::BlockParam
                 } else if is_function_param_on_entry {
                     PlannedLocalStorage::BlockParam
-                } else if !is_entry_block
-                    && (live_in_locations.contains(&location) || is_must_bound_on_entry)
-                {
+                } else if is_live_in || is_must_bound_on_entry {
                     PlannedLocalStorage::BlockParam
                 } else {
                     PlannedLocalStorage::StackSlot
@@ -160,6 +166,10 @@ pub fn plan_function_locals(
                     };
                 let provenance = if explicit_param_names.contains(name.as_str()) {
                     ParamProvenance::ExplicitBlockParam(location)
+                } else if is_function_param_on_entry {
+                    ParamProvenance::ForwardedLocal(location)
+                } else if is_entry_block && storage == PlannedLocalStorage::BlockParam {
+                    ParamProvenance::SyntheticUnbound(location)
                 } else if storage == PlannedLocalStorage::BlockParam {
                     ParamProvenance::ForwardedLocal(location)
                 } else {
@@ -214,8 +224,8 @@ pub fn plan_function_refcount_ownership(
 pub struct CurrentJitRefcountPlanCheck {
     pub local_rebinds: usize,
     pub local_deletes: usize,
-    pub terminal_stack_slot_releases: usize,
-    pub normal_edge_stack_slot_releases: usize,
+    pub terminal_local_releases: usize,
+    pub normal_edge_local_releases: usize,
     pub exception_edge_stack_slot_releases: usize,
     pub normal_edge_release_gaps: usize,
     pub exception_edge_release_gaps: usize,
@@ -280,14 +290,14 @@ pub fn check_refcount_plan_against_current_jit(
                     );
                     match reason {
                         RefcountReleaseReason::Return | RefcountReleaseReason::Raise => {
-                            check.terminal_stack_slot_releases += 1;
+                            check.terminal_local_releases += 1;
                         }
                         RefcountReleaseReason::Jump { .. }
                         | RefcountReleaseReason::IfThen { .. }
                         | RefcountReleaseReason::IfElse { .. }
                         | RefcountReleaseReason::BranchCase { .. }
                         | RefcountReleaseReason::BranchDefault { .. } => {
-                            check.normal_edge_stack_slot_releases += 1;
+                            check.normal_edge_local_releases += 1;
                         }
                         RefcountReleaseReason::ExceptionEdge { .. } => {
                             check.exception_edge_stack_slot_releases += 1;
@@ -316,7 +326,7 @@ fn check_local_has_stack_slot(
     }
     errors.push(format!(
         "refcount plan action for function {} ({}) references local {local_name:?}, \
-         but the current JIT cleanup model only tracks storage-layout stack slots",
+         but the current JIT cleanup model only tracks storage-layout locals",
         function.function_id, function.names.qualname
     ));
 }
@@ -352,6 +362,7 @@ pub struct BlockExcDispatchPlan {
     pub slot_writes: Vec<(String, BlockArg)>,
     pub target_args: Vec<(String, BlockArg)>,
     pub forwarded_local_names: Vec<String>,
+    pub release_local_names: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -542,21 +553,11 @@ pub fn plan_edge_transport(
     }
 }
 
-fn stack_slot_name_set_for_function(
-    function: &BlockPyFunction<CodegenModuleShape>,
-) -> HashSet<String> {
-    function
-        .storage_layout()
-        .as_ref()
-        .map(|layout| layout.stack_slots().iter().cloned().collect::<HashSet<_>>())
-        .unwrap_or_default()
-}
-
 pub fn planned_implicit_target_transports_for_function(
     function: &BlockPyFunction<CodegenModuleShape>,
     runtime_block_params: &[Vec<RuntimeBlockParamPlan>],
 ) -> Vec<EdgeTransportPlan> {
-    let stack_slot_name_set = stack_slot_name_set_for_function(function);
+    let no_slot_writes = HashSet::new();
     function
         .blocks
         .iter()
@@ -566,7 +567,7 @@ pub fn planned_implicit_target_transports_for_function(
                 &block.param_name_vec(),
                 &[],
                 &runtime_block_params[index],
-                &stack_slot_name_set,
+                &no_slot_writes,
             )
         })
         .collect()
@@ -576,7 +577,7 @@ pub fn planned_jump_edge_transports_for_function(
     function: &BlockPyFunction<CodegenModuleShape>,
     runtime_block_params: &[Vec<RuntimeBlockParamPlan>],
 ) -> Vec<Option<EdgeTransportPlan>> {
-    let stack_slot_name_set = stack_slot_name_set_for_function(function);
+    let no_slot_writes = HashSet::new();
     function
         .blocks
         .iter()
@@ -588,7 +589,7 @@ pub fn planned_jump_edge_transports_for_function(
                     &target_block.param_name_vec(),
                     &target.args,
                     &runtime_block_params[target_index],
-                    &stack_slot_name_set,
+                    &no_slot_writes,
                 ))
             }
             _ => None,
@@ -600,6 +601,7 @@ pub fn exc_dispatch_plan(
     function: &BlockPyFunction<CodegenModuleShape>,
     block: &CodegenBlock,
     runtime_target_params: &[RuntimeBlockParamPlan],
+    refcount_plan: &FunctionRefcountPlan,
 ) -> Option<BlockExcDispatchPlan> {
     let exc_edge = block.exc_edge.as_ref()?;
     let target_index = exc_edge.target.index();
@@ -623,11 +625,37 @@ pub fn exc_dispatch_plan(
         runtime_target_params,
         &stack_slot_name_set,
     );
+    let release_reason = RefcountReleaseReason::ExceptionEdge {
+        target: exc_edge.target,
+    };
+    let mut forwarded_local_names = transport.forwarded_local_names;
+    let mut release_local_names = Vec::new();
+    if let Some(block_plan) = refcount_plan.block(block.label) {
+        for action in &block_plan.actions {
+            let RefcountActionKind::ReleaseLocal {
+                local,
+                reason: action_reason,
+                ..
+            } = &action.kind
+            else {
+                continue;
+            };
+            if action_reason != &release_reason
+                || can_release_via_stack_slot_fallback(local.name.as_str())
+                || forwarded_local_names.iter().any(|name| name == &local.name)
+            {
+                continue;
+            }
+            forwarded_local_names.push(local.name.clone());
+            release_local_names.push(local.name.clone());
+        }
+    }
     Some(BlockExcDispatchPlan {
         target_index,
         slot_writes: transport.slot_writes,
         target_args: transport.target_args,
-        forwarded_local_names: transport.forwarded_local_names,
+        forwarded_local_names,
+        release_local_names,
     })
 }
 
@@ -965,6 +993,48 @@ def f(flag):
     }
 
     #[test]
+    fn local_plan_carries_entry_maybe_unbound_live_ins_as_synthetic_block_params() {
+        let (lowered, function_index) = lowered_function(
+            r#"
+def f(flag):
+    if flag:
+        x = 1
+    return x
+"#,
+            "f",
+        );
+        let function = &lowered.callable_defs[function_index];
+        let facts = infer_module_value_facts(&lowered);
+        let plan = plan_function_locals(function, &facts);
+        let runtime_params =
+            planned_jit_params_for_function(function, &plan).expect("runtime params should bind");
+        let seeds = planned_stack_slot_entry_seeds_for_function(function, &plan);
+        let entry_label = function.entry_block().label;
+        let entry_plan = plan.block(entry_label).expect("missing entry local plan");
+        let entry_x = binding_for_name(entry_plan, "x");
+
+        assert_eq!(entry_x.storage, PlannedLocalStorage::BlockParam);
+        assert_eq!(entry_x.param_facts.binding, ParamBindingFacts::MaybeUnbound);
+        assert_eq!(entry_x.param_facts.ownership, LocalRefKind::Unbound);
+        assert_eq!(
+            entry_x.param_facts.provenance,
+            ParamProvenance::SyntheticUnbound(entry_x.location)
+        );
+        assert!(
+            runtime_params[entry_label.index()]
+                .iter()
+                .any(|param| param.arg_name == "x"),
+            "entry maybe-unbound local should be initialized as a runtime block param"
+        );
+        assert!(
+            seeds[entry_label.index()]
+                .iter()
+                .all(|seed| seed.binding.name != "x"),
+            "entry maybe-unbound local should not require a stack-slot seed"
+        );
+    }
+
+    #[test]
     fn refcount_plan_is_available_to_jit_planning() {
         let (lowered, function_index) = lowered_function(
             r#"
@@ -1020,8 +1090,13 @@ def f():
             .expect("expected exception edge source block");
         let exc_edge = source_block.exc_edge.as_ref().expect("checked above");
         let runtime_target_params = &runtime_params[exc_edge.target.index()];
-        let dispatch_plan = exc_dispatch_plan(function, source_block, &runtime_target_params)
-            .expect("expected exception dispatch plan");
+        let dispatch_plan = exc_dispatch_plan(
+            function,
+            source_block,
+            &runtime_target_params,
+            &FunctionRefcountPlan::default(),
+        )
+        .expect("expected exception dispatch plan");
 
         assert!(
             dispatch_plan
@@ -1029,6 +1104,54 @@ def f():
                 .iter()
                 .any(|name| name == "original_import"),
             "exception dispatch should preserve original_import: {dispatch_plan:#?}"
+        );
+    }
+
+    #[test]
+    fn exc_dispatch_plan_carries_ordinary_exception_cleanup_locals_as_target_args() {
+        let (lowered, function_index) = lowered_function(
+            r#"
+def f():
+    try:
+        x = []
+        raise ValueError("boom")
+    except ValueError:
+        return None
+    return None
+"#,
+            "f",
+        );
+        let function = &lowered.callable_defs[function_index];
+        let facts = infer_module_value_facts(&lowered);
+        let local_plan = plan_function_locals(function, &facts);
+        let refcount_plan = plan_function_refcount_ownership(&lowered, function, &facts)
+            .expect("refcount plan should validate");
+        let runtime_params = planned_jit_params_for_function(function, &local_plan)
+            .expect("runtime params should bind");
+
+        let dispatches = function
+            .blocks
+            .iter()
+            .filter_map(|block| {
+                let runtime_target_params = block
+                    .exc_edge
+                    .as_ref()
+                    .map(|edge| runtime_params[edge.target.index()].as_slice())
+                    .unwrap_or(&[]);
+                exc_dispatch_plan(function, block, runtime_target_params, &refcount_plan)
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            dispatches
+                .iter()
+                .any(|dispatch| dispatch.release_local_names.is_empty()
+                    && dispatch
+                        .forwarded_local_names
+                        .iter()
+                        .any(|name| name == "x")
+                    && dispatch.target_args.iter().any(|(name, _)| name == "x")),
+            "exception dispatch should carry ordinary cleanup locals as target args: {dispatches:#?}"
         );
     }
 
@@ -1130,8 +1253,8 @@ def f():
             .expect("current JIT should account for storage-layout locals");
 
         assert_eq!(check.local_rebinds, 1);
-        assert_eq!(check.terminal_stack_slot_releases, 1);
-        assert_eq!(check.normal_edge_stack_slot_releases, 0);
+        assert_eq!(check.terminal_local_releases, 1);
+        assert_eq!(check.normal_edge_local_releases, 0);
         assert_eq!(check.exception_edge_stack_slot_releases, 0);
         assert_eq!(check.normal_edge_release_gaps, 0);
         assert_eq!(check.exception_edge_release_gaps, 0);
@@ -1158,12 +1281,12 @@ def f(flag):
             .expect("current JIT should account for storage-layout locals");
 
         assert!(
-            check.normal_edge_stack_slot_releases > 0,
-            "expected the plan to expose normal-edge stack-slot releases: {check:#?}"
+            check.normal_edge_local_releases > 0,
+            "expected the plan to expose normal-edge LocalEnv releases: {check:#?}"
         );
         assert_eq!(
             check.normal_edge_release_gaps, 0,
-            "normal edges are now consumed by planned stack-slot releases"
+            "normal edges are now consumed by planned LocalEnv releases"
         );
         assert_eq!(check.exception_edge_release_gaps, 0);
         assert!(!check.has_edge_release_gaps());
@@ -1196,7 +1319,7 @@ def f():
         );
         assert_eq!(
             check.exception_edge_release_gaps, 0,
-            "exception edges are now consumed by planned stack-slot releases"
+            "exception edges are still consumed by planned stack-slot releases"
         );
         assert_eq!(check.normal_edge_release_gaps, 0);
         assert!(!check.has_edge_release_gaps());

@@ -420,10 +420,6 @@ def f():
         expr_stmt(op_expr(Store::new(target, value)))
     }
 
-    fn delete_stmt(target: ResolvedName) -> InstrCodegen {
-        expr_stmt(op_expr(Del::new(target, false)))
-    }
-
     fn ret_term(value: InstrCodegen) -> BlockTerm<InstrCodegen> {
         BlockTerm::Return(value)
     }
@@ -6133,28 +6129,5 @@ def f(x, y):
             Some(value) => unsafe { std::env::set_var("SOAC_OPT_MODE", value) },
             None => unsafe { std::env::remove_var("SOAC_OPT_MODE") },
         }
-    }
-
-    #[test]
-    fn render_specialized_jit_delete_stmt_updates_function_state_slots() {
-        let blocks = [1usize as ObjPtr];
-        let mut constants = TestConstantPool::default();
-        let mut function = with_single_test_block(
-            test_function(),
-            vec![delete_stmt(test_name("x"))],
-            ret_term(constants.int_expr(0)),
-        );
-        set_stack_slots(&mut function, &["x"]);
-        let rendered = render_test_jit_function_with_module_constants(
-            &function,
-            &blocks,
-            constants.module_constants,
-        );
-        assert!(
-            rendered.contains("store.i64")
-                || rendered.contains("stack_store")
-                || rendered.contains("store notrap"),
-            "delete-backed JIT plans should update mirrored function-state slots:\n{rendered}"
-        );
     }
 }
