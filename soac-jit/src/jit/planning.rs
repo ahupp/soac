@@ -8,6 +8,7 @@ use soac_blockpy::passes::{
     plan_ownership_effects, validate_ownership_effects,
 };
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LocalRefKind {
@@ -406,6 +407,34 @@ impl PlannedJitModuleLocals {
     pub fn function(&self, function_id: FunctionId) -> Option<&PlannedJitFunctionLocals> {
         self.functions.get(&function_id)
     }
+
+    pub fn validate_for_module(
+        &self,
+        module: &BlockPyModule<CodegenModuleShape>,
+    ) -> Result<(), String> {
+        let expected_function_ids = module
+            .callable_defs
+            .iter()
+            .map(|function| function.function_id)
+            .collect::<HashSet<_>>();
+        for function in &module.callable_defs {
+            let function_plan = self.function(function.function_id).ok_or_else(|| {
+                format!(
+                    "missing JIT local plan for function {} ({})",
+                    function.function_id, function.names.qualname
+                )
+            })?;
+            function_plan.validate_for_function(function)?;
+        }
+        for function_id in self.functions.keys() {
+            if !expected_function_ids.contains(function_id) {
+                return Err(format!(
+                    "JIT local plan contains unknown function id {function_id}"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl PlannedJitFunctionLocals {
@@ -545,6 +574,161 @@ pub fn plan_jit_module_locals(
         }
     }
     Ok(PlannedJitModuleLocals { functions })
+}
+
+pub fn render_jit_module_locals(
+    module: &BlockPyModule<CodegenModuleShape>,
+    plan: &PlannedJitModuleLocals,
+) -> Result<String, String> {
+    plan.validate_for_module(module)?;
+    let mut out = String::new();
+    for function in &module.callable_defs {
+        let function_plan = plan.function(function.function_id).ok_or_else(|| {
+            format!(
+                "missing JIT local plan for function {} ({})",
+                function.function_id, function.names.qualname
+            )
+        })?;
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&render_jit_function_locals(function, function_plan)?);
+    }
+    Ok(out)
+}
+
+pub fn render_jit_function_locals(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    plan: &PlannedJitFunctionLocals,
+) -> Result<String, String> {
+    plan.validate_for_function(function)?;
+    let mut out = String::new();
+    writeln!(
+        out,
+        "function {} {}:",
+        function.function_id, function.names.qualname
+    )
+    .expect("writing to String should not fail");
+    for (index, block) in function.blocks.iter().enumerate() {
+        writeln!(out, "  block {}:", block.label).expect("writing to String should not fail");
+        if let Some(local_plan) = plan.local_plan.block(block.label) {
+            writeln!(out, "    entry_locals:").expect("writing to String should not fail");
+            for binding in &local_plan.entry_locals {
+                writeln!(out, "      {}", render_planned_local_binding(binding))
+                    .expect("writing to String should not fail");
+            }
+        }
+        writeln!(out, "    runtime_params:").expect("writing to String should not fail");
+        for param in &plan.runtime_block_params[index] {
+            writeln!(
+                out,
+                "      {} <- {} aliases={:?}",
+                param.arg_name,
+                render_planned_local_binding(&param.binding),
+                param.entry_aliases
+            )
+            .expect("writing to String should not fail");
+        }
+        if !plan.stack_slot_entry_seeds[index].is_empty() {
+            writeln!(out, "    stack_slot_entry_seeds:")
+                .expect("writing to String should not fail");
+            for seed in &plan.stack_slot_entry_seeds[index] {
+                writeln!(
+                    out,
+                    "      {} entry_ref_kind={:?}",
+                    render_planned_local_binding(&seed.binding),
+                    seed.entry_ref_kind
+                )
+                .expect("writing to String should not fail");
+            }
+        }
+        render_edge_transport(
+            &mut out,
+            "implicit_transport",
+            &plan.implicit_target_transports[index],
+        );
+        if let Some(transport) = &plan.jump_edge_transports[index] {
+            render_edge_transport(&mut out, "jump_transport", transport);
+        }
+        if let Some(dispatch) = &plan.exc_dispatches[index] {
+            writeln!(out, "    exc_dispatch:").expect("writing to String should not fail");
+            writeln!(out, "      target_index={}", dispatch.target_index)
+                .expect("writing to String should not fail");
+            writeln!(
+                out,
+                "      target_args=[{}]",
+                render_named_block_args(&dispatch.target_args)
+            )
+            .expect("writing to String should not fail");
+            writeln!(
+                out,
+                "      slot_writes=[{}]",
+                render_named_block_args(&dispatch.slot_writes)
+            )
+            .expect("writing to String should not fail");
+            writeln!(
+                out,
+                "      forwarded_locals={:?}",
+                dispatch.forwarded_local_names
+            )
+            .expect("writing to String should not fail");
+            writeln!(
+                out,
+                "      release_locals={:?}",
+                dispatch.release_local_names
+            )
+            .expect("writing to String should not fail");
+        }
+    }
+    Ok(out)
+}
+
+fn render_planned_local_binding(binding: &PlannedLocalBinding) -> String {
+    format!(
+        "{}@{} storage={:?} binding={:?} ownership={:?} provenance={:?} value={:?}",
+        binding.name,
+        binding.location.0,
+        binding.storage,
+        binding.param_facts.binding,
+        binding.param_facts.ownership,
+        binding.param_facts.provenance,
+        binding.param_facts.value
+    )
+}
+
+fn render_edge_transport(out: &mut String, label: &str, transport: &EdgeTransportPlan) {
+    if transport.slot_writes.is_empty()
+        && transport.target_args.is_empty()
+        && transport.forwarded_local_names.is_empty()
+    {
+        return;
+    }
+    writeln!(out, "    {label}:").expect("writing to String should not fail");
+    writeln!(
+        out,
+        "      target_args=[{}]",
+        render_named_block_args(&transport.target_args)
+    )
+    .expect("writing to String should not fail");
+    writeln!(
+        out,
+        "      slot_writes=[{}]",
+        render_named_block_args(&transport.slot_writes)
+    )
+    .expect("writing to String should not fail");
+    writeln!(
+        out,
+        "      forwarded_locals={:?}",
+        transport.forwarded_local_names
+    )
+    .expect("writing to String should not fail");
+}
+
+fn render_named_block_args(args: &[(String, BlockArg)]) -> String {
+    args.iter()
+        .map(|(name, arg)| format!("{name}={arg:?}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 pub fn local_ref_kind_for_stack_mirror(ref_kind: LocalRefKind) -> LocalRefKind {
@@ -1323,6 +1507,8 @@ def g(flag):
         let facts = infer_module_value_facts(&lowered);
         let plan = plan_jit_module_locals(&lowered, &facts)
             .expect("JIT module local state should plan before codegen");
+        plan.validate_for_module(&lowered)
+            .expect("module-level function plan should validate");
 
         assert_eq!(plan.functions.len(), lowered.callable_defs.len());
         for function in &lowered.callable_defs {

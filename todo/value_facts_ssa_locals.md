@@ -517,3 +517,7 @@ Started:
   Specialized codegen, inspector debug output, and focused PyO3 tests consume
   that precomputed plan instead of recomputing per-function LocalEnv state inside
   the Cranelift builder.
+- The module-level JIT local plan now has a renderer in the planning module, and
+  inspector pipeline output includes it as a `jit_local_plan` step. This makes
+  block params, stack-slot seeds, and edge transports inspectable without relying
+  on ad hoc codegen-only debug structures.

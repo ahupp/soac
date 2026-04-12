@@ -13,6 +13,7 @@ use soac_jit::module_constants::ModuleCodegenConstants;
 use soac_jit::module_type::build_shared_state_for_inspection;
 use soac_jit::{
     plan_jit_module_locals, render_cranelift_run_bb_specialized_with_runtime_state_and_cfg,
+    render_jit_function_locals, render_jit_module_locals,
 };
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
@@ -249,6 +250,17 @@ fn render_inspector_payload(source: &str, output: &soac_blockpy::LoweringResult)
             "text": text,
         }));
     }
+    let jit_local_plan_text = (|| {
+        let facts = infer_module_value_facts(&output.codegen_module);
+        let plan = plan_jit_module_locals(&output.codegen_module, &facts)?;
+        render_jit_module_locals(&output.codegen_module, &plan)
+    })()
+    .unwrap_or_else(|err| format!("; failed to render jit_local_plan: {err}"));
+    steps.push(json!({
+        "key": "jit_local_plan",
+        "label": "jit local plan",
+        "text": jit_local_plan_text,
+    }));
     json!({
         "steps": steps,
         "functions": output
@@ -298,24 +310,9 @@ pub fn jit_debug_plan(
     let jit_local_plan = jit_module_local_plan
         .function(function.function_id)
         .ok_or_else(|| format!("missing JIT local plan for {module_name}.fn#{function_id}"))?;
-    let block_info = function
-        .blocks
-        .iter()
-        .enumerate()
-        .map(|(index, block)| {
-            let block_runtime_params = &jit_local_plan.runtime_block_params[index];
-            (
-                block.label.to_string(),
-                block_runtime_params
-                    .iter()
-                    .map(|param| param.arg_name.clone())
-                    .collect::<Vec<_>>(),
-                jit_local_plan.exc_dispatches[index].clone(),
-            )
-        })
-        .collect::<Vec<_>>();
+    let jit_local_plan_text = render_jit_function_locals(function, jit_local_plan)?;
     Ok(format!(
-        "function:\n{function:#?}\n\njit_blocks:\n{block_info:#?}"
+        "function:\n{function:#?}\n\njit_local_plan:\n{jit_local_plan_text}"
     ))
 }
 
@@ -555,8 +552,21 @@ mod test {
             .iter()
             .filter_map(|step| step["text"].as_str())
             .collect::<Vec<_>>();
+        let step_keys = payload["steps"]
+            .as_array()
+            .expect("steps should be an array")
+            .iter()
+            .filter_map(|step| step["key"].as_str())
+            .collect::<Vec<_>>();
+        assert!(step_keys.contains(&"jit_local_plan"), "{payload}");
         assert!(
             step_texts.iter().any(|text| text.contains("BinOp(Add,")),
+            "{payload}"
+        );
+        assert!(
+            step_texts
+                .iter()
+                .any(|text| text.contains("function") && text.contains("runtime_params")),
             "{payload}"
         );
     }

@@ -78,7 +78,8 @@ pub use planning::{
     plan_function_locals, plan_function_refcount_ownership, plan_jit_function_locals,
     plan_jit_module_locals, planned_implicit_target_transports_for_function,
     planned_jit_params_for_function, planned_jump_edge_transports_for_function,
-    planned_stack_slot_entry_seeds_for_function,
+    planned_stack_slot_entry_seeds_for_function, render_jit_function_locals,
+    render_jit_module_locals,
 };
 use runtime_context::{
     FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET, FUNCTION_ENV_GLOBALS_OBJ_OFFSET,
