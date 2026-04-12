@@ -684,6 +684,34 @@ def f():
     }
 
     #[test]
+    fn specialized_jit_local_store_rhs_compiles_via_typed_demand() {
+        let mut constants = TestConstantPool::default();
+        let mut function = with_single_test_block(
+            test_function(),
+            vec![expr_stmt(op_expr(Store::new(
+                test_name("x"),
+                op_expr(BinOp::new(
+                    BinOpKind::Add,
+                    constants.int_expr(1),
+                    constants.int_expr(2),
+                )),
+            )))],
+            ret_term(name_expr(test_name("x"))),
+        );
+        set_stack_slots(&mut function, &["x"]);
+        let module = BlockPyModule {
+            module_name_gen: ModuleNameGen::new(0),
+            global_names: Vec::new(),
+            callable_defs: vec![function.clone()],
+            module_constants: constants.module_constants,
+            counter_defs: Vec::new(),
+        };
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        build_test_specialized_function(&[1usize as ObjPtr], &module, &function, &module_constants);
+    }
+
+    #[test]
     fn specialized_jit_body_calls_compile_via_effect_only_typed_ops() {
         let mut constants = TestConstantPool::default();
         let call = Call::new(
@@ -724,6 +752,37 @@ def f():
         assert_eq!(
             plan.demand_for_instr_id(instr_id),
             Some(ResultDemand::EffectOnly)
+        );
+    }
+
+    #[test]
+    fn typed_result_demand_plan_marks_local_store_rhs_pyobject_owned() {
+        let mut constants = TestConstantPool::default();
+        let store_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+        let rhs_instr_id = InstrId::new(BlockLabel::from_index(0), 1);
+        let store = with_instr_id(
+            op_expr(Store::new(
+                test_name("x"),
+                with_instr_id(constants.int_expr(1), rhs_instr_id),
+            )),
+            store_instr_id,
+        );
+        let function = with_single_test_block(
+            test_function(),
+            vec![store],
+            ret_term(constants.int_expr(2)),
+        );
+        let typed_function =
+            lower_typed_function_if_tests_to_truthy(lower_codegen_function_to_typed(function));
+        let plan = plan_typed_result_demands(&typed_function);
+
+        assert_eq!(
+            plan.demand_for_instr_id(store_instr_id),
+            Some(ResultDemand::EffectOnly)
+        );
+        assert_eq!(
+            plan.demand_for_instr_id(rhs_instr_id),
+            Some(ResultDemand::PYOBJECT_OWNED)
         );
     }
 

@@ -2055,6 +2055,9 @@ fn plan_typed_result_demands(
     for block in &function.blocks {
         for expr in &block.body {
             plan.insert_instr(expr, ResultDemand::EffectOnly);
+            if let InstrTyped::LegacyStore(store) = expr {
+                plan.insert_instr(store.value.as_ref(), ResultDemand::PYOBJECT_OWNED);
+            }
         }
         if let BlockTerm::IfTerm(if_term) = &block.term {
             plan.insert_instr(&if_term.test, ResultDemand::I32_BOOL01);
@@ -2950,7 +2953,22 @@ fn planned_local_store_effect(
     location: LocalLocation,
     ctx: &JitEmitCtx<'_>,
 ) -> Option<PlannedLocalStoreEffect> {
-    let instr_key = expr.semantic_instr_key(ctx.function_id);
+    planned_local_store_effect_for_key(expr.semantic_instr_key(ctx.function_id), location, ctx)
+}
+
+fn planned_typed_local_store_effect(
+    expr: &InstrTyped,
+    location: LocalLocation,
+    ctx: &JitEmitCtx<'_>,
+) -> Option<PlannedLocalStoreEffect> {
+    planned_local_store_effect_for_key(expr.semantic_instr_key(ctx.function_id), location, ctx)
+}
+
+fn planned_local_store_effect_for_key(
+    instr_key: InstrKey,
+    location: LocalLocation,
+    ctx: &JitEmitCtx<'_>,
+) -> Option<PlannedLocalStoreEffect> {
     let block_plan = ctx.refcount_plan.block(instr_key.instr_id.block_label())?;
     for action in &block_plan.actions {
         let RefcountSite::Instr(site_key) = action.site else {
@@ -2979,6 +2997,24 @@ fn planned_local_store_effect(
 fn local_ref_kind_for_stored_value(value: &InstrCodegen, ctx: &JitEmitCtx<'_>) -> LocalRefKind {
     match ctx
         .value_facts_for_expr(value)
+        .and_then(ValueFacts::as_pyobj)
+    {
+        Some(facts) if facts.is_immortal() => LocalRefKind::Immortal,
+        _ => LocalRefKind::Owned,
+    }
+}
+
+fn local_ref_kind_for_typed_stored_value(
+    value: &InstrTyped,
+    ownership: ValueOwnership,
+    ctx: &JitEmitCtx<'_>,
+) -> LocalRefKind {
+    if matches!(ownership, ValueOwnership::Immortal) {
+        return LocalRefKind::Immortal;
+    }
+    match value
+        .try_semantic_instr_id()
+        .and_then(|instr_id| ctx.value_facts_for_instr_id(instr_id))
         .and_then(ValueFacts::as_pyobj)
     {
         Some(facts) if facts.is_immortal() => LocalRefKind::Immortal,
@@ -3196,6 +3232,92 @@ fn emit_local_store_result_with_local_env(
         );
     }
     Some(emit_none_for_demand(fb, emit_ctx, demand))
+}
+
+fn emit_typed_local_store_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    expr: &InstrTyped,
+    op: &Store<InstrTyped>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<Option<EmitResult>, String> {
+    let Some(location) = op.name.local_location() else {
+        return Ok(None);
+    };
+    let layout = emit_ctx
+        .storage_layout
+        .as_ref()
+        .expect("Store local slot should have storage layout during typed codegen");
+    let name = local_name_for_location(layout, location);
+    if matches!(
+        planned_typed_local_store_effect(expr, location, emit_ctx),
+        Some(PlannedLocalStoreEffect::Delete)
+    ) {
+        local_env
+            .delete_location(
+                fb,
+                location,
+                name,
+                &emit_ctx.stack_slots,
+                emit_ctx.consts.ptr_ty,
+                emit_ctx.consts.thread_state_value,
+                emit_ctx.decref_ref,
+            )
+            .unwrap_or_else(|error| panic!("{error}"));
+        return Ok(Some(emit_none_for_demand(fb, emit_ctx, demand)));
+    }
+
+    let value_demand = op
+        .value
+        .try_semantic_instr_id()
+        .and_then(|instr_id| emit_ctx.result_demand_plan.demand_for_instr_id(instr_id))
+        .unwrap_or(ResultDemand::PYOBJECT_OWNED);
+    let value_result = match value_demand {
+        ResultDemand::PyObject { borrowed_ok: false } => {
+            emit_typed_codegen_stmt_result_with_local_env(
+                fb,
+                &op.value,
+                local_env,
+                emit_ctx,
+                value_demand,
+                jit_module,
+                func_imports,
+            )?
+        }
+        other => {
+            return Err(format!(
+                "typed local store RHS requires owned PyObject demand, got {other:?}"
+            ));
+        }
+    };
+    let (value, ownership, _) = value_result.expect_pyobject("typed local store RHS");
+    if !ownership.can_satisfy_pyobject_demand(ResultDemand::PYOBJECT_OWNED) {
+        return Err(format!(
+            "typed local store RHS produced {ownership:?}, but store requires owned PyObject"
+        ));
+    }
+    let value_ref_kind = match planned_typed_local_store_effect(expr, location, emit_ctx) {
+        Some(PlannedLocalStoreEffect::Rebind(ref_kind)) => ref_kind,
+        Some(PlannedLocalStoreEffect::Delete) => unreachable!(),
+        None => local_ref_kind_for_typed_stored_value(&op.value, ownership, emit_ctx),
+    };
+    local_env.store_location(
+        fb,
+        location,
+        name,
+        value,
+        value_ref_kind,
+        emit_ctx.allow_local_only_slot_backed_stores,
+        &emit_ctx.stack_slots,
+        emit_ctx.consts.ptr_ty,
+        emit_ctx.consts.thread_state_value,
+        emit_ctx.incref_ref,
+        emit_ctx.decref_ref,
+    );
+    Ok(Some(emit_none_for_demand(fb, emit_ctx, demand)))
 }
 
 fn emit_local_delete_with_local_env(
@@ -9006,6 +9128,21 @@ fn emit_typed_codegen_stmt_result_with_local_env(
     jit_module: &mut JITModule,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<EmitResult, String> {
+    if let InstrTyped::LegacyStore(op) = expr {
+        if let Some(result) = emit_typed_local_store_result_with_local_env(
+            fb,
+            expr,
+            op,
+            local_env,
+            emit_ctx,
+            demand,
+            jit_module,
+            func_imports,
+        )? {
+            return Ok(result);
+        }
+    }
+
     if matches!(
         expr,
         InstrTyped::Truthy(_) | InstrTyped::Load(_) | InstrTyped::BinOp(_)
