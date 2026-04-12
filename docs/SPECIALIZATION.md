@@ -545,6 +545,55 @@ apply/verify mode:
     encode directly
 
 
+## Static Runtime Builtin Primitives
+
+### Counted Input
+
+- There is no profile counter for the first version.
+- Candidate calls are recognized statically when name binding has already
+  proven the callee load is a runtime-name constant for `ord` or `chr`.
+- Global-name loads are not candidates at codegen time. That avoids treating
+  a shadowable module global as a builtin primitive.
+
+### Codegen
+
+- `ord(x)` can emit a direct call to the `soac-runtime`
+  `soac_runtime_builtin_ord_i64` primitive. The primitive accepts the argument
+  as a borrowed `PyObject*`, performs CPython-compatible validation internally,
+  sets `PyThreadState.current_exception` on failure, and returns an `i64`.
+- If the consumer demands a Python object, the `i64` result is boxed through
+  the existing `emit_to_python_long` coercion path. If the consumer demands an
+  `i64`, the scalar value is used directly.
+- `chr(ord(x))` can emit `ord_i64(x)` followed by
+  `soac_runtime_builtin_chr_i64(tstate, codepoint)`, avoiding a temporary
+  `PyLong` between the two builtins.
+- Scalar-returning primitive calls check `PyThreadState.current_exception`
+  immediately after the call. On error, codegen preserves the exception while
+  releasing owned temporaries, then jumps to the normal Python exception path.
+
+### Limitations / Soundness / Extensions
+
+- The current `chr` primitive path is only selected when its argument can
+  already satisfy an `i64` demand, currently the direct `ord(x)` shape. Plain
+  `chr(x)` still uses generic vectorcall unless `x` is itself lowered to an
+  `i64` by another specialization.
+- The runtime primitives use checked CPython C-API calls for Unicode handling.
+  Direct Unicode layout reads are a later optimization.
+- Error messages are not yet preserved on the checked primitive's explicit
+  validation failures; the correct exception type is set. C-API failures still
+  keep CPython's own error.
+- Static builtin recognition relies on the existing runtime-name lowering
+  behavior. That path is intentionally unsound for later module-global
+  shadowing of undeclared builtin names and is marked with `BEHAVIOR_CHANGE`
+  in the name-binding pass.
+- Natural extensions:
+  - carry `i64` results through stores and more expression forms
+  - support integer literals and profiled integer-returning functions as
+    inputs to `chr`
+  - use the same direct-call descriptor mechanism for regular SOAC Python
+    functions with typed return ABIs
+
+
 ## What Is Not Yet Specialized
 
 Some notable hot paths still use only generic lowering:

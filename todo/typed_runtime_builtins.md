@@ -127,10 +127,11 @@ This requires generic coercion edges:
 
 ## Implementation Order
 
-Status: steps 1 and 2 have started. The direct ABI descriptor scaffold exists
-in `soac-jit`, and checked `soac_runtime_builtin_ord_i64` /
-`soac_runtime_builtin_chr_i64` entry points exist in `soac-runtime` and are
-emitted into the runtime CLIF table.
+Status: steps 1 through 5 have started. The direct ABI descriptor scaffold
+exists in `soac-jit`, checked `soac_runtime_builtin_ord_i64` /
+`soac_runtime_builtin_chr_i64` entry points exist in `soac-runtime`, and static
+runtime-name `ord` calls can emit an `i64`. Static `chr(ord(x))` can consume
+that `i64` without materializing an intermediate `PyLong`.
 
 1. Add compiler-visible direct ABI descriptor scaffolding in `soac-jit`.
 
@@ -154,6 +155,11 @@ emitted into the runtime CLIF table.
    `ErrorAbi::CurrentException`, release owned temporary inputs according to the
    argument ownership contract, and return an `EmitResult`.
 
+   Current first slice: `ord(x)` emits the checked runtime primitive and returns
+   an `EmitResult::I64`; `chr(ord(x))` emits the checked `chr_i64` primitive.
+   The next cleanup is to make emission table-driven from `DirectCallableDesc`
+   rather than matching each primitive manually.
+
 4. Add coercion emission between typed results and demands.
 
    Start with `I64 -> PyObjectOwned` and `I32Bool01 -> PyObjectOwned`, using the
@@ -161,12 +167,19 @@ emitted into the runtime CLIF table.
    satisfy object-demanded `ord(x)` without changing the natural `ord_i64`
    result.
 
+   Current first slice: `I64 -> PyObjectOwned` is wired for object-demanded
+   `ord(x)`. `I32Bool01 -> PyObjectOwned` remains a general coercion follow-up.
+
 5. Wire static builtin call recognition.
 
    When name binding/runtime-name lowering proves a call target is the builtin
    `ord` or `chr`, consider the runtime primitive descriptor before generic
    vectorcall. Keep the existing vectorcall path as fallback for unsupported
    call shapes, keywords, or missing descriptors.
+
+   Current first slice: codegen recognizes only proven runtime-name constants.
+   It intentionally excludes global-name loads so shadowable globals do not get
+   treated as builtin primitives at codegen time.
 
 6. Generalize profiled direct-call target identity.
 

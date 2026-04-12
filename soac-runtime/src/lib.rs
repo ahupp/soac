@@ -181,7 +181,7 @@ struct RawPyThreadState {
 
 unsafe extern "C" {
     fn _Py_Dealloc(obj: *mut RawPyObject);
-    fn PyErr_SetString(exception: *mut c_void, string: *const u8);
+    fn PyErr_SetNone(exception: *mut c_void);
     fn PyUnicode_FromOrdinal(ordinal: i32) -> *mut c_void;
     fn PyUnicode_GetLength(unicode: *mut c_void) -> isize;
     fn PyUnicode_ReadChar(unicode: *mut c_void, index: isize) -> u32;
@@ -361,12 +361,7 @@ pub unsafe extern "C" fn soac_runtime_builtin_ord_i64(
         return 0;
     }
     if length != 1 {
-        unsafe {
-            PyErr_SetString(
-                PyExc_TypeError,
-                b"ord() expected a character, but string length was not 1\0".as_ptr(),
-            )
-        };
+        unsafe { PyErr_SetNone(PyExc_TypeError) };
         return 0;
     }
 
@@ -382,13 +377,8 @@ pub unsafe extern "C" fn soac_runtime_builtin_chr_i64(
     _tstate: *mut c_void,
     value: i64,
 ) -> *mut c_void {
-    if !(0..=0x10ffff).contains(&value) {
-        unsafe {
-            PyErr_SetString(
-                PyExc_ValueError,
-                b"chr() arg not in range(0x110000)\0".as_ptr(),
-            )
-        };
+    if value < 0 || value > 0x10ffff {
+        unsafe { PyErr_SetNone(PyExc_ValueError) };
         return core::ptr::null_mut();
     }
     unsafe { PyUnicode_FromOrdinal(value as i32) }

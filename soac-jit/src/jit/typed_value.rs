@@ -192,6 +192,7 @@ pub enum ResultDemand {
     EffectOnly,
     PyObject { borrowed_ok: bool },
     I32Bool01,
+    I64,
     I64Index,
 }
 
@@ -199,18 +200,19 @@ impl ResultDemand {
     pub const PYOBJECT_OWNED: Self = Self::PyObject { borrowed_ok: false };
     pub const PYOBJECT_BORROWED_OK: Self = Self::PyObject { borrowed_ok: true };
     pub const I32_BOOL01: Self = Self::I32Bool01;
+    pub const I64_VALUE: Self = Self::I64;
     pub const I64_INDEX: Self = Self::I64Index;
 
     pub const fn needs_value(self) -> bool {
         matches!(
             self,
-            Self::PyObject { .. } | Self::I32Bool01 | Self::I64Index
+            Self::PyObject { .. } | Self::I32Bool01 | Self::I64 | Self::I64Index
         )
     }
 
     pub const fn borrowed_ok(self) -> bool {
         match self {
-            Self::EffectOnly | Self::I32Bool01 | Self::I64Index => false,
+            Self::EffectOnly | Self::I32Bool01 | Self::I64 | Self::I64Index => false,
             Self::PyObject { borrowed_ok } => borrowed_ok,
         }
     }
@@ -230,7 +232,10 @@ impl ValueOwnership {
 
     pub const fn can_satisfy_pyobject_demand(self, demand: ResultDemand) -> bool {
         match demand {
-            ResultDemand::EffectOnly | ResultDemand::I32Bool01 | ResultDemand::I64Index => false,
+            ResultDemand::EffectOnly
+            | ResultDemand::I32Bool01
+            | ResultDemand::I64
+            | ResultDemand::I64Index => false,
             ResultDemand::PyObject { borrowed_ok } => {
                 borrowed_ok || matches!(self, Self::Owned | Self::Immortal)
             }
@@ -445,6 +450,8 @@ mod tests {
         assert!(!ResultDemand::EffectOnly.borrowed_ok());
         assert!(ResultDemand::I32_BOOL01.needs_value());
         assert!(!ResultDemand::I32_BOOL01.borrowed_ok());
+        assert!(ResultDemand::I64_VALUE.needs_value());
+        assert!(!ResultDemand::I64_VALUE.borrowed_ok());
         assert!(ResultDemand::I64_INDEX.needs_value());
         assert!(!ResultDemand::I64_INDEX.borrowed_ok());
         assert!(ResultDemand::PYOBJECT_OWNED.needs_value());
@@ -468,6 +475,7 @@ mod tests {
         );
         assert!(!ValueOwnership::Owned.can_satisfy_pyobject_demand(ResultDemand::EffectOnly));
         assert!(!ValueOwnership::Owned.can_satisfy_pyobject_demand(ResultDemand::I32_BOOL01));
+        assert!(!ValueOwnership::Owned.can_satisfy_pyobject_demand(ResultDemand::I64_VALUE));
         assert!(!ValueOwnership::Owned.can_satisfy_pyobject_demand(ResultDemand::I64_INDEX));
     }
 

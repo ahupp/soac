@@ -893,6 +893,47 @@ def f():
     }
 
     #[test]
+    fn runtime_builtin_primitive_recognition_requires_static_runtime_name() {
+        let mut module = test_module(ModuleNameGen::new(0), vec![test_function()]);
+        module
+            .module_constants
+            .push(InstrResolved::Load(Load::new(test_runtime_name("ord"))));
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let arg = name_expr(test_name("x"));
+
+        let runtime_ord_call = Call::new(
+            name_expr(test_runtime_name("ord")),
+            vec![CallArgPositional::Positional(arg.clone())],
+            vec![],
+        );
+        assert_eq!(
+            static_runtime_primitive_for_call(&runtime_ord_call, &module_constants),
+            Some(RuntimePrimitiveId::BuiltinOrdI64)
+        );
+
+        let constant_ord_call = Call::new(
+            name_expr(test_constant_name(0)),
+            vec![CallArgPositional::Positional(arg.clone())],
+            vec![],
+        );
+        assert_eq!(
+            static_runtime_primitive_for_call(&constant_ord_call, &module_constants),
+            Some(RuntimePrimitiveId::BuiltinOrdI64)
+        );
+
+        let global_ord_call = Call::new(
+            name_expr(test_global_name("ord")),
+            vec![CallArgPositional::Positional(arg)],
+            vec![],
+        );
+        assert_eq!(
+            static_runtime_primitive_for_call(&global_ord_call, &module_constants),
+            None
+        );
+    }
+
+    #[test]
     fn planned_pyobject_input_borrowed_ok_for_codegen_expr_uses_result_demand_plan() {
         let mut constants = TestConstantPool::default();
         let borrowed_id = InstrId::new(BlockLabel::from_index(0), 1);
