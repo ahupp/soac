@@ -868,6 +868,48 @@ def f():
     }
 
     #[test]
+    fn planned_pyobject_input_borrowed_ok_for_codegen_expr_uses_result_demand_plan() {
+        let mut constants = TestConstantPool::default();
+        let borrowed_id = InstrId::new(BlockLabel::from_index(0), 1);
+        let owned_id = InstrId::new(BlockLabel::from_index(0), 2);
+        let bool_id = InstrId::new(BlockLabel::from_index(0), 3);
+        let missing_id = InstrId::new(BlockLabel::from_index(0), 4);
+        let borrowed_expr = with_instr_id(constants.int_expr(1), borrowed_id);
+        let owned_expr = with_instr_id(constants.int_expr(2), owned_id);
+        let bool_expr = with_instr_id(constants.int_expr(3), bool_id);
+        let missing_expr = with_instr_id(constants.int_expr(4), missing_id);
+        let no_id_expr = constants.int_expr(5);
+        let mut plan = ResultDemandPlan::default();
+        plan.demands_by_instr_id
+            .insert(borrowed_id, ResultDemand::PYOBJECT_BORROWED_OK);
+        plan.demands_by_instr_id
+            .insert(owned_id, ResultDemand::PYOBJECT_OWNED);
+        plan.demands_by_instr_id
+            .insert(bool_id, ResultDemand::I32_BOOL01);
+
+        assert_eq!(
+            planned_pyobject_input_borrowed_ok_for_codegen_expr(&plan, &borrowed_expr),
+            Some(true)
+        );
+        assert_eq!(
+            planned_pyobject_input_borrowed_ok_for_codegen_expr(&plan, &owned_expr),
+            Some(false)
+        );
+        assert_eq!(
+            planned_pyobject_input_borrowed_ok_for_codegen_expr(&plan, &bool_expr),
+            Some(false)
+        );
+        assert_eq!(
+            planned_pyobject_input_borrowed_ok_for_codegen_expr(&plan, &missing_expr),
+            None
+        );
+        assert_eq!(
+            planned_pyobject_input_borrowed_ok_for_codegen_expr(&plan, &no_id_expr),
+            None
+        );
+    }
+
+    #[test]
     fn typed_result_demand_plan_marks_branch_tests_i32_bool01() {
         let mut constants = TestConstantPool::default();
         let function = test_function();

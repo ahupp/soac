@@ -1261,6 +1261,34 @@ fn codegen_expr_is_borrowable_from_local_env(
     }
 }
 
+fn planned_pyobject_input_borrowed_ok_for_codegen_expr(
+    result_demand_plan: &ResultDemandPlan,
+    expr: &InstrCodegen,
+) -> Option<bool> {
+    let instr_id = expr.try_semantic_instr_id()?;
+    result_demand_plan
+        .demand_for_instr_id(instr_id)
+        .map(ResultDemand::borrowed_ok)
+}
+
+fn codegen_expr_pyobject_input_is_borrowed_from_local_env(
+    expr: &InstrCodegen,
+    local_env: &LocalEnv,
+    ctx: &JitEmitCtx<'_>,
+) -> bool {
+    let planned_borrowed_ok =
+        planned_pyobject_input_borrowed_ok_for_codegen_expr(ctx.result_demand_plan, expr);
+    if !planned_borrowed_ok.unwrap_or(true) {
+        return false;
+    }
+    codegen_expr_is_borrowable_from_local_env(
+        expr,
+        local_env,
+        &ctx.stack_slots,
+        ctx.storage_layout.as_ref(),
+    )
+}
+
 fn local_name_for_location<'a>(
     storage_layout: &'a StorageLayout,
     location: LocalLocation,
@@ -1602,12 +1630,8 @@ fn emit_super_instance_arg_with_local_env(
         );
         return (value, false);
     }
-    let instance_is_borrowed = codegen_expr_is_borrowable_from_local_env(
-        instance_expr,
-        local_env,
-        &ctx.stack_slots,
-        ctx.storage_layout.as_ref(),
-    );
+    let instance_is_borrowed =
+        codegen_expr_pyobject_input_is_borrowed_from_local_env(instance_expr, local_env, ctx);
     let instance = emit_codegen_expr_with_local_env(
         fb,
         instance_expr,
@@ -1633,12 +1657,8 @@ fn emit_codegen_super_helper_call_with_local_env(
 ) -> ir::Value {
     let ptr_ty = ctx.consts.ptr_ty;
     let null_ptr = fb.ins().iconst(ptr_ty, 0);
-    let callable_is_borrowed = codegen_expr_is_borrowable_from_local_env(
-        callable_expr,
-        local_env,
-        &ctx.stack_slots,
-        ctx.storage_layout.as_ref(),
-    );
+    let callable_is_borrowed =
+        codegen_expr_pyobject_input_is_borrowed_from_local_env(callable_expr, local_env, ctx);
     let callable = emit_codegen_expr_with_local_env(
         fb,
         callable_expr,
@@ -1649,12 +1669,8 @@ fn emit_codegen_super_helper_call_with_local_env(
         func_imports,
     );
 
-    let super_fn_is_borrowed = codegen_expr_is_borrowable_from_local_env(
-        super_fn_expr,
-        local_env,
-        &ctx.stack_slots,
-        ctx.storage_layout.as_ref(),
-    );
+    let super_fn_is_borrowed =
+        codegen_expr_pyobject_input_is_borrowed_from_local_env(super_fn_expr, local_env, ctx);
     let super_fn = emit_codegen_expr_with_local_env(
         fb,
         super_fn_expr,
@@ -1665,12 +1681,8 @@ fn emit_codegen_super_helper_call_with_local_env(
         func_imports,
     );
 
-    let cls_is_borrowed = codegen_expr_is_borrowable_from_local_env(
-        cls_expr,
-        local_env,
-        &ctx.stack_slots,
-        ctx.storage_layout.as_ref(),
-    );
+    let cls_is_borrowed =
+        codegen_expr_pyobject_input_is_borrowed_from_local_env(cls_expr, local_env, ctx);
     let cls = emit_codegen_expr_with_local_env(
         fb,
         cls_expr,
@@ -4732,12 +4744,8 @@ fn emit_positional_vectorcall_with_local_env(
     let mut arg_values: Vec<ir::Value> = Vec::with_capacity(args.len());
     let mut arg_borrowed: Vec<bool> = Vec::with_capacity(args.len());
     for arg in args {
-        let borrowed_arg = codegen_expr_is_borrowable_from_local_env(
-            arg,
-            local_env,
-            &ctx.stack_slots,
-            ctx.storage_layout.as_ref(),
-        );
+        let borrowed_arg =
+            codegen_expr_pyobject_input_is_borrowed_from_local_env(arg, local_env, ctx);
         arg_borrowed.push(borrowed_arg);
         arg_values.push(emit_codegen_expr_with_local_env(
             fb,
@@ -5027,12 +5035,8 @@ fn emit_keyword_call_with_local_env(
 ) -> ir::Value {
     let mut tuple_items: Vec<(ir::Value, bool)> = Vec::with_capacity(args.len());
     for arg in args {
-        let borrowed_arg = codegen_expr_is_borrowable_from_local_env(
-            arg,
-            local_env,
-            &ctx.stack_slots,
-            ctx.storage_layout.as_ref(),
-        );
+        let borrowed_arg =
+            codegen_expr_pyobject_input_is_borrowed_from_local_env(arg, local_env, ctx);
         let value = emit_codegen_expr_with_local_env(
             fb,
             arg,
@@ -5058,12 +5062,8 @@ fn emit_keyword_call_with_local_env(
             ctx.module_constants.require_unicode_constant_id(name),
             ctx,
         );
-        let value_borrowed = codegen_expr_is_borrowable_from_local_env(
-            value_expr,
-            local_env,
-            &ctx.stack_slots,
-            ctx.storage_layout.as_ref(),
-        );
+        let value_borrowed =
+            codegen_expr_pyobject_input_is_borrowed_from_local_env(value_expr, local_env, ctx);
         let value_obj = emit_codegen_expr_with_local_env(
             fb,
             value_expr,
@@ -5138,12 +5138,8 @@ fn emit_unpack_call_with_local_env(
             CallArgPositional::Positional(value_expr) => (value_expr, b"append".as_slice()),
             CallArgPositional::Starred(value_expr) => (value_expr, b"extend".as_slice()),
         };
-        let value_borrowed = codegen_expr_is_borrowable_from_local_env(
-            value_expr,
-            local_env,
-            &ctx.stack_slots,
-            ctx.storage_layout.as_ref(),
-        );
+        let value_borrowed =
+            codegen_expr_pyobject_input_is_borrowed_from_local_env(value_expr, local_env, ctx);
         let value_obj = emit_codegen_expr_with_local_env(
             fb,
             value_expr,
@@ -5173,12 +5169,8 @@ fn emit_unpack_call_with_local_env(
                         .require_unicode_constant_id(arg.as_str()),
                     ctx,
                 );
-                let value_borrowed = codegen_expr_is_borrowable_from_local_env(
-                    value,
-                    local_env,
-                    &ctx.stack_slots,
-                    ctx.storage_layout.as_ref(),
-                );
+                let value_borrowed =
+                    codegen_expr_pyobject_input_is_borrowed_from_local_env(value, local_env, ctx);
                 let value_obj = emit_codegen_expr_with_local_env(
                     fb,
                     value,
@@ -5205,11 +5197,8 @@ fn emit_unpack_call_with_local_env(
             }
             CallArgKeyword::Starred(value_expr) => {
                 let kwargs_obj = kwargs_obj.expect("kwargs object must exist for kwstar part");
-                let value_borrowed = codegen_expr_is_borrowable_from_local_env(
-                    value_expr,
-                    local_env,
-                    &ctx.stack_slots,
-                    ctx.storage_layout.as_ref(),
+                let value_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
+                    value_expr, local_env, ctx,
                 );
                 let value_obj = emit_codegen_expr_with_local_env(
                     fb,
@@ -6972,12 +6961,8 @@ fn emit_direct_call_resolved_with_arg_plan_from_local_env(
     let mut provided_arg_values: Vec<ir::Value> = Vec::with_capacity(args.len());
     let mut provided_arg_borrowed: Vec<bool> = Vec::with_capacity(args.len());
     for arg in args {
-        let borrowed_arg = codegen_expr_is_borrowable_from_local_env(
-            arg,
-            local_env,
-            &ctx.stack_slots,
-            ctx.storage_layout.as_ref(),
-        );
+        let borrowed_arg =
+            codegen_expr_pyobject_input_is_borrowed_from_local_env(arg, local_env, ctx);
         provided_arg_borrowed.push(borrowed_arg);
         provided_arg_values.push(emit_codegen_expr_with_local_env(
             fb,
@@ -7023,12 +7008,8 @@ fn emit_direct_constructor_resolved_with_args_from_local_env(
     let mut arg_values = Vec::with_capacity(args.len());
     let mut arg_borrowed = Vec::with_capacity(args.len());
     for arg in args {
-        let borrowed_arg = codegen_expr_is_borrowable_from_local_env(
-            arg,
-            local_env,
-            &ctx.stack_slots,
-            ctx.storage_layout.as_ref(),
-        );
+        let borrowed_arg =
+            codegen_expr_pyobject_input_is_borrowed_from_local_env(arg, local_env, ctx);
         arg_borrowed.push(borrowed_arg);
         arg_values.push(emit_codegen_expr_with_local_env(
             fb,
@@ -7071,12 +7052,8 @@ fn emit_direct_method_resolved_with_args_from_local_env(
     provided_arg_values.push(receiver);
     provided_arg_borrowed.push(receiver_is_borrowed);
     for arg in args {
-        let borrowed_arg = codegen_expr_is_borrowable_from_local_env(
-            arg,
-            local_env,
-            &ctx.stack_slots,
-            ctx.storage_layout.as_ref(),
-        );
+        let borrowed_arg =
+            codegen_expr_pyobject_input_is_borrowed_from_local_env(arg, local_env, ctx);
         provided_arg_borrowed.push(borrowed_arg);
         provided_arg_values.push(emit_codegen_expr_with_local_env(
             fb,
@@ -7174,11 +7151,10 @@ fn emit_call_direct_expr_with_local_env(
         }
     };
 
-    let callable_is_borrowed = codegen_expr_is_borrowable_from_local_env(
+    let callable_is_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
         call.callable.as_ref(),
         local_env,
-        &ctx.stack_slots,
-        ctx.storage_layout.as_ref(),
+        ctx,
     );
     let callable = emit_codegen_expr_with_local_env(
         fb,
@@ -7994,11 +7970,10 @@ fn emit_codegen_simple_call_with_local_env(
             == Some(RuntimeHelperId::NextOrSentinel)
     {
         let iterator_expr = simple_args[0];
-        let iterator_is_borrowed = codegen_expr_is_borrowable_from_local_env(
+        let iterator_is_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
             iterator_expr,
             local_env,
-            &emit_ctx.stack_slots,
-            emit_ctx.storage_layout.as_ref(),
+            emit_ctx,
         );
         let iterator = emit_codegen_expr_with_local_env(
             fb,
@@ -8047,11 +8022,10 @@ fn emit_codegen_simple_call_with_local_env(
     }
 
     if has_unpack {
-        let callable_is_borrowed = codegen_expr_is_borrowable_from_local_env(
+        let callable_is_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
             call.func.as_ref(),
             local_env,
-            &emit_ctx.stack_slots,
-            emit_ctx.storage_layout.as_ref(),
+            emit_ctx,
         );
         let callable = emit_codegen_expr_with_local_env(
             fb,
@@ -8083,11 +8057,8 @@ fn emit_codegen_simple_call_with_local_env(
             let mut arg_values: Vec<ir::Value> = Vec::with_capacity(simple_args.len());
             let mut borrowed_args: Vec<bool> = Vec::with_capacity(simple_args.len());
             for arg in &simple_args {
-                let borrowed_arg = codegen_expr_is_borrowable_from_local_env(
-                    arg,
-                    local_env,
-                    &emit_ctx.stack_slots,
-                    emit_ctx.storage_layout.as_ref(),
+                let borrowed_arg = codegen_expr_pyobject_input_is_borrowed_from_local_env(
+                    arg, local_env, emit_ctx,
                 );
                 let value = emit_codegen_expr_with_local_env(
                     fb,
@@ -8123,11 +8094,10 @@ fn emit_codegen_simple_call_with_local_env(
                     .require_unicode_constant_id(name.as_str()),
                 emit_ctx,
             );
-            let value_borrowed = codegen_expr_is_borrowable_from_local_env(
+            let value_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
                 simple_args[1],
                 local_env,
-                &emit_ctx.stack_slots,
-                emit_ctx.storage_layout.as_ref(),
+                emit_ctx,
             );
             let value_obj = emit_codegen_expr_with_local_env(
                 fb,
@@ -8277,11 +8247,10 @@ fn emit_codegen_simple_call_with_local_env(
             let InstrCodegen::GetAttr(getattr) = call.func.as_ref() else {
                 unreachable!("direct method specializations require GetAttr call target");
             };
-            let receiver_is_borrowed = codegen_expr_is_borrowable_from_local_env(
+            let receiver_is_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
                 getattr.value.as_ref(),
                 local_env,
-                &emit_ctx.stack_slots,
-                emit_ctx.storage_layout.as_ref(),
+                emit_ctx,
             );
             let receiver = emit_codegen_expr_with_local_env(
                 fb,
@@ -8361,11 +8330,10 @@ fn emit_codegen_simple_call_with_local_env(
             }
 
             fb.switch_to_block(generic_block);
-            let attr_is_borrowed = codegen_expr_is_borrowable_from_local_env(
+            let attr_is_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
                 getattr.attr.as_ref(),
                 local_env,
-                &emit_ctx.stack_slots,
-                emit_ctx.storage_layout.as_ref(),
+                emit_ctx,
             );
             let attr = emit_codegen_expr_with_local_env(
                 fb,
@@ -8428,11 +8396,10 @@ fn emit_codegen_simple_call_with_local_env(
             fb.switch_to_block(result_block);
             return Some(fb.block_params(result_block)[0]);
         }
-        let callable_is_borrowed = codegen_expr_is_borrowable_from_local_env(
+        let callable_is_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
             call.func.as_ref(),
             local_env,
-            &emit_ctx.stack_slots,
-            emit_ctx.storage_layout.as_ref(),
+            emit_ctx,
         );
         let callable = emit_codegen_expr_with_local_env(
             fb,
@@ -8617,11 +8584,10 @@ fn emit_codegen_simple_call_with_local_env(
         ));
     }
     if !has_unpack && !simple_keywords.is_empty() {
-        let callable_is_borrowed = codegen_expr_is_borrowable_from_local_env(
+        let callable_is_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
             call.func.as_ref(),
             local_env,
-            &emit_ctx.stack_slots,
-            emit_ctx.storage_layout.as_ref(),
+            emit_ctx,
         );
         let callable = emit_codegen_expr_with_local_env(
             fb,
