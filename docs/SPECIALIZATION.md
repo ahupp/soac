@@ -13,7 +13,8 @@ For each specialization, this covers:
 ## Profiling Input
 
 The counter dump contains hot specialization input, cold key-layout
-metadata, and optional verify counters for indexed storage fast paths.
+metadata, and optional verify counters for indexed storage fast paths
+and applied refcount operations.
 The hot streams consumed by the current replay path are:
 
 - `call_hot_targets`
@@ -84,6 +85,18 @@ Verify-mode indexed-storage counters are scalar per-site counters:
   - Count whether a type-key specialization loaded the instance
     split-dict value directly or fell back to CPython attribute access.
 
+Verify-mode refcount counters are scalar per-function counters:
+
+- `runtime_incref` / `runtime_decref`
+  - Instrumented only in `SOAC_OPT_MODE=verify` by
+    `instrument_bb_module_with_refcount_counters`, at
+    `soac-blockpy/src/passes/trace/mod.rs`.
+  - Count applied SOAC runtime refcount operations emitted through the
+    JIT refcount helper path. Immortal or null values skipped by the
+    runtime helper do not increment these counters.
+  - These counters are diagnostic verification output; profile/apply
+    modes do not emit counted refcount helper wrappers.
+
 Normal multi-pass runs use one work directory and one mode:
 
 - `SOAC_WORK_DIR=/path/to/dir`
@@ -95,6 +108,7 @@ Normal multi-pass runs use one work directory and one mode:
   - read `/path/to/dir/profile.bin`
   - apply specializations
   - instrument specialization-input counters
+  - instrument applied runtime incref/decref counters
   - write `/path/to/dir/verify.bin`
 - `SOAC_OPT_MODE=apply`
   - read `/path/to/dir/profile.bin`

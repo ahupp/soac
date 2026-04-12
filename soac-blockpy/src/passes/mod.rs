@@ -687,6 +687,7 @@ pub(crate) use name_binding::{
 pub(crate) use trace::{
     call_target_counter_instrumentation_enabled, instrument_bb_module_for_trace,
     locality_counter_instrumentation_enabled, parse_trace_env,
+    refcount_counter_instrumentation_enabled,
 };
 
 pub fn relabel_dense_bb_module<P: ModuleShape>(module: &mut BlockPyModule<P>) {

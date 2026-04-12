@@ -1,6 +1,7 @@
 use super::{
     instrument_bb_module_for_trace, instrument_bb_module_with_global_load_counters,
-    instrument_bb_module_with_locality_counters, parse_trace_config, TraceConfig,
+    instrument_bb_module_with_locality_counters, parse_trace_config,
+    refcount_counter_instrumentation_enabled, TraceConfig,
 };
 use crate::block_py::{
     BlockPyFunction, Call, ChildVisitable, CounterScope, CounterSite, InstrCodegen, NameLike,
@@ -264,4 +265,47 @@ fn lowering_profile_mode_adds_block_entry_counters() {
         1,
         "profile lowering should still add branch_outcomes counters"
     );
+}
+
+#[test]
+fn lowering_verify_mode_adds_refcount_counters_only_in_verify() {
+    let _guard = profile_env_test_lock().lock().unwrap();
+    let source = "def f(x):\n    y = x\n    return y\n";
+
+    {
+        let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "verify");
+        assert!(refcount_counter_instrumentation_enabled());
+        let lowered = lower_python_to_blockpy_for_testing(source)
+            .expect("transform should succeed")
+            .codegen_module;
+        let refcount_counters = lowered
+            .counter_defs
+            .iter()
+            .filter(|counter| counter.kind == "runtime_incref" || counter.kind == "runtime_decref")
+            .collect::<Vec<_>>();
+        assert_eq!(refcount_counters.len(), lowered.callable_defs.len() * 2);
+        assert!(refcount_counters.iter().all(|counter| {
+            counter.scope == CounterScope::Function
+                && matches!(
+                    counter.site,
+                    CounterSite::Runtime {
+                        function_id: Some(_),
+                        instr_id: None,
+                    }
+                )
+        }));
+    }
+
+    for mode in ["profile", "apply"] {
+        let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", mode);
+        assert!(!refcount_counter_instrumentation_enabled());
+        let lowered = lower_python_to_blockpy_for_testing(source)
+            .expect("transform should succeed")
+            .codegen_module;
+        assert!(
+            lowered.counter_defs.iter().all(|counter| counter.kind != "runtime_incref"
+                && counter.kind != "runtime_decref"),
+            "{mode} lowering should not add refcount counters"
+        );
+    }
 }

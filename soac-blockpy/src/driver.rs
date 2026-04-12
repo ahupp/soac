@@ -1,5 +1,5 @@
 use crate::block_py::pretty::BlockPyPrettyPrint;
-use crate::block_py::{BlockPyModule, ModuleNameGen};
+use crate::block_py::{BlockPyModule, CounterScope, ModuleNameGen};
 use crate::pass_tracker::PassTracker;
 use crate::passes::ast_to_ast::ast_rewrite::rewrite_with_pass;
 use crate::passes::ast_to_ast::context::Context;
@@ -250,11 +250,26 @@ pub(crate) fn rewrite_module_with_tracker_with_options(
             bb_call_target_counted
         };
 
+    let bb_refcount_counted: BlockPyModule<CodegenModuleShape> =
+        if passes::refcount_counter_instrumentation_enabled() {
+            pass_tracker.record_timing("bb_refcount_counters", || {
+                let mut counted = bb_locality_counted;
+                passes::instrument_bb_module_with_refcount_counters(
+                    &mut counted,
+                    CounterScope::Function,
+                )
+                .map_err(anyhow::Error::msg)?;
+                Ok::<BlockPyModule<CodegenModuleShape>, anyhow::Error>(counted)
+            })?
+        } else {
+            bb_locality_counted
+        };
+
     pass_tracker.record_timing("validate", || {
-        crate::block_py::validate_module(&bb_locality_counted).map_err(anyhow::Error::msg)
+        crate::block_py::validate_module(&bb_refcount_counted).map_err(anyhow::Error::msg)
     })?;
 
-    Ok(bb_locality_counted)
+    Ok(bb_refcount_counted)
 }
 
 pub(crate) fn rewrite_module_with_tracker(

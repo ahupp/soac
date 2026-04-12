@@ -27,6 +27,11 @@ pub(crate) fn locality_counter_instrumentation_enabled() -> bool {
     specialization_mode_instruments_top_values()
 }
 
+pub(crate) fn refcount_counter_instrumentation_enabled() -> bool {
+    let mode = env::var("SOAC_OPT_MODE").unwrap_or_default();
+    mode.trim() == "verify"
+}
+
 pub fn specialization_runtime_logging_enabled() -> bool {
     let mode = env::var("SOAC_OPT_MODE").unwrap_or_default();
     if mode.trim() != "apply" {
