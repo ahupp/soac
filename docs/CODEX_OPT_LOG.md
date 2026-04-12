@@ -5,6 +5,28 @@ optimization attempts made by Codex agents. Keep entries succinct: what
 changed or was tried, which jj change id carried it when landed, the
 benchmarked throughput delta, and the headline pre/post numbers.
 
+## 2026-04-12 - Use fixed-arity fallback calls for small guarded calls
+
+- jj change id: `xqqowksq`
+- summary: Guarded direct-call, direct-method, and constructor miss
+  blocks now use the existing fixed-arity positional helper for fallback
+  calls with at most three positional args. This avoids per-callsite
+  vectorcall stack-slot setup on those cold miss paths while leaving the
+  unspecialized generic positional-call path unchanged.
+- throughput: `-0.35%` specialized pystone median in the finalized
+  run; total pystone code size `-0.43%`; total pystone machine blocks
+  `-0.17%`
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `281216`, `273692`, `276780 loops/s`
+  - verify pass: `158201 loops/s`
+  - total code size: `372092` bytes
+  - total machine blocks: `22691`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `275808`, `280431`, `273441 loops/s`
+  - verify pass: `156370 loops/s`
+  - total code size: `370500` bytes
+  - total machine blocks: `22652`
+
 ## 2026-04-12 - Share direct cleanup final return block
 
 - jj change id: `lqtorwoq`

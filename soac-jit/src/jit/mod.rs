@@ -4808,22 +4808,8 @@ fn emit_positional_vectorcall_with_local_env(
     jit_module: &mut JITModule,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> ir::Value {
-    let mut arg_values: Vec<ir::Value> = Vec::with_capacity(args.len());
-    let mut arg_borrowed: Vec<bool> = Vec::with_capacity(args.len());
-    for arg in args {
-        let borrowed_arg =
-            codegen_expr_pyobject_input_is_borrowed_from_local_env(arg, local_env, ctx);
-        arg_borrowed.push(borrowed_arg);
-        arg_values.push(emit_codegen_expr_with_local_env(
-            fb,
-            arg,
-            local_env,
-            ctx,
-            borrowed_arg,
-            jit_module,
-            func_imports,
-        ));
-    }
+    let (arg_values, arg_borrowed) =
+        emit_positional_arg_values(fb, args, local_env, ctx, jit_module, func_imports);
     emit_positional_vectorcall_with_arg_values(
         fb,
         callable,
@@ -4874,6 +4860,113 @@ fn emit_positional_vectorcall_with_arg_values(
         ],
     );
     let call_value = fb.inst_results(call_inst)[0];
+    emit_checked_positional_call_result(
+        fb,
+        callable,
+        callable_is_borrowed,
+        arg_values,
+        arg_borrowed,
+        call_value,
+        ctx,
+    )
+}
+
+fn emit_positional_call_three_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    callable: ir::Value,
+    callable_is_borrowed: bool,
+    args: &[&InstrCodegen],
+    local_env: &mut LocalEnv,
+    ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> ir::Value {
+    debug_assert!(args.len() <= 3);
+    let (arg_values, arg_borrowed) =
+        emit_positional_arg_values(fb, args, local_env, ctx, jit_module, func_imports);
+    emit_positional_call_three_with_arg_values(
+        fb,
+        callable,
+        callable_is_borrowed,
+        arg_values,
+        arg_borrowed,
+        ctx,
+    )
+}
+
+fn emit_positional_arg_values(
+    fb: &mut FunctionBuilder<'_>,
+    args: &[&InstrCodegen],
+    local_env: &mut LocalEnv,
+    ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> (Vec<ir::Value>, Vec<bool>) {
+    let mut arg_values: Vec<ir::Value> = Vec::with_capacity(args.len());
+    let mut arg_borrowed: Vec<bool> = Vec::with_capacity(args.len());
+    for arg in args {
+        let borrowed_arg =
+            codegen_expr_pyobject_input_is_borrowed_from_local_env(arg, local_env, ctx);
+        arg_borrowed.push(borrowed_arg);
+        arg_values.push(emit_codegen_expr_with_local_env(
+            fb,
+            arg,
+            local_env,
+            ctx,
+            borrowed_arg,
+            jit_module,
+            func_imports,
+        ));
+    }
+    (arg_values, arg_borrowed)
+}
+
+fn emit_positional_call_three_with_arg_values(
+    fb: &mut FunctionBuilder<'_>,
+    callable: ir::Value,
+    callable_is_borrowed: bool,
+    arg_values: Vec<ir::Value>,
+    arg_borrowed: Vec<bool>,
+    ctx: &JitEmitCtx<'_>,
+) -> ir::Value {
+    debug_assert_eq!(arg_values.len(), arg_borrowed.len());
+    debug_assert!(arg_values.len() <= 3);
+    let null_ptr = fb.ins().iconst(ctx.consts.ptr_ty, 0);
+    let arg1 = arg_values.first().copied().unwrap_or(null_ptr);
+    let arg2 = arg_values.get(1).copied().unwrap_or(null_ptr);
+    let arg3 = arg_values.get(2).copied().unwrap_or(null_ptr);
+    let call_inst = fb.ins().call(
+        ctx.py_call_positional_three_ref,
+        &[
+            ctx.consts.thread_state_value,
+            callable,
+            arg1,
+            arg2,
+            arg3,
+            null_ptr,
+        ],
+    );
+    let call_value = fb.inst_results(call_inst)[0];
+    emit_checked_positional_call_result(
+        fb,
+        callable,
+        callable_is_borrowed,
+        arg_values,
+        arg_borrowed,
+        call_value,
+        ctx,
+    )
+}
+
+fn emit_checked_positional_call_result(
+    fb: &mut FunctionBuilder<'_>,
+    callable: ir::Value,
+    callable_is_borrowed: bool,
+    arg_values: Vec<ir::Value>,
+    arg_borrowed: Vec<bool>,
+    call_value: ir::Value,
+    ctx: &JitEmitCtx<'_>,
+) -> ir::Value {
     let mut owned_inputs =
         Vec::with_capacity(arg_values.len() + usize::from(!callable_is_borrowed));
     for (value, borrowed_arg) in arg_values.into_iter().zip(arg_borrowed.into_iter()) {
@@ -8407,16 +8500,29 @@ fn emit_codegen_simple_call_with_local_env(
             if let Some(counter_id) = direct_fallback_counter_id {
                 let _ = emit_increment_counter(fb, counter_id, emit_ctx);
             }
-            let generic_result = emit_positional_vectorcall_with_local_env(
-                fb,
-                callable,
-                false,
-                simple_args.as_slice(),
-                local_env,
-                emit_ctx,
-                jit_module,
-                func_imports,
-            );
+            let generic_result = if simple_args.len() <= 3 {
+                emit_positional_call_three_with_local_env(
+                    fb,
+                    callable,
+                    false,
+                    simple_args.as_slice(),
+                    local_env,
+                    emit_ctx,
+                    jit_module,
+                    func_imports,
+                )
+            } else {
+                emit_positional_vectorcall_with_local_env(
+                    fb,
+                    callable,
+                    false,
+                    simple_args.as_slice(),
+                    local_env,
+                    emit_ctx,
+                    jit_module,
+                    func_imports,
+                )
+            };
             fb.ins()
                 .jump(result_block, &[ir::BlockArg::Value(generic_result)]);
             fb.switch_to_block(result_block);
@@ -8579,16 +8685,29 @@ fn emit_codegen_simple_call_with_local_env(
             if let Some(counter_id) = direct_fallback_counter_id {
                 let _ = emit_increment_counter(fb, counter_id, emit_ctx);
             }
-            let generic_result = emit_positional_vectorcall_with_local_env(
-                fb,
-                callable,
-                callable_is_borrowed,
-                simple_args.as_slice(),
-                local_env,
-                emit_ctx,
-                jit_module,
-                func_imports,
-            );
+            let generic_result = if simple_args.len() <= 3 {
+                emit_positional_call_three_with_local_env(
+                    fb,
+                    callable,
+                    callable_is_borrowed,
+                    simple_args.as_slice(),
+                    local_env,
+                    emit_ctx,
+                    jit_module,
+                    func_imports,
+                )
+            } else {
+                emit_positional_vectorcall_with_local_env(
+                    fb,
+                    callable,
+                    callable_is_borrowed,
+                    simple_args.as_slice(),
+                    local_env,
+                    emit_ctx,
+                    jit_module,
+                    func_imports,
+                )
+            };
             fb.ins()
                 .jump(result_block, &[ir::BlockArg::Value(generic_result)]);
             fb.switch_to_block(result_block);

@@ -124,3 +124,33 @@ def test_apply_mode_direct_constructor_failure_preserves_exception(tmp_path: Pat
     ]
     assert direct_edge_rows, rows
     assert result == ["Marker", "boom:7", True]
+
+
+def test_apply_mode_direct_call_miss_uses_generic_fallback(tmp_path: Path) -> None:
+    result, rows = _run_apply_module(
+        tmp_path,
+        "direct_call_small_fallback",
+        """
+        import os
+
+        def profiled_target(left, right):
+            return left + right
+
+        def fallback_target(left, right):
+            return left * right
+
+        def run():
+            target = profiled_target
+            if os.environ.get("SOAC_OPT_MODE") == "apply":
+                target = fallback_target
+            return target(6, 7)
+        """,
+    )
+
+    direct_edge_rows = [
+        row
+        for row in rows
+        if row.get("target") == "soac_jit_direct_edges" and row.get("clif_direct_edges", 0) > 0
+    ]
+    assert direct_edge_rows, rows
+    assert result == 42
