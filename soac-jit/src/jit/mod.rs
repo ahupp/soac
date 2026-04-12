@@ -2985,6 +2985,49 @@ fn emit_local_store_with_local_env(
     jit_module: &mut JITModule,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Option<ir::Value> {
+    let result = emit_local_store_result_with_local_env(
+        fb,
+        expr,
+        op,
+        local_env,
+        emit_ctx,
+        ResultDemand::PYOBJECT_OWNED,
+        jit_module,
+        func_imports,
+    )?;
+    let (value, ownership, _) = result.expect_pyobject("legacy local store result");
+    assert!(
+        ownership.is_owned(),
+        "legacy local store result should produce an owned PyObject"
+    );
+    Some(value)
+}
+
+fn emit_none_for_demand(
+    fb: &mut FunctionBuilder<'_>,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+) -> EmitResult {
+    match demand {
+        ResultDemand::EffectOnly => EmitResult::no_value(),
+        ResultDemand::PyObject { .. } => {
+            fb.ins()
+                .call(emit_ctx.incref_ref, &[emit_ctx.consts.none_const]);
+            EmitResult::owned_pyobject(emit_ctx.consts.none_const, PyObjFacts::none_singleton())
+        }
+    }
+}
+
+fn emit_local_store_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    expr: &InstrCodegen,
+    op: &Store<InstrCodegen>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Option<EmitResult> {
     if let Some(location) = op.name.local_location() {
         let layout = emit_ctx
             .storage_layout
@@ -3006,9 +3049,7 @@ fn emit_local_store_with_local_env(
                     emit_ctx.decref_ref,
                 )
                 .unwrap_or_else(|error| panic!("{error}"));
-            fb.ins()
-                .call(emit_ctx.incref_ref, &[emit_ctx.consts.none_const]);
-            return Some(emit_ctx.consts.none_const);
+            return Some(emit_none_for_demand(fb, emit_ctx, demand));
         }
         let value = emit_codegen_expr_with_local_env(
             fb,
@@ -3037,9 +3078,7 @@ fn emit_local_store_with_local_env(
             emit_ctx.incref_ref,
             emit_ctx.decref_ref,
         );
-        fb.ins()
-            .call(emit_ctx.incref_ref, &[emit_ctx.consts.none_const]);
-        return Some(emit_ctx.consts.none_const);
+        return Some(emit_none_for_demand(fb, emit_ctx, demand));
     }
 
     let location = op.name.cell_location()?;
@@ -3105,9 +3144,7 @@ fn emit_local_store_with_local_env(
             emit_ctx.decref_ref,
         );
     }
-    fb.ins()
-        .call(emit_ctx.incref_ref, &[emit_ctx.consts.none_const]);
-    Some(emit_ctx.consts.none_const)
+    Some(emit_none_for_demand(fb, emit_ctx, demand))
 }
 
 fn emit_local_delete_with_local_env(
@@ -3116,6 +3153,28 @@ fn emit_local_delete_with_local_env(
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
 ) -> Option<ir::Value> {
+    let result = emit_local_delete_result_with_local_env(
+        fb,
+        op,
+        local_env,
+        emit_ctx,
+        ResultDemand::PYOBJECT_OWNED,
+    )?;
+    let (value, ownership, _) = result.expect_pyobject("legacy local delete result");
+    assert!(
+        ownership.is_owned(),
+        "legacy local delete result should produce an owned PyObject"
+    );
+    Some(value)
+}
+
+fn emit_local_delete_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    op: &Del<InstrCodegen>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+) -> Option<EmitResult> {
     let location = op.name.local_location()?;
     let layout = emit_ctx
         .storage_layout
@@ -3133,9 +3192,7 @@ fn emit_local_delete_with_local_env(
             emit_ctx.decref_ref,
         )
         .unwrap_or_else(|error| panic!("{error}"));
-    fb.ins()
-        .call(emit_ctx.incref_ref, &[emit_ctx.consts.none_const]);
-    Some(emit_ctx.consts.none_const)
+    Some(emit_none_for_demand(fb, emit_ctx, demand))
 }
 
 #[derive(Clone)]
@@ -8609,6 +8666,30 @@ fn emit_codegen_stmt_result_with_local_env(
     jit_module: &mut JITModule,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<EmitResult, String> {
+    match expr {
+        InstrCodegen::Store(op) => {
+            if let Some(result) = emit_local_store_result_with_local_env(
+                fb,
+                expr,
+                op,
+                local_env,
+                emit_ctx,
+                demand,
+                jit_module,
+                func_imports,
+            ) {
+                return Ok(result);
+            }
+        }
+        InstrCodegen::Del(op) => {
+            if let Some(result) =
+                emit_local_delete_result_with_local_env(fb, op, local_env, emit_ctx, demand)
+            {
+                return Ok(result);
+            }
+        }
+        _ => {}
+    }
     let value =
         emit_codegen_stmt_with_local_env(fb, expr, local_env, emit_ctx, jit_module, func_imports);
     Ok(match demand {

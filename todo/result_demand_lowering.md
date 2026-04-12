@@ -119,8 +119,10 @@ result before returning `NoValue`.
 Status: step 1 has the initial codegen-local `ResultDemand`, `ValueOwnership`,
 and `EmitResult` wrappers in `soac-jit/src/jit/typed_value.rs`. Step 2 has
 started: statement-position JIT emission now requests `EffectOnly` through a
-typed result wrapper, but the underlying producers still use the legacy
-object-producing path before the wrapper discards the result.
+typed result wrapper. LocalEnv-backed `Store` and `Del` producers now honor
+`EffectOnly` directly and return `NoValue`; non-local cell/global producers and
+generic calls still use the legacy object-producing path before the wrapper
+discards the result.
 
 1. Add `ResultDemand::{EffectOnly, PyObject { borrowed_ok }}` and an `EmitResult`
    wrapper near the existing `SoacValue`/LocalEnv codegen types.
