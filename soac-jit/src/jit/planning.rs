@@ -387,6 +387,20 @@ pub struct PlannedStackSlotEntrySeed {
     pub entry_ref_kind: LocalRefKind,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlannedLocalEnvEntrySource {
+    BlockParam { param_index: usize },
+    StackSlotLoad,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlannedLocalEnvEntryMaterialization {
+    pub binding: PlannedLocalBinding,
+    pub entry_aliases: Vec<String>,
+    pub source: PlannedLocalEnvEntrySource,
+    pub entry_ref_kind: LocalRefKind,
+}
+
 #[derive(Clone, Debug)]
 pub struct PlannedJitFunctionLocals {
     pub local_plan: FunctionLocalPlan,
@@ -395,6 +409,7 @@ pub struct PlannedJitFunctionLocals {
     pub implicit_target_transports: Vec<EdgeTransportPlan>,
     pub jump_edge_transports: Vec<Option<EdgeTransportPlan>>,
     pub stack_slot_entry_seeds: Vec<Vec<PlannedStackSlotEntrySeed>>,
+    pub entry_materializations: Vec<Vec<PlannedLocalEnvEntryMaterialization>>,
     pub exc_dispatches: Vec<Option<BlockExcDispatchPlan>>,
 }
 
@@ -514,6 +529,7 @@ impl PlannedJitFunctionLocals {
             || self.implicit_target_transports.len() != block_count
             || self.jump_edge_transports.len() != block_count
             || self.stack_slot_entry_seeds.len() != block_count
+            || self.entry_materializations.len() != block_count
             || self.exc_dispatches.len() != block_count
         {
             return Err(format!(
@@ -526,7 +542,8 @@ impl PlannedJitFunctionLocals {
             let block_plan = self.local_plan.block(block.label);
             if block_plan.is_none()
                 && (!self.runtime_block_params[index].is_empty()
-                    || !self.stack_slot_entry_seeds[index].is_empty())
+                    || !self.stack_slot_entry_seeds[index].is_empty()
+                    || !self.entry_materializations[index].is_empty())
             {
                 return Err(format!(
                     "planned JIT local state for function {} ({}) is missing block {}",
@@ -569,6 +586,14 @@ impl PlannedJitFunctionLocals {
                     ));
                 }
             }
+            validate_entry_materializations_for_block(
+                function,
+                block.label,
+                index,
+                &self.runtime_block_params[index],
+                &self.stack_slot_entry_seeds[index],
+                &self.entry_materializations[index],
+            )?;
 
             let expected_jump = matches!(block.term, BlockTerm::Jump(_));
             if self.jump_edge_transports[index].is_some() != expected_jump {
@@ -621,6 +646,67 @@ impl PlannedJitFunctionLocals {
 
         Ok(())
     }
+}
+
+fn validate_entry_materializations_for_block(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    block_label: BlockLabel,
+    block_index: usize,
+    runtime_params: &[RuntimeBlockParamPlan],
+    stack_slot_entry_seeds: &[PlannedStackSlotEntrySeed],
+    entry_materializations: &[PlannedLocalEnvEntryMaterialization],
+) -> Result<(), String> {
+    let expected_count = runtime_params.len() + stack_slot_entry_seeds.len();
+    if entry_materializations.len() != expected_count {
+        return Err(format!(
+            "entry materialization count mismatch for function {} ({}) block {}: expected {}, got {}",
+            function.function_id,
+            function.names.qualname,
+            block_label,
+            expected_count,
+            entry_materializations.len()
+        ));
+    }
+    for (param_index, param) in runtime_params.iter().enumerate() {
+        let Some(entry) = entry_materializations.get(param_index) else {
+            unreachable!("count checked above");
+        };
+        let expected_entry_ref_kind = match param.binding.storage {
+            PlannedLocalStorage::BlockParam => param.binding.param_facts.ownership,
+            PlannedLocalStorage::StackSlot => {
+                local_ref_kind_for_stack_mirror(param.binding.param_facts.ownership)
+            }
+        };
+        if entry.source != (PlannedLocalEnvEntrySource::BlockParam { param_index })
+            || entry.binding != param.binding
+            || entry.entry_aliases != param.entry_aliases
+            || entry.entry_ref_kind != expected_entry_ref_kind
+        {
+            return Err(format!(
+                "runtime-param entry materialization mismatch for function {} ({}) block {} \
+                 param index {}",
+                function.function_id, function.names.qualname, block_label, block_index
+            ));
+        }
+    }
+    for (seed_index, seed) in stack_slot_entry_seeds.iter().enumerate() {
+        let materialization_index = runtime_params.len() + seed_index;
+        let Some(entry) = entry_materializations.get(materialization_index) else {
+            unreachable!("count checked above");
+        };
+        if entry.source != PlannedLocalEnvEntrySource::StackSlotLoad
+            || entry.binding != seed.binding
+            || !entry.entry_aliases.is_empty()
+            || entry.entry_ref_kind != seed.entry_ref_kind
+        {
+            return Err(format!(
+                "stack-slot entry materialization mismatch for function {} ({}) block {} \
+                 seed index {}",
+                function.function_id, function.names.qualname, block_label, seed_index
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn plan_jit_module_locals(
@@ -691,6 +777,15 @@ pub fn render_jit_function_locals(
                     .expect("writing to String should not fail");
             }
         }
+        writeln!(out, "    entry_materializations:").expect("writing to String should not fail");
+        for entry in &plan.entry_materializations[index] {
+            writeln!(
+                out,
+                "      {}",
+                render_local_env_entry_materialization(entry)
+            )
+            .expect("writing to String should not fail");
+        }
         writeln!(out, "    runtime_params:").expect("writing to String should not fail");
         for param in &plan.runtime_block_params[index] {
             writeln!(
@@ -754,6 +849,16 @@ pub fn render_jit_function_locals(
         }
     }
     Ok(out)
+}
+
+fn render_local_env_entry_materialization(entry: &PlannedLocalEnvEntryMaterialization) -> String {
+    format!(
+        "{} source={:?} entry_ref_kind={:?} aliases={:?}",
+        render_planned_local_binding(&entry.binding),
+        entry.source,
+        entry.entry_ref_kind,
+        entry.entry_aliases
+    )
 }
 
 fn render_planned_local_binding(binding: &PlannedLocalBinding) -> String {
@@ -910,6 +1015,51 @@ pub fn planned_stack_slot_entry_seeds_for_function(
                 .unwrap_or_default()
         })
         .collect()
+}
+
+pub fn planned_local_env_entry_materializations_for_function(
+    runtime_block_params: &[Vec<RuntimeBlockParamPlan>],
+    stack_slot_entry_seeds: &[Vec<PlannedStackSlotEntrySeed>],
+) -> Result<Vec<Vec<PlannedLocalEnvEntryMaterialization>>, String> {
+    if runtime_block_params.len() != stack_slot_entry_seeds.len() {
+        return Err(format!(
+            "entry materialization inputs have inconsistent block counts: runtime={}, stack_seeds={}",
+            runtime_block_params.len(),
+            stack_slot_entry_seeds.len()
+        ));
+    }
+    Ok(runtime_block_params
+        .iter()
+        .zip(stack_slot_entry_seeds.iter())
+        .map(|(params, seeds)| {
+            let mut entries = Vec::with_capacity(params.len() + seeds.len());
+            entries.extend(params.iter().enumerate().map(|(param_index, param)| {
+                let entry_ref_kind = match param.binding.storage {
+                    PlannedLocalStorage::BlockParam => param.binding.param_facts.ownership,
+                    PlannedLocalStorage::StackSlot => {
+                        local_ref_kind_for_stack_mirror(param.binding.param_facts.ownership)
+                    }
+                };
+                PlannedLocalEnvEntryMaterialization {
+                    binding: param.binding.clone(),
+                    entry_aliases: param.entry_aliases.clone(),
+                    source: PlannedLocalEnvEntrySource::BlockParam { param_index },
+                    entry_ref_kind,
+                }
+            }));
+            entries.extend(
+                seeds
+                    .iter()
+                    .map(|seed| PlannedLocalEnvEntryMaterialization {
+                        binding: seed.binding.clone(),
+                        entry_aliases: Vec::new(),
+                        source: PlannedLocalEnvEntrySource::StackSlotLoad,
+                        entry_ref_kind: seed.entry_ref_kind,
+                    }),
+            );
+            entries
+        })
+        .collect())
 }
 
 pub fn plan_edge_transport(
@@ -1092,6 +1242,10 @@ pub fn plan_jit_function_locals(
     let jump_edge_transports =
         planned_jump_edge_transports_for_function(function, &runtime_block_params);
     let stack_slot_entry_seeds = planned_stack_slot_entry_seeds_for_function(function, &local_plan);
+    let entry_materializations = planned_local_env_entry_materializations_for_function(
+        &runtime_block_params,
+        &stack_slot_entry_seeds,
+    )?;
     let exc_dispatches = function
         .blocks
         .iter()
@@ -1112,6 +1266,7 @@ pub fn plan_jit_function_locals(
         implicit_target_transports,
         jump_edge_transports,
         stack_slot_entry_seeds,
+        entry_materializations,
         exc_dispatches,
     };
     plan.validate_for_function(function)?;
@@ -1547,7 +1702,34 @@ def f(flag):
         assert_eq!(plan.implicit_target_transports.len(), function.blocks.len());
         assert_eq!(plan.jump_edge_transports.len(), function.blocks.len());
         assert_eq!(plan.stack_slot_entry_seeds.len(), function.blocks.len());
+        assert_eq!(plan.entry_materializations.len(), function.blocks.len());
         assert_eq!(plan.exc_dispatches.len(), function.blocks.len());
+        let materialization_count = plan
+            .entry_materializations
+            .iter()
+            .map(Vec::len)
+            .sum::<usize>();
+        let runtime_param_count = plan
+            .runtime_block_params
+            .iter()
+            .map(Vec::len)
+            .sum::<usize>();
+        let stack_seed_count = plan
+            .stack_slot_entry_seeds
+            .iter()
+            .map(Vec::len)
+            .sum::<usize>();
+        assert_eq!(
+            materialization_count,
+            runtime_param_count + stack_seed_count
+        );
+        assert!(
+            plan.entry_materializations
+                .iter()
+                .flatten()
+                .any(|entry| matches!(entry.source, PlannedLocalEnvEntrySource::BlockParam { .. })),
+            "expected block-param entry materialization to be represented in the pre-codegen plan"
+        );
         assert!(
             plan.exc_dispatches.iter().any(Option::is_some),
             "expected exception dispatches to be represented in the pre-codegen plan"
@@ -1567,6 +1749,87 @@ def f(flag):
                 .any(|name| name.starts_with("_dp_try_exc_")),
             "expected exception state stack slots to be represented in the pre-codegen plan: {required_stack_slot_names:?}"
         );
+    }
+
+    #[test]
+    fn planned_local_env_entry_materializations_preserve_sources() {
+        let block_binding = PlannedLocalBinding {
+            name: "x".to_string(),
+            location: LocalLocation(0),
+            storage: PlannedLocalStorage::BlockParam,
+            param_facts: BlockParamFacts {
+                value: None,
+                binding: ParamBindingFacts::DefinitelyBound,
+                provenance: ParamProvenance::ExplicitBlockParam(LocalLocation(0)),
+                ownership: LocalRefKind::Owned,
+            },
+        };
+        let stack_binding = PlannedLocalBinding {
+            name: "y".to_string(),
+            location: LocalLocation(1),
+            storage: PlannedLocalStorage::StackSlot,
+            param_facts: BlockParamFacts {
+                value: None,
+                binding: ParamBindingFacts::CheckedLocalValue,
+                provenance: ParamProvenance::StackSlot(LocalLocation(1)),
+                ownership: LocalRefKind::Owned,
+            },
+        };
+        let stack_runtime_binding = PlannedLocalBinding {
+            name: "z".to_string(),
+            location: LocalLocation(2),
+            storage: PlannedLocalStorage::StackSlot,
+            param_facts: BlockParamFacts {
+                value: None,
+                binding: ParamBindingFacts::DefinitelyBound,
+                provenance: ParamProvenance::ForwardedLocal(LocalLocation(2)),
+                ownership: LocalRefKind::Owned,
+            },
+        };
+        let runtime_params = vec![vec![
+            RuntimeBlockParamPlan {
+                arg_name: "x".to_string(),
+                binding: block_binding.clone(),
+                entry_aliases: vec!["x_alias".to_string()],
+            },
+            RuntimeBlockParamPlan {
+                arg_name: "z".to_string(),
+                binding: stack_runtime_binding.clone(),
+                entry_aliases: Vec::new(),
+            },
+        ]];
+        let stack_slot_entry_seeds = vec![vec![PlannedStackSlotEntrySeed {
+            binding: stack_binding.clone(),
+            entry_ref_kind: LocalRefKind::Borrowed,
+        }]];
+
+        let entries = planned_local_env_entry_materializations_for_function(
+            &runtime_params,
+            &stack_slot_entry_seeds,
+        )
+        .expect("entry materialization planning should succeed");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].len(), 3);
+        assert_eq!(entries[0][0].binding, block_binding);
+        assert_eq!(entries[0][0].entry_aliases, vec!["x_alias"]);
+        assert_eq!(
+            entries[0][0].source,
+            PlannedLocalEnvEntrySource::BlockParam { param_index: 0 }
+        );
+        assert_eq!(entries[0][0].entry_ref_kind, LocalRefKind::Owned);
+        assert_eq!(entries[0][1].binding, stack_runtime_binding);
+        assert_eq!(
+            entries[0][1].source,
+            PlannedLocalEnvEntrySource::BlockParam { param_index: 1 }
+        );
+        assert_eq!(entries[0][1].entry_ref_kind, LocalRefKind::Borrowed);
+        assert_eq!(entries[0][2].binding, stack_binding);
+        assert_eq!(
+            entries[0][2].source,
+            PlannedLocalEnvEntrySource::StackSlotLoad
+        );
+        assert_eq!(entries[0][2].entry_ref_kind, LocalRefKind::Borrowed);
     }
 
     #[test]

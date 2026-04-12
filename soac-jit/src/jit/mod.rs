@@ -73,11 +73,13 @@ use direct_abi::{
 pub use planning::{
     BlockExcDispatchPlan, BlockParamFacts, CurrentJitRefcountPlanCheck, EdgeTransportPlan,
     FunctionLocalPlan, LocalRefKind, ParamBindingFacts, ParamProvenance, PlannedJitFunctionLocals,
-    PlannedJitModuleLocals, PlannedLocalStorage, PlannedStackSlotEntrySeed, RuntimeBlockParamPlan,
+    PlannedJitModuleLocals, PlannedLocalEnvEntryMaterialization, PlannedLocalEnvEntrySource,
+    PlannedLocalStorage, PlannedStackSlotEntrySeed, RuntimeBlockParamPlan,
     check_refcount_plan_against_current_jit, exc_dispatch_plan, local_ref_kind_for_stack_mirror,
     plan_function_locals, plan_function_refcount_ownership, plan_jit_function_locals,
     plan_jit_module_locals, planned_implicit_target_transports_for_function,
     planned_jit_params_for_function, planned_jump_edge_transports_for_function,
+    planned_local_env_entry_materializations_for_function,
     planned_stack_slot_entry_seeds_for_function, render_jit_function_locals,
     render_jit_module_locals,
 };
@@ -2976,44 +2978,6 @@ impl LocalEnv {
     }
 }
 
-fn bind_planned_stack_slot_entries_at_block_entry(
-    fb: &mut FunctionBuilder<'_>,
-    stack_slot_entry_seeds: &[PlannedStackSlotEntrySeed],
-    local_env: &mut LocalEnv,
-    stack_slots: &StackSlots,
-    ptr_ty: ir::Type,
-) -> Result<(), String> {
-    for seed in stack_slot_entry_seeds {
-        let binding = &seed.binding;
-        if local_env
-            .entry_index_for_location(binding.location)
-            .or_else(|| local_env.entry_index_for_name(binding.name.as_str()))
-            .is_some()
-        {
-            continue;
-        }
-        let slot = stack_slots
-            .slot_for_block_arg_name(binding.name.as_str())
-            .ok_or_else(|| {
-                format!(
-                    "planned stack-slot entry binding for {} is missing stack storage",
-                    binding.name
-                )
-            })?;
-        let value = fb.ins().stack_load(ptr_ty, slot, 0);
-        local_env.bind_entry_location_with_aliases(
-            binding.location,
-            binding.name.as_str(),
-            Vec::new(),
-            value,
-            seed.entry_ref_kind,
-            LocalEnvStorage::StackMirror,
-            binding.param_facts.binding,
-        );
-    }
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 fn bind_planned_local_env_at_block_entry(
     fb: &mut FunctionBuilder<'_>,
@@ -3027,72 +2991,81 @@ fn bind_planned_local_env_at_block_entry(
     incref_ref: ir::FuncRef,
     decref_ref: ir::FuncRef,
 ) -> Result<(), String> {
-    bind_runtime_block_param_values_at_block_entry(
-        fb,
-        &jit_local_plan.runtime_block_params[block_index],
-        block_param_values,
-        local_env,
-        stack_slots,
-        ptr_ty,
-        thread_state_value,
-        incref_ref,
-        decref_ref,
-    )?;
-    bind_planned_stack_slot_entries_at_block_entry(
-        fb,
-        &jit_local_plan.stack_slot_entry_seeds[block_index],
-        local_env,
-        stack_slots,
-        ptr_ty,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn bind_runtime_block_param_values_at_block_entry(
-    fb: &mut FunctionBuilder<'_>,
-    runtime_params: &[RuntimeBlockParamPlan],
-    block_param_values: &[ir::Value],
-    local_env: &mut LocalEnv,
-    stack_slots: &StackSlots,
-    ptr_ty: ir::Type,
-    thread_state_value: ir::Value,
-    incref_ref: ir::FuncRef,
-    decref_ref: ir::FuncRef,
-) -> Result<(), String> {
-    for (param, param_value) in runtime_params.iter().zip(block_param_values.iter()) {
-        let binding = &param.binding;
-        let entry_storage = match binding.storage {
-            PlannedLocalStorage::BlockParam => LocalEnvStorage::LocalOnly,
-            PlannedLocalStorage::StackSlot => LocalEnvStorage::StackMirror,
-        };
-        let entry_ref_kind = match entry_storage {
-            LocalEnvStorage::LocalOnly => binding.param_facts.ownership,
-            LocalEnvStorage::StackMirror => {
-                local_ref_kind_for_stack_mirror(binding.param_facts.ownership)
-            }
-        };
-        local_env.bind_entry_location_with_aliases(
-            binding.location,
-            binding.name.as_str(),
-            param.entry_aliases.clone(),
-            *param_value,
-            entry_ref_kind,
-            entry_storage,
-            binding.param_facts.binding,
-        );
-        if entry_storage == LocalEnvStorage::StackMirror {
-            stack_slots
-                .replace_cloned_value(
-                    fb,
+    for entry in &jit_local_plan.entry_materializations[block_index] {
+        let binding = &entry.binding;
+        match entry.source {
+            PlannedLocalEnvEntrySource::BlockParam { param_index } => {
+                let param_value =
+                    block_param_values
+                        .get(param_index)
+                        .copied()
+                        .ok_or_else(|| {
+                            format!(
+                                "planned LocalEnv block param {} for {} is missing runtime value",
+                                param_index, binding.name
+                            )
+                        })?;
+                let entry_storage = match binding.storage {
+                    PlannedLocalStorage::BlockParam => LocalEnvStorage::LocalOnly,
+                    PlannedLocalStorage::StackSlot => LocalEnvStorage::StackMirror,
+                };
+                local_env.bind_entry_location_with_aliases(
+                    binding.location,
                     binding.name.as_str(),
-                    *param_value,
-                    ptr_ty,
-                    thread_state_value,
-                    incref_ref,
-                    decref_ref,
-                )
-                .expect("runtime block param missing from stack slots");
-            emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, *param_value);
+                    entry.entry_aliases.clone(),
+                    param_value,
+                    entry.entry_ref_kind,
+                    entry_storage,
+                    binding.param_facts.binding,
+                );
+                if entry_storage == LocalEnvStorage::StackMirror {
+                    stack_slots
+                        .replace_cloned_value(
+                            fb,
+                            binding.name.as_str(),
+                            param_value,
+                            ptr_ty,
+                            thread_state_value,
+                            incref_ref,
+                            decref_ref,
+                        )
+                        .expect("runtime block param missing from stack slots");
+                    emit_decref_if_not_null(
+                        fb,
+                        ptr_ty,
+                        decref_ref,
+                        thread_state_value,
+                        param_value,
+                    );
+                }
+            }
+            PlannedLocalEnvEntrySource::StackSlotLoad => {
+                if local_env
+                    .entry_index_for_location(binding.location)
+                    .or_else(|| local_env.entry_index_for_name(binding.name.as_str()))
+                    .is_some()
+                {
+                    continue;
+                }
+                let slot = stack_slots
+                    .slot_for_block_arg_name(binding.name.as_str())
+                    .ok_or_else(|| {
+                        format!(
+                            "planned stack-slot entry binding for {} is missing stack storage",
+                            binding.name
+                        )
+                    })?;
+                let value = fb.ins().stack_load(ptr_ty, slot, 0);
+                local_env.bind_entry_location_with_aliases(
+                    binding.location,
+                    binding.name.as_str(),
+                    entry.entry_aliases.clone(),
+                    value,
+                    entry.entry_ref_kind,
+                    LocalEnvStorage::StackMirror,
+                    binding.param_facts.binding,
+                );
+            }
         }
     }
     Ok(())
@@ -12336,7 +12309,7 @@ fn build_cranelift_run_bb_specialized_function(
         let runtime_block_params = &jit_local_plan.runtime_block_params;
         let implicit_target_transports = &jit_local_plan.implicit_target_transports;
         let jump_edge_transports = &jit_local_plan.jump_edge_transports;
-        let planned_stack_slot_entry_seeds = &jit_local_plan.stack_slot_entry_seeds;
+        let entry_materializations = &jit_local_plan.entry_materializations;
         let exc_dispatches = &jit_local_plan.exc_dispatches;
         let refcount_plan = &jit_local_plan.refcount_plan;
         let full_block_param_names = function
@@ -12650,9 +12623,12 @@ fn build_cranelift_run_bb_specialized_function(
             .iter()
             .map(|param| param.binding.name.as_str())
             .collect::<HashSet<_>>();
-        let entry_stack_seed_param_names = planned_stack_slot_entry_seeds[0]
+        let entry_stack_seed_param_names = entry_materializations[0]
             .iter()
-            .map(|seed| seed.binding.name.as_str())
+            .filter_map(|entry| {
+                matches!(entry.source, PlannedLocalEnvEntrySource::StackSlotLoad)
+                    .then_some(entry.binding.name.as_str())
+            })
             .collect::<HashSet<_>>();
         let mut entry_param_values = HashMap::new();
         for (param_index, (param, value)) in function

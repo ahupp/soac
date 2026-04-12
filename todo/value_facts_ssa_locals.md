@@ -528,3 +528,7 @@ Started:
   that takes the `PlannedJitFunctionLocals` and block index, instead of
   open-coding separate runtime-param and stack-seed binding calls in the main
   Cranelift block loop.
+- The JIT local plan now also contains explicit per-block `LocalEnv`
+  materialization entries. Each entry says whether the value comes from a
+  runtime block param or a stack-slot load, and codegen lowers that source list
+  instead of interpreting runtime params and stack-slot seeds independently.
