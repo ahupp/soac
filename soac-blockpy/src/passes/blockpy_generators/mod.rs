@@ -1482,7 +1482,10 @@ fn emit_yield_from_site(
     state.push_block(
         BlockPyBlock {
             label: non_stopiter_label,
-            body: Vec::new(),
+            body: vec![internal_store_stmt(
+                "_dp_yieldfrom",
+                InstrUnresolved::constant_none(),
+            )],
             term: BlockTerm::Raise(TermRaise {
                 exc: Some(core_name(caught_exc_name.as_str())),
             }),

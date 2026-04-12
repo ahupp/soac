@@ -13486,11 +13486,19 @@ fn build_cranelift_run_bb_specialized_function(
                     .entry(source_name.as_str())
                     .or_insert(0usize) += 1;
             }
+            let released_forwarded_names = dispatch_plan
+                .release_local_names
+                .iter()
+                .map(String::as_str)
+                .collect::<HashSet<_>>();
             for (name, value) in dispatch_plan
                 .forwarded_local_names
                 .iter()
                 .zip(forwarded_local_values.iter().copied())
             {
+                if released_forwarded_names.contains(name.as_str()) {
+                    continue;
+                }
                 if forwarded_target_use_counts
                     .get(name.as_str())
                     .copied()
