@@ -3548,6 +3548,34 @@ def read_point(point):
         count
     }
 
+    fn direct_call_colocated_flags_to_runtime_helpers(
+        function: &ir::Function,
+        helpers: &[ir::UserExternalName],
+    ) -> Vec<bool> {
+        let mut colocated = Vec::new();
+        for block in function.layout.blocks() {
+            for inst in function.layout.block_insts(block) {
+                let callee = match function.dfg.insts[inst] {
+                    ir::InstructionData::Call { func_ref, .. }
+                    | ir::InstructionData::TryCall { func_ref, .. } => Some(func_ref),
+                    _ => None,
+                };
+                let Some(callee) = callee else {
+                    continue;
+                };
+                let ext_func = &function.dfg.ext_funcs[callee];
+                let ir::ExternalName::User(name_ref) = &ext_func.name else {
+                    continue;
+                };
+                let user_name = &function.params.user_named_funcs()[*name_ref];
+                if helpers.contains(user_name) {
+                    colocated.push(ext_func.colocated);
+                }
+            }
+        }
+        colocated
+    }
+
     fn parsed_runtime_clif_function(symbol: &str) -> ParsedRuntimeClifFunction {
         parse_runtime_clif_functions()
             .expect("runtime CLIF should parse")
@@ -6016,6 +6044,48 @@ def f(x, y):
                 && !rendered.contains("call dp_jit_py_call_object")
                 && !rendered.contains("call dp_jit_py_call_with_kw"),
             "generic positional calls should avoid the tuple/kwargs helper path:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn specialized_jit_import_helpers_use_direct_external_refs() {
+        let blocks = [1usize as ObjPtr];
+        let mut constants = TestConstantPool::default();
+        let function = with_single_test_block(
+            test_function(),
+            vec![],
+            ret_term(op_expr(Call::new(
+                name_expr(test_global_name("f")),
+                vec![
+                    CallArgPositional::Positional(constants.int_expr(1)),
+                    CallArgPositional::Positional(constants.int_expr(2)),
+                ],
+                vec![],
+            ))),
+        );
+        let mut module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
+        module.module_constants = constants.module_constants;
+        let function = module.callable_defs[0].clone();
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let built = build_test_jit_function_with_constants(
+            &module,
+            &function,
+            &blocks,
+            &module_constants,
+        );
+
+        let vectorcall_helpers =
+            import_user_names_for_symbols(&built, &[DP_JIT_PY_VECTORCALL_IMPORT.symbol]);
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &vectorcall_helpers),
+            1,
+            "generic positional calls should still call the vectorcall helper"
+        );
+        assert_eq!(
+            direct_call_colocated_flags_to_runtime_helpers(&built.ctx.func, &vectorcall_helpers),
+            vec![false],
+            "imported helpers should be direct external refs, not colocated local trampolines"
         );
     }
 

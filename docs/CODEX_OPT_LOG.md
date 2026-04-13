@@ -526,3 +526,22 @@ benchmarked throughput delta, and the headline pre/post numbers.
   - specialized pass, 1M loops x3: `336900`, `349622`, `345921 loops/s`
   - pystone JIT code bytes: `261630`
   - pystone machine blocks: `16998`
+
+## 2026-04-13 - Call imported JIT helpers directly
+
+- jj change id: `zwsqzyuv`
+- summary: Imported helper calls now keep the Cranelift `Linkage::Import`
+  declaration directly instead of defining a local helper-pointer data slot and
+  trampoline function per imported symbol. This removes the extra trampoline
+  call/return hop, but leaves Cranelift's far external target materialization at
+  each call site.
+- throughput: `+9.62%` specialized pystone median; code size `+1.37%`;
+  machine blocks `+0.02%`
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `319541`, `347491`, `338516 loops/s`
+  - pystone JIT code bytes: `174333`
+  - pystone machine blocks: `11257`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `373208`, `366708`, `371067 loops/s`
+  - pystone JIT code bytes: `176723`
+  - pystone machine blocks: `11259`

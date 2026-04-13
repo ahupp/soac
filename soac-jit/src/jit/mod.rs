@@ -98,7 +98,6 @@ pub use typed_value::{
 
 static RUNTIME_SUPPORT_LIBRARY: OnceLock<Result<RuntimeSupportLibrary, String>> = OnceLock::new();
 static NEXT_IMPORT_SPEC_ID: AtomicUsize = AtomicUsize::new(0);
-static NEXT_IMPORT_TRAMPOLINE_ID: AtomicUsize = AtomicUsize::new(0);
 static JIT_DATA_SYMBOLS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
 static TYPE_KEY_RUNTIME_REGISTRY: OnceLock<Mutex<HashMap<CounterDumpTypeKey, usize>>> =
     OnceLock::new();
@@ -779,7 +778,7 @@ impl ModuleFuncImports {
         }
         let sig = lower_static_signature(jit_module, spec.signature);
         let func_id = match spec.linkage {
-            Linkage::Import => define_import_trampoline_fn(jit_module, spec.symbol, &sig)?,
+            Linkage::Import => declare_import_fn(jit_module, spec.symbol, &sig)?,
             Linkage::Local => declare_local_fn(jit_module, spec.symbol, &sig)?,
             linkage => {
                 return Err(format!(
@@ -11788,59 +11787,6 @@ fn declare_import_fn(
     jit_module
         .declare_function(symbol, Linkage::Import, sig)
         .map_err(|err| format!("failed to declare imported {symbol} symbol: {err}"))
-}
-
-fn define_import_trampoline_fn(
-    jit_module: &mut JITModule,
-    symbol: &str,
-    sig: &ir::Signature,
-) -> Result<FuncId, String> {
-    let import_id = declare_import_fn(jit_module, symbol, sig)?;
-    let symbol_suffix = symbol.replace(|ch: char| !ch.is_ascii_alphanumeric(), "_");
-    let trampoline_index = NEXT_IMPORT_TRAMPOLINE_ID.fetch_add(1, Ordering::Relaxed);
-    let data_symbol = format!("__soac_import_target_{symbol_suffix}_{trampoline_index}");
-    let data_id = jit_module
-        .declare_data(&data_symbol, Linkage::Local, false, false)
-        .map_err(|err| format!("failed to declare import target data for {symbol}: {err}"))?;
-    let mut data = DataDescription::new();
-    data.define_zeroinit(std::mem::size_of::<usize>());
-    data.set_align(std::mem::align_of::<usize>() as u64);
-    let import_ref = jit_module.declare_func_in_data(import_id, &mut data);
-    data.write_function_addr(0, import_ref);
-    jit_module
-        .define_data(data_id, &data)
-        .map_err(|err| format!("failed to define import target data for {symbol}: {err}"))?;
-
-    let trampoline_symbol = format!("__soac_import_trampoline_{symbol_suffix}_{trampoline_index}");
-    let trampoline_id = declare_local_fn(jit_module, &trampoline_symbol, sig)?;
-    let ptr_ty = jit_module.target_config().pointer_type();
-    let mut ctx = jit_module.make_context();
-    ctx.func.signature = sig.clone();
-    let mut builder_ctx = FunctionBuilderContext::new();
-    {
-        let mut fb = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
-        let entry = fb.create_block();
-        fb.append_block_params_for_function_params(entry);
-        fb.switch_to_block(entry);
-        fb.seal_block(entry);
-
-        let target_data = jit_module.declare_data_in_func(data_id, &mut fb.func);
-        let target_slot = fb.ins().global_value(ptr_ty, target_data);
-        let target = fb
-            .ins()
-            .load(ptr_ty, ir::MemFlags::trusted(), target_slot, 0);
-        let sig_ref = fb.import_signature(sig.clone());
-        let args = fb.block_params(entry).to_vec();
-        let call_inst = fb.ins().call_indirect(sig_ref, target, &args);
-        let results = fb.inst_results(call_inst).to_vec();
-        fb.ins().return_(&results);
-        fb.finalize();
-    }
-    jit_module
-        .define_function(trampoline_id, &mut ctx)
-        .map_err(|err| format!("failed to define import trampoline for {symbol}: {err}"))?;
-    jit_module.clear_context(&mut ctx);
-    Ok(trampoline_id)
 }
 
 fn declare_local_fn(
