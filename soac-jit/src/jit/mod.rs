@@ -7,6 +7,7 @@ use crate::counter_dump::{
 };
 use crate::module_constants::{ModuleCodegenConstants, ModuleConstantId};
 use crate::module_type::{CounterRuntimeSlot, SharedModuleState, build_counter_storage_layout};
+use cranelift_codegen::binemit::Reloc;
 use cranelift_codegen::cfg_printer::CFGPrinter;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::inline::{Inline, InlineCommand};
@@ -17,7 +18,9 @@ use cranelift_codegen::settings::Configurable;
 use cranelift_control::ControlPlane;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch};
 use cranelift_jit::{ArenaMemoryProvider, JITBuilder, JITModule};
-use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module, ModuleReloc};
+use cranelift_module::{
+    DataDescription, DataId, FuncId, Linkage, Module, ModuleReloc, ModuleRelocTarget,
+};
 use cranelift_reader::parse_functions;
 use pyo3::ffi;
 use soac_blockpy::block_py::{
@@ -42,7 +45,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::ffi::{CStr, CString, c_void};
+use std::fs;
 use std::mem::offset_of;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -7055,6 +7060,107 @@ fn collect_runtime_counter_ids_by_kind(
         .collect()
 }
 
+#[derive(Clone)]
+struct SpecializationProfile<'a> {
+    module_name: Option<&'a str>,
+    counter_dump_path: Option<Cow<'a, Path>>,
+    behavior_change_indexed_stores: bool,
+    profiled_cold_blocks: bool,
+}
+
+impl<'a> SpecializationProfile<'a> {
+    fn from_runtime_state(shared_state: Option<&'a SharedModuleState>) -> Self {
+        let counter_dump_path = if shared_state.is_some() && !specialization_mode_is_profile() {
+            counter_dump_input_path_from_env()
+        } else {
+            None
+        };
+        Self {
+            module_name: shared_state.map(|shared_state| shared_state.module_name.as_str()),
+            counter_dump_path: counter_dump_path.map(Cow::Owned),
+            behavior_change_indexed_stores: behavior_change_indexed_stores_enabled(),
+            profiled_cold_blocks: profiled_cold_blocks_enabled(),
+        }
+    }
+
+    fn from_precompile(module_name: &'a str, counter_dump_path: Option<&'a Path>) -> Self {
+        Self {
+            module_name: Some(module_name),
+            counter_dump_path: counter_dump_path.map(Cow::Borrowed),
+            behavior_change_indexed_stores: true,
+            profiled_cold_blocks: profiled_cold_blocks_enabled(),
+        }
+    }
+
+    fn call_target_specializations(
+        &self,
+        function_id: FunctionId,
+    ) -> Result<HashMap<InstrId, Vec<FunctionId>>, String> {
+        let Some(module_name) = self.module_name else {
+            return Ok(HashMap::new());
+        };
+        let Some(path) = existing_counter_dump_path(self.counter_dump_path.as_deref()) else {
+            return Ok(HashMap::new());
+        };
+        read_call_target_specializations_from_file(path, module_name, function_id)
+    }
+
+    fn operator_specializations(
+        &self,
+        function_id: FunctionId,
+    ) -> Result<HashMap<InstrId, Vec<u64>>, String> {
+        let Some(module_name) = self.module_name else {
+            return Ok(HashMap::new());
+        };
+        let Some(path) = existing_counter_dump_path(self.counter_dump_path.as_deref()) else {
+            return Ok(HashMap::new());
+        };
+        read_operator_specializations_from_file(path, module_name, function_id)
+    }
+
+    fn branch_preferences(
+        &self,
+        function_id: FunctionId,
+    ) -> Result<HashMap<InstrId, bool>, String> {
+        let Some(module_name) = self.module_name else {
+            return Ok(HashMap::new());
+        };
+        let Some(path) = existing_counter_dump_path(self.counter_dump_path.as_deref()) else {
+            return Ok(HashMap::new());
+        };
+        read_branch_preferences_from_file(path, module_name, function_id)
+    }
+
+    fn field_index_specializations(
+        &self,
+    ) -> Result<HashMap<String, Vec<FieldIndexSpecialization>>, String> {
+        let Some(path) = existing_counter_dump_path(self.counter_dump_path.as_deref()) else {
+            return Ok(HashMap::new());
+        };
+        load_field_index_specializations_from_path(path)
+    }
+
+    fn cold_block_labels(
+        &self,
+        function: &BlockPyFunction<CodegenModuleShape>,
+    ) -> Result<HashSet<BlockLabel>, String> {
+        if !self.profiled_cold_blocks {
+            return Ok(HashSet::new());
+        }
+        let Some(module_name) = self.module_name else {
+            return Ok(HashSet::new());
+        };
+        let Some(path) = existing_counter_dump_path(self.counter_dump_path.as_deref()) else {
+            return Ok(HashSet::new());
+        };
+        collect_cold_block_labels_from_path(path, function, module_name)
+    }
+}
+
+fn existing_counter_dump_path(path: Option<&Path>) -> Option<&Path> {
+    path.filter(|path| path.exists())
+}
+
 fn load_call_target_specializations(
     module_name: &str,
     function_id: FunctionId,
@@ -7070,40 +7176,6 @@ fn load_call_target_specializations(
         return Ok(HashMap::new());
     }
     read_call_target_specializations_from_file(path, module_name, function_id)
-}
-
-fn load_operator_specializations(
-    module_name: &str,
-    function_id: FunctionId,
-) -> Result<HashMap<InstrId, Vec<u64>>, String> {
-    if specialization_mode_is_profile() {
-        return Ok(HashMap::new());
-    }
-    let Some(path) = counter_dump_input_path_from_env() else {
-        return Ok(HashMap::new());
-    };
-    let path = path.as_path();
-    if !path.exists() {
-        return Ok(HashMap::new());
-    }
-    read_operator_specializations_from_file(path, module_name, function_id)
-}
-
-fn load_branch_preferences(
-    module_name: &str,
-    function_id: FunctionId,
-) -> Result<HashMap<InstrId, bool>, String> {
-    if specialization_mode_is_profile() {
-        return Ok(HashMap::new());
-    }
-    let Some(path) = counter_dump_input_path_from_env() else {
-        return Ok(HashMap::new());
-    };
-    let path = path.as_path();
-    if !path.exists() {
-        return Ok(HashMap::new());
-    }
-    read_branch_preferences_from_file(path, module_name, function_id)
 }
 
 fn resolve_type_key_to_type(
@@ -7572,18 +7644,9 @@ fn field_index_specialization_for_type(
     }))
 }
 
-fn load_field_index_specializations()
--> Result<HashMap<String, Vec<FieldIndexSpecialization>>, String> {
-    if specialization_mode_is_profile() {
-        return Ok(HashMap::new());
-    }
-    let Some(path) = counter_dump_input_path_from_env() else {
-        return Ok(HashMap::new());
-    };
-    let path = path.as_path();
-    if !path.exists() {
-        return Ok(HashMap::new());
-    }
+fn load_field_index_specializations_from_path(
+    path: &Path,
+) -> Result<HashMap<String, Vec<FieldIndexSpecialization>>, String> {
     let dump = CounterDumpFile::open(path)?;
     let records = dump.records()?;
     let type_table = collect_type_table(records.as_slice())?;
@@ -7606,6 +7669,22 @@ fn load_field_index_specializations()
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+fn load_field_index_specializations()
+-> Result<HashMap<String, Vec<FieldIndexSpecialization>>, String> {
+    if specialization_mode_is_profile() {
+        return Ok(HashMap::new());
+    }
+    let Some(path) = counter_dump_input_path_from_env() else {
+        return Ok(HashMap::new());
+    };
+    let path = path.as_path();
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    load_field_index_specializations_from_path(path)
 }
 
 fn specialization_mode_from_env() -> Option<String> {
@@ -7654,21 +7733,11 @@ fn counter_dump_input_path_from_env() -> Option<std::path::PathBuf> {
     }
 }
 
-fn collect_cold_block_labels(
+fn collect_cold_block_labels_from_path(
+    path: &Path,
     function: &BlockPyFunction<CodegenModuleShape>,
     module_name: &str,
 ) -> Result<HashSet<BlockLabel>, String> {
-    if !profiled_cold_blocks_enabled() || specialization_mode_is_profile() {
-        return Ok(HashSet::new());
-    }
-    let Some(path) = counter_dump_input_path_from_env() else {
-        return Ok(HashSet::new());
-    };
-    let path = path.as_path();
-    if !path.exists() {
-        return Ok(HashSet::new());
-    }
-
     let block_entry_counts =
         read_block_entry_counts_from_file(path, module_name, function.function_id)?;
     let entry_label = function.entry_block().label;
@@ -12996,6 +13065,7 @@ impl ProcessJitEngine {
                 function_top_value_counter_data_id,
                 session.as_ref(),
                 function_direct_call_resolver,
+                &SpecializationProfile::from_runtime_state(function_direct_call_resolver),
                 function_symbol_scope.as_deref(),
                 Some(&predeclared),
                 BuildSpecializedFunctionOptions::default(),
@@ -13181,6 +13251,18 @@ struct DefinedFunctionArtifact {
     systemv_unwind_info: Option<cranelift_codegen::isa::unwind::systemv::UnwindInfo>,
 }
 
+#[derive(Clone)]
+struct CompiledFunctionBytes {
+    code: Vec<u8>,
+    alignment: u64,
+    relocs: Vec<ModuleReloc>,
+}
+
+struct CompiledFunctionArtifact {
+    bytes: CompiledFunctionBytes,
+    artifact: DefinedFunctionArtifact,
+}
+
 #[derive(Debug)]
 struct TrivialJumpBlock {
     block: ir::Block,
@@ -13210,6 +13292,26 @@ fn define_prepared_function(
     function_name: &str,
     err_prefix: &str,
 ) -> Result<DefinedFunctionArtifact, String> {
+    let compiled =
+        compile_prepared_function_bytes(jit_module, func_id, ctx, function_name, err_prefix)?;
+    jit_module
+        .define_function_bytes(
+            func_id,
+            compiled.bytes.alignment,
+            compiled.bytes.code.as_slice(),
+            compiled.bytes.relocs.as_slice(),
+        )
+        .map_err(|err| format!("{err_prefix}: {err}"))?;
+    Ok(compiled.artifact)
+}
+
+fn compile_prepared_function_bytes(
+    jit_module: &mut JITModule,
+    func_id: FuncId,
+    ctx: &mut cranelift_codegen::Context,
+    function_name: &str,
+    err_prefix: &str,
+) -> Result<CompiledFunctionArtifact, String> {
     let function_name = if jit_refcount_emission_enabled() {
         Cow::Borrowed(function_name)
     } else {
@@ -13239,14 +13341,19 @@ fn define_prepared_function(
             cranelift_codegen::isa::unwind::UnwindInfo::SystemV(info) => Some(info),
             _ => None,
         });
-    jit_module
-        .define_function_bytes(func_id, alignment, compiled.code_buffer(), &relocs)
-        .map_err(|err| format!("{err_prefix}: {err}"))?;
-    Ok(DefinedFunctionArtifact {
-        code_size: compiled.code_buffer().len(),
-        code_bb_offsets,
-        code_bb_edges,
-        systemv_unwind_info,
+    let code = compiled.code_buffer().to_vec();
+    Ok(CompiledFunctionArtifact {
+        bytes: CompiledFunctionBytes {
+            code,
+            alignment,
+            relocs,
+        },
+        artifact: DefinedFunctionArtifact {
+            code_size: compiled.code_buffer().len(),
+            code_bb_offsets,
+            code_bb_edges,
+            systemv_unwind_info,
+        },
     })
 }
 
@@ -14451,6 +14558,874 @@ fn load_runtime_support_clif(jit_module: &mut JITModule) -> Result<(), String> {
     Ok(())
 }
 
+struct ObjectFunctionDefinition {
+    func_id: FuncId,
+    symbol: String,
+    bytes: CompiledFunctionBytes,
+}
+
+#[derive(Debug)]
+struct ObjectDataDefinition {
+    data_id: DataId,
+    symbol: String,
+    bytes: Vec<u8>,
+    align: u64,
+    writable: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PrecompileObjectSummary {
+    pub output_path: PathBuf,
+    pub function_count: usize,
+    pub data_object_count: usize,
+    pub object_size_bytes: usize,
+}
+
+fn compile_runtime_support_clif_for_object(
+    jit_module: &mut JITModule,
+) -> Result<Vec<ObjectFunctionDefinition>, String> {
+    let library = runtime_support_library()?;
+    let local_runtime_symbols = runtime_support_local_symbols(&library);
+    let mut import_func_ids = HashMap::new();
+    let mut import_data_ids = HashMap::new();
+    let mut local_func_ids = HashMap::new();
+    let mut out = Vec::new();
+    for parsed in library.functions.iter().cloned() {
+        if parsed
+            .symbol
+            .starts_with(SOAC_RUNTIME_EXAMPLE_SYMBOL_PREFIX)
+        {
+            continue;
+        }
+        let func_id = declare_runtime_clif_local_function(
+            jit_module,
+            &mut local_func_ids,
+            &parsed.symbol,
+            &parsed.function.signature,
+            "runtime CLIF function",
+        )?;
+        let mut function = parsed.function;
+        remap_runtime_clif_extern_user_names(
+            jit_module,
+            &mut function,
+            &parsed.extern_symbols,
+            &parsed.runtime_function_symbols,
+            &local_runtime_symbols,
+            &parsed.global_extern_symbols,
+            &mut import_func_ids,
+            &mut local_func_ids,
+            &mut import_data_ids,
+        )?;
+        let mut ctx = jit_module.make_context();
+        ctx.func = function;
+        let compiled = compile_prepared_function_bytes(
+            jit_module,
+            func_id,
+            &mut ctx,
+            &parsed.symbol,
+            &format!(
+                "failed to compile runtime CLIF function {} to object",
+                parsed.symbol
+            ),
+        )?;
+        jit_module.clear_context(&mut ctx);
+        out.push(ObjectFunctionDefinition {
+            func_id,
+            symbol: parsed.symbol,
+            bytes: compiled.bytes,
+        });
+    }
+    Ok(out)
+}
+
+pub fn precompile_codegen_module_to_object_file(
+    module_name: &str,
+    module: &BlockPyModule<CodegenModuleShape>,
+    counter_dump_path: Option<&Path>,
+    output_path: &Path,
+) -> Result<PrecompileObjectSummary, String> {
+    let bytes = precompile_codegen_module_to_object_bytes(module_name, module, counter_dump_path)?;
+    if let Some(parent) = output_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "failed to create object output dir {}: {err}",
+                parent.display()
+            )
+        })?;
+    }
+    fs::write(output_path, bytes.object.as_slice()).map_err(|err| {
+        format!(
+            "failed to write object file {}: {err}",
+            output_path.display()
+        )
+    })?;
+    Ok(PrecompileObjectSummary {
+        output_path: output_path.to_path_buf(),
+        function_count: bytes.function_count,
+        data_object_count: bytes.data_object_count,
+        object_size_bytes: bytes.object.len(),
+    })
+}
+
+struct PrecompiledObjectBytes {
+    object: Vec<u8>,
+    function_count: usize,
+    data_object_count: usize,
+}
+
+fn precompile_codegen_module_to_object_bytes(
+    module_name: &str,
+    module: &BlockPyModule<CodegenModuleShape>,
+    counter_dump_path: Option<&Path>,
+) -> Result<PrecompiledObjectBytes, String> {
+    let compile_session = crate::session::CompileSession::new();
+    let builder = new_jit_builder()?;
+    let mut jit_module = JITModule::new(builder);
+    let mut function_definitions = compile_runtime_support_clif_for_object(&mut jit_module)?;
+
+    let module_constants = ModuleCodegenConstants::collect_from_module(module);
+    let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
+    let module_constant_symbol_prefix = module_constant_symbol_prefix(module);
+    let module_constant_slot_data_ids = define_module_constant_slot_data_for_prefix(
+        &mut jit_module,
+        module_constant_symbol_prefix.as_str(),
+        module_constant_ptrs.as_slice(),
+    )?;
+
+    let (counter_slots_by_id, scalar_counter_count, top_value_counter_count) =
+        build_counter_storage_layout(module.counter_defs.as_slice())?;
+    let scalar_counter_data_id = if scalar_counter_count == 0 {
+        None
+    } else {
+        Some(define_scalar_counter_storage_data(
+            &mut jit_module,
+            module,
+            scalar_counter_count,
+        )?)
+    };
+    let top_value_counter_data_id = if top_value_counter_count == 0 {
+        None
+    } else {
+        Some(define_top_value_counter_storage_data(
+            &mut jit_module,
+            module,
+            top_value_counter_count,
+        )?)
+    };
+
+    let mut data_definitions = Vec::new();
+    for (index, data_id) in module_constant_slot_data_ids.iter().copied().enumerate() {
+        data_definitions.push(ObjectDataDefinition {
+            data_id,
+            symbol: module_constant_slot_symbol(
+                module_constant_symbol_prefix.as_str(),
+                ModuleConstantId(index),
+            ),
+            bytes: vec![0; std::mem::size_of::<usize>()],
+            align: std::mem::align_of::<usize>() as u64,
+            writable: false,
+        });
+    }
+    if let Some(data_id) = scalar_counter_data_id {
+        data_definitions.push(ObjectDataDefinition {
+            data_id,
+            symbol: scalar_counter_storage_symbol(module),
+            bytes: vec![
+                0;
+                scalar_counter_count
+                    .checked_mul(std::mem::size_of::<u64>())
+                    .ok_or_else(|| format!(
+                        "scalar counter storage size overflow: {scalar_counter_count}"
+                    ))?
+            ],
+            align: std::mem::align_of::<u64>() as u64,
+            writable: true,
+        });
+    }
+    if let Some(data_id) = top_value_counter_data_id {
+        data_definitions.push(ObjectDataDefinition {
+            data_id,
+            symbol: top_value_counter_storage_symbol(module),
+            bytes: vec![
+                0;
+                top_value_counter_count
+                    .checked_mul(std::mem::size_of::<TopValueCounter>())
+                    .ok_or_else(|| format!(
+                        "top-value counter storage size overflow: {top_value_counter_count}"
+                    ))?
+            ],
+            align: std::mem::align_of::<TopValueCounter>() as u64,
+            writable: true,
+        });
+    }
+
+    let value_facts = infer_jit_value_facts(module);
+    let jit_module_local_plan = plan_jit_module_locals(module, &value_facts)?;
+    let mut predeclared = HashMap::new();
+    let mut symbol_scopes = HashMap::new();
+    for function in &module.callable_defs {
+        let symbol_scope = direct_function_symbol_scope(function.function_id, 0);
+        let (_sig, declared) =
+            declare_direct_function(&mut jit_module, function, Some(symbol_scope.as_str()))?;
+        predeclared.insert(function.function_id, declared);
+        symbol_scopes.insert(function.function_id, symbol_scope);
+    }
+    let specialization_profile =
+        SpecializationProfile::from_precompile(module_name, counter_dump_path);
+    for function in &module.callable_defs {
+        let placeholder_blocks =
+            vec![std::ptr::null_mut::<std::ffi::c_void>(); function.blocks.len()];
+        let jit_local_plan = jit_module_local_plan
+            .function(function.function_id)
+            .ok_or_else(|| {
+                format!(
+                    "missing JIT local plan for function {} ({})",
+                    function.function_id, function.names.qualname
+                )
+            })?;
+        let built = build_cranelift_run_bb_specialized_function(
+            &mut jit_module,
+            placeholder_blocks.as_slice(),
+            module,
+            function,
+            &value_facts,
+            jit_local_plan,
+            &module_constants,
+            module.counter_defs.as_slice(),
+            module_constant_slot_data_ids.as_slice(),
+            counter_slots_by_id.as_ref(),
+            scalar_counter_data_id,
+            top_value_counter_data_id,
+            &compile_session,
+            None,
+            &specialization_profile,
+            symbol_scopes.get(&function.function_id).map(String::as_str),
+            Some(&predeclared),
+        )
+        .map_err(|err| {
+            format!(
+                "{err} [function={} id={}]",
+                function.names.qualname, function.function_id
+            )
+        })?;
+        let mut ctx = built.ctx;
+        let compiled = compile_prepared_function_bytes(
+            &mut jit_module,
+            built.main_id,
+            &mut ctx,
+            direct_function_backend_name(function, None).as_str(),
+            "failed to compile specialized jit run_bb function to object",
+        )
+        .map_err(|err| {
+            format!(
+                "{err} [function={} id={}]",
+                function.names.qualname, function.function_id
+            )
+        })?;
+        jit_module.clear_context(&mut ctx);
+        function_definitions.push(ObjectFunctionDefinition {
+            func_id: built.main_id,
+            symbol: built.main_symbol,
+            bytes: compiled.bytes,
+        });
+    }
+
+    let object = write_precompiled_object(&jit_module, &function_definitions, &data_definitions)?;
+    Ok(PrecompiledObjectBytes {
+        object,
+        function_count: function_definitions.len(),
+        data_object_count: data_definitions.len(),
+    })
+}
+
+fn write_precompiled_object(
+    jit_module: &JITModule,
+    function_definitions: &[ObjectFunctionDefinition],
+    data_definitions: &[ObjectDataDefinition],
+) -> Result<Vec<u8>, String> {
+    if !(cfg!(target_os = "linux")
+        && cfg!(target_arch = "x86_64")
+        && cfg!(target_endian = "little"))
+    {
+        return Err(format!(
+            "precompile object output currently supports only little-endian linux/x86_64 hosts, got {}",
+            std::env::consts::ARCH
+        ));
+    }
+
+    let mut object = ElfObjectBuilder::default();
+    let mut function_symbols = HashMap::new();
+    let mut data_symbols = HashMap::new();
+
+    for function in function_definitions {
+        let offset =
+            object.append_text(function.bytes.code.as_slice(), function.bytes.alignment)?;
+        let symbol_index = object.add_local_symbol(
+            function.symbol.as_str(),
+            ElfSymbolKind::Func,
+            ElfSectionIndex::Text,
+            offset,
+            function.bytes.code.len() as u64,
+        );
+        function_symbols.insert(function.func_id, (symbol_index, offset));
+    }
+
+    for data in data_definitions {
+        let section = if data.writable {
+            ElfSectionIndex::Data
+        } else {
+            ElfSectionIndex::Rodata
+        };
+        let offset = object.append_data(section, data.bytes.as_slice(), data.align)?;
+        let symbol_index = object.add_local_symbol(
+            data.symbol.as_str(),
+            ElfSymbolKind::Object,
+            section,
+            offset,
+            data.bytes.len() as u64,
+        );
+        data_symbols.insert(data.data_id, symbol_index);
+    }
+
+    for function in function_definitions {
+        let (_, function_offset) = function_symbols[&function.func_id];
+        for reloc in &function.bytes.relocs {
+            let (target_symbol, addend) = elf_symbol_for_reloc_target(
+                jit_module,
+                &mut object,
+                &function_symbols,
+                &data_symbols,
+                &reloc.name,
+                reloc.addend,
+            )?;
+            let offset = function_offset
+                .checked_add(u64::from(reloc.offset))
+                .ok_or_else(|| format!("relocation offset overflow in {}", function.symbol))?;
+            object.add_text_relocation(ElfRelocation {
+                offset,
+                symbol_index: target_symbol,
+                reloc_type: elf_relocation_type(reloc.kind)?,
+                addend,
+            });
+        }
+    }
+
+    object.finish()
+}
+
+#[derive(Default)]
+struct ElfObjectBuilder {
+    text: Vec<u8>,
+    data: Vec<u8>,
+    rodata: Vec<u8>,
+    symbols: Vec<ElfSymbol>,
+    global_symbols_by_name: HashMap<String, u32>,
+    text_relocations: Vec<ElfRelocation>,
+}
+
+impl ElfObjectBuilder {
+    fn append_text(&mut self, bytes: &[u8], align: u64) -> Result<u64, String> {
+        let offset = append_aligned(&mut self.text, bytes, align.max(1))?;
+        Ok(offset)
+    }
+
+    fn append_data(
+        &mut self,
+        section: ElfSectionIndex,
+        bytes: &[u8],
+        align: u64,
+    ) -> Result<u64, String> {
+        let target = match section {
+            ElfSectionIndex::Data => &mut self.data,
+            ElfSectionIndex::Rodata => &mut self.rodata,
+            ElfSectionIndex::Text | ElfSectionIndex::Undefined => {
+                return Err(format!("cannot append data to ELF section {section:?}"));
+            }
+        };
+        append_aligned(target, bytes, align.max(1))
+    }
+
+    fn add_local_symbol(
+        &mut self,
+        name: &str,
+        kind: ElfSymbolKind,
+        section: ElfSectionIndex,
+        value: u64,
+        size: u64,
+    ) -> u32 {
+        let index = (self.symbols.len() + 1) as u32;
+        self.symbols.push(ElfSymbol {
+            name: name.to_string(),
+            binding: ElfSymbolBinding::Local,
+            kind,
+            section,
+            value,
+            size,
+        });
+        index
+    }
+
+    fn add_global_undefined_symbol(&mut self, name: &str, kind: ElfSymbolKind) -> u32 {
+        if let Some(index) = self.global_symbols_by_name.get(name).copied() {
+            return index;
+        }
+        let index = (self.symbols.len() + 1) as u32;
+        self.symbols.push(ElfSymbol {
+            name: name.to_string(),
+            binding: ElfSymbolBinding::Global,
+            kind,
+            section: ElfSectionIndex::Undefined,
+            value: 0,
+            size: 0,
+        });
+        self.global_symbols_by_name.insert(name.to_string(), index);
+        index
+    }
+
+    fn add_text_relocation(&mut self, relocation: ElfRelocation) {
+        self.text_relocations.push(relocation);
+    }
+
+    fn finish(self) -> Result<Vec<u8>, String> {
+        let mut strtab = Vec::from([0]);
+        let mut symbol_names = Vec::with_capacity(self.symbols.len());
+        for symbol in &self.symbols {
+            symbol_names.push(push_string_table(&mut strtab, symbol.name.as_str())?);
+        }
+
+        let first_global_symbol = self
+            .symbols
+            .iter()
+            .position(|symbol| symbol.binding == ElfSymbolBinding::Global)
+            .map(|index| index + 1)
+            .unwrap_or(self.symbols.len() + 1) as u32;
+
+        let mut symtab = vec![0; ELF64_SYM_SIZE];
+        for (symbol, name_offset) in self.symbols.iter().zip(symbol_names) {
+            push_elf_symbol(&mut symtab, name_offset, symbol);
+        }
+
+        let mut rela_text = Vec::with_capacity(self.text_relocations.len() * ELF64_RELA_SIZE);
+        for relocation in &self.text_relocations {
+            push_u64(&mut rela_text, relocation.offset);
+            push_u64(
+                &mut rela_text,
+                (u64::from(relocation.symbol_index) << 32) | u64::from(relocation.reloc_type),
+            );
+            push_i64(&mut rela_text, relocation.addend);
+        }
+
+        let mut shstrtab = Vec::from([0]);
+        let text_name = push_string_table(&mut shstrtab, ".text")?;
+        let data_name = push_string_table(&mut shstrtab, ".data")?;
+        let rodata_name = push_string_table(&mut shstrtab, ".rodata")?;
+        let rela_text_name = push_string_table(&mut shstrtab, ".rela.text")?;
+        let symtab_name = push_string_table(&mut shstrtab, ".symtab")?;
+        let strtab_name = push_string_table(&mut shstrtab, ".strtab")?;
+        let shstrtab_name = push_string_table(&mut shstrtab, ".shstrtab")?;
+
+        let mut file = vec![0; ELF64_EHDR_SIZE];
+        let text_header = append_section_bytes(&mut file, self.text.as_slice(), 16)?;
+        let data_header = append_section_bytes(&mut file, self.data.as_slice(), 8)?;
+        let rodata_header = append_section_bytes(&mut file, self.rodata.as_slice(), 8)?;
+        let rela_text_header = append_section_bytes(&mut file, rela_text.as_slice(), 8)?;
+        let symtab_header = append_section_bytes(&mut file, symtab.as_slice(), 8)?;
+        let strtab_header = append_section_bytes(&mut file, strtab.as_slice(), 1)?;
+        let shstrtab_header = append_section_bytes(&mut file, shstrtab.as_slice(), 1)?;
+        let section_header_offset = align_vec(&mut file, 8)?;
+
+        let mut section_headers = Vec::with_capacity(ELF_SECTION_COUNT * ELF64_SHDR_SIZE);
+        section_headers.resize(ELF64_SHDR_SIZE, 0);
+        push_elf_section_header(
+            &mut section_headers,
+            text_name,
+            SHT_PROGBITS,
+            SHF_ALLOC | SHF_EXECINSTR,
+            text_header,
+            0,
+            0,
+            16,
+            0,
+        );
+        push_elf_section_header(
+            &mut section_headers,
+            data_name,
+            SHT_PROGBITS,
+            SHF_ALLOC | SHF_WRITE,
+            data_header,
+            0,
+            0,
+            8,
+            0,
+        );
+        push_elf_section_header(
+            &mut section_headers,
+            rodata_name,
+            SHT_PROGBITS,
+            SHF_ALLOC,
+            rodata_header,
+            0,
+            0,
+            8,
+            0,
+        );
+        push_elf_section_header(
+            &mut section_headers,
+            rela_text_name,
+            SHT_RELA,
+            0,
+            rela_text_header,
+            ELF_SECTION_SYMTAB_INDEX,
+            ELF_SECTION_TEXT_INDEX,
+            8,
+            ELF64_RELA_SIZE as u64,
+        );
+        push_elf_section_header(
+            &mut section_headers,
+            symtab_name,
+            SHT_SYMTAB,
+            0,
+            symtab_header,
+            ELF_SECTION_STRTAB_INDEX,
+            first_global_symbol,
+            8,
+            ELF64_SYM_SIZE as u64,
+        );
+        push_elf_section_header(
+            &mut section_headers,
+            strtab_name,
+            SHT_STRTAB,
+            0,
+            strtab_header,
+            0,
+            0,
+            1,
+            0,
+        );
+        push_elf_section_header(
+            &mut section_headers,
+            shstrtab_name,
+            SHT_STRTAB,
+            0,
+            shstrtab_header,
+            0,
+            0,
+            1,
+            0,
+        );
+        file.extend_from_slice(section_headers.as_slice());
+        write_elf_header(&mut file[..ELF64_EHDR_SIZE], section_header_offset)?;
+        Ok(file)
+    }
+}
+
+fn elf_symbol_for_reloc_target(
+    jit_module: &JITModule,
+    object: &mut ElfObjectBuilder,
+    function_symbols: &HashMap<FuncId, (u32, u64)>,
+    data_symbols: &HashMap<DataId, u32>,
+    target: &ModuleRelocTarget,
+    addend: i64,
+) -> Result<(u32, i64), String> {
+    match target {
+        ModuleRelocTarget::User { namespace: 0, .. } => {
+            let func_id = FuncId::from_name(target);
+            if let Some((symbol_id, _offset)) = function_symbols.get(&func_id).copied() {
+                return Ok((symbol_id, addend));
+            }
+            let decl = jit_module.declarations().get_function_decl(func_id);
+            if decl.linkage.requires_definition() {
+                return Err(format!(
+                    "relocation references local function {} that was not emitted into the object",
+                    decl.linkage_name(func_id)
+                ));
+            }
+            let symbol = decl.linkage_name(func_id).into_owned();
+            Ok((
+                object.add_global_undefined_symbol(symbol.as_str(), ElfSymbolKind::Func),
+                addend,
+            ))
+        }
+        ModuleRelocTarget::User { namespace: 1, .. } => {
+            let data_id = DataId::from_name(target);
+            if let Some(symbol_id) = data_symbols.get(&data_id).copied() {
+                return Ok((symbol_id, addend));
+            }
+            let decl = jit_module.declarations().get_data_decl(data_id);
+            if decl.linkage.requires_definition() {
+                return Err(format!(
+                    "relocation references local data object {} that was not emitted into the object",
+                    decl.linkage_name(data_id)
+                ));
+            }
+            let symbol = decl.linkage_name(data_id).into_owned();
+            Ok((
+                object.add_global_undefined_symbol(symbol.as_str(), ElfSymbolKind::Object),
+                addend,
+            ))
+        }
+        ModuleRelocTarget::User { namespace, index } => Err(format!(
+            "unsupported Cranelift user relocation namespace {namespace}:{index}"
+        )),
+        ModuleRelocTarget::LibCall(libcall) => {
+            let libcall_names = cranelift_module::default_libcall_names();
+            let symbol = libcall_names(*libcall);
+            Ok((
+                object.add_global_undefined_symbol(symbol.as_str(), ElfSymbolKind::Func),
+                addend,
+            ))
+        }
+        ModuleRelocTarget::KnownSymbol(symbol) => {
+            let symbol = match symbol {
+                ir::KnownSymbol::ElfGlobalOffsetTable => "_GLOBAL_OFFSET_TABLE_",
+                ir::KnownSymbol::CoffTlsIndex => "__tls_index",
+            };
+            Ok((
+                object.add_global_undefined_symbol(symbol, ElfSymbolKind::Object),
+                addend,
+            ))
+        }
+        ModuleRelocTarget::FunctionOffset(func_id, offset) => {
+            let (symbol_id, _target_offset) =
+                function_symbols.get(func_id).copied().ok_or_else(|| {
+                    format!("relocation references undefined function offset target {func_id}")
+                })?;
+            Ok((symbol_id, addend + i64::from(*offset)))
+        }
+    }
+}
+
+fn elf_relocation_type(reloc: Reloc) -> Result<u32, String> {
+    match reloc {
+        Reloc::Abs4 => Ok(R_X86_64_32),
+        Reloc::Abs8 => Ok(R_X86_64_64),
+        Reloc::X86PCRel4 => Ok(R_X86_64_PC32),
+        Reloc::X86CallPCRel4 | Reloc::X86CallPLTRel4 => Ok(R_X86_64_PLT32),
+        Reloc::X86GOTPCRel4 => Ok(R_X86_64_GOTPCREL),
+        other => Err(format!(
+            "unsupported Cranelift relocation for precompiled object: {other:?}"
+        )),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ElfSectionIndex {
+    Undefined,
+    Text,
+    Data,
+    Rodata,
+}
+
+impl ElfSectionIndex {
+    fn as_u16(self) -> u16 {
+        match self {
+            Self::Undefined => 0,
+            Self::Text => ELF_SECTION_TEXT_INDEX as u16,
+            Self::Data => ELF_SECTION_DATA_INDEX as u16,
+            Self::Rodata => ELF_SECTION_RODATA_INDEX as u16,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ElfSymbolKind {
+    Object,
+    Func,
+}
+
+impl ElfSymbolKind {
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::Object => 1,
+            Self::Func => 2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ElfSymbolBinding {
+    Local,
+    Global,
+}
+
+impl ElfSymbolBinding {
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::Local => 0,
+            Self::Global => 1,
+        }
+    }
+}
+
+struct ElfSymbol {
+    name: String,
+    binding: ElfSymbolBinding,
+    kind: ElfSymbolKind,
+    section: ElfSectionIndex,
+    value: u64,
+    size: u64,
+}
+
+struct ElfRelocation {
+    offset: u64,
+    symbol_index: u32,
+    reloc_type: u32,
+    addend: i64,
+}
+
+#[derive(Clone, Copy)]
+struct ElfSectionHeaderInput {
+    offset: u64,
+    size: u64,
+}
+
+const ELF64_EHDR_SIZE: usize = 64;
+const ELF64_SHDR_SIZE: usize = 64;
+const ELF64_SYM_SIZE: usize = 24;
+const ELF64_RELA_SIZE: usize = 24;
+const ELF_SECTION_COUNT: usize = 8;
+const ELF_SECTION_TEXT_INDEX: u32 = 1;
+const ELF_SECTION_DATA_INDEX: u32 = 2;
+const ELF_SECTION_RODATA_INDEX: u32 = 3;
+const ELF_SECTION_SYMTAB_INDEX: u32 = 5;
+const ELF_SECTION_STRTAB_INDEX: u32 = 6;
+const ELF_SECTION_SHSTRTAB_INDEX: u16 = 7;
+const SHT_PROGBITS: u32 = 1;
+const SHT_SYMTAB: u32 = 2;
+const SHT_STRTAB: u32 = 3;
+const SHT_RELA: u32 = 4;
+const SHF_WRITE: u64 = 0x1;
+const SHF_ALLOC: u64 = 0x2;
+const SHF_EXECINSTR: u64 = 0x4;
+const EM_X86_64: u16 = 62;
+const ET_REL: u16 = 1;
+const R_X86_64_64: u32 = 1;
+const R_X86_64_PC32: u32 = 2;
+const R_X86_64_PLT32: u32 = 4;
+const R_X86_64_GOTPCREL: u32 = 9;
+const R_X86_64_32: u32 = 10;
+
+fn append_aligned(out: &mut Vec<u8>, bytes: &[u8], align: u64) -> Result<u64, String> {
+    let offset = align_vec(out, align)?;
+    out.extend_from_slice(bytes);
+    Ok(offset)
+}
+
+fn append_section_bytes(
+    out: &mut Vec<u8>,
+    bytes: &[u8],
+    align: u64,
+) -> Result<ElfSectionHeaderInput, String> {
+    let offset = append_aligned(out, bytes, align)?;
+    Ok(ElfSectionHeaderInput {
+        offset,
+        size: bytes.len() as u64,
+    })
+}
+
+fn align_vec(out: &mut Vec<u8>, align: u64) -> Result<u64, String> {
+    if !align.is_power_of_two() {
+        return Err(format!(
+            "ELF section alignment must be a power of two, got {align}"
+        ));
+    }
+    let align = usize::try_from(align)
+        .map_err(|_| format!("ELF section alignment is too large: {align}"))?;
+    let padding = (align - (out.len() % align)) % align;
+    out.resize(out.len() + padding, 0);
+    Ok(out.len() as u64)
+}
+
+fn push_string_table(table: &mut Vec<u8>, value: &str) -> Result<u32, String> {
+    let offset = u32::try_from(table.len())
+        .map_err(|_| "ELF string table exceeds u32 offsets".to_string())?;
+    table.extend_from_slice(value.as_bytes());
+    table.push(0);
+    Ok(offset)
+}
+
+fn write_elf_header(header: &mut [u8], section_header_offset: u64) -> Result<(), String> {
+    if header.len() != ELF64_EHDR_SIZE {
+        return Err("internal error: ELF header buffer has wrong size".to_string());
+    }
+    header[0..4].copy_from_slice(b"\x7fELF");
+    header[4] = 2; // 64-bit
+    header[5] = 1; // little endian
+    header[6] = 1; // ELF version
+    put_u16(header, 16, ET_REL);
+    put_u16(header, 18, EM_X86_64);
+    put_u32(header, 20, 1);
+    put_u64(header, 40, section_header_offset);
+    put_u16(header, 52, ELF64_EHDR_SIZE as u16);
+    put_u16(header, 58, ELF64_SHDR_SIZE as u16);
+    put_u16(header, 60, ELF_SECTION_COUNT as u16);
+    put_u16(header, 62, ELF_SECTION_SHSTRTAB_INDEX);
+    Ok(())
+}
+
+fn push_elf_section_header(
+    out: &mut Vec<u8>,
+    name_offset: u32,
+    section_type: u32,
+    flags: u64,
+    input: ElfSectionHeaderInput,
+    link: u32,
+    info: u32,
+    align: u64,
+    entry_size: u64,
+) {
+    push_u32(out, name_offset);
+    push_u32(out, section_type);
+    push_u64(out, flags);
+    push_u64(out, 0);
+    push_u64(out, input.offset);
+    push_u64(out, input.size);
+    push_u32(out, link);
+    push_u32(out, info);
+    push_u64(out, align);
+    push_u64(out, entry_size);
+}
+
+fn push_elf_symbol(out: &mut Vec<u8>, name_offset: u32, symbol: &ElfSymbol) {
+    push_u32(out, name_offset);
+    out.push((symbol.binding.as_u8() << 4) | symbol.kind.as_u8());
+    out.push(0);
+    push_u16(out, symbol.section.as_u16());
+    push_u64(out, symbol.value);
+    push_u64(out, symbol.size);
+}
+
+fn put_u16(out: &mut [u8], offset: usize, value: u16) {
+    out[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u32(out: &mut [u8], offset: usize, value: u32) {
+    out[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64(out: &mut [u8], offset: usize, value: u64) {
+    out[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn push_u16(out: &mut Vec<u8>, value: u16) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_i64(out: &mut Vec<u8>, value: i64) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
 fn rewrite_import_fn_aliases(
     clif: &str,
     import_id_to_symbol: &HashMap<u32, &'static str>,
@@ -14673,6 +15648,7 @@ fn build_cranelift_run_bb_specialized_function(
     top_value_counter_data_id: Option<DataId>,
     compile_session: &crate::session::CompileSession,
     direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
+    specialization_profile: &SpecializationProfile<'_>,
     symbol_scope: Option<&str>,
     predeclared_direct_functions: Option<&HashMap<FunctionId, DeclaredJitFunction>>,
     options: BuildSpecializedFunctionOptions,
@@ -14779,36 +15755,14 @@ fn build_cranelift_run_bb_specialized_function(
             function.names.qualname
         ));
     }
-    let call_target_specializations = match direct_call_resolver {
-        Some(shared_state) => load_call_target_specializations(
-            shared_state.module_name.as_str(),
-            function.function_id,
-        )?,
-        None => HashMap::new(),
-    };
-    let operator_specializations = match direct_call_resolver {
-        Some(shared_state) => {
-            load_operator_specializations(shared_state.module_name.as_str(), function.function_id)?
-        }
-        None => HashMap::new(),
-    };
-    let field_index_specializations = match direct_call_resolver {
-        Some(_) => load_field_index_specializations()?,
-        None => HashMap::new(),
-    };
-    let branch_prefer_true = match direct_call_resolver {
-        Some(shared_state) => {
-            load_branch_preferences(shared_state.module_name.as_str(), function.function_id)?
-        }
-        None => HashMap::new(),
-    };
-    let cold_block_labels = match direct_call_resolver {
-        Some(shared_state) => {
-            collect_cold_block_labels(function, shared_state.module_name.as_str())?
-        }
-        None => HashSet::new(),
-    };
-    let behavior_change_indexed_stores = behavior_change_indexed_stores_enabled()
+    let call_target_specializations =
+        specialization_profile.call_target_specializations(function.function_id)?;
+    let operator_specializations =
+        specialization_profile.operator_specializations(function.function_id)?;
+    let field_index_specializations = specialization_profile.field_index_specializations()?;
+    let branch_prefer_true = specialization_profile.branch_preferences(function.function_id)?;
+    let cold_block_labels = specialization_profile.cold_block_labels(function)?;
+    let behavior_change_indexed_stores = specialization_profile.behavior_change_indexed_stores
         && function.scope.scope_kind != CallableScopeKind::Module;
     let function_runtime_data_layout = FunctionRuntimeDataLayout::from_function(function);
     let true_constant_id = module_constants.require_runtime_name_constant_id("TRUE");
@@ -15863,6 +16817,7 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
         top_value_counter_data_id,
         compile_session,
         runtime_state,
+        &SpecializationProfile::from_runtime_state(runtime_state),
         None,
         None,
         BuildSpecializedFunctionOptions::default(),

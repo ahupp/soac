@@ -580,6 +580,43 @@ def f():
     }
 
     #[test]
+    fn precompile_codegen_module_emits_relocatable_object() {
+        let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+            r#"
+def add(a, b):
+    return a + b
+"#,
+        )
+        .expect("lowering precompile smoke source should succeed")
+        .codegen_module;
+
+        let object = precompile_codegen_module_to_object_bytes("precompile_smoke", &lowered, None)
+            .expect("precompile should emit object bytes");
+        assert!(
+            object.function_count >= lowered.callable_defs.len(),
+            "object should contain generated functions plus runtime support"
+        );
+        assert!(
+            object.data_object_count > 0,
+            "object should contain module constant slot data objects"
+        );
+        assert_eq!(
+            object.object.get(0..4),
+            Some(b"\x7fELF".as_slice()),
+            "precompiled bytes should start with an ELF header"
+        );
+        let object_text = String::from_utf8_lossy(object.object.as_slice());
+        assert!(
+            object_text.contains("py:d:add"),
+            "precompiled object should define the direct add function"
+        );
+        assert!(
+            object_text.contains("__soac_module_constant_"),
+            "precompiled object should define module constant slot symbols"
+        );
+    }
+
+    #[test]
     fn stored_local_binding_facts_only_require_checks_for_unbound_values() {
         assert_eq!(
             local_binding_facts_for_stored_value(LocalRefKind::Owned),
@@ -977,6 +1014,7 @@ def f():
             top_value_counter_data_id,
             compile_session,
             direct_call_resolver,
+            &SpecializationProfile::from_runtime_state(direct_call_resolver),
             symbol_scope,
             predeclared_direct_functions,
             options,
