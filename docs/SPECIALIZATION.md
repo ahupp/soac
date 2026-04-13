@@ -297,12 +297,18 @@ apply/verify mode:
 - On the hot path it:
   - computes the callee `FunctionId`
   - compares it against profiled targets
+  - emits the `Py_EnterRecursiveCall` C-stack guard before calling the
+    direct callee
   - builds a direct argument plan for the target entry ABI, including
     null sentinels for omitted defaulted parameters
   - emits a direct Cranelift `call` to the already-compiled specialized
     runner for that function via
     `emit_direct_call_resolved_with_arg_plan`, at
     `soac-jit/src/jit/mod.rs:3515`
+- No `Py_LeaveRecursiveCall` call is emitted on the direct-call return
+  path. In the vendored CPython this leave operation is a no-op; the
+  paired stateful recursion accounting is not part of the current direct-call
+  guard.
 - On miss it falls back to normal Python vectorcall lowering.
 
 ### Limitations / Soundness / Extensions

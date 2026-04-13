@@ -631,8 +631,6 @@ static DP_JIT_ENTER_RECURSIVE_CALL_IMPORT: ImportSpec = ImportSpec::new(
     &[SigType::Pointer],
     &[SigType::I32],
 );
-static DP_JIT_LEAVE_RECURSIVE_CALL_IMPORT: ImportSpec =
-    ImportSpec::new("dp_jit_leave_recursive_call", &[SigType::Pointer], &[]);
 static PY_THREAD_STATE_GET_UNCHECKED_IMPORT: ImportSpec =
     ImportSpec::new("PyThreadState_GetUnchecked", &[], &[SigType::Pointer]);
 static DP_JIT_PY_CALL_WITH_KW_IMPORT: ImportSpec = ImportSpec::new(
@@ -2229,7 +2227,6 @@ struct JitEmitCtx<'mc> {
     store_field_indexed_ref: ir::FuncRef,
     load_runtime_obj_ref: ir::FuncRef,
     enter_recursive_ref: ir::FuncRef,
-    leave_recursive_ref: ir::FuncRef,
     pyobject_getattr_ref: ir::FuncRef,
     pyobject_setattr_ref: ir::FuncRef,
     pyobject_getitem_ref: ir::FuncRef,
@@ -6955,8 +6952,6 @@ fn emit_direct_call_resolved_raw_with_arg_values(
         fb.ins().call_indirect(direct_sig, callee_ptr, &call_args)
     };
     let call_value = fb.inst_results(call_inst)[0];
-    fb.ins()
-        .call(ctx.leave_recursive_ref, &[ctx.consts.thread_state_value]);
     let mut owned_inputs =
         Vec::with_capacity(arg_values.len() + usize::from(!callable_is_borrowed));
     for (value, borrowed_arg) in arg_values.into_iter().zip(arg_borrowed.into_iter()) {
@@ -12871,11 +12866,6 @@ fn build_cranelift_run_bb_specialized_function(
             &mut fb.func,
             &DP_JIT_ENTER_RECURSIVE_CALL_IMPORT,
         );
-        let leave_recursive_ref = func_imports.get_or_panic(
-            jit_module,
-            &mut fb.func,
-            &DP_JIT_LEAVE_RECURSIVE_CALL_IMPORT,
-        );
         let pytype_generic_alloc_ref = func_imports.get_or_panic(
             jit_module,
             &mut fb.func,
@@ -13278,7 +13268,6 @@ fn build_cranelift_run_bb_specialized_function(
                 store_field_indexed_ref,
                 load_runtime_obj_ref,
                 enter_recursive_ref,
-                leave_recursive_ref,
                 pyobject_getattr_ref,
                 pyobject_setattr_ref,
                 pyobject_getitem_ref,
@@ -13889,11 +13878,6 @@ fn define_shared_vectorcall_trampoline(
             &mut fb.func,
             &DP_JIT_ENTER_RECURSIVE_CALL_IMPORT,
         );
-        let leave_recursive_ref = func_imports.get_or_panic(
-            jit_module,
-            &mut fb.func,
-            &DP_JIT_LEAVE_RECURSIVE_CALL_IMPORT,
-        );
         let decref_ref = func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_DECREF_IMPORT);
         let thread_state_get_ref = func_imports.get_or_panic(
             jit_module,
@@ -14084,7 +14068,6 @@ fn define_shared_vectorcall_trampoline(
         fb.seal_block(ok_block);
 
         fb.switch_to_block(fail_block);
-        fb.ins().call(leave_recursive_ref, &[thread_state_val]);
         fb.ins().return_(&[null_ptr]);
 
         fb.switch_to_block(ok_block);
@@ -14120,7 +14103,6 @@ fn define_shared_vectorcall_trampoline(
         for value in owned_args.iter().copied() {
             fb.ins().call(decref_ref, &[thread_state_val, value]);
         }
-        fb.ins().call(leave_recursive_ref, &[thread_state_val]);
         fb.ins()
             .call(set_raised_exception_ref, &[thread_state_val, error_value]);
         fb.ins().return_(&[result]);
@@ -14129,7 +14111,6 @@ fn define_shared_vectorcall_trampoline(
         for value in owned_args {
             fb.ins().call(decref_ref, &[thread_state_val, value]);
         }
-        fb.ins().call(leave_recursive_ref, &[thread_state_val]);
         fb.ins().return_(&[result]);
         fb.seal_all_blocks();
         fb.finalize();

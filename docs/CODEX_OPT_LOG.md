@@ -5,6 +5,20 @@ optimization attempts made by Codex agents. Keep entries succinct: what
 changed or was tried, which jj change id carried it when landed, the
 benchmarked throughput delta, and the headline pre/post numbers.
 
+## 2026-04-13 - Remove no-op recursive leave calls
+
+- jj change id: `kyxysmzx`
+- summary: Direct-call and vectorcall-trampoline codegen no longer emits
+  `dp_jit_leave_recursive_call` after the direct callee returns or after
+  argument binding fails. In this vendored CPython, `Py_LeaveRecursiveCall`
+  wraps a no-op; the direct-call path keeps the `Py_EnterRecursiveCall`
+  C-stack guard and removes only the unpaired no-op leave call overhead.
+- throughput: `+2.50%` specialized pystone median
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `408266`, `418252`, `416438 loops/s`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `421926`, `430101`, `426855 loops/s`
+
 ## 2026-04-13 - Not landed: thread owner type into indexed-field helpers
 
 - jj change id: not landed

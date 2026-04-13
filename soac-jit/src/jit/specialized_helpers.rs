@@ -182,10 +182,6 @@ unsafe extern "C" fn enter_recursive_call_hook(_tstate: ObjPtr) -> i32 {
     ffi::Py_EnterRecursiveCall(b" while calling a Python object\0".as_ptr() as *const i8)
 }
 
-unsafe extern "C" fn leave_recursive_call_hook(_tstate: ObjPtr) {
-    ffi::Py_LeaveRecursiveCall();
-}
-
 unsafe extern "C" fn pytype_generic_alloc_hook(type_obj: ObjPtr, nitems: i64) -> ObjPtr {
     if type_obj.is_null() || nitems < 0 {
         ffi::PyErr_SetString(
@@ -1760,10 +1756,6 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol(
         "dp_jit_enter_recursive_call",
         enter_recursive_call_hook as *const u8,
-    );
-    builder.symbol(
-        "dp_jit_leave_recursive_call",
-        leave_recursive_call_hook as *const u8,
     );
     builder.symbol(
         "dp_jit_pytype_generic_alloc",
