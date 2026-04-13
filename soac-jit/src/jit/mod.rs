@@ -7648,6 +7648,30 @@ fn emit_exception_dispatch_forwarded_releases(
     Ok(())
 }
 
+fn emit_exception_dispatch_forwarded_drops(
+    fb: &mut FunctionBuilder<'_>,
+    forwarded_local_names: &[String],
+    forwarded_local_values: &[ir::Value],
+    drop_forwarded_local_names: &[String],
+    ptr_ty: ir::Type,
+    thread_state_value: ir::Value,
+    decref_ref: ir::FuncRef,
+) -> Result<(), String> {
+    let forwarded_locals_by_name = forwarded_local_names
+        .iter()
+        .zip(forwarded_local_values.iter().copied())
+        .map(|(name, value)| (name.as_str(), value))
+        .collect::<HashMap<_, _>>();
+    for drop_name in drop_forwarded_local_names {
+        let value = forwarded_locals_by_name
+            .get(drop_name.as_str())
+            .copied()
+            .ok_or_else(|| format!("missing forwarded exception drop local {drop_name}"))?;
+        emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, value);
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_exception_dispatch_target_args(
     fb: &mut FunctionBuilder<'_>,
@@ -13448,37 +13472,15 @@ fn build_cranelift_run_bb_specialized_function(
                 incref_ref,
                 decref_ref,
             )?;
-            let mut forwarded_target_use_counts = HashMap::new();
-            for (_, source) in &dispatch_plan.target_args {
-                let BlockArg::Name(source_name) = source else {
-                    continue;
-                };
-                *forwarded_target_use_counts
-                    .entry(source_name.as_str())
-                    .or_insert(0usize) += 1;
-            }
-            let released_forwarded_names = dispatch_plan
-                .release_local_names
-                .iter()
-                .map(String::as_str)
-                .collect::<HashSet<_>>();
-            for (name, value) in dispatch_plan
-                .forwarded_local_names
-                .iter()
-                .zip(forwarded_local_values.iter().copied())
-            {
-                if released_forwarded_names.contains(name.as_str()) {
-                    continue;
-                }
-                if forwarded_target_use_counts
-                    .get(name.as_str())
-                    .copied()
-                    .unwrap_or(0)
-                    == 0
-                {
-                    emit_decref_if_not_null(&mut fb, ptr_ty, decref_ref, thread_state_value, value);
-                }
-            }
+            emit_exception_dispatch_forwarded_drops(
+                &mut fb,
+                &dispatch_plan.forwarded_local_names,
+                &forwarded_local_values,
+                &dispatch_plan.drop_forwarded_local_names,
+                ptr_ty,
+                thread_state_value,
+                decref_ref,
+            )?;
             fb.ins()
                 .jump(exec_blocks[dispatch_plan.target_index], &target_jump_args);
         }

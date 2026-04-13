@@ -365,6 +365,7 @@ pub struct BlockExcDispatchPlan {
     pub target_args: Vec<(String, BlockArg)>,
     pub forwarded_local_names: Vec<String>,
     pub release_local_names: Vec<String>,
+    pub drop_forwarded_local_names: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -641,11 +642,127 @@ impl PlannedJitFunctionLocals {
                         ));
                     }
                 }
+                validate_exception_dispatch_ownership_sinks(function, block.label, dispatch)?;
             }
         }
 
         Ok(())
     }
+}
+
+fn validate_exception_dispatch_ownership_sinks(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    block_label: BlockLabel,
+    dispatch: &BlockExcDispatchPlan,
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    let forwarded_names = dispatch
+        .forwarded_local_names
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    if forwarded_names.len() != dispatch.forwarded_local_names.len() {
+        errors.push(format!(
+            "exception dispatch for function {} ({}) block {} has duplicate forwarded locals: {:?}",
+            function.function_id,
+            function.names.qualname,
+            block_label,
+            dispatch.forwarded_local_names
+        ));
+    }
+    let target_source_names = named_block_arg_sources(&dispatch.target_args);
+    let slot_write_source_names = named_block_arg_sources(&dispatch.slot_writes);
+    let release_names = dispatch
+        .release_local_names
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let drop_names = dispatch
+        .drop_forwarded_local_names
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    if release_names.len() != dispatch.release_local_names.len() {
+        errors.push(format!(
+            "exception dispatch for function {} ({}) block {} has duplicate release locals: {:?}",
+            function.function_id,
+            function.names.qualname,
+            block_label,
+            dispatch.release_local_names
+        ));
+    }
+    if drop_names.len() != dispatch.drop_forwarded_local_names.len() {
+        errors.push(format!(
+            "exception dispatch for function {} ({}) block {} has duplicate drop locals: {:?}",
+            function.function_id,
+            function.names.qualname,
+            block_label,
+            dispatch.drop_forwarded_local_names
+        ));
+    }
+
+    for name in target_source_names
+        .iter()
+        .chain(slot_write_source_names.iter())
+    {
+        if !forwarded_names.contains(name) {
+            errors.push(format!(
+                "exception dispatch for function {} ({}) block {} uses forwarded source {:?} \
+                 without forwarding it",
+                function.function_id, function.names.qualname, block_label, name
+            ));
+        }
+    }
+    for name in release_names.iter().chain(drop_names.iter()) {
+        if !forwarded_names.contains(name) {
+            errors.push(format!(
+                "exception dispatch for function {} ({}) block {} has ownership sink {:?} \
+                 without forwarding it",
+                function.function_id, function.names.qualname, block_label, name
+            ));
+        }
+    }
+
+    for name in &dispatch.forwarded_local_names {
+        let name = name.as_str();
+        let mut sinks = Vec::new();
+        if target_source_names.contains(name) {
+            sinks.push("target");
+        }
+        if release_names.contains(name) {
+            sinks.push("release");
+        }
+        if drop_names.contains(name) {
+            sinks.push("drop");
+        }
+        if sinks.len() != 1 {
+            errors.push(format!(
+                "exception dispatch for function {} ({}) block {} forwarded local {:?} has {} \
+                 ownership sinks {:?}; expected exactly one of target, release, or drop",
+                function.function_id,
+                function.names.qualname,
+                block_label,
+                name,
+                sinks.len(),
+                sinks
+            ));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("\n"))
+    }
+}
+
+fn named_block_arg_sources(args: &[(String, BlockArg)]) -> HashSet<&str> {
+    args.iter()
+        .filter_map(|(_, arg)| match arg {
+            BlockArg::Name(name) => Some(name.as_str()),
+            BlockArg::CurrentException | BlockArg::None | BlockArg::AbruptKind(_) => None,
+        })
+        .collect()
 }
 
 fn validate_entry_materializations_for_block(
@@ -844,6 +961,12 @@ pub fn render_jit_function_locals(
                 out,
                 "      release_locals={:?}",
                 dispatch.release_local_names
+            )
+            .expect("writing to String should not fail");
+            writeln!(
+                out,
+                "      drop_forwarded_locals={:?}",
+                dispatch.drop_forwarded_local_names
             )
             .expect("writing to String should not fail");
         }
@@ -1219,13 +1342,39 @@ pub fn exc_dispatch_plan(
             release_local_names.push(local.name.clone());
         }
     }
+    let drop_forwarded_local_names = planned_drop_forwarded_local_names(
+        &forwarded_local_names,
+        &transport.target_args,
+        &release_local_names,
+    );
     Some(BlockExcDispatchPlan {
         target_index,
         slot_writes: transport.slot_writes,
         target_args: transport.target_args,
         forwarded_local_names,
         release_local_names,
+        drop_forwarded_local_names,
     })
+}
+
+fn planned_drop_forwarded_local_names(
+    forwarded_local_names: &[String],
+    target_args: &[(String, BlockArg)],
+    release_local_names: &[String],
+) -> Vec<String> {
+    let target_arg_source_names = named_block_arg_sources(target_args);
+    let release_name_set = release_local_names
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    forwarded_local_names
+        .iter()
+        .filter(|name| {
+            !target_arg_source_names.contains(name.as_str())
+                && !release_name_set.contains(name.as_str())
+        })
+        .cloned()
+        .collect()
 }
 
 pub fn plan_jit_function_locals(
@@ -1953,6 +2102,83 @@ def f():
                         .any(|name| name == "x")
                     && dispatch.target_args.iter().any(|(name, _)| name == "x")),
             "exception dispatch should carry ordinary cleanup locals as target args: {dispatches:#?}"
+        );
+    }
+
+    #[test]
+    fn exception_dispatch_ownership_validator_requires_one_sink_per_forwarded_local() {
+        let (lowered, function_index) = lowered_function(
+            r#"
+def f():
+    return None
+"#,
+            "f",
+        );
+        let function = &lowered.callable_defs[function_index];
+        let block_label = function.entry_block().label;
+        let dispatch = BlockExcDispatchPlan {
+            target_index: 0,
+            slot_writes: vec![(
+                "slot_target".to_string(),
+                BlockArg::Name("slot_only".to_string()),
+            )],
+            target_args: vec![(
+                "target_param".to_string(),
+                BlockArg::Name("to_target".to_string()),
+            )],
+            forwarded_local_names: vec![
+                "slot_only".to_string(),
+                "to_target".to_string(),
+                "released".to_string(),
+                "dropped".to_string(),
+            ],
+            release_local_names: vec!["released".to_string()],
+            drop_forwarded_local_names: vec!["slot_only".to_string(), "dropped".to_string()],
+        };
+
+        validate_exception_dispatch_ownership_sinks(function, block_label, &dispatch)
+            .expect("dispatch with one ownership sink per forwarded local should validate");
+
+        let mut double_sink = dispatch.clone();
+        double_sink
+            .drop_forwarded_local_names
+            .push("to_target".to_string());
+        let err = validate_exception_dispatch_ownership_sinks(function, block_label, &double_sink)
+            .expect_err("targeted forwarded local should not also be dropped");
+        assert!(
+            err.contains("\"to_target\"") && err.contains("expected exactly one"),
+            "expected a targeted+drop ownership-sink error, got: {err}"
+        );
+
+        let mut missing_sink = dispatch.clone();
+        missing_sink
+            .drop_forwarded_local_names
+            .retain(|name| name != "slot_only");
+        let err = validate_exception_dispatch_ownership_sinks(function, block_label, &missing_sink)
+            .expect_err("slot-write-only forwarded local still needs a planned drop sink");
+        assert!(
+            err.contains("\"slot_only\"") && err.contains("0 ownership sinks"),
+            "expected a missing ownership-sink error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn planned_drop_forwarded_local_names_excludes_targeted_and_released_locals() {
+        let forwarded = vec![
+            "slot_only".to_string(),
+            "to_target".to_string(),
+            "released".to_string(),
+            "unused".to_string(),
+        ];
+        let target_args = vec![(
+            "target_param".to_string(),
+            BlockArg::Name("to_target".to_string()),
+        )];
+        let release_names = vec!["released".to_string()];
+
+        assert_eq!(
+            planned_drop_forwarded_local_names(&forwarded, &target_args, &release_names),
+            vec!["slot_only".to_string(), "unused".to_string()]
         );
     }
 
