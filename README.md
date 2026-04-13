@@ -161,26 +161,6 @@ exports are intentionally omitted here.
   expensive broad-mode coverage. When invoking pytest directly, pass
   `--run-slow` to include the same tests.
 
-- `SOAC_CRANELIFT_COMPILE_CACHE=1`
-  Opt into the experimental filesystem-backed Cranelift incremental
-  compile cache. When enabled, cache values are stored in
-  `SOAC_COMPILE_CACHE_DIR` if set, otherwise in
-  `$SOAC_WORK_DIR/compile-cache` when `SOAC_WORK_DIR` is set, otherwise
-  in a process temp directory. Filenames are derived from Cranelift's
-  cache keys. Cache configuration, hits, and store failures are emitted
-  through the `soac_jit_compile_cache` tracing target. The cache is
-  disabled by default. Direct Python function bodies now participate
-  using a logical cache key that includes the module identity, and
-  shared-state counted incref/decref helpers also participate when
-  they can bind stable shared counter symbols. Explicit local and
-  inspection builds still skip those helper stubs because their
-  counter storage names remain per-instance.
-
-- `SOAC_COMPILE_CACHE_DIR=/path/to/cache-dir`
-  Explicit filesystem root for `SOAC_CRANELIFT_COMPILE_CACHE`. Use this
-  when running from symlinked or shared checkouts so cache writes do not
-  depend on the process current directory.
-
 - `SOAC_CRANELIFT_OPT_LEVEL=none|speed|speed_and_size`
   Override the Cranelift optimization level used by the process JIT.
   Normal runtime and benchmark runs default to `speed`. The

@@ -44,6 +44,19 @@ impl IntRange {
             max: self.max.checked_sub(rhs.min)?,
         })
     }
+
+    pub fn checked_mul(self, rhs: Self) -> Option<Self> {
+        let products = [
+            self.min.checked_mul(rhs.min)?,
+            self.min.checked_mul(rhs.max)?,
+            self.max.checked_mul(rhs.min)?,
+            self.max.checked_mul(rhs.max)?,
+        ];
+        Some(Self {
+            min: *products.iter().min()?,
+            max: *products.iter().max()?,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

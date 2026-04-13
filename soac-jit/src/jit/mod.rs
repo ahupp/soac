@@ -8,6 +8,7 @@ use crate::counter_dump::{
 use crate::module_constants::{ModuleCodegenConstants, ModuleConstantId};
 use crate::module_type::{CounterRuntimeSlot, SharedModuleState, build_counter_storage_layout};
 use cranelift_codegen::cfg_printer::CFGPrinter;
+use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::inline::{Inline, InlineCommand};
 use cranelift_codegen::ir;
 use cranelift_codegen::ir::InstBuilder;
@@ -618,6 +619,8 @@ static SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_IMPORT: ImportSpec = ImportSpec::lo
     &[SigType::Pointer, SigType::Pointer],
     &[SigType::I64],
 );
+static DP_JIT_RAISE_I64_OVERFLOW_IMPORT: ImportSpec =
+    ImportSpec::new("dp_jit_raise_i64_overflow", &[], &[]);
 static DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_py_call_positional_three",
     &[
@@ -4519,11 +4522,9 @@ fn lookup_runtime_counter_id(
 }
 
 fn build_counted_runtime_refcount_helper(
-    compile_session: &crate::session::CompileSession,
     jit_module: &mut JITModule,
     symbol_name: &str,
-    cache_name: &str,
-    cache_policy: CraneliftCompileCachePolicy,
+    function_name: &str,
     wrapper_import: &'static ImportSpec,
     applied_import: &'static ImportSpec,
     scalar_counter_data_id: DataId,
@@ -4570,33 +4571,18 @@ fn build_counted_runtime_refcount_helper(
         fb.finalize();
     }
 
-    let _ = define_function_with_incremental_cache(
-        compile_session,
+    let _ = define_prepared_function(
         jit_module,
         helper_id,
         &mut ctx,
-        cache_name,
-        cache_policy,
+        function_name,
         "failed to define counted runtime refcount helper",
     )?;
     jit_module.clear_context(&mut ctx);
     Ok(helper_id)
 }
 
-fn counted_runtime_refcount_helper_cache_policy(
-    symbol_scope: Option<&str>,
-) -> CraneliftCompileCachePolicy {
-    if symbol_scope.is_some() {
-        CraneliftCompileCachePolicy::Enabled
-    } else {
-        CraneliftCompileCachePolicy::Disabled {
-            reason: "counted refcount helper lacks stable shared-state counter symbols",
-        }
-    }
-}
-
 fn build_counted_runtime_refcount_helpers(
-    compile_session: &crate::session::CompileSession,
     jit_module: &mut JITModule,
     function: &BlockPyFunction<CodegenModuleShape>,
     counter_defs: &[CounterDef],
@@ -4618,16 +4604,14 @@ fn build_counted_runtime_refcount_helpers(
                         counter_id.0
                     )
                 })?;
-                let cache_name = scoped_jit_symbol(
+                let helper_name = scoped_jit_symbol(
                     format!("py:rc:incref:{}", function.names.qualname).as_str(),
                     symbol_scope,
                 );
                 build_counted_runtime_refcount_helper(
-                    compile_session,
                     jit_module,
-                    &cache_name,
-                    &cache_name,
-                    counted_runtime_refcount_helper_cache_policy(symbol_scope),
+                    &helper_name,
+                    &helper_name,
                     &DP_JIT_INCREF_IMPORT,
                     &SOAC_RUNTIME_INCREF_APPLIED_IMPORT,
                     scalar_counter_data_id,
@@ -4646,16 +4630,14 @@ fn build_counted_runtime_refcount_helpers(
                         counter_id.0
                     )
                 })?;
-                let cache_name = scoped_jit_symbol(
+                let helper_name = scoped_jit_symbol(
                     format!("py:rc:decref:{}", function.names.qualname).as_str(),
                     symbol_scope,
                 );
                 build_counted_runtime_refcount_helper(
-                    compile_session,
                     jit_module,
-                    &cache_name,
-                    &cache_name,
-                    counted_runtime_refcount_helper_cache_policy(symbol_scope),
+                    &helper_name,
+                    &helper_name,
                     &DP_JIT_DECREF_IMPORT,
                     &SOAC_RUNTIME_DECREF_APPLIED_IMPORT,
                     scalar_counter_data_id,
@@ -9610,28 +9592,44 @@ fn i64_binop_result_facts(
     if lhs_facts.width != IntWidth::I64 || rhs_facts.width != IntWidth::I64 {
         return None;
     }
-    let lhs_range = lhs_facts.range?;
-    let rhs_range = rhs_facts.range?;
-    let result_range = match kind {
-        blockpy_intrinsics::BinOpKind::Add => lhs_range.checked_add(rhs_range)?,
-        blockpy_intrinsics::BinOpKind::Sub => lhs_range.checked_sub(rhs_range)?,
-        _ => return None,
-    };
-    if !result_range.is_within(IntRange::I64) {
+    if !matches!(
+        kind,
+        blockpy_intrinsics::BinOpKind::Add
+            | blockpy_intrinsics::BinOpKind::Sub
+            | blockpy_intrinsics::BinOpKind::Mul
+    ) {
         return None;
     }
+    let result_range = match (lhs_facts.range, rhs_facts.range) {
+        (Some(lhs_range), Some(rhs_range)) => match kind {
+            blockpy_intrinsics::BinOpKind::Add => lhs_range.checked_add(rhs_range),
+            blockpy_intrinsics::BinOpKind::Sub => lhs_range.checked_sub(rhs_range),
+            blockpy_intrinsics::BinOpKind::Mul => lhs_range.checked_mul(rhs_range),
+            _ => unreachable!("I64 BinOp kind checked above"),
+        }
+        .filter(|range| range.is_within(IntRange::I64)),
+        _ => None,
+    };
     let known_value = match (lhs_facts.known_value, rhs_facts.known_value) {
         (Some(lhs), Some(rhs)) => match kind {
-            blockpy_intrinsics::BinOpKind::Add => lhs.checked_add(rhs),
-            blockpy_intrinsics::BinOpKind::Sub => lhs.checked_sub(rhs),
+            blockpy_intrinsics::BinOpKind::Add => lhs
+                .checked_add(rhs)
+                .filter(|value| IntRange::exact(*value).is_within(IntRange::I64)),
+            blockpy_intrinsics::BinOpKind::Sub => lhs
+                .checked_sub(rhs)
+                .filter(|value| IntRange::exact(*value).is_within(IntRange::I64)),
+            blockpy_intrinsics::BinOpKind::Mul => lhs
+                .checked_mul(rhs)
+                .filter(|value| IntRange::exact(*value).is_within(IntRange::I64)),
             _ => None,
         },
         _ => None,
     };
+    let result_range = result_range.or_else(|| known_value.map(IntRange::exact));
     Some(IntFacts {
         width: IntWidth::I64,
         known_value,
-        range: Some(result_range),
+        range: result_range,
     })
 }
 
@@ -9868,6 +9866,38 @@ fn emit_i64_result_for_demand(
     }
 }
 
+fn emit_checked_i64_overflow_result(
+    fb: &mut FunctionBuilder<'_>,
+    value: ir::Value,
+    overflow: ir::Value,
+    emit_ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> ir::Value {
+    let overflow_block = fb.create_block();
+    let value_ok_block = fb.create_block();
+    fb.append_block_param(value_ok_block, emit_ctx.consts.i64_ty);
+    fb.ins().brif(
+        overflow,
+        overflow_block,
+        &[],
+        value_ok_block,
+        &[ir::BlockArg::Value(value)],
+    );
+
+    fb.switch_to_block(overflow_block);
+    let raise_overflow_ref =
+        func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_RAISE_I64_OVERFLOW_IMPORT);
+    fb.ins().call(raise_overflow_ref, &[]);
+    fb.ins().jump(
+        emit_ctx.consts.step_null_block,
+        &step_null_block_args(emit_ctx),
+    );
+
+    fb.switch_to_block(value_ok_block);
+    fb.block_params(value_ok_block)[0]
+}
+
 fn emit_i64_binop_result_with_local_env(
     fb: &mut FunctionBuilder<'_>,
     op: &blockpy_intrinsics::BinOp<InstrCodegen>,
@@ -9905,11 +9935,20 @@ fn emit_i64_binop_result_with_local_env(
     )
     .expect("I64-capable BinOp right operand should emit");
     let (rhs, _) = rhs.expect_i64("I64 BinOp right operand");
-    let value = match op.kind {
-        blockpy_intrinsics::BinOpKind::Add => fb.ins().iadd(lhs, rhs),
-        blockpy_intrinsics::BinOpKind::Sub => fb.ins().isub(lhs, rhs),
+    let (raw_value, overflow) = match op.kind {
+        blockpy_intrinsics::BinOpKind::Add => fb.ins().sadd_overflow(lhs, rhs),
+        blockpy_intrinsics::BinOpKind::Sub => fb.ins().ssub_overflow(lhs, rhs),
+        blockpy_intrinsics::BinOpKind::Mul => fb.ins().smul_overflow(lhs, rhs),
         _ => unreachable!("unsupported I64 BinOp should not pass demand analysis"),
     };
+    let value = emit_checked_i64_overflow_result(
+        fb,
+        raw_value,
+        overflow,
+        emit_ctx,
+        jit_module,
+        func_imports,
+    );
     Some(emit_i64_result_for_demand(
         fb,
         value,
@@ -10013,6 +10052,7 @@ fn emit_runtime_primitive_param_value_with_local_env(
         ParamAbi::I64 {
             py_long_coercion: Some(PyLongI64Coercion::Saturating),
         } if codegen_expr_const_i64(expr, emit_ctx.module_constants).is_none()
+            && !codegen_expr_can_satisfy_i64_demand(expr, local_env, emit_ctx)
             && codegen_expr_has_exact_int_pyobject_facts(expr, local_env, emit_ctx) =>
         {
             let coerced = emit_exact_pylong_as_i64_saturating_result_with_local_env(
@@ -11631,9 +11671,9 @@ fn new_jit_builder() -> Result<JITBuilder, String> {
     Ok(builder)
 }
 
-fn new_jit_module(compile_session: &crate::session::CompileSession) -> Result<JITModule, String> {
+fn new_jit_module(_compile_session: &crate::session::CompileSession) -> Result<JITModule, String> {
     let mut jit_module = JITModule::new(new_jit_builder()?);
-    load_runtime_support_clif(compile_session, &mut jit_module)?;
+    load_runtime_support_clif(&mut jit_module)?;
     Ok(jit_module)
 }
 
@@ -11762,7 +11802,7 @@ impl ProcessJitEngine {
 
     pub(crate) fn vectorcall_trampoline(
         &self,
-        compile_session: &crate::session::CompileSession,
+        _compile_session: &crate::session::CompileSession,
         param_count: usize,
     ) -> Result<VectorcallEntryFn, String> {
         let mut trampolines = self
@@ -11778,12 +11818,8 @@ impl ProcessJitEngine {
             .lock()
             .map_err(|_| "process JIT module lock poisoned".to_string())?;
         let symbol = format!("__soac_vectorcall_arity_{param_count}");
-        let entry = define_shared_vectorcall_trampoline(
-            compile_session,
-            &mut state.jit_module,
-            param_count,
-            &symbol,
-        )?;
+        let entry =
+            define_shared_vectorcall_trampoline(&mut state.jit_module, param_count, &symbol)?;
         trampolines.insert(param_count, entry);
         Ok(entry)
     }
@@ -11991,15 +12027,13 @@ impl ProcessJitEngine {
             let main_symbol = built.main_symbol;
             let clif_block_count = ctx.func.layout.blocks().count();
             let clif_inst_count = ctx.func.dfg.num_insts();
-            let cache_name =
-                direct_function_compile_cache_name(function, batch_function.source.shared_state());
-            let artifact = define_function_with_incremental_cache(
-                session.as_ref(),
+            let function_name =
+                direct_function_backend_name(function, batch_function.source.shared_state());
+            let artifact = define_prepared_function(
                 &mut state.jit_module,
                 main_id,
                 &mut ctx,
-                cache_name.as_str(),
-                CraneliftCompileCachePolicy::Enabled,
+                function_name.as_str(),
                 "failed to define specialized jit run_bb function",
             )
             .map_err(|err| {
@@ -12081,60 +12115,36 @@ struct DefinedFunctionArtifact {
     systemv_unwind_info: Option<cranelift_codegen::isa::unwind::systemv::UnwindInfo>,
 }
 
-fn define_function_with_incremental_cache(
-    compile_session: &crate::session::CompileSession,
+#[derive(Debug)]
+struct TrivialJumpBlock {
+    block: ir::Block,
+    target: ir::Block,
+    params: Vec<ir::Value>,
+    jump_args: Vec<ir::BlockArg>,
+    predecessors: Vec<cranelift_codegen::flowgraph::BlockPredecessor>,
+}
+
+fn define_prepared_function(
     jit_module: &mut JITModule,
     func_id: FuncId,
     ctx: &mut cranelift_codegen::Context,
-    cache_name: &str,
-    cache_policy: CraneliftCompileCachePolicy,
+    function_name: &str,
     err_prefix: &str,
 ) -> Result<DefinedFunctionArtifact, String> {
-    inline_runtime_support_calls(jit_module, ctx, err_prefix)?;
-    let cache_name = if jit_refcount_emission_enabled() {
-        Cow::Borrowed(cache_name)
+    let function_name = if jit_refcount_emission_enabled() {
+        Cow::Borrowed(function_name)
     } else {
-        Cow::Owned(format!("{cache_name}:refcounts=off"))
+        Cow::Owned(format!("{function_name}:refcounts=off"))
     };
-    ctx.func.name = stable_cranelift_compile_cache_name(cache_name.as_ref());
+    ctx.func.name = stable_cranelift_function_name(function_name.as_ref());
+    prepare_cranelift_function_for_backend(jit_module, ctx, err_prefix)?;
     let func_for_relocs = ctx.func.clone();
-    let func_name = ctx.func.name.clone();
     let mut ctrl_plane = ControlPlane::default();
-    let compiled =
-        if compile_session.cranelift_compile_cache().is_enabled() && cache_policy.is_enabled() {
-            let mut cache_store = compile_session.cranelift_compile_cache().store();
-            let (compiled, cache_hit) = ctx
-                .compile_with_cache(jit_module.isa(), &mut cache_store, &mut ctrl_plane)
-                .map_err(|err| format!("{err_prefix}: {err:?}"))?;
-            if cache_hit {
-                info!(
-                    target: "soac_jit_compile_cache",
-                    function = ?func_name,
-                    cache_name = cache_name.as_ref(),
-                    func_id = func_id.as_u32(),
-                    request = %err_prefix,
-                    code_size = compiled.code_buffer().len(),
-                    "Cranelift compile cache hit"
-                );
-            }
-            compiled
-        } else {
-            if compile_session.cranelift_compile_cache().is_enabled()
-                && let Some(reason) = cache_policy.disabled_reason()
-            {
-                tracing::debug!(
-                    target: "soac_jit_compile_cache",
-                    function = ?func_name,
-                    cache_name = cache_name.as_ref(),
-                    func_id = func_id.as_u32(),
-                    request = %err_prefix,
-                    reason,
-                    "Cranelift compile cache skipped for function"
-                );
-            }
-            ctx.compile(jit_module.isa(), &mut ctrl_plane)
-                .map_err(|err| format!("{err_prefix}: {err:?}"))?
-        };
+    let compiled_stencil = jit_module
+        .isa()
+        .compile_function(&ctx.func, &ctx.domtree, false, &mut ctrl_plane)
+        .map_err(|err| format!("{err_prefix}: {err:?}"))?;
+    let compiled = compiled_stencil.apply_params(&ctx.func.params);
     let (code_bb_offsets, code_bb_edges) = compiled.get_code_bb_layout();
     let alignment = compiled.buffer.alignment as u64;
     let relocs = compiled
@@ -12161,31 +12171,292 @@ fn define_function_with_incremental_cache(
     })
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CraneliftCompileCachePolicy {
-    Enabled,
-    Disabled { reason: &'static str },
+fn prepare_cranelift_function_for_backend(
+    jit_module: &mut JITModule,
+    ctx: &mut cranelift_codegen::Context,
+    err_prefix: &str,
+) -> Result<(), String> {
+    inline_runtime_support_calls(jit_module, ctx, err_prefix)?;
+    let mut ctrl_plane = ControlPlane::default();
+    ctx.optimize(jit_module.isa(), &mut ctrl_plane)
+        .map_err(|err| format!("{err_prefix}: {err:?}"))?;
+    collapse_postopt_noncritical_trivial_jump_blocks(&mut ctx.func);
+    ctx.compute_cfg();
+    ctx.compute_domtree();
+    ctx.verify_if(jit_module.isa())
+        .map_err(|err| format!("{err_prefix}: post-collapse verifier failed: {err:?}"))?;
+    Ok(())
 }
 
-impl CraneliftCompileCachePolicy {
-    fn is_enabled(self) -> bool {
-        matches!(self, Self::Enabled)
+fn collapse_postopt_noncritical_trivial_jump_blocks(func: &mut ir::Function) -> usize {
+    let mut collapsed = 0;
+    loop {
+        let cfg = ControlFlowGraph::with_function(func);
+        let value_uses = cranelift_value_use_insts(func);
+        let candidates = collect_noncritical_trivial_jump_blocks(func, &cfg, &value_uses);
+        if candidates.is_empty() {
+            break;
+        }
+        for block in &candidates {
+            redirect_trivial_jump_block_predecessors(func, block);
+        }
+        for block in candidates {
+            remove_block_from_layout(func, block.block);
+            collapsed += 1;
+        }
     }
+    collapsed
+}
 
-    fn disabled_reason(self) -> Option<&'static str> {
-        match self {
-            Self::Enabled => None,
-            Self::Disabled { reason } => Some(reason),
+fn collect_noncritical_trivial_jump_blocks(
+    func: &ir::Function,
+    cfg: &ControlFlowGraph,
+    value_uses: &HashMap<ir::Value, Vec<ir::Inst>>,
+) -> Vec<TrivialJumpBlock> {
+    let mut candidates = Vec::new();
+    let mut occupied_blocks = HashSet::new();
+    for block in func.layout.blocks() {
+        let Some((jump_inst, target, jump_args)) = trivial_jump_block_target(func, block) else {
+            continue;
+        };
+        if target == block {
+            continue;
+        }
+        let predecessors = cfg.pred_iter(block).collect::<Vec<_>>();
+        if predecessors.len() != 1 || predecessors.iter().any(|pred| pred.block == target) {
+            continue;
+        }
+        let params = func.dfg.block_params(block).to_vec();
+        if !trivial_jump_args_are_param_forwards(&jump_args, &params) {
+            continue;
+        }
+        if !trivial_jump_block_params_only_feed_jump(jump_inst, &params, value_uses) {
+            continue;
+        }
+        if func.dfg.block_params(target).len() != jump_args.len() {
+            continue;
+        }
+        if !trivial_jump_block_edges_are_noncritical(&cfg, block, target, &predecessors) {
+            continue;
+        }
+        if predecessors.iter().any(|pred| {
+            predecessor_forward_rewrites(func, pred.inst, block, target, &params, &jump_args)
+                .is_none()
+        }) {
+            continue;
+        }
+        let involved_blocks = std::iter::once(block)
+            .chain(std::iter::once(target))
+            .chain(predecessors.iter().map(|pred| pred.block))
+            .collect::<Vec<_>>();
+        if involved_blocks
+            .iter()
+            .any(|block| occupied_blocks.contains(block))
+        {
+            continue;
+        }
+        occupied_blocks.extend(involved_blocks);
+        candidates.push(TrivialJumpBlock {
+            block,
+            target,
+            params,
+            jump_args,
+            predecessors,
+        });
+    }
+    candidates
+}
+
+fn trivial_jump_args_are_param_forwards(jump_args: &[ir::BlockArg], params: &[ir::Value]) -> bool {
+    let params = params.iter().copied().collect::<HashSet<_>>();
+    jump_args.iter().all(|arg| match arg {
+        ir::BlockArg::Value(value) => params.contains(value),
+        ir::BlockArg::TryCallRet(_) | ir::BlockArg::TryCallExn(_) => false,
+    })
+}
+
+fn trivial_jump_block_target(
+    func: &ir::Function,
+    block: ir::Block,
+) -> Option<(ir::Inst, ir::Block, Vec<ir::BlockArg>)> {
+    let insts = func.layout.block_insts(block).collect::<Vec<_>>();
+    let (last, prefix) = insts.split_last()?;
+    if prefix
+        .iter()
+        .any(|inst| func.dfg.insts[*inst].opcode() != ir::Opcode::Nop)
+    {
+        return None;
+    }
+    if func.dfg.insts[*last].opcode() != ir::Opcode::Jump {
+        return None;
+    }
+    let destinations =
+        func.dfg.insts[*last].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
+    let destination = destinations.first()?;
+    if destinations.len() != 1 {
+        return None;
+    }
+    Some((
+        *last,
+        destination.block(&func.dfg.value_lists),
+        destination.args(&func.dfg.value_lists).collect(),
+    ))
+}
+
+fn cranelift_value_use_insts(func: &ir::Function) -> HashMap<ir::Value, Vec<ir::Inst>> {
+    let mut uses: HashMap<ir::Value, Vec<ir::Inst>> = HashMap::new();
+    for block in func.layout.blocks() {
+        for inst in func.layout.block_insts(block) {
+            let mut inst_values = Vec::new();
+            for value in func.dfg.inst_args(inst) {
+                if !inst_values.contains(value) {
+                    inst_values.push(*value);
+                }
+            }
+            let destinations = func.dfg.insts[inst]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
+            for destination in destinations {
+                for arg in destination.args(&func.dfg.value_lists) {
+                    let ir::BlockArg::Value(value) = arg else {
+                        continue;
+                    };
+                    if !inst_values.contains(&value) {
+                        inst_values.push(value);
+                    }
+                }
+            }
+            for value in inst_values {
+                uses.entry(value).or_default().push(inst);
+            }
+        }
+    }
+    uses
+}
+
+fn trivial_jump_block_params_only_feed_jump(
+    jump_inst: ir::Inst,
+    params: &[ir::Value],
+    value_uses: &HashMap<ir::Value, Vec<ir::Inst>>,
+) -> bool {
+    params.iter().all(|param| {
+        value_uses
+            .get(param)
+            .is_none_or(|uses| uses.iter().all(|inst| *inst == jump_inst))
+    })
+}
+
+fn trivial_jump_block_edges_are_noncritical(
+    cfg: &ControlFlowGraph,
+    block: ir::Block,
+    target: ir::Block,
+    predecessors: &[cranelift_codegen::flowgraph::BlockPredecessor],
+) -> bool {
+    let final_target_pred_count = cfg
+        .pred_iter(target)
+        .map(|pred| pred.block)
+        .filter(|pred| *pred != block)
+        .chain(predecessors.iter().map(|pred| pred.block))
+        .collect::<HashSet<_>>()
+        .len();
+    predecessors.iter().all(|pred| {
+        let mut final_pred_successors = cfg.succ_iter(pred.block).collect::<HashSet<_>>();
+        final_pred_successors.remove(&block);
+        final_pred_successors.insert(target);
+        final_pred_successors.len() <= 1 || final_target_pred_count <= 1
+    })
+}
+
+fn predecessor_forward_rewrites(
+    func: &ir::Function,
+    pred_inst: ir::Inst,
+    block: ir::Block,
+    target: ir::Block,
+    params: &[ir::Value],
+    jump_args: &[ir::BlockArg],
+) -> Option<Vec<(usize, Vec<ir::BlockArg>)>> {
+    let mut rewrites = Vec::new();
+    let destinations = func.dfg.insts[pred_inst]
+        .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
+    for (index, destination) in destinations.iter().enumerate() {
+        if destination.block(&func.dfg.value_lists) == block {
+            let incoming_args = destination.args(&func.dfg.value_lists).collect::<Vec<_>>();
+            let forwarded = compose_forwarded_block_args(&incoming_args, params, jump_args)?;
+            if func.dfg.block_params(target).len() != forwarded.len() {
+                return None;
+            }
+            rewrites.push((index, forwarded));
+        }
+    }
+    (!rewrites.is_empty()).then_some(rewrites)
+}
+
+fn compose_forwarded_block_args(
+    incoming_args: &[ir::BlockArg],
+    params: &[ir::Value],
+    jump_args: &[ir::BlockArg],
+) -> Option<Vec<ir::BlockArg>> {
+    if incoming_args.len() != params.len() {
+        return None;
+    }
+    let param_args = params
+        .iter()
+        .copied()
+        .zip(incoming_args.iter().copied())
+        .collect::<HashMap<_, _>>();
+    Some(
+        jump_args
+            .iter()
+            .map(|arg| match arg {
+                ir::BlockArg::Value(value) => param_args.get(value).copied().unwrap_or(*arg),
+                ir::BlockArg::TryCallRet(_) | ir::BlockArg::TryCallExn(_) => *arg,
+            })
+            .collect(),
+    )
+}
+
+fn redirect_trivial_jump_block_predecessors(func: &mut ir::Function, block: &TrivialJumpBlock) {
+    for predecessor in &block.predecessors {
+        let rewrites = predecessor_forward_rewrites(
+            func,
+            predecessor.inst,
+            block.block,
+            block.target,
+            &block.params,
+            &block.jump_args,
+        )
+        .expect("trivial jump predecessor rewrites should have been validated");
+        let new_calls = rewrites
+            .into_iter()
+            .map(|(index, args)| {
+                (
+                    index,
+                    ir::BlockCall::new(block.target, args, &mut func.dfg.value_lists),
+                )
+            })
+            .collect::<Vec<_>>();
+        let dfg = &mut func.dfg;
+        let destinations = dfg.insts[predecessor.inst]
+            .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables);
+        for (index, destination) in new_calls {
+            destinations[index] = destination;
         }
     }
 }
 
-fn stable_cranelift_compile_cache_name(cache_name: &str) -> ir::UserFuncName {
-    let hash = stable_compile_cache_hash(cache_name.as_bytes());
+fn remove_block_from_layout(func: &mut ir::Function, block: ir::Block) {
+    let insts = func.layout.block_insts(block).collect::<Vec<_>>();
+    for inst in insts {
+        func.layout.remove_inst(inst);
+    }
+    func.layout.remove_block(block);
+}
+
+fn stable_cranelift_function_name(function_name: &str) -> ir::UserFuncName {
+    let hash = stable_cranelift_function_hash(function_name.as_bytes());
     ir::UserFuncName::user((hash >> 32) as u32, hash as u32)
 }
 
-fn stable_compile_cache_hash(bytes: &[u8]) -> u64 {
+fn stable_cranelift_function_hash(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in bytes {
         hash ^= u64::from(*byte);
@@ -12426,13 +12697,13 @@ fn direct_function_symbol_scope(function_id: FunctionId, symbol_id: u64) -> Stri
     format!("fn_{}_{}", function_id.packed(), symbol_id)
 }
 
-fn direct_function_compile_cache_name(
+fn direct_function_backend_name(
     function: &BlockPyFunction<CodegenModuleShape>,
     shared_state: Option<&SharedModuleState>,
 ) -> String {
     let mut name = String::from("direct:");
     match shared_state {
-        Some(shared_state) => push_direct_function_cache_module_identity(
+        Some(shared_state) => push_direct_function_module_identity(
             &mut name,
             shared_state.module_name.as_str(),
             shared_state.source_hash(),
@@ -12449,11 +12720,7 @@ fn direct_function_compile_cache_name(
     name
 }
 
-fn push_direct_function_cache_module_identity(
-    out: &mut String,
-    module_name: &str,
-    source_hash: u64,
-) {
+fn push_direct_function_module_identity(out: &mut String, module_name: &str, source_hash: u64) {
     push_symbol_component_hex(out, module_name);
     out.push(':');
     out.push_str(format!("{source_hash:016x}").as_str());
@@ -12811,10 +13078,7 @@ fn remap_runtime_clif_extern_user_names(
     Ok(())
 }
 
-fn load_runtime_support_clif(
-    compile_session: &crate::session::CompileSession,
-    jit_module: &mut JITModule,
-) -> Result<(), String> {
+fn load_runtime_support_clif(jit_module: &mut JITModule) -> Result<(), String> {
     let library = runtime_support_library()?;
     let local_runtime_symbols = runtime_support_local_symbols(&library);
     let mut import_func_ids = HashMap::new();
@@ -12848,13 +13112,11 @@ fn load_runtime_support_clif(
         )?;
         let mut ctx = jit_module.make_context();
         ctx.func = function;
-        let _ = define_function_with_incremental_cache(
-            compile_session,
+        let _ = define_prepared_function(
             jit_module,
             func_id,
             &mut ctx,
             &parsed.symbol,
-            CraneliftCompileCachePolicy::Enabled,
             &format!("failed to define runtime CLIF function {}", parsed.symbol),
         )?;
         jit_module.clear_context(&mut ctx);
@@ -13040,13 +13302,11 @@ pub fn run_cranelift_smoke(module: &BlockPyModule<CodegenModuleShape>) -> Result
     }
 
     let function_id = declare_local_fn(&mut jit_module, "dp_jit_smoke", &ctx.func.signature)?;
-    let _ = define_function_with_incremental_cache(
-        &compile_session,
+    let _ = define_prepared_function(
         &mut jit_module,
         function_id,
         &mut ctx,
         "jit-smoke",
-        CraneliftCompileCachePolicy::Enabled,
         "failed to define Cranelift function",
     )?;
     jit_module.clear_context(&mut ctx);
@@ -13266,7 +13526,6 @@ fn build_cranelift_run_bb_specialized_function(
         }
     };
     let counted_refcount_helpers = build_counted_runtime_refcount_helpers(
-        compile_session,
         jit_module,
         function,
         counter_defs,
@@ -14346,14 +14605,11 @@ fn render_compiled_clif_and_vcode_disasm(
     import_id_to_symbol: &HashMap<u32, &'static str>,
     block_annotations: &ClifBlockDisplayAnnotations,
 ) -> Result<(String, String, String), String> {
-    inline_runtime_support_calls(
+    prepare_cranelift_function_for_backend(
         jit_module,
         &mut ctx,
         "failed to render specialized jit run_bb function",
     )?;
-    let mut ctrl_plane = ControlPlane::default();
-    ctx.optimize(jit_module.isa(), &mut ctrl_plane)
-        .map_err(|err| format!("failed to optimize specialized jit run_bb function: {err:?}"))?;
 
     let cfg_dot = CFGPrinter::new(&ctx.func).to_string();
 
@@ -14366,6 +14622,7 @@ fn render_compiled_clif_and_vcode_disasm(
         block_annotations,
     ));
 
+    let mut ctrl_plane = ControlPlane::default();
     let compiled = jit_module
         .isa()
         .compile_function(&ctx.func, &ctx.domtree, true, &mut ctrl_plane)
@@ -14424,7 +14681,6 @@ pub(crate) fn compiled_direct_code_ptr(compiled_handle: ObjPtr) -> Result<ObjPtr
 }
 
 fn define_shared_vectorcall_trampoline(
-    compile_session: &crate::session::CompileSession,
     jit_module: &mut JITModule,
     param_count: usize,
     symbol_name: &str,
@@ -14719,13 +14975,11 @@ fn define_shared_vectorcall_trampoline(
         fb.finalize();
     }
 
-    let main_artifact = define_function_with_incremental_cache(
-        compile_session,
+    let main_artifact = define_prepared_function(
         jit_module,
         main_id,
         &mut ctx,
         &format!("direct-vectorcall-trampoline:{param_count}"),
-        CraneliftCompileCachePolicy::Enabled,
         "failed to define direct vectorcall trampoline",
     )?;
     jit_module.clear_context(&mut ctx);

@@ -1026,6 +1026,7 @@ mod test_only_export_stubs {
     ));
     panic_obj_export!(dp_jit_del_quietly(obj: ObjPtr, key: ObjPtr));
     panic_i64_export!(dp_jit_pyobject_to_i64(value: ObjPtr));
+    panic_unit_export!(dp_jit_raise_i64_overflow());
     panic_obj_export!(dp_jit_make_cell(value: ObjPtr));
     panic_unit_export!(dp_jit_raise_deleted_name_error(name: ObjPtr));
     panic_obj_export!(dp_jit_load_cell(cell: ObjPtr));
@@ -1293,6 +1294,17 @@ unsafe fn exact_long_missing_slot_error() {
         ffi::PyExc_RuntimeError,
         c"exact long specialization missing slot".as_ptr(),
     );
+}
+unsafe fn exact_long_i64_overflow_error() {
+    // BEHAVIOR_CHANGE: optimized SOAC exact-int arithmetic intentionally raises
+    // on i64 overflow instead of falling back to CPython's arbitrary-precision int.
+    ffi::PyErr_SetString(
+        ffi::PyExc_OverflowError,
+        c"SOAC optimized integer arithmetic overflowed i64".as_ptr(),
+    );
+}
+pub unsafe extern "C" fn dp_jit_raise_i64_overflow() {
+    exact_long_i64_overflow_error();
 }
 #[inline(never)]
 unsafe extern "C" fn exact_long_binary_op_hook(kind: i64, lhs: ObjPtr, rhs: ObjPtr) -> ObjPtr {
@@ -1829,6 +1841,10 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol(
         "dp_jit_pyobject_to_i64",
         dp_jit_pyobject_to_i64 as *const u8,
+    );
+    builder.symbol(
+        "dp_jit_raise_i64_overflow",
+        dp_jit_raise_i64_overflow as *const u8,
     );
     builder.symbol(
         "dp_jit_guard_method_type_version",

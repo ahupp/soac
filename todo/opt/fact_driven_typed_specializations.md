@@ -56,6 +56,51 @@ representation-specific:
 Do not add `SoacValue::Truth`. Truth is an `I32` range invariant, not a separate
 runtime representation.
 
+## Producer Facts And Representation Choices
+
+Representation choice should start from what the producer can prove, not only
+from what a later consumer demands.
+
+Examples:
+
+- `ord(x)` semantically produces a Python `int`, but the checked builtin
+  implementation naturally produces an `I64` with exact-int/range facts.
+- a comparison semantically produces the Python bool result, but the natural
+  representation is `I32` with a `0..=1` invariant.
+- an exact-int module constant may be available as an `I64`, while still being
+  materializable as a `PyLong` object at Python-visible boundaries.
+
+The planner should treat each SSA value as a semantic value with one or more
+available physical representations:
+
+```rust
+struct ValueState {
+    facts: ValueFacts,
+    available_reps: SmallVec<[Rep; 2]>,
+}
+
+enum Rep {
+    PyObjectBorrowed,
+    PyObjectOwned,
+    I64,
+    I32Bool01,
+}
+```
+
+Operations then choose among legal lowering alternatives. Coercions are explicit
+edges in the same graph:
+
+```text
+I64 -> PyObjectOwned       via emit_to_python_long
+I32Bool01 -> PyObjectOwned via emit_to_python_bool
+PyObjectBorrowed -> I64    only with proven exact-int facts or a checked guard
+```
+
+This avoids the current failure mode where scalar work only happens when the
+consumer already asks for an `I64`. A producer such as `ord` should make its
+cheap native representation available immediately, and downstream operations
+should use it when their semantic preconditions are satisfied.
+
 ## Integer Facts
 
 Start with a deliberately small integer fact model:
@@ -245,6 +290,164 @@ For example, exact/unboxed integer addition can return `SoacValue::I64` when the
 consumer can stay unboxed, or can call `emit_to_python_long` when a Python object
 is required.
 
+## Lowering Alternatives And Guards
+
+Each optimizable operation should expose a small set of lowering alternatives.
+The planner chooses the cheapest legal alternative, rather than hard-coding a
+single demand-driven path.
+
+Sketch:
+
+```rust
+struct LoweringAlternative {
+    name: &'static str,
+    input_reps: SmallVec<[RepRequirement; 2]>,
+    output_rep: Rep,
+    required_facts: FactsPredicate,
+    output_facts: FactsTransform,
+    guards: SmallVec<[Guard; 2]>,
+    failure: FailureMode,
+    cost: Cost,
+}
+
+enum GuardKind {
+    SemanticCheck,
+    SpecializationCheck,
+}
+
+enum FailureMode {
+    Raise(RuntimeErrorKind),
+    FallbackToGeneric,
+}
+```
+
+There are two distinct guard families:
+
+- **Semantic checks** implement the operation's required Python behavior. A
+  failed `ord` unicode/length check raises the same exception as `ord`; it is not
+  a speculative miss.
+- **Specialization checks** protect an optional fast path. A failed exact-int
+  operator guard falls back to the generic Python operator path so reflected
+  methods, `NotImplemented`, and custom overloads still behave correctly.
+
+Facts decide whether a guard is needed:
+
+- proven facts make the specialized alternative unconditional;
+- dominating runtime checks narrow facts in the dominated region;
+- profile/counter facts require a specialization guard and fallback;
+- missing facts should make the candidate decline unless the guard/fallback
+  behavior is explicit.
+
+Costs should include more than local helper latency:
+
+```text
+total =
+  expected_hot_count * fast_path_cost
+  + expected_miss_count * fallback_cost
+  + materialization_cost
+  + guard_cost
+  + code_size_weight * estimated_bytes
+  + compile_cost_weight * estimated_compile_cost
+```
+
+For unary `-x`, useful candidates are:
+
+- `I64 -> I64` checked machine negate when the value is already unboxed.
+- `PyLong -> I64` via exact-int/fits-i64 guard, then checked machine negate.
+- exact `PyLong` slot helper returning a Python object.
+- generic `PyNumber_Negative`.
+
+If SOAC intentionally treats optimized integer overflow as `OverflowError`
+instead of CPython arbitrary-precision growth, that should be part of the
+candidate's explicit semantics. The candidate should not silently pretend it is
+the ordinary CPython `int` operation.
+
+For `ord(x)`, a checked primitive can be represented as a semantic-guarded
+candidate:
+
+```rust
+#[soac_builtin(name = "ord")]
+#[requires(arg0.type = PyUnicode, failure = RaiseOrdTypeError)]
+#[returns(rep = I64, facts = ExactIntRange(0, 0x10ffff))]
+fn builtin_ord_unicode(obj: PyObject) -> i64;
+```
+
+If facts already prove `x` is a unicode object of length one, codegen can omit
+the checks. If facts are missing, the checked primitive still remains legal
+because its checks implement `ord`'s required behavior.
+
+Binary operators use the same model, but specialization guards fail to generic
+operator dispatch:
+
+```text
+ord(a) + ord(b)
+  ord producers make I64 values available
+  exact-int I64 add candidate is legal
+  output can remain I64 until a Python object boundary
+
+ord(a) + some_random_object
+  RHS facts do not satisfy the I64 add candidate
+  materialize the LHS I64 as PyLong
+  call generic PyNumber_Add
+
+ord(a) + x  with profiled exact-int RHS
+  guard x exact int / fits I64
+  run checked machine add on hit
+  materialize LHS and fall back to PyNumber_Add on miss
+```
+
+## Across Function Calls And External Facts
+
+The same representation/cost model should apply across transformed direct calls.
+Python-visible entry points keep the ordinary object ABI, but direct call
+lowering can expose typed internal variants:
+
+```rust
+struct FunctionVariant {
+    param_reps: SmallVec<[Rep; 4]>,
+    param_required_facts: SmallVec<[FactsPredicate; 4]>,
+    return_rep: Rep,
+    return_facts: ValueFacts,
+    guards_at_entry: SmallVec<[Guard; 2]>,
+    cost: Cost,
+}
+```
+
+The public ABI remains:
+
+```text
+(fn_env, tstate, PyObject*...) -> owned PyObject
+```
+
+but a direct-call variant may be:
+
+```text
+(fn_env, tstate, PyObject unicode, PyObject unicode) -> I64
+(fn_env, tstate, I64, I64) -> I64
+```
+
+Call lowering should choose the cheapest compatible variant. If caller facts
+prove the callee's entry requirements, call it directly. If profile data makes a
+variant likely but not guaranteed, emit guards and a fallback to the generic
+object ABI. Compile cache keys for direct variants need to include the function
+id plus the selected parameter/return representation key and assumption key.
+
+External type information should enter as scoped facts:
+
+- an enforced runtime check such as `type(x) is int` can narrow `x` in dominated
+  code;
+- `isinstance(x, int)` is not enough to skip Python operator behavior because it
+  admits subclasses;
+- annotations alone are not facts unless SOAC or user code inserted an actual
+  enforcing check;
+- profile counters create guarded assumptions, never unconditional facts.
+
+Use CLIF transforms only as cleanup for already-chosen plans: remove redundant
+guards, fold known helper calls, and simplify materialization chains. The primary
+choice belongs in BlockPy/JIT planning, where the compiler still knows whether a
+guard failure means "raise the builtin's required exception" or "fall back to
+generic Python operator dispatch."
+
 ## Diagnostics
 
 Each planner should be able to report why it emitted or declined a specialization.
@@ -255,6 +458,7 @@ Useful fields:
 - operation kind: `truthiness`, `binary_add`, etc.
 - input representations and facts
 - selected implementation
+- candidate costs
 - guards emitted
 - fallback reason, if declined
 - materializations inserted, such as `emit_to_python_long`
@@ -313,7 +517,19 @@ These diagnostics should feed benchmark artifacts and targeted tests.
    operator-family planner so later `sub`, `mul`, comparisons, and unboxed cases
    reuse the same structure.
 
-8. Benchmark and log kept performance changes.
+8. Add cost-based candidate selection.
+
+   Start with unary operators, because their candidate space is smaller than
+   binary operators and they still exercise the important choices: existing
+   machine value, guarded `PyLong -> I64`, exact slot helper, or generic Python
+   fallback.
+
+9. Add typed direct-call variants.
+
+   Extend the same planner to runtime primitives and transformed Python
+   functions, keyed by parameter/return representation and assumption facts.
+
+10. Benchmark and log kept performance changes.
 
    Measure before/after on the standard benchmark workflow. If a specialization
    is kept, add a succinct entry to `docs/CODEX_OPT_LOG.md`.

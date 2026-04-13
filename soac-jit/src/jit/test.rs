@@ -52,32 +52,390 @@ mod tests {
         fn PyThreadState_GetUnchecked() -> *mut ffi::PyThreadState;
     }
     #[test]
-    fn cranelift_compile_cache_name_is_stable_from_logical_cache_name() {
+    fn cranelift_function_name_is_stable_from_logical_name() {
         assert_eq!(
-            stable_compile_cache_hash(b""),
+            stable_cranelift_function_hash(b""),
             0xcbf29ce484222325,
             "empty FNV-1a hash should stay stable"
         );
         assert_eq!(
-            stable_cranelift_compile_cache_name("direct:pkg.mod.fn:2"),
-            stable_cranelift_compile_cache_name("direct:pkg.mod.fn:2")
+            stable_cranelift_function_name("direct:pkg.mod.fn:2"),
+            stable_cranelift_function_name("direct:pkg.mod.fn:2")
         );
         assert_ne!(
-            stable_cranelift_compile_cache_name("direct:pkg.mod.fn:2"),
-            stable_cranelift_compile_cache_name("direct:pkg.mod.fn:3")
+            stable_cranelift_function_name("direct:pkg.mod.fn:2"),
+            stable_cranelift_function_name("direct:pkg.mod.fn:3")
+        );
+    }
+
+    fn block_successor_targets(function: &ir::Function, block: ir::Block) -> Vec<ir::Block> {
+        function
+            .layout
+            .last_inst(block)
+            .into_iter()
+            .flat_map(|inst| {
+                function.dfg.insts[inst]
+                    .branch_destination(&function.dfg.jump_tables, &function.dfg.exception_tables)
+                    .iter()
+                    .map(|destination| destination.block(&function.dfg.value_lists))
+            })
+            .collect()
+    }
+
+    fn single_block_successor_args(function: &ir::Function, block: ir::Block) -> Vec<ir::BlockArg> {
+        let inst = function
+            .layout
+            .last_inst(block)
+            .expect("block should end in a branch");
+        let destinations = function.dfg.insts[inst]
+            .branch_destination(&function.dfg.jump_tables, &function.dfg.exception_tables);
+        assert_eq!(destinations.len(), 1);
+        destinations[0].args(&function.dfg.value_lists).collect()
+    }
+
+    fn build_noncritical_trivial_jump_function() -> (ir::Function, ir::Block, ir::Block) {
+        let mut function = ir::Function::new();
+        function
+            .signature
+            .params
+            .push(ir::AbiParam::new(ir::types::I64));
+        function
+            .signature
+            .returns
+            .push(ir::AbiParam::new(ir::types::I64));
+        let entry;
+        let target;
+        let mut builder_ctx = FunctionBuilderContext::new();
+        {
+            let mut fb = FunctionBuilder::new(&mut function, &mut builder_ctx);
+            entry = fb.create_block();
+            let forwarder = fb.create_block();
+            target = fb.create_block();
+            fb.append_block_params_for_function_params(entry);
+            fb.append_block_param(forwarder, ir::types::I64);
+            fb.append_block_param(target, ir::types::I64);
+
+            fb.switch_to_block(entry);
+            let entry_value = fb.block_params(entry)[0];
+            fb.ins()
+                .jump(forwarder, &[ir::BlockArg::Value(entry_value)]);
+
+            fb.switch_to_block(forwarder);
+            let forwarded_value = fb.block_params(forwarder)[0];
+            fb.ins().nop();
+            fb.ins()
+                .jump(target, &[ir::BlockArg::Value(forwarded_value)]);
+
+            fb.switch_to_block(target);
+            let result = fb.block_params(target)[0];
+            fb.ins().return_(&[result]);
+
+            fb.seal_all_blocks();
+            fb.finalize();
+        }
+        (function, entry, target)
+    }
+
+    fn build_chained_trivial_jump_function() -> (ir::Function, ir::Block, ir::Block) {
+        let mut function = ir::Function::new();
+        function
+            .signature
+            .returns
+            .push(ir::AbiParam::new(ir::types::I64));
+        let entry;
+        let target;
+        let mut builder_ctx = FunctionBuilderContext::new();
+        {
+            let mut fb = FunctionBuilder::new(&mut function, &mut builder_ctx);
+            entry = fb.create_block();
+            let first_forwarder = fb.create_block();
+            let second_forwarder = fb.create_block();
+            target = fb.create_block();
+
+            fb.switch_to_block(entry);
+            fb.ins().jump(first_forwarder, &[]);
+
+            fb.switch_to_block(first_forwarder);
+            fb.ins().nop();
+            fb.ins().jump(second_forwarder, &[]);
+
+            fb.switch_to_block(second_forwarder);
+            fb.ins().nop();
+            fb.ins().jump(target, &[]);
+
+            fb.switch_to_block(target);
+            let result = fb.ins().iconst(ir::types::I64, 1);
+            fb.ins().return_(&[result]);
+
+            fb.seal_all_blocks();
+            fb.finalize();
+        }
+        (function, entry, target)
+    }
+
+    fn build_critical_trivial_jump_function() -> ir::Function {
+        let mut function = ir::Function::new();
+        function
+            .signature
+            .params
+            .push(ir::AbiParam::new(ir::types::I64));
+        function
+            .signature
+            .params
+            .push(ir::AbiParam::new(ir::types::I64));
+        function
+            .signature
+            .returns
+            .push(ir::AbiParam::new(ir::types::I64));
+        let mut builder_ctx = FunctionBuilderContext::new();
+        {
+            let mut fb = FunctionBuilder::new(&mut function, &mut builder_ctx);
+            let entry = fb.create_block();
+            let forwarder = fb.create_block();
+            let other = fb.create_block();
+            let target = fb.create_block();
+            fb.append_block_params_for_function_params(entry);
+            fb.append_block_param(forwarder, ir::types::I64);
+            fb.append_block_param(other, ir::types::I64);
+            fb.append_block_param(target, ir::types::I64);
+
+            fb.switch_to_block(entry);
+            let lhs = fb.block_params(entry)[0];
+            let rhs = fb.block_params(entry)[1];
+            fb.ins().brif(
+                lhs,
+                forwarder,
+                &[ir::BlockArg::Value(lhs)],
+                other,
+                &[ir::BlockArg::Value(rhs)],
+            );
+
+            fb.switch_to_block(forwarder);
+            let forwarded_value = fb.block_params(forwarder)[0];
+            fb.ins().nop();
+            fb.ins()
+                .jump(target, &[ir::BlockArg::Value(forwarded_value)]);
+
+            fb.switch_to_block(other);
+            let other_value = fb.block_params(other)[0];
+            fb.ins().jump(target, &[ir::BlockArg::Value(other_value)]);
+
+            fb.switch_to_block(target);
+            let result = fb.block_params(target)[0];
+            fb.ins().return_(&[result]);
+
+            fb.seal_all_blocks();
+            fb.finalize();
+        }
+        function
+    }
+
+    fn build_non_param_jump_arg_trivial_jump_function() -> ir::Function {
+        let mut function = ir::Function::new();
+        function
+            .signature
+            .returns
+            .push(ir::AbiParam::new(ir::types::I64));
+        let mut builder_ctx = FunctionBuilderContext::new();
+        {
+            let mut fb = FunctionBuilder::new(&mut function, &mut builder_ctx);
+            let entry = fb.create_block();
+            let forwarder = fb.create_block();
+            let target = fb.create_block();
+            fb.append_block_param(forwarder, ir::types::I64);
+            fb.append_block_param(target, ir::types::I64);
+
+            fb.switch_to_block(entry);
+            let forwarded = fb.ins().iconst(ir::types::I64, 1);
+            let non_param = fb.ins().iconst(ir::types::I64, 2);
+            fb.ins().jump(forwarder, &[ir::BlockArg::Value(forwarded)]);
+
+            fb.switch_to_block(forwarder);
+            fb.ins().nop();
+            fb.ins().jump(target, &[ir::BlockArg::Value(non_param)]);
+
+            fb.switch_to_block(target);
+            let result = fb.block_params(target)[0];
+            fb.ins().return_(&[result]);
+
+            fb.seal_all_blocks();
+            fb.finalize();
+        }
+        function
+    }
+
+    fn build_successor_use_trivial_jump_function() -> ir::Function {
+        let mut function = ir::Function::new();
+        function
+            .signature
+            .params
+            .push(ir::AbiParam::new(ir::types::I64));
+        function
+            .signature
+            .returns
+            .push(ir::AbiParam::new(ir::types::I64));
+        let mut builder_ctx = FunctionBuilderContext::new();
+        {
+            let mut fb = FunctionBuilder::new(&mut function, &mut builder_ctx);
+            let entry = fb.create_block();
+            let forwarder = fb.create_block();
+            let target = fb.create_block();
+            fb.append_block_params_for_function_params(entry);
+            fb.append_block_param(forwarder, ir::types::I64);
+
+            fb.switch_to_block(entry);
+            let entry_value = fb.block_params(entry)[0];
+            fb.ins()
+                .jump(forwarder, &[ir::BlockArg::Value(entry_value)]);
+
+            fb.switch_to_block(forwarder);
+            let forwarded_value = fb.block_params(forwarder)[0];
+            fb.ins().nop();
+            fb.ins().jump(target, &[]);
+
+            fb.switch_to_block(target);
+            let result = fb.ins().iadd_imm(forwarded_value, 1);
+            fb.ins().return_(&[result]);
+
+            fb.seal_all_blocks();
+            fb.finalize();
+        }
+        function
+    }
+
+    fn build_successor_branch_arg_trivial_jump_function() -> ir::Function {
+        let mut function = ir::Function::new();
+        function
+            .signature
+            .params
+            .push(ir::AbiParam::new(ir::types::I64));
+        function
+            .signature
+            .returns
+            .push(ir::AbiParam::new(ir::types::I64));
+        let mut builder_ctx = FunctionBuilderContext::new();
+        {
+            let mut fb = FunctionBuilder::new(&mut function, &mut builder_ctx);
+            let entry = fb.create_block();
+            let forwarder = fb.create_block();
+            let target = fb.create_block();
+            let done = fb.create_block();
+            fb.append_block_params_for_function_params(entry);
+            fb.append_block_param(forwarder, ir::types::I64);
+            fb.append_block_param(done, ir::types::I64);
+
+            fb.switch_to_block(entry);
+            let entry_value = fb.block_params(entry)[0];
+            fb.ins()
+                .jump(forwarder, &[ir::BlockArg::Value(entry_value)]);
+
+            fb.switch_to_block(forwarder);
+            let forwarded_value = fb.block_params(forwarder)[0];
+            fb.ins().nop();
+            fb.ins().jump(target, &[]);
+
+            fb.switch_to_block(target);
+            fb.ins().jump(done, &[ir::BlockArg::Value(forwarded_value)]);
+
+            fb.switch_to_block(done);
+            let result = fb.block_params(done)[0];
+            fb.ins().return_(&[result]);
+
+            fb.seal_all_blocks();
+            fb.finalize();
+        }
+        function
+    }
+
+    #[test]
+    fn collapse_trivial_jump_block_with_nop_before_terminator() {
+        let (mut function, entry, target) = build_noncritical_trivial_jump_function();
+        let entry_arg = function.dfg.block_params(entry)[0];
+
+        assert_eq!(function.layout.blocks().count(), 3);
+        assert_eq!(
+            collapse_postopt_noncritical_trivial_jump_blocks(&mut function),
+            1
+        );
+        assert_eq!(function.layout.blocks().count(), 2);
+        assert_eq!(block_successor_targets(&function, entry), vec![target]);
+        assert_eq!(
+            single_block_successor_args(&function, entry),
+            vec![ir::BlockArg::Value(entry_arg)]
         );
     }
 
     #[test]
-    fn direct_function_cache_module_identity_is_stable() {
+    fn collapse_trivial_jump_blocks_iterates_to_fixpoint() {
+        let (mut function, entry, target) = build_chained_trivial_jump_function();
+
+        assert_eq!(function.layout.blocks().count(), 4);
+        assert_eq!(
+            collapse_postopt_noncritical_trivial_jump_blocks(&mut function),
+            2
+        );
+        assert_eq!(function.layout.blocks().count(), 2);
+        assert_eq!(block_successor_targets(&function, entry), vec![target]);
+    }
+
+    #[test]
+    fn collapse_trivial_jump_block_keeps_critical_edges_split() {
+        let mut function = build_critical_trivial_jump_function();
+
+        assert_eq!(function.layout.blocks().count(), 4);
+        assert_eq!(
+            collapse_postopt_noncritical_trivial_jump_blocks(&mut function),
+            0
+        );
+        assert_eq!(function.layout.blocks().count(), 4);
+    }
+
+    #[test]
+    fn collapse_trivial_jump_block_skips_non_param_forwarding() {
+        let mut function = build_non_param_jump_arg_trivial_jump_function();
+
+        assert_eq!(function.layout.blocks().count(), 3);
+        assert_eq!(
+            collapse_postopt_noncritical_trivial_jump_blocks(&mut function),
+            0
+        );
+        assert_eq!(function.layout.blocks().count(), 3);
+    }
+
+    #[test]
+    fn collapse_trivial_jump_block_skips_successor_param_uses() {
+        let mut function = build_successor_use_trivial_jump_function();
+
+        assert_eq!(function.layout.blocks().count(), 3);
+        assert_eq!(
+            collapse_postopt_noncritical_trivial_jump_blocks(&mut function),
+            0
+        );
+        assert_eq!(function.layout.blocks().count(), 3);
+    }
+
+    #[test]
+    fn collapse_trivial_jump_block_skips_successor_branch_arg_uses() {
+        let mut function = build_successor_branch_arg_trivial_jump_function();
+
+        assert_eq!(function.layout.blocks().count(), 4);
+        assert_eq!(
+            collapse_postopt_noncritical_trivial_jump_blocks(&mut function),
+            0
+        );
+        assert_eq!(function.layout.blocks().count(), 4);
+    }
+
+    #[test]
+    fn direct_function_module_identity_is_stable() {
         let mut first = String::new();
-        push_direct_function_cache_module_identity(&mut first, "pkg.mod", 0x1234);
+        push_direct_function_module_identity(&mut first, "pkg.mod", 0x1234);
         let mut second = String::new();
-        push_direct_function_cache_module_identity(&mut second, "pkg.mod", 0x1234);
+        push_direct_function_module_identity(&mut second, "pkg.mod", 0x1234);
         let mut different_hash = String::new();
-        push_direct_function_cache_module_identity(&mut different_hash, "pkg.mod", 0x1235);
+        push_direct_function_module_identity(&mut different_hash, "pkg.mod", 0x1235);
         let mut different_module = String::new();
-        push_direct_function_cache_module_identity(&mut different_module, "pkg.other", 0x1234);
+        push_direct_function_module_identity(&mut different_module, "pkg.other", 0x1234);
         assert_eq!(first, second);
         assert_eq!(first, "706b672e6d6f64:0000000000001234");
         assert_ne!(first, different_hash);
@@ -144,20 +502,6 @@ def f():
                 )
             );
         });
-    }
-
-    #[test]
-    fn counted_refcount_helper_cache_requires_stable_scope() {
-        assert_eq!(
-            counted_runtime_refcount_helper_cache_policy(Some("shared_pkg_fn_7")),
-            CraneliftCompileCachePolicy::Enabled
-        );
-        assert_eq!(
-            counted_runtime_refcount_helper_cache_policy(None),
-            CraneliftCompileCachePolicy::Disabled {
-                reason: "counted refcount helper lacks stable shared-state counter symbols",
-            }
-        );
     }
 
     #[test]
@@ -1033,6 +1377,99 @@ def f():
                 max: 0x110000
             })
         );
+    }
+
+    #[test]
+    fn i64_demand_facts_accept_checked_machine_int_overflow_paths() {
+        let mut module = test_module(ModuleNameGen::new(0), vec![test_function()]);
+        module.module_constants.push(int_literal(i64::MAX));
+        module.module_constants.push(int_literal(1));
+        module.module_constants.push(int_literal(3037000500i64));
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+
+        let overflowing_add = op_expr(BinOp::new(
+            BinOpKind::Add,
+            name_expr(test_constant_name(0)),
+            name_expr(test_constant_name(1)),
+        ));
+        let checked_mul = op_expr(BinOp::new(
+            BinOpKind::Mul,
+            name_expr(test_constant_name(2)),
+            name_expr(test_constant_name(2)),
+        ));
+
+        assert_eq!(
+            codegen_expr_static_i64_demand_facts(&overflowing_add, &module_constants),
+            Some(IntFacts::i64_unknown()),
+        );
+        assert_eq!(
+            codegen_expr_static_i64_demand_facts(&checked_mul, &module_constants),
+            Some(IntFacts::i64_unknown()),
+        );
+    }
+
+    #[test]
+    fn i64_demand_codegen_emits_checked_machine_int_overflow_paths() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "i64_demand_codegen_emits_checked_machine_int_overflow_paths",
+        ) {
+            return;
+        }
+
+        for (kind, lhs, rhs, opcode) in [
+            (BinOpKind::Add, 1, 2, ir::Opcode::SaddOverflow),
+            (BinOpKind::Sub, 1, 2, ir::Opcode::SsubOverflow),
+            (BinOpKind::Mul, 3, 4, ir::Opcode::SmulOverflow),
+        ] {
+            let blocks = [1usize as ObjPtr];
+            let mut constants = TestConstantPool::default();
+            constants
+                .module_constants
+                .push(InstrResolved::Load(Load::new(test_runtime_name("chr"))));
+            let chr = name_expr(test_constant_name(0));
+            let lhs = constants.int_expr(lhs);
+            let rhs = constants.int_expr(rhs);
+            let checked_arg = op_expr(BinOp::new(kind, lhs, rhs));
+            let chr_call = Call::new(
+                chr,
+                vec![CallArgPositional::Positional(checked_arg)],
+                vec![],
+            );
+            let mut function = test_function();
+            let block = CodegenBlock {
+                label: function.name_gen.next_block_name(),
+                body: vec![],
+                term: ret_term(op_expr(chr_call)),
+                params: vec![],
+                exc_edge: None,
+            };
+            function.blocks = vec![block];
+            let mut module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
+            module.module_constants = constants.module_constants.clone();
+            let module_constants =
+                crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+            let built = build_test_jit_function_with_constants(
+                &module,
+                &module.callable_defs[0],
+                &blocks,
+                &module_constants,
+            );
+
+            assert_eq!(
+                count_opcode(&built.ctx.func, opcode),
+                1,
+                "{kind:?} should lower to a signed overflow-checking Cranelift opcode"
+            );
+            let helper_names =
+                import_user_names_for_symbols(&built, &["dp_jit_raise_i64_overflow"]);
+            assert_eq!(
+                count_direct_calls_to_runtime_helpers(&built.ctx.func, &helper_names),
+                1,
+                "{kind:?} overflow path should call the SOAC overflow raiser"
+            );
+        }
     }
 
     #[test]
@@ -4014,6 +4451,20 @@ def read_point(point):
         })
     }
 
+    fn count_opcode(function: &ir::Function, opcode: ir::Opcode) -> usize {
+        function
+            .layout
+            .blocks()
+            .map(|block| {
+                function
+                    .layout
+                    .block_insts(block)
+                    .filter(|inst| function.dfg.insts[*inst].opcode() == opcode)
+                    .count()
+            })
+            .sum()
+    }
+
     fn count_symbolic_global_values(function: &ir::Function) -> usize {
         function
             .global_values
@@ -4170,16 +4621,14 @@ def read_point(point):
 
     unsafe fn build_runtime_refcount_smoke_wrapper()
     -> unsafe extern "C" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void {
-        let (compile_session, mut jit_module, mut ctx, wrapper_id, _) =
+        let (_compile_session, mut jit_module, mut ctx, wrapper_id, _) =
             build_runtime_refcount_smoke_context();
 
-        define_function_with_incremental_cache(
-            &compile_session,
+        define_prepared_function(
             &mut jit_module,
             wrapper_id,
             &mut ctx,
             "test-runtime-refcount-smoke-wrapper",
-            CraneliftCompileCachePolicy::Enabled,
             "test wrapper function should define",
         )
         .expect("wrapper function should compile");
@@ -4243,13 +4692,11 @@ def read_point(point):
             fb.finalize();
         }
 
-        define_function_with_incremental_cache(
-            &compile_session,
+        define_prepared_function(
             &mut jit_module,
             wrapper_id,
             &mut ctx,
             "test-runtime-refcount-decref-wrapper",
-            CraneliftCompileCachePolicy::Enabled,
             "test wrapper function should define",
         )
         .expect("wrapper function should compile");
@@ -4281,11 +4728,9 @@ def read_point(point):
         )
         .expect("scalar counter storage should define");
         let counted_incref_id = build_counted_runtime_refcount_helper(
-            &compile_session,
             &mut jit_module,
             "test_counted_runtime_incref",
             "test-counted-runtime-incref",
-            CraneliftCompileCachePolicy::Enabled,
             &DP_JIT_INCREF_IMPORT,
             &SOAC_RUNTIME_INCREF_APPLIED_IMPORT,
             scalar_counter_data_id,
@@ -4324,13 +4769,11 @@ def read_point(point):
             fb.finalize();
         }
 
-        define_function_with_incremental_cache(
-            &compile_session,
+        define_prepared_function(
             &mut jit_module,
             wrapper_id,
             &mut ctx,
             "test-counted-runtime-incref-wrapper",
-            CraneliftCompileCachePolicy::Enabled,
             "counted incref wrapper should define",
         )
         .expect("wrapper function should compile");
@@ -4370,11 +4813,9 @@ def read_point(point):
         )
         .expect("scalar counter storage should define");
         let counted_decref_id = build_counted_runtime_refcount_helper(
-            &compile_session,
             &mut jit_module,
             "test_counted_runtime_decref",
             "test-counted-runtime-decref",
-            CraneliftCompileCachePolicy::Enabled,
             &DP_JIT_DECREF_IMPORT,
             &SOAC_RUNTIME_DECREF_APPLIED_IMPORT,
             scalar_counter_data_id,
@@ -4414,13 +4855,11 @@ def read_point(point):
             fb.finalize();
         }
 
-        define_function_with_incremental_cache(
-            &compile_session,
+        define_prepared_function(
             &mut jit_module,
             wrapper_id,
             &mut ctx,
             "test-counted-runtime-decref-wrapper",
-            CraneliftCompileCachePolicy::Enabled,
             "counted decref wrapper should define",
         )
         .expect("wrapper function should compile");

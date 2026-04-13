@@ -395,23 +395,6 @@ anything non-code affected the run. If there were no such issues, say
   to inline generated JIT INCREF/DECREF helper calls as no-ops. This is an
   intentionally unsound performance experiment knob and leaks Python
   references.
-- `SOAC_CRANELIFT_COMPILE_CACHE`
-  Set to `1`, `true`, `yes`, or `on` to enable the experimental
-  filesystem-backed Cranelift incremental compile cache. It writes
-  entries to `SOAC_COMPILE_CACHE_DIR`, `$SOAC_WORK_DIR/compile-cache`,
-  or a process temp directory using key-derived filenames, and logs
-  cache configuration, hits, and store failures through the
-  `soac_jit_compile_cache` tracing target. The cache is disabled by
-  default. Direct Python function bodies now participate using a
-  logical cache key that includes the module identity, and shared-state
-  counted incref/decref helpers also participate when they can bind
-  stable shared counter symbols. Explicit local and inspection builds
-  still skip those helper stubs because their counter storage names
-  remain per-instance.
-- `SOAC_COMPILE_CACHE_DIR`
-  Explicit cache directory for `SOAC_CRANELIFT_COMPILE_CACHE`. Prefer
-  this for CPython test runs and symlinked/shared checkout workflows so
-  cache writes do not depend on the process current directory.
 - `BEHAVIOR_CHANGE`
   Source comments with this exact tag mark intentional CPython-visible
   compatibility changes. Current examples: apply-mode raw indexed

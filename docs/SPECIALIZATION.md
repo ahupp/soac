@@ -463,7 +463,7 @@ apply/verify mode:
 - The fast path:
   - records the current observed operand shape
   - compares it against the profiled exact-int shape
-  - on hit, calls the exact-int helper
+  - on hit, calls the profiled `PyLong` number slot helper
   - on miss, falls back to the normal Python operator lowering
 - The current specialized operator space covers:
   - arithmetic
@@ -579,6 +579,11 @@ apply/verify mode:
 - `chr(<i64 module constant>)` can pass the constant directly to
   `soac_runtime_builtin_chr_i64` instead of first materializing a temporary
   `PyLong`.
+- When `Add`, `Sub`, or `Mul` is emitted to satisfy an `i64`/index demand,
+  codegen uses Cranelift signed overflow-checking arithmetic and branches to
+  `OverflowError` on overflow. **BEHAVIOR_CHANGE:** optimized SOAC raises on
+  overflow in this scalar path instead of falling back to CPython's
+  arbitrary-precision `int`.
 - `chr(x)` can use the same scalar path when local value facts prove that `x`
   is an exact `PyLong`. Codegen emits the general
   `soac_runtime_pylong_as_i64_saturating` coercion before calling

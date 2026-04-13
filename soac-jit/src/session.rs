@@ -1,21 +1,14 @@
 use crate::jit::ProcessJitEngine;
 use crate::module_type::SharedModuleState;
-use cranelift_codegen::incremental_cache::CacheKvStore;
 use soac_blockpy::block_py::{BlockPyFunction, FunctionId, ModuleNameGen};
 use soac_blockpy::passes::CodegenModuleShape;
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
-use std::fs;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 static NEXT_COMPILE_SESSION_ID: AtomicU32 = AtomicU32::new(1);
 static PROCESS_COMPILE_SESSION: OnceLock<Arc<CompileSession>> = OnceLock::new();
-const SOAC_COMPILE_CACHE_DIR_ENV: &str = "SOAC_COMPILE_CACHE_DIR";
-const SOAC_WORK_DIR_ENV: &str = "SOAC_WORK_DIR";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct CompileSessionId(u32);
@@ -35,169 +28,6 @@ pub struct CompileSession {
     next_module_id: AtomicU32,
     shared_module_states: Mutex<SharedModuleStateRegistry>,
     process_jit: OnceLock<Result<ProcessJitEngine, String>>,
-    cranelift_compile_cache: CraneliftCompileCache,
-}
-
-#[derive(Debug)]
-pub(crate) struct CraneliftCompileCache {
-    enabled: bool,
-    root: PathBuf,
-}
-
-pub(crate) struct CraneliftCompileCacheStore<'a> {
-    cache: &'a CraneliftCompileCache,
-}
-
-impl CraneliftCompileCache {
-    fn new(root: impl Into<PathBuf>, enabled: bool) -> Self {
-        Self {
-            enabled,
-            root: root.into(),
-        }
-    }
-
-    fn from_env() -> Self {
-        let enabled = parse_cranelift_compile_cache_enabled(
-            std::env::var("SOAC_CRANELIFT_COMPILE_CACHE")
-                .ok()
-                .as_deref(),
-        );
-        let (root, root_source) = compile_cache_root_from_env();
-        let cache = Self::new(root, enabled);
-        if enabled {
-            tracing::info!(
-                target: "soac_jit_compile_cache",
-                cache_root = %cache.root.display(),
-                cache_root_source = root_source.as_str(),
-                "Cranelift compile cache enabled"
-            );
-        } else {
-            tracing::debug!(
-                target: "soac_jit_compile_cache",
-                cache_root = %cache.root.display(),
-                cache_root_source = root_source.as_str(),
-                "Cranelift compile cache disabled"
-            );
-        }
-        cache
-    }
-
-    pub(crate) fn store(&self) -> CraneliftCompileCacheStore<'_> {
-        CraneliftCompileCacheStore { cache: self }
-    }
-
-    pub(crate) fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-
-    fn path_for_key(&self, key: &[u8]) -> PathBuf {
-        self.root.join(hex_cache_key(key))
-    }
-
-    fn temp_path_for_key(&self, key: &[u8]) -> PathBuf {
-        let name = hex_cache_key(key);
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        self.root
-            .join(format!(".{name}.{}.{}.tmp", std::process::id(), timestamp))
-    }
-
-    fn read(&self, key: &[u8]) -> Option<Cow<'_, [u8]>> {
-        fs::read(self.path_for_key(key)).ok().map(Cow::Owned)
-    }
-
-    fn write(&self, key: &[u8], value: Vec<u8>) -> std::io::Result<()> {
-        fs::create_dir_all(&self.root)?;
-        let temp_path = self.temp_path_for_key(key);
-        fs::write(&temp_path, value)?;
-        if let Err(err) = fs::rename(&temp_path, self.path_for_key(key)) {
-            let _ = fs::remove_file(&temp_path);
-            return Err(err);
-        }
-        Ok(())
-    }
-}
-
-fn parse_cranelift_compile_cache_enabled(raw: Option<&str>) -> bool {
-    raw.map(|value| {
-        matches!(
-            value.to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
-    .unwrap_or(false)
-}
-
-impl CacheKvStore for CraneliftCompileCacheStore<'_> {
-    fn get(&self, key: &[u8]) -> Option<Cow<'_, [u8]>> {
-        self.cache.read(key)
-    }
-
-    fn insert(&mut self, key: &[u8], val: Vec<u8>) {
-        if let Err(err) = self.cache.write(key, val) {
-            tracing::warn!(
-                target: "soac_jit_compile_cache",
-                cache_root = %self.cache.root.display(),
-                error = %err,
-                "failed to store Cranelift compile cache entry"
-            );
-        }
-    }
-}
-
-fn hex_cache_key(key: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(key.len() * 2);
-    for byte in key {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CompileCacheRootSource {
-    ExplicitDir,
-    WorkDir,
-    TempDir,
-}
-
-impl CompileCacheRootSource {
-    fn as_str(self) -> &'static str {
-        match self {
-            CompileCacheRootSource::ExplicitDir => SOAC_COMPILE_CACHE_DIR_ENV,
-            CompileCacheRootSource::WorkDir => SOAC_WORK_DIR_ENV,
-            CompileCacheRootSource::TempDir => "std::env::temp_dir",
-        }
-    }
-}
-
-fn compile_cache_root_from_env() -> (PathBuf, CompileCacheRootSource) {
-    compile_cache_root_from_values(
-        std::env::var(SOAC_COMPILE_CACHE_DIR_ENV).ok().as_deref(),
-        std::env::var(SOAC_WORK_DIR_ENV).ok().as_deref(),
-    )
-}
-
-fn compile_cache_root_from_values(
-    explicit_dir: Option<&str>,
-    work_dir: Option<&str>,
-) -> (PathBuf, CompileCacheRootSource) {
-    if let Some(raw_dir) = explicit_dir.map(str::trim).filter(|raw| !raw.is_empty()) {
-        return (PathBuf::from(raw_dir), CompileCacheRootSource::ExplicitDir);
-    }
-    if let Some(raw_dir) = work_dir.map(str::trim).filter(|raw| !raw.is_empty()) {
-        return (
-            PathBuf::from(raw_dir).join("compile-cache"),
-            CompileCacheRootSource::WorkDir,
-        );
-    }
-    (
-        std::env::temp_dir().join("soac-compile-cache"),
-        CompileCacheRootSource::TempDir,
-    )
 }
 
 #[derive(Default)]
@@ -232,7 +62,6 @@ impl CompileSession {
             next_module_id: AtomicU32::new(1),
             shared_module_states: Mutex::new(SharedModuleStateRegistry::default()),
             process_jit: OnceLock::new(),
-            cranelift_compile_cache: CraneliftCompileCache::from_env(),
         }
     }
 
@@ -253,10 +82,6 @@ impl CompileSession {
             Ok(engine) => Ok(engine),
             Err(err) => Err(err.clone()),
         }
-    }
-
-    pub(crate) fn cranelift_compile_cache(&self) -> &CraneliftCompileCache {
-        &self.cranelift_compile_cache
     }
 
     pub(crate) fn retain_shared_module_state(
@@ -323,15 +148,8 @@ impl fmt::Debug for CompileSession {
 
 #[cfg(test)]
 mod test {
-    use super::{
-        CompileCacheRootSource, CompileSession, CraneliftCompileCache, allocate_compile_session_id,
-        compile_cache_root_from_values, parse_cranelift_compile_cache_enabled,
-    };
-    use cranelift_codegen::incremental_cache::CacheKvStore;
-    use std::fs;
-    use std::path::PathBuf;
+    use super::{CompileSession, allocate_compile_session_id};
     use std::sync::Mutex;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     static SESSION_ID_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -373,73 +191,5 @@ mod test {
                 .unwrap()
                 .is_none()
         );
-    }
-
-    #[test]
-    fn cranelift_compile_cache_writes_values_to_key_named_paths() {
-        let root = unique_temp_dir("soac-cl-cache-test");
-        let cache = CraneliftCompileCache::new(&root, true);
-        let mut store = cache.store();
-        let key = [0x00, 0x01, 0xab, 0xff];
-        let value = b"compiled-value".to_vec();
-
-        store.insert(&key, value.clone());
-
-        let expected_path = root.join("0001abff");
-        assert_eq!(fs::read(&expected_path).unwrap(), value);
-        assert_eq!(store.get(&key).unwrap().as_ref(), b"compiled-value");
-
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn cranelift_compile_cache_root_prefers_explicit_dir() {
-        let (root, source) =
-            compile_cache_root_from_values(Some("/tmp/explicit-cache"), Some("/tmp/work"));
-
-        assert_eq!(root, PathBuf::from("/tmp/explicit-cache"));
-        assert_eq!(source, CompileCacheRootSource::ExplicitDir);
-    }
-
-    #[test]
-    fn cranelift_compile_cache_root_falls_back_to_work_dir() {
-        let (root, source) = compile_cache_root_from_values(None, Some("/tmp/work"));
-
-        assert_eq!(root, PathBuf::from("/tmp/work").join("compile-cache"));
-        assert_eq!(source, CompileCacheRootSource::WorkDir);
-    }
-
-    #[test]
-    fn cranelift_compile_cache_root_ignores_blank_values() {
-        let (root, source) = compile_cache_root_from_values(Some("  "), Some("/tmp/work"));
-
-        assert_eq!(root, PathBuf::from("/tmp/work").join("compile-cache"));
-        assert_eq!(source, CompileCacheRootSource::WorkDir);
-    }
-
-    #[test]
-    fn cranelift_compile_cache_root_uses_temp_dir_without_env() {
-        let (root, source) = compile_cache_root_from_values(None, None);
-
-        assert!(root.ends_with("soac-compile-cache"));
-        assert_eq!(source, CompileCacheRootSource::TempDir);
-    }
-
-    #[test]
-    fn cranelift_compile_cache_is_opt_in() {
-        assert!(!parse_cranelift_compile_cache_enabled(None));
-        assert!(!parse_cranelift_compile_cache_enabled(Some("")));
-        assert!(!parse_cranelift_compile_cache_enabled(Some("0")));
-        assert!(parse_cranelift_compile_cache_enabled(Some("1")));
-        assert!(parse_cranelift_compile_cache_enabled(Some("true")));
-        assert!(parse_cranelift_compile_cache_enabled(Some("ON")));
-    }
-
-    fn unique_temp_dir(prefix: &str) -> PathBuf {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        std::env::temp_dir().join(format!("{prefix}-{}-{timestamp}", std::process::id()))
     }
 }
