@@ -473,3 +473,20 @@ benchmarked throughput delta, and the headline pre/post numbers.
   - specialized pass, 1M loops x3: `279717`, `277360`, `281715 loops/s`
   - pystone JIT code bytes: `310747`
   - pystone machine blocks: `19587`
+
+## 2026-04-13 - Remove redundant refcount null guards
+
+- jj change id: `rxmtwtlm`
+- summary: JIT refcount release/acquire sites now call the runtime refcount
+  helper directly and rely on the helper's own null/immortal checks, avoiding a
+  duplicate caller-side branch pair that survived runtime helper inlining.
+- throughput: `+5.55%` specialized pystone median; code size `-13.78%`;
+  machine blocks `-12.60%`
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `290599`, `284774`, `285709 loops/s`
+  - pystone JIT code bytes: `310747`
+  - pystone machine blocks: `19587`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `303904`, `297016`, `301574 loops/s`
+  - pystone JIT code bytes: `267926`
+  - pystone machine blocks: `17119`

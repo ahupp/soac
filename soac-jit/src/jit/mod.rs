@@ -3764,54 +3764,25 @@ impl StackSlots {
     }
 }
 
-fn emit_call_if_not_null(
-    fb: &mut FunctionBuilder<'_>,
-    ptr_ty: ir::Type,
-    func_ref: ir::FuncRef,
-    value: ir::Value,
-) {
-    let null_ptr = fb.ins().iconst(ptr_ty, 0);
-    let value_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, value, null_ptr);
-    let call_block = fb.create_block();
-    let done_block = fb.create_block();
-    fb.ins()
-        .brif(value_is_null, done_block, &[], call_block, &[]);
-
-    fb.switch_to_block(call_block);
-    fb.ins().call(func_ref, &[value]);
-    fb.ins().jump(done_block, &[]);
-
-    fb.switch_to_block(done_block);
-}
-
 fn emit_incref_if_not_null(
     fb: &mut FunctionBuilder<'_>,
-    ptr_ty: ir::Type,
+    _ptr_ty: ir::Type,
     incref_ref: ir::FuncRef,
     value: ir::Value,
 ) {
-    emit_call_if_not_null(fb, ptr_ty, incref_ref, value);
+    // The runtime refcount helpers own the null and immortal checks. Emitting
+    // a caller-side null branch duplicates those checks after runtime inlining.
+    fb.ins().call(incref_ref, &[value]);
 }
 
 fn emit_decref_if_not_null(
     fb: &mut FunctionBuilder<'_>,
-    ptr_ty: ir::Type,
+    _ptr_ty: ir::Type,
     decref_ref: ir::FuncRef,
     thread_state_value: ir::Value,
     value: ir::Value,
 ) {
-    let null_ptr = fb.ins().iconst(ptr_ty, 0);
-    let value_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, value, null_ptr);
-    let call_block = fb.create_block();
-    let done_block = fb.create_block();
-    fb.ins()
-        .brif(value_is_null, done_block, &[], call_block, &[]);
-
-    fb.switch_to_block(call_block);
     fb.ins().call(decref_ref, &[thread_state_value, value]);
-    fb.ins().jump(done_block, &[]);
-
-    fb.switch_to_block(done_block);
 }
 
 #[derive(Clone)]
