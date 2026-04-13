@@ -7624,11 +7624,12 @@ fn emit_exception_dispatch_slot_writes(
     Ok(())
 }
 
-fn emit_exception_dispatch_forwarded_releases(
+fn emit_exception_dispatch_forwarded_decrefs(
     fb: &mut FunctionBuilder<'_>,
     forwarded_local_names: &[String],
     forwarded_local_values: &[ir::Value],
-    release_local_names: &[String],
+    decref_local_names: &[String],
+    reason: &str,
     ptr_ty: ir::Type,
     thread_state_value: ir::Value,
     decref_ref: ir::FuncRef,
@@ -7638,35 +7639,11 @@ fn emit_exception_dispatch_forwarded_releases(
         .zip(forwarded_local_values.iter().copied())
         .map(|(name, value)| (name.as_str(), value))
         .collect::<HashMap<_, _>>();
-    for release_name in release_local_names {
+    for name in decref_local_names {
         let value = forwarded_locals_by_name
-            .get(release_name.as_str())
+            .get(name.as_str())
             .copied()
-            .ok_or_else(|| format!("missing forwarded exception release local {release_name}"))?;
-        emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, value);
-    }
-    Ok(())
-}
-
-fn emit_exception_dispatch_forwarded_drops(
-    fb: &mut FunctionBuilder<'_>,
-    forwarded_local_names: &[String],
-    forwarded_local_values: &[ir::Value],
-    drop_forwarded_local_names: &[String],
-    ptr_ty: ir::Type,
-    thread_state_value: ir::Value,
-    decref_ref: ir::FuncRef,
-) -> Result<(), String> {
-    let forwarded_locals_by_name = forwarded_local_names
-        .iter()
-        .zip(forwarded_local_values.iter().copied())
-        .map(|(name, value)| (name.as_str(), value))
-        .collect::<HashMap<_, _>>();
-    for drop_name in drop_forwarded_local_names {
-        let value = forwarded_locals_by_name
-            .get(drop_name.as_str())
-            .copied()
-            .ok_or_else(|| format!("missing forwarded exception drop local {drop_name}"))?;
+            .ok_or_else(|| format!("missing forwarded exception {reason} local {name}"))?;
         emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, value);
     }
     Ok(())
@@ -13416,11 +13393,12 @@ fn build_cranelift_run_bb_specialized_function(
                 incref_ref,
                 decref_ref,
             )?;
-            emit_exception_dispatch_forwarded_releases(
+            emit_exception_dispatch_forwarded_decrefs(
                 &mut fb,
                 &dispatch_plan.forwarded_local_names,
                 &forwarded_local_values,
                 &dispatch_plan.release_local_names,
+                "release",
                 ptr_ty,
                 thread_state_value,
                 decref_ref,
@@ -13461,11 +13439,12 @@ fn build_cranelift_run_bb_specialized_function(
                 incref_ref,
                 decref_ref,
             )?;
-            emit_exception_dispatch_forwarded_drops(
+            emit_exception_dispatch_forwarded_decrefs(
                 &mut fb,
                 &dispatch_plan.forwarded_local_names,
                 &forwarded_local_values,
                 &dispatch_plan.drop_forwarded_local_names,
+                "drop",
                 ptr_ty,
                 thread_state_value,
                 decref_ref,
