@@ -307,6 +307,8 @@ anything non-code affected the run. If there were no such issues, say
   or, if you intentionally want a fresh child revision, `jj new`.
   Report the specialized apply-pass median from the result directory's
   `benchmark.txt` unless I explicitly ask for the warm unspecialized baseline.
+  The benchmark also reports an unsound `SOAC_JIT_EMIT_REFCOUNTS=0` diagnostic
+  apply median; keep the default refcounts-enabled median as the headline.
 - Repo-local uv state
   `.envrc` and `Justfile` keep uv and XDG state under the repo with
   `UV_CACHE_DIR`, `UV_TOOL_DIR`, `UV_TOOL_BIN_DIR`, `XDG_CACHE_HOME`,
@@ -388,6 +390,11 @@ anything non-code affected the run. If there were no such issues, say
   `just run-cpython-tests` default to `none` unless the caller already set it,
   so correctness runs do not spend cold-start time optimizing import-time helper
   code.
+- `SOAC_JIT_EMIT_REFCOUNTS`
+  Refcount emission is enabled by default. Set to `0`, `false`, `no`, or `off`
+  to inline generated JIT INCREF/DECREF helper calls as no-ops. This is an
+  intentionally unsound performance experiment knob and leaks Python
+  references.
 - `SOAC_CRANELIFT_COMPILE_CACHE`
   Set to `1`, `true`, `yes`, or `on` to enable the experimental
   filesystem-backed Cranelift incremental compile cache. It writes

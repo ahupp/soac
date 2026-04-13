@@ -44,7 +44,8 @@ just benchmark 1000000
 
 - transformed profile pass
 - transformed verify pass
-- transformed specialized apply pass
+- transformed specialized apply pass with `SOAC_JIT_EMIT_REFCOUNTS=0`
+- transformed specialized apply pass with refcount emission enabled
 
 If the user explicitly wants the heavy follow-on artifacts, use one of:
 
@@ -92,7 +93,8 @@ Every benchmark result should also have:
 For a default benchmark request, report:
 
 - result directory
-- specialized apply-pass median loops per second from `summary.txt` or `summary.json`
+- specialized apply-pass median loops per second with refcounts enabled from `summary.txt` or `summary.json`
+- unsound no-refcounts apply-pass median loops per second as a diagnostic comparison
 - verify-mode loops per second
 - Cranelift opt level used for the run
 - latest pystone JIT code size totals from `summary.txt` or `summary.json`

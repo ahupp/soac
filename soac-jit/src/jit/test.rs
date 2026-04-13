@@ -4065,6 +4065,34 @@ def read_point(point):
         symbols
     }
 
+    struct EnvVarGuard {
+        name: &'static str,
+        old_value: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            let old_value = std::env::var_os(name);
+            unsafe { std::env::set_var(name, value) };
+            Self { name, old_value }
+        }
+
+        fn remove(name: &'static str) -> Self {
+            let old_value = std::env::var_os(name);
+            unsafe { std::env::remove_var(name) };
+            Self { name, old_value }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.old_value.as_ref() {
+                Some(value) => unsafe { std::env::set_var(self.name, value) },
+                None => unsafe { std::env::remove_var(self.name) },
+            }
+        }
+    }
+
     unsafe fn build_runtime_refcount_smoke_context() -> (
         crate::session::CompileSession,
         JITModule,
@@ -4453,6 +4481,81 @@ def read_point(point):
         assert_eq!(
             after, 0,
             "runtime support inliner should remove direct incref/decref calls from the caller"
+        );
+    }
+
+    #[test]
+    fn jit_refcount_emission_env_defaults_to_enabled() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        {
+            let _env = EnvVarGuard::remove(SOAC_JIT_EMIT_REFCOUNTS_ENV);
+            assert!(
+                jit_refcount_emission_enabled(),
+                "refcount emission should be enabled by default"
+            );
+        }
+        for value in ["0", "false", "False", "no", "off"] {
+            let _env = EnvVarGuard::set(SOAC_JIT_EMIT_REFCOUNTS_ENV, value);
+            assert!(
+                !jit_refcount_emission_enabled(),
+                "{SOAC_JIT_EMIT_REFCOUNTS_ENV}={value:?} should disable refcount emission"
+            );
+        }
+        for value in ["", "1", "true", "yes", "on"] {
+            let _env = EnvVarGuard::set(SOAC_JIT_EMIT_REFCOUNTS_ENV, value);
+            assert!(
+                jit_refcount_emission_enabled(),
+                "{SOAC_JIT_EMIT_REFCOUNTS_ENV}={value:?} should keep refcount emission enabled"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_support_inliner_uses_noop_refcount_helpers_when_disabled() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        let disabled_insts = {
+            let _env = EnvVarGuard::set(SOAC_JIT_EMIT_REFCOUNTS_ENV, "0");
+            let (_compile_session, mut jit_module, mut ctx, _wrapper_id, helper_names) =
+                unsafe { build_runtime_refcount_smoke_context() };
+            let before_calls = count_direct_calls_to_runtime_helpers(&ctx.func, &helper_names);
+            assert_eq!(
+                before_calls, 2,
+                "test caller should start with direct incref/decref calls"
+            );
+
+            let inlined = inline_runtime_support_calls(
+                &mut jit_module,
+                &mut ctx,
+                "test runtime support inliner should run with refcounts disabled",
+            )
+            .expect("runtime support inliner should succeed");
+            let after_calls = count_direct_calls_to_runtime_helpers(&ctx.func, &helper_names);
+            assert!(
+                inlined,
+                "runtime support inliner should report at least one inlined call"
+            );
+            assert_eq!(
+                after_calls, 0,
+                "disabled refcount emission should remove direct helper calls"
+            );
+            ctx.func.dfg.num_insts()
+        };
+
+        let enabled_insts = {
+            let _env = EnvVarGuard::set(SOAC_JIT_EMIT_REFCOUNTS_ENV, "1");
+            let (_compile_session, mut jit_module, mut ctx, _wrapper_id, _helper_names) =
+                unsafe { build_runtime_refcount_smoke_context() };
+            inline_runtime_support_calls(
+                &mut jit_module,
+                &mut ctx,
+                "test runtime support inliner should run with refcounts enabled",
+            )
+            .expect("runtime support inliner should succeed");
+            ctx.func.dfg.num_insts()
+        };
+        assert!(
+            disabled_insts < enabled_insts,
+            "disabled refcount emission should inline smaller no-op helpers; disabled={disabled_insts} enabled={enabled_insts}"
         );
     }
 

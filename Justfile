@@ -1124,6 +1124,7 @@ benchmark benchmark_loops="1000000" verify_loops="100000" results_root="bench" r
     echo "benchmark cpu: $BENCHMARK_CPU"
     echo "benchmark constant clocks: $BENCHMARK_CONSTANT_CLOCKS"
     echo "cranelift opt level: $CRANELIFT_OPT_LEVEL"
+    echo "apply refcount modes: disabled, enabled"
     echo
 
     echo "jit transformed profile pass"
@@ -1148,19 +1149,26 @@ benchmark benchmark_loops="1000000" verify_loops="100000" results_root="bench" r
       "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
 
     site_count="$(just _call-target-specializations-from-dump "$counters_dir/profile.bin" | awk -F';' 'NF { print NF }')"
-    echo
-    echo "jit transformed specialized apply pass (${site_count:-0} callsites)"
-    for run in $(seq 1 "$SPECIALIZED_RUNS"); do
-      echo "specialized run $run/$SPECIALIZED_RUNS"
-      LOOPS="$BENCHMARK_LOOPS" \
-      WARMUP_LOOPS="$WARMUP_LOOPS" \
-      BENCHMARK_CPU="$BENCHMARK_CPU" \
-      BENCHMARK_CONSTANT_CLOCKS="$BENCHMARK_CONSTANT_CLOCKS" \
-      SOAC_WORK_DIR="$counters_dir" \
-      SOAC_CRANELIFT_OPT_LEVEL="$CRANELIFT_OPT_LEVEL" \
-      SOAC_OPT_MODE=apply \
-        "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
-    done
+    run_apply_pass() {
+      local refcount_label="$1"
+      local refcount_env="$2"
+      echo
+      echo "jit transformed specialized apply pass (${site_count:-0} callsites, refcounts $refcount_label)"
+      for run in $(seq 1 "$SPECIALIZED_RUNS"); do
+        echo "specialized run $run/$SPECIALIZED_RUNS"
+        LOOPS="$BENCHMARK_LOOPS" \
+        WARMUP_LOOPS="$WARMUP_LOOPS" \
+        BENCHMARK_CPU="$BENCHMARK_CPU" \
+        BENCHMARK_CONSTANT_CLOCKS="$BENCHMARK_CONSTANT_CLOCKS" \
+        SOAC_WORK_DIR="$counters_dir" \
+        SOAC_CRANELIFT_OPT_LEVEL="$CRANELIFT_OPT_LEVEL" \
+        SOAC_OPT_MODE=apply \
+        SOAC_JIT_EMIT_REFCOUNTS="$refcount_env" \
+          "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
+      done
+    }
+    run_apply_pass disabled 0
+    run_apply_pass enabled 1
   } 2>&1 | tee "$report"
 
   python3 "$REPO_ROOT/scripts/summarize_benchmark_result.py" \

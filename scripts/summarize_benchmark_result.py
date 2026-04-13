@@ -46,9 +46,11 @@ def parse_benchmark_report(report_path: Path) -> dict[str, Any]:
         "profile_loops_per_s": None,
         "verify_loops_per_s": None,
         "apply_loops_per_s_runs": [],
+        "apply_refcounts_disabled_loops_per_s_runs": [],
     }
 
     pending_section: str | None = None
+    current_apply_section = "apply"
     for raw_line in report_path.read_text().splitlines():
         line = raw_line.rstrip("\n")
         stripped = line.strip()
@@ -94,8 +96,14 @@ def parse_benchmark_report(report_path: Path) -> dict[str, Any]:
         if stripped == "jit transformed verify pass":
             pending_section = "verify"
             continue
+        if stripped.startswith("jit transformed specialized apply pass"):
+            if "refcounts disabled" in stripped or "without refcounts" in stripped:
+                current_apply_section = "apply_refcounts_disabled"
+            else:
+                current_apply_section = "apply"
+            continue
         if stripped.startswith("specialized run "):
-            pending_section = "apply"
+            pending_section = current_apply_section
             continue
 
         match = RAW_LOOPS_PER_S_RE.match(stripped)
@@ -107,14 +115,21 @@ def parse_benchmark_report(report_path: Path) -> dict[str, Any]:
                 result["verify_loops_per_s"] = loops_per_s
             elif pending_section == "apply":
                 result["apply_loops_per_s_runs"].append(loops_per_s)
+            elif pending_section == "apply_refcounts_disabled":
+                result["apply_refcounts_disabled_loops_per_s_runs"].append(loops_per_s)
             pending_section = None
 
-    apply_runs = result["apply_loops_per_s_runs"]
-    result["apply_loops_per_s_median"] = int(median(apply_runs)) if apply_runs else None
-    result["apply_loops_per_s_mean"] = int(round(mean(apply_runs))) if apply_runs else None
-    result["apply_loops_per_s_min"] = min(apply_runs) if apply_runs else None
-    result["apply_loops_per_s_max"] = max(apply_runs) if apply_runs else None
+    add_run_stats(result, "apply")
+    add_run_stats(result, "apply_refcounts_disabled")
     return result
+
+
+def add_run_stats(result: dict[str, Any], key_prefix: str) -> None:
+    runs = result[f"{key_prefix}_loops_per_s_runs"]
+    result[f"{key_prefix}_loops_per_s_median"] = int(median(runs)) if runs else None
+    result[f"{key_prefix}_loops_per_s_mean"] = int(round(mean(runs))) if runs else None
+    result[f"{key_prefix}_loops_per_s_min"] = min(runs) if runs else None
+    result[f"{key_prefix}_loops_per_s_max"] = max(runs) if runs else None
 
 
 def parse_jit_code_size(jit_bb_map_path: Path) -> dict[str, Any] | None:
@@ -206,12 +221,25 @@ def format_summary(summary: dict[str, Any]) -> str:
         f"cranelift opt level: {maybe(benchmark['cranelift_opt_level'])}",
         f"profile loops/s: {maybe(benchmark['profile_loops_per_s'])}",
         f"verify loops/s: {maybe(benchmark['verify_loops_per_s'])}",
-        "apply loops/s runs: "
+        "apply loops/s runs (refcounts enabled): "
         + (", ".join(str(value) for value in benchmark["apply_loops_per_s_runs"]) or "n/a"),
-        f"apply median loops/s: {maybe(benchmark['apply_loops_per_s_median'])}",
-        f"apply mean loops/s: {maybe(benchmark['apply_loops_per_s_mean'])}",
-        f"apply min loops/s: {maybe(benchmark['apply_loops_per_s_min'])}",
-        f"apply max loops/s: {maybe(benchmark['apply_loops_per_s_max'])}",
+        f"apply median loops/s (refcounts enabled): {maybe(benchmark['apply_loops_per_s_median'])}",
+        f"apply mean loops/s (refcounts enabled): {maybe(benchmark['apply_loops_per_s_mean'])}",
+        f"apply min loops/s (refcounts enabled): {maybe(benchmark['apply_loops_per_s_min'])}",
+        f"apply max loops/s (refcounts enabled): {maybe(benchmark['apply_loops_per_s_max'])}",
+        "apply loops/s runs (refcounts disabled): "
+        + (
+            ", ".join(str(value) for value in benchmark["apply_refcounts_disabled_loops_per_s_runs"])
+            or "n/a"
+        ),
+        "apply median loops/s (refcounts disabled): "
+        f"{maybe(benchmark['apply_refcounts_disabled_loops_per_s_median'])}",
+        "apply mean loops/s (refcounts disabled): "
+        f"{maybe(benchmark['apply_refcounts_disabled_loops_per_s_mean'])}",
+        "apply min loops/s (refcounts disabled): "
+        f"{maybe(benchmark['apply_refcounts_disabled_loops_per_s_min'])}",
+        "apply max loops/s (refcounts disabled): "
+        f"{maybe(benchmark['apply_refcounts_disabled_loops_per_s_max'])}",
     ]
 
     if code_size is None:

@@ -189,6 +189,12 @@ exports are intentionally omitted here.
   latency-sensitive and should not spend cold-start time optimizing import-time
   helper code.
 
+- `SOAC_JIT_EMIT_REFCOUNTS=0`
+  Disable generated JIT INCREF/DECREF emission by inlining the SOAC runtime
+  refcount helpers as no-ops. Refcount emission is enabled by default; only
+  `0`, `false`, `no`, or `off` disable it. This is an intentionally unsound
+  performance experiment knob and leaks Python references.
+
 ## Counters And Specialization
 
 - `SOAC_WORK_DIR=/path/to/work-dir`
@@ -246,7 +252,9 @@ Notes:
   default it keeps only the benchmark log and raw
   counter files (`profile.bin`, `verify.bin`, `events.jsonl`); it does
   not run `perf` and it does not build inspector-based counter/CLIF
-  artifacts.
+  artifacts. The specialized apply phase reports both the default
+  refcounts-enabled throughput and an additional unsound
+  `SOAC_JIT_EMIT_REFCOUNTS=0` diagnostic throughput.
 
 - `just benchmark-deep-profile`
   Run `just benchmark`, then add the heavier follow-on artifacts in the

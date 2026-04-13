@@ -4473,7 +4473,7 @@ pub(super) fn emit_record_top_value_counter_slot(
         .call(record_top_value_sample_ref, &[counter_addr, observed_value]);
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 struct CountedRefcountHelpers {
     incref_func_id: Option<FuncId>,
     decref_func_id: Option<FuncId>,
@@ -4604,6 +4604,10 @@ fn build_counted_runtime_refcount_helpers(
     scalar_counter_data_id: Option<DataId>,
     symbol_scope: Option<&str>,
 ) -> Result<CountedRefcountHelpers, String> {
+    if !jit_refcount_emission_enabled() {
+        return Ok(CountedRefcountHelpers::default());
+    }
+
     let incref_func_id =
         lookup_runtime_counter_id(counter_defs, function.function_id, "runtime_incref")
             .map(|counter_id| {
@@ -6728,6 +6732,20 @@ fn profiled_cold_blocks_enabled() -> bool {
         .ok()
         .map(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false)
+}
+
+const SOAC_JIT_EMIT_REFCOUNTS_ENV: &str = "SOAC_JIT_EMIT_REFCOUNTS";
+
+fn jit_refcount_emission_enabled() -> bool {
+    env::var(SOAC_JIT_EMIT_REFCOUNTS_ENV)
+        .ok()
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
+        .unwrap_or(true)
 }
 
 fn counter_dump_input_path_from_env() -> Option<std::path::PathBuf> {
@@ -12073,7 +12091,12 @@ fn define_function_with_incremental_cache(
     err_prefix: &str,
 ) -> Result<DefinedFunctionArtifact, String> {
     inline_runtime_support_calls(jit_module, ctx, err_prefix)?;
-    ctx.func.name = stable_cranelift_compile_cache_name(cache_name);
+    let cache_name = if jit_refcount_emission_enabled() {
+        Cow::Borrowed(cache_name)
+    } else {
+        Cow::Owned(format!("{cache_name}:refcounts=off"))
+    };
+    ctx.func.name = stable_cranelift_compile_cache_name(cache_name.as_ref());
     let func_for_relocs = ctx.func.clone();
     let func_name = ctx.func.name.clone();
     let mut ctrl_plane = ControlPlane::default();
@@ -12087,7 +12110,7 @@ fn define_function_with_incremental_cache(
                 info!(
                     target: "soac_jit_compile_cache",
                     function = ?func_name,
-                    cache_name,
+                    cache_name = cache_name.as_ref(),
                     func_id = func_id.as_u32(),
                     request = %err_prefix,
                     code_size = compiled.code_buffer().len(),
@@ -12102,7 +12125,7 @@ fn define_function_with_incremental_cache(
                 tracing::debug!(
                     target: "soac_jit_compile_cache",
                     function = ?func_name,
-                    cache_name,
+                    cache_name = cache_name.as_ref(),
                     func_id = func_id.as_u32(),
                     request = %err_prefix,
                     reason,
@@ -12249,7 +12272,11 @@ impl RuntimeSupportInliner {
                 &parsed.function.signature,
                 "inlineable runtime CLIF function",
             )?;
-            let mut function = parsed.function.clone();
+            let mut function = if should_inline_refcount_as_noop(parsed.symbol.as_str()) {
+                build_noop_runtime_support_function(func_id, &parsed.function.signature)
+            } else {
+                parsed.function.clone()
+            };
             remap_runtime_clif_extern_user_names(
                 jit_module,
                 &mut function,
@@ -12268,6 +12295,32 @@ impl RuntimeSupportInliner {
         }
         Ok(Self { inlineable })
     }
+}
+
+fn should_inline_refcount_as_noop(symbol: &str) -> bool {
+    !jit_refcount_emission_enabled()
+        && matches!(
+            symbol,
+            SOAC_RUNTIME_INCREF_SYMBOL | SOAC_RUNTIME_DECREF_SYMBOL
+        )
+}
+
+fn build_noop_runtime_support_function(func_id: FuncId, signature: &ir::Signature) -> ir::Function {
+    let mut function = ir::Function::with_name_signature(
+        ir::UserFuncName::user(0, func_id.as_u32()),
+        signature.clone(),
+    );
+    let mut builder_ctx = FunctionBuilderContext::new();
+    {
+        let mut fb = FunctionBuilder::new(&mut function, &mut builder_ctx);
+        let entry = fb.create_block();
+        fb.append_block_params_for_function_params(entry);
+        fb.switch_to_block(entry);
+        fb.seal_block(entry);
+        fb.ins().return_(&[]);
+        fb.finalize();
+    }
+    function
 }
 
 impl Inline for RuntimeSupportInliner {
