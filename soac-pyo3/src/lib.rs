@@ -123,7 +123,7 @@ fn inspect_counter_dump_json(path: &str) -> PyResult<String> {
 
 #[pymodule]
 fn _soac_ext(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
-    soac_blockpy::init_logging();
+    soac_blockpy::init_logging().map_err(PyRuntimeError::new_err)?;
     module.add(
         "IndexedModuleType",
         soac_jit::module_type::indexed_module_type_for_python(py)?,

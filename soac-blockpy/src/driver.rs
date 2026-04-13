@@ -1,6 +1,7 @@
 use crate::block_py::pretty::BlockPyPrettyPrint;
 use crate::block_py::{BlockPyModule, CounterScope, ModuleNameGen};
 use crate::codegen_cache::{load_codegen_module_cache, store_codegen_module_cache};
+use crate::env_config::SoacEnvConfig;
 use crate::pass_tracker::PassTracker;
 use crate::passes::ast_to_ast::ast_rewrite::rewrite_with_pass;
 use crate::passes::ast_to_ast::context::Context;
@@ -82,10 +83,11 @@ pub(crate) fn rewrite_module_with_tracker_with_options(
     module_name_gen: ModuleNameGen,
     pass_tracker: &mut impl PassTracker,
     options: LoweringOptions,
+    env_config: &SoacEnvConfig,
 ) -> Result<BlockPyModule<CodegenModuleShape>> {
     let bb_codegen =
         rewrite_pre_optimization_module_with_cache(source, module_name_gen, pass_tracker, options)?;
-    finish_codegen_module_with_tracker(bb_codegen, pass_tracker)
+    finish_codegen_module_with_tracker(bb_codegen, pass_tracker, env_config)
 }
 
 fn rewrite_pre_optimization_module_with_cache(
@@ -319,6 +321,7 @@ fn store_pre_optimization_cache(
 fn finish_codegen_module_with_tracker(
     bb_codegen: BlockPyModule<CodegenModuleShape>,
     pass_tracker: &mut impl PassTracker,
+    env_config: &SoacEnvConfig,
 ) -> Result<BlockPyModule<CodegenModuleShape>> {
     pass_tracker.record_timing("validate_codegen_instr_ids", || {
         passes::validate_codegen_instr_ids(&bb_codegen).map_err(anyhow::Error::msg)
@@ -357,7 +360,7 @@ fn finish_codegen_module_with_tracker(
     })?;
 
     let bb_traced: BlockPyModule<CodegenModuleShape> =
-        if let Some(config) = passes::parse_trace_env() {
+        if let Some(config) = passes::parse_trace_env(env_config) {
             pass_tracker.run_pass("bb_trace", || {
                 let mut traced = bb_codegen;
                 passes::instrument_bb_module_for_trace(&mut traced, &config);
@@ -368,7 +371,7 @@ fn finish_codegen_module_with_tracker(
         };
 
     let bb_call_target_counted: BlockPyModule<CodegenModuleShape> =
-        if passes::call_target_counter_instrumentation_enabled() {
+        if passes::call_target_counter_instrumentation_enabled(env_config) {
             pass_tracker.run_pass("bb_call_target_counters", || {
                 let mut counted = bb_traced;
                 passes::instrument_bb_module_with_call_target_counters(&mut counted);
@@ -379,7 +382,7 @@ fn finish_codegen_module_with_tracker(
         };
 
     let bb_locality_counted: BlockPyModule<CodegenModuleShape> =
-        if passes::locality_counter_instrumentation_enabled() {
+        if passes::locality_counter_instrumentation_enabled(env_config) {
             pass_tracker.run_pass("bb_locality_counters", || {
                 let mut counted = bb_call_target_counted;
                 passes::instrument_bb_module_with_block_entry_counters(&mut counted);
@@ -391,7 +394,7 @@ fn finish_codegen_module_with_tracker(
         };
 
     let bb_refcount_counted: BlockPyModule<CodegenModuleShape> =
-        if passes::refcount_counter_instrumentation_enabled() {
+        if passes::refcount_counter_instrumentation_enabled(env_config) {
             pass_tracker.record_timing("bb_refcount_counters", || {
                 let mut counted = bb_locality_counted;
                 passes::instrument_bb_module_with_refcount_counters(
@@ -416,12 +419,14 @@ pub(crate) fn rewrite_module_with_tracker(
     source: &str,
     module_name_gen: ModuleNameGen,
     pass_tracker: &mut impl PassTracker,
+    env_config: &SoacEnvConfig,
 ) -> Result<BlockPyModule<CodegenModuleShape>> {
     rewrite_module_with_tracker_with_options(
         source,
         module_name_gen,
         pass_tracker,
         LoweringOptions::default(),
+        env_config,
     )
 }
 

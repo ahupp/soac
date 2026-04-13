@@ -6,11 +6,9 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyFunction, PyModule, PyString, PyTuple};
 use soac_blockpy::block_py::{BlockPyFunction, BlockPyModule, FunctionId, FunctionKind, ParamKind};
-use soac_blockpy::codegen_cache::{
-    PythonModuleCacheSource, codegen_module_cache_key, codegen_module_cache_path,
-};
 use soac_blockpy::passes::CodegenModuleShape;
 use soac_blockpy::{LoweringOptions, lower_python_to_blockpy_recorded_with_options};
+use soac_jit::config::{eager_clif_compile_requested, module_cache_root_from_env_or_repo};
 use soac_jit::module_type::{ModuleInfo, SharedModuleState, SoacExtModule, hash_module_source};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
@@ -170,30 +168,24 @@ fn soac_repo_root() -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-fn module_cache_root_from_env() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("SOAC_MODULE_CACHE_DIR")
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
-    {
-        return Some(path);
-    }
-    soac_repo_root().map(|root| root.join("soac-module-cache"))
-}
-
 fn pre_optimization_module_cache_path(
     source_hash: u64,
     runtime_names_as_globals: bool,
-) -> Option<PathBuf> {
-    let cache_root = module_cache_root_from_env()?;
-    let cache_identity =
-        format!("{SOAC_BUILD_IDENTITY};runtime_names_as_globals={runtime_names_as_globals}");
-    let cache_key = codegen_module_cache_key(source_hash, cache_identity.as_str());
-    codegen_module_cache_path(
-        cache_root,
-        PythonModuleCacheSource::Project,
-        cache_key.as_str(),
+) -> PyResult<Option<PathBuf>> {
+    let repo_root = soac_repo_root();
+    let Some(cache_root) = module_cache_root_from_env_or_repo(repo_root.as_deref())
+        .map_err(PyRuntimeError::new_err)?
+    else {
+        return Ok(None);
+    };
+    soac_jit::config::pre_optimization_module_cache_path(
+        cache_root.as_path(),
+        source_hash,
+        SOAC_BUILD_IDENTITY,
+        runtime_names_as_globals,
     )
-    .ok()
+    .map(Some)
+    .map_err(PyRuntimeError::new_err)
 }
 
 fn pending_module_load_timings() -> &'static Mutex<HashMap<usize, PendingModuleLoadTiming>> {
@@ -416,20 +408,13 @@ fn register_clif_vectorcall_raw(
     }
 }
 
-fn eager_clif_compile_requested() -> bool {
-    std::env::var("SOAC_COMPILE_MODE")
-        .ok()
-        .map(|value| value.trim().eq_ignore_ascii_case("eager"))
-        .unwrap_or(false)
-}
-
 fn maybe_eager_compile_clif_entry(
     py: Python<'_>,
     func: &Bound<'_, PyAny>,
     module_runtime: &soac_jit::ModuleRuntimeContext,
     function_id: FunctionId,
 ) -> PyResult<()> {
-    if !eager_clif_compile_requested() {
+    if !eager_clif_compile_requested().map_err(PyRuntimeError::new_err)? {
         return Ok(());
     }
     let start = Instant::now();
@@ -992,7 +977,7 @@ fn create_module(py: Python<'_>, path: &str, spec: Py<PyAny>) -> PyResult<Py<PyA
         pre_optimization_cache_path: pre_optimization_module_cache_path(
             source_hash,
             runtime_names_as_globals,
-        ),
+        )?,
     };
     let output = time_phase(&mut create_timings, "lower_blockpy", || {
         lower_python_to_blockpy_recorded_with_options(

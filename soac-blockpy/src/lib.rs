@@ -10,7 +10,7 @@ pub use ruff_python_parser::ParseError;
 use ruff_source_file::LineEnding;
 use ruff_text_size::TextRange;
 use std::fs::{self, OpenOptions};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
@@ -18,6 +18,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 pub mod block_py;
 pub mod codegen_cache;
 mod driver;
+pub mod env_config;
 pub mod fixture;
 mod namegen;
 pub mod pass_tracker;
@@ -65,50 +66,6 @@ impl From<AnyhowError> for LoweringError {
     }
 }
 
-struct SoacLogConfig {
-    filter: EnvFilter,
-    json_path: Option<PathBuf>,
-}
-
-const DEFAULT_SOAC_JSON_LOG_FILTER: &str =
-    "soac_jit=info,soac_module_load=info,soac_jit_codegen=info,soac_specialization_runtime=info,soac_blockpy_module_cache=info";
-
-fn soac_work_dir_from_env() -> Option<PathBuf> {
-    std::env::var_os("SOAC_WORK_DIR")
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
-}
-
-fn parse_soac_log_env() -> SoacLogConfig {
-    let raw = std::env::var("SOAC_LOG").unwrap_or_default();
-    let mut filter_segments = Vec::new();
-    let mut json_path = None;
-    for segment in raw.split(';') {
-        let segment = segment.trim();
-        if segment.is_empty() {
-            continue;
-        }
-        if let Some(path) = segment.strip_prefix("json=") {
-            let path = path.trim();
-            if !path.is_empty() {
-                json_path = Some(PathBuf::from(path));
-            }
-        } else {
-            filter_segments.push(segment);
-        }
-    }
-    if raw.trim().is_empty() {
-        if let Some(work_dir) = soac_work_dir_from_env() {
-            json_path = Some(work_dir.join("events.jsonl"));
-            filter_segments.push(DEFAULT_SOAC_JSON_LOG_FILTER);
-        }
-    }
-    let filter = EnvFilter::builder()
-        .parse(filter_segments.join(","))
-        .unwrap_or_else(|_| EnvFilter::new(""));
-    SoacLogConfig { filter, json_path }
-}
-
 fn open_soac_log_file(path: &Path) -> std::io::Result<Arc<std::fs::File>> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -120,8 +77,18 @@ fn open_soac_log_file(path: &Path) -> std::io::Result<Arc<std::fs::File>> {
         .map(Arc::new)
 }
 
-pub fn init_logging() {
-    let SoacLogConfig { filter, json_path } = parse_soac_log_env();
+pub fn init_logging() -> std::result::Result<(), String> {
+    let config = env_config::SoacEnvConfig::from_env()?;
+    init_logging_with_config(&config)
+}
+
+pub fn init_logging_with_config(
+    config: &env_config::SoacEnvConfig,
+) -> std::result::Result<(), String> {
+    let env_config::SoacLogConfig { filter, json_path } = config.soac_log().clone();
+    let filter = EnvFilter::builder()
+        .parse(filter)
+        .map_err(|err| format!("failed to parse SOAC_LOG filter: {err}"))?;
     let registry = tracing_subscriber::registry().with(filter);
     if let Some(json_path) = json_path {
         match open_soac_log_file(&json_path) {
@@ -141,6 +108,10 @@ pub fn init_logging() {
                     "[soac logging] failed to open SOAC_LOG json file {}: {err}",
                     json_path.display()
                 );
+                return Err(format!(
+                    "failed to open SOAC_LOG json file {}: {err}",
+                    json_path.display()
+                ));
             }
         }
     } else {
@@ -149,6 +120,7 @@ pub fn init_logging() {
             .with_ansi(!cfg!(test));
         let _ = registry.with(fmt_layer).try_init();
     }
+    Ok(())
 }
 
 pub struct LoweringResult<P = RecordingPassTracker> {
@@ -182,18 +154,20 @@ fn lower_python_to_blockpy_with_tracker_and_options<P>(
 where
     P: PassTracker,
 {
-    init_logging();
+    let env_config = env_config::SoacEnvConfig::from_env().map_err(anyhow::Error::msg)?;
+    init_logging_with_config(&env_config).map_err(anyhow::Error::msg)?;
     namegen::reset_namegen_state();
     let total_start = Instant::now();
 
     let codegen_module = if options == LoweringOptions::default() {
-        rewrite_module_with_tracker(source, module_name_gen, &mut pass_tracker)?
+        rewrite_module_with_tracker(source, module_name_gen, &mut pass_tracker, &env_config)?
     } else {
         rewrite_module_with_tracker_with_options(
             source,
             module_name_gen,
             &mut pass_tracker,
             options,
+            &env_config,
         )?
     };
 

@@ -1,3 +1,4 @@
+use crate::config::{SpecializationMode, counter_dump_output_path_from_env};
 use crate::counter::{CounterEntry, GilTopValueCounter, TopValueCounter};
 use crate::counter_dump::{
     CounterDumpKeyLayout, CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey,
@@ -13,10 +14,10 @@ use pyo3::types::{PyAnyMethods, PyList, PyTuple};
 use soac_blockpy::block_py::{
     BlockPyFunction, BlockPyModule, CounterDef, CounterId, CounterScope, CounterSite, FunctionId,
 };
+use soac_blockpy::env_config::SoacEnvConfig;
 use soac_blockpy::passes::CodegenModuleShape;
 use soac_blockpy::passes::specialization_runtime_logging_enabled;
 use std::collections::{HashMap, HashSet};
-use std::env;
 use std::ffi::{c_char, c_int, c_void};
 use std::fs::{OpenOptions, create_dir_all};
 use std::io::Write;
@@ -278,7 +279,14 @@ impl SharedModuleState {
     }
 
     pub fn append_specialization_runtime_log(&self) {
-        if !specialization_runtime_logging_enabled() {
+        let env_config = match SoacEnvConfig::from_env() {
+            Ok(config) => config,
+            Err(err) => {
+                eprintln!("[soac counters] invalid specialization runtime log config: {err}");
+                return;
+            }
+        };
+        if !specialization_runtime_logging_enabled(&env_config) {
             return;
         }
         for counter in &self.lowered_module.counter_defs {
@@ -752,8 +760,15 @@ pub fn key_layout_counter_enabled() -> bool {
 }
 
 fn specialization_mode_records_counters() -> bool {
-    let mode = env::var("SOAC_OPT_MODE").unwrap_or_default();
-    matches!(mode.trim(), "profile" | "verify")
+    match SoacEnvConfig::from_env() {
+        Ok(config) => config
+            .specialization_mode()
+            .is_some_and(SpecializationMode::records_counters),
+        Err(err) => {
+            eprintln!("[soac counters] invalid specialization config: {err}");
+            false
+        }
+    }
 }
 
 fn append_jit_codegen_log(
@@ -896,28 +911,25 @@ fn snapshot_type_key_layout_events_bound(
 }
 
 fn counter_dump_file_from_env() -> Option<std::path::PathBuf> {
-    let mode = env::var("SOAC_OPT_MODE").ok()?;
-    let filename = match mode.trim() {
-        "none" => return None,
-        "profile" => "profile.bin",
-        "verify" => "verify.bin",
-        _ => return None,
+    let path = match counter_dump_output_path_from_env() {
+        Ok(Some(path)) => path,
+        Ok(None) => return None,
+        Err(err) => {
+            eprintln!("[soac counters] invalid counter dump config: {err}");
+            return None;
+        }
     };
-    let dir = soac_work_dir_from_env()?;
-    if let Err(err) = create_dir_all(&dir) {
+    let Some(dir) = path.parent() else {
+        return Some(path);
+    };
+    if let Err(err) = create_dir_all(dir) {
         eprintln!(
             "[soac counters] failed to create SOAC_WORK_DIR {}: {err}",
             dir.display()
         );
         return None;
     }
-    Some(dir.join(filename))
-}
-
-fn soac_work_dir_from_env() -> Option<std::path::PathBuf> {
-    env::var_os("SOAC_WORK_DIR")
-        .map(std::path::PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
+    Some(path)
 }
 
 unsafe extern "C" fn soac_ext_module_clear(module: *mut ffi::PyObject) -> c_int {

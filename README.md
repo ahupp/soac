@@ -117,6 +117,11 @@ exports are intentionally omitted here.
 
 ## Import Hook And Runtime Behavior
 
+SOAC Rust runtime/JIT environment variables are parsed into a typed config once
+at the relevant entrypoint. Unset variables use documented defaults; present
+typed variables must use recognized values. Boolean knobs accept `1`, `true`,
+`yes`, or `on` for true and `0`, `false`, `no`, or `off` for false.
+
 - `SOAC_MODULE_ENABLED=path:/absolute/or/relative/root[,path:/another/root]`
   In `def _module_is_enabled`, at
   [soac_py/src/soac/import_hook.py:39](/home/adam/project/soac-profile/soac_py/src/soac/import_hook.py#L39),

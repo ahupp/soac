@@ -1,4 +1,11 @@
 use crate::SOAC_RUNTIME_CLIF;
+#[cfg(test)]
+use crate::config::SOAC_JIT_EMIT_REFCOUNTS_ENV;
+use crate::config::{
+    CraneliftTargetConfig, behavior_change_indexed_stores_enabled,
+    counter_dump_input_path_from_env, jit_refcount_emission_enabled, profiled_cold_blocks_enabled,
+    soac_work_dir_from_env, specialization_mode_is_profile,
+};
 use crate::counter::TopValueCounter;
 use crate::counter_dump::{
     CollectedTypeKeyLayout, CounterDumpFile, CounterDumpTypeKey, collect_type_key_layouts,
@@ -14,7 +21,7 @@ use cranelift_codegen::inline::{Inline, InlineCommand};
 use cranelift_codegen::ir;
 use cranelift_codegen::ir::InstBuilder;
 use cranelift_codegen::isa::TargetIsa;
-use cranelift_codegen::settings;
+#[cfg(test)]
 use cranelift_codegen::settings::Configurable;
 use cranelift_control::ControlPlane;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch};
@@ -44,7 +51,6 @@ use soac_blockpy::passes::{
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::env;
 use std::ffi::{CStr, CString, c_void};
 use std::fs;
 use std::mem::offset_of;
@@ -118,8 +124,6 @@ static TYPE_KEY_RUNTIME_REGISTRY: OnceLock<Mutex<HashMap<CounterDumpTypeKey, usi
 const JIT_ARENA_BYTES: usize = 256 * 1024 * 1024;
 const MISSING_PYTHON_EXCEPTION_TRAP: ir::TrapCode = ir::TrapCode::unwrap_user(1);
 const COLD_BLOCK_ENTRY_RATE_DENOMINATOR: u64 = 100;
-const SOAC_ENABLE_PROFILED_COLD_BLOCKS: &str = "SOAC_ENABLE_PROFILED_COLD_BLOCKS";
-
 thread_local! {
     static PROCESS_JIT_COMPILE_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
@@ -5540,7 +5544,7 @@ fn build_counted_runtime_refcount_helpers(
     scalar_counter_data_id: Option<DataId>,
     symbol_scope: Option<&str>,
 ) -> Result<CountedRefcountHelpers, String> {
-    if !jit_refcount_emission_enabled() {
+    if !jit_refcount_emission_enabled()? {
         return Ok(CountedRefcountHelpers::default());
     }
 
@@ -7070,27 +7074,30 @@ struct SpecializationProfile<'a> {
 }
 
 impl<'a> SpecializationProfile<'a> {
-    fn from_runtime_state(shared_state: Option<&'a SharedModuleState>) -> Self {
-        let counter_dump_path = if shared_state.is_some() && !specialization_mode_is_profile() {
-            counter_dump_input_path_from_env()
+    fn from_runtime_state(shared_state: Option<&'a SharedModuleState>) -> Result<Self, String> {
+        let counter_dump_path = if shared_state.is_some() && !specialization_mode_is_profile()? {
+            counter_dump_input_path_from_env()?
         } else {
             None
         };
-        Self {
+        Ok(Self {
             module_name: shared_state.map(|shared_state| shared_state.module_name.as_str()),
             counter_dump_path: counter_dump_path.map(Cow::Owned),
-            behavior_change_indexed_stores: behavior_change_indexed_stores_enabled(),
-            profiled_cold_blocks: profiled_cold_blocks_enabled(),
-        }
+            behavior_change_indexed_stores: behavior_change_indexed_stores_enabled()?,
+            profiled_cold_blocks: profiled_cold_blocks_enabled()?,
+        })
     }
 
-    fn from_precompile(module_name: &'a str, counter_dump_path: Option<&'a Path>) -> Self {
-        Self {
+    fn from_precompile(
+        module_name: &'a str,
+        counter_dump_path: Option<&'a Path>,
+    ) -> Result<Self, String> {
+        Ok(Self {
             module_name: Some(module_name),
             counter_dump_path: counter_dump_path.map(Cow::Borrowed),
             behavior_change_indexed_stores: true,
-            profiled_cold_blocks: profiled_cold_blocks_enabled(),
-        }
+            profiled_cold_blocks: profiled_cold_blocks_enabled()?,
+        })
     }
 
     fn call_target_specializations(
@@ -7166,10 +7173,10 @@ fn load_call_target_specializations(
     module_name: &str,
     function_id: FunctionId,
 ) -> Result<HashMap<InstrId, Vec<FunctionId>>, String> {
-    if specialization_mode_is_profile() {
+    if specialization_mode_is_profile()? {
         return Ok(HashMap::new());
     }
-    let Some(path) = counter_dump_input_path_from_env() else {
+    let Some(path) = counter_dump_input_path_from_env()? else {
         return Ok(HashMap::new());
     };
     let path = path.as_path();
@@ -7675,10 +7682,10 @@ fn load_field_index_specializations_from_path(
 #[cfg(test)]
 fn load_field_index_specializations()
 -> Result<HashMap<String, Vec<FieldIndexSpecialization>>, String> {
-    if specialization_mode_is_profile() {
+    if specialization_mode_is_profile()? {
         return Ok(HashMap::new());
     }
-    let Some(path) = counter_dump_input_path_from_env() else {
+    let Some(path) = counter_dump_input_path_from_env()? else {
         return Ok(HashMap::new());
     };
     let path = path.as_path();
@@ -7686,52 +7693,6 @@ fn load_field_index_specializations()
         return Ok(HashMap::new());
     }
     load_field_index_specializations_from_path(path)
-}
-
-fn specialization_mode_from_env() -> Option<String> {
-    env::var("SOAC_OPT_MODE")
-        .ok()
-        .map(|raw| raw.trim().to_string())
-        .filter(|raw| !raw.is_empty() && raw != "none")
-}
-
-fn specialization_mode_is_profile() -> bool {
-    specialization_mode_from_env().as_deref() == Some("profile")
-}
-
-fn behavior_change_indexed_stores_enabled() -> bool {
-    matches!(
-        specialization_mode_from_env().as_deref(),
-        Some("verify" | "apply")
-    )
-}
-
-fn profiled_cold_blocks_enabled() -> bool {
-    env::var(SOAC_ENABLE_PROFILED_COLD_BLOCKS)
-        .ok()
-        .map(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
-}
-
-const SOAC_JIT_EMIT_REFCOUNTS_ENV: &str = "SOAC_JIT_EMIT_REFCOUNTS";
-
-fn jit_refcount_emission_enabled() -> bool {
-    env::var(SOAC_JIT_EMIT_REFCOUNTS_ENV)
-        .ok()
-        .map(|value| {
-            !matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "no" | "off"
-            )
-        })
-        .unwrap_or(true)
-}
-
-fn counter_dump_input_path_from_env() -> Option<std::path::PathBuf> {
-    match specialization_mode_from_env().as_deref() {
-        Some("verify" | "apply") => soac_work_dir_from_env().map(|dir| dir.join("profile.bin")),
-        _ => None,
-    }
 }
 
 fn collect_cold_block_labels_from_path(
@@ -7761,12 +7722,6 @@ fn collect_cold_block_labels_from_path(
                 .then_some(block.label)
         })
         .collect())
-}
-
-fn soac_work_dir_from_env() -> Option<std::path::PathBuf> {
-    env::var_os("SOAC_WORK_DIR")
-        .map(std::path::PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
 }
 
 pub(super) fn emit_exact_type_version_match(
@@ -12646,35 +12601,13 @@ fn emit_typed_codegen_term(
 }
 
 fn new_jit_builder() -> Result<JITBuilder, String> {
-    let isa = new_cranelift_isa(false)?;
+    let isa = CraneliftTargetConfig::runtime_from_env()?.build_isa()?;
     let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
     if let Ok(provider) = ArenaMemoryProvider::new_with_size(JIT_ARENA_BYTES) {
         builder.memory_provider(Box::new(provider));
     }
     register_jit_builder_symbols(&mut builder);
     Ok(builder)
-}
-
-fn new_cranelift_isa(is_pic: bool) -> Result<Arc<dyn TargetIsa>, String> {
-    let mut flag_builder = settings::builder();
-    let opt_level = env::var("SOAC_CRANELIFT_OPT_LEVEL").unwrap_or_else(|_| "speed".to_string());
-    flag_builder
-        .set("opt_level", opt_level.as_str())
-        .map_err(|err| format!("failed to configure Cranelift flags: {err}"))?;
-    flag_builder
-        .set("is_pic", if is_pic { "true" } else { "false" })
-        .map_err(|err| format!("failed to configure Cranelift flags: {err}"))?;
-    flag_builder
-        .set("preserve_frame_pointers", "true")
-        .map_err(|err| format!("failed to configure Cranelift flags: {err}"))?;
-    flag_builder
-        .set("machine_code_cfg_info", "true")
-        .map_err(|err| format!("failed to configure Cranelift flags: {err}"))?;
-    let isa_builder = cranelift_native::builder().map_err(|err| format!("{err}"))?;
-    let isa = isa_builder
-        .finish(settings::Flags::new(flag_builder))
-        .map_err(|err| format!("failed to finish ISA: {err}"))?;
-    Ok(isa)
 }
 
 fn register_jit_builder_symbols(builder: &mut JITBuilder) {
@@ -13075,7 +13008,7 @@ impl ProcessJitEngine {
                 function_top_value_counter_data_id,
                 session.as_ref(),
                 function_direct_call_resolver,
-                &SpecializationProfile::from_runtime_state(function_direct_call_resolver),
+                &SpecializationProfile::from_runtime_state(function_direct_call_resolver)?,
                 function_symbol_scope.as_deref(),
                 Some(&predeclared),
                 BuildSpecializedFunctionOptions::default(),
@@ -13322,13 +13255,13 @@ fn compile_prepared_function_bytes(
     function_name: &str,
     err_prefix: &str,
 ) -> Result<CompiledFunctionArtifact, String> {
-    let function_name = if jit_refcount_emission_enabled() {
+    let function_name = if jit_refcount_emission_enabled()? {
         Cow::Borrowed(function_name)
     } else {
         Cow::Owned(format!("{function_name}:refcounts=off"))
     };
     ctx.func.name = stable_cranelift_function_name(function_name.as_ref());
-    prepare_cranelift_function_for_backend(jit_module, ctx, err_prefix)?;
+    prepare_cranelift_function_for_backend(jit_module, None, ctx, err_prefix)?;
     compile_backend_prepared_function_bytes(jit_module.isa(), func_id, ctx, err_prefix)
 }
 
@@ -13340,13 +13273,13 @@ fn compile_prepared_function_bytes_with_isa(
     function_name: &str,
     err_prefix: &str,
 ) -> Result<CompiledFunctionArtifact, String> {
-    let function_name = if jit_refcount_emission_enabled() {
+    let function_name = if jit_refcount_emission_enabled()? {
         Cow::Borrowed(function_name)
     } else {
         Cow::Owned(format!("{function_name}:refcounts=off"))
     };
     ctx.func.name = stable_cranelift_function_name(function_name.as_ref());
-    prepare_cranelift_function_for_backend_with_isa(jit_module, isa, ctx, err_prefix)?;
+    prepare_cranelift_function_for_backend(jit_module, Some(isa), ctx, err_prefix)?;
     compile_backend_prepared_function_bytes(isa, func_id, ctx, err_prefix)
 }
 
@@ -13395,27 +13328,12 @@ fn compile_backend_prepared_function_bytes(
 
 fn prepare_cranelift_function_for_backend(
     jit_module: &mut JITModule,
+    isa: Option<&dyn TargetIsa>,
     ctx: &mut cranelift_codegen::Context,
     err_prefix: &str,
 ) -> Result<(), String> {
     inline_runtime_support_calls(jit_module, ctx, err_prefix)?;
-    let mut ctrl_plane = ControlPlane::default();
-    ctx.optimize(jit_module.isa(), &mut ctrl_plane)
-        .map_err(|err| format!("{err_prefix}: {err:?}"))?;
-    ctx.compute_cfg();
-    ctx.compute_domtree();
-    ctx.verify_if(jit_module.isa())
-        .map_err(|err| format!("{err_prefix}: post-opt verifier failed: {err:?}"))?;
-    Ok(())
-}
-
-fn prepare_cranelift_function_for_backend_with_isa(
-    jit_module: &mut JITModule,
-    isa: &dyn TargetIsa,
-    ctx: &mut cranelift_codegen::Context,
-    err_prefix: &str,
-) -> Result<(), String> {
-    inline_runtime_support_calls(jit_module, ctx, err_prefix)?;
+    let isa = isa.unwrap_or_else(|| jit_module.isa());
     let mut ctrl_plane = ControlPlane::default();
     ctx.optimize(isa, &mut ctrl_plane)
         .map_err(|err| format!("{err_prefix}: {err:?}"))?;
@@ -13804,8 +13722,13 @@ fn record_jit_bb_map(
     function_qualname: &str,
     entry_kind: &str,
 ) {
-    let Some(dir) = soac_work_dir_from_env() else {
-        return;
+    let dir = match soac_work_dir_from_env() {
+        Ok(Some(dir)) => dir,
+        Ok(None) => return,
+        Err(err) => {
+            eprintln!("[soac jitdump] invalid SOAC_WORK_DIR: {err}");
+            return;
+        }
     };
     let path = dir.join("jit-bb-map.jsonl");
     let record = serde_json::json!({
@@ -13876,7 +13799,7 @@ impl RuntimeSupportInliner {
                 &parsed.function.signature,
                 "inlineable runtime CLIF function",
             )?;
-            let mut function = if should_inline_refcount_as_noop(parsed.symbol.as_str()) {
+            let mut function = if should_inline_refcount_as_noop(parsed.symbol.as_str())? {
                 build_noop_runtime_support_function(func_id, &parsed.function.signature)
             } else {
                 parsed.function.clone()
@@ -13901,12 +13824,12 @@ impl RuntimeSupportInliner {
     }
 }
 
-fn should_inline_refcount_as_noop(symbol: &str) -> bool {
-    !jit_refcount_emission_enabled()
+fn should_inline_refcount_as_noop(symbol: &str) -> Result<bool, String> {
+    Ok(!jit_refcount_emission_enabled()?
         && matches!(
             symbol,
             SOAC_RUNTIME_INCREF_SYMBOL | SOAC_RUNTIME_DECREF_SYMBOL
-        )
+        ))
 }
 
 fn build_noop_runtime_support_function(func_id: FuncId, signature: &ir::Signature) -> ir::Function {
@@ -14740,7 +14663,7 @@ fn precompile_codegen_module_to_object_bytes(
     counter_dump_path: Option<&Path>,
 ) -> Result<PrecompiledObjectBytes, String> {
     let compile_session = crate::session::CompileSession::new();
-    let object_isa = new_cranelift_isa(true)?;
+    let object_isa = CraneliftTargetConfig::object_from_env()?.build_isa()?;
     let builder = new_jit_builder()?;
     let mut jit_module = JITModule::new(builder);
     let mut function_definitions =
@@ -14837,7 +14760,7 @@ fn precompile_codegen_module_to_object_bytes(
         symbol_scopes.insert(function.function_id, symbol_scope);
     }
     let specialization_profile =
-        SpecializationProfile::from_precompile(module_name, counter_dump_path);
+        SpecializationProfile::from_precompile(module_name, counter_dump_path)?;
     for function in &module.callable_defs {
         let placeholder_blocks =
             vec![std::ptr::null_mut::<std::ffi::c_void>(); function.blocks.len()];
@@ -16897,7 +16820,7 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
         top_value_counter_data_id,
         compile_session,
         runtime_state,
-        &SpecializationProfile::from_runtime_state(runtime_state),
+        &SpecializationProfile::from_runtime_state(runtime_state)?,
         None,
         None,
         BuildSpecializedFunctionOptions::default(),
@@ -16935,6 +16858,7 @@ fn render_compiled_clif_and_vcode_disasm(
 ) -> Result<(String, String, String), String> {
     prepare_cranelift_function_for_backend(
         jit_module,
+        None,
         &mut ctx,
         "failed to render specialized jit run_bb function",
     )?;

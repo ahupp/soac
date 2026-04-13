@@ -330,19 +330,8 @@ pub fn lower_source_to_codegen_module_with_module_id(
     Ok(output.codegen_module)
 }
 
-fn counter_dump_input_path_from_env_for_render() -> Option<PathBuf> {
-    let mode = std::env::var("SOAC_OPT_MODE").ok()?;
-    match mode.trim() {
-        "verify" | "apply" => std::env::var_os("SOAC_WORK_DIR")
-            .map(PathBuf::from)
-            .filter(|path| !path.as_os_str().is_empty())
-            .map(|dir| dir.join("profile.bin")),
-        _ => None,
-    }
-}
-
 pub fn profile_module_id_from_env(module_name: &str) -> Result<Option<u32>, String> {
-    let Some(path) = counter_dump_input_path_from_env_for_render() else {
+    let Some(path) = soac_jit::config::counter_dump_input_path_from_env()? else {
         return Ok(None);
     };
     if !path.exists() {

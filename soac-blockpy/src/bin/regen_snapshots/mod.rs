@@ -393,7 +393,7 @@ fn write_summary(summary: &[SnapshotSummaryRow]) -> Result<(), String> {
 }
 
 fn main() -> Result<(), String> {
-    init_logging();
+    init_logging()?;
     fs::create_dir_all(snapshot_dir()?)
         .map_err(|err| format!("failed to create snapshot dir: {}", err))?;
     let args: Vec<String> = env::args().skip(1).collect();

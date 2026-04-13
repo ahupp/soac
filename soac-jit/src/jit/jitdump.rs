@@ -4,7 +4,6 @@ mod imp {
     use cranelift_codegen::isa::unwind::systemv::UnwindInfo as SystemVUnwindInfo;
     use gimli::LittleEndian;
     use gimli::write::{Address, EhFrame, EndianVec, FrameTable};
-    use std::env;
     use std::fs::{File, OpenOptions};
     use std::io::Write;
     use std::os::fd::AsRawFd;
@@ -96,9 +95,8 @@ mod imp {
 
     impl JitDumpSession {
         fn new() -> Result<Self, String> {
-            let dump_dir = env::var_os("SOAC_WORK_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/tmp"));
+            let dump_dir =
+                crate::config::soac_work_dir_from_env()?.unwrap_or_else(|| PathBuf::from("/tmp"));
             Self::new_in_dir(&dump_dir)
         }
 

@@ -4,9 +4,9 @@ use crate::block_py::{
     CallArgPositional, ChildVisitable, CounterScope, CounterSite, IncrementCounter, InstrCodegen,
     InstrResolved, Load, Meta, NameLocation, ResolvedName, StringLiteral, Visit, WithMeta,
 };
+use crate::env_config::{SoacEnvConfig, SpecializationMode};
 use crate::passes::{CodegenModuleShape, CounterBuilder};
 use std::collections::HashMap;
-use std::env;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TraceConfig {
@@ -14,40 +14,30 @@ pub(crate) struct TraceConfig {
     pub(crate) include_params: bool,
 }
 
-pub(crate) fn parse_trace_env() -> Option<TraceConfig> {
-    let raw = env::var("SOAC_EXEC_TRACE").ok()?;
-    parse_trace_config(raw.as_str())
+pub(crate) fn parse_trace_env(config: &SoacEnvConfig) -> Option<TraceConfig> {
+    parse_trace_config(config.soac_exec_trace()?)
 }
 
-pub(crate) fn call_target_counter_instrumentation_enabled() -> bool {
-    specialization_mode_instruments_top_values()
+pub(crate) fn call_target_counter_instrumentation_enabled(config: &SoacEnvConfig) -> bool {
+    specialization_mode_instruments_top_values(config)
 }
 
-pub(crate) fn locality_counter_instrumentation_enabled() -> bool {
-    specialization_mode_instruments_top_values()
+pub(crate) fn locality_counter_instrumentation_enabled(config: &SoacEnvConfig) -> bool {
+    specialization_mode_instruments_top_values(config)
 }
 
-pub(crate) fn refcount_counter_instrumentation_enabled() -> bool {
-    let mode = env::var("SOAC_OPT_MODE").unwrap_or_default();
-    mode.trim() == "verify"
+pub(crate) fn refcount_counter_instrumentation_enabled(config: &SoacEnvConfig) -> bool {
+    config.specialization_mode() == Some(SpecializationMode::Verify)
 }
 
-pub fn specialization_runtime_logging_enabled() -> bool {
-    let mode = env::var("SOAC_OPT_MODE").unwrap_or_default();
-    if mode.trim() != "apply" {
-        return false;
-    }
-    env::var_os("SOAC_LOG")
-        .map(|value| !value.is_empty())
-        .unwrap_or(false)
-        || env::var_os("SOAC_WORK_DIR")
-            .map(|value| !value.is_empty())
-            .unwrap_or(false)
+pub fn specialization_runtime_logging_enabled(config: &SoacEnvConfig) -> bool {
+    config.specialization_runtime_logging_enabled()
 }
 
-fn specialization_mode_instruments_top_values() -> bool {
-    let mode = env::var("SOAC_OPT_MODE").unwrap_or_default();
-    matches!(mode.trim(), "profile" | "verify")
+fn specialization_mode_instruments_top_values(config: &SoacEnvConfig) -> bool {
+    config
+        .specialization_mode()
+        .is_some_and(SpecializationMode::records_counters)
 }
 
 pub(crate) fn parse_trace_config(raw: &str) -> Option<TraceConfig> {

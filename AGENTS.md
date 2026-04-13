@@ -339,6 +339,10 @@ anything non-code affected the run. If there were no such issues, say
   When sandboxing would otherwise block shared benchmark writes, run Codex with
   the worktree and parent checkout as writable roots, for example
   `--add-dir ../main-repo .`.
+- SOAC Rust runtime/JIT environment variables are parsed into a typed config
+  once at the relevant entrypoint. Unset variables use documented defaults;
+  present typed variables must use recognized values. Boolean knobs accept `1`,
+  `true`, `yes`, or `on` for true and `0`, `false`, `no`, or `off` for false.
 - `SOAC_WORK_DIR` / `SOAC_OPT_MODE`
   Normal specialization runs use one work directory with conventional
   files: `profile.bin` for specialization input, `verify.bin` for the

@@ -6,6 +6,7 @@ include!(concat!(env!("OUT_DIR"), "/soac_runtime_clif.rs"));
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
+pub mod config;
 mod jit;
 pub(crate) mod operator_specialization;
 pub use jit::*;

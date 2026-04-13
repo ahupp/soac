@@ -998,6 +998,8 @@ def add(a, b):
                     function.function_id, function.names.qualname
                 )
             })?;
+        let specialization_profile =
+            SpecializationProfile::from_runtime_state(direct_call_resolver)?;
         build_cranelift_run_bb_specialized_function(
             jit_module,
             blocks,
@@ -1014,7 +1016,7 @@ def add(a, b):
             top_value_counter_data_id,
             compile_session,
             direct_call_resolver,
-            &SpecializationProfile::from_runtime_state(direct_call_resolver),
+            &specialization_profile,
             symbol_scope,
             predeclared_direct_functions,
             options,
@@ -6302,24 +6304,29 @@ def f(x):
         {
             let _env = EnvVarGuard::remove(SOAC_JIT_EMIT_REFCOUNTS_ENV);
             assert!(
-                jit_refcount_emission_enabled(),
+                jit_refcount_emission_enabled().unwrap(),
                 "refcount emission should be enabled by default"
             );
         }
         for value in ["0", "false", "False", "no", "off"] {
             let _env = EnvVarGuard::set(SOAC_JIT_EMIT_REFCOUNTS_ENV, value);
             assert!(
-                !jit_refcount_emission_enabled(),
+                !jit_refcount_emission_enabled().unwrap(),
                 "{SOAC_JIT_EMIT_REFCOUNTS_ENV}={value:?} should disable refcount emission"
             );
         }
-        for value in ["", "1", "true", "yes", "on"] {
+        for value in ["1", "true", "yes", "on"] {
             let _env = EnvVarGuard::set(SOAC_JIT_EMIT_REFCOUNTS_ENV, value);
             assert!(
-                jit_refcount_emission_enabled(),
+                jit_refcount_emission_enabled().unwrap(),
                 "{SOAC_JIT_EMIT_REFCOUNTS_ENV}={value:?} should keep refcount emission enabled"
             );
         }
+        let _env = EnvVarGuard::set(SOAC_JIT_EMIT_REFCOUNTS_ENV, "");
+        assert!(
+            jit_refcount_emission_enabled().is_err(),
+            "{SOAC_JIT_EMIT_REFCOUNTS_ENV}=empty should be rejected"
+        );
     }
 
     #[test]

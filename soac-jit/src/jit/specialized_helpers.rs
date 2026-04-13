@@ -1,6 +1,7 @@
 #![cfg_attr(test, allow(dead_code, unused_imports))]
 
-use super::RuntimeJitDeoptInvocation;
+use super::{RuntimeJitDeoptContinuation, RuntimeJitDeoptInvocation};
+use crate::config::jit_perf_helper_frames_enabled;
 use crate::module_constants::load_runtime_name_owned;
 use crate::module_constants::raise_name_error_for_missing_name;
 use crate::operator_specialization::{ExactIntBinaryOpKind, ExactIntUnaryOpKind};
@@ -1738,24 +1739,13 @@ define_unary_obj_wrapper!(pynumber_positive_wrapper, "PyNumber_Positive");
 define_unary_obj_wrapper!(pynumber_negative_wrapper, "PyNumber_Negative");
 define_unary_obj_wrapper!(pynumber_invert_wrapper, "PyNumber_Invert");
 
-fn env_flag_enabled(name: &str) -> bool {
-    std::env::var(name)
-        .map(|raw| {
-            let trimmed = raw.trim();
-            !(trimmed.is_empty() || trimmed == "0")
-        })
-        .unwrap_or(false)
-}
-
-fn should_preserve_perf_helper_frames() -> bool {
-    env_flag_enabled("SOAC_JIT_PERF_HELPER_FRAMES")
-}
-
 fn chosen_helper_symbol(fast: *const u8, with_frame: *const u8) -> *const u8 {
     if cfg!(test) {
         return fast;
     }
-    if should_preserve_perf_helper_frames() {
+    if jit_perf_helper_frames_enabled()
+        .unwrap_or_else(|err| panic!("invalid SOAC_JIT_PERF_HELPER_FRAMES config: {err}"))
+    {
         with_frame
     } else {
         fast
@@ -2102,22 +2092,44 @@ mod tests {
             return;
         }
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        let prior = std::env::var_os("SOAC_JIT_PERF_HELPER_FRAMES");
-        unsafe { std::env::remove_var("SOAC_JIT_PERF_HELPER_FRAMES") };
-        assert!(!should_preserve_perf_helper_frames());
+        let prior = std::env::var_os(soac_blockpy::env_config::SOAC_JIT_PERF_HELPER_FRAMES_ENV);
+        unsafe { std::env::remove_var(soac_blockpy::env_config::SOAC_JIT_PERF_HELPER_FRAMES_ENV) };
+        assert!(!crate::config::jit_perf_helper_frames_enabled().unwrap());
 
-        unsafe { std::env::set_var("SOAC_JIT_PERF_HELPER_FRAMES", "1") };
-        assert!(should_preserve_perf_helper_frames());
+        unsafe {
+            std::env::set_var(
+                soac_blockpy::env_config::SOAC_JIT_PERF_HELPER_FRAMES_ENV,
+                "1",
+            )
+        };
+        assert!(crate::config::jit_perf_helper_frames_enabled().unwrap());
 
-        unsafe { std::env::set_var("SOAC_JIT_PERF_HELPER_FRAMES", "0") };
-        assert!(!should_preserve_perf_helper_frames());
+        unsafe {
+            std::env::set_var(
+                soac_blockpy::env_config::SOAC_JIT_PERF_HELPER_FRAMES_ENV,
+                "0",
+            )
+        };
+        assert!(!crate::config::jit_perf_helper_frames_enabled().unwrap());
 
-        unsafe { std::env::set_var("SOAC_JIT_PERF_HELPER_FRAMES", "") };
-        assert!(!should_preserve_perf_helper_frames());
+        unsafe {
+            std::env::set_var(
+                soac_blockpy::env_config::SOAC_JIT_PERF_HELPER_FRAMES_ENV,
+                "",
+            )
+        };
+        assert!(crate::config::jit_perf_helper_frames_enabled().is_err());
 
         match prior {
-            Some(value) => unsafe { std::env::set_var("SOAC_JIT_PERF_HELPER_FRAMES", value) },
-            None => unsafe { std::env::remove_var("SOAC_JIT_PERF_HELPER_FRAMES") },
+            Some(value) => unsafe {
+                std::env::set_var(
+                    soac_blockpy::env_config::SOAC_JIT_PERF_HELPER_FRAMES_ENV,
+                    value,
+                )
+            },
+            None => unsafe {
+                std::env::remove_var(soac_blockpy::env_config::SOAC_JIT_PERF_HELPER_FRAMES_ENV)
+            },
         }
     }
 }

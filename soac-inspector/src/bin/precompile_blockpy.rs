@@ -1,8 +1,5 @@
 use soac_blockpy::block_py::{FunctionId, ModuleNameGen};
-use soac_blockpy::codegen_cache::{
-    PythonModuleCacheSource, codegen_module_cache_key, codegen_module_cache_path,
-    load_codegen_module_cache, remap_codegen_module_function_ids,
-};
+use soac_blockpy::codegen_cache::{load_codegen_module_cache, remap_codegen_module_function_ids};
 use soac_jit::counter_dump::{CounterDumpFile, CounterDumpRecordView, CounterDumpRowView};
 use soac_jit::precompile_codegen_module_to_object_file;
 use std::collections::HashSet;
@@ -60,9 +57,10 @@ fn run() -> Result<(), String> {
     let out_path = args
         .out
         .ok_or_else(|| "missing required --out <shared-library>".to_string())?;
-    let module_cache_dir = args
-        .module_cache_dir
-        .unwrap_or_else(default_module_cache_dir);
+    let module_cache_dir = match args.module_cache_dir {
+        Some(path) => path,
+        None => default_module_cache_dir()?,
+    };
     let object_dir = args
         .object_dir
         .unwrap_or_else(|| default_object_dir(out_path.as_path()));
@@ -267,21 +265,11 @@ fn module_cache_path_for_identity(
     module_ref: &CounterModuleRef,
     build_identity: &str,
 ) -> Result<PathBuf, String> {
-    let effective_identity =
-        effective_module_cache_identity(build_identity, &module_ref.module_name);
-    let cache_key = codegen_module_cache_key(module_ref.source_hash, effective_identity.as_str());
-    codegen_module_cache_path(
+    soac_jit::config::pre_optimization_module_cache_path(
         cache_root,
-        PythonModuleCacheSource::Project,
-        cache_key.as_str(),
-    )
-    .map_err(|err| err.to_string())
-}
-
-fn effective_module_cache_identity(build_identity: &str, module_name: &str) -> String {
-    format!(
-        "{build_identity};runtime_names_as_globals={}",
-        module_name == "soac.runtime"
+        module_ref.source_hash,
+        build_identity,
+        module_ref.module_name == "soac.runtime",
     )
 }
 
@@ -346,14 +334,10 @@ fn link_shared_library(
     }
 }
 
-fn default_module_cache_dir() -> PathBuf {
-    if let Some(path) = env::var_os("SOAC_MODULE_CACHE_DIR")
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
-    {
-        return path;
-    }
-    repo_root().join("soac-module-cache")
+fn default_module_cache_dir() -> Result<PathBuf, String> {
+    let repo_root = repo_root();
+    soac_jit::config::module_cache_root_from_env_or_repo(Some(repo_root.as_path()))?
+        .ok_or_else(|| "repo root fallback should always produce a module cache dir".to_string())
 }
 
 fn repo_root() -> PathBuf {
