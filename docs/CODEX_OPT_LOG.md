@@ -508,3 +508,21 @@ benchmarked throughput delta, and the headline pre/post numbers.
   - specialized pass, 1M loops x3: `302549`, `307871`, `306656 loops/s`
   - pystone JIT code bytes: `261630`
   - pystone machine blocks: `16998`
+
+## 2026-04-13 - Optimize vectorcall argument binding
+
+- jj change id: `rvqxpmyw`
+- summary: Direct vectorcall argument binding now uses a precomputed function
+  binding plan and writes owned argument values directly into the trampoline's
+  output buffer, avoiding per-call `bound_args`, `assigned`, and positional
+  parameter-index vector allocations.
+- throughput: `+12.54%` specialized pystone median; code size unchanged;
+  machine blocks unchanged
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `305154`, `311978`, `307370 loops/s`
+  - pystone JIT code bytes: `261630`
+  - pystone machine blocks: `16998`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `336900`, `349622`, `345921 loops/s`
+  - pystone JIT code bytes: `261630`
+  - pystone machine blocks: `16998`

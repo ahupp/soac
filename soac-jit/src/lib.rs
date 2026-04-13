@@ -375,10 +375,89 @@ struct PyFunctionJitExtra {
     function_env_ptr: *mut c_void,
     function_id: FunctionId,
     function_env: Box<FunctionEnv>,
+    binding_plan: DirectArgBindingPlan,
     compile_session: Arc<CompileSession>,
     module_state: Arc<module_type::SharedModuleState>,
     compiled_vectorcall_entry: Option<jit::VectorcallEntryFn>,
     previous_vectorcall: Option<ffi::vectorcallfunc>,
+}
+
+struct DirectArgParamBinding {
+    name: String,
+    kind: ParamKind,
+    default_slot: Option<usize>,
+}
+
+struct DirectArgBindingPlan {
+    callable_name: String,
+    params: Box<[DirectArgParamBinding]>,
+    positional_param_indices: Box<[usize]>,
+    param_indices_by_name: HashMap<String, usize>,
+    varargs_param: Option<usize>,
+    varkw_param: Option<usize>,
+}
+
+impl DirectArgBindingPlan {
+    fn from_function(
+        function: &soac_blockpy::block_py::BlockPyFunction<CodegenModuleShape>,
+    ) -> Self {
+        let runtime_data_layout = jit::FunctionRuntimeDataLayout::from_function(function);
+        let positional_param_indices = function
+            .params
+            .params
+            .iter()
+            .enumerate()
+            .filter_map(|(index, param)| {
+                matches!(param.kind, ParamKind::PosOnly | ParamKind::Any).then_some(index)
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let varargs_param = function.params.vararg_index();
+        let varkw_param = function.params.kwarg_index();
+        let mut param_indices_by_name = HashMap::with_capacity(function.params.len());
+        let params = function
+            .params
+            .params
+            .iter()
+            .enumerate()
+            .map(|(index, param)| {
+                param_indices_by_name.insert(param.name.clone(), index);
+                let default_slot = match param.kind {
+                    ParamKind::PosOnly | ParamKind::Any => {
+                        runtime_data_layout.positional_default_slot_for_param_index(index)
+                    }
+                    ParamKind::KwOnly => runtime_data_layout.kwonly_default_slot(&param.name),
+                    ParamKind::VarArg | ParamKind::KwArg => None,
+                };
+                DirectArgParamBinding {
+                    name: param.name.clone(),
+                    kind: param.kind,
+                    default_slot,
+                }
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self {
+            callable_name: function.names.display_name.clone(),
+            params,
+            positional_param_indices,
+            param_indices_by_name,
+            varargs_param,
+            varkw_param,
+        }
+    }
+
+    fn param_count(&self) -> usize {
+        self.params.len()
+    }
+
+    fn positional_capacity(&self) -> usize {
+        self.positional_param_indices.len()
+    }
+
+    fn param_index(&self, name: &str) -> Option<usize> {
+        self.param_indices_by_name.get(name).copied()
+    }
 }
 
 impl FunctionEnv {
@@ -464,6 +543,18 @@ impl FunctionEnv {
             let runtime_objects =
                 base.add(Self::runtime_objects_offset()) as *mut *mut ffi::PyObject;
             std::slice::from_raw_parts_mut(runtime_objects, self.runtime_object_len)
+        }
+    }
+
+    fn runtime_object(&self, slot: usize) -> *mut ffi::PyObject {
+        if slot >= self.runtime_object_len {
+            return ptr::null_mut();
+        }
+        unsafe {
+            let base = self.abi.as_ptr() as *mut u8;
+            let runtime_objects =
+                base.add(Self::runtime_objects_offset()) as *mut *mut ffi::PyObject;
+            *runtime_objects.add(slot)
         }
     }
 
@@ -604,9 +695,9 @@ unsafe extern "C" fn free_clif_function_data(ptr: *mut c_void) {
     drop(unsafe { Box::from_raw(ptr as *mut PyFunctionJitExtra) });
 }
 
-unsafe fn py_string(obj: *mut ffi::PyObject) -> Result<String, ()> {
+unsafe fn py_unicode_utf8_str<'a>(obj: *mut ffi::PyObject) -> Result<&'a str, ()> {
     if ffi::PyUnicode_Check(obj) == 0 {
-        return set_type_error("expected string metadata while registering CLIF vectorcall");
+        return set_type_error("expected string keyword argument name in CLIF vectorcall binding");
     }
     let mut len = 0;
     let ptr = ffi::PyUnicode_AsUTF8AndSize(obj, &mut len);
@@ -614,7 +705,12 @@ unsafe fn py_string(obj: *mut ffi::PyObject) -> Result<String, ()> {
         return Err(());
     }
     let bytes = std::slice::from_raw_parts(ptr as *const u8, len as usize);
-    Ok(String::from_utf8_lossy(bytes).into_owned())
+    std::str::from_utf8(bytes).map_err(|_| {
+        ffi::PyErr_SetString(
+            ffi::PyExc_RuntimeError,
+            c"invalid UTF-8 keyword argument name in CLIF vectorcall binding".as_ptr(),
+        );
+    })
 }
 
 unsafe fn collect_function_runtime_objects(
@@ -765,6 +861,7 @@ unsafe fn make_clif_function_data(
         return Err(());
     };
     let runtime_data_layout = jit::FunctionRuntimeDataLayout::from_function(&blockpy_function);
+    let binding_plan = DirectArgBindingPlan::from_function(&blockpy_function);
     let runtime_object_values =
         unsafe { collect_function_runtime_objects(callable, &runtime_data_layout, None, None)? };
     let mut function_env = unsafe {
@@ -778,6 +875,7 @@ unsafe fn make_clif_function_data(
         function_env_ptr,
         function_id,
         function_env,
+        binding_plan,
         compile_session: module_runtime.compile_session.clone(),
         module_state,
         compiled_vectorcall_entry: None,
@@ -1395,7 +1493,7 @@ unsafe fn ensure_clif_vectorcall_compiled(
         return Err(());
     }
     if data.compiled_vectorcall_entry.is_none() {
-        let param_count = data.function()?.params.len();
+        let param_count = data.binding_plan.param_count();
         let entry = match data
             .compile_session
             .process_jit()
@@ -1434,144 +1532,137 @@ unsafe fn cleanup_state_values(state_values: &mut [*mut ffi::PyObject]) {
     }
 }
 
-unsafe fn bound_arg_value_from_borrowed(
-    bound_args: &mut [*mut ffi::PyObject],
+unsafe fn cleanup_output_args(out_args: *mut *mut ffi::PyObject, out_len: usize) {
+    if out_args.is_null() {
+        return;
+    }
+    for index in 0..out_len {
+        let slot = out_args.add(index);
+        let value = *slot;
+        if !value.is_null() {
+            ffi::Py_DECREF(value);
+            *slot = ptr::null_mut();
+        }
+    }
+}
+
+unsafe fn initialize_output_args(
+    out_args: *mut *mut ffi::PyObject,
+    out_len: usize,
+) -> Result<(), ()> {
+    if out_len == 0 {
+        return Ok(());
+    }
+    if out_args.is_null() {
+        ffi::PyErr_SetString(
+            ffi::PyExc_RuntimeError,
+            c"missing output buffer for direct CLIF function arguments".as_ptr(),
+        );
+        return Err(());
+    }
+    for index in 0..out_len {
+        *out_args.add(index) = ptr::null_mut();
+    }
+    Ok(())
+}
+
+unsafe fn output_arg_is_assigned(out_args: *mut *mut ffi::PyObject, param_index: usize) -> bool {
+    !(*out_args.add(param_index)).is_null()
+}
+
+unsafe fn write_output_arg_from_borrowed(
+    out_args: *mut *mut ffi::PyObject,
     param_index: usize,
     value: *mut ffi::PyObject,
 ) {
     ffi::Py_INCREF(value);
-    bound_args[param_index] = value;
+    *out_args.add(param_index) = value;
 }
 
-unsafe fn bound_arg_value_from_owned(
-    bound_args: &mut [*mut ffi::PyObject],
+unsafe fn write_output_arg_from_owned(
+    out_args: *mut *mut ffi::PyObject,
     param_index: usize,
     value: *mut ffi::PyObject,
 ) {
-    bound_args[param_index] = value;
+    *out_args.add(param_index) = value;
 }
 
-unsafe fn function_has_live_positional_default(
-    callable: *mut ffi::PyObject,
-    param_index: usize,
-    positional_param_indices: &[usize],
-) -> bool {
-    let Some(position) = positional_param_indices
-        .iter()
-        .position(|candidate| *candidate == param_index)
-    else {
-        return false;
-    };
-    let defaults = PyFunction_GetDefaults(callable);
-    if defaults.is_null() || ffi::PyTuple_Check(defaults) == 0 {
-        return false;
-    }
-    let default_len = ffi::PyTuple_GET_SIZE(defaults) as usize;
-    if default_len == 0 {
-        return false;
-    }
-    let positional_count = positional_param_indices.len();
-    let first_default_position = positional_count.saturating_sub(default_len);
-    position >= first_default_position
+fn binding_type_error<T>(msg: String) -> Result<T, ()> {
+    let _ = set_type_error::<()>(&msg);
+    Err(())
 }
 
-unsafe fn function_has_live_kwonly_default(callable: *mut ffi::PyObject, name: &str) -> bool {
-    let kwdefaults = PyFunction_GetKwDefaults(callable);
-    if kwdefaults.is_null() || ffi::PyDict_Check(kwdefaults) == 0 {
-        return false;
-    }
-    let Ok(name) = CString::new(name) else {
-        return false;
-    };
-    !ffi::PyDict_GetItemString(kwdefaults, name.as_ptr()).is_null()
-}
-
-unsafe fn function_param_has_live_default(
-    callable: *mut ffi::PyObject,
-    param_index: usize,
-    param: &soac_blockpy::block_py::Param,
-    positional_param_indices: &[usize],
-) -> bool {
-    match param.kind {
-        ParamKind::PosOnly | ParamKind::Any => unsafe {
-            function_has_live_positional_default(callable, param_index, positional_param_indices)
-        },
-        ParamKind::KwOnly => unsafe { function_has_live_kwonly_default(callable, &param.name) },
-        ParamKind::VarArg | ParamKind::KwArg => false,
-    }
-}
-
-unsafe fn build_function_bound_args(
-    callable: *mut ffi::PyObject,
+unsafe fn bind_function_args_to_output(
+    data: &PyFunctionJitExtra,
     args: *const *mut ffi::PyObject,
     nargsf: usize,
     kwnames: *mut ffi::PyObject,
-    function: &soac_blockpy::block_py::BlockPyFunction<CodegenModuleShape>,
-) -> Result<Vec<*mut ffi::PyObject>, ()> {
-    if callable.is_null() {
+    out_args: *mut *mut ffi::PyObject,
+    out_len: usize,
+) -> Result<(), ()> {
+    let plan = &data.binding_plan;
+    if out_len != plan.param_count() {
         ffi::PyErr_SetString(
             ffi::PyExc_RuntimeError,
-            b"null callable in CLIF function binding\0".as_ptr() as *const i8,
+            c"bound CLIF argument count did not match direct entry arity".as_ptr(),
         );
         return Err(());
     }
-    let params = &function.params;
-    let callable_name = function.names.display_name.as_str();
+    initialize_output_args(out_args, out_len)?;
+    let callable_name = plan.callable_name.as_str();
     let nargs = ffi::PyVectorcall_NARGS(nargsf) as usize;
     let nkw = if kwnames.is_null() {
         0
     } else {
         ffi::PyTuple_GET_SIZE(kwnames) as usize
     };
-    let mut bound_args = vec![ptr::null_mut(); params.len()];
-    let mut assigned = vec![false; params.len()];
-    let positional_param_indices = params.positional_param_indices();
-    let positional_capacity = positional_param_indices.len();
-    let varargs_param = params.vararg_index();
-    let varkw_param = params.kwarg_index();
+    if (nargs > 0 || nkw > 0) && args.is_null() {
+        ffi::PyErr_SetString(
+            ffi::PyExc_RuntimeError,
+            c"missing vectorcall argument array in CLIF function binding".as_ptr(),
+        );
+        return Err(());
+    }
 
-    if varargs_param.is_none() && nargs > positional_capacity {
-        cleanup_state_values(&mut bound_args);
-        let msg = format!(
+    let positional_capacity = plan.positional_capacity();
+    if plan.varargs_param.is_none() && nargs > positional_capacity {
+        return binding_type_error(format!(
             "{}() takes {} positional argument{} but {} {} given",
             callable_name,
             positional_capacity,
             if positional_capacity == 1 { "" } else { "s" },
             nargs,
             if nargs == 1 { "was" } else { "were" }
-        );
-        let _ = set_type_error::<()>(&msg);
-        return Err(());
+        ));
     }
 
     let positional_bound = nargs.min(positional_capacity);
     for position in 0..positional_bound {
-        let param_index = positional_param_indices[position];
+        let param_index = plan.positional_param_indices[position];
         let value = *args.add(position);
         if value.is_null() {
-            cleanup_state_values(&mut bound_args);
+            cleanup_output_args(out_args, out_len);
             ffi::PyErr_SetString(
                 ffi::PyExc_RuntimeError,
                 b"null vectorcall positional argument\0".as_ptr() as *const i8,
             );
             return Err(());
         }
-        bound_arg_value_from_borrowed(&mut bound_args, param_index, value);
-        assigned[param_index] = true;
+        write_output_arg_from_borrowed(out_args, param_index, value);
     }
 
-    if let Some(varargs_param) = varargs_param {
+    if let Some(varargs_param) = plan.varargs_param {
         let extras = nargs.saturating_sub(positional_capacity);
         let extra_tuple = ffi::PyTuple_New(extras as ffi::Py_ssize_t);
         if extra_tuple.is_null() {
-            cleanup_state_values(&mut bound_args);
+            cleanup_output_args(out_args, out_len);
             return Err(());
         }
         for offset in 0..extras {
             let value = *args.add(positional_capacity + offset);
             if value.is_null() {
                 ffi::Py_DECREF(extra_tuple);
-                cleanup_state_values(&mut bound_args);
+                cleanup_output_args(out_args, out_len);
                 ffi::PyErr_SetString(
                     ffi::PyExc_RuntimeError,
                     b"null vectorcall positional vararg\0".as_ptr() as *const i8,
@@ -1582,164 +1673,114 @@ unsafe fn build_function_bound_args(
             if ffi::PyTuple_SetItem(extra_tuple, offset as ffi::Py_ssize_t, value) != 0 {
                 ffi::Py_DECREF(value);
                 ffi::Py_DECREF(extra_tuple);
-                cleanup_state_values(&mut bound_args);
+                cleanup_output_args(out_args, out_len);
                 return Err(());
             }
         }
-        bound_arg_value_from_owned(&mut bound_args, varargs_param, extra_tuple);
-        assigned[varargs_param] = true;
+        write_output_arg_from_owned(out_args, varargs_param, extra_tuple);
     }
 
-    let has_varkw = varkw_param.is_some();
+    let has_varkw = plan.varkw_param.is_some();
     let mut varkw_dict = ptr::null_mut();
-    if let Some(varkw_param) = varkw_param {
+    if let Some(varkw_param) = plan.varkw_param {
         varkw_dict = ffi::PyDict_New();
         if varkw_dict.is_null() {
-            cleanup_state_values(&mut bound_args);
+            cleanup_output_args(out_args, out_len);
             return Err(());
         }
-        bound_arg_value_from_owned(&mut bound_args, varkw_param, varkw_dict);
-        assigned[varkw_param] = true;
+        write_output_arg_from_owned(out_args, varkw_param, varkw_dict);
     }
 
     for kw_index in 0..nkw {
         let key = ffi::PyTuple_GetItem(kwnames, kw_index as ffi::Py_ssize_t);
         if key.is_null() {
-            cleanup_state_values(&mut bound_args);
+            cleanup_output_args(out_args, out_len);
             return Err(());
         }
         let value = *args.add(nargs + kw_index);
         if value.is_null() {
-            cleanup_state_values(&mut bound_args);
+            cleanup_output_args(out_args, out_len);
             ffi::PyErr_SetString(
                 ffi::PyExc_RuntimeError,
                 b"null vectorcall keyword argument\0".as_ptr() as *const i8,
             );
             return Err(());
         }
-        let key_name = match py_string(key) {
+        let key_name = match py_unicode_utf8_str(key) {
             Ok(name) => name,
             Err(()) => {
-                cleanup_state_values(&mut bound_args);
+                cleanup_output_args(out_args, out_len);
                 return Err(());
             }
         };
-        if let Some(param_index) = params.param_index(key_name.as_str()) {
-            let param = &params.params[param_index];
+        if let Some(param_index) = plan.param_index(key_name) {
+            let param = &plan.params[param_index];
             match param.kind {
                 ParamKind::PosOnly | ParamKind::VarArg => {
                     if !has_varkw {
-                        cleanup_state_values(&mut bound_args);
-                        let msg = format!(
+                        cleanup_output_args(out_args, out_len);
+                        return binding_type_error(format!(
                             "{}() got an unexpected keyword argument '{}'",
                             callable_name, key_name
-                        );
-                        let _ = set_type_error::<()>(&msg);
-                        return Err(());
+                        ));
                     }
                     if !varkw_dict.is_null() && ffi::PyDict_SetItem(varkw_dict, key, value) != 0 {
-                        cleanup_state_values(&mut bound_args);
+                        cleanup_output_args(out_args, out_len);
                         return Err(());
                     }
                 }
                 ParamKind::Any | ParamKind::KwOnly => {
-                    if assigned[param_index] {
-                        cleanup_state_values(&mut bound_args);
-                        let msg = format!(
+                    if output_arg_is_assigned(out_args, param_index) {
+                        cleanup_output_args(out_args, out_len);
+                        return binding_type_error(format!(
                             "{}() got multiple values for argument '{}'",
                             callable_name, key_name
-                        );
-                        let _ = set_type_error::<()>(&msg);
-                        return Err(());
+                        ));
                     }
-                    bound_arg_value_from_borrowed(&mut bound_args, param_index, value);
-                    assigned[param_index] = true;
+                    write_output_arg_from_borrowed(out_args, param_index, value);
                 }
                 ParamKind::KwArg => {
                     if !varkw_dict.is_null() && ffi::PyDict_SetItem(varkw_dict, key, value) != 0 {
-                        cleanup_state_values(&mut bound_args);
+                        cleanup_output_args(out_args, out_len);
                         return Err(());
                     }
                 }
             }
         } else if has_varkw {
             if !varkw_dict.is_null() && ffi::PyDict_SetItem(varkw_dict, key, value) != 0 {
-                cleanup_state_values(&mut bound_args);
+                cleanup_output_args(out_args, out_len);
                 return Err(());
             }
         } else {
-            cleanup_state_values(&mut bound_args);
-            let msg = format!(
+            cleanup_output_args(out_args, out_len);
+            return binding_type_error(format!(
                 "{}() got an unexpected keyword argument '{}'",
                 callable_name, key_name
-            );
-            let _ = set_type_error::<()>(&msg);
-            return Err(());
+            ));
         }
     }
 
-    for (param_index, param) in params.iter().enumerate() {
-        if assigned[param_index] {
+    for (param_index, param) in plan.params.iter().enumerate() {
+        if output_arg_is_assigned(out_args, param_index) {
             continue;
         }
         match param.kind {
             ParamKind::VarArg | ParamKind::KwArg => {}
             _ => {
-                if unsafe {
-                    function_param_has_live_default(
-                        callable,
-                        param_index,
-                        param,
-                        &positional_param_indices,
-                    )
-                } {
-                    assigned[param_index] = true;
+                if param
+                    .default_slot
+                    .is_some_and(|slot| !data.function_env.runtime_object(slot).is_null())
+                {
                     continue;
                 }
-                cleanup_state_values(&mut bound_args);
-                let msg = format!(
+                cleanup_output_args(out_args, out_len);
+                return binding_type_error(format!(
                     "{}() missing required argument '{}'",
                     callable_name, param.name
-                );
-                let _ = set_type_error::<()>(&msg);
-                return Err(());
+                ));
             }
         }
     }
-    Ok(bound_args)
-}
-
-unsafe fn write_owned_bound_args_to_buffer(
-    mut bound_args: Vec<*mut ffi::PyObject>,
-    out_args: *mut *mut ffi::PyObject,
-    out_len: usize,
-) -> Result<(), ()> {
-    if bound_args.len() != out_len {
-        cleanup_state_values(&mut bound_args);
-        ffi::PyErr_SetString(
-            ffi::PyExc_RuntimeError,
-            b"bound CLIF argument count did not match direct entry arity\0".as_ptr() as *const i8,
-        );
-        return Err(());
-    }
-    if out_len == 0 {
-        cleanup_state_values(&mut bound_args);
-        return Ok(());
-    }
-    if out_args.is_null() {
-        cleanup_state_values(&mut bound_args);
-        ffi::PyErr_SetString(
-            ffi::PyExc_RuntimeError,
-            b"missing output buffer for direct CLIF function arguments\0".as_ptr() as *const i8,
-        );
-        return Err(());
-    }
-    for (index, value) in bound_args.iter_mut().enumerate() {
-        let owned = *value;
-        *out_args.add(index) = owned;
-        *value = ptr::null_mut();
-    }
-    cleanup_state_values(&mut bound_args);
     Ok(())
 }
 
@@ -1840,22 +1881,11 @@ pub(crate) unsafe extern "C" fn bind_direct_args_from_vectorcall(
             return 0;
         }
         let data = &mut *(data_ptr as *mut PyFunctionJitExtra);
-        let function = match data.function() {
-            Ok(value) => value,
-            Err(()) => return 0,
-        };
-        let bound_args = match build_function_bound_args(
-            callable as *mut ffi::PyObject,
+        match bind_function_args_to_output(
+            data,
             args as *const *mut ffi::PyObject,
             nargsf,
             kwnames as *mut ffi::PyObject,
-            function,
-        ) {
-            Ok(value) => value,
-            Err(()) => return 0,
-        };
-        match write_owned_bound_args_to_buffer(
-            bound_args,
             out_args as *mut *mut ffi::PyObject,
             out_len as usize,
         ) {
@@ -1897,13 +1927,11 @@ pub unsafe fn register_clif_vectorcall(
     let func = function as *mut ffi::PyFunctionObject;
     if !PyFunction_GetSoacMetadata(function).is_null() {
         let data = unsafe { py_function_jit_extra(function)? };
-        let function = data.function()?;
+        let param_count = data.binding_plan.param_count();
         let entry = data
             .compile_session
             .process_jit()
-            .and_then(|engine| {
-                engine.vectorcall_trampoline(&data.compile_session, function.params.len())
-            })
+            .and_then(|engine| engine.vectorcall_trampoline(&data.compile_session, param_count))
             .map_err(|err| {
                 if let Ok(c_msg) = CString::new(err) {
                     ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
