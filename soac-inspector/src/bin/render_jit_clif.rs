@@ -1,6 +1,7 @@
 use soac_blockpy::block_py::FunctionId;
 use soac_inspector::{
     JitClifRenderOptions, jit_debug_plan, lower_source_to_codegen_module,
+    lower_source_to_codegen_module_with_module_id, profile_module_id_from_env,
     render_jit_clif_for_module_with_options,
 };
 use std::fs;
@@ -116,22 +117,33 @@ fn main() -> Result<(), String> {
             .unwrap_or("render_jit_clif")
             .to_string()
     });
-    let module = lower_source_to_codegen_module(&source)?;
+    let profile_module_id = if args.specialized {
+        profile_module_id_from_env(&module_name)?
+    } else {
+        None
+    };
+    let function_id = profile_module_id
+        .filter(|_| args.function_id.module_id() == 0)
+        .map(|module_id| FunctionId::new(module_id, args.function_id.function_id()))
+        .unwrap_or(args.function_id);
+    let module = if let Some(module_id) = profile_module_id {
+        lower_source_to_codegen_module_with_module_id(&source, module_id)?
+    } else {
+        lower_source_to_codegen_module(&source)?
+    };
 
     if args.debug_plan {
-        eprintln!(
-            "{}",
-            jit_debug_plan(&module_name, &module, args.function_id)?
-        );
+        eprintln!("{}", jit_debug_plan(&module_name, &module, function_id)?);
     }
 
     let rendered = render_jit_clif_for_module_with_options(
         &soac_inspector::repo_root(),
         &module_name,
         &module,
-        args.function_id,
+        function_id,
         JitClifRenderOptions {
             load_runtime_specializations: args.specialized,
+            runtime_source_path: args.specialized.then_some(source_path.clone()),
         },
     )?;
     if let Some(path) = args.cfg_dot_out {

@@ -267,8 +267,17 @@ fn collect_original_code_objects(
         .or_default()
         .push_back(code.clone().unbind());
 
-    let consts = code.getattr("co_consts")?.cast_into::<PyTuple>()?;
-    for item in consts.iter() {
+    let consts = code.getattr("co_consts")?;
+    let const_count = unsafe { ffi::PyTuple_Size(consts.as_ptr()) };
+    if const_count < 0 {
+        return Err(PyErr::fetch(code.py()));
+    }
+    for index in 0..const_count {
+        let item = unsafe { ffi::PyTuple_GetItem(consts.as_ptr(), index) };
+        if item.is_null() {
+            return Err(PyErr::fetch(code.py()));
+        }
+        let item = unsafe { Bound::from_borrowed_ptr(code.py(), item) };
         if item.is_instance(code_type)? {
             collect_original_code_objects(&item, code_type, by_qualname)?;
         }
@@ -1109,17 +1118,21 @@ fn exec_module_inner(
             })?;
         }
         time_phase(exec_timings, "register_function_owner_types", || {
-            unsafe { soac_jit::register_function_owner_types_for_module(module.as_ptr()) }.map_err(
-                |_| {
-                    if unsafe { ffi::PyErr_Occurred() }.is_null() {
-                        PyRuntimeError::new_err(
-                            "failed to register function owner types for type invalidation",
-                        )
-                    } else {
-                        PyErr::fetch(py)
-                    }
-                },
-            )
+            unsafe {
+                soac_jit::register_function_owner_types_for_module_keys(
+                    module.as_ptr(),
+                    &module_data.shared_state.lowered_module.global_names,
+                )
+            }
+            .map_err(|_| {
+                if unsafe { ffi::PyErr_Occurred() }.is_null() {
+                    PyRuntimeError::new_err(
+                        "failed to register function owner types for type invalidation",
+                    )
+                } else {
+                    PyErr::fetch(py)
+                }
+            })
         })?;
         Ok(())
     });

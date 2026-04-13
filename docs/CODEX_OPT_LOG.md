@@ -5,6 +5,22 @@ optimization attempts made by Codex agents. Keep entries succinct: what
 changed or was tried, which jj change id carried it when landed, the
 benchmarked throughput delta, and the headline pre/post numbers.
 
+## 2026-04-13 - Recover direct Record constructor specialization
+
+- jj change id: `rmsmspso`
+- summary: Owner-type registration now also scans SOAC indexed module
+  globals by direct indexed-dict slot lookup, so classes stored outside
+  the plain module dict can register their `__init__` owner types without
+  invoking module `__getattr__`. The specialized `Record.copy`
+  constructor call in pystone now emits the direct
+  `dp_jit_pytype_generic_alloc` / constructor-init path instead of always
+  routing through `_PyObject_MakeTpCall`.
+- throughput: `+27.31%` specialized pystone median
+- pre-change benchmark:
+  - specialized pass, 100k loops x1: `300817 loops/s`
+- post-change benchmark:
+  - specialized pass, 100k loops x1: `382976 loops/s`
+
 ## 2026-04-12 - Deduplicate identical local failure cleanup blocks
 
 - jj change id: `spxzrtuu`

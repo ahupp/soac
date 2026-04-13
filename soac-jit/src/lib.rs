@@ -197,6 +197,15 @@ unsafe extern "C" {
         callback: *mut ffi::PyObject,
     ) -> *mut ffi::PyObject;
     fn PyWeakref_GetRef(reference: *mut ffi::PyObject, object: *mut *mut ffi::PyObject) -> i32;
+    fn _PyDict_IndexedKeyIndex(
+        dict: *mut ffi::PyObject,
+        key: *mut ffi::PyObject,
+    ) -> ffi::Py_ssize_t;
+    fn _PyDict_GetIndexedItem(
+        dict: *mut ffi::PyObject,
+        index: ffi::Py_ssize_t,
+        result: *mut *mut ffi::PyObject,
+    ) -> i32;
 }
 
 type PyFunctionWatchEvent = i32;
@@ -1328,9 +1337,59 @@ unsafe fn register_owner_types_from_type(
     Ok(())
 }
 
+unsafe fn register_function_owner_type_value(
+    value: *mut ffi::PyObject,
+    module_name: *mut ffi::PyObject,
+    visited_types: &mut HashSet<usize>,
+) -> Result<(), ()> {
+    if ffi::PyType_Check(value) != 0 {
+        register_owner_types_from_type(
+            value as *mut ffi::PyTypeObject,
+            module_name,
+            visited_types,
+        )?;
+    }
+    Ok(())
+}
+
+unsafe fn register_function_owner_type_indexed_key(
+    globals: *mut ffi::PyObject,
+    module_name: *mut ffi::PyObject,
+    key: &str,
+    visited_types: &mut HashSet<usize>,
+) -> Result<(), ()> {
+    let key_obj = ffi::PyUnicode_FromStringAndSize(
+        key.as_ptr().cast::<c_char>(),
+        key.len() as ffi::Py_ssize_t,
+    );
+    if key_obj.is_null() {
+        return Err(());
+    }
+    let index = _PyDict_IndexedKeyIndex(globals, key_obj);
+    ffi::Py_DECREF(key_obj);
+    if index < 0 {
+        ffi::PyErr_Clear();
+        return Ok(());
+    }
+
+    let mut value = ptr::null_mut();
+    let found = _PyDict_GetIndexedItem(globals, index, &mut value);
+    if found < 0 {
+        ffi::PyErr_Clear();
+        return Ok(());
+    }
+    if found == 0 {
+        return Ok(());
+    }
+    let result = register_function_owner_type_value(value, module_name, visited_types);
+    ffi::Py_DECREF(value);
+    result
+}
+
 unsafe fn register_function_owner_types_for_globals(
     globals: *mut ffi::PyObject,
     module_name: *mut ffi::PyObject,
+    indexed_module_keys: &[String],
 ) -> Result<(), ()> {
     if globals.is_null() {
         if ffi::PyErr_Occurred().is_null() {
@@ -1353,13 +1412,15 @@ unsafe fn register_function_owner_types_for_globals(
     let mut key = ptr::null_mut();
     let mut value = ptr::null_mut();
     while ffi::PyDict_Next(globals, &mut pos, &mut key, &mut value) != 0 {
-        if ffi::PyType_Check(value) != 0 {
-            register_owner_types_from_type(
-                value as *mut ffi::PyTypeObject,
-                module_name,
-                &mut visited_types,
-            )?;
-        }
+        register_function_owner_type_value(value, module_name, &mut visited_types)?;
+    }
+    for key in indexed_module_keys {
+        register_function_owner_type_indexed_key(
+            globals,
+            module_name,
+            key.as_str(),
+            &mut visited_types,
+        )?;
     }
     Ok(())
 }
@@ -1380,7 +1441,27 @@ pub unsafe fn register_function_owner_types_for_module(
     } else {
         ffi::PyDict_GetItemString(globals, c"__name__".as_ptr())
     };
-    register_function_owner_types_for_globals(globals, module_name)
+    register_function_owner_types_for_globals(globals, module_name, &[])
+}
+
+pub unsafe fn register_function_owner_types_for_module_keys(
+    module: *mut ffi::PyObject,
+    indexed_module_keys: &[String],
+) -> Result<(), ()> {
+    if module.is_null() {
+        ffi::PyErr_SetString(
+            ffi::PyExc_RuntimeError,
+            c"register_function_owner_types_for_module_keys requires a module".as_ptr(),
+        );
+        return Err(());
+    }
+    let globals = ffi::PyModule_GetDict(module);
+    let module_name = if globals.is_null() {
+        ptr::null_mut()
+    } else {
+        ffi::PyDict_GetItemString(globals, c"__name__".as_ptr())
+    };
+    register_function_owner_types_for_globals(globals, module_name, indexed_module_keys)
 }
 
 unsafe fn ensure_clif_vectorcall_compiled(
@@ -2012,7 +2093,7 @@ pub unsafe fn compile_clif_vectorcall(function: *mut ffi::PyObject) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pyo3::types::{PyDict, PyModule};
+    use pyo3::types::{PyDict, PyList, PyModule};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     unsafe extern "C" {
@@ -2392,6 +2473,48 @@ mod tests {
                 "owner type registration should decode the attached constructor id"
             );
             ffi::Py_DECREF(init_function);
+        });
+    }
+
+    #[test]
+    fn owner_type_registration_module_keys_do_not_invoke_module_getattr() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        initialize_test_python();
+        Python::attach(|py| unsafe {
+            let module = PyModule::new(py, "watcher_test").expect("module should allocate");
+            let globals = module.dict();
+            let calls = PyList::empty(py);
+            let builtins = py.import("builtins").expect("builtins should import");
+            globals
+                .set_item("__builtins__", &builtins)
+                .expect("module globals should accept builtins");
+            globals
+                .set_item("calls", &calls)
+                .expect("module globals should accept calls list");
+
+            let source = std::ffi::CString::new(
+                "def __getattr__(name):\n    calls.append(name)\n    raise AttributeError(name)\n",
+            )
+            .expect("python source should be CString-compatible");
+            assert!(
+                !ffi::PyRun_StringFlags(
+                    source.as_ptr(),
+                    ffi::Py_file_input,
+                    globals.as_ptr(),
+                    globals.as_ptr(),
+                    ptr::null_mut(),
+                )
+                .is_null(),
+                "module getattr definition should execute"
+            );
+
+            register_function_owner_types_for_module_keys(module.as_ptr(), &["C".to_string()])
+                .expect("indexed module-key registration should succeed");
+            assert_eq!(
+                calls.len(),
+                0,
+                "registration should read indexed dict storage directly, not module __getattr__"
+            );
         });
     }
 

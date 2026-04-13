@@ -249,7 +249,7 @@ fn transformed_module_methods_register_owner_types_for_lookup() {
         let spec = module_spec
             .call1(("transformed_owner_lookup_test", py.None()))
             .expect("ModuleSpec should instantiate");
-        let source = "class C:\n    def f(self):\n        return 1\n";
+        let source = "class C:\n    def __init__(self):\n        self.value = 1\n    def f(self):\n        return 1\n";
         let source_path = std::env::temp_dir().join(format!(
             "soac_create_module_test_{}_{}.py",
             std::process::id(),
@@ -304,6 +304,23 @@ fn transformed_module_methods_register_owner_types_for_lookup() {
         );
         assert_eq!(owners[0].owner_type, owner_type);
         assert_eq!(owners[0].function_obj, function);
+
+        let init_function = class_dict_function(owner_type, c"__init__");
+        let init_function_id = soac_jit::registered_clif_function_id(init_function)
+            .expect("registered __init__ function id lookup should succeed")
+            .expect("transformed __init__ should carry a FunctionId");
+        let constructor_owners =
+            soac_jit::lookup_exact_owner_types_for_constructor(init_function_id)
+                .expect("exact constructor owner lookup should succeed");
+        assert_eq!(
+            constructor_owners.len(),
+            1,
+            "expected one constructor owner type for transformed C.__init__"
+        );
+        assert_eq!(constructor_owners[0].owner_type, owner_type);
+        assert_eq!(constructor_owners[0].init_function_obj, init_function);
+
+        pyo3::ffi::Py_DECREF(init_function);
         pyo3::ffi::Py_DECREF(function);
     });
 }

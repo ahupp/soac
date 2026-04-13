@@ -4,10 +4,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use pyo3::prelude::*;
-use pyo3::types::{PyList, PyModule};
+use pyo3::types::{PyDict, PyList, PyModule};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use soac_blockpy::block_py::{BlockPyFunction, BlockPyModule, FunctionId};
+use soac_blockpy::block_py::{BlockPyFunction, BlockPyModule, FunctionId, ModuleNameGen};
 use soac_blockpy::passes::{CodegenModuleShape, infer_module_value_facts};
 use soac_jit::module_constants::ModuleCodegenConstants;
 use soac_jit::module_type::build_shared_state_for_inspection;
@@ -66,9 +66,10 @@ pub struct JitClifResponse {
     pub resolved_entry: String,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct JitClifRenderOptions {
     pub load_runtime_specializations: bool,
+    pub runtime_source_path: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -279,6 +280,54 @@ pub fn lower_source_to_codegen_module(
     Ok(output.codegen_module)
 }
 
+pub fn lower_source_to_codegen_module_with_module_id(
+    source: &str,
+    module_id: u32,
+) -> Result<BlockPyModule<CodegenModuleShape>, String> {
+    let output =
+        soac_blockpy::lower_python_to_blockpy_recorded(source, ModuleNameGen::new(module_id))
+            .map_err(|err| err.to_string())?;
+    Ok(output.codegen_module)
+}
+
+fn counter_dump_input_path_from_env_for_render() -> Option<PathBuf> {
+    let mode = std::env::var("SOAC_OPT_MODE").ok()?;
+    match mode.trim() {
+        "verify" | "apply" => std::env::var_os("SOAC_WORK_DIR")
+            .map(PathBuf::from)
+            .filter(|path| !path.as_os_str().is_empty())
+            .map(|dir| dir.join("profile.bin")),
+        _ => None,
+    }
+}
+
+pub fn profile_module_id_from_env(module_name: &str) -> Result<Option<u32>, String> {
+    let Some(path) = counter_dump_input_path_from_env_for_render() else {
+        return Ok(None);
+    };
+    if !path.exists() {
+        return Ok(None);
+    }
+    let dump = CounterDumpFile::open(path.as_path())?;
+    let records = dump.records()?;
+    for record in records {
+        if record.module_name()? != module_name {
+            continue;
+        }
+        for row_index in 0..record.row_count() {
+            let row = record.row(row_index)?;
+            let Some(function_id) = row.function_id else {
+                continue;
+            };
+            if function_id == FunctionId::global() {
+                continue;
+            }
+            return Ok(Some(function_id.module_id()));
+        }
+    }
+    Ok(None)
+}
+
 fn next_web_module_name() -> String {
     format!(
         "_dp_web_{:016x}",
@@ -331,6 +380,80 @@ pub fn render_jit_clif_for_module(
     )
 }
 
+fn module_package_name(module_name: &str) -> &str {
+    module_name
+        .rsplit_once('.')
+        .map(|(package, _)| package)
+        .unwrap_or("")
+}
+
+fn execute_module_for_runtime_render_state(
+    py: Python<'_>,
+    source_path: &Path,
+    module_name: &str,
+    indexed_module_keys: &[String],
+) -> Result<(), String> {
+    let source_path = source_path
+        .to_str()
+        .ok_or_else(|| format!("source path is not valid utf-8: {}", source_path.display()))?;
+    let ext = PyModule::import(py, "_soac_ext").map_err(|err| err.to_string())?;
+    let importlib = PyModule::import(py, "importlib.machinery").map_err(|err| err.to_string())?;
+    let module_spec = importlib
+        .getattr("ModuleSpec")
+        .map_err(|err| err.to_string())?;
+    let spec = module_spec
+        .call1((module_name, py.None()))
+        .map_err(|err| err.to_string())?;
+    let module = ext
+        .getattr("create_module")
+        .map_err(|err| err.to_string())?
+        .call1((source_path, &spec))
+        .map_err(|err| err.to_string())?;
+    let globals = module.getattr("__dict__").map_err(|err| err.to_string())?;
+    let globals = globals.cast::<PyDict>().map_err(|err| err.to_string())?;
+    globals
+        .set_item("__package__", module_package_name(module_name))
+        .map_err(|err| err.to_string())?;
+    globals
+        .set_item("__file__", source_path)
+        .map_err(|err| err.to_string())?;
+    ext.getattr("exec_module")
+        .map_err(|err| err.to_string())?
+        .call1((&module,))
+        .map_err(|err| err.to_string())?;
+    unsafe {
+        soac_jit::register_function_owner_types_for_module_keys(
+            module.as_ptr(),
+            indexed_module_keys,
+        )
+    }
+    .map_err(|_| {
+        if unsafe { pyo3::ffi::PyErr_Occurred() }.is_null() {
+            "failed to register owner types for rendered runtime module".to_string()
+        } else {
+            PyErr::fetch(py).to_string()
+        }
+    })
+}
+
+fn corresponding_runtime_function<'a>(
+    module: &'a BlockPyModule<CodegenModuleShape>,
+    requested_function: &BlockPyFunction<CodegenModuleShape>,
+) -> Option<&'a BlockPyFunction<CodegenModuleShape>> {
+    module
+        .callable_defs
+        .iter()
+        .find(|function| {
+            function.function_id.function_id() == requested_function.function_id.function_id()
+        })
+        .or_else(|| {
+            module
+                .callable_defs
+                .iter()
+                .find(|function| function.names.qualname == requested_function.names.qualname)
+        })
+}
+
 pub fn render_jit_clif_for_module_with_options(
     repo_root: &Path,
     module_name: &str,
@@ -347,10 +470,18 @@ pub fn render_jit_clif_for_module_with_options(
     let module_constants = ModuleCodegenConstants::collect_from_module(module);
     let compile_session = soac_jit::CompileSession::new();
     prepare_python();
-    let rendered = Python::attach(|py| {
+    let (rendered, resolved_qualname, resolved_function_id, entry_label) = Python::attach(|py| {
         ensure_python_support_paths(py, repo_root).map_err(|err| err.error)?;
         PyModule::import(py, "soac.runtime").map_err(|err| err.to_string())?;
         let runtime_state = if options.load_runtime_specializations {
+            if let Some(source_path) = options.runtime_source_path.as_deref() {
+                execute_module_for_runtime_render_state(
+                    py,
+                    source_path,
+                    module_name,
+                    &module.global_names,
+                )?;
+            }
             Some(
                 build_shared_state_for_inspection(py, module.clone(), module_name, "")
                     .map_err(|err| err.to_string())?,
@@ -358,30 +489,78 @@ pub fn render_jit_clif_for_module_with_options(
         } else {
             None
         };
-        unsafe {
-            render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
-                &compile_session,
-                &vec![std::ptr::null_mut::<c_void>(); function.blocks.len()],
-                module,
-                &function,
-                &module_constants,
-                runtime_state.as_deref(),
-            )
-        }
+
+        let (rendered, resolved_qualname, resolved_function_id, entry_label) =
+            if let Some(shared_state) = runtime_state.as_deref() {
+                let render_function =
+                    corresponding_runtime_function(&shared_state.lowered_module, &function)
+                        .cloned()
+                        .ok_or_else(|| {
+                            format!(
+                                "runtime module for {module_name} did not contain function {} ({})",
+                                function.function_id, function.names.qualname
+                            )
+                        })?;
+                let rendered = unsafe {
+                    render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
+                        &compile_session,
+                        &vec![std::ptr::null_mut::<c_void>(); render_function.blocks.len()],
+                        &shared_state.lowered_module,
+                        &render_function,
+                        &shared_state.codegen_constants,
+                        Some(shared_state),
+                    )
+                }?;
+                let entry_label = render_function
+                    .blocks
+                    .first()
+                    .map(|block| block.label.to_string())
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                (
+                    rendered,
+                    render_function.names.qualname.to_string(),
+                    render_function.function_id,
+                    entry_label,
+                )
+            } else {
+                let rendered = unsafe {
+                    render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
+                        &compile_session,
+                        &vec![std::ptr::null_mut::<c_void>(); function.blocks.len()],
+                        module,
+                        &function,
+                        &module_constants,
+                        None,
+                    )
+                }?;
+                let entry_label = function
+                    .blocks
+                    .first()
+                    .map(|block| block.label.to_string())
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                (
+                    rendered,
+                    function.names.qualname.to_string(),
+                    function.function_id,
+                    entry_label,
+                )
+            };
+
+        Ok::<_, String>((
+            rendered,
+            resolved_qualname,
+            resolved_function_id,
+            entry_label,
+        ))
     })?;
-    let entry_label = function
-        .blocks
-        .first()
-        .map(|block| block.label.to_string())
-        .unwrap_or_else(|| "<unknown>".to_string());
     Ok(JitClifResponse {
         clif: rendered.clif,
         cfg_dot: rendered.cfg_dot,
         vcode_disasm: rendered.vcode_disasm,
         resolved_entry: format!(
             "{}::__dp_fn_{}::{}",
-            function.names.qualname,
-            function_id.packed(),
+            resolved_qualname,
+            resolved_function_id.packed(),
             entry_label
         ),
     })
