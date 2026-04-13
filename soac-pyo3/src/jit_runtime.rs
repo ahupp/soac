@@ -6,14 +6,20 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyFunction, PyModule, PyString, PyTuple};
 use soac_blockpy::block_py::{BlockPyFunction, BlockPyModule, FunctionId, FunctionKind, ParamKind};
+use soac_blockpy::codegen_cache::{
+    PythonModuleCacheSource, codegen_module_cache_key, codegen_module_cache_path,
+};
 use soac_blockpy::passes::CodegenModuleShape;
 use soac_blockpy::{LoweringOptions, lower_python_to_blockpy_recorded_with_options};
 use soac_jit::module_type::{ModuleInfo, SharedModuleState, SoacExtModule, hash_module_source};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tracing::{info, trace};
+
+const SOAC_BUILD_IDENTITY: &str = env!("SOAC_BUILD_IDENTITY");
 
 unsafe extern "C" {
     static mut PyCell_Type: ffi::PyTypeObject;
@@ -156,6 +162,38 @@ fn elapsed_us(elapsed: Duration) -> u64 {
 
 fn source_hash_hex(source_hash: u64) -> String {
     format!("0x{source_hash:016x}")
+}
+
+fn soac_repo_root() -> Option<PathBuf> {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(Path::to_path_buf)
+}
+
+fn module_cache_root_from_env() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("SOAC_MODULE_CACHE_DIR")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        return Some(path);
+    }
+    soac_repo_root().map(|root| root.join("soac-module-cache"))
+}
+
+fn pre_optimization_module_cache_path(
+    source_hash: u64,
+    runtime_names_as_globals: bool,
+) -> Option<PathBuf> {
+    let cache_root = module_cache_root_from_env()?;
+    let cache_identity =
+        format!("{SOAC_BUILD_IDENTITY};runtime_names_as_globals={runtime_names_as_globals}");
+    let cache_key = codegen_module_cache_key(source_hash, cache_identity.as_str());
+    codegen_module_cache_path(
+        cache_root,
+        PythonModuleCacheSource::Project,
+        cache_key.as_str(),
+    )
+    .ok()
 }
 
 fn pending_module_load_timings() -> &'static Mutex<HashMap<usize, PendingModuleLoadTiming>> {
@@ -948,8 +986,13 @@ fn create_module(py: Python<'_>, path: &str, spec: Py<PyAny>) -> PyResult<Py<PyA
         indexed_module_keys: Vec::new(),
     };
     let session = soac_jit::CompileSession::process();
+    let runtime_names_as_globals = module_name == "soac.runtime";
     let lowering_options = LoweringOptions {
-        runtime_names_as_globals: module_name == "soac.runtime",
+        runtime_names_as_globals,
+        pre_optimization_cache_path: pre_optimization_module_cache_path(
+            source_hash,
+            runtime_names_as_globals,
+        ),
     };
     let output = time_phase(&mut create_timings, "lower_blockpy", || {
         lower_python_to_blockpy_recorded_with_options(

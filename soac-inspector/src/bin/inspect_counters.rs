@@ -165,6 +165,7 @@ fn main() -> Result<(), String> {
             }
 
             json_records.push(json!({
+                "source_hash": format!("0x{:016x}", record.source_hash()),
                 "module_name": record.module_name()?,
                 "package_name": record.package_name()?,
                 "module_keys": module_keys,
@@ -182,8 +183,9 @@ fn main() -> Result<(), String> {
     }
     for (record_index, record) in records.iter().enumerate() {
         println!(
-            "record={} module={} package={} rows={} module_keys={} type_keys={} type_table={}",
+            "record={} source_hash=0x{:016x} module={} package={} rows={} module_keys={} type_keys={} type_table={}",
             record_index,
+            record.source_hash(),
             record.module_name()?,
             record.package_name()?.unwrap_or("-"),
             record.row_count(),
@@ -313,6 +315,7 @@ mod tests {
     #[test]
     fn specialization_output_reads_directly_from_counter_dump() {
         let record = CounterDumpRecord {
+            source_hash: 0,
             module_name: "mod".to_string(),
             package_name: None,
             module_keys: Vec::new(),

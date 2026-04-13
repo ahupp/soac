@@ -3034,6 +3034,7 @@ def add(a, b):
         write_test_counter_dump(
             soac_work_dir.join("profile.bin").as_path(),
             &CounterDumpRecord {
+                source_hash: 0,
                 module_name: module_name.to_string(),
                 package_name: None,
                 rows: operator_specializations
@@ -3144,6 +3145,7 @@ def add(a, b):
         write_test_counter_dump(
             soac_work_dir.join("profile.bin").as_path(),
             &CounterDumpRecord {
+                source_hash: 0,
                 module_name: module_name.to_string(),
                 package_name: None,
                 rows: block_entry_counts
@@ -3302,6 +3304,7 @@ class Point:
             write_test_counter_dump(
                 soac_work_dir.join("profile.bin").as_path(),
                 &CounterDumpRecord {
+                    source_hash: 0,
                     module_name: "counter_test".to_string(),
                     package_name: None,
                     rows: Vec::new(),
@@ -3484,6 +3487,7 @@ class Point:
             write_test_counter_dump(
                 soac_work_dir.join("profile.bin").as_path(),
                 &CounterDumpRecord {
+                    source_hash: 0,
                     module_name: "counter_test".to_string(),
                     package_name: None,
                     rows: Vec::new(),
@@ -3737,6 +3741,7 @@ class Record:
             write_test_counter_dump(
                 soac_work_dir.join("profile.bin").as_path(),
                 &CounterDumpRecord {
+                    source_hash: 0,
                     module_name: "counter_test".to_string(),
                     package_name: None,
                     rows: Vec::new(),
@@ -4043,6 +4048,7 @@ class Point:
             write_test_counter_dump(
                 soac_work_dir.join("profile.bin").as_path(),
                 &CounterDumpRecord {
+                    source_hash: 0,
                     module_name: "counter_test".to_string(),
                     package_name: None,
                     rows: Vec::new(),
@@ -7753,6 +7759,7 @@ def f(x, y):
         write_test_counter_dump(
             soac_work_dir.join("profile.bin").as_path(),
             &CounterDumpRecord {
+                source_hash: 0,
                 module_name: "counter_test".to_string(),
                 package_name: None,
                 rows: Vec::new(),
@@ -8816,6 +8823,7 @@ def f(x, y):
                 write_test_counter_dump(
                     soac_work_dir.join("profile.bin").as_path(),
                     &CounterDumpRecord {
+                        source_hash: 0,
                         module_name: "counter_test".to_string(),
                         package_name: None,
                         rows: vec![CounterDumpRow {

@@ -12,6 +12,7 @@ xdg_cache_home := env_var_or_default("XDG_CACHE_HOME", repo_root + "/.xdg/cache"
 xdg_data_home := env_var_or_default("XDG_DATA_HOME", repo_root + "/.xdg/data")
 xdg_runtime_dir := env_var_or_default("XDG_RUNTIME_DIR", repo_root + "/tmp")
 cargo_home := env_var_or_default("CARGO_HOME", repo_root + "/tmp/cargo-home")
+soac_module_cache_dir := env_var_or_default("SOAC_MODULE_CACHE_DIR", repo_root + "/soac-module-cache")
 pyo3_python := cpython_bin
 web_dir := repo_root + "/web"
 inspector_bin := repo_root + "/target/debug/soac-inspector"
@@ -36,6 +37,7 @@ export XDG_RUNTIME_DIR := xdg_runtime_dir
 export PYO3_PYTHON := pyo3_python
 export PYO3_PYTHON_REAL := pyo3_python
 export CARGO_HOME := cargo_home
+export SOAC_MODULE_CACHE_DIR := soac_module_cache_dir
 export PATH := uv_tool_bin_dir + ":" + env_var_or_default("PATH", "")
 export WEB_DIR := web_dir
 export INSPECTOR_BIN := inspector_bin
@@ -249,6 +251,7 @@ setup-dev-env:
       "$parent_repo/.uv/bin" \
       "$parent_repo/.xdg/cache" \
       "$parent_repo/.xdg/data" \
+      "$parent_repo/soac-module-cache" \
       "$parent_repo/tmp/cargo-home"
 
     link_shared_dir "$REPO_ROOT/vendor/cpython" "$parent_repo/vendor/cpython" "vendor/cpython"
@@ -256,6 +259,7 @@ setup-dev-env:
     link_shared_dir "$REPO_ROOT/.uv-cache" "$parent_repo/.uv-cache" ".uv-cache" 1
     link_shared_dir "$REPO_ROOT/.uv" "$parent_repo/.uv" ".uv" 1
     link_shared_dir "$REPO_ROOT/.xdg" "$parent_repo/.xdg" ".xdg" 1
+    link_shared_dir "$REPO_ROOT/soac-module-cache" "$parent_repo/soac-module-cache" "soac-module-cache" 1
     link_shared_dir "$REPO_ROOT/tmp/cargo-home" "$parent_repo/tmp/cargo-home" "tmp/cargo-home" 1
   else
     if [[ -L "$REPO_ROOT/bench" ]]; then
@@ -271,6 +275,7 @@ setup-dev-env:
     "$UV_TOOL_BIN_DIR" \
     "$XDG_CACHE_HOME" \
     "$XDG_DATA_HOME" \
+    "$SOAC_MODULE_CACHE_DIR" \
     "$XDG_RUNTIME_DIR"
 
   if [[ ! -x "$CPYTHON_BIN" ]]; then

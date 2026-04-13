@@ -424,6 +424,7 @@ impl SharedModuleState {
         }
 
         Some(CounterDumpRecord {
+            source_hash: self.source_hash,
             module_name: self.module_name.clone(),
             package_name: (!self.package_name.is_empty()).then(|| self.package_name.clone()),
             rows,

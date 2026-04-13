@@ -28,6 +28,7 @@ def _read_jsonl(path):
 def _soac_subprocess_env(module_root, *, work_dir=None, extra_env=None):
     env = dict(os.environ)
     env["SOAC_MODULE_ENABLED"] = f"path:{module_root}"
+    env["SOAC_MODULE_CACHE_DIR"] = str(module_root / "soac-module-cache")
     if work_dir is not None:
         env["SOAC_WORK_DIR"] = str(work_dir)
     else:
@@ -137,6 +138,8 @@ def read():
     assert len(data) > 64
     dump = _inspect_counter_dump_json(dump_path)
     assert dump["records"]
+    assert dump["records"][0]["source_hash"].startswith("0x")
+    assert int(dump["records"][0]["source_hash"], 16) > 0
 
 
 def test_counter_dump_file_is_not_written_in_none_mode(tmp_path, monkeypatch):
@@ -256,6 +259,44 @@ def read():
     assert jit_row["jit_clif_inst_count"] > 0
     assert jit_row["jit_machine_code_size_bytes"] > 0
     assert jit_row["jit_machine_code_block_count"] > 0
+
+
+def test_pre_optimization_blockpy_module_cache_is_reused(tmp_path):
+    cache_dir = tmp_path / "module-cache"
+    log_path = tmp_path / "cache-events.jsonl"
+    module_path = tmp_path / "module_cache_case.py"
+    module_path.write_text(
+        """
+def value():
+    return 42
+""",
+        encoding="utf-8",
+    )
+    env = _soac_subprocess_env(
+        tmp_path,
+        extra_env={
+            "SOAC_MODULE_CACHE_DIR": str(cache_dir),
+            "SOAC_LOG": f"soac_blockpy_module_cache=info;json={log_path}",
+        },
+    )
+    script = _import_and_run_script(
+        tmp_path,
+        "import module_cache_case",
+        "assert module_cache_case.value() == 42",
+    )
+
+    first = _run_soac_subprocess(script, env=env)
+    _assert_subprocess_ok(first)
+    second = _run_soac_subprocess(script, env=env)
+    _assert_subprocess_ok(second)
+
+    cache_files = list(cache_dir.rglob("*.blockpy.rkyv"))
+    assert cache_files
+    rows = _read_jsonl(log_path)
+    assert any(
+        row.get("event") == "soac.blockpy_module_cache" and row.get("cache_hit") is True
+        for row in rows
+    )
 
 
 def test_soac_work_dir_is_default_event_log_dir(tmp_path):

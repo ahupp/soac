@@ -1,5 +1,9 @@
-use crate::block_py::{BlockPyFunction, BlockPyModule, FunctionNameGen, ModuleNameGen};
-use crate::passes::CodegenModuleShape;
+use crate::block_py::{
+    walk_expr_mut, walk_module, walk_module_mut, BlockPyFunction, BlockPyModule, CallArgPositional,
+    ChildVisitable, CounterSite, FunctionId, FunctionNameGen, HasMeta, IntLiteral, Literal,
+    ModuleNameGen, NameLike, NumberLiteral, NumberLiteralValue, Visit, VisitMut, WithMeta,
+};
+use crate::passes::{CodegenModuleShape, InstrCodegen};
 use anyhow::{anyhow, Context, Result};
 use std::fs::{self, File};
 use std::io::Write;
@@ -34,6 +38,10 @@ pub fn codegen_module_cache_path(
         .join(source.subtree())
         .join("blockpy-codegen")
         .join(format!("{file_stem}.blockpy.rkyv")))
+}
+
+pub fn codegen_module_cache_key(source_hash: u64, build_identity: &str) -> String {
+    format!("{source_hash:016x}-{:016x}", stable_hash(build_identity))
 }
 
 pub fn store_codegen_module_cache(
@@ -99,6 +107,188 @@ pub fn rehydrate_codegen_module_generators(module: &mut BlockPyModule<CodegenMod
     }
 }
 
+pub fn remap_codegen_module_function_ids(
+    module: &mut BlockPyModule<CodegenModuleShape>,
+    module_name_gen: ModuleNameGen,
+) {
+    let new_module_id = module_name_gen.module_id();
+    let mut remapper = FunctionIdRemapper { new_module_id };
+    let make_function_constant_slots = collect_make_function_constant_slots(module);
+    walk_module_mut(&mut remapper, module);
+    for (constant_index, function_id) in make_function_constant_slots {
+        let remapped = remapper.remap(function_id);
+        if let Some(constant) = module.module_constants.get_mut(constant_index) {
+            *constant = function_id_constant_expr(constant.meta(), remapped);
+        }
+    }
+
+    for function in &mut module.callable_defs {
+        function.function_id = remapper.remap(function.function_id);
+        function.name_gen = recovered_function_name_gen(function);
+    }
+    for counter in &mut module.counter_defs {
+        match &mut counter.site {
+            CounterSite::BlockEntry { function_id, .. } => {
+                *function_id = remapper.remap(*function_id);
+            }
+            CounterSite::Runtime { function_id, .. } => {
+                if let Some(function_id) = function_id {
+                    *function_id = remapper.remap(*function_id);
+                }
+            }
+        }
+    }
+    module.module_name_gen = recovered_module_name_gen(module);
+}
+
+struct FunctionIdRemapper {
+    new_module_id: u32,
+}
+
+impl FunctionIdRemapper {
+    fn remap(&self, function_id: FunctionId) -> FunctionId {
+        if function_id == FunctionId::global() {
+            function_id
+        } else {
+            FunctionId::new(self.new_module_id, function_id.function_id())
+        }
+    }
+}
+
+impl VisitMut<InstrCodegen> for FunctionIdRemapper {
+    fn visit_instr_mut(&mut self, expr: &mut InstrCodegen)
+    where
+        InstrCodegen: crate::block_py::ChildVisitable<InstrCodegen>,
+    {
+        match expr {
+            InstrCodegen::CallDirect(op) => {
+                op.function_id = self.remap(op.function_id);
+            }
+            InstrCodegen::MakeFunction(op) => {
+                op.set_function_id(self.remap(op.function_id()));
+            }
+            InstrCodegen::BinOp(_)
+            | InstrCodegen::UnaryOp(_)
+            | InstrCodegen::CalleeFunctionId(_)
+            | InstrCodegen::Call(_)
+            | InstrCodegen::GetAttr(_)
+            | InstrCodegen::SetAttr(_)
+            | InstrCodegen::GetItem(_)
+            | InstrCodegen::SetItem(_)
+            | InstrCodegen::DelItem(_)
+            | InstrCodegen::Load(_)
+            | InstrCodegen::Store(_)
+            | InstrCodegen::Del(_)
+            | InstrCodegen::MakeCell(_)
+            | InstrCodegen::IncrementCounter(_)
+            | InstrCodegen::CellRef(_) => {}
+        }
+        walk_expr_mut(self, expr);
+    }
+}
+
+fn collect_make_function_constant_slots(
+    module: &BlockPyModule<CodegenModuleShape>,
+) -> Vec<(usize, FunctionId)> {
+    struct MakeFunctionConstantCollector<'a> {
+        module_constants: &'a [crate::block_py::InstrResolved],
+        out: Vec<(usize, FunctionId)>,
+    }
+
+    impl Visit<InstrCodegen> for MakeFunctionConstantCollector<'_> {
+        fn visit_instr(&mut self, expr: &InstrCodegen)
+        where
+            InstrCodegen: crate::block_py::ChildVisitable<InstrCodegen>,
+        {
+            if let InstrCodegen::Call(call) = expr {
+                if codegen_expr_is_runtime_symbol(
+                    call.func.as_ref(),
+                    self.module_constants,
+                    "make_function",
+                ) {
+                    if let Some(CallArgPositional::Positional(function_id_expr)) = call.args.first()
+                    {
+                        if let Some(constant_index) = codegen_expr_constant_index(function_id_expr)
+                        {
+                            if let Some(function_id) = self
+                                .module_constants
+                                .get(constant_index)
+                                .and_then(resolved_function_id_constant)
+                            {
+                                self.out.push((constant_index, function_id));
+                            }
+                        }
+                    }
+                }
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut collector = MakeFunctionConstantCollector {
+        module_constants: &module.module_constants,
+        out: Vec::new(),
+    };
+    walk_module(&mut collector, module);
+    collector.out
+}
+
+fn codegen_expr_is_runtime_symbol(
+    expr: &InstrCodegen,
+    module_constants: &[crate::block_py::InstrResolved],
+    name: &str,
+) -> bool {
+    match expr {
+        InstrCodegen::Load(load) if load.name.is_runtime_symbol(name) => true,
+        InstrCodegen::Load(load) => load
+            .name
+            .location
+            .as_constant()
+            .and_then(|index| module_constants.get(index as usize))
+            .is_some_and(|constant| resolved_expr_is_runtime_symbol(constant, name)),
+        _ => false,
+    }
+}
+
+fn resolved_expr_is_runtime_symbol(expr: &crate::block_py::InstrResolved, name: &str) -> bool {
+    matches!(expr, crate::block_py::InstrResolved::Load(load) if load.name.is_runtime_symbol(name))
+}
+
+fn codegen_expr_constant_index(expr: &InstrCodegen) -> Option<usize> {
+    match expr {
+        InstrCodegen::Load(load) => load.name.location.as_constant().map(|index| index as usize),
+        _ => None,
+    }
+}
+
+fn resolved_function_id_constant(expr: &crate::block_py::InstrResolved) -> Option<FunctionId> {
+    let crate::block_py::InstrResolved::Literal(literal) = expr else {
+        return None;
+    };
+    let Literal::NumberLiteral(NumberLiteral {
+        value: NumberLiteralValue::Int(value),
+    }) = literal.as_literal()
+    else {
+        return None;
+    };
+    value
+        .as_decimal()
+        .parse::<u64>()
+        .ok()
+        .map(FunctionId::from_packed)
+}
+
+fn function_id_constant_expr(
+    meta: crate::block_py::Meta,
+    function_id: FunctionId,
+) -> crate::block_py::InstrResolved {
+    let literal = crate::block_py::LiteralValue::new(Literal::NumberLiteral(NumberLiteral {
+        value: NumberLiteralValue::Int(IntLiteral::from_decimal(function_id.packed().to_string())),
+    }))
+    .with_meta(meta);
+    crate::block_py::InstrResolved::Literal(literal)
+}
+
 fn archive_bytes_from_cache_file(bytes: &[u8]) -> Result<&[u8]> {
     let rest = bytes
         .strip_prefix(CODEGEN_MODULE_CACHE_MAGIC)
@@ -137,6 +327,18 @@ fn cache_file_stem(cache_key: &str) -> Result<&str> {
             "BlockPy cache key must be a non-empty ASCII alnum/_/- file stem: {cache_key:?}"
         ))
     }
+}
+
+fn stable_hash(text: &str) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x00000100000001b3;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }
 
 fn recovered_module_name_gen(module: &BlockPyModule<CodegenModuleShape>) -> ModuleNameGen {
@@ -192,12 +394,13 @@ fn temp_cache_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod test {
     use super::{
-        codegen_module_cache_path, load_codegen_module_cache, store_codegen_module_cache,
+        codegen_module_cache_key, codegen_module_cache_path, collect_make_function_constant_slots,
+        load_codegen_module_cache, remap_codegen_module_function_ids, store_codegen_module_cache,
         PythonModuleCacheSource,
     };
     use crate::block_py::{
         walk_block, walk_expr, BlockPyModule, ChildVisitable, FunctionId, HasSemanticInstrId,
-        InstrCodegen, Visit,
+        InstrCodegen, ModuleNameGen, Visit,
     };
     use crate::lower_python_to_blockpy_for_testing;
     use crate::passes::CodegenModuleShape;
@@ -313,6 +516,60 @@ def g(y):
             "../escape"
         )
         .is_err());
+    }
+
+    #[test]
+    fn cache_key_combines_source_hash_and_build_identity_hash() {
+        assert_eq!(
+            codegen_module_cache_key(0x1234, "build-a"),
+            "0000000000001234-09e267510d26cc71"
+        );
+        assert_ne!(
+            codegen_module_cache_key(0x1234, "build-a"),
+            codegen_module_cache_key(0x1234, "build-b")
+        );
+        assert_ne!(
+            codegen_module_cache_key(0x1234, "build-a"),
+            codegen_module_cache_key(0x5678, "build-a")
+        );
+    }
+
+    #[test]
+    fn remaps_cached_codegen_module_to_fresh_module_id() {
+        let mut module = lower_python_to_blockpy_for_testing(
+            r#"
+def outer():
+    def inner():
+        return 1
+    return inner()
+"#,
+        )
+        .expect("transform should succeed")
+        .codegen_module;
+
+        remap_codegen_module_function_ids(&mut module, ModuleNameGen::new(99));
+
+        assert_eq!(module.module_name_gen.module_id(), 99);
+        for function in &module.callable_defs {
+            assert_eq!(function.function_id.module_id(), 99);
+            assert_eq!(function.name_gen.function_id(), function.function_id);
+        }
+        for (_, function_id) in collect_make_function_constant_slots(&module) {
+            assert_eq!(
+                function_id.module_id(),
+                99,
+                "cached make_function constants must point at the remapped module id"
+            );
+        }
+
+        let recovered_next_function = module.module_name_gen.next_function_name_gen();
+        assert!(
+            !module
+                .callable_defs
+                .iter()
+                .any(|function| function.function_id == recovered_next_function.function_id()),
+            "rehydrated module generator should not reissue an existing function id"
+        );
     }
 
     fn summarize_module(module: &BlockPyModule<CodegenModuleShape>) -> ModuleSummary {

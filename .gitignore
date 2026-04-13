@@ -16,7 +16,7 @@ cpython_full_test_run_summary.txt
 /.uv-cache
 /.xdg
 .cl-cache/
-soac-module-cache/
+/soac-module-cache/
 /web/history_metrics.html
 
 # coverage artifacts

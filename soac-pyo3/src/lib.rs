@@ -107,6 +107,7 @@ fn inspect_counter_dump_json(path: &str) -> PyResult<String> {
         }
 
         json_records.push(json!({
+            "source_hash": format!("0x{:016x}", record.source_hash()),
             "module_name": record.module_name().map_err(PyRuntimeError::new_err)?,
             "package_name": record.package_name().map_err(PyRuntimeError::new_err)?,
             "module_keys": module_keys,

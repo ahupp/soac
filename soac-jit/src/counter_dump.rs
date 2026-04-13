@@ -11,7 +11,7 @@ use std::io::Write;
 use std::path::Path;
 
 pub const COUNTER_DUMP_MAGIC: [u8; 8] = *b"SOACRKV1";
-pub const COUNTER_DUMP_VERSION: u16 = 2;
+pub const COUNTER_DUMP_VERSION: u16 = 3;
 const COUNTER_DUMP_FRAME_HEADER_LEN: usize = 32;
 const COUNTER_DUMP_FRAME_ALIGN: usize = 16;
 pub const COUNTER_DUMP_NONE_U64: u64 = u64::MAX;
@@ -35,6 +35,7 @@ pub struct CounterDumpRow {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CounterDumpRecord {
+    pub source_hash: u64,
     pub module_name: String,
     pub package_name: Option<String>,
     pub rows: Vec<CounterDumpRow>,
@@ -114,6 +115,7 @@ pub struct CounterDumpTypeTableEntryView<'a> {
 #[derive(Archive, Deserialize, Serialize, Debug)]
 #[rkyv(derive(Debug))]
 struct CounterDumpRecordArchive {
+    source_hash: u64,
     module_name: String,
     package_name: String,
     rows: Vec<CounterDumpRowArchive>,
@@ -217,6 +219,7 @@ impl CounterDumpRecord {
 impl CounterDumpRecordArchive {
     fn from_record(record: &CounterDumpRecord) -> Self {
         Self {
+            source_hash: record.source_hash,
             module_name: record.module_name.clone(),
             package_name: record.package_name.clone().unwrap_or_default(),
             rows: record
@@ -322,6 +325,10 @@ impl CounterDumpFile {
 }
 
 impl<'a> CounterDumpRecordView<'a> {
+    pub fn source_hash(&self) -> u64 {
+        self.record.source_hash.into()
+    }
+
     pub fn module_name(&self) -> Result<&'a str, String> {
         Ok(self.record.module_name.as_str())
     }
@@ -966,6 +973,7 @@ mod tests {
     #[test]
     fn encodes_length_delimited_rkyv_record() {
         let record = CounterDumpRecord {
+            source_hash: 0x1234,
             module_name: "counter_test".to_string(),
             package_name: Some("pkg".to_string()),
             module_keys: vec![CounterDumpKeyLayout {
@@ -1032,6 +1040,7 @@ mod tests {
             parse_counter_dump_records(bytes.as_slice()).expect("counter dump should parse");
         assert_eq!(records.len(), 1);
         let record = records[0];
+        assert_eq!(record.source_hash(), 0x1234);
         assert_eq!(record.module_name().expect("module name"), "counter_test");
         assert_eq!(record.package_name().expect("package name"), Some("pkg"));
         assert_eq!(record.row_count(), 2);
@@ -1067,6 +1076,7 @@ mod tests {
     #[test]
     fn parses_appended_counter_dump_records_from_mmap() {
         let first = CounterDumpRecord {
+            source_hash: 0,
             module_name: "alpha".to_string(),
             package_name: Some("pkg".to_string()),
             module_keys: Vec::new(),
@@ -1088,6 +1098,7 @@ mod tests {
             }],
         };
         let second = CounterDumpRecord {
+            source_hash: 0,
             module_name: "beta".to_string(),
             package_name: None,
             module_keys: Vec::new(),
@@ -1165,6 +1176,7 @@ mod tests {
     #[test]
     fn collects_unique_key_layouts_by_owner() {
         let record = CounterDumpRecord {
+            source_hash: 0,
             module_name: "mod".to_string(),
             package_name: None,
             module_keys: vec![
@@ -1221,6 +1233,7 @@ mod tests {
     #[test]
     fn collects_type_table_by_id() {
         let record = CounterDumpRecord {
+            source_hash: 0,
             module_name: "mod".to_string(),
             package_name: None,
             module_keys: Vec::new(),
@@ -1275,6 +1288,7 @@ mod tests {
     #[test]
     fn rejects_conflicting_type_table_ids() {
         let record = CounterDumpRecord {
+            source_hash: 0,
             module_name: "mod".to_string(),
             package_name: None,
             module_keys: Vec::new(),
@@ -1308,6 +1322,7 @@ mod tests {
     #[test]
     fn renders_and_collects_call_target_specializations() {
         let record = CounterDumpRecord {
+            source_hash: 0,
             module_name: "mod".to_string(),
             package_name: None,
             module_keys: Vec::new(),
@@ -1395,6 +1410,7 @@ mod tests {
     #[test]
     fn collect_operator_specializations_filters_and_deduplicates_shapes() {
         let record = CounterDumpRecord {
+            source_hash: 0,
             module_name: "mod".to_string(),
             package_name: None,
             module_keys: Vec::new(),
@@ -1495,6 +1511,7 @@ mod tests {
         let hot_false_site = InstrId::new(BlockLabel::from_index(2), 4);
         let hot_true_site = InstrId::new(BlockLabel::from_index(3), 5);
         let record = CounterDumpRecord {
+            source_hash: 0,
             module_name: "mod".to_string(),
             package_name: None,
             module_keys: Vec::new(),

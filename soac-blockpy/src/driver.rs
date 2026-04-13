@@ -1,5 +1,6 @@
 use crate::block_py::pretty::BlockPyPrettyPrint;
 use crate::block_py::{BlockPyModule, CounterScope, ModuleNameGen};
+use crate::codegen_cache::{load_codegen_module_cache, store_codegen_module_cache};
 use crate::pass_tracker::PassTracker;
 use crate::passes::ast_to_ast::ast_rewrite::rewrite_with_pass;
 use crate::passes::ast_to_ast::context::Context;
@@ -18,6 +19,8 @@ use crate::passes::{
 use crate::{ParseError, Result};
 use ruff_python_ast::{self as ast, Stmt};
 use ruff_python_parser::parse_module;
+use std::path::{Path, PathBuf};
+use tracing::{info, warn};
 
 #[derive(Clone)]
 pub(crate) struct AstToAstPassResult {
@@ -25,9 +28,10 @@ pub(crate) struct AstToAstPassResult {
     semantic_state: SemanticAstState,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct LoweringOptions {
     pub runtime_names_as_globals: bool,
+    pub pre_optimization_cache_path: Option<PathBuf>,
 }
 
 impl BlockPyPrettyPrint for AstToAstPassResult {
@@ -78,6 +82,84 @@ pub(crate) fn rewrite_module_with_tracker_with_options(
     module_name_gen: ModuleNameGen,
     pass_tracker: &mut impl PassTracker,
     options: LoweringOptions,
+) -> Result<BlockPyModule<CodegenModuleShape>> {
+    let bb_codegen =
+        rewrite_pre_optimization_module_with_cache(source, module_name_gen, pass_tracker, options)?;
+    finish_codegen_module_with_tracker(bb_codegen, pass_tracker)
+}
+
+fn rewrite_pre_optimization_module_with_cache(
+    source: &str,
+    module_name_gen: ModuleNameGen,
+    pass_tracker: &mut impl PassTracker,
+    options: LoweringOptions,
+) -> Result<BlockPyModule<CodegenModuleShape>> {
+    if let Some(cache_path) = &options.pre_optimization_cache_path {
+        let cache_exists =
+            pass_tracker.record_timing("bb_codegen_cache_lookup", || cache_path.is_file());
+        if cache_exists {
+            let loaded = pass_tracker.record_timing("bb_codegen_cache_load", || {
+                load_codegen_module_cache(cache_path)
+            });
+            match loaded {
+                Ok(mut module) => {
+                    crate::codegen_cache::remap_codegen_module_function_ids(
+                        &mut module,
+                        module_name_gen,
+                    );
+                    info!(
+                        target: "soac_blockpy_module_cache",
+                        event = "soac.blockpy_module_cache",
+                        cache_hit = true,
+                        path = %cache_path.display(),
+                        "blockpy_module_cache_hit",
+                    );
+                    return Ok(pass_tracker.run_pass("bb_codegen", || module));
+                }
+                Err(err) => {
+                    warn!(
+                        target: "soac_blockpy_module_cache",
+                        event = "soac.blockpy_module_cache",
+                        cache_hit = false,
+                        path = %cache_path.display(),
+                        error = %err,
+                        "blockpy_module_cache_load_failed",
+                    );
+                }
+            }
+        } else {
+            info!(
+                target: "soac_blockpy_module_cache",
+                event = "soac.blockpy_module_cache",
+                cache_hit = false,
+                path = %cache_path.display(),
+                "blockpy_module_cache_miss",
+            );
+        }
+
+        let module = rewrite_pre_optimization_module_from_source(
+            source,
+            module_name_gen,
+            pass_tracker,
+            options.runtime_names_as_globals,
+        )?;
+        store_pre_optimization_cache(cache_path, &module, pass_tracker);
+        Ok(module)
+    } else {
+        rewrite_pre_optimization_module_from_source(
+            source,
+            module_name_gen,
+            pass_tracker,
+            options.runtime_names_as_globals,
+        )
+    }
+}
+
+fn rewrite_pre_optimization_module_from_source(
+    source: &str,
+    module_name_gen: ModuleNameGen,
+    pass_tracker: &mut impl PassTracker,
+    runtime_names_as_globals: bool,
 ) -> Result<BlockPyModule<CodegenModuleShape>> {
     let module =
         pass_tracker.record_timing("parse", || -> std::result::Result<_, ParseError> {
@@ -174,7 +256,7 @@ pub(crate) fn rewrite_module_with_tracker_with_options(
     */
     let name_binding: BlockPyModule<ResolvedStorageModuleShape> =
         pass_tracker.run_pass("name_binding", || {
-            if options.runtime_names_as_globals {
+            if runtime_names_as_globals {
                 passes::lower_name_binding_in_core_blockpy_module_with_options(
                     core_blockpy_without_await_or_yield,
                     true,
@@ -201,6 +283,43 @@ pub(crate) fn rewrite_module_with_tracker_with_options(
         passes::relabel_dense_bb_module(&mut bb_codegen);
         passes::assign_module_instr_ids(bb_codegen)
     });
+
+    Ok(bb_codegen)
+}
+
+fn store_pre_optimization_cache(
+    cache_path: &Path,
+    module: &BlockPyModule<CodegenModuleShape>,
+    pass_tracker: &mut impl PassTracker,
+) {
+    let stored = pass_tracker.record_timing("bb_codegen_cache_store", || {
+        store_codegen_module_cache(cache_path, module)
+    });
+    match stored {
+        Ok(()) => {
+            info!(
+                target: "soac_blockpy_module_cache",
+                event = "soac.blockpy_module_cache_store",
+                path = %cache_path.display(),
+                "blockpy_module_cache_store",
+            );
+        }
+        Err(err) => {
+            warn!(
+                target: "soac_blockpy_module_cache",
+                event = "soac.blockpy_module_cache_store",
+                path = %cache_path.display(),
+                error = %err,
+                "blockpy_module_cache_store_failed",
+            );
+        }
+    }
+}
+
+fn finish_codegen_module_with_tracker(
+    bb_codegen: BlockPyModule<CodegenModuleShape>,
+    pass_tracker: &mut impl PassTracker,
+) -> Result<BlockPyModule<CodegenModuleShape>> {
     pass_tracker.record_timing("validate_codegen_instr_ids", || {
         passes::validate_codegen_instr_ids(&bb_codegen).map_err(anyhow::Error::msg)
     })?;

@@ -752,6 +752,16 @@ define_operation! {
     }
 }
 
+impl<E: Instr> MakeFunction<E> {
+    pub fn function_id(&self) -> FunctionId {
+        self.function_id
+    }
+
+    pub fn set_function_id(&mut self, function_id: FunctionId) {
+        self.function_id = function_id;
+    }
+}
+
 define_operation! {
     pub struct Await<E> {
         value: Box<E>,

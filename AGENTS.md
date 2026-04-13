@@ -322,8 +322,9 @@ anything non-code affected the run. If there were no such issues, say
 - Repo-local uv state
   `.envrc` and `Justfile` keep uv and XDG state under the repo with
   `UV_CACHE_DIR`, `UV_TOOL_DIR`, `UV_TOOL_BIN_DIR`, `XDG_CACHE_HOME`,
-  `XDG_DATA_HOME`, and `XDG_RUNTIME_DIR`. The `Justfile` respects pre-set values
-  for those variables. `just setup-dev-env` installs the repo-local `ruff`
+  `XDG_DATA_HOME`, `XDG_RUNTIME_DIR`, and `SOAC_MODULE_CACHE_DIR`. The
+  `Justfile` respects pre-set values for those variables. `just setup-dev-env`
+  installs the repo-local `ruff`
   command. Test and benchmark recipes use `UV_OFFLINE=1` for uv-backed venv
   refreshes; use `just update-venv` or rerun `just setup-dev-env` when
   dependency changes intentionally require network access.
@@ -331,10 +332,10 @@ anything non-code affected the run. If there were no such issues, say
   Optional override for `just setup-dev-env` in a jj worktree. The setup recipe
   normally infers the parent checkout from a file-backed `.jj/repo`; the parent
   owns shared offline state and `bench/` as a regular directory. The setup
-  recipe symlinks `vendor/cpython`, `bench/`, `.uv-cache`, `.uv/`, `.xdg/`, and
-  `tmp/cargo-home` from that parent into the worktree, and errors instead of
-  creating isolated empty offline caches when neither inference nor the override
-  can identify the parent.
+  recipe symlinks `vendor/cpython`, `bench/`, `.uv-cache`, `.uv/`, `.xdg/`,
+  `soac-module-cache`, and `tmp/cargo-home` from that parent into the worktree,
+  and errors instead of creating isolated empty offline caches when neither
+  inference nor the override can identify the parent.
   When sandboxing would otherwise block shared benchmark writes, run Codex with
   the worktree and parent checkout as writable roots, for example
   `--add-dir ../main-repo .`.
@@ -379,10 +380,10 @@ anything non-code affected the run. If there were no such issues, say
   of formatted stderr. Module-load timing is emitted by the
   `soac_module_load` target; JIT-codegen timing is emitted by
   `soac_jit_codegen`; apply-mode indexed specialization hit/fallback
-  summaries are emitted by `soac_specialization_runtime`. When
-  `SOAC_LOG` is unset and `SOAC_WORK_DIR` is set, the default event log
-  is `$SOAC_WORK_DIR/events.jsonl` and includes
-  `soac_specialization_runtime`.
+  summaries are emitted by `soac_specialization_runtime`; BlockPy module-cache
+  hits and stores are emitted by `soac_blockpy_module_cache`. When `SOAC_LOG` is
+  unset and `SOAC_WORK_DIR` is set, the default event log is
+  `$SOAC_WORK_DIR/events.jsonl` and includes `soac_specialization_runtime`.
 - `SOAC_PYTEST_TRACE` / `SOAC_PYTEST_EVENTS_LOG`
   `just pytest ...` and `just test-all` do not write the verbose JSON module
   load/JIT-codegen trace by default. Set `SOAC_PYTEST_TRACE=1` to enable it
@@ -393,6 +394,12 @@ anything non-code affected the run. If there were no such issues, say
   default. Set `SOAC_RUN_SLOW_TESTS=1` to include intentionally expensive tests
   such as broad import-hook coverage. Direct pytest invocations can also pass
   `--run-slow`.
+- `SOAC_MODULE_CACHE_DIR`
+  Directory for the shared pre-optimization BlockPy module cache. The cache uses
+  filenames keyed by source hash plus SOAC build identity, and cached modules
+  are remapped to the current `CompileSession` module id when loaded. `.envrc`
+  and the `Justfile` default this to `soac-module-cache`; set it explicitly
+  when running outside the recipes.
 - `SOAC_CRANELIFT_OPT_LEVEL`
   Optional Cranelift process-JIT optimization level override:
   `none`, `speed`, or `speed_and_size`. Normal runtime and benchmark
