@@ -188,10 +188,6 @@ unsafe extern "C" {
     fn PyObject_Size(obj: *mut c_void) -> isize;
     fn PyLong_AsLongLong(obj: *mut c_void) -> i64;
     fn PyLong_AsLongLongAndOverflow(obj: *mut c_void, overflow: *mut c_int) -> i64;
-    fn soac_runtime_decref_dealloc_preserving_error(
-        tstate: *mut RawPyThreadState,
-        obj: *mut RawPyObject,
-    );
     fn _PyDict_SetIndexedItem(dict: *mut c_void, index: isize, value: *mut c_void) -> i32;
     fn soac_runtime_load_global_slow(
         dict: *mut c_void,
@@ -277,6 +273,24 @@ macro_rules! decref_raw_with_tstate {
         let obj: *mut RawPyObject = $obj;
         let _ = unsafe { decref_impl(tstate, obj) };
     }};
+}
+
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub unsafe extern "C" fn soac_runtime_decref_dealloc_preserving_error(
+    tstate: *mut c_void,
+    obj: *mut c_void,
+) {
+    let tstate = tstate.cast::<RawPyThreadState>();
+    let obj = obj.cast::<RawPyObject>();
+    debug_assert!(!tstate.is_null());
+
+    let saved_error = unsafe { (*tstate).current_exception };
+    unsafe { (*tstate).current_exception = core::ptr::null_mut() };
+    unsafe { _Py_Dealloc(obj) };
+    if !saved_error.is_null() {
+        set_raised_exception_direct!(tstate, saved_error);
+    }
 }
 
 #[inline(always)]

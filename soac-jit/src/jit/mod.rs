@@ -11679,8 +11679,10 @@ struct RuntimeSupportInliner {
 impl RuntimeSupportInliner {
     fn for_module(jit_module: &mut JITModule) -> Result<Self, String> {
         let library = runtime_support_library()?;
+        let local_runtime_symbols = runtime_support_local_symbols(&library);
         let mut import_func_ids = HashMap::new();
         let mut import_data_ids = HashMap::new();
+        let mut local_func_ids = HashMap::new();
         let mut inlineable = HashMap::new();
         for parsed in &library.functions {
             if !matches!(
@@ -11696,21 +11698,23 @@ impl RuntimeSupportInliner {
             ) {
                 continue;
             }
-            let func_id = jit_module
-                .declare_function(&parsed.symbol, Linkage::Local, &parsed.function.signature)
-                .map_err(|err| {
-                    format!(
-                        "failed to declare inlineable runtime CLIF function {}: {err}",
-                        parsed.symbol
-                    )
-                })?;
+            let func_id = declare_runtime_clif_local_function(
+                jit_module,
+                &mut local_func_ids,
+                &parsed.symbol,
+                &parsed.function.signature,
+                "inlineable runtime CLIF function",
+            )?;
             let mut function = parsed.function.clone();
             remap_runtime_clif_extern_user_names(
                 jit_module,
                 &mut function,
                 &parsed.extern_symbols,
+                &parsed.runtime_function_symbols,
+                &local_runtime_symbols,
                 &parsed.global_extern_symbols,
                 &mut import_func_ids,
+                &mut local_func_ids,
                 &mut import_data_ids,
             )?;
             if function.dfg.num_insts() > RUNTIME_SUPPORT_INLINE_MAX_INSTS {
@@ -11927,6 +11931,7 @@ struct ParsedRuntimeClifFunction {
     symbol: String,
     function: ir::Function,
     extern_symbols: HashMap<ir::UserExternalName, String>,
+    runtime_function_symbols: HashMap<ir::UserExternalName, String>,
     global_extern_symbols: HashMap<u32, String>,
 }
 
@@ -11948,6 +11953,7 @@ fn parse_runtime_clif_functions() -> Result<Vec<ParsedRuntimeClifFunction>, Stri
             symbol: (*symbol).to_string(),
             function,
             extern_symbols: parse_runtime_clif_extern_symbols(clif_text)?,
+            runtime_function_symbols: parse_runtime_clif_runtime_function_symbols(clif_text)?,
             global_extern_symbols: parse_runtime_clif_global_extern_symbols(clif_text)?,
         });
     }
@@ -11959,10 +11965,13 @@ fn parse_runtime_clif_extern_symbols(
 ) -> Result<HashMap<ir::UserExternalName, String>, String> {
     let mut extern_symbols = HashMap::new();
     for line in clif_text.lines() {
+        if line.trim_start().starts_with(';') {
+            continue;
+        }
         if !line.contains("::{extern#") {
             continue;
         }
-        if !line.contains(" = u") {
+        if !line.contains("Instance {") {
             continue;
         }
         let Some(user_name) = parse_runtime_clif_user_name(line) else {
@@ -11978,6 +11987,32 @@ fn parse_runtime_clif_extern_symbols(
         extern_symbols.insert(user_name, symbol);
     }
     Ok(extern_symbols)
+}
+
+fn parse_runtime_clif_runtime_function_symbols(
+    clif_text: &str,
+) -> Result<HashMap<ir::UserExternalName, String>, String> {
+    let mut runtime_symbols = HashMap::new();
+    for line in clif_text.lines() {
+        if line.trim_start().starts_with(';') {
+            continue;
+        }
+        if !line.contains("Instance {") {
+            continue;
+        }
+        let Some(user_name) = parse_runtime_clif_user_name(line) else {
+            return Err(format!(
+                "failed to parse user function name from runtime CLIF line: {line}"
+            ));
+        };
+        let Some(symbol) = parse_runtime_clif_instance_symbol(line) else {
+            continue;
+        };
+        if symbol.starts_with("soac_runtime_") {
+            runtime_symbols.insert(user_name, symbol);
+        }
+    }
+    Ok(runtime_symbols)
 }
 
 fn parse_runtime_clif_global_extern_symbols(
@@ -12035,7 +12070,11 @@ fn parse_runtime_clif_user_name(line: &str) -> Option<ir::UserExternalName> {
 fn parse_runtime_clif_extern_symbol(line: &str) -> Option<String> {
     let extern_pos = line.find("::{extern#")?;
     let rest = line.get(extern_pos..)?;
-    let symbol = rest.rsplit("::").next()?;
+    parse_runtime_clif_instance_symbol(rest)
+}
+
+fn parse_runtime_clif_instance_symbol(line: &str) -> Option<String> {
+    let symbol = line.rsplit("::").next()?;
     let symbol_end = symbol
         .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
         .unwrap_or(symbol.len());
@@ -12046,12 +12085,45 @@ fn parse_runtime_clif_extern_symbol(line: &str) -> Option<String> {
     Some(symbol.to_string())
 }
 
+fn runtime_support_local_symbols(library: &RuntimeSupportLibrary) -> HashSet<String> {
+    library
+        .functions
+        .iter()
+        .filter(|parsed| {
+            !parsed
+                .symbol
+                .starts_with(SOAC_RUNTIME_EXAMPLE_SYMBOL_PREFIX)
+        })
+        .map(|parsed| parsed.symbol.clone())
+        .collect()
+}
+
+fn declare_runtime_clif_local_function(
+    jit_module: &mut JITModule,
+    local_func_ids: &mut HashMap<String, FuncId>,
+    symbol: &str,
+    signature: &ir::Signature,
+    description: &str,
+) -> Result<FuncId, String> {
+    if let Some(func_id) = local_func_ids.get(symbol) {
+        return Ok(*func_id);
+    }
+    let func_id = jit_module
+        .declare_function(symbol, Linkage::Local, signature)
+        .map_err(|err| format!("failed to declare {description} {symbol}: {err}"))?;
+    local_func_ids.insert(symbol.to_string(), func_id);
+    Ok(func_id)
+}
+
 fn remap_runtime_clif_extern_user_names(
     jit_module: &mut JITModule,
     function: &mut ir::Function,
     extern_symbols: &HashMap<ir::UserExternalName, String>,
+    runtime_function_symbols: &HashMap<ir::UserExternalName, String>,
+    local_runtime_symbols: &HashSet<String>,
     global_extern_symbols: &HashMap<u32, String>,
     import_func_ids: &mut HashMap<String, FuncId>,
+    local_func_ids: &mut HashMap<String, FuncId>,
     import_data_ids: &mut HashMap<String, cranelift_module::DataId>,
 ) -> Result<(), String> {
     let remaps = function
@@ -12068,7 +12140,20 @@ fn remap_runtime_clif_extern_user_names(
         .collect::<Vec<_>>();
 
     for (name_ref, original_name, sig_ref) in remaps {
-        let mapped_name = if let Some(symbol) = extern_symbols.get(&original_name) {
+        let mapped_name = if let Some(symbol) = runtime_function_symbols
+            .get(&original_name)
+            .filter(|symbol| local_runtime_symbols.contains(*symbol))
+        {
+            let sig = function.dfg.signatures[sig_ref].clone();
+            let local_id = declare_runtime_clif_local_function(
+                jit_module,
+                local_func_ids,
+                symbol,
+                &sig,
+                "runtime CLIF local symbol",
+            )?;
+            ir::UserExternalName::new(0, local_id.as_u32())
+        } else if let Some(symbol) = extern_symbols.get(&original_name) {
             let import_id = if let Some(import_id) = import_func_ids.get(symbol) {
                 *import_id
             } else {
@@ -12134,8 +12219,10 @@ fn load_runtime_support_clif(
     jit_module: &mut JITModule,
 ) -> Result<(), String> {
     let library = runtime_support_library()?;
+    let local_runtime_symbols = runtime_support_local_symbols(&library);
     let mut import_func_ids = HashMap::new();
     let mut import_data_ids = HashMap::new();
+    let mut local_func_ids = HashMap::new();
     for parsed in library.functions.iter().cloned() {
         if parsed
             .symbol
@@ -12143,21 +12230,23 @@ fn load_runtime_support_clif(
         {
             continue;
         }
-        let func_id = jit_module
-            .declare_function(&parsed.symbol, Linkage::Local, &parsed.function.signature)
-            .map_err(|err| {
-                format!(
-                    "failed to declare runtime CLIF function {}: {err}",
-                    parsed.symbol
-                )
-            })?;
+        let func_id = declare_runtime_clif_local_function(
+            jit_module,
+            &mut local_func_ids,
+            &parsed.symbol,
+            &parsed.function.signature,
+            "runtime CLIF function",
+        )?;
         let mut function = parsed.function;
         remap_runtime_clif_extern_user_names(
             jit_module,
             &mut function,
             &parsed.extern_symbols,
+            &parsed.runtime_function_symbols,
+            &local_runtime_symbols,
             &parsed.global_extern_symbols,
             &mut import_func_ids,
+            &mut local_func_ids,
             &mut import_data_ids,
         )?;
         let mut ctx = jit_module.make_context();

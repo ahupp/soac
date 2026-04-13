@@ -1,6 +1,5 @@
 #![cfg_attr(test, allow(dead_code, unused_imports))]
 
-use super::runtime_context::{set_raised_exception_direct, take_raised_exception_direct};
 use crate::module_constants::load_runtime_name_owned;
 use crate::module_constants::raise_name_error_for_missing_name;
 use crate::operator_specialization::{ExactIntBinaryOpKind, ExactIntUnaryOpKind};
@@ -24,7 +23,6 @@ unsafe extern "C" {
         index: ffi::Py_ssize_t,
         value: *mut ffi::PyObject,
     ) -> libc::c_int;
-    fn _Py_Dealloc(obj: *mut ffi::PyObject);
     fn _PyDict_IndexedKeyIndex(
         dict: *mut ffi::PyObject,
         key: *mut ffi::PyObject,
@@ -55,19 +53,6 @@ unsafe extern "C" {
 
 pub type ObjPtr = *mut c_void;
 
-#[cold]
-#[inline(never)]
-unsafe extern "C" fn soac_runtime_decref_dealloc_preserving_error(tstate: ObjPtr, obj: ObjPtr) {
-    assert!(
-        !tstate.is_null(),
-        "soac_runtime_decref_dealloc_preserving_error requires a non-null PyThreadState"
-    );
-    let saved_error = unsafe { take_raised_exception_direct(tstate) };
-    unsafe { _Py_Dealloc(obj.cast::<ffi::PyObject>()) };
-    if !saved_error.is_null() {
-        unsafe { set_raised_exception_direct(tstate, saved_error) };
-    }
-}
 #[repr(C)]
 struct SoacPyLongValue {
     lv_tag: usize,
@@ -1743,10 +1728,6 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol(
         "soac_runtime_set_runtime_error_static",
         soac_runtime_set_runtime_error_static as *const u8,
-    );
-    builder.symbol(
-        "soac_runtime_decref_dealloc_preserving_error",
-        soac_runtime_decref_dealloc_preserving_error as *const u8,
     );
     builder.symbol(
         "dp_jit_py_call_positional_three",

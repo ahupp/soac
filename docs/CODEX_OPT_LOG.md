@@ -561,3 +561,21 @@ benchmarked throughput delta, and the headline pre/post numbers.
   - specialized pass, 1M loops x3: `373208`, `366708`, `371067 loops/s`
   - pystone JIT code bytes: `176723`
   - pystone machine blocks: `11259`
+
+## 2026-04-13 - Outline decref dealloc preservation
+
+- jj change id: `pmmnxlnu`
+- summary: The exception-preserving refcount-zero dealloc path now lives in a
+  non-inlined generated runtime CLIF helper and runtime-CLIF calls to generated
+  runtime functions are remapped as local JIT functions, removing duplicated
+  dealloc-preservation code from inlined decref/store fast paths.
+- throughput: `+0.22%` specialized pystone median; code size `-5.44%`;
+  machine blocks `+0.03%`
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `411595`, `406691`, `405697 loops/s`
+  - pystone JIT code bytes: `271819`
+  - pystone machine blocks: `17385`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `417360`, `407568`, `405675 loops/s`
+  - pystone JIT code bytes: `257025`
+  - pystone machine blocks: `17390`
