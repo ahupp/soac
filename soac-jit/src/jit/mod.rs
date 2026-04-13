@@ -4182,7 +4182,7 @@ fn emit_decref_owned_inputs_after_nullable_result(
     result
 }
 
-fn emit_checked_owned_pyobject_call_with_cleanup(
+fn emit_nullable_pyobject_call_with_cleanup(
     fb: &mut FunctionBuilder<'_>,
     ctx: &JitEmitCtx<'_>,
     func_ref: ir::FuncRef,
@@ -4190,13 +4190,86 @@ fn emit_checked_owned_pyobject_call_with_cleanup(
     owned_inputs: &[ir::Value],
 ) -> ir::Value {
     let call_inst = fb.ins().call(func_ref, args);
-    let value = emit_decref_owned_inputs_after_nullable_result(
+    emit_decref_owned_inputs_after_nullable_result(
         fb,
         ctx,
         fb.inst_results(call_inst)[0],
         owned_inputs,
+    )
+}
+
+fn emit_checked_owned_pyobject_result_for_demand(
+    fb: &mut FunctionBuilder<'_>,
+    value: ir::Value,
+    facts: PyObjFacts,
+    ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+) -> EmitResult {
+    match demand {
+        ResultDemand::EffectOnly => {
+            let null_ptr = fb.ins().iconst(ctx.consts.ptr_ty, 0);
+            let value_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, value, null_ptr);
+            let value_ok_block = fb.create_block();
+            fb.ins().brif(
+                value_is_null,
+                ctx.consts.step_null_block,
+                &step_null_block_args(ctx),
+                value_ok_block,
+                &[],
+            );
+            fb.switch_to_block(value_ok_block);
+            fb.ins()
+                .call(ctx.decref_ref, &[ctx.consts.thread_state_value, value]);
+            EmitResult::no_value()
+        }
+        ResultDemand::PyObject { .. } => {
+            let value = emit_checked_owned_pyobject_result(fb, value, ctx);
+            EmitResult::owned_pyobject(value, facts)
+        }
+        ResultDemand::I32Bool01 => {
+            panic!("owned PyObject result helper cannot satisfy I32Bool01 demand")
+        }
+        ResultDemand::I64 => {
+            panic!("owned PyObject result helper cannot satisfy I64 demand")
+        }
+        ResultDemand::I64Index => {
+            panic!("owned PyObject result helper cannot satisfy I64Index demand")
+        }
+    }
+}
+
+fn emit_checked_owned_pyobject_call_result_with_cleanup(
+    fb: &mut FunctionBuilder<'_>,
+    ctx: &JitEmitCtx<'_>,
+    func_ref: ir::FuncRef,
+    args: &[ir::Value],
+    owned_inputs: &[ir::Value],
+    demand: ResultDemand,
+    facts: PyObjFacts,
+) -> EmitResult {
+    let value = emit_nullable_pyobject_call_with_cleanup(fb, ctx, func_ref, args, owned_inputs);
+    emit_checked_owned_pyobject_result_for_demand(fb, value, facts, ctx, demand)
+}
+
+fn emit_checked_owned_pyobject_call_with_cleanup(
+    fb: &mut FunctionBuilder<'_>,
+    ctx: &JitEmitCtx<'_>,
+    func_ref: ir::FuncRef,
+    args: &[ir::Value],
+    owned_inputs: &[ir::Value],
+) -> ir::Value {
+    let result = emit_checked_owned_pyobject_call_result_with_cleanup(
+        fb,
+        ctx,
+        func_ref,
+        args,
+        owned_inputs,
+        ResultDemand::PYOBJECT_OWNED,
+        PyObjFacts::unknown(),
     );
-    emit_checked_owned_pyobject_result(fb, value, ctx)
+    let (value, ownership, _) = result.expect_pyobject("checked owned PyObject call");
+    debug_assert!(ownership.is_owned());
+    value
 }
 
 fn emit_checked_owned_pyobject_call_value_with_cleanup(
@@ -4891,24 +4964,53 @@ fn emit_positional_vectorcall_with_local_env(
 ) -> ir::Value {
     let (arg_values, arg_borrowed) =
         emit_positional_arg_values(fb, args, local_env, ctx, jit_module, func_imports);
-    emit_positional_vectorcall_with_arg_values(
+    let result = emit_positional_vectorcall_result_with_arg_values(
         fb,
         callable,
         callable_is_borrowed,
         arg_values,
         arg_borrowed,
         ctx,
+        ResultDemand::PYOBJECT_OWNED,
+    );
+    let (value, ownership, _) = result.expect_pyobject("positional vectorcall result");
+    debug_assert!(ownership.is_owned());
+    value
+}
+
+fn emit_positional_vectorcall_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    callable: ir::Value,
+    callable_is_borrowed: bool,
+    args: &[&InstrCodegen],
+    local_env: &mut LocalEnv,
+    ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+    demand: ResultDemand,
+) -> EmitResult {
+    let (arg_values, arg_borrowed) =
+        emit_positional_arg_values(fb, args, local_env, ctx, jit_module, func_imports);
+    emit_positional_vectorcall_result_with_arg_values(
+        fb,
+        callable,
+        callable_is_borrowed,
+        arg_values,
+        arg_borrowed,
+        ctx,
+        demand,
     )
 }
 
-fn emit_positional_vectorcall_with_arg_values(
+fn emit_positional_vectorcall_result_with_arg_values(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
     callable_is_borrowed: bool,
     arg_values: Vec<ir::Value>,
     arg_borrowed: Vec<bool>,
     ctx: &JitEmitCtx<'_>,
-) -> ir::Value {
+    demand: ResultDemand,
+) -> EmitResult {
     debug_assert_eq!(arg_values.len(), arg_borrowed.len());
     let ptr_ty = ctx.consts.ptr_ty;
     let null_ptr = fb.ins().iconst(ptr_ty, 0);
@@ -4941,7 +5043,7 @@ fn emit_positional_vectorcall_with_arg_values(
         ],
     );
     let call_value = fb.inst_results(call_inst)[0];
-    emit_checked_positional_call_result(
+    emit_checked_positional_call_result_for_demand(
         fb,
         callable,
         callable_is_borrowed,
@@ -4949,6 +5051,7 @@ fn emit_positional_vectorcall_with_arg_values(
         arg_borrowed,
         call_value,
         ctx,
+        demand,
     )
 }
 
@@ -4965,13 +5068,42 @@ fn emit_positional_call_three_with_local_env(
     debug_assert!(args.len() <= 3);
     let (arg_values, arg_borrowed) =
         emit_positional_arg_values(fb, args, local_env, ctx, jit_module, func_imports);
-    emit_positional_call_three_with_arg_values(
+    let result = emit_positional_call_three_result_with_arg_values(
         fb,
         callable,
         callable_is_borrowed,
         arg_values,
         arg_borrowed,
         ctx,
+        ResultDemand::PYOBJECT_OWNED,
+    );
+    let (value, ownership, _) = result.expect_pyobject("positional call-three result");
+    debug_assert!(ownership.is_owned());
+    value
+}
+
+fn emit_positional_call_three_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    callable: ir::Value,
+    callable_is_borrowed: bool,
+    args: &[&InstrCodegen],
+    local_env: &mut LocalEnv,
+    ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+    demand: ResultDemand,
+) -> EmitResult {
+    debug_assert!(args.len() <= 3);
+    let (arg_values, arg_borrowed) =
+        emit_positional_arg_values(fb, args, local_env, ctx, jit_module, func_imports);
+    emit_positional_call_three_result_with_arg_values(
+        fb,
+        callable,
+        callable_is_borrowed,
+        arg_values,
+        arg_borrowed,
+        ctx,
+        demand,
     )
 }
 
@@ -5002,14 +5134,15 @@ fn emit_positional_arg_values(
     (arg_values, arg_borrowed)
 }
 
-fn emit_positional_call_three_with_arg_values(
+fn emit_positional_call_three_result_with_arg_values(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
     callable_is_borrowed: bool,
     arg_values: Vec<ir::Value>,
     arg_borrowed: Vec<bool>,
     ctx: &JitEmitCtx<'_>,
-) -> ir::Value {
+    demand: ResultDemand,
+) -> EmitResult {
     debug_assert_eq!(arg_values.len(), arg_borrowed.len());
     debug_assert!(arg_values.len() <= 3);
     let null_ptr = fb.ins().iconst(ctx.consts.ptr_ty, 0);
@@ -5028,7 +5161,7 @@ fn emit_positional_call_three_with_arg_values(
         ],
     );
     let call_value = fb.inst_results(call_inst)[0];
-    emit_checked_positional_call_result(
+    emit_checked_positional_call_result_for_demand(
         fb,
         callable,
         callable_is_borrowed,
@@ -5036,10 +5169,11 @@ fn emit_positional_call_three_with_arg_values(
         arg_borrowed,
         call_value,
         ctx,
+        demand,
     )
 }
 
-fn emit_checked_positional_call_result(
+fn emit_checked_positional_call_result_for_demand(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
     callable_is_borrowed: bool,
@@ -5047,7 +5181,8 @@ fn emit_checked_positional_call_result(
     arg_borrowed: Vec<bool>,
     call_value: ir::Value,
     ctx: &JitEmitCtx<'_>,
-) -> ir::Value {
+    demand: ResultDemand,
+) -> EmitResult {
     let mut owned_inputs =
         Vec::with_capacity(arg_values.len() + usize::from(!callable_is_borrowed));
     for (value, borrowed_arg) in arg_values.into_iter().zip(arg_borrowed.into_iter()) {
@@ -5060,17 +5195,24 @@ fn emit_checked_positional_call_result(
     }
     let call_value =
         emit_decref_owned_inputs_after_nullable_result(fb, ctx, call_value, &owned_inputs);
-    emit_checked_owned_pyobject_result(fb, call_value, ctx)
+    emit_checked_owned_pyobject_result_for_demand(
+        fb,
+        call_value,
+        PyObjFacts::unknown(),
+        ctx,
+        demand,
+    )
 }
 
-fn emit_object_call_with_tuple_args(
+fn emit_object_call_with_tuple_args_result(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
     callable_is_borrowed: bool,
     call_args_tuple: ir::Value,
     kwargs_obj: Option<ir::Value>,
     ctx: &JitEmitCtx<'_>,
-) -> ir::Value {
+    demand: ResultDemand,
+) -> EmitResult {
     let mut owned_inputs = Vec::with_capacity(3);
     if let Some(kwargs_obj) = kwargs_obj {
         owned_inputs.push(kwargs_obj);
@@ -5087,12 +5229,14 @@ fn emit_object_call_with_tuple_args(
     } else {
         (ctx.py_call_object_ref, vec![callable, call_args_tuple])
     };
-    emit_checked_owned_pyobject_call_with_cleanup(
+    emit_checked_owned_pyobject_call_result_with_cleanup(
         fb,
         ctx,
         func_ref,
         args.as_slice(),
         owned_inputs.as_slice(),
+        demand,
+        PyObjFacts::unknown(),
     )
 }
 
@@ -5163,7 +5307,7 @@ fn emit_one_arg_method_call_and_discard(
         owned_inputs.push(value_obj);
     }
     owned_inputs.push(method_obj);
-    let call_value = emit_checked_owned_pyobject_call_with_cleanup(
+    let _ = emit_checked_owned_pyobject_call_result_with_cleanup(
         fb,
         ctx,
         ctx.py_call_positional_three_ref,
@@ -5176,9 +5320,9 @@ fn emit_one_arg_method_call_and_discard(
             null_ptr,
         ],
         owned_inputs.as_slice(),
+        ResultDemand::EffectOnly,
+        PyObjFacts::unknown(),
     );
-    fb.ins()
-        .call(ctx.decref_ref, &[ctx.consts.thread_state_value, call_value]);
 }
 
 fn emit_kwargs_setitem_or_cleanup(
@@ -5237,6 +5381,36 @@ fn emit_keyword_call_with_local_env(
     jit_module: &mut JITModule,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> ir::Value {
+    let result = emit_keyword_call_result_with_local_env(
+        fb,
+        callable,
+        callable_is_borrowed,
+        args,
+        keywords,
+        local_env,
+        ctx,
+        jit_module,
+        func_imports,
+        ResultDemand::PYOBJECT_OWNED,
+    );
+    let (value, ownership, _) = result.expect_pyobject("keyword call result");
+    debug_assert!(ownership.is_owned());
+    value
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_keyword_call_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    callable: ir::Value,
+    callable_is_borrowed: bool,
+    args: &[&InstrCodegen],
+    keywords: &[(&str, &InstrCodegen)],
+    local_env: &mut LocalEnv,
+    ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+    demand: ResultDemand,
+) -> EmitResult {
     let mut tuple_items: Vec<(ir::Value, bool)> = Vec::with_capacity(args.len());
     for arg in args {
         let borrowed_arg =
@@ -5293,13 +5467,14 @@ fn emit_keyword_call_with_local_env(
         );
     }
 
-    emit_object_call_with_tuple_args(
+    emit_object_call_with_tuple_args_result(
         fb,
         callable,
         callable_is_borrowed,
         call_args_tuple,
         Some(kwargs_obj),
         ctx,
+        demand,
     )
 }
 
@@ -5314,6 +5489,36 @@ fn emit_unpack_call_with_local_env(
     jit_module: &mut JITModule,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> ir::Value {
+    let result = emit_unpack_call_result_with_local_env(
+        fb,
+        callable,
+        callable_is_borrowed,
+        args,
+        keywords,
+        local_env,
+        ctx,
+        jit_module,
+        func_imports,
+        ResultDemand::PYOBJECT_OWNED,
+    );
+    let (value, ownership, _) = result.expect_pyobject("unpack call result");
+    debug_assert!(ownership.is_owned());
+    value
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_unpack_call_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    callable: ir::Value,
+    callable_is_borrowed: bool,
+    args: &[CallArgPositional<InstrCodegen>],
+    keywords: &[CallArgKeyword<InstrCodegen>],
+    local_env: &mut LocalEnv,
+    ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+    demand: ResultDemand,
+) -> EmitResult {
     let ptr_ty = ctx.consts.ptr_ty;
     let null_ptr = fb.ins().iconst(ptr_ty, 0);
 
@@ -5441,13 +5646,14 @@ fn emit_unpack_call_with_local_env(
         &[tuple_callable, args_list],
     );
 
-    emit_object_call_with_tuple_args(
+    emit_object_call_with_tuple_args_result(
         fb,
         callable,
         callable_is_borrowed,
         call_args_tuple,
         kwargs_obj,
         ctx,
+        demand,
     )
 }
 
@@ -8100,16 +8306,13 @@ fn emit_typed_codegen_expr_value_with_local_env(
     ))
 }
 
-fn emit_codegen_simple_call_with_local_env(
-    fb: &mut FunctionBuilder<'_>,
-    call: &soac_blockpy::block_py::Call<InstrCodegen>,
-    local_env: &mut LocalEnv,
-    emit_ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
-    func_imports: &mut FuncBuildImports<'_>,
-) -> Option<ir::Value> {
-    let ptr_ty = emit_ctx.consts.ptr_ty;
-    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+struct SimpleCallParts<'a> {
+    simple_args: Vec<&'a InstrCodegen>,
+    simple_keywords: Vec<(&'a str, &'a InstrCodegen)>,
+    has_unpack: bool,
+}
+
+fn simple_call_parts(call: &soac_blockpy::block_py::Call<InstrCodegen>) -> SimpleCallParts<'_> {
     let mut simple_args: Vec<&InstrCodegen> = Vec::new();
     let mut simple_keywords: Vec<(&str, &InstrCodegen)> = Vec::new();
     let mut has_unpack = false;
@@ -8125,6 +8328,171 @@ fn emit_codegen_simple_call_with_local_env(
             CallArgKeyword::Starred(_) => has_unpack = true,
         }
     }
+    SimpleCallParts {
+        simple_args,
+        simple_keywords,
+        has_unpack,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_codegen_simple_call_effect_only_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    call: &soac_blockpy::block_py::Call<InstrCodegen>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Option<EmitResult> {
+    let SimpleCallParts {
+        simple_args,
+        simple_keywords,
+        has_unpack,
+    } = simple_call_parts(call);
+
+    if has_unpack {
+        let callable_is_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
+            call.func.as_ref(),
+            local_env,
+            emit_ctx,
+        );
+        let callable = emit_codegen_expr_with_local_env(
+            fb,
+            call.func.as_ref(),
+            local_env,
+            emit_ctx,
+            callable_is_borrowed,
+            jit_module,
+            func_imports,
+        );
+        return Some(emit_unpack_call_result_with_local_env(
+            fb,
+            callable,
+            callable_is_borrowed,
+            call.args.as_slice(),
+            call.keywords.as_slice(),
+            local_env,
+            emit_ctx,
+            jit_module,
+            func_imports,
+            ResultDemand::EffectOnly,
+        ));
+    }
+
+    if !simple_keywords.is_empty() {
+        let callable_is_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
+            call.func.as_ref(),
+            local_env,
+            emit_ctx,
+        );
+        let callable = emit_codegen_expr_with_local_env(
+            fb,
+            call.func.as_ref(),
+            local_env,
+            emit_ctx,
+            callable_is_borrowed,
+            jit_module,
+            func_imports,
+        );
+        return Some(emit_keyword_call_result_with_local_env(
+            fb,
+            callable,
+            callable_is_borrowed,
+            simple_args.as_slice(),
+            simple_keywords.as_slice(),
+            local_env,
+            emit_ctx,
+            jit_module,
+            func_imports,
+            ResultDemand::EffectOnly,
+        ));
+    }
+
+    if codegen_expr_runtime_helper(call.func.as_ref(), emit_ctx).is_some() {
+        return None;
+    }
+    if simple_args.len() == 3
+        && matches!(
+            codegen_expr_helper_name(call.func.as_ref(), emit_ctx.module_constants),
+            Some("call_super")
+        )
+    {
+        return None;
+    }
+
+    let site_instr_id = call.try_semantic_instr_id();
+    if !direct_constructor_specializations_for_call_site(call, emit_ctx).is_empty()
+        || !direct_method_specializations_for_call_site(call, emit_ctx).is_empty()
+        || site_instr_id
+            .and_then(|site_instr_id| emit_ctx.call_target_specializations.get(&site_instr_id))
+            .is_some_and(|targets| !targets.is_empty())
+    {
+        return None;
+    }
+
+    let callable_is_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
+        call.func.as_ref(),
+        local_env,
+        emit_ctx,
+    );
+    let callable = emit_codegen_expr_with_local_env(
+        fb,
+        call.func.as_ref(),
+        local_env,
+        emit_ctx,
+        callable_is_borrowed,
+        jit_module,
+        func_imports,
+    );
+    if let Some(counter_id) = site_instr_id
+        .and_then(|site_instr_id| emit_ctx.call_target_counter_ids.get(&site_instr_id))
+        .copied()
+    {
+        let callee_id = emit_callee_function_id_checked(fb, callable, emit_ctx, jit_module);
+        emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
+    }
+    Some(if simple_args.len() <= 3 {
+        emit_positional_call_three_result_with_local_env(
+            fb,
+            callable,
+            callable_is_borrowed,
+            simple_args.as_slice(),
+            local_env,
+            emit_ctx,
+            jit_module,
+            func_imports,
+            ResultDemand::EffectOnly,
+        )
+    } else {
+        emit_positional_vectorcall_result_with_local_env(
+            fb,
+            callable,
+            callable_is_borrowed,
+            simple_args.as_slice(),
+            local_env,
+            emit_ctx,
+            jit_module,
+            func_imports,
+            ResultDemand::EffectOnly,
+        )
+    })
+}
+
+fn emit_codegen_simple_call_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    call: &soac_blockpy::block_py::Call<InstrCodegen>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Option<ir::Value> {
+    let ptr_ty = emit_ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let SimpleCallParts {
+        simple_args,
+        simple_keywords,
+        has_unpack,
+    } = simple_call_parts(call);
 
     if !has_unpack
         && simple_keywords.is_empty()
@@ -9189,26 +9557,96 @@ fn runtime_primitive_import_spec(desc: &DirectCallableDesc) -> &'static ImportSp
     }
 }
 
-fn codegen_expr_can_satisfy_i64_demand(
+fn runtime_primitive_i64_result_facts(desc: &DirectCallableDesc) -> IntFacts {
+    match desc.target {
+        DirectTargetId::RuntimePrimitive(direct_abi::RuntimePrimitiveId::BuiltinOrdI64) => {
+            IntFacts::i64_range(IntRange {
+                min: 0,
+                max: 0x10ffff,
+            })
+        }
+        DirectTargetId::RuntimePrimitive(direct_abi::RuntimePrimitiveId::BuiltinLenI64) => {
+            IntFacts::i64_range(IntRange {
+                min: 0,
+                max: i64::MAX as i128,
+            })
+        }
+        DirectTargetId::RuntimePrimitive(_) | DirectTargetId::PythonFunction(_) => {
+            IntFacts::i64_unknown()
+        }
+    }
+}
+
+fn i64_binop_result_facts(
+    kind: blockpy_intrinsics::BinOpKind,
+    lhs_facts: IntFacts,
+    rhs_facts: IntFacts,
+) -> Option<IntFacts> {
+    if lhs_facts.width != IntWidth::I64 || rhs_facts.width != IntWidth::I64 {
+        return None;
+    }
+    let lhs_range = lhs_facts.range?;
+    let rhs_range = rhs_facts.range?;
+    let result_range = match kind {
+        blockpy_intrinsics::BinOpKind::Add => lhs_range.checked_add(rhs_range)?,
+        blockpy_intrinsics::BinOpKind::Sub => lhs_range.checked_sub(rhs_range)?,
+        _ => return None,
+    };
+    if !result_range.is_within(IntRange::I64) {
+        return None;
+    }
+    let known_value = match (lhs_facts.known_value, rhs_facts.known_value) {
+        (Some(lhs), Some(rhs)) => match kind {
+            blockpy_intrinsics::BinOpKind::Add => lhs.checked_add(rhs),
+            blockpy_intrinsics::BinOpKind::Sub => lhs.checked_sub(rhs),
+            _ => None,
+        },
+        _ => None,
+    };
+    Some(IntFacts {
+        width: IntWidth::I64,
+        known_value,
+        range: Some(result_range),
+    })
+}
+
+fn codegen_expr_i64_demand_facts(
     expr: &InstrCodegen,
     local_env: &LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
-) -> bool {
-    if codegen_expr_const_i64(expr, emit_ctx.module_constants).is_some() {
-        return true;
+) -> Option<IntFacts> {
+    if let Some(value) = codegen_expr_const_i64(expr, emit_ctx.module_constants) {
+        return Some(IntFacts::i64_known(value));
     }
     match expr {
         InstrCodegen::Call(call) => {
             let Some(desc) =
                 static_runtime_primitive_desc_for_call(call, emit_ctx.module_constants)
             else {
-                return false;
+                return None;
             };
-            matches!(desc.abi.result, ResultAbi::I64)
-                && runtime_primitive_call_params_can_satisfy_abi(call, desc, local_env, emit_ctx)
+            if !matches!(desc.abi.result, ResultAbi::I64)
+                || !runtime_primitive_call_params_can_satisfy_abi(call, desc, local_env, emit_ctx)
+            {
+                return None;
+            }
+            Some(runtime_primitive_i64_result_facts(desc))
         }
-        _ => false,
+        InstrCodegen::BinOp(op) => {
+            let lhs_facts = codegen_expr_i64_demand_facts(op.left.as_ref(), local_env, emit_ctx)?;
+            let rhs_facts = codegen_expr_i64_demand_facts(op.right.as_ref(), local_env, emit_ctx)?;
+            i64_binop_result_facts(op.kind, lhs_facts, rhs_facts)
+        }
+        _ => None,
     }
+}
+
+fn codegen_expr_can_satisfy_i64_demand(
+    expr: &InstrCodegen,
+    local_env: &LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+) -> bool {
+    codegen_expr_i64_demand_facts(expr, local_env, emit_ctx).is_some()
 }
 
 fn codegen_expr_has_exact_int_pyobject_facts(
@@ -9279,22 +9717,41 @@ fn codegen_expr_static_can_satisfy_i64_demand(
     expr: &InstrCodegen,
     module_constants: &ModuleCodegenConstants,
 ) -> bool {
-    if codegen_expr_const_i64(expr, module_constants).is_some() {
-        return true;
+    codegen_expr_static_i64_demand_facts(expr, module_constants).is_some()
+}
+
+#[cfg(test)]
+fn codegen_expr_static_i64_demand_facts(
+    expr: &InstrCodegen,
+    module_constants: &ModuleCodegenConstants,
+) -> Option<IntFacts> {
+    if let Some(value) = codegen_expr_const_i64(expr, module_constants) {
+        return Some(IntFacts::i64_known(value));
     }
     match expr {
         InstrCodegen::Call(call) => {
             let Some(desc) = static_runtime_primitive_desc_for_call(call, module_constants) else {
-                return false;
+                return None;
             };
-            matches!(desc.abi.result, ResultAbi::I64)
-                && runtime_primitive_call_static_params_can_satisfy_abi(
+            if !matches!(desc.abi.result, ResultAbi::I64)
+                || !runtime_primitive_call_static_params_can_satisfy_abi(
                     call,
                     desc,
                     module_constants,
                 )
+            {
+                return None;
+            }
+            Some(runtime_primitive_i64_result_facts(desc))
         }
-        _ => false,
+        InstrCodegen::BinOp(op) => {
+            let lhs_facts =
+                codegen_expr_static_i64_demand_facts(op.left.as_ref(), module_constants)?;
+            let rhs_facts =
+                codegen_expr_static_i64_demand_facts(op.right.as_ref(), module_constants)?;
+            i64_binop_result_facts(op.kind, lhs_facts, rhs_facts)
+        }
+        _ => None,
     }
 }
 
@@ -9384,6 +9841,57 @@ fn emit_i64_result_for_demand(
             EmitResult::owned_pyobject(boxed, boxed_facts)
         }
     }
+}
+
+fn emit_i64_binop_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    op: &blockpy_intrinsics::BinOp<InstrCodegen>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Option<EmitResult> {
+    if !matches!(demand, ResultDemand::I64 | ResultDemand::I64Index) {
+        return None;
+    }
+    let lhs_facts = codegen_expr_i64_demand_facts(op.left.as_ref(), local_env, emit_ctx)?;
+    let rhs_facts = codegen_expr_i64_demand_facts(op.right.as_ref(), local_env, emit_ctx)?;
+    let result_facts = i64_binop_result_facts(op.kind, lhs_facts, rhs_facts)?;
+    let lhs = emit_codegen_stmt_result_with_local_env(
+        fb,
+        op.left.as_ref(),
+        local_env,
+        emit_ctx,
+        ResultDemand::I64_VALUE,
+        jit_module,
+        func_imports,
+    )
+    .expect("I64-capable BinOp left operand should emit");
+    let (lhs, _) = lhs.expect_i64("I64 BinOp left operand");
+    let rhs = emit_codegen_stmt_result_with_local_env(
+        fb,
+        op.right.as_ref(),
+        local_env,
+        emit_ctx,
+        ResultDemand::I64_VALUE,
+        jit_module,
+        func_imports,
+    )
+    .expect("I64-capable BinOp right operand should emit");
+    let (rhs, _) = rhs.expect_i64("I64 BinOp right operand");
+    let value = match op.kind {
+        blockpy_intrinsics::BinOpKind::Add => fb.ins().iadd(lhs, rhs),
+        blockpy_intrinsics::BinOpKind::Sub => fb.ins().isub(lhs, rhs),
+        _ => unreachable!("unsupported I64 BinOp should not pass demand analysis"),
+    };
+    Some(emit_i64_result_for_demand(
+        fb,
+        value,
+        result_facts,
+        emit_ctx,
+        demand,
+    ))
 }
 
 fn emit_exact_pylong_as_i64_saturating_result_with_local_env(
@@ -9538,7 +10046,13 @@ fn emit_runtime_primitive_result_for_demand(
                     raw_result
                 }
             };
-            emit_i64_result_for_demand(fb, value, IntFacts::i64_unknown(), emit_ctx, demand)
+            emit_i64_result_for_demand(
+                fb,
+                value,
+                runtime_primitive_i64_result_facts(desc),
+                emit_ctx,
+                demand,
+            )
         }
         ResultAbi::PyObject {
             ownership: ValueOwnership::Owned,
@@ -9672,6 +10186,18 @@ fn emit_codegen_call_result_with_local_env(
     ) {
         return Some(result);
     }
+    if demand == ResultDemand::EffectOnly
+        && let Some(result) = emit_codegen_simple_call_effect_only_with_local_env(
+            fb,
+            call,
+            local_env,
+            emit_ctx,
+            jit_module,
+            func_imports,
+        )
+    {
+        return Some(result);
+    }
     emit_codegen_simple_call_with_local_env(fb, call, local_env, emit_ctx, jit_module, func_imports)
         .map(|value| {
             emit_owned_pyobject_result_for_demand(
@@ -9744,6 +10270,19 @@ fn emit_codegen_stmt_result_with_local_env(
             if let Some(result) =
                 emit_local_delete_result_with_local_env(fb, op, local_env, emit_ctx, demand)
             {
+                return Ok(result);
+            }
+        }
+        InstrCodegen::BinOp(op) => {
+            if let Some(result) = emit_i64_binop_result_with_local_env(
+                fb,
+                op,
+                local_env,
+                emit_ctx,
+                demand,
+                jit_module,
+                func_imports,
+            ) {
                 return Ok(result);
             }
         }

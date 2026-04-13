@@ -996,6 +996,7 @@ def f():
             .module_constants
             .push(InstrResolved::Load(Load::new(test_runtime_name("ord"))));
         module.module_constants.push(int_literal(65));
+        module.module_constants.push(int_literal(1));
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
         let arg = name_expr(test_name("x"));
@@ -1005,6 +1006,12 @@ def f():
             vec![],
         ));
         let int_constant = name_expr(test_constant_name(1));
+        let one_constant = name_expr(test_constant_name(2));
+        let ord_plus_one = op_expr(BinOp::new(
+            BinOpKind::Add,
+            Box::new(ord_call.clone()),
+            Box::new(one_constant),
+        ));
 
         assert!(codegen_expr_static_can_satisfy_i64_demand(
             &ord_call,
@@ -1014,6 +1021,18 @@ def f():
             &int_constant,
             &module_constants
         ));
+        assert!(codegen_expr_static_can_satisfy_i64_demand(
+            &ord_plus_one,
+            &module_constants
+        ));
+        assert_eq!(
+            codegen_expr_static_i64_demand_facts(&ord_plus_one, &module_constants)
+                .and_then(|facts| facts.range),
+            Some(IntRange {
+                min: 1,
+                max: 0x110000
+            })
+        );
     }
 
     #[test]

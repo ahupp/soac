@@ -608,3 +608,21 @@ benchmarked throughput delta, and the headline pre/post numbers.
   - specialized pass, 1M loops x3: `417360`, `407568`, `405675 loops/s`
   - pystone JIT code bytes: `257025`
   - pystone machine blocks: `17390`
+
+## 2026-04-13 - Keep scalar builtin chains unboxed
+
+- jj change id: `tlxlmktz`
+- summary: Bounded I64 demand now propagates through Add/Sub, letting hot
+  `chr(ord(x) + 1)` codegen keep the `ord` result unboxed until the `chr`
+  runtime primitive consumes it instead of boxing through PyLong and generic
+  Python addition.
+- throughput: `+1.84%` specialized pystone median; code size `-0.41%`;
+  machine blocks `-0.26%`
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `421455`, `421742`, `420594 loops/s`
+  - pystone JIT code bytes: `257353`
+  - pystone machine blocks: `17384`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `425734`, `429207`, `432758 loops/s`
+  - pystone JIT code bytes: `256306`
+  - pystone machine blocks: `17339`

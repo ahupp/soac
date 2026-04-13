@@ -15,6 +15,10 @@ pub struct IntRange {
 
 impl IntRange {
     pub const ZERO_OR_ONE: Self = Self { min: 0, max: 1 };
+    pub const I64: Self = Self {
+        min: i64::MIN as i128,
+        max: i64::MAX as i128,
+    };
 
     pub const fn exact(value: i128) -> Self {
         Self {
@@ -25,6 +29,20 @@ impl IntRange {
 
     pub const fn is_within(self, outer: Self) -> bool {
         self.min >= outer.min && self.max <= outer.max
+    }
+
+    pub fn checked_add(self, rhs: Self) -> Option<Self> {
+        Some(Self {
+            min: self.min.checked_add(rhs.min)?,
+            max: self.max.checked_add(rhs.max)?,
+        })
+    }
+
+    pub fn checked_sub(self, rhs: Self) -> Option<Self> {
+        Some(Self {
+            min: self.min.checked_sub(rhs.max)?,
+            max: self.max.checked_sub(rhs.min)?,
+        })
     }
 }
 
@@ -73,6 +91,14 @@ impl IntFacts {
             width: IntWidth::I64,
             known_value: Some(value as i128),
             range: Some(IntRange::exact(value as i128)),
+        }
+    }
+
+    pub const fn i64_range(range: IntRange) -> Self {
+        Self {
+            width: IntWidth::I64,
+            known_value: None,
+            range: Some(range),
         }
     }
 
