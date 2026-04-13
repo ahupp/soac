@@ -2828,7 +2828,6 @@ class Point:
                     }],
                 },
             );
-
             let mut lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
                 r#"
 def write_point(point, value):
@@ -2998,6 +2997,321 @@ def write_point(point, value):
             unsafe { ffi::Py_DECREF(point) };
             modules
                 .del_item("field_type_test")
+                .expect("owner module should be removed");
+        });
+
+        unsafe {
+            match old_soac_work_dir {
+                Some(value) => std::env::set_var("SOAC_WORK_DIR", value),
+                None => std::env::remove_var("SOAC_WORK_DIR"),
+            }
+            match old_soac_opt_mode {
+                Some(value) => std::env::set_var("SOAC_OPT_MODE", value),
+                None => std::env::remove_var("SOAC_OPT_MODE"),
+            }
+        }
+    }
+
+    #[test]
+    fn field_index_specialized_constructor_stores_hit_apply_mode_first_inserts() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "field_index_specialized_constructor_stores_hit_apply_mode_first_inserts",
+        ) {
+            return;
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
+        let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
+        let soac_work_dir = fresh_test_work_dir("test-work");
+        unsafe {
+            std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
+            std::env::set_var("SOAC_OPT_MODE", "apply");
+        }
+        crate::initialize_test_python();
+
+        Python::attach(|py| {
+            let owner_module = PyModule::from_code(
+                py,
+                c"
+class Record:
+    pass
+",
+                c"field_record_test.py",
+                c"field_record_test",
+            )
+            .expect("test module should execute");
+            let sys = PyModule::import(py, "sys").expect("sys should import");
+            let modules = sys
+                .getattr("modules")
+                .expect("sys.modules should exist")
+                .cast_into::<pyo3::types::PyDict>()
+                .expect("sys.modules should be a dict");
+            modules
+                .set_item("field_record_test", owner_module.as_any())
+                .expect("owner module should be registered");
+            let record_type = owner_module
+                .getattr("Record")
+                .expect("Record should exist on owner module");
+            let owner_type = record_type.as_ptr() as *mut ffi::PyTypeObject;
+            assert_eq!(
+                cached_split_key_layout(py, owner_type),
+                Vec::<(String, u32)>::new(),
+                "empty __static_attributes__ should leave SOAC's profile input as the split-key source"
+            );
+
+            write_test_counter_dump(
+                soac_work_dir.join("profile.bin").as_path(),
+                &CounterDumpRecord {
+                    module_name: "counter_test".to_string(),
+                    package_name: None,
+                    rows: Vec::new(),
+                    module_keys: Vec::new(),
+                    type_keys: vec![
+                        CounterDumpTypeKeyLayout {
+                            owner_type_id: 7,
+                            key: "PtrComp".to_string(),
+                            index: 0,
+                        },
+                        CounterDumpTypeKeyLayout {
+                            owner_type_id: 7,
+                            key: "Discr".to_string(),
+                            index: 1,
+                        },
+                        CounterDumpTypeKeyLayout {
+                            owner_type_id: 7,
+                            key: "EnumComp".to_string(),
+                            index: 2,
+                        },
+                        CounterDumpTypeKeyLayout {
+                            owner_type_id: 7,
+                            key: "IntComp".to_string(),
+                            index: 3,
+                        },
+                        CounterDumpTypeKeyLayout {
+                            owner_type_id: 7,
+                            key: "StringComp".to_string(),
+                            index: 4,
+                        },
+                    ],
+                    type_table: vec![CounterDumpTypeTableEntry {
+                        type_id: 7,
+                        key: CounterDumpTypeKey {
+                            module_name: "field_record_test".to_string(),
+                            qualname: "Record".to_string(),
+                        },
+                    }],
+                },
+            );
+            let loaded_specializations =
+                load_field_index_specializations().expect("field specializations should load");
+            assert_eq!(
+                loaded_specializations
+                    .values()
+                    .map(std::vec::Vec::len)
+                    .sum::<usize>(),
+                5,
+                "each profiled Record field should produce one specialization"
+            );
+            assert!(
+                cached_split_key_layout(py, owner_type).starts_with(&[
+                    ("PtrComp".to_string(), 0),
+                    ("Discr".to_string(), 1),
+                    ("EnumComp".to_string(), 2),
+                    ("IntComp".to_string(), 3),
+                    ("StringComp".to_string(), 4),
+                ]),
+                "SOAC priming should establish the profile-order split-key layout"
+            );
+
+            let mut lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+                r#"
+class Record:
+    def __init__(self, PtrComp=None, Discr=0, EnumComp=0, IntComp=0, StringComp=0):
+        self.PtrComp = PtrComp
+        self.Discr = Discr
+        self.EnumComp = EnumComp
+        self.IntComp = IntComp
+        self.StringComp = StringComp
+"#,
+            )
+            .expect("lowering should succeed")
+            .codegen_module;
+            instrument_bb_module_with_call_target_counters(&mut lowered);
+            let function = lowered
+                .callable_defs
+                .iter()
+                .find(|function| function.names.qualname == "Record.__init__")
+                .expect("missing lowered function Record.__init__")
+                .clone();
+            let setattr_instr_ids = function
+                .blocks
+                .iter()
+                .flat_map(|block| block.body.iter())
+                .filter_map(|expr| match expr {
+                    InstrCodegen::SetAttr(_) => Some(expr.semantic_instr_id()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                setattr_instr_ids.len(),
+                5,
+                "Record.__init__ should contain five SetAttr operations"
+            );
+            let shared_state =
+                crate::module_type::build_shared_state_for_testing(py, lowered, "counter_test", "")
+                    .expect("shared state should build");
+            let hit_counter_ids = setattr_instr_ids
+                .iter()
+                .map(|setattr_instr_id| {
+                    shared_state
+                        .lowered_module
+                        .counter_defs
+                        .iter()
+                        .find_map(|counter| match &counter.site {
+                            CounterSite::Runtime {
+                                function_id: Some(counter_function_id),
+                                instr_id: Some(counter_instr_id),
+                            } if counter.kind == "field_indexed_hit"
+                                && *counter_function_id == function.function_id
+                                && counter_instr_id == setattr_instr_id =>
+                            {
+                                Some(counter.id)
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| {
+                            panic!("missing field_indexed_hit counter for {setattr_instr_id:?}")
+                        })
+                })
+                .collect::<Vec<_>>();
+            let fallback_counter_ids = setattr_instr_ids
+                .iter()
+                .map(|setattr_instr_id| {
+                    shared_state
+                        .lowered_module
+                        .counter_defs
+                        .iter()
+                        .find_map(|counter| match &counter.site {
+                            CounterSite::Runtime {
+                                function_id: Some(counter_function_id),
+                                instr_id: Some(counter_instr_id),
+                            } if counter.kind == "field_indexed_fallback"
+                                && *counter_function_id == function.function_id
+                                && counter_instr_id == setattr_instr_id =>
+                            {
+                                Some(counter.id)
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "missing field_indexed_fallback counter for {setattr_instr_id:?}"
+                            )
+                        })
+                })
+                .collect::<Vec<_>>();
+
+            let runtime = unsafe { build_test_module_runtime(py, shared_state.clone()) };
+            let module_constant_ptrs = shared_state.module_constant_ptrs();
+            let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
+            let compile_session = crate::session::CompileSession::process();
+            let compiled_handle = unsafe {
+                compile_cranelift_run_bb_specialized_cached(
+                    &compile_session,
+                    &blocks,
+                    &shared_state.lowered_module,
+                    &function,
+                    &shared_state.codegen_constants,
+                    &shared_state.lowered_module.counter_defs,
+                    &module_constant_ptrs,
+                    Some(shared_state.as_ref()),
+                )
+            }
+            .expect("specialized Record.__init__ should compile");
+            let (code_ptr, param_count) = compiled_handle
+                .handle
+                .direct_runner_info()
+                .expect("compiled direct runner should expose entrypoint");
+            assert_eq!(
+                param_count, 6,
+                "Record.__init__ should take six direct args"
+            );
+            let entry: unsafe extern "C" fn(
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+            ) -> *mut c_void = unsafe { std::mem::transmute(code_ptr) };
+
+            let record = unsafe { ffi::PyType_GenericAlloc(owner_type, 0) };
+            assert!(
+                !record.is_null(),
+                "PyType_GenericAlloc should create a fresh uninitialized Record instance"
+            );
+            let none = unsafe { ffi::Py_None() };
+            unsafe { ffi::Py_INCREF(none) };
+            let discr = unsafe { ffi::PyLong_FromLong(1) };
+            let enum_comp = unsafe { ffi::PyLong_FromLong(2) };
+            let int_comp = unsafe { ffi::PyLong_FromLong(3) };
+            let string_comp = unsafe { ffi::PyUnicode_FromString(c"value".as_ptr()) };
+            assert!(
+                !discr.is_null()
+                    && !enum_comp.is_null()
+                    && !int_comp.is_null()
+                    && !string_comp.is_null(),
+                "test values should allocate"
+            );
+
+            let mut function_context = test_function_jit_context(&runtime, std::ptr::null_mut());
+            let thread_state = unsafe { ffi::PyThreadState_Get() }.cast::<c_void>();
+            let result = unsafe {
+                entry(
+                    std::ptr::addr_of_mut!(function_context).cast(),
+                    thread_state,
+                    record.cast(),
+                    none.cast(),
+                    discr.cast(),
+                    enum_comp.cast(),
+                    int_comp.cast(),
+                    string_comp.cast(),
+                )
+            };
+            assert!(!result.is_null(), "Record.__init__ should return None");
+            unsafe { ffi::Py_DECREF(result.cast::<ffi::PyObject>()) };
+
+            for counter_id in hit_counter_ids {
+                assert_eq!(
+                    shared_state.counter_value(counter_id),
+                    1,
+                    "constructor SetAttr should take the indexed-store fast path"
+                );
+            }
+            for counter_id in fallback_counter_ids {
+                assert_eq!(
+                    shared_state.counter_value(counter_id),
+                    0,
+                    "constructor SetAttr should avoid the generic setattr fallback"
+                );
+            }
+
+            let record_obj = unsafe { pyo3::Bound::from_borrowed_ptr(py, record) };
+            assert_eq!(
+                record_obj
+                    .getattr("IntComp")
+                    .expect("Record should expose IntComp")
+                    .extract::<i64>()
+                    .expect("IntComp should be an int"),
+                3
+            );
+
+            unsafe { ffi::Py_DECREF(record) };
+            modules
+                .del_item("field_record_test")
                 .expect("owner module should be removed");
         });
 
@@ -6068,12 +6382,8 @@ def f(x, y):
         let function = module.callable_defs[0].clone();
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
-        let built = build_test_jit_function_with_constants(
-            &module,
-            &function,
-            &blocks,
-            &module_constants,
-        );
+        let built =
+            build_test_jit_function_with_constants(&module, &function, &blocks, &module_constants);
 
         let vectorcall_helpers =
             import_user_names_for_symbols(&built, &[DP_JIT_PY_VECTORCALL_IMPORT.symbol]);
