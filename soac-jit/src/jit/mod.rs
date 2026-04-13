@@ -12963,6 +12963,36 @@ fn build_cranelift_run_bb_specialized_function(
         let module_constant_table_data =
             jit_module.declare_data_in_func(module_constant_table_data_id, &mut fb.func);
         let module_constant_table_value = fb.ins().global_value(ptr_ty, module_constant_table_data);
+        let none_const = emit_owned_module_constant_from_parts(
+            &mut fb,
+            none_constant_id,
+            module_constant_table_value,
+            ptr_ty,
+        );
+        let true_const = emit_owned_module_constant_from_parts(
+            &mut fb,
+            true_constant_id,
+            module_constant_table_value,
+            ptr_ty,
+        );
+        let false_const = emit_owned_module_constant_from_parts(
+            &mut fb,
+            false_constant_id,
+            module_constant_table_value,
+            ptr_ty,
+        );
+        let deleted_const = emit_owned_module_constant_from_parts(
+            &mut fb,
+            deleted_constant_id,
+            module_constant_table_value,
+            ptr_ty,
+        );
+        let empty_tuple_const = emit_owned_module_constant_from_parts(
+            &mut fb,
+            empty_tuple_constant_id,
+            module_constant_table_value,
+            ptr_ty,
+        );
         let scalar_counter_base_value = scalar_counter_data_id.map(|data_id| {
             let counter_data = jit_module.declare_data_in_func(data_id, &mut fb.func);
             fb.ins().global_value(ptr_ty, counter_data)
@@ -13123,12 +13153,7 @@ fn build_cranelift_run_bb_specialized_function(
                     fb.switch_to_block(value_ok_block);
                     fb.block_params(value_ok_block)[0]
                 }
-                BlockParamRole::AbruptPayload => emit_owned_module_constant_from_parts(
-                    &mut fb,
-                    none_constant_id,
-                    module_constant_table_value,
-                    ptr_ty,
-                ),
+                BlockParamRole::AbruptPayload => none_const,
                 BlockParamRole::Exception => null_ptr,
             };
             entry_param_values.insert(block_param.name.as_str(), value);
@@ -13198,36 +13223,6 @@ fn build_cranelift_run_bb_specialized_function(
                 matches!(function.kind, FunctionKind::Function),
             )?;
             let block_const = globals_value;
-            let none_const = emit_owned_module_constant_from_parts(
-                &mut fb,
-                none_constant_id,
-                module_constant_table_value,
-                ptr_ty,
-            );
-            let true_const = emit_owned_module_constant_from_parts(
-                &mut fb,
-                true_constant_id,
-                module_constant_table_value,
-                ptr_ty,
-            );
-            let false_const = emit_owned_module_constant_from_parts(
-                &mut fb,
-                false_constant_id,
-                module_constant_table_value,
-                ptr_ty,
-            );
-            let deleted_const = emit_owned_module_constant_from_parts(
-                &mut fb,
-                deleted_constant_id,
-                module_constant_table_value,
-                ptr_ty,
-            );
-            let empty_tuple_const = emit_owned_module_constant_from_parts(
-                &mut fb,
-                empty_tuple_constant_id,
-                module_constant_table_value,
-                ptr_ty,
-            );
             let fast_step_null_block =
                 exception_dispatch_blocks[index].unwrap_or(pre_cleanup_null_blocks[index]);
             let fast_step_null_args = Vec::new();
@@ -13376,12 +13371,6 @@ fn build_cranelift_run_bb_specialized_function(
             fb.switch_to_block(dispatch_block);
             let forwarded_local_values = fb.block_params(dispatch_block).to_vec();
             let null_ptr = fb.ins().iconst(ptr_ty, 0);
-            let none_const = emit_owned_module_constant_from_parts(
-                &mut fb,
-                none_constant_id,
-                module_constant_table_value,
-                ptr_ty,
-            );
             let dispatch_step_null_args = Vec::new();
 
             let raised_exc =

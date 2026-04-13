@@ -490,3 +490,21 @@ benchmarked throughput delta, and the headline pre/post numbers.
   - specialized pass, 1M loops x3: `303904`, `297016`, `301574 loops/s`
   - pystone JIT code bytes: `267926`
   - pystone machine blocks: `17119`
+
+## 2026-04-13 - Hoist JIT runtime constant loads
+
+- jj change id: `uunnzzqx`
+- summary: Runtime constants loaded from the module constant table now happen
+  once in the direct-entry setup and are reused across generated blocks,
+  instead of reloading `None`, bools, deleted-sentinel, and empty-tuple for
+  every block.
+- throughput: `-0.03%` specialized pystone median; code size `-2.35%`;
+  machine blocks `-0.71%`
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `306741`, `306534`, `308409 loops/s`
+  - pystone JIT code bytes: `267926`
+  - pystone machine blocks: `17119`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `302549`, `307871`, `306656 loops/s`
+  - pystone JIT code bytes: `261630`
+  - pystone machine blocks: `16998`
