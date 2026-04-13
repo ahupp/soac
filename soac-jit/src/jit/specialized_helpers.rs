@@ -150,10 +150,7 @@ unsafe extern "C" fn py_call_positional_three_hook(
     ) as ObjPtr
 }
 unsafe extern "C" fn py_call_object_hook(callable: ObjPtr, args: ObjPtr) -> ObjPtr {
-    let result =
-        ffi::PyObject_CallObject(callable as *mut ffi::PyObject, args as *mut ffi::PyObject)
-            as ObjPtr;
-    result
+    ffi::PyObject_CallObject(callable as *mut ffi::PyObject, args as *mut ffi::PyObject) as ObjPtr
 }
 unsafe extern "C" fn py_vectorcall_hook(
     tstate: ObjPtr,
@@ -169,14 +166,13 @@ unsafe extern "C" fn py_vectorcall_hook(
         );
         return ptr::null_mut();
     }
-    let result = ffi::_PyObject_VectorcallTstate(
+    ffi::_PyObject_VectorcallTstate(
         tstate as *mut ffi::PyThreadState,
         callable as *mut ffi::PyObject,
         args as *const *mut ffi::PyObject,
         nargsf as usize,
         kwnames as *mut ffi::PyObject,
-    ) as ObjPtr;
-    result
+    ) as ObjPtr
 }
 unsafe extern "C" fn next_or_sentinel_hook(iterator: ObjPtr, sentinel: ObjPtr) -> ObjPtr {
     if iterator.is_null() || sentinel.is_null() {
@@ -250,20 +246,6 @@ unsafe extern "C" fn finish_constructor_init_hook(obj: ObjPtr, init_result: ObjP
     }
     ffi::Py_DECREF(init_result);
     obj as ObjPtr
-}
-unsafe extern "C" fn direct_function_context_hook(callable: ObjPtr) -> ObjPtr {
-    if callable.is_null() {
-        ffi::PyErr_SetString(
-            ffi::PyExc_RuntimeError,
-            b"invalid null callable in dp_jit_direct_function_context\0".as_ptr() as *const i8,
-        );
-        return ptr::null_mut();
-    }
-    crate::registered_clif_function_context_ptr(callable as *mut ffi::PyObject)
-        .unwrap_or(ptr::null_mut())
-}
-unsafe extern "C" fn py_thread_state_get_hook() -> ObjPtr {
-    ffi::PyThreadState_Get().cast::<c_void>()
 }
 unsafe extern "C" fn guard_method_type_version_hook(
     receiver: ObjPtr,
@@ -995,6 +977,11 @@ mod test_only_export_stubs {
     ));
     panic_obj_export!(dp_jit_push_handled_exception(exc: ObjPtr));
     panic_unit_export!(dp_jit_pop_handled_exception(previous: ObjPtr));
+    panic_dual_i32_export!(dp_jit_guard_method_type_version, dp_jit_guard_method_type_version_with_frame(
+        receiver: ObjPtr,
+        expected_type: ObjPtr,
+        expected_version: i64
+    ));
     panic_dual_obj_export!(dp_jit_py_call_positional_three, dp_jit_py_call_positional_three_with_frame(
         tstate: ObjPtr,
         callable: ObjPtr,
@@ -1023,19 +1010,12 @@ mod test_only_export_stubs {
         args: ObjPtr,
         kw: ObjPtr
     ));
-    panic_dual_i32_export!(dp_jit_guard_method_type_version, dp_jit_guard_method_type_version_with_frame(
-        receiver: ObjPtr,
-        expected_type: ObjPtr,
-        expected_version: i64
-    ));
     panic_unit_export!(dp_jit_record_top_value_sample(counter: ObjPtr, value: i64));
     panic_dual_obj_export!(dp_jit_get_arg_item, dp_jit_get_arg_item_with_frame(
         args: ObjPtr,
         index: i64
     ));
     panic_obj_export!(dp_jit_load_runtime_obj(name: ObjPtr));
-    panic_obj_export!(dp_jit_direct_function_context(callable: ObjPtr));
-    panic_obj_export!(dp_jit_py_thread_state_get());
     panic_obj_export!(dp_jit_pyobject_getattr(obj: ObjPtr, attr: ObjPtr));
     panic_obj_export!(dp_jit_pyobject_setattr(obj: ObjPtr, attr: ObjPtr, value: ObjPtr));
     panic_obj_export!(dp_jit_pyobject_getitem(obj: ObjPtr, key: ObjPtr));
@@ -1123,6 +1103,15 @@ define_perf_toggle_export!(
     dp_jit_raise_from_exc_with_frame(exc: ObjPtr) => raise_from_exc_hook(exc)
 );
 define_perf_toggle_export!(
+    i32,
+    dp_jit_guard_method_type_version,
+    dp_jit_guard_method_type_version_with_frame(
+        receiver: ObjPtr,
+        expected_type: ObjPtr,
+        expected_version: i64
+    ) => guard_method_type_version_hook(receiver, expected_type, expected_version)
+);
+define_perf_toggle_export!(
     ObjPtr,
     dp_jit_py_call_positional_three,
     dp_jit_py_call_positional_three_with_frame(
@@ -1160,15 +1149,6 @@ define_perf_toggle_export!(
     dp_jit_py_call_with_kw,
     dp_jit_py_call_with_kw_with_frame(callable: ObjPtr, args: ObjPtr, kw: ObjPtr) => py_call_with_kw_hook(callable, args, kw)
 );
-define_perf_toggle_export!(
-    i32,
-    dp_jit_guard_method_type_version,
-    dp_jit_guard_method_type_version_with_frame(
-        receiver: ObjPtr,
-        expected_type: ObjPtr,
-        expected_version: i64
-    ) => guard_method_type_version_hook(receiver, expected_type, expected_version)
-);
 pub unsafe extern "C" fn dp_jit_record_top_value_sample(counter: ObjPtr, value: i64) {
     record_top_value_sample_hook(counter, value)
 }
@@ -1180,12 +1160,6 @@ define_perf_toggle_export!(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_load_runtime_obj(name: ObjPtr) -> ObjPtr {
     load_runtime_name_owned(name as *mut ffi::PyObject) as ObjPtr
-}
-pub unsafe extern "C" fn dp_jit_direct_function_context(callable: ObjPtr) -> ObjPtr {
-    direct_function_context_hook(callable)
-}
-pub unsafe extern "C" fn dp_jit_py_thread_state_get() -> ObjPtr {
-    py_thread_state_get_hook()
 }
 pub unsafe extern "C" fn dp_jit_pyobject_getattr(obj: ObjPtr, attr: ObjPtr) -> ObjPtr {
     pyobject_getattr_hook(obj, attr)
@@ -1288,7 +1262,6 @@ pub unsafe extern "C" fn dp_jit_dict_set_item(dict_obj: ObjPtr, key: ObjPtr, val
 pub unsafe extern "C" fn dp_jit_is_true(value: ObjPtr) -> i32 {
     is_true_hook(value)
 }
-
 unsafe extern "C" fn pyobject_richcompare_wrapper(lhs: ObjPtr, rhs: ObjPtr, op: i32) -> ObjPtr {
     if lhs.is_null() || rhs.is_null() {
         return ptr::null_mut();
@@ -1838,24 +1811,12 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
         dp_jit_load_runtime_obj as *const u8,
     );
     builder.symbol(
-        "dp_jit_direct_function_context",
-        dp_jit_direct_function_context as *const u8,
-    );
-    builder.symbol(
         "dp_jit_vectorcall_bind_direct_args",
         crate::bind_direct_args_from_vectorcall as *const u8,
     );
     builder.symbol(
-        "dp_jit_vectorcall_function_extra",
-        crate::vectorcall_function_extra as *const u8,
-    );
-    builder.symbol(
-        "dp_jit_vectorcall_function_env",
-        crate::vectorcall_function_env as *const u8,
-    );
-    builder.symbol(
-        "dp_jit_py_thread_state_get",
-        dp_jit_py_thread_state_get as *const u8,
+        "dp_jit_vectorcall_compile_function_env",
+        crate::vectorcall_compile_function_env as *const u8,
     );
     builder.symbol(
         "dp_jit_pyobject_getattr",

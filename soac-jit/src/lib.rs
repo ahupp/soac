@@ -923,14 +923,6 @@ pub unsafe fn registered_clif_function_id(
     Ok(Some(FunctionId::from_packed(packed)))
 }
 
-pub unsafe fn registered_clif_function_context_ptr(
-    function: *mut ffi::PyObject,
-) -> Result<*mut c_void, ()> {
-    unsafe { compile_clif_vectorcall(function)? };
-    let data = unsafe { py_function_jit_extra(function)? };
-    Ok(data.function_env_ptr)
-}
-
 pub unsafe fn registered_clif_type_function_id(
     type_obj: *mut ffi::PyObject,
 ) -> Result<Option<FunctionId>, ()> {
@@ -1865,85 +1857,6 @@ unsafe fn bind_function_args_to_output(
     Ok(())
 }
 
-pub(crate) unsafe extern "C" fn vectorcall_function_extra(callable: *mut c_void) -> *mut c_void {
-    match panic::catch_unwind(AssertUnwindSafe(|| {
-        if callable.is_null() || ffi::PyFunction_Check(callable as *mut ffi::PyObject) == 0 {
-            ffi::PyErr_SetString(
-                ffi::PyExc_RuntimeError,
-                b"invalid callable in vectorcall function extra lookup\0".as_ptr() as *const i8,
-            );
-            return ptr::null_mut();
-        }
-        let data_ptr = PyFunction_GetSoacMetadata(callable as *mut ffi::PyObject);
-        if data_ptr.is_null() {
-            ffi::PyErr_SetString(
-                ffi::PyExc_RuntimeError,
-                b"missing SOAC metadata in vectorcall function extra lookup\0".as_ptr()
-                    as *const i8,
-            );
-        }
-        data_ptr
-    })) {
-        Ok(value) => value,
-        Err(payload) => {
-            let message = format!(
-                "panic in vectorcall_function_extra: {}",
-                panic_payload_to_string(payload)
-            );
-            if let Ok(c_msg) = CString::new(message) {
-                ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
-            } else {
-                ffi::PyErr_SetString(
-                    ffi::PyExc_RuntimeError,
-                    b"panic in vectorcall_function_extra\0".as_ptr() as *const i8,
-                );
-            }
-            ptr::null_mut()
-        }
-    }
-}
-
-pub(crate) unsafe extern "C" fn vectorcall_function_env(
-    callable: *mut c_void,
-    data_ptr: *mut c_void,
-) -> *mut c_void {
-    match panic::catch_unwind(AssertUnwindSafe(|| {
-        if callable.is_null()
-            || data_ptr.is_null()
-            || ffi::PyFunction_Check(callable as *mut ffi::PyObject) == 0
-        {
-            ffi::PyErr_SetString(
-                ffi::PyExc_RuntimeError,
-                b"invalid vectorcall function env lookup\0".as_ptr() as *const i8,
-            );
-            return ptr::null_mut();
-        }
-        let py = Python::assume_attached();
-        let data = &mut *(data_ptr as *mut PyFunctionJitExtra);
-        match ensure_clif_vectorcall_compiled(py, callable as *mut ffi::PyObject, data) {
-            Ok(()) => data.function_env_ptr,
-            Err(()) => ptr::null_mut(),
-        }
-    })) {
-        Ok(value) => value,
-        Err(payload) => {
-            let message = format!(
-                "panic in vectorcall_function_env: {}",
-                panic_payload_to_string(payload)
-            );
-            if let Ok(c_msg) = CString::new(message) {
-                ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
-            } else {
-                ffi::PyErr_SetString(
-                    ffi::PyExc_RuntimeError,
-                    b"panic in vectorcall_function_env\0".as_ptr() as *const i8,
-                );
-            }
-            ptr::null_mut()
-        }
-    }
-}
-
 pub(crate) unsafe extern "C" fn bind_direct_args_from_vectorcall(
     callable: *mut c_void,
     args: *const *mut c_void,
@@ -1989,6 +1902,47 @@ pub(crate) unsafe extern "C" fn bind_direct_args_from_vectorcall(
                 );
             }
             0
+        }
+    }
+}
+
+pub(crate) unsafe extern "C" fn vectorcall_compile_function_env(
+    callable: *mut c_void,
+    data_ptr: *mut c_void,
+) -> *mut c_void {
+    match panic::catch_unwind(AssertUnwindSafe(|| {
+        if callable.is_null()
+            || data_ptr.is_null()
+            || ffi::PyFunction_Check(callable as *mut ffi::PyObject) == 0
+        {
+            ffi::PyErr_SetString(
+                ffi::PyExc_RuntimeError,
+                b"invalid vectorcall function env compile input\0".as_ptr() as *const i8,
+            );
+            return ptr::null_mut();
+        }
+        let py = Python::assume_attached();
+        let data = &mut *(data_ptr as *mut PyFunctionJitExtra);
+        match ensure_clif_vectorcall_compiled(py, callable as *mut ffi::PyObject, data) {
+            Ok(()) => data.function_env_ptr,
+            Err(()) => ptr::null_mut(),
+        }
+    })) {
+        Ok(value) => value,
+        Err(payload) => {
+            let message = format!(
+                "panic in vectorcall_compile_function_env: {}",
+                panic_payload_to_string(payload)
+            );
+            if let Ok(c_msg) = CString::new(message) {
+                ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
+            } else {
+                ffi::PyErr_SetString(
+                    ffi::PyExc_RuntimeError,
+                    b"panic in vectorcall_compile_function_env\0".as_ptr() as *const i8,
+                );
+            }
+            ptr::null_mut()
         }
     }
 }

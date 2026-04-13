@@ -1375,7 +1375,7 @@ def f():
     }
 
     #[test]
-    fn specialized_jit_call_direct_uses_function_env_indirect_call_without_predeclared_symbol() {
+    fn specialized_jit_call_direct_uses_loaded_function_env_without_predeclared_symbol() {
         let blocks = [1usize as ObjPtr];
         let module_name_gen = ModuleNameGen::new(95);
         let mut constants = TestConstantPool::default();
@@ -1404,13 +1404,6 @@ def f():
         assert!(
             count_indirect_calls(&built.ctx.func) >= 1,
             "direct-call lowering without a predeclared target should indirect through FunctionEnv.direct_code_ptr",
-        );
-        let slow_path_helpers =
-            import_user_names_for_symbols(&built, &[DP_JIT_DIRECT_FUNCTION_CONTEXT_IMPORT.symbol]);
-        assert_eq!(
-            count_direct_calls_to_runtime_helpers(&built.ctx.func, &slow_path_helpers),
-            1,
-            "direct-call lowering should keep the FunctionEnv lookup slow path available",
         );
         let generic_call_helpers = import_user_names_for_symbols(
             &built,
