@@ -12121,7 +12121,20 @@ struct TrivialJumpBlock {
     target: ir::Block,
     params: Vec<ir::Value>,
     jump_args: Vec<ir::BlockArg>,
-    predecessors: Vec<cranelift_codegen::flowgraph::BlockPredecessor>,
+    predecessors: Vec<TrivialJumpPredecessor>,
+    remove_if_unreferenced: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TrivialJumpPredecessor {
+    block: ir::Block,
+    inst: ir::Inst,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct TrivialJumpNormalizationStats {
+    removed_blocks: usize,
+    redirected_edges: usize,
 }
 
 fn define_prepared_function(
@@ -12180,40 +12193,51 @@ fn prepare_cranelift_function_for_backend(
     let mut ctrl_plane = ControlPlane::default();
     ctx.optimize(jit_module.isa(), &mut ctrl_plane)
         .map_err(|err| format!("{err_prefix}: {err:?}"))?;
-    collapse_postopt_noncritical_trivial_jump_blocks(&mut ctx.func);
     ctx.compute_cfg();
     ctx.compute_domtree();
     ctx.verify_if(jit_module.isa())
-        .map_err(|err| format!("{err_prefix}: post-collapse verifier failed: {err:?}"))?;
+        .map_err(|err| format!("{err_prefix}: post-opt verifier failed: {err:?}"))?;
     Ok(())
 }
 
-fn collapse_postopt_noncritical_trivial_jump_blocks(func: &mut ir::Function) -> usize {
-    let mut collapsed = 0;
+fn normalize_postopt_clif_for_inspection(func: &mut ir::Function) -> TrivialJumpNormalizationStats {
+    let mut stats = TrivialJumpNormalizationStats::default();
     loop {
         let cfg = ControlFlowGraph::with_function(func);
         let value_uses = cranelift_value_use_insts(func);
-        let candidates = collect_noncritical_trivial_jump_blocks(func, &cfg, &value_uses);
-        if candidates.is_empty() {
+        let blocks = collect_noncritical_trivial_jump_block_rewrites(func, &cfg, &value_uses);
+        if blocks.is_empty() {
             break;
         }
-        for block in &candidates {
-            redirect_trivial_jump_block_predecessors(func, block);
+        let redirected_edges = redirect_trivial_jump_block_predecessors(func, &blocks);
+        if redirected_edges == 0 {
+            break;
         }
-        for block in candidates {
-            remove_block_from_layout(func, block.block);
-            collapsed += 1;
+        stats.redirected_edges += redirected_edges;
+        let cfg = ControlFlowGraph::with_function(func);
+        let entry_block = func.layout.blocks().next();
+        for block in blocks {
+            if !block.remove_if_unreferenced {
+                continue;
+            }
+            if Some(block.block) == entry_block {
+                continue;
+            }
+            if cfg.pred_iter(block.block).next().is_none() {
+                stats.removed_blocks += 1;
+                remove_block_from_layout(func, block.block);
+            }
         }
     }
-    collapsed
+    stats
 }
 
-fn collect_noncritical_trivial_jump_blocks(
+fn collect_noncritical_trivial_jump_block_rewrites(
     func: &ir::Function,
     cfg: &ControlFlowGraph,
     value_uses: &HashMap<ir::Value, Vec<ir::Inst>>,
 ) -> Vec<TrivialJumpBlock> {
-    let mut candidates = Vec::new();
+    let mut rewrites = Vec::new();
     let mut occupied_blocks = HashSet::new();
     for block in func.layout.blocks() {
         let Some((jump_inst, target, jump_args)) = trivial_jump_block_target(func, block) else {
@@ -12222,8 +12246,14 @@ fn collect_noncritical_trivial_jump_blocks(
         if target == block {
             continue;
         }
-        let predecessors = cfg.pred_iter(block).collect::<Vec<_>>();
-        if predecessors.len() != 1 || predecessors.iter().any(|pred| pred.block == target) {
+        let predecessors = cfg
+            .pred_iter(block)
+            .map(|pred| TrivialJumpPredecessor {
+                block: pred.block,
+                inst: pred.inst,
+            })
+            .collect::<Vec<_>>();
+        if predecessors.is_empty() {
             continue;
         }
         let params = func.dfg.block_params(block).to_vec();
@@ -12236,35 +12266,74 @@ fn collect_noncritical_trivial_jump_blocks(
         if func.dfg.block_params(target).len() != jump_args.len() {
             continue;
         }
-        if !trivial_jump_block_edges_are_noncritical(&cfg, block, target, &predecessors) {
+
+        if predecessors.len() == 1 && predecessors[0].block != target {
+            if !trivial_jump_block_edges_are_noncritical(cfg, block, target, &predecessors) {
+                continue;
+            }
+            if predecessors.iter().any(|pred| {
+                predecessor_forward_rewrites(func, pred.inst, block, target, &params, &jump_args)
+                    .is_none()
+            }) {
+                continue;
+            }
+            let involved_blocks = std::iter::once(block)
+                .chain(std::iter::once(target))
+                .chain(predecessors.iter().map(|pred| pred.block))
+                .collect::<Vec<_>>();
+            if involved_blocks
+                .iter()
+                .any(|block| occupied_blocks.contains(block))
+            {
+                continue;
+            }
+            occupied_blocks.extend(involved_blocks);
+            rewrites.push(TrivialJumpBlock {
+                block,
+                target,
+                params,
+                jump_args,
+                predecessors,
+                remove_if_unreferenced: true,
+            });
             continue;
         }
-        if predecessors.iter().any(|pred| {
-            predecessor_forward_rewrites(func, pred.inst, block, target, &params, &jump_args)
-                .is_none()
-        }) {
-            continue;
-        }
-        let involved_blocks = std::iter::once(block)
-            .chain(std::iter::once(target))
-            .chain(predecessors.iter().map(|pred| pred.block))
-            .collect::<Vec<_>>();
-        if involved_blocks
+
+        let final_target_pred_count =
+            trivial_jump_final_target_pred_count(cfg, block, target, &predecessors);
+        let rewritable_predecessors = predecessors
             .iter()
-            .any(|block| occupied_blocks.contains(block))
+            .filter(|pred| pred.block != target)
+            .filter(|pred| func.dfg.insts[pred.inst].opcode() == ir::Opcode::Jump)
+            .filter(|pred| trivial_jump_block_target(func, pred.block).is_some())
+            .filter(|pred| {
+                trivial_jump_predecessor_edge_is_noncritical(
+                    cfg,
+                    block,
+                    target,
+                    pred,
+                    final_target_pred_count,
+                )
+            })
+            .filter(|pred| {
+                predecessor_forward_rewrites(func, pred.inst, block, target, &params, &jump_args)
+                    .is_some()
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        if !rewritable_predecessors.is_empty() && rewritable_predecessors.len() < predecessors.len()
         {
-            continue;
+            rewrites.push(TrivialJumpBlock {
+                block,
+                target,
+                params,
+                jump_args,
+                predecessors: rewritable_predecessors,
+                remove_if_unreferenced: false,
+            });
         }
-        occupied_blocks.extend(involved_blocks);
-        candidates.push(TrivialJumpBlock {
-            block,
-            target,
-            params,
-            jump_args,
-            predecessors,
-        });
     }
-    candidates
+    rewrites
 }
 
 fn trivial_jump_args_are_param_forwards(jump_args: &[ir::BlockArg], params: &[ir::Value]) -> bool {
@@ -12349,21 +12418,46 @@ fn trivial_jump_block_edges_are_noncritical(
     cfg: &ControlFlowGraph,
     block: ir::Block,
     target: ir::Block,
-    predecessors: &[cranelift_codegen::flowgraph::BlockPredecessor],
+    predecessors: &[TrivialJumpPredecessor],
 ) -> bool {
-    let final_target_pred_count = cfg
-        .pred_iter(target)
+    let final_target_pred_count =
+        trivial_jump_final_target_pred_count(cfg, block, target, predecessors);
+    predecessors.iter().all(|pred| {
+        trivial_jump_predecessor_edge_is_noncritical(
+            cfg,
+            block,
+            target,
+            pred,
+            final_target_pred_count,
+        )
+    })
+}
+
+fn trivial_jump_final_target_pred_count(
+    cfg: &ControlFlowGraph,
+    block: ir::Block,
+    target: ir::Block,
+    predecessors: &[TrivialJumpPredecessor],
+) -> usize {
+    cfg.pred_iter(target)
         .map(|pred| pred.block)
         .filter(|pred| *pred != block)
         .chain(predecessors.iter().map(|pred| pred.block))
         .collect::<HashSet<_>>()
-        .len();
-    predecessors.iter().all(|pred| {
-        let mut final_pred_successors = cfg.succ_iter(pred.block).collect::<HashSet<_>>();
-        final_pred_successors.remove(&block);
-        final_pred_successors.insert(target);
-        final_pred_successors.len() <= 1 || final_target_pred_count <= 1
-    })
+        .len()
+}
+
+fn trivial_jump_predecessor_edge_is_noncritical(
+    cfg: &ControlFlowGraph,
+    block: ir::Block,
+    target: ir::Block,
+    predecessor: &TrivialJumpPredecessor,
+    final_target_pred_count: usize,
+) -> bool {
+    let mut final_pred_successors = cfg.succ_iter(predecessor.block).collect::<HashSet<_>>();
+    final_pred_successors.remove(&block);
+    final_pred_successors.insert(target);
+    final_pred_successors.len() <= 1 || final_target_pred_count <= 1
 }
 
 fn predecessor_forward_rewrites(
@@ -12414,33 +12508,44 @@ fn compose_forwarded_block_args(
     )
 }
 
-fn redirect_trivial_jump_block_predecessors(func: &mut ir::Function, block: &TrivialJumpBlock) {
-    for predecessor in &block.predecessors {
-        let rewrites = predecessor_forward_rewrites(
-            func,
-            predecessor.inst,
-            block.block,
-            block.target,
-            &block.params,
-            &block.jump_args,
-        )
-        .expect("trivial jump predecessor rewrites should have been validated");
-        let new_calls = rewrites
-            .into_iter()
-            .map(|(index, args)| {
-                (
-                    index,
-                    ir::BlockCall::new(block.target, args, &mut func.dfg.value_lists),
-                )
-            })
-            .collect::<Vec<_>>();
-        let dfg = &mut func.dfg;
-        let destinations = dfg.insts[predecessor.inst]
-            .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables);
-        for (index, destination) in new_calls {
-            destinations[index] = destination;
+fn redirect_trivial_jump_block_predecessors(
+    func: &mut ir::Function,
+    blocks: &[TrivialJumpBlock],
+) -> usize {
+    let mut changed = 0;
+    for block in blocks {
+        for predecessor in &block.predecessors {
+            let Some(rewrites) = predecessor_forward_rewrites(
+                func,
+                predecessor.inst,
+                block.block,
+                block.target,
+                &block.params,
+                &block.jump_args,
+            ) else {
+                continue;
+            };
+            let new_calls = rewrites
+                .into_iter()
+                .map(|(index, args)| {
+                    (
+                        index,
+                        ir::BlockCall::new(block.target, args, &mut func.dfg.value_lists),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let dfg = &mut func.dfg;
+            let destinations = dfg.insts[predecessor.inst]
+                .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables);
+            for (index, destination) in new_calls {
+                if destinations[index].block(&dfg.value_lists) == block.block {
+                    destinations[index] = destination;
+                    changed += 1;
+                }
+            }
         }
     }
+    changed
 }
 
 fn remove_block_from_layout(func: &mut ir::Function, block: ir::Block) {
@@ -14611,12 +14716,23 @@ fn render_compiled_clif_and_vcode_disasm(
         "failed to render specialized jit run_bb function",
     )?;
 
-    let cfg_dot = CFGPrinter::new(&ctx.func).to_string();
+    let mut display_func = ctx.func.clone();
+    let normalize_stats = normalize_postopt_clif_for_inspection(&mut display_func);
+    let cfg_dot = CFGPrinter::new(&display_func).to_string();
 
     let mut clif = String::new();
-    clif.push_str("; ---- post-opt CLIF fed to Cranelift backend ----\n");
-    let clif_display =
-        rewrite_import_fn_aliases(ctx.func.display().to_string().as_str(), import_id_to_symbol);
+    clif.push_str("; ---- normalized post-opt CLIF for inspection ----\n");
+    clif.push_str(
+        "; trivial jump-only blocks are collapsed here for readability; production codegen uses the unnormalized post-opt CLIF\n",
+    );
+    clif.push_str(&format!(
+        "; normalized trivial jumps: redirected_edges={}, removed_blocks={}\n",
+        normalize_stats.redirected_edges, normalize_stats.removed_blocks
+    ));
+    let clif_display = rewrite_import_fn_aliases(
+        display_func.display().to_string().as_str(),
+        import_id_to_symbol,
+    );
     clif.push_str(&rewrite_block_header_annotations(
         &clif_display,
         block_annotations,

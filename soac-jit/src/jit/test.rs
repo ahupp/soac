@@ -230,6 +230,65 @@ mod tests {
         function
     }
 
+    fn build_partially_noncritical_trivial_jump_function() -> (
+        ir::Function,
+        ir::Block,
+        ir::Block,
+        ir::Block,
+        ir::Block,
+        ir::Block,
+    ) {
+        let mut function = ir::Function::new();
+        function
+            .signature
+            .params
+            .push(ir::AbiParam::new(ir::types::I64));
+        function
+            .signature
+            .returns
+            .push(ir::AbiParam::new(ir::types::I64));
+        let direct;
+        let branch;
+        let forwarder;
+        let other;
+        let target;
+        let mut builder_ctx = FunctionBuilderContext::new();
+        {
+            let mut fb = FunctionBuilder::new(&mut function, &mut builder_ctx);
+            let entry = fb.create_block();
+            direct = fb.create_block();
+            branch = fb.create_block();
+            forwarder = fb.create_block();
+            other = fb.create_block();
+            target = fb.create_block();
+            fb.append_block_params_for_function_params(entry);
+
+            fb.switch_to_block(entry);
+            let cond = fb.block_params(entry)[0];
+            fb.ins().brif(cond, direct, &[], branch, &[]);
+
+            fb.switch_to_block(direct);
+            fb.ins().jump(forwarder, &[]);
+
+            fb.switch_to_block(branch);
+            fb.ins().brif(cond, forwarder, &[], other, &[]);
+
+            fb.switch_to_block(forwarder);
+            fb.ins().jump(target, &[]);
+
+            fb.switch_to_block(other);
+            fb.ins().jump(target, &[]);
+
+            fb.switch_to_block(target);
+            let result = fb.ins().iconst(ir::types::I64, 1);
+            fb.ins().return_(&[result]);
+
+            fb.seal_all_blocks();
+            fb.finalize();
+        }
+        (function, direct, branch, forwarder, other, target)
+    }
+
     fn build_non_param_jump_arg_trivial_jump_function() -> ir::Function {
         let mut function = ir::Function::new();
         function
@@ -348,15 +407,13 @@ mod tests {
     }
 
     #[test]
-    fn collapse_trivial_jump_block_with_nop_before_terminator() {
+    fn normalize_trivial_jump_block_with_nop_before_terminator() {
         let (mut function, entry, target) = build_noncritical_trivial_jump_function();
         let entry_arg = function.dfg.block_params(entry)[0];
 
         assert_eq!(function.layout.blocks().count(), 3);
-        assert_eq!(
-            collapse_postopt_noncritical_trivial_jump_blocks(&mut function),
-            1
-        );
+        let stats = normalize_postopt_clif_for_inspection(&mut function);
+        assert_eq!(stats.removed_blocks, 1);
         assert_eq!(function.layout.blocks().count(), 2);
         assert_eq!(block_successor_targets(&function, entry), vec![target]);
         assert_eq!(
@@ -366,63 +423,81 @@ mod tests {
     }
 
     #[test]
-    fn collapse_trivial_jump_blocks_iterates_to_fixpoint() {
+    fn normalize_trivial_jump_blocks_iterates_to_fixpoint() {
         let (mut function, entry, target) = build_chained_trivial_jump_function();
 
         assert_eq!(function.layout.blocks().count(), 4);
-        assert_eq!(
-            collapse_postopt_noncritical_trivial_jump_blocks(&mut function),
-            2
-        );
+        let stats = normalize_postopt_clif_for_inspection(&mut function);
+        assert_eq!(stats.removed_blocks, 2);
         assert_eq!(function.layout.blocks().count(), 2);
         assert_eq!(block_successor_targets(&function, entry), vec![target]);
     }
 
     #[test]
-    fn collapse_trivial_jump_block_keeps_critical_edges_split() {
+    fn normalize_trivial_jump_block_keeps_critical_edges_split() {
         let mut function = build_critical_trivial_jump_function();
 
         assert_eq!(function.layout.blocks().count(), 4);
-        assert_eq!(
-            collapse_postopt_noncritical_trivial_jump_blocks(&mut function),
-            0
-        );
+        let stats = normalize_postopt_clif_for_inspection(&mut function);
+        assert_eq!(stats.removed_blocks, 0);
+        assert_eq!(stats.redirected_edges, 0);
         assert_eq!(function.layout.blocks().count(), 4);
     }
 
     #[test]
-    fn collapse_trivial_jump_block_skips_non_param_forwarding() {
+    fn normalize_trivial_jump_block_threads_safe_predecessor_edges() {
+        let (mut function, direct, branch, forwarder, other, target) =
+            build_partially_noncritical_trivial_jump_function();
+
+        assert_eq!(function.layout.blocks().count(), 6);
+        let stats = normalize_postopt_clif_for_inspection(&mut function);
+        assert_eq!(
+            stats.removed_blocks, 0,
+            "the split block should remain for the critical conditional edge"
+        );
+        assert_eq!(
+            stats.redirected_edges, 1,
+            "only the safe direct predecessor edge should be rewritten"
+        );
+        assert_eq!(function.layout.blocks().count(), 6);
+        assert_eq!(block_successor_targets(&function, direct), vec![target]);
+        assert_eq!(
+            block_successor_targets(&function, branch),
+            vec![forwarder, other],
+            "the conditional predecessor should still use the split block for its critical edge"
+        );
+    }
+
+    #[test]
+    fn normalize_trivial_jump_block_skips_non_param_forwarding() {
         let mut function = build_non_param_jump_arg_trivial_jump_function();
 
         assert_eq!(function.layout.blocks().count(), 3);
-        assert_eq!(
-            collapse_postopt_noncritical_trivial_jump_blocks(&mut function),
-            0
-        );
+        let stats = normalize_postopt_clif_for_inspection(&mut function);
+        assert_eq!(stats.removed_blocks, 0);
+        assert_eq!(stats.redirected_edges, 0);
         assert_eq!(function.layout.blocks().count(), 3);
     }
 
     #[test]
-    fn collapse_trivial_jump_block_skips_successor_param_uses() {
+    fn normalize_trivial_jump_block_skips_successor_param_uses() {
         let mut function = build_successor_use_trivial_jump_function();
 
         assert_eq!(function.layout.blocks().count(), 3);
-        assert_eq!(
-            collapse_postopt_noncritical_trivial_jump_blocks(&mut function),
-            0
-        );
+        let stats = normalize_postopt_clif_for_inspection(&mut function);
+        assert_eq!(stats.removed_blocks, 0);
+        assert_eq!(stats.redirected_edges, 0);
         assert_eq!(function.layout.blocks().count(), 3);
     }
 
     #[test]
-    fn collapse_trivial_jump_block_skips_successor_branch_arg_uses() {
+    fn normalize_trivial_jump_block_skips_successor_branch_arg_uses() {
         let mut function = build_successor_branch_arg_trivial_jump_function();
 
         assert_eq!(function.layout.blocks().count(), 4);
-        assert_eq!(
-            collapse_postopt_noncritical_trivial_jump_blocks(&mut function),
-            0
-        );
+        let stats = normalize_postopt_clif_for_inspection(&mut function);
+        assert_eq!(stats.removed_blocks, 0);
+        assert_eq!(stats.redirected_edges, 0);
         assert_eq!(function.layout.blocks().count(), 4);
     }
 
