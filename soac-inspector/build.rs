@@ -1,7 +1,13 @@
+include!("../build_support/soac_build_identity.rs");
+
 fn main() {
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("workspace crate should have a repo-root parent");
+    let build_identity = compute_soac_build_identity(repo_root)
+        .expect("expected to compute SOAC build identity for module cache keys");
+    println!("cargo:rustc-env=SOAC_BUILD_IDENTITY={build_identity}");
+
     let python_lib_dir = repo_root.join("vendor/cpython");
     let python_link_name =
         find_python_shared_lib_name(&python_lib_dir).expect("expected vendored shared libpython");

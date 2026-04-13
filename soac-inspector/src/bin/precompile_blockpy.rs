@@ -1,15 +1,42 @@
-use soac_blockpy::codegen_cache::load_codegen_module_cache;
+use soac_blockpy::block_py::{FunctionId, ModuleNameGen};
+use soac_blockpy::codegen_cache::{
+    PythonModuleCacheSource, codegen_module_cache_key, codegen_module_cache_path,
+    load_codegen_module_cache, remap_codegen_module_function_ids,
+};
+use soac_jit::counter_dump::{CounterDumpFile, CounterDumpRecordView, CounterDumpRowView};
 use soac_jit::precompile_codegen_module_to_object_file;
+use std::collections::HashSet;
 use std::env;
-use std::ffi::OsString;
-use std::path::PathBuf;
+use std::ffi::{OsStr, OsString};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+const SOAC_BUILD_IDENTITY: &str = env!("SOAC_BUILD_IDENTITY");
 
 #[derive(Debug, Default)]
 struct Args {
-    module: Option<PathBuf>,
     counters: Option<PathBuf>,
-    module_name: Option<String>,
+    module_cache_dir: Option<PathBuf>,
+    build_identity: Option<String>,
     out: Option<PathBuf>,
+    object_dir: Option<PathBuf>,
+    linker: Option<OsString>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct CounterModuleRef {
+    module_name: String,
+    source_hash: u64,
+    module_id: Option<u32>,
+}
+
+#[derive(Debug)]
+struct CompiledModuleObject {
+    object_path: PathBuf,
+    function_count: usize,
+    data_object_count: usize,
+    object_size_bytes: usize,
 }
 
 fn main() {
@@ -21,12 +48,6 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let args = parse_args(env::args_os().skip(1))?;
-    let module_path = args
-        .module
-        .ok_or_else(|| "missing required --module <path>".to_string())?;
-    let module_name = args
-        .module_name
-        .ok_or_else(|| "missing required --module-name <name>".to_string())?;
     let counters_path = args
         .counters
         .ok_or_else(|| "missing required --counters <path>".to_string())?;
@@ -38,23 +59,348 @@ fn run() -> Result<(), String> {
     }
     let out_path = args
         .out
-        .ok_or_else(|| "missing required --out <path>".to_string())?;
-    let module = load_codegen_module_cache(&module_path)
-        .map_err(|err| format!("failed to load {}: {err}", module_path.display()))?;
-    let summary = precompile_codegen_module_to_object_file(
-        module_name.as_str(),
-        &module,
-        Some(counters_path.as_path()),
-        &out_path,
+        .ok_or_else(|| "missing required --out <shared-library>".to_string())?;
+    let module_cache_dir = args
+        .module_cache_dir
+        .unwrap_or_else(default_module_cache_dir);
+    let object_dir = args
+        .object_dir
+        .unwrap_or_else(|| default_object_dir(out_path.as_path()));
+    let linker = args.linker.unwrap_or_else(|| OsString::from("cc"));
+
+    let counter_dump = CounterDumpFile::open(counters_path.as_path())?;
+    let records = counter_dump.records()?;
+    let modules = counter_modules_from_records(records.as_slice())?;
+    if modules.is_empty() {
+        return Err(format!(
+            "counter dump {} does not reference any modules",
+            counters_path.display()
+        ));
+    }
+
+    fs::create_dir_all(object_dir.as_path()).map_err(|err| {
+        format!(
+            "failed to create precompile object dir {}: {err}",
+            object_dir.display()
+        )
+    })?;
+    if let Some(parent) = out_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "failed to create shared-library output dir {}: {err}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let mut compiled = Vec::new();
+    for module_ref in modules {
+        let cache_path = resolve_module_cache_path(
+            module_cache_dir.as_path(),
+            &module_ref,
+            args.build_identity.as_deref(),
+        )?;
+        let mut module = load_codegen_module_cache(cache_path.as_path())
+            .map_err(|err| format!("failed to load {}: {err}", cache_path.display()))?;
+        if let Some(module_id) = module_ref.module_id {
+            remap_codegen_module_function_ids(&mut module, ModuleNameGen::new(module_id));
+        }
+
+        let object_path = object_dir.join(object_file_name(&module_ref));
+        let summary = precompile_codegen_module_to_object_file(
+            module_ref.module_name.as_str(),
+            &module,
+            Some(counters_path.as_path()),
+            object_path.as_path(),
+        )?;
+        println!(
+            "wrote {} for module={} source_hash=0x{:016x} module_id={} ({} bytes, {} functions, {} data objects)",
+            summary.output_path.display(),
+            module_ref.module_name,
+            module_ref.source_hash,
+            module_ref
+                .module_id
+                .map(|module_id| module_id.to_string())
+                .unwrap_or_else(|| "cached".to_string()),
+            summary.object_size_bytes,
+            summary.function_count,
+            summary.data_object_count
+        );
+        compiled.push(CompiledModuleObject {
+            object_path: summary.output_path,
+            function_count: summary.function_count,
+            data_object_count: summary.data_object_count,
+            object_size_bytes: summary.object_size_bytes,
+        });
+    }
+
+    link_shared_library(
+        linker.as_os_str(),
+        compiled
+            .iter()
+            .map(|compiled| compiled.object_path.as_path())
+            .collect::<Vec<_>>()
+            .as_slice(),
+        out_path.as_path(),
     )?;
+    let total_size = compiled
+        .iter()
+        .map(|compiled| compiled.object_size_bytes)
+        .sum::<usize>();
+    let total_functions = compiled
+        .iter()
+        .map(|compiled| compiled.function_count)
+        .sum::<usize>();
+    let total_data_objects = compiled
+        .iter()
+        .map(|compiled| compiled.data_object_count)
+        .sum::<usize>();
     println!(
-        "wrote {} ({} bytes, {} functions, {} data objects)",
-        summary.output_path.display(),
-        summary.object_size_bytes,
-        summary.function_count,
-        summary.data_object_count
+        "linked {} from {} objects ({} object bytes, {} functions, {} data objects)",
+        out_path.display(),
+        compiled.len(),
+        total_size,
+        total_functions,
+        total_data_objects
     );
     Ok(())
+}
+
+fn counter_modules_from_records(
+    records: &[CounterDumpRecordView<'_>],
+) -> Result<Vec<CounterModuleRef>, String> {
+    let mut modules = HashSet::new();
+    for record in records {
+        modules.insert(CounterModuleRef {
+            module_name: record.module_name()?.to_string(),
+            source_hash: record.source_hash(),
+            module_id: module_id_for_record(record)?,
+        });
+    }
+    let mut modules = modules.into_iter().collect::<Vec<_>>();
+    modules.sort();
+    Ok(modules)
+}
+
+fn module_id_for_record(record: &CounterDumpRecordView<'_>) -> Result<Option<u32>, String> {
+    let mut module_id = None;
+    for row_index in 0..record.row_count() {
+        let row = record.row(row_index)?;
+        for function_id in row_function_ids(&row) {
+            if function_id == FunctionId::global() {
+                continue;
+            }
+            match module_id {
+                Some(current) if current != function_id.module_id() => {
+                    return Err(format!(
+                        "counter record for module {} mixes function ids from module ids {} and {}",
+                        record.module_name()?,
+                        current,
+                        function_id.module_id()
+                    ));
+                }
+                Some(_) => {}
+                None => module_id = Some(function_id.module_id()),
+            }
+        }
+    }
+    Ok(module_id)
+}
+
+fn row_function_ids(row: &CounterDumpRowView<'_>) -> impl IntoIterator<Item = FunctionId> {
+    [row.function_id, row.current_function_id]
+        .into_iter()
+        .flatten()
+}
+
+fn resolve_module_cache_path(
+    cache_root: &Path,
+    module_ref: &CounterModuleRef,
+    build_identity: Option<&str>,
+) -> Result<PathBuf, String> {
+    if let Some(build_identity) = build_identity {
+        let path = module_cache_path_for_identity(cache_root, module_ref, build_identity)?;
+        if path.exists() {
+            return Ok(path);
+        }
+        return Err(format!(
+            "cached BlockPy module for module={} source_hash=0x{:016x} build_identity={} not found at {}",
+            module_ref.module_name,
+            module_ref.source_hash,
+            build_identity,
+            path.display()
+        ));
+    }
+
+    let current_path = module_cache_path_for_identity(cache_root, module_ref, SOAC_BUILD_IDENTITY)?;
+    if current_path.exists() {
+        return Ok(current_path);
+    }
+
+    let matches = matching_cache_paths_for_source_hash(cache_root, module_ref.source_hash)?;
+    match matches.as_slice() {
+        [path] => Ok(path.clone()),
+        [] => Err(format!(
+            "cached BlockPy module for module={} source_hash=0x{:016x} not found under {}",
+            module_ref.module_name,
+            module_ref.source_hash,
+            cache_root.display()
+        )),
+        _ => Err(format!(
+            "multiple cached BlockPy modules for module={} source_hash=0x{:016x}; pass --build-identity to select one: {}",
+            module_ref.module_name,
+            module_ref.source_hash,
+            matches
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+fn module_cache_path_for_identity(
+    cache_root: &Path,
+    module_ref: &CounterModuleRef,
+    build_identity: &str,
+) -> Result<PathBuf, String> {
+    let effective_identity =
+        effective_module_cache_identity(build_identity, &module_ref.module_name);
+    let cache_key = codegen_module_cache_key(module_ref.source_hash, effective_identity.as_str());
+    codegen_module_cache_path(
+        cache_root,
+        PythonModuleCacheSource::Project,
+        cache_key.as_str(),
+    )
+    .map_err(|err| err.to_string())
+}
+
+fn effective_module_cache_identity(build_identity: &str, module_name: &str) -> String {
+    format!(
+        "{build_identity};runtime_names_as_globals={}",
+        module_name == "soac.runtime"
+    )
+}
+
+fn matching_cache_paths_for_source_hash(
+    cache_root: &Path,
+    source_hash: u64,
+) -> Result<Vec<PathBuf>, String> {
+    let cache_dir = cache_root.join("project").join("blockpy-codegen");
+    let entries = match fs::read_dir(cache_dir.as_path()) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(format!(
+                "failed to read BlockPy module cache dir {}: {err}",
+                cache_dir.display()
+            ));
+        }
+    };
+    let prefix = format!("{source_hash:016x}-");
+    let mut matches = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|err| {
+            format!(
+                "failed to read BlockPy module cache entry in {}: {err}",
+                cache_dir.display()
+            )
+        })?;
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if file_name.starts_with(prefix.as_str()) && file_name.ends_with(".blockpy.rkyv") {
+            matches.push(path);
+        }
+    }
+    matches.sort();
+    Ok(matches)
+}
+
+fn link_shared_library(
+    linker: &OsStr,
+    object_paths: &[&Path],
+    out_path: &Path,
+) -> Result<(), String> {
+    if object_paths.is_empty() {
+        return Err("cannot link shared library without object inputs".to_string());
+    }
+    let status = Command::new(linker)
+        .arg("-shared")
+        .arg("-o")
+        .arg(out_path)
+        .args(object_paths)
+        .status()
+        .map_err(|err| format!("failed to run linker {linker:?}: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "linker {linker:?} failed with status {status} while writing {}",
+            out_path.display()
+        ))
+    }
+}
+
+fn default_module_cache_dir() -> PathBuf {
+    if let Some(path) = env::var_os("SOAC_MODULE_CACHE_DIR")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        return path;
+    }
+    repo_root().join("soac-module-cache")
+}
+
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace crate should have a repo-root parent")
+        .to_path_buf()
+}
+
+fn default_object_dir(out_path: &Path) -> PathBuf {
+    let file_name = out_path
+        .file_name()
+        .map(|file_name| file_name.to_string_lossy())
+        .unwrap_or_else(|| "precompiled-soac".into());
+    let dir_name = format!("{file_name}.objects");
+    out_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join(dir_name)
+}
+
+fn object_file_name(module_ref: &CounterModuleRef) -> String {
+    let module_name = sanitize_path_component(module_ref.module_name.as_str());
+    let module_id = module_ref
+        .module_id
+        .map(|module_id| module_id.to_string())
+        .unwrap_or_else(|| "cached".to_string());
+    format!(
+        "{module_name}-{:016x}-m{module_id}.o",
+        module_ref.source_hash
+    )
+}
+
+fn sanitize_path_component(text: &str) -> String {
+    let mut out = String::with_capacity(text.len().max(1));
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_') {
+            out.push(char::from(byte));
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        out.push_str("module");
+    }
+    out
 }
 
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Args, String> {
@@ -65,10 +411,12 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Args, String> 
             .to_str()
             .ok_or_else(|| format!("non-UTF-8 argument is unsupported: {arg:?}"))?;
         match flag {
-            "--module" => parsed.module = Some(next_path(&mut args, flag)?),
             "--counters" => parsed.counters = Some(next_path(&mut args, flag)?),
-            "--module-name" => parsed.module_name = Some(next_string(&mut args, flag)?),
+            "--module-cache-dir" => parsed.module_cache_dir = Some(next_path(&mut args, flag)?),
+            "--build-identity" => parsed.build_identity = Some(next_string(&mut args, flag)?),
             "--out" => parsed.out = Some(next_path(&mut args, flag)?),
+            "--object-dir" => parsed.object_dir = Some(next_path(&mut args, flag)?),
+            "--linker" => parsed.linker = Some(next_os_string(&mut args, flag)?),
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -80,21 +428,167 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Args, String> 
 }
 
 fn next_path(args: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<PathBuf, String> {
-    Ok(PathBuf::from(
-        args.next()
-            .ok_or_else(|| format!("{flag} requires a value"))?,
-    ))
+    Ok(PathBuf::from(next_os_string(args, flag)?))
 }
 
 fn next_string(args: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<String, String> {
-    args.next()
-        .ok_or_else(|| format!("{flag} requires a value"))?
+    next_os_string(args, flag)?
         .into_string()
         .map_err(|value| format!("{flag} value must be UTF-8, got {value:?}"))
 }
 
+fn next_os_string(
+    args: &mut impl Iterator<Item = OsString>,
+    flag: &str,
+) -> Result<OsString, String> {
+    args.next()
+        .ok_or_else(|| format!("{flag} requires a value"))
+}
+
 fn print_usage() {
     println!(
-        "usage: precompile_blockpy --module <module.blockpy.rkyv> --module-name <name> --counters <profile.bin> --out <module.o>"
+        "usage: precompile_blockpy --counters <profile.bin> --out <libsoac_precompiled.so> [--module-cache-dir <dir>] [--build-identity <identity>] [--object-dir <dir>] [--linker <cc>]"
     );
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use soac_jit::counter_dump::{CounterDumpRecord, CounterDumpRow, parse_counter_dump_records};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn counter_modules_dedup_by_module_source_and_module_id() {
+        let record = counter_record("pkg.mod", 0x1234, Some(FunctionId::new(7, 1)));
+        let other_record = counter_record("pkg.mod", 0x1234, Some(FunctionId::new(7, 2)));
+        let bytes = [record.encode().unwrap(), other_record.encode().unwrap()].concat();
+        let records = parse_counter_dump_records(bytes.as_slice()).unwrap();
+
+        let modules = counter_modules_from_records(records.as_slice()).unwrap();
+
+        assert_eq!(
+            modules,
+            vec![CounterModuleRef {
+                module_name: "pkg.mod".to_string(),
+                source_hash: 0x1234,
+                module_id: Some(7),
+            }]
+        );
+    }
+
+    #[test]
+    fn counter_modules_reject_mixed_module_ids_in_one_record() {
+        let mut record = counter_record("pkg.mod", 0x1234, Some(FunctionId::new(7, 1)));
+        record.rows.push(counter_row(Some(FunctionId::new(8, 1))));
+        let bytes = record.encode().unwrap();
+        let records = parse_counter_dump_records(bytes.as_slice()).unwrap();
+
+        let err = counter_modules_from_records(records.as_slice()).unwrap_err();
+
+        assert!(err.contains("mixes function ids from module ids 7 and 8"));
+    }
+
+    #[test]
+    fn resolves_exact_current_build_identity_cache_path() {
+        let root = unique_temp_dir();
+        let module_ref = CounterModuleRef {
+            module_name: "pkg.mod".to_string(),
+            source_hash: 0x1234,
+            module_id: Some(7),
+        };
+        let path = module_cache_path_for_identity(root.as_path(), &module_ref, SOAC_BUILD_IDENTITY)
+            .unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path.as_path(), b"not a real cache payload").unwrap();
+
+        let resolved = resolve_module_cache_path(root.as_path(), &module_ref, None).unwrap();
+
+        assert_eq!(resolved, path);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cache_resolution_requires_build_identity_for_ambiguous_source_hash() {
+        let root = unique_temp_dir();
+        let module_ref = CounterModuleRef {
+            module_name: "pkg.mod".to_string(),
+            source_hash: 0x1234,
+            module_id: Some(7),
+        };
+        let cache_dir = root.join("project").join("blockpy-codegen");
+        fs::create_dir_all(cache_dir.as_path()).unwrap();
+        fs::write(
+            cache_dir.join("0000000000001234-aaaaaaaaaaaaaaaa.blockpy.rkyv"),
+            b"a",
+        )
+        .unwrap();
+        fs::write(
+            cache_dir.join("0000000000001234-bbbbbbbbbbbbbbbb.blockpy.rkyv"),
+            b"b",
+        )
+        .unwrap();
+
+        let err = resolve_module_cache_path(root.as_path(), &module_ref, None).unwrap_err();
+
+        assert!(err.contains("multiple cached BlockPy modules"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn object_file_name_is_path_safe_and_stable() {
+        let module_ref = CounterModuleRef {
+            module_name: "pkg/mod:name".to_string(),
+            source_hash: 0x1234,
+            module_id: Some(7),
+        };
+
+        assert_eq!(
+            object_file_name(&module_ref),
+            "pkg_mod_name-0000000000001234-m7.o"
+        );
+    }
+
+    fn counter_record(
+        module_name: &str,
+        source_hash: u64,
+        function_id: Option<FunctionId>,
+    ) -> CounterDumpRecord {
+        CounterDumpRecord {
+            source_hash,
+            module_name: module_name.to_string(),
+            package_name: None,
+            rows: vec![counter_row(function_id)],
+            module_keys: Vec::new(),
+            type_keys: Vec::new(),
+            type_table: Vec::new(),
+        }
+    }
+
+    fn counter_row(function_id: Option<FunctionId>) -> CounterDumpRow {
+        CounterDumpRow {
+            counter_id: 0,
+            scope: "function".to_string(),
+            kind: "block_entry".to_string(),
+            site_kind: "block_entry".to_string(),
+            function_id,
+            current_function_id: function_id,
+            instr_id: None,
+            function_qualname: Some("f".to_string()),
+            block_label: Some("bb0".to_string()),
+            value: 1,
+            observed_value: None,
+            max_overcount: None,
+        }
+    }
+
+    fn unique_temp_dir() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "soac-precompile-blockpy-test-{}-{unique}",
+            std::process::id()
+        ))
+    }
 }

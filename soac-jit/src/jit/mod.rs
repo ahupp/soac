@@ -13,6 +13,7 @@ use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::inline::{Inline, InlineCommand};
 use cranelift_codegen::ir;
 use cranelift_codegen::ir::InstBuilder;
+use cranelift_codegen::isa::TargetIsa;
 use cranelift_codegen::settings;
 use cranelift_codegen::settings::Configurable;
 use cranelift_control::ControlPlane;
@@ -12645,13 +12646,23 @@ fn emit_typed_codegen_term(
 }
 
 fn new_jit_builder() -> Result<JITBuilder, String> {
+    let isa = new_cranelift_isa(false)?;
+    let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+    if let Ok(provider) = ArenaMemoryProvider::new_with_size(JIT_ARENA_BYTES) {
+        builder.memory_provider(Box::new(provider));
+    }
+    register_jit_builder_symbols(&mut builder);
+    Ok(builder)
+}
+
+fn new_cranelift_isa(is_pic: bool) -> Result<Arc<dyn TargetIsa>, String> {
     let mut flag_builder = settings::builder();
     let opt_level = env::var("SOAC_CRANELIFT_OPT_LEVEL").unwrap_or_else(|_| "speed".to_string());
     flag_builder
         .set("opt_level", opt_level.as_str())
         .map_err(|err| format!("failed to configure Cranelift flags: {err}"))?;
     flag_builder
-        .set("is_pic", "false")
+        .set("is_pic", if is_pic { "true" } else { "false" })
         .map_err(|err| format!("failed to configure Cranelift flags: {err}"))?;
     flag_builder
         .set("preserve_frame_pointers", "true")
@@ -12663,10 +12674,10 @@ fn new_jit_builder() -> Result<JITBuilder, String> {
     let isa = isa_builder
         .finish(settings::Flags::new(flag_builder))
         .map_err(|err| format!("failed to finish ISA: {err}"))?;
-    let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
-    if let Ok(provider) = ArenaMemoryProvider::new_with_size(JIT_ARENA_BYTES) {
-        builder.memory_provider(Box::new(provider));
-    }
+    Ok(isa)
+}
+
+fn register_jit_builder_symbols(builder: &mut JITBuilder) {
     builder.symbol("_Py_Dealloc", py_dealloc_symbol());
     builder.symbol(
         cpython_type_symbol_name(CpythonTypeSymbol::Function),
@@ -12689,8 +12700,7 @@ fn new_jit_builder() -> Result<JITBuilder, String> {
         std::ptr::addr_of_mut!(_PyDict_IndexedValueTombstone).cast::<u8>(),
     );
     builder.symbol_lookup_fn(Box::new(lookup_registered_jit_data_symbol));
-    register_specialized_jit_symbols(&mut builder);
-    Ok(builder)
+    register_specialized_jit_symbols(builder);
 }
 
 fn new_jit_module(_compile_session: &crate::session::CompileSession) -> Result<JITModule, String> {
@@ -13319,10 +13329,36 @@ fn compile_prepared_function_bytes(
     };
     ctx.func.name = stable_cranelift_function_name(function_name.as_ref());
     prepare_cranelift_function_for_backend(jit_module, ctx, err_prefix)?;
+    compile_backend_prepared_function_bytes(jit_module.isa(), func_id, ctx, err_prefix)
+}
+
+fn compile_prepared_function_bytes_with_isa(
+    jit_module: &mut JITModule,
+    isa: &dyn TargetIsa,
+    func_id: FuncId,
+    ctx: &mut cranelift_codegen::Context,
+    function_name: &str,
+    err_prefix: &str,
+) -> Result<CompiledFunctionArtifact, String> {
+    let function_name = if jit_refcount_emission_enabled() {
+        Cow::Borrowed(function_name)
+    } else {
+        Cow::Owned(format!("{function_name}:refcounts=off"))
+    };
+    ctx.func.name = stable_cranelift_function_name(function_name.as_ref());
+    prepare_cranelift_function_for_backend_with_isa(jit_module, isa, ctx, err_prefix)?;
+    compile_backend_prepared_function_bytes(isa, func_id, ctx, err_prefix)
+}
+
+fn compile_backend_prepared_function_bytes(
+    isa: &dyn TargetIsa,
+    func_id: FuncId,
+    ctx: &mut cranelift_codegen::Context,
+    err_prefix: &str,
+) -> Result<CompiledFunctionArtifact, String> {
     let func_for_relocs = ctx.func.clone();
     let mut ctrl_plane = ControlPlane::default();
-    let compiled_stencil = jit_module
-        .isa()
+    let compiled_stencil = isa
         .compile_function(&ctx.func, &ctx.domtree, false, &mut ctrl_plane)
         .map_err(|err| format!("{err_prefix}: {err:?}"))?;
     let compiled = compiled_stencil.apply_params(&ctx.func.params);
@@ -13335,7 +13371,7 @@ fn compile_prepared_function_bytes(
         .map(|reloc| ModuleReloc::from_mach_reloc(reloc, &func_for_relocs, func_id))
         .collect::<Vec<_>>();
     let systemv_unwind_info = compiled
-        .create_unwind_info(jit_module.isa())
+        .create_unwind_info(isa)
         .map_err(|err| format!("{err_prefix}: failed to create unwind info: {err:?}"))?
         .and_then(|unwind_info| match unwind_info {
             cranelift_codegen::isa::unwind::UnwindInfo::SystemV(info) => Some(info),
@@ -13369,6 +13405,23 @@ fn prepare_cranelift_function_for_backend(
     ctx.compute_cfg();
     ctx.compute_domtree();
     ctx.verify_if(jit_module.isa())
+        .map_err(|err| format!("{err_prefix}: post-opt verifier failed: {err:?}"))?;
+    Ok(())
+}
+
+fn prepare_cranelift_function_for_backend_with_isa(
+    jit_module: &mut JITModule,
+    isa: &dyn TargetIsa,
+    ctx: &mut cranelift_codegen::Context,
+    err_prefix: &str,
+) -> Result<(), String> {
+    inline_runtime_support_calls(jit_module, ctx, err_prefix)?;
+    let mut ctrl_plane = ControlPlane::default();
+    ctx.optimize(isa, &mut ctrl_plane)
+        .map_err(|err| format!("{err_prefix}: {err:?}"))?;
+    ctx.compute_cfg();
+    ctx.compute_domtree();
+    ctx.verify_if(isa)
         .map_err(|err| format!("{err_prefix}: post-opt verifier failed: {err:?}"))?;
     Ok(())
 }
@@ -14561,6 +14614,7 @@ fn load_runtime_support_clif(jit_module: &mut JITModule) -> Result<(), String> {
 struct ObjectFunctionDefinition {
     func_id: FuncId,
     symbol: String,
+    binding: ElfSymbolBinding,
     bytes: CompiledFunctionBytes,
 }
 
@@ -14568,6 +14622,7 @@ struct ObjectFunctionDefinition {
 struct ObjectDataDefinition {
     data_id: DataId,
     symbol: String,
+    binding: ElfSymbolBinding,
     bytes: Vec<u8>,
     align: u64,
     writable: bool,
@@ -14583,6 +14638,7 @@ pub struct PrecompileObjectSummary {
 
 fn compile_runtime_support_clif_for_object(
     jit_module: &mut JITModule,
+    object_isa: &dyn TargetIsa,
 ) -> Result<Vec<ObjectFunctionDefinition>, String> {
     let library = runtime_support_library()?;
     let local_runtime_symbols = runtime_support_local_symbols(&library);
@@ -14618,8 +14674,9 @@ fn compile_runtime_support_clif_for_object(
         )?;
         let mut ctx = jit_module.make_context();
         ctx.func = function;
-        let compiled = compile_prepared_function_bytes(
+        let compiled = compile_prepared_function_bytes_with_isa(
             jit_module,
+            object_isa,
             func_id,
             &mut ctx,
             &parsed.symbol,
@@ -14632,6 +14689,7 @@ fn compile_runtime_support_clif_for_object(
         out.push(ObjectFunctionDefinition {
             func_id,
             symbol: parsed.symbol,
+            binding: ElfSymbolBinding::Local,
             bytes: compiled.bytes,
         });
     }
@@ -14682,9 +14740,11 @@ fn precompile_codegen_module_to_object_bytes(
     counter_dump_path: Option<&Path>,
 ) -> Result<PrecompiledObjectBytes, String> {
     let compile_session = crate::session::CompileSession::new();
+    let object_isa = new_cranelift_isa(true)?;
     let builder = new_jit_builder()?;
     let mut jit_module = JITModule::new(builder);
-    let mut function_definitions = compile_runtime_support_clif_for_object(&mut jit_module)?;
+    let mut function_definitions =
+        compile_runtime_support_clif_for_object(&mut jit_module, object_isa.as_ref())?;
 
     let module_constants = ModuleCodegenConstants::collect_from_module(module);
     let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
@@ -14724,6 +14784,7 @@ fn precompile_codegen_module_to_object_bytes(
                 module_constant_symbol_prefix.as_str(),
                 ModuleConstantId(index),
             ),
+            binding: ElfSymbolBinding::Global,
             bytes: vec![0; std::mem::size_of::<usize>()],
             align: std::mem::align_of::<usize>() as u64,
             writable: false,
@@ -14733,6 +14794,7 @@ fn precompile_codegen_module_to_object_bytes(
         data_definitions.push(ObjectDataDefinition {
             data_id,
             symbol: scalar_counter_storage_symbol(module),
+            binding: ElfSymbolBinding::Global,
             bytes: vec![
                 0;
                 scalar_counter_count
@@ -14749,6 +14811,7 @@ fn precompile_codegen_module_to_object_bytes(
         data_definitions.push(ObjectDataDefinition {
             data_id,
             symbol: top_value_counter_storage_symbol(module),
+            binding: ElfSymbolBinding::Global,
             bytes: vec![
                 0;
                 top_value_counter_count
@@ -14812,8 +14875,9 @@ fn precompile_codegen_module_to_object_bytes(
             )
         })?;
         let mut ctx = built.ctx;
-        let compiled = compile_prepared_function_bytes(
+        let compiled = compile_prepared_function_bytes_with_isa(
             &mut jit_module,
+            object_isa.as_ref(),
             built.main_id,
             &mut ctx,
             direct_function_backend_name(function, None).as_str(),
@@ -14829,6 +14893,7 @@ fn precompile_codegen_module_to_object_bytes(
         function_definitions.push(ObjectFunctionDefinition {
             func_id: built.main_id,
             symbol: built.main_symbol,
+            binding: ElfSymbolBinding::Global,
             bytes: compiled.bytes,
         });
     }
@@ -14863,8 +14928,9 @@ fn write_precompiled_object(
     for function in function_definitions {
         let offset =
             object.append_text(function.bytes.code.as_slice(), function.bytes.alignment)?;
-        let symbol_index = object.add_local_symbol(
+        let symbol_index = object.add_defined_symbol(
             function.symbol.as_str(),
+            function.binding,
             ElfSymbolKind::Func,
             ElfSectionIndex::Text,
             offset,
@@ -14880,8 +14946,9 @@ fn write_precompiled_object(
             ElfSectionIndex::Rodata
         };
         let offset = object.append_data(section, data.bytes.as_slice(), data.align)?;
-        let symbol_index = object.add_local_symbol(
+        let symbol_index = object.add_defined_symbol(
             data.symbol.as_str(),
+            data.binding,
             ElfSymbolKind::Object,
             section,
             offset,
@@ -14948,9 +15015,10 @@ impl ElfObjectBuilder {
         append_aligned(target, bytes, align.max(1))
     }
 
-    fn add_local_symbol(
+    fn add_defined_symbol(
         &mut self,
         name: &str,
+        binding: ElfSymbolBinding,
         kind: ElfSymbolKind,
         section: ElfSectionIndex,
         value: u64,
@@ -14959,7 +15027,7 @@ impl ElfObjectBuilder {
         let index = (self.symbols.len() + 1) as u32;
         self.symbols.push(ElfSymbol {
             name: name.to_string(),
-            binding: ElfSymbolBinding::Local,
+            binding,
             kind,
             section,
             value,
@@ -15026,6 +15094,7 @@ impl ElfObjectBuilder {
         let symtab_name = push_string_table(&mut shstrtab, ".symtab")?;
         let strtab_name = push_string_table(&mut shstrtab, ".strtab")?;
         let shstrtab_name = push_string_table(&mut shstrtab, ".shstrtab")?;
+        let gnu_stack_name = push_string_table(&mut shstrtab, ".note.GNU-stack")?;
 
         let mut file = vec![0; ELF64_EHDR_SIZE];
         let text_header = append_section_bytes(&mut file, self.text.as_slice(), 16)?;
@@ -15111,6 +15180,17 @@ impl ElfObjectBuilder {
             SHT_STRTAB,
             0,
             shstrtab_header,
+            0,
+            0,
+            1,
+            0,
+        );
+        push_elf_section_header(
+            &mut section_headers,
+            gnu_stack_name,
+            SHT_PROGBITS,
+            0,
+            ElfSectionHeaderInput { offset: 0, size: 0 },
             0,
             0,
             1,
@@ -15245,7 +15325,7 @@ impl ElfSymbolKind {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ElfSymbolBinding {
     Local,
     Global,
@@ -15286,7 +15366,7 @@ const ELF64_EHDR_SIZE: usize = 64;
 const ELF64_SHDR_SIZE: usize = 64;
 const ELF64_SYM_SIZE: usize = 24;
 const ELF64_RELA_SIZE: usize = 24;
-const ELF_SECTION_COUNT: usize = 8;
+const ELF_SECTION_COUNT: usize = 9;
 const ELF_SECTION_TEXT_INDEX: u32 = 1;
 const ELF_SECTION_DATA_INDEX: u32 = 2;
 const ELF_SECTION_RODATA_INDEX: u32 = 3;
