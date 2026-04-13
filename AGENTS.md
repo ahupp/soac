@@ -309,6 +309,16 @@ anything non-code affected the run. If there were no such issues, say
   `benchmark.txt` unless I explicitly ask for the warm unspecialized baseline.
   The benchmark also reports an unsound `SOAC_JIT_EMIT_REFCOUNTS=0` diagnostic
   apply median; keep the default refcounts-enabled median as the headline.
+- `soac.ipython`
+  IPython extension for interactive optimization inspection. Launch it with
+  `just ipython`, load it with `%load_ext soac.ipython`, profile a top-level
+  recoverable Python function with `%soac-profile func(args...)`, then print
+  specialized CLIF with `%soac-clif func`, Codex-annotated CLIF with
+  `%soac-clif-annotate func`, or lowered assembly-like VCode with
+  `%soac-vcode func`. It materializes the function source into a temporary
+  transformed module, uses `soac-inspector` for rendering, and uses
+  `codex exec` for annotation, so it is for local exploration rather than
+  benchmark-quality measurement.
 - Repo-local uv state
   `.envrc` and `Justfile` keep uv and XDG state under the repo with
   `UV_CACHE_DIR`, `UV_TOOL_DIR`, `UV_TOOL_BIN_DIR`, `XDG_CACHE_HOME`,

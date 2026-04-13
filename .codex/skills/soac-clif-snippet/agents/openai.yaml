@@ -1,0 +1,4 @@
+interface:
+  display_name: "SOAC CLIF Snippet"
+  short_description: "Profile a Python snippet and annotate specialized SOAC CLIF"
+  default_prompt: "Use this skill when you need to run a small Python snippet under SOAC with an example workload, render specialized CLIF, annotate it inline, and answer optimization questions about the resulting blocks."

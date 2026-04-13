@@ -220,6 +220,48 @@ Notes:
   fast paths. Today that includes raw indexed module-global / instance
   field stores outside module-init code, and undeclared known-builtin
   loads lowered to `RuntimeName` constants.
+
+## IPython Optimization Explorer
+
+Launch the repo-managed IPython with the built SOAC extension available:
+
+```sh
+just ipython
+```
+
+Load the notebook helper with:
+
+```python
+%load_ext soac.ipython
+```
+
+Then profile a top-level Python function from the IPython namespace and render
+the specialized CLIF or VCode for that function:
+
+```python
+def add(a, b):
+    return a + b
+
+%soac-profile add(1, 1)
+%soac-clif add
+%soac-clif-annotate add
+%soac-vcode add
+```
+
+`%soac-profile` materializes the recovered function source into a temporary
+module, runs that module through SOAC with `SOAC_OPT_MODE=profile`, calls the
+function with the provided arguments, and records the profile counters for the
+session. `%soac-clif` uses `soac-inspector` with those counters to print
+specialized Cranelift IR, which is the more readable structured view for most
+optimization decisions. `%soac-clif-annotate` sends the recovered Python source,
+specialized CLIF, and decoded specialization-counter context to `codex exec` and
+prints annotated CLIF with comments describing what each block is doing.
+`%soac-vcode` prints the lowered assembly-like VCode when instruction selection
+or final code shape matters. This initial explorer supports top-level Python
+functions whose source can be recovered by `inspect.getsource`; nested
+functions, methods, and functions that depend on non-materialized notebook
+globals are out of scope for now.
+
 ## Perf And Benchmarking
 
 - `just benchmark`

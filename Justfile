@@ -803,6 +803,16 @@ py *args='': build-test-runtime
   set -- {{args}}
   "$VENV_DIR/bin/python" "$@"
 
+ipython *args='': build-test-runtime
+  #!/usr/bin/env bash
+  export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  cd "$REPO_ROOT"
+
+  # Interactive optimization-inspection entrypoint. This uses the repo venv
+  # and built debug extension so `%load_ext soac.ipython` works out of the box.
+  set -- {{args}}
+  "$VENV_DIR/bin/ipython" "$@"
+
 py-fast *args='': build-test-runtime-fast
   #!/usr/bin/env bash
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"

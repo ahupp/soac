@@ -15,4 +15,7 @@ packages = ["soac"]
 "" = "src"
 
 [dependency-groups]
-dev = ["pytest>=8,<9"]
+dev = [
+    "ipython>=9,<10",
+    "pytest>=8,<9",
+]
