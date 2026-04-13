@@ -621,7 +621,7 @@ pub unsafe extern "C" fn soac_runtime_store_global_indexed(
     let values = unsafe { (*dict_obj).ma_values.cast::<RawPyDictIndexedValues>() };
     let old_value = unsafe { indexed_value(values, index) };
 
-    // BEHAVIOR_CHANGE: this is a raw slot store for apply-mode JIT code.
+    // BEHAVIOR_CHANGE: this is a raw slot store for verify/apply JIT code.
     // First insert, insertion order, ma_used, watchers, and versions are skipped.
     let value = value.cast::<RawPyObject>();
     unsafe { incref_impl(value) };
@@ -803,7 +803,7 @@ pub unsafe extern "C" fn soac_runtime_store_field_indexed(
         }
     }
 
-    // BEHAVIOR_CHANGE: this is a raw split-slot store for apply-mode JIT code.
+    // BEHAVIOR_CHANGE: this is a raw split-slot store for verify/apply JIT code.
     // Existing values skip CPython watcher/version bookkeeping. First inserts
     // keep split-value insertion order and split-dict ma_used in sync once the
     // class shared-key layout has already been established.

@@ -3006,10 +3006,10 @@ def write_point(point, value):
     }
 
     #[test]
-    fn field_index_specialized_constructor_stores_hit_apply_mode_first_inserts() {
+    fn field_index_specialized_constructor_stores_hit_verify_mode_first_inserts() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
-            "field_index_specialized_constructor_stores_hit_apply_mode_first_inserts",
+            "field_index_specialized_constructor_stores_hit_verify_mode_first_inserts",
         ) {
             return;
         }
@@ -3019,7 +3019,7 @@ def write_point(point, value):
         let soac_work_dir = fresh_test_work_dir("test-work");
         unsafe {
             std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
-            std::env::set_var("SOAC_OPT_MODE", "apply");
+            std::env::set_var("SOAC_OPT_MODE", "verify");
         }
         crate::initialize_test_python();
 
@@ -3288,7 +3288,7 @@ class Record:
                 assert_eq!(
                     shared_state.counter_value(counter_id),
                     0,
-                    "constructor SetAttr should avoid the generic setattr fallback"
+                    "verify-mode constructor SetAttr should avoid the generic setattr fallback"
                 );
             }
 

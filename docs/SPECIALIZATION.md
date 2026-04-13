@@ -210,8 +210,8 @@ apply/verify mode:
 - On guard miss, tombstone, absent value, or store failure, codegen
   increments the fallback counter when enabled and executes the existing
   global load/store slow path.
-- In `apply` mode, store fast paths can be emitted for non-module-scope
-  code. The helper then performs a raw store into the expected
+- In `verify`/`apply` mode, store fast paths can be emitted for
+  non-module-scope code. The helper then performs a raw store into the expected
   indexed-values slot, including null first-insert slots or tombstone
   slots that CPython would normally treat as deleted/absent.
 
@@ -249,9 +249,9 @@ apply/verify mode:
   dicts, key-index mismatch, type guard miss, or type-version miss
   increment the fallback counter when enabled and execute normal CPython
   attribute lookup.
-- `SetAttr` sites use generic attribute set in profile/verify mode.
-- In `apply` mode, constant-string `SetAttr` sites with a recorded key
-  index get the same exact-owner/version guard.
+- `SetAttr` sites use generic attribute set in profile mode.
+- In `verify`/`apply` mode, constant-string `SetAttr` sites with a
+  recorded key index get the same exact-owner/version guard.
 - When loading those specializations, SOAC best-effort primes the owner
   type's shared-key layout from the recorded `type_keys` stream so fresh
   instances in apply/verify mode already have the expected split-key
@@ -265,7 +265,7 @@ apply/verify mode:
 
 - The owner guard is exact-type today; it is sound but does not yet keep
   base-class field fast paths active on subclasses.
-- Direct field stores remain an apply-mode behavior change. They still
+- Direct field stores remain a verify/apply-mode behavior change. They still
   bypass CPython watcher and version bookkeeping on the raw slot-store
   path, and owner types that cannot be safely primed still fall back on
   the first store until normal CPython execution establishes the shared

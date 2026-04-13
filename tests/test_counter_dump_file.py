@@ -440,4 +440,7 @@ def write_field():
         hit_counts_by_function[row["function_qualname"]] = (
             hit_counts_by_function.get(row["function_qualname"], 0) + 1
         )
-    assert hit_counts_by_function == {"read_fields": 4, "write_field": 4}, verify
+    # Verify mode should measure both field loads and field stores on the
+    # specialized path: read_fields has 4 stores + 4 loads, and write_field has
+    # 7 stores + 4 loads.
+    assert hit_counts_by_function == {"read_fields": 8, "write_field": 11}, verify

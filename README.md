@@ -210,7 +210,9 @@ exports are intentionally omitted here.
     counters, and write `$SOAC_WORK_DIR/profile.bin`.
   - `verify`: read `$SOAC_WORK_DIR/profile.bin`, apply its
     specializations, instrument specialization input counters again, and
-    write `$SOAC_WORK_DIR/verify.bin`.
+    write `$SOAC_WORK_DIR/verify.bin`. Verify mode exercises indexed
+    store fast paths so their hit/fallback counters measure the
+    specialized steady-state path.
   - `apply`: read `$SOAC_WORK_DIR/profile.bin`, apply its
     specializations, and emit no specialization counter dump files.
     When event logging is enabled through `SOAC_LOG` or the default

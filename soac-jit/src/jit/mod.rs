@@ -6507,7 +6507,10 @@ fn specialization_mode_is_profile() -> bool {
 }
 
 fn behavior_change_indexed_stores_enabled() -> bool {
-    specialization_mode_from_env().as_deref() == Some("apply")
+    matches!(
+        specialization_mode_from_env().as_deref(),
+        Some("verify" | "apply")
+    )
 }
 
 fn profiled_cold_blocks_enabled() -> bool {
