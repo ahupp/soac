@@ -187,18 +187,18 @@ fn reloc_callable_ref_symbol_name(callable_ref: &RelocCallableRef) -> String {
     }
 }
 
-fn module_constant_table_symbol(module: &BlockPyModule<CodegenModuleShape>) -> String {
+fn module_constant_symbol_prefix(module: &BlockPyModule<CodegenModuleShape>) -> String {
     format!(
-        "__soac_module_constants_{}",
+        "__soac_module_constant_{}",
         module.module_name_gen.module_id()
     )
 }
 
-fn module_constant_table_symbol_for_instance(
+fn module_constant_symbol_prefix_for_instance(
     module: &BlockPyModule<CodegenModuleShape>,
     instance_key: usize,
 ) -> String {
-    format!("{}_{}", module_constant_table_symbol(module), instance_key)
+    format!("{}_{}", module_constant_symbol_prefix(module), instance_key)
 }
 
 fn scalar_counter_storage_symbol(module: &BlockPyModule<CodegenModuleShape>) -> String {
@@ -262,8 +262,8 @@ fn push_shared_module_symbol_identity_for_shared_state(
     );
 }
 
-fn module_constant_table_symbol_for_shared_state(shared_state: &SharedModuleState) -> String {
-    let mut symbol = String::from("__soac_module_constants_shared_");
+fn module_constant_symbol_prefix_for_shared_state(shared_state: &SharedModuleState) -> String {
+    let mut symbol = String::from("__soac_module_constant_shared_");
     push_shared_module_symbol_identity_for_shared_state(&mut symbol, shared_state);
     symbol
 }
@@ -291,41 +291,66 @@ fn direct_function_symbol_scope_for_shared_state(
     scope
 }
 
-fn module_constant_table_bytes(module_constant_ptrs: &[*mut ffi::PyObject]) -> Box<[u8]> {
-    let mut bytes = Vec::with_capacity(module_constant_ptrs.len() * std::mem::size_of::<usize>());
-    for &ptr in module_constant_ptrs {
-        bytes.extend_from_slice(&(ptr as usize).to_ne_bytes());
-    }
-    bytes.into_boxed_slice()
+fn module_constant_slot_symbol(symbol_prefix: &str, constant_id: ModuleConstantId) -> String {
+    format!("{symbol_prefix}_slot_{}", constant_id.0)
 }
 
-fn define_module_constant_table_data_for_symbol(
+fn module_constant_slot_bytes(module_constant_ptr: *mut ffi::PyObject) -> Box<[u8]> {
+    (module_constant_ptr as usize)
+        .to_ne_bytes()
+        .to_vec()
+        .into_boxed_slice()
+}
+
+fn define_module_constant_slot_data_for_symbol(
     jit_module: &mut JITModule,
-    symbol: &str,
-    module_constant_ptrs: &[*mut ffi::PyObject],
+    symbol_prefix: &str,
+    constant_id: ModuleConstantId,
+    module_constant_ptr: *mut ffi::PyObject,
 ) -> Result<DataId, String> {
+    let symbol = module_constant_slot_symbol(symbol_prefix, constant_id);
     let data_id = jit_module
-        .declare_data(symbol, Linkage::Local, false, false)
-        .map_err(|err| format!("failed to declare module constant table {symbol}: {err}"))?;
+        .declare_data(symbol.as_str(), Linkage::Local, false, false)
+        .map_err(|err| format!("failed to declare module constant slot {symbol}: {err}"))?;
     let mut data = DataDescription::new();
-    data.define(module_constant_table_bytes(module_constant_ptrs));
+    data.define(module_constant_slot_bytes(module_constant_ptr));
     data.set_align(std::mem::size_of::<usize>() as u64);
     jit_module
         .define_data(data_id, &data)
-        .map_err(|err| format!("failed to define module constant table {symbol}: {err}"))?;
+        .map_err(|err| format!("failed to define module constant slot {symbol}: {err}"))?;
     Ok(data_id)
 }
 
-fn define_module_constant_table_data(
+fn define_module_constant_slot_data(
     jit_module: &mut JITModule,
     module: &BlockPyModule<CodegenModuleShape>,
     module_constant_ptrs: &[*mut ffi::PyObject],
-) -> Result<DataId, String> {
-    define_module_constant_table_data_for_symbol(
+) -> Result<Vec<DataId>, String> {
+    define_module_constant_slot_data_for_prefix(
         jit_module,
-        module_constant_table_symbol(module).as_str(),
+        module_constant_symbol_prefix(module).as_str(),
         module_constant_ptrs,
     )
+}
+
+fn define_module_constant_slot_data_for_prefix(
+    jit_module: &mut JITModule,
+    symbol_prefix: &str,
+    module_constant_ptrs: &[*mut ffi::PyObject],
+) -> Result<Vec<DataId>, String> {
+    module_constant_ptrs
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, ptr)| {
+            define_module_constant_slot_data_for_symbol(
+                jit_module,
+                symbol_prefix,
+                ModuleConstantId(index),
+                ptr,
+            )
+        })
+        .collect()
 }
 
 fn define_scalar_counter_storage_data_for_symbol(
@@ -900,16 +925,15 @@ pub(crate) struct ProcessJitEngine {
 struct ProcessJitState {
     jit_module: JITModule,
     direct_functions: HashMap<FunctionId, ProcessJitFunctionEntry>,
-    module_constant_tables: HashMap<usize, ModuleConstantTableBinding>,
+    module_constant_slots: HashMap<usize, ModuleConstantSlotBinding>,
     scalar_counter_storage: HashMap<usize, ScalarCounterStorageBinding>,
     top_value_counter_storage: HashMap<usize, TopValueCounterStorageBinding>,
     next_direct_symbol_id: u64,
 }
 
-#[derive(Clone, Copy)]
-struct ModuleConstantTableBinding {
-    data_id: DataId,
-    entry_count: usize,
+#[derive(Clone)]
+struct ModuleConstantSlotBinding {
+    data_ids: Vec<DataId>,
 }
 
 #[derive(Clone, Copy)]
@@ -983,43 +1007,42 @@ impl ProcessJitState {
         Ok(Self {
             jit_module: new_jit_module(compile_session)?,
             direct_functions: HashMap::new(),
-            module_constant_tables: HashMap::new(),
+            module_constant_slots: HashMap::new(),
             scalar_counter_storage: HashMap::new(),
             top_value_counter_storage: HashMap::new(),
             next_direct_symbol_id: 0,
         })
     }
 
-    fn ensure_module_constant_table(
+    fn ensure_module_constant_slots(
         &mut self,
         module_constant_ptrs: &[*mut ffi::PyObject],
         binding_key: usize,
-        symbol: &str,
-    ) -> Result<DataId, String> {
-        if let Some(binding) = self.module_constant_tables.get(&binding_key).copied() {
-            if binding.entry_count != module_constant_ptrs.len() {
+        symbol_prefix: &str,
+    ) -> Result<Vec<DataId>, String> {
+        if let Some(binding) = self.module_constant_slots.get(&binding_key) {
+            if binding.data_ids.len() != module_constant_ptrs.len() {
                 return Err(format!(
-                    "module constant table length mismatch for module instance {}: {} != {}",
+                    "module constant slot count mismatch for module instance {}: {} != {}",
                     binding_key,
-                    binding.entry_count,
+                    binding.data_ids.len(),
                     module_constant_ptrs.len()
                 ));
             }
-            return Ok(binding.data_id);
+            return Ok(binding.data_ids.clone());
         }
-        let data_id = define_module_constant_table_data_for_symbol(
+        let data_ids = define_module_constant_slot_data_for_prefix(
             &mut self.jit_module,
-            symbol,
+            symbol_prefix,
             module_constant_ptrs,
         )?;
-        self.module_constant_tables.insert(
+        self.module_constant_slots.insert(
             binding_key,
-            ModuleConstantTableBinding {
-                data_id,
-                entry_count: module_constant_ptrs.len(),
+            ModuleConstantSlotBinding {
+                data_ids: data_ids.clone(),
             },
         );
-        Ok(data_id)
+        Ok(data_ids)
     }
 
     fn ensure_local_scalar_counter_storage(
@@ -2058,7 +2081,7 @@ struct JitEmitConsts {
     i64_ty: ir::Type,
     i32_ty: ir::Type,
     function_data_value: ir::Value,
-    module_constant_table_value: ir::Value,
+    module_constant_slot_values: Vec<ir::Value>,
     scalar_counter_base_value: Option<ir::Value>,
     top_value_counter_base_value: Option<ir::Value>,
     thread_state_value: ir::Value,
@@ -4288,31 +4311,15 @@ fn emit_checked_owned_pyobject_call_value_with_cleanup(
 fn emit_owned_module_constant_from_parts(
     fb: &mut FunctionBuilder<'_>,
     constant_id: ModuleConstantId,
-    module_constant_table_value: ir::Value,
+    module_constant_slot_values: &[ir::Value],
     ptr_ty: ir::Type,
 ) -> ir::Value {
-    let byte_offset = constant_id
-        .0
-        .checked_mul(std::mem::size_of::<*mut ffi::PyObject>())
-        .unwrap_or_else(|| {
-            panic!(
-                "module constant byte offset overflow for constant id {}",
-                constant_id.0
-            )
-        });
-    if let Ok(offset) = i32::try_from(byte_offset) {
-        fb.ins().load(
-            ptr_ty,
-            ir::MemFlags::trusted(),
-            module_constant_table_value,
-            offset,
-        )
-    } else {
-        let slot_addr = fb
-            .ins()
-            .iadd_imm(module_constant_table_value, byte_offset as i64);
-        fb.ins().load(ptr_ty, ir::MemFlags::trusted(), slot_addr, 0)
-    }
+    let slot_value = module_constant_slot_values
+        .get(constant_id.0)
+        .copied()
+        .unwrap_or_else(|| panic!("missing module constant slot {}", constant_id.0));
+    fb.ins()
+        .load(ptr_ty, ir::MemFlags::trusted(), slot_value, 0)
 }
 
 fn emit_owned_module_constant(
@@ -4323,7 +4330,7 @@ fn emit_owned_module_constant(
     emit_owned_module_constant_from_parts(
         fb,
         constant_id,
-        ctx.consts.module_constant_table_value,
+        &ctx.consts.module_constant_slot_values,
         ctx.consts.ptr_ty,
     )
 }
@@ -7840,7 +7847,7 @@ fn emit_exception_dispatch_target_args(
     forwarded_local_values: &[ir::Value],
     dispatch_exc: ir::Value,
     module_constants: &ModuleCodegenConstants,
-    module_constant_table_value: ir::Value,
+    module_constant_slot_values: &[ir::Value],
     ptr_ty: ir::Type,
     thread_state_value: ir::Value,
     none_const: ir::Value,
@@ -7889,7 +7896,7 @@ fn emit_exception_dispatch_target_args(
             BlockArg::AbruptKind(kind) => emit_owned_module_constant_from_parts(
                 fb,
                 module_constants.require_int_constant_id(abrupt_kind_tag(*kind)),
-                module_constant_table_value,
+                module_constant_slot_values,
                 ptr_ty,
             ),
         };
@@ -11832,8 +11839,8 @@ impl ProcessJitEngine {
                 function_scalar_counter_data_id,
                 function_top_value_counter_data_id,
                 function_direct_call_resolver,
-                function_module_constant_table_binding_key,
-                function_module_constant_table_symbol,
+                function_module_constant_binding_key,
+                function_module_constant_symbol_prefix,
                 function_symbol_scope,
             ) = if let Some(shared_state) = batch_function.source.shared_state() {
                 owned_module_constant_ptrs = shared_state.module_constant_ptrs();
@@ -11878,7 +11885,7 @@ impl ProcessJitEngine {
                     top_value_counter_data_id,
                     Some(shared_state),
                     instance_key,
-                    module_constant_table_symbol_for_shared_state(shared_state),
+                    module_constant_symbol_prefix_for_shared_state(shared_state),
                     Some(direct_function_symbol_scope_for_shared_state(
                         shared_state,
                         function.function_id,
@@ -11909,25 +11916,25 @@ impl ProcessJitEngine {
                     top_value_counter_data_id,
                     None,
                     instance_key,
-                    module_constant_table_symbol_for_instance(module, instance_key),
+                    module_constant_symbol_prefix_for_instance(module, instance_key),
                     None,
                 )
             };
-            let function_module_constant_table_data_id = state.ensure_module_constant_table(
+            let function_module_constant_slot_data_ids = state.ensure_module_constant_slots(
                 function_module_constant_ptrs,
-                function_module_constant_table_binding_key,
-                function_module_constant_table_symbol.as_str(),
+                function_module_constant_binding_key,
+                function_module_constant_symbol_prefix.as_str(),
             )?;
-            if !jit_local_plan_cache.contains_key(&function_module_constant_table_binding_key) {
+            if !jit_local_plan_cache.contains_key(&function_module_constant_binding_key) {
                 let value_facts = infer_jit_value_facts(function_module);
                 let jit_module_local_plan = plan_jit_module_locals(function_module, &value_facts)?;
                 jit_local_plan_cache.insert(
-                    function_module_constant_table_binding_key,
+                    function_module_constant_binding_key,
                     (value_facts, jit_module_local_plan),
                 );
             }
             let (function_value_facts, function_jit_module_local_plan) = jit_local_plan_cache
-                .get(&function_module_constant_table_binding_key)
+                .get(&function_module_constant_binding_key)
                 .expect("JIT local plan cache entry should exist after insertion");
             let function_jit_local_plan = function_jit_module_local_plan
                 .function(function.function_id)
@@ -11946,7 +11953,7 @@ impl ProcessJitEngine {
                 function_jit_local_plan,
                 function_module_constants,
                 function_counter_defs,
-                function_module_constant_table_data_id,
+                function_module_constant_slot_data_ids.as_slice(),
                 function_counter_slots_by_id,
                 function_scalar_counter_data_id,
                 function_top_value_counter_data_id,
@@ -13014,7 +13021,7 @@ fn build_cranelift_run_bb_specialized_function(
     jit_local_plan: &PlannedJitFunctionLocals,
     module_constants: &ModuleCodegenConstants,
     counter_defs: &[CounterDef],
-    module_constant_table_data_id: DataId,
+    module_constant_slot_data_ids: &[DataId],
     counter_slots_by_id: &[CounterRuntimeSlot],
     scalar_counter_data_id: Option<DataId>,
     top_value_counter_data_id: Option<DataId>,
@@ -13497,37 +13504,41 @@ fn build_cranelift_run_bb_specialized_function(
             &mut fb.func,
             &SOAC_RUNTIME_SET_RAISED_EXCEPTION_IMPORT,
         );
-        let module_constant_table_data =
-            jit_module.declare_data_in_func(module_constant_table_data_id, &mut fb.func);
-        let module_constant_table_value = fb.ins().global_value(ptr_ty, module_constant_table_data);
+        let module_constant_slot_values = module_constant_slot_data_ids
+            .iter()
+            .map(|data_id| {
+                let slot_data = jit_module.declare_data_in_func(*data_id, &mut fb.func);
+                fb.ins().global_value(ptr_ty, slot_data)
+            })
+            .collect::<Vec<_>>();
         let none_const = emit_owned_module_constant_from_parts(
             &mut fb,
             none_constant_id,
-            module_constant_table_value,
+            &module_constant_slot_values,
             ptr_ty,
         );
         let true_const = emit_owned_module_constant_from_parts(
             &mut fb,
             true_constant_id,
-            module_constant_table_value,
+            &module_constant_slot_values,
             ptr_ty,
         );
         let false_const = emit_owned_module_constant_from_parts(
             &mut fb,
             false_constant_id,
-            module_constant_table_value,
+            &module_constant_slot_values,
             ptr_ty,
         );
         let deleted_const = emit_owned_module_constant_from_parts(
             &mut fb,
             deleted_constant_id,
-            module_constant_table_value,
+            &module_constant_slot_values,
             ptr_ty,
         );
         let empty_tuple_const = emit_owned_module_constant_from_parts(
             &mut fb,
             empty_tuple_constant_id,
-            module_constant_table_value,
+            &module_constant_slot_values,
             ptr_ty,
         );
         let scalar_counter_base_value = scalar_counter_data_id.map(|data_id| {
@@ -13542,7 +13553,7 @@ fn build_cranelift_run_bb_specialized_function(
             emit_owned_module_constant_from_parts(
                 &mut fb,
                 module_constants.require_int_constant_id(abrupt_kind_tag(AbruptKind::Fallthrough)),
-                module_constant_table_value,
+                &module_constant_slot_values,
                 ptr_ty,
             )
         });
@@ -13788,7 +13799,7 @@ fn build_cranelift_run_bb_specialized_function(
                     i64_ty,
                     i32_ty: ir::types::I32,
                     function_data_value,
-                    module_constant_table_value,
+                    module_constant_slot_values: module_constant_slot_values.clone(),
                     scalar_counter_base_value,
                     top_value_counter_base_value,
                     thread_state_value,
@@ -13990,7 +14001,7 @@ fn build_cranelift_run_bb_specialized_function(
                 &forwarded_local_values,
                 dispatch_exc,
                 module_constants,
-                module_constant_table_value,
+                &module_constant_slot_values,
                 ptr_ty,
                 thread_state_value,
                 none_const,
@@ -14198,8 +14209,8 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
         .unwrap_or(module.counter_defs.as_slice());
     let (counter_slots_by_id, scalar_counter_count, top_value_counter_count) =
         build_counter_storage_layout(counter_defs)?;
-    let module_constant_table_data_id =
-        define_module_constant_table_data(&mut jit_module, module, &module_constant_ptrs)?;
+    let module_constant_slot_data_ids =
+        define_module_constant_slot_data(&mut jit_module, module, &module_constant_ptrs)?;
     let scalar_counter_data_id = if scalar_counter_count == 0 {
         None
     } else {
@@ -14242,7 +14253,7 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
         jit_local_plan,
         module_constants,
         counter_defs,
-        module_constant_table_data_id,
+        module_constant_slot_data_ids.as_slice(),
         counter_slots_by_id.as_ref(),
         scalar_counter_data_id,
         top_value_counter_data_id,

@@ -5,6 +5,19 @@ optimization attempts made by Codex agents. Keep entries succinct: what
 changed or was tried, which jj change id carried it when landed, the
 benchmarked throughput delta, and the headline pre/post numbers.
 
+## 2026-04-13 - Load module constants through per-slot symbols
+
+- jj change id: `oxkwxwwy`
+- summary: Module constant loads now reference one symbol per constant slot
+  instead of loading from a shared constant-table symbol plus a byte offset.
+  This gives object-file loading a constant-specific relocation target while
+  preserving the same specialization set.
+- throughput: `+0.42%` specialized pystone median
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `422870`, `418198`, `423934 loops/s`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `425631`, `417725`, `424651 loops/s`
+
 ## 2026-04-13 - Remove no-op recursive leave calls
 
 - jj change id: `kyxysmzx`
