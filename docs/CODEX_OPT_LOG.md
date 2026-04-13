@@ -5,6 +5,21 @@ optimization attempts made by Codex agents. Keep entries succinct: what
 changed or was tried, which jj change id carried it when landed, the
 benchmarked throughput delta, and the headline pre/post numbers.
 
+## 2026-04-13 - Not landed: thread owner type into indexed-field helpers
+
+- jj change id: not landed
+- summary: Tried passing the already-guarded exact owner type into
+  `soac_runtime_probe_field_indexed` / `soac_runtime_store_field_indexed`
+  so the helpers could skip reloading and re-deriving object type
+  information on successful field get/store paths. The helper ABI change
+  slightly reduced generated code size but did not improve specialized
+  pystone throughput, so it was reverted.
+- throughput: `-0.14%` specialized pystone median
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `408266`, `418252`, `416438 loops/s`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `421436`, `409964`, `415850 loops/s`
+
 ## 2026-04-13 - Recover direct Record constructor specialization
 
 - jj change id: `rmsmspso`

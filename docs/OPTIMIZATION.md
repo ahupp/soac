@@ -79,6 +79,28 @@ For each optimization attempt:
 
 ## Lessons From Abandoned Attempts
 
+### Indexed-field helper owner-type threading
+
+After indexed field-store misses were eliminated in pystone, the remaining
+`soac_runtime_store_field_indexed` self time looked like it might include
+avoidable duplicate type-shape work. An attempted helper ABI change passed the
+already-guarded exact owner type into the field probe/store helpers so they
+could skip reloading the object's type and deriving the dict / inline-values
+path from scratch.
+
+The result was benchmark-negative: median specialized throughput changed
+`416438 -> 415850 loops/s` (`-0.14%`). Generated pystone code size dropped
+slightly (`257025 -> 256777` bytes), but that was below the landing threshold
+and did not translate to throughput.
+
+Lesson: successful indexed field stores are no longer dominated by owner-type
+lookup alone. The remaining cost includes split-slot validation, first-insert
+insertion-order maintenance, overwrite refcount traffic, and helper call shape.
+Future work should either remove more of the store operation at once, such as a
+full inlined/batched split-slot store for a specific storage shape, or use
+typed ownership/immortal facts to reduce refcount work. Do not churn the helper
+ABI just to save the duplicate type load without a clearer measured win.
+
 ### Exact-list item access after helper specialization
 
 After the exact-list getitem/setitem helper optimization, the remaining
