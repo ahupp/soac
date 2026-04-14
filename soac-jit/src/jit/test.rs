@@ -2954,33 +2954,12 @@ def add(a, b):
                 std::sync::Arc::as_ptr(&first_deopt_table) as ObjPtr,
                 "compiled direct handle should expose the runtime deopt table pointer"
             );
-            let mut live_values: Vec<ObjPtr> =
-                vec![std::ptr::null_mut(); first_entry_record.locals().len()];
-            let live_values_ptr = if live_values.is_empty() {
-                std::ptr::null_mut()
-            } else {
-                live_values.as_mut_ptr().cast()
-            };
-            let deopt_result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
-                    std::sync::Arc::as_ptr(&first_deopt_table) as ObjPtr,
-                    std::ptr::null_mut(),
-                    first_entry_record.ordinal() as i64,
-                    live_values_ptr,
-                    first_entry_record.locals().len() as i64,
-                )
-            };
-            assert!(
-                deopt_result.is_null(),
-                "unsupported deopt continuation should return a null error sentinel"
-            );
-            let deopt_error = pyo3::PyErr::fetch(py);
-            let deopt_error_text = deopt_error.to_string();
-            assert!(
-                deopt_error_text.contains("JIT deopt helper is not implemented")
-                    && deopt_error_text.contains(&format!("function {}", first.function_id))
-                    && deopt_error_text.contains("record 0"),
-                "unsupported deopt continuation should report the planned runtime record: {deopt_error_text}"
+            assert_eq!(
+                first_entry_record.continuation(),
+                &RuntimeJitDeoptContinuation::ResumeBlockTail {
+                    cursor: RuntimeJitDeoptCursor::at_block_entry(first.blocks[0].label),
+                },
+                "block-entry deopt records should now be executable from body index 0"
             );
             let second_deopt_table = second_handle
                 .direct_deopt_table()
@@ -5327,6 +5306,35 @@ def f(x):
     }
 
     #[test]
+    fn runtime_deopt_table_marks_block_entry_continuation() {
+        let function = with_single_test_block(test_function(), vec![], ret_term(none_expr()));
+        let module = test_module(ModuleNameGen::new(0), vec![function]);
+        let function = &module.callable_defs[0];
+        let block = function.entry_block();
+        let facts = infer_module_value_facts(&module);
+        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+            .expect("JIT deopt resume planning should succeed");
+        let function_plan = module_plan
+            .function(function.function_id)
+            .expect("function should have a JIT deopt plan");
+        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
+            .expect("runtime deopt table should build from plan");
+        let point = LocalEnvResumePoint::BlockEntry {
+            function_id: function.function_id,
+            block: block.label,
+        };
+        let record = table
+            .record_for_point(point)
+            .expect("block-entry point should have a runtime record");
+        assert_eq!(
+            record.continuation(),
+            &RuntimeJitDeoptContinuation::ResumeBlockTail {
+                cursor: RuntimeJitDeoptCursor::at_block_entry(block.label),
+            }
+        );
+    }
+
+    #[test]
     fn runtime_deopt_table_marks_no_arg_jump_before_term_continuation() {
         let function = test_function();
         let target = test_source_block(&function, vec![], ret_term(none_expr()));
@@ -5676,6 +5684,53 @@ def f(x):
     }
 
     #[test]
+    fn deopt_unimplemented_continuation_reports_record_description() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let function = with_single_test_block(test_function(), vec![], ret_term(none_expr()));
+            let function_id = function.function_id;
+            let block = function.entry_block().label;
+            let table = RuntimeJitDeoptTable {
+                function_id,
+                function: Box::new(function),
+                module_constant_ptrs: Vec::new(),
+                points: vec![RuntimeJitDeoptRecord {
+                    id: PlannedJitDeoptPointId {
+                        function_id,
+                        ordinal: 0,
+                    },
+                    resume_point: LocalEnvResumePoint::BeforeTerm { function_id, block },
+                    precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                    locals: vec![],
+                    continuation: RuntimeJitDeoptContinuation::Unimplemented,
+                }],
+            };
+            let result = unsafe {
+                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                    std::ptr::addr_of!(table).cast_mut().cast(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert!(
+                result.is_null(),
+                "unimplemented deopt continuation should return a null error sentinel"
+            );
+            let deopt_error = pyo3::PyErr::fetch(py);
+            let deopt_error_text = deopt_error.to_string();
+            assert!(
+                deopt_error_text.contains("JIT deopt helper is not implemented")
+                    && deopt_error_text.contains(&format!("function {function_id}"))
+                    && deopt_error_text.contains("record 0"),
+                "unimplemented deopt continuation should report the planned runtime record: {deopt_error_text}"
+            );
+        });
+    }
+
+    #[test]
     fn deopt_return_local_continuation_returns_owned_live_value() {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
@@ -5963,6 +6018,89 @@ def f(x):
                 ffi::Py_DECREF(value);
                 ffi::Py_DECREF(key);
                 ffi::Py_DECREF(globals);
+            }
+        });
+    }
+
+    #[test]
+    fn deopt_block_entry_continuation_executes_from_body_start() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|_| {
+            let mut constants = TestConstantPool::default();
+            let function = with_single_test_block(
+                test_function(),
+                vec![expr_stmt(constants.int_expr(111))],
+                ret_term(constants.int_expr(222)),
+            );
+            let mut module = test_module(ModuleNameGen::new(0), vec![function]);
+            module.module_constants = constants.module_constants;
+            let function = &module.callable_defs[0];
+            let block = function.entry_block();
+            let body_value = unsafe { ffi::PyLong_FromLong(111_111_111) };
+            assert!(
+                !body_value.is_null(),
+                "test body constant allocation should succeed"
+            );
+            let return_value = unsafe { ffi::PyLong_FromLong(222_222_222) };
+            assert!(
+                !return_value.is_null(),
+                "test return constant allocation should succeed"
+            );
+            let module_constant_ptrs = vec![body_value, return_value];
+            let facts = infer_module_value_facts(&module);
+            let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+                .expect("JIT deopt resume planning should succeed");
+            let function_plan = module_plan
+                .function(function.function_id)
+                .expect("function should have a JIT deopt plan");
+            let table =
+                RuntimeJitDeoptTable::from_plan(function, function_plan, &module_constant_ptrs)
+                    .expect("runtime deopt table should build from plan");
+            let point = LocalEnvResumePoint::BlockEntry {
+                function_id: function.function_id,
+                block: block.label,
+            };
+            let ordinal = table
+                .record_for_point(point)
+                .expect("block-entry point should have a runtime record")
+                .id()
+                .ordinal as i64;
+
+            let before_body = unsafe { ffi::Py_REFCNT(body_value) };
+            let before_return = unsafe { ffi::Py_REFCNT(return_value) };
+            let result = unsafe {
+                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                    std::ptr::addr_of!(table).cast_mut().cast(),
+                    std::ptr::null_mut(),
+                    ordinal,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!(
+                result,
+                return_value.cast(),
+                "block-entry deopt should execute body index 0 and then return"
+            );
+            assert!(
+                unsafe { ffi::PyErr_Occurred() }.is_null(),
+                "successful block-entry deopt continuation should not leave a Python exception"
+            );
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(body_value) },
+                before_body,
+                "block-entry deopt should consume and release the body expression value"
+            );
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(return_value) },
+                before_return + 1,
+                "block-entry deopt should return an owned value"
+            );
+            unsafe {
+                ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+                ffi::Py_DECREF(body_value);
+                ffi::Py_DECREF(return_value);
             }
         });
     }

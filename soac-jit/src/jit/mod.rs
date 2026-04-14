@@ -1945,7 +1945,22 @@ fn runtime_jit_deopt_continuation_for_point(
                 cursor: RuntimeJitDeoptCursor::new(block_label, start_body_index),
             }
         }
-        LocalEnvResumePoint::BlockEntry { .. } => RuntimeJitDeoptContinuation::Unimplemented,
+        LocalEnvResumePoint::BlockEntry { function_id, block } => {
+            if function_id != function.function_id {
+                return RuntimeJitDeoptContinuation::Unimplemented;
+            }
+            if function
+                .blocks
+                .iter()
+                .any(|candidate| candidate.label == block)
+            {
+                RuntimeJitDeoptContinuation::ResumeBlockTail {
+                    cursor: RuntimeJitDeoptCursor::at_block_entry(block),
+                }
+            } else {
+                RuntimeJitDeoptContinuation::Unimplemented
+            }
+        }
     }
 }
 
