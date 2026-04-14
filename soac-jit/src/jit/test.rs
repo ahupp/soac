@@ -5543,6 +5543,35 @@ def write_point(point, value):
         count
     }
 
+    fn assert_guard_miss_deopts_without_local_fallback(
+        built: &BuiltSpecializedFunction,
+        fallback_symbols: &[&'static str],
+        case_name: &str,
+    ) {
+        let deopt_helpers = import_user_names_for_symbols(built, &["dp_jit_deopt_resume"]);
+        let fallback_helpers = import_user_names_for_symbols(built, fallback_symbols);
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
+            1,
+            "{case_name}: replay-safe guard miss should call the deopt resume helper"
+        );
+        assert_eq!(
+            count_cold_block_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
+            1,
+            "{case_name}: deopt helper call should be cold"
+        );
+        assert_eq!(
+            count_deopt_helper_success_returns(&built.ctx.func, &deopt_helpers),
+            1,
+            "{case_name}: deopt should return a successful continuation result"
+        );
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &fallback_helpers),
+            0,
+            "{case_name}: replay-safe guard miss should not emit the local fallback helper"
+        );
+    }
+
     fn direct_call_colocated_flags_to_runtime_helpers(
         function: &ir::Function,
         helpers: &[ir::UserExternalName],
@@ -12313,27 +12342,10 @@ def f(x):
                 ),
             )],
         );
-        let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
-        let generic_add_helpers = import_user_names_for_symbols(&built, &["PyNumber_Add"]);
-        assert_eq!(
-            count_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
-            1,
-            "replay-safe exact-int binary op guard miss should call the deopt resume helper"
-        );
-        assert_eq!(
-            count_cold_block_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
-            1,
-            "exact-int binary op deopt helper call should be cold"
-        );
-        assert_eq!(
-            count_deopt_helper_success_returns(&built.ctx.func, &deopt_helpers),
-            1,
-            "exact-int binary op deopt should return a successful continuation result"
-        );
-        assert_eq!(
-            count_direct_calls_to_runtime_helpers(&built.ctx.func, &generic_add_helpers),
-            0,
-            "replay-safe exact-int binary op should not emit the local generic add fallback"
+        assert_guard_miss_deopts_without_local_fallback(
+            &built,
+            &["PyNumber_Add"],
+            "exact-int binary op",
         );
     }
 
@@ -12613,6 +12625,66 @@ def f(x):
         assert!(
             count_symbolic_global_values(&built.ctx.func) > baseline_symbolic_globals,
             "exact-int compare specialization should add a symbolic global for the profiled type guard",
+        );
+    }
+
+    #[test]
+    fn specialized_jit_exact_int_compare_guard_miss_deopts_for_replay_safe_operands() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "specialized_jit_exact_int_compare_guard_miss_deopts_for_replay_safe_operands",
+        ) {
+            return;
+        }
+        let blocks = [1usize as ObjPtr];
+        let mut function = test_function();
+        function.params = ParamSpec {
+            params: vec![
+                Param {
+                    name: "a".into(),
+                    kind: ParamKind::Any,
+                    has_default: false,
+                },
+                Param {
+                    name: "b".into(),
+                    kind: ParamKind::Any,
+                    has_default: false,
+                },
+            ],
+        };
+        let block_label = function.name_gen.next_block_name();
+        let instr_id = InstrId::new(block_label, 0);
+        function.blocks = vec![CodegenBlock {
+            label: block_label,
+            body: vec![],
+            term: ret_term(with_instr_id(
+                op_expr(BinOp::new(
+                    BinOpKind::Lt,
+                    name_expr(test_name("a")),
+                    name_expr(test_local_name("b", 1)),
+                )),
+                instr_id,
+            )),
+            params: vec![],
+            exc_edge: None,
+        }];
+        set_stack_slots(&mut function, &["a", "b"]);
+        let (_jit_module, built) = build_test_jit_function_with_operator_specializations(
+            &function,
+            &blocks,
+            Vec::new(),
+            &[(
+                instr_id,
+                crate::operator_specialization::pack_binary_shape(
+                    crate::operator_specialization::ExactTypeTag::Int,
+                    crate::operator_specialization::ExactTypeTag::Int,
+                ),
+            )],
+        );
+        assert_guard_miss_deopts_without_local_fallback(
+            &built,
+            &["PyObject_RichCompare"],
+            "exact-int comparison",
         );
     }
 
@@ -12932,27 +13004,10 @@ def f(x):
                 ),
             )],
         );
-        let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
-        let generic_neg_helpers = import_user_names_for_symbols(&built, &["PyNumber_Negative"]);
-        assert_eq!(
-            count_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
-            1,
-            "replay-safe exact-int unary op guard miss should call the deopt resume helper"
-        );
-        assert_eq!(
-            count_cold_block_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
-            1,
-            "exact-int unary op deopt helper call should be cold"
-        );
-        assert_eq!(
-            count_deopt_helper_success_returns(&built.ctx.func, &deopt_helpers),
-            1,
-            "exact-int unary op deopt should return a successful continuation result"
-        );
-        assert_eq!(
-            count_direct_calls_to_runtime_helpers(&built.ctx.func, &generic_neg_helpers),
-            0,
-            "replay-safe exact-int unary op should not emit the local generic neg fallback"
+        assert_guard_miss_deopts_without_local_fallback(
+            &built,
+            &["PyNumber_Negative"],
+            "exact-int unary op",
         );
     }
 
