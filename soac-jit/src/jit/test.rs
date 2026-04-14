@@ -5335,6 +5335,100 @@ def f(x):
     }
 
     #[test]
+    fn runtime_deopt_table_rejects_unsupported_block_entry_tail() {
+        let function = with_single_test_block(
+            test_function(),
+            vec![expr_stmt(name_expr(test_closure_cell_name("cell", 0)))],
+            ret_term(none_expr()),
+        );
+        let module = test_module(ModuleNameGen::new(0), vec![function]);
+        let function = &module.callable_defs[0];
+        let block = function.entry_block();
+        let body_instr_id = block.body[0]
+            .try_semantic_instr_id()
+            .expect("test body instruction should have an id");
+        let facts = infer_module_value_facts(&module);
+        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+            .expect("JIT deopt resume planning should succeed");
+        let function_plan = module_plan
+            .function(function.function_id)
+            .expect("function should have a JIT deopt plan");
+        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
+            .expect("runtime deopt table should build from plan");
+
+        let block_entry_record = table
+            .record_for_point(LocalEnvResumePoint::BlockEntry {
+                function_id: function.function_id,
+                block: block.label,
+            })
+            .expect("block-entry point should have a runtime record");
+        assert_eq!(
+            block_entry_record.continuation(),
+            &RuntimeJitDeoptContinuation::Unimplemented,
+            "block-entry continuation should not claim support for unsupported body tails"
+        );
+
+        let before_instr_record = table
+            .record_for_point(LocalEnvResumePoint::BeforeInstr {
+                key: InstrKey::new(function.function_id, body_instr_id),
+            })
+            .expect("before-instr point should have a runtime record");
+        assert_eq!(
+            before_instr_record.continuation(),
+            &RuntimeJitDeoptContinuation::Unimplemented,
+            "before-instr continuation should not claim support for unsupported body tails"
+        );
+    }
+
+    #[test]
+    fn runtime_deopt_table_marks_store_body_tail_continuation() {
+        let function = with_single_test_block(
+            test_function(),
+            vec![assign_stmt(test_name("x"), none_expr())],
+            ret_term(name_expr(test_name("x"))),
+        );
+        let module = test_module(ModuleNameGen::new(0), vec![function]);
+        let function = &module.callable_defs[0];
+        let block = function.entry_block();
+        let body_instr_id = block.body[0]
+            .try_semantic_instr_id()
+            .expect("test body instruction should have an id");
+        let facts = infer_module_value_facts(&module);
+        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+            .expect("JIT deopt resume planning should succeed");
+        let function_plan = module_plan
+            .function(function.function_id)
+            .expect("function should have a JIT deopt plan");
+        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
+            .expect("runtime deopt table should build from plan");
+
+        let block_entry_record = table
+            .record_for_point(LocalEnvResumePoint::BlockEntry {
+                function_id: function.function_id,
+                block: block.label,
+            })
+            .expect("block-entry point should have a runtime record");
+        assert_eq!(
+            block_entry_record.continuation(),
+            &RuntimeJitDeoptContinuation::ResumeBlockTail {
+                cursor: RuntimeJitDeoptCursor::at_block_entry(block.label),
+            }
+        );
+
+        let before_instr_record = table
+            .record_for_point(LocalEnvResumePoint::BeforeInstr {
+                key: InstrKey::new(function.function_id, body_instr_id),
+            })
+            .expect("before-instr point should have a runtime record");
+        assert_eq!(
+            before_instr_record.continuation(),
+            &RuntimeJitDeoptContinuation::ResumeBlockTail {
+                cursor: RuntimeJitDeoptCursor::at_block_entry(block.label),
+            }
+        );
+    }
+
+    #[test]
     fn runtime_deopt_table_marks_no_arg_jump_before_term_continuation() {
         let function = test_function();
         let target = test_source_block(&function, vec![], ret_term(none_expr()));

@@ -1914,7 +1914,7 @@ fn runtime_jit_deopt_continuation_for_point(
             else {
                 return RuntimeJitDeoptContinuation::Unimplemented;
             };
-            if runtime_jit_deopt_term_supported(&block.term) {
+            if runtime_jit_deopt_block_tail_supported(block, block.body.len()) {
                 RuntimeJitDeoptContinuation::ResumeBlockTail {
                     cursor: RuntimeJitDeoptCursor::new(block.label, block.body.len()),
                 }
@@ -1941,27 +1941,42 @@ fn runtime_jit_deopt_continuation_for_point(
             else {
                 return RuntimeJitDeoptContinuation::Unimplemented;
             };
-            RuntimeJitDeoptContinuation::ResumeBlockTail {
-                cursor: RuntimeJitDeoptCursor::new(block_label, start_body_index),
+            if runtime_jit_deopt_block_tail_supported(block, start_body_index) {
+                RuntimeJitDeoptContinuation::ResumeBlockTail {
+                    cursor: RuntimeJitDeoptCursor::new(block_label, start_body_index),
+                }
+            } else {
+                RuntimeJitDeoptContinuation::Unimplemented
             }
         }
         LocalEnvResumePoint::BlockEntry { function_id, block } => {
             if function_id != function.function_id {
                 return RuntimeJitDeoptContinuation::Unimplemented;
             }
-            if function
+            let Some(block) = function
                 .blocks
                 .iter()
-                .any(|candidate| candidate.label == block)
-            {
+                .find(|candidate| candidate.label == block)
+            else {
+                return RuntimeJitDeoptContinuation::Unimplemented;
+            };
+            if runtime_jit_deopt_block_tail_supported(block, 0) {
                 RuntimeJitDeoptContinuation::ResumeBlockTail {
-                    cursor: RuntimeJitDeoptCursor::at_block_entry(block),
+                    cursor: RuntimeJitDeoptCursor::at_block_entry(block.label),
                 }
             } else {
                 RuntimeJitDeoptContinuation::Unimplemented
             }
         }
     }
+}
+
+fn runtime_jit_deopt_block_tail_supported(block: &CodegenBlock, start_body_index: usize) -> bool {
+    let Some(body_tail) = block.body.get(start_body_index..) else {
+        return false;
+    };
+    body_tail.iter().all(runtime_jit_deopt_expr_supported)
+        && runtime_jit_deopt_term_supported(&block.term)
 }
 
 fn runtime_jit_deopt_expr_supported(expr: &InstrCodegen) -> bool {
@@ -2002,6 +2017,8 @@ fn runtime_jit_deopt_expr_supported(expr: &InstrCodegen) -> bool {
         InstrCodegen::CallDirect(call) => {
             runtime_jit_deopt_call_parts_supported(&call.callable, &call.args, &call.keywords)
         }
+        InstrCodegen::Store(store) => runtime_jit_deopt_expr_supported(&store.value),
+        InstrCodegen::Del(_) => true,
         _ => false,
     }
 }
