@@ -7268,6 +7268,134 @@ def f(x, y):
     }
 
     #[test]
+    fn indexed_global_term_guard_miss_deopt_resumes_return_global_runtime() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| unsafe {
+            #[repr(C)]
+            struct TestFunctionEnv {
+                direct_code_ptr: *const u8,
+                default_direct_code_ptr: *const u8,
+                deopt_table_ptr: ObjPtr,
+                globals_obj: ObjPtr,
+            }
+
+            let function = with_single_test_block(
+                test_function(),
+                vec![],
+                ret_term(op_expr(Load::new(test_global_name("x")))),
+            );
+            let module = test_module(ModuleNameGen::new(0), vec![function]);
+            let shared_state =
+                crate::module_type::build_shared_state_for_testing(py, module, "deopt_test", "")
+                    .expect("shared state should build");
+            let function = shared_state.lowered_module.callable_defs[0].clone();
+            let runtime = build_test_module_runtime(py, shared_state.clone());
+            let key = ffi::PyUnicode_FromString(c"x".as_ptr());
+            assert!(!key.is_null(), "test key allocation should succeed");
+            let value = ffi::PyLong_FromLong(246_813_579);
+            assert!(!value.is_null(), "test value allocation should succeed");
+            assert_eq!(
+                ffi::PyDict_SetItem(runtime.mod_ctx.globals_obj.cast(), key, value),
+                0,
+                "test globals insertion should succeed"
+            );
+
+            let compile_session = crate::session::CompileSession::new();
+            let mut jit_module =
+                new_jit_module(&compile_session).expect("test jit module should construct");
+            let module_constant_ptrs = shared_state.module_constant_ptrs();
+            let module_constant_object_data_ids = declare_module_constant_object_data(
+                &mut jit_module,
+                &shared_state.lowered_module,
+                &module_constant_ptrs,
+            )
+            .expect("module constant object data should declare");
+            let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
+                define_test_counter_storage(
+                    &mut jit_module,
+                    &shared_state.lowered_module,
+                    shared_state.lowered_module.counter_defs.as_slice(),
+                );
+            let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
+            let built = build_test_cranelift_run_bb_specialized_function(
+                &mut jit_module,
+                blocks.as_slice(),
+                &shared_state.lowered_module,
+                &function,
+                &shared_state.codegen_constants,
+                shared_state.lowered_module.counter_defs.as_slice(),
+                module_constant_object_data_ids.as_slice(),
+                counter_slots_by_id.as_ref(),
+                scalar_counter_data_id,
+                top_value_counter_data_id,
+                &compile_session,
+                Some(shared_state.as_ref()),
+                None,
+                None,
+                BuildSpecializedFunctionOptions {
+                    indexed_global_guard_miss_deopt_stub: true,
+                },
+            )
+            .expect("specialized JIT build should succeed");
+            let facts = infer_jit_value_facts(&shared_state.lowered_module);
+            let module_plan = plan_jit_deopt_resume_module(&shared_state.lowered_module, &facts)
+                .expect("JIT deopt resume planning should succeed");
+            let function_plan = module_plan
+                .function(function.function_id)
+                .expect("function should have a JIT deopt plan");
+            let deopt_table = RuntimeJitDeoptTable::from_plan(&function, function_plan)
+                .expect("runtime deopt table should build from plan");
+
+            let mut ctx = built.ctx;
+            define_prepared_function(
+                &mut jit_module,
+                built.main_id,
+                &mut ctx,
+                "test-return-global-deopt-resume",
+                "return-global deopt test should define",
+            )
+            .expect("test function should define");
+            jit_module.clear_context(&mut ctx);
+            jit_module
+                .finalize_definitions()
+                .expect("test jit module should finalize");
+            let code_ptr = jit_module.get_finalized_function(built.main_id);
+            let function_env = TestFunctionEnv {
+                direct_code_ptr: code_ptr,
+                default_direct_code_ptr: std::ptr::null(),
+                deopt_table_ptr: std::ptr::addr_of!(deopt_table).cast_mut().cast(),
+                globals_obj: runtime.mod_ctx.globals_obj,
+            };
+            let entry: unsafe extern "C" fn(ObjPtr, ObjPtr) -> ObjPtr =
+                std::mem::transmute(code_ptr);
+            let before = ffi::Py_REFCNT(value);
+            let result = entry(
+                std::ptr::addr_of!(function_env).cast_mut().cast(),
+                ffi::PyThreadState_Get().cast(),
+            );
+            assert_eq!(
+                result,
+                value.cast::<c_void>(),
+                "guard-miss deopt should resume to the global return value"
+            );
+            assert!(
+                ffi::PyErr_Occurred().is_null(),
+                "successful return-global deopt should not leave a Python exception"
+            );
+            assert_eq!(
+                ffi::Py_REFCNT(value),
+                before + 1,
+                "resumed return value should be owned by the caller"
+            );
+
+            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+            ffi::Py_DECREF(value);
+            ffi::Py_DECREF(key);
+        });
+    }
+
+    #[test]
     fn render_specialized_jit_load_global_intrinsic_uses_direct_helper() {
         let blocks = [1usize as ObjPtr];
         let function = with_single_test_block(
