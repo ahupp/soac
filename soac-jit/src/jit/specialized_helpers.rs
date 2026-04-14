@@ -1242,6 +1242,8 @@ pub unsafe extern "C" fn dp_jit_del_deref(cell: ObjPtr) -> ObjPtr {
 pub unsafe extern "C" fn dp_jit_del_deref_quietly(cell: ObjPtr) -> ObjPtr {
     del_deref_quietly_hook(cell)
 }
+#[cold]
+#[inline(never)]
 pub unsafe extern "C" fn dp_jit_deopt_unimplemented(
     deopt_table: ObjPtr,
     record_ordinal: i64,

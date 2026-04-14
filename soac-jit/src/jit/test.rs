@@ -940,6 +940,7 @@ def f():
         direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
         symbol_scope: Option<&str>,
         predeclared_direct_functions: Option<&HashMap<FunctionId, DeclaredJitFunction>>,
+        options: BuildSpecializedFunctionOptions,
     ) -> Result<BuiltSpecializedFunction, String> {
         let value_facts = infer_jit_value_facts(module);
         let jit_module_local_plan = plan_jit_module_locals(module, &value_facts)?;
@@ -978,6 +979,7 @@ def f():
             direct_call_resolver,
             symbol_scope,
             predeclared_direct_functions,
+            options,
         )
     }
 
@@ -1011,6 +1013,7 @@ def f():
             None,
             None,
             None,
+            BuildSpecializedFunctionOptions::default(),
         )
         .expect("test specialized JIT function should build")
     }
@@ -3032,6 +3035,7 @@ def f():
                 Some(shared_state.as_ref()),
                 None,
                 None,
+                BuildSpecializedFunctionOptions::default(),
             )
             .expect("specialized JIT build should succeed");
             (jit_module, built)
@@ -3147,6 +3151,7 @@ def f():
                 Some(shared_state.as_ref()),
                 None,
                 None,
+                BuildSpecializedFunctionOptions::default(),
             )
             .expect("specialized JIT build should succeed");
             let (clif, _cfg_dot, _vcode_disasm) = render_compiled_clif_and_vcode_disasm(
@@ -4199,6 +4204,7 @@ def read_point(point):
                 None,
                 None,
                 None,
+                BuildSpecializedFunctionOptions::default(),
             )
             .expect("specialized JIT build should succeed");
             let (clif, _cfg_dot, _vcode_disasm) = render_compiled_clif_and_vcode_disasm(
@@ -4271,6 +4277,22 @@ def read_point(point):
         blocks: &[ObjPtr],
         module_constants: &crate::module_constants::ModuleCodegenConstants,
     ) -> BuiltSpecializedFunction {
+        build_test_jit_function_with_constants_and_options(
+            module,
+            function,
+            blocks,
+            module_constants,
+            BuildSpecializedFunctionOptions::default(),
+        )
+    }
+
+    fn build_test_jit_function_with_constants_and_options(
+        module: &BlockPyModule<CodegenModuleShape>,
+        function: &BlockPyFunction<CodegenModuleShape>,
+        blocks: &[ObjPtr],
+        module_constants: &crate::module_constants::ModuleCodegenConstants,
+        options: BuildSpecializedFunctionOptions,
+    ) -> BuiltSpecializedFunction {
         unsafe {
             let compile_session = crate::session::CompileSession::new();
             let mut jit_module =
@@ -4300,6 +4322,7 @@ def read_point(point):
                 None,
                 None,
                 None,
+                options,
             )
             .expect("specialized JIT build should succeed")
         }
@@ -4340,6 +4363,7 @@ def read_point(point):
                 None,
                 None,
                 None,
+                BuildSpecializedFunctionOptions::default(),
             )
             .expect("specialized JIT build should succeed");
             inline_runtime_support_calls(&mut jit_module, &mut built.ctx, "test")
@@ -4435,6 +4459,37 @@ def read_point(point):
     ) -> usize {
         let mut count = 0usize;
         for block in function.layout.blocks() {
+            for inst in function.layout.block_insts(block) {
+                let callee = match function.dfg.insts[inst] {
+                    ir::InstructionData::Call { func_ref, .. }
+                    | ir::InstructionData::TryCall { func_ref, .. } => Some(func_ref),
+                    _ => None,
+                };
+                let Some(callee) = callee else {
+                    continue;
+                };
+                let ext_func = &function.dfg.ext_funcs[callee];
+                let ir::ExternalName::User(name_ref) = &ext_func.name else {
+                    continue;
+                };
+                let user_name = &function.params.user_named_funcs()[*name_ref];
+                if helpers.contains(user_name) {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    fn count_cold_block_direct_calls_to_runtime_helpers(
+        function: &ir::Function,
+        helpers: &[ir::UserExternalName],
+    ) -> usize {
+        let mut count = 0usize;
+        for block in function.layout.blocks() {
+            if !function.layout.is_cold(block) {
+                continue;
+            }
             for inst in function.layout.block_insts(block) {
                 let callee = match function.dfg.insts[inst] {
                     ir::InstructionData::Call { func_ref, .. }
@@ -5629,6 +5684,7 @@ def f():
                 None,
                 None,
                 None,
+                BuildSpecializedFunctionOptions::default(),
             )
             .expect("specialized JIT build should succeed");
             assert_eq!(
@@ -6377,6 +6433,7 @@ def f():
                     Some(shared_state.as_ref()),
                     None,
                     None,
+                    BuildSpecializedFunctionOptions::default(),
                 )
                 .expect("specialized JIT build should succeed");
 
@@ -6503,6 +6560,7 @@ def f(x, y):
                     Some(shared_state.as_ref()),
                     None,
                     None,
+                    BuildSpecializedFunctionOptions::default(),
                 )
                 .expect("specialized JIT build should succeed");
 
@@ -6686,6 +6744,48 @@ def f(x, y):
         assert_inlined_indexed_global_guard(
             &rendered,
             "global located names should inline the indexed-module-dict guard",
+        );
+    }
+
+    #[test]
+    fn indexed_global_guard_miss_can_target_cold_deopt_stub() {
+        let blocks = [1usize as ObjPtr];
+        let function = with_single_test_block(
+            test_function(),
+            vec![op_expr(Load::new(test_global_name("x")))],
+            ret_term(none_expr()),
+        );
+        let mut module = test_module(ModuleNameGen::new(0), vec![function]);
+        instrument_bb_module_with_call_target_counters(&mut module);
+        let function = module.callable_defs[0].clone();
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let built = build_test_jit_function_with_constants_and_options(
+            &module,
+            &function,
+            &blocks,
+            &module_constants,
+            BuildSpecializedFunctionOptions {
+                indexed_global_guard_miss_deopt_stub: true,
+            },
+        );
+        let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_unimplemented"]);
+        let slow_global_helpers =
+            import_user_names_for_symbols(&built, &["soac_runtime_load_global_slow"]);
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
+            1,
+            "test deopt guard mode should call the placeholder deopt helper"
+        );
+        assert_eq!(
+            count_cold_block_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
+            1,
+            "test deopt guard mode should isolate the deopt helper call in a cold block"
+        );
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &slow_global_helpers),
+            0,
+            "test deopt guard mode should not emit the local slow global-load fallback"
         );
     }
 
@@ -7418,6 +7518,7 @@ def f(x, y):
                     Some(shared_state.as_ref()),
                     None,
                     Some(&predeclared),
+                    BuildSpecializedFunctionOptions::default(),
                 )
                 .expect("specialized JIT build should succeed");
                 let alloc_helpers = import_user_names_for_symbols(

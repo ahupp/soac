@@ -1664,7 +1664,10 @@ fn emit_codegen_indexed_global_load(
     let guard_miss_target = ctx
         .guard_miss_target_before_instr_id(instr_id, fallback_block)
         .unwrap_or_else(|err| panic!("{err}"));
-    let guard_miss_dispatch = prepare_guard_miss_dispatch(guard_miss_target, None);
+    let guard_miss_dispatch = prepare_guard_miss_dispatch(
+        guard_miss_target,
+        ctx.indexed_global_guard_miss_deopt_stub_ref,
+    );
     let direct_block = fb.create_block();
     fb.append_block_param(direct_block, ptr_ty);
 
@@ -2449,6 +2452,7 @@ struct JitEmitCtx<'mc> {
     load_global_fast_ref: ir::FuncRef,
     probe_global_indexed_ref: ir::FuncRef,
     load_global_slow_ref: ir::FuncRef,
+    indexed_global_guard_miss_deopt_stub_ref: Option<ir::FuncRef>,
     store_global_indexed_ref: ir::FuncRef,
     probe_field_indexed_ref: ir::FuncRef,
     store_field_indexed_ref: ir::FuncRef,
@@ -12441,6 +12445,7 @@ impl ProcessJitEngine {
                 function_direct_call_resolver,
                 function_symbol_scope.as_deref(),
                 Some(&predeclared),
+                BuildSpecializedFunctionOptions::default(),
             )
             .map_err(|err| {
                 format!(
@@ -14094,6 +14099,11 @@ pub fn run_cranelift_smoke(module: &BlockPyModule<CodegenModuleShape>) -> Result
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct BuildSpecializedFunctionOptions {
+    indexed_global_guard_miss_deopt_stub: bool,
+}
+
 fn build_cranelift_run_bb_specialized_function(
     jit_module: &mut JITModule,
     blocks: &[ObjPtr],
@@ -14112,6 +14122,7 @@ fn build_cranelift_run_bb_specialized_function(
     direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
     symbol_scope: Option<&str>,
     predeclared_direct_functions: Option<&HashMap<FunctionId, DeclaredJitFunction>>,
+    options: BuildSpecializedFunctionOptions,
 ) -> Result<BuiltSpecializedFunction, String> {
     let block_count = function.blocks.len();
     if block_count == 0 {
@@ -14526,6 +14537,14 @@ fn build_cranelift_run_bb_specialized_function(
             &mut fb.func,
             &SOAC_RUNTIME_LOAD_GLOBAL_SLOW_IMPORT,
         );
+        let indexed_global_guard_miss_deopt_stub_ref =
+            options.indexed_global_guard_miss_deopt_stub.then(|| {
+                func_imports.get_or_panic(
+                    jit_module,
+                    &mut fb.func,
+                    &DP_JIT_DEOPT_UNIMPLEMENTED_IMPORT,
+                )
+            });
         let store_global_indexed_ref = func_imports.get_or_panic(
             jit_module,
             &mut fb.func,
@@ -14815,6 +14834,7 @@ fn build_cranelift_run_bb_specialized_function(
                 load_global_fast_ref,
                 probe_global_indexed_ref,
                 load_global_slow_ref,
+                indexed_global_guard_miss_deopt_stub_ref,
                 store_global_indexed_ref,
                 probe_field_indexed_ref,
                 store_field_indexed_ref,
@@ -15295,6 +15315,7 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
         runtime_state,
         None,
         None,
+        BuildSpecializedFunctionOptions::default(),
     )?;
     let mut out = String::new();
     out.push_str("; import fn aliases (Cranelift display id -> symbol)\n");
