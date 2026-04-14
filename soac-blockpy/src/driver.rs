@@ -215,6 +215,14 @@ pub(crate) fn rewrite_module_with_tracker_with_options(
         passes::validate_ownership_effects(&bb_codegen, &value_facts, &ownership_plan)
             .map_err(anyhow::Error::msg)
     })?;
+    let local_env_plan: passes::LocalEnvModulePlan = pass_tracker
+        .record_timing("local_env_plan", || {
+            passes::plan_local_env_module(&bb_codegen, &value_facts)
+        });
+    pass_tracker.record_timing("validate_local_env_plan", || {
+        passes::validate_local_env_module_plan(&bb_codegen, &value_facts, &local_env_plan)
+            .map_err(anyhow::Error::msg)
+    })?;
 
     let bb_traced: BlockPyModule<CodegenModuleShape> =
         if let Some(config) = passes::parse_trace_env() {

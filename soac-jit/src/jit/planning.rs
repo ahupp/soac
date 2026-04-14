@@ -1,212 +1,22 @@
 use soac_blockpy::block_py::{
     BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, CodegenBlock, FunctionId,
-    LocalLocation,
+};
+pub use soac_blockpy::passes::{
+    BlockParamFacts, FunctionLocalPlan, LocalRefKind, ParamBindingFacts, ParamProvenance,
+    PlannedLocalBinding, PlannedLocalStorage, plan_function_locals,
 };
 use soac_blockpy::passes::{
-    CodegenModuleShape, FactStore, FunctionRefcountPlan, PyObjFacts, RefcountActionKind,
-    RefcountReleaseReason, compute_function_local_live_ins, compute_function_local_must_bound_ins,
-    plan_ownership_effects, validate_ownership_effects,
+    CodegenModuleShape, FactStore, FunctionRefcountPlan, RefcountActionKind, RefcountReleaseReason,
+    compute_function_local_live_ins, compute_function_local_must_bound_ins, plan_ownership_effects,
+    validate_ownership_effects,
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LocalRefKind {
-    Unknown,
-    Owned,
-    Borrowed,
-    Immortal,
-    Unbound,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PlannedLocalStorage {
-    BlockParam,
-    StackSlot,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ParamBindingFacts {
-    DefinitelyBound,
-    CheckedLocalValue,
-    MaybeUnbound,
-}
-
-impl ParamBindingFacts {
-    pub const fn requires_checked_local_load(self) -> bool {
-        !matches!(self, Self::DefinitelyBound)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ParamProvenance {
-    ExplicitBlockParam(LocalLocation),
-    ForwardedLocal(LocalLocation),
-    SyntheticUnbound(LocalLocation),
-    StackSlot(LocalLocation),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BlockParamFacts {
-    pub value: Option<PyObjFacts>,
-    pub binding: ParamBindingFacts,
-    pub provenance: ParamProvenance,
-    pub ownership: LocalRefKind,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PlannedLocalBinding {
-    pub name: String,
-    pub location: LocalLocation,
-    pub storage: PlannedLocalStorage,
-    pub param_facts: BlockParamFacts,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BlockLocalPlan {
-    pub label: BlockLabel,
-    pub entry_locals: Vec<PlannedLocalBinding>,
-}
-
-fn is_try_exception_alias_name(name: &str) -> bool {
-    name.starts_with("_dp_try_exc_")
-}
 
 fn can_release_via_stack_slot_fallback(name: &str) -> bool {
     name.starts_with("_dp_try_exc_")
         || name.starts_with("_dp_try_abrupt_kind_")
         || name.starts_with("_dp_try_abrupt_payload_")
-}
-
-impl BlockLocalPlan {
-    pub fn binding_for_name(&self, name: &str) -> Option<&PlannedLocalBinding> {
-        self.entry_locals
-            .iter()
-            .find(|binding| binding.name == name)
-    }
-
-    pub fn binding_for_block_arg_name(&self, name: &str) -> Option<&PlannedLocalBinding> {
-        self.binding_for_name(name).or_else(|| {
-            if !is_try_exception_alias_name(name) {
-                return None;
-            }
-            self.entry_locals
-                .iter()
-                .find(|binding| is_try_exception_alias_name(binding.name.as_str()))
-        })
-    }
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct FunctionLocalPlan {
-    pub blocks: HashMap<BlockLabel, BlockLocalPlan>,
-}
-
-impl FunctionLocalPlan {
-    pub fn block(&self, label: BlockLabel) -> Option<&BlockLocalPlan> {
-        self.blocks.get(&label)
-    }
-}
-
-pub fn plan_function_locals(
-    function: &BlockPyFunction<CodegenModuleShape>,
-    facts: &FactStore,
-) -> FunctionLocalPlan {
-    let Some(storage_layout) = function.storage_layout().as_ref() else {
-        return FunctionLocalPlan::default();
-    };
-    let live_ins = compute_function_local_live_ins(function);
-    let must_bound_ins = compute_function_local_must_bound_ins(function);
-    let entry_label = function.entry_block().label;
-    let mut blocks = HashMap::with_capacity(function.blocks.len());
-    for block in &function.blocks {
-        let entry_facts = facts.block_entry_fact(function.function_id, block.label);
-        let is_entry_block = block.label == entry_label;
-        let live_in_locations = live_ins.get(&block.label).cloned().unwrap_or_default();
-        let must_bound_locations = must_bound_ins
-            .get(&block.label)
-            .cloned()
-            .unwrap_or_default();
-        let explicit_param_names = block.param_names().collect::<HashSet<_>>();
-        let entry_locals = storage_layout
-            .stack_slots()
-            .iter()
-            .enumerate()
-            .map(|(slot, name)| {
-                let location = LocalLocation(
-                    u32::try_from(slot).expect("storage layout slot index should fit in u32"),
-                );
-                let is_function_param_on_entry = is_entry_block
-                    && function
-                        .params
-                        .iter()
-                        .any(|param| param.name == name.as_str());
-                let is_must_bound_on_entry = must_bound_locations.contains(&location);
-                let py_facts = entry_facts
-                    .and_then(|env| env.local_pyobj_fact(location))
-                    .filter(|_| is_must_bound_on_entry);
-                let is_live_in = live_in_locations.contains(&location);
-                let storage = if explicit_param_names.contains(name.as_str()) {
-                    PlannedLocalStorage::BlockParam
-                } else if is_function_param_on_entry {
-                    PlannedLocalStorage::BlockParam
-                } else if is_live_in || is_must_bound_on_entry {
-                    PlannedLocalStorage::BlockParam
-                } else {
-                    PlannedLocalStorage::StackSlot
-                };
-                let binding_facts =
-                    if explicit_param_names.contains(name.as_str()) || is_function_param_on_entry {
-                        ParamBindingFacts::DefinitelyBound
-                    } else if is_must_bound_on_entry {
-                        match storage {
-                            PlannedLocalStorage::BlockParam => ParamBindingFacts::DefinitelyBound,
-                            PlannedLocalStorage::StackSlot => ParamBindingFacts::CheckedLocalValue,
-                        }
-                    } else {
-                        ParamBindingFacts::MaybeUnbound
-                    };
-                let provenance = if explicit_param_names.contains(name.as_str()) {
-                    ParamProvenance::ExplicitBlockParam(location)
-                } else if is_function_param_on_entry {
-                    ParamProvenance::ForwardedLocal(location)
-                } else if is_entry_block && storage == PlannedLocalStorage::BlockParam {
-                    ParamProvenance::SyntheticUnbound(location)
-                } else if storage == PlannedLocalStorage::BlockParam {
-                    ParamProvenance::ForwardedLocal(location)
-                } else {
-                    ParamProvenance::StackSlot(location)
-                };
-                PlannedLocalBinding {
-                    name: name.clone(),
-                    location,
-                    storage,
-                    param_facts: BlockParamFacts {
-                        value: py_facts,
-                        binding: binding_facts,
-                        provenance,
-                        ownership: local_ref_kind_for_block_entry(
-                            function,
-                            is_entry_block,
-                            name,
-                            explicit_param_names.contains(name.as_str())
-                                || is_function_param_on_entry,
-                            is_must_bound_on_entry,
-                            py_facts,
-                        ),
-                    },
-                }
-            })
-            .collect();
-        blocks.insert(
-            block.label,
-            BlockLocalPlan {
-                label: block.label,
-                entry_locals,
-            },
-        );
-    }
-    FunctionLocalPlan { blocks }
 }
 
 pub fn plan_function_refcount_ownership(
@@ -331,31 +141,6 @@ fn check_local_has_storage_layout_entry(
          but the current JIT cleanup model only tracks storage-layout locals",
         function.function_id, function.names.qualname
     ));
-}
-
-fn local_ref_kind_for_block_entry(
-    function: &BlockPyFunction<CodegenModuleShape>,
-    is_entry_block: bool,
-    name: &str,
-    is_explicit_block_param: bool,
-    is_must_bound_on_entry: bool,
-    facts: Option<PyObjFacts>,
-) -> LocalRefKind {
-    match facts {
-        Some(facts) if facts.is_immortal() => return LocalRefKind::Immortal,
-        Some(_) => return LocalRefKind::Owned,
-        None => {}
-    }
-    if is_entry_block && function.params.iter().any(|param| param.name == name) {
-        return LocalRefKind::Owned;
-    }
-    if is_explicit_block_param {
-        return LocalRefKind::Owned;
-    }
-    if is_must_bound_on_entry {
-        return LocalRefKind::Owned;
-    }
-    LocalRefKind::Unbound
 }
 
 #[derive(Clone, Debug)]
@@ -1425,8 +1210,9 @@ pub fn plan_jit_function_locals(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soac_blockpy::block_py::BlockTerm;
+    use soac_blockpy::block_py::{BlockTerm, LocalLocation};
     use soac_blockpy::lower_python_to_blockpy_for_testing;
+    use soac_blockpy::passes::BlockLocalPlan;
     use soac_blockpy::passes::{
         RefcountActionKind, RefcountReleaseReason, infer_module_value_facts,
     };

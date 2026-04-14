@@ -8,6 +8,7 @@ pub(crate) mod core_await_lower;
 mod global_index;
 mod instr_id;
 mod instrument;
+mod local_env_plan;
 mod name_binding;
 mod ownership_effects;
 pub mod ruff_to_blockpy;
@@ -660,6 +661,11 @@ pub use instr_id::{
 };
 pub use instrument::{
     CounterBuilder, CounterHandle, CounterSpec, InstrumentInstr, OptBlock, OptInstr,
+};
+pub use local_env_plan::{
+    plan_function_locals, plan_local_env_module, validate_local_env_module_plan, BlockLocalPlan,
+    BlockParamFacts, FunctionLocalPlan, LocalEnvModulePlan, LocalRefKind, ParamBindingFacts,
+    ParamProvenance, PlannedLocalBinding, PlannedLocalStorage,
 };
 pub use ownership_effects::{
     compute_function_local_live_ins, compute_function_local_must_bound_ins, plan_ownership_effects,
