@@ -1534,15 +1534,20 @@ impl RuntimeJitDeoptInvocation<'_> {
         self.record
     }
 
-    pub(crate) fn live_values(&self) -> &'_ [ObjPtr] {
-        self.live_values
+    pub(crate) fn live_bindings(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (&'_ LocalEnvResumeBinding, ObjPtr)> + '_ {
+        self.record
+            .locals()
+            .iter()
+            .zip(self.live_values.iter().copied())
     }
 
     pub(crate) fn describe(&self) -> String {
         format!(
             "{}, live values {}",
             self.record().describe(self.table.function_id()),
-            self.live_values().len()
+            self.live_bindings().len()
         )
     }
 }

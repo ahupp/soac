@@ -1255,36 +1255,54 @@ pub unsafe extern "C" fn dp_jit_deopt_unimplemented(
     live_values: ObjPtr,
     live_value_count: i64,
 ) -> ObjPtr {
-    set_deopt_unimplemented_error(deopt_table, record_ordinal, live_values, live_value_count);
-    ptr::null_mut()
+    match unsafe {
+        run_deopt_unimplemented(deopt_table, record_ordinal, live_values, live_value_count)
+    } {
+        Ok(value) => value,
+        Err(detail) => {
+            set_deopt_unimplemented_error(detail);
+            ptr::null_mut()
+        }
+    }
 }
 
 #[cold]
-unsafe fn set_deopt_unimplemented_error(
+unsafe fn run_deopt_unimplemented(
     deopt_table: ObjPtr,
     record_ordinal: i64,
     live_values: ObjPtr,
     live_value_count: i64,
-) {
-    let detail = match unsafe {
+) -> Result<ObjPtr, String> {
+    let invocation = unsafe {
         RuntimeJitDeoptInvocation::from_raw(
             deopt_table,
             record_ordinal,
             live_values,
             live_value_count,
-        )
-    } {
-        Ok(invocation) => invocation.describe(),
-        Err(err) => err,
+        )?
     };
+    execute_deopt_invocation(&invocation)
+}
+
+#[cold]
+fn execute_deopt_invocation(invocation: &RuntimeJitDeoptInvocation<'_>) -> Result<ObjPtr, String> {
+    Err(invocation.describe())
+}
+
+#[cold]
+fn set_deopt_unimplemented_error(detail: String) {
     let message = format!("JIT deopt helper is not implemented: {detail}");
     if let Ok(c_message) = std::ffi::CString::new(message) {
-        ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_message.as_ptr());
+        unsafe {
+            ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_message.as_ptr());
+        }
     } else {
-        ffi::PyErr_SetString(
-            ffi::PyExc_RuntimeError,
-            b"JIT deopt helper is not implemented\0".as_ptr() as *const i8,
-        );
+        unsafe {
+            ffi::PyErr_SetString(
+                ffi::PyExc_RuntimeError,
+                b"JIT deopt helper is not implemented\0".as_ptr() as *const i8,
+            );
+        }
     }
 }
 pub unsafe extern "C" fn dp_jit_tuple_new(size: i64) -> ObjPtr {
