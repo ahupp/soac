@@ -302,6 +302,14 @@ globals are out of scope for now.
   rerun only the verify pass to produce `verify.bin`, then add the same
   deep-profile artifacts without rerunning the profile pass.
 
+- `just precompile-shared-library counters=<profile.bin> out=<lib.so>`
+  Offline precompile a counter-referenced set of cached BlockPy modules into
+  relocatable object files and link them into a shared library. The counter file
+  normally comes from a previous profile pass, and the matching pre-optimization
+  BlockPy cache entries must still exist in `SOAC_MODULE_CACHE_DIR`
+  (`soac-module-cache` by default). When `counters` is omitted, the recipe uses
+  `$LAST_BENCHMARK_COUNTERS`.
+
 - `SOAC_JIT_PERF_HELPER_FRAMES=1`
   In `fn should_preserve_perf_helper_frames`, at
   [soac-jit/src/jit/specialized_helpers.rs:1700](/home/adam/project/soac-profile/soac-jit/src/jit/specialized_helpers.rs#L1700),

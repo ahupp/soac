@@ -7,7 +7,7 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 const SOAC_BUILD_IDENTITY: &str = env!("SOAC_BUILD_IDENTITY");
 
@@ -44,7 +44,11 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let args = parse_args(env::args_os().skip(1))?;
+    run_with_args(env::args_os().skip(1))
+}
+
+fn run_with_args(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
+    let args = parse_args(args)?;
     let counters_path = args
         .counters
         .ok_or_else(|| "missing required --counters <path>".to_string())?;
@@ -438,7 +442,9 @@ fn print_usage() {
 #[cfg(test)]
 mod test {
     use super::*;
+    use soac_blockpy::{LoweringOptions, lower_python_to_blockpy_recorded_with_options};
     use soac_jit::counter_dump::{CounterDumpRecord, CounterDumpRow, parse_counter_dump_records};
+    use soac_jit::module_type::hash_module_source;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -532,6 +538,71 @@ mod test {
         );
     }
 
+    #[test]
+    fn offline_precompile_links_shared_library_from_counter_dump_and_cache() {
+        if !linker_available(OsStr::new("cc")) {
+            eprintln!("skipping offline precompile shared-library test: cc is unavailable");
+            return;
+        }
+
+        let root = unique_temp_dir();
+        let source = "def f(a, b):\n    return a + b\n";
+        let module_name = "pkg.mod";
+        let module_id = 7;
+        let source_hash = hash_module_source(source);
+        let module_ref = CounterModuleRef {
+            module_name: module_name.to_string(),
+            source_hash,
+            module_id: Some(module_id),
+        };
+        let cache_root = root.join("soac-module-cache");
+        let cache_path =
+            module_cache_path_for_identity(cache_root.as_path(), &module_ref, SOAC_BUILD_IDENTITY)
+                .unwrap();
+        let output = lower_python_to_blockpy_recorded_with_options(
+            source,
+            ModuleNameGen::new(module_id),
+            LoweringOptions {
+                runtime_names_as_globals: false,
+                pre_optimization_cache_path: Some(cache_path.clone()),
+            },
+        )
+        .unwrap();
+        assert!(
+            cache_path.exists(),
+            "lowering should populate the module cache"
+        );
+        let function_id = output
+            .codegen_module
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "f")
+            .map(|function| function.function_id)
+            .expect("test module should contain f");
+        let counters_path = root.join("profile.bin");
+        let record = counter_record(module_name, source_hash, Some(function_id));
+        fs::write(counters_path.as_path(), record.encode().unwrap()).unwrap();
+
+        let out_path = root.join("libsoac_precompiled_test.so");
+        let object_dir = root.join("objects");
+        run_with_args([
+            OsString::from("--counters"),
+            counters_path.into_os_string(),
+            OsString::from("--module-cache-dir"),
+            cache_root.into_os_string(),
+            OsString::from("--out"),
+            out_path.clone().into_os_string(),
+            OsString::from("--object-dir"),
+            object_dir.clone().into_os_string(),
+        ])
+        .unwrap();
+
+        let object_path = object_dir.join(object_file_name(&module_ref));
+        assert_elf_file(object_path.as_path());
+        assert_elf_file(out_path.as_path());
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn counter_record(
         module_name: &str,
         source_hash: u64,
@@ -574,5 +645,27 @@ mod test {
             "soac-precompile-blockpy-test-{}-{unique}",
             std::process::id()
         ))
+    }
+
+    fn linker_available(linker: &OsStr) -> bool {
+        Command::new(linker)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    fn assert_elf_file(path: &Path) {
+        let bytes = fs::read(path).unwrap_or_else(|err| {
+            panic!("failed to read emitted ELF file {}: {err}", path.display())
+        });
+        assert!(
+            bytes.starts_with(b"\x7fELF"),
+            "{} should be an ELF file",
+            path.display()
+        );
     }
 }

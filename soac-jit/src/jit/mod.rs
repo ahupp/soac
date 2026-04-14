@@ -14672,7 +14672,7 @@ fn precompile_codegen_module_to_object_bytes(
     let module_constants = ModuleCodegenConstants::collect_from_module(module);
     let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
     let module_constant_symbol_prefix = module_constant_symbol_prefix(module);
-    let module_constant_slot_data_ids = define_module_constant_slot_data_for_prefix(
+    let module_constant_object_data_ids = declare_module_constant_object_data_for_prefix(
         &mut jit_module,
         module_constant_symbol_prefix.as_str(),
         module_constant_ptrs.as_slice(),
@@ -14700,10 +14700,10 @@ fn precompile_codegen_module_to_object_bytes(
     };
 
     let mut data_definitions = Vec::new();
-    for (index, data_id) in module_constant_slot_data_ids.iter().copied().enumerate() {
+    for (index, data_id) in module_constant_object_data_ids.iter().copied().enumerate() {
         data_definitions.push(ObjectDataDefinition {
             data_id,
-            symbol: module_constant_slot_symbol(
+            symbol: module_constant_object_symbol(
                 module_constant_symbol_prefix.as_str(),
                 ModuleConstantId(index),
             ),
@@ -14750,6 +14750,7 @@ fn precompile_codegen_module_to_object_bytes(
 
     let value_facts = infer_jit_value_facts(module);
     let jit_module_local_plan = plan_jit_module_locals(module, &value_facts)?;
+    let jit_module_deopt_resume_plan = plan_jit_deopt_resume_module(module, &value_facts)?;
     let mut predeclared = HashMap::new();
     let mut symbol_scopes = HashMap::new();
     for function in &module.callable_defs {
@@ -14772,6 +14773,14 @@ fn precompile_codegen_module_to_object_bytes(
                     function.function_id, function.names.qualname
                 )
             })?;
+        let jit_deopt_resume_plan = jit_module_deopt_resume_plan
+            .function(function.function_id)
+            .ok_or_else(|| {
+                format!(
+                    "missing JIT deopt resume plan for function {} ({})",
+                    function.function_id, function.names.qualname
+                )
+            })?;
         let built = build_cranelift_run_bb_specialized_function(
             &mut jit_module,
             placeholder_blocks.as_slice(),
@@ -14779,9 +14788,10 @@ fn precompile_codegen_module_to_object_bytes(
             function,
             &value_facts,
             jit_local_plan,
+            jit_deopt_resume_plan,
             &module_constants,
             module.counter_defs.as_slice(),
-            module_constant_slot_data_ids.as_slice(),
+            module_constant_object_data_ids.as_slice(),
             counter_slots_by_id.as_ref(),
             scalar_counter_data_id,
             top_value_counter_data_id,
@@ -14790,6 +14800,7 @@ fn precompile_codegen_module_to_object_bytes(
             &specialization_profile,
             symbol_scopes.get(&function.function_id).map(String::as_str),
             Some(&predeclared),
+            BuildSpecializedFunctionOptions::default(),
         )
         .map_err(|err| {
             format!(

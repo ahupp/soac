@@ -1197,6 +1197,38 @@ benchmark benchmark_loops="1000000" verify_loops="100000" results_root="bench" r
 
   echo "benchmark result: $result_dir"
 
+precompile-shared-library counters="" out="logs/libsoac_precompiled.so" object_dir="":
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cd "$REPO_ROOT"
+
+  COUNTERS="{{counters}}"
+  if [[ -z "$COUNTERS" ]]; then
+    COUNTERS="$LAST_BENCHMARK_COUNTERS"
+  elif [[ "$COUNTERS" != /* ]]; then
+    COUNTERS="$REPO_ROOT/$COUNTERS"
+  fi
+  if [[ ! -f "$COUNTERS" ]]; then
+    echo "counter profile not found at $COUNTERS; run 'just benchmark' first or pass counters=<profile.bin>" >&2
+    exit 1
+  fi
+
+  OUT="{{out}}"
+  if [[ "$OUT" != /* ]]; then
+    OUT="$REPO_ROOT/$OUT"
+  fi
+
+  args=(--counters "$COUNTERS" --out "$OUT")
+  OBJECT_DIR="{{object_dir}}"
+  if [[ -n "$OBJECT_DIR" ]]; then
+    if [[ "$OBJECT_DIR" != /* ]]; then
+      OBJECT_DIR="$REPO_ROOT/$OBJECT_DIR"
+    fi
+    args+=(--object-dir "$OBJECT_DIR")
+  fi
+
+  cargo run -p soac-inspector --bin precompile_blockpy -- "${args[@]}"
+
 [private]
 _benchmark-export-specialized-artifacts result_dir:
   #!/usr/bin/env bash
