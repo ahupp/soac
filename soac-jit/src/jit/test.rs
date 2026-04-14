@@ -12637,6 +12637,255 @@ def f(x):
     }
 
     #[test]
+    fn specialized_jit_exact_int_unary_guard_miss_deopts_for_replay_safe_operand() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "specialized_jit_exact_int_unary_guard_miss_deopts_for_replay_safe_operand",
+        ) {
+            return;
+        }
+        let blocks = [1usize as ObjPtr];
+        let mut function = test_function();
+        function.params = ParamSpec {
+            params: vec![Param {
+                name: "value".into(),
+                kind: ParamKind::Any,
+                has_default: false,
+            }],
+        };
+        let block_label = function.name_gen.next_block_name();
+        let instr_id = InstrId::new(block_label, 0);
+        function.blocks = vec![CodegenBlock {
+            label: block_label,
+            body: vec![],
+            term: ret_term(with_instr_id(
+                op_expr(UnaryOp::new(
+                    UnaryOpKind::Neg,
+                    name_expr(test_name("value")),
+                )),
+                instr_id,
+            )),
+            params: vec![],
+            exc_edge: None,
+        }];
+        set_stack_slots(&mut function, &["value"]);
+        let (_jit_module, built) = build_test_jit_function_with_operator_specializations(
+            &function,
+            &blocks,
+            Vec::new(),
+            &[(
+                instr_id,
+                crate::operator_specialization::pack_unary_shape(
+                    crate::operator_specialization::ExactTypeTag::Int,
+                ),
+            )],
+        );
+        let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
+        let generic_neg_helpers = import_user_names_for_symbols(&built, &["PyNumber_Negative"]);
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
+            1,
+            "replay-safe exact-int unary op guard miss should call the deopt resume helper"
+        );
+        assert_eq!(
+            count_cold_block_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
+            1,
+            "exact-int unary op deopt helper call should be cold"
+        );
+        assert_eq!(
+            count_deopt_helper_success_returns(&built.ctx.func, &deopt_helpers),
+            1,
+            "exact-int unary op deopt should return a successful continuation result"
+        );
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &generic_neg_helpers),
+            0,
+            "replay-safe exact-int unary op should not emit the local generic neg fallback"
+        );
+    }
+
+    #[test]
+    fn exact_int_unary_guard_miss_deopt_resumes_generic_unary_runtime() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "exact_int_unary_guard_miss_deopt_resumes_generic_unary_runtime",
+        ) {
+            return;
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| unsafe {
+            #[repr(C)]
+            struct TestFunctionEnv {
+                direct_code_ptr: *const u8,
+                default_direct_code_ptr: *const u8,
+                deopt_table_ptr: ObjPtr,
+                globals_obj: ObjPtr,
+            }
+
+            let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "apply");
+            let soac_work_dir = fresh_test_work_dir("exact-int-unary-deopt-runtime");
+            let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
+            let mut function = test_function();
+            function.params = ParamSpec {
+                params: vec![Param {
+                    name: "value".into(),
+                    kind: ParamKind::Any,
+                    has_default: false,
+                }],
+            };
+            let block_label = function.name_gen.next_block_name();
+            let instr_id = InstrId::new(block_label, 0);
+            function.blocks = vec![CodegenBlock {
+                label: block_label,
+                body: vec![],
+                term: ret_term(with_instr_id(
+                    op_expr(UnaryOp::new(
+                        UnaryOpKind::Neg,
+                        name_expr(test_name("value")),
+                    )),
+                    instr_id,
+                )),
+                params: vec![],
+                exc_edge: None,
+            }];
+            set_stack_slots(&mut function, &["value"]);
+            let mut module = test_module(ModuleNameGen::new(0), vec![function]);
+            instrument_bb_module_with_call_target_counters(&mut module);
+            let function = module.callable_defs[0].clone();
+            write_test_counter_dump(
+                soac_work_dir.join("profile.bin").as_path(),
+                &CounterDumpRecord {
+                    source_hash: 0,
+                    module_name: "operator_deopt_runtime_test".to_string(),
+                    package_name: None,
+                    rows: vec![CounterDumpRow {
+                        counter_id: 0,
+                        scope: "this".to_string(),
+                        kind: "operator_hot_shapes".to_string(),
+                        site_kind: "runtime".to_string(),
+                        function_id: Some(function.function_id),
+                        current_function_id: Some(function.function_id),
+                        instr_id: Some(instr_id),
+                        function_qualname: Some(function.names.qualname.clone()),
+                        block_label: None,
+                        value: 1,
+                        observed_value: Some(crate::operator_specialization::pack_unary_shape(
+                            crate::operator_specialization::ExactTypeTag::Int,
+                        )),
+                        max_overcount: Some(0),
+                    }],
+                    module_keys: Vec::new(),
+                    type_keys: Vec::new(),
+                    type_table: Vec::new(),
+                },
+            );
+            let shared_state = crate::module_type::build_shared_state_for_testing(
+                py,
+                module,
+                "operator_deopt_runtime_test",
+                "",
+            )
+            .expect("shared state should build");
+            let _runtime = build_test_module_runtime(py, shared_state.clone());
+            let function = shared_state.lowered_module.callable_defs[0].clone();
+            let compile_session = crate::session::CompileSession::new();
+            let mut jit_module =
+                new_jit_module(&compile_session).expect("test jit module should construct");
+            let module_constant_ptrs = shared_state.module_constant_ptrs();
+            let module_constant_object_data_ids = declare_module_constant_object_data(
+                &mut jit_module,
+                &shared_state.lowered_module,
+                &module_constant_ptrs,
+            )
+            .expect("module constant object data should declare");
+            let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
+                define_test_counter_storage(
+                    &mut jit_module,
+                    &shared_state.lowered_module,
+                    shared_state.lowered_module.counter_defs.as_slice(),
+                );
+            let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
+            let built = build_test_cranelift_run_bb_specialized_function(
+                &mut jit_module,
+                blocks.as_slice(),
+                &shared_state.lowered_module,
+                &function,
+                &shared_state.codegen_constants,
+                shared_state.lowered_module.counter_defs.as_slice(),
+                module_constant_object_data_ids.as_slice(),
+                counter_slots_by_id.as_ref(),
+                scalar_counter_data_id,
+                top_value_counter_data_id,
+                &compile_session,
+                Some(shared_state.as_ref()),
+                None,
+                None,
+                BuildSpecializedFunctionOptions::default(),
+            )
+            .expect("specialized JIT build should succeed");
+            let facts = infer_jit_value_facts(&shared_state.lowered_module);
+            let module_plan = plan_jit_deopt_resume_module(&shared_state.lowered_module, &facts)
+                .expect("JIT deopt resume planning should succeed");
+            let function_plan = module_plan
+                .function(function.function_id)
+                .expect("function should have a JIT deopt plan");
+            let deopt_table =
+                RuntimeJitDeoptTable::from_plan(&function, function_plan, &module_constant_ptrs)
+                    .expect("runtime deopt table should build from plan");
+
+            let mut ctx = built.ctx;
+            define_prepared_function(
+                &mut jit_module,
+                built.main_id,
+                &mut ctx,
+                "test-exact-int-unary-deopt-resume",
+                "exact-int unary deopt test should define",
+            )
+            .expect("test function should define");
+            jit_module.clear_context(&mut ctx);
+            jit_module
+                .finalize_definitions()
+                .expect("test jit module should finalize");
+            let code_ptr = jit_module.get_finalized_function(built.main_id);
+
+            let globals = ffi::PyDict_New();
+            assert!(!globals.is_null(), "test globals dict should allocate");
+            let value = ffi::PyBool_FromLong(1);
+            assert!(!value.is_null(), "bool value should allocate");
+
+            let function_env = TestFunctionEnv {
+                direct_code_ptr: code_ptr,
+                default_direct_code_ptr: std::ptr::null(),
+                deopt_table_ptr: std::ptr::addr_of!(deopt_table).cast_mut().cast(),
+                globals_obj: globals.cast(),
+            };
+            let entry: unsafe extern "C" fn(ObjPtr, ObjPtr, ObjPtr) -> ObjPtr =
+                std::mem::transmute(code_ptr);
+            let result = entry(
+                std::ptr::addr_of!(function_env).cast_mut().cast(),
+                ffi::PyThreadState_Get().cast(),
+                value.cast(),
+            );
+            if !ffi::PyErr_Occurred().is_null() {
+                ffi::PyErr_Print();
+                panic!(
+                    "successful exact-int unary guard-miss deopt should not leave a Python exception"
+                );
+            }
+            assert_eq!(
+                ffi::PyLong_AsLong(result.cast()),
+                -1,
+                "exact-int unary guard-miss deopt should resume and execute generic bool negation"
+            );
+
+            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+            ffi::Py_DECREF(value);
+            ffi::Py_DECREF(globals);
+        });
+    }
+
+    #[test]
     fn apply_mode_operator_specialization_omits_top_value_counter_helper_imports() {
         let blocks = [1usize as ObjPtr];
         let mut constants = TestConstantPool::default();

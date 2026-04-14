@@ -526,19 +526,23 @@ apply/verify mode:
 
 - Unary specialization is emitted in
   `emit_specialized_unary_op`, at
-  `soac-jit/src/jit/intrinsics.rs:801`.
+  `soac-jit/src/jit/intrinsics.rs`.
 - The fast path:
   - records the observed unary operand shape
   - checks for exact `int`
   - on hit, calls the exact-int unary helper
-  - on miss, falls back to generic Python unary lowering
+  - on miss in `verify`/`apply` mode, deopts to the generic
+    continuation when the operand is safe to replay
+  - on miss without a deopt plan, falls back to generic Python unary
+    lowering
 
 ### Limitations / Soundness / Extensions
 
 - Current limitations:
   - only exact `int`
 - Soundness boundary:
-  - exact-type guard plus generic fallback
+  - exact-type guard plus deopt to the generic continuation or generic
+    fallback
 - Natural extensions:
   - additional exact-type tags
   - mixed numeric shape handling where unary semantics make sense
