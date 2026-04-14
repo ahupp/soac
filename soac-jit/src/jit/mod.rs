@@ -2854,37 +2854,16 @@ fn emit_codegen_indexed_global_load(
                 ctx.global_indexed_fallback_counter_ids,
                 instr_id,
             );
-            let (live_values_base, live_value_count) =
-                emit_deopt_live_value_buffer(fb, target, ctx, local_env)
-                    .unwrap_or_else(|err| panic!("{err}"));
-            let deopt_result = emit_deopt_resume_call(
+            let deopt_result = emit_deopt_resume_call_with_local_env(
                 fb,
                 target,
                 deopt_resume_ref,
                 globals_obj,
-                live_values_base,
-                live_value_count,
-                ctx.consts.ptr_ty,
-                ctx.consts.i64_ty,
+                ctx,
+                local_env,
             );
             emit_release_owned_inputs(fb, ctx, &[name_obj]);
-            let deopt_result_is_null =
-                fb.ins()
-                    .icmp(ir::condcodes::IntCC::Equal, deopt_result, null_ptr);
-            let deopt_success_block = fb.create_block();
-            fb.append_block_param(deopt_success_block, ptr_ty);
-            fb.set_cold_block(deopt_success_block);
-            fb.ins().brif(
-                deopt_result_is_null,
-                ctx.consts.step_null_block,
-                &step_null_block_args(ctx),
-                deopt_success_block,
-                &[ir::BlockArg::Value(deopt_result)],
-            );
-
-            fb.switch_to_block(deopt_success_block);
-            let resumed_result = fb.block_params(deopt_success_block)[0];
-            fb.ins().return_(&[resumed_result]);
+            emit_deopt_result_return_or_step_null(fb, ctx, deopt_result);
         }
     }
 
@@ -3780,6 +3759,55 @@ fn emit_deopt_resume_call(
         ],
     );
     fb.inst_results(call_inst)[0]
+}
+
+fn emit_deopt_resume_call_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    target: JitDeoptExitRef,
+    deopt_resume_ref: ir::FuncRef,
+    globals_obj: ir::Value,
+    ctx: &JitEmitCtx<'_>,
+    local_env: &LocalEnv,
+) -> ir::Value {
+    let (live_values_base, live_value_count) =
+        emit_deopt_live_value_buffer(fb, target, ctx, local_env)
+            .unwrap_or_else(|err| panic!("{err}"));
+    emit_deopt_resume_call(
+        fb,
+        target,
+        deopt_resume_ref,
+        globals_obj,
+        live_values_base,
+        live_value_count,
+        ctx.consts.ptr_ty,
+        ctx.consts.i64_ty,
+    )
+}
+
+fn emit_deopt_result_return_or_step_null(
+    fb: &mut FunctionBuilder<'_>,
+    ctx: &JitEmitCtx<'_>,
+    deopt_result: ir::Value,
+) {
+    let ptr_ty = ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let deopt_result_is_null = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, deopt_result, null_ptr);
+    let deopt_success_block = fb.create_block();
+    fb.append_block_param(deopt_success_block, ptr_ty);
+    fb.set_cold_block(deopt_success_block);
+    fb.ins().brif(
+        deopt_result_is_null,
+        ctx.consts.step_null_block,
+        &step_null_block_args(ctx),
+        deopt_success_block,
+        &[ir::BlockArg::Value(deopt_result)],
+    );
+
+    fb.switch_to_block(deopt_success_block);
+    let resumed_result = fb.block_params(deopt_success_block)[0];
+    fb.ins().return_(&[resumed_result]);
 }
 
 fn emit_deopt_live_value_buffer(
@@ -10846,36 +10874,15 @@ fn emit_codegen_simple_call_with_local_env(
                     if !receiver_is_borrowed {
                         emit_release_owned_inputs(fb, emit_ctx, &[receiver]);
                     }
-                    let (live_values_base, live_value_count) =
-                        emit_deopt_live_value_buffer(fb, target, emit_ctx, local_env)
-                            .unwrap_or_else(|err| panic!("{err}"));
-                    let deopt_result = emit_deopt_resume_call(
+                    let deopt_result = emit_deopt_resume_call_with_local_env(
                         fb,
                         target,
                         deopt_resume_ref,
                         emit_ctx.consts.block_const,
-                        live_values_base,
-                        live_value_count,
-                        emit_ctx.consts.ptr_ty,
-                        emit_ctx.consts.i64_ty,
+                        emit_ctx,
+                        local_env,
                     );
-                    let deopt_result_is_null =
-                        fb.ins()
-                            .icmp(ir::condcodes::IntCC::Equal, deopt_result, null_ptr);
-                    let deopt_success_block = fb.create_block();
-                    fb.append_block_param(deopt_success_block, ptr_ty);
-                    fb.set_cold_block(deopt_success_block);
-                    fb.ins().brif(
-                        deopt_result_is_null,
-                        emit_ctx.consts.step_null_block,
-                        &step_null_block_args(emit_ctx),
-                        deopt_success_block,
-                        &[ir::BlockArg::Value(deopt_result)],
-                    );
-
-                    fb.switch_to_block(deopt_success_block);
-                    let resumed_result = fb.block_params(deopt_success_block)[0];
-                    fb.ins().return_(&[resumed_result]);
+                    emit_deopt_result_return_or_step_null(fb, emit_ctx, deopt_result);
                 }
             }
             fb.switch_to_block(result_block);
@@ -11121,36 +11128,15 @@ fn emit_codegen_simple_call_with_local_env(
                     if !callable_is_borrowed {
                         emit_release_owned_inputs(fb, emit_ctx, &[callable]);
                     }
-                    let (live_values_base, live_value_count) =
-                        emit_deopt_live_value_buffer(fb, target, emit_ctx, local_env)
-                            .unwrap_or_else(|err| panic!("{err}"));
-                    let deopt_result = emit_deopt_resume_call(
+                    let deopt_result = emit_deopt_resume_call_with_local_env(
                         fb,
                         target,
                         deopt_resume_ref,
                         emit_ctx.consts.block_const,
-                        live_values_base,
-                        live_value_count,
-                        emit_ctx.consts.ptr_ty,
-                        emit_ctx.consts.i64_ty,
+                        emit_ctx,
+                        local_env,
                     );
-                    let deopt_result_is_null =
-                        fb.ins()
-                            .icmp(ir::condcodes::IntCC::Equal, deopt_result, null_ptr);
-                    let deopt_success_block = fb.create_block();
-                    fb.append_block_param(deopt_success_block, ptr_ty);
-                    fb.set_cold_block(deopt_success_block);
-                    fb.ins().brif(
-                        deopt_result_is_null,
-                        emit_ctx.consts.step_null_block,
-                        &step_null_block_args(emit_ctx),
-                        deopt_success_block,
-                        &[ir::BlockArg::Value(deopt_result)],
-                    );
-
-                    fb.switch_to_block(deopt_success_block);
-                    let resumed_result = fb.block_params(deopt_success_block)[0];
-                    fb.ins().return_(&[resumed_result]);
+                    emit_deopt_result_return_or_step_null(fb, emit_ctx, deopt_result);
                 }
             }
             fb.switch_to_block(result_block);
