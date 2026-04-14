@@ -6,8 +6,8 @@ use crate::module_constants::load_runtime_name_owned;
 use pyo3::ffi;
 use soac_blockpy::block_py::{
     AbruptKind, BinOp, BinOpKind, BlockArg, BlockEdge, BlockTerm, CallArgKeyword,
-    CallArgPositional, CalleeFunctionId, InstrCodegen, LocalLocation, NameLocation, UnaryOp,
-    UnaryOpKind,
+    CallArgPositional, CalleeFunctionId, CellLocation, InstrCodegen, LocalLocation, NameLocation,
+    UnaryOp, UnaryOpKind,
 };
 use std::ffi::{c_int, c_void};
 use std::ptr;
@@ -333,6 +333,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             InstrCodegen::Del(del) => unsafe { self.execute_del_owned(del) },
             InstrCodegen::IncrementCounter(_) => unsafe { execute_runtime_name_deopt("NONE") },
             InstrCodegen::MakeCell(make_cell) => unsafe { self.execute_make_cell_owned(make_cell) },
+            InstrCodegen::CellRef(cell_ref) => unsafe { self.execute_cell_ref_owned(cell_ref) },
             _ => Err(format!(
                 "deopt continuation only supports simple load/binop/call/store/del expressions, got {expr:?}"
             )),
@@ -366,6 +367,58 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             ffi::Py_DECREF(initial_value.cast::<ffi::PyObject>());
         }
         Ok(cell.cast())
+    }
+
+    #[cold]
+    unsafe fn execute_cell_ref_owned(
+        &self,
+        cell_ref: &soac_blockpy::block_py::CellRef,
+    ) -> Result<ObjPtr, String> {
+        match cell_ref.location {
+            CellLocation::Owned(slot) => unsafe { self.execute_owned_cell_ref_owned(slot) },
+            location => Err(format!(
+                "deopt continuation does not support cell_ref for {location:?}"
+            )),
+        }
+    }
+
+    #[cold]
+    unsafe fn execute_owned_cell_ref_owned(&self, slot: u32) -> Result<ObjPtr, String> {
+        let function = self.invocation.function();
+        let layout = function.storage_layout.as_ref().ok_or_else(|| {
+            format!(
+                "deopt continuation expected storage layout for owned cell_ref slot {slot} in function {}",
+                function.function_id
+            )
+        })?;
+        let closure_slot = layout.local_cell_slot(slot).ok_or_else(|| {
+            format!(
+                "deopt continuation expected owned cell slot {slot} in function {} storage layout",
+                function.function_id
+            )
+        })?;
+        let mut candidate_names = vec![closure_slot.storage_name.as_str()];
+        if closure_slot.logical_name != closure_slot.storage_name {
+            candidate_names.push(closure_slot.logical_name.as_str());
+        }
+        for candidate_name in &candidate_names {
+            if let Some(local) = self.locals.get_by_name(candidate_name) {
+                let value = local.value();
+                if value.is_null() {
+                    set_deopt_unbound_local_error(candidate_name);
+                    return Ok(ptr::null_mut());
+                }
+                unsafe {
+                    ffi::Py_INCREF(value.cast::<ffi::PyObject>());
+                }
+                return Ok(value);
+            }
+        }
+        Err(format!(
+            "deopt continuation expected owned cell_ref slot {slot} via names {:?}, but locals were {}",
+            candidate_names,
+            self.locals.describe()
+        ))
     }
 
     #[cold]

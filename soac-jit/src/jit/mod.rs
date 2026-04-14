@@ -1914,7 +1914,7 @@ fn runtime_jit_deopt_continuation_for_point(
             else {
                 return RuntimeJitDeoptContinuation::Unimplemented;
             };
-            if runtime_jit_deopt_block_tail_supported(block, block.body.len()) {
+            if runtime_jit_deopt_block_tail_supported(function, block, block.body.len()) {
                 RuntimeJitDeoptContinuation::ResumeBlockTail {
                     cursor: RuntimeJitDeoptCursor::new(block.label, block.body.len()),
                 }
@@ -1941,7 +1941,7 @@ fn runtime_jit_deopt_continuation_for_point(
             else {
                 return RuntimeJitDeoptContinuation::Unimplemented;
             };
-            if runtime_jit_deopt_block_tail_supported(block, start_body_index) {
+            if runtime_jit_deopt_block_tail_supported(function, block, start_body_index) {
                 RuntimeJitDeoptContinuation::ResumeBlockTail {
                     cursor: RuntimeJitDeoptCursor::new(block_label, start_body_index),
                 }
@@ -1960,7 +1960,7 @@ fn runtime_jit_deopt_continuation_for_point(
             else {
                 return RuntimeJitDeoptContinuation::Unimplemented;
             };
-            if runtime_jit_deopt_block_tail_supported(block, 0) {
+            if runtime_jit_deopt_block_tail_supported(function, block, 0) {
                 RuntimeJitDeoptContinuation::ResumeBlockTail {
                     cursor: RuntimeJitDeoptCursor::at_block_entry(block.label),
                 }
@@ -1971,62 +1971,90 @@ fn runtime_jit_deopt_continuation_for_point(
     }
 }
 
-fn runtime_jit_deopt_block_tail_supported(block: &CodegenBlock, start_body_index: usize) -> bool {
+fn runtime_jit_deopt_block_tail_supported(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    block: &CodegenBlock,
+    start_body_index: usize,
+) -> bool {
     let Some(body_tail) = block.body.get(start_body_index..) else {
         return false;
     };
-    body_tail.iter().all(runtime_jit_deopt_expr_supported)
-        && runtime_jit_deopt_term_supported(&block.term)
+    let storage_layout = function.storage_layout.as_ref();
+    body_tail
+        .iter()
+        .all(|expr| runtime_jit_deopt_expr_supported(expr, storage_layout))
+        && runtime_jit_deopt_term_supported(&block.term, storage_layout)
         && block
             .exc_edge
             .as_ref()
             .is_none_or(runtime_jit_deopt_exception_edge_supported)
 }
 
-fn runtime_jit_deopt_expr_supported(expr: &InstrCodegen) -> bool {
+fn runtime_jit_deopt_expr_supported(
+    expr: &InstrCodegen,
+    storage_layout: Option<&StorageLayout>,
+) -> bool {
     match expr {
         InstrCodegen::Load(load) => !matches!(load.name.location, NameLocation::Cell(_)),
         InstrCodegen::BinOp(binop) => {
             runtime_jit_deopt_binop_supported(binop.kind)
-                && runtime_jit_deopt_expr_supported(&binop.left)
-                && runtime_jit_deopt_expr_supported(&binop.right)
+                && runtime_jit_deopt_expr_supported(&binop.left, storage_layout)
+                && runtime_jit_deopt_expr_supported(&binop.right, storage_layout)
         }
-        InstrCodegen::UnaryOp(unary) => runtime_jit_deopt_expr_supported(&unary.operand),
+        InstrCodegen::UnaryOp(unary) => {
+            runtime_jit_deopt_expr_supported(&unary.operand, storage_layout)
+        }
         InstrCodegen::GetAttr(getattr) => {
-            runtime_jit_deopt_expr_supported(&getattr.value)
-                && runtime_jit_deopt_expr_supported(&getattr.attr)
+            runtime_jit_deopt_expr_supported(&getattr.value, storage_layout)
+                && runtime_jit_deopt_expr_supported(&getattr.attr, storage_layout)
         }
         InstrCodegen::GetItem(getitem) => {
-            runtime_jit_deopt_expr_supported(&getitem.value)
-                && runtime_jit_deopt_expr_supported(&getitem.index)
+            runtime_jit_deopt_expr_supported(&getitem.value, storage_layout)
+                && runtime_jit_deopt_expr_supported(&getitem.index, storage_layout)
         }
         InstrCodegen::SetAttr(setattr) => {
-            runtime_jit_deopt_expr_supported(&setattr.value)
-                && runtime_jit_deopt_expr_supported(&setattr.attr)
-                && runtime_jit_deopt_expr_supported(&setattr.replacement)
+            runtime_jit_deopt_expr_supported(&setattr.value, storage_layout)
+                && runtime_jit_deopt_expr_supported(&setattr.attr, storage_layout)
+                && runtime_jit_deopt_expr_supported(&setattr.replacement, storage_layout)
         }
         InstrCodegen::SetItem(setitem) => {
-            runtime_jit_deopt_expr_supported(&setitem.value)
-                && runtime_jit_deopt_expr_supported(&setitem.index)
-                && runtime_jit_deopt_expr_supported(&setitem.replacement)
+            runtime_jit_deopt_expr_supported(&setitem.value, storage_layout)
+                && runtime_jit_deopt_expr_supported(&setitem.index, storage_layout)
+                && runtime_jit_deopt_expr_supported(&setitem.replacement, storage_layout)
         }
         InstrCodegen::DelItem(delitem) => {
-            runtime_jit_deopt_expr_supported(&delitem.value)
-                && runtime_jit_deopt_expr_supported(&delitem.index)
+            runtime_jit_deopt_expr_supported(&delitem.value, storage_layout)
+                && runtime_jit_deopt_expr_supported(&delitem.index, storage_layout)
         }
-        InstrCodegen::CalleeFunctionId(callee) => runtime_jit_deopt_expr_supported(&callee.value),
-        InstrCodegen::Call(call) => {
-            runtime_jit_deopt_call_parts_supported(&call.func, &call.args, &call.keywords)
+        InstrCodegen::CalleeFunctionId(callee) => {
+            runtime_jit_deopt_expr_supported(&callee.value, storage_layout)
         }
-        InstrCodegen::CallDirect(call) => {
-            runtime_jit_deopt_call_parts_supported(&call.callable, &call.args, &call.keywords)
+        InstrCodegen::Call(call) => runtime_jit_deopt_call_parts_supported(
+            &call.func,
+            &call.args,
+            &call.keywords,
+            storage_layout,
+        ),
+        InstrCodegen::CallDirect(call) => runtime_jit_deopt_call_parts_supported(
+            &call.callable,
+            &call.args,
+            &call.keywords,
+            storage_layout,
+        ),
+        InstrCodegen::Store(store) => {
+            runtime_jit_deopt_expr_supported(&store.value, storage_layout)
         }
-        InstrCodegen::Store(store) => runtime_jit_deopt_expr_supported(&store.value),
         InstrCodegen::Del(_) => true,
         InstrCodegen::IncrementCounter(_) => true,
         InstrCodegen::MakeCell(make_cell) => {
-            runtime_jit_deopt_expr_supported(&make_cell.initial_value)
+            runtime_jit_deopt_expr_supported(&make_cell.initial_value, storage_layout)
         }
+        InstrCodegen::CellRef(cell_ref) => match cell_ref.location {
+            CellLocation::Owned(slot) => storage_layout
+                .and_then(|layout| layout.local_cell_slot(slot))
+                .is_some(),
+            CellLocation::Closure(_) | CellLocation::CapturedSource(_) => false,
+        },
         _ => false,
     }
 }
@@ -2035,15 +2063,24 @@ fn runtime_jit_deopt_call_parts_supported(
     callable: &InstrCodegen,
     args: &[CallArgPositional<InstrCodegen>],
     keywords: &[CallArgKeyword<InstrCodegen>],
+    storage_layout: Option<&StorageLayout>,
 ) -> bool {
-    runtime_jit_deopt_expr_supported(callable)
+    runtime_jit_deopt_expr_supported(callable, storage_layout)
         && args.iter().all(|arg| match arg {
-            CallArgPositional::Positional(expr) => runtime_jit_deopt_expr_supported(expr),
-            CallArgPositional::Starred(expr) => runtime_jit_deopt_expr_supported(expr),
+            CallArgPositional::Positional(expr) => {
+                runtime_jit_deopt_expr_supported(expr, storage_layout)
+            }
+            CallArgPositional::Starred(expr) => {
+                runtime_jit_deopt_expr_supported(expr, storage_layout)
+            }
         })
         && keywords.iter().all(|keyword| match keyword {
-            CallArgKeyword::Named { value, .. } => runtime_jit_deopt_expr_supported(value),
-            CallArgKeyword::Starred(value) => runtime_jit_deopt_expr_supported(value),
+            CallArgKeyword::Named { value, .. } => {
+                runtime_jit_deopt_expr_supported(value, storage_layout)
+            }
+            CallArgKeyword::Starred(value) => {
+                runtime_jit_deopt_expr_supported(value, storage_layout)
+            }
         })
 }
 
@@ -2087,9 +2124,12 @@ fn runtime_jit_deopt_binop_supported(kind: blockpy_intrinsics::BinOpKind) -> boo
     )
 }
 
-fn runtime_jit_deopt_term_supported(term: &BlockTerm<InstrCodegen>) -> bool {
+fn runtime_jit_deopt_term_supported(
+    term: &BlockTerm<InstrCodegen>,
+    storage_layout: Option<&StorageLayout>,
+) -> bool {
     match term {
-        BlockTerm::Return(value) => runtime_jit_deopt_expr_supported(value),
+        BlockTerm::Return(value) => runtime_jit_deopt_expr_supported(value, storage_layout),
         BlockTerm::Jump(edge) => edge.args.iter().all(|arg| {
             matches!(
                 arg,
@@ -2099,12 +2139,16 @@ fn runtime_jit_deopt_term_supported(term: &BlockTerm<InstrCodegen>) -> bool {
                     | BlockArg::AbruptKind(_)
             )
         }),
-        BlockTerm::IfTerm(if_term) => runtime_jit_deopt_expr_supported(&if_term.test),
-        BlockTerm::BranchTable(branch) => runtime_jit_deopt_expr_supported(&branch.index),
+        BlockTerm::IfTerm(if_term) => {
+            runtime_jit_deopt_expr_supported(&if_term.test, storage_layout)
+        }
+        BlockTerm::BranchTable(branch) => {
+            runtime_jit_deopt_expr_supported(&branch.index, storage_layout)
+        }
         BlockTerm::Raise(raise) => raise
             .exc
             .as_ref()
-            .is_none_or(runtime_jit_deopt_expr_supported),
+            .is_none_or(|exc| runtime_jit_deopt_expr_supported(exc, storage_layout)),
     }
 }
 
