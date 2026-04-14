@@ -13080,6 +13080,321 @@ def f(x, y):
     }
 
     #[test]
+    fn method_call_guard_miss_deopt_resumes_generic_method_runtime() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "method_call_guard_miss_deopt_resumes_generic_method_runtime",
+        ) {
+            return;
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| unsafe {
+            #[repr(C)]
+            struct TestFunctionEnv {
+                direct_code_ptr: *const u8,
+                default_direct_code_ptr: *const u8,
+                deopt_table_ptr: ObjPtr,
+                globals_obj: ObjPtr,
+            }
+
+            let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "verify");
+            let soac_work_dir = fresh_test_work_dir("direct-method-deopt-runtime");
+            let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
+            let module_name = "direct_method_deopt_runtime_test";
+            let module_name_gen = ModuleNameGen::new(0);
+            let method_name_gen = module_name_gen.next_function_name_gen();
+            let method_function_id = method_name_gen.function_id();
+            let mut method_function = BlockPyFunction {
+                function_id: method_function_id,
+                name_gen: method_name_gen,
+                names: FunctionName::new("Thing.f", "Thing.f", "Thing.f", "Thing.f"),
+                kind: soac_blockpy::block_py::FunctionKind::Function,
+                params: ParamSpec {
+                    params: vec![Param {
+                        name: "self".into(),
+                        kind: ParamKind::Any,
+                        has_default: false,
+                    }],
+                },
+                blocks: vec![CodegenBlock {
+                    label: BlockLabel::from_index(0),
+                    body: vec![],
+                    term: ret_term(none_expr()),
+                    params: vec![],
+                    exc_edge: None,
+                }],
+                doc: None,
+                storage_layout: None,
+                scope: Default::default(),
+            };
+            set_stack_slots(&mut method_function, &["self"]);
+
+            let caller_name_gen = module_name_gen.next_function_name_gen();
+            let caller_function_id = caller_name_gen.function_id();
+            let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+            let mut constants = TestConstantPool::default();
+            let mut caller_function = BlockPyFunction {
+                function_id: caller_function_id,
+                name_gen: caller_name_gen,
+                names: FunctionName::new("caller", "caller", "caller", "caller"),
+                kind: soac_blockpy::block_py::FunctionKind::Function,
+                params: ParamSpec {
+                    params: vec![Param {
+                        name: "obj".into(),
+                        kind: ParamKind::Any,
+                        has_default: false,
+                    }],
+                },
+                blocks: vec![CodegenBlock {
+                    label: BlockLabel::from_index(0),
+                    body: vec![],
+                    term: ret_term(with_instr_id(
+                        op_expr(Call::new(
+                            op_expr(GetAttr::new(
+                                name_expr(test_name("obj")),
+                                constants.string_expr("f"),
+                            )),
+                            Vec::<CallArgPositional<InstrCodegen>>::new(),
+                            Vec::<CallArgKeyword<InstrCodegen>>::new(),
+                        )),
+                        call_instr_id,
+                    )),
+                    params: vec![],
+                    exc_edge: None,
+                }],
+                doc: None,
+                storage_layout: None,
+                scope: Default::default(),
+            };
+            set_stack_slots(&mut caller_function, &["obj"]);
+
+            let mut module = test_module(
+                ModuleNameGen::new(0),
+                vec![method_function.clone(), caller_function.clone()],
+            );
+            module.module_constants = constants.module_constants;
+            write_test_counter_dump(
+                soac_work_dir.join("profile.bin").as_path(),
+                &CounterDumpRecord {
+                    source_hash: 0,
+                    module_name: module_name.to_string(),
+                    package_name: None,
+                    rows: vec![CounterDumpRow {
+                        counter_id: 0,
+                        scope: "this".to_string(),
+                        kind: "call_hot_targets".to_string(),
+                        site_kind: "runtime".to_string(),
+                        function_id: Some(caller_function.function_id),
+                        current_function_id: Some(caller_function.function_id),
+                        instr_id: Some(call_instr_id),
+                        function_qualname: Some(caller_function.names.qualname.clone()),
+                        block_label: None,
+                        value: 1,
+                        observed_value: Some(method_function.function_id.packed()),
+                        max_overcount: Some(0),
+                    }],
+                    module_keys: Vec::new(),
+                    type_keys: Vec::new(),
+                    type_table: Vec::new(),
+                },
+            );
+            instrument_bb_module_with_call_target_counters(&mut module);
+
+            let shared_state =
+                crate::module_type::build_shared_state_for_testing(py, module, module_name, "")
+                    .expect("shared state should build");
+            let runtime = build_test_module_runtime(py, shared_state.clone());
+            let globals = pyo3::Bound::<pyo3::PyAny>::from_borrowed_ptr(
+                py,
+                runtime.mod_ctx.globals_obj.cast(),
+            )
+            .cast_into::<pyo3::types::PyDict>()
+            .expect("runtime globals should be a dict");
+            globals
+                .set_item("__name__", module_name)
+                .expect("globals should accept __name__");
+            let class_source = std::ffi::CString::new(
+                "class Thing:\n    def f(self):\n        return None\n\
+                 class Other:\n    def f(self):\n        return 9191\n\
+                 miss_obj = Other()\n",
+            )
+            .expect("class source should be CString-compatible");
+            let run_result = ffi::PyRun_StringFlags(
+                class_source.as_ptr(),
+                ffi::Py_file_input,
+                globals.as_ptr(),
+                globals.as_ptr(),
+                std::ptr::null_mut(),
+            );
+            assert!(
+                !run_result.is_null(),
+                "class definitions should execute in test globals"
+            );
+            ffi::Py_DECREF(run_result);
+            let thing_cls = globals
+                .get_item("Thing")
+                .expect("Thing lookup should not error")
+                .expect("Thing should exist");
+            let owner_type = thing_cls.as_ptr() as *mut ffi::PyTypeObject;
+            let method_function_obj =
+                ffi::PyDict_GetItemString((*owner_type).tp_dict, c"f".as_ptr());
+            assert!(
+                !method_function_obj.is_null(),
+                "Thing class dict should contain f"
+            );
+            ffi::Py_INCREF(method_function_obj);
+            let runtime_clone = crate::clone_module_runtime_context(&runtime)
+                .expect("runtime clone should succeed");
+            crate::register_clif_vectorcall(
+                method_function_obj,
+                method_function.function_id,
+                runtime_clone,
+            )
+            .expect("registering method vectorcall should succeed");
+            ffi::Py_DECREF(method_function_obj);
+            let module_obj = ffi::PyModule_New(c"direct_method_deopt_runtime_test".as_ptr());
+            assert!(!module_obj.is_null(), "test module should allocate");
+            let module_dict = ffi::PyModule_GetDict(module_obj);
+            assert!(
+                ffi::PyDict_SetItemString(module_dict, c"Thing".as_ptr(), thing_cls.as_ptr()) == 0,
+                "test module should accept Thing binding"
+            );
+            crate::register_function_owner_types_for_module(module_obj)
+                .expect("owner types should register from explicit test module");
+            ffi::Py_DECREF(module_obj);
+
+            let method_function = shared_state.lowered_module.callable_defs[0].clone();
+            let caller_function = shared_state.lowered_module.callable_defs[1].clone();
+            let module_constant_ptrs = shared_state.module_constant_ptrs();
+            let compile_session = runtime.compile_session.as_ref();
+            let mut jit_module =
+                new_jit_module(compile_session).expect("test jit module should construct");
+            let module_constant_object_data_ids = declare_module_constant_object_data(
+                &mut jit_module,
+                &shared_state.lowered_module,
+                &module_constant_ptrs,
+            )
+            .expect("module constant object data should declare");
+            let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
+                define_test_counter_storage(
+                    &mut jit_module,
+                    &shared_state.lowered_module,
+                    shared_state.lowered_module.counter_defs.as_slice(),
+                );
+            let (_method_sig, declared_method) =
+                declare_direct_function(&mut jit_module, &method_function, None)
+                    .expect("profiled method should declare");
+            let predeclared =
+                HashMap::from([(method_function.function_id, declared_method.clone())]);
+            let blocks = vec![std::ptr::null_mut::<c_void>(); caller_function.blocks.len()];
+            let built_method = build_test_cranelift_run_bb_specialized_function(
+                &mut jit_module,
+                blocks.as_slice(),
+                &shared_state.lowered_module,
+                &method_function,
+                &shared_state.codegen_constants,
+                shared_state.lowered_module.counter_defs.as_slice(),
+                module_constant_object_data_ids.as_slice(),
+                counter_slots_by_id.as_ref(),
+                scalar_counter_data_id,
+                top_value_counter_data_id,
+                compile_session,
+                Some(shared_state.as_ref()),
+                None,
+                Some(&predeclared),
+                BuildSpecializedFunctionOptions::default(),
+            )
+            .expect("profiled method JIT build should succeed");
+            let built = build_test_cranelift_run_bb_specialized_function(
+                &mut jit_module,
+                blocks.as_slice(),
+                &shared_state.lowered_module,
+                &caller_function,
+                &shared_state.codegen_constants,
+                shared_state.lowered_module.counter_defs.as_slice(),
+                module_constant_object_data_ids.as_slice(),
+                counter_slots_by_id.as_ref(),
+                scalar_counter_data_id,
+                top_value_counter_data_id,
+                compile_session,
+                Some(shared_state.as_ref()),
+                None,
+                Some(&predeclared),
+                BuildSpecializedFunctionOptions::default(),
+            )
+            .expect("caller JIT build should succeed");
+            let facts = infer_jit_value_facts(&shared_state.lowered_module);
+            let module_plan = plan_jit_deopt_resume_module(&shared_state.lowered_module, &facts)
+                .expect("JIT deopt resume planning should succeed");
+            let function_plan = module_plan
+                .function(caller_function.function_id)
+                .expect("caller should have a JIT deopt plan");
+            let deopt_table = RuntimeJitDeoptTable::from_plan(
+                &caller_function,
+                function_plan,
+                &module_constant_ptrs,
+            )
+            .expect("runtime deopt table should build from plan");
+
+            let mut method_ctx = built_method.ctx;
+            define_prepared_function(
+                &mut jit_module,
+                built_method.main_id,
+                &mut method_ctx,
+                "test-direct-method-deopt-profiled-method",
+                "profiled method should define",
+            )
+            .expect("profiled method should define");
+            jit_module.clear_context(&mut method_ctx);
+            let mut caller_ctx = built.ctx;
+            define_prepared_function(
+                &mut jit_module,
+                built.main_id,
+                &mut caller_ctx,
+                "test-direct-method-deopt-runtime-caller",
+                "caller should define",
+            )
+            .expect("caller should define");
+            jit_module.clear_context(&mut caller_ctx);
+            jit_module
+                .finalize_definitions()
+                .expect("test jit module should finalize");
+            let code_ptr = jit_module.get_finalized_function(built.main_id);
+            let miss_obj =
+                ffi::PyDict_GetItemString(runtime.mod_ctx.globals_obj.cast(), c"miss_obj".as_ptr());
+            assert!(!miss_obj.is_null(), "miss object should exist");
+            ffi::Py_INCREF(miss_obj);
+
+            let function_env = TestFunctionEnv {
+                direct_code_ptr: code_ptr,
+                default_direct_code_ptr: std::ptr::null(),
+                deopt_table_ptr: std::ptr::addr_of!(deopt_table).cast_mut().cast(),
+                globals_obj: runtime.mod_ctx.globals_obj,
+            };
+            let entry: unsafe extern "C" fn(ObjPtr, ObjPtr, ObjPtr) -> ObjPtr =
+                std::mem::transmute(code_ptr);
+            let result = entry(
+                std::ptr::addr_of!(function_env).cast_mut().cast(),
+                ffi::PyThreadState_Get().cast(),
+                miss_obj.cast(),
+            );
+            assert!(
+                ffi::PyErr_Occurred().is_null(),
+                "successful method guard-miss deopt should not leave a Python exception"
+            );
+            assert_eq!(
+                ffi::PyLong_AsLong(result.cast::<ffi::PyObject>()),
+                9191,
+                "method guard-miss deopt should resume before generic obj.f() and return its result"
+            );
+
+            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+            ffi::Py_DECREF(miss_obj);
+        });
+    }
+
+    #[test]
     fn direct_call_guard_miss_deopt_resumes_generic_call_runtime() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
