@@ -2834,6 +2834,24 @@ def f():
                 std::sync::Arc::as_ptr(&first_deopt_table) as ObjPtr,
                 "compiled direct handle should expose the runtime deopt table pointer"
             );
+            let deopt_result = unsafe {
+                crate::jit::specialized_helpers::dp_jit_deopt_unimplemented(
+                    std::sync::Arc::as_ptr(&first_deopt_table) as ObjPtr,
+                    first_entry_record.id.ordinal as i64,
+                )
+            };
+            assert!(
+                deopt_result.is_null(),
+                "placeholder deopt helper should return a null error sentinel"
+            );
+            let deopt_error = pyo3::PyErr::fetch(py);
+            let deopt_error_text = deopt_error.to_string();
+            assert!(
+                deopt_error_text.contains("JIT deopt helper is not implemented")
+                    && deopt_error_text.contains(&format!("function {}", first.function_id))
+                    && deopt_error_text.contains("record 0"),
+                "placeholder deopt helper should report the planned runtime record: {deopt_error_text}"
+            );
             let second_deopt_table = second_handle
                 .direct_deopt_table()
                 .expect("callee compiled handle should carry deopt metadata");
