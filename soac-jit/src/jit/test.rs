@@ -2869,7 +2869,7 @@ def f():
                 live_values.as_mut_ptr().cast()
             };
             let deopt_result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_unimplemented(
+                crate::jit::specialized_helpers::dp_jit_deopt_resume(
                     std::sync::Arc::as_ptr(&first_deopt_table) as ObjPtr,
                     first_entry_record.ordinal() as i64,
                     live_values_ptr,
@@ -2878,7 +2878,7 @@ def f():
             };
             assert!(
                 deopt_result.is_null(),
-                "placeholder deopt helper should return a null error sentinel"
+                "unsupported deopt continuation should return a null error sentinel"
             );
             let deopt_error = pyo3::PyErr::fetch(py);
             let deopt_error_text = deopt_error.to_string();
@@ -2886,7 +2886,7 @@ def f():
                 deopt_error_text.contains("JIT deopt helper is not implemented")
                     && deopt_error_text.contains(&format!("function {}", first.function_id))
                     && deopt_error_text.contains("record 0"),
-                "placeholder deopt helper should report the planned runtime record: {deopt_error_text}"
+                "unsupported deopt continuation should report the planned runtime record: {deopt_error_text}"
             );
             let second_deopt_table = second_handle
                 .direct_deopt_table()
@@ -4991,7 +4991,7 @@ def f(x):
             let before = unsafe { ffi::Py_REFCNT(value) };
             let mut live_values = vec![value.cast::<c_void>()];
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_unimplemented(
+                crate::jit::specialized_helpers::dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     0,
                     live_values.as_mut_ptr().cast(),
@@ -5016,7 +5016,7 @@ def f(x):
     }
 
     #[test]
-    fn deopt_unimplemented_exit_call_uses_function_env_deopt_table_and_ordinal() {
+    fn deopt_resume_call_uses_function_env_deopt_table_and_ordinal() {
         let compile_session = crate::session::CompileSession::new();
         let mut jit_module =
             new_jit_module(&compile_session).expect("test jit module should construct");
@@ -5042,11 +5042,11 @@ def f(x):
             let deopt_ref = func_imports.get_or_panic(
                 &mut jit_module,
                 &mut fb.func,
-                &DP_JIT_DEOPT_UNIMPLEMENTED_IMPORT,
+                &DP_JIT_DEOPT_RESUME_IMPORT,
             );
             let function_env_value = fb.block_params(entry)[0];
             let live_values = fb.ins().iconst(ptr_ty, 0);
-            let result = emit_deopt_unimplemented_exit_call(
+            let result = emit_deopt_resume_call(
                 &mut fb,
                 JitDeoptExitRef {
                     function_env_value,
@@ -5066,8 +5066,7 @@ def f(x):
             .debug_symbols()
             .iter()
             .find_map(|(import_id, symbol)| {
-                (*symbol == "dp_jit_deopt_unimplemented")
-                    .then(|| ir::UserExternalName::new(0, *import_id))
+                (*symbol == "dp_jit_deopt_resume").then(|| ir::UserExternalName::new(0, *import_id))
             })
             .expect("deopt helper import should be declared");
         assert_eq!(
@@ -7067,13 +7066,13 @@ def f(x, y):
                 indexed_global_guard_miss_deopt_stub: true,
             },
         );
-        let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_unimplemented"]);
+        let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
         let slow_global_helpers =
             import_user_names_for_symbols(&built, &["soac_runtime_load_global_slow"]);
         assert_eq!(
             count_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
             1,
-            "{case_name}: test deopt guard mode should call the placeholder deopt helper"
+            "{case_name}: test deopt guard mode should call the deopt resume helper"
         );
         assert_eq!(
             count_cold_block_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
@@ -7135,7 +7134,7 @@ def f(x, y):
                 indexed_global_guard_miss_deopt_stub: true,
             },
         );
-        let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_unimplemented"]);
+        let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
         let deopt_call_args = direct_call_args_to_runtime_helpers(&built.ctx.func, &deopt_helpers);
         let [deopt_args] = deopt_call_args.as_slice() else {
             panic!(

@@ -1042,7 +1042,7 @@ mod test_only_export_stubs {
     panic_obj_export!(dp_jit_store_cell(cell: ObjPtr, value: ObjPtr));
     panic_obj_export!(dp_jit_del_deref(cell: ObjPtr));
     panic_obj_export!(dp_jit_del_deref_quietly(cell: ObjPtr));
-    panic_obj_export!(dp_jit_deopt_unimplemented(
+    panic_obj_export!(dp_jit_deopt_resume(
         deopt_table: ObjPtr,
         record_ordinal: i64,
         live_values: ObjPtr,
@@ -1249,25 +1249,23 @@ pub unsafe extern "C" fn dp_jit_del_deref_quietly(cell: ObjPtr) -> ObjPtr {
 }
 #[cold]
 #[inline(never)]
-pub unsafe extern "C" fn dp_jit_deopt_unimplemented(
+pub unsafe extern "C" fn dp_jit_deopt_resume(
     deopt_table: ObjPtr,
     record_ordinal: i64,
     live_values: ObjPtr,
     live_value_count: i64,
 ) -> ObjPtr {
-    match unsafe {
-        run_deopt_unimplemented(deopt_table, record_ordinal, live_values, live_value_count)
-    } {
+    match unsafe { run_deopt_resume(deopt_table, record_ordinal, live_values, live_value_count) } {
         Ok(value) => value,
         Err(detail) => {
-            set_deopt_unimplemented_error(detail);
+            set_deopt_unsupported_continuation_error(detail);
             ptr::null_mut()
         }
     }
 }
 
 #[cold]
-unsafe fn run_deopt_unimplemented(
+unsafe fn run_deopt_resume(
     deopt_table: ObjPtr,
     record_ordinal: i64,
     live_values: ObjPtr,
@@ -1324,7 +1322,7 @@ fn execute_blockpy_deopt_continuation(
 }
 
 #[cold]
-fn set_deopt_unimplemented_error(detail: String) {
+fn set_deopt_unsupported_continuation_error(detail: String) {
     let message = format!("JIT deopt helper is not implemented: {detail}");
     if let Ok(c_message) = std::ffi::CString::new(message) {
         unsafe {
@@ -2001,10 +1999,7 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
         "dp_jit_del_deref_quietly",
         dp_jit_del_deref_quietly as *const u8,
     );
-    builder.symbol(
-        "dp_jit_deopt_unimplemented",
-        dp_jit_deopt_unimplemented as *const u8,
-    );
+    builder.symbol("dp_jit_deopt_resume", dp_jit_deopt_resume as *const u8);
     builder.symbol("dp_jit_tuple_new", dp_jit_tuple_new as *const u8);
     builder.symbol("dp_jit_tuple_set_item", dp_jit_tuple_set_item as *const u8);
     builder.symbol("dp_jit_dict_new", dp_jit_dict_new as *const u8);

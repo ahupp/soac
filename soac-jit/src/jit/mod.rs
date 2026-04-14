@@ -740,8 +740,8 @@ static DP_JIT_PUSH_HANDLED_EXCEPTION_IMPORT: ImportSpec = ImportSpec::new(
 );
 static DP_JIT_POP_HANDLED_EXCEPTION_IMPORT: ImportSpec =
     ImportSpec::new("dp_jit_pop_handled_exception", &[SigType::Pointer], &[]);
-static DP_JIT_DEOPT_UNIMPLEMENTED_IMPORT: ImportSpec = ImportSpec::new(
-    "dp_jit_deopt_unimplemented",
+static DP_JIT_DEOPT_RESUME_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_deopt_resume",
     &[
         SigType::Pointer,
         SigType::I64,
@@ -1992,10 +1992,10 @@ fn emit_codegen_indexed_global_load(
             fb.ins()
                 .jump(result_block, &[ir::BlockArg::Value(fallback_value)]);
         }
-        JitGuardMissDispatch::DeoptUnimplemented {
+        JitGuardMissDispatch::DeoptResume {
             block,
             target,
-            deopt_unimplemented_ref,
+            deopt_resume_ref,
         } => {
             fb.switch_to_block(block);
             fb.set_cold_block(block);
@@ -2008,10 +2008,10 @@ fn emit_codegen_indexed_global_load(
             let (live_values_base, live_value_count) =
                 emit_deopt_live_value_buffer(fb, target, ctx, local_env)
                     .unwrap_or_else(|err| panic!("{err}"));
-            let deopt_result = emit_deopt_unimplemented_exit_call(
+            let deopt_result = emit_deopt_resume_call(
                 fb,
                 target,
-                deopt_unimplemented_ref,
+                deopt_resume_ref,
                 live_values_base,
                 live_value_count,
                 ctx.consts.ptr_ty,
@@ -2823,39 +2823,39 @@ impl JitGuardMissTarget {
 #[derive(Clone, Copy)]
 enum JitGuardMissDispatch {
     FallbackBlock(ir::Block),
-    DeoptUnimplemented {
+    DeoptResume {
         block: ir::Block,
         target: JitDeoptExitRef,
-        deopt_unimplemented_ref: ir::FuncRef,
+        deopt_resume_ref: ir::FuncRef,
     },
 }
 
 impl JitGuardMissDispatch {
     fn branch_block(self) -> ir::Block {
         match self {
-            Self::FallbackBlock(block) | Self::DeoptUnimplemented { block, .. } => block,
+            Self::FallbackBlock(block) | Self::DeoptResume { block, .. } => block,
         }
     }
 }
 
 fn prepare_guard_miss_dispatch(
     target: JitGuardMissTarget,
-    deopt_unimplemented_ref: Option<ir::FuncRef>,
+    deopt_resume_ref: Option<ir::FuncRef>,
 ) -> JitGuardMissDispatch {
-    match deopt_unimplemented_ref {
-        Some(deopt_unimplemented_ref) => JitGuardMissDispatch::DeoptUnimplemented {
+    match deopt_resume_ref {
+        Some(deopt_resume_ref) => JitGuardMissDispatch::DeoptResume {
             block: target.fallback_block(),
             target: target.deopt_exit(),
-            deopt_unimplemented_ref,
+            deopt_resume_ref,
         },
         None => JitGuardMissDispatch::FallbackBlock(target.fallback_block()),
     }
 }
 
-fn emit_deopt_unimplemented_exit_call(
+fn emit_deopt_resume_call(
     fb: &mut FunctionBuilder<'_>,
     target: JitDeoptExitRef,
-    deopt_unimplemented_ref: ir::FuncRef,
+    deopt_resume_ref: ir::FuncRef,
     live_values_base: ir::Value,
     live_value_count: usize,
     ptr_ty: ir::Type,
@@ -2872,7 +2872,7 @@ fn emit_deopt_unimplemented_exit_call(
         .unwrap_or_else(|_| panic!("deopt live value count does not fit i64"));
     let live_value_count = fb.ins().iconst(i64_ty, live_value_count);
     let call_inst = fb.ins().call(
-        deopt_unimplemented_ref,
+        deopt_resume_ref,
         &[
             deopt_table,
             record_ordinal,
@@ -14967,11 +14967,7 @@ fn build_cranelift_run_bb_specialized_function(
         );
         let indexed_global_guard_miss_deopt_stub_ref =
             options.indexed_global_guard_miss_deopt_stub.then(|| {
-                func_imports.get_or_panic(
-                    jit_module,
-                    &mut fb.func,
-                    &DP_JIT_DEOPT_UNIMPLEMENTED_IMPORT,
-                )
+                func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_DEOPT_RESUME_IMPORT)
             });
         let store_global_indexed_ref = func_imports.get_or_panic(
             jit_module,
