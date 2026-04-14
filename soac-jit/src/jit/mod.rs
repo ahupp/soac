@@ -1980,6 +1980,7 @@ fn runtime_jit_deopt_expr_supported(expr: &InstrCodegen) -> bool {
             runtime_jit_deopt_expr_supported(&delitem.value)
                 && runtime_jit_deopt_expr_supported(&delitem.index)
         }
+        InstrCodegen::CalleeFunctionId(callee) => runtime_jit_deopt_expr_supported(&callee.value),
         InstrCodegen::Call(call) => {
             runtime_jit_deopt_call_parts_supported(&call.func, &call.args, &call.keywords)
         }

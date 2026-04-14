@@ -5,11 +5,17 @@ use super::{
 use crate::module_constants::load_runtime_name_owned;
 use pyo3::ffi;
 use soac_blockpy::block_py::{
-    BinOp, BinOpKind, BlockTerm, CallArgKeyword, CallArgPositional, InstrCodegen, LocalLocation,
-    NameLocation, UnaryOp, UnaryOpKind,
+    BinOp, BinOpKind, BlockTerm, CallArgKeyword, CallArgPositional, CalleeFunctionId, InstrCodegen,
+    LocalLocation, NameLocation, UnaryOp, UnaryOpKind,
 };
 use std::ffi::c_void;
 use std::ptr;
+
+unsafe extern "C" {
+    static mut PyMethod_Type: ffi::PyTypeObject;
+
+    fn PyMethod_Function(meth: *mut ffi::PyObject) -> *mut ffi::PyObject;
+}
 
 #[cold]
 pub(super) fn execute_deopt_invocation(
@@ -147,6 +153,9 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             InstrCodegen::SetAttr(setattr) => unsafe { self.execute_setattr_owned(setattr) },
             InstrCodegen::SetItem(setitem) => unsafe { self.execute_setitem_owned(setitem) },
             InstrCodegen::DelItem(delitem) => unsafe { self.execute_delitem_owned(delitem) },
+            InstrCodegen::CalleeFunctionId(callee) => unsafe {
+                self.execute_callee_function_id_owned(callee)
+            },
             InstrCodegen::Call(call) => unsafe { self.execute_call_owned(call) },
             InstrCodegen::CallDirect(call) => unsafe { self.execute_call_direct_owned(call) },
             InstrCodegen::Store(store) => unsafe { self.execute_store_owned(store) },
@@ -376,6 +385,22 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
         call: &soac_blockpy::block_py::CallDirect<InstrCodegen>,
     ) -> Result<ObjPtr, String> {
         unsafe { self.execute_call_parts_owned(&call.callable, &call.args, &call.keywords) }
+    }
+
+    #[cold]
+    unsafe fn execute_callee_function_id_owned(
+        &mut self,
+        callee: &CalleeFunctionId<InstrCodegen>,
+    ) -> Result<ObjPtr, String> {
+        let callable = unsafe { self.execute_expr_owned(&callee.value)? };
+        if callable.is_null() {
+            return Ok(ptr::null_mut());
+        }
+        let packed = unsafe { callable_soac_function_id(callable.cast::<ffi::PyObject>()) };
+        unsafe {
+            ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
+        }
+        Ok(unsafe { ffi::PyLong_FromLongLong(packed as i64).cast() })
     }
 
     #[cold]
@@ -875,6 +900,29 @@ unsafe fn set_raise_exception_owned(exc: ObjPtr) {
             );
         }
     }
+}
+
+unsafe fn callable_soac_function_id(callable: *mut ffi::PyObject) -> u64 {
+    unsafe {
+        if ffi::PyFunction_Check(callable) != 0 {
+            return crate::PyFunction_GetSoacFunctionId(callable);
+        }
+
+        if ffi::Py_TYPE(callable) == ptr::addr_of_mut!(PyMethod_Type) {
+            let function = PyMethod_Function(callable);
+            if !function.is_null() && ffi::PyFunction_Check(function) != 0 {
+                return crate::PyFunction_GetSoacFunctionId(function);
+            }
+        }
+
+        if ffi::PyType_Check(callable) != 0 {
+            let type_obj = callable.cast::<ffi::PyTypeObject>();
+            if ((*type_obj).tp_flags & ffi::Py_TPFLAGS_HEAPTYPE as std::ffi::c_ulong) != 0 {
+                return crate::PyType_GetSoacFunctionId(callable);
+            }
+        }
+    }
+    0
 }
 
 #[cold]
