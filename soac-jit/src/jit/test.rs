@@ -5047,8 +5047,10 @@ def f(x):
         assert_eq!(
             record.continuation(),
             &RuntimeJitDeoptContinuation::ResumeBlockTail {
-                block: function.entry_block().label,
-                start_body_index: function.entry_block().body.len(),
+                cursor: RuntimeJitDeoptCursor::new(
+                    function.entry_block().label,
+                    function.entry_block().body.len(),
+                ),
             }
         );
     }
@@ -5080,8 +5082,10 @@ def f(x):
         assert_eq!(
             record.continuation(),
             &RuntimeJitDeoptContinuation::ResumeBlockTail {
-                block: function.entry_block().label,
-                start_body_index: function.entry_block().body.len(),
+                cursor: RuntimeJitDeoptCursor::new(
+                    function.entry_block().label,
+                    function.entry_block().body.len(),
+                ),
             }
         );
     }
@@ -5117,8 +5121,10 @@ def f(x):
         assert_eq!(
             record.continuation(),
             &RuntimeJitDeoptContinuation::ResumeBlockTail {
-                block: function.entry_block().label,
-                start_body_index: function.entry_block().body.len(),
+                cursor: RuntimeJitDeoptCursor::new(
+                    function.entry_block().label,
+                    function.entry_block().body.len(),
+                ),
             }
         );
     }
@@ -5153,8 +5159,7 @@ def f(x):
         assert_eq!(
             record.continuation(),
             &RuntimeJitDeoptContinuation::ResumeBlockTail {
-                block: block.label,
-                start_body_index: 0,
+                cursor: RuntimeJitDeoptCursor::at_block_entry(block.label),
             }
         );
     }
@@ -5191,8 +5196,7 @@ def f(x):
         assert_eq!(
             record.continuation(),
             &RuntimeJitDeoptContinuation::ResumeBlockTail {
-                block: entry.label,
-                start_body_index: entry.body.len(),
+                cursor: RuntimeJitDeoptCursor::new(entry.label, entry.body.len()),
             }
         );
     }
@@ -5237,8 +5241,7 @@ def f(x):
         assert_eq!(
             record.continuation(),
             &RuntimeJitDeoptContinuation::ResumeBlockTail {
-                block: entry.label,
-                start_body_index: entry.body.len(),
+                cursor: RuntimeJitDeoptCursor::new(entry.label, entry.body.len()),
             }
         );
     }
@@ -5284,8 +5287,7 @@ def f(x):
         assert_eq!(
             record.continuation(),
             &RuntimeJitDeoptContinuation::ResumeBlockTail {
-                block: entry.label,
-                start_body_index: entry.body.len(),
+                cursor: RuntimeJitDeoptCursor::new(entry.label, entry.body.len()),
             }
         );
     }
@@ -5324,8 +5326,7 @@ def f(x):
                     precision: LocalEnvResumeStatePrecision::InstructionBoundary,
                     locals: vec![binding],
                     continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
-                        block,
-                        start_body_index: 0,
+                        cursor: RuntimeJitDeoptCursor::at_block_entry(block),
                     },
                 }],
             };
@@ -5392,8 +5393,7 @@ def f(x):
                     precision: LocalEnvResumeStatePrecision::InstructionBoundary,
                     locals: vec![binding],
                     continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
-                        block,
-                        start_body_index: 0,
+                        cursor: RuntimeJitDeoptCursor::at_block_entry(block),
                     },
                 }],
             };
@@ -5459,8 +5459,7 @@ def f(x):
                     precision: LocalEnvResumeStatePrecision::InstructionBoundary,
                     locals: vec![],
                     continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
-                        block,
-                        start_body_index: 0,
+                        cursor: RuntimeJitDeoptCursor::at_block_entry(block),
                     },
                 }],
             };
@@ -5534,8 +5533,7 @@ def f(x):
                     precision: LocalEnvResumeStatePrecision::InstructionBoundary,
                     locals: vec![],
                     continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
-                        block,
-                        start_body_index: 0,
+                        cursor: RuntimeJitDeoptCursor::at_block_entry(block),
                     },
                 }],
             };
@@ -5616,8 +5614,7 @@ def f(x):
                     precision: LocalEnvResumeStatePrecision::InstructionBoundary,
                     locals: vec![],
                     continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
-                        block: entry.label,
-                        start_body_index: entry.body.len(),
+                        cursor: RuntimeJitDeoptCursor::new(entry.label, entry.body.len()),
                     },
                 }],
             };
@@ -5703,8 +5700,7 @@ def f(x):
                     precision: LocalEnvResumeStatePrecision::InstructionBoundary,
                     locals: vec![],
                     continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
-                        block: entry.label,
-                        start_body_index: entry.body.len(),
+                        cursor: RuntimeJitDeoptCursor::new(entry.label, entry.body.len()),
                     },
                 }],
             };
@@ -5820,8 +5816,7 @@ def f(x):
                     precision: LocalEnvResumeStatePrecision::InstructionBoundary,
                     locals: vec![],
                     continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
-                        block: entry.label,
-                        start_body_index: entry.body.len(),
+                        cursor: RuntimeJitDeoptCursor::new(entry.label, entry.body.len()),
                     },
                 }],
             };
@@ -5891,8 +5886,7 @@ def f(x):
                     precision: LocalEnvResumeStatePrecision::InstructionBoundary,
                     locals: vec![],
                     continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
-                        block,
-                        start_body_index: 0,
+                        cursor: RuntimeJitDeoptCursor::at_block_entry(block),
                     },
                 }],
             };
@@ -5989,8 +5983,7 @@ def f(x):
                     precision: LocalEnvResumeStatePrecision::InstructionBoundary,
                     locals: vec![],
                     continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
-                        block,
-                        start_body_index: 0,
+                        cursor: RuntimeJitDeoptCursor::at_block_entry(block),
                     },
                 }],
             };
@@ -6071,8 +6064,7 @@ def f(x):
                     precision: LocalEnvResumeStatePrecision::InstructionBoundary,
                     locals: vec![],
                     continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
-                        block,
-                        start_body_index: 0,
+                        cursor: RuntimeJitDeoptCursor::at_block_entry(block),
                     },
                 }],
             };
@@ -6152,8 +6144,7 @@ def f(x):
                     precision: LocalEnvResumeStatePrecision::InstructionBoundary,
                     locals: vec![],
                     continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
-                        block,
-                        start_body_index: 0,
+                        cursor: RuntimeJitDeoptCursor::at_block_entry(block),
                     },
                 }],
             };
@@ -6261,8 +6252,7 @@ def f(x):
                     precision: LocalEnvResumeStatePrecision::InstructionBoundary,
                     locals: vec![binding],
                     continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
-                        block,
-                        start_body_index: 0,
+                        cursor: RuntimeJitDeoptCursor::at_block_entry(block),
                     },
                 }],
             };
@@ -6346,8 +6336,7 @@ def f(x):
                     precision: LocalEnvResumeStatePrecision::InstructionBoundary,
                     locals: vec![binding],
                     continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
-                        block,
-                        start_body_index: 0,
+                        cursor: RuntimeJitDeoptCursor::at_block_entry(block),
                     },
                 }],
             };

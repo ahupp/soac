@@ -1635,10 +1635,7 @@ pub(crate) struct RuntimeJitDeoptCursor {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RuntimeJitDeoptContinuation {
     Unimplemented,
-    ResumeBlockTail {
-        block: BlockLabel,
-        start_body_index: usize,
-    },
+    ResumeBlockTail { cursor: RuntimeJitDeoptCursor },
 }
 
 impl RuntimeJitDeoptCursor {
@@ -1662,10 +1659,7 @@ impl RuntimeJitDeoptCursor {
 impl RuntimeJitDeoptContinuation {
     pub(crate) fn initial_cursor(&self) -> Option<RuntimeJitDeoptCursor> {
         match self {
-            RuntimeJitDeoptContinuation::ResumeBlockTail {
-                block,
-                start_body_index,
-            } => Some(RuntimeJitDeoptCursor::new(*block, *start_body_index)),
+            RuntimeJitDeoptContinuation::ResumeBlockTail { cursor } => Some(*cursor),
             RuntimeJitDeoptContinuation::Unimplemented => None,
         }
     }
@@ -1902,8 +1896,7 @@ fn runtime_jit_deopt_continuation_for_point(
             };
             if runtime_jit_deopt_term_supported(&block.term) {
                 RuntimeJitDeoptContinuation::ResumeBlockTail {
-                    block: block.label,
-                    start_body_index: block.body.len(),
+                    cursor: RuntimeJitDeoptCursor::new(block.label, block.body.len()),
                 }
             } else {
                 RuntimeJitDeoptContinuation::Unimplemented
@@ -1929,8 +1922,7 @@ fn runtime_jit_deopt_continuation_for_point(
                 return RuntimeJitDeoptContinuation::Unimplemented;
             };
             RuntimeJitDeoptContinuation::ResumeBlockTail {
-                block: block_label,
-                start_body_index,
+                cursor: RuntimeJitDeoptCursor::new(block_label, start_body_index),
             }
         }
         LocalEnvResumePoint::BlockEntry { .. } => RuntimeJitDeoptContinuation::Unimplemented,
