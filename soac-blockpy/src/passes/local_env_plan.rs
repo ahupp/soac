@@ -474,7 +474,20 @@ pub fn plan_function_locals(
     facts: &FactStore,
 ) -> FunctionLocalPlan {
     let Some(storage_layout) = function.storage_layout().as_ref() else {
-        return FunctionLocalPlan::default();
+        let blocks = function
+            .blocks
+            .iter()
+            .map(|block| {
+                (
+                    block.label,
+                    BlockLocalPlan {
+                        label: block.label,
+                        entry_locals: Vec::new(),
+                    },
+                )
+            })
+            .collect();
+        return FunctionLocalPlan { blocks };
     };
     let live_ins = compute_function_local_live_ins(function);
     let must_bound_ins = compute_function_local_must_bound_ins(function);
@@ -938,6 +951,51 @@ def f(flag):
             })
         });
         assert!(has_immortal_x, "LocalEnv plan should carry value facts");
+    }
+
+    #[test]
+    fn local_env_plan_keeps_empty_block_entries_without_storage_layout() {
+        let lowered = lower_python_to_blockpy_for_testing(
+            r#"
+def f():
+    return 1
+"#,
+        )
+        .expect("transform should succeed")
+        .codegen_module;
+        let facts = infer_module_value_facts(&lowered);
+        let function = lowered
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "f")
+            .expect("lowered function should exist");
+        let mut function_without_storage = function.clone();
+        function_without_storage.storage_layout = None;
+
+        let local_plan = plan_function_locals(&function_without_storage, &facts);
+        assert_eq!(
+            local_plan.blocks.len(),
+            function_without_storage.blocks.len()
+        );
+        assert!(local_plan
+            .blocks
+            .values()
+            .all(|block_plan| block_plan.entry_locals.is_empty()));
+
+        let resume_plan =
+            plan_function_local_env_resume(&function_without_storage, &local_plan, &facts);
+        let block_entry_count = resume_plan
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry.point, LocalEnvResumePoint::BlockEntry { .. }))
+            .count();
+        let before_term_count = resume_plan
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry.point, LocalEnvResumePoint::BeforeTerm { .. }))
+            .count();
+        assert_eq!(block_entry_count, function_without_storage.blocks.len());
+        assert_eq!(before_term_count, function_without_storage.blocks.len());
     }
 
     #[test]

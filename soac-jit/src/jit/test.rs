@@ -943,11 +943,20 @@ def f():
     ) -> Result<BuiltSpecializedFunction, String> {
         let value_facts = infer_jit_value_facts(module);
         let jit_module_local_plan = plan_jit_module_locals(module, &value_facts)?;
+        let jit_module_deopt_resume_plan = plan_jit_deopt_resume_module(module, &value_facts)?;
         let jit_local_plan = jit_module_local_plan
             .function(function.function_id)
             .ok_or_else(|| {
                 format!(
                     "missing JIT local plan for function {} ({})",
+                    function.function_id, function.names.qualname
+                )
+            })?;
+        let jit_deopt_resume_plan = jit_module_deopt_resume_plan
+            .function(function.function_id)
+            .ok_or_else(|| {
+                format!(
+                    "missing JIT deopt resume plan for function {} ({})",
                     function.function_id, function.names.qualname
                 )
             })?;
@@ -958,6 +967,7 @@ def f():
             function,
             &value_facts,
             jit_local_plan,
+            jit_deopt_resume_plan,
             module_constants,
             counter_defs,
             module_constant_object_data_ids,

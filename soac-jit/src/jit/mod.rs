@@ -2247,6 +2247,7 @@ struct JitEmitCtx<'mc> {
     module_constants: &'mc ModuleCodegenConstants,
     value_facts: &'mc FactStore,
     result_demand_plan: &'mc ResultDemandPlan,
+    deopt_resume_plan: &'mc PlannedJitDeoptResumeFunction,
     refcount_plan: &'mc FunctionRefcountPlan,
     counter_slots_by_id: &'mc [CounterRuntimeSlot],
     storage_layout: Option<StorageLayout>,
@@ -11933,8 +11934,14 @@ impl ProcessJitEngine {
         }
 
         let mut defined_functions = Vec::with_capacity(functions_to_define.len());
-        let mut jit_local_plan_cache: HashMap<usize, (FactStore, PlannedJitModuleLocals)> =
-            HashMap::new();
+        let mut jit_plan_cache: HashMap<
+            usize,
+            (
+                FactStore,
+                PlannedJitModuleLocals,
+                PlannedJitDeoptResumeModule,
+            ),
+        > = HashMap::new();
         for batch_function in functions_to_define {
             let function = &batch_function.function;
             let placeholder_blocks;
@@ -12042,22 +12049,40 @@ impl ProcessJitEngine {
                 function_module_constant_binding_key,
                 function_module_constant_symbol_prefix.as_str(),
             )?;
-            if !jit_local_plan_cache.contains_key(&function_module_constant_binding_key) {
+            if !jit_plan_cache.contains_key(&function_module_constant_binding_key) {
                 let value_facts = infer_jit_value_facts(function_module);
                 let jit_module_local_plan = plan_jit_module_locals(function_module, &value_facts)?;
-                jit_local_plan_cache.insert(
+                let jit_module_deopt_resume_plan =
+                    plan_jit_deopt_resume_module(function_module, &value_facts)?;
+                jit_plan_cache.insert(
                     function_module_constant_binding_key,
-                    (value_facts, jit_module_local_plan),
+                    (
+                        value_facts,
+                        jit_module_local_plan,
+                        jit_module_deopt_resume_plan,
+                    ),
                 );
             }
-            let (function_value_facts, function_jit_module_local_plan) = jit_local_plan_cache
+            let (
+                function_value_facts,
+                function_jit_module_local_plan,
+                function_jit_module_deopt_resume_plan,
+            ) = jit_plan_cache
                 .get(&function_module_constant_binding_key)
-                .expect("JIT local plan cache entry should exist after insertion");
+                .expect("JIT plan cache entry should exist after insertion");
             let function_jit_local_plan = function_jit_module_local_plan
                 .function(function.function_id)
                 .ok_or_else(|| {
                     format!(
                         "missing JIT local plan for function {} ({})",
+                        function.function_id, function.names.qualname
+                    )
+                })?;
+            let function_jit_deopt_resume_plan = function_jit_module_deopt_resume_plan
+                .function(function.function_id)
+                .ok_or_else(|| {
+                    format!(
+                        "missing JIT deopt resume plan for function {} ({})",
                         function.function_id, function.names.qualname
                     )
                 })?;
@@ -12068,6 +12093,7 @@ impl ProcessJitEngine {
                 function,
                 function_value_facts,
                 function_jit_local_plan,
+                function_jit_deopt_resume_plan,
                 function_module_constants,
                 function_counter_defs,
                 function_module_constant_object_data_ids.as_slice(),
@@ -13736,6 +13762,7 @@ fn build_cranelift_run_bb_specialized_function(
     function: &BlockPyFunction<CodegenModuleShape>,
     value_facts: &FactStore,
     jit_local_plan: &PlannedJitFunctionLocals,
+    jit_deopt_resume_plan: &PlannedJitDeoptResumeFunction,
     module_constants: &ModuleCodegenConstants,
     counter_defs: &[CounterDef],
     module_constant_object_data_ids: &[DataId],
@@ -13770,6 +13797,7 @@ fn build_cranelift_run_bb_specialized_function(
             }
         }
     }
+    jit_deopt_resume_plan.validate_for_function(function)?;
     let typed_function =
         lower_typed_function_if_tests_to_truthy(lower_codegen_function_to_typed(function.clone()));
     if typed_function.blocks.len() != function.blocks.len() {
@@ -14415,6 +14443,7 @@ fn build_cranelift_run_bb_specialized_function(
                 module_constants,
                 value_facts,
                 result_demand_plan: &result_demand_plan,
+                deopt_resume_plan: jit_deopt_resume_plan,
                 refcount_plan,
                 counter_slots_by_id,
                 storage_layout: function.storage_layout().clone(),
@@ -14495,6 +14524,12 @@ fn build_cranelift_run_bb_specialized_function(
                 type_ptr_data_ids: RefCell::new(HashMap::new()),
                 callable_ptr_data_ids: RefCell::new(HashMap::new()),
             };
+            debug_assert!(
+                emit_ctx
+                    .deopt_resume_plan
+                    .deopt_points_for_block(codegen_block.label)
+                    .all(|point| point.id.function_id == function.function_id)
+            );
             let _block_refcount_plan = emit_ctx.refcount_plan.block(codegen_block.label);
 
             emit_typed_codegen_ops(
@@ -14883,11 +14918,20 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
     };
     let value_facts = infer_jit_value_facts(module);
     let jit_module_local_plan = plan_jit_module_locals(module, &value_facts)?;
+    let jit_module_deopt_resume_plan = plan_jit_deopt_resume_module(module, &value_facts)?;
     let jit_local_plan = jit_module_local_plan
         .function(function.function_id)
         .ok_or_else(|| {
             format!(
                 "missing JIT local plan for function {} ({})",
+                function.function_id, function.names.qualname
+            )
+        })?;
+    let jit_deopt_resume_plan = jit_module_deopt_resume_plan
+        .function(function.function_id)
+        .ok_or_else(|| {
+            format!(
+                "missing JIT deopt resume plan for function {} ({})",
                 function.function_id, function.names.qualname
             )
         })?;
@@ -14898,6 +14942,7 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
         function,
         &value_facts,
         jit_local_plan,
+        jit_deopt_resume_plan,
         module_constants,
         counter_defs,
         module_constant_object_data_ids.as_slice(),
