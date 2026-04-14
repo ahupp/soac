@@ -2271,8 +2271,9 @@ fn typed_nested_guard_scan_expr(expr: &InstrTyped, saw_replay_unsafe_effect: &mu
         }
         InstrTyped::LegacyDel(_) => mark_replay_unsafe_effect(saw_replay_unsafe_effect),
         InstrTyped::LegacyMakeCell(op) => {
-            typed_nested_guard_scan_expr(op.initial_value.as_ref(), saw_replay_unsafe_effect)
-                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+            op.initial_value.as_ref().map_or(true, |initial_value| {
+                typed_nested_guard_scan_expr(initial_value.as_ref(), saw_replay_unsafe_effect)
+            }) && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
         }
         InstrTyped::LegacyIncrementCounter(_) => {
             mark_replay_unsafe_effect(saw_replay_unsafe_effect)
