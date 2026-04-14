@@ -114,7 +114,8 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             },
             NameLocation::GlobalName => unsafe { self.execute_return_global(name, -1) },
             NameLocation::RuntimeName => unsafe { execute_runtime_name_deopt(name) },
-            NameLocation::Cell(_) | NameLocation::Constant(_) => Err(format!(
+            NameLocation::Constant(constant_index) => self.execute_module_constant(constant_index),
+            NameLocation::Cell(_) => Err(format!(
                 "deopt continuation does not support loading {location:?} for {name:?}"
             )),
         }
@@ -138,6 +139,18 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
         if value.is_null() {
             set_deopt_unbound_local_error(name);
             return Ok(ptr::null_mut());
+        }
+        unsafe { ffi::Py_INCREF(value.cast::<ffi::PyObject>()) };
+        Ok(value)
+    }
+
+    #[cold]
+    fn execute_module_constant(&self, constant_index: u32) -> Result<ObjPtr, String> {
+        let value = self.invocation.module_constant_ptr(constant_index)?;
+        if value.is_null() {
+            return Err(format!(
+                "deopt continuation expected non-null module constant {constant_index}"
+            ));
         }
         unsafe { ffi::Py_INCREF(value.cast::<ffi::PyObject>()) };
         Ok(value)

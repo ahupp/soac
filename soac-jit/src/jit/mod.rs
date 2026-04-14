@@ -41,7 +41,7 @@ use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, c_void};
 use std::mem::offset_of;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1316,6 +1316,7 @@ enum CompiledRunnerEntry {
 pub(crate) struct RuntimeJitDeoptTable {
     function_id: FunctionId,
     function: Box<BlockPyFunction<CodegenModuleShape>>,
+    module_constant_ptrs: Vec<ObjPtr>,
     points: Vec<RuntimeJitDeoptRecord>,
 }
 
@@ -1429,6 +1430,7 @@ impl RuntimeJitDeoptTable {
     fn from_plan(
         function: &BlockPyFunction<CodegenModuleShape>,
         plan: &PlannedJitDeoptResumeFunction,
+        module_constant_ptrs: &[*mut ffi::PyObject],
     ) -> Result<Self, String> {
         let mut points = Vec::with_capacity(plan.deopt_points.len());
         for deopt_point in &plan.deopt_points {
@@ -1452,6 +1454,10 @@ impl RuntimeJitDeoptTable {
         let table = Self {
             function_id: function.function_id,
             function: Box::new(function.clone()),
+            module_constant_ptrs: module_constant_ptrs
+                .iter()
+                .map(|ptr| ptr.cast::<c_void>())
+                .collect(),
             points,
         };
         table.validate_against_plan(plan)?;
@@ -1499,6 +1505,21 @@ impl RuntimeJitDeoptTable {
 
     pub(crate) fn function(&self) -> &BlockPyFunction<CodegenModuleShape> {
         self.function.as_ref()
+    }
+
+    pub(crate) fn module_constant_ptr(
+        &self,
+        constant_id: ModuleConstantId,
+    ) -> Result<ObjPtr, String> {
+        self.module_constant_ptrs
+            .get(constant_id.0)
+            .copied()
+            .ok_or_else(|| {
+                format!(
+                    "deopt table for function {} is missing module constant {}",
+                    self.function_id, constant_id.0
+                )
+            })
     }
 
     pub(crate) fn record_for_ordinal(
@@ -1655,6 +1676,11 @@ impl RuntimeJitDeoptInvocation<'_> {
 
     pub(crate) fn globals_obj(&self) -> ObjPtr {
         self.globals_obj
+    }
+
+    pub(crate) fn module_constant_ptr(&self, constant_index: u32) -> Result<ObjPtr, String> {
+        self.table
+            .module_constant_ptr(ModuleConstantId(constant_index as usize))
     }
 
     pub(crate) fn live_bindings(
@@ -12920,6 +12946,7 @@ impl ProcessJitEngine {
             let function_deopt_table = Arc::new(RuntimeJitDeoptTable::from_plan(
                 function,
                 function_jit_deopt_resume_plan,
+                function_module_constant_ptrs,
             )?);
             let built = build_cranelift_run_bb_specialized_function(
                 &mut state.jit_module,

@@ -2642,6 +2642,7 @@ def f():
                 std::sync::Arc::new(RuntimeJitDeoptTable {
                     function_id: first.function_id,
                     function: Box::new(first.clone()),
+                    module_constant_ptrs: Vec::new(),
                     points: Vec::new(),
                 }),
             )
@@ -4869,6 +4870,7 @@ def read_point(point):
         let table = RuntimeJitDeoptTable {
             function_id,
             function: Box::new(function),
+            module_constant_ptrs: Vec::new(),
             points: vec![RuntimeJitDeoptRecord {
                 id: PlannedJitDeoptPointId {
                     function_id,
@@ -4936,7 +4938,7 @@ def f(x):
         let function_plan = module_plan
             .function(function.function_id)
             .expect("function should have a JIT deopt plan");
-        let table = RuntimeJitDeoptTable::from_plan(function, function_plan)
+        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
             .expect("runtime deopt table should build from plan");
         let point = LocalEnvResumePoint::BeforeTerm {
             function_id: function.function_id,
@@ -4974,7 +4976,7 @@ def f(x):
         let function_plan = module_plan
             .function(function.function_id)
             .expect("function should have a JIT deopt plan");
-        let table = RuntimeJitDeoptTable::from_plan(function, function_plan)
+        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
             .expect("runtime deopt table should build from plan");
         let point = LocalEnvResumePoint::BeforeTerm {
             function_id: function.function_id,
@@ -5011,7 +5013,7 @@ def f(x):
         let function_plan = module_plan
             .function(function.function_id)
             .expect("function should have a JIT deopt plan");
-        let table = RuntimeJitDeoptTable::from_plan(function, function_plan)
+        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
             .expect("runtime deopt table should build from plan");
         let point = LocalEnvResumePoint::BeforeInstr {
             key: InstrKey::new(function.function_id, body_instr_id),
@@ -5048,6 +5050,7 @@ def f(x):
             let table = RuntimeJitDeoptTable {
                 function_id,
                 function: Box::new(function),
+                module_constant_ptrs: Vec::new(),
                 points: vec![RuntimeJitDeoptRecord {
                     id: PlannedJitDeoptPointId {
                         function_id,
@@ -5103,6 +5106,7 @@ def f(x):
             let table = RuntimeJitDeoptTable {
                 function_id,
                 function: Box::new(function),
+                module_constant_ptrs: Vec::new(),
                 points: vec![RuntimeJitDeoptRecord {
                     id: PlannedJitDeoptPointId {
                         function_id,
@@ -5175,6 +5179,7 @@ def f(x):
             let table = RuntimeJitDeoptTable {
                 function_id,
                 function: Box::new(function),
+                module_constant_ptrs: Vec::new(),
                 points: vec![RuntimeJitDeoptRecord {
                     id: PlannedJitDeoptPointId {
                         function_id,
@@ -5234,6 +5239,97 @@ def f(x):
                 ffi::Py_DECREF(value);
                 ffi::Py_DECREF(key);
                 ffi::Py_DECREF(globals);
+            }
+        });
+    }
+
+    #[test]
+    fn deopt_block_tail_continuation_returns_owned_module_constant() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|_| {
+            let function = with_single_test_block(
+                test_function(),
+                vec![expr_stmt(name_expr(test_global_name("x")))],
+                ret_term(name_expr(test_constant_name(0))),
+            );
+            let function_id = function.function_id;
+            let block = function.entry_block().label;
+            let constant = unsafe { ffi::PyLong_FromLong(444_555_666) };
+            assert!(
+                !constant.is_null(),
+                "test module constant allocation should succeed"
+            );
+            let table = RuntimeJitDeoptTable {
+                function_id,
+                function: Box::new(function),
+                module_constant_ptrs: vec![constant.cast()],
+                points: vec![RuntimeJitDeoptRecord {
+                    id: PlannedJitDeoptPointId {
+                        function_id,
+                        ordinal: 0,
+                    },
+                    resume_point: LocalEnvResumePoint::BeforeInstr {
+                        key: InstrKey::new(function_id, InstrId::new(block, 0)),
+                    },
+                    precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                    locals: vec![],
+                    continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
+                        block,
+                        start_body_index: 0,
+                    },
+                }],
+            };
+            let globals = unsafe { ffi::PyDict_New() };
+            assert!(
+                !globals.is_null(),
+                "test globals dict allocation should succeed"
+            );
+            let key = unsafe { ffi::PyUnicode_FromString(c"x".as_ptr()) };
+            assert!(!key.is_null(), "test key allocation should succeed");
+            let value = unsafe { ffi::PyLong_FromLong(222_333_444) };
+            assert!(!value.is_null(), "test PyLong allocation should succeed");
+            assert_eq!(
+                unsafe { ffi::PyDict_SetItem(globals, key, value) },
+                0,
+                "test globals dict insertion should succeed"
+            );
+            let before_constant = unsafe { ffi::Py_REFCNT(constant) };
+            let before_value = unsafe { ffi::Py_REFCNT(value) };
+            let result = unsafe {
+                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                    std::ptr::addr_of!(table).cast_mut().cast(),
+                    globals.cast(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!(
+                result,
+                constant.cast(),
+                "block-tail deopt should return the module constant"
+            );
+            assert!(
+                unsafe { ffi::PyErr_Occurred() }.is_null(),
+                "successful block-tail constant deopt should not leave a Python exception"
+            );
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(constant) },
+                before_constant + 1,
+                "returned module constant should be owned by the JIT caller"
+            );
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(value) },
+                before_value,
+                "expression-statement global load should still be decref'd before returning"
+            );
+            unsafe {
+                ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+                ffi::Py_DECREF(value);
+                ffi::Py_DECREF(key);
+                ffi::Py_DECREF(globals);
+                ffi::Py_DECREF(constant);
             }
         });
     }
@@ -7403,8 +7499,9 @@ def f(x, y):
             let function_plan = module_plan
                 .function(function.function_id)
                 .expect("function should have a JIT deopt plan");
-            let deopt_table = RuntimeJitDeoptTable::from_plan(&function, function_plan)
-                .expect("runtime deopt table should build from plan");
+            let deopt_table =
+                RuntimeJitDeoptTable::from_plan(&function, function_plan, &module_constant_ptrs)
+                    .expect("runtime deopt table should build from plan");
 
             let mut ctx = built.ctx;
             define_prepared_function(
@@ -7593,8 +7690,9 @@ def f(x, y):
             let function_plan = module_plan
                 .function(function.function_id)
                 .expect("function should have a JIT deopt plan");
-            let deopt_table = RuntimeJitDeoptTable::from_plan(&function, function_plan)
-                .expect("runtime deopt table should build from plan");
+            let deopt_table =
+                RuntimeJitDeoptTable::from_plan(&function, function_plan, &module_constant_ptrs)
+                    .expect("runtime deopt table should build from plan");
 
             let mut ctx = built.ctx;
             define_prepared_function(
