@@ -3,7 +3,7 @@ use soac_blockpy::block_py::{
 };
 pub use soac_blockpy::passes::{
     BlockParamFacts, FunctionLocalPlan, LocalRefKind, ParamBindingFacts, ParamProvenance,
-    PlannedLocalBinding, PlannedLocalStorage, plan_function_locals,
+    PlannedLocalBinding, PlannedLocalStorage, plan_function_locals, render_planned_local_binding,
 };
 use soac_blockpy::passes::{
     CodegenModuleShape, FactStore, FunctionRefcountPlan, LocalEnvModulePlan, RefcountActionKind,
@@ -794,19 +794,6 @@ fn render_local_env_entry_materialization(entry: &PlannedLocalEnvEntryMaterializ
         entry.source,
         entry.entry_ref_kind,
         entry.entry_aliases
-    )
-}
-
-fn render_planned_local_binding(binding: &PlannedLocalBinding) -> String {
-    format!(
-        "{}@{} storage={:?} binding={:?} ownership={:?} provenance={:?} value={:?}",
-        binding.name,
-        binding.location.0,
-        binding.storage,
-        binding.param_facts.binding,
-        binding.param_facts.ownership,
-        binding.param_facts.provenance,
-        binding.param_facts.value
     )
 }
 

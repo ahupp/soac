@@ -11,6 +11,7 @@ use crate::passes::ownership_effects::{
 };
 use crate::passes::{CodegenModuleShape, FactStore, PyObjFacts};
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LocalRefKind {
@@ -268,6 +269,69 @@ pub fn plan_function_locals(
         );
     }
     FunctionLocalPlan { blocks }
+}
+
+pub fn render_local_env_module_plan(
+    module: &BlockPyModule<CodegenModuleShape>,
+    facts: &FactStore,
+    plan: &LocalEnvModulePlan,
+) -> Result<String, String> {
+    validate_local_env_module_plan(module, facts, plan)?;
+    let mut out = String::new();
+    for function in &module.callable_defs {
+        let function_plan = plan.function(function.function_id).ok_or_else(|| {
+            format!(
+                "missing LocalEnv plan for function {} ({})",
+                function.function_id, function.names.qualname
+            )
+        })?;
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&render_local_env_function_plan(function, function_plan)?);
+    }
+    Ok(out)
+}
+
+pub fn render_local_env_function_plan(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    plan: &FunctionLocalPlan,
+) -> Result<String, String> {
+    let mut out = String::new();
+    writeln!(
+        out,
+        "function {} {}:",
+        function.function_id, function.names.qualname
+    )
+    .expect("writing to String should not fail");
+    for block in &function.blocks {
+        let Some(block_plan) = plan.block(block.label) else {
+            return Err(format!(
+                "missing LocalEnv block plan for function {} ({}) block {}",
+                function.function_id, function.names.qualname, block.label
+            ));
+        };
+        writeln!(out, "  block {}:", block.label).expect("writing to String should not fail");
+        writeln!(out, "    entry_locals:").expect("writing to String should not fail");
+        for binding in &block_plan.entry_locals {
+            writeln!(out, "      {}", render_planned_local_binding(binding))
+                .expect("writing to String should not fail");
+        }
+    }
+    Ok(out)
+}
+
+pub fn render_planned_local_binding(binding: &PlannedLocalBinding) -> String {
+    format!(
+        "{}@{} storage={:?} binding={:?} ownership={:?} provenance={:?} value={:?}",
+        binding.name,
+        binding.location.0,
+        binding.storage,
+        binding.param_facts.binding,
+        binding.param_facts.ownership,
+        binding.param_facts.provenance,
+        binding.param_facts.value
+    )
 }
 
 fn validate_function_local_plan(
