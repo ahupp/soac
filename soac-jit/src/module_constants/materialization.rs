@@ -88,10 +88,11 @@ impl StaticPyObjectTemplate {
     }
 
     fn build_python_constant(self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        if let Some(image) = self.static_object_image() {
+            return materialize_static_pyobject_image(py, &image);
+        }
         match self {
-            Self::CompactPyLongI64 { value, digit } => {
-                build_static_compact_pylong_i64(py, value, digit)
-            }
+            Self::CompactPyLongI64 { value, .. } => build_pylong_i64_fallback(py, value),
         }
     }
 
@@ -230,35 +231,82 @@ fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
     bytes[offset..offset + mem::size_of::<u32>()].copy_from_slice(&value.to_le_bytes());
 }
 
-fn build_static_compact_pylong_i64(
+fn materialize_static_pyobject_image(
     py: Python<'_>,
-    value: i64,
-    digit: RawPyLongDigit,
+    image: &StaticPyObjectImage,
 ) -> PyResult<Py<PyAny>> {
-    let template = StaticPyObjectTemplate::CompactPyLongI64 { value, digit };
-    let raw =
-        unsafe { ffi::PyObject_Malloc(mem::size_of::<RawPyLongObject>()) } as *mut RawPyLongObject;
+    let raw = unsafe { ffi::PyObject_Malloc(image.bytes.len()) } as *mut u8;
     if raw.is_null() {
         unsafe { ffi::PyErr_NoMemory() };
         return Err(PyErr::fetch(py));
     }
+    let align = usize::try_from(image.align).unwrap_or(usize::MAX);
+    if align == 0 || (raw as usize) % align != 0 {
+        unsafe { ffi::PyObject_Free(raw.cast()) };
+        return Err(PyRuntimeError::new_err(format!(
+            "PyObject_Malloc returned memory {raw:p} that does not satisfy static object alignment {}",
+            image.align
+        )));
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(image.bytes.as_ptr(), raw, image.bytes.len());
+    }
+    if let Err(error) = unsafe {
+        patch_static_pyobject_image_relocations(raw, image.bytes.len(), &image.relocations)
+    } {
+        unsafe { ffi::PyObject_Free(raw.cast()) };
+        return Err(PyRuntimeError::new_err(error));
+    }
+    unsafe { Bound::from_owned_ptr_or_err(py, raw.cast::<ffi::PyObject>()).map(Py::from) }
+}
 
-    let obj = unsafe {
-        let obj = ffi::PyObject_Init(
-            raw.cast::<ffi::PyObject>(),
-            ptr::addr_of_mut!(ffi::PyLong_Type),
-        );
-        if obj.is_null() {
-            ffi::PyObject_Free(raw.cast());
-            return unsafe { Bound::from_owned_ptr_or_err(py, obj) }.map(Py::from);
+fn build_pylong_i64_fallback(py: Python<'_>, value: i64) -> PyResult<Py<PyAny>> {
+    let ptr = unsafe { ffi::PyLong_FromLongLong(value as std::ffi::c_longlong) };
+    let bound: Bound<'_, PyAny> = unsafe { Bound::from_owned_ptr_or_err(py, ptr)? };
+    Ok(bound.unbind())
+}
+
+unsafe fn patch_static_pyobject_image_relocations(
+    base: *mut u8,
+    len: usize,
+    relocations: &[StaticPyObjectRelocation],
+) -> Result<(), String> {
+    for relocation in relocations {
+        let offset = usize::try_from(relocation.offset).map_err(|_| {
+            format!(
+                "static PyObject relocation offset does not fit usize: {}",
+                relocation.offset
+            )
+        })?;
+        let end = offset.checked_add(mem::size_of::<usize>()).ok_or_else(|| {
+            format!(
+                "static PyObject relocation offset overflow at {}",
+                relocation.offset
+            )
+        })?;
+        if end > len {
+            return Err(format!(
+                "static PyObject relocation at byte {} exceeds image size {}",
+                relocation.offset, len
+            ));
         }
-        (*raw).long_value = RawPyLongValue {
-            lv_tag: template.compact_pylong_lv_tag(),
-            ob_digit: [digit],
-        };
-        obj
-    };
-    unsafe { Bound::from_owned_ptr_or_err(py, obj).map(Py::from) }
+        let value = static_pyobject_relocation_value(relocation.symbol)?;
+        ptr::copy_nonoverlapping(
+            value.to_ne_bytes().as_ptr(),
+            base.add(offset),
+            mem::size_of::<usize>(),
+        );
+    }
+    Ok(())
+}
+
+fn static_pyobject_relocation_value(symbol: &str) -> Result<usize, String> {
+    match symbol {
+        "PyLong_Type" => Ok(ptr::addr_of_mut!(ffi::PyLong_Type) as usize),
+        _ => Err(format!(
+            "unsupported static PyObject relocation symbol {symbol:?}"
+        )),
+    }
 }
 
 fn build_unicode_constant<'py>(py: Python<'py>, bytes: &[u8]) -> PyResult<Bound<'py, PyAny>> {
@@ -653,12 +701,25 @@ mod tests {
         Python::attach(|py| {
             let mut constants = ModuleCodegenConstants::default();
             let constant_id = constants.intern_int(12345);
+            let image = constants
+                .static_pyobject_image(constant_id)
+                .expect("test constant should have a static image");
             let objects = constants
                 .build_python_constants(py)
                 .expect("building static PyLong constant should succeed");
             let obj = objects[constant_id.0].as_ptr();
 
             unsafe {
+                let mut expected_bytes = image.bytes.clone();
+                patch_static_pyobject_image_relocations(
+                    expected_bytes.as_mut_ptr(),
+                    expected_bytes.len(),
+                    &image.relocations,
+                )
+                .expect("test static image relocations should patch");
+                let actual_bytes =
+                    std::slice::from_raw_parts(obj.cast::<u8>(), expected_bytes.len());
+                assert_eq!(actual_bytes, expected_bytes.as_slice());
                 assert_ne!(ffi::PyLong_CheckExact(obj), 0);
                 assert_eq!(ffi::PyLong_AsLongLong(obj), 12345);
                 assert_ne!(PyUnstable_IsImmortal(obj), 0);
