@@ -1634,7 +1634,7 @@ fn emit_codegen_indexed_global_load(
     let guard_miss_target = ctx
         .guard_miss_target_before_instr_id(instr_id, fallback_block)
         .unwrap_or_else(|err| panic!("{err}"));
-    let _future_deopt_exit = guard_miss_target.deopt_exit_ref();
+    let guard_miss_dispatch = prepare_guard_miss_dispatch(guard_miss_target, None);
     let direct_block = fb.create_block();
     fb.append_block_param(direct_block, ptr_ty);
 
@@ -1648,7 +1648,7 @@ fn emit_codegen_indexed_global_load(
         .icmp(ir::condcodes::IntCC::Equal, direct_value, null_ptr);
     fb.ins().brif(
         direct_is_null,
-        guard_miss_target.fallback_block(),
+        guard_miss_dispatch.branch_block(),
         &[],
         direct_block,
         &[ir::BlockArg::Value(direct_value)],
@@ -1663,22 +1663,50 @@ fn emit_codegen_indexed_global_load(
     fb.ins()
         .jump(result_block, &[ir::BlockArg::Value(direct_value)]);
 
-    fb.switch_to_block(guard_miss_target.fallback_block());
-    emit_optional_counter_increment_for_kind(
-        fb,
-        ctx,
-        ctx.global_indexed_fallback_counter_ids,
-        instr_id,
-    );
-    let fallback_inst = fb.ins().call(
-        ctx.load_global_slow_ref,
-        &[globals_obj, name_obj, slot_index],
-    );
-    let fallback_value = fb.inst_results(fallback_inst)[0];
-    let fallback_value =
-        emit_decref_owned_input_after_nullable_result(fb, ctx, fallback_value, name_obj);
-    fb.ins()
-        .jump(result_block, &[ir::BlockArg::Value(fallback_value)]);
+    match guard_miss_dispatch {
+        JitGuardMissDispatch::FallbackBlock(fallback_block) => {
+            fb.switch_to_block(fallback_block);
+            emit_optional_counter_increment_for_kind(
+                fb,
+                ctx,
+                ctx.global_indexed_fallback_counter_ids,
+                instr_id,
+            );
+            let fallback_inst = fb.ins().call(
+                ctx.load_global_slow_ref,
+                &[globals_obj, name_obj, slot_index],
+            );
+            let fallback_value = fb.inst_results(fallback_inst)[0];
+            let fallback_value =
+                emit_decref_owned_input_after_nullable_result(fb, ctx, fallback_value, name_obj);
+            fb.ins()
+                .jump(result_block, &[ir::BlockArg::Value(fallback_value)]);
+        }
+        JitGuardMissDispatch::DeoptUnimplemented {
+            block,
+            target,
+            deopt_unimplemented_ref,
+        } => {
+            fb.switch_to_block(block);
+            fb.set_cold_block(block);
+            emit_optional_counter_increment_for_kind(
+                fb,
+                ctx,
+                ctx.global_indexed_fallback_counter_ids,
+                instr_id,
+            );
+            let _ = emit_deopt_unimplemented_exit_call(
+                fb,
+                target,
+                deopt_unimplemented_ref,
+                ctx.consts.ptr_ty,
+                ctx.consts.i64_ty,
+            );
+            emit_release_owned_inputs(fb, ctx, &[name_obj]);
+            fb.ins()
+                .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
+        }
+    }
 
     fb.switch_to_block(result_block);
     fb.block_params(result_block)[0]
@@ -2455,11 +2483,40 @@ impl JitGuardMissTarget {
         self.fallback_block
     }
 
-    fn deopt_exit_ref(self) -> (ir::Value, i64) {
-        (
-            self.deopt_exit.function_env_value,
-            self.deopt_exit.record_ordinal,
-        )
+    fn deopt_exit(self) -> JitDeoptExitRef {
+        self.deopt_exit
+    }
+}
+
+#[derive(Clone, Copy)]
+enum JitGuardMissDispatch {
+    FallbackBlock(ir::Block),
+    DeoptUnimplemented {
+        block: ir::Block,
+        target: JitDeoptExitRef,
+        deopt_unimplemented_ref: ir::FuncRef,
+    },
+}
+
+impl JitGuardMissDispatch {
+    fn branch_block(self) -> ir::Block {
+        match self {
+            Self::FallbackBlock(block) | Self::DeoptUnimplemented { block, .. } => block,
+        }
+    }
+}
+
+fn prepare_guard_miss_dispatch(
+    target: JitGuardMissTarget,
+    deopt_unimplemented_ref: Option<ir::FuncRef>,
+) -> JitGuardMissDispatch {
+    match deopt_unimplemented_ref {
+        Some(deopt_unimplemented_ref) => JitGuardMissDispatch::DeoptUnimplemented {
+            block: target.fallback_block(),
+            target: target.deopt_exit(),
+            deopt_unimplemented_ref,
+        },
+        None => JitGuardMissDispatch::FallbackBlock(target.fallback_block()),
     }
 }
 
