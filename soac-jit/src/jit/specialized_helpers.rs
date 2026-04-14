@@ -86,7 +86,8 @@ unsafe fn object_type_name(obj: *mut ffi::PyObject) -> String {
 
 #[cold]
 #[inline(never)]
-unsafe extern "C" fn soac_runtime_set_runtime_error_static(message: *const c_char) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soac_runtime_set_runtime_error_static(message: *const c_char) {
     ffi::PyErr_SetString(ffi::PyExc_RuntimeError, message);
 }
 unsafe fn raise_expected_cell(where_name: &str, obj: *mut ffi::PyObject) {
@@ -184,6 +185,11 @@ unsafe extern "C" fn enter_recursive_call_hook(_tstate: ObjPtr) -> i32 {
     ffi::Py_EnterRecursiveCall(b" while calling a Python object\0".as_ptr() as *const i8)
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dp_jit_enter_recursive_call(tstate: ObjPtr) -> i32 {
+    enter_recursive_call_hook(tstate)
+}
+
 unsafe extern "C" fn pytype_generic_alloc_hook(type_obj: ObjPtr, nitems: i64) -> ObjPtr {
     if type_obj.is_null() || nitems < 0 {
         ffi::PyErr_SetString(
@@ -196,6 +202,11 @@ unsafe extern "C" fn pytype_generic_alloc_hook(type_obj: ObjPtr, nitems: i64) ->
         type_obj as *mut ffi::PyTypeObject,
         nitems as ffi::Py_ssize_t,
     ) as ObjPtr
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dp_jit_pytype_generic_alloc(type_obj: ObjPtr, nitems: i64) -> ObjPtr {
+    pytype_generic_alloc_hook(type_obj, nitems)
 }
 
 unsafe extern "C" fn finish_constructor_init_hook(obj: ObjPtr, init_result: ObjPtr) -> ObjPtr {
@@ -691,6 +702,14 @@ unsafe extern "C" fn raise_deleted_name_error_hook(name_obj: ObjPtr) {
     );
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dp_jit_finish_constructor_init(
+    obj: ObjPtr,
+    init_result: ObjPtr,
+) -> ObjPtr {
+    finish_constructor_init_hook(obj, init_result)
+}
+
 unsafe extern "C" fn raise_missing_required_argument_hook() {
     ffi::PyErr_SetString(
         ffi::PyExc_TypeError,
@@ -1086,11 +1105,13 @@ macro_rules! define_perf_toggle_export {
         $fast:ident,
         $with_frame:ident($($arg:ident : $ty:ty),* $(,)?) => $body:expr
     ) => {
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn $fast($($arg: $ty),*) -> $ret {
             $body
         }
 
         #[inline(never)]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn $with_frame($($arg: $ty),*) -> $ret {
             preserve_helper_frame!($body)
         }
@@ -1148,6 +1169,7 @@ define_perf_toggle_export!(
     dp_jit_py_call_with_kw,
     dp_jit_py_call_with_kw_with_frame(callable: ObjPtr, args: ObjPtr, kw: ObjPtr) => py_call_with_kw_hook(callable, args, kw)
 );
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_record_top_value_sample(counter: ObjPtr, value: i64) {
     record_top_value_sample_hook(counter, value)
 }
@@ -1160,9 +1182,11 @@ define_perf_toggle_export!(
 pub unsafe extern "C" fn dp_jit_load_runtime_obj(name: ObjPtr) -> ObjPtr {
     load_runtime_name_owned(name as *mut ffi::PyObject) as ObjPtr
 }
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_pyobject_getattr(obj: ObjPtr, attr: ObjPtr) -> ObjPtr {
     pyobject_getattr_hook(obj, attr)
 }
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_pyobject_setattr(
     obj: ObjPtr,
     attr: ObjPtr,
@@ -1170,9 +1194,11 @@ pub unsafe extern "C" fn dp_jit_pyobject_setattr(
 ) -> ObjPtr {
     pyobject_setattr_hook(obj, attr, value)
 }
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_pyobject_getitem(obj: ObjPtr, key: ObjPtr) -> ObjPtr {
     pyobject_getitem_hook(obj, key)
 }
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_pyobject_setitem(
     obj: ObjPtr,
     key: ObjPtr,
@@ -1180,9 +1206,11 @@ pub unsafe extern "C" fn dp_jit_pyobject_setitem(
 ) -> ObjPtr {
     pyobject_setitem_hook(obj, key, value)
 }
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_pyobject_delitem(obj: ObjPtr, key: ObjPtr) -> ObjPtr {
     pyobject_delitem_hook(obj, key)
 }
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_load_global_obj(
     globals_obj: ObjPtr,
     name: ObjPtr,
@@ -1190,6 +1218,7 @@ pub unsafe extern "C" fn dp_jit_load_global_obj(
 ) -> ObjPtr {
     load_global_obj_hook(globals_obj, name, slot_index)
 }
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn soac_runtime_load_global_slow(
     globals_obj: ObjPtr,
     name: ObjPtr,
@@ -1200,6 +1229,7 @@ pub unsafe extern "C" fn soac_runtime_load_global_slow(
     let result = load_global_obj_impl(globals_obj, name_obj, slot_index);
     ensure_global_load_error(result, name_obj)
 }
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_store_global(
     globals_obj: ObjPtr,
     name: ObjPtr,
@@ -1208,6 +1238,7 @@ pub unsafe extern "C" fn dp_jit_store_global(
 ) -> ObjPtr {
     store_global_hook(globals_obj, name, slot_index, value)
 }
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_del_global(
     globals_obj: ObjPtr,
     key: ObjPtr,
@@ -1215,6 +1246,7 @@ pub unsafe extern "C" fn dp_jit_del_global(
 ) -> ObjPtr {
     del_global_hook(globals_obj, key, slot_index, false)
 }
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_del_global_quietly(
     globals_obj: ObjPtr,
     key: ObjPtr,
@@ -1222,35 +1254,45 @@ pub unsafe extern "C" fn dp_jit_del_global_quietly(
 ) -> ObjPtr {
     del_global_hook(globals_obj, key, slot_index, true)
 }
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_del_quietly(obj: ObjPtr, key: ObjPtr) -> ObjPtr {
     del_quietly_hook(obj, key)
 }
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_pyobject_to_i64(value: ObjPtr) -> i64 {
     pyobject_to_i64_hook(value)
 }
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_make_cell(value: ObjPtr) -> ObjPtr {
     make_cell_hook(value)
 }
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_raise_deleted_name_error(name: ObjPtr) {
     raise_deleted_name_error_hook(name)
 }
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_raise_missing_required_argument() {
     raise_missing_required_argument_hook()
 }
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_load_cell(cell: ObjPtr) -> ObjPtr {
     load_cell_hook(cell)
 }
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_store_cell(cell: ObjPtr, value: ObjPtr) -> ObjPtr {
     store_cell_hook(cell, value)
 }
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_del_deref(cell: ObjPtr) -> ObjPtr {
     del_deref_hook(cell)
 }
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_del_deref_quietly(cell: ObjPtr) -> ObjPtr {
     del_deref_quietly_hook(cell)
 }
 #[cold]
 #[inline(never)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_deopt_resume(
     deopt_table: ObjPtr,
     globals_obj: ObjPtr,
@@ -1312,18 +1354,23 @@ fn set_deopt_unsupported_continuation_error(detail: String) {
     }
 }
 
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_tuple_new(size: i64) -> ObjPtr {
     tuple_new_hook(size)
 }
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_tuple_set_item(tuple_obj: ObjPtr, index: i64, item: ObjPtr) -> i32 {
     tuple_set_item_hook(tuple_obj, index, item)
 }
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_dict_new() -> ObjPtr {
     dict_new_hook()
 }
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_dict_set_item(dict_obj: ObjPtr, key: ObjPtr, value: ObjPtr) -> i32 {
     dict_set_item_hook(dict_obj, key, value)
 }
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_is_true(value: ObjPtr) -> i32 {
     is_true_hook(value)
 }
@@ -1386,6 +1433,7 @@ unsafe fn exact_long_i64_overflow_error() {
         c"SOAC optimized integer arithmetic overflowed i64".as_ptr(),
     );
 }
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_raise_i64_overflow() {
     exact_long_i64_overflow_error();
 }
@@ -1766,6 +1814,76 @@ unsafe fn exact_long_richcompare_slot_symbol() -> *const u8 {
         .tp_richcompare
         .expect("PyLong_Type is missing required tp_richcompare slot") as *const u8
 }
+unsafe fn exact_long_number_slot_call(
+    slot_name: &str,
+    slot: Option<
+        unsafe extern "C" fn(*mut ffi::PyObject, *mut ffi::PyObject) -> *mut ffi::PyObject,
+    >,
+    lhs: ObjPtr,
+    rhs: ObjPtr,
+) -> ObjPtr {
+    let slot =
+        slot.unwrap_or_else(|| panic!("PyLong_Type is missing required number slot {slot_name}"));
+    slot(lhs as *mut ffi::PyObject, rhs as *mut ffi::PyObject) as ObjPtr
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dp_jit_exact_long_add_slot(lhs: ObjPtr, rhs: ObjPtr) -> ObjPtr {
+    let long_type = std::ptr::addr_of_mut!(PyLong_Type);
+    let number = (*long_type).tp_as_number;
+    assert!(
+        !number.is_null(),
+        "PyLong_Type is missing required tp_as_number table"
+    );
+    exact_long_number_slot_call("nb_add", (*number).nb_add, lhs, rhs)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dp_jit_exact_long_sub_slot(lhs: ObjPtr, rhs: ObjPtr) -> ObjPtr {
+    let long_type = std::ptr::addr_of_mut!(PyLong_Type);
+    let number = (*long_type).tp_as_number;
+    assert!(
+        !number.is_null(),
+        "PyLong_Type is missing required tp_as_number table"
+    );
+    exact_long_number_slot_call("nb_subtract", (*number).nb_subtract, lhs, rhs)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dp_jit_exact_long_mul_slot(lhs: ObjPtr, rhs: ObjPtr) -> ObjPtr {
+    let long_type = std::ptr::addr_of_mut!(PyLong_Type);
+    let number = (*long_type).tp_as_number;
+    assert!(
+        !number.is_null(),
+        "PyLong_Type is missing required tp_as_number table"
+    );
+    exact_long_number_slot_call("nb_multiply", (*number).nb_multiply, lhs, rhs)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dp_jit_exact_long_true_div_slot(lhs: ObjPtr, rhs: ObjPtr) -> ObjPtr {
+    let long_type = std::ptr::addr_of_mut!(PyLong_Type);
+    let number = (*long_type).tp_as_number;
+    assert!(
+        !number.is_null(),
+        "PyLong_Type is missing required tp_as_number table"
+    );
+    exact_long_number_slot_call("nb_true_divide", (*number).nb_true_divide, lhs, rhs)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dp_jit_exact_long_richcompare_slot(
+    lhs: ObjPtr,
+    rhs: ObjPtr,
+    op: i32,
+) -> ObjPtr {
+    let long_type = std::ptr::addr_of_mut!(PyLong_Type);
+    let slot = (*long_type)
+        .tp_richcompare
+        .expect("PyLong_Type is missing required tp_richcompare slot");
+    slot(lhs as *mut ffi::PyObject, rhs as *mut ffi::PyObject, op) as ObjPtr
+}
+
 unsafe fn register_exact_long_slot_symbols(builder: &mut JITBuilder) {
     let long_type = std::ptr::addr_of_mut!(PyLong_Type);
     let number = (*long_type).tp_as_number;

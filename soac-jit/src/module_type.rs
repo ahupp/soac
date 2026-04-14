@@ -220,6 +220,11 @@ impl SharedModuleState {
             .lookup_function(function_id)
             .cloned()
             .ok_or_else(|| format!("missing direct-call target for function_id={function_id}"))?;
+        if let Some(handle) =
+            crate::jit::lookup_precompiled_direct_function_handle(compile_session, self, &function)?
+        {
+            return Ok(Some(handle));
+        }
         let blocks = vec![ptr::null_mut::<c_void>(); function.blocks.len()];
         let module_constant_ptrs = self.module_constant_ptrs();
         let compile_start = std::time::Instant::now();

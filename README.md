@@ -109,6 +109,13 @@ exports are intentionally omitted here.
   `.envrc` and the `Justfile` default this to `soac-module-cache`, and
   `just setup-dev-env` shares that directory across jj worktrees.
 
+- `SOAC_PRECOMPILED_LIBRARY=/path/to/libsoac_precompiled.so`
+  Optional runtime source for offline-precompiled direct function bodies. When
+  set, SOAC loads the shared library once, looks up direct-entry symbols by
+  module name, source hash, and function id, patches module-constant pointer
+  slots for matching modules, and falls back to normal lazy JIT when a function
+  symbol is missing.
+
 - `UV_OFFLINE=1`
   Normal test and benchmark recipes set this for uv-backed venv refreshes after
   `setup-dev-env` has populated the repo-local cache and installed tools. Use
@@ -308,7 +315,8 @@ globals are out of scope for now.
   normally comes from a previous profile pass, and the matching pre-optimization
   BlockPy cache entries must still exist in `SOAC_MODULE_CACHE_DIR`
   (`soac-module-cache` by default). When `counters` is omitted, the recipe uses
-  `$LAST_BENCHMARK_COUNTERS`.
+  `$LAST_BENCHMARK_COUNTERS`. Set `SOAC_PRECOMPILED_LIBRARY` to the resulting
+  `.so` to let runtime direct-function setup use matching precompiled entries.
 
 - `SOAC_JIT_PERF_HELPER_FRAMES=1`
   In `fn should_preserve_perf_helper_frames`, at

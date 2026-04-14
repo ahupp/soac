@@ -7,7 +7,7 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 const SOAC_BUILD_IDENTITY: &str = env!("SOAC_BUILD_IDENTITY");
 
@@ -114,6 +114,7 @@ fn run_with_args(args: impl IntoIterator<Item = OsString>) -> Result<(), String>
         let object_path = object_dir.join(object_file_name(&module_ref));
         let summary = precompile_codegen_module_to_object_file(
             module_ref.module_name.as_str(),
+            module_ref.source_hash,
             &module,
             Some(counters_path.as_path()),
             object_path.as_path(),
@@ -445,6 +446,7 @@ mod test {
     use soac_blockpy::{LoweringOptions, lower_python_to_blockpy_recorded_with_options};
     use soac_jit::counter_dump::{CounterDumpRecord, CounterDumpRow, parse_counter_dump_records};
     use soac_jit::module_type::hash_module_source;
+    use std::process::Stdio;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]

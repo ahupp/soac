@@ -580,6 +580,46 @@ def f():
     }
 
     #[test]
+    fn precompiled_symbol_scopes_use_source_hash_and_logical_function_id() {
+        let cached_scope = precompiled_direct_function_symbol_scope_for_module_identity(
+            "pkg.mod",
+            0x1234,
+            FunctionId::new(1, 7),
+        );
+        let remapped_scope = precompiled_direct_function_symbol_scope_for_module_identity(
+            "pkg.mod",
+            0x1234,
+            FunctionId::new(42, 7),
+        );
+        assert_eq!(
+            cached_scope, remapped_scope,
+            "precompiled symbols must survive module id remapping after cache load"
+        );
+        assert_ne!(
+            cached_scope,
+            precompiled_direct_function_symbol_scope_for_module_identity(
+                "pkg.mod",
+                0x1234,
+                FunctionId::new(1, 8)
+            ),
+            "distinct logical function ids need distinct direct entry symbols"
+        );
+        assert_ne!(
+            precompiled_direct_function_symbol_scope_for_module_identity(
+                "pkg.mod",
+                0,
+                FunctionId::new(1, 7)
+            ),
+            precompiled_direct_function_symbol_scope_for_module_identity(
+                "pkg.mod",
+                0,
+                FunctionId::new(42, 7)
+            ),
+            "source-less modules still need packed function ids to avoid collisions"
+        );
+    }
+
+    #[test]
     fn precompile_codegen_module_emits_relocatable_object() {
         let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
             r#"
@@ -590,8 +630,9 @@ def add(a, b):
         .expect("lowering precompile smoke source should succeed")
         .codegen_module;
 
-        let object = precompile_codegen_module_to_object_bytes("precompile_smoke", &lowered, None)
-            .expect("precompile should emit object bytes");
+        let object =
+            precompile_codegen_module_to_object_bytes("precompile_smoke", 0x1234, &lowered, None)
+                .expect("precompile should emit object bytes");
         assert!(
             object.function_count >= lowered.callable_defs.len(),
             "object should contain generated functions plus runtime support"
@@ -605,13 +646,18 @@ def add(a, b):
             Some(b"\x7fELF".as_slice()),
             "precompiled bytes should start with an ELF header"
         );
-        let object_text = String::from_utf8_lossy(object.object.as_slice());
         assert!(
-            object_text.contains("py:d:add"),
+            object
+                .function_symbols
+                .iter()
+                .any(|symbol| symbol.contains("py:d:add")),
             "precompiled object should define the direct add function"
         );
         assert!(
-            object_text.contains("__soac_module_constant_"),
+            object
+                .data_symbols
+                .iter()
+                .any(|symbol| symbol.starts_with("__soac_module_constant_shared_")),
             "precompiled object should define module constant slot symbols"
         );
     }
@@ -8397,6 +8443,7 @@ def f(x, y):
             &module_constants,
             BuildSpecializedFunctionOptions {
                 indexed_global_guard_miss_deopt_stub: true,
+                ..BuildSpecializedFunctionOptions::default()
             },
         );
         let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
@@ -8460,6 +8507,7 @@ def f(x, y):
             &module_constants,
             BuildSpecializedFunctionOptions {
                 indexed_global_guard_miss_deopt_stub: true,
+                ..BuildSpecializedFunctionOptions::default()
             },
         );
         let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
@@ -8545,6 +8593,7 @@ def f(x, y):
                 None,
                 BuildSpecializedFunctionOptions {
                     indexed_global_guard_miss_deopt_stub: true,
+                    ..BuildSpecializedFunctionOptions::default()
                 },
             )
             .expect("specialized JIT build should succeed");
@@ -8637,6 +8686,7 @@ def f(x, y):
             &module_constants,
             BuildSpecializedFunctionOptions {
                 indexed_global_guard_miss_deopt_stub: true,
+                ..BuildSpecializedFunctionOptions::default()
             },
         );
         let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
@@ -8736,6 +8786,7 @@ def f(x, y):
                 None,
                 BuildSpecializedFunctionOptions {
                     indexed_global_guard_miss_deopt_stub: true,
+                    ..BuildSpecializedFunctionOptions::default()
                 },
             )
             .expect("specialized JIT build should succeed");

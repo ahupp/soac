@@ -12,6 +12,7 @@ use soac_blockpy::env_config::{
     module_cache_root_from_env_or_repo as blockpy_module_cache_root_from_env_or_repo,
     pre_optimization_module_cache_identity as blockpy_pre_optimization_module_cache_identity,
     pre_optimization_module_cache_path as blockpy_pre_optimization_module_cache_path,
+    precompiled_library_path_from_env as blockpy_precompiled_library_path_from_env,
     profiled_cold_blocks_enabled_from_env,
     soac_work_dir_from_env as blockpy_soac_work_dir_from_env,
     specialization_mode_from_env as blockpy_specialization_mode_from_env,
@@ -132,6 +133,10 @@ pub fn pre_optimization_module_cache_path(
         build_identity,
         runtime_names_as_globals,
     )
+}
+
+pub(crate) fn precompiled_library_path_from_env() -> Result<Option<PathBuf>, String> {
+    blockpy_precompiled_library_path_from_env()
 }
 
 pub fn eager_clif_compile_requested() -> Result<bool, String> {

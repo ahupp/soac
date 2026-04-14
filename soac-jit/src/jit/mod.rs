@@ -53,7 +53,8 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, CString, c_void};
 use std::fs;
-use std::mem::offset_of;
+use std::mem::{MaybeUninit, offset_of};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -117,6 +118,7 @@ pub use typed_value::{
 };
 
 static RUNTIME_SUPPORT_LIBRARY: OnceLock<Result<RuntimeSupportLibrary, String>> = OnceLock::new();
+static PRECOMPILED_LIBRARY: OnceLock<Result<Option<PrecompiledLibrary>, String>> = OnceLock::new();
 static NEXT_IMPORT_SPEC_ID: AtomicUsize = AtomicUsize::new(0);
 static JIT_DATA_SYMBOLS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
 static TYPE_KEY_RUNTIME_REGISTRY: OnceLock<Mutex<HashMap<CounterDumpTypeKey, usize>>> =
@@ -286,6 +288,15 @@ fn module_constant_symbol_prefix_for_shared_state(shared_state: &SharedModuleSta
     symbol
 }
 
+fn module_constant_symbol_prefix_for_module_identity(
+    module_name: &str,
+    source_hash: u64,
+) -> String {
+    let mut symbol = String::from("__soac_module_constant_shared_");
+    push_shared_module_symbol_identity(&mut symbol, module_name, source_hash, None);
+    symbol
+}
+
 fn scalar_counter_storage_symbol_for_shared_state(shared_state: &SharedModuleState) -> String {
     let mut symbol = String::from("__soac_scalar_counters_shared_");
     push_shared_module_symbol_identity_for_shared_state(&mut symbol, shared_state);
@@ -306,6 +317,33 @@ fn direct_function_symbol_scope_for_shared_state(
     push_shared_module_symbol_identity_for_shared_state(&mut scope, shared_state);
     scope.push_str("_fn_");
     scope.push_str(function_id.packed().to_string().as_str());
+    scope
+}
+
+fn precompiled_direct_function_symbol_scope_for_shared_state(
+    shared_state: &SharedModuleState,
+    function_id: FunctionId,
+) -> String {
+    precompiled_direct_function_symbol_scope_for_module_identity(
+        shared_state.module_name.as_str(),
+        shared_state.source_hash(),
+        function_id,
+    )
+}
+
+fn precompiled_direct_function_symbol_scope_for_module_identity(
+    module_name: &str,
+    source_hash: u64,
+    function_id: FunctionId,
+) -> String {
+    let mut scope = String::from("shared_");
+    push_shared_module_symbol_identity(&mut scope, module_name, source_hash, None);
+    scope.push_str("_fn_");
+    if source_hash == 0 {
+        scope.push_str(function_id.packed().to_string().as_str());
+    } else {
+        scope.push_str(function_id.function_id().to_string().as_str());
+    }
     scope
 }
 
@@ -465,6 +503,148 @@ fn runtime_support_library() -> Result<&'static RuntimeSupportLibrary, String> {
     }) {
         Ok(library) => Ok(library),
         Err(error) => Err(error.clone()),
+    }
+}
+
+fn precompiled_library() -> Result<Option<&'static PrecompiledLibrary>, String> {
+    match PRECOMPILED_LIBRARY.get_or_init(load_precompiled_library_from_env) {
+        Ok(Some(library)) => Ok(Some(library)),
+        Ok(None) => Ok(None),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+fn load_precompiled_library_from_env() -> Result<Option<PrecompiledLibrary>, String> {
+    let Some(path) = crate::config::precompiled_library_path_from_env()? else {
+        return Ok(None);
+    };
+    promote_current_soac_extension_symbols_for_precompiled_library()?;
+    let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        format!(
+            "SOAC_PRECOMPILED_LIBRARY contains an interior NUL byte: {}",
+            path.display()
+        )
+    })?;
+    let handle = unsafe {
+        libc::dlerror();
+        libc::dlopen(c_path.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL)
+    };
+    if handle.is_null() {
+        return Err(format!(
+            "failed to load SOAC_PRECOMPILED_LIBRARY {}: {}",
+            path.display(),
+            take_dlerror()
+        ));
+    }
+    info!(
+        target: "soac_jit_precompiled",
+        event = "soac.precompiled_library_load",
+        path = %path.display(),
+        "soac_precompiled_library_load",
+    );
+    Ok(Some(PrecompiledLibrary {
+        handle: handle as usize,
+        path,
+    }))
+}
+
+fn promote_current_soac_extension_symbols_for_precompiled_library() -> Result<(), String> {
+    let mut info = MaybeUninit::<libc::Dl_info>::zeroed();
+    let ok = unsafe {
+        libc::dladdr(
+            specialized_helpers::dp_jit_load_runtime_obj as *const c_void,
+            info.as_mut_ptr(),
+        )
+    };
+    if ok == 0 {
+        return Err(
+            "failed to locate the loaded _soac_ext shared object for SOAC_PRECOMPILED_LIBRARY"
+                .to_string(),
+        );
+    }
+    let info = unsafe { info.assume_init() };
+    if info.dli_fname.is_null() {
+        return Err(
+            "dynamic loader did not report a path for the loaded _soac_ext shared object"
+                .to_string(),
+        );
+    }
+
+    let handle = unsafe {
+        libc::dlerror();
+        libc::dlopen(
+            info.dli_fname,
+            libc::RTLD_NOW | libc::RTLD_GLOBAL | libc::RTLD_NOLOAD,
+        )
+    };
+    if !handle.is_null() {
+        return Ok(());
+    }
+    let no_load_error = take_dlerror();
+
+    let handle = unsafe {
+        libc::dlerror();
+        libc::dlopen(info.dli_fname, libc::RTLD_NOW | libc::RTLD_GLOBAL)
+    };
+    if handle.is_null() {
+        return Err(format!(
+            "failed to promote _soac_ext symbols for SOAC_PRECOMPILED_LIBRARY (RTLD_NOLOAD error: {}; reopen error: {})",
+            no_load_error,
+            take_dlerror()
+        ));
+    }
+    Ok(())
+}
+
+fn take_dlerror() -> String {
+    let error = unsafe { libc::dlerror() };
+    if error.is_null() {
+        return "unknown dynamic loader error".to_string();
+    }
+    unsafe { CStr::from_ptr(error) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[derive(Debug)]
+struct PrecompiledLibrary {
+    handle: usize,
+    path: PathBuf,
+}
+
+impl PrecompiledLibrary {
+    fn lookup_code_symbol(&self, symbol: &str) -> Result<Option<*const u8>, String> {
+        self.lookup_symbol(symbol)
+            .map(|ptr| ptr.map(|ptr| ptr.cast::<u8>() as *const u8))
+    }
+
+    fn lookup_module_constant_slot(
+        &self,
+        symbol: &str,
+    ) -> Result<Option<*mut *mut ffi::PyObject>, String> {
+        self.lookup_symbol(symbol)
+            .map(|ptr| ptr.map(|ptr| ptr.cast::<*mut ffi::PyObject>()))
+    }
+
+    fn lookup_symbol(&self, symbol: &str) -> Result<Option<*mut c_void>, String> {
+        let c_symbol = CString::new(symbol)
+            .map_err(|_| format!("precompiled symbol contains an interior NUL byte: {symbol:?}"))?;
+        let ptr = unsafe {
+            libc::dlerror();
+            libc::dlsym(self.handle as *mut c_void, c_symbol.as_ptr())
+        };
+        if ptr.is_null() {
+            let error = unsafe { libc::dlerror() };
+            if error.is_null() {
+                return Ok(None);
+            }
+            return Err(format!(
+                "failed to look up precompiled symbol {symbol:?} in {}: {}",
+                self.path.display(),
+                unsafe { CStr::from_ptr(error) }.to_string_lossy()
+            ));
+        }
+        Ok(Some(ptr))
     }
 }
 
@@ -1302,6 +1482,96 @@ impl CompiledFunctionHandle {
     fn raw_handle(&self) -> ObjPtr {
         self.handle
     }
+}
+
+pub(crate) fn lookup_precompiled_direct_function_handle(
+    session: &Arc<crate::session::CompileSession>,
+    shared_state: &SharedModuleState,
+    function: &BlockPyFunction<CodegenModuleShape>,
+) -> Result<Option<Arc<CompiledFunctionHandle>>, String> {
+    let Some(library) = precompiled_library()? else {
+        return Ok(None);
+    };
+    if shared_state.source_hash() == 0 {
+        return Ok(None);
+    }
+
+    let symbol_scope = precompiled_direct_function_symbol_scope_for_shared_state(
+        shared_state,
+        function.function_id,
+    );
+    let symbol = direct_function_symbol(function, Some(symbol_scope.as_str()));
+    let Some(code_ptr) = library.lookup_code_symbol(symbol.as_str())? else {
+        return Ok(None);
+    };
+    patch_precompiled_module_constant_slots(library, shared_state)?;
+
+    let default_code_ptr = if function_has_default_resolving_direct_entry(function) {
+        let default_symbol = default_direct_function_symbol(function, Some(symbol_scope.as_str()));
+        library
+            .lookup_code_symbol(default_symbol.as_str())?
+            .ok_or_else(|| {
+                format!(
+                    "precompiled library {} has direct entry {symbol:?} but is missing default entry {default_symbol:?}",
+                    library.path.display()
+                )
+            })?
+    } else {
+        code_ptr
+    };
+
+    let value_facts = infer_jit_value_facts(&shared_state.lowered_module);
+    let deopt_resume_plan =
+        plan_jit_deopt_resume_module(&shared_state.lowered_module, &value_facts)?;
+    let function_deopt_resume_plan = deopt_resume_plan
+        .function(function.function_id)
+        .ok_or_else(|| {
+            format!(
+                "missing JIT deopt resume plan for precompiled function {} ({})",
+                function.function_id, function.names.qualname
+            )
+        })?;
+    let module_constant_ptrs = shared_state.module_constant_ptrs();
+    let deopt_table = Arc::new(RuntimeJitDeoptTable::from_plan(
+        function,
+        function_deopt_resume_plan,
+        module_constant_ptrs.as_slice(),
+    )?);
+    info!(
+        target: "soac_jit_precompiled",
+        event = "soac.precompiled_direct_function_hit",
+        module = shared_state.module_name.as_str(),
+        source_hash = format_args!("0x{:016x}", shared_state.source_hash()),
+        function_id = function.function_id.function_id(),
+        qualname = function.names.qualname.as_str(),
+        symbol = symbol.as_str(),
+        "soac_precompiled_direct_function_hit",
+    );
+    Ok(Some(Arc::new(CompiledFunctionHandle::from_direct_entry(
+        session,
+        code_ptr,
+        default_code_ptr,
+        function.params.len(),
+        deopt_table,
+    ))))
+}
+
+fn patch_precompiled_module_constant_slots(
+    library: &PrecompiledLibrary,
+    shared_state: &SharedModuleState,
+) -> Result<(), String> {
+    let symbol_prefix = module_constant_symbol_prefix_for_shared_state(shared_state);
+    for (index, ptr) in shared_state.module_constant_ptrs().into_iter().enumerate() {
+        let symbol = module_constant_object_symbol(symbol_prefix.as_str(), ModuleConstantId(index));
+        let Some(slot) = library.lookup_module_constant_slot(symbol.as_str())? else {
+            return Err(format!(
+                "precompiled library {} is missing module constant slot {symbol:?}",
+                library.path.display()
+            ));
+        };
+        unsafe { *slot = ptr };
+    }
+    Ok(())
 }
 
 impl Drop for CompiledFunctionHandle {
@@ -2781,6 +3051,14 @@ struct JitEmitConsts {
     deleted_constant_id: ModuleConstantId,
     empty_tuple_constant_id: ModuleConstantId,
     block_const: ir::Value,
+    module_constant_access: ModuleConstantAccess,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ModuleConstantAccess {
+    #[default]
+    SymbolAddress,
+    PointerSlot,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -5319,12 +5597,20 @@ fn emit_owned_module_constant_from_parts(
     constant_id: ModuleConstantId,
     module_constant_object_globals: &[ir::GlobalValue],
     ptr_ty: ir::Type,
+    access: ModuleConstantAccess,
 ) -> ir::Value {
     let object_global = module_constant_object_globals
         .get(constant_id.0)
         .copied()
         .unwrap_or_else(|| panic!("missing module constant object {}", constant_id.0));
-    fb.ins().global_value(ptr_ty, object_global)
+    let symbol_value = fb.ins().global_value(ptr_ty, object_global);
+    match access {
+        ModuleConstantAccess::SymbolAddress => symbol_value,
+        ModuleConstantAccess::PointerSlot => {
+            fb.ins()
+                .load(ptr_ty, ir::MemFlags::trusted(), symbol_value, 0)
+        }
+    }
 }
 
 fn emit_owned_module_constant(
@@ -5337,6 +5623,7 @@ fn emit_owned_module_constant(
         constant_id,
         &ctx.consts.module_constant_object_globals,
         ctx.consts.ptr_ty,
+        ctx.consts.module_constant_access,
     )
 }
 
@@ -8881,6 +9168,7 @@ fn emit_exception_dispatch_target_args(
     module_constants: &ModuleCodegenConstants,
     module_constant_object_globals: &[ir::GlobalValue],
     ptr_ty: ir::Type,
+    module_constant_access: ModuleConstantAccess,
     thread_state_value: ir::Value,
     none_const: ir::Value,
     incref_ref: ir::FuncRef,
@@ -8930,6 +9218,7 @@ fn emit_exception_dispatch_target_args(
                 module_constants.require_int_constant_id(abrupt_kind_tag(*kind)),
                 module_constant_object_globals,
                 ptr_ty,
+                module_constant_access,
             ),
         };
         args.push(ir::BlockArg::Value(value));
@@ -14690,11 +14979,17 @@ fn compile_runtime_support_clif_for_object(
 
 pub fn precompile_codegen_module_to_object_file(
     module_name: &str,
+    source_hash: u64,
     module: &BlockPyModule<CodegenModuleShape>,
     counter_dump_path: Option<&Path>,
     output_path: &Path,
 ) -> Result<PrecompileObjectSummary, String> {
-    let bytes = precompile_codegen_module_to_object_bytes(module_name, module, counter_dump_path)?;
+    let bytes = precompile_codegen_module_to_object_bytes(
+        module_name,
+        source_hash,
+        module,
+        counter_dump_path,
+    )?;
     if let Some(parent) = output_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -14724,10 +15019,15 @@ struct PrecompiledObjectBytes {
     object: Vec<u8>,
     function_count: usize,
     data_object_count: usize,
+    #[cfg(test)]
+    function_symbols: Vec<String>,
+    #[cfg(test)]
+    data_symbols: Vec<String>,
 }
 
 fn precompile_codegen_module_to_object_bytes(
     module_name: &str,
+    source_hash: u64,
     module: &BlockPyModule<CodegenModuleShape>,
     counter_dump_path: Option<&Path>,
 ) -> Result<PrecompiledObjectBytes, String> {
@@ -14740,7 +15040,8 @@ fn precompile_codegen_module_to_object_bytes(
 
     let module_constants = ModuleCodegenConstants::collect_from_module(module);
     let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
-    let module_constant_symbol_prefix = module_constant_symbol_prefix(module);
+    let module_constant_symbol_prefix =
+        module_constant_symbol_prefix_for_module_identity(module_name, source_hash);
     let module_constant_object_data_ids = declare_module_constant_object_data_for_prefix(
         &mut jit_module,
         module_constant_symbol_prefix.as_str(),
@@ -14779,7 +15080,7 @@ fn precompile_codegen_module_to_object_bytes(
             binding: ElfSymbolBinding::Global,
             bytes: vec![0; std::mem::size_of::<usize>()],
             align: std::mem::align_of::<usize>() as u64,
-            writable: false,
+            writable: true,
         });
     }
     if let Some(data_id) = scalar_counter_data_id {
@@ -14823,7 +15124,11 @@ fn precompile_codegen_module_to_object_bytes(
     let mut predeclared = HashMap::new();
     let mut symbol_scopes = HashMap::new();
     for function in &module.callable_defs {
-        let symbol_scope = direct_function_symbol_scope(function.function_id, 0);
+        let symbol_scope = precompiled_direct_function_symbol_scope_for_module_identity(
+            module_name,
+            source_hash,
+            function.function_id,
+        );
         let (_sig, declared) =
             declare_direct_function(&mut jit_module, function, Some(symbol_scope.as_str()))?;
         predeclared.insert(function.function_id, declared);
@@ -14869,7 +15174,10 @@ fn precompile_codegen_module_to_object_bytes(
             &specialization_profile,
             symbol_scopes.get(&function.function_id).map(String::as_str),
             Some(&predeclared),
-            BuildSpecializedFunctionOptions::default(),
+            BuildSpecializedFunctionOptions {
+                module_constant_access: ModuleConstantAccess::PointerSlot,
+                ..BuildSpecializedFunctionOptions::default()
+            },
         )
         .map_err(|err| {
             format!(
@@ -14899,6 +15207,53 @@ fn precompile_codegen_module_to_object_bytes(
             binding: ElfSymbolBinding::Global,
             bytes: compiled.bytes,
         });
+        match (
+            built.default_adapter_id,
+            built.default_adapter_symbol.as_ref(),
+        ) {
+            (Some(default_adapter_id), Some(default_adapter_symbol)) => {
+                let mut default_ctx = build_default_resolving_direct_adapter(
+                    &mut jit_module,
+                    function,
+                    built.main_id,
+                    default_adapter_id,
+                )
+                .map_err(|err| {
+                    format!(
+                        "{err} [default-adapter function={} id={}]",
+                        function.names.qualname, function.function_id
+                    )
+                })?;
+                let compiled = compile_prepared_function_bytes_with_isa(
+                    &mut jit_module,
+                    object_isa.as_ref(),
+                    default_adapter_id,
+                    &mut default_ctx,
+                    default_adapter_symbol.as_str(),
+                    "failed to compile default-resolving direct adapter to object",
+                )
+                .map_err(|err| {
+                    format!(
+                        "{err} [default-adapter function={} id={}]",
+                        function.names.qualname, function.function_id
+                    )
+                })?;
+                jit_module.clear_context(&mut default_ctx);
+                function_definitions.push(ObjectFunctionDefinition {
+                    func_id: default_adapter_id,
+                    symbol: default_adapter_symbol.clone(),
+                    binding: ElfSymbolBinding::Global,
+                    bytes: compiled.bytes,
+                });
+            }
+            (None, None) => {}
+            _ => {
+                return Err(format!(
+                    "default direct adapter declaration is inconsistent for function {} id={}",
+                    function.names.qualname, function.function_id
+                ));
+            }
+        }
     }
 
     let object = write_precompiled_object(&jit_module, &function_definitions, &data_definitions)?;
@@ -14906,6 +15261,16 @@ fn precompile_codegen_module_to_object_bytes(
         object,
         function_count: function_definitions.len(),
         data_object_count: data_definitions.len(),
+        #[cfg(test)]
+        function_symbols: function_definitions
+            .iter()
+            .map(|definition| definition.symbol.clone())
+            .collect(),
+        #[cfg(test)]
+        data_symbols: data_definitions
+            .iter()
+            .map(|definition| definition.symbol.clone())
+            .collect(),
     })
 }
 
@@ -15713,6 +16078,7 @@ pub fn run_cranelift_smoke(module: &BlockPyModule<CodegenModuleShape>) -> Result
 #[derive(Clone, Copy, Debug, Default)]
 struct BuildSpecializedFunctionOptions {
     indexed_global_guard_miss_deopt_stub: bool,
+    module_constant_access: ModuleConstantAccess,
 }
 
 fn build_cranelift_run_bb_specialized_function(
@@ -16219,6 +16585,7 @@ fn build_cranelift_run_bb_specialized_function(
                 module_constants.require_int_constant_id(abrupt_kind_tag(AbruptKind::Fallthrough)),
                 &module_constant_object_globals,
                 ptr_ty,
+                options.module_constant_access,
             )
         });
         stack_slots.initialize_all(&mut fb, ptr_ty, fallthrough_abrupt_kind_const);
@@ -16306,6 +16673,7 @@ fn build_cranelift_run_bb_specialized_function(
                     none_constant_id,
                     &module_constant_object_globals,
                     ptr_ty,
+                    options.module_constant_access,
                 ),
                 BlockParamRole::Exception => null_ptr,
             };
@@ -16416,6 +16784,7 @@ fn build_cranelift_run_bb_specialized_function(
                     deleted_constant_id,
                     empty_tuple_constant_id,
                     block_const,
+                    module_constant_access: options.module_constant_access,
                 },
                 load_global_fast_ref,
                 probe_global_indexed_ref,
@@ -16571,6 +16940,7 @@ fn build_cranelift_run_bb_specialized_function(
                 none_constant_id,
                 &module_constant_object_globals,
                 ptr_ty,
+                options.module_constant_access,
             );
             emit_exception_dispatch_slot_writes(
                 &mut fb,
@@ -16622,6 +16992,7 @@ fn build_cranelift_run_bb_specialized_function(
                 none_constant_id,
                 &module_constant_object_globals,
                 ptr_ty,
+                options.module_constant_access,
             );
             let target_jump_args = emit_exception_dispatch_target_args(
                 &mut fb,
@@ -16632,6 +17003,7 @@ fn build_cranelift_run_bb_specialized_function(
                 module_constants,
                 &module_constant_object_globals,
                 ptr_ty,
+                options.module_constant_access,
                 thread_state_value,
                 target_arg_none_const,
                 incref_ref,

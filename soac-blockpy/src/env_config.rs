@@ -10,6 +10,7 @@ pub const SOAC_CRANELIFT_OPT_LEVEL_ENV: &str = "SOAC_CRANELIFT_OPT_LEVEL";
 pub const SOAC_ENABLE_PROFILED_COLD_BLOCKS_ENV: &str = "SOAC_ENABLE_PROFILED_COLD_BLOCKS";
 pub const SOAC_JIT_EMIT_REFCOUNTS_ENV: &str = "SOAC_JIT_EMIT_REFCOUNTS";
 pub const SOAC_MODULE_CACHE_DIR_ENV: &str = "SOAC_MODULE_CACHE_DIR";
+pub const SOAC_PRECOMPILED_LIBRARY_ENV: &str = "SOAC_PRECOMPILED_LIBRARY";
 pub const SOAC_COMPILE_MODE_ENV: &str = "SOAC_COMPILE_MODE";
 pub const SOAC_JIT_PERF_HELPER_FRAMES_ENV: &str = "SOAC_JIT_PERF_HELPER_FRAMES";
 pub const SOAC_LOG_ENV: &str = "SOAC_LOG";
@@ -316,6 +317,10 @@ pub fn module_cache_root_from_env_or_repo(
     Ok(SoacEnvConfig::from_env()?.module_cache_root_or_repo(repo_root))
 }
 
+pub fn precompiled_library_path_from_env() -> Result<Option<PathBuf>, String> {
+    env_path(SOAC_PRECOMPILED_LIBRARY_ENV)
+}
+
 pub fn pre_optimization_module_cache_identity(
     build_identity: &str,
     runtime_names_as_globals: bool,
@@ -450,6 +455,7 @@ mod tests {
             EnvVarGuard::remove(SOAC_ENABLE_PROFILED_COLD_BLOCKS_ENV),
             EnvVarGuard::remove(SOAC_JIT_EMIT_REFCOUNTS_ENV),
             EnvVarGuard::remove(SOAC_MODULE_CACHE_DIR_ENV),
+            EnvVarGuard::remove(SOAC_PRECOMPILED_LIBRARY_ENV),
             EnvVarGuard::remove(SOAC_COMPILE_MODE_ENV),
             EnvVarGuard::remove(SOAC_JIT_PERF_HELPER_FRAMES_ENV),
             EnvVarGuard::remove(SOAC_LOG_ENV),

@@ -409,12 +409,18 @@ anything non-code affected the run. If there were no such issues, say
   are remapped to the current `CompileSession` module id when loaded. `.envrc`
   and the `Justfile` default this to `soac-module-cache`; set it explicitly
   when running outside the recipes.
+- `SOAC_PRECOMPILED_LIBRARY`
+  Optional path to an offline-precompiled SOAC shared library. When set, runtime
+  direct-function compilation first tries to load matching code by module name,
+  source hash, and function id, patches module-constant slots, and falls back to
+  lazy JIT when a function symbol is absent.
 - `just precompile-shared-library counters=<profile.bin> out=<lib.so>`
   Offline precompiles all modules referenced by a counter dump from cached
   pre-optimization BlockPy modules, writes per-module object files, and links a
   shared library. It expects matching module-cache entries in
   `SOAC_MODULE_CACHE_DIR`; run a profile/benchmark pass first when the cache is
-  empty.
+  empty. Use `SOAC_PRECOMPILED_LIBRARY` to point runtime execution at the
+  resulting shared library.
 - `SOAC_CRANELIFT_OPT_LEVEL`
   Optional Cranelift process-JIT optimization level override:
   `none`, `speed`, or `speed_and_size`. Normal runtime and benchmark
