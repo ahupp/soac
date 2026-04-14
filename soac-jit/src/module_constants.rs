@@ -10,7 +10,7 @@ use soac_blockpy::block_py::{
 use soac_blockpy::passes::CodegenModuleShape;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_int};
-use std::ptr;
+use std::{mem, ptr};
 
 unsafe extern "C" {
     fn _Py_SetImmortal(op: *mut ffi::PyObject);
@@ -64,6 +64,61 @@ enum ModuleConstantValue {
 enum RuntimeNameConstantMode {
     ImportRuntime,
     BootstrapSoacRuntime,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum StaticPyObjectTemplate {
+    CompactPyLongI64 { value: i64, digit: RawPyLongDigit },
+}
+
+type RawPyLongDigit = u32;
+
+#[repr(C)]
+struct RawPyLongValue {
+    lv_tag: usize,
+    ob_digit: [RawPyLongDigit; 1],
+}
+
+#[repr(C)]
+struct RawPyLongObject {
+    ob_base: ffi::PyObject,
+    long_value: RawPyLongValue,
+}
+
+const RAW_PYLONG_SHIFT: u32 = 30;
+const RAW_PYLONG_MASK: i64 = (1_i64 << RAW_PYLONG_SHIFT) - 1;
+const RAW_PYLONG_NON_SIZE_BITS: usize = 3;
+const RAW_PYLONG_SIGN_POSITIVE: usize = 0;
+// Keep this conservative until the offline object-image path carries the CPython
+// small-int range as validated build metadata.
+const RAW_PYLONG_SMALL_INT_MAX: i64 = 1024;
+
+impl StaticPyObjectTemplate {
+    fn for_int(value: i64) -> Option<Self> {
+        if !(RAW_PYLONG_SMALL_INT_MAX + 1..=RAW_PYLONG_MASK).contains(&value) {
+            return None;
+        }
+        Some(Self::CompactPyLongI64 {
+            value,
+            digit: value as RawPyLongDigit,
+        })
+    }
+
+    fn build_python_constant(self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        match self {
+            Self::CompactPyLongI64 { value, digit } => {
+                build_static_compact_pylong_i64(py, value, digit)
+            }
+        }
+    }
+
+    fn compact_pylong_lv_tag(self) -> usize {
+        match self {
+            Self::CompactPyLongI64 { .. } => {
+                (1 << RAW_PYLONG_NON_SIZE_BITS) | RAW_PYLONG_SIGN_POSITIVE
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -157,9 +212,15 @@ impl ModuleCodegenConstants {
                     bound.unbind()
                 }
                 ModuleConstantValue::Int(value) => {
-                    let ptr = unsafe { ffi::PyLong_FromLongLong(*value as std::ffi::c_longlong) };
-                    let bound: Bound<'_, PyAny> = unsafe { Bound::from_owned_ptr_or_err(py, ptr)? };
-                    bound.unbind()
+                    if let Some(template) = StaticPyObjectTemplate::for_int(*value) {
+                        template.build_python_constant(py)?
+                    } else {
+                        let ptr =
+                            unsafe { ffi::PyLong_FromLongLong(*value as std::ffi::c_longlong) };
+                        let bound: Bound<'_, PyAny> =
+                            unsafe { Bound::from_owned_ptr_or_err(py, ptr)? };
+                        bound.unbind()
+                    }
                 }
                 ModuleConstantValue::BigInt(value) => {
                     let value = std::ffi::CString::new(value.as_str())
@@ -364,6 +425,37 @@ impl ModuleCodegenConstants {
     fn intern_int(&mut self, value: i64) -> ModuleConstantId {
         self.intern(ModuleConstantValue::Int(value))
     }
+}
+
+fn build_static_compact_pylong_i64(
+    py: Python<'_>,
+    value: i64,
+    digit: RawPyLongDigit,
+) -> PyResult<Py<PyAny>> {
+    let template = StaticPyObjectTemplate::CompactPyLongI64 { value, digit };
+    let raw =
+        unsafe { ffi::PyObject_Malloc(mem::size_of::<RawPyLongObject>()) } as *mut RawPyLongObject;
+    if raw.is_null() {
+        unsafe { ffi::PyErr_NoMemory() };
+        return Err(PyErr::fetch(py));
+    }
+
+    let obj = unsafe {
+        let obj = ffi::PyObject_Init(
+            raw.cast::<ffi::PyObject>(),
+            ptr::addr_of_mut!(ffi::PyLong_Type),
+        );
+        if obj.is_null() {
+            ffi::PyObject_Free(raw.cast());
+            return unsafe { Bound::from_owned_ptr_or_err(py, obj) }.map(Py::from);
+        }
+        (*raw).long_value = RawPyLongValue {
+            lv_tag: template.compact_pylong_lv_tag(),
+            ob_digit: [digit],
+        };
+        obj
+    };
+    unsafe { Bound::from_owned_ptr_or_err(py, obj).map(Py::from) }
 }
 
 fn build_unicode_constant<'py>(py: Python<'py>, bytes: &[u8]) -> PyResult<Bound<'py, PyAny>> {
@@ -977,5 +1069,56 @@ fn abrupt_kind_tag(kind: AbruptKind) -> i64 {
         AbruptKind::Exception => 2,
         AbruptKind::Break => 3,
         AbruptKind::Continue => 4,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn static_pylong_template_accepts_only_positive_one_digit_non_small_ints() {
+        assert_eq!(StaticPyObjectTemplate::for_int(-1), None);
+        assert_eq!(StaticPyObjectTemplate::for_int(0), None);
+        assert_eq!(
+            StaticPyObjectTemplate::for_int(RAW_PYLONG_SMALL_INT_MAX),
+            None
+        );
+        assert_eq!(
+            StaticPyObjectTemplate::for_int(RAW_PYLONG_SMALL_INT_MAX + 1),
+            Some(StaticPyObjectTemplate::CompactPyLongI64 {
+                value: RAW_PYLONG_SMALL_INT_MAX + 1,
+                digit: (RAW_PYLONG_SMALL_INT_MAX + 1) as RawPyLongDigit,
+            })
+        );
+        assert_eq!(StaticPyObjectTemplate::for_int(RAW_PYLONG_MASK + 1), None);
+    }
+
+    #[test]
+    fn build_python_constants_materializes_static_compact_pylong() {
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let mut constants = ModuleCodegenConstants::default();
+            let constant_id = constants.intern_int(12345);
+            let objects = constants
+                .build_python_constants(py)
+                .expect("building static PyLong constant should succeed");
+            let obj = objects[constant_id.0].as_ptr();
+
+            unsafe {
+                assert_ne!(ffi::PyLong_CheckExact(obj), 0);
+                assert_eq!(ffi::PyLong_AsLongLong(obj), 12345);
+                assert_ne!(PyUnstable_IsImmortal(obj), 0);
+
+                let raw = &*(obj.cast::<RawPyLongObject>());
+                assert_eq!(
+                    raw.long_value.lv_tag,
+                    StaticPyObjectTemplate::for_int(12345)
+                        .expect("constant should be static-capable")
+                        .compact_pylong_lv_tag()
+                );
+                assert_eq!(raw.long_value.ob_digit[0], 12345);
+            }
+        });
     }
 }
