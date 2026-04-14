@@ -1314,6 +1314,7 @@ enum CompiledRunnerEntry {
 #[derive(Clone, Debug)]
 pub(crate) struct RuntimeJitDeoptTable {
     function_id: FunctionId,
+    function: Box<BlockPyFunction<CodegenModuleShape>>,
     points: Vec<RuntimeJitDeoptRecord>,
 }
 
@@ -1352,6 +1353,10 @@ pub(crate) enum RuntimeJitDeoptContinuation {
     ReturnGlobal {
         name: String,
         expected_index: i64,
+    },
+    ResumeBlockTail {
+        block: BlockLabel,
+        start_body_index: usize,
     },
 }
 
@@ -1445,6 +1450,7 @@ impl RuntimeJitDeoptTable {
         }
         let table = Self {
             function_id: function.function_id,
+            function: Box::new(function.clone()),
             points,
         };
         table.validate_against_plan(plan)?;
@@ -1488,6 +1494,10 @@ impl RuntimeJitDeoptTable {
 
     pub(crate) fn function_id(&self) -> FunctionId {
         self.function_id
+    }
+
+    pub(crate) fn function(&self) -> &BlockPyFunction<CodegenModuleShape> {
+        self.function.as_ref()
     }
 
     pub(crate) fn record_for_ordinal(
@@ -1538,41 +1548,67 @@ fn runtime_jit_deopt_continuation_for_point(
     function: &BlockPyFunction<CodegenModuleShape>,
     point: LocalEnvResumePoint,
 ) -> RuntimeJitDeoptContinuation {
-    let LocalEnvResumePoint::BeforeTerm { function_id, block } = point else {
-        return RuntimeJitDeoptContinuation::Unimplemented;
-    };
-    if function_id != function.function_id {
-        return RuntimeJitDeoptContinuation::Unimplemented;
-    }
-    let Some(block) = function
-        .blocks
-        .iter()
-        .find(|candidate| candidate.label == block)
-    else {
-        return RuntimeJitDeoptContinuation::Unimplemented;
-    };
-    let BlockTerm::Return(value) = &block.term else {
-        return RuntimeJitDeoptContinuation::Unimplemented;
-    };
-    let InstrCodegen::Load(load) = value else {
-        return RuntimeJitDeoptContinuation::Unimplemented;
-    };
-    let name = load.name.id.as_str().to_string();
-    match load.name.location {
-        NameLocation::Local(location) => {
-            RuntimeJitDeoptContinuation::ReturnLocal { name, location }
+    match point {
+        LocalEnvResumePoint::BeforeTerm { function_id, block } => {
+            if function_id != function.function_id {
+                return RuntimeJitDeoptContinuation::Unimplemented;
+            }
+            let Some(block) = function
+                .blocks
+                .iter()
+                .find(|candidate| candidate.label == block)
+            else {
+                return RuntimeJitDeoptContinuation::Unimplemented;
+            };
+            let BlockTerm::Return(value) = &block.term else {
+                return RuntimeJitDeoptContinuation::Unimplemented;
+            };
+            let InstrCodegen::Load(load) = value else {
+                return RuntimeJitDeoptContinuation::Unimplemented;
+            };
+            let name = load.name.id.as_str().to_string();
+            match load.name.location {
+                NameLocation::Local(location) => {
+                    RuntimeJitDeoptContinuation::ReturnLocal { name, location }
+                }
+                NameLocation::Global(slot) => RuntimeJitDeoptContinuation::ReturnGlobal {
+                    name,
+                    expected_index: i64::from(slot.slot()),
+                },
+                NameLocation::GlobalName => RuntimeJitDeoptContinuation::ReturnGlobal {
+                    name,
+                    expected_index: -1,
+                },
+                NameLocation::RuntimeName | NameLocation::Cell(_) | NameLocation::Constant(_) => {
+                    RuntimeJitDeoptContinuation::Unimplemented
+                }
+            }
         }
-        NameLocation::Global(slot) => RuntimeJitDeoptContinuation::ReturnGlobal {
-            name,
-            expected_index: i64::from(slot.slot()),
-        },
-        NameLocation::GlobalName => RuntimeJitDeoptContinuation::ReturnGlobal {
-            name,
-            expected_index: -1,
-        },
-        NameLocation::RuntimeName | NameLocation::Cell(_) | NameLocation::Constant(_) => {
-            RuntimeJitDeoptContinuation::Unimplemented
+        LocalEnvResumePoint::BeforeInstr { key } => {
+            if key.function_id != function.function_id {
+                return RuntimeJitDeoptContinuation::Unimplemented;
+            }
+            let block_label = key.instr_id.block_label();
+            let Some(block) = function
+                .blocks
+                .iter()
+                .find(|candidate| candidate.label == block_label)
+            else {
+                return RuntimeJitDeoptContinuation::Unimplemented;
+            };
+            let Some(start_body_index) = block
+                .body
+                .iter()
+                .position(|instr| instr.try_semantic_instr_id() == Some(key.instr_id))
+            else {
+                return RuntimeJitDeoptContinuation::Unimplemented;
+            };
+            RuntimeJitDeoptContinuation::ResumeBlockTail {
+                block: block_label,
+                start_body_index,
+            }
         }
+        LocalEnvResumePoint::BlockEntry { .. } => RuntimeJitDeoptContinuation::Unimplemented,
     }
 }
 
@@ -1610,6 +1646,10 @@ impl RuntimeJitDeoptInvocation<'_> {
 
     pub(crate) fn record(&self) -> &'_ RuntimeJitDeoptRecord {
         self.record
+    }
+
+    pub(crate) fn function(&self) -> &BlockPyFunction<CodegenModuleShape> {
+        self.table.function()
     }
 
     pub(crate) fn globals_obj(&self) -> ObjPtr {
