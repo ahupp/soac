@@ -104,6 +104,25 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
                     };
                     start_body_index = 0;
                 }
+                BlockTerm::BranchTable(branch) => {
+                    let index_obj = unsafe { self.execute_expr_owned(&branch.index)? };
+                    if index_obj.is_null() {
+                        return Ok(ptr::null_mut());
+                    }
+                    let index =
+                        unsafe { ffi::PyLong_AsLongLong(index_obj.cast::<ffi::PyObject>()) };
+                    unsafe {
+                        ffi::Py_DECREF(index_obj.cast::<ffi::PyObject>());
+                    }
+                    if index == -1 && !unsafe { ffi::PyErr_Occurred() }.is_null() {
+                        return Ok(ptr::null_mut());
+                    }
+                    block_label = usize::try_from(index)
+                        .ok()
+                        .and_then(|index| branch.targets.get(index).copied())
+                        .unwrap_or(branch.default_label);
+                    start_body_index = 0;
+                }
                 BlockTerm::Jump(edge) => {
                     return Err(format!(
                         "deopt continuation for block {block_label} does not support jump args {:?}",
@@ -112,7 +131,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
                 }
                 _ => {
                     return Err(format!(
-                        "deopt continuation for block {block_label} only supports return, if, or no-arg jump terms"
+                        "deopt continuation for block {block_label} only supports return, if, branch-table, or no-arg jump terms"
                     ));
                 }
             }

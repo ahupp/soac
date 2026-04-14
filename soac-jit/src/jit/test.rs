@@ -5161,6 +5161,53 @@ def f(x):
     }
 
     #[test]
+    fn runtime_deopt_table_marks_branch_table_before_term_continuation() {
+        let function = test_function();
+        let first_block = test_source_block(&function, vec![], ret_term(none_expr()));
+        let second_block = test_source_block(&function, vec![], ret_term(none_expr()));
+        let default_block = test_source_block(&function, vec![], ret_term(none_expr()));
+        let entry = test_source_block(
+            &function,
+            vec![],
+            BlockTerm::BranchTable(soac_blockpy::block_py::TermBranchTable {
+                index: name_expr(test_constant_name(0)),
+                targets: vec![first_block.label, second_block.label],
+                default_label: default_block.label,
+            }),
+        );
+        let module = test_module(
+            ModuleNameGen::new(0),
+            vec![with_test_blocks(
+                function,
+                vec![entry.clone(), first_block, second_block, default_block],
+            )],
+        );
+        let function = &module.callable_defs[0];
+        let facts = infer_module_value_facts(&module);
+        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+            .expect("JIT deopt resume planning should succeed");
+        let function_plan = module_plan
+            .function(function.function_id)
+            .expect("function should have a JIT deopt plan");
+        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
+            .expect("runtime deopt table should build from plan");
+        let point = LocalEnvResumePoint::BeforeTerm {
+            function_id: function.function_id,
+            block: entry.label,
+        };
+        let record = table
+            .record_for_point(point)
+            .expect("before-term branch-table point should have a runtime record");
+        assert_eq!(
+            record.continuation(),
+            &RuntimeJitDeoptContinuation::ResumeBlockTail {
+                block: entry.label,
+                start_body_index: entry.body.len(),
+            }
+        );
+    }
+
+    #[test]
     fn deopt_return_local_continuation_returns_owned_live_value() {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
@@ -5613,6 +5660,118 @@ def f(x):
                 ffi::Py_DECREF(else_value);
                 ffi::Py_DECREF(then_value);
                 ffi::Py_DECREF(condition);
+            }
+        });
+    }
+
+    #[test]
+    fn deopt_block_tail_continuation_follows_branch_table_term() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|_| {
+            let function = test_function();
+            let first_block = test_source_block(
+                &function,
+                vec![],
+                ret_term(name_expr(test_constant_name(1))),
+            );
+            let second_block = test_source_block(
+                &function,
+                vec![],
+                ret_term(name_expr(test_constant_name(2))),
+            );
+            let default_block = test_source_block(
+                &function,
+                vec![],
+                ret_term(name_expr(test_constant_name(3))),
+            );
+            let entry = test_source_block(
+                &function,
+                vec![],
+                BlockTerm::BranchTable(soac_blockpy::block_py::TermBranchTable {
+                    index: name_expr(test_constant_name(0)),
+                    targets: vec![first_block.label, second_block.label],
+                    default_label: default_block.label,
+                }),
+            );
+            let function = with_test_blocks(
+                function,
+                vec![entry.clone(), first_block, second_block, default_block],
+            );
+            let function_id = function.function_id;
+            let index = unsafe { ffi::PyLong_FromLong(1) };
+            assert!(!index.is_null(), "test index allocation should succeed");
+            let first_value = unsafe { ffi::PyLong_FromLong(666_666_666) };
+            assert!(
+                !first_value.is_null(),
+                "test first-value allocation should succeed"
+            );
+            let second_value = unsafe { ffi::PyLong_FromLong(777_777_777) };
+            assert!(
+                !second_value.is_null(),
+                "test second-value allocation should succeed"
+            );
+            let default_value = unsafe { ffi::PyLong_FromLong(888_888_888) };
+            assert!(
+                !default_value.is_null(),
+                "test default-value allocation should succeed"
+            );
+            let table = RuntimeJitDeoptTable {
+                function_id,
+                function: Box::new(function),
+                module_constant_ptrs: vec![
+                    index.cast(),
+                    first_value.cast(),
+                    second_value.cast(),
+                    default_value.cast(),
+                ],
+                points: vec![RuntimeJitDeoptRecord {
+                    id: PlannedJitDeoptPointId {
+                        function_id,
+                        ordinal: 0,
+                    },
+                    resume_point: LocalEnvResumePoint::BeforeTerm {
+                        function_id,
+                        block: entry.label,
+                    },
+                    precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                    locals: vec![],
+                    continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
+                        block: entry.label,
+                        start_body_index: entry.body.len(),
+                    },
+                }],
+            };
+            let before_second = unsafe { ffi::Py_REFCNT(second_value) };
+            let result = unsafe {
+                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                    std::ptr::addr_of!(table).cast_mut().cast(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!(
+                result,
+                second_value.cast(),
+                "branch-table deopt should continue through the indexed target"
+            );
+            assert!(
+                unsafe { ffi::PyErr_Occurred() }.is_null(),
+                "successful branch-table deopt continuation should not leave a Python exception"
+            );
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(second_value) },
+                before_second + 1,
+                "branch-table target return should be owned by the JIT caller"
+            );
+            unsafe {
+                ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+                ffi::Py_DECREF(default_value);
+                ffi::Py_DECREF(second_value);
+                ffi::Py_DECREF(first_value);
+                ffi::Py_DECREF(index);
             }
         });
     }
