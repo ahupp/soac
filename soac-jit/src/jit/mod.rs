@@ -1311,11 +1311,44 @@ pub(crate) struct RuntimeJitDeoptTable {
 }
 
 #[derive(Clone, Debug)]
-struct RuntimeJitDeoptRecord {
+pub(crate) struct RuntimeJitDeoptRecord {
     id: PlannedJitDeoptPointId,
     resume_point: LocalEnvResumePoint,
     precision: LocalEnvResumeStatePrecision,
     locals: Vec<LocalEnvResumeBinding>,
+}
+
+impl RuntimeJitDeoptRecord {
+    pub(crate) fn id(&self) -> PlannedJitDeoptPointId {
+        self.id
+    }
+
+    pub(crate) fn ordinal(&self) -> usize {
+        self.id.ordinal
+    }
+
+    pub(crate) fn resume_point(&self) -> LocalEnvResumePoint {
+        self.resume_point
+    }
+
+    pub(crate) fn precision(&self) -> LocalEnvResumeStatePrecision {
+        self.precision
+    }
+
+    pub(crate) fn locals(&self) -> &[LocalEnvResumeBinding] {
+        &self.locals
+    }
+
+    pub(crate) fn describe(&self, function_id: FunctionId) -> String {
+        format!(
+            "function {}, record {}, resume_point {:?}, precision {:?}, locals {}",
+            function_id,
+            self.ordinal(),
+            self.resume_point,
+            self.precision,
+            self.locals.len()
+        )
+    }
 }
 
 impl RuntimeJitDeoptTable {
@@ -1385,7 +1418,10 @@ impl RuntimeJitDeoptTable {
         self.function_id
     }
 
-    pub(crate) fn describe_record_ordinal(&self, record_ordinal: i64) -> Result<String, String> {
+    pub(crate) fn record_for_ordinal(
+        &self,
+        record_ordinal: i64,
+    ) -> Result<&RuntimeJitDeoptRecord, String> {
         let ordinal = usize::try_from(record_ordinal).map_err(|_| {
             format!(
                 "deopt record ordinal {record_ordinal} is negative or does not fit usize for function {}",
@@ -1405,14 +1441,12 @@ impl RuntimeJitDeoptTable {
                 record.id
             ));
         }
-        Ok(format!(
-            "function {}, record {}, resume_point {:?}, precision {:?}, locals {}",
-            self.function_id,
-            ordinal,
-            record.resume_point,
-            record.precision,
-            record.locals.len()
-        ))
+        Ok(record)
+    }
+
+    pub(crate) fn describe_record_ordinal(&self, record_ordinal: i64) -> Result<String, String> {
+        self.record_for_ordinal(record_ordinal)
+            .map(|record| record.describe(self.function_id))
     }
 
     #[cfg(test)]

@@ -1258,8 +1258,8 @@ unsafe fn set_deopt_unimplemented_error(deopt_table: ObjPtr, record_ordinal: i64
         format!("null deopt table pointer, ordinal {record_ordinal}")
     } else {
         let table = &*(deopt_table.cast::<RuntimeJitDeoptTable>());
-        match table.describe_record_ordinal(record_ordinal) {
-            Ok(record) => record,
+        match table.record_for_ordinal(record_ordinal) {
+            Ok(record) => record.describe(table.function_id()),
             Err(err) => err,
         }
     };

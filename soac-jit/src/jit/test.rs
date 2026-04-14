@@ -2815,12 +2815,32 @@ def f():
                     block: first.blocks[0].label,
                 })
                 .expect("block-entry deopt point should be addressable by resume point");
+            assert_eq!(first_entry_record.id().function_id, first.function_id);
             assert_eq!(
-                first_entry_record.id.ordinal, 0,
+                first_entry_record.ordinal(),
+                0,
                 "runtime deopt records should preserve planned ordinal ids"
             );
+            assert_eq!(
+                first_entry_record.precision(),
+                LocalEnvResumeStatePrecision::BlockEntry
+            );
+            assert_eq!(
+                first_deopt_table
+                    .record_for_ordinal(first_entry_record.ordinal() as i64)
+                    .expect("runtime deopt records should be addressable by ordinal")
+                    .resume_point(),
+                first_entry_record.resume_point()
+            );
+            assert_eq!(
+                first_deopt_table
+                    .record_for_ordinal(first_entry_record.ordinal() as i64)
+                    .expect("runtime deopt records should be addressable by ordinal")
+                    .locals(),
+                first_entry_record.locals()
+            );
             let first_entry_description = first_deopt_table
-                .describe_record_ordinal(first_entry_record.id.ordinal as i64)
+                .describe_record_ordinal(first_entry_record.ordinal() as i64)
                 .expect("runtime deopt record should be describable by ordinal");
             assert!(
                 first_entry_description.contains(&format!("function {}", first.function_id))
@@ -2831,6 +2851,10 @@ def f():
                 first_deopt_table.describe_record_ordinal(-1).is_err(),
                 "runtime deopt record lookup should reject negative ordinals"
             );
+            assert!(
+                first_deopt_table.record_for_ordinal(-1).is_err(),
+                "structured runtime deopt record lookup should reject negative ordinals"
+            );
             assert_eq!(
                 compiled_direct_deopt_table_ptr(first_handle.raw_handle())
                     .expect("root deopt table pointer should be available"),
@@ -2840,7 +2864,7 @@ def f():
             let deopt_result = unsafe {
                 crate::jit::specialized_helpers::dp_jit_deopt_unimplemented(
                     std::sync::Arc::as_ptr(&first_deopt_table) as ObjPtr,
-                    first_entry_record.id.ordinal as i64,
+                    first_entry_record.ordinal() as i64,
                 )
             };
             assert!(
