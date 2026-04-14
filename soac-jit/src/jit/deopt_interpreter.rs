@@ -123,15 +123,11 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
                         .unwrap_or(branch.default_label);
                     cursor = RuntimeJitDeoptCursor::at_block_entry(next_block);
                 }
+                BlockTerm::Raise(raise) => return unsafe { self.execute_raise_term_owned(raise) },
                 BlockTerm::Jump(edge) => {
                     return Err(format!(
                         "deopt continuation for block {block_label} does not support jump args {:?}",
                         edge.args
-                    ));
-                }
-                _ => {
-                    return Err(format!(
-                        "deopt continuation for block {block_label} only supports return, if, branch-table, or no-arg jump terms"
                     ));
                 }
             }
@@ -540,6 +536,27 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
     }
 
     #[cold]
+    unsafe fn execute_raise_term_owned(
+        &mut self,
+        raise: &soac_blockpy::block_py::TermRaise<InstrCodegen>,
+    ) -> Result<ObjPtr, String> {
+        let Some(exc_expr) = &raise.exc else {
+            return Err(
+                "deopt continuation does not support bare raise without exception state"
+                    .to_string(),
+            );
+        };
+        let exc = unsafe { self.execute_expr_owned(exc_expr)? };
+        if exc.is_null() {
+            return Ok(ptr::null_mut());
+        }
+        unsafe {
+            set_raise_exception_owned(exc);
+        }
+        Ok(ptr::null_mut())
+    }
+
+    #[cold]
     unsafe fn execute_load_owned(
         &mut self,
         name: &str,
@@ -836,6 +853,26 @@ unsafe fn release_owned_values(values: Vec<ObjPtr>) {
     for value in values {
         unsafe {
             ffi::Py_DECREF(value.cast::<ffi::PyObject>());
+        }
+    }
+}
+
+unsafe fn set_raise_exception_owned(exc: ObjPtr) {
+    let exc = exc.cast::<ffi::PyObject>();
+    unsafe {
+        if ffi::PyExceptionClass_Check(exc) != 0 {
+            ffi::PyErr_SetObject(exc, ptr::null_mut());
+            ffi::Py_DECREF(exc);
+        } else if ffi::PyExceptionInstance_Check(exc) != 0 {
+            let exc_type = ffi::PyExceptionInstance_Class(exc);
+            ffi::PyErr_SetObject(exc_type, exc);
+            ffi::Py_DECREF(exc);
+        } else {
+            ffi::Py_DECREF(exc);
+            ffi::PyErr_SetString(
+                ffi::PyExc_TypeError,
+                c"exceptions must derive from BaseException".as_ptr(),
+            );
         }
     }
 }

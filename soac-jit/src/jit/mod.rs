@@ -2052,7 +2052,10 @@ fn runtime_jit_deopt_term_supported(term: &BlockTerm<InstrCodegen>) -> bool {
         BlockTerm::Jump(edge) => edge.args.is_empty(),
         BlockTerm::IfTerm(if_term) => runtime_jit_deopt_expr_supported(&if_term.test),
         BlockTerm::BranchTable(branch) => runtime_jit_deopt_expr_supported(&branch.index),
-        _ => false,
+        BlockTerm::Raise(raise) => raise
+            .exc
+            .as_ref()
+            .is_some_and(runtime_jit_deopt_expr_supported),
     }
 }
 
