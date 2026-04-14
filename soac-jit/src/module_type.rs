@@ -73,6 +73,8 @@ pub struct SharedModuleState {
     counter_slots_by_id: Box<[CounterRuntimeSlot]>,
     counter_values: Box<[u64]>,
     top_value_counters: Box<[GilTopValueCounter]>,
+    pub(crate) precompiled_module_runtime:
+        OnceLock<Result<Arc<crate::jit::PrecompiledModuleRuntime>, String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -633,6 +635,7 @@ pub fn build_shared_state_for_inspection(
         counter_slots_by_id,
         counter_values,
         top_value_counters,
+        precompiled_module_runtime: OnceLock::new(),
     }))
 }
 
@@ -712,6 +715,7 @@ impl SoacExtModuleState {
             counter_slots_by_id,
             counter_values,
             top_value_counters,
+            precompiled_module_runtime: OnceLock::new(),
         });
         compile_session
             .retain_shared_module_state(shared_state.clone())
@@ -1396,6 +1400,7 @@ def f():
             module_name: "counter_test".to_string(),
             package_name: String::new(),
             original_code_by_function_id: HashMap::new(),
+            precompiled_module_runtime: OnceLock::new(),
         };
 
         let record = shared_state
@@ -1554,6 +1559,7 @@ def f():
             module_name: "counter_test".to_string(),
             package_name: "pkg".to_string(),
             original_code_by_function_id: HashMap::new(),
+            precompiled_module_runtime: OnceLock::new(),
         };
 
         let unique = SystemTime::now()

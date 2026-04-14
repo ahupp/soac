@@ -612,6 +612,20 @@ struct PrecompiledLibrary {
     path: PathBuf,
 }
 
+pub(crate) struct PrecompiledModuleRuntime {
+    deopt_resume_plan: PlannedJitDeoptResumeModule,
+    module_constant_ptrs: Vec<usize>,
+}
+
+impl PrecompiledModuleRuntime {
+    fn module_constant_ptrs(&self) -> Vec<*mut ffi::PyObject> {
+        self.module_constant_ptrs
+            .iter()
+            .map(|ptr| *ptr as *mut ffi::PyObject)
+            .collect()
+    }
+}
+
 impl PrecompiledLibrary {
     fn lookup_code_symbol(&self, symbol: &str) -> Result<Option<*const u8>, String> {
         let c_symbol = CString::new(symbol)
@@ -1541,10 +1555,9 @@ pub(crate) fn lookup_precompiled_direct_function_handle(
         code_ptr
     };
 
-    let value_facts = infer_jit_value_facts(&shared_state.lowered_module);
-    let deopt_resume_plan =
-        plan_jit_deopt_resume_module(&shared_state.lowered_module, &value_facts)?;
-    let function_deopt_resume_plan = deopt_resume_plan
+    let runtime = precompiled_module_runtime(library, shared_state)?;
+    let function_deopt_resume_plan = runtime
+        .deopt_resume_plan
         .function(function.function_id)
         .ok_or_else(|| {
             format!(
@@ -1552,7 +1565,7 @@ pub(crate) fn lookup_precompiled_direct_function_handle(
                 function.function_id, function.names.qualname
             )
         })?;
-    let module_constant_ptrs = shared_state.module_constant_ptrs();
+    let module_constant_ptrs = runtime.module_constant_ptrs();
     let deopt_table = Arc::new(RuntimeJitDeoptTable::from_plan(
         function,
         function_deopt_resume_plan,
@@ -1575,6 +1588,38 @@ pub(crate) fn lookup_precompiled_direct_function_handle(
         function.params.len(),
         deopt_table,
     ))))
+}
+
+fn precompiled_module_runtime(
+    library: &PrecompiledLibrary,
+    shared_state: &SharedModuleState,
+) -> Result<Arc<PrecompiledModuleRuntime>, String> {
+    match shared_state
+        .precompiled_module_runtime
+        .get_or_init(|| build_precompiled_module_runtime(library, shared_state))
+    {
+        Ok(runtime) => Ok(Arc::clone(runtime)),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+fn build_precompiled_module_runtime(
+    library: &PrecompiledLibrary,
+    shared_state: &SharedModuleState,
+) -> Result<Arc<PrecompiledModuleRuntime>, String> {
+    patch_precompiled_module_constant_slots(library, shared_state)?;
+    let value_facts = infer_jit_value_facts(&shared_state.lowered_module);
+    let deopt_resume_plan =
+        plan_jit_deopt_resume_module(&shared_state.lowered_module, &value_facts)?;
+    let module_constant_ptrs = shared_state
+        .module_constant_ptrs()
+        .into_iter()
+        .map(|ptr| ptr as usize)
+        .collect();
+    Ok(Arc::new(PrecompiledModuleRuntime {
+        deopt_resume_plan,
+        module_constant_ptrs,
+    }))
 }
 
 fn patch_precompiled_module_constant_slots(
