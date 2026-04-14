@@ -5,7 +5,8 @@ use super::{
 use crate::module_constants::load_runtime_name_owned;
 use pyo3::ffi;
 use soac_blockpy::block_py::{
-    BinOp, BinOpKind, BlockTerm, InstrCodegen, LocalLocation, NameLocation, UnaryOp, UnaryOpKind,
+    BinOp, BinOpKind, BlockTerm, CallArgPositional, InstrCodegen, LocalLocation, NameLocation,
+    UnaryOp, UnaryOpKind,
 };
 use std::ffi::c_void;
 use std::ptr;
@@ -150,10 +151,11 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             InstrCodegen::SetAttr(setattr) => unsafe { self.execute_setattr_owned(setattr) },
             InstrCodegen::SetItem(setitem) => unsafe { self.execute_setitem_owned(setitem) },
             InstrCodegen::DelItem(delitem) => unsafe { self.execute_delitem_owned(delitem) },
+            InstrCodegen::Call(call) => unsafe { self.execute_call_owned(call) },
             InstrCodegen::Store(store) => unsafe { self.execute_store_owned(store) },
             InstrCodegen::Del(del) => unsafe { self.execute_del_owned(del) },
             _ => Err(format!(
-                "deopt continuation only supports simple load/binop/store/del expressions, got {expr:?}"
+                "deopt continuation only supports simple load/binop/call/store/del expressions, got {expr:?}"
             )),
         }
     }
@@ -361,6 +363,84 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             return Ok(ptr::null_mut());
         }
         Ok(owned_none())
+    }
+
+    #[cold]
+    unsafe fn execute_call_owned(
+        &mut self,
+        call: &soac_blockpy::block_py::Call<InstrCodegen>,
+    ) -> Result<ObjPtr, String> {
+        if !call.keywords.is_empty() {
+            return Err("deopt continuation does not support keyword call arguments".to_string());
+        }
+
+        let callable = unsafe { self.execute_expr_owned(&call.func)? };
+        if callable.is_null() {
+            return Ok(ptr::null_mut());
+        }
+
+        let mut args = Vec::with_capacity(call.args.len());
+        for arg in &call.args {
+            let CallArgPositional::Positional(expr) = arg else {
+                unsafe {
+                    release_owned_values(args);
+                    ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
+                }
+                return Err(
+                    "deopt continuation does not support starred call arguments".to_string()
+                );
+            };
+            let value = unsafe { self.execute_expr_owned(expr)? };
+            if value.is_null() {
+                unsafe {
+                    release_owned_values(args);
+                    ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
+                }
+                return Ok(ptr::null_mut());
+            }
+            args.push(value);
+        }
+
+        let args_len = match ffi::Py_ssize_t::try_from(args.len()) {
+            Ok(args_len) => args_len,
+            Err(_) => {
+                unsafe {
+                    release_owned_values(args);
+                    ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
+                }
+                return Err(format!(
+                    "deopt continuation call has too many positional args: {}",
+                    call.args.len()
+                ));
+            }
+        };
+        let tuple = unsafe { ffi::PyTuple_New(args_len) };
+        if tuple.is_null() {
+            unsafe {
+                release_owned_values(args);
+                ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
+            }
+            return Ok(ptr::null_mut());
+        }
+        for (index, arg) in args.into_iter().enumerate() {
+            let index = ffi::Py_ssize_t::try_from(index)
+                .expect("tuple arg index should fit after tuple length conversion");
+            // Use the exported API rather than the layout macro; this path must match the
+            // vendored CPython tuple layout even when PyO3's cfgs lag a CPython change.
+            if unsafe { ffi::PyTuple_SetItem(tuple, index, arg.cast::<ffi::PyObject>()) } != 0 {
+                unsafe {
+                    ffi::Py_DECREF(tuple);
+                    ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
+                }
+                return Ok(ptr::null_mut());
+            }
+        }
+        let result = unsafe { ffi::PyObject_CallObject(callable.cast::<ffi::PyObject>(), tuple) };
+        unsafe {
+            ffi::Py_DECREF(tuple);
+            ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
+        }
+        Ok(result.cast())
     }
 
     #[cold]
@@ -653,6 +733,14 @@ fn owned_none() -> ObjPtr {
         let none = ffi::Py_None();
         ffi::Py_INCREF(none);
         none.cast()
+    }
+}
+
+unsafe fn release_owned_values(values: Vec<ObjPtr>) {
+    for value in values {
+        unsafe {
+            ffi::Py_DECREF(value.cast::<ffi::PyObject>());
+        }
     }
 }
 

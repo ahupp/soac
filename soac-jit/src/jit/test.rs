@@ -6524,6 +6524,86 @@ def f(x):
     }
 
     #[test]
+    fn deopt_block_tail_continuation_executes_return_positional_call() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|_| {
+            let function = with_single_test_block(
+                test_function(),
+                vec![],
+                ret_term(op_expr(Call::new(
+                    name_expr(test_constant_name(0)),
+                    vec![CallArgPositional::Positional(name_expr(
+                        test_constant_name(1),
+                    ))],
+                    Vec::<CallArgKeyword<InstrCodegen>>::new(),
+                ))),
+            );
+            let function_id = function.function_id;
+            let block = function.entry_block().label;
+            let int_callable = std::ptr::addr_of_mut!(ffi::PyLong_Type).cast::<ffi::PyObject>();
+            unsafe {
+                ffi::Py_INCREF(int_callable);
+            }
+            let input = unsafe { ffi::PyUnicode_FromString(c"222333444".as_ptr()) };
+            assert!(
+                !input.is_null(),
+                "test call input string allocation should succeed"
+            );
+            let table = RuntimeJitDeoptTable {
+                function_id,
+                function: Box::new(function),
+                module_constant_ptrs: vec![int_callable.cast(), input.cast()],
+                points: vec![RuntimeJitDeoptRecord {
+                    id: PlannedJitDeoptPointId {
+                        function_id,
+                        ordinal: 0,
+                    },
+                    resume_point: LocalEnvResumePoint::BeforeTerm { function_id, block },
+                    precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                    locals: vec![],
+                    continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
+                        cursor: RuntimeJitDeoptCursor::at_block_entry(block),
+                    },
+                }],
+            };
+            let before_input = unsafe { ffi::Py_REFCNT(input) };
+            let result = unsafe {
+                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                    std::ptr::addr_of!(table).cast_mut().cast(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert!(
+                !result.is_null(),
+                "return-call deopt should produce a value"
+            );
+            assert!(
+                unsafe { ffi::PyErr_Occurred() }.is_null(),
+                "successful return-call deopt should not leave a Python exception"
+            );
+            assert_eq!(
+                unsafe { ffi::PyLong_AsLongLong(result.cast::<ffi::PyObject>()) },
+                222_333_444,
+                "return-call deopt should execute PyObject_CallObject"
+            );
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(input) },
+                before_input,
+                "argument module constant should not leak through call execution"
+            );
+            unsafe {
+                ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+                ffi::Py_DECREF(input);
+                ffi::Py_DECREF(int_callable);
+            }
+        });
+    }
+
+    #[test]
     fn deopt_block_tail_continuation_executes_global_store() {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
