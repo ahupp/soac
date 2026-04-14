@@ -12,7 +12,8 @@ use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyAnyMethods, PyList, PyTuple};
 use soac_blockpy::block_py::{
-    BlockPyFunction, BlockPyModule, CounterDef, CounterId, CounterScope, CounterSite, FunctionId,
+    BlockPyFunction, BlockPyModule, CounterDef, CounterId, CounterScope, CounterSite,
+    DeoptEntrySource, FunctionId,
 };
 use soac_blockpy::env_config::SoacEnvConfig;
 use soac_blockpy::passes::CodegenModuleShape;
@@ -304,6 +305,7 @@ impl SharedModuleState {
                     | "global_indexed_fallback"
                     | "field_indexed_hit"
                     | "field_indexed_fallback"
+                    | "deopt_entry_guard_miss"
             ) {
                 continue;
             }
@@ -311,8 +313,23 @@ impl SharedModuleState {
             if value == 0 {
                 continue;
             }
-            let (function_id, instr_id, function_qualname) = match &counter.site {
-                CounterSite::BlockEntry { .. } => (String::new(), String::new(), String::new()),
+            let (function_id, instr_id, function_qualname, block_label) = match &counter.site {
+                CounterSite::BlockEntry { .. } => {
+                    (String::new(), String::new(), String::new(), String::new())
+                }
+                CounterSite::DeoptEntry {
+                    function_id,
+                    source,
+                } => (
+                    function_id.to_string(),
+                    deopt_entry_source_instr_id(*source)
+                        .map(|instr_id| instr_id.to_string())
+                        .unwrap_or_default(),
+                    self.lookup_function(*function_id)
+                        .map(|function| function.names.qualname.clone())
+                        .unwrap_or_default(),
+                    deopt_entry_source_block_label(*source),
+                ),
                 CounterSite::Runtime {
                     function_id,
                     instr_id,
@@ -329,6 +346,7 @@ impl SharedModuleState {
                                 .map(|function| function.names.qualname.clone())
                         })
                         .unwrap_or_default(),
+                    String::new(),
                 ),
             };
             info!(
@@ -341,6 +359,7 @@ impl SharedModuleState {
                 function_id,
                 function_qualname,
                 instr_id,
+                block_label,
                 value,
                 "specialization_runtime",
             );
@@ -377,6 +396,18 @@ impl SharedModuleState {
                         Some(block_label.to_string()),
                     )
                 }
+                CounterSite::DeoptEntry {
+                    function_id,
+                    source,
+                } => (
+                    "deopt_entry".to_string(),
+                    Some(*function_id),
+                    Some(*function_id),
+                    deopt_entry_source_instr_id(*source),
+                    self.lookup_function(*function_id)
+                        .map(|function| function.names.qualname.clone()),
+                    Some(deopt_entry_source_block_label(*source)),
+                ),
                 CounterSite::Runtime {
                     function_id,
                     instr_id,
@@ -516,6 +547,23 @@ fn counter_scope_name(scope: CounterScope) -> &'static str {
         CounterScope::This => "this",
         CounterScope::Function => "function",
         CounterScope::Global => "global",
+    }
+}
+
+fn deopt_entry_source_instr_id(
+    source: DeoptEntrySource,
+) -> Option<soac_blockpy::block_py::InstrId> {
+    match source {
+        DeoptEntrySource::BeforeInstr { instr_id } => Some(instr_id),
+        DeoptEntrySource::BlockEntry { .. } | DeoptEntrySource::BeforeTerm { .. } => None,
+    }
+}
+
+fn deopt_entry_source_block_label(source: DeoptEntrySource) -> String {
+    match source {
+        DeoptEntrySource::BlockEntry { block_label }
+        | DeoptEntrySource::BeforeTerm { block_label } => block_label.to_string(),
+        DeoptEntrySource::BeforeInstr { instr_id } => instr_id.block_label().to_string(),
     }
 }
 
@@ -1443,6 +1491,72 @@ def f():
         assert_eq!(row.value, 3);
         assert_eq!(row.observed_value, None);
         assert_eq!(row.max_overcount, None);
+    }
+
+    #[test]
+    fn counter_dump_record_includes_deopt_entry_source_and_reason() {
+        let mut lowered = lower_python_to_blockpy_for_testing(
+            r#"
+def f(x):
+    return x
+"#,
+        )
+        .expect("transform should succeed")
+        .codegen_module;
+
+        let function = lowered
+            .callable_defs
+            .iter()
+            .find(|function| function.names.bind_name == "f")
+            .expect("missing lowered function f");
+        let function_id = function.function_id;
+        let entry_label = function.entry_block().label;
+        let entry_label_text = entry_label.to_string();
+        lowered.counter_defs.push(CounterDef {
+            id: CounterId(0),
+            scope: CounterScope::This,
+            kind: "deopt_entry_guard_miss".to_string(),
+            site: CounterSite::DeoptEntry {
+                function_id,
+                source: DeoptEntrySource::BeforeTerm {
+                    block_label: entry_label,
+                },
+            },
+        });
+
+        let shared_state = SharedModuleState {
+            function_index_by_id: build_function_index_by_id(&lowered)
+                .expect("function index should build"),
+            codegen_constants: ModuleCodegenConstants::collect_from_module(&lowered),
+            source_hash: 0,
+            storage_instance_key: allocate_shared_module_state_storage_key(),
+            module_constant_objs: Vec::new(),
+            counter_slots_by_id: vec![CounterRuntimeSlot::Scalar(0)].into_boxed_slice(),
+            counter_values: vec![5].into_boxed_slice(),
+            top_value_counters: Vec::new().into_boxed_slice(),
+            lowered_module: lowered,
+            module_name: "counter_test".to_string(),
+            package_name: String::new(),
+            original_code_by_function_id: HashMap::new(),
+            precompiled_module_runtime: OnceLock::new(),
+        };
+
+        let record = shared_state
+            .counter_dump_record()
+            .expect("counter dump record should be present");
+        let row = record
+            .rows
+            .iter()
+            .find(|row| row.kind == "deopt_entry_guard_miss")
+            .expect("deopt-entry counter row should be present");
+        assert_eq!(row.scope, "this");
+        assert_eq!(row.site_kind, "deopt_entry");
+        assert_eq!(row.function_id, Some(function_id));
+        assert_eq!(row.current_function_id, Some(function_id));
+        assert_eq!(row.function_qualname.as_deref(), Some("f"));
+        assert_eq!(row.block_label.as_deref(), Some(entry_label_text.as_str()));
+        assert_eq!(row.instr_id, None);
+        assert_eq!(row.value, 5);
     }
 
     #[test]

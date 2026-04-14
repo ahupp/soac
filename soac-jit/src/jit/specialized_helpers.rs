@@ -2041,6 +2041,10 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
         dp_jit_raise_deleted_name_error as *const u8,
     );
     builder.symbol(
+        "dp_jit_raise_super_arg_deleted",
+        dp_jit_raise_super_arg_deleted as *const u8,
+    );
+    builder.symbol(
         "dp_jit_raise_missing_required_argument",
         dp_jit_raise_missing_required_argument as *const u8,
     );

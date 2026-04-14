@@ -366,8 +366,8 @@ anything non-code affected the run. If there were no such issues, say
   dumps. `verify` exercises indexed store fast paths so hit/fallback
   counters measure the specialized steady-state path. `apply` still
   skips counter dump files, but when event logging is enabled it records
-  indexed specialization hit/fallback counts long enough to emit
-  `soac_specialization_runtime` summary events.
+  indexed specialization hit/fallback counts and deopt-entry counts long enough
+  to emit `soac_specialization_runtime` summary events.
 - `SOAC_ENABLE_PROFILED_COLD_BLOCKS`
   Optional opt-in for replaying `block_entry` counters from
   `$SOAC_WORK_DIR/profile.bin` as Cranelift `cold` block hints during

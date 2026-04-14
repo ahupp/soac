@@ -34,10 +34,10 @@ use pyo3::ffi;
 use soac_blockpy::block_py::{
     AbruptKind, BlockArg, BlockEdge, BlockLabel, BlockParamRole, BlockPyFunction, BlockPyModule,
     BlockTerm, CallArgKeyword, CallArgPositional, CallableScopeKind, CellLocation, ChildVisitable,
-    CodegenBlock, CounterDef, CounterId, CounterScope, CounterSite, Del, FunctionId, FunctionKind,
-    HasMeta, HasSemanticInstrId, InstrCodegen, InstrId, InstrKey, Literal, LocalLocation,
-    NameLocation, ParamKind, ResolvedName, StorageLayout, Store, Visit, WithMeta,
-    operation as blockpy_intrinsics,
+    CodegenBlock, CounterDef, CounterId, CounterScope, CounterSite, Del, DeoptEntrySource,
+    FunctionId, FunctionKind, HasMeta, HasSemanticInstrId, InstrCodegen, InstrId, InstrKey,
+    Literal, LocalLocation, NameLocation, ParamKind, ResolvedName, StorageLayout, Store, Visit,
+    WithMeta, operation as blockpy_intrinsics,
 };
 use soac_blockpy::passes::{
     CodegenModuleShape, FactStore, FunctionRefcountPlan, InstrResolved, InstrTyped,
@@ -3894,6 +3894,7 @@ struct JitEmitCtx<'mc> {
     global_indexed_fallback_counter_ids: &'mc HashMap<InstrId, CounterId>,
     field_indexed_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
     field_indexed_fallback_counter_ids: &'mc HashMap<InstrId, CounterId>,
+    deopt_entry_guard_miss_counter_ids: &'mc HashMap<usize, CounterId>,
     field_index_specializations: &'mc HashMap<String, Vec<FieldIndexSpecialization>>,
     behavior_change_indexed_stores: bool,
     allow_local_only_slot_backed_stores: bool,
@@ -4016,6 +4017,7 @@ fn emit_deopt_resume_call_with_local_env(
     ctx: &JitEmitCtx<'_>,
     local_env: &LocalEnv,
 ) -> ir::Value {
+    emit_deopt_entry_guard_miss_counter(fb, target, ctx);
     let (live_values_base, live_value_count) =
         emit_deopt_live_value_buffer(fb, target, ctx, local_env)
             .unwrap_or_else(|err| panic!("{err}"));
@@ -4029,6 +4031,28 @@ fn emit_deopt_resume_call_with_local_env(
         ctx.consts.ptr_ty,
         ctx.consts.i64_ty,
     )
+}
+
+fn emit_deopt_entry_guard_miss_counter(
+    fb: &mut FunctionBuilder<'_>,
+    target: JitDeoptExitRef,
+    ctx: &JitEmitCtx<'_>,
+) {
+    let Ok(ordinal) = usize::try_from(target.record_ordinal) else {
+        return;
+    };
+    let Some(counter_id) = ctx.deopt_entry_guard_miss_counter_ids.get(&ordinal) else {
+        return;
+    };
+    let counter_slot = scalar_counter_slot_for_id(ctx.counter_slots_by_id, *counter_id)
+        .unwrap_or_else(|err| panic!("{err}"));
+    let scalar_counter_base_value = ctx.consts.scalar_counter_base_value.unwrap_or_else(|| {
+        panic!(
+            "missing scalar counter base for deopt-entry counter id {}",
+            counter_id.0
+        )
+    });
+    emit_increment_counter_slot(fb, scalar_counter_base_value, counter_slot);
 }
 
 fn emit_deopt_result_return_or_step_null(
@@ -8121,6 +8145,46 @@ fn collect_runtime_counter_ids_by_kind(
                 instr_id: Some(instr_id),
             } if counter.kind == kind && *counter_function_id == function_id => {
                 Some((*instr_id, counter.id))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn deopt_entry_source_for_resume_point(point: LocalEnvResumePoint) -> DeoptEntrySource {
+    match point {
+        LocalEnvResumePoint::BlockEntry { block, .. } => {
+            DeoptEntrySource::BlockEntry { block_label: block }
+        }
+        LocalEnvResumePoint::BeforeInstr { key } => DeoptEntrySource::BeforeInstr {
+            instr_id: key.instr_id,
+        },
+        LocalEnvResumePoint::BeforeTerm { block, .. } => {
+            DeoptEntrySource::BeforeTerm { block_label: block }
+        }
+    }
+}
+
+fn collect_deopt_entry_counter_ids_by_kind(
+    counter_defs: &[CounterDef],
+    function_id: FunctionId,
+    kind: &str,
+    deopt_resume_plan: &PlannedJitDeoptResumeFunction,
+) -> HashMap<usize, CounterId> {
+    counter_defs
+        .iter()
+        .filter_map(|counter| match &counter.site {
+            CounterSite::DeoptEntry {
+                function_id: counter_function_id,
+                source,
+            } if counter.kind == kind && *counter_function_id == function_id => {
+                let ordinal = deopt_resume_plan
+                    .deopt_points
+                    .iter()
+                    .find(|point| deopt_entry_source_for_resume_point(point.point) == *source)?
+                    .id
+                    .ordinal;
+                Some((ordinal, counter.id))
             }
             _ => None,
         })
@@ -17183,6 +17247,12 @@ fn build_cranelift_run_bb_specialized_function(
         function.function_id,
         "field_indexed_fallback",
     );
+    let deopt_entry_guard_miss_counter_ids = collect_deopt_entry_counter_ids_by_kind(
+        counter_defs,
+        function.function_id,
+        "deopt_entry_guard_miss",
+        jit_deopt_resume_plan,
+    );
     let branch_outcome_counter_ids =
         collect_runtime_counter_ids_by_kind(counter_defs, function.function_id, "branch_outcomes");
     for counter_id in call_target_counter_ids
@@ -17833,6 +17903,7 @@ fn build_cranelift_run_bb_specialized_function(
                 global_indexed_fallback_counter_ids: &global_indexed_fallback_counter_ids,
                 field_indexed_hit_counter_ids: &field_indexed_hit_counter_ids,
                 field_indexed_fallback_counter_ids: &field_indexed_fallback_counter_ids,
+                deopt_entry_guard_miss_counter_ids: &deopt_entry_guard_miss_counter_ids,
                 branch_outcome_counter_ids: &branch_outcome_counter_ids,
                 branch_prefer_true: &branch_prefer_true,
                 field_index_specializations: &field_index_specializations,

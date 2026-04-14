@@ -131,6 +131,9 @@ pub fn remap_codegen_module_function_ids(
             CounterSite::BlockEntry { function_id, .. } => {
                 *function_id = remapper.remap(*function_id);
             }
+            CounterSite::DeoptEntry { function_id, .. } => {
+                *function_id = remapper.remap(*function_id);
+            }
             CounterSite::Runtime { function_id, .. } => {
                 if let Some(function_id) = function_id {
                     *function_id = remapper.remap(*function_id);

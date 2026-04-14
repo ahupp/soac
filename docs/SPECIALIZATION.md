@@ -113,7 +113,9 @@ Normal multi-pass runs use one work directory and one mode:
 - `SOAC_OPT_MODE=apply`
   - read `/path/to/dir/profile.bin`
   - apply specializations
-  - emit no specialization-input counters
+  - emit no specialization-input counter dump
+  - keep in-process `deopt_entry_guard_miss` counters so apply-mode event
+    logs can report which planned source point entered `dp_jit_deopt_resume`
 
 The JIT loads hot profile input from `$SOAC_WORK_DIR/profile.bin` in
 apply/verify mode:

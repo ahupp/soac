@@ -408,11 +408,22 @@ fn finish_codegen_module_with_tracker(
             bb_locality_counted
         };
 
+    let bb_deopt_entry_counted: BlockPyModule<CodegenModuleShape> =
+        if passes::deopt_entry_counter_instrumentation_enabled(env_config) {
+            pass_tracker.record_timing("bb_deopt_entry_counters", || {
+                let mut counted = bb_refcount_counted;
+                passes::define_bb_module_deopt_entry_counters(&mut counted, &local_env_resume_plan);
+                counted
+            })
+        } else {
+            bb_refcount_counted
+        };
+
     pass_tracker.record_timing("validate", || {
-        crate::block_py::validate_module(&bb_refcount_counted).map_err(anyhow::Error::msg)
+        crate::block_py::validate_module(&bb_deopt_entry_counted).map_err(anyhow::Error::msg)
     })?;
 
-    Ok(bb_refcount_counted)
+    Ok(bb_deopt_entry_counted)
 }
 
 pub(crate) fn rewrite_module_with_tracker(

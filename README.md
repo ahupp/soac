@@ -157,9 +157,9 @@ typed variables must use recognized values. Boolean knobs accept `1`, `true`,
   `;json=/path/to/events.jsonl` to write tracing JSONL to that file
   instead of formatted stderr. Module-load timings are emitted as
   `soac_module_load` tracing events, and JIT-codegen timing is emitted
-  through `soac_jit_codegen`. Apply-mode indexed specialization hit and
-  fallback summaries are emitted through `soac_specialization_runtime`.
-  BlockPy module-cache hits and stores are emitted through
+  through `soac_jit_codegen`. Apply-mode indexed specialization hit/fallback
+  summaries and deopt-entry summaries are emitted through
+  `soac_specialization_runtime`. BlockPy module-cache hits and stores are emitted through
   `soac_blockpy_module_cache`.
   Enable them with
   `SOAC_LOG=soac_module_load=info,soac_jit_codegen=info,soac_specialization_runtime=info`.
@@ -224,8 +224,8 @@ typed variables must use recognized values. Boolean knobs accept `1`, `true`,
     specializations, and emit no specialization counter dump files.
     When event logging is enabled through `SOAC_LOG` or the default
     `$SOAC_WORK_DIR/events.jsonl`, apply mode still records in-process
-    indexed specialization hit/fallback counts long enough to emit
-    `soac_specialization_runtime` summary events at module teardown.
+    indexed specialization hit/fallback and deopt-entry counts long enough to
+    emit `soac_specialization_runtime` summary events at module teardown.
   Set `SOAC_WORK_DIR` for any mode that reads or writes counters. Leave
   `SOAC_OPT_MODE` unset, or set it to `none`, for the ordinary
   unspecialized/no-counter path.

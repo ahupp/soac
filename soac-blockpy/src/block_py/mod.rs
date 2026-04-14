@@ -45,7 +45,9 @@ pub use crate::passes::{
     InstrCodegen, InstrCodegenOp, InstrLow, InstrResolved, InstrRuff, InstrUnresolved,
     InstrWithAwaitAndYield, InstrWithYield,
 };
-pub use counters::{CounterDef, CounterId, CounterScope, CounterSite, IncrementCounter};
+pub use counters::{
+    CounterDef, CounterId, CounterScope, CounterSite, DeoptEntrySource, IncrementCounter,
+};
 pub(crate) use literal::literal_expr;
 pub use literal::{
     BytesLiteral, IntLiteral, Literal, LiteralValue, NumberLiteral, NumberLiteralValue,

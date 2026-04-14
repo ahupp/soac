@@ -15,7 +15,7 @@ Scope:
   intentionally re-exported helper callables in `soac_py/src/soac/runtime.py`.
 
 This list does not include plain runtime constants such as `TRUE`, `FALSE`,
-`NONE`, `DELETED`, `EMPTY_TUPLE`, or type/data symbols such as `PyFunction_Type`.
+`NONE`, `EMPTY_TUPLE`, or type/data symbols such as `PyFunction_Type`.
 
 ## soac-runtime
 

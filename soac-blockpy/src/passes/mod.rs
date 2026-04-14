@@ -680,6 +680,7 @@ pub use ownership_effects::{
     RefcountSite,
 };
 pub use trace::{
+    define_bb_module_deopt_entry_counters, deopt_entry_counter_instrumentation_enabled,
     instrument_bb_module_with_block_entry_counters, instrument_bb_module_with_call_target_counters,
     instrument_bb_module_with_global_load_counters, instrument_bb_module_with_locality_counters,
     instrument_bb_module_with_refcount_counters, specialization_runtime_logging_enabled,

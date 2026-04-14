@@ -313,7 +313,7 @@ fn lowering_verify_mode_adds_refcount_counters_only_in_verify() {
 }
 
 #[test]
-fn lowering_apply_mode_does_not_add_specialization_counters_even_with_runtime_logging() {
+fn lowering_apply_mode_keeps_only_deopt_entry_counters_even_with_runtime_logging() {
     let _guard = profile_env_test_lock().lock().unwrap();
     let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "apply");
     let _work_dir = EnvVarGuard::set("SOAC_WORK_DIR", "/tmp/soac-apply-counter-test");
@@ -324,12 +324,23 @@ fn lowering_apply_mode_does_not_add_specialization_counters_even_with_runtime_lo
         .codegen_module;
 
     assert!(
-        lowered.counter_defs.is_empty(),
-        "apply lowering should not add specialization counters just because runtime logging is enabled: {:?}",
+        lowered
+            .counter_defs
+            .iter()
+            .all(|counter| counter.kind == "deopt_entry_guard_miss"),
+        "apply lowering should keep only deopt-entry counters just because runtime logging is enabled: {:?}",
         lowered
             .counter_defs
             .iter()
             .map(|counter| counter.kind.as_str())
             .collect::<Vec<_>>()
+    );
+    assert!(
+        lowered
+            .counter_defs
+            .iter()
+            .all(|counter| matches!(counter.site, CounterSite::DeoptEntry { .. })),
+        "apply deopt-entry counters should carry source metadata: {:?}",
+        lowered.counter_defs
     );
 }

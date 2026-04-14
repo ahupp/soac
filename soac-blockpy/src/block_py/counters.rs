@@ -31,12 +31,25 @@ pub enum CounterSite {
         function_id: FunctionId,
         block_label: BlockLabel,
     },
+    DeoptEntry {
+        function_id: FunctionId,
+        source: DeoptEntrySource,
+    },
     // `instr_id` names the semantic instruction site being observed. Synthetic
     // instrumentation instructions may have no semantic id of their own.
     Runtime {
         function_id: Option<FunctionId>,
         instr_id: Option<InstrId>,
     },
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+pub enum DeoptEntrySource {
+    BlockEntry { block_label: BlockLabel },
+    BeforeInstr { instr_id: InstrId },
+    BeforeTerm { block_label: BlockLabel },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]

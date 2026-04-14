@@ -24,6 +24,9 @@ const SOAC_RUNTIME_BOOTSTRAP_HELPER_NAMES: &[&str] = &[
     "import_attr",
     "class_lookup_global",
     "class_lookup_cell",
+    "current_exception",
+    "exception_matches",
+    "exceptiongroup_split",
 ];
 
 #[derive(Debug, Clone, Copy)]
@@ -870,6 +873,35 @@ def class_lookup_cell(class_ns, name, cell):
             f'cannot access free variable {name!r} where it is not associated with a value in enclosing scope'
         ) from exc
     return value
+
+def _validate_exception_type(exc_type):
+    if _builtins.isinstance(exc_type, tuple):
+        for entry in exc_type:
+            _validate_exception_type(entry)
+        return
+    if _builtins.isinstance(exc_type, type) and _builtins.issubclass(exc_type, _builtins.BaseException):
+        return
+    raise _builtins.TypeError(
+        'catching classes that do not inherit from BaseException is not allowed'
+    )
+
+def current_exception():
+    return _sys.exception()
+
+def exception_matches(exc, exc_type):
+    if _builtins.isinstance(exc, _builtins.RecursionError):
+        return _builtins.isinstance(exc, exc_type)
+    _validate_exception_type(exc_type)
+    return _builtins.isinstance(exc, exc_type)
+
+def exceptiongroup_split(exc, exc_type):
+    _validate_exception_type(exc_type)
+    if _builtins.isinstance(exc, _builtins.BaseExceptionGroup):
+        match, rest = exc.split(exc_type)
+        return match, rest
+    if _builtins.isinstance(exc, exc_type):
+        return exc, None
+    return None, exc
 ",
         c"<soac.runtime bootstrap>",
         c"soac.runtime._bootstrap",

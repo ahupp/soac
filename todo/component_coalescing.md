@@ -54,7 +54,7 @@ Create a shared runtime-name registry with:
 - whether it may be lowered into a module constant slot
 - whether treating it as a constant is a CPython-visible behavior change
 
-This should remove repeated hard-coded lists for `TRUE`, `FALSE`, `NONE`, `DELETED`, `EMPTY_TUPLE`,
+This should remove repeated hard-coded lists for `TRUE`, `FALSE`, `NONE`, `EMPTY_TUPLE`,
 and builtin aliases.
 
 ### Counter Schema
