@@ -1625,6 +1625,10 @@ fn emit_codegen_indexed_global_load(
     let result_block = fb.create_block();
     fb.append_block_param(result_block, ptr_ty);
     let fallback_block = fb.create_block();
+    let guard_miss_target = ctx
+        .guard_miss_target_before_instr_id(instr_id, fallback_block)
+        .unwrap_or_else(|err| panic!("{err}"));
+    let _future_deopt_exit = guard_miss_target.deopt_exit_ref();
     let direct_block = fb.create_block();
     fb.append_block_param(direct_block, ptr_ty);
 
@@ -1638,7 +1642,7 @@ fn emit_codegen_indexed_global_load(
         .icmp(ir::condcodes::IntCC::Equal, direct_value, null_ptr);
     fb.ins().brif(
         direct_is_null,
-        fallback_block,
+        guard_miss_target.fallback_block(),
         &[],
         direct_block,
         &[ir::BlockArg::Value(direct_value)],
@@ -1653,7 +1657,7 @@ fn emit_codegen_indexed_global_load(
     fb.ins()
         .jump(result_block, &[ir::BlockArg::Value(direct_value)]);
 
-    fb.switch_to_block(fallback_block);
+    fb.switch_to_block(guard_miss_target.fallback_block());
     emit_optional_counter_increment_for_kind(
         fb,
         ctx,
@@ -2428,6 +2432,31 @@ struct JitEmitCtx<'mc> {
     callable_ptr_data_ids: RefCell<HashMap<RelocCallableRef, DataId>>,
 }
 
+#[derive(Clone, Copy)]
+struct JitDeoptExitRef {
+    function_env_value: ir::Value,
+    record_ordinal: i64,
+}
+
+#[derive(Clone, Copy)]
+struct JitGuardMissTarget {
+    fallback_block: ir::Block,
+    deopt_exit: JitDeoptExitRef,
+}
+
+impl JitGuardMissTarget {
+    fn fallback_block(self) -> ir::Block {
+        self.fallback_block
+    }
+
+    fn deopt_exit_ref(self) -> (ir::Value, i64) {
+        (
+            self.deopt_exit.function_env_value,
+            self.deopt_exit.record_ordinal,
+        )
+    }
+}
+
 impl JitEmitCtx<'_> {
     fn value_facts_for_instr_id(&self, instr_id: InstrId) -> Option<ValueFacts> {
         self.value_facts
@@ -2454,7 +2483,7 @@ impl JitEmitCtx<'_> {
     fn require_deopt_record_ref(
         &self,
         point: LocalEnvResumePoint,
-    ) -> Result<(ir::Value, i64), String> {
+    ) -> Result<JitDeoptExitRef, String> {
         let deopt_point = self.require_deopt_point(point)?;
         let ordinal = i64::try_from(deopt_point.id.ordinal).map_err(|_| {
             format!(
@@ -2462,13 +2491,16 @@ impl JitEmitCtx<'_> {
                 point, self.function_id
             )
         })?;
-        Ok((self.consts.function_env_value, ordinal))
+        Ok(JitDeoptExitRef {
+            function_env_value: self.consts.function_env_value,
+            record_ordinal: ordinal,
+        })
     }
 
     fn require_deopt_point_at_block_entry(
         &self,
         block: BlockLabel,
-    ) -> Result<(ir::Value, i64), String> {
+    ) -> Result<JitDeoptExitRef, String> {
         self.require_deopt_record_ref(LocalEnvResumePoint::BlockEntry {
             function_id: self.function_id,
             block,
@@ -2478,7 +2510,7 @@ impl JitEmitCtx<'_> {
     fn require_deopt_point_before_instr_id(
         &self,
         instr_id: InstrId,
-    ) -> Result<(ir::Value, i64), String> {
+    ) -> Result<JitDeoptExitRef, String> {
         self.require_deopt_record_ref(LocalEnvResumePoint::BeforeInstr {
             key: InstrKey::new(self.function_id, instr_id),
         })
@@ -2487,10 +2519,21 @@ impl JitEmitCtx<'_> {
     fn require_deopt_point_before_term(
         &self,
         block: BlockLabel,
-    ) -> Result<(ir::Value, i64), String> {
+    ) -> Result<JitDeoptExitRef, String> {
         self.require_deopt_record_ref(LocalEnvResumePoint::BeforeTerm {
             function_id: self.function_id,
             block,
+        })
+    }
+
+    fn guard_miss_target_before_instr_id(
+        &self,
+        instr_id: InstrId,
+        fallback_block: ir::Block,
+    ) -> Result<JitGuardMissTarget, String> {
+        Ok(JitGuardMissTarget {
+            fallback_block,
+            deopt_exit: self.require_deopt_point_before_instr_id(instr_id)?,
         })
     }
 
