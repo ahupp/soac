@@ -212,8 +212,10 @@ apply/verify mode:
   global load slow path so counter collection stays local and non-deopting.
 - In `verify`/`apply` mode, load guard misses for planned deopt points
   branch to a cold `dp_jit_deopt_resume` continuation instead of emitting
-  the local slow global-load fallback. Loads nested inside another expression
-  still use the local slow path until they have precise resume state.
+  the local slow global-load fallback. Loads nested inside another body
+  expression may reuse the enclosing instruction boundary when a conservative
+  evaluation-order scan proves that deopting there cannot replay an earlier
+  side effect; otherwise they keep the local slow path.
 - In `profile` mode, store guard misses or store failures still
   increment the fallback counter when enabled and execute the existing
   global store slow path.

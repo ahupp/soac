@@ -2135,6 +2135,163 @@ fn runtime_jit_deopt_guard_operand_replay_safe(expr: &InstrCodegen) -> bool {
     )
 }
 
+fn typed_nested_guard_misses_can_resume_before_instr(expr: &InstrTyped) -> bool {
+    let mut saw_replay_unsafe_effect = false;
+    typed_nested_guard_scan_expr(expr, &mut saw_replay_unsafe_effect)
+}
+
+fn nested_guard_candidate_seen_before_replay_unsafe_effect(
+    has_guard_candidate: bool,
+    saw_replay_unsafe_effect: bool,
+) -> bool {
+    !has_guard_candidate || !saw_replay_unsafe_effect
+}
+
+fn typed_nested_guard_scan_expr(expr: &InstrTyped, saw_replay_unsafe_effect: &mut bool) -> bool {
+    match expr {
+        InstrTyped::Truthy(op) => {
+            typed_nested_guard_scan_expr(op.value(), saw_replay_unsafe_effect)
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::Load(op) => nested_guard_candidate_seen_before_replay_unsafe_effect(
+            matches!(op.name.location, NameLocation::Global(_)),
+            *saw_replay_unsafe_effect,
+        ),
+        InstrTyped::BinOp(op) => {
+            typed_nested_guard_scan_expr(op.left.as_ref(), saw_replay_unsafe_effect)
+                && typed_nested_guard_scan_expr(op.right.as_ref(), saw_replay_unsafe_effect)
+                && nested_guard_candidate_seen_before_replay_unsafe_effect(
+                    true,
+                    *saw_replay_unsafe_effect,
+                )
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::LegacyUnaryOp(op) => {
+            typed_nested_guard_scan_expr(op.operand.as_ref(), saw_replay_unsafe_effect)
+                && nested_guard_candidate_seen_before_replay_unsafe_effect(
+                    true,
+                    *saw_replay_unsafe_effect,
+                )
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::LegacyCalleeFunctionId(op) => {
+            typed_nested_guard_scan_expr(op.value.as_ref(), saw_replay_unsafe_effect)
+        }
+        InstrTyped::LegacyCall(op) => {
+            typed_nested_guard_scan_expr(op.func.as_ref(), saw_replay_unsafe_effect)
+                && typed_nested_guard_scan_positional_args(
+                    op.args.as_slice(),
+                    saw_replay_unsafe_effect,
+                )
+                && typed_nested_guard_scan_keyword_args(
+                    op.keywords.as_slice(),
+                    saw_replay_unsafe_effect,
+                )
+                && nested_guard_candidate_seen_before_replay_unsafe_effect(
+                    true,
+                    *saw_replay_unsafe_effect,
+                )
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::LegacyCallDirect(op) => {
+            typed_nested_guard_scan_expr(op.callable.as_ref(), saw_replay_unsafe_effect)
+                && typed_nested_guard_scan_positional_args(
+                    op.args.as_slice(),
+                    saw_replay_unsafe_effect,
+                )
+                && typed_nested_guard_scan_keyword_args(
+                    op.keywords.as_slice(),
+                    saw_replay_unsafe_effect,
+                )
+                && nested_guard_candidate_seen_before_replay_unsafe_effect(
+                    true,
+                    *saw_replay_unsafe_effect,
+                )
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::LegacyGetAttr(op) => {
+            typed_nested_guard_scan_expr(op.value.as_ref(), saw_replay_unsafe_effect)
+                && typed_nested_guard_scan_expr(op.attr.as_ref(), saw_replay_unsafe_effect)
+                && nested_guard_candidate_seen_before_replay_unsafe_effect(
+                    true,
+                    *saw_replay_unsafe_effect,
+                )
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::LegacySetAttr(op) => {
+            typed_nested_guard_scan_expr(op.value.as_ref(), saw_replay_unsafe_effect)
+                && typed_nested_guard_scan_expr(op.attr.as_ref(), saw_replay_unsafe_effect)
+                && typed_nested_guard_scan_expr(op.replacement.as_ref(), saw_replay_unsafe_effect)
+                && nested_guard_candidate_seen_before_replay_unsafe_effect(
+                    true,
+                    *saw_replay_unsafe_effect,
+                )
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::LegacyGetItem(op) => {
+            typed_nested_guard_scan_expr(op.value.as_ref(), saw_replay_unsafe_effect)
+                && typed_nested_guard_scan_expr(op.index.as_ref(), saw_replay_unsafe_effect)
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::LegacySetItem(op) => {
+            typed_nested_guard_scan_expr(op.value.as_ref(), saw_replay_unsafe_effect)
+                && typed_nested_guard_scan_expr(op.index.as_ref(), saw_replay_unsafe_effect)
+                && typed_nested_guard_scan_expr(op.replacement.as_ref(), saw_replay_unsafe_effect)
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::LegacyDelItem(op) => {
+            typed_nested_guard_scan_expr(op.value.as_ref(), saw_replay_unsafe_effect)
+                && typed_nested_guard_scan_expr(op.index.as_ref(), saw_replay_unsafe_effect)
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::LegacyStore(op) => {
+            typed_nested_guard_scan_expr(op.value.as_ref(), saw_replay_unsafe_effect)
+                && nested_guard_candidate_seen_before_replay_unsafe_effect(
+                    matches!(op.name.location, NameLocation::Global(_)),
+                    *saw_replay_unsafe_effect,
+                )
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::LegacyDel(_) => mark_replay_unsafe_effect(saw_replay_unsafe_effect),
+        InstrTyped::LegacyMakeCell(op) => {
+            typed_nested_guard_scan_expr(op.initial_value.as_ref(), saw_replay_unsafe_effect)
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::LegacyIncrementCounter(_) => {
+            mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::LegacyCellRef(_) => true,
+        InstrTyped::LegacyMakeFunction(_) => false,
+    }
+}
+
+fn typed_nested_guard_scan_positional_args(
+    args: &[CallArgPositional<InstrTyped>],
+    saw_replay_unsafe_effect: &mut bool,
+) -> bool {
+    args.iter().all(|arg| match arg {
+        CallArgPositional::Positional(expr) | CallArgPositional::Starred(expr) => {
+            typed_nested_guard_scan_expr(expr, saw_replay_unsafe_effect)
+        }
+    })
+}
+
+fn typed_nested_guard_scan_keyword_args(
+    keywords: &[CallArgKeyword<InstrTyped>],
+    saw_replay_unsafe_effect: &mut bool,
+) -> bool {
+    keywords.iter().all(|keyword| match keyword {
+        CallArgKeyword::Named { value, .. } | CallArgKeyword::Starred(value) => {
+            typed_nested_guard_scan_expr(value, saw_replay_unsafe_effect)
+        }
+    })
+}
+
+fn mark_replay_unsafe_effect(saw_replay_unsafe_effect: &mut bool) -> bool {
+    *saw_replay_unsafe_effect = true;
+    true
+}
+
 fn runtime_jit_deopt_block_tail_supported(
     function: &BlockPyFunction<CodegenModuleShape>,
     block: &CodegenBlock,
@@ -12684,7 +12841,8 @@ fn emit_typed_codegen_ops(
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<(), String> {
     for expr in ops {
-        if let Some(instr_id) = expr.try_semantic_instr_id() {
+        let instr_id = expr.try_semantic_instr_id();
+        if let Some(instr_id) = instr_id {
             emit_ctx.require_deopt_point_before_instr_id(instr_id)?;
         }
         let stmt_emit_ctx = local_failure_cleanup_emit_ctx(
@@ -12696,6 +12854,14 @@ fn emit_typed_codegen_ops(
             local_failure_cleanup_blocks,
         )?;
         let stmt_emit_ctx = stmt_emit_ctx.as_ref().unwrap_or(emit_ctx);
+        let guard_miss_emit_ctx = instr_id
+            .filter(|_| typed_nested_guard_misses_can_resume_before_instr(expr))
+            .map(|instr_id| {
+                stmt_emit_ctx.with_guard_miss_resume_point(LocalEnvResumePoint::BeforeInstr {
+                    key: InstrKey::new(stmt_emit_ctx.function_id, instr_id),
+                })
+            });
+        let stmt_emit_ctx = guard_miss_emit_ctx.as_ref().unwrap_or(stmt_emit_ctx);
         let result = emit_typed_codegen_stmt_result_with_local_env(
             fb,
             expr,
