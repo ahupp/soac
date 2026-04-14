@@ -1981,18 +1981,29 @@ fn runtime_jit_deopt_expr_supported(expr: &InstrCodegen) -> bool {
                 && runtime_jit_deopt_expr_supported(&delitem.index)
         }
         InstrCodegen::Call(call) => {
-            runtime_jit_deopt_expr_supported(&call.func)
-                && call.args.iter().all(|arg| match arg {
-                    CallArgPositional::Positional(expr) => runtime_jit_deopt_expr_supported(expr),
-                    CallArgPositional::Starred(_) => false,
-                })
-                && call.keywords.iter().all(|keyword| match keyword {
-                    CallArgKeyword::Named { value, .. } => runtime_jit_deopt_expr_supported(value),
-                    CallArgKeyword::Starred(_) => false,
-                })
+            runtime_jit_deopt_call_parts_supported(&call.func, &call.args, &call.keywords)
+        }
+        InstrCodegen::CallDirect(call) => {
+            runtime_jit_deopt_call_parts_supported(&call.callable, &call.args, &call.keywords)
         }
         _ => false,
     }
+}
+
+fn runtime_jit_deopt_call_parts_supported(
+    callable: &InstrCodegen,
+    args: &[CallArgPositional<InstrCodegen>],
+    keywords: &[CallArgKeyword<InstrCodegen>],
+) -> bool {
+    runtime_jit_deopt_expr_supported(callable)
+        && args.iter().all(|arg| match arg {
+            CallArgPositional::Positional(expr) => runtime_jit_deopt_expr_supported(expr),
+            CallArgPositional::Starred(_) => false,
+        })
+        && keywords.iter().all(|keyword| match keyword {
+            CallArgKeyword::Named { value, .. } => runtime_jit_deopt_expr_supported(value),
+            CallArgKeyword::Starred(_) => false,
+        })
 }
 
 fn runtime_jit_deopt_binop_supported(kind: blockpy_intrinsics::BinOpKind) -> bool {

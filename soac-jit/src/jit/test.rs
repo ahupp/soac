@@ -5130,6 +5130,48 @@ def f(x):
     }
 
     #[test]
+    fn runtime_deopt_table_marks_return_call_direct_before_term_continuation() {
+        let function = with_single_test_block(
+            test_function(),
+            vec![],
+            ret_term(InstrCodegen::CallDirect(CallDirect::new(
+                name_expr(test_constant_name(0)),
+                FunctionId::new(0, 999),
+                vec![CallArgPositional::Positional(name_expr(
+                    test_constant_name(1),
+                ))],
+                Vec::<CallArgKeyword<InstrCodegen>>::new(),
+            ))),
+        );
+        let module = test_module(ModuleNameGen::new(0), vec![function]);
+        let function = &module.callable_defs[0];
+        let facts = infer_module_value_facts(&module);
+        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+            .expect("JIT deopt resume planning should succeed");
+        let function_plan = module_plan
+            .function(function.function_id)
+            .expect("function should have a JIT deopt plan");
+        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
+            .expect("runtime deopt table should build from plan");
+        let point = LocalEnvResumePoint::BeforeTerm {
+            function_id: function.function_id,
+            block: function.entry_block().label,
+        };
+        let record = table
+            .record_for_point(point)
+            .expect("before-term return-call-direct point should have a runtime record");
+        assert_eq!(
+            record.continuation(),
+            &RuntimeJitDeoptContinuation::ResumeBlockTail {
+                cursor: RuntimeJitDeoptCursor::new(
+                    function.entry_block().label,
+                    function.entry_block().body.len(),
+                ),
+            }
+        );
+    }
+
+    #[test]
     fn runtime_deopt_table_marks_body_instr_block_tail_continuation() {
         let function = with_single_test_block(
             test_function(),
@@ -6700,6 +6742,87 @@ def f(x):
             unsafe {
                 ffi::Py_DECREF(value);
                 ffi::Py_DECREF(dict_callable);
+            }
+        });
+    }
+
+    #[test]
+    fn deopt_block_tail_continuation_executes_return_call_direct() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|_| {
+            let function = with_single_test_block(
+                test_function(),
+                vec![],
+                ret_term(InstrCodegen::CallDirect(CallDirect::new(
+                    name_expr(test_constant_name(0)),
+                    FunctionId::new(0, 999),
+                    vec![CallArgPositional::Positional(name_expr(
+                        test_constant_name(1),
+                    ))],
+                    Vec::<CallArgKeyword<InstrCodegen>>::new(),
+                ))),
+            );
+            let function_id = function.function_id;
+            let block = function.entry_block().label;
+            let int_callable = std::ptr::addr_of_mut!(ffi::PyLong_Type).cast::<ffi::PyObject>();
+            unsafe {
+                ffi::Py_INCREF(int_callable);
+            }
+            let input = unsafe { ffi::PyUnicode_FromString(c"333444555".as_ptr()) };
+            assert!(
+                !input.is_null(),
+                "test direct-call input string allocation should succeed"
+            );
+            let table = RuntimeJitDeoptTable {
+                function_id,
+                function: Box::new(function),
+                module_constant_ptrs: vec![int_callable.cast(), input.cast()],
+                points: vec![RuntimeJitDeoptRecord {
+                    id: PlannedJitDeoptPointId {
+                        function_id,
+                        ordinal: 0,
+                    },
+                    resume_point: LocalEnvResumePoint::BeforeTerm { function_id, block },
+                    precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                    locals: vec![],
+                    continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
+                        cursor: RuntimeJitDeoptCursor::at_block_entry(block),
+                    },
+                }],
+            };
+            let before_input = unsafe { ffi::Py_REFCNT(input) };
+            let result = unsafe {
+                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                    std::ptr::addr_of!(table).cast_mut().cast(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert!(
+                !result.is_null(),
+                "return-call-direct deopt should produce a value"
+            );
+            assert!(
+                unsafe { ffi::PyErr_Occurred() }.is_null(),
+                "successful return-call-direct deopt should not leave a Python exception"
+            );
+            assert_eq!(
+                unsafe { ffi::PyLong_AsLongLong(result.cast::<ffi::PyObject>()) },
+                333_444_555,
+                "return-call-direct deopt should execute a generic Python call"
+            );
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(input) },
+                before_input,
+                "direct-call argument module constant should not leak through call execution"
+            );
+            unsafe {
+                ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+                ffi::Py_DECREF(input);
+                ffi::Py_DECREF(int_callable);
             }
         });
     }

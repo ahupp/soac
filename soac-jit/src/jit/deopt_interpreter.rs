@@ -152,6 +152,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             InstrCodegen::SetItem(setitem) => unsafe { self.execute_setitem_owned(setitem) },
             InstrCodegen::DelItem(delitem) => unsafe { self.execute_delitem_owned(delitem) },
             InstrCodegen::Call(call) => unsafe { self.execute_call_owned(call) },
+            InstrCodegen::CallDirect(call) => unsafe { self.execute_call_direct_owned(call) },
             InstrCodegen::Store(store) => unsafe { self.execute_store_owned(store) },
             InstrCodegen::Del(del) => unsafe { self.execute_del_owned(del) },
             _ => Err(format!(
@@ -370,13 +371,31 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
         &mut self,
         call: &soac_blockpy::block_py::Call<InstrCodegen>,
     ) -> Result<ObjPtr, String> {
-        let callable = unsafe { self.execute_expr_owned(&call.func)? };
+        unsafe { self.execute_call_parts_owned(&call.func, &call.args, &call.keywords) }
+    }
+
+    #[cold]
+    unsafe fn execute_call_direct_owned(
+        &mut self,
+        call: &soac_blockpy::block_py::CallDirect<InstrCodegen>,
+    ) -> Result<ObjPtr, String> {
+        unsafe { self.execute_call_parts_owned(&call.callable, &call.args, &call.keywords) }
+    }
+
+    #[cold]
+    unsafe fn execute_call_parts_owned(
+        &mut self,
+        callable_expr: &InstrCodegen,
+        positional_args: &[CallArgPositional<InstrCodegen>],
+        keyword_args: &[CallArgKeyword<InstrCodegen>],
+    ) -> Result<ObjPtr, String> {
+        let callable = unsafe { self.execute_expr_owned(callable_expr)? };
         if callable.is_null() {
             return Ok(ptr::null_mut());
         }
 
-        let mut args = Vec::with_capacity(call.args.len());
-        for arg in &call.args {
+        let mut args = Vec::with_capacity(positional_args.len());
+        for arg in positional_args {
             let CallArgPositional::Positional(expr) = arg else {
                 unsafe {
                     release_owned_values(args);
@@ -406,7 +425,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
                 }
                 return Err(format!(
                     "deopt continuation call has too many positional args: {}",
-                    call.args.len()
+                    positional_args.len()
                 ));
             }
         };
@@ -431,7 +450,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
                 return Ok(ptr::null_mut());
             }
         }
-        let kwargs = if call.keywords.is_empty() {
+        let kwargs = if keyword_args.is_empty() {
             ptr::null_mut()
         } else {
             let kwargs = unsafe { ffi::PyDict_New() };
@@ -442,7 +461,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
                 }
                 return Ok(ptr::null_mut());
             }
-            for keyword in &call.keywords {
+            for keyword in keyword_args {
                 let CallArgKeyword::Named { arg, value } = keyword else {
                     unsafe {
                         ffi::Py_DECREF(kwargs);
