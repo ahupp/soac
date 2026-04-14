@@ -1,3 +1,5 @@
+include!("../build_support/soac_build_identity.rs");
+
 use std::env;
 use std::error::Error;
 use std::ffi::OsStr;
@@ -38,38 +40,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     write_runtime_clif_constant(&runtime_clif)?;
     Ok(())
-}
-
-fn emit_vendored_python_link(repo_root: &Path) -> Result<(), Box<dyn Error>> {
-    let python_lib_dir = repo_root.join("vendor").join("cpython");
-    let python_link_name = find_python_shared_lib_name(&python_lib_dir)
-        .ok_or("expected vendored shared libpython under vendor/cpython")?;
-    println!(
-        "cargo:rustc-link-search=native={}",
-        python_lib_dir.display()
-    );
-    println!(
-        "cargo:rustc-link-arg=-Wl,-rpath,{}",
-        python_lib_dir.display()
-    );
-    println!("cargo:rustc-link-lib=dylib={python_link_name}");
-    Ok(())
-}
-
-fn find_python_shared_lib_name(dir: &Path) -> Option<String> {
-    let entries = fs::read_dir(dir).ok()?;
-    for entry in entries {
-        let path = entry.ok()?.path();
-        let file_name = path.file_name()?.to_str()?;
-        if !file_name.starts_with("libpython") || !file_name.ends_with(".so") {
-            continue;
-        }
-        return file_name
-            .strip_prefix("lib")
-            .and_then(|name| name.strip_suffix(".so"))
-            .map(ToOwned::to_owned);
-    }
-    None
 }
 
 fn ensure_supported_python_runtime_layout() -> Result<(), Box<dyn Error>> {

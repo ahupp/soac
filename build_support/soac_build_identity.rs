@@ -42,6 +42,62 @@ pub fn compute_soac_build_identity(repo_root: &std::path::Path) -> std::io::Resu
     Ok(format!("{:016x}", hasher.finish()))
 }
 
+pub fn emit_vendored_python_link(repo_root: &std::path::Path) -> std::io::Result<()> {
+    let python_lib_dir = vendored_python_lib_dir(repo_root);
+    let python_link_name = find_vendored_python_shared_lib_name(repo_root)?;
+    println!("cargo:rerun-if-changed={}", python_lib_dir.display());
+    println!(
+        "cargo:rustc-link-search=native={}",
+        python_lib_dir.display()
+    );
+    println!(
+        "cargo:rustc-link-arg=-Wl,-rpath,{}",
+        python_lib_dir.display()
+    );
+    println!("cargo:rustc-link-lib=dylib={python_link_name}");
+    Ok(())
+}
+
+pub fn find_vendored_python_shared_lib_name(
+    repo_root: &std::path::Path,
+) -> std::io::Result<String> {
+    let python_lib_dir = vendored_python_lib_dir(repo_root);
+    find_python_shared_lib_name(&python_lib_dir).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "expected vendored shared libpython under {}",
+                python_lib_dir.display()
+            ),
+        )
+    })
+}
+
+pub fn vendored_python_lib_dir(repo_root: &std::path::Path) -> std::path::PathBuf {
+    repo_root.join("vendor").join("cpython")
+}
+
+fn find_python_shared_lib_name(dir: &std::path::Path) -> Option<String> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !file_name.starts_with("libpython") || !file_name.ends_with(".so") {
+            continue;
+        }
+        return file_name
+            .strip_prefix("lib")
+            .and_then(|name| name.strip_suffix(".so"))
+            .map(ToOwned::to_owned);
+    }
+    None
+}
+
 fn collect_identity_paths(
     path: &std::path::Path,
     out: &mut Vec<std::path::PathBuf>,

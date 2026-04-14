@@ -88,12 +88,15 @@ fields of one model. This keeps staged lowering while reducing translation-only 
 
 ## Lower-Risk Cleanup
 
-### Build Support For Vendored CPython
+### Build Support For Vendored CPython (done)
 
 The build scripts for `soac-jit`, `soac-inspector`, and `soac-pyo3` duplicate vendored `libpython`
 discovery and Cargo link directive emission. `build_support/soac_build_identity.rs` already provides
 shared build identity support; extend build support with vendored-CPython library discovery and link
 emission helpers.
+
+Done: vendored CPython shared-library discovery and Cargo link directive emission now live in shared
+build support and are used by all three build scripts.
 
 ### Region And CFG Builder
 
