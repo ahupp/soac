@@ -145,7 +145,14 @@ current `@`. Do not treat another workspace's live `@` as a dependency.
    tooling, document it in `README.md` and add or update the relevant
    note in `AGENTS.md` in the same logical change.
 
-9. Record finalized performance changes.
+9. Keep runtime helper inventory in sync.
+
+   If you add, remove, rename, or move runtime helper functions in
+   `soac-runtime`, `soac-jit/src/jit/specialized_helpers.rs`, or
+   `soac_py/src/soac/runtime.py`, update `docs/RUNTIME_FUNCTIONS.md`
+   in the same logical change.
+
+10. Record finalized performance changes.
 
 When a change is expected to affect performance, validate it with a before/after
 benchmark before treating it as complete. Use the repo benchmark comparison
@@ -168,7 +175,7 @@ workspace to that revision first, for example with `jj edit <rev>`. Use
 `jj new <rev>` only when you intentionally want a fresh child revision and
 benchmark artifacts named for that child rather than the existing revision.
 
-10. Run the full gate before submitting code changes.
+11. Run the full gate before submitting code changes.
 
 Run `just test-all` before submitting unless the change is docs-only,
 such as `TODO.md`, `AGENTS.md`, or similar documentation-only files.
@@ -176,26 +183,26 @@ Put test output in `logs/`. Summarize the failures, separate expected
 failures from unexpected failures, investigate the root cause, report
 it, then fix it.
 
-11. When a logical set of changes is complete, freeze it before
+12. When a logical set of changes is complete, freeze it before
    integrating it.
 
 Run `jj new` so the finished work is no longer the live working commit.
 Rebase and integrate the finished change, not the live `@`.
 
-12. Try to advance `main` directly to the finished head.
+13. Try to advance `main` directly to the finished head.
 
 Prefer `jj bookmark move main -t <finished-head>` when the finished
 change is already a descendant of the current `main`. This avoids
 unnecessary rebases and duplicate sibling revisions.
 
-13. If advancing `main` fails because the finished head is not a
+14. If advancing `main` fails because the finished head is not a
    descendant of `main`, rebase the finished commit or finished stack
    onto `main`.
 
 Use `jj rebase` on the finished revision or stack root so the completed
 work sits directly on top of the current shared base.
 
-14. Resolve any conflicts and rerun the relevant tests.
+15. Resolve any conflicts and rerun the relevant tests.
 
 The rebased change is not ready to advance `main` until conflicts are
 resolved and the relevant checks have been rerun.
@@ -205,7 +212,7 @@ revision, inspect `jj diff --summary <good-rev>..main` and restore the entire
 logical file set before validating. Partial restores can leave the change in an
 internally inconsistent state that compiles or fails for misleading reasons.
 
-15. Advance `main` to the finished head.
+16. Advance `main` to the finished head.
 
 This is the synchronization point. Once `main` moves, the finished work
 becomes the new shared base for future work.
@@ -215,14 +222,14 @@ main", do not stop after the stack is merely based on `main`. After conflict
 resolution and validation, explicitly move `main` to the validated head and
 verify the bookmark in `jj log`.
 
-16. When another agent advances `main`, refresh and continue on top of
+17. When another agent advances `main`, refresh and continue on top of
     it.
 
 Run `jj workspace update-stale` and rebase your live work onto the new
 `main` as needed. Other agents should only depend on `main`, not on a
 peer workspace's live `@`.
 
-17. Report the result: run `jj diff --stat` on the completed change and
+18. Report the result: run `jj diff --stat` on the completed change and
 report its output, then describe the next step. If I did not ask to
 approve each step after the plan, continue with the next step.
 
