@@ -15676,7 +15676,7 @@ fn precompile_codegen_module_to_object_bytes(
                 binding: ElfSymbolBinding::Global,
                 bytes: image.bytes,
                 align: image.align,
-                writable: false,
+                writable: image.writable,
                 relocations: image
                     .relocations
                     .into_iter()

@@ -32,15 +32,17 @@ pub(super) enum RuntimeNameConstantMode {
     BootstrapSoacRuntime,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 enum StaticPyObjectTemplate {
     CompactPyLongI64 { value: i64, digit: RawPyLongDigit },
+    CompactAsciiUnicode { bytes: Vec<u8> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StaticPyObjectImage {
     pub bytes: Vec<u8>,
     pub align: u64,
+    pub writable: bool,
     pub relocations: Vec<StaticPyObjectRelocation>,
 }
 
@@ -64,6 +66,14 @@ struct RawPyLongObject {
     long_value: RawPyLongValue,
 }
 
+#[repr(C)]
+struct RawPyASCIIObject {
+    ob_base: ffi::PyObject,
+    length: ffi::Py_ssize_t,
+    hash: ffi::Py_hash_t,
+    state: u32,
+}
+
 const RAW_PYLONG_SHIFT: u32 = 30;
 const RAW_PYLONG_MASK: i64 = (1_i64 << RAW_PYLONG_SHIFT) - 1;
 const RAW_PYLONG_NON_SIZE_BITS: usize = 3;
@@ -72,6 +82,16 @@ const RAW_PYOBJECT_STATIC_IMMORTAL_FLAGS: i64 = (1 << 2) | (1 << 0);
 const RAW_PYOBJECT_IMMORTAL_INITIAL_REFCNT_64: i64 = 3 << 30;
 const RAW_PYOBJECT_STATIC_IMMORTAL_INITIAL_REFCNT_64: i64 =
     RAW_PYOBJECT_IMMORTAL_INITIAL_REFCNT_64 | (RAW_PYOBJECT_STATIC_IMMORTAL_FLAGS << 48);
+const RAW_PYUNICODE_1BYTE_KIND: u32 = 1;
+const RAW_PYUNICODE_KIND_SHIFT: u32 = 2;
+const RAW_PYUNICODE_COMPACT_SHIFT: u32 = 5;
+const RAW_PYUNICODE_ASCII_SHIFT: u32 = 6;
+const RAW_PYUNICODE_STATICALLY_ALLOCATED_SHIFT: u32 = 7;
+const RAW_PYUNICODE_COMPACT_ASCII_STATE: u32 = (RAW_PYUNICODE_1BYTE_KIND
+    << RAW_PYUNICODE_KIND_SHIFT)
+    | (1 << RAW_PYUNICODE_COMPACT_SHIFT)
+    | (1 << RAW_PYUNICODE_ASCII_SHIFT)
+    | (1 << RAW_PYUNICODE_STATICALLY_ALLOCATED_SHIFT);
 // Keep this conservative until the offline object-image path carries the CPython
 // small-int range as validated build metadata.
 const RAW_PYLONG_SMALL_INT_MAX: i64 = 1024;
@@ -87,24 +107,38 @@ impl StaticPyObjectTemplate {
         })
     }
 
-    fn build_python_constant(self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    fn for_unicode(bytes: &[u8]) -> Option<Self> {
+        if !bytes.is_ascii() {
+            return None;
+        }
+        ffi::Py_ssize_t::try_from(bytes.len()).ok()?;
+        Some(Self::CompactAsciiUnicode {
+            bytes: bytes.to_vec(),
+        })
+    }
+
+    fn build_python_constant(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         if let Some(image) = self.static_object_image() {
             return materialize_static_pyobject_image(py, &image);
         }
         match self {
-            Self::CompactPyLongI64 { value, .. } => build_pylong_i64_fallback(py, value),
+            Self::CompactPyLongI64 { value, .. } => build_pylong_i64_fallback(py, *value),
+            Self::CompactAsciiUnicode { bytes } => build_unicode_constant(py, bytes).map(Py::from),
         }
     }
 
-    fn compact_pylong_lv_tag(self) -> usize {
+    fn compact_pylong_lv_tag(&self) -> usize {
         match self {
             Self::CompactPyLongI64 { .. } => {
                 (1 << RAW_PYLONG_NON_SIZE_BITS) | RAW_PYLONG_SIGN_POSITIVE
             }
+            Self::CompactAsciiUnicode { .. } => {
+                panic!("compact PyLong tag requested for non-PyLong constant")
+            }
         }
     }
 
-    fn static_object_image(self) -> Option<StaticPyObjectImage> {
+    fn static_object_image(&self) -> Option<StaticPyObjectImage> {
         if !cfg!(all(
             target_arch = "x86_64",
             target_endian = "little",
@@ -132,14 +166,49 @@ impl StaticPyObjectTemplate {
                 write_u32(
                     bytes.as_mut_slice(),
                     offset_of!(RawPyLongObject, long_value) + offset_of!(RawPyLongValue, ob_digit),
-                    digit,
+                    *digit,
                 );
                 Some(StaticPyObjectImage {
                     bytes,
                     align: mem::align_of::<RawPyLongObject>() as u64,
+                    writable: false,
                     relocations: vec![StaticPyObjectRelocation {
                         offset: type_offset as u64,
                         symbol: "PyLong_Type",
+                    }],
+                })
+            }
+            Self::CompactAsciiUnicode { bytes: data } => {
+                let len = ffi::Py_ssize_t::try_from(data.len()).ok()?;
+                let object_size = mem::size_of::<RawPyASCIIObject>();
+                let total_size = object_size.checked_add(data.len())?.checked_add(1)?;
+                let mut bytes = vec![0; total_size];
+                write_i64(
+                    bytes.as_mut_slice(),
+                    offset_of!(RawPyASCIIObject, ob_base) + offset_of!(ffi::PyObject, ob_refcnt),
+                    RAW_PYOBJECT_STATIC_IMMORTAL_INITIAL_REFCNT_64,
+                );
+                let type_offset =
+                    offset_of!(RawPyASCIIObject, ob_base) + offset_of!(ffi::PyObject, ob_type);
+                write_py_ssize_t(
+                    bytes.as_mut_slice(),
+                    offset_of!(RawPyASCIIObject, length),
+                    len,
+                );
+                write_py_hash_t(bytes.as_mut_slice(), offset_of!(RawPyASCIIObject, hash), -1);
+                write_u32(
+                    bytes.as_mut_slice(),
+                    offset_of!(RawPyASCIIObject, state),
+                    RAW_PYUNICODE_COMPACT_ASCII_STATE,
+                );
+                bytes[object_size..object_size + data.len()].copy_from_slice(data.as_slice());
+                Some(StaticPyObjectImage {
+                    bytes,
+                    align: mem::align_of::<RawPyASCIIObject>() as u64,
+                    writable: true,
+                    relocations: vec![StaticPyObjectRelocation {
+                        offset: type_offset as u64,
+                        symbol: "PyUnicode_Type",
                     }],
                 })
             }
@@ -152,8 +221,10 @@ pub(super) fn static_pyobject_image(value: &ModuleConstantValue) -> Option<Stati
         ModuleConstantValue::Int(value) => {
             StaticPyObjectTemplate::for_int(*value)?.static_object_image()
         }
-        ModuleConstantValue::Unicode(_)
-        | ModuleConstantValue::Bytes(_)
+        ModuleConstantValue::Unicode(bytes) => {
+            StaticPyObjectTemplate::for_unicode(bytes)?.static_object_image()
+        }
+        ModuleConstantValue::Bytes(_)
         | ModuleConstantValue::BigInt(_)
         | ModuleConstantValue::FloatBits(_)
         | ModuleConstantValue::RuntimeName(_) => None,
@@ -221,6 +292,14 @@ pub(super) fn build_python_constants(
 
 fn write_i64(bytes: &mut [u8], offset: usize, value: i64) {
     bytes[offset..offset + mem::size_of::<i64>()].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_py_ssize_t(bytes: &mut [u8], offset: usize, value: ffi::Py_ssize_t) {
+    bytes[offset..offset + mem::size_of::<ffi::Py_ssize_t>()].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_py_hash_t(bytes: &mut [u8], offset: usize, value: ffi::Py_hash_t) {
+    bytes[offset..offset + mem::size_of::<ffi::Py_hash_t>()].copy_from_slice(&value.to_le_bytes());
 }
 
 fn write_usize(bytes: &mut [u8], offset: usize, value: usize) {
@@ -303,6 +382,7 @@ unsafe fn patch_static_pyobject_image_relocations(
 fn static_pyobject_relocation_value(symbol: &str) -> Result<usize, String> {
     match symbol {
         "PyLong_Type" => Ok(ptr::addr_of_mut!(ffi::PyLong_Type) as usize),
+        "PyUnicode_Type" => Ok(ptr::addr_of_mut!(ffi::PyUnicode_Type) as usize),
         _ => Err(format!(
             "unsupported static PyObject relocation symbol {symbol:?}"
         )),
@@ -696,6 +776,20 @@ mod tests {
     }
 
     #[test]
+    fn static_unicode_template_accepts_only_ascii() {
+        assert_eq!(
+            StaticPyObjectTemplate::for_unicode(b"ascii"),
+            Some(StaticPyObjectTemplate::CompactAsciiUnicode {
+                bytes: b"ascii".to_vec(),
+            })
+        );
+        assert_eq!(
+            StaticPyObjectTemplate::for_unicode("caf\u{e9}".as_bytes()),
+            None
+        );
+    }
+
+    #[test]
     fn build_python_constants_materializes_static_compact_pylong() {
         crate::initialize_test_python();
         Python::attach(|py| {
@@ -737,6 +831,51 @@ mod tests {
     }
 
     #[test]
+    fn materialize_static_compact_ascii_unicode() {
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let image = StaticPyObjectTemplate::for_unicode(b"ascii")
+                .expect("test constant should be static-capable")
+                .static_object_image()
+                .expect("test build should support static Unicode object images");
+            let object = materialize_static_pyobject_image(py, &image)
+                .expect("materializing static Unicode image should succeed");
+            let obj = object.as_ptr();
+
+            unsafe {
+                let mut expected_bytes = image.bytes.clone();
+                patch_static_pyobject_image_relocations(
+                    expected_bytes.as_mut_ptr(),
+                    expected_bytes.len(),
+                    &image.relocations,
+                )
+                .expect("test static image relocations should patch");
+                let actual_bytes =
+                    std::slice::from_raw_parts(obj.cast::<u8>(), expected_bytes.len());
+                assert_eq!(actual_bytes, expected_bytes.as_slice());
+                assert_ne!(ffi::PyUnicode_CheckExact(obj), 0);
+                assert_eq!(ffi::_PyUnicode_CheckConsistency(obj, 1), 1);
+                assert_eq!(ffi::PyUnicode_GET_LENGTH(obj), 5);
+                assert_eq!(ffi::PyUnicode_KIND(obj), ffi::PyUnicode_1BYTE_KIND);
+                let mut utf8_len = 0;
+                let utf8 = ffi::PyUnicode_AsUTF8AndSize(obj, &mut utf8_len);
+                assert!(!utf8.is_null());
+                assert_eq!(utf8_len, 5);
+                assert_eq!(
+                    std::slice::from_raw_parts(utf8.cast::<u8>(), utf8_len as usize),
+                    b"ascii"
+                );
+
+                let raw = &*(obj.cast::<RawPyASCIIObject>());
+                assert_eq!(raw.hash, -1);
+                let hash = ffi::PyObject_Hash(obj);
+                assert_ne!(hash, -1);
+                assert_eq!((&*(obj.cast::<RawPyASCIIObject>())).hash, hash);
+            }
+        });
+    }
+
+    #[test]
     fn build_python_constants_uses_static_resolver_for_static_pylong() {
         crate::initialize_test_python();
         Python::attach(|py| {
@@ -773,6 +912,7 @@ mod tests {
 
         assert_eq!(image.bytes.len(), mem::size_of::<RawPyLongObject>());
         assert_eq!(image.align, mem::align_of::<RawPyLongObject>() as u64);
+        assert!(!image.writable);
         assert_eq!(
             image.relocations,
             vec![StaticPyObjectRelocation {
@@ -809,6 +949,71 @@ mod tests {
                     .expect("digit slice should have u32 width")
             ),
             12345
+        );
+    }
+
+    #[test]
+    fn static_compact_ascii_unicode_image_matches_raw_layout() {
+        let image = StaticPyObjectTemplate::for_unicode(b"ascii")
+            .expect("test constant should be static-capable")
+            .static_object_image()
+            .expect("test build should support static Unicode object images");
+        let type_offset =
+            offset_of!(RawPyASCIIObject, ob_base) + offset_of!(ffi::PyObject, ob_type);
+        let length_offset = offset_of!(RawPyASCIIObject, length);
+        let hash_offset = offset_of!(RawPyASCIIObject, hash);
+        let state_offset = offset_of!(RawPyASCIIObject, state);
+        let data_offset = mem::size_of::<RawPyASCIIObject>();
+
+        assert_eq!(image.bytes.len(), data_offset + b"ascii".len() + 1);
+        assert_eq!(image.align, mem::align_of::<RawPyASCIIObject>() as u64);
+        assert!(image.writable);
+        assert_eq!(
+            image.relocations,
+            vec![StaticPyObjectRelocation {
+                offset: type_offset as u64,
+                symbol: "PyUnicode_Type",
+            }]
+        );
+        assert_eq!(
+            i64::from_le_bytes(
+                image.bytes[offset_of!(RawPyASCIIObject, ob_base)
+                    + offset_of!(ffi::PyObject, ob_refcnt)
+                    ..offset_of!(RawPyASCIIObject, ob_base)
+                        + offset_of!(ffi::PyObject, ob_refcnt)
+                        + mem::size_of::<i64>()]
+                    .try_into()
+                    .expect("refcount slice should have i64 width")
+            ),
+            RAW_PYOBJECT_STATIC_IMMORTAL_INITIAL_REFCNT_64
+        );
+        assert_eq!(
+            ffi::Py_ssize_t::from_le_bytes(
+                image.bytes[length_offset..length_offset + mem::size_of::<ffi::Py_ssize_t>()]
+                    .try_into()
+                    .expect("length slice should have Py_ssize_t width")
+            ),
+            5
+        );
+        assert_eq!(
+            ffi::Py_hash_t::from_le_bytes(
+                image.bytes[hash_offset..hash_offset + mem::size_of::<ffi::Py_hash_t>()]
+                    .try_into()
+                    .expect("hash slice should have Py_hash_t width")
+            ),
+            -1
+        );
+        assert_eq!(
+            u32::from_le_bytes(
+                image.bytes[state_offset..state_offset + mem::size_of::<u32>()]
+                    .try_into()
+                    .expect("state slice should have u32 width")
+            ),
+            RAW_PYUNICODE_COMPACT_ASCII_STATE
+        );
+        assert_eq!(
+            &image.bytes[data_offset..data_offset + b"ascii".len() + 1],
+            b"ascii\0"
         );
     }
 }

@@ -746,6 +746,45 @@ def get_value():
     }
 
     #[test]
+    fn precompile_codegen_module_emits_static_compact_ascii_unicode_in_data() {
+        let module_name = "precompile_static_ascii";
+        let source_hash = 0x6789;
+        let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+            r#"
+def get_value():
+    return "ascii-value"
+"#,
+        )
+        .expect("lowering precompile static ASCII source should succeed")
+        .codegen_module;
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&lowered);
+        let constant_id = module_constants.require_unicode_constant_id("ascii-value");
+        let symbol_prefix =
+            module_constant_symbol_prefix_for_module_identity(module_name, source_hash);
+        let constant_symbol = module_constant_object_symbol(symbol_prefix.as_str(), constant_id);
+
+        let object =
+            precompile_codegen_module_to_object_bytes(module_name, source_hash, &lowered, None)
+                .expect("precompile should emit object bytes");
+
+        assert!(
+            object
+                .data_symbol_writable
+                .iter()
+                .any(|(symbol, writable)| symbol == &constant_symbol && *writable),
+            "static compact ASCII Unicode constants should be emitted as writable object data"
+        );
+        assert!(
+            object
+                .object
+                .windows(b".rela.data".len())
+                .any(|window| window == b".rela.data"),
+            "static Unicode object data should carry a writable-data relocation for PyUnicode_Type"
+        );
+    }
+
+    #[test]
     fn stored_local_binding_facts_only_require_checks_for_unbound_values() {
         assert_eq!(
             local_binding_facts_for_stored_value(LocalRefKind::Owned),
