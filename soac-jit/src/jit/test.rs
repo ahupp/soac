@@ -2624,6 +2624,7 @@ def f():
                 &session,
                 first.function_id,
                 1usize as *const u8,
+                1usize as *const u8,
                 first.params.len(),
             )
             .expect("first function should mark ready");
@@ -3455,7 +3456,7 @@ def write_point(point, value):
                 )
             }
             .expect("specialized write_point should compile");
-            let (code_ptr, param_count) = compiled_handle
+            let (code_ptr, _default_code_ptr, param_count) = compiled_handle
                 .handle
                 .direct_runner_info()
                 .expect("compiled direct runner should expose entrypoint");
@@ -3753,7 +3754,7 @@ class Record:
                 )
             }
             .expect("specialized Record.__init__ should compile");
-            let (code_ptr, param_count) = compiled_handle
+            let (code_ptr, _default_code_ptr, param_count) = compiled_handle
                 .handle
                 .direct_runner_info()
                 .expect("compiled direct runner should expose entrypoint");
@@ -4024,7 +4025,7 @@ def read_point(point):
                 )
             }
             .expect("specialized read_point should compile");
-            let (code_ptr, param_count) = compiled_handle
+            let (code_ptr, _default_code_ptr, param_count) = compiled_handle
                 .handle
                 .direct_runner_info()
                 .expect("compiled direct runner should expose entrypoint");
@@ -5381,7 +5382,7 @@ def f():
                     Some(shared_state.as_ref()),
                 )
                 .expect("direct counter test function should compile");
-                let (code_ptr, param_count) = compiled_handle
+                let (code_ptr, _default_code_ptr, param_count) = compiled_handle
                     .handle
                     .direct_runner_info()
                     .expect("compiled direct runner should expose entrypoint");

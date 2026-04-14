@@ -5,6 +5,32 @@ import os
 import subprocess
 import sys
 
+import pytest
+
+from tests._integration import soac_module
+
+
+def test_vectorcall_wrong_arity_is_checked_before_direct_entry(tmp_path):
+    source = """
+def add(a, b):
+    return a + b
+
+def missing():
+    return add(1)
+
+def extra():
+    return add(1, 2, 3)
+"""
+
+    with soac_module(tmp_path, "direct_entry_wrong_arity_case", source) as module:
+        with pytest.raises(TypeError, match="add\\(\\) missing required argument 'b'"):
+            module.missing()
+        with pytest.raises(
+            TypeError,
+            match="add\\(\\) takes 2 positional arguments but 3 were given",
+        ):
+            module.extra()
+
 
 def _run_soac_module(tmp_path, module_name: str, env: dict[str, str]) -> None:
     script = f"""

@@ -656,3 +656,21 @@ benchmarked throughput delta, and the headline pre/post numbers.
   - specialized pass, 1M loops x3: `443631`, `436627`, `436614 loops/s`
   - pystone JIT code bytes: `252190`
   - pystone machine blocks: `17216`
+
+## 2026-04-14 - Split default-resolving direct calls
+
+- jj change id: `rrvownsp`
+- summary: Core direct-call JIT entries now assume formal argument slots are
+  already well-formed, while vectorcall/defaulted direct edges use a separate
+  default-resolving adapter that preserves dynamic `__defaults__` /
+  `__kwdefaults__` updates.
+- throughput: `+0.45%` specialized pystone median; code size `-0.16%`;
+  machine blocks `-1.19%`
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `438783`, `436726`, `436053 loops/s`
+  - pystone JIT code bytes: `252190`
+  - pystone machine blocks: `17216`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `438677`, `436415`, `441002 loops/s`
+  - pystone JIT code bytes: `251784`
+  - pystone machine blocks: `17011`

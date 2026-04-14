@@ -86,9 +86,9 @@ pub use planning::{
     render_jit_module_locals,
 };
 use runtime_context::{
-    FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET, FUNCTION_ENV_GLOBALS_OBJ_OFFSET,
-    FUNCTION_ENV_RUNTIME_OBJECTS_OFFSET, PY_FUNCTION_JIT_EXTRA_FUNCTION_ENV_OFFSET,
-    PY_THREAD_STATE_CURRENT_EXCEPTION_OFFSET,
+    FUNCTION_ENV_DEFAULT_DIRECT_CODE_PTR_OFFSET, FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET,
+    FUNCTION_ENV_GLOBALS_OBJ_OFFSET, FUNCTION_ENV_RUNTIME_OBJECTS_OFFSET,
+    PY_FUNCTION_JIT_EXTRA_FUNCTION_ENV_OFFSET, PY_THREAD_STATE_CURRENT_EXCEPTION_OFFSET,
 };
 pub use runtime_context::{ModuleJitContext, ModuleRuntimeContext};
 pub use specialized_helpers::ObjPtr;
@@ -702,6 +702,8 @@ static DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT: ImportSpec = ImportSpec::new(
 );
 static DP_JIT_RAISE_DELETED_NAME_ERROR_IMPORT: ImportSpec =
     ImportSpec::new("dp_jit_raise_deleted_name_error", &[SigType::Pointer], &[]);
+static DP_JIT_RAISE_MISSING_REQUIRED_ARGUMENT_IMPORT: ImportSpec =
+    ImportSpec::new("dp_jit_raise_missing_required_argument", &[], &[]);
 static DP_JIT_MAKE_CELL_IMPORT: ImportSpec =
     ImportSpec::new("dp_jit_make_cell", &[SigType::Pointer], &[SigType::Pointer]);
 static DP_JIT_LOAD_CELL_IMPORT: ImportSpec =
@@ -865,6 +867,8 @@ struct BuiltSpecializedFunction {
     ctx: cranelift_codegen::Context,
     main_id: cranelift_module::FuncId,
     main_symbol: String,
+    default_adapter_id: Option<cranelift_module::FuncId>,
+    default_adapter_symbol: Option<String>,
     import_id_to_symbol: HashMap<u32, &'static str>,
     block_annotations: ClifBlockDisplayAnnotations,
 }
@@ -872,7 +876,9 @@ struct BuiltSpecializedFunction {
 #[derive(Clone)]
 struct DeclaredJitFunction {
     func_id: FuncId,
+    default_func_id: Option<FuncId>,
     symbol: String,
+    default_symbol: Option<String>,
 }
 
 struct DefinedJitFunction {
@@ -881,8 +887,11 @@ struct DefinedJitFunction {
     param_count: usize,
     main_id: FuncId,
     main_symbol: String,
+    default_adapter_id: Option<FuncId>,
+    default_adapter_symbol: Option<String>,
     stats: JitCodegenStats,
     artifact: DefinedFunctionArtifact,
+    default_adapter_artifact: Option<DefinedFunctionArtifact>,
 }
 
 struct ProcessJitBatchFunction<'a> {
@@ -1156,6 +1165,7 @@ impl ProcessJitState {
         session: &Arc<crate::session::CompileSession>,
         function_id: FunctionId,
         code_ptr: *const u8,
+        default_code_ptr: *const u8,
         param_count: usize,
     ) -> Result<Arc<CompiledFunctionHandle>, String> {
         let Some(entry) = self.direct_functions.get(&function_id) else {
@@ -1168,6 +1178,7 @@ impl ProcessJitState {
         let compiled_handle = Arc::new(CompiledFunctionHandle::from_direct_entry(
             session,
             code_ptr,
+            default_code_ptr,
             param_count,
         ));
         self.direct_functions.insert(
@@ -1217,20 +1228,30 @@ impl CompiledFunctionHandle {
     fn from_direct_entry(
         session: &Arc<crate::session::CompileSession>,
         code_ptr: *const u8,
+        default_code_ptr: *const u8,
         param_count: usize,
     ) -> Self {
         Self {
-            handle: new_compiled_direct_runner_handle(session, code_ptr, param_count),
+            handle: new_compiled_direct_runner_handle(
+                session,
+                code_ptr,
+                default_code_ptr,
+                param_count,
+            ),
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn direct_runner_info(&self) -> Result<(*const u8, usize), String> {
+    pub(crate) fn direct_runner_info(&self) -> Result<(*const u8, *const u8, usize), String> {
         compiled_direct_runner_info(self.handle)
     }
 
     pub(crate) fn direct_code_ptr(&self) -> Result<ObjPtr, String> {
         compiled_direct_code_ptr(self.handle)
+    }
+
+    pub(crate) fn default_direct_code_ptr(&self) -> Result<ObjPtr, String> {
+        compiled_default_direct_code_ptr(self.handle)
     }
 }
 
@@ -1247,6 +1268,7 @@ pub type VectorcallEntryFn = unsafe extern "C" fn(ObjPtr, *const ObjPtr, usize, 
 enum CompiledRunnerEntry {
     Direct {
         code_ptr: *const u8,
+        default_code_ptr: *const u8,
         param_count: usize,
     },
 }
@@ -1254,12 +1276,14 @@ enum CompiledRunnerEntry {
 fn new_compiled_direct_runner_handle(
     session: &Arc<crate::session::CompileSession>,
     code_ptr: *const u8,
+    default_code_ptr: *const u8,
     param_count: usize,
 ) -> ObjPtr {
     Box::into_raw(Box::new(CompiledSpecializedRunner {
         _session: Arc::clone(session),
         entry: Some(CompiledRunnerEntry::Direct {
             code_ptr,
+            default_code_ptr,
             param_count,
         }),
     })) as ObjPtr
@@ -2341,6 +2365,12 @@ impl DirectCallArgPlan {
     fn len(&self) -> usize {
         self.sources.len()
     }
+
+    fn requires_default_resolving_entry(&self) -> bool {
+        self.sources
+            .iter()
+            .any(|source| matches!(source, DirectCallArgSource::DefaultSentinel))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2356,6 +2386,12 @@ enum DirectCallIncompatibility {
     UnsupportedParameterKind { kind: ParamKind },
     MissingRequiredArgument,
     TooManyPositionalArguments { provided: usize, accepted: usize },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectCallEntryKind {
+    Core,
+    DefaultResolving,
 }
 
 #[derive(Default)]
@@ -2548,6 +2584,33 @@ fn plan_direct_call_args_for_target(
     }
     debug_assert_eq!(next_provided_arg, provided_positional_arg_count);
     Ok(DirectCallArgPlan { sources })
+}
+
+fn function_has_default_resolving_direct_entry(
+    function: &BlockPyFunction<CodegenModuleShape>,
+) -> bool {
+    // The adapter is also needed for parameters without source defaults:
+    // __defaults__ / __kwdefaults__ can be assigned after function creation.
+    function.params.iter().any(|param| {
+        matches!(
+            param.kind,
+            ParamKind::PosOnly | ParamKind::Any | ParamKind::KwOnly
+        )
+    })
+}
+
+fn param_runtime_default_slot(
+    layout: &FunctionRuntimeDataLayout,
+    param: &soac_blockpy::block_py::Param,
+    param_index: usize,
+) -> Option<usize> {
+    match param.kind {
+        ParamKind::PosOnly | ParamKind::Any => {
+            layout.positional_default_slot_for_param_index(param_index)
+        }
+        ParamKind::KwOnly => layout.kwonly_default_slot(&param.name),
+        ParamKind::VarArg | ParamKind::KwArg => None,
+    }
 }
 
 fn validate_direct_call_compatibility(
@@ -4754,35 +4817,6 @@ fn emit_function_data_slot_borrowed(
         .expect("function runtime object slot offset should fit in i32");
     fb.ins()
         .load(ptr_ty, ir::MemFlags::trusted(), function_data, offset)
-}
-
-fn emit_function_data_slot_owned_or_null(
-    fb: &mut FunctionBuilder<'_>,
-    function_data: ir::Value,
-    slot: usize,
-    ptr_ty: ir::Type,
-    incref_ref: ir::FuncRef,
-) -> ir::Value {
-    let null_ptr = fb.ins().iconst(ptr_ty, 0);
-    let borrowed = emit_function_data_slot_borrowed(fb, function_data, slot, ptr_ty);
-    let is_null = fb
-        .ins()
-        .icmp(ir::condcodes::IntCC::Equal, borrowed, null_ptr);
-    let null_block = fb.create_block();
-    let owned_block = fb.create_block();
-    let done_block = fb.create_block();
-    fb.append_block_param(done_block, ptr_ty);
-    fb.ins().brif(is_null, null_block, &[], owned_block, &[]);
-
-    fb.switch_to_block(null_block);
-    fb.ins().jump(done_block, &[ir::BlockArg::Value(null_ptr)]);
-
-    fb.switch_to_block(owned_block);
-    fb.ins().call(incref_ref, &[borrowed]);
-    fb.ins().jump(done_block, &[ir::BlockArg::Value(borrowed)]);
-
-    fb.switch_to_block(done_block);
-    fb.block_params(done_block)[0]
 }
 
 fn emit_pack_current_values_tuple(
@@ -7109,6 +7143,7 @@ fn emit_direct_call_resolved_raw_with_arg_values(
     callable_is_borrowed: bool,
     arg_values: Vec<ir::Value>,
     arg_borrowed: Vec<bool>,
+    entry_kind: DirectCallEntryKind,
     target_function: &BlockPyFunction<CodegenModuleShape>,
     ctx: &JitEmitCtx<'_>,
     jit_module: &mut JITModule,
@@ -7156,18 +7191,19 @@ fn emit_direct_call_resolved_raw_with_arg_values(
     let call_inst = if let Some(direct_func_id) = ctx
         .direct_call_functions
         .get(&target_function.function_id)
-        .map(|function| function.func_id)
-    {
+        .and_then(|function| match entry_kind {
+            DirectCallEntryKind::Core => Some(function.func_id),
+            DirectCallEntryKind::DefaultResolving => function.default_func_id,
+        }) {
         let func_ref = jit_module.declare_func_in_func(direct_func_id, &mut fb.func);
         fb.ins().call(func_ref, &call_args)
     } else {
         ctx.direct_edge_stats.record_function_env_indirect_edge();
-        let callee_ptr = load_function_env_obj(
-            fb,
-            ptr_ty,
-            function_env,
-            FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET,
-        );
+        let offset = match entry_kind {
+            DirectCallEntryKind::Core => FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET,
+            DirectCallEntryKind::DefaultResolving => FUNCTION_ENV_DEFAULT_DIRECT_CODE_PTR_OFFSET,
+        };
+        let callee_ptr = load_function_env_obj(fb, ptr_ty, function_env, offset);
         let direct_sig =
             fb.import_signature(make_direct_function_signature(jit_module, target_function));
         fb.ins().call_indirect(direct_sig, callee_ptr, &call_args)
@@ -7192,6 +7228,7 @@ fn emit_direct_call_resolved_with_arg_values(
     callable_is_borrowed: bool,
     arg_values: Vec<ir::Value>,
     arg_borrowed: Vec<bool>,
+    entry_kind: DirectCallEntryKind,
     target_function: &BlockPyFunction<CodegenModuleShape>,
     ctx: &JitEmitCtx<'_>,
     jit_module: &mut JITModule,
@@ -7204,6 +7241,7 @@ fn emit_direct_call_resolved_with_arg_values(
         callable_is_borrowed,
         arg_values,
         arg_borrowed,
+        entry_kind,
         target_function,
         ctx,
         jit_module,
@@ -7296,6 +7334,11 @@ fn emit_direct_constructor_resolved_with_arg_values(
         true,
         init_arg_values,
         init_arg_borrowed,
+        if specialization.arg_plan.requires_default_resolving_entry() {
+            DirectCallEntryKind::DefaultResolving
+        } else {
+            DirectCallEntryKind::Core
+        },
         target_function,
         ctx,
         jit_module,
@@ -7414,6 +7457,11 @@ fn emit_direct_call_resolved_with_arg_plan_from_local_env(
         callable_is_borrowed,
         arg_values,
         arg_borrowed,
+        if arg_plan.requires_default_resolving_entry() {
+            DirectCallEntryKind::DefaultResolving
+        } else {
+            DirectCallEntryKind::Core
+        },
         target_function,
         ctx,
         jit_module,
@@ -7513,6 +7561,11 @@ fn emit_direct_method_resolved_with_args_from_local_env(
         true,
         arg_values,
         arg_borrowed,
+        if specialization.arg_plan.requires_default_resolving_entry() {
+            DirectCallEntryKind::DefaultResolving
+        } else {
+            DirectCallEntryKind::Core
+        },
         target_function,
         ctx,
         jit_module,
@@ -12032,6 +12085,8 @@ impl ProcessJitEngine {
             let mut ctx = built.ctx;
             let main_id = built.main_id;
             let main_symbol = built.main_symbol;
+            let default_adapter_id = built.default_adapter_id;
+            let default_adapter_symbol = built.default_adapter_symbol;
             let clif_block_count = ctx.func.layout.blocks().count();
             let clif_inst_count = ctx.func.dfg.num_insts();
             let function_name =
@@ -12050,12 +12105,55 @@ impl ProcessJitEngine {
                 )
             })?;
             state.jit_module.clear_context(&mut ctx);
+            let default_adapter_artifact = match (
+                default_adapter_id,
+                default_adapter_symbol.as_ref(),
+            ) {
+                (Some(default_adapter_id), Some(default_adapter_symbol)) => {
+                    let mut default_ctx = build_default_resolving_direct_adapter(
+                        &mut state.jit_module,
+                        function,
+                        main_id,
+                        default_adapter_id,
+                    )
+                    .map_err(|err| {
+                        format!(
+                            "{err} [default-adapter function={} id={}]",
+                            function.names.qualname, function.function_id
+                        )
+                    })?;
+                    let artifact = define_prepared_function(
+                        &mut state.jit_module,
+                        default_adapter_id,
+                        &mut default_ctx,
+                        default_adapter_symbol.as_str(),
+                        "failed to define default-resolving direct adapter",
+                    )
+                    .map_err(|err| {
+                        format!(
+                            "{err} [default-adapter function={} id={}]",
+                            function.names.qualname, function.function_id
+                        )
+                    })?;
+                    state.jit_module.clear_context(&mut default_ctx);
+                    Some(artifact)
+                }
+                (None, None) => None,
+                _ => {
+                    return Err(format!(
+                        "default direct adapter declaration is inconsistent for function {} id={}",
+                        function.names.qualname, function.function_id
+                    ));
+                }
+            };
             defined_functions.push(DefinedJitFunction {
                 function_id: function.function_id,
                 function_qualname: function.names.qualname.clone(),
                 param_count: function.params.len(),
                 main_id,
                 main_symbol,
+                default_adapter_id,
+                default_adapter_symbol,
                 stats: JitCodegenStats {
                     clif_block_count,
                     clif_inst_count,
@@ -12064,6 +12162,7 @@ impl ProcessJitEngine {
                     machine_code_edge_count: artifact.code_bb_edges.len(),
                 },
                 artifact,
+                default_adapter_artifact,
             });
         }
 
@@ -12075,10 +12174,17 @@ impl ProcessJitEngine {
         let mut root_stats = None;
         for defined in defined_functions {
             let code_ptr = state.jit_module.get_finalized_function(defined.main_id);
+            let default_code_ptr = defined
+                .default_adapter_id
+                .map(|default_adapter_id| {
+                    state.jit_module.get_finalized_function(default_adapter_id)
+                })
+                .unwrap_or(code_ptr);
             let compiled_handle = state.mark_direct_function_ready(
                 session,
                 defined.function_id,
                 code_ptr,
+                default_code_ptr,
                 defined.param_count,
             )?;
             let code_id = jitdump::record_code_load(
@@ -12094,7 +12200,34 @@ impl ProcessJitEngine {
                 &defined.artifact,
                 defined.function_id,
                 &defined.function_qualname,
+                "direct_function_body",
             );
+            if let (
+                Some(default_adapter_id),
+                Some(default_adapter_symbol),
+                Some(default_adapter_artifact),
+            ) = (
+                defined.default_adapter_id,
+                defined.default_adapter_symbol.as_ref(),
+                defined.default_adapter_artifact.as_ref(),
+            ) {
+                let default_code_ptr = state.jit_module.get_finalized_function(default_adapter_id);
+                let code_id = jitdump::record_code_load(
+                    default_adapter_symbol,
+                    default_code_ptr.cast::<u8>(),
+                    default_adapter_artifact.code_size,
+                    state.jit_module.isa(),
+                    default_adapter_artifact.systemv_unwind_info.as_ref(),
+                )?;
+                record_jit_bb_map(
+                    default_adapter_symbol,
+                    code_id,
+                    default_adapter_artifact,
+                    defined.function_id,
+                    &defined.function_qualname,
+                    "default_direct_adapter",
+                );
+            }
             if defined.function_id == function.function_id {
                 root_handle = Some(compiled_handle);
                 root_stats = Some(defined.stats);
@@ -12583,6 +12716,7 @@ fn record_jit_bb_map(
     artifact: &DefinedFunctionArtifact,
     function_id: FunctionId,
     function_qualname: &str,
+    entry_kind: &str,
 ) {
     let Some(dir) = soac_work_dir_from_env() else {
         return;
@@ -12595,6 +12729,7 @@ fn record_jit_bb_map(
         "code_size": artifact.code_size,
         "function_id": format!("{function_id}"),
         "function_qualname": function_qualname,
+        "entry_kind": entry_kind,
         "bb_offsets": &artifact.code_bb_offsets,
         "bb_edges": &artifact.code_bb_edges,
     });
@@ -12805,6 +12940,17 @@ fn direct_function_symbol(
     scoped_jit_symbol(&base, symbol_scope)
 }
 
+fn default_direct_function_symbol(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    symbol_scope: Option<&str>,
+) -> String {
+    let base = format!(
+        "{}:defaults",
+        jit_python_perf_symbol_name(JIT_PYTHON_PERF_SYMBOL_KIND_DIRECT, &function.names.qualname)
+    );
+    scoped_jit_symbol(&base, symbol_scope)
+}
+
 fn direct_function_symbol_scope(function_id: FunctionId, symbol_id: u64) -> String {
     format!("fn_{}_{}", function_id.packed(), symbol_id)
 }
@@ -12846,7 +12992,150 @@ fn declare_direct_function(
     let sig = make_direct_function_signature(jit_module, function);
     let symbol = direct_function_symbol(function, symbol_scope);
     let func_id = declare_local_fn(jit_module, &symbol, &sig)?;
-    Ok((sig, DeclaredJitFunction { func_id, symbol }))
+    let (default_func_id, default_symbol) = if function_has_default_resolving_direct_entry(function)
+    {
+        let default_symbol = default_direct_function_symbol(function, symbol_scope);
+        (
+            Some(declare_local_fn(jit_module, &default_symbol, &sig)?),
+            Some(default_symbol),
+        )
+    } else {
+        (None, None)
+    };
+    Ok((
+        sig,
+        DeclaredJitFunction {
+            func_id,
+            default_func_id,
+            symbol,
+            default_symbol,
+        },
+    ))
+}
+
+fn build_default_resolving_direct_adapter(
+    jit_module: &mut JITModule,
+    function: &BlockPyFunction<CodegenModuleShape>,
+    core_func_id: FuncId,
+    adapter_func_id: FuncId,
+) -> Result<cranelift_codegen::Context, String> {
+    let ptr_ty = jit_module.target_config().pointer_type();
+    let runtime_layout = FunctionRuntimeDataLayout::from_function(function);
+    let mut module_imports = ModuleFuncImports::new();
+    let mut ctx = jit_module.make_context();
+    ctx.func.signature = make_direct_function_signature(jit_module, function);
+    let mut builder_ctx = FunctionBuilderContext::new();
+    {
+        let mut fb = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+        let entry_block = fb.create_block();
+        fb.append_block_params_for_function_params(entry_block);
+        fb.switch_to_block(entry_block);
+        fb.seal_block(entry_block);
+
+        let entry_params = fb.block_params(entry_block).to_vec();
+        let function_env_value = entry_params[0];
+        let thread_state_value = entry_params[1];
+        let direct_entry_args = &entry_params[2..];
+        let function_data_value = fb.ins().iadd_imm(
+            function_env_value,
+            i64::from(FUNCTION_ENV_RUNTIME_OBJECTS_OFFSET),
+        );
+        let null_ptr = fb.ins().iconst(ptr_ty, 0);
+        let raise_missing_ref = FuncBuildImports::new(&mut module_imports).get_or_panic(
+            jit_module,
+            &mut fb.func,
+            &DP_JIT_RAISE_MISSING_REQUIRED_ARGUMENT_IMPORT,
+        );
+        let missing_block = fb.create_block();
+        let call_core_block = fb.create_block();
+        for _ in function.params.iter() {
+            fb.append_block_param(call_core_block, ptr_ty);
+        }
+
+        let mut selected_args = Vec::with_capacity(function.params.len());
+        for (param_index, (param, arg_value)) in function
+            .params
+            .iter()
+            .zip(direct_entry_args.iter().copied())
+            .enumerate()
+        {
+            let Some(default_slot) =
+                param_runtime_default_slot(&runtime_layout, param, param_index)
+            else {
+                let is_missing = fb
+                    .ins()
+                    .icmp(ir::condcodes::IntCC::Equal, arg_value, null_ptr);
+                let present_block = fb.create_block();
+                fb.ins()
+                    .brif(is_missing, missing_block, &[], present_block, &[]);
+                fb.switch_to_block(present_block);
+                selected_args.push(arg_value);
+                continue;
+            };
+
+            let is_missing = fb
+                .ins()
+                .icmp(ir::condcodes::IntCC::Equal, arg_value, null_ptr);
+            let use_default_block = fb.create_block();
+            let use_arg_block = fb.create_block();
+            let after_block = fb.create_block();
+            fb.append_block_param(after_block, ptr_ty);
+            fb.ins()
+                .brif(is_missing, use_default_block, &[], use_arg_block, &[]);
+
+            fb.switch_to_block(use_default_block);
+            let default_value = emit_function_data_slot_borrowed(
+                &mut fb,
+                function_data_value,
+                default_slot,
+                ptr_ty,
+            );
+            let default_is_missing =
+                fb.ins()
+                    .icmp(ir::condcodes::IntCC::Equal, default_value, null_ptr);
+            let default_ok_block = fb.create_block();
+            fb.ins().brif(
+                default_is_missing,
+                missing_block,
+                &[],
+                default_ok_block,
+                &[],
+            );
+            fb.switch_to_block(default_ok_block);
+            fb.ins()
+                .jump(after_block, &[ir::BlockArg::Value(default_value)]);
+
+            fb.switch_to_block(use_arg_block);
+            fb.ins()
+                .jump(after_block, &[ir::BlockArg::Value(arg_value)]);
+
+            fb.switch_to_block(after_block);
+            selected_args.push(fb.block_params(after_block)[0]);
+        }
+        fb.ins()
+            .jump(call_core_block, &block_arg_values(&selected_args));
+        fb.seal_block(call_core_block);
+
+        fb.switch_to_block(call_core_block);
+        let mut call_args = Vec::with_capacity(function.params.len() + 2);
+        call_args.push(function_env_value);
+        call_args.push(thread_state_value);
+        call_args.extend(fb.block_params(call_core_block).iter().copied());
+        let core_func_ref = jit_module.declare_func_in_func(core_func_id, &mut fb.func);
+        let call_inst = fb.ins().call(core_func_ref, &call_args);
+        let result = fb.inst_results(call_inst)[0];
+        fb.ins().return_(&[result]);
+
+        fb.seal_block(missing_block);
+        fb.switch_to_block(missing_block);
+        fb.ins().call(raise_missing_ref, &[]);
+        fb.ins().return_(&[null_ptr]);
+
+        fb.seal_all_blocks();
+        fb.finalize();
+    }
+    let _ = adapter_func_id;
+    Ok(ctx)
 }
 
 fn scoped_jit_symbol(base: &str, symbol_scope: Option<&str>) -> String {
@@ -13624,19 +13913,28 @@ fn build_cranelift_run_bb_specialized_function(
     let i64_ty = ir::types::I64;
     let mut module_imports = ModuleFuncImports::new();
 
-    let (main_sig, main_id, main_symbol) = match predeclared_direct_functions
-        .and_then(|functions| functions.get(&function.function_id))
-    {
-        Some(declared) => (
-            make_direct_function_signature(jit_module, function),
-            declared.func_id,
-            declared.symbol.clone(),
-        ),
-        None => {
-            let (sig, declared) = declare_direct_function(jit_module, function, symbol_scope)?;
-            (sig, declared.func_id, declared.symbol)
-        }
-    };
+    let (main_sig, main_id, main_symbol, default_adapter_id, default_adapter_symbol) =
+        match predeclared_direct_functions
+            .and_then(|functions| functions.get(&function.function_id))
+        {
+            Some(declared) => (
+                make_direct_function_signature(jit_module, function),
+                declared.func_id,
+                declared.symbol.clone(),
+                declared.default_func_id,
+                declared.default_symbol.clone(),
+            ),
+            None => {
+                let (sig, declared) = declare_direct_function(jit_module, function, symbol_scope)?;
+                (
+                    sig,
+                    declared.func_id,
+                    declared.symbol,
+                    declared.default_func_id,
+                    declared.default_symbol,
+                )
+            }
+        };
     let counted_refcount_helpers = build_counted_runtime_refcount_helpers(
         jit_module,
         function,
@@ -13971,75 +14269,11 @@ fn build_cranelift_run_bb_specialized_function(
             })
             .collect::<HashSet<_>>();
         let mut entry_param_values = HashMap::new();
-        for (param_index, (param, value)) in function
-            .params
-            .iter()
-            .zip(direct_entry_args.iter())
-            .enumerate()
-        {
+        for (param, value) in function.params.iter().zip(direct_entry_args.iter()) {
             let needs_runtime_arg = entry_runtime_param_names.contains(param.name.as_str());
             let needs_stack_seed = entry_stack_seed_param_names.contains(param.name.as_str());
             let needs_owned_value = needs_runtime_arg || needs_stack_seed;
-            let default_slot = match param.kind {
-                ParamKind::PosOnly | ParamKind::Any => function_runtime_data_layout
-                    .positional_default_slot_for_param_index(param_index),
-                ParamKind::KwOnly => function_runtime_data_layout.kwonly_default_slot(&param.name),
-                ParamKind::VarArg | ParamKind::KwArg => None,
-            };
-
-            let selected_value = if let Some(default_slot) = default_slot {
-                let arg_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, *value, null_ptr);
-                let use_default_block = fb.create_block();
-                let use_arg_block = fb.create_block();
-                let after_block = fb.create_block();
-                if needs_owned_value {
-                    fb.append_block_param(after_block, ptr_ty);
-                }
-                fb.ins()
-                    .brif(arg_is_null, use_default_block, &[], use_arg_block, &[]);
-
-                fb.switch_to_block(use_default_block);
-                let default_value = emit_function_data_slot_owned_or_null(
-                    &mut fb,
-                    function_data_value,
-                    default_slot,
-                    ptr_ty,
-                    incref_ref,
-                );
-                let default_is_null =
-                    fb.ins()
-                        .icmp(ir::condcodes::IntCC::Equal, default_value, null_ptr);
-                let default_ok_block = fb.create_block();
-                fb.append_block_param(default_ok_block, ptr_ty);
-                fb.ins().brif(
-                    default_is_null,
-                    entry_failure_block,
-                    &block_arg_values(&entry_failure_args),
-                    default_ok_block,
-                    &[ir::BlockArg::Value(default_value)],
-                );
-                fb.switch_to_block(default_ok_block);
-                let default_value = fb.block_params(default_ok_block)[0];
-                if needs_owned_value {
-                    fb.ins()
-                        .jump(after_block, &[ir::BlockArg::Value(default_value)]);
-                } else {
-                    fb.ins()
-                        .call(decref_ref, &[thread_state_value, default_value]);
-                    fb.ins().jump(after_block, &[]);
-                }
-
-                fb.switch_to_block(use_arg_block);
-                if needs_owned_value {
-                    emit_incref_if_not_null(&mut fb, ptr_ty, incref_ref, *value);
-                    fb.ins().jump(after_block, &[ir::BlockArg::Value(*value)]);
-                } else {
-                    fb.ins().jump(after_block, &[]);
-                }
-
-                fb.switch_to_block(after_block);
-                needs_owned_value.then(|| fb.block_params(after_block)[0])
-            } else if needs_owned_value {
+            let selected_value = if needs_owned_value {
                 emit_incref_if_not_null(&mut fb, ptr_ty, incref_ref, *value);
                 Some(*value)
             } else {
@@ -14570,6 +14804,8 @@ fn build_cranelift_run_bb_specialized_function(
         ctx,
         main_id,
         main_symbol,
+        default_adapter_id,
+        default_adapter_symbol,
         import_id_to_symbol: module_imports.debug_symbols().clone(),
         block_annotations,
     })
@@ -14769,7 +15005,9 @@ pub(crate) unsafe fn compile_cranelift_run_bb_specialized_cached(
     }
 }
 
-fn compiled_direct_runner_info(compiled_handle: ObjPtr) -> Result<(*const u8, usize), String> {
+fn compiled_direct_runner_info(
+    compiled_handle: ObjPtr,
+) -> Result<(*const u8, *const u8, usize), String> {
     if compiled_handle.is_null() {
         return Err("invalid null compiled handle for direct vectorcall trampoline".to_string());
     }
@@ -14777,14 +15015,20 @@ fn compiled_direct_runner_info(compiled_handle: ObjPtr) -> Result<(*const u8, us
     match compiled.entry {
         Some(CompiledRunnerEntry::Direct {
             code_ptr,
+            default_code_ptr,
             param_count,
-        }) => Ok((code_ptr, param_count)),
+        }) => Ok((code_ptr, default_code_ptr, param_count)),
         None => Err("invalid compiled handle without entrypoint".to_string()),
     }
 }
 
 pub(crate) fn compiled_direct_code_ptr(compiled_handle: ObjPtr) -> Result<ObjPtr, String> {
-    compiled_direct_runner_info(compiled_handle).map(|(code_ptr, _)| code_ptr as ObjPtr)
+    compiled_direct_runner_info(compiled_handle).map(|(code_ptr, _, _)| code_ptr as ObjPtr)
+}
+
+pub(crate) fn compiled_default_direct_code_ptr(compiled_handle: ObjPtr) -> Result<ObjPtr, String> {
+    compiled_direct_runner_info(compiled_handle)
+        .map(|(_, default_code_ptr, _)| default_code_ptr as ObjPtr)
 }
 
 fn define_shared_vectorcall_trampoline(
@@ -14906,7 +15150,7 @@ fn define_shared_vectorcall_trampoline(
             &mut fb,
             ptr_ty,
             function_env_val,
-            FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET,
+            FUNCTION_ENV_DEFAULT_DIRECT_CODE_PTR_OFFSET,
         );
         let initial_callee_missing =
             fb.ins()
@@ -14955,7 +15199,7 @@ fn define_shared_vectorcall_trampoline(
             &mut fb,
             ptr_ty,
             compiled_function_env_val,
-            FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET,
+            FUNCTION_ENV_DEFAULT_DIRECT_CODE_PTR_OFFSET,
         );
         let compiled_callee_missing =
             fb.ins()

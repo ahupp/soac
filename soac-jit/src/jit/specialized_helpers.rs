@@ -688,6 +688,13 @@ unsafe extern "C" fn raise_deleted_name_error_hook(name_obj: ObjPtr) {
         b"cannot access local variable before assignment\0".as_ptr() as *const i8,
     );
 }
+
+unsafe extern "C" fn raise_missing_required_argument_hook() {
+    ffi::PyErr_SetString(
+        ffi::PyExc_TypeError,
+        c"missing required argument in direct JIT call".as_ptr(),
+    );
+}
 unsafe extern "C" fn make_cell_hook(value: ObjPtr) -> ObjPtr {
     PyCell_New(value as *mut ffi::PyObject) as ObjPtr
 }
@@ -1029,6 +1036,7 @@ mod test_only_export_stubs {
     panic_unit_export!(dp_jit_raise_i64_overflow());
     panic_obj_export!(dp_jit_make_cell(value: ObjPtr));
     panic_unit_export!(dp_jit_raise_deleted_name_error(name: ObjPtr));
+    panic_unit_export!(dp_jit_raise_missing_required_argument());
     panic_obj_export!(dp_jit_load_cell(cell: ObjPtr));
     panic_obj_export!(dp_jit_store_cell(cell: ObjPtr, value: ObjPtr));
     panic_obj_export!(dp_jit_del_deref(cell: ObjPtr));
@@ -1216,6 +1224,9 @@ pub unsafe extern "C" fn dp_jit_make_cell(value: ObjPtr) -> ObjPtr {
 }
 pub unsafe extern "C" fn dp_jit_raise_deleted_name_error(name: ObjPtr) {
     raise_deleted_name_error_hook(name)
+}
+pub unsafe extern "C" fn dp_jit_raise_missing_required_argument() {
+    raise_missing_required_argument_hook()
 }
 pub unsafe extern "C" fn dp_jit_load_cell(cell: ObjPtr) -> ObjPtr {
     load_cell_hook(cell)
@@ -1860,6 +1871,10 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol(
         "dp_jit_raise_deleted_name_error",
         dp_jit_raise_deleted_name_error as *const u8,
+    );
+    builder.symbol(
+        "dp_jit_raise_missing_required_argument",
+        dp_jit_raise_missing_required_argument as *const u8,
     );
     builder.symbol("dp_jit_make_cell", dp_jit_make_cell as *const u8);
     builder.symbol("dp_jit_load_cell", dp_jit_load_cell as *const u8);

@@ -370,6 +370,7 @@ fn set_runtime_error<T>(msg: &str) -> Result<T, ()> {
 #[repr(C)]
 struct FunctionEnvAbiHeader {
     direct_code_ptr: *const u8,
+    default_direct_code_ptr: *const u8,
     globals_obj: *mut ffi::PyObject,
 }
 
@@ -431,6 +432,8 @@ impl DirectArgBindingPlan {
             .enumerate()
             .map(|(index, param)| {
                 param_indices_by_name.insert(param.name.clone(), index);
+                // Runtime slots exist for all default-capable parameters because
+                // __defaults__ / __kwdefaults__ can be assigned after function creation.
                 let default_slot = match param.kind {
                     ParamKind::PosOnly | ParamKind::Any => {
                         runtime_data_layout.positional_default_slot_for_param_index(index)
@@ -504,6 +507,7 @@ impl FunctionEnv {
         unsafe {
             abi.as_ptr().write(FunctionEnvAbiHeader {
                 direct_code_ptr: ptr::null(),
+                default_direct_code_ptr: ptr::null(),
                 globals_obj,
             });
             let runtime_objects =
@@ -544,6 +548,14 @@ impl FunctionEnv {
 
     fn set_direct_code_ptr(&mut self, direct_code_ptr: *const u8) {
         self.header_mut().direct_code_ptr = direct_code_ptr;
+    }
+
+    fn default_direct_code_ptr(&self) -> *const u8 {
+        self.header().default_direct_code_ptr
+    }
+
+    fn set_default_direct_code_ptr(&mut self, default_direct_code_ptr: *const u8) {
+        self.header_mut().default_direct_code_ptr = default_direct_code_ptr;
     }
 
     fn runtime_objects_mut(&mut self) -> &mut [*mut ffi::PyObject] {
@@ -1549,6 +1561,25 @@ unsafe fn ensure_clif_vectorcall_compiled(
             }
         };
         data.function_env.set_direct_code_ptr(direct_code_ptr);
+        let default_direct_code_ptr = match compiled_function
+            .default_direct_code_ptr()
+            .map(|ptr| ptr as *const u8)
+        {
+            Ok(ptr) => ptr,
+            Err(err) => {
+                if let Ok(c_msg) = CString::new(err) {
+                    ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
+                } else {
+                    ffi::PyErr_SetString(
+                        ffi::PyExc_RuntimeError,
+                        b"missing CLIF default direct entry\0".as_ptr() as *const i8,
+                    );
+                }
+                return Err(());
+            }
+        };
+        data.function_env
+            .set_default_direct_code_ptr(default_direct_code_ptr);
         data.function_env.compiled_function = Some(compiled_function);
         let elapsed_ms = compile_start.elapsed().as_secs_f64() * 1000.0;
         info!(
@@ -1562,6 +1593,14 @@ unsafe fn ensure_clif_vectorcall_compiled(
         ffi::PyErr_SetString(
             ffi::PyExc_RuntimeError,
             b"compiled CLIF function is missing a direct entry pointer\0".as_ptr() as *const i8,
+        );
+        return Err(());
+    }
+    if data.function_env.default_direct_code_ptr().is_null() {
+        ffi::PyErr_SetString(
+            ffi::PyExc_RuntimeError,
+            b"compiled CLIF function is missing a default direct entry pointer\0".as_ptr()
+                as *const i8,
         );
         return Err(());
     }

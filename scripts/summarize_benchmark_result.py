@@ -153,13 +153,18 @@ def parse_jit_code_size(jit_bb_map_path: Path) -> dict[str, Any] | None:
 
     process_id = max(by_process)
     rows = by_process[process_id]
-    by_name = {
-        str(row["function_qualname"]): {
+    by_name = {}
+    for row in rows:
+        qualname = str(row["function_qualname"])
+        entry_kind = str(row.get("entry_kind") or "")
+        if not entry_kind:
+            symbol = str(row.get("symbol") or "")
+            entry_kind = "default_direct_adapter" if ":defaults" in symbol else "direct_function_body"
+        name = qualname if entry_kind == "direct_function_body" else f"{qualname} [{entry_kind}]"
+        by_name[name] = {
             "code_size_bytes": int(row["code_size"]),
             "machine_block_count": len(row.get("bb_offsets") or []),
         }
-        for row in rows
-    }
     total = sum(row["code_size_bytes"] for row in by_name.values())
     total_blocks = sum(row["machine_block_count"] for row in by_name.values())
     non_dp_total = sum(
