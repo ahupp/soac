@@ -1547,12 +1547,18 @@ fn emit_codegen_non_local_name_load(
                 ctx.global_indexed_hit_counter_ids
                     .contains_key(load_instr_id)
             }) {
+                let guard_miss_resume_point =
+                    ctx.guard_miss_resume_point
+                        .unwrap_or(LocalEnvResumePoint::BeforeInstr {
+                            key: InstrKey::new(ctx.function_id, load_instr_id),
+                        });
                 emit_codegen_indexed_global_load(
                     fb,
                     globals_obj,
                     name_obj,
                     slot_index,
                     load_instr_id,
+                    guard_miss_resume_point,
                     ctx,
                 )
             } else {
@@ -1654,6 +1660,7 @@ fn emit_codegen_indexed_global_load(
     name_obj: ir::Value,
     slot_index: ir::Value,
     instr_id: InstrId,
+    guard_miss_resume_point: LocalEnvResumePoint,
     ctx: &JitEmitCtx<'_>,
 ) -> ir::Value {
     let ptr_ty = ctx.consts.ptr_ty;
@@ -1662,7 +1669,7 @@ fn emit_codegen_indexed_global_load(
     fb.append_block_param(result_block, ptr_ty);
     let fallback_block = fb.create_block();
     let guard_miss_target = ctx
-        .guard_miss_target_before_instr_id(instr_id, fallback_block)
+        .guard_miss_target_for_resume_point(guard_miss_resume_point, fallback_block)
         .unwrap_or_else(|err| panic!("{err}"));
     let guard_miss_dispatch = prepare_guard_miss_dispatch(
         guard_miss_target,
@@ -2453,6 +2460,7 @@ struct JitEmitCtx<'mc> {
     probe_global_indexed_ref: ir::FuncRef,
     load_global_slow_ref: ir::FuncRef,
     indexed_global_guard_miss_deopt_stub_ref: Option<ir::FuncRef>,
+    guard_miss_resume_point: Option<LocalEnvResumePoint>,
     store_global_indexed_ref: ir::FuncRef,
     probe_field_indexed_ref: ir::FuncRef,
     store_field_indexed_ref: ir::FuncRef,
@@ -2643,15 +2651,21 @@ impl JitEmitCtx<'_> {
         })
     }
 
-    fn guard_miss_target_before_instr_id(
+    fn guard_miss_target_for_resume_point(
         &self,
-        instr_id: InstrId,
+        point: LocalEnvResumePoint,
         fallback_block: ir::Block,
     ) -> Result<JitGuardMissTarget, String> {
         Ok(JitGuardMissTarget {
             fallback_block,
-            deopt_exit: self.require_deopt_point_before_instr_id(instr_id)?,
+            deopt_exit: self.require_deopt_record_ref(point)?,
         })
+    }
+
+    fn with_guard_miss_resume_point(&self, point: LocalEnvResumePoint) -> Self {
+        let mut ctx = self.clone();
+        ctx.guard_miss_resume_point = Some(point);
+        ctx
     }
 
     fn with_step_null_target(
@@ -11659,6 +11673,12 @@ fn emit_codegen_term(
     raise_exc_ref: ir::FuncRef,
     current_exception_name: Option<&str>,
 ) -> Result<(), String> {
+    let term_guard_miss_resume_point = LocalEnvResumePoint::BeforeTerm {
+        function_id: emit_ctx.function_id,
+        block: source_label,
+    };
+    let term_emit_ctx = emit_ctx.with_guard_miss_resume_point(term_guard_miss_resume_point);
+    let emit_ctx = &term_emit_ctx;
     let decref_ref = emit_ctx.decref_ref;
 
     match term {
@@ -11836,6 +11856,13 @@ fn emit_typed_codegen_term(
     raise_exc_ref: ir::FuncRef,
     current_exception_name: Option<&str>,
 ) -> Result<(), String> {
+    let term_guard_miss_resume_point = LocalEnvResumePoint::BeforeTerm {
+        function_id: emit_ctx.function_id,
+        block: source_label,
+    };
+    let term_emit_ctx = emit_ctx.with_guard_miss_resume_point(term_guard_miss_resume_point);
+    let emit_ctx = &term_emit_ctx;
+
     if let BlockTerm::IfTerm(if_term) = term {
         let test_instr_id = if_term.test.try_semantic_instr_id();
         let demand = test_instr_id
@@ -14835,6 +14862,7 @@ fn build_cranelift_run_bb_specialized_function(
                 probe_global_indexed_ref,
                 load_global_slow_ref,
                 indexed_global_guard_miss_deopt_stub_ref,
+                guard_miss_resume_point: None,
                 store_global_indexed_ref,
                 probe_field_indexed_ref,
                 store_field_indexed_ref,

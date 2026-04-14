@@ -6747,14 +6747,11 @@ def f(x, y):
         );
     }
 
-    #[test]
-    fn indexed_global_guard_miss_can_target_cold_deopt_stub() {
+    fn assert_indexed_global_guard_miss_targets_cold_deopt_stub(
+        function: BlockPyFunction<CodegenModuleShape>,
+        case_name: &str,
+    ) {
         let blocks = [1usize as ObjPtr];
-        let function = with_single_test_block(
-            test_function(),
-            vec![op_expr(Load::new(test_global_name("x")))],
-            ret_term(none_expr()),
-        );
         let mut module = test_module(ModuleNameGen::new(0), vec![function]);
         instrument_bb_module_with_call_target_counters(&mut module);
         let function = module.callable_defs[0].clone();
@@ -6775,18 +6772,38 @@ def f(x, y):
         assert_eq!(
             count_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
             1,
-            "test deopt guard mode should call the placeholder deopt helper"
+            "{case_name}: test deopt guard mode should call the placeholder deopt helper"
         );
         assert_eq!(
             count_cold_block_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
             1,
-            "test deopt guard mode should isolate the deopt helper call in a cold block"
+            "{case_name}: test deopt guard mode should isolate the deopt helper call in a cold block"
         );
         assert_eq!(
             count_direct_calls_to_runtime_helpers(&built.ctx.func, &slow_global_helpers),
             0,
-            "test deopt guard mode should not emit the local slow global-load fallback"
+            "{case_name}: test deopt guard mode should not emit the local slow global-load fallback"
         );
+    }
+
+    #[test]
+    fn indexed_global_body_guard_miss_can_target_cold_deopt_stub() {
+        let function = with_single_test_block(
+            test_function(),
+            vec![op_expr(Load::new(test_global_name("x")))],
+            ret_term(none_expr()),
+        );
+        assert_indexed_global_guard_miss_targets_cold_deopt_stub(function, "body load");
+    }
+
+    #[test]
+    fn indexed_global_term_guard_miss_can_target_cold_deopt_stub() {
+        let function = with_single_test_block(
+            test_function(),
+            vec![],
+            ret_term(op_expr(Load::new(test_global_name("x")))),
+        );
+        assert_indexed_global_guard_miss_targets_cold_deopt_stub(function, "term load");
     }
 
     #[test]
