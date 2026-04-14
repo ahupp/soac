@@ -1348,14 +1348,6 @@ pub(crate) struct RuntimeJitDeoptLocals<'a> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RuntimeJitDeoptContinuation {
     Unimplemented,
-    ReturnLocal {
-        name: String,
-        location: LocalLocation,
-    },
-    ReturnGlobal {
-        name: String,
-        expected_index: i64,
-    },
     ResumeBlockTail {
         block: BlockLabel,
         start_body_index: usize,
@@ -1582,28 +1574,15 @@ fn runtime_jit_deopt_continuation_for_point(
             else {
                 return RuntimeJitDeoptContinuation::Unimplemented;
             };
-            let BlockTerm::Return(value) = &block.term else {
-                return RuntimeJitDeoptContinuation::Unimplemented;
-            };
-            let InstrCodegen::Load(load) = value else {
-                return RuntimeJitDeoptContinuation::Unimplemented;
-            };
-            let name = load.name.id.as_str().to_string();
-            match load.name.location {
-                NameLocation::Local(location) => {
-                    RuntimeJitDeoptContinuation::ReturnLocal { name, location }
+            if let BlockTerm::Return(value) = &block.term
+                && runtime_jit_deopt_expr_supported(value)
+            {
+                RuntimeJitDeoptContinuation::ResumeBlockTail {
+                    block: block.label,
+                    start_body_index: block.body.len(),
                 }
-                NameLocation::Global(slot) => RuntimeJitDeoptContinuation::ReturnGlobal {
-                    name,
-                    expected_index: i64::from(slot.slot()),
-                },
-                NameLocation::GlobalName => RuntimeJitDeoptContinuation::ReturnGlobal {
-                    name,
-                    expected_index: -1,
-                },
-                NameLocation::RuntimeName | NameLocation::Cell(_) | NameLocation::Constant(_) => {
-                    RuntimeJitDeoptContinuation::Unimplemented
-                }
+            } else {
+                RuntimeJitDeoptContinuation::Unimplemented
             }
         }
         LocalEnvResumePoint::BeforeInstr { key } => {
@@ -1631,6 +1610,13 @@ fn runtime_jit_deopt_continuation_for_point(
             }
         }
         LocalEnvResumePoint::BlockEntry { .. } => RuntimeJitDeoptContinuation::Unimplemented,
+    }
+}
+
+fn runtime_jit_deopt_expr_supported(expr: &InstrCodegen) -> bool {
+    match expr {
+        InstrCodegen::Load(load) => !matches!(load.name.location, NameLocation::Cell(_)),
+        _ => false,
     }
 }
 

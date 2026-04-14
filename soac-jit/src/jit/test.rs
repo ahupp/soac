@@ -4947,16 +4947,16 @@ def f(x):
         let record = table
             .record_for_point(point)
             .expect("before-term return point should have a runtime record");
-        let x_binding = record
+        let _x_binding = record
             .locals()
             .iter()
             .find(|binding| binding.name == "x")
             .expect("return-local deopt state should carry x");
         assert_eq!(
             record.continuation(),
-            &RuntimeJitDeoptContinuation::ReturnLocal {
-                name: "x".to_string(),
-                location: x_binding.location,
+            &RuntimeJitDeoptContinuation::ResumeBlockTail {
+                block: function.entry_block().label,
+                start_body_index: function.entry_block().body.len(),
             }
         );
     }
@@ -4987,9 +4987,9 @@ def f(x):
             .expect("before-term return point should have a runtime record");
         assert_eq!(
             record.continuation(),
-            &RuntimeJitDeoptContinuation::ReturnGlobal {
-                name: "x".to_string(),
-                expected_index: 0,
+            &RuntimeJitDeoptContinuation::ResumeBlockTail {
+                block: function.entry_block().label,
+                start_body_index: function.entry_block().body.len(),
             }
         );
     }
@@ -5035,9 +5035,13 @@ def f(x):
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
         Python::attach(|_| {
-            let function = test_function();
+            let function = with_single_test_block(
+                test_function(),
+                vec![],
+                ret_term(name_expr(test_name("x"))),
+            );
             let function_id = function.function_id;
-            let block = BlockLabel::from_index(0);
+            let block = function.entry_block().label;
             let location = LocalLocation(0);
             let binding = LocalEnvResumeBinding {
                 name: "x".to_string(),
@@ -5059,9 +5063,9 @@ def f(x):
                     resume_point: LocalEnvResumePoint::BeforeTerm { function_id, block },
                     precision: LocalEnvResumeStatePrecision::InstructionBoundary,
                     locals: vec![binding],
-                    continuation: RuntimeJitDeoptContinuation::ReturnLocal {
-                        name: "x".to_string(),
-                        location,
+                    continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
+                        block,
+                        start_body_index: 0,
                     },
                 }],
             };
@@ -5100,9 +5104,13 @@ def f(x):
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
         Python::attach(|_| {
-            let function = test_function();
+            let function = with_single_test_block(
+                test_function(),
+                vec![],
+                ret_term(name_expr(test_global_name("x"))),
+            );
             let function_id = function.function_id;
-            let block = BlockLabel::from_index(0);
+            let block = function.entry_block().label;
             let table = RuntimeJitDeoptTable {
                 function_id,
                 function: Box::new(function),
@@ -5115,9 +5123,9 @@ def f(x):
                     resume_point: LocalEnvResumePoint::BeforeTerm { function_id, block },
                     precision: LocalEnvResumeStatePrecision::InstructionBoundary,
                     locals: vec![],
-                    continuation: RuntimeJitDeoptContinuation::ReturnGlobal {
-                        name: "x".to_string(),
-                        expected_index: -1,
+                    continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
+                        block,
+                        start_body_index: 0,
                     },
                 }],
             };

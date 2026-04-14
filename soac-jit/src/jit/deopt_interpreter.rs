@@ -31,13 +31,6 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
     #[cold]
     fn execute(&self) -> Result<ObjPtr, String> {
         match self.invocation.record().continuation() {
-            RuntimeJitDeoptContinuation::ReturnLocal { name, location } => {
-                self.execute_return_local(name, *location)
-            }
-            RuntimeJitDeoptContinuation::ReturnGlobal {
-                name,
-                expected_index,
-            } => unsafe { self.execute_return_global(name, *expected_index) },
             RuntimeJitDeoptContinuation::ResumeBlockTail {
                 block,
                 start_body_index,
