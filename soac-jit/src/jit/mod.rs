@@ -7808,7 +7808,7 @@ struct SpecializationProfile<'a> {
     counter_dump_path: Option<Cow<'a, Path>>,
     behavior_change_indexed_stores: bool,
     profiled_cold_blocks: bool,
-    indexed_global_guard_miss_deopt: bool,
+    guard_miss_deopt: bool,
 }
 
 impl<'a> SpecializationProfile<'a> {
@@ -7826,7 +7826,7 @@ impl<'a> SpecializationProfile<'a> {
             counter_dump_path: counter_dump_path.map(Cow::Owned),
             behavior_change_indexed_stores: behavior_change_indexed_stores_enabled()?,
             profiled_cold_blocks: profiled_cold_blocks_enabled()?,
-            indexed_global_guard_miss_deopt: matches!(
+            guard_miss_deopt: matches!(
                 specialization_mode,
                 Some(SpecializationMode::Verify | SpecializationMode::Apply)
             ),
@@ -7842,7 +7842,7 @@ impl<'a> SpecializationProfile<'a> {
             counter_dump_path: counter_dump_path.map(Cow::Borrowed),
             behavior_change_indexed_stores: true,
             profiled_cold_blocks: profiled_cold_blocks_enabled()?,
-            indexed_global_guard_miss_deopt: true,
+            guard_miss_deopt: true,
         })
     }
 
@@ -16624,7 +16624,7 @@ pub fn run_cranelift_smoke(module: &BlockPyModule<CodegenModuleShape>) -> Result
 
 #[derive(Clone, Debug, Default)]
 struct BuildSpecializedFunctionOptions {
-    indexed_global_guard_miss_deopt_stub: bool,
+    guard_miss_deopt_stub: bool,
     module_constant_accesses: ModuleConstantAccessTable,
 }
 
@@ -16760,8 +16760,7 @@ fn build_cranelift_run_bb_specialized_function(
     let cold_block_labels = specialization_profile.cold_block_labels(function)?;
     let behavior_change_indexed_stores = specialization_profile.behavior_change_indexed_stores
         && function.scope.scope_kind != CallableScopeKind::Module;
-    let indexed_global_guard_miss_deopt_stub =
-        specialization_profile.indexed_global_guard_miss_deopt;
+    let guard_miss_deopt_stub = specialization_profile.guard_miss_deopt;
     let function_runtime_data_layout = FunctionRuntimeDataLayout::from_function(function);
     let true_constant_id = module_constants.require_runtime_name_constant_id("TRUE");
     let false_constant_id = module_constants.require_runtime_name_constant_id("FALSE");
@@ -17042,8 +17041,7 @@ fn build_cranelift_run_bb_specialized_function(
             &mut fb.func,
             &SOAC_RUNTIME_LOAD_GLOBAL_SLOW_IMPORT,
         );
-        let guard_miss_deopt_stub_ref = (options.indexed_global_guard_miss_deopt_stub
-            || indexed_global_guard_miss_deopt_stub)
+        let guard_miss_deopt_stub_ref = (options.guard_miss_deopt_stub || guard_miss_deopt_stub)
             .then(|| {
                 func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_DEOPT_RESUME_IMPORT)
             });

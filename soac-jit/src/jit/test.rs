@@ -12353,7 +12353,7 @@ def f(x, y):
             &blocks,
             &module_constants,
             BuildSpecializedFunctionOptions {
-                indexed_global_guard_miss_deopt_stub: true,
+                guard_miss_deopt_stub: true,
                 ..BuildSpecializedFunctionOptions::default()
             },
         );
@@ -12537,7 +12537,7 @@ def f(x, y):
             &blocks,
             &module_constants,
             BuildSpecializedFunctionOptions {
-                indexed_global_guard_miss_deopt_stub: true,
+                guard_miss_deopt_stub: true,
                 ..BuildSpecializedFunctionOptions::default()
             },
         );
@@ -12623,7 +12623,7 @@ def f(x, y):
                 None,
                 None,
                 BuildSpecializedFunctionOptions {
-                    indexed_global_guard_miss_deopt_stub: true,
+                    guard_miss_deopt_stub: true,
                     ..BuildSpecializedFunctionOptions::default()
                 },
             )
@@ -12716,7 +12716,7 @@ def f(x, y):
             &blocks,
             &module_constants,
             BuildSpecializedFunctionOptions {
-                indexed_global_guard_miss_deopt_stub: true,
+                guard_miss_deopt_stub: true,
                 ..BuildSpecializedFunctionOptions::default()
             },
         );
@@ -12816,7 +12816,7 @@ def f(x, y):
                 None,
                 None,
                 BuildSpecializedFunctionOptions {
-                    indexed_global_guard_miss_deopt_stub: true,
+                    guard_miss_deopt_stub: true,
                     ..BuildSpecializedFunctionOptions::default()
                 },
             )
