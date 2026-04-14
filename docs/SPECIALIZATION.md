@@ -271,6 +271,11 @@ apply/verify mode:
   expected split-dict or inline-values slot. First inserts update the
   split-values insertion order and split-dict `ma_used` when the class
   layout has already been primed.
+- In `verify`/`apply` mode, store guard misses or helper misses for
+  planned deopt points use a cold `dp_jit_deopt_resume` continuation
+  when the receiver, attribute key, and replacement operands are safe to
+  replay. Otherwise codegen keeps the local CPython attribute-set
+  fallback.
 
 ### Limitations / Soundness / Extensions
 

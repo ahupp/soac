@@ -4409,7 +4409,7 @@ def read_point(point):
         }
     }
 
-    fn build_field_indexed_getattr_for_source(
+    fn build_field_indexed_specialization_for_source(
         py: Python<'_>,
         mode: &str,
         source: &str,
@@ -4527,7 +4527,7 @@ class Point:
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
         Python::attach(|py| {
-            let built = build_field_indexed_getattr_for_source(
+            let built = build_field_indexed_specialization_for_source(
                 py,
                 "verify",
                 r#"
@@ -4568,7 +4568,7 @@ def read_point(point):
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
         Python::attach(|py| {
-            let built = build_field_indexed_getattr_for_source(
+            let built = build_field_indexed_specialization_for_source(
                 py,
                 "verify",
                 r#"
@@ -4589,6 +4589,85 @@ def read_point(factory):
                 count_direct_calls_to_runtime_helpers(&built.ctx.func, &getattr_helpers),
                 1,
                 "unsafe-to-replay indexed GetAttr should keep the local getattr fallback"
+            );
+        });
+    }
+
+    #[test]
+    fn field_indexed_setattr_guard_miss_deopts_when_operands_are_replay_safe() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "field_indexed_setattr_guard_miss_deopts_when_operands_are_replay_safe",
+        ) {
+            return;
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let built = build_field_indexed_specialization_for_source(
+                py,
+                "verify",
+                r#"
+def write_point(point, value):
+    point.x = value
+    return value
+"#,
+                "write_point",
+            );
+            let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
+            let setattr_helpers =
+                import_user_names_for_symbols(&built, &[DP_JIT_PYOBJECT_SETATTR_IMPORT.symbol]);
+            assert_eq!(
+                count_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
+                1,
+                "replay-safe indexed SetAttr guard miss should call the deopt resume helper"
+            );
+            assert_eq!(
+                count_cold_block_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
+                1,
+                "replay-safe indexed SetAttr deopt helper call should be cold"
+            );
+            assert_eq!(
+                count_direct_calls_to_runtime_helpers(&built.ctx.func, &setattr_helpers),
+                0,
+                "replay-safe indexed SetAttr should not emit a local setattr fallback"
+            );
+        });
+    }
+
+    #[test]
+    fn field_indexed_setattr_guard_miss_deopts_when_receiver_call_is_presequenced() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "field_indexed_setattr_guard_miss_deopts_when_receiver_call_is_presequenced",
+        ) {
+            return;
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let built = build_field_indexed_specialization_for_source(
+                py,
+                "verify",
+                r#"
+def write_point(factory, value):
+    factory().x = value
+    return value
+"#,
+                "write_point",
+            );
+            let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
+            let setattr_helpers =
+                import_user_names_for_symbols(&built, &[DP_JIT_PYOBJECT_SETATTR_IMPORT.symbol]);
+            assert_eq!(
+                count_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
+                1,
+                "lowering should sequence factory() before SetAttr, so the guard miss can deopt without replaying it"
+            );
+            assert_eq!(
+                count_direct_calls_to_runtime_helpers(&built.ctx.func, &setattr_helpers),
+                0,
+                "presequenced indexed SetAttr should not keep the local setattr fallback"
             );
         });
     }
@@ -4774,6 +4853,204 @@ def read_point(point):
             );
 
             ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+            ffi::Py_DECREF(other);
+            modules
+                .del_item("field_type_test")
+                .expect("owner module should be removed");
+        });
+    }
+
+    #[test]
+    fn field_indexed_setattr_guard_miss_deopt_resumes_generic_setattr_runtime() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "field_indexed_setattr_guard_miss_deopt_resumes_generic_setattr_runtime",
+        ) {
+            return;
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| unsafe {
+            #[repr(C)]
+            struct TestFunctionEnv {
+                direct_code_ptr: *const u8,
+                default_direct_code_ptr: *const u8,
+                deopt_table_ptr: ObjPtr,
+                globals_obj: ObjPtr,
+            }
+
+            let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "verify");
+            let soac_work_dir = fresh_test_work_dir("field-setattr-deopt-runtime");
+            let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
+            let owner_module = PyModule::from_code(
+                py,
+                c"
+class Point:
+    pass
+
+class Other:
+    pass
+",
+                c"field_type_test.py",
+                c"field_type_test",
+            )
+            .expect("owner module should execute");
+            let sys = PyModule::import(py, "sys").expect("sys should import");
+            let modules = sys
+                .getattr("modules")
+                .expect("sys.modules should exist")
+                .cast_into::<pyo3::types::PyDict>()
+                .expect("sys.modules should be a dict");
+            modules
+                .set_item("field_type_test", owner_module.as_any())
+                .expect("owner module should be registered");
+
+            write_test_counter_dump(
+                soac_work_dir.join("profile.bin").as_path(),
+                &CounterDumpRecord {
+                    source_hash: 0,
+                    module_name: "counter_test".to_string(),
+                    package_name: None,
+                    rows: Vec::new(),
+                    module_keys: Vec::new(),
+                    type_keys: vec![CounterDumpTypeKeyLayout {
+                        owner_type_id: 7,
+                        key: "x".to_string(),
+                        index: 0,
+                    }],
+                    type_table: vec![CounterDumpTypeTableEntry {
+                        type_id: 7,
+                        key: CounterDumpTypeKey {
+                            module_name: "field_type_test".to_string(),
+                            qualname: "Point".to_string(),
+                        },
+                    }],
+                },
+            );
+
+            let mut lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+                r#"
+def write_point(point, value):
+    point.x = value
+    return value
+"#,
+            )
+            .expect("lowering should succeed")
+            .codegen_module;
+            instrument_bb_module_with_call_target_counters(&mut lowered);
+            let function = lowered
+                .callable_defs
+                .iter()
+                .find(|function| function.names.bind_name == "write_point")
+                .expect("missing lowered function write_point")
+                .clone();
+            let shared_state =
+                crate::module_type::build_shared_state_for_testing(py, lowered, "counter_test", "")
+                    .expect("shared state should build");
+            let runtime = build_test_module_runtime(py, shared_state.clone());
+            let module_constant_ptrs = shared_state.module_constant_ptrs();
+            let compile_session = runtime.compile_session.as_ref();
+            let mut jit_module =
+                new_jit_module(compile_session).expect("test jit module should construct");
+            let module_constant_object_data_ids = declare_module_constant_object_data(
+                &mut jit_module,
+                &shared_state.lowered_module,
+                &module_constant_ptrs,
+            )
+            .expect("module constant object data should declare");
+            let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
+                define_test_counter_storage(
+                    &mut jit_module,
+                    &shared_state.lowered_module,
+                    shared_state.lowered_module.counter_defs.as_slice(),
+                );
+            let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
+            let built = build_test_cranelift_run_bb_specialized_function(
+                &mut jit_module,
+                blocks.as_slice(),
+                &shared_state.lowered_module,
+                &function,
+                &shared_state.codegen_constants,
+                shared_state.lowered_module.counter_defs.as_slice(),
+                module_constant_object_data_ids.as_slice(),
+                counter_slots_by_id.as_ref(),
+                scalar_counter_data_id,
+                top_value_counter_data_id,
+                compile_session,
+                Some(shared_state.as_ref()),
+                None,
+                None,
+                BuildSpecializedFunctionOptions::default(),
+            )
+            .expect("specialized JIT build should succeed");
+            let facts = infer_jit_value_facts(&shared_state.lowered_module);
+            let module_plan = plan_jit_deopt_resume_module(&shared_state.lowered_module, &facts)
+                .expect("JIT deopt resume planning should succeed");
+            let function_plan = module_plan
+                .function(function.function_id)
+                .expect("write_point should have a JIT deopt plan");
+            let deopt_table =
+                RuntimeJitDeoptTable::from_plan(&function, function_plan, &module_constant_ptrs)
+                    .expect("runtime deopt table should build from plan");
+
+            let mut ctx = built.ctx;
+            define_prepared_function(
+                &mut jit_module,
+                built.main_id,
+                &mut ctx,
+                "test-field-setattr-deopt-runtime-write-point",
+                "field setattr deopt runtime test should define",
+            )
+            .expect("test function should define");
+            jit_module.clear_context(&mut ctx);
+            jit_module
+                .finalize_definitions()
+                .expect("test jit module should finalize");
+            let code_ptr = jit_module.get_finalized_function(built.main_id);
+
+            let other_type = owner_module
+                .getattr("Other")
+                .expect("Other should exist on owner module");
+            let other = ffi::PyObject_CallNoArgs(other_type.as_ptr());
+            assert!(!other.is_null(), "Other() should create a test instance");
+            let replacement = ffi::PyLong_FromLong(445_566);
+            assert!(!replacement.is_null(), "replacement value should allocate");
+
+            let function_env = TestFunctionEnv {
+                direct_code_ptr: code_ptr,
+                default_direct_code_ptr: std::ptr::null(),
+                deopt_table_ptr: std::ptr::addr_of!(deopt_table).cast_mut().cast(),
+                globals_obj: runtime.mod_ctx.globals_obj,
+            };
+            let entry: unsafe extern "C" fn(ObjPtr, ObjPtr, ObjPtr, ObjPtr) -> ObjPtr =
+                std::mem::transmute(code_ptr);
+            let result = entry(
+                std::ptr::addr_of!(function_env).cast_mut().cast(),
+                ffi::PyThreadState_Get().cast(),
+                other.cast(),
+                replacement.cast(),
+            );
+            assert!(
+                ffi::PyErr_Occurred().is_null(),
+                "successful field SetAttr guard-miss deopt should not leave a Python exception"
+            );
+            assert_eq!(
+                ffi::PyLong_AsLong(result.cast::<ffi::PyObject>()),
+                445_566,
+                "field SetAttr guard-miss deopt should resume and return the local value"
+            );
+            let other_obj = pyo3::Bound::from_borrowed_ptr(py, other);
+            assert_eq!(
+                other_obj
+                    .getattr("x")
+                    .expect("generic SetAttr deopt should write x")
+                    .extract::<i64>()
+                    .expect("x should be an int"),
+                445_566
+            );
+
+            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+            ffi::Py_DECREF(replacement);
             ffi::Py_DECREF(other);
             modules
                 .del_item("field_type_test")

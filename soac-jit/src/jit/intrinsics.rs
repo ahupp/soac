@@ -662,6 +662,9 @@ fn emit_specialized_setattr<'fb>(
     let result_block = state.fb().create_block();
     state.fb().append_block_param(result_block, ptr_ty);
     let fallback_block = state.fb().create_block();
+    let pre_guard_operands = [op.value.as_ref(), op.attr.as_ref(), op.replacement.as_ref()];
+    let guard_miss_dispatch =
+        state.prepare_guard_miss_dispatch_for_instr(instr_id, &pre_guard_operands, fallback_block);
     for (index, specialization) in specializations.iter().enumerate() {
         let Some(owner_type) = state.emit_type_ptr_value(&specialization.owner_type_ref) else {
             continue;
@@ -706,10 +709,11 @@ fn emit_specialized_setattr<'fb>(
                 .fb()
                 .ins()
                 .icmp(ir::condcodes::IntCC::Equal, direct_result, zero_i32);
+        let direct_miss_block = guard_miss_dispatch.branch_block();
         state
             .fb()
             .ins()
-            .brif(direct_missed, fallback_block, &[], direct_block, &[]);
+            .brif(direct_missed, direct_miss_block, &[], direct_block, &[]);
 
         state.fb().switch_to_block(direct_block);
         increment_counter_with_state(state, hit_counter_id);
@@ -728,14 +732,51 @@ fn emit_specialized_setattr<'fb>(
         }
     }
 
-    state.fb().switch_to_block(fallback_block);
-    increment_counter_with_state(state, fallback_counter_id);
-    let fallback_value = emit_setattr_fallback(state, None, &arg_values);
-    state.release_arg_values(&arg_values);
-    state
-        .fb()
-        .ins()
-        .jump(result_block, &[ir::BlockArg::Value(fallback_value)]);
+    match guard_miss_dispatch {
+        JitGuardMissDispatch::FallbackBlock(fallback_block) => {
+            state.fb().switch_to_block(fallback_block);
+            increment_counter_with_state(state, fallback_counter_id);
+            let fallback_value = emit_setattr_fallback(state, None, &arg_values);
+            state.release_arg_values(&arg_values);
+            state
+                .fb()
+                .ins()
+                .jump(result_block, &[ir::BlockArg::Value(fallback_value)]);
+        }
+        JitGuardMissDispatch::DeoptResume {
+            block,
+            target,
+            deopt_resume_ref,
+        } => {
+            state.fb().switch_to_block(block);
+            state.fb().set_cold_block(block);
+            increment_counter_with_state(state, fallback_counter_id);
+            state.release_arg_values(&arg_values);
+            let deopt_result = state.emit_deopt_resume_result(target, deopt_resume_ref);
+            let null_ptr = state.fb().ins().iconst(ptr_ty, 0);
+            let deopt_result_is_null =
+                state
+                    .fb()
+                    .ins()
+                    .icmp(ir::condcodes::IntCC::Equal, deopt_result, null_ptr);
+            let deopt_success_block = state.fb().create_block();
+            state.fb().append_block_param(deopt_success_block, ptr_ty);
+            state.fb().set_cold_block(deopt_success_block);
+            let step_null_block = state.ctx().consts.step_null_block;
+            let step_null_args = super::step_null_block_args(state.ctx());
+            state.fb().ins().brif(
+                deopt_result_is_null,
+                step_null_block,
+                &step_null_args,
+                deopt_success_block,
+                &[ir::BlockArg::Value(deopt_result)],
+            );
+
+            state.fb().switch_to_block(deopt_success_block);
+            let resumed_result = state.fb().block_params(deopt_success_block)[0];
+            state.fb().ins().return_(&[resumed_result]);
+        }
+    }
 
     state.fb().switch_to_block(result_block);
     let result = state.fb().block_params(result_block)[0];
