@@ -1,5 +1,6 @@
 #![cfg_attr(test, allow(dead_code, unused_imports))]
 
+use super::RuntimeJitDeoptTable;
 use crate::module_constants::load_runtime_name_owned;
 use crate::module_constants::raise_name_error_for_missing_name;
 use crate::operator_specialization::{ExactIntBinaryOpKind, ExactIntUnaryOpKind};
@@ -1245,13 +1246,30 @@ pub unsafe extern "C" fn dp_jit_deopt_unimplemented(
     deopt_table: ObjPtr,
     record_ordinal: i64,
 ) -> ObjPtr {
-    let _ = deopt_table;
-    let _ = record_ordinal;
-    ffi::PyErr_SetString(
-        ffi::PyExc_RuntimeError,
-        b"JIT deopt helper is not implemented\0".as_ptr() as *const i8,
-    );
+    set_deopt_unimplemented_error(deopt_table, record_ordinal);
     ptr::null_mut()
+}
+
+#[cold]
+unsafe fn set_deopt_unimplemented_error(deopt_table: ObjPtr, record_ordinal: i64) {
+    let detail = if deopt_table.is_null() {
+        format!("null deopt table pointer, ordinal {record_ordinal}")
+    } else {
+        let table = &*(deopt_table.cast::<RuntimeJitDeoptTable>());
+        match table.describe_record_ordinal(record_ordinal) {
+            Ok(record) => record,
+            Err(err) => err,
+        }
+    };
+    let message = format!("JIT deopt helper is not implemented: {detail}");
+    if let Ok(c_message) = std::ffi::CString::new(message) {
+        ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_message.as_ptr());
+    } else {
+        ffi::PyErr_SetString(
+            ffi::PyExc_RuntimeError,
+            b"JIT deopt helper is not implemented\0".as_ptr() as *const i8,
+        );
+    }
 }
 pub unsafe extern "C" fn dp_jit_tuple_new(size: i64) -> ObjPtr {
     tuple_new_hook(size)

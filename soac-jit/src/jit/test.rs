@@ -2816,6 +2816,18 @@ def f():
                 first_entry_record.id.ordinal, 0,
                 "runtime deopt records should preserve planned ordinal ids"
             );
+            let first_entry_description = first_deopt_table
+                .describe_record_ordinal(first_entry_record.id.ordinal as i64)
+                .expect("runtime deopt record should be describable by ordinal");
+            assert!(
+                first_entry_description.contains(&format!("function {}", first.function_id))
+                    && first_entry_description.contains("record 0"),
+                "runtime deopt record descriptions should include stable lookup context: {first_entry_description}"
+            );
+            assert!(
+                first_deopt_table.describe_record_ordinal(-1).is_err(),
+                "runtime deopt record lookup should reject negative ordinals"
+            );
             assert_eq!(
                 compiled_direct_deopt_table_ptr(first_handle.raw_handle())
                     .expect("root deopt table pointer should be available"),

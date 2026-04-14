@@ -1385,6 +1385,36 @@ impl RuntimeJitDeoptTable {
         self.function_id
     }
 
+    pub(crate) fn describe_record_ordinal(&self, record_ordinal: i64) -> Result<String, String> {
+        let ordinal = usize::try_from(record_ordinal).map_err(|_| {
+            format!(
+                "deopt record ordinal {record_ordinal} is negative or does not fit usize for function {}",
+                self.function_id
+            )
+        })?;
+        let record = self.points.get(ordinal).ok_or_else(|| {
+            format!(
+                "deopt record ordinal {ordinal} is outside table for function {} with {} records",
+                self.function_id,
+                self.points.len()
+            )
+        })?;
+        if record.id.ordinal != ordinal {
+            return Err(format!(
+                "deopt record ordinal {ordinal} resolves to stale record {:?}",
+                record.id
+            ));
+        }
+        Ok(format!(
+            "function {}, record {}, resume_point {:?}, precision {:?}, locals {}",
+            self.function_id,
+            ordinal,
+            record.resume_point,
+            record.precision,
+            record.locals.len()
+        ))
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.points.len()
