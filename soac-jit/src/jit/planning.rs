@@ -6,9 +6,10 @@ pub use soac_blockpy::passes::{
     PlannedLocalBinding, PlannedLocalStorage, plan_function_locals,
 };
 use soac_blockpy::passes::{
-    CodegenModuleShape, FactStore, FunctionRefcountPlan, RefcountActionKind, RefcountReleaseReason,
-    compute_function_local_live_ins, compute_function_local_must_bound_ins, plan_ownership_effects,
-    validate_ownership_effects,
+    CodegenModuleShape, FactStore, FunctionRefcountPlan, LocalEnvModulePlan, RefcountActionKind,
+    RefcountPlan, RefcountReleaseReason, compute_function_local_live_ins,
+    compute_function_local_must_bound_ins, plan_local_env_module, plan_ownership_effects,
+    validate_local_env_module_plan, validate_ownership_effects,
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -615,9 +616,36 @@ pub fn plan_jit_module_locals(
     module: &BlockPyModule<CodegenModuleShape>,
     facts: &FactStore,
 ) -> Result<PlannedJitModuleLocals, String> {
+    let local_env_plan = plan_local_env_module(module, facts);
+    let refcount_plan = plan_ownership_effects(module, facts);
+    plan_jit_module_locals_from_passes(module, facts, &local_env_plan, &refcount_plan)
+}
+
+pub fn plan_jit_module_locals_from_passes(
+    module: &BlockPyModule<CodegenModuleShape>,
+    facts: &FactStore,
+    local_env_plan: &LocalEnvModulePlan,
+    refcount_plan: &RefcountPlan,
+) -> Result<PlannedJitModuleLocals, String> {
+    validate_local_env_module_plan(module, facts, local_env_plan)?;
+    validate_ownership_effects(module, facts, refcount_plan)?;
     let mut functions = HashMap::with_capacity(module.callable_defs.len());
     for function in &module.callable_defs {
-        let function_plan = plan_jit_function_locals(module, function, facts)?;
+        let local_plan = local_env_plan
+            .function(function.function_id)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "missing LocalEnv plan for function {} ({})",
+                    function.function_id, function.names.qualname
+                )
+            })?;
+        let function_refcount_plan = refcount_plan
+            .function(function.function_id)
+            .cloned()
+            .unwrap_or_default();
+        let function_plan =
+            plan_jit_function_locals_from_plans(function, local_plan, function_refcount_plan)?;
         if functions
             .insert(function.function_id, function_plan)
             .is_some()
@@ -1169,6 +1197,14 @@ pub fn plan_jit_function_locals(
 ) -> Result<PlannedJitFunctionLocals, String> {
     let local_plan = plan_function_locals(function, facts);
     let refcount_plan = plan_function_refcount_ownership(module, function, facts)?;
+    plan_jit_function_locals_from_plans(function, local_plan, refcount_plan)
+}
+
+pub fn plan_jit_function_locals_from_plans(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    local_plan: FunctionLocalPlan,
+    refcount_plan: FunctionRefcountPlan,
+) -> Result<PlannedJitFunctionLocals, String> {
     let _refcount_plan_check = check_refcount_plan_against_current_jit(function, &refcount_plan)?;
     let runtime_block_params = planned_jit_params_for_function(function, &local_plan)?;
     let implicit_target_transports =
@@ -1797,6 +1833,31 @@ def g(flag):
                 .validate_for_function(function)
                 .expect("module-level function plan should validate");
         }
+    }
+
+    #[test]
+    fn planned_jit_module_locals_accepts_precomputed_blockpy_pass_plans() {
+        let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+            r#"
+def f(flag):
+    x = None
+    if flag:
+        return x
+    return x
+"#,
+        )
+        .expect("lowering should succeed")
+        .codegen_module;
+        let facts = infer_module_value_facts(&lowered);
+        let local_env_plan = plan_local_env_module(&lowered, &facts);
+        let refcount_plan = plan_ownership_effects(&lowered, &facts);
+        let plan =
+            plan_jit_module_locals_from_passes(&lowered, &facts, &local_env_plan, &refcount_plan)
+                .expect("JIT planning should consume BlockPy pass sidecars");
+
+        plan.validate_for_module(&lowered)
+            .expect("JIT plan from BlockPy pass sidecars should validate");
+        assert_eq!(plan.functions.len(), lowered.callable_defs.len());
     }
 
     #[test]
