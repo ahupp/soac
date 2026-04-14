@@ -1,5 +1,6 @@
 use soac_blockpy::block_py::{
     BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, CodegenBlock, FunctionId,
+    LocalLocation,
 };
 pub use soac_blockpy::passes::{
     BlockParamFacts, FunctionLocalPlan, LocalRefKind, ParamBindingFacts, ParamProvenance,
@@ -8,10 +9,10 @@ pub use soac_blockpy::passes::{
 use soac_blockpy::passes::{
     CodegenModuleShape, FactStore, FunctionLocalEnvResumePlan, FunctionRefcountPlan,
     LocalEnvModulePlan, LocalEnvResumeEntry, LocalEnvResumeModulePlan, LocalEnvResumePoint,
-    RefcountActionKind, RefcountPlan, RefcountReleaseReason, compute_function_local_live_ins,
-    compute_function_local_must_bound_ins, plan_local_env_module, plan_local_env_resume_module,
-    plan_ownership_effects, validate_local_env_module_plan, validate_local_env_resume_module_plan,
-    validate_ownership_effects,
+    LocalEnvResumeStatePrecision, RefcountActionKind, RefcountPlan, RefcountReleaseReason,
+    compute_function_local_live_ins, compute_function_local_must_bound_ins, plan_local_env_module,
+    plan_local_env_resume_module, plan_ownership_effects, validate_local_env_module_plan,
+    validate_local_env_resume_module_plan, validate_ownership_effects,
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -210,11 +211,27 @@ pub struct PlannedJitModuleLocals {
 #[derive(Clone, Debug)]
 pub struct PlannedJitDeoptResumeFunction {
     pub resume_plan: FunctionLocalEnvResumePlan,
+    pub deopt_points: Vec<PlannedJitDeoptPoint>,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct PlannedJitDeoptResumeModule {
     pub functions: HashMap<FunctionId, PlannedJitDeoptResumeFunction>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PlannedJitDeoptPointId {
+    pub function_id: FunctionId,
+    pub ordinal: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlannedJitDeoptPoint {
+    pub id: PlannedJitDeoptPointId,
+    pub point: LocalEnvResumePoint,
+    pub resume_point: LocalEnvResumePoint,
+    pub precision: LocalEnvResumeStatePrecision,
+    pub local_locations: Vec<LocalLocation>,
 }
 
 impl PlannedJitModuleLocals {
@@ -255,6 +272,112 @@ impl PlannedJitDeoptResumeFunction {
     pub fn entry(&self, point: LocalEnvResumePoint) -> Option<&LocalEnvResumeEntry> {
         self.resume_plan.entry(point)
     }
+
+    pub fn deopt_point(&self, point: LocalEnvResumePoint) -> Option<&PlannedJitDeoptPoint> {
+        self.deopt_points
+            .iter()
+            .find(|deopt_point| deopt_point.point == point)
+    }
+
+    pub fn deopt_point_by_id(&self, id: PlannedJitDeoptPointId) -> Option<&PlannedJitDeoptPoint> {
+        self.deopt_points
+            .iter()
+            .find(|deopt_point| deopt_point.id == id)
+    }
+
+    pub fn deopt_points_for_block(
+        &self,
+        block: BlockLabel,
+    ) -> impl Iterator<Item = &PlannedJitDeoptPoint> {
+        self.deopt_points
+            .iter()
+            .filter(move |point| point.point.block_label() == block)
+    }
+
+    pub fn validate_for_function(
+        &self,
+        function: &BlockPyFunction<CodegenModuleShape>,
+    ) -> Result<(), String> {
+        let mut errors = Vec::new();
+        if self.deopt_points.len() != self.resume_plan.entries.len() {
+            errors.push(format!(
+                "JIT deopt resume plan for function {} ({}) has {} deopt points but {} \
+                 LocalEnv resume entries",
+                function.function_id,
+                function.names.qualname,
+                self.deopt_points.len(),
+                self.resume_plan.entries.len()
+            ));
+        }
+
+        for (ordinal, entry) in self.resume_plan.entries.iter().enumerate() {
+            let Some(deopt_point) = self.deopt_points.get(ordinal) else {
+                errors.push(format!(
+                    "JIT deopt resume plan for function {} ({}) is missing deopt point {ordinal}",
+                    function.function_id, function.names.qualname
+                ));
+                continue;
+            };
+            if deopt_point.id.function_id != function.function_id {
+                errors.push(format!(
+                    "JIT deopt point {ordinal} for function {} ({}) has wrong function id {}",
+                    function.function_id, function.names.qualname, deopt_point.id.function_id
+                ));
+            }
+            if deopt_point.id.ordinal != ordinal {
+                errors.push(format!(
+                    "JIT deopt point for function {} ({}) at index {ordinal} has id ordinal {}",
+                    function.function_id, function.names.qualname, deopt_point.id.ordinal
+                ));
+            }
+            if deopt_point.point != entry.point || deopt_point.resume_point != entry.point {
+                errors.push(format!(
+                    "JIT deopt point {:?} for function {} ({}) does not map exactly to LocalEnv \
+                     resume point {:?}",
+                    deopt_point.point, function.function_id, function.names.qualname, entry.point
+                ));
+            }
+            if deopt_point.precision != entry.precision {
+                errors.push(format!(
+                    "JIT deopt point {:?} for function {} ({}) has precision {:?}, expected {:?}",
+                    deopt_point.point,
+                    function.function_id,
+                    function.names.qualname,
+                    deopt_point.precision,
+                    entry.precision
+                ));
+            }
+
+            let mut seen_locations = HashSet::new();
+            for location in &deopt_point.local_locations {
+                if !seen_locations.insert(*location) {
+                    errors.push(format!(
+                        "JIT deopt point {:?} for function {} ({}) duplicates local location {}",
+                        deopt_point.point,
+                        function.function_id,
+                        function.names.qualname,
+                        location.0
+                    ));
+                }
+                if entry.binding_for_location(*location).is_none() {
+                    errors.push(format!(
+                        "JIT deopt point {:?} for function {} ({}) references unavailable local \
+                         location {}",
+                        deopt_point.point,
+                        function.function_id,
+                        function.names.qualname,
+                        location.0
+                    ));
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("\n"))
+        }
+    }
 }
 
 impl PlannedJitDeoptResumeModule {
@@ -265,6 +388,11 @@ impl PlannedJitDeoptResumeModule {
     pub fn entry(&self, point: LocalEnvResumePoint) -> Option<&LocalEnvResumeEntry> {
         self.function(point.function_id())
             .and_then(|function| function.entry(point))
+    }
+
+    pub fn deopt_point(&self, point: LocalEnvResumePoint) -> Option<&PlannedJitDeoptPoint> {
+        self.function(point.function_id())
+            .and_then(|function| function.deopt_point(point))
     }
 
     pub fn validate_for_module(
@@ -283,6 +411,7 @@ impl PlannedJitDeoptResumeModule {
                     function.function_id, function.names.qualname
                 )
             })?;
+            function_plan.validate_for_function(function)?;
             for block in &function.blocks {
                 if function_plan
                     .resume_plan
@@ -760,10 +889,15 @@ pub fn plan_jit_deopt_resume_module_from_passes(
                     function.function_id, function.names.qualname
                 )
             })?;
+        let deopt_points =
+            planned_deopt_points_from_resume_plan(function.function_id, &resume_plan);
         if functions
             .insert(
                 function.function_id,
-                PlannedJitDeoptResumeFunction { resume_plan },
+                PlannedJitDeoptResumeFunction {
+                    resume_plan,
+                    deopt_points,
+                },
             )
             .is_some()
         {
@@ -776,6 +910,116 @@ pub fn plan_jit_deopt_resume_module_from_passes(
     let plan = PlannedJitDeoptResumeModule { functions };
     plan.validate_for_module(module)?;
     Ok(plan)
+}
+
+fn planned_deopt_points_from_resume_plan(
+    function_id: FunctionId,
+    resume_plan: &FunctionLocalEnvResumePlan,
+) -> Vec<PlannedJitDeoptPoint> {
+    resume_plan
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(ordinal, entry)| PlannedJitDeoptPoint {
+            id: PlannedJitDeoptPointId {
+                function_id,
+                ordinal,
+            },
+            point: entry.point,
+            resume_point: entry.point,
+            precision: entry.precision,
+            local_locations: entry
+                .locals
+                .iter()
+                .map(|binding| binding.location)
+                .collect(),
+        })
+        .collect()
+}
+
+pub fn render_jit_deopt_resume_module(
+    module: &BlockPyModule<CodegenModuleShape>,
+    plan: &PlannedJitDeoptResumeModule,
+) -> Result<String, String> {
+    plan.validate_for_module(module)?;
+    let mut out = String::new();
+    for function in &module.callable_defs {
+        let function_plan = plan.function(function.function_id).ok_or_else(|| {
+            format!(
+                "missing JIT deopt resume plan for function {} ({})",
+                function.function_id, function.names.qualname
+            )
+        })?;
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&render_jit_deopt_resume_function(function, function_plan)?);
+    }
+    Ok(out)
+}
+
+pub fn render_jit_deopt_resume_function(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    plan: &PlannedJitDeoptResumeFunction,
+) -> Result<String, String> {
+    plan.validate_for_function(function)?;
+    let mut out = String::new();
+    writeln!(
+        out,
+        "function {} {}:",
+        function.function_id, function.names.qualname
+    )
+    .expect("writing to String should not fail");
+    for block in &function.blocks {
+        writeln!(out, "  block {}:", block.label).expect("writing to String should not fail");
+        for deopt_point in plan.deopt_points_for_block(block.label) {
+            let entry = plan.entry(deopt_point.resume_point).ok_or_else(|| {
+                format!(
+                    "deopt point {:?} for function {} ({}) references missing resume entry",
+                    deopt_point.point, function.function_id, function.names.qualname
+                )
+            })?;
+            writeln!(
+                out,
+                "    deopt #{} {} precision={:?}:",
+                deopt_point.id.ordinal,
+                render_jit_deopt_point(deopt_point.point),
+                deopt_point.precision
+            )
+            .expect("writing to String should not fail");
+            for location in &deopt_point.local_locations {
+                let binding = entry.binding_for_location(*location).ok_or_else(|| {
+                    format!(
+                        "deopt point {:?} for function {} ({}) references missing local location {}",
+                        deopt_point.point,
+                        function.function_id,
+                        function.names.qualname,
+                        location.0
+                    )
+                })?;
+                writeln!(
+                    out,
+                    "      {}@{} binding={:?} source={:?} ownership={:?} value={:?}",
+                    binding.name,
+                    binding.location.0,
+                    binding.binding,
+                    binding.source,
+                    binding.ownership,
+                    binding.value
+                )
+                .expect("writing to String should not fail");
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn render_jit_deopt_point(point: LocalEnvResumePoint) -> String {
+    match point {
+        LocalEnvResumePoint::BlockEntry { .. } => "block_entry".to_string(),
+        LocalEnvResumePoint::BeforeInstr { key } => format!("before_instr {key}"),
+        LocalEnvResumePoint::BeforeTerm { .. } => "before_term".to_string(),
+    }
 }
 
 pub fn render_jit_module_locals(
@@ -1352,7 +1596,7 @@ pub fn plan_jit_function_locals_from_plans(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soac_blockpy::block_py::{BlockTerm, LocalLocation};
+    use soac_blockpy::block_py::BlockTerm;
     use soac_blockpy::lower_python_to_blockpy_for_testing;
     use soac_blockpy::passes::BlockLocalPlan;
     use soac_blockpy::passes::{
@@ -1993,7 +2237,15 @@ def f():
         let function_plan = plan
             .function(function.function_id)
             .expect("function should have a JIT deopt resume plan");
+        assert_eq!(
+            function_plan.deopt_points.len(),
+            function_plan.resume_plan.entries.len()
+        );
         let entry_block = function.entry_block();
+        let before_term_point = LocalEnvResumePoint::BeforeTerm {
+            function_id: function.function_id,
+            block: entry_block.label,
+        };
         let before_term = function_plan
             .resume_plan
             .before_term(function.function_id, entry_block.label)
@@ -2004,13 +2256,30 @@ def f():
         assert_eq!(x_binding.binding, LocalEnvResumeBindingState::Unbound);
         assert_eq!(x_binding.source, LocalEnvResumeValueSource::Unbound);
 
+        let planned_deopt = function_plan
+            .deopt_point(before_term_point)
+            .expect("before-term resume point should have a planned deopt point");
+        assert_eq!(planned_deopt.resume_point, before_term.point);
+        assert_eq!(planned_deopt.precision, before_term.precision);
+        assert!(
+            planned_deopt
+                .local_locations
+                .iter()
+                .any(|location| *location == x_binding.location)
+        );
+        assert_eq!(
+            function_plan.deopt_point_by_id(planned_deopt.id),
+            Some(planned_deopt)
+        );
+
         let via_module = plan
-            .entry(LocalEnvResumePoint::BeforeTerm {
-                function_id: function.function_id,
-                block: entry_block.label,
-            })
+            .entry(before_term_point)
             .expect("module-level point lookup should find before-term entry");
         assert_eq!(via_module, before_term);
+        let via_module_deopt = plan
+            .deopt_point(before_term_point)
+            .expect("module-level point lookup should find planned deopt point");
+        assert_eq!(via_module_deopt, planned_deopt);
     }
 
     #[test]

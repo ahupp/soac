@@ -74,18 +74,19 @@ use direct_abi::{
 };
 pub use planning::{
     BlockExcDispatchPlan, BlockParamFacts, CurrentJitRefcountPlanCheck, EdgeTransportPlan,
-    FunctionLocalPlan, LocalRefKind, ParamBindingFacts, ParamProvenance,
-    PlannedJitDeoptResumeFunction, PlannedJitDeoptResumeModule, PlannedJitFunctionLocals,
-    PlannedJitModuleLocals, PlannedLocalEnvEntryMaterialization, PlannedLocalEnvEntrySource,
-    PlannedLocalStorage, PlannedStackSlotEntrySeed, RuntimeBlockParamPlan,
-    check_refcount_plan_against_current_jit, exc_dispatch_plan, local_ref_kind_for_stack_mirror,
-    plan_function_locals, plan_function_refcount_ownership, plan_jit_deopt_resume_module,
-    plan_jit_deopt_resume_module_from_passes, plan_jit_function_locals, plan_jit_module_locals,
+    FunctionLocalPlan, LocalRefKind, ParamBindingFacts, ParamProvenance, PlannedJitDeoptPoint,
+    PlannedJitDeoptPointId, PlannedJitDeoptResumeFunction, PlannedJitDeoptResumeModule,
+    PlannedJitFunctionLocals, PlannedJitModuleLocals, PlannedLocalEnvEntryMaterialization,
+    PlannedLocalEnvEntrySource, PlannedLocalStorage, PlannedStackSlotEntrySeed,
+    RuntimeBlockParamPlan, check_refcount_plan_against_current_jit, exc_dispatch_plan,
+    local_ref_kind_for_stack_mirror, plan_function_locals, plan_function_refcount_ownership,
+    plan_jit_deopt_resume_module, plan_jit_deopt_resume_module_from_passes,
+    plan_jit_function_locals, plan_jit_module_locals,
     planned_implicit_target_transports_for_function, planned_jit_params_for_function,
     planned_jump_edge_transports_for_function,
     planned_local_env_entry_materializations_for_function,
-    planned_stack_slot_entry_seeds_for_function, render_jit_function_locals,
-    render_jit_module_locals,
+    planned_stack_slot_entry_seeds_for_function, render_jit_deopt_resume_function,
+    render_jit_deopt_resume_module, render_jit_function_locals, render_jit_module_locals,
 };
 use runtime_context::{
     FUNCTION_ENV_DEFAULT_DIRECT_CODE_PTR_OFFSET, FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET,

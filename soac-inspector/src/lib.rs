@@ -16,7 +16,8 @@ use soac_blockpy::passes::{
 use soac_jit::module_constants::ModuleCodegenConstants;
 use soac_jit::module_type::build_shared_state_for_inspection;
 use soac_jit::{
-    plan_jit_module_locals, render_cranelift_run_bb_specialized_with_runtime_state_and_cfg,
+    plan_jit_deopt_resume_module, plan_jit_module_locals,
+    render_cranelift_run_bb_specialized_with_runtime_state_and_cfg, render_jit_deopt_resume_module,
     render_jit_function_locals, render_jit_module_locals,
 };
 use std::ffi::c_void;
@@ -280,6 +281,16 @@ fn render_inspector_payload(source: &str, output: &soac_blockpy::LoweringResult)
         "key": "local_env_resume_plan",
         "label": "local env resume plan",
         "text": local_env_resume_plan_text,
+    }));
+    let jit_deopt_resume_plan_text = (|| {
+        let plan = plan_jit_deopt_resume_module(&output.codegen_module, &facts)?;
+        render_jit_deopt_resume_module(&output.codegen_module, &plan)
+    })()
+    .unwrap_or_else(|err| format!("; failed to render jit_deopt_resume_plan: {err}"));
+    steps.push(json!({
+        "key": "jit_deopt_resume_plan",
+        "label": "jit deopt resume plan",
+        "text": jit_deopt_resume_plan_text,
     }));
     let jit_local_plan_text = (|| {
         let plan = plan_jit_module_locals(&output.codegen_module, &facts)?;
