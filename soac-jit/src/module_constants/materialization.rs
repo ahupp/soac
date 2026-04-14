@@ -2,7 +2,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyModule, PyTuple};
-use std::ffi::{CStr, CString, c_int};
+use std::ffi::{CStr, CString, c_char, c_int};
 use std::mem::{self, offset_of};
 use std::ptr;
 
@@ -36,7 +36,7 @@ pub(super) enum RuntimeNameConstantMode {
 enum StaticPyObjectTemplate {
     PyLongI64 { value: i64 },
     PyLongDecimal { value: String },
-    CompactAsciiUnicode { bytes: Vec<u8> },
+    CompactUnicode { bytes: Vec<u8> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +75,13 @@ struct RawPyASCIIObject {
     state: u32,
 }
 
+#[repr(C)]
+struct RawPyCompactUnicodeObject {
+    base: RawPyASCIIObject,
+    utf8_length: ffi::Py_ssize_t,
+    utf8: *mut c_char,
+}
+
 #[cfg(test)]
 const RAW_PYLONG_SHIFT: u32 = 30;
 const RAW_PYLONG_NON_SIZE_BITS: usize = 3;
@@ -84,15 +91,27 @@ const RAW_PYOBJECT_IMMORTAL_INITIAL_REFCNT_64: i64 = 3 << 30;
 const RAW_PYOBJECT_STATIC_IMMORTAL_INITIAL_REFCNT_64: i64 =
     RAW_PYOBJECT_IMMORTAL_INITIAL_REFCNT_64 | (RAW_PYOBJECT_STATIC_IMMORTAL_FLAGS << 48);
 const RAW_PYUNICODE_1BYTE_KIND: u32 = 1;
+const RAW_PYUNICODE_2BYTE_KIND: u32 = 2;
+const RAW_PYUNICODE_4BYTE_KIND: u32 = 4;
 const RAW_PYUNICODE_KIND_SHIFT: u32 = 2;
 const RAW_PYUNICODE_COMPACT_SHIFT: u32 = 5;
 const RAW_PYUNICODE_ASCII_SHIFT: u32 = 6;
+const RAW_PYUNICODE_COMPACT_MASK: u32 = 1 << RAW_PYUNICODE_COMPACT_SHIFT;
+const RAW_PYUNICODE_ASCII_MASK: u32 = 1 << RAW_PYUNICODE_ASCII_SHIFT;
 #[cfg(test)]
 const RAW_PYUNICODE_INTERNED_MASK: u32 = 0b11;
-const RAW_PYUNICODE_COMPACT_ASCII_STATE: u32 = (RAW_PYUNICODE_1BYTE_KIND
-    << RAW_PYUNICODE_KIND_SHIFT)
-    | (1 << RAW_PYUNICODE_COMPACT_SHIFT)
-    | (1 << RAW_PYUNICODE_ASCII_SHIFT);
+const RAW_PYUNICODE_COMPACT_ASCII_STATE: u32 =
+    raw_pyunicode_compact_state(RAW_PYUNICODE_1BYTE_KIND, true);
+
+const fn raw_pyunicode_compact_state(kind: u32, ascii: bool) -> u32 {
+    (kind << RAW_PYUNICODE_KIND_SHIFT)
+        | (1 << RAW_PYUNICODE_COMPACT_SHIFT)
+        | if ascii {
+            1 << RAW_PYUNICODE_ASCII_SHIFT
+        } else {
+            0
+        }
+}
 
 impl StaticPyObjectTemplate {
     fn for_int(value: i64) -> Option<Self> {
@@ -107,11 +126,8 @@ impl StaticPyObjectTemplate {
     }
 
     fn for_unicode(bytes: &[u8]) -> Option<Self> {
-        if !bytes.is_ascii() {
-            return None;
-        }
         ffi::Py_ssize_t::try_from(bytes.len()).ok()?;
-        Some(Self::CompactAsciiUnicode {
+        Some(Self::CompactUnicode {
             bytes: bytes.to_vec(),
         })
     }
@@ -123,7 +139,7 @@ impl StaticPyObjectTemplate {
         match self {
             Self::PyLongI64 { value } => build_pylong_i64_fallback(py, *value),
             Self::PyLongDecimal { value } => build_pylong_decimal_fallback(py, value),
-            Self::CompactAsciiUnicode { bytes } => build_unicode_constant(py, bytes).map(Py::from),
+            Self::CompactUnicode { bytes } => build_unicode_constant(py, bytes).map(Py::from),
         }
     }
 
@@ -140,40 +156,7 @@ impl StaticPyObjectTemplate {
         match self {
             Self::PyLongI64 { value } => static_pylong_i64_image(*value),
             Self::PyLongDecimal { value } => static_pylong_decimal_image(value),
-            Self::CompactAsciiUnicode { bytes: data } => {
-                let len = ffi::Py_ssize_t::try_from(data.len()).ok()?;
-                let object_size = mem::size_of::<RawPyASCIIObject>();
-                let total_size = object_size.checked_add(data.len())?.checked_add(1)?;
-                let mut bytes = vec![0; total_size];
-                write_i64(
-                    bytes.as_mut_slice(),
-                    offset_of!(RawPyASCIIObject, ob_base) + offset_of!(ffi::PyObject, ob_refcnt),
-                    RAW_PYOBJECT_STATIC_IMMORTAL_INITIAL_REFCNT_64,
-                );
-                let type_offset =
-                    offset_of!(RawPyASCIIObject, ob_base) + offset_of!(ffi::PyObject, ob_type);
-                write_py_ssize_t(
-                    bytes.as_mut_slice(),
-                    offset_of!(RawPyASCIIObject, length),
-                    len,
-                );
-                write_py_hash_t(bytes.as_mut_slice(), offset_of!(RawPyASCIIObject, hash), -1);
-                write_u32(
-                    bytes.as_mut_slice(),
-                    offset_of!(RawPyASCIIObject, state),
-                    RAW_PYUNICODE_COMPACT_ASCII_STATE,
-                );
-                bytes[object_size..object_size + data.len()].copy_from_slice(data.as_slice());
-                Some(StaticPyObjectImage {
-                    bytes,
-                    align: mem::align_of::<RawPyASCIIObject>() as u64,
-                    writable: true,
-                    relocations: vec![StaticPyObjectRelocation {
-                        offset: type_offset as u64,
-                        symbol: "PyUnicode_Type",
-                    }],
-                })
-            }
+            Self::CompactUnicode { bytes: data } => static_compact_unicode_image(data),
         }
     }
 }
@@ -401,6 +384,151 @@ unsafe fn static_pylong_image_from_borrowed_ptr(
         relocations: vec![StaticPyObjectRelocation {
             offset: type_offset as u64,
             symbol: "PyLong_Type",
+        }],
+    })
+}
+
+fn static_compact_unicode_image(data: &[u8]) -> Option<StaticPyObjectImage> {
+    if data.is_ascii() {
+        return static_compact_ascii_unicode_image(data);
+    }
+    static_compact_unicode_image_from_utf8(data)
+}
+
+fn static_compact_ascii_unicode_image(data: &[u8]) -> Option<StaticPyObjectImage> {
+    let len = ffi::Py_ssize_t::try_from(data.len()).ok()?;
+    let object_size = mem::size_of::<RawPyASCIIObject>();
+    let total_size = object_size.checked_add(data.len())?.checked_add(1)?;
+    let mut bytes = vec![0; total_size];
+    write_i64(
+        bytes.as_mut_slice(),
+        offset_of!(RawPyASCIIObject, ob_base) + offset_of!(ffi::PyObject, ob_refcnt),
+        RAW_PYOBJECT_STATIC_IMMORTAL_INITIAL_REFCNT_64,
+    );
+    let type_offset = offset_of!(RawPyASCIIObject, ob_base) + offset_of!(ffi::PyObject, ob_type);
+    write_py_ssize_t(
+        bytes.as_mut_slice(),
+        offset_of!(RawPyASCIIObject, length),
+        len,
+    );
+    write_py_hash_t(bytes.as_mut_slice(), offset_of!(RawPyASCIIObject, hash), -1);
+    write_u32(
+        bytes.as_mut_slice(),
+        offset_of!(RawPyASCIIObject, state),
+        RAW_PYUNICODE_COMPACT_ASCII_STATE,
+    );
+    bytes[object_size..object_size + data.len()].copy_from_slice(data);
+    Some(StaticPyObjectImage {
+        bytes,
+        align: mem::align_of::<RawPyASCIIObject>() as u64,
+        writable: true,
+        relocations: vec![StaticPyObjectRelocation {
+            offset: type_offset as u64,
+            symbol: "PyUnicode_Type",
+        }],
+    })
+}
+
+fn static_compact_unicode_image_from_utf8(data: &[u8]) -> Option<StaticPyObjectImage> {
+    let len = ffi::Py_ssize_t::try_from(data.len()).ok()?;
+    Python::try_attach(|py| unsafe {
+        let ptr = ffi::PyUnicode_DecodeUTF8(
+            data.as_ptr().cast::<c_char>(),
+            len,
+            c"surrogatepass".as_ptr(),
+        );
+        if ptr.is_null() {
+            if !ffi::PyErr_Occurred().is_null() {
+                ffi::PyErr_Clear();
+            }
+            return None;
+        }
+        let object: Bound<'_, PyAny> = Bound::from_owned_ptr(py, ptr);
+        static_compact_unicode_image_from_borrowed_ptr(object.as_ptr())
+    })
+    .flatten()
+}
+
+unsafe fn static_compact_unicode_image_from_borrowed_ptr(
+    ptr: *mut ffi::PyObject,
+) -> Option<StaticPyObjectImage> {
+    if unsafe { ffi::PyUnicode_CheckExact(ptr) } == 0 {
+        return None;
+    }
+    if unsafe { ffi::PyUnicode_READY(ptr) } != 0 {
+        if unsafe { !ffi::PyErr_Occurred().is_null() } {
+            unsafe { ffi::PyErr_Clear() };
+        }
+        return None;
+    }
+    let state = unsafe { (&*(ptr.cast::<RawPyASCIIObject>())).state };
+    if state & RAW_PYUNICODE_COMPACT_MASK == 0 || state & RAW_PYUNICODE_ASCII_MASK != 0 {
+        return None;
+    }
+
+    let length = unsafe { ffi::PyUnicode_GET_LENGTH(ptr) };
+    let char_count = usize::try_from(length).ok()?;
+    let kind = unsafe { ffi::PyUnicode_KIND(ptr) };
+    let char_size = match kind {
+        RAW_PYUNICODE_1BYTE_KIND | RAW_PYUNICODE_2BYTE_KIND | RAW_PYUNICODE_4BYTE_KIND => {
+            usize::try_from(kind).ok()?
+        }
+        _ => return None,
+    };
+    let data_ptr = unsafe { ffi::PyUnicode_DATA(ptr) }.cast::<u8>();
+    if data_ptr.is_null() {
+        return None;
+    }
+
+    let object_size = mem::size_of::<RawPyCompactUnicodeObject>();
+    let data_size = char_count.checked_add(1)?.checked_mul(char_size)?;
+    let total_size = object_size.checked_add(data_size)?;
+    let mut bytes = vec![0; total_size];
+    write_i64(
+        bytes.as_mut_slice(),
+        offset_of!(RawPyCompactUnicodeObject, base)
+            + offset_of!(RawPyASCIIObject, ob_base)
+            + offset_of!(ffi::PyObject, ob_refcnt),
+        RAW_PYOBJECT_STATIC_IMMORTAL_INITIAL_REFCNT_64,
+    );
+    let type_offset = offset_of!(RawPyCompactUnicodeObject, base)
+        + offset_of!(RawPyASCIIObject, ob_base)
+        + offset_of!(ffi::PyObject, ob_type);
+    write_py_ssize_t(
+        bytes.as_mut_slice(),
+        offset_of!(RawPyCompactUnicodeObject, base) + offset_of!(RawPyASCIIObject, length),
+        length,
+    );
+    write_py_hash_t(
+        bytes.as_mut_slice(),
+        offset_of!(RawPyCompactUnicodeObject, base) + offset_of!(RawPyASCIIObject, hash),
+        -1,
+    );
+    write_u32(
+        bytes.as_mut_slice(),
+        offset_of!(RawPyCompactUnicodeObject, base) + offset_of!(RawPyASCIIObject, state),
+        raw_pyunicode_compact_state(kind, false),
+    );
+    write_py_ssize_t(
+        bytes.as_mut_slice(),
+        offset_of!(RawPyCompactUnicodeObject, utf8_length),
+        0,
+    );
+    write_usize(
+        bytes.as_mut_slice(),
+        offset_of!(RawPyCompactUnicodeObject, utf8),
+        0,
+    );
+    unsafe {
+        ptr::copy_nonoverlapping(data_ptr, bytes.as_mut_ptr().add(object_size), data_size);
+    }
+    Some(StaticPyObjectImage {
+        bytes,
+        align: mem::align_of::<RawPyCompactUnicodeObject>() as u64,
+        writable: true,
+        relocations: vec![StaticPyObjectRelocation {
+            offset: type_offset as u64,
+            symbol: "PyUnicode_Type",
         }],
     })
 }
@@ -886,16 +1014,25 @@ mod tests {
     }
 
     #[test]
-    fn static_unicode_template_accepts_only_ascii() {
+    fn static_unicode_template_accepts_ascii_and_non_ascii() {
+        crate::initialize_test_python();
         assert_eq!(
             StaticPyObjectTemplate::for_unicode(b"ascii"),
-            Some(StaticPyObjectTemplate::CompactAsciiUnicode {
+            Some(StaticPyObjectTemplate::CompactUnicode {
                 bytes: b"ascii".to_vec(),
             })
         );
         assert_eq!(
             StaticPyObjectTemplate::for_unicode("caf\u{e9}".as_bytes()),
-            None
+            Some(StaticPyObjectTemplate::CompactUnicode {
+                bytes: "caf\u{e9}".as_bytes().to_vec(),
+            })
+        );
+        assert!(
+            StaticPyObjectTemplate::for_unicode("caf\u{e9}".as_bytes())
+                .expect("non-ASCII Unicode template should construct")
+                .static_object_image()
+                .is_some()
         );
     }
 
@@ -1067,6 +1204,57 @@ mod tests {
     }
 
     #[test]
+    fn build_python_constants_materializes_static_compact_non_ascii_unicode() {
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let mut constants = ModuleCodegenConstants::default();
+            let value = "caf\u{e9} \u{1f40d}";
+            let constant_id = constants.intern_unicode_bytes(value.as_bytes());
+            let image = constants
+                .static_pyobject_image(constant_id)
+                .expect("test non-ASCII constant should have a static image");
+            let objects = constants
+                .build_python_constants(py)
+                .expect("building static non-ASCII Unicode constant should succeed");
+            let obj = objects[constant_id.0].as_ptr();
+
+            unsafe {
+                assert_ne!(ffi::PyUnicode_CheckExact(obj), 0);
+                assert_eq!(ffi::_PyUnicode_CheckConsistency(obj, 1), 1);
+                assert_eq!(ffi::PyUnicode_GET_LENGTH(obj), 6);
+                assert_eq!(ffi::PyUnicode_KIND(obj), ffi::PyUnicode_4BYTE_KIND);
+                let raw = &*(obj.cast::<RawPyCompactUnicodeObject>());
+                assert_ne!(raw.base.state & RAW_PYUNICODE_COMPACT_MASK, 0);
+                assert_eq!(raw.base.state & RAW_PYUNICODE_ASCII_MASK, 0);
+                assert_ne!(raw.base.state & RAW_PYUNICODE_INTERNED_MASK, 0);
+
+                let image_object = materialize_static_pyobject_image(py, &image)
+                    .expect("materializing static non-ASCII Unicode image should succeed");
+                let image_obj = image_object.as_ptr();
+                let mut expected_bytes = image.bytes.clone();
+                patch_static_pyobject_image_relocations(
+                    expected_bytes.as_mut_ptr(),
+                    expected_bytes.len(),
+                    &image.relocations,
+                )
+                .expect("test static image relocations should patch");
+                let actual_bytes =
+                    std::slice::from_raw_parts(image_obj.cast::<u8>(), expected_bytes.len());
+                assert_eq!(actual_bytes, expected_bytes.as_slice());
+
+                let mut utf8_len = 0;
+                let utf8 = ffi::PyUnicode_AsUTF8AndSize(image_obj, &mut utf8_len);
+                assert!(!utf8.is_null());
+                assert_eq!(utf8_len as usize, value.len());
+                assert_eq!(
+                    std::slice::from_raw_parts(utf8.cast::<u8>(), utf8_len as usize),
+                    value.as_bytes()
+                );
+            }
+        });
+    }
+
+    #[test]
     fn build_python_constants_uses_static_resolver_for_static_pylong() {
         crate::initialize_test_python();
         Python::attach(|py| {
@@ -1123,6 +1311,48 @@ mod tests {
                 assert_eq!(
                     std::slice::from_raw_parts(utf8.cast::<u8>(), utf8_len as usize),
                     b"soac-static-resolver-ascii"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn build_python_constants_interns_static_resolver_non_ascii_unicode() {
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let mut constants = ModuleCodegenConstants::default();
+            let value = "caf\u{e9} \u{1f40d}";
+            let constant_id = constants.intern_unicode_bytes(value.as_bytes());
+            let image = constants
+                .static_pyobject_image(constant_id)
+                .expect("test non-ASCII constant should have a static image");
+            let resolved_object = materialize_static_pyobject_image(py, &image)
+                .expect("materializing static non-ASCII Unicode image should succeed");
+            let resolved_ptr = resolved_object.as_ptr();
+
+            let objects = constants
+                .build_python_constants_with_static_resolver(py, false, |id| {
+                    assert_eq!(id, constant_id);
+                    Ok(Some(resolved_ptr))
+                })
+                .expect("building constants with static resolver should succeed");
+
+            let obj = objects[constant_id.0].as_ptr();
+            unsafe {
+                assert_ne!(ffi::PyUnicode_CheckExact(obj), 0);
+                assert_eq!(ffi::_PyUnicode_CheckConsistency(obj, 1), 1);
+                let raw = &*(obj.cast::<RawPyCompactUnicodeObject>());
+                assert_ne!(raw.base.state & RAW_PYUNICODE_COMPACT_MASK, 0);
+                assert_eq!(raw.base.state & RAW_PYUNICODE_ASCII_MASK, 0);
+                assert_ne!(raw.base.state & RAW_PYUNICODE_INTERNED_MASK, 0);
+                assert_eq!(ffi::PyUnicode_GET_LENGTH(obj), 6);
+                let mut utf8_len = 0;
+                let utf8 = ffi::PyUnicode_AsUTF8AndSize(obj, &mut utf8_len);
+                assert!(!utf8.is_null());
+                assert_eq!(utf8_len as usize, value.len());
+                assert_eq!(
+                    std::slice::from_raw_parts(utf8.cast::<u8>(), utf8_len as usize),
+                    value.as_bytes()
                 );
             }
         });
@@ -1246,6 +1476,116 @@ mod tests {
         assert_eq!(
             &image.bytes[data_offset..data_offset + b"ascii".len() + 1],
             b"ascii\0"
+        );
+    }
+
+    #[test]
+    fn static_compact_non_ascii_unicode_image_matches_raw_layout() {
+        crate::initialize_test_python();
+        let image = StaticPyObjectTemplate::for_unicode("caf\u{e9} \u{1f40d}".as_bytes())
+            .expect("test constant should be static-capable")
+            .static_object_image()
+            .expect("test build should support static non-ASCII Unicode object images");
+        let type_offset = offset_of!(RawPyCompactUnicodeObject, base)
+            + offset_of!(RawPyASCIIObject, ob_base)
+            + offset_of!(ffi::PyObject, ob_type);
+        let length_offset =
+            offset_of!(RawPyCompactUnicodeObject, base) + offset_of!(RawPyASCIIObject, length);
+        let hash_offset =
+            offset_of!(RawPyCompactUnicodeObject, base) + offset_of!(RawPyASCIIObject, hash);
+        let state_offset =
+            offset_of!(RawPyCompactUnicodeObject, base) + offset_of!(RawPyASCIIObject, state);
+        let utf8_length_offset = offset_of!(RawPyCompactUnicodeObject, utf8_length);
+        let utf8_offset = offset_of!(RawPyCompactUnicodeObject, utf8);
+        let data_offset = mem::size_of::<RawPyCompactUnicodeObject>();
+        let char_count = 6;
+        let char_size = mem::size_of::<u32>();
+        let data_size = (char_count + 1) * char_size;
+
+        assert_eq!(image.bytes.len(), data_offset + data_size);
+        assert_eq!(
+            image.align,
+            mem::align_of::<RawPyCompactUnicodeObject>() as u64
+        );
+        assert!(image.writable);
+        assert_eq!(
+            image.relocations,
+            vec![StaticPyObjectRelocation {
+                offset: type_offset as u64,
+                symbol: "PyUnicode_Type",
+            }]
+        );
+        assert_eq!(
+            i64::from_le_bytes(
+                image.bytes[offset_of!(RawPyCompactUnicodeObject, base)
+                    + offset_of!(RawPyASCIIObject, ob_base)
+                    + offset_of!(ffi::PyObject, ob_refcnt)
+                    ..offset_of!(RawPyCompactUnicodeObject, base)
+                        + offset_of!(RawPyASCIIObject, ob_base)
+                        + offset_of!(ffi::PyObject, ob_refcnt)
+                        + mem::size_of::<i64>()]
+                    .try_into()
+                    .expect("refcount slice should have i64 width")
+            ),
+            RAW_PYOBJECT_STATIC_IMMORTAL_INITIAL_REFCNT_64
+        );
+        assert_eq!(
+            ffi::Py_ssize_t::from_le_bytes(
+                image.bytes[length_offset..length_offset + mem::size_of::<ffi::Py_ssize_t>()]
+                    .try_into()
+                    .expect("length slice should have Py_ssize_t width")
+            ),
+            char_count as ffi::Py_ssize_t
+        );
+        assert_eq!(
+            ffi::Py_hash_t::from_le_bytes(
+                image.bytes[hash_offset..hash_offset + mem::size_of::<ffi::Py_hash_t>()]
+                    .try_into()
+                    .expect("hash slice should have Py_hash_t width")
+            ),
+            -1
+        );
+        assert_eq!(
+            u32::from_le_bytes(
+                image.bytes[state_offset..state_offset + mem::size_of::<u32>()]
+                    .try_into()
+                    .expect("state slice should have u32 width")
+            ),
+            raw_pyunicode_compact_state(RAW_PYUNICODE_4BYTE_KIND, false)
+        );
+        assert_eq!(
+            ffi::Py_ssize_t::from_le_bytes(
+                image.bytes
+                    [utf8_length_offset..utf8_length_offset + mem::size_of::<ffi::Py_ssize_t>()]
+                    .try_into()
+                    .expect("utf8 length slice should have Py_ssize_t width")
+            ),
+            0
+        );
+        assert_eq!(
+            usize::from_le_bytes(
+                image.bytes[utf8_offset..utf8_offset + mem::size_of::<usize>()]
+                    .try_into()
+                    .expect("utf8 pointer slice should have pointer width")
+            ),
+            0
+        );
+        let data = &image.bytes[data_offset..data_offset + data_size];
+        assert_eq!(
+            u32::from_le_bytes(data[0..4].try_into().expect("codepoint width")),
+            'c' as u32
+        );
+        assert_eq!(
+            u32::from_le_bytes(data[12..16].try_into().expect("codepoint width")),
+            '\u{e9}' as u32
+        );
+        assert_eq!(
+            u32::from_le_bytes(data[20..24].try_into().expect("codepoint width")),
+            '\u{1f40d}' as u32
+        );
+        assert_eq!(
+            u32::from_le_bytes(data[24..28].try_into().expect("terminator width")),
+            0
         );
     }
 }
