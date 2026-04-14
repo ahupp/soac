@@ -10,7 +10,6 @@ NONE = None
 EMPTY_TUPLE = ()
 _SOAC_RUNTIME_READY = False
 
-from asyncio import coroutines as _coroutines
 import collections.abc as _abc
 import keyword as _keyword
 import os as _os
@@ -66,7 +65,7 @@ from .sim import (
     xor,
 )
 
-_jit_make_bb_function = _soac_ext.make_bb_function
+make_function = _soac_ext.make_function
 
 next = _builtins.next
 iter = _builtins.iter
@@ -758,27 +757,6 @@ def code_template_gen(_it):
 async def code_template_async_gen():
     if False:
         yield None
-
-
-def make_function(
-    function_id,
-    kind,
-    captures,
-    param_defaults,
-    annotate_fn=None,
-    module_globals=None,
-):
-    func = _jit_make_bb_function(
-        function_id,
-        captures,
-        param_defaults,
-        annotate_fn,
-        module_globals,
-    )
-    if kind == "coroutine":
-        func._is_coroutine = _coroutines._is_coroutine
-
-    return func
 
 
 def annotation_forwardref_value(thunk, source, module_name):

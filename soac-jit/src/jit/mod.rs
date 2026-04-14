@@ -10243,6 +10243,32 @@ fn emit_codegen_simple_call_with_local_env(
             }
             return Some(tuple_value);
         }
+        if helper_id == RuntimeHelperId::MakeFunction && simple_args.len() == 6 {
+            let callable_is_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
+                call.func.as_ref(),
+                local_env,
+                emit_ctx,
+            );
+            let callable = emit_codegen_expr_with_local_env(
+                fb,
+                call.func.as_ref(),
+                local_env,
+                emit_ctx,
+                callable_is_borrowed,
+                jit_module,
+                func_imports,
+            );
+            return Some(emit_positional_vectorcall_with_local_env(
+                fb,
+                callable,
+                callable_is_borrowed,
+                simple_args.as_slice(),
+                local_env,
+                emit_ctx,
+                jit_module,
+                func_imports,
+            ));
+        }
         if helper_id == RuntimeHelperId::LoadDeletedName
             && simple_args.len() == 2
             && let Some(name) = codegen_expr_const_string(simple_args[0], emit_ctx.module_constants)

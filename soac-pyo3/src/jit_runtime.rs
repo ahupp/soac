@@ -857,6 +857,21 @@ fn instantiate_bb_function(
     Ok(entry.unbind())
 }
 
+fn function_kind_name(kind: FunctionKind) -> &'static str {
+    match kind {
+        FunctionKind::Function => "function",
+        FunctionKind::Coroutine => "coroutine",
+        FunctionKind::Generator => "generator",
+        FunctionKind::AsyncGenerator => "async_generator",
+    }
+}
+
+fn mark_coroutine_function(py: Python<'_>, func: &Bound<'_, PyAny>) -> PyResult<()> {
+    let coroutines = PyModule::import(py, "asyncio.coroutines")?;
+    let marker = coroutines.getattr("_is_coroutine")?;
+    func.setattr("_is_coroutine", marker)
+}
+
 fn instantiate_closure_backed_entry<'py>(
     py: Python<'py>,
     dp: &Bound<'py, PyModule>,
@@ -904,14 +919,15 @@ fn instantiate_closure_backed_entry<'py>(
     Ok(entry)
 }
 
-#[pyfunction]
-fn make_bb_function(
+#[pyfunction(signature = (function_id, kind, captures, param_defaults, annotate_fn=None, module_globals=None))]
+fn make_function(
     py: Python<'_>,
     function_id: u64,
+    kind: &str,
     captures: Py<PyAny>,
     param_defaults: Py<PyAny>,
-    annotate_fn: Py<PyAny>,
-    module_globals: Py<PyAny>,
+    annotate_fn: Option<Py<PyAny>>,
+    module_globals: Option<Py<PyAny>>,
 ) -> PyResult<Py<PyAny>> {
     let dp = import_dp_module(py)?;
     let function_id = FunctionId::from_packed(function_id);
@@ -930,8 +946,16 @@ fn make_bb_function(
         module_name = shared_state.module_name.as_str(),
         function_id = %function.function_id,
         function_qualname = function.names.qualname.as_str(),
-        "make_bb_function"
+        "make_function"
     );
+    let expected_kind = function_kind_name(*function.lowered_kind());
+    if kind != expected_kind {
+        return Err(PyRuntimeError::new_err(format!(
+            "JIT basic-block function instantiation expected kind {expected_kind:?} for fn#{function_id}, got {kind:?}"
+        )));
+    }
+    let annotate_fn = annotate_fn.unwrap_or_else(|| py.None());
+    let module_globals = module_globals.unwrap_or_else(|| py.None());
     let module_globals = module_globals.bind(py);
     module_globals.cast::<PyDict>().map_err(|_| {
         PyTypeError::new_err("JIT basic-block function instantiation requires module globals dict")
@@ -939,7 +963,7 @@ fn make_bb_function(
     let module_name = shared_state.module_name.clone();
     let module_runtime =
         module_runtime_from_shared_state(compile_session, shared_state, &module_globals);
-    instantiate_bb_function(
+    let func = instantiate_bb_function(
         py,
         &dp,
         &module_name,
@@ -949,7 +973,11 @@ fn make_bb_function(
         &module_globals,
         annotate_fn.bind(py),
         &module_runtime,
-    )
+    )?;
+    if *function.lowered_kind() == FunctionKind::Coroutine {
+        mark_coroutine_function(py, func.bind(py))?;
+    }
+    Ok(func)
 }
 
 #[pyfunction]
@@ -1187,7 +1215,7 @@ fn profile_watch_type_key_layout(type_obj: &Bound<'_, PyAny>) -> PyResult<()> {
 pub(crate) fn add_module_functions(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(create_module, module)?)?;
     module.add_function(wrap_pyfunction!(exec_module, module)?)?;
-    module.add_function(wrap_pyfunction!(make_bb_function, module)?)?;
+    module.add_function(wrap_pyfunction!(make_function, module)?)?;
     module.add_function(wrap_pyfunction!(profile_watch_type_key_layout, module)?)?;
     Ok(())
 }
