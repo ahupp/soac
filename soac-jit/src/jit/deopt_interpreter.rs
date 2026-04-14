@@ -145,6 +145,8 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             },
             InstrCodegen::BinOp(binop) => unsafe { self.execute_binop_owned(binop) },
             InstrCodegen::UnaryOp(unary) => unsafe { self.execute_unary_op_owned(unary) },
+            InstrCodegen::GetAttr(getattr) => unsafe { self.execute_getattr_owned(getattr) },
+            InstrCodegen::GetItem(getitem) => unsafe { self.execute_getitem_owned(getitem) },
             InstrCodegen::Store(store) => unsafe { self.execute_store_owned(store) },
             InstrCodegen::Del(del) => unsafe { self.execute_del_owned(del) },
             _ => Err(format!(
@@ -191,6 +193,58 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             ffi::Py_DECREF(operand.cast::<ffi::PyObject>());
         }
         Ok(result)
+    }
+
+    #[cold]
+    unsafe fn execute_getattr_owned(
+        &mut self,
+        getattr: &soac_blockpy::block_py::GetAttr<InstrCodegen>,
+    ) -> Result<ObjPtr, String> {
+        let value = unsafe { self.execute_expr_owned(&getattr.value)? };
+        if value.is_null() {
+            return Ok(ptr::null_mut());
+        }
+        let attr = unsafe { self.execute_expr_owned(&getattr.attr)? };
+        if attr.is_null() {
+            unsafe {
+                ffi::Py_DECREF(value.cast::<ffi::PyObject>());
+            }
+            return Ok(ptr::null_mut());
+        }
+        let result = unsafe {
+            ffi::PyObject_GetAttr(value.cast::<ffi::PyObject>(), attr.cast::<ffi::PyObject>())
+        };
+        unsafe {
+            ffi::Py_DECREF(attr.cast::<ffi::PyObject>());
+            ffi::Py_DECREF(value.cast::<ffi::PyObject>());
+        }
+        Ok(result.cast())
+    }
+
+    #[cold]
+    unsafe fn execute_getitem_owned(
+        &mut self,
+        getitem: &soac_blockpy::block_py::GetItem<InstrCodegen>,
+    ) -> Result<ObjPtr, String> {
+        let value = unsafe { self.execute_expr_owned(&getitem.value)? };
+        if value.is_null() {
+            return Ok(ptr::null_mut());
+        }
+        let index = unsafe { self.execute_expr_owned(&getitem.index)? };
+        if index.is_null() {
+            unsafe {
+                ffi::Py_DECREF(value.cast::<ffi::PyObject>());
+            }
+            return Ok(ptr::null_mut());
+        }
+        let result = unsafe {
+            ffi::PyObject_GetItem(value.cast::<ffi::PyObject>(), index.cast::<ffi::PyObject>())
+        };
+        unsafe {
+            ffi::Py_DECREF(index.cast::<ffi::PyObject>());
+            ffi::Py_DECREF(value.cast::<ffi::PyObject>());
+        }
+        Ok(result.cast())
     }
 
     #[cold]

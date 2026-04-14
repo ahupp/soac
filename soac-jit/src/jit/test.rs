@@ -3,10 +3,10 @@ use soac_blockpy::block_py::{
     BinOp, BinOpKind, BlockEdge, BlockLabel, BlockParamRole, BlockPyFunction, BlockPyModule,
     BlockTerm, Call, CallArgKeyword, CallArgPositional, CallDirect, CellLocation, ChildVisitable,
     ClosureInit, ClosureSlot, CodegenBlock, CounterDef, CounterSite, Del, DelItem, FunctionId,
-    FunctionName, HasMeta, HasSemanticInstrId, InstrCodegen, InstrResolved, Literal, LiteralValue,
-    Load, LocalLocation, Meta, ModuleNameGen, NameLocation, NumberLiteral, NumberLiteralValue,
-    Param, ParamKind, ParamSpec, ResolvedName, StorageLayout, Store, StringLiteral, UnaryOp,
-    UnaryOpKind, Visit, VisitMut, WithMeta,
+    FunctionName, GetAttr, GetItem, HasMeta, HasSemanticInstrId, InstrCodegen, InstrResolved,
+    Literal, LiteralValue, Load, LocalLocation, Meta, ModuleNameGen, NameLocation, NumberLiteral,
+    NumberLiteralValue, Param, ParamKind, ParamSpec, ResolvedName, StorageLayout, Store,
+    StringLiteral, UnaryOp, UnaryOpKind, Visit, VisitMut, WithMeta,
 };
 use soac_blockpy::passes::{
     CodegenModuleShape, instrument_bb_module_with_block_entry_counters,
@@ -6109,6 +6109,164 @@ def f(x):
                 unsafe {
                     ffi::Py_DECREF(operand);
                 }
+            }
+        });
+    }
+
+    #[test]
+    fn deopt_block_tail_continuation_executes_return_getattr() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|_| {
+            let function = with_single_test_block(
+                test_function(),
+                vec![],
+                ret_term(op_expr(GetAttr::new(
+                    name_expr(test_constant_name(0)),
+                    name_expr(test_constant_name(1)),
+                ))),
+            );
+            let function_id = function.function_id;
+            let block = function.entry_block().label;
+            let value = unsafe { ffi::PyLong_FromLong(222_333_444) };
+            assert!(
+                !value.is_null(),
+                "test getattr value PyLong allocation should succeed"
+            );
+            let attr = unsafe { ffi::PyUnicode_FromString(c"denominator".as_ptr()) };
+            assert!(
+                !attr.is_null(),
+                "test getattr attr string allocation should succeed"
+            );
+            let table = RuntimeJitDeoptTable {
+                function_id,
+                function: Box::new(function),
+                module_constant_ptrs: vec![value.cast(), attr.cast()],
+                points: vec![RuntimeJitDeoptRecord {
+                    id: PlannedJitDeoptPointId {
+                        function_id,
+                        ordinal: 0,
+                    },
+                    resume_point: LocalEnvResumePoint::BeforeTerm { function_id, block },
+                    precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                    locals: vec![],
+                    continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
+                        cursor: RuntimeJitDeoptCursor::at_block_entry(block),
+                    },
+                }],
+            };
+            let result = unsafe {
+                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                    std::ptr::addr_of!(table).cast_mut().cast(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert!(
+                !result.is_null(),
+                "return-getattr deopt should produce a value"
+            );
+            assert!(
+                unsafe { ffi::PyErr_Occurred() }.is_null(),
+                "successful return-getattr deopt should not leave a Python exception"
+            );
+            assert_eq!(
+                unsafe { ffi::PyLong_AsLongLong(result.cast::<ffi::PyObject>()) },
+                1,
+                "return-getattr deopt should execute PyObject_GetAttr"
+            );
+            unsafe {
+                ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+                ffi::Py_DECREF(attr);
+                ffi::Py_DECREF(value);
+            }
+        });
+    }
+
+    #[test]
+    fn deopt_block_tail_continuation_executes_return_getitem() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|_| {
+            let function = with_single_test_block(
+                test_function(),
+                vec![],
+                ret_term(op_expr(GetItem::new(
+                    name_expr(test_constant_name(0)),
+                    name_expr(test_constant_name(1)),
+                ))),
+            );
+            let function_id = function.function_id;
+            let block = function.entry_block().label;
+            let list = unsafe { ffi::PyList_New(1) };
+            assert!(
+                !list.is_null(),
+                "test getitem list allocation should succeed"
+            );
+            let item = unsafe { ffi::PyLong_FromLong(777_888_999) };
+            assert!(
+                !item.is_null(),
+                "test getitem item allocation should succeed"
+            );
+            unsafe {
+                ffi::Py_INCREF(item);
+            }
+            assert_eq!(
+                unsafe { ffi::PyList_SetItem(list, 0, item) },
+                0,
+                "test getitem list setup should succeed"
+            );
+            let index = unsafe { ffi::PyLong_FromLong(0) };
+            assert!(
+                !index.is_null(),
+                "test getitem index allocation should succeed"
+            );
+            let table = RuntimeJitDeoptTable {
+                function_id,
+                function: Box::new(function),
+                module_constant_ptrs: vec![list.cast(), index.cast()],
+                points: vec![RuntimeJitDeoptRecord {
+                    id: PlannedJitDeoptPointId {
+                        function_id,
+                        ordinal: 0,
+                    },
+                    resume_point: LocalEnvResumePoint::BeforeTerm { function_id, block },
+                    precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                    locals: vec![],
+                    continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
+                        cursor: RuntimeJitDeoptCursor::at_block_entry(block),
+                    },
+                }],
+            };
+            let result = unsafe {
+                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                    std::ptr::addr_of!(table).cast_mut().cast(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert!(
+                !result.is_null(),
+                "return-getitem deopt should produce a value"
+            );
+            assert!(
+                unsafe { ffi::PyErr_Occurred() }.is_null(),
+                "successful return-getitem deopt should not leave a Python exception"
+            );
+            assert_eq!(
+                unsafe { ffi::PyLong_AsLongLong(result.cast::<ffi::PyObject>()) },
+                777_888_999,
+                "return-getitem deopt should execute PyObject_GetItem"
+            );
+            unsafe {
+                ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+                ffi::Py_DECREF(index);
+                ffi::Py_DECREF(list);
+                ffi::Py_DECREF(item);
             }
         });
     }

@@ -1938,6 +1938,14 @@ fn runtime_jit_deopt_expr_supported(expr: &InstrCodegen) -> bool {
                 && runtime_jit_deopt_expr_supported(&binop.right)
         }
         InstrCodegen::UnaryOp(unary) => runtime_jit_deopt_expr_supported(&unary.operand),
+        InstrCodegen::GetAttr(getattr) => {
+            runtime_jit_deopt_expr_supported(&getattr.value)
+                && runtime_jit_deopt_expr_supported(&getattr.attr)
+        }
+        InstrCodegen::GetItem(getitem) => {
+            runtime_jit_deopt_expr_supported(&getitem.value)
+                && runtime_jit_deopt_expr_supported(&getitem.index)
+        }
         _ => false,
     }
 }
