@@ -5432,6 +5432,93 @@ def f(x):
     }
 
     #[test]
+    fn deopt_block_tail_continuation_executes_global_delete() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|_| {
+            let function = with_single_test_block(
+                test_function(),
+                vec![op_expr(Del::new(test_global_name("x"), false))],
+                ret_term(none_expr()),
+            );
+            let function_id = function.function_id;
+            let block = function.entry_block().label;
+            let table = RuntimeJitDeoptTable {
+                function_id,
+                function: Box::new(function),
+                module_constant_ptrs: Vec::new(),
+                points: vec![RuntimeJitDeoptRecord {
+                    id: PlannedJitDeoptPointId {
+                        function_id,
+                        ordinal: 0,
+                    },
+                    resume_point: LocalEnvResumePoint::BeforeInstr {
+                        key: InstrKey::new(function_id, InstrId::new(block, 0)),
+                    },
+                    precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                    locals: vec![],
+                    continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
+                        block,
+                        start_body_index: 0,
+                    },
+                }],
+            };
+            let globals = unsafe { ffi::PyDict_New() };
+            assert!(
+                !globals.is_null(),
+                "test globals dict allocation should succeed"
+            );
+            let key = unsafe { ffi::PyUnicode_FromString(c"x".as_ptr()) };
+            assert!(!key.is_null(), "test key allocation should succeed");
+            let value = unsafe { ffi::PyLong_FromLong(333_444_555) };
+            assert!(!value.is_null(), "test value allocation should succeed");
+            assert_eq!(
+                unsafe { ffi::PyDict_SetItem(globals, key, value) },
+                0,
+                "test globals insertion should succeed"
+            );
+            let before = unsafe { ffi::Py_REFCNT(value) };
+            let result = unsafe {
+                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                    std::ptr::addr_of!(table).cast_mut().cast(),
+                    globals.cast(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!(
+                result,
+                unsafe { ffi::Py_None() }.cast(),
+                "block-tail global delete deopt should continue to return None"
+            );
+            assert!(
+                unsafe { ffi::PyErr_Occurred() }.is_null(),
+                "successful block-tail delete deopt should not leave a Python exception"
+            );
+            assert!(
+                unsafe { ffi::PyDict_GetItemWithError(globals, key) }.is_null(),
+                "global delete replay should remove the key"
+            );
+            assert!(
+                unsafe { ffi::PyErr_Occurred() }.is_null(),
+                "deleted key lookup should not leave a Python exception"
+            );
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(value) },
+                before - 1,
+                "global delete replay should drop the globals dict reference"
+            );
+            unsafe {
+                ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+                ffi::Py_DECREF(value);
+                ffi::Py_DECREF(key);
+                ffi::Py_DECREF(globals);
+            }
+        });
+    }
+
+    #[test]
     fn deopt_resume_call_uses_function_env_deopt_table_and_ordinal() {
         let compile_session = crate::session::CompileSession::new();
         let mut jit_module =

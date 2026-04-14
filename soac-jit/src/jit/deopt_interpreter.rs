@@ -89,8 +89,9 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
                 self.execute_load_owned(load.name.id.as_str(), load.name.location)
             },
             InstrCodegen::Store(store) => unsafe { self.execute_store_owned(store) },
+            InstrCodegen::Del(del) => unsafe { self.execute_del_owned(del) },
             _ => Err(format!(
-                "deopt continuation only supports simple load/store expressions, got {expr:?}"
+                "deopt continuation only supports simple load/store/del expressions, got {expr:?}"
             )),
         }
     }
@@ -148,6 +149,58 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
         }
         unsafe { ffi::Py_INCREF(value.cast::<ffi::PyObject>()) };
         Ok(value)
+    }
+
+    #[cold]
+    unsafe fn execute_del_owned(
+        &self,
+        del: &soac_blockpy::block_py::Del<InstrCodegen>,
+    ) -> Result<ObjPtr, String> {
+        match del.name.location {
+            NameLocation::Global(_) | NameLocation::GlobalName => unsafe {
+                self.execute_global_del_owned(del.name.id.as_str(), del.quietly)
+            },
+            location => Err(format!(
+                "deopt continuation does not support deleting {location:?} for {:?}",
+                del.name.id.as_str()
+            )),
+        }
+    }
+
+    #[cold]
+    unsafe fn execute_global_del_owned(&self, name: &str, quietly: bool) -> Result<ObjPtr, String> {
+        let globals_obj = self.invocation.globals_obj();
+        if globals_obj.is_null() {
+            return Err(format!(
+                "deopt continuation expected module globals for global delete {name:?}"
+            ));
+        }
+        let name_len = ffi::Py_ssize_t::try_from(name.len()).map_err(|_| {
+            format!("global-delete deopt name {name:?} is too large to materialize as PyUnicode")
+        })?;
+        let name_obj = unsafe { ffi::PyUnicode_FromStringAndSize(name.as_ptr().cast(), name_len) };
+        if name_obj.is_null() {
+            return Ok(ptr::null_mut());
+        }
+        let result = if quietly {
+            unsafe {
+                super::specialized_helpers::dp_jit_del_global_quietly(
+                    globals_obj,
+                    name_obj.cast::<c_void>(),
+                    -1,
+                )
+            }
+        } else {
+            unsafe {
+                super::specialized_helpers::dp_jit_del_global(
+                    globals_obj,
+                    name_obj.cast::<c_void>(),
+                    -1,
+                )
+            }
+        };
+        unsafe { ffi::Py_DECREF(name_obj) };
+        Ok(result)
     }
 
     #[cold]
