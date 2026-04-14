@@ -799,32 +799,6 @@ unsafe extern "C" fn load_global_obj_hook(
     let result = load_global_obj_impl(globals_obj, name_obj, slot_index);
     ensure_global_load_error(result, name_obj)
 }
-unsafe extern "C" fn tuple_new_hook(size: i64) -> ObjPtr {
-    if size < 0 {
-        ffi::PyErr_SetString(
-            ffi::PyExc_RuntimeError,
-            b"invalid tuple size in JIT\0".as_ptr() as *const i8,
-        );
-        return ptr::null_mut();
-    }
-    let result = ffi::PyTuple_New(size as ffi::Py_ssize_t) as ObjPtr;
-    result
-}
-unsafe extern "C" fn tuple_set_item_hook(tuple_obj: ObjPtr, index: i64, value: ObjPtr) -> i32 {
-    if tuple_obj.is_null() || value.is_null() || index < 0 {
-        ffi::PyErr_SetString(
-            ffi::PyExc_RuntimeError,
-            b"invalid tuple_set_item arguments in JIT\0".as_ptr() as *const i8,
-        );
-        return -1;
-    }
-    let result = ffi::PyTuple_SetItem(
-        tuple_obj as *mut ffi::PyObject,
-        index as ffi::Py_ssize_t,
-        value as *mut ffi::PyObject,
-    );
-    result
-}
 unsafe extern "C" fn dict_new_hook() -> ObjPtr {
     ffi::PyDict_New() as ObjPtr
 }
@@ -1080,8 +1054,6 @@ mod test_only_export_stubs {
         live_values: ObjPtr,
         live_value_count: i64
     ));
-    panic_obj_export!(dp_jit_tuple_new(size: i64));
-    panic_i32_export!(dp_jit_tuple_set_item(tuple_obj: ObjPtr, index: i64, item: ObjPtr));
     panic_obj_export!(dp_jit_dict_new());
     panic_i32_export!(dp_jit_dict_set_item(dict_obj: ObjPtr, key: ObjPtr, value: ObjPtr));
     panic_i32_export!(dp_jit_is_true(value: ObjPtr));
@@ -1369,14 +1341,6 @@ fn set_deopt_unsupported_continuation_error(detail: String) {
     }
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn dp_jit_tuple_new(size: i64) -> ObjPtr {
-    tuple_new_hook(size)
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn dp_jit_tuple_set_item(tuple_obj: ObjPtr, index: i64, item: ObjPtr) -> i32 {
-    tuple_set_item_hook(tuple_obj, index, item)
-}
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_dict_new() -> ObjPtr {
     dict_new_hook()
@@ -2079,8 +2043,6 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
         dp_jit_del_deref_quietly as *const u8,
     );
     builder.symbol("dp_jit_deopt_resume", dp_jit_deopt_resume as *const u8);
-    builder.symbol("dp_jit_tuple_new", dp_jit_tuple_new as *const u8);
-    builder.symbol("dp_jit_tuple_set_item", dp_jit_tuple_set_item as *const u8);
     builder.symbol("dp_jit_dict_new", dp_jit_dict_new as *const u8);
     builder.symbol("dp_jit_dict_set_item", dp_jit_dict_set_item as *const u8);
     builder.symbol("dp_jit_is_true", dp_jit_is_true as *const u8);

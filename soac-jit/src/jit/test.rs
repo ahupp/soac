@@ -5741,6 +5741,22 @@ def write_point(point, value):
             .collect()
     }
 
+    fn declared_user_names_for_symbols(
+        built: &BuiltSpecializedFunction,
+        symbols: &[&'static str],
+    ) -> Vec<ir::UserExternalName> {
+        built
+            .func_id_to_symbol
+            .iter()
+            .filter_map(|(func_id, symbol)| {
+                symbols
+                    .iter()
+                    .any(|wanted| wanted == symbol)
+                    .then(|| ir::UserExternalName::new(0, *func_id))
+            })
+            .collect()
+    }
+
     fn imported_symbol_names(built: &BuiltSpecializedFunction) -> Vec<&'static str> {
         let mut symbols: Vec<&'static str> = built.import_id_to_symbol.values().copied().collect();
         symbols.sort_unstable();
@@ -16007,7 +16023,7 @@ def f(x, y):
     }
 
     #[test]
-    fn specialized_jit_tuple_values_uses_tuple_c_api_helpers() {
+    fn specialized_jit_tuple_values_uses_runtime_tuple_helpers() {
         let blocks = [1usize as ObjPtr];
         let mut constants = TestConstantPool::default();
         let function = with_single_test_block(
@@ -16029,22 +16045,30 @@ def f(x, y):
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
         let built =
             build_test_jit_function_with_constants(&module, &function, &blocks, &module_constants);
-
         let tuple_new_helpers =
-            import_user_names_for_symbols(&built, &[DP_JIT_TUPLE_NEW_IMPORT.symbol]);
-        let tuple_set_item_helpers =
-            import_user_names_for_symbols(&built, &[DP_JIT_TUPLE_SET_ITEM_IMPORT.symbol]);
+            declared_user_names_for_symbols(&built, &[SOAC_RUNTIME_TUPLE_NEW_IMPORT.symbol]);
+        let tuple_set_item_helpers = declared_user_names_for_symbols(
+            &built,
+            &[SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_IMPORT.symbol],
+        );
+        let public_tuple_set_item_helpers =
+            import_user_names_for_symbols(&built, &["PyTuple_SetItem"]);
         let vectorcall_helpers =
             import_user_names_for_symbols(&built, &[DP_JIT_PY_VECTORCALL_IMPORT.symbol]);
         assert_eq!(
             count_direct_calls_to_runtime_helpers(&built.ctx.func, &tuple_new_helpers),
             1,
-            "tuple_values should allocate via the tuple C-API helper"
+            "tuple_values should allocate via the tuple runtime helper"
         );
         assert_eq!(
             count_direct_calls_to_runtime_helpers(&built.ctx.func, &tuple_set_item_helpers),
             1,
-            "tuple_values should fill via the tuple C-API helper"
+            "tuple_values should fill via the fresh-tuple runtime helper"
+        );
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &public_tuple_set_item_helpers),
+            0,
+            "tuple_values should not call PyTuple_SetItem for fresh tuple stores"
         );
         assert_eq!(
             count_direct_calls_to_runtime_helpers(&built.ctx.func, &vectorcall_helpers),

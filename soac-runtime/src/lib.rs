@@ -43,6 +43,13 @@ struct RawPyVarObject {
 }
 
 #[repr(C)]
+struct RawPyTupleObject {
+    ob_base: RawPyVarObject,
+    ob_hash: isize,
+    ob_item: [*mut RawPyObject; 1],
+}
+
+#[repr(C)]
 struct RawPyTypeObject {
     ob_base: RawPyVarObject,
     tp_name: *const u8,
@@ -186,6 +193,7 @@ unsafe extern "C" {
     fn PyUnicode_GetLength(unicode: *mut c_void) -> isize;
     fn PyUnicode_ReadChar(unicode: *mut c_void, index: isize) -> u32;
     fn PyObject_Size(obj: *mut c_void) -> isize;
+    fn PyTuple_New(size: isize) -> *mut c_void;
     fn PyLong_AsLongLong(obj: *mut c_void) -> i64;
     fn PyLong_AsLongLongAndOverflow(obj: *mut c_void, overflow: *mut c_int) -> i64;
     fn _PyDict_SetIndexedItem(dict: *mut c_void, index: isize, value: *mut c_void) -> i32;
@@ -353,6 +361,33 @@ pub unsafe extern "C" fn soac_runtime_incref_applied(obj: *mut c_void) -> i32 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soac_runtime_set_raised_exception(tstate: *mut c_void, exc: *mut c_void) {
     set_raised_exception_direct!(tstate.cast::<RawPyThreadState>(), exc.cast());
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soac_runtime_tuple_new(size: isize) -> *mut c_void {
+    unsafe { PyTuple_New(size) }
+}
+
+// Fresh-tuple construction helper: steals `value`; caller proves the slot is in bounds and unset.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soac_runtime_tuple_set_item_stolen(
+    tuple: *mut c_void,
+    index: isize,
+    value: *mut c_void,
+) {
+    debug_assert!(!tuple.is_null());
+    debug_assert!(!value.is_null());
+    debug_assert!(index >= 0);
+    debug_assert!(index < unsafe { (*tuple.cast::<RawPyTupleObject>()).ob_base.ob_size });
+    let items = unsafe {
+        tuple
+            .cast::<u8>()
+            .add(core::mem::offset_of!(RawPyTupleObject, ob_item))
+            .cast::<*mut RawPyObject>()
+    };
+    unsafe {
+        *items.offset(index) = value.cast::<RawPyObject>();
+    }
 }
 
 #[unsafe(no_mangle)]

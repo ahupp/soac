@@ -944,12 +944,15 @@ static DP_JIT_STORE_CELL_IMPORT: ImportSpec = ImportSpec::new(
     &[SigType::Pointer, SigType::Pointer],
     &[SigType::Pointer],
 );
-static DP_JIT_TUPLE_NEW_IMPORT: ImportSpec =
-    ImportSpec::new("dp_jit_tuple_new", &[SigType::I64], &[SigType::Pointer]);
-static DP_JIT_TUPLE_SET_ITEM_IMPORT: ImportSpec = ImportSpec::new(
-    "dp_jit_tuple_set_item",
+static SOAC_RUNTIME_TUPLE_NEW_IMPORT: ImportSpec = ImportSpec::local(
+    SOAC_RUNTIME_TUPLE_NEW_SYMBOL,
+    &[SigType::I64],
+    &[SigType::Pointer],
+);
+static SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_IMPORT: ImportSpec = ImportSpec::local(
+    SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_SYMBOL,
     &[SigType::Pointer, SigType::I64, SigType::Pointer],
-    &[SigType::I32],
+    &[],
 );
 static DP_JIT_IS_TRUE_IMPORT: ImportSpec =
     ImportSpec::new("dp_jit_is_true", &[SigType::Pointer], &[SigType::I32]);
@@ -998,6 +1001,8 @@ static DP_JIT_VECTORCALL_COMPILE_FUNCTION_ENV_IMPORT: ImportSpec = ImportSpec::n
 struct ModuleFuncImports {
     func_ids_by_internal_id: Vec<Option<FuncId>>,
     import_id_to_symbol: HashMap<u32, &'static str>,
+    #[cfg(test)]
+    func_id_to_symbol: HashMap<u32, &'static str>,
 }
 
 impl ModuleFuncImports {
@@ -1005,11 +1010,18 @@ impl ModuleFuncImports {
         Self {
             func_ids_by_internal_id: Vec::new(),
             import_id_to_symbol: HashMap::new(),
+            #[cfg(test)]
+            func_id_to_symbol: HashMap::new(),
         }
     }
 
     fn debug_symbols(&self) -> &HashMap<u32, &'static str> {
         &self.import_id_to_symbol
+    }
+
+    #[cfg(test)]
+    fn debug_declared_symbols(&self) -> &HashMap<u32, &'static str> {
+        &self.func_id_to_symbol
     }
 
     fn ensure_declared(
@@ -1036,6 +1048,8 @@ impl ModuleFuncImports {
             }
         };
         self.func_ids_by_internal_id[internal_id] = Some(func_id);
+        #[cfg(test)]
+        self.func_id_to_symbol.insert(func_id.as_u32(), spec.symbol);
         if matches!(spec.linkage, Linkage::Import) {
             self.import_id_to_symbol
                 .insert(func_id.as_u32(), spec.symbol);
@@ -1113,6 +1127,8 @@ struct BuiltSpecializedFunction {
     default_adapter_id: Option<cranelift_module::FuncId>,
     default_adapter_symbol: Option<String>,
     import_id_to_symbol: HashMap<u32, &'static str>,
+    #[cfg(test)]
+    func_id_to_symbol: HashMap<u32, &'static str>,
     block_annotations: ClifBlockDisplayAnnotations,
 }
 
@@ -6610,8 +6626,6 @@ fn emit_pack_current_values_tuple(
     let loop_block = fb.create_block();
     fb.append_block_param(loop_block, i64_ty);
     fb.append_block_param(loop_block, ptr_ty);
-    let set_fail_block = fb.create_block();
-    fb.append_block_param(set_fail_block, ptr_ty);
     let done_block = fb.create_block();
     fb.append_block_param(done_block, ptr_ty);
     let body_block = fb.create_block();
@@ -6651,30 +6665,16 @@ fn emit_pack_current_values_tuple(
     let value_addr = fb.ins().iadd(values_base, value_offset);
     let value = fb.ins().load(ptr_ty, ir::MemFlags::new(), value_addr, 0);
     fb.ins().call(ctx.incref_ref, &[value]);
-    let set_inst = fb
-        .ins()
+    fb.ins()
         .call(ctx.tuple_set_item_ref, &[body_tuple, body_index, value]);
-    let set_result = fb.inst_results(set_inst)[0];
-    let set_failed = fb
-        .ins()
-        .icmp_imm(ir::condcodes::IntCC::NotEqual, set_result, 0);
     let next_index = fb.ins().iadd_imm(body_index, 1);
-    fb.ins().brif(
-        set_failed,
-        set_fail_block,
-        &[ir::BlockArg::Value(body_tuple)],
+    fb.ins().jump(
         loop_block,
         &[
             ir::BlockArg::Value(next_index),
             ir::BlockArg::Value(body_tuple),
         ],
     );
-
-    fb.switch_to_block(set_fail_block);
-    let failed_tuple = fb.block_params(set_fail_block)[0];
-    emit_release_owned_inputs(fb, ctx, &[failed_tuple]);
-    fb.ins()
-        .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
 
     fb.switch_to_block(done_block);
     fb.block_params(done_block)[0]
@@ -6685,7 +6685,6 @@ fn emit_call_args_tuple_from_values(
     arg_values: &[(ir::Value, bool)],
     ctx: &JitEmitCtx<'_>,
 ) -> ir::Value {
-    let ptr_ty = ctx.consts.ptr_ty;
     let i64_ty = ctx.consts.i64_ty;
     let tuple_len = fb.ins().iconst(i64_ty, arg_values.len() as i64);
     let tuple_inst = fb.ins().call(ctx.tuple_new_ref, &[tuple_len]);
@@ -6697,30 +6696,10 @@ fn emit_call_args_tuple_from_values(
             fb.ins().call(ctx.incref_ref, &[*value]);
         }
         let item_index = fb.ins().iconst(i64_ty, index as i64);
-        let set_inst = fb.ins().call(
+        fb.ins().call(
             ctx.tuple_set_item_ref,
             &[call_args_tuple, item_index, *value],
         );
-        let set_result = fb.inst_results(set_inst)[0];
-        let set_failed = fb
-            .ins()
-            .icmp_imm(ir::condcodes::IntCC::NotEqual, set_result, 0);
-        let set_ok_block = fb.create_block();
-        let set_fail_block = fb.create_block();
-        fb.append_block_param(set_fail_block, ptr_ty);
-        fb.ins().brif(
-            set_failed,
-            set_fail_block,
-            &[ir::BlockArg::Value(call_args_tuple)],
-            set_ok_block,
-            &[],
-        );
-        fb.switch_to_block(set_fail_block);
-        let failed_tuple = fb.block_params(set_fail_block)[0];
-        emit_release_owned_inputs(fb, ctx, &[failed_tuple]);
-        fb.ins()
-            .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
-        fb.switch_to_block(set_ok_block);
     }
 
     call_args_tuple
@@ -14781,6 +14760,8 @@ impl RuntimeSupportInliner {
                     | SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL
                     | SOAC_RUNTIME_PROBE_FIELD_INDEXED_SYMBOL
                     | SOAC_RUNTIME_STORE_FIELD_INDEXED_SYMBOL
+                    | SOAC_RUNTIME_TUPLE_NEW_SYMBOL
+                    | SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_SYMBOL
             ) {
                 continue;
             }
@@ -15165,6 +15146,9 @@ pub(crate) const SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL: &str =
     "soac_runtime_store_global_indexed";
 pub(crate) const SOAC_RUNTIME_PROBE_FIELD_INDEXED_SYMBOL: &str = "soac_runtime_probe_field_indexed";
 pub(crate) const SOAC_RUNTIME_STORE_FIELD_INDEXED_SYMBOL: &str = "soac_runtime_store_field_indexed";
+pub(crate) const SOAC_RUNTIME_TUPLE_NEW_SYMBOL: &str = "soac_runtime_tuple_new";
+pub(crate) const SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_SYMBOL: &str =
+    "soac_runtime_tuple_set_item_stolen";
 #[cfg(test)]
 pub(crate) const SOAC_RUNTIME_PYLONG_AS_I64_SYMBOL: &str = "soac_runtime_pylong_as_i64";
 pub(crate) const SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_SYMBOL: &str =
@@ -17323,9 +17307,12 @@ fn build_cranelift_run_bb_specialized_function(
         let store_cell_ref =
             func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_STORE_CELL_IMPORT);
         let tuple_new_ref =
-            func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_TUPLE_NEW_IMPORT);
-        let tuple_set_item_ref =
-            func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_TUPLE_SET_ITEM_IMPORT);
+            func_imports.get_or_panic(jit_module, &mut fb.func, &SOAC_RUNTIME_TUPLE_NEW_IMPORT);
+        let tuple_set_item_ref = func_imports.get_or_panic(
+            jit_module,
+            &mut fb.func,
+            &SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_IMPORT,
+        );
         let set_raised_exception_ref = func_imports.get_or_panic(
             jit_module,
             &mut fb.func,
@@ -17930,6 +17917,8 @@ fn build_cranelift_run_bb_specialized_function(
         default_adapter_id,
         default_adapter_symbol,
         import_id_to_symbol: module_imports.debug_symbols().clone(),
+        #[cfg(test)]
+        func_id_to_symbol: module_imports.debug_declared_symbols().clone(),
         block_annotations,
     })
 }
