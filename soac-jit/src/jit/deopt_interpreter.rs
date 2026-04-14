@@ -1,11 +1,11 @@
 use super::{
-    RuntimeJitDeoptContinuation, RuntimeJitDeoptInvocation, RuntimeJitDeoptLocals,
+    RuntimeJitDeoptCursor, RuntimeJitDeoptInvocation, RuntimeJitDeoptLocals,
     specialized_helpers::ObjPtr,
 };
 use crate::module_constants::load_runtime_name_owned;
 use pyo3::ffi;
 use soac_blockpy::block_py::{
-    BinOp, BinOpKind, BlockLabel, BlockTerm, InstrCodegen, LocalLocation, NameLocation,
+    BinOp, BinOpKind, BlockTerm, InstrCodegen, LocalLocation, NameLocation,
 };
 use std::ffi::c_void;
 use std::ptr;
@@ -36,27 +36,25 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
 
     #[cold]
     fn execute(&mut self) -> Result<ObjPtr, String> {
-        match self.invocation.record().continuation() {
-            RuntimeJitDeoptContinuation::ResumeBlockTail {
-                block,
-                start_body_index,
-            } => unsafe { self.execute_block_tail(*block, *start_body_index) },
-            RuntimeJitDeoptContinuation::Unimplemented => Err(format!(
+        let Some(cursor) = self.invocation.record().initial_cursor() else {
+            return Err(format!(
                 "{}, {}",
                 self.invocation.describe(),
                 self.locals.describe()
-            )),
-        }
+            ));
+        };
+        unsafe { self.execute_from_cursor(cursor) }
     }
 
     #[cold]
-    unsafe fn execute_block_tail(
+    unsafe fn execute_from_cursor(
         &mut self,
-        mut block_label: BlockLabel,
-        mut start_body_index: usize,
+        mut cursor: RuntimeJitDeoptCursor,
     ) -> Result<ObjPtr, String> {
         let function = self.invocation.function();
         loop {
+            let block_label = cursor.block();
+            let start_body_index = cursor.body_index();
             let block = function
                 .blocks
                 .iter()
@@ -84,8 +82,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             match &block.term {
                 BlockTerm::Return(value) => return unsafe { self.execute_expr_owned(value) },
                 BlockTerm::Jump(edge) if edge.args.is_empty() => {
-                    block_label = edge.target;
-                    start_body_index = 0;
+                    cursor = RuntimeJitDeoptCursor::at_block_entry(edge.target);
                 }
                 BlockTerm::IfTerm(if_term) => {
                     let test = unsafe { self.execute_expr_owned(&if_term.test)? };
@@ -99,12 +96,12 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
                     if truth < 0 {
                         return Ok(ptr::null_mut());
                     }
-                    block_label = if truth != 0 {
+                    let next_block = if truth != 0 {
                         if_term.then_label
                     } else {
                         if_term.else_label
                     };
-                    start_body_index = 0;
+                    cursor = RuntimeJitDeoptCursor::at_block_entry(next_block);
                 }
                 BlockTerm::BranchTable(branch) => {
                     let index_obj = unsafe { self.execute_expr_owned(&branch.index)? };
@@ -119,11 +116,11 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
                     if index == -1 && !unsafe { ffi::PyErr_Occurred() }.is_null() {
                         return Ok(ptr::null_mut());
                     }
-                    block_label = usize::try_from(index)
+                    let next_block = usize::try_from(index)
                         .ok()
                         .and_then(|index| branch.targets.get(index).copied())
                         .unwrap_or(branch.default_label);
-                    start_body_index = 0;
+                    cursor = RuntimeJitDeoptCursor::at_block_entry(next_block);
                 }
                 BlockTerm::Jump(edge) => {
                     return Err(format!(

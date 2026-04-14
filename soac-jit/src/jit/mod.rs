@@ -1626,6 +1626,12 @@ pub(crate) struct RuntimeJitDeoptLocals<'a> {
     locals: Vec<RuntimeJitDeoptLocal<'a>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeJitDeoptCursor {
+    block: BlockLabel,
+    body_index: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RuntimeJitDeoptContinuation {
     Unimplemented,
@@ -1633,6 +1639,36 @@ pub(crate) enum RuntimeJitDeoptContinuation {
         block: BlockLabel,
         start_body_index: usize,
     },
+}
+
+impl RuntimeJitDeoptCursor {
+    pub(crate) fn new(block: BlockLabel, body_index: usize) -> Self {
+        Self { block, body_index }
+    }
+
+    pub(crate) fn block(self) -> BlockLabel {
+        self.block
+    }
+
+    pub(crate) fn body_index(self) -> usize {
+        self.body_index
+    }
+
+    pub(crate) fn at_block_entry(block: BlockLabel) -> Self {
+        Self::new(block, 0)
+    }
+}
+
+impl RuntimeJitDeoptContinuation {
+    pub(crate) fn initial_cursor(&self) -> Option<RuntimeJitDeoptCursor> {
+        match self {
+            RuntimeJitDeoptContinuation::ResumeBlockTail {
+                block,
+                start_body_index,
+            } => Some(RuntimeJitDeoptCursor::new(*block, *start_body_index)),
+            RuntimeJitDeoptContinuation::Unimplemented => None,
+        }
+    }
 }
 
 impl RuntimeJitDeoptRecord {
@@ -1659,6 +1695,11 @@ impl RuntimeJitDeoptRecord {
         &self.locals
     }
 
+    pub(crate) fn initial_cursor(&self) -> Option<RuntimeJitDeoptCursor> {
+        self.continuation.initial_cursor()
+    }
+
+    #[cfg(test)]
     pub(crate) fn continuation(&self) -> &RuntimeJitDeoptContinuation {
         &self.continuation
     }
