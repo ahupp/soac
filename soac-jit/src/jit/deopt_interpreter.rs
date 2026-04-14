@@ -16,6 +16,7 @@ unsafe extern "C" {
     static mut PyMethod_Type: ffi::PyTypeObject;
 
     fn PyMethod_Function(meth: *mut ffi::PyObject) -> *mut ffi::PyObject;
+    fn PyCell_New(obj: *mut ffi::PyObject) -> *mut ffi::PyObject;
     fn PyErr_SetRaisedException(exc: *mut ffi::PyObject);
     fn _PyDict_MergeEx(
         mp: *mut ffi::PyObject,
@@ -331,10 +332,40 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             InstrCodegen::Store(store) => unsafe { self.execute_store_owned(store) },
             InstrCodegen::Del(del) => unsafe { self.execute_del_owned(del) },
             InstrCodegen::IncrementCounter(_) => unsafe { execute_runtime_name_deopt("NONE") },
+            InstrCodegen::MakeCell(make_cell) => unsafe { self.execute_make_cell_owned(make_cell) },
             _ => Err(format!(
                 "deopt continuation only supports simple load/binop/call/store/del expressions, got {expr:?}"
             )),
         }
+    }
+
+    #[cold]
+    unsafe fn execute_make_cell_owned(
+        &mut self,
+        make_cell: &soac_blockpy::block_py::MakeCell<InstrCodegen>,
+    ) -> Result<ObjPtr, String> {
+        let initial_value = unsafe { self.execute_expr_owned(&make_cell.initial_value)? };
+        if initial_value.is_null() {
+            return Ok(ptr::null_mut());
+        }
+        let deleted = unsafe { execute_runtime_name_deopt("DELETED")? };
+        if deleted.is_null() {
+            unsafe {
+                ffi::Py_DECREF(initial_value.cast::<ffi::PyObject>());
+            }
+            return Ok(ptr::null_mut());
+        }
+        let cell_initial_value = if initial_value == deleted {
+            ptr::null_mut()
+        } else {
+            initial_value.cast::<ffi::PyObject>()
+        };
+        let cell = unsafe { PyCell_New(cell_initial_value) };
+        unsafe {
+            ffi::Py_DECREF(deleted.cast::<ffi::PyObject>());
+            ffi::Py_DECREF(initial_value.cast::<ffi::PyObject>());
+        }
+        Ok(cell.cast())
     }
 
     #[cold]

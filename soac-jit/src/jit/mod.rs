@@ -2024,6 +2024,9 @@ fn runtime_jit_deopt_expr_supported(expr: &InstrCodegen) -> bool {
         InstrCodegen::Store(store) => runtime_jit_deopt_expr_supported(&store.value),
         InstrCodegen::Del(_) => true,
         InstrCodegen::IncrementCounter(_) => true,
+        InstrCodegen::MakeCell(make_cell) => {
+            runtime_jit_deopt_expr_supported(&make_cell.initial_value)
+        }
         _ => false,
     }
 }

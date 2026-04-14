@@ -5,9 +5,9 @@ use soac_blockpy::block_py::{
     CalleeFunctionId, CellLocation, ChildVisitable, ClosureInit, ClosureSlot, CodegenBlock,
     CounterDef, CounterSite, Del, DelItem, FunctionId, FunctionName, GetAttr, GetItem, HasMeta,
     HasSemanticInstrId, IncrementCounter, InstrCodegen, InstrResolved, Literal, LiteralValue, Load,
-    LocalLocation, Meta, ModuleNameGen, NameLocation, NumberLiteral, NumberLiteralValue, Param,
-    ParamKind, ParamSpec, ResolvedName, SetAttr, SetItem, StorageLayout, Store, StringLiteral,
-    UnaryOp, UnaryOpKind, Visit, VisitMut, WithMeta,
+    LocalLocation, MakeCell, Meta, ModuleNameGen, NameLocation, NumberLiteral, NumberLiteralValue,
+    Param, ParamKind, ParamSpec, ResolvedName, SetAttr, SetItem, StorageLayout, Store,
+    StringLiteral, UnaryOp, UnaryOpKind, Visit, VisitMut, WithMeta,
 };
 use soac_blockpy::passes::{
     CodegenModuleShape, instrument_bb_module_with_block_entry_counters,
@@ -5477,6 +5477,41 @@ def f(x):
     }
 
     #[test]
+    fn runtime_deopt_table_marks_make_cell_return_continuation() {
+        let function = with_single_test_block(
+            test_function(),
+            vec![],
+            ret_term(op_expr(MakeCell::new(Box::new(name_expr(
+                test_constant_name(0),
+            ))))),
+        );
+        let module = test_module(ModuleNameGen::new(0), vec![function]);
+        let function = &module.callable_defs[0];
+        let block = function.entry_block();
+        let facts = infer_module_value_facts(&module);
+        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+            .expect("JIT deopt resume planning should succeed");
+        let function_plan = module_plan
+            .function(function.function_id)
+            .expect("function should have a JIT deopt plan");
+        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
+            .expect("runtime deopt table should build from plan");
+        let point = LocalEnvResumePoint::BeforeTerm {
+            function_id: function.function_id,
+            block: block.label,
+        };
+        let record = table
+            .record_for_point(point)
+            .expect("before-term make-cell point should have a runtime record");
+        assert_eq!(
+            record.continuation(),
+            &RuntimeJitDeoptContinuation::ResumeBlockTail {
+                cursor: RuntimeJitDeoptCursor::new(block.label, block.body.len()),
+            }
+        );
+    }
+
+    #[test]
     fn runtime_deopt_table_marks_exception_edge_body_tail_continuation() {
         let function = test_function();
         let mut handler = test_source_block(
@@ -8518,6 +8553,166 @@ def g():
                 ffi::Py_DECREF(result.cast::<ffi::PyObject>());
                 ffi::Py_DECREF(input);
                 ffi::Py_DECREF(int_callable);
+            }
+        });
+    }
+
+    #[test]
+    fn deopt_block_tail_continuation_executes_return_make_cell() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|_| {
+            let function = with_single_test_block(
+                test_function(),
+                vec![],
+                ret_term(op_expr(MakeCell::new(Box::new(name_expr(
+                    test_constant_name(0),
+                ))))),
+            );
+            let function_id = function.function_id;
+            let block = function.entry_block().label;
+            let cell_value = unsafe { ffi::PyLong_FromLong(123_321_123) };
+            assert!(
+                !cell_value.is_null(),
+                "test cell value allocation should succeed"
+            );
+            let table = RuntimeJitDeoptTable {
+                function_id,
+                function: Box::new(function),
+                module_constant_ptrs: vec![cell_value.cast()],
+                points: vec![RuntimeJitDeoptRecord {
+                    id: PlannedJitDeoptPointId {
+                        function_id,
+                        ordinal: 0,
+                    },
+                    resume_point: LocalEnvResumePoint::BeforeTerm { function_id, block },
+                    precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                    locals: vec![],
+                    continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
+                        cursor: RuntimeJitDeoptCursor::at_block_entry(block),
+                    },
+                }],
+            };
+            let before_value = unsafe { ffi::Py_REFCNT(cell_value) };
+            let result = unsafe {
+                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                    std::ptr::addr_of!(table).cast_mut().cast(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert!(
+                !result.is_null(),
+                "return-make-cell deopt should produce a cell object"
+            );
+            assert!(
+                unsafe { ffi::PyErr_Occurred() }.is_null(),
+                "successful return-make-cell deopt should not leave a Python exception"
+            );
+            let contents = unsafe {
+                ffi::PyObject_GetAttrString(
+                    result.cast::<ffi::PyObject>(),
+                    c"cell_contents".as_ptr(),
+                )
+            };
+            assert!(
+                !contents.is_null(),
+                "return-make-cell deopt should populate the returned cell"
+            );
+            assert_eq!(
+                contents, cell_value,
+                "return-make-cell deopt should populate the cell with the initial value"
+            );
+            unsafe {
+                ffi::Py_DECREF(contents);
+            }
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(cell_value) },
+                before_value + 1,
+                "returned cell should own one reference to the initial value"
+            );
+            unsafe {
+                ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+            }
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(cell_value) },
+                before_value,
+                "dropping the returned cell should release the initial value"
+            );
+            unsafe {
+                ffi::Py_DECREF(cell_value);
+            }
+        });
+    }
+
+    #[test]
+    fn deopt_block_tail_continuation_executes_return_empty_make_cell() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|_| {
+            let function = with_single_test_block(
+                test_function(),
+                vec![],
+                ret_term(op_expr(MakeCell::new(Box::new(name_expr(
+                    test_runtime_name("DELETED"),
+                ))))),
+            );
+            let function_id = function.function_id;
+            let block = function.entry_block().label;
+            let table = RuntimeJitDeoptTable {
+                function_id,
+                function: Box::new(function),
+                module_constant_ptrs: vec![],
+                points: vec![RuntimeJitDeoptRecord {
+                    id: PlannedJitDeoptPointId {
+                        function_id,
+                        ordinal: 0,
+                    },
+                    resume_point: LocalEnvResumePoint::BeforeTerm { function_id, block },
+                    precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                    locals: vec![],
+                    continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
+                        cursor: RuntimeJitDeoptCursor::at_block_entry(block),
+                    },
+                }],
+            };
+            let result = unsafe {
+                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                    std::ptr::addr_of!(table).cast_mut().cast(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert!(
+                !result.is_null(),
+                "return-empty-make-cell deopt should produce a cell object"
+            );
+            assert!(
+                unsafe { ffi::PyErr_Occurred() }.is_null(),
+                "successful return-empty-make-cell deopt should not leave a Python exception"
+            );
+            let contents = unsafe {
+                ffi::PyObject_GetAttrString(
+                    result.cast::<ffi::PyObject>(),
+                    c"cell_contents".as_ptr(),
+                )
+            };
+            assert!(
+                contents.is_null(),
+                "return-empty-make-cell deopt should leave the returned cell empty"
+            );
+            assert_ne!(
+                unsafe { ffi::PyErr_ExceptionMatches(ffi::PyExc_ValueError) },
+                0,
+                "empty cell_contents access should raise ValueError"
+            );
+            unsafe {
+                ffi::PyErr_Clear();
+                ffi::Py_DECREF(result.cast::<ffi::PyObject>());
             }
         });
     }
