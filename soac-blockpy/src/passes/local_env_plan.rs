@@ -174,6 +174,18 @@ pub struct LocalEnvResumeEntry {
     pub locals: Vec<LocalEnvResumeBinding>,
 }
 
+impl LocalEnvResumeEntry {
+    pub fn binding_for_name(&self, name: &str) -> Option<&LocalEnvResumeBinding> {
+        self.locals.iter().find(|binding| binding.name == name)
+    }
+
+    pub fn binding_for_location(&self, location: LocalLocation) -> Option<&LocalEnvResumeBinding> {
+        self.locals
+            .iter()
+            .find(|binding| binding.location == location)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LocalEnvResumeBindingState {
     Bound,
@@ -206,6 +218,30 @@ pub struct FunctionLocalEnvResumePlan {
 }
 
 impl FunctionLocalEnvResumePlan {
+    pub fn entry(&self, point: LocalEnvResumePoint) -> Option<&LocalEnvResumeEntry> {
+        self.entries.iter().find(|entry| entry.point == point)
+    }
+
+    pub fn block_entry(
+        &self,
+        function_id: FunctionId,
+        block: BlockLabel,
+    ) -> Option<&LocalEnvResumeEntry> {
+        self.entry(LocalEnvResumePoint::BlockEntry { function_id, block })
+    }
+
+    pub fn before_instr(&self, key: InstrKey) -> Option<&LocalEnvResumeEntry> {
+        self.entry(LocalEnvResumePoint::BeforeInstr { key })
+    }
+
+    pub fn before_term(
+        &self,
+        function_id: FunctionId,
+        block: BlockLabel,
+    ) -> Option<&LocalEnvResumeEntry> {
+        self.entry(LocalEnvResumePoint::BeforeTerm { function_id, block })
+    }
+
     pub fn entries_for_block(
         &self,
         block: BlockLabel,
@@ -224,6 +260,11 @@ pub struct LocalEnvResumeModulePlan {
 impl LocalEnvResumeModulePlan {
     pub fn function(&self, function_id: FunctionId) -> Option<&FunctionLocalEnvResumePlan> {
         self.functions.get(&function_id)
+    }
+
+    pub fn entry(&self, point: LocalEnvResumePoint) -> Option<&LocalEnvResumeEntry> {
+        self.function(point.function_id())
+            .and_then(|function| function.entry(point))
     }
 
     pub fn validate_for_module(
@@ -976,6 +1017,16 @@ def f():
         let function_plan = resume_plan
             .function(function.function_id)
             .expect("function should have a LocalEnv resume plan");
+        let function_before_term = function_plan
+            .before_term(function.function_id, function.entry_block().label)
+            .expect("function-level before-term lookup should find entry");
+        let module_before_term = resume_plan
+            .entry(LocalEnvResumePoint::BeforeTerm {
+                function_id: function.function_id,
+                block: function.entry_block().label,
+            })
+            .expect("module-level resume lookup should find before-term entry");
+        assert_eq!(function_before_term, module_before_term);
         assert!(function_plan.entries.iter().any(|entry| {
             matches!(entry.point, LocalEnvResumePoint::BeforeInstr { .. })
                 && entry.locals.iter().any(|binding| {

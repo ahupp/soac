@@ -6,10 +6,12 @@ pub use soac_blockpy::passes::{
     PlannedLocalBinding, PlannedLocalStorage, plan_function_locals, render_planned_local_binding,
 };
 use soac_blockpy::passes::{
-    CodegenModuleShape, FactStore, FunctionRefcountPlan, LocalEnvModulePlan, RefcountActionKind,
-    RefcountPlan, RefcountReleaseReason, compute_function_local_live_ins,
-    compute_function_local_must_bound_ins, plan_local_env_module, plan_ownership_effects,
-    validate_local_env_module_plan, validate_ownership_effects,
+    CodegenModuleShape, FactStore, FunctionLocalEnvResumePlan, FunctionRefcountPlan,
+    LocalEnvModulePlan, LocalEnvResumeEntry, LocalEnvResumeModulePlan, LocalEnvResumePoint,
+    RefcountActionKind, RefcountPlan, RefcountReleaseReason, compute_function_local_live_ins,
+    compute_function_local_must_bound_ins, plan_local_env_module, plan_local_env_resume_module,
+    plan_ownership_effects, validate_local_env_module_plan, validate_local_env_resume_module_plan,
+    validate_ownership_effects,
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -205,6 +207,16 @@ pub struct PlannedJitModuleLocals {
     pub functions: HashMap<FunctionId, PlannedJitFunctionLocals>,
 }
 
+#[derive(Clone, Debug)]
+pub struct PlannedJitDeoptResumeFunction {
+    pub resume_plan: FunctionLocalEnvResumePlan,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PlannedJitDeoptResumeModule {
+    pub functions: HashMap<FunctionId, PlannedJitDeoptResumeFunction>,
+}
+
 impl PlannedJitModuleLocals {
     pub fn function(&self, function_id: FunctionId) -> Option<&PlannedJitFunctionLocals> {
         self.functions.get(&function_id)
@@ -232,6 +244,67 @@ impl PlannedJitModuleLocals {
             if !expected_function_ids.contains(function_id) {
                 return Err(format!(
                     "JIT local plan contains unknown function id {function_id}"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl PlannedJitDeoptResumeFunction {
+    pub fn entry(&self, point: LocalEnvResumePoint) -> Option<&LocalEnvResumeEntry> {
+        self.resume_plan.entry(point)
+    }
+}
+
+impl PlannedJitDeoptResumeModule {
+    pub fn function(&self, function_id: FunctionId) -> Option<&PlannedJitDeoptResumeFunction> {
+        self.functions.get(&function_id)
+    }
+
+    pub fn entry(&self, point: LocalEnvResumePoint) -> Option<&LocalEnvResumeEntry> {
+        self.function(point.function_id())
+            .and_then(|function| function.entry(point))
+    }
+
+    pub fn validate_for_module(
+        &self,
+        module: &BlockPyModule<CodegenModuleShape>,
+    ) -> Result<(), String> {
+        let expected_function_ids = module
+            .callable_defs
+            .iter()
+            .map(|function| function.function_id)
+            .collect::<HashSet<_>>();
+        for function in &module.callable_defs {
+            let function_plan = self.function(function.function_id).ok_or_else(|| {
+                format!(
+                    "missing JIT deopt resume plan for function {} ({})",
+                    function.function_id, function.names.qualname
+                )
+            })?;
+            for block in &function.blocks {
+                if function_plan
+                    .resume_plan
+                    .block_entry(function.function_id, block.label)
+                    .is_none()
+                    || function_plan
+                        .resume_plan
+                        .before_term(function.function_id, block.label)
+                        .is_none()
+                {
+                    return Err(format!(
+                        "JIT deopt resume plan for function {} ({}) is missing block boundary \
+                         entries for block {}",
+                        function.function_id, function.names.qualname, block.label
+                    ));
+                }
+            }
+        }
+        for function_id in self.functions.keys() {
+            if !expected_function_ids.contains(function_id) {
+                return Err(format!(
+                    "JIT deopt resume plan contains unknown function id {function_id}"
                 ));
             }
         }
@@ -657,6 +730,52 @@ pub fn plan_jit_module_locals_from_passes(
         }
     }
     Ok(PlannedJitModuleLocals { functions })
+}
+
+pub fn plan_jit_deopt_resume_module(
+    module: &BlockPyModule<CodegenModuleShape>,
+    facts: &FactStore,
+) -> Result<PlannedJitDeoptResumeModule, String> {
+    let local_env_plan = plan_local_env_module(module, facts);
+    let resume_plan = plan_local_env_resume_module(module, &local_env_plan, facts);
+    plan_jit_deopt_resume_module_from_passes(module, facts, &local_env_plan, &resume_plan)
+}
+
+pub fn plan_jit_deopt_resume_module_from_passes(
+    module: &BlockPyModule<CodegenModuleShape>,
+    facts: &FactStore,
+    local_env_plan: &LocalEnvModulePlan,
+    resume_plan: &LocalEnvResumeModulePlan,
+) -> Result<PlannedJitDeoptResumeModule, String> {
+    validate_local_env_module_plan(module, facts, local_env_plan)?;
+    validate_local_env_resume_module_plan(module, local_env_plan, facts, resume_plan)?;
+    let mut functions = HashMap::with_capacity(module.callable_defs.len());
+    for function in &module.callable_defs {
+        let resume_plan = resume_plan
+            .function(function.function_id)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "missing LocalEnv resume plan for function {} ({})",
+                    function.function_id, function.names.qualname
+                )
+            })?;
+        if functions
+            .insert(
+                function.function_id,
+                PlannedJitDeoptResumeFunction { resume_plan },
+            )
+            .is_some()
+        {
+            return Err(format!(
+                "duplicate JIT deopt resume plan for function id {} ({})",
+                function.function_id, function.names.qualname
+            ));
+        }
+    }
+    let plan = PlannedJitDeoptResumeModule { functions };
+    plan.validate_for_module(module)?;
+    Ok(plan)
 }
 
 pub fn render_jit_module_locals(
@@ -1237,7 +1356,8 @@ mod tests {
     use soac_blockpy::lower_python_to_blockpy_for_testing;
     use soac_blockpy::passes::BlockLocalPlan;
     use soac_blockpy::passes::{
-        RefcountActionKind, RefcountReleaseReason, infer_module_value_facts,
+        LocalEnvResumeBindingState, LocalEnvResumeValueSource, RefcountActionKind,
+        RefcountReleaseReason, infer_module_value_facts,
     };
 
     fn lowered_function(
@@ -1845,6 +1965,52 @@ def f(flag):
         plan.validate_for_module(&lowered)
             .expect("JIT plan from BlockPy pass sidecars should validate");
         assert_eq!(plan.functions.len(), lowered.callable_defs.len());
+    }
+
+    #[test]
+    fn planned_jit_deopt_resume_module_wraps_validated_local_env_resume_plan() {
+        let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+            r#"
+def f():
+    x = None
+    del x
+    return 1
+"#,
+        )
+        .expect("lowering should succeed")
+        .codegen_module;
+        let facts = infer_module_value_facts(&lowered);
+        let plan = plan_jit_deopt_resume_module(&lowered, &facts)
+            .expect("JIT deopt resume planning should consume LocalEnv resume sidecar");
+        plan.validate_for_module(&lowered)
+            .expect("JIT deopt resume plan should validate");
+
+        let function = lowered
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "f")
+            .expect("lowered function should exist");
+        let function_plan = plan
+            .function(function.function_id)
+            .expect("function should have a JIT deopt resume plan");
+        let entry_block = function.entry_block();
+        let before_term = function_plan
+            .resume_plan
+            .before_term(function.function_id, entry_block.label)
+            .expect("resume plan should expose before-term lookup");
+        let x_binding = before_term
+            .binding_for_name("x")
+            .expect("before-term resume state should include x");
+        assert_eq!(x_binding.binding, LocalEnvResumeBindingState::Unbound);
+        assert_eq!(x_binding.source, LocalEnvResumeValueSource::Unbound);
+
+        let via_module = plan
+            .entry(LocalEnvResumePoint::BeforeTerm {
+                function_id: function.function_id,
+                block: entry_block.label,
+            })
+            .expect("module-level point lookup should find before-term entry");
+        assert_eq!(via_module, before_term);
     }
 
     #[test]
