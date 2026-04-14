@@ -51,7 +51,7 @@ pub(super) trait OperationEmitState<'fb, E> {
         constant_id: crate::module_constants::ModuleConstantId,
     ) -> ir::Value {
         let ptr_ty = self.ctx().consts.ptr_ty;
-        let module_constant_access = self.ctx().consts.module_constant_access;
+        let module_constant_accesses = self.ctx().consts.module_constant_accesses.clone();
         let module_constant_object_globals =
             self.ctx().consts.module_constant_object_globals.clone();
         emit_owned_module_constant_from_parts(
@@ -59,7 +59,7 @@ pub(super) trait OperationEmitState<'fb, E> {
             constant_id,
             &module_constant_object_globals,
             ptr_ty,
-            module_constant_access,
+            &module_constant_accesses,
         )
     }
 

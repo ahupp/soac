@@ -548,7 +548,7 @@ mod test {
         }
 
         let root = unique_temp_dir();
-        let source = "def f(a, b):\n    return a + b\n";
+        let source = "def f():\n    return 12345\n";
         let module_name = "pkg.mod";
         let module_id = 7;
         let source_hash = hash_module_source(source);

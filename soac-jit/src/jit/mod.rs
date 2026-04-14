@@ -1589,6 +1589,24 @@ pub(crate) fn lookup_precompiled_direct_function_handle(
     ))))
 }
 
+pub(crate) fn lookup_precompiled_static_module_constant(
+    module_name: &str,
+    source_hash: u64,
+    constant_id: ModuleConstantId,
+) -> Result<Option<*mut ffi::PyObject>, String> {
+    let Some(library) = precompiled_library()? else {
+        return Ok(None);
+    };
+    if source_hash == 0 {
+        return Ok(None);
+    }
+    let symbol_prefix = module_constant_symbol_prefix_for_module_identity(module_name, source_hash);
+    let symbol = module_constant_object_symbol(symbol_prefix.as_str(), constant_id);
+    library
+        .lookup_code_symbol(symbol.as_str())
+        .map(|ptr| ptr.map(|ptr| ptr.cast_mut().cast::<ffi::PyObject>()))
+}
+
 fn precompiled_module_runtime(
     library: &PrecompiledLibrary,
     shared_state: &SharedModuleState,
@@ -1627,7 +1645,15 @@ fn patch_precompiled_module_constant_slots(
 ) -> Result<(), String> {
     let symbol_prefix = module_constant_symbol_prefix_for_shared_state(shared_state);
     for (index, ptr) in shared_state.module_constant_ptrs().into_iter().enumerate() {
-        let symbol = module_constant_object_symbol(symbol_prefix.as_str(), ModuleConstantId(index));
+        let constant_id = ModuleConstantId(index);
+        if shared_state
+            .codegen_constants
+            .static_pyobject_image(constant_id)
+            .is_some()
+        {
+            continue;
+        }
+        let symbol = module_constant_object_symbol(symbol_prefix.as_str(), constant_id);
         let Some(slot) = library.lookup_module_constant_slot(symbol.as_str())? else {
             return Err(format!(
                 "precompiled library {} is missing module constant slot {symbol:?}",
@@ -3342,7 +3368,7 @@ struct JitEmitConsts {
     deleted_constant_id: ModuleConstantId,
     empty_tuple_constant_id: ModuleConstantId,
     block_const: ir::Value,
-    module_constant_access: ModuleConstantAccess,
+    module_constant_accesses: ModuleConstantAccessTable,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -3350,6 +3376,26 @@ enum ModuleConstantAccess {
     #[default]
     SymbolAddress,
     PointerSlot,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ModuleConstantAccessTable {
+    entries: Option<Arc<[ModuleConstantAccess]>>,
+}
+
+impl ModuleConstantAccessTable {
+    fn from_entries(entries: Vec<ModuleConstantAccess>) -> Self {
+        Self {
+            entries: Some(Arc::from(entries)),
+        }
+    }
+
+    fn access(&self, constant_id: ModuleConstantId) -> ModuleConstantAccess {
+        self.entries
+            .as_ref()
+            .and_then(|entries| entries.get(constant_id.0).copied())
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -5893,14 +5939,14 @@ fn emit_owned_module_constant_from_parts(
     constant_id: ModuleConstantId,
     module_constant_object_globals: &[ir::GlobalValue],
     ptr_ty: ir::Type,
-    access: ModuleConstantAccess,
+    access_table: &ModuleConstantAccessTable,
 ) -> ir::Value {
     let object_global = module_constant_object_globals
         .get(constant_id.0)
         .copied()
         .unwrap_or_else(|| panic!("missing module constant object {}", constant_id.0));
     let symbol_value = fb.ins().global_value(ptr_ty, object_global);
-    match access {
+    match access_table.access(constant_id) {
         ModuleConstantAccess::SymbolAddress => symbol_value,
         ModuleConstantAccess::PointerSlot => {
             fb.ins()
@@ -5919,7 +5965,7 @@ fn emit_owned_module_constant(
         constant_id,
         &ctx.consts.module_constant_object_globals,
         ctx.consts.ptr_ty,
-        ctx.consts.module_constant_access,
+        &ctx.consts.module_constant_accesses,
     )
 }
 
@@ -9464,7 +9510,7 @@ fn emit_exception_dispatch_target_args(
     module_constants: &ModuleCodegenConstants,
     module_constant_object_globals: &[ir::GlobalValue],
     ptr_ty: ir::Type,
-    module_constant_access: ModuleConstantAccess,
+    module_constant_accesses: &ModuleConstantAccessTable,
     thread_state_value: ir::Value,
     none_const: ir::Value,
     incref_ref: ir::FuncRef,
@@ -9514,7 +9560,7 @@ fn emit_exception_dispatch_target_args(
                 module_constants.require_int_constant_id(abrupt_kind_tag(*kind)),
                 module_constant_object_globals,
                 ptr_ty,
-                module_constant_access,
+                module_constant_accesses,
             ),
         };
         args.push(ir::BlockArg::Value(value));
@@ -15231,6 +15277,16 @@ struct ObjectDataDefinition {
     bytes: Vec<u8>,
     align: u64,
     writable: bool,
+    relocations: Vec<ObjectDataRelocation>,
+}
+
+#[derive(Debug)]
+struct ObjectDataRelocation {
+    offset: u64,
+    symbol: String,
+    kind: ElfSymbolKind,
+    reloc_type: u32,
+    addend: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -15347,6 +15403,8 @@ struct PrecompiledObjectBytes {
     function_symbols: Vec<String>,
     #[cfg(test)]
     data_symbols: Vec<String>,
+    #[cfg(test)]
+    data_symbol_writable: Vec<(String, bool)>,
 }
 
 fn precompile_codegen_module_to_object_bytes(
@@ -15394,19 +15452,47 @@ fn precompile_codegen_module_to_object_bytes(
     };
 
     let mut data_definitions = Vec::new();
+    let mut module_constant_accesses = Vec::with_capacity(module_constants.len());
     for (index, data_id) in module_constant_object_data_ids.iter().copied().enumerate() {
-        data_definitions.push(ObjectDataDefinition {
-            data_id,
-            symbol: module_constant_object_symbol(
-                module_constant_symbol_prefix.as_str(),
-                ModuleConstantId(index),
-            ),
-            binding: ElfSymbolBinding::Global,
-            bytes: vec![0; std::mem::size_of::<usize>()],
-            align: std::mem::align_of::<usize>() as u64,
-            writable: true,
-        });
+        let constant_id = ModuleConstantId(index);
+        let symbol =
+            module_constant_object_symbol(module_constant_symbol_prefix.as_str(), constant_id);
+        if let Some(image) = module_constants.static_pyobject_image(constant_id) {
+            module_constant_accesses.push(ModuleConstantAccess::SymbolAddress);
+            data_definitions.push(ObjectDataDefinition {
+                data_id,
+                symbol,
+                binding: ElfSymbolBinding::Global,
+                bytes: image.bytes,
+                align: image.align,
+                writable: false,
+                relocations: image
+                    .relocations
+                    .into_iter()
+                    .map(|relocation| ObjectDataRelocation {
+                        offset: relocation.offset,
+                        symbol: relocation.symbol.to_string(),
+                        kind: ElfSymbolKind::Object,
+                        reloc_type: R_X86_64_64,
+                        addend: 0,
+                    })
+                    .collect(),
+            });
+        } else {
+            module_constant_accesses.push(ModuleConstantAccess::PointerSlot);
+            data_definitions.push(ObjectDataDefinition {
+                data_id,
+                symbol,
+                binding: ElfSymbolBinding::Global,
+                bytes: vec![0; std::mem::size_of::<usize>()],
+                align: std::mem::align_of::<usize>() as u64,
+                writable: true,
+                relocations: Vec::new(),
+            });
+        }
     }
+    let module_constant_access_table =
+        ModuleConstantAccessTable::from_entries(module_constant_accesses);
     if let Some(data_id) = scalar_counter_data_id {
         data_definitions.push(ObjectDataDefinition {
             data_id,
@@ -15422,6 +15508,7 @@ fn precompile_codegen_module_to_object_bytes(
             ],
             align: std::mem::align_of::<u64>() as u64,
             writable: true,
+            relocations: Vec::new(),
         });
     }
     if let Some(data_id) = top_value_counter_data_id {
@@ -15439,6 +15526,7 @@ fn precompile_codegen_module_to_object_bytes(
             ],
             align: std::mem::align_of::<TopValueCounter>() as u64,
             writable: true,
+            relocations: Vec::new(),
         });
     }
 
@@ -15499,7 +15587,7 @@ fn precompile_codegen_module_to_object_bytes(
             symbol_scopes.get(&function.function_id).map(String::as_str),
             Some(&predeclared),
             BuildSpecializedFunctionOptions {
-                module_constant_access: ModuleConstantAccess::PointerSlot,
+                module_constant_accesses: module_constant_access_table.clone(),
                 ..BuildSpecializedFunctionOptions::default()
             },
         )
@@ -15595,6 +15683,11 @@ fn precompile_codegen_module_to_object_bytes(
             .iter()
             .map(|definition| definition.symbol.clone())
             .collect(),
+        #[cfg(test)]
+        data_symbol_writable: data_definitions
+            .iter()
+            .map(|definition| (definition.symbol.clone(), definition.writable))
+            .collect(),
     })
 }
 
@@ -15646,6 +15739,22 @@ fn write_precompiled_object(
             offset,
             data.bytes.len() as u64,
         );
+        for relocation in &data.relocations {
+            let relocation_offset = offset
+                .checked_add(relocation.offset)
+                .ok_or_else(|| format!("data relocation offset overflow in {}", data.symbol))?;
+            let symbol_index =
+                object.add_global_undefined_symbol(relocation.symbol.as_str(), relocation.kind);
+            object.add_section_relocation(
+                section,
+                ElfRelocation {
+                    offset: relocation_offset,
+                    symbol_index,
+                    reloc_type: relocation.reloc_type,
+                    addend: relocation.addend,
+                },
+            )?;
+        }
         data_symbols.insert(data.data_id, symbol_index);
     }
 
@@ -15683,6 +15792,8 @@ struct ElfObjectBuilder {
     symbols: Vec<ElfSymbol>,
     global_symbols_by_name: HashMap<String, u32>,
     text_relocations: Vec<ElfRelocation>,
+    data_relocations: Vec<ElfRelocation>,
+    rodata_relocations: Vec<ElfRelocation>,
 }
 
 impl ElfObjectBuilder {
@@ -15749,6 +15860,26 @@ impl ElfObjectBuilder {
         self.text_relocations.push(relocation);
     }
 
+    fn add_section_relocation(
+        &mut self,
+        section: ElfSectionIndex,
+        relocation: ElfRelocation,
+    ) -> Result<(), String> {
+        match section {
+            ElfSectionIndex::Data => {
+                self.data_relocations.push(relocation);
+                Ok(())
+            }
+            ElfSectionIndex::Rodata => {
+                self.rodata_relocations.push(relocation);
+                Ok(())
+            }
+            ElfSectionIndex::Text | ElfSectionIndex::Undefined => Err(format!(
+                "cannot add data relocation to ELF section {section:?}"
+            )),
+        }
+    }
+
     fn finish(self) -> Result<Vec<u8>, String> {
         let mut strtab = Vec::from([0]);
         let mut symbol_names = Vec::with_capacity(self.symbols.len());
@@ -15777,12 +15908,32 @@ impl ElfObjectBuilder {
             );
             push_i64(&mut rela_text, relocation.addend);
         }
+        let mut rela_data = Vec::with_capacity(self.data_relocations.len() * ELF64_RELA_SIZE);
+        for relocation in &self.data_relocations {
+            push_u64(&mut rela_data, relocation.offset);
+            push_u64(
+                &mut rela_data,
+                (u64::from(relocation.symbol_index) << 32) | u64::from(relocation.reloc_type),
+            );
+            push_i64(&mut rela_data, relocation.addend);
+        }
+        let mut rela_rodata = Vec::with_capacity(self.rodata_relocations.len() * ELF64_RELA_SIZE);
+        for relocation in &self.rodata_relocations {
+            push_u64(&mut rela_rodata, relocation.offset);
+            push_u64(
+                &mut rela_rodata,
+                (u64::from(relocation.symbol_index) << 32) | u64::from(relocation.reloc_type),
+            );
+            push_i64(&mut rela_rodata, relocation.addend);
+        }
 
         let mut shstrtab = Vec::from([0]);
         let text_name = push_string_table(&mut shstrtab, ".text")?;
         let data_name = push_string_table(&mut shstrtab, ".data")?;
         let rodata_name = push_string_table(&mut shstrtab, ".rodata")?;
         let rela_text_name = push_string_table(&mut shstrtab, ".rela.text")?;
+        let rela_data_name = push_string_table(&mut shstrtab, ".rela.data")?;
+        let rela_rodata_name = push_string_table(&mut shstrtab, ".rela.rodata")?;
         let symtab_name = push_string_table(&mut shstrtab, ".symtab")?;
         let strtab_name = push_string_table(&mut shstrtab, ".strtab")?;
         let shstrtab_name = push_string_table(&mut shstrtab, ".shstrtab")?;
@@ -15793,6 +15944,8 @@ impl ElfObjectBuilder {
         let data_header = append_section_bytes(&mut file, self.data.as_slice(), 8)?;
         let rodata_header = append_section_bytes(&mut file, self.rodata.as_slice(), 8)?;
         let rela_text_header = append_section_bytes(&mut file, rela_text.as_slice(), 8)?;
+        let rela_data_header = append_section_bytes(&mut file, rela_data.as_slice(), 8)?;
+        let rela_rodata_header = append_section_bytes(&mut file, rela_rodata.as_slice(), 8)?;
         let symtab_header = append_section_bytes(&mut file, symtab.as_slice(), 8)?;
         let strtab_header = append_section_bytes(&mut file, strtab.as_slice(), 1)?;
         let shstrtab_header = append_section_bytes(&mut file, shstrtab.as_slice(), 1)?;
@@ -15841,6 +15994,28 @@ impl ElfObjectBuilder {
             rela_text_header,
             ELF_SECTION_SYMTAB_INDEX,
             ELF_SECTION_TEXT_INDEX,
+            8,
+            ELF64_RELA_SIZE as u64,
+        );
+        push_elf_section_header(
+            &mut section_headers,
+            rela_data_name,
+            SHT_RELA,
+            0,
+            rela_data_header,
+            ELF_SECTION_SYMTAB_INDEX,
+            ELF_SECTION_DATA_INDEX,
+            8,
+            ELF64_RELA_SIZE as u64,
+        );
+        push_elf_section_header(
+            &mut section_headers,
+            rela_rodata_name,
+            SHT_RELA,
+            0,
+            rela_rodata_header,
+            ELF_SECTION_SYMTAB_INDEX,
+            ELF_SECTION_RODATA_INDEX,
             8,
             ELF64_RELA_SIZE as u64,
         );
@@ -16002,7 +16177,7 @@ impl ElfSectionIndex {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum ElfSymbolKind {
     Object,
     Func,
@@ -16058,13 +16233,13 @@ const ELF64_EHDR_SIZE: usize = 64;
 const ELF64_SHDR_SIZE: usize = 64;
 const ELF64_SYM_SIZE: usize = 24;
 const ELF64_RELA_SIZE: usize = 24;
-const ELF_SECTION_COUNT: usize = 9;
+const ELF_SECTION_COUNT: usize = 11;
 const ELF_SECTION_TEXT_INDEX: u32 = 1;
 const ELF_SECTION_DATA_INDEX: u32 = 2;
 const ELF_SECTION_RODATA_INDEX: u32 = 3;
-const ELF_SECTION_SYMTAB_INDEX: u32 = 5;
-const ELF_SECTION_STRTAB_INDEX: u32 = 6;
-const ELF_SECTION_SHSTRTAB_INDEX: u16 = 7;
+const ELF_SECTION_SYMTAB_INDEX: u32 = 7;
+const ELF_SECTION_STRTAB_INDEX: u32 = 8;
+const ELF_SECTION_SHSTRTAB_INDEX: u16 = 9;
 const SHT_PROGBITS: u32 = 1;
 const SHT_SYMTAB: u32 = 2;
 const SHT_STRTAB: u32 = 3;
@@ -16399,10 +16574,10 @@ pub fn run_cranelift_smoke(module: &BlockPyModule<CodegenModuleShape>) -> Result
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct BuildSpecializedFunctionOptions {
     indexed_global_guard_miss_deopt_stub: bool,
-    module_constant_access: ModuleConstantAccess,
+    module_constant_accesses: ModuleConstantAccessTable,
 }
 
 fn build_cranelift_run_bb_specialized_function(
@@ -16909,7 +17084,7 @@ fn build_cranelift_run_bb_specialized_function(
                 module_constants.require_int_constant_id(abrupt_kind_tag(AbruptKind::Fallthrough)),
                 &module_constant_object_globals,
                 ptr_ty,
-                options.module_constant_access,
+                &options.module_constant_accesses,
             )
         });
         stack_slots.initialize_all(&mut fb, ptr_ty, fallthrough_abrupt_kind_const);
@@ -16997,7 +17172,7 @@ fn build_cranelift_run_bb_specialized_function(
                     none_constant_id,
                     &module_constant_object_globals,
                     ptr_ty,
-                    options.module_constant_access,
+                    &options.module_constant_accesses,
                 ),
                 BlockParamRole::Exception => null_ptr,
             };
@@ -17108,7 +17283,7 @@ fn build_cranelift_run_bb_specialized_function(
                     deleted_constant_id,
                     empty_tuple_constant_id,
                     block_const,
-                    module_constant_access: options.module_constant_access,
+                    module_constant_accesses: options.module_constant_accesses.clone(),
                 },
                 load_global_fast_ref,
                 probe_global_indexed_ref,
@@ -17264,7 +17439,7 @@ fn build_cranelift_run_bb_specialized_function(
                 none_constant_id,
                 &module_constant_object_globals,
                 ptr_ty,
-                options.module_constant_access,
+                &options.module_constant_accesses,
             );
             emit_exception_dispatch_slot_writes(
                 &mut fb,
@@ -17316,7 +17491,7 @@ fn build_cranelift_run_bb_specialized_function(
                 none_constant_id,
                 &module_constant_object_globals,
                 ptr_ty,
-                options.module_constant_access,
+                &options.module_constant_accesses,
             );
             let target_jump_args = emit_exception_dispatch_target_args(
                 &mut fb,
@@ -17327,7 +17502,7 @@ fn build_cranelift_run_bb_specialized_function(
                 module_constants,
                 &module_constant_object_globals,
                 ptr_ty,
-                options.module_constant_access,
+                &options.module_constant_accesses,
                 thread_state_value,
                 target_arg_none_const,
                 incref_ref,

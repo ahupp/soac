@@ -707,6 +707,45 @@ def add(a, b):
     }
 
     #[test]
+    fn precompile_codegen_module_emits_static_compact_pylong_in_rodata() {
+        let module_name = "precompile_static_int";
+        let source_hash = 0x5678;
+        let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+            r#"
+def get_value():
+    return 12345
+"#,
+        )
+        .expect("lowering precompile static int source should succeed")
+        .codegen_module;
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&lowered);
+        let constant_id = module_constants.require_int_constant_id(12345);
+        let symbol_prefix =
+            module_constant_symbol_prefix_for_module_identity(module_name, source_hash);
+        let constant_symbol = module_constant_object_symbol(symbol_prefix.as_str(), constant_id);
+
+        let object =
+            precompile_codegen_module_to_object_bytes(module_name, source_hash, &lowered, None)
+                .expect("precompile should emit object bytes");
+
+        assert!(
+            object
+                .data_symbol_writable
+                .iter()
+                .any(|(symbol, writable)| symbol == &constant_symbol && !*writable),
+            "static compact PyLong constants should be emitted as read-only object data"
+        );
+        assert!(
+            object
+                .object
+                .windows(b".rela.rodata".len())
+                .any(|window| window == b".rela.rodata"),
+            "static PyLong object data should carry a relocation for PyLong_Type"
+        );
+    }
+
+    #[test]
     fn stored_local_binding_facts_only_require_checks_for_unbound_values() {
         assert_eq!(
             local_binding_facts_for_stored_value(LocalRefKind::Owned),

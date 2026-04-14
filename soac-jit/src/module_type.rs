@@ -603,6 +603,26 @@ fn build_counter_storage(
     ))
 }
 
+fn build_module_constant_objects(
+    py: Python<'_>,
+    codegen_constants: &ModuleCodegenConstants,
+    module_name: &str,
+    source_hash: u64,
+) -> PyResult<Vec<Py<PyAny>>> {
+    codegen_constants.build_python_constants_with_static_resolver(
+        py,
+        module_name == "soac.runtime",
+        |constant_id| {
+            crate::jit::lookup_precompiled_static_module_constant(
+                module_name,
+                source_hash,
+                constant_id,
+            )
+            .map_err(PyRuntimeError::new_err)
+        },
+    )
+}
+
 pub fn build_shared_state_for_inspection(
     py: Python<'_>,
     lowered_module: BlockPyModule<CodegenModuleShape>,
@@ -617,11 +637,8 @@ pub fn build_shared_state_for_inspection(
     } else {
         ModuleCodegenConstants::collect_from_module(&lowered_module)
     };
-    let module_constant_objs = if module_name == "soac.runtime" {
-        codegen_constants.build_python_constants_for_soac_runtime(py)?
-    } else {
-        codegen_constants.build_python_constants(py)?
-    };
+    let module_constant_objs =
+        build_module_constant_objects(py, &codegen_constants, module_name, 0)?;
     Ok(Arc::new(SharedModuleState {
         lowered_module,
         module_name: module_name.to_string(),
@@ -697,11 +714,12 @@ impl SoacExtModuleState {
         } else {
             ModuleCodegenConstants::collect_from_module(&lowered_module)
         };
-        let module_constant_objs = if module_name == "soac.runtime" {
-            codegen_constants.build_python_constants_for_soac_runtime(py)?
-        } else {
-            codegen_constants.build_python_constants(py)?
-        };
+        let module_constant_objs = build_module_constant_objects(
+            py,
+            &codegen_constants,
+            module_name.as_str(),
+            source_hash,
+        )?;
         let shared_state = Arc::new(SharedModuleState {
             lowered_module,
             module_name,

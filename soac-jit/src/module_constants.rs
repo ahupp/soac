@@ -10,7 +10,8 @@ use soac_blockpy::block_py::{
 use soac_blockpy::passes::CodegenModuleShape;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_int};
-use std::{mem, ptr};
+use std::mem::{self, offset_of};
+use std::ptr;
 
 unsafe extern "C" {
     fn _Py_SetImmortal(op: *mut ffi::PyObject);
@@ -71,6 +72,19 @@ pub(crate) enum StaticPyObjectTemplate {
     CompactPyLongI64 { value: i64, digit: RawPyLongDigit },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StaticPyObjectImage {
+    pub bytes: Vec<u8>,
+    pub align: u64,
+    pub relocations: Vec<StaticPyObjectRelocation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StaticPyObjectRelocation {
+    pub offset: u64,
+    pub symbol: &'static str,
+}
+
 type RawPyLongDigit = u32;
 
 #[repr(C)]
@@ -89,6 +103,10 @@ const RAW_PYLONG_SHIFT: u32 = 30;
 const RAW_PYLONG_MASK: i64 = (1_i64 << RAW_PYLONG_SHIFT) - 1;
 const RAW_PYLONG_NON_SIZE_BITS: usize = 3;
 const RAW_PYLONG_SIGN_POSITIVE: usize = 0;
+const RAW_PYOBJECT_STATIC_IMMORTAL_FLAGS: i64 = (1 << 2) | (1 << 0);
+const RAW_PYOBJECT_IMMORTAL_INITIAL_REFCNT_64: i64 = 3 << 30;
+const RAW_PYOBJECT_STATIC_IMMORTAL_INITIAL_REFCNT_64: i64 =
+    RAW_PYOBJECT_IMMORTAL_INITIAL_REFCNT_64 | (RAW_PYOBJECT_STATIC_IMMORTAL_FLAGS << 48);
 // Keep this conservative until the offline object-image path carries the CPython
 // small-int range as validated build metadata.
 const RAW_PYLONG_SMALL_INT_MAX: i64 = 1024;
@@ -116,6 +134,48 @@ impl StaticPyObjectTemplate {
         match self {
             Self::CompactPyLongI64 { .. } => {
                 (1 << RAW_PYLONG_NON_SIZE_BITS) | RAW_PYLONG_SIGN_POSITIVE
+            }
+        }
+    }
+
+    pub(crate) fn static_object_image(self) -> Option<StaticPyObjectImage> {
+        if !cfg!(all(
+            target_arch = "x86_64",
+            target_endian = "little",
+            not(Py_GIL_DISABLED),
+            not(py_sys_config = "Py_TRACE_REFS")
+        )) {
+            return None;
+        }
+
+        match self {
+            Self::CompactPyLongI64 { digit, .. } => {
+                let mut bytes = vec![0; mem::size_of::<RawPyLongObject>()];
+                write_i64(
+                    bytes.as_mut_slice(),
+                    offset_of!(RawPyLongObject, ob_base) + offset_of!(ffi::PyObject, ob_refcnt),
+                    RAW_PYOBJECT_STATIC_IMMORTAL_INITIAL_REFCNT_64,
+                );
+                let type_offset =
+                    offset_of!(RawPyLongObject, ob_base) + offset_of!(ffi::PyObject, ob_type);
+                write_usize(
+                    bytes.as_mut_slice(),
+                    offset_of!(RawPyLongObject, long_value) + offset_of!(RawPyLongValue, lv_tag),
+                    self.compact_pylong_lv_tag(),
+                );
+                write_u32(
+                    bytes.as_mut_slice(),
+                    offset_of!(RawPyLongObject, long_value) + offset_of!(RawPyLongValue, ob_digit),
+                    digit,
+                );
+                Some(StaticPyObjectImage {
+                    bytes,
+                    align: mem::align_of::<RawPyLongObject>() as u64,
+                    relocations: vec![StaticPyObjectRelocation {
+                        offset: type_offset as u64,
+                        symbol: "PyLong_Type",
+                    }],
+                })
             }
         }
     }
@@ -179,7 +239,11 @@ impl ModuleCodegenConstants {
     }
 
     pub fn build_python_constants(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
-        self.build_python_constants_with_runtime_names(py, RuntimeNameConstantMode::ImportRuntime)
+        self.build_python_constants_with_runtime_names(
+            py,
+            RuntimeNameConstantMode::ImportRuntime,
+            |_| Ok(None),
+        )
     }
 
     pub fn build_python_constants_for_soac_runtime(
@@ -189,16 +253,40 @@ impl ModuleCodegenConstants {
         self.build_python_constants_with_runtime_names(
             py,
             RuntimeNameConstantMode::BootstrapSoacRuntime,
+            |_| Ok(None),
         )
+    }
+
+    pub(crate) fn build_python_constants_with_static_resolver(
+        &self,
+        py: Python<'_>,
+        is_soac_runtime: bool,
+        static_resolver: impl FnMut(ModuleConstantId) -> PyResult<Option<*mut ffi::PyObject>>,
+    ) -> PyResult<Vec<Py<PyAny>>> {
+        let runtime_name_mode = if is_soac_runtime {
+            RuntimeNameConstantMode::BootstrapSoacRuntime
+        } else {
+            RuntimeNameConstantMode::ImportRuntime
+        };
+        self.build_python_constants_with_runtime_names(py, runtime_name_mode, static_resolver)
     }
 
     fn build_python_constants_with_runtime_names(
         &self,
         py: Python<'_>,
         runtime_name_mode: RuntimeNameConstantMode,
+        mut static_resolver: impl FnMut(ModuleConstantId) -> PyResult<Option<*mut ffi::PyObject>>,
     ) -> PyResult<Vec<Py<PyAny>>> {
         let mut out = Vec::with_capacity(self.values.len());
-        for value in &self.values {
+        for (index, value) in self.values.iter().enumerate() {
+            let constant_id = ModuleConstantId(index);
+            if self.static_pyobject_image(constant_id).is_some()
+                && let Some(ptr) = static_resolver(constant_id)?
+            {
+                let bound: Bound<'_, PyAny> = unsafe { Bound::from_borrowed_ptr(py, ptr) };
+                out.push(bound.unbind());
+                continue;
+            }
             out.push(match value {
                 ModuleConstantValue::Unicode(bytes) => build_unicode_constant(py, bytes)?.unbind(),
                 ModuleConstantValue::Bytes(bytes) => {
@@ -246,6 +334,22 @@ impl ModuleCodegenConstants {
 
     pub fn len(&self) -> usize {
         self.values.len()
+    }
+
+    pub(crate) fn static_pyobject_image(
+        &self,
+        constant_id: ModuleConstantId,
+    ) -> Option<StaticPyObjectImage> {
+        match self.values.get(constant_id.0)? {
+            ModuleConstantValue::Int(value) => {
+                StaticPyObjectTemplate::for_int(*value)?.static_object_image()
+            }
+            ModuleConstantValue::Unicode(_)
+            | ModuleConstantValue::Bytes(_)
+            | ModuleConstantValue::BigInt(_)
+            | ModuleConstantValue::FloatBits(_)
+            | ModuleConstantValue::RuntimeName(_) => None,
+        }
     }
 
     pub fn require_unicode_constant_id(&self, value: &str) -> ModuleConstantId {
@@ -425,6 +529,18 @@ impl ModuleCodegenConstants {
     fn intern_int(&mut self, value: i64) -> ModuleConstantId {
         self.intern(ModuleConstantValue::Int(value))
     }
+}
+
+fn write_i64(bytes: &mut [u8], offset: usize, value: i64) {
+    bytes[offset..offset + mem::size_of::<i64>()].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_usize(bytes: &mut [u8], offset: usize, value: usize) {
+    bytes[offset..offset + mem::size_of::<usize>()].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + mem::size_of::<u32>()].copy_from_slice(&value.to_le_bytes());
 }
 
 fn build_static_compact_pylong_i64(
@@ -1115,5 +1231,81 @@ mod tests {
                 assert_eq!(raw.long_value.ob_digit[0], 12345);
             }
         });
+    }
+
+    #[test]
+    fn build_python_constants_uses_static_resolver_for_static_pylong() {
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let mut constants = ModuleCodegenConstants::default();
+            let constant_id = constants.intern_int(12345);
+            let resolved_ptr = unsafe { ffi::PyLong_FromLongLong(12345) };
+            assert!(
+                !resolved_ptr.is_null(),
+                "test PyLong allocation should succeed"
+            );
+
+            let objects = constants
+                .build_python_constants_with_static_resolver(py, false, |id| {
+                    assert_eq!(id, constant_id);
+                    Ok(Some(resolved_ptr))
+                })
+                .expect("building constants with static resolver should succeed");
+
+            assert_eq!(objects[constant_id.0].as_ptr(), resolved_ptr);
+        });
+    }
+
+    #[test]
+    fn static_compact_pylong_image_matches_raw_layout() {
+        let image = StaticPyObjectTemplate::for_int(12345)
+            .expect("test constant should be static-capable")
+            .static_object_image()
+            .expect("test build should support static PyLong object images");
+        let type_offset = offset_of!(RawPyLongObject, ob_base) + offset_of!(ffi::PyObject, ob_type);
+        let tag_offset =
+            offset_of!(RawPyLongObject, long_value) + offset_of!(RawPyLongValue, lv_tag);
+        let digit_offset =
+            offset_of!(RawPyLongObject, long_value) + offset_of!(RawPyLongValue, ob_digit);
+
+        assert_eq!(image.bytes.len(), mem::size_of::<RawPyLongObject>());
+        assert_eq!(image.align, mem::align_of::<RawPyLongObject>() as u64);
+        assert_eq!(
+            image.relocations,
+            vec![StaticPyObjectRelocation {
+                offset: type_offset as u64,
+                symbol: "PyLong_Type",
+            }]
+        );
+        assert_eq!(
+            i64::from_le_bytes(
+                image.bytes[offset_of!(RawPyLongObject, ob_base)
+                    + offset_of!(ffi::PyObject, ob_refcnt)
+                    ..offset_of!(RawPyLongObject, ob_base)
+                        + offset_of!(ffi::PyObject, ob_refcnt)
+                        + mem::size_of::<i64>()]
+                    .try_into()
+                    .expect("refcount slice should have i64 width")
+            ),
+            RAW_PYOBJECT_STATIC_IMMORTAL_INITIAL_REFCNT_64
+        );
+        assert_eq!(
+            usize::from_le_bytes(
+                image.bytes[tag_offset..tag_offset + mem::size_of::<usize>()]
+                    .try_into()
+                    .expect("tag slice should have usize width")
+            ),
+            StaticPyObjectTemplate::for_int(12345)
+                .expect("test constant should be static-capable")
+                .compact_pylong_lv_tag()
+        );
+        assert_eq!(
+            u32::from_le_bytes(
+                image.bytes[digit_offset..digit_offset + mem::size_of::<u32>()]
+                    .try_into()
+                    .expect("digit slice should have u32 width")
+            ),
+            12345
+        );
     }
 }
