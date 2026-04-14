@@ -485,7 +485,10 @@ apply/verify mode:
   - records the current observed operand shape
   - compares it against the profiled exact-int shape
   - on hit, calls the profiled `PyLong` number slot helper
-  - on miss, falls back to the normal Python operator lowering
+  - on miss in `verify`/`apply` mode, uses a cold
+    `dp_jit_deopt_resume` continuation when both operands are safe to
+    replay
+  - otherwise, falls back to the normal Python operator lowering
 - The current specialized operator space covers:
   - arithmetic
   - bitwise ops
@@ -500,7 +503,8 @@ apply/verify mode:
   - excluded binops still always use generic lowering
 - Soundness boundary:
   - specialization is guarded by exact observed type-shape match
-  - unsupported or mismatched shapes always fall back
+  - unsupported or mismatched shapes either deopt to the generic
+    continuation or fall back to generic lowering
 - Natural extensions:
   - `float`, `str`, `bytes`, `bool`, and mixed-type shapes
   - richer shape encodings
