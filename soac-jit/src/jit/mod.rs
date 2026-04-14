@@ -2214,6 +2214,7 @@ struct JitEmitConsts {
     ptr_ty: ir::Type,
     i64_ty: ir::Type,
     i32_ty: ir::Type,
+    function_env_value: ir::Value,
     function_data_value: ir::Value,
     module_constant_object_globals: Vec<ir::GlobalValue>,
     scalar_counter_base_value: Option<ir::Value>,
@@ -2450,31 +2451,44 @@ impl JitEmitCtx<'_> {
         })
     }
 
-    fn require_deopt_record_ordinal(&self, point: LocalEnvResumePoint) -> Result<i64, String> {
+    fn require_deopt_record_ref(
+        &self,
+        point: LocalEnvResumePoint,
+    ) -> Result<(ir::Value, i64), String> {
         let deopt_point = self.require_deopt_point(point)?;
-        i64::try_from(deopt_point.id.ordinal).map_err(|_| {
+        let ordinal = i64::try_from(deopt_point.id.ordinal).map_err(|_| {
             format!(
                 "planned JIT deopt point {:?} for function {} has an ordinal that does not fit i64",
                 point, self.function_id
             )
-        })
+        })?;
+        Ok((self.consts.function_env_value, ordinal))
     }
 
-    fn require_deopt_point_at_block_entry(&self, block: BlockLabel) -> Result<i64, String> {
-        self.require_deopt_record_ordinal(LocalEnvResumePoint::BlockEntry {
+    fn require_deopt_point_at_block_entry(
+        &self,
+        block: BlockLabel,
+    ) -> Result<(ir::Value, i64), String> {
+        self.require_deopt_record_ref(LocalEnvResumePoint::BlockEntry {
             function_id: self.function_id,
             block,
         })
     }
 
-    fn require_deopt_point_before_instr_id(&self, instr_id: InstrId) -> Result<i64, String> {
-        self.require_deopt_record_ordinal(LocalEnvResumePoint::BeforeInstr {
+    fn require_deopt_point_before_instr_id(
+        &self,
+        instr_id: InstrId,
+    ) -> Result<(ir::Value, i64), String> {
+        self.require_deopt_record_ref(LocalEnvResumePoint::BeforeInstr {
             key: InstrKey::new(self.function_id, instr_id),
         })
     }
 
-    fn require_deopt_point_before_term(&self, block: BlockLabel) -> Result<i64, String> {
-        self.require_deopt_record_ordinal(LocalEnvResumePoint::BeforeTerm {
+    fn require_deopt_point_before_term(
+        &self,
+        block: BlockLabel,
+    ) -> Result<(ir::Value, i64), String> {
+        self.require_deopt_record_ref(LocalEnvResumePoint::BeforeTerm {
             function_id: self.function_id,
             block,
         })
@@ -14629,6 +14643,7 @@ fn build_cranelift_run_bb_specialized_function(
                     ptr_ty,
                     i64_ty,
                     i32_ty: ir::types::I32,
+                    function_env_value: fn_env_value,
                     function_data_value,
                     module_constant_object_globals: module_constant_object_globals.clone(),
                     scalar_counter_base_value,
