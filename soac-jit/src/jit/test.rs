@@ -4873,6 +4873,7 @@ def read_point(point):
                 resume_point: LocalEnvResumePoint::BlockEntry { function_id, block },
                 precision: LocalEnvResumeStatePrecision::BlockEntry,
                 locals: vec![binding],
+                continuation: RuntimeJitDeoptContinuation::Unimplemented,
             }],
         };
         let expected_value = 0x1234usize as ObjPtr;
@@ -4907,6 +4908,111 @@ def read_point(point):
             locals.describe().contains("x="),
             "runtime locals diagnostics should include local names"
         );
+    }
+
+    #[test]
+    fn runtime_deopt_table_marks_return_local_before_term_continuation() {
+        let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+            r#"
+def f(x):
+    return x
+"#,
+        )
+        .expect("lowering should succeed")
+        .codegen_module;
+        let function = lowered
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "f")
+            .expect("lowered function should exist");
+        let facts = infer_module_value_facts(&lowered);
+        let module_plan = plan_jit_deopt_resume_module(&lowered, &facts)
+            .expect("JIT deopt resume planning should succeed");
+        let function_plan = module_plan
+            .function(function.function_id)
+            .expect("function should have a JIT deopt plan");
+        let table = RuntimeJitDeoptTable::from_plan(function, function_plan)
+            .expect("runtime deopt table should build from plan");
+        let point = LocalEnvResumePoint::BeforeTerm {
+            function_id: function.function_id,
+            block: function.entry_block().label,
+        };
+        let record = table
+            .record_for_point(point)
+            .expect("before-term return point should have a runtime record");
+        let x_binding = record
+            .locals()
+            .iter()
+            .find(|binding| binding.name == "x")
+            .expect("return-local deopt state should carry x");
+        assert_eq!(
+            record.continuation(),
+            &RuntimeJitDeoptContinuation::ReturnLocal {
+                name: "x".to_string(),
+                location: x_binding.location,
+            }
+        );
+    }
+
+    #[test]
+    fn deopt_return_local_continuation_returns_owned_live_value() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|_| {
+            let function_id = FunctionId::new(12, 35);
+            let block = BlockLabel::from_index(0);
+            let location = LocalLocation(0);
+            let binding = LocalEnvResumeBinding {
+                name: "x".to_string(),
+                location,
+                binding: LocalEnvResumeBindingState::Bound,
+                source: LocalEnvResumeValueSource::BlockParam(location),
+                ownership: LocalRefKind::Owned,
+                value: None,
+            };
+            let table = RuntimeJitDeoptTable {
+                function_id,
+                points: vec![RuntimeJitDeoptRecord {
+                    id: PlannedJitDeoptPointId {
+                        function_id,
+                        ordinal: 0,
+                    },
+                    resume_point: LocalEnvResumePoint::BeforeTerm { function_id, block },
+                    precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                    locals: vec![binding],
+                    continuation: RuntimeJitDeoptContinuation::ReturnLocal {
+                        name: "x".to_string(),
+                        location,
+                    },
+                }],
+            };
+            let value = unsafe { ffi::PyLong_FromLong(123_456_789) };
+            assert!(!value.is_null(), "test PyLong allocation should succeed");
+            let before = unsafe { ffi::Py_REFCNT(value) };
+            let mut live_values = vec![value.cast::<c_void>()];
+            let result = unsafe {
+                crate::jit::specialized_helpers::dp_jit_deopt_unimplemented(
+                    std::ptr::addr_of!(table).cast_mut().cast(),
+                    0,
+                    live_values.as_mut_ptr().cast(),
+                    live_values.len() as i64,
+                )
+            };
+            assert_eq!(result, value.cast::<c_void>());
+            assert!(
+                unsafe { ffi::PyErr_Occurred() }.is_null(),
+                "successful deopt continuation should not leave a Python exception"
+            );
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(value) },
+                before + 1,
+                "returned deopt value should be owned by the JIT caller"
+            );
+            unsafe {
+                ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+                ffi::Py_DECREF(value);
+            }
+        });
     }
 
     #[test]

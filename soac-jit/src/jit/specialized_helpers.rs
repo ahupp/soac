@@ -1,6 +1,6 @@
 #![cfg_attr(test, allow(dead_code, unused_imports))]
 
-use super::RuntimeJitDeoptInvocation;
+use super::{RuntimeJitDeoptContinuation, RuntimeJitDeoptInvocation};
 use crate::module_constants::load_runtime_name_owned;
 use crate::module_constants::raise_name_error_for_missing_name;
 use crate::operator_specialization::{ExactIntBinaryOpKind, ExactIntUnaryOpKind};
@@ -1295,7 +1295,32 @@ fn execute_blockpy_deopt_continuation(
     invocation: &RuntimeJitDeoptInvocation<'_>,
     locals: &super::RuntimeJitDeoptLocals<'_>,
 ) -> Result<ObjPtr, String> {
-    Err(format!("{}, {}", invocation.describe(), locals.describe()))
+    match invocation.record().continuation() {
+        RuntimeJitDeoptContinuation::ReturnLocal { name, location } => {
+            let local = locals.get_by_location(*location).ok_or_else(|| {
+                format!(
+                    "deopt continuation expected local {name} at {location:?}, but it was not materialized: {}",
+                    locals.describe()
+                )
+            })?;
+            if local.binding().name != *name {
+                return Err(format!(
+                    "deopt continuation expected local {name} at {location:?}, but materialized {}",
+                    local.binding().name
+                ));
+            }
+            let value = local.value();
+            if value.is_null() {
+                set_deopt_unbound_local_error(name);
+                return Ok(ptr::null_mut());
+            }
+            unsafe { ffi::Py_INCREF(value.cast::<ffi::PyObject>()) };
+            Ok(value)
+        }
+        RuntimeJitDeoptContinuation::Unimplemented => {
+            Err(format!("{}, {}", invocation.describe(), locals.describe()))
+        }
+    }
 }
 
 #[cold]
@@ -1310,6 +1335,24 @@ fn set_deopt_unimplemented_error(detail: String) {
             ffi::PyErr_SetString(
                 ffi::PyExc_RuntimeError,
                 b"JIT deopt helper is not implemented\0".as_ptr() as *const i8,
+            );
+        }
+    }
+}
+
+#[cold]
+fn set_deopt_unbound_local_error(name: &str) {
+    let message =
+        format!("cannot access local variable {name:?} where it is not associated with a value");
+    if let Ok(c_message) = std::ffi::CString::new(message) {
+        unsafe {
+            ffi::PyErr_SetString(ffi::PyExc_UnboundLocalError, c_message.as_ptr());
+        }
+    } else {
+        unsafe {
+            ffi::PyErr_SetString(
+                ffi::PyExc_UnboundLocalError,
+                b"cannot access local variable before assignment\0".as_ptr() as *const i8,
             );
         }
     }

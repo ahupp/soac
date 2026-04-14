@@ -1322,6 +1322,7 @@ pub(crate) struct RuntimeJitDeoptRecord {
     resume_point: LocalEnvResumePoint,
     precision: LocalEnvResumeStatePrecision,
     locals: Vec<LocalEnvResumeBinding>,
+    continuation: RuntimeJitDeoptContinuation,
 }
 
 pub(crate) struct RuntimeJitDeoptInvocation<'a> {
@@ -1337,6 +1338,15 @@ pub(crate) struct RuntimeJitDeoptLocal<'a> {
 
 pub(crate) struct RuntimeJitDeoptLocals<'a> {
     locals: Vec<RuntimeJitDeoptLocal<'a>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeJitDeoptContinuation {
+    Unimplemented,
+    ReturnLocal {
+        name: String,
+        location: LocalLocation,
+    },
 }
 
 impl RuntimeJitDeoptRecord {
@@ -1358,6 +1368,10 @@ impl RuntimeJitDeoptRecord {
 
     pub(crate) fn locals(&self) -> &[LocalEnvResumeBinding] {
         &self.locals
+    }
+
+    pub(crate) fn continuation(&self) -> &RuntimeJitDeoptContinuation {
+        &self.continuation
     }
 
     pub(crate) fn validate_live_value_buffer(
@@ -1388,19 +1402,20 @@ impl RuntimeJitDeoptRecord {
 
     pub(crate) fn describe(&self, function_id: FunctionId) -> String {
         format!(
-            "function {}, record {}, resume_point {:?}, precision {:?}, locals {}",
+            "function {}, record {}, resume_point {:?}, precision {:?}, locals {}, continuation {:?}",
             function_id,
             self.ordinal(),
             self.resume_point,
             self.precision,
-            self.locals.len()
+            self.locals.len(),
+            self.continuation
         )
     }
 }
 
 impl RuntimeJitDeoptTable {
     fn from_plan(
-        function_id: FunctionId,
+        function: &BlockPyFunction<CodegenModuleShape>,
         plan: &PlannedJitDeoptResumeFunction,
     ) -> Result<Self, String> {
         let mut points = Vec::with_capacity(plan.deopt_points.len());
@@ -1408,7 +1423,7 @@ impl RuntimeJitDeoptTable {
             let entry = plan.entry(deopt_point.resume_point).ok_or_else(|| {
                 format!(
                     "planned deopt point {:?} for function {} has no resume entry",
-                    deopt_point.point, function_id
+                    deopt_point.point, function.function_id
                 )
             })?;
             points.push(RuntimeJitDeoptRecord {
@@ -1416,10 +1431,14 @@ impl RuntimeJitDeoptTable {
                 resume_point: deopt_point.resume_point,
                 precision: deopt_point.precision,
                 locals: entry.locals.clone(),
+                continuation: runtime_jit_deopt_continuation_for_point(
+                    function,
+                    deopt_point.resume_point,
+                ),
             });
         }
         let table = Self {
-            function_id,
+            function_id: function.function_id,
             points,
         };
         table.validate_against_plan(plan)?;
@@ -1506,6 +1525,38 @@ impl RuntimeJitDeoptTable {
         self.points
             .iter()
             .find(|record| record.resume_point == point)
+    }
+}
+
+fn runtime_jit_deopt_continuation_for_point(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    point: LocalEnvResumePoint,
+) -> RuntimeJitDeoptContinuation {
+    let LocalEnvResumePoint::BeforeTerm { function_id, block } = point else {
+        return RuntimeJitDeoptContinuation::Unimplemented;
+    };
+    if function_id != function.function_id {
+        return RuntimeJitDeoptContinuation::Unimplemented;
+    }
+    let Some(block) = function
+        .blocks
+        .iter()
+        .find(|candidate| candidate.label == block)
+    else {
+        return RuntimeJitDeoptContinuation::Unimplemented;
+    };
+    let BlockTerm::Return(value) = &block.term else {
+        return RuntimeJitDeoptContinuation::Unimplemented;
+    };
+    let InstrCodegen::Load(load) = value else {
+        return RuntimeJitDeoptContinuation::Unimplemented;
+    };
+    let Some(location) = load.name.local_location() else {
+        return RuntimeJitDeoptContinuation::Unimplemented;
+    };
+    RuntimeJitDeoptContinuation::ReturnLocal {
+        name: load.name.id.as_str().to_string(),
+        location,
     }
 }
 
@@ -1624,8 +1675,10 @@ impl<'a> RuntimeJitDeoptLocals<'a> {
         self.locals.iter().find(|local| local.binding.name == name)
     }
 
-    #[cfg(test)]
-    fn get_by_location(&self, location: LocalLocation) -> Option<&RuntimeJitDeoptLocal<'a>> {
+    pub(crate) fn get_by_location(
+        &self,
+        location: LocalLocation,
+    ) -> Option<&RuntimeJitDeoptLocal<'a>> {
         self.locals
             .iter()
             .find(|local| local.binding.location == location)
@@ -1633,13 +1686,11 @@ impl<'a> RuntimeJitDeoptLocals<'a> {
 }
 
 impl RuntimeJitDeoptLocal<'_> {
-    #[cfg(test)]
-    fn binding(&self) -> &'_ LocalEnvResumeBinding {
+    pub(crate) fn binding(&self) -> &'_ LocalEnvResumeBinding {
         self.binding
     }
 
-    #[cfg(test)]
-    fn value(&self) -> ObjPtr {
+    pub(crate) fn value(&self) -> ObjPtr {
         self.value
     }
 }
@@ -12801,7 +12852,7 @@ impl ProcessJitEngine {
                     )
                 })?;
             let function_deopt_table = Arc::new(RuntimeJitDeoptTable::from_plan(
-                function.function_id,
+                function,
                 function_jit_deopt_resume_plan,
             )?);
             let built = build_cranelift_run_bb_specialized_function(
