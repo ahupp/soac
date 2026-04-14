@@ -2871,6 +2871,7 @@ def f():
             let deopt_result = unsafe {
                 crate::jit::specialized_helpers::dp_jit_deopt_resume(
                     std::sync::Arc::as_ptr(&first_deopt_table) as ObjPtr,
+                    std::ptr::null_mut(),
                     first_entry_record.ordinal() as i64,
                     live_values_ptr,
                     first_entry_record.locals().len() as i64,
@@ -4881,6 +4882,7 @@ def read_point(point):
         let invocation = unsafe {
             RuntimeJitDeoptInvocation::from_raw(
                 std::ptr::addr_of!(table).cast_mut().cast(),
+                std::ptr::null_mut(),
                 0,
                 live_values.as_mut_ptr().cast(),
                 live_values.len() as i64,
@@ -4955,6 +4957,39 @@ def f(x):
     }
 
     #[test]
+    fn runtime_deopt_table_marks_return_global_before_term_continuation() {
+        let function = with_single_test_block(
+            test_function(),
+            vec![],
+            ret_term(name_expr(test_global_name("x"))),
+        );
+        let module = test_module(ModuleNameGen::new(0), vec![function]);
+        let function = &module.callable_defs[0];
+        let facts = infer_module_value_facts(&module);
+        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+            .expect("JIT deopt resume planning should succeed");
+        let function_plan = module_plan
+            .function(function.function_id)
+            .expect("function should have a JIT deopt plan");
+        let table = RuntimeJitDeoptTable::from_plan(function, function_plan)
+            .expect("runtime deopt table should build from plan");
+        let point = LocalEnvResumePoint::BeforeTerm {
+            function_id: function.function_id,
+            block: function.entry_block().label,
+        };
+        let record = table
+            .record_for_point(point)
+            .expect("before-term return point should have a runtime record");
+        assert_eq!(
+            record.continuation(),
+            &RuntimeJitDeoptContinuation::ReturnGlobal {
+                name: "x".to_string(),
+                expected_index: 0,
+            }
+        );
+    }
+
+    #[test]
     fn deopt_return_local_continuation_returns_owned_live_value() {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
@@ -4993,6 +5028,7 @@ def f(x):
             let result = unsafe {
                 crate::jit::specialized_helpers::dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
+                    std::ptr::null_mut(),
                     0,
                     live_values.as_mut_ptr().cast(),
                     live_values.len() as i64,
@@ -5011,6 +5047,72 @@ def f(x):
             unsafe {
                 ffi::Py_DECREF(result.cast::<ffi::PyObject>());
                 ffi::Py_DECREF(value);
+            }
+        });
+    }
+
+    #[test]
+    fn deopt_return_global_continuation_loads_owned_value_from_globals() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|_| {
+            let function_id = FunctionId::new(12, 36);
+            let block = BlockLabel::from_index(0);
+            let table = RuntimeJitDeoptTable {
+                function_id,
+                points: vec![RuntimeJitDeoptRecord {
+                    id: PlannedJitDeoptPointId {
+                        function_id,
+                        ordinal: 0,
+                    },
+                    resume_point: LocalEnvResumePoint::BeforeTerm { function_id, block },
+                    precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                    locals: vec![],
+                    continuation: RuntimeJitDeoptContinuation::ReturnGlobal {
+                        name: "x".to_string(),
+                        expected_index: -1,
+                    },
+                }],
+            };
+            let globals = unsafe { ffi::PyDict_New() };
+            assert!(
+                !globals.is_null(),
+                "test globals dict allocation should succeed"
+            );
+            let key = unsafe { ffi::PyUnicode_FromString(c"x".as_ptr()) };
+            assert!(!key.is_null(), "test key allocation should succeed");
+            let value = unsafe { ffi::PyLong_FromLong(987_654_321) };
+            assert!(!value.is_null(), "test PyLong allocation should succeed");
+            assert_eq!(
+                unsafe { ffi::PyDict_SetItem(globals, key, value) },
+                0,
+                "test globals dict insertion should succeed"
+            );
+            let before = unsafe { ffi::Py_REFCNT(value) };
+            let result = unsafe {
+                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                    std::ptr::addr_of!(table).cast_mut().cast(),
+                    globals.cast(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!(result, value.cast::<c_void>());
+            assert!(
+                unsafe { ffi::PyErr_Occurred() }.is_null(),
+                "successful return-global deopt continuation should not leave a Python exception"
+            );
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(value) },
+                before + 1,
+                "global deopt load should return an owned reference"
+            );
+            unsafe {
+                ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+                ffi::Py_DECREF(value);
+                ffi::Py_DECREF(key);
+                ffi::Py_DECREF(globals);
             }
         });
     }
@@ -5045,6 +5147,7 @@ def f(x):
                 &DP_JIT_DEOPT_RESUME_IMPORT,
             );
             let function_env_value = fb.block_params(entry)[0];
+            let globals_obj = fb.ins().iconst(ptr_ty, 0);
             let live_values = fb.ins().iconst(ptr_ty, 0);
             let result = emit_deopt_resume_call(
                 &mut fb,
@@ -5053,6 +5156,7 @@ def f(x):
                     record_ordinal: 42,
                 },
                 deopt_ref,
+                globals_obj,
                 live_values,
                 0,
                 ptr_ty,
@@ -7144,11 +7248,11 @@ def f(x, y):
         };
         assert_eq!(
             deopt_args.len(),
-            4,
-            "deopt helper call should pass table, record ordinal, live buffer, and live count"
+            5,
+            "deopt helper call should pass table, globals, record ordinal, live buffer, and live count"
         );
         assert!(
-            value_is_iconst_imm(&built.ctx.func, deopt_args[3], 1),
+            value_is_iconst_imm(&built.ctx.func, deopt_args[4], 1),
             "guard-miss deopt should pass one live local value for x"
         );
     }

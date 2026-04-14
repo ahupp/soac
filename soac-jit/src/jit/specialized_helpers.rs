@@ -1044,6 +1044,7 @@ mod test_only_export_stubs {
     panic_obj_export!(dp_jit_del_deref_quietly(cell: ObjPtr));
     panic_obj_export!(dp_jit_deopt_resume(
         deopt_table: ObjPtr,
+        globals_obj: ObjPtr,
         record_ordinal: i64,
         live_values: ObjPtr,
         live_value_count: i64
@@ -1251,11 +1252,20 @@ pub unsafe extern "C" fn dp_jit_del_deref_quietly(cell: ObjPtr) -> ObjPtr {
 #[inline(never)]
 pub unsafe extern "C" fn dp_jit_deopt_resume(
     deopt_table: ObjPtr,
+    globals_obj: ObjPtr,
     record_ordinal: i64,
     live_values: ObjPtr,
     live_value_count: i64,
 ) -> ObjPtr {
-    match unsafe { run_deopt_resume(deopt_table, record_ordinal, live_values, live_value_count) } {
+    match unsafe {
+        run_deopt_resume(
+            deopt_table,
+            globals_obj,
+            record_ordinal,
+            live_values,
+            live_value_count,
+        )
+    } {
         Ok(value) => value,
         Err(detail) => {
             set_deopt_unsupported_continuation_error(detail);
@@ -1267,6 +1277,7 @@ pub unsafe extern "C" fn dp_jit_deopt_resume(
 #[cold]
 unsafe fn run_deopt_resume(
     deopt_table: ObjPtr,
+    globals_obj: ObjPtr,
     record_ordinal: i64,
     live_values: ObjPtr,
     live_value_count: i64,
@@ -1274,6 +1285,7 @@ unsafe fn run_deopt_resume(
     let invocation = unsafe {
         RuntimeJitDeoptInvocation::from_raw(
             deopt_table,
+            globals_obj,
             record_ordinal,
             live_values,
             live_value_count,
@@ -1315,10 +1327,40 @@ fn execute_blockpy_deopt_continuation(
             unsafe { ffi::Py_INCREF(value.cast::<ffi::PyObject>()) };
             Ok(value)
         }
+        RuntimeJitDeoptContinuation::ReturnGlobal {
+            name,
+            expected_index,
+        } => unsafe { execute_return_global_deopt(invocation, name, *expected_index) },
         RuntimeJitDeoptContinuation::Unimplemented => {
             Err(format!("{}, {}", invocation.describe(), locals.describe()))
         }
     }
+}
+
+#[cold]
+unsafe fn execute_return_global_deopt(
+    invocation: &RuntimeJitDeoptInvocation<'_>,
+    name: &str,
+    expected_index: i64,
+) -> Result<ObjPtr, String> {
+    let globals_obj = invocation.globals_obj();
+    if globals_obj.is_null() {
+        return Err(format!(
+            "deopt continuation expected module globals for return-global {name:?}"
+        ));
+    }
+    let name_len = ffi::Py_ssize_t::try_from(name.len()).map_err(|_| {
+        format!("return-global deopt name {name:?} is too large to materialize as PyUnicode")
+    })?;
+    let name_obj = unsafe { ffi::PyUnicode_FromStringAndSize(name.as_ptr().cast(), name_len) };
+    if name_obj.is_null() {
+        return Ok(ptr::null_mut());
+    }
+    let result = unsafe {
+        soac_runtime_load_global_slow(globals_obj, name_obj.cast::<c_void>(), expected_index)
+    };
+    unsafe { ffi::Py_DECREF(name_obj) };
+    Ok(result)
 }
 
 #[cold]

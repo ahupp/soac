@@ -744,6 +744,7 @@ static DP_JIT_DEOPT_RESUME_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_deopt_resume",
     &[
         SigType::Pointer,
+        SigType::Pointer,
         SigType::I64,
         SigType::Pointer,
         SigType::I64,
@@ -1328,6 +1329,7 @@ pub(crate) struct RuntimeJitDeoptRecord {
 pub(crate) struct RuntimeJitDeoptInvocation<'a> {
     table: &'a RuntimeJitDeoptTable,
     record: &'a RuntimeJitDeoptRecord,
+    globals_obj: ObjPtr,
     live_values: &'a [ObjPtr],
 }
 
@@ -1346,6 +1348,10 @@ pub(crate) enum RuntimeJitDeoptContinuation {
     ReturnLocal {
         name: String,
         location: LocalLocation,
+    },
+    ReturnGlobal {
+        name: String,
+        expected_index: i64,
     },
 }
 
@@ -1551,18 +1557,29 @@ fn runtime_jit_deopt_continuation_for_point(
     let InstrCodegen::Load(load) = value else {
         return RuntimeJitDeoptContinuation::Unimplemented;
     };
-    let Some(location) = load.name.local_location() else {
-        return RuntimeJitDeoptContinuation::Unimplemented;
-    };
-    RuntimeJitDeoptContinuation::ReturnLocal {
-        name: load.name.id.as_str().to_string(),
-        location,
+    let name = load.name.id.as_str().to_string();
+    match load.name.location {
+        NameLocation::Local(location) => {
+            RuntimeJitDeoptContinuation::ReturnLocal { name, location }
+        }
+        NameLocation::Global(slot) => RuntimeJitDeoptContinuation::ReturnGlobal {
+            name,
+            expected_index: i64::from(slot.slot()),
+        },
+        NameLocation::GlobalName => RuntimeJitDeoptContinuation::ReturnGlobal {
+            name,
+            expected_index: -1,
+        },
+        NameLocation::RuntimeName | NameLocation::Cell(_) | NameLocation::Constant(_) => {
+            RuntimeJitDeoptContinuation::Unimplemented
+        }
     }
 }
 
 impl RuntimeJitDeoptInvocation<'_> {
     pub(crate) unsafe fn from_raw<'a>(
         deopt_table: ObjPtr,
+        globals_obj: ObjPtr,
         record_ordinal: i64,
         live_values: ObjPtr,
         live_value_count: i64,
@@ -1586,12 +1603,17 @@ impl RuntimeJitDeoptInvocation<'_> {
         Ok(RuntimeJitDeoptInvocation {
             table,
             record,
+            globals_obj,
             live_values,
         })
     }
 
     pub(crate) fn record(&self) -> &'_ RuntimeJitDeoptRecord {
         self.record
+    }
+
+    pub(crate) fn globals_obj(&self) -> ObjPtr {
+        self.globals_obj
     }
 
     pub(crate) fn live_bindings(
@@ -2012,6 +2034,7 @@ fn emit_codegen_indexed_global_load(
                 fb,
                 target,
                 deopt_resume_ref,
+                globals_obj,
                 live_values_base,
                 live_value_count,
                 ctx.consts.ptr_ty,
@@ -2856,6 +2879,7 @@ fn emit_deopt_resume_call(
     fb: &mut FunctionBuilder<'_>,
     target: JitDeoptExitRef,
     deopt_resume_ref: ir::FuncRef,
+    globals_obj: ir::Value,
     live_values_base: ir::Value,
     live_value_count: usize,
     ptr_ty: ir::Type,
@@ -2875,6 +2899,7 @@ fn emit_deopt_resume_call(
         deopt_resume_ref,
         &[
             deopt_table,
+            globals_obj,
             record_ordinal,
             live_values_base,
             live_value_count,
