@@ -417,24 +417,67 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
 
         let mut args = Vec::with_capacity(positional_args.len());
         for arg in positional_args {
-            let CallArgPositional::Positional(expr) = arg else {
-                unsafe {
-                    release_owned_values(args);
-                    ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
+            match arg {
+                CallArgPositional::Positional(expr) => {
+                    let value = unsafe { self.execute_expr_owned(expr)? };
+                    if value.is_null() {
+                        unsafe {
+                            release_owned_values(args);
+                            ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
+                        }
+                        return Ok(ptr::null_mut());
+                    }
+                    args.push(value);
                 }
-                return Err(
-                    "deopt continuation does not support starred call arguments".to_string()
-                );
+                CallArgPositional::Starred(expr) => {
+                    let value = unsafe { self.execute_expr_owned(expr)? };
+                    if value.is_null() {
+                        unsafe {
+                            release_owned_values(args);
+                            ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
+                        }
+                        return Ok(ptr::null_mut());
+                    }
+                    let tuple = unsafe { ffi::PySequence_Tuple(value.cast::<ffi::PyObject>()) };
+                    unsafe {
+                        ffi::Py_DECREF(value.cast::<ffi::PyObject>());
+                    }
+                    if tuple.is_null() {
+                        unsafe {
+                            release_owned_values(args);
+                            ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
+                        }
+                        return Ok(ptr::null_mut());
+                    }
+                    let tuple_len = unsafe { ffi::PyTuple_Size(tuple) };
+                    if tuple_len < 0 {
+                        unsafe {
+                            ffi::Py_DECREF(tuple);
+                            release_owned_values(args);
+                            ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
+                        }
+                        return Ok(ptr::null_mut());
+                    }
+                    for index in 0..tuple_len {
+                        let item = unsafe { ffi::PyTuple_GetItem(tuple, index) };
+                        if item.is_null() {
+                            unsafe {
+                                ffi::Py_DECREF(tuple);
+                                release_owned_values(args);
+                                ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
+                            }
+                            return Ok(ptr::null_mut());
+                        }
+                        unsafe {
+                            ffi::Py_INCREF(item);
+                        }
+                        args.push(item.cast());
+                    }
+                    unsafe {
+                        ffi::Py_DECREF(tuple);
+                    }
+                }
             };
-            let value = unsafe { self.execute_expr_owned(expr)? };
-            if value.is_null() {
-                unsafe {
-                    release_owned_values(args);
-                    ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
-                }
-                return Ok(ptr::null_mut());
-            }
-            args.push(value);
         }
 
         let args_len = match ffi::Py_ssize_t::try_from(args.len()) {

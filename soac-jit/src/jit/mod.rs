@@ -1999,7 +1999,7 @@ fn runtime_jit_deopt_call_parts_supported(
     runtime_jit_deopt_expr_supported(callable)
         && args.iter().all(|arg| match arg {
             CallArgPositional::Positional(expr) => runtime_jit_deopt_expr_supported(expr),
-            CallArgPositional::Starred(_) => false,
+            CallArgPositional::Starred(expr) => runtime_jit_deopt_expr_supported(expr),
         })
         && keywords.iter().all(|keyword| match keyword {
             CallArgKeyword::Named { value, .. } => runtime_jit_deopt_expr_supported(value),
