@@ -1,7 +1,3 @@
-try:
-    DELETED
-except NameError:
-    DELETED = object()
 NO_DEFAULT = object()
 ELLIPSIS = Ellipsis
 TRUE = True
@@ -9,6 +5,7 @@ FALSE = False
 NONE = None
 EMPTY_TUPLE = ()
 _SOAC_RUNTIME_READY = False
+_ANNOTATION_FORWARDREF_MISSING = object()
 
 import collections.abc as _abc
 import keyword as _keyword
@@ -144,11 +141,14 @@ def templatelib_Interpolation(value, expr_text, conversion, format_spec):
 
 
 def load_deleted_name(name, value):
-    if value is DELETED:
-        raise UnboundLocalError(
-            f"cannot access local variable {name!r} where it is not associated with a value"
-        )
+    del name
     return value
+
+
+def raise_deleted_name(name):
+    raise UnboundLocalError(
+        f"cannot access local variable {name!r} where it is not associated with a value"
+    )
 
 
 def bb_trace_enter(function_qualname, block_label, params=None):
@@ -525,10 +525,6 @@ def class_lookup_cell(class_ns, name, cell):
         raise NameError(
             f"cannot access free variable {name!r} where it is not associated with a value in enclosing scope"
         ) from exc
-    if value is DELETED:
-        raise NameError(
-            f"cannot access free variable {name!r} where it is not associated with a value in enclosing scope"
-        )
     return value
 
 
@@ -638,8 +634,6 @@ def call_super(super_fn, cls, instance_or_cls):
             except ValueError:
                 raise RuntimeError("super(): empty __class__ cell")
             cls = cls_value
-        if instance_or_cls is DELETED:
-            raise RuntimeError("super(): arg[0] deleted")
         return _builtins.super(cls, instance_or_cls)
     return super_fn()
 
@@ -763,8 +757,8 @@ def annotation_forwardref_value(thunk, source, module_name):
     try:
         value = thunk()
     except Exception:
-        value = DELETED
-    if value is not DELETED:
+        value = _ANNOTATION_FORWARDREF_MISSING
+    if value is not _ANNOTATION_FORWARDREF_MISSING:
         return value
     annotationlib = _builtins.__import__("annotationlib")
     return annotationlib.ForwardRef(source, module=module_name)

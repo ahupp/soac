@@ -1105,10 +1105,6 @@ class Box:
         class_helper,
         "__dp_delitem"
     ));
-    assert!(!blockpy_module_has_root_name(
-        &blockpy_module,
-        "__dp_DELETED"
-    ));
 
     let resolved_class_helper = lowered.bb_function("_dp_class_ns_Box");
     assert!(resolved_function_has_delitem(resolved_class_helper));
@@ -1131,10 +1127,6 @@ def outer():
     assert!(!blockpy_module_has_root_name(
         &blockpy_module,
         "cell_contents"
-    ));
-    assert!(!blockpy_module_has_root_name(
-        &blockpy_module,
-        "__dp_DELETED"
     ));
 
     let resolved_class_helper = lowered.bb_function("_dp_class_ns_Box");
@@ -2275,13 +2267,26 @@ del x
     let init = blockpy_function_by_name(&blockpy_module, "_dp_module_init");
     assert!(!blockpy_function_has_root_name(init, "__dp_delitem"));
     assert!(blockpy_function_has_del_name(init, "x"));
-    assert!(!blockpy_module_has_root_name(
-        &blockpy_module,
-        "__dp_DELETED"
-    ));
 
     let resolved_init = lowered.bb_function("_dp_module_init");
     assert!(resolved_function_has_del(resolved_init, "x", false));
+}
+
+#[test]
+fn local_delete_stays_semantic_del_after_name_binding() {
+    let source = r#"
+def f():
+    x = 1
+    del x
+"#;
+
+    let lowered = TrackedLowering::new(source);
+    let blockpy_module = lowered.blockpy_module();
+    let f = blockpy_function_by_name(&blockpy_module, "f");
+    assert!(blockpy_function_has_del_name(f, "x"));
+
+    let resolved_f = lowered.bb_function("f");
+    assert!(resolved_function_has_del(resolved_f, "x", false));
 }
 
 #[test]
@@ -2300,8 +2305,7 @@ def f():
     assert!(!blockpy_function_has_store_name(f, "x"));
 
     assert!(
-        module_constant_text(lowered.bb_module()).contains("load_deleted_name")
-            && module_constant_text(lowered.bb_module()).contains("DELETED"),
+        module_constant_text(lowered.bb_module()).contains("raise_deleted_name"),
         "{:?}\n{}",
         lowered.bb_function("f"),
         module_constant_text(lowered.bb_module())
@@ -3752,13 +3756,7 @@ def f():
     let f = function_by_name(&bb_module, "f");
     let debug = format!("{f:?}");
     assert!(
-        module_constant_text(&bb_module).contains("load_deleted_name"),
-        "{}\n{}",
-        debug,
-        module_constant_text(&bb_module)
-    );
-    assert!(
-        module_constant_text(&bb_module).contains("DELETED"),
+        module_constant_text(&bb_module).contains("raise_deleted_name"),
         "{}\n{}",
         debug,
         module_constant_text(&bb_module)

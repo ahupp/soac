@@ -8,14 +8,14 @@ guard has proved a shape/type.
 ## SOAC Question
 
 Can SOAC track guard facts and owned-reference facts within a JIT function so repeated type/version,
-dict-key, deleted-sentinel, and refcount operations collapse?
+dict-key, unbound-local, and refcount operations collapse?
 
 ## Concrete Experiment
 
 - Add a fact lattice over BB blocks:
   - exact Python type / owner type version known
   - module/type key-layout guard known
-  - local slot known not DELETED
+  - local slot known bound
   - value is an owned live temporary
 - Use it only for instructions dominated by the guard and invalidated at Python-call / helper-call
   boundaries unless the callee is known not to mutate the relevant object.

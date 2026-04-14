@@ -467,10 +467,10 @@ Started:
   instrumentation rather than assigning fake semantic identities.
 - A first BlockPy ownership-effects sidecar exists and is computed after
   `value_facts` in the lowering driver. It records local rebind, delete, and
-  cleanup ownership effects from codegen-shaped BlockPy, including stores of
-  the runtime `DELETED` sentinel and immortal local facts. The Rust types still
-  use the transitional `RefcountPlan` names internally, but the pass entrypoint
-  and timing label are now `ownership_effects`.
+  cleanup ownership effects from codegen-shaped BlockPy, including explicit
+  local deletes and immortal local facts. The Rust types still use the
+  transitional `RefcountPlan` names internally, but the pass entrypoint and
+  timing label are now `ownership_effects`.
 - The ownership-effects plan has a verifier that replays local ownership through each
   codegen block and validates store/delete transitions plus edge and return
   cleanup actions before instrumentation or JIT codegen can consume the module.
@@ -486,10 +486,9 @@ Started:
   semantic Python local ownership out of function-wide stack slots and into an
   edge-transfer-aware SSA/`LocalEnv` representation for handled exception
   dispatch and other failure paths.
-- JIT physical stack slots now use `NULL` for unbound or released local state
-  instead of the runtime `DELETED` sentinel. Stack-slot loads raise the deleted
-  name error before exposing `NULL` as a Python value, and stack-slot
-  INCREF/DECREF operations skip `NULL`.
+- JIT physical stack slots now use `NULL` for unbound or released local state.
+  Stack-slot loads raise the deleted name error before exposing `NULL` as a
+  Python value, and stack-slot INCREF/DECREF operations skip `NULL`.
 - JIT return and successful explicit-raise terminals now also consume terminal
   ownership-plan releases. Returns clear planned stack slots to `NULL` and no
   longer scan every stack slot; explicit-raise terminals still route through

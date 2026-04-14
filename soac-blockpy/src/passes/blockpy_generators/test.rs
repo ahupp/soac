@@ -236,7 +236,7 @@ fn resume_closure_bindings_keep_internal_eval_state_on_runtime_binding_path() {
             ClosureSlot {
                 logical_name: "_dp_try_exc_0".to_string(),
                 storage_name: "_dp_cell__dp_try_exc_0".to_string(),
-                init: ClosureInit::DeletedSentinel,
+                init: ClosureInit::EmptyCell,
             },
         ],
         runtime_cells: vec![
@@ -360,7 +360,7 @@ fn build_blockpy_storage_layout_classifies_capture_local_and_runtime_cells() {
             (
                 "_dp_try_exc_0",
                 "_dp_cell__dp_try_exc_0",
-                &ClosureInit::DeletedSentinel
+                &ClosureInit::EmptyCell
             ),
         ]
     );
@@ -691,7 +691,7 @@ fn resume_semantic_overlay_marks_runtime_and_logical_state_for_standard_name_bin
             ClosureSlot {
                 logical_name: "_dp_try_exc_0".to_string(),
                 storage_name: "_dp_cell__dp_try_exc_0".to_string(),
-                init: ClosureInit::DeletedSentinel,
+                init: ClosureInit::EmptyCell,
             },
         ],
         runtime_cells: vec![

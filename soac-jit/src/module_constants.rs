@@ -24,14 +24,8 @@ const ALWAYS_REQUIRED_UNICODE_CONSTANTS: &[&str] = &[
     "extend",
     "update",
 ];
-const ALWAYS_REQUIRED_RUNTIME_NAME_CONSTANTS: &[&str] = &[
-    "TRUE",
-    "FALSE",
-    "NONE",
-    "DELETED",
-    "EMPTY_TUPLE",
-    "ITER_COMPLETE",
-];
+const ALWAYS_REQUIRED_RUNTIME_NAME_CONSTANTS: &[&str] =
+    &["TRUE", "FALSE", "NONE", "EMPTY_TUPLE", "ITER_COMPLETE"];
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct ModuleConstantId(pub usize);
 
@@ -519,11 +513,10 @@ impl ModuleConstantCollector {
         &self,
         call: &blockpy_intrinsics::Call<InstrCodegen>,
     ) -> Option<Vec<u8>> {
-        if helper_name_for_codegen_expr(call.func.as_ref(), &self.constants)
-            != Some("load_deleted_name")
-            || call.args.len() != 2
-        {
-            return None;
+        match helper_name_for_codegen_expr(call.func.as_ref(), &self.constants) {
+            Some("load_deleted_name") if call.args.len() == 2 => {}
+            Some("raise_deleted_name") if call.args.len() == 1 => {}
+            _ => return None,
         }
         self.string_constant_bytes_for_specialized_codegen(call.args[0].expr())
     }

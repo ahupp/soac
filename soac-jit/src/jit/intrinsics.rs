@@ -790,23 +790,22 @@ fn emit_specialized_setattr<'fb>(
     Some(state.finish_owned_result(result))
 }
 
-fn emit_make_cell<'fb, E>(state: &mut impl OperationEmitState<'fb, E>, args: &[&E]) -> ir::Value {
-    let arg_values = state.emit_arg_values(&args);
+fn emit_make_cell<'fb>(
+    state: &mut impl OperationEmitState<'fb, InstrCodegen>,
+    initial_value: Option<&InstrCodegen>,
+) -> ir::Value {
     let ptr_ty = state.ctx().consts.ptr_ty;
-    let deleted_constant_id = state.ctx().consts.deleted_constant_id;
-    let deleted_const = state.emit_owned_module_constant(deleted_constant_id);
-    let null_ptr = state.fb().ins().iconst(ptr_ty, 0);
-    let is_deleted =
-        state
-            .fb()
-            .ins()
-            .icmp(ir::condcodes::IntCC::Equal, arg_values[0].0, deleted_const);
-    let cell_initial_value = state
-        .fb()
-        .ins()
-        .select(is_deleted, null_ptr, arg_values[0].0);
+    let Some(initial_value) = initial_value else {
+        let null_ptr = state.fb().ins().iconst(ptr_ty, 0);
+        let make_cell_ref = state.ctx().make_cell_ref;
+        let call_inst = state.fb().ins().call(make_cell_ref, &[null_ptr]);
+        let result = state.fb().inst_results(call_inst)[0];
+        return state.finish_owned_result(result);
+    };
+    let args = [initial_value];
+    let arg_values = state.emit_arg_values(&args);
     let make_cell_ref = state.ctx().make_cell_ref;
-    let call_inst = state.fb().ins().call(make_cell_ref, &[cell_initial_value]);
+    let call_inst = state.fb().ins().call(make_cell_ref, &[arg_values[0].0]);
     state.release_arg_values(&arg_values);
     let result = state.fb().inst_results(call_inst)[0];
     state.finish_owned_result(result)
@@ -1857,7 +1856,7 @@ pub(super) fn emit_operation<'fb>(
         InstrCodegen::Load(op) => (op.name.location.is_global()
             || op.name.location.is_runtime_name())
         .then(|| emit_load(op, state)),
-        InstrCodegen::MakeCell(op) => Some(emit_make_cell(state, &[op.initial_value.as_ref()])),
+        InstrCodegen::MakeCell(op) => Some(emit_make_cell(state, op.initial_value.as_deref())),
         InstrCodegen::IncrementCounter(_) => None,
         InstrCodegen::CellRef(_) => None,
         InstrCodegen::MakeFunction(_) => None,

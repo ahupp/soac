@@ -7,7 +7,7 @@
 
 use crate::block_py::{
     BlockLabel, BlockPyFunction, BlockPyModule, FunctionId, HasSemanticInstrId, InstrCodegen,
-    InstrKey, InstrResolved, LocalLocation, NameLike,
+    InstrKey, LocalLocation,
 };
 use crate::passes::ownership_effects::{
     compute_function_local_live_ins, compute_function_local_must_bound_ins,
@@ -294,7 +294,6 @@ pub fn plan_local_env_resume_module(
     local_env_plan: &LocalEnvModulePlan,
     facts: &FactStore,
 ) -> LocalEnvResumeModulePlan {
-    let deleted_sentinel_constants = deleted_sentinel_constant_slots(module);
     let functions = module
         .callable_defs
         .iter()
@@ -302,12 +301,7 @@ pub fn plan_local_env_resume_module(
             let function_plan = local_env_plan.function(function.function_id)?;
             Some((
                 function.function_id,
-                plan_function_local_env_resume_with_deleted_constants(
-                    function,
-                    function_plan,
-                    facts,
-                    &deleted_sentinel_constants,
-                ),
+                plan_function_local_env_resume(function, function_plan, facts),
             ))
         })
         .collect();
@@ -318,20 +312,6 @@ pub fn plan_function_local_env_resume(
     function: &BlockPyFunction<CodegenModuleShape>,
     local_env_plan: &FunctionLocalPlan,
     facts: &FactStore,
-) -> FunctionLocalEnvResumePlan {
-    plan_function_local_env_resume_with_deleted_constants(
-        function,
-        local_env_plan,
-        facts,
-        &HashSet::new(),
-    )
-}
-
-fn plan_function_local_env_resume_with_deleted_constants(
-    function: &BlockPyFunction<CodegenModuleShape>,
-    local_env_plan: &FunctionLocalPlan,
-    facts: &FactStore,
-    deleted_sentinel_constants: &HashSet<u32>,
 ) -> FunctionLocalEnvResumePlan {
     let mut entries = Vec::new();
     for block in &function.blocks {
@@ -353,13 +333,7 @@ fn plan_function_local_env_resume_with_deleted_constants(
         });
         for instr in &block.body {
             let Some(instr_id) = instr.try_semantic_instr_id() else {
-                transfer_resume_local_state(
-                    function.function_id,
-                    instr,
-                    facts,
-                    deleted_sentinel_constants,
-                    &mut locals,
-                );
+                transfer_resume_local_state(function.function_id, instr, facts, &mut locals);
                 continue;
             };
             entries.push(LocalEnvResumeEntry {
@@ -369,13 +343,7 @@ fn plan_function_local_env_resume_with_deleted_constants(
                 precision: LocalEnvResumeStatePrecision::InstructionBoundary,
                 locals: locals.clone(),
             });
-            transfer_resume_local_state(
-                function.function_id,
-                instr,
-                facts,
-                deleted_sentinel_constants,
-                &mut locals,
-            );
+            transfer_resume_local_state(function.function_id, instr, facts, &mut locals);
         }
         entries.push(LocalEnvResumeEntry {
             point: LocalEnvResumePoint::BeforeTerm {
@@ -772,7 +740,6 @@ fn transfer_resume_local_state(
     function_id: FunctionId,
     instr: &InstrCodegen,
     facts: &FactStore,
-    deleted_sentinel_constants: &HashSet<u32>,
     locals: &mut [LocalEnvResumeBinding],
 ) {
     match instr {
@@ -780,18 +747,6 @@ fn transfer_resume_local_state(
             let Some(location) = op.name.local_location() else {
                 return;
             };
-            if expr_is_deleted_sentinel(&op.value, deleted_sentinel_constants) {
-                if let Some(binding) = locals
-                    .iter_mut()
-                    .find(|binding| binding.location == location)
-                {
-                    binding.binding = LocalEnvResumeBindingState::Unbound;
-                    binding.source = LocalEnvResumeValueSource::Unbound;
-                    binding.ownership = LocalRefKind::Unbound;
-                    binding.value = None;
-                }
-                return;
-            }
             let value_key = op
                 .value
                 .try_semantic_instr_id()
@@ -827,35 +782,6 @@ fn transfer_resume_local_state(
         }
         _ => {}
     }
-}
-
-fn expr_is_deleted_sentinel(
-    expr: &InstrCodegen,
-    deleted_sentinel_constants: &HashSet<u32>,
-) -> bool {
-    match expr {
-        InstrCodegen::Load(op) if op.name.is_runtime_symbol("DELETED") => true,
-        InstrCodegen::Load(op) => op
-            .name
-            .location
-            .as_constant()
-            .is_some_and(|index| deleted_sentinel_constants.contains(&index)),
-        _ => false,
-    }
-}
-
-fn deleted_sentinel_constant_slots(module: &BlockPyModule<CodegenModuleShape>) -> HashSet<u32> {
-    module
-        .module_constants
-        .iter()
-        .enumerate()
-        .filter_map(|(index, constant)| match constant {
-            InstrResolved::Load(op) if op.name.is_runtime_symbol("DELETED") => {
-                Some(u32::try_from(index).expect("module constant index should fit in u32"))
-            }
-            _ => None,
-        })
-        .collect()
 }
 
 fn local_ref_kind_for_resume_value(facts: Option<PyObjFacts>) -> LocalRefKind {

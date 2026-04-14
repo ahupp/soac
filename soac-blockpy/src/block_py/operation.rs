@@ -727,7 +727,17 @@ impl<I: Instr> Mappable<I> for Del<I> {
 
 define_operation! {
     pub struct MakeCell<E> {
-        initial_value: Box<E>,
+        initial_value: Option<Box<E>>,
+    }
+}
+
+impl<E: Instr> MakeCell<E> {
+    pub fn empty() -> Self {
+        Self::new(None)
+    }
+
+    pub fn with_initial_value(initial_value: E) -> Self {
+        Self::new(Some(Box::new(initial_value)))
     }
 }
 

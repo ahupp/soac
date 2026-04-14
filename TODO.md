@@ -5,7 +5,6 @@
  * If caching BlockPy before codegen, recover FunctionNameGen.next_tmp_id from generated `_dp_*` names.
  * Revisit Cranelift compile caching by relocating constant values instead of embedding per-run object/counter pointers in CLIF.
  * Add mutation watchers for `f.__defaults__` and `f.__kwdefaults__` so direct/JIT default slots stay fresh after in-place edits.
- * Remove `DELETED` from internal local storage paths and use `NULL` as the only unbound sentinel.
  * Simplify class-cell capture by unconditionally treating `super()` as capturing `__class__`.
  * Consider moving `LocalEnvEntry` construction into a name-binding-like BlockPy pass so local ownership/storage entries are decided before JIT codegen.
  * Treat `exec` as a keyword explicitly instead of handling it as a runtime helper name.
@@ -20,7 +19,7 @@
  * Statically linking against libpython.a
 
  * Value tracing (types, escape analysis)
-   * If a local is always set, skip DELETED checks
+   * If a local is always set, skip unbound checks
    * Make closure cells function constants if they are never written after capture
    * Stack allocate values if they don't escape
    * unbocked ints when possible and convert at border

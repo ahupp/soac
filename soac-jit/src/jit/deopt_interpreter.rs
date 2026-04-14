@@ -345,25 +345,16 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
         &mut self,
         make_cell: &soac_blockpy::block_py::MakeCell<InstrCodegen>,
     ) -> Result<ObjPtr, String> {
-        let initial_value = unsafe { self.execute_expr_owned(&make_cell.initial_value)? };
+        let Some(initial_value_expr) = make_cell.initial_value.as_ref() else {
+            let cell = unsafe { PyCell_New(ptr::null_mut()) };
+            return Ok(cell.cast());
+        };
+        let initial_value = unsafe { self.execute_expr_owned(initial_value_expr)? };
         if initial_value.is_null() {
             return Ok(ptr::null_mut());
         }
-        let deleted = unsafe { execute_runtime_name_deopt("DELETED")? };
-        if deleted.is_null() {
-            unsafe {
-                ffi::Py_DECREF(initial_value.cast::<ffi::PyObject>());
-            }
-            return Ok(ptr::null_mut());
-        }
-        let cell_initial_value = if initial_value == deleted {
-            ptr::null_mut()
-        } else {
-            initial_value.cast::<ffi::PyObject>()
-        };
-        let cell = unsafe { PyCell_New(cell_initial_value) };
+        let cell = unsafe { PyCell_New(initial_value.cast::<ffi::PyObject>()) };
         unsafe {
-            ffi::Py_DECREF(deleted.cast::<ffi::PyObject>());
             ffi::Py_DECREF(initial_value.cast::<ffi::PyObject>());
         }
         Ok(cell.cast())

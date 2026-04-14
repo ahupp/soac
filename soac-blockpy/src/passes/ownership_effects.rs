@@ -8,10 +8,9 @@
 
 use crate::block_py::{
     Block, BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, CellLocation,
-    ChildVisitable, FunctionId, HasSemanticInstrId, InstrCodegen, InstrKey, LocalLocation,
-    NameLike, Visit,
+    ChildVisitable, FunctionId, HasSemanticInstrId, InstrCodegen, InstrKey, LocalLocation, Visit,
 };
-use crate::passes::{CodegenModuleShape, FactStore, InstrResolved, PyObjFacts, ValueFacts};
+use crate::passes::{CodegenModuleShape, FactStore, PyObjFacts, ValueFacts};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -110,14 +109,13 @@ pub fn plan_ownership_effects(
     module: &BlockPyModule<CodegenModuleShape>,
     facts: &FactStore,
 ) -> RefcountPlan {
-    let deleted_sentinel_constants = deleted_sentinel_constant_slots(module);
     let functions = module
         .callable_defs
         .iter()
         .map(|function| {
             (
                 function.function_id,
-                plan_function_refcounts(function, facts, &deleted_sentinel_constants),
+                plan_function_refcounts(function, facts),
             )
         })
         .collect();
@@ -130,7 +128,6 @@ pub fn validate_ownership_effects(
     plan: &RefcountPlan,
 ) -> Result<(), String> {
     let mut errors = Vec::new();
-    let deleted_sentinel_constants = deleted_sentinel_constant_slots(module);
     let function_ids = module
         .callable_defs
         .iter()
@@ -146,13 +143,7 @@ pub fn validate_ownership_effects(
     }
 
     for function in &module.callable_defs {
-        validate_function_refcount_plan(
-            function,
-            facts,
-            plan,
-            &deleted_sentinel_constants,
-            &mut errors,
-        );
+        validate_function_refcount_plan(function, facts, plan, &mut errors);
     }
 
     if errors.is_empty() {
@@ -166,7 +157,6 @@ fn validate_function_refcount_plan(
     function: &BlockPyFunction<CodegenModuleShape>,
     facts: &FactStore,
     plan: &RefcountPlan,
-    deleted_sentinel_constants: &HashSet<u32>,
     errors: &mut Vec<String>,
 ) {
     let Some(function_plan) = plan.function(function.function_id) else {
@@ -249,7 +239,6 @@ fn validate_function_refcount_plan(
             &target_params,
             &local_liveness,
             &local_must_bound,
-            deleted_sentinel_constants,
             block.label == entry_label,
             errors,
         );
@@ -259,7 +248,6 @@ fn validate_function_refcount_plan(
 fn plan_function_refcounts(
     function: &BlockPyFunction<CodegenModuleShape>,
     facts: &FactStore,
-    deleted_sentinel_constants: &HashSet<u32>,
 ) -> FunctionRefcountPlan {
     let Some(storage_layout) = function.storage_layout().as_ref() else {
         return FunctionRefcountPlan::default();
@@ -310,7 +298,6 @@ fn plan_function_refcounts(
                     &target_params,
                     &local_liveness,
                     &local_must_bound,
-                    deleted_sentinel_constants,
                     block.label == entry_label,
                 ),
             )
@@ -369,7 +356,6 @@ fn plan_block_refcounts(
     target_params: &HashMap<BlockLabel, Vec<String>>,
     local_liveness: &LocalLiveness,
     local_must_bound: &LocalMustBound,
-    deleted_sentinel_constants: &HashSet<u32>,
     is_entry_block: bool,
 ) -> BlockRefcountPlan {
     let empty_must_bound = HashSet::new();
@@ -400,14 +386,6 @@ fn plan_block_refcounts(
                     .get(&location)
                     .copied()
                     .unwrap_or(LocalRefState::Unbound);
-                if expr_is_deleted_sentinel(&op.value, deleted_sentinel_constants) {
-                    actions.push(RefcountAction {
-                        site: RefcountSite::Instr(instr.semantic_instr_key(function.function_id)),
-                        kind: RefcountActionKind::DeleteLocal { local, old_state },
-                    });
-                    env.insert(location, LocalRefState::Unbound);
-                    continue;
-                }
                 let new_state = state_for_expr(function.function_id, &op.value, facts);
                 actions.push(RefcountAction {
                     site: RefcountSite::Instr(instr.semantic_instr_key(function.function_id)),
@@ -586,7 +564,6 @@ fn validate_block_refcount_plan(
     target_params: &HashMap<BlockLabel, Vec<String>>,
     local_liveness: &LocalLiveness,
     local_must_bound: &LocalMustBound,
-    deleted_sentinel_constants: &HashSet<u32>,
     is_entry_block: bool,
     errors: &mut Vec<String>,
 ) {
@@ -650,19 +627,6 @@ fn validate_block_refcount_plan(
                     .get(&location)
                     .copied()
                     .unwrap_or(LocalRefState::Unbound);
-                if expr_is_deleted_sentinel(&op.value, deleted_sentinel_constants) {
-                    let expected = RefcountActionKind::DeleteLocal { local, old_state };
-                    validate_exact_refcount_action(
-                        function,
-                        block.label,
-                        &site,
-                        actions,
-                        expected,
-                        errors,
-                    );
-                    env.insert(location, LocalRefState::Unbound);
-                    continue;
-                }
                 let new_state = state_for_expr(function.function_id, &op.value, facts);
                 let expected = RefcountActionKind::RebindLocal {
                     local,
@@ -936,35 +900,6 @@ fn state_for_expr(
         Some(ValueFacts::PyObj(py_facts)) => state_for_py_facts(py_facts),
         Some(_) | None => LocalRefState::Owned,
     }
-}
-
-fn expr_is_deleted_sentinel(
-    expr: &InstrCodegen,
-    deleted_sentinel_constants: &HashSet<u32>,
-) -> bool {
-    match expr {
-        InstrCodegen::Load(op) if op.name.is_runtime_symbol("DELETED") => true,
-        InstrCodegen::Load(op) => op
-            .name
-            .location
-            .as_constant()
-            .is_some_and(|index| deleted_sentinel_constants.contains(&index)),
-        _ => false,
-    }
-}
-
-fn deleted_sentinel_constant_slots(module: &BlockPyModule<CodegenModuleShape>) -> HashSet<u32> {
-    module
-        .module_constants
-        .iter()
-        .enumerate()
-        .filter_map(|(index, constant)| match constant {
-            InstrResolved::Load(op) if op.name.is_runtime_symbol("DELETED") => {
-                Some(u32::try_from(index).expect("module constant index should fit in u32"))
-            }
-            _ => None,
-        })
-        .collect()
 }
 
 fn state_for_py_facts(facts: PyObjFacts) -> LocalRefState {

@@ -660,7 +660,6 @@ import soac.runtime as runtime
 
 assert runtime._SOAC_RUNTIME_READY is True
 assert isinstance(runtime.__spec__.loader, import_hook.SoacLoader)
-assert runtime.DELETED is runtime.DELETED
 assert runtime.ITER_COMPLETE is runtime.ITER_COMPLETE
 for name in ("locals", "eval", "exec"):
     try:

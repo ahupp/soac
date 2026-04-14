@@ -405,13 +405,7 @@ fn rewrite_binding_delete(
         return op_stmt(Del::new(target, false).with_meta(meta));
     }
     match scope.binding_target_for_name(bind_name.as_str(), BindingPurpose::Store) {
-        BindingTarget::Local => op_stmt(
-            Store::new(
-                target,
-                Box::new(deleted_sentinel_expr(meta.node_index.clone(), meta.range)),
-            )
-            .with_meta(meta),
-        ),
+        BindingTarget::Local => op_stmt(Del::new(target, false).with_meta(meta)),
         BindingTarget::ModuleGlobal => {
             rewrite_global_binding_delete_by_name(bind_name.into(), meta)
         }
@@ -443,6 +437,19 @@ fn wrap_deleted_name_load_expr(
             core_string_expr(logical_name, node_index.clone(), range),
             value,
         ],
+    )
+}
+
+fn raise_deleted_name_expr(
+    logical_name: String,
+    node_index: ast::AtomicNodeIndex,
+    range: ruff_text_size::TextRange,
+) -> InstrUnresolved {
+    core_runtime_positional_call_expr_with_meta(
+        "raise_deleted_name",
+        node_index.clone(),
+        range,
+        vec![core_string_expr(logical_name, node_index, range)],
     )
 }
 
@@ -548,16 +555,20 @@ fn rewrite_deleted_name_loads_in_expr(
             let always_unbound = always_unbound_names.contains(op.name.id_str());
             let deleted = deleted_names.contains(op.name.id_str());
             if always_unbound || deleted {
-                *expr = wrap_deleted_name_load_expr(
-                    op.name.id_str().to_string(),
-                    meta.node_index.clone(),
-                    meta.range,
-                    if always_unbound {
-                        deleted_sentinel_expr(meta.node_index, meta.range)
-                    } else {
-                        expr.clone()
-                    },
-                );
+                *expr = if always_unbound {
+                    raise_deleted_name_expr(
+                        op.name.id_str().to_string(),
+                        meta.node_index.clone(),
+                        meta.range,
+                    )
+                } else {
+                    wrap_deleted_name_load_expr(
+                        op.name.id_str().to_string(),
+                        meta.node_index.clone(),
+                        meta.range,
+                        expr.clone(),
+                    )
+                };
                 return;
             }
             if let UnresolvedName::SourceName(_) = &op.name {
@@ -573,16 +584,20 @@ fn rewrite_deleted_name_loads_in_expr(
                         let always_unbound = always_unbound_names.contains(logical_name.as_str());
                         let deleted = deleted_names.contains(logical_name.as_str());
                         if always_unbound || deleted {
-                            *expr = wrap_deleted_name_load_expr(
-                                logical_name,
-                                meta.node_index.clone(),
-                                meta.range,
-                                if always_unbound {
-                                    deleted_sentinel_expr(meta.node_index, meta.range)
-                                } else {
-                                    expr.clone()
-                                },
-                            );
+                            *expr = if always_unbound {
+                                raise_deleted_name_expr(
+                                    logical_name,
+                                    meta.node_index.clone(),
+                                    meta.range,
+                                )
+                            } else {
+                                wrap_deleted_name_load_expr(
+                                    logical_name,
+                                    meta.node_index.clone(),
+                                    meta.range,
+                                    expr.clone(),
+                                )
+                            };
                         }
                     }
                 }
@@ -659,13 +674,13 @@ fn core_name_expr(
     if matches!(ctx, ast::ExprContext::Load)
         && matches!(
             id,
-            "DELETED"
-                | "NONE"
+            "NONE"
                 | "TRUE"
                 | "FALSE"
                 | "ELLIPSIS"
                 | "globals"
                 | "load_deleted_name"
+                | "raise_deleted_name"
                 | "class_lookup_global"
                 | "class_lookup_cell"
                 | "tuple"
@@ -694,13 +709,6 @@ fn class_namespace_expr(
     range: ruff_text_size::TextRange,
 ) -> InstrUnresolved {
     core_name_expr("_dp_class_ns", ast::ExprContext::Load, node_index, range)
-}
-
-fn deleted_sentinel_expr(
-    node_index: ast::AtomicNodeIndex,
-    range: ruff_text_size::TextRange,
-) -> InstrUnresolved {
-    core_name_expr("DELETED", ast::ExprContext::Load, node_index, range)
 }
 
 fn rewrite_class_name_load_global(
@@ -750,13 +758,7 @@ fn rewrite_quiet_delete_marker(
             op_stmt(Del::new(name, true).with_meta(meta))
         }
         _ => match scope.binding_target_for_name(name.as_str(), BindingPurpose::Store) {
-            BindingTarget::Local => op_stmt(
-                Store::new(
-                    name,
-                    Box::new(deleted_sentinel_expr(meta.node_index.clone(), meta.range)),
-                )
-                .with_meta(meta),
-            ),
+            BindingTarget::Local => op_stmt(Del::new(name, true).with_meta(meta)),
             BindingTarget::ModuleGlobal => op_stmt(Del::new(name, true).with_meta(meta)),
             BindingTarget::ClassNamespace => op_stmt(
                 DelItem::new(
@@ -813,10 +815,6 @@ fn quiet_delete_marker_target(expr: &InstrUnresolved) -> Option<ast::name::Name>
     }
 }
 
-fn is_deleted_sentinel_expr(expr: &InstrUnresolved) -> bool {
-    matches!(expr, InstrUnresolved::Load(op) if op.name.is_runtime_symbol("DELETED"))
-}
-
 fn cell_ref_marker_target(expr: &InstrUnresolved) -> Option<String> {
     let InstrUnresolved::CellRefForName(CellRefForName { logical_name, .. }) = expr else {
         return None;
@@ -851,22 +849,23 @@ fn build_local_cell_init_assign(
 ) -> CoreStmt {
     let node_index = compat_node_index();
     let range = compat_range();
-    let init_expr = if is_parameter {
-        core_name_expr(
+    let make_cell = if is_parameter {
+        MakeCell::with_initial_value(core_name_expr(
             logical_name,
             ast::ExprContext::Load,
             node_index.clone(),
             range,
-        )
+        ))
     } else {
-        deleted_sentinel_expr(node_index.clone(), range)
+        MakeCell::empty()
     };
     op_stmt(
         Store::new(
             ast::name::Name::new(storage_name),
-            Box::new(op_expr(MakeCell::new(Box::new(init_expr)).with_meta(
-                crate::block_py::Meta::new(node_index.clone(), range),
-            ))),
+            Box::new(op_expr(make_cell.with_meta(crate::block_py::Meta::new(
+                node_index.clone(),
+                range,
+            )))),
         )
         .with_meta(crate::block_py::Meta::new(node_index, range)),
     )
@@ -885,7 +884,9 @@ fn closure_slot_init_expr(slot: &ClosureSlot) -> InstrUnresolved {
             node_index,
             range,
         ),
-        ClosureInit::DeletedSentinel => deleted_sentinel_expr(node_index, range),
+        ClosureInit::EmptyCell => {
+            panic!("empty cells should lower through MakeCell::empty, not an expression")
+        }
         ClosureInit::RuntimePcUnstarted => literal_expr(
             NumberLiteral {
                 value: NumberLiteralValue::Int(IntLiteral::from_i64(1)),
@@ -910,10 +911,13 @@ fn build_closure_slot_cell_init_assign(slot: &ClosureSlot) -> CoreStmt {
     op_stmt(
         Store::new(
             ast::name::Name::new(slot.storage_name.as_str()),
-            Box::new(op_expr(
-                MakeCell::new(Box::new(closure_slot_init_expr(slot)))
-                    .with_meta(crate::block_py::Meta::new(node_index.clone(), range)),
-            )),
+            Box::new(op_expr({
+                let make_cell = match slot.init {
+                    ClosureInit::EmptyCell => MakeCell::empty(),
+                    _ => MakeCell::with_initial_value(closure_slot_init_expr(slot)),
+                };
+                make_cell.with_meta(crate::block_py::Meta::new(node_index.clone(), range))
+            })),
         )
         .with_meta(crate::block_py::Meta::new(node_index, range)),
     )
@@ -980,20 +984,6 @@ fn logical_name_for_cell_bound_name(
     scope.logical_name_for_cell_storage(storage_name.as_str())
 }
 
-fn store_cell_deleted_logical_name(
-    expr: &InstrUnresolved,
-    scope: &CallableScopeInfo,
-    _storage_layout: &StorageLayout,
-) -> Option<String> {
-    let InstrUnresolved::Store(op) = expr else {
-        return None;
-    };
-    if !is_deleted_sentinel_expr(&op.value) {
-        return None;
-    }
-    logical_name_for_cell_bound_name(scope, &op.name)
-}
-
 fn del_deref_logical_name(
     expr: &InstrUnresolved,
     scope: &CallableScopeInfo,
@@ -1016,9 +1006,6 @@ fn store_cell_runtime_logical_name(
     let InstrUnresolved::Store(op) = expr else {
         return None;
     };
-    if is_deleted_sentinel_expr(&op.value) {
-        return None;
-    }
     logical_name_for_cell_bound_name(scope, &op.name)
 }
 
@@ -1098,29 +1085,11 @@ fn rewrite_binding_assign_by_name(
     let meta = crate::block_py::Meta::new(node_index.clone(), range);
     let target: UnresolvedName = ast::name::Name::new(name.clone()).into();
     if scope.is_cell_binding(name.as_str()) {
-        if is_deleted_sentinel_expr(&value) {
-            let _ = resolver;
-            return op_stmt(Del::new(target.clone(), false).with_meta(meta));
-        }
         return rewrite_cell_binding_assign(target, value, meta, scope, resolver);
     }
     match scope.binding_target_for_name(name.as_str(), BindingPurpose::Store) {
-        BindingTarget::ModuleGlobal => {
-            if is_deleted_sentinel_expr(&value) {
-                return rewrite_global_binding_delete_by_name(ast::name::Name::new(name), meta);
-            }
-            rewrite_global_binding_assign(target, value, meta)
-        }
+        BindingTarget::ModuleGlobal => rewrite_global_binding_assign(target, value, meta),
         BindingTarget::ClassNamespace => {
-            if is_deleted_sentinel_expr(&value) {
-                return op_stmt(
-                    DelItem::new(
-                        Box::new(class_namespace_expr(node_index.clone(), range)),
-                        Box::new(core_string_expr(name, node_index, range)),
-                    )
-                    .with_meta(meta),
-                );
-            }
             rewrite_class_namespace_binding_assign(target, value, meta)
         }
         BindingTarget::Local => op_stmt(Store::new(target, Box::new(value)).with_meta(meta)),
@@ -1268,18 +1237,21 @@ fn collect_deleted_names_in_stmt(
     storage_layout: &StorageLayout,
     names: &mut HashSet<String>,
 ) {
-    if let Some((name, value, _, _)) = unresolved_semantic_store_parts(stmt) {
-        if scope.has_local_def(name.as_str()) && is_deleted_sentinel_expr(&value) {
-            names.insert(name);
+    match stmt {
+        InstrUnresolved::Del(op)
+            if !op.name.is_runtime_name()
+                && !is_internal_symbol(op.name.id_str())
+                && scope.has_local_def(op.name.id_str()) =>
+        {
+            names.insert(op.name.id_str().to_string());
         }
-    }
-    if let Some((target, _meta)) = unresolved_semantic_delete_target(stmt) {
-        if scope.has_local_def(target.as_str()) {
-            names.insert(target.to_string());
+        _ => {
+            if let Some((target, _meta)) = unresolved_semantic_delete_target(stmt) {
+                if scope.has_local_def(target.as_str()) {
+                    names.insert(target.to_string());
+                }
+            }
         }
-    }
-    if let Some(name) = store_cell_deleted_logical_name(stmt, scope, storage_layout) {
-        names.insert(name);
     }
     if let Some(name) = del_deref_logical_name(stmt, scope, storage_layout) {
         names.insert(name);
@@ -1580,8 +1552,8 @@ fn collect_runtime_bound_local_names_in_stmt(
     storage_layout: &StorageLayout,
     names: &mut HashSet<String>,
 ) {
-    if let Some((name, value, _, _)) = unresolved_semantic_store_parts(stmt) {
-        if scope.has_local_def(name.as_str()) && !is_deleted_sentinel_expr(&value) {
+    if let Some((name, _, _, _)) = unresolved_semantic_store_parts(stmt) {
+        if scope.has_local_def(name.as_str()) {
             names.insert(name);
         }
     }
@@ -2209,10 +2181,10 @@ impl MapInstr<InstrUnresolved, InstrResolved> for NameLocator<'_> {
     fn map_instr(&mut self, expr: InstrUnresolved) -> InstrResolved {
         if let InstrLow::MakeCell(op) = expr {
             let meta = op.meta();
-            let initial_value = self.map_make_cell_initial_value(*op.initial_value);
-            return MakeCell::new(Box::new(initial_value))
-                .with_meta(meta)
-                .into();
+            let initial_value = op
+                .initial_value
+                .map(|initial_value| Box::new(self.map_make_cell_initial_value(*initial_value)));
+            return MakeCell::new(initial_value).with_meta(meta).into();
         }
         match_default!(expr: crate::passes::InstrLow<UnresolvedName> {
             InstrLow::Literal(literal) => InstrResolved::Literal(literal),
@@ -2508,7 +2480,7 @@ fn compute_callable_storage_layout_for_name_binding(
             let init = if param_name_set.contains(logical_name.as_str()) {
                 ClosureInit::Parameter
             } else {
-                ClosureInit::DeletedSentinel
+                ClosureInit::EmptyCell
             };
             layout.cellvars.push(ClosureSlot {
                 logical_name,
@@ -3130,6 +3102,7 @@ fn should_keep_runtime_bootstrap_name_as_constant(name: &ResolvedName) -> bool {
         || name.is_runtime_symbol("EMPTY_TUPLE")
         || name.is_runtime_symbol("ITER_COMPLETE")
         || name.is_runtime_symbol("tuple_values")
+        || name.is_runtime_symbol("raise_deleted_name")
         || name.is_runtime_symbol("make_function")
         || name.is_runtime_symbol("create_class")
         || name.is_runtime_symbol("import_")

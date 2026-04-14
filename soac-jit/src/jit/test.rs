@@ -6425,9 +6425,9 @@ def f(x):
         let function = with_single_test_block(
             test_function(),
             vec![],
-            ret_term(op_expr(MakeCell::new(Box::new(name_expr(
+            ret_term(op_expr(MakeCell::with_initial_value(name_expr(
                 test_constant_name(0),
-            ))))),
+            )))),
         );
         let module = test_module(ModuleNameGen::new(0), vec![function]);
         let function = &module.callable_defs[0];
@@ -9733,9 +9733,9 @@ def g():
             let function = with_single_test_block(
                 test_function(),
                 vec![],
-                ret_term(op_expr(MakeCell::new(Box::new(name_expr(
+                ret_term(op_expr(MakeCell::with_initial_value(name_expr(
                     test_constant_name(0),
-                ))))),
+                )))),
             );
             let function_id = function.function_id;
             let block = function.entry_block().label;
@@ -9823,9 +9823,7 @@ def g():
             let function = with_single_test_block(
                 test_function(),
                 vec![],
-                ret_term(op_expr(MakeCell::new(Box::new(name_expr(
-                    test_runtime_name("DELETED"),
-                ))))),
+                ret_term(op_expr(MakeCell::empty())),
             );
             let function_id = function.function_id;
             let block = function.entry_block().label;
@@ -16131,7 +16129,7 @@ def f(x, y):
     }
 
     #[test]
-    fn render_specialized_jit_deleted_name_checks_inline_the_sentinel_compare() {
+    fn render_specialized_jit_deleted_name_checks_use_null_unbound_state() {
         let blocks = [1usize as ObjPtr];
         let mut constants = TestConstantPool::default();
         let mut function = with_single_test_block(
@@ -16158,26 +16156,7 @@ def f(x, y):
         );
         assert!(
             !rendered.contains("call dp_jit_load_deleted_name_obj"),
-            "deleted-name lowering should inline the DELETED sentinel check in CLIF:\n{rendered}"
-        );
-    }
-
-    #[test]
-    fn render_specialized_jit_local_store_of_deleted_sentinel_behaves_like_delete() {
-        let blocks = [1usize as ObjPtr];
-        let mut function = with_single_test_block(
-            test_function(),
-            vec![assign_stmt(
-                test_name("x"),
-                name_expr(test_runtime_name("DELETED")),
-            )],
-            ret_term(name_expr(test_name("x"))),
-        );
-        set_stack_slots(&mut function, &["x"]);
-        let rendered = render_test_jit_function(&function, &blocks);
-        assert!(
-            rendered.contains("call dp_jit_raise_deleted_name_error"),
-            "store of the deleted sentinel should clear the local binding, not keep a local-only DELETED object:\n{rendered}"
+            "deleted-name lowering should avoid calling the Python helper:\n{rendered}"
         );
     }
 

@@ -68,9 +68,7 @@ fn install_soac_runtime_bootstrap_globals(
     shared_state: &SharedModuleState,
 ) -> PyResult<SoacRuntimeBootstrapGlobals> {
     let bootstrap = soac_jit::module_constants::build_soac_runtime_bootstrap_module(py)?;
-    let deleted = install_soac_runtime_bootstrap_sentinel(py, globals, shared_state, "DELETED")?;
     install_soac_runtime_bootstrap_sentinel(py, globals, shared_state, "ITER_COMPLETE")?;
-    bootstrap.setattr("DELETED", deleted)?;
     let mut helpers = Vec::new();
     for name in [
         "_entry_template",

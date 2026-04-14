@@ -935,6 +935,8 @@ static DP_JIT_RAISE_DELETED_NAME_ERROR_IMPORT: ImportSpec =
     ImportSpec::new("dp_jit_raise_deleted_name_error", &[SigType::Pointer], &[]);
 static DP_JIT_RAISE_MISSING_REQUIRED_ARGUMENT_IMPORT: ImportSpec =
     ImportSpec::new("dp_jit_raise_missing_required_argument", &[], &[]);
+static DP_JIT_RAISE_SUPER_ARG_DELETED_IMPORT: ImportSpec =
+    ImportSpec::new("dp_jit_raise_super_arg_deleted", &[], &[]);
 static DP_JIT_MAKE_CELL_IMPORT: ImportSpec =
     ImportSpec::new("dp_jit_make_cell", &[SigType::Pointer], &[SigType::Pointer]);
 static DP_JIT_LOAD_CELL_IMPORT: ImportSpec =
@@ -2411,9 +2413,12 @@ fn runtime_jit_deopt_expr_supported(
             runtime_jit_deopt_name_location_supported(del.name.location, support)
         }
         InstrCodegen::IncrementCounter(_) => true,
-        InstrCodegen::MakeCell(make_cell) => {
-            runtime_jit_deopt_expr_supported(&make_cell.initial_value, support)
-        }
+        InstrCodegen::MakeCell(make_cell) => make_cell
+            .initial_value
+            .as_ref()
+            .map_or(true, |initial_value| {
+                runtime_jit_deopt_expr_supported(initial_value, support)
+            }),
         InstrCodegen::CellRef(cell_ref) => match cell_ref.location {
             CellLocation::Owned(slot) => support.owned_cell_supported(slot),
             CellLocation::Closure(slot) | CellLocation::CapturedSource(slot) => {
@@ -3144,12 +3149,18 @@ fn load_deleted_name_arg<'a>(
     Some(value)
 }
 
-fn emit_owned_local_value_or_deleted_sentinel_for_super(
+struct SuperInstanceArg {
+    value: ir::Value,
+    is_borrowed: bool,
+    is_deleted: Option<ir::Value>,
+}
+
+fn emit_local_value_for_super_deleted_name_arg(
     fb: &mut FunctionBuilder<'_>,
     expr: &InstrCodegen,
     local_env: &LocalEnv,
     ctx: &JitEmitCtx<'_>,
-) -> Option<ir::Value> {
+) -> Option<(ir::Value, ir::Value)> {
     let InstrCodegen::Load(op) = expr else {
         return None;
     };
@@ -3170,10 +3181,7 @@ fn emit_owned_local_value_or_deleted_sentinel_for_super(
     };
     let null_ptr = fb.ins().iconst(ctx.consts.ptr_ty, 0);
     let value_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, value, null_ptr);
-    let deleted_const = emit_deleted_const(fb, ctx);
-    let selected = fb.ins().select(value_is_null, deleted_const, value);
-    fb.ins().call(ctx.incref_ref, &[selected]);
-    Some(selected)
+    Some((value, value_is_null))
 }
 
 fn emit_super_instance_arg_with_local_env(
@@ -3183,12 +3191,16 @@ fn emit_super_instance_arg_with_local_env(
     ctx: &JitEmitCtx<'_>,
     jit_module: &mut JITModule,
     func_imports: &mut FuncBuildImports<'_>,
-) -> (ir::Value, bool) {
+) -> SuperInstanceArg {
     if let Some(value_expr) = load_deleted_name_arg(instance_expr, ctx.module_constants) {
-        if let Some(value) =
-            emit_owned_local_value_or_deleted_sentinel_for_super(fb, value_expr, local_env, ctx)
+        if let Some((value, is_deleted)) =
+            emit_local_value_for_super_deleted_name_arg(fb, value_expr, local_env, ctx)
         {
-            return (value, false);
+            return SuperInstanceArg {
+                value,
+                is_borrowed: true,
+                is_deleted: Some(is_deleted),
+            };
         }
         let value = emit_codegen_expr_with_local_env(
             fb,
@@ -3199,7 +3211,11 @@ fn emit_super_instance_arg_with_local_env(
             jit_module,
             func_imports,
         );
-        return (value, false);
+        return SuperInstanceArg {
+            value,
+            is_borrowed: false,
+            is_deleted: None,
+        };
     }
     let instance_is_borrowed =
         codegen_expr_pyobject_input_is_borrowed_from_local_env(instance_expr, local_env, ctx);
@@ -3212,7 +3228,11 @@ fn emit_super_instance_arg_with_local_env(
         jit_module,
         func_imports,
     );
-    (instance, instance_is_borrowed)
+    SuperInstanceArg {
+        value: instance,
+        is_borrowed: instance_is_borrowed,
+        is_deleted: None,
+    }
 }
 
 fn emit_codegen_super_helper_call_with_local_env(
@@ -3264,7 +3284,7 @@ fn emit_codegen_super_helper_call_with_local_env(
         func_imports,
     );
 
-    let (instance, instance_is_borrowed) = emit_super_instance_arg_with_local_env(
+    let mut instance_arg = emit_super_instance_arg_with_local_env(
         fb,
         instance_expr,
         local_env,
@@ -3272,6 +3292,43 @@ fn emit_codegen_super_helper_call_with_local_env(
         jit_module,
         func_imports,
     );
+    if let Some(instance_is_deleted) = instance_arg.is_deleted {
+        let instance_deleted_block = fb.create_block();
+        let instance_ok_block = fb.create_block();
+        fb.append_block_param(instance_ok_block, ptr_ty);
+        fb.ins().brif(
+            instance_is_deleted,
+            instance_deleted_block,
+            &[],
+            instance_ok_block,
+            &[ir::BlockArg::Value(instance_arg.value)],
+        );
+
+        fb.switch_to_block(instance_deleted_block);
+        let raise_super_arg_deleted_ref = func_imports.get_or_panic(
+            jit_module,
+            &mut fb.func,
+            &DP_JIT_RAISE_SUPER_ARG_DELETED_IMPORT,
+        );
+        fb.ins().call(raise_super_arg_deleted_ref, &[]);
+        if !cls_is_borrowed {
+            fb.ins()
+                .call(ctx.decref_ref, &[ctx.consts.thread_state_value, cls]);
+        }
+        if !super_fn_is_borrowed {
+            fb.ins()
+                .call(ctx.decref_ref, &[ctx.consts.thread_state_value, super_fn]);
+        }
+        if !callable_is_borrowed {
+            fb.ins()
+                .call(ctx.decref_ref, &[ctx.consts.thread_state_value, callable]);
+        }
+        fb.ins()
+            .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
+
+        fb.switch_to_block(instance_ok_block);
+        instance_arg.value = fb.block_params(instance_ok_block)[0];
+    }
 
     let call_inst = fb.ins().call(
         ctx.py_call_positional_three_ref,
@@ -3280,13 +3337,15 @@ fn emit_codegen_super_helper_call_with_local_env(
             callable,
             super_fn,
             cls,
-            instance,
+            instance_arg.value,
             null_ptr,
         ],
     );
-    if !instance_is_borrowed {
-        fb.ins()
-            .call(ctx.decref_ref, &[ctx.consts.thread_state_value, instance]);
+    if !instance_arg.is_borrowed {
+        fb.ins().call(
+            ctx.decref_ref,
+            &[ctx.consts.thread_state_value, instance_arg.value],
+        );
     }
     if !cls_is_borrowed {
         fb.ins()
@@ -3608,7 +3667,6 @@ struct JitEmitConsts {
     none_constant_id: ModuleConstantId,
     true_constant_id: ModuleConstantId,
     false_constant_id: ModuleConstantId,
-    deleted_constant_id: ModuleConstantId,
     empty_tuple_constant_id: ModuleConstantId,
     block_const: ir::Value,
     module_constant_accesses: ModuleConstantAccessTable,
@@ -6325,10 +6383,6 @@ fn emit_true_const(fb: &mut FunctionBuilder<'_>, ctx: &JitEmitCtx<'_>) -> ir::Va
 
 fn emit_false_const(fb: &mut FunctionBuilder<'_>, ctx: &JitEmitCtx<'_>) -> ir::Value {
     emit_owned_module_constant(fb, ctx.consts.false_constant_id, ctx)
-}
-
-fn emit_deleted_const(fb: &mut FunctionBuilder<'_>, ctx: &JitEmitCtx<'_>) -> ir::Value {
-    emit_owned_module_constant(fb, ctx.consts.deleted_constant_id, ctx)
 }
 
 fn emit_empty_tuple_const(fb: &mut FunctionBuilder<'_>, ctx: &JitEmitCtx<'_>) -> ir::Value {
@@ -10679,6 +10733,26 @@ fn emit_codegen_simple_call_with_local_env(
                 func_imports,
             ));
         }
+        if helper_id == RuntimeHelperId::RaiseDeletedName
+            && simple_args.len() == 1
+            && let Some(name) = codegen_expr_const_string(simple_args[0], emit_ctx.module_constants)
+        {
+            let name_obj = emit_owned_module_constant(
+                fb,
+                emit_ctx
+                    .module_constants
+                    .require_unicode_constant_id(name.as_str()),
+                emit_ctx,
+            );
+            fb.ins()
+                .call(emit_ctx.raise_deleted_name_error_ref, &[name_obj]);
+            emit_release_owned_inputs(fb, emit_ctx, &[name_obj]);
+            fb.ins().jump(
+                emit_ctx.consts.step_null_block,
+                &step_null_block_args(emit_ctx),
+            );
+            return Some(null_ptr);
+        }
         if helper_id == RuntimeHelperId::LoadDeletedName
             && simple_args.len() == 2
             && let Some(name) = codegen_expr_const_string(simple_args[0], emit_ctx.module_constants)
@@ -10704,19 +10778,14 @@ fn emit_codegen_simple_call_with_local_env(
                 jit_module,
                 func_imports,
             );
-            let deleted_const = emit_deleted_const(fb, emit_ctx);
-            let value_is_deleted_sentinel =
-                fb.ins()
-                    .icmp(ir::condcodes::IntCC::Equal, value_obj, deleted_const);
             let value_is_null = fb
                 .ins()
                 .icmp(ir::condcodes::IntCC::Equal, value_obj, null_ptr);
-            let value_is_deleted = fb.ins().bor(value_is_deleted_sentinel, value_is_null);
             let deleted_block = fb.create_block();
             let value_ok_block = fb.create_block();
             fb.append_block_param(value_ok_block, ptr_ty);
             fb.ins().brif(
-                value_is_deleted,
+                value_is_null,
                 deleted_block,
                 &[],
                 value_ok_block,
@@ -17150,7 +17219,6 @@ fn build_cranelift_run_bb_specialized_function(
     let true_constant_id = module_constants.require_runtime_name_constant_id("TRUE");
     let false_constant_id = module_constants.require_runtime_name_constant_id("FALSE");
     let none_constant_id = module_constants.require_runtime_name_constant_id("NONE");
-    let deleted_constant_id = module_constants.require_runtime_name_constant_id("DELETED");
     let empty_tuple_constant_id = module_constants.require_runtime_name_constant_id("EMPTY_TUPLE");
 
     let mut direct_call_targets = collect_call_direct_targets(function);
@@ -17717,7 +17785,6 @@ fn build_cranelift_run_bb_specialized_function(
                     none_constant_id,
                     true_constant_id,
                     false_constant_id,
-                    deleted_constant_id,
                     empty_tuple_constant_id,
                     block_const,
                     module_constant_accesses: options.module_constant_accesses.clone(),

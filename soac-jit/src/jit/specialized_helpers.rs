@@ -716,6 +716,11 @@ unsafe extern "C" fn raise_missing_required_argument_hook() {
         c"missing required argument in direct JIT call".as_ptr(),
     );
 }
+
+unsafe extern "C" fn raise_super_arg_deleted_hook() {
+    ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c"super(): arg[0] deleted".as_ptr());
+}
+
 unsafe extern "C" fn make_cell_hook(value: ObjPtr) -> ObjPtr {
     PyCell_New(value as *mut ffi::PyObject) as ObjPtr
 }
@@ -1042,6 +1047,7 @@ mod test_only_export_stubs {
     panic_obj_export!(dp_jit_make_cell(value: ObjPtr));
     panic_unit_export!(dp_jit_raise_deleted_name_error(name: ObjPtr));
     panic_unit_export!(dp_jit_raise_missing_required_argument());
+    panic_unit_export!(dp_jit_raise_super_arg_deleted());
     panic_obj_export!(dp_jit_load_cell(cell: ObjPtr));
     panic_obj_export!(dp_jit_store_cell(cell: ObjPtr, value: ObjPtr));
     panic_obj_export!(dp_jit_del_deref(cell: ObjPtr));
@@ -1256,6 +1262,10 @@ pub unsafe extern "C" fn dp_jit_raise_deleted_name_error(name: ObjPtr) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_raise_missing_required_argument() {
     raise_missing_required_argument_hook()
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dp_jit_raise_super_arg_deleted() {
+    raise_super_arg_deleted_hook()
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_load_cell(cell: ObjPtr) -> ObjPtr {
@@ -2033,6 +2043,10 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol(
         "dp_jit_raise_missing_required_argument",
         dp_jit_raise_missing_required_argument as *const u8,
+    );
+    builder.symbol(
+        "dp_jit_raise_super_arg_deleted",
+        dp_jit_raise_super_arg_deleted as *const u8,
     );
     builder.symbol("dp_jit_make_cell", dp_jit_make_cell as *const u8);
     builder.symbol("dp_jit_load_cell", dp_jit_load_cell as *const u8);

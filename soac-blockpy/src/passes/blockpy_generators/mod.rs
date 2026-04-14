@@ -158,7 +158,7 @@ pub(crate) fn build_blockpy_storage_layout(
             continue;
         }
         let init = if injected_exception_names.contains(logical_name.as_str()) {
-            ClosureInit::DeletedSentinel
+            ClosureInit::EmptyCell
         } else if param_names.iter().any(|param| param == &logical_name) {
             ClosureInit::Parameter
         } else {

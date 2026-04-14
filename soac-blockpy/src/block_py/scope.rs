@@ -109,7 +109,7 @@ pub struct ClosureSlot {
 pub enum ClosureInit {
     InheritedCapture,
     Parameter,
-    DeletedSentinel,
+    EmptyCell,
     RuntimePcUnstarted,
     RuntimeAbruptKindFallthrough,
     RuntimeNone,
@@ -1035,7 +1035,7 @@ where
             let init = if param_name_set.contains(logical_name.as_str()) {
                 ClosureInit::Parameter
             } else {
-                ClosureInit::DeletedSentinel
+                ClosureInit::EmptyCell
             };
             ClosureSlot {
                 logical_name,

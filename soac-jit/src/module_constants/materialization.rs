@@ -659,7 +659,7 @@ fn build_soac_runtime_bootstrap_runtime_name(py: Python<'_>, bytes: &[u8]) -> Py
             .getattr("Ellipsis")?
             .unbind()),
         "EMPTY_TUPLE" => Ok(PyTuple::empty(py).clone().into_any().unbind()),
-        "DELETED" | "ITER_COMPLETE" => Ok(PyModule::import(py, "builtins")?
+        "ITER_COMPLETE" => Ok(PyModule::import(py, "builtins")?
             .getattr("object")?
             .call0()?
             .unbind()),
@@ -679,10 +679,13 @@ from soac import _soac_ext
 import sys as _sys
 import types as _types
 
-DELETED = object()
-
 def _entry_template(*args, **kwargs):
     raise RuntimeError('SOAC runtime bootstrap entry template executed')
+
+def raise_deleted_name(name):
+    raise UnboundLocalError(
+        f'cannot access local variable {name!r} where it is not associated with a value'
+    )
 
 _DP_CODE_WITH_FREEVARS_CACHE = {}
 _CLIF_ENTRY_RUNTIME_ERROR = 'CLIF entry executed without vectorcall interception'
@@ -866,10 +869,6 @@ def class_lookup_cell(class_ns, name, cell):
         raise NameError(
             f'cannot access free variable {name!r} where it is not associated with a value in enclosing scope'
         ) from exc
-    if value is DELETED:
-        raise NameError(
-            f'cannot access free variable {name!r} where it is not associated with a value in enclosing scope'
-        )
     return value
 ",
         c"<soac.runtime bootstrap>",

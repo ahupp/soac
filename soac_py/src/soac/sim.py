@@ -267,7 +267,6 @@ def gt(lhs, rhs):
         matches = []
         for module_name, attr_name in (
             ("soac.runtime", "NO_DEFAULT"),
-            ("soac.runtime", "DELETED"),
             ("annotationlib", "_sentinel"),
             ("dataclasses", "MISSING"),
             ("dataclasses", "_HAS_DEFAULT_FACTORY"),
