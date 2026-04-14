@@ -1024,6 +1024,9 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             NameLocation::Global(_) | NameLocation::GlobalName => unsafe {
                 self.execute_global_del_owned(del.name.id.as_str(), del.quietly)
             },
+            NameLocation::Cell(location) => unsafe {
+                self.execute_cell_del_owned(del.name.id.as_str(), location, del.quietly)
+            },
             location => Err(format!(
                 "deopt continuation does not support deleting {location:?} for {:?}",
                 del.name.id.as_str()
@@ -1062,6 +1065,28 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             }
         }
         unsafe { execute_runtime_name_deopt("NONE") }
+    }
+
+    #[cold]
+    unsafe fn execute_cell_del_owned(
+        &self,
+        name: &str,
+        location: CellLocation,
+        quietly: bool,
+    ) -> Result<ObjPtr, String> {
+        let cell = unsafe { self.execute_raw_cell_object_for_location_owned(location, name)? };
+        if cell.is_null() {
+            return Ok(ptr::null_mut());
+        }
+        let result = if quietly {
+            unsafe { super::specialized_helpers::dp_jit_del_deref_quietly(cell) }
+        } else {
+            unsafe { super::specialized_helpers::dp_jit_del_deref(cell) }
+        };
+        unsafe {
+            ffi::Py_DECREF(cell.cast::<ffi::PyObject>());
+        }
+        Ok(result)
     }
 
     #[cold]
@@ -1116,6 +1141,13 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             NameLocation::Global(_) | NameLocation::GlobalName => unsafe {
                 self.execute_global_store_owned(store.name.id.as_str(), store.value.as_ref())
             },
+            NameLocation::Cell(location) => unsafe {
+                self.execute_cell_store_owned(
+                    store.name.id.as_str(),
+                    location,
+                    store.value.as_ref(),
+                )
+            },
             location => Err(format!(
                 "deopt continuation does not support storing {location:?} for {:?}",
                 store.name.id.as_str()
@@ -1155,6 +1187,40 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
         unsafe {
             local.replace_with_owned_value(value);
             ffi::Py_INCREF(value.cast::<ffi::PyObject>());
+        }
+        Ok(value)
+    }
+
+    #[cold]
+    unsafe fn execute_cell_store_owned(
+        &mut self,
+        name: &str,
+        location: CellLocation,
+        value_expr: &InstrCodegen,
+    ) -> Result<ObjPtr, String> {
+        let value = unsafe { self.execute_expr_owned(value_expr)? };
+        if value.is_null() {
+            return Ok(ptr::null_mut());
+        }
+        let cell = unsafe { self.execute_raw_cell_object_for_location_owned(location, name)? };
+        if cell.is_null() {
+            unsafe {
+                ffi::Py_DECREF(value.cast::<ffi::PyObject>());
+            }
+            return Ok(ptr::null_mut());
+        }
+        let result = unsafe { super::specialized_helpers::dp_jit_store_cell(cell, value) };
+        unsafe {
+            ffi::Py_DECREF(cell.cast::<ffi::PyObject>());
+        }
+        if result.is_null() {
+            unsafe {
+                ffi::Py_DECREF(value.cast::<ffi::PyObject>());
+            }
+            return Ok(ptr::null_mut());
+        }
+        unsafe {
+            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
         }
         Ok(value)
     }

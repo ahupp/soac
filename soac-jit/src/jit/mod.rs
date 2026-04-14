@@ -2049,9 +2049,12 @@ fn runtime_jit_deopt_expr_supported(
             storage_layout,
         ),
         InstrCodegen::Store(store) => {
-            runtime_jit_deopt_expr_supported(&store.value, storage_layout)
+            runtime_jit_deopt_name_location_supported(store.name.location, storage_layout)
+                && runtime_jit_deopt_expr_supported(&store.value, storage_layout)
         }
-        InstrCodegen::Del(_) => true,
+        InstrCodegen::Del(del) => {
+            runtime_jit_deopt_name_location_supported(del.name.location, storage_layout)
+        }
         InstrCodegen::IncrementCounter(_) => true,
         InstrCodegen::MakeCell(make_cell) => {
             runtime_jit_deopt_expr_supported(&make_cell.initial_value, storage_layout)
@@ -2063,6 +2066,20 @@ fn runtime_jit_deopt_expr_supported(
             CellLocation::Closure(_) | CellLocation::CapturedSource(_) => false,
         },
         _ => false,
+    }
+}
+
+fn runtime_jit_deopt_name_location_supported(
+    location: NameLocation,
+    storage_layout: Option<&StorageLayout>,
+) -> bool {
+    match location {
+        NameLocation::Cell(CellLocation::Owned(slot)) => storage_layout
+            .and_then(|layout| layout.local_cell_slot(slot))
+            .is_some(),
+        NameLocation::Cell(CellLocation::Closure(_))
+        | NameLocation::Cell(CellLocation::CapturedSource(_)) => false,
+        _ => true,
     }
 }
 
