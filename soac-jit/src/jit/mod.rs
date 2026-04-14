@@ -1966,6 +1966,20 @@ fn runtime_jit_deopt_expr_supported(expr: &InstrCodegen) -> bool {
             runtime_jit_deopt_expr_supported(&getitem.value)
                 && runtime_jit_deopt_expr_supported(&getitem.index)
         }
+        InstrCodegen::SetAttr(setattr) => {
+            runtime_jit_deopt_expr_supported(&setattr.value)
+                && runtime_jit_deopt_expr_supported(&setattr.attr)
+                && runtime_jit_deopt_expr_supported(&setattr.replacement)
+        }
+        InstrCodegen::SetItem(setitem) => {
+            runtime_jit_deopt_expr_supported(&setitem.value)
+                && runtime_jit_deopt_expr_supported(&setitem.index)
+                && runtime_jit_deopt_expr_supported(&setitem.replacement)
+        }
+        InstrCodegen::DelItem(delitem) => {
+            runtime_jit_deopt_expr_supported(&delitem.value)
+                && runtime_jit_deopt_expr_supported(&delitem.index)
+        }
         _ => false,
     }
 }

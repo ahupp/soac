@@ -5,8 +5,8 @@ use soac_blockpy::block_py::{
     ClosureInit, ClosureSlot, CodegenBlock, CounterDef, CounterSite, Del, DelItem, FunctionId,
     FunctionName, GetAttr, GetItem, HasMeta, HasSemanticInstrId, InstrCodegen, InstrResolved,
     Literal, LiteralValue, Load, LocalLocation, Meta, ModuleNameGen, NameLocation, NumberLiteral,
-    NumberLiteralValue, Param, ParamKind, ParamSpec, ResolvedName, StorageLayout, Store,
-    StringLiteral, UnaryOp, UnaryOpKind, Visit, VisitMut, WithMeta,
+    NumberLiteralValue, Param, ParamKind, ParamSpec, ResolvedName, SetAttr, SetItem, StorageLayout,
+    Store, StringLiteral, UnaryOp, UnaryOpKind, Visit, VisitMut, WithMeta,
 };
 use soac_blockpy::passes::{
     CodegenModuleShape, instrument_bb_module_with_block_entry_counters,
@@ -6267,6 +6267,258 @@ def f(x):
                 ffi::Py_DECREF(index);
                 ffi::Py_DECREF(list);
                 ffi::Py_DECREF(item);
+            }
+        });
+    }
+
+    #[test]
+    fn deopt_block_tail_continuation_executes_return_setattr() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|_| {
+            let function = with_single_test_block(
+                test_function(),
+                vec![],
+                ret_term(op_expr(SetAttr::new(
+                    name_expr(test_constant_name(0)),
+                    name_expr(test_constant_name(1)),
+                    name_expr(test_constant_name(2)),
+                ))),
+            );
+            let function_id = function.function_id;
+            let block = function.entry_block().label;
+            let module = unsafe { ffi::PyModule_New(c"deopt_setattr_test".as_ptr()) };
+            assert!(
+                !module.is_null(),
+                "test setattr module allocation should succeed"
+            );
+            let attr = unsafe { ffi::PyUnicode_FromString(c"x".as_ptr()) };
+            assert!(
+                !attr.is_null(),
+                "test setattr attr allocation should succeed"
+            );
+            let replacement = unsafe { ffi::PyLong_FromLong(444_555_666) };
+            assert!(
+                !replacement.is_null(),
+                "test setattr replacement allocation should succeed"
+            );
+            let table = RuntimeJitDeoptTable {
+                function_id,
+                function: Box::new(function),
+                module_constant_ptrs: vec![module.cast(), attr.cast(), replacement.cast()],
+                points: vec![RuntimeJitDeoptRecord {
+                    id: PlannedJitDeoptPointId {
+                        function_id,
+                        ordinal: 0,
+                    },
+                    resume_point: LocalEnvResumePoint::BeforeTerm { function_id, block },
+                    precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                    locals: vec![],
+                    continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
+                        cursor: RuntimeJitDeoptCursor::at_block_entry(block),
+                    },
+                }],
+            };
+            let result = unsafe {
+                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                    std::ptr::addr_of!(table).cast_mut().cast(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!(
+                result,
+                unsafe { ffi::Py_None() }.cast(),
+                "return-setattr deopt should return owned None on success"
+            );
+            assert!(
+                unsafe { ffi::PyErr_Occurred() }.is_null(),
+                "successful return-setattr deopt should not leave a Python exception"
+            );
+            let stored = unsafe { ffi::PyObject_GetAttr(module, attr) };
+            assert!(
+                !stored.is_null(),
+                "return-setattr deopt should write the requested attribute"
+            );
+            assert_eq!(
+                unsafe { ffi::PyLong_AsLongLong(stored) },
+                444_555_666,
+                "return-setattr deopt should write the replacement value"
+            );
+            unsafe {
+                ffi::Py_DECREF(stored);
+                ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+                ffi::Py_DECREF(module);
+                ffi::Py_DECREF(replacement);
+                ffi::Py_DECREF(attr);
+            }
+        });
+    }
+
+    #[test]
+    fn deopt_block_tail_continuation_executes_return_setitem() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|_| {
+            let function = with_single_test_block(
+                test_function(),
+                vec![],
+                ret_term(op_expr(SetItem::new(
+                    name_expr(test_constant_name(0)),
+                    name_expr(test_constant_name(1)),
+                    name_expr(test_constant_name(2)),
+                ))),
+            );
+            let function_id = function.function_id;
+            let block = function.entry_block().label;
+            let dict = unsafe { ffi::PyDict_New() };
+            assert!(
+                !dict.is_null(),
+                "test setitem dict allocation should succeed"
+            );
+            let key = unsafe { ffi::PyUnicode_FromString(c"x".as_ptr()) };
+            assert!(!key.is_null(), "test setitem key allocation should succeed");
+            let replacement = unsafe { ffi::PyLong_FromLong(555_666_777) };
+            assert!(
+                !replacement.is_null(),
+                "test setitem replacement allocation should succeed"
+            );
+            let table = RuntimeJitDeoptTable {
+                function_id,
+                function: Box::new(function),
+                module_constant_ptrs: vec![dict.cast(), key.cast(), replacement.cast()],
+                points: vec![RuntimeJitDeoptRecord {
+                    id: PlannedJitDeoptPointId {
+                        function_id,
+                        ordinal: 0,
+                    },
+                    resume_point: LocalEnvResumePoint::BeforeTerm { function_id, block },
+                    precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                    locals: vec![],
+                    continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
+                        cursor: RuntimeJitDeoptCursor::at_block_entry(block),
+                    },
+                }],
+            };
+            let result = unsafe {
+                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                    std::ptr::addr_of!(table).cast_mut().cast(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!(
+                result,
+                unsafe { ffi::Py_None() }.cast(),
+                "return-setitem deopt should return owned None on success"
+            );
+            assert!(
+                unsafe { ffi::PyErr_Occurred() }.is_null(),
+                "successful return-setitem deopt should not leave a Python exception"
+            );
+            let stored = unsafe { ffi::PyDict_GetItemWithError(dict, key) };
+            assert!(
+                !stored.is_null(),
+                "return-setitem deopt should write the requested key"
+            );
+            assert_eq!(
+                unsafe { ffi::PyLong_AsLongLong(stored) },
+                555_666_777,
+                "return-setitem deopt should write the replacement value"
+            );
+            unsafe {
+                ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+                ffi::Py_DECREF(dict);
+                ffi::Py_DECREF(replacement);
+                ffi::Py_DECREF(key);
+            }
+        });
+    }
+
+    #[test]
+    fn deopt_block_tail_continuation_executes_return_delitem() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|_| {
+            let function = with_single_test_block(
+                test_function(),
+                vec![],
+                ret_term(op_expr(DelItem::new(
+                    name_expr(test_constant_name(0)),
+                    name_expr(test_constant_name(1)),
+                ))),
+            );
+            let function_id = function.function_id;
+            let block = function.entry_block().label;
+            let dict = unsafe { ffi::PyDict_New() };
+            assert!(
+                !dict.is_null(),
+                "test delitem dict allocation should succeed"
+            );
+            let key = unsafe { ffi::PyUnicode_FromString(c"x".as_ptr()) };
+            assert!(!key.is_null(), "test delitem key allocation should succeed");
+            let value = unsafe { ffi::PyLong_FromLong(666_777_888) };
+            assert!(
+                !value.is_null(),
+                "test delitem value allocation should succeed"
+            );
+            assert_eq!(
+                unsafe { ffi::PyDict_SetItem(dict, key, value) },
+                0,
+                "test delitem dict setup should succeed"
+            );
+            let table = RuntimeJitDeoptTable {
+                function_id,
+                function: Box::new(function),
+                module_constant_ptrs: vec![dict.cast(), key.cast()],
+                points: vec![RuntimeJitDeoptRecord {
+                    id: PlannedJitDeoptPointId {
+                        function_id,
+                        ordinal: 0,
+                    },
+                    resume_point: LocalEnvResumePoint::BeforeTerm { function_id, block },
+                    precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                    locals: vec![],
+                    continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
+                        cursor: RuntimeJitDeoptCursor::at_block_entry(block),
+                    },
+                }],
+            };
+            let result = unsafe {
+                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                    std::ptr::addr_of!(table).cast_mut().cast(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!(
+                result,
+                unsafe { ffi::Py_None() }.cast(),
+                "return-delitem deopt should return owned None on success"
+            );
+            assert!(
+                unsafe { ffi::PyErr_Occurred() }.is_null(),
+                "successful return-delitem deopt should not leave a Python exception"
+            );
+            assert!(
+                unsafe { ffi::PyDict_GetItemWithError(dict, key) }.is_null(),
+                "return-delitem deopt should delete the requested key"
+            );
+            assert!(
+                unsafe { ffi::PyErr_Occurred() }.is_null(),
+                "deleted key lookup should not leave a Python exception"
+            );
+            unsafe {
+                ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+                ffi::Py_DECREF(value);
+                ffi::Py_DECREF(key);
+                ffi::Py_DECREF(dict);
             }
         });
     }

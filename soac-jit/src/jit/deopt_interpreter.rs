@@ -147,6 +147,9 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             InstrCodegen::UnaryOp(unary) => unsafe { self.execute_unary_op_owned(unary) },
             InstrCodegen::GetAttr(getattr) => unsafe { self.execute_getattr_owned(getattr) },
             InstrCodegen::GetItem(getitem) => unsafe { self.execute_getitem_owned(getitem) },
+            InstrCodegen::SetAttr(setattr) => unsafe { self.execute_setattr_owned(setattr) },
+            InstrCodegen::SetItem(setitem) => unsafe { self.execute_setitem_owned(setitem) },
+            InstrCodegen::DelItem(delitem) => unsafe { self.execute_delitem_owned(delitem) },
             InstrCodegen::Store(store) => unsafe { self.execute_store_owned(store) },
             InstrCodegen::Del(del) => unsafe { self.execute_del_owned(del) },
             _ => Err(format!(
@@ -245,6 +248,119 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             ffi::Py_DECREF(value.cast::<ffi::PyObject>());
         }
         Ok(result.cast())
+    }
+
+    #[cold]
+    unsafe fn execute_setattr_owned(
+        &mut self,
+        setattr: &soac_blockpy::block_py::SetAttr<InstrCodegen>,
+    ) -> Result<ObjPtr, String> {
+        let value = unsafe { self.execute_expr_owned(&setattr.value)? };
+        if value.is_null() {
+            return Ok(ptr::null_mut());
+        }
+        let attr = unsafe { self.execute_expr_owned(&setattr.attr)? };
+        if attr.is_null() {
+            unsafe {
+                ffi::Py_DECREF(value.cast::<ffi::PyObject>());
+            }
+            return Ok(ptr::null_mut());
+        }
+        let replacement = unsafe { self.execute_expr_owned(&setattr.replacement)? };
+        if replacement.is_null() {
+            unsafe {
+                ffi::Py_DECREF(attr.cast::<ffi::PyObject>());
+                ffi::Py_DECREF(value.cast::<ffi::PyObject>());
+            }
+            return Ok(ptr::null_mut());
+        }
+        let rc = unsafe {
+            ffi::PyObject_SetAttr(
+                value.cast::<ffi::PyObject>(),
+                attr.cast::<ffi::PyObject>(),
+                replacement.cast::<ffi::PyObject>(),
+            )
+        };
+        unsafe {
+            ffi::Py_DECREF(replacement.cast::<ffi::PyObject>());
+            ffi::Py_DECREF(attr.cast::<ffi::PyObject>());
+            ffi::Py_DECREF(value.cast::<ffi::PyObject>());
+        }
+        if rc != 0 {
+            return Ok(ptr::null_mut());
+        }
+        Ok(owned_none())
+    }
+
+    #[cold]
+    unsafe fn execute_setitem_owned(
+        &mut self,
+        setitem: &soac_blockpy::block_py::SetItem<InstrCodegen>,
+    ) -> Result<ObjPtr, String> {
+        let value = unsafe { self.execute_expr_owned(&setitem.value)? };
+        if value.is_null() {
+            return Ok(ptr::null_mut());
+        }
+        let index = unsafe { self.execute_expr_owned(&setitem.index)? };
+        if index.is_null() {
+            unsafe {
+                ffi::Py_DECREF(value.cast::<ffi::PyObject>());
+            }
+            return Ok(ptr::null_mut());
+        }
+        let replacement = unsafe { self.execute_expr_owned(&setitem.replacement)? };
+        if replacement.is_null() {
+            unsafe {
+                ffi::Py_DECREF(index.cast::<ffi::PyObject>());
+                ffi::Py_DECREF(value.cast::<ffi::PyObject>());
+            }
+            return Ok(ptr::null_mut());
+        }
+        let rc = unsafe {
+            ffi::PyObject_SetItem(
+                value.cast::<ffi::PyObject>(),
+                index.cast::<ffi::PyObject>(),
+                replacement.cast::<ffi::PyObject>(),
+            )
+        };
+        unsafe {
+            ffi::Py_DECREF(replacement.cast::<ffi::PyObject>());
+            ffi::Py_DECREF(index.cast::<ffi::PyObject>());
+            ffi::Py_DECREF(value.cast::<ffi::PyObject>());
+        }
+        if rc != 0 {
+            return Ok(ptr::null_mut());
+        }
+        Ok(owned_none())
+    }
+
+    #[cold]
+    unsafe fn execute_delitem_owned(
+        &mut self,
+        delitem: &soac_blockpy::block_py::DelItem<InstrCodegen>,
+    ) -> Result<ObjPtr, String> {
+        let value = unsafe { self.execute_expr_owned(&delitem.value)? };
+        if value.is_null() {
+            return Ok(ptr::null_mut());
+        }
+        let index = unsafe { self.execute_expr_owned(&delitem.index)? };
+        if index.is_null() {
+            unsafe {
+                ffi::Py_DECREF(value.cast::<ffi::PyObject>());
+            }
+            return Ok(ptr::null_mut());
+        }
+        let rc = unsafe {
+            ffi::PyObject_DelItem(value.cast::<ffi::PyObject>(), index.cast::<ffi::PyObject>())
+        };
+        unsafe {
+            ffi::Py_DECREF(index.cast::<ffi::PyObject>());
+            ffi::Py_DECREF(value.cast::<ffi::PyObject>());
+        }
+        if rc != 0 {
+            return Ok(ptr::null_mut());
+        }
+        Ok(owned_none())
     }
 
     #[cold]
@@ -529,6 +645,14 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
         unsafe {
             self.locals.release_frame_owned_values();
         }
+    }
+}
+
+fn owned_none() -> ObjPtr {
+    unsafe {
+        let none = ffi::Py_None();
+        ffi::Py_INCREF(none);
+        none.cast()
     }
 }
 
