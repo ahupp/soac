@@ -1265,9 +1265,18 @@ impl CompiledFunctionHandle {
         compiled_default_direct_code_ptr(self.handle)
     }
 
+    pub(crate) fn direct_deopt_table_ptr(&self) -> Result<ObjPtr, String> {
+        compiled_direct_deopt_table_ptr(self.handle)
+    }
+
     #[cfg(test)]
     pub(crate) fn direct_deopt_table(&self) -> Result<Arc<RuntimeJitDeoptTable>, String> {
         compiled_direct_deopt_table(self.handle)
+    }
+
+    #[cfg(test)]
+    fn raw_handle(&self) -> ObjPtr {
+        self.handle
     }
 }
 
@@ -1373,6 +1382,13 @@ impl RuntimeJitDeoptTable {
     #[cfg(test)]
     fn len(&self) -> usize {
         self.points.len()
+    }
+
+    #[cfg(test)]
+    fn record_for_point(&self, point: LocalEnvResumePoint) -> Option<&RuntimeJitDeoptRecord> {
+        self.points
+            .iter()
+            .find(|record| record.resume_point == point)
     }
 }
 
@@ -2434,30 +2450,31 @@ impl JitEmitCtx<'_> {
         })
     }
 
-    fn require_deopt_point_at_block_entry(
-        &self,
-        block: BlockLabel,
-    ) -> Result<&PlannedJitDeoptPoint, String> {
-        self.require_deopt_point(LocalEnvResumePoint::BlockEntry {
+    fn require_deopt_record_ordinal(&self, point: LocalEnvResumePoint) -> Result<i64, String> {
+        let deopt_point = self.require_deopt_point(point)?;
+        i64::try_from(deopt_point.id.ordinal).map_err(|_| {
+            format!(
+                "planned JIT deopt point {:?} for function {} has an ordinal that does not fit i64",
+                point, self.function_id
+            )
+        })
+    }
+
+    fn require_deopt_point_at_block_entry(&self, block: BlockLabel) -> Result<i64, String> {
+        self.require_deopt_record_ordinal(LocalEnvResumePoint::BlockEntry {
             function_id: self.function_id,
             block,
         })
     }
 
-    fn require_deopt_point_before_instr_id(
-        &self,
-        instr_id: InstrId,
-    ) -> Result<&PlannedJitDeoptPoint, String> {
-        self.require_deopt_point(LocalEnvResumePoint::BeforeInstr {
+    fn require_deopt_point_before_instr_id(&self, instr_id: InstrId) -> Result<i64, String> {
+        self.require_deopt_record_ordinal(LocalEnvResumePoint::BeforeInstr {
             key: InstrKey::new(self.function_id, instr_id),
         })
     }
 
-    fn require_deopt_point_before_term(
-        &self,
-        block: BlockLabel,
-    ) -> Result<&PlannedJitDeoptPoint, String> {
-        self.require_deopt_point(LocalEnvResumePoint::BeforeTerm {
+    fn require_deopt_point_before_term(&self, block: BlockLabel) -> Result<i64, String> {
+        self.require_deopt_record_ordinal(LocalEnvResumePoint::BeforeTerm {
             function_id: self.function_id,
             block,
         })
@@ -15235,6 +15252,18 @@ pub(crate) fn compiled_direct_code_ptr(compiled_handle: ObjPtr) -> Result<ObjPtr
 pub(crate) fn compiled_default_direct_code_ptr(compiled_handle: ObjPtr) -> Result<ObjPtr, String> {
     compiled_direct_runner_info(compiled_handle)
         .map(|(_, default_code_ptr, _)| default_code_ptr as ObjPtr)
+}
+
+pub(crate) fn compiled_direct_deopt_table_ptr(compiled_handle: ObjPtr) -> Result<ObjPtr, String> {
+    if compiled_handle.is_null() {
+        return Err("invalid null compiled handle for direct deopt table pointer".to_string());
+    }
+    let compiled = unsafe { &*(compiled_handle as *const CompiledSpecializedRunner) };
+    compiled
+        .direct_deopt_table
+        .as_ref()
+        .map(|table| Arc::as_ptr(table) as ObjPtr)
+        .ok_or_else(|| "compiled direct handle does not carry a deopt table".to_string())
 }
 
 #[cfg(test)]

@@ -1041,6 +1041,7 @@ mod test_only_export_stubs {
     panic_obj_export!(dp_jit_store_cell(cell: ObjPtr, value: ObjPtr));
     panic_obj_export!(dp_jit_del_deref(cell: ObjPtr));
     panic_obj_export!(dp_jit_del_deref_quietly(cell: ObjPtr));
+    panic_obj_export!(dp_jit_deopt_unimplemented(deopt_table: ObjPtr, record_ordinal: i64));
     panic_obj_export!(dp_jit_tuple_new(size: i64));
     panic_i32_export!(dp_jit_tuple_set_item(tuple_obj: ObjPtr, index: i64, item: ObjPtr));
     panic_obj_export!(dp_jit_dict_new());
@@ -1239,6 +1240,18 @@ pub unsafe extern "C" fn dp_jit_del_deref(cell: ObjPtr) -> ObjPtr {
 }
 pub unsafe extern "C" fn dp_jit_del_deref_quietly(cell: ObjPtr) -> ObjPtr {
     del_deref_quietly_hook(cell)
+}
+pub unsafe extern "C" fn dp_jit_deopt_unimplemented(
+    deopt_table: ObjPtr,
+    record_ordinal: i64,
+) -> ObjPtr {
+    let _ = deopt_table;
+    let _ = record_ordinal;
+    ffi::PyErr_SetString(
+        ffi::PyExc_RuntimeError,
+        b"JIT deopt helper is not implemented\0".as_ptr() as *const i8,
+    );
+    ptr::null_mut()
 }
 pub unsafe extern "C" fn dp_jit_tuple_new(size: i64) -> ObjPtr {
     tuple_new_hook(size)
@@ -1883,6 +1896,10 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol(
         "dp_jit_del_deref_quietly",
         dp_jit_del_deref_quietly as *const u8,
+    );
+    builder.symbol(
+        "dp_jit_deopt_unimplemented",
+        dp_jit_deopt_unimplemented as *const u8,
     );
     builder.symbol("dp_jit_tuple_new", dp_jit_tuple_new as *const u8);
     builder.symbol("dp_jit_tuple_set_item", dp_jit_tuple_set_item as *const u8);

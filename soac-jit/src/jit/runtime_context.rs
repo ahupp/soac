@@ -43,6 +43,7 @@ pub struct ModuleJitContext {
 struct FunctionEnvPrefix {
     direct_code_ptr: *const u8,
     default_direct_code_ptr: *const u8,
+    deopt_table_ptr: ObjPtr,
     globals_obj: ObjPtr,
 }
 

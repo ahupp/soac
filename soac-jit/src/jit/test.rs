@@ -2806,6 +2806,22 @@ def f():
                 first_deopt_table.len() >= first.blocks.len() * 2,
                 "block entry and before-term points should be available for each block"
             );
+            let first_entry_record = first_deopt_table
+                .record_for_point(LocalEnvResumePoint::BlockEntry {
+                    function_id: first.function_id,
+                    block: first.blocks[0].label,
+                })
+                .expect("block-entry deopt point should be addressable by resume point");
+            assert_eq!(
+                first_entry_record.id.ordinal, 0,
+                "runtime deopt records should preserve planned ordinal ids"
+            );
+            assert_eq!(
+                compiled_direct_deopt_table_ptr(first_handle.raw_handle())
+                    .expect("root deopt table pointer should be available"),
+                std::sync::Arc::as_ptr(&first_deopt_table) as ObjPtr,
+                "compiled direct handle should expose the runtime deopt table pointer"
+            );
             let second_deopt_table = second_handle
                 .direct_deopt_table()
                 .expect("callee compiled handle should carry deopt metadata");

@@ -371,6 +371,7 @@ fn set_runtime_error<T>(msg: &str) -> Result<T, ()> {
 struct FunctionEnvAbiHeader {
     direct_code_ptr: *const u8,
     default_direct_code_ptr: *const u8,
+    deopt_table_ptr: *const c_void,
     globals_obj: *mut ffi::PyObject,
 }
 
@@ -508,6 +509,7 @@ impl FunctionEnv {
             abi.as_ptr().write(FunctionEnvAbiHeader {
                 direct_code_ptr: ptr::null(),
                 default_direct_code_ptr: ptr::null(),
+                deopt_table_ptr: ptr::null(),
                 globals_obj,
             });
             let runtime_objects =
@@ -556,6 +558,14 @@ impl FunctionEnv {
 
     fn set_default_direct_code_ptr(&mut self, default_direct_code_ptr: *const u8) {
         self.header_mut().default_direct_code_ptr = default_direct_code_ptr;
+    }
+
+    fn deopt_table_ptr(&self) -> *const c_void {
+        self.header().deopt_table_ptr
+    }
+
+    fn set_deopt_table_ptr(&mut self, deopt_table_ptr: *const c_void) {
+        self.header_mut().deopt_table_ptr = deopt_table_ptr;
     }
 
     fn runtime_objects_mut(&mut self) -> &mut [*mut ffi::PyObject] {
@@ -1580,6 +1590,21 @@ unsafe fn ensure_clif_vectorcall_compiled(
         };
         data.function_env
             .set_default_direct_code_ptr(default_direct_code_ptr);
+        let deopt_table_ptr = match compiled_function.direct_deopt_table_ptr() {
+            Ok(ptr) => ptr as *const c_void,
+            Err(err) => {
+                if let Ok(c_msg) = CString::new(err) {
+                    ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
+                } else {
+                    ffi::PyErr_SetString(
+                        ffi::PyExc_RuntimeError,
+                        b"missing CLIF deopt metadata\0".as_ptr() as *const i8,
+                    );
+                }
+                return Err(());
+            }
+        };
+        data.function_env.set_deopt_table_ptr(deopt_table_ptr);
         data.function_env.compiled_function = Some(compiled_function);
         let elapsed_ms = compile_start.elapsed().as_secs_f64() * 1000.0;
         info!(
@@ -1601,6 +1626,13 @@ unsafe fn ensure_clif_vectorcall_compiled(
             ffi::PyExc_RuntimeError,
             b"compiled CLIF function is missing a default direct entry pointer\0".as_ptr()
                 as *const i8,
+        );
+        return Err(());
+    }
+    if data.function_env.deopt_table_ptr().is_null() {
+        ffi::PyErr_SetString(
+            ffi::PyExc_RuntimeError,
+            b"compiled CLIF function is missing deopt metadata\0".as_ptr() as *const i8,
         );
         return Err(());
     }
