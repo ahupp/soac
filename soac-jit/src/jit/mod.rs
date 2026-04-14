@@ -292,49 +292,36 @@ fn direct_function_symbol_scope_for_shared_state(
     scope
 }
 
-fn module_constant_slot_symbol(symbol_prefix: &str, constant_id: ModuleConstantId) -> String {
-    format!("{symbol_prefix}_slot_{}", constant_id.0)
+fn module_constant_object_symbol(symbol_prefix: &str, constant_id: ModuleConstantId) -> String {
+    format!("{symbol_prefix}_object_{}", constant_id.0)
 }
 
-fn module_constant_slot_bytes(module_constant_ptr: *mut ffi::PyObject) -> Box<[u8]> {
-    (module_constant_ptr as usize)
-        .to_ne_bytes()
-        .to_vec()
-        .into_boxed_slice()
-}
-
-fn define_module_constant_slot_data_for_symbol(
+fn declare_module_constant_object_data_for_symbol(
     jit_module: &mut JITModule,
     symbol_prefix: &str,
     constant_id: ModuleConstantId,
     module_constant_ptr: *mut ffi::PyObject,
 ) -> Result<DataId, String> {
-    let symbol = module_constant_slot_symbol(symbol_prefix, constant_id);
-    let data_id = jit_module
-        .declare_data(symbol.as_str(), Linkage::Local, false, false)
-        .map_err(|err| format!("failed to declare module constant slot {symbol}: {err}"))?;
-    let mut data = DataDescription::new();
-    data.define(module_constant_slot_bytes(module_constant_ptr));
-    data.set_align(std::mem::size_of::<usize>() as u64);
+    let symbol = module_constant_object_symbol(symbol_prefix, constant_id);
+    register_jit_data_symbol(symbol.as_str(), module_constant_ptr.cast::<u8>());
     jit_module
-        .define_data(data_id, &data)
-        .map_err(|err| format!("failed to define module constant slot {symbol}: {err}"))?;
-    Ok(data_id)
+        .declare_data(symbol.as_str(), Linkage::Import, true, false)
+        .map_err(|err| format!("failed to declare module constant object {symbol}: {err}"))
 }
 
-fn define_module_constant_slot_data(
+fn declare_module_constant_object_data(
     jit_module: &mut JITModule,
     module: &BlockPyModule<CodegenModuleShape>,
     module_constant_ptrs: &[*mut ffi::PyObject],
 ) -> Result<Vec<DataId>, String> {
-    define_module_constant_slot_data_for_prefix(
+    declare_module_constant_object_data_for_prefix(
         jit_module,
         module_constant_symbol_prefix(module).as_str(),
         module_constant_ptrs,
     )
 }
 
-fn define_module_constant_slot_data_for_prefix(
+fn declare_module_constant_object_data_for_prefix(
     jit_module: &mut JITModule,
     symbol_prefix: &str,
     module_constant_ptrs: &[*mut ffi::PyObject],
@@ -344,7 +331,7 @@ fn define_module_constant_slot_data_for_prefix(
         .copied()
         .enumerate()
         .map(|(index, ptr)| {
-            define_module_constant_slot_data_for_symbol(
+            declare_module_constant_object_data_for_symbol(
                 jit_module,
                 symbol_prefix,
                 ModuleConstantId(index),
@@ -928,14 +915,14 @@ pub(crate) struct ProcessJitEngine {
 struct ProcessJitState {
     jit_module: JITModule,
     direct_functions: HashMap<FunctionId, ProcessJitFunctionEntry>,
-    module_constant_slots: HashMap<usize, ModuleConstantSlotBinding>,
+    module_constant_objects: HashMap<usize, ModuleConstantObjectBinding>,
     scalar_counter_storage: HashMap<usize, ScalarCounterStorageBinding>,
     top_value_counter_storage: HashMap<usize, TopValueCounterStorageBinding>,
     next_direct_symbol_id: u64,
 }
 
 #[derive(Clone)]
-struct ModuleConstantSlotBinding {
+struct ModuleConstantObjectBinding {
     data_ids: Vec<DataId>,
 }
 
@@ -1010,23 +997,23 @@ impl ProcessJitState {
         Ok(Self {
             jit_module: new_jit_module(compile_session)?,
             direct_functions: HashMap::new(),
-            module_constant_slots: HashMap::new(),
+            module_constant_objects: HashMap::new(),
             scalar_counter_storage: HashMap::new(),
             top_value_counter_storage: HashMap::new(),
             next_direct_symbol_id: 0,
         })
     }
 
-    fn ensure_module_constant_slots(
+    fn ensure_module_constant_objects(
         &mut self,
         module_constant_ptrs: &[*mut ffi::PyObject],
         binding_key: usize,
         symbol_prefix: &str,
     ) -> Result<Vec<DataId>, String> {
-        if let Some(binding) = self.module_constant_slots.get(&binding_key) {
+        if let Some(binding) = self.module_constant_objects.get(&binding_key) {
             if binding.data_ids.len() != module_constant_ptrs.len() {
                 return Err(format!(
-                    "module constant slot count mismatch for module instance {}: {} != {}",
+                    "module constant object count mismatch for module instance {}: {} != {}",
                     binding_key,
                     binding.data_ids.len(),
                     module_constant_ptrs.len()
@@ -1034,14 +1021,14 @@ impl ProcessJitState {
             }
             return Ok(binding.data_ids.clone());
         }
-        let data_ids = define_module_constant_slot_data_for_prefix(
+        let data_ids = declare_module_constant_object_data_for_prefix(
             &mut self.jit_module,
             symbol_prefix,
             module_constant_ptrs,
         )?;
-        self.module_constant_slots.insert(
+        self.module_constant_objects.insert(
             binding_key,
-            ModuleConstantSlotBinding {
+            ModuleConstantObjectBinding {
                 data_ids: data_ids.clone(),
             },
         );
@@ -1653,9 +1640,8 @@ fn emit_owned_local_value_or_deleted_sentinel_for_super(
     };
     let null_ptr = fb.ins().iconst(ctx.consts.ptr_ty, 0);
     let value_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, value, null_ptr);
-    let selected = fb
-        .ins()
-        .select(value_is_null, ctx.consts.deleted_const, value);
+    let deleted_const = emit_deleted_const(fb, ctx);
+    let selected = fb.ins().select(value_is_null, deleted_const, value);
     fb.ins().call(ctx.incref_ref, &[selected]);
     Some(selected)
 }
@@ -2084,15 +2070,15 @@ struct JitEmitConsts {
     i64_ty: ir::Type,
     i32_ty: ir::Type,
     function_data_value: ir::Value,
-    module_constant_slot_values: Vec<ir::Value>,
+    module_constant_object_globals: Vec<ir::GlobalValue>,
     scalar_counter_base_value: Option<ir::Value>,
     top_value_counter_base_value: Option<ir::Value>,
     thread_state_value: ir::Value,
-    none_const: ir::Value,
-    true_const: ir::Value,
-    false_const: ir::Value,
-    deleted_const: ir::Value,
-    empty_tuple_const: ir::Value,
+    none_constant_id: ModuleConstantId,
+    true_constant_id: ModuleConstantId,
+    false_constant_id: ModuleConstantId,
+    deleted_constant_id: ModuleConstantId,
+    empty_tuple_constant_id: ModuleConstantId,
     block_const: ir::Value,
 }
 
@@ -3343,9 +3329,9 @@ fn emit_none_for_demand(
     match demand {
         ResultDemand::EffectOnly => EmitResult::no_value(),
         ResultDemand::PyObject { .. } => {
-            fb.ins()
-                .call(emit_ctx.incref_ref, &[emit_ctx.consts.none_const]);
-            EmitResult::owned_pyobject(emit_ctx.consts.none_const, PyObjFacts::none_singleton())
+            let none_const = emit_none_const(fb, emit_ctx);
+            fb.ins().call(emit_ctx.incref_ref, &[none_const]);
+            EmitResult::owned_pyobject(none_const, PyObjFacts::none_singleton())
         }
         ResultDemand::I32Bool01 => {
             panic!("owned None materialization cannot satisfy I32Bool01 demand")
@@ -4314,15 +4300,14 @@ fn emit_checked_owned_pyobject_call_value_with_cleanup(
 fn emit_owned_module_constant_from_parts(
     fb: &mut FunctionBuilder<'_>,
     constant_id: ModuleConstantId,
-    module_constant_slot_values: &[ir::Value],
+    module_constant_object_globals: &[ir::GlobalValue],
     ptr_ty: ir::Type,
 ) -> ir::Value {
-    let slot_value = module_constant_slot_values
+    let object_global = module_constant_object_globals
         .get(constant_id.0)
         .copied()
-        .unwrap_or_else(|| panic!("missing module constant slot {}", constant_id.0));
-    fb.ins()
-        .load(ptr_ty, ir::MemFlags::trusted(), slot_value, 0)
+        .unwrap_or_else(|| panic!("missing module constant object {}", constant_id.0));
+    fb.ins().global_value(ptr_ty, object_global)
 }
 
 fn emit_owned_module_constant(
@@ -4333,9 +4318,29 @@ fn emit_owned_module_constant(
     emit_owned_module_constant_from_parts(
         fb,
         constant_id,
-        &ctx.consts.module_constant_slot_values,
+        &ctx.consts.module_constant_object_globals,
         ctx.consts.ptr_ty,
     )
+}
+
+fn emit_none_const(fb: &mut FunctionBuilder<'_>, ctx: &JitEmitCtx<'_>) -> ir::Value {
+    emit_owned_module_constant(fb, ctx.consts.none_constant_id, ctx)
+}
+
+fn emit_true_const(fb: &mut FunctionBuilder<'_>, ctx: &JitEmitCtx<'_>) -> ir::Value {
+    emit_owned_module_constant(fb, ctx.consts.true_constant_id, ctx)
+}
+
+fn emit_false_const(fb: &mut FunctionBuilder<'_>, ctx: &JitEmitCtx<'_>) -> ir::Value {
+    emit_owned_module_constant(fb, ctx.consts.false_constant_id, ctx)
+}
+
+fn emit_deleted_const(fb: &mut FunctionBuilder<'_>, ctx: &JitEmitCtx<'_>) -> ir::Value {
+    emit_owned_module_constant(fb, ctx.consts.deleted_constant_id, ctx)
+}
+
+fn emit_empty_tuple_const(fb: &mut FunctionBuilder<'_>, ctx: &JitEmitCtx<'_>) -> ir::Value {
+    emit_owned_module_constant(fb, ctx.consts.empty_tuple_constant_id, ctx)
 }
 
 fn placeholder_module_constant_ptrs(count: usize) -> Vec<*mut ffi::PyObject> {
@@ -4428,8 +4433,9 @@ fn emit_increment_counter(
     );
     // TODO: Split codegen instructions into value-producing vs non-value-producing ops
     // and elide retain/release work when a statement result is not consumed.
-    fb.ins().call(ctx.incref_ref, &[ctx.consts.none_const]);
-    ctx.consts.none_const
+    let none_const = emit_none_const(fb, ctx);
+    fb.ins().call(ctx.incref_ref, &[none_const]);
+    none_const
 }
 
 pub(super) fn emit_increment_counter_slot(
@@ -4785,9 +4791,9 @@ fn emit_pack_current_values_tuple(
     ctx: &JitEmitCtx<'_>,
 ) -> ir::Value {
     if values.is_empty() {
-        fb.ins()
-            .call(ctx.incref_ref, &[ctx.consts.empty_tuple_const]);
-        return ctx.consts.empty_tuple_const;
+        let empty_tuple_const = emit_empty_tuple_const(fb, ctx);
+        fb.ins().call(ctx.incref_ref, &[empty_tuple_const]);
+        return empty_tuple_const;
     }
 
     let ptr_ty = ctx.consts.ptr_ty;
@@ -5516,20 +5522,22 @@ fn emit_unpack_call_result_with_local_env(
     let null_ptr = fb.ins().iconst(ptr_ty, 0);
 
     let list_callable = emit_checked_runtime_name_object(fb, "list", ctx);
+    let empty_tuple_const = emit_empty_tuple_const(fb, ctx);
     let args_list = emit_checked_owned_pyobject_call_with_cleanup(
         fb,
         ctx,
         ctx.py_call_object_ref,
-        &[list_callable, ctx.consts.empty_tuple_const],
+        &[list_callable, empty_tuple_const],
         &[list_callable],
     );
 
     let kwargs_obj = if keywords.is_empty() {
         None
     } else {
+        let empty_tuple_const = emit_empty_tuple_const(fb, ctx);
         Some(emit_empty_dict_with_args_tuple(
             fb,
-            ctx.consts.empty_tuple_const,
+            empty_tuple_const,
             true,
             ctx,
         ))
@@ -5699,9 +5707,9 @@ fn emit_to_python_bool(
     let is_true = fb
         .ins()
         .icmp_imm(ir::condcodes::IntCC::NotEqual, truth_i32, 0);
-    let bool_value = fb
-        .ins()
-        .select(is_true, ctx.consts.true_const, ctx.consts.false_const);
+    let true_const = emit_true_const(fb, ctx);
+    let false_const = emit_false_const(fb, ctx);
+    let bool_value = fb.ins().select(is_true, true_const, false_const);
     fb.ins().call(ctx.incref_ref, &[bool_value]);
     SoacValue::pyobject(bool_value, PyObjFacts::bool_object())
 }
@@ -7647,8 +7655,9 @@ fn emit_planned_target_args_codegen_from_local_env(
                 value
             }
             BlockArg::None => {
-                fb.ins().call(ctx.incref_ref, &[ctx.consts.none_const]);
-                ctx.consts.none_const
+                let none_const = emit_none_const(fb, ctx);
+                fb.ins().call(ctx.incref_ref, &[none_const]);
+                none_const
             }
             BlockArg::CurrentException => {
                 return Err(LocalEnvEdgePrepError::UnsupportedCurrentExceptionArg);
@@ -7740,8 +7749,9 @@ where
             continue;
         }
         if is_try_abrupt_payload_name(source_name) {
-            fb.ins().call(incref_ref, &[ctx.consts.none_const]);
-            values.push(ctx.consts.none_const);
+            let none_const = emit_none_const(fb, ctx);
+            fb.ins().call(incref_ref, &[none_const]);
+            values.push(none_const);
             continue;
         }
         values.push(fb.ins().iconst(ptr_ty, 0));
@@ -7847,7 +7857,7 @@ fn emit_exception_dispatch_target_args(
     forwarded_local_values: &[ir::Value],
     dispatch_exc: ir::Value,
     module_constants: &ModuleCodegenConstants,
-    module_constant_slot_values: &[ir::Value],
+    module_constant_object_globals: &[ir::GlobalValue],
     ptr_ty: ir::Type,
     thread_state_value: ir::Value,
     none_const: ir::Value,
@@ -7896,7 +7906,7 @@ fn emit_exception_dispatch_target_args(
             BlockArg::AbruptKind(kind) => emit_owned_module_constant_from_parts(
                 fb,
                 module_constants.require_int_constant_id(abrupt_kind_tag(*kind)),
-                module_constant_slot_values,
+                module_constant_object_globals,
                 ptr_ty,
             ),
         };
@@ -8184,9 +8194,10 @@ fn emit_truthy_from_pyobject_value(
         return emit_i32_bool01_const(fb, true, ctx);
     }
     if py_facts.is_exact_type(PyExactType::Bool) {
+        let true_const = emit_true_const(fb, ctx);
         let is_true = fb
             .ins()
-            .icmp(ir::condcodes::IntCC::Equal, value, ctx.consts.true_const);
+            .icmp(ir::condcodes::IntCC::Equal, value, true_const);
         emit_release_pyobject_if_owned(fb, value, py_facts, owned, ctx);
         return emit_i32_bool01_from_cond(fb, is_true, ctx);
     }
@@ -8694,11 +8705,10 @@ fn emit_codegen_simple_call_with_local_env(
                 jit_module,
                 func_imports,
             );
-            let value_is_deleted_sentinel = fb.ins().icmp(
-                ir::condcodes::IntCC::Equal,
-                value_obj,
-                emit_ctx.consts.deleted_const,
-            );
+            let deleted_const = emit_deleted_const(fb, emit_ctx);
+            let value_is_deleted_sentinel =
+                fb.ins()
+                    .icmp(ir::condcodes::IntCC::Equal, value_obj, deleted_const);
             let value_is_null = fb
                 .ins()
                 .icmp(ir::condcodes::IntCC::Equal, value_obj, null_ptr);
@@ -10449,11 +10459,9 @@ fn emit_typed_codegen_expr_with_local_env(
             let is_true = fb
                 .ins()
                 .icmp_imm(ir::condcodes::IntCC::NotEqual, truth_i32, 0);
-            let bool_value = fb.ins().select(
-                is_true,
-                emit_ctx.consts.true_const,
-                emit_ctx.consts.false_const,
-            );
+            let true_const = emit_true_const(fb, emit_ctx);
+            let false_const = emit_false_const(fb, emit_ctx);
+            let bool_value = fb.ins().select(is_true, true_const, false_const);
             if !borrowed {
                 fb.ins().call(emit_ctx.incref_ref, &[bool_value]);
             }
@@ -11150,9 +11158,8 @@ fn emit_codegen_raise_exception_from_function(
     let thread_state_value = emit_ctx.consts.thread_state_value;
     let decref_ref = emit_ctx.decref_ref;
 
-    fb.ins()
-        .call(emit_ctx.incref_ref, &[emit_ctx.consts.none_const]);
-    let cause_value = emit_ctx.consts.none_const;
+    let cause_value = emit_none_const(fb, emit_ctx);
+    fb.ins().call(emit_ctx.incref_ref, &[cause_value]);
     let raise_call_inst = fb.ins().call(
         emit_ctx.py_call_positional_three_ref,
         &[
@@ -11397,9 +11404,9 @@ fn emit_codegen_term(
                     func_imports,
                 )
             } else {
-                fb.ins()
-                    .call(emit_ctx.incref_ref, &[emit_ctx.consts.none_const]);
-                emit_ctx.consts.none_const
+                let none_const = emit_none_const(fb, emit_ctx);
+                fb.ins().call(emit_ctx.incref_ref, &[none_const]);
+                none_const
             };
             emit_codegen_raise_exception_from_function(
                 fb,
@@ -11546,9 +11553,9 @@ fn emit_typed_codegen_term(
             }
             (exc_value, ownership)
         } else {
-            fb.ins()
-                .call(emit_ctx.incref_ref, &[emit_ctx.consts.none_const]);
-            (emit_ctx.consts.none_const, ValueOwnership::Owned)
+            let none_const = emit_none_const(fb, emit_ctx);
+            fb.ins().call(emit_ctx.incref_ref, &[none_const]);
+            (none_const, ValueOwnership::Owned)
         };
         return emit_codegen_raise_exception_from_function(
             fb,
@@ -11974,7 +11981,7 @@ impl ProcessJitEngine {
                     None,
                 )
             };
-            let function_module_constant_slot_data_ids = state.ensure_module_constant_slots(
+            let function_module_constant_object_data_ids = state.ensure_module_constant_objects(
                 function_module_constant_ptrs,
                 function_module_constant_binding_key,
                 function_module_constant_symbol_prefix.as_str(),
@@ -12007,7 +12014,7 @@ impl ProcessJitEngine {
                 function_jit_local_plan,
                 function_module_constants,
                 function_counter_defs,
-                function_module_constant_slot_data_ids.as_slice(),
+                function_module_constant_object_data_ids.as_slice(),
                 function_counter_slots_by_id,
                 function_scalar_counter_data_id,
                 function_top_value_counter_data_id,
@@ -13439,7 +13446,7 @@ fn build_cranelift_run_bb_specialized_function(
     jit_local_plan: &PlannedJitFunctionLocals,
     module_constants: &ModuleCodegenConstants,
     counter_defs: &[CounterDef],
-    module_constant_slot_data_ids: &[DataId],
+    module_constant_object_data_ids: &[DataId],
     counter_slots_by_id: &[CounterRuntimeSlot],
     scalar_counter_data_id: Option<DataId>,
     top_value_counter_data_id: Option<DataId>,
@@ -13921,43 +13928,10 @@ fn build_cranelift_run_bb_specialized_function(
             &mut fb.func,
             &SOAC_RUNTIME_SET_RAISED_EXCEPTION_IMPORT,
         );
-        let module_constant_slot_values = module_constant_slot_data_ids
+        let module_constant_object_globals = module_constant_object_data_ids
             .iter()
-            .map(|data_id| {
-                let slot_data = jit_module.declare_data_in_func(*data_id, &mut fb.func);
-                fb.ins().global_value(ptr_ty, slot_data)
-            })
+            .map(|data_id| jit_module.declare_data_in_func(*data_id, &mut fb.func))
             .collect::<Vec<_>>();
-        let none_const = emit_owned_module_constant_from_parts(
-            &mut fb,
-            none_constant_id,
-            &module_constant_slot_values,
-            ptr_ty,
-        );
-        let true_const = emit_owned_module_constant_from_parts(
-            &mut fb,
-            true_constant_id,
-            &module_constant_slot_values,
-            ptr_ty,
-        );
-        let false_const = emit_owned_module_constant_from_parts(
-            &mut fb,
-            false_constant_id,
-            &module_constant_slot_values,
-            ptr_ty,
-        );
-        let deleted_const = emit_owned_module_constant_from_parts(
-            &mut fb,
-            deleted_constant_id,
-            &module_constant_slot_values,
-            ptr_ty,
-        );
-        let empty_tuple_const = emit_owned_module_constant_from_parts(
-            &mut fb,
-            empty_tuple_constant_id,
-            &module_constant_slot_values,
-            ptr_ty,
-        );
         let scalar_counter_base_value = scalar_counter_data_id.map(|data_id| {
             let counter_data = jit_module.declare_data_in_func(data_id, &mut fb.func);
             fb.ins().global_value(ptr_ty, counter_data)
@@ -13970,7 +13944,7 @@ fn build_cranelift_run_bb_specialized_function(
             emit_owned_module_constant_from_parts(
                 &mut fb,
                 module_constants.require_int_constant_id(abrupt_kind_tag(AbruptKind::Fallthrough)),
-                &module_constant_slot_values,
+                &module_constant_object_globals,
                 ptr_ty,
             )
         });
@@ -14118,7 +14092,12 @@ fn build_cranelift_run_bb_specialized_function(
                     fb.switch_to_block(value_ok_block);
                     fb.block_params(value_ok_block)[0]
                 }
-                BlockParamRole::AbruptPayload => none_const,
+                BlockParamRole::AbruptPayload => emit_owned_module_constant_from_parts(
+                    &mut fb,
+                    none_constant_id,
+                    &module_constant_object_globals,
+                    ptr_ty,
+                ),
                 BlockParamRole::Exception => null_ptr,
             };
             entry_param_values.insert(block_param.name.as_str(), value);
@@ -14216,15 +14195,15 @@ fn build_cranelift_run_bb_specialized_function(
                     i64_ty,
                     i32_ty: ir::types::I32,
                     function_data_value,
-                    module_constant_slot_values: module_constant_slot_values.clone(),
+                    module_constant_object_globals: module_constant_object_globals.clone(),
                     scalar_counter_base_value,
                     top_value_counter_base_value,
                     thread_state_value,
-                    none_const,
-                    true_const,
-                    false_const,
-                    deleted_const,
-                    empty_tuple_const,
+                    none_constant_id,
+                    true_constant_id,
+                    false_constant_id,
+                    deleted_constant_id,
+                    empty_tuple_constant_id,
                     block_const,
                 },
                 load_global_fast_ref,
@@ -14366,6 +14345,12 @@ fn build_cranelift_run_bb_specialized_function(
                     fb.ins().stack_store(is_pushed, is_pushed_slot, 0);
                 }
             }
+            let slot_write_none_const = emit_owned_module_constant_from_parts(
+                &mut fb,
+                none_constant_id,
+                &module_constant_object_globals,
+                ptr_ty,
+            );
             emit_exception_dispatch_slot_writes(
                 &mut fb,
                 &dispatch_plan.slot_writes,
@@ -14375,7 +14360,7 @@ fn build_cranelift_run_bb_specialized_function(
                 &stack_slots,
                 ptr_ty,
                 thread_state_value,
-                none_const,
+                slot_write_none_const,
                 incref_ref,
                 decref_ref,
             )?;
@@ -14411,6 +14396,12 @@ fn build_cranelift_run_bb_specialized_function(
                 thread_state_value,
                 decref_ref,
             )?;
+            let target_arg_none_const = emit_owned_module_constant_from_parts(
+                &mut fb,
+                none_constant_id,
+                &module_constant_object_globals,
+                ptr_ty,
+            );
             let target_jump_args = emit_exception_dispatch_target_args(
                 &mut fb,
                 &dispatch_plan.target_args,
@@ -14418,10 +14409,10 @@ fn build_cranelift_run_bb_specialized_function(
                 &forwarded_local_values,
                 dispatch_exc,
                 module_constants,
-                &module_constant_slot_values,
+                &module_constant_object_globals,
                 ptr_ty,
                 thread_state_value,
-                none_const,
+                target_arg_none_const,
                 incref_ref,
                 decref_ref,
             )?;
@@ -14626,8 +14617,8 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
         .unwrap_or(module.counter_defs.as_slice());
     let (counter_slots_by_id, scalar_counter_count, top_value_counter_count) =
         build_counter_storage_layout(counter_defs)?;
-    let module_constant_slot_data_ids =
-        define_module_constant_slot_data(&mut jit_module, module, &module_constant_ptrs)?;
+    let module_constant_object_data_ids =
+        declare_module_constant_object_data(&mut jit_module, module, &module_constant_ptrs)?;
     let scalar_counter_data_id = if scalar_counter_count == 0 {
         None
     } else {
@@ -14670,7 +14661,7 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
         jit_local_plan,
         module_constants,
         counter_defs,
-        module_constant_slot_data_ids.as_slice(),
+        module_constant_object_data_ids.as_slice(),
         counter_slots_by_id.as_ref(),
         scalar_counter_data_id,
         top_value_counter_data_id,

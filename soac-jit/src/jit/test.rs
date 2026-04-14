@@ -932,7 +932,7 @@ def f():
         function: &BlockPyFunction<CodegenModuleShape>,
         module_constants: &crate::module_constants::ModuleCodegenConstants,
         counter_defs: &[CounterDef],
-        module_constant_slot_data_ids: &[DataId],
+        module_constant_object_data_ids: &[DataId],
         counter_slots_by_id: &[CounterRuntimeSlot],
         scalar_counter_data_id: Option<DataId>,
         top_value_counter_data_id: Option<DataId>,
@@ -960,7 +960,7 @@ def f():
             jit_local_plan,
             module_constants,
             counter_defs,
-            module_constant_slot_data_ids,
+            module_constant_object_data_ids,
             counter_slots_by_id,
             scalar_counter_data_id,
             top_value_counter_data_id,
@@ -981,9 +981,9 @@ def f():
         let mut jit_module =
             new_jit_module(&compile_session).expect("test jit module should construct");
         let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
-        let module_constant_slot_data_ids =
-            define_module_constant_slot_data(&mut jit_module, module, &module_constant_ptrs)
-                .expect("module constant slot data should define");
+        let module_constant_object_data_ids =
+            declare_module_constant_object_data(&mut jit_module, module, &module_constant_ptrs)
+                .expect("module constant object data should declare");
         let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
             define_test_counter_storage(&mut jit_module, module, &module.counter_defs);
         build_test_cranelift_run_bb_specialized_function(
@@ -993,7 +993,7 @@ def f():
             function,
             module_constants,
             &module.counter_defs,
-            module_constant_slot_data_ids.as_slice(),
+            module_constant_object_data_ids.as_slice(),
             counter_slots_by_id.as_ref(),
             scalar_counter_data_id,
             top_value_counter_data_id,
@@ -2930,12 +2930,12 @@ def f():
             let mut jit_module =
                 new_jit_module(&compile_session).expect("test jit module should construct");
             let module_constant_ptrs = shared_state.module_constant_ptrs();
-            let module_constant_slot_data_ids = define_module_constant_slot_data(
+            let module_constant_object_data_ids = declare_module_constant_object_data(
                 &mut jit_module,
                 &shared_state.lowered_module,
                 &module_constant_ptrs,
             )
-            .expect("module constant slot data should define");
+            .expect("module constant object data should declare");
             let (counter_slots_by_id, scalar_counter_data_id, _top_value_counter_data_id) =
                 define_test_counter_storage(
                     &mut jit_module,
@@ -2953,7 +2953,7 @@ def f():
                 &function,
                 &shared_state.codegen_constants,
                 &shared_state.lowered_module.counter_defs,
-                module_constant_slot_data_ids.as_slice(),
+                module_constant_object_data_ids.as_slice(),
                 counter_slots_by_id.as_ref(),
                 scalar_counter_data_id,
                 top_value_counter_data_id,
@@ -3045,12 +3045,12 @@ def f():
             let mut jit_module =
                 new_jit_module(&compile_session).expect("test jit module should construct");
             let module_constant_ptrs = shared_state.module_constant_ptrs();
-            let module_constant_slot_data_ids = define_module_constant_slot_data(
+            let module_constant_object_data_ids = declare_module_constant_object_data(
                 &mut jit_module,
                 &shared_state.lowered_module,
                 &module_constant_ptrs,
             )
-            .expect("module constant slot data should define");
+            .expect("module constant object data should declare");
             let (counter_slots_by_id, scalar_counter_data_id, _top_value_counter_data_id) =
                 define_test_counter_storage(
                     &mut jit_module,
@@ -3068,7 +3068,7 @@ def f():
                 &function,
                 &shared_state.codegen_constants,
                 &shared_state.lowered_module.counter_defs,
-                module_constant_slot_data_ids.as_slice(),
+                module_constant_object_data_ids.as_slice(),
                 counter_slots_by_id.as_ref(),
                 scalar_counter_data_id,
                 top_value_counter_data_id,
@@ -4104,9 +4104,9 @@ def read_point(point):
             let mut jit_module =
                 new_jit_module(&compile_session).expect("test jit module should construct");
             let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
-            let module_constant_slot_data_ids =
-                define_module_constant_slot_data(&mut jit_module, module, &module_constant_ptrs)
-                    .expect("module constant slot data should define");
+            let module_constant_object_data_ids =
+                declare_module_constant_object_data(&mut jit_module, module, &module_constant_ptrs)
+                    .expect("module constant object data should declare");
             let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
                 define_test_counter_storage(
                     &mut jit_module,
@@ -4120,7 +4120,7 @@ def read_point(point):
                 function,
                 module_constants,
                 module.counter_defs.as_slice(),
-                module_constant_slot_data_ids.as_slice(),
+                module_constant_object_data_ids.as_slice(),
                 counter_slots_by_id.as_ref(),
                 scalar_counter_data_id,
                 top_value_counter_data_id,
@@ -4205,9 +4205,9 @@ def read_point(point):
             let mut jit_module =
                 new_jit_module(&compile_session).expect("test jit module should construct");
             let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
-            let module_constant_slot_data_ids =
-                define_module_constant_slot_data(&mut jit_module, module, &module_constant_ptrs)
-                    .expect("module constant slot data should define");
+            let module_constant_object_data_ids =
+                declare_module_constant_object_data(&mut jit_module, module, &module_constant_ptrs)
+                    .expect("module constant object data should declare");
             let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
                 define_test_counter_storage(
                     &mut jit_module,
@@ -4221,7 +4221,7 @@ def read_point(point):
                 function,
                 module_constants,
                 module.counter_defs.as_slice(),
-                module_constant_slot_data_ids.as_slice(),
+                module_constant_object_data_ids.as_slice(),
                 counter_slots_by_id.as_ref(),
                 scalar_counter_data_id,
                 top_value_counter_data_id,
@@ -4245,9 +4245,9 @@ def read_point(point):
             let mut jit_module =
                 new_jit_module(&compile_session).expect("test jit module should construct");
             let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
-            let module_constant_slot_data_ids =
-                define_module_constant_slot_data(&mut jit_module, module, &module_constant_ptrs)
-                    .expect("module constant slot data should define");
+            let module_constant_object_data_ids =
+                declare_module_constant_object_data(&mut jit_module, module, &module_constant_ptrs)
+                    .expect("module constant object data should declare");
             let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
                 define_test_counter_storage(
                     &mut jit_module,
@@ -4261,7 +4261,7 @@ def read_point(point):
                 function,
                 module_constants,
                 module.counter_defs.as_slice(),
-                module_constant_slot_data_ids.as_slice(),
+                module_constant_object_data_ids.as_slice(),
                 counter_slots_by_id.as_ref(),
                 scalar_counter_data_id,
                 top_value_counter_data_id,
@@ -5457,9 +5457,12 @@ def f():
             let mut jit_module =
                 new_jit_module(&compile_session).expect("test jit module should construct");
             let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
-            let module_constant_slot_data_ids =
-                define_module_constant_slot_data(&mut jit_module, &module, &module_constant_ptrs)
-                    .expect("module constant slot data should define");
+            let module_constant_object_data_ids = declare_module_constant_object_data(
+                &mut jit_module,
+                &module,
+                &module_constant_ptrs,
+            )
+            .expect("module constant object data should declare");
             let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
                 define_test_counter_storage(
                     &mut jit_module,
@@ -5473,7 +5476,7 @@ def f():
                 &function,
                 &module_constants,
                 module.counter_defs.as_slice(),
-                module_constant_slot_data_ids.as_slice(),
+                module_constant_object_data_ids.as_slice(),
                 counter_slots_by_id.as_ref(),
                 scalar_counter_data_id,
                 top_value_counter_data_id,
@@ -6076,7 +6079,7 @@ def f(x):
     }
 
     #[test]
-    fn specialized_jit_string_literals_load_from_module_constant_slot_symbol() {
+    fn specialized_jit_string_literals_load_from_module_constant_object_symbol() {
         let blocks = [1usize as ObjPtr];
         let mut constants = TestConstantPool::default();
         let function = with_single_test_block(
@@ -6097,12 +6100,17 @@ def f(x):
         );
         assert!(
             count_symbolic_global_values(&built.ctx.func) >= module_constants.len(),
-            "string literal lowering should reference one symbolic slot per module constant"
+            "string literal lowering should reference one symbolic object per module constant"
+        );
+        assert_eq!(
+            count_opcode(&built.ctx.func, ir::Opcode::GlobalValue),
+            1,
+            "string literal lowering should materialize only the used module constant object"
         );
     }
 
     #[test]
-    fn specialized_jit_constant_locations_load_from_module_constant_slot_symbol() {
+    fn specialized_jit_constant_locations_load_from_module_constant_object_symbol() {
         let blocks = [1usize as ObjPtr];
         let function = with_single_test_block(
             test_function(),
@@ -6117,11 +6125,16 @@ def f(x):
             build_test_jit_function_with_constants(&module, &function, &blocks, &module_constants);
         assert!(
             !function_contains_iconst_imm(&built.ctx.func, 0x1000),
-            "constant slot lowering should not bake the placeholder module constant pointer into the function body"
+            "constant object lowering should not bake the placeholder module constant pointer into the function body"
         );
         assert!(
             count_symbolic_global_values(&built.ctx.func) >= module_constants.len(),
-            "constant slot lowering should reference one symbolic slot per module constant"
+            "constant object lowering should reference one symbolic object per module constant"
+        );
+        assert_eq!(
+            count_opcode(&built.ctx.func, ir::Opcode::GlobalValue),
+            1,
+            "constant object lowering should materialize only the used module constant object"
         );
     }
 
@@ -6178,12 +6191,12 @@ def f():
                 let mut jit_module =
                     new_jit_module(&compile_session).expect("test jit module should construct");
                 let module_constant_ptrs = shared_state.module_constant_ptrs();
-                let module_constant_slot_data_ids = define_module_constant_slot_data(
+                let module_constant_object_data_ids = declare_module_constant_object_data(
                     &mut jit_module,
                     &shared_state.lowered_module,
                     &module_constant_ptrs,
                 )
-                .expect("module constant slot data should define");
+                .expect("module constant object data should declare");
                 let scalar_counter_ptr = shared_state.scalar_counter_values_ptr() as i64;
                 assert_ne!(
                     scalar_counter_ptr, 0,
@@ -6211,7 +6224,7 @@ def f():
                     &function,
                     &shared_state.codegen_constants,
                     &shared_state.lowered_module.counter_defs,
-                    module_constant_slot_data_ids.as_slice(),
+                    module_constant_object_data_ids.as_slice(),
                     shared_state.counter_slots_by_id(),
                     scalar_counter_data_id,
                     top_value_counter_data_id,
@@ -6310,12 +6323,12 @@ def f(x, y):
                 let mut jit_module =
                     new_jit_module(&compile_session).expect("test jit module should construct");
                 let module_constant_ptrs = shared_state.module_constant_ptrs();
-                let module_constant_slot_data_ids = define_module_constant_slot_data(
+                let module_constant_object_data_ids = declare_module_constant_object_data(
                     &mut jit_module,
                     &shared_state.lowered_module,
                     &module_constant_ptrs,
                 )
-                .expect("module constant slot data should define");
+                .expect("module constant object data should declare");
                 let top_value_counter_base_ptr = shared_state.top_value_counter_values_ptr();
                 assert!(
                     !top_value_counter_base_ptr.is_null(),
@@ -6337,7 +6350,7 @@ def f(x, y):
                     &function,
                     &shared_state.codegen_constants,
                     &shared_state.lowered_module.counter_defs,
-                    module_constant_slot_data_ids.as_slice(),
+                    module_constant_object_data_ids.as_slice(),
                     shared_state.counter_slots_by_id(),
                     None,
                     top_value_counter_data_id,
@@ -7229,12 +7242,12 @@ def f(x, y):
                         .expect("test __init__ direct function should declare");
                 let predeclared = HashMap::from([(init_function.function_id, declared_init)]);
                 let module_constant_ptrs = shared_state.module_constant_ptrs();
-                let module_constant_slot_data_ids = define_module_constant_slot_data(
+                let module_constant_object_data_ids = declare_module_constant_object_data(
                     &mut jit_module,
                     &shared_state.lowered_module,
                     &module_constant_ptrs,
                 )
-                .expect("module constant slot data should define");
+                .expect("module constant object data should declare");
                 let (counter_slots_by_id, scalar_counter_data_id, _top_value_counter_data_id) =
                     define_test_counter_storage(
                         &mut jit_module,
@@ -7252,7 +7265,7 @@ def f(x, y):
                     &caller_function,
                     &shared_state.codegen_constants,
                     &shared_state.lowered_module.counter_defs,
-                    module_constant_slot_data_ids.as_slice(),
+                    module_constant_object_data_ids.as_slice(),
                     counter_slots_by_id.as_ref(),
                     scalar_counter_data_id,
                     top_value_counter_data_id,

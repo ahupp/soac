@@ -51,11 +51,12 @@ pub(super) trait OperationEmitState<'fb, E> {
         constant_id: crate::module_constants::ModuleConstantId,
     ) -> ir::Value {
         let ptr_ty = self.ctx().consts.ptr_ty;
-        let module_constant_slot_values = self.ctx().consts.module_constant_slot_values.clone();
+        let module_constant_object_globals =
+            self.ctx().consts.module_constant_object_globals.clone();
         emit_owned_module_constant_from_parts(
             self.fb(),
             constant_id,
-            &module_constant_slot_values,
+            &module_constant_object_globals,
             ptr_ty,
         )
     }
@@ -361,7 +362,8 @@ fn emit_pow_like_from_values<'fb, E>(
     arg_values: &[(ir::Value, bool)],
 ) -> ir::Value {
     let func_ref = state.import_func(spec);
-    let none_const = state.ctx().consts.none_const;
+    let none_constant_id = state.ctx().consts.none_constant_id;
+    let none_const = state.emit_owned_module_constant(none_constant_id);
     let call_inst = match arg_values {
         [(left, _), (right, _)] => state
             .fb()
@@ -654,7 +656,8 @@ fn emit_specialized_setattr<'fb>(
 
         state.fb().switch_to_block(direct_block);
         increment_counter_with_state(state, hit_counter_id);
-        let none_const = state.ctx().consts.none_const;
+        let none_constant_id = state.ctx().consts.none_constant_id;
+        let none_const = state.emit_owned_module_constant(none_constant_id);
         let incref_ref = state.ctx().incref_ref;
         state.fb().ins().call(incref_ref, &[none_const]);
         state.release_arg_values(&arg_values);
@@ -685,7 +688,8 @@ fn emit_specialized_setattr<'fb>(
 fn emit_make_cell<'fb, E>(state: &mut impl OperationEmitState<'fb, E>, args: &[&E]) -> ir::Value {
     let arg_values = state.emit_arg_values(&args);
     let ptr_ty = state.ctx().consts.ptr_ty;
-    let deleted_const = state.ctx().consts.deleted_const;
+    let deleted_constant_id = state.ctx().consts.deleted_constant_id;
+    let deleted_const = state.emit_owned_module_constant(deleted_constant_id);
     let null_ptr = state.fb().ins().iconst(ptr_ty, 0);
     let is_deleted =
         state

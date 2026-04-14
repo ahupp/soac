@@ -639,3 +639,20 @@ benchmarked throughput delta, and the headline pre/post numbers.
   - specialized pass, 1M loops x3: `425734`, `429207`, `432758 loops/s`
   - pystone JIT code bytes: `256306`
   - pystone machine blocks: `17339`
+
+## 2026-04-14 - Use direct object symbols for module constants
+
+- jj change id: `xmxmkuxl`
+- summary: Immutable module constants now use direct object-address symbols
+  instead of slot-address symbols containing `PyObject*` values, removing the
+  extra symbol-value load while preserving symbolic relocation.
+- throughput: `+2.23%` specialized pystone median; code size `-2.12%`;
+  machine blocks `-1.14%`
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `424374`, `432790`, `427096 loops/s`
+  - pystone JIT code bytes: `257638`
+  - pystone machine blocks: `17415`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `443631`, `436627`, `436614 loops/s`
+  - pystone JIT code bytes: `252190`
+  - pystone machine blocks: `17216`
