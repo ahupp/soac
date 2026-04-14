@@ -5,8 +5,8 @@ use soac_blockpy::block_py::{
     ClosureInit, ClosureSlot, CodegenBlock, CounterDef, CounterSite, Del, DelItem, FunctionId,
     FunctionName, HasMeta, HasSemanticInstrId, InstrCodegen, InstrResolved, Literal, LiteralValue,
     Load, LocalLocation, Meta, ModuleNameGen, NameLocation, NumberLiteral, NumberLiteralValue,
-    Param, ParamKind, ParamSpec, ResolvedName, StorageLayout, Store, StringLiteral, Visit,
-    VisitMut, WithMeta,
+    Param, ParamKind, ParamSpec, ResolvedName, StorageLayout, Store, StringLiteral, UnaryOp,
+    UnaryOpKind, Visit, VisitMut, WithMeta,
 };
 use soac_blockpy::passes::{
     CodegenModuleShape, instrument_bb_module_with_block_entry_counters,
@@ -6025,6 +6025,90 @@ def f(x):
                 ffi::Py_DECREF(result.cast::<ffi::PyObject>());
                 ffi::Py_DECREF(right);
                 ffi::Py_DECREF(left);
+            }
+        });
+    }
+
+    #[test]
+    fn deopt_block_tail_continuation_executes_return_unary_ops() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|_| {
+            for (kind, input, expected, check_refcount) in [
+                (UnaryOpKind::Pos, 222_333_444, 222_333_444, true),
+                (UnaryOpKind::Neg, 222_333_444, -222_333_444, true),
+                (UnaryOpKind::Invert, 222_333_444, -222_333_445, true),
+                (UnaryOpKind::Not, 0, 1, false),
+                (UnaryOpKind::Truth, 0, 0, false),
+            ] {
+                let function = with_single_test_block(
+                    test_function(),
+                    vec![],
+                    ret_term(op_expr(UnaryOp::new(
+                        kind,
+                        name_expr(test_constant_name(0)),
+                    ))),
+                );
+                let function_id = function.function_id;
+                let block = function.entry_block().label;
+                let operand = unsafe { ffi::PyLong_FromLong(input) };
+                assert!(
+                    !operand.is_null(),
+                    "test unary operand PyLong allocation should succeed"
+                );
+                let table = RuntimeJitDeoptTable {
+                    function_id,
+                    function: Box::new(function),
+                    module_constant_ptrs: vec![operand.cast()],
+                    points: vec![RuntimeJitDeoptRecord {
+                        id: PlannedJitDeoptPointId {
+                            function_id,
+                            ordinal: 0,
+                        },
+                        resume_point: LocalEnvResumePoint::BeforeTerm { function_id, block },
+                        precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                        locals: vec![],
+                        continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
+                            cursor: RuntimeJitDeoptCursor::at_block_entry(block),
+                        },
+                    }],
+                };
+                let before_operand = unsafe { ffi::Py_REFCNT(operand) };
+                let result = unsafe {
+                    crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                        std::ptr::addr_of!(table).cast_mut().cast(),
+                        std::ptr::null_mut(),
+                        0,
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                };
+                assert!(
+                    !result.is_null(),
+                    "return-unary deopt should produce a value for {kind:?}"
+                );
+                assert!(
+                    unsafe { ffi::PyErr_Occurred() }.is_null(),
+                    "successful return-unary deopt should not leave a Python exception for {kind:?}"
+                );
+                assert_eq!(
+                    unsafe { ffi::PyLong_AsLongLong(result.cast::<ffi::PyObject>()) },
+                    expected,
+                    "return-unary deopt should execute {kind:?}"
+                );
+                unsafe {
+                    ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+                }
+                if check_refcount {
+                    assert_eq!(
+                        unsafe { ffi::Py_REFCNT(operand) },
+                        before_operand,
+                        "operand module constant should not leak after releasing unary result for {kind:?}"
+                    );
+                }
+                unsafe {
+                    ffi::Py_DECREF(operand);
+                }
             }
         });
     }

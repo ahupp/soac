@@ -5,7 +5,7 @@ use super::{
 use crate::module_constants::load_runtime_name_owned;
 use pyo3::ffi;
 use soac_blockpy::block_py::{
-    BinOp, BinOpKind, BlockTerm, InstrCodegen, LocalLocation, NameLocation,
+    BinOp, BinOpKind, BlockTerm, InstrCodegen, LocalLocation, NameLocation, UnaryOp, UnaryOpKind,
 };
 use std::ffi::c_void;
 use std::ptr;
@@ -144,6 +144,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
                 self.execute_load_owned(load.name.id.as_str(), load.name.location)
             },
             InstrCodegen::BinOp(binop) => unsafe { self.execute_binop_owned(binop) },
+            InstrCodegen::UnaryOp(unary) => unsafe { self.execute_unary_op_owned(unary) },
             InstrCodegen::Store(store) => unsafe { self.execute_store_owned(store) },
             InstrCodegen::Del(del) => unsafe { self.execute_del_owned(del) },
             _ => Err(format!(
@@ -172,6 +173,22 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
         unsafe {
             ffi::Py_DECREF(left.cast::<ffi::PyObject>());
             ffi::Py_DECREF(right.cast::<ffi::PyObject>());
+        }
+        Ok(result)
+    }
+
+    #[cold]
+    unsafe fn execute_unary_op_owned(
+        &mut self,
+        unary: &UnaryOp<InstrCodegen>,
+    ) -> Result<ObjPtr, String> {
+        let operand = unsafe { self.execute_expr_owned(&unary.operand)? };
+        if operand.is_null() {
+            return Ok(ptr::null_mut());
+        }
+        let result = unsafe { execute_unary_op_kind_owned(unary.kind, operand)? };
+        unsafe {
+            ffi::Py_DECREF(operand.cast::<ffi::PyObject>());
         }
         Ok(result)
     }
@@ -459,6 +476,35 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             self.locals.release_frame_owned_values();
         }
     }
+}
+
+#[cold]
+unsafe fn execute_unary_op_kind_owned(
+    kind: UnaryOpKind,
+    operand: ObjPtr,
+) -> Result<ObjPtr, String> {
+    let operand = operand.cast::<ffi::PyObject>();
+    let result = unsafe {
+        match kind {
+            UnaryOpKind::Pos => ffi::PyNumber_Positive(operand),
+            UnaryOpKind::Neg => ffi::PyNumber_Negative(operand),
+            UnaryOpKind::Invert => ffi::PyNumber_Invert(operand),
+            UnaryOpKind::Not | UnaryOpKind::Truth => {
+                let truth = ffi::PyObject_IsTrue(operand);
+                if truth < 0 {
+                    ptr::null_mut()
+                } else {
+                    let bool_value = if kind == UnaryOpKind::Not {
+                        truth == 0
+                    } else {
+                        truth != 0
+                    };
+                    ffi::PyBool_FromLong(bool_value as libc::c_long)
+                }
+            }
+        }
+    };
+    Ok(result.cast())
 }
 
 #[cold]
