@@ -53,6 +53,52 @@ pub(super) trait OperationEmitState<'fb, E> {
         panic!("this operation emitter cannot materialize JIT deopt live values")
     }
 
+    fn emit_guard_miss_deopt_resume_return(
+        &mut self,
+        block: ir::Block,
+        fallback_counter_id: Option<CounterId>,
+        arg_values: &[(ir::Value, bool)],
+        target: JitDeoptExitRef,
+        deopt_resume_ref: ir::FuncRef,
+    ) where
+        Self: Sized,
+    {
+        self.fb().switch_to_block(block);
+        self.fb().set_cold_block(block);
+        increment_counter_with_state(self, fallback_counter_id);
+        self.release_arg_values(arg_values);
+        let deopt_result = self.emit_deopt_resume_result(target, deopt_resume_ref);
+        self.emit_deopt_result_return_or_step_null(deopt_result);
+    }
+
+    fn emit_deopt_result_return_or_step_null(&mut self, deopt_result: ir::Value)
+    where
+        Self: Sized,
+    {
+        let ptr_ty = self.ctx().consts.ptr_ty;
+        let null_ptr = self.fb().ins().iconst(ptr_ty, 0);
+        let deopt_result_is_null =
+            self.fb()
+                .ins()
+                .icmp(ir::condcodes::IntCC::Equal, deopt_result, null_ptr);
+        let deopt_success_block = self.fb().create_block();
+        self.fb().append_block_param(deopt_success_block, ptr_ty);
+        self.fb().set_cold_block(deopt_success_block);
+        let step_null_block = self.ctx().consts.step_null_block;
+        let step_null_args = super::step_null_block_args(self.ctx());
+        self.fb().ins().brif(
+            deopt_result_is_null,
+            step_null_block,
+            &step_null_args,
+            deopt_success_block,
+            &[ir::BlockArg::Value(deopt_result)],
+        );
+
+        self.fb().switch_to_block(deopt_success_block);
+        let resumed_result = self.fb().block_params(deopt_success_block)[0];
+        self.fb().ins().return_(&[resumed_result]);
+    }
+
     fn emit_owned_string_constant(&mut self, value: &str) -> ir::Value {
         let constant_id = self
             .ctx()
@@ -566,32 +612,13 @@ fn emit_specialized_getattr<'fb>(
             target,
             deopt_resume_ref,
         } => {
-            state.fb().switch_to_block(block);
-            state.fb().set_cold_block(block);
-            increment_counter_with_state(state, fallback_counter_id);
-            state.release_arg_values(&arg_values);
-            let deopt_result = state.emit_deopt_resume_result(target, deopt_resume_ref);
-            let deopt_result_is_null =
-                state
-                    .fb()
-                    .ins()
-                    .icmp(ir::condcodes::IntCC::Equal, deopt_result, null_ptr);
-            let deopt_success_block = state.fb().create_block();
-            state.fb().append_block_param(deopt_success_block, ptr_ty);
-            state.fb().set_cold_block(deopt_success_block);
-            let step_null_block = state.ctx().consts.step_null_block;
-            let step_null_args = super::step_null_block_args(state.ctx());
-            state.fb().ins().brif(
-                deopt_result_is_null,
-                step_null_block,
-                &step_null_args,
-                deopt_success_block,
-                &[ir::BlockArg::Value(deopt_result)],
+            state.emit_guard_miss_deopt_resume_return(
+                block,
+                fallback_counter_id,
+                &arg_values,
+                target,
+                deopt_resume_ref,
             );
-
-            state.fb().switch_to_block(deopt_success_block);
-            let resumed_result = state.fb().block_params(deopt_success_block)[0];
-            state.fb().ins().return_(&[resumed_result]);
         }
     }
 
@@ -748,33 +775,13 @@ fn emit_specialized_setattr<'fb>(
             target,
             deopt_resume_ref,
         } => {
-            state.fb().switch_to_block(block);
-            state.fb().set_cold_block(block);
-            increment_counter_with_state(state, fallback_counter_id);
-            state.release_arg_values(&arg_values);
-            let deopt_result = state.emit_deopt_resume_result(target, deopt_resume_ref);
-            let null_ptr = state.fb().ins().iconst(ptr_ty, 0);
-            let deopt_result_is_null =
-                state
-                    .fb()
-                    .ins()
-                    .icmp(ir::condcodes::IntCC::Equal, deopt_result, null_ptr);
-            let deopt_success_block = state.fb().create_block();
-            state.fb().append_block_param(deopt_success_block, ptr_ty);
-            state.fb().set_cold_block(deopt_success_block);
-            let step_null_block = state.ctx().consts.step_null_block;
-            let step_null_args = super::step_null_block_args(state.ctx());
-            state.fb().ins().brif(
-                deopt_result_is_null,
-                step_null_block,
-                &step_null_args,
-                deopt_success_block,
-                &[ir::BlockArg::Value(deopt_result)],
+            state.emit_guard_miss_deopt_resume_return(
+                block,
+                fallback_counter_id,
+                &arg_values,
+                target,
+                deopt_resume_ref,
             );
-
-            state.fb().switch_to_block(deopt_success_block);
-            let resumed_result = state.fb().block_params(deopt_success_block)[0];
-            state.fb().ins().return_(&[resumed_result]);
         }
     }
 
@@ -1257,33 +1264,13 @@ fn emit_specialized_binop<'fb>(
             target,
             deopt_resume_ref,
         } => {
-            state.fb().switch_to_block(block);
-            state.fb().set_cold_block(block);
-            increment_counter_with_state(state, specialized_fallback_counter_id);
-            state.release_arg_values(&arg_values);
-            let deopt_result = state.emit_deopt_resume_result(target, deopt_resume_ref);
-            let null_ptr = state.fb().ins().iconst(ptr_ty, 0);
-            let deopt_result_is_null =
-                state
-                    .fb()
-                    .ins()
-                    .icmp(ir::condcodes::IntCC::Equal, deopt_result, null_ptr);
-            let deopt_success_block = state.fb().create_block();
-            state.fb().append_block_param(deopt_success_block, ptr_ty);
-            state.fb().set_cold_block(deopt_success_block);
-            let step_null_block = state.ctx().consts.step_null_block;
-            let step_null_args = super::step_null_block_args(state.ctx());
-            state.fb().ins().brif(
-                deopt_result_is_null,
-                step_null_block,
-                &step_null_args,
-                deopt_success_block,
-                &[ir::BlockArg::Value(deopt_result)],
+            state.emit_guard_miss_deopt_resume_return(
+                block,
+                specialized_fallback_counter_id,
+                &arg_values,
+                target,
+                deopt_resume_ref,
             );
-
-            state.fb().switch_to_block(deopt_success_block);
-            let resumed_result = state.fb().block_params(deopt_success_block)[0];
-            state.fb().ins().return_(&[resumed_result]);
         }
     }
 
@@ -1415,33 +1402,13 @@ fn emit_specialized_unary_op<'fb>(
             target,
             deopt_resume_ref,
         } => {
-            state.fb().switch_to_block(block);
-            state.fb().set_cold_block(block);
-            increment_counter_with_state(state, specialized_fallback_counter_id);
-            state.release_arg_values(&arg_values);
-            let deopt_result = state.emit_deopt_resume_result(target, deopt_resume_ref);
-            let null_ptr = state.fb().ins().iconst(ptr_ty, 0);
-            let deopt_result_is_null =
-                state
-                    .fb()
-                    .ins()
-                    .icmp(ir::condcodes::IntCC::Equal, deopt_result, null_ptr);
-            let deopt_success_block = state.fb().create_block();
-            state.fb().append_block_param(deopt_success_block, ptr_ty);
-            state.fb().set_cold_block(deopt_success_block);
-            let step_null_block = state.ctx().consts.step_null_block;
-            let step_null_args = super::step_null_block_args(state.ctx());
-            state.fb().ins().brif(
-                deopt_result_is_null,
-                step_null_block,
-                &step_null_args,
-                deopt_success_block,
-                &[ir::BlockArg::Value(deopt_result)],
+            state.emit_guard_miss_deopt_resume_return(
+                block,
+                specialized_fallback_counter_id,
+                &arg_values,
+                target,
+                deopt_resume_ref,
             );
-
-            state.fb().switch_to_block(deopt_success_block);
-            let resumed_result = state.fb().block_params(deopt_success_block)[0];
-            state.fb().ins().return_(&[resumed_result]);
         }
     }
 
@@ -1753,27 +1720,7 @@ fn emit_store<'fb>(
                     .fb()
                     .ins()
                     .call(decref_ref, &[thread_state_value, name_obj]);
-                let deopt_result_is_null =
-                    state
-                        .fb()
-                        .ins()
-                        .icmp(ir::condcodes::IntCC::Equal, deopt_result, null_ptr);
-                let deopt_success_block = state.fb().create_block();
-                state.fb().append_block_param(deopt_success_block, ptr_ty);
-                state.fb().set_cold_block(deopt_success_block);
-                let step_null_block = state.ctx().consts.step_null_block;
-                let step_null_args = super::step_null_block_args(state.ctx());
-                state.fb().ins().brif(
-                    deopt_result_is_null,
-                    step_null_block,
-                    &step_null_args,
-                    deopt_success_block,
-                    &[ir::BlockArg::Value(deopt_result)],
-                );
-
-                state.fb().switch_to_block(deopt_success_block);
-                let resumed_result = state.fb().block_params(deopt_success_block)[0];
-                state.fb().ins().return_(&[resumed_result]);
+                state.emit_deopt_result_return_or_step_null(deopt_result);
             }
         }
 
