@@ -2003,7 +2003,7 @@ fn runtime_jit_deopt_call_parts_supported(
         })
         && keywords.iter().all(|keyword| match keyword {
             CallArgKeyword::Named { value, .. } => runtime_jit_deopt_expr_supported(value),
-            CallArgKeyword::Starred(_) => false,
+            CallArgKeyword::Starred(value) => runtime_jit_deopt_expr_supported(value),
         })
 }
 

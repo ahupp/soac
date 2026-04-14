@@ -5211,6 +5211,45 @@ def f(x):
     }
 
     #[test]
+    fn runtime_deopt_table_marks_return_starred_keyword_call_before_term_continuation() {
+        let function = with_single_test_block(
+            test_function(),
+            vec![],
+            ret_term(op_expr(Call::new(
+                name_expr(test_constant_name(0)),
+                Vec::<CallArgPositional<InstrCodegen>>::new(),
+                vec![CallArgKeyword::Starred(name_expr(test_constant_name(1)))],
+            ))),
+        );
+        let module = test_module(ModuleNameGen::new(0), vec![function]);
+        let function = &module.callable_defs[0];
+        let facts = infer_module_value_facts(&module);
+        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+            .expect("JIT deopt resume planning should succeed");
+        let function_plan = module_plan
+            .function(function.function_id)
+            .expect("function should have a JIT deopt plan");
+        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
+            .expect("runtime deopt table should build from plan");
+        let point = LocalEnvResumePoint::BeforeTerm {
+            function_id: function.function_id,
+            block: function.entry_block().label,
+        };
+        let record = table
+            .record_for_point(point)
+            .expect("before-term return-starred-keyword-call point should have a runtime record");
+        assert_eq!(
+            record.continuation(),
+            &RuntimeJitDeoptContinuation::ResumeBlockTail {
+                cursor: RuntimeJitDeoptCursor::new(
+                    function.entry_block().label,
+                    function.entry_block().body.len(),
+                ),
+            }
+        );
+    }
+
+    #[test]
     fn runtime_deopt_table_marks_raise_before_term_continuation() {
         let function = with_single_test_block(
             test_function(),
@@ -7097,6 +7136,207 @@ def g():
             );
             unsafe {
                 ffi::Py_DECREF(value);
+                ffi::Py_DECREF(dict_callable);
+            }
+        });
+    }
+
+    #[test]
+    fn deopt_block_tail_continuation_executes_return_starred_keyword_call() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|_| {
+            let function = with_single_test_block(
+                test_function(),
+                vec![],
+                ret_term(op_expr(Call::new(
+                    name_expr(test_constant_name(0)),
+                    Vec::<CallArgPositional<InstrCodegen>>::new(),
+                    vec![CallArgKeyword::Starred(name_expr(test_constant_name(1)))],
+                ))),
+            );
+            let function_id = function.function_id;
+            let block = function.entry_block().label;
+            let dict_callable = std::ptr::addr_of_mut!(ffi::PyDict_Type).cast::<ffi::PyObject>();
+            unsafe {
+                ffi::Py_INCREF(dict_callable);
+            }
+            let kwargs = unsafe { ffi::PyDict_New() };
+            assert!(!kwargs.is_null(), "test kwargs allocation should succeed");
+            let key = unsafe { ffi::PyUnicode_FromString(c"x".as_ptr()) };
+            assert!(!key.is_null(), "test keyword key allocation should succeed");
+            let value = unsafe { ffi::PyLong_FromLong(123_456_789) };
+            assert!(
+                !value.is_null(),
+                "test keyword value allocation should succeed"
+            );
+            assert_eq!(
+                unsafe { ffi::PyDict_SetItem(kwargs, key, value) },
+                0,
+                "test kwargs dict should accept the keyword"
+            );
+            unsafe {
+                ffi::Py_DECREF(key);
+                ffi::Py_DECREF(value);
+            }
+            let table = RuntimeJitDeoptTable {
+                function_id,
+                function: Box::new(function),
+                module_constant_ptrs: vec![dict_callable.cast(), kwargs.cast()],
+                points: vec![RuntimeJitDeoptRecord {
+                    id: PlannedJitDeoptPointId {
+                        function_id,
+                        ordinal: 0,
+                    },
+                    resume_point: LocalEnvResumePoint::BeforeTerm { function_id, block },
+                    precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                    locals: vec![],
+                    continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
+                        cursor: RuntimeJitDeoptCursor::at_block_entry(block),
+                    },
+                }],
+            };
+            let before_kwargs = unsafe { ffi::Py_REFCNT(kwargs) };
+            let result = unsafe {
+                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                    std::ptr::addr_of!(table).cast_mut().cast(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert!(
+                !result.is_null(),
+                "return-starred-keyword-call deopt should produce a value"
+            );
+            assert!(
+                unsafe { ffi::PyErr_Occurred() }.is_null(),
+                "successful return-starred-keyword-call deopt should not leave a Python exception"
+            );
+            assert_ne!(
+                unsafe { ffi::PyDict_Check(result.cast::<ffi::PyObject>()) },
+                0,
+                "return-starred-keyword-call deopt should call dict with kwargs"
+            );
+            let lookup_key = unsafe { ffi::PyUnicode_FromString(c"x".as_ptr()) };
+            assert!(
+                !lookup_key.is_null(),
+                "test keyword lookup key allocation should succeed"
+            );
+            let stored =
+                unsafe { ffi::PyDict_GetItemWithError(result.cast::<ffi::PyObject>(), lookup_key) };
+            assert!(
+                !stored.is_null(),
+                "return-starred-keyword-call deopt should store the unpacked keyword"
+            );
+            assert_eq!(
+                unsafe { ffi::PyLong_AsLongLong(stored) },
+                123_456_789,
+                "return-starred-keyword-call deopt should preserve the unpacked value"
+            );
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(kwargs) },
+                before_kwargs,
+                "starred kwargs module constant should not leak through call execution"
+            );
+            unsafe {
+                ffi::Py_DECREF(lookup_key);
+                ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+                ffi::Py_DECREF(kwargs);
+                ffi::Py_DECREF(dict_callable);
+            }
+        });
+    }
+
+    #[test]
+    fn deopt_block_tail_continuation_rejects_duplicate_starred_keyword_call() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|_| {
+            let function = with_single_test_block(
+                test_function(),
+                vec![],
+                ret_term(op_expr(Call::new(
+                    name_expr(test_constant_name(0)),
+                    Vec::<CallArgPositional<InstrCodegen>>::new(),
+                    vec![
+                        CallArgKeyword::Starred(name_expr(test_constant_name(1))),
+                        CallArgKeyword::Named {
+                            arg: "x".into(),
+                            value: name_expr(test_constant_name(2)),
+                        },
+                    ],
+                ))),
+            );
+            let function_id = function.function_id;
+            let block = function.entry_block().label;
+            let dict_callable = std::ptr::addr_of_mut!(ffi::PyDict_Type).cast::<ffi::PyObject>();
+            unsafe {
+                ffi::Py_INCREF(dict_callable);
+            }
+            let kwargs = unsafe { ffi::PyDict_New() };
+            assert!(!kwargs.is_null(), "test kwargs allocation should succeed");
+            let key = unsafe { ffi::PyUnicode_FromString(c"x".as_ptr()) };
+            assert!(!key.is_null(), "test keyword key allocation should succeed");
+            let first = unsafe { ffi::PyLong_FromLong(1) };
+            assert!(
+                !first.is_null(),
+                "test first keyword value allocation should succeed"
+            );
+            assert_eq!(
+                unsafe { ffi::PyDict_SetItem(kwargs, key, first) },
+                0,
+                "test kwargs dict should accept the first keyword"
+            );
+            unsafe {
+                ffi::Py_DECREF(key);
+                ffi::Py_DECREF(first);
+            }
+            let duplicate = unsafe { ffi::PyLong_FromLong(2) };
+            assert!(
+                !duplicate.is_null(),
+                "test duplicate keyword value allocation should succeed"
+            );
+            let table = RuntimeJitDeoptTable {
+                function_id,
+                function: Box::new(function),
+                module_constant_ptrs: vec![dict_callable.cast(), kwargs.cast(), duplicate.cast()],
+                points: vec![RuntimeJitDeoptRecord {
+                    id: PlannedJitDeoptPointId {
+                        function_id,
+                        ordinal: 0,
+                    },
+                    resume_point: LocalEnvResumePoint::BeforeTerm { function_id, block },
+                    precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                    locals: vec![],
+                    continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
+                        cursor: RuntimeJitDeoptCursor::at_block_entry(block),
+                    },
+                }],
+            };
+            let result = unsafe {
+                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                    std::ptr::addr_of!(table).cast_mut().cast(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert!(
+                result.is_null(),
+                "duplicate-starred-keyword-call deopt should signal a Python error"
+            );
+            assert_ne!(
+                unsafe { ffi::PyErr_ExceptionMatches(ffi::PyExc_TypeError) },
+                0,
+                "duplicate-starred-keyword-call deopt should raise TypeError"
+            );
+            unsafe {
+                ffi::PyErr_Clear();
+                ffi::Py_DECREF(duplicate);
+                ffi::Py_DECREF(kwargs);
                 ffi::Py_DECREF(dict_callable);
             }
         });
