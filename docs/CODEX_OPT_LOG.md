@@ -5,6 +5,28 @@ optimization attempts made by Codex agents. Keep entries succinct: what
 changed or was tried, which jj change id carried it when landed, the
 benchmarked throughput delta, and the headline pre/post numbers.
 
+# cpython
+
+## 2026-04-14 - Temporary no-refcount CPython pystone experiment
+
+- checkout: isolated in `vendor/cpython-norefcount`; original
+  `vendor/cpython` was restored and left clean
+- summary: Built an optimized/LTO vendored CPython variant with temporary
+  `SOAC_REFCOUNT_NOOP` patches that make normal refcount inc/dec paths no-op.
+  The experiment also needed no-refcount-only workarounds for ceval-local
+  decref macros, dict-key lifetime, frame ownership transfer, cyclic GC
+  collection, and a couple of sysconfig build-helper paths.
+- status: benchmark-usable linked interpreter, but not a clean `build_all`.
+  The remaining `build_all` failures are later helper crashes in
+  `generate-build-details.py` / `checksharedmods`; the Python-aware backtrace
+  for `generate-build-details.py` lands in frozen importlib while importing
+  `importlib.machinery`.
+- throughput: `+10.7%` pystone median using `python -E -S`
+- baseline `vendor/cpython`, 1M loops x3:
+  `583437`, `580613`, `578021 loops/s`
+- no-refcount `vendor/cpython-norefcount`, 1M loops x3:
+  `624041`, `642477`, `657865 loops/s`
+
 ## 2026-04-13 - Load module constants through per-slot symbols
 
 - jj change id: `oxkwxwwy`
