@@ -29,11 +29,12 @@ use soac_blockpy::block_py::{
     operation as blockpy_intrinsics,
 };
 use soac_blockpy::passes::{
-    CodegenModuleShape, FactStore, FunctionRefcountPlan, InstrResolved, InstrTyped, LocalRefState,
-    PyExactType, PyObjFacts, RefcountActionKind, RefcountReleaseReason, RefcountSite,
-    RuntimeHelperId, TypedCodegenModuleShape, ValueFacts, infer_module_value_facts,
-    lower_codegen_function_to_typed, lower_typed_function_if_tests_to_truthy,
-    try_lower_typed_instr_to_codegen_legacy, try_lower_typed_term_to_codegen_legacy,
+    CodegenModuleShape, FactStore, FunctionRefcountPlan, InstrResolved, InstrTyped,
+    LocalEnvResumePoint, LocalRefState, PyExactType, PyObjFacts, RefcountActionKind,
+    RefcountReleaseReason, RefcountSite, RuntimeHelperId, TypedCodegenModuleShape, ValueFacts,
+    infer_module_value_facts, lower_codegen_function_to_typed,
+    lower_typed_function_if_tests_to_truthy, try_lower_typed_instr_to_codegen_legacy,
+    try_lower_typed_term_to_codegen_legacy,
 };
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -2318,6 +2319,47 @@ impl JitEmitCtx<'_> {
     fn value_facts_for_expr(&self, expr: &InstrCodegen) -> Option<ValueFacts> {
         let instr_id = expr.try_semantic_instr_id()?;
         self.value_facts_for_instr_id(instr_id)
+    }
+
+    fn require_deopt_point(
+        &self,
+        point: LocalEnvResumePoint,
+    ) -> Result<&PlannedJitDeoptPoint, String> {
+        self.deopt_resume_plan.deopt_point(point).ok_or_else(|| {
+            format!(
+                "missing planned JIT deopt point {:?} for function {}",
+                point, self.function_id
+            )
+        })
+    }
+
+    fn require_deopt_point_at_block_entry(
+        &self,
+        block: BlockLabel,
+    ) -> Result<&PlannedJitDeoptPoint, String> {
+        self.require_deopt_point(LocalEnvResumePoint::BlockEntry {
+            function_id: self.function_id,
+            block,
+        })
+    }
+
+    fn require_deopt_point_before_instr_id(
+        &self,
+        instr_id: InstrId,
+    ) -> Result<&PlannedJitDeoptPoint, String> {
+        self.require_deopt_point(LocalEnvResumePoint::BeforeInstr {
+            key: InstrKey::new(self.function_id, instr_id),
+        })
+    }
+
+    fn require_deopt_point_before_term(
+        &self,
+        block: BlockLabel,
+    ) -> Result<&PlannedJitDeoptPoint, String> {
+        self.require_deopt_point(LocalEnvResumePoint::BeforeTerm {
+            function_id: self.function_id,
+            block,
+        })
     }
 
     fn with_step_null_target(
@@ -10815,6 +10857,9 @@ fn emit_typed_codegen_ops(
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<(), String> {
     for expr in ops {
+        if let Some(instr_id) = expr.try_semantic_instr_id() {
+            emit_ctx.require_deopt_point_before_instr_id(instr_id)?;
+        }
         let stmt_emit_ctx = local_failure_cleanup_emit_ctx(
             fb,
             emit_ctx,
@@ -14530,6 +14575,7 @@ fn build_cranelift_run_bb_specialized_function(
                     .deopt_points_for_block(codegen_block.label)
                     .all(|point| point.id.function_id == function.function_id)
             );
+            emit_ctx.require_deopt_point_at_block_entry(codegen_block.label)?;
             let _block_refcount_plan = emit_ctx.refcount_plan.block(codegen_block.label);
 
             emit_typed_codegen_ops(
@@ -14544,6 +14590,7 @@ fn build_cranelift_run_bb_specialized_function(
                 jit_module,
                 &mut func_imports,
             )?;
+            emit_ctx.require_deopt_point_before_term(codegen_block.label)?;
 
             let term_emit_ctx = local_failure_cleanup_emit_ctx(
                 &mut fb,
