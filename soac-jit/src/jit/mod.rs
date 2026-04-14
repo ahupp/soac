@@ -2050,10 +2050,12 @@ fn runtime_jit_deopt_binop_supported(kind: blockpy_intrinsics::BinOpKind) -> boo
 fn runtime_jit_deopt_term_supported(term: &BlockTerm<InstrCodegen>) -> bool {
     match term {
         BlockTerm::Return(value) => runtime_jit_deopt_expr_supported(value),
-        BlockTerm::Jump(edge) => edge
-            .args
-            .iter()
-            .all(|arg| matches!(arg, BlockArg::Name(_) | BlockArg::None)),
+        BlockTerm::Jump(edge) => edge.args.iter().all(|arg| {
+            matches!(
+                arg,
+                BlockArg::Name(_) | BlockArg::None | BlockArg::AbruptKind(_)
+            )
+        }),
         BlockTerm::IfTerm(if_term) => runtime_jit_deopt_expr_supported(&if_term.test),
         BlockTerm::BranchTable(branch) => runtime_jit_deopt_expr_supported(&branch.index),
         BlockTerm::Raise(raise) => raise

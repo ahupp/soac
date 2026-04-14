@@ -1,7 +1,7 @@
 use super::*;
 use soac_blockpy::block_py::{
-    BinOp, BinOpKind, BlockArg, BlockEdge, BlockLabel, BlockParam, BlockParamRole, BlockPyFunction,
-    BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional, CallDirect,
+    AbruptKind, BinOp, BinOpKind, BlockArg, BlockEdge, BlockLabel, BlockParam, BlockParamRole,
+    BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional, CallDirect,
     CalleeFunctionId, CellLocation, ChildVisitable, ClosureInit, ClosureSlot, CodegenBlock,
     CounterDef, CounterSite, Del, DelItem, FunctionId, FunctionName, GetAttr, GetItem, HasMeta,
     HasSemanticInstrId, InstrCodegen, InstrResolved, Literal, LiteralValue, Load, LocalLocation,
@@ -5412,6 +5412,54 @@ def f(x):
     }
 
     #[test]
+    fn runtime_deopt_table_marks_abrupt_kind_jump_args_before_term_continuation() {
+        let function = test_function();
+        let mut target = test_source_block(
+            &function,
+            vec![],
+            ret_term(name_expr(test_local_name("kind", 0))),
+        );
+        target.params = vec![BlockParam {
+            name: "kind".to_string(),
+            role: BlockParamRole::AbruptKind,
+        }];
+        let entry = test_source_block(
+            &function,
+            vec![],
+            BlockTerm::Jump(BlockEdge::with_args(
+                target.label,
+                vec![BlockArg::AbruptKind(AbruptKind::Exception)],
+            )),
+        );
+        let module = test_module(
+            ModuleNameGen::new(0),
+            vec![with_test_blocks(function, vec![entry.clone(), target])],
+        );
+        let function = &module.callable_defs[0];
+        let facts = infer_module_value_facts(&module);
+        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+            .expect("JIT deopt resume planning should succeed");
+        let function_plan = module_plan
+            .function(function.function_id)
+            .expect("function should have a JIT deopt plan");
+        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
+            .expect("runtime deopt table should build from plan");
+        let point = LocalEnvResumePoint::BeforeTerm {
+            function_id: function.function_id,
+            block: entry.label,
+        };
+        let record = table
+            .record_for_point(point)
+            .expect("before-term abrupt-kind jump-arg point should have a runtime record");
+        assert_eq!(
+            record.continuation(),
+            &RuntimeJitDeoptContinuation::ResumeBlockTail {
+                cursor: RuntimeJitDeoptCursor::new(entry.label, entry.body.len()),
+            }
+        );
+    }
+
+    #[test]
     fn runtime_deopt_table_marks_if_before_term_continuation() {
         let function = test_function();
         let then_block = test_source_block(&function, vec![], ret_term(none_expr()));
@@ -6100,6 +6148,104 @@ def f(x):
             unsafe {
                 ffi::Py_DECREF(result.cast::<ffi::PyObject>());
                 ffi::Py_DECREF(old_y_value);
+            }
+        });
+    }
+
+    #[test]
+    fn deopt_block_tail_continuation_applies_abrupt_kind_jump_arg() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|_| {
+            let kind_location = LocalLocation(0);
+            let function = test_function();
+            let mut target = test_source_block(
+                &function,
+                vec![],
+                ret_term(name_expr(test_local_name("kind", kind_location.slot()))),
+            );
+            target.params = vec![BlockParam {
+                name: "kind".to_string(),
+                role: BlockParamRole::AbruptKind,
+            }];
+            let entry = test_source_block(
+                &function,
+                vec![],
+                BlockTerm::Jump(BlockEdge::with_args(
+                    target.label,
+                    vec![BlockArg::AbruptKind(AbruptKind::Return)],
+                )),
+            );
+            let function = with_test_blocks(function, vec![entry.clone(), target]);
+            let function_id = function.function_id;
+            let kind_binding = LocalEnvResumeBinding {
+                name: "kind".to_string(),
+                location: kind_location,
+                binding: LocalEnvResumeBindingState::Bound,
+                source: LocalEnvResumeValueSource::BlockParam(kind_location),
+                ownership: LocalRefKind::Owned,
+                value: None,
+            };
+            let table = RuntimeJitDeoptTable {
+                function_id,
+                function: Box::new(function),
+                module_constant_ptrs: Vec::new(),
+                points: vec![RuntimeJitDeoptRecord {
+                    id: PlannedJitDeoptPointId {
+                        function_id,
+                        ordinal: 0,
+                    },
+                    resume_point: LocalEnvResumePoint::BeforeTerm {
+                        function_id,
+                        block: entry.label,
+                    },
+                    precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                    locals: vec![kind_binding],
+                    continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
+                        cursor: RuntimeJitDeoptCursor::new(entry.label, entry.body.len()),
+                    },
+                }],
+            };
+            let old_kind_value = unsafe { ffi::PyLong_FromLong(987_654_321) };
+            assert!(
+                !old_kind_value.is_null(),
+                "test old abrupt-kind allocation should succeed"
+            );
+            let before_old_kind = unsafe { ffi::Py_REFCNT(old_kind_value) };
+            unsafe {
+                ffi::Py_INCREF(old_kind_value);
+            }
+            let mut live_values = vec![old_kind_value.cast::<c_void>()];
+            let result = unsafe {
+                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                    std::ptr::addr_of!(table).cast_mut().cast(),
+                    std::ptr::null_mut(),
+                    0,
+                    live_values.as_mut_ptr().cast(),
+                    live_values.len() as i64,
+                )
+            };
+            assert!(
+                !result.is_null(),
+                "jump abrupt-kind arg should produce a Python int"
+            );
+            assert!(
+                unsafe { ffi::PyErr_Occurred() }.is_null(),
+                "successful abrupt-kind jump-arg deopt continuation should not leave a Python exception"
+            );
+            assert_eq!(
+                unsafe { ffi::PyLong_AsLongLong(result.cast::<ffi::PyObject>()) },
+                abrupt_kind_tag(AbruptKind::Return),
+                "jump abrupt-kind arg should bind the target param to its integer tag"
+            );
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(old_kind_value) },
+                before_old_kind,
+                "jump abrupt-kind arg should release the replaced frame-owned local"
+            );
+            unsafe {
+                ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+                ffi::Py_DECREF(old_kind_value);
             }
         });
     }

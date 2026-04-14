@@ -5,8 +5,9 @@ use super::{
 use crate::module_constants::load_runtime_name_owned;
 use pyo3::ffi;
 use soac_blockpy::block_py::{
-    BinOp, BinOpKind, BlockArg, BlockEdge, BlockTerm, CallArgKeyword, CallArgPositional,
-    CalleeFunctionId, InstrCodegen, LocalLocation, NameLocation, UnaryOp, UnaryOpKind,
+    AbruptKind, BinOp, BinOpKind, BlockArg, BlockEdge, BlockTerm, CallArgKeyword,
+    CallArgPositional, CalleeFunctionId, InstrCodegen, LocalLocation, NameLocation, UnaryOp,
+    UnaryOpKind,
 };
 use std::ffi::{c_int, c_void};
 use std::ptr;
@@ -188,7 +189,8 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             let value = match arg {
                 BlockArg::Name(name) => unsafe { self.execute_block_arg_name_owned(name)? },
                 BlockArg::None => owned_none(),
-                BlockArg::CurrentException | BlockArg::AbruptKind(_) => {
+                BlockArg::AbruptKind(kind) => unsafe { execute_abrupt_kind_arg_owned(*kind) },
+                BlockArg::CurrentException => {
                     unsafe {
                         release_owned_values(values);
                     }
@@ -1060,6 +1062,10 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             self.locals.release_frame_owned_values();
         }
     }
+}
+
+unsafe fn execute_abrupt_kind_arg_owned(kind: AbruptKind) -> ObjPtr {
+    unsafe { ffi::PyLong_FromLongLong(super::abrupt_kind_tag(kind)).cast() }
 }
 
 fn owned_none() -> ObjPtr {
