@@ -5,6 +5,60 @@ optimization attempts made by Codex agents. Keep entries succinct: what
 changed or was tried, which jj change id carried it when landed, the
 benchmarked throughput delta, and the headline pre/post numbers.
 
+# Journal of Negative Results
+
+## 2026-04-14 - Not landed: exact narrow scalar counters with cold overflow
+
+- jj change id: not landed (`pwvwzkwq` while testing)
+- summary: Tried shrinking hot scalar counter slots from `u64` to `u16`
+  while preserving exact dump totals through a cold overflow helper and
+  side `u64` overflow array. Counter dumps and specialization summaries
+  were byte-for-byte identical to baseline, and JIT code size did not
+  change. The smaller hot slots did not offset the added wrap check and
+  overflow plumbing, especially in countered modes.
+- profile throughput: `-5.48%`
+- verify throughput: `-9.15%`
+- apply throughput: `+0.78%` median with refcounts enabled, likely noise
+- baseline benchmark:
+  - profile: `234169 loops/s`
+  - verify: `197711 loops/s`
+  - apply, refcounts enabled, 1M loops x3: `438585`, `442082`,
+    `437448 loops/s`
+- attempted benchmark:
+  - profile: `221332 loops/s`
+  - verify: `179615 loops/s`
+  - apply, refcounts enabled, 1M loops x3: `442001`, `440594`,
+    `444028 loops/s`
+
+## 2026-04-14 - Not landed: u32 scalar counters with cold overflow
+
+- jj change id: not landed (`pwvwzkwq` while testing)
+- summary: Retried the narrow-counter experiment with `u32` hot slots to
+  avoid practical overflow traffic while halving the hot counter array
+  footprint relative to `u64`. Counter dumps, verify dumps, and
+  specialization summaries again matched baseline exactly, and JIT code
+  size was unchanged. The profile and verify passes still regressed,
+  indicating that the hot increment sequence and extra branch dominate
+  over any cache-footprint benefit for pystone.
+- profile throughput: `-3.51%`
+- verify throughput: `-15.96%`
+- apply throughput: `+1.58%` median with refcounts enabled, likely noise
+- baseline benchmark:
+  - profile: `234277 loops/s`
+  - verify: `207845 loops/s`
+  - apply, refcounts enabled, 1M loops x3: `438998`, `430012`,
+    `432882 loops/s`
+- attempted benchmark:
+  - profile: `226048 loops/s`
+  - verify: `174680 loops/s`
+  - apply, refcounts enabled, 1M loops x3: `439727`, `439593`,
+    `442380 loops/s`
+- storage note: the on-disk `profile.bin` and `verify.bin` counter dumps
+  stayed unchanged at `3,204,400 bytes` combined because dump rows store
+  reported `u64` totals and metadata. The full benchmark `counters/`
+  directory was about `17 MiB`, dominated by `jit-bb-map.jsonl` and
+  `jit-*.dump` artifacts rather than scalar counter values.
+
 # cpython
 
 ## 2026-04-14 - Temporary no-refcount CPython pystone experiment
