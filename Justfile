@@ -94,8 +94,11 @@ ensure-venv:
   fi
 
 [private]
-uninstall-extension: ensure-venv
+uninstall-extension:
   #!/usr/bin/env bash
+  if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+    exit 0
+  fi
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
   SITE_PACKAGES="$("$VENV_DIR/bin/python" -c 'import sysconfig; print(sysconfig.get_path("platlib"))')"
   if [[ -d "$SITE_PACKAGES" ]]; then
