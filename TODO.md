@@ -9,6 +9,7 @@
  * Simplify class-cell capture by unconditionally treating `super()` as capturing `__class__`.
  * Consider moving `LocalEnvEntry` construction into a name-binding-like BlockPy pass so local ownership/storage entries are decided before JIT codegen.
  * Treat `exec` as a keyword explicitly instead of handling it as a runtime helper name.
+ * Consolidate the bootstrap module in `build_soac_runtime_bootstrap_module` with `runtime.py`.
  * Replace the function-instantiation fallback for `co_freevars`/capture mismatches with a cleaner explicit closure entry/code-object alignment.
  * Track slow CPython fast-suite cases that pass with longer timeouts, including `test_dataclasses` and `test_bytes -m test_count`.
 
