@@ -561,10 +561,12 @@ apply/verify mode:
 
 - Comparison specialization also goes through
   `emit_specialized_binop`, at
-  `soac-jit/src/jit/intrinsics.rs:714`.
+  `soac-jit/src/jit/intrinsics.rs`.
 - If the profiled shape is exact `int`/`int`, comparisons such as
   `Eq`, `Ne`, `Lt`, `Le`, `Gt`, and `Ge` use the direct exact-int
   helper path instead of generic `PyObject_RichCompare` lowering.
+- On guard miss, comparison specialization uses the same deopt-or-fallback
+  behavior as exact-int binary operators.
 
 ### Limitations / Soundness / Extensions
 
@@ -572,7 +574,8 @@ apply/verify mode:
   - only exact `int`/`int`
   - no string/bytes/tuple/list comparison specialization
 - Soundness boundary:
-  - exact-shape guarded, otherwise generic fallback
+  - exact-shape guarded, otherwise deopt to the generic continuation or
+    generic fallback
 - Natural extensions:
   - exact `str` comparisons
   - exact `float` comparisons
