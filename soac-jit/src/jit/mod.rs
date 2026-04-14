@@ -1625,8 +1625,53 @@ fn runtime_jit_deopt_continuation_for_point(
 fn runtime_jit_deopt_expr_supported(expr: &InstrCodegen) -> bool {
     match expr {
         InstrCodegen::Load(load) => !matches!(load.name.location, NameLocation::Cell(_)),
+        InstrCodegen::BinOp(binop) => {
+            runtime_jit_deopt_binop_supported(binop.kind)
+                && runtime_jit_deopt_expr_supported(&binop.left)
+                && runtime_jit_deopt_expr_supported(&binop.right)
+        }
         _ => false,
     }
+}
+
+fn runtime_jit_deopt_binop_supported(kind: blockpy_intrinsics::BinOpKind) -> bool {
+    matches!(
+        kind,
+        blockpy_intrinsics::BinOpKind::Add
+            | blockpy_intrinsics::BinOpKind::Sub
+            | blockpy_intrinsics::BinOpKind::Mul
+            | blockpy_intrinsics::BinOpKind::MatMul
+            | blockpy_intrinsics::BinOpKind::TrueDiv
+            | blockpy_intrinsics::BinOpKind::FloorDiv
+            | blockpy_intrinsics::BinOpKind::Mod
+            | blockpy_intrinsics::BinOpKind::Pow
+            | blockpy_intrinsics::BinOpKind::LShift
+            | blockpy_intrinsics::BinOpKind::RShift
+            | blockpy_intrinsics::BinOpKind::Or
+            | blockpy_intrinsics::BinOpKind::Xor
+            | blockpy_intrinsics::BinOpKind::And
+            | blockpy_intrinsics::BinOpKind::Eq
+            | blockpy_intrinsics::BinOpKind::Ne
+            | blockpy_intrinsics::BinOpKind::Lt
+            | blockpy_intrinsics::BinOpKind::Le
+            | blockpy_intrinsics::BinOpKind::Gt
+            | blockpy_intrinsics::BinOpKind::Ge
+            | blockpy_intrinsics::BinOpKind::Contains
+            | blockpy_intrinsics::BinOpKind::Is
+            | blockpy_intrinsics::BinOpKind::InplaceAdd
+            | blockpy_intrinsics::BinOpKind::InplaceSub
+            | blockpy_intrinsics::BinOpKind::InplaceMul
+            | blockpy_intrinsics::BinOpKind::InplaceMatMul
+            | blockpy_intrinsics::BinOpKind::InplaceTrueDiv
+            | blockpy_intrinsics::BinOpKind::InplaceFloorDiv
+            | blockpy_intrinsics::BinOpKind::InplaceMod
+            | blockpy_intrinsics::BinOpKind::InplacePow
+            | blockpy_intrinsics::BinOpKind::InplaceLShift
+            | blockpy_intrinsics::BinOpKind::InplaceRShift
+            | blockpy_intrinsics::BinOpKind::InplaceOr
+            | blockpy_intrinsics::BinOpKind::InplaceXor
+            | blockpy_intrinsics::BinOpKind::InplaceAnd
+    )
 }
 
 fn runtime_jit_deopt_term_supported(term: &BlockTerm<InstrCodegen>) -> bool {

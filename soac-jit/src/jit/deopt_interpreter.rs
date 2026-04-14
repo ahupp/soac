@@ -4,7 +4,9 @@ use super::{
 };
 use crate::module_constants::load_runtime_name_owned;
 use pyo3::ffi;
-use soac_blockpy::block_py::{BlockLabel, BlockTerm, InstrCodegen, LocalLocation, NameLocation};
+use soac_blockpy::block_py::{
+    BinOp, BinOpKind, BlockLabel, BlockTerm, InstrCodegen, LocalLocation, NameLocation,
+};
 use std::ffi::c_void;
 use std::ptr;
 
@@ -144,12 +146,37 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             InstrCodegen::Load(load) => unsafe {
                 self.execute_load_owned(load.name.id.as_str(), load.name.location)
             },
+            InstrCodegen::BinOp(binop) => unsafe { self.execute_binop_owned(binop) },
             InstrCodegen::Store(store) => unsafe { self.execute_store_owned(store) },
             InstrCodegen::Del(del) => unsafe { self.execute_del_owned(del) },
             _ => Err(format!(
-                "deopt continuation only supports simple load/store/del expressions, got {expr:?}"
+                "deopt continuation only supports simple load/binop/store/del expressions, got {expr:?}"
             )),
         }
+    }
+
+    #[cold]
+    unsafe fn execute_binop_owned(
+        &mut self,
+        binop: &BinOp<InstrCodegen>,
+    ) -> Result<ObjPtr, String> {
+        let left = unsafe { self.execute_expr_owned(&binop.left)? };
+        if left.is_null() {
+            return Ok(ptr::null_mut());
+        }
+        let right = unsafe { self.execute_expr_owned(&binop.right)? };
+        if right.is_null() {
+            unsafe {
+                ffi::Py_DECREF(left.cast::<ffi::PyObject>());
+            }
+            return Ok(ptr::null_mut());
+        }
+        let result = unsafe { execute_binop_kind_owned(binop.kind, left, right)? };
+        unsafe {
+            ffi::Py_DECREF(left.cast::<ffi::PyObject>());
+            ffi::Py_DECREF(right.cast::<ffi::PyObject>());
+        }
+        Ok(result)
     }
 
     #[cold]
@@ -435,6 +462,62 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             self.locals.release_frame_owned_values();
         }
     }
+}
+
+#[cold]
+unsafe fn execute_binop_kind_owned(
+    kind: BinOpKind,
+    left: ObjPtr,
+    right: ObjPtr,
+) -> Result<ObjPtr, String> {
+    let left = left.cast::<ffi::PyObject>();
+    let right = right.cast::<ffi::PyObject>();
+    let result = unsafe {
+        match kind {
+            BinOpKind::Add => ffi::PyNumber_Add(left, right),
+            BinOpKind::Sub => ffi::PyNumber_Subtract(left, right),
+            BinOpKind::Mul => ffi::PyNumber_Multiply(left, right),
+            BinOpKind::MatMul => ffi::PyNumber_MatrixMultiply(left, right),
+            BinOpKind::TrueDiv => ffi::PyNumber_TrueDivide(left, right),
+            BinOpKind::FloorDiv => ffi::PyNumber_FloorDivide(left, right),
+            BinOpKind::Mod => ffi::PyNumber_Remainder(left, right),
+            BinOpKind::Pow => ffi::PyNumber_Power(left, right, ffi::Py_None()),
+            BinOpKind::LShift => ffi::PyNumber_Lshift(left, right),
+            BinOpKind::RShift => ffi::PyNumber_Rshift(left, right),
+            BinOpKind::Or => ffi::PyNumber_Or(left, right),
+            BinOpKind::Xor => ffi::PyNumber_Xor(left, right),
+            BinOpKind::And => ffi::PyNumber_And(left, right),
+            BinOpKind::Eq => ffi::PyObject_RichCompare(left, right, ffi::Py_EQ),
+            BinOpKind::Ne => ffi::PyObject_RichCompare(left, right, ffi::Py_NE),
+            BinOpKind::Lt => ffi::PyObject_RichCompare(left, right, ffi::Py_LT),
+            BinOpKind::Le => ffi::PyObject_RichCompare(left, right, ffi::Py_LE),
+            BinOpKind::Gt => ffi::PyObject_RichCompare(left, right, ffi::Py_GT),
+            BinOpKind::Ge => ffi::PyObject_RichCompare(left, right, ffi::Py_GE),
+            BinOpKind::Contains => {
+                let contains = ffi::PySequence_Contains(right, left);
+                if contains < 0 {
+                    ptr::null_mut()
+                } else {
+                    ffi::PyBool_FromLong((contains != 0) as libc::c_long)
+                }
+            }
+            BinOpKind::Is => ffi::PyBool_FromLong((left == right) as libc::c_long),
+            BinOpKind::InplaceAdd => ffi::PyNumber_InPlaceAdd(left, right),
+            BinOpKind::InplaceSub => ffi::PyNumber_InPlaceSubtract(left, right),
+            BinOpKind::InplaceMul => ffi::PyNumber_InPlaceMultiply(left, right),
+            BinOpKind::InplaceMatMul => ffi::PyNumber_InPlaceMatrixMultiply(left, right),
+            BinOpKind::InplaceTrueDiv => ffi::PyNumber_InPlaceTrueDivide(left, right),
+            BinOpKind::InplaceFloorDiv => ffi::PyNumber_InPlaceFloorDivide(left, right),
+            BinOpKind::InplaceMod => ffi::PyNumber_InPlaceRemainder(left, right),
+            BinOpKind::InplacePow => ffi::PyNumber_InPlacePower(left, right, ffi::Py_None()),
+            BinOpKind::InplaceLShift => ffi::PyNumber_InPlaceLshift(left, right),
+            BinOpKind::InplaceRShift => ffi::PyNumber_InPlaceRshift(left, right),
+            BinOpKind::InplaceOr => ffi::PyNumber_InPlaceOr(left, right),
+            BinOpKind::InplaceXor => ffi::PyNumber_InPlaceXor(left, right),
+            BinOpKind::InplaceAnd => ffi::PyNumber_InPlaceAnd(left, right),
+        }
+    };
+    Ok(result.cast())
 }
 
 #[cold]
