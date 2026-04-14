@@ -1339,6 +1339,7 @@ pub(crate) struct RuntimeJitDeoptInvocation<'a> {
 pub(crate) struct RuntimeJitDeoptLocal<'a> {
     binding: &'a LocalEnvResumeBinding,
     value: ObjPtr,
+    release_on_frame_exit: bool,
 }
 
 pub(crate) struct RuntimeJitDeoptLocals<'a> {
@@ -1726,7 +1727,11 @@ impl<'a> RuntimeJitDeoptLocals<'a> {
                 }
                 _ => {}
             }
-            locals.push(RuntimeJitDeoptLocal { binding, value });
+            locals.push(RuntimeJitDeoptLocal {
+                binding,
+                value,
+                release_on_frame_exit: transient_local_needs_decref(binding.ownership),
+            });
         }
         Ok(Self { locals })
     }
@@ -1758,6 +1763,14 @@ impl<'a> RuntimeJitDeoptLocals<'a> {
             .iter()
             .find(|local| local.binding.location == location)
     }
+
+    pub(crate) unsafe fn release_frame_owned_values(&mut self) {
+        for local in &mut self.locals {
+            unsafe {
+                local.release_frame_owned_value();
+            }
+        }
+    }
 }
 
 impl RuntimeJitDeoptLocal<'_> {
@@ -1767,6 +1780,16 @@ impl RuntimeJitDeoptLocal<'_> {
 
     pub(crate) fn value(&self) -> ObjPtr {
         self.value
+    }
+
+    unsafe fn release_frame_owned_value(&mut self) {
+        if self.release_on_frame_exit && !self.value.is_null() {
+            unsafe {
+                ffi::Py_DECREF(self.value.cast::<ffi::PyObject>());
+            }
+        }
+        self.value = std::ptr::null_mut();
+        self.release_on_frame_exit = false;
     }
 }
 

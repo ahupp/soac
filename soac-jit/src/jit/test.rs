@@ -5072,6 +5072,9 @@ def f(x):
             let value = unsafe { ffi::PyLong_FromLong(123_456_789) };
             assert!(!value.is_null(), "test PyLong allocation should succeed");
             let before = unsafe { ffi::Py_REFCNT(value) };
+            unsafe {
+                ffi::Py_INCREF(value);
+            }
             let mut live_values = vec![value.cast::<c_void>()];
             let result = unsafe {
                 crate::jit::specialized_helpers::dp_jit_deopt_resume(
@@ -5091,6 +5094,78 @@ def f(x):
                 unsafe { ffi::Py_REFCNT(value) },
                 before + 1,
                 "returned deopt value should be owned by the JIT caller"
+            );
+            unsafe {
+                ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+                ffi::Py_DECREF(value);
+            }
+        });
+    }
+
+    #[test]
+    fn deopt_frame_releases_unreturned_owned_live_local() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|_| {
+            let function = with_single_test_block(test_function(), vec![], ret_term(none_expr()));
+            let function_id = function.function_id;
+            let block = function.entry_block().label;
+            let location = LocalLocation(0);
+            let binding = LocalEnvResumeBinding {
+                name: "x".to_string(),
+                location,
+                binding: LocalEnvResumeBindingState::Bound,
+                source: LocalEnvResumeValueSource::BlockParam(location),
+                ownership: LocalRefKind::Owned,
+                value: None,
+            };
+            let table = RuntimeJitDeoptTable {
+                function_id,
+                function: Box::new(function),
+                module_constant_ptrs: Vec::new(),
+                points: vec![RuntimeJitDeoptRecord {
+                    id: PlannedJitDeoptPointId {
+                        function_id,
+                        ordinal: 0,
+                    },
+                    resume_point: LocalEnvResumePoint::BeforeTerm { function_id, block },
+                    precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                    locals: vec![binding],
+                    continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
+                        block,
+                        start_body_index: 0,
+                    },
+                }],
+            };
+            let value = unsafe { ffi::PyLong_FromLong(246_813_579) };
+            assert!(!value.is_null(), "test PyLong allocation should succeed");
+            let before = unsafe { ffi::Py_REFCNT(value) };
+            unsafe {
+                ffi::Py_INCREF(value);
+            }
+            let mut live_values = vec![value.cast::<c_void>()];
+            let result = unsafe {
+                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                    std::ptr::addr_of!(table).cast_mut().cast(),
+                    std::ptr::null_mut(),
+                    0,
+                    live_values.as_mut_ptr().cast(),
+                    live_values.len() as i64,
+                )
+            };
+            assert_eq!(
+                result,
+                unsafe { ffi::Py_None() }.cast(),
+                "block-tail deopt should continue to return None"
+            );
+            assert!(
+                unsafe { ffi::PyErr_Occurred() }.is_null(),
+                "successful deopt continuation should not leave a Python exception"
+            );
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(value) },
+                before,
+                "deopt frame should release the live local reference it took ownership of"
             );
             unsafe {
                 ffi::Py_DECREF(result.cast::<ffi::PyObject>());

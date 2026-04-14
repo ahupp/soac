@@ -12,8 +12,12 @@ use std::ptr;
 pub(super) fn execute_deopt_invocation(
     invocation: &RuntimeJitDeoptInvocation<'_>,
 ) -> Result<ObjPtr, String> {
-    let frame = BlockPyDeoptFrame::new(invocation)?;
-    frame.execute()
+    let mut frame = BlockPyDeoptFrame::new(invocation)?;
+    let result = frame.execute();
+    unsafe {
+        frame.release_frame_owned_values();
+    }
+    result
 }
 
 struct BlockPyDeoptFrame<'inv, 'data> {
@@ -29,7 +33,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
     }
 
     #[cold]
-    fn execute(&self) -> Result<ObjPtr, String> {
+    fn execute(&mut self) -> Result<ObjPtr, String> {
         match self.invocation.record().continuation() {
             RuntimeJitDeoptContinuation::ResumeBlockTail {
                 block,
@@ -45,7 +49,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
 
     #[cold]
     unsafe fn execute_block_tail(
-        &self,
+        &mut self,
         block_label: BlockLabel,
         start_body_index: usize,
     ) -> Result<ObjPtr, String> {
@@ -83,7 +87,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
     }
 
     #[cold]
-    unsafe fn execute_expr_owned(&self, expr: &InstrCodegen) -> Result<ObjPtr, String> {
+    unsafe fn execute_expr_owned(&mut self, expr: &InstrCodegen) -> Result<ObjPtr, String> {
         match expr {
             InstrCodegen::Load(load) => unsafe {
                 self.execute_load_owned(load.name.id.as_str(), load.name.location)
@@ -98,7 +102,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
 
     #[cold]
     unsafe fn execute_load_owned(
-        &self,
+        &mut self,
         name: &str,
         location: NameLocation,
     ) -> Result<ObjPtr, String> {
@@ -205,7 +209,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
 
     #[cold]
     unsafe fn execute_store_owned(
-        &self,
+        &mut self,
         store: &soac_blockpy::block_py::Store<InstrCodegen>,
     ) -> Result<ObjPtr, String> {
         match store.name.location {
@@ -221,7 +225,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
 
     #[cold]
     unsafe fn execute_global_store_owned(
-        &self,
+        &mut self,
         name: &str,
         value_expr: &InstrCodegen,
     ) -> Result<ObjPtr, String> {
@@ -292,6 +296,13 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
         };
         unsafe { ffi::Py_DECREF(name_obj) };
         Ok(result)
+    }
+
+    #[cold]
+    unsafe fn release_frame_owned_values(&mut self) {
+        unsafe {
+            self.locals.release_frame_owned_values();
+        }
     }
 }
 
