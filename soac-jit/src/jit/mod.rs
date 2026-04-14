@@ -1324,6 +1324,12 @@ pub(crate) struct RuntimeJitDeoptRecord {
     locals: Vec<LocalEnvResumeBinding>,
 }
 
+pub(crate) struct RuntimeJitDeoptInvocation<'a> {
+    table: &'a RuntimeJitDeoptTable,
+    record: &'a RuntimeJitDeoptRecord,
+    live_values: &'a [ObjPtr],
+}
+
 impl RuntimeJitDeoptRecord {
     pub(crate) fn id(&self) -> PlannedJitDeoptPointId {
         self.id
@@ -1491,6 +1497,53 @@ impl RuntimeJitDeoptTable {
         self.points
             .iter()
             .find(|record| record.resume_point == point)
+    }
+}
+
+impl RuntimeJitDeoptInvocation<'_> {
+    pub(crate) unsafe fn from_raw<'a>(
+        deopt_table: ObjPtr,
+        record_ordinal: i64,
+        live_values: ObjPtr,
+        live_value_count: i64,
+    ) -> Result<RuntimeJitDeoptInvocation<'a>, String> {
+        if deopt_table.is_null() {
+            return Err(format!(
+                "null deopt table pointer, ordinal {record_ordinal}, live values {live_value_count}"
+            ));
+        }
+        let table = unsafe { &*(deopt_table.cast::<RuntimeJitDeoptTable>()) };
+        let record = table.record_for_ordinal(record_ordinal)?;
+        record.validate_live_value_buffer(live_values, live_value_count)?;
+        let live_value_count = usize::try_from(live_value_count).map_err(|_| {
+            format!("live value count {live_value_count} is negative or does not fit usize")
+        })?;
+        let live_values = if live_value_count == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(live_values.cast::<ObjPtr>(), live_value_count) }
+        };
+        Ok(RuntimeJitDeoptInvocation {
+            table,
+            record,
+            live_values,
+        })
+    }
+
+    pub(crate) fn record(&self) -> &'_ RuntimeJitDeoptRecord {
+        self.record
+    }
+
+    pub(crate) fn live_values(&self) -> &'_ [ObjPtr] {
+        self.live_values
+    }
+
+    pub(crate) fn describe(&self) -> String {
+        format!(
+            "{}, live values {}",
+            self.record().describe(self.table.function_id()),
+            self.live_values().len()
+        )
     }
 }
 

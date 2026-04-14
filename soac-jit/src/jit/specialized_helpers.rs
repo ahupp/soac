@@ -1,6 +1,6 @@
 #![cfg_attr(test, allow(dead_code, unused_imports))]
 
-use super::RuntimeJitDeoptTable;
+use super::RuntimeJitDeoptInvocation;
 use crate::module_constants::load_runtime_name_owned;
 use crate::module_constants::raise_name_error_for_missing_name;
 use crate::operator_specialization::{ExactIntBinaryOpKind, ExactIntUnaryOpKind};
@@ -1266,19 +1266,16 @@ unsafe fn set_deopt_unimplemented_error(
     live_values: ObjPtr,
     live_value_count: i64,
 ) {
-    let detail = if deopt_table.is_null() {
-        format!(
-            "null deopt table pointer, ordinal {record_ordinal}, live values {live_value_count}"
+    let detail = match unsafe {
+        RuntimeJitDeoptInvocation::from_raw(
+            deopt_table,
+            record_ordinal,
+            live_values,
+            live_value_count,
         )
-    } else {
-        let table = &*(deopt_table.cast::<RuntimeJitDeoptTable>());
-        match table.record_for_ordinal(record_ordinal) {
-            Ok(record) => match record.validate_live_value_buffer(live_values, live_value_count) {
-                Ok(()) => record.describe(table.function_id()),
-                Err(err) => format!("{}; {}", record.describe(table.function_id()), err),
-            },
-            Err(err) => err,
-        }
+    } {
+        Ok(invocation) => invocation.describe(),
+        Err(err) => err,
     };
     let message = format!("JIT deopt helper is not implemented: {detail}");
     if let Ok(c_message) = std::ffi::CString::new(message) {
