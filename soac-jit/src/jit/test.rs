@@ -5477,6 +5477,76 @@ def f(x):
     }
 
     #[test]
+    fn runtime_deopt_table_marks_exception_edge_body_tail_continuation() {
+        let function = test_function();
+        let mut handler = test_source_block(
+            &function,
+            vec![],
+            ret_term(name_expr(test_local_name("exc", 0))),
+        );
+        handler.params = vec![BlockParam {
+            name: "exc".to_string(),
+            role: BlockParamRole::Exception,
+        }];
+        let mut entry = test_source_block(
+            &function,
+            vec![op_expr(Call::new(
+                name_expr(test_constant_name(0)),
+                vec![CallArgPositional::Positional(name_expr(
+                    test_constant_name(1),
+                ))],
+                Vec::<CallArgKeyword<InstrCodegen>>::new(),
+            ))],
+            ret_term(none_expr()),
+        );
+        entry.exc_edge = Some(BlockEdge::with_args(
+            handler.label,
+            vec![BlockArg::CurrentException],
+        ));
+        let module = test_module(
+            ModuleNameGen::new(0),
+            vec![with_test_blocks(function, vec![entry.clone(), handler])],
+        );
+        let function = &module.callable_defs[0];
+        let body_instr_id = function.blocks[0].body[0]
+            .try_semantic_instr_id()
+            .expect("test body instruction should have an id");
+        let facts = infer_module_value_facts(&module);
+        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+            .expect("JIT deopt resume planning should succeed");
+        let function_plan = module_plan
+            .function(function.function_id)
+            .expect("function should have a JIT deopt plan");
+        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
+            .expect("runtime deopt table should build from plan");
+
+        let block_entry_record = table
+            .record_for_point(LocalEnvResumePoint::BlockEntry {
+                function_id: function.function_id,
+                block: entry.label,
+            })
+            .expect("block-entry point should have a runtime record");
+        assert_eq!(
+            block_entry_record.continuation(),
+            &RuntimeJitDeoptContinuation::ResumeBlockTail {
+                cursor: RuntimeJitDeoptCursor::at_block_entry(entry.label),
+            }
+        );
+
+        let before_instr_record = table
+            .record_for_point(LocalEnvResumePoint::BeforeInstr {
+                key: InstrKey::new(function.function_id, body_instr_id),
+            })
+            .expect("before-instr point should have a runtime record");
+        assert_eq!(
+            before_instr_record.continuation(),
+            &RuntimeJitDeoptContinuation::ResumeBlockTail {
+                cursor: RuntimeJitDeoptCursor::at_block_entry(entry.label),
+            }
+        );
+    }
+
+    #[test]
     fn runtime_deopt_table_marks_no_arg_jump_before_term_continuation() {
         let function = test_function();
         let target = test_source_block(&function, vec![], ret_term(none_expr()));
@@ -6160,6 +6230,112 @@ def f(x):
                 ffi::Py_DECREF(value);
                 ffi::Py_DECREF(key);
                 ffi::Py_DECREF(globals);
+            }
+        });
+    }
+
+    #[test]
+    fn deopt_block_tail_continuation_dispatches_body_exception_edge() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|_| {
+            let exc_location = LocalLocation(0);
+            let function = test_function();
+            let mut handler = test_source_block(
+                &function,
+                vec![],
+                ret_term(name_expr(test_local_name("exc", exc_location.slot()))),
+            );
+            handler.params = vec![BlockParam {
+                name: "exc".to_string(),
+                role: BlockParamRole::Exception,
+            }];
+            let mut entry = test_source_block(
+                &function,
+                vec![op_expr(Call::new(
+                    name_expr(test_constant_name(0)),
+                    vec![CallArgPositional::Positional(name_expr(
+                        test_constant_name(1),
+                    ))],
+                    Vec::<CallArgKeyword<InstrCodegen>>::new(),
+                ))],
+                ret_term(none_expr()),
+            );
+            entry.exc_edge = Some(BlockEdge::with_args(
+                handler.label,
+                vec![BlockArg::CurrentException],
+            ));
+            let function = with_test_blocks(function, vec![entry.clone(), handler]);
+            let function_id = function.function_id;
+            let exc_binding = LocalEnvResumeBinding {
+                name: "exc".to_string(),
+                location: exc_location,
+                binding: LocalEnvResumeBindingState::Unbound,
+                source: LocalEnvResumeValueSource::BlockParam(exc_location),
+                ownership: LocalRefKind::Owned,
+                value: None,
+            };
+            let int_callable = std::ptr::addr_of_mut!(ffi::PyLong_Type).cast::<ffi::PyObject>();
+            unsafe {
+                ffi::Py_INCREF(int_callable);
+            }
+            let input = unsafe { ffi::PyUnicode_FromString(c"not-an-int".as_ptr()) };
+            assert!(
+                !input.is_null(),
+                "test failing int input allocation should succeed"
+            );
+            let table = RuntimeJitDeoptTable {
+                function_id,
+                function: Box::new(function),
+                module_constant_ptrs: vec![int_callable.cast(), input.cast()],
+                points: vec![RuntimeJitDeoptRecord {
+                    id: PlannedJitDeoptPointId {
+                        function_id,
+                        ordinal: 0,
+                    },
+                    resume_point: LocalEnvResumePoint::BeforeInstr {
+                        key: InstrKey::new(function_id, InstrId::new(entry.label, 0)),
+                    },
+                    precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                    locals: vec![exc_binding],
+                    continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
+                        cursor: RuntimeJitDeoptCursor::at_block_entry(entry.label),
+                    },
+                }],
+            };
+            let mut live_values = vec![std::ptr::null_mut::<c_void>()];
+            let before_input = unsafe { ffi::Py_REFCNT(input) };
+            let result = unsafe {
+                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                    std::ptr::addr_of!(table).cast_mut().cast(),
+                    std::ptr::null_mut(),
+                    0,
+                    live_values.as_mut_ptr().cast(),
+                    live_values.len() as i64,
+                )
+            };
+            assert!(
+                !result.is_null(),
+                "exception-edge deopt should catch the body failure and return the handler value"
+            );
+            assert!(
+                unsafe { ffi::PyErr_Occurred() }.is_null(),
+                "caught exception-edge deopt should clear the active Python error"
+            );
+            assert_ne!(
+                unsafe { ffi::PyExceptionInstance_Check(result.cast::<ffi::PyObject>()) },
+                0,
+                "exception-edge deopt should pass the raised exception instance"
+            );
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(input) },
+                before_input,
+                "failing call argument module constant should not leak through exception dispatch"
+            );
+            unsafe {
+                ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+                ffi::Py_DECREF(input);
+                ffi::Py_DECREF(int_callable);
             }
         });
     }

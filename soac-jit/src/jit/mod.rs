@@ -32,8 +32,8 @@ use cranelift_module::{
 use cranelift_reader::parse_functions;
 use pyo3::ffi;
 use soac_blockpy::block_py::{
-    AbruptKind, BlockArg, BlockLabel, BlockParamRole, BlockPyFunction, BlockPyModule, BlockTerm,
-    CallArgKeyword, CallArgPositional, CallableScopeKind, CellLocation, ChildVisitable,
+    AbruptKind, BlockArg, BlockEdge, BlockLabel, BlockParamRole, BlockPyFunction, BlockPyModule,
+    BlockTerm, CallArgKeyword, CallArgPositional, CallableScopeKind, CellLocation, ChildVisitable,
     CodegenBlock, CounterDef, CounterId, CounterScope, CounterSite, Del, FunctionId, FunctionKind,
     HasMeta, HasSemanticInstrId, InstrCodegen, InstrId, InstrKey, Literal, LocalLocation,
     NameLocation, ParamKind, ResolvedName, StorageLayout, Store, Visit, WithMeta,
@@ -1977,6 +1977,10 @@ fn runtime_jit_deopt_block_tail_supported(block: &CodegenBlock, start_body_index
     };
     body_tail.iter().all(runtime_jit_deopt_expr_supported)
         && runtime_jit_deopt_term_supported(&block.term)
+        && block
+            .exc_edge
+            .as_ref()
+            .is_none_or(runtime_jit_deopt_exception_edge_supported)
 }
 
 fn runtime_jit_deopt_expr_supported(expr: &InstrCodegen) -> bool {
@@ -2099,6 +2103,15 @@ fn runtime_jit_deopt_term_supported(term: &BlockTerm<InstrCodegen>) -> bool {
             .as_ref()
             .is_none_or(runtime_jit_deopt_expr_supported),
     }
+}
+
+fn runtime_jit_deopt_exception_edge_supported(edge: &BlockEdge) -> bool {
+    edge.args.iter().all(|arg| {
+        matches!(
+            arg,
+            BlockArg::Name(_) | BlockArg::None | BlockArg::CurrentException
+        )
+    })
 }
 
 impl RuntimeJitDeoptInvocation<'_> {

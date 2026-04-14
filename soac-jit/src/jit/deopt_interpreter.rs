@@ -76,7 +76,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
         mut cursor: RuntimeJitDeoptCursor,
     ) -> Result<ObjPtr, String> {
         let function = self.invocation.function();
-        loop {
+        'execute: loop {
             let block_label = cursor.block();
             let start_body_index = cursor.body_index();
             let block = function
@@ -97,6 +97,12 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             for instr in body_tail {
                 let value = unsafe { self.execute_expr_owned(instr)? };
                 if value.is_null() {
+                    if let Some(next_cursor) =
+                        unsafe { self.try_dispatch_exception_edge(block.exc_edge.clone())? }
+                    {
+                        cursor = next_cursor;
+                        continue 'execute;
+                    }
                     return Ok(ptr::null_mut());
                 }
                 unsafe {
@@ -104,7 +110,18 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
                 }
             }
             match &block.term {
-                BlockTerm::Return(value) => return unsafe { self.execute_expr_owned(value) },
+                BlockTerm::Return(value) => {
+                    let value = unsafe { self.execute_expr_owned(value)? };
+                    if value.is_null() {
+                        if let Some(next_cursor) =
+                            unsafe { self.try_dispatch_exception_edge(block.exc_edge.clone())? }
+                        {
+                            cursor = next_cursor;
+                            continue 'execute;
+                        }
+                    }
+                    return Ok(value);
+                }
                 BlockTerm::Jump(edge) => {
                     let Some(next_cursor) = (unsafe { self.execute_jump_edge(edge)? }) else {
                         return Ok(ptr::null_mut());
@@ -114,6 +131,12 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
                 BlockTerm::IfTerm(if_term) => {
                     let test = unsafe { self.execute_expr_owned(&if_term.test)? };
                     if test.is_null() {
+                        if let Some(next_cursor) =
+                            unsafe { self.try_dispatch_exception_edge(block.exc_edge.clone())? }
+                        {
+                            cursor = next_cursor;
+                            continue 'execute;
+                        }
                         return Ok(ptr::null_mut());
                     }
                     let truth = unsafe { ffi::PyObject_IsTrue(test.cast::<ffi::PyObject>()) };
@@ -121,6 +144,12 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
                         ffi::Py_DECREF(test.cast::<ffi::PyObject>());
                     }
                     if truth < 0 {
+                        if let Some(next_cursor) =
+                            unsafe { self.try_dispatch_exception_edge(block.exc_edge.clone())? }
+                        {
+                            cursor = next_cursor;
+                            continue 'execute;
+                        }
                         return Ok(ptr::null_mut());
                     }
                     let next_block = if truth != 0 {
@@ -141,6 +170,12 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
                         ffi::Py_DECREF(index_obj.cast::<ffi::PyObject>());
                     }
                     if index == -1 && !unsafe { ffi::PyErr_Occurred() }.is_null() {
+                        if let Some(next_cursor) =
+                            unsafe { self.try_dispatch_exception_edge(block.exc_edge.clone())? }
+                        {
+                            cursor = next_cursor;
+                            continue 'execute;
+                        }
                         return Ok(ptr::null_mut());
                     }
                     let next_block = usize::try_from(index)
@@ -149,9 +184,46 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
                         .unwrap_or(branch.default_label);
                     cursor = RuntimeJitDeoptCursor::at_block_entry(next_block);
                 }
-                BlockTerm::Raise(raise) => return unsafe { self.execute_raise_term_owned(raise) },
+                BlockTerm::Raise(raise) => {
+                    let value = unsafe { self.execute_raise_term_owned(raise)? };
+                    if value.is_null() {
+                        if let Some(next_cursor) =
+                            unsafe { self.try_dispatch_exception_edge(block.exc_edge.clone())? }
+                        {
+                            cursor = next_cursor;
+                            continue 'execute;
+                        }
+                    }
+                    return Ok(value);
+                }
             }
         }
+    }
+
+    #[cold]
+    unsafe fn try_dispatch_exception_edge(
+        &mut self,
+        edge: Option<BlockEdge>,
+    ) -> Result<Option<RuntimeJitDeoptCursor>, String> {
+        if edge.is_none() || unsafe { ffi::PyErr_Occurred() }.is_null() {
+            return Ok(None);
+        }
+        if !unsafe { self.capture_current_exception_for_dispatch() } {
+            return Ok(None);
+        }
+        unsafe { self.execute_jump_edge(&edge.expect("edge checked above")) }
+    }
+
+    #[cold]
+    unsafe fn capture_current_exception_for_dispatch(&mut self) -> bool {
+        unsafe {
+            if !self.current_exception.is_null() {
+                ffi::Py_DECREF(self.current_exception.cast::<ffi::PyObject>());
+                self.current_exception = ptr::null_mut();
+            }
+        }
+        self.current_exception = unsafe { take_current_raised_exception_owned() };
+        !self.current_exception.is_null()
     }
 
     #[cold]
