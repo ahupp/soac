@@ -10841,6 +10841,27 @@ fn emit_codegen_simple_call_with_local_env(
             let result_block = fb.create_block();
             fb.append_block_param(result_block, ptr_ty);
             let generic_block = fb.create_block();
+            let direct_guard_miss_dispatch = if !constructor_specializations.is_empty() {
+                JitGuardMissDispatch::FallbackBlock(generic_block)
+            } else if let Some(site_instr_id) = site_instr_id {
+                let guard_miss_resume_point =
+                    emit_ctx
+                        .guard_miss_resume_point
+                        .unwrap_or(LocalEnvResumePoint::BeforeInstr {
+                            key: InstrKey::new(emit_ctx.function_id, site_instr_id),
+                        });
+                prepare_optional_guard_miss_dispatch(
+                    emit_ctx.guard_miss_target_for_resume_point(
+                        guard_miss_resume_point,
+                        &[call.func.as_ref()],
+                        generic_block,
+                    ),
+                    generic_block,
+                    emit_ctx.guard_miss_deopt_stub_ref,
+                )
+            } else {
+                JitGuardMissDispatch::FallbackBlock(generic_block)
+            };
             let mut direct_chain_start = None;
             if !constructor_specializations.is_empty() {
                 let mut next_miss_block = fb.create_block();
@@ -10943,7 +10964,7 @@ fn emit_codegen_simple_call_with_local_env(
                 for (index, specialization) in direct_specializations.iter().enumerate() {
                     let direct_block = fb.create_block();
                     let miss_block = if index + 1 == direct_specializations.len() {
-                        generic_block
+                        direct_guard_miss_dispatch.branch_block()
                     } else {
                         fb.create_block()
                     };
@@ -10982,38 +11003,89 @@ fn emit_codegen_simple_call_with_local_env(
                 }
             }
 
-            fb.switch_to_block(generic_block);
-            emit_ctx
-                .direct_edge_stats
-                .record_guarded_generic_fallback_block();
-            if let Some(counter_id) = direct_fallback_counter_id {
-                let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+            match direct_guard_miss_dispatch {
+                JitGuardMissDispatch::FallbackBlock(generic_block) => {
+                    fb.switch_to_block(generic_block);
+                    emit_ctx
+                        .direct_edge_stats
+                        .record_guarded_generic_fallback_block();
+                    if let Some(counter_id) = direct_fallback_counter_id {
+                        let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+                    }
+                    let generic_result = if simple_args.len() <= 3 {
+                        emit_positional_call_three_with_local_env(
+                            fb,
+                            callable,
+                            callable_is_borrowed,
+                            simple_args.as_slice(),
+                            local_env,
+                            emit_ctx,
+                            jit_module,
+                            func_imports,
+                        )
+                    } else {
+                        emit_positional_vectorcall_with_local_env(
+                            fb,
+                            callable,
+                            callable_is_borrowed,
+                            simple_args.as_slice(),
+                            local_env,
+                            emit_ctx,
+                            jit_module,
+                            func_imports,
+                        )
+                    };
+                    fb.ins()
+                        .jump(result_block, &[ir::BlockArg::Value(generic_result)]);
+                }
+                JitGuardMissDispatch::DeoptResume {
+                    block,
+                    target,
+                    deopt_resume_ref,
+                } => {
+                    fb.switch_to_block(block);
+                    fb.set_cold_block(block);
+                    emit_ctx
+                        .direct_edge_stats
+                        .record_guarded_generic_fallback_block();
+                    if let Some(counter_id) = direct_fallback_counter_id {
+                        let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+                    }
+                    if !callable_is_borrowed {
+                        emit_release_owned_inputs(fb, emit_ctx, &[callable]);
+                    }
+                    let (live_values_base, live_value_count) =
+                        emit_deopt_live_value_buffer(fb, target, emit_ctx, local_env)
+                            .unwrap_or_else(|err| panic!("{err}"));
+                    let deopt_result = emit_deopt_resume_call(
+                        fb,
+                        target,
+                        deopt_resume_ref,
+                        emit_ctx.consts.block_const,
+                        live_values_base,
+                        live_value_count,
+                        emit_ctx.consts.ptr_ty,
+                        emit_ctx.consts.i64_ty,
+                    );
+                    let deopt_result_is_null =
+                        fb.ins()
+                            .icmp(ir::condcodes::IntCC::Equal, deopt_result, null_ptr);
+                    let deopt_success_block = fb.create_block();
+                    fb.append_block_param(deopt_success_block, ptr_ty);
+                    fb.set_cold_block(deopt_success_block);
+                    fb.ins().brif(
+                        deopt_result_is_null,
+                        emit_ctx.consts.step_null_block,
+                        &step_null_block_args(emit_ctx),
+                        deopt_success_block,
+                        &[ir::BlockArg::Value(deopt_result)],
+                    );
+
+                    fb.switch_to_block(deopt_success_block);
+                    let resumed_result = fb.block_params(deopt_success_block)[0];
+                    fb.ins().return_(&[resumed_result]);
+                }
             }
-            let generic_result = if simple_args.len() <= 3 {
-                emit_positional_call_three_with_local_env(
-                    fb,
-                    callable,
-                    callable_is_borrowed,
-                    simple_args.as_slice(),
-                    local_env,
-                    emit_ctx,
-                    jit_module,
-                    func_imports,
-                )
-            } else {
-                emit_positional_vectorcall_with_local_env(
-                    fb,
-                    callable,
-                    callable_is_borrowed,
-                    simple_args.as_slice(),
-                    local_env,
-                    emit_ctx,
-                    jit_module,
-                    func_imports,
-                )
-            };
-            fb.ins()
-                .jump(result_block, &[ir::BlockArg::Value(generic_result)]);
             fb.switch_to_block(result_block);
             return Some(fb.block_params(result_block)[0]);
         }

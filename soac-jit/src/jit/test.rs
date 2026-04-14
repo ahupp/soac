@@ -12534,6 +12534,217 @@ def f(x, y):
         });
     }
 
+    fn build_direct_call_guard_miss_with_runtime_profile(
+        py: Python<'_>,
+        callable_replay_safe: bool,
+    ) -> BuiltSpecializedFunction {
+        let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "verify");
+        let soac_work_dir = fresh_test_work_dir("direct-call-deopt-profile");
+        let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
+        let blocks = [1usize as ObjPtr];
+        let module_name_gen = ModuleNameGen::new(0);
+        let callee_function = with_single_test_block(
+            test_function_in_module(&module_name_gen, "callee"),
+            vec![],
+            ret_term(none_expr()),
+        );
+
+        let caller_name_gen = module_name_gen.next_function_name_gen();
+        let caller_function_id = caller_name_gen.function_id();
+        let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+        let callable_expr = if callable_replay_safe {
+            name_expr(test_name("fn"))
+        } else {
+            op_expr(Call::new(
+                name_expr(test_runtime_name("tuple_values")),
+                Vec::<CallArgPositional<InstrCodegen>>::new(),
+                Vec::<CallArgKeyword<InstrCodegen>>::new(),
+            ))
+        };
+        let caller_params = if callable_replay_safe {
+            ParamSpec {
+                params: vec![Param {
+                    name: "fn".into(),
+                    kind: ParamKind::Any,
+                    has_default: false,
+                }],
+            }
+        } else {
+            ParamSpec::default()
+        };
+        let mut caller_function = BlockPyFunction {
+            function_id: caller_function_id,
+            name_gen: caller_name_gen,
+            names: FunctionName::new("caller", "caller", "caller", "caller"),
+            kind: soac_blockpy::block_py::FunctionKind::Function,
+            params: caller_params,
+            blocks: vec![CodegenBlock {
+                label: BlockLabel::from_index(0),
+                body: vec![],
+                term: ret_term(with_instr_id(
+                    op_expr(Call::new(
+                        callable_expr,
+                        Vec::<CallArgPositional<InstrCodegen>>::new(),
+                        Vec::<CallArgKeyword<InstrCodegen>>::new(),
+                    )),
+                    call_instr_id,
+                )),
+                params: vec![],
+                exc_edge: None,
+            }],
+            doc: None,
+            storage_layout: None,
+            scope: Default::default(),
+        };
+        if callable_replay_safe {
+            set_stack_slots(&mut caller_function, &["fn"]);
+        }
+
+        let mut module = test_module(
+            ModuleNameGen::new(0),
+            vec![callee_function.clone(), caller_function.clone()],
+        );
+        write_test_counter_dump(
+            soac_work_dir.join("profile.bin").as_path(),
+            &CounterDumpRecord {
+                source_hash: 0,
+                module_name: "direct_call_deopt_profile_test".to_string(),
+                package_name: None,
+                rows: vec![CounterDumpRow {
+                    counter_id: 0,
+                    scope: "this".to_string(),
+                    kind: "call_hot_targets".to_string(),
+                    site_kind: "runtime".to_string(),
+                    function_id: Some(caller_function.function_id),
+                    current_function_id: Some(caller_function.function_id),
+                    instr_id: Some(call_instr_id),
+                    function_qualname: Some(caller_function.names.qualname.clone()),
+                    block_label: None,
+                    value: 1,
+                    observed_value: Some(callee_function.function_id.packed()),
+                    max_overcount: Some(0),
+                }],
+                module_keys: Vec::new(),
+                type_keys: Vec::new(),
+                type_table: Vec::new(),
+            },
+        );
+        instrument_bb_module_with_call_target_counters(&mut module);
+
+        let shared_state = crate::module_type::build_shared_state_for_testing(
+            py,
+            module,
+            "direct_call_deopt_profile_test",
+            "",
+        )
+        .expect("shared state should build");
+        let caller_function = shared_state.lowered_module.callable_defs[1].clone();
+        let compile_session = crate::session::CompileSession::new();
+        let mut jit_module =
+            new_jit_module(&compile_session).expect("test jit module should construct");
+        let module_constant_ptrs = shared_state.module_constant_ptrs();
+        let module_constant_object_data_ids = declare_module_constant_object_data(
+            &mut jit_module,
+            &shared_state.lowered_module,
+            &module_constant_ptrs,
+        )
+        .expect("module constant object data should declare");
+        let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
+            define_test_counter_storage(
+                &mut jit_module,
+                &shared_state.lowered_module,
+                shared_state.lowered_module.counter_defs.as_slice(),
+            );
+        build_test_cranelift_run_bb_specialized_function(
+            &mut jit_module,
+            &blocks,
+            &shared_state.lowered_module,
+            &caller_function,
+            &shared_state.codegen_constants,
+            shared_state.lowered_module.counter_defs.as_slice(),
+            module_constant_object_data_ids.as_slice(),
+            counter_slots_by_id.as_ref(),
+            scalar_counter_data_id,
+            top_value_counter_data_id,
+            &compile_session,
+            Some(shared_state.as_ref()),
+            None,
+            None,
+            BuildSpecializedFunctionOptions::default(),
+        )
+        .expect("specialized JIT build should succeed")
+    }
+
+    #[test]
+    fn direct_call_guard_miss_deopt_enabled_for_replay_safe_callable() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "direct_call_guard_miss_deopt_enabled_for_replay_safe_callable",
+        ) {
+            return;
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let built = build_direct_call_guard_miss_with_runtime_profile(py, true);
+            let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
+            let generic_call_helpers = import_user_names_for_symbols(
+                &built,
+                &[DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT.symbol],
+            );
+            assert_eq!(
+                count_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
+                1,
+                "verify mode should enable direct-call guard-miss deopt for replay-safe callables"
+            );
+            assert_eq!(
+                count_cold_block_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
+                1,
+                "direct-call guard-miss deopt should keep the helper call cold"
+            );
+            assert_eq!(
+                count_deopt_helper_success_returns(&built.ctx.func, &deopt_helpers),
+                1,
+                "direct-call guard-miss deopt should return a successful deopt continuation result"
+            );
+            assert_eq!(
+                count_direct_calls_to_runtime_helpers(&built.ctx.func, &generic_call_helpers),
+                0,
+                "direct-call guard miss should not emit the local generic call fallback when deopt is planned"
+            );
+        });
+    }
+
+    #[test]
+    fn direct_call_guard_miss_keeps_fallback_for_replay_unsafe_callable() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "direct_call_guard_miss_keeps_fallback_for_replay_unsafe_callable",
+        ) {
+            return;
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let built = build_direct_call_guard_miss_with_runtime_profile(py, false);
+            let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
+            let generic_call_helpers = import_user_names_for_symbols(
+                &built,
+                &[DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT.symbol],
+            );
+            assert_eq!(
+                count_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
+                0,
+                "replay-unsafe callable expressions should keep the local fallback instead of deopt"
+            );
+            assert_eq!(
+                count_direct_calls_to_runtime_helpers(&built.ctx.func, &generic_call_helpers),
+                1,
+                "replay-unsafe callable expressions should still emit the generic fallback call"
+            );
+        });
+    }
+
     #[test]
     fn indexed_global_body_guard_miss_can_target_cold_deopt_stub() {
         let function = with_single_test_block(
