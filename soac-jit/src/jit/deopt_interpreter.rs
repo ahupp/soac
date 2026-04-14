@@ -85,6 +85,25 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
                     block_label = edge.target;
                     start_body_index = 0;
                 }
+                BlockTerm::IfTerm(if_term) => {
+                    let test = unsafe { self.execute_expr_owned(&if_term.test)? };
+                    if test.is_null() {
+                        return Ok(ptr::null_mut());
+                    }
+                    let truth = unsafe { ffi::PyObject_IsTrue(test.cast::<ffi::PyObject>()) };
+                    unsafe {
+                        ffi::Py_DECREF(test.cast::<ffi::PyObject>());
+                    }
+                    if truth < 0 {
+                        return Ok(ptr::null_mut());
+                    }
+                    block_label = if truth != 0 {
+                        if_term.then_label
+                    } else {
+                        if_term.else_label
+                    };
+                    start_body_index = 0;
+                }
                 BlockTerm::Jump(edge) => {
                     return Err(format!(
                         "deopt continuation for block {block_label} does not support jump args {:?}",
@@ -93,7 +112,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
                 }
                 _ => {
                     return Err(format!(
-                        "deopt continuation for block {block_label} only supports return or no-arg jump terms"
+                        "deopt continuation for block {block_label} only supports return, if, or no-arg jump terms"
                     ));
                 }
             }

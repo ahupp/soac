@@ -1633,6 +1633,7 @@ fn runtime_jit_deopt_term_supported(term: &BlockTerm<InstrCodegen>) -> bool {
     match term {
         BlockTerm::Return(value) => runtime_jit_deopt_expr_supported(value),
         BlockTerm::Jump(edge) => edge.args.is_empty(),
+        BlockTerm::IfTerm(if_term) => runtime_jit_deopt_expr_supported(&if_term.test),
         _ => false,
     }
 }
