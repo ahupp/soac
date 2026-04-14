@@ -5460,6 +5460,83 @@ def f(x):
     }
 
     #[test]
+    fn runtime_deopt_table_marks_current_exception_jump_args_before_term_continuation() {
+        let function = test_function();
+        let mut target = test_source_block(
+            &function,
+            vec![],
+            ret_term(name_expr(test_local_name("exc", 0))),
+        );
+        target.params = vec![BlockParam {
+            name: "exc".to_string(),
+            role: BlockParamRole::Exception,
+        }];
+        let entry = test_source_block(
+            &function,
+            vec![],
+            BlockTerm::Jump(BlockEdge::with_args(
+                target.label,
+                vec![BlockArg::CurrentException],
+            )),
+        );
+        let module = test_module(
+            ModuleNameGen::new(0),
+            vec![with_test_blocks(function, vec![entry.clone(), target])],
+        );
+        let function = &module.callable_defs[0];
+        let facts = infer_module_value_facts(&module);
+        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+            .expect("JIT deopt resume planning should succeed");
+        let function_plan = module_plan
+            .function(function.function_id)
+            .expect("function should have a JIT deopt plan");
+        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
+            .expect("runtime deopt table should build from plan");
+        let point = LocalEnvResumePoint::BeforeTerm {
+            function_id: function.function_id,
+            block: entry.label,
+        };
+        let record = table
+            .record_for_point(point)
+            .expect("before-term current-exception jump-arg point should have a runtime record");
+        assert_eq!(
+            record.continuation(),
+            &RuntimeJitDeoptContinuation::ResumeBlockTail {
+                cursor: RuntimeJitDeoptCursor::new(entry.label, entry.body.len()),
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_deopt_table_marks_bare_raise_before_term_continuation() {
+        let function = with_single_test_block(test_function(), vec![], raise_term());
+        let module = test_module(ModuleNameGen::new(0), vec![function]);
+        let function = &module.callable_defs[0];
+        let block = function.entry_block();
+        let facts = infer_module_value_facts(&module);
+        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+            .expect("JIT deopt resume planning should succeed");
+        let function_plan = module_plan
+            .function(function.function_id)
+            .expect("function should have a JIT deopt plan");
+        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
+            .expect("runtime deopt table should build from plan");
+        let point = LocalEnvResumePoint::BeforeTerm {
+            function_id: function.function_id,
+            block: block.label,
+        };
+        let record = table
+            .record_for_point(point)
+            .expect("before-term bare raise point should have a runtime record");
+        assert_eq!(
+            record.continuation(),
+            &RuntimeJitDeoptContinuation::ResumeBlockTail {
+                cursor: RuntimeJitDeoptCursor::new(block.label, block.body.len()),
+            }
+        );
+    }
+
+    #[test]
     fn runtime_deopt_table_marks_if_before_term_continuation() {
         let function = test_function();
         let then_block = test_source_block(&function, vec![], ret_term(none_expr()));
@@ -6246,6 +6323,114 @@ def f(x):
             unsafe {
                 ffi::Py_DECREF(result.cast::<ffi::PyObject>());
                 ffi::Py_DECREF(old_kind_value);
+            }
+        });
+    }
+
+    #[test]
+    fn deopt_block_tail_continuation_applies_current_exception_jump_arg() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|_| {
+            let exc_location = LocalLocation(0);
+            let function = test_function();
+            let mut target = test_source_block(
+                &function,
+                vec![],
+                ret_term(name_expr(test_local_name("exc", exc_location.slot()))),
+            );
+            target.params = vec![BlockParam {
+                name: "exc".to_string(),
+                role: BlockParamRole::Exception,
+            }];
+            let entry = test_source_block(
+                &function,
+                vec![],
+                BlockTerm::Jump(BlockEdge::with_args(
+                    target.label,
+                    vec![BlockArg::CurrentException],
+                )),
+            );
+            let function = with_test_blocks(function, vec![entry.clone(), target]);
+            let function_id = function.function_id;
+            let exc_binding = LocalEnvResumeBinding {
+                name: "exc".to_string(),
+                location: exc_location,
+                binding: LocalEnvResumeBindingState::Bound,
+                source: LocalEnvResumeValueSource::BlockParam(exc_location),
+                ownership: LocalRefKind::Owned,
+                value: None,
+            };
+            let table = RuntimeJitDeoptTable {
+                function_id,
+                function: Box::new(function),
+                module_constant_ptrs: Vec::new(),
+                points: vec![RuntimeJitDeoptRecord {
+                    id: PlannedJitDeoptPointId {
+                        function_id,
+                        ordinal: 0,
+                    },
+                    resume_point: LocalEnvResumePoint::BeforeTerm {
+                        function_id,
+                        block: entry.label,
+                    },
+                    precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                    locals: vec![exc_binding],
+                    continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
+                        cursor: RuntimeJitDeoptCursor::new(entry.label, entry.body.len()),
+                    },
+                }],
+            };
+            let old_exc_value = unsafe { ffi::PyLong_FromLong(123_456_789) };
+            assert!(
+                !old_exc_value.is_null(),
+                "test old exception-param allocation should succeed"
+            );
+            let before_old_exc = unsafe { ffi::Py_REFCNT(old_exc_value) };
+            let exc = unsafe { ffi::PyObject_CallNoArgs(ffi::PyExc_ValueError) };
+            assert!(
+                !exc.is_null(),
+                "test current exception allocation should succeed"
+            );
+            let before_exc = unsafe { ffi::Py_REFCNT(exc) };
+            unsafe {
+                ffi::Py_INCREF(old_exc_value);
+                ffi::Py_INCREF(exc);
+                ffi::PyErr_SetRaisedException(exc);
+            }
+            let mut live_values = vec![old_exc_value.cast::<c_void>()];
+            let result = unsafe {
+                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                    std::ptr::addr_of!(table).cast_mut().cast(),
+                    std::ptr::null_mut(),
+                    0,
+                    live_values.as_mut_ptr().cast(),
+                    live_values.len() as i64,
+                )
+            };
+            assert_eq!(
+                result,
+                exc.cast(),
+                "jump current-exception arg should bind the target param to the active exception"
+            );
+            assert!(
+                unsafe { ffi::PyErr_Occurred() }.is_null(),
+                "current-exception jump arg should consume the active error state"
+            );
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(old_exc_value) },
+                before_old_exc,
+                "current-exception jump arg should release the replaced frame-owned local"
+            );
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(exc) },
+                before_exc + 1,
+                "returned current exception should be owned by the JIT caller after frame cleanup"
+            );
+            unsafe {
+                ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+                ffi::Py_DECREF(exc);
+                ffi::Py_DECREF(old_exc_value);
             }
         });
     }
@@ -7974,6 +8159,86 @@ def g():
             unsafe {
                 ffi::Py_DECREF(raised);
                 ffi::Py_DECREF(exc_class);
+            }
+        });
+    }
+
+    #[test]
+    fn deopt_block_tail_continuation_executes_bare_raise() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|_| {
+            let function = with_single_test_block(test_function(), vec![], raise_term());
+            let function_id = function.function_id;
+            let block = function.entry_block().label;
+            let exc = unsafe { ffi::PyObject_CallNoArgs(ffi::PyExc_ValueError) };
+            assert!(
+                !exc.is_null(),
+                "test current exception allocation should succeed"
+            );
+            let table = RuntimeJitDeoptTable {
+                function_id,
+                function: Box::new(function),
+                module_constant_ptrs: Vec::new(),
+                points: vec![RuntimeJitDeoptRecord {
+                    id: PlannedJitDeoptPointId {
+                        function_id,
+                        ordinal: 0,
+                    },
+                    resume_point: LocalEnvResumePoint::BeforeTerm { function_id, block },
+                    precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                    locals: vec![],
+                    continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
+                        cursor: RuntimeJitDeoptCursor::at_block_entry(block),
+                    },
+                }],
+            };
+            let before_exc = unsafe { ffi::Py_REFCNT(exc) };
+            unsafe {
+                ffi::Py_INCREF(exc);
+                ffi::PyErr_SetRaisedException(exc);
+            }
+            let result = unsafe {
+                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                    std::ptr::addr_of!(table).cast_mut().cast(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert!(
+                result.is_null(),
+                "bare-raise deopt should return null to signal Python error"
+            );
+            assert_ne!(
+                unsafe { ffi::PyErr_ExceptionMatches(ffi::PyExc_ValueError) },
+                0,
+                "bare-raise deopt should re-raise the active exception"
+            );
+            let raised = unsafe { ffi::PyErr_GetRaisedException() };
+            assert!(
+                !raised.is_null(),
+                "bare-raise deopt should leave a raised exception object"
+            );
+            assert_eq!(
+                raised, exc,
+                "bare-raise deopt should preserve the active exception object"
+            );
+            unsafe {
+                ffi::Py_DECREF(raised);
+            }
+            assert!(
+                unsafe { ffi::PyErr_Occurred() }.is_null(),
+                "fetching the raised exception should clear it"
+            );
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(exc) },
+                before_exc,
+                "bare-raise deopt should not leak the active exception"
+            );
+            unsafe {
+                ffi::Py_DECREF(exc);
             }
         });
     }

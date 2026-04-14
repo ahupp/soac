@@ -2053,7 +2053,10 @@ fn runtime_jit_deopt_term_supported(term: &BlockTerm<InstrCodegen>) -> bool {
         BlockTerm::Jump(edge) => edge.args.iter().all(|arg| {
             matches!(
                 arg,
-                BlockArg::Name(_) | BlockArg::None | BlockArg::AbruptKind(_)
+                BlockArg::Name(_)
+                    | BlockArg::None
+                    | BlockArg::CurrentException
+                    | BlockArg::AbruptKind(_)
             )
         }),
         BlockTerm::IfTerm(if_term) => runtime_jit_deopt_expr_supported(&if_term.test),
@@ -2061,7 +2064,7 @@ fn runtime_jit_deopt_term_supported(term: &BlockTerm<InstrCodegen>) -> bool {
         BlockTerm::Raise(raise) => raise
             .exc
             .as_ref()
-            .is_some_and(runtime_jit_deopt_expr_supported),
+            .is_none_or(runtime_jit_deopt_expr_supported),
     }
 }
 

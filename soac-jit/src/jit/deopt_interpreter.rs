@@ -16,6 +16,7 @@ unsafe extern "C" {
     static mut PyMethod_Type: ffi::PyTypeObject;
 
     fn PyMethod_Function(meth: *mut ffi::PyObject) -> *mut ffi::PyObject;
+    fn PyErr_SetRaisedException(exc: *mut ffi::PyObject);
     fn _PyDict_MergeEx(
         mp: *mut ffi::PyObject,
         other: *mut ffi::PyObject,
@@ -43,13 +44,18 @@ pub(super) fn execute_deopt_invocation(
 struct BlockPyDeoptFrame<'inv, 'data> {
     invocation: &'inv RuntimeJitDeoptInvocation<'data>,
     locals: RuntimeJitDeoptLocals<'inv>,
+    current_exception: ObjPtr,
 }
 
 impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
     #[cold]
     fn new(invocation: &'inv RuntimeJitDeoptInvocation<'data>) -> Result<Self, String> {
         let locals = invocation.materialize_locals()?;
-        Ok(Self { invocation, locals })
+        Ok(Self {
+            invocation,
+            locals,
+            current_exception: ptr::null_mut(),
+        })
     }
 
     #[cold]
@@ -190,15 +196,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
                 BlockArg::Name(name) => unsafe { self.execute_block_arg_name_owned(name)? },
                 BlockArg::None => owned_none(),
                 BlockArg::AbruptKind(kind) => unsafe { execute_abrupt_kind_arg_owned(*kind) },
-                BlockArg::CurrentException => {
-                    unsafe {
-                        release_owned_values(values);
-                    }
-                    return Err(format!(
-                        "deopt continuation jump to {} does not support edge arg {:?}",
-                        edge.target, arg
-                    ));
-                }
+                BlockArg::CurrentException => unsafe { self.current_exception_arg_owned() },
             };
             if value.is_null() {
                 unsafe {
@@ -764,10 +762,14 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
         raise: &soac_blockpy::block_py::TermRaise<InstrCodegen>,
     ) -> Result<ObjPtr, String> {
         let Some(exc_expr) = &raise.exc else {
-            return Err(
-                "deopt continuation does not support bare raise without exception state"
-                    .to_string(),
-            );
+            let exc = unsafe { self.current_exception_arg_owned() };
+            if exc.is_null() {
+                return Ok(ptr::null_mut());
+            }
+            unsafe {
+                PyErr_SetRaisedException(exc.cast::<ffi::PyObject>());
+            }
+            return Ok(ptr::null_mut());
         };
         let exc = unsafe { self.execute_expr_owned(exc_expr)? };
         if exc.is_null() {
@@ -1060,12 +1062,55 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
     unsafe fn release_frame_owned_values(&mut self) {
         unsafe {
             self.locals.release_frame_owned_values();
+            if !self.current_exception.is_null() {
+                ffi::Py_DECREF(self.current_exception.cast::<ffi::PyObject>());
+                self.current_exception = ptr::null_mut();
+            }
         }
     }
 }
 
 unsafe fn execute_abrupt_kind_arg_owned(kind: AbruptKind) -> ObjPtr {
     unsafe { ffi::PyLong_FromLongLong(super::abrupt_kind_tag(kind)).cast() }
+}
+
+impl BlockPyDeoptFrame<'_, '_> {
+    unsafe fn current_exception_arg_owned(&mut self) -> ObjPtr {
+        if self.current_exception.is_null() {
+            self.current_exception = unsafe { take_current_raised_exception_owned() };
+            if self.current_exception.is_null() {
+                return ptr::null_mut();
+            }
+        }
+        unsafe {
+            ffi::Py_INCREF(self.current_exception.cast::<ffi::PyObject>());
+        }
+        self.current_exception
+    }
+}
+
+unsafe fn take_current_raised_exception_owned() -> ObjPtr {
+    let tstate = unsafe { ffi::PyThreadState_Get() };
+    let current_exception_slot = unsafe {
+        tstate
+            .cast::<u8>()
+            .add(super::PY_THREAD_STATE_CURRENT_EXCEPTION_OFFSET as usize)
+            .cast::<*mut ffi::PyObject>()
+    };
+    let current_exception = unsafe { *current_exception_slot };
+    if current_exception.is_null() {
+        unsafe {
+            ffi::PyErr_SetString(
+                ffi::PyExc_RuntimeError,
+                c"No active exception to reraise".as_ptr(),
+            );
+        }
+        return ptr::null_mut();
+    }
+    unsafe {
+        *current_exception_slot = ptr::null_mut();
+    }
+    current_exception.cast()
 }
 
 fn owned_none() -> ObjPtr {
