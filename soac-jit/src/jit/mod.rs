@@ -30,11 +30,11 @@ use soac_blockpy::block_py::{
 };
 use soac_blockpy::passes::{
     CodegenModuleShape, FactStore, FunctionRefcountPlan, InstrResolved, InstrTyped,
-    LocalEnvResumePoint, LocalRefState, PyExactType, PyObjFacts, RefcountActionKind,
-    RefcountReleaseReason, RefcountSite, RuntimeHelperId, TypedCodegenModuleShape, ValueFacts,
-    infer_module_value_facts, lower_codegen_function_to_typed,
-    lower_typed_function_if_tests_to_truthy, try_lower_typed_instr_to_codegen_legacy,
-    try_lower_typed_term_to_codegen_legacy,
+    LocalEnvResumeBinding, LocalEnvResumePoint, LocalEnvResumeStatePrecision, LocalRefState,
+    PyExactType, PyObjFacts, RefcountActionKind, RefcountReleaseReason, RefcountSite,
+    RuntimeHelperId, TypedCodegenModuleShape, ValueFacts, infer_module_value_facts,
+    lower_codegen_function_to_typed, lower_typed_function_if_tests_to_truthy,
+    try_lower_typed_instr_to_codegen_legacy, try_lower_typed_term_to_codegen_legacy,
 };
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -896,6 +896,7 @@ struct DefinedJitFunction {
     stats: JitCodegenStats,
     artifact: DefinedFunctionArtifact,
     default_adapter_artifact: Option<DefinedFunctionArtifact>,
+    deopt_table: Arc<RuntimeJitDeoptTable>,
 }
 
 struct ProcessJitBatchFunction<'a> {
@@ -1171,12 +1172,14 @@ impl ProcessJitState {
         code_ptr: *const u8,
         default_code_ptr: *const u8,
         param_count: usize,
+        deopt_table: Arc<RuntimeJitDeoptTable>,
     ) -> Result<Arc<CompiledFunctionHandle>, String> {
         let Some(entry) = self.direct_functions.get(&function_id) else {
             return Err(format!(
                 "process JIT function {function_id} was defined before declaration"
             ));
         };
+        debug_assert_eq!(deopt_table.function_id(), function_id);
         let declared = entry.declared();
         let shape = entry.shape().clone();
         let compiled_handle = Arc::new(CompiledFunctionHandle::from_direct_entry(
@@ -1184,6 +1187,7 @@ impl ProcessJitState {
             code_ptr,
             default_code_ptr,
             param_count,
+            deopt_table,
         ));
         self.direct_functions.insert(
             function_id,
@@ -1202,6 +1206,7 @@ struct ProcessJitCompileGuard;
 struct CompiledSpecializedRunner {
     _session: Arc<crate::session::CompileSession>,
     entry: Option<CompiledRunnerEntry>,
+    direct_deopt_table: Option<Arc<RuntimeJitDeoptTable>>,
 }
 
 pub(crate) struct CompiledFunctionHandle {
@@ -1234,6 +1239,7 @@ impl CompiledFunctionHandle {
         code_ptr: *const u8,
         default_code_ptr: *const u8,
         param_count: usize,
+        deopt_table: Arc<RuntimeJitDeoptTable>,
     ) -> Self {
         Self {
             handle: new_compiled_direct_runner_handle(
@@ -1241,6 +1247,7 @@ impl CompiledFunctionHandle {
                 code_ptr,
                 default_code_ptr,
                 param_count,
+                deopt_table,
             ),
         }
     }
@@ -1256,6 +1263,11 @@ impl CompiledFunctionHandle {
 
     pub(crate) fn default_direct_code_ptr(&self) -> Result<ObjPtr, String> {
         compiled_default_direct_code_ptr(self.handle)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn direct_deopt_table(&self) -> Result<Arc<RuntimeJitDeoptTable>, String> {
+        compiled_direct_deopt_table(self.handle)
     }
 }
 
@@ -1277,11 +1289,99 @@ enum CompiledRunnerEntry {
     },
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct RuntimeJitDeoptTable {
+    function_id: FunctionId,
+    points: Vec<RuntimeJitDeoptRecord>,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeJitDeoptRecord {
+    id: PlannedJitDeoptPointId,
+    resume_point: LocalEnvResumePoint,
+    precision: LocalEnvResumeStatePrecision,
+    locals: Vec<LocalEnvResumeBinding>,
+}
+
+impl RuntimeJitDeoptTable {
+    fn from_plan(
+        function_id: FunctionId,
+        plan: &PlannedJitDeoptResumeFunction,
+    ) -> Result<Self, String> {
+        let mut points = Vec::with_capacity(plan.deopt_points.len());
+        for deopt_point in &plan.deopt_points {
+            let entry = plan.entry(deopt_point.resume_point).ok_or_else(|| {
+                format!(
+                    "planned deopt point {:?} for function {} has no resume entry",
+                    deopt_point.point, function_id
+                )
+            })?;
+            points.push(RuntimeJitDeoptRecord {
+                id: deopt_point.id,
+                resume_point: deopt_point.resume_point,
+                precision: deopt_point.precision,
+                locals: entry.locals.clone(),
+            });
+        }
+        let table = Self {
+            function_id,
+            points,
+        };
+        table.validate_against_plan(plan)?;
+        Ok(table)
+    }
+
+    fn validate_against_plan(&self, plan: &PlannedJitDeoptResumeFunction) -> Result<(), String> {
+        if self.points.len() != plan.deopt_points.len() {
+            return Err(format!(
+                "runtime JIT deopt table for function {} has {} points, expected {}",
+                self.function_id,
+                self.points.len(),
+                plan.deopt_points.len()
+            ));
+        }
+        for (record, planned) in self.points.iter().zip(plan.deopt_points.iter()) {
+            if record.id != planned.id
+                || record.resume_point != planned.resume_point
+                || record.precision != planned.precision
+            {
+                return Err(format!(
+                    "runtime JIT deopt table record {:?} does not match planned point {:?}",
+                    record.id, planned.id
+                ));
+            }
+            let Some(entry) = plan.entry(planned.resume_point) else {
+                return Err(format!(
+                    "runtime JIT deopt table record {:?} references missing resume point {:?}",
+                    record.id, planned.resume_point
+                ));
+            };
+            if record.locals != entry.locals {
+                return Err(format!(
+                    "runtime JIT deopt table record {:?} has stale local materialization",
+                    record.id
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn function_id(&self) -> FunctionId {
+        self.function_id
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.points.len()
+    }
+}
+
 fn new_compiled_direct_runner_handle(
     session: &Arc<crate::session::CompileSession>,
     code_ptr: *const u8,
     default_code_ptr: *const u8,
     param_count: usize,
+    deopt_table: Arc<RuntimeJitDeoptTable>,
 ) -> ObjPtr {
     Box::into_raw(Box::new(CompiledSpecializedRunner {
         _session: Arc::clone(session),
@@ -1290,6 +1390,7 @@ fn new_compiled_direct_runner_handle(
             default_code_ptr,
             param_count,
         }),
+        direct_deopt_table: Some(deopt_table),
     })) as ObjPtr
 }
 
@@ -12131,6 +12232,10 @@ impl ProcessJitEngine {
                         function.function_id, function.names.qualname
                     )
                 })?;
+            let function_deopt_table = Arc::new(RuntimeJitDeoptTable::from_plan(
+                function.function_id,
+                function_jit_deopt_resume_plan,
+            )?);
             let built = build_cranelift_run_bb_specialized_function(
                 &mut state.jit_module,
                 function_blocks,
@@ -12237,6 +12342,7 @@ impl ProcessJitEngine {
                 },
                 artifact,
                 default_adapter_artifact,
+                deopt_table: function_deopt_table,
             });
         }
 
@@ -12260,6 +12366,7 @@ impl ProcessJitEngine {
                 code_ptr,
                 default_code_ptr,
                 defined.param_count,
+                Arc::clone(&defined.deopt_table),
             )?;
             let code_id = jitdump::record_code_load(
                 &defined.main_symbol,
@@ -15107,6 +15214,10 @@ fn compiled_direct_runner_info(
         return Err("invalid null compiled handle for direct vectorcall trampoline".to_string());
     }
     let compiled = unsafe { &*(compiled_handle as *const CompiledSpecializedRunner) };
+    debug_assert!(
+        compiled.direct_deopt_table.is_some(),
+        "compiled direct handle should carry a deopt table"
+    );
     match compiled.entry {
         Some(CompiledRunnerEntry::Direct {
             code_ptr,
@@ -15124,6 +15235,21 @@ pub(crate) fn compiled_direct_code_ptr(compiled_handle: ObjPtr) -> Result<ObjPtr
 pub(crate) fn compiled_default_direct_code_ptr(compiled_handle: ObjPtr) -> Result<ObjPtr, String> {
     compiled_direct_runner_info(compiled_handle)
         .map(|(_, default_code_ptr, _)| default_code_ptr as ObjPtr)
+}
+
+#[cfg(test)]
+fn compiled_direct_deopt_table(
+    compiled_handle: ObjPtr,
+) -> Result<Arc<RuntimeJitDeoptTable>, String> {
+    if compiled_handle.is_null() {
+        return Err("invalid null compiled handle for direct deopt table".to_string());
+    }
+    let compiled = unsafe { &*(compiled_handle as *const CompiledSpecializedRunner) };
+    compiled
+        .direct_deopt_table
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| "compiled direct handle does not carry a deopt table".to_string())
 }
 
 fn define_shared_vectorcall_trampoline(

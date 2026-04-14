@@ -2636,6 +2636,10 @@ def f():
                 1usize as *const u8,
                 1usize as *const u8,
                 first.params.len(),
+                std::sync::Arc::new(RuntimeJitDeoptTable {
+                    function_id: first.function_id,
+                    points: Vec::new(),
+                }),
             )
             .expect("first function should mark ready");
         let ready_handle = state
@@ -2788,14 +2792,24 @@ def f():
                 .state
                 .lock()
                 .expect("process JIT state lock should not be poisoned");
+            let first_handle = state
+                .ready_direct_function(&first)
+                .expect("root function should be marked ready");
+            let second_handle = state
+                .ready_direct_function(&second)
+                .expect("mutually-recursive callee should be marked ready");
+            let first_deopt_table = first_handle
+                .direct_deopt_table()
+                .expect("root compiled handle should carry deopt metadata");
+            assert_eq!(first_deopt_table.function_id(), first.function_id);
             assert!(
-                state.ready_direct_function(&first).is_some(),
-                "root function should be marked ready"
+                first_deopt_table.len() >= first.blocks.len() * 2,
+                "block entry and before-term points should be available for each block"
             );
-            assert!(
-                state.ready_direct_function(&second).is_some(),
-                "mutually-recursive callee should be marked ready"
-            );
+            let second_deopt_table = second_handle
+                .direct_deopt_table()
+                .expect("callee compiled handle should carry deopt metadata");
+            assert_eq!(second_deopt_table.function_id(), second.function_id);
         });
         result
     }
