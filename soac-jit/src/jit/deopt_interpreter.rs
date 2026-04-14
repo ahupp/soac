@@ -50,39 +50,53 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
     #[cold]
     unsafe fn execute_block_tail(
         &mut self,
-        block_label: BlockLabel,
-        start_body_index: usize,
+        mut block_label: BlockLabel,
+        mut start_body_index: usize,
     ) -> Result<ObjPtr, String> {
         let function = self.invocation.function();
-        let block = function
-            .blocks
-            .iter()
-            .find(|candidate| candidate.label == block_label)
-            .ok_or_else(|| {
+        loop {
+            let block = function
+                .blocks
+                .iter()
+                .find(|candidate| candidate.label == block_label)
+                .ok_or_else(|| {
+                    format!(
+                        "deopt continuation expected block {block_label} in function {}",
+                        function.function_id
+                    )
+                })?;
+            let body_tail = block.body.get(start_body_index..).ok_or_else(|| {
                 format!(
-                    "deopt continuation expected block {block_label} in function {}",
-                    function.function_id
+                    "deopt continuation start body index {start_body_index} is outside block {block_label}"
                 )
             })?;
-        let body_tail = block.body.get(start_body_index..).ok_or_else(|| {
-            format!(
-                "deopt continuation start body index {start_body_index} is outside block {block_label}"
-            )
-        })?;
-        for instr in body_tail {
-            let value = unsafe { self.execute_expr_owned(instr)? };
-            if value.is_null() {
-                return Ok(ptr::null_mut());
+            for instr in body_tail {
+                let value = unsafe { self.execute_expr_owned(instr)? };
+                if value.is_null() {
+                    return Ok(ptr::null_mut());
+                }
+                unsafe {
+                    ffi::Py_DECREF(value.cast::<ffi::PyObject>());
+                }
             }
-            unsafe {
-                ffi::Py_DECREF(value.cast::<ffi::PyObject>());
+            match &block.term {
+                BlockTerm::Return(value) => return unsafe { self.execute_expr_owned(value) },
+                BlockTerm::Jump(edge) if edge.args.is_empty() => {
+                    block_label = edge.target;
+                    start_body_index = 0;
+                }
+                BlockTerm::Jump(edge) => {
+                    return Err(format!(
+                        "deopt continuation for block {block_label} does not support jump args {:?}",
+                        edge.args
+                    ));
+                }
+                _ => {
+                    return Err(format!(
+                        "deopt continuation for block {block_label} only supports return or no-arg jump terms"
+                    ));
+                }
             }
-        }
-        match &block.term {
-            BlockTerm::Return(value) => unsafe { self.execute_expr_owned(value) },
-            _ => Err(format!(
-                "deopt continuation for block {block_label} only supports return terms"
-            )),
         }
     }
 

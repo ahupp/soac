@@ -1585,9 +1585,7 @@ fn runtime_jit_deopt_continuation_for_point(
             else {
                 return RuntimeJitDeoptContinuation::Unimplemented;
             };
-            if let BlockTerm::Return(value) = &block.term
-                && runtime_jit_deopt_expr_supported(value)
-            {
+            if runtime_jit_deopt_term_supported(&block.term) {
                 RuntimeJitDeoptContinuation::ResumeBlockTail {
                     block: block.label,
                     start_body_index: block.body.len(),
@@ -1627,6 +1625,14 @@ fn runtime_jit_deopt_continuation_for_point(
 fn runtime_jit_deopt_expr_supported(expr: &InstrCodegen) -> bool {
     match expr {
         InstrCodegen::Load(load) => !matches!(load.name.location, NameLocation::Cell(_)),
+        _ => false,
+    }
+}
+
+fn runtime_jit_deopt_term_supported(term: &BlockTerm<InstrCodegen>) -> bool {
+    match term {
+        BlockTerm::Return(value) => runtime_jit_deopt_expr_supported(value),
+        BlockTerm::Jump(edge) => edge.args.is_empty(),
         _ => false,
     }
 }
