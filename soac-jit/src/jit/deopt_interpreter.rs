@@ -88,8 +88,9 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             InstrCodegen::Load(load) => unsafe {
                 self.execute_load_owned(load.name.id.as_str(), load.name.location)
             },
+            InstrCodegen::Store(store) => unsafe { self.execute_store_owned(store) },
             _ => Err(format!(
-                "deopt continuation only supports simple load expressions, got {expr:?}"
+                "deopt continuation only supports simple load/store expressions, got {expr:?}"
             )),
         }
     }
@@ -146,6 +147,67 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             ));
         }
         unsafe { ffi::Py_INCREF(value.cast::<ffi::PyObject>()) };
+        Ok(value)
+    }
+
+    #[cold]
+    unsafe fn execute_store_owned(
+        &self,
+        store: &soac_blockpy::block_py::Store<InstrCodegen>,
+    ) -> Result<ObjPtr, String> {
+        match store.name.location {
+            NameLocation::Global(_) | NameLocation::GlobalName => unsafe {
+                self.execute_global_store_owned(store.name.id.as_str(), store.value.as_ref())
+            },
+            location => Err(format!(
+                "deopt continuation does not support storing {location:?} for {:?}",
+                store.name.id.as_str()
+            )),
+        }
+    }
+
+    #[cold]
+    unsafe fn execute_global_store_owned(
+        &self,
+        name: &str,
+        value_expr: &InstrCodegen,
+    ) -> Result<ObjPtr, String> {
+        let globals_obj = self.invocation.globals_obj();
+        if globals_obj.is_null() {
+            return Err(format!(
+                "deopt continuation expected module globals for global store {name:?}"
+            ));
+        }
+        let value = unsafe { self.execute_expr_owned(value_expr)? };
+        if value.is_null() {
+            return Ok(ptr::null_mut());
+        }
+        let name_len = match ffi::Py_ssize_t::try_from(name.len()) {
+            Ok(name_len) => name_len,
+            Err(_) => {
+                unsafe { ffi::Py_DECREF(value.cast::<ffi::PyObject>()) };
+                return Err(format!(
+                    "global-store deopt name {name:?} is too large to materialize as PyUnicode"
+                ));
+            }
+        };
+        let name_obj = unsafe { ffi::PyUnicode_FromStringAndSize(name.as_ptr().cast(), name_len) };
+        if name_obj.is_null() {
+            unsafe { ffi::Py_DECREF(value.cast::<ffi::PyObject>()) };
+            return Ok(ptr::null_mut());
+        }
+        let rc = unsafe {
+            ffi::PyObject_SetItem(
+                globals_obj.cast::<ffi::PyObject>(),
+                name_obj,
+                value.cast::<ffi::PyObject>(),
+            )
+        };
+        unsafe { ffi::Py_DECREF(name_obj) };
+        if rc != 0 {
+            unsafe { ffi::Py_DECREF(value.cast::<ffi::PyObject>()) };
+            return Ok(ptr::null_mut());
+        }
         Ok(value)
     }
 

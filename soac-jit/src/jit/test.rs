@@ -5343,6 +5343,95 @@ def f(x):
     }
 
     #[test]
+    fn deopt_block_tail_continuation_executes_global_store() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|_| {
+            let function = with_single_test_block(
+                test_function(),
+                vec![assign_stmt(
+                    test_global_name("x"),
+                    name_expr(test_constant_name(0)),
+                )],
+                ret_term(name_expr(test_global_name("x"))),
+            );
+            let function_id = function.function_id;
+            let block = function.entry_block().label;
+            let constant = unsafe { ffi::PyLong_FromLong(777_888_999) };
+            assert!(
+                !constant.is_null(),
+                "test module constant allocation should succeed"
+            );
+            let table = RuntimeJitDeoptTable {
+                function_id,
+                function: Box::new(function),
+                module_constant_ptrs: vec![constant.cast()],
+                points: vec![RuntimeJitDeoptRecord {
+                    id: PlannedJitDeoptPointId {
+                        function_id,
+                        ordinal: 0,
+                    },
+                    resume_point: LocalEnvResumePoint::BeforeInstr {
+                        key: InstrKey::new(function_id, InstrId::new(block, 0)),
+                    },
+                    precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                    locals: vec![],
+                    continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
+                        block,
+                        start_body_index: 0,
+                    },
+                }],
+            };
+            let globals = unsafe { ffi::PyDict_New() };
+            assert!(
+                !globals.is_null(),
+                "test globals dict allocation should succeed"
+            );
+            let before = unsafe { ffi::Py_REFCNT(constant) };
+            let result = unsafe {
+                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                    std::ptr::addr_of!(table).cast_mut().cast(),
+                    globals.cast(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!(
+                result,
+                constant.cast(),
+                "block-tail deopt should return the stored global value"
+            );
+            assert!(
+                unsafe { ffi::PyErr_Occurred() }.is_null(),
+                "successful block-tail store deopt should not leave a Python exception"
+            );
+            let key = unsafe { ffi::PyUnicode_FromString(c"x".as_ptr()) };
+            assert!(!key.is_null(), "test key allocation should succeed");
+            let stored = unsafe { ffi::PyDict_GetItemWithError(globals, key) };
+            assert_eq!(
+                stored, constant,
+                "block-tail deopt should store the module constant in globals"
+            );
+            assert!(
+                unsafe { ffi::PyErr_Occurred() }.is_null(),
+                "test globals lookup should not leave a Python exception"
+            );
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(constant) },
+                before + 2,
+                "global store and returned global load should each own one reference"
+            );
+            unsafe {
+                ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+                ffi::Py_DECREF(key);
+                ffi::Py_DECREF(globals);
+                ffi::Py_DECREF(constant);
+            }
+        });
+    }
+
+    #[test]
     fn deopt_resume_call_uses_function_env_deopt_table_and_ordinal() {
         let compile_session = crate::session::CompileSession::new();
         let mut jit_module =
