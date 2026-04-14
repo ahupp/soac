@@ -214,8 +214,13 @@ apply/verify mode:
   branch to a cold `dp_jit_deopt_resume` continuation instead of emitting
   the local slow global-load fallback. Loads nested inside another expression
   still use the local slow path until they have precise resume state.
-- Store guard misses or store failures still increment the fallback counter
-  when enabled and execute the existing global store slow path.
+- In `profile` mode, store guard misses or store failures still
+  increment the fallback counter when enabled and execute the existing
+  global store slow path.
+- In `verify`/`apply` mode, store guard misses for planned deopt
+  points use a cold `dp_jit_deopt_resume` continuation when the stored
+  value operand is safe to replay. Otherwise codegen keeps the existing
+  global store slow path.
 - In `verify`/`apply` mode, store fast paths can be emitted for
   non-module-scope code. The helper then performs a raw store into the expected
   indexed-values slot, including null first-insert slots or tombstone

@@ -1589,6 +1589,12 @@ fn emit_store<'fb>(
         let result_block = state.fb().create_block();
         state.fb().append_block_param(result_block, ptr_ty);
         let fallback_block = state.fb().create_block();
+        let pre_guard_operands = [op.value.as_ref()];
+        let guard_miss_dispatch = state.prepare_guard_miss_dispatch_for_instr(
+            instr_id,
+            &pre_guard_operands,
+            fallback_block,
+        );
         let direct_block = state.fb().create_block();
         state.fb().append_block_param(direct_block, ptr_ty);
         let direct_inst = state.fb().ins().call(
@@ -1609,7 +1615,7 @@ fn emit_store<'fb>(
                 .icmp(ir::condcodes::IntCC::Equal, direct_value, null_ptr);
         state.fb().ins().brif(
             direct_is_null,
-            fallback_block,
+            guard_miss_dispatch.branch_block(),
             &[],
             direct_block,
             &[ir::BlockArg::Value(direct_value)],
@@ -1628,22 +1634,62 @@ fn emit_store<'fb>(
             .ins()
             .jump(result_block, &[ir::BlockArg::Value(direct_value)]);
 
-        state.fb().switch_to_block(fallback_block);
-        increment_counter_with_state(state, fallback_counter_id);
-        let fallback_inst = state.fb().ins().call(
-            func_ref,
-            &[globals_obj, name_obj, slot_index, arg_values[0].0],
-        );
-        let fallback_value = state.fb().inst_results(fallback_inst)[0];
-        state.release_arg_values(&arg_values);
-        state
-            .fb()
-            .ins()
-            .call(decref_ref, &[thread_state_value, name_obj]);
-        state
-            .fb()
-            .ins()
-            .jump(result_block, &[ir::BlockArg::Value(fallback_value)]);
+        match guard_miss_dispatch {
+            JitGuardMissDispatch::FallbackBlock(fallback_block) => {
+                state.fb().switch_to_block(fallback_block);
+                increment_counter_with_state(state, fallback_counter_id);
+                let fallback_inst = state.fb().ins().call(
+                    func_ref,
+                    &[globals_obj, name_obj, slot_index, arg_values[0].0],
+                );
+                let fallback_value = state.fb().inst_results(fallback_inst)[0];
+                state.release_arg_values(&arg_values);
+                state
+                    .fb()
+                    .ins()
+                    .call(decref_ref, &[thread_state_value, name_obj]);
+                state
+                    .fb()
+                    .ins()
+                    .jump(result_block, &[ir::BlockArg::Value(fallback_value)]);
+            }
+            JitGuardMissDispatch::DeoptResume {
+                block,
+                target,
+                deopt_resume_ref,
+            } => {
+                state.fb().switch_to_block(block);
+                state.fb().set_cold_block(block);
+                increment_counter_with_state(state, fallback_counter_id);
+                let deopt_result = state.emit_deopt_resume_result(target, deopt_resume_ref);
+                state.release_arg_values(&arg_values);
+                state
+                    .fb()
+                    .ins()
+                    .call(decref_ref, &[thread_state_value, name_obj]);
+                let deopt_result_is_null =
+                    state
+                        .fb()
+                        .ins()
+                        .icmp(ir::condcodes::IntCC::Equal, deopt_result, null_ptr);
+                let deopt_success_block = state.fb().create_block();
+                state.fb().append_block_param(deopt_success_block, ptr_ty);
+                state.fb().set_cold_block(deopt_success_block);
+                let step_null_block = state.ctx().consts.step_null_block;
+                let step_null_args = super::step_null_block_args(state.ctx());
+                state.fb().ins().brif(
+                    deopt_result_is_null,
+                    step_null_block,
+                    &step_null_args,
+                    deopt_success_block,
+                    &[ir::BlockArg::Value(deopt_result)],
+                );
+
+                state.fb().switch_to_block(deopt_success_block);
+                let resumed_result = state.fb().block_params(deopt_success_block)[0];
+                state.fb().ins().return_(&[resumed_result]);
+            }
+        }
 
         state.fb().switch_to_block(result_block);
         state.fb().block_params(result_block)[0]

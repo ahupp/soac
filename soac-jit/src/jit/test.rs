@@ -12977,6 +12977,70 @@ def f(x, y):
         .expect("specialized JIT build should succeed")
     }
 
+    fn build_indexed_global_store_guard_miss_with_runtime_profile(
+        py: Python<'_>,
+        mode: &str,
+    ) -> BuiltSpecializedFunction {
+        let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", mode);
+        let soac_work_dir = fresh_test_work_dir("indexed-global-store-deopt-profile");
+        let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
+        let blocks = [1usize as ObjPtr];
+        let mut constants = TestConstantPool::default();
+        let function = with_single_test_block(
+            test_function(),
+            vec![op_expr(Store::new(
+                test_global_name("x"),
+                constants.int_expr(3),
+            ))],
+            ret_term(none_expr()),
+        );
+        let mut module = test_module(ModuleNameGen::new(0), vec![function]);
+        module.module_constants = constants.module_constants;
+        instrument_bb_module_with_call_target_counters(&mut module);
+        let shared_state = crate::module_type::build_shared_state_for_testing(
+            py,
+            module,
+            "indexed_global_store_deopt_profile_test",
+            "",
+        )
+        .expect("shared state should build");
+        let function = shared_state.lowered_module.callable_defs[0].clone();
+        let compile_session = crate::session::CompileSession::new();
+        let mut jit_module =
+            new_jit_module(&compile_session).expect("test jit module should construct");
+        let module_constant_ptrs = shared_state.module_constant_ptrs();
+        let module_constant_object_data_ids = declare_module_constant_object_data(
+            &mut jit_module,
+            &shared_state.lowered_module,
+            &module_constant_ptrs,
+        )
+        .expect("module constant object data should declare");
+        let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
+            define_test_counter_storage(
+                &mut jit_module,
+                &shared_state.lowered_module,
+                shared_state.lowered_module.counter_defs.as_slice(),
+            );
+        build_test_cranelift_run_bb_specialized_function(
+            &mut jit_module,
+            &blocks,
+            &shared_state.lowered_module,
+            &function,
+            &shared_state.codegen_constants,
+            shared_state.lowered_module.counter_defs.as_slice(),
+            module_constant_object_data_ids.as_slice(),
+            counter_slots_by_id.as_ref(),
+            scalar_counter_data_id,
+            top_value_counter_data_id,
+            &compile_session,
+            Some(shared_state.as_ref()),
+            None,
+            None,
+            BuildSpecializedFunctionOptions::default(),
+        )
+        .expect("specialized JIT build should succeed")
+    }
+
     #[test]
     fn indexed_global_guard_miss_deopt_enabled_by_verify_mode_runtime_profile() {
         if crate::run_test_in_isolated_process_if_needed(
@@ -13034,6 +13098,74 @@ def f(x, y):
                 count_direct_calls_to_runtime_helpers(&built.ctx.func, &slow_global_helpers),
                 1,
                 "profile mode should preserve the local slow global-load fallback"
+            );
+        });
+    }
+
+    #[test]
+    fn indexed_global_store_guard_miss_deopt_enabled_by_verify_mode_runtime_profile() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "indexed_global_store_guard_miss_deopt_enabled_by_verify_mode_runtime_profile",
+        ) {
+            return;
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let built = build_indexed_global_store_guard_miss_with_runtime_profile(py, "verify");
+            let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
+            let slow_store_helpers =
+                import_user_names_for_symbols(&built, &[SOAC_RUNTIME_STORE_GLOBAL_IMPORT.symbol]);
+            assert_eq!(
+                count_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
+                1,
+                "verify mode should enable indexed global store guard-miss deopt"
+            );
+            assert_eq!(
+                count_cold_block_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
+                1,
+                "verify-mode indexed global store deopt helper call should be cold"
+            );
+            assert_eq!(
+                count_deopt_helper_success_returns(&built.ctx.func, &deopt_helpers),
+                1,
+                "verify-mode indexed global store deopt should return a successful continuation result"
+            );
+            assert_eq!(
+                count_direct_calls_to_runtime_helpers(&built.ctx.func, &slow_store_helpers),
+                0,
+                "verify mode should not emit the local slow global-store fallback for a planned deopt point"
+            );
+        });
+    }
+
+    #[test]
+    fn indexed_global_store_guard_miss_deopt_disabled_by_profile_mode_runtime_profile() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "indexed_global_store_guard_miss_deopt_disabled_by_profile_mode_runtime_profile",
+        ) {
+            return;
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let built = build_indexed_global_store_guard_miss_with_runtime_profile(py, "profile");
+            let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
+            let indexed_store_helpers = import_user_names_for_symbols(
+                &built,
+                &[SOAC_RUNTIME_STORE_GLOBAL_INDEXED_IMPORT.symbol],
+            );
+            assert_eq!(
+                count_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
+                0,
+                "profile mode should not replace the global-store guard-miss path with deopt"
+            );
+            assert_eq!(
+                count_direct_calls_to_runtime_helpers(&built.ctx.func, &indexed_store_helpers),
+                0,
+                "profile mode should not enable the indexed global-store helper"
             );
         });
     }
@@ -14491,6 +14623,168 @@ def f(x, y):
             ffi::Py_DECREF(result.cast::<ffi::PyObject>());
             ffi::Py_DECREF(value);
             ffi::Py_DECREF(key);
+        });
+    }
+
+    #[test]
+    fn indexed_global_store_guard_miss_deopt_resumes_generic_store_runtime() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "indexed_global_store_guard_miss_deopt_resumes_generic_store_runtime",
+        ) {
+            return;
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| unsafe {
+            #[repr(C)]
+            struct TestFunctionEnv {
+                direct_code_ptr: *const u8,
+                default_direct_code_ptr: *const u8,
+                deopt_table_ptr: ObjPtr,
+                globals_obj: ObjPtr,
+            }
+
+            let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "verify");
+            let soac_work_dir = fresh_test_work_dir("indexed-global-store-deopt-runtime");
+            let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
+            let mut function = test_function();
+            function.params = ParamSpec {
+                params: vec![Param {
+                    name: "value".into(),
+                    kind: ParamKind::Any,
+                    has_default: false,
+                }],
+            };
+            function = with_single_test_block(
+                function,
+                vec![op_expr(Store::new(
+                    test_global_name("x"),
+                    name_expr(test_name("value")),
+                ))],
+                ret_term(name_expr(test_name("value"))),
+            );
+            set_stack_slots(&mut function, &["value"]);
+            let mut module = test_module(ModuleNameGen::new(0), vec![function]);
+            instrument_bb_module_with_call_target_counters(&mut module);
+            let shared_state = crate::module_type::build_shared_state_for_testing(
+                py,
+                module,
+                "global_store_deopt_test",
+                "",
+            )
+            .expect("shared state should build");
+            let _runtime = build_test_module_runtime(py, shared_state.clone());
+            let function = shared_state.lowered_module.callable_defs[0].clone();
+
+            let compile_session = crate::session::CompileSession::new();
+            let mut jit_module =
+                new_jit_module(&compile_session).expect("test jit module should construct");
+            let module_constant_ptrs = shared_state.module_constant_ptrs();
+            let module_constant_object_data_ids = declare_module_constant_object_data(
+                &mut jit_module,
+                &shared_state.lowered_module,
+                &module_constant_ptrs,
+            )
+            .expect("module constant object data should declare");
+            let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
+                define_test_counter_storage(
+                    &mut jit_module,
+                    &shared_state.lowered_module,
+                    shared_state.lowered_module.counter_defs.as_slice(),
+                );
+            let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
+            let built = build_test_cranelift_run_bb_specialized_function(
+                &mut jit_module,
+                blocks.as_slice(),
+                &shared_state.lowered_module,
+                &function,
+                &shared_state.codegen_constants,
+                shared_state.lowered_module.counter_defs.as_slice(),
+                module_constant_object_data_ids.as_slice(),
+                counter_slots_by_id.as_ref(),
+                scalar_counter_data_id,
+                top_value_counter_data_id,
+                &compile_session,
+                Some(shared_state.as_ref()),
+                None,
+                None,
+                BuildSpecializedFunctionOptions::default(),
+            )
+            .expect("specialized JIT build should succeed");
+            let facts = infer_jit_value_facts(&shared_state.lowered_module);
+            let module_plan = plan_jit_deopt_resume_module(&shared_state.lowered_module, &facts)
+                .expect("JIT deopt resume planning should succeed");
+            let function_plan = module_plan
+                .function(function.function_id)
+                .expect("function should have a JIT deopt plan");
+            let deopt_table =
+                RuntimeJitDeoptTable::from_plan(&function, function_plan, &module_constant_ptrs)
+                    .expect("runtime deopt table should build from plan");
+
+            let mut ctx = built.ctx;
+            define_prepared_function(
+                &mut jit_module,
+                built.main_id,
+                &mut ctx,
+                "test-global-store-deopt-resume",
+                "global-store deopt test should define",
+            )
+            .expect("test function should define");
+            jit_module.clear_context(&mut ctx);
+            jit_module
+                .finalize_definitions()
+                .expect("test jit module should finalize");
+            let code_ptr = jit_module.get_finalized_function(built.main_id);
+
+            let globals = ffi::PyDict_New();
+            assert!(!globals.is_null(), "test globals dict should allocate");
+            assert_eq!(
+                ffi::PyDict_SetItemString(
+                    globals,
+                    c"__builtins__".as_ptr(),
+                    ffi::PyEval_GetBuiltins()
+                ),
+                0,
+                "test globals should accept builtins"
+            );
+            let key = ffi::PyUnicode_FromString(c"x".as_ptr());
+            assert!(!key.is_null(), "test key allocation should succeed");
+            let value = ffi::PyLong_FromLong(445_566);
+            assert!(!value.is_null(), "test value allocation should succeed");
+
+            let function_env = TestFunctionEnv {
+                direct_code_ptr: code_ptr,
+                default_direct_code_ptr: std::ptr::null(),
+                deopt_table_ptr: std::ptr::addr_of!(deopt_table).cast_mut().cast(),
+                globals_obj: globals.cast(),
+            };
+            let entry: unsafe extern "C" fn(ObjPtr, ObjPtr, ObjPtr) -> ObjPtr =
+                std::mem::transmute(code_ptr);
+            let result = entry(
+                std::ptr::addr_of!(function_env).cast_mut().cast(),
+                ffi::PyThreadState_Get().cast(),
+                value.cast(),
+            );
+            assert!(
+                ffi::PyErr_Occurred().is_null(),
+                "successful global-store guard-miss deopt should not leave a Python exception"
+            );
+            assert_eq!(
+                result,
+                value.cast::<c_void>(),
+                "global-store guard-miss deopt should resume and return the stored value"
+            );
+            assert_eq!(
+                ffi::PyDict_GetItem(globals, key),
+                value,
+                "global-store guard-miss deopt should execute the generic global store"
+            );
+
+            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+            ffi::Py_DECREF(value);
+            ffi::Py_DECREF(key);
+            ffi::Py_DECREF(globals);
         });
     }
 
