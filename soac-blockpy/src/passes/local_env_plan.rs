@@ -181,11 +181,21 @@ pub enum LocalEnvResumeBindingState {
     Unbound,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalEnvResumeValueSource {
+    BlockParam(LocalLocation),
+    StackSlot(LocalLocation),
+    StoredValue(InstrKey),
+    Unbound,
+    Unknown,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalEnvResumeBinding {
     pub name: String,
     pub location: LocalLocation,
     pub binding: LocalEnvResumeBindingState,
+    pub source: LocalEnvResumeValueSource,
     pub ownership: LocalRefKind,
     pub value: Option<PyObjFacts>,
 }
@@ -649,16 +659,23 @@ fn render_local_env_resume_point(point: LocalEnvResumePoint) -> String {
 
 fn render_local_env_resume_binding(binding: &LocalEnvResumeBinding) -> String {
     format!(
-        "{}@{} binding={:?} ownership={:?} value={:?}",
-        binding.name, binding.location.0, binding.binding, binding.ownership, binding.value
+        "{}@{} binding={:?} source={:?} ownership={:?} value={:?}",
+        binding.name,
+        binding.location.0,
+        binding.binding,
+        binding.source,
+        binding.ownership,
+        binding.value
     )
 }
 
 fn resume_binding_from_planned_local(binding: &PlannedLocalBinding) -> LocalEnvResumeBinding {
+    let binding_state = resume_binding_state_for_planned_local(binding);
     LocalEnvResumeBinding {
         name: binding.name.clone(),
         location: binding.location,
-        binding: resume_binding_state_for_planned_local(binding),
+        binding: binding_state,
+        source: resume_value_source_for_planned_local(binding, binding_state),
         ownership: binding.param_facts.ownership,
         value: binding.param_facts.value,
     }
@@ -680,6 +697,23 @@ fn resume_binding_state_for_planned_local(
     }
 }
 
+fn resume_value_source_for_planned_local(
+    binding: &PlannedLocalBinding,
+    binding_state: LocalEnvResumeBindingState,
+) -> LocalEnvResumeValueSource {
+    if binding_state == LocalEnvResumeBindingState::Unbound {
+        return LocalEnvResumeValueSource::Unbound;
+    }
+    match binding.param_facts.provenance {
+        ParamProvenance::ExplicitBlockParam(location)
+        | ParamProvenance::ForwardedLocal(location) => {
+            LocalEnvResumeValueSource::BlockParam(location)
+        }
+        ParamProvenance::SyntheticUnbound(_) => LocalEnvResumeValueSource::Unbound,
+        ParamProvenance::StackSlot(location) => LocalEnvResumeValueSource::StackSlot(location),
+    }
+}
+
 fn transfer_resume_local_state(
     function_id: FunctionId,
     instr: &InstrCodegen,
@@ -698,21 +732,27 @@ fn transfer_resume_local_state(
                     .find(|binding| binding.location == location)
                 {
                     binding.binding = LocalEnvResumeBindingState::Unbound;
+                    binding.source = LocalEnvResumeValueSource::Unbound;
                     binding.ownership = LocalRefKind::Unbound;
                     binding.value = None;
                 }
                 return;
             }
-            let py_facts = op
+            let value_key = op
                 .value
                 .try_semantic_instr_id()
-                .and_then(|instr_id| facts.fact_for(InstrKey::new(function_id, instr_id)))
+                .map(|instr_id| InstrKey::new(function_id, instr_id));
+            let py_facts = value_key
+                .and_then(|key| facts.fact_for(key))
                 .and_then(|facts| facts.as_pyobj());
             if let Some(binding) = locals
                 .iter_mut()
                 .find(|binding| binding.location == location)
             {
                 binding.binding = LocalEnvResumeBindingState::Bound;
+                binding.source = value_key
+                    .map(LocalEnvResumeValueSource::StoredValue)
+                    .unwrap_or(LocalEnvResumeValueSource::Unknown);
                 binding.ownership = local_ref_kind_for_resume_value(py_facts);
                 binding.value = py_facts;
             }
@@ -726,6 +766,7 @@ fn transfer_resume_local_state(
                 .find(|binding| binding.location == location)
             {
                 binding.binding = LocalEnvResumeBindingState::Unbound;
+                binding.source = LocalEnvResumeValueSource::Unbound;
                 binding.ownership = LocalRefKind::Unbound;
                 binding.value = None;
             }
@@ -936,10 +977,19 @@ def f():
             .function(function.function_id)
             .expect("function should have a LocalEnv resume plan");
         assert!(function_plan.entries.iter().any(|entry| {
+            matches!(entry.point, LocalEnvResumePoint::BeforeInstr { .. })
+                && entry.locals.iter().any(|binding| {
+                    binding.name == "x"
+                        && binding.binding == LocalEnvResumeBindingState::Bound
+                        && matches!(binding.source, LocalEnvResumeValueSource::StoredValue(_))
+                })
+        }));
+        assert!(function_plan.entries.iter().any(|entry| {
             matches!(entry.point, LocalEnvResumePoint::BeforeTerm { .. })
                 && entry.locals.iter().any(|binding| {
                     binding.name == "x"
                         && binding.binding == LocalEnvResumeBindingState::Unbound
+                        && binding.source == LocalEnvResumeValueSource::Unbound
                         && binding.ownership == LocalRefKind::Unbound
                 })
         }));
