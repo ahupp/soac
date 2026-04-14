@@ -956,6 +956,7 @@ static DP_JIT_DEOPT_RESUME_IMPORT: ImportSpec = ImportSpec::new(
     &[
         SigType::Pointer,
         SigType::Pointer,
+        SigType::Pointer,
         SigType::I64,
         SigType::Pointer,
         SigType::I64,
@@ -1633,6 +1634,7 @@ pub(crate) struct RuntimeJitDeoptInvocation<'a> {
     table: &'a RuntimeJitDeoptTable,
     record: &'a RuntimeJitDeoptRecord,
     globals_obj: ObjPtr,
+    function_data_obj: ObjPtr,
     live_values: &'a [ObjPtr],
 }
 
@@ -1979,91 +1981,110 @@ fn runtime_jit_deopt_block_tail_supported(
     let Some(body_tail) = block.body.get(start_body_index..) else {
         return false;
     };
-    let storage_layout = function.storage_layout.as_ref();
+    let support = RuntimeJitDeoptSupportCtx::new(function);
     body_tail
         .iter()
-        .all(|expr| runtime_jit_deopt_expr_supported(expr, storage_layout))
-        && runtime_jit_deopt_term_supported(&block.term, storage_layout)
+        .all(|expr| runtime_jit_deopt_expr_supported(expr, &support))
+        && runtime_jit_deopt_term_supported(&block.term, &support)
         && block
             .exc_edge
             .as_ref()
             .is_none_or(runtime_jit_deopt_exception_edge_supported)
 }
 
+struct RuntimeJitDeoptSupportCtx<'a> {
+    storage_layout: Option<&'a StorageLayout>,
+    runtime_layout: FunctionRuntimeDataLayout,
+}
+
+impl<'a> RuntimeJitDeoptSupportCtx<'a> {
+    fn new(function: &'a BlockPyFunction<CodegenModuleShape>) -> Self {
+        RuntimeJitDeoptSupportCtx {
+            storage_layout: function.storage_layout.as_ref(),
+            runtime_layout: FunctionRuntimeDataLayout::from_function(function),
+        }
+    }
+
+    fn owned_cell_supported(&self, slot: u32) -> bool {
+        self.storage_layout
+            .and_then(|layout| layout.local_cell_slot(slot))
+            .is_some()
+    }
+
+    fn closure_cell_supported(&self, slot: u32) -> bool {
+        (slot as usize) < self.runtime_layout.closure_len()
+    }
+}
+
 fn runtime_jit_deopt_expr_supported(
     expr: &InstrCodegen,
-    storage_layout: Option<&StorageLayout>,
+    support: &RuntimeJitDeoptSupportCtx<'_>,
 ) -> bool {
     match expr {
         InstrCodegen::Load(load) => match load.name.location {
-            NameLocation::Cell(CellLocation::Owned(slot)) => storage_layout
-                .and_then(|layout| layout.local_cell_slot(slot))
-                .is_some(),
-            NameLocation::Cell(CellLocation::Closure(_))
-            | NameLocation::Cell(CellLocation::CapturedSource(_)) => false,
+            NameLocation::Cell(CellLocation::Owned(slot)) => support.owned_cell_supported(slot),
+            NameLocation::Cell(CellLocation::Closure(slot))
+            | NameLocation::Cell(CellLocation::CapturedSource(slot)) => {
+                support.closure_cell_supported(slot)
+            }
             _ => true,
         },
         InstrCodegen::BinOp(binop) => {
             runtime_jit_deopt_binop_supported(binop.kind)
-                && runtime_jit_deopt_expr_supported(&binop.left, storage_layout)
-                && runtime_jit_deopt_expr_supported(&binop.right, storage_layout)
+                && runtime_jit_deopt_expr_supported(&binop.left, support)
+                && runtime_jit_deopt_expr_supported(&binop.right, support)
         }
-        InstrCodegen::UnaryOp(unary) => {
-            runtime_jit_deopt_expr_supported(&unary.operand, storage_layout)
-        }
+        InstrCodegen::UnaryOp(unary) => runtime_jit_deopt_expr_supported(&unary.operand, support),
         InstrCodegen::GetAttr(getattr) => {
-            runtime_jit_deopt_expr_supported(&getattr.value, storage_layout)
-                && runtime_jit_deopt_expr_supported(&getattr.attr, storage_layout)
+            runtime_jit_deopt_expr_supported(&getattr.value, support)
+                && runtime_jit_deopt_expr_supported(&getattr.attr, support)
         }
         InstrCodegen::GetItem(getitem) => {
-            runtime_jit_deopt_expr_supported(&getitem.value, storage_layout)
-                && runtime_jit_deopt_expr_supported(&getitem.index, storage_layout)
+            runtime_jit_deopt_expr_supported(&getitem.value, support)
+                && runtime_jit_deopt_expr_supported(&getitem.index, support)
         }
         InstrCodegen::SetAttr(setattr) => {
-            runtime_jit_deopt_expr_supported(&setattr.value, storage_layout)
-                && runtime_jit_deopt_expr_supported(&setattr.attr, storage_layout)
-                && runtime_jit_deopt_expr_supported(&setattr.replacement, storage_layout)
+            runtime_jit_deopt_expr_supported(&setattr.value, support)
+                && runtime_jit_deopt_expr_supported(&setattr.attr, support)
+                && runtime_jit_deopt_expr_supported(&setattr.replacement, support)
         }
         InstrCodegen::SetItem(setitem) => {
-            runtime_jit_deopt_expr_supported(&setitem.value, storage_layout)
-                && runtime_jit_deopt_expr_supported(&setitem.index, storage_layout)
-                && runtime_jit_deopt_expr_supported(&setitem.replacement, storage_layout)
+            runtime_jit_deopt_expr_supported(&setitem.value, support)
+                && runtime_jit_deopt_expr_supported(&setitem.index, support)
+                && runtime_jit_deopt_expr_supported(&setitem.replacement, support)
         }
         InstrCodegen::DelItem(delitem) => {
-            runtime_jit_deopt_expr_supported(&delitem.value, storage_layout)
-                && runtime_jit_deopt_expr_supported(&delitem.index, storage_layout)
+            runtime_jit_deopt_expr_supported(&delitem.value, support)
+                && runtime_jit_deopt_expr_supported(&delitem.index, support)
         }
         InstrCodegen::CalleeFunctionId(callee) => {
-            runtime_jit_deopt_expr_supported(&callee.value, storage_layout)
+            runtime_jit_deopt_expr_supported(&callee.value, support)
         }
-        InstrCodegen::Call(call) => runtime_jit_deopt_call_parts_supported(
-            &call.func,
-            &call.args,
-            &call.keywords,
-            storage_layout,
-        ),
+        InstrCodegen::Call(call) => {
+            runtime_jit_deopt_call_parts_supported(&call.func, &call.args, &call.keywords, support)
+        }
         InstrCodegen::CallDirect(call) => runtime_jit_deopt_call_parts_supported(
             &call.callable,
             &call.args,
             &call.keywords,
-            storage_layout,
+            support,
         ),
         InstrCodegen::Store(store) => {
-            runtime_jit_deopt_name_location_supported(store.name.location, storage_layout)
-                && runtime_jit_deopt_expr_supported(&store.value, storage_layout)
+            runtime_jit_deopt_name_location_supported(store.name.location, support)
+                && runtime_jit_deopt_expr_supported(&store.value, support)
         }
         InstrCodegen::Del(del) => {
-            runtime_jit_deopt_name_location_supported(del.name.location, storage_layout)
+            runtime_jit_deopt_name_location_supported(del.name.location, support)
         }
         InstrCodegen::IncrementCounter(_) => true,
         InstrCodegen::MakeCell(make_cell) => {
-            runtime_jit_deopt_expr_supported(&make_cell.initial_value, storage_layout)
+            runtime_jit_deopt_expr_supported(&make_cell.initial_value, support)
         }
         InstrCodegen::CellRef(cell_ref) => match cell_ref.location {
-            CellLocation::Owned(slot) => storage_layout
-                .and_then(|layout| layout.local_cell_slot(slot))
-                .is_some(),
-            CellLocation::Closure(_) | CellLocation::CapturedSource(_) => false,
+            CellLocation::Owned(slot) => support.owned_cell_supported(slot),
+            CellLocation::Closure(slot) | CellLocation::CapturedSource(slot) => {
+                support.closure_cell_supported(slot)
+            }
         },
         _ => false,
     }
@@ -2071,14 +2092,14 @@ fn runtime_jit_deopt_expr_supported(
 
 fn runtime_jit_deopt_name_location_supported(
     location: NameLocation,
-    storage_layout: Option<&StorageLayout>,
+    support: &RuntimeJitDeoptSupportCtx<'_>,
 ) -> bool {
     match location {
-        NameLocation::Cell(CellLocation::Owned(slot)) => storage_layout
-            .and_then(|layout| layout.local_cell_slot(slot))
-            .is_some(),
-        NameLocation::Cell(CellLocation::Closure(_))
-        | NameLocation::Cell(CellLocation::CapturedSource(_)) => false,
+        NameLocation::Cell(CellLocation::Owned(slot)) => support.owned_cell_supported(slot),
+        NameLocation::Cell(CellLocation::Closure(slot))
+        | NameLocation::Cell(CellLocation::CapturedSource(slot)) => {
+            support.closure_cell_supported(slot)
+        }
         _ => true,
     }
 }
@@ -2087,24 +2108,16 @@ fn runtime_jit_deopt_call_parts_supported(
     callable: &InstrCodegen,
     args: &[CallArgPositional<InstrCodegen>],
     keywords: &[CallArgKeyword<InstrCodegen>],
-    storage_layout: Option<&StorageLayout>,
+    support: &RuntimeJitDeoptSupportCtx<'_>,
 ) -> bool {
-    runtime_jit_deopt_expr_supported(callable, storage_layout)
+    runtime_jit_deopt_expr_supported(callable, support)
         && args.iter().all(|arg| match arg {
-            CallArgPositional::Positional(expr) => {
-                runtime_jit_deopt_expr_supported(expr, storage_layout)
-            }
-            CallArgPositional::Starred(expr) => {
-                runtime_jit_deopt_expr_supported(expr, storage_layout)
-            }
+            CallArgPositional::Positional(expr) => runtime_jit_deopt_expr_supported(expr, support),
+            CallArgPositional::Starred(expr) => runtime_jit_deopt_expr_supported(expr, support),
         })
         && keywords.iter().all(|keyword| match keyword {
-            CallArgKeyword::Named { value, .. } => {
-                runtime_jit_deopt_expr_supported(value, storage_layout)
-            }
-            CallArgKeyword::Starred(value) => {
-                runtime_jit_deopt_expr_supported(value, storage_layout)
-            }
+            CallArgKeyword::Named { value, .. } => runtime_jit_deopt_expr_supported(value, support),
+            CallArgKeyword::Starred(value) => runtime_jit_deopt_expr_supported(value, support),
         })
 }
 
@@ -2150,10 +2163,10 @@ fn runtime_jit_deopt_binop_supported(kind: blockpy_intrinsics::BinOpKind) -> boo
 
 fn runtime_jit_deopt_term_supported(
     term: &BlockTerm<InstrCodegen>,
-    storage_layout: Option<&StorageLayout>,
+    support: &RuntimeJitDeoptSupportCtx<'_>,
 ) -> bool {
     match term {
-        BlockTerm::Return(value) => runtime_jit_deopt_expr_supported(value, storage_layout),
+        BlockTerm::Return(value) => runtime_jit_deopt_expr_supported(value, support),
         BlockTerm::Jump(edge) => edge.args.iter().all(|arg| {
             matches!(
                 arg,
@@ -2163,16 +2176,12 @@ fn runtime_jit_deopt_term_supported(
                     | BlockArg::AbruptKind(_)
             )
         }),
-        BlockTerm::IfTerm(if_term) => {
-            runtime_jit_deopt_expr_supported(&if_term.test, storage_layout)
-        }
-        BlockTerm::BranchTable(branch) => {
-            runtime_jit_deopt_expr_supported(&branch.index, storage_layout)
-        }
+        BlockTerm::IfTerm(if_term) => runtime_jit_deopt_expr_supported(&if_term.test, support),
+        BlockTerm::BranchTable(branch) => runtime_jit_deopt_expr_supported(&branch.index, support),
         BlockTerm::Raise(raise) => raise
             .exc
             .as_ref()
-            .is_none_or(|exc| runtime_jit_deopt_expr_supported(exc, storage_layout)),
+            .is_none_or(|exc| runtime_jit_deopt_expr_supported(exc, support)),
     }
 }
 
@@ -2189,6 +2198,7 @@ impl RuntimeJitDeoptInvocation<'_> {
     pub(crate) unsafe fn from_raw<'a>(
         deopt_table: ObjPtr,
         globals_obj: ObjPtr,
+        function_data_obj: ObjPtr,
         record_ordinal: i64,
         live_values: ObjPtr,
         live_value_count: i64,
@@ -2213,6 +2223,7 @@ impl RuntimeJitDeoptInvocation<'_> {
             table,
             record,
             globals_obj,
+            function_data_obj,
             live_values,
         })
     }
@@ -2227,6 +2238,10 @@ impl RuntimeJitDeoptInvocation<'_> {
 
     pub(crate) fn globals_obj(&self) -> ObjPtr {
         self.globals_obj
+    }
+
+    pub(crate) fn function_data_obj(&self) -> ObjPtr {
+        self.function_data_obj
     }
 
     pub(crate) fn module_constant_ptr(&self, constant_index: u32) -> Result<ObjPtr, String> {
@@ -3579,6 +3594,10 @@ fn emit_deopt_resume_call(
         target.function_env_value,
         FUNCTION_ENV_DEOPT_TABLE_PTR_OFFSET,
     );
+    let function_data = fb.ins().iadd_imm(
+        target.function_env_value,
+        i64::from(FUNCTION_ENV_RUNTIME_OBJECTS_OFFSET),
+    );
     let record_ordinal = fb.ins().iconst(i64_ty, target.record_ordinal);
     let live_value_count = i64::try_from(live_value_count)
         .unwrap_or_else(|_| panic!("deopt live value count does not fit i64"));
@@ -3588,6 +3607,7 @@ fn emit_deopt_resume_call(
         &[
             deopt_table,
             globals_obj,
+            function_data,
             record_ordinal,
             live_values_base,
             live_value_count,

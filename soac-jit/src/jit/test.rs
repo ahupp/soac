@@ -33,6 +33,45 @@ mod tests {
         fn PyCell_New(obj: *mut ffi::PyObject) -> *mut ffi::PyObject;
     }
 
+    unsafe fn test_dp_jit_deopt_resume(
+        deopt_table: ObjPtr,
+        globals_obj: ObjPtr,
+        record_ordinal: i64,
+        live_values: ObjPtr,
+        live_value_count: i64,
+    ) -> ObjPtr {
+        unsafe {
+            crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                deopt_table,
+                globals_obj,
+                std::ptr::null_mut(),
+                record_ordinal,
+                live_values,
+                live_value_count,
+            )
+        }
+    }
+
+    unsafe fn test_dp_jit_deopt_resume_with_function_data(
+        deopt_table: ObjPtr,
+        globals_obj: ObjPtr,
+        function_data_obj: ObjPtr,
+        record_ordinal: i64,
+        live_values: ObjPtr,
+        live_value_count: i64,
+    ) -> ObjPtr {
+        unsafe {
+            crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                deopt_table,
+                globals_obj,
+                function_data_obj,
+                record_ordinal,
+                live_values,
+                live_value_count,
+            )
+        }
+    }
+
     static CAPSULE_DESTROYED: AtomicBool = AtomicBool::new(false);
     static NEXT_TEST_WORK_DIR_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -4975,6 +5014,7 @@ def read_point(point):
             RuntimeJitDeoptInvocation::from_raw(
                 std::ptr::addr_of!(table).cast_mut().cast(),
                 std::ptr::null_mut(),
+                std::ptr::null_mut(),
                 0,
                 live_values.as_mut_ptr().cast(),
                 live_values.len() as i64,
@@ -5347,9 +5387,18 @@ def f(x):
 
     #[test]
     fn runtime_deopt_table_rejects_unsupported_block_entry_tail() {
+        let test_function = test_function();
+        let unsupported_function_id = test_function.function_id;
         let function = with_single_test_block(
-            test_function(),
-            vec![expr_stmt(name_expr(test_closure_cell_name("cell", 0)))],
+            test_function,
+            vec![expr_stmt(op_expr(
+                soac_blockpy::block_py::MakeFunction::new(
+                    unsupported_function_id,
+                    soac_blockpy::block_py::FunctionKind::Function,
+                    Box::new(none_expr()),
+                    Box::new(none_expr()),
+                ),
+            ))],
             ret_term(none_expr()),
         );
         let module = test_module(ModuleNameGen::new(0), vec![function]);
@@ -5559,6 +5608,76 @@ def f(x):
         let record = table
             .record_for_point(point)
             .expect("before-term owned-cell-ref point should have a runtime record");
+        assert_eq!(
+            record.continuation(),
+            &RuntimeJitDeoptContinuation::ResumeBlockTail {
+                cursor: RuntimeJitDeoptCursor::new(block.label, block.body.len()),
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_deopt_table_marks_closure_cell_ref_return_continuation() {
+        let function = with_single_test_block(
+            test_function(),
+            vec![],
+            ret_term(op_expr(soac_blockpy::block_py::CellRef::new(
+                CellLocation::Closure(0),
+            ))),
+        );
+        let module = test_module(ModuleNameGen::new(0), vec![function]);
+        let function = &module.callable_defs[0];
+        let block = function.entry_block();
+        let facts = infer_module_value_facts(&module);
+        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+            .expect("JIT deopt resume planning should succeed");
+        let function_plan = module_plan
+            .function(function.function_id)
+            .expect("function should have a JIT deopt plan");
+        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
+            .expect("runtime deopt table should build from plan");
+        let point = LocalEnvResumePoint::BeforeTerm {
+            function_id: function.function_id,
+            block: block.label,
+        };
+        let record = table
+            .record_for_point(point)
+            .expect("before-term closure-cell-ref point should have a runtime record");
+        assert_eq!(
+            record.continuation(),
+            &RuntimeJitDeoptContinuation::ResumeBlockTail {
+                cursor: RuntimeJitDeoptCursor::new(block.label, block.body.len()),
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_deopt_table_marks_captured_source_cell_ref_return_continuation() {
+        let function = with_single_test_block(
+            test_function(),
+            vec![],
+            ret_term(op_expr(soac_blockpy::block_py::CellRef::new(
+                CellLocation::CapturedSource(0),
+            ))),
+        );
+        let module = test_module(ModuleNameGen::new(0), vec![function]);
+        let function = &module.callable_defs[0];
+        let block = function.entry_block();
+        let facts = infer_module_value_facts(&module);
+        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+            .expect("JIT deopt resume planning should succeed");
+        let function_plan = module_plan
+            .function(function.function_id)
+            .expect("function should have a JIT deopt plan");
+        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
+            .expect("runtime deopt table should build from plan");
+        let point = LocalEnvResumePoint::BeforeTerm {
+            function_id: function.function_id,
+            block: block.label,
+        };
+        let record = table
+            .record_for_point(point)
+            .expect("before-term captured-source-cell-ref point should have a runtime record");
         assert_eq!(
             record.continuation(),
             &RuntimeJitDeoptContinuation::ResumeBlockTail {
@@ -6117,7 +6236,7 @@ def f(x):
                 }],
             };
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     std::ptr::null_mut(),
                     0,
@@ -6186,7 +6305,7 @@ def f(x):
             }
             let mut live_values = vec![value.cast::<c_void>()];
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     std::ptr::null_mut(),
                     0,
@@ -6253,7 +6372,7 @@ def f(x):
             }
             let mut live_values = vec![value.cast::<c_void>()];
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     std::ptr::null_mut(),
                     0,
@@ -6327,7 +6446,7 @@ def f(x):
             );
             let before = unsafe { ffi::Py_REFCNT(value) };
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     globals.cast(),
                     0,
@@ -6401,7 +6520,7 @@ def f(x):
             );
             let before = unsafe { ffi::Py_REFCNT(value) };
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     globals.cast(),
                     0,
@@ -6504,7 +6623,7 @@ def f(x):
             let mut live_values = vec![std::ptr::null_mut::<c_void>()];
             let before_input = unsafe { ffi::Py_REFCNT(input) };
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     std::ptr::null_mut(),
                     0,
@@ -6586,7 +6705,7 @@ def f(x):
             let before_body = unsafe { ffi::Py_REFCNT(body_value) };
             let before_return = unsafe { ffi::Py_REFCNT(return_value) };
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     std::ptr::null_mut(),
                     ordinal,
@@ -6653,7 +6772,7 @@ def f(x):
                 .ordinal as i64;
 
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     std::ptr::null_mut(),
                     ordinal,
@@ -6711,7 +6830,7 @@ def f(x):
                 }],
             };
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     std::ptr::null_mut(),
                     0,
@@ -6812,7 +6931,7 @@ def f(x):
             }
             let mut live_values = vec![x_value.cast::<c_void>(), old_y_value.cast::<c_void>()];
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     std::ptr::null_mut(),
                     0,
@@ -6909,7 +7028,7 @@ def f(x):
             }
             let mut live_values = vec![old_y_value.cast::<c_void>()];
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     std::ptr::null_mut(),
                     0,
@@ -7003,7 +7122,7 @@ def f(x):
             }
             let mut live_values = vec![old_kind_value.cast::<c_void>()];
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     std::ptr::null_mut(),
                     0,
@@ -7109,7 +7228,7 @@ def f(x):
             }
             let mut live_values = vec![old_exc_value.cast::<c_void>()];
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     std::ptr::null_mut(),
                     0,
@@ -7209,7 +7328,7 @@ def f(x):
             let before_condition = unsafe { ffi::Py_REFCNT(condition) };
             let before_else = unsafe { ffi::Py_REFCNT(else_value) };
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     std::ptr::null_mut(),
                     0,
@@ -7324,7 +7443,7 @@ def f(x):
             };
             let before_second = unsafe { ffi::Py_REFCNT(second_value) };
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     std::ptr::null_mut(),
                     0,
@@ -7463,7 +7582,7 @@ def g():
             let before_callable = unsafe { ffi::Py_REFCNT(callable) };
             let before_second = unsafe { ffi::Py_REFCNT(second_value) };
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     std::ptr::null_mut(),
                     0,
@@ -7553,7 +7672,7 @@ def g():
             let before_constant = unsafe { ffi::Py_REFCNT(constant) };
             let before_value = unsafe { ffi::Py_REFCNT(value) };
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     globals.cast(),
                     0,
@@ -7636,7 +7755,7 @@ def g():
             let before_left = unsafe { ffi::Py_REFCNT(left) };
             let before_right = unsafe { ffi::Py_REFCNT(right) };
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     std::ptr::null_mut(),
                     0,
@@ -7721,7 +7840,7 @@ def g():
                 };
                 let before_operand = unsafe { ffi::Py_REFCNT(operand) };
                 let result = unsafe {
-                    crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                    test_dp_jit_deopt_resume(
                         std::ptr::addr_of!(table).cast_mut().cast(),
                         std::ptr::null_mut(),
                         0,
@@ -7802,7 +7921,7 @@ def g():
                 }],
             };
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     std::ptr::null_mut(),
                     0,
@@ -7887,7 +8006,7 @@ def g():
                 }],
             };
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     std::ptr::null_mut(),
                     0,
@@ -7966,7 +8085,7 @@ def g():
                 }],
             };
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     std::ptr::null_mut(),
                     0,
@@ -8049,7 +8168,7 @@ def g():
                 }],
             };
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     std::ptr::null_mut(),
                     0,
@@ -8135,7 +8254,7 @@ def g():
                 }],
             };
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     std::ptr::null_mut(),
                     0,
@@ -8215,7 +8334,7 @@ def g():
             };
             let before_input = unsafe { ffi::Py_REFCNT(input) };
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     std::ptr::null_mut(),
                     0,
@@ -8303,7 +8422,7 @@ def g():
             };
             let before_starred_args = unsafe { ffi::Py_REFCNT(starred_args) };
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     std::ptr::null_mut(),
                     0,
@@ -8384,7 +8503,7 @@ def g():
             };
             let before_value = unsafe { ffi::Py_REFCNT(value) };
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     std::ptr::null_mut(),
                     0,
@@ -8495,7 +8614,7 @@ def g():
             };
             let before_kwargs = unsafe { ffi::Py_REFCNT(kwargs) };
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     std::ptr::null_mut(),
                     0,
@@ -8613,7 +8732,7 @@ def g():
                 }],
             };
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     std::ptr::null_mut(),
                     0,
@@ -8686,7 +8805,7 @@ def g():
             };
             let before_input = unsafe { ffi::Py_REFCNT(input) };
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     std::ptr::null_mut(),
                     0,
@@ -8758,7 +8877,7 @@ def g():
             };
             let before_value = unsafe { ffi::Py_REFCNT(cell_value) };
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     std::ptr::null_mut(),
                     0,
@@ -8842,7 +8961,7 @@ def g():
                 }],
             };
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     std::ptr::null_mut(),
                     0,
@@ -8940,7 +9059,7 @@ def g():
             let before_cell = unsafe { ffi::Py_REFCNT(cell) };
             let mut live_values = vec![cell.cast::<c_void>()];
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     std::ptr::null_mut(),
                     0,
@@ -8971,6 +9090,80 @@ def g():
                 "dropping the returned cell_ref should release the returned reference"
             );
             unsafe {
+                ffi::Py_DECREF(cell);
+                ffi::Py_DECREF(cell_contents);
+            }
+        });
+    }
+
+    #[test]
+    fn deopt_block_tail_continuation_executes_return_closure_cell_ref() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|_| {
+            let function = with_single_test_block(
+                test_function(),
+                vec![],
+                ret_term(op_expr(soac_blockpy::block_py::CellRef::new(
+                    CellLocation::Closure(0),
+                ))),
+            );
+            let function_id = function.function_id;
+            let block = function.entry_block().label;
+            let layout = FunctionRuntimeDataLayout::from_function(&function);
+            let cell_contents = unsafe { ffi::PyLong_FromLong(987_654_321) };
+            assert!(
+                !cell_contents.is_null(),
+                "test cell contents allocation should succeed"
+            );
+            let cell = unsafe { PyCell_New(cell_contents) };
+            assert!(!cell.is_null(), "test cell allocation should succeed");
+            let mut function_data: Vec<ObjPtr> = vec![std::ptr::null_mut(); layout.total_len()];
+            function_data[layout.closure_cell_slot(0)] = cell.cast();
+            let table = RuntimeJitDeoptTable {
+                function_id,
+                function: Box::new(function),
+                module_constant_ptrs: vec![],
+                points: vec![RuntimeJitDeoptRecord {
+                    id: PlannedJitDeoptPointId {
+                        function_id,
+                        ordinal: 0,
+                    },
+                    resume_point: LocalEnvResumePoint::BeforeTerm { function_id, block },
+                    precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                    locals: vec![],
+                    continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
+                        cursor: RuntimeJitDeoptCursor::at_block_entry(block),
+                    },
+                }],
+            };
+            let before_cell = unsafe { ffi::Py_REFCNT(cell) };
+            let result = unsafe {
+                test_dp_jit_deopt_resume_with_function_data(
+                    std::ptr::addr_of!(table).cast_mut().cast(),
+                    std::ptr::null_mut(),
+                    function_data.as_mut_ptr().cast(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!(
+                result,
+                cell.cast(),
+                "closure-cell-ref deopt should return the function-data cell object"
+            );
+            assert!(
+                unsafe { ffi::PyErr_Occurred() }.is_null(),
+                "successful closure-cell-ref deopt should not leave a Python exception"
+            );
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(cell) },
+                before_cell + 1,
+                "closure-cell-ref deopt should return an owned reference"
+            );
+            unsafe {
+                ffi::Py_DECREF(result.cast::<ffi::PyObject>());
                 ffi::Py_DECREF(cell);
                 ffi::Py_DECREF(cell_contents);
             }
@@ -9036,7 +9229,7 @@ def g():
             let before_cell = unsafe { ffi::Py_REFCNT(cell) };
             let mut live_values = vec![cell.cast::<c_void>()];
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     std::ptr::null_mut(),
                     0,
@@ -9145,7 +9338,7 @@ def g():
             let before_replacement = unsafe { ffi::Py_REFCNT(replacement) };
             let mut live_values = vec![cell.cast::<c_void>()];
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     std::ptr::null_mut(),
                     0,
@@ -9254,7 +9447,7 @@ def g():
             let before_contents = unsafe { ffi::Py_REFCNT(cell_contents) };
             let mut live_values = vec![cell.cast::<c_void>()];
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     std::ptr::null_mut(),
                     0,
@@ -9335,7 +9528,7 @@ def g():
             };
             let before_exc = unsafe { ffi::Py_REFCNT(exc) };
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     std::ptr::null_mut(),
                     0,
@@ -9415,7 +9608,7 @@ def g():
                 }],
             };
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     std::ptr::null_mut(),
                     0,
@@ -9485,7 +9678,7 @@ def g():
                 ffi::PyErr_SetRaisedException(exc);
             }
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     std::ptr::null_mut(),
                     0,
@@ -9575,7 +9768,7 @@ def g():
             );
             let before = unsafe { ffi::Py_REFCNT(constant) };
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     globals.cast(),
                     0,
@@ -9664,7 +9857,7 @@ def g():
             );
             let before = unsafe { ffi::Py_REFCNT(value) };
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     globals.cast(),
                     0,
@@ -9763,7 +9956,7 @@ def g():
             }
             let mut live_values = vec![old_value.cast::<c_void>()];
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     std::ptr::null_mut(),
                     0,
@@ -9846,7 +10039,7 @@ def g():
             }
             let mut live_values = vec![value.cast::<c_void>()];
             let result = unsafe {
-                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                test_dp_jit_deopt_resume(
                     std::ptr::addr_of!(table).cast_mut().cast(),
                     std::ptr::null_mut(),
                     0,
@@ -12188,11 +12381,11 @@ def f(x, y):
         };
         assert_eq!(
             deopt_args.len(),
-            5,
-            "deopt helper call should pass table, globals, record ordinal, live buffer, and live count"
+            6,
+            "deopt helper call should pass table, globals, function data, record ordinal, live buffer, and live count"
         );
         assert!(
-            value_is_iconst_imm(&built.ctx.func, deopt_args[4], 1),
+            value_is_iconst_imm(&built.ctx.func, deopt_args[5], 1),
             "guard-miss deopt should pass one live local value for x"
         );
     }

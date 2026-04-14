@@ -1,6 +1,6 @@
 use super::{
-    RuntimeJitDeoptCursor, RuntimeJitDeoptInvocation, RuntimeJitDeoptLocals,
-    specialized_helpers::ObjPtr,
+    FunctionRuntimeDataLayout, RuntimeJitDeoptCursor, RuntimeJitDeoptInvocation,
+    RuntimeJitDeoptLocals, specialized_helpers::ObjPtr,
 };
 use crate::module_constants::load_runtime_name_owned;
 use pyo3::ffi;
@@ -383,11 +383,22 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
         location: CellLocation,
         debug_name: &str,
     ) -> Result<ObjPtr, String> {
-        let CellLocation::Owned(slot) = location else {
-            return Err(format!(
-                "deopt continuation does not support {debug_name} for {location:?}"
-            ));
-        };
+        match location {
+            CellLocation::Owned(slot) => unsafe {
+                self.execute_owned_raw_cell_object_for_slot_owned(slot, debug_name)
+            },
+            CellLocation::Closure(slot) | CellLocation::CapturedSource(slot) => unsafe {
+                self.execute_closure_raw_cell_object_for_slot_owned(slot, debug_name)
+            },
+        }
+    }
+
+    #[cold]
+    unsafe fn execute_owned_raw_cell_object_for_slot_owned(
+        &self,
+        slot: u32,
+        debug_name: &str,
+    ) -> Result<ObjPtr, String> {
         let function = self.invocation.function();
         let layout = function.storage_layout.as_ref().ok_or_else(|| {
             format!(
@@ -423,6 +434,41 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             candidate_names,
             self.locals.describe()
         ))
+    }
+
+    #[cold]
+    unsafe fn execute_closure_raw_cell_object_for_slot_owned(
+        &self,
+        slot: u32,
+        debug_name: &str,
+    ) -> Result<ObjPtr, String> {
+        let function_data = self.invocation.function_data_obj();
+        if function_data.is_null() {
+            return Err(format!(
+                "deopt continuation expected function data for closure {debug_name} slot {slot}"
+            ));
+        }
+        let function = self.invocation.function();
+        let runtime_layout = FunctionRuntimeDataLayout::from_function(function);
+        if slot as usize >= runtime_layout.closure_len() {
+            return Err(format!(
+                "deopt continuation expected closure {debug_name} slot {slot} in function {} with {} closure slots",
+                function.function_id,
+                runtime_layout.closure_len()
+            ));
+        }
+        let data_slot = runtime_layout.closure_cell_slot(slot as usize);
+        let raw_cell = unsafe { *function_data.cast::<ObjPtr>().add(data_slot) };
+        if raw_cell.is_null() {
+            return Err(format!(
+                "deopt continuation expected non-null closure {debug_name} slot {slot} in function {}",
+                function.function_id
+            ));
+        }
+        unsafe {
+            ffi::Py_INCREF(raw_cell.cast::<ffi::PyObject>());
+        }
+        Ok(raw_cell)
     }
 
     #[cold]

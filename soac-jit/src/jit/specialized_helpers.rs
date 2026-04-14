@@ -1075,6 +1075,7 @@ mod test_only_export_stubs {
     panic_obj_export!(dp_jit_deopt_resume(
         deopt_table: ObjPtr,
         globals_obj: ObjPtr,
+        function_data_obj: ObjPtr,
         record_ordinal: i64,
         live_values: ObjPtr,
         live_value_count: i64
@@ -1306,6 +1307,7 @@ pub unsafe extern "C" fn dp_jit_del_deref_quietly(cell: ObjPtr) -> ObjPtr {
 pub unsafe extern "C" fn dp_jit_deopt_resume(
     deopt_table: ObjPtr,
     globals_obj: ObjPtr,
+    function_data_obj: ObjPtr,
     record_ordinal: i64,
     live_values: ObjPtr,
     live_value_count: i64,
@@ -1314,6 +1316,7 @@ pub unsafe extern "C" fn dp_jit_deopt_resume(
         run_deopt_resume(
             deopt_table,
             globals_obj,
+            function_data_obj,
             record_ordinal,
             live_values,
             live_value_count,
@@ -1331,6 +1334,7 @@ pub unsafe extern "C" fn dp_jit_deopt_resume(
 unsafe fn run_deopt_resume(
     deopt_table: ObjPtr,
     globals_obj: ObjPtr,
+    function_data_obj: ObjPtr,
     record_ordinal: i64,
     live_values: ObjPtr,
     live_value_count: i64,
@@ -1339,6 +1343,7 @@ unsafe fn run_deopt_resume(
         RuntimeJitDeoptInvocation::from_raw(
             deopt_table,
             globals_obj,
+            function_data_obj,
             record_ordinal,
             live_values,
             live_value_count,
