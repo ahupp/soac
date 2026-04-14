@@ -210,6 +210,11 @@ internally inconsistent state that compiles or fails for misleading reasons.
 This is the synchronization point. Once `main` moves, the finished work
 becomes the new shared base for future work.
 
+If the user asks to rebase, merge, or otherwise put a completed stack "on
+main", do not stop after the stack is merely based on `main`. After conflict
+resolution and validation, explicitly move `main` to the validated head and
+verify the bookmark in `jj log`.
+
 16. When another agent advances `main`, refresh and continue on top of
     it.
 
