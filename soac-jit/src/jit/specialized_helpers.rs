@@ -1,6 +1,6 @@
 #![cfg_attr(test, allow(dead_code, unused_imports))]
 
-use super::{RuntimeJitDeoptContinuation, RuntimeJitDeoptInvocation};
+use super::RuntimeJitDeoptInvocation;
 use crate::config::jit_perf_helper_frames_enabled;
 use crate::module_constants::load_runtime_name_owned;
 use crate::module_constants::raise_name_error_for_missing_name;
