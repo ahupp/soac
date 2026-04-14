@@ -5594,6 +5594,180 @@ def f(x):
     }
 
     #[test]
+    fn deopt_block_tail_continuation_executes_local_store() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|_| {
+            let location = LocalLocation(0);
+            let function = with_single_test_block(
+                test_function(),
+                vec![assign_stmt(
+                    test_name("x"),
+                    name_expr(test_constant_name(0)),
+                )],
+                ret_term(name_expr(test_name("x"))),
+            );
+            let function_id = function.function_id;
+            let block = function.entry_block().label;
+            let binding = LocalEnvResumeBinding {
+                name: "x".to_string(),
+                location,
+                binding: LocalEnvResumeBindingState::Bound,
+                source: LocalEnvResumeValueSource::BlockParam(location),
+                ownership: LocalRefKind::Owned,
+                value: None,
+            };
+            let old_value = unsafe { ffi::PyLong_FromLong(111_111_111) };
+            assert!(
+                !old_value.is_null(),
+                "test old local allocation should succeed"
+            );
+            let new_value = unsafe { ffi::PyLong_FromLong(222_222_222) };
+            assert!(
+                !new_value.is_null(),
+                "test module constant allocation should succeed"
+            );
+            let table = RuntimeJitDeoptTable {
+                function_id,
+                function: Box::new(function),
+                module_constant_ptrs: vec![new_value.cast()],
+                points: vec![RuntimeJitDeoptRecord {
+                    id: PlannedJitDeoptPointId {
+                        function_id,
+                        ordinal: 0,
+                    },
+                    resume_point: LocalEnvResumePoint::BeforeInstr {
+                        key: InstrKey::new(function_id, InstrId::new(block, 0)),
+                    },
+                    precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                    locals: vec![binding],
+                    continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
+                        block,
+                        start_body_index: 0,
+                    },
+                }],
+            };
+            let before_old = unsafe { ffi::Py_REFCNT(old_value) };
+            let before_new = unsafe { ffi::Py_REFCNT(new_value) };
+            unsafe {
+                ffi::Py_INCREF(old_value);
+            }
+            let mut live_values = vec![old_value.cast::<c_void>()];
+            let result = unsafe {
+                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                    std::ptr::addr_of!(table).cast_mut().cast(),
+                    std::ptr::null_mut(),
+                    0,
+                    live_values.as_mut_ptr().cast(),
+                    live_values.len() as i64,
+                )
+            };
+            assert_eq!(
+                result,
+                new_value.cast(),
+                "block-tail local-store deopt should return the rebound local value"
+            );
+            assert!(
+                unsafe { ffi::PyErr_Occurred() }.is_null(),
+                "successful local-store deopt continuation should not leave a Python exception"
+            );
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(old_value) },
+                before_old,
+                "local store replay should release the old frame-owned local"
+            );
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(new_value) },
+                before_new + 1,
+                "returned rebound local should be owned by the JIT caller after frame cleanup"
+            );
+            unsafe {
+                ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+                ffi::Py_DECREF(new_value);
+                ffi::Py_DECREF(old_value);
+            }
+        });
+    }
+
+    #[test]
+    fn deopt_block_tail_continuation_executes_local_delete() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|_| {
+            let location = LocalLocation(0);
+            let function = with_single_test_block(
+                test_function(),
+                vec![op_expr(Del::new(test_name("x"), false))],
+                ret_term(none_expr()),
+            );
+            let function_id = function.function_id;
+            let block = function.entry_block().label;
+            let binding = LocalEnvResumeBinding {
+                name: "x".to_string(),
+                location,
+                binding: LocalEnvResumeBindingState::Bound,
+                source: LocalEnvResumeValueSource::BlockParam(location),
+                ownership: LocalRefKind::Owned,
+                value: None,
+            };
+            let value = unsafe { ffi::PyLong_FromLong(333_333_333) };
+            assert!(!value.is_null(), "test local allocation should succeed");
+            let table = RuntimeJitDeoptTable {
+                function_id,
+                function: Box::new(function),
+                module_constant_ptrs: Vec::new(),
+                points: vec![RuntimeJitDeoptRecord {
+                    id: PlannedJitDeoptPointId {
+                        function_id,
+                        ordinal: 0,
+                    },
+                    resume_point: LocalEnvResumePoint::BeforeInstr {
+                        key: InstrKey::new(function_id, InstrId::new(block, 0)),
+                    },
+                    precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                    locals: vec![binding],
+                    continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
+                        block,
+                        start_body_index: 0,
+                    },
+                }],
+            };
+            let before = unsafe { ffi::Py_REFCNT(value) };
+            unsafe {
+                ffi::Py_INCREF(value);
+            }
+            let mut live_values = vec![value.cast::<c_void>()];
+            let result = unsafe {
+                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                    std::ptr::addr_of!(table).cast_mut().cast(),
+                    std::ptr::null_mut(),
+                    0,
+                    live_values.as_mut_ptr().cast(),
+                    live_values.len() as i64,
+                )
+            };
+            assert_eq!(
+                result,
+                unsafe { ffi::Py_None() }.cast(),
+                "block-tail local-delete deopt should continue to return None"
+            );
+            assert!(
+                unsafe { ffi::PyErr_Occurred() }.is_null(),
+                "successful local-delete deopt continuation should not leave a Python exception"
+            );
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(value) },
+                before,
+                "local delete replay should release the frame-owned local"
+            );
+            unsafe {
+                ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+                ffi::Py_DECREF(value);
+            }
+        });
+    }
+
+    #[test]
     fn deopt_resume_call_uses_function_env_deopt_table_and_ordinal() {
         let compile_session = crate::session::CompileSession::new();
         let mut jit_module =

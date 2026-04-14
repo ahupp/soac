@@ -1764,6 +1764,15 @@ impl<'a> RuntimeJitDeoptLocals<'a> {
             .find(|local| local.binding.location == location)
     }
 
+    pub(crate) fn get_by_location_mut(
+        &mut self,
+        location: LocalLocation,
+    ) -> Option<&mut RuntimeJitDeoptLocal<'a>> {
+        self.locals
+            .iter_mut()
+            .find(|local| local.binding.location == location)
+    }
+
     pub(crate) unsafe fn release_frame_owned_values(&mut self) {
         for local in &mut self.locals {
             unsafe {
@@ -1780,6 +1789,20 @@ impl RuntimeJitDeoptLocal<'_> {
 
     pub(crate) fn value(&self) -> ObjPtr {
         self.value
+    }
+
+    pub(crate) unsafe fn replace_with_owned_value(&mut self, value: ObjPtr) {
+        unsafe {
+            self.release_frame_owned_value();
+        }
+        self.value = value;
+        self.release_on_frame_exit = true;
+    }
+
+    pub(crate) unsafe fn delete_value(&mut self) {
+        unsafe {
+            self.release_frame_owned_value();
+        }
     }
 
     unsafe fn release_frame_owned_value(&mut self) {

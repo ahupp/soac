@@ -157,10 +157,13 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
 
     #[cold]
     unsafe fn execute_del_owned(
-        &self,
+        &mut self,
         del: &soac_blockpy::block_py::Del<InstrCodegen>,
     ) -> Result<ObjPtr, String> {
         match del.name.location {
+            NameLocation::Local(location) => unsafe {
+                self.execute_local_del_owned(del.name.id.as_str(), location, del.quietly)
+            },
             NameLocation::Global(_) | NameLocation::GlobalName => unsafe {
                 self.execute_global_del_owned(del.name.id.as_str(), del.quietly)
             },
@@ -169,6 +172,39 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
                 del.name.id.as_str()
             )),
         }
+    }
+
+    #[cold]
+    unsafe fn execute_local_del_owned(
+        &mut self,
+        name: &str,
+        location: LocalLocation,
+        quietly: bool,
+    ) -> Result<ObjPtr, String> {
+        let Some(local) = self.locals.get_by_location_mut(location) else {
+            if !quietly {
+                set_deopt_unbound_local_error(name);
+                return Ok(ptr::null_mut());
+            }
+            return unsafe { execute_runtime_name_deopt("NONE") };
+        };
+        if local.binding().name != *name {
+            return Err(format!(
+                "deopt continuation expected local {name} at {location:?}, but materialized {}",
+                local.binding().name
+            ));
+        }
+        if local.value().is_null() {
+            if !quietly {
+                set_deopt_unbound_local_error(name);
+                return Ok(ptr::null_mut());
+            }
+        } else {
+            unsafe {
+                local.delete_value();
+            }
+        }
+        unsafe { execute_runtime_name_deopt("NONE") }
     }
 
     #[cold]
@@ -213,6 +249,13 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
         store: &soac_blockpy::block_py::Store<InstrCodegen>,
     ) -> Result<ObjPtr, String> {
         match store.name.location {
+            NameLocation::Local(location) => unsafe {
+                self.execute_local_store_owned(
+                    store.name.id.as_str(),
+                    location,
+                    store.value.as_ref(),
+                )
+            },
             NameLocation::Global(_) | NameLocation::GlobalName => unsafe {
                 self.execute_global_store_owned(store.name.id.as_str(), store.value.as_ref())
             },
@@ -221,6 +264,42 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
                 store.name.id.as_str()
             )),
         }
+    }
+
+    #[cold]
+    unsafe fn execute_local_store_owned(
+        &mut self,
+        name: &str,
+        location: LocalLocation,
+        value_expr: &InstrCodegen,
+    ) -> Result<ObjPtr, String> {
+        let value = unsafe { self.execute_expr_owned(value_expr)? };
+        if value.is_null() {
+            return Ok(ptr::null_mut());
+        }
+        let Some(local) = self.locals.get_by_location_mut(location) else {
+            unsafe {
+                ffi::Py_DECREF(value.cast::<ffi::PyObject>());
+            }
+            return Err(format!(
+                "deopt continuation expected local {name} at {location:?} for store, but it was not materialized: {}",
+                self.locals.describe()
+            ));
+        };
+        if local.binding().name != *name {
+            unsafe {
+                ffi::Py_DECREF(value.cast::<ffi::PyObject>());
+            }
+            return Err(format!(
+                "deopt continuation expected local {name} at {location:?}, but materialized {}",
+                local.binding().name
+            ));
+        }
+        unsafe {
+            local.replace_with_owned_value(value);
+            ffi::Py_INCREF(value.cast::<ffi::PyObject>());
+        }
+        Ok(value)
     }
 
     #[cold]
