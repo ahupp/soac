@@ -1042,7 +1042,12 @@ mod test_only_export_stubs {
     panic_obj_export!(dp_jit_store_cell(cell: ObjPtr, value: ObjPtr));
     panic_obj_export!(dp_jit_del_deref(cell: ObjPtr));
     panic_obj_export!(dp_jit_del_deref_quietly(cell: ObjPtr));
-    panic_obj_export!(dp_jit_deopt_unimplemented(deopt_table: ObjPtr, record_ordinal: i64));
+    panic_obj_export!(dp_jit_deopt_unimplemented(
+        deopt_table: ObjPtr,
+        record_ordinal: i64,
+        live_values: ObjPtr,
+        live_value_count: i64
+    ));
     panic_obj_export!(dp_jit_tuple_new(size: i64));
     panic_i32_export!(dp_jit_tuple_set_item(tuple_obj: ObjPtr, index: i64, item: ObjPtr));
     panic_obj_export!(dp_jit_dict_new());
@@ -1247,19 +1252,31 @@ pub unsafe extern "C" fn dp_jit_del_deref_quietly(cell: ObjPtr) -> ObjPtr {
 pub unsafe extern "C" fn dp_jit_deopt_unimplemented(
     deopt_table: ObjPtr,
     record_ordinal: i64,
+    live_values: ObjPtr,
+    live_value_count: i64,
 ) -> ObjPtr {
-    set_deopt_unimplemented_error(deopt_table, record_ordinal);
+    set_deopt_unimplemented_error(deopt_table, record_ordinal, live_values, live_value_count);
     ptr::null_mut()
 }
 
 #[cold]
-unsafe fn set_deopt_unimplemented_error(deopt_table: ObjPtr, record_ordinal: i64) {
+unsafe fn set_deopt_unimplemented_error(
+    deopt_table: ObjPtr,
+    record_ordinal: i64,
+    live_values: ObjPtr,
+    live_value_count: i64,
+) {
     let detail = if deopt_table.is_null() {
-        format!("null deopt table pointer, ordinal {record_ordinal}")
+        format!(
+            "null deopt table pointer, ordinal {record_ordinal}, live values {live_value_count}"
+        )
     } else {
         let table = &*(deopt_table.cast::<RuntimeJitDeoptTable>());
         match table.record_for_ordinal(record_ordinal) {
-            Ok(record) => record.describe(table.function_id()),
+            Ok(record) => match record.validate_live_value_buffer(live_values, live_value_count) {
+                Ok(()) => record.describe(table.function_id()),
+                Err(err) => format!("{}; {}", record.describe(table.function_id()), err),
+            },
             Err(err) => err,
         }
     };

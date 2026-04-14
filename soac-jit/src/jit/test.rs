@@ -2861,10 +2861,19 @@ def f():
                 std::sync::Arc::as_ptr(&first_deopt_table) as ObjPtr,
                 "compiled direct handle should expose the runtime deopt table pointer"
             );
+            let mut live_values: Vec<ObjPtr> =
+                vec![std::ptr::null_mut(); first_entry_record.locals().len()];
+            let live_values_ptr = if live_values.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                live_values.as_mut_ptr().cast()
+            };
             let deopt_result = unsafe {
                 crate::jit::specialized_helpers::dp_jit_deopt_unimplemented(
                     std::sync::Arc::as_ptr(&first_deopt_table) as ObjPtr,
                     first_entry_record.ordinal() as i64,
+                    live_values_ptr,
+                    first_entry_record.locals().len() as i64,
                 )
             };
             assert!(
@@ -4505,6 +4514,45 @@ def read_point(point):
         count
     }
 
+    fn direct_call_args_to_runtime_helpers(
+        function: &ir::Function,
+        helpers: &[ir::UserExternalName],
+    ) -> Vec<Vec<ir::Value>> {
+        let mut args = Vec::new();
+        for block in function.layout.blocks() {
+            for inst in function.layout.block_insts(block) {
+                let callee = match function.dfg.insts[inst] {
+                    ir::InstructionData::Call { func_ref, .. }
+                    | ir::InstructionData::TryCall { func_ref, .. } => Some(func_ref),
+                    _ => None,
+                };
+                let Some(callee) = callee else {
+                    continue;
+                };
+                let ext_func = &function.dfg.ext_funcs[callee];
+                let ir::ExternalName::User(name_ref) = &ext_func.name else {
+                    continue;
+                };
+                let user_name = &function.params.user_named_funcs()[*name_ref];
+                if helpers.contains(user_name) {
+                    args.push(function.dfg.inst_args(inst).to_vec());
+                }
+            }
+        }
+        args
+    }
+
+    fn value_is_iconst_imm(function: &ir::Function, value: ir::Value, expected_imm: i64) -> bool {
+        let ir::ValueDef::Result(inst, _) = function.dfg.value_def(value) else {
+            return false;
+        };
+        matches!(
+            function.dfg.insts[inst],
+            ir::InstructionData::UnaryImm { opcode: ir::Opcode::Iconst, imm }
+                if imm.bits() == expected_imm
+        )
+    }
+
     fn count_cold_block_direct_calls_to_runtime_helpers(
         function: &ir::Function,
         helpers: &[ir::UserExternalName],
@@ -4771,6 +4819,7 @@ def read_point(point):
                 &DP_JIT_DEOPT_UNIMPLEMENTED_IMPORT,
             );
             let function_env_value = fb.block_params(entry)[0];
+            let live_values = fb.ins().iconst(ptr_ty, 0);
             let result = emit_deopt_unimplemented_exit_call(
                 &mut fb,
                 JitDeoptExitRef {
@@ -4778,6 +4827,8 @@ def read_point(point):
                     record_ordinal: 42,
                 },
                 deopt_ref,
+                live_values,
+                0,
                 ptr_ty,
                 ir::types::I64,
             );
@@ -6818,6 +6869,58 @@ def f(x, y):
             ret_term(none_expr()),
         );
         assert_indexed_global_guard_miss_targets_cold_deopt_stub(function, "body load");
+    }
+
+    #[test]
+    fn indexed_global_guard_miss_deopt_forwards_live_local_count() {
+        let blocks = [1usize as ObjPtr];
+        let mut constants = TestConstantPool::default();
+        let mut function = with_single_test_block(
+            test_function(),
+            vec![
+                assign_stmt(test_name("x"), constants.int_expr(7)),
+                op_expr(Load::new(test_global_name("y"))),
+            ],
+            ret_term(none_expr()),
+        );
+        set_stack_slots(&mut function, &["x"]);
+        let mut module = BlockPyModule {
+            module_name_gen: ModuleNameGen::new(0),
+            global_names: Vec::new(),
+            callable_defs: vec![function],
+            module_constants: constants.module_constants,
+            counter_defs: Vec::new(),
+        };
+        instrument_bb_module_with_call_target_counters(&mut module);
+        let function = module.callable_defs[0].clone();
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let built = build_test_jit_function_with_constants_and_options(
+            &module,
+            &function,
+            &blocks,
+            &module_constants,
+            BuildSpecializedFunctionOptions {
+                indexed_global_guard_miss_deopt_stub: true,
+            },
+        );
+        let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_unimplemented"]);
+        let deopt_call_args = direct_call_args_to_runtime_helpers(&built.ctx.func, &deopt_helpers);
+        let [deopt_args] = deopt_call_args.as_slice() else {
+            panic!(
+                "test should emit exactly one deopt helper call, got {}",
+                deopt_call_args.len()
+            );
+        };
+        assert_eq!(
+            deopt_args.len(),
+            4,
+            "deopt helper call should pass table, record ordinal, live buffer, and live count"
+        );
+        assert!(
+            value_is_iconst_imm(&built.ctx.func, deopt_args[3], 1),
+            "guard-miss deopt should pass one live local value for x"
+        );
     }
 
     #[test]

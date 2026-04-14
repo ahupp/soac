@@ -30,11 +30,12 @@ use soac_blockpy::block_py::{
 };
 use soac_blockpy::passes::{
     CodegenModuleShape, FactStore, FunctionRefcountPlan, InstrResolved, InstrTyped,
-    LocalEnvResumeBinding, LocalEnvResumePoint, LocalEnvResumeStatePrecision, LocalRefState,
-    PyExactType, PyObjFacts, RefcountActionKind, RefcountReleaseReason, RefcountSite,
-    RuntimeHelperId, TypedCodegenModuleShape, ValueFacts, infer_module_value_facts,
-    lower_codegen_function_to_typed, lower_typed_function_if_tests_to_truthy,
-    try_lower_typed_instr_to_codegen_legacy, try_lower_typed_term_to_codegen_legacy,
+    LocalEnvResumeBinding, LocalEnvResumePoint, LocalEnvResumeStatePrecision,
+    LocalEnvResumeValueSource, LocalRefState, PyExactType, PyObjFacts, RefcountActionKind,
+    RefcountReleaseReason, RefcountSite, RuntimeHelperId, TypedCodegenModuleShape, ValueFacts,
+    infer_module_value_facts, lower_codegen_function_to_typed,
+    lower_typed_function_if_tests_to_truthy, try_lower_typed_instr_to_codegen_legacy,
+    try_lower_typed_term_to_codegen_legacy,
 };
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -741,7 +742,12 @@ static DP_JIT_POP_HANDLED_EXCEPTION_IMPORT: ImportSpec =
     ImportSpec::new("dp_jit_pop_handled_exception", &[SigType::Pointer], &[]);
 static DP_JIT_DEOPT_UNIMPLEMENTED_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_deopt_unimplemented",
-    &[SigType::Pointer, SigType::I64],
+    &[
+        SigType::Pointer,
+        SigType::I64,
+        SigType::Pointer,
+        SigType::I64,
+    ],
     &[SigType::Pointer],
 );
 static DP_JIT_VECTORCALL_BIND_DIRECT_ARGS_IMPORT: ImportSpec = ImportSpec::new(
@@ -1339,6 +1345,32 @@ impl RuntimeJitDeoptRecord {
         &self.locals
     }
 
+    pub(crate) fn validate_live_value_buffer(
+        &self,
+        live_values: ObjPtr,
+        live_value_count: i64,
+    ) -> Result<(), String> {
+        let count = usize::try_from(live_value_count).map_err(|_| {
+            format!("live value count {live_value_count} is negative or does not fit usize")
+        })?;
+        if count != self.locals.len() {
+            return Err(format!(
+                "deopt record {} expected {} live values but got {}",
+                self.ordinal(),
+                self.locals.len(),
+                count
+            ));
+        }
+        if count != 0 && live_values.is_null() {
+            return Err(format!(
+                "deopt record {} expected a non-null live value buffer for {} values",
+                self.ordinal(),
+                count
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn describe(&self, function_id: FunctionId) -> String {
         format!(
             "function {}, record {}, resume_point {:?}, precision {:?}, locals {}",
@@ -1547,6 +1579,7 @@ fn emit_codegen_non_local_name_load(
     fb: &mut FunctionBuilder<'_>,
     name: &ResolvedName,
     load_instr_id: Option<InstrId>,
+    local_env: &LocalEnv,
     ctx: &JitEmitCtx<'_>,
     borrowed: bool,
 ) -> Option<ir::Value> {
@@ -1593,6 +1626,7 @@ fn emit_codegen_non_local_name_load(
                     slot_index,
                     load_instr_id,
                     guard_miss_resume_point,
+                    local_env,
                     ctx,
                 )
             } else {
@@ -1695,6 +1729,7 @@ fn emit_codegen_indexed_global_load(
     slot_index: ir::Value,
     instr_id: InstrId,
     guard_miss_resume_point: LocalEnvResumePoint,
+    local_env: &LocalEnv,
     ctx: &JitEmitCtx<'_>,
 ) -> ir::Value {
     let ptr_ty = ctx.consts.ptr_ty;
@@ -1769,10 +1804,15 @@ fn emit_codegen_indexed_global_load(
                 ctx.global_indexed_fallback_counter_ids,
                 instr_id,
             );
+            let (live_values_base, live_value_count) =
+                emit_deopt_live_value_buffer(fb, target, ctx, local_env)
+                    .unwrap_or_else(|err| panic!("{err}"));
             let _ = emit_deopt_unimplemented_exit_call(
                 fb,
                 target,
                 deopt_unimplemented_ref,
+                live_values_base,
+                live_value_count,
                 ctx.consts.ptr_ty,
                 ctx.consts.i64_ty,
             );
@@ -2600,6 +2640,8 @@ fn emit_deopt_unimplemented_exit_call(
     fb: &mut FunctionBuilder<'_>,
     target: JitDeoptExitRef,
     deopt_unimplemented_ref: ir::FuncRef,
+    live_values_base: ir::Value,
+    live_value_count: usize,
     ptr_ty: ir::Type,
     i64_ty: ir::Type,
 ) -> ir::Value {
@@ -2610,10 +2652,117 @@ fn emit_deopt_unimplemented_exit_call(
         FUNCTION_ENV_DEOPT_TABLE_PTR_OFFSET,
     );
     let record_ordinal = fb.ins().iconst(i64_ty, target.record_ordinal);
-    let call_inst = fb
-        .ins()
-        .call(deopt_unimplemented_ref, &[deopt_table, record_ordinal]);
+    let live_value_count = i64::try_from(live_value_count)
+        .unwrap_or_else(|_| panic!("deopt live value count does not fit i64"));
+    let live_value_count = fb.ins().iconst(i64_ty, live_value_count);
+    let call_inst = fb.ins().call(
+        deopt_unimplemented_ref,
+        &[
+            deopt_table,
+            record_ordinal,
+            live_values_base,
+            live_value_count,
+        ],
+    );
     fb.inst_results(call_inst)[0]
+}
+
+fn emit_deopt_live_value_buffer(
+    fb: &mut FunctionBuilder<'_>,
+    target: JitDeoptExitRef,
+    ctx: &JitEmitCtx<'_>,
+    local_env: &LocalEnv,
+) -> Result<(ir::Value, usize), String> {
+    let point_id = PlannedJitDeoptPointId {
+        function_id: ctx.function_id,
+        ordinal: usize::try_from(target.record_ordinal).map_err(|_| {
+            format!(
+                "deopt target ordinal {} is negative or does not fit usize",
+                target.record_ordinal
+            )
+        })?,
+    };
+    let deopt_point = ctx
+        .deopt_resume_plan
+        .deopt_point_by_id(point_id)
+        .ok_or_else(|| format!("missing planned JIT deopt point {:?}", point_id))?;
+    let entry = ctx
+        .deopt_resume_plan
+        .entry(deopt_point.resume_point)
+        .ok_or_else(|| {
+            format!(
+                "planned JIT deopt point {:?} has no resume entry {:?}",
+                point_id, deopt_point.resume_point
+            )
+        })?;
+    let ptr_ty = ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    if entry.locals.is_empty() {
+        return Ok((null_ptr, 0));
+    }
+
+    let mut values = Vec::with_capacity(entry.locals.len());
+    for binding in &entry.locals {
+        values.push(emit_deopt_live_value_for_binding(
+            fb, binding, ctx, local_env, null_ptr,
+        )?);
+    }
+
+    let slot_size = (values.len() * std::mem::size_of::<u64>()) as u32;
+    let stack_slot = fb.create_sized_stack_slot(ir::StackSlotData::new(
+        ir::StackSlotKind::ExplicitSlot,
+        slot_size,
+        0,
+    ));
+    for (index, value) in values.iter().copied().enumerate() {
+        fb.ins().stack_store(
+            value,
+            stack_slot,
+            (index * std::mem::size_of::<u64>()) as i32,
+        );
+    }
+    Ok((fb.ins().stack_addr(ptr_ty, stack_slot, 0), values.len()))
+}
+
+fn emit_deopt_live_value_for_binding(
+    fb: &mut FunctionBuilder<'_>,
+    binding: &LocalEnvResumeBinding,
+    ctx: &JitEmitCtx<'_>,
+    local_env: &LocalEnv,
+    null_ptr: ir::Value,
+) -> Result<ir::Value, String> {
+    if matches!(binding.source, LocalEnvResumeValueSource::Unbound) {
+        return Ok(null_ptr);
+    }
+    if let Some(index) = local_env
+        .entry_index_for_location(binding.location)
+        .or_else(|| local_env.entry_index_for_name(binding.name.as_str()))
+    {
+        return Ok(local_env.entries[index].value);
+    }
+    if let Some(slot) = ctx
+        .stack_slots
+        .slot_for_block_arg_name(binding.name.as_str())
+        .or_else(|| deopt_binding_stack_slot_for_location(ctx, binding.location))
+    {
+        return Ok(fb.ins().stack_load(ctx.consts.ptr_ty, slot, 0));
+    }
+    Err(format!(
+        "cannot materialize live deopt value for local {} at location {:?} from source {:?}",
+        binding.name, binding.location, binding.source
+    ))
+}
+
+fn deopt_binding_stack_slot_for_location(
+    ctx: &JitEmitCtx<'_>,
+    location: LocalLocation,
+) -> Option<ir::StackSlot> {
+    let layout = ctx.storage_layout.as_ref()?;
+    let name = layout
+        .stack_slots()
+        .get(location.slot() as usize)
+        .map(String::as_str)?;
+    ctx.stack_slots.slot_for_block_arg_name(name)
 }
 
 impl JitEmitCtx<'_> {
@@ -10845,7 +10994,9 @@ fn emit_resolved_name_load_with_local_env(
     emit_ctx: &JitEmitCtx<'_>,
     borrowed: bool,
 ) -> ir::Value {
-    if let Some(value) = emit_codegen_non_local_name_load(fb, name, instr_id, emit_ctx, borrowed) {
+    if let Some(value) =
+        emit_codegen_non_local_name_load(fb, name, instr_id, local_env, emit_ctx, borrowed)
+    {
         return value;
     }
     if let Some(location) = name.local_location() {
