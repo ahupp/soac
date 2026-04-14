@@ -1539,7 +1539,6 @@ pub(crate) fn lookup_precompiled_direct_function_handle(
     let Some(code_ptr) = library.lookup_code_symbol(symbol.as_str())? else {
         return Ok(None);
     };
-    patch_precompiled_module_constant_slots(library, shared_state)?;
 
     let default_code_ptr = if function_has_default_resolving_direct_entry(function) {
         let default_symbol = default_direct_function_symbol(function, Some(symbol_scope.as_str()));
