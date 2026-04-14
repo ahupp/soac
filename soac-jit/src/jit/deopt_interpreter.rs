@@ -258,6 +258,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             InstrCodegen::CallDirect(call) => unsafe { self.execute_call_direct_owned(call) },
             InstrCodegen::Store(store) => unsafe { self.execute_store_owned(store) },
             InstrCodegen::Del(del) => unsafe { self.execute_del_owned(del) },
+            InstrCodegen::IncrementCounter(_) => unsafe { execute_runtime_name_deopt("NONE") },
             _ => Err(format!(
                 "deopt continuation only supports simple load/binop/call/store/del expressions, got {expr:?}"
             )),

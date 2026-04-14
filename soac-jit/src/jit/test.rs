@@ -4,10 +4,10 @@ use soac_blockpy::block_py::{
     BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional, CallDirect,
     CalleeFunctionId, CellLocation, ChildVisitable, ClosureInit, ClosureSlot, CodegenBlock,
     CounterDef, CounterSite, Del, DelItem, FunctionId, FunctionName, GetAttr, GetItem, HasMeta,
-    HasSemanticInstrId, InstrCodegen, InstrResolved, Literal, LiteralValue, Load, LocalLocation,
-    Meta, ModuleNameGen, NameLocation, NumberLiteral, NumberLiteralValue, Param, ParamKind,
-    ParamSpec, ResolvedName, SetAttr, SetItem, StorageLayout, Store, StringLiteral, UnaryOp,
-    UnaryOpKind, Visit, VisitMut, WithMeta,
+    HasSemanticInstrId, IncrementCounter, InstrCodegen, InstrResolved, Literal, LiteralValue, Load,
+    LocalLocation, Meta, ModuleNameGen, NameLocation, NumberLiteral, NumberLiteralValue, Param,
+    ParamKind, ParamSpec, ResolvedName, SetAttr, SetItem, StorageLayout, Store, StringLiteral,
+    UnaryOp, UnaryOpKind, Visit, VisitMut, WithMeta,
 };
 use soac_blockpy::passes::{
     CodegenModuleShape, instrument_bb_module_with_block_entry_counters,
@@ -5429,6 +5429,54 @@ def f(x):
     }
 
     #[test]
+    fn runtime_deopt_table_marks_increment_counter_body_tail_continuation() {
+        let function = with_single_test_block(
+            test_function(),
+            vec![op_expr(IncrementCounter::new(CounterId(0)))],
+            ret_term(none_expr()),
+        );
+        let module = test_module(ModuleNameGen::new(0), vec![function]);
+        let function = &module.callable_defs[0];
+        let block = function.entry_block();
+        let body_instr_id = block.body[0]
+            .try_semantic_instr_id()
+            .expect("test body instruction should have an id");
+        let facts = infer_module_value_facts(&module);
+        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+            .expect("JIT deopt resume planning should succeed");
+        let function_plan = module_plan
+            .function(function.function_id)
+            .expect("function should have a JIT deopt plan");
+        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
+            .expect("runtime deopt table should build from plan");
+
+        let block_entry_record = table
+            .record_for_point(LocalEnvResumePoint::BlockEntry {
+                function_id: function.function_id,
+                block: block.label,
+            })
+            .expect("block-entry point should have a runtime record");
+        assert_eq!(
+            block_entry_record.continuation(),
+            &RuntimeJitDeoptContinuation::ResumeBlockTail {
+                cursor: RuntimeJitDeoptCursor::at_block_entry(block.label),
+            }
+        );
+
+        let before_instr_record = table
+            .record_for_point(LocalEnvResumePoint::BeforeInstr {
+                key: InstrKey::new(function.function_id, body_instr_id),
+            })
+            .expect("before-instr point should have a runtime record");
+        assert_eq!(
+            before_instr_record.continuation(),
+            &RuntimeJitDeoptContinuation::ResumeBlockTail {
+                cursor: RuntimeJitDeoptCursor::at_block_entry(block.label),
+            }
+        );
+    }
+
+    #[test]
     fn runtime_deopt_table_marks_no_arg_jump_before_term_continuation() {
         let function = test_function();
         let target = test_source_block(&function, vec![], ret_term(none_expr()));
@@ -6195,6 +6243,61 @@ def f(x):
                 ffi::Py_DECREF(result.cast::<ffi::PyObject>());
                 ffi::Py_DECREF(body_value);
                 ffi::Py_DECREF(return_value);
+            }
+        });
+    }
+
+    #[test]
+    fn deopt_block_entry_continuation_skips_increment_counter() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|_| {
+            let function = with_single_test_block(
+                test_function(),
+                vec![op_expr(IncrementCounter::new(CounterId(0)))],
+                ret_term(none_expr()),
+            );
+            let module = test_module(ModuleNameGen::new(0), vec![function]);
+            let function = &module.callable_defs[0];
+            let block = function.entry_block();
+            let facts = infer_module_value_facts(&module);
+            let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+                .expect("JIT deopt resume planning should succeed");
+            let function_plan = module_plan
+                .function(function.function_id)
+                .expect("function should have a JIT deopt plan");
+            let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
+                .expect("runtime deopt table should build from plan");
+            let point = LocalEnvResumePoint::BlockEntry {
+                function_id: function.function_id,
+                block: block.label,
+            };
+            let ordinal = table
+                .record_for_point(point)
+                .expect("block-entry point should have a runtime record")
+                .id()
+                .ordinal as i64;
+
+            let result = unsafe {
+                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                    std::ptr::addr_of!(table).cast_mut().cast(),
+                    std::ptr::null_mut(),
+                    ordinal,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!(
+                result,
+                unsafe { ffi::Py_None() }.cast(),
+                "synthetic counter replay should be a no-op and continue to the return"
+            );
+            assert!(
+                unsafe { ffi::PyErr_Occurred() }.is_null(),
+                "successful counter deopt continuation should not leave a Python exception"
+            );
+            unsafe {
+                ffi::Py_DECREF(result.cast::<ffi::PyObject>());
             }
         });
     }
