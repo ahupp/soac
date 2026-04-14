@@ -2050,7 +2050,10 @@ fn runtime_jit_deopt_binop_supported(kind: blockpy_intrinsics::BinOpKind) -> boo
 fn runtime_jit_deopt_term_supported(term: &BlockTerm<InstrCodegen>) -> bool {
     match term {
         BlockTerm::Return(value) => runtime_jit_deopt_expr_supported(value),
-        BlockTerm::Jump(edge) => edge.args.is_empty(),
+        BlockTerm::Jump(edge) => edge
+            .args
+            .iter()
+            .all(|arg| matches!(arg, BlockArg::Name(_) | BlockArg::None)),
         BlockTerm::IfTerm(if_term) => runtime_jit_deopt_expr_supported(&if_term.test),
         BlockTerm::BranchTable(branch) => runtime_jit_deopt_expr_supported(&branch.index),
         BlockTerm::Raise(raise) => raise
@@ -2189,9 +2192,14 @@ impl<'a> RuntimeJitDeoptLocals<'a> {
         format!("reconstructed locals {} [{}]", self.len(), names)
     }
 
-    #[cfg(test)]
-    fn get_by_name(&self, name: &str) -> Option<&RuntimeJitDeoptLocal<'a>> {
+    pub(crate) fn get_by_name(&self, name: &str) -> Option<&RuntimeJitDeoptLocal<'a>> {
         self.locals.iter().find(|local| local.binding.name == name)
+    }
+
+    pub(crate) fn get_by_name_mut(&mut self, name: &str) -> Option<&mut RuntimeJitDeoptLocal<'a>> {
+        self.locals
+            .iter_mut()
+            .find(|local| local.binding.name == name)
     }
 
     pub(crate) fn get_by_location(

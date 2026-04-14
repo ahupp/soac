@@ -1,12 +1,13 @@
 use super::*;
 use soac_blockpy::block_py::{
-    BinOp, BinOpKind, BlockEdge, BlockLabel, BlockParamRole, BlockPyFunction, BlockPyModule,
-    BlockTerm, Call, CallArgKeyword, CallArgPositional, CallDirect, CalleeFunctionId, CellLocation,
-    ChildVisitable, ClosureInit, ClosureSlot, CodegenBlock, CounterDef, CounterSite, Del, DelItem,
-    FunctionId, FunctionName, GetAttr, GetItem, HasMeta, HasSemanticInstrId, InstrCodegen,
-    InstrResolved, Literal, LiteralValue, Load, LocalLocation, Meta, ModuleNameGen, NameLocation,
-    NumberLiteral, NumberLiteralValue, Param, ParamKind, ParamSpec, ResolvedName, SetAttr, SetItem,
-    StorageLayout, Store, StringLiteral, UnaryOp, UnaryOpKind, Visit, VisitMut, WithMeta,
+    BinOp, BinOpKind, BlockArg, BlockEdge, BlockLabel, BlockParam, BlockParamRole, BlockPyFunction,
+    BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional, CallDirect,
+    CalleeFunctionId, CellLocation, ChildVisitable, ClosureInit, ClosureSlot, CodegenBlock,
+    CounterDef, CounterSite, Del, DelItem, FunctionId, FunctionName, GetAttr, GetItem, HasMeta,
+    HasSemanticInstrId, InstrCodegen, InstrResolved, Literal, LiteralValue, Load, LocalLocation,
+    Meta, ModuleNameGen, NameLocation, NumberLiteral, NumberLiteralValue, Param, ParamKind,
+    ParamSpec, ResolvedName, SetAttr, SetItem, StorageLayout, Store, StringLiteral, UnaryOp,
+    UnaryOpKind, Visit, VisitMut, WithMeta,
 };
 use soac_blockpy::passes::{
     CodegenModuleShape, instrument_bb_module_with_block_entry_counters,
@@ -691,9 +692,13 @@ def add(a, b):
     }
 
     fn test_name(name: &str) -> ResolvedName {
+        test_local_name(name, 0)
+    }
+
+    fn test_local_name(name: &str, slot: u32) -> ResolvedName {
         ResolvedName {
             id: name.into(),
-            location: NameLocation::local(0),
+            location: NameLocation::local(slot),
         }
     }
 
@@ -5359,6 +5364,54 @@ def f(x):
     }
 
     #[test]
+    fn runtime_deopt_table_marks_simple_jump_args_before_term_continuation() {
+        let function = test_function();
+        let mut target = test_source_block(
+            &function,
+            vec![],
+            ret_term(name_expr(test_local_name("y", 1))),
+        );
+        target.params = vec![BlockParam {
+            name: "y".to_string(),
+            role: BlockParamRole::AbruptPayload,
+        }];
+        let entry = test_source_block(
+            &function,
+            vec![],
+            BlockTerm::Jump(BlockEdge::with_args(
+                target.label,
+                vec![BlockArg::Name("x".to_string())],
+            )),
+        );
+        let module = test_module(
+            ModuleNameGen::new(0),
+            vec![with_test_blocks(function, vec![entry.clone(), target])],
+        );
+        let function = &module.callable_defs[0];
+        let facts = infer_module_value_facts(&module);
+        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+            .expect("JIT deopt resume planning should succeed");
+        let function_plan = module_plan
+            .function(function.function_id)
+            .expect("function should have a JIT deopt plan");
+        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
+            .expect("runtime deopt table should build from plan");
+        let point = LocalEnvResumePoint::BeforeTerm {
+            function_id: function.function_id,
+            block: entry.label,
+        };
+        let record = table
+            .record_for_point(point)
+            .expect("before-term jump-arg point should have a runtime record");
+        assert_eq!(
+            record.continuation(),
+            &RuntimeJitDeoptContinuation::ResumeBlockTail {
+                cursor: RuntimeJitDeoptCursor::new(entry.label, entry.body.len()),
+            }
+        );
+    }
+
+    #[test]
     fn runtime_deopt_table_marks_if_before_term_continuation() {
         let function = test_function();
         let then_block = test_source_block(&function, vec![], ret_term(none_expr()));
@@ -5843,6 +5896,210 @@ def f(x):
             );
             unsafe {
                 ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+            }
+        });
+    }
+
+    #[test]
+    fn deopt_block_tail_continuation_applies_simple_jump_args() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|_| {
+            let x_location = LocalLocation(0);
+            let y_location = LocalLocation(1);
+            let function = test_function();
+            let mut target = test_source_block(
+                &function,
+                vec![],
+                ret_term(name_expr(test_local_name("y", y_location.slot()))),
+            );
+            target.params = vec![BlockParam {
+                name: "y".to_string(),
+                role: BlockParamRole::AbruptPayload,
+            }];
+            let entry = test_source_block(
+                &function,
+                vec![],
+                BlockTerm::Jump(BlockEdge::with_args(
+                    target.label,
+                    vec![BlockArg::Name("x".to_string())],
+                )),
+            );
+            let function = with_test_blocks(function, vec![entry.clone(), target]);
+            let function_id = function.function_id;
+            let x_binding = LocalEnvResumeBinding {
+                name: "x".to_string(),
+                location: x_location,
+                binding: LocalEnvResumeBindingState::Bound,
+                source: LocalEnvResumeValueSource::BlockParam(x_location),
+                ownership: LocalRefKind::Owned,
+                value: None,
+            };
+            let y_binding = LocalEnvResumeBinding {
+                name: "y".to_string(),
+                location: y_location,
+                binding: LocalEnvResumeBindingState::Bound,
+                source: LocalEnvResumeValueSource::BlockParam(y_location),
+                ownership: LocalRefKind::Owned,
+                value: None,
+            };
+            let table = RuntimeJitDeoptTable {
+                function_id,
+                function: Box::new(function),
+                module_constant_ptrs: Vec::new(),
+                points: vec![RuntimeJitDeoptRecord {
+                    id: PlannedJitDeoptPointId {
+                        function_id,
+                        ordinal: 0,
+                    },
+                    resume_point: LocalEnvResumePoint::BeforeTerm {
+                        function_id,
+                        block: entry.label,
+                    },
+                    precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                    locals: vec![x_binding, y_binding],
+                    continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
+                        cursor: RuntimeJitDeoptCursor::new(entry.label, entry.body.len()),
+                    },
+                }],
+            };
+            let x_value = unsafe { ffi::PyLong_FromLong(123_123_123) };
+            assert!(!x_value.is_null(), "test x allocation should succeed");
+            let old_y_value = unsafe { ffi::PyLong_FromLong(456_456_456) };
+            assert!(
+                !old_y_value.is_null(),
+                "test old y allocation should succeed"
+            );
+            let before_x = unsafe { ffi::Py_REFCNT(x_value) };
+            let before_old_y = unsafe { ffi::Py_REFCNT(old_y_value) };
+            unsafe {
+                ffi::Py_INCREF(x_value);
+                ffi::Py_INCREF(old_y_value);
+            }
+            let mut live_values = vec![x_value.cast::<c_void>(), old_y_value.cast::<c_void>()];
+            let result = unsafe {
+                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                    std::ptr::addr_of!(table).cast_mut().cast(),
+                    std::ptr::null_mut(),
+                    0,
+                    live_values.as_mut_ptr().cast(),
+                    live_values.len() as i64,
+                )
+            };
+            assert_eq!(
+                result,
+                x_value.cast(),
+                "jump-arg deopt should bind target param y to source local x"
+            );
+            assert!(
+                unsafe { ffi::PyErr_Occurred() }.is_null(),
+                "successful jump-arg deopt continuation should not leave a Python exception"
+            );
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(x_value) },
+                before_x + 1,
+                "returned jump-arg value should be owned by the JIT caller after frame cleanup"
+            );
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(old_y_value) },
+                before_old_y,
+                "jump-arg target rebinding should release the replaced frame-owned local"
+            );
+            unsafe {
+                ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+                ffi::Py_DECREF(x_value);
+                ffi::Py_DECREF(old_y_value);
+            }
+        });
+    }
+
+    #[test]
+    fn deopt_block_tail_continuation_applies_none_jump_arg() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|_| {
+            let y_location = LocalLocation(0);
+            let function = test_function();
+            let mut target = test_source_block(
+                &function,
+                vec![],
+                ret_term(name_expr(test_local_name("y", y_location.slot()))),
+            );
+            target.params = vec![BlockParam {
+                name: "y".to_string(),
+                role: BlockParamRole::AbruptPayload,
+            }];
+            let entry = test_source_block(
+                &function,
+                vec![],
+                BlockTerm::Jump(BlockEdge::with_args(target.label, vec![BlockArg::None])),
+            );
+            let function = with_test_blocks(function, vec![entry.clone(), target]);
+            let function_id = function.function_id;
+            let y_binding = LocalEnvResumeBinding {
+                name: "y".to_string(),
+                location: y_location,
+                binding: LocalEnvResumeBindingState::Bound,
+                source: LocalEnvResumeValueSource::BlockParam(y_location),
+                ownership: LocalRefKind::Owned,
+                value: None,
+            };
+            let table = RuntimeJitDeoptTable {
+                function_id,
+                function: Box::new(function),
+                module_constant_ptrs: Vec::new(),
+                points: vec![RuntimeJitDeoptRecord {
+                    id: PlannedJitDeoptPointId {
+                        function_id,
+                        ordinal: 0,
+                    },
+                    resume_point: LocalEnvResumePoint::BeforeTerm {
+                        function_id,
+                        block: entry.label,
+                    },
+                    precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                    locals: vec![y_binding],
+                    continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
+                        cursor: RuntimeJitDeoptCursor::new(entry.label, entry.body.len()),
+                    },
+                }],
+            };
+            let old_y_value = unsafe { ffi::PyLong_FromLong(789_789_789) };
+            assert!(
+                !old_y_value.is_null(),
+                "test old y allocation should succeed"
+            );
+            let before_old_y = unsafe { ffi::Py_REFCNT(old_y_value) };
+            unsafe {
+                ffi::Py_INCREF(old_y_value);
+            }
+            let mut live_values = vec![old_y_value.cast::<c_void>()];
+            let result = unsafe {
+                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                    std::ptr::addr_of!(table).cast_mut().cast(),
+                    std::ptr::null_mut(),
+                    0,
+                    live_values.as_mut_ptr().cast(),
+                    live_values.len() as i64,
+                )
+            };
+            assert_eq!(
+                result,
+                unsafe { ffi::Py_None() }.cast(),
+                "jump None arg should bind the target param to None"
+            );
+            assert!(
+                unsafe { ffi::PyErr_Occurred() }.is_null(),
+                "successful None jump-arg deopt continuation should not leave a Python exception"
+            );
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(old_y_value) },
+                before_old_y,
+                "jump None arg should release the replaced frame-owned local"
+            );
+            unsafe {
+                ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+                ffi::Py_DECREF(old_y_value);
             }
         });
     }

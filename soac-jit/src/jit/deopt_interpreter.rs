@@ -5,8 +5,8 @@ use super::{
 use crate::module_constants::load_runtime_name_owned;
 use pyo3::ffi;
 use soac_blockpy::block_py::{
-    BinOp, BinOpKind, BlockTerm, CallArgKeyword, CallArgPositional, CalleeFunctionId, InstrCodegen,
-    LocalLocation, NameLocation, UnaryOp, UnaryOpKind,
+    BinOp, BinOpKind, BlockArg, BlockEdge, BlockTerm, CallArgKeyword, CallArgPositional,
+    CalleeFunctionId, InstrCodegen, LocalLocation, NameLocation, UnaryOp, UnaryOpKind,
 };
 use std::ffi::{c_int, c_void};
 use std::ptr;
@@ -98,8 +98,11 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             }
             match &block.term {
                 BlockTerm::Return(value) => return unsafe { self.execute_expr_owned(value) },
-                BlockTerm::Jump(edge) if edge.args.is_empty() => {
-                    cursor = RuntimeJitDeoptCursor::at_block_entry(edge.target);
+                BlockTerm::Jump(edge) => {
+                    let Some(next_cursor) = (unsafe { self.execute_jump_edge(edge)? }) else {
+                        return Ok(ptr::null_mut());
+                    };
+                    cursor = next_cursor;
                 }
                 BlockTerm::IfTerm(if_term) => {
                     let test = unsafe { self.execute_expr_owned(&if_term.test)? };
@@ -140,14 +143,99 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
                     cursor = RuntimeJitDeoptCursor::at_block_entry(next_block);
                 }
                 BlockTerm::Raise(raise) => return unsafe { self.execute_raise_term_owned(raise) },
-                BlockTerm::Jump(edge) => {
-                    return Err(format!(
-                        "deopt continuation for block {block_label} does not support jump args {:?}",
-                        edge.args
-                    ));
-                }
             }
         }
+    }
+
+    #[cold]
+    unsafe fn execute_jump_edge(
+        &mut self,
+        edge: &BlockEdge,
+    ) -> Result<Option<RuntimeJitDeoptCursor>, String> {
+        let function = self.invocation.function();
+        let target_block = function
+            .blocks
+            .iter()
+            .find(|candidate| candidate.label == edge.target)
+            .ok_or_else(|| {
+                format!(
+                    "deopt continuation expected jump target {} in function {}",
+                    edge.target, function.function_id
+                )
+            })?;
+        let target_params = target_block.params.clone();
+        if target_params.len() != edge.args.len() {
+            return Err(format!(
+                "deopt continuation jump to {} has {} args for {} target params",
+                edge.target,
+                edge.args.len(),
+                target_params.len()
+            ));
+        }
+        for param in &target_params {
+            if self.locals.get_by_name(param.name.as_str()).is_none() {
+                return Err(format!(
+                    "deopt continuation jump to {} targets param {}, but it was not materialized: {}",
+                    edge.target,
+                    param.name,
+                    self.locals.describe()
+                ));
+            }
+        }
+
+        let mut values = Vec::with_capacity(edge.args.len());
+        for arg in &edge.args {
+            let value = match arg {
+                BlockArg::Name(name) => unsafe { self.execute_block_arg_name_owned(name)? },
+                BlockArg::None => owned_none(),
+                BlockArg::CurrentException | BlockArg::AbruptKind(_) => {
+                    unsafe {
+                        release_owned_values(values);
+                    }
+                    return Err(format!(
+                        "deopt continuation jump to {} does not support edge arg {:?}",
+                        edge.target, arg
+                    ));
+                }
+            };
+            if value.is_null() {
+                unsafe {
+                    release_owned_values(values);
+                }
+                return Ok(None);
+            }
+            values.push(value);
+        }
+
+        for (param, value) in target_params.iter().zip(values.into_iter()) {
+            let local = self
+                .locals
+                .get_by_name_mut(param.name.as_str())
+                .expect("jump target params were prevalidated against materialized locals");
+            unsafe {
+                local.replace_with_owned_value(value);
+            }
+        }
+        Ok(Some(RuntimeJitDeoptCursor::at_block_entry(edge.target)))
+    }
+
+    #[cold]
+    unsafe fn execute_block_arg_name_owned(&self, name: &str) -> Result<ObjPtr, String> {
+        let Some(local) = self.locals.get_by_name(name) else {
+            return Err(format!(
+                "deopt continuation jump expected local {name}, but it was not materialized: {}",
+                self.locals.describe()
+            ));
+        };
+        let value = local.value();
+        if value.is_null() {
+            set_deopt_unbound_local_error(name);
+            return Ok(ptr::null_mut());
+        }
+        unsafe {
+            ffi::Py_INCREF(value.cast::<ffi::PyObject>());
+        }
+        Ok(value)
     }
 
     #[cold]
