@@ -34,7 +34,8 @@ pub(super) enum RuntimeNameConstantMode {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 enum StaticPyObjectTemplate {
-    CompactPyLongI64 { value: i64, digit: RawPyLongDigit },
+    PyLongI64 { value: i64 },
+    PyLongDecimal { value: String },
     CompactAsciiUnicode { bytes: Vec<u8> },
 }
 
@@ -74,10 +75,10 @@ struct RawPyASCIIObject {
     state: u32,
 }
 
+#[cfg(test)]
 const RAW_PYLONG_SHIFT: u32 = 30;
-const RAW_PYLONG_MASK: i64 = (1_i64 << RAW_PYLONG_SHIFT) - 1;
 const RAW_PYLONG_NON_SIZE_BITS: usize = 3;
-const RAW_PYLONG_SIGN_POSITIVE: usize = 0;
+const RAW_PYLONG_SMALL_INT_FLAG: usize = 1 << 2;
 const RAW_PYOBJECT_STATIC_IMMORTAL_FLAGS: i64 = (1 << 2) | (1 << 0);
 const RAW_PYOBJECT_IMMORTAL_INITIAL_REFCNT_64: i64 = 3 << 30;
 const RAW_PYOBJECT_STATIC_IMMORTAL_INITIAL_REFCNT_64: i64 =
@@ -92,18 +93,16 @@ const RAW_PYUNICODE_COMPACT_ASCII_STATE: u32 = (RAW_PYUNICODE_1BYTE_KIND
     << RAW_PYUNICODE_KIND_SHIFT)
     | (1 << RAW_PYUNICODE_COMPACT_SHIFT)
     | (1 << RAW_PYUNICODE_ASCII_SHIFT);
-// Keep this conservative until the offline object-image path carries the CPython
-// small-int range as validated build metadata.
-const RAW_PYLONG_SMALL_INT_MAX: i64 = 1024;
 
 impl StaticPyObjectTemplate {
     fn for_int(value: i64) -> Option<Self> {
-        if !(RAW_PYLONG_SMALL_INT_MAX + 1..=RAW_PYLONG_MASK).contains(&value) {
-            return None;
-        }
-        Some(Self::CompactPyLongI64 {
-            value,
-            digit: value as RawPyLongDigit,
+        Some(Self::PyLongI64 { value })
+    }
+
+    fn for_big_int(value: &str) -> Option<Self> {
+        CString::new(value).ok()?;
+        Some(Self::PyLongDecimal {
+            value: value.to_string(),
         })
     }
 
@@ -122,19 +121,9 @@ impl StaticPyObjectTemplate {
             return materialize_static_pyobject_image(py, &image);
         }
         match self {
-            Self::CompactPyLongI64 { value, .. } => build_pylong_i64_fallback(py, *value),
+            Self::PyLongI64 { value } => build_pylong_i64_fallback(py, *value),
+            Self::PyLongDecimal { value } => build_pylong_decimal_fallback(py, value),
             Self::CompactAsciiUnicode { bytes } => build_unicode_constant(py, bytes).map(Py::from),
-        }
-    }
-
-    fn compact_pylong_lv_tag(&self) -> usize {
-        match self {
-            Self::CompactPyLongI64 { .. } => {
-                (1 << RAW_PYLONG_NON_SIZE_BITS) | RAW_PYLONG_SIGN_POSITIVE
-            }
-            Self::CompactAsciiUnicode { .. } => {
-                panic!("compact PyLong tag requested for non-PyLong constant")
-            }
         }
     }
 
@@ -149,35 +138,8 @@ impl StaticPyObjectTemplate {
         }
 
         match self {
-            Self::CompactPyLongI64 { digit, .. } => {
-                let mut bytes = vec![0; mem::size_of::<RawPyLongObject>()];
-                write_i64(
-                    bytes.as_mut_slice(),
-                    offset_of!(RawPyLongObject, ob_base) + offset_of!(ffi::PyObject, ob_refcnt),
-                    RAW_PYOBJECT_STATIC_IMMORTAL_INITIAL_REFCNT_64,
-                );
-                let type_offset =
-                    offset_of!(RawPyLongObject, ob_base) + offset_of!(ffi::PyObject, ob_type);
-                write_usize(
-                    bytes.as_mut_slice(),
-                    offset_of!(RawPyLongObject, long_value) + offset_of!(RawPyLongValue, lv_tag),
-                    self.compact_pylong_lv_tag(),
-                );
-                write_u32(
-                    bytes.as_mut_slice(),
-                    offset_of!(RawPyLongObject, long_value) + offset_of!(RawPyLongValue, ob_digit),
-                    *digit,
-                );
-                Some(StaticPyObjectImage {
-                    bytes,
-                    align: mem::align_of::<RawPyLongObject>() as u64,
-                    writable: false,
-                    relocations: vec![StaticPyObjectRelocation {
-                        offset: type_offset as u64,
-                        symbol: "PyLong_Type",
-                    }],
-                })
-            }
+            Self::PyLongI64 { value } => static_pylong_i64_image(*value),
+            Self::PyLongDecimal { value } => static_pylong_decimal_image(value),
             Self::CompactAsciiUnicode { bytes: data } => {
                 let len = ffi::Py_ssize_t::try_from(data.len()).ok()?;
                 let object_size = mem::size_of::<RawPyASCIIObject>();
@@ -224,8 +186,10 @@ pub(super) fn static_pyobject_image(value: &ModuleConstantValue) -> Option<Stati
         ModuleConstantValue::Unicode(bytes) => {
             StaticPyObjectTemplate::for_unicode(bytes)?.static_object_image()
         }
+        ModuleConstantValue::BigInt(value) => {
+            StaticPyObjectTemplate::for_big_int(value)?.static_object_image()
+        }
         ModuleConstantValue::Bytes(_)
-        | ModuleConstantValue::BigInt(_)
         | ModuleConstantValue::FloatBits(_)
         | ModuleConstantValue::RuntimeName(_) => None,
     }
@@ -279,12 +243,11 @@ pub(super) fn build_python_constants(
                 }
             }
             ModuleConstantValue::BigInt(value) => {
-                let value =
-                    CString::new(value.as_str()).expect("big int literal should not contain NUL");
-                let mut end_ptr = ptr::null_mut();
-                let ptr = unsafe { ffi::PyLong_FromString(value.as_ptr(), &mut end_ptr, 0) };
-                let bound: Bound<'_, PyAny> = unsafe { Bound::from_owned_ptr_or_err(py, ptr)? };
-                bound.unbind()
+                if let Some(template) = StaticPyObjectTemplate::for_big_int(value) {
+                    template.build_python_constant(py)?
+                } else {
+                    build_pylong_decimal_fallback(py, value)?
+                }
             }
             ModuleConstantValue::FloatBits(bits) => {
                 let ptr = unsafe { ffi::PyFloat_FromDouble(f64::from_bits(*bits)) };
@@ -353,6 +316,93 @@ fn build_pylong_i64_fallback(py: Python<'_>, value: i64) -> PyResult<Py<PyAny>> 
     let ptr = unsafe { ffi::PyLong_FromLongLong(value as std::ffi::c_longlong) };
     let bound: Bound<'_, PyAny> = unsafe { Bound::from_owned_ptr_or_err(py, ptr)? };
     Ok(bound.unbind())
+}
+
+fn build_pylong_decimal_fallback(py: Python<'_>, value: &str) -> PyResult<Py<PyAny>> {
+    let value = CString::new(value).expect("big int literal should not contain NUL");
+    let mut end_ptr = ptr::null_mut();
+    let ptr = unsafe { ffi::PyLong_FromString(value.as_ptr(), &mut end_ptr, 0) };
+    let bound: Bound<'_, PyAny> = unsafe { Bound::from_owned_ptr_or_err(py, ptr)? };
+    if !end_ptr.is_null() && unsafe { *end_ptr != 0 } {
+        return Err(PyRuntimeError::new_err(
+            "big int literal was only partially parsed by PyLong_FromString",
+        ));
+    }
+    Ok(bound.unbind())
+}
+
+fn static_pylong_i64_image(value: i64) -> Option<StaticPyObjectImage> {
+    static_pylong_image_from_c_api(|| {
+        Some(unsafe { ffi::PyLong_FromLongLong(value as std::ffi::c_longlong) })
+    })
+}
+
+fn static_pylong_decimal_image(value: &str) -> Option<StaticPyObjectImage> {
+    let value = CString::new(value).ok()?;
+    static_pylong_image_from_c_api(|| {
+        let mut end_ptr = ptr::null_mut();
+        let ptr = unsafe { ffi::PyLong_FromString(value.as_ptr(), &mut end_ptr, 0) };
+        if ptr.is_null() {
+            return Some(ptr);
+        }
+        if !end_ptr.is_null() && unsafe { *end_ptr != 0 } {
+            unsafe { ffi::Py_DECREF(ptr) };
+            return None;
+        }
+        Some(ptr)
+    })
+}
+
+fn static_pylong_image_from_c_api(
+    create: impl FnOnce() -> Option<*mut ffi::PyObject>,
+) -> Option<StaticPyObjectImage> {
+    Python::try_attach(|py| unsafe {
+        let ptr = create()?;
+        if ptr.is_null() {
+            if !ffi::PyErr_Occurred().is_null() {
+                ffi::PyErr_Clear();
+            }
+            return None;
+        }
+        let object: Bound<'_, PyAny> = Bound::from_owned_ptr(py, ptr);
+        static_pylong_image_from_borrowed_ptr(object.as_ptr())
+    })
+    .flatten()
+}
+
+unsafe fn static_pylong_image_from_borrowed_ptr(
+    ptr: *mut ffi::PyObject,
+) -> Option<StaticPyObjectImage> {
+    if unsafe { ffi::PyLong_CheckExact(ptr) } == 0 {
+        return None;
+    }
+    let raw = unsafe { &*(ptr.cast::<RawPyLongObject>()) };
+    if raw.long_value.lv_tag & RAW_PYLONG_SMALL_INT_FLAG != 0 {
+        return None;
+    }
+    let ndigits = raw.long_value.lv_tag >> RAW_PYLONG_NON_SIZE_BITS;
+    let digit_count = ndigits.max(1);
+    let digit_offset =
+        offset_of!(RawPyLongObject, long_value) + offset_of!(RawPyLongValue, ob_digit);
+    let digit_bytes = digit_count.checked_mul(mem::size_of::<RawPyLongDigit>())?;
+    let object_size = digit_offset.checked_add(digit_bytes)?;
+    let mut bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), object_size) }.to_vec();
+    write_i64(
+        bytes.as_mut_slice(),
+        offset_of!(RawPyLongObject, ob_base) + offset_of!(ffi::PyObject, ob_refcnt),
+        RAW_PYOBJECT_STATIC_IMMORTAL_INITIAL_REFCNT_64,
+    );
+    let type_offset = offset_of!(RawPyLongObject, ob_base) + offset_of!(ffi::PyObject, ob_type);
+    write_usize(bytes.as_mut_slice(), type_offset, 0);
+    Some(StaticPyObjectImage {
+        bytes,
+        align: mem::align_of::<RawPyLongObject>() as u64,
+        writable: false,
+        relocations: vec![StaticPyObjectRelocation {
+            offset: type_offset as u64,
+            symbol: "PyLong_Type",
+        }],
+    })
 }
 
 fn build_static_unicode_constant(
@@ -795,21 +845,44 @@ mod tests {
     use crate::module_constants::ModuleCodegenConstants;
 
     #[test]
-    fn static_pylong_template_accepts_only_positive_one_digit_non_small_ints() {
-        assert_eq!(StaticPyObjectTemplate::for_int(-1), None);
-        assert_eq!(StaticPyObjectTemplate::for_int(0), None);
+    fn static_pylong_template_accepts_arbitrary_non_small_pylongs() {
+        crate::initialize_test_python();
         assert_eq!(
-            StaticPyObjectTemplate::for_int(RAW_PYLONG_SMALL_INT_MAX),
-            None
+            StaticPyObjectTemplate::for_int(-1)
+                .expect("i64 PyLong templates should construct")
+                .static_object_image(),
+            None,
+            "CPython small-int singletons should stay on the normal C API path"
         );
         assert_eq!(
-            StaticPyObjectTemplate::for_int(RAW_PYLONG_SMALL_INT_MAX + 1),
-            Some(StaticPyObjectTemplate::CompactPyLongI64 {
-                value: RAW_PYLONG_SMALL_INT_MAX + 1,
-                digit: (RAW_PYLONG_SMALL_INT_MAX + 1) as RawPyLongDigit,
-            })
+            StaticPyObjectTemplate::for_int(0)
+                .expect("i64 PyLong templates should construct")
+                .static_object_image(),
+            None,
+            "CPython small-int singletons should stay on the normal C API path"
         );
-        assert_eq!(StaticPyObjectTemplate::for_int(RAW_PYLONG_MASK + 1), None);
+        assert_eq!(
+            StaticPyObjectTemplate::for_int(12345),
+            Some(StaticPyObjectTemplate::PyLongI64 { value: 12345 })
+        );
+        assert!(
+            StaticPyObjectTemplate::for_int(-12345)
+                .expect("negative non-small int should be static-capable")
+                .static_object_image()
+                .is_some()
+        );
+        assert!(
+            StaticPyObjectTemplate::for_int(1_i64 << RAW_PYLONG_SHIFT)
+                .expect("multi-digit i64 int should be static-capable")
+                .static_object_image()
+                .is_some()
+        );
+        assert!(
+            StaticPyObjectTemplate::for_big_int("123456789012345678901234567890")
+                .expect("big int template should construct")
+                .static_object_image()
+                .is_some()
+        );
     }
 
     #[test]
@@ -827,11 +900,11 @@ mod tests {
     }
 
     #[test]
-    fn build_python_constants_materializes_static_compact_pylong() {
+    fn build_python_constants_materializes_static_pylong() {
         crate::initialize_test_python();
         Python::attach(|py| {
             let mut constants = ModuleCodegenConstants::default();
-            let constant_id = constants.intern_int(12345);
+            let constant_id = constants.intern_int(1_i64 << RAW_PYLONG_SHIFT);
             let image = constants
                 .static_pyobject_image(constant_id)
                 .expect("test constant should have a static image");
@@ -852,17 +925,53 @@ mod tests {
                     std::slice::from_raw_parts(obj.cast::<u8>(), expected_bytes.len());
                 assert_eq!(actual_bytes, expected_bytes.as_slice());
                 assert_ne!(ffi::PyLong_CheckExact(obj), 0);
-                assert_eq!(ffi::PyLong_AsLongLong(obj), 12345);
+                assert_eq!(ffi::PyLong_AsLongLong(obj), 1_i64 << RAW_PYLONG_SHIFT);
                 assert_ne!(PyUnstable_IsImmortal(obj), 0);
 
                 let raw = &*(obj.cast::<RawPyLongObject>());
+                assert_eq!(raw.long_value.lv_tag >> RAW_PYLONG_NON_SIZE_BITS, 2);
+                let digits = raw.long_value.ob_digit.as_ptr();
+                assert_eq!(*digits, 0);
+                assert_eq!(*digits.add(1), 1);
+            }
+        });
+    }
+
+    #[test]
+    fn build_python_constants_materializes_static_big_pylong() {
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let mut constants = ModuleCodegenConstants::default();
+            let value = "123456789012345678901234567890";
+            let constant_id = constants.intern(ModuleConstantValue::BigInt(value.to_string()));
+            let image = constants
+                .static_pyobject_image(constant_id)
+                .expect("test big int constant should have a static image");
+            let objects = constants
+                .build_python_constants(py)
+                .expect("building static big PyLong constant should succeed");
+            let obj = objects[constant_id.0].as_ptr();
+
+            unsafe {
+                let mut expected_bytes = image.bytes.clone();
+                patch_static_pyobject_image_relocations(
+                    expected_bytes.as_mut_ptr(),
+                    expected_bytes.len(),
+                    &image.relocations,
+                )
+                .expect("test static image relocations should patch");
+                let actual_bytes =
+                    std::slice::from_raw_parts(obj.cast::<u8>(), expected_bytes.len());
+                assert_eq!(actual_bytes, expected_bytes.as_slice());
+                assert_ne!(ffi::PyLong_CheckExact(obj), 0);
+                assert_ne!(PyUnstable_IsImmortal(obj), 0);
+
+                let expected = build_pylong_decimal_fallback(py, value)
+                    .expect("test expected big int should build");
                 assert_eq!(
-                    raw.long_value.lv_tag,
-                    StaticPyObjectTemplate::for_int(12345)
-                        .expect("constant should be static-capable")
-                        .compact_pylong_lv_tag()
+                    ffi::PyObject_RichCompareBool(obj, expected.as_ptr(), ffi::Py_EQ),
+                    1
                 );
-                assert_eq!(raw.long_value.ob_digit[0], 12345);
             }
         });
     }
@@ -1020,7 +1129,8 @@ mod tests {
     }
 
     #[test]
-    fn static_compact_pylong_image_matches_raw_layout() {
+    fn static_pylong_image_matches_raw_layout() {
+        crate::initialize_test_python();
         let image = StaticPyObjectTemplate::for_int(12345)
             .expect("test constant should be static-capable")
             .static_object_image()
@@ -1031,7 +1141,10 @@ mod tests {
         let digit_offset =
             offset_of!(RawPyLongObject, long_value) + offset_of!(RawPyLongValue, ob_digit);
 
-        assert_eq!(image.bytes.len(), mem::size_of::<RawPyLongObject>());
+        assert_eq!(
+            image.bytes.len(),
+            digit_offset + mem::size_of::<RawPyLongDigit>()
+        );
         assert_eq!(image.align, mem::align_of::<RawPyLongObject>() as u64);
         assert!(!image.writable);
         assert_eq!(
@@ -1059,9 +1172,7 @@ mod tests {
                     .try_into()
                     .expect("tag slice should have usize width")
             ),
-            StaticPyObjectTemplate::for_int(12345)
-                .expect("test constant should be static-capable")
-                .compact_pylong_lv_tag()
+            1 << RAW_PYLONG_NON_SIZE_BITS
         );
         assert_eq!(
             u32::from_le_bytes(

@@ -70,6 +70,8 @@ fn run_with_args(args: impl IntoIterator<Item = OsString>) -> Result<(), String>
         .unwrap_or_else(|| default_object_dir(out_path.as_path()));
     let linker = args.linker.unwrap_or_else(|| OsString::from("cc"));
 
+    soac_inspector::prepare_python();
+
     let counter_dump = CounterDumpFile::open(counters_path.as_path())?;
     let records = counter_dump.records()?;
     let modules = counter_modules_from_records(records.as_slice())?;
