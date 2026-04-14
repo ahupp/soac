@@ -4584,6 +4584,67 @@ def read_point(point):
         count
     }
 
+    fn count_deopt_helper_success_returns(
+        function: &ir::Function,
+        helpers: &[ir::UserExternalName],
+    ) -> usize {
+        let mut count = 0usize;
+        for block in function.layout.blocks() {
+            for inst in function.layout.block_insts(block) {
+                let callee = match function.dfg.insts[inst] {
+                    ir::InstructionData::Call { func_ref, .. }
+                    | ir::InstructionData::TryCall { func_ref, .. } => Some(func_ref),
+                    _ => None,
+                };
+                let Some(callee) = callee else {
+                    continue;
+                };
+                let ext_func = &function.dfg.ext_funcs[callee];
+                let ir::ExternalName::User(name_ref) = &ext_func.name else {
+                    continue;
+                };
+                let user_name = &function.params.user_named_funcs()[*name_ref];
+                if !helpers.contains(user_name) {
+                    continue;
+                }
+                let [deopt_result] = function.dfg.inst_results(inst) else {
+                    panic!("deopt helper call should have one result");
+                };
+                let Some(term) = function.layout.last_inst(block) else {
+                    continue;
+                };
+                for destination in function.dfg.insts[term]
+                    .branch_destination(&function.dfg.jump_tables, &function.dfg.exception_tables)
+                {
+                    let args = destination
+                        .args(&function.dfg.value_lists)
+                        .collect::<Vec<_>>();
+                    if !args.iter().any(
+                        |arg| matches!(arg, ir::BlockArg::Value(value) if value == deopt_result),
+                    ) {
+                        continue;
+                    }
+                    let target = destination.block(&function.dfg.value_lists);
+                    let Some(target_term) = function.layout.last_inst(target) else {
+                        continue;
+                    };
+                    if function.dfg.insts[target_term].opcode() != ir::Opcode::Return {
+                        continue;
+                    }
+                    let return_args = function.dfg.inst_args(target_term);
+                    let target_params = function.dfg.block_params(target);
+                    if return_args.len() == 1
+                        && target_params.len() == 1
+                        && return_args[0] == target_params[0]
+                    {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        count
+    }
+
     fn direct_call_colocated_flags_to_runtime_helpers(
         function: &ir::Function,
         helpers: &[ir::UserExternalName],
@@ -6912,6 +6973,11 @@ def f(x, y):
             count_cold_block_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
             1,
             "{case_name}: test deopt guard mode should isolate the deopt helper call in a cold block"
+        );
+        assert_eq!(
+            count_deopt_helper_success_returns(&built.ctx.func, &deopt_helpers),
+            1,
+            "{case_name}: test deopt guard mode should return a successful deopt continuation result"
         );
         assert_eq!(
             count_direct_calls_to_runtime_helpers(&built.ctx.func, &slow_global_helpers),

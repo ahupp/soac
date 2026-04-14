@@ -1957,7 +1957,7 @@ fn emit_codegen_indexed_global_load(
             let (live_values_base, live_value_count) =
                 emit_deopt_live_value_buffer(fb, target, ctx, local_env)
                     .unwrap_or_else(|err| panic!("{err}"));
-            let _ = emit_deopt_unimplemented_exit_call(
+            let deopt_result = emit_deopt_unimplemented_exit_call(
                 fb,
                 target,
                 deopt_unimplemented_ref,
@@ -1967,8 +1967,23 @@ fn emit_codegen_indexed_global_load(
                 ctx.consts.i64_ty,
             );
             emit_release_owned_inputs(fb, ctx, &[name_obj]);
-            fb.ins()
-                .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
+            let deopt_result_is_null =
+                fb.ins()
+                    .icmp(ir::condcodes::IntCC::Equal, deopt_result, null_ptr);
+            let deopt_success_block = fb.create_block();
+            fb.append_block_param(deopt_success_block, ptr_ty);
+            fb.set_cold_block(deopt_success_block);
+            fb.ins().brif(
+                deopt_result_is_null,
+                ctx.consts.step_null_block,
+                &step_null_block_args(ctx),
+                deopt_success_block,
+                &[ir::BlockArg::Value(deopt_result)],
+            );
+
+            fb.switch_to_block(deopt_success_block);
+            let resumed_result = fb.block_params(deopt_success_block)[0];
+            fb.ins().return_(&[resumed_result]);
         }
     }
 
