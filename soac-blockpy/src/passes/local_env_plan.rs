@@ -5,7 +5,10 @@
 //! backend-neutral: backends may materialize these entries as SSA block params,
 //! stack-slot loads, or another resume-state representation.
 
-use crate::block_py::{BlockLabel, BlockPyFunction, BlockPyModule, FunctionId, LocalLocation};
+use crate::block_py::{
+    BlockLabel, BlockPyFunction, BlockPyModule, FunctionId, HasSemanticInstrId, InstrKey,
+    LocalLocation,
+};
 use crate::passes::ownership_effects::{
     compute_function_local_live_ins, compute_function_local_must_bound_ins,
 };
@@ -120,6 +123,89 @@ impl LocalEnvModulePlan {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalEnvResumeStatePrecision {
+    /// The resume record contains the LocalEnv entries that are valid at the
+    /// containing block's entry. This is sufficient for block-entry resume
+    /// validation and rendering, but not yet a runnable mid-block deopt state.
+    BlockEntry,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalEnvResumePoint {
+    BlockEntry {
+        function_id: FunctionId,
+        block: BlockLabel,
+    },
+    BeforeInstr {
+        key: InstrKey,
+    },
+    BeforeTerm {
+        function_id: FunctionId,
+        block: BlockLabel,
+    },
+}
+
+impl LocalEnvResumePoint {
+    pub const fn function_id(self) -> FunctionId {
+        match self {
+            Self::BlockEntry { function_id, .. } | Self::BeforeTerm { function_id, .. } => {
+                function_id
+            }
+            Self::BeforeInstr { key } => key.function_id,
+        }
+    }
+
+    pub const fn block_label(self) -> BlockLabel {
+        match self {
+            Self::BlockEntry { block, .. } | Self::BeforeTerm { block, .. } => block,
+            Self::BeforeInstr { key } => key.instr_id.block_label(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalEnvResumeEntry {
+    pub point: LocalEnvResumePoint,
+    pub precision: LocalEnvResumeStatePrecision,
+    pub block_entry_locals: Vec<PlannedLocalBinding>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct FunctionLocalEnvResumePlan {
+    pub entries: Vec<LocalEnvResumeEntry>,
+}
+
+impl FunctionLocalEnvResumePlan {
+    pub fn entries_for_block(
+        &self,
+        block: BlockLabel,
+    ) -> impl Iterator<Item = &LocalEnvResumeEntry> {
+        self.entries
+            .iter()
+            .filter(move |entry| entry.point.block_label() == block)
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LocalEnvResumeModulePlan {
+    pub functions: HashMap<FunctionId, FunctionLocalEnvResumePlan>,
+}
+
+impl LocalEnvResumeModulePlan {
+    pub fn function(&self, function_id: FunctionId) -> Option<&FunctionLocalEnvResumePlan> {
+        self.functions.get(&function_id)
+    }
+
+    pub fn validate_for_module(
+        &self,
+        module: &BlockPyModule<CodegenModuleShape>,
+        local_env_plan: &LocalEnvModulePlan,
+    ) -> Result<(), String> {
+        validate_local_env_resume_module_plan(module, local_env_plan, self)
+    }
+}
+
 pub fn plan_local_env_module(
     module: &BlockPyModule<CodegenModuleShape>,
     facts: &FactStore,
@@ -130,6 +216,66 @@ pub fn plan_local_env_module(
         .map(|function| (function.function_id, plan_function_locals(function, facts)))
         .collect();
     LocalEnvModulePlan { functions }
+}
+
+pub fn plan_local_env_resume_module(
+    module: &BlockPyModule<CodegenModuleShape>,
+    local_env_plan: &LocalEnvModulePlan,
+) -> LocalEnvResumeModulePlan {
+    let functions = module
+        .callable_defs
+        .iter()
+        .filter_map(|function| {
+            let function_plan = local_env_plan.function(function.function_id)?;
+            Some((
+                function.function_id,
+                plan_function_local_env_resume(function, function_plan),
+            ))
+        })
+        .collect();
+    LocalEnvResumeModulePlan { functions }
+}
+
+pub fn plan_function_local_env_resume(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    local_env_plan: &FunctionLocalPlan,
+) -> FunctionLocalEnvResumePlan {
+    let mut entries = Vec::new();
+    for block in &function.blocks {
+        let Some(block_plan) = local_env_plan.block(block.label) else {
+            continue;
+        };
+        let block_entry_locals = block_plan.entry_locals.clone();
+        entries.push(LocalEnvResumeEntry {
+            point: LocalEnvResumePoint::BlockEntry {
+                function_id: function.function_id,
+                block: block.label,
+            },
+            precision: LocalEnvResumeStatePrecision::BlockEntry,
+            block_entry_locals: block_entry_locals.clone(),
+        });
+        for instr in &block.body {
+            let Some(instr_id) = instr.try_semantic_instr_id() else {
+                continue;
+            };
+            entries.push(LocalEnvResumeEntry {
+                point: LocalEnvResumePoint::BeforeInstr {
+                    key: InstrKey::new(function.function_id, instr_id),
+                },
+                precision: LocalEnvResumeStatePrecision::BlockEntry,
+                block_entry_locals: block_entry_locals.clone(),
+            });
+        }
+        entries.push(LocalEnvResumeEntry {
+            point: LocalEnvResumePoint::BeforeTerm {
+                function_id: function.function_id,
+                block: block.label,
+            },
+            precision: LocalEnvResumeStatePrecision::BlockEntry,
+            block_entry_locals,
+        });
+    }
+    FunctionLocalEnvResumePlan { entries }
 }
 
 pub fn validate_local_env_module_plan(
@@ -159,6 +305,47 @@ pub fn validate_local_env_module_plan(
         if !expected_function_ids.contains(function_id) {
             errors.push(format!(
                 "LocalEnv plan contains unknown function id {function_id}"
+            ));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("\n"))
+    }
+}
+
+pub fn validate_local_env_resume_module_plan(
+    module: &BlockPyModule<CodegenModuleShape>,
+    local_env_plan: &LocalEnvModulePlan,
+    resume_plan: &LocalEnvResumeModulePlan,
+) -> Result<(), String> {
+    let expected = plan_local_env_resume_module(module, local_env_plan);
+    if &expected != resume_plan {
+        return Err(format!(
+            "LocalEnv resume plan mismatch\nexpected: {expected:#?}\nactual: {resume_plan:#?}"
+        ));
+    }
+
+    let expected_function_ids = module
+        .callable_defs
+        .iter()
+        .map(|function| function.function_id)
+        .collect::<HashSet<_>>();
+    let mut errors = Vec::new();
+    for function in &module.callable_defs {
+        if resume_plan.function(function.function_id).is_none() {
+            errors.push(format!(
+                "missing LocalEnv resume plan for function {} ({})",
+                function.function_id, function.names.qualname
+            ));
+        }
+    }
+    for function_id in resume_plan.functions.keys() {
+        if !expected_function_ids.contains(function_id) {
+            errors.push(format!(
+                "LocalEnv resume plan contains unknown function id {function_id}"
             ));
         }
     }
@@ -293,6 +480,62 @@ pub fn render_local_env_module_plan(
     Ok(out)
 }
 
+pub fn render_local_env_resume_module_plan(
+    module: &BlockPyModule<CodegenModuleShape>,
+    local_env_plan: &LocalEnvModulePlan,
+    resume_plan: &LocalEnvResumeModulePlan,
+) -> Result<String, String> {
+    validate_local_env_resume_module_plan(module, local_env_plan, resume_plan)?;
+    let mut out = String::new();
+    for function in &module.callable_defs {
+        let function_plan = resume_plan.function(function.function_id).ok_or_else(|| {
+            format!(
+                "missing LocalEnv resume plan for function {} ({})",
+                function.function_id, function.names.qualname
+            )
+        })?;
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&render_local_env_resume_function_plan(
+            function,
+            function_plan,
+        )?);
+    }
+    Ok(out)
+}
+
+pub fn render_local_env_resume_function_plan(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    plan: &FunctionLocalEnvResumePlan,
+) -> Result<String, String> {
+    let mut out = String::new();
+    writeln!(
+        out,
+        "function {} {}:",
+        function.function_id, function.names.qualname
+    )
+    .expect("writing to String should not fail");
+    for block in &function.blocks {
+        writeln!(out, "  block {}:", block.label).expect("writing to String should not fail");
+        for entry in plan.entries_for_block(block.label) {
+            writeln!(
+                out,
+                "    {} precision={:?}:",
+                render_local_env_resume_point(entry.point),
+                entry.precision,
+            )
+            .expect("writing to String should not fail");
+            writeln!(out, "      block_entry_locals:").expect("writing to String should not fail");
+            for binding in &entry.block_entry_locals {
+                writeln!(out, "        {}", render_planned_local_binding(binding))
+                    .expect("writing to String should not fail");
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub fn render_local_env_function_plan(
     function: &BlockPyFunction<CodegenModuleShape>,
     plan: &FunctionLocalPlan,
@@ -332,6 +575,14 @@ pub fn render_planned_local_binding(binding: &PlannedLocalBinding) -> String {
         binding.param_facts.provenance,
         binding.param_facts.value
     )
+}
+
+fn render_local_env_resume_point(point: LocalEnvResumePoint) -> String {
+    match point {
+        LocalEnvResumePoint::BlockEntry { .. } => "block_entry".to_string(),
+        LocalEnvResumePoint::BeforeInstr { key } => format!("before_instr {key}"),
+        LocalEnvResumePoint::BeforeTerm { .. } => "before_term".to_string(),
+    }
 }
 
 fn validate_function_local_plan(
@@ -420,5 +671,56 @@ def f(flag):
             })
         });
         assert!(has_immortal_x, "LocalEnv plan should carry value facts");
+    }
+
+    #[test]
+    fn local_env_resume_plan_records_validated_block_boundaries() {
+        let lowered = lower_python_to_blockpy_for_testing(
+            r#"
+def choose(flag, x):
+    if flag:
+        y = x
+    else:
+        y = 1
+    return y
+"#,
+        )
+        .expect("transform should succeed")
+        .codegen_module;
+        let facts = infer_module_value_facts(&lowered);
+        let local_plan = plan_local_env_module(&lowered, &facts);
+        let resume_plan = plan_local_env_resume_module(&lowered, &local_plan);
+
+        validate_local_env_resume_module_plan(&lowered, &local_plan, &resume_plan)
+            .expect("fresh LocalEnv resume plan should validate");
+
+        for function in &lowered.callable_defs {
+            let function_plan = resume_plan
+                .function(function.function_id)
+                .expect("each function should have a LocalEnv resume plan");
+            let block_entry_count = function_plan
+                .entries
+                .iter()
+                .filter(|entry| matches!(entry.point, LocalEnvResumePoint::BlockEntry { .. }))
+                .count();
+            let before_term_count = function_plan
+                .entries
+                .iter()
+                .filter(|entry| matches!(entry.point, LocalEnvResumePoint::BeforeTerm { .. }))
+                .count();
+            assert_eq!(block_entry_count, function.blocks.len());
+            assert_eq!(before_term_count, function.blocks.len());
+            assert!(
+                function_plan
+                    .entries
+                    .iter()
+                    .any(|entry| matches!(entry.point, LocalEnvResumePoint::BeforeInstr { .. })),
+                "non-empty functions should expose instruction-keyed resume points"
+            );
+            assert!(function_plan.entries.iter().all(|entry| {
+                entry.point.function_id() == function.function_id
+                    && entry.precision == LocalEnvResumeStatePrecision::BlockEntry
+            }));
+        }
     }
 }

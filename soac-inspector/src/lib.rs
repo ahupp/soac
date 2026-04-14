@@ -10,7 +10,8 @@ use serde_json::{Value, json};
 use soac_blockpy::block_py::{BlockPyFunction, BlockPyModule, FunctionId, ModuleNameGen};
 use soac_blockpy::passes::{
     CodegenModuleShape, infer_module_value_facts, plan_local_env_module,
-    render_local_env_function_plan, render_local_env_module_plan,
+    plan_local_env_resume_module, render_local_env_function_plan, render_local_env_module_plan,
+    render_local_env_resume_function_plan, render_local_env_resume_module_plan,
 };
 use soac_jit::module_constants::ModuleCodegenConstants;
 use soac_jit::module_type::build_shared_state_for_inspection;
@@ -255,15 +256,24 @@ fn render_inspector_payload(source: &str, output: &soac_blockpy::LoweringResult)
         }));
     }
     let facts = infer_module_value_facts(&output.codegen_module);
-    let local_env_plan_text = (|| {
-        let plan = plan_local_env_module(&output.codegen_module, &facts);
-        render_local_env_module_plan(&output.codegen_module, &facts, &plan)
-    })()
-    .unwrap_or_else(|err| format!("; failed to render local_env_plan: {err}"));
+    let local_env_plan = plan_local_env_module(&output.codegen_module, &facts);
+    let local_env_plan_text =
+        render_local_env_module_plan(&output.codegen_module, &facts, &local_env_plan)
+            .unwrap_or_else(|err| format!("; failed to render local_env_plan: {err}"));
     steps.push(json!({
         "key": "local_env_plan",
         "label": "local env plan",
         "text": local_env_plan_text,
+    }));
+    let local_env_resume_plan_text = (|| {
+        let resume_plan = plan_local_env_resume_module(&output.codegen_module, &local_env_plan);
+        render_local_env_resume_module_plan(&output.codegen_module, &local_env_plan, &resume_plan)
+    })()
+    .unwrap_or_else(|err| format!("; failed to render local_env_resume_plan: {err}"));
+    steps.push(json!({
+        "key": "local_env_resume_plan",
+        "label": "local env resume plan",
+        "text": local_env_resume_plan_text,
     }));
     let jit_local_plan_text = (|| {
         let plan = plan_jit_module_locals(&output.codegen_module, &facts)?;
@@ -375,13 +385,22 @@ pub fn jit_debug_plan(
             .function(function.function_id)
             .ok_or_else(|| format!("missing LocalEnv plan for {module_name}.fn#{function_id}"))?,
     )?;
+    let local_env_resume_plan = plan_local_env_resume_module(module, &local_env_plan);
+    let local_env_resume_plan_text = render_local_env_resume_function_plan(
+        function,
+        local_env_resume_plan
+            .function(function.function_id)
+            .ok_or_else(|| {
+                format!("missing LocalEnv resume plan for {module_name}.fn#{function_id}")
+            })?,
+    )?;
     let jit_module_local_plan = plan_jit_module_locals(module, &facts)?;
     let jit_local_plan = jit_module_local_plan
         .function(function.function_id)
         .ok_or_else(|| format!("missing JIT local plan for {module_name}.fn#{function_id}"))?;
     let jit_local_plan_text = render_jit_function_locals(function, jit_local_plan)?;
     Ok(format!(
-        "function:\n{function:#?}\n\nlocal_env_plan:\n{local_env_plan_text}\n\njit_local_plan:\n{jit_local_plan_text}"
+        "function:\n{function:#?}\n\nlocal_env_plan:\n{local_env_plan_text}\n\nlocal_env_resume_plan:\n{local_env_resume_plan_text}\n\njit_local_plan:\n{jit_local_plan_text}"
     ))
 }
 

@@ -663,9 +663,13 @@ pub use instrument::{
     CounterBuilder, CounterHandle, CounterSpec, InstrumentInstr, OptBlock, OptInstr,
 };
 pub use local_env_plan::{
-    plan_function_locals, plan_local_env_module, render_local_env_function_plan,
-    render_local_env_module_plan, render_planned_local_binding, validate_local_env_module_plan,
-    BlockLocalPlan, BlockParamFacts, FunctionLocalPlan, LocalEnvModulePlan, LocalRefKind,
+    plan_function_local_env_resume, plan_function_locals, plan_local_env_module,
+    plan_local_env_resume_module, render_local_env_function_plan, render_local_env_module_plan,
+    render_local_env_resume_function_plan, render_local_env_resume_module_plan,
+    render_planned_local_binding, validate_local_env_module_plan,
+    validate_local_env_resume_module_plan, BlockLocalPlan, BlockParamFacts,
+    FunctionLocalEnvResumePlan, FunctionLocalPlan, LocalEnvModulePlan, LocalEnvResumeEntry,
+    LocalEnvResumeModulePlan, LocalEnvResumePoint, LocalEnvResumeStatePrecision, LocalRefKind,
     ParamBindingFacts, ParamProvenance, PlannedLocalBinding, PlannedLocalStorage,
 };
 pub use ownership_effects::{
