@@ -1366,6 +1366,7 @@ pub(crate) enum RuntimeJitDeoptContinuation {
 }
 
 impl RuntimeJitDeoptRecord {
+    #[cfg(test)]
     pub(crate) fn id(&self) -> PlannedJitDeoptPointId {
         self.id
     }
@@ -1374,10 +1375,12 @@ impl RuntimeJitDeoptRecord {
         self.id.ordinal
     }
 
+    #[cfg(test)]
     pub(crate) fn resume_point(&self) -> LocalEnvResumePoint {
         self.resume_point
     }
 
+    #[cfg(test)]
     pub(crate) fn precision(&self) -> LocalEnvResumeStatePrecision {
         self.precision
     }
@@ -1551,6 +1554,7 @@ impl RuntimeJitDeoptTable {
         Ok(record)
     }
 
+    #[cfg(test)]
     pub(crate) fn describe_record_ordinal(&self, record_ordinal: i64) -> Result<String, String> {
         self.record_for_ordinal(record_ordinal)
             .map(|record| record.describe(self.function_id))
