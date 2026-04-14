@@ -1724,10 +1724,25 @@ pub(crate) struct RuntimeJitDeoptCursor {
     body_index: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeJitDeoptUnsupportedReason {
+    WrongFunction,
+    MissingFunction,
+    MissingBlock,
+    MissingInstruction,
+    MissingPlanRecord,
+    UnsupportedBlockTail,
+    ReplayUnsafeGuardOperand,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RuntimeJitDeoptContinuation {
-    Unimplemented,
-    ResumeBlockTail { cursor: RuntimeJitDeoptCursor },
+    Unsupported {
+        reason: RuntimeJitDeoptUnsupportedReason,
+    },
+    ResumeBlockTail {
+        cursor: RuntimeJitDeoptCursor,
+    },
 }
 
 impl RuntimeJitDeoptCursor {
@@ -1749,10 +1764,21 @@ impl RuntimeJitDeoptCursor {
 }
 
 impl RuntimeJitDeoptContinuation {
+    pub(crate) fn unsupported(reason: RuntimeJitDeoptUnsupportedReason) -> Self {
+        Self::Unsupported { reason }
+    }
+
     pub(crate) fn initial_cursor(&self) -> Option<RuntimeJitDeoptCursor> {
         match self {
             RuntimeJitDeoptContinuation::ResumeBlockTail { cursor } => Some(*cursor),
-            RuntimeJitDeoptContinuation::Unimplemented => None,
+            RuntimeJitDeoptContinuation::Unsupported { .. } => None,
+        }
+    }
+
+    pub(crate) fn unsupported_reason(&self) -> Option<RuntimeJitDeoptUnsupportedReason> {
+        match self {
+            RuntimeJitDeoptContinuation::Unsupported { reason } => Some(*reason),
+            RuntimeJitDeoptContinuation::ResumeBlockTail { .. } => None,
         }
     }
 }
@@ -1977,26 +2003,34 @@ fn runtime_jit_deopt_continuation_for_point(
     match point {
         LocalEnvResumePoint::BeforeTerm { function_id, block } => {
             if function_id != function.function_id {
-                return RuntimeJitDeoptContinuation::Unimplemented;
+                return RuntimeJitDeoptContinuation::unsupported(
+                    RuntimeJitDeoptUnsupportedReason::WrongFunction,
+                );
             }
             let Some(block) = function
                 .blocks
                 .iter()
                 .find(|candidate| candidate.label == block)
             else {
-                return RuntimeJitDeoptContinuation::Unimplemented;
+                return RuntimeJitDeoptContinuation::unsupported(
+                    RuntimeJitDeoptUnsupportedReason::MissingBlock,
+                );
             };
             if runtime_jit_deopt_block_tail_supported(function, block, block.body.len()) {
                 RuntimeJitDeoptContinuation::ResumeBlockTail {
                     cursor: RuntimeJitDeoptCursor::new(block.label, block.body.len()),
                 }
             } else {
-                RuntimeJitDeoptContinuation::Unimplemented
+                RuntimeJitDeoptContinuation::unsupported(
+                    RuntimeJitDeoptUnsupportedReason::UnsupportedBlockTail,
+                )
             }
         }
         LocalEnvResumePoint::BeforeInstr { key } => {
             if key.function_id != function.function_id {
-                return RuntimeJitDeoptContinuation::Unimplemented;
+                return RuntimeJitDeoptContinuation::unsupported(
+                    RuntimeJitDeoptUnsupportedReason::WrongFunction,
+                );
             }
             let block_label = key.instr_id.block_label();
             let Some(block) = function
@@ -2004,43 +2038,85 @@ fn runtime_jit_deopt_continuation_for_point(
                 .iter()
                 .find(|candidate| candidate.label == block_label)
             else {
-                return RuntimeJitDeoptContinuation::Unimplemented;
+                return RuntimeJitDeoptContinuation::unsupported(
+                    RuntimeJitDeoptUnsupportedReason::MissingBlock,
+                );
             };
             let Some(start_body_index) = block
                 .body
                 .iter()
                 .position(|instr| instr.try_semantic_instr_id() == Some(key.instr_id))
             else {
-                return RuntimeJitDeoptContinuation::Unimplemented;
+                return RuntimeJitDeoptContinuation::unsupported(
+                    RuntimeJitDeoptUnsupportedReason::MissingInstruction,
+                );
             };
             if runtime_jit_deopt_block_tail_supported(function, block, start_body_index) {
                 RuntimeJitDeoptContinuation::ResumeBlockTail {
                     cursor: RuntimeJitDeoptCursor::new(block_label, start_body_index),
                 }
             } else {
-                RuntimeJitDeoptContinuation::Unimplemented
+                RuntimeJitDeoptContinuation::unsupported(
+                    RuntimeJitDeoptUnsupportedReason::UnsupportedBlockTail,
+                )
             }
         }
         LocalEnvResumePoint::BlockEntry { function_id, block } => {
             if function_id != function.function_id {
-                return RuntimeJitDeoptContinuation::Unimplemented;
+                return RuntimeJitDeoptContinuation::unsupported(
+                    RuntimeJitDeoptUnsupportedReason::WrongFunction,
+                );
             }
             let Some(block) = function
                 .blocks
                 .iter()
                 .find(|candidate| candidate.label == block)
             else {
-                return RuntimeJitDeoptContinuation::Unimplemented;
+                return RuntimeJitDeoptContinuation::unsupported(
+                    RuntimeJitDeoptUnsupportedReason::MissingBlock,
+                );
             };
             if runtime_jit_deopt_block_tail_supported(function, block, 0) {
                 RuntimeJitDeoptContinuation::ResumeBlockTail {
                     cursor: RuntimeJitDeoptCursor::at_block_entry(block.label),
                 }
             } else {
-                RuntimeJitDeoptContinuation::Unimplemented
+                RuntimeJitDeoptContinuation::unsupported(
+                    RuntimeJitDeoptUnsupportedReason::UnsupportedBlockTail,
+                )
             }
         }
     }
+}
+
+fn runtime_jit_deopt_guard_miss_supported(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    point: LocalEnvResumePoint,
+    pre_guard_operands: &[&InstrCodegen],
+) -> Result<(), RuntimeJitDeoptUnsupportedReason> {
+    if let Some(reason) =
+        runtime_jit_deopt_continuation_for_point(function, point).unsupported_reason()
+    {
+        return Err(reason);
+    }
+    if pre_guard_operands
+        .iter()
+        .any(|expr| !runtime_jit_deopt_guard_operand_replay_safe(expr))
+    {
+        return Err(RuntimeJitDeoptUnsupportedReason::ReplayUnsafeGuardOperand);
+    }
+    Ok(())
+}
+
+fn runtime_jit_deopt_guard_operand_replay_safe(expr: &InstrCodegen) -> bool {
+    matches!(
+        expr,
+        InstrCodegen::Load(load)
+            if matches!(
+                load.name.location,
+                NameLocation::Local(_) | NameLocation::Cell(_) | NameLocation::Constant(_)
+            )
+    )
 }
 
 fn runtime_jit_deopt_block_tail_supported(
@@ -2714,7 +2790,7 @@ fn emit_codegen_indexed_global_load(
     fb.append_block_param(result_block, ptr_ty);
     let fallback_block = fb.create_block();
     let guard_miss_dispatch = prepare_optional_guard_miss_dispatch(
-        ctx.guard_miss_target_for_resume_point(guard_miss_resume_point, fallback_block),
+        ctx.guard_miss_target_for_resume_point(guard_miss_resume_point, &[], fallback_block),
         fallback_block,
         ctx.guard_miss_deopt_stub_ref,
     );
@@ -3655,7 +3731,7 @@ fn prepare_guard_miss_dispatch(
 }
 
 fn prepare_optional_guard_miss_dispatch(
-    target: Result<JitGuardMissTarget, String>,
+    target: Result<JitGuardMissTarget, RuntimeJitDeoptUnsupportedReason>,
     fallback_block: ir::Block,
     deopt_resume_ref: Option<ir::FuncRef>,
 ) -> JitGuardMissDispatch {
@@ -3876,11 +3952,22 @@ impl JitEmitCtx<'_> {
     fn guard_miss_target_for_resume_point(
         &self,
         point: LocalEnvResumePoint,
+        pre_guard_operands: &[&InstrCodegen],
         fallback_block: ir::Block,
-    ) -> Result<JitGuardMissTarget, String> {
+    ) -> Result<JitGuardMissTarget, RuntimeJitDeoptUnsupportedReason> {
+        let function = self
+            .module
+            .callable_defs
+            .iter()
+            .find(|function| function.function_id == self.function_id)
+            .ok_or(RuntimeJitDeoptUnsupportedReason::MissingFunction)?;
+        runtime_jit_deopt_guard_miss_supported(function, point, pre_guard_operands)?;
+        let deopt_exit = self
+            .require_deopt_record_ref(point)
+            .map_err(|_| RuntimeJitDeoptUnsupportedReason::MissingPlanRecord)?;
         Ok(JitGuardMissTarget {
             fallback_block,
-            deopt_exit: self.require_deopt_record_ref(point)?,
+            deopt_exit,
         })
     }
 
@@ -5585,6 +5672,7 @@ impl<'a, 'b, 'mc, 'c, 'd> intrinsics::OperationEmitState<'b, InstrCodegen>
     fn prepare_guard_miss_dispatch_for_instr(
         &mut self,
         instr_id: InstrId,
+        pre_guard_operands: &[&InstrCodegen],
         fallback_block: ir::Block,
     ) -> JitGuardMissDispatch {
         let guard_miss_resume_point =
@@ -5594,8 +5682,11 @@ impl<'a, 'b, 'mc, 'c, 'd> intrinsics::OperationEmitState<'b, InstrCodegen>
                     key: InstrKey::new(self.ctx.function_id, instr_id),
                 });
         prepare_optional_guard_miss_dispatch(
-            self.ctx
-                .guard_miss_target_for_resume_point(guard_miss_resume_point, fallback_block),
+            self.ctx.guard_miss_target_for_resume_point(
+                guard_miss_resume_point,
+                pre_guard_operands,
+                fallback_block,
+            ),
             fallback_block,
             self.ctx.guard_miss_deopt_stub_ref,
         )

@@ -40,6 +40,7 @@ pub(super) trait OperationEmitState<'fb, E> {
     fn prepare_guard_miss_dispatch_for_instr(
         &mut self,
         _instr_id: soac_blockpy::block_py::InstrId,
+        _pre_guard_operands: &[&E],
         fallback_block: ir::Block,
     ) -> JitGuardMissDispatch {
         JitGuardMissDispatch::FallbackBlock(fallback_block)
@@ -484,11 +485,9 @@ fn emit_specialized_getattr<'fb>(
     let result_block = state.fb().create_block();
     state.fb().append_block_param(result_block, ptr_ty);
     let fallback_block = state.fb().create_block();
-    let guard_miss_dispatch = if field_getattr_pre_guard_operands_are_replay_safe(op) {
-        state.prepare_guard_miss_dispatch_for_instr(instr_id, fallback_block)
-    } else {
-        JitGuardMissDispatch::FallbackBlock(fallback_block)
-    };
+    let pre_guard_operands = [op.value.as_ref(), op.attr.as_ref()];
+    let guard_miss_dispatch =
+        state.prepare_guard_miss_dispatch_for_instr(instr_id, &pre_guard_operands, fallback_block);
     for (index, specialization) in specializations.iter().enumerate() {
         let Some(owner_type) = state.emit_type_ptr_value(&specialization.owner_type_ref) else {
             continue;
@@ -599,24 +598,6 @@ fn emit_specialized_getattr<'fb>(
     state.fb().switch_to_block(result_block);
     let result = state.fb().block_params(result_block)[0];
     Some(state.finish_owned_result(result))
-}
-
-fn field_getattr_pre_guard_operands_are_replay_safe(
-    op: &blockpy_intrinsics::GetAttr<InstrCodegen>,
-) -> bool {
-    field_getattr_operand_is_replay_safe(op.value.as_ref())
-        && field_getattr_operand_is_replay_safe(op.attr.as_ref())
-}
-
-fn field_getattr_operand_is_replay_safe(expr: &InstrCodegen) -> bool {
-    matches!(
-        expr,
-        InstrCodegen::Load(load)
-            if matches!(
-                load.name.location,
-                NameLocation::Local(_) | NameLocation::Cell(_) | NameLocation::Constant(_)
-            )
-    )
 }
 
 fn emit_setattr_fallback<'fb>(

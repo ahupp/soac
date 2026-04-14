@@ -5228,7 +5228,9 @@ def read_point(factory):
                 resume_point: LocalEnvResumePoint::BlockEntry { function_id, block },
                 precision: LocalEnvResumeStatePrecision::BlockEntry,
                 locals: vec![binding],
-                continuation: RuntimeJitDeoptContinuation::Unimplemented,
+                continuation: RuntimeJitDeoptContinuation::unsupported(
+                    RuntimeJitDeoptUnsupportedReason::UnsupportedBlockTail,
+                ),
             }],
         };
         let expected_value = 0x1234usize as ObjPtr;
@@ -5647,7 +5649,9 @@ def f(x):
             .expect("block-entry point should have a runtime record");
         assert_eq!(
             block_entry_record.continuation(),
-            &RuntimeJitDeoptContinuation::Unimplemented,
+            &RuntimeJitDeoptContinuation::unsupported(
+                RuntimeJitDeoptUnsupportedReason::UnsupportedBlockTail,
+            ),
             "block-entry continuation should not claim support for unsupported body tails"
         );
 
@@ -5658,8 +5662,34 @@ def f(x):
             .expect("before-instr point should have a runtime record");
         assert_eq!(
             before_instr_record.continuation(),
-            &RuntimeJitDeoptContinuation::Unimplemented,
+            &RuntimeJitDeoptContinuation::unsupported(
+                RuntimeJitDeoptUnsupportedReason::UnsupportedBlockTail,
+            ),
             "before-instr continuation should not claim support for unsupported body tails"
+        );
+    }
+
+    #[test]
+    fn runtime_deopt_guard_miss_rejects_replay_unsafe_operands() {
+        let function = with_single_test_block(test_function(), vec![], ret_term(none_expr()));
+        let block = function.entry_block().label;
+        let point = LocalEnvResumePoint::BeforeTerm {
+            function_id: function.function_id,
+            block,
+        };
+        assert_eq!(
+            runtime_jit_deopt_guard_miss_supported(&function, point, &[&name_expr(test_name("x"))],),
+            Ok(()),
+            "plain local loads should be replay-safe guard operands"
+        );
+        assert_eq!(
+            runtime_jit_deopt_guard_miss_supported(
+                &function,
+                point,
+                &[&direct_call_expr(function.function_id)],
+            ),
+            Err(RuntimeJitDeoptUnsupportedReason::ReplayUnsafeGuardOperand),
+            "guard miss deopt should reject operands that could repeat side effects"
         );
     }
 
@@ -6455,7 +6485,9 @@ def f(x):
                     resume_point: LocalEnvResumePoint::BeforeTerm { function_id, block },
                     precision: LocalEnvResumeStatePrecision::InstructionBoundary,
                     locals: vec![],
-                    continuation: RuntimeJitDeoptContinuation::Unimplemented,
+                    continuation: RuntimeJitDeoptContinuation::unsupported(
+                        RuntimeJitDeoptUnsupportedReason::UnsupportedBlockTail,
+                    ),
                 }],
             };
             let result = unsafe {
