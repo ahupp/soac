@@ -921,6 +921,16 @@ unsafe extern "C" fn pop_handled_exception_hook(previous: ObjPtr) {
     }
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dp_jit_push_handled_exception(exc: ObjPtr) -> ObjPtr {
+    push_handled_exception_hook(exc)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dp_jit_pop_handled_exception(previous: ObjPtr) {
+    pop_handled_exception_hook(previous);
+}
+
 #[cfg(test)]
 mod test_only_export_stubs {
     use super::*;

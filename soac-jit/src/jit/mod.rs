@@ -614,8 +614,28 @@ struct PrecompiledLibrary {
 
 impl PrecompiledLibrary {
     fn lookup_code_symbol(&self, symbol: &str) -> Result<Option<*const u8>, String> {
-        self.lookup_symbol(symbol)
-            .map(|ptr| ptr.map(|ptr| ptr.cast::<u8>() as *const u8))
+        let c_symbol = CString::new(symbol)
+            .map_err(|_| format!("precompiled symbol contains an interior NUL byte: {symbol:?}"))?;
+        let ptr = unsafe {
+            libc::dlerror();
+            libc::dlsym(self.handle as *mut c_void, c_symbol.as_ptr())
+        };
+        if ptr.is_null() {
+            let error = unsafe { libc::dlerror() };
+            if error.is_null() {
+                return Ok(None);
+            }
+            let error = unsafe { CStr::from_ptr(error) }.to_string_lossy();
+            if error.contains("undefined symbol:") {
+                return Ok(None);
+            }
+            return Err(format!(
+                "failed to look up precompiled symbol {symbol:?} in {}: {}",
+                self.path.display(),
+                error
+            ));
+        }
+        Ok(Some(ptr.cast::<u8>() as *const u8))
     }
 
     fn lookup_module_constant_slot(
