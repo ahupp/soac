@@ -12990,6 +12990,53 @@ def f(x, y):
     }
 
     #[test]
+    fn specialized_jit_tuple_values_uses_tuple_c_api_helpers() {
+        let blocks = [1usize as ObjPtr];
+        let mut constants = TestConstantPool::default();
+        let function = with_single_test_block(
+            test_function(),
+            vec![],
+            ret_term(op_expr(Call::new(
+                name_expr(test_runtime_name("tuple_values")),
+                vec![
+                    CallArgPositional::Positional(constants.int_expr(1)),
+                    CallArgPositional::Positional(constants.int_expr(2)),
+                ],
+                vec![],
+            ))),
+        );
+        let mut module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
+        module.module_constants = constants.module_constants;
+        let function = module.callable_defs[0].clone();
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let built =
+            build_test_jit_function_with_constants(&module, &function, &blocks, &module_constants);
+
+        let tuple_new_helpers =
+            import_user_names_for_symbols(&built, &[DP_JIT_TUPLE_NEW_IMPORT.symbol]);
+        let tuple_set_item_helpers =
+            import_user_names_for_symbols(&built, &[DP_JIT_TUPLE_SET_ITEM_IMPORT.symbol]);
+        let vectorcall_helpers =
+            import_user_names_for_symbols(&built, &[DP_JIT_PY_VECTORCALL_IMPORT.symbol]);
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &tuple_new_helpers),
+            1,
+            "tuple_values should allocate via the tuple C-API helper"
+        );
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &tuple_set_item_helpers),
+            1,
+            "tuple_values should fill via the tuple C-API helper"
+        );
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &vectorcall_helpers),
+            0,
+            "tuple_values should not call the Python helper through vectorcall"
+        );
+    }
+
+    #[test]
     fn specialized_jit_import_helpers_use_direct_external_refs() {
         let blocks = [1usize as ObjPtr];
         let mut constants = TestConstantPool::default();

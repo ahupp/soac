@@ -10276,6 +10276,8 @@ fn emit_codegen_simple_call_with_local_env(
                 arg_values.push(value);
                 borrowed_args.push(borrowed_arg);
             }
+            // tuple_values is the variadic tuple construction primitive for
+            // lowered IR; do not bounce through the Python helper callable.
             let tuple_value = emit_pack_current_values_tuple(fb, arg_values.as_slice(), emit_ctx);
             for (value, borrowed_arg) in arg_values.into_iter().zip(borrowed_args.into_iter()) {
                 if !borrowed_arg {
