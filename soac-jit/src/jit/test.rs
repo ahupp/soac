@@ -4632,6 +4632,80 @@ def read_point(point):
         symbols
     }
 
+    #[test]
+    fn deopt_unimplemented_exit_call_uses_function_env_deopt_table_and_ordinal() {
+        let compile_session = crate::session::CompileSession::new();
+        let mut jit_module =
+            new_jit_module(&compile_session).expect("test jit module should construct");
+        let ptr_ty = jit_module.target_config().pointer_type();
+        let mut signature = jit_module.make_signature();
+        signature.params.push(ir::AbiParam::new(ptr_ty));
+        signature.returns.push(ir::AbiParam::new(ptr_ty));
+        let wrapper_id = declare_local_fn(&mut jit_module, "test_deopt_exit_call", &signature)
+            .expect("test wrapper should declare");
+        let mut module_imports = ModuleFuncImports::new();
+        let mut ctx = jit_module.make_context();
+        ctx.func.name = ir::UserFuncName::user(0, wrapper_id.as_u32());
+        ctx.func.signature = signature;
+
+        let mut builder_ctx = FunctionBuilderContext::new();
+        {
+            let mut fb = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+            let entry = fb.create_block();
+            fb.append_block_params_for_function_params(entry);
+            fb.switch_to_block(entry);
+            fb.seal_block(entry);
+            let mut func_imports = FuncBuildImports::new(&mut module_imports);
+            let deopt_ref = func_imports.get_or_panic(
+                &mut jit_module,
+                &mut fb.func,
+                &DP_JIT_DEOPT_UNIMPLEMENTED_IMPORT,
+            );
+            let function_env_value = fb.block_params(entry)[0];
+            let result = emit_deopt_unimplemented_exit_call(
+                &mut fb,
+                JitDeoptExitRef {
+                    function_env_value,
+                    record_ordinal: 42,
+                },
+                deopt_ref,
+                ptr_ty,
+                ir::types::I64,
+            );
+            fb.ins().return_(&[result]);
+            fb.finalize();
+        }
+
+        let deopt_import = module_imports
+            .debug_symbols()
+            .iter()
+            .find_map(|(import_id, symbol)| {
+                (*symbol == "dp_jit_deopt_unimplemented")
+                    .then(|| ir::UserExternalName::new(0, *import_id))
+            })
+            .expect("deopt helper import should be declared");
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&ctx.func, &[deopt_import]),
+            1,
+            "deopt exit call should target the runtime deopt helper"
+        );
+        assert!(
+            function_contains_iconst_imm(&ctx.func, 42),
+            "deopt exit call should materialize the planned record ordinal"
+        );
+        assert!(
+            ctx.func.layout.blocks().any(|block| {
+                ctx.func.layout.block_insts(block).any(|inst| {
+                    matches!(
+                        ctx.func.dfg.insts[inst].load_store_offset(),
+                        Some(offset) if offset == FUNCTION_ENV_DEOPT_TABLE_PTR_OFFSET
+                    )
+                })
+            }),
+            "deopt exit call should load the deopt table pointer from the function env"
+        );
+    }
+
     struct EnvVarGuard {
         name: &'static str,
         old_value: Option<std::ffi::OsString>,

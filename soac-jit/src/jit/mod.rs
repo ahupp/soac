@@ -90,9 +90,10 @@ pub use planning::{
     render_jit_deopt_resume_module, render_jit_function_locals, render_jit_module_locals,
 };
 use runtime_context::{
-    FUNCTION_ENV_DEFAULT_DIRECT_CODE_PTR_OFFSET, FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET,
-    FUNCTION_ENV_GLOBALS_OBJ_OFFSET, FUNCTION_ENV_RUNTIME_OBJECTS_OFFSET,
-    PY_FUNCTION_JIT_EXTRA_FUNCTION_ENV_OFFSET, PY_THREAD_STATE_CURRENT_EXCEPTION_OFFSET,
+    FUNCTION_ENV_DEFAULT_DIRECT_CODE_PTR_OFFSET, FUNCTION_ENV_DEOPT_TABLE_PTR_OFFSET,
+    FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET, FUNCTION_ENV_GLOBALS_OBJ_OFFSET,
+    FUNCTION_ENV_RUNTIME_OBJECTS_OFFSET, PY_FUNCTION_JIT_EXTRA_FUNCTION_ENV_OFFSET,
+    PY_THREAD_STATE_CURRENT_EXCEPTION_OFFSET,
 };
 pub use runtime_context::{ModuleJitContext, ModuleRuntimeContext};
 pub use specialized_helpers::ObjPtr;
@@ -738,6 +739,11 @@ static DP_JIT_PUSH_HANDLED_EXCEPTION_IMPORT: ImportSpec = ImportSpec::new(
 );
 static DP_JIT_POP_HANDLED_EXCEPTION_IMPORT: ImportSpec =
     ImportSpec::new("dp_jit_pop_handled_exception", &[SigType::Pointer], &[]);
+static DP_JIT_DEOPT_UNIMPLEMENTED_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_deopt_unimplemented",
+    &[SigType::Pointer, SigType::I64],
+    &[SigType::Pointer],
+);
 static DP_JIT_VECTORCALL_BIND_DIRECT_ARGS_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_vectorcall_bind_direct_args",
     &[
@@ -2455,6 +2461,26 @@ impl JitGuardMissTarget {
             self.deopt_exit.record_ordinal,
         )
     }
+}
+
+fn emit_deopt_unimplemented_exit_call(
+    fb: &mut FunctionBuilder<'_>,
+    target: JitDeoptExitRef,
+    deopt_unimplemented_ref: ir::FuncRef,
+    ptr_ty: ir::Type,
+    i64_ty: ir::Type,
+) -> ir::Value {
+    let deopt_table = load_function_env_obj(
+        fb,
+        ptr_ty,
+        target.function_env_value,
+        FUNCTION_ENV_DEOPT_TABLE_PTR_OFFSET,
+    );
+    let record_ordinal = fb.ins().iconst(i64_ty, target.record_ordinal);
+    let call_inst = fb
+        .ins()
+        .call(deopt_unimplemented_ref, &[deopt_table, record_ordinal]);
+    fb.inst_results(call_inst)[0]
 }
 
 impl JitEmitCtx<'_> {
