@@ -374,26 +374,30 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
         &self,
         cell_ref: &soac_blockpy::block_py::CellRef,
     ) -> Result<ObjPtr, String> {
-        match cell_ref.location {
-            CellLocation::Owned(slot) => unsafe { self.execute_owned_cell_ref_owned(slot) },
-            location => Err(format!(
-                "deopt continuation does not support cell_ref for {location:?}"
-            )),
-        }
+        unsafe { self.execute_raw_cell_object_for_location_owned(cell_ref.location, "cell_ref") }
     }
 
     #[cold]
-    unsafe fn execute_owned_cell_ref_owned(&self, slot: u32) -> Result<ObjPtr, String> {
+    unsafe fn execute_raw_cell_object_for_location_owned(
+        &self,
+        location: CellLocation,
+        debug_name: &str,
+    ) -> Result<ObjPtr, String> {
+        let CellLocation::Owned(slot) = location else {
+            return Err(format!(
+                "deopt continuation does not support {debug_name} for {location:?}"
+            ));
+        };
         let function = self.invocation.function();
         let layout = function.storage_layout.as_ref().ok_or_else(|| {
             format!(
-                "deopt continuation expected storage layout for owned cell_ref slot {slot} in function {}",
+                "deopt continuation expected storage layout for owned {debug_name} slot {slot} in function {}",
                 function.function_id
             )
         })?;
         let closure_slot = layout.local_cell_slot(slot).ok_or_else(|| {
             format!(
-                "deopt continuation expected owned cell slot {slot} in function {} storage layout",
+                "deopt continuation expected owned {debug_name} slot {slot} in function {} storage layout",
                 function.function_id
             )
         })?;
@@ -415,7 +419,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             }
         }
         Err(format!(
-            "deopt continuation expected owned cell_ref slot {slot} via names {:?}, but locals were {}",
+            "deopt continuation expected owned {debug_name} slot {slot} via names {:?}, but locals were {}",
             candidate_names,
             self.locals.describe()
         ))
@@ -952,10 +956,25 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             NameLocation::GlobalName => unsafe { self.execute_return_global(name, -1) },
             NameLocation::RuntimeName => unsafe { execute_runtime_name_deopt(name) },
             NameLocation::Constant(constant_index) => self.execute_module_constant(constant_index),
-            NameLocation::Cell(_) => Err(format!(
-                "deopt continuation does not support loading {location:?} for {name:?}"
-            )),
+            NameLocation::Cell(location) => unsafe { self.execute_cell_load_owned(name, location) },
         }
+    }
+
+    #[cold]
+    unsafe fn execute_cell_load_owned(
+        &self,
+        name: &str,
+        location: CellLocation,
+    ) -> Result<ObjPtr, String> {
+        let cell = unsafe { self.execute_raw_cell_object_for_location_owned(location, name)? };
+        if cell.is_null() {
+            return Ok(ptr::null_mut());
+        }
+        let value = unsafe { super::specialized_helpers::dp_jit_load_cell(cell) };
+        unsafe {
+            ffi::Py_DECREF(cell.cast::<ffi::PyObject>());
+        }
+        Ok(value)
     }
 
     #[cold]

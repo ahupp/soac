@@ -1995,7 +1995,14 @@ fn runtime_jit_deopt_expr_supported(
     storage_layout: Option<&StorageLayout>,
 ) -> bool {
     match expr {
-        InstrCodegen::Load(load) => !matches!(load.name.location, NameLocation::Cell(_)),
+        InstrCodegen::Load(load) => match load.name.location {
+            NameLocation::Cell(CellLocation::Owned(slot)) => storage_layout
+                .and_then(|layout| layout.local_cell_slot(slot))
+                .is_some(),
+            NameLocation::Cell(CellLocation::Closure(_))
+            | NameLocation::Cell(CellLocation::CapturedSource(_)) => false,
+            _ => true,
+        },
         InstrCodegen::BinOp(binop) => {
             runtime_jit_deopt_binop_supported(binop.kind)
                 && runtime_jit_deopt_expr_supported(&binop.left, storage_layout)

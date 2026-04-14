@@ -727,6 +727,13 @@ def add(a, b):
         }
     }
 
+    fn test_owned_cell_name(name: &str, slot: u32) -> ResolvedName {
+        ResolvedName {
+            id: name.into(),
+            location: NameLocation::owned_cell(slot),
+        }
+    }
+
     fn test_constant_name(index: u32) -> ResolvedName {
         ResolvedName {
             id: "__dp_constant".into(),
@@ -5561,6 +5568,49 @@ def f(x):
     }
 
     #[test]
+    fn runtime_deopt_table_marks_owned_cell_load_return_continuation() {
+        let mut function = with_single_test_block(
+            test_function(),
+            vec![],
+            ret_term(name_expr(test_owned_cell_name("cell", 0))),
+        );
+        function.storage_layout = Some(StorageLayout {
+            freevars: vec![],
+            cellvars: vec![ClosureSlot {
+                logical_name: "cell".to_string(),
+                storage_name: "cell".to_string(),
+                init: ClosureInit::Deferred,
+            }],
+            runtime_cells: vec![],
+            stack_slots: vec!["cell".to_string()],
+        });
+        let module = test_module(ModuleNameGen::new(0), vec![function]);
+        let function = &module.callable_defs[0];
+        let block = function.entry_block();
+        let facts = infer_module_value_facts(&module);
+        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+            .expect("JIT deopt resume planning should succeed");
+        let function_plan = module_plan
+            .function(function.function_id)
+            .expect("function should have a JIT deopt plan");
+        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
+            .expect("runtime deopt table should build from plan");
+        let point = LocalEnvResumePoint::BeforeTerm {
+            function_id: function.function_id,
+            block: block.label,
+        };
+        let record = table
+            .record_for_point(point)
+            .expect("before-term owned-cell-load point should have a runtime record");
+        assert_eq!(
+            record.continuation(),
+            &RuntimeJitDeoptContinuation::ResumeBlockTail {
+                cursor: RuntimeJitDeoptCursor::new(block.label, block.body.len()),
+            }
+        );
+    }
+
+    #[test]
     fn runtime_deopt_table_marks_exception_edge_body_tail_continuation() {
         let function = test_function();
         let mut handler = test_source_block(
@@ -8855,6 +8905,107 @@ def g():
                 unsafe { ffi::Py_REFCNT(cell) },
                 before_cell,
                 "dropping the returned cell_ref should release the returned reference"
+            );
+            unsafe {
+                ffi::Py_DECREF(cell);
+                ffi::Py_DECREF(cell_contents);
+            }
+        });
+    }
+
+    #[test]
+    fn deopt_block_tail_continuation_executes_return_owned_cell_load() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|_| {
+            let cell_location = LocalLocation(0);
+            let mut function = with_single_test_block(
+                test_function(),
+                vec![],
+                ret_term(name_expr(test_owned_cell_name("cell", 0))),
+            );
+            function.storage_layout = Some(StorageLayout {
+                freevars: vec![],
+                cellvars: vec![ClosureSlot {
+                    logical_name: "cell".to_string(),
+                    storage_name: "cell".to_string(),
+                    init: ClosureInit::Deferred,
+                }],
+                runtime_cells: vec![],
+                stack_slots: vec!["cell".to_string()],
+            });
+            let function_id = function.function_id;
+            let block = function.entry_block().label;
+            let cell_contents = unsafe { ffi::PyLong_FromLong(654_456_654) };
+            assert!(
+                !cell_contents.is_null(),
+                "test cell contents allocation should succeed"
+            );
+            let cell = unsafe { PyCell_New(cell_contents) };
+            assert!(!cell.is_null(), "test cell allocation should succeed");
+            let binding = LocalEnvResumeBinding {
+                name: "cell".to_string(),
+                location: cell_location,
+                binding: LocalEnvResumeBindingState::Bound,
+                source: LocalEnvResumeValueSource::BlockParam(cell_location),
+                ownership: LocalRefKind::Borrowed,
+                value: None,
+            };
+            let table = RuntimeJitDeoptTable {
+                function_id,
+                function: Box::new(function),
+                module_constant_ptrs: vec![],
+                points: vec![RuntimeJitDeoptRecord {
+                    id: PlannedJitDeoptPointId {
+                        function_id,
+                        ordinal: 0,
+                    },
+                    resume_point: LocalEnvResumePoint::BeforeTerm { function_id, block },
+                    precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                    locals: vec![binding],
+                    continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
+                        cursor: RuntimeJitDeoptCursor::at_block_entry(block),
+                    },
+                }],
+            };
+            let before_contents = unsafe { ffi::Py_REFCNT(cell_contents) };
+            let before_cell = unsafe { ffi::Py_REFCNT(cell) };
+            let mut live_values = vec![cell.cast::<c_void>()];
+            let result = unsafe {
+                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                    std::ptr::addr_of!(table).cast_mut().cast(),
+                    std::ptr::null_mut(),
+                    0,
+                    live_values.as_mut_ptr().cast(),
+                    live_values.len() as i64,
+                )
+            };
+            assert_eq!(
+                result,
+                cell_contents.cast(),
+                "owned-cell-load deopt should return the cell contents"
+            );
+            assert!(
+                unsafe { ffi::PyErr_Occurred() }.is_null(),
+                "successful owned-cell-load deopt should not leave a Python exception"
+            );
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(cell_contents) },
+                before_contents + 1,
+                "owned-cell-load deopt should return an owned reference to the contents"
+            );
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(cell) },
+                before_cell,
+                "owned-cell-load deopt should release its temporary cell reference"
+            );
+            unsafe {
+                ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+            }
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(cell_contents) },
+                before_contents,
+                "dropping the returned cell contents should release the returned reference"
             );
             unsafe {
                 ffi::Py_DECREF(cell);
