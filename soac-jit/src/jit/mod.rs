@@ -2178,6 +2178,21 @@ fn typed_nested_guard_scan_expr(expr: &InstrTyped, saw_replay_unsafe_effect: &mu
             typed_nested_guard_scan_expr(op.value.as_ref(), saw_replay_unsafe_effect)
         }
         InstrTyped::LegacyCall(op) => {
+            if op.args.is_empty()
+                && op.keywords.is_empty()
+                && let InstrTyped::LegacyGetAttr(getattr) = op.func.as_ref()
+            {
+                // Direct-method guard code evaluates only the receiver before the guard.
+                // Keep this no-arg only until argument guard points carry their own
+                // precise resume state.
+                return typed_nested_guard_scan_expr(
+                    getattr.value.as_ref(),
+                    saw_replay_unsafe_effect,
+                ) && nested_guard_candidate_seen_before_replay_unsafe_effect(
+                    true,
+                    *saw_replay_unsafe_effect,
+                ) && mark_replay_unsafe_effect(saw_replay_unsafe_effect);
+            }
             typed_nested_guard_scan_expr(op.func.as_ref(), saw_replay_unsafe_effect)
                 && typed_nested_guard_scan_positional_args(
                     op.args.as_slice(),
@@ -13360,12 +13375,6 @@ fn emit_codegen_term(
     raise_exc_ref: ir::FuncRef,
     current_exception_name: Option<&str>,
 ) -> Result<(), String> {
-    let term_guard_miss_resume_point = LocalEnvResumePoint::BeforeTerm {
-        function_id: emit_ctx.function_id,
-        block: source_label,
-    };
-    let term_emit_ctx = emit_ctx.with_guard_miss_resume_point(term_guard_miss_resume_point);
-    let emit_ctx = &term_emit_ctx;
     let decref_ref = emit_ctx.decref_ref;
 
     match term {
@@ -13547,10 +13556,11 @@ fn emit_typed_codegen_term(
         function_id: emit_ctx.function_id,
         block: source_label,
     };
-    let term_emit_ctx = emit_ctx.with_guard_miss_resume_point(term_guard_miss_resume_point);
-    let emit_ctx = &term_emit_ctx;
 
     if let BlockTerm::IfTerm(if_term) = term {
+        let term_emit_ctx = typed_nested_guard_misses_can_resume_before_instr(&if_term.test)
+            .then(|| emit_ctx.with_guard_miss_resume_point(term_guard_miss_resume_point));
+        let emit_ctx = term_emit_ctx.as_ref().unwrap_or(emit_ctx);
         let test_instr_id = if_term.test.try_semantic_instr_id();
         let demand = test_instr_id
             .and_then(|instr_id| emit_ctx.result_demand_plan.demand_for_instr_id(instr_id))
@@ -13590,6 +13600,9 @@ fn emit_typed_codegen_term(
     }
 
     if let BlockTerm::Return(value) = term {
+        let term_emit_ctx = typed_nested_guard_misses_can_resume_before_instr(value)
+            .then(|| emit_ctx.with_guard_miss_resume_point(term_guard_miss_resume_point));
+        let emit_ctx = term_emit_ctx.as_ref().unwrap_or(emit_ctx);
         let value_instr_id = value.try_semantic_instr_id();
         let demand = value_instr_id
             .and_then(|instr_id| emit_ctx.result_demand_plan.demand_for_instr_id(instr_id))
@@ -13631,6 +13644,9 @@ fn emit_typed_codegen_term(
     if let BlockTerm::Raise(raise_stmt) = term {
         let raise_fn = emit_load_raise_from_function(fb, emit_ctx);
         let (exc_value, exc_ownership) = if let Some(exc_expr) = raise_stmt.exc.as_ref() {
+            // Do not propagate BeforeTerm to the exception expression yet:
+            // emit_load_raise_from_function has already run, so resuming before
+            // the term would replay that prework.
             let exc_instr_id = exc_expr.try_semantic_instr_id();
             let demand = exc_instr_id
                 .and_then(|instr_id| emit_ctx.result_demand_plan.demand_for_instr_id(instr_id))
@@ -13679,6 +13695,9 @@ fn emit_typed_codegen_term(
     }
 
     if let BlockTerm::BranchTable(branch) = term {
+        let term_emit_ctx = typed_nested_guard_misses_can_resume_before_instr(&branch.index)
+            .then(|| emit_ctx.with_guard_miss_resume_point(term_guard_miss_resume_point));
+        let emit_ctx = term_emit_ctx.as_ref().unwrap_or(emit_ctx);
         let index_instr_id = branch.index.try_semantic_instr_id();
         let demand = index_instr_id
             .and_then(|instr_id| emit_ctx.result_demand_plan.demand_for_instr_id(instr_id))

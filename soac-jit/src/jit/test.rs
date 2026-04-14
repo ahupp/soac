@@ -15549,6 +15549,55 @@ def f(x, y):
     }
 
     #[test]
+    fn indexed_global_term_guard_miss_keeps_fallback_after_replay_unsafe_effect() {
+        let blocks = [1usize as ObjPtr];
+        let function = with_single_test_block(
+            test_function(),
+            vec![],
+            ret_term(op_expr(Call::new(
+                name_expr(test_runtime_name("tuple_values")),
+                vec![
+                    CallArgPositional::Positional(op_expr(Call::new(
+                        none_expr(),
+                        Vec::<CallArgPositional<InstrCodegen>>::new(),
+                        Vec::<CallArgKeyword<InstrCodegen>>::new(),
+                    ))),
+                    CallArgPositional::Positional(op_expr(Load::new(test_global_name("x")))),
+                ],
+                Vec::<CallArgKeyword<InstrCodegen>>::new(),
+            ))),
+        );
+        let mut module = test_module(ModuleNameGen::new(0), vec![function]);
+        instrument_bb_module_with_call_target_counters(&mut module);
+        let function = module.callable_defs[0].clone();
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let built = build_test_jit_function_with_constants_and_options(
+            &module,
+            &function,
+            &blocks,
+            &module_constants,
+            BuildSpecializedFunctionOptions {
+                guard_miss_deopt_stub: true,
+                ..BuildSpecializedFunctionOptions::default()
+            },
+        );
+        let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
+        let slow_global_helpers =
+            import_user_names_for_symbols(&built, &["soac_runtime_load_global_slow"]);
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
+            0,
+            "nested term guard miss after a possibly side-effecting call must not deopt to before the term"
+        );
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &slow_global_helpers),
+            1,
+            "nested term guard miss after a replay-unsafe effect should preserve the local slow fallback"
+        );
+    }
+
+    #[test]
     fn indexed_global_term_guard_miss_deopt_resumes_return_global_runtime() {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
