@@ -62,6 +62,7 @@ unsafe extern "C" {
     ) -> *mut ffi::PyObject;
 }
 
+mod deopt_interpreter;
 mod direct_abi;
 mod intrinsics;
 mod jitdump;
