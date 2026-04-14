@@ -6,8 +6,8 @@
 //! stack-slot loads, or another resume-state representation.
 
 use crate::block_py::{
-    BlockLabel, BlockPyFunction, BlockPyModule, FunctionId, HasSemanticInstrId, InstrKey,
-    LocalLocation,
+    BlockLabel, BlockPyFunction, BlockPyModule, FunctionId, HasSemanticInstrId, InstrCodegen,
+    InstrKey, InstrResolved, LocalLocation, NameLike,
 };
 use crate::passes::ownership_effects::{
     compute_function_local_live_ins, compute_function_local_must_bound_ins,
@@ -129,6 +129,9 @@ pub enum LocalEnvResumeStatePrecision {
     /// containing block's entry. This is sufficient for block-entry resume
     /// validation and rendering, but not yet a runnable mid-block deopt state.
     BlockEntry,
+    /// The resume record has applied direct top-level local Store/Del effects
+    /// within the block up to the instruction boundary.
+    InstructionBoundary,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -168,7 +171,23 @@ impl LocalEnvResumePoint {
 pub struct LocalEnvResumeEntry {
     pub point: LocalEnvResumePoint,
     pub precision: LocalEnvResumeStatePrecision,
-    pub block_entry_locals: Vec<PlannedLocalBinding>,
+    pub locals: Vec<LocalEnvResumeBinding>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalEnvResumeBindingState {
+    Bound,
+    MaybeUnbound,
+    Unbound,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalEnvResumeBinding {
+    pub name: String,
+    pub location: LocalLocation,
+    pub binding: LocalEnvResumeBindingState,
+    pub ownership: LocalRefKind,
+    pub value: Option<PyObjFacts>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -201,8 +220,9 @@ impl LocalEnvResumeModulePlan {
         &self,
         module: &BlockPyModule<CodegenModuleShape>,
         local_env_plan: &LocalEnvModulePlan,
+        facts: &FactStore,
     ) -> Result<(), String> {
-        validate_local_env_resume_module_plan(module, local_env_plan, self)
+        validate_local_env_resume_module_plan(module, local_env_plan, facts, self)
     }
 }
 
@@ -221,7 +241,9 @@ pub fn plan_local_env_module(
 pub fn plan_local_env_resume_module(
     module: &BlockPyModule<CodegenModuleShape>,
     local_env_plan: &LocalEnvModulePlan,
+    facts: &FactStore,
 ) -> LocalEnvResumeModulePlan {
+    let deleted_sentinel_constants = deleted_sentinel_constant_slots(module);
     let functions = module
         .callable_defs
         .iter()
@@ -229,7 +251,12 @@ pub fn plan_local_env_resume_module(
             let function_plan = local_env_plan.function(function.function_id)?;
             Some((
                 function.function_id,
-                plan_function_local_env_resume(function, function_plan),
+                plan_function_local_env_resume_with_deleted_constants(
+                    function,
+                    function_plan,
+                    facts,
+                    &deleted_sentinel_constants,
+                ),
             ))
         })
         .collect();
@@ -239,40 +266,73 @@ pub fn plan_local_env_resume_module(
 pub fn plan_function_local_env_resume(
     function: &BlockPyFunction<CodegenModuleShape>,
     local_env_plan: &FunctionLocalPlan,
+    facts: &FactStore,
+) -> FunctionLocalEnvResumePlan {
+    plan_function_local_env_resume_with_deleted_constants(
+        function,
+        local_env_plan,
+        facts,
+        &HashSet::new(),
+    )
+}
+
+fn plan_function_local_env_resume_with_deleted_constants(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    local_env_plan: &FunctionLocalPlan,
+    facts: &FactStore,
+    deleted_sentinel_constants: &HashSet<u32>,
 ) -> FunctionLocalEnvResumePlan {
     let mut entries = Vec::new();
     for block in &function.blocks {
         let Some(block_plan) = local_env_plan.block(block.label) else {
             continue;
         };
-        let block_entry_locals = block_plan.entry_locals.clone();
+        let mut locals = block_plan
+            .entry_locals
+            .iter()
+            .map(resume_binding_from_planned_local)
+            .collect::<Vec<_>>();
         entries.push(LocalEnvResumeEntry {
             point: LocalEnvResumePoint::BlockEntry {
                 function_id: function.function_id,
                 block: block.label,
             },
             precision: LocalEnvResumeStatePrecision::BlockEntry,
-            block_entry_locals: block_entry_locals.clone(),
+            locals: locals.clone(),
         });
         for instr in &block.body {
             let Some(instr_id) = instr.try_semantic_instr_id() else {
+                transfer_resume_local_state(
+                    function.function_id,
+                    instr,
+                    facts,
+                    deleted_sentinel_constants,
+                    &mut locals,
+                );
                 continue;
             };
             entries.push(LocalEnvResumeEntry {
                 point: LocalEnvResumePoint::BeforeInstr {
                     key: InstrKey::new(function.function_id, instr_id),
                 },
-                precision: LocalEnvResumeStatePrecision::BlockEntry,
-                block_entry_locals: block_entry_locals.clone(),
+                precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                locals: locals.clone(),
             });
+            transfer_resume_local_state(
+                function.function_id,
+                instr,
+                facts,
+                deleted_sentinel_constants,
+                &mut locals,
+            );
         }
         entries.push(LocalEnvResumeEntry {
             point: LocalEnvResumePoint::BeforeTerm {
                 function_id: function.function_id,
                 block: block.label,
             },
-            precision: LocalEnvResumeStatePrecision::BlockEntry,
-            block_entry_locals,
+            precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+            locals,
         });
     }
     FunctionLocalEnvResumePlan { entries }
@@ -319,9 +379,10 @@ pub fn validate_local_env_module_plan(
 pub fn validate_local_env_resume_module_plan(
     module: &BlockPyModule<CodegenModuleShape>,
     local_env_plan: &LocalEnvModulePlan,
+    facts: &FactStore,
     resume_plan: &LocalEnvResumeModulePlan,
 ) -> Result<(), String> {
-    let expected = plan_local_env_resume_module(module, local_env_plan);
+    let expected = plan_local_env_resume_module(module, local_env_plan, facts);
     if &expected != resume_plan {
         return Err(format!(
             "LocalEnv resume plan mismatch\nexpected: {expected:#?}\nactual: {resume_plan:#?}"
@@ -483,9 +544,10 @@ pub fn render_local_env_module_plan(
 pub fn render_local_env_resume_module_plan(
     module: &BlockPyModule<CodegenModuleShape>,
     local_env_plan: &LocalEnvModulePlan,
+    facts: &FactStore,
     resume_plan: &LocalEnvResumeModulePlan,
 ) -> Result<String, String> {
-    validate_local_env_resume_module_plan(module, local_env_plan, resume_plan)?;
+    validate_local_env_resume_module_plan(module, local_env_plan, facts, resume_plan)?;
     let mut out = String::new();
     for function in &module.callable_defs {
         let function_plan = resume_plan.function(function.function_id).ok_or_else(|| {
@@ -526,9 +588,9 @@ pub fn render_local_env_resume_function_plan(
                 entry.precision,
             )
             .expect("writing to String should not fail");
-            writeln!(out, "      block_entry_locals:").expect("writing to String should not fail");
-            for binding in &entry.block_entry_locals {
-                writeln!(out, "        {}", render_planned_local_binding(binding))
+            writeln!(out, "      locals:").expect("writing to String should not fail");
+            for binding in &entry.locals {
+                writeln!(out, "        {}", render_local_env_resume_binding(binding))
                     .expect("writing to String should not fail");
             }
         }
@@ -582,6 +644,129 @@ fn render_local_env_resume_point(point: LocalEnvResumePoint) -> String {
         LocalEnvResumePoint::BlockEntry { .. } => "block_entry".to_string(),
         LocalEnvResumePoint::BeforeInstr { key } => format!("before_instr {key}"),
         LocalEnvResumePoint::BeforeTerm { .. } => "before_term".to_string(),
+    }
+}
+
+fn render_local_env_resume_binding(binding: &LocalEnvResumeBinding) -> String {
+    format!(
+        "{}@{} binding={:?} ownership={:?} value={:?}",
+        binding.name, binding.location.0, binding.binding, binding.ownership, binding.value
+    )
+}
+
+fn resume_binding_from_planned_local(binding: &PlannedLocalBinding) -> LocalEnvResumeBinding {
+    LocalEnvResumeBinding {
+        name: binding.name.clone(),
+        location: binding.location,
+        binding: resume_binding_state_for_planned_local(binding),
+        ownership: binding.param_facts.ownership,
+        value: binding.param_facts.value,
+    }
+}
+
+fn resume_binding_state_for_planned_local(
+    binding: &PlannedLocalBinding,
+) -> LocalEnvResumeBindingState {
+    match binding.param_facts.binding {
+        ParamBindingFacts::DefinitelyBound | ParamBindingFacts::CheckedLocalValue => {
+            LocalEnvResumeBindingState::Bound
+        }
+        ParamBindingFacts::MaybeUnbound
+            if binding.param_facts.ownership == LocalRefKind::Unbound =>
+        {
+            LocalEnvResumeBindingState::Unbound
+        }
+        ParamBindingFacts::MaybeUnbound => LocalEnvResumeBindingState::MaybeUnbound,
+    }
+}
+
+fn transfer_resume_local_state(
+    function_id: FunctionId,
+    instr: &InstrCodegen,
+    facts: &FactStore,
+    deleted_sentinel_constants: &HashSet<u32>,
+    locals: &mut [LocalEnvResumeBinding],
+) {
+    match instr {
+        InstrCodegen::Store(op) => {
+            let Some(location) = op.name.local_location() else {
+                return;
+            };
+            if expr_is_deleted_sentinel(&op.value, deleted_sentinel_constants) {
+                if let Some(binding) = locals
+                    .iter_mut()
+                    .find(|binding| binding.location == location)
+                {
+                    binding.binding = LocalEnvResumeBindingState::Unbound;
+                    binding.ownership = LocalRefKind::Unbound;
+                    binding.value = None;
+                }
+                return;
+            }
+            let py_facts = op
+                .value
+                .try_semantic_instr_id()
+                .and_then(|instr_id| facts.fact_for(InstrKey::new(function_id, instr_id)))
+                .and_then(|facts| facts.as_pyobj());
+            if let Some(binding) = locals
+                .iter_mut()
+                .find(|binding| binding.location == location)
+            {
+                binding.binding = LocalEnvResumeBindingState::Bound;
+                binding.ownership = local_ref_kind_for_resume_value(py_facts);
+                binding.value = py_facts;
+            }
+        }
+        InstrCodegen::Del(op) => {
+            let Some(location) = op.name.local_location() else {
+                return;
+            };
+            if let Some(binding) = locals
+                .iter_mut()
+                .find(|binding| binding.location == location)
+            {
+                binding.binding = LocalEnvResumeBindingState::Unbound;
+                binding.ownership = LocalRefKind::Unbound;
+                binding.value = None;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn expr_is_deleted_sentinel(
+    expr: &InstrCodegen,
+    deleted_sentinel_constants: &HashSet<u32>,
+) -> bool {
+    match expr {
+        InstrCodegen::Load(op) if op.name.is_runtime_symbol("DELETED") => true,
+        InstrCodegen::Load(op) => op
+            .name
+            .location
+            .as_constant()
+            .is_some_and(|index| deleted_sentinel_constants.contains(&index)),
+        _ => false,
+    }
+}
+
+fn deleted_sentinel_constant_slots(module: &BlockPyModule<CodegenModuleShape>) -> HashSet<u32> {
+    module
+        .module_constants
+        .iter()
+        .enumerate()
+        .filter_map(|(index, constant)| match constant {
+            InstrResolved::Load(op) if op.name.is_runtime_symbol("DELETED") => {
+                Some(u32::try_from(index).expect("module constant index should fit in u32"))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn local_ref_kind_for_resume_value(facts: Option<PyObjFacts>) -> LocalRefKind {
+    match facts {
+        Some(facts) if facts.is_immortal() => LocalRefKind::Immortal,
+        Some(_) | None => LocalRefKind::Owned,
     }
 }
 
@@ -689,9 +874,9 @@ def choose(flag, x):
         .codegen_module;
         let facts = infer_module_value_facts(&lowered);
         let local_plan = plan_local_env_module(&lowered, &facts);
-        let resume_plan = plan_local_env_resume_module(&lowered, &local_plan);
+        let resume_plan = plan_local_env_resume_module(&lowered, &local_plan, &facts);
 
-        validate_local_env_resume_module_plan(&lowered, &local_plan, &resume_plan)
+        validate_local_env_resume_module_plan(&lowered, &local_plan, &facts, &resume_plan)
             .expect("fresh LocalEnv resume plan should validate");
 
         for function in &lowered.callable_defs {
@@ -717,10 +902,46 @@ def choose(flag, x):
                     .any(|entry| matches!(entry.point, LocalEnvResumePoint::BeforeInstr { .. })),
                 "non-empty functions should expose instruction-keyed resume points"
             );
-            assert!(function_plan.entries.iter().all(|entry| {
-                entry.point.function_id() == function.function_id
-                    && entry.precision == LocalEnvResumeStatePrecision::BlockEntry
-            }));
+            assert!(function_plan
+                .entries
+                .iter()
+                .all(|entry| entry.point.function_id() == function.function_id));
         }
+    }
+
+    #[test]
+    fn local_env_resume_plan_applies_direct_local_store_and_del_effects() {
+        let lowered = lower_python_to_blockpy_for_testing(
+            r#"
+def f():
+    x = None
+    del x
+    return 1
+"#,
+        )
+        .expect("transform should succeed")
+        .codegen_module;
+        let facts = infer_module_value_facts(&lowered);
+        let local_plan = plan_local_env_module(&lowered, &facts);
+        let resume_plan = plan_local_env_resume_module(&lowered, &local_plan, &facts);
+        validate_local_env_resume_module_plan(&lowered, &local_plan, &facts, &resume_plan)
+            .expect("fresh LocalEnv resume plan should validate");
+
+        let function = lowered
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "f")
+            .expect("lowered function should exist");
+        let function_plan = resume_plan
+            .function(function.function_id)
+            .expect("function should have a LocalEnv resume plan");
+        assert!(function_plan.entries.iter().any(|entry| {
+            matches!(entry.point, LocalEnvResumePoint::BeforeTerm { .. })
+                && entry.locals.iter().any(|binding| {
+                    binding.name == "x"
+                        && binding.binding == LocalEnvResumeBindingState::Unbound
+                        && binding.ownership == LocalRefKind::Unbound
+                })
+        }));
     }
 }

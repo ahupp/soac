@@ -225,12 +225,13 @@ pub(crate) fn rewrite_module_with_tracker_with_options(
     })?;
     let local_env_resume_plan: passes::LocalEnvResumeModulePlan = pass_tracker
         .record_timing("local_env_resume_plan", || {
-            passes::plan_local_env_resume_module(&bb_codegen, &local_env_plan)
+            passes::plan_local_env_resume_module(&bb_codegen, &local_env_plan, &value_facts)
         });
     pass_tracker.record_timing("validate_local_env_resume_plan", || {
         passes::validate_local_env_resume_module_plan(
             &bb_codegen,
             &local_env_plan,
+            &value_facts,
             &local_env_resume_plan,
         )
         .map_err(anyhow::Error::msg)

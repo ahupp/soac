@@ -668,9 +668,10 @@ pub use local_env_plan::{
     render_local_env_resume_function_plan, render_local_env_resume_module_plan,
     render_planned_local_binding, validate_local_env_module_plan,
     validate_local_env_resume_module_plan, BlockLocalPlan, BlockParamFacts,
-    FunctionLocalEnvResumePlan, FunctionLocalPlan, LocalEnvModulePlan, LocalEnvResumeEntry,
-    LocalEnvResumeModulePlan, LocalEnvResumePoint, LocalEnvResumeStatePrecision, LocalRefKind,
-    ParamBindingFacts, ParamProvenance, PlannedLocalBinding, PlannedLocalStorage,
+    FunctionLocalEnvResumePlan, FunctionLocalPlan, LocalEnvModulePlan, LocalEnvResumeBinding,
+    LocalEnvResumeBindingState, LocalEnvResumeEntry, LocalEnvResumeModulePlan, LocalEnvResumePoint,
+    LocalEnvResumeStatePrecision, LocalRefKind, ParamBindingFacts, ParamProvenance,
+    PlannedLocalBinding, PlannedLocalStorage,
 };
 pub use ownership_effects::{
     compute_function_local_live_ins, compute_function_local_must_bound_ins, plan_ownership_effects,

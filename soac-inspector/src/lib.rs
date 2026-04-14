@@ -266,8 +266,14 @@ fn render_inspector_payload(source: &str, output: &soac_blockpy::LoweringResult)
         "text": local_env_plan_text,
     }));
     let local_env_resume_plan_text = (|| {
-        let resume_plan = plan_local_env_resume_module(&output.codegen_module, &local_env_plan);
-        render_local_env_resume_module_plan(&output.codegen_module, &local_env_plan, &resume_plan)
+        let resume_plan =
+            plan_local_env_resume_module(&output.codegen_module, &local_env_plan, &facts);
+        render_local_env_resume_module_plan(
+            &output.codegen_module,
+            &local_env_plan,
+            &facts,
+            &resume_plan,
+        )
     })()
     .unwrap_or_else(|err| format!("; failed to render local_env_resume_plan: {err}"));
     steps.push(json!({
@@ -385,7 +391,7 @@ pub fn jit_debug_plan(
             .function(function.function_id)
             .ok_or_else(|| format!("missing LocalEnv plan for {module_name}.fn#{function_id}"))?,
     )?;
-    let local_env_resume_plan = plan_local_env_resume_module(module, &local_env_plan);
+    let local_env_resume_plan = plan_local_env_resume_module(module, &local_env_plan, &facts);
     let local_env_resume_plan_text = render_local_env_resume_function_plan(
         function,
         local_env_resume_plan
