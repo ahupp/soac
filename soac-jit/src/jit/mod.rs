@@ -2,9 +2,9 @@ use crate::SOAC_RUNTIME_CLIF;
 #[cfg(test)]
 use crate::config::SOAC_JIT_EMIT_REFCOUNTS_ENV;
 use crate::config::{
-    CraneliftTargetConfig, behavior_change_indexed_stores_enabled,
+    CraneliftTargetConfig, SpecializationMode, behavior_change_indexed_stores_enabled,
     counter_dump_input_path_from_env, jit_refcount_emission_enabled, profiled_cold_blocks_enabled,
-    soac_work_dir_from_env, specialization_mode_is_profile,
+    soac_work_dir_from_env, specialization_mode_from_env, specialization_mode_is_profile,
 };
 use crate::counter::TopValueCounter;
 use crate::counter_dump::{
@@ -7769,11 +7769,15 @@ struct SpecializationProfile<'a> {
     counter_dump_path: Option<Cow<'a, Path>>,
     behavior_change_indexed_stores: bool,
     profiled_cold_blocks: bool,
+    indexed_global_guard_miss_deopt: bool,
 }
 
 impl<'a> SpecializationProfile<'a> {
     fn from_runtime_state(shared_state: Option<&'a SharedModuleState>) -> Result<Self, String> {
-        let counter_dump_path = if shared_state.is_some() && !specialization_mode_is_profile()? {
+        let specialization_mode = specialization_mode_from_env()?;
+        let counter_dump_path = if shared_state.is_some()
+            && specialization_mode != Some(crate::config::SpecializationMode::Profile)
+        {
             counter_dump_input_path_from_env()?
         } else {
             None
@@ -7783,6 +7787,10 @@ impl<'a> SpecializationProfile<'a> {
             counter_dump_path: counter_dump_path.map(Cow::Owned),
             behavior_change_indexed_stores: behavior_change_indexed_stores_enabled()?,
             profiled_cold_blocks: profiled_cold_blocks_enabled()?,
+            indexed_global_guard_miss_deopt: matches!(
+                specialization_mode,
+                Some(SpecializationMode::Verify | SpecializationMode::Apply)
+            ),
         })
     }
 
@@ -7795,6 +7803,7 @@ impl<'a> SpecializationProfile<'a> {
             counter_dump_path: counter_dump_path.map(Cow::Borrowed),
             behavior_change_indexed_stores: true,
             profiled_cold_blocks: profiled_cold_blocks_enabled()?,
+            indexed_global_guard_miss_deopt: true,
         })
     }
 
@@ -16712,6 +16721,8 @@ fn build_cranelift_run_bb_specialized_function(
     let cold_block_labels = specialization_profile.cold_block_labels(function)?;
     let behavior_change_indexed_stores = specialization_profile.behavior_change_indexed_stores
         && function.scope.scope_kind != CallableScopeKind::Module;
+    let indexed_global_guard_miss_deopt_stub =
+        specialization_profile.indexed_global_guard_miss_deopt;
     let function_runtime_data_layout = FunctionRuntimeDataLayout::from_function(function);
     let true_constant_id = module_constants.require_runtime_name_constant_id("TRUE");
     let false_constant_id = module_constants.require_runtime_name_constant_id("FALSE");
@@ -16993,9 +17004,10 @@ fn build_cranelift_run_bb_specialized_function(
             &SOAC_RUNTIME_LOAD_GLOBAL_SLOW_IMPORT,
         );
         let indexed_global_guard_miss_deopt_stub_ref =
-            options.indexed_global_guard_miss_deopt_stub.then(|| {
-                func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_DEOPT_RESUME_IMPORT)
-            });
+            (options.indexed_global_guard_miss_deopt_stub || indexed_global_guard_miss_deopt_stub)
+                .then(|| {
+                    func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_DEOPT_RESUME_IMPORT)
+                });
         let store_global_indexed_ref = func_imports.get_or_panic(
             jit_module,
             &mut fb.func,

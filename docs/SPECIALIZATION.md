@@ -207,9 +207,15 @@ apply/verify mode:
 - The helper guards that the globals dict still has an indexed-unicode
   keys object and an indexed-values block large enough for the compiled
   slot, then reads or writes that slot.
-- On guard miss, tombstone, absent value, or store failure, codegen
-  increments the fallback counter when enabled and executes the existing
-  global load/store slow path.
+- In `profile` mode, load guard misses, tombstones, and absent values
+  increment the fallback counter when enabled and execute the existing
+  global load slow path so counter collection stays local and non-deopting.
+- In `verify`/`apply` mode, load guard misses for planned deopt points
+  branch to a cold `dp_jit_deopt_resume` continuation instead of emitting
+  the local slow global-load fallback. Loads nested inside another expression
+  still use the local slow path until they have precise resume state.
+- Store guard misses or store failures still increment the fallback counter
+  when enabled and execute the existing global store slow path.
 - In `verify`/`apply` mode, store fast paths can be emitted for
   non-module-scope code. The helper then performs a raw store into the expected
   indexed-values slot, including null first-insert slots or tombstone
