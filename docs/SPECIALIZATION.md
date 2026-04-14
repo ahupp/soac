@@ -255,6 +255,11 @@ apply/verify mode:
   dicts, key-index mismatch, type guard miss, or type-version miss
   increment the fallback counter when enabled and execute normal CPython
   attribute lookup.
+- In `verify`/`apply` mode, load guard misses for planned deopt points
+  use a cold `dp_jit_deopt_resume` continuation when the receiver and
+  attribute-key operands are safe to replay. If the receiver expression
+  could have side effects, codegen keeps the local CPython attribute
+  lookup fallback instead of deopting before the `GetAttr`.
 - `SetAttr` sites use generic attribute set in profile mode.
 - In `verify`/`apply` mode, constant-string `SetAttr` sites with a
   recorded key index get the same exact-owner/version guard.

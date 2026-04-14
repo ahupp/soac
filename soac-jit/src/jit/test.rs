@@ -4370,6 +4370,190 @@ def read_point(point):
         }
     }
 
+    fn build_field_indexed_getattr_for_source(
+        py: Python<'_>,
+        mode: &str,
+        source: &str,
+        function_bind_name: &str,
+    ) -> BuiltSpecializedFunction {
+        let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", mode);
+        let soac_work_dir = fresh_test_work_dir("field-getattr-deopt");
+        let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
+        let owner_module = PyModule::from_code(
+            py,
+            c"
+class Point:
+    pass
+",
+            c"field_type_test.py",
+            c"field_type_test",
+        )
+        .expect("owner module should execute");
+        let sys = PyModule::import(py, "sys").expect("sys should import");
+        let modules = sys
+            .getattr("modules")
+            .expect("sys.modules should exist")
+            .cast_into::<pyo3::types::PyDict>()
+            .expect("sys.modules should be a dict");
+        modules
+            .set_item("field_type_test", owner_module.as_any())
+            .expect("owner module should be registered");
+
+        write_test_counter_dump(
+            soac_work_dir.join("profile.bin").as_path(),
+            &CounterDumpRecord {
+                source_hash: 0,
+                module_name: "counter_test".to_string(),
+                package_name: None,
+                rows: Vec::new(),
+                module_keys: Vec::new(),
+                type_keys: vec![CounterDumpTypeKeyLayout {
+                    owner_type_id: 7,
+                    key: "x".to_string(),
+                    index: 0,
+                }],
+                type_table: vec![CounterDumpTypeTableEntry {
+                    type_id: 7,
+                    key: CounterDumpTypeKey {
+                        module_name: "field_type_test".to_string(),
+                        qualname: "Point".to_string(),
+                    },
+                }],
+            },
+        );
+
+        let mut lowered = soac_blockpy::lower_python_to_blockpy_for_testing(source)
+            .expect("lowering should succeed")
+            .codegen_module;
+        instrument_bb_module_with_call_target_counters(&mut lowered);
+        let shared_state =
+            crate::module_type::build_shared_state_for_testing(py, lowered, "counter_test", "")
+                .expect("shared state should build");
+        let function = shared_state
+            .lowered_module
+            .callable_defs
+            .iter()
+            .find(|function| function.names.bind_name == function_bind_name)
+            .unwrap_or_else(|| panic!("missing shared-state function {function_bind_name}"))
+            .clone();
+        let compile_session = crate::session::CompileSession::new();
+        let mut jit_module =
+            new_jit_module(&compile_session).expect("test jit module should construct");
+        let module_constant_ptrs = shared_state.module_constant_ptrs();
+        let module_constant_object_data_ids = declare_module_constant_object_data(
+            &mut jit_module,
+            &shared_state.lowered_module,
+            &module_constant_ptrs,
+        )
+        .expect("module constant object data should declare");
+        let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
+            define_test_counter_storage(
+                &mut jit_module,
+                &shared_state.lowered_module,
+                shared_state.lowered_module.counter_defs.as_slice(),
+            );
+        let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
+        let built = build_test_cranelift_run_bb_specialized_function(
+            &mut jit_module,
+            blocks.as_slice(),
+            &shared_state.lowered_module,
+            &function,
+            &shared_state.codegen_constants,
+            shared_state.lowered_module.counter_defs.as_slice(),
+            module_constant_object_data_ids.as_slice(),
+            counter_slots_by_id.as_ref(),
+            scalar_counter_data_id,
+            top_value_counter_data_id,
+            &compile_session,
+            Some(shared_state.as_ref()),
+            None,
+            None,
+            BuildSpecializedFunctionOptions::default(),
+        )
+        .expect("specialized JIT build should succeed");
+        modules
+            .del_item("field_type_test")
+            .expect("owner module should be removed");
+        built
+    }
+
+    #[test]
+    fn field_indexed_getattr_guard_miss_deopts_when_operands_are_replay_safe() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "field_indexed_getattr_guard_miss_deopts_when_operands_are_replay_safe",
+        ) {
+            return;
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let built = build_field_indexed_getattr_for_source(
+                py,
+                "verify",
+                r#"
+def read_point(point):
+    return point.x
+"#,
+                "read_point",
+            );
+            let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
+            let getattr_helpers =
+                import_user_names_for_symbols(&built, &["dp_jit_pyobject_getattr"]);
+            assert_eq!(
+                count_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
+                1,
+                "replay-safe indexed GetAttr guard miss should call the deopt resume helper"
+            );
+            assert_eq!(
+                count_cold_block_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
+                1,
+                "replay-safe indexed GetAttr deopt helper call should be cold"
+            );
+            assert_eq!(
+                count_direct_calls_to_runtime_helpers(&built.ctx.func, &getattr_helpers),
+                0,
+                "replay-safe indexed GetAttr should not emit a local getattr fallback"
+            );
+        });
+    }
+
+    #[test]
+    fn field_indexed_getattr_guard_miss_keeps_fallback_when_receiver_replay_is_unsafe() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "field_indexed_getattr_guard_miss_keeps_fallback_when_receiver_replay_is_unsafe",
+        ) {
+            return;
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let built = build_field_indexed_getattr_for_source(
+                py,
+                "verify",
+                r#"
+def read_point(factory):
+    return factory().x
+"#,
+                "read_point",
+            );
+            let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
+            let getattr_helpers =
+                import_user_names_for_symbols(&built, &["dp_jit_pyobject_getattr"]);
+            assert_eq!(
+                count_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
+                0,
+                "receiver calls are not replay-safe, so the guard miss should not deopt"
+            );
+            assert_eq!(
+                count_direct_calls_to_runtime_helpers(&built.ctx.func, &getattr_helpers),
+                1,
+                "unsafe-to-replay indexed GetAttr should keep the local getattr fallback"
+            );
+        });
+    }
+
     fn render_test_jit_function_with_constants(
         module: &BlockPyModule<CodegenModuleShape>,
         function: &BlockPyFunction<CodegenModuleShape>,

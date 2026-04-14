@@ -2716,7 +2716,7 @@ fn emit_codegen_indexed_global_load(
     let guard_miss_dispatch = prepare_optional_guard_miss_dispatch(
         ctx.guard_miss_target_for_resume_point(guard_miss_resume_point, fallback_block),
         fallback_block,
-        ctx.indexed_global_guard_miss_deopt_stub_ref,
+        ctx.guard_miss_deopt_stub_ref,
     );
     let direct_block = fb.create_block();
     fb.append_block_param(direct_block, ptr_ty);
@@ -3551,7 +3551,7 @@ struct JitEmitCtx<'mc> {
     load_global_fast_ref: ir::FuncRef,
     probe_global_indexed_ref: ir::FuncRef,
     load_global_slow_ref: ir::FuncRef,
-    indexed_global_guard_miss_deopt_stub_ref: Option<ir::FuncRef>,
+    guard_miss_deopt_stub_ref: Option<ir::FuncRef>,
     guard_miss_resume_point: Option<LocalEnvResumePoint>,
     store_global_indexed_ref: ir::FuncRef,
     probe_field_indexed_ref: ir::FuncRef,
@@ -5580,6 +5580,45 @@ impl<'a, 'b, 'mc, 'c, 'd> intrinsics::OperationEmitState<'b, InstrCodegen>
             .value_facts_for_expr(arg)
             .and_then(ValueFacts::as_pyobj)
             .unwrap_or_else(PyObjFacts::unknown)
+    }
+
+    fn prepare_guard_miss_dispatch_for_instr(
+        &mut self,
+        instr_id: InstrId,
+        fallback_block: ir::Block,
+    ) -> JitGuardMissDispatch {
+        let guard_miss_resume_point =
+            self.ctx
+                .guard_miss_resume_point
+                .unwrap_or(LocalEnvResumePoint::BeforeInstr {
+                    key: InstrKey::new(self.ctx.function_id, instr_id),
+                });
+        prepare_optional_guard_miss_dispatch(
+            self.ctx
+                .guard_miss_target_for_resume_point(guard_miss_resume_point, fallback_block),
+            fallback_block,
+            self.ctx.guard_miss_deopt_stub_ref,
+        )
+    }
+
+    fn emit_deopt_resume_result(
+        &mut self,
+        target: JitDeoptExitRef,
+        deopt_resume_ref: ir::FuncRef,
+    ) -> ir::Value {
+        let (live_values_base, live_value_count) =
+            emit_deopt_live_value_buffer(self.fb, target, self.ctx, self.local_env)
+                .unwrap_or_else(|err| panic!("{err}"));
+        emit_deopt_resume_call(
+            self.fb,
+            target,
+            deopt_resume_ref,
+            self.ctx.consts.block_const,
+            live_values_base,
+            live_value_count,
+            self.ctx.consts.ptr_ty,
+            self.ctx.consts.i64_ty,
+        )
     }
 }
 
@@ -17003,11 +17042,11 @@ fn build_cranelift_run_bb_specialized_function(
             &mut fb.func,
             &SOAC_RUNTIME_LOAD_GLOBAL_SLOW_IMPORT,
         );
-        let indexed_global_guard_miss_deopt_stub_ref =
-            (options.indexed_global_guard_miss_deopt_stub || indexed_global_guard_miss_deopt_stub)
-                .then(|| {
-                    func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_DEOPT_RESUME_IMPORT)
-                });
+        let guard_miss_deopt_stub_ref = (options.indexed_global_guard_miss_deopt_stub
+            || indexed_global_guard_miss_deopt_stub)
+            .then(|| {
+                func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_DEOPT_RESUME_IMPORT)
+            });
         let store_global_indexed_ref = func_imports.get_or_panic(
             jit_module,
             &mut fb.func,
@@ -17300,7 +17339,7 @@ fn build_cranelift_run_bb_specialized_function(
                 load_global_fast_ref,
                 probe_global_indexed_ref,
                 load_global_slow_ref,
-                indexed_global_guard_miss_deopt_stub_ref,
+                guard_miss_deopt_stub_ref,
                 guard_miss_resume_point: None,
                 store_global_indexed_ref,
                 probe_field_indexed_ref,

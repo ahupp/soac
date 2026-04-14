@@ -1,7 +1,7 @@
 use super::{
-    ImportSpec, JitEmitCtx, RelocTypeRef, SOAC_RUNTIME_LOAD_GLOBAL_IMPORT,
-    SOAC_RUNTIME_STORE_GLOBAL_IMPORT, SigType, codegen_constant_string_value,
-    emit_exact_type_version_match, emit_increment_counter_slot,
+    ImportSpec, JitDeoptExitRef, JitEmitCtx, JitGuardMissDispatch, RelocTypeRef,
+    SOAC_RUNTIME_LOAD_GLOBAL_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_IMPORT, SigType,
+    codegen_constant_string_value, emit_exact_type_version_match, emit_increment_counter_slot,
     emit_owned_module_constant_from_parts,
 };
 use crate::jit::blockpy_intrinsics;
@@ -37,6 +37,20 @@ pub(super) trait OperationEmitState<'fb, E> {
     ) -> ir::Value;
     fn emit_type_ptr_value(&mut self, owner_type_ref: &RelocTypeRef) -> Option<ir::Value>;
     fn py_facts_for_arg(&self, arg: &E) -> PyObjFacts;
+    fn prepare_guard_miss_dispatch_for_instr(
+        &mut self,
+        _instr_id: soac_blockpy::block_py::InstrId,
+        fallback_block: ir::Block,
+    ) -> JitGuardMissDispatch {
+        JitGuardMissDispatch::FallbackBlock(fallback_block)
+    }
+    fn emit_deopt_resume_result(
+        &mut self,
+        _target: JitDeoptExitRef,
+        _deopt_resume_ref: ir::FuncRef,
+    ) -> ir::Value {
+        panic!("this operation emitter cannot materialize JIT deopt live values")
+    }
 
     fn emit_owned_string_constant(&mut self, value: &str) -> ir::Value {
         let constant_id = self
@@ -470,6 +484,11 @@ fn emit_specialized_getattr<'fb>(
     let result_block = state.fb().create_block();
     state.fb().append_block_param(result_block, ptr_ty);
     let fallback_block = state.fb().create_block();
+    let guard_miss_dispatch = if field_getattr_pre_guard_operands_are_replay_safe(op) {
+        state.prepare_guard_miss_dispatch_for_instr(instr_id, fallback_block)
+    } else {
+        JitGuardMissDispatch::FallbackBlock(fallback_block)
+    };
     for (index, specialization) in specializations.iter().enumerate() {
         let Some(owner_type) = state.emit_type_ptr_value(&specialization.owner_type_ref) else {
             continue;
@@ -508,9 +527,10 @@ fn emit_specialized_getattr<'fb>(
                 .fb()
                 .ins()
                 .icmp(ir::condcodes::IntCC::Equal, direct_value, null_ptr);
+        let direct_miss_block = guard_miss_dispatch.branch_block();
         state.fb().ins().brif(
             direct_is_null,
-            fallback_block,
+            direct_miss_block,
             &[],
             direct_block,
             &[ir::BlockArg::Value(direct_value)],
@@ -531,18 +551,72 @@ fn emit_specialized_getattr<'fb>(
         }
     }
 
-    state.fb().switch_to_block(fallback_block);
-    increment_counter_with_state(state, fallback_counter_id);
-    let fallback_value = emit_counted_getattr_fallback(state, None, &arg_values);
-    state.release_arg_values(&arg_values);
-    state
-        .fb()
-        .ins()
-        .jump(result_block, &[ir::BlockArg::Value(fallback_value)]);
+    match guard_miss_dispatch {
+        JitGuardMissDispatch::FallbackBlock(fallback_block) => {
+            state.fb().switch_to_block(fallback_block);
+            increment_counter_with_state(state, fallback_counter_id);
+            let fallback_value = emit_counted_getattr_fallback(state, None, &arg_values);
+            state.release_arg_values(&arg_values);
+            state
+                .fb()
+                .ins()
+                .jump(result_block, &[ir::BlockArg::Value(fallback_value)]);
+        }
+        JitGuardMissDispatch::DeoptResume {
+            block,
+            target,
+            deopt_resume_ref,
+        } => {
+            state.fb().switch_to_block(block);
+            state.fb().set_cold_block(block);
+            increment_counter_with_state(state, fallback_counter_id);
+            state.release_arg_values(&arg_values);
+            let deopt_result = state.emit_deopt_resume_result(target, deopt_resume_ref);
+            let deopt_result_is_null =
+                state
+                    .fb()
+                    .ins()
+                    .icmp(ir::condcodes::IntCC::Equal, deopt_result, null_ptr);
+            let deopt_success_block = state.fb().create_block();
+            state.fb().append_block_param(deopt_success_block, ptr_ty);
+            state.fb().set_cold_block(deopt_success_block);
+            let step_null_block = state.ctx().consts.step_null_block;
+            let step_null_args = super::step_null_block_args(state.ctx());
+            state.fb().ins().brif(
+                deopt_result_is_null,
+                step_null_block,
+                &step_null_args,
+                deopt_success_block,
+                &[ir::BlockArg::Value(deopt_result)],
+            );
+
+            state.fb().switch_to_block(deopt_success_block);
+            let resumed_result = state.fb().block_params(deopt_success_block)[0];
+            state.fb().ins().return_(&[resumed_result]);
+        }
+    }
 
     state.fb().switch_to_block(result_block);
     let result = state.fb().block_params(result_block)[0];
     Some(state.finish_owned_result(result))
+}
+
+fn field_getattr_pre_guard_operands_are_replay_safe(
+    op: &blockpy_intrinsics::GetAttr<InstrCodegen>,
+) -> bool {
+    field_getattr_operand_is_replay_safe(op.value.as_ref())
+        && field_getattr_operand_is_replay_safe(op.attr.as_ref())
+}
+
+fn field_getattr_operand_is_replay_safe(expr: &InstrCodegen) -> bool {
+    matches!(
+        expr,
+        InstrCodegen::Load(load)
+            if matches!(
+                load.name.location,
+                NameLocation::Local(_) | NameLocation::Cell(_) | NameLocation::Constant(_)
+            )
+    )
 }
 
 fn emit_setattr_fallback<'fb>(
