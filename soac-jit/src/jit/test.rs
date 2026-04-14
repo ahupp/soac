@@ -4790,6 +4790,65 @@ def read_point(point):
     }
 
     #[test]
+    fn runtime_deopt_invocation_materializes_live_local_snapshot() {
+        let function_id = FunctionId::new(12, 34);
+        let block = BlockLabel::from_index(0);
+        let location = LocalLocation(0);
+        let binding = LocalEnvResumeBinding {
+            name: "x".to_string(),
+            location,
+            binding: LocalEnvResumeBindingState::Bound,
+            source: LocalEnvResumeValueSource::BlockParam(location),
+            ownership: LocalRefKind::Owned,
+            value: None,
+        };
+        let table = RuntimeJitDeoptTable {
+            function_id,
+            points: vec![RuntimeJitDeoptRecord {
+                id: PlannedJitDeoptPointId {
+                    function_id,
+                    ordinal: 0,
+                },
+                resume_point: LocalEnvResumePoint::BlockEntry { function_id, block },
+                precision: LocalEnvResumeStatePrecision::BlockEntry,
+                locals: vec![binding],
+            }],
+        };
+        let expected_value = 0x1234usize as ObjPtr;
+        let mut live_values = vec![expected_value];
+        let invocation = unsafe {
+            RuntimeJitDeoptInvocation::from_raw(
+                std::ptr::addr_of!(table).cast_mut().cast(),
+                0,
+                live_values.as_mut_ptr().cast(),
+                live_values.len() as i64,
+            )
+            .expect("well-formed live value buffer should validate")
+        };
+        let locals = invocation
+            .materialize_locals()
+            .expect("validated live bindings should materialize into runtime locals");
+
+        assert_eq!(locals.len(), 1);
+        let local = locals
+            .get_by_name("x")
+            .expect("runtime locals should be addressable by source name");
+        assert_eq!(local.binding().location, location);
+        assert_eq!(local.value(), expected_value);
+        assert_eq!(
+            locals
+                .get_by_location(location)
+                .expect("runtime locals should be addressable by location")
+                .value(),
+            expected_value
+        );
+        assert!(
+            locals.describe().contains("x="),
+            "runtime locals diagnostics should include local names"
+        );
+    }
+
+    #[test]
     fn deopt_unimplemented_exit_call_uses_function_env_deopt_table_and_ordinal() {
         let compile_session = crate::session::CompileSession::new();
         let mut jit_module =

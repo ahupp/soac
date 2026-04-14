@@ -30,10 +30,10 @@ use soac_blockpy::block_py::{
 };
 use soac_blockpy::passes::{
     CodegenModuleShape, FactStore, FunctionRefcountPlan, InstrResolved, InstrTyped,
-    LocalEnvResumeBinding, LocalEnvResumePoint, LocalEnvResumeStatePrecision,
-    LocalEnvResumeValueSource, LocalRefState, PyExactType, PyObjFacts, RefcountActionKind,
-    RefcountReleaseReason, RefcountSite, RuntimeHelperId, TypedCodegenModuleShape, ValueFacts,
-    infer_module_value_facts, lower_codegen_function_to_typed,
+    LocalEnvResumeBinding, LocalEnvResumeBindingState, LocalEnvResumePoint,
+    LocalEnvResumeStatePrecision, LocalEnvResumeValueSource, LocalRefState, PyExactType,
+    PyObjFacts, RefcountActionKind, RefcountReleaseReason, RefcountSite, RuntimeHelperId,
+    TypedCodegenModuleShape, ValueFacts, infer_module_value_facts, lower_codegen_function_to_typed,
     lower_typed_function_if_tests_to_truthy, try_lower_typed_instr_to_codegen_legacy,
     try_lower_typed_term_to_codegen_legacy,
 };
@@ -1330,6 +1330,15 @@ pub(crate) struct RuntimeJitDeoptInvocation<'a> {
     live_values: &'a [ObjPtr],
 }
 
+pub(crate) struct RuntimeJitDeoptLocal<'a> {
+    binding: &'a LocalEnvResumeBinding,
+    value: ObjPtr,
+}
+
+pub(crate) struct RuntimeJitDeoptLocals<'a> {
+    locals: Vec<RuntimeJitDeoptLocal<'a>>,
+}
+
 impl RuntimeJitDeoptRecord {
     pub(crate) fn id(&self) -> PlannedJitDeoptPointId {
         self.id
@@ -1543,12 +1552,95 @@ impl RuntimeJitDeoptInvocation<'_> {
             .zip(self.live_values.iter().copied())
     }
 
+    pub(crate) fn materialize_locals(&self) -> Result<RuntimeJitDeoptLocals<'_>, String> {
+        RuntimeJitDeoptLocals::from_live_bindings(self.live_bindings())
+    }
+
     pub(crate) fn describe(&self) -> String {
         format!(
             "{}, live values {}",
             self.record().describe(self.table.function_id()),
             self.live_bindings().len()
         )
+    }
+}
+
+impl<'a> RuntimeJitDeoptLocals<'a> {
+    fn from_live_bindings(
+        live_bindings: impl IntoIterator<Item = (&'a LocalEnvResumeBinding, ObjPtr)>,
+    ) -> Result<Self, String> {
+        let mut names = HashSet::new();
+        let mut locations = HashSet::new();
+        let mut locals = Vec::new();
+        for (binding, value) in live_bindings {
+            if !names.insert(binding.name.as_str()) {
+                return Err(format!(
+                    "duplicate deopt local name {} while reconstructing runtime locals",
+                    binding.name
+                ));
+            }
+            if !locations.insert(binding.location) {
+                return Err(format!(
+                    "duplicate deopt local location {:?} while reconstructing runtime locals",
+                    binding.location
+                ));
+            }
+            match binding.binding {
+                LocalEnvResumeBindingState::Bound if value.is_null() => {
+                    return Err(format!(
+                        "deopt local {} at {:?} is definitely bound but has a null value",
+                        binding.name, binding.location
+                    ));
+                }
+                LocalEnvResumeBindingState::Unbound if !value.is_null() => {
+                    return Err(format!(
+                        "deopt local {} at {:?} is unbound but has a non-null value",
+                        binding.name, binding.location
+                    ));
+                }
+                _ => {}
+            }
+            locals.push(RuntimeJitDeoptLocal { binding, value });
+        }
+        Ok(Self { locals })
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.locals.len()
+    }
+
+    pub(crate) fn describe(&self) -> String {
+        let names = self
+            .locals
+            .iter()
+            .map(|local| format!("{}={:p}", local.binding.name, local.value))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("reconstructed locals {} [{}]", self.len(), names)
+    }
+
+    #[cfg(test)]
+    fn get_by_name(&self, name: &str) -> Option<&RuntimeJitDeoptLocal<'a>> {
+        self.locals.iter().find(|local| local.binding.name == name)
+    }
+
+    #[cfg(test)]
+    fn get_by_location(&self, location: LocalLocation) -> Option<&RuntimeJitDeoptLocal<'a>> {
+        self.locals
+            .iter()
+            .find(|local| local.binding.location == location)
+    }
+}
+
+impl RuntimeJitDeoptLocal<'_> {
+    #[cfg(test)]
+    fn binding(&self) -> &'_ LocalEnvResumeBinding {
+        self.binding
+    }
+
+    #[cfg(test)]
+    fn value(&self) -> ObjPtr {
+        self.value
     }
 }
 

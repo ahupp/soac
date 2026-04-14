@@ -1286,7 +1286,16 @@ unsafe fn run_deopt_unimplemented(
 
 #[cold]
 fn execute_deopt_invocation(invocation: &RuntimeJitDeoptInvocation<'_>) -> Result<ObjPtr, String> {
-    Err(invocation.describe())
+    let locals = invocation.materialize_locals()?;
+    execute_blockpy_deopt_continuation(invocation, &locals)
+}
+
+#[cold]
+fn execute_blockpy_deopt_continuation(
+    invocation: &RuntimeJitDeoptInvocation<'_>,
+    locals: &super::RuntimeJitDeoptLocals<'_>,
+) -> Result<ObjPtr, String> {
+    Err(format!("{}, {}", invocation.describe(), locals.describe()))
 }
 
 #[cold]
