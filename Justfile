@@ -910,7 +910,9 @@ _test-all-test-phase:
   cargo_test_status_file="$parallel_log_dir/cargo-test.status"
   pytest_status_file="$parallel_log_dir/pytest.status"
 
-  run_parallel_step cargo_test_pid cargo-test "$cargo_test_log" "$cargo_test_status_file" cargo_test_s cargo test
+  # Some soac-jit tests share CPython process state and JIT finalization state.
+  # Keep the Rust harness serial here so the full gate is deterministic.
+  run_parallel_step cargo_test_pid cargo-test "$cargo_test_log" "$cargo_test_status_file" cargo_test_s cargo test -- --test-threads=1
   run_parallel_step pytest_pid pytest "$pytest_log" "$pytest_status_file" pytest_s just _pytest-run tests/
 
   cargo_test_status=0

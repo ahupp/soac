@@ -8312,6 +8312,49 @@ def f(x, y):
     }
 
     #[test]
+    fn indexed_global_nested_body_guard_miss_uses_slow_fallback_without_deopt_point() {
+        let blocks = [1usize as ObjPtr];
+        let function = with_single_test_block(
+            test_function(),
+            vec![op_expr(Call::new(
+                name_expr(test_runtime_name("tuple_values")),
+                vec![CallArgPositional::Positional(op_expr(Load::new(
+                    test_global_name("x"),
+                )))],
+                Vec::<CallArgKeyword<InstrCodegen>>::new(),
+            ))],
+            ret_term(none_expr()),
+        );
+        let mut module = test_module(ModuleNameGen::new(0), vec![function]);
+        instrument_bb_module_with_call_target_counters(&mut module);
+        let function = module.callable_defs[0].clone();
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let built = build_test_jit_function_with_constants_and_options(
+            &module,
+            &function,
+            &blocks,
+            &module_constants,
+            BuildSpecializedFunctionOptions {
+                indexed_global_guard_miss_deopt_stub: true,
+            },
+        );
+        let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
+        let slow_global_helpers =
+            import_user_names_for_symbols(&built, &["soac_runtime_load_global_slow"]);
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
+            0,
+            "nested expression loads are not planned deopt points and should not deopt"
+        );
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &slow_global_helpers),
+            1,
+            "nested expression guard miss should preserve local slow global-load fallback"
+        );
+    }
+
+    #[test]
     fn indexed_global_body_guard_miss_deopt_resumes_block_tail_runtime() {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();

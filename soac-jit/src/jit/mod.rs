@@ -2077,11 +2077,9 @@ fn emit_codegen_indexed_global_load(
     let result_block = fb.create_block();
     fb.append_block_param(result_block, ptr_ty);
     let fallback_block = fb.create_block();
-    let guard_miss_target = ctx
-        .guard_miss_target_for_resume_point(guard_miss_resume_point, fallback_block)
-        .unwrap_or_else(|err| panic!("{err}"));
-    let guard_miss_dispatch = prepare_guard_miss_dispatch(
-        guard_miss_target,
+    let guard_miss_dispatch = prepare_optional_guard_miss_dispatch(
+        ctx.guard_miss_target_for_resume_point(guard_miss_resume_point, fallback_block),
+        fallback_block,
         ctx.indexed_global_guard_miss_deopt_stub_ref,
     );
     let direct_block = fb.create_block();
@@ -2990,6 +2988,20 @@ fn prepare_guard_miss_dispatch(
         },
         None => JitGuardMissDispatch::FallbackBlock(target.fallback_block()),
     }
+}
+
+fn prepare_optional_guard_miss_dispatch(
+    target: Result<JitGuardMissTarget, String>,
+    fallback_block: ir::Block,
+    deopt_resume_ref: Option<ir::FuncRef>,
+) -> JitGuardMissDispatch {
+    let Some(deopt_resume_ref) = deopt_resume_ref else {
+        return JitGuardMissDispatch::FallbackBlock(fallback_block);
+    };
+    let Ok(target) = target else {
+        return JitGuardMissDispatch::FallbackBlock(fallback_block);
+    };
+    prepare_guard_miss_dispatch(target, Some(deopt_resume_ref))
 }
 
 fn emit_deopt_resume_call(
