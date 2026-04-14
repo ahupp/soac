@@ -1981,11 +1981,14 @@ fn runtime_jit_deopt_expr_supported(expr: &InstrCodegen) -> bool {
                 && runtime_jit_deopt_expr_supported(&delitem.index)
         }
         InstrCodegen::Call(call) => {
-            call.keywords.is_empty()
-                && runtime_jit_deopt_expr_supported(&call.func)
+            runtime_jit_deopt_expr_supported(&call.func)
                 && call.args.iter().all(|arg| match arg {
                     CallArgPositional::Positional(expr) => runtime_jit_deopt_expr_supported(expr),
                     CallArgPositional::Starred(_) => false,
+                })
+                && call.keywords.iter().all(|keyword| match keyword {
+                    CallArgKeyword::Named { value, .. } => runtime_jit_deopt_expr_supported(value),
+                    CallArgKeyword::Starred(_) => false,
                 })
         }
         _ => false,

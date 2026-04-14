@@ -5,8 +5,8 @@ use super::{
 use crate::module_constants::load_runtime_name_owned;
 use pyo3::ffi;
 use soac_blockpy::block_py::{
-    BinOp, BinOpKind, BlockTerm, CallArgPositional, InstrCodegen, LocalLocation, NameLocation,
-    UnaryOp, UnaryOpKind,
+    BinOp, BinOpKind, BlockTerm, CallArgKeyword, CallArgPositional, InstrCodegen, LocalLocation,
+    NameLocation, UnaryOp, UnaryOpKind,
 };
 use std::ffi::c_void;
 use std::ptr;
@@ -370,10 +370,6 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
         &mut self,
         call: &soac_blockpy::block_py::Call<InstrCodegen>,
     ) -> Result<ObjPtr, String> {
-        if !call.keywords.is_empty() {
-            return Err("deopt continuation does not support keyword call arguments".to_string());
-        }
-
         let callable = unsafe { self.execute_expr_owned(&call.func)? };
         if callable.is_null() {
             return Ok(ptr::null_mut());
@@ -435,8 +431,89 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
                 return Ok(ptr::null_mut());
             }
         }
-        let result = unsafe { ffi::PyObject_CallObject(callable.cast::<ffi::PyObject>(), tuple) };
+        let kwargs = if call.keywords.is_empty() {
+            ptr::null_mut()
+        } else {
+            let kwargs = unsafe { ffi::PyDict_New() };
+            if kwargs.is_null() {
+                unsafe {
+                    ffi::Py_DECREF(tuple);
+                    ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
+                }
+                return Ok(ptr::null_mut());
+            }
+            for keyword in &call.keywords {
+                let CallArgKeyword::Named { arg, value } = keyword else {
+                    unsafe {
+                        ffi::Py_DECREF(kwargs);
+                        ffi::Py_DECREF(tuple);
+                        ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
+                    }
+                    return Err(
+                        "deopt continuation does not support starred keyword arguments".to_string(),
+                    );
+                };
+                let value = unsafe { self.execute_expr_owned(value)? };
+                if value.is_null() {
+                    unsafe {
+                        ffi::Py_DECREF(kwargs);
+                        ffi::Py_DECREF(tuple);
+                        ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
+                    }
+                    return Ok(ptr::null_mut());
+                }
+                let name_len = match ffi::Py_ssize_t::try_from(arg.as_str().len()) {
+                    Ok(name_len) => name_len,
+                    Err(_) => {
+                        unsafe {
+                            ffi::Py_DECREF(value.cast::<ffi::PyObject>());
+                            ffi::Py_DECREF(kwargs);
+                            ffi::Py_DECREF(tuple);
+                            ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
+                        }
+                        return Err(format!(
+                            "deopt continuation keyword name {:?} is too large to materialize as PyUnicode",
+                            arg.as_str()
+                        ));
+                    }
+                };
+                let key = unsafe {
+                    ffi::PyUnicode_FromStringAndSize(arg.as_str().as_ptr().cast(), name_len)
+                };
+                if key.is_null() {
+                    unsafe {
+                        ffi::Py_DECREF(value.cast::<ffi::PyObject>());
+                        ffi::Py_DECREF(kwargs);
+                        ffi::Py_DECREF(tuple);
+                        ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
+                    }
+                    return Ok(ptr::null_mut());
+                }
+                let rc = unsafe { ffi::PyDict_SetItem(kwargs, key, value.cast::<ffi::PyObject>()) };
+                unsafe {
+                    ffi::Py_DECREF(key);
+                    ffi::Py_DECREF(value.cast::<ffi::PyObject>());
+                }
+                if rc != 0 {
+                    unsafe {
+                        ffi::Py_DECREF(kwargs);
+                        ffi::Py_DECREF(tuple);
+                        ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
+                    }
+                    return Ok(ptr::null_mut());
+                }
+            }
+            kwargs
+        };
+        let result = if kwargs.is_null() {
+            unsafe { ffi::PyObject_CallObject(callable.cast::<ffi::PyObject>(), tuple) }
+        } else {
+            unsafe { ffi::PyObject_Call(callable.cast::<ffi::PyObject>(), tuple, kwargs) }
+        };
         unsafe {
+            if !kwargs.is_null() {
+                ffi::Py_DECREF(kwargs);
+            }
             ffi::Py_DECREF(tuple);
             ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
         }

@@ -6604,6 +6604,107 @@ def f(x):
     }
 
     #[test]
+    fn deopt_block_tail_continuation_executes_return_keyword_call() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|_| {
+            let function = with_single_test_block(
+                test_function(),
+                vec![],
+                ret_term(op_expr(Call::new(
+                    name_expr(test_constant_name(0)),
+                    Vec::<CallArgPositional<InstrCodegen>>::new(),
+                    vec![CallArgKeyword::Named {
+                        arg: "x".into(),
+                        value: name_expr(test_constant_name(1)),
+                    }],
+                ))),
+            );
+            let function_id = function.function_id;
+            let block = function.entry_block().label;
+            let dict_callable = std::ptr::addr_of_mut!(ffi::PyDict_Type).cast::<ffi::PyObject>();
+            unsafe {
+                ffi::Py_INCREF(dict_callable);
+            }
+            let value = unsafe { ffi::PyLong_FromLong(777_888_999) };
+            assert!(
+                !value.is_null(),
+                "test keyword value PyLong allocation should succeed"
+            );
+            let table = RuntimeJitDeoptTable {
+                function_id,
+                function: Box::new(function),
+                module_constant_ptrs: vec![dict_callable.cast(), value.cast()],
+                points: vec![RuntimeJitDeoptRecord {
+                    id: PlannedJitDeoptPointId {
+                        function_id,
+                        ordinal: 0,
+                    },
+                    resume_point: LocalEnvResumePoint::BeforeTerm { function_id, block },
+                    precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                    locals: vec![],
+                    continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
+                        cursor: RuntimeJitDeoptCursor::at_block_entry(block),
+                    },
+                }],
+            };
+            let before_value = unsafe { ffi::Py_REFCNT(value) };
+            let result = unsafe {
+                crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                    std::ptr::addr_of!(table).cast_mut().cast(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert!(
+                !result.is_null(),
+                "return-keyword-call deopt should produce a value"
+            );
+            assert!(
+                unsafe { ffi::PyErr_Occurred() }.is_null(),
+                "successful return-keyword-call deopt should not leave a Python exception"
+            );
+            assert_ne!(
+                unsafe { ffi::PyDict_Check(result.cast::<ffi::PyObject>()) },
+                0,
+                "return-keyword-call deopt should call dict with kwargs"
+            );
+            let key = unsafe { ffi::PyUnicode_FromString(c"x".as_ptr()) };
+            assert!(!key.is_null(), "test keyword key allocation should succeed");
+            let stored =
+                unsafe { ffi::PyDict_GetItemWithError(result.cast::<ffi::PyObject>(), key) };
+            assert!(
+                !stored.is_null(),
+                "return-keyword-call deopt should store the named keyword in the result dict"
+            );
+            assert_eq!(
+                unsafe { ffi::PyLong_AsLongLong(stored) },
+                777_888_999,
+                "return-keyword-call deopt should preserve the keyword value"
+            );
+            assert!(
+                unsafe { ffi::PyErr_Occurred() }.is_null(),
+                "result dict lookup should not leave a Python exception"
+            );
+            unsafe {
+                ffi::Py_DECREF(key);
+                ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+            }
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(value) },
+                before_value,
+                "keyword value module constant should not leak after releasing the call result"
+            );
+            unsafe {
+                ffi::Py_DECREF(value);
+                ffi::Py_DECREF(dict_callable);
+            }
+        });
+    }
+
+    #[test]
     fn deopt_block_tail_continuation_executes_global_store() {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
