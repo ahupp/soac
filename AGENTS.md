@@ -348,9 +348,12 @@ anything non-code affected the run. If there were no such issues, say
   `soac-module-cache`, and `tmp/cargo-home` from that parent into the worktree,
   and errors instead of creating isolated empty offline caches when neither
   inference nor the override can identify the parent.
-  When sandboxing would otherwise block shared benchmark writes, run Codex with
-  the worktree and parent checkout as writable roots, for example
-  `--add-dir ../main-repo .`.
+  When sandboxing would otherwise block shared benchmark writes or jj metadata
+  updates, run Codex with the worktree and parent checkout as writable roots.
+  Prefer an absolute parent path such as `--add-dir /home/adamh/code/soac`;
+  relative paths in project config can be resolved relative to the config file
+  rather than the shell cwd, and a mistaken path can expose a directory inside
+  the worktree instead of the shared parent repo.
 - SOAC Rust runtime/JIT environment variables are parsed into a typed config
   once at the relevant entrypoint. Unset variables use documented defaults;
   present typed variables must use recognized values. Boolean knobs accept `1`,
