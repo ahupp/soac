@@ -1191,10 +1191,21 @@ struct DirectFunctionCompileInputs<'a> {
     module_constant_ptrs: &'a [*mut ffi::PyObject],
 }
 
+struct ReservedJitFunctionCompileInputs {
+    module_constant_ptrs: Vec<*mut ffi::PyObject>,
+    counter_slots_by_id: Vec<CounterRuntimeSlot>,
+    module_constant_object_data_ids: Vec<DataId>,
+    scalar_counter_data_id: Option<DataId>,
+    top_value_counter_data_id: Option<DataId>,
+    module_constant_binding_key: usize,
+    symbol_scope: Option<String>,
+}
+
 struct JitBatchPlan<'a> {
     root_function_id: FunctionId,
     batch_functions: Vec<ProcessJitBatchFunction<'a>>,
     function_indices_to_define: Vec<usize>,
+    function_compile_inputs: HashMap<usize, ReservedJitFunctionCompileInputs>,
     predeclared: HashMap<FunctionId, DeclaredJitFunction>,
 }
 
@@ -1526,9 +1537,102 @@ impl ProcessJitState {
 }
 
 impl ProcessJitState {
+    fn reserve_direct_function_compile_inputs(
+        &mut self,
+        jit_module: &mut JITModule,
+        inputs: &DirectFunctionCompileInputs<'_>,
+        batch_function: &ProcessJitBatchFunction<'_>,
+    ) -> Result<ReservedJitFunctionCompileInputs, String> {
+        if let Some(shared_state) = batch_function.source.shared_state() {
+            let module_constant_ptrs = shared_state.module_constant_ptrs();
+            let instance_key = shared_state.storage_instance_key();
+            let scalar_counter_symbol =
+                scalar_counter_storage_symbol_for_shared_state(shared_state);
+            let scalar_counter_base_ptr = shared_state.scalar_counter_values_ptr();
+            let scalar_counter_data_id = if scalar_counter_base_ptr.is_null() {
+                None
+            } else {
+                register_jit_data_symbol(
+                    scalar_counter_symbol.as_str(),
+                    scalar_counter_base_ptr.cast::<u8>(),
+                );
+                Some(declare_scalar_counter_storage_import(
+                    jit_module,
+                    scalar_counter_symbol.as_str(),
+                )?)
+            };
+            let top_value_counter_symbol =
+                top_value_counter_storage_symbol_for_shared_state(shared_state);
+            let top_value_counter_base_ptr = shared_state.top_value_counter_values_ptr();
+            let top_value_counter_data_id = if top_value_counter_base_ptr.is_null() {
+                None
+            } else {
+                register_jit_data_symbol(
+                    top_value_counter_symbol.as_str(),
+                    top_value_counter_base_ptr.cast::<u8>(),
+                );
+                Some(declare_top_value_counter_storage_import(
+                    jit_module,
+                    top_value_counter_symbol.as_str(),
+                )?)
+            };
+            let module_constant_object_data_ids = self.ensure_module_constant_objects(
+                jit_module,
+                module_constant_ptrs.as_slice(),
+                instance_key,
+                module_constant_symbol_prefix_for_shared_state(shared_state).as_str(),
+            )?;
+            return Ok(ReservedJitFunctionCompileInputs {
+                module_constant_ptrs,
+                counter_slots_by_id: shared_state.counter_slots_by_id().to_vec(),
+                module_constant_object_data_ids,
+                scalar_counter_data_id,
+                top_value_counter_data_id,
+                module_constant_binding_key: instance_key,
+                symbol_scope: Some(direct_function_symbol_scope_for_shared_state(
+                    shared_state,
+                    batch_function.function.function_id,
+                )),
+            });
+        }
+
+        let (counter_slots_by_id, scalar_counter_count, top_value_count) =
+            build_counter_storage_layout(inputs.counter_defs)?;
+        let instance_key = inputs.module as *const BlockPyModule<CodegenModuleShape> as usize;
+        let scalar_counter_data_id = self.ensure_local_scalar_counter_storage(
+            jit_module,
+            inputs.module,
+            scalar_counter_count,
+            instance_key,
+        )?;
+        let top_value_counter_data_id = self.ensure_local_top_value_counter_storage(
+            jit_module,
+            inputs.module,
+            top_value_count,
+            instance_key,
+        )?;
+        let module_constant_ptrs = inputs.module_constant_ptrs.to_vec();
+        let module_constant_object_data_ids = self.ensure_module_constant_objects(
+            jit_module,
+            module_constant_ptrs.as_slice(),
+            instance_key,
+            module_constant_symbol_prefix_for_instance(inputs.module, instance_key).as_str(),
+        )?;
+        Ok(ReservedJitFunctionCompileInputs {
+            module_constant_ptrs,
+            counter_slots_by_id: counter_slots_by_id.into_vec(),
+            module_constant_object_data_ids,
+            scalar_counter_data_id,
+            top_value_counter_data_id,
+            module_constant_binding_key: instance_key,
+            symbol_scope: None,
+        })
+    }
+
     fn reserve_direct_function_batch<'a>(
         &mut self,
         jit_module: &mut JITModule,
+        inputs: &DirectFunctionCompileInputs<'a>,
         root_function: &BlockPyFunction<CodegenModuleShape>,
         batch_functions: Vec<ProcessJitBatchFunction<'a>>,
     ) -> Result<ReservedDirectFunctionBatch<'a>, String> {
@@ -1538,6 +1642,7 @@ impl ProcessJitState {
 
         let mut predeclared = HashMap::new();
         let mut function_indices_to_define = Vec::new();
+        let mut function_compile_inputs = HashMap::new();
         for (index, batch_function) in batch_functions.iter().enumerate() {
             let function = &batch_function.function;
             let direct_symbol_scope = batch_function.source.shared_state().map(|shared_state| {
@@ -1547,6 +1652,14 @@ impl ProcessJitState {
                 self.declare_direct_function(jit_module, function, direct_symbol_scope.as_deref())?;
             if !self.is_direct_function_ready(function.function_id) {
                 function_indices_to_define.push(index);
+                function_compile_inputs.insert(
+                    index,
+                    self.reserve_direct_function_compile_inputs(
+                        jit_module,
+                        inputs,
+                        batch_function,
+                    )?,
+                );
             }
             predeclared.insert(function.function_id, declared);
         }
@@ -1555,12 +1668,12 @@ impl ProcessJitState {
             root_function_id: root_function.function_id,
             batch_functions,
             function_indices_to_define,
+            function_compile_inputs,
             predeclared,
         }))
     }
 
     fn compile_reserved_direct_function_batch<'a>(
-        &mut self,
         jit_module: &mut JITModule,
         inputs: &DirectFunctionCompileInputs<'a>,
         plan: &JitBatchPlan<'a>,
@@ -1585,107 +1698,31 @@ impl ProcessJitState {
                     vec![std::ptr::null_mut::<std::ffi::c_void>(); function.blocks.len()];
                 placeholder_blocks.as_slice()
             };
-            let owned_module_constant_ptrs;
-            let owned_counter_slots_by_id;
+            let reserved_inputs = plan
+                .function_compile_inputs
+                .get(batch_function_index)
+                .expect("reserved JIT batch function should have compile inputs");
             let (
                 function_module,
                 function_module_constants,
                 function_counter_defs,
-                function_module_constant_ptrs,
-                function_counter_slots_by_id,
-                function_scalar_counter_data_id,
-                function_top_value_counter_data_id,
                 function_direct_call_resolver,
-                function_module_constant_binding_key,
-                function_module_constant_symbol_prefix,
-                function_symbol_scope,
             ) = if let Some(shared_state) = batch_function.source.shared_state() {
-                owned_module_constant_ptrs = shared_state.module_constant_ptrs();
-                let instance_key = shared_state.storage_instance_key();
-                let scalar_counter_symbol =
-                    scalar_counter_storage_symbol_for_shared_state(shared_state);
-                let scalar_counter_base_ptr = shared_state.scalar_counter_values_ptr();
-                let scalar_counter_data_id = if scalar_counter_base_ptr.is_null() {
-                    None
-                } else {
-                    register_jit_data_symbol(
-                        scalar_counter_symbol.as_str(),
-                        scalar_counter_base_ptr.cast::<u8>(),
-                    );
-                    Some(declare_scalar_counter_storage_import(
-                        jit_module,
-                        scalar_counter_symbol.as_str(),
-                    )?)
-                };
-                let top_value_counter_symbol =
-                    top_value_counter_storage_symbol_for_shared_state(shared_state);
-                let top_value_counter_base_ptr = shared_state.top_value_counter_values_ptr();
-                let top_value_counter_data_id = if top_value_counter_base_ptr.is_null() {
-                    None
-                } else {
-                    register_jit_data_symbol(
-                        top_value_counter_symbol.as_str(),
-                        top_value_counter_base_ptr.cast::<u8>(),
-                    );
-                    Some(declare_top_value_counter_storage_import(
-                        jit_module,
-                        top_value_counter_symbol.as_str(),
-                    )?)
-                };
                 (
                     &shared_state.lowered_module,
                     &shared_state.codegen_constants,
                     shared_state.lowered_module.counter_defs.as_slice(),
-                    owned_module_constant_ptrs.as_slice(),
-                    shared_state.counter_slots_by_id(),
-                    scalar_counter_data_id,
-                    top_value_counter_data_id,
                     Some(shared_state),
-                    instance_key,
-                    module_constant_symbol_prefix_for_shared_state(shared_state),
-                    Some(direct_function_symbol_scope_for_shared_state(
-                        shared_state,
-                        function.function_id,
-                    )),
                 )
             } else {
-                let (counter_slots_by_id, scalar_counter_count, top_value_count) =
-                    build_counter_storage_layout(inputs.counter_defs)?;
-                let instance_key =
-                    inputs.module as *const BlockPyModule<CodegenModuleShape> as usize;
-                let scalar_counter_data_id = self.ensure_local_scalar_counter_storage(
-                    jit_module,
-                    inputs.module,
-                    scalar_counter_count,
-                    instance_key,
-                )?;
-                let top_value_counter_data_id = self.ensure_local_top_value_counter_storage(
-                    jit_module,
-                    inputs.module,
-                    top_value_count,
-                    instance_key,
-                )?;
-                owned_counter_slots_by_id = counter_slots_by_id;
                 (
                     inputs.module,
                     inputs.module_constants,
                     inputs.counter_defs,
-                    inputs.module_constant_ptrs,
-                    owned_counter_slots_by_id.as_ref(),
-                    scalar_counter_data_id,
-                    top_value_counter_data_id,
-                    None,
-                    instance_key,
-                    module_constant_symbol_prefix_for_instance(inputs.module, instance_key),
                     None,
                 )
             };
-            let function_module_constant_object_data_ids = self.ensure_module_constant_objects(
-                jit_module,
-                function_module_constant_ptrs,
-                function_module_constant_binding_key,
-                function_module_constant_symbol_prefix.as_str(),
-            )?;
+            let function_module_constant_binding_key = reserved_inputs.module_constant_binding_key;
             if !jit_plan_cache.contains_key(&function_module_constant_binding_key) {
                 let value_facts = infer_jit_value_facts(function_module);
                 let jit_module_local_plan = plan_jit_module_locals(function_module, &value_facts)?;
@@ -1726,7 +1763,7 @@ impl ProcessJitState {
             let function_deopt_table = Arc::new(RuntimeJitDeoptTable::from_plan(
                 function,
                 function_jit_deopt_resume_plan,
-                function_module_constant_ptrs,
+                reserved_inputs.module_constant_ptrs.as_slice(),
             )?);
             let built = build_cranelift_run_bb_specialized_function(
                 jit_module,
@@ -1738,14 +1775,14 @@ impl ProcessJitState {
                 function_jit_deopt_resume_plan,
                 function_module_constants,
                 function_counter_defs,
-                function_module_constant_object_data_ids.as_slice(),
-                function_counter_slots_by_id,
-                function_scalar_counter_data_id,
-                function_top_value_counter_data_id,
+                reserved_inputs.module_constant_object_data_ids.as_slice(),
+                reserved_inputs.counter_slots_by_id.as_slice(),
+                reserved_inputs.scalar_counter_data_id,
+                reserved_inputs.top_value_counter_data_id,
                 inputs.session.as_ref(),
                 function_direct_call_resolver,
                 &SpecializationProfile::from_runtime_state(function_direct_call_resolver)?,
-                function_symbol_scope.as_deref(),
+                reserved_inputs.symbol_scope.as_deref(),
                 Some(&plan.predeclared),
                 BuildSpecializedFunctionOptions::default(),
             )
@@ -14755,28 +14792,44 @@ impl ProcessJitEngine {
             counter_defs,
             module_constant_ptrs,
         };
+        let plan = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| "process JIT state lock poisoned".to_string())?;
+            let mut jit_module = self.module.lock_for_serial_phase()?;
+            let _guard = ProcessJitCompileGuard::enter();
+            match state.reserve_direct_function_batch(
+                &mut jit_module,
+                &inputs,
+                function,
+                batch_functions,
+            )? {
+                ReservedDirectFunctionBatch::Ready(handle) => {
+                    return Ok(DirectFunctionCompileResult {
+                        handle,
+                        compiled: false,
+                        stats: None,
+                    });
+                }
+                ReservedDirectFunctionBatch::Reserved(plan) => plan,
+            }
+        };
+        let compiled_functions = {
+            let mut jit_module = self.module.lock_for_serial_phase()?;
+            let _guard = ProcessJitCompileGuard::enter();
+            ProcessJitState::compile_reserved_direct_function_batch(
+                &mut jit_module,
+                &inputs,
+                &plan,
+            )?
+        };
         let mut state = self
             .state
             .lock()
             .map_err(|_| "process JIT state lock poisoned".to_string())?;
         let mut jit_module = self.module.lock_for_serial_phase()?;
         let _guard = ProcessJitCompileGuard::enter();
-        let plan = match state.reserve_direct_function_batch(
-            &mut jit_module,
-            function,
-            batch_functions,
-        )? {
-            ReservedDirectFunctionBatch::Ready(handle) => {
-                return Ok(DirectFunctionCompileResult {
-                    handle,
-                    compiled: false,
-                    stats: None,
-                });
-            }
-            ReservedDirectFunctionBatch::Reserved(plan) => plan,
-        };
-        let compiled_functions =
-            state.compile_reserved_direct_function_batch(&mut jit_module, &inputs, &plan)?;
         state.commit_compiled_direct_function_batch(
             &mut jit_module,
             session,
