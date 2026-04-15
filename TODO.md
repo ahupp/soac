@@ -3,14 +3,10 @@
 
  * Complete migration of ast-to-instr pass
  * Clean up the instruction metadata passing cruft so metadata ownership and propagation are explicit instead of threaded ad hoc through lowering helpers.
- * Decide how much codegen should depend on known imports versus relying only on specialization feedback for cross-module assumptions.
  * If caching BlockPy before codegen, recover FunctionNameGen.next_tmp_id from generated `_dp_*` names.
- * Revisit Cranelift compile caching by relocating constant values instead of embedding per-run object/counter pointers in CLIF.
  * Add mutation watchers for `f.__defaults__` and `f.__kwdefaults__` so direct/JIT default slots stay fresh after in-place edits.
  * Simplify class-cell capture by unconditionally treating `super()` as capturing `__class__`.
- * Consider moving `LocalEnvEntry` construction into a name-binding-like BlockPy pass so local ownership/storage entries are decided before JIT codegen.
  * Treat `exec` as a keyword explicitly instead of handling it as a runtime helper name.
- * Consolidate the bootstrap module in `build_soac_runtime_bootstrap_module` with `runtime.py`.
  * Review stable identifiers for modules, functions, types, and pyc-to-function mapping.
  * Replace the function-instantiation fallback for `co_freevars`/capture mismatches with a cleaner explicit closure entry/code-object alignment.
  * Track slow CPython fast-suite cases that pass with longer timeouts, including `test_dataclasses` and `test_bytes -m test_count`.
@@ -19,6 +15,7 @@
 ## Perf-to-investigate
 
  * Statically linking against libpython.a
+ * Decide how much codegen should depend on known imports versus relying only on specialization feedback for cross-module assumptions.
 
  * Value tracing (types, escape analysis)
    * If a local is always set, skip unbound checks
@@ -74,3 +71,6 @@
 - Compute `ClosureLayout` in `name_binding`, and keep all closure data semantic before that.
 - Add a pass for specific storage decisions, closure slot offsets, and stack offsets.
 - Use Ruff for scope analysis and see if it can be computed once and preserved through transform layers.
+- Consolidate the bootstrap module in `build_soac_runtime_bootstrap_module` with `runtime.py`.
+- Consider moving `LocalEnvEntry` construction into a name-binding-like BlockPy pass so local ownership/storage entries are decided before JIT codegen.
+- Revisit Cranelift compile caching by relocating constant values instead of embedding per-run object/counter pointers in CLIF.
