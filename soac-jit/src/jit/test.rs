@@ -1021,6 +1021,257 @@ def needs_arg(value):
     }
 
     #[test]
+    fn blockpy_entry_interpreter_binds_positional_defaults_from_function_data() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| unsafe {
+            let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+                r#"
+def add_default(left, right=9):
+    return left + right
+"#,
+            )
+            .expect("lowering entry interpreter default source should succeed")
+            .codegen_module;
+            let shared_state =
+                crate::module_type::build_shared_state_for_testing(py, lowered, "entry_test", "")
+                    .expect("shared state should build for entry interpreter default test");
+            let function = shared_state
+                .lowered_module
+                .callable_defs
+                .iter()
+                .find(|function| function.names.bind_name == "add_default")
+                .expect("lowered module should contain add_default function");
+            let runtime_layout = FunctionRuntimeDataLayout::from_function(function);
+            let mut function_data =
+                vec![std::ptr::null_mut::<ffi::PyObject>(); runtime_layout.total_len()];
+            let default_slot = runtime_layout
+                .positional_default_slot_for_param_index(1)
+                .expect("right param should have a runtime default slot");
+            let default = ffi::PyLong_FromLong(9);
+            assert!(!default.is_null(), "test default allocation should succeed");
+            function_data[default_slot] = default;
+            let left = ffi::PyLong_FromLong(33);
+            assert!(!left.is_null(), "test left allocation should succeed");
+            let args = [left.cast::<c_void>()];
+            let module_constant_ptrs = shared_state
+                .module_constant_ptrs()
+                .into_iter()
+                .map(|ptr| ptr.cast::<c_void>())
+                .collect::<Vec<_>>();
+
+            let result = run_blockpy_function_from_entry(
+                function,
+                std::ptr::null_mut(),
+                function_data.as_mut_ptr().cast::<c_void>(),
+                module_constant_ptrs.as_slice(),
+                &args,
+            )
+            .expect("entry interpreter should bind missing positional arg from function data");
+
+            assert_eq!(
+                ffi::PyLong_AsLong(result.cast::<ffi::PyObject>()),
+                42,
+                "entry interpreter should use the runtime default for right"
+            );
+            assert!(
+                ffi::PyErr_Occurred().is_null(),
+                "successful entry interpreter run should not leave a Python exception"
+            );
+            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+            ffi::Py_DECREF(left);
+            ffi::Py_DECREF(default);
+        });
+    }
+
+    unsafe fn run_named_blockpy_entry_for_test(
+        py: Python<'_>,
+        source: &str,
+        function_name: &str,
+        globals_obj: ObjPtr,
+        positional_args: &[ObjPtr],
+    ) -> Result<ObjPtr, String> {
+        let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(source)
+            .map_err(|err| format!("lowering entry interpreter source failed: {err}"))?
+            .codegen_module;
+        let shared_state =
+            crate::module_type::build_shared_state_for_testing(py, lowered, "entry_test", "")
+                .map_err(|err| format!("building entry interpreter shared state failed: {err}"))?;
+        let function = shared_state
+            .lowered_module
+            .callable_defs
+            .iter()
+            .find(|function| function.names.bind_name == function_name)
+            .ok_or_else(|| format!("lowered module should contain function {function_name:?}"))?;
+        let module_constant_ptrs = shared_state
+            .module_constant_ptrs()
+            .into_iter()
+            .map(|ptr| ptr.cast::<c_void>())
+            .collect::<Vec<_>>();
+        unsafe {
+            run_blockpy_function_from_entry(
+                function,
+                globals_obj,
+                std::ptr::null_mut(),
+                module_constant_ptrs.as_slice(),
+                positional_args,
+            )
+        }
+    }
+
+    #[test]
+    fn blockpy_entry_interpreter_executes_local_store_and_tuple_return() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| unsafe {
+            let input = ffi::PyLong_FromLong(41);
+            assert!(!input.is_null(), "test input allocation should succeed");
+            let args = [input.cast::<c_void>()];
+            let result = run_named_blockpy_entry_for_test(
+                py,
+                r#"
+def build(value):
+    next_value = value + 1
+    return (next_value, value)
+"#,
+                "build",
+                std::ptr::null_mut(),
+                &args,
+            )
+            .expect("entry interpreter should execute local store and tuple return");
+
+            assert_eq!(
+                ffi::PyTuple_Size(result.cast::<ffi::PyObject>()),
+                2,
+                "entry interpreter should return a 2-tuple"
+            );
+            let first = ffi::PyTuple_GetItem(result.cast::<ffi::PyObject>(), 0);
+            let second = ffi::PyTuple_GetItem(result.cast::<ffi::PyObject>(), 1);
+            assert_eq!(
+                ffi::PyLong_AsLong(first),
+                42,
+                "entry interpreter should store and return the computed local"
+            );
+            assert_eq!(
+                ffi::PyLong_AsLong(second),
+                41,
+                "entry interpreter should preserve the original arg local"
+            );
+            assert!(
+                ffi::PyErr_Occurred().is_null(),
+                "successful entry interpreter run should not leave a Python exception"
+            );
+            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+            ffi::Py_DECREF(input);
+        });
+    }
+
+    #[test]
+    fn blockpy_entry_interpreter_executes_branch_and_global_load() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| unsafe {
+            let globals = ffi::PyDict_New();
+            assert!(!globals.is_null(), "test globals allocation should succeed");
+            let value = ffi::PyLong_FromLong(40);
+            assert!(
+                !value.is_null(),
+                "test global value allocation should succeed"
+            );
+            assert_eq!(
+                ffi::PyDict_SetItemString(globals, c"VALUE".as_ptr(), value),
+                0,
+                "test global value should insert"
+            );
+            let flag = ffi::PyBool_FromLong(1);
+            assert!(!flag.is_null(), "test flag allocation should succeed");
+            let args = [flag.cast::<c_void>()];
+            let result = run_named_blockpy_entry_for_test(
+                py,
+                r#"
+def choose(flag):
+    if flag:
+        return VALUE + 2
+    return 5
+"#,
+                "choose",
+                globals.cast(),
+                &args,
+            )
+            .expect("entry interpreter should execute branch and global load");
+
+            assert_eq!(
+                ffi::PyLong_AsLong(result.cast::<ffi::PyObject>()),
+                42,
+                "entry interpreter should take the true branch and load VALUE from globals"
+            );
+            assert!(
+                ffi::PyErr_Occurred().is_null(),
+                "successful entry interpreter run should not leave a Python exception"
+            );
+            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+            ffi::Py_DECREF(flag);
+            ffi::Py_DECREF(value);
+            ffi::Py_DECREF(globals);
+        });
+    }
+
+    #[test]
+    fn blockpy_entry_interpreter_executes_global_keyword_call() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| unsafe {
+            let helper_module = PyModule::from_code(
+                py,
+                c"
+def helper(value, scale=1):
+    return value * scale + 7
+",
+                c"entry_helper.py",
+                c"entry_helper",
+            )
+            .expect("helper module should execute");
+            let helper = helper_module
+                .getattr("helper")
+                .expect("helper function should exist");
+            let globals = ffi::PyDict_New();
+            assert!(!globals.is_null(), "test globals allocation should succeed");
+            assert_eq!(
+                ffi::PyDict_SetItemString(globals, c"helper".as_ptr(), helper.as_ptr()),
+                0,
+                "helper should insert into globals"
+            );
+            let input = ffi::PyLong_FromLong(11);
+            assert!(!input.is_null(), "test input allocation should succeed");
+            let args = [input.cast::<c_void>()];
+            let result = run_named_blockpy_entry_for_test(
+                py,
+                r#"
+def call_helper(value):
+    return helper(value, scale=3)
+"#,
+                "call_helper",
+                globals.cast(),
+                &args,
+            )
+            .expect("entry interpreter should execute global keyword call");
+
+            assert_eq!(
+                ffi::PyLong_AsLong(result.cast::<ffi::PyObject>()),
+                40,
+                "entry interpreter should call the global helper with a keyword"
+            );
+            assert!(
+                ffi::PyErr_Occurred().is_null(),
+                "successful entry interpreter run should not leave a Python exception"
+            );
+            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+            ffi::Py_DECREF(input);
+            ffi::Py_DECREF(globals);
+        });
+    }
+
+    #[test]
     fn stored_local_binding_facts_only_require_checks_for_unbound_values() {
         assert_eq!(
             local_binding_facts_for_stored_value(LocalRefKind::Owned),

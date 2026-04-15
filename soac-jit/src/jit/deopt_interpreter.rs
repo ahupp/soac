@@ -57,7 +57,8 @@ pub(crate) unsafe fn run_blockpy_function_from_entry(
     module_constant_ptrs: &[ObjPtr],
     positional_args: &[ObjPtr],
 ) -> Result<ObjPtr, String> {
-    let (bindings, values) = unsafe { build_entry_local_bindings(function, positional_args)? };
+    let (bindings, values) =
+        unsafe { build_entry_local_bindings(function, function_data_obj, positional_args)? };
     let locals = match RuntimeJitDeoptLocals::from_live_bindings(
         bindings.iter().zip(values.iter().copied()),
     ) {
@@ -163,6 +164,7 @@ impl<'inv, 'data> BlockPyFrameSource<'inv, 'data> {
 #[allow(dead_code)]
 unsafe fn build_entry_local_bindings(
     function: &BlockPyFunction<CodegenModuleShape>,
+    function_data_obj: ObjPtr,
     positional_args: &[ObjPtr],
 ) -> Result<(Vec<LocalEnvResumeBinding>, Vec<ObjPtr>), String> {
     let layout = function.storage_layout.as_ref().ok_or_else(|| {
@@ -192,42 +194,16 @@ unsafe fn build_entry_local_bindings(
     let positional_params = function
         .params
         .iter()
-        .filter(|param| matches!(param.kind, ParamKind::PosOnly | ParamKind::Any))
+        .enumerate()
+        .filter(|(_, param)| matches!(param.kind, ParamKind::PosOnly | ParamKind::Any))
         .collect::<Vec<_>>();
-    if positional_args.len() != positional_params.len() {
-        if positional_args.len() < positional_params.len() {
-            let missing = positional_params[positional_args.len()..]
-                .iter()
-                .map(|param| param.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let defaults_note = if positional_params[positional_args.len()..]
-                .iter()
-                .any(|param| param.has_default)
-            {
-                "; default binding is not implemented"
-            } else {
-                ""
-            };
-            return Err(format!(
-                "entry interpreter missing positional args for function {}: {}{}",
-                function.function_id, missing, defaults_note
-            ));
-        }
+    if positional_args.len() > positional_params.len() {
         return Err(format!(
             "entry interpreter got {} positional args for function {} with {} positional params",
             positional_args.len(),
             function.function_id,
             positional_params.len()
         ));
-    }
-    for (index, arg) in positional_args.iter().enumerate() {
-        if arg.is_null() {
-            return Err(format!(
-                "entry interpreter got null positional arg {index} for function {}",
-                function.function_id
-            ));
-        }
     }
 
     let mut slot_by_name = HashMap::new();
@@ -245,7 +221,7 @@ unsafe fn build_entry_local_bindings(
             ));
         }
     }
-    for param in &positional_params {
+    for (_, param) in &positional_params {
         if !slot_by_name.contains_key(param.name.as_str()) {
             return Err(format!(
                 "entry interpreter expected positional param {:?} in stack slots for function {}",
@@ -254,19 +230,47 @@ unsafe fn build_entry_local_bindings(
         }
     }
 
-    let arg_by_name = positional_params
-        .iter()
-        .zip(positional_args.iter().copied())
-        .map(|(param, arg)| (param.name.as_str(), arg))
-        .collect::<HashMap<_, _>>();
+    let runtime_layout = FunctionRuntimeDataLayout::from_function(function);
+    let mut arg_by_name = HashMap::new();
+    let mut missing_required_args = Vec::new();
+    for (positional_index, (param_index, param)) in positional_params.iter().copied().enumerate() {
+        let provided = positional_args
+            .get(positional_index)
+            .copied()
+            .filter(|arg| !arg.is_null());
+        let arg = match provided {
+            Some(arg) => {
+                unsafe {
+                    ffi::Py_INCREF(arg.cast::<ffi::PyObject>());
+                }
+                Some(arg)
+            }
+            None => unsafe {
+                load_entry_default_arg_owned(&runtime_layout, function_data_obj, param_index)?
+            },
+        };
+        if let Some(arg) = arg {
+            arg_by_name.insert(param.name.as_str(), arg);
+        } else {
+            missing_required_args.push(param.name.as_str());
+        }
+    }
+    if !missing_required_args.is_empty() {
+        unsafe {
+            release_owned_values(arg_by_name.values().copied().collect());
+        }
+        return Err(format!(
+            "entry interpreter missing positional args for function {}: {}",
+            function.function_id,
+            missing_required_args.join(", ")
+        ));
+    }
+
     let mut bindings = Vec::with_capacity(layout.stack_slots().len());
     let mut values = Vec::with_capacity(layout.stack_slots().len());
     for (slot, name) in layout.stack_slots().iter().enumerate() {
         let location = LocalLocation(u32::try_from(slot).expect("slot was validated above"));
         if let Some(arg) = arg_by_name.get(name.as_str()).copied() {
-            unsafe {
-                ffi::Py_INCREF(arg.cast::<ffi::PyObject>());
-            }
             bindings.push(LocalEnvResumeBinding {
                 name: name.clone(),
                 location,
@@ -289,6 +293,29 @@ unsafe fn build_entry_local_bindings(
         }
     }
     Ok((bindings, values))
+}
+
+#[cold]
+unsafe fn load_entry_default_arg_owned(
+    runtime_layout: &FunctionRuntimeDataLayout,
+    function_data_obj: ObjPtr,
+    param_index: usize,
+) -> Result<Option<ObjPtr>, String> {
+    let Some(default_slot) = runtime_layout.positional_default_slot_for_param_index(param_index)
+    else {
+        return Ok(None);
+    };
+    if function_data_obj.is_null() {
+        return Ok(None);
+    }
+    let value = unsafe { *function_data_obj.cast::<ObjPtr>().add(default_slot) };
+    if value.is_null() {
+        return Ok(None);
+    }
+    unsafe {
+        ffi::Py_INCREF(value.cast::<ffi::PyObject>());
+    }
+    Ok(Some(value))
 }
 
 #[allow(dead_code)]
