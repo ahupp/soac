@@ -1,5 +1,9 @@
 import pytest
 
+FRAME_SENSITIVE_BUILTINS_XFAIL = (
+    "frame-sensitive locals()/vars()/dir()/eval()/exec() behavior is not supported"
+)
+
 def test_exec_accepts_globals_keyword(run_integration_module):
     with run_integration_module("exec_globals_kw") as module:
         with pytest.raises(
@@ -17,9 +21,6 @@ def test_exec_accepts_locals_keyword(run_integration_module):
 
 
 def test_exec_accepts_closure_keyword(run_integration_module):
-    pytest.xfail(
-        "SOAC-loaded functions wrap lowered functions with synthetic entry parameters; "
-        "exec(code, ..., closure=...) is not yet compatible"
-    )
+    pytest.xfail(FRAME_SENSITIVE_BUILTINS_XFAIL)
     with run_integration_module("exec_closure_kw") as module:
         assert module.run() == 2

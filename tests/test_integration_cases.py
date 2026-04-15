@@ -12,6 +12,9 @@ from tests._integration import (
 )
 
 MODULES_DIR = Path(__file__).resolve().parent / "integration_modules"
+FRAME_SENSITIVE_BUILTINS_XFAIL = (
+    "frame-sensitive locals()/vars()/dir()/eval()/exec() behavior is not supported"
+)
 
 
 def _case_paths() -> list[Path]:
@@ -50,7 +53,7 @@ def test_integration_case(tmp_path: Path, case_path: Path, mode: str) -> None:
         "named_expression_locals_unbound",
         "scope_locals",
     }:
-        pytest.xfail("scope-aware builtin rewriting has been removed")
+        pytest.xfail(FRAME_SENSITIVE_BUILTINS_XFAIL)
     if mode in {"soac", "entry"} and case_path.stem in {
         "builtin_dynamic_global_shadow",
     }:

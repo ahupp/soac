@@ -1,5 +1,9 @@
 import pytest
 
+FRAME_SENSITIVE_BUILTINS_XFAIL = (
+    "frame-sensitive locals()/vars()/dir()/eval()/exec() behavior is not supported"
+)
+
 def test_dictcomp_helper_preserves_result_container(run_integration_module):
     with run_integration_module("dictcomp_temp_collision") as module:
         assert module.dict_comp_fib() == {
@@ -13,6 +17,6 @@ def test_dictcomp_helper_preserves_result_container(run_integration_module):
 
 
 def test_dictcomp_helper_works_in_class_namespace(run_integration_module):
-    pytest.xfail("scope-aware builtin rewriting has been removed")
+    pytest.xfail(FRAME_SENSITIVE_BUILTINS_XFAIL)
     with run_integration_module("dictcomp_temp_collision_class") as module:
         assert [member.name for member in module.Foo] == ["FOO_CAT", "FOO_HORSE"]
