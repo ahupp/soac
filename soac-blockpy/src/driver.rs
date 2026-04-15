@@ -1,6 +1,9 @@
 use crate::block_py::pretty::BlockPyPrettyPrint;
 use crate::block_py::{BlockPyModule, CounterScope, ModuleNameGen};
-use crate::codegen_cache::{load_codegen_module_cache, store_codegen_module_cache};
+use crate::codegen_cache::{
+    load_codegen_module_cache, remap_cached_codegen_module_function_ids,
+    store_codegen_module_cache, CachedCodegenModule, CachedPreparedCodegen,
+};
 use crate::env_config::SoacEnvConfig;
 use crate::pass_tracker::PassTracker;
 use crate::passes::ast_to_ast::ast_rewrite::rewrite_with_pass;
@@ -33,6 +36,12 @@ pub(crate) struct AstToAstPassResult {
 pub struct LoweringOptions {
     pub runtime_names_as_globals: bool,
     pub pre_optimization_cache_path: Option<PathBuf>,
+}
+
+struct PreOptimizationModule {
+    module: BlockPyModule<CodegenModuleShape>,
+    prepared: Option<CachedPreparedCodegen>,
+    cache_path_for_store: Option<PathBuf>,
 }
 
 impl BlockPyPrettyPrint for AstToAstPassResult {
@@ -85,9 +94,9 @@ pub(crate) fn rewrite_module_with_tracker_with_options(
     options: LoweringOptions,
     env_config: &SoacEnvConfig,
 ) -> Result<BlockPyModule<CodegenModuleShape>> {
-    let bb_codegen =
+    let pre_optimization =
         rewrite_pre_optimization_module_with_cache(source, module_name_gen, pass_tracker, options)?;
-    finish_codegen_module_with_tracker(bb_codegen, pass_tracker, env_config)
+    finish_codegen_module_with_tracker(pre_optimization, pass_tracker, env_config)
 }
 
 fn rewrite_pre_optimization_module_with_cache(
@@ -95,7 +104,7 @@ fn rewrite_pre_optimization_module_with_cache(
     module_name_gen: ModuleNameGen,
     pass_tracker: &mut impl PassTracker,
     options: LoweringOptions,
-) -> Result<BlockPyModule<CodegenModuleShape>> {
+) -> Result<PreOptimizationModule> {
     if let Some(cache_path) = &options.pre_optimization_cache_path {
         let cache_exists =
             pass_tracker.record_timing("bb_codegen_cache_lookup", || cache_path.is_file());
@@ -104,19 +113,23 @@ fn rewrite_pre_optimization_module_with_cache(
                 load_codegen_module_cache(cache_path)
             });
             match loaded {
-                Ok(mut module) => {
-                    crate::codegen_cache::remap_codegen_module_function_ids(
-                        &mut module,
-                        module_name_gen,
-                    );
+                Ok(mut cache) => {
+                    remap_cached_codegen_module_function_ids(&mut cache, module_name_gen);
+                    let has_prepared = cache.prepared.is_some();
                     info!(
                         target: "soac_blockpy_module_cache",
                         event = "soac.blockpy_module_cache",
                         cache_hit = true,
+                        prepared = has_prepared,
                         path = %cache_path.display(),
                         "blockpy_module_cache_hit",
                     );
-                    return Ok(pass_tracker.run_pass("bb_codegen", || module));
+                    let CachedCodegenModule { module, prepared } = cache;
+                    return Ok(PreOptimizationModule {
+                        module: pass_tracker.run_pass("bb_codegen", || module),
+                        prepared,
+                        cache_path_for_store: None,
+                    });
                 }
                 Err(err) => {
                     warn!(
@@ -145,15 +158,23 @@ fn rewrite_pre_optimization_module_with_cache(
             pass_tracker,
             options.runtime_names_as_globals,
         )?;
-        store_pre_optimization_cache(cache_path, &module, pass_tracker);
-        Ok(module)
+        Ok(PreOptimizationModule {
+            module,
+            prepared: None,
+            cache_path_for_store: Some(cache_path.clone()),
+        })
     } else {
-        rewrite_pre_optimization_module_from_source(
+        let module = rewrite_pre_optimization_module_from_source(
             source,
             module_name_gen,
             pass_tracker,
             options.runtime_names_as_globals,
-        )
+        )?;
+        Ok(PreOptimizationModule {
+            module,
+            prepared: None,
+            cache_path_for_store: None,
+        })
     }
 }
 
@@ -293,10 +314,11 @@ fn rewrite_pre_optimization_module_from_source(
 fn store_pre_optimization_cache(
     cache_path: &Path,
     module: &BlockPyModule<CodegenModuleShape>,
+    prepared: &CachedPreparedCodegen,
     pass_tracker: &mut impl PassTracker,
 ) {
     let stored = pass_tracker.record_timing("bb_codegen_cache_store", || {
-        store_codegen_module_cache(cache_path, module)
+        store_codegen_module_cache(cache_path, module, Some(prepared))
     });
     match stored {
         Ok(()) => {
@@ -320,45 +342,69 @@ fn store_pre_optimization_cache(
 }
 
 fn finish_codegen_module_with_tracker(
-    bb_codegen: BlockPyModule<CodegenModuleShape>,
+    pre_optimization: PreOptimizationModule,
     pass_tracker: &mut impl PassTracker,
     env_config: &SoacEnvConfig,
 ) -> Result<BlockPyModule<CodegenModuleShape>> {
+    let PreOptimizationModule {
+        module: bb_codegen,
+        prepared,
+        cache_path_for_store,
+    } = pre_optimization;
     pass_tracker.record_timing("validate_codegen_instr_ids", || {
         passes::validate_codegen_instr_ids(&bb_codegen).map_err(anyhow::Error::msg)
     })?;
-    let value_facts: passes::FactStore = pass_tracker.record_timing("value_facts", || {
-        passes::infer_module_value_facts(&bb_codegen)
-    });
-    let ownership_plan: passes::RefcountPlan = pass_tracker
-        .record_timing("ownership_effects", || {
-            passes::plan_ownership_effects(&bb_codegen, &value_facts)
+    let prepared = if let Some(prepared) = prepared {
+        pass_tracker.record_timing("prepared_codegen_cache_use", || prepared)
+    } else {
+        let value_facts: passes::FactStore = pass_tracker.record_timing("value_facts", || {
+            passes::infer_module_value_facts(&bb_codegen)
         });
-    pass_tracker.record_timing("validate_ownership_effects", || {
-        passes::validate_ownership_effects(&bb_codegen, &value_facts, &ownership_plan)
+        let ownership_plan: passes::RefcountPlan = pass_tracker
+            .record_timing("ownership_effects", || {
+                passes::plan_ownership_effects(&bb_codegen, &value_facts)
+            });
+        pass_tracker.record_timing("validate_ownership_effects", || {
+            passes::validate_ownership_effects(&bb_codegen, &value_facts, &ownership_plan)
+                .map_err(anyhow::Error::msg)
+        })?;
+        let local_env_plan: passes::LocalEnvModulePlan = pass_tracker
+            .record_timing("local_env_plan", || {
+                passes::plan_local_env_module(&bb_codegen, &value_facts)
+            });
+        pass_tracker.record_timing("validate_local_env_plan", || {
+            passes::validate_local_env_module_plan(&bb_codegen, &value_facts, &local_env_plan)
+                .map_err(anyhow::Error::msg)
+        })?;
+        let local_env_resume_plan: passes::LocalEnvResumeModulePlan = pass_tracker
+            .record_timing("local_env_resume_plan", || {
+                passes::plan_local_env_resume_module(&bb_codegen, &local_env_plan, &value_facts)
+            });
+        pass_tracker.record_timing("validate_local_env_resume_plan", || {
+            passes::validate_local_env_resume_module_plan(
+                &bb_codegen,
+                &local_env_plan,
+                &value_facts,
+                &local_env_resume_plan,
+            )
             .map_err(anyhow::Error::msg)
-    })?;
-    let local_env_plan: passes::LocalEnvModulePlan = pass_tracker
-        .record_timing("local_env_plan", || {
-            passes::plan_local_env_module(&bb_codegen, &value_facts)
-        });
-    pass_tracker.record_timing("validate_local_env_plan", || {
-        passes::validate_local_env_module_plan(&bb_codegen, &value_facts, &local_env_plan)
-            .map_err(anyhow::Error::msg)
-    })?;
-    let local_env_resume_plan: passes::LocalEnvResumeModulePlan = pass_tracker
-        .record_timing("local_env_resume_plan", || {
-            passes::plan_local_env_resume_module(&bb_codegen, &local_env_plan, &value_facts)
-        });
-    pass_tracker.record_timing("validate_local_env_resume_plan", || {
-        passes::validate_local_env_resume_module_plan(
-            &bb_codegen,
-            &local_env_plan,
-            &value_facts,
-            &local_env_resume_plan,
-        )
-        .map_err(anyhow::Error::msg)
-    })?;
+        })?;
+        CachedPreparedCodegen {
+            value_facts,
+            ownership_plan,
+            local_env_plan,
+            local_env_resume_plan,
+        }
+    };
+
+    if let Some(cache_path) = &cache_path_for_store {
+        store_pre_optimization_cache(cache_path, &bb_codegen, &prepared, pass_tracker);
+    }
+
+    let CachedPreparedCodegen {
+        local_env_resume_plan,
+        ..
+    } = prepared;
 
     let bb_traced: BlockPyModule<CodegenModuleShape> =
         if let Some(config) = passes::parse_trace_env(env_config) {

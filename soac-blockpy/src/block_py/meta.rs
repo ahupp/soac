@@ -16,6 +16,7 @@ use std::fmt;
     rkyv::Serialize,
     rkyv::Deserialize,
 )]
+#[rkyv(derive(Hash, PartialEq, Eq, Debug))]
 pub struct InstrId {
     block_label: BlockLabel,
     instr_index_in_block: u32,
@@ -57,6 +58,7 @@ impl fmt::Display for InstrId {
     rkyv::Serialize,
     rkyv::Deserialize,
 )]
+#[rkyv(derive(Hash, PartialEq, Eq, Debug))]
 pub struct InstrKey {
     pub function_id: FunctionId,
     pub instr_id: InstrId,

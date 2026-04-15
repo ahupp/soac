@@ -76,6 +76,7 @@ fn is_internal_symbol(name: &str) -> bool {
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
+#[rkyv(derive(Hash, PartialEq, Eq, Debug))]
 pub struct LocalLocation(pub u32);
 
 impl LocalLocation {
@@ -87,6 +88,7 @@ impl LocalLocation {
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
+#[rkyv(derive(Hash, PartialEq, Eq, Debug))]
 pub struct GlobalSlot(pub u32);
 
 impl GlobalSlot {

@@ -15,6 +15,7 @@ use std::sync::Arc;
     rkyv::Serialize,
     rkyv::Deserialize,
 )]
+#[rkyv(derive(Hash, PartialEq, Eq, Debug))]
 pub struct FunctionId(u64);
 
 impl FunctionId {
@@ -70,6 +71,7 @@ impl fmt::Display for FunctionId {
     rkyv::Serialize,
     rkyv::Deserialize,
 )]
+#[rkyv(derive(Hash, PartialEq, Eq, Debug))]
 pub struct BlockLabel {
     index: u32,
 }

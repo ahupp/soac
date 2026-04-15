@@ -16,7 +16,7 @@ use crate::passes::{CodegenModuleShape, FactStore, PyObjFacts};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum LocalRefKind {
     Unknown,
     Owned,
@@ -25,13 +25,13 @@ pub enum LocalRefKind {
     Unbound,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum PlannedLocalStorage {
     BlockParam,
     StackSlot,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum ParamBindingFacts {
     DefinitelyBound,
     CheckedLocalValue,
@@ -44,7 +44,7 @@ impl ParamBindingFacts {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum ParamProvenance {
     ExplicitBlockParam(LocalLocation),
     ForwardedLocal(LocalLocation),
@@ -52,7 +52,7 @@ pub enum ParamProvenance {
     StackSlot(LocalLocation),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct BlockParamFacts {
     pub value: Option<PyObjFacts>,
     pub binding: ParamBindingFacts,
@@ -60,7 +60,7 @@ pub struct BlockParamFacts {
     pub ownership: LocalRefKind,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct PlannedLocalBinding {
     pub name: String,
     pub location: LocalLocation,
@@ -68,7 +68,7 @@ pub struct PlannedLocalBinding {
     pub param_facts: BlockParamFacts,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct BlockLocalPlan {
     pub label: BlockLabel,
     pub entry_locals: Vec<PlannedLocalBinding>,
@@ -93,7 +93,9 @@ impl BlockLocalPlan {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(
+    Clone, Debug, Default, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct FunctionLocalPlan {
     pub blocks: HashMap<BlockLabel, BlockLocalPlan>,
 }
@@ -104,7 +106,9 @@ impl FunctionLocalPlan {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(
+    Clone, Debug, Default, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct LocalEnvModulePlan {
     pub functions: HashMap<FunctionId, FunctionLocalPlan>,
 }
@@ -112,6 +116,13 @@ pub struct LocalEnvModulePlan {
 impl LocalEnvModulePlan {
     pub fn function(&self, function_id: FunctionId) -> Option<&FunctionLocalPlan> {
         self.functions.get(&function_id)
+    }
+
+    pub fn remap_function_ids(&mut self, remap: impl Fn(FunctionId) -> FunctionId + Copy) {
+        self.functions = std::mem::take(&mut self.functions)
+            .into_iter()
+            .map(|(function_id, plan)| (remap(function_id), plan))
+            .collect();
     }
 
     pub fn validate_for_module(
@@ -123,7 +134,7 @@ impl LocalEnvModulePlan {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum LocalEnvResumeStatePrecision {
     /// The resume record contains the LocalEnv entries that are valid at the
     /// containing block's entry. This is sufficient for block-entry resume
@@ -134,7 +145,7 @@ pub enum LocalEnvResumeStatePrecision {
     InstructionBoundary,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum LocalEnvResumePoint {
     BlockEntry {
         function_id: FunctionId,
@@ -165,9 +176,20 @@ impl LocalEnvResumePoint {
             Self::BeforeInstr { key } => key.instr_id.block_label(),
         }
     }
+
+    pub fn remap_function_ids(&mut self, remap: impl Fn(FunctionId) -> FunctionId + Copy) {
+        match self {
+            Self::BlockEntry { function_id, .. } | Self::BeforeTerm { function_id, .. } => {
+                *function_id = remap(*function_id);
+            }
+            Self::BeforeInstr { key } => {
+                key.function_id = remap(key.function_id);
+            }
+        }
+    }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct LocalEnvResumeEntry {
     pub point: LocalEnvResumePoint,
     pub precision: LocalEnvResumeStatePrecision,
@@ -186,14 +208,14 @@ impl LocalEnvResumeEntry {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum LocalEnvResumeBindingState {
     Bound,
     MaybeUnbound,
     Unbound,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum LocalEnvResumeValueSource {
     BlockParam(LocalLocation),
     StackSlot(LocalLocation),
@@ -202,7 +224,15 @@ pub enum LocalEnvResumeValueSource {
     Unknown,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+impl LocalEnvResumeValueSource {
+    pub fn remap_function_ids(&mut self, remap: impl Fn(FunctionId) -> FunctionId + Copy) {
+        if let Self::StoredValue(key) = self {
+            key.function_id = remap(key.function_id);
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct LocalEnvResumeBinding {
     pub name: String,
     pub location: LocalLocation,
@@ -212,7 +242,9 @@ pub struct LocalEnvResumeBinding {
     pub value: Option<PyObjFacts>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(
+    Clone, Debug, Default, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct FunctionLocalEnvResumePlan {
     pub entries: Vec<LocalEnvResumeEntry>,
 }
@@ -250,9 +282,20 @@ impl FunctionLocalEnvResumePlan {
             .iter()
             .filter(move |entry| entry.point.block_label() == block)
     }
+
+    pub fn remap_function_ids(&mut self, remap: impl Fn(FunctionId) -> FunctionId + Copy) {
+        for entry in &mut self.entries {
+            entry.point.remap_function_ids(remap);
+            for binding in &mut entry.locals {
+                binding.source.remap_function_ids(remap);
+            }
+        }
+    }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(
+    Clone, Debug, Default, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct LocalEnvResumeModulePlan {
     pub functions: HashMap<FunctionId, FunctionLocalEnvResumePlan>,
 }
@@ -260,6 +303,16 @@ pub struct LocalEnvResumeModulePlan {
 impl LocalEnvResumeModulePlan {
     pub fn function(&self, function_id: FunctionId) -> Option<&FunctionLocalEnvResumePlan> {
         self.functions.get(&function_id)
+    }
+
+    pub fn remap_function_ids(&mut self, remap: impl Fn(FunctionId) -> FunctionId + Copy) {
+        self.functions = std::mem::take(&mut self.functions)
+            .into_iter()
+            .map(|(function_id, mut plan)| {
+                plan.remap_function_ids(remap);
+                (remap(function_id), plan)
+            })
+            .collect();
     }
 
     pub fn entry(&self, point: LocalEnvResumePoint) -> Option<&LocalEnvResumeEntry> {

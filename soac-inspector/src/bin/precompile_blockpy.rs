@@ -1,5 +1,7 @@
 use soac_blockpy::block_py::{FunctionId, ModuleNameGen};
-use soac_blockpy::codegen_cache::{load_codegen_module_cache, remap_codegen_module_function_ids};
+use soac_blockpy::codegen_cache::{
+    load_codegen_module_cache, remap_cached_codegen_module_function_ids,
+};
 use soac_jit::counter_dump::{CounterDumpFile, CounterDumpRecordView, CounterDumpRowView};
 use soac_jit::module_type::hash_module_source;
 use soac_jit::precompile_codegen_module_to_object_file;
@@ -114,11 +116,12 @@ fn run_with_args(args: impl IntoIterator<Item = OsString>) -> Result<(), String>
             &module_ref,
             args.build_identity.as_deref(),
         )?;
-        let mut module = load_codegen_module_cache(cache_path.as_path())
+        let mut cache = load_codegen_module_cache(cache_path.as_path())
             .map_err(|err| format!("failed to load {}: {err}", cache_path.display()))?;
         if let Some(module_id) = module_ref.module_id {
-            remap_codegen_module_function_ids(&mut module, ModuleNameGen::new(module_id));
+            remap_cached_codegen_module_function_ids(&mut cache, ModuleNameGen::new(module_id));
         }
+        let module = cache.module;
 
         let object_path = object_dir.join(object_file_name(&module_ref));
         let summary = precompile_codegen_module_to_object_file(

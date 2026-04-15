@@ -2,19 +2,45 @@ use crate::block_py::{
     walk_expr_mut, walk_module_mut, BlockPyFunction, BlockPyModule, CounterSite, FunctionId,
     FunctionNameGen, ModuleNameGen, VisitMut,
 };
-use crate::passes::{CodegenModuleShape, InstrCodegen};
+use crate::passes::{
+    CodegenModuleShape, FactStore, InstrCodegen, LocalEnvModulePlan, LocalEnvResumeModulePlan,
+    RefcountPlan,
+};
 use anyhow::{anyhow, Context, Result};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const CODEGEN_MODULE_CACHE_MAGIC: &[u8] = b"SOAC_BLOCKPY_CODEGEN_CACHE\0";
-const CODEGEN_MODULE_CACHE_FORMAT_VERSION: u32 = 1;
+const CODEGEN_MODULE_CACHE_FORMAT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PythonModuleCacheSource {
     Project,
     PythonStdlib,
+}
+
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct CachedPreparedCodegen {
+    pub value_facts: FactStore,
+    pub ownership_plan: RefcountPlan,
+    pub local_env_plan: LocalEnvModulePlan,
+    pub local_env_resume_plan: LocalEnvResumeModulePlan,
+}
+
+impl CachedPreparedCodegen {
+    pub fn remap_function_ids(&mut self, remap: impl Fn(FunctionId) -> FunctionId + Copy) {
+        self.value_facts.remap_function_ids(remap);
+        self.ownership_plan.remap_function_ids(remap);
+        self.local_env_plan.remap_function_ids(remap);
+        self.local_env_resume_plan.remap_function_ids(remap);
+    }
+}
+
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct CachedCodegenModule {
+    pub module: BlockPyModule<CodegenModuleShape>,
+    pub prepared: Option<CachedPreparedCodegen>,
 }
 
 impl PythonModuleCacheSource {
@@ -46,6 +72,7 @@ pub fn codegen_module_cache_key(source_hash: u64, build_identity: &str) -> Strin
 pub fn store_codegen_module_cache(
     path: impl AsRef<Path>,
     module: &BlockPyModule<CodegenModuleShape>,
+    prepared: Option<&CachedPreparedCodegen>,
 ) -> Result<()> {
     let path = path.as_ref();
     if let Some(parent) = non_empty_parent(path) {
@@ -53,7 +80,11 @@ pub fn store_codegen_module_cache(
             .with_context(|| format!("create BlockPy cache dir {}", parent.display()))?;
     }
 
-    let archive = rkyv::to_bytes::<rkyv::rancor::Error>(module)
+    let cache = CachedCodegenModule {
+        module: module.clone(),
+        prepared: prepared.cloned(),
+    };
+    let archive = rkyv::to_bytes::<rkyv::rancor::Error>(&cache)
         .map_err(|err| anyhow!("serialize BlockPy codegen module cache: {err}"))?;
     let temp_path = temp_cache_path(path);
 
@@ -81,22 +112,18 @@ pub fn store_codegen_module_cache(
     Ok(())
 }
 
-pub fn load_codegen_module_cache(
-    path: impl AsRef<Path>,
-) -> Result<BlockPyModule<CodegenModuleShape>> {
+pub fn load_codegen_module_cache(path: impl AsRef<Path>) -> Result<CachedCodegenModule> {
     let path = path.as_ref();
     let bytes = fs::read(path).with_context(|| format!("read BlockPy cache {}", path.display()))?;
     let archive = archive_bytes_from_cache_file(&bytes)
         .with_context(|| format!("decode BlockPy cache header {}", path.display()))?;
     let archive = aligned_archive_bytes(archive);
 
-    let mut module = rkyv::from_bytes::<BlockPyModule<CodegenModuleShape>, rkyv::rancor::Error>(
-        archive.as_ref(),
-    )
-    .map_err(|err| anyhow!("deserialize BlockPy codegen module cache: {err}"))?;
+    let mut cache = rkyv::from_bytes::<CachedCodegenModule, rkyv::rancor::Error>(archive.as_ref())
+        .map_err(|err| anyhow!("deserialize BlockPy codegen module cache: {err}"))?;
 
-    rehydrate_codegen_module_generators(&mut module);
-    Ok(module)
+    rehydrate_codegen_module_generators(&mut cache.module);
+    Ok(cache)
 }
 
 pub fn rehydrate_codegen_module_generators(module: &mut BlockPyModule<CodegenModuleShape>) {
@@ -110,8 +137,31 @@ pub fn remap_codegen_module_function_ids(
     module: &mut BlockPyModule<CodegenModuleShape>,
     module_name_gen: ModuleNameGen,
 ) {
-    let new_module_id = module_name_gen.module_id();
-    let mut remapper = FunctionIdRemapper { new_module_id };
+    remap_codegen_module_function_ids_with_remapper(
+        module,
+        FunctionIdRemapper {
+            new_module_id: module_name_gen.module_id(),
+        },
+    );
+}
+
+pub fn remap_cached_codegen_module_function_ids(
+    cache: &mut CachedCodegenModule,
+    module_name_gen: ModuleNameGen,
+) {
+    let remapper = FunctionIdRemapper {
+        new_module_id: module_name_gen.module_id(),
+    };
+    remap_codegen_module_function_ids_with_remapper(&mut cache.module, remapper);
+    if let Some(prepared) = &mut cache.prepared {
+        prepared.remap_function_ids(|function_id| remapper.remap(function_id));
+    }
+}
+
+fn remap_codegen_module_function_ids_with_remapper(
+    module: &mut BlockPyModule<CodegenModuleShape>,
+    mut remapper: FunctionIdRemapper,
+) {
     walk_module_mut(&mut remapper, module);
 
     for function in &mut module.callable_defs {
@@ -136,6 +186,7 @@ pub fn remap_codegen_module_function_ids(
     module.module_name_gen = recovered_module_name_gen(module);
 }
 
+#[derive(Clone, Copy)]
 struct FunctionIdRemapper {
     new_module_id: u32,
 }
@@ -291,14 +342,15 @@ fn temp_cache_path(path: &Path) -> PathBuf {
 mod test {
     use super::{
         codegen_module_cache_key, codegen_module_cache_path, load_codegen_module_cache,
-        remap_codegen_module_function_ids, store_codegen_module_cache, PythonModuleCacheSource,
+        remap_cached_codegen_module_function_ids, remap_codegen_module_function_ids,
+        store_codegen_module_cache, CachedPreparedCodegen, PythonModuleCacheSource,
     };
     use crate::block_py::{
         walk_block, walk_expr, BlockPyModule, ChildVisitable, FunctionId, HasSemanticInstrId,
         InstrCodegen, ModuleNameGen, Visit,
     };
     use crate::lower_python_to_blockpy_for_testing;
-    use crate::passes::CodegenModuleShape;
+    use crate::passes::{self, CodegenModuleShape};
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -387,9 +439,11 @@ def g(y):
 
         let path = unique_cache_path();
         let _ = std::fs::remove_file(&path);
-        store_codegen_module_cache(&path, &module).expect("store codegen cache");
+        store_codegen_module_cache(&path, &module, None).expect("store codegen cache");
 
-        let loaded = load_codegen_module_cache(&path).expect("load codegen cache");
+        let loaded = load_codegen_module_cache(&path)
+            .expect("load codegen cache")
+            .module;
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(summarize_module(&loaded), before);
@@ -502,6 +556,100 @@ def outer():
         );
     }
 
+    #[test]
+    fn round_trips_prepared_codegen_cache_without_rendering() {
+        let module = lower_python_to_blockpy_for_testing(
+            r#"
+def outer(value):
+    def inner():
+        return value
+    return inner()
+"#,
+        )
+        .expect("transform should succeed")
+        .codegen_module;
+        let prepared = prepared_codegen_for_module(&module);
+        let value_fact_count = prepared.value_facts.expr_facts().count();
+        let ownership_function_count = prepared.ownership_plan.functions.len();
+        let local_env_function_count = prepared.local_env_plan.functions.len();
+        let resume_function_count = prepared.local_env_resume_plan.functions.len();
+
+        let path = unique_cache_path();
+        let _ = std::fs::remove_file(&path);
+        store_codegen_module_cache(&path, &module, Some(&prepared)).expect("store codegen cache");
+
+        let loaded = load_codegen_module_cache(&path).expect("load codegen cache");
+        let _ = std::fs::remove_file(&path);
+        let loaded_prepared = loaded
+            .prepared
+            .as_ref()
+            .expect("prepared codegen cache should be persisted");
+
+        assert_eq!(summarize_module(&loaded.module), summarize_module(&module));
+        assert_eq!(
+            loaded_prepared.value_facts.expr_facts().count(),
+            value_fact_count
+        );
+        assert_eq!(
+            loaded_prepared.ownership_plan.functions.len(),
+            ownership_function_count
+        );
+        assert_eq!(
+            loaded_prepared.local_env_plan.functions.len(),
+            local_env_function_count
+        );
+        assert_eq!(
+            loaded_prepared.local_env_resume_plan.functions.len(),
+            resume_function_count
+        );
+    }
+
+    #[test]
+    fn remaps_prepared_codegen_cache_to_fresh_module_id() {
+        let module = lower_python_to_blockpy_for_testing(
+            r#"
+def outer(value):
+    def inner():
+        return value
+    return inner()
+"#,
+        )
+        .expect("transform should succeed")
+        .codegen_module;
+        let prepared = prepared_codegen_for_module(&module);
+        let mut cache = super::CachedCodegenModule {
+            module,
+            prepared: Some(prepared),
+        };
+
+        remap_cached_codegen_module_function_ids(&mut cache, ModuleNameGen::new(111));
+
+        let prepared = cache
+            .prepared
+            .as_ref()
+            .expect("prepared codegen cache should be preserved");
+        for (key, _) in prepared.value_facts.expr_facts() {
+            assert_eq!(key.function_id.module_id(), 111);
+        }
+        for ((function_id, _), _) in prepared.value_facts.block_entry_facts() {
+            assert_eq!(function_id.module_id(), 111);
+        }
+        for function_id in prepared.ownership_plan.functions.keys() {
+            assert_eq!(function_id.module_id(), 111);
+        }
+        for function_id in prepared.local_env_plan.functions.keys() {
+            assert_eq!(function_id.module_id(), 111);
+        }
+        for function_id in prepared.local_env_resume_plan.functions.keys() {
+            assert_eq!(function_id.module_id(), 111);
+        }
+        for function_plan in prepared.local_env_resume_plan.functions.values() {
+            for entry in &function_plan.entries {
+                assert_eq!(entry.point.function_id().module_id(), 111);
+            }
+        }
+    }
+
     fn summarize_module(module: &BlockPyModule<CodegenModuleShape>) -> ModuleSummary {
         ModuleSummary {
             global_names: module.global_names.clone(),
@@ -557,5 +705,21 @@ def outer():
             "soac-blockpy-codegen-cache-test-{}-{unique}.rkyv",
             std::process::id()
         ))
+    }
+
+    fn prepared_codegen_for_module(
+        module: &BlockPyModule<CodegenModuleShape>,
+    ) -> CachedPreparedCodegen {
+        let value_facts = passes::infer_module_value_facts(module);
+        let ownership_plan = passes::plan_ownership_effects(module, &value_facts);
+        let local_env_plan = passes::plan_local_env_module(module, &value_facts);
+        let local_env_resume_plan =
+            passes::plan_local_env_resume_module(module, &local_env_plan, &value_facts);
+        CachedPreparedCodegen {
+            value_facts,
+            ownership_plan,
+            local_env_plan,
+            local_env_resume_plan,
+        }
     }
 }

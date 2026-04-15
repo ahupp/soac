@@ -13,7 +13,7 @@ use crate::block_py::{
 use crate::passes::{CodegenModuleShape, FactStore, PyObjFacts, ValueFacts};
 use std::collections::{HashMap, HashSet};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum LocalRefState {
     Unbound,
     Owned,
@@ -26,13 +26,13 @@ impl LocalRefState {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct RefcountLocal {
     pub location: LocalLocation,
     pub name: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum RefcountSite {
     Instr(InstrKey),
     Term {
@@ -41,7 +41,7 @@ pub enum RefcountSite {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum RefcountReleaseReason {
     Return,
     Raise,
@@ -53,7 +53,7 @@ pub enum RefcountReleaseReason {
     ExceptionEdge { target: BlockLabel },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum RefcountActionKind {
     RebindLocal {
         local: RefcountLocal,
@@ -71,19 +71,21 @@ pub enum RefcountActionKind {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct RefcountAction {
     pub site: RefcountSite,
     pub kind: RefcountActionKind,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct BlockRefcountPlan {
     pub label: BlockLabel,
     pub actions: Vec<RefcountAction>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(
+    Clone, Debug, Default, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct FunctionRefcountPlan {
     pub blocks: HashMap<BlockLabel, BlockRefcountPlan>,
 }
@@ -92,9 +94,19 @@ impl FunctionRefcountPlan {
     pub fn block(&self, label: BlockLabel) -> Option<&BlockRefcountPlan> {
         self.blocks.get(&label)
     }
+
+    pub fn remap_function_ids(&mut self, remap: impl Fn(FunctionId) -> FunctionId + Copy) {
+        for block in self.blocks.values_mut() {
+            for action in &mut block.actions {
+                action.site.remap_function_ids(remap);
+            }
+        }
+    }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(
+    Clone, Debug, Default, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct RefcountPlan {
     pub functions: HashMap<FunctionId, FunctionRefcountPlan>,
 }
@@ -102,6 +114,29 @@ pub struct RefcountPlan {
 impl RefcountPlan {
     pub fn function(&self, function_id: FunctionId) -> Option<&FunctionRefcountPlan> {
         self.functions.get(&function_id)
+    }
+
+    pub fn remap_function_ids(&mut self, remap: impl Fn(FunctionId) -> FunctionId + Copy) {
+        self.functions = std::mem::take(&mut self.functions)
+            .into_iter()
+            .map(|(function_id, mut plan)| {
+                plan.remap_function_ids(remap);
+                (remap(function_id), plan)
+            })
+            .collect();
+    }
+}
+
+impl RefcountSite {
+    pub fn remap_function_ids(&mut self, remap: impl Fn(FunctionId) -> FunctionId + Copy) {
+        match self {
+            Self::Instr(key) => {
+                key.function_id = remap(key.function_id);
+            }
+            Self::Term { function_id, .. } => {
+                *function_id = remap(*function_id);
+            }
+        }
     }
 }
 

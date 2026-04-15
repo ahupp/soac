@@ -6,14 +6,14 @@ use crate::block_py::{
 use crate::passes::CodegenModuleShape;
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum TruthinessFact {
     Unknown,
     AlwaysTrue,
     AlwaysFalse,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum PyExactType {
     NoneType,
     Bool,
@@ -23,47 +23,47 @@ pub enum PyExactType {
     Float,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum TypeFact {
     Unknown,
     Exact(PyExactType),
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum RuntimeSingleton {
     None,
     True,
     False,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum NoneFact {
     Unknown,
     IsNone,
     IsNotNone,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum BoolSingletonFact {
     Unknown,
     IsTrue,
     IsFalse,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum RefcountFact {
     Unknown,
     Immortal,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum ProvenanceFact {
     Unknown,
     RuntimeSingleton(RuntimeSingleton),
     ModuleConstant(u32),
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum RuntimeHelperId {
     Globals,
     Str,
@@ -81,7 +81,7 @@ pub enum RuntimeHelperId {
     ClassLookupCell,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum ThrowSpec {
     Never,
     ThrowsOnNullPyObj,
@@ -90,7 +90,7 @@ pub enum ThrowSpec {
     ThrowsOnNonZeroI32,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct RuntimeHelperSignature {
     pub helper: RuntimeHelperId,
     pub result: ValueFacts,
@@ -127,13 +127,13 @@ impl RuntimeHelperId {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum CallableFact {
     Unknown,
     RuntimeHelper(RuntimeHelperId),
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct PyObjFacts {
     pub ty: TypeFact,
     pub truthiness: TruthinessFact,
@@ -329,20 +329,20 @@ const fn none_fact_for_exact_type(exact_type: PyExactType) -> NoneFact {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct I32Facts {
     pub sentinel: Option<i32>,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct I64Facts {
     pub sentinel: Option<i64>,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct BoolFacts;
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum ValueFacts {
     PyObj(PyObjFacts),
     I32(I32Facts),
@@ -411,7 +411,9 @@ const fn runtime_helper_throw_spec(helper: RuntimeHelperId) -> ThrowSpec {
     }
 }
 
-#[derive(Debug, Clone, Default, Eq, PartialEq)]
+#[derive(
+    Debug, Clone, Default, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct EnvFacts {
     local_pyobj_facts: HashMap<LocalLocation, PyObjFacts>,
 }
@@ -445,7 +447,9 @@ impl EnvFacts {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(
+    Debug, Clone, Default, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct FactStore {
     expr_facts: HashMap<InstrKey, ValueFacts>,
     block_entry_facts: HashMap<(FunctionId, BlockLabel), EnvFacts>,
@@ -472,6 +476,20 @@ impl FactStore {
         self.block_entry_facts
             .iter()
             .map(|(key, facts)| (*key, facts))
+    }
+
+    pub fn remap_function_ids(&mut self, remap: impl Fn(FunctionId) -> FunctionId + Copy) {
+        self.expr_facts = std::mem::take(&mut self.expr_facts)
+            .into_iter()
+            .map(|(mut key, facts)| {
+                key.function_id = remap(key.function_id);
+                (key, facts)
+            })
+            .collect();
+        self.block_entry_facts = std::mem::take(&mut self.block_entry_facts)
+            .into_iter()
+            .map(|((function_id, label), facts)| ((remap(function_id), label), facts))
+            .collect();
     }
 }
 
