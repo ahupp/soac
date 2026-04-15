@@ -179,6 +179,10 @@ benchmark artifacts named for that child rather than the existing revision.
 
 Run `just test-all` before submitting unless the change is docs-only,
 such as `TODO.md`, `AGENTS.md`, or similar documentation-only files.
+For fast feedback on Rust changes that may affect crate test targets,
+run `cargo check -p soac-jit --tests` before the full gate; it
+type-checks the `soac-jit` crate including tests without running the
+entire transformed-runtime suite.
 Put test output in `logs/`. Summarize the failures, separate expected
 failures from unexpected failures, investigate the root cause, report
 it, then fix it.
