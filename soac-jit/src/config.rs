@@ -8,7 +8,8 @@ use soac_blockpy::env_config::{
     counter_dump_input_path_from_env as blockpy_counter_dump_input_path_from_env,
     counter_dump_output_path_from_env as blockpy_counter_dump_output_path_from_env,
     cranelift_opt_level_from_env, eager_clif_compile_requested_from_env,
-    jit_perf_helper_frames_enabled_from_env, jit_refcount_emission_enabled_from_env,
+    jit_compile_workers_from_env, jit_perf_helper_frames_enabled_from_env,
+    jit_refcount_emission_enabled_from_env,
     module_cache_root_from_env_or_repo as blockpy_module_cache_root_from_env_or_repo,
     pre_optimization_module_cache_identity as blockpy_pre_optimization_module_cache_identity,
     pre_optimization_module_cache_path as blockpy_pre_optimization_module_cache_path,
@@ -141,6 +142,10 @@ pub(crate) fn precompiled_library_path_from_env() -> Result<Option<PathBuf>, Str
 
 pub fn eager_clif_compile_requested() -> Result<bool, String> {
     eager_clif_compile_requested_from_env()
+}
+
+pub(crate) fn jit_compile_workers() -> Result<Option<usize>, String> {
+    jit_compile_workers_from_env()
 }
 
 pub(crate) fn jit_perf_helper_frames_enabled() -> Result<bool, String> {

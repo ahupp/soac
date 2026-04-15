@@ -7,8 +7,9 @@ use crate::SOAC_RUNTIME_CLIF;
 use crate::config::SOAC_JIT_EMIT_REFCOUNTS_ENV;
 use crate::config::{
     CraneliftTargetConfig, SpecializationMode, behavior_change_indexed_stores_enabled,
-    counter_dump_input_path_from_env, jit_refcount_emission_enabled, profiled_cold_blocks_enabled,
-    soac_work_dir_from_env, specialization_mode_from_env, specialization_mode_is_profile,
+    counter_dump_input_path_from_env, jit_compile_workers, jit_refcount_emission_enabled,
+    profiled_cold_blocks_enabled, soac_work_dir_from_env, specialization_mode_from_env,
+    specialization_mode_is_profile,
 };
 use crate::counter::TopValueCounter;
 use crate::counter_dump::{
@@ -28,16 +29,13 @@ use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::inline::{Inline, InlineCommand};
 use cranelift_codegen::ir;
 use cranelift_codegen::ir::InstBuilder;
-use cranelift_codegen::isa::TargetIsa;
+use cranelift_codegen::isa::{OwnedTargetIsa, TargetFrontendConfig, TargetIsa};
 #[cfg(test)]
 use cranelift_codegen::settings::Configurable;
 use cranelift_control::ControlPlane;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch};
 use cranelift_jit::{ArenaMemoryProvider, JITBuilder, JITModule};
-use cranelift_module::{
-    DataDeclaration, DataDescription, DataId, FuncId, FunctionDeclaration, Linkage, Module,
-    ModuleReloc,
-};
+use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module, ModuleReloc};
 use cranelift_reader::parse_functions;
 use pyo3::ffi;
 use soac_blockpy::block_py::{
@@ -65,11 +63,11 @@ use std::fs;
 use std::mem::{MaybeUninit, offset_of};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
-use tracing::info;
+use tracing::{info, warn};
 
 unsafe extern "C" {
     static mut PyFunction_Type: ffi::PyTypeObject;
@@ -384,7 +382,7 @@ fn declare_module_constant_object_data_for_symbol(
     let symbol = module_constant_object_symbol(symbol_prefix, constant_id);
     register_jit_data_symbol(symbol.as_str(), module_constant_ptr.cast::<u8>());
     jit_module
-        .declare_data(symbol.as_str(), Linkage::Import, true, false)
+        .codegen_declare_data(symbol.as_str(), Linkage::Import, true, false)
         .map_err(|err| format!("failed to declare module constant object {symbol}: {err}"))
 }
 
@@ -428,7 +426,7 @@ fn define_scalar_counter_storage_data_for_symbol(
     scalar_counter_count: usize,
 ) -> Result<DataId, String> {
     let data_id = jit_module
-        .declare_data(symbol, Linkage::Local, true, false)
+        .codegen_declare_data(symbol, Linkage::Local, true, false)
         .map_err(|err| format!("failed to declare scalar counter storage {symbol}: {err}"))?;
     let mut data = DataDescription::new();
     data.define_zeroinit(
@@ -462,7 +460,7 @@ fn declare_scalar_counter_storage_import(
     symbol: &str,
 ) -> Result<DataId, String> {
     jit_module
-        .declare_data(symbol, Linkage::Import, true, false)
+        .codegen_declare_data(symbol, Linkage::Import, true, false)
         .map_err(|err| format!("failed to declare imported scalar counter storage {symbol}: {err}"))
 }
 
@@ -472,7 +470,7 @@ fn define_top_value_counter_storage_data_for_symbol(
     top_value_counter_count: usize,
 ) -> Result<DataId, String> {
     let data_id = jit_module
-        .declare_data(symbol, Linkage::Local, true, false)
+        .codegen_declare_data(symbol, Linkage::Local, true, false)
         .map_err(|err| format!("failed to declare top-value counter storage {symbol}: {err}"))?;
     let mut data = DataDescription::new();
     data.define_zeroinit(
@@ -508,15 +506,18 @@ fn declare_top_value_counter_storage_import(
     symbol: &str,
 ) -> Result<DataId, String> {
     jit_module
-        .declare_data(symbol, Linkage::Import, true, false)
+        .codegen_declare_data(symbol, Linkage::Import, true, false)
         .map_err(|err| {
             format!("failed to declare imported top-value counter storage {symbol}: {err}")
         })
 }
 
-fn declare_type_ptr_import(jit_module: &mut JITModule, symbol: &str) -> Result<DataId, String> {
-    jit_module
-        .declare_data(symbol, Linkage::Import, true, false)
+fn declare_type_ptr_import(
+    codegen_env: &mut impl JitCodegenEnv,
+    symbol: &str,
+) -> Result<DataId, String> {
+    codegen_env
+        .codegen_declare_data(symbol, Linkage::Import, true, false)
         .map_err(|err| format!("failed to declare imported type symbol {symbol}: {err}"))
 }
 
@@ -1120,7 +1121,7 @@ impl ModuleFuncImports {
 
     fn ensure_declared(
         &mut self,
-        jit_module: &mut JITModule,
+        codegen_env: &mut impl JitCodegenEnv,
         spec: &'static ImportSpec,
     ) -> Result<FuncId, String> {
         let internal_id = spec.internal_id();
@@ -1130,10 +1131,10 @@ impl ModuleFuncImports {
         if let Some(func_id) = self.func_ids_by_internal_id[internal_id] {
             return Ok(func_id);
         }
-        let sig = lower_static_signature(jit_module, spec.signature);
+        let sig = lower_static_signature(codegen_env, spec.signature);
         let func_id = match spec.linkage {
-            Linkage::Import => declare_import_fn(jit_module, spec.symbol, &sig)?,
-            Linkage::Local => declare_local_fn(jit_module, spec.symbol, &sig)?,
+            Linkage::Import => declare_import_fn(codegen_env, spec.symbol, &sig)?,
+            Linkage::Local => declare_local_fn(codegen_env, spec.symbol, &sig)?,
             linkage => {
                 return Err(format!(
                     "unsupported linkage {linkage:?} for jit call spec {}",
@@ -1345,7 +1346,7 @@ impl<'a> FuncBuildImports<'a> {
 
     fn get(
         &mut self,
-        jit_module: &mut JITModule,
+        codegen_env: &mut impl JitCodegenEnv,
         func: &mut ir::Function,
         spec: &'static ImportSpec,
     ) -> Result<ir::FuncRef, String> {
@@ -1356,19 +1357,19 @@ impl<'a> FuncBuildImports<'a> {
         if let Some(func_ref) = self.func_refs_by_internal_id[internal_id] {
             return Ok(func_ref);
         }
-        let func_id = self.module_imports.ensure_declared(jit_module, spec)?;
-        let func_ref = jit_module.declare_func_in_func(func_id, func);
+        let func_id = self.module_imports.ensure_declared(codegen_env, spec)?;
+        let func_ref = codegen_env.codegen_declare_func_in_func(func_id, func)?;
         self.func_refs_by_internal_id[internal_id] = Some(func_ref);
         Ok(func_ref)
     }
 
     fn get_or_panic(
         &mut self,
-        jit_module: &mut JITModule,
+        codegen_env: &mut impl JitCodegenEnv,
         func: &mut ir::Function,
         spec: &'static ImportSpec,
     ) -> ir::FuncRef {
-        self.get(jit_module, func, spec).unwrap_or_else(|err| {
+        self.get(codegen_env, func, spec).unwrap_or_else(|err| {
             panic!(
                 "failed to bind import {} during JIT codegen: {}",
                 spec.symbol, err
@@ -1488,12 +1489,16 @@ struct JitBatchPlan<'a> {
     batch_functions: Vec<ProcessJitBatchFunction<'a>>,
     function_indices_to_define: Vec<usize>,
     function_compile_inputs: HashMap<usize, ReservedJitFunctionCompileInputs>,
+    compile_waiters: HashMap<FunctionId, Arc<ProcessJitCompileWaiter>>,
     module_declarations: JitModuleDeclarationSnapshot,
+    isa: OwnedTargetIsa,
+    module_plans: HashMap<usize, JitModulePlan>,
     predeclared: HashMap<FunctionId, DeclaredJitFunction>,
 }
 
 enum ReservedDirectFunctionBatch<'a> {
     Ready(Arc<CompiledFunctionHandle>),
+    Compiling(Arc<ProcessJitCompileWaiter>),
     Reserved(JitBatchPlan<'a>),
 }
 
@@ -1502,29 +1507,28 @@ struct JitBatchCompileOutput {
     worker_metrics: JitBatchWorkerMetrics,
 }
 
+const DEFAULT_JIT_COMPILE_WORKER_LIMIT: usize = 4;
+
 #[derive(Clone, Copy, Debug, Default)]
 struct JitBatchWorkerMetrics {
     requested_worker_count: usize,
-    worker_module_count: usize,
+    actual_worker_count: usize,
     worker_function_count_min: usize,
     worker_function_count_max: usize,
     worker_total_sum: Duration,
     worker_total_max: Duration,
-    worker_module_build_sum: Duration,
-    worker_module_build_max: Duration,
+    worker_setup_sum: Duration,
+    worker_setup_max: Duration,
     worker_compile_sum: Duration,
     worker_compile_max: Duration,
-    worker_validate_sum: Duration,
-    worker_validate_max: Duration,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct JitBatchWorkerTiming {
     function_count: usize,
     total: Duration,
-    module_build: Duration,
+    setup: Duration,
     compile: Duration,
-    validate: Duration,
 }
 
 struct JitBatchWorkerOutput {
@@ -1542,35 +1546,261 @@ impl JitBatchWorkerMetrics {
     }
 
     fn record_worker(&mut self, timing: JitBatchWorkerTiming) {
-        self.worker_module_count += 1;
+        self.actual_worker_count += 1;
         self.worker_function_count_min = self.worker_function_count_min.min(timing.function_count);
         self.worker_function_count_max = self.worker_function_count_max.max(timing.function_count);
         self.worker_total_sum += timing.total;
         self.worker_total_max = self.worker_total_max.max(timing.total);
-        self.worker_module_build_sum += timing.module_build;
-        self.worker_module_build_max = self.worker_module_build_max.max(timing.module_build);
+        self.worker_setup_sum += timing.setup;
+        self.worker_setup_max = self.worker_setup_max.max(timing.setup);
         self.worker_compile_sum += timing.compile;
         self.worker_compile_max = self.worker_compile_max.max(timing.compile);
-        self.worker_validate_sum += timing.validate;
-        self.worker_validate_max = self.worker_validate_max.max(timing.validate);
     }
 
     fn finish(mut self) -> Self {
-        if self.worker_module_count == 0 {
+        if self.actual_worker_count == 0 {
             self.worker_function_count_min = 0;
         }
         self
     }
 }
 
-type JitWorkerPlanCache = HashMap<
-    usize,
-    (
-        FactStore,
-        PlannedJitModuleLocals,
-        PlannedJitDeoptResumeModule,
-    ),
->;
+fn jit_batch_worker_count(function_count: usize) -> Result<usize, String> {
+    if function_count == 0 {
+        return Ok(0);
+    }
+    let available = std::thread::available_parallelism().map_or(1, usize::from);
+    let configured_limit = jit_compile_workers()?.unwrap_or(DEFAULT_JIT_COMPILE_WORKER_LIMIT);
+    Ok(function_count.min(available).min(configured_limit).max(1))
+}
+
+impl JitBatchPlan<'_> {
+    fn precompute_module_plans(
+        &mut self,
+        inputs: &DirectFunctionCompileInputs<'_>,
+    ) -> Result<(), String> {
+        for batch_function_index in &self.function_indices_to_define {
+            let batch_function = &self.batch_functions[*batch_function_index];
+            let reserved_inputs = self
+                .function_compile_inputs
+                .get(batch_function_index)
+                .expect("reserved JIT batch function should have compile inputs");
+            let binding_key = reserved_inputs.module_constant_binding_key;
+            if self.module_plans.contains_key(&binding_key) {
+                continue;
+            }
+            let function_module = batch_function
+                .source
+                .shared_state()
+                .map(|shared_state| &shared_state.lowered_module)
+                .unwrap_or(inputs.module);
+            let value_facts = infer_jit_value_facts(function_module);
+            let locals = plan_jit_module_locals(function_module, &value_facts)?;
+            let deopt_resume = plan_jit_deopt_resume_module(function_module, &value_facts)?;
+            self.module_plans.insert(
+                binding_key,
+                JitModulePlan {
+                    value_facts,
+                    locals,
+                    deopt_resume,
+                },
+            );
+        }
+        Ok(())
+    }
+}
+
+struct JitModulePlan {
+    value_facts: FactStore,
+    locals: PlannedJitModuleLocals,
+    deopt_resume: PlannedJitDeoptResumeModule,
+}
+
+trait JitCodegenEnv {
+    fn codegen_isa(&self) -> &dyn TargetIsa;
+
+    fn codegen_jit_module_mut(&mut self) -> Option<&mut JITModule> {
+        None
+    }
+
+    fn function_declaration(&self, id: FuncId) -> Result<(&ir::Signature, Linkage), String>;
+
+    fn data_declaration(&self, id: DataId) -> Result<(Linkage, bool), String>;
+
+    fn codegen_declare_function(
+        &mut self,
+        name: &str,
+        linkage: Linkage,
+        signature: &ir::Signature,
+    ) -> Result<FuncId, String>;
+
+    fn codegen_declare_data(
+        &mut self,
+        name: &str,
+        linkage: Linkage,
+        writable: bool,
+        tls: bool,
+    ) -> Result<DataId, String>;
+
+    fn codegen_target_config(&self) -> TargetFrontendConfig {
+        self.codegen_isa().frontend_config()
+    }
+
+    fn codegen_make_context(&self) -> cranelift_codegen::Context {
+        let mut ctx = cranelift_codegen::Context::new();
+        ctx.func.signature.call_conv = self.codegen_isa().default_call_conv();
+        ctx
+    }
+
+    fn codegen_clear_context(&self, ctx: &mut cranelift_codegen::Context) {
+        ctx.clear();
+        ctx.func.signature.call_conv = self.codegen_isa().default_call_conv();
+    }
+
+    fn codegen_make_signature(&self) -> ir::Signature {
+        ir::Signature::new(self.codegen_isa().default_call_conv())
+    }
+
+    fn codegen_declare_func_in_func(
+        &mut self,
+        func_id: FuncId,
+        func: &mut ir::Function,
+    ) -> Result<ir::FuncRef, String> {
+        let (signature, linkage) = self.function_declaration(func_id)?;
+        let signature = func.import_signature(signature.clone());
+        let user_name_ref = func.declare_imported_user_function(ir::UserExternalName {
+            namespace: 0,
+            index: func_id.as_u32(),
+        });
+        Ok(func.import_function(ir::ExtFuncData {
+            name: ir::ExternalName::user(user_name_ref),
+            signature,
+            colocated: linkage.is_final(),
+            patchable: false,
+        }))
+    }
+
+    fn codegen_declare_data_in_func(
+        &mut self,
+        data_id: DataId,
+        func: &mut ir::Function,
+    ) -> Result<ir::GlobalValue, String> {
+        let (linkage, tls) = self.data_declaration(data_id)?;
+        let user_name_ref = func.declare_imported_user_function(ir::UserExternalName {
+            namespace: 1,
+            index: data_id.as_u32(),
+        });
+        Ok(func.create_global_value(ir::GlobalValueData::Symbol {
+            name: ir::ExternalName::user(user_name_ref),
+            offset: ir::immediates::Imm64::new(0),
+            colocated: linkage.is_final(),
+            tls,
+        }))
+    }
+}
+
+struct ReservedJitCodegenEnv<'a> {
+    isa: OwnedTargetIsa,
+    declarations: &'a JitModuleDeclarationSnapshot,
+}
+
+impl JitCodegenEnv for ReservedJitCodegenEnv<'_> {
+    fn codegen_isa(&self) -> &dyn TargetIsa {
+        self.isa.as_ref()
+    }
+
+    fn function_declaration(&self, id: FuncId) -> Result<(&ir::Signature, Linkage), String> {
+        let declaration = self
+            .declarations
+            .function(id)
+            .ok_or_else(|| format!("reserved JIT declaration snapshot is missing function {id}"))?;
+        Ok((&declaration.signature, declaration.linkage))
+    }
+
+    fn data_declaration(&self, id: DataId) -> Result<(Linkage, bool), String> {
+        let declaration = self
+            .declarations
+            .data(id)
+            .ok_or_else(|| format!("reserved JIT declaration snapshot is missing data {id}"))?;
+        Ok((declaration.linkage, declaration.tls))
+    }
+
+    fn codegen_declare_function(
+        &mut self,
+        name: &str,
+        _linkage: Linkage,
+        signature: &ir::Signature,
+    ) -> Result<FuncId, String> {
+        let declaration = self.declarations.function_by_name(name).ok_or_else(|| {
+            format!("reserved JIT declaration snapshot is missing function symbol {name}")
+        })?;
+        if declaration.signature != *signature {
+            return Err(format!(
+                "reserved JIT declaration snapshot function {name} signature mismatch"
+            ));
+        }
+        Ok(declaration.id)
+    }
+
+    fn codegen_declare_data(
+        &mut self,
+        name: &str,
+        _linkage: Linkage,
+        writable: bool,
+        tls: bool,
+    ) -> Result<DataId, String> {
+        let declaration = self.declarations.data_by_name(name).ok_or_else(|| {
+            format!("reserved JIT declaration snapshot is missing data symbol {name}")
+        })?;
+        if declaration.writable != writable || declaration.tls != tls {
+            return Err(format!(
+                "reserved JIT declaration snapshot data {name} storage flags mismatch"
+            ));
+        }
+        Ok(declaration.id)
+    }
+}
+
+impl JitCodegenEnv for JITModule {
+    fn codegen_isa(&self) -> &dyn TargetIsa {
+        Module::isa(self)
+    }
+
+    fn codegen_jit_module_mut(&mut self) -> Option<&mut JITModule> {
+        Some(self)
+    }
+
+    fn function_declaration(&self, id: FuncId) -> Result<(&ir::Signature, Linkage), String> {
+        let declaration = self.declarations().get_function_decl(id);
+        Ok((&declaration.signature, declaration.linkage))
+    }
+
+    fn data_declaration(&self, id: DataId) -> Result<(Linkage, bool), String> {
+        let declaration = self.declarations().get_data_decl(id);
+        Ok((declaration.linkage, declaration.tls))
+    }
+
+    fn codegen_declare_function(
+        &mut self,
+        name: &str,
+        linkage: Linkage,
+        signature: &ir::Signature,
+    ) -> Result<FuncId, String> {
+        Module::declare_function(self, name, linkage, signature)
+            .map_err(|err| format!("failed to declare JIT function {name}: {err}"))
+    }
+
+    fn codegen_declare_data(
+        &mut self,
+        name: &str,
+        linkage: Linkage,
+        writable: bool,
+        tls: bool,
+    ) -> Result<DataId, String> {
+        Module::declare_data(self, name, linkage, writable, tls)
+            .map_err(|err| format!("failed to declare JIT data {name}: {err}"))
+    }
+}
 
 impl JitModuleDeclarationSnapshot {
     fn from_module(jit_module: &JITModule) -> Self {
@@ -1599,176 +1829,32 @@ impl JitModuleDeclarationSnapshot {
         }
     }
 
-    fn build_worker_module(
-        &self,
-        compile_session: &crate::session::CompileSession,
-    ) -> Result<JITModule, String> {
-        let mut jit_module = new_jit_module(compile_session)?;
-        self.replay_into(&mut jit_module)?;
-        Ok(jit_module)
-    }
-
-    fn validate_no_extra_declarations(&self, jit_module: &JITModule) -> Result<(), String> {
-        let reserved_functions = self
-            .functions
+    fn function(&self, id: FuncId) -> Option<&JitFunctionDeclarationSnapshot> {
+        self.functions
             .iter()
-            .map(|declaration| declaration.id)
-            .collect::<HashSet<_>>();
-        for (id, declaration) in jit_module.declarations().get_functions() {
-            if !reserved_functions.contains(&id) {
-                return Err(format!(
-                    "worker JIT declared function after batch reservation: {id} {:?} {:?}",
-                    declaration.name, declaration.linkage
-                ));
-            }
-        }
+            .find(|declaration| declaration.id == id)
+    }
 
-        let reserved_data_objects = self
-            .data_objects
+    fn function_by_name(&self, name: &str) -> Option<&JitFunctionDeclarationSnapshot> {
+        self.functions
             .iter()
-            .map(|declaration| declaration.id)
-            .collect::<HashSet<_>>();
-        for (id, declaration) in jit_module.declarations().get_data_objects() {
-            if !reserved_data_objects.contains(&id) {
-                return Err(format!(
-                    "worker JIT declared data after batch reservation: {id} {:?} {:?}",
-                    declaration.name, declaration.linkage
-                ));
-            }
-        }
-        Ok(())
+            .find(|declaration| declaration.name.as_deref() == Some(name))
     }
 
-    fn replay_into(&self, jit_module: &mut JITModule) -> Result<(), String> {
-        for declaration in &self.functions {
-            if let Some((_, existing)) = jit_module
-                .declarations()
-                .get_functions()
-                .find(|(id, _)| *id == declaration.id)
-            {
-                Self::validate_function_declaration(declaration.id, existing, declaration)?;
-                continue;
-            }
-            let actual_id = if let Some(name) = declaration.name.as_deref() {
-                jit_module
-                    .declare_function(name, declaration.linkage, &declaration.signature)
-                    .map_err(|err| {
-                        format!("failed to replay JIT function declaration {name}: {err}")
-                    })?
-            } else {
-                jit_module
-                    .declare_anonymous_function(&declaration.signature)
-                    .map_err(|err| {
-                        format!(
-                            "failed to replay anonymous JIT function declaration {}: {err}",
-                            declaration.id
-                        )
-                    })?
-            };
-            if actual_id != declaration.id {
-                return Err(format!(
-                    "replayed JIT function declaration id mismatch for {}: {} != {}",
-                    declaration
-                        .name
-                        .as_deref()
-                        .unwrap_or("<anonymous function>"),
-                    actual_id,
-                    declaration.id
-                ));
-            }
-        }
-
-        for declaration in &self.data_objects {
-            if let Some((_, existing)) = jit_module
-                .declarations()
-                .get_data_objects()
-                .find(|(id, _)| *id == declaration.id)
-            {
-                Self::validate_data_declaration(declaration.id, existing, declaration)?;
-                continue;
-            }
-            let actual_id = if let Some(name) = declaration.name.as_deref() {
-                jit_module
-                    .declare_data(
-                        name,
-                        declaration.linkage,
-                        declaration.writable,
-                        declaration.tls,
-                    )
-                    .map_err(|err| format!("failed to replay JIT data declaration {name}: {err}"))?
-            } else {
-                jit_module
-                    .declare_anonymous_data(declaration.writable, declaration.tls)
-                    .map_err(|err| {
-                        format!(
-                            "failed to replay anonymous JIT data declaration {}: {err}",
-                            declaration.id
-                        )
-                    })?
-            };
-            if actual_id != declaration.id {
-                return Err(format!(
-                    "replayed JIT data declaration id mismatch for {}: {} != {}",
-                    declaration.name.as_deref().unwrap_or("<anonymous data>"),
-                    actual_id,
-                    declaration.id
-                ));
-            }
-        }
-        Ok(())
+    fn data(&self, id: DataId) -> Option<&JitDataDeclarationSnapshot> {
+        self.data_objects
+            .iter()
+            .find(|declaration| declaration.id == id)
     }
 
-    fn validate_function_declaration(
-        id: FuncId,
-        actual: &FunctionDeclaration,
-        expected: &JitFunctionDeclarationSnapshot,
-    ) -> Result<(), String> {
-        if actual.name != expected.name {
-            return Err(format!(
-                "worker JIT function declaration {id} name mismatch: {:?} != {:?}",
-                actual.name, expected.name
-            ));
-        }
-        if actual.linkage != expected.linkage {
-            return Err(format!(
-                "worker JIT function declaration {id} linkage mismatch: {:?} != {:?}",
-                actual.linkage, expected.linkage
-            ));
-        }
-        if actual.signature != expected.signature {
-            return Err(format!(
-                "worker JIT function declaration {id} signature mismatch"
-            ));
-        }
-        Ok(())
-    }
-
-    fn validate_data_declaration(
-        id: DataId,
-        actual: &DataDeclaration,
-        expected: &JitDataDeclarationSnapshot,
-    ) -> Result<(), String> {
-        if actual.name != expected.name {
-            return Err(format!(
-                "worker JIT data declaration {id} name mismatch: {:?} != {:?}",
-                actual.name, expected.name
-            ));
-        }
-        if actual.linkage != expected.linkage {
-            return Err(format!(
-                "worker JIT data declaration {id} linkage mismatch: {:?} != {:?}",
-                actual.linkage, expected.linkage
-            ));
-        }
-        if actual.writable != expected.writable || actual.tls != expected.tls {
-            return Err(format!(
-                "worker JIT data declaration {id} storage flags mismatch"
-            ));
-        }
-        Ok(())
+    fn data_by_name(&self, name: &str) -> Option<&JitDataDeclarationSnapshot> {
+        self.data_objects
+            .iter()
+            .find(|declaration| declaration.name.as_deref() == Some(name))
     }
 }
 
+#[derive(Clone)]
 struct ProcessJitBatchFunction<'a> {
     function: BlockPyFunction<CodegenModuleShape>,
     source: ProcessJitBatchFunctionSource<'a>,
@@ -1833,7 +1919,7 @@ fn emit_jit_batch_codegen_log(
         batch_function_count = u64::try_from(batch_function_count).unwrap_or(u64::MAX),
         functions_to_define_count = u64::try_from(functions_to_define_count).unwrap_or(u64::MAX),
         requested_worker_count = u64::try_from(worker_metrics.requested_worker_count).unwrap_or(u64::MAX),
-        worker_module_count = u64::try_from(worker_metrics.worker_module_count).unwrap_or(u64::MAX),
+        actual_worker_count = u64::try_from(worker_metrics.actual_worker_count).unwrap_or(u64::MAX),
         worker_function_count_min = u64::try_from(worker_metrics.worker_function_count_min).unwrap_or(u64::MAX),
         worker_function_count_max = u64::try_from(worker_metrics.worker_function_count_max).unwrap_or(u64::MAX),
         jit_batch_collect_us = duration_micros(batch_collect_elapsed),
@@ -1843,14 +1929,10 @@ fn emit_jit_batch_codegen_log(
         jit_batch_total_us = duration_micros(total_elapsed),
         jit_batch_worker_total_sum_us = duration_micros(worker_metrics.worker_total_sum),
         jit_batch_worker_total_max_us = duration_micros(worker_metrics.worker_total_max),
-        jit_batch_worker_module_build_sum_us =
-            duration_micros(worker_metrics.worker_module_build_sum),
-        jit_batch_worker_module_build_max_us =
-            duration_micros(worker_metrics.worker_module_build_max),
+        jit_batch_worker_setup_sum_us = duration_micros(worker_metrics.worker_setup_sum),
+        jit_batch_worker_setup_max_us = duration_micros(worker_metrics.worker_setup_max),
         jit_batch_worker_compile_sum_us = duration_micros(worker_metrics.worker_compile_sum),
         jit_batch_worker_compile_max_us = duration_micros(worker_metrics.worker_compile_max),
-        jit_batch_worker_validate_sum_us = duration_micros(worker_metrics.worker_validate_sum),
-        jit_batch_worker_validate_max_us = duration_micros(worker_metrics.worker_validate_max),
         "jit_batch_codegen",
     );
 }
@@ -1896,6 +1978,11 @@ enum ProcessJitFunctionEntry {
         declared: DeclaredJitFunction,
         shape: ProcessJitFunctionShape,
     },
+    Compiling {
+        declared: DeclaredJitFunction,
+        shape: ProcessJitFunctionShape,
+        waiter: Arc<ProcessJitCompileWaiter>,
+    },
     Ready {
         declared: DeclaredJitFunction,
         shape: ProcessJitFunctionShape,
@@ -1922,13 +2009,16 @@ impl ProcessJitFunctionEntry {
     fn declared(&self) -> DeclaredJitFunction {
         match self {
             Self::Declared { declared, .. } => declared.clone(),
+            Self::Compiling { declared, .. } => declared.clone(),
             Self::Ready { declared, .. } => declared.clone(),
         }
     }
 
     fn shape(&self) -> &ProcessJitFunctionShape {
         match self {
-            Self::Declared { shape, .. } | Self::Ready { shape, .. } => shape,
+            Self::Declared { shape, .. }
+            | Self::Compiling { shape, .. }
+            | Self::Ready { shape, .. } => shape,
         }
     }
 
@@ -1939,7 +2029,54 @@ impl ProcessJitFunctionEntry {
                 compiled_handle,
                 ..
             } => Some((declared.clone(), Arc::clone(compiled_handle))),
-            Self::Declared { .. } => None,
+            Self::Declared { .. } | Self::Compiling { .. } => None,
+        }
+    }
+
+    fn compile_waiter(&self) -> Option<Arc<ProcessJitCompileWaiter>> {
+        match self {
+            Self::Compiling { waiter, .. } => Some(Arc::clone(waiter)),
+            Self::Declared { .. } | Self::Ready { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ProcessJitCompileWaiter {
+    result: Mutex<Option<Result<(), String>>>,
+    ready: Condvar,
+}
+
+impl ProcessJitCompileWaiter {
+    fn new() -> Self {
+        Self {
+            result: Mutex::new(None),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn wait(&self) -> Result<(), String> {
+        let mut result = self
+            .result
+            .lock()
+            .map_err(|_| "process JIT compile waiter lock poisoned".to_string())?;
+        loop {
+            if let Some(result) = result.as_ref() {
+                return result.clone();
+            }
+            result = self
+                .ready
+                .wait(result)
+                .map_err(|_| "process JIT compile waiter lock poisoned".to_string())?;
+        }
+    }
+
+    fn finish(&self, result: Result<(), String>) {
+        if let Ok(mut slot) = self.result.lock() {
+            if slot.is_none() {
+                *slot = Some(result);
+                self.ready.notify_all();
+            }
         }
     }
 }
@@ -2109,6 +2246,16 @@ impl ProcessJitState {
             .is_some_and(|entry| entry.ready_entry().is_some())
     }
 
+    fn direct_function_compile_waiter(
+        &self,
+        function: &BlockPyFunction<CodegenModuleShape>,
+    ) -> Option<Arc<ProcessJitCompileWaiter>> {
+        let entry = self.direct_functions.get(&function.function_id)?;
+        (entry.shape() == &ProcessJitFunctionShape::for_function(function))
+            .then(|| entry.compile_waiter())
+            .flatten()
+    }
+
     fn ready_direct_function(
         &self,
         function: &BlockPyFunction<CodegenModuleShape>,
@@ -2127,6 +2274,7 @@ impl ProcessJitState {
         default_code_ptr: *const u8,
         param_count: usize,
         deopt_table: Arc<RuntimeJitDeoptTable>,
+        stats: JitCodegenStats,
     ) -> Result<Arc<CompiledFunctionHandle>, String> {
         let Some(entry) = self.direct_functions.get(&function_id) else {
             return Err(format!(
@@ -2136,12 +2284,14 @@ impl ProcessJitState {
         debug_assert_eq!(deopt_table.function_id(), function_id);
         let declared = entry.declared();
         let shape = entry.shape().clone();
+        let compile_waiter = entry.compile_waiter();
         let compiled_handle = Arc::new(CompiledFunctionHandle::from_direct_entry(
             session,
             code_ptr,
             default_code_ptr,
             param_count,
             deopt_table,
+            Some(stats),
         ));
         self.direct_functions.insert(
             function_id,
@@ -2151,7 +2301,37 @@ impl ProcessJitState {
                 compiled_handle: Arc::clone(&compiled_handle),
             },
         );
+        if let Some(waiter) = compile_waiter {
+            waiter.finish(Ok(()));
+        }
         Ok(compiled_handle)
+    }
+
+    fn fail_direct_function_batch(&mut self, plan: &JitBatchPlan<'_>, err: &str) {
+        for (function_id, waiter) in &plan.compile_waiters {
+            let Some(entry) = self.direct_functions.get(function_id) else {
+                waiter.finish(Err(err.to_string()));
+                continue;
+            };
+            let ProcessJitFunctionEntry::Compiling {
+                declared,
+                shape,
+                waiter: entry_waiter,
+            } = entry
+            else {
+                continue;
+            };
+            if !Arc::ptr_eq(waiter, entry_waiter) {
+                continue;
+            }
+            let declared = declared.clone();
+            let shape = shape.clone();
+            self.direct_functions.insert(
+                *function_id,
+                ProcessJitFunctionEntry::Declared { declared, shape },
+            );
+            waiter.finish(Err(err.to_string()));
+        }
     }
 }
 
@@ -2288,10 +2468,14 @@ impl ProcessJitState {
         if let Some(compiled_handle) = self.ready_direct_function(root_function) {
             return Ok(ReservedDirectFunctionBatch::Ready(compiled_handle));
         }
+        if let Some(waiter) = self.direct_function_compile_waiter(root_function) {
+            return Ok(ReservedDirectFunctionBatch::Compiling(waiter));
+        }
 
         let mut predeclared = HashMap::new();
         let mut function_indices_to_define = Vec::new();
         let mut function_compile_inputs = HashMap::new();
+        let mut compile_waiters = HashMap::new();
         for (index, batch_function) in batch_functions.iter().enumerate() {
             let function = &batch_function.function;
             let direct_symbol_scope = batch_function.source.shared_state().map(|shared_state| {
@@ -2299,17 +2483,30 @@ impl ProcessJitState {
             });
             let declared =
                 self.declare_direct_function(jit_module, function, direct_symbol_scope.as_deref())?;
-            if !self.is_direct_function_ready(function.function_id) {
-                function_indices_to_define.push(index);
-                function_compile_inputs.insert(
-                    index,
-                    self.reserve_direct_function_compile_inputs(
-                        jit_module,
-                        inputs,
-                        batch_function,
-                    )?,
-                );
+            if self.is_direct_function_ready(function.function_id) {
+                predeclared.insert(function.function_id, declared);
+                continue;
             }
+            if self.direct_function_compile_waiter(function).is_some() {
+                predeclared.insert(function.function_id, declared);
+                continue;
+            }
+            let waiter = Arc::new(ProcessJitCompileWaiter::new());
+            let shape = ProcessJitFunctionShape::for_function(function);
+            function_indices_to_define.push(index);
+            function_compile_inputs.insert(
+                index,
+                self.reserve_direct_function_compile_inputs(jit_module, inputs, batch_function)?,
+            );
+            compile_waiters.insert(function.function_id, Arc::clone(&waiter));
+            self.direct_functions.insert(
+                function.function_id,
+                ProcessJitFunctionEntry::Compiling {
+                    declared: declared.clone(),
+                    shape,
+                    waiter,
+                },
+            );
             predeclared.insert(function.function_id, declared);
         }
         predeclare_jit_runtime_imports(jit_module)?;
@@ -2319,7 +2516,10 @@ impl ProcessJitState {
             batch_functions,
             function_indices_to_define,
             function_compile_inputs,
+            compile_waiters,
             module_declarations: JitModuleDeclarationSnapshot::from_module(jit_module),
+            isa: CraneliftTargetConfig::runtime_from_env()?.build_isa()?,
+            module_plans: HashMap::new(),
             predeclared,
         }))
     }
@@ -2330,53 +2530,46 @@ impl ProcessJitState {
         batch_function_indices: &[usize],
     ) -> Result<JitBatchWorkerOutput, String> {
         let worker_start = Instant::now();
-        let module_build_start = Instant::now();
-        let mut jit_module = plan
-            .module_declarations
-            .build_worker_module(inputs.session)?;
-        let module_build = module_build_start.elapsed();
+        let setup_start = Instant::now();
+        let mut codegen_env = ReservedJitCodegenEnv {
+            isa: Arc::clone(&plan.isa),
+            declarations: &plan.module_declarations,
+        };
+        let setup = setup_start.elapsed();
 
         let compile_start = Instant::now();
         let compiled_functions = Self::compile_reserved_direct_function_batch_indices(
-            &mut jit_module,
+            &mut codegen_env,
             inputs,
             plan,
             batch_function_indices,
         )?;
         let compile = compile_start.elapsed();
 
-        let validate_start = Instant::now();
-        plan.module_declarations
-            .validate_no_extra_declarations(&jit_module)?;
-        let validate = validate_start.elapsed();
-
         Ok(JitBatchWorkerOutput {
             compiled_functions,
             timing: JitBatchWorkerTiming {
                 function_count: batch_function_indices.len(),
                 total: worker_start.elapsed(),
-                module_build,
+                setup,
                 compile,
-                validate,
             },
         })
     }
 
     fn compile_reserved_direct_function_batch_indices<'a>(
-        jit_module: &mut JITModule,
+        codegen_env: &mut impl JitCodegenEnv,
         inputs: &DirectFunctionCompileInputs<'a>,
         plan: &JitBatchPlan<'a>,
         batch_function_indices: &[usize],
     ) -> Result<Vec<CompiledJitFunction>, String> {
         let mut compiled_functions = Vec::with_capacity(batch_function_indices.len());
-        let mut jit_plan_cache: JitWorkerPlanCache = HashMap::new();
         for batch_function_index in batch_function_indices {
             let compiled_function = Self::compile_reserved_direct_function_index(
-                jit_module,
+                codegen_env,
                 inputs,
                 plan,
                 *batch_function_index,
-                &mut jit_plan_cache,
             )?;
             compiled_functions.push(compiled_function);
         }
@@ -2394,9 +2587,7 @@ impl ProcessJitState {
                 worker_metrics: JitBatchWorkerMetrics::default(),
             });
         }
-        let worker_count = std::thread::available_parallelism()
-            .map_or(1, usize::from)
-            .min(function_count);
+        let worker_count = jit_batch_worker_count(function_count)?;
         if worker_count <= 1 {
             let worker_output = Self::compile_reserved_direct_function_batch_worker(
                 inputs,
@@ -2445,11 +2636,10 @@ impl ProcessJitState {
     }
 
     fn compile_reserved_direct_function_index<'a>(
-        jit_module: &mut JITModule,
+        codegen_env: &mut impl JitCodegenEnv,
         inputs: &DirectFunctionCompileInputs<'a>,
         plan: &JitBatchPlan<'a>,
         batch_function_index: usize,
-        jit_plan_cache: &mut JitWorkerPlanCache,
     ) -> Result<CompiledJitFunction, String> {
         let batch_function = &plan.batch_functions[batch_function_index];
         let function = &batch_function.function;
@@ -2486,28 +2676,12 @@ impl ProcessJitState {
             )
         };
         let function_module_constant_binding_key = reserved_inputs.module_constant_binding_key;
-        if !jit_plan_cache.contains_key(&function_module_constant_binding_key) {
-            let value_facts = infer_jit_value_facts(function_module);
-            let jit_module_local_plan = plan_jit_module_locals(function_module, &value_facts)?;
-            let jit_module_deopt_resume_plan =
-                plan_jit_deopt_resume_module(function_module, &value_facts)?;
-            jit_plan_cache.insert(
-                function_module_constant_binding_key,
-                (
-                    value_facts,
-                    jit_module_local_plan,
-                    jit_module_deopt_resume_plan,
-                ),
-            );
-        }
-        let (
-            function_value_facts,
-            function_jit_module_local_plan,
-            function_jit_module_deopt_resume_plan,
-        ) = jit_plan_cache
+        let function_module_plan = plan
+            .module_plans
             .get(&function_module_constant_binding_key)
-            .expect("JIT plan cache entry should exist after insertion");
-        let function_jit_local_plan = function_jit_module_local_plan
+            .expect("JIT module plan should be precomputed before worker codegen");
+        let function_jit_local_plan = function_module_plan
+            .locals
             .function(function.function_id)
             .ok_or_else(|| {
                 format!(
@@ -2515,7 +2689,8 @@ impl ProcessJitState {
                     function.function_id, function.names.qualname
                 )
             })?;
-        let function_jit_deopt_resume_plan = function_jit_module_deopt_resume_plan
+        let function_jit_deopt_resume_plan = function_module_plan
+            .deopt_resume
             .function(function.function_id)
             .ok_or_else(|| {
                 format!(
@@ -2529,11 +2704,11 @@ impl ProcessJitState {
             reserved_inputs.module_constant_ptrs.as_slice(),
         )?);
         let built = build_cranelift_run_bb_specialized_function(
-            jit_module,
+            codegen_env,
             function_blocks,
             function_module,
             function,
-            function_value_facts,
+            &function_module_plan.value_facts,
             function_jit_local_plan,
             function_jit_deopt_resume_plan,
             function_module_constants,
@@ -2571,7 +2746,7 @@ impl ProcessJitState {
         let function_name =
             direct_function_backend_name(function, batch_function.source.shared_state());
         let compiled = compile_prepared_function_bytes(
-            jit_module,
+            codegen_env,
             main_id,
             &mut ctx,
             function_name.as_str(),
@@ -2583,11 +2758,11 @@ impl ProcessJitState {
                 function.names.qualname, function.function_id
             )
         })?;
-        jit_module.clear_context(&mut ctx);
+        codegen_env.codegen_clear_context(&mut ctx);
         let default_adapter_compiled = match (default_adapter_id, default_adapter_symbol.as_ref()) {
             (Some(default_adapter_id), Some(default_adapter_symbol)) => {
                 let mut default_ctx = build_default_resolving_direct_adapter(
-                    jit_module,
+                    codegen_env,
                     function,
                     main_id,
                     default_adapter_id,
@@ -2599,7 +2774,7 @@ impl ProcessJitState {
                     )
                 })?;
                 let compiled = compile_prepared_function_bytes(
-                    jit_module,
+                    codegen_env,
                     default_adapter_id,
                     &mut default_ctx,
                     default_adapter_symbol.as_str(),
@@ -2611,7 +2786,7 @@ impl ProcessJitState {
                         function.names.qualname, function.function_id
                     )
                 })?;
-                jit_module.clear_context(&mut default_ctx);
+                codegen_env.codegen_clear_context(&mut default_ctx);
                 Some(compiled)
             }
             (None, None) => None,
@@ -2702,12 +2877,13 @@ impl ProcessJitState {
                 default_code_ptr,
                 defined.param_count,
                 Arc::clone(&defined.deopt_table),
+                defined.stats,
             )?;
             let code_id = jitdump::record_code_load(
                 &defined.main_symbol,
                 code_ptr.cast::<u8>(),
                 defined.compiled.artifact.code_size,
-                jit_module.isa(),
+                jit_module.codegen_isa(),
                 defined.compiled.artifact.systemv_unwind_info.as_ref(),
             )?;
             record_jit_bb_map(
@@ -2740,7 +2916,7 @@ impl ProcessJitState {
                     default_adapter_symbol,
                     default_code_ptr.cast::<u8>(),
                     default_adapter_compiled.artifact.code_size,
-                    jit_module.isa(),
+                    jit_module.codegen_isa(),
                     default_adapter_compiled
                         .artifact
                         .systemv_unwind_info
@@ -2792,6 +2968,7 @@ struct CompiledSpecializedRunner {
 
 pub(crate) struct CompiledFunctionHandle {
     handle: ObjPtr,
+    stats: Option<JitCodegenStats>,
 }
 
 pub(crate) struct DirectFunctionCompileResult {
@@ -2821,6 +2998,7 @@ impl CompiledFunctionHandle {
         default_code_ptr: *const u8,
         param_count: usize,
         deopt_table: Arc<RuntimeJitDeoptTable>,
+        stats: Option<JitCodegenStats>,
     ) -> Self {
         Self {
             handle: new_compiled_direct_runner_handle(
@@ -2830,7 +3008,12 @@ impl CompiledFunctionHandle {
                 param_count,
                 deopt_table,
             ),
+            stats,
         }
+    }
+
+    pub(crate) fn jit_stats(&self) -> Option<&JitCodegenStats> {
+        self.stats.as_ref()
     }
 
     #[cfg(test)]
@@ -2928,6 +3111,7 @@ pub(crate) fn lookup_precompiled_direct_function_handle(
         default_code_ptr,
         function.params.len(),
         deopt_table,
+        None,
     ))))
 }
 
@@ -4541,7 +4725,7 @@ fn emit_super_instance_arg_with_local_env(
     instance_expr: &InstrCodegen,
     local_env: &mut LocalEnv,
     ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> SuperInstanceArg {
     if let Some(value_expr) = load_deleted_name_arg(instance_expr, ctx.module_constants) {
@@ -4560,7 +4744,7 @@ fn emit_super_instance_arg_with_local_env(
             local_env,
             ctx,
             false,
-            jit_module,
+            codegen_env,
             func_imports,
         );
         return SuperInstanceArg {
@@ -4577,7 +4761,7 @@ fn emit_super_instance_arg_with_local_env(
         local_env,
         ctx,
         instance_is_borrowed,
-        jit_module,
+        codegen_env,
         func_imports,
     );
     SuperInstanceArg {
@@ -4595,7 +4779,7 @@ fn emit_codegen_super_helper_call_with_local_env(
     instance_expr: &InstrCodegen,
     local_env: &mut LocalEnv,
     ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> ir::Value {
     let ptr_ty = ctx.consts.ptr_ty;
@@ -4608,7 +4792,7 @@ fn emit_codegen_super_helper_call_with_local_env(
         local_env,
         ctx,
         callable_is_borrowed,
-        jit_module,
+        codegen_env,
         func_imports,
     );
 
@@ -4620,7 +4804,7 @@ fn emit_codegen_super_helper_call_with_local_env(
         local_env,
         ctx,
         super_fn_is_borrowed,
-        jit_module,
+        codegen_env,
         func_imports,
     );
 
@@ -4632,7 +4816,7 @@ fn emit_codegen_super_helper_call_with_local_env(
         local_env,
         ctx,
         cls_is_borrowed,
-        jit_module,
+        codegen_env,
         func_imports,
     );
 
@@ -4641,7 +4825,7 @@ fn emit_codegen_super_helper_call_with_local_env(
         instance_expr,
         local_env,
         ctx,
-        jit_module,
+        codegen_env,
         func_imports,
     );
     if let Some(instance_is_deleted) = instance_arg.is_deleted {
@@ -4658,7 +4842,7 @@ fn emit_codegen_super_helper_call_with_local_env(
 
         fb.switch_to_block(instance_deleted_block);
         let raise_super_arg_deleted_ref = func_imports.get_or_panic(
-            jit_module,
+            codegen_env,
             &mut fb.func,
             &DP_JIT_RAISE_SUPER_ARG_DELETED_IMPORT,
         );
@@ -6030,11 +6214,11 @@ enum RelocCallableRef {
     },
 }
 
-struct LocalEnvCodegenIntrinsicEmitState<'a, 'b, 'mc, 'c, 'd> {
+struct LocalEnvCodegenIntrinsicEmitState<'a, 'b, 'mc, 'c, 'd, Env: JitCodegenEnv> {
     fb: &'a mut FunctionBuilder<'b>,
     local_env: &'c mut LocalEnv,
     ctx: &'c JitEmitCtx<'mc>,
-    jit_module: &'a mut JITModule,
+    codegen_env: &'a mut Env,
     func_imports: &'a mut FuncBuildImports<'d>,
 }
 
@@ -6717,7 +6901,7 @@ fn emit_local_store_with_local_env(
     op: &Store<InstrCodegen>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Option<ir::Value> {
     let result = emit_local_store_result_with_local_env(
@@ -6727,7 +6911,7 @@ fn emit_local_store_with_local_env(
         local_env,
         emit_ctx,
         ResultDemand::PYOBJECT_OWNED,
-        jit_module,
+        codegen_env,
         func_imports,
     )?;
     let (value, ownership, _) = result.expect_pyobject("legacy local store result");
@@ -6769,7 +6953,7 @@ fn emit_local_store_result_with_local_env(
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     demand: ResultDemand,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Option<EmitResult> {
     if let Some(location) = op.name.local_location() {
@@ -6806,7 +6990,7 @@ fn emit_local_store_result_with_local_env(
             local_env,
             emit_ctx,
             false,
-            jit_module,
+            codegen_env,
             func_imports,
         );
         let value_ref_kind = match planned_local_store_effect(expr, location, emit_ctx) {
@@ -6865,7 +7049,7 @@ fn emit_local_store_result_with_local_env(
         local_env,
         emit_ctx,
         false,
-        jit_module,
+        codegen_env,
         func_imports,
     );
     let default_ref_kind = local_ref_kind_for_stored_value(&op.value, emit_ctx);
@@ -6911,7 +7095,7 @@ fn emit_typed_local_store_result_with_local_env(
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     demand: ResultDemand,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<Option<EmitResult>, String> {
     let Some(location) = op.name.local_location() else {
@@ -6953,7 +7137,7 @@ fn emit_typed_local_store_result_with_local_env(
                 local_env,
                 emit_ctx,
                 value_demand,
-                jit_module,
+                codegen_env,
                 func_imports,
             )?
         }
@@ -7248,8 +7432,8 @@ impl ExceptionStateSlots {
     }
 }
 
-impl<'a, 'b, 'mc, 'c, 'd> intrinsics::OperationEmitState<'b, InstrCodegen>
-    for LocalEnvCodegenIntrinsicEmitState<'a, 'b, 'mc, 'c, 'd>
+impl<'a, 'b, 'mc, 'c, 'd, Env: JitCodegenEnv> intrinsics::OperationEmitState<'b, InstrCodegen>
+    for LocalEnvCodegenIntrinsicEmitState<'a, 'b, 'mc, 'c, 'd, Env>
 {
     fn ctx(&self) -> &JitEmitCtx<'mc> {
         self.ctx
@@ -7261,7 +7445,7 @@ impl<'a, 'b, 'mc, 'c, 'd> intrinsics::OperationEmitState<'b, InstrCodegen>
 
     fn import_func(&mut self, spec: &'static ImportSpec) -> ir::FuncRef {
         self.func_imports
-            .get_or_panic(self.jit_module, &mut self.fb.func, spec)
+            .get_or_panic(self.codegen_env, &mut self.fb.func, spec)
     }
 
     fn emit_arg_values(&mut self, args: &[&InstrCodegen]) -> Vec<(ir::Value, bool)> {
@@ -7278,7 +7462,7 @@ impl<'a, 'b, 'mc, 'c, 'd> intrinsics::OperationEmitState<'b, InstrCodegen>
                 &mut *self.local_env,
                 self.ctx,
                 borrowed_arg,
-                self.jit_module,
+                self.codegen_env,
                 self.func_imports,
             );
             arg_values.push((value, borrowed_arg));
@@ -7333,7 +7517,7 @@ impl<'a, 'b, 'mc, 'c, 'd> intrinsics::OperationEmitState<'b, InstrCodegen>
         invert: bool,
     ) -> ir::Value {
         let is_true_ref = self.func_imports.get_or_panic(
-            self.jit_module,
+            self.codegen_env,
             &mut self.fb.func,
             &DP_JIT_IS_TRUE_IMPORT,
         );
@@ -7349,7 +7533,7 @@ impl<'a, 'b, 'mc, 'c, 'd> intrinsics::OperationEmitState<'b, InstrCodegen>
     }
 
     fn emit_type_ptr_value(&mut self, owner_type_ref: &RelocTypeRef) -> Option<ir::Value> {
-        emit_type_ptr_value_for_ref(self.fb, self.jit_module, self.ctx, owner_type_ref)
+        emit_type_ptr_value_for_ref(self.fb, self.codegen_env, self.ctx, owner_type_ref)
             .unwrap_or_else(|err| {
                 panic!("failed to bind type symbol during JIT codegen: {err}");
             })
@@ -8001,11 +8185,11 @@ fn build_counted_runtime_refcount_helper(
     scalar_counter_data_id: DataId,
     counter_slot: usize,
 ) -> Result<FuncId, String> {
-    let ptr_ty = jit_module.target_config().pointer_type();
+    let ptr_ty = jit_module.codegen_target_config().pointer_type();
     let sig = lower_static_signature(jit_module, wrapper_import.signature);
     let helper_id = declare_local_fn(jit_module, symbol_name, &sig)?;
 
-    let mut ctx = jit_module.make_context();
+    let mut ctx = jit_module.codegen_make_context();
     ctx.func.signature = sig;
     let mut builder_ctx = FunctionBuilderContext::new();
     {
@@ -8019,7 +8203,8 @@ fn build_counted_runtime_refcount_helper(
         let runtime_ref = func_imports.get_or_panic(jit_module, &mut fb.func, applied_import);
         let runtime_call = fb.ins().call(runtime_ref, &call_args);
         let applied = fb.inst_results(runtime_call)[0];
-        let counter_data = jit_module.declare_data_in_func(scalar_counter_data_id, &mut fb.func);
+        let counter_data =
+            jit_module.codegen_declare_data_in_func(scalar_counter_data_id, &mut fb.func)?;
         let scalar_counter_base_value = fb.ins().global_value(ptr_ty, counter_data);
         let (counter_addr, counter_offset) =
             scalar_counter_addr(&mut fb, scalar_counter_base_value, counter_slot);
@@ -8049,7 +8234,7 @@ fn build_counted_runtime_refcount_helper(
         function_name,
         "failed to define counted runtime refcount helper",
     )?;
-    jit_module.clear_context(&mut ctx);
+    jit_module.codegen_clear_context(&mut ctx);
     Ok(helper_id)
 }
 
@@ -8330,7 +8515,7 @@ fn emit_codegen_tuple_with_local_env(
     tuple: &blockpy_intrinsics::Tuple<InstrCodegen>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> ir::Value {
     let mut arg_values: Vec<ir::Value> = Vec::with_capacity(tuple.values.len());
@@ -8344,7 +8529,7 @@ fn emit_codegen_tuple_with_local_env(
             local_env,
             emit_ctx,
             borrowed_arg,
-            jit_module,
+            codegen_env,
             func_imports,
         );
         arg_values.push(value);
@@ -8394,11 +8579,11 @@ fn emit_positional_vectorcall_with_local_env(
     args: &[&InstrCodegen],
     local_env: &mut LocalEnv,
     ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> ir::Value {
     let (arg_values, arg_borrowed) =
-        emit_positional_arg_values(fb, args, local_env, ctx, jit_module, func_imports);
+        emit_positional_arg_values(fb, args, local_env, ctx, codegen_env, func_imports);
     let result = emit_positional_vectorcall_result_with_arg_values(
         fb,
         callable,
@@ -8420,12 +8605,12 @@ fn emit_positional_vectorcall_result_with_local_env(
     args: &[&InstrCodegen],
     local_env: &mut LocalEnv,
     ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
     demand: ResultDemand,
 ) -> EmitResult {
     let (arg_values, arg_borrowed) =
-        emit_positional_arg_values(fb, args, local_env, ctx, jit_module, func_imports);
+        emit_positional_arg_values(fb, args, local_env, ctx, codegen_env, func_imports);
     emit_positional_vectorcall_result_with_arg_values(
         fb,
         callable,
@@ -8497,12 +8682,12 @@ fn emit_positional_call_three_with_local_env(
     args: &[&InstrCodegen],
     local_env: &mut LocalEnv,
     ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> ir::Value {
     debug_assert!(args.len() <= 3);
     let (arg_values, arg_borrowed) =
-        emit_positional_arg_values(fb, args, local_env, ctx, jit_module, func_imports);
+        emit_positional_arg_values(fb, args, local_env, ctx, codegen_env, func_imports);
     let result = emit_positional_call_three_result_with_arg_values(
         fb,
         callable,
@@ -8524,13 +8709,13 @@ fn emit_positional_call_three_result_with_local_env(
     args: &[&InstrCodegen],
     local_env: &mut LocalEnv,
     ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
     demand: ResultDemand,
 ) -> EmitResult {
     debug_assert!(args.len() <= 3);
     let (arg_values, arg_borrowed) =
-        emit_positional_arg_values(fb, args, local_env, ctx, jit_module, func_imports);
+        emit_positional_arg_values(fb, args, local_env, ctx, codegen_env, func_imports);
     emit_positional_call_three_result_with_arg_values(
         fb,
         callable,
@@ -8547,7 +8732,7 @@ fn emit_positional_arg_values(
     args: &[&InstrCodegen],
     local_env: &mut LocalEnv,
     ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> (Vec<ir::Value>, Vec<bool>) {
     let mut arg_values: Vec<ir::Value> = Vec::with_capacity(args.len());
@@ -8562,7 +8747,7 @@ fn emit_positional_arg_values(
             local_env,
             ctx,
             borrowed_arg,
-            jit_module,
+            codegen_env,
             func_imports,
         ));
     }
@@ -8813,7 +8998,7 @@ fn emit_keyword_call_with_local_env(
     keywords: &[(&str, &InstrCodegen)],
     local_env: &mut LocalEnv,
     ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> ir::Value {
     let result = emit_keyword_call_result_with_local_env(
@@ -8824,7 +9009,7 @@ fn emit_keyword_call_with_local_env(
         keywords,
         local_env,
         ctx,
-        jit_module,
+        codegen_env,
         func_imports,
         ResultDemand::PYOBJECT_OWNED,
     );
@@ -8842,7 +9027,7 @@ fn emit_keyword_call_result_with_local_env(
     keywords: &[(&str, &InstrCodegen)],
     local_env: &mut LocalEnv,
     ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
     demand: ResultDemand,
 ) -> EmitResult {
@@ -8856,7 +9041,7 @@ fn emit_keyword_call_result_with_local_env(
             local_env,
             ctx,
             borrowed_arg,
-            jit_module,
+            codegen_env,
             func_imports,
         );
         tuple_items.push((value, borrowed_arg));
@@ -8883,7 +9068,7 @@ fn emit_keyword_call_result_with_local_env(
             local_env,
             ctx,
             value_borrowed,
-            jit_module,
+            codegen_env,
             func_imports,
         );
         let mut cleanup_on_error = Vec::with_capacity(2);
@@ -8921,7 +9106,7 @@ fn emit_unpack_call_with_local_env(
     keywords: &[CallArgKeyword<InstrCodegen>],
     local_env: &mut LocalEnv,
     ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> ir::Value {
     let result = emit_unpack_call_result_with_local_env(
@@ -8932,7 +9117,7 @@ fn emit_unpack_call_with_local_env(
         keywords,
         local_env,
         ctx,
-        jit_module,
+        codegen_env,
         func_imports,
         ResultDemand::PYOBJECT_OWNED,
     );
@@ -8950,7 +9135,7 @@ fn emit_unpack_call_result_with_local_env(
     keywords: &[CallArgKeyword<InstrCodegen>],
     local_env: &mut LocalEnv,
     ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
     demand: ResultDemand,
 ) -> EmitResult {
@@ -8992,7 +9177,7 @@ fn emit_unpack_call_result_with_local_env(
             local_env,
             ctx,
             value_borrowed,
-            jit_module,
+            codegen_env,
             func_imports,
         );
         emit_one_arg_method_call_and_discard(
@@ -9023,7 +9208,7 @@ fn emit_unpack_call_result_with_local_env(
                     local_env,
                     ctx,
                     value_borrowed,
-                    jit_module,
+                    codegen_env,
                     func_imports,
                 );
                 let mut cleanup_on_error = Vec::with_capacity(2);
@@ -9052,7 +9237,7 @@ fn emit_unpack_call_result_with_local_env(
                     local_env,
                     ctx,
                     value_borrowed,
-                    jit_module,
+                    codegen_env,
                     func_imports,
                 );
                 emit_one_arg_method_call_and_discard(
@@ -9278,7 +9463,7 @@ fn emit_branch_index_i64(
     expr: &InstrCodegen,
     local_env: &mut LocalEnv,
     ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
     pyobject_to_i64_ref: ir::FuncRef,
 ) -> ir::Value {
@@ -9295,10 +9480,10 @@ fn emit_branch_index_i64(
                 local_env,
                 ctx,
                 callable_is_borrowed,
-                jit_module,
+                codegen_env,
                 func_imports,
             );
-            let callee_id = emit_callee_function_id_checked(fb, callable, ctx, jit_module);
+            let callee_id = emit_callee_function_id_checked(fb, callable, ctx, codegen_env);
             if !callable_is_borrowed {
                 fb.ins()
                     .call(ctx.decref_ref, &[ctx.consts.thread_state_value, callable]);
@@ -9312,7 +9497,7 @@ fn emit_branch_index_i64(
                 local_env,
                 ctx,
                 false,
-                jit_module,
+                codegen_env,
                 func_imports,
             );
             let index_i64_inst = fb.ins().call(pyobject_to_i64_ref, &[index_obj]);
@@ -9573,7 +9758,9 @@ fn collect_make_function_targets(
     out
 }
 
-fn is_synthetic_class_helper_function(function: &BlockPyFunction<CodegenModuleShape>) -> bool {
+pub(crate) fn is_synthetic_class_helper_function(
+    function: &BlockPyFunction<CodegenModuleShape>,
+) -> bool {
     function.names.bind_name.starts_with("_dp_class_ns_")
         || function.names.bind_name.starts_with("_dp_define_class_")
 }
@@ -9994,7 +10181,7 @@ fn ensure_reloc_type_symbol_registered(owner_type_ref: &RelocTypeRef) -> Result<
 }
 
 fn type_ptr_data_id_for_ref(
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     ctx: &JitEmitCtx<'_>,
     owner_type_ref: &RelocTypeRef,
 ) -> Result<Option<DataId>, String> {
@@ -10005,7 +10192,7 @@ fn type_ptr_data_id_for_ref(
         return Ok(None);
     }
     let symbol = reloc_type_ref_symbol_name(owner_type_ref);
-    let data_id = declare_type_ptr_import(jit_module, symbol.as_ref())?;
+    let data_id = declare_type_ptr_import(codegen_env, symbol.as_ref())?;
     ctx.type_ptr_data_ids
         .borrow_mut()
         .insert(owner_type_ref.clone(), data_id);
@@ -10014,14 +10201,14 @@ fn type_ptr_data_id_for_ref(
 
 fn emit_type_ptr_value_for_ref(
     fb: &mut FunctionBuilder<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     ctx: &JitEmitCtx<'_>,
     owner_type_ref: &RelocTypeRef,
 ) -> Result<Option<ir::Value>, String> {
-    let Some(data_id) = type_ptr_data_id_for_ref(jit_module, ctx, owner_type_ref)? else {
+    let Some(data_id) = type_ptr_data_id_for_ref(codegen_env, ctx, owner_type_ref)? else {
         return Ok(None);
     };
-    let type_data = jit_module.declare_data_in_func(data_id, &mut fb.func);
+    let type_data = codegen_env.codegen_declare_data_in_func(data_id, &mut fb.func)?;
     Ok(Some(fb.ins().global_value(ctx.consts.ptr_ty, type_data)))
 }
 
@@ -10067,7 +10254,7 @@ fn ensure_reloc_callable_symbol_registered(
 }
 
 fn callable_ptr_data_id_for_ref(
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     ctx: &JitEmitCtx<'_>,
     callable_ref: &RelocCallableRef,
 ) -> Result<Option<DataId>, String> {
@@ -10083,7 +10270,7 @@ fn callable_ptr_data_id_for_ref(
         return Ok(None);
     }
     let symbol = reloc_callable_ref_symbol_name(callable_ref);
-    let data_id = declare_type_ptr_import(jit_module, symbol.as_str())?;
+    let data_id = declare_type_ptr_import(codegen_env, symbol.as_str())?;
     ctx.callable_ptr_data_ids
         .borrow_mut()
         .insert(callable_ref.clone(), data_id);
@@ -10092,14 +10279,14 @@ fn callable_ptr_data_id_for_ref(
 
 fn emit_callable_ptr_value_for_ref(
     fb: &mut FunctionBuilder<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     ctx: &JitEmitCtx<'_>,
     callable_ref: &RelocCallableRef,
 ) -> Result<Option<ir::Value>, String> {
-    let Some(data_id) = callable_ptr_data_id_for_ref(jit_module, ctx, callable_ref)? else {
+    let Some(data_id) = callable_ptr_data_id_for_ref(codegen_env, ctx, callable_ref)? else {
         return Ok(None);
     };
-    let callable_data = jit_module.declare_data_in_func(data_id, &mut fb.func);
+    let callable_data = codegen_env.codegen_declare_data_in_func(data_id, &mut fb.func)?;
     Ok(Some(
         fb.ins().global_value(ctx.consts.ptr_ty, callable_data),
     ))
@@ -10373,7 +10560,7 @@ fn emit_callee_function_id_checked(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
     ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
 ) -> ir::Value {
     #[repr(C)]
     struct PyMethodObjectPrefix {
@@ -10469,7 +10656,7 @@ fn emit_callee_function_id_checked(
     );
     let py_function_type = emit_type_ptr_value_for_ref(
         fb,
-        jit_module,
+        codegen_env,
         ctx,
         &RelocTypeRef::CpythonTypeSymbol(CpythonTypeSymbol::Function),
     )
@@ -10488,7 +10675,7 @@ fn emit_callee_function_id_checked(
     fb.switch_to_block(maybe_method_block);
     let py_method_type = emit_type_ptr_value_for_ref(
         fb,
-        jit_module,
+        codegen_env,
         ctx,
         &RelocTypeRef::CpythonTypeSymbol(CpythonTypeSymbol::Method),
     )
@@ -10515,7 +10702,7 @@ fn emit_callee_function_id_checked(
     fb.switch_to_block(maybe_type_block);
     let py_type_type = emit_type_ptr_value_for_ref(
         fb,
-        jit_module,
+        codegen_env,
         ctx,
         &RelocTypeRef::CpythonTypeSymbol(CpythonTypeSymbol::Type),
     )
@@ -10661,7 +10848,7 @@ fn emit_direct_call_resolved_raw_with_arg_values(
     entry_kind: DirectCallEntryKind,
     target_function: &BlockPyFunction<CodegenModuleShape>,
     ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
 ) -> ir::Value {
     debug_assert_eq!(arg_values.len(), target_function.params.len());
     let ptr_ty = ctx.consts.ptr_ty;
@@ -10710,7 +10897,9 @@ fn emit_direct_call_resolved_raw_with_arg_values(
             DirectCallEntryKind::Core => Some(function.func_id),
             DirectCallEntryKind::DefaultResolving => function.default_func_id,
         }) {
-        let func_ref = jit_module.declare_func_in_func(direct_func_id, &mut fb.func);
+        let func_ref = codegen_env
+            .codegen_declare_func_in_func(direct_func_id, &mut fb.func)
+            .expect("reserved direct function should be declared in codegen env");
         fb.ins().call(func_ref, &call_args)
     } else {
         ctx.direct_edge_stats.record_function_env_indirect_edge();
@@ -10720,7 +10909,7 @@ fn emit_direct_call_resolved_raw_with_arg_values(
         };
         let callee_ptr = load_function_env_obj(fb, ptr_ty, function_env, offset);
         let direct_sig =
-            fb.import_signature(make_direct_function_signature(jit_module, target_function));
+            fb.import_signature(make_direct_function_signature(codegen_env, target_function));
         fb.ins().call_indirect(direct_sig, callee_ptr, &call_args)
     };
     let call_value = fb.inst_results(call_inst)[0];
@@ -10746,7 +10935,7 @@ fn emit_direct_call_resolved_with_arg_values(
     entry_kind: DirectCallEntryKind,
     target_function: &BlockPyFunction<CodegenModuleShape>,
     ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
 ) -> ir::Value {
     let ptr_ty = ctx.consts.ptr_ty;
     let null_ptr = fb.ins().iconst(ptr_ty, 0);
@@ -10759,7 +10948,7 @@ fn emit_direct_call_resolved_with_arg_values(
         entry_kind,
         target_function,
         ctx,
-        jit_module,
+        codegen_env,
     );
     let call_is_null = fb
         .ins()
@@ -10786,7 +10975,7 @@ fn emit_direct_constructor_resolved_with_arg_values(
     specialization: &DirectConstructorSpecialization,
     target_function: &BlockPyFunction<CodegenModuleShape>,
     ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
 ) -> ir::Value {
     let ptr_ty = ctx.consts.ptr_ty;
     let null_ptr = fb.ins().iconst(ptr_ty, 0);
@@ -10840,7 +11029,7 @@ fn emit_direct_constructor_resolved_with_arg_values(
         ptr_ty,
     );
     let init_callable =
-        emit_callable_ptr_value_for_ref(fb, jit_module, ctx, &specialization.init_function_ref)
+        emit_callable_ptr_value_for_ref(fb, codegen_env, ctx, &specialization.init_function_ref)
             .unwrap_or_else(|err| panic!("failed to bind constructor callable symbol: {err}"))
             .expect("constructor callable symbol should be available");
     let init_result = emit_direct_call_resolved_raw_with_arg_values(
@@ -10856,7 +11045,7 @@ fn emit_direct_constructor_resolved_with_arg_values(
         },
         target_function,
         ctx,
-        jit_module,
+        codegen_env,
     );
     let init_failed = fb
         .ins()
@@ -10939,7 +11128,7 @@ fn emit_direct_call_resolved_with_arg_plan_from_local_env(
     target_function: &BlockPyFunction<CodegenModuleShape>,
     local_env: &mut LocalEnv,
     ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> ir::Value {
     let ptr_ty = ctx.consts.ptr_ty;
@@ -10955,7 +11144,7 @@ fn emit_direct_call_resolved_with_arg_plan_from_local_env(
             local_env,
             ctx,
             borrowed_arg,
-            jit_module,
+            codegen_env,
             func_imports,
         ));
     }
@@ -10979,7 +11168,7 @@ fn emit_direct_call_resolved_with_arg_plan_from_local_env(
         },
         target_function,
         ctx,
-        jit_module,
+        codegen_env,
     )
 }
 
@@ -10992,7 +11181,7 @@ fn emit_direct_constructor_resolved_with_args_from_local_env(
     target_function: &BlockPyFunction<CodegenModuleShape>,
     local_env: &mut LocalEnv,
     ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> ir::Value {
     let mut arg_values = Vec::with_capacity(args.len());
@@ -11007,7 +11196,7 @@ fn emit_direct_constructor_resolved_with_args_from_local_env(
             local_env,
             ctx,
             borrowed_arg,
-            jit_module,
+            codegen_env,
             func_imports,
         ));
     }
@@ -11020,7 +11209,7 @@ fn emit_direct_constructor_resolved_with_args_from_local_env(
         specialization,
         target_function,
         ctx,
-        jit_module,
+        codegen_env,
     )
 }
 
@@ -11033,7 +11222,7 @@ fn emit_direct_method_resolved_with_args_from_local_env(
     target_function: &BlockPyFunction<CodegenModuleShape>,
     local_env: &mut LocalEnv,
     ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> ir::Value {
     let ptr_ty = ctx.consts.ptr_ty;
@@ -11051,7 +11240,7 @@ fn emit_direct_method_resolved_with_args_from_local_env(
             local_env,
             ctx,
             borrowed_arg,
-            jit_module,
+            codegen_env,
             func_imports,
         ));
     }
@@ -11064,7 +11253,7 @@ fn emit_direct_method_resolved_with_args_from_local_env(
     );
     let callable = emit_callable_ptr_value_for_ref(
         fb,
-        jit_module,
+        codegen_env,
         ctx,
         &specialization.descriptor_function_ref,
     )
@@ -11083,7 +11272,7 @@ fn emit_direct_method_resolved_with_args_from_local_env(
         },
         target_function,
         ctx,
-        jit_module,
+        codegen_env,
     )
 }
 
@@ -11092,7 +11281,7 @@ fn emit_call_direct_expr_with_local_env(
     call: &soac_blockpy::block_py::CallDirect<InstrCodegen>,
     local_env: &mut LocalEnv,
     ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> ir::Value {
     let fallback_call = || {
@@ -11116,7 +11305,7 @@ fn emit_call_direct_expr_with_local_env(
             local_env,
             ctx,
             false,
-            jit_module,
+            codegen_env,
             func_imports,
         );
     };
@@ -11140,7 +11329,7 @@ fn emit_call_direct_expr_with_local_env(
                 local_env,
                 ctx,
                 false,
-                jit_module,
+                codegen_env,
                 func_imports,
             );
         }
@@ -11157,7 +11346,7 @@ fn emit_call_direct_expr_with_local_env(
         local_env,
         ctx,
         callable_is_borrowed,
-        jit_module,
+        codegen_env,
         func_imports,
     );
     let args = call
@@ -11179,7 +11368,7 @@ fn emit_call_direct_expr_with_local_env(
         target_function,
         local_env,
         ctx,
-        jit_module,
+        codegen_env,
         func_imports,
     )
 }
@@ -11199,7 +11388,7 @@ fn emit_planned_target_args_codegen_from_local_env(
     target_args: &[(String, BlockArg)],
     local_env: &LocalEnv,
     ctx: &JitEmitCtx<'_>,
-    _jit_module: &mut JITModule,
+    _codegen_env: &mut impl JitCodegenEnv,
     _func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<(Vec<ir::BlockArg>, HashSet<LocalLocation>), LocalEnvEdgePrepError> {
     let mut args = Vec::with_capacity(target_args.len());
@@ -11799,7 +11988,7 @@ fn emit_codegen_expr_value_with_local_env(
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     borrowed: bool,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> SoacValue {
     let facts = py_facts_for_codegen_expr_with_local_env(expr, local_env, emit_ctx)
@@ -11810,7 +11999,7 @@ fn emit_codegen_expr_value_with_local_env(
         local_env,
         emit_ctx,
         borrowed,
-        jit_module,
+        codegen_env,
         func_imports,
     );
     SoacValue::pyobject(value, facts)
@@ -11823,7 +12012,7 @@ fn emit_typed_codegen_expr_value_with_local_env(
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     borrowed: bool,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<SoacValue, String> {
     if let InstrTyped::Load(op) = expr {
@@ -11850,10 +12039,10 @@ fn emit_typed_codegen_expr_value_with_local_env(
             local_env,
             emit_ctx,
             false,
-            jit_module,
+            codegen_env,
             func_imports,
         )?;
-        let is_true_ref = func_imports.get(jit_module, &mut fb.func, &DP_JIT_IS_TRUE_IMPORT)?;
+        let is_true_ref = func_imports.get(codegen_env, &mut fb.func, &DP_JIT_IS_TRUE_IMPORT)?;
         return Ok(emit_truthy_from_owned_value(
             fb,
             value,
@@ -11870,7 +12059,7 @@ fn emit_typed_codegen_expr_value_with_local_env(
             local_env,
             emit_ctx,
             borrowed,
-            jit_module,
+            codegen_env,
             func_imports,
         ));
     }
@@ -11882,7 +12071,7 @@ fn emit_typed_codegen_expr_value_with_local_env(
         local_env,
         emit_ctx,
         borrowed,
-        jit_module,
+        codegen_env,
         func_imports,
     ))
 }
@@ -11922,7 +12111,7 @@ fn emit_codegen_simple_call_effect_only_with_local_env(
     call: &soac_blockpy::block_py::Call<InstrCodegen>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Option<EmitResult> {
     let SimpleCallParts {
@@ -11943,7 +12132,7 @@ fn emit_codegen_simple_call_effect_only_with_local_env(
             local_env,
             emit_ctx,
             callable_is_borrowed,
-            jit_module,
+            codegen_env,
             func_imports,
         );
         return Some(emit_unpack_call_result_with_local_env(
@@ -11954,7 +12143,7 @@ fn emit_codegen_simple_call_effect_only_with_local_env(
             call.keywords.as_slice(),
             local_env,
             emit_ctx,
-            jit_module,
+            codegen_env,
             func_imports,
             ResultDemand::EffectOnly,
         ));
@@ -11972,7 +12161,7 @@ fn emit_codegen_simple_call_effect_only_with_local_env(
             local_env,
             emit_ctx,
             callable_is_borrowed,
-            jit_module,
+            codegen_env,
             func_imports,
         );
         return Some(emit_keyword_call_result_with_local_env(
@@ -11983,7 +12172,7 @@ fn emit_codegen_simple_call_effect_only_with_local_env(
             simple_keywords.as_slice(),
             local_env,
             emit_ctx,
-            jit_module,
+            codegen_env,
             func_imports,
             ResultDemand::EffectOnly,
         ));
@@ -12022,14 +12211,14 @@ fn emit_codegen_simple_call_effect_only_with_local_env(
         local_env,
         emit_ctx,
         callable_is_borrowed,
-        jit_module,
+        codegen_env,
         func_imports,
     );
     if let Some(counter_id) = site_instr_id
         .and_then(|site_instr_id| emit_ctx.call_target_counter_ids.get(&site_instr_id))
         .copied()
     {
-        let callee_id = emit_callee_function_id_checked(fb, callable, emit_ctx, jit_module);
+        let callee_id = emit_callee_function_id_checked(fb, callable, emit_ctx, codegen_env);
         emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
     }
     Some(if simple_args.len() <= 3 {
@@ -12040,7 +12229,7 @@ fn emit_codegen_simple_call_effect_only_with_local_env(
             simple_args.as_slice(),
             local_env,
             emit_ctx,
-            jit_module,
+            codegen_env,
             func_imports,
             ResultDemand::EffectOnly,
         )
@@ -12052,7 +12241,7 @@ fn emit_codegen_simple_call_effect_only_with_local_env(
             simple_args.as_slice(),
             local_env,
             emit_ctx,
-            jit_module,
+            codegen_env,
             func_imports,
             ResultDemand::EffectOnly,
         )
@@ -12064,7 +12253,7 @@ fn emit_codegen_simple_call_with_local_env(
     call: &soac_blockpy::block_py::Call<InstrCodegen>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Option<ir::Value> {
     let SimpleCallParts {
@@ -12103,7 +12292,7 @@ fn emit_codegen_simple_call_with_local_env(
             simple_args[2],
             local_env,
             emit_ctx,
-            jit_module,
+            codegen_env,
             func_imports,
         ));
     }
@@ -12142,7 +12331,7 @@ fn emit_codegen_simple_call_with_local_env(
             local_env,
             emit_ctx,
             iterator_is_borrowed,
-            jit_module,
+            codegen_env,
             func_imports,
         );
         let sentinel = emit_owned_module_constant(
@@ -12153,7 +12342,7 @@ fn emit_codegen_simple_call_with_local_env(
             emit_ctx,
         );
         let next_or_sentinel_ref =
-            func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_NEXT_OR_SENTINEL_IMPORT);
+            func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_NEXT_OR_SENTINEL_IMPORT);
         let next_inst = fb.ins().call(next_or_sentinel_ref, &[iterator, sentinel]);
         let mut owned_inputs = Vec::with_capacity(2);
         if !iterator_is_borrowed {
@@ -12194,7 +12383,7 @@ fn emit_codegen_simple_call_with_local_env(
             local_env,
             emit_ctx,
             callable_is_borrowed,
-            jit_module,
+            codegen_env,
             func_imports,
         );
         return Some(emit_unpack_call_with_local_env(
@@ -12205,7 +12394,7 @@ fn emit_codegen_simple_call_with_local_env(
             call.keywords.as_slice(),
             local_env,
             emit_ctx,
-            jit_module,
+            codegen_env,
             func_imports,
         ));
     }
@@ -12256,7 +12445,7 @@ fn emit_codegen_simple_call_with_local_env(
                 local_env,
                 emit_ctx,
                 value_borrowed,
-                jit_module,
+                codegen_env,
                 func_imports,
             );
             let value_is_null = fb
@@ -12398,7 +12587,7 @@ fn emit_codegen_simple_call_with_local_env(
                 local_env,
                 emit_ctx,
                 receiver_is_borrowed,
-                jit_module,
+                codegen_env,
                 func_imports,
             );
             let result_block = fb.create_block();
@@ -12426,7 +12615,7 @@ fn emit_codegen_simple_call_with_local_env(
             for (index, specialization) in direct_method_specializations.iter().enumerate() {
                 let Some(expected_type) = emit_type_ptr_value_for_ref(
                     fb,
-                    jit_module,
+                    codegen_env,
                     emit_ctx,
                     &specialization.owner_type_ref,
                 )
@@ -12472,7 +12661,7 @@ fn emit_codegen_simple_call_with_local_env(
                     target_function,
                     local_env,
                     emit_ctx,
-                    jit_module,
+                    codegen_env,
                     func_imports,
                 );
                 fb.ins()
@@ -12496,7 +12685,7 @@ fn emit_codegen_simple_call_with_local_env(
                         local_env,
                         emit_ctx,
                         attr_is_borrowed,
-                        jit_module,
+                        codegen_env,
                         func_imports,
                     );
                     let getattr_inst = fb
@@ -12531,7 +12720,7 @@ fn emit_codegen_simple_call_with_local_env(
                     let callable = fb.block_params(callable_ok_block)[0];
                     if let Some(counter_id) = call_target_counter {
                         let callee_id =
-                            emit_callee_function_id_checked(fb, callable, emit_ctx, jit_module);
+                            emit_callee_function_id_checked(fb, callable, emit_ctx, codegen_env);
                         emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
                     }
                     if let Some(counter_id) = direct_fallback_counter_id {
@@ -12545,7 +12734,7 @@ fn emit_codegen_simple_call_with_local_env(
                             simple_args.as_slice(),
                             local_env,
                             emit_ctx,
-                            jit_module,
+                            codegen_env,
                             func_imports,
                         )
                     } else {
@@ -12556,7 +12745,7 @@ fn emit_codegen_simple_call_with_local_env(
                             simple_args.as_slice(),
                             local_env,
                             emit_ctx,
-                            jit_module,
+                            codegen_env,
                             func_imports,
                         )
                     };
@@ -12601,14 +12790,14 @@ fn emit_codegen_simple_call_with_local_env(
             local_env,
             emit_ctx,
             callable_is_borrowed,
-            jit_module,
+            codegen_env,
             func_imports,
         );
         let should_emit_callee_id = call_target_counter.is_some()
             || !constructor_specializations.is_empty()
             || !direct_specializations.is_empty();
         let callee_id = should_emit_callee_id
-            .then(|| emit_callee_function_id_checked(fb, callable, emit_ctx, jit_module));
+            .then(|| emit_callee_function_id_checked(fb, callable, emit_ctx, codegen_env));
         if let Some(counter_id) = call_target_counter {
             let callee_id = callee_id.expect("callee id should exist for call target counter");
             emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
@@ -12645,7 +12834,7 @@ fn emit_codegen_simple_call_with_local_env(
                 for (index, specialization) in constructor_specializations.iter().enumerate() {
                     let Some(expected_type) = emit_type_ptr_value_for_ref(
                         fb,
-                        jit_module,
+                        codegen_env,
                         emit_ctx,
                         &specialization.owner_type_ref,
                     )
@@ -12702,7 +12891,7 @@ fn emit_codegen_simple_call_with_local_env(
                         target_function,
                         local_env,
                         emit_ctx,
-                        jit_module,
+                        codegen_env,
                         func_imports,
                     );
                     fb.ins()
@@ -12729,7 +12918,7 @@ fn emit_codegen_simple_call_with_local_env(
                 );
                 let py_function_type = emit_type_ptr_value_for_ref(
                     fb,
-                    jit_module,
+                    codegen_env,
                     emit_ctx,
                     &RelocTypeRef::CpythonTypeSymbol(CpythonTypeSymbol::Function),
                 )
@@ -12769,7 +12958,7 @@ fn emit_codegen_simple_call_with_local_env(
                         target_function,
                         local_env,
                         emit_ctx,
-                        jit_module,
+                        codegen_env,
                         func_imports,
                     );
                     fb.ins()
@@ -12797,7 +12986,7 @@ fn emit_codegen_simple_call_with_local_env(
                             simple_args.as_slice(),
                             local_env,
                             emit_ctx,
-                            jit_module,
+                            codegen_env,
                             func_imports,
                         )
                     } else {
@@ -12808,7 +12997,7 @@ fn emit_codegen_simple_call_with_local_env(
                             simple_args.as_slice(),
                             local_env,
                             emit_ctx,
-                            jit_module,
+                            codegen_env,
                             func_imports,
                         )
                     };
@@ -12856,7 +13045,7 @@ fn emit_codegen_simple_call_with_local_env(
             simple_args.as_slice(),
             local_env,
             emit_ctx,
-            jit_module,
+            codegen_env,
             func_imports,
         ));
     }
@@ -12872,7 +13061,7 @@ fn emit_codegen_simple_call_with_local_env(
             local_env,
             emit_ctx,
             callable_is_borrowed,
-            jit_module,
+            codegen_env,
             func_imports,
         );
         return Some(emit_keyword_call_with_local_env(
@@ -12883,7 +13072,7 @@ fn emit_codegen_simple_call_with_local_env(
             simple_keywords.as_slice(),
             local_env,
             emit_ctx,
-            jit_module,
+            codegen_env,
             func_imports,
         ));
     }
@@ -12896,7 +13085,7 @@ fn emit_codegen_make_function_with_closure_with_local_env(
     make_function: &soac_blockpy::block_py::MakeFunctionWithClosure<InstrCodegen>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> ir::Value {
     let function_id = fb.ins().iconst(
@@ -12918,7 +13107,7 @@ fn emit_codegen_make_function_with_closure_with_local_env(
         local_env,
         emit_ctx,
         captures_is_borrowed,
-        jit_module,
+        codegen_env,
         func_imports,
     );
     let param_defaults_is_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
@@ -12932,7 +13121,7 @@ fn emit_codegen_make_function_with_closure_with_local_env(
         local_env,
         emit_ctx,
         param_defaults_is_borrowed,
-        jit_module,
+        codegen_env,
         func_imports,
     );
     let annotate_fn_is_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
@@ -12946,7 +13135,7 @@ fn emit_codegen_make_function_with_closure_with_local_env(
         local_env,
         emit_ctx,
         annotate_fn_is_borrowed,
-        jit_module,
+        codegen_env,
         func_imports,
     );
     let globals = emit_ctx.consts.block_const;
@@ -12995,7 +13184,7 @@ fn emit_codegen_expr_with_local_env(
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     borrowed: bool,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> ir::Value {
     if let InstrCodegen::Load(op) = expr {
@@ -13025,7 +13214,7 @@ fn emit_codegen_expr_with_local_env(
             op,
             local_env,
             emit_ctx,
-            jit_module,
+            codegen_env,
             func_imports,
         );
     }
@@ -13039,7 +13228,7 @@ fn emit_codegen_expr_with_local_env(
             op,
             local_env,
             emit_ctx,
-            jit_module,
+            codegen_env,
             func_imports,
         );
     }
@@ -13059,10 +13248,10 @@ fn emit_codegen_expr_with_local_env(
             local_env,
             emit_ctx,
             callable_is_borrowed,
-            jit_module,
+            codegen_env,
             func_imports,
         );
-        let callee_id = emit_callee_function_id_checked(fb, callable, emit_ctx, jit_module);
+        let callee_id = emit_callee_function_id_checked(fb, callable, emit_ctx, codegen_env);
         if !callable_is_borrowed {
             fb.ins().call(
                 emit_ctx.decref_ref,
@@ -13105,7 +13294,7 @@ fn emit_codegen_expr_with_local_env(
             fb,
             local_env,
             ctx: emit_ctx,
-            jit_module,
+            codegen_env,
             func_imports,
         };
         if let Some(value) = intrinsics::emit_operation(expr, &mut intrinsic_state) {
@@ -13119,7 +13308,7 @@ fn emit_codegen_expr_with_local_env(
             op,
             local_env,
             emit_ctx,
-            jit_module,
+            codegen_env,
             func_imports,
         ) {
             return value;
@@ -13142,7 +13331,7 @@ fn emit_codegen_expr_with_local_env(
             local_env,
             emit_ctx,
             value_borrowed,
-            jit_module,
+            codegen_env,
             func_imports,
         );
         let call_inst = fb.ins().call(emit_ctx.store_cell_ref, &[raw_cell, value]);
@@ -13161,7 +13350,7 @@ fn emit_codegen_expr_with_local_env(
             fb,
             local_env,
             ctx: emit_ctx,
-            jit_module,
+            codegen_env,
             func_imports,
         };
         return intrinsics::OperationEmitState::finish_owned_result(
@@ -13183,7 +13372,7 @@ fn emit_codegen_expr_with_local_env(
             fb,
             local_env,
             ctx: emit_ctx,
-            jit_module,
+            codegen_env,
             func_imports,
         };
         return intrinsics::emit_del_deref_raw_cell(raw_cell, op.quietly, &mut intrinsic_state);
@@ -13198,7 +13387,7 @@ fn emit_codegen_expr_with_local_env(
             call,
             local_env,
             emit_ctx,
-            jit_module,
+            codegen_env,
             func_imports,
         );
     }
@@ -13213,7 +13402,7 @@ fn emit_codegen_expr_with_local_env(
             local_env,
             emit_ctx,
             ResultDemand::PYOBJECT_OWNED,
-            jit_module,
+            codegen_env,
             func_imports,
         ) {
             let (value, ownership, _) = result.expect_pyobject("runtime builtin expression result");
@@ -13228,7 +13417,7 @@ fn emit_codegen_expr_with_local_env(
             call,
             local_env,
             emit_ctx,
-            jit_module,
+            codegen_env,
             func_imports,
         ) {
             return value;
@@ -13652,7 +13841,7 @@ fn emit_checked_i64_overflow_result(
     value: ir::Value,
     overflow: ir::Value,
     emit_ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> ir::Value {
     let overflow_block = fb.create_block();
@@ -13668,7 +13857,7 @@ fn emit_checked_i64_overflow_result(
 
     fb.switch_to_block(overflow_block);
     let raise_overflow_ref =
-        func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_RAISE_I64_OVERFLOW_IMPORT);
+        func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_RAISE_I64_OVERFLOW_IMPORT);
     fb.ins().call(raise_overflow_ref, &[]);
     fb.ins().jump(
         emit_ctx.consts.step_null_block,
@@ -13685,7 +13874,7 @@ fn emit_i64_binop_result_with_local_env(
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     demand: ResultDemand,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Option<EmitResult> {
     if !matches!(demand, ResultDemand::I64 | ResultDemand::I64Index) {
@@ -13700,7 +13889,7 @@ fn emit_i64_binop_result_with_local_env(
         local_env,
         emit_ctx,
         ResultDemand::I64_VALUE,
-        jit_module,
+        codegen_env,
         func_imports,
     )
     .expect("I64-capable BinOp left operand should emit");
@@ -13711,7 +13900,7 @@ fn emit_i64_binop_result_with_local_env(
         local_env,
         emit_ctx,
         ResultDemand::I64_VALUE,
-        jit_module,
+        codegen_env,
         func_imports,
     )
     .expect("I64-capable BinOp right operand should emit");
@@ -13727,7 +13916,7 @@ fn emit_i64_binop_result_with_local_env(
         raw_value,
         overflow,
         emit_ctx,
-        jit_module,
+        codegen_env,
         func_imports,
     );
     Some(emit_i64_result_for_demand(
@@ -13745,7 +13934,7 @@ fn emit_exact_pylong_as_i64_saturating_result_with_local_env(
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     demand: ResultDemand,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> EmitResult {
     let value_is_borrowed =
@@ -13756,11 +13945,11 @@ fn emit_exact_pylong_as_i64_saturating_result_with_local_env(
         local_env,
         emit_ctx,
         value_is_borrowed,
-        jit_module,
+        codegen_env,
         func_imports,
     );
     let pylong_as_i64_saturating_ref = func_imports.get_or_panic(
-        jit_module,
+        codegen_env,
         &mut fb.func,
         &SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_IMPORT,
     );
@@ -13806,7 +13995,7 @@ fn emit_runtime_primitive_param_value_with_local_env(
     param: ParamAbi,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> (ir::Value, Option<ir::Value>) {
     match param {
@@ -13821,7 +14010,7 @@ fn emit_runtime_primitive_param_value_with_local_env(
                 local_env,
                 emit_ctx,
                 expr_is_borrowed,
-                jit_module,
+                codegen_env,
                 func_imports,
             );
             let owned_after_call = if expr_is_borrowed { None } else { Some(value) };
@@ -13842,7 +14031,7 @@ fn emit_runtime_primitive_param_value_with_local_env(
                 local_env,
                 emit_ctx,
                 ResultDemand::I64_VALUE,
-                jit_module,
+                codegen_env,
                 func_imports,
             );
             let (value, _) = coerced.expect_i64("runtime primitive PyLong-to-I64 param");
@@ -13855,7 +14044,7 @@ fn emit_runtime_primitive_param_value_with_local_env(
                 local_env,
                 emit_ctx,
                 ResultDemand::I64_VALUE,
-                jit_module,
+                codegen_env,
                 func_imports,
             )
             .expect("I64-capable runtime builtin argument should emit");
@@ -13943,7 +14132,7 @@ fn emit_runtime_builtin_primitive_desc_call_result_with_local_env(
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     demand: ResultDemand,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> EmitResult {
     let args = direct_positional_call_args(call, desc.abi.params.len())
@@ -13957,7 +14146,7 @@ fn emit_runtime_builtin_primitive_desc_call_result_with_local_env(
             param,
             local_env,
             emit_ctx,
-            jit_module,
+            codegen_env,
             func_imports,
         );
         call_args.push(value);
@@ -13966,7 +14155,7 @@ fn emit_runtime_builtin_primitive_desc_call_result_with_local_env(
         }
     }
     let func_ref = func_imports.get_or_panic(
-        jit_module,
+        codegen_env,
         &mut fb.func,
         runtime_primitive_import_spec(desc),
     );
@@ -13988,7 +14177,7 @@ fn emit_runtime_builtin_primitive_call_result_with_local_env(
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     demand: ResultDemand,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Option<EmitResult> {
     let desc = static_runtime_primitive_desc_for_call(call, emit_ctx.module_constants)?;
@@ -14006,7 +14195,7 @@ fn emit_runtime_builtin_primitive_call_result_with_local_env(
             local_env,
             emit_ctx,
             demand,
-            jit_module,
+            codegen_env,
             func_imports,
         ),
     )
@@ -14018,7 +14207,7 @@ fn emit_codegen_call_result_with_local_env(
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     demand: ResultDemand,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Option<EmitResult> {
     if let Some(result) = emit_runtime_builtin_primitive_call_result_with_local_env(
@@ -14027,7 +14216,7 @@ fn emit_codegen_call_result_with_local_env(
         local_env,
         emit_ctx,
         demand,
-        jit_module,
+        codegen_env,
         func_imports,
     ) {
         return Some(result);
@@ -14038,22 +14227,23 @@ fn emit_codegen_call_result_with_local_env(
             call,
             local_env,
             emit_ctx,
-            jit_module,
+            codegen_env,
             func_imports,
         )
     {
         return Some(result);
     }
-    emit_codegen_simple_call_with_local_env(fb, call, local_env, emit_ctx, jit_module, func_imports)
-        .map(|value| {
-            emit_owned_pyobject_result_for_demand(
-                fb,
-                value,
-                PyObjFacts::unknown(),
-                emit_ctx,
-                demand,
-            )
-        })
+    emit_codegen_simple_call_with_local_env(
+        fb,
+        call,
+        local_env,
+        emit_ctx,
+        codegen_env,
+        func_imports,
+    )
+    .map(|value| {
+        emit_owned_pyobject_result_for_demand(fb, value, PyObjFacts::unknown(), emit_ctx, demand)
+    })
 }
 
 fn emit_codegen_call_direct_result_with_local_env(
@@ -14062,7 +14252,7 @@ fn emit_codegen_call_direct_result_with_local_env(
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     demand: ResultDemand,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> EmitResult {
     let value = emit_call_direct_expr_with_local_env(
@@ -14070,7 +14260,7 @@ fn emit_codegen_call_direct_result_with_local_env(
         call,
         local_env,
         emit_ctx,
-        jit_module,
+        codegen_env,
         func_imports,
     );
     emit_owned_pyobject_result_for_demand(fb, value, PyObjFacts::unknown(), emit_ctx, demand)
@@ -14082,7 +14272,7 @@ fn emit_codegen_stmt_result_with_local_env(
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     demand: ResultDemand,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<EmitResult, String> {
     if matches!(demand, ResultDemand::I64 | ResultDemand::I64Index)
@@ -14106,7 +14296,7 @@ fn emit_codegen_stmt_result_with_local_env(
                 local_env,
                 emit_ctx,
                 demand,
-                jit_module,
+                codegen_env,
                 func_imports,
             ) {
                 return Ok(result);
@@ -14126,7 +14316,7 @@ fn emit_codegen_stmt_result_with_local_env(
                 local_env,
                 emit_ctx,
                 demand,
-                jit_module,
+                codegen_env,
                 func_imports,
             ) {
                 return Ok(result);
@@ -14139,7 +14329,7 @@ fn emit_codegen_stmt_result_with_local_env(
                 local_env,
                 emit_ctx,
                 demand,
-                jit_module,
+                codegen_env,
                 func_imports,
             ));
         }
@@ -14150,7 +14340,7 @@ fn emit_codegen_stmt_result_with_local_env(
                 local_env,
                 emit_ctx,
                 demand,
-                jit_module,
+                codegen_env,
                 func_imports,
             ) {
                 return Ok(result);
@@ -14159,7 +14349,7 @@ fn emit_codegen_stmt_result_with_local_env(
         _ => {}
     }
     let value =
-        emit_codegen_stmt_with_local_env(fb, expr, local_env, emit_ctx, jit_module, func_imports);
+        emit_codegen_stmt_with_local_env(fb, expr, local_env, emit_ctx, codegen_env, func_imports);
     Ok(emit_owned_pyobject_result_for_demand(
         fb,
         value,
@@ -14211,7 +14401,7 @@ fn emit_typed_codegen_expr_with_local_env(
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     borrowed: bool,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<ir::Value, String> {
     let value = emit_typed_codegen_expr_value_with_local_env(
@@ -14220,7 +14410,7 @@ fn emit_typed_codegen_expr_with_local_env(
         local_env,
         emit_ctx,
         borrowed,
-        jit_module,
+        codegen_env,
         func_imports,
     )?;
     Ok(match value {
@@ -14254,7 +14444,7 @@ fn emit_codegen_stmt_with_local_env(
     expr: &InstrCodegen,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> ir::Value {
     match expr {
@@ -14265,7 +14455,7 @@ fn emit_codegen_stmt_with_local_env(
                 op,
                 local_env,
                 emit_ctx,
-                jit_module,
+                codegen_env,
                 func_imports,
             ) {
                 return value;
@@ -14284,7 +14474,7 @@ fn emit_codegen_stmt_with_local_env(
         local_env,
         emit_ctx,
         false,
-        jit_module,
+        codegen_env,
         func_imports,
     )
 }
@@ -14295,7 +14485,7 @@ fn emit_typed_codegen_stmt_with_local_env(
     expr: &InstrTyped,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<ir::Value, String> {
     if matches!(
@@ -14308,7 +14498,7 @@ fn emit_typed_codegen_stmt_with_local_env(
             local_env,
             emit_ctx,
             false,
-            jit_module,
+            codegen_env,
             func_imports,
         );
     }
@@ -14319,7 +14509,7 @@ fn emit_typed_codegen_stmt_with_local_env(
         &legacy_expr,
         local_env,
         emit_ctx,
-        jit_module,
+        codegen_env,
         func_imports,
     ))
 }
@@ -14330,7 +14520,7 @@ fn emit_typed_codegen_stmt_result_with_local_env(
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     demand: ResultDemand,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<EmitResult, String> {
     if let InstrTyped::LegacyStore(op) = expr {
@@ -14341,7 +14531,7 @@ fn emit_typed_codegen_stmt_result_with_local_env(
             local_env,
             emit_ctx,
             demand,
-            jit_module,
+            codegen_env,
             func_imports,
         )? {
             return Ok(result);
@@ -14358,7 +14548,7 @@ fn emit_typed_codegen_stmt_result_with_local_env(
                 expr,
                 local_env,
                 emit_ctx,
-                jit_module,
+                codegen_env,
                 func_imports,
             );
         }
@@ -14367,7 +14557,7 @@ fn emit_typed_codegen_stmt_result_with_local_env(
             expr,
             local_env,
             emit_ctx,
-            jit_module,
+            codegen_env,
             func_imports,
         )?;
         return Ok(match demand {
@@ -14394,7 +14584,7 @@ fn emit_typed_codegen_stmt_result_with_local_env(
         local_env,
         emit_ctx,
         demand,
-        jit_module,
+        codegen_env,
         func_imports,
     )
 }
@@ -14404,17 +14594,17 @@ fn emit_typed_codegen_i32_bool01_result_with_local_env(
     expr: &InstrTyped,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<EmitResult, String> {
-    let is_true_ref = func_imports.get(jit_module, &mut fb.func, &DP_JIT_IS_TRUE_IMPORT)?;
+    let is_true_ref = func_imports.get(codegen_env, &mut fb.func, &DP_JIT_IS_TRUE_IMPORT)?;
     let value = emit_typed_codegen_expr_value_with_local_env(
         fb,
         expr,
         local_env,
         emit_ctx,
         false,
-        jit_module,
+        codegen_env,
         func_imports,
     )?;
     let truth = emit_truthy_from_owned_value(fb, value, is_true_ref, emit_ctx);
@@ -14427,7 +14617,7 @@ fn emit_typed_codegen_i64_index_result_with_local_env(
     expr: &InstrTyped,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
     pyobject_to_i64_ref: ir::FuncRef,
 ) -> Result<EmitResult, String> {
@@ -14437,7 +14627,7 @@ fn emit_typed_codegen_i64_index_result_with_local_env(
         &legacy_expr,
         local_env,
         emit_ctx,
-        jit_module,
+        codegen_env,
         func_imports,
         pyobject_to_i64_ref,
     );
@@ -14527,7 +14717,7 @@ fn emit_typed_codegen_ops(
     cleanup_null_block: ir::Block,
     pending_local_failure_cleanups: &mut Vec<PendingLocalFailureCleanup>,
     local_failure_cleanup_blocks: &mut HashMap<LocalFailureCleanupKey, ir::Block>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<(), String> {
     for expr in ops {
@@ -14558,7 +14748,7 @@ fn emit_typed_codegen_ops(
             local_env,
             stmt_emit_ctx,
             stmt_emit_ctx.result_demand_plan.demand_for_typed_stmt(expr),
-            jit_module,
+            codegen_env,
             func_imports,
         )?;
         discard_emit_result(fb, result, emit_ctx)?;
@@ -14579,7 +14769,7 @@ fn emit_codegen_if_target_arm(
     implicit_target_transports: &[EdgeTransportPlan],
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<(), String> {
     fb.switch_to_block(branch_block);
@@ -14591,7 +14781,7 @@ fn emit_codegen_if_target_arm(
         &edge_transport.target_args,
         local_env,
         emit_ctx,
-        jit_module,
+        codegen_env,
         func_imports,
     )
     .map_err(|err| {
@@ -14640,7 +14830,7 @@ fn emit_codegen_if_truth_i32(
     implicit_target_transports: &[EdgeTransportPlan],
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<(), String> {
     if let Some(test_instr_id) = test_instr_id {
@@ -14689,7 +14879,7 @@ fn emit_codegen_if_truth_i32(
         implicit_target_transports,
         &mut hot_local_env,
         emit_ctx,
-        jit_module,
+        codegen_env,
         func_imports,
     )?;
     let mut cold_local_env = local_env.clone();
@@ -14710,7 +14900,7 @@ fn emit_codegen_if_truth_i32(
         implicit_target_transports,
         &mut cold_local_env,
         emit_ctx,
-        jit_module,
+        codegen_env,
         func_imports,
     )
 }
@@ -14758,7 +14948,7 @@ fn emit_codegen_branch_table_from_i64(
     implicit_target_transports: &[EdgeTransportPlan],
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
     current_exception_name: Option<&str>,
 ) -> Result<(), String> {
@@ -14802,7 +14992,7 @@ fn emit_codegen_branch_table_from_i64(
                 &edge_transport.target_args,
                 &case_local_env,
                 emit_ctx,
-                jit_module,
+                codegen_env,
                 func_imports,
             )
             .map_err(|err| {
@@ -14849,7 +15039,7 @@ fn emit_codegen_branch_table_from_i64(
         &edge_transport.target_args,
         &default_local_env,
         emit_ctx,
-        jit_module,
+        codegen_env,
         func_imports,
     )
     .map_err(|err| {
@@ -15043,7 +15233,7 @@ fn emit_codegen_term(
     implicit_target_transports: &[EdgeTransportPlan],
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
     is_true_ref: ir::FuncRef,
     pyobject_to_i64_ref: ir::FuncRef,
@@ -15065,7 +15255,7 @@ fn emit_codegen_term(
                     &edge_transport.target_args,
                     local_env,
                     emit_ctx,
-                    jit_module,
+                    codegen_env,
                     func_imports,
                 )
                 .map_err(|err| {
@@ -15109,7 +15299,7 @@ fn emit_codegen_term(
                 local_env,
                 emit_ctx,
                 false,
-                jit_module,
+                codegen_env,
                 func_imports,
             );
             let truth = emit_truthy_from_owned_value(fb, test_value, is_true_ref, emit_ctx);
@@ -15127,7 +15317,7 @@ fn emit_codegen_term(
                 implicit_target_transports,
                 local_env,
                 emit_ctx,
-                jit_module,
+                codegen_env,
                 func_imports,
             )?;
         }
@@ -15137,7 +15327,7 @@ fn emit_codegen_term(
                 &branch.index,
                 local_env,
                 emit_ctx,
-                jit_module,
+                codegen_env,
                 func_imports,
                 pyobject_to_i64_ref,
             );
@@ -15152,7 +15342,7 @@ fn emit_codegen_term(
                 implicit_target_transports,
                 local_env,
                 emit_ctx,
-                jit_module,
+                codegen_env,
                 func_imports,
                 current_exception_name,
             )?;
@@ -15164,7 +15354,7 @@ fn emit_codegen_term(
                 local_env,
                 emit_ctx,
                 false,
-                jit_module,
+                codegen_env,
                 func_imports,
             );
             emit_codegen_return_pyobject(
@@ -15185,7 +15375,7 @@ fn emit_codegen_term(
                     local_env,
                     emit_ctx,
                     false,
-                    jit_module,
+                    codegen_env,
                     func_imports,
                 )
             } else {
@@ -15220,7 +15410,7 @@ fn emit_typed_codegen_term(
     implicit_target_transports: &[EdgeTransportPlan],
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
     is_true_ref: ir::FuncRef,
     pyobject_to_i64_ref: ir::FuncRef,
@@ -15246,7 +15436,7 @@ fn emit_typed_codegen_term(
                 &if_term.test,
                 local_env,
                 emit_ctx,
-                jit_module,
+                codegen_env,
                 func_imports,
             )?,
             other => {
@@ -15269,7 +15459,7 @@ fn emit_typed_codegen_term(
             implicit_target_transports,
             local_env,
             emit_ctx,
-            jit_module,
+            codegen_env,
             func_imports,
         );
     }
@@ -15290,7 +15480,7 @@ fn emit_typed_codegen_term(
                     local_env,
                     emit_ctx,
                     demand,
-                    jit_module,
+                    codegen_env,
                     func_imports,
                 )?
             }
@@ -15334,7 +15524,7 @@ fn emit_typed_codegen_term(
                         local_env,
                         emit_ctx,
                         demand,
-                        jit_module,
+                        codegen_env,
                         func_imports,
                     )?
                 }
@@ -15383,7 +15573,7 @@ fn emit_typed_codegen_term(
                 &branch.index,
                 local_env,
                 emit_ctx,
-                jit_module,
+                codegen_env,
                 func_imports,
                 pyobject_to_i64_ref,
             )?,
@@ -15405,7 +15595,7 @@ fn emit_typed_codegen_term(
             implicit_target_transports,
             local_env,
             emit_ctx,
-            jit_module,
+            codegen_env,
             func_imports,
             current_exception_name,
         );
@@ -15422,7 +15612,7 @@ fn emit_typed_codegen_term(
         implicit_target_transports,
         local_env,
         emit_ctx,
-        jit_module,
+        codegen_env,
         func_imports,
         is_true_ref,
         pyobject_to_i64_ref,
@@ -15617,6 +15807,178 @@ impl ProcessJitEngine {
         Ok(entry)
     }
 
+    fn lookup_ready_direct_function(
+        &self,
+        function: &BlockPyFunction<CodegenModuleShape>,
+    ) -> Result<Option<Arc<CompiledFunctionHandle>>, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "process JIT state lock poisoned".to_string())?;
+        Ok(state.ready_direct_function(function))
+    }
+
+    fn direct_function_needs_compile(
+        &self,
+        function: &BlockPyFunction<CodegenModuleShape>,
+    ) -> Result<bool, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "process JIT state lock poisoned".to_string())?;
+        let Some(entry) = state.direct_functions.get(&function.function_id) else {
+            return Ok(true);
+        };
+        if entry.shape() != &ProcessJitFunctionShape::for_function(function) {
+            return Ok(true);
+        }
+        Ok(entry.ready_entry().is_none() && entry.compile_waiter().is_none())
+    }
+
+    fn fail_reserved_direct_function_batch(&self, plan: &JitBatchPlan<'_>, err: &str) {
+        match self.state.lock() {
+            Ok(mut state) => state.fail_direct_function_batch(plan, err),
+            Err(_) => {
+                let wait_error = format!("{err}; process JIT state lock poisoned");
+                for waiter in plan.compile_waiters.values() {
+                    waiter.finish(Err(wait_error.clone()));
+                }
+            }
+        }
+    }
+
+    pub(crate) fn start_background_compile_shared_module(
+        &self,
+        session: Arc<crate::session::CompileSession>,
+        shared_state: Arc<crate::module_type::SharedModuleState>,
+    ) -> Result<(), String> {
+        if specialization_mode_from_env()?.is_some() {
+            return Ok(());
+        }
+        if shared_state.lowered_module.callable_defs.is_empty() {
+            return Ok(());
+        }
+        let module_name = shared_state.module_name.clone();
+        let thread_name = format!("soac-jit-bg-{module_name}");
+        std::thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || {
+                if let Err(err) = unsafe {
+                    ProcessJitEngine::compile_shared_module_in_background(session, shared_state)
+                } {
+                    warn!(
+                        target: "soac_jit_codegen",
+                        module_name = %module_name,
+                        error = %err,
+                        "jit_background_module_compile"
+                    );
+                }
+            })
+            .map(|_| ())
+            .map_err(|err| format!("failed to spawn process JIT background compile worker: {err}"))
+    }
+
+    unsafe fn compile_shared_module_in_background(
+        session: Arc<crate::session::CompileSession>,
+        shared_state: Arc<crate::module_type::SharedModuleState>,
+    ) -> Result<(), String> {
+        let batch_functions: Vec<_> = shared_state
+            .lowered_module
+            .callable_defs
+            .iter()
+            .filter(|function| function.function_id != FunctionId::global())
+            .cloned()
+            .map(|function| ProcessJitBatchFunction {
+                function,
+                source: ProcessJitBatchFunctionSource::OwnedSharedState(Arc::clone(&shared_state)),
+            })
+            .collect();
+        if batch_functions.is_empty() {
+            return Ok(());
+        }
+        let module_name = shared_state.module_name.clone();
+        let start = Instant::now();
+        let attempted = batch_functions.len();
+        let mut first_error = None;
+        let engine = session.process_jit()?;
+        loop {
+            let root_function = batch_functions
+                .iter()
+                .find_map(|batch_function| {
+                    match engine.direct_function_needs_compile(&batch_function.function) {
+                        Ok(true) => Some(Ok(batch_function.function.clone())),
+                        Ok(false) => None,
+                        Err(err) => Some(Err(err)),
+                    }
+                })
+                .transpose()?;
+            let Some(root_function) = root_function else {
+                break;
+            };
+            let blocks = vec![std::ptr::null_mut::<std::ffi::c_void>(); root_function.blocks.len()];
+            let module_constant_ptrs = shared_state.module_constant_ptrs();
+            match unsafe {
+                engine.compile_direct_function_precollected(
+                    &session,
+                    blocks.as_slice(),
+                    &shared_state.lowered_module,
+                    &root_function,
+                    &shared_state.codegen_constants,
+                    &shared_state.lowered_module.counter_defs,
+                    module_constant_ptrs.as_slice(),
+                    Some(shared_state.as_ref()),
+                    batch_functions.clone(),
+                )
+            } {
+                Ok(_result) => {}
+                Err(err) => {
+                    if first_error.is_none() {
+                        first_error = Some(format!(
+                            "{err} [background_function={} id={}]",
+                            root_function.names.qualname, root_function.function_id
+                        ));
+                    }
+                    break;
+                }
+            }
+        }
+        let elapsed = start.elapsed();
+        let compiled_or_ready = batch_functions
+            .iter()
+            .filter(|batch_function| {
+                engine
+                    .direct_function_needs_compile(&batch_function.function)
+                    .map(|needs_compile| !needs_compile)
+                    .unwrap_or(false)
+            })
+            .count();
+        match first_error {
+            Some(err) => {
+                warn!(
+                    target: "soac_jit_codegen",
+                    module_name = %module_name,
+                    attempted_function_count = attempted,
+                    compiled_or_ready_function_count = compiled_or_ready,
+                    elapsed_us = duration_micros(elapsed),
+                    error = %err,
+                    "jit_background_module_compile_done"
+                );
+                Err(err)
+            }
+            None => {
+                info!(
+                    target: "soac_jit_codegen",
+                    module_name = %module_name,
+                    attempted_function_count = attempted,
+                    compiled_or_ready_function_count = compiled_or_ready,
+                    elapsed_us = duration_micros(elapsed),
+                    "jit_background_module_compile_done"
+                );
+                Ok(())
+            }
+        }
+    }
+
     pub(crate) unsafe fn compile_direct_function(
         &self,
         session: &Arc<crate::session::CompileSession>,
@@ -15628,6 +15990,107 @@ impl ProcessJitEngine {
         module_constant_ptrs: &[*mut ffi::PyObject],
         direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
     ) -> Result<DirectFunctionCompileResult, String> {
+        let mut background_wait_errors = 0usize;
+        loop {
+            match self.compile_direct_function_once(
+                session,
+                blocks,
+                module,
+                function,
+                module_constants,
+                counter_defs,
+                module_constant_ptrs,
+                direct_call_resolver,
+            ) {
+                Ok(DirectFunctionCompileAttempt::Done(result)) => return Ok(result),
+                Ok(DirectFunctionCompileAttempt::Wait(waiter)) => {
+                    let wait_result = waiter.wait();
+                    if let Some(handle) = self.lookup_ready_direct_function(function)? {
+                        return Ok(DirectFunctionCompileResult {
+                            handle,
+                            compiled: false,
+                            stats: None,
+                        });
+                    }
+                    if let Err(err) = wait_result {
+                        background_wait_errors += 1;
+                        if background_wait_errors > 4 {
+                            return Err(format!(
+                                "process JIT background compile repeatedly failed for function {} id={}: {err}",
+                                function.names.qualname, function.function_id
+                            ));
+                        }
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn compile_direct_function_precollected<'a>(
+        &self,
+        session: &Arc<crate::session::CompileSession>,
+        blocks: &[ObjPtr],
+        module: &'a BlockPyModule<CodegenModuleShape>,
+        function: &BlockPyFunction<CodegenModuleShape>,
+        module_constants: &'a ModuleCodegenConstants,
+        counter_defs: &'a [CounterDef],
+        module_constant_ptrs: &[*mut ffi::PyObject],
+        direct_call_resolver: Option<&'a crate::module_type::SharedModuleState>,
+        batch_functions: Vec<ProcessJitBatchFunction<'a>>,
+    ) -> Result<DirectFunctionCompileResult, String> {
+        let mut background_wait_errors = 0usize;
+        loop {
+            match self.compile_direct_function_precollected_once(
+                session,
+                blocks,
+                module,
+                function,
+                module_constants,
+                counter_defs,
+                module_constant_ptrs,
+                direct_call_resolver,
+                batch_functions.clone(),
+                Duration::ZERO,
+                Instant::now(),
+            ) {
+                Ok(DirectFunctionCompileAttempt::Done(result)) => return Ok(result),
+                Ok(DirectFunctionCompileAttempt::Wait(waiter)) => {
+                    let wait_result = waiter.wait();
+                    if let Some(handle) = self.lookup_ready_direct_function(function)? {
+                        return Ok(DirectFunctionCompileResult {
+                            handle,
+                            compiled: false,
+                            stats: None,
+                        });
+                    }
+                    if let Err(err) = wait_result {
+                        background_wait_errors += 1;
+                        if background_wait_errors > 4 {
+                            return Err(format!(
+                                "process JIT background compile repeatedly failed for function {} id={}: {err}",
+                                function.names.qualname, function.function_id
+                            ));
+                        }
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    unsafe fn compile_direct_function_once(
+        &self,
+        session: &Arc<crate::session::CompileSession>,
+        blocks: &[ObjPtr],
+        module: &BlockPyModule<CodegenModuleShape>,
+        function: &BlockPyFunction<CodegenModuleShape>,
+        module_constants: &ModuleCodegenConstants,
+        counter_defs: &[CounterDef],
+        module_constant_ptrs: &[*mut ffi::PyObject],
+        direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
+    ) -> Result<DirectFunctionCompileAttempt, String> {
         let total_start = Instant::now();
         let batch_collect_start = Instant::now();
         let batch_functions =
@@ -15653,6 +16116,36 @@ impl ProcessJitEngine {
                 }
             };
         let batch_collect_elapsed = batch_collect_start.elapsed();
+        self.compile_direct_function_precollected_once(
+            session,
+            blocks,
+            module,
+            function,
+            module_constants,
+            counter_defs,
+            module_constant_ptrs,
+            direct_call_resolver,
+            batch_functions,
+            batch_collect_elapsed,
+            total_start,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn compile_direct_function_precollected_once<'a>(
+        &self,
+        session: &Arc<crate::session::CompileSession>,
+        blocks: &[ObjPtr],
+        module: &'a BlockPyModule<CodegenModuleShape>,
+        function: &BlockPyFunction<CodegenModuleShape>,
+        module_constants: &'a ModuleCodegenConstants,
+        counter_defs: &'a [CounterDef],
+        module_constant_ptrs: &[*mut ffi::PyObject],
+        direct_call_resolver: Option<&'a crate::module_type::SharedModuleState>,
+        batch_functions: Vec<ProcessJitBatchFunction<'a>>,
+        batch_collect_elapsed: Duration,
+        total_start: Instant,
+    ) -> Result<DirectFunctionCompileAttempt, String> {
         let inputs = DirectFunctionCompileInputs {
             session,
             blocks,
@@ -15672,13 +16165,17 @@ impl ProcessJitEngine {
             state.reserve_direct_function_batch(&mut jit_module, &inputs, function, batch_functions)
         };
         let reservation_elapsed = reservation_start.elapsed();
-        let plan = match reserved_batch_result {
+        let mut plan = match reserved_batch_result {
             Ok(ReservedDirectFunctionBatch::Ready(handle)) => {
                 return Ok(DirectFunctionCompileResult {
                     handle,
                     compiled: false,
                     stats: None,
-                });
+                }
+                .into());
+            }
+            Ok(ReservedDirectFunctionBatch::Compiling(waiter)) => {
+                return Ok(DirectFunctionCompileAttempt::Wait(waiter));
             }
             Ok(ReservedDirectFunctionBatch::Reserved(plan)) => plan,
             Err(err) => {
@@ -15700,6 +16197,25 @@ impl ProcessJitEngine {
                 return Err(err);
             }
         };
+        if let Err(err) = plan.precompute_module_plans(&inputs) {
+            emit_jit_batch_codegen_log(
+                function,
+                direct_call_resolver,
+                "error",
+                "plan",
+                Some(&err),
+                plan.batch_functions.len(),
+                plan.function_indices_to_define.len(),
+                batch_collect_elapsed,
+                reservation_elapsed,
+                Duration::ZERO,
+                Duration::ZERO,
+                total_start.elapsed(),
+                JitBatchWorkerMetrics::default(),
+            );
+            self.fail_reserved_direct_function_batch(&plan, &err);
+            return Err(err);
+        }
         let batch_function_count = plan.batch_functions.len();
         let functions_to_define_count = plan.function_indices_to_define.len();
         let codegen_start = Instant::now();
@@ -15726,6 +16242,7 @@ impl ProcessJitEngine {
                         total_start.elapsed(),
                         JitBatchWorkerMetrics::default(),
                     );
+                    self.fail_reserved_direct_function_batch(&plan, &err);
                     return Err(err);
                 }
             }
@@ -15733,11 +16250,22 @@ impl ProcessJitEngine {
         let codegen_elapsed = codegen_start.elapsed();
         let worker_metrics = batch_output.worker_metrics;
         let commit_start = Instant::now();
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| "process JIT state lock poisoned".to_string())?;
-        let mut jit_module = self.module.lock_for_serial_phase()?;
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => {
+                let err = "process JIT state lock poisoned".to_string();
+                self.fail_reserved_direct_function_batch(&plan, &err);
+                return Err(err);
+            }
+        };
+        let mut jit_module = match self.module.lock_for_serial_phase() {
+            Ok(jit_module) => jit_module,
+            Err(err) => {
+                drop(state);
+                self.fail_reserved_direct_function_batch(&plan, &err);
+                return Err(err);
+            }
+        };
         let _guard = ProcessJitCompileGuard::enter();
         let commit_result = state.commit_compiled_direct_function_batch(
             &mut jit_module,
@@ -15746,6 +16274,8 @@ impl ProcessJitEngine {
             batch_output.compiled_functions,
         );
         let commit_elapsed = commit_start.elapsed();
+        drop(jit_module);
+        drop(state);
         match commit_result {
             Ok(result) => {
                 emit_jit_batch_codegen_log(
@@ -15763,7 +16293,7 @@ impl ProcessJitEngine {
                     total_start.elapsed(),
                     worker_metrics,
                 );
-                Ok(result)
+                Ok(result.into())
             }
             Err(err) => {
                 emit_jit_batch_codegen_log(
@@ -15781,9 +16311,21 @@ impl ProcessJitEngine {
                     total_start.elapsed(),
                     worker_metrics,
                 );
+                self.fail_reserved_direct_function_batch(&plan, &err);
                 Err(err)
             }
         }
+    }
+}
+
+enum DirectFunctionCompileAttempt {
+    Done(DirectFunctionCompileResult),
+    Wait(Arc<ProcessJitCompileWaiter>),
+}
+
+impl From<DirectFunctionCompileResult> for DirectFunctionCompileAttempt {
+    fn from(result: DirectFunctionCompileResult) -> Self {
+        Self::Done(result)
     }
 }
 
@@ -15860,7 +16402,7 @@ fn define_compiled_function_bytes(
 }
 
 fn compile_prepared_function_bytes(
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     func_id: FuncId,
     ctx: &mut cranelift_codegen::Context,
     function_name: &str,
@@ -15872,12 +16414,12 @@ fn compile_prepared_function_bytes(
         Cow::Owned(format!("{function_name}:refcounts=off"))
     };
     ctx.func.name = stable_cranelift_function_name(function_name.as_ref());
-    prepare_cranelift_function_for_backend(jit_module, None, ctx, err_prefix)?;
-    compile_backend_prepared_function_bytes(jit_module.isa(), func_id, ctx, err_prefix)
+    prepare_cranelift_function_for_backend(codegen_env, None, ctx, err_prefix)?;
+    compile_backend_prepared_function_bytes(codegen_env.codegen_isa(), func_id, ctx, err_prefix)
 }
 
 fn compile_prepared_function_bytes_with_isa(
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     isa: &dyn TargetIsa,
     func_id: FuncId,
     ctx: &mut cranelift_codegen::Context,
@@ -15890,7 +16432,7 @@ fn compile_prepared_function_bytes_with_isa(
         Cow::Owned(format!("{function_name}:refcounts=off"))
     };
     ctx.func.name = stable_cranelift_function_name(function_name.as_ref());
-    prepare_cranelift_function_for_backend(jit_module, Some(isa), ctx, err_prefix)?;
+    prepare_cranelift_function_for_backend(codegen_env, Some(isa), ctx, err_prefix)?;
     compile_backend_prepared_function_bytes(isa, func_id, ctx, err_prefix)
 }
 
@@ -15938,13 +16480,13 @@ fn compile_backend_prepared_function_bytes(
 }
 
 fn prepare_cranelift_function_for_backend(
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     isa: Option<&dyn TargetIsa>,
     ctx: &mut cranelift_codegen::Context,
     err_prefix: &str,
 ) -> Result<(), String> {
-    inline_runtime_support_calls(jit_module, ctx, err_prefix)?;
-    let isa = isa.unwrap_or_else(|| jit_module.isa());
+    inline_runtime_support_calls(codegen_env, ctx, err_prefix)?;
+    let isa = isa.unwrap_or_else(|| codegen_env.codegen_isa());
     let mut ctrl_plane = ControlPlane::default();
     ctx.optimize(isa, &mut ctrl_plane)
         .map_err(|err| format!("{err_prefix}: {err:?}"))?;
@@ -16401,7 +16943,7 @@ struct RuntimeSupportInliner {
 }
 
 impl RuntimeSupportInliner {
-    fn for_module(jit_module: &mut JITModule) -> Result<Self, String> {
+    fn for_module(codegen_env: &mut impl JitCodegenEnv) -> Result<Self, String> {
         let library = runtime_support_library()?;
         let local_runtime_symbols = runtime_support_local_symbols(&library);
         let mut import_func_ids = HashMap::new();
@@ -16425,7 +16967,7 @@ impl RuntimeSupportInliner {
                 continue;
             }
             let func_id = declare_runtime_clif_local_function(
-                jit_module,
+                codegen_env,
                 &mut local_func_ids,
                 &parsed.symbol,
                 &parsed.function.signature,
@@ -16437,7 +16979,7 @@ impl RuntimeSupportInliner {
                 parsed.function.clone()
             };
             remap_runtime_clif_extern_user_names(
-                jit_module,
+                codegen_env,
                 &mut function,
                 &parsed.extern_symbols,
                 &parsed.runtime_function_symbols,
@@ -16508,19 +17050,22 @@ impl Inline for RuntimeSupportInliner {
 }
 
 fn inline_runtime_support_calls(
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     ctx: &mut cranelift_codegen::Context,
     err_prefix: &str,
 ) -> Result<bool, String> {
-    let mut inliner = RuntimeSupportInliner::for_module(jit_module)?;
+    let mut inliner = RuntimeSupportInliner::for_module(codegen_env)?;
     ctx.inline(&mut inliner)
         .map_err(|err| format!("{err_prefix}: failed to inline runtime support calls: {err:?}"))
 }
 
-fn lower_static_signature(jit_module: &mut JITModule, signature: StaticSignature) -> ir::Signature {
-    let mut lowered = jit_module.make_signature();
+fn lower_static_signature(
+    codegen_env: &impl JitCodegenEnv,
+    signature: StaticSignature,
+) -> ir::Signature {
+    let mut lowered = codegen_env.codegen_make_signature();
     let lower_sig_type = |sig_type| match sig_type {
-        SigType::Pointer => jit_module.target_config().pointer_type(),
+        SigType::Pointer => codegen_env.codegen_target_config().pointer_type(),
         SigType::I64 => ir::types::I64,
         SigType::I32 => ir::types::I32,
     };
@@ -16538,31 +17083,31 @@ fn lower_static_signature(jit_module: &mut JITModule, signature: StaticSignature
 }
 
 fn declare_import_fn(
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     symbol: &str,
     sig: &ir::Signature,
 ) -> Result<FuncId, String> {
-    jit_module
-        .declare_function(symbol, Linkage::Import, sig)
+    codegen_env
+        .codegen_declare_function(symbol, Linkage::Import, sig)
         .map_err(|err| format!("failed to declare imported {symbol} symbol: {err}"))
 }
 
 fn declare_local_fn(
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     symbol: &str,
     sig: &ir::Signature,
 ) -> Result<FuncId, String> {
-    jit_module
-        .declare_function(symbol, Linkage::Local, sig)
+    codegen_env
+        .codegen_declare_function(symbol, Linkage::Local, sig)
         .map_err(|err| format!("failed to declare local {symbol} function: {err}"))
 }
 
 fn make_direct_function_signature(
-    jit_module: &JITModule,
+    codegen_env: &impl JitCodegenEnv,
     function: &BlockPyFunction<CodegenModuleShape>,
 ) -> ir::Signature {
-    let ptr_ty = jit_module.target_config().pointer_type();
-    let mut sig = jit_module.make_signature();
+    let ptr_ty = codegen_env.codegen_target_config().pointer_type();
+    let mut sig = codegen_env.codegen_make_signature();
     sig.params.push(ir::AbiParam::new(ptr_ty));
     sig.params.push(ir::AbiParam::new(ptr_ty));
     for _ in function.params.iter() {
@@ -16626,18 +17171,18 @@ fn push_direct_function_module_identity(out: &mut String, module_name: &str, sou
 }
 
 fn declare_direct_function(
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     function: &BlockPyFunction<CodegenModuleShape>,
     symbol_scope: Option<&str>,
 ) -> Result<(ir::Signature, DeclaredJitFunction), String> {
-    let sig = make_direct_function_signature(jit_module, function);
+    let sig = make_direct_function_signature(codegen_env, function);
     let symbol = direct_function_symbol(function, symbol_scope);
-    let func_id = declare_local_fn(jit_module, &symbol, &sig)?;
+    let func_id = declare_local_fn(codegen_env, &symbol, &sig)?;
     let (default_func_id, default_symbol) = if function_has_default_resolving_direct_entry(function)
     {
         let default_symbol = default_direct_function_symbol(function, symbol_scope);
         (
-            Some(declare_local_fn(jit_module, &default_symbol, &sig)?),
+            Some(declare_local_fn(codegen_env, &default_symbol, &sig)?),
             Some(default_symbol),
         )
     } else {
@@ -16655,16 +17200,16 @@ fn declare_direct_function(
 }
 
 fn build_default_resolving_direct_adapter(
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     function: &BlockPyFunction<CodegenModuleShape>,
     core_func_id: FuncId,
     adapter_func_id: FuncId,
 ) -> Result<cranelift_codegen::Context, String> {
-    let ptr_ty = jit_module.target_config().pointer_type();
+    let ptr_ty = codegen_env.codegen_target_config().pointer_type();
     let runtime_layout = FunctionRuntimeDataLayout::from_function(function);
     let mut module_imports = ModuleFuncImports::new();
-    let mut ctx = jit_module.make_context();
-    ctx.func.signature = make_direct_function_signature(jit_module, function);
+    let mut ctx = codegen_env.codegen_make_context();
+    ctx.func.signature = make_direct_function_signature(codegen_env, function);
     let mut builder_ctx = FunctionBuilderContext::new();
     {
         let mut fb = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
@@ -16683,7 +17228,7 @@ fn build_default_resolving_direct_adapter(
         );
         let null_ptr = fb.ins().iconst(ptr_ty, 0);
         let raise_missing_ref = FuncBuildImports::new(&mut module_imports).get_or_panic(
-            jit_module,
+            codegen_env,
             &mut fb.func,
             &DP_JIT_RAISE_MISSING_REQUIRED_ARGUMENT_IMPORT,
         );
@@ -16762,7 +17307,7 @@ fn build_default_resolving_direct_adapter(
         call_args.push(function_env_value);
         call_args.push(thread_state_value);
         call_args.extend(fb.block_params(call_core_block).iter().copied());
-        let core_func_ref = jit_module.declare_func_in_func(core_func_id, &mut fb.func);
+        let core_func_ref = codegen_env.codegen_declare_func_in_func(core_func_id, &mut fb.func)?;
         let call_inst = fb.ins().call(core_func_ref, &call_args);
         let result = fb.inst_results(call_inst)[0];
         fb.ins().return_(&[result]);
@@ -17008,7 +17553,7 @@ fn runtime_support_local_symbols(library: &RuntimeSupportLibrary) -> HashSet<Str
 }
 
 fn declare_runtime_clif_local_function(
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     local_func_ids: &mut HashMap<String, FuncId>,
     symbol: &str,
     signature: &ir::Signature,
@@ -17017,15 +17562,15 @@ fn declare_runtime_clif_local_function(
     if let Some(func_id) = local_func_ids.get(symbol) {
         return Ok(*func_id);
     }
-    let func_id = jit_module
-        .declare_function(symbol, Linkage::Local, signature)
+    let func_id = codegen_env
+        .codegen_declare_function(symbol, Linkage::Local, signature)
         .map_err(|err| format!("failed to declare {description} {symbol}: {err}"))?;
     local_func_ids.insert(symbol.to_string(), func_id);
     Ok(func_id)
 }
 
 fn remap_runtime_clif_extern_user_names(
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     function: &mut ir::Function,
     extern_symbols: &HashMap<ir::UserExternalName, String>,
     runtime_function_symbols: &HashMap<ir::UserExternalName, String>,
@@ -17055,7 +17600,7 @@ fn remap_runtime_clif_extern_user_names(
         {
             let sig = function.dfg.signatures[sig_ref].clone();
             let local_id = declare_runtime_clif_local_function(
-                jit_module,
+                codegen_env,
                 local_func_ids,
                 symbol,
                 &sig,
@@ -17067,8 +17612,8 @@ fn remap_runtime_clif_extern_user_names(
                 *import_id
             } else {
                 let sig = function.dfg.signatures[sig_ref].clone();
-                let import_id = jit_module
-                    .declare_function(symbol, Linkage::Import, &sig)
+                let import_id = codegen_env
+                    .codegen_declare_function(symbol, Linkage::Import, &sig)
                     .map_err(|err| {
                         format!("failed to declare runtime CLIF extern symbol {symbol}: {err}")
                     })?;
@@ -17106,8 +17651,8 @@ fn remap_runtime_clif_extern_user_names(
         let import_id = if let Some(import_id) = import_data_ids.get(symbol) {
             *import_id
         } else {
-            let import_id = jit_module
-                .declare_data(symbol, Linkage::Import, false, false)
+            let import_id = codegen_env
+                .codegen_declare_data(symbol, Linkage::Import, false, false)
                 .map_err(|err| {
                     format!("failed to declare runtime CLIF extern data symbol {symbol}: {err}")
                 })?;
@@ -17155,7 +17700,7 @@ fn load_runtime_support_clif(jit_module: &mut JITModule) -> Result<(), String> {
             &mut local_func_ids,
             &mut import_data_ids,
         )?;
-        let mut ctx = jit_module.make_context();
+        let mut ctx = jit_module.codegen_make_context();
         ctx.func = function;
         let _ = define_prepared_function(
             jit_module,
@@ -17164,7 +17709,7 @@ fn load_runtime_support_clif(jit_module: &mut JITModule) -> Result<(), String> {
             &parsed.symbol,
             &format!("failed to define runtime CLIF function {}", parsed.symbol),
         )?;
-        jit_module.clear_context(&mut ctx);
+        jit_module.codegen_clear_context(&mut ctx);
     }
     Ok(())
 }
@@ -17213,7 +17758,7 @@ fn compile_runtime_support_clif_for_object(
             &mut local_func_ids,
             &mut import_data_ids,
         )?;
-        let mut ctx = jit_module.make_context();
+        let mut ctx = jit_module.codegen_make_context();
         ctx.func = function;
         let compiled = compile_prepared_function_bytes_with_isa(
             jit_module,
@@ -17226,7 +17771,7 @@ fn compile_runtime_support_clif_for_object(
                 parsed.symbol
             ),
         )?;
-        jit_module.clear_context(&mut ctx);
+        jit_module.codegen_clear_context(&mut ctx);
         out.push(ObjectFunctionDefinition {
             func_id,
             symbol: parsed.symbol,
@@ -17493,7 +18038,7 @@ fn precompile_codegen_module_to_object_bytes(
                 function.names.qualname, function.function_id
             )
         })?;
-        jit_module.clear_context(&mut ctx);
+        jit_module.codegen_clear_context(&mut ctx);
         function_definitions.push(ObjectFunctionDefinition {
             func_id: built.main_id,
             symbol: built.main_symbol,
@@ -17532,7 +18077,7 @@ fn precompile_codegen_module_to_object_bytes(
                         function.names.qualname, function.function_id
                     )
                 })?;
-                jit_module.clear_context(&mut default_ctx);
+                jit_module.codegen_clear_context(&mut default_ctx);
                 function_definitions.push(ObjectFunctionDefinition {
                     func_id: default_adapter_id,
                     symbol: default_adapter_symbol.clone(),
@@ -17740,7 +18285,7 @@ pub fn run_cranelift_smoke(module: &BlockPyModule<CodegenModuleShape>) -> Result
 
     let compile_session = crate::session::CompileSession::new();
     let mut jit_module = new_jit_module(&compile_session)?;
-    let mut ctx = jit_module.make_context();
+    let mut ctx = jit_module.codegen_make_context();
     ctx.func
         .signature
         .returns
@@ -17764,7 +18309,7 @@ pub fn run_cranelift_smoke(module: &BlockPyModule<CodegenModuleShape>) -> Result
         "jit-smoke",
         "failed to define Cranelift function",
     )?;
-    jit_module.clear_context(&mut ctx);
+    jit_module.codegen_clear_context(&mut ctx);
     jit_module
         .finalize_definitions()
         .map_err(|err| format!("failed to finalize Cranelift definitions: {err}"))?;
@@ -17790,7 +18335,7 @@ struct BuildSpecializedFunctionOptions {
 }
 
 fn build_cranelift_run_bb_specialized_function(
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
     blocks: &[ObjPtr],
     module: &BlockPyModule<CodegenModuleShape>,
     function: &BlockPyFunction<CodegenModuleShape>,
@@ -17999,7 +18544,7 @@ fn build_cranelift_run_bb_specialized_function(
         };
         direct_call_target_functions.insert(function_id, target_function);
     }
-    let ptr_ty = jit_module.target_config().pointer_type();
+    let ptr_ty = codegen_env.codegen_target_config().pointer_type();
     let i64_ty = ir::types::I64;
     let mut module_imports = ModuleFuncImports::new();
 
@@ -18008,14 +18553,14 @@ fn build_cranelift_run_bb_specialized_function(
             .and_then(|functions| functions.get(&function.function_id))
         {
             Some(declared) => (
-                make_direct_function_signature(jit_module, function),
+                make_direct_function_signature(codegen_env, function),
                 declared.func_id,
                 declared.symbol.clone(),
                 declared.default_func_id,
                 declared.default_symbol.clone(),
             ),
             None => {
-                let (sig, declared) = declare_direct_function(jit_module, function, symbol_scope)?;
+                let (sig, declared) = declare_direct_function(codegen_env, function, symbol_scope)?;
                 (
                     sig,
                     declared.func_id,
@@ -18025,21 +18570,25 @@ fn build_cranelift_run_bb_specialized_function(
                 )
             }
         };
-    let counted_refcount_helpers =
-        if let Some(counted_refcount_helpers) = options.counted_refcount_helpers {
-            counted_refcount_helpers
-        } else {
-            build_counted_runtime_refcount_helpers(
-                jit_module,
-                function,
-                counter_defs,
-                counter_slots_by_id,
-                scalar_counter_data_id,
-                symbol_scope,
-            )?
-        };
+    let counted_refcount_helpers = if let Some(counted_refcount_helpers) =
+        options.counted_refcount_helpers
+    {
+        counted_refcount_helpers
+    } else {
+        let jit_module = codegen_env.codegen_jit_module_mut().ok_or_else(|| {
+            "counted runtime refcount helpers must be reserved before detached codegen".to_string()
+        })?;
+        build_counted_runtime_refcount_helpers(
+            jit_module,
+            function,
+            counter_defs,
+            counter_slots_by_id,
+            scalar_counter_data_id,
+            symbol_scope,
+        )?
+    };
 
-    let mut ctx = jit_module.make_context();
+    let mut ctx = codegen_env.codegen_make_context();
     ctx.func.signature = main_sig;
     let mut builder_ctx = FunctionBuilderContext::new();
     let mut block_annotations = ClifBlockDisplayAnnotations::new();
@@ -18204,145 +18753,149 @@ fn build_cranelift_run_bb_specialized_function(
         let direct_entry_args = entry_block_params[2..].to_vec();
         let mut func_imports = FuncBuildImports::new(&mut module_imports);
         let incref_ref = if let Some(incref_func_id) = counted_refcount_helpers.incref_func_id {
-            jit_module.declare_func_in_func(incref_func_id, &mut fb.func)
+            codegen_env.codegen_declare_func_in_func(incref_func_id, &mut fb.func)?
         } else {
-            func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_INCREF_IMPORT)
+            func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_INCREF_IMPORT)
         };
         let decref_ref = if let Some(decref_func_id) = counted_refcount_helpers.decref_func_id {
-            jit_module.declare_func_in_func(decref_func_id, &mut fb.func)
+            codegen_env.codegen_declare_func_in_func(decref_func_id, &mut fb.func)?
         } else {
-            func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_DECREF_IMPORT)
+            func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_DECREF_IMPORT)
         };
         let py_call_positional_three_ref = func_imports.get_or_panic(
-            jit_module,
+            codegen_env,
             &mut fb.func,
             &DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT,
         );
         let py_call_object_ref =
-            func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_PY_CALL_OBJECT_IMPORT);
+            func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_PY_CALL_OBJECT_IMPORT);
         let py_vectorcall_ref =
-            func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_PY_VECTORCALL_IMPORT);
+            func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_PY_VECTORCALL_IMPORT);
         let py_call_with_kw_ref =
-            func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_PY_CALL_WITH_KW_IMPORT);
+            func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_PY_CALL_WITH_KW_IMPORT);
         let enter_recursive_ref = func_imports.get_or_panic(
-            jit_module,
+            codegen_env,
             &mut fb.func,
             &DP_JIT_ENTER_RECURSIVE_CALL_IMPORT,
         );
         let pytype_generic_alloc_ref = func_imports.get_or_panic(
-            jit_module,
+            codegen_env,
             &mut fb.func,
             &DP_JIT_PYTYPE_GENERIC_ALLOC_IMPORT,
         );
         let finish_constructor_init_ref = func_imports.get_or_panic(
-            jit_module,
+            codegen_env,
             &mut fb.func,
             &DP_JIT_FINISH_CONSTRUCTOR_INIT_IMPORT,
         );
         let load_global_fast_ref =
-            func_imports.get_or_panic(jit_module, &mut fb.func, &SOAC_RUNTIME_LOAD_GLOBAL_IMPORT);
+            func_imports.get_or_panic(codegen_env, &mut fb.func, &SOAC_RUNTIME_LOAD_GLOBAL_IMPORT);
         let probe_global_indexed_ref = func_imports.get_or_panic(
-            jit_module,
+            codegen_env,
             &mut fb.func,
             &SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_IMPORT,
         );
         let load_global_slow_ref = func_imports.get_or_panic(
-            jit_module,
+            codegen_env,
             &mut fb.func,
             &SOAC_RUNTIME_LOAD_GLOBAL_SLOW_IMPORT,
         );
         let guard_miss_deopt_stub_ref = (options.guard_miss_deopt_stub || guard_miss_deopt_stub)
             .then(|| {
-                func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_DEOPT_RESUME_IMPORT)
+                func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_DEOPT_RESUME_IMPORT)
             });
         let store_global_indexed_ref = func_imports.get_or_panic(
-            jit_module,
+            codegen_env,
             &mut fb.func,
             &SOAC_RUNTIME_STORE_GLOBAL_INDEXED_IMPORT,
         );
         let probe_field_indexed_ref = func_imports.get_or_panic(
-            jit_module,
+            codegen_env,
             &mut fb.func,
             &SOAC_RUNTIME_PROBE_FIELD_INDEXED_IMPORT,
         );
         let store_field_indexed_ref = func_imports.get_or_panic(
-            jit_module,
+            codegen_env,
             &mut fb.func,
             &SOAC_RUNTIME_STORE_FIELD_INDEXED_IMPORT,
         );
         let load_runtime_obj_ref =
-            func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_LOAD_RUNTIME_OBJ_IMPORT);
+            func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_LOAD_RUNTIME_OBJ_IMPORT);
         let is_true_ref =
-            func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_IS_TRUE_IMPORT);
+            func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_IS_TRUE_IMPORT);
         let raise_exc_ref =
-            func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_RAISE_FROM_EXC_IMPORT);
+            func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_RAISE_FROM_EXC_IMPORT);
         let push_handled_exception_ref = func_imports.get_or_panic(
-            jit_module,
+            codegen_env,
             &mut fb.func,
             &DP_JIT_PUSH_HANDLED_EXCEPTION_IMPORT,
         );
         let pop_handled_exception_ref = func_imports.get_or_panic(
-            jit_module,
+            codegen_env,
             &mut fb.func,
             &DP_JIT_POP_HANDLED_EXCEPTION_IMPORT,
         );
         let pyobject_getattr_ref =
-            func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_PYOBJECT_GETATTR_IMPORT);
+            func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_PYOBJECT_GETATTR_IMPORT);
         let pyobject_setattr_ref =
-            func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_PYOBJECT_SETATTR_IMPORT);
+            func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_PYOBJECT_SETATTR_IMPORT);
         let pyobject_getitem_ref =
-            func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_PYOBJECT_GETITEM_IMPORT);
+            func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_PYOBJECT_GETITEM_IMPORT);
         let pyobject_setitem_ref =
-            func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_PYOBJECT_SETITEM_IMPORT);
+            func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_PYOBJECT_SETITEM_IMPORT);
         let pyobject_to_i64_ref =
-            func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_PYOBJECT_TO_I64_IMPORT);
+            func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_PYOBJECT_TO_I64_IMPORT);
         let py_long_from_i64_ref =
-            func_imports.get_or_panic(jit_module, &mut fb.func, &PYLONG_FROM_LONGLONG_IMPORT);
+            func_imports.get_or_panic(codegen_env, &mut fb.func, &PYLONG_FROM_LONGLONG_IMPORT);
         let record_top_value_sample_ref = requires_top_value_counters.then(|| {
             func_imports.get_or_panic(
-                jit_module,
+                codegen_env,
                 &mut fb.func,
                 &DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT,
             )
         });
         let raise_deleted_name_error_ref = func_imports.get_or_panic(
-            jit_module,
+            codegen_env,
             &mut fb.func,
             &DP_JIT_RAISE_DELETED_NAME_ERROR_IMPORT,
         );
         let make_function_with_closure_ref = func_imports.get_or_panic(
-            jit_module,
+            codegen_env,
             &mut fb.func,
             &SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_IMPORT,
         );
         let make_cell_ref =
-            func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_MAKE_CELL_IMPORT);
+            func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_MAKE_CELL_IMPORT);
         let load_cell_ref =
-            func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_LOAD_CELL_IMPORT);
+            func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_LOAD_CELL_IMPORT);
         let store_cell_ref =
-            func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_STORE_CELL_IMPORT);
+            func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_STORE_CELL_IMPORT);
         let tuple_new_ref =
-            func_imports.get_or_panic(jit_module, &mut fb.func, &SOAC_RUNTIME_TUPLE_NEW_IMPORT);
+            func_imports.get_or_panic(codegen_env, &mut fb.func, &SOAC_RUNTIME_TUPLE_NEW_IMPORT);
         let tuple_set_item_ref = func_imports.get_or_panic(
-            jit_module,
+            codegen_env,
             &mut fb.func,
             &SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_IMPORT,
         );
         let set_raised_exception_ref = func_imports.get_or_panic(
-            jit_module,
+            codegen_env,
             &mut fb.func,
             &SOAC_RUNTIME_SET_RAISED_EXCEPTION_IMPORT,
         );
         let module_constant_object_globals = module_constant_object_data_ids
             .iter()
-            .map(|data_id| jit_module.declare_data_in_func(*data_id, &mut fb.func))
-            .collect::<Vec<_>>();
+            .map(|data_id| codegen_env.codegen_declare_data_in_func(*data_id, &mut fb.func))
+            .collect::<Result<Vec<_>, _>>()?;
         let scalar_counter_base_value = scalar_counter_data_id.map(|data_id| {
-            let counter_data = jit_module.declare_data_in_func(data_id, &mut fb.func);
+            let counter_data = codegen_env
+                .codegen_declare_data_in_func(data_id, &mut fb.func)
+                .expect("scalar counter storage should be declared before JIT codegen");
             fb.ins().global_value(ptr_ty, counter_data)
         });
         let top_value_counter_base_value = top_value_counter_data_id.map(|data_id| {
-            let counter_data = jit_module.declare_data_in_func(data_id, &mut fb.func);
+            let counter_data = codegen_env
+                .codegen_declare_data_in_func(data_id, &mut fb.func)
+                .expect("top-value counter storage should be declared before JIT codegen");
             fb.ins().global_value(ptr_ty, counter_data)
         });
         let fallthrough_abrupt_kind_const = stack_slots.has_try_abrupt_kind_name().then(|| {
@@ -18636,7 +19189,7 @@ fn build_cranelift_run_bb_specialized_function(
                 cleanup_null_blocks[index],
                 &mut pending_local_failure_cleanups,
                 &mut local_failure_cleanup_blocks,
-                jit_module,
+                codegen_env,
                 &mut func_imports,
             )?;
             emit_ctx.require_deopt_point_before_term(codegen_block.label)?;
@@ -18660,7 +19213,7 @@ fn build_cranelift_run_bb_specialized_function(
                 implicit_target_transports,
                 &mut local_env,
                 term_emit_ctx,
-                jit_module,
+                codegen_env,
                 &mut func_imports,
                 is_true_ref,
                 pyobject_to_i64_ref,
@@ -19119,7 +19672,7 @@ fn render_compiled_clif_and_vcode_disasm(
 
     let mut ctrl_plane = ControlPlane::default();
     let compiled = jit_module
-        .isa()
+        .codegen_isa()
         .compile_function(&ctx.func, &ctx.domtree, true, &mut ctrl_plane)
         .map_err(|err| format!("failed to compile specialized jit run_bb function: {err:?}"))?;
 
@@ -19219,11 +19772,11 @@ fn define_shared_vectorcall_trampoline(
     param_count: usize,
     symbol_name: &str,
 ) -> Result<VectorcallEntryFn, String> {
-    let ptr_ty = jit_module.target_config().pointer_type();
+    let ptr_ty = jit_module.codegen_target_config().pointer_type();
     let i64_ty = ir::types::I64;
     let mut module_imports = ModuleFuncImports::new();
 
-    let mut main_sig = jit_module.make_signature();
+    let mut main_sig = jit_module.codegen_make_signature();
     main_sig.params.push(ir::AbiParam::new(ptr_ty));
     main_sig.params.push(ir::AbiParam::new(ptr_ty));
     main_sig.params.push(ir::AbiParam::new(ptr_ty));
@@ -19232,7 +19785,7 @@ fn define_shared_vectorcall_trampoline(
 
     let main_id = declare_local_fn(jit_module, symbol_name, &main_sig)?;
 
-    let mut direct_sig = jit_module.make_signature();
+    let mut direct_sig = jit_module.codegen_make_signature();
     direct_sig.params.push(ir::AbiParam::new(ptr_ty));
     direct_sig.params.push(ir::AbiParam::new(ptr_ty));
     for _ in 0..param_count {
@@ -19240,7 +19793,7 @@ fn define_shared_vectorcall_trampoline(
     }
     direct_sig.returns.push(ir::AbiParam::new(ptr_ty));
 
-    let mut ctx = jit_module.make_context();
+    let mut ctx = jit_module.codegen_make_context();
     ctx.func.signature = main_sig;
     let mut builder_ctx = FunctionBuilderContext::new();
     {
@@ -19516,7 +20069,7 @@ fn define_shared_vectorcall_trampoline(
         &format!("direct-vectorcall-trampoline:{param_count}"),
         "failed to define direct vectorcall trampoline",
     )?;
-    jit_module.clear_context(&mut ctx);
+    jit_module.codegen_clear_context(&mut ctx);
     jit_module
         .finalize_definitions()
         .map_err(|err| format!("failed to finalize direct vectorcall trampoline: {err}"))?;
@@ -19526,7 +20079,7 @@ fn define_shared_vectorcall_trampoline(
         symbol_name,
         code_ptr.cast::<u8>(),
         main_artifact.code_size,
-        jit_module.isa(),
+        jit_module.codegen_isa(),
         main_artifact.systemv_unwind_info.as_ref(),
     )?;
     register_jit_signal_diagnostics(

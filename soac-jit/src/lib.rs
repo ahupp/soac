@@ -886,6 +886,48 @@ pub unsafe fn build_module_runtime_context_for_module(
     })
 }
 
+pub unsafe fn start_background_jit_compile_for_module(
+    module: *mut ffi::PyObject,
+) -> Result<(), ()> {
+    let py = Python::assume_attached();
+    if module.is_null() {
+        return set_runtime_error("missing transformed module for background JIT compile");
+    }
+    let module = unsafe { Bound::from_borrowed_ptr(py, module) };
+    let shared_state = crate::module_type::SoacExtModule::clone_shared_state(module.as_any())
+        .map_err(|err| {
+            err.restore(py);
+        })?;
+    let compile_session = CompileSession::process();
+    let process_jit = compile_session.process_jit().map_err(|err| {
+        if let Ok(c_msg) = CString::new(err) {
+            unsafe { ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr()) };
+        } else {
+            unsafe {
+                ffi::PyErr_SetString(
+                    ffi::PyExc_RuntimeError,
+                    b"failed to initialize process JIT for background compile\0".as_ptr()
+                        as *const c_char,
+                )
+            };
+        }
+    })?;
+    process_jit
+        .start_background_compile_shared_module(Arc::clone(&compile_session), shared_state)
+        .map_err(|err| {
+            if let Ok(c_msg) = CString::new(err) {
+                unsafe { ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr()) };
+            } else {
+                unsafe {
+                    ffi::PyErr_SetString(
+                        ffi::PyExc_RuntimeError,
+                        b"failed to start background JIT compile\0".as_ptr() as *const c_char,
+                    )
+                };
+            }
+        })
+}
+
 unsafe fn make_clif_function_data(
     callable: *mut ffi::PyObject,
     function_id: FunctionId,
@@ -1508,7 +1550,22 @@ unsafe fn ensure_clif_vectorcall_compiled(
             .module_state
             .lookup_or_compile_direct_function_handle(&data.compile_session, function.function_id)
         {
-            Ok(Some(handle)) => handle,
+            Ok(Some((handle, compiled))) => {
+                if !compiled
+                    && !jit::is_synthetic_class_helper_function(&function)
+                    && let Some(stats) = handle.jit_stats()
+                {
+                    data.module_state.append_jit_codegen_log(
+                        &function,
+                        "direct_function_body",
+                        compile_start.elapsed(),
+                        "ok",
+                        None,
+                        Some(stats),
+                    );
+                }
+                handle
+            }
             Ok(None) => {
                 let block_ptrs = vec![ptr::null_mut::<c_void>(); function.blocks.len()];
                 let module_constant_ptrs = data.module_state.module_constant_ptrs();

@@ -8,6 +8,7 @@ use soac_blockpy::passes::CodegenModuleShape;
 use soac_blockpy::{LoweringOptions, lower_python_to_blockpy_recorded_with_options};
 use soac_jit::config::module_cache_root_from_env_or_repo;
 use soac_jit::module_type::{ModuleInfo, SoacExtModule, hash_module_source};
+use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,6 +17,40 @@ use std::time::{Duration, Instant};
 use tracing::info;
 
 const SOAC_BUILD_IDENTITY: &str = env!("SOAC_BUILD_IDENTITY");
+
+thread_local! {
+    static EXEC_MODULE_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+struct ExecModuleDepthGuard {
+    outermost: bool,
+}
+
+impl ExecModuleDepthGuard {
+    fn enter() -> Self {
+        EXEC_MODULE_DEPTH.with(|depth| {
+            let current = depth.get();
+            depth.set(current + 1);
+            Self {
+                outermost: current == 0,
+            }
+        })
+    }
+
+    fn is_outermost(&self) -> bool {
+        self.outermost
+    }
+}
+
+impl Drop for ExecModuleDepthGuard {
+    fn drop(&mut self) {
+        EXEC_MODULE_DEPTH.with(|depth| {
+            let current = depth.get();
+            debug_assert!(current > 0);
+            depth.set(current.saturating_sub(1));
+        });
+    }
+}
 
 fn import_dp_module<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyModule>> {
     PyModule::import(py, "soac.runtime")
@@ -492,6 +527,7 @@ fn exec_module_inner(
     module: &Bound<'_, PyAny>,
     exec_timings: &mut Vec<TimedPhase>,
 ) -> PyResult<()> {
+    let exec_depth = ExecModuleDepthGuard::enter();
     let module_globals = time_phase(exec_timings, "get_module_globals", || {
         module.getattr("__dict__")
     })?;
@@ -581,6 +617,20 @@ fn exec_module_inner(
                 }
             })
         })?;
+        if exec_depth.is_outermost() && !is_soac_runtime {
+            time_phase(exec_timings, "start_background_jit_compile", || {
+                unsafe { soac_jit::start_background_jit_compile_for_module(module.as_ptr()) }
+                    .map_err(|_| {
+                        if unsafe { ffi::PyErr_Occurred() }.is_null() {
+                            PyRuntimeError::new_err(
+                                "failed to start background JIT compile for module",
+                            )
+                        } else {
+                            PyErr::fetch(py)
+                        }
+                    })
+            })?;
+        }
         Ok(())
     });
     exec_timings.push(TimedPhase {

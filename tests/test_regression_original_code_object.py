@@ -62,6 +62,12 @@ class C{index}:
     env = {
         **os.environ,
         "SOAC_MODULE_ENABLED": f"path:{module_path}",
+        # Background warmup intentionally compiles all ordinary-mode module callables,
+        # including generated class helpers. Profile mode keeps testing the narrower
+        # invariant: class helper execution during import should not itself trigger
+        # foreground lazy JIT compilation.
+        "SOAC_OPT_MODE": "profile",
+        "SOAC_WORK_DIR": str(tmp_path / "profile"),
         "SOAC_LOG": f"soac_jit_codegen=info;json={log_path}",
     }
 

@@ -203,7 +203,7 @@ impl SharedModuleState {
         &self,
         compile_session: &Arc<crate::session::CompileSession>,
         function_id: FunctionId,
-    ) -> Result<Option<Arc<crate::jit::CompiledFunctionHandle>>, String> {
+    ) -> Result<Option<(Arc<crate::jit::CompiledFunctionHandle>, bool)>, String> {
         if function_id == FunctionId::global() {
             return Ok(None);
         }
@@ -226,7 +226,7 @@ impl SharedModuleState {
         if let Some(handle) =
             crate::jit::lookup_precompiled_direct_function_handle(compile_session, self, &function)?
         {
-            return Ok(Some(handle));
+            return Ok(Some((handle, false)));
         }
         let blocks = vec![ptr::null_mut::<c_void>(); function.blocks.len()];
         let module_constant_ptrs = self.module_constant_ptrs();
@@ -255,7 +255,7 @@ impl SharedModuleState {
                         result.stats.as_ref(),
                     );
                 }
-                Ok(Some(result.handle))
+                Ok(Some((result.handle, result.compiled)))
             }
             Err(err) => {
                 self.append_jit_codegen_log(

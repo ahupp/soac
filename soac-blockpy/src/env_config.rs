@@ -9,6 +9,7 @@ pub const SOAC_WORK_DIR_ENV: &str = "SOAC_WORK_DIR";
 pub const SOAC_CRANELIFT_OPT_LEVEL_ENV: &str = "SOAC_CRANELIFT_OPT_LEVEL";
 pub const SOAC_ENABLE_PROFILED_COLD_BLOCKS_ENV: &str = "SOAC_ENABLE_PROFILED_COLD_BLOCKS";
 pub const SOAC_JIT_EMIT_REFCOUNTS_ENV: &str = "SOAC_JIT_EMIT_REFCOUNTS";
+pub const SOAC_JIT_COMPILE_WORKERS_ENV: &str = "SOAC_JIT_COMPILE_WORKERS";
 pub const SOAC_MODULE_CACHE_DIR_ENV: &str = "SOAC_MODULE_CACHE_DIR";
 pub const SOAC_PRECOMPILED_LIBRARY_ENV: &str = "SOAC_PRECOMPILED_LIBRARY";
 pub const SOAC_COMPILE_MODE_ENV: &str = "SOAC_COMPILE_MODE";
@@ -96,6 +97,7 @@ pub struct SoacEnvConfig {
     jit_refcount_emission_enabled: bool,
     module_cache_dir: Option<PathBuf>,
     compile_mode: CompileMode,
+    jit_compile_workers: Option<usize>,
     jit_perf_helper_frames_enabled: bool,
     soac_exec_trace: Option<String>,
     soac_log: SoacLogConfig,
@@ -115,6 +117,10 @@ impl SoacEnvConfig {
         let module_cache_dir = env_path(SOAC_MODULE_CACHE_DIR_ENV)?;
         let compile_mode =
             parse_optional_compile_mode(env_string(SOAC_COMPILE_MODE_ENV)?.as_deref())?;
+        let jit_compile_workers = parse_optional_positive_usize(
+            SOAC_JIT_COMPILE_WORKERS_ENV,
+            env_string(SOAC_JIT_COMPILE_WORKERS_ENV)?.as_deref(),
+        )?;
         let jit_perf_helper_frames_enabled = env_bool(SOAC_JIT_PERF_HELPER_FRAMES_ENV, false)?;
         let soac_exec_trace = env_string(SOAC_EXEC_TRACE_ENV)?;
         let soac_log_raw = env_string(SOAC_LOG_ENV)?;
@@ -131,6 +137,7 @@ impl SoacEnvConfig {
             jit_refcount_emission_enabled,
             module_cache_dir,
             compile_mode,
+            jit_compile_workers,
             jit_perf_helper_frames_enabled,
             soac_exec_trace,
             soac_log,
@@ -182,6 +189,10 @@ impl SoacEnvConfig {
 
     pub fn eager_clif_compile_requested(&self) -> bool {
         self.compile_mode == CompileMode::Eager
+    }
+
+    pub fn jit_compile_workers(&self) -> Option<usize> {
+        self.jit_compile_workers
     }
 
     pub fn jit_perf_helper_frames_enabled(&self) -> bool {
@@ -285,6 +296,23 @@ fn parse_optional_compile_mode(raw: Option<&str>) -> Result<CompileMode, String>
     CompileMode::from_str(raw).map_err(|err| invalid_env_value(SOAC_COMPILE_MODE_ENV, raw, err))
 }
 
+fn parse_optional_positive_usize(name: &str, raw: Option<&str>) -> Result<Option<usize>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(invalid_env_value(name, raw, "expected a positive integer"));
+    }
+    let value = trimmed
+        .parse::<usize>()
+        .map_err(|_| invalid_env_value(name, raw, "expected a positive integer"))?;
+    if value == 0 {
+        return Err(invalid_env_value(name, raw, "expected a positive integer"));
+    }
+    Ok(Some(value))
+}
+
 pub fn specialization_mode_from_env() -> Result<Option<SpecializationMode>, String> {
     Ok(SoacEnvConfig::from_env()?.specialization_mode())
 }
@@ -351,6 +379,10 @@ pub fn compile_mode_from_env() -> Result<CompileMode, String> {
 
 pub fn eager_clif_compile_requested_from_env() -> Result<bool, String> {
     Ok(SoacEnvConfig::from_env()?.eager_clif_compile_requested())
+}
+
+pub fn jit_compile_workers_from_env() -> Result<Option<usize>, String> {
+    Ok(SoacEnvConfig::from_env()?.jit_compile_workers())
 }
 
 pub fn jit_perf_helper_frames_enabled_from_env() -> Result<bool, String> {
@@ -457,6 +489,7 @@ mod tests {
             EnvVarGuard::remove(SOAC_MODULE_CACHE_DIR_ENV),
             EnvVarGuard::remove(SOAC_PRECOMPILED_LIBRARY_ENV),
             EnvVarGuard::remove(SOAC_COMPILE_MODE_ENV),
+            EnvVarGuard::remove(SOAC_JIT_COMPILE_WORKERS_ENV),
             EnvVarGuard::remove(SOAC_JIT_PERF_HELPER_FRAMES_ENV),
             EnvVarGuard::remove(SOAC_LOG_ENV),
             EnvVarGuard::remove(SOAC_EXEC_TRACE_ENV),
@@ -484,8 +517,20 @@ mod tests {
         assert_eq!(config.specialization_mode(), None);
         assert_eq!(config.cranelift_opt_level(), "speed");
         assert_eq!(config.compile_mode(), CompileMode::Lazy);
+        assert_eq!(config.jit_compile_workers(), None);
         assert!(config.jit_refcount_emission_enabled());
         assert!(!config.jit_perf_helper_frames_enabled());
+    }
+
+    #[test]
+    fn env_config_accepts_jit_compile_worker_count() {
+        let _lock = env_lock().lock().unwrap();
+        let _guards = clear_soac_config_env();
+        let _workers = EnvVarGuard::set(SOAC_JIT_COMPILE_WORKERS_ENV, "3");
+
+        let config = SoacEnvConfig::from_env().unwrap();
+
+        assert_eq!(config.jit_compile_workers(), Some(3));
     }
 
     #[test]
@@ -498,6 +543,7 @@ mod tests {
             (SOAC_ENABLE_PROFILED_COLD_BLOCKS_ENV, "maybe"),
             (SOAC_JIT_EMIT_REFCOUNTS_ENV, ""),
             (SOAC_COMPILE_MODE_ENV, "always"),
+            (SOAC_JIT_COMPILE_WORKERS_ENV, "0"),
             (SOAC_JIT_PERF_HELPER_FRAMES_ENV, "2"),
         ] {
             let _guards = clear_soac_config_env();

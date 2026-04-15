@@ -442,6 +442,11 @@ anything non-code affected the run. If there were no such issues, say
   `just run-cpython-tests` default to `none` unless the caller already set it,
   so correctness runs do not spend cold-start time optimizing import-time helper
   code.
+- `SOAC_JIT_COMPILE_WORKERS`
+  Optional positive integer cap for worker threads used to compile functions
+  inside one reserved process-JIT batch. Unset defaults to
+  `min(available_parallelism, 4)`. Set `SOAC_JIT_COMPILE_WORKERS=1` to force
+  single-worker compilation for before/after timing comparisons.
 - `SOAC_JIT_EMIT_REFCOUNTS`
   Refcount emission is enabled by default. Set to `0`, `false`, `no`, or `off`
   to inline generated JIT INCREF/DECREF helper calls as no-ops. This is an

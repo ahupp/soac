@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import importlib
+import json
 import os
 import subprocess
 import sys
@@ -581,6 +582,93 @@ def test_module_enabled_path_filter_only_transforms_matching_tree(monkeypatch, t
         sys.path.remove(str(skipped_dir))
         sys.modules.pop("enabled_probe", None)
         sys.modules.pop("skipped_probe", None)
+
+
+def test_background_jit_does_not_recursively_compile_import_tree(tmp_path):
+    log_path = tmp_path / "jit-events.jsonl"
+    package_dir = tmp_path / "recursive_bg_pkg"
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "child.py").write_text(
+        """
+VALUE = 5
+
+def child_value():
+    return VALUE
+""",
+        encoding="utf-8",
+    )
+    (package_dir / "parent.py").write_text(
+        """
+from recursive_bg_pkg import child
+
+VALUE = child.VALUE + 1
+
+def parent_value():
+    return VALUE
+""",
+        encoding="utf-8",
+    )
+
+    script = f"""
+import json
+import pathlib
+import sys
+import time
+
+sys.path.insert(0, {str(tmp_path)!r})
+from soac import import_hook
+
+import_hook.install()
+from recursive_bg_pkg import parent
+
+assert parent.parent_value() == 6
+log_path = pathlib.Path({str(log_path)!r})
+deadline = time.monotonic() + 5
+while time.monotonic() < deadline:
+    rows = [
+        json.loads(line)
+        for line in log_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ] if log_path.exists() else []
+    if any(
+        row.get("message") == "jit_background_module_compile_done"
+        and row.get("module_name") == "recursive_bg_pkg.parent"
+        for row in rows
+    ):
+        break
+    time.sleep(0.05)
+else:
+    raise AssertionError("parent background JIT compile did not finish")
+
+# Give a wrongly recursive child background compile a chance to show up.
+time.sleep(0.25)
+"""
+    env = os.environ.copy()
+    env.pop("SOAC_OPT_MODE", None)
+    env["SOAC_MODULE_ENABLED"] = f"path:{tmp_path}"
+    env["SOAC_LOG"] = f"soac_jit_codegen=info;json={log_path}"
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        env=env,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    rows = [
+        json.loads(line)
+        for line in log_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    background_modules = {
+        row["module_name"]
+        for row in rows
+        if row.get("message") == "jit_background_module_compile_done"
+    }
+    assert "recursive_bg_pkg.parent" in background_modules
+    assert "recursive_bg_pkg.child" not in background_modules
 
 
 @BROAD_MODE_SLOW

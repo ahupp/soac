@@ -4852,6 +4852,7 @@ def build(values):
                     module_constant_ptrs: Vec::new(),
                     points: Vec::new(),
                 }),
+                JitCodegenStats::default(),
             )
             .expect("first function should mark ready");
         let ready_handle = state

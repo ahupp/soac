@@ -190,6 +190,11 @@ typed variables must use recognized values. Boolean knobs accept `1`, `true`,
   latency-sensitive and should not spend cold-start time optimizing import-time
   helper code.
 
+- `SOAC_JIT_COMPILE_WORKERS=<positive-integer>`
+  Cap the number of worker threads used to compile functions inside one
+  reserved process-JIT batch. Unset defaults to `min(available_parallelism, 4)`;
+  set `1` to force single-worker compilation for timing comparisons.
+
 - `SOAC_JIT_EMIT_REFCOUNTS=0`
   Disable generated JIT INCREF/DECREF emission by inlining the SOAC runtime
   refcount helpers as no-ops. Refcount emission is enabled by default; only
