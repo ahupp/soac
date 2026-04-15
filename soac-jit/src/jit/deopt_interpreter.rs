@@ -63,8 +63,30 @@ pub(crate) unsafe fn run_blockpy_function_from_entry(
     context: BlockPyEntryRuntimeContext<'_>,
     positional_args: &[ObjPtr],
 ) -> Result<ObjPtr, String> {
-    let (bindings, values) = unsafe {
-        build_entry_local_bindings(function, context.function_data_obj, positional_args)?
+    unsafe {
+        run_blockpy_function_from_vectorcall_entry(
+            function,
+            context,
+            positional_args.as_ptr(),
+            positional_args.len(),
+            ptr::null_mut(),
+        )
+    }
+}
+
+#[cold]
+#[allow(dead_code)]
+pub(crate) unsafe fn run_blockpy_function_from_vectorcall_entry(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    context: BlockPyEntryRuntimeContext<'_>,
+    args: *const ObjPtr,
+    nargsf: usize,
+    kwnames: ObjPtr,
+) -> Result<ObjPtr, String> {
+    let Some((bindings, values)) = (unsafe {
+        build_entry_local_bindings(function, context.function_data_obj, args, nargsf, kwnames)?
+    }) else {
+        return Ok(ptr::null_mut());
     };
     let locals = match RuntimeJitDeoptLocals::from_live_bindings(
         bindings.iter().zip(values.iter().copied()),
@@ -216,45 +238,44 @@ impl<'inv, 'data> BlockPyFrameSource<'inv, 'data> {
 unsafe fn build_entry_local_bindings(
     function: &BlockPyFunction<CodegenModuleShape>,
     function_data_obj: ObjPtr,
-    positional_args: &[ObjPtr],
-) -> Result<(Vec<LocalEnvResumeBinding>, Vec<ObjPtr>), String> {
+    args: *const ObjPtr,
+    nargsf: usize,
+    kwnames: ObjPtr,
+) -> Result<Option<(Vec<LocalEnvResumeBinding>, Vec<ObjPtr>)>, String> {
     let layout = function.storage_layout.as_ref().ok_or_else(|| {
         format!(
             "entry interpreter expected storage layout for function {}",
             function.function_id
         )
     })?;
-    let unsupported_params = function
-        .params
-        .iter()
-        .filter(|param| {
-            matches!(
-                param.kind,
-                ParamKind::VarArg | ParamKind::KwOnly | ParamKind::KwArg
-            )
-        })
-        .map(|param| format!("{}:{:?}", param.name, param.kind))
-        .collect::<Vec<_>>();
-    if !unsupported_params.is_empty() {
-        return Err(format!(
-            "entry interpreter only supports explicit positional args for function {}; unsupported params: {}",
-            function.function_id,
-            unsupported_params.join(", ")
-        ));
-    }
-    let positional_params = function
-        .params
+
+    let params = &function.params.params;
+    let runtime_layout = FunctionRuntimeDataLayout::from_function(function);
+    let positional_param_indices = params
         .iter()
         .enumerate()
-        .filter(|(_, param)| matches!(param.kind, ParamKind::PosOnly | ParamKind::Any))
+        .filter_map(|(index, param)| {
+            matches!(param.kind, ParamKind::PosOnly | ParamKind::Any).then_some(index)
+        })
         .collect::<Vec<_>>();
-    if positional_args.len() > positional_params.len() {
-        return Err(format!(
-            "entry interpreter got {} positional args for function {} with {} positional params",
-            positional_args.len(),
-            function.function_id,
-            positional_params.len()
-        ));
+    let positional_capacity = positional_param_indices.len();
+    let varargs_param = function.params.vararg_index();
+    let varkw_param = function.params.kwarg_index();
+    let callable_name = function.names.display_name.as_str();
+    let nargs = unsafe { ffi::PyVectorcall_NARGS(nargsf) as usize };
+    let nkw = if kwnames.is_null() {
+        0
+    } else {
+        unsafe { ffi::PyTuple_GET_SIZE(kwnames.cast::<ffi::PyObject>()) as usize }
+    };
+    if (nargs > 0 || nkw > 0) && args.is_null() {
+        unsafe {
+            ffi::PyErr_SetString(
+                ffi::PyExc_RuntimeError,
+                c"missing vectorcall argument array in entry interpreter binding".as_ptr(),
+            );
+        }
+        return Ok(None);
     }
 
     let mut slot_by_name = HashMap::new();
@@ -272,49 +293,244 @@ unsafe fn build_entry_local_bindings(
             ));
         }
     }
-    for (_, param) in &positional_params {
+    for param in params {
         if !slot_by_name.contains_key(param.name.as_str()) {
             return Err(format!(
-                "entry interpreter expected positional param {:?} in stack slots for function {}",
+                "entry interpreter expected param {:?} in stack slots for function {}",
                 param.name, function.function_id
             ));
         }
     }
 
-    let runtime_layout = FunctionRuntimeDataLayout::from_function(function);
-    let mut arg_by_name = HashMap::new();
-    let mut missing_required_args = Vec::new();
-    for (positional_index, (param_index, param)) in positional_params.iter().copied().enumerate() {
-        let provided = positional_args
-            .get(positional_index)
-            .copied()
-            .filter(|arg| !arg.is_null());
-        let arg = match provided {
-            Some(arg) => {
-                unsafe {
-                    ffi::Py_INCREF(arg.cast::<ffi::PyObject>());
-                }
-                Some(arg)
+    if varargs_param.is_none() && nargs > positional_capacity {
+        unsafe {
+            set_entry_type_error(format!(
+                "{}() takes {} positional argument{} but {} {} given",
+                callable_name,
+                positional_capacity,
+                if positional_capacity == 1 { "" } else { "s" },
+                nargs,
+                if nargs == 1 { "was" } else { "were" }
+            ));
+        }
+        return Ok(None);
+    }
+
+    let mut param_values = vec![ptr::null_mut(); params.len()];
+    let mut assigned = vec![false; params.len()];
+
+    let positional_bound = nargs.min(positional_capacity);
+    for position in 0..positional_bound {
+        let param_index = positional_param_indices[position];
+        let value = unsafe { *args.add(position) };
+        if value.is_null() {
+            unsafe {
+                release_entry_param_values(param_values.as_mut_slice());
+                ffi::PyErr_SetString(
+                    ffi::PyExc_RuntimeError,
+                    c"null vectorcall positional argument in entry interpreter binding".as_ptr(),
+                );
             }
-            None => unsafe {
-                load_entry_default_arg_owned(&runtime_layout, function_data_obj, param_index)?
-            },
+            return Ok(None);
+        }
+        unsafe {
+            ffi::Py_INCREF(value.cast::<ffi::PyObject>());
+        }
+        param_values[param_index] = value;
+        assigned[param_index] = true;
+    }
+
+    if let Some(varargs_param) = varargs_param {
+        let extras = nargs.saturating_sub(positional_capacity);
+        let tuple = unsafe { ffi::PyTuple_New(extras as ffi::Py_ssize_t) };
+        if tuple.is_null() {
+            unsafe { release_entry_param_values(param_values.as_mut_slice()) };
+            return Ok(None);
+        }
+        for offset in 0..extras {
+            let value = unsafe { *args.add(positional_capacity + offset) };
+            if value.is_null() {
+                unsafe {
+                    ffi::Py_DECREF(tuple);
+                    release_entry_param_values(param_values.as_mut_slice());
+                    ffi::PyErr_SetString(
+                        ffi::PyExc_RuntimeError,
+                        c"null vectorcall positional vararg in entry interpreter binding".as_ptr(),
+                    );
+                }
+                return Ok(None);
+            }
+            unsafe {
+                ffi::Py_INCREF(value.cast::<ffi::PyObject>());
+                if ffi::PyTuple_SetItem(
+                    tuple,
+                    offset as ffi::Py_ssize_t,
+                    value.cast::<ffi::PyObject>(),
+                ) != 0
+                {
+                    ffi::Py_DECREF(value.cast::<ffi::PyObject>());
+                    ffi::Py_DECREF(tuple);
+                    release_entry_param_values(param_values.as_mut_slice());
+                    return Ok(None);
+                }
+            }
+        }
+        param_values[varargs_param] = tuple.cast();
+        assigned[varargs_param] = true;
+    }
+
+    let has_varkw = varkw_param.is_some();
+    if let Some(varkw_param) = varkw_param {
+        let dict = unsafe { ffi::PyDict_New() };
+        if dict.is_null() {
+            unsafe { release_entry_param_values(param_values.as_mut_slice()) };
+            return Ok(None);
+        }
+        param_values[varkw_param] = dict.cast();
+        assigned[varkw_param] = true;
+    }
+
+    for kw_index in 0..nkw {
+        let key = unsafe {
+            ffi::PyTuple_GetItem(kwnames.cast::<ffi::PyObject>(), kw_index as ffi::Py_ssize_t)
         };
-        if let Some(arg) = arg {
-            arg_by_name.insert(param.name.as_str(), arg);
+        if key.is_null() {
+            unsafe { release_entry_param_values(param_values.as_mut_slice()) };
+            return Ok(None);
+        }
+        let value = unsafe { *args.add(nargs + kw_index) };
+        if value.is_null() {
+            unsafe {
+                release_entry_param_values(param_values.as_mut_slice());
+                ffi::PyErr_SetString(
+                    ffi::PyExc_RuntimeError,
+                    c"null vectorcall keyword argument in entry interpreter binding".as_ptr(),
+                );
+            }
+            return Ok(None);
+        }
+        let Some(key_name) = (unsafe { entry_keyword_name(key)? }) else {
+            unsafe { release_entry_param_values(param_values.as_mut_slice()) };
+            return Ok(None);
+        };
+        if let Some(param_index) = function.params.param_index(key_name.as_str()) {
+            let param = &params[param_index];
+            match param.kind {
+                ParamKind::PosOnly | ParamKind::VarArg => {
+                    if !has_varkw {
+                        unsafe {
+                            release_entry_param_values(param_values.as_mut_slice());
+                            set_entry_type_error(format!(
+                                "{}() got an unexpected keyword argument '{}'",
+                                callable_name, key_name
+                            ));
+                        }
+                        return Ok(None);
+                    }
+                    if let Some(varkw_param) = varkw_param {
+                        let dict = param_values[varkw_param].cast::<ffi::PyObject>();
+                        if unsafe { ffi::PyDict_SetItem(dict, key, value.cast::<ffi::PyObject>()) }
+                            != 0
+                        {
+                            unsafe { release_entry_param_values(param_values.as_mut_slice()) };
+                            return Ok(None);
+                        }
+                    }
+                }
+                ParamKind::Any | ParamKind::KwOnly => {
+                    if assigned[param_index] {
+                        unsafe {
+                            release_entry_param_values(param_values.as_mut_slice());
+                            set_entry_type_error(format!(
+                                "{}() got multiple values for argument '{}'",
+                                callable_name, key_name
+                            ));
+                        }
+                        return Ok(None);
+                    }
+                    unsafe {
+                        ffi::Py_INCREF(value.cast::<ffi::PyObject>());
+                    }
+                    param_values[param_index] = value;
+                    assigned[param_index] = true;
+                }
+                ParamKind::KwArg => {
+                    if let Some(varkw_param) = varkw_param {
+                        let dict = param_values[varkw_param].cast::<ffi::PyObject>();
+                        if unsafe { ffi::PyDict_SetItem(dict, key, value.cast::<ffi::PyObject>()) }
+                            != 0
+                        {
+                            unsafe { release_entry_param_values(param_values.as_mut_slice()) };
+                            return Ok(None);
+                        }
+                    }
+                }
+            }
+        } else if let Some(varkw_param) = varkw_param {
+            let dict = param_values[varkw_param].cast::<ffi::PyObject>();
+            if unsafe { ffi::PyDict_SetItem(dict, key, value.cast::<ffi::PyObject>()) } != 0 {
+                unsafe { release_entry_param_values(param_values.as_mut_slice()) };
+                return Ok(None);
+            }
         } else {
-            missing_required_args.push(param.name.as_str());
+            unsafe {
+                release_entry_param_values(param_values.as_mut_slice());
+                set_entry_type_error(format!(
+                    "{}() got an unexpected keyword argument '{}'",
+                    callable_name, key_name
+                ));
+            }
+            return Ok(None);
         }
     }
-    if !missing_required_args.is_empty() {
-        unsafe {
-            release_owned_values(arg_by_name.values().copied().collect());
+
+    for (param_index, param) in params.iter().enumerate() {
+        if assigned[param_index] {
+            continue;
         }
-        return Err(format!(
-            "entry interpreter missing positional args for function {}: {}",
-            function.function_id,
-            missing_required_args.join(", ")
-        ));
+        match param.kind {
+            ParamKind::VarArg | ParamKind::KwArg => {}
+            ParamKind::PosOnly | ParamKind::Any | ParamKind::KwOnly => {
+                let default = unsafe {
+                    load_entry_default_arg_owned(
+                        &runtime_layout,
+                        function_data_obj,
+                        param_index,
+                        param.kind,
+                        param.name.as_str(),
+                    )?
+                };
+                if let Some(default) = default {
+                    param_values[param_index] = default;
+                    assigned[param_index] = true;
+                } else {
+                    unsafe {
+                        release_entry_param_values(param_values.as_mut_slice());
+                        set_entry_type_error(format!(
+                            "{}() missing required argument '{}'",
+                            callable_name, param.name
+                        ));
+                    }
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
+    let mut arg_by_name = HashMap::new();
+    for (param_index, param) in params.iter().enumerate() {
+        let value = param_values[param_index];
+        if value.is_null() {
+            continue;
+        }
+        if !slot_by_name.contains_key(param.name.as_str()) {
+            unsafe { release_entry_param_values(param_values.as_mut_slice()) };
+            return Err(format!(
+                "entry interpreter expected param {:?} in stack slots for function {}",
+                param.name, function.function_id
+            ));
+        }
+        arg_by_name.insert(param.name.as_str(), value);
     }
 
     let mut bindings = Vec::with_capacity(layout.stack_slots().len());
@@ -343,7 +559,7 @@ unsafe fn build_entry_local_bindings(
             values.push(ptr::null_mut());
         }
     }
-    Ok((bindings, values))
+    Ok(Some((bindings, values)))
 }
 
 #[cold]
@@ -351,9 +567,17 @@ unsafe fn load_entry_default_arg_owned(
     runtime_layout: &FunctionRuntimeDataLayout,
     function_data_obj: ObjPtr,
     param_index: usize,
+    param_kind: ParamKind,
+    param_name: &str,
 ) -> Result<Option<ObjPtr>, String> {
-    let Some(default_slot) = runtime_layout.positional_default_slot_for_param_index(param_index)
-    else {
+    let default_slot = match param_kind {
+        ParamKind::PosOnly | ParamKind::Any => {
+            runtime_layout.positional_default_slot_for_param_index(param_index)
+        }
+        ParamKind::KwOnly => runtime_layout.kwonly_default_slot(param_name),
+        ParamKind::VarArg | ParamKind::KwArg => None,
+    };
+    let Some(default_slot) = default_slot else {
         return Ok(None);
     };
     if function_data_obj.is_null() {
@@ -367,6 +591,49 @@ unsafe fn load_entry_default_arg_owned(
         ffi::Py_INCREF(value.cast::<ffi::PyObject>());
     }
     Ok(Some(value))
+}
+
+#[cold]
+unsafe fn entry_keyword_name(key: *mut ffi::PyObject) -> Result<Option<String>, String> {
+    let mut size = 0;
+    let ptr = unsafe { ffi::PyUnicode_AsUTF8AndSize(key, &mut size) };
+    if ptr.is_null() {
+        return Ok(None);
+    }
+    let len = usize::try_from(size)
+        .map_err(|_| "entry interpreter keyword name had negative UTF-8 size".to_string())?;
+    let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) };
+    std::str::from_utf8(bytes)
+        .map(|name| Some(name.to_string()))
+        .map_err(|_| "entry interpreter keyword name was not valid UTF-8".to_string())
+}
+
+#[cold]
+unsafe fn set_entry_type_error(message: String) {
+    if let Ok(c_message) = std::ffi::CString::new(message) {
+        unsafe {
+            ffi::PyErr_SetString(ffi::PyExc_TypeError, c_message.as_ptr());
+        }
+    } else {
+        unsafe {
+            ffi::PyErr_SetString(
+                ffi::PyExc_TypeError,
+                c"invalid entry interpreter argument binding error".as_ptr(),
+            );
+        }
+    }
+}
+
+#[cold]
+unsafe fn release_entry_param_values(values: &mut [ObjPtr]) {
+    for value in values.iter_mut() {
+        if !value.is_null() {
+            unsafe {
+                ffi::Py_DECREF(value.cast::<ffi::PyObject>());
+            }
+            *value = ptr::null_mut();
+        }
+    }
 }
 
 #[allow(dead_code)]

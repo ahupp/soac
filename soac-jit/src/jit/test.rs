@@ -1024,17 +1024,19 @@ def needs_arg(value):
                 std::ptr::null_mut(),
                 module_constant_ptrs.as_slice(),
             );
-            let err = unsafe { run_blockpy_function_from_entry(function, context, &[]) }
-                .expect_err("entry interpreter should report missing positional args");
+            let result = unsafe { run_blockpy_function_from_entry(function, context, &[]) }.expect(
+                "entry interpreter should handle missing positional args as a Python call error",
+            );
 
             assert!(
-                err.contains("missing positional args"),
-                "error should identify function-entry argument binding as the blocker: {err}"
+                result.is_null(),
+                "entry interpreter should return null for Python argument binding errors"
             );
             assert!(
-                unsafe { ffi::PyErr_Occurred() }.is_null(),
-                "argument-binding validation should not leave a Python exception"
+                unsafe { ffi::PyErr_ExceptionMatches(ffi::PyExc_TypeError) } != 0,
+                "missing positional arg should raise TypeError"
             );
+            unsafe { ffi::PyErr_Clear() };
         });
     }
 
@@ -1135,6 +1137,24 @@ def add_default(left, right=9):
             module_constant_ptrs.as_slice(),
         );
         unsafe { run_blockpy_function_from_entry(function, context, positional_args) }
+    }
+
+    unsafe fn entry_test_kwnames(names: &[&str]) -> *mut ffi::PyObject {
+        let tuple = ffi::PyTuple_New(names.len() as ffi::Py_ssize_t);
+        assert!(!tuple.is_null(), "kwnames tuple should allocate");
+        for (index, name) in names.iter().enumerate() {
+            let key = ffi::PyUnicode_FromStringAndSize(
+                name.as_ptr().cast(),
+                name.len() as ffi::Py_ssize_t,
+            );
+            assert!(!key.is_null(), "keyword name should allocate");
+            assert_eq!(
+                ffi::PyTuple_SetItem(tuple, index as ffi::Py_ssize_t, key),
+                0,
+                "keyword name should insert into kwnames tuple"
+            );
+        }
+        tuple
     }
 
     #[test]
@@ -1286,6 +1306,230 @@ def call_helper(value):
             ffi::Py_DECREF(result.cast::<ffi::PyObject>());
             ffi::Py_DECREF(input);
             ffi::Py_DECREF(globals);
+        });
+    }
+
+    #[test]
+    fn blockpy_entry_interpreter_binds_vectorcall_varargs_kwonly_and_kwargs() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| unsafe {
+            let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+                r#"
+def shaped(a, /, b, *args, c, **kwargs):
+    return (a, b, args, c, kwargs["extra"])
+"#,
+            )
+            .expect("lowering vectorcall entry source should succeed")
+            .codegen_module;
+            let shared_state =
+                crate::module_type::build_shared_state_for_testing(py, lowered, "entry_test", "")
+                    .expect("shared state should build for vectorcall entry test");
+            let function = shared_state
+                .lowered_module
+                .callable_defs
+                .iter()
+                .find(|function| function.names.bind_name == "shaped")
+                .expect("lowered module should contain shaped function");
+            let module_constant_ptrs = shared_state
+                .module_constant_ptrs()
+                .into_iter()
+                .map(|ptr| ptr.cast::<c_void>())
+                .collect::<Vec<_>>();
+            let context = BlockPyEntryRuntimeContext::new(
+                std::sync::Arc::new(crate::session::CompileSession::new()),
+                std::sync::Arc::clone(&shared_state),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                module_constant_ptrs.as_slice(),
+            );
+            let a = ffi::PyLong_FromLong(1);
+            let b = ffi::PyLong_FromLong(2);
+            let extra_positional = ffi::PyLong_FromLong(3);
+            let c = ffi::PyLong_FromLong(4);
+            let extra = ffi::PyLong_FromLong(5);
+            assert!(!a.is_null() && !b.is_null() && !extra_positional.is_null());
+            assert!(!c.is_null() && !extra.is_null());
+            let args = [
+                a.cast::<c_void>(),
+                b.cast::<c_void>(),
+                extra_positional.cast::<c_void>(),
+                c.cast::<c_void>(),
+                extra.cast::<c_void>(),
+            ];
+            let kwnames = entry_test_kwnames(&["c", "extra"]);
+
+            let result = run_blockpy_function_from_vectorcall_entry(
+                function,
+                context,
+                args.as_ptr(),
+                3,
+                kwnames.cast(),
+            )
+            .expect("entry interpreter should bind vectorcall-shaped arguments");
+
+            assert!(
+                ffi::PyErr_Occurred().is_null(),
+                "successful vectorcall entry run should not leave a Python exception"
+            );
+            assert_eq!(
+                ffi::PyTuple_Size(result.cast::<ffi::PyObject>()),
+                5,
+                "entry interpreter should return the shaped argument tuple"
+            );
+            let item0 = ffi::PyTuple_GetItem(result.cast::<ffi::PyObject>(), 0);
+            let item1 = ffi::PyTuple_GetItem(result.cast::<ffi::PyObject>(), 1);
+            let varargs = ffi::PyTuple_GetItem(result.cast::<ffi::PyObject>(), 2);
+            let item3 = ffi::PyTuple_GetItem(result.cast::<ffi::PyObject>(), 3);
+            let item4 = ffi::PyTuple_GetItem(result.cast::<ffi::PyObject>(), 4);
+            assert_eq!(ffi::PyLong_AsLong(item0), 1);
+            assert_eq!(ffi::PyLong_AsLong(item1), 2);
+            assert_eq!(ffi::PyTuple_Size(varargs), 1);
+            assert_eq!(ffi::PyLong_AsLong(ffi::PyTuple_GetItem(varargs, 0)), 3);
+            assert_eq!(ffi::PyLong_AsLong(item3), 4);
+            assert_eq!(ffi::PyLong_AsLong(item4), 5);
+            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+            ffi::Py_DECREF(kwnames);
+            ffi::Py_DECREF(extra);
+            ffi::Py_DECREF(c);
+            ffi::Py_DECREF(extra_positional);
+            ffi::Py_DECREF(b);
+            ffi::Py_DECREF(a);
+        });
+    }
+
+    #[test]
+    fn blockpy_entry_interpreter_binds_kwonly_defaults_from_function_data() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| unsafe {
+            let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+                r#"
+def add_kw_default(value, *, scale=9):
+    return value + scale
+"#,
+            )
+            .expect("lowering keyword-default entry source should succeed")
+            .codegen_module;
+            let shared_state =
+                crate::module_type::build_shared_state_for_testing(py, lowered, "entry_test", "")
+                    .expect("shared state should build for keyword-default entry test");
+            let function = shared_state
+                .lowered_module
+                .callable_defs
+                .iter()
+                .find(|function| function.names.bind_name == "add_kw_default")
+                .expect("lowered module should contain add_kw_default function");
+            let runtime_layout = FunctionRuntimeDataLayout::from_function(function);
+            let mut function_data =
+                vec![std::ptr::null_mut::<ffi::PyObject>(); runtime_layout.total_len()];
+            let default_slot = runtime_layout
+                .kwonly_default_slot("scale")
+                .expect("scale should have a runtime kwonly default slot");
+            let default = ffi::PyLong_FromLong(9);
+            assert!(!default.is_null(), "test kwonly default should allocate");
+            function_data[default_slot] = default;
+            let input = ffi::PyLong_FromLong(33);
+            assert!(!input.is_null(), "test input should allocate");
+            let args = [input.cast::<c_void>()];
+            let module_constant_ptrs = shared_state
+                .module_constant_ptrs()
+                .into_iter()
+                .map(|ptr| ptr.cast::<c_void>())
+                .collect::<Vec<_>>();
+            let context = BlockPyEntryRuntimeContext::new(
+                std::sync::Arc::new(crate::session::CompileSession::new()),
+                std::sync::Arc::clone(&shared_state),
+                std::ptr::null_mut(),
+                function_data.as_mut_ptr().cast::<c_void>(),
+                module_constant_ptrs.as_slice(),
+            );
+
+            let result = run_blockpy_function_from_vectorcall_entry(
+                function,
+                context,
+                args.as_ptr(),
+                1,
+                std::ptr::null_mut(),
+            )
+            .expect("entry interpreter should bind keyword-only default from function data");
+
+            assert_eq!(
+                ffi::PyLong_AsLong(result.cast::<ffi::PyObject>()),
+                42,
+                "entry interpreter should use kwonly runtime default"
+            );
+            assert!(
+                ffi::PyErr_Occurred().is_null(),
+                "successful kwonly default run should not leave a Python exception"
+            );
+            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+            ffi::Py_DECREF(input);
+            ffi::Py_DECREF(default);
+        });
+    }
+
+    #[test]
+    fn blockpy_entry_interpreter_reports_duplicate_vectorcall_argument() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| unsafe {
+            let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+                r#"
+def takes_one(value):
+    return value
+"#,
+            )
+            .expect("lowering duplicate vectorcall entry source should succeed")
+            .codegen_module;
+            let shared_state =
+                crate::module_type::build_shared_state_for_testing(py, lowered, "entry_test", "")
+                    .expect("shared state should build for duplicate vectorcall entry test");
+            let function = shared_state
+                .lowered_module
+                .callable_defs
+                .iter()
+                .find(|function| function.names.bind_name == "takes_one")
+                .expect("lowered module should contain takes_one function");
+            let module_constant_ptrs = shared_state
+                .module_constant_ptrs()
+                .into_iter()
+                .map(|ptr| ptr.cast::<c_void>())
+                .collect::<Vec<_>>();
+            let context = BlockPyEntryRuntimeContext::new(
+                std::sync::Arc::new(crate::session::CompileSession::new()),
+                std::sync::Arc::clone(&shared_state),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                module_constant_ptrs.as_slice(),
+            );
+            let positional = ffi::PyLong_FromLong(1);
+            let keyword = ffi::PyLong_FromLong(2);
+            assert!(!positional.is_null() && !keyword.is_null());
+            let args = [positional.cast::<c_void>(), keyword.cast::<c_void>()];
+            let kwnames = entry_test_kwnames(&["value"]);
+
+            let result = run_blockpy_function_from_vectorcall_entry(
+                function,
+                context,
+                args.as_ptr(),
+                1,
+                kwnames.cast(),
+            )
+            .expect("duplicate vectorcall argument should be reported as a Python call error");
+
+            assert!(
+                result.is_null(),
+                "duplicate vectorcall argument should return null"
+            );
+            assert!(
+                ffi::PyErr_ExceptionMatches(ffi::PyExc_TypeError) != 0,
+                "duplicate vectorcall argument should raise TypeError"
+            );
+            ffi::PyErr_Clear();
+            ffi::Py_DECREF(kwnames);
+            ffi::Py_DECREF(keyword);
+            ffi::Py_DECREF(positional);
         });
     }
 

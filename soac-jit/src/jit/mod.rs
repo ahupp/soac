@@ -84,7 +84,10 @@ unsafe extern "C" {
 
 mod deopt_interpreter;
 #[allow(unused_imports)]
-pub(crate) use deopt_interpreter::{BlockPyEntryRuntimeContext, run_blockpy_function_from_entry};
+pub(crate) use deopt_interpreter::{
+    BlockPyEntryRuntimeContext, run_blockpy_function_from_entry,
+    run_blockpy_function_from_vectorcall_entry,
+};
 mod direct_abi;
 mod intrinsics;
 mod jitdump;
