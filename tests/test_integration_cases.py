@@ -42,18 +42,6 @@ def test_integration_case(tmp_path: Path, case_path: Path, mode: str) -> None:
         # helper target function under the generated integration module name.
         pytest.xfail("spawn-mode multiprocessing helper pickling is not yet stable")
     if mode in {"soac", "entry"} and case_path.stem in {
-        "exception_refcycle_after_except",
-        "exception_refcycle_args_tuple",
-        "taskgroup_propagate_cancellation_refcycle",
-        "asyncio_taskgroup_base_error_refcycle",
-        "iter_refcount_behavior",
-        "with_context_exception_leak",
-    }:
-        # Dict-backed frame locals are currently GC-visible, unlike CPython's
-        # fast-locals representation. This changes refcycle/collection behavior
-        # for exception-sensitive cases on the SOAC-loaded path.
-        pytest.xfail("exception/refcycle behavior differs in SOAC-loaded path")
-    if mode in {"soac", "entry"} and case_path.stem in {
         "enum_dynamic_members_vars_update",
         "enum_ignore_dynamic_names",
         "exception_cleanup_name",
