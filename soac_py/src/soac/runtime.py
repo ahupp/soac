@@ -21,7 +21,6 @@ import builtins as _builtins
 import threading as _threading
 import types as _types
 import typing as _typing
-import warnings as _warnings
 
 from . import _soac_ext
 from .sim import (
@@ -622,14 +621,6 @@ def import_attr(module, attr):
     if module_name:
         submodule = _sys.modules.get(f"{module_name}.{attr}")
         if submodule is not None:
-            try:
-                setattr(module, attr, submodule)
-            except Exception:
-                _warnings.warn(
-                    f"cannot set attribute {attr!r} on {module_name!r}",
-                    ImportWarning,
-                    stacklevel=2,
-                )
             return submodule
     module_spec = getattr(module, "__spec__", None)
     if (

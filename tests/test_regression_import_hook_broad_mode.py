@@ -86,6 +86,28 @@ else:
         assert module.VALUE == "math"
 
 
+def test_soac_from_import_sys_modules_fallback_does_not_set_parent_attr(tmp_path):
+    package_dir = tmp_path / "from_import_cached_pkg"
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "child.py").write_text("VALUE = 42\n", encoding="utf-8")
+    source = f"""
+import sys
+sys.path.insert(0, {str(tmp_path)!r})
+try:
+    import from_import_cached_pkg.child as child
+    import from_import_cached_pkg as parent
+    del parent.child
+    from from_import_cached_pkg import child as imported
+    VALUE = (imported is child, hasattr(parent, "child"))
+finally:
+    sys.path.remove({str(tmp_path)!r})
+"""
+
+    with soac_module(tmp_path, "from_import_cached_submodule", source) as module:
+        assert module.VALUE == (True, False)
+
+
 def test_soac_module_helper_does_not_transform_stdlib_imports_by_default(tmp_path):
     source = """
 import sys
