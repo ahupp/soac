@@ -21,8 +21,6 @@ const SOAC_RUNTIME_BOOTSTRAP_HELPER_NAMES: &[&str] = &[
     "exec",
     "import_",
     "import_attr",
-    "exception_matches",
-    "exceptiongroup_split",
 ];
 
 #[derive(Debug, Clone, Copy)]
@@ -719,31 +717,6 @@ def import_attr(module, attr):
         message = f'{message} (unknown location)'
     raise ImportError(message, name=module_name, path=module_file) from None
 
-def _validate_exception_type(exc_type):
-    if _builtins.isinstance(exc_type, tuple):
-        for entry in exc_type:
-            _validate_exception_type(entry)
-        return
-    if _builtins.isinstance(exc_type, type) and _builtins.issubclass(exc_type, _builtins.BaseException):
-        return
-    raise _builtins.TypeError(
-        'catching classes that do not inherit from BaseException is not allowed'
-    )
-
-def exception_matches(exc, exc_type):
-    if _builtins.isinstance(exc, _builtins.RecursionError):
-        return _builtins.isinstance(exc, exc_type)
-    _validate_exception_type(exc_type)
-    return _builtins.isinstance(exc, exc_type)
-
-def exceptiongroup_split(exc, exc_type):
-    _validate_exception_type(exc_type)
-    if _builtins.isinstance(exc, _builtins.BaseExceptionGroup):
-        match, rest = exc.split(exc_type)
-        return match, rest
-    if _builtins.isinstance(exc, exc_type):
-        return exc, None
-    return None, exc
 ",
         c"<soac.runtime bootstrap>",
         c"soac.runtime._bootstrap",
