@@ -14,6 +14,7 @@ DEFAULT_LOG = Path("logs/last_benchmark_counters/module_loads.jsonl")
 MODULE_LOAD_EVENT = "soac.module_load"
 MODULE_LOAD_PHASE_EVENT = "soac.module_load.phase"
 JIT_CODEGEN_EVENT = "soac.jit_codegen"
+JIT_BATCH_CODEGEN_EVENT = "soac.jit_batch_codegen"
 JIT_CODEGEN_TIMING = "jit_codegen_total"
 MODULE_LOAD_TIMING = "module_load_total"
 JIT_CODEGEN_COUNTERS = (
@@ -64,6 +65,10 @@ class LogSummary:
     cumulative_jit_codegen_ms: float
     max_jit_codegen: JitMax | None
     jit_counter_stats: dict[str, CounterStats]
+    jit_batch_event_count: int
+    jit_batch_status_counts: Counter[str]
+    cumulative_jit_batch_codegen_ms: float
+    jit_batch_timing_stats: dict[str, TimingStats]
 
 
 def parse_args() -> argparse.Namespace:
@@ -150,6 +155,13 @@ def function_name(entry: dict[str, Any]) -> tuple[str, str, str]:
     return str(module), str(qualname), str(entry_kind)
 
 
+def batch_root_name(entry: dict[str, Any]) -> str:
+    module = module_name(entry)
+    raw_qualname = entry.get("root_function_qualname")
+    qualname = raw_qualname if isinstance(raw_qualname, str) and raw_qualname else "<unknown>"
+    return f"{module}.{qualname}"
+
+
 def status(entry: dict[str, Any]) -> str:
     raw_status = entry.get("status")
     return raw_status if isinstance(raw_status, str) and raw_status else "<missing>"
@@ -197,6 +209,7 @@ def summarize_entries(path: Path, entries: list[dict[str, Any]]) -> LogSummary:
     module_events = [entry for entry in entries if entry.get("event") == MODULE_LOAD_EVENT]
     module_phase_events = [entry for entry in entries if entry.get("event") == MODULE_LOAD_PHASE_EVENT]
     jit_events = [entry for entry in entries if entry.get("event") == JIT_CODEGEN_EVENT]
+    jit_batch_events = [entry for entry in entries if entry.get("event") == JIT_BATCH_CODEGEN_EVENT]
 
     module_timing_values: dict[str, list[tuple[float, str]]] = defaultdict(list)
     cumulative_module_load_ms = 0.0
@@ -233,6 +246,16 @@ def summarize_entries(path: Path, entries: list[dict[str, Any]]) -> LogSummary:
             if isinstance(value, int | float):
                 jit_counter_values[counter_name].append((int(value), owner))
 
+    cumulative_jit_batch_codegen_ms = 0.0
+    jit_batch_timing_values: dict[str, list[tuple[float, str]]] = defaultdict(list)
+    for entry in jit_batch_events:
+        timings = numeric_timings(entry)
+        owner = batch_root_name(entry)
+        cumulative_jit_batch_codegen_ms += timings.get("jit_batch_total", 0.0)
+        for timing_name, value in timings.items():
+            if timing_name.startswith("jit_batch_"):
+                jit_batch_timing_values[timing_name].append((value, owner))
+
     return LogSummary(
         path=path,
         module_event_count=len(module_events),
@@ -244,6 +267,10 @@ def summarize_entries(path: Path, entries: list[dict[str, Any]]) -> LogSummary:
         cumulative_jit_codegen_ms=cumulative_jit_codegen_ms,
         max_jit_codegen=max_jit_codegen,
         jit_counter_stats=jit_counter_stats(jit_counter_values),
+        jit_batch_event_count=len(jit_batch_events),
+        jit_batch_status_counts=Counter(status(entry) for entry in jit_batch_events),
+        cumulative_jit_batch_codegen_ms=cumulative_jit_batch_codegen_ms,
+        jit_batch_timing_stats=timing_stats(jit_batch_timing_values),
     )
 
 
@@ -302,6 +329,21 @@ def print_summary(summary: LogSummary) -> None:
                 f"{counter_name:32} {stats.count:5d} "
                 f"{stats.total:12d} {stats.median:12.1f} "
                 f"{stats.max:12d} {stats.max_owner}"
+            )
+
+    print()
+    print(f"jit-batch-codegen events: {summary.jit_batch_event_count}")
+    print_status_counts("jit-batch-codegen status", summary.jit_batch_status_counts)
+    print(f"cumulative jit_batch_total: {fmt_ms(summary.cumulative_jit_batch_codegen_ms)} ms")
+    if summary.jit_batch_timing_stats:
+        print("jit-batch timing medians/maxima:")
+        print(f"{'timing':56} {'n':>5} {'total_ms':>10} {'median_ms':>10} {'max_ms':>10} max_batch")
+        for timing_name in sorted(summary.jit_batch_timing_stats):
+            stats = summary.jit_batch_timing_stats[timing_name]
+            print(
+                f"{timing_name:56} {stats.count:5d} "
+                f"{fmt_ms(stats.cumulative_ms)} {fmt_ms(stats.median_ms)} "
+                f"{fmt_ms(stats.max_ms)} {stats.max_owner}"
             )
 
 

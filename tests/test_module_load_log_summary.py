@@ -120,6 +120,31 @@ def test_summarize_log_reports_load_phase_and_jit_codegen_max(tmp_path, capsys):
                 "jit_machine_code_block_count": 8,
                 "jit_machine_code_edge_count": 10,
             },
+            {
+                "event": "soac.jit_batch_codegen",
+                "status": "ok",
+                "module_name": "slow",
+                "root_function_qualname": "_dp_module_init",
+                "batch_function_count": 9,
+                "functions_to_define_count": 7,
+                "requested_worker_count": 4,
+                "worker_module_count": 4,
+                "worker_function_count_min": 1,
+                "worker_function_count_max": 2,
+                "jit_batch_collect_us": 100,
+                "jit_batch_reservation_us": 1_000,
+                "jit_batch_codegen_us": 20_000,
+                "jit_batch_commit_us": 2_000,
+                "jit_batch_total_us": 24_000,
+                "jit_batch_worker_total_sum_us": 40_000,
+                "jit_batch_worker_total_max_us": 12_000,
+                "jit_batch_worker_module_build_sum_us": 7_000,
+                "jit_batch_worker_module_build_max_us": 3_000,
+                "jit_batch_worker_compile_sum_us": 30_000,
+                "jit_batch_worker_compile_max_us": 9_000,
+                "jit_batch_worker_validate_sum_us": 2_000,
+                "jit_batch_worker_validate_max_us": 800,
+            },
         ],
     )
 
@@ -139,6 +164,10 @@ def test_summarize_log_reports_load_phase_and_jit_codegen_max(tmp_path, capsys):
     assert summary.jit_counter_stats["jit_machine_code_size_bytes"].max_owner == "slow.expensive (direct_function_body)"
     assert summary.jit_counter_stats["jit_machine_code_block_count"].total == 12
     assert summary.jit_counter_stats["function_block_count"].total == 12
+    assert summary.jit_batch_event_count == 1
+    assert summary.cumulative_jit_batch_codegen_ms == 24.0
+    assert summary.jit_batch_timing_stats["jit_batch_worker_compile_sum"].max_ms == 30.0
+    assert summary.jit_batch_timing_stats["jit_batch_worker_compile_sum"].max_owner == "slow._dp_module_init"
 
     summary_script.print_summary(summary)
     out = capsys.readouterr().out
@@ -147,3 +176,5 @@ def test_summarize_log_reports_load_phase_and_jit_codegen_max(tmp_path, capsys):
     assert "slow.expensive" in out
     assert "jit-codegen counters (excluding soac.* modules):" in out
     assert "jit_machine_code_size_bytes" in out
+    assert "jit-batch-codegen events:" in out
+    assert "jit_batch_worker_compile_sum" in out

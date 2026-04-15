@@ -68,6 +68,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 use tracing::info;
 
 unsafe extern "C" {
@@ -1491,6 +1492,72 @@ enum ReservedDirectFunctionBatch<'a> {
     Reserved(JitBatchPlan<'a>),
 }
 
+struct JitBatchCompileOutput {
+    compiled_functions: Vec<CompiledJitFunction>,
+    worker_metrics: JitBatchWorkerMetrics,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct JitBatchWorkerMetrics {
+    requested_worker_count: usize,
+    worker_module_count: usize,
+    worker_function_count_min: usize,
+    worker_function_count_max: usize,
+    worker_total_sum: Duration,
+    worker_total_max: Duration,
+    worker_module_build_sum: Duration,
+    worker_module_build_max: Duration,
+    worker_compile_sum: Duration,
+    worker_compile_max: Duration,
+    worker_validate_sum: Duration,
+    worker_validate_max: Duration,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct JitBatchWorkerTiming {
+    function_count: usize,
+    total: Duration,
+    module_build: Duration,
+    compile: Duration,
+    validate: Duration,
+}
+
+struct JitBatchWorkerOutput {
+    compiled_functions: Vec<CompiledJitFunction>,
+    timing: JitBatchWorkerTiming,
+}
+
+impl JitBatchWorkerMetrics {
+    fn new(requested_worker_count: usize) -> Self {
+        Self {
+            requested_worker_count,
+            worker_function_count_min: usize::MAX,
+            ..Self::default()
+        }
+    }
+
+    fn record_worker(&mut self, timing: JitBatchWorkerTiming) {
+        self.worker_module_count += 1;
+        self.worker_function_count_min = self.worker_function_count_min.min(timing.function_count);
+        self.worker_function_count_max = self.worker_function_count_max.max(timing.function_count);
+        self.worker_total_sum += timing.total;
+        self.worker_total_max = self.worker_total_max.max(timing.total);
+        self.worker_module_build_sum += timing.module_build;
+        self.worker_module_build_max = self.worker_module_build_max.max(timing.module_build);
+        self.worker_compile_sum += timing.compile;
+        self.worker_compile_max = self.worker_compile_max.max(timing.compile);
+        self.worker_validate_sum += timing.validate;
+        self.worker_validate_max = self.worker_validate_max.max(timing.validate);
+    }
+
+    fn finish(mut self) -> Self {
+        if self.worker_module_count == 0 {
+            self.worker_function_count_min = 0;
+        }
+        self
+    }
+}
+
 type JitWorkerPlanCache = HashMap<
     usize,
     (
@@ -1717,6 +1784,70 @@ impl ProcessJitBatchFunctionSource<'_> {
             Self::OwnedSharedState(shared_state) => Some(shared_state.as_ref()),
         }
     }
+}
+
+fn duration_micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_jit_batch_codegen_log(
+    root_function: &BlockPyFunction<CodegenModuleShape>,
+    direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
+    status: &str,
+    failed_phase: &str,
+    error: Option<&str>,
+    batch_function_count: usize,
+    functions_to_define_count: usize,
+    batch_collect_elapsed: Duration,
+    reservation_elapsed: Duration,
+    codegen_elapsed: Duration,
+    commit_elapsed: Duration,
+    total_elapsed: Duration,
+    worker_metrics: JitBatchWorkerMetrics,
+) {
+    let (module_name, package_name) = direct_call_resolver
+        .map(|shared_state| {
+            (
+                shared_state.module_name.as_str(),
+                shared_state.package_name.as_str(),
+            )
+        })
+        .unwrap_or(("", ""));
+    info!(
+        target: "soac_jit_codegen",
+        event = "soac.jit_batch_codegen",
+        status,
+        failed_phase,
+        error = error.unwrap_or(""),
+        module_name,
+        package_name,
+        root_function_id = %root_function.function_id,
+        root_function_logical_id = root_function.function_id.function_id(),
+        root_function_qualname = root_function.names.qualname.as_str(),
+        batch_function_count = u64::try_from(batch_function_count).unwrap_or(u64::MAX),
+        functions_to_define_count = u64::try_from(functions_to_define_count).unwrap_or(u64::MAX),
+        requested_worker_count = u64::try_from(worker_metrics.requested_worker_count).unwrap_or(u64::MAX),
+        worker_module_count = u64::try_from(worker_metrics.worker_module_count).unwrap_or(u64::MAX),
+        worker_function_count_min = u64::try_from(worker_metrics.worker_function_count_min).unwrap_or(u64::MAX),
+        worker_function_count_max = u64::try_from(worker_metrics.worker_function_count_max).unwrap_or(u64::MAX),
+        jit_batch_collect_us = duration_micros(batch_collect_elapsed),
+        jit_batch_reservation_us = duration_micros(reservation_elapsed),
+        jit_batch_codegen_us = duration_micros(codegen_elapsed),
+        jit_batch_commit_us = duration_micros(commit_elapsed),
+        jit_batch_total_us = duration_micros(total_elapsed),
+        jit_batch_worker_total_sum_us = duration_micros(worker_metrics.worker_total_sum),
+        jit_batch_worker_total_max_us = duration_micros(worker_metrics.worker_total_max),
+        jit_batch_worker_module_build_sum_us =
+            duration_micros(worker_metrics.worker_module_build_sum),
+        jit_batch_worker_module_build_max_us =
+            duration_micros(worker_metrics.worker_module_build_max),
+        jit_batch_worker_compile_sum_us = duration_micros(worker_metrics.worker_compile_sum),
+        jit_batch_worker_compile_max_us = duration_micros(worker_metrics.worker_compile_max),
+        jit_batch_worker_validate_sum_us = duration_micros(worker_metrics.worker_validate_sum),
+        jit_batch_worker_validate_max_us = duration_micros(worker_metrics.worker_validate_max),
+        "jit_batch_codegen",
+    );
 }
 
 pub(crate) struct ProcessJitEngine {
@@ -2188,17 +2319,42 @@ impl ProcessJitState {
         }))
     }
 
-    fn compile_reserved_direct_function_batch<'a>(
-        jit_module: &mut JITModule,
+    fn compile_reserved_direct_function_batch_worker<'a>(
         inputs: &DirectFunctionCompileInputs<'a>,
         plan: &JitBatchPlan<'a>,
-    ) -> Result<Vec<CompiledJitFunction>, String> {
-        Self::compile_reserved_direct_function_batch_indices(
-            jit_module,
+        batch_function_indices: &[usize],
+    ) -> Result<JitBatchWorkerOutput, String> {
+        let worker_start = Instant::now();
+        let module_build_start = Instant::now();
+        let mut jit_module = plan
+            .module_declarations
+            .build_worker_module(inputs.session)?;
+        let module_build = module_build_start.elapsed();
+
+        let compile_start = Instant::now();
+        let compiled_functions = Self::compile_reserved_direct_function_batch_indices(
+            &mut jit_module,
             inputs,
             plan,
-            plan.function_indices_to_define.as_slice(),
-        )
+            batch_function_indices,
+        )?;
+        let compile = compile_start.elapsed();
+
+        let validate_start = Instant::now();
+        plan.module_declarations
+            .validate_no_extra_declarations(&jit_module)?;
+        let validate = validate_start.elapsed();
+
+        Ok(JitBatchWorkerOutput {
+            compiled_functions,
+            timing: JitBatchWorkerTiming {
+                function_count: batch_function_indices.len(),
+                total: worker_start.elapsed(),
+                module_build,
+                compile,
+                validate,
+            },
+        })
     }
 
     fn compile_reserved_direct_function_batch_indices<'a>(
@@ -2225,23 +2381,29 @@ impl ProcessJitState {
     fn compile_reserved_direct_function_batch_worker_modules<'a>(
         inputs: &DirectFunctionCompileInputs<'a>,
         plan: &JitBatchPlan<'a>,
-    ) -> Result<Vec<CompiledJitFunction>, String> {
+    ) -> Result<JitBatchCompileOutput, String> {
         let function_count = plan.function_indices_to_define.len();
         if function_count == 0 {
-            return Ok(Vec::new());
+            return Ok(JitBatchCompileOutput {
+                compiled_functions: Vec::new(),
+                worker_metrics: JitBatchWorkerMetrics::default(),
+            });
         }
         let worker_count = std::thread::available_parallelism()
             .map_or(1, usize::from)
             .min(function_count);
         if worker_count <= 1 {
-            let mut jit_module = plan
-                .module_declarations
-                .build_worker_module(inputs.session)?;
-            let compiled_functions =
-                Self::compile_reserved_direct_function_batch(&mut jit_module, inputs, plan)?;
-            plan.module_declarations
-                .validate_no_extra_declarations(&jit_module)?;
-            return Ok(compiled_functions);
+            let worker_output = Self::compile_reserved_direct_function_batch_worker(
+                inputs,
+                plan,
+                plan.function_indices_to_define.as_slice(),
+            )?;
+            let mut worker_metrics = JitBatchWorkerMetrics::new(worker_count);
+            worker_metrics.record_worker(worker_output.timing);
+            return Ok(JitBatchCompileOutput {
+                compiled_functions: worker_output.compiled_functions,
+                worker_metrics: worker_metrics.finish(),
+            });
         }
 
         let chunk_size = function_count.div_ceil(worker_count);
@@ -2250,32 +2412,30 @@ impl ProcessJitState {
             for batch_function_indices in plan.function_indices_to_define.chunks(chunk_size) {
                 handles.push(scope.spawn(move || {
                     let _guard = ProcessJitCompileGuard::enter();
-                    let mut jit_module = plan
-                        .module_declarations
-                        .build_worker_module(inputs.session)?;
-                    let compiled_functions = Self::compile_reserved_direct_function_batch_indices(
-                        &mut jit_module,
+                    Self::compile_reserved_direct_function_batch_worker(
                         inputs,
                         plan,
                         batch_function_indices,
-                    )?;
-                    plan.module_declarations
-                        .validate_no_extra_declarations(&jit_module)?;
-                    Ok::<_, String>(compiled_functions)
+                    )
                 }));
             }
 
             let mut compiled_functions = Vec::with_capacity(function_count);
+            let mut worker_metrics = JitBatchWorkerMetrics::new(worker_count);
             for handle in handles {
                 match handle.join() {
-                    Ok(Ok(mut worker_functions)) => {
-                        compiled_functions.append(&mut worker_functions)
+                    Ok(Ok(mut worker_output)) => {
+                        worker_metrics.record_worker(worker_output.timing);
+                        compiled_functions.append(&mut worker_output.compiled_functions)
                     }
                     Ok(Err(err)) => return Err(err),
                     Err(_) => return Err("process JIT batch codegen worker panicked".to_string()),
                 }
             }
-            Ok(compiled_functions)
+            Ok(JitBatchCompileOutput {
+                compiled_functions,
+                worker_metrics: worker_metrics.finish(),
+            })
         })
     }
 
@@ -15447,8 +15607,31 @@ impl ProcessJitEngine {
         module_constant_ptrs: &[*mut ffi::PyObject],
         direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
     ) -> Result<DirectFunctionCompileResult, String> {
+        let total_start = Instant::now();
+        let batch_collect_start = Instant::now();
         let batch_functions =
-            collect_process_jit_batch_functions(session, function, direct_call_resolver)?;
+            match collect_process_jit_batch_functions(session, function, direct_call_resolver) {
+                Ok(batch_functions) => batch_functions,
+                Err(err) => {
+                    emit_jit_batch_codegen_log(
+                        function,
+                        direct_call_resolver,
+                        "error",
+                        "collect",
+                        Some(&err),
+                        0,
+                        0,
+                        batch_collect_start.elapsed(),
+                        Duration::ZERO,
+                        Duration::ZERO,
+                        Duration::ZERO,
+                        total_start.elapsed(),
+                        JitBatchWorkerMetrics::default(),
+                    );
+                    return Err(err);
+                }
+            };
+        let batch_collect_elapsed = batch_collect_start.elapsed();
         let inputs = DirectFunctionCompileInputs {
             session,
             blocks,
@@ -15457,45 +15640,129 @@ impl ProcessJitEngine {
             counter_defs,
             module_constant_ptrs,
         };
-        let plan = {
+        let reservation_start = Instant::now();
+        let reserved_batch_result = {
             let mut state = self
                 .state
                 .lock()
                 .map_err(|_| "process JIT state lock poisoned".to_string())?;
             let mut jit_module = self.module.lock_for_serial_phase()?;
             let _guard = ProcessJitCompileGuard::enter();
-            match state.reserve_direct_function_batch(
-                &mut jit_module,
-                &inputs,
-                function,
-                batch_functions,
-            )? {
-                ReservedDirectFunctionBatch::Ready(handle) => {
-                    return Ok(DirectFunctionCompileResult {
-                        handle,
-                        compiled: false,
-                        stats: None,
-                    });
-                }
-                ReservedDirectFunctionBatch::Reserved(plan) => plan,
+            state.reserve_direct_function_batch(&mut jit_module, &inputs, function, batch_functions)
+        };
+        let reservation_elapsed = reservation_start.elapsed();
+        let plan = match reserved_batch_result {
+            Ok(ReservedDirectFunctionBatch::Ready(handle)) => {
+                return Ok(DirectFunctionCompileResult {
+                    handle,
+                    compiled: false,
+                    stats: None,
+                });
+            }
+            Ok(ReservedDirectFunctionBatch::Reserved(plan)) => plan,
+            Err(err) => {
+                emit_jit_batch_codegen_log(
+                    function,
+                    direct_call_resolver,
+                    "error",
+                    "reserve",
+                    Some(&err),
+                    0,
+                    0,
+                    batch_collect_elapsed,
+                    reservation_elapsed,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                    total_start.elapsed(),
+                    JitBatchWorkerMetrics::default(),
+                );
+                return Err(err);
             }
         };
-        let compiled_functions = {
+        let batch_function_count = plan.batch_functions.len();
+        let functions_to_define_count = plan.function_indices_to_define.len();
+        let codegen_start = Instant::now();
+        let batch_output = {
             let _guard = ProcessJitCompileGuard::enter();
-            ProcessJitState::compile_reserved_direct_function_batch_worker_modules(&inputs, &plan)?
+            match ProcessJitState::compile_reserved_direct_function_batch_worker_modules(
+                &inputs, &plan,
+            ) {
+                Ok(batch_output) => batch_output,
+                Err(err) => {
+                    let codegen_elapsed = codegen_start.elapsed();
+                    emit_jit_batch_codegen_log(
+                        function,
+                        direct_call_resolver,
+                        "error",
+                        "codegen",
+                        Some(&err),
+                        batch_function_count,
+                        functions_to_define_count,
+                        batch_collect_elapsed,
+                        reservation_elapsed,
+                        codegen_elapsed,
+                        Duration::ZERO,
+                        total_start.elapsed(),
+                        JitBatchWorkerMetrics::default(),
+                    );
+                    return Err(err);
+                }
+            }
         };
+        let codegen_elapsed = codegen_start.elapsed();
+        let worker_metrics = batch_output.worker_metrics;
+        let commit_start = Instant::now();
         let mut state = self
             .state
             .lock()
             .map_err(|_| "process JIT state lock poisoned".to_string())?;
         let mut jit_module = self.module.lock_for_serial_phase()?;
         let _guard = ProcessJitCompileGuard::enter();
-        state.commit_compiled_direct_function_batch(
+        let commit_result = state.commit_compiled_direct_function_batch(
             &mut jit_module,
             session,
             function,
-            compiled_functions,
-        )
+            batch_output.compiled_functions,
+        );
+        let commit_elapsed = commit_start.elapsed();
+        match commit_result {
+            Ok(result) => {
+                emit_jit_batch_codegen_log(
+                    function,
+                    direct_call_resolver,
+                    "ok",
+                    "",
+                    None,
+                    batch_function_count,
+                    functions_to_define_count,
+                    batch_collect_elapsed,
+                    reservation_elapsed,
+                    codegen_elapsed,
+                    commit_elapsed,
+                    total_start.elapsed(),
+                    worker_metrics,
+                );
+                Ok(result)
+            }
+            Err(err) => {
+                emit_jit_batch_codegen_log(
+                    function,
+                    direct_call_resolver,
+                    "error",
+                    "commit",
+                    Some(&err),
+                    batch_function_count,
+                    functions_to_define_count,
+                    batch_collect_elapsed,
+                    reservation_elapsed,
+                    codegen_elapsed,
+                    commit_elapsed,
+                    total_start.elapsed(),
+                    worker_metrics,
+                );
+                Err(err)
+            }
+        }
     }
 }
 
