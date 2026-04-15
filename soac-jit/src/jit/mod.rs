@@ -79,6 +79,8 @@ unsafe extern "C" {
 }
 
 mod deopt_interpreter;
+#[allow(unused_imports)]
+pub(crate) use deopt_interpreter::run_blockpy_function_from_entry;
 mod direct_abi;
 mod intrinsics;
 mod jitdump;
@@ -375,9 +377,11 @@ fn declare_module_constant_object_data(
     module: &BlockPyModule<CodegenModuleShape>,
     module_constant_ptrs: &[*mut ffi::PyObject],
 ) -> Result<Vec<DataId>, String> {
+    let instance_key = module as *const BlockPyModule<CodegenModuleShape> as usize;
+    let symbol_prefix = module_constant_symbol_prefix_for_instance(module, instance_key);
     declare_module_constant_object_data_for_prefix(
         jit_module,
-        module_constant_symbol_prefix(module).as_str(),
+        symbol_prefix.as_str(),
         module_constant_ptrs,
     )
 }
@@ -2638,7 +2642,7 @@ impl RuntimeJitDeoptInvocation<'_> {
 }
 
 impl<'a> RuntimeJitDeoptLocals<'a> {
-    fn from_live_bindings(
+    pub(crate) fn from_live_bindings(
         live_bindings: impl IntoIterator<Item = (&'a LocalEnvResumeBinding, ObjPtr)>,
     ) -> Result<Self, String> {
         let mut names = HashSet::new();

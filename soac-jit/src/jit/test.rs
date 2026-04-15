@@ -624,6 +624,43 @@ def f():
     }
 
     #[test]
+    fn local_module_constant_data_symbols_are_instance_scoped() {
+        let compile_session = crate::session::CompileSession::new();
+        let mut jit_module =
+            new_jit_module(&compile_session).expect("test jit module should construct");
+        let first = test_module(ModuleNameGen::new(0), vec![test_function()]);
+        let second = test_module(ModuleNameGen::new(0), vec![test_function()]);
+        let first_ptr = 0x1_0000usize as *mut ffi::PyObject;
+        let second_ptr = 0x2_0000usize as *mut ffi::PyObject;
+
+        declare_module_constant_object_data(&mut jit_module, &first, &[first_ptr])
+            .expect("first module constant object data should declare");
+        declare_module_constant_object_data(&mut jit_module, &second, &[second_ptr])
+            .expect("second module constant object data should declare");
+
+        let first_prefix =
+            module_constant_symbol_prefix_for_instance(&first, std::ptr::addr_of!(first) as usize);
+        let second_prefix = module_constant_symbol_prefix_for_instance(
+            &second,
+            std::ptr::addr_of!(second) as usize,
+        );
+        let first_symbol =
+            module_constant_object_symbol(first_prefix.as_str(), ModuleConstantId(0));
+        let second_symbol =
+            module_constant_object_symbol(second_prefix.as_str(), ModuleConstantId(0));
+
+        assert_ne!(first_symbol, second_symbol);
+        assert_eq!(
+            lookup_registered_jit_data_symbol(first_symbol.as_str()),
+            Some(first_ptr.cast::<u8>() as *const u8)
+        );
+        assert_eq!(
+            lookup_registered_jit_data_symbol(second_symbol.as_str()),
+            Some(second_ptr.cast::<u8>() as *const u8)
+        );
+    }
+
+    #[test]
     fn precompiled_symbol_scopes_use_source_hash_and_logical_function_id() {
         let cached_scope = precompiled_direct_function_symbol_scope_for_module_identity(
             "pkg.mod",
@@ -882,6 +919,105 @@ def get_value():
                 .any(|window| window == b".rela.data"),
             "static Unicode object data should carry a writable-data relocation for PyUnicode_Type"
         );
+    }
+
+    #[test]
+    fn blockpy_entry_interpreter_binds_positional_args() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|_| unsafe {
+            let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+                r#"
+def add(left, right):
+    return left + right
+"#,
+            )
+            .expect("lowering entry interpreter smoke source should succeed")
+            .codegen_module;
+            let function = lowered
+                .callable_defs
+                .iter()
+                .find(|function| function.names.bind_name == "add")
+                .expect("lowered module should contain add function");
+            let left = ffi::PyLong_FromLong(123_456_789);
+            assert!(!left.is_null(), "test left allocation should succeed");
+            let right = ffi::PyLong_FromLong(987_654_321);
+            assert!(!right.is_null(), "test right allocation should succeed");
+            let before_left = ffi::Py_REFCNT(left);
+            let before_right = ffi::Py_REFCNT(right);
+            let args = [left.cast::<c_void>(), right.cast::<c_void>()];
+            let result = run_blockpy_function_from_entry(
+                function,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &[],
+                &args,
+            )
+            .expect("entry interpreter should run simple positional function");
+
+            assert_eq!(
+                ffi::PyLong_AsLongLong(result.cast::<ffi::PyObject>()),
+                1_111_111_110,
+                "entry interpreter should execute the function body"
+            );
+            assert!(
+                ffi::PyErr_Occurred().is_null(),
+                "successful entry interpreter run should not leave a Python exception"
+            );
+            assert_eq!(
+                ffi::Py_REFCNT(left),
+                before_left,
+                "entry interpreter should release its owned frame reference to left"
+            );
+            assert_eq!(
+                ffi::Py_REFCNT(right),
+                before_right,
+                "entry interpreter should release its owned frame reference to right"
+            );
+            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+            ffi::Py_DECREF(right);
+            ffi::Py_DECREF(left);
+        });
+    }
+
+    #[test]
+    fn blockpy_entry_interpreter_reports_argument_binding_gaps() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|_| {
+            let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+                r#"
+def needs_arg(value):
+    return value
+"#,
+            )
+            .expect("lowering entry interpreter missing-arg source should succeed")
+            .codegen_module;
+            let function = lowered
+                .callable_defs
+                .iter()
+                .find(|function| function.names.bind_name == "needs_arg")
+                .expect("lowered module should contain needs_arg function");
+            let err = unsafe {
+                run_blockpy_function_from_entry(
+                    function,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &[],
+                    &[],
+                )
+            }
+            .expect_err("entry interpreter should report missing positional args");
+
+            assert!(
+                err.contains("missing positional args"),
+                "error should identify function-entry argument binding as the blocker: {err}"
+            );
+            assert!(
+                unsafe { ffi::PyErr_Occurred() }.is_null(),
+                "argument-binding validation should not leave a Python exception"
+            );
+        });
     }
 
     #[test]
