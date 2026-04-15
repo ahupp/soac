@@ -2670,6 +2670,47 @@ def build(values):
     }
 
     #[test]
+    fn blockpy_entry_interpreter_executes_import_statements() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        let _entry_vectorcall = ForceEntryInterpreterVectorcallGuard::new();
+        Python::attach(|py| unsafe {
+            let globals = entry_test_globals(py);
+            let result = run_named_blockpy_entry_for_test(
+                py,
+                r#"
+def build():
+    import collections as c
+    from collections import deque
+    values = deque()
+    values.append(41)
+    return c.deque is deque and values.pop() == 41
+"#,
+                "build",
+                globals.cast(),
+                &[],
+            )
+            .expect("entry interpreter should execute import statements");
+            if result.is_null() {
+                ffi::PyErr_Print();
+                panic!("import statement execution returned null");
+            }
+
+            assert_eq!(
+                result.cast::<ffi::PyObject>(),
+                ffi::Py_True(),
+                "entry interpreter should bind import aliases and from-import names"
+            );
+            assert!(
+                ffi::PyErr_Occurred().is_null(),
+                "import statement execution should not leave a Python exception"
+            );
+            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+            ffi::Py_DECREF(globals);
+        });
+    }
+
+    #[test]
     fn stored_local_binding_facts_only_require_checks_for_unbound_values() {
         assert_eq!(
             local_binding_facts_for_stored_value(LocalRefKind::Owned),
