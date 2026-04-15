@@ -17965,7 +17965,8 @@ fn build_cranelift_run_bb_specialized_function(
     let cold_block_labels = specialization_profile.cold_block_labels(function)?;
     let behavior_change_indexed_stores = specialization_profile.behavior_change_indexed_stores
         && function.scope.scope_kind != CallableScopeKind::Module;
-    let guard_miss_deopt_stub = specialization_profile.guard_miss_deopt;
+    let guard_miss_deopt_stub = specialization_profile.guard_miss_deopt
+        && function.scope.scope_kind != CallableScopeKind::Module;
     let function_runtime_data_layout = FunctionRuntimeDataLayout::from_function(function);
     let true_constant_id = module_constants.require_runtime_name_constant_id("TRUE");
     let false_constant_id = module_constants.require_runtime_name_constant_id("FALSE");

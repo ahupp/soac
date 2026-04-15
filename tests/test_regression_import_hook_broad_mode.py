@@ -738,6 +738,43 @@ assert isinstance(runtime.AsyncGenComplete(), Exception)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@BROAD_MODE_SLOW
+def test_import_hook_can_transform_soac_runtime_in_verify_mode(tmp_path):
+    script = """
+from soac import import_hook
+
+import_hook.install()
+import soac.runtime as runtime
+
+assert runtime._SOAC_RUNTIME_READY is True
+assert runtime.typing_Generic is not None
+"""
+    env = os.environ.copy()
+    env.pop("SOAC_MODULE_ENABLED", None)
+    base_env = {
+        **env,
+        "SOAC_WORK_DIR": str(tmp_path / "runtime-profile-counters"),
+        "SOAC_MODULE_CACHE_DIR": str(tmp_path / "module-cache"),
+    }
+    profile_result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        env={**base_env, "SOAC_OPT_MODE": "profile"},
+        text=True,
+    )
+    assert profile_result.returncode == 0, profile_result.stdout + profile_result.stderr
+
+    verify_result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        env={**base_env, "SOAC_OPT_MODE": "verify"},
+        text=True,
+    )
+    assert verify_result.returncode == 0, verify_result.stdout + verify_result.stderr
+
+
 def test_import_hook_can_reload_soac_temp_module(monkeypatch, tmp_path):
     monkeypatch.setenv("SOAC_MODULE_ENABLED", f"path:{tmp_path}")
     import_hook.install()

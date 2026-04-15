@@ -1157,7 +1157,7 @@ impl SemanticAstState {
             let inner = Arc::make_mut(&mut self.inner);
             let scope_id = SemanticScopeId(inner.snapshot.scopes.len());
             inner.snapshot.scopes.push(SemanticScopeData {
-                kind: SemanticScopeKind::Function,
+                kind: SemanticScopeKind::Module,
                 bindings: translated_bindings,
                 local_defs: HashSet::new(),
                 type_param_names: HashSet::new(),

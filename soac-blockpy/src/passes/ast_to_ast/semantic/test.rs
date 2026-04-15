@@ -130,6 +130,7 @@ def _dp_module_init():
     );
     let module_init_scope = semantic_state.synthesize_module_init_scope(&module_init);
 
+    assert_eq!(module_init_scope.kind(), SemanticScopeKind::Module);
     assert_eq!(
         module_init_scope.binding_in_scope("x", SemanticBindingUse::Load),
         SemanticBindingKind::Global
