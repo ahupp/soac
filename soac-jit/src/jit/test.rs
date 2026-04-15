@@ -21,7 +21,7 @@ mod tests {
     };
     use crate::jit::direct_abi::RuntimePrimitiveId;
     use cranelift_codegen::cursor::Cursor;
-    use pyo3::types::{PyAnyMethods, PyDictMethods, PyModule, PyModuleMethods, PyTuple};
+    use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyModule, PyModuleMethods, PyTuple};
     use pyo3::{Bound, Python, ffi};
     use ruff_python_ast as ast;
     use std::ffi::c_void;
@@ -1195,6 +1195,67 @@ def add_default(left, right=9):
             .expect("test tuple should cast")
     }
 
+    unsafe fn run_registered_module_init_entry_for_test<'py>(
+        py: Python<'py>,
+        source: &str,
+    ) -> Bound<'py, PyDict> {
+        let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(source)
+            .expect("lowering module init source should succeed")
+            .codegen_module;
+        let shared_state =
+            crate::module_type::build_shared_state_for_testing(py, lowered, "entry_test", "")
+                .expect("shared state should build for module init test");
+        let function_id = shared_state
+            .lowered_module
+            .callable_defs
+            .iter()
+            .find(|function| function.names.bind_name == "_dp_module_init")
+            .expect("lowered module should contain module init")
+            .function_id;
+        let globals = PyDict::new(py);
+        let builtins = py.import("builtins").expect("builtins should import");
+        globals
+            .set_item("__builtins__", &builtins)
+            .expect("module globals should accept builtins");
+        globals
+            .set_item("__name__", "entry_test")
+            .expect("module globals should accept __name__");
+
+        let captures = entry_test_tuple(py, &[]);
+        let param_defaults = entry_test_tuple(py, &[]);
+        let annotate_fn = py.None();
+        let module_init = crate::function_instantiation::make_function_in_shared_state(
+            py,
+            std::sync::Arc::new(crate::session::CompileSession::new()),
+            std::sync::Arc::clone(&shared_state),
+            function_id,
+            FunctionKind::Function,
+            captures.as_any(),
+            param_defaults.as_any(),
+            annotate_fn.bind(py),
+            globals.as_any(),
+        )
+        .expect("registered module init should instantiate");
+        let module_init = module_init.bind(py);
+        assert!(
+            !crate::PyFunction_GetSoacMetadata(module_init.as_ptr()).is_null(),
+            "module init should have SOAC metadata"
+        );
+
+        let result = module_init
+            .call0()
+            .expect("entry-interpreter vectorcall should execute module init");
+        assert!(
+            result.is_none(),
+            "module init should return None through Python call dispatch"
+        );
+        assert!(
+            ffi::PyErr_Occurred().is_null(),
+            "successful module init run should not leave a Python exception"
+        );
+        globals
+    }
+
     #[test]
     fn blockpy_entry_interpreter_uses_registered_function_env() {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
@@ -1283,7 +1344,8 @@ def add_default(left, right=9):
         crate::initialize_test_python();
         let _entry_vectorcall = ForceEntryInterpreterVectorcallGuard::new();
         Python::attach(|py| unsafe {
-            let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+            let globals = run_registered_module_init_entry_for_test(
+                py,
                 r#"
 class C:
     marker = 40
@@ -1293,56 +1355,6 @@ class C:
 
 RESULT = C().method()
 "#,
-            )
-            .expect("lowering class creation source should succeed")
-            .codegen_module;
-            let shared_state =
-                crate::module_type::build_shared_state_for_testing(py, lowered, "entry_test", "")
-                    .expect("shared state should build for class creation test");
-            let function_id = shared_state
-                .lowered_module
-                .callable_defs
-                .iter()
-                .find(|function| function.names.bind_name == "_dp_module_init")
-                .expect("lowered module should contain module init")
-                .function_id;
-            let module = PyModule::new(py, "entry_test").expect("module should allocate");
-            let globals = module.dict();
-            let builtins = py.import("builtins").expect("builtins should import");
-            globals
-                .set_item("__builtins__", &builtins)
-                .expect("module globals should accept builtins");
-            globals
-                .set_item("__name__", "entry_test")
-                .expect("module globals should accept __name__");
-
-            let captures = entry_test_tuple(py, &[]);
-            let param_defaults = entry_test_tuple(py, &[]);
-            let annotate_fn = py.None();
-            let module_init = crate::function_instantiation::make_function_in_shared_state(
-                py,
-                std::sync::Arc::new(crate::session::CompileSession::new()),
-                std::sync::Arc::clone(&shared_state),
-                function_id,
-                FunctionKind::Function,
-                captures.as_any(),
-                param_defaults.as_any(),
-                annotate_fn.bind(py),
-                globals.as_any(),
-            )
-            .expect("registered module init should instantiate");
-            let module_init = module_init.bind(py);
-            assert!(
-                !crate::PyFunction_GetSoacMetadata(module_init.as_ptr()).is_null(),
-                "module init should have SOAC metadata"
-            );
-
-            let result = module_init
-                .call0()
-                .expect("entry-interpreter vectorcall should execute module init");
-            assert!(
-                result.is_none(),
-                "module init should return None through Python call dispatch"
             );
             let stored_result = globals
                 .get_item("RESULT")
@@ -1363,9 +1375,79 @@ RESULT = C().method()
                 ffi::PyType_Check(stored_class.as_ptr()) != 0,
                 "class creation should store a Python type"
             );
-            assert!(
-                ffi::PyErr_Occurred().is_null(),
-                "successful class creation run should not leave a Python exception"
+        });
+    }
+
+    #[test]
+    fn blockpy_entry_interpreter_vectorcall_executes_class_super_closure() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        let _entry_vectorcall = ForceEntryInterpreterVectorcallGuard::new();
+        Python::attach(|py| unsafe {
+            let globals = run_registered_module_init_entry_for_test(
+                py,
+                r#"
+class Base:
+    def value(self):
+        return 40
+
+class C(Base):
+    def value(self):
+        return super().value() + 2
+
+RESULT = C().value()
+"#,
+            );
+            let stored_result = globals
+                .get_item("RESULT")
+                .expect("RESULT lookup should succeed")
+                .expect("module init should store RESULT");
+            assert_eq!(
+                stored_result
+                    .extract::<i64>()
+                    .expect("RESULT should be int"),
+                42,
+                "entry interpreter dispatch should preserve __class__ closure for super()"
+            );
+        });
+    }
+
+    #[test]
+    fn blockpy_entry_interpreter_vectorcall_executes_decorator_and_metaclass() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        let _entry_vectorcall = ForceEntryInterpreterVectorcallGuard::new();
+        Python::attach(|py| unsafe {
+            let globals = run_registered_module_init_entry_for_test(
+                py,
+                r#"
+def decorate(cls):
+    cls.decorated = cls.flag + 1
+    return cls
+
+class Meta(type):
+    def __new__(mcls, name, bases, ns, **kw):
+        cls = type.__new__(mcls, name, bases, ns)
+        cls.flag = kw["flag"]
+        return cls
+
+@decorate
+class C(metaclass=Meta, flag=41):
+    pass
+
+RESULT = C.decorated
+"#,
+            );
+            let stored_result = globals
+                .get_item("RESULT")
+                .expect("RESULT lookup should succeed")
+                .expect("module init should store RESULT");
+            assert_eq!(
+                stored_result
+                    .extract::<i64>()
+                    .expect("RESULT should be int"),
+                42,
+                "entry interpreter dispatch should handle decorators and metaclass kwargs"
             );
         });
     }
