@@ -867,9 +867,9 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
                 )
             })?;
         let target_params = target_block.params.clone();
-        if target_params.len() != edge.args.len() {
+        if edge.args.len() > target_params.len() {
             return Err(format!(
-                "deopt continuation jump to {} has {} args for {} target params",
+                "deopt continuation jump to {} has {} explicit args for {} target params",
                 edge.target,
                 edge.args.len(),
                 target_params.len()
@@ -887,7 +887,10 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
         }
 
         let mut values = Vec::with_capacity(edge.args.len());
-        for arg in &edge.args {
+        let mut explicit_param_names = Vec::with_capacity(edge.args.len());
+        // Omitted edge args mean "keep forwarding the already-materialized local";
+        // explicit args overwrite the corresponding target params by position.
+        for (param, arg) in target_params.iter().zip(edge.args.iter()) {
             let value = match arg {
                 BlockArg::Name(name) => unsafe { self.execute_block_arg_name_owned(name)? },
                 BlockArg::None => owned_none(),
@@ -900,13 +903,14 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
                 }
                 return Ok(None);
             }
+            explicit_param_names.push(param.name.clone());
             values.push(value);
         }
 
-        for (param, value) in target_params.iter().zip(values.into_iter()) {
+        for (param_name, value) in explicit_param_names.into_iter().zip(values.into_iter()) {
             let local = self
                 .locals
-                .get_by_name_mut(param.name.as_str())
+                .get_by_name_mut(param_name.as_str())
                 .expect("jump target params were prevalidated against materialized locals");
             unsafe {
                 local.replace_with_owned_value(value);

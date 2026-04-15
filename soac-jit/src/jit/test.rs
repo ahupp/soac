@@ -1134,9 +1134,20 @@ def add_default(left, right=9):
         let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(source)
             .map_err(|err| format!("lowering entry interpreter source failed: {err}"))?
             .codegen_module;
-        let shared_state =
-            crate::module_type::build_shared_state_for_testing(py, lowered, "entry_test", "")
-                .map_err(|err| format!("building entry interpreter shared state failed: {err}"))?;
+        let module_code = compile_original_module_code_for_test(py, source)
+            .map_err(|err| format!("compiling original entry interpreter source failed: {err}"))?;
+        let original_code_by_function_id =
+            match_original_code_to_functions_for_test(py, module_code.bind(py), &lowered).map_err(
+                |err| format!("mapping original code to lowered functions failed: {err}"),
+            )?;
+        let shared_state = crate::module_type::build_shared_state_for_testing_with_original_code(
+            py,
+            lowered,
+            "entry_test",
+            "",
+            original_code_by_function_id,
+        )
+        .map_err(|err| format!("building entry interpreter shared state failed: {err}"))?;
         let function = shared_state
             .lowered_module
             .callable_defs
@@ -1156,6 +1167,28 @@ def add_default(left, right=9):
             module_constant_ptrs.as_slice(),
         );
         unsafe { run_blockpy_function_from_entry(function, context, positional_args) }
+    }
+
+    unsafe fn entry_test_globals(py: Python<'_>) -> *mut ffi::PyObject {
+        let globals = unsafe { ffi::PyDict_New() };
+        assert!(!globals.is_null(), "test globals dict should allocate");
+        let builtins = py.import("builtins").expect("builtins should import");
+        assert_eq!(
+            unsafe {
+                ffi::PyDict_SetItemString(globals, c"__builtins__".as_ptr(), builtins.as_ptr())
+            },
+            0,
+            "test globals should store builtins"
+        );
+        let module_name = unsafe { ffi::PyUnicode_FromStringAndSize(c"entry_test".as_ptr(), 10) };
+        assert!(!module_name.is_null(), "test module name should allocate");
+        assert_eq!(
+            unsafe { ffi::PyDict_SetItemString(globals, c"__name__".as_ptr(), module_name) },
+            0,
+            "test globals should store __name__"
+        );
+        unsafe { ffi::Py_DECREF(module_name) };
+        globals
     }
 
     unsafe fn entry_test_kwnames(names: &[&str]) -> *mut ffi::PyObject {
@@ -2439,6 +2472,100 @@ def continue_through_finally():
                 "continue-through-finally should not leave a Python exception"
             );
             ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+        });
+    }
+
+    #[test]
+    fn blockpy_entry_interpreter_executes_with_statement_value_flow() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        let _entry_vectorcall = ForceEntryInterpreterVectorcallGuard::new();
+        Python::attach(|py| unsafe {
+            let globals = entry_test_globals(py);
+            let result = run_named_blockpy_entry_for_test(
+                py,
+                r#"
+def use_manager():
+    class Manager:
+        def __enter__(self):
+            return 40
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    with Manager() as value:
+        result = value + 2
+    return result
+"#,
+                "use_manager",
+                globals.cast(),
+                &[],
+            )
+            .expect("entry interpreter should execute normal with-statement flow");
+            if result.is_null() {
+                ffi::PyErr_Print();
+                panic!("normal with-statement execution returned null");
+            }
+
+            assert_eq!(
+                ffi::PyLong_AsLong(result.cast::<ffi::PyObject>()),
+                42,
+                "entry interpreter should bind the __enter__ value and leave through __exit__"
+            );
+            assert!(
+                ffi::PyErr_Occurred().is_null(),
+                "normal with-statement execution should not leave a Python exception"
+            );
+            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+            ffi::Py_DECREF(globals);
+        });
+    }
+
+    #[test]
+    fn blockpy_entry_interpreter_executes_with_statement_exception_suppression() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        let _entry_vectorcall = ForceEntryInterpreterVectorcallGuard::new();
+        Python::attach(|py| unsafe {
+            let globals = entry_test_globals(py);
+            let result = run_named_blockpy_entry_for_test(
+                py,
+                r#"
+def suppress_with_exception():
+    class Manager:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            self.saw_value_error = exc_type is ValueError
+            return True
+
+    manager = Manager()
+    with manager:
+        raise ValueError("boom")
+    return manager.saw_value_error
+"#,
+                "suppress_with_exception",
+                globals.cast(),
+                &[],
+            )
+            .expect("entry interpreter should execute with-statement exception suppression");
+            if result.is_null() {
+                ffi::PyErr_Print();
+                panic!("with-statement exception suppression returned null");
+            }
+
+            assert_eq!(
+                result.cast::<ffi::PyObject>(),
+                ffi::Py_True(),
+                "entry interpreter should pass the active exception to __exit__ and honor suppression"
+            );
+            assert!(
+                ffi::PyErr_Occurred().is_null(),
+                "suppressed with-statement exception should not remain active"
+            );
+            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+            ffi::Py_DECREF(globals);
         });
     }
 
