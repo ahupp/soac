@@ -1097,6 +1097,13 @@ def add_default(left, right=9):
         let shared_state =
             crate::module_type::build_shared_state_for_testing(py, lowered, "entry_test", "")
                 .map_err(|err| format!("building entry interpreter shared state failed: {err}"))?;
+        crate::session::CompileSession::process()
+            .retain_shared_module_state(std::sync::Arc::clone(&shared_state))
+            .map_err(|err| {
+                format!(
+                    "retaining entry interpreter shared state for nested functions failed: {err}"
+                )
+            })?;
         let function = shared_state
             .lowered_module
             .callable_defs
@@ -1260,6 +1267,45 @@ def call_helper(value):
                 ffi::PyLong_AsLong(result.cast::<ffi::PyObject>()),
                 40,
                 "entry interpreter should call the global helper with a keyword"
+            );
+            assert!(
+                ffi::PyErr_Occurred().is_null(),
+                "successful entry interpreter run should not leave a Python exception"
+            );
+            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+            ffi::Py_DECREF(input);
+            ffi::Py_DECREF(globals);
+        });
+    }
+
+    #[test]
+    fn blockpy_entry_interpreter_executes_nested_function_with_closure() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| unsafe {
+            let globals = ffi::PyDict_New();
+            assert!(!globals.is_null(), "test globals allocation should succeed");
+            let input = ffi::PyLong_FromLong(37);
+            assert!(!input.is_null(), "test input allocation should succeed");
+            let args = [input.cast::<c_void>()];
+            let result = run_named_blockpy_entry_for_test(
+                py,
+                r#"
+def outer(x):
+    def inner(y):
+        return x + y
+    return inner(5)
+"#,
+                "outer",
+                globals.cast(),
+                &args,
+            )
+            .expect("entry interpreter should instantiate and call a nested closure");
+
+            assert_eq!(
+                ffi::PyLong_AsLong(result.cast::<ffi::PyObject>()),
+                42,
+                "entry interpreter should preserve closure capture through nested function call"
             );
             assert!(
                 ffi::PyErr_Occurred().is_null(),

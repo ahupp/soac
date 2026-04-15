@@ -49,6 +49,43 @@ fn tuple_from_owned_objects<'py>(
     Ok(tuple)
 }
 
+fn tuple_from_strings<'py>(py: Python<'py>, values: &[String]) -> PyResult<Bound<'py, PyTuple>> {
+    // Keep this on the CPython tuple API because this code runs against vendored
+    // CPython builds where PyO3 tuple iteration/construction can lag layout changes.
+    let tuple = unsafe { ffi::PyTuple_New(values.len() as ffi::Py_ssize_t) };
+    if tuple.is_null() {
+        return Err(PyErr::fetch(py));
+    }
+    for (index, value) in values.iter().enumerate() {
+        let value_len = ffi::Py_ssize_t::try_from(value.len())
+            .map_err(|_| PyValueError::new_err("tuple string value is too large"))?;
+        let string = unsafe { ffi::PyUnicode_FromStringAndSize(value.as_ptr().cast(), value_len) };
+        if string.is_null() {
+            unsafe { ffi::Py_DECREF(tuple) };
+            return Err(PyErr::fetch(py));
+        }
+        if unsafe { ffi::PyTuple_SetItem(tuple, index as ffi::Py_ssize_t, string) } != 0 {
+            unsafe { ffi::Py_DECREF(tuple) };
+            return Err(PyErr::fetch(py));
+        }
+    }
+    Ok(unsafe { Bound::from_owned_ptr_or_err(py, tuple)? }.cast_into::<PyTuple>()?)
+}
+
+fn tuple_strings(py: Python<'_>, tuple: &Bound<'_, PyTuple>) -> PyResult<Vec<String>> {
+    // See tuple_from_strings: use the CPython tuple API at this ABI boundary.
+    let mut values = Vec::with_capacity(tuple.len());
+    for index in 0..tuple.len() {
+        let item = unsafe { ffi::PyTuple_GetItem(tuple.as_ptr(), index as ffi::Py_ssize_t) };
+        if item.is_null() {
+            return Err(PyErr::fetch(py));
+        }
+        let item = unsafe { Bound::from_borrowed_ptr(py, item) };
+        values.push(item.extract::<String>()?);
+    }
+    Ok(values)
+}
+
 fn register_clif_vectorcall_raw(
     py: Python<'_>,
     func: &Bound<'_, PyAny>,
@@ -212,7 +249,12 @@ fn build_capture_map<'py>(
     })?;
     let closure_values = PyDict::new(py);
     let mut captured_names = Vec::with_capacity(captures.len());
-    for item in captures.iter() {
+    for index in 0..captures.len() {
+        let item = unsafe { ffi::PyTuple_GetItem(captures.as_ptr(), index as ffi::Py_ssize_t) };
+        if item.is_null() {
+            return Err(PyErr::fetch(py));
+        }
+        let item = unsafe { Bound::from_borrowed_ptr(py, item) };
         let item = item
             .cast::<PyTuple>()
             .map_err(|_| PyTypeError::new_err(format!("invalid bb capture payload: {item:?}")))?;
@@ -355,12 +397,8 @@ fn build_closure_shaped_entry<'py>(
     let generated_code;
     let original_code_matches_captures = match original_code {
         Some(code) => {
-            let freevars = code
-                .getattr("co_freevars")?
-                .cast_into::<PyTuple>()?
-                .iter()
-                .map(|name| name.extract::<String>())
-                .collect::<PyResult<Vec<_>>>()?;
+            let freevars_obj = code.getattr("co_freevars")?;
+            let freevars = tuple_strings(py, freevars_obj.cast::<PyTuple>()?)?;
             freevars == captured_names
         }
         None => false,
@@ -377,7 +415,7 @@ fn build_closure_shaped_entry<'py>(
             FunctionKind::AsyncGenerator => (true, true),
         };
         generated_code = dp.getattr("code_with_freevars")?.call1((
-            PyTuple::new(py, captured_names)?,
+            tuple_from_strings(py, captured_names)?,
             is_async,
             is_generator,
         ))?;
@@ -386,8 +424,7 @@ fn build_closure_shaped_entry<'py>(
     let freevars_obj = code.getattr("co_freevars")?;
     let freevars = freevars_obj.cast::<PyTuple>()?;
     let mut closure_cells = Vec::with_capacity(freevars.len());
-    for name_obj in freevars.iter() {
-        let name = name_obj.extract::<String>()?;
+    for name in tuple_strings(py, freevars)?.into_iter() {
         let value = captured_values.get_item(name.as_str())?.ok_or_else(|| {
             PyRuntimeError::new_err(format!(
                 "missing captured value for closure freevar {name:?}"
