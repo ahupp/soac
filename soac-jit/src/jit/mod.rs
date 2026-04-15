@@ -11,7 +11,7 @@ use crate::counter_dump::{
     CollectedTypeKeyLayout, CounterDumpFile, CounterDumpTypeKey, collect_type_key_layouts,
     collect_type_table, read_block_entry_counts_from_file, read_branch_preferences_from_file,
     read_call_target_specializations_from_file, read_getitem_specializations_from_file,
-    read_operator_specializations_from_file,
+    read_operator_specializations_from_file, read_setitem_specializations_from_file,
 };
 use crate::module_constants::{ModuleCodegenConstants, ModuleConstantId};
 use crate::module_type::{CounterRuntimeSlot, SharedModuleState, build_counter_storage_layout};
@@ -2987,6 +2987,7 @@ fn emit_codegen_indexed_global_load(
     let result_block = fb.create_block();
     fb.append_block_param(result_block, ptr_ty);
     let fallback_block = fb.create_block();
+    fb.set_cold_block(fallback_block);
     let guard_miss_dispatch = prepare_optional_guard_miss_dispatch(
         ctx.guard_miss_target_for_resume_point(guard_miss_resume_point, &[], fallback_block),
         fallback_block,
@@ -3896,6 +3897,10 @@ struct JitEmitCtx<'mc> {
     getitem_specializations: &'mc HashMap<InstrId, Vec<u64>>,
     getitem_specialized_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
     getitem_specialized_fallback_counter_ids: &'mc HashMap<InstrId, CounterId>,
+    setitem_shape_counter_ids: &'mc HashMap<InstrId, CounterId>,
+    setitem_specializations: &'mc HashMap<InstrId, Vec<u64>>,
+    setitem_specialized_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
+    setitem_specialized_fallback_counter_ids: &'mc HashMap<InstrId, CounterId>,
     branch_outcome_counter_ids: &'mc HashMap<InstrId, CounterId>,
     branch_prefer_true: &'mc HashMap<InstrId, bool>,
     global_indexed_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
@@ -8283,6 +8288,19 @@ impl<'a> SpecializationProfile<'a> {
         read_getitem_specializations_from_file(path, module_name, function_id)
     }
 
+    fn setitem_specializations(
+        &self,
+        function_id: FunctionId,
+    ) -> Result<HashMap<InstrId, Vec<u64>>, String> {
+        let Some(module_name) = self.module_name else {
+            return Ok(HashMap::new());
+        };
+        let Some(path) = existing_counter_dump_path(self.counter_dump_path.as_deref()) else {
+            return Ok(HashMap::new());
+        };
+        read_setitem_specializations_from_file(path, module_name, function_id)
+    }
+
     fn branch_preferences(
         &self,
         function_id: FunctionId,
@@ -11012,6 +11030,7 @@ fn emit_codegen_simple_call_with_local_env(
             let result_block = fb.create_block();
             fb.append_block_param(result_block, ptr_ty);
             let generic_block = fb.create_block();
+            fb.set_cold_block(generic_block);
             let method_guard_miss_resume_point = emit_ctx.guard_miss_resume_point.or_else(|| {
                 site_instr_id.map(|site_instr_id| LocalEnvResumePoint::BeforeInstr {
                     key: InstrKey::new(emit_ctx.function_id, site_instr_id),
@@ -11224,6 +11243,7 @@ fn emit_codegen_simple_call_with_local_env(
             let result_block = fb.create_block();
             fb.append_block_param(result_block, ptr_ty);
             let generic_block = fb.create_block();
+            fb.set_cold_block(generic_block);
             let direct_guard_miss_dispatch = if !constructor_specializations.is_empty() {
                 JitGuardMissDispatch::FallbackBlock(generic_block)
             } else if let Some(site_instr_id) = site_instr_id {
@@ -17270,6 +17290,21 @@ fn build_cranelift_run_bb_specialized_function(
         function.function_id,
         "getitem_specialized_fallback",
     );
+    let setitem_shape_counter_ids = collect_runtime_counter_ids_by_kind(
+        counter_defs,
+        function.function_id,
+        "setitem_hot_shapes",
+    );
+    let setitem_specialized_hit_counter_ids = collect_runtime_counter_ids_by_kind(
+        counter_defs,
+        function.function_id,
+        "setitem_specialized_hit",
+    );
+    let setitem_specialized_fallback_counter_ids = collect_runtime_counter_ids_by_kind(
+        counter_defs,
+        function.function_id,
+        "setitem_specialized_fallback",
+    );
     let global_indexed_hit_counter_ids = collect_runtime_counter_ids_by_kind(
         counter_defs,
         function.function_id,
@@ -17302,6 +17337,7 @@ fn build_cranelift_run_bb_specialized_function(
         .values()
         .chain(operator_shape_counter_ids.values())
         .chain(getitem_shape_counter_ids.values())
+        .chain(setitem_shape_counter_ids.values())
         .chain(branch_outcome_counter_ids.values())
     {
         top_value_counter_slot_for_id(counter_slots_by_id, *counter_id).map_err(|_| {
@@ -17314,6 +17350,7 @@ fn build_cranelift_run_bb_specialized_function(
     let requires_top_value_counters = !call_target_counter_ids.is_empty()
         || !operator_shape_counter_ids.is_empty()
         || !getitem_shape_counter_ids.is_empty()
+        || !setitem_shape_counter_ids.is_empty()
         || !branch_outcome_counter_ids.is_empty();
     if requires_top_value_counters && top_value_counter_data_id.is_none() {
         return Err(format!(
@@ -17327,6 +17364,8 @@ fn build_cranelift_run_bb_specialized_function(
         specialization_profile.operator_specializations(function.function_id)?;
     let getitem_specializations =
         specialization_profile.getitem_specializations(function.function_id)?;
+    let setitem_specializations =
+        specialization_profile.setitem_specializations(function.function_id)?;
     let field_index_specializations = specialization_profile.field_index_specializations()?;
     let branch_prefer_true = specialization_profile.branch_preferences(function.function_id)?;
     let cold_block_labels = specialization_profile.cold_block_labels(function)?;
@@ -17950,6 +17989,10 @@ fn build_cranelift_run_bb_specialized_function(
                 getitem_specializations: &getitem_specializations,
                 getitem_specialized_hit_counter_ids: &getitem_specialized_hit_counter_ids,
                 getitem_specialized_fallback_counter_ids: &getitem_specialized_fallback_counter_ids,
+                setitem_shape_counter_ids: &setitem_shape_counter_ids,
+                setitem_specializations: &setitem_specializations,
+                setitem_specialized_hit_counter_ids: &setitem_specialized_hit_counter_ids,
+                setitem_specialized_fallback_counter_ids: &setitem_specialized_fallback_counter_ids,
                 global_indexed_hit_counter_ids: &global_indexed_hit_counter_ids,
                 global_indexed_fallback_counter_ids: &global_indexed_fallback_counter_ids,
                 field_indexed_hit_counter_ids: &field_indexed_hit_counter_ids,

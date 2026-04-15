@@ -767,3 +767,21 @@ benchmarked throughput delta, and the headline pre/post numbers.
   - specialized pass, 1M loops x3: `443282`, `441606`, `448104 loops/s`
   - pystone JIT code bytes: `274113`
   - pystone machine blocks: `17125`
+
+## 2026-04-15 - Specialize exact-list setitem
+
+- jj change id: `lwnzpkpv`
+- summary: `SetItem` now records profiled receiver/index shapes and replays an
+  exact-`list`/compact-exact-`int` arm that directly bounds-checks and stores
+  through `PyListObject.ob_item[index]`; specialization guard-miss fallback
+  blocks are marked cold.
+- throughput: `+0.41%` specialized pystone median; code size `+1.40%`;
+  machine blocks `+1.35%`
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `443282`, `441606`, `448104 loops/s`
+  - pystone JIT code bytes: `274113`
+  - pystone machine blocks: `17125`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `445109`, `450530`, `440886 loops/s`
+  - pystone JIT code bytes: `277954`
+  - pystone machine blocks: `17356`

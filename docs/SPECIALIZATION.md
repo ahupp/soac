@@ -466,9 +466,9 @@ apply/verify mode:
 
 SOAC keeps operation-level specializations in
 `soac-jit/src/jit/operation_specializations.rs` instead of spreading guarded
-fast paths through generic opcode lowering. The first implementation is concrete
-rather than framework-driven: `GetItem` emits an exact-list/exact-int arm and
-shares one generic fallback path.
+fast paths through generic opcode lowering. The first implementations are
+concrete rather than framework-driven: `GetItem` and `SetItem` emit
+exact-list/exact-int arms and share generic fallback paths.
 
 ### Exact-List `GetItem`
 
@@ -520,8 +520,54 @@ shares one generic fallback path.
   - add richer operation dispatch tags for tuple, string, dict, and custom slots
   - emit borrowed `EmitResult` for typed consumers instead of forcing an owned
     legacy result
-  - add direct PyLong compact-int unboxing
-  - add matching list `SetItem` and tuple/string getitem arms
+  - add matching tuple/string getitem arms
+
+### Exact-List `SetItem`
+
+### Counted Input
+
+- Source input is `setitem_hot_shapes`.
+- The shape tag records exact `list` receiver with an exact `int` index. The
+  replacement value does not participate in the shape because list slots accept
+  any Python object.
+- Verify mode also records `setitem_specialized_hit` and
+  `setitem_specialized_fallback` scalar counters for selected arms.
+
+### Codegen
+
+- `SetItem` lowering routes through the operation-specialization module.
+- Without counters or replayed hot shapes, `SetItem` stays on the generic
+  `PyObject_SetItem` helper path.
+- With `setitem_hot_shapes` counters, profile/verify mode records the dispatch
+  shape after evaluating operands, then uses the generic path unless a replayed
+  hot shape selected the specialized arm.
+- The specialized arm guards:
+  - the object is exactly `PyList_Type`
+  - the index object is exactly `PyLong_Type`
+  - the index is compact and normalizes in bounds
+  - the replacement value is non-null
+- On hit, codegen INCREFs the replacement, stores it directly to
+  `PyListObject.ob_item[index]`, DECREFs the old slot value, and returns owned
+  `None`.
+- On miss, codegen falls back to `PyObject_SetItem` through the generic helper
+  path and records `setitem_specialized_fallback` in verify mode.
+
+### Limitations / Soundness / Extensions
+
+- Current limitations:
+  - only the exact-list/exact-int dispatch shape is recorded
+  - guard misses use the generic fallback path for now, matching `GetItem`
+  - only compact exact integers are unboxed directly; non-compact exact integers
+    fall back to the generic C API path
+- Soundness boundary:
+  - receiver and index exact types are guarded before direct layout writes
+  - non-list objects, list subclasses, non-exact-int indices, out-of-bounds
+    indices, and null replacements fall back before direct list memory access
+- Natural extensions:
+  - add a separate list-compatible subclass arm guarded by assignment slot
+    identity
+  - preserve effect-only result demand so successful stores do not materialize
+    owned `None` when the value is unused
 
 ## Exact-Int Binary Operators
 

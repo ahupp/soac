@@ -124,18 +124,6 @@ pub(super) trait OperationEmitState<'fb, E> {
             &module_constant_accesses,
         )
     }
-
-    fn emit_owned_func_call(&mut self, func_ref: ir::FuncRef, args: &[&E]) -> ir::Value {
-        let arg_values = self.emit_arg_values(args);
-        let values = arg_values
-            .iter()
-            .map(|(value, _)| *value)
-            .collect::<Vec<_>>();
-        let call_inst = self.fb().ins().call(func_ref, &values);
-        self.release_arg_values(&arg_values);
-        let result = self.fb().inst_results(call_inst)[0];
-        self.finish_owned_result(result)
-    }
 }
 
 macro_rules! define_owned_import_spec {
@@ -532,6 +520,7 @@ fn emit_specialized_getattr<'fb>(
     let result_block = state.fb().create_block();
     state.fb().append_block_param(result_block, ptr_ty);
     let fallback_block = state.fb().create_block();
+    state.fb().set_cold_block(fallback_block);
     let pre_guard_operands = [op.value.as_ref(), op.attr.as_ref()];
     let guard_miss_dispatch =
         state.prepare_guard_miss_dispatch_for_instr(instr_id, &pre_guard_operands, fallback_block);
@@ -690,6 +679,7 @@ fn emit_specialized_setattr<'fb>(
     let result_block = state.fb().create_block();
     state.fb().append_block_param(result_block, ptr_ty);
     let fallback_block = state.fb().create_block();
+    state.fb().set_cold_block(fallback_block);
     let pre_guard_operands = [op.value.as_ref(), op.attr.as_ref(), op.replacement.as_ref()];
     let guard_miss_dispatch =
         state.prepare_guard_miss_dispatch_for_instr(instr_id, &pre_guard_operands, fallback_block);
@@ -810,10 +800,6 @@ fn emit_make_cell<'fb>(
     state.release_arg_values(&arg_values);
     let result = state.fb().inst_results(call_inst)[0];
     state.finish_owned_result(result)
-}
-
-fn emit_setitem<'fb, E>(state: &mut impl OperationEmitState<'fb, E>, args: &[&E]) -> ir::Value {
-    state.emit_owned_func_call(state.ctx().pyobject_setitem_ref, &args)
 }
 
 fn emit_exact_type_tag_for_value<'fb, E>(
@@ -1220,6 +1206,7 @@ fn emit_specialized_binop<'fb>(
     let result_block = state.fb().create_block();
     state.fb().append_block_param(result_block, ptr_ty);
     let generic_block = state.fb().create_block();
+    state.fb().set_cold_block(generic_block);
     let pre_guard_operands = [op.left.as_ref(), op.right.as_ref()];
     let guard_miss_dispatch =
         state.prepare_guard_miss_dispatch_for_instr(instr_id, &pre_guard_operands, generic_block);
@@ -1357,6 +1344,7 @@ fn emit_specialized_unary_op<'fb>(
     let result_block = state.fb().create_block();
     state.fb().append_block_param(result_block, ptr_ty);
     let generic_block = state.fb().create_block();
+    state.fb().set_cold_block(generic_block);
     let pre_guard_operands = [op.operand.as_ref()];
     let guard_miss_dispatch =
         state.prepare_guard_miss_dispatch_for_instr(instr_id, &pre_guard_operands, generic_block);
@@ -1463,6 +1451,7 @@ fn emit_indexed_global_load_with_state<'fb>(
     let result_block = state.fb().create_block();
     state.fb().append_block_param(result_block, ptr_ty);
     let fallback_block = state.fb().create_block();
+    state.fb().set_cold_block(fallback_block);
     let direct_block = state.fb().create_block();
     state.fb().append_block_param(direct_block, ptr_ty);
 
@@ -1638,6 +1627,7 @@ fn emit_store<'fb>(
         let result_block = state.fb().create_block();
         state.fb().append_block_param(result_block, ptr_ty);
         let fallback_block = state.fb().create_block();
+        state.fb().set_cold_block(fallback_block);
         let pre_guard_operands = [op.value.as_ref()];
         let guard_miss_dispatch = state.prepare_guard_miss_dispatch_for_instr(
             instr_id,
@@ -1835,14 +1825,7 @@ pub(super) fn emit_operation<'fb>(
             }
         }
         InstrCodegen::GetItem(op) => Some(operation_specializations::emit_getitem(op, state)),
-        InstrCodegen::SetItem(op) => Some(emit_setitem(
-            state,
-            &[
-                op.value.as_ref(),
-                op.index.as_ref(),
-                op.replacement.as_ref(),
-            ],
-        )),
+        InstrCodegen::SetItem(op) => Some(operation_specializations::emit_setitem(op, state)),
         InstrCodegen::DelItem(op) => Some(emit_positional_owned_call(
             &DP_JIT_PYOBJECT_DELITEM_IMPORT,
             state,

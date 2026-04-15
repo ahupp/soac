@@ -581,7 +581,11 @@ fn counter_storage_key(counter: &CounterDef) -> Result<CounterStorageKey, String
 fn counter_uses_call_target_storage(counter: &CounterDef) -> bool {
     matches!(
         counter.kind.as_str(),
-        "branch_outcomes" | "call_hot_targets" | "operator_hot_shapes" | "getitem_hot_shapes"
+        "branch_outcomes"
+            | "call_hot_targets"
+            | "operator_hot_shapes"
+            | "getitem_hot_shapes"
+            | "setitem_hot_shapes"
     )
 }
 

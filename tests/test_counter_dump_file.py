@@ -444,6 +444,82 @@ def run_case():
     assert fallback_count >= 1, verify
 
 
+def test_setitem_profile_replay_records_hit_and_fallback_counters(tmp_path):
+    module_path = tmp_path / "setitem_specialization_case.py"
+    module_path.write_text(
+        """
+class OverrideList(list):
+    def __setitem__(self, index, value):
+        super().__setitem__(index, 100 + value)
+
+
+def set_item(obj, index, value):
+    obj[index] = value
+    return obj
+
+
+def run_case():
+    first = [10, 20, 30]
+    second = [40, 50, 60]
+    override = OverrideList([1, 2, 3])
+    set_item(first, 1, 99)
+    set_item(second, -1, 77)
+    set_item(override, 2, 5)
+    return first[1] + second[2] + override[2]
+""",
+        encoding="utf-8",
+    )
+    work_dir = tmp_path / "soac-work"
+    script = _import_and_run_script(
+        tmp_path,
+        "import setitem_specialization_case",
+        "assert setitem_specialization_case.run_case() == 281",
+    )
+    base_env = _soac_subprocess_env(tmp_path, work_dir=work_dir)
+
+    profile_result = _run_soac_subprocess(
+        script,
+        env={**base_env, "SOAC_OPT_MODE": "profile"},
+    )
+    _assert_subprocess_ok(profile_result)
+    profile_dump_path = work_dir / "profile.bin"
+    profile = _inspect_counter_dump_json(profile_dump_path)
+    profiled_shapes = [
+        row
+        for record in profile["records"]
+        if record["module_name"] == "setitem_specialization_case"
+        for row in record["rows"]
+        if row["kind"] == "setitem_hot_shapes"
+        and row["observed_value"] == 1
+        and row["value"] > 0
+    ]
+    assert profiled_shapes, profile
+
+    verify_result = _run_soac_subprocess(
+        script,
+        env={**base_env, "SOAC_OPT_MODE": "verify"},
+    )
+    _assert_subprocess_ok(verify_result)
+    verify_dump_path = work_dir / "verify.bin"
+    verify = _inspect_counter_dump_json(verify_dump_path)
+    hit_count = sum(
+        row["value"]
+        for record in verify["records"]
+        if record["module_name"] == "setitem_specialization_case"
+        for row in record["rows"]
+        if row["kind"] == "setitem_specialized_hit"
+    )
+    fallback_count = sum(
+        row["value"]
+        for record in verify["records"]
+        if record["module_name"] == "setitem_specialization_case"
+        for row in record["rows"]
+        if row["kind"] == "setitem_specialized_fallback"
+    )
+    assert hit_count >= 2, verify
+    assert fallback_count >= 1, verify
+
+
 def test_cross_module_field_profile_uses_type_id_table(tmp_path):
     owner_path = tmp_path / "field_owner_case.py"
     owner_path.write_text(

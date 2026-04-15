@@ -265,6 +265,44 @@ pub fn instrument_bb_module_with_call_target_counters(
         matches!(expr, InstrCodegen::GetItem(_))
     }
 
+    fn is_setitem_specialization_candidate(expr: &InstrCodegen) -> bool {
+        matches!(expr, InstrCodegen::SetItem(_))
+    }
+
+    fn define_operation_shape_counters(
+        counters: &mut CounterBuilder<'_>,
+        function_id: crate::block_py::FunctionId,
+        instr_id: crate::block_py::InstrId,
+        shape_kind: &'static str,
+        hit_kind: &'static str,
+        fallback_kind: &'static str,
+    ) {
+        counters.define_if_missing(
+            CounterScope::This,
+            shape_kind,
+            CounterSite::Runtime {
+                function_id: Some(function_id),
+                instr_id: Some(instr_id),
+            },
+        );
+        counters.define_if_missing(
+            CounterScope::This,
+            hit_kind,
+            CounterSite::Runtime {
+                function_id: Some(function_id),
+                instr_id: Some(instr_id),
+            },
+        );
+        counters.define_if_missing(
+            CounterScope::This,
+            fallback_kind,
+            CounterSite::Runtime {
+                function_id: Some(function_id),
+                instr_id: Some(instr_id),
+            },
+        );
+    }
+
     fn define_indexed_hit_fallback_counters(
         counters: &mut CounterBuilder<'_>,
         function_id: crate::block_py::FunctionId,
@@ -346,29 +384,24 @@ pub fn instrument_bb_module_with_call_target_counters(
             }
             if is_getitem_specialization_candidate(expr) {
                 let instr_id = expr.semantic_instr_id();
-                self.counters.define_if_missing(
-                    CounterScope::This,
+                define_operation_shape_counters(
+                    self.counters,
+                    self.function_id,
+                    instr_id,
                     "getitem_hot_shapes",
-                    CounterSite::Runtime {
-                        function_id: Some(self.function_id),
-                        instr_id: Some(instr_id),
-                    },
-                );
-                self.counters.define_if_missing(
-                    CounterScope::This,
                     "getitem_specialized_hit",
-                    CounterSite::Runtime {
-                        function_id: Some(self.function_id),
-                        instr_id: Some(instr_id),
-                    },
-                );
-                self.counters.define_if_missing(
-                    CounterScope::This,
                     "getitem_specialized_fallback",
-                    CounterSite::Runtime {
-                        function_id: Some(self.function_id),
-                        instr_id: Some(instr_id),
-                    },
+                );
+            }
+            if is_setitem_specialization_candidate(expr) {
+                let instr_id = expr.semantic_instr_id();
+                define_operation_shape_counters(
+                    self.counters,
+                    self.function_id,
+                    instr_id,
+                    "setitem_hot_shapes",
+                    "setitem_specialized_hit",
+                    "setitem_specialized_fallback",
                 );
             }
             if let InstrCodegen::Call(call) = expr {
