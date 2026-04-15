@@ -647,7 +647,7 @@ fn build_soac_runtime_bootstrap_runtime_name(py: Python<'_>, bytes: &[u8]) -> Py
     }
     match name {
         "TRUE" | "FALSE" | "NONE" | "ELLIPSIS" | "EMPTY_TUPLE" | "ITER_COMPLETE" => {
-            Ok(PyModule::import(py, "soac.constants")?
+            Ok(PyModule::import(py, "soac.bootstrap")?
                 .getattr(name)?
                 .unbind())
         }
@@ -667,23 +667,11 @@ from soac import _soac_ext
 import sys as _sys
 import types as _types
 
-def _entry_template(*args, **kwargs):
-    raise RuntimeError('SOAC runtime bootstrap entry template executed')
-
 def raise_deleted_name(name):
     raise UnboundLocalError(
         f'cannot access local variable {name!r} where it is not associated with a value'
     )
 
-_DP_CODE_WITH_FREEVARS_CACHE = {}
-_CLIF_ENTRY_RUNTIME_ERROR = 'CLIF entry executed without vectorcall interception'
-_PYTHON_KEYWORDS = frozenset((
-    'False', 'None', 'True', 'and', 'as', 'assert', 'async', 'await',
-    'break', 'class', 'continue', 'def', 'del', 'elif', 'else',
-    'except', 'finally', 'for', 'from', 'global', 'if', 'import',
-    'in', 'is', 'lambda', 'nonlocal', 'not', 'or', 'pass', 'raise',
-    'return', 'try', 'while', 'with', 'yield',
-))
 _MISSING = object()
 
 def _unsupported_frame_builtin(*args, **kwargs):
@@ -694,50 +682,6 @@ locals = _unsupported_frame_builtin
 eval = _unsupported_frame_builtin
 # `exec` is a keyword, so expose soac.runtime.exec through the module dict.
 vars(_sys.modules[__name__])['exec'] = _unsupported_frame_builtin
-
-def code_with_freevars(names, is_async, is_generator):
-    names = tuple(names)
-    is_async = bool(is_async)
-    is_generator = bool(is_generator)
-    cache_key = (names, is_async, is_generator)
-    cached = _DP_CODE_WITH_FREEVARS_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-    for name in names:
-        if not isinstance(name, str):
-            raise TypeError(f'freevar names must be str, got {type(name)!r}')
-        if not name.isidentifier() or name in _PYTHON_KEYWORDS:
-            raise ValueError(f'invalid freevar name: {name!r}')
-    if len(set(names)) != len(names):
-        raise ValueError('freevar names must be unique')
-
-    outer_lines = ['def __dp_make_code():']
-    for name in names:
-        outer_lines.append(f'    {name} = None')
-    if is_async:
-        outer_lines.append('    async def wrapped(*args, **kwargs):')
-    else:
-        outer_lines.append('    def wrapped(*args, **kwargs):')
-    if names:
-        outer_lines.append('        if False:')
-        for name in names:
-            outer_lines.append(f'            {name}')
-    if is_async and is_generator:
-        outer_lines.append('        if False:')
-        outer_lines.append('            yield None')
-    elif is_generator:
-        outer_lines.append('        if False:')
-        outer_lines.append('            yield None')
-    outer_lines.append(f'        raise RuntimeError({_CLIF_ENTRY_RUNTIME_ERROR!r})')
-    outer_lines.append('    return wrapped.__code__')
-
-    ns = {}
-    _builtins.exec('\\n'.join(outer_lines), {}, ns)
-    code = ns['__dp_make_code']()
-    if code.co_freevars != names:
-        code = code.replace(co_freevars=names)
-    _DP_CODE_WITH_FREEVARS_CACHE[cache_key] = code
-    return code
 
 def create_class(
     name,

@@ -70,7 +70,7 @@ def _should_transform(path: str) -> bool:
 
 
 def _should_transform_module(fullname: str, path: str) -> bool:
-    if fullname == "soac.constants":
+    if fullname == "soac.bootstrap":
         return False
     return _should_transform(path)
 

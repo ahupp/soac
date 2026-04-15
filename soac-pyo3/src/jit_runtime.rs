@@ -39,10 +39,14 @@ fn install_soac_runtime_bootstrap_globals(
     globals: &Bound<'_, PyDict>,
 ) -> PyResult<SoacRuntimeBootstrapGlobals> {
     let bootstrap = soac_jit::module_constants::build_soac_runtime_bootstrap_module(py)?;
+    let normal_bootstrap = PyModule::import(py, "soac.bootstrap")?;
     let mut helpers = Vec::new();
+    for name in ["_entry_template", "code_with_freevars"] {
+        let helper = normal_bootstrap.getattr(name)?;
+        globals.set_item(name, &helper)?;
+        helpers.push((name, helper.unbind()));
+    }
     for name in [
-        "_entry_template",
-        "code_with_freevars",
         "locals",
         "eval",
         "exec",

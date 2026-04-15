@@ -178,6 +178,19 @@ current_exception
   to the block's explicit exception parameter before codegen. It is not
   `soac.runtime.current_exception` and should not be exposed as a Python helper.
 
+## soac.bootstrap
+
+`soac.bootstrap` is evaluated through normal Python, not the SOAC import
+transform. It provides constants and function-instantiation helpers needed while
+`soac.runtime` itself is still initializing.
+
+Top-level functions defined by `soac.bootstrap`:
+
+```text
+code_with_freevars
+_entry_template
+```
+
 ## soac.runtime
 
 Top-level functions defined by `soac.runtime`:
@@ -212,8 +225,6 @@ call_super_noargs
 _match_class_validate_arity
 match_class_attr_exists
 match_class_attr_value
-code_with_freevars
-_entry_template
 code_template_gen
 code_template_async_gen
 annotation_forwardref_value
@@ -315,6 +326,8 @@ str
 format
 pow
 aiter
+code_with_freevars
+_entry_template
 AssertionError
 AttributeError
 ImportError
