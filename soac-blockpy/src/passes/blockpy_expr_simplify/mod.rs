@@ -5,7 +5,6 @@ use crate::block_py::{
     CallArgKeyword, CallArgPositional, HasMeta, InstrWithAwaitAndYield, InstrWithConstantNone,
     Meta, NumberLiteral, NumberLiteralValue, StringLiteral, WithMeta, Yield, YieldFrom,
 };
-use crate::passes::ast_to_ast::expr_utils::make_tuple;
 use crate::passes::InstrRuff;
 use crate::py_expr;
 use ruff_python_ast::{self as ast, Expr};
@@ -20,6 +19,21 @@ fn number_literal_expr_with_meta(
     range: ruff_text_size::TextRange,
 ) -> InstrWithAwaitAndYield {
     literal_expr(NumberLiteral { value }, Meta::new(node_index, range))
+}
+
+fn tuple_from_ast_exprs_with_meta(
+    values: Vec<Expr>,
+    node_index: ast::AtomicNodeIndex,
+    range: ruff_text_size::TextRange,
+) -> InstrWithAwaitAndYield {
+    operation::Tuple::new(
+        values
+            .into_iter()
+            .map(InstrWithAwaitAndYield::from_ast_expr)
+            .collect::<Vec<_>>(),
+    )
+    .with_meta(Meta::new(node_index, range))
+    .into()
 }
 
 fn complex_literal_expr_with_meta(
@@ -61,11 +75,17 @@ fn reduce_core_blockpy_dict(items: Box<[ast::DictItem]>) -> InstrWithAwaitAndYie
             }
             ast::DictItem { key: None, value } => {
                 if !keyed_pairs.is_empty() {
-                    let tuple = make_tuple(std::mem::take(&mut keyed_pairs));
-                    segments.push(InstrWithAwaitAndYield::from_ast_expr(py_expr!(
-                        "__soac__.dict({tuple:expr})",
-                        tuple = tuple
-                    )));
+                    let tuple = tuple_from_ast_exprs_with_meta(
+                        std::mem::take(&mut keyed_pairs),
+                        ast::AtomicNodeIndex::default(),
+                        Default::default(),
+                    );
+                    segments.push(core_runtime_positional_call_expr_with_meta(
+                        "dict",
+                        ast::AtomicNodeIndex::default(),
+                        Default::default(),
+                        vec![tuple],
+                    ));
                 }
                 segments.push(InstrWithAwaitAndYield::from_ast_expr(py_expr!(
                     "__soac__.dict({mapping:expr})",
@@ -76,11 +96,17 @@ fn reduce_core_blockpy_dict(items: Box<[ast::DictItem]>) -> InstrWithAwaitAndYie
     }
 
     if !keyed_pairs.is_empty() {
-        let tuple = make_tuple(keyed_pairs);
-        segments.push(InstrWithAwaitAndYield::from_ast_expr(py_expr!(
-            "__soac__.dict({tuple:expr})",
-            tuple = tuple
-        )));
+        let tuple = tuple_from_ast_exprs_with_meta(
+            keyed_pairs,
+            ast::AtomicNodeIndex::default(),
+            Default::default(),
+        );
+        segments.push(core_runtime_positional_call_expr_with_meta(
+            "dict",
+            ast::AtomicNodeIndex::default(),
+            Default::default(),
+            vec![tuple],
+        ));
     }
 
     let expr = match segments.len() {
@@ -737,18 +763,17 @@ impl InstrWithAwaitAndYield {
                 )
             }
             Expr::Tuple(node) if matches!(node.ctx, ast::ExprContext::Load) => {
-                let tuple = if node.elts.iter().any(Expr::is_starred_expr) {
-                    return reduce_core_tuple_splat(node.elts);
+                if node.elts.iter().any(Expr::is_starred_expr) {
+                    reduce_core_tuple_splat(node.elts)
                 } else {
-                    make_tuple(node.elts)
-                };
-                Self::from_ast_expr(tuple)
+                    tuple_from_ast_exprs_with_meta(node.elts, node.node_index, node.range)
+                }
             }
             Expr::List(node) if matches!(node.ctx, ast::ExprContext::Load) => {
                 let tuple = if node.elts.iter().any(Expr::is_starred_expr) {
                     reduce_core_tuple_splat(node.elts)
                 } else {
-                    Self::from_ast_expr(make_tuple(node.elts))
+                    tuple_from_ast_exprs_with_meta(node.elts, node.node_index.clone(), node.range)
                 };
                 core_runtime_positional_call_expr_with_meta(
                     "list",
@@ -761,7 +786,7 @@ impl InstrWithAwaitAndYield {
                 let tuple = if node.elts.iter().any(Expr::is_starred_expr) {
                     reduce_core_tuple_splat(node.elts)
                 } else {
-                    Self::from_ast_expr(make_tuple(node.elts))
+                    tuple_from_ast_exprs_with_meta(node.elts, node.node_index.clone(), node.range)
                 };
                 core_runtime_positional_call_expr_with_meta(
                     "set",
