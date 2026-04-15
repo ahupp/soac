@@ -3074,11 +3074,8 @@ fn should_keep_runtime_bootstrap_name_as_constant(name: &ResolvedName) -> bool {
         || name.is_runtime_symbol("EMPTY_TUPLE")
         || name.is_runtime_symbol("ITER_COMPLETE")
         || name.is_runtime_symbol("raise_deleted_name")
-        || name.is_runtime_symbol("create_class")
         || name.is_runtime_symbol("import_")
         || name.is_runtime_symbol("import_attr")
-        || name.is_runtime_symbol("class_lookup_global")
-        || name.is_runtime_symbol("class_lookup_cell")
 }
 
 impl crate::block_py::VisitMut<InstrResolved> for RuntimeNameGlobalNameRewriter {

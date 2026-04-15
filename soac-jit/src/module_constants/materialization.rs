@@ -19,11 +19,8 @@ const SOAC_RUNTIME_BOOTSTRAP_HELPER_NAMES: &[&str] = &[
     "locals",
     "eval",
     "exec",
-    "create_class",
     "import_",
     "import_attr",
-    "class_lookup_global",
-    "class_lookup_cell",
     "exception_matches",
     "exceptiongroup_split",
 ];
@@ -663,9 +660,7 @@ pub fn build_soac_runtime_bootstrap_module<'py>(py: Python<'py>) -> PyResult<Bou
         py,
         c"
 import builtins as _builtins
-from soac import _soac_ext
 import sys as _sys
-import types as _types
 
 def raise_deleted_name(name):
     raise UnboundLocalError(
@@ -682,49 +677,6 @@ locals = _unsupported_frame_builtin
 eval = _unsupported_frame_builtin
 # `exec` is a keyword, so expose soac.runtime.exec through the module dict.
 vars(_sys.modules[__name__])['exec'] = _unsupported_frame_builtin
-
-def create_class(
-    name,
-    namespace_fn,
-    bases,
-    kwds,
-    requires_class_cell,
-    firstlineno=None,
-    static_attributes=(),
-):
-    resolved_bases = _types.resolve_bases(bases)
-    meta, ns, meta_kwds = _types.prepare_class(name, resolved_bases, kwds)
-    class_cell = ns.get('__classcell__', None)
-    if requires_class_cell and class_cell is None:
-        class_cell = _types.CellType()
-        ns['__classcell__'] = class_cell
-    namespace_fn(ns, class_cell)
-    if '__firstlineno__' not in ns and firstlineno is not None:
-        ns['__firstlineno__'] = firstlineno
-    if '__static_attributes__' not in ns:
-        ns['__static_attributes__'] = static_attributes
-    if resolved_bases is not bases and '__orig_bases__' not in ns:
-        ns['__orig_bases__'] = bases
-    cls = meta(name, resolved_bases, ns, **meta_kwds)
-    if cls is not None:
-        ns.pop('__classcell__', None)
-        if class_cell is not None:
-            if isinstance(class_cell, _types.CellType):
-                try:
-                    class_cell_value = class_cell.cell_contents
-                except ValueError:
-                    raise RuntimeError(
-                        f'__class__ not set defining {name!r}; '
-                        '__classcell__ propagated to type.__new__?'
-                    )
-                if class_cell_value is not cls:
-                    raise TypeError(
-                        f'__class__ set to {class_cell_value!r} defining {name!r} as {cls!r}'
-                    )
-            else:
-                raise TypeError('__classcell__ must be a cell')
-        _soac_ext.profile_watch_type_key_layout(cls)
-    return cls
 
 def import_(name, spec, fromlist=None, level=0):
     if fromlist is None:
@@ -766,38 +718,6 @@ def import_attr(module, attr):
     else:
         message = f'{message} (unknown location)'
     raise ImportError(message, name=module_name, path=module_file) from None
-
-def class_lookup_global(class_ns, name, globals_dict):
-    try:
-        return class_ns[name]
-    except KeyError:
-        for type_param in class_ns.get('__type_params__', ()):
-            if getattr(type_param, '__name__', None) == name:
-                return type_param
-        for member in class_ns.values():
-            for type_param in getattr(member, '__type_params__', ()):
-                if getattr(type_param, '__name__', None) == name:
-                    return type_param
-        try:
-            return globals_dict[name]
-        except KeyError:
-            try:
-                return _builtins.__dict__[name]
-            except KeyError as exc:
-                raise NameError(f'name {name!r} is not defined') from exc
-
-def class_lookup_cell(class_ns, name, cell):
-    try:
-        return class_ns[name]
-    except KeyError:
-        pass
-    try:
-        value = cell.cell_contents
-    except ValueError as exc:
-        raise NameError(
-            f'cannot access free variable {name!r} where it is not associated with a value in enclosing scope'
-        ) from exc
-    return value
 
 def _validate_exception_type(exc_type):
     if _builtins.isinstance(exc_type, tuple):
