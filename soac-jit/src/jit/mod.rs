@@ -1275,10 +1275,11 @@ fn predeclare_direct_call_owner_type_imports(
     module: &BlockPyModule<CodegenModuleShape>,
     function: &BlockPyFunction<CodegenModuleShape>,
     profile: &SpecializationProfile<'_>,
-) -> Result<(), String> {
+) -> Result<HashMap<DirectOwnerAttrKey, Vec<DirectOwnerAttrSpecialization>>, String> {
+    let mut out: HashMap<DirectOwnerAttrKey, Vec<DirectOwnerAttrSpecialization>> = HashMap::new();
     let call_target_specializations = profile.call_target_specializations(function.function_id)?;
     if call_target_specializations.is_empty() {
-        return Ok(());
+        return Ok(out);
     }
 
     let call_sites =
@@ -1289,7 +1290,16 @@ fn predeclare_direct_call_owner_type_imports(
                 unsafe { crate::lookup_exact_owner_types_for_constructor(function_id) }
             {
                 for owner in owner_types {
+                    let Some(owner_type_ref) = reloc_type_ref_for_type(owner.owner_type)? else {
+                        continue;
+                    };
                     predeclare_owner_attr_import(jit_module, owner.owner_type, "__init__")?;
+                    out.entry(DirectOwnerAttrKey::new(function_id, "__init__"))
+                        .or_default()
+                        .push(DirectOwnerAttrSpecialization {
+                            owner_type_ref,
+                            type_version: owner.type_version,
+                        });
                 }
             }
             if let Some(method_name) = call_site.method_name.as_deref()
@@ -1297,12 +1307,21 @@ fn predeclare_direct_call_owner_type_imports(
                     unsafe { crate::lookup_exact_owner_types_for_method(function_id, method_name) }
             {
                 for owner in owner_types {
+                    let Some(owner_type_ref) = reloc_type_ref_for_type(owner.owner_type)? else {
+                        continue;
+                    };
                     predeclare_owner_attr_import(jit_module, owner.owner_type, method_name)?;
+                    out.entry(DirectOwnerAttrKey::new(function_id, method_name))
+                        .or_default()
+                        .push(DirectOwnerAttrSpecialization {
+                            owner_type_ref,
+                            type_version: owner.type_version,
+                        });
                 }
             }
         }
     }
-    Ok(())
+    Ok(out)
 }
 
 struct FuncBuildImports<'a> {
@@ -1410,6 +1429,12 @@ struct DirectFunctionCompileInputs<'a> {
     module_constant_ptrs: &'a [*mut ffi::PyObject],
 }
 
+// Worker codegen treats these as immutable inputs. The raw Python pointers are copied into
+// generated metadata or used as opaque identity values; Python-visible lookup/materialization work
+// must happen during the serial reservation/commit phases.
+unsafe impl<'a> Send for DirectFunctionCompileInputs<'a> {}
+unsafe impl<'a> Sync for DirectFunctionCompileInputs<'a> {}
+
 struct ReservedJitFunctionCompileInputs {
     module_constant_ptrs: Vec<*mut ffi::PyObject>,
     counter_slots_by_id: Vec<CounterRuntimeSlot>,
@@ -1417,9 +1442,17 @@ struct ReservedJitFunctionCompileInputs {
     scalar_counter_data_id: Option<DataId>,
     top_value_counter_data_id: Option<DataId>,
     counted_refcount_helpers: CountedRefcountHelpers,
+    direct_owner_attr_specializations:
+        HashMap<DirectOwnerAttrKey, Vec<DirectOwnerAttrSpecialization>>,
     module_constant_binding_key: usize,
     symbol_scope: Option<String>,
 }
+
+// Reservation records are frozen before worker codegen starts. Workers only read ids, counter slot
+// offsets, and raw module-constant pointer values that were already installed in the process JIT
+// namespace during the serial phase.
+unsafe impl Send for ReservedJitFunctionCompileInputs {}
+unsafe impl Sync for ReservedJitFunctionCompileInputs {}
 
 #[derive(Clone)]
 struct JitModuleDeclarationSnapshot {
@@ -1457,6 +1490,15 @@ enum ReservedDirectFunctionBatch<'a> {
     Ready(Arc<CompiledFunctionHandle>),
     Reserved(JitBatchPlan<'a>),
 }
+
+type JitWorkerPlanCache = HashMap<
+    usize,
+    (
+        FactStore,
+        PlannedJitModuleLocals,
+        PlannedJitDeoptResumeModule,
+    ),
+>;
 
 impl JitModuleDeclarationSnapshot {
     fn from_module(jit_module: &JITModule) -> Self {
@@ -2038,7 +2080,7 @@ impl ProcessJitState {
             let specialization_profile =
                 SpecializationProfile::from_runtime_state(Some(shared_state))?;
             predeclare_specialization_type_imports(jit_module, &specialization_profile)?;
-            predeclare_direct_call_owner_type_imports(
+            let direct_owner_attr_specializations = predeclare_direct_call_owner_type_imports(
                 jit_module,
                 &shared_state.lowered_module,
                 &batch_function.function,
@@ -2051,6 +2093,7 @@ impl ProcessJitState {
                 scalar_counter_data_id,
                 top_value_counter_data_id,
                 counted_refcount_helpers,
+                direct_owner_attr_specializations,
                 module_constant_binding_key: instance_key,
                 symbol_scope: Some(symbol_scope),
             });
@@ -2093,6 +2136,7 @@ impl ProcessJitState {
             scalar_counter_data_id,
             top_value_counter_data_id,
             counted_refcount_helpers,
+            direct_owner_attr_specializations: HashMap::new(),
             module_constant_binding_key: instance_key,
             symbol_scope: None,
         })
@@ -2149,208 +2193,289 @@ impl ProcessJitState {
         inputs: &DirectFunctionCompileInputs<'a>,
         plan: &JitBatchPlan<'a>,
     ) -> Result<Vec<CompiledJitFunction>, String> {
-        let mut compiled_functions = Vec::with_capacity(plan.function_indices_to_define.len());
-        let mut jit_plan_cache: HashMap<
-            usize,
-            (
-                FactStore,
-                PlannedJitModuleLocals,
-                PlannedJitDeoptResumeModule,
-            ),
-        > = HashMap::new();
-        for batch_function_index in &plan.function_indices_to_define {
-            let batch_function = &plan.batch_functions[*batch_function_index];
-            let function = &batch_function.function;
-            let placeholder_blocks;
-            let function_blocks = if function.function_id == plan.root_function_id {
-                inputs.blocks
-            } else {
-                placeholder_blocks =
-                    vec![std::ptr::null_mut::<std::ffi::c_void>(); function.blocks.len()];
-                placeholder_blocks.as_slice()
-            };
-            let reserved_inputs = plan
-                .function_compile_inputs
-                .get(batch_function_index)
-                .expect("reserved JIT batch function should have compile inputs");
-            let (
-                function_module,
-                function_module_constants,
-                function_counter_defs,
-                function_direct_call_resolver,
-            ) = if let Some(shared_state) = batch_function.source.shared_state() {
-                (
-                    &shared_state.lowered_module,
-                    &shared_state.codegen_constants,
-                    shared_state.lowered_module.counter_defs.as_slice(),
-                    Some(shared_state),
-                )
-            } else {
-                (
-                    inputs.module,
-                    inputs.module_constants,
-                    inputs.counter_defs,
-                    None,
-                )
-            };
-            let function_module_constant_binding_key = reserved_inputs.module_constant_binding_key;
-            if !jit_plan_cache.contains_key(&function_module_constant_binding_key) {
-                let value_facts = infer_jit_value_facts(function_module);
-                let jit_module_local_plan = plan_jit_module_locals(function_module, &value_facts)?;
-                let jit_module_deopt_resume_plan =
-                    plan_jit_deopt_resume_module(function_module, &value_facts)?;
-                jit_plan_cache.insert(
-                    function_module_constant_binding_key,
-                    (
-                        value_facts,
-                        jit_module_local_plan,
-                        jit_module_deopt_resume_plan,
-                    ),
-                );
-            }
-            let (
-                function_value_facts,
-                function_jit_module_local_plan,
-                function_jit_module_deopt_resume_plan,
-            ) = jit_plan_cache
-                .get(&function_module_constant_binding_key)
-                .expect("JIT plan cache entry should exist after insertion");
-            let function_jit_local_plan = function_jit_module_local_plan
-                .function(function.function_id)
-                .ok_or_else(|| {
-                    format!(
-                        "missing JIT local plan for function {} ({})",
-                        function.function_id, function.names.qualname
-                    )
-                })?;
-            let function_jit_deopt_resume_plan = function_jit_module_deopt_resume_plan
-                .function(function.function_id)
-                .ok_or_else(|| {
-                    format!(
-                        "missing JIT deopt resume plan for function {} ({})",
-                        function.function_id, function.names.qualname
-                    )
-                })?;
-            let function_deopt_table = Arc::new(RuntimeJitDeoptTable::from_plan(
-                function,
-                function_jit_deopt_resume_plan,
-                reserved_inputs.module_constant_ptrs.as_slice(),
-            )?);
-            let built = build_cranelift_run_bb_specialized_function(
+        Self::compile_reserved_direct_function_batch_indices(
+            jit_module,
+            inputs,
+            plan,
+            plan.function_indices_to_define.as_slice(),
+        )
+    }
+
+    fn compile_reserved_direct_function_batch_indices<'a>(
+        jit_module: &mut JITModule,
+        inputs: &DirectFunctionCompileInputs<'a>,
+        plan: &JitBatchPlan<'a>,
+        batch_function_indices: &[usize],
+    ) -> Result<Vec<CompiledJitFunction>, String> {
+        let mut compiled_functions = Vec::with_capacity(batch_function_indices.len());
+        let mut jit_plan_cache: JitWorkerPlanCache = HashMap::new();
+        for batch_function_index in batch_function_indices {
+            let compiled_function = Self::compile_reserved_direct_function_index(
                 jit_module,
-                function_blocks,
-                function_module,
-                function,
-                function_value_facts,
-                function_jit_local_plan,
-                function_jit_deopt_resume_plan,
-                function_module_constants,
-                function_counter_defs,
-                reserved_inputs.module_constant_object_data_ids.as_slice(),
-                reserved_inputs.counter_slots_by_id.as_slice(),
-                reserved_inputs.scalar_counter_data_id,
-                reserved_inputs.top_value_counter_data_id,
-                inputs.session.as_ref(),
-                function_direct_call_resolver,
-                &SpecializationProfile::from_runtime_state(function_direct_call_resolver)?,
-                reserved_inputs.symbol_scope.as_deref(),
-                Some(&plan.predeclared),
-                BuildSpecializedFunctionOptions {
-                    counted_refcount_helpers: Some(reserved_inputs.counted_refcount_helpers),
-                    ..BuildSpecializedFunctionOptions::default()
-                },
-            )
-            .map_err(|err| {
-                format!(
-                    "{err} [function={} id={}]",
-                    function.names.qualname, function.function_id
-                )
-            })?;
-            let mut ctx = built.ctx;
-            let main_id = built.main_id;
-            let main_symbol = built.main_symbol;
-            let default_adapter_id = built.default_adapter_id;
-            let default_adapter_symbol = built.default_adapter_symbol;
-            let clif_block_count = ctx.func.layout.blocks().count();
-            let clif_inst_count = ctx.func.dfg.num_insts();
-            let function_name =
-                direct_function_backend_name(function, batch_function.source.shared_state());
-            let compiled = compile_prepared_function_bytes(
-                jit_module,
-                main_id,
-                &mut ctx,
-                function_name.as_str(),
-                "failed to compile specialized jit run_bb function",
-            )
-            .map_err(|err| {
-                format!(
-                    "{err} [function={} id={}]",
-                    function.names.qualname, function.function_id
-                )
-            })?;
-            jit_module.clear_context(&mut ctx);
-            let default_adapter_compiled = match (
-                default_adapter_id,
-                default_adapter_symbol.as_ref(),
-            ) {
-                (Some(default_adapter_id), Some(default_adapter_symbol)) => {
-                    let mut default_ctx = build_default_resolving_direct_adapter(
-                        jit_module,
-                        function,
-                        main_id,
-                        default_adapter_id,
-                    )
-                    .map_err(|err| {
-                        format!(
-                            "{err} [default-adapter function={} id={}]",
-                            function.names.qualname, function.function_id
-                        )
-                    })?;
-                    let compiled = compile_prepared_function_bytes(
-                        jit_module,
-                        default_adapter_id,
-                        &mut default_ctx,
-                        default_adapter_symbol.as_str(),
-                        "failed to compile default-resolving direct adapter",
-                    )
-                    .map_err(|err| {
-                        format!(
-                            "{err} [default-adapter function={} id={}]",
-                            function.names.qualname, function.function_id
-                        )
-                    })?;
-                    jit_module.clear_context(&mut default_ctx);
-                    Some(compiled)
-                }
-                (None, None) => None,
-                _ => {
-                    return Err(format!(
-                        "default direct adapter declaration is inconsistent for function {} id={}",
-                        function.names.qualname, function.function_id
-                    ));
-                }
-            };
-            compiled_functions.push(CompiledJitFunction {
-                function_id: function.function_id,
-                function_qualname: function.names.qualname.clone(),
-                param_count: function.params.len(),
-                main_id,
-                main_symbol,
-                default_adapter_id,
-                default_adapter_symbol,
-                stats: JitCodegenStats {
-                    clif_block_count,
-                    clif_inst_count,
-                    machine_code_size_bytes: compiled.artifact.code_size,
-                    machine_code_block_count: compiled.artifact.code_bb_offsets.len(),
-                    machine_code_edge_count: compiled.artifact.code_bb_edges.len(),
-                },
-                compiled,
-                default_adapter_compiled,
-                deopt_table: function_deopt_table,
-            });
+                inputs,
+                plan,
+                *batch_function_index,
+                &mut jit_plan_cache,
+            )?;
+            compiled_functions.push(compiled_function);
         }
         Ok(compiled_functions)
+    }
+
+    fn compile_reserved_direct_function_batch_worker_modules<'a>(
+        inputs: &DirectFunctionCompileInputs<'a>,
+        plan: &JitBatchPlan<'a>,
+    ) -> Result<Vec<CompiledJitFunction>, String> {
+        let function_count = plan.function_indices_to_define.len();
+        if function_count == 0 {
+            return Ok(Vec::new());
+        }
+        let worker_count = std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(function_count);
+        if worker_count <= 1 {
+            let mut jit_module = plan
+                .module_declarations
+                .build_worker_module(inputs.session)?;
+            let compiled_functions =
+                Self::compile_reserved_direct_function_batch(&mut jit_module, inputs, plan)?;
+            plan.module_declarations
+                .validate_no_extra_declarations(&jit_module)?;
+            return Ok(compiled_functions);
+        }
+
+        let chunk_size = function_count.div_ceil(worker_count);
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(worker_count);
+            for batch_function_indices in plan.function_indices_to_define.chunks(chunk_size) {
+                handles.push(scope.spawn(move || {
+                    let _guard = ProcessJitCompileGuard::enter();
+                    let mut jit_module = plan
+                        .module_declarations
+                        .build_worker_module(inputs.session)?;
+                    let compiled_functions = Self::compile_reserved_direct_function_batch_indices(
+                        &mut jit_module,
+                        inputs,
+                        plan,
+                        batch_function_indices,
+                    )?;
+                    plan.module_declarations
+                        .validate_no_extra_declarations(&jit_module)?;
+                    Ok::<_, String>(compiled_functions)
+                }));
+            }
+
+            let mut compiled_functions = Vec::with_capacity(function_count);
+            for handle in handles {
+                match handle.join() {
+                    Ok(Ok(mut worker_functions)) => {
+                        compiled_functions.append(&mut worker_functions)
+                    }
+                    Ok(Err(err)) => return Err(err),
+                    Err(_) => return Err("process JIT batch codegen worker panicked".to_string()),
+                }
+            }
+            Ok(compiled_functions)
+        })
+    }
+
+    fn compile_reserved_direct_function_index<'a>(
+        jit_module: &mut JITModule,
+        inputs: &DirectFunctionCompileInputs<'a>,
+        plan: &JitBatchPlan<'a>,
+        batch_function_index: usize,
+        jit_plan_cache: &mut JitWorkerPlanCache,
+    ) -> Result<CompiledJitFunction, String> {
+        let batch_function = &plan.batch_functions[batch_function_index];
+        let function = &batch_function.function;
+        let placeholder_blocks;
+        let function_blocks = if function.function_id == plan.root_function_id {
+            inputs.blocks
+        } else {
+            placeholder_blocks =
+                vec![std::ptr::null_mut::<std::ffi::c_void>(); function.blocks.len()];
+            placeholder_blocks.as_slice()
+        };
+        let reserved_inputs = plan
+            .function_compile_inputs
+            .get(&batch_function_index)
+            .expect("reserved JIT batch function should have compile inputs");
+        let (
+            function_module,
+            function_module_constants,
+            function_counter_defs,
+            function_direct_call_resolver,
+        ) = if let Some(shared_state) = batch_function.source.shared_state() {
+            (
+                &shared_state.lowered_module,
+                &shared_state.codegen_constants,
+                shared_state.lowered_module.counter_defs.as_slice(),
+                Some(shared_state),
+            )
+        } else {
+            (
+                inputs.module,
+                inputs.module_constants,
+                inputs.counter_defs,
+                None,
+            )
+        };
+        let function_module_constant_binding_key = reserved_inputs.module_constant_binding_key;
+        if !jit_plan_cache.contains_key(&function_module_constant_binding_key) {
+            let value_facts = infer_jit_value_facts(function_module);
+            let jit_module_local_plan = plan_jit_module_locals(function_module, &value_facts)?;
+            let jit_module_deopt_resume_plan =
+                plan_jit_deopt_resume_module(function_module, &value_facts)?;
+            jit_plan_cache.insert(
+                function_module_constant_binding_key,
+                (
+                    value_facts,
+                    jit_module_local_plan,
+                    jit_module_deopt_resume_plan,
+                ),
+            );
+        }
+        let (
+            function_value_facts,
+            function_jit_module_local_plan,
+            function_jit_module_deopt_resume_plan,
+        ) = jit_plan_cache
+            .get(&function_module_constant_binding_key)
+            .expect("JIT plan cache entry should exist after insertion");
+        let function_jit_local_plan = function_jit_module_local_plan
+            .function(function.function_id)
+            .ok_or_else(|| {
+                format!(
+                    "missing JIT local plan for function {} ({})",
+                    function.function_id, function.names.qualname
+                )
+            })?;
+        let function_jit_deopt_resume_plan = function_jit_module_deopt_resume_plan
+            .function(function.function_id)
+            .ok_or_else(|| {
+                format!(
+                    "missing JIT deopt resume plan for function {} ({})",
+                    function.function_id, function.names.qualname
+                )
+            })?;
+        let function_deopt_table = Arc::new(RuntimeJitDeoptTable::from_plan(
+            function,
+            function_jit_deopt_resume_plan,
+            reserved_inputs.module_constant_ptrs.as_slice(),
+        )?);
+        let built = build_cranelift_run_bb_specialized_function(
+            jit_module,
+            function_blocks,
+            function_module,
+            function,
+            function_value_facts,
+            function_jit_local_plan,
+            function_jit_deopt_resume_plan,
+            function_module_constants,
+            function_counter_defs,
+            reserved_inputs.module_constant_object_data_ids.as_slice(),
+            reserved_inputs.counter_slots_by_id.as_slice(),
+            reserved_inputs.scalar_counter_data_id,
+            reserved_inputs.top_value_counter_data_id,
+            inputs.session.as_ref(),
+            function_direct_call_resolver,
+            &SpecializationProfile::from_runtime_state(function_direct_call_resolver)?,
+            reserved_inputs.symbol_scope.as_deref(),
+            Some(&plan.predeclared),
+            BuildSpecializedFunctionOptions {
+                counted_refcount_helpers: Some(reserved_inputs.counted_refcount_helpers),
+                direct_owner_attr_specializations: Some(
+                    reserved_inputs.direct_owner_attr_specializations.clone(),
+                ),
+                ..BuildSpecializedFunctionOptions::default()
+            },
+        )
+        .map_err(|err| {
+            format!(
+                "{err} [function={} id={}]",
+                function.names.qualname, function.function_id
+            )
+        })?;
+        let mut ctx = built.ctx;
+        let main_id = built.main_id;
+        let main_symbol = built.main_symbol;
+        let default_adapter_id = built.default_adapter_id;
+        let default_adapter_symbol = built.default_adapter_symbol;
+        let clif_block_count = ctx.func.layout.blocks().count();
+        let clif_inst_count = ctx.func.dfg.num_insts();
+        let function_name =
+            direct_function_backend_name(function, batch_function.source.shared_state());
+        let compiled = compile_prepared_function_bytes(
+            jit_module,
+            main_id,
+            &mut ctx,
+            function_name.as_str(),
+            "failed to compile specialized jit run_bb function",
+        )
+        .map_err(|err| {
+            format!(
+                "{err} [function={} id={}]",
+                function.names.qualname, function.function_id
+            )
+        })?;
+        jit_module.clear_context(&mut ctx);
+        let default_adapter_compiled = match (default_adapter_id, default_adapter_symbol.as_ref()) {
+            (Some(default_adapter_id), Some(default_adapter_symbol)) => {
+                let mut default_ctx = build_default_resolving_direct_adapter(
+                    jit_module,
+                    function,
+                    main_id,
+                    default_adapter_id,
+                )
+                .map_err(|err| {
+                    format!(
+                        "{err} [default-adapter function={} id={}]",
+                        function.names.qualname, function.function_id
+                    )
+                })?;
+                let compiled = compile_prepared_function_bytes(
+                    jit_module,
+                    default_adapter_id,
+                    &mut default_ctx,
+                    default_adapter_symbol.as_str(),
+                    "failed to compile default-resolving direct adapter",
+                )
+                .map_err(|err| {
+                    format!(
+                        "{err} [default-adapter function={} id={}]",
+                        function.names.qualname, function.function_id
+                    )
+                })?;
+                jit_module.clear_context(&mut default_ctx);
+                Some(compiled)
+            }
+            (None, None) => None,
+            _ => {
+                return Err(format!(
+                    "default direct adapter declaration is inconsistent for function {} id={}",
+                    function.names.qualname, function.function_id
+                ));
+            }
+        };
+        Ok(CompiledJitFunction {
+            function_id: function.function_id,
+            function_qualname: function.names.qualname.clone(),
+            param_count: function.params.len(),
+            main_id,
+            main_symbol,
+            default_adapter_id,
+            default_adapter_symbol,
+            stats: JitCodegenStats {
+                clif_block_count,
+                clif_inst_count,
+                machine_code_size_bytes: compiled.artifact.code_size,
+                machine_code_block_count: compiled.artifact.code_bb_offsets.len(),
+                machine_code_edge_count: compiled.artifact.code_bb_edges.len(),
+            },
+            compiled,
+            default_adapter_compiled,
+            deopt_table: function_deopt_table,
+        })
     }
 
     fn commit_compiled_direct_function_batch(
@@ -2726,6 +2851,12 @@ pub(crate) struct RuntimeJitDeoptTable {
     module_constant_ptrs: Vec<ObjPtr>,
     points: Vec<RuntimeJitDeoptRecord>,
 }
+
+// The table is immutable after construction. Raw module-constant pointers are copied into the
+// table as runtime metadata and are only dereferenced when generated/deopt code is running under
+// the Python runtime contract, not during worker-thread codegen.
+unsafe impl Send for RuntimeJitDeoptTable {}
+unsafe impl Sync for RuntimeJitDeoptTable {}
 
 #[derive(Clone, Debug)]
 pub(crate) struct RuntimeJitDeoptRecord {
@@ -4932,6 +5063,8 @@ struct JitEmitCtx<'mc> {
     direct_call_functions: &'mc HashMap<FunctionId, DeclaredJitFunction>,
     call_target_counter_ids: &'mc HashMap<InstrId, CounterId>,
     call_target_specializations: &'mc HashMap<InstrId, Vec<FunctionId>>,
+    direct_owner_attr_specializations:
+        Option<&'mc HashMap<DirectOwnerAttrKey, Vec<DirectOwnerAttrSpecialization>>>,
     call_direct_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
     call_direct_fallback_counter_ids: &'mc HashMap<InstrId, CounterId>,
     operator_shape_counter_ids: &'mc HashMap<InstrId, CounterId>,
@@ -5366,6 +5499,27 @@ struct DirectConstructorSpecialization {
     owner_type_ref: RelocTypeRef,
     type_version: u32,
     arg_plan: DirectCallArgPlan,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct DirectOwnerAttrKey {
+    function_id: FunctionId,
+    attr_name: String,
+}
+
+impl DirectOwnerAttrKey {
+    fn new(function_id: FunctionId, attr_name: &str) -> Self {
+        Self {
+            function_id,
+            attr_name: attr_name.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DirectOwnerAttrSpecialization {
+    owner_type_ref: RelocTypeRef,
+    type_version: u32,
 }
 
 #[derive(Clone)]
@@ -9016,6 +9170,60 @@ pub(super) fn codegen_constant_string_value<'a>(
     module_constant_string_value(module, constant_index)
 }
 
+fn direct_method_owner_attr_specializations(
+    ctx: &JitEmitCtx<'_>,
+    function_id: FunctionId,
+    method_name: &str,
+) -> Vec<DirectOwnerAttrSpecialization> {
+    let key = DirectOwnerAttrKey::new(function_id, method_name);
+    if let Some(predeclared) = ctx.direct_owner_attr_specializations {
+        return predeclared.get(&key).cloned().unwrap_or_default();
+    }
+    let Ok(owner_types) =
+        (unsafe { crate::lookup_exact_owner_types_for_method(function_id, method_name) })
+    else {
+        return Vec::new();
+    };
+    owner_types
+        .into_iter()
+        .filter_map(|owner| {
+            let Ok(Some(owner_type_ref)) = reloc_type_ref_for_type(owner.owner_type) else {
+                return None;
+            };
+            Some(DirectOwnerAttrSpecialization {
+                owner_type_ref,
+                type_version: owner.type_version,
+            })
+        })
+        .collect()
+}
+
+fn direct_constructor_owner_attr_specializations(
+    ctx: &JitEmitCtx<'_>,
+    function_id: FunctionId,
+) -> Vec<DirectOwnerAttrSpecialization> {
+    let key = DirectOwnerAttrKey::new(function_id, "__init__");
+    if let Some(predeclared) = ctx.direct_owner_attr_specializations {
+        return predeclared.get(&key).cloned().unwrap_or_default();
+    }
+    let Ok(owner_types) = (unsafe { crate::lookup_exact_owner_types_for_constructor(function_id) })
+    else {
+        return Vec::new();
+    };
+    owner_types
+        .into_iter()
+        .filter_map(|owner| {
+            let Ok(Some(owner_type_ref)) = reloc_type_ref_for_type(owner.owner_type) else {
+                return None;
+            };
+            Some(DirectOwnerAttrSpecialization {
+                owner_type_ref,
+                type_version: owner.type_version,
+            })
+        })
+        .collect()
+}
+
 fn direct_method_specializations_for_call_site(
     call: &blockpy_intrinsics::Call<InstrCodegen>,
     ctx: &JitEmitCtx<'_>,
@@ -9059,22 +9267,14 @@ fn direct_method_specializations_for_call_site(
                 continue;
             }
         };
-        let Ok(owner_types) =
-            (unsafe { crate::lookup_exact_owner_types_for_method(function_id, method_name) })
-        else {
-            continue;
-        };
-        for owner in owner_types {
-            let Ok(Some(owner_type_ref)) = reloc_type_ref_for_type(owner.owner_type) else {
-                continue;
-            };
+        for owner in direct_method_owner_attr_specializations(ctx, function_id, method_name) {
             out.push(DirectMethodSpecialization {
                 function_id,
                 descriptor_function_ref: RelocCallableRef::OwnerAttr {
-                    owner_type_ref: owner_type_ref.clone(),
+                    owner_type_ref: owner.owner_type_ref.clone(),
                     attr_name: method_name.to_string(),
                 },
-                owner_type_ref,
+                owner_type_ref: owner.owner_type_ref.clone(),
                 type_version: owner.type_version,
                 arg_plan: arg_plan.clone(),
             });
@@ -9120,22 +9320,14 @@ fn direct_constructor_specializations_for_call_site(
                 continue;
             }
         };
-        let Ok(owner_types) =
-            (unsafe { crate::lookup_exact_owner_types_for_constructor(function_id) })
-        else {
-            continue;
-        };
-        for owner in owner_types {
-            let Ok(Some(owner_type_ref)) = reloc_type_ref_for_type(owner.owner_type) else {
-                continue;
-            };
+        for owner in direct_constructor_owner_attr_specializations(ctx, function_id) {
             out.push(DirectConstructorSpecialization {
                 function_id,
                 init_function_ref: RelocCallableRef::OwnerAttr {
-                    owner_type_ref: owner_type_ref.clone(),
+                    owner_type_ref: owner.owner_type_ref.clone(),
                     attr_name: "__init__".to_string(),
                 },
-                owner_type_ref,
+                owner_type_ref: owner.owner_type_ref.clone(),
                 type_version: owner.type_version,
                 arg_plan: arg_plan.clone(),
             });
@@ -9607,10 +9799,13 @@ fn ensure_reloc_type_symbol_registered(owner_type_ref: &RelocTypeRef) -> Result<
     match owner_type_ref {
         RelocTypeRef::CpythonTypeSymbol(_) => Ok(true),
         RelocTypeRef::TypeKey(_) => {
+            let symbol = reloc_type_ref_symbol_name(owner_type_ref);
+            if lookup_registered_jit_data_symbol(symbol.as_ref()).is_some() {
+                return Ok(true);
+            }
             let Some(owner_type) = resolve_reloc_type_ref_to_type(owner_type_ref)? else {
                 return Ok(false);
             };
-            let symbol = reloc_type_ref_symbol_name(owner_type_ref);
             register_jit_data_symbol(symbol.as_ref(), owner_type.cast::<u8>());
             Ok(true)
         }
@@ -9679,10 +9874,13 @@ fn resolve_reloc_callable_ref_to_object(
 fn ensure_reloc_callable_symbol_registered(
     callable_ref: &RelocCallableRef,
 ) -> Result<bool, String> {
+    let symbol = reloc_callable_ref_symbol_name(callable_ref);
+    if lookup_registered_jit_data_symbol(symbol.as_str()).is_some() {
+        return Ok(true);
+    }
     let Some(callable) = resolve_reloc_callable_ref_to_object(callable_ref)? else {
         return Ok(false);
     };
-    let symbol = reloc_callable_ref_symbol_name(callable_ref);
     register_jit_data_symbol(symbol.as_str(), callable.cast::<u8>());
     Ok(true)
 }
@@ -15283,16 +15481,8 @@ impl ProcessJitEngine {
             }
         };
         let compiled_functions = {
-            let mut jit_module = plan.module_declarations.build_worker_module(session)?;
             let _guard = ProcessJitCompileGuard::enter();
-            let compiled_functions = ProcessJitState::compile_reserved_direct_function_batch(
-                &mut jit_module,
-                &inputs,
-                &plan,
-            )?;
-            plan.module_declarations
-                .validate_no_extra_declarations(&jit_module)?;
-            compiled_functions
+            ProcessJitState::compile_reserved_direct_function_batch_worker_modules(&inputs, &plan)?
         };
         let mut state = self
             .state
@@ -17288,6 +17478,8 @@ struct BuildSpecializedFunctionOptions {
     guard_miss_deopt_stub: bool,
     module_constant_accesses: ModuleConstantAccessTable,
     counted_refcount_helpers: Option<CountedRefcountHelpers>,
+    direct_owner_attr_specializations:
+        Option<HashMap<DirectOwnerAttrKey, Vec<DirectOwnerAttrSpecialization>>>,
 }
 
 fn build_cranelift_run_bb_specialized_function(
@@ -18084,6 +18276,9 @@ fn build_cranelift_run_bb_specialized_function(
                 direct_call_functions,
                 call_target_counter_ids: &call_target_counter_ids,
                 call_target_specializations: &call_target_specializations,
+                direct_owner_attr_specializations: options
+                    .direct_owner_attr_specializations
+                    .as_ref(),
                 call_direct_hit_counter_ids: &call_direct_hit_counter_ids,
                 call_direct_fallback_counter_ids: &call_direct_fallback_counter_ids,
                 operator_shape_counter_ids: &operator_shape_counter_ids,
