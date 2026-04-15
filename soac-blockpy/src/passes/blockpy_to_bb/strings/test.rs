@@ -90,9 +90,6 @@ fn collect_helper_like_names_in_expr(out: &mut Vec<String>, expr: &InstrCodegen)
         InstrCodegen::CellRef(operation) => {
             operation.visit_children(&mut HelperNameVisitor { out });
         }
-        InstrCodegen::MakeFunction(operation) => {
-            operation.visit_children(&mut HelperNameVisitor { out });
-        }
         InstrCodegen::MakeFunctionWithClosure(operation) => {
             operation.visit_children(&mut HelperNameVisitor { out });
         }

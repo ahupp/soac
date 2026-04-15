@@ -210,9 +210,6 @@ impl VisitMut<InstrCodegen> for FunctionIdRemapper {
             InstrCodegen::CallDirect(op) => {
                 op.function_id = self.remap(op.function_id);
             }
-            InstrCodegen::MakeFunction(op) => {
-                op.set_function_id(self.remap(op.function_id()));
-            }
             InstrCodegen::MakeFunctionWithClosure(op) => {
                 op.set_function_id(self.remap(op.function_id()));
             }

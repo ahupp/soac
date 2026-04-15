@@ -28,7 +28,6 @@ from .sim import (
     eq,
     floordiv,
     ge,
-    globals,
     gt,
     iadd,
     iand,
@@ -62,8 +61,6 @@ from .sim import (
     xor,
 )
 
-make_function = _soac_ext.make_function
-
 next = _builtins.next
 iter = _builtins.iter
 anext = _builtins.anext
@@ -89,10 +86,11 @@ ImportError = _builtins.ImportError
 
 def _unsupported_frame_builtin(*args, **kwargs):
     raise _builtins.NotImplementedError(
-        "soac.runtime does not support frame-sensitive locals/eval/exec"
+        "soac.runtime does not support frame-sensitive globals/locals/eval/exec"
     )
 
 
+globals = _unsupported_frame_builtin
 locals = _unsupported_frame_builtin
 eval = _unsupported_frame_builtin
 # `exec` is a keyword, so expose soac.runtime.exec through the module dict.

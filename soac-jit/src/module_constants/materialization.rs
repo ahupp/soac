@@ -14,11 +14,12 @@ unsafe extern "C" {
 }
 
 const SOAC_RUNTIME_BOOTSTRAP_HELPER_NAMES: &[&str] = &[
+    "_soac_ext",
+    "globals",
     "locals",
     "eval",
     "exec",
     "tuple_values",
-    "make_function",
     "create_class",
     "import_",
     "import_attr",
@@ -702,12 +703,13 @@ _PYTHON_KEYWORDS = frozenset((
 _MISSING = object()
 
 def _unsupported_frame_builtin(*args, **kwargs):
-    raise NotImplementedError('soac.runtime does not support frame-sensitive locals/eval/exec')
+    raise NotImplementedError('soac.runtime does not support frame-sensitive globals/locals/eval/exec')
 
+globals = _unsupported_frame_builtin
 locals = _unsupported_frame_builtin
 eval = _unsupported_frame_builtin
 # `exec` is a keyword, so expose soac.runtime.exec through the module dict.
-globals()['exec'] = _unsupported_frame_builtin
+vars(_sys.modules[__name__])['exec'] = _unsupported_frame_builtin
 
 def code_with_freevars(names, is_async, is_generator):
     names = tuple(names)
@@ -755,8 +757,6 @@ def code_with_freevars(names, is_async, is_generator):
 
 def tuple_values(*values):
     return tuple(values)
-
-make_function = _soac_ext.make_function
 
 def create_class(
     name,

@@ -280,8 +280,6 @@ _AwaitIterWrapper:
 Runtime aliases and re-exports:
 
 ```text
-make_function = _soac_ext.make_function
-
 next
 iter
 anext
@@ -304,6 +302,7 @@ AssertionError
 AttributeError
 ImportError
 
+globals = _unsupported_frame_builtin
 locals = _unsupported_frame_builtin
 eval = _unsupported_frame_builtin
 exec = _unsupported_frame_builtin
@@ -320,7 +319,6 @@ and_
 eq
 floordiv
 ge
-globals
 gt
 iadd
 iand

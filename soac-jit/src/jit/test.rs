@@ -2,12 +2,12 @@ use super::*;
 use soac_blockpy::block_py::{
     AbruptKind, BinOp, BinOpKind, BlockArg, BlockEdge, BlockLabel, BlockParam, BlockParamRole,
     BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional, CallDirect,
-    CalleeFunctionId, CellLocation, ChildVisitable, ClosureInit, ClosureSlot, CodegenBlock,
-    CounterDef, CounterSite, Del, DelItem, FunctionId, FunctionName, GetAttr, GetItem, HasMeta,
-    HasSemanticInstrId, IncrementCounter, InstrCodegen, InstrResolved, Literal, LiteralValue, Load,
-    LocalLocation, MakeCell, Meta, ModuleNameGen, NameLocation, NumberLiteral, NumberLiteralValue,
-    Param, ParamKind, ParamSpec, ResolvedName, SetAttr, SetItem, StorageLayout, Store,
-    StringLiteral, UnaryOp, UnaryOpKind, Visit, VisitMut, WithMeta,
+    CalleeFunctionId, CellLocation, CellRef, ChildVisitable, ClosureInit, ClosureSlot,
+    CodegenBlock, CounterDef, CounterSite, Del, DelItem, FunctionId, FunctionName, GetAttr,
+    GetItem, HasMeta, HasSemanticInstrId, IncrementCounter, InstrCodegen, InstrResolved, Literal,
+    LiteralValue, Load, LocalLocation, MakeCell, Meta, ModuleNameGen, NameLocation, NumberLiteral,
+    NumberLiteralValue, Param, ParamKind, ParamSpec, ResolvedName, SetAttr, SetItem, StorageLayout,
+    Store, StringLiteral, UnaryOp, UnaryOpKind, Visit, VisitMut, WithMeta,
 };
 use soac_blockpy::passes::{
     CodegenModuleShape, instrument_bb_module_with_block_entry_counters,
@@ -6254,17 +6254,9 @@ def f(x):
     #[test]
     fn runtime_deopt_table_rejects_unsupported_block_entry_tail() {
         let test_function = test_function();
-        let unsupported_function_id = test_function.function_id;
         let function = with_single_test_block(
             test_function,
-            vec![expr_stmt(op_expr(
-                soac_blockpy::block_py::MakeFunction::new(
-                    unsupported_function_id,
-                    soac_blockpy::block_py::FunctionKind::Function,
-                    Box::new(none_expr()),
-                    Box::new(none_expr()),
-                ),
-            ))],
+            vec![expr_stmt(op_expr(CellRef::new(CellLocation::Owned(0))))],
             ret_term(none_expr()),
         );
         let module = test_module(ModuleNameGen::new(0), vec![function]);

@@ -17,7 +17,7 @@ def validate_module(module):
 
     if __dp_integration_soac__:
         assert isinstance(module.result, NotImplementedError)
-        assert "frame-sensitive locals/eval/exec" in str(module.result)
+        assert "frame-sensitive globals/locals/eval/exec" in str(module.result)
         return
 
     assert module.result is not None

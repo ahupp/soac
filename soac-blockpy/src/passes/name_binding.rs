@@ -674,7 +674,6 @@ fn core_name_expr(
                 | "class_lookup_global"
                 | "class_lookup_cell"
                 | "tuple"
-                | "make_function"
         )
     {
         return Load::new(<UnresolvedName as NameLike>::runtime_name(id))
@@ -2220,6 +2219,9 @@ impl MapInstr<InstrUnresolved, InstrResolved> for NameLocator<'_> {
                 call.with_meta(meta).into()
             },
             InstrLow::CellRef(node) => node.into(),
+            InstrLow::MakeFunction(_) => {
+                panic!("MakeFunction should lower to MakeFunctionWithClosure before name location")
+            },
             rest => rest.map_children(self).into(),
         })
     }
@@ -3078,7 +3080,6 @@ fn should_keep_runtime_bootstrap_name_as_constant(name: &ResolvedName) -> bool {
         || name.is_runtime_symbol("ITER_COMPLETE")
         || name.is_runtime_symbol("tuple_values")
         || name.is_runtime_symbol("raise_deleted_name")
-        || name.is_runtime_symbol("make_function")
         || name.is_runtime_symbol("create_class")
         || name.is_runtime_symbol("import_")
         || name.is_runtime_symbol("import_attr")

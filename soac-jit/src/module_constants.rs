@@ -518,13 +518,11 @@ impl ModuleConstantCollector {
             InstrCodegen::MakeCell(op) => {
                 op.visit_children(self);
             }
-            InstrCodegen::MakeFunction(op) => {
-                op.visit_children(self);
-            }
             InstrCodegen::MakeFunctionWithClosure(op) => {
                 self.constants.intern_u64(op.function_id().packed());
                 self.constants
                     .intern_unicode_bytes(op.kind.make_function_kind_name().as_bytes());
+                self.constants.intern_runtime_name_bytes(b"_soac_ext");
                 self.constants.intern_unicode_bytes(b"make_function");
                 op.visit_children(self);
             }

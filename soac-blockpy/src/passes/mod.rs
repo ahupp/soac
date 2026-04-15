@@ -142,7 +142,6 @@ pub enum InstrCodegenOp {
     MakeCell(#[rkyv(omit_bounds)] MakeCell<Self>),
     IncrementCounter(IncrementCounter),
     CellRef(CellRef),
-    MakeFunction(#[rkyv(omit_bounds)] MakeFunction<Self>),
     MakeFunctionWithClosure(#[rkyv(omit_bounds)] MakeFunctionWithClosure<Self>),
 }
 
@@ -259,7 +258,6 @@ pub enum InstrTyped {
     LegacyMakeCell(MakeCell<Self>),
     LegacyIncrementCounter(IncrementCounter),
     LegacyCellRef(CellRef),
-    LegacyMakeFunction(MakeFunction<Self>),
     LegacyMakeFunctionWithClosure(MakeFunctionWithClosure<Self>),
 }
 
@@ -283,7 +281,6 @@ impl InstrTyped {
                 | Self::LegacyMakeCell(_)
                 | Self::LegacyIncrementCounter(_)
                 | Self::LegacyCellRef(_)
-                | Self::LegacyMakeFunction(_)
                 | Self::LegacyMakeFunctionWithClosure(_)
         )
     }
@@ -322,9 +319,6 @@ impl MapInstr<InstrCodegen, InstrTyped> for CodegenToTyped {
             InstrCodegenOp::MakeCell(op) => InstrTyped::LegacyMakeCell(op.map_children(self)),
             InstrCodegenOp::IncrementCounter(op) => InstrTyped::LegacyIncrementCounter(op),
             InstrCodegenOp::CellRef(op) => InstrTyped::LegacyCellRef(op),
-            InstrCodegenOp::MakeFunction(op) => {
-                InstrTyped::LegacyMakeFunction(op.map_children(self))
-            }
             InstrCodegenOp::MakeFunctionWithClosure(op) => {
                 InstrTyped::LegacyMakeFunctionWithClosure(op.map_children(self))
             }
@@ -405,9 +399,6 @@ impl TryMapInstr<InstrTyped, InstrCodegen, String> for TypedToCodegen {
             InstrTyped::LegacyMakeCell(op) => InstrCodegenOp::MakeCell(op.try_map_children(self)?),
             InstrTyped::LegacyIncrementCounter(op) => InstrCodegenOp::IncrementCounter(op),
             InstrTyped::LegacyCellRef(op) => InstrCodegenOp::CellRef(op),
-            InstrTyped::LegacyMakeFunction(op) => {
-                InstrCodegenOp::MakeFunction(op.try_map_children(self)?)
-            }
             InstrTyped::LegacyMakeFunctionWithClosure(op) => {
                 InstrCodegenOp::MakeFunctionWithClosure(op.try_map_children(self)?)
             }
@@ -602,7 +593,6 @@ pub enum InstrResolved {
     Del(#[rkyv(omit_bounds)] Del<Self>),
     MakeCell(#[rkyv(omit_bounds)] MakeCell<Self>),
     CellRef(CellRef),
-    MakeFunction(#[rkyv(omit_bounds)] MakeFunction<Self>),
     MakeFunctionWithClosure(#[rkyv(omit_bounds)] MakeFunctionWithClosure<Self>),
 }
 

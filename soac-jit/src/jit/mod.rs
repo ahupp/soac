@@ -2285,7 +2285,6 @@ fn typed_nested_guard_scan_expr(expr: &InstrTyped, saw_replay_unsafe_effect: &mu
             mark_replay_unsafe_effect(saw_replay_unsafe_effect)
         }
         InstrTyped::LegacyCellRef(_) => true,
-        InstrTyped::LegacyMakeFunction(_) => false,
         InstrTyped::LegacyMakeFunctionWithClosure(op) => {
             typed_nested_guard_scan_expr(op.captures.as_ref(), saw_replay_unsafe_effect)
                 && typed_nested_guard_scan_expr(
@@ -2446,7 +2445,6 @@ fn runtime_jit_deopt_expr_supported(
                 support.closure_cell_supported(slot)
             }
         },
-        _ => false,
     }
 }
 
@@ -7298,6 +7296,31 @@ fn emit_checked_runtime_name_object(
     )
 }
 
+fn emit_soac_ext_make_function_callable(
+    fb: &mut FunctionBuilder<'_>,
+    ctx: &JitEmitCtx<'_>,
+) -> ir::Value {
+    let ext_module = emit_owned_module_constant(
+        fb,
+        ctx.module_constants
+            .require_runtime_name_constant_id("_soac_ext"),
+        ctx,
+    );
+    let attr_name = emit_owned_module_constant(
+        fb,
+        ctx.module_constants
+            .require_unicode_constant_id("make_function"),
+        ctx,
+    );
+    emit_checked_owned_pyobject_call_with_cleanup(
+        fb,
+        ctx,
+        ctx.pyobject_getattr_ref,
+        &[ext_module, attr_name],
+        &[ext_module, attr_name],
+    )
+}
+
 fn emit_empty_dict_with_args_tuple(
     fb: &mut FunctionBuilder<'_>,
     empty_args_tuple: ir::Value,
@@ -10634,13 +10657,14 @@ fn emit_codegen_simple_call_with_local_env(
     jit_module: &mut JITModule,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Option<ir::Value> {
-    let ptr_ty = emit_ctx.consts.ptr_ty;
-    let null_ptr = fb.ins().iconst(ptr_ty, 0);
     let SimpleCallParts {
         simple_args,
         simple_keywords,
         has_unpack,
     } = simple_call_parts(call);
+
+    let ptr_ty = emit_ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
 
     if !has_unpack
         && simple_keywords.is_empty()
@@ -11497,7 +11521,7 @@ fn emit_codegen_make_function_with_closure_with_local_env(
     jit_module: &mut JITModule,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> ir::Value {
-    let callable = emit_checked_runtime_name_object(fb, "make_function", emit_ctx);
+    let callable = emit_soac_ext_make_function_callable(fb, emit_ctx);
     let function_id = emit_owned_module_constant(
         fb,
         emit_ctx
@@ -11691,9 +11715,6 @@ fn emit_codegen_expr_with_local_env(
         if let Some(value) = intrinsics::emit_operation(expr, &mut intrinsic_state) {
             return value;
         }
-    }
-    if matches!(expr, InstrCodegen::MakeFunction(_)) {
-        panic!("MakeFunction should lower to MakeFunctionWithClosure before codegen");
     }
     if let InstrCodegen::Store(op) = expr {
         if let Some(value) = emit_local_store_with_local_env(

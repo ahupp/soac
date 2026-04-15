@@ -337,9 +337,6 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
                 self.execute_make_function_with_closure_owned(make_function)
             },
             InstrCodegen::CellRef(cell_ref) => unsafe { self.execute_cell_ref_owned(cell_ref) },
-            _ => Err(format!(
-                "deopt continuation only supports simple load/binop/call/store/del expressions, got {expr:?}"
-            )),
         }
     }
 
@@ -368,7 +365,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
         &mut self,
         make_function: &soac_blockpy::block_py::MakeFunctionWithClosure<InstrCodegen>,
     ) -> Result<ObjPtr, String> {
-        let callable = unsafe { execute_runtime_name_deopt("make_function")? };
+        let callable = unsafe { execute_soac_ext_make_function_deopt()? };
         if callable.is_null() {
             return Ok(ptr::null_mut());
         }
@@ -1704,6 +1701,24 @@ unsafe fn execute_runtime_name_deopt(name: &str) -> Result<ObjPtr, String> {
     let result = unsafe { load_runtime_name_owned(name_obj) as ObjPtr };
     unsafe { ffi::Py_DECREF(name_obj) };
     Ok(result)
+}
+
+#[cold]
+unsafe fn execute_soac_ext_make_function_deopt() -> Result<ObjPtr, String> {
+    let ext_module = unsafe { ffi::PyImport_ImportModule(c"_soac_ext".as_ptr()) as ObjPtr };
+    if ext_module.is_null() {
+        return Ok(ptr::null_mut());
+    }
+    let callable = unsafe {
+        ffi::PyObject_GetAttrString(
+            ext_module.cast::<ffi::PyObject>(),
+            c"make_function".as_ptr(),
+        )
+    };
+    unsafe {
+        ffi::Py_DECREF(ext_module.cast::<ffi::PyObject>());
+    }
+    Ok(callable.cast())
 }
 
 #[cold]
