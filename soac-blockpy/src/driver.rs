@@ -357,7 +357,7 @@ fn finish_codegen_module_with_tracker(
     let prepared = if let Some(prepared) = prepared {
         pass_tracker.record_timing("prepared_codegen_cache_use", || prepared)
     } else {
-        let escape_summary = pass_tracker.record_timing("escape_summary", || {
+        let escape_summary = pass_tracker.run_pass("escape_summary", || {
             passes::summarize_module_escapes(&bb_codegen)
         });
         let value_facts: passes::FactStore = pass_tracker.record_timing("value_facts", || {
