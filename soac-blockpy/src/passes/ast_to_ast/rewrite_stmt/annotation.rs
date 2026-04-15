@@ -361,7 +361,7 @@ pub(crate) fn build_annotate_fn_with_capture_values(
         )
     );
     // Capture runtime at definition time so annotationlib fallback cloning cannot replace
-    // runtime helpers/builtins used by this thunk.
+    // runtime builtins used by this thunk.
     // Format values in Python 3.15's annotationlib are:
     // VALUE=1, VALUE_WITH_FAKE_GLOBALS=2, FORWARDREF=3, STRING=4.
     // We handle STRING and FORWARDREF directly so annotationlib does not need to clone
@@ -374,11 +374,11 @@ def {annotate_name:id}(
     __soac_type_params__={capture_tuple:expr},
 ):
     {capture_bindings:stmt}
-    if __soac__.eq(_dp_format, 4):
+    if _dp_format == 4:
         return {string_dict:expr}
-    if __soac__.eq(_dp_format, 3):
+    if _dp_format == 3:
         return {forwardref_dict:expr}
-    if __soac__.gt(_dp_format, 2):
+    if _dp_format > 2:
         raise __soac__.builtins.NotImplementedError
     return {value_dict:expr}
 "#,
