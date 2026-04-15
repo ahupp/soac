@@ -1610,6 +1610,35 @@ OBJ.close()
     }
 
     #[test]
+    fn blockpy_entry_interpreter_vectorcall_preserves_async_generator_call_semantics() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        let _entry_vectorcall = ForceEntryInterpreterVectorcallGuard::new();
+        Python::attach(|py| unsafe {
+            let globals = run_registered_module_init_entry_for_test(
+                py,
+                r#"
+async def agen():
+    yield 42
+
+OBJ = agen()
+RESULT = hasattr(OBJ, "__anext__")
+"#,
+            );
+            let stored_result = globals
+                .get_item("RESULT")
+                .expect("RESULT lookup should succeed")
+                .expect("module init should store RESULT");
+            assert!(
+                stored_result
+                    .extract::<bool>()
+                    .expect("RESULT should be bool"),
+                "forced entry dispatch should leave async-generator calls as async-generator object creation"
+            );
+        });
+    }
+
+    #[test]
     fn blockpy_entry_interpreter_executes_module_init_globals() {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
