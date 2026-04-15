@@ -323,7 +323,12 @@ pub fn compute_function_local_live_ins(
             )
         })
         .collect::<HashMap<_, _>>();
-    compute_local_liveness(function, &location_by_name).live_in_by_block
+    let labels = function
+        .blocks
+        .iter()
+        .map(|block| block.label)
+        .collect::<Vec<_>>();
+    compute_local_liveness(function, &location_by_name).into_hash_map(&labels)
 }
 
 pub fn compute_function_local_must_bound_ins(
@@ -343,7 +348,12 @@ pub fn compute_function_local_must_bound_ins(
             )
         })
         .collect::<HashMap<_, _>>();
-    compute_local_must_bound(function, &location_by_name).must_bound_in_by_block
+    let labels = function
+        .blocks
+        .iter()
+        .map(|block| block.label)
+        .collect::<Vec<_>>();
+    compute_local_must_bound(function, &location_by_name).into_hash_map(&labels)
 }
 
 fn plan_block_refcounts(
@@ -358,7 +368,7 @@ fn plan_block_refcounts(
     local_must_bound: &LocalMustBound,
     is_entry_block: bool,
 ) -> BlockRefcountPlan {
-    let empty_must_bound = HashSet::new();
+    let empty_must_bound = LocalBitSet::empty(locals.len());
     let must_bound_on_entry = local_must_bound
         .live_in(block.label)
         .unwrap_or(&empty_must_bound);
@@ -582,7 +592,7 @@ fn validate_block_refcount_plan(
             .push(action.kind.clone());
     }
 
-    let empty_must_bound = HashSet::new();
+    let empty_must_bound = LocalBitSet::empty(locals.len());
     let must_bound_on_entry = local_must_bound
         .live_in(block.label)
         .unwrap_or(&empty_must_bound);
@@ -853,7 +863,7 @@ fn initial_block_env(
     facts: &FactStore,
     locals: &HashMap<LocalLocation, RefcountLocal>,
     location_by_name: &HashMap<String, LocalLocation>,
-    must_bound_on_entry: &HashSet<LocalLocation>,
+    must_bound_on_entry: &LocalBitSet,
     is_entry_block: bool,
 ) -> HashMap<LocalLocation, LocalRefState> {
     let mut env = locals
@@ -876,13 +886,13 @@ fn initial_block_env(
         }
     }
 
-    for location in must_bound_on_entry {
-        env.insert(*location, LocalRefState::Owned);
+    for location in must_bound_on_entry.locations() {
+        env.insert(location, LocalRefState::Owned);
     }
 
     if let Some(entry_facts) = facts.block_entry_fact(function.function_id, block.label) {
         for (location, py_facts) in entry_facts.local_pyobj_facts() {
-            if must_bound_on_entry.contains(&location) {
+            if must_bound_on_entry.contains(location) {
                 env.insert(location, state_for_py_facts(py_facts));
             }
         }
@@ -912,23 +922,47 @@ fn state_for_py_facts(facts: PyObjFacts) -> LocalRefState {
 
 #[derive(Clone, Debug, Default)]
 struct LocalLiveness {
-    live_in_by_block: HashMap<BlockLabel, HashSet<LocalLocation>>,
+    live_in_by_block: Vec<LocalBitSet>,
 }
 
 impl LocalLiveness {
-    fn live_in(&self, label: BlockLabel) -> Option<&HashSet<LocalLocation>> {
-        self.live_in_by_block.get(&label)
+    fn live_in(&self, label: BlockLabel) -> Option<&LocalBitSet> {
+        self.live_in_by_block.get(label.index())
+    }
+
+    fn into_hash_map(self, labels: &[BlockLabel]) -> HashMap<BlockLabel, HashSet<LocalLocation>> {
+        labels
+            .iter()
+            .copied()
+            .filter_map(|label| {
+                self.live_in_by_block
+                    .get(label.index())
+                    .map(|live_in| (label, live_in.to_hash_set()))
+            })
+            .collect()
     }
 }
 
 #[derive(Clone, Debug, Default)]
 struct LocalMustBound {
-    must_bound_in_by_block: HashMap<BlockLabel, HashSet<LocalLocation>>,
+    must_bound_in_by_block: Vec<LocalBitSet>,
 }
 
 impl LocalMustBound {
-    fn live_in(&self, label: BlockLabel) -> Option<&HashSet<LocalLocation>> {
-        self.must_bound_in_by_block.get(&label)
+    fn live_in(&self, label: BlockLabel) -> Option<&LocalBitSet> {
+        self.must_bound_in_by_block.get(label.index())
+    }
+
+    fn into_hash_map(self, labels: &[BlockLabel]) -> HashMap<BlockLabel, HashSet<LocalLocation>> {
+        labels
+            .iter()
+            .copied()
+            .filter_map(|label| {
+                self.must_bound_in_by_block
+                    .get(label.index())
+                    .map(|must_bound| (label, must_bound.to_hash_set()))
+            })
+            .collect()
     }
 }
 
@@ -938,11 +972,116 @@ struct BlockLocalEffects {
     defs: HashSet<LocalLocation>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LocalBitSet {
+    words: Vec<u64>,
+    local_count: usize,
+}
+
+impl LocalBitSet {
+    fn empty(local_count: usize) -> Self {
+        Self {
+            words: vec![0; local_count.div_ceil(u64::BITS as usize)],
+            local_count,
+        }
+    }
+
+    fn full(local_count: usize) -> Self {
+        let mut bitset = Self {
+            words: vec![u64::MAX; local_count.div_ceil(u64::BITS as usize)],
+            local_count,
+        };
+        bitset.clear_unused_bits();
+        bitset
+    }
+
+    fn from_locations(
+        local_count: usize,
+        locations: impl IntoIterator<Item = LocalLocation>,
+    ) -> Self {
+        let mut bitset = Self::empty(local_count);
+        for location in locations {
+            bitset.insert(location);
+        }
+        bitset
+    }
+
+    fn contains(&self, location: LocalLocation) -> bool {
+        self.index(location)
+            .is_some_and(|(word_index, mask)| self.words[word_index] & mask != 0)
+    }
+
+    fn insert(&mut self, location: LocalLocation) {
+        if let Some((word_index, mask)) = self.index(location) {
+            self.words[word_index] |= mask;
+        }
+    }
+
+    fn remove(&mut self, location: LocalLocation) {
+        if let Some((word_index, mask)) = self.index(location) {
+            self.words[word_index] &= !mask;
+        }
+    }
+
+    fn union_with(&mut self, other: &Self) {
+        debug_assert_eq!(self.local_count, other.local_count);
+        for (left, right) in self.words.iter_mut().zip(&other.words) {
+            *left |= *right;
+        }
+    }
+
+    fn intersect_with(&mut self, other: &Self) {
+        debug_assert_eq!(self.local_count, other.local_count);
+        for (left, right) in self.words.iter_mut().zip(&other.words) {
+            *left &= *right;
+        }
+    }
+
+    fn difference_with(&mut self, other: &Self) {
+        debug_assert_eq!(self.local_count, other.local_count);
+        for (left, right) in self.words.iter_mut().zip(&other.words) {
+            *left &= !*right;
+        }
+    }
+
+    fn to_hash_set(&self) -> HashSet<LocalLocation> {
+        self.locations().collect()
+    }
+
+    fn locations(&self) -> impl Iterator<Item = LocalLocation> + '_ {
+        (0..self.local_count).filter_map(|slot| {
+            let location = LocalLocation(u32::try_from(slot).ok()?);
+            self.contains(location).then_some(location)
+        })
+    }
+
+    fn index(&self, location: LocalLocation) -> Option<(usize, u64)> {
+        let index = usize::try_from(location.0).ok()?;
+        if index >= self.local_count {
+            return None;
+        }
+        let word_index = index / u64::BITS as usize;
+        let bit_index = index % u64::BITS as usize;
+        Some((word_index, 1_u64 << bit_index))
+    }
+
+    fn clear_unused_bits(&mut self) {
+        let used_bits = self.local_count % u64::BITS as usize;
+        if used_bits == 0 {
+            return;
+        }
+        if let Some(last) = self.words.last_mut() {
+            *last &= (1_u64 << used_bits) - 1;
+        }
+    }
+}
+
 fn compute_local_liveness(
     function: &BlockPyFunction<CodegenModuleShape>,
     location_by_name: &HashMap<String, LocalLocation>,
 ) -> LocalLiveness {
     let owned_cell_locations = owned_cell_locations(function, location_by_name);
+    let local_count = location_by_name.len();
     let effects_by_block = function
         .blocks
         .iter()
@@ -956,13 +1095,9 @@ fn compute_local_liveness(
     let successors_by_block = function
         .blocks
         .iter()
-        .map(|block| (block.label, block_successors(block)))
-        .collect::<HashMap<_, _>>();
-    let mut live_in_by_block = function
-        .blocks
-        .iter()
-        .map(|block| (block.label, HashSet::new()))
-        .collect::<HashMap<_, _>>();
+        .map(block_successors)
+        .collect::<Vec<_>>();
+    let mut live_in_by_block = vec![LocalBitSet::empty(local_count); function.blocks.len()];
 
     let mut changed = true;
     while changed {
@@ -971,25 +1106,19 @@ fn compute_local_liveness(
             let effects = effects_by_block
                 .get(&block.label)
                 .expect("liveness effects should exist for every block");
-            let mut live_out = HashSet::new();
-            for successor in successors_by_block
-                .get(&block.label)
-                .expect("successors should exist for every block")
-            {
-                if let Some(successor_live_in) = live_in_by_block.get(successor) {
-                    live_out.extend(successor_live_in.iter().copied());
+            let mut live_out = LocalBitSet::empty(local_count);
+            for successor in &successors_by_block[block.label.index()] {
+                if let Some(successor_live_in) = live_in_by_block.get(successor.index()) {
+                    live_out.union_with(successor_live_in);
                 }
             }
 
-            let mut new_live_in = effects.uses.clone();
-            new_live_in.extend(
-                live_out
-                    .into_iter()
-                    .filter(|location| !effects.defs.contains(location)),
-            );
-            let entry = live_in_by_block
-                .get_mut(&block.label)
-                .expect("live-in should exist for every block");
+            let mut new_live_in =
+                LocalBitSet::from_locations(local_count, effects.uses.iter().copied());
+            let defs = LocalBitSet::from_locations(local_count, effects.defs.iter().copied());
+            live_out.difference_with(&defs);
+            new_live_in.union_with(&live_out);
+            let entry = &mut live_in_by_block[block.label.index()];
             if *entry != new_live_in {
                 *entry = new_live_in;
                 changed = true;
@@ -1005,6 +1134,7 @@ fn compute_local_must_bound(
     location_by_name: &HashMap<String, LocalLocation>,
 ) -> LocalMustBound {
     let owned_cell_locations = owned_cell_locations(function, location_by_name);
+    let local_count = location_by_name.len();
     let labels = function
         .blocks
         .iter()
@@ -1013,59 +1143,49 @@ fn compute_local_must_bound(
     let successors_by_block = function
         .blocks
         .iter()
-        .map(|block| (block.label, block_successors(block)))
-        .collect::<HashMap<_, _>>();
-    let mut predecessors_by_block = labels
-        .iter()
-        .copied()
-        .map(|label| (label, Vec::new()))
-        .collect::<HashMap<_, Vec<BlockLabel>>>();
-    for (source, successors) in &successors_by_block {
+        .map(block_successors)
+        .collect::<Vec<_>>();
+    let mut predecessors_by_block = vec![Vec::new(); function.blocks.len()];
+    for (source_index, successors) in successors_by_block.iter().enumerate() {
+        let source = labels[source_index];
         for successor in successors {
-            predecessors_by_block
-                .entry(*successor)
-                .or_default()
-                .push(*source);
+            predecessors_by_block[successor.index()].push(source);
         }
     }
 
-    let all_locations = location_by_name.values().copied().collect::<HashSet<_>>();
     let entry_label = function.entry_block().label;
-    let entry_bound = function
-        .params
-        .iter()
-        .filter_map(|param| location_by_name.get(&param.name).copied())
-        .collect::<HashSet<_>>();
+    let entry_bound = LocalBitSet::from_locations(
+        local_count,
+        function
+            .params
+            .iter()
+            .filter_map(|param| location_by_name.get(&param.name).copied()),
+    );
 
     let mut must_bound_in_by_block = labels
         .iter()
         .copied()
         .map(|label| {
             if label == entry_label {
-                (label, entry_bound.clone())
+                entry_bound.clone()
             } else {
-                (label, all_locations.clone())
+                LocalBitSet::full(local_count)
             }
         })
-        .collect::<HashMap<_, _>>();
+        .collect::<Vec<_>>();
     let mut must_bound_out_by_block = labels
         .iter()
         .copied()
         .map(|label| {
-            let initial_in = must_bound_in_by_block
-                .get(&label)
-                .expect("must-bound-in should exist for every block");
-            (
-                label,
-                transfer_must_bound_through_block(
-                    function,
-                    &function.blocks[label.index()],
-                    initial_in,
-                    &owned_cell_locations,
-                ),
+            let initial_in = &must_bound_in_by_block[label.index()];
+            transfer_must_bound_through_block(
+                function,
+                &function.blocks[label.index()],
+                initial_in,
+                &owned_cell_locations,
             )
         })
-        .collect::<HashMap<_, _>>();
+        .collect::<Vec<_>>();
 
     let mut changed = true;
     while changed {
@@ -1074,37 +1194,26 @@ fn compute_local_must_bound(
             let new_in = if block.label == entry_label {
                 entry_bound.clone()
             } else {
-                let predecessors = predecessors_by_block
-                    .get(&block.label)
-                    .expect("predecessors should exist for every block");
+                let predecessors = &predecessors_by_block[block.label.index()];
                 if predecessors.is_empty() {
-                    HashSet::new()
+                    LocalBitSet::empty(local_count)
                 } else {
-                    let mut intersection = must_bound_out_by_block
-                        .get(&predecessors[0])
-                        .cloned()
-                        .unwrap_or_default();
+                    let mut intersection = must_bound_out_by_block[predecessors[0].index()].clone();
                     for predecessor in &predecessors[1..] {
-                        let predecessor_out = must_bound_out_by_block
-                            .get(predecessor)
-                            .expect("must-bound-out should exist for every predecessor");
-                        intersection.retain(|location| predecessor_out.contains(location));
+                        let predecessor_out = &must_bound_out_by_block[predecessor.index()];
+                        intersection.intersect_with(predecessor_out);
                     }
                     intersection
                 }
             };
             let new_out =
                 transfer_must_bound_through_block(function, block, &new_in, &owned_cell_locations);
-            let in_entry = must_bound_in_by_block
-                .get_mut(&block.label)
-                .expect("must-bound-in should exist for every block");
+            let in_entry = &mut must_bound_in_by_block[block.label.index()];
             if *in_entry != new_in {
                 *in_entry = new_in;
                 changed = true;
             }
-            let out_entry = must_bound_out_by_block
-                .get_mut(&block.label)
-                .expect("must-bound-out should exist for every block");
+            let out_entry = &mut must_bound_out_by_block[block.label.index()];
             if *out_entry != new_out {
                 *out_entry = new_out;
                 changed = true;
@@ -1120,14 +1229,13 @@ fn compute_local_must_bound(
 fn transfer_must_bound_through_block(
     function: &BlockPyFunction<CodegenModuleShape>,
     block: &Block<InstrCodegen>,
-    must_bound_in: &HashSet<LocalLocation>,
+    must_bound_in: &LocalBitSet,
     owned_cell_locations: &HashMap<u32, LocalLocation>,
-) -> HashSet<LocalLocation> {
+) -> LocalBitSet {
     let mut must_bound = must_bound_in.clone();
     let Some(storage_layout) = function.storage_layout().as_ref() else {
         return must_bound;
     };
-    let local_count = storage_layout.stack_slots().len();
     for name in block.param_names() {
         if let Some(index) = storage_layout
             .stack_slots()
@@ -1148,14 +1256,12 @@ fn transfer_must_bound_through_block(
             }
             InstrCodegen::Del(op) => {
                 if let Some(location) = op.name.local_location() {
-                    must_bound.remove(&location);
+                    must_bound.remove(location);
                 }
             }
             _ => {}
         }
     }
-    must_bound
-        .retain(|location| usize::try_from(location.0).is_ok_and(|index| index < local_count));
     must_bound
 }
 
@@ -1449,7 +1555,7 @@ fn preserved_locations(
 ) -> HashSet<LocalLocation> {
     let mut preserved = forwarded_locations(target, explicit_args, target_params, location_by_name);
     if let Some(live_in) = local_liveness.live_in(target) {
-        preserved.extend(live_in.iter().copied());
+        preserved.extend(live_in.locations());
     }
     preserved
 }
