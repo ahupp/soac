@@ -37,7 +37,7 @@ fn direct_core_expr_lowering_materializes_make_function_operation() {
     let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new(&name_gen);
     let lowered = lower_expr_into_with_setup(
         crate::passes::ast_to_instr::from_ast_expr(py_expr!(
-            "__soac__.make_function(7, \"function\", __soac__.tuple_values(), __soac__.tuple_values(), None)"
+            "__soac__.make_function(7, \"function\", (), (), None)"
         )),
         &mut out,
         None,

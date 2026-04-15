@@ -184,7 +184,6 @@ Top-level functions defined by `soac.runtime`:
 
 ```text
 _unsupported_frame_builtin
-tuple_values
 tuple_from_iter
 eval_string_literal
 __deepcopy__

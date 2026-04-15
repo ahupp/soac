@@ -161,7 +161,7 @@ fn build_lowered_function_instantiation_expr(
         "__soac__.make_function({function_id:literal}, {kind:literal}, {closure:expr}, {param_defaults:expr}, {annotate_fn:expr})",
         function_id = function_id.packed(),
         kind = kind_name,
-        closure = py_expr!("__soac__.tuple_values()"),
+        closure = py_expr!("()"),
         param_defaults = param_defaults_expr.clone(),
         annotate_fn = annotate_fn_expr.clone(),
     );

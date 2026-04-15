@@ -67,7 +67,6 @@ pub enum ProvenanceFact {
 pub enum RuntimeHelperId {
     Globals,
     Str,
-    TupleValues,
     LoadDeletedName,
     RaiseDeletedName,
     CellRef,
@@ -102,7 +101,6 @@ impl RuntimeHelperId {
         match name.as_bytes() {
             b"globals" => Some(Self::Globals),
             b"str" => Some(Self::Str),
-            b"tuple_values" => Some(Self::TupleValues),
             b"load_deleted_name" => Some(Self::LoadDeletedName),
             b"raise_deleted_name" => Some(Self::RaiseDeletedName),
             b"cell_ref" => Some(Self::CellRef),
@@ -377,7 +375,6 @@ const fn runtime_helper_result(helper: RuntimeHelperId) -> ValueFacts {
     match helper {
         RuntimeHelperId::Str => ValueFacts::PyObj(PyObjFacts::exact_type(PyExactType::Str)),
         RuntimeHelperId::Globals
-        | RuntimeHelperId::TupleValues
         | RuntimeHelperId::LoadDeletedName
         | RuntimeHelperId::RaiseDeletedName
         | RuntimeHelperId::CellRef
@@ -394,9 +391,7 @@ const fn runtime_helper_result(helper: RuntimeHelperId) -> ValueFacts {
 
 const fn runtime_helper_throw_spec(helper: RuntimeHelperId) -> ThrowSpec {
     match helper {
-        RuntimeHelperId::Globals | RuntimeHelperId::TupleValues | RuntimeHelperId::CellRef => {
-            ThrowSpec::Never
-        }
+        RuntimeHelperId::Globals | RuntimeHelperId::CellRef => ThrowSpec::Never,
         RuntimeHelperId::Str
         | RuntimeHelperId::LoadDeletedName
         | RuntimeHelperId::RaiseDeletedName
@@ -1024,12 +1019,12 @@ def f(x, flag):
 
     #[test]
     fn runtime_helper_facts_mark_helpers_as_callable_py_objects() {
-        let py_facts = PyObjFacts::runtime_helper(RuntimeHelperId::TupleValues);
+        let py_facts = PyObjFacts::runtime_helper(RuntimeHelperId::Globals);
         assert!(py_facts.is_known_not_none());
         assert_eq!(py_facts.is_truthy(), Some(true));
         assert_eq!(
             py_facts.callable,
-            CallableFact::RuntimeHelper(RuntimeHelperId::TupleValues)
+            CallableFact::RuntimeHelper(RuntimeHelperId::Globals)
         );
     }
 

@@ -372,13 +372,6 @@ fn non_operator_operation_from_helper_call(
     range: ruff_text_size::TextRange,
     args: Vec<InstrWithAwaitAndYield>,
 ) -> Option<InstrWithAwaitAndYield> {
-    if name == "tuple_values" {
-        return Some(
-            operation::Tuple::new(args)
-                .with_meta(Meta::new(node_index, range))
-                .into(),
-        );
-    }
     let mut args = args.into_iter();
     let meta = Meta::new(node_index, range);
     let operation = match name {

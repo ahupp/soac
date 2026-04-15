@@ -97,11 +97,6 @@ eval = _unsupported_frame_builtin
 vars(_sys.modules[__name__])["exec"] = _unsupported_frame_builtin
 
 
-def tuple_values(*values):
-    # Strict variadic tuple construction for transformed code.
-    return _builtins.tuple(values)
-
-
 def tuple_from_iter(value):
     return _builtins.tuple(value)
 
