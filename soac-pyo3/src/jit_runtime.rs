@@ -46,7 +46,7 @@ fn install_soac_runtime_bootstrap_globals(
         globals.set_item(name, &helper)?;
         helpers.push((name, helper.unbind()));
     }
-    for name in ["locals", "eval", "exec", "import_", "import_attr"] {
+    for name in ["import_", "import_attr"] {
         let helper = bootstrap.getattr(name)?;
         globals.set_item(name, &helper)?;
         helpers.push((name, helper.unbind()));

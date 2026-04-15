@@ -13,15 +13,7 @@ unsafe extern "C" {
     fn PyUnstable_IsImmortal(op: *mut ffi::PyObject) -> c_int;
 }
 
-const SOAC_RUNTIME_BOOTSTRAP_HELPER_NAMES: &[&str] = &[
-    "_soac_ext",
-    "globals",
-    "locals",
-    "eval",
-    "exec",
-    "import_",
-    "import_attr",
-];
+const SOAC_RUNTIME_BOOTSTRAP_HELPER_NAMES: &[&str] = &["_soac_ext", "import_", "import_attr"];
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum RuntimeNameConstantMode {
@@ -666,15 +658,6 @@ def raise_deleted_name(name):
     )
 
 _MISSING = object()
-
-def _unsupported_frame_builtin(*args, **kwargs):
-    raise NotImplementedError('soac.runtime does not support frame-sensitive globals/locals/eval/exec')
-
-globals = _unsupported_frame_builtin
-locals = _unsupported_frame_builtin
-eval = _unsupported_frame_builtin
-# `exec` is a keyword, so expose soac.runtime.exec through the module dict.
-vars(_sys.modules[__name__])['exec'] = _unsupported_frame_builtin
 
 def import_(name, spec, fromlist=None, level=0):
     if fromlist is None:
