@@ -825,7 +825,7 @@ def create_class(
 
 
 def exc_info():
-    exc = current_exception()
+    exc = _sys.exception()
     return exc_info_from_exception(exc)
 
 
@@ -833,10 +833,6 @@ def exc_info_from_exception(exc):
     if exc is None:
         return None
     return (type(exc), exc, exc.__traceback__)
-
-def current_exception():
-    return _sys.exception()
-
 
 class _AwaitIterWrapper:
     __slots__ = ("_it",)

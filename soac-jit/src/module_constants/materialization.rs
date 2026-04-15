@@ -24,7 +24,6 @@ const SOAC_RUNTIME_BOOTSTRAP_HELPER_NAMES: &[&str] = &[
     "import_attr",
     "class_lookup_global",
     "class_lookup_cell",
-    "current_exception",
     "exception_matches",
     "exceptiongroup_split",
 ];
@@ -880,9 +879,6 @@ def _validate_exception_type(exc_type):
     raise _builtins.TypeError(
         'catching classes that do not inherit from BaseException is not allowed'
     )
-
-def current_exception():
-    return _sys.exception()
 
 def exception_matches(exc, exc_type):
     if _builtins.isinstance(exc, _builtins.RecursionError):

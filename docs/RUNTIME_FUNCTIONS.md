@@ -13,6 +13,9 @@ Scope:
   `register_specialized_jit_symbols`.
 - `soac.runtime`: top-level Python callables, runtime classes, methods, and
   intentionally re-exported helper callables in `soac_py/src/soac/runtime.py`.
+- Synthetic inter-pass markers: helper-shaped names emitted by one compiler pass
+  and recognized by a later pass. These names are not executable runtime APIs and
+  must not survive to codegen or Python execution.
 
 This list does not include plain runtime constants such as `TRUE`, `FALSE`,
 `NONE`, `EMPTY_TUPLE`, or type/data symbols such as `PyFunction_Type`.
@@ -160,6 +163,21 @@ dp_jit_vectorcall_bind_direct_args
 dp_jit_vectorcall_compile_function_env
 ```
 
+## Synthetic Inter-Pass Markers
+
+These helper-shaped names are compiler-internal markers. They may appear in
+intermediate AST or BlockPy during lowering, but a later pass must replace them
+with structured IR or dataflow before runtime execution.
+
+```text
+current_exception
+```
+
+- `current_exception()` is emitted by exception/with statement lowering to mean
+  "the active exception object for this exception edge". Name binding rewrites it
+  to the block's explicit exception parameter before codegen. It is not
+  `soac.runtime.current_exception` and should not be exposed as a Python helper.
+
 ## soac.runtime
 
 Top-level functions defined by `soac.runtime`:
@@ -203,7 +221,6 @@ annotation_forwardref_value
 create_class
 exc_info
 exc_info_from_exception
-current_exception
 _get_awaitable_iter
 await_iter
 anext_or_sentinel
