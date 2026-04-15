@@ -64,7 +64,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use tracing::info;
 
 unsafe extern "C" {
@@ -1226,12 +1226,16 @@ impl ProcessJitBatchFunctionSource<'_> {
 }
 
 pub(crate) struct ProcessJitEngine {
+    module: ProcessJitModule,
     state: Mutex<ProcessJitState>,
     vectorcall_trampolines: Mutex<HashMap<usize, VectorcallEntryFn>>,
 }
 
+struct ProcessJitModule {
+    jit_module: Mutex<JITModule>,
+}
+
 struct ProcessJitState {
-    jit_module: JITModule,
     direct_functions: HashMap<FunctionId, ProcessJitFunctionEntry>,
     module_constant_objects: HashMap<usize, ModuleConstantObjectBinding>,
     scalar_counter_storage: HashMap<usize, ScalarCounterStorageBinding>,
@@ -1310,20 +1314,34 @@ impl ProcessJitFunctionEntry {
     }
 }
 
-impl ProcessJitState {
+impl ProcessJitModule {
     fn new(compile_session: &crate::session::CompileSession) -> Result<Self, String> {
         Ok(Self {
-            jit_module: new_jit_module(compile_session)?,
+            jit_module: Mutex::new(new_jit_module(compile_session)?),
+        })
+    }
+
+    fn lock_for_serial_phase(&self) -> Result<MutexGuard<'_, JITModule>, String> {
+        self.jit_module
+            .lock()
+            .map_err(|_| "process JIT module lock poisoned".to_string())
+    }
+}
+
+impl ProcessJitState {
+    fn new() -> Self {
+        Self {
             direct_functions: HashMap::new(),
             module_constant_objects: HashMap::new(),
             scalar_counter_storage: HashMap::new(),
             top_value_counter_storage: HashMap::new(),
             next_direct_symbol_id: 0,
-        })
+        }
     }
 
     fn ensure_module_constant_objects(
         &mut self,
+        jit_module: &mut JITModule,
         module_constant_ptrs: &[*mut ffi::PyObject],
         binding_key: usize,
         symbol_prefix: &str,
@@ -1340,7 +1358,7 @@ impl ProcessJitState {
             return Ok(binding.data_ids.clone());
         }
         let data_ids = declare_module_constant_object_data_for_prefix(
-            &mut self.jit_module,
+            jit_module,
             symbol_prefix,
             module_constant_ptrs,
         )?;
@@ -1355,6 +1373,7 @@ impl ProcessJitState {
 
     fn ensure_local_scalar_counter_storage(
         &mut self,
+        jit_module: &mut JITModule,
         module: &BlockPyModule<CodegenModuleShape>,
         scalar_counter_count: usize,
         instance_key: usize,
@@ -1373,7 +1392,7 @@ impl ProcessJitState {
         }
         let symbol = scalar_counter_storage_symbol_for_instance(module, instance_key);
         let data_id = define_scalar_counter_storage_data_for_symbol(
-            &mut self.jit_module,
+            jit_module,
             symbol.as_str(),
             scalar_counter_count,
         )?;
@@ -1389,6 +1408,7 @@ impl ProcessJitState {
 
     fn ensure_local_top_value_counter_storage(
         &mut self,
+        jit_module: &mut JITModule,
         module: &BlockPyModule<CodegenModuleShape>,
         top_value_counter_count: usize,
         instance_key: usize,
@@ -1407,7 +1427,7 @@ impl ProcessJitState {
         }
         let symbol = top_value_counter_storage_symbol_for_instance(module, instance_key);
         let data_id = define_top_value_counter_storage_data_for_symbol(
-            &mut self.jit_module,
+            jit_module,
             symbol.as_str(),
             top_value_counter_count,
         )?;
@@ -1423,6 +1443,7 @@ impl ProcessJitState {
 
     fn declare_direct_function(
         &mut self,
+        jit_module: &mut JITModule,
         function: &BlockPyFunction<CodegenModuleShape>,
         symbol_scope: Option<&str>,
     ) -> Result<DeclaredJitFunction, String> {
@@ -1441,8 +1462,7 @@ impl ProcessJitState {
             self.next_direct_symbol_id = self.next_direct_symbol_id.wrapping_add(1);
             owned_symbol_scope.as_str()
         };
-        let (_sig, declared) =
-            declare_direct_function(&mut self.jit_module, function, Some(symbol_scope))?;
+        let (_sig, declared) = declare_direct_function(jit_module, function, Some(symbol_scope))?;
         self.direct_functions.insert(
             function.function_id,
             ProcessJitFunctionEntry::Declared {
@@ -1508,6 +1528,7 @@ impl ProcessJitState {
 impl ProcessJitState {
     fn reserve_direct_function_batch<'a>(
         &mut self,
+        jit_module: &mut JITModule,
         root_function: &BlockPyFunction<CodegenModuleShape>,
         batch_functions: Vec<ProcessJitBatchFunction<'a>>,
     ) -> Result<ReservedDirectFunctionBatch<'a>, String> {
@@ -1523,7 +1544,7 @@ impl ProcessJitState {
                 direct_function_symbol_scope_for_shared_state(shared_state, function.function_id)
             });
             let declared =
-                self.declare_direct_function(function, direct_symbol_scope.as_deref())?;
+                self.declare_direct_function(jit_module, function, direct_symbol_scope.as_deref())?;
             if !self.is_direct_function_ready(function.function_id) {
                 function_indices_to_define.push(index);
             }
@@ -1540,6 +1561,7 @@ impl ProcessJitState {
 
     fn compile_reserved_direct_function_batch<'a>(
         &mut self,
+        jit_module: &mut JITModule,
         inputs: &DirectFunctionCompileInputs<'a>,
         plan: &JitBatchPlan<'a>,
     ) -> Result<Vec<CompiledJitFunction>, String> {
@@ -1591,7 +1613,7 @@ impl ProcessJitState {
                         scalar_counter_base_ptr.cast::<u8>(),
                     );
                     Some(declare_scalar_counter_storage_import(
-                        &mut self.jit_module,
+                        jit_module,
                         scalar_counter_symbol.as_str(),
                     )?)
                 };
@@ -1606,7 +1628,7 @@ impl ProcessJitState {
                         top_value_counter_base_ptr.cast::<u8>(),
                     );
                     Some(declare_top_value_counter_storage_import(
-                        &mut self.jit_module,
+                        jit_module,
                         top_value_counter_symbol.as_str(),
                     )?)
                 };
@@ -1632,11 +1654,13 @@ impl ProcessJitState {
                 let instance_key =
                     inputs.module as *const BlockPyModule<CodegenModuleShape> as usize;
                 let scalar_counter_data_id = self.ensure_local_scalar_counter_storage(
+                    jit_module,
                     inputs.module,
                     scalar_counter_count,
                     instance_key,
                 )?;
                 let top_value_counter_data_id = self.ensure_local_top_value_counter_storage(
+                    jit_module,
                     inputs.module,
                     top_value_count,
                     instance_key,
@@ -1657,6 +1681,7 @@ impl ProcessJitState {
                 )
             };
             let function_module_constant_object_data_ids = self.ensure_module_constant_objects(
+                jit_module,
                 function_module_constant_ptrs,
                 function_module_constant_binding_key,
                 function_module_constant_symbol_prefix.as_str(),
@@ -1704,7 +1729,7 @@ impl ProcessJitState {
                 function_module_constant_ptrs,
             )?);
             let built = build_cranelift_run_bb_specialized_function(
-                &mut self.jit_module,
+                jit_module,
                 function_blocks,
                 function_module,
                 function,
@@ -1740,7 +1765,7 @@ impl ProcessJitState {
             let function_name =
                 direct_function_backend_name(function, batch_function.source.shared_state());
             let compiled = compile_prepared_function_bytes(
-                &mut self.jit_module,
+                jit_module,
                 main_id,
                 &mut ctx,
                 function_name.as_str(),
@@ -1752,14 +1777,14 @@ impl ProcessJitState {
                     function.names.qualname, function.function_id
                 )
             })?;
-            self.jit_module.clear_context(&mut ctx);
+            jit_module.clear_context(&mut ctx);
             let default_adapter_compiled = match (
                 default_adapter_id,
                 default_adapter_symbol.as_ref(),
             ) {
                 (Some(default_adapter_id), Some(default_adapter_symbol)) => {
                     let mut default_ctx = build_default_resolving_direct_adapter(
-                        &mut self.jit_module,
+                        jit_module,
                         function,
                         main_id,
                         default_adapter_id,
@@ -1771,7 +1796,7 @@ impl ProcessJitState {
                         )
                     })?;
                     let compiled = compile_prepared_function_bytes(
-                        &mut self.jit_module,
+                        jit_module,
                         default_adapter_id,
                         &mut default_ctx,
                         default_adapter_symbol.as_str(),
@@ -1783,7 +1808,7 @@ impl ProcessJitState {
                             function.names.qualname, function.function_id
                         )
                     })?;
-                    self.jit_module.clear_context(&mut default_ctx);
+                    jit_module.clear_context(&mut default_ctx);
                     Some(compiled)
                 }
                 (None, None) => None,
@@ -1819,13 +1844,14 @@ impl ProcessJitState {
 
     fn commit_compiled_direct_function_batch(
         &mut self,
+        jit_module: &mut JITModule,
         session: &Arc<crate::session::CompileSession>,
         root_function: &BlockPyFunction<CodegenModuleShape>,
         compiled_functions: Vec<CompiledJitFunction>,
     ) -> Result<DirectFunctionCompileResult, String> {
         for defined in &compiled_functions {
             define_compiled_function_bytes(
-                &mut self.jit_module,
+                jit_module,
                 defined.main_id,
                 &defined.compiled,
                 "failed to define specialized jit run_bb function",
@@ -1844,7 +1870,7 @@ impl ProcessJitState {
                     ));
                 };
                 define_compiled_function_bytes(
-                    &mut self.jit_module,
+                    jit_module,
                     default_adapter_id,
                     default_adapter_compiled,
                     "failed to define default-resolving direct adapter",
@@ -1857,18 +1883,16 @@ impl ProcessJitState {
                 })?;
             }
         }
-        self.jit_module
+        jit_module
             .finalize_definitions()
             .map_err(|err| format!("failed to finalize specialized jit run_bb function: {err}"))?;
         let mut root_handle = None;
         let mut root_stats = None;
         for defined in compiled_functions {
-            let code_ptr = self.jit_module.get_finalized_function(defined.main_id);
+            let code_ptr = jit_module.get_finalized_function(defined.main_id);
             let default_code_ptr = defined
                 .default_adapter_id
-                .map(|default_adapter_id| {
-                    self.jit_module.get_finalized_function(default_adapter_id)
-                })
+                .map(|default_adapter_id| jit_module.get_finalized_function(default_adapter_id))
                 .unwrap_or(code_ptr);
             let compiled_handle = self.mark_direct_function_ready(
                 session,
@@ -1882,7 +1906,7 @@ impl ProcessJitState {
                 &defined.main_symbol,
                 code_ptr.cast::<u8>(),
                 defined.compiled.artifact.code_size,
-                self.jit_module.isa(),
+                jit_module.isa(),
                 defined.compiled.artifact.systemv_unwind_info.as_ref(),
             )?;
             record_jit_bb_map(
@@ -1902,12 +1926,12 @@ impl ProcessJitState {
                 defined.default_adapter_symbol.as_ref(),
                 defined.default_adapter_compiled.as_ref(),
             ) {
-                let default_code_ptr = self.jit_module.get_finalized_function(default_adapter_id);
+                let default_code_ptr = jit_module.get_finalized_function(default_adapter_id);
                 let code_id = jitdump::record_code_load(
                     default_adapter_symbol,
                     default_code_ptr.cast::<u8>(),
                     default_adapter_compiled.artifact.code_size,
-                    self.jit_module.isa(),
+                    jit_module.isa(),
                     default_adapter_compiled
                         .artifact
                         .systemv_unwind_info
@@ -14684,7 +14708,8 @@ fn resolve_process_jit_batch_function<'a>(
 impl ProcessJitEngine {
     pub(crate) fn new(compile_session: &crate::session::CompileSession) -> Result<Self, String> {
         Ok(Self {
-            state: Mutex::new(ProcessJitState::new(compile_session)?),
+            module: ProcessJitModule::new(compile_session)?,
+            state: Mutex::new(ProcessJitState::new()),
             vectorcall_trampolines: Mutex::new(HashMap::new()),
         })
     }
@@ -14702,13 +14727,9 @@ impl ProcessJitEngine {
             return Ok(entry);
         }
 
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| "process JIT module lock poisoned".to_string())?;
+        let mut jit_module = self.module.lock_for_serial_phase()?;
         let symbol = format!("__soac_vectorcall_arity_{param_count}");
-        let entry =
-            define_shared_vectorcall_trampoline(&mut state.jit_module, param_count, &symbol)?;
+        let entry = define_shared_vectorcall_trampoline(&mut jit_module, param_count, &symbol)?;
         trampolines.insert(param_count, entry);
         Ok(entry)
     }
@@ -14737,9 +14758,14 @@ impl ProcessJitEngine {
         let mut state = self
             .state
             .lock()
-            .map_err(|_| "process JIT module lock poisoned".to_string())?;
+            .map_err(|_| "process JIT state lock poisoned".to_string())?;
+        let mut jit_module = self.module.lock_for_serial_phase()?;
         let _guard = ProcessJitCompileGuard::enter();
-        let plan = match state.reserve_direct_function_batch(function, batch_functions)? {
+        let plan = match state.reserve_direct_function_batch(
+            &mut jit_module,
+            function,
+            batch_functions,
+        )? {
             ReservedDirectFunctionBatch::Ready(handle) => {
                 return Ok(DirectFunctionCompileResult {
                     handle,
@@ -14749,8 +14775,14 @@ impl ProcessJitEngine {
             }
             ReservedDirectFunctionBatch::Reserved(plan) => plan,
         };
-        let compiled_functions = state.compile_reserved_direct_function_batch(&inputs, &plan)?;
-        state.commit_compiled_direct_function_batch(session, function, compiled_functions)
+        let compiled_functions =
+            state.compile_reserved_direct_function_batch(&mut jit_module, &inputs, &plan)?;
+        state.commit_compiled_direct_function_batch(
+            &mut jit_module,
+            session,
+            function,
+            compiled_functions,
+        )
     }
 }
 

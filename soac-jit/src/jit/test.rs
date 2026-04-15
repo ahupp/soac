@@ -3364,8 +3364,12 @@ def outer(x):
     #[test]
     fn process_jit_registry_does_not_reuse_colliding_function_ids_with_different_shapes() {
         let compile_session = crate::session::CompileSession::new();
-        let mut state =
-            ProcessJitState::new(&compile_session).expect("process JIT state should initialize");
+        let module =
+            ProcessJitModule::new(&compile_session).expect("process JIT module should initialize");
+        let mut jit_module = module
+            .lock_for_serial_phase()
+            .expect("process JIT module should lock");
+        let mut state = ProcessJitState::new();
         let first = test_function();
         let mut second = test_function();
         second.params.params.push(Param {
@@ -3375,10 +3379,10 @@ def outer(x):
         });
 
         let first_decl = state
-            .declare_direct_function(&first, None)
+            .declare_direct_function(&mut jit_module, &first, None)
             .expect("first function should declare");
         let first_decl_again = state
-            .declare_direct_function(&first, None)
+            .declare_direct_function(&mut jit_module, &first, None)
             .expect("same shape should reuse declaration");
         assert_eq!(first_decl.symbol, first_decl_again.symbol);
 
@@ -3405,7 +3409,7 @@ def outer(x):
         assert!(state.ready_direct_function(&second).is_none());
 
         let second_decl = state
-            .declare_direct_function(&second, None)
+            .declare_direct_function(&mut jit_module, &second, None)
             .expect("colliding function id with different shape should redeclare");
         assert_ne!(first_decl.symbol, second_decl.symbol);
     }
