@@ -34,7 +34,10 @@ use cranelift_codegen::settings::Configurable;
 use cranelift_control::ControlPlane;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch};
 use cranelift_jit::{ArenaMemoryProvider, JITBuilder, JITModule};
-use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module, ModuleReloc};
+use cranelift_module::{
+    DataDeclaration, DataDescription, DataId, FuncId, FunctionDeclaration, Linkage, Module,
+    ModuleReloc,
+};
 use cranelift_reader::parse_functions;
 use pyo3::ffi;
 use soac_blockpy::block_py::{
@@ -1029,6 +1032,60 @@ static SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_IMPORT: ImportSpec = ImportSpec::new(
     ],
     &[SigType::Pointer],
 );
+
+static JIT_RUNTIME_IMPORT_SPECS: &[&ImportSpec] = &[
+    &DP_JIT_INCREF_IMPORT,
+    &DP_JIT_DECREF_IMPORT,
+    &SOAC_RUNTIME_INCREF_APPLIED_IMPORT,
+    &SOAC_RUNTIME_DECREF_APPLIED_IMPORT,
+    &SOAC_RUNTIME_SET_RAISED_EXCEPTION_IMPORT,
+    &SOAC_RUNTIME_LOAD_GLOBAL_IMPORT,
+    &SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_IMPORT,
+    &SOAC_RUNTIME_LOAD_GLOBAL_SLOW_IMPORT,
+    &SOAC_RUNTIME_STORE_GLOBAL_IMPORT,
+    &SOAC_RUNTIME_STORE_GLOBAL_INDEXED_IMPORT,
+    &SOAC_RUNTIME_PROBE_FIELD_INDEXED_IMPORT,
+    &SOAC_RUNTIME_STORE_FIELD_INDEXED_IMPORT,
+    &SOAC_RUNTIME_BUILTIN_ORD_I64_IMPORT,
+    &SOAC_RUNTIME_BUILTIN_CHR_I64_IMPORT,
+    &SOAC_RUNTIME_BUILTIN_LEN_I64_IMPORT,
+    &SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_IMPORT,
+    &DP_JIT_RAISE_I64_OVERFLOW_IMPORT,
+    &DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT,
+    &DP_JIT_PY_CALL_OBJECT_IMPORT,
+    &DP_JIT_PY_VECTORCALL_IMPORT,
+    &DP_JIT_NEXT_OR_SENTINEL_IMPORT,
+    &DP_JIT_ENTER_RECURSIVE_CALL_IMPORT,
+    &PY_THREAD_STATE_GET_UNCHECKED_IMPORT,
+    &DP_JIT_PY_CALL_WITH_KW_IMPORT,
+    &DP_JIT_PYTYPE_GENERIC_ALLOC_IMPORT,
+    &DP_JIT_FINISH_CONSTRUCTOR_INIT_IMPORT,
+    &DP_JIT_LOAD_RUNTIME_OBJ_IMPORT,
+    &DP_JIT_PYOBJECT_GETATTR_IMPORT,
+    &DP_JIT_PYOBJECT_SETATTR_IMPORT,
+    &DP_JIT_PYOBJECT_GETITEM_IMPORT,
+    &DP_JIT_PYOBJECT_SETITEM_IMPORT,
+    &DP_JIT_PYOBJECT_TO_I64_IMPORT,
+    &PYLONG_FROM_LONGLONG_IMPORT,
+    &DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT,
+    &DP_JIT_RAISE_DELETED_NAME_ERROR_IMPORT,
+    &DP_JIT_RAISE_MISSING_REQUIRED_ARGUMENT_IMPORT,
+    &DP_JIT_RAISE_SUPER_ARG_DELETED_IMPORT,
+    &DP_JIT_MAKE_CELL_IMPORT,
+    &DP_JIT_LOAD_CELL_IMPORT,
+    &DP_JIT_STORE_CELL_IMPORT,
+    &SOAC_RUNTIME_TUPLE_NEW_IMPORT,
+    &SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_IMPORT,
+    &DP_JIT_IS_TRUE_IMPORT,
+    &DP_JIT_RAISE_FROM_EXC_IMPORT,
+    &DP_JIT_PUSH_HANDLED_EXCEPTION_IMPORT,
+    &DP_JIT_POP_HANDLED_EXCEPTION_IMPORT,
+    &DP_JIT_DEOPT_RESUME_IMPORT,
+    &DP_JIT_VECTORCALL_BIND_DIRECT_ARGS_IMPORT,
+    &DP_JIT_VECTORCALL_COMPILE_FUNCTION_ENV_IMPORT,
+    &SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_IMPORT,
+];
+
 struct ModuleFuncImports {
     func_ids_by_internal_id: Vec<Option<FuncId>>,
     import_id_to_symbol: HashMap<u32, &'static str>,
@@ -1087,6 +1144,165 @@ impl ModuleFuncImports {
         }
         Ok(func_id)
     }
+}
+
+fn predeclare_jit_runtime_imports(jit_module: &mut JITModule) -> Result<(), String> {
+    let mut imports = ModuleFuncImports::new();
+    for spec in JIT_RUNTIME_IMPORT_SPECS
+        .iter()
+        .chain(intrinsics::OPERATION_IMPORT_SPECS.iter())
+    {
+        imports.ensure_declared(jit_module, spec)?;
+    }
+    for symbol in [
+        CpythonTypeSymbol::Function,
+        CpythonTypeSymbol::Method,
+        CpythonTypeSymbol::Type,
+        CpythonTypeSymbol::Long,
+        CpythonTypeSymbol::List,
+    ] {
+        let _ = declare_type_ptr_import(jit_module, cpython_type_symbol_name(symbol))?;
+    }
+    Ok(())
+}
+
+fn predeclare_reloc_type_ref_import(
+    jit_module: &mut JITModule,
+    type_ref: &RelocTypeRef,
+) -> Result<(), String> {
+    if !ensure_reloc_type_symbol_registered(type_ref)? {
+        return Ok(());
+    }
+    let symbol = reloc_type_ref_symbol_name(type_ref);
+    let _ = declare_type_ptr_import(jit_module, symbol.as_ref())?;
+    Ok(())
+}
+
+fn predeclare_reloc_callable_ref_import(
+    jit_module: &mut JITModule,
+    callable_ref: &RelocCallableRef,
+) -> Result<(), String> {
+    if !ensure_reloc_callable_symbol_registered(callable_ref)? {
+        return Ok(());
+    }
+    let symbol = reloc_callable_ref_symbol_name(callable_ref);
+    let _ = declare_type_ptr_import(jit_module, symbol.as_str())?;
+    Ok(())
+}
+
+fn predeclare_owner_attr_import(
+    jit_module: &mut JITModule,
+    owner_type: *mut ffi::PyTypeObject,
+    attr_name: &str,
+) -> Result<(), String> {
+    let Some(owner_type_ref) = reloc_type_ref_for_type(owner_type)? else {
+        return Ok(());
+    };
+    predeclare_reloc_type_ref_import(jit_module, &owner_type_ref)?;
+    predeclare_reloc_callable_ref_import(
+        jit_module,
+        &RelocCallableRef::OwnerAttr {
+            owner_type_ref,
+            attr_name: attr_name.to_string(),
+        },
+    )
+}
+
+fn predeclare_specialization_type_imports(
+    jit_module: &mut JITModule,
+    profile: &SpecializationProfile<'_>,
+) -> Result<(), String> {
+    let mut type_refs = HashSet::new();
+    for specializations in profile.field_index_specializations()?.values() {
+        for specialization in specializations {
+            type_refs.insert(specialization.owner_type_ref.clone());
+        }
+    }
+    for type_ref in type_refs {
+        predeclare_reloc_type_ref_import(jit_module, &type_ref)?;
+    }
+    Ok(())
+}
+
+struct ProfiledDirectCallSite {
+    method_name: Option<String>,
+    targets: Vec<FunctionId>,
+}
+
+fn collect_profiled_direct_call_sites(
+    module: &BlockPyModule<CodegenModuleShape>,
+    function: &BlockPyFunction<CodegenModuleShape>,
+    call_target_specializations: &HashMap<InstrId, Vec<FunctionId>>,
+) -> Vec<ProfiledDirectCallSite> {
+    struct Collector<'a> {
+        module: &'a BlockPyModule<CodegenModuleShape>,
+        call_target_specializations: &'a HashMap<InstrId, Vec<FunctionId>>,
+        out: Vec<ProfiledDirectCallSite>,
+    }
+
+    impl Visit<InstrCodegen> for Collector<'_> {
+        fn visit_instr(&mut self, expr: &InstrCodegen) {
+            if let InstrCodegen::Call(call) = expr
+                && let Some(instr_id) = call.try_semantic_instr_id()
+                && let Some(targets) = self.call_target_specializations.get(&instr_id)
+            {
+                let method_name = if let InstrCodegen::GetAttr(getattr) = call.func.as_ref() {
+                    codegen_constant_string_value(self.module, getattr.attr.as_ref())
+                        .map(str::to_string)
+                } else {
+                    None
+                };
+                self.out.push(ProfiledDirectCallSite {
+                    method_name,
+                    targets: targets.clone(),
+                });
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut collector = Collector {
+        module,
+        call_target_specializations,
+        out: Vec::new(),
+    };
+    collector.visit_fn(function);
+    collector.out
+}
+
+fn predeclare_direct_call_owner_type_imports(
+    jit_module: &mut JITModule,
+    module: &BlockPyModule<CodegenModuleShape>,
+    function: &BlockPyFunction<CodegenModuleShape>,
+    profile: &SpecializationProfile<'_>,
+) -> Result<(), String> {
+    let call_target_specializations = profile.call_target_specializations(function.function_id)?;
+    if call_target_specializations.is_empty() {
+        return Ok(());
+    }
+
+    let call_sites =
+        collect_profiled_direct_call_sites(module, function, &call_target_specializations);
+    for call_site in call_sites {
+        for function_id in call_site.targets.iter().copied() {
+            if let Ok(owner_types) =
+                unsafe { crate::lookup_exact_owner_types_for_constructor(function_id) }
+            {
+                for owner in owner_types {
+                    predeclare_owner_attr_import(jit_module, owner.owner_type, "__init__")?;
+                }
+            }
+            if let Some(method_name) = call_site.method_name.as_deref()
+                && let Ok(owner_types) =
+                    unsafe { crate::lookup_exact_owner_types_for_method(function_id, method_name) }
+            {
+                for owner in owner_types {
+                    predeclare_owner_attr_import(jit_module, owner.owner_type, method_name)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 struct FuncBuildImports<'a> {
@@ -1200,8 +1416,32 @@ struct ReservedJitFunctionCompileInputs {
     module_constant_object_data_ids: Vec<DataId>,
     scalar_counter_data_id: Option<DataId>,
     top_value_counter_data_id: Option<DataId>,
+    counted_refcount_helpers: CountedRefcountHelpers,
     module_constant_binding_key: usize,
     symbol_scope: Option<String>,
+}
+
+#[derive(Clone)]
+struct JitModuleDeclarationSnapshot {
+    functions: Vec<JitFunctionDeclarationSnapshot>,
+    data_objects: Vec<JitDataDeclarationSnapshot>,
+}
+
+#[derive(Clone)]
+struct JitFunctionDeclarationSnapshot {
+    id: FuncId,
+    name: Option<String>,
+    linkage: Linkage,
+    signature: ir::Signature,
+}
+
+#[derive(Clone)]
+struct JitDataDeclarationSnapshot {
+    id: DataId,
+    name: Option<String>,
+    linkage: Linkage,
+    writable: bool,
+    tls: bool,
 }
 
 struct JitBatchPlan<'a> {
@@ -1209,12 +1449,210 @@ struct JitBatchPlan<'a> {
     batch_functions: Vec<ProcessJitBatchFunction<'a>>,
     function_indices_to_define: Vec<usize>,
     function_compile_inputs: HashMap<usize, ReservedJitFunctionCompileInputs>,
+    module_declarations: JitModuleDeclarationSnapshot,
     predeclared: HashMap<FunctionId, DeclaredJitFunction>,
 }
 
 enum ReservedDirectFunctionBatch<'a> {
     Ready(Arc<CompiledFunctionHandle>),
     Reserved(JitBatchPlan<'a>),
+}
+
+impl JitModuleDeclarationSnapshot {
+    fn from_module(jit_module: &JITModule) -> Self {
+        Self {
+            functions: jit_module
+                .declarations()
+                .get_functions()
+                .map(|(id, declaration)| JitFunctionDeclarationSnapshot {
+                    id,
+                    name: declaration.name.clone(),
+                    linkage: declaration.linkage,
+                    signature: declaration.signature.clone(),
+                })
+                .collect(),
+            data_objects: jit_module
+                .declarations()
+                .get_data_objects()
+                .map(|(id, declaration)| JitDataDeclarationSnapshot {
+                    id,
+                    name: declaration.name.clone(),
+                    linkage: declaration.linkage,
+                    writable: declaration.writable,
+                    tls: declaration.tls,
+                })
+                .collect(),
+        }
+    }
+
+    fn build_worker_module(
+        &self,
+        compile_session: &crate::session::CompileSession,
+    ) -> Result<JITModule, String> {
+        let mut jit_module = new_jit_module(compile_session)?;
+        self.replay_into(&mut jit_module)?;
+        Ok(jit_module)
+    }
+
+    fn validate_no_extra_declarations(&self, jit_module: &JITModule) -> Result<(), String> {
+        let reserved_functions = self
+            .functions
+            .iter()
+            .map(|declaration| declaration.id)
+            .collect::<HashSet<_>>();
+        for (id, declaration) in jit_module.declarations().get_functions() {
+            if !reserved_functions.contains(&id) {
+                return Err(format!(
+                    "worker JIT declared function after batch reservation: {id} {:?} {:?}",
+                    declaration.name, declaration.linkage
+                ));
+            }
+        }
+
+        let reserved_data_objects = self
+            .data_objects
+            .iter()
+            .map(|declaration| declaration.id)
+            .collect::<HashSet<_>>();
+        for (id, declaration) in jit_module.declarations().get_data_objects() {
+            if !reserved_data_objects.contains(&id) {
+                return Err(format!(
+                    "worker JIT declared data after batch reservation: {id} {:?} {:?}",
+                    declaration.name, declaration.linkage
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn replay_into(&self, jit_module: &mut JITModule) -> Result<(), String> {
+        for declaration in &self.functions {
+            if let Some((_, existing)) = jit_module
+                .declarations()
+                .get_functions()
+                .find(|(id, _)| *id == declaration.id)
+            {
+                Self::validate_function_declaration(declaration.id, existing, declaration)?;
+                continue;
+            }
+            let actual_id = if let Some(name) = declaration.name.as_deref() {
+                jit_module
+                    .declare_function(name, declaration.linkage, &declaration.signature)
+                    .map_err(|err| {
+                        format!("failed to replay JIT function declaration {name}: {err}")
+                    })?
+            } else {
+                jit_module
+                    .declare_anonymous_function(&declaration.signature)
+                    .map_err(|err| {
+                        format!(
+                            "failed to replay anonymous JIT function declaration {}: {err}",
+                            declaration.id
+                        )
+                    })?
+            };
+            if actual_id != declaration.id {
+                return Err(format!(
+                    "replayed JIT function declaration id mismatch for {}: {} != {}",
+                    declaration
+                        .name
+                        .as_deref()
+                        .unwrap_or("<anonymous function>"),
+                    actual_id,
+                    declaration.id
+                ));
+            }
+        }
+
+        for declaration in &self.data_objects {
+            if let Some((_, existing)) = jit_module
+                .declarations()
+                .get_data_objects()
+                .find(|(id, _)| *id == declaration.id)
+            {
+                Self::validate_data_declaration(declaration.id, existing, declaration)?;
+                continue;
+            }
+            let actual_id = if let Some(name) = declaration.name.as_deref() {
+                jit_module
+                    .declare_data(
+                        name,
+                        declaration.linkage,
+                        declaration.writable,
+                        declaration.tls,
+                    )
+                    .map_err(|err| format!("failed to replay JIT data declaration {name}: {err}"))?
+            } else {
+                jit_module
+                    .declare_anonymous_data(declaration.writable, declaration.tls)
+                    .map_err(|err| {
+                        format!(
+                            "failed to replay anonymous JIT data declaration {}: {err}",
+                            declaration.id
+                        )
+                    })?
+            };
+            if actual_id != declaration.id {
+                return Err(format!(
+                    "replayed JIT data declaration id mismatch for {}: {} != {}",
+                    declaration.name.as_deref().unwrap_or("<anonymous data>"),
+                    actual_id,
+                    declaration.id
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_function_declaration(
+        id: FuncId,
+        actual: &FunctionDeclaration,
+        expected: &JitFunctionDeclarationSnapshot,
+    ) -> Result<(), String> {
+        if actual.name != expected.name {
+            return Err(format!(
+                "worker JIT function declaration {id} name mismatch: {:?} != {:?}",
+                actual.name, expected.name
+            ));
+        }
+        if actual.linkage != expected.linkage {
+            return Err(format!(
+                "worker JIT function declaration {id} linkage mismatch: {:?} != {:?}",
+                actual.linkage, expected.linkage
+            ));
+        }
+        if actual.signature != expected.signature {
+            return Err(format!(
+                "worker JIT function declaration {id} signature mismatch"
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_data_declaration(
+        id: DataId,
+        actual: &DataDeclaration,
+        expected: &JitDataDeclarationSnapshot,
+    ) -> Result<(), String> {
+        if actual.name != expected.name {
+            return Err(format!(
+                "worker JIT data declaration {id} name mismatch: {:?} != {:?}",
+                actual.name, expected.name
+            ));
+        }
+        if actual.linkage != expected.linkage {
+            return Err(format!(
+                "worker JIT data declaration {id} linkage mismatch: {:?} != {:?}",
+                actual.linkage, expected.linkage
+            ));
+        }
+        if actual.writable != expected.writable || actual.tls != expected.tls {
+            return Err(format!(
+                "worker JIT data declaration {id} storage flags mismatch"
+            ));
+        }
+        Ok(())
+    }
 }
 
 struct ProcessJitBatchFunction<'a> {
@@ -1585,17 +2023,36 @@ impl ProcessJitState {
                 instance_key,
                 module_constant_symbol_prefix_for_shared_state(shared_state).as_str(),
             )?;
+            let symbol_scope = direct_function_symbol_scope_for_shared_state(
+                shared_state,
+                batch_function.function.function_id,
+            );
+            let counted_refcount_helpers = build_counted_runtime_refcount_helpers(
+                jit_module,
+                &batch_function.function,
+                shared_state.lowered_module.counter_defs.as_slice(),
+                shared_state.counter_slots_by_id(),
+                scalar_counter_data_id,
+                Some(symbol_scope.as_str()),
+            )?;
+            let specialization_profile =
+                SpecializationProfile::from_runtime_state(Some(shared_state))?;
+            predeclare_specialization_type_imports(jit_module, &specialization_profile)?;
+            predeclare_direct_call_owner_type_imports(
+                jit_module,
+                &shared_state.lowered_module,
+                &batch_function.function,
+                &specialization_profile,
+            )?;
             return Ok(ReservedJitFunctionCompileInputs {
                 module_constant_ptrs,
                 counter_slots_by_id: shared_state.counter_slots_by_id().to_vec(),
                 module_constant_object_data_ids,
                 scalar_counter_data_id,
                 top_value_counter_data_id,
+                counted_refcount_helpers,
                 module_constant_binding_key: instance_key,
-                symbol_scope: Some(direct_function_symbol_scope_for_shared_state(
-                    shared_state,
-                    batch_function.function.function_id,
-                )),
+                symbol_scope: Some(symbol_scope),
             });
         }
 
@@ -1621,12 +2078,21 @@ impl ProcessJitState {
             instance_key,
             module_constant_symbol_prefix_for_instance(inputs.module, instance_key).as_str(),
         )?;
+        let counted_refcount_helpers = build_counted_runtime_refcount_helpers(
+            jit_module,
+            &batch_function.function,
+            inputs.counter_defs,
+            counter_slots_by_id.as_ref(),
+            scalar_counter_data_id,
+            None,
+        )?;
         Ok(ReservedJitFunctionCompileInputs {
             module_constant_ptrs,
             counter_slots_by_id: counter_slots_by_id.into_vec(),
             module_constant_object_data_ids,
             scalar_counter_data_id,
             top_value_counter_data_id,
+            counted_refcount_helpers,
             module_constant_binding_key: instance_key,
             symbol_scope: None,
         })
@@ -1666,12 +2132,14 @@ impl ProcessJitState {
             }
             predeclared.insert(function.function_id, declared);
         }
+        predeclare_jit_runtime_imports(jit_module)?;
 
         Ok(ReservedDirectFunctionBatch::Reserved(JitBatchPlan {
             root_function_id: root_function.function_id,
             batch_functions,
             function_indices_to_define,
             function_compile_inputs,
+            module_declarations: JitModuleDeclarationSnapshot::from_module(jit_module),
             predeclared,
         }))
     }
@@ -1787,7 +2255,10 @@ impl ProcessJitState {
                 &SpecializationProfile::from_runtime_state(function_direct_call_resolver)?,
                 reserved_inputs.symbol_scope.as_deref(),
                 Some(&plan.predeclared),
-                BuildSpecializedFunctionOptions::default(),
+                BuildSpecializedFunctionOptions {
+                    counted_refcount_helpers: Some(reserved_inputs.counted_refcount_helpers),
+                    ..BuildSpecializedFunctionOptions::default()
+                },
             )
             .map_err(|err| {
                 format!(
@@ -14812,13 +15283,16 @@ impl ProcessJitEngine {
             }
         };
         let compiled_functions = {
-            let mut jit_module = self.module.lock_for_serial_phase()?;
+            let mut jit_module = plan.module_declarations.build_worker_module(session)?;
             let _guard = ProcessJitCompileGuard::enter();
-            ProcessJitState::compile_reserved_direct_function_batch(
+            let compiled_functions = ProcessJitState::compile_reserved_direct_function_batch(
                 &mut jit_module,
                 &inputs,
                 &plan,
-            )?
+            )?;
+            plan.module_declarations
+                .validate_no_extra_declarations(&jit_module)?;
+            compiled_functions
         };
         let mut state = self
             .state
@@ -16813,6 +17287,7 @@ pub fn run_cranelift_smoke(module: &BlockPyModule<CodegenModuleShape>) -> Result
 struct BuildSpecializedFunctionOptions {
     guard_miss_deopt_stub: bool,
     module_constant_accesses: ModuleConstantAccessTable,
+    counted_refcount_helpers: Option<CountedRefcountHelpers>,
 }
 
 fn build_cranelift_run_bb_specialized_function(
@@ -17050,14 +17525,19 @@ fn build_cranelift_run_bb_specialized_function(
                 )
             }
         };
-    let counted_refcount_helpers = build_counted_runtime_refcount_helpers(
-        jit_module,
-        function,
-        counter_defs,
-        counter_slots_by_id,
-        scalar_counter_data_id,
-        symbol_scope,
-    )?;
+    let counted_refcount_helpers =
+        if let Some(counted_refcount_helpers) = options.counted_refcount_helpers {
+            counted_refcount_helpers
+        } else {
+            build_counted_runtime_refcount_helpers(
+                jit_module,
+                function,
+                counter_defs,
+                counter_slots_by_id,
+                scalar_counter_data_id,
+                symbol_scope,
+            )?
+        };
 
     let mut ctx = jit_module.make_context();
     ctx.func.signature = main_sig;
