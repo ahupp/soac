@@ -3,16 +3,20 @@ use super::{
     RuntimeJitDeoptLocals, specialized_helpers::ObjPtr,
 };
 use crate::function_instantiation::{
-    make_function_kind_abi_tag, soac_jit_make_function_with_closure,
+    make_function_in_shared_state, make_function_kind_abi_tag, soac_jit_make_function_with_closure,
 };
 use crate::module_constants::load_runtime_name_owned;
+use crate::module_type::SharedModuleState;
+use crate::session::CompileSession;
 use pyo3::ffi;
-use soac_blockpy::block_py::BlockPyFunction;
+use pyo3::types::PyAny;
+use pyo3::{Bound, Python};
 use soac_blockpy::block_py::{
     AbruptKind, BinOp, BinOpKind, BlockArg, BlockEdge, BlockTerm, CallArgKeyword,
     CallArgPositional, CalleeFunctionId, CellLocation, InstrCodegen, LocalLocation, NameLocation,
     ParamKind, UnaryOp, UnaryOpKind,
 };
+use soac_blockpy::block_py::{BlockPyFunction, FunctionKind};
 use soac_blockpy::passes::{
     CodegenModuleShape, LocalEnvResumeBinding, LocalEnvResumeBindingState,
     LocalEnvResumeValueSource, LocalRefKind,
@@ -20,6 +24,7 @@ use soac_blockpy::passes::{
 use std::collections::HashMap;
 use std::ffi::{c_int, c_void};
 use std::ptr;
+use std::sync::Arc;
 
 unsafe extern "C" {
     static mut PyMethod_Type: ffi::PyTypeObject;
@@ -55,13 +60,12 @@ pub(super) fn execute_deopt_invocation(
 #[allow(dead_code)]
 pub(crate) unsafe fn run_blockpy_function_from_entry(
     function: &BlockPyFunction<CodegenModuleShape>,
-    globals_obj: ObjPtr,
-    function_data_obj: ObjPtr,
-    module_constant_ptrs: &[ObjPtr],
+    context: BlockPyEntryRuntimeContext<'_>,
     positional_args: &[ObjPtr],
 ) -> Result<ObjPtr, String> {
-    let (bindings, values) =
-        unsafe { build_entry_local_bindings(function, function_data_obj, positional_args)? };
+    let (bindings, values) = unsafe {
+        build_entry_local_bindings(function, context.function_data_obj, positional_args)?
+    };
     let locals = match RuntimeJitDeoptLocals::from_live_bindings(
         bindings.iter().zip(values.iter().copied()),
     ) {
@@ -71,15 +75,8 @@ pub(crate) unsafe fn run_blockpy_function_from_entry(
             return Err(err);
         }
     };
-    let mut frame = BlockPyDeoptFrame::new_entry(
-        BlockPyEntryFrameSource {
-            function,
-            globals_obj,
-            function_data_obj,
-            module_constant_ptrs,
-        },
-        locals,
-    );
+    let mut frame =
+        BlockPyDeoptFrame::new_entry(BlockPyEntryFrameSource { function, context }, locals);
     let cursor = RuntimeJitDeoptCursor::at_block_entry(function.entry_block().label);
     let result = unsafe { frame.execute_from_cursor(cursor) };
     unsafe {
@@ -88,16 +85,40 @@ pub(crate) unsafe fn run_blockpy_function_from_entry(
     result
 }
 
-#[derive(Clone, Copy)]
 #[allow(dead_code)]
-struct BlockPyEntryFrameSource<'a> {
-    function: &'a BlockPyFunction<CodegenModuleShape>,
+pub(crate) struct BlockPyEntryRuntimeContext<'a> {
+    compile_session: Arc<CompileSession>,
+    shared_state: Arc<SharedModuleState>,
     globals_obj: ObjPtr,
     function_data_obj: ObjPtr,
     module_constant_ptrs: &'a [ObjPtr],
 }
 
-#[derive(Clone, Copy)]
+#[allow(dead_code)]
+impl<'a> BlockPyEntryRuntimeContext<'a> {
+    pub(crate) fn new(
+        compile_session: Arc<CompileSession>,
+        shared_state: Arc<SharedModuleState>,
+        globals_obj: ObjPtr,
+        function_data_obj: ObjPtr,
+        module_constant_ptrs: &'a [ObjPtr],
+    ) -> Self {
+        Self {
+            compile_session,
+            shared_state,
+            globals_obj,
+            function_data_obj,
+            module_constant_ptrs,
+        }
+    }
+}
+
+#[allow(dead_code)]
+struct BlockPyEntryFrameSource<'a> {
+    function: &'a BlockPyFunction<CodegenModuleShape>,
+    context: BlockPyEntryRuntimeContext<'a>,
+}
+
 #[allow(dead_code)]
 enum BlockPyFrameSource<'inv, 'data> {
     Deopt(&'inv RuntimeJitDeoptInvocation<'data>),
@@ -105,7 +126,7 @@ enum BlockPyFrameSource<'inv, 'data> {
 }
 
 impl<'inv, 'data> BlockPyFrameSource<'inv, 'data> {
-    fn initial_cursor(self) -> Option<RuntimeJitDeoptCursor> {
+    fn initial_cursor(&self) -> Option<RuntimeJitDeoptCursor> {
         match self {
             Self::Deopt(invocation) => invocation.record().initial_cursor(),
             Self::Entry(entry) => Some(RuntimeJitDeoptCursor::at_block_entry(
@@ -114,31 +135,32 @@ impl<'inv, 'data> BlockPyFrameSource<'inv, 'data> {
         }
     }
 
-    fn function(self) -> &'inv BlockPyFunction<CodegenModuleShape> {
+    fn function(&self) -> &'inv BlockPyFunction<CodegenModuleShape> {
         match self {
             Self::Deopt(invocation) => invocation.function(),
             Self::Entry(entry) => entry.function,
         }
     }
 
-    fn globals_obj(self) -> ObjPtr {
+    fn globals_obj(&self) -> ObjPtr {
         match self {
             Self::Deopt(invocation) => invocation.globals_obj(),
-            Self::Entry(entry) => entry.globals_obj,
+            Self::Entry(entry) => entry.context.globals_obj,
         }
     }
 
-    fn function_data_obj(self) -> ObjPtr {
+    fn function_data_obj(&self) -> ObjPtr {
         match self {
             Self::Deopt(invocation) => invocation.function_data_obj(),
-            Self::Entry(entry) => entry.function_data_obj,
+            Self::Entry(entry) => entry.context.function_data_obj,
         }
     }
 
-    fn module_constant_ptr(self, constant_index: u32) -> Result<ObjPtr, String> {
+    fn module_constant_ptr(&self, constant_index: u32) -> Result<ObjPtr, String> {
         match self {
             Self::Deopt(invocation) => invocation.module_constant_ptr(constant_index),
             Self::Entry(entry) => entry
+                .context
                 .module_constant_ptrs
                 .get(constant_index as usize)
                 .copied()
@@ -151,14 +173,40 @@ impl<'inv, 'data> BlockPyFrameSource<'inv, 'data> {
         }
     }
 
-    fn describe(self) -> String {
+    fn describe(&self) -> String {
         match self {
             Self::Deopt(invocation) => invocation.describe(),
             Self::Entry(entry) => format!(
                 "function {}, entry interpreter, module constants {}",
                 entry.function.function_id,
-                entry.module_constant_ptrs.len()
+                entry.context.module_constant_ptrs.len()
             ),
+        }
+    }
+
+    fn instantiate_entry_function(
+        &self,
+        py: Python<'_>,
+        function_id: soac_blockpy::block_py::FunctionId,
+        expected_kind: FunctionKind,
+        captures: &Bound<'_, PyAny>,
+        param_defaults: &Bound<'_, PyAny>,
+        annotate_fn: &Bound<'_, PyAny>,
+        module_globals: &Bound<'_, PyAny>,
+    ) -> Option<pyo3::PyResult<pyo3::Py<PyAny>>> {
+        match self {
+            Self::Deopt(_) => None,
+            Self::Entry(entry) => Some(make_function_in_shared_state(
+                py,
+                Arc::clone(&entry.context.compile_session),
+                Arc::clone(&entry.context.shared_state),
+                function_id,
+                expected_kind,
+                captures,
+                param_defaults,
+                annotate_fn,
+                module_globals,
+            )),
         }
     }
 }
@@ -703,15 +751,28 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             }
             return Err("deopt continuation expected module globals for make_function".to_string());
         }
-        let result = unsafe {
-            soac_jit_make_function_with_closure(
-                make_function.function_id().packed(),
-                make_function_kind_abi_tag(make_function.kind),
-                captures.cast::<ffi::PyObject>(),
-                param_defaults.cast::<ffi::PyObject>(),
-                annotate_fn.cast::<ffi::PyObject>(),
-                globals.cast::<ffi::PyObject>(),
+        let result = if let Some(result) = unsafe {
+            self.execute_entry_make_function_with_closure(
+                make_function,
+                captures,
+                param_defaults,
+                annotate_fn,
+                globals,
             )
+        } {
+            result
+        } else {
+            unsafe {
+                soac_jit_make_function_with_closure(
+                    make_function.function_id().packed(),
+                    make_function_kind_abi_tag(make_function.kind),
+                    captures.cast::<ffi::PyObject>(),
+                    param_defaults.cast::<ffi::PyObject>(),
+                    annotate_fn.cast::<ffi::PyObject>(),
+                    globals.cast::<ffi::PyObject>(),
+                )
+                .cast()
+            }
         };
         unsafe {
             ffi::Py_DECREF(annotate_fn.cast::<ffi::PyObject>());
@@ -719,6 +780,40 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             ffi::Py_DECREF(captures.cast::<ffi::PyObject>());
         }
         Ok(result.cast())
+    }
+
+    #[cold]
+    unsafe fn execute_entry_make_function_with_closure(
+        &self,
+        make_function: &soac_blockpy::block_py::MakeFunctionWithClosure<InstrCodegen>,
+        captures: ObjPtr,
+        param_defaults: ObjPtr,
+        annotate_fn: ObjPtr,
+        globals: ObjPtr,
+    ) -> Option<ObjPtr> {
+        let py = Python::assume_attached();
+        let captures = unsafe { Bound::from_borrowed_ptr(py, captures.cast::<ffi::PyObject>()) };
+        let param_defaults =
+            unsafe { Bound::from_borrowed_ptr(py, param_defaults.cast::<ffi::PyObject>()) };
+        let annotate_fn =
+            unsafe { Bound::from_borrowed_ptr(py, annotate_fn.cast::<ffi::PyObject>()) };
+        let globals = unsafe { Bound::from_borrowed_ptr(py, globals.cast::<ffi::PyObject>()) };
+        match self.source.instantiate_entry_function(
+            py,
+            make_function.function_id(),
+            make_function.kind,
+            &captures,
+            &param_defaults,
+            &annotate_fn,
+            &globals,
+        ) {
+            Some(Ok(func)) => Some(func.into_ptr().cast()),
+            Some(Err(err)) => {
+                err.restore(py);
+                Some(ptr::null_mut())
+            }
+            None => None,
+        }
     }
 
     #[cold]

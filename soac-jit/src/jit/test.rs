@@ -925,7 +925,7 @@ def get_value():
     fn blockpy_entry_interpreter_binds_positional_args() {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
-        Python::attach(|_| unsafe {
+        Python::attach(|py| unsafe {
             let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
                 r#"
 def add(left, right):
@@ -934,11 +934,20 @@ def add(left, right):
             )
             .expect("lowering entry interpreter smoke source should succeed")
             .codegen_module;
-            let function = lowered
+            let shared_state =
+                crate::module_type::build_shared_state_for_testing(py, lowered, "entry_test", "")
+                    .expect("shared state should build for entry interpreter smoke test");
+            let function = shared_state
+                .lowered_module
                 .callable_defs
                 .iter()
                 .find(|function| function.names.bind_name == "add")
                 .expect("lowered module should contain add function");
+            let module_constant_ptrs = shared_state
+                .module_constant_ptrs()
+                .into_iter()
+                .map(|ptr| ptr.cast::<c_void>())
+                .collect::<Vec<_>>();
             let left = ffi::PyLong_FromLong(123_456_789);
             assert!(!left.is_null(), "test left allocation should succeed");
             let right = ffi::PyLong_FromLong(987_654_321);
@@ -946,14 +955,15 @@ def add(left, right):
             let before_left = ffi::Py_REFCNT(left);
             let before_right = ffi::Py_REFCNT(right);
             let args = [left.cast::<c_void>(), right.cast::<c_void>()];
-            let result = run_blockpy_function_from_entry(
-                function,
+            let context = BlockPyEntryRuntimeContext::new(
+                std::sync::Arc::new(crate::session::CompileSession::new()),
+                std::sync::Arc::clone(&shared_state),
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &[],
-                &args,
-            )
-            .expect("entry interpreter should run simple positional function");
+                module_constant_ptrs.as_slice(),
+            );
+            let result = run_blockpy_function_from_entry(function, context, &args)
+                .expect("entry interpreter should run simple positional function");
 
             assert_eq!(
                 ffi::PyLong_AsLongLong(result.cast::<ffi::PyObject>()),
@@ -984,7 +994,7 @@ def add(left, right):
     fn blockpy_entry_interpreter_reports_argument_binding_gaps() {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
-        Python::attach(|_| {
+        Python::attach(|py| {
             let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
                 r#"
 def needs_arg(value):
@@ -993,21 +1003,29 @@ def needs_arg(value):
             )
             .expect("lowering entry interpreter missing-arg source should succeed")
             .codegen_module;
-            let function = lowered
+            let shared_state =
+                crate::module_type::build_shared_state_for_testing(py, lowered, "entry_test", "")
+                    .expect("shared state should build for entry interpreter missing-arg test");
+            let function = shared_state
+                .lowered_module
                 .callable_defs
                 .iter()
                 .find(|function| function.names.bind_name == "needs_arg")
                 .expect("lowered module should contain needs_arg function");
-            let err = unsafe {
-                run_blockpy_function_from_entry(
-                    function,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    &[],
-                    &[],
-                )
-            }
-            .expect_err("entry interpreter should report missing positional args");
+            let module_constant_ptrs = shared_state
+                .module_constant_ptrs()
+                .into_iter()
+                .map(|ptr| ptr.cast::<c_void>())
+                .collect::<Vec<_>>();
+            let context = BlockPyEntryRuntimeContext::new(
+                std::sync::Arc::new(crate::session::CompileSession::new()),
+                std::sync::Arc::clone(&shared_state),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                module_constant_ptrs.as_slice(),
+            );
+            let err = unsafe { run_blockpy_function_from_entry(function, context, &[]) }
+                .expect_err("entry interpreter should report missing positional args");
 
             assert!(
                 err.contains("missing positional args"),
@@ -1059,15 +1077,16 @@ def add_default(left, right=9):
                 .into_iter()
                 .map(|ptr| ptr.cast::<c_void>())
                 .collect::<Vec<_>>();
-
-            let result = run_blockpy_function_from_entry(
-                function,
+            let context = BlockPyEntryRuntimeContext::new(
+                std::sync::Arc::new(crate::session::CompileSession::new()),
+                std::sync::Arc::clone(&shared_state),
                 std::ptr::null_mut(),
                 function_data.as_mut_ptr().cast::<c_void>(),
                 module_constant_ptrs.as_slice(),
-                &args,
-            )
-            .expect("entry interpreter should bind missing positional arg from function data");
+            );
+
+            let result = run_blockpy_function_from_entry(function, context, &args)
+                .expect("entry interpreter should bind missing positional arg from function data");
 
             assert_eq!(
                 ffi::PyLong_AsLong(result.cast::<ffi::PyObject>()),
@@ -1097,13 +1116,6 @@ def add_default(left, right=9):
         let shared_state =
             crate::module_type::build_shared_state_for_testing(py, lowered, "entry_test", "")
                 .map_err(|err| format!("building entry interpreter shared state failed: {err}"))?;
-        crate::session::CompileSession::process()
-            .retain_shared_module_state(std::sync::Arc::clone(&shared_state))
-            .map_err(|err| {
-                format!(
-                    "retaining entry interpreter shared state for nested functions failed: {err}"
-                )
-            })?;
         let function = shared_state
             .lowered_module
             .callable_defs
@@ -1115,15 +1127,14 @@ def add_default(left, right=9):
             .into_iter()
             .map(|ptr| ptr.cast::<c_void>())
             .collect::<Vec<_>>();
-        unsafe {
-            run_blockpy_function_from_entry(
-                function,
-                globals_obj,
-                std::ptr::null_mut(),
-                module_constant_ptrs.as_slice(),
-                positional_args,
-            )
-        }
+        let context = BlockPyEntryRuntimeContext::new(
+            std::sync::Arc::new(crate::session::CompileSession::new()),
+            std::sync::Arc::clone(&shared_state),
+            globals_obj,
+            std::ptr::null_mut(),
+            module_constant_ptrs.as_slice(),
+        );
+        unsafe { run_blockpy_function_from_entry(function, context, positional_args) }
     }
 
     #[test]

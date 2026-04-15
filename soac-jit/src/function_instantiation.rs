@@ -712,6 +712,38 @@ pub fn make_function(
     )
 }
 
+pub(crate) fn make_function_in_shared_state(
+    py: Python<'_>,
+    compile_session: Arc<CompileSession>,
+    shared_state: Arc<SharedModuleState>,
+    function_id: FunctionId,
+    expected_kind: FunctionKind,
+    captures: &Bound<'_, PyAny>,
+    param_defaults: &Bound<'_, PyAny>,
+    annotate_fn: &Bound<'_, PyAny>,
+    module_globals: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    let function = shared_state
+        .lookup_function(function_id)
+        .cloned()
+        .ok_or_else(|| {
+            PyRuntimeError::new_err(format!(
+                "JIT basic-block function instantiation failed to resolve explicit static function metadata for fn#{function_id}"
+            ))
+        })?;
+    instantiate_shared_function(
+        py,
+        compile_session,
+        shared_state,
+        function,
+        expected_kind,
+        captures,
+        param_defaults,
+        annotate_fn,
+        module_globals,
+    )
+}
+
 pub fn make_function_from_python_args(
     py: Python<'_>,
     function_id: u64,

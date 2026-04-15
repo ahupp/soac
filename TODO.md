@@ -13,7 +13,6 @@
  * Consolidate the bootstrap module in `build_soac_runtime_bootstrap_module` with `runtime.py`.
  * Review stable identifiers for modules, functions, types, and pyc-to-function mapping.
  * Replace the function-instantiation fallback for `co_freevars`/capture mismatches with a cleaner explicit closure entry/code-object alignment.
- * Make entry-interpreter calls carry an explicit shared-state/static metadata context instead of relying on process `CompileSession` retention for nested function instantiation.
  * Track slow CPython fast-suite cases that pass with longer timeouts, including `test_dataclasses` and `test_bytes -m test_count`.
 
 
