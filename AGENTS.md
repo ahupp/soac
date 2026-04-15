@@ -481,10 +481,14 @@ anything non-code affected the run. If there were no such issues, say
 - Use `jj describe` with real newlines for multi-paragraph messages.
 - Keep one logical change per `jj` change.
 - After finishing a logical change and moving to the next, create a fresh child with `jj new`.
-- Treat "do not run `jj` workspace inspection commands in parallel" as a hard rule.
-  Even read-only repo-state commands such as `jj status`, `jj workspace update-stale`,
-  and `jj log` can race on snapshotting or auto-recovery in agent workflows. Run
-  them serially, wait for completion, then inspect the next command's fresh output.
+- Do not run mutating `jj` commands in parallel. Commands such as `jj describe`,
+  `jj new`, `jj squash`, `jj split`, `jj rebase`, `jj abandon`, `jj restore`,
+  `jj resolve`, and `jj bookmark set`/`move` rewrite repo state and can trigger
+  automatic rebases; run them serially and verify with fresh `jj status`
+  afterwards. Read-only inspection commands such as `jj diff`, `jj log`, and
+  `jj show` may run in parallel when they do not depend on each other's output.
+  Run `jj workspace update-stale` and `jj status` serially when using them as a
+  preflight before mutation, so the mutation is based on fresh workspace state.
 - For one-off revision checks, switch the current workspace in-place instead of
   creating another workspace or ad hoc temporary worktree. Create a new empty
   working-copy child at the revision you need:

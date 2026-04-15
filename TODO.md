@@ -2,6 +2,8 @@
 ## Codex TODO Intake
 
  * Complete migration of ast-to-instr pass
+ * Clean up the instruction metadata passing cruft so metadata ownership and propagation are explicit instead of threaded ad hoc through lowering helpers.
+ * Decide how much codegen should depend on known imports versus relying only on specialization feedback for cross-module assumptions.
  * If caching BlockPy before codegen, recover FunctionNameGen.next_tmp_id from generated `_dp_*` names.
  * Revisit Cranelift compile caching by relocating constant values instead of embedding per-run object/counter pointers in CLIF.
  * Add mutation watchers for `f.__defaults__` and `f.__kwdefaults__` so direct/JIT default slots stay fresh after in-place edits.

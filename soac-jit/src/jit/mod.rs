@@ -1166,6 +1166,27 @@ struct DefinedJitFunction {
     deopt_table: Arc<RuntimeJitDeoptTable>,
 }
 
+struct DirectFunctionCompileInputs<'a> {
+    session: &'a Arc<crate::session::CompileSession>,
+    blocks: &'a [ObjPtr],
+    module: &'a BlockPyModule<CodegenModuleShape>,
+    module_constants: &'a ModuleCodegenConstants,
+    counter_defs: &'a [CounterDef],
+    module_constant_ptrs: &'a [*mut ffi::PyObject],
+}
+
+struct JitBatchPlan<'a> {
+    root_function_id: FunctionId,
+    batch_functions: Vec<ProcessJitBatchFunction<'a>>,
+    function_indices_to_define: Vec<usize>,
+    predeclared: HashMap<FunctionId, DeclaredJitFunction>,
+}
+
+enum ReservedDirectFunctionBatch<'a> {
+    Ready(Arc<CompiledFunctionHandle>),
+    Reserved(JitBatchPlan<'a>),
+}
+
 struct ProcessJitBatchFunction<'a> {
     function: BlockPyFunction<CodegenModuleShape>,
     source: ProcessJitBatchFunctionSource<'a>,
@@ -1465,6 +1486,405 @@ impl ProcessJitState {
             },
         );
         Ok(compiled_handle)
+    }
+}
+
+impl ProcessJitState {
+    fn reserve_direct_function_batch<'a>(
+        &mut self,
+        root_function: &BlockPyFunction<CodegenModuleShape>,
+        batch_functions: Vec<ProcessJitBatchFunction<'a>>,
+    ) -> Result<ReservedDirectFunctionBatch<'a>, String> {
+        if let Some(compiled_handle) = self.ready_direct_function(root_function) {
+            return Ok(ReservedDirectFunctionBatch::Ready(compiled_handle));
+        }
+
+        let mut predeclared = HashMap::new();
+        let mut function_indices_to_define = Vec::new();
+        for (index, batch_function) in batch_functions.iter().enumerate() {
+            let function = &batch_function.function;
+            let direct_symbol_scope = batch_function.source.shared_state().map(|shared_state| {
+                direct_function_symbol_scope_for_shared_state(shared_state, function.function_id)
+            });
+            let declared =
+                self.declare_direct_function(function, direct_symbol_scope.as_deref())?;
+            if !self.is_direct_function_ready(function.function_id) {
+                function_indices_to_define.push(index);
+            }
+            predeclared.insert(function.function_id, declared);
+        }
+
+        Ok(ReservedDirectFunctionBatch::Reserved(JitBatchPlan {
+            root_function_id: root_function.function_id,
+            batch_functions,
+            function_indices_to_define,
+            predeclared,
+        }))
+    }
+
+    fn compile_reserved_direct_function_batch<'a>(
+        &mut self,
+        inputs: &DirectFunctionCompileInputs<'a>,
+        plan: &JitBatchPlan<'a>,
+    ) -> Result<Vec<DefinedJitFunction>, String> {
+        let mut defined_functions = Vec::with_capacity(plan.function_indices_to_define.len());
+        let mut jit_plan_cache: HashMap<
+            usize,
+            (
+                FactStore,
+                PlannedJitModuleLocals,
+                PlannedJitDeoptResumeModule,
+            ),
+        > = HashMap::new();
+        for batch_function_index in &plan.function_indices_to_define {
+            let batch_function = &plan.batch_functions[*batch_function_index];
+            let function = &batch_function.function;
+            let placeholder_blocks;
+            let function_blocks = if function.function_id == plan.root_function_id {
+                inputs.blocks
+            } else {
+                placeholder_blocks =
+                    vec![std::ptr::null_mut::<std::ffi::c_void>(); function.blocks.len()];
+                placeholder_blocks.as_slice()
+            };
+            let owned_module_constant_ptrs;
+            let owned_counter_slots_by_id;
+            let (
+                function_module,
+                function_module_constants,
+                function_counter_defs,
+                function_module_constant_ptrs,
+                function_counter_slots_by_id,
+                function_scalar_counter_data_id,
+                function_top_value_counter_data_id,
+                function_direct_call_resolver,
+                function_module_constant_binding_key,
+                function_module_constant_symbol_prefix,
+                function_symbol_scope,
+            ) = if let Some(shared_state) = batch_function.source.shared_state() {
+                owned_module_constant_ptrs = shared_state.module_constant_ptrs();
+                let instance_key = shared_state.storage_instance_key();
+                let scalar_counter_symbol =
+                    scalar_counter_storage_symbol_for_shared_state(shared_state);
+                let scalar_counter_base_ptr = shared_state.scalar_counter_values_ptr();
+                let scalar_counter_data_id = if scalar_counter_base_ptr.is_null() {
+                    None
+                } else {
+                    register_jit_data_symbol(
+                        scalar_counter_symbol.as_str(),
+                        scalar_counter_base_ptr.cast::<u8>(),
+                    );
+                    Some(declare_scalar_counter_storage_import(
+                        &mut self.jit_module,
+                        scalar_counter_symbol.as_str(),
+                    )?)
+                };
+                let top_value_counter_symbol =
+                    top_value_counter_storage_symbol_for_shared_state(shared_state);
+                let top_value_counter_base_ptr = shared_state.top_value_counter_values_ptr();
+                let top_value_counter_data_id = if top_value_counter_base_ptr.is_null() {
+                    None
+                } else {
+                    register_jit_data_symbol(
+                        top_value_counter_symbol.as_str(),
+                        top_value_counter_base_ptr.cast::<u8>(),
+                    );
+                    Some(declare_top_value_counter_storage_import(
+                        &mut self.jit_module,
+                        top_value_counter_symbol.as_str(),
+                    )?)
+                };
+                (
+                    &shared_state.lowered_module,
+                    &shared_state.codegen_constants,
+                    shared_state.lowered_module.counter_defs.as_slice(),
+                    owned_module_constant_ptrs.as_slice(),
+                    shared_state.counter_slots_by_id(),
+                    scalar_counter_data_id,
+                    top_value_counter_data_id,
+                    Some(shared_state),
+                    instance_key,
+                    module_constant_symbol_prefix_for_shared_state(shared_state),
+                    Some(direct_function_symbol_scope_for_shared_state(
+                        shared_state,
+                        function.function_id,
+                    )),
+                )
+            } else {
+                let (counter_slots_by_id, scalar_counter_count, top_value_count) =
+                    build_counter_storage_layout(inputs.counter_defs)?;
+                let instance_key =
+                    inputs.module as *const BlockPyModule<CodegenModuleShape> as usize;
+                let scalar_counter_data_id = self.ensure_local_scalar_counter_storage(
+                    inputs.module,
+                    scalar_counter_count,
+                    instance_key,
+                )?;
+                let top_value_counter_data_id = self.ensure_local_top_value_counter_storage(
+                    inputs.module,
+                    top_value_count,
+                    instance_key,
+                )?;
+                owned_counter_slots_by_id = counter_slots_by_id;
+                (
+                    inputs.module,
+                    inputs.module_constants,
+                    inputs.counter_defs,
+                    inputs.module_constant_ptrs,
+                    owned_counter_slots_by_id.as_ref(),
+                    scalar_counter_data_id,
+                    top_value_counter_data_id,
+                    None,
+                    instance_key,
+                    module_constant_symbol_prefix_for_instance(inputs.module, instance_key),
+                    None,
+                )
+            };
+            let function_module_constant_object_data_ids = self.ensure_module_constant_objects(
+                function_module_constant_ptrs,
+                function_module_constant_binding_key,
+                function_module_constant_symbol_prefix.as_str(),
+            )?;
+            if !jit_plan_cache.contains_key(&function_module_constant_binding_key) {
+                let value_facts = infer_jit_value_facts(function_module);
+                let jit_module_local_plan = plan_jit_module_locals(function_module, &value_facts)?;
+                let jit_module_deopt_resume_plan =
+                    plan_jit_deopt_resume_module(function_module, &value_facts)?;
+                jit_plan_cache.insert(
+                    function_module_constant_binding_key,
+                    (
+                        value_facts,
+                        jit_module_local_plan,
+                        jit_module_deopt_resume_plan,
+                    ),
+                );
+            }
+            let (
+                function_value_facts,
+                function_jit_module_local_plan,
+                function_jit_module_deopt_resume_plan,
+            ) = jit_plan_cache
+                .get(&function_module_constant_binding_key)
+                .expect("JIT plan cache entry should exist after insertion");
+            let function_jit_local_plan = function_jit_module_local_plan
+                .function(function.function_id)
+                .ok_or_else(|| {
+                    format!(
+                        "missing JIT local plan for function {} ({})",
+                        function.function_id, function.names.qualname
+                    )
+                })?;
+            let function_jit_deopt_resume_plan = function_jit_module_deopt_resume_plan
+                .function(function.function_id)
+                .ok_or_else(|| {
+                    format!(
+                        "missing JIT deopt resume plan for function {} ({})",
+                        function.function_id, function.names.qualname
+                    )
+                })?;
+            let function_deopt_table = Arc::new(RuntimeJitDeoptTable::from_plan(
+                function,
+                function_jit_deopt_resume_plan,
+                function_module_constant_ptrs,
+            )?);
+            let built = build_cranelift_run_bb_specialized_function(
+                &mut self.jit_module,
+                function_blocks,
+                function_module,
+                function,
+                function_value_facts,
+                function_jit_local_plan,
+                function_jit_deopt_resume_plan,
+                function_module_constants,
+                function_counter_defs,
+                function_module_constant_object_data_ids.as_slice(),
+                function_counter_slots_by_id,
+                function_scalar_counter_data_id,
+                function_top_value_counter_data_id,
+                inputs.session.as_ref(),
+                function_direct_call_resolver,
+                &SpecializationProfile::from_runtime_state(function_direct_call_resolver)?,
+                function_symbol_scope.as_deref(),
+                Some(&plan.predeclared),
+                BuildSpecializedFunctionOptions::default(),
+            )
+            .map_err(|err| {
+                format!(
+                    "{err} [function={} id={}]",
+                    function.names.qualname, function.function_id
+                )
+            })?;
+            let mut ctx = built.ctx;
+            let main_id = built.main_id;
+            let main_symbol = built.main_symbol;
+            let default_adapter_id = built.default_adapter_id;
+            let default_adapter_symbol = built.default_adapter_symbol;
+            let clif_block_count = ctx.func.layout.blocks().count();
+            let clif_inst_count = ctx.func.dfg.num_insts();
+            let function_name =
+                direct_function_backend_name(function, batch_function.source.shared_state());
+            let artifact = define_prepared_function(
+                &mut self.jit_module,
+                main_id,
+                &mut ctx,
+                function_name.as_str(),
+                "failed to define specialized jit run_bb function",
+            )
+            .map_err(|err| {
+                format!(
+                    "{err} [function={} id={}]",
+                    function.names.qualname, function.function_id
+                )
+            })?;
+            self.jit_module.clear_context(&mut ctx);
+            let default_adapter_artifact = match (
+                default_adapter_id,
+                default_adapter_symbol.as_ref(),
+            ) {
+                (Some(default_adapter_id), Some(default_adapter_symbol)) => {
+                    let mut default_ctx = build_default_resolving_direct_adapter(
+                        &mut self.jit_module,
+                        function,
+                        main_id,
+                        default_adapter_id,
+                    )
+                    .map_err(|err| {
+                        format!(
+                            "{err} [default-adapter function={} id={}]",
+                            function.names.qualname, function.function_id
+                        )
+                    })?;
+                    let artifact = define_prepared_function(
+                        &mut self.jit_module,
+                        default_adapter_id,
+                        &mut default_ctx,
+                        default_adapter_symbol.as_str(),
+                        "failed to define default-resolving direct adapter",
+                    )
+                    .map_err(|err| {
+                        format!(
+                            "{err} [default-adapter function={} id={}]",
+                            function.names.qualname, function.function_id
+                        )
+                    })?;
+                    self.jit_module.clear_context(&mut default_ctx);
+                    Some(artifact)
+                }
+                (None, None) => None,
+                _ => {
+                    return Err(format!(
+                        "default direct adapter declaration is inconsistent for function {} id={}",
+                        function.names.qualname, function.function_id
+                    ));
+                }
+            };
+            defined_functions.push(DefinedJitFunction {
+                function_id: function.function_id,
+                function_qualname: function.names.qualname.clone(),
+                param_count: function.params.len(),
+                main_id,
+                main_symbol,
+                default_adapter_id,
+                default_adapter_symbol,
+                stats: JitCodegenStats {
+                    clif_block_count,
+                    clif_inst_count,
+                    machine_code_size_bytes: artifact.code_size,
+                    machine_code_block_count: artifact.code_bb_offsets.len(),
+                    machine_code_edge_count: artifact.code_bb_edges.len(),
+                },
+                artifact,
+                default_adapter_artifact,
+                deopt_table: function_deopt_table,
+            });
+        }
+        Ok(defined_functions)
+    }
+
+    fn commit_defined_direct_function_batch(
+        &mut self,
+        session: &Arc<crate::session::CompileSession>,
+        root_function: &BlockPyFunction<CodegenModuleShape>,
+        defined_functions: Vec<DefinedJitFunction>,
+    ) -> Result<DirectFunctionCompileResult, String> {
+        self.jit_module
+            .finalize_definitions()
+            .map_err(|err| format!("failed to finalize specialized jit run_bb function: {err}"))?;
+        let mut root_handle = None;
+        let mut root_stats = None;
+        for defined in defined_functions {
+            let code_ptr = self.jit_module.get_finalized_function(defined.main_id);
+            let default_code_ptr = defined
+                .default_adapter_id
+                .map(|default_adapter_id| {
+                    self.jit_module.get_finalized_function(default_adapter_id)
+                })
+                .unwrap_or(code_ptr);
+            let compiled_handle = self.mark_direct_function_ready(
+                session,
+                defined.function_id,
+                code_ptr,
+                default_code_ptr,
+                defined.param_count,
+                Arc::clone(&defined.deopt_table),
+            )?;
+            let code_id = jitdump::record_code_load(
+                &defined.main_symbol,
+                code_ptr.cast::<u8>(),
+                defined.artifact.code_size,
+                self.jit_module.isa(),
+                defined.artifact.systemv_unwind_info.as_ref(),
+            )?;
+            record_jit_bb_map(
+                &defined.main_symbol,
+                code_id,
+                &defined.artifact,
+                defined.function_id,
+                &defined.function_qualname,
+                "direct_function_body",
+            );
+            if let (
+                Some(default_adapter_id),
+                Some(default_adapter_symbol),
+                Some(default_adapter_artifact),
+            ) = (
+                defined.default_adapter_id,
+                defined.default_adapter_symbol.as_ref(),
+                defined.default_adapter_artifact.as_ref(),
+            ) {
+                let default_code_ptr = self.jit_module.get_finalized_function(default_adapter_id);
+                let code_id = jitdump::record_code_load(
+                    default_adapter_symbol,
+                    default_code_ptr.cast::<u8>(),
+                    default_adapter_artifact.code_size,
+                    self.jit_module.isa(),
+                    default_adapter_artifact.systemv_unwind_info.as_ref(),
+                )?;
+                record_jit_bb_map(
+                    default_adapter_symbol,
+                    code_id,
+                    default_adapter_artifact,
+                    defined.function_id,
+                    &defined.function_qualname,
+                    "default_direct_adapter",
+                );
+            }
+            if defined.function_id == root_function.function_id {
+                root_handle = Some(compiled_handle);
+                root_stats = Some(defined.stats);
+            }
+        }
+        let handle = root_handle.ok_or_else(|| {
+            format!(
+                "process JIT batch did not define root function {} id={}",
+                root_function.names.qualname, root_function.function_id
+            )
+        })?;
+        Ok(DirectFunctionCompileResult {
+            handle,
+            compiled: true,
+            stats: root_stats,
+        })
     }
 }
 
@@ -14269,383 +14689,31 @@ impl ProcessJitEngine {
     ) -> Result<DirectFunctionCompileResult, String> {
         let batch_functions =
             collect_process_jit_batch_functions(session, function, direct_call_resolver)?;
-        let root_function_id = function.function_id;
+        let inputs = DirectFunctionCompileInputs {
+            session,
+            blocks,
+            module,
+            module_constants,
+            counter_defs,
+            module_constant_ptrs,
+        };
         let mut state = self
             .state
             .lock()
             .map_err(|_| "process JIT module lock poisoned".to_string())?;
-        if let Some(compiled_handle) = state.ready_direct_function(function) {
-            return Ok(DirectFunctionCompileResult {
-                handle: compiled_handle,
-                compiled: false,
-                stats: None,
-            });
-        }
         let _guard = ProcessJitCompileGuard::enter();
-        let mut predeclared = HashMap::new();
-        let mut functions_to_define = Vec::new();
-        for batch_function in &batch_functions {
-            let function = &batch_function.function;
-            let direct_symbol_scope = batch_function.source.shared_state().map(|shared_state| {
-                direct_function_symbol_scope_for_shared_state(shared_state, function.function_id)
-            });
-            let declared =
-                state.declare_direct_function(function, direct_symbol_scope.as_deref())?;
-            if !state.is_direct_function_ready(function.function_id) {
-                functions_to_define.push(batch_function);
+        let plan = match state.reserve_direct_function_batch(function, batch_functions)? {
+            ReservedDirectFunctionBatch::Ready(handle) => {
+                return Ok(DirectFunctionCompileResult {
+                    handle,
+                    compiled: false,
+                    stats: None,
+                });
             }
-            predeclared.insert(function.function_id, declared);
-        }
-
-        let mut defined_functions = Vec::with_capacity(functions_to_define.len());
-        let mut jit_plan_cache: HashMap<
-            usize,
-            (
-                FactStore,
-                PlannedJitModuleLocals,
-                PlannedJitDeoptResumeModule,
-            ),
-        > = HashMap::new();
-        for batch_function in functions_to_define {
-            let function = &batch_function.function;
-            let placeholder_blocks;
-            let function_blocks = if function.function_id == root_function_id {
-                blocks
-            } else {
-                placeholder_blocks =
-                    vec![std::ptr::null_mut::<std::ffi::c_void>(); function.blocks.len()];
-                placeholder_blocks.as_slice()
-            };
-            let owned_module_constant_ptrs;
-            let owned_counter_slots_by_id;
-            let (
-                function_module,
-                function_module_constants,
-                function_counter_defs,
-                function_module_constant_ptrs,
-                function_counter_slots_by_id,
-                function_scalar_counter_data_id,
-                function_top_value_counter_data_id,
-                function_direct_call_resolver,
-                function_module_constant_binding_key,
-                function_module_constant_symbol_prefix,
-                function_symbol_scope,
-            ) = if let Some(shared_state) = batch_function.source.shared_state() {
-                owned_module_constant_ptrs = shared_state.module_constant_ptrs();
-                let instance_key = shared_state.storage_instance_key();
-                let scalar_counter_symbol =
-                    scalar_counter_storage_symbol_for_shared_state(shared_state);
-                let scalar_counter_base_ptr = shared_state.scalar_counter_values_ptr();
-                let scalar_counter_data_id = if scalar_counter_base_ptr.is_null() {
-                    None
-                } else {
-                    register_jit_data_symbol(
-                        scalar_counter_symbol.as_str(),
-                        scalar_counter_base_ptr.cast::<u8>(),
-                    );
-                    Some(declare_scalar_counter_storage_import(
-                        &mut state.jit_module,
-                        scalar_counter_symbol.as_str(),
-                    )?)
-                };
-                let top_value_counter_symbol =
-                    top_value_counter_storage_symbol_for_shared_state(shared_state);
-                let top_value_counter_base_ptr = shared_state.top_value_counter_values_ptr();
-                let top_value_counter_data_id = if top_value_counter_base_ptr.is_null() {
-                    None
-                } else {
-                    register_jit_data_symbol(
-                        top_value_counter_symbol.as_str(),
-                        top_value_counter_base_ptr.cast::<u8>(),
-                    );
-                    Some(declare_top_value_counter_storage_import(
-                        &mut state.jit_module,
-                        top_value_counter_symbol.as_str(),
-                    )?)
-                };
-                (
-                    &shared_state.lowered_module,
-                    &shared_state.codegen_constants,
-                    shared_state.lowered_module.counter_defs.as_slice(),
-                    owned_module_constant_ptrs.as_slice(),
-                    shared_state.counter_slots_by_id(),
-                    scalar_counter_data_id,
-                    top_value_counter_data_id,
-                    Some(shared_state),
-                    instance_key,
-                    module_constant_symbol_prefix_for_shared_state(shared_state),
-                    Some(direct_function_symbol_scope_for_shared_state(
-                        shared_state,
-                        function.function_id,
-                    )),
-                )
-            } else {
-                let (counter_slots_by_id, scalar_counter_count, top_value_count) =
-                    build_counter_storage_layout(counter_defs)?;
-                let instance_key = module as *const BlockPyModule<CodegenModuleShape> as usize;
-                let scalar_counter_data_id = state.ensure_local_scalar_counter_storage(
-                    module,
-                    scalar_counter_count,
-                    instance_key,
-                )?;
-                let top_value_counter_data_id = state.ensure_local_top_value_counter_storage(
-                    module,
-                    top_value_count,
-                    instance_key,
-                )?;
-                owned_counter_slots_by_id = counter_slots_by_id;
-                (
-                    module,
-                    module_constants,
-                    counter_defs,
-                    module_constant_ptrs,
-                    owned_counter_slots_by_id.as_ref(),
-                    scalar_counter_data_id,
-                    top_value_counter_data_id,
-                    None,
-                    instance_key,
-                    module_constant_symbol_prefix_for_instance(module, instance_key),
-                    None,
-                )
-            };
-            let function_module_constant_object_data_ids = state.ensure_module_constant_objects(
-                function_module_constant_ptrs,
-                function_module_constant_binding_key,
-                function_module_constant_symbol_prefix.as_str(),
-            )?;
-            if !jit_plan_cache.contains_key(&function_module_constant_binding_key) {
-                let value_facts = infer_jit_value_facts(function_module);
-                let jit_module_local_plan = plan_jit_module_locals(function_module, &value_facts)?;
-                let jit_module_deopt_resume_plan =
-                    plan_jit_deopt_resume_module(function_module, &value_facts)?;
-                jit_plan_cache.insert(
-                    function_module_constant_binding_key,
-                    (
-                        value_facts,
-                        jit_module_local_plan,
-                        jit_module_deopt_resume_plan,
-                    ),
-                );
-            }
-            let (
-                function_value_facts,
-                function_jit_module_local_plan,
-                function_jit_module_deopt_resume_plan,
-            ) = jit_plan_cache
-                .get(&function_module_constant_binding_key)
-                .expect("JIT plan cache entry should exist after insertion");
-            let function_jit_local_plan = function_jit_module_local_plan
-                .function(function.function_id)
-                .ok_or_else(|| {
-                    format!(
-                        "missing JIT local plan for function {} ({})",
-                        function.function_id, function.names.qualname
-                    )
-                })?;
-            let function_jit_deopt_resume_plan = function_jit_module_deopt_resume_plan
-                .function(function.function_id)
-                .ok_or_else(|| {
-                    format!(
-                        "missing JIT deopt resume plan for function {} ({})",
-                        function.function_id, function.names.qualname
-                    )
-                })?;
-            let function_deopt_table = Arc::new(RuntimeJitDeoptTable::from_plan(
-                function,
-                function_jit_deopt_resume_plan,
-                function_module_constant_ptrs,
-            )?);
-            let built = build_cranelift_run_bb_specialized_function(
-                &mut state.jit_module,
-                function_blocks,
-                function_module,
-                function,
-                function_value_facts,
-                function_jit_local_plan,
-                function_jit_deopt_resume_plan,
-                function_module_constants,
-                function_counter_defs,
-                function_module_constant_object_data_ids.as_slice(),
-                function_counter_slots_by_id,
-                function_scalar_counter_data_id,
-                function_top_value_counter_data_id,
-                session.as_ref(),
-                function_direct_call_resolver,
-                &SpecializationProfile::from_runtime_state(function_direct_call_resolver)?,
-                function_symbol_scope.as_deref(),
-                Some(&predeclared),
-                BuildSpecializedFunctionOptions::default(),
-            )
-            .map_err(|err| {
-                format!(
-                    "{err} [function={} id={}]",
-                    function.names.qualname, function.function_id
-                )
-            })?;
-            let mut ctx = built.ctx;
-            let main_id = built.main_id;
-            let main_symbol = built.main_symbol;
-            let default_adapter_id = built.default_adapter_id;
-            let default_adapter_symbol = built.default_adapter_symbol;
-            let clif_block_count = ctx.func.layout.blocks().count();
-            let clif_inst_count = ctx.func.dfg.num_insts();
-            let function_name =
-                direct_function_backend_name(function, batch_function.source.shared_state());
-            let artifact = define_prepared_function(
-                &mut state.jit_module,
-                main_id,
-                &mut ctx,
-                function_name.as_str(),
-                "failed to define specialized jit run_bb function",
-            )
-            .map_err(|err| {
-                format!(
-                    "{err} [function={} id={}]",
-                    function.names.qualname, function.function_id
-                )
-            })?;
-            state.jit_module.clear_context(&mut ctx);
-            let default_adapter_artifact = match (
-                default_adapter_id,
-                default_adapter_symbol.as_ref(),
-            ) {
-                (Some(default_adapter_id), Some(default_adapter_symbol)) => {
-                    let mut default_ctx = build_default_resolving_direct_adapter(
-                        &mut state.jit_module,
-                        function,
-                        main_id,
-                        default_adapter_id,
-                    )
-                    .map_err(|err| {
-                        format!(
-                            "{err} [default-adapter function={} id={}]",
-                            function.names.qualname, function.function_id
-                        )
-                    })?;
-                    let artifact = define_prepared_function(
-                        &mut state.jit_module,
-                        default_adapter_id,
-                        &mut default_ctx,
-                        default_adapter_symbol.as_str(),
-                        "failed to define default-resolving direct adapter",
-                    )
-                    .map_err(|err| {
-                        format!(
-                            "{err} [default-adapter function={} id={}]",
-                            function.names.qualname, function.function_id
-                        )
-                    })?;
-                    state.jit_module.clear_context(&mut default_ctx);
-                    Some(artifact)
-                }
-                (None, None) => None,
-                _ => {
-                    return Err(format!(
-                        "default direct adapter declaration is inconsistent for function {} id={}",
-                        function.names.qualname, function.function_id
-                    ));
-                }
-            };
-            defined_functions.push(DefinedJitFunction {
-                function_id: function.function_id,
-                function_qualname: function.names.qualname.clone(),
-                param_count: function.params.len(),
-                main_id,
-                main_symbol,
-                default_adapter_id,
-                default_adapter_symbol,
-                stats: JitCodegenStats {
-                    clif_block_count,
-                    clif_inst_count,
-                    machine_code_size_bytes: artifact.code_size,
-                    machine_code_block_count: artifact.code_bb_offsets.len(),
-                    machine_code_edge_count: artifact.code_bb_edges.len(),
-                },
-                artifact,
-                default_adapter_artifact,
-                deopt_table: function_deopt_table,
-            });
-        }
-
-        state
-            .jit_module
-            .finalize_definitions()
-            .map_err(|err| format!("failed to finalize specialized jit run_bb function: {err}"))?;
-        let mut root_handle = None;
-        let mut root_stats = None;
-        for defined in defined_functions {
-            let code_ptr = state.jit_module.get_finalized_function(defined.main_id);
-            let default_code_ptr = defined
-                .default_adapter_id
-                .map(|default_adapter_id| {
-                    state.jit_module.get_finalized_function(default_adapter_id)
-                })
-                .unwrap_or(code_ptr);
-            let compiled_handle = state.mark_direct_function_ready(
-                session,
-                defined.function_id,
-                code_ptr,
-                default_code_ptr,
-                defined.param_count,
-                Arc::clone(&defined.deopt_table),
-            )?;
-            let code_id = jitdump::record_code_load(
-                &defined.main_symbol,
-                code_ptr.cast::<u8>(),
-                defined.artifact.code_size,
-                state.jit_module.isa(),
-                defined.artifact.systemv_unwind_info.as_ref(),
-            )?;
-            record_jit_bb_map(
-                &defined.main_symbol,
-                code_id,
-                &defined.artifact,
-                defined.function_id,
-                &defined.function_qualname,
-                "direct_function_body",
-            );
-            if let (
-                Some(default_adapter_id),
-                Some(default_adapter_symbol),
-                Some(default_adapter_artifact),
-            ) = (
-                defined.default_adapter_id,
-                defined.default_adapter_symbol.as_ref(),
-                defined.default_adapter_artifact.as_ref(),
-            ) {
-                let default_code_ptr = state.jit_module.get_finalized_function(default_adapter_id);
-                let code_id = jitdump::record_code_load(
-                    default_adapter_symbol,
-                    default_code_ptr.cast::<u8>(),
-                    default_adapter_artifact.code_size,
-                    state.jit_module.isa(),
-                    default_adapter_artifact.systemv_unwind_info.as_ref(),
-                )?;
-                record_jit_bb_map(
-                    default_adapter_symbol,
-                    code_id,
-                    default_adapter_artifact,
-                    defined.function_id,
-                    &defined.function_qualname,
-                    "default_direct_adapter",
-                );
-            }
-            if defined.function_id == function.function_id {
-                root_handle = Some(compiled_handle);
-                root_stats = Some(defined.stats);
-            }
-        }
-        let handle = root_handle.ok_or_else(|| {
-            format!(
-                "process JIT batch did not define root function {} id={}",
-                function.names.qualname, function.function_id
-            )
-        })?;
-        Ok(DirectFunctionCompileResult {
-            handle,
-            compiled: true,
-            stats: root_stats,
-        })
+            ReservedDirectFunctionBatch::Reserved(plan) => plan,
+        };
+        let defined_functions = state.compile_reserved_direct_function_batch(&inputs, &plan)?;
+        state.commit_defined_direct_function_batch(session, function, defined_functions)
     }
 }
 
