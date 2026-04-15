@@ -1,30 +1,34 @@
 use super::{
-    FunctionRuntimeDataLayout, RuntimeJitDeoptCursor, RuntimeJitDeoptInvocation,
-    RuntimeJitDeoptLocals, specialized_helpers::ObjPtr,
+    FunctionRuntimeDataLayout, RuntimeFunctionEntryPlan, RuntimeJitDeoptCursor,
+    RuntimeJitDeoptInvocation, RuntimeJitDeoptLocals, specialized_helpers::ObjPtr,
 };
 use crate::function_instantiation::{
     make_function_in_shared_state, make_function_kind_abi_tag, soac_jit_make_function_with_closure,
 };
-use crate::module_constants::load_runtime_name_owned;
+use crate::module_constants::{ModuleConstantId, load_runtime_name_owned_by_id};
 use crate::module_type::SharedModuleState;
 use crate::session::CompileSession;
 use pyo3::ffi;
 use pyo3::types::PyAny;
 use pyo3::{Bound, Python};
 use soac_blockpy::block_py::{
-    AbruptKind, BinOp, BinOpKind, BlockArg, BlockEdge, BlockTerm, CallArgKeyword,
-    CallArgPositional, CalleeFunctionId, CellLocation, InstrCodegen, LocalLocation, NameLike,
-    NameLocation, ParamKind, UnaryOp, UnaryOpKind,
+    AbruptKind, BinOp, BinOpKind, Block, BlockArg, BlockEdge, BlockLabel, BlockTerm,
+    CallArgKeyword, CallArgPositional, CalleeFunctionId, CellLocation, InstrCodegen,
+    LocalLocation, NameLocation, ParamKind, RuntimeName, UnaryOp, UnaryOpKind,
 };
 use soac_blockpy::block_py::{BlockPyFunction, FunctionKind};
-use soac_blockpy::passes::{
-    CodegenModuleShape, LocalEnvResumeBinding, LocalEnvResumeBindingState,
-    LocalEnvResumeValueSource, LocalRefKind,
-};
-use std::collections::HashMap;
+use soac_blockpy::passes::CodegenModuleShape;
 use std::ffi::{c_int, c_void};
 use std::ptr;
 use std::sync::Arc;
+
+fn dense_block_for_label<'a>(
+    function: &'a BlockPyFunction<CodegenModuleShape>,
+    label: BlockLabel,
+) -> Option<&'a Block<InstrCodegen>> {
+    let block = function.blocks.get(label.index())?;
+    (block.label == label).then_some(block)
+}
 
 unsafe extern "C" {
     static mut PyMethod_Type: ffi::PyTypeObject;
@@ -83,13 +87,20 @@ pub(crate) unsafe fn run_blockpy_function_from_vectorcall_entry(
     nargsf: usize,
     kwnames: ObjPtr,
 ) -> Result<ObjPtr, String> {
-    let Some((bindings, values)) = (unsafe {
-        build_entry_local_bindings(function, context.function_data_obj, args, nargsf, kwnames)?
+    let Some(values) = (unsafe {
+        build_entry_local_values(
+            context.entry_plan,
+            context.function_data_obj,
+            args,
+            nargsf,
+            kwnames,
+        )?
     }) else {
         return Ok(ptr::null_mut());
     };
-    let locals = match RuntimeJitDeoptLocals::from_live_bindings(
-        bindings.iter().zip(values.iter().copied()),
+    let locals = match RuntimeJitDeoptLocals::from_prevalidated_live_values(
+        context.entry_plan.local_bindings(),
+        values.as_slice(),
     ) {
         Ok(locals) => locals,
         Err(err) => {
@@ -113,7 +124,7 @@ pub(crate) struct BlockPyEntryRuntimeContext<'a> {
     shared_state: Arc<SharedModuleState>,
     globals_obj: ObjPtr,
     function_data_obj: ObjPtr,
-    module_constant_ptrs: &'a [ObjPtr],
+    entry_plan: &'a RuntimeFunctionEntryPlan,
 }
 
 #[allow(dead_code)]
@@ -123,14 +134,14 @@ impl<'a> BlockPyEntryRuntimeContext<'a> {
         shared_state: Arc<SharedModuleState>,
         globals_obj: ObjPtr,
         function_data_obj: ObjPtr,
-        module_constant_ptrs: &'a [ObjPtr],
+        entry_plan: &'a RuntimeFunctionEntryPlan,
     ) -> Self {
         Self {
             compile_session,
             shared_state,
             globals_obj,
             function_data_obj,
-            module_constant_ptrs,
+            entry_plan,
         }
     }
 }
@@ -183,9 +194,9 @@ impl<'inv, 'data> BlockPyFrameSource<'inv, 'data> {
             Self::Deopt(invocation) => invocation.module_constant_ptr(constant_index),
             Self::Entry(entry) => entry
                 .context
-                .module_constant_ptrs
-                .get(constant_index as usize)
-                .copied()
+                .shared_state
+                .module_constant_obj(ModuleConstantId(constant_index as usize))
+                .map(|obj| obj.as_ptr().cast())
                 .ok_or_else(|| {
                     format!(
                         "entry interpreter for function {} is missing module constant {}",
@@ -195,13 +206,26 @@ impl<'inv, 'data> BlockPyFrameSource<'inv, 'data> {
         }
     }
 
+    unsafe fn runtime_name_owned(&self, runtime_name: RuntimeName) -> ObjPtr {
+        match self {
+            Self::Deopt(_) => unsafe { load_runtime_name_owned_by_id(runtime_name).cast() },
+            Self::Entry(entry) => unsafe {
+                entry
+                    .context
+                    .shared_state
+                    .runtime_name_owned_cached(runtime_name)
+                    .cast()
+            },
+        }
+    }
+
     fn describe(&self) -> String {
         match self {
             Self::Deopt(invocation) => invocation.describe(),
             Self::Entry(entry) => format!(
-                "function {}, entry interpreter, module constants {}",
+                "function {}, entry interpreter, module {}",
                 entry.function.function_id,
-                entry.context.module_constant_ptrs.len()
+                entry.context.shared_state.module_id()
             ),
         }
     }
@@ -235,33 +259,18 @@ impl<'inv, 'data> BlockPyFrameSource<'inv, 'data> {
 
 #[cold]
 #[allow(dead_code)]
-unsafe fn build_entry_local_bindings(
-    function: &BlockPyFunction<CodegenModuleShape>,
+unsafe fn build_entry_local_values(
+    entry_plan: &RuntimeFunctionEntryPlan,
     function_data_obj: ObjPtr,
     args: *const ObjPtr,
     nargsf: usize,
     kwnames: ObjPtr,
-) -> Result<Option<(Vec<LocalEnvResumeBinding>, Vec<ObjPtr>)>, String> {
-    let layout = function.storage_layout.as_ref().ok_or_else(|| {
-        format!(
-            "entry interpreter expected storage layout for function {}",
-            function.function_id
-        )
-    })?;
-
-    let params = &function.params.params;
-    let runtime_layout = FunctionRuntimeDataLayout::from_function(function);
-    let positional_param_indices = params
-        .iter()
-        .enumerate()
-        .filter_map(|(index, param)| {
-            matches!(param.kind, ParamKind::PosOnly | ParamKind::Any).then_some(index)
-        })
-        .collect::<Vec<_>>();
-    let positional_capacity = positional_param_indices.len();
-    let varargs_param = function.params.vararg_index();
-    let varkw_param = function.params.kwarg_index();
-    let callable_name = function.names.display_name.as_str();
+) -> Result<Option<Vec<ObjPtr>>, String> {
+    let params = entry_plan.params();
+    let positional_capacity = entry_plan.positional_capacity();
+    let varargs_param = entry_plan.varargs_param();
+    let varkw_param = entry_plan.varkw_param();
+    let callable_name = entry_plan.callable_name();
     let nargs = unsafe { ffi::PyVectorcall_NARGS(nargsf) as usize };
     let nkw = if kwnames.is_null() {
         0
@@ -276,30 +285,6 @@ unsafe fn build_entry_local_bindings(
             );
         }
         return Ok(None);
-    }
-
-    let mut slot_by_name = HashMap::new();
-    for (slot, name) in layout.stack_slots().iter().enumerate() {
-        let slot_u32 = u32::try_from(slot).map_err(|_| {
-            format!(
-                "entry interpreter cannot address stack slot {slot} for function {}",
-                function.function_id
-            )
-        })?;
-        if slot_by_name.insert(name.as_str(), slot_u32).is_some() {
-            return Err(format!(
-                "entry interpreter found duplicate stack slot name {name:?} in function {}",
-                function.function_id
-            ));
-        }
-    }
-    for param in params {
-        if !slot_by_name.contains_key(param.name.as_str()) {
-            return Err(format!(
-                "entry interpreter expected param {:?} in stack slots for function {}",
-                param.name, function.function_id
-            ));
-        }
     }
 
     if varargs_param.is_none() && nargs > positional_capacity {
@@ -321,7 +306,7 @@ unsafe fn build_entry_local_bindings(
 
     let positional_bound = nargs.min(positional_capacity);
     for position in 0..positional_bound {
-        let param_index = positional_param_indices[position];
+        let param_index = entry_plan.positional_param_indices()[position];
         let value = unsafe { *args.add(position) };
         if value.is_null() {
             unsafe {
@@ -413,9 +398,9 @@ unsafe fn build_entry_local_bindings(
             unsafe { release_entry_param_values(param_values.as_mut_slice()) };
             return Ok(None);
         };
-        if let Some(param_index) = function.params.param_index(key_name.as_str()) {
+        if let Some(param_index) = entry_plan.param_index(key_name.as_str()) {
             let param = &params[param_index];
-            match param.kind {
+            match param.kind() {
                 ParamKind::PosOnly | ParamKind::VarArg => {
                     if !has_varkw {
                         unsafe {
@@ -488,17 +473,11 @@ unsafe fn build_entry_local_bindings(
         if assigned[param_index] {
             continue;
         }
-        match param.kind {
+        match param.kind() {
             ParamKind::VarArg | ParamKind::KwArg => {}
             ParamKind::PosOnly | ParamKind::Any | ParamKind::KwOnly => {
                 let default = unsafe {
-                    load_entry_default_arg_owned(
-                        &runtime_layout,
-                        function_data_obj,
-                        param_index,
-                        param.kind,
-                        param.name.as_str(),
-                    )?
+                    load_entry_default_arg_owned(param.default_slot(), function_data_obj)?
                 };
                 if let Some(default) = default {
                     param_values[param_index] = default;
@@ -508,7 +487,8 @@ unsafe fn build_entry_local_bindings(
                         release_entry_param_values(param_values.as_mut_slice());
                         set_entry_type_error(format!(
                             "{}() missing required argument '{}'",
-                            callable_name, param.name
+                            callable_name,
+                            param.name()
                         ));
                     }
                     return Ok(None);
@@ -517,66 +497,24 @@ unsafe fn build_entry_local_bindings(
         }
     }
 
-    let mut arg_by_name = HashMap::new();
-    for (param_index, param) in params.iter().enumerate() {
-        let value = param_values[param_index];
-        if value.is_null() {
-            continue;
-        }
-        if !slot_by_name.contains_key(param.name.as_str()) {
-            unsafe { release_entry_param_values(param_values.as_mut_slice()) };
-            return Err(format!(
-                "entry interpreter expected param {:?} in stack slots for function {}",
-                param.name, function.function_id
-            ));
-        }
-        arg_by_name.insert(param.name.as_str(), value);
-    }
-
-    let mut bindings = Vec::with_capacity(layout.stack_slots().len());
-    let mut values = Vec::with_capacity(layout.stack_slots().len());
-    for (slot, name) in layout.stack_slots().iter().enumerate() {
-        let location = LocalLocation(u32::try_from(slot).expect("slot was validated above"));
-        if let Some(arg) = arg_by_name.get(name.as_str()).copied() {
-            bindings.push(LocalEnvResumeBinding {
-                name: name.clone(),
-                location,
-                binding: LocalEnvResumeBindingState::Bound,
-                source: LocalEnvResumeValueSource::Unknown,
-                ownership: LocalRefKind::Owned,
-                value: None,
-            });
-            values.push(arg);
+    let mut values = vec![ptr::null_mut(); entry_plan.local_bindings().len()];
+    for (local_index, param_index) in entry_plan.local_param_indices().iter().copied().enumerate() {
+        if let Some(param_index) = param_index {
+            values[local_index] = param_values[param_index];
+            param_values[param_index] = ptr::null_mut();
         } else {
-            bindings.push(LocalEnvResumeBinding {
-                name: name.clone(),
-                location,
-                binding: LocalEnvResumeBindingState::Unbound,
-                source: LocalEnvResumeValueSource::Unbound,
-                ownership: LocalRefKind::Unbound,
-                value: None,
-            });
-            values.push(ptr::null_mut());
+            values[local_index] = ptr::null_mut();
         }
     }
-    Ok(Some((bindings, values)))
+    debug_assert!(param_values.iter().all(|value| value.is_null()));
+    Ok(Some(values))
 }
 
 #[cold]
 unsafe fn load_entry_default_arg_owned(
-    runtime_layout: &FunctionRuntimeDataLayout,
+    default_slot: Option<usize>,
     function_data_obj: ObjPtr,
-    param_index: usize,
-    param_kind: ParamKind,
-    param_name: &str,
 ) -> Result<Option<ObjPtr>, String> {
-    let default_slot = match param_kind {
-        ParamKind::PosOnly | ParamKind::Any => {
-            runtime_layout.positional_default_slot_for_param_index(param_index)
-        }
-        ParamKind::KwOnly => runtime_layout.kwonly_default_slot(param_name),
-        ParamKind::VarArg | ParamKind::KwArg => None,
-    };
     let Some(default_slot) = default_slot else {
         return Ok(None);
     };
@@ -683,6 +621,26 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
     }
 
     #[cold]
+    unsafe fn execute_runtime_name_deopt(
+        &self,
+        runtime_name: RuntimeName,
+    ) -> Result<ObjPtr, String> {
+        Ok(unsafe { self.source.runtime_name_owned(runtime_name) })
+    }
+
+    unsafe fn callable_is_runtime_name(&self, callable: ObjPtr, runtime_name: RuntimeName) -> bool {
+        let runtime_obj = unsafe { self.source.runtime_name_owned(runtime_name) };
+        if runtime_obj.is_null() {
+            return false;
+        }
+        let matches = runtime_obj.cast::<c_void>() == callable;
+        unsafe {
+            ffi::Py_DECREF(runtime_obj.cast::<ffi::PyObject>());
+        }
+        matches
+    }
+
+    #[cold]
     fn execute(&mut self) -> Result<ObjPtr, String> {
         let Some(cursor) = self.source.initial_cursor() else {
             return Err(format!(
@@ -703,16 +661,12 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
         'execute: loop {
             let block_label = cursor.block();
             let start_body_index = cursor.body_index();
-            let block = function
-                .blocks
-                .iter()
-                .find(|candidate| candidate.label == block_label)
-                .ok_or_else(|| {
-                    format!(
-                        "deopt continuation expected block {block_label} in function {}",
-                        function.function_id
-                    )
-                })?;
+            let block = dense_block_for_label(function, block_label).ok_or_else(|| {
+                format!(
+                    "deopt continuation expected dense block {block_label} in function {}",
+                    function.function_id
+                )
+            })?;
             let body_tail = block.body.get(start_body_index..).ok_or_else(|| {
                 format!(
                     "deopt continuation start body index {start_body_index} is outside block {block_label}"
@@ -856,17 +810,13 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
         edge: &BlockEdge,
     ) -> Result<Option<RuntimeJitDeoptCursor>, String> {
         let function = self.source.function();
-        let target_block = function
-            .blocks
-            .iter()
-            .find(|candidate| candidate.label == edge.target)
-            .ok_or_else(|| {
-                format!(
-                    "deopt continuation expected jump target {} in function {}",
-                    edge.target, function.function_id
-                )
-            })?;
-        let target_params = target_block.params.clone();
+        let target_block = dense_block_for_label(function, edge.target).ok_or_else(|| {
+            format!(
+                "deopt continuation expected dense jump target {} in function {}",
+                edge.target, function.function_id
+            )
+        })?;
+        let target_params = &target_block.params;
         if edge.args.len() > target_params.len() {
             return Err(format!(
                 "deopt continuation jump to {} has {} explicit args for {} target params",
@@ -875,7 +825,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
                 target_params.len()
             ));
         }
-        for param in &target_params {
+        for param in target_params {
             if self.locals.get_by_name(param.name.as_str()).is_none() {
                 return Err(format!(
                     "deopt continuation jump to {} targets param {}, but it was not materialized: {}",
@@ -903,14 +853,14 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
                 }
                 return Ok(None);
             }
-            explicit_param_names.push(param.name.clone());
+            explicit_param_names.push(param.name.as_str());
             values.push(value);
         }
 
         for (param_name, value) in explicit_param_names.into_iter().zip(values.into_iter()) {
             let local = self
                 .locals
-                .get_by_name_mut(param_name.as_str())
+                .get_by_name_mut(param_name)
                 .expect("jump target params were prevalidated against materialized locals");
             unsafe {
                 local.replace_with_owned_value(value);
@@ -959,7 +909,9 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             InstrCodegen::CallDirect(call) => unsafe { self.execute_call_direct_owned(call) },
             InstrCodegen::Store(store) => unsafe { self.execute_store_owned(store) },
             InstrCodegen::Del(del) => unsafe { self.execute_del_owned(del) },
-            InstrCodegen::IncrementCounter(_) => unsafe { execute_runtime_name_deopt("NONE") },
+            InstrCodegen::IncrementCounter(_) => unsafe {
+                self.execute_runtime_name_deopt(RuntimeName::None)
+            },
             InstrCodegen::MakeCell(make_cell) => unsafe { self.execute_make_cell_owned(make_cell) },
             InstrCodegen::MakeFunctionWithClosure(make_function) => unsafe {
                 self.execute_make_function_with_closure_owned(make_function)
@@ -1130,28 +1082,33 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
                 function.function_id
             )
         })?;
-        let mut candidate_names = vec![closure_slot.storage_name.as_str()];
-        if closure_slot.logical_name != closure_slot.storage_name {
-            candidate_names.push(closure_slot.logical_name.as_str());
+        let location = layout
+            .stack_slots()
+            .iter()
+            .position(|name| name == &closure_slot.storage_name)
+            .and_then(|index| u32::try_from(index).ok())
+            .map(LocalLocation)
+            .ok_or_else(|| {
+                format!(
+                    "deopt continuation expected owned {debug_name} slot {slot} storage {} in function {} stack slots",
+                    closure_slot.storage_name, function.function_id
+                )
+            })?;
+        let Some(local) = self.locals.get_by_location(location) else {
+            return Err(format!(
+                "deopt continuation expected owned {debug_name} slot {slot} via local {location:?}, but locals were {}",
+                self.locals.describe()
+            ));
+        };
+        let value = local.value();
+        if value.is_null() {
+            set_deopt_unbound_local_error(closure_slot.storage_name.as_str());
+            return Ok(ptr::null_mut());
         }
-        for candidate_name in &candidate_names {
-            if let Some(local) = self.locals.get_by_name(candidate_name) {
-                let value = local.value();
-                if value.is_null() {
-                    set_deopt_unbound_local_error(candidate_name);
-                    return Ok(ptr::null_mut());
-                }
-                unsafe {
-                    ffi::Py_INCREF(value.cast::<ffi::PyObject>());
-                }
-                return Ok(value);
-            }
+        unsafe {
+            ffi::Py_INCREF(value.cast::<ffi::PyObject>());
         }
-        Err(format!(
-            "deopt continuation expected owned {debug_name} slot {slot} via names {:?}, but locals were {}",
-            candidate_names,
-            self.locals.describe()
-        ))
+        Ok(value)
     }
 
     #[cold]
@@ -1473,7 +1430,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
     ) -> Result<ObjPtr, String> {
         if positional_args.is_empty()
             && keyword_args.is_empty()
-            && is_runtime_name_load(callable_expr, "globals")
+            && is_runtime_name_load(callable_expr, RuntimeName::Globals)
         {
             return Ok(unsafe { self.entry_globals_owned() });
         }
@@ -1484,7 +1441,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
         }
         if positional_args.is_empty()
             && keyword_args.is_empty()
-            && unsafe { callable_is_runtime_name(callable, "globals") }
+            && unsafe { self.callable_is_runtime_name(callable, RuntimeName::Globals) }
         {
             unsafe {
                 ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
@@ -1790,7 +1747,9 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
                 self.execute_return_global(name, i64::from(slot.slot()))
             },
             NameLocation::GlobalName => unsafe { self.execute_return_global(name, -1) },
-            NameLocation::RuntimeName => unsafe { execute_runtime_name_deopt(name) },
+            NameLocation::RuntimeName(runtime_name) => unsafe {
+                self.execute_runtime_name_deopt(runtime_name)
+            },
             NameLocation::Constant(constant_index) => self.execute_module_constant(constant_index),
             NameLocation::Cell(location) => unsafe { self.execute_cell_load_owned(name, location) },
         }
@@ -1821,12 +1780,11 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
                 self.locals.describe()
             )
         })?;
-        if local.binding().name != *name {
-            return Err(format!(
-                "deopt continuation expected local {name} at {location:?}, but materialized {}",
-                local.binding().name
-            ));
-        }
+        debug_assert_eq!(
+            local.binding().name.as_str(),
+            name,
+            "deopt continuation local slot {location:?} should be bound to {name}"
+        );
         let value = local.value();
         if value.is_null() {
             set_deopt_unbound_local_error(name);
@@ -1882,14 +1840,13 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
                 set_deopt_unbound_local_error(name);
                 return Ok(ptr::null_mut());
             }
-            return unsafe { execute_runtime_name_deopt("NONE") };
+            return unsafe { self.execute_runtime_name_deopt(RuntimeName::None) };
         };
-        if local.binding().name != *name {
-            return Err(format!(
-                "deopt continuation expected local {name} at {location:?}, but materialized {}",
-                local.binding().name
-            ));
-        }
+        debug_assert_eq!(
+            local.binding().name.as_str(),
+            name,
+            "deopt continuation local slot {location:?} should be bound to {name}"
+        );
         if local.value().is_null() {
             if !quietly {
                 set_deopt_unbound_local_error(name);
@@ -1900,7 +1857,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
                 local.delete_value();
             }
         }
-        unsafe { execute_runtime_name_deopt("NONE") }
+        unsafe { self.execute_runtime_name_deopt(RuntimeName::None) }
     }
 
     #[cold]
@@ -2011,15 +1968,11 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
                 self.locals.describe()
             ));
         };
-        if local.binding().name != *name {
-            unsafe {
-                ffi::Py_DECREF(value.cast::<ffi::PyObject>());
-            }
-            return Err(format!(
-                "deopt continuation expected local {name} at {location:?}, but materialized {}",
-                local.binding().name
-            ));
-        }
+        debug_assert_eq!(
+            local.binding().name.as_str(),
+            name,
+            "deopt continuation local slot {location:?} should be bound to {name}"
+        );
         unsafe {
             local.replace_with_owned_value(value);
             ffi::Py_INCREF(value.cast::<ffi::PyObject>());
@@ -2250,31 +2203,11 @@ unsafe fn callable_soac_function_id(callable: *mut ffi::PyObject) -> u64 {
     0
 }
 
-fn is_runtime_name_load(expr: &InstrCodegen, name: &str) -> bool {
-    matches!(expr, InstrCodegen::Load(load) if load.name.is_runtime_symbol(name))
-}
-
-unsafe fn callable_is_runtime_name(callable: ObjPtr, name: &str) -> bool {
-    let name_len = match ffi::Py_ssize_t::try_from(name.len()) {
-        Ok(name_len) => name_len,
-        Err(_) => return false,
-    };
-    let name_obj = unsafe { ffi::PyUnicode_FromStringAndSize(name.as_ptr().cast(), name_len) };
-    if name_obj.is_null() {
-        return false;
-    }
-    let runtime_obj = unsafe { load_runtime_name_owned(name_obj) };
-    unsafe {
-        ffi::Py_DECREF(name_obj);
-    }
-    if runtime_obj.is_null() {
-        return false;
-    }
-    let matches = runtime_obj.cast::<c_void>() == callable;
-    unsafe {
-        ffi::Py_DECREF(runtime_obj);
-    }
-    matches
+fn is_runtime_name_load(expr: &InstrCodegen, runtime_name: RuntimeName) -> bool {
+    matches!(
+        expr,
+        InstrCodegen::Load(load) if load.name.runtime_name_id() == Some(runtime_name)
+    )
 }
 
 unsafe fn merge_kwargs_or_format_error(
@@ -2374,20 +2307,6 @@ unsafe fn execute_binop_kind_owned(
         }
     };
     Ok(result.cast())
-}
-
-#[cold]
-unsafe fn execute_runtime_name_deopt(name: &str) -> Result<ObjPtr, String> {
-    let name_len = ffi::Py_ssize_t::try_from(name.len()).map_err(|_| {
-        format!("runtime-name deopt name {name:?} is too large to materialize as PyUnicode")
-    })?;
-    let name_obj = unsafe { ffi::PyUnicode_FromStringAndSize(name.as_ptr().cast(), name_len) };
-    if name_obj.is_null() {
-        return Ok(ptr::null_mut());
-    }
-    let result = unsafe { load_runtime_name_owned(name_obj) as ObjPtr };
-    unsafe { ffi::Py_DECREF(name_obj) };
-    Ok(result)
 }
 
 #[cold]

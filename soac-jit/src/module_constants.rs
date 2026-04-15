@@ -3,7 +3,7 @@ use pyo3::prelude::*;
 use soac_blockpy::block_py::{
     AbruptKind, BlockArg, BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword,
     ChildVisitable, InstrCodegen, InstrResolved, Literal, NameLike, NumberLiteralValue,
-    ParamDefaultSource, operation as blockpy_intrinsics,
+    ParamDefaultSource, RuntimeName, operation as blockpy_intrinsics,
 };
 use soac_blockpy::passes::CodegenModuleShape;
 use std::collections::HashMap;
@@ -11,7 +11,8 @@ use std::collections::HashMap;
 mod materialization;
 use materialization::RuntimeNameConstantMode;
 pub(crate) use materialization::{
-    StaticPyObjectImage, load_runtime_name_owned, raise_name_error_for_missing_name,
+    StaticPyObjectImage, load_runtime_name_owned, load_runtime_name_owned_by_id,
+    raise_name_error_for_missing_name,
 };
 
 const ALWAYS_REQUIRED_UNICODE_CONSTANTS: &[&str] = &[
@@ -23,8 +24,13 @@ const ALWAYS_REQUIRED_UNICODE_CONSTANTS: &[&str] = &[
     "extend",
     "update",
 ];
-const ALWAYS_REQUIRED_RUNTIME_NAME_CONSTANTS: &[&str] =
-    &["TRUE", "FALSE", "NONE", "EMPTY_TUPLE", "ITER_COMPLETE"];
+const ALWAYS_REQUIRED_RUNTIME_NAME_CONSTANTS: &[RuntimeName] = &[
+    RuntimeName::True,
+    RuntimeName::False,
+    RuntimeName::None,
+    RuntimeName::EmptyTuple,
+    RuntimeName::IterComplete,
+];
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct ModuleConstantId(pub usize);
 
@@ -35,7 +41,7 @@ enum ModuleConstantValue {
     Int(i64),
     BigInt(String),
     FloatBits(u64),
-    RuntimeName(Vec<u8>),
+    RuntimeName(RuntimeName),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -66,9 +72,7 @@ impl ModuleCodegenConstants {
         }
         if include_runtime_name_prelude {
             for name in ALWAYS_REQUIRED_RUNTIME_NAME_CONSTANTS {
-                collector
-                    .constants
-                    .intern_runtime_name_bytes(name.as_bytes());
+                collector.constants.intern_runtime_name(*name);
             }
         }
         for function in &module.callable_defs {
@@ -85,9 +89,7 @@ impl ModuleCodegenConstants {
             collector.constants.intern_unicode_bytes(name.as_bytes());
         }
         for name in ALWAYS_REQUIRED_RUNTIME_NAME_CONSTANTS {
-            collector
-                .constants
-                .intern_runtime_name_bytes(name.as_bytes());
+            collector.constants.intern_runtime_name(*name);
         }
         for function in functions {
             collector.collect_function(function);
@@ -196,7 +198,9 @@ impl ModuleCodegenConstants {
     }
 
     pub fn require_runtime_name_constant_id(&self, value: &str) -> ModuleConstantId {
-        self.lookup_id(&ModuleConstantValue::RuntimeName(value.as_bytes().to_vec()))
+        let runtime_name = RuntimeName::from_name(value)
+            .unwrap_or_else(|| panic!("unknown runtime-name module constant: {value}"));
+        self.lookup_id(&ModuleConstantValue::RuntimeName(runtime_name))
             .unwrap_or_else(|| {
                 panic!("missing runtime-name module constant in codegen pool: {value}")
             })
@@ -269,7 +273,7 @@ impl ModuleCodegenConstants {
 
     pub fn constant_runtime_name_value(&self, constant_id: ModuleConstantId) -> Option<&str> {
         match self.values.get(constant_id.0)? {
-            ModuleConstantValue::RuntimeName(bytes) => std::str::from_utf8(bytes).ok(),
+            ModuleConstantValue::RuntimeName(name) => Some(name.name()),
             ModuleConstantValue::Unicode(_)
             | ModuleConstantValue::Bytes(_)
             | ModuleConstantValue::Int(_)
@@ -303,7 +307,11 @@ impl ModuleCodegenConstants {
                 },
             },
             InstrResolved::Load(op) if op.name.is_runtime_name() => {
-                ModuleConstantValue::RuntimeName(op.name.id_str().as_bytes().to_vec())
+                ModuleConstantValue::RuntimeName(
+                    op.name
+                        .runtime_name_id()
+                        .expect("runtime-name load should carry a RuntimeName id"),
+                )
             }
             _ => {
                 panic!(
@@ -331,8 +339,8 @@ impl ModuleCodegenConstants {
         self.intern(ModuleConstantValue::Unicode(value.to_vec()))
     }
 
-    fn intern_runtime_name_bytes(&mut self, value: &[u8]) -> ModuleConstantId {
-        self.intern(ModuleConstantValue::RuntimeName(value.to_vec()))
+    fn intern_runtime_name(&mut self, value: RuntimeName) -> ModuleConstantId {
+        self.intern(ModuleConstantValue::RuntimeName(value))
     }
 
     fn intern_int(&mut self, value: i64) -> ModuleConstantId {

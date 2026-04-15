@@ -6,8 +6,9 @@ use soac_blockpy::block_py::{
     CodegenBlock, CounterDef, CounterSite, Del, DelItem, FunctionId, FunctionKind, FunctionName,
     GetAttr, GetItem, HasMeta, HasSemanticInstrId, IncrementCounter, InstrCodegen, InstrResolved,
     Literal, LiteralValue, Load, LocalLocation, MakeCell, Meta, ModuleNameGen, NameLocation,
-    NumberLiteral, NumberLiteralValue, Param, ParamKind, ParamSpec, ResolvedName, SetAttr, SetItem,
-    StorageLayout, Store, StringLiteral, Tuple, UnaryOp, UnaryOpKind, Visit, VisitMut, WithMeta,
+    NumberLiteral, NumberLiteralValue, Param, ParamKind, ParamSpec, ResolvedName, RuntimeName,
+    SetAttr, SetItem, StorageLayout, Store, StringLiteral, Tuple, UnaryOp, UnaryOpKind, Visit,
+    VisitMut, WithMeta,
 };
 use soac_blockpy::passes::{
     CodegenModuleShape, instrument_bb_module_with_block_entry_counters,
@@ -962,11 +963,8 @@ def add(left, right):
                 .iter()
                 .find(|function| function.names.bind_name == "add")
                 .expect("lowered module should contain add function");
-            let module_constant_ptrs = shared_state
-                .module_constant_ptrs()
-                .into_iter()
-                .map(|ptr| ptr.cast::<c_void>())
-                .collect::<Vec<_>>();
+            let entry_plan = RuntimeFunctionEntryPlan::from_function(function)
+                .expect("entry interpreter plan should build");
             let left = ffi::PyLong_FromLong(123_456_789);
             assert!(!left.is_null(), "test left allocation should succeed");
             let right = ffi::PyLong_FromLong(987_654_321);
@@ -979,7 +977,7 @@ def add(left, right):
                 std::sync::Arc::clone(&shared_state),
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                module_constant_ptrs.as_slice(),
+                &entry_plan,
             );
             let result = run_blockpy_function_from_entry(function, context, &args)
                 .expect("entry interpreter should run simple positional function");
@@ -1031,17 +1029,14 @@ def needs_arg(value):
                 .iter()
                 .find(|function| function.names.bind_name == "needs_arg")
                 .expect("lowered module should contain needs_arg function");
-            let module_constant_ptrs = shared_state
-                .module_constant_ptrs()
-                .into_iter()
-                .map(|ptr| ptr.cast::<c_void>())
-                .collect::<Vec<_>>();
+            let entry_plan = RuntimeFunctionEntryPlan::from_function(function)
+                .expect("entry interpreter plan should build");
             let context = BlockPyEntryRuntimeContext::new(
                 std::sync::Arc::new(crate::session::CompileSession::new()),
                 std::sync::Arc::clone(&shared_state),
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                module_constant_ptrs.as_slice(),
+                &entry_plan,
             );
             let result = unsafe { run_blockpy_function_from_entry(function, context, &[]) }.expect(
                 "entry interpreter should handle missing positional args as a Python call error",
@@ -1093,17 +1088,14 @@ def add_default(left, right=9):
             let left = ffi::PyLong_FromLong(33);
             assert!(!left.is_null(), "test left allocation should succeed");
             let args = [left.cast::<c_void>()];
-            let module_constant_ptrs = shared_state
-                .module_constant_ptrs()
-                .into_iter()
-                .map(|ptr| ptr.cast::<c_void>())
-                .collect::<Vec<_>>();
+            let entry_plan = RuntimeFunctionEntryPlan::from_function(function)
+                .expect("entry interpreter plan should build");
             let context = BlockPyEntryRuntimeContext::new(
                 std::sync::Arc::new(crate::session::CompileSession::new()),
                 std::sync::Arc::clone(&shared_state),
                 std::ptr::null_mut(),
                 function_data.as_mut_ptr().cast::<c_void>(),
-                module_constant_ptrs.as_slice(),
+                &entry_plan,
             );
 
             let result = run_blockpy_function_from_entry(function, context, &args)
@@ -1154,17 +1146,14 @@ def add_default(left, right=9):
             .iter()
             .find(|function| function.names.bind_name == function_name)
             .ok_or_else(|| format!("lowered module should contain function {function_name:?}"))?;
-        let module_constant_ptrs = shared_state
-            .module_constant_ptrs()
-            .into_iter()
-            .map(|ptr| ptr.cast::<c_void>())
-            .collect::<Vec<_>>();
+        let entry_plan = RuntimeFunctionEntryPlan::from_function(function)
+            .expect("entry interpreter plan should build");
         let context = BlockPyEntryRuntimeContext::new(
             std::sync::Arc::new(crate::session::CompileSession::new()),
             std::sync::Arc::clone(&shared_state),
             globals_obj,
             std::ptr::null_mut(),
-            module_constant_ptrs.as_slice(),
+            &entry_plan,
         );
         unsafe { run_blockpy_function_from_entry(function, context, positional_args) }
     }
@@ -2008,17 +1997,14 @@ def shaped(a, /, b, *args, c, **kwargs):
                 .iter()
                 .find(|function| function.names.bind_name == "shaped")
                 .expect("lowered module should contain shaped function");
-            let module_constant_ptrs = shared_state
-                .module_constant_ptrs()
-                .into_iter()
-                .map(|ptr| ptr.cast::<c_void>())
-                .collect::<Vec<_>>();
+            let entry_plan = RuntimeFunctionEntryPlan::from_function(function)
+                .expect("entry interpreter plan should build");
             let context = BlockPyEntryRuntimeContext::new(
                 std::sync::Arc::new(crate::session::CompileSession::new()),
                 std::sync::Arc::clone(&shared_state),
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                module_constant_ptrs.as_slice(),
+                &entry_plan,
             );
             let a = ffi::PyLong_FromLong(1);
             let b = ffi::PyLong_FromLong(2);
@@ -2109,17 +2095,14 @@ def add_kw_default(value, *, scale=9):
             let input = ffi::PyLong_FromLong(33);
             assert!(!input.is_null(), "test input should allocate");
             let args = [input.cast::<c_void>()];
-            let module_constant_ptrs = shared_state
-                .module_constant_ptrs()
-                .into_iter()
-                .map(|ptr| ptr.cast::<c_void>())
-                .collect::<Vec<_>>();
+            let entry_plan = RuntimeFunctionEntryPlan::from_function(function)
+                .expect("entry interpreter plan should build");
             let context = BlockPyEntryRuntimeContext::new(
                 std::sync::Arc::new(crate::session::CompileSession::new()),
                 std::sync::Arc::clone(&shared_state),
                 std::ptr::null_mut(),
                 function_data.as_mut_ptr().cast::<c_void>(),
-                module_constant_ptrs.as_slice(),
+                &entry_plan,
             );
 
             let result = run_blockpy_function_from_vectorcall_entry(
@@ -2168,17 +2151,14 @@ def takes_one(value):
                 .iter()
                 .find(|function| function.names.bind_name == "takes_one")
                 .expect("lowered module should contain takes_one function");
-            let module_constant_ptrs = shared_state
-                .module_constant_ptrs()
-                .into_iter()
-                .map(|ptr| ptr.cast::<c_void>())
-                .collect::<Vec<_>>();
+            let entry_plan = RuntimeFunctionEntryPlan::from_function(function)
+                .expect("entry interpreter plan should build");
             let context = BlockPyEntryRuntimeContext::new(
                 std::sync::Arc::new(crate::session::CompileSession::new()),
                 std::sync::Arc::clone(&shared_state),
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                module_constant_ptrs.as_slice(),
+                &entry_plan,
             );
             let positional = ffi::PyLong_FromLong(1);
             let keyword = ffi::PyLong_FromLong(2);
@@ -2816,9 +2796,11 @@ def build(values):
     }
 
     fn test_runtime_name(name: &str) -> ResolvedName {
+        let runtime_name = RuntimeName::from_name(name)
+            .unwrap_or_else(|| panic!("unknown test runtime name {name:?}"));
         ResolvedName {
-            id: name.into(),
-            location: NameLocation::RuntimeName,
+            id: runtime_name.name().into(),
+            location: NameLocation::RuntimeName(runtime_name),
         }
     }
 
@@ -7794,8 +7776,10 @@ def write_point(point, value):
             expected_value
         );
         assert!(
-            locals.describe().contains("x="),
-            "runtime locals diagnostics should include local names"
+            locals
+                .describe()
+                .contains(format!("x@{}=", location.slot()).as_str()),
+            "runtime locals diagnostics should include local names and slots"
         );
     }
 

@@ -295,9 +295,9 @@ define_owned_import_spec!(
     &[SigType::Pointer, SigType::Pointer]
 );
 define_owned_import_spec!(
-    DP_JIT_LOAD_RUNTIME_OBJ_IMPORT,
-    "dp_jit_load_runtime_obj",
-    &[SigType::Pointer]
+    DP_JIT_LOAD_RUNTIME_OBJ_BY_ID_IMPORT,
+    "dp_jit_load_runtime_obj_by_id",
+    &[SigType::I64]
 );
 define_owned_import_spec!(
     DP_JIT_DEL_GLOBAL_IMPORT,
@@ -399,7 +399,7 @@ pub(super) static OPERATION_IMPORT_SPECS: &[&ImportSpec] = &[
     &PYOBJECT_IS_TRUE_IMPORT,
     &PYSEQUENCE_CONTAINS_IMPORT,
     &DP_JIT_PYOBJECT_DELITEM_IMPORT,
-    &DP_JIT_LOAD_RUNTIME_OBJ_IMPORT,
+    &DP_JIT_LOAD_RUNTIME_OBJ_BY_ID_IMPORT,
     &DP_JIT_DEL_GLOBAL_IMPORT,
     &DP_JIT_DEL_GLOBAL_QUIETLY_IMPORT,
     &DP_JIT_DEL_DEREF_QUIETLY_IMPORT,
@@ -1560,7 +1560,7 @@ fn emit_load<'fb>(
 ) -> ir::Value {
     let func_ref = match op.name.location {
         NameLocation::Global(_) => state.import_func(&SOAC_RUNTIME_LOAD_GLOBAL_IMPORT),
-        NameLocation::RuntimeName => state.import_func(&DP_JIT_LOAD_RUNTIME_OBJ_IMPORT),
+        NameLocation::RuntimeName(_) => state.import_func(&DP_JIT_LOAD_RUNTIME_OBJ_BY_ID_IMPORT),
         _ => unreachable!("emit_load only applies to global and runtime helper names"),
     };
     let decref_ref = state.ctx().decref_ref;
@@ -1627,13 +1627,16 @@ fn emit_load<'fb>(
             state.fb().switch_to_block(value_ok_block);
             state.fb().block_params(value_ok_block)[0]
         }
-        NameLocation::RuntimeName => {
-            let name_obj = state.emit_owned_string_constant(op.name.id_str());
-            let call_inst = state.fb().ins().call(func_ref, &[name_obj]);
-            state
+        NameLocation::RuntimeName(_) => {
+            let runtime_name = op
+                .name
+                .runtime_name_id()
+                .expect("runtime-name load should carry a RuntimeName id");
+            let runtime_name_id = state
                 .fb()
                 .ins()
-                .call(decref_ref, &[thread_state_value, name_obj]);
+                .iconst(ir::types::I64, i64::from(runtime_name.id()));
+            let call_inst = state.fb().ins().call(func_ref, &[runtime_name_id]);
             state.fb().inst_results(call_inst)[0]
         }
         _ => unreachable!("emit_load only applies to global and runtime helper names"),

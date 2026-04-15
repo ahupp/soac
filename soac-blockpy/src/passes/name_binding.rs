@@ -7,8 +7,8 @@ use crate::block_py::{
     ChildVisitable, ClassBodyFallback, ClosureInit, ClosureSlot, Del, DelItem, EffectiveBinding,
     FunctionId, FunctionKind, HasMeta, InstrLow, InstrResolved, InstrUnresolved, IntLiteral, Load,
     LocalLocation, MakeCell, MakeFunction, MakeFunctionWithClosure, MapFunction, MapInstr,
-    Mappable, NameLike, NameLocation, NumberLiteral, NumberLiteralValue, ResolvedName, SetItem,
-    StorageLayout, Store, StringLiteral, Tuple, UnresolvedName, Visit, VisitMut, WithMeta,
+    Mappable, NameLike, NameLocation, NumberLiteral, NumberLiteralValue, ResolvedName, RuntimeName,
+    SetItem, StorageLayout, Store, StringLiteral, Tuple, UnresolvedName, Visit, VisitMut, WithMeta,
 };
 use crate::passes::ruff_to_blockpy::{
     populate_exception_edge_args, rewrite_current_exception_in_core_blocks,
@@ -2075,8 +2075,8 @@ impl NameLocator<'_> {
         match name {
             UnresolvedName::SourceName(name) => self.locate_name(name),
             UnresolvedName::RuntimeName(name) => ResolvedName {
-                id: name,
-                location: NameLocation::RuntimeName,
+                id: name.name().into(),
+                location: NameLocation::RuntimeName(name),
             },
         }
     }
@@ -2103,8 +2103,8 @@ impl NameLocator<'_> {
         let name = match op.name {
             UnresolvedName::SourceName(name) => self.locate_make_cell_initializer_name(name),
             UnresolvedName::RuntimeName(name) => ResolvedName {
-                id: name,
-                location: NameLocation::RuntimeName,
+                id: name.name().into(),
+                location: NameLocation::RuntimeName(name),
             },
         };
         Load::new(name).with_meta(meta).into()
@@ -3030,7 +3030,10 @@ impl UnsoundBuiltinRuntimeNameRewriter<'_> {
         }
         // BEHAVIOR_CHANGE: runtime builtins are loaded from SOAC runtime constants,
         // not by re-checking module globals for a later shadowing store.
-        name.location = NameLocation::RuntimeName;
+        name.location = NameLocation::RuntimeName(
+            RuntimeName::from_name(name.id.as_str())
+                .expect("runtime builtin candidate should have a RuntimeName id"),
+        );
     }
 }
 

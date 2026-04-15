@@ -5,7 +5,7 @@ use crate::counter_dump::{
     CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry,
 };
 use crate::jit::JitCodegenStats;
-use crate::module_constants::ModuleCodegenConstants;
+use crate::module_constants::{ModuleCodegenConstants, load_runtime_name_owned_by_id};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::ffi;
 use pyo3::prelude::*;
@@ -13,7 +13,7 @@ use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyAnyMethods, PyList, PyTuple};
 use soac_blockpy::block_py::{
     BlockPyFunction, BlockPyModule, CounterDef, CounterId, CounterScope, CounterSite,
-    DeoptEntrySource, FunctionId,
+    DeoptEntrySource, FunctionId, RuntimeName,
 };
 use soac_blockpy::env_config::SoacEnvConfig;
 use soac_blockpy::passes::CodegenModuleShape;
@@ -71,6 +71,9 @@ pub struct SharedModuleState {
     function_index_by_id: HashMap<FunctionId, usize>,
     original_code_by_function_id: HashMap<FunctionId, Py<PyAny>>,
     module_constant_objs: Vec<Py<PyAny>>,
+    // Each non-null slot owns one runtime-name reference for this module state; lookups return a
+    // fresh owned reference by INCREFing the cached pointer.
+    runtime_name_cache: Box<[AtomicUsize]>,
     counter_slots_by_id: Box<[CounterRuntimeSlot]>,
     counter_values: Box<[u64]>,
     top_value_counters: Box<[GilTopValueCounter]>,
@@ -95,7 +98,56 @@ pub(crate) enum CounterRuntimeSlot {
     TopValues(usize),
 }
 
+fn build_runtime_name_cache() -> Box<[AtomicUsize]> {
+    RuntimeName::ALL
+        .iter()
+        .map(|_| AtomicUsize::new(0))
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
 impl SharedModuleState {
+    pub(crate) unsafe fn runtime_name_owned_cached(
+        &self,
+        runtime_name: RuntimeName,
+    ) -> *mut ffi::PyObject {
+        let Some(slot) = self.runtime_name_cache.get(usize::from(runtime_name.id())) else {
+            return unsafe { load_runtime_name_owned_by_id(runtime_name) };
+        };
+        let cached = slot.load(Ordering::Acquire) as *mut ffi::PyObject;
+        if !cached.is_null() {
+            unsafe {
+                ffi::Py_INCREF(cached);
+            }
+            return cached;
+        }
+
+        let loaded = unsafe { load_runtime_name_owned_by_id(runtime_name) };
+        if loaded.is_null() {
+            return loaded;
+        }
+        match slot.compare_exchange(0, loaded as usize, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => {
+                unsafe {
+                    ffi::Py_INCREF(loaded);
+                }
+                loaded
+            }
+            Err(existing) => {
+                unsafe {
+                    ffi::Py_DECREF(loaded);
+                }
+                let existing = existing as *mut ffi::PyObject;
+                if !existing.is_null() {
+                    unsafe {
+                        ffi::Py_INCREF(existing);
+                    }
+                }
+                existing
+            }
+        }
+    }
+
     pub(crate) fn storage_instance_key(&self) -> usize {
         self.storage_instance_key
     }
@@ -735,6 +787,7 @@ fn build_shared_state_for_inspection_with_original_code(
         function_index_by_id,
         original_code_by_function_id,
         module_constant_objs,
+        runtime_name_cache: build_runtime_name_cache(),
         counter_slots_by_id,
         counter_values,
         top_value_counters,
@@ -817,6 +870,7 @@ impl SoacExtModuleState {
             function_index_by_id,
             original_code_by_function_id,
             module_constant_objs,
+            runtime_name_cache: build_runtime_name_cache(),
             counter_slots_by_id,
             counter_values,
             top_value_counters,
@@ -1499,6 +1553,7 @@ def f():
             source_hash: 0,
             storage_instance_key: allocate_shared_module_state_storage_key(),
             module_constant_objs: Vec::new(),
+            runtime_name_cache: build_runtime_name_cache(),
             counter_slots_by_id: vec![CounterRuntimeSlot::Scalar(0)].into_boxed_slice(),
             counter_values: vec![3].into_boxed_slice(),
             top_value_counters: Vec::new().into_boxed_slice(),
@@ -1572,6 +1627,7 @@ def f(x):
             source_hash: 0,
             storage_instance_key: allocate_shared_module_state_storage_key(),
             module_constant_objs: Vec::new(),
+            runtime_name_cache: build_runtime_name_cache(),
             counter_slots_by_id: vec![CounterRuntimeSlot::Scalar(0)].into_boxed_slice(),
             counter_values: vec![5].into_boxed_slice(),
             top_value_counters: Vec::new().into_boxed_slice(),
@@ -1725,6 +1781,7 @@ def f():
             source_hash: 0,
             storage_instance_key: allocate_shared_module_state_storage_key(),
             module_constant_objs: Vec::new(),
+            runtime_name_cache: build_runtime_name_cache(),
             counter_slots_by_id: vec![CounterRuntimeSlot::Scalar(0), CounterRuntimeSlot::Scalar(1)]
                 .into_boxed_slice(),
             counter_values: vec![5, 8].into_boxed_slice(),

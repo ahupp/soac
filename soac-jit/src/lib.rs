@@ -394,6 +394,7 @@ struct PyFunctionJitExtra {
     function_id: FunctionId,
     function_env: Box<FunctionEnv>,
     binding_plan: DirectArgBindingPlan,
+    entry_plan: jit::RuntimeFunctionEntryPlan,
     compile_session: Arc<CompileSession>,
     module_state: Arc<module_type::SharedModuleState>,
     compiled_vectorcall_entry: Option<jit::VectorcallEntryFn>,
@@ -951,6 +952,10 @@ unsafe fn make_clif_function_data(
     };
     let runtime_data_layout = jit::FunctionRuntimeDataLayout::from_function(&blockpy_function);
     let binding_plan = DirectArgBindingPlan::from_function(&blockpy_function);
+    let entry_plan = match jit::RuntimeFunctionEntryPlan::from_function(&blockpy_function) {
+        Ok(plan) => plan,
+        Err(err) => return set_runtime_error(&err),
+    };
     let runtime_object_values =
         unsafe { collect_function_runtime_objects(callable, &runtime_data_layout, None, None)? };
     let mut function_env = unsafe {
@@ -965,6 +970,7 @@ unsafe fn make_clif_function_data(
         function_id,
         function_env,
         binding_plan,
+        entry_plan,
         compile_session: module_runtime.compile_session.clone(),
         module_state,
         compiled_vectorcall_entry: None,
@@ -2282,18 +2288,12 @@ pub(crate) unsafe fn run_registered_clif_function_from_vectorcall_entry(
     }
     let data = py_function_jit_extra(function_obj)?;
     let blockpy_function = data.function()?;
-    let module_constant_ptrs = data
-        .module_state
-        .module_constant_ptrs()
-        .into_iter()
-        .map(|ptr| ptr.cast::<c_void>())
-        .collect::<Vec<_>>();
     let context = jit::BlockPyEntryRuntimeContext::new(
         Arc::clone(&data.compile_session),
         Arc::clone(&data.module_state),
         data.function_env.globals_obj().cast::<c_void>(),
         data.function_env.runtime_objects_ptr().cast::<c_void>(),
-        module_constant_ptrs.as_slice(),
+        &data.entry_plan,
     );
     match jit::run_blockpy_function_from_vectorcall_entry(
         blockpy_function,

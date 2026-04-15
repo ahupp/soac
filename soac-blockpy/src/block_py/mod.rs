@@ -73,6 +73,295 @@ fn is_internal_symbol(name: &str) -> bool {
     name.starts_with("_dp_") || name == "__soac__"
 }
 
+macro_rules! define_runtime_names {
+    ($($variant:ident => $name:literal,)+) => {
+        #[repr(u16)]
+        #[derive(
+            Debug,
+            Clone,
+            Copy,
+            PartialEq,
+            Eq,
+            Hash,
+            rkyv::Archive,
+            rkyv::Serialize,
+            rkyv::Deserialize,
+        )]
+        #[rkyv(derive(Hash, PartialEq, Eq, Debug))]
+        pub enum RuntimeName {
+            $($variant,)+
+        }
+
+        impl RuntimeName {
+            pub const ALL: &'static [Self] = &[
+                $(Self::$variant,)+
+            ];
+
+            pub const fn name(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $name,)+
+                }
+            }
+
+            pub fn from_name(name: &str) -> Option<Self> {
+                match name {
+                    $($name => Some(Self::$variant),)+
+                    _ => None,
+                }
+            }
+
+            pub const fn from_id(id: u16) -> Option<Self> {
+                match id {
+                    $(x if x == Self::$variant as u16 => Some(Self::$variant),)+
+                    _ => None,
+                }
+            }
+
+            pub const fn id(self) -> u16 {
+                self as u16
+            }
+
+            pub const fn name_nul_bytes(self) -> &'static [u8] {
+                match self {
+                    $(Self::$variant => concat!($name, "\0").as_bytes(),)+
+                }
+            }
+        }
+    };
+}
+
+define_runtime_names! {
+    NoDefault => "NO_DEFAULT",
+    Ellipsis => "ELLIPSIS",
+    True => "TRUE",
+    False => "FALSE",
+    None => "NONE",
+    EmptyTuple => "EMPTY_TUPLE",
+    IterComplete => "ITER_COMPLETE",
+    ArithmeticError => "ArithmeticError",
+    AssertionError => "AssertionError",
+    AttributeError => "AttributeError",
+    BaseException => "BaseException",
+    BaseExceptionGroup => "BaseExceptionGroup",
+    BlockingIOError => "BlockingIOError",
+    BrokenPipeError => "BrokenPipeError",
+    BufferError => "BufferError",
+    BytesWarning => "BytesWarning",
+    ChildProcessError => "ChildProcessError",
+    ConnectionAbortedError => "ConnectionAbortedError",
+    ConnectionError => "ConnectionError",
+    ConnectionRefusedError => "ConnectionRefusedError",
+    ConnectionResetError => "ConnectionResetError",
+    DeprecationWarning => "DeprecationWarning",
+    EOFError => "EOFError",
+    EncodingWarning => "EncodingWarning",
+    EnvironmentError => "EnvironmentError",
+    Exception => "Exception",
+    ExceptionGroup => "ExceptionGroup",
+    FileExistsError => "FileExistsError",
+    FileNotFoundError => "FileNotFoundError",
+    FloatingPointError => "FloatingPointError",
+    FutureWarning => "FutureWarning",
+    GeneratorExit => "GeneratorExit",
+    IOError => "IOError",
+    ImportError => "ImportError",
+    ImportWarning => "ImportWarning",
+    IndentationError => "IndentationError",
+    IndexError => "IndexError",
+    InterruptedError => "InterruptedError",
+    IsADirectoryError => "IsADirectoryError",
+    KeyError => "KeyError",
+    KeyboardInterrupt => "KeyboardInterrupt",
+    LookupError => "LookupError",
+    MemoryError => "MemoryError",
+    ModuleNotFoundError => "ModuleNotFoundError",
+    NameError => "NameError",
+    NotADirectoryError => "NotADirectoryError",
+    NotImplemented => "NotImplemented",
+    NotImplementedError => "NotImplementedError",
+    OSError => "OSError",
+    OverflowError => "OverflowError",
+    PendingDeprecationWarning => "PendingDeprecationWarning",
+    PermissionError => "PermissionError",
+    ProcessLookupError => "ProcessLookupError",
+    RecursionError => "RecursionError",
+    ReferenceError => "ReferenceError",
+    ResourceWarning => "ResourceWarning",
+    RuntimeError => "RuntimeError",
+    RuntimeWarning => "RuntimeWarning",
+    StopAsyncIteration => "StopAsyncIteration",
+    StopIteration => "StopIteration",
+    SyntaxError => "SyntaxError",
+    SyntaxWarning => "SyntaxWarning",
+    SystemError => "SystemError",
+    SystemExit => "SystemExit",
+    TabError => "TabError",
+    TimeoutError => "TimeoutError",
+    TypeError => "TypeError",
+    UnboundLocalError => "UnboundLocalError",
+    UnicodeDecodeError => "UnicodeDecodeError",
+    UnicodeEncodeError => "UnicodeEncodeError",
+    UnicodeError => "UnicodeError",
+    UnicodeTranslateError => "UnicodeTranslateError",
+    UnicodeWarning => "UnicodeWarning",
+    UserWarning => "UserWarning",
+    ValueError => "ValueError",
+    Warning => "Warning",
+    ZeroDivisionError => "ZeroDivisionError",
+    BuildClass => "__build_class__",
+    Import => "__import__",
+    Abs => "abs",
+    Aiter => "aiter",
+    All => "all",
+    Anext => "anext",
+    Any => "any",
+    Ascii => "ascii",
+    Bin => "bin",
+    Bool => "bool",
+    Breakpoint => "breakpoint",
+    Builtins => "builtins",
+    Bytearray => "bytearray",
+    Bytes => "bytes",
+    Callable => "callable",
+    Chr => "chr",
+    Classmethod => "classmethod",
+    Compile => "compile",
+    Complex => "complex",
+    Copyright => "copyright",
+    Credits => "credits",
+    Delattr => "delattr",
+    Dict => "dict",
+    Dir => "dir",
+    Divmod => "divmod",
+    Enumerate => "enumerate",
+    Eval => "eval",
+    Exec => "exec",
+    Exit => "exit",
+    Filter => "filter",
+    Float => "float",
+    Format => "format",
+    Frozenset => "frozenset",
+    Getattr => "getattr",
+    Globals => "globals",
+    Hasattr => "hasattr",
+    Hash => "hash",
+    Help => "help",
+    Hex => "hex",
+    Id => "id",
+    Input => "input",
+    Int => "int",
+    Isinstance => "isinstance",
+    Issubclass => "issubclass",
+    Iter => "iter",
+    Len => "len",
+    License => "license",
+    List => "list",
+    Locals => "locals",
+    Map => "map",
+    Max => "max",
+    Memoryview => "memoryview",
+    Min => "min",
+    Next => "next",
+    Object => "object",
+    Oct => "oct",
+    Open => "open",
+    Ord => "ord",
+    Pow => "pow",
+    Print => "print",
+    Property => "property",
+    Quit => "quit",
+    Range => "range",
+    Repr => "repr",
+    Reversed => "reversed",
+    Round => "round",
+    Set => "set",
+    Setattr => "setattr",
+    Slice => "slice",
+    Sorted => "sorted",
+    Staticmethod => "staticmethod",
+    Str => "str",
+    Sum => "sum",
+    Tuple => "tuple",
+    Type => "type",
+    Vars => "vars",
+    Zip => "zip",
+    ImportUnderscore => "import_",
+    ImportAttr => "import_attr",
+    Index => "_index",
+    UnsupportedFrameBuiltin => "_unsupported_frame_builtin",
+    TupleFromIter => "tuple_from_iter",
+    EvalStringLiteral => "eval_string_literal",
+    Deepcopy => "__deepcopy__",
+    TypingGeneric => "typing_Generic",
+    TypingTypeVar => "typing_TypeVar",
+    TypingTypeVarTuple => "typing_TypeVarTuple",
+    TypingParamSpec => "typing_ParamSpec",
+    TypingTypeAliasType => "typing_TypeAliasType",
+    TypingUnpack => "typing_Unpack",
+    TemplatelibTemplate => "templatelib_Template",
+    TemplatelibInterpolation => "templatelib_Interpolation",
+    LoadDeletedName => "load_deleted_name",
+    RaiseDeletedName => "raise_deleted_name",
+    BbTraceEnter => "bb_trace_enter",
+    YieldfromCellValue => "_yieldfrom_cell_value",
+    CurrentYieldfrom => "_current_yieldfrom",
+    IsCancelledError => "_is_cancelled_error",
+    ReraiseControlFlow => "_reraise_control_flow",
+    ClearCell => "_clear_cell",
+    MarkClosed => "_mark_closed",
+    NormalizeThrowExc => "_normalize_throw_exc",
+    CurrentThrowContext => "_current_throw_context",
+    FloatFromLiteral => "float_from_literal",
+    ComplexFromParts => "complex_from_parts",
+    ClassLookupCell => "class_lookup_cell",
+    ClassLookupGlobal => "class_lookup_global",
+    ValidateExceptionType => "_validate_exception_type",
+    ExceptionMatches => "exception_matches",
+    ExceptiongroupSplit => "exceptiongroup_split",
+    Unpack => "unpack",
+    CallSuper => "call_super",
+    CallSuperNoargs => "call_super_noargs",
+    MatchClassValidateArity => "_match_class_validate_arity",
+    MatchClassAttrExists => "match_class_attr_exists",
+    MatchClassAttrValue => "match_class_attr_value",
+    CodeTemplateGen => "code_template_gen",
+    CodeTemplateAsyncGen => "code_template_async_gen",
+    AnnotationForwardrefValue => "annotation_forwardref_value",
+    CurrentException => "current_exception",
+    CreateClass => "create_class",
+    ExcInfo => "exc_info",
+    ExcInfoFromException => "exc_info_from_exception",
+    GetAwaitableIter => "_get_awaitable_iter",
+    AwaitIter => "await_iter",
+    AnextOrSentinel => "anext_or_sentinel",
+    NextOrSentinel => "next_or_sentinel",
+    RaiseFrom => "raise_from",
+    CallExceptionClass => "_call_exception_class",
+    ImportStar => "import_star",
+    StoreGlobal => "store_global",
+    CellRef => "cell_ref",
+    DelQuietly => "del_quietly",
+    MakeFunction => "make_function",
+    LookupSpecialMethod => "_lookup_special_method",
+    HasSpecialMethod => "_has_special_method",
+    MissingContextProtocolMessage => "_missing_context_protocol_message",
+    ContextmanagerEnter => "contextmanager_enter",
+    ContextmanagerGetExit => "contextmanager_get_exit",
+    ContextmanagerExit => "contextmanager_exit",
+    EnsureAwaitable => "_ensure_awaitable",
+    AsynccontextmanagerAenter => "asynccontextmanager_aenter",
+    AsynccontextmanagerGetAexit => "asynccontextmanager_get_aexit",
+    AsynccontextmanagerExit => "asynccontextmanager_exit",
+    IterRange => "IterRange",
+    AsyncGenComplete => "AsyncGenComplete",
+    ClosureGenerator => "ClosureGenerator",
+    Coroutine => "Coroutine",
+    ClosureAsyncGenerator => "ClosureAsyncGenerator",
+    AsyncGenSend => "AsyncGenSend",
+    AwaitIterWrapper => "_AwaitIterWrapper",
+    DynamicCallee => "__dp_dynamic_callee",
+}
+
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
@@ -133,7 +422,7 @@ pub enum NameLocation {
     Local(LocalLocation),
     GlobalName,
     Global(GlobalSlot),
-    RuntimeName,
+    RuntimeName(RuntimeName),
     Cell(CellLocation),
     Constant(u32),
 }
@@ -151,8 +440,8 @@ impl NameLocation {
         Self::GlobalName
     }
 
-    pub fn runtime_name() -> Self {
-        Self::RuntimeName
+    pub fn runtime_name(name: RuntimeName) -> Self {
+        Self::RuntimeName(name)
     }
 
     pub fn owned_cell(slot: u32) -> Self {
@@ -176,7 +465,7 @@ impl NameLocation {
             Self::Local(location) => Some(location),
             Self::GlobalName
             | Self::Global(_)
-            | Self::RuntimeName
+            | Self::RuntimeName(_)
             | Self::Cell(_)
             | Self::Constant(_) => None,
         }
@@ -188,7 +477,7 @@ impl NameLocation {
             Self::Local(_)
             | Self::GlobalName
             | Self::Global(_)
-            | Self::RuntimeName
+            | Self::RuntimeName(_)
             | Self::Constant(_) => None,
         }
     }
@@ -199,7 +488,7 @@ impl NameLocation {
             Self::Local(_)
             | Self::GlobalName
             | Self::Global(_)
-            | Self::RuntimeName
+            | Self::RuntimeName(_)
             | Self::Cell(_) => None,
         }
     }
@@ -209,7 +498,7 @@ impl NameLocation {
             Self::Global(slot) => Some(slot),
             Self::Local(_)
             | Self::GlobalName
-            | Self::RuntimeName
+            | Self::RuntimeName(_)
             | Self::Cell(_)
             | Self::Constant(_) => None,
         }
@@ -224,7 +513,18 @@ impl NameLocation {
     }
 
     pub fn is_runtime_name(self) -> bool {
-        matches!(self, Self::RuntimeName)
+        matches!(self, Self::RuntimeName(_))
+    }
+
+    pub fn runtime_name_id(self) -> Option<RuntimeName> {
+        match self {
+            Self::RuntimeName(name) => Some(name),
+            Self::Local(_)
+            | Self::GlobalName
+            | Self::Global(_)
+            | Self::Cell(_)
+            | Self::Constant(_) => None,
+        }
     }
 
     pub fn pretty_id(self, unresolved_name: &str) -> String {
@@ -232,7 +532,7 @@ impl NameLocation {
             Self::Local(location) => format!("{location:?}"),
             Self::GlobalName => format!("{unresolved_name}@global"),
             Self::Global(slot) => format!("{unresolved_name}@g{}", slot.slot()),
-            Self::RuntimeName => unresolved_name.to_string(),
+            Self::RuntimeName(name) => name.name().to_string(),
             Self::Cell(location) => format!("{location:?}"),
             Self::Constant(index) => format!("constant slot {index}"),
         }
@@ -242,14 +542,17 @@ impl NameLocation {
 pub trait NameLike: Clone + fmt::Debug {
     fn id_str(&self) -> &str;
     fn runtime_name(name: &str) -> Self;
+    fn runtime_name_id(&self) -> Option<RuntimeName> {
+        None
+    }
     fn pretty_id(&self) -> String {
         self.id_str().to_string()
     }
     fn is_runtime_name(&self) -> bool {
-        false
+        self.runtime_name_id().is_some()
     }
     fn is_runtime_symbol(&self, name: &str) -> bool {
-        self.is_runtime_name() && self.id_str() == name
+        self.runtime_name_id() == RuntimeName::from_name(name)
     }
 }
 
@@ -307,7 +610,7 @@ impl From<ast::name::Name> for BlockPyName {
 #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum UnresolvedName {
     SourceName(BlockPyName),
-    RuntimeName(BlockPyName),
+    RuntimeName(RuntimeName),
 }
 
 impl fmt::Debug for UnresolvedName {
@@ -319,16 +622,23 @@ impl fmt::Debug for UnresolvedName {
 impl NameLike for UnresolvedName {
     fn id_str(&self) -> &str {
         match self {
-            Self::SourceName(name) | Self::RuntimeName(name) => name.as_str(),
+            Self::SourceName(name) => name.as_str(),
+            Self::RuntimeName(name) => name.name(),
         }
     }
 
     fn runtime_name(name: &str) -> Self {
-        Self::RuntimeName(name.into())
+        Self::RuntimeName(
+            RuntimeName::from_name(name)
+                .unwrap_or_else(|| panic!("unknown SOAC runtime name {name:?}")),
+        )
     }
 
-    fn is_runtime_name(&self) -> bool {
-        matches!(self, Self::RuntimeName(_))
+    fn runtime_name_id(&self) -> Option<RuntimeName> {
+        match self {
+            Self::RuntimeName(name) => Some(*name),
+            Self::SourceName(_) => None,
+        }
     }
 }
 
@@ -344,7 +654,8 @@ where
 impl UnresolvedName {
     pub fn name(self) -> ast::name::Name {
         match self {
-            Self::SourceName(name) | Self::RuntimeName(name) => name.into_ast_name(),
+            Self::SourceName(name) => name.into_ast_name(),
+            Self::RuntimeName(name) => ast::name::Name::new(name.name()),
         }
     }
 }
@@ -382,17 +693,25 @@ impl ResolvedName {
     pub fn is_runtime_name(&self) -> bool {
         self.location.is_runtime_name()
     }
+
+    pub fn runtime_name_id(&self) -> Option<RuntimeName> {
+        self.location.runtime_name_id()
+    }
 }
 
 impl NameLike for ResolvedName {
     fn id_str(&self) -> &str {
-        self.id.as_str()
+        self.runtime_name_id()
+            .map(RuntimeName::name)
+            .unwrap_or_else(|| self.id.as_str())
     }
 
     fn runtime_name(name: &str) -> Self {
+        let runtime_name = RuntimeName::from_name(name)
+            .unwrap_or_else(|| panic!("unknown SOAC runtime name {name:?}"));
         Self {
-            id: BlockPyName::new(name),
-            location: NameLocation::RuntimeName,
+            id: BlockPyName::new(runtime_name.name()),
+            location: NameLocation::RuntimeName(runtime_name),
         }
     }
 
@@ -400,8 +719,8 @@ impl NameLike for ResolvedName {
         self.resolved_pretty_id()
     }
 
-    fn is_runtime_name(&self) -> bool {
-        self.location.is_runtime_name()
+    fn runtime_name_id(&self) -> Option<RuntimeName> {
+        self.runtime_name_id()
     }
 }
 

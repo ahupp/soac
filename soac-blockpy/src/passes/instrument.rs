@@ -248,7 +248,7 @@ mod tests {
     use crate::block_py::{
         BlockEdge, Call, CallArgPositional, CallDirect, CalleeFunctionId, FunctionId, HasMeta,
         HasSemanticInstrId, InstrCodegen, InstrId, InstrWithConstantNone, Load, Meta, NameLocation,
-        ResolvedName, TermBranchTable, WithMeta,
+        ResolvedName, RuntimeName, TermBranchTable, WithMeta,
     };
     use crate::passes::InstrRuff;
     use crate::py_expr;
@@ -382,9 +382,11 @@ mod tests {
     }
 
     fn runtime_name_expr(name: &str, meta: Meta) -> InstrCodegen {
+        let runtime_name = RuntimeName::from_name(name)
+            .unwrap_or_else(|| panic!("unknown SOAC instrumentation runtime name {name:?}"));
         Load::new(ResolvedName {
-            id: name.into(),
-            location: NameLocation::RuntimeName,
+            id: runtime_name.name().into(),
+            location: NameLocation::RuntimeName(runtime_name),
         })
         .with_meta(meta)
         .into()
@@ -526,7 +528,7 @@ mod tests {
             Call::new(
                 runtime_name_expr("__dp_dynamic_callee", Meta::synthetic()),
                 vec![CallArgPositional::Positional(runtime_name_expr(
-                    "arg0",
+                    "NONE",
                     Meta::synthetic(),
                 ))],
                 Vec::new(),

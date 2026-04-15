@@ -43,8 +43,8 @@ use soac_blockpy::block_py::{
     BlockTerm, CallArgKeyword, CallArgPositional, CallableScopeKind, CellLocation, ChildVisitable,
     CodegenBlock, CounterDef, CounterId, CounterScope, CounterSite, Del, DeoptEntrySource,
     FunctionId, FunctionKind, HasMeta, HasSemanticInstrId, InstrCodegen, InstrId, InstrKey,
-    Literal, LocalLocation, NameLocation, ParamKind, ResolvedName, StorageLayout, Store, Visit,
-    WithMeta, operation as blockpy_intrinsics,
+    Literal, LocalLocation, NameLocation, ParamKind, ResolvedName, RuntimeName, StorageLayout,
+    Store, Visit, WithMeta, operation as blockpy_intrinsics,
 };
 use soac_blockpy::passes::{
     CodegenModuleShape, FactStore, FunctionRefcountPlan, InstrResolved, InstrTyped,
@@ -927,6 +927,11 @@ static DP_JIT_LOAD_RUNTIME_OBJ_IMPORT: ImportSpec = ImportSpec::new(
     &[SigType::Pointer],
     &[SigType::Pointer],
 );
+static DP_JIT_LOAD_RUNTIME_OBJ_BY_ID_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_load_runtime_obj_by_id",
+    &[SigType::I64],
+    &[SigType::Pointer],
+);
 static DP_JIT_PYOBJECT_GETATTR_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_pyobject_getattr",
     &[SigType::Pointer, SigType::Pointer],
@@ -1069,6 +1074,7 @@ static JIT_RUNTIME_IMPORT_SPECS: &[&ImportSpec] = &[
     &DP_JIT_PYTYPE_GENERIC_ALLOC_IMPORT,
     &DP_JIT_FINISH_CONSTRUCTOR_INIT_IMPORT,
     &DP_JIT_LOAD_RUNTIME_OBJ_IMPORT,
+    &DP_JIT_LOAD_RUNTIME_OBJ_BY_ID_IMPORT,
     &DP_JIT_PYOBJECT_GETATTR_IMPORT,
     &DP_JIT_PYOBJECT_SETATTR_IMPORT,
     &DP_JIT_PYOBJECT_GETITEM_IMPORT,
@@ -3290,7 +3296,25 @@ pub(crate) struct RuntimeJitDeoptLocal<'a> {
 }
 
 pub(crate) struct RuntimeJitDeoptLocals<'a> {
-    locals: Vec<RuntimeJitDeoptLocal<'a>>,
+    locals_by_slot: Vec<Option<RuntimeJitDeoptLocal<'a>>>,
+    len: usize,
+}
+
+pub(crate) struct RuntimeFunctionEntryParam {
+    name: String,
+    kind: ParamKind,
+    default_slot: Option<usize>,
+}
+
+pub(crate) struct RuntimeFunctionEntryPlan {
+    callable_name: String,
+    params: Box<[RuntimeFunctionEntryParam]>,
+    positional_param_indices: Box<[usize]>,
+    param_indices_by_name: HashMap<String, usize>,
+    varargs_param: Option<usize>,
+    varkw_param: Option<usize>,
+    local_bindings: Box<[LocalEnvResumeBinding]>,
+    local_param_indices: Box<[Option<usize>]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3355,6 +3379,176 @@ impl RuntimeJitDeoptContinuation {
             RuntimeJitDeoptContinuation::Unsupported { reason } => Some(*reason),
             RuntimeJitDeoptContinuation::ResumeBlockTail { .. } => None,
         }
+    }
+}
+
+impl RuntimeFunctionEntryPlan {
+    pub(crate) fn from_function(
+        function: &BlockPyFunction<CodegenModuleShape>,
+    ) -> Result<Self, String> {
+        let layout = function.storage_layout.as_ref().ok_or_else(|| {
+            format!(
+                "entry interpreter expected storage layout for function {}",
+                function.function_id
+            )
+        })?;
+        let runtime_data_layout = FunctionRuntimeDataLayout::from_function(function);
+        let positional_param_indices = function
+            .params
+            .params
+            .iter()
+            .enumerate()
+            .filter_map(|(index, param)| {
+                matches!(param.kind, ParamKind::PosOnly | ParamKind::Any).then_some(index)
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let varargs_param = function.params.vararg_index();
+        let varkw_param = function.params.kwarg_index();
+        let mut param_indices_by_name = HashMap::with_capacity(function.params.len());
+        let params = function
+            .params
+            .params
+            .iter()
+            .enumerate()
+            .map(|(index, param)| {
+                if param_indices_by_name
+                    .insert(param.name.clone(), index)
+                    .is_some()
+                {
+                    return Err(format!(
+                        "entry interpreter found duplicate param name {:?} in function {}",
+                        param.name, function.function_id
+                    ));
+                }
+                let default_slot = match param.kind {
+                    ParamKind::PosOnly | ParamKind::Any => {
+                        runtime_data_layout.positional_default_slot_for_param_index(index)
+                    }
+                    ParamKind::KwOnly => runtime_data_layout.kwonly_default_slot(&param.name),
+                    ParamKind::VarArg | ParamKind::KwArg => None,
+                };
+                Ok(RuntimeFunctionEntryParam {
+                    name: param.name.clone(),
+                    kind: param.kind,
+                    default_slot,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?
+            .into_boxed_slice();
+
+        let mut param_has_stack_slot = vec![false; params.len()];
+        let mut local_bindings = Vec::with_capacity(layout.stack_slots().len());
+        let mut local_param_indices = Vec::with_capacity(layout.stack_slots().len());
+        let mut local_names = HashSet::with_capacity(layout.stack_slots().len());
+        for (slot, name) in layout.stack_slots().iter().enumerate() {
+            if !local_names.insert(name.as_str()) {
+                return Err(format!(
+                    "entry interpreter found duplicate stack slot name {name:?} in function {}",
+                    function.function_id
+                ));
+            }
+            let location = LocalLocation(u32::try_from(slot).map_err(|_| {
+                format!(
+                    "entry interpreter cannot address stack slot {slot} for function {}",
+                    function.function_id
+                )
+            })?);
+            let param_index = param_indices_by_name.get(name.as_str()).copied();
+            if let Some(param_index) = param_index {
+                param_has_stack_slot[param_index] = true;
+            }
+            local_bindings.push(LocalEnvResumeBinding {
+                name: name.clone(),
+                location,
+                binding: if param_index.is_some() {
+                    LocalEnvResumeBindingState::Bound
+                } else {
+                    LocalEnvResumeBindingState::Unbound
+                },
+                source: if param_index.is_some() {
+                    LocalEnvResumeValueSource::Unknown
+                } else {
+                    LocalEnvResumeValueSource::Unbound
+                },
+                ownership: if param_index.is_some() {
+                    LocalRefKind::Owned
+                } else {
+                    LocalRefKind::Unbound
+                },
+                value: None,
+            });
+            local_param_indices.push(param_index);
+        }
+        for (param_index, param) in params.iter().enumerate() {
+            if !param_has_stack_slot[param_index] {
+                return Err(format!(
+                    "entry interpreter expected param {:?} in stack slots for function {}",
+                    param.name, function.function_id
+                ));
+            }
+        }
+
+        Ok(Self {
+            callable_name: function.names.display_name.clone(),
+            params,
+            positional_param_indices,
+            param_indices_by_name,
+            varargs_param,
+            varkw_param,
+            local_bindings: local_bindings.into_boxed_slice(),
+            local_param_indices: local_param_indices.into_boxed_slice(),
+        })
+    }
+
+    pub(crate) fn callable_name(&self) -> &str {
+        self.callable_name.as_str()
+    }
+
+    pub(crate) fn params(&self) -> &[RuntimeFunctionEntryParam] {
+        &self.params
+    }
+
+    pub(crate) fn param_index(&self, name: &str) -> Option<usize> {
+        self.param_indices_by_name.get(name).copied()
+    }
+
+    pub(crate) fn positional_param_indices(&self) -> &[usize] {
+        &self.positional_param_indices
+    }
+
+    pub(crate) fn positional_capacity(&self) -> usize {
+        self.positional_param_indices.len()
+    }
+
+    pub(crate) fn varargs_param(&self) -> Option<usize> {
+        self.varargs_param
+    }
+
+    pub(crate) fn varkw_param(&self) -> Option<usize> {
+        self.varkw_param
+    }
+
+    pub(crate) fn local_bindings(&self) -> &[LocalEnvResumeBinding] {
+        &self.local_bindings
+    }
+
+    pub(crate) fn local_param_indices(&self) -> &[Option<usize>] {
+        &self.local_param_indices
+    }
+}
+
+impl RuntimeFunctionEntryParam {
+    pub(crate) fn name(&self) -> &str {
+        self.name.as_str()
+    }
+
+    pub(crate) fn kind(&self) -> ParamKind {
+        self.kind
+    }
+
+    pub(crate) fn default_slot(&self) -> Option<usize> {
+        self.default_slot
     }
 }
 
@@ -4189,12 +4383,37 @@ impl RuntimeJitDeoptInvocation<'_> {
 }
 
 impl<'a> RuntimeJitDeoptLocals<'a> {
+    fn local_slot_index(location: LocalLocation) -> Result<usize, String> {
+        usize::try_from(location.slot()).map_err(|_| {
+            format!("local location {location:?} does not fit in a runtime local slot index")
+        })
+    }
+
+    fn insert_local(&mut self, local: RuntimeJitDeoptLocal<'a>) -> Result<(), String> {
+        let slot = Self::local_slot_index(local.binding.location)?;
+        if slot >= self.locals_by_slot.len() {
+            self.locals_by_slot.resize_with(slot + 1, || None);
+        }
+        if self.locals_by_slot[slot].is_some() {
+            return Err(format!(
+                "duplicate deopt local location {:?} while reconstructing runtime locals",
+                local.binding.location
+            ));
+        }
+        self.locals_by_slot[slot] = Some(local);
+        self.len += 1;
+        Ok(())
+    }
+
     pub(crate) fn from_live_bindings(
         live_bindings: impl IntoIterator<Item = (&'a LocalEnvResumeBinding, ObjPtr)>,
     ) -> Result<Self, String> {
         let mut names = HashSet::new();
         let mut locations = HashSet::new();
-        let mut locals = Vec::new();
+        let mut locals = Self {
+            locals_by_slot: Vec::new(),
+            len: 0,
+        };
         for (binding, value) in live_bindings {
             if !names.insert(binding.name.as_str()) {
                 return Err(format!(
@@ -4223,36 +4442,88 @@ impl<'a> RuntimeJitDeoptLocals<'a> {
                 }
                 _ => {}
             }
-            locals.push(RuntimeJitDeoptLocal {
+            locals.insert_local(RuntimeJitDeoptLocal {
                 binding,
                 value,
                 release_on_frame_exit: transient_local_needs_decref(binding.ownership),
-            });
+            })?;
         }
-        Ok(Self { locals })
+        Ok(locals)
+    }
+
+    pub(crate) fn from_prevalidated_live_values(
+        bindings: &'a [LocalEnvResumeBinding],
+        values: &[ObjPtr],
+    ) -> Result<Self, String> {
+        if bindings.len() != values.len() {
+            return Err(format!(
+                "entry interpreter expected {} local values but got {}",
+                bindings.len(),
+                values.len()
+            ));
+        }
+        let mut locals = Self {
+            locals_by_slot: Vec::with_capacity(bindings.len()),
+            len: 0,
+        };
+        for (binding, value) in bindings.iter().zip(values.iter().copied()) {
+            match binding.binding {
+                LocalEnvResumeBindingState::Bound if value.is_null() => {
+                    return Err(format!(
+                        "entry local {} at {:?} is definitely bound but has a null value",
+                        binding.name, binding.location
+                    ));
+                }
+                LocalEnvResumeBindingState::Unbound if !value.is_null() => {
+                    return Err(format!(
+                        "entry local {} at {:?} is unbound but has a non-null value",
+                        binding.name, binding.location
+                    ));
+                }
+                _ => {}
+            }
+            locals.insert_local(RuntimeJitDeoptLocal {
+                binding,
+                value,
+                release_on_frame_exit: transient_local_needs_decref(binding.ownership),
+            })?;
+        }
+        Ok(locals)
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.locals.len()
+        self.len
     }
 
     pub(crate) fn describe(&self) -> String {
         let names = self
-            .locals
+            .locals_by_slot
             .iter()
-            .map(|local| format!("{}={:p}", local.binding.name, local.value))
+            .filter_map(Option::as_ref)
+            .map(|local| {
+                format!(
+                    "{}@{}={:p}",
+                    local.binding.name,
+                    local.binding.location.slot(),
+                    local.value
+                )
+            })
             .collect::<Vec<_>>()
             .join(", ");
         format!("reconstructed locals {} [{}]", self.len(), names)
     }
 
     pub(crate) fn get_by_name(&self, name: &str) -> Option<&RuntimeJitDeoptLocal<'a>> {
-        self.locals.iter().find(|local| local.binding.name == name)
+        self.locals_by_slot
+            .iter()
+            .filter_map(Option::as_ref)
+            .find(|local| local.binding.name == name)
     }
 
     pub(crate) fn get_by_name_mut(&mut self, name: &str) -> Option<&mut RuntimeJitDeoptLocal<'a>> {
-        self.locals
+        self.locals_by_slot
             .iter_mut()
+            .filter_map(Option::as_mut)
             .find(|local| local.binding.name == name)
     }
 
@@ -4260,22 +4531,20 @@ impl<'a> RuntimeJitDeoptLocals<'a> {
         &self,
         location: LocalLocation,
     ) -> Option<&RuntimeJitDeoptLocal<'a>> {
-        self.locals
-            .iter()
-            .find(|local| local.binding.location == location)
+        let slot = usize::try_from(location.slot()).ok()?;
+        self.locals_by_slot.get(slot)?.as_ref()
     }
 
     pub(crate) fn get_by_location_mut(
         &mut self,
         location: LocalLocation,
     ) -> Option<&mut RuntimeJitDeoptLocal<'a>> {
-        self.locals
-            .iter_mut()
-            .find(|local| local.binding.location == location)
+        let slot = usize::try_from(location.slot()).ok()?;
+        self.locals_by_slot.get_mut(slot)?.as_mut()
     }
 
     pub(crate) unsafe fn release_frame_owned_values(&mut self) {
-        for local in &mut self.locals {
+        for local in self.locals_by_slot.iter_mut().filter_map(Option::as_mut) {
             unsafe {
                 local.release_frame_owned_value();
             }
@@ -4474,16 +4743,12 @@ fn emit_codegen_non_local_name_load(
             fb.switch_to_block(value_ok_block);
             Some(fb.block_params(value_ok_block)[0])
         }
-        NameLocation::RuntimeName => {
-            let name_obj = emit_owned_module_constant(
-                fb,
-                ctx.module_constants
-                    .require_unicode_constant_id(name.id.as_str()),
-                ctx,
-            );
-            let value_inst = fb.ins().call(ctx.load_runtime_obj_ref, &[name_obj]);
+        NameLocation::RuntimeName(_) => {
+            let runtime_name_id = runtime_name_id_value(fb, name.runtime_name_id());
+            let value_inst = fb
+                .ins()
+                .call(ctx.load_runtime_obj_by_id_ref, &[runtime_name_id]);
             let value = fb.inst_results(value_inst)[0];
-            let value = emit_decref_owned_input_after_nullable_result(fb, ctx, value, name_obj);
             let value_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, value, null_ptr);
             let value_ok_block = fb.create_block();
             fb.append_block_param(value_ok_block, ptr_ty);
@@ -4499,6 +4764,15 @@ fn emit_codegen_non_local_name_load(
         }
         NameLocation::Local(_) | NameLocation::Cell(_) => None,
     }
+}
+
+fn runtime_name_id_value(
+    fb: &mut FunctionBuilder<'_>,
+    runtime_name: Option<RuntimeName>,
+) -> ir::Value {
+    let runtime_name = runtime_name.expect("runtime-name load should carry a RuntimeName id");
+    fb.ins()
+        .iconst(ir::types::I64, i64::from(runtime_name.id()))
 }
 
 fn emit_cell_value_load_from_raw_cell(
@@ -5446,7 +5720,7 @@ struct JitEmitCtx<'mc> {
     store_global_indexed_ref: ir::FuncRef,
     probe_field_indexed_ref: ir::FuncRef,
     store_field_indexed_ref: ir::FuncRef,
-    load_runtime_obj_ref: ir::FuncRef,
+    load_runtime_obj_by_id_ref: ir::FuncRef,
     enter_recursive_ref: ir::FuncRef,
     pyobject_getattr_ref: ir::FuncRef,
     pyobject_setattr_ref: ir::FuncRef,
@@ -8905,20 +9179,16 @@ fn emit_object_call_with_tuple_args_result(
 
 fn emit_checked_runtime_name_object(
     fb: &mut FunctionBuilder<'_>,
-    name: &str,
+    runtime_name: RuntimeName,
     ctx: &JitEmitCtx<'_>,
 ) -> ir::Value {
-    let name_obj = emit_owned_module_constant(
-        fb,
-        ctx.module_constants.require_unicode_constant_id(name),
-        ctx,
-    );
+    let runtime_name_id = runtime_name_id_value(fb, Some(runtime_name));
     emit_checked_owned_pyobject_call_with_cleanup(
         fb,
         ctx,
-        ctx.load_runtime_obj_ref,
-        &[name_obj],
-        &[name_obj],
+        ctx.load_runtime_obj_by_id_ref,
+        &[runtime_name_id],
+        &[],
     )
 }
 
@@ -8928,7 +9198,7 @@ fn emit_empty_dict_with_args_tuple(
     empty_args_tuple_is_borrowed: bool,
     ctx: &JitEmitCtx<'_>,
 ) -> ir::Value {
-    let dict_callable = emit_checked_runtime_name_object(fb, "dict", ctx);
+    let dict_callable = emit_checked_runtime_name_object(fb, RuntimeName::Dict, ctx);
     let mut owned_inputs = Vec::with_capacity(2);
     if !empty_args_tuple_is_borrowed {
         owned_inputs.push(empty_args_tuple);
@@ -9185,7 +9455,7 @@ fn emit_unpack_call_result_with_local_env(
     let ptr_ty = ctx.consts.ptr_ty;
     let null_ptr = fb.ins().iconst(ptr_ty, 0);
 
-    let list_callable = emit_checked_runtime_name_object(fb, "list", ctx);
+    let list_callable = emit_checked_runtime_name_object(fb, RuntimeName::List, ctx);
     let empty_tuple_const = emit_empty_tuple_const(fb, ctx);
     let args_list = emit_checked_owned_pyobject_call_with_cleanup(
         fb,
@@ -9295,7 +9565,7 @@ fn emit_unpack_call_result_with_local_env(
         }
     }
 
-    let tuple_callable = emit_checked_runtime_name_object(fb, "tuple_from_iter", ctx);
+    let tuple_callable = emit_checked_runtime_name_object(fb, RuntimeName::TupleFromIter, ctx);
     let call_args_tuple = emit_checked_owned_pyobject_call_with_cleanup(
         fb,
         ctx,
@@ -15127,20 +15397,10 @@ fn emit_load_raise_from_function(
 ) -> ir::Value {
     let ptr_ty = emit_ctx.consts.ptr_ty;
     let null_ptr = fb.ins().iconst(ptr_ty, 0);
-    let raise_name_obj = emit_owned_module_constant(
-        fb,
-        emit_ctx
-            .module_constants
-            .require_unicode_constant_id("raise_from"),
-        emit_ctx,
-    );
+    let runtime_name_id = runtime_name_id_value(fb, Some(RuntimeName::RaiseFrom));
     let raise_fn_inst = fb
         .ins()
-        .call(emit_ctx.load_runtime_obj_ref, &[raise_name_obj]);
-    fb.ins().call(
-        emit_ctx.decref_ref,
-        &[emit_ctx.consts.thread_state_value, raise_name_obj],
-    );
+        .call(emit_ctx.load_runtime_obj_by_id_ref, &[runtime_name_id]);
     let raise_fn = fb.inst_results(raise_fn_inst)[0];
     let raise_fn_null = fb
         .ins()
@@ -19177,8 +19437,11 @@ fn build_cranelift_run_bb_specialized_function(
             &mut fb.func,
             &SOAC_RUNTIME_STORE_FIELD_INDEXED_IMPORT,
         );
-        let load_runtime_obj_ref =
-            func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_LOAD_RUNTIME_OBJ_IMPORT);
+        let load_runtime_obj_by_id_ref = func_imports.get_or_panic(
+            codegen_env,
+            &mut fb.func,
+            &DP_JIT_LOAD_RUNTIME_OBJ_BY_ID_IMPORT,
+        );
         let is_true_ref =
             func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_IS_TRUE_IMPORT);
         let raise_exc_ref =
@@ -19470,7 +19733,7 @@ fn build_cranelift_run_bb_specialized_function(
                 store_global_indexed_ref,
                 probe_field_indexed_ref,
                 store_field_indexed_ref,
-                load_runtime_obj_ref,
+                load_runtime_obj_by_id_ref,
                 enter_recursive_ref,
                 pyobject_getattr_ref,
                 pyobject_setattr_ref,

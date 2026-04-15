@@ -2,8 +2,8 @@
 
 use super::RuntimeJitDeoptInvocation;
 use crate::config::jit_perf_helper_frames_enabled;
-use crate::module_constants::load_runtime_name_owned;
 use crate::module_constants::raise_name_error_for_missing_name;
+use crate::module_constants::{load_runtime_name_owned, load_runtime_name_owned_by_id};
 use crate::operator_specialization::{ExactIntBinaryOpKind, ExactIntUnaryOpKind};
 use cranelift_jit::JITBuilder;
 use libc;
@@ -1014,6 +1014,7 @@ mod test_only_export_stubs {
         index: i64
     ));
     panic_obj_export!(dp_jit_load_runtime_obj(name: ObjPtr));
+    panic_obj_export!(dp_jit_load_runtime_obj_by_id(runtime_name_id: i64));
     panic_obj_export!(dp_jit_pyobject_getattr(obj: ObjPtr, attr: ObjPtr));
     panic_obj_export!(dp_jit_pyobject_setattr(obj: ObjPtr, attr: ObjPtr, value: ObjPtr));
     panic_obj_export!(dp_jit_pyobject_getitem(obj: ObjPtr, key: ObjPtr));
@@ -1170,6 +1171,18 @@ define_perf_toggle_export!(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_load_runtime_obj(name: ObjPtr) -> ObjPtr {
     load_runtime_name_owned(name as *mut ffi::PyObject) as ObjPtr
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dp_jit_load_runtime_obj_by_id(runtime_name_id: i64) -> ObjPtr {
+    let Ok(runtime_name_id) = u16::try_from(runtime_name_id) else {
+        ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c"invalid runtime name id".as_ptr());
+        return ptr::null_mut();
+    };
+    let Some(runtime_name) = soac_blockpy::block_py::RuntimeName::from_id(runtime_name_id) else {
+        ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c"unknown runtime name id".as_ptr());
+        return ptr::null_mut();
+    };
+    load_runtime_name_owned_by_id(runtime_name) as ObjPtr
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_pyobject_getattr(obj: ObjPtr, attr: ObjPtr) -> ObjPtr {
@@ -1973,6 +1986,10 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol(
         "dp_jit_load_runtime_obj",
         dp_jit_load_runtime_obj as *const u8,
+    );
+    builder.symbol(
+        "dp_jit_load_runtime_obj_by_id",
+        dp_jit_load_runtime_obj_by_id as *const u8,
     );
     builder.symbol(
         "dp_jit_vectorcall_bind_direct_args",

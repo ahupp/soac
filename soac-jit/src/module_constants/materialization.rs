@@ -2,6 +2,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
+use soac_blockpy::block_py::RuntimeName;
 use std::ffi::{CStr, CString, c_char, c_int};
 use std::mem::{self, offset_of};
 use std::ptr;
@@ -224,8 +225,8 @@ pub(super) fn build_python_constants(
                 let bound: Bound<'_, PyAny> = unsafe { Bound::from_owned_ptr_or_err(py, ptr)? };
                 bound.unbind()
             }
-            ModuleConstantValue::RuntimeName(bytes) => {
-                build_runtime_name_constant(py, bytes, runtime_name_mode)?
+            ModuleConstantValue::RuntimeName(name) => {
+                build_runtime_name_constant(py, *name, runtime_name_mode)?
             }
         });
     }
@@ -610,27 +611,30 @@ fn build_unicode_constant<'py>(py: Python<'py>, bytes: &[u8]) -> PyResult<Bound<
 
 fn build_runtime_name_constant(
     py: Python<'_>,
-    bytes: &[u8],
+    runtime_name: RuntimeName,
     mode: RuntimeNameConstantMode,
 ) -> PyResult<Py<PyAny>> {
     if matches!(mode, RuntimeNameConstantMode::BootstrapSoacRuntime) {
-        return build_soac_runtime_bootstrap_runtime_name(py, bytes);
+        return build_soac_runtime_bootstrap_runtime_name(py, runtime_name);
     }
-    let name = build_unicode_constant(py, bytes)?;
-    let ptr = unsafe { load_runtime_name_owned(name.as_ptr()) };
+    let ptr = unsafe { load_runtime_name_owned_by_id(runtime_name) };
     let bound: Bound<'_, PyAny> = unsafe { Bound::from_owned_ptr_or_err(py, ptr)? };
     Ok(bound.unbind())
 }
 
-fn build_soac_runtime_bootstrap_runtime_name(py: Python<'_>, bytes: &[u8]) -> PyResult<Py<PyAny>> {
-    let name = std::str::from_utf8(bytes)
-        .map_err(|_| PyRuntimeError::new_err("runtime-name constant is not UTF-8"))?;
-    match name {
-        "TRUE" | "FALSE" | "NONE" | "ELLIPSIS" | "EMPTY_TUPLE" | "ITER_COMPLETE" => {
-            Ok(PyModule::import(py, "soac.bootstrap")?
-                .getattr(name)?
-                .unbind())
-        }
+fn build_soac_runtime_bootstrap_runtime_name(
+    py: Python<'_>,
+    runtime_name: RuntimeName,
+) -> PyResult<Py<PyAny>> {
+    match runtime_name {
+        RuntimeName::True
+        | RuntimeName::False
+        | RuntimeName::None
+        | RuntimeName::Ellipsis
+        | RuntimeName::EmptyTuple
+        | RuntimeName::IterComplete => Ok(PyModule::import(py, "soac.bootstrap")?
+            .getattr(runtime_name.name())?
+            .unbind()),
         other => Err(PyRuntimeError::new_err(format!(
             "soac.runtime bootstrap cannot build runtime-name constant {other:?}; \
              source runtime-name loads in soac.runtime should have been lowered as globals"
@@ -669,14 +673,16 @@ pub(crate) unsafe fn raise_name_error_for_missing_name(name_obj: *mut ffi::PyObj
     ffi::PyErr_SetString(ffi::PyExc_NameError, c"name is not defined".as_ptr());
 }
 
-pub(crate) unsafe fn load_runtime_name_owned(name_obj: *mut ffi::PyObject) -> *mut ffi::PyObject {
-    if name_obj.is_null() {
-        ffi::PyErr_SetString(
-            ffi::PyExc_RuntimeError,
-            c"invalid runtime name constant".as_ptr(),
-        );
-        return ptr::null_mut();
+unsafe fn raise_name_error_for_missing_runtime_name(runtime_name: RuntimeName) {
+    let message = format!("name {:?} is not defined", runtime_name.name());
+    if let Ok(c_message) = CString::new(message) {
+        ffi::PyErr_SetString(ffi::PyExc_NameError, c_message.as_ptr());
+    } else {
+        ffi::PyErr_SetString(ffi::PyExc_NameError, c"name is not defined".as_ptr());
     }
+}
+
+unsafe fn load_runtime_module_owned() -> *mut ffi::PyObject {
     let runtime_module_name = c"soac.runtime".as_ptr();
     let mut runtime_obj = ptr::null_mut();
     let modules = ffi::PyImport_GetModuleDict();
@@ -689,6 +695,66 @@ pub(crate) unsafe fn load_runtime_name_owned(name_obj: *mut ffi::PyObject) -> *m
     if runtime_obj.is_null() {
         runtime_obj = ffi::PyImport_ImportModule(runtime_module_name);
     }
+    runtime_obj
+}
+
+pub(crate) unsafe fn load_runtime_name_owned_by_id(
+    runtime_name: RuntimeName,
+) -> *mut ffi::PyObject {
+    if runtime_name == RuntimeName::Builtins {
+        return ffi::PyImport_ImportModule(c"builtins".as_ptr());
+    }
+    let runtime_obj = load_runtime_module_owned();
+    if runtime_obj.is_null() {
+        return ptr::null_mut();
+    }
+    let name_ptr = runtime_name.name_nul_bytes().as_ptr().cast();
+    let runtime_value = ffi::PyObject_GetAttrString(runtime_obj, name_ptr);
+    ffi::Py_DECREF(runtime_obj);
+    if !runtime_value.is_null() {
+        return runtime_value;
+    }
+    if ffi::PyErr_ExceptionMatches(ffi::PyExc_AttributeError) == 0 {
+        return ptr::null_mut();
+    }
+    ffi::PyErr_Clear();
+    let builtins_dict = ffi::PyEval_GetBuiltins();
+    if builtins_dict.is_null() {
+        ffi::PyErr_SetString(
+            ffi::PyExc_RuntimeError,
+            c"PyEval_GetBuiltins returned null".as_ptr(),
+        );
+        return ptr::null_mut();
+    }
+    let builtin_value = ffi::PyDict_GetItemString(builtins_dict, name_ptr);
+    if !builtin_value.is_null() {
+        ffi::Py_INCREF(builtin_value);
+        return builtin_value;
+    }
+    raise_name_error_for_missing_runtime_name(runtime_name);
+    ptr::null_mut()
+}
+
+pub(crate) unsafe fn load_runtime_name_owned(name_obj: *mut ffi::PyObject) -> *mut ffi::PyObject {
+    if name_obj.is_null() {
+        ffi::PyErr_SetString(
+            ffi::PyExc_RuntimeError,
+            c"invalid runtime name constant".as_ptr(),
+        );
+        return ptr::null_mut();
+    }
+    let name_utf8 = ffi::PyUnicode_AsUTF8(name_obj);
+    if !name_utf8.is_null() {
+        let name_bytes = CStr::from_ptr(name_utf8).to_bytes();
+        if let Ok(name) = std::str::from_utf8(name_bytes)
+            && let Some(runtime_name) = RuntimeName::from_name(name)
+        {
+            return load_runtime_name_owned_by_id(runtime_name);
+        }
+    } else {
+        ffi::PyErr_Clear();
+    }
+    let runtime_obj = load_runtime_module_owned();
     if runtime_obj.is_null() {
         return ptr::null_mut();
     }
@@ -701,13 +767,6 @@ pub(crate) unsafe fn load_runtime_name_owned(name_obj: *mut ffi::PyObject) -> *m
         return ptr::null_mut();
     }
     ffi::PyErr_Clear();
-    let is_builtins_name = {
-        let name_utf8 = ffi::PyUnicode_AsUTF8(name_obj);
-        !name_utf8.is_null() && CStr::from_ptr(name_utf8).to_bytes() == b"builtins"
-    };
-    if is_builtins_name {
-        return ffi::PyImport_ImportModule(c"builtins".as_ptr());
-    }
     let builtins_dict = ffi::PyEval_GetBuiltins();
     if builtins_dict.is_null() {
         ffi::PyErr_SetString(

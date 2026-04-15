@@ -3,7 +3,7 @@ use crate::block_py::{
     core_call_expr_with_meta, literal_expr, BlockPyFunction, BlockPyModule, BlockTerm,
     CallArgPositional, ChildVisitable, CounterScope, CounterSite, DeoptEntrySource,
     IncrementCounter, InstrCodegen, InstrResolved, Load, Meta, NameLocation, ResolvedName,
-    StringLiteral, Tuple, Visit, WithMeta,
+    RuntimeName, StringLiteral, Tuple, Visit, WithMeta,
 };
 use crate::env_config::{SoacEnvConfig, SpecializationMode};
 use crate::passes::{
@@ -576,9 +576,11 @@ impl PreparedTraceNameLocator {
 
 fn helper_call_expr(helper_name: &str, args: Vec<InstrCodegen>) -> InstrCodegen {
     let meta = Meta::synthetic();
+    let runtime_name = RuntimeName::from_name(helper_name)
+        .unwrap_or_else(|| panic!("unknown SOAC trace helper runtime name {helper_name:?}"));
     let func = Load::new(ResolvedName {
-        id: helper_name.into(),
-        location: NameLocation::RuntimeName,
+        id: runtime_name.name().into(),
+        location: NameLocation::RuntimeName(runtime_name),
     })
     .with_meta(meta.clone())
     .into();
