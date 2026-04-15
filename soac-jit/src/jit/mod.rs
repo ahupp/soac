@@ -1168,7 +1168,7 @@ struct DeclaredJitFunction {
     default_symbol: Option<String>,
 }
 
-struct DefinedJitFunction {
+struct CompiledJitFunction {
     function_id: FunctionId,
     function_qualname: String,
     param_count: usize,
@@ -1177,8 +1177,8 @@ struct DefinedJitFunction {
     default_adapter_id: Option<FuncId>,
     default_adapter_symbol: Option<String>,
     stats: JitCodegenStats,
-    artifact: DefinedFunctionArtifact,
-    default_adapter_artifact: Option<DefinedFunctionArtifact>,
+    compiled: CompiledFunctionArtifact,
+    default_adapter_compiled: Option<CompiledFunctionArtifact>,
     deopt_table: Arc<RuntimeJitDeoptTable>,
 }
 
@@ -1542,8 +1542,8 @@ impl ProcessJitState {
         &mut self,
         inputs: &DirectFunctionCompileInputs<'a>,
         plan: &JitBatchPlan<'a>,
-    ) -> Result<Vec<DefinedJitFunction>, String> {
-        let mut defined_functions = Vec::with_capacity(plan.function_indices_to_define.len());
+    ) -> Result<Vec<CompiledJitFunction>, String> {
+        let mut compiled_functions = Vec::with_capacity(plan.function_indices_to_define.len());
         let mut jit_plan_cache: HashMap<
             usize,
             (
@@ -1739,12 +1739,12 @@ impl ProcessJitState {
             let clif_inst_count = ctx.func.dfg.num_insts();
             let function_name =
                 direct_function_backend_name(function, batch_function.source.shared_state());
-            let artifact = define_prepared_function(
+            let compiled = compile_prepared_function_bytes(
                 &mut self.jit_module,
                 main_id,
                 &mut ctx,
                 function_name.as_str(),
-                "failed to define specialized jit run_bb function",
+                "failed to compile specialized jit run_bb function",
             )
             .map_err(|err| {
                 format!(
@@ -1753,7 +1753,7 @@ impl ProcessJitState {
                 )
             })?;
             self.jit_module.clear_context(&mut ctx);
-            let default_adapter_artifact = match (
+            let default_adapter_compiled = match (
                 default_adapter_id,
                 default_adapter_symbol.as_ref(),
             ) {
@@ -1770,12 +1770,12 @@ impl ProcessJitState {
                             function.names.qualname, function.function_id
                         )
                     })?;
-                    let artifact = define_prepared_function(
+                    let compiled = compile_prepared_function_bytes(
                         &mut self.jit_module,
                         default_adapter_id,
                         &mut default_ctx,
                         default_adapter_symbol.as_str(),
-                        "failed to define default-resolving direct adapter",
+                        "failed to compile default-resolving direct adapter",
                     )
                     .map_err(|err| {
                         format!(
@@ -1784,7 +1784,7 @@ impl ProcessJitState {
                         )
                     })?;
                     self.jit_module.clear_context(&mut default_ctx);
-                    Some(artifact)
+                    Some(compiled)
                 }
                 (None, None) => None,
                 _ => {
@@ -1794,7 +1794,7 @@ impl ProcessJitState {
                     ));
                 }
             };
-            defined_functions.push(DefinedJitFunction {
+            compiled_functions.push(CompiledJitFunction {
                 function_id: function.function_id,
                 function_qualname: function.names.qualname.clone(),
                 param_count: function.params.len(),
@@ -1805,30 +1805,64 @@ impl ProcessJitState {
                 stats: JitCodegenStats {
                     clif_block_count,
                     clif_inst_count,
-                    machine_code_size_bytes: artifact.code_size,
-                    machine_code_block_count: artifact.code_bb_offsets.len(),
-                    machine_code_edge_count: artifact.code_bb_edges.len(),
+                    machine_code_size_bytes: compiled.artifact.code_size,
+                    machine_code_block_count: compiled.artifact.code_bb_offsets.len(),
+                    machine_code_edge_count: compiled.artifact.code_bb_edges.len(),
                 },
-                artifact,
-                default_adapter_artifact,
+                compiled,
+                default_adapter_compiled,
                 deopt_table: function_deopt_table,
             });
         }
-        Ok(defined_functions)
+        Ok(compiled_functions)
     }
 
-    fn commit_defined_direct_function_batch(
+    fn commit_compiled_direct_function_batch(
         &mut self,
         session: &Arc<crate::session::CompileSession>,
         root_function: &BlockPyFunction<CodegenModuleShape>,
-        defined_functions: Vec<DefinedJitFunction>,
+        compiled_functions: Vec<CompiledJitFunction>,
     ) -> Result<DirectFunctionCompileResult, String> {
+        for defined in &compiled_functions {
+            define_compiled_function_bytes(
+                &mut self.jit_module,
+                defined.main_id,
+                &defined.compiled,
+                "failed to define specialized jit run_bb function",
+            )
+            .map_err(|err| {
+                format!(
+                    "{err} [function={} id={}]",
+                    defined.function_qualname, defined.function_id
+                )
+            })?;
+            if let Some(default_adapter_compiled) = defined.default_adapter_compiled.as_ref() {
+                let Some(default_adapter_id) = defined.default_adapter_id else {
+                    return Err(format!(
+                        "compiled default direct adapter is missing declaration for function {} id={}",
+                        defined.function_qualname, defined.function_id
+                    ));
+                };
+                define_compiled_function_bytes(
+                    &mut self.jit_module,
+                    default_adapter_id,
+                    default_adapter_compiled,
+                    "failed to define default-resolving direct adapter",
+                )
+                .map_err(|err| {
+                    format!(
+                        "{err} [default-adapter function={} id={}]",
+                        defined.function_qualname, defined.function_id
+                    )
+                })?;
+            }
+        }
         self.jit_module
             .finalize_definitions()
             .map_err(|err| format!("failed to finalize specialized jit run_bb function: {err}"))?;
         let mut root_handle = None;
         let mut root_stats = None;
-        for defined in defined_functions {
+        for defined in compiled_functions {
             let code_ptr = self.jit_module.get_finalized_function(defined.main_id);
             let default_code_ptr = defined
                 .default_adapter_id
@@ -1847,14 +1881,14 @@ impl ProcessJitState {
             let code_id = jitdump::record_code_load(
                 &defined.main_symbol,
                 code_ptr.cast::<u8>(),
-                defined.artifact.code_size,
+                defined.compiled.artifact.code_size,
                 self.jit_module.isa(),
-                defined.artifact.systemv_unwind_info.as_ref(),
+                defined.compiled.artifact.systemv_unwind_info.as_ref(),
             )?;
             record_jit_bb_map(
                 &defined.main_symbol,
                 code_id,
-                &defined.artifact,
+                &defined.compiled.artifact,
                 defined.function_id,
                 &defined.function_qualname,
                 "direct_function_body",
@@ -1862,24 +1896,27 @@ impl ProcessJitState {
             if let (
                 Some(default_adapter_id),
                 Some(default_adapter_symbol),
-                Some(default_adapter_artifact),
+                Some(default_adapter_compiled),
             ) = (
                 defined.default_adapter_id,
                 defined.default_adapter_symbol.as_ref(),
-                defined.default_adapter_artifact.as_ref(),
+                defined.default_adapter_compiled.as_ref(),
             ) {
                 let default_code_ptr = self.jit_module.get_finalized_function(default_adapter_id);
                 let code_id = jitdump::record_code_load(
                     default_adapter_symbol,
                     default_code_ptr.cast::<u8>(),
-                    default_adapter_artifact.code_size,
+                    default_adapter_compiled.artifact.code_size,
                     self.jit_module.isa(),
-                    default_adapter_artifact.systemv_unwind_info.as_ref(),
+                    default_adapter_compiled
+                        .artifact
+                        .systemv_unwind_info
+                        .as_ref(),
                 )?;
                 record_jit_bb_map(
                     default_adapter_symbol,
                     code_id,
-                    default_adapter_artifact,
+                    &default_adapter_compiled.artifact,
                     defined.function_id,
                     &defined.function_qualname,
                     "default_direct_adapter",
@@ -14712,8 +14749,8 @@ impl ProcessJitEngine {
             }
             ReservedDirectFunctionBatch::Reserved(plan) => plan,
         };
-        let defined_functions = state.compile_reserved_direct_function_batch(&inputs, &plan)?;
-        state.commit_defined_direct_function_batch(session, function, defined_functions)
+        let compiled_functions = state.compile_reserved_direct_function_batch(&inputs, &plan)?;
+        state.commit_compiled_direct_function_batch(session, function, compiled_functions)
     }
 }
 
@@ -14768,6 +14805,16 @@ fn define_prepared_function(
 ) -> Result<DefinedFunctionArtifact, String> {
     let compiled =
         compile_prepared_function_bytes(jit_module, func_id, ctx, function_name, err_prefix)?;
+    define_compiled_function_bytes(jit_module, func_id, &compiled, err_prefix)?;
+    Ok(compiled.artifact)
+}
+
+fn define_compiled_function_bytes(
+    jit_module: &mut JITModule,
+    func_id: FuncId,
+    compiled: &CompiledFunctionArtifact,
+    err_prefix: &str,
+) -> Result<(), String> {
     jit_module
         .define_function_bytes(
             func_id,
@@ -14776,7 +14823,7 @@ fn define_prepared_function(
             compiled.bytes.relocs.as_slice(),
         )
         .map_err(|err| format!("{err_prefix}: {err}"))?;
-    Ok(compiled.artifact)
+    Ok(())
 }
 
 fn compile_prepared_function_bytes(
