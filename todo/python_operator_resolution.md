@@ -9,11 +9,10 @@ through CPython C APIs or specialized exact-type helper paths.
 
 The old `soac.sim` Python implementation of operator resolution was removed
 from the active runtime surface. The remaining `soac.sim` module contains only
-small support helpers still used by `soac.runtime` or lowering:
+small support helpers still used by `soac.runtime`:
 
 - `_MISSING`
 - `_mro_getattr`
-- `aiter`
 
 ## Removed Python-Level Operator Helpers
 

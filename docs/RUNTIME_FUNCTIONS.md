@@ -314,6 +314,7 @@ repr
 str
 format
 pow
+aiter
 AssertionError
 AttributeError
 ImportError
@@ -329,5 +330,4 @@ Runtime helpers imported from `soac.sim`:
 ```text
 _MISSING
 _mro_getattr
-aiter
 ```

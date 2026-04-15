@@ -26,7 +26,6 @@ from . import _soac_ext
 from .sim import (
     _MISSING,
     _mro_getattr,
-    aiter,
 )
 
 next = _builtins.next
@@ -67,6 +66,26 @@ vars(_sys.modules[__name__])["exec"] = _unsupported_frame_builtin
 
 def tuple_from_iter(value):
     return _builtins.tuple(value)
+
+
+def aiter(obj):
+    try:
+        aiter_fn = obj.__aiter__
+    except AttributeError:
+        obj_type = type(obj).__name__
+        obj = None
+        raise TypeError(
+            f"'async for' requires an object with __aiter__ method, got {obj_type}"
+        ) from None
+    iterator = aiter_fn()
+    if not hasattr(iterator, "__anext__"):
+        iter_type = type(iterator).__name__
+        iterator = None
+        raise TypeError(
+            "'async for' received an object from __aiter__ that does not implement __anext__"
+            f": {iter_type}"
+        ) from None
+    return iterator
 
 
 def eval_string_literal(source):
