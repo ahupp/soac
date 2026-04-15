@@ -6,9 +6,9 @@ use crate::block_py::{
     CallableScopeKind, CellBindingKind, CellCaptureBinding, CellLocation, CellRef, CellRefForName,
     ChildVisitable, ClassBodyFallback, ClosureInit, ClosureSlot, Del, DelItem, EffectiveBinding,
     FunctionId, FunctionKind, HasMeta, InstrLow, InstrResolved, InstrUnresolved, IntLiteral, Load,
-    LocalLocation, MakeCell, MakeFunction, MapFunction, MapInstr, Mappable, NameLike, NameLocation,
-    NumberLiteral, NumberLiteralValue, ResolvedName, SetItem, StorageLayout, Store, StringLiteral,
-    UnresolvedName, Visit, VisitMut, WithMeta,
+    LocalLocation, MakeCell, MakeFunction, MakeFunctionWithClosure, MapFunction, MapInstr,
+    Mappable, NameLike, NameLocation, NumberLiteral, NumberLiteralValue, ResolvedName, SetItem,
+    StorageLayout, Store, StringLiteral, UnresolvedName, Visit, VisitMut, WithMeta,
 };
 use crate::passes::ruff_to_blockpy::{
     populate_exception_edge_args, rewrite_current_exception_in_core_blocks,
@@ -188,20 +188,6 @@ fn core_string_expr(
 ) -> InstrUnresolved {
     literal_expr(
         StringLiteral { value },
-        crate::block_py::Meta::new(node_index, range),
-    )
-}
-
-fn core_int_expr(
-    value: u64,
-    node_index: ast::AtomicNodeIndex,
-    range: ruff_text_size::TextRange,
-) -> InstrUnresolved {
-    let text = value.to_string();
-    literal_expr(
-        NumberLiteral {
-            value: NumberLiteralValue::Int(IntLiteral::from_decimal(text)),
-        },
         crate::block_py::Meta::new(node_index, range),
     )
 }
@@ -476,6 +462,9 @@ fn with_helper_arg_mut<N: NameLike + Clone>(
         }
         InstrLow::CellRef(operation) => with_helper_arg_mut_in_operation(operation, index, f),
         InstrLow::MakeFunction(operation) => with_helper_arg_mut_in_operation(operation, index, f),
+        InstrLow::MakeFunctionWithClosure(operation) => {
+            with_helper_arg_mut_in_operation(operation, index, f)
+        }
         _ => false,
     }
 }
@@ -612,7 +601,8 @@ fn rewrite_deleted_name_loads_in_expr(
         | InstrUnresolved::SetItem(_)
         | InstrUnresolved::DelItem(_)
         | InstrUnresolved::MakeCell(_)
-        | InstrUnresolved::MakeFunction(_) => {
+        | InstrUnresolved::MakeFunction(_)
+        | InstrUnresolved::MakeFunctionWithClosure(_) => {
             struct RewriteVisitor<'a> {
                 scope: &'a CallableScopeInfo,
                 storage_layout: &'a StorageLayout,
@@ -820,15 +810,6 @@ fn cell_ref_marker_target(expr: &InstrUnresolved) -> Option<String> {
         return None;
     };
     Some(logical_name.clone())
-}
-
-fn make_function_kind_name(kind: FunctionKind) -> &'static str {
-    match kind {
-        FunctionKind::Function => "function",
-        FunctionKind::Coroutine => "coroutine",
-        FunctionKind::Generator => "generator",
-        FunctionKind::AsyncGenerator => "async_generator",
-    }
 }
 
 fn cell_load_logical_name(
@@ -1054,23 +1035,15 @@ impl NameBindingMapper<'_> {
             meta.range,
             captures,
         );
-        core_runtime_positional_call_expr_with_meta(
-            "make_function",
-            meta.node_index.clone(),
-            meta.range,
-            vec![
-                core_int_expr(op.function_id.packed(), meta.node_index.clone(), meta.range),
-                core_string_expr(
-                    make_function_kind_name(op.kind).to_string(),
-                    meta.node_index.clone(),
-                    meta.range,
-                ),
-                captures_expr,
-                self.map_instr(*op.param_defaults),
-                self.map_instr(*op.annotate_fn),
-                globals_expr(meta.node_index.clone(), meta.range),
-            ],
+        MakeFunctionWithClosure::new(
+            op.function_id,
+            op.kind,
+            captures_expr,
+            self.map_instr(*op.param_defaults),
+            self.map_instr(*op.annotate_fn),
         )
+        .with_meta(meta)
+        .into()
     }
 }
 
@@ -1365,7 +1338,8 @@ fn rewrite_raw_cell_loads_in_expr(
         | InstrUnresolved::MakeCell(_)
         | InstrUnresolved::CellRefForName(_)
         | InstrUnresolved::CellRef(_)
-        | InstrUnresolved::MakeFunction(_) => {
+        | InstrUnresolved::MakeFunction(_)
+        | InstrUnresolved::MakeFunctionWithClosure(_) => {
             if let InstrUnresolved::Load(op) = expr {
                 if let UnresolvedName::SourceName(name) = &op.name {
                     if matches!(
@@ -1626,7 +1600,8 @@ fn collect_remaining_names_in_expr(expr: &InstrUnresolved, names: &mut HashSet<S
         | InstrUnresolved::MakeCell(_)
         | InstrUnresolved::CellRefForName(_)
         | InstrUnresolved::CellRef(_)
-        | InstrUnresolved::MakeFunction(_) => {}
+        | InstrUnresolved::MakeFunction(_)
+        | InstrUnresolved::MakeFunctionWithClosure(_) => {}
     }
 
     struct RemainingNamesVisitor<'a> {

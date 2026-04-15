@@ -210,8 +210,9 @@ fn rewrite_pre_optimization_module_from_source(
        This removes while/with/for from the AST, as well as expressions that
        interact with the block structure like walrus, and those that short circuit like bool ops.
 
-       "def" is replaced by a call to
-       `__soac__.make_function(function_id, kind, closure, param_defaults, annotate_fn)`.
+       "def" is replaced by a `MakeFunction` operation, and name binding
+       resolves that into `MakeFunctionWithClosure` with explicit closure
+       capture construction.
 
        try/except are replaced by an exception handling block, and each block in the `try` has exc_edge
        set to that handler.  except block has it's own exc_edge to ensure exceptions in except

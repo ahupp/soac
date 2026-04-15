@@ -333,6 +333,9 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             InstrCodegen::Del(del) => unsafe { self.execute_del_owned(del) },
             InstrCodegen::IncrementCounter(_) => unsafe { execute_runtime_name_deopt("NONE") },
             InstrCodegen::MakeCell(make_cell) => unsafe { self.execute_make_cell_owned(make_cell) },
+            InstrCodegen::MakeFunctionWithClosure(make_function) => unsafe {
+                self.execute_make_function_with_closure_owned(make_function)
+            },
             InstrCodegen::CellRef(cell_ref) => unsafe { self.execute_cell_ref_owned(cell_ref) },
             _ => Err(format!(
                 "deopt continuation only supports simple load/binop/call/store/del expressions, got {expr:?}"
@@ -358,6 +361,103 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             ffi::Py_DECREF(initial_value.cast::<ffi::PyObject>());
         }
         Ok(cell.cast())
+    }
+
+    #[cold]
+    unsafe fn execute_make_function_with_closure_owned(
+        &mut self,
+        make_function: &soac_blockpy::block_py::MakeFunctionWithClosure<InstrCodegen>,
+    ) -> Result<ObjPtr, String> {
+        let callable = unsafe { execute_runtime_name_deopt("make_function")? };
+        if callable.is_null() {
+            return Ok(ptr::null_mut());
+        }
+        let function_id =
+            unsafe { ffi::PyLong_FromUnsignedLongLong(make_function.function_id().packed()) };
+        if function_id.is_null() {
+            unsafe { ffi::Py_DECREF(callable.cast::<ffi::PyObject>()) };
+            return Ok(ptr::null_mut());
+        }
+        let kind_name = make_function.kind.make_function_kind_name();
+        let kind_len = match ffi::Py_ssize_t::try_from(kind_name.len()) {
+            Ok(kind_len) => kind_len,
+            Err(_) => {
+                unsafe {
+                    ffi::Py_DECREF(function_id);
+                    ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
+                }
+                return Err(format!(
+                    "make-function deopt kind name {kind_name:?} is too large to materialize"
+                ));
+            }
+        };
+        let kind = unsafe { ffi::PyUnicode_FromStringAndSize(kind_name.as_ptr().cast(), kind_len) };
+        if kind.is_null() {
+            unsafe {
+                ffi::Py_DECREF(function_id);
+                ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
+            }
+            return Ok(ptr::null_mut());
+        }
+        let captures = unsafe { self.execute_expr_owned(make_function.captures.as_ref())? };
+        if captures.is_null() {
+            unsafe {
+                ffi::Py_DECREF(kind);
+                ffi::Py_DECREF(function_id);
+                ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
+            }
+            return Ok(ptr::null_mut());
+        }
+        let param_defaults =
+            unsafe { self.execute_expr_owned(make_function.param_defaults.as_ref())? };
+        if param_defaults.is_null() {
+            unsafe {
+                ffi::Py_DECREF(captures.cast::<ffi::PyObject>());
+                ffi::Py_DECREF(kind);
+                ffi::Py_DECREF(function_id);
+                ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
+            }
+            return Ok(ptr::null_mut());
+        }
+        let annotate_fn = unsafe { self.execute_expr_owned(make_function.annotate_fn.as_ref())? };
+        if annotate_fn.is_null() {
+            unsafe {
+                ffi::Py_DECREF(param_defaults.cast::<ffi::PyObject>());
+                ffi::Py_DECREF(captures.cast::<ffi::PyObject>());
+                ffi::Py_DECREF(kind);
+                ffi::Py_DECREF(function_id);
+                ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
+            }
+            return Ok(ptr::null_mut());
+        }
+        let globals = self.invocation.globals_obj();
+        if globals.is_null() {
+            unsafe {
+                ffi::Py_DECREF(annotate_fn.cast::<ffi::PyObject>());
+                ffi::Py_DECREF(param_defaults.cast::<ffi::PyObject>());
+                ffi::Py_DECREF(captures.cast::<ffi::PyObject>());
+                ffi::Py_DECREF(kind);
+                ffi::Py_DECREF(function_id);
+                ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
+            }
+            return Err("deopt continuation expected module globals for make_function".to_string());
+        }
+        unsafe {
+            ffi::Py_INCREF(globals.cast::<ffi::PyObject>());
+        }
+        unsafe {
+            execute_owned_positional_call(
+                callable,
+                vec![
+                    function_id.cast(),
+                    kind.cast(),
+                    captures,
+                    param_defaults,
+                    annotate_fn,
+                    globals,
+                ],
+            )
+        }
     }
 
     #[cold]
@@ -1547,6 +1647,48 @@ unsafe fn execute_binop_kind_owned(
             BinOpKind::InplaceAnd => ffi::PyNumber_InPlaceAnd(left, right),
         }
     };
+    Ok(result.cast())
+}
+
+#[cold]
+unsafe fn execute_owned_positional_call(
+    callable: ObjPtr,
+    args: Vec<ObjPtr>,
+) -> Result<ObjPtr, String> {
+    let args_len = match ffi::Py_ssize_t::try_from(args.len()) {
+        Ok(args_len) => args_len,
+        Err(_) => {
+            unsafe {
+                release_owned_values(args);
+                ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
+            }
+            return Err("deopt continuation positional call has too many args".to_string());
+        }
+    };
+    let tuple = unsafe { ffi::PyTuple_New(args_len) };
+    if tuple.is_null() {
+        unsafe {
+            release_owned_values(args);
+            ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
+        }
+        return Ok(ptr::null_mut());
+    }
+    for (index, arg) in args.into_iter().enumerate() {
+        let index = ffi::Py_ssize_t::try_from(index)
+            .expect("tuple arg index should fit after tuple length conversion");
+        if unsafe { ffi::PyTuple_SetItem(tuple, index, arg.cast::<ffi::PyObject>()) } != 0 {
+            unsafe {
+                ffi::Py_DECREF(tuple);
+                ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
+            }
+            return Ok(ptr::null_mut());
+        }
+    }
+    let result = unsafe { ffi::PyObject_CallObject(callable.cast::<ffi::PyObject>(), tuple) };
+    unsafe {
+        ffi::Py_DECREF(tuple);
+        ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
+    }
     Ok(result.cast())
 }
 

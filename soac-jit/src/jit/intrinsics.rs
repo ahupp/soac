@@ -1837,7 +1837,7 @@ pub(super) fn emit_operation<'fb>(
         InstrCodegen::MakeCell(op) => Some(emit_make_cell(state, op.initial_value.as_deref())),
         InstrCodegen::IncrementCounter(_) => None,
         InstrCodegen::CellRef(_) => None,
-        InstrCodegen::MakeFunction(_) => None,
+        InstrCodegen::MakeFunction(_) | InstrCodegen::MakeFunctionWithClosure(_) => None,
         InstrCodegen::Store(op) => op.name.location.is_global().then(|| emit_store(op, state)),
         InstrCodegen::Del(op) => op.name.location.is_global().then(|| emit_del(op, state)),
     }

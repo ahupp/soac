@@ -3016,13 +3016,9 @@ def get_value():
                 .retain_shared_module_state(callee_state)
                 .expect("callee state should be retained");
 
-            let batch = collect_process_jit_batch_functions(
-                &session,
-                &caller,
-                &caller_state.codegen_constants,
-                Some(caller_state.as_ref()),
-            )
-            .expect("cross-module process JIT batch should collect");
+            let batch =
+                collect_process_jit_batch_functions(&session, &caller, Some(caller_state.as_ref()))
+                    .expect("cross-module process JIT batch should collect");
             let function_ids = batch
                 .iter()
                 .map(|batch_function| batch_function.function.function_id)
@@ -3051,12 +3047,8 @@ def get_value():
         );
 
         let session = std::sync::Arc::new(crate::session::CompileSession::new());
-        let module = test_module(module_name_gen, vec![function.clone()]);
-        let module_constants =
-            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
-        let batch =
-            collect_process_jit_batch_functions(&session, &function, &module_constants, None)
-                .expect("recursive process JIT batch should collect");
+        let batch = collect_process_jit_batch_functions(&session, &function, None)
+            .expect("recursive process JIT batch should collect");
         let function_ids = batch
             .iter()
             .map(|batch_function| batch_function.function.function_id)
@@ -6315,6 +6307,56 @@ def f(x):
                 RuntimeJitDeoptUnsupportedReason::UnsupportedBlockTail,
             ),
             "before-instr continuation should not claim support for unsupported body tails"
+        );
+    }
+
+    #[test]
+    fn runtime_deopt_table_accepts_make_function_with_closure_block_tail() {
+        let test_function = test_function();
+        let function_id = test_function.function_id;
+        let empty_tuple_expr = || {
+            op_expr(Call::new(
+                name_expr(test_runtime_name("tuple_values")),
+                Vec::<CallArgPositional<InstrCodegen>>::new(),
+                Vec::<CallArgKeyword<InstrCodegen>>::new(),
+            ))
+        };
+        let function = with_single_test_block(
+            test_function,
+            vec![expr_stmt(op_expr(
+                soac_blockpy::block_py::MakeFunctionWithClosure::new(
+                    function_id,
+                    soac_blockpy::block_py::FunctionKind::Function,
+                    empty_tuple_expr(),
+                    empty_tuple_expr(),
+                    none_expr(),
+                ),
+            ))],
+            ret_term(none_expr()),
+        );
+        let module = test_module(ModuleNameGen::new(0), vec![function]);
+        let function = &module.callable_defs[0];
+        let block = function.entry_block();
+        let facts = infer_module_value_facts(&module);
+        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+            .expect("JIT deopt resume planning should succeed");
+        let function_plan = module_plan
+            .function(function.function_id)
+            .expect("function should have a JIT deopt plan");
+        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
+            .expect("runtime deopt table should build from plan");
+        let block_entry_record = table
+            .record_for_point(LocalEnvResumePoint::BlockEntry {
+                function_id: function.function_id,
+                block: block.label,
+            })
+            .expect("block-entry point should have a runtime record");
+        assert_eq!(
+            block_entry_record.continuation(),
+            &RuntimeJitDeoptContinuation::ResumeBlockTail {
+                cursor: RuntimeJitDeoptCursor::at_block_entry(block.label),
+            },
+            "MakeFunctionWithClosure should be replayable by the deopt interpreter"
         );
     }
 

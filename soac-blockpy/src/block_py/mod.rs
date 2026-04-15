@@ -18,11 +18,12 @@ pub use operation::{
     ExprDict, ExprDictComp, ExprEllipsisLiteral, ExprFString, ExprGenerator, ExprIf,
     ExprIpyEscapeCommand, ExprLambda, ExprList, ExprListComp, ExprName, ExprNamed, ExprNoneLiteral,
     ExprNumberLiteral, ExprSet, ExprSetComp, ExprSlice, ExprStarred, ExprStringLiteral,
-    ExprSubscript, ExprTString, ExprTuple, GetAttr, GetItem, Load, MakeCell, MakeFunction, SetAttr,
-    SetItem, StmtAnnAssign, StmtAssert, StmtAssign, StmtAugAssign, StmtBreak, StmtClassDef,
-    StmtContinue, StmtDelete, StmtExpr, StmtFor, StmtFunctionDef, StmtGlobal, StmtIf, StmtImport,
-    StmtImportFrom, StmtIpyEscapeCommand, StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn,
-    StmtTry, StmtTypeAlias, StmtWhile, StmtWith, Store, UnaryOp, UnaryOpKind, Yield, YieldFrom,
+    ExprSubscript, ExprTString, ExprTuple, GetAttr, GetItem, Load, MakeCell, MakeFunction,
+    MakeFunctionWithClosure, SetAttr, SetItem, StmtAnnAssign, StmtAssert, StmtAssign,
+    StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue, StmtDelete, StmtExpr, StmtFor,
+    StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom, StmtIpyEscapeCommand,
+    StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry, StmtTypeAlias, StmtWhile,
+    StmtWith, Store, UnaryOp, UnaryOpKind, Yield, YieldFrom,
 };
 pub use ruff_python_ast::Expr;
 use ruff_python_ast::{self as ast};
@@ -408,6 +409,17 @@ pub enum FunctionKind {
     Coroutine,
     Generator,
     AsyncGenerator,
+}
+
+impl FunctionKind {
+    pub const fn make_function_kind_name(self) -> &'static str {
+        match self {
+            Self::Function => "function",
+            Self::Coroutine => "coroutine",
+            Self::Generator => "generator",
+            Self::AsyncGenerator => "async_generator",
+        }
+    }
 }
 
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]

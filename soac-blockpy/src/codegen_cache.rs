@@ -1,7 +1,6 @@
 use crate::block_py::{
-    walk_expr_mut, walk_module, walk_module_mut, BlockPyFunction, BlockPyModule, CallArgPositional,
-    ChildVisitable, CounterSite, FunctionId, FunctionNameGen, HasMeta, IntLiteral, Literal,
-    ModuleNameGen, NameLike, NumberLiteral, NumberLiteralValue, Visit, VisitMut, WithMeta,
+    walk_expr_mut, walk_module_mut, BlockPyFunction, BlockPyModule, CounterSite, FunctionId,
+    FunctionNameGen, ModuleNameGen, VisitMut,
 };
 use crate::passes::{CodegenModuleShape, InstrCodegen};
 use anyhow::{anyhow, Context, Result};
@@ -113,14 +112,7 @@ pub fn remap_codegen_module_function_ids(
 ) {
     let new_module_id = module_name_gen.module_id();
     let mut remapper = FunctionIdRemapper { new_module_id };
-    let make_function_constant_slots = collect_make_function_constant_slots(module);
     walk_module_mut(&mut remapper, module);
-    for (constant_index, function_id) in make_function_constant_slots {
-        let remapped = remapper.remap(function_id);
-        if let Some(constant) = module.module_constants.get_mut(constant_index) {
-            *constant = function_id_constant_expr(constant.meta(), remapped);
-        }
-    }
 
     for function in &mut module.callable_defs {
         function.function_id = remapper.remap(function.function_id);
@@ -170,6 +162,9 @@ impl VisitMut<InstrCodegen> for FunctionIdRemapper {
             InstrCodegen::MakeFunction(op) => {
                 op.set_function_id(self.remap(op.function_id()));
             }
+            InstrCodegen::MakeFunctionWithClosure(op) => {
+                op.set_function_id(self.remap(op.function_id()));
+            }
             InstrCodegen::BinOp(_)
             | InstrCodegen::UnaryOp(_)
             | InstrCodegen::CalleeFunctionId(_)
@@ -188,108 +183,6 @@ impl VisitMut<InstrCodegen> for FunctionIdRemapper {
         }
         walk_expr_mut(self, expr);
     }
-}
-
-fn collect_make_function_constant_slots(
-    module: &BlockPyModule<CodegenModuleShape>,
-) -> Vec<(usize, FunctionId)> {
-    struct MakeFunctionConstantCollector<'a> {
-        module_constants: &'a [crate::block_py::InstrResolved],
-        out: Vec<(usize, FunctionId)>,
-    }
-
-    impl Visit<InstrCodegen> for MakeFunctionConstantCollector<'_> {
-        fn visit_instr(&mut self, expr: &InstrCodegen)
-        where
-            InstrCodegen: crate::block_py::ChildVisitable<InstrCodegen>,
-        {
-            if let InstrCodegen::Call(call) = expr {
-                if codegen_expr_is_runtime_symbol(
-                    call.func.as_ref(),
-                    self.module_constants,
-                    "make_function",
-                ) {
-                    if let Some(CallArgPositional::Positional(function_id_expr)) = call.args.first()
-                    {
-                        if let Some(constant_index) = codegen_expr_constant_index(function_id_expr)
-                        {
-                            if let Some(function_id) = self
-                                .module_constants
-                                .get(constant_index)
-                                .and_then(resolved_function_id_constant)
-                            {
-                                self.out.push((constant_index, function_id));
-                            }
-                        }
-                    }
-                }
-            }
-            expr.visit_children(self);
-        }
-    }
-
-    let mut collector = MakeFunctionConstantCollector {
-        module_constants: &module.module_constants,
-        out: Vec::new(),
-    };
-    walk_module(&mut collector, module);
-    collector.out
-}
-
-fn codegen_expr_is_runtime_symbol(
-    expr: &InstrCodegen,
-    module_constants: &[crate::block_py::InstrResolved],
-    name: &str,
-) -> bool {
-    match expr {
-        InstrCodegen::Load(load) if load.name.is_runtime_symbol(name) => true,
-        InstrCodegen::Load(load) => load
-            .name
-            .location
-            .as_constant()
-            .and_then(|index| module_constants.get(index as usize))
-            .is_some_and(|constant| resolved_expr_is_runtime_symbol(constant, name)),
-        _ => false,
-    }
-}
-
-fn resolved_expr_is_runtime_symbol(expr: &crate::block_py::InstrResolved, name: &str) -> bool {
-    matches!(expr, crate::block_py::InstrResolved::Load(load) if load.name.is_runtime_symbol(name))
-}
-
-fn codegen_expr_constant_index(expr: &InstrCodegen) -> Option<usize> {
-    match expr {
-        InstrCodegen::Load(load) => load.name.location.as_constant().map(|index| index as usize),
-        _ => None,
-    }
-}
-
-fn resolved_function_id_constant(expr: &crate::block_py::InstrResolved) -> Option<FunctionId> {
-    let crate::block_py::InstrResolved::Literal(literal) = expr else {
-        return None;
-    };
-    let Literal::NumberLiteral(NumberLiteral {
-        value: NumberLiteralValue::Int(value),
-    }) = literal.as_literal()
-    else {
-        return None;
-    };
-    value
-        .as_decimal()
-        .parse::<u64>()
-        .ok()
-        .map(FunctionId::from_packed)
-}
-
-fn function_id_constant_expr(
-    meta: crate::block_py::Meta,
-    function_id: FunctionId,
-) -> crate::block_py::InstrResolved {
-    let literal = crate::block_py::LiteralValue::new(Literal::NumberLiteral(NumberLiteral {
-        value: NumberLiteralValue::Int(IntLiteral::from_decimal(function_id.packed().to_string())),
-    }))
-    .with_meta(meta);
-    crate::block_py::InstrResolved::Literal(literal)
 }
 
 fn archive_bytes_from_cache_file(bytes: &[u8]) -> Result<&[u8]> {
@@ -397,9 +290,8 @@ fn temp_cache_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod test {
     use super::{
-        codegen_module_cache_key, codegen_module_cache_path, collect_make_function_constant_slots,
-        load_codegen_module_cache, remap_codegen_module_function_ids, store_codegen_module_cache,
-        PythonModuleCacheSource,
+        codegen_module_cache_key, codegen_module_cache_path, load_codegen_module_cache,
+        remap_codegen_module_function_ids, store_codegen_module_cache, PythonModuleCacheSource,
     };
     use crate::block_py::{
         walk_block, walk_expr, BlockPyModule, ChildVisitable, FunctionId, HasSemanticInstrId,
@@ -444,6 +336,36 @@ mod test {
             ));
             walk_expr(self, expr);
         }
+    }
+
+    fn collect_make_function_with_closure_ids(
+        module: &BlockPyModule<CodegenModuleShape>,
+    ) -> Vec<FunctionId> {
+        struct Collector {
+            function_ids: Vec<FunctionId>,
+        }
+
+        impl Visit<InstrCodegen> for Collector {
+            fn visit_instr(&mut self, expr: &InstrCodegen)
+            where
+                InstrCodegen: ChildVisitable<InstrCodegen>,
+            {
+                if let InstrCodegen::MakeFunctionWithClosure(op) = expr {
+                    self.function_ids.push(op.function_id());
+                }
+                walk_expr(self, expr);
+            }
+        }
+
+        let mut collector = Collector {
+            function_ids: Vec::new(),
+        };
+        for function in &module.callable_defs {
+            for block in &function.blocks {
+                walk_block(&mut collector, block);
+            }
+        }
+        collector.function_ids
     }
 
     #[test]
@@ -557,11 +479,16 @@ def outer():
             assert_eq!(function.function_id.module_id(), 99);
             assert_eq!(function.name_gen.function_id(), function.function_id);
         }
-        for (_, function_id) in collect_make_function_constant_slots(&module) {
+        let make_function_ids = collect_make_function_with_closure_ids(&module);
+        assert!(
+            !make_function_ids.is_empty(),
+            "test module should contain MakeFunctionWithClosure"
+        );
+        for function_id in make_function_ids {
             assert_eq!(
                 function_id.module_id(),
                 99,
-                "cached make_function constants must point at the remapped module id"
+                "cached MakeFunctionWithClosure ids must point at the remapped module id"
             );
         }
 

@@ -486,6 +486,14 @@ fn resolved_function_has_make_cell(function: &BlockPyFunction<ResolvedStorageMod
     blockpy_function_instr_any(function, |expr| matches!(expr, InstrResolved::MakeCell(_)))
 }
 
+fn resolved_function_has_make_function_with_closure(
+    function: &BlockPyFunction<ResolvedStorageModuleShape>,
+) -> bool {
+    blockpy_function_instr_any(function, |expr| {
+        matches!(expr, InstrResolved::MakeFunctionWithClosure(_))
+    })
+}
+
 fn resolved_function_has_cell_ref(function: &BlockPyFunction<ResolvedStorageModuleShape>) -> bool {
     blockpy_function_instr_any(function, |expr| matches!(expr, InstrResolved::CellRef(_)))
 }
@@ -783,7 +791,7 @@ def foo(a, b):
 }
 
 #[test]
-fn name_binding_lifts_runtime_helper_loads_into_module_constants() {
+fn name_binding_lowers_make_function_to_structured_closure_node() {
     let source = r#"
 def f():
     pass
@@ -792,36 +800,30 @@ def f():
     let bb_module = tracked_name_binding_module(source)
         .expect("transform should succeed")
         .expect("bb module should be available");
-    let make_function_index = bb_module
-        .module_constants
-        .iter()
-        .position(|expr| {
-            matches!(
-                expr,
-                InstrResolved::Load(load)
-                    if load.name.is_runtime_name()
-                        && load.name.id_str() == "make_function"
-                        && load.name.location == NameLocation::RuntimeName
-            )
-        })
-        .unwrap_or_else(|| panic!("expected lifted make_function runtime load, got {bb_module:?}"));
-    let runtime_make_function = &bb_module.module_constants[make_function_index];
-    let InstrResolved::Load(load) = runtime_make_function else {
-        unreachable!();
-    };
-    assert_eq!(load.name.location, NameLocation::RuntimeName, "{load:?}");
-
+    let f = function_by_name(&bb_module, "f");
     let module_init = function_by_name(&bb_module, "_dp_module_init");
-    let rendered_init = module_init
-        .blocks
-        .iter()
-        .flat_map(|block| block.body.iter().map(expr_text))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut saw_make_function = false;
+    let mut saw_empty_captures = false;
+    let mut saw_empty_defaults = false;
+    assert!(!module_constant_runtime_name(&bb_module, "make_function"));
     assert!(
-        rendered_init.contains(format!("constant slot {make_function_index}(").as_str()),
-        "expected module init to call through the extracted runtime constant slot:\n{rendered_init}"
+        blockpy_function_instr_any(module_init, |expr| {
+            let InstrResolved::MakeFunctionWithClosure(op) = expr else {
+                return false;
+            };
+            saw_make_function = true;
+            saw_empty_captures = runtime_call_by_name(&bb_module, &op.captures, "tuple_values")
+                .is_some_and(|call| call.args.is_empty());
+            saw_empty_defaults =
+                runtime_call_by_name(&bb_module, &op.param_defaults, "tuple_values")
+                    .is_some_and(|call| call.args.is_empty());
+            op.function_id() == f.function_id && op.kind == FunctionKind::Function
+        }),
+        "expected module init to use MakeFunctionWithClosure, got {module_init:?}"
     );
+    assert!(saw_make_function);
+    assert!(saw_empty_captures);
+    assert!(saw_empty_defaults);
 }
 
 #[test]
@@ -1037,7 +1039,7 @@ class Box:
     let resolved_class_helper = lowered.bb_function("_dp_class_ns_Box");
     assert!(
         resolved_function_has_setitem(resolved_class_helper)
-            && module_constant_text(lowered.bb_module()).contains("make_function"),
+            && resolved_function_has_make_function_with_closure(resolved_class_helper),
         "{resolved_class_helper:?}\n{}",
         module_constant_text(lowered.bb_module())
     );
@@ -1169,7 +1171,7 @@ fn nested_method_dunder_class_capture_uses_classcell_storage() {
     assert_eq!(resolved_inner.names.qualname, "C.f.<locals>.g");
     assert!(resolved_function_uses_captured_source(resolved_inner));
     assert!(
-        module_constant_text(lowered.bb_module()).contains("make_function")
+        resolved_function_has_make_function_with_closure(lowered.bb_function("f"))
             && resolved_function_has_cell_ref(lowered.bb_function("f")),
         "{resolved_inner:?}\n{}",
         module_constant_text(lowered.bb_module())
@@ -1815,7 +1817,7 @@ class A:
     let resolved_class_helper = lowered.bb_function("_dp_class_ns_A");
     assert!(
         resolved_function_has_setitem(resolved_class_helper)
-            && module_constant_text(lowered.bb_module()).contains("make_function"),
+            && resolved_function_has_make_function_with_closure(resolved_class_helper),
         "{resolved_class_helper:?}\n{}",
         module_constant_text(lowered.bb_module())
     );
@@ -2130,7 +2132,7 @@ def f():
     let resolved_init = lowered.bb_function("_dp_module_init");
     assert!(
         resolved_function_uses_global(resolved_init, "f")
-            && module_constant_text(lowered.bb_module()).contains("make_function"),
+            && resolved_function_has_make_function_with_closure(resolved_init),
         "{resolved_init:?}\n{}",
         module_constant_text(lowered.bb_module())
     );
@@ -3481,11 +3483,9 @@ def make_counter(delta):
             _ => None,
         })
         .expect("ClosureGenerator should carry a resume= keyword");
-    let make_function = runtime_call_by_name(bb_module, resume_expr, "make_function")
-        .expect("resume should use make_function");
-    let captures_expr = match make_function.args.get(2) {
-        Some(CallArgPositional::Positional(expr)) => expr,
-        other => panic!("expected captures positional arg, got {other:?}"),
+    let captures_expr = match resume_expr {
+        InstrResolved::MakeFunctionWithClosure(make_function) => make_function.captures.as_ref(),
+        other => panic!("resume should use MakeFunctionWithClosure, got {other:?}"),
     };
     let captures_tuple = runtime_call_by_name(bb_module, captures_expr, "tuple_values")
         .expect("captures should be tuple_values");

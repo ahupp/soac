@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use crate::block_py::{BlockPyModule, ModuleNameGen};
 pub use crate::driver::LoweringOptions;
 use crate::driver::{rewrite_module_with_tracker, rewrite_module_with_tracker_with_options};

@@ -7,6 +7,24 @@ benchmarked throughput delta, and the headline pre/post numbers.
 
 # Journal of Negative Results
 
+## 2026-04-15 - Not landed: Cranelift opt-level tuning for typing import
+
+- jj change id: not landed
+- summary: Timed the slow broad-import `typing` case in `SOAC_OPT_MODE=none`
+  while varying `SOAC_CRANELIFT_OPT_LEVEL`. The run imports stdlib `typing`
+  through the SOAC import hook in a fresh process. Backend optimization level
+  was not the dominant cost: all valid settings stayed in the same roughly
+  92-95 second range, and the observed variance was larger than the opt-level
+  effect. Plain `size` is not a valid Cranelift opt-level value in current
+  config.
+- direct fresh-process typing import:
+  - `SOAC_CRANELIFT_OPT_LEVEL=none`: `93.07s`
+  - `SOAC_CRANELIFT_OPT_LEVEL=speed`: `94.82s`
+  - `SOAC_CRANELIFT_OPT_LEVEL=speed_and_size`: `92.44s`
+- pytest wrapper check, warmed setup, `SOAC_CRANELIFT_OPT_LEVEL=none`:
+  `91.30s` wall / `89.99s` pytest call and `90.75s` wall / `89.46s`
+  pytest call
+
 ## 2026-04-14 - Not landed: exact narrow scalar counters with cold overflow
 
 - jj change id: not landed (`pwvwzkwq` while testing)

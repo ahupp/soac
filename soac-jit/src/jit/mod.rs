@@ -2286,6 +2286,15 @@ fn typed_nested_guard_scan_expr(expr: &InstrTyped, saw_replay_unsafe_effect: &mu
         }
         InstrTyped::LegacyCellRef(_) => true,
         InstrTyped::LegacyMakeFunction(_) => false,
+        InstrTyped::LegacyMakeFunctionWithClosure(op) => {
+            typed_nested_guard_scan_expr(op.captures.as_ref(), saw_replay_unsafe_effect)
+                && typed_nested_guard_scan_expr(
+                    op.param_defaults.as_ref(),
+                    saw_replay_unsafe_effect,
+                )
+                && typed_nested_guard_scan_expr(op.annotate_fn.as_ref(), saw_replay_unsafe_effect)
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
     }
 }
 
@@ -2426,6 +2435,11 @@ fn runtime_jit_deopt_expr_supported(
             .map_or(true, |initial_value| {
                 runtime_jit_deopt_expr_supported(initial_value, support)
             }),
+        InstrCodegen::MakeFunctionWithClosure(make_function) => {
+            runtime_jit_deopt_expr_supported(&make_function.captures, support)
+                && runtime_jit_deopt_expr_supported(&make_function.param_defaults, support)
+                && runtime_jit_deopt_expr_supported(&make_function.annotate_fn, support)
+        }
         InstrCodegen::CellRef(cell_ref) => match cell_ref.location {
             CellLocation::Owned(slot) => support.owned_cell_supported(slot),
             CellLocation::Closure(slot) | CellLocation::CapturedSource(slot) => {
@@ -3797,6 +3811,11 @@ fn insert_typed_child_demands(plan: &mut ResultDemandPlan, expr: &InstrTyped) {
         InstrTyped::LegacyDelItem(op) => {
             insert_pyobject_borrowed_input_demand(plan, op.value.as_ref());
             insert_pyobject_borrowed_input_demand(plan, op.index.as_ref());
+        }
+        InstrTyped::LegacyMakeFunctionWithClosure(op) => {
+            insert_pyobject_borrowed_input_demand(plan, op.captures.as_ref());
+            insert_pyobject_borrowed_input_demand(plan, op.param_defaults.as_ref());
+            insert_pyobject_borrowed_input_demand(plan, op.annotate_fn.as_ref());
         }
         _ => {}
     }
@@ -8086,18 +8105,6 @@ fn collect_call_direct_targets(
     out
 }
 
-fn codegen_expr_const_u64(
-    expr: &InstrCodegen,
-    module_constants: &ModuleCodegenConstants,
-) -> Option<u64> {
-    match expr {
-        InstrCodegen::Load(op) => op.name.location.as_constant().and_then(|index| {
-            module_constants.constant_u64_value(ModuleConstantId(index as usize))
-        }),
-        _ => None,
-    }
-}
-
 fn codegen_expr_const_i64(
     expr: &InstrCodegen,
     module_constants: &ModuleCodegenConstants,
@@ -8112,33 +8119,22 @@ fn codegen_expr_const_i64(
 
 fn collect_make_function_targets(
     function: &BlockPyFunction<CodegenModuleShape>,
-    module_constants: &ModuleCodegenConstants,
 ) -> HashSet<FunctionId> {
     struct MakeFunctionTargetCollector<'a> {
-        module_constants: &'a ModuleCodegenConstants,
         out: &'a mut HashSet<FunctionId>,
     }
 
     impl Visit<InstrCodegen> for MakeFunctionTargetCollector<'_> {
         fn visit_instr(&mut self, expr: &InstrCodegen) {
-            if let InstrCodegen::Call(call) = expr
-                && codegen_expr_helper_name(call.func.as_ref(), self.module_constants)
-                    == Some("make_function")
-                && let Some(CallArgPositional::Positional(function_id_expr)) = call.args.first()
-                && let Some(packed_function_id) =
-                    codegen_expr_const_u64(function_id_expr, self.module_constants)
-            {
-                self.out.insert(FunctionId::from_packed(packed_function_id));
+            if let InstrCodegen::MakeFunctionWithClosure(op) = expr {
+                self.out.insert(op.function_id());
             }
             expr.visit_children(self);
         }
     }
 
     let mut out = HashSet::new();
-    let mut collector = MakeFunctionTargetCollector {
-        module_constants,
-        out: &mut out,
-    };
+    let mut collector = MakeFunctionTargetCollector { out: &mut out };
     collector.visit_fn(function);
     out
 }
@@ -10816,32 +10812,6 @@ fn emit_codegen_simple_call_with_local_env(
             }
             return Some(tuple_value);
         }
-        if helper_id == RuntimeHelperId::MakeFunction && simple_args.len() == 6 {
-            let callable_is_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
-                call.func.as_ref(),
-                local_env,
-                emit_ctx,
-            );
-            let callable = emit_codegen_expr_with_local_env(
-                fb,
-                call.func.as_ref(),
-                local_env,
-                emit_ctx,
-                callable_is_borrowed,
-                jit_module,
-                func_imports,
-            );
-            return Some(emit_positional_vectorcall_with_local_env(
-                fb,
-                callable,
-                callable_is_borrowed,
-                simple_args.as_slice(),
-                local_env,
-                emit_ctx,
-                jit_module,
-                func_imports,
-            ));
-        }
         if helper_id == RuntimeHelperId::RaiseDeletedName
             && simple_args.len() == 1
             && let Some(name) = codegen_expr_const_string(simple_args[0], emit_ctx.module_constants)
@@ -11519,6 +11489,100 @@ fn emit_codegen_simple_call_with_local_env(
     None
 }
 
+fn emit_codegen_make_function_with_closure_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    make_function: &soac_blockpy::block_py::MakeFunctionWithClosure<InstrCodegen>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> ir::Value {
+    let callable = emit_checked_runtime_name_object(fb, "make_function", emit_ctx);
+    let function_id = emit_owned_module_constant(
+        fb,
+        emit_ctx
+            .module_constants
+            .require_u64_constant_id(make_function.function_id().packed()),
+        emit_ctx,
+    );
+    let kind = emit_owned_module_constant(
+        fb,
+        emit_ctx
+            .module_constants
+            .require_unicode_constant_id(make_function.kind.make_function_kind_name()),
+        emit_ctx,
+    );
+    let captures_is_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
+        make_function.captures.as_ref(),
+        local_env,
+        emit_ctx,
+    );
+    let captures = emit_codegen_expr_with_local_env(
+        fb,
+        make_function.captures.as_ref(),
+        local_env,
+        emit_ctx,
+        captures_is_borrowed,
+        jit_module,
+        func_imports,
+    );
+    let param_defaults_is_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
+        make_function.param_defaults.as_ref(),
+        local_env,
+        emit_ctx,
+    );
+    let param_defaults = emit_codegen_expr_with_local_env(
+        fb,
+        make_function.param_defaults.as_ref(),
+        local_env,
+        emit_ctx,
+        param_defaults_is_borrowed,
+        jit_module,
+        func_imports,
+    );
+    let annotate_fn_is_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
+        make_function.annotate_fn.as_ref(),
+        local_env,
+        emit_ctx,
+    );
+    let annotate_fn = emit_codegen_expr_with_local_env(
+        fb,
+        make_function.annotate_fn.as_ref(),
+        local_env,
+        emit_ctx,
+        annotate_fn_is_borrowed,
+        jit_module,
+        func_imports,
+    );
+    let globals = emit_ctx.consts.block_const;
+    let result = emit_positional_vectorcall_result_with_arg_values(
+        fb,
+        callable,
+        false,
+        vec![
+            function_id,
+            kind,
+            captures,
+            param_defaults,
+            annotate_fn,
+            globals,
+        ],
+        vec![
+            false,
+            false,
+            captures_is_borrowed,
+            param_defaults_is_borrowed,
+            annotate_fn_is_borrowed,
+            true,
+        ],
+        emit_ctx,
+        ResultDemand::PYOBJECT_OWNED,
+    );
+    let (value, ownership, _) = result.expect_pyobject("make-function-with-closure result");
+    debug_assert!(ownership.is_owned());
+    value
+}
+
 fn emit_codegen_expr_with_local_env(
     fb: &mut FunctionBuilder<'_>,
     expr: &InstrCodegen,
@@ -11544,6 +11608,20 @@ fn emit_codegen_expr_with_local_env(
             "increment_counter must not request a borrowed result"
         );
         return emit_increment_counter(fb, op.counter_id, emit_ctx);
+    }
+    if let InstrCodegen::MakeFunctionWithClosure(op) = expr {
+        assert!(
+            !borrowed,
+            "MakeFunctionWithClosure must not request a borrowed result"
+        );
+        return emit_codegen_make_function_with_closure_with_local_env(
+            fb,
+            op,
+            local_env,
+            emit_ctx,
+            jit_module,
+            func_imports,
+        );
     }
     if let InstrCodegen::CalleeFunctionId(op) = expr {
         assert!(
@@ -11615,7 +11693,7 @@ fn emit_codegen_expr_with_local_env(
         }
     }
     if matches!(expr, InstrCodegen::MakeFunction(_)) {
-        panic!("MakeFunction should lower to a regular call before codegen");
+        panic!("MakeFunction should lower to MakeFunctionWithClosure before codegen");
     }
     if let InstrCodegen::Store(op) = expr {
         if let Some(value) = emit_local_store_with_local_env(
@@ -14006,7 +14084,6 @@ impl Drop for ProcessJitCompileGuard {
 fn collect_process_jit_batch_functions<'a>(
     session: &Arc<crate::session::CompileSession>,
     root: &BlockPyFunction<CodegenModuleShape>,
-    module_constants: &ModuleCodegenConstants,
     direct_call_resolver: Option<&'a crate::module_type::SharedModuleState>,
 ) -> Result<Vec<ProcessJitBatchFunction<'a>>, String> {
     let mut out = Vec::new();
@@ -14045,14 +14122,7 @@ fn collect_process_jit_batch_functions<'a>(
                 queue.push_back(function);
             }
         }
-        let batch_module_constants = batch_function
-            .source
-            .shared_state()
-            .map(|shared_state| &shared_state.codegen_constants)
-            .unwrap_or(module_constants);
-        for function_id in
-            collect_make_function_targets(&batch_function.function, batch_module_constants)
-        {
+        for function_id in collect_make_function_targets(&batch_function.function) {
             if seen.contains(&function_id) {
                 continue;
             }
@@ -14140,12 +14210,8 @@ impl ProcessJitEngine {
         module_constant_ptrs: &[*mut ffi::PyObject],
         direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
     ) -> Result<DirectFunctionCompileResult, String> {
-        let batch_functions = collect_process_jit_batch_functions(
-            session,
-            function,
-            module_constants,
-            direct_call_resolver,
-        )?;
+        let batch_functions =
+            collect_process_jit_batch_functions(session, function, direct_call_resolver)?;
         let root_function_id = function.function_id;
         let mut state = self
             .state

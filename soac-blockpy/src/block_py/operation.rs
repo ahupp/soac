@@ -773,6 +773,26 @@ impl<E: Instr> MakeFunction<E> {
 }
 
 define_operation! {
+    pub struct MakeFunctionWithClosure<E> {
+        function_id: FunctionId,
+        kind: FunctionKind,
+        captures: Box<E>,
+        param_defaults: Box<E>,
+        annotate_fn: Box<E>,
+    }
+}
+
+impl<E: Instr> MakeFunctionWithClosure<E> {
+    pub fn function_id(&self) -> FunctionId {
+        self.function_id
+    }
+
+    pub fn set_function_id(&mut self, function_id: FunctionId) {
+        self.function_id = function_id;
+    }
+}
+
+define_operation! {
     pub struct Await<E> {
         value: Box<E>,
     }

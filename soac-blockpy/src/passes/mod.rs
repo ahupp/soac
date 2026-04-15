@@ -24,13 +24,13 @@ use crate::block_py::{
     ExprList, ExprListComp, ExprName, ExprNamed, ExprNoneLiteral, ExprNumberLiteral, ExprSet,
     ExprSetComp, ExprSlice, ExprStarred, ExprStringLiteral, ExprSubscript, ExprTString, ExprTuple,
     GetAttr, GetItem, HasMeta, IdentifiedInstr, IncrementCounter, Instr, InstrWithConstantNone,
-    LiteralValue, Load, MakeCell, MakeFunction, MapFunction, MapInstr, MapModule, Mappable, Meta,
-    ModuleShape, NameLike, ResolvedName, SetAttr, SetItem, StmtAnnAssign, StmtAssert, StmtAssign,
-    StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue, StmtDelete, StmtExpr, StmtFor,
-    StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom, StmtIpyEscapeCommand,
-    StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry, StmtTypeAlias, StmtWhile,
-    StmtWith, Store, TryMapInstr, TryMapModule, TryMapTerm, UnaryOp, UnresolvedName, WithMeta,
-    Yield, YieldFrom,
+    LiteralValue, Load, MakeCell, MakeFunction, MakeFunctionWithClosure, MapFunction, MapInstr,
+    MapModule, Mappable, Meta, ModuleShape, NameLike, ResolvedName, SetAttr, SetItem,
+    StmtAnnAssign, StmtAssert, StmtAssign, StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue,
+    StmtDelete, StmtExpr, StmtFor, StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom,
+    StmtIpyEscapeCommand, StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry,
+    StmtTypeAlias, StmtWhile, StmtWith, Store, TryMapInstr, TryMapModule, TryMapTerm, UnaryOp,
+    UnresolvedName, WithMeta, Yield, YieldFrom,
 };
 use ruff_python_ast::{self as ast};
 use soac_macros::{enum_broadcast, DelegateMatchDefault};
@@ -143,6 +143,7 @@ pub enum InstrCodegenOp {
     IncrementCounter(IncrementCounter),
     CellRef(CellRef),
     MakeFunction(#[rkyv(omit_bounds)] MakeFunction<Self>),
+    MakeFunctionWithClosure(#[rkyv(omit_bounds)] MakeFunctionWithClosure<Self>),
 }
 
 pub type InstrCodegen = InstrCodegenOp;
@@ -259,6 +260,7 @@ pub enum InstrTyped {
     LegacyIncrementCounter(IncrementCounter),
     LegacyCellRef(CellRef),
     LegacyMakeFunction(MakeFunction<Self>),
+    LegacyMakeFunctionWithClosure(MakeFunctionWithClosure<Self>),
 }
 
 pub type InstrTypedCodegen = InstrTyped;
@@ -282,6 +284,7 @@ impl InstrTyped {
                 | Self::LegacyIncrementCounter(_)
                 | Self::LegacyCellRef(_)
                 | Self::LegacyMakeFunction(_)
+                | Self::LegacyMakeFunctionWithClosure(_)
         )
     }
 }
@@ -321,6 +324,9 @@ impl MapInstr<InstrCodegen, InstrTyped> for CodegenToTyped {
             InstrCodegenOp::CellRef(op) => InstrTyped::LegacyCellRef(op),
             InstrCodegenOp::MakeFunction(op) => {
                 InstrTyped::LegacyMakeFunction(op.map_children(self))
+            }
+            InstrCodegenOp::MakeFunctionWithClosure(op) => {
+                InstrTyped::LegacyMakeFunctionWithClosure(op.map_children(self))
             }
         }
     }
@@ -401,6 +407,9 @@ impl TryMapInstr<InstrTyped, InstrCodegen, String> for TypedToCodegen {
             InstrTyped::LegacyCellRef(op) => InstrCodegenOp::CellRef(op),
             InstrTyped::LegacyMakeFunction(op) => {
                 InstrCodegenOp::MakeFunction(op.try_map_children(self)?)
+            }
+            InstrTyped::LegacyMakeFunctionWithClosure(op) => {
+                InstrCodegenOp::MakeFunctionWithClosure(op.try_map_children(self)?)
             }
         })
     }
@@ -546,6 +555,7 @@ pub enum InstrLow<N: NameLike> {
     CellRefForName(CellRefForName),
     CellRef(CellRef),
     MakeFunction(#[rkyv(omit_bounds)] MakeFunction<Self>),
+    MakeFunctionWithClosure(#[rkyv(omit_bounds)] MakeFunctionWithClosure<Self>),
 }
 
 impl<N: NameLike> Instr for InstrLow<N> {
@@ -593,6 +603,7 @@ pub enum InstrResolved {
     MakeCell(#[rkyv(omit_bounds)] MakeCell<Self>),
     CellRef(CellRef),
     MakeFunction(#[rkyv(omit_bounds)] MakeFunction<Self>),
+    MakeFunctionWithClosure(#[rkyv(omit_bounds)] MakeFunctionWithClosure<Self>),
 }
 
 impl Instr for InstrResolved {

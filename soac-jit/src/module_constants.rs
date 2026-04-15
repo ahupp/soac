@@ -178,6 +178,14 @@ impl ModuleCodegenConstants {
             .unwrap_or_else(|| panic!("missing module int constant in codegen pool: {value}"))
     }
 
+    pub fn require_u64_constant_id(&self, value: u64) -> ModuleConstantId {
+        if let Ok(value) = i64::try_from(value) {
+            self.require_int_constant_id(value)
+        } else {
+            self.require_big_int_constant_id(value.to_string().as_str())
+        }
+    }
+
     pub fn require_big_int_constant_id(&self, value: &str) -> ModuleConstantId {
         self.lookup_id(&ModuleConstantValue::BigInt(value.to_string()))
             .unwrap_or_else(|| panic!("missing module big-int constant in codegen pool: {value}"))
@@ -330,6 +338,14 @@ impl ModuleCodegenConstants {
 
     fn intern_int(&mut self, value: i64) -> ModuleConstantId {
         self.intern(ModuleConstantValue::Int(value))
+    }
+
+    fn intern_u64(&mut self, value: u64) -> ModuleConstantId {
+        if let Ok(value) = i64::try_from(value) {
+            self.intern_int(value)
+        } else {
+            self.intern(ModuleConstantValue::BigInt(value.to_string()))
+        }
     }
 }
 
@@ -503,6 +519,13 @@ impl ModuleConstantCollector {
                 op.visit_children(self);
             }
             InstrCodegen::MakeFunction(op) => {
+                op.visit_children(self);
+            }
+            InstrCodegen::MakeFunctionWithClosure(op) => {
+                self.constants.intern_u64(op.function_id().packed());
+                self.constants
+                    .intern_unicode_bytes(op.kind.make_function_kind_name().as_bytes());
+                self.constants.intern_unicode_bytes(b"make_function");
                 op.visit_children(self);
             }
             InstrCodegen::Del(_) | InstrCodegen::CellRef(_) => {}
