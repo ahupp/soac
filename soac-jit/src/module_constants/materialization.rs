@@ -13,8 +13,6 @@ unsafe extern "C" {
     fn PyUnstable_IsImmortal(op: *mut ffi::PyObject) -> c_int;
 }
 
-const SOAC_RUNTIME_BOOTSTRAP_HELPER_NAMES: &[&str] = &["import_", "import_attr"];
-
 #[derive(Debug, Clone, Copy)]
 pub(super) enum RuntimeNameConstantMode {
     ImportRuntime,
@@ -627,9 +625,6 @@ fn build_runtime_name_constant(
 fn build_soac_runtime_bootstrap_runtime_name(py: Python<'_>, bytes: &[u8]) -> PyResult<Py<PyAny>> {
     let name = std::str::from_utf8(bytes)
         .map_err(|_| PyRuntimeError::new_err("runtime-name constant is not UTF-8"))?;
-    if SOAC_RUNTIME_BOOTSTRAP_HELPER_NAMES.contains(&name) {
-        return Ok(PyModule::import(py, "_soac_ext")?.getattr(name)?.unbind());
-    }
     match name {
         "TRUE" | "FALSE" | "NONE" | "ELLIPSIS" | "EMPTY_TUPLE" | "ITER_COMPLETE" => {
             Ok(PyModule::import(py, "soac.bootstrap")?
