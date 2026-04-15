@@ -13,7 +13,7 @@ unsafe extern "C" {
     fn PyUnstable_IsImmortal(op: *mut ffi::PyObject) -> c_int;
 }
 
-const SOAC_RUNTIME_BOOTSTRAP_HELPER_NAMES: &[&str] = &["_soac_ext", "import_", "import_attr"];
+const SOAC_RUNTIME_BOOTSTRAP_HELPER_NAMES: &[&str] = &["import_", "import_attr"];
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum RuntimeNameConstantMode {
