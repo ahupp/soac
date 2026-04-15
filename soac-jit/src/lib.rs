@@ -41,6 +41,8 @@ use std::ffi::{CString, c_char, c_void};
 use std::mem;
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr::{self, NonNull};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tracing::info;
 
@@ -397,6 +399,9 @@ struct PyFunctionJitExtra {
     compiled_vectorcall_entry: Option<jit::VectorcallEntryFn>,
     previous_vectorcall: Option<ffi::vectorcallfunc>,
 }
+
+#[cfg(test)]
+static FORCE_ENTRY_INTERPRETER_VECTORCALL_FOR_TESTS: AtomicBool = AtomicBool::new(false);
 
 struct DirectArgParamBinding {
     name: String,
@@ -2045,6 +2050,12 @@ pub unsafe fn register_clif_vectorcall(
     let func = function as *mut ffi::PyFunctionObject;
     if !PyFunction_GetSoacMetadata(function).is_null() {
         let data = unsafe { py_function_jit_extra(function)? };
+        #[cfg(test)]
+        if entry_interpreter_vectorcall_for_tests_enabled() {
+            data.compiled_vectorcall_entry = None;
+            PyFunction_SetVectorcall(func, Some(entry_interpreter_vectorcall_for_tests));
+            return Ok(());
+        }
         let param_count = data.binding_plan.param_count();
         let entry = data
             .compile_session
@@ -2076,6 +2087,22 @@ pub unsafe fn register_clif_vectorcall(
                 c"no specialized JIT plan found while registering vectorcall".as_ptr(),
             );
         })?;
+    #[cfg(test)]
+    if entry_interpreter_vectorcall_for_tests_enabled() {
+        let data_ptr = make_clif_function_data(function, function_id, module_runtime)?;
+        if PyFunction_SetSoacMetadata(
+            function,
+            function_id.packed(),
+            data_ptr,
+            Some(free_clif_function_data),
+        ) != 0
+        {
+            free_clif_function_data(data_ptr);
+            return Err(());
+        }
+        PyFunction_SetVectorcall(func, Some(entry_interpreter_vectorcall_for_tests));
+        return Ok(());
+    }
     let entry = module_runtime
         .compile_session
         .process_jit()
@@ -2125,6 +2152,46 @@ pub unsafe fn compile_clif_vectorcall(function: *mut ffi::PyObject) -> Result<()
     let py = Python::assume_attached();
     let data = py_function_jit_extra(function)?;
     ensure_clif_vectorcall_compiled(py, function, data)
+}
+
+#[cfg(test)]
+pub(crate) fn force_entry_interpreter_vectorcall_for_tests(enabled: bool) -> bool {
+    FORCE_ENTRY_INTERPRETER_VECTORCALL_FOR_TESTS.swap(enabled, Ordering::SeqCst)
+}
+
+#[cfg(test)]
+fn entry_interpreter_vectorcall_for_tests_enabled() -> bool {
+    FORCE_ENTRY_INTERPRETER_VECTORCALL_FOR_TESTS.load(Ordering::SeqCst)
+}
+
+#[cfg(test)]
+unsafe extern "C" fn entry_interpreter_vectorcall_for_tests(
+    callable: *mut ffi::PyObject,
+    args: *const *mut ffi::PyObject,
+    nargsf: usize,
+    kwnames: *mut ffi::PyObject,
+) -> *mut ffi::PyObject {
+    match panic::catch_unwind(AssertUnwindSafe(|| unsafe {
+        run_registered_clif_function_from_vectorcall_entry(callable, args, nargsf, kwnames)
+    })) {
+        Ok(Ok(result)) => result,
+        Ok(Err(())) => ptr::null_mut(),
+        Err(payload) => {
+            let message = format!(
+                "panic in entry_interpreter_vectorcall_for_tests: {}",
+                panic_payload_to_string(payload)
+            );
+            if let Ok(c_msg) = CString::new(message) {
+                ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
+            } else {
+                ffi::PyErr_SetString(
+                    ffi::PyExc_RuntimeError,
+                    c"panic in entry_interpreter_vectorcall_for_tests".as_ptr(),
+                );
+            }
+            ptr::null_mut()
+        }
+    }
 }
 
 #[cold]

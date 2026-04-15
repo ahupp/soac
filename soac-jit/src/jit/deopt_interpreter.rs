@@ -13,8 +13,8 @@ use pyo3::types::PyAny;
 use pyo3::{Bound, Python};
 use soac_blockpy::block_py::{
     AbruptKind, BinOp, BinOpKind, BlockArg, BlockEdge, BlockTerm, CallArgKeyword,
-    CallArgPositional, CalleeFunctionId, CellLocation, InstrCodegen, LocalLocation, NameLocation,
-    ParamKind, UnaryOp, UnaryOpKind,
+    CallArgPositional, CalleeFunctionId, CellLocation, InstrCodegen, LocalLocation, NameLike,
+    NameLocation, ParamKind, UnaryOp, UnaryOpKind,
 };
 use soac_blockpy::block_py::{BlockPyFunction, FunctionKind};
 use soac_blockpy::passes::{
@@ -1467,9 +1467,25 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
         positional_args: &[CallArgPositional<InstrCodegen>],
         keyword_args: &[CallArgKeyword<InstrCodegen>],
     ) -> Result<ObjPtr, String> {
+        if positional_args.is_empty()
+            && keyword_args.is_empty()
+            && is_runtime_name_load(callable_expr, "globals")
+        {
+            return Ok(unsafe { self.entry_globals_owned() });
+        }
+
         let callable = unsafe { self.execute_expr_owned(callable_expr)? };
         if callable.is_null() {
             return Ok(ptr::null_mut());
+        }
+        if positional_args.is_empty()
+            && keyword_args.is_empty()
+            && unsafe { callable_is_runtime_name(callable, "globals") }
+        {
+            unsafe {
+                ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
+            }
+            return Ok(unsafe { self.entry_globals_owned() });
         }
 
         let mut args = Vec::with_capacity(positional_args.len());
@@ -1713,6 +1729,24 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
         }
         Ok(result.cast())
+    }
+
+    #[cold]
+    unsafe fn entry_globals_owned(&self) -> ObjPtr {
+        let globals = self.source.globals_obj();
+        if globals.is_null() {
+            unsafe {
+                ffi::PyErr_SetString(
+                    ffi::PyExc_RuntimeError,
+                    c"entry interpreter globals() has no module globals".as_ptr(),
+                );
+            }
+            return ptr::null_mut();
+        }
+        unsafe {
+            ffi::Py_INCREF(globals.cast::<ffi::PyObject>());
+        }
+        globals
     }
 
     #[cold]
@@ -2210,6 +2244,33 @@ unsafe fn callable_soac_function_id(callable: *mut ffi::PyObject) -> u64 {
         }
     }
     0
+}
+
+fn is_runtime_name_load(expr: &InstrCodegen, name: &str) -> bool {
+    matches!(expr, InstrCodegen::Load(load) if load.name.is_runtime_symbol(name))
+}
+
+unsafe fn callable_is_runtime_name(callable: ObjPtr, name: &str) -> bool {
+    let name_len = match ffi::Py_ssize_t::try_from(name.len()) {
+        Ok(name_len) => name_len,
+        Err(_) => return false,
+    };
+    let name_obj = unsafe { ffi::PyUnicode_FromStringAndSize(name.as_ptr().cast(), name_len) };
+    if name_obj.is_null() {
+        return false;
+    }
+    let runtime_obj = unsafe { load_runtime_name_owned(name_obj) };
+    unsafe {
+        ffi::Py_DECREF(name_obj);
+    }
+    if runtime_obj.is_null() {
+        return false;
+    }
+    let matches = runtime_obj.cast::<c_void>() == callable;
+    unsafe {
+        ffi::Py_DECREF(runtime_obj);
+    }
+    matches
 }
 
 unsafe fn merge_kwargs_or_format_error(
