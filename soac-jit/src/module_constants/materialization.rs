@@ -628,9 +628,7 @@ fn build_soac_runtime_bootstrap_runtime_name(py: Python<'_>, bytes: &[u8]) -> Py
     let name = std::str::from_utf8(bytes)
         .map_err(|_| PyRuntimeError::new_err("runtime-name constant is not UTF-8"))?;
     if SOAC_RUNTIME_BOOTSTRAP_HELPER_NAMES.contains(&name) {
-        return Ok(build_soac_runtime_bootstrap_module(py)?
-            .getattr(name)?
-            .unbind());
+        return Ok(PyModule::import(py, "_soac_ext")?.getattr(name)?.unbind());
     }
     match name {
         "TRUE" | "FALSE" | "NONE" | "ELLIPSIS" | "EMPTY_TUPLE" | "ITER_COMPLETE" => {
@@ -643,67 +641,6 @@ fn build_soac_runtime_bootstrap_runtime_name(py: Python<'_>, bytes: &[u8]) -> Py
              it should have been lowered as a global name"
         ))),
     }
-}
-
-pub fn build_soac_runtime_bootstrap_module<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyModule>> {
-    PyModule::from_code(
-        py,
-        c"
-import builtins as _builtins
-import sys as _sys
-
-def raise_deleted_name(name):
-    raise UnboundLocalError(
-        f'cannot access local variable {name!r} where it is not associated with a value'
-    )
-
-_MISSING = object()
-
-def import_(name, spec, fromlist=None, level=0):
-    if fromlist is None:
-        fromlist = []
-    globals_dict = {'__spec__': spec}
-    if spec is not None:
-        package = spec.parent
-        if not package and getattr(spec, 'submodule_search_locations', None):
-            package = spec.name
-        globals_dict['__package__'] = package
-        globals_dict['__name__'] = spec.name
-    return _builtins.__import__(name, globals_dict, {}, fromlist, level)
-
-def import_attr(module, attr):
-    value = getattr(module, attr, _MISSING)
-    if value is not _MISSING:
-        return value
-    module_name = getattr(module, '__name__', None)
-    if module_name:
-        submodule = _sys.modules.get(f'{module_name}.{attr}')
-        if submodule is not None:
-            return submodule
-    module_spec = getattr(module, '__spec__', None)
-    if (
-        module_name
-        and module_spec is not None
-        and getattr(module_spec, '_initializing', False)
-    ):
-        message = (
-            f'cannot import name {attr!r} from partially initialized module '
-            f'{module_name!r} (most likely due to a circular import)'
-        )
-        raise ImportError(message, name=module_name) from None
-    module_name = module_name or '<unknown module name>'
-    module_file = getattr(module, '__file__', None)
-    message = f'cannot import name {attr!r} from {module_name!r}'
-    if module_file is not None:
-        message = f'{message} ({module_file})'
-    else:
-        message = f'{message} (unknown location)'
-    raise ImportError(message, name=module_name, path=module_file) from None
-
-",
-        c"<soac.runtime bootstrap>",
-        c"soac.runtime._bootstrap",
-    )
 }
 
 fn mark_constants_immortal(constants: &[Py<PyAny>]) {

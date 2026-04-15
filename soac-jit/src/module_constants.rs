@@ -10,7 +10,6 @@ use std::collections::HashMap;
 
 mod materialization;
 use materialization::RuntimeNameConstantMode;
-pub use materialization::build_soac_runtime_bootstrap_module;
 pub(crate) use materialization::{
     StaticPyObjectImage, load_runtime_name_owned, raise_name_error_for_missing_name,
 };

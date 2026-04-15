@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 pub mod config;
 pub mod function_instantiation;
+pub mod import_helpers;
 mod jit;
 pub(crate) mod operator_specialization;
 pub use function_instantiation::{

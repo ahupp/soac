@@ -17,7 +17,7 @@ pub fn rewrite(ast::StmtImport { names, .. }: ast::StmtImport) -> Rewrite {
                 .unwrap_or_else(|| module_name.split('.').next().unwrap());
             let needs_fromlist = alias.asname.is_some() && module_name.contains('.');
             if needs_fromlist {
-                let mut expr = format!("__soac__.import_({:?}, __spec__)", module_name.as_str());
+                let mut expr = format!("__soac__.import_({:?}, globals())", module_name.as_str());
                 let mut parts = module_name.split('.').collect::<Vec<_>>();
                 if !parts.is_empty() {
                     parts.remove(0);
@@ -33,7 +33,7 @@ pub fn rewrite(ast::StmtImport { names, .. }: ast::StmtImport) -> Rewrite {
                 body
             } else {
                 vec![py_stmt!(
-                    "{name:id} = __soac__.import_({module:literal}, __spec__)",
+                    "{name:id} = __soac__.import_({module:literal}, globals())",
                     name = binding,
                     module = module_name.as_str(),
                 )]
@@ -55,7 +55,7 @@ pub fn rewrite_from(context: &Context, import_from: ast::StmtImportFrom) -> Rewr
         let module_name = module.as_ref().map(|n| n.id.as_str()).unwrap_or("");
         let module_literal = format!("{:?}", module_name);
         let import_stmt_source = format!(
-            "__soac__.import_star({module}, __spec__, globals(), {level})",
+            "__soac__.import_star({module}, globals(), {level})",
             module = module_literal,
             level = level
         );
@@ -77,7 +77,7 @@ pub fn rewrite_from(context: &Context, import_from: ast::StmtImportFrom) -> Rewr
     let module_literal = format!("{:?}", module_name);
     let import_stmt_source = if level > 0 {
         format!(
-            "{tmp} = __soac__.import_({module}, __spec__, {fromlist}, {level})",
+            "{tmp} = __soac__.import_({module}, globals(), {fromlist}, {level})",
             tmp = temp_binding,
             module = module_literal,
             fromlist = fromlist_literal,
@@ -85,7 +85,7 @@ pub fn rewrite_from(context: &Context, import_from: ast::StmtImportFrom) -> Rewr
         )
     } else {
         format!(
-            "{tmp} = __soac__.import_({module}, __spec__, {fromlist})",
+            "{tmp} = __soac__.import_({module}, globals(), {fromlist})",
             tmp = temp_binding,
             module = module_literal,
             fromlist = fromlist_literal

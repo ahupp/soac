@@ -38,7 +38,7 @@ fn install_soac_runtime_bootstrap_globals(
     py: Python<'_>,
     globals: &Bound<'_, PyDict>,
 ) -> PyResult<SoacRuntimeBootstrapGlobals> {
-    let bootstrap = soac_jit::module_constants::build_soac_runtime_bootstrap_module(py)?;
+    let native_ext = PyModule::import(py, "_soac_ext")?;
     let normal_bootstrap = PyModule::import(py, "soac.bootstrap")?;
     let mut helpers = Vec::new();
     for name in ["_entry_template", "code_with_freevars"] {
@@ -47,7 +47,7 @@ fn install_soac_runtime_bootstrap_globals(
         helpers.push((name, helper.unbind()));
     }
     for name in ["import_", "import_attr"] {
-        let helper = bootstrap.getattr(name)?;
+        let helper = native_ext.getattr(name)?;
         globals.set_item(name, &helper)?;
         helpers.push((name, helper.unbind()));
     }
@@ -608,11 +608,33 @@ fn force_entry_interpreter_for_tests(enabled: bool) -> bool {
     soac_jit::force_entry_interpreter_vectorcall_for_tests(enabled)
 }
 
+#[pyfunction(signature = (name, globals, fromlist=None, level=0))]
+fn import_(
+    py: Python<'_>,
+    name: &Bound<'_, PyAny>,
+    globals: &Bound<'_, PyAny>,
+    fromlist: Option<&Bound<'_, PyAny>>,
+    level: i32,
+) -> PyResult<Py<PyAny>> {
+    soac_jit::import_helpers::import_module_level(py, name, globals, fromlist, level)
+}
+
+#[pyfunction]
+fn import_attr(
+    py: Python<'_>,
+    module: &Bound<'_, PyAny>,
+    name: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    soac_jit::import_helpers::import_from(py, module, name)
+}
+
 pub(crate) fn add_module_functions(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(create_module, module)?)?;
     module.add_function(wrap_pyfunction!(exec_module, module)?)?;
     module.add_function(wrap_pyfunction!(make_function, module)?)?;
     module.add_function(wrap_pyfunction!(profile_watch_type_key_layout, module)?)?;
     module.add_function(wrap_pyfunction!(force_entry_interpreter_for_tests, module)?)?;
+    module.add_function(wrap_pyfunction!(import_, module)?)?;
+    module.add_function(wrap_pyfunction!(import_attr, module)?)?;
     Ok(())
 }

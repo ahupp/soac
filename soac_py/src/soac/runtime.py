@@ -53,6 +53,8 @@ AttributeError = _builtins.AttributeError
 ImportError = _builtins.ImportError
 TypeError = _builtins.TypeError
 ValueError = _builtins.ValueError
+import_ = _soac_ext.import_
+import_attr = _soac_ext.import_attr
 
 
 def _index(value, /):
@@ -612,67 +614,8 @@ def _call_exception_class(exc_type):
     return inst
 
 
-def import_(name, spec, fromlist=None, level=0):
-    if fromlist is None:
-        fromlist = []
-    globals_dict = {"__spec__": spec}
-    if spec is not None:
-        package = spec.parent
-        if not package and getattr(spec, "submodule_search_locations", None):
-            package = spec.name
-        globals_dict["__package__"] = package
-        globals_dict["__name__"] = spec.name
-    try:
-        return _builtins.__import__(name, globals_dict, {}, fromlist, level)
-    except Exception as exc:
-        raise exc from None
-
-
-def import_attr(module, attr):
-    value = getattr(module, attr, _MISSING)
-    if value is not _MISSING:
-        return value
-
-    module_name = getattr(module, "__name__", None)
-    if module_name:
-        submodule = _sys.modules.get(f"{module_name}.{attr}")
-        if submodule is not None:
-            return submodule
-    module_spec = getattr(module, "__spec__", None)
-    if (
-        module_name
-        and module_spec is not None
-        and getattr(module_spec, "_initializing", False)
-    ):
-        message = (
-            f"cannot import name {attr!r} from partially initialized module "
-            f"{module_name!r} (most likely due to a circular import)"
-        )
-        raise ImportError(message, name=module_name) from None
-    module_name = module_name or "<unknown module name>"
-    module_file = getattr(module, "__file__", None)
-    message = f"cannot import name {attr!r} from {module_name!r}"
-    if module_file is not None:
-        message = f"{message} ({module_file})"
-    else:
-        message = f"{message} (unknown location)"
-    raise ImportError(message, name=module_name, path=module_file) from None
-
-
-def import_star(name, spec, globals_dict, level=0):
-    module = import_(name, spec, ["*"], level)
-    if (
-        level
-        and name
-        and spec is not None
-        and getattr(spec, "submodule_search_locations", None) is not None
-    ):
-        root_name = name.split(".", 1)[0]
-        package_module = _sys.modules.get(spec.name)
-        if package_module is not None:
-            root_module = getattr(package_module, root_name, _MISSING)
-            if root_module is not _MISSING:
-                globals_dict[root_name] = root_module
+def import_star(name, globals_dict, level=0):
+    module = import_(name, globals_dict, ["*"], level)
     try:
         names = getattr(module, "__all__", None)
     except Exception:

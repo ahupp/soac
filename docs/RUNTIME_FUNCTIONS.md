@@ -13,6 +13,8 @@ Scope:
   `register_specialized_jit_symbols`.
 - `soac.runtime`: top-level Python callables, runtime classes, methods, and
   intentionally re-exported helper callables in `soac_py/src/soac/runtime.py`.
+  Some of these names, such as import helpers, are native `_soac_ext`
+  callables re-exported by `soac.runtime`.
 - Synthetic inter-pass markers: helper-shaped names emitted by one compiler pass
   and recognized by a later pass. These names are not executable runtime APIs and
   must not survive to codegen or Python execution.
@@ -193,7 +195,7 @@ _entry_template
 
 ## soac.runtime
 
-Top-level functions defined by `soac.runtime`:
+Top-level functions defined or re-exported by `soac.runtime`:
 
 ```text
 _unsupported_frame_builtin
