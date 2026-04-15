@@ -1,6 +1,7 @@
 use soac_blockpy::block_py::{FunctionId, ModuleNameGen};
 use soac_blockpy::codegen_cache::{load_codegen_module_cache, remap_codegen_module_function_ids};
 use soac_jit::counter_dump::{CounterDumpFile, CounterDumpRecordView, CounterDumpRowView};
+use soac_jit::module_type::hash_module_source;
 use soac_jit::precompile_codegen_module_to_object_file;
 use std::collections::HashSet;
 use std::env;
@@ -10,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const SOAC_BUILD_IDENTITY: &str = env!("SOAC_BUILD_IDENTITY");
+const SOAC_RUNTIME_MODULE_NAME: &str = "soac.runtime";
 
 #[derive(Debug, Default)]
 struct Args {
@@ -74,13 +76,18 @@ fn run_with_args(args: impl IntoIterator<Item = OsString>) -> Result<(), String>
 
     let counter_dump = CounterDumpFile::open(counters_path.as_path())?;
     let records = counter_dump.records()?;
-    let modules = counter_modules_from_records(records.as_slice())?;
+    let mut modules = counter_modules_from_records(records.as_slice())?;
     if modules.is_empty() {
         return Err(format!(
             "counter dump {} does not reference any modules",
             counters_path.display()
         ));
     }
+    include_soac_runtime_module(
+        &mut modules,
+        module_cache_dir.as_path(),
+        args.build_identity.as_deref(),
+    )?;
 
     fs::create_dir_all(object_dir.as_path()).map_err(|err| {
         format!(
@@ -190,6 +197,48 @@ fn counter_modules_from_records(
     Ok(modules)
 }
 
+fn include_soac_runtime_module(
+    modules: &mut Vec<CounterModuleRef>,
+    module_cache_dir: &Path,
+    build_identity: Option<&str>,
+) -> Result<(), String> {
+    if modules
+        .iter()
+        .any(|module_ref| module_ref.module_name == SOAC_RUNTIME_MODULE_NAME)
+    {
+        return Ok(());
+    }
+
+    let source_path = soac_runtime_source_path();
+    let source = fs::read_to_string(source_path.as_path()).map_err(|err| {
+        format!(
+            "failed to read {SOAC_RUNTIME_MODULE_NAME} source {}: {err}",
+            source_path.display()
+        )
+    })?;
+    let module_ref = CounterModuleRef {
+        module_name: SOAC_RUNTIME_MODULE_NAME.to_string(),
+        source_hash: hash_module_source(source.as_str()),
+        module_id: None,
+    };
+    resolve_module_cache_path(module_cache_dir, &module_ref, build_identity).map_err(|err| {
+        format!(
+            "{err}; precompiled shared libraries include {SOAC_RUNTIME_MODULE_NAME}, so run a profile/import pass first to populate its module cache"
+        )
+    })?;
+    modules.push(module_ref);
+    modules.sort();
+    Ok(())
+}
+
+fn soac_runtime_source_path() -> PathBuf {
+    repo_root()
+        .join("soac_py")
+        .join("src")
+        .join("soac")
+        .join("runtime.py")
+}
+
 fn module_id_for_record(record: &CounterDumpRecordView<'_>) -> Result<Option<u32>, String> {
     let mut module_id = None;
     for row_index in 0..record.row_count() {
@@ -276,7 +325,7 @@ fn module_cache_path_for_identity(
         cache_root,
         module_ref.source_hash,
         build_identity,
-        module_ref.module_name == "soac.runtime",
+        module_ref.module_name == SOAC_RUNTIME_MODULE_NAME,
     )
 }
 
@@ -529,6 +578,40 @@ mod test {
     }
 
     #[test]
+    fn include_soac_runtime_module_adds_runtime_cache_entry() {
+        let root = unique_temp_dir();
+        let cache_root = root.join("soac-module-cache");
+        let runtime_source = fs::read_to_string(soac_runtime_source_path()).unwrap();
+        let runtime_ref = CounterModuleRef {
+            module_name: SOAC_RUNTIME_MODULE_NAME.to_string(),
+            source_hash: hash_module_source(runtime_source.as_str()),
+            module_id: None,
+        };
+        let runtime_cache_path =
+            module_cache_path_for_identity(cache_root.as_path(), &runtime_ref, SOAC_BUILD_IDENTITY)
+                .unwrap();
+        lower_python_to_blockpy_recorded_with_options(
+            runtime_source.as_str(),
+            ModuleNameGen::new(11),
+            LoweringOptions {
+                runtime_names_as_globals: true,
+                pre_optimization_cache_path: Some(runtime_cache_path),
+            },
+        )
+        .unwrap();
+        let mut modules = vec![CounterModuleRef {
+            module_name: "pkg.mod".to_string(),
+            source_hash: 0x1234,
+            module_id: Some(7),
+        }];
+
+        include_soac_runtime_module(&mut modules, cache_root.as_path(), None).unwrap();
+
+        assert!(modules.contains(&runtime_ref));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn object_file_name_is_path_safe_and_stable() {
         let module_ref = CounterModuleRef {
             module_name: "pkg/mod:name".to_string(),
@@ -576,6 +659,24 @@ mod test {
             cache_path.exists(),
             "lowering should populate the module cache"
         );
+        let runtime_source = fs::read_to_string(soac_runtime_source_path()).unwrap();
+        let runtime_ref = CounterModuleRef {
+            module_name: SOAC_RUNTIME_MODULE_NAME.to_string(),
+            source_hash: hash_module_source(runtime_source.as_str()),
+            module_id: None,
+        };
+        let runtime_cache_path =
+            module_cache_path_for_identity(cache_root.as_path(), &runtime_ref, SOAC_BUILD_IDENTITY)
+                .unwrap();
+        lower_python_to_blockpy_recorded_with_options(
+            runtime_source.as_str(),
+            ModuleNameGen::new(11),
+            LoweringOptions {
+                runtime_names_as_globals: true,
+                pre_optimization_cache_path: Some(runtime_cache_path),
+            },
+        )
+        .unwrap();
         let function_id = output
             .codegen_module
             .callable_defs
@@ -602,7 +703,9 @@ mod test {
         .unwrap();
 
         let object_path = object_dir.join(object_file_name(&module_ref));
+        let runtime_object_path = object_dir.join(object_file_name(&runtime_ref));
         assert_elf_file(object_path.as_path());
+        assert_elf_file(runtime_object_path.as_path());
         assert_elf_file(out_path.as_path());
         let _ = fs::remove_dir_all(root);
     }

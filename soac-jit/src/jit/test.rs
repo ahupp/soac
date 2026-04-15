@@ -704,6 +704,24 @@ def add(a, b):
                 .any(|symbol| symbol.starts_with("__soac_module_constant_shared_")),
             "precompiled object should define module constant slot symbols"
         );
+        for section in [
+            ".eh_frame",
+            ".rela.eh_frame",
+            ".debug_info",
+            ".rela.debug_info",
+            ".debug_abbrev",
+            ".debug_line",
+            ".rela.debug_line",
+            ".debug_str",
+        ] {
+            assert!(
+                object
+                    .object
+                    .windows(section.len())
+                    .any(|window| window == section.as_bytes()),
+                "precompiled object should contain {section}"
+            );
+        }
     }
 
     #[test]

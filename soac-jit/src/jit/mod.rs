@@ -1,3 +1,7 @@
+use self::precompiled_object::{
+    ElfSymbolBinding, ElfSymbolKind, ObjectDataDefinition, ObjectDataRelocation,
+    ObjectFunctionDefinition, R_X86_64_64, write_precompiled_object,
+};
 use crate::SOAC_RUNTIME_CLIF;
 #[cfg(test)]
 use crate::config::SOAC_JIT_EMIT_REFCOUNTS_ENV;
@@ -15,7 +19,6 @@ use crate::counter_dump::{
 };
 use crate::module_constants::{ModuleCodegenConstants, ModuleConstantId};
 use crate::module_type::{CounterRuntimeSlot, SharedModuleState, build_counter_storage_layout};
-use cranelift_codegen::binemit::Reloc;
 use cranelift_codegen::cfg_printer::CFGPrinter;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::inline::{Inline, InlineCommand};
@@ -27,9 +30,7 @@ use cranelift_codegen::settings::Configurable;
 use cranelift_control::ControlPlane;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch};
 use cranelift_jit::{ArenaMemoryProvider, JITBuilder, JITModule};
-use cranelift_module::{
-    DataDescription, DataId, FuncId, Linkage, Module, ModuleReloc, ModuleRelocTarget,
-};
+use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module, ModuleReloc};
 use cranelift_reader::parse_functions;
 use pyo3::ffi;
 use soac_blockpy::block_py::{
@@ -83,6 +84,7 @@ mod intrinsics;
 mod jitdump;
 mod operation_specializations;
 mod planning;
+mod precompiled_object;
 mod runtime_context;
 mod specialized_helpers;
 mod typed_value;
@@ -14533,7 +14535,7 @@ struct DefinedFunctionArtifact {
 }
 
 #[derive(Clone)]
-struct CompiledFunctionBytes {
+pub(super) struct CompiledFunctionBytes {
     code: Vec<u8>,
     alignment: u64,
     relocs: Vec<ModuleReloc>,
@@ -15877,33 +15879,6 @@ fn load_runtime_support_clif(jit_module: &mut JITModule) -> Result<(), String> {
     Ok(())
 }
 
-struct ObjectFunctionDefinition {
-    func_id: FuncId,
-    symbol: String,
-    binding: ElfSymbolBinding,
-    bytes: CompiledFunctionBytes,
-}
-
-#[derive(Debug)]
-struct ObjectDataDefinition {
-    data_id: DataId,
-    symbol: String,
-    binding: ElfSymbolBinding,
-    bytes: Vec<u8>,
-    align: u64,
-    writable: bool,
-    relocations: Vec<ObjectDataRelocation>,
-}
-
-#[derive(Debug)]
-struct ObjectDataRelocation {
-    offset: u64,
-    symbol: String,
-    kind: ElfSymbolKind,
-    reloc_type: u32,
-    addend: i64,
-}
-
 #[derive(Debug, Clone)]
 pub struct PrecompileObjectSummary {
     pub output_path: PathBuf,
@@ -15967,6 +15942,7 @@ fn compile_runtime_support_clif_for_object(
             symbol: parsed.symbol,
             binding: ElfSymbolBinding::Local,
             bytes: compiled.bytes,
+            systemv_unwind_info: compiled.artifact.systemv_unwind_info,
         });
     }
     Ok(out)
@@ -16233,6 +16209,7 @@ fn precompile_codegen_module_to_object_bytes(
             symbol: built.main_symbol,
             binding: ElfSymbolBinding::Global,
             bytes: compiled.bytes,
+            systemv_unwind_info: compiled.artifact.systemv_unwind_info,
         });
         match (
             built.default_adapter_id,
@@ -16271,6 +16248,7 @@ fn precompile_codegen_module_to_object_bytes(
                     symbol: default_adapter_symbol.clone(),
                     binding: ElfSymbolBinding::Global,
                     bytes: compiled.bytes,
+                    systemv_unwind_info: compiled.artifact.systemv_unwind_info,
                 });
             }
             (None, None) => {}
@@ -16283,7 +16261,12 @@ fn precompile_codegen_module_to_object_bytes(
         }
     }
 
-    let object = write_precompiled_object(&jit_module, &function_definitions, &data_definitions)?;
+    let object = write_precompiled_object(
+        &jit_module,
+        object_isa.as_ref(),
+        &function_definitions,
+        &data_definitions,
+    )?;
     Ok(PrecompiledObjectBytes {
         object,
         function_count: function_definitions.len(),
@@ -16304,688 +16287,6 @@ fn precompile_codegen_module_to_object_bytes(
             .map(|definition| (definition.symbol.clone(), definition.writable))
             .collect(),
     })
-}
-
-fn write_precompiled_object(
-    jit_module: &JITModule,
-    function_definitions: &[ObjectFunctionDefinition],
-    data_definitions: &[ObjectDataDefinition],
-) -> Result<Vec<u8>, String> {
-    if !(cfg!(target_os = "linux")
-        && cfg!(target_arch = "x86_64")
-        && cfg!(target_endian = "little"))
-    {
-        return Err(format!(
-            "precompile object output currently supports only little-endian linux/x86_64 hosts, got {}",
-            std::env::consts::ARCH
-        ));
-    }
-
-    let mut object = ElfObjectBuilder::default();
-    let mut function_symbols = HashMap::new();
-    let mut data_symbols = HashMap::new();
-
-    for function in function_definitions {
-        let offset =
-            object.append_text(function.bytes.code.as_slice(), function.bytes.alignment)?;
-        let symbol_index = object.add_defined_symbol(
-            function.symbol.as_str(),
-            function.binding,
-            ElfSymbolKind::Func,
-            ElfSectionIndex::Text,
-            offset,
-            function.bytes.code.len() as u64,
-        );
-        function_symbols.insert(function.func_id, (symbol_index, offset));
-    }
-
-    for data in data_definitions {
-        let section = if data.writable {
-            ElfSectionIndex::Data
-        } else {
-            ElfSectionIndex::Rodata
-        };
-        let offset = object.append_data(section, data.bytes.as_slice(), data.align)?;
-        let symbol_index = object.add_defined_symbol(
-            data.symbol.as_str(),
-            data.binding,
-            ElfSymbolKind::Object,
-            section,
-            offset,
-            data.bytes.len() as u64,
-        );
-        for relocation in &data.relocations {
-            let relocation_offset = offset
-                .checked_add(relocation.offset)
-                .ok_or_else(|| format!("data relocation offset overflow in {}", data.symbol))?;
-            let symbol_index =
-                object.add_global_undefined_symbol(relocation.symbol.as_str(), relocation.kind);
-            object.add_section_relocation(
-                section,
-                ElfRelocation {
-                    offset: relocation_offset,
-                    symbol_index,
-                    reloc_type: relocation.reloc_type,
-                    addend: relocation.addend,
-                },
-            )?;
-        }
-        data_symbols.insert(data.data_id, symbol_index);
-    }
-
-    for function in function_definitions {
-        let (_, function_offset) = function_symbols[&function.func_id];
-        for reloc in &function.bytes.relocs {
-            let (target_symbol, addend) = elf_symbol_for_reloc_target(
-                jit_module,
-                &mut object,
-                &function_symbols,
-                &data_symbols,
-                &reloc.name,
-                reloc.addend,
-            )?;
-            let offset = function_offset
-                .checked_add(u64::from(reloc.offset))
-                .ok_or_else(|| format!("relocation offset overflow in {}", function.symbol))?;
-            object.add_text_relocation(ElfRelocation {
-                offset,
-                symbol_index: target_symbol,
-                reloc_type: elf_relocation_type(reloc.kind)?,
-                addend,
-            });
-        }
-    }
-
-    object.finish()
-}
-
-#[derive(Default)]
-struct ElfObjectBuilder {
-    text: Vec<u8>,
-    data: Vec<u8>,
-    rodata: Vec<u8>,
-    symbols: Vec<ElfSymbol>,
-    global_symbols_by_name: HashMap<String, u32>,
-    text_relocations: Vec<ElfRelocation>,
-    data_relocations: Vec<ElfRelocation>,
-    rodata_relocations: Vec<ElfRelocation>,
-}
-
-impl ElfObjectBuilder {
-    fn append_text(&mut self, bytes: &[u8], align: u64) -> Result<u64, String> {
-        let offset = append_aligned(&mut self.text, bytes, align.max(1))?;
-        Ok(offset)
-    }
-
-    fn append_data(
-        &mut self,
-        section: ElfSectionIndex,
-        bytes: &[u8],
-        align: u64,
-    ) -> Result<u64, String> {
-        let target = match section {
-            ElfSectionIndex::Data => &mut self.data,
-            ElfSectionIndex::Rodata => &mut self.rodata,
-            ElfSectionIndex::Text | ElfSectionIndex::Undefined => {
-                return Err(format!("cannot append data to ELF section {section:?}"));
-            }
-        };
-        append_aligned(target, bytes, align.max(1))
-    }
-
-    fn add_defined_symbol(
-        &mut self,
-        name: &str,
-        binding: ElfSymbolBinding,
-        kind: ElfSymbolKind,
-        section: ElfSectionIndex,
-        value: u64,
-        size: u64,
-    ) -> u32 {
-        let index = (self.symbols.len() + 1) as u32;
-        self.symbols.push(ElfSymbol {
-            name: name.to_string(),
-            binding,
-            kind,
-            section,
-            value,
-            size,
-        });
-        index
-    }
-
-    fn add_global_undefined_symbol(&mut self, name: &str, kind: ElfSymbolKind) -> u32 {
-        if let Some(index) = self.global_symbols_by_name.get(name).copied() {
-            return index;
-        }
-        let index = (self.symbols.len() + 1) as u32;
-        self.symbols.push(ElfSymbol {
-            name: name.to_string(),
-            binding: ElfSymbolBinding::Global,
-            kind,
-            section: ElfSectionIndex::Undefined,
-            value: 0,
-            size: 0,
-        });
-        self.global_symbols_by_name.insert(name.to_string(), index);
-        index
-    }
-
-    fn add_text_relocation(&mut self, relocation: ElfRelocation) {
-        self.text_relocations.push(relocation);
-    }
-
-    fn add_section_relocation(
-        &mut self,
-        section: ElfSectionIndex,
-        relocation: ElfRelocation,
-    ) -> Result<(), String> {
-        match section {
-            ElfSectionIndex::Data => {
-                self.data_relocations.push(relocation);
-                Ok(())
-            }
-            ElfSectionIndex::Rodata => {
-                self.rodata_relocations.push(relocation);
-                Ok(())
-            }
-            ElfSectionIndex::Text | ElfSectionIndex::Undefined => Err(format!(
-                "cannot add data relocation to ELF section {section:?}"
-            )),
-        }
-    }
-
-    fn finish(self) -> Result<Vec<u8>, String> {
-        let mut strtab = Vec::from([0]);
-        let mut symbol_names = Vec::with_capacity(self.symbols.len());
-        for symbol in &self.symbols {
-            symbol_names.push(push_string_table(&mut strtab, symbol.name.as_str())?);
-        }
-
-        let first_global_symbol = self
-            .symbols
-            .iter()
-            .position(|symbol| symbol.binding == ElfSymbolBinding::Global)
-            .map(|index| index + 1)
-            .unwrap_or(self.symbols.len() + 1) as u32;
-
-        let mut symtab = vec![0; ELF64_SYM_SIZE];
-        for (symbol, name_offset) in self.symbols.iter().zip(symbol_names) {
-            push_elf_symbol(&mut symtab, name_offset, symbol);
-        }
-
-        let mut rela_text = Vec::with_capacity(self.text_relocations.len() * ELF64_RELA_SIZE);
-        for relocation in &self.text_relocations {
-            push_u64(&mut rela_text, relocation.offset);
-            push_u64(
-                &mut rela_text,
-                (u64::from(relocation.symbol_index) << 32) | u64::from(relocation.reloc_type),
-            );
-            push_i64(&mut rela_text, relocation.addend);
-        }
-        let mut rela_data = Vec::with_capacity(self.data_relocations.len() * ELF64_RELA_SIZE);
-        for relocation in &self.data_relocations {
-            push_u64(&mut rela_data, relocation.offset);
-            push_u64(
-                &mut rela_data,
-                (u64::from(relocation.symbol_index) << 32) | u64::from(relocation.reloc_type),
-            );
-            push_i64(&mut rela_data, relocation.addend);
-        }
-        let mut rela_rodata = Vec::with_capacity(self.rodata_relocations.len() * ELF64_RELA_SIZE);
-        for relocation in &self.rodata_relocations {
-            push_u64(&mut rela_rodata, relocation.offset);
-            push_u64(
-                &mut rela_rodata,
-                (u64::from(relocation.symbol_index) << 32) | u64::from(relocation.reloc_type),
-            );
-            push_i64(&mut rela_rodata, relocation.addend);
-        }
-
-        let mut shstrtab = Vec::from([0]);
-        let text_name = push_string_table(&mut shstrtab, ".text")?;
-        let data_name = push_string_table(&mut shstrtab, ".data")?;
-        let rodata_name = push_string_table(&mut shstrtab, ".rodata")?;
-        let rela_text_name = push_string_table(&mut shstrtab, ".rela.text")?;
-        let rela_data_name = push_string_table(&mut shstrtab, ".rela.data")?;
-        let rela_rodata_name = push_string_table(&mut shstrtab, ".rela.rodata")?;
-        let symtab_name = push_string_table(&mut shstrtab, ".symtab")?;
-        let strtab_name = push_string_table(&mut shstrtab, ".strtab")?;
-        let shstrtab_name = push_string_table(&mut shstrtab, ".shstrtab")?;
-        let gnu_stack_name = push_string_table(&mut shstrtab, ".note.GNU-stack")?;
-
-        let mut file = vec![0; ELF64_EHDR_SIZE];
-        let text_header = append_section_bytes(&mut file, self.text.as_slice(), 16)?;
-        let data_header = append_section_bytes(&mut file, self.data.as_slice(), 8)?;
-        let rodata_header = append_section_bytes(&mut file, self.rodata.as_slice(), 8)?;
-        let rela_text_header = append_section_bytes(&mut file, rela_text.as_slice(), 8)?;
-        let rela_data_header = append_section_bytes(&mut file, rela_data.as_slice(), 8)?;
-        let rela_rodata_header = append_section_bytes(&mut file, rela_rodata.as_slice(), 8)?;
-        let symtab_header = append_section_bytes(&mut file, symtab.as_slice(), 8)?;
-        let strtab_header = append_section_bytes(&mut file, strtab.as_slice(), 1)?;
-        let shstrtab_header = append_section_bytes(&mut file, shstrtab.as_slice(), 1)?;
-        let section_header_offset = align_vec(&mut file, 8)?;
-
-        let mut section_headers = Vec::with_capacity(ELF_SECTION_COUNT * ELF64_SHDR_SIZE);
-        section_headers.resize(ELF64_SHDR_SIZE, 0);
-        push_elf_section_header(
-            &mut section_headers,
-            text_name,
-            SHT_PROGBITS,
-            SHF_ALLOC | SHF_EXECINSTR,
-            text_header,
-            0,
-            0,
-            16,
-            0,
-        );
-        push_elf_section_header(
-            &mut section_headers,
-            data_name,
-            SHT_PROGBITS,
-            SHF_ALLOC | SHF_WRITE,
-            data_header,
-            0,
-            0,
-            8,
-            0,
-        );
-        push_elf_section_header(
-            &mut section_headers,
-            rodata_name,
-            SHT_PROGBITS,
-            SHF_ALLOC,
-            rodata_header,
-            0,
-            0,
-            8,
-            0,
-        );
-        push_elf_section_header(
-            &mut section_headers,
-            rela_text_name,
-            SHT_RELA,
-            0,
-            rela_text_header,
-            ELF_SECTION_SYMTAB_INDEX,
-            ELF_SECTION_TEXT_INDEX,
-            8,
-            ELF64_RELA_SIZE as u64,
-        );
-        push_elf_section_header(
-            &mut section_headers,
-            rela_data_name,
-            SHT_RELA,
-            0,
-            rela_data_header,
-            ELF_SECTION_SYMTAB_INDEX,
-            ELF_SECTION_DATA_INDEX,
-            8,
-            ELF64_RELA_SIZE as u64,
-        );
-        push_elf_section_header(
-            &mut section_headers,
-            rela_rodata_name,
-            SHT_RELA,
-            0,
-            rela_rodata_header,
-            ELF_SECTION_SYMTAB_INDEX,
-            ELF_SECTION_RODATA_INDEX,
-            8,
-            ELF64_RELA_SIZE as u64,
-        );
-        push_elf_section_header(
-            &mut section_headers,
-            symtab_name,
-            SHT_SYMTAB,
-            0,
-            symtab_header,
-            ELF_SECTION_STRTAB_INDEX,
-            first_global_symbol,
-            8,
-            ELF64_SYM_SIZE as u64,
-        );
-        push_elf_section_header(
-            &mut section_headers,
-            strtab_name,
-            SHT_STRTAB,
-            0,
-            strtab_header,
-            0,
-            0,
-            1,
-            0,
-        );
-        push_elf_section_header(
-            &mut section_headers,
-            shstrtab_name,
-            SHT_STRTAB,
-            0,
-            shstrtab_header,
-            0,
-            0,
-            1,
-            0,
-        );
-        push_elf_section_header(
-            &mut section_headers,
-            gnu_stack_name,
-            SHT_PROGBITS,
-            0,
-            ElfSectionHeaderInput { offset: 0, size: 0 },
-            0,
-            0,
-            1,
-            0,
-        );
-        file.extend_from_slice(section_headers.as_slice());
-        write_elf_header(&mut file[..ELF64_EHDR_SIZE], section_header_offset)?;
-        Ok(file)
-    }
-}
-
-fn elf_symbol_for_reloc_target(
-    jit_module: &JITModule,
-    object: &mut ElfObjectBuilder,
-    function_symbols: &HashMap<FuncId, (u32, u64)>,
-    data_symbols: &HashMap<DataId, u32>,
-    target: &ModuleRelocTarget,
-    addend: i64,
-) -> Result<(u32, i64), String> {
-    match target {
-        ModuleRelocTarget::User { namespace: 0, .. } => {
-            let func_id = FuncId::from_name(target);
-            if let Some((symbol_id, _offset)) = function_symbols.get(&func_id).copied() {
-                return Ok((symbol_id, addend));
-            }
-            let decl = jit_module.declarations().get_function_decl(func_id);
-            if decl.linkage.requires_definition() {
-                return Err(format!(
-                    "relocation references local function {} that was not emitted into the object",
-                    decl.linkage_name(func_id)
-                ));
-            }
-            let symbol = decl.linkage_name(func_id).into_owned();
-            Ok((
-                object.add_global_undefined_symbol(symbol.as_str(), ElfSymbolKind::Func),
-                addend,
-            ))
-        }
-        ModuleRelocTarget::User { namespace: 1, .. } => {
-            let data_id = DataId::from_name(target);
-            if let Some(symbol_id) = data_symbols.get(&data_id).copied() {
-                return Ok((symbol_id, addend));
-            }
-            let decl = jit_module.declarations().get_data_decl(data_id);
-            if decl.linkage.requires_definition() {
-                return Err(format!(
-                    "relocation references local data object {} that was not emitted into the object",
-                    decl.linkage_name(data_id)
-                ));
-            }
-            let symbol = decl.linkage_name(data_id).into_owned();
-            Ok((
-                object.add_global_undefined_symbol(symbol.as_str(), ElfSymbolKind::Object),
-                addend,
-            ))
-        }
-        ModuleRelocTarget::User { namespace, index } => Err(format!(
-            "unsupported Cranelift user relocation namespace {namespace}:{index}"
-        )),
-        ModuleRelocTarget::LibCall(libcall) => {
-            let libcall_names = cranelift_module::default_libcall_names();
-            let symbol = libcall_names(*libcall);
-            Ok((
-                object.add_global_undefined_symbol(symbol.as_str(), ElfSymbolKind::Func),
-                addend,
-            ))
-        }
-        ModuleRelocTarget::KnownSymbol(symbol) => {
-            let symbol = match symbol {
-                ir::KnownSymbol::ElfGlobalOffsetTable => "_GLOBAL_OFFSET_TABLE_",
-                ir::KnownSymbol::CoffTlsIndex => "__tls_index",
-            };
-            Ok((
-                object.add_global_undefined_symbol(symbol, ElfSymbolKind::Object),
-                addend,
-            ))
-        }
-        ModuleRelocTarget::FunctionOffset(func_id, offset) => {
-            let (symbol_id, _target_offset) =
-                function_symbols.get(func_id).copied().ok_or_else(|| {
-                    format!("relocation references undefined function offset target {func_id}")
-                })?;
-            Ok((symbol_id, addend + i64::from(*offset)))
-        }
-    }
-}
-
-fn elf_relocation_type(reloc: Reloc) -> Result<u32, String> {
-    match reloc {
-        Reloc::Abs4 => Ok(R_X86_64_32),
-        Reloc::Abs8 => Ok(R_X86_64_64),
-        Reloc::X86PCRel4 => Ok(R_X86_64_PC32),
-        Reloc::X86CallPCRel4 | Reloc::X86CallPLTRel4 => Ok(R_X86_64_PLT32),
-        Reloc::X86GOTPCRel4 => Ok(R_X86_64_GOTPCREL),
-        other => Err(format!(
-            "unsupported Cranelift relocation for precompiled object: {other:?}"
-        )),
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ElfSectionIndex {
-    Undefined,
-    Text,
-    Data,
-    Rodata,
-}
-
-impl ElfSectionIndex {
-    fn as_u16(self) -> u16 {
-        match self {
-            Self::Undefined => 0,
-            Self::Text => ELF_SECTION_TEXT_INDEX as u16,
-            Self::Data => ELF_SECTION_DATA_INDEX as u16,
-            Self::Rodata => ELF_SECTION_RODATA_INDEX as u16,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum ElfSymbolKind {
-    Object,
-    Func,
-}
-
-impl ElfSymbolKind {
-    fn as_u8(self) -> u8 {
-        match self {
-            Self::Object => 1,
-            Self::Func => 2,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ElfSymbolBinding {
-    Local,
-    Global,
-}
-
-impl ElfSymbolBinding {
-    fn as_u8(self) -> u8 {
-        match self {
-            Self::Local => 0,
-            Self::Global => 1,
-        }
-    }
-}
-
-struct ElfSymbol {
-    name: String,
-    binding: ElfSymbolBinding,
-    kind: ElfSymbolKind,
-    section: ElfSectionIndex,
-    value: u64,
-    size: u64,
-}
-
-struct ElfRelocation {
-    offset: u64,
-    symbol_index: u32,
-    reloc_type: u32,
-    addend: i64,
-}
-
-#[derive(Clone, Copy)]
-struct ElfSectionHeaderInput {
-    offset: u64,
-    size: u64,
-}
-
-const ELF64_EHDR_SIZE: usize = 64;
-const ELF64_SHDR_SIZE: usize = 64;
-const ELF64_SYM_SIZE: usize = 24;
-const ELF64_RELA_SIZE: usize = 24;
-const ELF_SECTION_COUNT: usize = 11;
-const ELF_SECTION_TEXT_INDEX: u32 = 1;
-const ELF_SECTION_DATA_INDEX: u32 = 2;
-const ELF_SECTION_RODATA_INDEX: u32 = 3;
-const ELF_SECTION_SYMTAB_INDEX: u32 = 7;
-const ELF_SECTION_STRTAB_INDEX: u32 = 8;
-const ELF_SECTION_SHSTRTAB_INDEX: u16 = 9;
-const SHT_PROGBITS: u32 = 1;
-const SHT_SYMTAB: u32 = 2;
-const SHT_STRTAB: u32 = 3;
-const SHT_RELA: u32 = 4;
-const SHF_WRITE: u64 = 0x1;
-const SHF_ALLOC: u64 = 0x2;
-const SHF_EXECINSTR: u64 = 0x4;
-const EM_X86_64: u16 = 62;
-const ET_REL: u16 = 1;
-const R_X86_64_64: u32 = 1;
-const R_X86_64_PC32: u32 = 2;
-const R_X86_64_PLT32: u32 = 4;
-const R_X86_64_GOTPCREL: u32 = 9;
-const R_X86_64_32: u32 = 10;
-
-fn append_aligned(out: &mut Vec<u8>, bytes: &[u8], align: u64) -> Result<u64, String> {
-    let offset = align_vec(out, align)?;
-    out.extend_from_slice(bytes);
-    Ok(offset)
-}
-
-fn append_section_bytes(
-    out: &mut Vec<u8>,
-    bytes: &[u8],
-    align: u64,
-) -> Result<ElfSectionHeaderInput, String> {
-    let offset = append_aligned(out, bytes, align)?;
-    Ok(ElfSectionHeaderInput {
-        offset,
-        size: bytes.len() as u64,
-    })
-}
-
-fn align_vec(out: &mut Vec<u8>, align: u64) -> Result<u64, String> {
-    if !align.is_power_of_two() {
-        return Err(format!(
-            "ELF section alignment must be a power of two, got {align}"
-        ));
-    }
-    let align = usize::try_from(align)
-        .map_err(|_| format!("ELF section alignment is too large: {align}"))?;
-    let padding = (align - (out.len() % align)) % align;
-    out.resize(out.len() + padding, 0);
-    Ok(out.len() as u64)
-}
-
-fn push_string_table(table: &mut Vec<u8>, value: &str) -> Result<u32, String> {
-    let offset = u32::try_from(table.len())
-        .map_err(|_| "ELF string table exceeds u32 offsets".to_string())?;
-    table.extend_from_slice(value.as_bytes());
-    table.push(0);
-    Ok(offset)
-}
-
-fn write_elf_header(header: &mut [u8], section_header_offset: u64) -> Result<(), String> {
-    if header.len() != ELF64_EHDR_SIZE {
-        return Err("internal error: ELF header buffer has wrong size".to_string());
-    }
-    header[0..4].copy_from_slice(b"\x7fELF");
-    header[4] = 2; // 64-bit
-    header[5] = 1; // little endian
-    header[6] = 1; // ELF version
-    put_u16(header, 16, ET_REL);
-    put_u16(header, 18, EM_X86_64);
-    put_u32(header, 20, 1);
-    put_u64(header, 40, section_header_offset);
-    put_u16(header, 52, ELF64_EHDR_SIZE as u16);
-    put_u16(header, 58, ELF64_SHDR_SIZE as u16);
-    put_u16(header, 60, ELF_SECTION_COUNT as u16);
-    put_u16(header, 62, ELF_SECTION_SHSTRTAB_INDEX);
-    Ok(())
-}
-
-fn push_elf_section_header(
-    out: &mut Vec<u8>,
-    name_offset: u32,
-    section_type: u32,
-    flags: u64,
-    input: ElfSectionHeaderInput,
-    link: u32,
-    info: u32,
-    align: u64,
-    entry_size: u64,
-) {
-    push_u32(out, name_offset);
-    push_u32(out, section_type);
-    push_u64(out, flags);
-    push_u64(out, 0);
-    push_u64(out, input.offset);
-    push_u64(out, input.size);
-    push_u32(out, link);
-    push_u32(out, info);
-    push_u64(out, align);
-    push_u64(out, entry_size);
-}
-
-fn push_elf_symbol(out: &mut Vec<u8>, name_offset: u32, symbol: &ElfSymbol) {
-    push_u32(out, name_offset);
-    out.push((symbol.binding.as_u8() << 4) | symbol.kind.as_u8());
-    out.push(0);
-    push_u16(out, symbol.section.as_u16());
-    push_u64(out, symbol.value);
-    push_u64(out, symbol.size);
-}
-
-fn put_u16(out: &mut [u8], offset: usize, value: u16) {
-    out[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
-}
-
-fn put_u32(out: &mut [u8], offset: usize, value: u32) {
-    out[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-}
-
-fn put_u64(out: &mut [u8], offset: usize, value: u64) {
-    out[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
-}
-
-fn push_u16(out: &mut Vec<u8>, value: u16) {
-    out.extend_from_slice(&value.to_le_bytes());
-}
-
-fn push_u32(out: &mut Vec<u8>, value: u32) {
-    out.extend_from_slice(&value.to_le_bytes());
-}
-
-fn push_u64(out: &mut Vec<u8>, value: u64) {
-    out.extend_from_slice(&value.to_le_bytes());
-}
-
-fn push_i64(out: &mut Vec<u8>, value: i64) {
-    out.extend_from_slice(&value.to_le_bytes());
 }
 
 fn rewrite_import_fn_aliases(
