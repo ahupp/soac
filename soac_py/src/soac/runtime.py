@@ -40,6 +40,8 @@ list = _builtins.list
 dict = _builtins.dict
 set = _builtins.set
 slice = _builtins.slice
+type = _builtins.type
+int = _builtins.int
 classmethod = _builtins.classmethod
 ascii = _builtins.ascii
 repr = _builtins.repr
@@ -49,6 +51,20 @@ pow = _builtins.pow
 AssertionError = _builtins.AssertionError
 AttributeError = _builtins.AttributeError
 ImportError = _builtins.ImportError
+TypeError = _builtins.TypeError
+ValueError = _builtins.ValueError
+
+
+def _index(value, /):
+    try:
+        result = value.__index__()
+    except AttributeError:
+        raise TypeError(
+            f"'{type(value).__name__}' object cannot be interpreted as an integer"
+        ) from None
+    if not isinstance(result, int):
+        raise TypeError(f"__index__ returned non-int (type {type(result).__name__})")
+    return result
 
 
 def _unsupported_frame_builtin(*args, **kwargs):
@@ -843,6 +859,57 @@ async def asynccontextmanager_exit(exit_fn, exc):
 # exception helpers, and generator/coroutine support helpers lets future
 # bootstrapping treat `__soac__.X` inside this module as ordinary module-global
 # references instead of installing duplicate bootstrap helper implementations.
+class IterRange:
+    def __init__(self, start, stop, step, /):
+        self.current = start
+        self.stop = stop
+        self.step = step
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        current = self.current
+        stop = self.stop
+        step = self.step
+        if step > 0:
+            if current >= stop:
+                raise StopIteration
+        elif current <= stop:
+            raise StopIteration
+        self.current = current + step
+        return current
+
+
+class range:
+    def __init__(self, start=_MISSING, stop=_MISSING, step=_MISSING, /):
+        # BEHAVIOR_CHANGE: transformed builtin range resolves to a reusable
+        # Python class, not CPython's compact immutable range object. This is
+        # intentionally kept as a stress case for inlining and escape analysis.
+        if start is _MISSING:
+            raise TypeError("range expected at least 1 argument, got 0")
+        if stop is _MISSING:
+            stop = _index(start)
+            start = 0
+            step = 1
+        elif step is _MISSING:
+            start = _index(start)
+            stop = _index(stop)
+            step = 1
+        else:
+            start = _index(start)
+            stop = _index(stop)
+            step = _index(step)
+        if step == 0:
+            raise ValueError("range() arg 3 must not be zero")
+        self.start = start
+        self.stop = stop
+        self.step = step
+
+    def __iter__(self):
+        return IterRange(self.start, self.stop, self.step)
+
+
 class AsyncGenComplete(Exception):
     pass
 

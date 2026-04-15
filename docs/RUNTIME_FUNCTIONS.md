@@ -197,6 +197,9 @@ Top-level functions defined by `soac.runtime`:
 
 ```text
 _unsupported_frame_builtin
+_index
+IterRange
+range
 tuple_from_iter
 eval_string_literal
 __deepcopy__
@@ -319,6 +322,8 @@ list
 dict
 set
 slice
+type
+int
 classmethod
 ascii
 repr
@@ -331,6 +336,8 @@ _entry_template
 AssertionError
 AttributeError
 ImportError
+TypeError
+ValueError
 
 globals = _unsupported_frame_builtin
 locals = _unsupported_frame_builtin

@@ -99,6 +99,7 @@ mod operation_specializations;
 mod planning;
 mod precompiled_object;
 mod runtime_context;
+mod signal_diagnostics;
 mod specialized_helpers;
 mod typed_value;
 
@@ -134,6 +135,10 @@ use specialized_helpers::register_specialized_jit_symbols;
 pub use typed_value::{
     EmitResult, IntFacts, IntRange, IntWidth, ResultDemand, SoacRepr, SoacValue, ValueOwnership,
 };
+
+pub fn install_sigill_diagnostics() -> Result<(), String> {
+    signal_diagnostics::install_sigill_diagnostics()
+}
 
 static RUNTIME_SUPPORT_LIBRARY: OnceLock<Result<RuntimeSupportLibrary, String>> = OnceLock::new();
 static PRECOMPILED_LIBRARY: OnceLock<Result<Option<PrecompiledLibrary>, String>> = OnceLock::new();
@@ -2713,6 +2718,14 @@ impl ProcessJitState {
                 &defined.function_qualname,
                 "direct_function_body",
             );
+            register_jit_signal_diagnostics(
+                &defined.main_symbol,
+                code_ptr.cast::<u8>(),
+                &defined.compiled.artifact,
+                defined.function_id,
+                &defined.function_qualname,
+                "direct_function_body",
+            );
             if let (
                 Some(default_adapter_id),
                 Some(default_adapter_symbol),
@@ -2736,6 +2749,14 @@ impl ProcessJitState {
                 record_jit_bb_map(
                     default_adapter_symbol,
                     code_id,
+                    &default_adapter_compiled.artifact,
+                    defined.function_id,
+                    &defined.function_qualname,
+                    "default_direct_adapter",
+                );
+                register_jit_signal_diagnostics(
+                    default_adapter_symbol,
+                    default_code_ptr.cast::<u8>(),
                     &default_adapter_compiled.artifact,
                     defined.function_id,
                     &defined.function_qualname,
@@ -16352,6 +16373,25 @@ fn record_jit_bb_map(
     }
 }
 
+fn register_jit_signal_diagnostics(
+    symbol: &str,
+    code_ptr: *const u8,
+    artifact: &DefinedFunctionArtifact,
+    function_id: FunctionId,
+    function_qualname: &str,
+    entry_kind: &str,
+) {
+    signal_diagnostics::register_jit_code_range(
+        symbol,
+        code_ptr,
+        artifact.code_size,
+        function_id,
+        function_qualname,
+        entry_kind,
+        &artifact.code_bb_offsets,
+    );
+}
+
 const RUNTIME_SUPPORT_INLINE_MAX_INSTS: usize = 128;
 const SOAC_RUNTIME_EXAMPLE_SYMBOL_PREFIX: &str = "soac_runtime_example_";
 
@@ -19488,6 +19528,14 @@ fn define_shared_vectorcall_trampoline(
         jit_module.isa(),
         main_artifact.systemv_unwind_info.as_ref(),
     )?;
+    register_jit_signal_diagnostics(
+        symbol_name,
+        code_ptr.cast::<u8>(),
+        &main_artifact,
+        FunctionId::global(),
+        symbol_name,
+        "direct_vectorcall_trampoline",
+    );
     let entry: VectorcallEntryFn = unsafe { std::mem::transmute(code_ptr) };
     Ok(entry)
 }
