@@ -1229,6 +1229,23 @@ def add_default(left, right=9):
             .expect("test tuple should cast")
     }
 
+    unsafe fn entry_test_int_tuple<'py>(py: Python<'py>, values: &[i64]) -> Bound<'py, PyTuple> {
+        let tuple = ffi::PyTuple_New(values.len() as ffi::Py_ssize_t);
+        assert!(!tuple.is_null(), "test int tuple should allocate");
+        for (index, value) in values.iter().copied().enumerate() {
+            let item = ffi::PyLong_FromLongLong(value);
+            assert!(!item.is_null(), "test int tuple value should allocate");
+            if ffi::PyTuple_SetItem(tuple, index as ffi::Py_ssize_t, item) != 0 {
+                ffi::Py_DECREF(item);
+                ffi::Py_DECREF(tuple);
+                panic!("test int tuple item should insert");
+            }
+        }
+        Bound::from_owned_ptr(py, tuple)
+            .cast_into::<PyTuple>()
+            .expect("test int tuple should cast")
+    }
+
     type OriginalCodeByQualname = HashMap<String, VecDeque<Py<PyAny>>>;
     type OriginalCodeMap = HashMap<FunctionId, Py<PyAny>>;
 
@@ -2563,6 +2580,89 @@ def suppress_with_exception():
             assert!(
                 ffi::PyErr_Occurred().is_null(),
                 "suppressed with-statement exception should not remain active"
+            );
+            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+            ffi::Py_DECREF(globals);
+        });
+    }
+
+    #[test]
+    fn blockpy_entry_interpreter_executes_comprehensions_with_captures() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        let _entry_vectorcall = ForceEntryInterpreterVectorcallGuard::new();
+        Python::attach(|py| unsafe {
+            let globals = entry_test_globals(py);
+            let input = entry_test_int_tuple(py, &[1, 2, 3]);
+            let args = [input.as_ptr().cast()];
+            let result = run_named_blockpy_entry_for_test(
+                py,
+                r#"
+def build(values):
+    scale = 2
+    odd_list = [value + scale for value in values if value % 2]
+    odd_dict = {value: value + scale for value in values if value % 2}
+    odd_set = {value + scale for value in values if value % 2}
+    return odd_list == [3, 5] and odd_dict == {1: 3, 3: 5} and odd_set == {3, 5}
+"#,
+                "build",
+                globals.cast(),
+                &args,
+            )
+            .expect("entry interpreter should execute comprehension helpers");
+            if result.is_null() {
+                ffi::PyErr_Print();
+                panic!("comprehension execution returned null");
+            }
+
+            assert_eq!(
+                result.cast::<ffi::PyObject>(),
+                ffi::Py_True(),
+                "entry interpreter should execute list/dict/set comprehensions with captured locals"
+            );
+            assert!(
+                ffi::PyErr_Occurred().is_null(),
+                "comprehension execution should not leave a Python exception"
+            );
+            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+            ffi::Py_DECREF(globals);
+        });
+    }
+
+    #[test]
+    fn blockpy_entry_interpreter_executes_generator_expression_with_capture() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        let _entry_vectorcall = ForceEntryInterpreterVectorcallGuard::new();
+        Python::attach(|py| unsafe {
+            let globals = entry_test_globals(py);
+            let input = entry_test_int_tuple(py, &[1, 2, 3]);
+            let args = [input.as_ptr().cast()];
+            let result = run_named_blockpy_entry_for_test(
+                py,
+                r#"
+def build(values):
+    scale = 2
+    return tuple(value + scale for value in values if value % 2) == (3, 5)
+"#,
+                "build",
+                globals.cast(),
+                &args,
+            )
+            .expect("entry interpreter should execute generator expression");
+            if result.is_null() {
+                ffi::PyErr_Print();
+                panic!("generator expression execution returned null");
+            }
+
+            assert_eq!(
+                result.cast::<ffi::PyObject>(),
+                ffi::Py_True(),
+                "entry interpreter should create generator expressions with captured locals"
+            );
+            assert!(
+                ffi::PyErr_Occurred().is_null(),
+                "generator expression execution should not leave a Python exception"
             );
             ffi::Py_DECREF(result.cast::<ffi::PyObject>());
             ffi::Py_DECREF(globals);
