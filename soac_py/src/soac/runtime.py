@@ -159,10 +159,6 @@ def _current_yieldfrom(owner):
     return _yieldfrom_cell_value(owner._yield_from_cell)
 
 
-class AsyncGenComplete(Exception):
-    pass
-
-
 def _is_cancelled_error(exc):
     asyncio_mod = _sys.modules.get("asyncio")
     if asyncio_mod is None:
@@ -206,283 +202,6 @@ def _normalize_throw_exc(typ, val=None, tb=None, *, where, throw_context=None):
 
 def _current_throw_context(owner):
     return _yieldfrom_cell_value(owner._throw_context_cell)
-
-
-class ClosureGenerator:
-    __slots__ = (
-        "_resume_fn",
-        "_is_closed",
-        "_yield_from_cell",
-        "_throw_context_cell",
-        "_cleanup_cells",
-        "__name__",
-        "__qualname__",
-        "gi_code",
-    )
-
-    def __init__(
-        self,
-        *,
-        resume,
-        name,
-        qualname,
-        code,
-        yieldfrom_cell,
-        throw_context_cell,
-        cleanup_cells=(),
-    ):
-        self._resume_fn = resume
-        self._is_closed = False
-        self._yield_from_cell = yieldfrom_cell
-        self._throw_context_cell = throw_context_cell
-        self._cleanup_cells = tuple(cleanup_cells)
-        self.__name__ = name
-        self.__qualname__ = qualname
-        self.gi_code = code
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        return self.send(None)
-
-    def send(self, value):
-        if self._is_closed:
-            raise StopIteration
-        try:
-            return self._resume_fn(self, value, NO_DEFAULT)
-        except BaseException as exc:
-            _mark_closed(self)
-            _reraise_control_flow(exc)
-
-    def throw(self, typ=None, val=None, tb=None):
-        exc = _normalize_throw_exc(
-            typ,
-            val,
-            tb,
-            where="ClosureGenerator.throw()",
-            throw_context=_current_throw_context(self),
-        )
-        if self._is_closed:
-            _reraise_control_flow(exc)
-        try:
-            return self._resume_fn(self, NO_DEFAULT, exc)
-        except BaseException as exc:
-            _mark_closed(self)
-            _reraise_control_flow(exc)
-
-    def close(self):
-        if self._is_closed:
-            return None
-        try:
-            self.throw(GeneratorExit)
-        except (GeneratorExit, StopIteration):
-            return None
-        raise RuntimeError("generator ignored GeneratorExit")
-
-    @property
-    def gi_yieldfrom(self):
-        return _current_yieldfrom(self)
-
-
-class Coroutine(_abc.Coroutine):
-    __slots__ = ("_gen",)
-
-    def __init__(self, gen):
-        self._gen = gen
-
-    def __await__(self):
-        return self
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        return self.send(None)
-
-    def send(self, value):
-        return self._gen.send(value)
-
-    def throw(self, typ, val=None, tb=None):
-        return self._gen.throw(
-            _normalize_throw_exc(typ, val, tb, where="Coroutine.throw()")
-        )
-
-    def close(self):
-        return self._gen.close()
-
-    @property
-    def cr_frame(self):
-        return getattr(self._gen, "gi_frame", None)
-
-    @property
-    def cr_running(self):
-        return False
-
-    @property
-    def cr_code(self):
-        return self._gen.gi_code
-
-    @property
-    def cr_await(self):
-        return self._gen.gi_yieldfrom
-
-
-class ClosureAsyncGenerator:
-    __slots__ = (
-        "_resume_fn",
-        "_is_closed",
-        "_yield_from_cell",
-        "_throw_context_cell",
-        "_cleanup_cells",
-        "__name__",
-        "__qualname__",
-        "ag_code",
-    )
-
-    def __init__(
-        self,
-        *,
-        resume,
-        name,
-        qualname,
-        code,
-        yieldfrom_cell,
-        throw_context_cell,
-        cleanup_cells=(),
-    ):
-        self._resume_fn = resume
-        self._is_closed = False
-        self._yield_from_cell = yieldfrom_cell
-        self._throw_context_cell = throw_context_cell
-        self._cleanup_cells = tuple(cleanup_cells)
-        self.__name__ = name
-        self.__qualname__ = qualname
-        self.ag_code = code
-
-    def __aiter__(self):
-        return self
-
-    def __anext__(self):
-        return self.asend(None)
-
-    def __getattr__(self, name):
-        if name == "ag_running":
-            return False
-        if name == "ag_frame":
-            return None
-        if name == "ag_await":
-            return self.gi_yieldfrom
-        raise AttributeError(name)
-
-    @property
-    def gi_yieldfrom(self):
-        return _current_yieldfrom(self)
-
-    def asend(self, value):
-        return AsyncGenSend(self, value, NO_DEFAULT)
-
-    def athrow(self, typ=None, val=None, tb=None):
-        exc = _normalize_throw_exc(
-            typ,
-            val,
-            tb,
-            where="ClosureAsyncGenerator.athrow()",
-            throw_context=_current_throw_context(self),
-        )
-        return AsyncGenSend(self, NO_DEFAULT, exc)
-
-    async def aclose(self):
-        try:
-            await self.athrow(GeneratorExit)
-        except (GeneratorExit, StopAsyncIteration):
-            return None
-        raise RuntimeError("async generator ignored GeneratorExit")
-
-class AsyncGenSend:
-    __slots__ = ("_generator", "_send_value", "_resume_exception", "_is_done")
-
-    def __init__(self, gen, value, resume_exc):
-        self._generator = gen
-        self._send_value = value
-        self._resume_exception = resume_exc
-        self._is_done = False
-
-    def __iter__(self):
-        return self
-
-    def __await__(self):
-        return self
-
-    def __next__(self):
-        return self.send(None)
-
-    def _step(self, transport_sent):
-        if self._generator._is_closed:
-            self._is_done = True
-            resume_exc = self._resume_exception
-            self._resume_exception = NO_DEFAULT
-            if resume_exc is NO_DEFAULT:
-                raise StopAsyncIteration
-            raise StopIteration(None)
-        step_send_value = (
-            transport_sent
-            if _current_yieldfrom(self._generator) is not None
-            else self._send_value
-        )
-        try:
-            result = self._generator._resume_fn(
-                self._generator,
-                step_send_value,
-                self._resume_exception,
-                transport_sent,
-            )
-        except AsyncGenComplete:
-            self._is_done = True
-            self._resume_exception = NO_DEFAULT
-            _mark_closed(self._generator)
-            raise StopAsyncIteration
-        except BaseException as exc:
-            self._is_done = True
-            self._resume_exception = NO_DEFAULT
-            _mark_closed(self._generator)
-            if _is_cancelled_error(exc) or isinstance(exc, GeneratorExit):
-                _reraise_control_flow(exc)
-            if isinstance(exc, StopIteration):
-                raise RuntimeError("async generator raised StopIteration") from exc
-            if isinstance(exc, StopAsyncIteration):
-                raise RuntimeError("async generator raised StopAsyncIteration") from exc
-            raise exc
-        self._resume_exception = NO_DEFAULT
-        if _current_yieldfrom(self._generator) is None:
-            self._is_done = True
-            raise StopIteration(result)
-        return result
-
-    def send(self, value):
-        if self._is_done:
-            raise StopIteration
-        if (
-            value is not None
-            and self._send_value is None
-            and self._resume_exception is NO_DEFAULT
-            and _current_yieldfrom(self._generator) is None
-        ):
-            raise TypeError(
-                "can't send non-None value to a just-started async generator"
-            )
-        return self._step(value)
-
-    def throw(self, typ, val=None, tb=None):
-        if self._is_done:
-            raise _normalize_throw_exc(typ, val, tb, where="AsyncGenSend.throw()")
-        self._resume_exception = _normalize_throw_exc(
-            typ, val, tb, where="AsyncGenSend.throw()"
-        )
-        return self._step(None)
-
-    def close(self):
-        return None
 
 
 # TODO: very questionable
@@ -750,15 +469,6 @@ def exc_info_from_exception(exc):
     if exc is None:
         return None
     return (type(exc), exc, exc.__traceback__)
-
-class _AwaitIterWrapper:
-    __slots__ = ("_it",)
-
-    def __init__(self, iterator):
-        self._it = iterator
-
-    def __await__(self):
-        return self._it
 
 
 def _get_awaitable_iter(awaitable):
@@ -1134,6 +844,304 @@ async def asynccontextmanager_exit(exit_fn, exc):
         await_iter = _ensure_awaitable(exit_fn(None, None, None), "__aexit__")
         await _AwaitIterWrapper(await_iter)
         return None
+
+
+# Runtime class definitions intentionally live after the helper functions above.
+# `runtime.py` is itself transformed by SOAC, and class statements lower through
+# `create_class`. Keeping every class below `create_class`, the import helpers,
+# exception helpers, and generator/coroutine support helpers lets future
+# bootstrapping treat `__soac__.X` inside this module as ordinary module-global
+# references instead of installing duplicate bootstrap helper implementations.
+class AsyncGenComplete(Exception):
+    pass
+
+
+class ClosureGenerator:
+    __slots__ = (
+        "_resume_fn",
+        "_is_closed",
+        "_yield_from_cell",
+        "_throw_context_cell",
+        "_cleanup_cells",
+        "__name__",
+        "__qualname__",
+        "gi_code",
+    )
+
+    def __init__(
+        self,
+        *,
+        resume,
+        name,
+        qualname,
+        code,
+        yieldfrom_cell,
+        throw_context_cell,
+        cleanup_cells=(),
+    ):
+        self._resume_fn = resume
+        self._is_closed = False
+        self._yield_from_cell = yieldfrom_cell
+        self._throw_context_cell = throw_context_cell
+        self._cleanup_cells = tuple(cleanup_cells)
+        self.__name__ = name
+        self.__qualname__ = qualname
+        self.gi_code = code
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return self.send(None)
+
+    def send(self, value):
+        if self._is_closed:
+            raise StopIteration
+        try:
+            return self._resume_fn(self, value, NO_DEFAULT)
+        except BaseException as exc:
+            _mark_closed(self)
+            _reraise_control_flow(exc)
+
+    def throw(self, typ=None, val=None, tb=None):
+        exc = _normalize_throw_exc(
+            typ,
+            val,
+            tb,
+            where="ClosureGenerator.throw()",
+            throw_context=_current_throw_context(self),
+        )
+        if self._is_closed:
+            _reraise_control_flow(exc)
+        try:
+            return self._resume_fn(self, NO_DEFAULT, exc)
+        except BaseException as exc:
+            _mark_closed(self)
+            _reraise_control_flow(exc)
+
+    def close(self):
+        if self._is_closed:
+            return None
+        try:
+            self.throw(GeneratorExit)
+        except (GeneratorExit, StopIteration):
+            return None
+        raise RuntimeError("generator ignored GeneratorExit")
+
+    @property
+    def gi_yieldfrom(self):
+        return _current_yieldfrom(self)
+
+
+class Coroutine(_abc.Coroutine):
+    __slots__ = ("_gen",)
+
+    def __init__(self, gen):
+        self._gen = gen
+
+    def __await__(self):
+        return self
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return self.send(None)
+
+    def send(self, value):
+        return self._gen.send(value)
+
+    def throw(self, typ, val=None, tb=None):
+        return self._gen.throw(
+            _normalize_throw_exc(typ, val, tb, where="Coroutine.throw()")
+        )
+
+    def close(self):
+        return self._gen.close()
+
+    @property
+    def cr_frame(self):
+        return getattr(self._gen, "gi_frame", None)
+
+    @property
+    def cr_running(self):
+        return False
+
+    @property
+    def cr_code(self):
+        return self._gen.gi_code
+
+    @property
+    def cr_await(self):
+        return self._gen.gi_yieldfrom
+
+
+class ClosureAsyncGenerator:
+    __slots__ = (
+        "_resume_fn",
+        "_is_closed",
+        "_yield_from_cell",
+        "_throw_context_cell",
+        "_cleanup_cells",
+        "__name__",
+        "__qualname__",
+        "ag_code",
+    )
+
+    def __init__(
+        self,
+        *,
+        resume,
+        name,
+        qualname,
+        code,
+        yieldfrom_cell,
+        throw_context_cell,
+        cleanup_cells=(),
+    ):
+        self._resume_fn = resume
+        self._is_closed = False
+        self._yield_from_cell = yieldfrom_cell
+        self._throw_context_cell = throw_context_cell
+        self._cleanup_cells = tuple(cleanup_cells)
+        self.__name__ = name
+        self.__qualname__ = qualname
+        self.ag_code = code
+
+    def __aiter__(self):
+        return self
+
+    def __anext__(self):
+        return self.asend(None)
+
+    def __getattr__(self, name):
+        if name == "ag_running":
+            return False
+        if name == "ag_frame":
+            return None
+        if name == "ag_await":
+            return self.gi_yieldfrom
+        raise AttributeError(name)
+
+    @property
+    def gi_yieldfrom(self):
+        return _current_yieldfrom(self)
+
+    def asend(self, value):
+        return AsyncGenSend(self, value, NO_DEFAULT)
+
+    def athrow(self, typ=None, val=None, tb=None):
+        exc = _normalize_throw_exc(
+            typ,
+            val,
+            tb,
+            where="ClosureAsyncGenerator.athrow()",
+            throw_context=_current_throw_context(self),
+        )
+        return AsyncGenSend(self, NO_DEFAULT, exc)
+
+    async def aclose(self):
+        try:
+            await self.athrow(GeneratorExit)
+        except (GeneratorExit, StopAsyncIteration):
+            return None
+        raise RuntimeError("async generator ignored GeneratorExit")
+
+
+class AsyncGenSend:
+    __slots__ = ("_generator", "_send_value", "_resume_exception", "_is_done")
+
+    def __init__(self, gen, value, resume_exc):
+        self._generator = gen
+        self._send_value = value
+        self._resume_exception = resume_exc
+        self._is_done = False
+
+    def __iter__(self):
+        return self
+
+    def __await__(self):
+        return self
+
+    def __next__(self):
+        return self.send(None)
+
+    def _step(self, transport_sent):
+        if self._generator._is_closed:
+            self._is_done = True
+            resume_exc = self._resume_exception
+            self._resume_exception = NO_DEFAULT
+            if resume_exc is NO_DEFAULT:
+                raise StopAsyncIteration
+            raise StopIteration(None)
+        step_send_value = (
+            transport_sent
+            if _current_yieldfrom(self._generator) is not None
+            else self._send_value
+        )
+        try:
+            result = self._generator._resume_fn(
+                self._generator,
+                step_send_value,
+                self._resume_exception,
+                transport_sent,
+            )
+        except AsyncGenComplete:
+            self._is_done = True
+            self._resume_exception = NO_DEFAULT
+            _mark_closed(self._generator)
+            raise StopAsyncIteration
+        except BaseException as exc:
+            self._is_done = True
+            self._resume_exception = NO_DEFAULT
+            _mark_closed(self._generator)
+            if _is_cancelled_error(exc) or isinstance(exc, GeneratorExit):
+                _reraise_control_flow(exc)
+            if isinstance(exc, StopIteration):
+                raise RuntimeError("async generator raised StopIteration") from exc
+            if isinstance(exc, StopAsyncIteration):
+                raise RuntimeError("async generator raised StopAsyncIteration") from exc
+            raise exc
+        self._resume_exception = NO_DEFAULT
+        if _current_yieldfrom(self._generator) is None:
+            self._is_done = True
+            raise StopIteration(result)
+        return result
+
+    def send(self, value):
+        if self._is_done:
+            raise StopIteration
+        if (
+            value is not None
+            and self._send_value is None
+            and self._resume_exception is NO_DEFAULT
+            and _current_yieldfrom(self._generator) is None
+        ):
+            raise TypeError(
+                "can't send non-None value to a just-started async generator"
+            )
+        return self._step(value)
+
+    def throw(self, typ, val=None, tb=None):
+        if self._is_done:
+            raise _normalize_throw_exc(typ, val, tb, where="AsyncGenSend.throw()")
+        self._resume_exception = _normalize_throw_exc(
+            typ, val, tb, where="AsyncGenSend.throw()"
+        )
+        return self._step(None)
+
+    def close(self):
+        return None
+
+
+class _AwaitIterWrapper:
+    __slots__ = ("_it",)
+
+    def __init__(self, iterator):
+        self._it = iterator
+
+    def __await__(self):
+        return self._it
 
 
 _SOAC_RUNTIME_READY = True
