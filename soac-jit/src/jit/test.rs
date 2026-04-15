@@ -3,11 +3,11 @@ use soac_blockpy::block_py::{
     AbruptKind, BinOp, BinOpKind, BlockArg, BlockEdge, BlockLabel, BlockParam, BlockParamRole,
     BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional, CallDirect,
     CalleeFunctionId, CellLocation, CellRef, ChildVisitable, ClosureInit, ClosureSlot,
-    CodegenBlock, CounterDef, CounterSite, Del, DelItem, FunctionId, FunctionName, GetAttr,
-    GetItem, HasMeta, HasSemanticInstrId, IncrementCounter, InstrCodegen, InstrResolved, Literal,
-    LiteralValue, Load, LocalLocation, MakeCell, Meta, ModuleNameGen, NameLocation, NumberLiteral,
-    NumberLiteralValue, Param, ParamKind, ParamSpec, ResolvedName, SetAttr, SetItem, StorageLayout,
-    Store, StringLiteral, Tuple, UnaryOp, UnaryOpKind, Visit, VisitMut, WithMeta,
+    CodegenBlock, CounterDef, CounterSite, Del, DelItem, FunctionId, FunctionKind, FunctionName,
+    GetAttr, GetItem, HasMeta, HasSemanticInstrId, IncrementCounter, InstrCodegen, InstrResolved,
+    Literal, LiteralValue, Load, LocalLocation, MakeCell, Meta, ModuleNameGen, NameLocation,
+    NumberLiteral, NumberLiteralValue, Param, ParamKind, ParamSpec, ResolvedName, SetAttr, SetItem,
+    StorageLayout, Store, StringLiteral, Tuple, UnaryOp, UnaryOpKind, Visit, VisitMut, WithMeta,
 };
 use soac_blockpy::passes::{
     CodegenModuleShape, instrument_bb_module_with_block_entry_counters,
@@ -21,8 +21,8 @@ mod tests {
     };
     use crate::jit::direct_abi::RuntimePrimitiveId;
     use cranelift_codegen::cursor::Cursor;
-    use pyo3::types::{PyAnyMethods, PyDictMethods, PyModule};
-    use pyo3::{Python, ffi};
+    use pyo3::types::{PyAnyMethods, PyDictMethods, PyModule, PyModuleMethods, PyTuple};
+    use pyo3::{Bound, Python, ffi};
     use ruff_python_ast as ast;
     use std::ffi::c_void;
     use std::mem::size_of;
@@ -1155,6 +1155,108 @@ def add_default(left, right=9):
             );
         }
         tuple
+    }
+
+    unsafe fn entry_test_tuple<'py>(
+        py: Python<'py>,
+        values: &[*mut ffi::PyObject],
+    ) -> Bound<'py, PyTuple> {
+        let tuple = ffi::PyTuple_New(values.len() as ffi::Py_ssize_t);
+        assert!(!tuple.is_null(), "test tuple should allocate");
+        for (index, value) in values.iter().copied().enumerate() {
+            assert!(!value.is_null(), "test tuple value should be non-null");
+            ffi::Py_INCREF(value);
+            assert_eq!(
+                ffi::PyTuple_SetItem(tuple, index as ffi::Py_ssize_t, value),
+                0,
+                "test tuple item should insert"
+            );
+        }
+        Bound::from_owned_ptr(py, tuple)
+            .cast_into::<PyTuple>()
+            .expect("test tuple should cast")
+    }
+
+    #[test]
+    fn blockpy_entry_interpreter_uses_registered_function_env() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| unsafe {
+            let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+                r#"
+def add_default(left, right=9):
+    return left + right
+"#,
+            )
+            .expect("lowering registered entry source should succeed")
+            .codegen_module;
+            let shared_state =
+                crate::module_type::build_shared_state_for_testing(py, lowered, "entry_test", "")
+                    .expect("shared state should build for registered entry test");
+            let function_id = shared_state
+                .lowered_module
+                .callable_defs
+                .iter()
+                .find(|function| function.names.bind_name == "add_default")
+                .expect("lowered module should contain add_default")
+                .function_id;
+            let module = PyModule::new(py, "entry_test").expect("module should allocate");
+            let globals = module.dict();
+            let builtins = py.import("builtins").expect("builtins should import");
+            globals
+                .set_item("__builtins__", &builtins)
+                .expect("module globals should accept builtins");
+            globals
+                .set_item("__name__", "entry_test")
+                .expect("module globals should accept __name__");
+
+            let captures = entry_test_tuple(py, &[]);
+            let default = ffi::PyLong_FromLong(9);
+            assert!(!default.is_null(), "default value should allocate");
+            let param_defaults = entry_test_tuple(py, &[default]);
+            ffi::Py_DECREF(default);
+            let annotate_fn = py.None();
+            let function_obj = crate::function_instantiation::make_function_in_shared_state(
+                py,
+                std::sync::Arc::new(crate::session::CompileSession::new()),
+                std::sync::Arc::clone(&shared_state),
+                function_id,
+                FunctionKind::Function,
+                captures.as_any(),
+                param_defaults.as_any(),
+                annotate_fn.bind(py),
+                globals.as_any(),
+            )
+            .expect("registered function should instantiate");
+            let function_obj = function_obj.bind(py);
+            assert!(
+                !crate::PyFunction_GetSoacMetadata(function_obj.as_ptr()).is_null(),
+                "instantiated function should have SOAC metadata"
+            );
+
+            let left = ffi::PyLong_FromLong(33);
+            assert!(!left.is_null(), "left value should allocate");
+            let args = [left];
+            let result = crate::run_registered_clif_function_from_vectorcall_entry(
+                function_obj.as_ptr(),
+                args.as_ptr(),
+                args.len(),
+                std::ptr::null_mut(),
+            )
+            .expect("registered entry interpreter should execute");
+
+            assert_eq!(
+                ffi::PyLong_AsLong(result),
+                42,
+                "entry interpreter should read the default from FunctionEnv runtime objects"
+            );
+            assert!(
+                ffi::PyErr_Occurred().is_null(),
+                "successful registered entry run should not leave a Python exception"
+            );
+            ffi::Py_DECREF(result);
+            ffi::Py_DECREF(left);
+        });
     }
 
     #[test]

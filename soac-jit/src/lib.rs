@@ -582,6 +582,13 @@ impl FunctionEnv {
         }
     }
 
+    fn runtime_objects_ptr(&self) -> *mut ffi::PyObject {
+        unsafe {
+            let base = self.abi.as_ptr() as *mut u8;
+            base.add(Self::runtime_objects_offset()) as *mut ffi::PyObject
+        }
+    }
+
     fn runtime_object(&self, slot: usize) -> *mut ffi::PyObject {
         if slot >= self.runtime_object_len {
             return ptr::null_mut();
@@ -2118,6 +2125,58 @@ pub unsafe fn compile_clif_vectorcall(function: *mut ffi::PyObject) -> Result<()
     let py = Python::assume_attached();
     let data = py_function_jit_extra(function)?;
     ensure_clif_vectorcall_compiled(py, function, data)
+}
+
+#[cold]
+#[allow(dead_code)]
+pub(crate) unsafe fn run_registered_clif_function_from_vectorcall_entry(
+    function_obj: *mut ffi::PyObject,
+    args: *const *mut ffi::PyObject,
+    nargsf: usize,
+    kwnames: *mut ffi::PyObject,
+) -> Result<*mut ffi::PyObject, ()> {
+    if ffi::PyFunction_Check(function_obj) == 0 {
+        ffi::PyErr_SetString(
+            ffi::PyExc_TypeError,
+            c"entry interpreter expects a registered Python function".as_ptr(),
+        );
+        return Err(());
+    }
+    let data = py_function_jit_extra(function_obj)?;
+    let blockpy_function = data.function()?;
+    let module_constant_ptrs = data
+        .module_state
+        .module_constant_ptrs()
+        .into_iter()
+        .map(|ptr| ptr.cast::<c_void>())
+        .collect::<Vec<_>>();
+    let context = jit::BlockPyEntryRuntimeContext::new(
+        Arc::clone(&data.compile_session),
+        Arc::clone(&data.module_state),
+        data.function_env.globals_obj().cast::<c_void>(),
+        data.function_env.runtime_objects_ptr().cast::<c_void>(),
+        module_constant_ptrs.as_slice(),
+    );
+    match jit::run_blockpy_function_from_vectorcall_entry(
+        blockpy_function,
+        context,
+        args.cast::<*mut c_void>(),
+        nargsf,
+        kwnames.cast::<c_void>(),
+    ) {
+        Ok(result) => Ok(result.cast::<ffi::PyObject>()),
+        Err(err) => {
+            if let Ok(c_msg) = CString::new(err) {
+                ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
+            } else {
+                ffi::PyErr_SetString(
+                    ffi::PyExc_RuntimeError,
+                    c"entry interpreter failed".as_ptr(),
+                );
+            }
+            Err(())
+        }
+    }
 }
 
 #[cfg(test)]
