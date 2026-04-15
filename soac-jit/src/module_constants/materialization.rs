@@ -633,7 +633,7 @@ fn build_soac_runtime_bootstrap_runtime_name(py: Python<'_>, bytes: &[u8]) -> Py
         }
         other => Err(PyRuntimeError::new_err(format!(
             "soac.runtime bootstrap cannot build runtime-name constant {other:?}; \
-             it should have been lowered as a global name"
+             source runtime-name loads in soac.runtime should have been lowered as globals"
         ))),
     }
 }

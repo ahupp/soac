@@ -3066,22 +3066,10 @@ fn rewrite_unsound_builtin_loads_as_runtime_names(
 
 struct RuntimeNameGlobalNameRewriter;
 
-fn should_keep_runtime_bootstrap_name_as_constant(name: &ResolvedName) -> bool {
-    name.is_runtime_symbol("TRUE")
-        || name.is_runtime_symbol("FALSE")
-        || name.is_runtime_symbol("NONE")
-        || name.is_runtime_symbol("ELLIPSIS")
-        || name.is_runtime_symbol("EMPTY_TUPLE")
-        || name.is_runtime_symbol("ITER_COMPLETE")
-        || name.is_runtime_symbol("raise_deleted_name")
-}
-
 impl crate::block_py::VisitMut<InstrResolved> for RuntimeNameGlobalNameRewriter {
     fn visit_instr_mut(&mut self, expr: &mut InstrResolved) {
         if let InstrResolved::Load(op) = expr {
-            if op.name.location.is_runtime_name()
-                && !should_keep_runtime_bootstrap_name_as_constant(&op.name)
-            {
+            if op.name.location.is_runtime_name() {
                 op.name.location = NameLocation::global_name();
             }
         }
