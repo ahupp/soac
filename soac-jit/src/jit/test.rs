@@ -2711,6 +2711,65 @@ def build():
     }
 
     #[test]
+    fn blockpy_entry_interpreter_executes_for_loop_control_flow() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        let _entry_vectorcall = ForceEntryInterpreterVectorcallGuard::new();
+        Python::attach(|py| unsafe {
+            let globals = entry_test_globals(py);
+            let input = entry_test_int_tuple(py, &[1, 2, 3]);
+            let args = [input.as_ptr().cast()];
+            let result = run_named_blockpy_entry_for_test(
+                py,
+                r#"
+def build(values):
+    exhausted = []
+    for value in values:
+        if value == 2:
+            continue
+        exhausted.append(value)
+    else:
+        exhausted.append(99)
+    exhausted_last = value
+
+    stopped = []
+    for value in values:
+        if value == 2:
+            continue
+        if value == 3:
+            break
+        stopped.append(value)
+    else:
+        stopped.append(99)
+    stopped_last = value
+
+    return exhausted == [1, 3, 99] and exhausted_last == 3 and stopped == [1] and stopped_last == 3
+"#,
+                "build",
+                globals.cast(),
+                &args,
+            )
+            .expect("entry interpreter should execute for-loop control flow");
+            if result.is_null() {
+                ffi::PyErr_Print();
+                panic!("for-loop execution returned null");
+            }
+
+            assert_eq!(
+                result.cast::<ffi::PyObject>(),
+                ffi::Py_True(),
+                "entry interpreter should handle for-loop exhaustion, else, continue, and break"
+            );
+            assert!(
+                ffi::PyErr_Occurred().is_null(),
+                "for-loop execution should not leave a Python exception"
+            );
+            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+            ffi::Py_DECREF(globals);
+        });
+    }
+
+    #[test]
     fn stored_local_binding_facts_only_require_checks_for_unbound_values() {
         assert_eq!(
             local_binding_facts_for_stored_value(LocalRefKind::Owned),
