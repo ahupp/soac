@@ -1158,6 +1158,152 @@ def add_default(left, right=9):
     }
 
     #[test]
+    fn blockpy_entry_interpreter_executes_module_init_globals() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| unsafe {
+            let globals = ffi::PyDict_New();
+            assert!(!globals.is_null(), "test globals dict should allocate");
+            let result = run_named_blockpy_entry_for_test(
+                py,
+                r#"
+VALUE = 41
+
+def add_one(value):
+    return value + 1
+
+RESULT = add_one(VALUE)
+"#,
+                "_dp_module_init",
+                globals.cast(),
+                &[],
+            )
+            .expect("entry interpreter should execute module init");
+
+            assert_eq!(
+                result,
+                ffi::Py_None().cast(),
+                "module init should return owned None"
+            );
+            assert!(
+                ffi::PyErr_Occurred().is_null(),
+                "successful module init should not leave a Python exception"
+            );
+            let stored_result = ffi::PyDict_GetItemString(globals, c"RESULT".as_ptr());
+            assert!(
+                !stored_result.is_null(),
+                "module init should store RESULT in globals"
+            );
+            assert_eq!(
+                ffi::PyLong_AsLong(stored_result),
+                42,
+                "module init should call the nested function through globals"
+            );
+            let stored_function = ffi::PyDict_GetItemString(globals, c"add_one".as_ptr());
+            assert!(
+                !stored_function.is_null(),
+                "module init should store the nested function in globals"
+            );
+            assert!(
+                ffi::PyCallable_Check(stored_function) != 0,
+                "stored nested function should be callable"
+            );
+            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+            ffi::Py_DECREF(globals);
+        });
+    }
+
+    #[test]
+    fn blockpy_entry_interpreter_executes_attr_and_item_mutation() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| unsafe {
+            let obj = ffi::PyModule_New(c"entry_attr_item_target".as_ptr());
+            assert!(!obj.is_null(), "test module object should allocate");
+            let data = ffi::PyDict_New();
+            assert!(!data.is_null(), "test data dict should allocate");
+            let start = ffi::PyLong_FromLong(10);
+            assert!(!start.is_null(), "test start value should allocate");
+            assert_eq!(
+                ffi::PyDict_SetItemString(data, c"start".as_ptr(), start),
+                0,
+                "test dict setup should store start"
+            );
+
+            let result = run_named_blockpy_entry_for_test(
+                py,
+                r#"
+def mutate(obj, data):
+    obj.value = data["start"]
+    data["next"] = obj.value + 1
+    del data["start"]
+    return obj.value, data["next"], "start" in data
+"#,
+                "mutate",
+                std::ptr::null_mut(),
+                &[obj.cast(), data.cast()],
+            )
+            .expect("entry interpreter should execute attr/item mutation");
+
+            if result.is_null() {
+                ffi::PyErr_Print();
+                panic!("entry interpreter attr/item mutation should produce a result");
+            }
+            assert!(
+                ffi::PyTuple_Check(result.cast::<ffi::PyObject>()) != 0,
+                "mutation result should be a tuple"
+            );
+            assert_eq!(
+                ffi::PyTuple_Size(result.cast::<ffi::PyObject>()),
+                3,
+                "mutation result should have three values"
+            );
+            let first = ffi::PyTuple_GetItem(result.cast::<ffi::PyObject>(), 0);
+            let second = ffi::PyTuple_GetItem(result.cast::<ffi::PyObject>(), 1);
+            let third = ffi::PyTuple_GetItem(result.cast::<ffi::PyObject>(), 2);
+            assert_eq!(
+                ffi::PyLong_AsLong(first),
+                10,
+                "entry interpreter should return the assigned attribute"
+            );
+            assert_eq!(
+                ffi::PyLong_AsLong(second),
+                11,
+                "entry interpreter should return the updated item"
+            );
+            assert_eq!(
+                third,
+                ffi::Py_False(),
+                "entry interpreter should observe the deleted item as absent"
+            );
+            assert!(
+                ffi::PyErr_Occurred().is_null(),
+                "successful attr/item mutation should not leave a Python exception"
+            );
+            let stored_attr = ffi::PyObject_GetAttrString(obj, c"value".as_ptr());
+            assert!(!stored_attr.is_null(), "mutate should store obj.value");
+            assert_eq!(
+                ffi::PyLong_AsLong(stored_attr),
+                10,
+                "stored obj.value should match data['start']"
+            );
+            assert!(
+                ffi::PyDict_GetItemString(data, c"start".as_ptr()).is_null(),
+                "mutate should delete data['start']"
+            );
+            assert!(
+                !ffi::PyDict_GetItemString(data, c"next".as_ptr()).is_null(),
+                "mutate should store data['next']"
+            );
+            ffi::Py_DECREF(stored_attr);
+            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+            ffi::Py_DECREF(start);
+            ffi::Py_DECREF(data);
+            ffi::Py_DECREF(obj);
+        });
+    }
+
+    #[test]
     fn blockpy_entry_interpreter_executes_local_store_and_tuple_return() {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();

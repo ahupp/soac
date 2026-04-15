@@ -2285,7 +2285,7 @@ unsafe fn execute_binop_kind_owned(
             BinOpKind::Gt => ffi::PyObject_RichCompare(left, right, ffi::Py_GT),
             BinOpKind::Ge => ffi::PyObject_RichCompare(left, right, ffi::Py_GE),
             BinOpKind::Contains => {
-                let contains = ffi::PySequence_Contains(right, left);
+                let contains = ffi::PySequence_Contains(left, right);
                 if contains < 0 {
                     ptr::null_mut()
                 } else {
