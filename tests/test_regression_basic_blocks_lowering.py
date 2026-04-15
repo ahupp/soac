@@ -84,3 +84,30 @@ def f(mode):
 
         assert module.f("ok") == 20
         assert module.events == ["body", "else", "finally"]
+
+
+def test_basic_block_lowering_try_finally_loop_abrupt_edges(tmp_path):
+    source = """
+def break_through_finally():
+    total = 0
+    for value in (1, 2, 3):
+        try:
+            break
+        finally:
+            total = total + 40
+    return total + value
+
+def continue_through_finally():
+    total = 0
+    for value in (1, 2, 3):
+        try:
+            if value == 2:
+                continue
+            total = total + value
+        finally:
+            total = total + 10
+    return total
+"""
+    with integration_module(tmp_path, "basic_blocks_try_finally_loop_abrupt", source, mode="soac") as module:
+        assert module.break_through_finally() == 41
+        assert module.continue_through_finally() == 34

@@ -1573,6 +1573,249 @@ def outer(x):
     }
 
     #[test]
+    fn blockpy_entry_interpreter_catches_raised_exception() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| unsafe {
+            let result = run_named_blockpy_entry_for_test(
+                py,
+                r#"
+def catch_value_error():
+    try:
+        raise ValueError("boom")
+    except ValueError:
+        return 42
+"#,
+                "catch_value_error",
+                std::ptr::null_mut(),
+                &[],
+            )
+            .expect("entry interpreter should execute try/except");
+
+            assert_eq!(
+                ffi::PyLong_AsLong(result.cast::<ffi::PyObject>()),
+                42,
+                "entry interpreter should dispatch raised ValueError to the except handler"
+            );
+            assert!(
+                ffi::PyErr_Occurred().is_null(),
+                "caught exception should not remain active after entry execution"
+            );
+            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+        });
+    }
+
+    #[test]
+    fn blockpy_entry_interpreter_reraises_current_exception() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| unsafe {
+            let result = run_named_blockpy_entry_for_test(
+                py,
+                r#"
+def reraise_value_error():
+    try:
+        raise ValueError("boom")
+    except ValueError:
+        raise
+"#,
+                "reraise_value_error",
+                std::ptr::null_mut(),
+                &[],
+            )
+            .expect("entry interpreter should execute bare reraise");
+
+            assert!(
+                result.is_null(),
+                "bare reraise should propagate the active exception"
+            );
+            assert!(
+                ffi::PyErr_ExceptionMatches(ffi::PyExc_ValueError) != 0,
+                "bare reraise should restore the caught ValueError"
+            );
+            ffi::PyErr_Clear();
+        });
+    }
+
+    #[test]
+    fn blockpy_entry_interpreter_runs_finally_before_return() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| unsafe {
+            let result = run_named_blockpy_entry_for_test(
+                py,
+                r#"
+def return_through_finally():
+    value = 40
+    try:
+        return value
+    finally:
+        value = 99
+"#,
+                "return_through_finally",
+                std::ptr::null_mut(),
+                &[],
+            )
+            .expect("entry interpreter should execute try/finally return dispatch");
+
+            assert_eq!(
+                ffi::PyLong_AsLong(result.cast::<ffi::PyObject>()),
+                40,
+                "finally should run but preserve the original return value"
+            );
+            assert!(
+                ffi::PyErr_Occurred().is_null(),
+                "successful try/finally return should not leave a Python exception"
+            );
+            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+        });
+    }
+
+    #[test]
+    fn blockpy_entry_interpreter_finally_return_overrides_exception() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| unsafe {
+            let result = run_named_blockpy_entry_for_test(
+                py,
+                r#"
+def finally_overrides_exception():
+    try:
+        raise ValueError("boom")
+    finally:
+        return 42
+"#,
+                "finally_overrides_exception",
+                std::ptr::null_mut(),
+                &[],
+            )
+            .expect("entry interpreter should let finally return suppress an exception");
+
+            assert_eq!(
+                ffi::PyLong_AsLong(result.cast::<ffi::PyObject>()),
+                42,
+                "return from finally should suppress the pending ValueError"
+            );
+            assert!(
+                ffi::PyErr_Occurred().is_null(),
+                "suppressed exception should not remain active after finally return"
+            );
+            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+        });
+    }
+
+    #[test]
+    fn blockpy_entry_interpreter_preserves_exception_through_finally() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| unsafe {
+            let result = run_named_blockpy_entry_for_test(
+                py,
+                r#"
+def exception_through_finally():
+    marker = 0
+    try:
+        try:
+            raise ValueError("boom")
+        finally:
+            marker = 40
+    except ValueError:
+        return marker + 2
+"#,
+                "exception_through_finally",
+                std::ptr::null_mut(),
+                &[],
+            )
+            .expect("entry interpreter should propagate an exception through finally");
+
+            assert_eq!(
+                ffi::PyLong_AsLong(result.cast::<ffi::PyObject>()),
+                42,
+                "finally should run while preserving the exception for the outer handler"
+            );
+            assert!(
+                ffi::PyErr_Occurred().is_null(),
+                "handled exception-through-finally should not leave a Python exception"
+            );
+            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+        });
+    }
+
+    #[test]
+    fn blockpy_entry_interpreter_runs_finally_before_loop_break() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| unsafe {
+            let result = run_named_blockpy_entry_for_test(
+                py,
+                r#"
+def break_through_finally():
+    total = 0
+    for value in (1, 2, 3):
+        try:
+            break
+        finally:
+            total = total + 40
+    return total + value
+"#,
+                "break_through_finally",
+                std::ptr::null_mut(),
+                &[],
+            )
+            .expect("entry interpreter should run finally before loop break");
+
+            assert_eq!(
+                ffi::PyLong_AsLong(result.cast::<ffi::PyObject>()),
+                41,
+                "finally should run once before the break leaves the loop"
+            );
+            assert!(
+                ffi::PyErr_Occurred().is_null(),
+                "break-through-finally should not leave a Python exception"
+            );
+            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+        });
+    }
+
+    #[test]
+    fn blockpy_entry_interpreter_runs_finally_before_loop_continue() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| unsafe {
+            let result = run_named_blockpy_entry_for_test(
+                py,
+                r#"
+def continue_through_finally():
+    total = 0
+    for value in (1, 2, 3):
+        try:
+            if value == 2:
+                continue
+            total = total + value
+        finally:
+            total = total + 10
+    return total
+"#,
+                "continue_through_finally",
+                std::ptr::null_mut(),
+                &[],
+            )
+            .expect("entry interpreter should run finally before loop continue");
+
+            assert_eq!(
+                ffi::PyLong_AsLong(result.cast::<ffi::PyObject>()),
+                34,
+                "finally should run for normal and continue loop iterations"
+            );
+            assert!(
+                ffi::PyErr_Occurred().is_null(),
+                "continue-through-finally should not leave a Python exception"
+            );
+            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+        });
+    }
+
+    #[test]
     fn stored_local_binding_facts_only_require_checks_for_unbound_values() {
         assert_eq!(
             local_binding_facts_for_stored_value(LocalRefKind::Owned),

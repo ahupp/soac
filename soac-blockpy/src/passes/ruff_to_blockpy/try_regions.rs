@@ -20,6 +20,8 @@ pub(crate) struct TryPlan {
     pub finally_dispatch_label: Option<BlockLabel>,
     pub finally_return_label: Option<BlockLabel>,
     pub finally_raise_label: Option<BlockLabel>,
+    pub finally_break_label: Option<BlockLabel>,
+    pub finally_continue_label: Option<BlockLabel>,
 }
 
 pub(crate) fn build_try_plan(
@@ -53,6 +55,16 @@ pub(crate) fn build_try_plan(
     } else {
         None
     };
+    let finally_break_label = if has_finally {
+        Some(name_gen.next_block_name())
+    } else {
+        None
+    };
+    let finally_continue_label = if has_finally {
+        Some(name_gen.next_block_name())
+    } else {
+        None
+    };
     TryPlan {
         except_exc_name,
         finally_abrupt_kind_name,
@@ -60,6 +72,8 @@ pub(crate) fn build_try_plan(
         finally_dispatch_label,
         finally_return_label,
         finally_raise_label,
+        finally_break_label,
+        finally_continue_label,
     }
 }
 
@@ -173,15 +187,32 @@ where
             Some(finally_return_label),
             Some(finally_dispatch_label),
             Some(finally_raise_label),
+            Some(finally_break_label),
+            Some(finally_continue_label),
             Some(payload_name),
             Some(kind_name),
         ) = (
             try_plan.finally_return_label.clone(),
             try_plan.finally_dispatch_label.clone(),
             try_plan.finally_raise_label.clone(),
+            try_plan.finally_break_label.clone(),
+            try_plan.finally_continue_label.clone(),
             try_plan.finally_abrupt_payload_name.as_ref(),
             try_plan.finally_abrupt_kind_name.as_ref(),
         ) {
+            let break_target = loop_labels
+                .as_ref()
+                .map(|labels| labels.break_label.clone());
+            let continue_target = loop_labels
+                .as_ref()
+                .map(|labels| labels.continue_label.clone());
+            emit_finally_loop_abrupt_entry_blocks(
+                blocks,
+                finally_label.clone(),
+                finally_break_label.clone(),
+                finally_continue_label.clone(),
+                active_exc_target.clone(),
+            );
             emit_finally_abrupt_dispatch_blocks(
                 name_gen,
                 blocks,
@@ -191,6 +222,8 @@ where
                 payload_name,
                 kind_name,
                 rest_entry.clone(),
+                break_target,
+                continue_target,
                 active_exc_target.clone(),
             );
         }
@@ -202,6 +235,23 @@ where
         ))
     } else {
         None
+    };
+    let protected_loop_labels = if finally_label.is_some() {
+        match (
+            loop_labels.as_ref(),
+            try_plan.finally_break_label.as_ref(),
+            try_plan.finally_continue_label.as_ref(),
+        ) {
+            (Some(_), Some(finally_break_label), Some(finally_continue_label)) => {
+                Some(LoopLabels {
+                    break_label: finally_break_label.clone(),
+                    continue_label: finally_continue_label.clone(),
+                })
+            }
+            _ => loop_labels.clone(),
+        }
+    } else {
+        loop_labels.clone()
     };
 
     let cleanup_target = finally_label
@@ -225,7 +275,7 @@ where
             &else_body,
             RegionTargets {
                 normal_cont: cleanup_target.clone(),
-                loop_labels: loop_labels.clone(),
+                loop_labels: protected_loop_labels.clone(),
                 active_exc: cleanup_exc_target.clone(),
             },
             blocks,
@@ -255,7 +305,7 @@ where
             &except_body,
             RegionTargets {
                 normal_cont: except_cleanup_target.unwrap_or_else(|| cleanup_target.clone()),
-                loop_labels: loop_labels.clone(),
+                loop_labels: protected_loop_labels.clone(),
                 active_exc: cleanup_exc_target,
             },
             blocks,
@@ -275,7 +325,7 @@ where
         &try_body,
         RegionTargets {
             normal_cont: else_entry,
-            loop_labels,
+            loop_labels: protected_loop_labels,
             active_exc: Some(except_label.clone()),
         },
         blocks,
@@ -381,6 +431,35 @@ fn rewrite_region_returns_to_finally_blockpy<E>(
     }
 }
 
+pub(crate) fn emit_finally_loop_abrupt_entry_blocks<E>(
+    blocks: &mut Vec<LoweredBlockPyBlock<E>>,
+    finally_label: BlockLabel,
+    finally_break_label: BlockLabel,
+    finally_continue_label: BlockLabel,
+    active_exc_target: Option<BlockLabel>,
+) where
+    E: RuffToBlockPyExpr,
+{
+    for (label, kind) in [
+        (finally_break_label, AbruptKind::Break),
+        (finally_continue_label, AbruptKind::Continue),
+    ] {
+        blocks.push(Block::from_builder(
+            label,
+            BlockBuilder::with_term(
+                Vec::new(),
+                Some(BlockTerm::Jump(BlockEdge::with_args(
+                    finally_label.clone(),
+                    vec![BlockArg::AbruptKind(kind), BlockArg::None],
+                ))),
+            ),
+            Vec::new(),
+            active_exc_target.clone().map(BlockEdge::new),
+            None,
+        ));
+    }
+}
+
 pub(crate) fn emit_finally_abrupt_dispatch_blocks<E>(
     name_gen: &FunctionNameGen,
     blocks: &mut Vec<LoweredBlockPyBlock<E>>,
@@ -390,6 +469,8 @@ pub(crate) fn emit_finally_abrupt_dispatch_blocks<E>(
     payload_name: &str,
     kind_name: &str,
     rest_entry: BlockLabel,
+    break_target: Option<BlockLabel>,
+    continue_target: Option<BlockLabel>,
     active_exc_target: Option<BlockLabel>,
 ) where
     E: RuffToBlockPyExpr,
@@ -433,6 +514,8 @@ pub(crate) fn emit_finally_abrupt_dispatch_blocks<E>(
                 rest_entry.clone(),
                 finally_return_label,
                 finally_raise_label,
+                break_target.unwrap_or_else(|| rest_entry.clone()),
+                continue_target.unwrap_or_else(|| rest_entry.clone()),
             ],
             default_label: rest_entry,
         }),

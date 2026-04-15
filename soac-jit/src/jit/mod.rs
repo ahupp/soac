@@ -10785,13 +10785,6 @@ fn emit_planned_local_releases_for_reason_with_local_env(
                 previous.value,
             );
         }
-        if removed.is_none() && !can_release_via_stack_slot_fallback(local.name.as_str()) {
-            return Err(format!(
-                "refcount plan release for block {source_label} references local {:?} \
-                 without a LocalEnv binding",
-                local.name
-            ));
-        }
         if removed
             .as_ref()
             .is_some_and(|entry| entry.storage == LocalEnvStorage::StackMirror)
