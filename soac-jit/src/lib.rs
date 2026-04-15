@@ -33,6 +33,8 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 #[cfg(test)]
 use pyo3::types::PyAnyMethods;
+#[cfg(test)]
+use soac_blockpy::block_py::FunctionKind;
 use soac_blockpy::block_py::{FunctionId, ParamKind};
 use soac_blockpy::passes::CodegenModuleShape;
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
@@ -2053,7 +2055,11 @@ pub unsafe fn register_clif_vectorcall(
         #[cfg(test)]
         if entry_interpreter_vectorcall_for_tests_enabled() {
             data.compiled_vectorcall_entry = None;
-            PyFunction_SetVectorcall(func, Some(entry_interpreter_vectorcall_for_tests));
+            if *data.function()?.lowered_kind() == FunctionKind::Function {
+                PyFunction_SetVectorcall(func, Some(entry_interpreter_vectorcall_for_tests));
+            } else {
+                PyFunction_SetVectorcall(func, data.previous_vectorcall);
+            }
             return Ok(());
         }
         let param_count = data.binding_plan.param_count();
@@ -2088,6 +2094,9 @@ pub unsafe fn register_clif_vectorcall(
             );
         })?;
     #[cfg(test)]
+    let blockpy_function_kind = *blockpy_function.lowered_kind();
+    let blockpy_function_param_count = blockpy_function.params.len();
+    #[cfg(test)]
     if entry_interpreter_vectorcall_for_tests_enabled() {
         let data_ptr = make_clif_function_data(function, function_id, module_runtime)?;
         if PyFunction_SetSoacMetadata(
@@ -2100,7 +2109,9 @@ pub unsafe fn register_clif_vectorcall(
             free_clif_function_data(data_ptr);
             return Err(());
         }
-        PyFunction_SetVectorcall(func, Some(entry_interpreter_vectorcall_for_tests));
+        if blockpy_function_kind == FunctionKind::Function {
+            PyFunction_SetVectorcall(func, Some(entry_interpreter_vectorcall_for_tests));
+        }
         return Ok(());
     }
     let entry = module_runtime
@@ -2109,7 +2120,7 @@ pub unsafe fn register_clif_vectorcall(
         .and_then(|engine| {
             engine.vectorcall_trampoline(
                 &module_runtime.compile_session,
-                blockpy_function.params.len(),
+                blockpy_function_param_count,
             )
         })
         .map_err(|err| {

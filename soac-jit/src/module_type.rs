@@ -681,6 +681,39 @@ pub fn build_shared_state_for_inspection(
     module_name: &str,
     package_name: &str,
 ) -> PyResult<Arc<SharedModuleState>> {
+    build_shared_state_for_inspection_with_original_code(
+        py,
+        lowered_module,
+        module_name,
+        package_name,
+        HashMap::new(),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn build_shared_state_for_testing_with_original_code(
+    py: Python<'_>,
+    lowered_module: BlockPyModule<CodegenModuleShape>,
+    module_name: &str,
+    package_name: &str,
+    original_code_by_function_id: HashMap<FunctionId, Py<PyAny>>,
+) -> PyResult<Arc<SharedModuleState>> {
+    build_shared_state_for_inspection_with_original_code(
+        py,
+        lowered_module,
+        module_name,
+        package_name,
+        original_code_by_function_id,
+    )
+}
+
+fn build_shared_state_for_inspection_with_original_code(
+    py: Python<'_>,
+    lowered_module: BlockPyModule<CodegenModuleShape>,
+    module_name: &str,
+    package_name: &str,
+    original_code_by_function_id: HashMap<FunctionId, Py<PyAny>>,
+) -> PyResult<Arc<SharedModuleState>> {
     let function_index_by_id = build_function_index_by_id(&lowered_module)?;
     let (counter_slots_by_id, counter_values, top_value_counters) =
         build_counter_storage(&lowered_module.counter_defs)?;
@@ -699,7 +732,7 @@ pub fn build_shared_state_for_inspection(
         codegen_constants,
         storage_instance_key: allocate_shared_module_state_storage_key(),
         function_index_by_id,
-        original_code_by_function_id: HashMap::new(),
+        original_code_by_function_id,
         module_constant_objs,
         counter_slots_by_id,
         counter_values,

@@ -22,8 +22,9 @@ mod tests {
     use crate::jit::direct_abi::RuntimePrimitiveId;
     use cranelift_codegen::cursor::Cursor;
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyModule, PyModuleMethods, PyTuple};
-    use pyo3::{Bound, Python, ffi};
+    use pyo3::{Bound, Py, PyAny, PyErr, PyResult, Python, ffi};
     use ruff_python_ast as ast;
+    use std::collections::{HashMap, VecDeque};
     use std::ffi::c_void;
     use std::mem::size_of;
     use std::path::{Path, PathBuf};
@@ -1195,6 +1196,92 @@ def add_default(left, right=9):
             .expect("test tuple should cast")
     }
 
+    type OriginalCodeByQualname = HashMap<String, VecDeque<Py<PyAny>>>;
+    type OriginalCodeMap = HashMap<FunctionId, Py<PyAny>>;
+
+    fn compile_original_module_code_for_test(py: Python<'_>, source: &str) -> PyResult<Py<PyAny>> {
+        let code = PyModule::import(py, "builtins")?
+            .getattr("compile")?
+            .call1((source, "<entry_test>", "exec"))?;
+        Ok(code.unbind())
+    }
+
+    fn collect_original_code_objects_for_test(
+        code: &Bound<'_, PyAny>,
+        code_type: &Bound<'_, PyAny>,
+        by_qualname: &mut OriginalCodeByQualname,
+    ) -> PyResult<()> {
+        let qualname = code.getattr("co_qualname")?.extract::<String>()?;
+        by_qualname
+            .entry(qualname)
+            .or_default()
+            .push_back(code.clone().unbind());
+
+        let consts = code.getattr("co_consts")?;
+        let const_count = unsafe { ffi::PyTuple_Size(consts.as_ptr()) };
+        if const_count < 0 {
+            return Err(PyErr::fetch(code.py()));
+        }
+        for index in 0..const_count {
+            let item = unsafe { ffi::PyTuple_GetItem(consts.as_ptr(), index) };
+            if item.is_null() {
+                return Err(PyErr::fetch(code.py()));
+            }
+            let item = unsafe { Bound::from_borrowed_ptr(code.py(), item) };
+            if item.is_instance(code_type)? {
+                collect_original_code_objects_for_test(&item, code_type, by_qualname)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn is_synthetic_class_helper_for_original_code(
+        function: &BlockPyFunction<CodegenModuleShape>,
+    ) -> bool {
+        function.names.bind_name.starts_with("_dp_class_ns_")
+            || function.names.bind_name.starts_with("_dp_define_class_")
+    }
+
+    fn original_code_lookup_key_for_test(
+        function: &BlockPyFunction<CodegenModuleShape>,
+    ) -> Option<&str> {
+        let qualname = function.names.qualname.as_str();
+        if qualname == "_dp_module_init"
+            || qualname == "__annotate__"
+            || qualname.ends_with(".__annotate_func__")
+            || function.names.fn_name == "_dp_resume"
+            || is_synthetic_class_helper_for_original_code(function)
+        {
+            return None;
+        }
+        Some(qualname)
+    }
+
+    fn match_original_code_to_functions_for_test(
+        py: Python<'_>,
+        module_code: &Bound<'_, PyAny>,
+        lowered_module: &BlockPyModule<CodegenModuleShape>,
+    ) -> PyResult<OriginalCodeMap> {
+        let code_type = PyModule::import(py, "types")?.getattr("CodeType")?;
+        let mut code_by_qualname = HashMap::new();
+        collect_original_code_objects_for_test(module_code, &code_type, &mut code_by_qualname)?;
+
+        let mut code_by_function_id = HashMap::new();
+        for function in &lowered_module.callable_defs {
+            let Some(qualname) = original_code_lookup_key_for_test(function) else {
+                continue;
+            };
+            let Some(codes) = code_by_qualname.get_mut(qualname) else {
+                continue;
+            };
+            let Some(code) = codes.pop_front() else {
+                continue;
+            };
+            code_by_function_id.insert(function.function_id, code);
+        }
+        Ok(code_by_function_id)
+    }
+
     unsafe fn run_registered_module_init_entry_for_test<'py>(
         py: Python<'py>,
         source: &str,
@@ -1202,9 +1289,19 @@ def add_default(left, right=9):
         let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(source)
             .expect("lowering module init source should succeed")
             .codegen_module;
-        let shared_state =
-            crate::module_type::build_shared_state_for_testing(py, lowered, "entry_test", "")
-                .expect("shared state should build for module init test");
+        let module_code = compile_original_module_code_for_test(py, source)
+            .expect("original module source should compile for entry test");
+        let original_code_by_function_id =
+            match_original_code_to_functions_for_test(py, module_code.bind(py), &lowered)
+                .expect("original code should map to lowered entry-test functions");
+        let shared_state = crate::module_type::build_shared_state_for_testing_with_original_code(
+            py,
+            lowered,
+            "entry_test",
+            "",
+            original_code_by_function_id,
+        )
+        .expect("shared state should build for module init test");
         let function_id = shared_state
             .lowered_module
             .callable_defs
@@ -1448,6 +1545,66 @@ RESULT = C.decorated
                     .expect("RESULT should be int"),
                 42,
                 "entry interpreter dispatch should handle decorators and metaclass kwargs"
+            );
+        });
+    }
+
+    #[test]
+    fn blockpy_entry_interpreter_vectorcall_preserves_generator_call_semantics() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        let _entry_vectorcall = ForceEntryInterpreterVectorcallGuard::new();
+        Python::attach(|py| unsafe {
+            let globals = run_registered_module_init_entry_for_test(
+                py,
+                r#"
+def gen():
+    yield 40
+    yield 2
+
+RESULT = list(gen())
+"#,
+            );
+            let stored_result = globals
+                .get_item("RESULT")
+                .expect("RESULT lookup should succeed")
+                .expect("module init should store RESULT");
+            assert_eq!(
+                stored_result
+                    .extract::<Vec<i64>>()
+                    .expect("RESULT should be list[int]"),
+                vec![40, 2],
+                "forced entry dispatch should leave generator calls as generator-object creation"
+            );
+        });
+    }
+
+    #[test]
+    fn blockpy_entry_interpreter_vectorcall_preserves_coroutine_call_semantics() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        let _entry_vectorcall = ForceEntryInterpreterVectorcallGuard::new();
+        Python::attach(|py| unsafe {
+            let globals = run_registered_module_init_entry_for_test(
+                py,
+                r#"
+async def coro():
+    return 42
+
+OBJ = coro()
+RESULT = hasattr(OBJ, "__await__")
+OBJ.close()
+"#,
+            );
+            let stored_result = globals
+                .get_item("RESULT")
+                .expect("RESULT lookup should succeed")
+                .expect("module init should store RESULT");
+            assert!(
+                stored_result
+                    .extract::<bool>()
+                    .expect("RESULT should be bool"),
+                "forced entry dispatch should leave coroutine calls as coroutine-object creation"
             );
         });
     }
