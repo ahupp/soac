@@ -17,6 +17,10 @@ use crate::counter_dump::{
     read_call_target_specializations_from_file, read_getitem_specializations_from_file,
     read_operator_specializations_from_file, read_setitem_specializations_from_file,
 };
+use crate::function_instantiation::{
+    SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_SYMBOL, make_function_kind_abi_tag,
+    soac_jit_make_function_with_closure,
+};
 use crate::module_constants::{ModuleCodegenConstants, ModuleConstantId};
 use crate::module_type::{CounterRuntimeSlot, SharedModuleState, build_counter_storage_layout};
 use cranelift_codegen::cfg_printer::CFGPrinter;
@@ -1008,6 +1012,18 @@ static DP_JIT_VECTORCALL_BIND_DIRECT_ARGS_IMPORT: ImportSpec = ImportSpec::new(
 static DP_JIT_VECTORCALL_COMPILE_FUNCTION_ENV_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_vectorcall_compile_function_env",
     &[SigType::Pointer, SigType::Pointer],
+    &[SigType::Pointer],
+);
+static SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_IMPORT: ImportSpec = ImportSpec::new(
+    SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_SYMBOL,
+    &[
+        SigType::I64,
+        SigType::I64,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+    ],
     &[SigType::Pointer],
 );
 struct ModuleFuncImports {
@@ -4327,6 +4343,7 @@ struct JitEmitCtx<'mc> {
     pyobject_setitem_ref: ir::FuncRef,
     py_long_from_i64_ref: ir::FuncRef,
     raise_deleted_name_error_ref: ir::FuncRef,
+    make_function_with_closure_ref: ir::FuncRef,
     make_cell_ref: ir::FuncRef,
     load_cell_ref: ir::FuncRef,
     store_cell_ref: ir::FuncRef,
@@ -7767,31 +7784,6 @@ fn emit_checked_runtime_name_object(
         ctx.load_runtime_obj_ref,
         &[name_obj],
         &[name_obj],
-    )
-}
-
-fn emit_soac_ext_make_function_callable(
-    fb: &mut FunctionBuilder<'_>,
-    ctx: &JitEmitCtx<'_>,
-) -> ir::Value {
-    let ext_module = emit_owned_module_constant(
-        fb,
-        ctx.module_constants
-            .require_runtime_name_constant_id("_soac_ext"),
-        ctx,
-    );
-    let attr_name = emit_owned_module_constant(
-        fb,
-        ctx.module_constants
-            .require_unicode_constant_id("make_function"),
-        ctx,
-    );
-    emit_checked_owned_pyobject_call_with_cleanup(
-        fb,
-        ctx,
-        ctx.pyobject_getattr_ref,
-        &[ext_module, attr_name],
-        &[ext_module, attr_name],
     )
 }
 
@@ -11963,20 +11955,13 @@ fn emit_codegen_make_function_with_closure_with_local_env(
     jit_module: &mut JITModule,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> ir::Value {
-    let callable = emit_soac_ext_make_function_callable(fb, emit_ctx);
-    let function_id = emit_owned_module_constant(
-        fb,
-        emit_ctx
-            .module_constants
-            .require_u64_constant_id(make_function.function_id().packed()),
-        emit_ctx,
+    let function_id = fb.ins().iconst(
+        emit_ctx.consts.i64_ty,
+        make_function.function_id().packed() as i64,
     );
-    let kind = emit_owned_module_constant(
-        fb,
-        emit_ctx
-            .module_constants
-            .require_unicode_constant_id(make_function.kind.make_function_kind_name()),
-        emit_ctx,
+    let kind = fb.ins().iconst(
+        emit_ctx.consts.i64_ty,
+        make_function_kind_abi_tag(make_function.kind),
     );
     let captures_is_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
         make_function.captures.as_ref(),
@@ -12021,11 +12006,9 @@ fn emit_codegen_make_function_with_closure_with_local_env(
         func_imports,
     );
     let globals = emit_ctx.consts.block_const;
-    let result = emit_positional_vectorcall_result_with_arg_values(
-        fb,
-        callable,
-        false,
-        vec![
+    let call_inst = fb.ins().call(
+        emit_ctx.make_function_with_closure_ref,
+        &[
             function_id,
             kind,
             captures,
@@ -12033,14 +12016,27 @@ fn emit_codegen_make_function_with_closure_with_local_env(
             annotate_fn,
             globals,
         ],
-        vec![
-            false,
-            false,
-            captures_is_borrowed,
-            param_defaults_is_borrowed,
-            annotate_fn_is_borrowed,
-            true,
-        ],
+    );
+    let mut owned_inputs = Vec::new();
+    if !captures_is_borrowed {
+        owned_inputs.push(captures);
+    }
+    if !param_defaults_is_borrowed {
+        owned_inputs.push(param_defaults);
+    }
+    if !annotate_fn_is_borrowed {
+        owned_inputs.push(annotate_fn);
+    }
+    let value = emit_decref_owned_inputs_after_nullable_result(
+        fb,
+        emit_ctx,
+        fb.inst_results(call_inst)[0],
+        owned_inputs.as_slice(),
+    );
+    let result = emit_checked_owned_pyobject_result_for_demand(
+        fb,
+        value,
+        PyObjFacts::unknown(),
         emit_ctx,
         ResultDemand::PYOBJECT_OWNED,
     );
@@ -14526,6 +14522,10 @@ fn register_jit_builder_symbols(builder: &mut JITBuilder) {
     builder.symbol(
         "_PyDict_IndexedValueTombstone",
         std::ptr::addr_of_mut!(_PyDict_IndexedValueTombstone).cast::<u8>(),
+    );
+    builder.symbol(
+        SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_SYMBOL,
+        soac_jit_make_function_with_closure as *const u8,
     );
     builder.symbol_lookup_fn(Box::new(lookup_registered_jit_data_symbol));
     register_specialized_jit_symbols(builder);
@@ -17202,6 +17202,11 @@ fn build_cranelift_run_bb_specialized_function(
             &mut fb.func,
             &DP_JIT_RAISE_DELETED_NAME_ERROR_IMPORT,
         );
+        let make_function_with_closure_ref = func_imports.get_or_panic(
+            jit_module,
+            &mut fb.func,
+            &SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_IMPORT,
+        );
         let make_cell_ref =
             func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_MAKE_CELL_IMPORT);
         let load_cell_ref =
@@ -17454,6 +17459,7 @@ fn build_cranelift_run_bb_specialized_function(
                 pyobject_setitem_ref,
                 py_long_from_i64_ref,
                 raise_deleted_name_error_ref,
+                make_function_with_closure_ref,
                 make_cell_ref,
                 load_cell_ref,
                 store_cell_ref,

@@ -7,8 +7,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub mod config;
+pub mod function_instantiation;
 mod jit;
 pub(crate) mod operator_specialization;
+pub use function_instantiation::{
+    instantiate_bb_function, make_function, make_function_from_python_args,
+};
 pub use jit::*;
 
 pub mod counter;
