@@ -13,7 +13,7 @@ use crate::block_py::{
     InstrUnresolved, InstrWithConstantNone, InstrWithYield, Load, MakeFunction, Mappable,
     ModuleNameGen, NameLike, NumberLiteral, NumberLiteralValue, ScopeExprNode, StorageLayout,
     Store, StringLiteral, TermBranchTable, TermIf, TermRaise, TryMapFunction, TryMapInstr,
-    TryMapTerm, UnaryOp, UnaryOpKind, UnresolvedName,
+    TryMapTerm, Tuple, UnaryOp, UnaryOpKind, UnresolvedName, WithMeta,
 };
 use crate::passes::ast_to_ast::scope_helpers::is_internal_symbol;
 use crate::passes::ruff_to_blockpy::{attach_exception_edges_to_blocks, lowered_exception_edges};
@@ -338,6 +338,10 @@ fn core_call(func_name: &str, args: Vec<InstrUnresolved>) -> InstrUnresolved {
     )
 }
 
+fn core_tuple(values: Vec<InstrUnresolved>) -> InstrUnresolved {
+    Tuple::new(values).with_meta(Default::default()).into()
+}
+
 fn core_call_expr(
     func: InstrUnresolved,
     args: Vec<InstrUnresolved>,
@@ -602,11 +606,10 @@ fn build_factory_block(
     let resume_entry = core_make_function(
         resume_function_id,
         FunctionKind::Function,
-        core_call("tuple_values", Vec::new()),
+        core_tuple(Vec::new()),
         core_none(),
     );
-    let cleanup_cells = core_call(
-        "tuple_values",
+    let cleanup_cells = core_tuple(
         cleanup_cell_names
             .iter()
             .map(|name| core_cell_ref(name.as_str()))

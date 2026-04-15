@@ -29,8 +29,8 @@ use crate::block_py::{
     StmtAnnAssign, StmtAssert, StmtAssign, StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue,
     StmtDelete, StmtExpr, StmtFor, StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom,
     StmtIpyEscapeCommand, StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry,
-    StmtTypeAlias, StmtWhile, StmtWith, Store, TryMapInstr, TryMapModule, TryMapTerm, UnaryOp,
-    UnresolvedName, WithMeta, Yield, YieldFrom,
+    StmtTypeAlias, StmtWhile, StmtWith, Store, TryMapInstr, TryMapModule, TryMapTerm, Tuple,
+    UnaryOp, UnresolvedName, WithMeta, Yield, YieldFrom,
 };
 use ruff_python_ast::{self as ast};
 use soac_macros::{enum_broadcast, DelegateMatchDefault};
@@ -129,6 +129,7 @@ pub enum InstrCodegenOp {
     BinOp(#[rkyv(omit_bounds)] BinOp<Self>),
     UnaryOp(#[rkyv(omit_bounds)] UnaryOp<Self>),
     CalleeFunctionId(#[rkyv(omit_bounds)] CalleeFunctionId<Self>),
+    Tuple(#[rkyv(omit_bounds)] Tuple<Self>),
     Call(#[rkyv(omit_bounds)] Call<Self>),
     CallDirect(#[rkyv(omit_bounds)] CallDirect<Self>),
     GetAttr(#[rkyv(omit_bounds)] GetAttr<Self>),
@@ -244,6 +245,7 @@ pub enum InstrTyped {
     Truthy(TypedTruthy<Self>),
     Load(Load<Self>),
     BinOp(BinOp<Self>),
+    LegacyTuple(Tuple<Self>),
     LegacyUnaryOp(UnaryOp<Self>),
     LegacyCalleeFunctionId(CalleeFunctionId<Self>),
     LegacyCall(Call<Self>),
@@ -270,6 +272,7 @@ impl InstrTyped {
             Self::LegacyUnaryOp(_)
                 | Self::LegacyCalleeFunctionId(_)
                 | Self::LegacyCall(_)
+                | Self::LegacyTuple(_)
                 | Self::LegacyCallDirect(_)
                 | Self::LegacyGetAttr(_)
                 | Self::LegacySetAttr(_)
@@ -302,6 +305,7 @@ impl MapInstr<InstrCodegen, InstrTyped> for CodegenToTyped {
     fn map_instr(&mut self, instr: InstrCodegen) -> InstrTyped {
         match instr {
             InstrCodegenOp::BinOp(op) => InstrTyped::BinOp(op.map_children(self)),
+            InstrCodegenOp::Tuple(op) => InstrTyped::LegacyTuple(op.map_children(self)),
             InstrCodegenOp::UnaryOp(op) => InstrTyped::LegacyUnaryOp(op.map_children(self)),
             InstrCodegenOp::CalleeFunctionId(op) => {
                 InstrTyped::LegacyCalleeFunctionId(op.map_children(self))
@@ -381,6 +385,7 @@ impl TryMapInstr<InstrTyped, InstrCodegen, String> for TypedToCodegen {
             }
             InstrTyped::Load(op) => InstrCodegenOp::Load(op.try_map_children(self)?),
             InstrTyped::BinOp(op) => InstrCodegenOp::BinOp(op.try_map_children(self)?),
+            InstrTyped::LegacyTuple(op) => InstrCodegenOp::Tuple(op.try_map_children(self)?),
             InstrTyped::LegacyUnaryOp(op) => InstrCodegenOp::UnaryOp(op.try_map_children(self)?),
             InstrTyped::LegacyCalleeFunctionId(op) => {
                 InstrCodegenOp::CalleeFunctionId(op.try_map_children(self)?)
@@ -445,6 +450,7 @@ pub enum InstrWithAwaitAndYield {
     Literal(LiteralValue),
     BinOp(BinOp<Self>),
     UnaryOp(UnaryOp<Self>),
+    Tuple(Tuple<Self>),
     Call(Call<Self>),
     GetAttr(GetAttr<Self>),
     SetAttr(SetAttr<Self>),
@@ -479,6 +485,7 @@ pub enum InstrWithYield {
     Literal(LiteralValue),
     BinOp(BinOp<Self>),
     UnaryOp(UnaryOp<Self>),
+    Tuple(Tuple<Self>),
     Call(Call<Self>),
     GetAttr(GetAttr<Self>),
     SetAttr(SetAttr<Self>),
@@ -533,6 +540,7 @@ pub enum InstrLow<N: NameLike> {
     Literal(LiteralValue),
     BinOp(#[rkyv(omit_bounds)] BinOp<Self>),
     UnaryOp(#[rkyv(omit_bounds)] UnaryOp<Self>),
+    Tuple(#[rkyv(omit_bounds)] Tuple<Self>),
     Call(#[rkyv(omit_bounds)] Call<Self>),
     GetAttr(#[rkyv(omit_bounds)] GetAttr<Self>),
     SetAttr(#[rkyv(omit_bounds)] SetAttr<Self>),
@@ -582,6 +590,7 @@ pub enum InstrResolved {
     Literal(LiteralValue),
     BinOp(#[rkyv(omit_bounds)] BinOp<Self>),
     UnaryOp(#[rkyv(omit_bounds)] UnaryOp<Self>),
+    Tuple(#[rkyv(omit_bounds)] Tuple<Self>),
     Call(#[rkyv(omit_bounds)] Call<Self>),
     GetAttr(#[rkyv(omit_bounds)] GetAttr<Self>),
     SetAttr(#[rkyv(omit_bounds)] SetAttr<Self>),

@@ -23,7 +23,7 @@ pub use operation::{
     StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue, StmtDelete, StmtExpr, StmtFor,
     StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom, StmtIpyEscapeCommand,
     StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry, StmtTypeAlias, StmtWhile,
-    StmtWith, Store, UnaryOp, UnaryOpKind, Yield, YieldFrom,
+    StmtWith, Store, Tuple, UnaryOp, UnaryOpKind, Yield, YieldFrom,
 };
 pub use ruff_python_ast::Expr;
 use ruff_python_ast::{self as ast};

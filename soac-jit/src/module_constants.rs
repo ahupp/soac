@@ -515,6 +515,9 @@ impl ModuleConstantCollector {
             InstrCodegen::DelItem(op) => {
                 op.visit_children(self);
             }
+            InstrCodegen::Tuple(op) => {
+                op.visit_children(self);
+            }
             InstrCodegen::MakeCell(op) => {
                 op.visit_children(self);
             }

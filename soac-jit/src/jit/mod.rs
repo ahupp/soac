@@ -2182,6 +2182,10 @@ fn typed_nested_guard_scan_expr(expr: &InstrTyped, saw_replay_unsafe_effect: &mu
                 )
                 && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
         }
+        InstrTyped::LegacyTuple(op) => op
+            .values
+            .iter()
+            .all(|value| typed_nested_guard_scan_expr(value, saw_replay_unsafe_effect)),
         InstrTyped::LegacyCalleeFunctionId(op) => {
             typed_nested_guard_scan_expr(op.value.as_ref(), saw_replay_unsafe_effect)
         }
@@ -2386,6 +2390,10 @@ fn runtime_jit_deopt_expr_supported(
                 && runtime_jit_deopt_expr_supported(&binop.right, support)
         }
         InstrCodegen::UnaryOp(unary) => runtime_jit_deopt_expr_supported(&unary.operand, support),
+        InstrCodegen::Tuple(tuple) => tuple
+            .values
+            .iter()
+            .all(|value| runtime_jit_deopt_expr_supported(value, support)),
         InstrCodegen::GetAttr(getattr) => {
             runtime_jit_deopt_expr_supported(&getattr.value, support)
                 && runtime_jit_deopt_expr_supported(&getattr.attr, support)
@@ -3770,6 +3778,11 @@ fn insert_typed_child_demands(plan: &mut ResultDemandPlan, expr: &InstrTyped) {
         }
         InstrTyped::LegacyUnaryOp(op) => {
             insert_pyobject_borrowed_input_demand(plan, op.operand.as_ref());
+        }
+        InstrTyped::LegacyTuple(op) => {
+            for value in &op.values {
+                insert_pyobject_borrowed_input_demand(plan, value);
+            }
         }
         InstrTyped::LegacyCalleeFunctionId(op) => {
             insert_pyobject_borrowed_input_demand(plan, op.value.as_ref());
@@ -6962,6 +6975,43 @@ fn emit_pack_current_values_tuple(
 
     fb.switch_to_block(done_block);
     fb.block_params(done_block)[0]
+}
+
+fn emit_codegen_tuple_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    tuple: &blockpy_intrinsics::Tuple<InstrCodegen>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> ir::Value {
+    let mut arg_values: Vec<ir::Value> = Vec::with_capacity(tuple.values.len());
+    let mut borrowed_args: Vec<bool> = Vec::with_capacity(tuple.values.len());
+    for arg in &tuple.values {
+        let borrowed_arg =
+            codegen_expr_pyobject_input_is_borrowed_from_local_env(arg, local_env, emit_ctx);
+        let value = emit_codegen_expr_with_local_env(
+            fb,
+            arg,
+            local_env,
+            emit_ctx,
+            borrowed_arg,
+            jit_module,
+            func_imports,
+        );
+        arg_values.push(value);
+        borrowed_args.push(borrowed_arg);
+    }
+    let tuple_value = emit_pack_current_values_tuple(fb, arg_values.as_slice(), emit_ctx);
+    for (value, borrowed_arg) in arg_values.into_iter().zip(borrowed_args.into_iter()) {
+        if !borrowed_arg {
+            fb.ins().call(
+                emit_ctx.decref_ref,
+                &[emit_ctx.consts.thread_state_value, value],
+            );
+        }
+    }
+    tuple_value
 }
 
 fn emit_call_args_tuple_from_values(
@@ -10804,38 +10854,6 @@ fn emit_codegen_simple_call_with_local_env(
         && simple_keywords.is_empty()
         && let Some(helper_id) = codegen_expr_runtime_helper(call.func.as_ref(), emit_ctx)
     {
-        if helper_id == RuntimeHelperId::TupleValues {
-            let mut arg_values: Vec<ir::Value> = Vec::with_capacity(simple_args.len());
-            let mut borrowed_args: Vec<bool> = Vec::with_capacity(simple_args.len());
-            for arg in &simple_args {
-                let borrowed_arg = codegen_expr_pyobject_input_is_borrowed_from_local_env(
-                    arg, local_env, emit_ctx,
-                );
-                let value = emit_codegen_expr_with_local_env(
-                    fb,
-                    arg,
-                    local_env,
-                    emit_ctx,
-                    borrowed_arg,
-                    jit_module,
-                    func_imports,
-                );
-                arg_values.push(value);
-                borrowed_args.push(borrowed_arg);
-            }
-            // tuple_values is the variadic tuple construction primitive for
-            // lowered IR; do not bounce through the Python helper callable.
-            let tuple_value = emit_pack_current_values_tuple(fb, arg_values.as_slice(), emit_ctx);
-            for (value, borrowed_arg) in arg_values.into_iter().zip(borrowed_args.into_iter()) {
-                if !borrowed_arg {
-                    fb.ins().call(
-                        emit_ctx.decref_ref,
-                        &[emit_ctx.consts.thread_state_value, value],
-                    );
-                }
-            }
-            return Some(tuple_value);
-        }
         if helper_id == RuntimeHelperId::RaiseDeletedName
             && simple_args.len() == 1
             && let Some(name) = codegen_expr_const_string(simple_args[0], emit_ctx.module_constants)
@@ -11639,6 +11657,20 @@ fn emit_codegen_expr_with_local_env(
             "MakeFunctionWithClosure must not request a borrowed result"
         );
         return emit_codegen_make_function_with_closure_with_local_env(
+            fb,
+            op,
+            local_env,
+            emit_ctx,
+            jit_module,
+            func_imports,
+        );
+    }
+    if let InstrCodegen::Tuple(op) = expr {
+        assert!(
+            !borrowed,
+            "tuple expression must not request a borrowed result"
+        );
+        return emit_codegen_tuple_with_local_env(
             fb,
             op,
             local_env,

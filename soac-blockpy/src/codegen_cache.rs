@@ -215,6 +215,7 @@ impl VisitMut<InstrCodegen> for FunctionIdRemapper {
             }
             InstrCodegen::BinOp(_)
             | InstrCodegen::UnaryOp(_)
+            | InstrCodegen::Tuple(_)
             | InstrCodegen::CalleeFunctionId(_)
             | InstrCodegen::Call(_)
             | InstrCodegen::GetAttr(_)

@@ -169,12 +169,7 @@ fn core_blockpy_expr_reduces_operator_helper_families_to_intrinsics() {
 
 #[test]
 fn core_blockpy_expr_keeps_non_intrinsic_helper_families_as_named_calls() {
-    for (expr, helper_name) in [
-        ("(x, y)", "tuple_values"),
-        ("[x, y]", "list"),
-        ("{x, y}", "set"),
-        ("{x: y}", "dict"),
-    ] {
+    for (expr, helper_name) in [("[x, y]", "list"), ("{x, y}", "set"), ("{x: y}", "dict")] {
         let parsed = *parse_expression(expr).unwrap().into_syntax().body;
         let InstrWithAwaitAndYield::Call(call) = InstrWithAwaitAndYield::from_ast_expr(parsed)
         else {
@@ -189,6 +184,15 @@ fn core_blockpy_expr_keeps_non_intrinsic_helper_families_as_named_calls() {
             "{call:?}",
         );
     }
+}
+
+#[test]
+fn core_blockpy_expr_reduces_tuple_literal_to_tuple_instruction() {
+    let parsed = *parse_expression("(x, y)").unwrap().into_syntax().body;
+    let InstrWithAwaitAndYield::Tuple(tuple) = InstrWithAwaitAndYield::from_ast_expr(parsed) else {
+        panic!("expected tuple instruction for tuple literal");
+    };
+    assert_eq!(tuple.values.len(), 2);
 }
 
 #[test]

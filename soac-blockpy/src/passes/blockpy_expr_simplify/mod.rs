@@ -346,6 +346,13 @@ fn non_operator_operation_from_helper_call(
     range: ruff_text_size::TextRange,
     args: Vec<InstrWithAwaitAndYield>,
 ) -> Option<InstrWithAwaitAndYield> {
+    if name == "tuple_values" {
+        return Some(
+            operation::Tuple::new(args)
+                .with_meta(Meta::new(node_index, range))
+                .into(),
+        );
+    }
     let mut args = args.into_iter();
     let meta = Meta::new(node_index, range);
     let operation = match name {
@@ -438,6 +445,15 @@ fn reduce_core_tuple_splat(elts: Vec<Expr>) -> InstrWithAwaitAndYield {
     let mut segments: Vec<InstrWithAwaitAndYield> = Vec::new();
     let mut values: Vec<InstrWithAwaitAndYield> = Vec::new();
 
+    fn tuple_pack(values: Vec<InstrWithAwaitAndYield>) -> InstrWithAwaitAndYield {
+        operation::Tuple::new(values)
+            .with_meta(Meta::new(
+                ast::AtomicNodeIndex::default(),
+                Default::default(),
+            ))
+            .into()
+    }
+
     for elt in elts {
         match elt {
             Expr::Starred(ast::ExprStarred {
@@ -447,12 +463,7 @@ fn reduce_core_tuple_splat(elts: Vec<Expr>) -> InstrWithAwaitAndYield {
                 ..
             }) => {
                 if !values.is_empty() {
-                    segments.push(core_runtime_positional_call_expr_with_meta(
-                        "tuple_values",
-                        ast::AtomicNodeIndex::default(),
-                        Default::default(),
-                        std::mem::take(&mut values),
-                    ));
+                    segments.push(tuple_pack(std::mem::take(&mut values)));
                 }
                 segments.push(core_runtime_positional_call_expr_with_meta(
                     "tuple_from_iter",
@@ -466,22 +477,13 @@ fn reduce_core_tuple_splat(elts: Vec<Expr>) -> InstrWithAwaitAndYield {
     }
 
     if !values.is_empty() {
-        segments.push(core_runtime_positional_call_expr_with_meta(
-            "tuple_values",
-            ast::AtomicNodeIndex::default(),
-            Default::default(),
-            values,
-        ));
+        segments.push(tuple_pack(values));
     }
 
-    segments.into_iter().reduce(add_op_expr).unwrap_or_else(|| {
-        core_runtime_positional_call_expr_with_meta(
-            "tuple_values",
-            ast::AtomicNodeIndex::default(),
-            Default::default(),
-            Vec::new(),
-        )
-    })
+    segments
+        .into_iter()
+        .reduce(add_op_expr)
+        .unwrap_or_else(|| tuple_pack(Vec::new()))
 }
 
 impl InstrWithAwaitAndYield {

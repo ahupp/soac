@@ -327,6 +327,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             InstrCodegen::CalleeFunctionId(callee) => unsafe {
                 self.execute_callee_function_id_owned(callee)
             },
+            InstrCodegen::Tuple(tuple) => unsafe { self.execute_tuple_owned(tuple) },
             InstrCodegen::Call(call) => unsafe { self.execute_call_owned(call) },
             InstrCodegen::CallDirect(call) => unsafe { self.execute_call_direct_owned(call) },
             InstrCodegen::Store(store) => unsafe { self.execute_store_owned(store) },
@@ -770,6 +771,44 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
         call: &soac_blockpy::block_py::Call<InstrCodegen>,
     ) -> Result<ObjPtr, String> {
         unsafe { self.execute_call_parts_owned(&call.func, &call.args, &call.keywords) }
+    }
+
+    #[cold]
+    unsafe fn execute_tuple_owned(
+        &mut self,
+        tuple_expr: &soac_blockpy::block_py::Tuple<InstrCodegen>,
+    ) -> Result<ObjPtr, String> {
+        let tuple_len = match ffi::Py_ssize_t::try_from(tuple_expr.values.len()) {
+            Ok(tuple_len) => tuple_len,
+            Err(_) => {
+                return Err(format!(
+                    "deopt continuation tuple has too many values: {}",
+                    tuple_expr.values.len()
+                ));
+            }
+        };
+        let tuple = unsafe { ffi::PyTuple_New(tuple_len) };
+        if tuple.is_null() {
+            return Ok(ptr::null_mut());
+        }
+        for (index, expr) in tuple_expr.values.iter().enumerate() {
+            let value = unsafe { self.execute_expr_owned(expr)? };
+            if value.is_null() {
+                unsafe {
+                    ffi::Py_DECREF(tuple);
+                }
+                return Ok(ptr::null_mut());
+            }
+            let index = ffi::Py_ssize_t::try_from(index)
+                .expect("tuple value index should fit after tuple length conversion");
+            if unsafe { ffi::PyTuple_SetItem(tuple, index, value.cast::<ffi::PyObject>()) } != 0 {
+                unsafe {
+                    ffi::Py_DECREF(tuple);
+                }
+                return Ok(ptr::null_mut());
+            }
+        }
+        Ok(tuple.cast())
     }
 
     #[cold]

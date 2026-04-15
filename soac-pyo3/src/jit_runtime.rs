@@ -76,7 +76,6 @@ fn install_soac_runtime_bootstrap_globals(
         "locals",
         "eval",
         "exec",
-        "tuple_values",
         "create_class",
         "import_",
         "import_attr",

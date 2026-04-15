@@ -7,7 +7,7 @@ use soac_blockpy::block_py::{
     GetItem, HasMeta, HasSemanticInstrId, IncrementCounter, InstrCodegen, InstrResolved, Literal,
     LiteralValue, Load, LocalLocation, MakeCell, Meta, ModuleNameGen, NameLocation, NumberLiteral,
     NumberLiteralValue, Param, ParamKind, ParamSpec, ResolvedName, SetAttr, SetItem, StorageLayout,
-    Store, StringLiteral, UnaryOp, UnaryOpKind, Visit, VisitMut, WithMeta,
+    Store, StringLiteral, Tuple, UnaryOp, UnaryOpKind, Visit, VisitMut, WithMeta,
 };
 use soac_blockpy::passes::{
     CodegenModuleShape, instrument_bb_module_with_block_entry_counters,
@@ -1011,6 +1011,10 @@ def get_value():
         operation.into()
     }
 
+    fn tuple_expr(values: Vec<InstrCodegen>) -> InstrCodegen {
+        Tuple::new(values).into()
+    }
+
     fn expr_stmt(expr: InstrCodegen) -> InstrCodegen {
         expr
     }
@@ -1531,16 +1535,11 @@ def get_value():
     }
 
     #[test]
-    fn specialized_jit_body_calls_compile_via_effect_only_typed_ops() {
+    fn specialized_jit_body_tuple_compile_via_effect_only_typed_ops() {
         let mut constants = TestConstantPool::default();
-        let call = Call::new(
-            name_expr(test_runtime_name("tuple_values")),
-            vec![CallArgPositional::Positional(constants.int_expr(1))],
-            Vec::<CallArgKeyword<InstrCodegen>>::new(),
-        );
         let function = with_single_test_block(
             test_function(),
-            vec![expr_stmt(op_expr(call))],
+            vec![expr_stmt(tuple_expr(vec![constants.int_expr(1)]))],
             ret_term(constants.int_expr(2)),
         );
         let module = BlockPyModule {
@@ -1614,7 +1613,7 @@ def get_value():
         let keyword_instr_id = InstrId::new(BlockLabel::from_index(0), 3);
         let call = with_instr_id(
             op_expr(Call::new(
-                with_instr_id(name_expr(test_runtime_name("tuple_values")), func_instr_id),
+                with_instr_id(name_expr(test_runtime_name("callable")), func_instr_id),
                 vec![CallArgPositional::Positional(with_instr_id(
                     constants.int_expr(1),
                     positional_instr_id,
@@ -6306,13 +6305,7 @@ def f(x):
     fn runtime_deopt_table_accepts_make_function_with_closure_block_tail() {
         let test_function = test_function();
         let function_id = test_function.function_id;
-        let empty_tuple_expr = || {
-            op_expr(Call::new(
-                name_expr(test_runtime_name("tuple_values")),
-                Vec::<CallArgPositional<InstrCodegen>>::new(),
-                Vec::<CallArgKeyword<InstrCodegen>>::new(),
-            ))
-        };
+        let empty_tuple_expr = || tuple_expr(Vec::new());
         let function = with_single_test_block(
             test_function,
             vec![expr_stmt(op_expr(
@@ -14112,7 +14105,7 @@ def f(x, y):
             name_expr(test_name("fn"))
         } else {
             op_expr(Call::new(
-                name_expr(test_runtime_name("tuple_values")),
+                name_expr(test_runtime_name("list")),
                 Vec::<CallArgPositional<InstrCodegen>>::new(),
                 Vec::<CallArgKeyword<InstrCodegen>>::new(),
             ))
@@ -15184,13 +15177,7 @@ def f(x, y):
         let blocks = [1usize as ObjPtr];
         let function = with_single_test_block(
             test_function(),
-            vec![op_expr(Call::new(
-                name_expr(test_runtime_name("tuple_values")),
-                vec![CallArgPositional::Positional(op_expr(Load::new(
-                    test_global_name("x"),
-                )))],
-                Vec::<CallArgKeyword<InstrCodegen>>::new(),
-            ))],
+            vec![tuple_expr(vec![op_expr(Load::new(test_global_name("x")))])],
             ret_term(none_expr()),
         );
         let mut module = test_module(ModuleNameGen::new(0), vec![function]);
@@ -15220,18 +15207,14 @@ def f(x, y):
         let blocks = [1usize as ObjPtr];
         let function = with_single_test_block(
             test_function(),
-            vec![op_expr(Call::new(
-                name_expr(test_runtime_name("tuple_values")),
-                vec![
-                    CallArgPositional::Positional(op_expr(Call::new(
-                        none_expr(),
-                        Vec::<CallArgPositional<InstrCodegen>>::new(),
-                        Vec::<CallArgKeyword<InstrCodegen>>::new(),
-                    ))),
-                    CallArgPositional::Positional(op_expr(Load::new(test_global_name("x")))),
-                ],
-                Vec::<CallArgKeyword<InstrCodegen>>::new(),
-            ))],
+            vec![tuple_expr(vec![
+                op_expr(Call::new(
+                    none_expr(),
+                    Vec::<CallArgPositional<InstrCodegen>>::new(),
+                    Vec::<CallArgKeyword<InstrCodegen>>::new(),
+                )),
+                op_expr(Load::new(test_global_name("x"))),
+            ])],
             ret_term(none_expr()),
         );
         let mut module = test_module(ModuleNameGen::new(0), vec![function]);
@@ -15277,16 +15260,10 @@ def f(x, y):
                 globals_obj: ObjPtr,
             }
 
-            let tuple_expr = op_expr(Call::new(
-                name_expr(test_runtime_name("tuple_values")),
-                vec![CallArgPositional::Positional(op_expr(Load::new(
-                    test_global_name("x"),
-                )))],
-                Vec::<CallArgKeyword<InstrCodegen>>::new(),
-            ));
+            let tuple_value_expr = tuple_expr(vec![op_expr(Load::new(test_global_name("x")))]);
             let mut function = with_single_test_block(
                 test_function(),
-                vec![assign_stmt(test_name("out"), tuple_expr)],
+                vec![assign_stmt(test_name("out"), tuple_value_expr)],
                 ret_term(name_expr(test_name("out"))),
             );
             set_stack_slots(&mut function, &["out"]);
@@ -15396,7 +15373,7 @@ def f(x, y):
             assert_eq!(
                 ffi::PyTuple_GetItem(result.cast::<ffi::PyObject>(), 0),
                 value.cast::<ffi::PyObject>(),
-                "deopt continuation should replay the nested global load into tuple_values"
+                "deopt continuation should replay the nested global load into Tuple"
             );
 
             ffi::Py_DECREF(result.cast::<ffi::PyObject>());
@@ -15604,18 +15581,14 @@ def f(x, y):
         let function = with_single_test_block(
             test_function(),
             vec![],
-            ret_term(op_expr(Call::new(
-                name_expr(test_runtime_name("tuple_values")),
-                vec![
-                    CallArgPositional::Positional(op_expr(Call::new(
-                        none_expr(),
-                        Vec::<CallArgPositional<InstrCodegen>>::new(),
-                        Vec::<CallArgKeyword<InstrCodegen>>::new(),
-                    ))),
-                    CallArgPositional::Positional(op_expr(Load::new(test_global_name("x")))),
-                ],
-                Vec::<CallArgKeyword<InstrCodegen>>::new(),
-            ))),
+            ret_term(tuple_expr(vec![
+                op_expr(Call::new(
+                    none_expr(),
+                    Vec::<CallArgPositional<InstrCodegen>>::new(),
+                    Vec::<CallArgKeyword<InstrCodegen>>::new(),
+                )),
+                op_expr(Load::new(test_global_name("x"))),
+            ])),
         );
         let mut module = test_module(ModuleNameGen::new(0), vec![function]);
         instrument_bb_module_with_call_target_counters(&mut module);
@@ -16380,20 +16353,16 @@ def f(x, y):
     }
 
     #[test]
-    fn specialized_jit_tuple_values_uses_runtime_tuple_helpers() {
+    fn specialized_jit_tuple_instruction_uses_runtime_tuple_helpers() {
         let blocks = [1usize as ObjPtr];
         let mut constants = TestConstantPool::default();
         let function = with_single_test_block(
             test_function(),
             vec![],
-            ret_term(op_expr(Call::new(
-                name_expr(test_runtime_name("tuple_values")),
-                vec![
-                    CallArgPositional::Positional(constants.int_expr(1)),
-                    CallArgPositional::Positional(constants.int_expr(2)),
-                ],
-                vec![],
-            ))),
+            ret_term(tuple_expr(vec![
+                constants.int_expr(1),
+                constants.int_expr(2),
+            ])),
         );
         let mut module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
         module.module_constants = constants.module_constants;
@@ -16415,22 +16384,22 @@ def f(x, y):
         assert_eq!(
             count_direct_calls_to_runtime_helpers(&built.ctx.func, &tuple_new_helpers),
             1,
-            "tuple_values should allocate via the tuple runtime helper"
+            "Tuple should allocate via the tuple runtime helper"
         );
         assert_eq!(
             count_direct_calls_to_runtime_helpers(&built.ctx.func, &tuple_set_item_helpers),
             1,
-            "tuple_values should fill via the fresh-tuple runtime helper"
+            "Tuple should fill via the fresh-tuple runtime helper"
         );
         assert_eq!(
             count_direct_calls_to_runtime_helpers(&built.ctx.func, &public_tuple_set_item_helpers),
             0,
-            "tuple_values should not call PyTuple_SetItem for fresh tuple stores"
+            "Tuple should not call PyTuple_SetItem for fresh tuple stores"
         );
         assert_eq!(
             count_direct_calls_to_runtime_helpers(&built.ctx.func, &vectorcall_helpers),
             0,
-            "tuple_values should not call the Python helper through vectorcall"
+            "Tuple should not call a Python helper through vectorcall"
         );
     }
 

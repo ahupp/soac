@@ -1787,6 +1787,7 @@ pub(super) fn emit_operation<'fb>(
 ) -> Option<ir::Value> {
     match operation {
         InstrCodegen::CalleeFunctionId(_) => None,
+        InstrCodegen::Tuple(_) => None,
         InstrCodegen::Call(_) => None,
         InstrCodegen::CallDirect(_) => None,
         InstrCodegen::BinOp(op) => emit_specialized_binop(op, state).or_else(|| {

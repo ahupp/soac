@@ -72,6 +72,9 @@ fn collect_helper_like_names_in_expr(out: &mut Vec<String>, expr: &InstrCodegen)
         InstrCodegen::UnaryOp(operation) => {
             operation.visit_children(&mut HelperNameVisitor { out });
         }
+        InstrCodegen::Tuple(operation) => {
+            operation.visit_children(&mut HelperNameVisitor { out });
+        }
         InstrCodegen::Load(operation) => {
             operation.visit_children(&mut HelperNameVisitor { out });
         }

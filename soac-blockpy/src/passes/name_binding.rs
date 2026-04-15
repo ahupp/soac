@@ -8,7 +8,7 @@ use crate::block_py::{
     FunctionId, FunctionKind, HasMeta, InstrLow, InstrResolved, InstrUnresolved, IntLiteral, Load,
     LocalLocation, MakeCell, MakeFunction, MakeFunctionWithClosure, MapFunction, MapInstr,
     Mappable, NameLike, NameLocation, NumberLiteral, NumberLiteralValue, ResolvedName, SetItem,
-    StorageLayout, Store, StringLiteral, UnresolvedName, Visit, VisitMut, WithMeta,
+    StorageLayout, Store, StringLiteral, Tuple, UnresolvedName, Visit, VisitMut, WithMeta,
 };
 use crate::passes::ruff_to_blockpy::{
     populate_exception_edge_args, rewrite_current_exception_in_core_blocks,
@@ -594,6 +594,7 @@ fn rewrite_deleted_name_loads_in_expr(
         }
         InstrUnresolved::BinOp(_)
         | InstrUnresolved::UnaryOp(_)
+        | InstrUnresolved::Tuple(_)
         | InstrUnresolved::Call(_)
         | InstrUnresolved::GetAttr(_)
         | InstrUnresolved::SetAttr(_)
@@ -1002,38 +1003,30 @@ impl NameBindingMapper<'_> {
         meta: crate::block_py::Meta,
         op: MakeFunction<InstrUnresolved>,
     ) -> InstrUnresolved {
-        let captures = self
+        let captures: Vec<InstrUnresolved> = self
             .callee_make_function_captures
             .get(&op.function_id)
             .into_iter()
             .flat_map(|captures| captures.iter())
             .map(|capture| {
-                core_runtime_positional_call_expr_with_meta(
-                    "tuple_values",
-                    meta.node_index.clone(),
-                    meta.range,
-                    vec![
-                        core_string_expr(
-                            capture.logical_name.clone(),
-                            meta.node_index.clone(),
-                            meta.range,
-                        ),
-                        rewrite_cell_ref_expr(
-                            capture.source_name.as_str(),
-                            self.scope,
-                            meta.node_index.clone(),
-                            meta.range,
-                        ),
-                    ],
-                )
+                Tuple::new(vec![
+                    core_string_expr(
+                        capture.logical_name.clone(),
+                        meta.node_index.clone(),
+                        meta.range,
+                    ),
+                    rewrite_cell_ref_expr(
+                        capture.source_name.as_str(),
+                        self.scope,
+                        meta.node_index.clone(),
+                        meta.range,
+                    ),
+                ])
+                .with_meta(meta.clone())
+                .into()
             })
             .collect::<Vec<_>>();
-        let captures_expr = core_runtime_positional_call_expr_with_meta(
-            "tuple_values",
-            meta.node_index.clone(),
-            meta.range,
-            captures,
-        );
+        let captures_expr: InstrUnresolved = Tuple::new(captures).with_meta(meta.clone()).into();
         MakeFunctionWithClosure::new(
             op.function_id,
             op.kind,
@@ -1326,6 +1319,7 @@ fn rewrite_raw_cell_loads_in_expr(
         }
         InstrUnresolved::BinOp(_)
         | InstrUnresolved::UnaryOp(_)
+        | InstrUnresolved::Tuple(_)
         | InstrUnresolved::GetAttr(_)
         | InstrUnresolved::SetAttr(_)
         | InstrUnresolved::GetItem(_)
@@ -1590,6 +1584,7 @@ fn collect_remaining_names_in_expr(expr: &InstrUnresolved, names: &mut HashSet<S
         InstrUnresolved::Literal(_)
         | InstrUnresolved::BinOp(_)
         | InstrUnresolved::UnaryOp(_)
+        | InstrUnresolved::Tuple(_)
         | InstrUnresolved::Call(_)
         | InstrUnresolved::GetAttr(_)
         | InstrUnresolved::SetAttr(_)
@@ -3078,7 +3073,6 @@ fn should_keep_runtime_bootstrap_name_as_constant(name: &ResolvedName) -> bool {
         || name.is_runtime_symbol("ELLIPSIS")
         || name.is_runtime_symbol("EMPTY_TUPLE")
         || name.is_runtime_symbol("ITER_COMPLETE")
-        || name.is_runtime_symbol("tuple_values")
         || name.is_runtime_symbol("raise_deleted_name")
         || name.is_runtime_symbol("create_class")
         || name.is_runtime_symbol("import_")

@@ -309,9 +309,42 @@ fn lowered_helper_call<'a>(
     Some(call)
 }
 
+fn lowered_variadic_helper_call<'a>(
+    expr: &'a InstrRuff,
+    expected_name: &str,
+) -> Option<&'a operation::Call<InstrRuff>> {
+    let InstrRuff::Call(call) = expr else {
+        return None;
+    };
+    if !call.keywords.is_empty() {
+        return None;
+    }
+    if !matches!(
+        call.func.as_ref(),
+        InstrRuff::ExprAttribute(attr_expr)
+            if matches!(attr_expr.value.as_ref(), InstrRuff::ExprName(name) if name.id.as_str() == "__soac__")
+                && attr_expr.attr.id.as_str() == expected_name
+    ) {
+        return None;
+    }
+    Some(call)
+}
+
 fn lower_direct_core_helper_expr(expr: &InstrRuff) -> Option<InstrWithAwaitAndYield> {
     fn lowered(expr: InstrRuff) -> InstrWithAwaitAndYield {
         <InstrWithAwaitAndYield as RuffToBlockPyExpr>::from_lowered_expr(expr)
+    }
+
+    if let Some(call) = lowered_variadic_helper_call(expr, "tuple_values") {
+        let values = call
+            .args
+            .iter()
+            .map(|arg| match arg {
+                crate::block_py::CallArgPositional::Positional(expr) => Some(lowered(expr.clone())),
+                crate::block_py::CallArgPositional::Starred(_) => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        return Some(operation::Tuple::new(values).with_meta(call.meta()).into());
     }
 
     if let Some(call) = lowered_helper_call(expr, "make_function", 5) {

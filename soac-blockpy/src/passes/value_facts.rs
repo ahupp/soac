@@ -526,6 +526,7 @@ impl FunctionFactInferer<'_> {
                     ValueFacts::unknown_pyobj()
                 }
             }
+            InstrCodegen::Tuple(_) => ValueFacts::PyObj(PyObjFacts::known_not_none()),
             _ => ValueFacts::unknown_pyobj(),
         }
     }

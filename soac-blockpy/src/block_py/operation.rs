@@ -149,6 +149,12 @@ define_operation! {
     }
 }
 
+define_operation! {
+    pub struct Tuple<E> {
+        values: Vec<E>,
+    }
+}
+
 #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct Call<E> {
     _meta: Meta,

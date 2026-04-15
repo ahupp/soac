@@ -19,7 +19,6 @@ const SOAC_RUNTIME_BOOTSTRAP_HELPER_NAMES: &[&str] = &[
     "locals",
     "eval",
     "exec",
-    "tuple_values",
     "create_class",
     "import_",
     "import_attr",
@@ -754,9 +753,6 @@ def code_with_freevars(names, is_async, is_generator):
         code = code.replace(co_freevars=names)
     _DP_CODE_WITH_FREEVARS_CACHE[cache_key] = code
     return code
-
-def tuple_values(*values):
-    return tuple(values)
 
 def create_class(
     name,

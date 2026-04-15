@@ -812,11 +812,8 @@ def f():
                 return false;
             };
             saw_make_function = true;
-            saw_empty_captures = runtime_call_by_name(&bb_module, &op.captures, "tuple_values")
-                .is_some_and(|call| call.args.is_empty());
-            saw_empty_defaults =
-                runtime_call_by_name(&bb_module, &op.param_defaults, "tuple_values")
-                    .is_some_and(|call| call.args.is_empty());
+            saw_empty_captures = matches!(op.captures.as_ref(), InstrResolved::Tuple(tuple) if tuple.values.is_empty());
+            saw_empty_defaults = matches!(op.param_defaults.as_ref(), InstrResolved::Tuple(tuple) if tuple.values.is_empty());
             op.function_id() == f.function_id && op.kind == FunctionKind::Function
         }),
         "expected module init to use MakeFunctionWithClosure, got {module_init:?}"
@@ -3487,10 +3484,11 @@ def make_counter(delta):
         InstrResolved::MakeFunctionWithClosure(make_function) => make_function.captures.as_ref(),
         other => panic!("resume should use MakeFunctionWithClosure, got {other:?}"),
     };
-    let captures_tuple = runtime_call_by_name(bb_module, captures_expr, "tuple_values")
-        .expect("captures should be tuple_values");
+    let InstrResolved::Tuple(captures_tuple) = captures_expr else {
+        panic!("captures should be Tuple, got {captures_expr:?}");
+    };
     assert_eq!(
-        captures_tuple.args.len(),
+        captures_tuple.values.len(),
         resume_layout.freevars.len(),
         "visible generator should materialize one closure capture per resume freevar:\n{}",
         lowering.name_binding_text(),

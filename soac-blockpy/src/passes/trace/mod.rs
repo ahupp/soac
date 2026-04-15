@@ -3,7 +3,7 @@ use crate::block_py::{
     core_call_expr_with_meta, literal_expr, BlockPyFunction, BlockPyModule, BlockTerm,
     CallArgPositional, ChildVisitable, CounterScope, CounterSite, DeoptEntrySource,
     IncrementCounter, InstrCodegen, InstrResolved, Load, Meta, NameLocation, ResolvedName,
-    StringLiteral, Visit, WithMeta,
+    StringLiteral, Tuple, Visit, WithMeta,
 };
 use crate::env_config::{SoacEnvConfig, SpecializationMode};
 use crate::passes::{
@@ -612,7 +612,7 @@ fn string_literal_expr(module_constants: &mut Vec<InstrResolved>, value: &str) -
 }
 
 fn tuple_expr(values: Vec<InstrCodegen>) -> InstrCodegen {
-    helper_call_expr("tuple_values", values)
+    Tuple::new(values).with_meta(Meta::synthetic()).into()
 }
 
 fn param_pairs_expr(
