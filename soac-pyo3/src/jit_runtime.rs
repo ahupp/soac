@@ -603,10 +603,16 @@ fn profile_watch_type_key_layout(type_obj: &Bound<'_, PyAny>) -> PyResult<()> {
     })
 }
 
+#[pyfunction]
+fn force_entry_interpreter_for_tests(enabled: bool) -> bool {
+    soac_jit::force_entry_interpreter_vectorcall_for_tests(enabled)
+}
+
 pub(crate) fn add_module_functions(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(create_module, module)?)?;
     module.add_function(wrap_pyfunction!(exec_module, module)?)?;
     module.add_function(wrap_pyfunction!(make_function, module)?)?;
     module.add_function(wrap_pyfunction!(profile_watch_type_key_layout, module)?)?;
+    module.add_function(wrap_pyfunction!(force_entry_interpreter_for_tests, module)?)?;
     Ok(())
 }

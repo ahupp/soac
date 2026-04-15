@@ -33,9 +33,7 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 #[cfg(test)]
 use pyo3::types::PyAnyMethods;
-#[cfg(test)]
-use soac_blockpy::block_py::FunctionKind;
-use soac_blockpy::block_py::{FunctionId, ParamKind};
+use soac_blockpy::block_py::{FunctionId, FunctionKind, ParamKind};
 use soac_blockpy::passes::CodegenModuleShape;
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::any::Any;
@@ -43,7 +41,6 @@ use std::ffi::{CString, c_char, c_void};
 use std::mem;
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr::{self, NonNull};
-#[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tracing::info;
@@ -402,7 +399,6 @@ struct PyFunctionJitExtra {
     previous_vectorcall: Option<ffi::vectorcallfunc>,
 }
 
-#[cfg(test)]
 static FORCE_ENTRY_INTERPRETER_VECTORCALL_FOR_TESTS: AtomicBool = AtomicBool::new(false);
 
 struct DirectArgParamBinding {
@@ -2052,7 +2048,6 @@ pub unsafe fn register_clif_vectorcall(
     let func = function as *mut ffi::PyFunctionObject;
     if !PyFunction_GetSoacMetadata(function).is_null() {
         let data = unsafe { py_function_jit_extra(function)? };
-        #[cfg(test)]
         if entry_interpreter_vectorcall_for_tests_enabled() {
             data.compiled_vectorcall_entry = None;
             if *data.function()?.lowered_kind() == FunctionKind::Function {
@@ -2093,10 +2088,8 @@ pub unsafe fn register_clif_vectorcall(
                 c"no specialized JIT plan found while registering vectorcall".as_ptr(),
             );
         })?;
-    #[cfg(test)]
     let blockpy_function_kind = *blockpy_function.lowered_kind();
     let blockpy_function_param_count = blockpy_function.params.len();
-    #[cfg(test)]
     if entry_interpreter_vectorcall_for_tests_enabled() {
         let data_ptr = make_clif_function_data(function, function_id, module_runtime)?;
         if PyFunction_SetSoacMetadata(
@@ -2165,23 +2158,32 @@ pub unsafe fn compile_clif_vectorcall(function: *mut ffi::PyObject) -> Result<()
     ensure_clif_vectorcall_compiled(py, function, data)
 }
 
-#[cfg(test)]
-pub(crate) fn force_entry_interpreter_vectorcall_for_tests(enabled: bool) -> bool {
+pub fn force_entry_interpreter_vectorcall_for_tests(enabled: bool) -> bool {
     FORCE_ENTRY_INTERPRETER_VECTORCALL_FOR_TESTS.swap(enabled, Ordering::SeqCst)
 }
 
-#[cfg(test)]
 fn entry_interpreter_vectorcall_for_tests_enabled() -> bool {
     FORCE_ENTRY_INTERPRETER_VECTORCALL_FOR_TESTS.load(Ordering::SeqCst)
 }
 
-#[cfg(test)]
+struct EntryInterpreterRecursiveCallGuard;
+
+impl Drop for EntryInterpreterRecursiveCallGuard {
+    fn drop(&mut self) {
+        unsafe { ffi::Py_LeaveRecursiveCall() };
+    }
+}
+
 unsafe extern "C" fn entry_interpreter_vectorcall_for_tests(
     callable: *mut ffi::PyObject,
     args: *const *mut ffi::PyObject,
     nargsf: usize,
     kwnames: *mut ffi::PyObject,
 ) -> *mut ffi::PyObject {
+    if ffi::Py_EnterRecursiveCall(c" while calling a Python object".as_ptr()) != 0 {
+        return ptr::null_mut();
+    }
+    let _recursive_call = EntryInterpreterRecursiveCallGuard;
     match panic::catch_unwind(AssertUnwindSafe(|| unsafe {
         run_registered_clif_function_from_vectorcall_entry(callable, args, nargsf, kwnames)
     })) {

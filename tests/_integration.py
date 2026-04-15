@@ -61,7 +61,7 @@ def split_integration_case(module_path: Path) -> tuple[str, str]:
 def _soac_env_for_mode(mode: str | None) -> Iterator[None]:
     prior_mode = os.environ.get("DIET_PYTHON_MODE")
     try:
-        if mode == "soac":
+        if mode in {"soac", "entry"}:
             os.environ["DIET_PYTHON_MODE"] = "transform"
         elif mode == "stock":
             os.environ.pop("DIET_PYTHON_MODE", None)
@@ -75,6 +75,15 @@ def _soac_env_for_mode(mode: str | None) -> Iterator[None]:
             os.environ.pop("DIET_PYTHON_MODE", None)
         else:
             os.environ["DIET_PYTHON_MODE"] = prior_mode
+
+
+@contextmanager
+def _force_entry_interpreter_for_tests(enabled: bool) -> Iterator[None]:
+    previous = _soac_ext.force_entry_interpreter_for_tests(enabled)
+    try:
+        yield
+    finally:
+        _soac_ext.force_entry_interpreter_for_tests(previous)
 
 
 def _print_integration_failure_context(module_path: Path, mode: str | None = None) -> None:
@@ -158,15 +167,16 @@ def _load_module(
     full_name = f"{package_name}.{module_name}"
 
     try:
-        if mode == "soac":
+        if mode in {"soac", "entry"}:
             os.environ["DIET_PYTHON_MODE"] = "transform"
             if prior_enabled_modules is None:
                 os.environ["SOAC_MODULE_ENABLED"] = f"path:{package_dir}"
             import_hook.install()
             sys.modules.pop(full_name, None)
             sys.modules.pop(package_name, None)
-            module = importlib.import_module(full_name)
-            yield module
+            with _force_entry_interpreter_for_tests(mode == "entry"):
+                module = importlib.import_module(full_name)
+                yield module
         elif mode == "stock":
             os.environ.pop("DIET_PYTHON_MODE", None)
             with _disable_import_hook():
@@ -218,7 +228,8 @@ def stock_module(
 def exec_integration_validation(
     validate_source: str, module: ModuleType, module_path: Path, *, mode: str
 ) -> None:
-    module.__dict__["__dp_integration_soac__"] = mode == "soac"
+    module.__dict__["__dp_integration_soac__"] = mode in {"soac", "entry"}
+    module.__dict__["__dp_integration_entry__"] = mode == "entry"
     module.__dict__["__dp_integration_mode__"] = mode
     globals_dict = dict(module.__dict__)
     exec(compile(validate_source, str(module_path), "exec"), globals_dict)
