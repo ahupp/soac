@@ -261,6 +261,10 @@ pub fn instrument_bb_module_with_call_target_counters(
         matches!(expr, InstrCodegen::GetAttr(_) | InstrCodegen::SetAttr(_))
     }
 
+    fn is_getitem_specialization_candidate(expr: &InstrCodegen) -> bool {
+        matches!(expr, InstrCodegen::GetItem(_))
+    }
+
     fn define_indexed_hit_fallback_counters(
         counters: &mut CounterBuilder<'_>,
         function_id: crate::block_py::FunctionId,
@@ -334,6 +338,33 @@ pub fn instrument_bb_module_with_call_target_counters(
                 self.counters.define_if_missing(
                     CounterScope::This,
                     "operator_specialized_fallback",
+                    CounterSite::Runtime {
+                        function_id: Some(self.function_id),
+                        instr_id: Some(instr_id),
+                    },
+                );
+            }
+            if is_getitem_specialization_candidate(expr) {
+                let instr_id = expr.semantic_instr_id();
+                self.counters.define_if_missing(
+                    CounterScope::This,
+                    "getitem_hot_shapes",
+                    CounterSite::Runtime {
+                        function_id: Some(self.function_id),
+                        instr_id: Some(instr_id),
+                    },
+                );
+                self.counters.define_if_missing(
+                    CounterScope::This,
+                    "getitem_specialized_hit",
+                    CounterSite::Runtime {
+                        function_id: Some(self.function_id),
+                        instr_id: Some(instr_id),
+                    },
+                );
+                self.counters.define_if_missing(
+                    CounterScope::This,
+                    "getitem_specialized_fallback",
                     CounterSite::Runtime {
                         function_id: Some(self.function_id),
                         instr_id: Some(instr_id),

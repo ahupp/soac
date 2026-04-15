@@ -462,6 +462,66 @@ apply/verify mode:
   - broader safe subsets of heap types, if we can prove the constructor
     protocol remains equivalent to the fast path
 
+## Operation Specializations
+
+SOAC keeps operation-level specializations in
+`soac-jit/src/jit/operation_specializations.rs` instead of spreading guarded
+fast paths through generic opcode lowering. The first implementation is concrete
+rather than framework-driven: `GetItem` emits an exact-list/exact-int arm and
+shares one generic fallback path.
+
+### Exact-List `GetItem`
+
+### Counted Input
+
+- Source input is `getitem_hot_shapes`.
+- The initial shape tag records exact `list` receiver with an exact `int` index.
+  Zero means "no specialized arm selected" and is ignored during profile
+  replay.
+- Verify mode also records `getitem_specialized_hit` and
+  `getitem_specialized_fallback` scalar counters for selected arms.
+
+### Codegen
+
+- `GetItem` lowering routes through the operation-specialization module.
+- Without counters or replayed hot shapes, `GetItem` stays on the generic
+  `PyObject_GetItem` path.
+- With `getitem_hot_shapes` counters, profile/verify mode records the dispatch
+  shape after evaluating operands, then uses the generic path unless a replayed
+  hot shape selected the specialized arm.
+- The first specialized arm guards:
+  - the object is exactly `PyList_Type`
+  - the index object is exactly `PyLong_Type`
+  - the normalized integer index is in bounds
+- On hit, codegen loads `PyListObject.ob_item[index]` directly, INCREFs the
+  borrowed list element, and returns the owned result expected by the current
+  legacy `GetItem` lowering path.
+- On miss, codegen falls back to `PyObject_GetItem` through the generic helper
+  path and records `getitem_specialized_fallback` in verify mode.
+
+### Limitations / Soundness / Extensions
+
+- Current limitations:
+  - only the exact-list/exact-int dispatch shape is recorded
+  - guard misses use the generic fallback path for now; deopt is deliberately
+    deferred until operation-specialization sites can guarantee a non-null
+    runtime deopt table in all apply/verify entry paths
+  - the current legacy path adapts the direct borrowed list element to owned
+    immediately; typed-result consumers should eventually preserve borrowed
+    ownership when their `ResultDemand` allows it
+  - only compact exact integers are unboxed directly; non-compact exact integers
+    fall back to the generic C API path
+- Soundness boundary:
+  - receiver and index exact types are guarded before direct layout reads
+  - non-list objects, list subclasses, non-exact-int indices, and out-of-bounds
+    indices fall back before direct list memory access
+- Natural extensions:
+  - add a separate list-compatible subclass arm guarded by mapping slot identity
+  - add richer operation dispatch tags for tuple, string, dict, and custom slots
+  - emit borrowed `EmitResult` for typed consumers instead of forcing an owned
+    legacy result
+  - add direct PyLong compact-int unboxing
+  - add matching list `SetItem` and tuple/string getitem arms
 
 ## Exact-Int Binary Operators
 

@@ -1,3 +1,4 @@
+use super::operation_specializations;
 use super::{
     ImportSpec, JitDeoptExitRef, JitEmitCtx, JitGuardMissDispatch, RelocTypeRef,
     SOAC_RUNTIME_LOAD_GLOBAL_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_IMPORT, SigType,
@@ -811,10 +812,6 @@ fn emit_make_cell<'fb>(
     state.finish_owned_result(result)
 }
 
-fn emit_getitem<'fb, E>(state: &mut impl OperationEmitState<'fb, E>, args: &[&E]) -> ir::Value {
-    state.emit_owned_func_call(state.ctx().pyobject_getitem_ref, &args)
-}
-
 fn emit_setitem<'fb, E>(state: &mut impl OperationEmitState<'fb, E>, args: &[&E]) -> ir::Value {
     state.emit_owned_func_call(state.ctx().pyobject_setitem_ref, &args)
 }
@@ -1415,7 +1412,7 @@ fn emit_specialized_unary_op<'fb>(
     Some(state.fb().block_params(result_block)[0])
 }
 
-fn increment_counter_with_state<'fb, E>(
+pub(super) fn increment_counter_with_state<'fb, E>(
     state: &mut impl OperationEmitState<'fb, E>,
     counter_id: Option<CounterId>,
 ) {
@@ -1837,9 +1834,7 @@ pub(super) fn emit_operation<'fb>(
                 Some(state.finish_owned_result(result))
             }
         }
-        InstrCodegen::GetItem(op) => {
-            Some(emit_getitem(state, &[op.value.as_ref(), op.index.as_ref()]))
-        }
+        InstrCodegen::GetItem(op) => Some(operation_specializations::emit_getitem(op, state)),
         InstrCodegen::SetItem(op) => Some(emit_setitem(
             state,
             &[

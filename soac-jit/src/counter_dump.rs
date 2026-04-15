@@ -675,6 +675,26 @@ pub fn collect_operator_specializations_for_function(
     Ok(out)
 }
 
+pub fn collect_getitem_specializations_for_function(
+    records: &[CounterDumpRecordView<'_>],
+    module_name: &str,
+    function_id: FunctionId,
+) -> Result<HashMap<InstrId, Vec<u64>>, String> {
+    let mut out = HashMap::<InstrId, Vec<u64>>::new();
+    let mut seen_shapes = HashSet::<(InstrId, u64)>::new();
+    for (entry_module_name, site_function_id, instr_id, observed_value) in
+        observed_value_entries_for_kind(records, "getitem_hot_shapes")?
+    {
+        if entry_module_name != module_name || site_function_id != function_id {
+            continue;
+        }
+        if seen_shapes.insert((instr_id, observed_value)) {
+            out.entry(instr_id).or_default().push(observed_value);
+        }
+    }
+    Ok(out)
+}
+
 pub fn collect_branch_preferences_for_function(
     records: &[CounterDumpRecordView<'_>],
     module_name: &str,
@@ -842,6 +862,16 @@ pub fn read_operator_specializations_from_file(
     let dump = CounterDumpFile::open(path)?;
     let records = dump.records()?;
     collect_operator_specializations_for_function(records.as_slice(), module_name, function_id)
+}
+
+pub fn read_getitem_specializations_from_file(
+    path: &Path,
+    module_name: &str,
+    function_id: FunctionId,
+) -> Result<HashMap<InstrId, Vec<u64>>, String> {
+    let dump = CounterDumpFile::open(path)?;
+    let records = dump.records()?;
+    collect_getitem_specializations_for_function(records.as_slice(), module_name, function_id)
 }
 
 pub fn read_branch_preferences_from_file(
@@ -1503,6 +1533,91 @@ mod tests {
         assert!(
             !collected.contains_key(&InstrId::new(BlockLabel::from_index(3), 1)),
             "operator specializations should filter other functions"
+        );
+    }
+
+    #[test]
+    fn collect_getitem_specializations_filters_and_deduplicates_shapes() {
+        let record = CounterDumpRecord {
+            source_hash: 0,
+            module_name: "mod".to_string(),
+            package_name: None,
+            module_keys: Vec::new(),
+            type_keys: Vec::new(),
+            type_table: Vec::new(),
+            rows: vec![
+                CounterDumpRow {
+                    counter_id: 1,
+                    scope: "this".to_string(),
+                    kind: "getitem_hot_shapes".to_string(),
+                    site_kind: "runtime".to_string(),
+                    function_id: Some(FunctionId::new(1, 7)),
+                    current_function_id: Some(FunctionId::new(1, 7)),
+                    instr_id: Some(InstrId::new(BlockLabel::from_index(2), 4)),
+                    function_qualname: Some("pkg.mod.f".to_string()),
+                    block_label: None,
+                    value: 11,
+                    observed_value: Some(1),
+                    max_overcount: Some(0),
+                },
+                CounterDumpRow {
+                    counter_id: 2,
+                    scope: "this".to_string(),
+                    kind: "getitem_hot_shapes".to_string(),
+                    site_kind: "runtime".to_string(),
+                    function_id: Some(FunctionId::new(1, 7)),
+                    current_function_id: Some(FunctionId::new(1, 7)),
+                    instr_id: Some(InstrId::new(BlockLabel::from_index(2), 4)),
+                    function_qualname: Some("pkg.mod.f".to_string()),
+                    block_label: None,
+                    value: 4,
+                    observed_value: Some(1),
+                    max_overcount: Some(0),
+                },
+                CounterDumpRow {
+                    counter_id: 3,
+                    scope: "this".to_string(),
+                    kind: "getitem_hot_shapes".to_string(),
+                    site_kind: "runtime".to_string(),
+                    function_id: Some(FunctionId::new(1, 8)),
+                    current_function_id: Some(FunctionId::new(1, 8)),
+                    instr_id: Some(InstrId::new(BlockLabel::from_index(3), 1)),
+                    function_qualname: Some("pkg.mod.g".to_string()),
+                    block_label: None,
+                    value: 7,
+                    observed_value: Some(1),
+                    max_overcount: Some(0),
+                },
+                CounterDumpRow {
+                    counter_id: 4,
+                    scope: "this".to_string(),
+                    kind: "getitem_hot_shapes".to_string(),
+                    site_kind: "runtime".to_string(),
+                    function_id: Some(FunctionId::new(1, 7)),
+                    current_function_id: Some(FunctionId::new(1, 7)),
+                    instr_id: Some(InstrId::new(BlockLabel::from_index(2), 4)),
+                    function_qualname: Some("pkg.mod.f".to_string()),
+                    block_label: None,
+                    value: 1,
+                    observed_value: Some(0),
+                    max_overcount: Some(0),
+                },
+            ],
+        };
+
+        let bytes = record.encode().expect("counter dump should encode");
+        let records =
+            parse_counter_dump_records(bytes.as_slice()).expect("counter dump should parse");
+        let collected =
+            collect_getitem_specializations_for_function(&records, "mod", FunctionId::new(1, 7))
+                .expect("getitem specializations should collect");
+        assert_eq!(
+            collected.get(&InstrId::new(BlockLabel::from_index(2), 4)),
+            Some(&vec![1])
+        );
+        assert!(
+            !collected.contains_key(&InstrId::new(BlockLabel::from_index(3), 1)),
+            "getitem specializations should filter other functions"
         );
     }
 

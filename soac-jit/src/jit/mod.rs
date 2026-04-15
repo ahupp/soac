@@ -10,7 +10,8 @@ use crate::counter::TopValueCounter;
 use crate::counter_dump::{
     CollectedTypeKeyLayout, CounterDumpFile, CounterDumpTypeKey, collect_type_key_layouts,
     collect_type_table, read_block_entry_counts_from_file, read_branch_preferences_from_file,
-    read_call_target_specializations_from_file, read_operator_specializations_from_file,
+    read_call_target_specializations_from_file, read_getitem_specializations_from_file,
+    read_operator_specializations_from_file,
 };
 use crate::module_constants::{ModuleCodegenConstants, ModuleConstantId};
 use crate::module_type::{CounterRuntimeSlot, SharedModuleState, build_counter_storage_layout};
@@ -66,6 +67,7 @@ unsafe extern "C" {
     static mut PyMethod_Type: ffi::PyTypeObject;
     static mut PyType_Type: ffi::PyTypeObject;
     static mut PyLong_Type: ffi::PyTypeObject;
+    static mut PyList_Type: ffi::PyTypeObject;
     static mut _PyDict_IndexedValueTombstone: i8;
     fn PyThreadState_GetUnchecked() -> *mut ffi::PyThreadState;
     fn PyUnstable_Type_AssignVersionTag(type_obj: *mut ffi::PyTypeObject) -> i32;
@@ -79,6 +81,7 @@ mod deopt_interpreter;
 mod direct_abi;
 mod intrinsics;
 mod jitdump;
+mod operation_specializations;
 mod planning;
 mod runtime_context;
 mod specialized_helpers;
@@ -166,6 +169,7 @@ fn cpython_type_symbol_name(symbol: CpythonTypeSymbol) -> &'static str {
         CpythonTypeSymbol::Method => "PyMethod_Type",
         CpythonTypeSymbol::Type => "PyType_Type",
         CpythonTypeSymbol::Long => "PyLong_Type",
+        CpythonTypeSymbol::List => "PyList_Type",
     }
 }
 
@@ -3888,6 +3892,10 @@ struct JitEmitCtx<'mc> {
     operator_specializations: &'mc HashMap<InstrId, Vec<u64>>,
     operator_specialized_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
     operator_specialized_fallback_counter_ids: &'mc HashMap<InstrId, CounterId>,
+    getitem_shape_counter_ids: &'mc HashMap<InstrId, CounterId>,
+    getitem_specializations: &'mc HashMap<InstrId, Vec<u64>>,
+    getitem_specialized_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
+    getitem_specialized_fallback_counter_ids: &'mc HashMap<InstrId, CounterId>,
     branch_outcome_counter_ids: &'mc HashMap<InstrId, CounterId>,
     branch_prefer_true: &'mc HashMap<InstrId, bool>,
     global_indexed_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
@@ -4620,6 +4628,7 @@ enum CpythonTypeSymbol {
     Method,
     Type,
     Long,
+    List,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -8261,6 +8270,19 @@ impl<'a> SpecializationProfile<'a> {
         read_operator_specializations_from_file(path, module_name, function_id)
     }
 
+    fn getitem_specializations(
+        &self,
+        function_id: FunctionId,
+    ) -> Result<HashMap<InstrId, Vec<u64>>, String> {
+        let Some(module_name) = self.module_name else {
+            return Ok(HashMap::new());
+        };
+        let Some(path) = existing_counter_dump_path(self.counter_dump_path.as_deref()) else {
+            return Ok(HashMap::new());
+        };
+        read_getitem_specializations_from_file(path, module_name, function_id)
+    }
+
     fn branch_preferences(
         &self,
         function_id: FunctionId,
@@ -8380,6 +8402,7 @@ fn cpython_type_symbol_for_type(owner_type: *mut ffi::PyTypeObject) -> Option<Cp
         ptr if ptr == std::ptr::addr_of_mut!(PyMethod_Type) => Some(CpythonTypeSymbol::Method),
         ptr if ptr == std::ptr::addr_of_mut!(PyType_Type) => Some(CpythonTypeSymbol::Type),
         ptr if ptr == std::ptr::addr_of_mut!(PyLong_Type) => Some(CpythonTypeSymbol::Long),
+        ptr if ptr == std::ptr::addr_of_mut!(PyList_Type) => Some(CpythonTypeSymbol::List),
         _ => None,
     }
 }
@@ -8390,6 +8413,7 @@ fn resolve_cpython_type_symbol(symbol: CpythonTypeSymbol) -> *mut ffi::PyTypeObj
         CpythonTypeSymbol::Method => std::ptr::addr_of_mut!(PyMethod_Type),
         CpythonTypeSymbol::Type => std::ptr::addr_of_mut!(PyType_Type),
         CpythonTypeSymbol::Long => std::ptr::addr_of_mut!(PyLong_Type),
+        CpythonTypeSymbol::List => std::ptr::addr_of_mut!(PyList_Type),
     }
 }
 
@@ -13919,6 +13943,10 @@ fn register_jit_builder_symbols(builder: &mut JITBuilder) {
         std::ptr::addr_of_mut!(PyLong_Type).cast::<u8>(),
     );
     builder.symbol(
+        cpython_type_symbol_name(CpythonTypeSymbol::List),
+        std::ptr::addr_of_mut!(PyList_Type).cast::<u8>(),
+    );
+    builder.symbol(
         "_PyDict_IndexedValueTombstone",
         std::ptr::addr_of_mut!(_PyDict_IndexedValueTombstone).cast::<u8>(),
     );
@@ -17227,6 +17255,21 @@ fn build_cranelift_run_bb_specialized_function(
         function.function_id,
         "operator_specialized_fallback",
     );
+    let getitem_shape_counter_ids = collect_runtime_counter_ids_by_kind(
+        counter_defs,
+        function.function_id,
+        "getitem_hot_shapes",
+    );
+    let getitem_specialized_hit_counter_ids = collect_runtime_counter_ids_by_kind(
+        counter_defs,
+        function.function_id,
+        "getitem_specialized_hit",
+    );
+    let getitem_specialized_fallback_counter_ids = collect_runtime_counter_ids_by_kind(
+        counter_defs,
+        function.function_id,
+        "getitem_specialized_fallback",
+    );
     let global_indexed_hit_counter_ids = collect_runtime_counter_ids_by_kind(
         counter_defs,
         function.function_id,
@@ -17258,6 +17301,7 @@ fn build_cranelift_run_bb_specialized_function(
     for counter_id in call_target_counter_ids
         .values()
         .chain(operator_shape_counter_ids.values())
+        .chain(getitem_shape_counter_ids.values())
         .chain(branch_outcome_counter_ids.values())
     {
         top_value_counter_slot_for_id(counter_slots_by_id, *counter_id).map_err(|_| {
@@ -17269,6 +17313,7 @@ fn build_cranelift_run_bb_specialized_function(
     }
     let requires_top_value_counters = !call_target_counter_ids.is_empty()
         || !operator_shape_counter_ids.is_empty()
+        || !getitem_shape_counter_ids.is_empty()
         || !branch_outcome_counter_ids.is_empty();
     if requires_top_value_counters && top_value_counter_data_id.is_none() {
         return Err(format!(
@@ -17280,6 +17325,8 @@ fn build_cranelift_run_bb_specialized_function(
         specialization_profile.call_target_specializations(function.function_id)?;
     let operator_specializations =
         specialization_profile.operator_specializations(function.function_id)?;
+    let getitem_specializations =
+        specialization_profile.getitem_specializations(function.function_id)?;
     let field_index_specializations = specialization_profile.field_index_specializations()?;
     let branch_prefer_true = specialization_profile.branch_preferences(function.function_id)?;
     let cold_block_labels = specialization_profile.cold_block_labels(function)?;
@@ -17899,6 +17946,10 @@ fn build_cranelift_run_bb_specialized_function(
                 operator_specialized_hit_counter_ids: &operator_specialized_hit_counter_ids,
                 operator_specialized_fallback_counter_ids:
                     &operator_specialized_fallback_counter_ids,
+                getitem_shape_counter_ids: &getitem_shape_counter_ids,
+                getitem_specializations: &getitem_specializations,
+                getitem_specialized_hit_counter_ids: &getitem_specialized_hit_counter_ids,
+                getitem_specialized_fallback_counter_ids: &getitem_specialized_fallback_counter_ids,
                 global_indexed_hit_counter_ids: &global_indexed_hit_counter_ids,
                 global_indexed_fallback_counter_ids: &global_indexed_fallback_counter_ids,
                 field_indexed_hit_counter_ids: &field_indexed_hit_counter_ids,
