@@ -5,6 +5,7 @@ pub(crate) mod blockpy_expr_simplify;
 mod blockpy_generators;
 pub mod blockpy_to_bb;
 pub(crate) mod core_await_lower;
+mod escape_analysis;
 mod global_index;
 mod instr_id;
 mod instrument;
@@ -666,6 +667,10 @@ impl ModuleShape for CodegenUnidentifiedModuleShape {
 
 pub(crate) use blockpy_generators::lower_yield_in_lowered_core_blockpy_module_bundle;
 pub use blockpy_to_bb::{lower_try_jump_exception_flow, normalize_bb_module_strings};
+pub use escape_analysis::{
+    summarize_module_escapes, ConstructorFieldStore, ConstructorFieldValue, EscapeSummaryModule,
+    FunctionEscapeSummary, NonEscapingConstructorSummary,
+};
 pub use instr_id::{
     assign_function_instr_ids, assign_module_instr_ids, validate_codegen_instr_ids,
 };

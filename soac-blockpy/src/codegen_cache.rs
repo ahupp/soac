@@ -3,8 +3,8 @@ use crate::block_py::{
     FunctionNameGen, ModuleNameGen, VisitMut,
 };
 use crate::passes::{
-    CodegenModuleShape, FactStore, InstrCodegen, LocalEnvModulePlan, LocalEnvResumeModulePlan,
-    RefcountPlan,
+    CodegenModuleShape, EscapeSummaryModule, FactStore, InstrCodegen, LocalEnvModulePlan,
+    LocalEnvResumeModulePlan, RefcountPlan,
 };
 use anyhow::{anyhow, Context, Result};
 use std::fs::{self, File};
@@ -12,7 +12,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const CODEGEN_MODULE_CACHE_MAGIC: &[u8] = b"SOAC_BLOCKPY_CODEGEN_CACHE\0";
-const CODEGEN_MODULE_CACHE_FORMAT_VERSION: u32 = 2;
+const CODEGEN_MODULE_CACHE_FORMAT_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PythonModuleCacheSource {
@@ -22,6 +22,7 @@ pub enum PythonModuleCacheSource {
 
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct CachedPreparedCodegen {
+    pub escape_summary: EscapeSummaryModule,
     pub value_facts: FactStore,
     pub ownership_plan: RefcountPlan,
     pub local_env_plan: LocalEnvModulePlan,
@@ -30,6 +31,7 @@ pub struct CachedPreparedCodegen {
 
 impl CachedPreparedCodegen {
     pub fn remap_function_ids(&mut self, remap: impl Fn(FunctionId) -> FunctionId + Copy) {
+        self.escape_summary.remap_function_ids(remap);
         self.value_facts.remap_function_ids(remap);
         self.ownership_plan.remap_function_ids(remap);
         self.local_env_plan.remap_function_ids(remap);
@@ -567,6 +569,7 @@ def outer(value):
         .expect("transform should succeed")
         .codegen_module;
         let prepared = prepared_codegen_for_module(&module);
+        let escape_function_count = prepared.escape_summary.functions.len();
         let value_fact_count = prepared.value_facts.expr_facts().count();
         let ownership_function_count = prepared.ownership_plan.functions.len();
         let local_env_function_count = prepared.local_env_plan.functions.len();
@@ -584,6 +587,10 @@ def outer(value):
             .expect("prepared codegen cache should be persisted");
 
         assert_eq!(summarize_module(&loaded.module), summarize_module(&module));
+        assert_eq!(
+            loaded_prepared.escape_summary.functions.len(),
+            escape_function_count
+        );
         assert_eq!(
             loaded_prepared.value_facts.expr_facts().count(),
             value_fact_count
@@ -626,6 +633,9 @@ def outer(value):
             .prepared
             .as_ref()
             .expect("prepared codegen cache should be preserved");
+        for function_id in prepared.escape_summary.functions.keys() {
+            assert_eq!(function_id.module_id(), 111);
+        }
         for (key, _) in prepared.value_facts.expr_facts() {
             assert_eq!(key.function_id.module_id(), 111);
         }
@@ -709,11 +719,13 @@ def outer(value):
         module: &BlockPyModule<CodegenModuleShape>,
     ) -> CachedPreparedCodegen {
         let value_facts = passes::infer_module_value_facts(module);
+        let escape_summary = passes::summarize_module_escapes(module);
         let ownership_plan = passes::plan_ownership_effects(module, &value_facts);
         let local_env_plan = passes::plan_local_env_module(module, &value_facts);
         let local_env_resume_plan =
             passes::plan_local_env_resume_module(module, &local_env_plan, &value_facts);
         CachedPreparedCodegen {
+            escape_summary,
             value_facts,
             ownership_plan,
             local_env_plan,
