@@ -1,7 +1,7 @@
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::types::{PyModule, PyTuple};
+use pyo3::types::PyModule;
 use std::ffi::{CStr, CString, c_char, c_int};
 use std::mem::{self, offset_of};
 use std::ptr;
@@ -646,25 +646,11 @@ fn build_soac_runtime_bootstrap_runtime_name(py: Python<'_>, bytes: &[u8]) -> Py
             .unbind());
     }
     match name {
-        "TRUE" => {
-            let ptr = unsafe { ffi::PyBool_FromLong(1) };
-            let bound: Bound<'_, PyAny> = unsafe { Bound::from_owned_ptr_or_err(py, ptr)? };
-            Ok(bound.unbind())
+        "TRUE" | "FALSE" | "NONE" | "ELLIPSIS" | "EMPTY_TUPLE" | "ITER_COMPLETE" => {
+            Ok(PyModule::import(py, "soac.constants")?
+                .getattr(name)?
+                .unbind())
         }
-        "FALSE" => {
-            let ptr = unsafe { ffi::PyBool_FromLong(0) };
-            let bound: Bound<'_, PyAny> = unsafe { Bound::from_owned_ptr_or_err(py, ptr)? };
-            Ok(bound.unbind())
-        }
-        "NONE" => Ok(py.None().into_any()),
-        "ELLIPSIS" => Ok(PyModule::import(py, "builtins")?
-            .getattr("Ellipsis")?
-            .unbind()),
-        "EMPTY_TUPLE" => Ok(PyTuple::empty(py).clone().into_any().unbind()),
-        "ITER_COMPLETE" => Ok(PyModule::import(py, "builtins")?
-            .getattr("object")?
-            .call0()?
-            .unbind()),
         other => Err(PyRuntimeError::new_err(format!(
             "soac.runtime bootstrap cannot build runtime-name constant {other:?}; \
              it should have been lowered as a global name"

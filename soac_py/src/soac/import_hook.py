@@ -69,6 +69,12 @@ def _should_transform(path: str) -> bool:
     return True
 
 
+def _should_transform_module(fullname: str, path: str) -> bool:
+    if fullname == "soac.constants":
+        return False
+    return _should_transform(path)
+
+
 def _source_path_for_frozen_spec(spec):
     loader_state = getattr(spec, "loader_state", None)
     filename = getattr(loader_state, "filename", None)
@@ -137,7 +143,7 @@ class SoacFinder(importlib.machinery.PathFinder):
         if (
             isinstance(spec.loader, importlib.machinery.SourceFileLoader)
             and spec.origin
-            and _should_transform(spec.origin)
+            and _should_transform_module(fullname, spec.origin)
         ):
             spec.loader = SoacLoader(fullname, spec.origin)
         elif (
@@ -146,7 +152,7 @@ class SoacFinder(importlib.machinery.PathFinder):
             and not _is_cpython_frozen_fixture(spec)
         ):
             source_path = _source_path_for_frozen_spec(spec)
-            if source_path and _should_transform(source_path):
+            if source_path and _should_transform_module(fullname, source_path):
                 spec.origin = source_path
                 spec.has_location = True
                 spec.loader = SoacLoader(fullname, source_path)

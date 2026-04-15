@@ -234,12 +234,12 @@ fn transformed_module_methods_register_owner_types_for_lookup() {
     initialize_test_python();
     Python::attach(|py| unsafe {
         let ext = PyModule::new(py, "_soac_ext").expect("extension module should allocate");
-        crate::_soac_ext(py, &ext).expect("extension init should succeed");
         let sys = py.import("sys").expect("sys should import");
         let modules = sys.getattr("modules").expect("sys.modules should exist");
         modules
             .set_item("_soac_ext", &ext)
             .expect("sys.modules should accept _soac_ext");
+        crate::_soac_ext(py, &ext).expect("extension init should succeed");
         let importlib = py
             .import("importlib.machinery")
             .expect("importlib.machinery should import");

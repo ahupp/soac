@@ -1,11 +1,15 @@
-NO_DEFAULT = object()
-ELLIPSIS = Ellipsis
-TRUE = True
-FALSE = False
-NONE = None
-EMPTY_TUPLE = ()
+from .constants import (
+    ANNOTATION_FORWARDREF_MISSING as _ANNOTATION_FORWARDREF_MISSING,
+    ELLIPSIS,
+    EMPTY_TUPLE,
+    FALSE,
+    ITER_COMPLETE,
+    NO_DEFAULT,
+    NONE,
+    TRUE,
+)
+
 _SOAC_RUNTIME_READY = False
-_ANNOTATION_FORWARDREF_MISSING = object()
 
 import collections.abc as _abc
 import keyword as _keyword
@@ -885,12 +889,6 @@ def await_iter(awaitable):
             f"object {awaitable_type!r} can't be used in 'await' expression"
         ) from None
     return iterator
-
-
-try:
-    ITER_COMPLETE
-except NameError:
-    ITER_COMPLETE = object()
 
 
 async def anext_or_sentinel(iterator):

@@ -7,7 +7,7 @@ use soac_blockpy::block_py::{BlockPyFunction, BlockPyModule, FunctionId};
 use soac_blockpy::passes::CodegenModuleShape;
 use soac_blockpy::{LoweringOptions, lower_python_to_blockpy_recorded_with_options};
 use soac_jit::config::module_cache_root_from_env_or_repo;
-use soac_jit::module_type::{ModuleInfo, SharedModuleState, SoacExtModule, hash_module_source};
+use soac_jit::module_type::{ModuleInfo, SoacExtModule, hash_module_source};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -19,23 +19,6 @@ const SOAC_BUILD_IDENTITY: &str = env!("SOAC_BUILD_IDENTITY");
 
 fn import_dp_module<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyModule>> {
     PyModule::import(py, "soac.runtime")
-}
-
-fn install_soac_runtime_bootstrap_sentinel<'py>(
-    py: Python<'py>,
-    globals: &Bound<'py, PyDict>,
-    shared_state: &SharedModuleState,
-    name: &str,
-) -> PyResult<Bound<'py, PyAny>> {
-    let id = shared_state
-        .codegen_constants
-        .require_runtime_name_constant_id(name);
-    let obj = shared_state.module_constant_obj(id).ok_or_else(|| {
-        PyRuntimeError::new_err(format!("missing runtime bootstrap constant {name:?}"))
-    })?;
-    let obj = obj.bind(py).clone();
-    globals.set_item(name, &obj)?;
-    Ok(obj)
 }
 
 struct SoacRuntimeBootstrapGlobals {
@@ -54,10 +37,8 @@ impl SoacRuntimeBootstrapGlobals {
 fn install_soac_runtime_bootstrap_globals(
     py: Python<'_>,
     globals: &Bound<'_, PyDict>,
-    shared_state: &SharedModuleState,
 ) -> PyResult<SoacRuntimeBootstrapGlobals> {
     let bootstrap = soac_jit::module_constants::build_soac_runtime_bootstrap_module(py)?;
-    install_soac_runtime_bootstrap_sentinel(py, globals, shared_state, "ITER_COMPLETE")?;
     let mut helpers = Vec::new();
     for name in [
         "_entry_template",
@@ -542,7 +523,7 @@ fn exec_module_inner(
             Some(time_phase(
                 exec_timings,
                 "install_soac_runtime_bootstrap",
-                || install_soac_runtime_bootstrap_globals(py, globals, &module_data.shared_state),
+                || install_soac_runtime_bootstrap_globals(py, globals),
             )?)
         } else {
             None

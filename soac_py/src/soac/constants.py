@@ -1,0 +1,9 @@
+NO_DEFAULT = object()
+ELLIPSIS = Ellipsis
+TRUE = True
+FALSE = False
+NONE = None
+EMPTY_TUPLE = ()
+ITER_COMPLETE = object()
+ANNOTATION_FORWARDREF_MISSING = object()
+
