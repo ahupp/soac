@@ -18383,7 +18383,7 @@ def f(x, y):
                             Param {
                                 name: "x".into(),
                                 kind: ParamKind::Any,
-                                has_default: false,
+                                has_default: true,
                             },
                         ],
                     },
@@ -18423,7 +18423,7 @@ def f(x, y):
                         term: ret_term(with_instr_id(
                             op_expr(Call::new(
                                 name_expr(test_global_name("Record")),
-                                vec![CallArgPositional::Positional(constants.int_expr(1))],
+                                vec![],
                                 vec![],
                             )),
                             call_instr_id,
@@ -18498,7 +18498,7 @@ def f(x, y):
                     .set_item("__name__", "counter_test")
                     .expect("globals should accept __name__");
                 let class_source = std::ffi::CString::new(
-                    "class Record:\n    def __init__(self, x):\n        self.x = x\n",
+                    "class Record:\n    def __init__(self, x=1):\n        self.x = x\n",
                 )
                 .expect("class source should be CString-compatible");
                 let run_result = ffi::PyRun_StringFlags(

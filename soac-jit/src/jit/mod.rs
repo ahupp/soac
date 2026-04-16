@@ -5746,6 +5746,7 @@ struct JitEmitCtx<'mc> {
     pyobject_setitem_ref: ir::FuncRef,
     py_long_from_i64_ref: ir::FuncRef,
     raise_deleted_name_error_ref: ir::FuncRef,
+    raise_missing_required_argument_ref: ir::FuncRef,
     make_function_with_closure_ref: ir::FuncRef,
     make_cell_ref: ir::FuncRef,
     load_cell_ref: ir::FuncRef,
@@ -11344,21 +11345,46 @@ fn emit_straightline_constructor_initializer_inline(
     init_arg_values: &[ir::Value],
     init_arg_borrowed: &[bool],
     specialization: &DirectConstructorSpecialization,
+    target_function: &BlockPyFunction<CodegenModuleShape>,
     ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
 ) -> Option<ir::Value> {
-    if specialization.arg_plan.requires_default_resolving_entry() {
-        return None;
-    }
     let plan = ctx
         .inline_plan
         .straightline_constructor(specialization.function_id)?;
-    let mut field_values = Vec::with_capacity(plan.field_stores.len());
-    for store in &plan.field_stores {
-        let ConstructorFieldValue::Param { index, .. } = store.value else {
-            return None;
-        };
+    let field_stores = plan
+        .field_stores
+        .iter()
+        .map(|store| {
+            let ConstructorFieldValue::Param { index, .. } = store.value else {
+                return None;
+            };
+            Some((store.field_name.as_str(), index))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if init_arg_values.len() != target_function.params.len()
+        || init_arg_borrowed.len() != target_function.params.len()
+        || specialization.arg_plan.sources.len() != target_function.params.len()
+        || field_stores
+            .iter()
+            .any(|(_, param_index)| *param_index >= init_arg_values.len())
+    {
+        return None;
+    }
+    let (init_arg_values, init_arg_borrowed) = emit_resolved_straightline_constructor_init_args(
+        fb,
+        allocated,
+        init_arg_values,
+        init_arg_borrowed,
+        specialization,
+        target_function,
+        ctx,
+        jit_module,
+    )?;
+    let mut field_values = Vec::with_capacity(field_stores.len());
+    for (field_name, index) in field_stores {
         let value = *init_arg_values.get(index)?;
-        field_values.push((store.field_name.as_str(), value));
+        field_values.push((field_name, value));
     }
 
     let owned_init_args = init_arg_values
@@ -11397,6 +11423,113 @@ fn emit_straightline_constructor_initializer_inline(
     }
     emit_release_owned_inputs(fb, ctx, &owned_init_args);
     Some(allocated)
+}
+
+fn emit_resolved_straightline_constructor_init_args(
+    fb: &mut FunctionBuilder<'_>,
+    allocated: ir::Value,
+    init_arg_values: &[ir::Value],
+    init_arg_borrowed: &[bool],
+    specialization: &DirectConstructorSpecialization,
+    target_function: &BlockPyFunction<CodegenModuleShape>,
+    ctx: &JitEmitCtx<'_>,
+    jit_module: &mut JITModule,
+) -> Option<(Vec<ir::Value>, Vec<bool>)> {
+    if !specialization.arg_plan.requires_default_resolving_entry() {
+        return Some((init_arg_values.to_vec(), init_arg_borrowed.to_vec()));
+    }
+
+    let init_callable =
+        emit_callable_ptr_value_for_ref(fb, jit_module, ctx, &specialization.init_function_ref)
+            .unwrap_or_else(|err| panic!("failed to bind constructor callable symbol: {err}"))?;
+    let ptr_ty = ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let missing_block = fb.create_block();
+    fb.set_cold_block(missing_block);
+
+    let function_env = emit_direct_function_env_load(fb, init_callable, ctx);
+    let function_env_is_null = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, function_env, null_ptr);
+    let function_env_ok_block = fb.create_block();
+    fb.ins().brif(
+        function_env_is_null,
+        missing_block,
+        &[],
+        function_env_ok_block,
+        &[],
+    );
+    fb.switch_to_block(function_env_ok_block);
+    let function_data = fb
+        .ins()
+        .iadd_imm(function_env, i64::from(FUNCTION_ENV_RUNTIME_OBJECTS_OFFSET));
+    let runtime_layout = FunctionRuntimeDataLayout::from_function(target_function);
+
+    let mut selected_args = Vec::with_capacity(init_arg_values.len());
+    let mut selected_borrowed = Vec::with_capacity(init_arg_borrowed.len());
+    for (param_index, ((param, source), (arg_value, arg_borrowed))) in target_function
+        .params
+        .iter()
+        .zip(specialization.arg_plan.sources.iter())
+        .zip(
+            init_arg_values
+                .iter()
+                .copied()
+                .zip(init_arg_borrowed.iter().copied()),
+        )
+        .enumerate()
+    {
+        match source {
+            DirectCallArgSource::Provided(_) => {
+                selected_args.push(arg_value);
+                selected_borrowed.push(arg_borrowed);
+            }
+            DirectCallArgSource::DefaultSentinel => {
+                let default_slot = param_runtime_default_slot(&runtime_layout, param, param_index)
+                    .expect("default sentinel should have a runtime default slot");
+                let default_value =
+                    emit_function_data_slot_borrowed(fb, function_data, default_slot, ptr_ty);
+                let default_is_missing =
+                    fb.ins()
+                        .icmp(ir::condcodes::IntCC::Equal, default_value, null_ptr);
+                let default_ok_block = fb.create_block();
+                fb.ins().brif(
+                    default_is_missing,
+                    missing_block,
+                    &[],
+                    default_ok_block,
+                    &[],
+                );
+                fb.switch_to_block(default_ok_block);
+                selected_args.push(default_value);
+                selected_borrowed.push(true);
+            }
+        }
+    }
+
+    let resume_block = fb.create_block();
+    for _ in &selected_args {
+        fb.append_block_param(resume_block, ptr_ty);
+    }
+    fb.ins()
+        .jump(resume_block, &block_arg_values(&selected_args));
+
+    fb.switch_to_block(missing_block);
+    fb.ins().call(ctx.raise_missing_required_argument_ref, &[]);
+    emit_release_owned_inputs(fb, ctx, &[allocated]);
+    let owned_init_args = init_arg_values
+        .iter()
+        .copied()
+        .zip(init_arg_borrowed.iter().copied())
+        .filter_map(|(value, borrowed)| (!borrowed).then_some(value))
+        .collect::<Vec<_>>();
+    emit_release_owned_inputs(fb, ctx, &owned_init_args);
+    fb.ins()
+        .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
+
+    fb.switch_to_block(resume_block);
+    let resolved_args = fb.block_params(resume_block).to_vec();
+    Some((resolved_args, selected_borrowed))
 }
 
 fn constructor_field_index_specialization<'a>(
@@ -11556,7 +11689,9 @@ fn emit_direct_constructor_resolved_with_arg_values(
         init_arg_values.as_slice(),
         init_arg_borrowed.as_slice(),
         specialization,
+        target_function,
         ctx,
+        jit_module,
     ) {
         return result;
     }
@@ -19736,6 +19871,11 @@ fn build_cranelift_run_bb_specialized_function(
             &mut fb.func,
             &DP_JIT_RAISE_DELETED_NAME_ERROR_IMPORT,
         );
+        let raise_missing_required_argument_ref = func_imports.get_or_panic(
+            jit_module,
+            &mut fb.func,
+            &DP_JIT_RAISE_MISSING_REQUIRED_ARGUMENT_IMPORT,
+        );
         let make_function_with_closure_ref = func_imports.get_or_panic(
             codegen_env,
             &mut fb.func,
@@ -19998,6 +20138,7 @@ fn build_cranelift_run_bb_specialized_function(
                 pyobject_setitem_ref,
                 py_long_from_i64_ref,
                 raise_deleted_name_error_ref,
+                raise_missing_required_argument_ref,
                 make_function_with_closure_ref,
                 make_cell_ref,
                 load_cell_ref,

@@ -430,6 +430,9 @@ apply/verify mode:
   - when the BlockPy inline plan proves `__init__` is a straight-line
     field initializer from constructor parameters, emits those
     `self.field = param` stores directly and skips the `__init__` call
+  - resolves omitted defaulted initializer parameters from the
+    transformed function's runtime default slots before emitting
+    inlined field stores
   - if the profiled type-key layout has a matching field-index
     specialization for the guarded constructor owner type, tries
     `soac_runtime_store_field_indexed` for the inlined field store and
@@ -459,8 +462,7 @@ apply/verify mode:
   - no custom allocator
   - no abstract types
   - initializer inlining currently covers only parameter-to-field
-    stores, and only when the direct-call arg plan does not need the
-    default-resolving entry path
+    stores
   - initializer indexed stores are limited to field names that also
     have type-key layout profile input for the exact guarded owner type
 - Soundness boundary:
