@@ -59,7 +59,7 @@ use soac_blockpy::passes::{
     TypedDirectCallableCallGuard, TypedDirectConstructorCallGuard, TypedDirectFunctionCallGuard,
     TypedDirectMethodCall, TypedDirectMethodCallGuard, TypedGetAttr, TypedGuardedCallableCall,
     TypedGuardedMethodCall, TypedIndexedFieldGuard, TypedSetAttr, ValueFacts,
-    assign_missing_codegen_function_instr_ids,
+    annotate_typed_function_value_facts, assign_missing_codegen_function_instr_ids,
     build_cross_module_direct_method_inline_fragment_to_target,
     build_direct_method_inline_fragment_to_target, infer_module_value_facts,
     inline_direct_call_stores_with_callees, lower_codegen_function_to_typed,
@@ -9278,29 +9278,20 @@ fn py_facts_for_typed_expr_with_local_env(
         }) {
             return Some(PyObjFacts::exact_type(PyExactType::Int));
         }
-        return op
-            .try_semantic_instr_id()
-            .and_then(|instr_id| ctx.value_facts_for_instr_id(instr_id))
-            .and_then(ValueFacts::as_pyobj);
+        return op.extra().result_facts().and_then(ValueFacts::as_pyobj);
     }
-    expr.try_semantic_instr_id()
-        .and_then(|instr_id| ctx.value_facts_for_instr_id(instr_id))
-        .and_then(ValueFacts::as_pyobj)
+    expr.result_facts().and_then(ValueFacts::as_pyobj)
 }
 
 fn local_ref_kind_for_typed_stored_value(
     value: &InstrTyped,
     ownership: ValueOwnership,
-    ctx: &JitEmitCtx<'_>,
+    _ctx: &JitEmitCtx<'_>,
 ) -> LocalRefKind {
     if matches!(ownership, ValueOwnership::Immortal) {
         return LocalRefKind::Immortal;
     }
-    match value
-        .try_semantic_instr_id()
-        .and_then(|instr_id| ctx.value_facts_for_instr_id(instr_id))
-        .and_then(ValueFacts::as_pyobj)
-    {
+    match value.result_facts().and_then(ValueFacts::as_pyobj) {
         Some(facts) if facts.is_immortal() => LocalRefKind::Immortal,
         _ => LocalRefKind::Owned,
     }
@@ -15574,8 +15565,8 @@ fn emit_typed_codegen_expr_value_with_local_env(
 ) -> Result<SoacValue, String> {
     if let InstrTyped::Load(op) = expr {
         let facts = op
-            .try_semantic_instr_id()
-            .and_then(|instr_id| emit_ctx.value_facts_for_instr_id(instr_id))
+            .extra()
+            .result_facts()
             .and_then(ValueFacts::as_pyobj)
             .unwrap_or_else(PyObjFacts::unknown);
         let value = emit_resolved_name_load_with_local_env(
@@ -23281,13 +23272,15 @@ fn validate_typed_function_preserves_codegen_cfg(
 fn prepare_specialized_typed_function(
     module: &BlockPyModule<CodegenModuleShape>,
     function: &BlockPyFunction<CodegenModuleShape>,
+    value_facts: &FactStore,
     field_index_specializations: &HashMap<String, Vec<FieldIndexSpecialization>>,
     specialize_field_stores: bool,
     call_specialization_ctx: &CallSpecializationCtx<'_>,
     call_target_specializations: &HashMap<InstrId, Vec<FunctionId>>,
 ) -> Result<PreparedSpecializedTypedFunction, String> {
-    let mut typed_function =
-        lower_typed_function_if_tests_to_truthy(lower_codegen_function_to_typed(function.clone()));
+    let mut typed_function = lower_codegen_function_to_typed(function.clone());
+    annotate_typed_function_value_facts(&mut typed_function, value_facts);
+    let mut typed_function = lower_typed_function_if_tests_to_truthy(typed_function);
 
     annotate_typed_attr_accesses(
         module,
@@ -23538,6 +23531,7 @@ fn build_cranelift_run_bb_specialized_function(
     } = prepare_specialized_typed_function(
         module,
         function,
+        value_facts,
         &field_index_specializations,
         behavior_change_indexed_stores,
         &call_specialization_ctx,

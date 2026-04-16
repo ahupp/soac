@@ -28,7 +28,7 @@ use crate::block_py::{
     ExprEllipsisLiteral, ExprFString, ExprGenerator, ExprIf, ExprIpyEscapeCommand, ExprLambda,
     ExprList, ExprListComp, ExprName, ExprNamed, ExprNoneLiteral, ExprNumberLiteral, ExprSet,
     ExprSetComp, ExprSlice, ExprStarred, ExprStringLiteral, ExprSubscript, ExprTString, ExprTuple,
-    FunctionId, GetAttr, GetItem, HasMeta, IdentifiedInstr, IncrementCounter, Instr,
+    FunctionId, GetAttr, GetItem, HasMeta, IdentifiedInstr, IncrementCounter, Instr, InstrKey,
     InstrWithConstantNone, LiteralValue, Load, LocalLocation, MakeCell, MakeFunction,
     MakeFunctionWithClosure, MapFunction, MapInstr, MapModule, Mappable, Meta, ModuleShape,
     NameLike, NameLocation, ResolvedName, RuntimeName, SetAttr, SetItem, StmtAnnAssign, StmtAssert,
@@ -1589,6 +1589,29 @@ pub enum InstrTyped {
 
 pub type InstrTypedCodegen = InstrTyped;
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TypedInstrExtra {
+    pub result_facts: Option<ValueFacts>,
+}
+
+impl TypedInstrExtra {
+    pub fn result_facts(&self) -> Option<ValueFacts> {
+        self.result_facts
+    }
+
+    pub fn refine_result_facts(&mut self, facts: ValueFacts) -> bool {
+        if self.result_facts == Some(facts) {
+            return false;
+        }
+        self.result_facts = Some(facts);
+        true
+    }
+
+    pub fn clear_result_facts(&mut self) -> bool {
+        self.result_facts.take().is_some()
+    }
+}
+
 impl InstrTyped {
     pub fn is_legacy(&self) -> bool {
         matches!(
@@ -1611,11 +1634,77 @@ impl InstrTyped {
                 | Self::LegacyMakeFunctionWithClosure(_)
         )
     }
+
+    pub fn typed_extra(&self) -> Option<&TypedInstrExtra> {
+        match self {
+            Self::Truthy(op) => Some(&op.extra),
+            Self::Load(op) => Some(op.extra()),
+            Self::BinOp(op) => Some(op.extra()),
+            Self::LegacyTuple(op) => Some(op.extra()),
+            Self::LegacyUnaryOp(op) => Some(op.extra()),
+            Self::LegacyCalleeFunctionId(op) => Some(op.extra()),
+            Self::CallTyped(op) => Some(&op.extra),
+            Self::GuardedCallableCallTyped(op) => Some(&op.extra),
+            Self::GuardedMethodCallTyped(op) => Some(&op.extra),
+            Self::DirectCallableCallTyped(op) => Some(&op.extra),
+            Self::DirectMethodCallTyped(op) => Some(&op.extra),
+            Self::DirectCallGuardTest(op) => Some(&op.extra),
+            Self::LegacyCall(op) => Some(op.extra()),
+            Self::LegacyCallDirect(op) => Some(op.extra()),
+            Self::GetAttrTyped(op) => Some(&op.extra),
+            Self::SetAttrTyped(op) => Some(&op.extra),
+            Self::LegacyGetAttr(op) => Some(op.extra()),
+            Self::LegacySetAttr(op) => Some(op.extra()),
+            Self::LegacyGetItem(op) => Some(op.extra()),
+            Self::LegacySetItem(op) => Some(op.extra()),
+            Self::LegacyDelItem(op) => Some(op.extra()),
+            Self::LegacyStore(op) => Some(op.extra()),
+            Self::LegacyDel(op) => Some(op.extra()),
+            Self::LegacyMakeCell(op) => Some(op.extra()),
+            Self::LegacyMakeFunctionWithClosure(op) => Some(op.extra()),
+            Self::LegacyIncrementCounter(_) | Self::LegacyCellRef(_) => None,
+        }
+    }
+
+    pub fn typed_extra_mut(&mut self) -> Option<&mut TypedInstrExtra> {
+        match self {
+            Self::Truthy(op) => Some(&mut op.extra),
+            Self::Load(op) => Some(op.extra_mut()),
+            Self::BinOp(op) => Some(op.extra_mut()),
+            Self::LegacyTuple(op) => Some(op.extra_mut()),
+            Self::LegacyUnaryOp(op) => Some(op.extra_mut()),
+            Self::LegacyCalleeFunctionId(op) => Some(op.extra_mut()),
+            Self::CallTyped(op) => Some(&mut op.extra),
+            Self::GuardedCallableCallTyped(op) => Some(&mut op.extra),
+            Self::GuardedMethodCallTyped(op) => Some(&mut op.extra),
+            Self::DirectCallableCallTyped(op) => Some(&mut op.extra),
+            Self::DirectMethodCallTyped(op) => Some(&mut op.extra),
+            Self::DirectCallGuardTest(op) => Some(&mut op.extra),
+            Self::LegacyCall(op) => Some(op.extra_mut()),
+            Self::LegacyCallDirect(op) => Some(op.extra_mut()),
+            Self::GetAttrTyped(op) => Some(&mut op.extra),
+            Self::SetAttrTyped(op) => Some(&mut op.extra),
+            Self::LegacyGetAttr(op) => Some(op.extra_mut()),
+            Self::LegacySetAttr(op) => Some(op.extra_mut()),
+            Self::LegacyGetItem(op) => Some(op.extra_mut()),
+            Self::LegacySetItem(op) => Some(op.extra_mut()),
+            Self::LegacyDelItem(op) => Some(op.extra_mut()),
+            Self::LegacyStore(op) => Some(op.extra_mut()),
+            Self::LegacyDel(op) => Some(op.extra_mut()),
+            Self::LegacyMakeCell(op) => Some(op.extra_mut()),
+            Self::LegacyMakeFunctionWithClosure(op) => Some(op.extra_mut()),
+            Self::LegacyIncrementCounter(_) | Self::LegacyCellRef(_) => None,
+        }
+    }
+
+    pub fn result_facts(&self) -> Option<ValueFacts> {
+        self.typed_extra().and_then(TypedInstrExtra::result_facts)
+    }
 }
 
 impl Instr for InstrTyped {
     type Name = ResolvedName;
-    type Extra = ();
+    type Extra = TypedInstrExtra;
 }
 
 impl InstrWithConstantNone for InstrTyped {
@@ -1700,6 +1789,53 @@ pub fn lower_codegen_function_to_typed(
     function: BlockPyFunction<CodegenModuleShape>,
 ) -> BlockPyFunction<TypedCodegenModuleShape> {
     CodegenToTyped.map_fn(function)
+}
+
+pub fn annotate_typed_module_value_facts(
+    module: &mut BlockPyModule<TypedCodegenModuleShape>,
+    facts: &FactStore,
+) -> usize {
+    module
+        .callable_defs
+        .iter_mut()
+        .map(|function| annotate_typed_function_value_facts(function, facts))
+        .sum()
+}
+
+pub fn annotate_typed_function_value_facts(
+    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    facts: &FactStore,
+) -> usize {
+    struct Annotator<'a> {
+        function_id: FunctionId,
+        facts: &'a FactStore,
+        changed: usize,
+    }
+
+    impl VisitMut<InstrTyped> for Annotator<'_> {
+        fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+            let instr_id = expr.meta().instr_id;
+            if let Some(instr_id) = instr_id {
+                if let Some(facts) = self
+                    .facts
+                    .fact_for(InstrKey::new(self.function_id, instr_id))
+                {
+                    if let Some(extra) = expr.typed_extra_mut() {
+                        self.changed += usize::from(extra.refine_result_facts(facts));
+                    }
+                }
+            }
+            expr.visit_children_mut(self);
+        }
+    }
+
+    let mut annotator = Annotator {
+        function_id: function.function_id,
+        facts,
+        changed: 0,
+    };
+    annotator.visit_fn_mut(function);
+    annotator.changed
 }
 
 pub fn lower_typed_function_if_tests_to_truthy(
@@ -2604,6 +2740,38 @@ mod typed_codegen_tests {
         counter
     }
 
+    #[derive(Default)]
+    struct TypedExtraFactCounter {
+        extras: usize,
+        facts: usize,
+        none_singletons: usize,
+    }
+
+    impl Visit<InstrTyped> for TypedExtraFactCounter {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            if let Some(extra) = expr.typed_extra() {
+                self.extras += 1;
+                if let Some(facts) = extra.result_facts() {
+                    self.facts += 1;
+                    if facts.as_pyobj().is_some_and(PyObjFacts::is_none) {
+                        self.none_singletons += 1;
+                    }
+                }
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    fn count_typed_extra_facts(
+        module: &BlockPyModule<TypedCodegenModuleShape>,
+    ) -> TypedExtraFactCounter {
+        let mut counter = TypedExtraFactCounter::default();
+        for function in &module.callable_defs {
+            counter.visit_fn(function);
+        }
+        counter
+    }
+
     fn typed_function_by_qualname_mut<'a>(
         module: &'a mut BlockPyModule<TypedCodegenModuleShape>,
         qualname: &str,
@@ -2698,6 +2866,33 @@ mod typed_codegen_tests {
                 + counter.typed_getattrs
                 + counter.typed_setattrs
         );
+    }
+
+    #[test]
+    fn typed_instr_extras_start_without_result_facts() {
+        let lowered = crate::lower_python_to_blockpy_for_testing("def f():\n    return None\n")
+            .expect("source should lower");
+
+        let typed = lower_codegen_module_to_typed(lowered.codegen_module);
+        let counter = count_typed_extra_facts(&typed);
+
+        assert!(counter.extras > 0);
+        assert_eq!(counter.facts, 0);
+    }
+
+    #[test]
+    fn annotate_typed_module_value_facts_materializes_result_facts() {
+        let lowered = crate::lower_python_to_blockpy_for_testing("def f():\n    return None\n")
+            .expect("source should lower");
+        let facts = infer_module_value_facts(&lowered.codegen_module);
+        let mut typed = lower_codegen_module_to_typed(lowered.codegen_module);
+
+        let changed = annotate_typed_module_value_facts(&mut typed, &facts);
+        let counter = count_typed_extra_facts(&typed);
+
+        assert!(changed > 0);
+        assert!(counter.facts > 0);
+        assert!(counter.none_singletons > 0);
     }
 
     #[test]
