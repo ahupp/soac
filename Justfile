@@ -904,6 +904,50 @@ _test-all-test-phase:
     printf -v "$pid_var" '%s' "$!"
   }
 
+  kill_process_tree() {
+    local pid="$1"
+    local signal="$2"
+    local children=()
+
+    if command -v pgrep >/dev/null 2>&1; then
+      mapfile -t children < <(pgrep -P "$pid" 2>/dev/null || true)
+    fi
+
+    local child
+    for child in "${children[@]}"; do
+      if [ -n "$child" ]; then
+        kill_process_tree "$child" "$signal"
+      fi
+    done
+
+    kill -"$signal" "$pid" 2>/dev/null || true
+  }
+
+  terminate_parallel_step() {
+    local label="$1"
+    local pid="$2"
+
+    if ! kill -0 "$pid" 2>/dev/null; then
+      return
+    fi
+
+    echo "[diet-python test-all] terminating: $label (pid $pid)" >&2
+    kill_process_tree "$pid" TERM
+
+    local attempt
+    for attempt in {1..20}; do
+      if ! kill -0 "$pid" 2>/dev/null; then
+        return
+      fi
+      sleep 0.25
+    done
+
+    if kill -0 "$pid" 2>/dev/null; then
+      echo "[diet-python test-all] force terminating: $label (pid $pid)" >&2
+      kill_process_tree "$pid" KILL
+    fi
+  }
+
   overall_status=0
   parallel_log_dir="$(mktemp -d)"
   cargo_test_log="$parallel_log_dir/cargo-test.log"
@@ -918,6 +962,7 @@ _test-all-test-phase:
 
   cargo_test_status=0
   pytest_status=0
+  pytest_cancelled=0
   cargo_test_reported=0
   pytest_reported=0
   phase_start_s="$(date +%s)"
@@ -932,6 +977,13 @@ _test-all-test-phase:
     if [ "$cargo_test_reported" -eq 0 ] && [ -f "$cargo_test_status_file" ]; then
       cargo_test_reported=1
       echo "[diet-python test-all] completed: cargo-test"
+      cargo_test_status="$(cat "$cargo_test_status_file")"
+      if [ "$cargo_test_status" -ne 0 ] && [ ! -f "$pytest_status_file" ]; then
+        pytest_cancelled=1
+        echo "[diet-python test-all] cargo-test failed; terminating pytest early" >&2
+        terminate_parallel_step pytest "$pytest_pid"
+        break
+      fi
     fi
 
     if [ "$pytest_reported" -eq 0 ] && [ -f "$pytest_status_file" ]; then
@@ -967,15 +1019,21 @@ _test-all-test-phase:
     pytest_status=$?
   fi
 
-  cargo_test_status="$(cat "$cargo_test_status_file")"
-  pytest_status="$(cat "$pytest_status_file")"
+  if [ -f "$cargo_test_status_file" ]; then
+    cargo_test_status="$(cat "$cargo_test_status_file")"
+  fi
+  if [ -f "$pytest_status_file" ]; then
+    pytest_status="$(cat "$pytest_status_file")"
+  fi
 
   if [ "$cargo_test_status" -ne 0 ]; then
     echo "[diet-python test-all] step failed: cargo-test (exit $cargo_test_status)" >&2
     overall_status="$cargo_test_status"
   fi
 
-  if [ "$pytest_status" -ne 0 ]; then
+  if [ "$pytest_cancelled" -eq 1 ]; then
+    echo "[diet-python test-all] step cancelled: pytest (cargo-test failed)" >&2
+  elif [ "$pytest_status" -ne 0 ]; then
     echo "[diet-python test-all] step failed: pytest (exit $pytest_status)" >&2
     if [ "$overall_status" -eq 0 ]; then
       overall_status="$pytest_status"
