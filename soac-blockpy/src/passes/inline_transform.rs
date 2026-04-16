@@ -1,6 +1,6 @@
 use crate::block_py::{
     Block, BlockArg, BlockEdge, BlockLabel, BlockPyFunction, BlockTerm, CallArgPositional,
-    CallDirect, HasMeta, InstrCodegen, LocalLocation, Mappable, NameLocation, ParamKind,
+    CallDirect, HasMeta, InstrCodegen, LocalLocation, MapInstr, Mappable, NameLocation, ParamKind,
     ResolvedName, Store, TryMapInstr, WithMeta,
 };
 use crate::passes::{CodegenModuleShape, InstrCodegenOp};
@@ -281,29 +281,29 @@ impl TryMapInstr<InstrCodegen, InstrCodegen, InlineUnsupportedReason> for Inline
         &mut self,
         instr: InstrCodegen,
     ) -> Result<InstrCodegen, InlineUnsupportedReason> {
-        match instr {
-            InstrCodegenOp::BinOp(op) => Ok(InstrCodegenOp::BinOp(op.try_map_children(self)?)),
-            InstrCodegenOp::UnaryOp(op) => Ok(InstrCodegenOp::UnaryOp(op.try_map_children(self)?)),
+        let mapped = match instr {
+            InstrCodegenOp::BinOp(op) => InstrCodegenOp::BinOp(op.try_map_children(self)?),
+            InstrCodegenOp::UnaryOp(op) => InstrCodegenOp::UnaryOp(op.try_map_children(self)?),
             InstrCodegenOp::CalleeFunctionId(op) => {
-                Ok(InstrCodegenOp::CalleeFunctionId(op.try_map_children(self)?))
+                InstrCodegenOp::CalleeFunctionId(op.try_map_children(self)?)
             }
-            InstrCodegenOp::Tuple(op) => Ok(InstrCodegenOp::Tuple(op.try_map_children(self)?)),
-            InstrCodegenOp::Call(op) => Ok(InstrCodegenOp::Call(op.try_map_children(self)?)),
+            InstrCodegenOp::Tuple(op) => InstrCodegenOp::Tuple(op.try_map_children(self)?),
+            InstrCodegenOp::Call(op) => InstrCodegenOp::Call(op.try_map_children(self)?),
             InstrCodegenOp::CallDirect(op) => {
-                Ok(InstrCodegenOp::CallDirect(op.try_map_children(self)?))
+                InstrCodegenOp::CallDirect(op.try_map_children(self)?)
             }
-            InstrCodegenOp::GetAttr(op) => Ok(InstrCodegenOp::GetAttr(op.try_map_children(self)?)),
-            InstrCodegenOp::SetAttr(op) => Ok(InstrCodegenOp::SetAttr(op.try_map_children(self)?)),
-            InstrCodegenOp::GetItem(op) => Ok(InstrCodegenOp::GetItem(op.try_map_children(self)?)),
-            InstrCodegenOp::SetItem(op) => Ok(InstrCodegenOp::SetItem(op.try_map_children(self)?)),
-            InstrCodegenOp::DelItem(op) => Ok(InstrCodegenOp::DelItem(op.try_map_children(self)?)),
+            InstrCodegenOp::GetAttr(op) => InstrCodegenOp::GetAttr(op.try_map_children(self)?),
+            InstrCodegenOp::SetAttr(op) => InstrCodegenOp::SetAttr(op.try_map_children(self)?),
+            InstrCodegenOp::GetItem(op) => InstrCodegenOp::GetItem(op.try_map_children(self)?),
+            InstrCodegenOp::SetItem(op) => InstrCodegenOp::SetItem(op.try_map_children(self)?),
+            InstrCodegenOp::DelItem(op) => InstrCodegenOp::DelItem(op.try_map_children(self)?),
             InstrCodegenOp::Load(op) => {
                 if let Some(location) = op.name.local_location() {
                     if let Some(value) = self.value_bindings.get(&location) {
-                        return Ok(value.clone());
+                        return Ok(clear_codegen_instr_ids(value.clone()));
                     }
                 }
-                Ok(InstrCodegenOp::Load(op.try_map_children(self)?))
+                InstrCodegenOp::Load(op.try_map_children(self)?)
             }
             InstrCodegenOp::Store(op) => {
                 if let Some(location) = op.name.local_location() {
@@ -311,7 +311,7 @@ impl TryMapInstr<InstrCodegen, InstrCodegen, InlineUnsupportedReason> for Inline
                         return Err(InlineUnsupportedReason::RebindsBoundLocal(location));
                     }
                 }
-                Ok(InstrCodegenOp::Store(op.try_map_children(self)?))
+                InstrCodegenOp::Store(op.try_map_children(self)?)
             }
             InstrCodegenOp::Del(op) => {
                 if let Some(location) = op.name.local_location() {
@@ -319,17 +319,16 @@ impl TryMapInstr<InstrCodegen, InstrCodegen, InlineUnsupportedReason> for Inline
                         return Err(InlineUnsupportedReason::RebindsBoundLocal(location));
                     }
                 }
-                Ok(InstrCodegenOp::Del(op.try_map_children(self)?))
+                InstrCodegenOp::Del(op.try_map_children(self)?)
             }
-            InstrCodegenOp::MakeCell(op) => {
-                Ok(InstrCodegenOp::MakeCell(op.try_map_children(self)?))
+            InstrCodegenOp::MakeCell(op) => InstrCodegenOp::MakeCell(op.try_map_children(self)?),
+            InstrCodegenOp::IncrementCounter(op) => InstrCodegenOp::IncrementCounter(op),
+            InstrCodegenOp::CellRef(op) => InstrCodegenOp::CellRef(op),
+            InstrCodegenOp::MakeFunctionWithClosure(op) => {
+                InstrCodegenOp::MakeFunctionWithClosure(op.try_map_children(self)?)
             }
-            InstrCodegenOp::IncrementCounter(op) => Ok(InstrCodegenOp::IncrementCounter(op)),
-            InstrCodegenOp::CellRef(op) => Ok(InstrCodegenOp::CellRef(op)),
-            InstrCodegenOp::MakeFunctionWithClosure(op) => Ok(
-                InstrCodegenOp::MakeFunctionWithClosure(op.try_map_children(self)?),
-            ),
-        }
+        };
+        Ok(clear_codegen_instr_id(mapped))
     }
 
     fn try_map_name(
@@ -351,10 +350,56 @@ impl TryMapInstr<InstrCodegen, InstrCodegen, InlineUnsupportedReason> for Inline
     }
 }
 
+fn clear_codegen_instr_ids(instr: InstrCodegen) -> InstrCodegen {
+    InstrIdScrubber.map_instr(instr)
+}
+
+fn clear_codegen_instr_id(instr: InstrCodegen) -> InstrCodegen {
+    let mut meta = instr.meta();
+    meta.instr_id = None;
+    instr.with_meta(meta)
+}
+
+struct InstrIdScrubber;
+
+impl MapInstr<InstrCodegen, InstrCodegen> for InstrIdScrubber {
+    fn map_instr(&mut self, instr: InstrCodegen) -> InstrCodegen {
+        let mapped = match instr {
+            InstrCodegenOp::BinOp(op) => InstrCodegenOp::BinOp(op.map_children(self)),
+            InstrCodegenOp::UnaryOp(op) => InstrCodegenOp::UnaryOp(op.map_children(self)),
+            InstrCodegenOp::CalleeFunctionId(op) => {
+                InstrCodegenOp::CalleeFunctionId(op.map_children(self))
+            }
+            InstrCodegenOp::Tuple(op) => InstrCodegenOp::Tuple(op.map_children(self)),
+            InstrCodegenOp::Call(op) => InstrCodegenOp::Call(op.map_children(self)),
+            InstrCodegenOp::CallDirect(op) => InstrCodegenOp::CallDirect(op.map_children(self)),
+            InstrCodegenOp::GetAttr(op) => InstrCodegenOp::GetAttr(op.map_children(self)),
+            InstrCodegenOp::SetAttr(op) => InstrCodegenOp::SetAttr(op.map_children(self)),
+            InstrCodegenOp::GetItem(op) => InstrCodegenOp::GetItem(op.map_children(self)),
+            InstrCodegenOp::SetItem(op) => InstrCodegenOp::SetItem(op.map_children(self)),
+            InstrCodegenOp::DelItem(op) => InstrCodegenOp::DelItem(op.map_children(self)),
+            InstrCodegenOp::Load(op) => InstrCodegenOp::Load(op.map_children(self)),
+            InstrCodegenOp::Store(op) => InstrCodegenOp::Store(op.map_children(self)),
+            InstrCodegenOp::Del(op) => InstrCodegenOp::Del(op.map_children(self)),
+            InstrCodegenOp::MakeCell(op) => InstrCodegenOp::MakeCell(op.map_children(self)),
+            InstrCodegenOp::IncrementCounter(op) => InstrCodegenOp::IncrementCounter(op),
+            InstrCodegenOp::CellRef(op) => InstrCodegenOp::CellRef(op),
+            InstrCodegenOp::MakeFunctionWithClosure(op) => {
+                InstrCodegenOp::MakeFunctionWithClosure(op.map_children(self))
+            }
+        };
+        clear_codegen_instr_id(mapped)
+    }
+
+    fn map_name(&mut self, name: ResolvedName) -> ResolvedName {
+        name
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block_py::{BlockParam, BlockParamRole, CallDirect, Load};
+    use crate::block_py::{BlockParam, BlockParamRole, CallDirect, InstrId, Load};
     use crate::lower_python_to_blockpy_for_testing;
 
     fn function_by_qualname<'a>(
@@ -480,6 +525,10 @@ def caller(x, y):
         assert_eq!(fragment.blocks.len(), 1);
         assert_ne!(fragment.entry_label, callee.blocks[0].label);
         assert_eq!(fragment.blocks[0].label, fragment.entry_label);
+        assert!(fragment.blocks[0]
+            .body
+            .iter()
+            .all(|instr| instr.meta().instr_id.is_none()));
         assert_eq!(
             caller
                 .storage_layout
@@ -559,8 +608,12 @@ def caller(x):
         let callee = function_by_qualname(&module, "callee");
         let mut caller = function_by_qualname(&module, "caller").clone();
         let callee_a = local_location(callee, "a");
+        let mut bound_x = local_load(&caller, "x");
+        let mut bound_x_meta = bound_x.meta();
+        bound_x_meta.instr_id = Some(InstrId::new(BlockLabel::from_index(20_000), 7));
+        bound_x = bound_x.with_meta(bound_x_meta);
         let mut bindings = InlineValueBindings::new();
-        bindings.insert(callee_a, local_load(&caller, "x"));
+        bindings.insert(callee_a, bound_x);
         let return_target = local_resolved_name(&caller, "out");
 
         let fragment = build_single_block_inline_fragment_to_target(
@@ -580,6 +633,7 @@ def caller(x):
         let Some(InstrCodegen::Store(return_store)) = fragment.blocks[0].body.last() else {
             panic!("inlined block should store the return value before jumping");
         };
+        assert!(return_store.value.meta().instr_id.is_none());
         assert_eq!(
             return_store.name.local_location(),
             Some(local_location(&caller, "out"))
