@@ -634,3 +634,89 @@ def write_field():
     # specialized path: read_fields has 4 stores + 4 loads, and write_field has
     # 7 stores + 4 loads.
     assert hit_counts_by_function == {"read_fields": 8, "write_field": 11}, verify
+
+
+def test_method_class_field_profile_uses_indexed_get_set_in_verify(tmp_path):
+    module_name = "field_method_case"
+    module_path = tmp_path / f"{module_name}.py"
+    module_path.write_text(
+        """
+class Record:
+    def __init__(self, x=0, y=0):
+        self.x = x
+        self.y = y
+
+    def copy(self):
+        return Record(self.x, self.y)
+
+def run():
+    record = Record(1, 2)
+    record.x = 3
+    copied = record.copy()
+    return copied.x + copied.y + record.x
+""",
+        encoding="utf-8",
+    )
+    work_dir = tmp_path / "soac-work"
+    script = _import_and_run_script(
+        tmp_path,
+        f"import {module_name} as module",
+        "assert module.run() == 8",
+    )
+    base_env = _soac_subprocess_env(tmp_path, work_dir=work_dir)
+
+    profile_result = _run_soac_subprocess(
+        script,
+        env={**base_env, "SOAC_OPT_MODE": "profile"},
+    )
+    _assert_subprocess_ok(profile_result)
+    profile = _inspect_counter_dump_json(work_dir / "profile.bin")
+    record_type_entries = [
+        entry
+        for record in profile["records"]
+        for entry in record["type_table"]
+        if entry["module_name"] == module_name and entry["qualname"] == "Record"
+    ]
+    assert len(record_type_entries) == 1, profile
+    record_type_id = record_type_entries[0]["type_id"]
+    profiled_keys = {
+        key["key"]
+        for record in profile["records"]
+        for key in record["type_keys"]
+        if key["owner_type_id"] == record_type_id
+    }
+    assert profiled_keys == {"x", "y"}, profile
+
+    verify_result = _run_soac_subprocess(
+        script,
+        env={**base_env, "SOAC_OPT_MODE": "verify"},
+    )
+    _assert_subprocess_ok(verify_result)
+    verify = _inspect_counter_dump_json(work_dir / "verify.bin")
+
+    hit_values_by_function = {}
+    fallback_values_by_function = {}
+    for record in verify["records"]:
+        if record["module_name"] != module_name:
+            continue
+        for row in record["rows"]:
+            if row["kind"] == "field_indexed_hit":
+                hit_values_by_function[row["function_qualname"]] = (
+                    hit_values_by_function.get(row["function_qualname"], 0) + row["value"]
+                )
+            elif row["kind"] == "field_indexed_fallback":
+                fallback_values_by_function[row["function_qualname"]] = (
+                    fallback_values_by_function.get(row["function_qualname"], 0)
+                    + row["value"]
+                )
+
+    assert hit_values_by_function == {
+        "Record.__init__": 4,
+        "Record.copy": 2,
+        "run": 4,
+    }, verify
+    assert not {
+        function: value
+        for function, value in fallback_values_by_function.items()
+        if value
+    }, verify

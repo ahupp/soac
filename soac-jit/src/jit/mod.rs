@@ -1441,6 +1441,7 @@ struct DirectFunctionCompileInputs<'a> {
     module_constants: &'a ModuleCodegenConstants,
     counter_defs: &'a [CounterDef],
     module_constant_ptrs: &'a [*mut ffi::PyObject],
+    direct_call_resolver: Option<&'a crate::module_type::SharedModuleState>,
 }
 
 // Worker codegen treats these as immutable inputs. The raw Python pointers are copied into
@@ -1458,6 +1459,7 @@ struct ReservedJitFunctionCompileInputs {
     counted_refcount_helpers: CountedRefcountHelpers,
     direct_owner_attr_specializations:
         HashMap<DirectOwnerAttrKey, Vec<DirectOwnerAttrSpecialization>>,
+    specialization_inputs: FunctionSpecializationInputs,
     module_constant_binding_key: usize,
     symbol_scope: Option<String>,
 }
@@ -2429,6 +2431,10 @@ impl ProcessJitState {
             let specialization_profile =
                 SpecializationProfile::from_runtime_state(Some(shared_state))?;
             predeclare_specialization_type_imports(jit_module, &specialization_profile)?;
+            let specialization_inputs = FunctionSpecializationInputs::from_profile(
+                &specialization_profile,
+                &batch_function.function,
+            )?;
             let direct_owner_attr_specializations = predeclare_direct_call_owner_type_imports(
                 jit_module,
                 &shared_state.lowered_module,
@@ -2443,6 +2449,7 @@ impl ProcessJitState {
                 top_value_counter_data_id,
                 counted_refcount_helpers,
                 direct_owner_attr_specializations,
+                specialization_inputs,
                 module_constant_binding_key: instance_key,
                 symbol_scope: Some(symbol_scope),
             });
@@ -2478,6 +2485,13 @@ impl ProcessJitState {
             scalar_counter_data_id,
             None,
         )?;
+        let specialization_profile =
+            SpecializationProfile::from_runtime_state(inputs.direct_call_resolver)?;
+        predeclare_specialization_type_imports(jit_module, &specialization_profile)?;
+        let specialization_inputs = FunctionSpecializationInputs::from_profile(
+            &specialization_profile,
+            &batch_function.function,
+        )?;
         Ok(ReservedJitFunctionCompileInputs {
             module_constant_ptrs,
             counter_slots_by_id: counter_slots_by_id.into_vec(),
@@ -2486,6 +2500,7 @@ impl ProcessJitState {
             top_value_counter_data_id,
             counted_refcount_helpers,
             direct_owner_attr_specializations: HashMap::new(),
+            specialization_inputs,
             module_constant_binding_key: instance_key,
             symbol_scope: None,
         })
@@ -2752,7 +2767,7 @@ impl ProcessJitState {
             reserved_inputs.top_value_counter_data_id,
             inputs.session.as_ref(),
             function_direct_call_resolver,
-            &SpecializationProfile::from_runtime_state(function_direct_call_resolver)?,
+            None,
             reserved_inputs.symbol_scope.as_deref(),
             Some(&plan.predeclared),
             BuildSpecializedFunctionOptions {
@@ -2760,6 +2775,7 @@ impl ProcessJitState {
                 direct_owner_attr_specializations: Some(
                     reserved_inputs.direct_owner_attr_specializations.clone(),
                 ),
+                specialization_inputs: Some(reserved_inputs.specialization_inputs.clone()),
                 ..BuildSpecializedFunctionOptions::default()
             },
         )
@@ -6502,7 +6518,7 @@ fn record_profiled_direct_call_incompatibility(
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct FieldIndexSpecialization {
     expected_index: u32,
     owner_type_ref: RelocTypeRef,
@@ -10145,6 +10161,41 @@ struct SpecializationProfile<'a> {
     behavior_change_indexed_stores: bool,
     profiled_cold_blocks: bool,
     guard_miss_deopt: bool,
+}
+
+#[derive(Clone, Debug)]
+struct FunctionSpecializationInputs {
+    call_target_specializations: HashMap<InstrId, Vec<FunctionId>>,
+    operator_specializations: HashMap<InstrId, Vec<u64>>,
+    getitem_specializations: HashMap<InstrId, Vec<u64>>,
+    setitem_specializations: HashMap<InstrId, Vec<u64>>,
+    field_index_specializations: HashMap<String, Vec<FieldIndexSpecialization>>,
+    branch_prefer_true: HashMap<InstrId, bool>,
+    cold_block_labels: HashSet<BlockLabel>,
+    behavior_change_indexed_stores: bool,
+    guard_miss_deopt_stub: bool,
+}
+
+impl FunctionSpecializationInputs {
+    fn from_profile(
+        profile: &SpecializationProfile<'_>,
+        function: &BlockPyFunction<CodegenModuleShape>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            call_target_specializations: profile
+                .call_target_specializations(function.function_id)?,
+            operator_specializations: profile.operator_specializations(function.function_id)?,
+            getitem_specializations: profile.getitem_specializations(function.function_id)?,
+            setitem_specializations: profile.setitem_specializations(function.function_id)?,
+            field_index_specializations: profile.field_index_specializations()?,
+            branch_prefer_true: profile.branch_preferences(function.function_id)?,
+            cold_block_labels: profile.cold_block_labels(function)?,
+            behavior_change_indexed_stores: profile.behavior_change_indexed_stores
+                && function.scope.scope_kind != CallableScopeKind::Module,
+            guard_miss_deopt_stub: profile.guard_miss_deopt
+                && function.scope.scope_kind != CallableScopeKind::Module,
+        })
+    }
 }
 
 impl<'a> SpecializationProfile<'a> {
@@ -16564,6 +16615,7 @@ impl ProcessJitEngine {
             module_constants,
             counter_defs,
             module_constant_ptrs,
+            direct_call_resolver,
         };
         let reservation_start = Instant::now();
         let reserved_batch_result = {
@@ -16793,6 +16845,7 @@ impl ProcessJitEngine {
             module_constants,
             counter_defs,
             module_constant_ptrs,
+            direct_call_resolver,
         };
         let reservation_start = Instant::now();
         let reserved_batch_result = {
@@ -18649,7 +18702,7 @@ fn precompile_codegen_module_to_object_bytes(
             top_value_counter_data_id,
             &compile_session,
             None,
-            &specialization_profile,
+            Some(&specialization_profile),
             symbol_scopes.get(&function.function_id).map(String::as_str),
             Some(&predeclared),
             BuildSpecializedFunctionOptions {
@@ -18972,6 +19025,7 @@ struct BuildSpecializedFunctionOptions {
     counted_refcount_helpers: Option<CountedRefcountHelpers>,
     direct_owner_attr_specializations:
         Option<HashMap<DirectOwnerAttrKey, Vec<DirectOwnerAttrSpecialization>>>,
+    specialization_inputs: Option<FunctionSpecializationInputs>,
 }
 
 fn build_cranelift_run_bb_specialized_function(
@@ -18990,7 +19044,7 @@ fn build_cranelift_run_bb_specialized_function(
     top_value_counter_data_id: Option<DataId>,
     compile_session: &crate::session::CompileSession,
     direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
-    specialization_profile: &SpecializationProfile<'_>,
+    specialization_profile: Option<&SpecializationProfile<'_>>,
     symbol_scope: Option<&str>,
     predeclared_direct_functions: Option<&HashMap<FunctionId, DeclaredJitFunction>>,
     options: BuildSpecializedFunctionOptions,
@@ -19137,21 +19191,27 @@ fn build_cranelift_run_bb_specialized_function(
             function.names.qualname
         ));
     }
-    let call_target_specializations =
-        specialization_profile.call_target_specializations(function.function_id)?;
-    let operator_specializations =
-        specialization_profile.operator_specializations(function.function_id)?;
-    let getitem_specializations =
-        specialization_profile.getitem_specializations(function.function_id)?;
-    let setitem_specializations =
-        specialization_profile.setitem_specializations(function.function_id)?;
-    let field_index_specializations = specialization_profile.field_index_specializations()?;
-    let branch_prefer_true = specialization_profile.branch_preferences(function.function_id)?;
-    let cold_block_labels = specialization_profile.cold_block_labels(function)?;
-    let behavior_change_indexed_stores = specialization_profile.behavior_change_indexed_stores
-        && function.scope.scope_kind != CallableScopeKind::Module;
-    let guard_miss_deopt_stub = specialization_profile.guard_miss_deopt
-        && function.scope.scope_kind != CallableScopeKind::Module;
+    let specialization_inputs = match options.specialization_inputs.clone() {
+        Some(inputs) => inputs,
+        None => {
+            let profile = specialization_profile.ok_or_else(|| {
+                format!(
+                    "missing specialization profile for function {} ({})",
+                    function.function_id, function.names.qualname
+                )
+            })?;
+            FunctionSpecializationInputs::from_profile(profile, function)?
+        }
+    };
+    let call_target_specializations = specialization_inputs.call_target_specializations;
+    let operator_specializations = specialization_inputs.operator_specializations;
+    let getitem_specializations = specialization_inputs.getitem_specializations;
+    let setitem_specializations = specialization_inputs.setitem_specializations;
+    let field_index_specializations = specialization_inputs.field_index_specializations;
+    let branch_prefer_true = specialization_inputs.branch_prefer_true;
+    let cold_block_labels = specialization_inputs.cold_block_labels;
+    let behavior_change_indexed_stores = specialization_inputs.behavior_change_indexed_stores;
+    let guard_miss_deopt_stub = specialization_inputs.guard_miss_deopt_stub;
     let function_runtime_data_layout = FunctionRuntimeDataLayout::from_function(function);
     let true_constant_id = module_constants.require_runtime_name_constant_id("TRUE");
     let false_constant_id = module_constants.require_runtime_name_constant_id("FALSE");
@@ -20248,7 +20308,7 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
         top_value_counter_data_id,
         compile_session,
         runtime_state,
-        &SpecializationProfile::from_runtime_state(runtime_state)?,
+        Some(&SpecializationProfile::from_runtime_state(runtime_state)?),
         None,
         None,
         BuildSpecializedFunctionOptions::default(),
