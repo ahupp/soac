@@ -812,6 +812,8 @@ exact-list/exact-int arms and share generic fallback paths.
 - The fast path:
   - records the current observed operand shape
   - compares it against the profiled exact-int shape
+  - skips the shape guard when value facts already prove both operands are
+    exact `int`
   - on hit, calls the profiled `PyLong` number slot helper
   - on miss in `verify`/`apply` mode, uses a cold
     `dp_jit_deopt_resume` continuation when both operands are safe to
@@ -831,6 +833,8 @@ exact-list/exact-int arms and share generic fallback paths.
   - excluded binops still always use generic lowering
 - Soundness boundary:
   - specialization is guarded by exact observed type-shape match
+  - fact-proven exact-int operands may use the same direct helper without
+    a runtime shape guard
   - unsupported or mismatched shapes either deopt to the generic
     continuation or fall back to generic lowering
 - Natural extensions:
@@ -858,6 +862,8 @@ exact-list/exact-int arms and share generic fallback paths.
 - The fast path:
   - records the observed unary operand shape
   - checks for exact `int`
+  - skips the shape guard when value facts already prove the operand is
+    exact `int`
   - on hit, calls the exact-int unary helper
   - on miss in `verify`/`apply` mode, deopts to the generic
     continuation when the operand is safe to replay
