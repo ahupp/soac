@@ -117,30 +117,48 @@ fn rewrite_pre_optimization_module_with_cache(
             });
             match loaded {
                 Ok(mut cache) => {
-                    if let Some(expected) = &options.pre_optimization_cache_metadata {
-                        validate_codegen_module_cache_metadata(&cache.metadata, expected)?;
+                    let metadata_mismatch = if let Some(expected) =
+                        &options.pre_optimization_cache_metadata
+                    {
+                        match validate_codegen_module_cache_metadata(&cache.metadata, expected) {
+                            Ok(()) => None,
+                            Err(err) => Some(err),
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(err) = metadata_mismatch {
+                        warn!(
+                            target: "soac_blockpy_module_cache",
+                            event = "soac.blockpy_module_cache",
+                            cache_hit = false,
+                            path = %cache_path.display(),
+                            error = %err,
+                            "blockpy_module_cache_metadata_mismatch",
+                        );
+                    } else {
+                        remap_cached_codegen_module_function_ids(&mut cache, module_name_gen);
+                        let has_prepared = cache.prepared.is_some();
+                        info!(
+                            target: "soac_blockpy_module_cache",
+                            event = "soac.blockpy_module_cache",
+                            cache_hit = true,
+                            prepared = has_prepared,
+                            path = %cache_path.display(),
+                            "blockpy_module_cache_hit",
+                        );
+                        let CachedCodegenModule {
+                            metadata: _,
+                            module,
+                            prepared,
+                        } = cache;
+                        return Ok(PreOptimizationModule {
+                            module: pass_tracker.run_pass("bb_codegen", || module),
+                            prepared,
+                            cache_path_for_store: None,
+                            cache_metadata_for_store: None,
+                        });
                     }
-                    remap_cached_codegen_module_function_ids(&mut cache, module_name_gen);
-                    let has_prepared = cache.prepared.is_some();
-                    info!(
-                        target: "soac_blockpy_module_cache",
-                        event = "soac.blockpy_module_cache",
-                        cache_hit = true,
-                        prepared = has_prepared,
-                        path = %cache_path.display(),
-                        "blockpy_module_cache_hit",
-                    );
-                    let CachedCodegenModule {
-                        metadata: _,
-                        module,
-                        prepared,
-                    } = cache;
-                    return Ok(PreOptimizationModule {
-                        module: pass_tracker.run_pass("bb_codegen", || module),
-                        prepared,
-                        cache_path_for_store: None,
-                        cache_metadata_for_store: None,
-                    });
                 }
                 Err(err) => {
                     warn!(
@@ -556,4 +574,71 @@ def _dp_module_init():
     semantic_state.synthesize_module_init_scope(&module_init);
 
     *module = vec![Stmt::FunctionDef(module_init)];
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block_py::ModuleNameGen;
+    use crate::codegen_cache::{
+        load_codegen_module_cache, store_codegen_module_cache, CachedCodegenModuleMetadata,
+        PythonModuleCacheSource,
+    };
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn pre_optimization_cache_metadata_mismatch_rebuilds_and_replaces_cache() {
+        let source = "def f():\n    return 1\n";
+        let module_name = "cache_metadata_mismatch_test";
+        let cache_path = unique_temp_dir()
+            .join("project")
+            .join(module_name)
+            .join("mod.blockpy");
+        let stale_metadata = metadata(module_name, "old-build");
+        let expected_metadata = metadata(module_name, "new-build");
+        let stale_module = crate::lower_python_to_blockpy_recorded(source, ModuleNameGen::new(1))
+            .expect("initial lowering should succeed")
+            .codegen_module;
+        store_codegen_module_cache(cache_path.as_path(), &stale_metadata, &stale_module, None)
+            .expect("stale cache should be writable");
+
+        if let Err(err) = crate::lower_python_to_blockpy_recorded_with_options(
+            source,
+            ModuleNameGen::new(2),
+            LoweringOptions {
+                runtime_names_as_globals: false,
+                pre_optimization_cache_path: Some(cache_path.clone()),
+                pre_optimization_cache_metadata: Some(expected_metadata.clone()),
+            },
+        ) {
+            panic!(
+                "stale cache metadata should be treated as a miss, not as a lowering error: {err}"
+            );
+        }
+
+        let replaced = load_codegen_module_cache(cache_path.as_path())
+            .expect("rebuilt cache should be readable");
+        assert_eq!(replaced.metadata, expected_metadata);
+    }
+
+    fn metadata(module_name: &str, cache_identity: &str) -> CachedCodegenModuleMetadata {
+        CachedCodegenModuleMetadata {
+            source: PythonModuleCacheSource::Project,
+            module_name: module_name.to_string(),
+            source_hash: 0x1234,
+            cache_identity: cache_identity.to_string(),
+        }
+    }
+
+    fn unique_temp_dir() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "soac-blockpy-cache-test-{}-{nanos}",
+            std::process::id()
+        ))
+    }
 }

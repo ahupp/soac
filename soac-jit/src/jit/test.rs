@@ -21,10 +21,15 @@ mod tests {
         CounterDumpTypeTableEntry, write_counter_dump_records,
     };
     use crate::jit::direct_abi::RuntimePrimitiveId;
+    use crate::optimization_plan::{
+        FunctionOptimizationPlan, OptimizationDecision, OptimizationPlan, PlannedAction,
+        PlannedAlternative, PlannedFallback, PlannedGuard, PlannedReplacement, ShapeFamily,
+    };
     use cranelift_codegen::cursor::Cursor;
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyModule, PyModuleMethods, PyTuple};
     use pyo3::{Bound, Py, PyAny, PyErr, PyResult, Python, ffi};
     use ruff_python_ast as ast;
+    use soac_blockpy::codegen_cache::{PythonModuleCacheSource, module_optimization_plan_path};
     use soac_blockpy::passes::{TypedInstrExtra, TypedPlannedResult as PlannedResult};
     use std::collections::{HashMap, VecDeque};
     use std::ffi::c_void;
@@ -2986,6 +2991,15 @@ def build(values):
     fn write_test_counter_dump(path: &Path, record: &CounterDumpRecord) {
         write_counter_dump_records(path, std::iter::once(record))
             .expect("test counter dump should be writable");
+    }
+
+    fn write_test_optimization_plan(path: &Path, plan: &OptimizationPlan) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("test optimization plan dir should exist");
+        }
+        let archive = rkyv::to_bytes::<rkyv::rancor::Error>(plan)
+            .expect("test optimization plan should serialize");
+        std::fs::write(path, archive.as_ref()).expect("test optimization plan should be writable");
     }
 
     fn cached_split_key_layout(
@@ -16153,6 +16167,135 @@ def f(x, y):
             Some(value) => unsafe { std::env::set_var("SOAC_OPT_MODE", value) },
             None => unsafe { std::env::remove_var("SOAC_OPT_MODE") },
         }
+    }
+
+    #[test]
+    fn specialization_profile_loads_module_optimization_plan() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "specialization_profile_loads_module_optimization_plan",
+        ) {
+            return;
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let module_cache_root = fresh_test_work_dir("planned-specialization-modules");
+            let _cache_dir =
+                EnvVarGuard::set_os("SOAC_MODULE_CACHE_DIR", module_cache_root.as_os_str());
+            let _work_dir = EnvVarGuard::remove("SOAC_WORK_DIR");
+            let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "verify");
+            let module_name = "planned_specialization_profile_test";
+            let module_name_gen = ModuleNameGen::new(0);
+            let callee = with_single_test_block(
+                test_function_in_module(&module_name_gen, "callee"),
+                vec![],
+                ret_term(none_expr()),
+            );
+            let caller = with_single_test_block(
+                test_function_in_module(&module_name_gen, "caller"),
+                vec![],
+                ret_term(none_expr()),
+            );
+            let callee_function_id = callee.function_id;
+            let caller_function_id = caller.function_id;
+            let instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+            let module = test_module(module_name_gen, vec![callee, caller]);
+            let shared_state =
+                crate::module_type::build_shared_state_for_testing(py, module, module_name, "")
+                    .expect("shared state should build");
+            let cache_identity = pre_optimization_module_cache_identity(
+                env!("SOAC_BUILD_IDENTITY"),
+                shared_state.module_name == "soac.runtime",
+            );
+            let plan = OptimizationPlan {
+                source: PythonModuleCacheSource::Project,
+                module_name: module_name.to_string(),
+                source_hash: shared_state.source_hash,
+                cache_identity,
+                functions: vec![FunctionOptimizationPlan {
+                    function_id: caller_function_id,
+                    qualname: "caller".to_string(),
+                    decisions: vec![
+                        OptimizationDecision {
+                            instr_id,
+                            replacement: PlannedReplacement::Guarded {
+                                alternatives: vec![PlannedAlternative {
+                                    guards: vec![PlannedGuard::FunctionId {
+                                        function_id: callee_function_id,
+                                    }],
+                                    action: PlannedAction::DirectCall {
+                                        function_id: callee_function_id,
+                                    },
+                                }],
+                                fallback: PlannedFallback::OriginalInstruction,
+                            },
+                        },
+                        OptimizationDecision {
+                            instr_id,
+                            replacement: PlannedReplacement::Guarded {
+                                alternatives: vec![PlannedAlternative {
+                                    guards: vec![PlannedGuard::ObservedShape {
+                                        family: ShapeFamily::Operator,
+                                        shape: 257,
+                                    }],
+                                    action: PlannedAction::SpecializedShape {
+                                        family: ShapeFamily::Operator,
+                                        shape: 257,
+                                    },
+                                }],
+                                fallback: PlannedFallback::OriginalInstruction,
+                            },
+                        },
+                        OptimizationDecision {
+                            instr_id,
+                            replacement: PlannedReplacement::BranchPreference {
+                                prefer_true: false,
+                            },
+                        },
+                    ],
+                }],
+            };
+            let plan_path = module_optimization_plan_path(
+                module_cache_root.as_path(),
+                PythonModuleCacheSource::Project,
+                module_name,
+            )
+            .expect("test optimization plan path should build");
+            write_test_optimization_plan(plan_path.as_path(), &plan);
+
+            let profile = SpecializationProfile::from_runtime_state(Some(shared_state.as_ref()))
+                .expect("specialization profile should load planned evidence");
+            assert!(
+                profile.has_specialization_inputs(),
+                "mod.opt should count as specialization input even without a counter dump"
+            );
+            assert!(
+                !profile.has_existing_counter_dump(),
+                "test should prove the profile is not relying on a profile.bin fallback"
+            );
+            assert_eq!(
+                profile
+                    .call_target_specializations(caller_function_id)
+                    .unwrap()
+                    .get(&instr_id),
+                Some(&vec![callee_function_id])
+            );
+            assert_eq!(
+                profile
+                    .operator_specializations(caller_function_id)
+                    .unwrap()
+                    .get(&instr_id),
+                Some(&vec![257])
+            );
+            assert_eq!(
+                profile
+                    .branch_preferences(caller_function_id)
+                    .unwrap()
+                    .get(&instr_id),
+                Some(&false)
+            );
+        });
     }
 
     #[test]

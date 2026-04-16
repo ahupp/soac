@@ -15,6 +15,7 @@ use soac_blockpy::block_py::{
     BlockPyFunction, BlockPyModule, CounterDef, CounterId, CounterScope, CounterSite,
     DeoptEntrySource, FunctionExecutionMode, FunctionId, RuntimeName,
 };
+use soac_blockpy::codegen_cache::PythonModuleCacheSource;
 use soac_blockpy::env_config::SoacEnvConfig;
 use soac_blockpy::passes::{
     CodegenModuleShape, InlinePlanModule, plan_module_inlining,
@@ -48,6 +49,7 @@ pub struct SoacExtModuleDataRef<'a> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ModuleInfo {
     pub hash: u64,
+    pub cache_source: Option<PythonModuleCacheSource>,
     pub indexed_module_keys: Vec<String>,
 }
 
@@ -69,6 +71,7 @@ pub struct SharedModuleState {
     pub module_name: String,
     pub package_name: String,
     pub source_hash: u64,
+    pub module_cache_source: Option<PythonModuleCacheSource>,
     pub codegen_constants: ModuleCodegenConstants,
     storage_instance_key: usize,
     function_index_by_id: HashMap<FunctionId, usize>,
@@ -773,6 +776,7 @@ pub fn build_shared_state_for_inspection_with_placeholder_constants(
         module_name: module_name.to_string(),
         package_name: package_name.to_string(),
         source_hash: 0,
+        module_cache_source: None,
         codegen_constants,
         storage_instance_key: allocate_shared_module_state_storage_key(),
         function_index_by_id,
@@ -828,6 +832,7 @@ fn build_shared_state_for_inspection_with_original_code(
         module_name: module_name.to_string(),
         package_name: package_name.to_string(),
         source_hash: 0,
+        module_cache_source: None,
         codegen_constants,
         storage_instance_key: allocate_shared_module_state_storage_key(),
         function_index_by_id,
@@ -891,6 +896,7 @@ impl SoacExtModuleState {
         module_name: String,
         package_name: String,
         source_hash: u64,
+        module_cache_source: Option<PythonModuleCacheSource>,
     ) -> PyResult<()> {
         if self.initialized {
             return Err(PyRuntimeError::new_err(
@@ -918,6 +924,7 @@ impl SoacExtModuleState {
             module_name,
             package_name,
             source_hash,
+            module_cache_source,
             codegen_constants,
             storage_instance_key: allocate_shared_module_state_storage_key(),
             function_index_by_id,
@@ -1521,6 +1528,7 @@ impl SoacExtModule {
         ensure_module_dict_metadata_names(&mut lowered_module.global_names);
         module_info.indexed_module_keys = lowered_module.global_names.clone();
         let source_hash = module_info.hash;
+        let module_cache_source = module_info.cache_source;
         let module_name = spec
             .getattr("name")?
             .extract::<String>()
@@ -1549,6 +1557,7 @@ impl SoacExtModule {
                 module_name,
                 package_name,
                 source_hash,
+                module_cache_source,
             )?
         };
         Ok(module.unbind())
@@ -1605,6 +1614,7 @@ def f():
             codegen_constants: ModuleCodegenConstants::collect_from_module(&lowered),
             inline_plan: plan_inline_candidates(&lowered),
             source_hash: 0,
+            module_cache_source: None,
             storage_instance_key: allocate_shared_module_state_storage_key(),
             module_constant_objs: Vec::new(),
             runtime_name_cache: build_runtime_name_cache(),
@@ -1680,6 +1690,7 @@ def f(x):
             codegen_constants: ModuleCodegenConstants::collect_from_module(&lowered),
             inline_plan: plan_inline_candidates(&lowered),
             source_hash: 0,
+            module_cache_source: None,
             storage_instance_key: allocate_shared_module_state_storage_key(),
             module_constant_objs: Vec::new(),
             runtime_name_cache: build_runtime_name_cache(),
@@ -1835,6 +1846,7 @@ def f():
             codegen_constants: ModuleCodegenConstants::collect_from_module(&lowered),
             inline_plan: plan_inline_candidates(&lowered),
             source_hash: 0,
+            module_cache_source: None,
             storage_instance_key: allocate_shared_module_state_storage_key(),
             module_constant_objs: Vec::new(),
             runtime_name_cache: build_runtime_name_cache(),

@@ -4,6 +4,7 @@ use soac_blockpy::block_py::{BlockPyModule, FunctionId, InstrId};
 use soac_blockpy::codegen_cache::{CachedCodegenModuleMetadata, PythonModuleCacheSource};
 use soac_blockpy::passes::CodegenModuleShape;
 use std::collections::HashMap;
+use std::fs;
 use std::path::Path;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -236,6 +237,162 @@ impl OptimizationPlan {
             cache_identity: metadata.cache_identity.clone(),
             functions,
         }
+    }
+
+    pub fn validate_for_module(
+        &self,
+        source: Option<PythonModuleCacheSource>,
+        module_name: &str,
+        source_hash: u64,
+        cache_identity: &str,
+    ) -> Result<()> {
+        if let Some(source) = source
+            && self.source != source
+        {
+            bail!(
+                "optimization plan source for module {module_name} is {:?}, expected {:?}",
+                self.source,
+                source
+            );
+        }
+        if self.module_name != module_name {
+            bail!(
+                "optimization plan module name is {}, expected {module_name}",
+                self.module_name
+            );
+        }
+        if self.source_hash != source_hash {
+            bail!(
+                "optimization plan source hash for module {module_name} is 0x{:016x}, expected 0x{source_hash:016x}",
+                self.source_hash
+            );
+        }
+        if self.cache_identity != cache_identity {
+            bail!(
+                "optimization plan cache identity for module {module_name} is {}, expected {cache_identity}",
+                self.cache_identity
+            );
+        }
+        Ok(())
+    }
+
+    pub fn evidence_for_function(
+        &self,
+        function_id: FunctionId,
+    ) -> Result<FunctionProfileEvidence> {
+        let Some(function) = self
+            .functions
+            .iter()
+            .find(|function| function.function_id == function_id)
+        else {
+            return Ok(FunctionProfileEvidence::default());
+        };
+        let mut evidence = FunctionProfileEvidence::default();
+        for decision in &function.decisions {
+            apply_decision_to_evidence(decision, &mut evidence)?;
+        }
+        Ok(evidence)
+    }
+
+    pub fn evidence_by_function(&self) -> Result<HashMap<FunctionId, FunctionProfileEvidence>> {
+        let mut out = HashMap::new();
+        for function in &self.functions {
+            let mut evidence = FunctionProfileEvidence::default();
+            for decision in &function.decisions {
+                apply_decision_to_evidence(decision, &mut evidence)?;
+            }
+            out.insert(function.function_id, evidence);
+        }
+        Ok(out)
+    }
+}
+
+pub fn load_optimization_plan(path: &Path) -> Result<OptimizationPlan> {
+    let bytes =
+        fs::read(path).with_context(|| format!("read optimization plan {}", path.display()))?;
+    rkyv::from_bytes::<OptimizationPlan, rkyv::rancor::Error>(bytes.as_slice())
+        .map_err(|err| anyhow::anyhow!("deserialize optimization plan {}: {err}", path.display()))
+}
+
+fn apply_decision_to_evidence(
+    decision: &OptimizationDecision,
+    evidence: &mut FunctionProfileEvidence,
+) -> Result<()> {
+    match &decision.replacement {
+        PlannedReplacement::Guarded {
+            alternatives,
+            fallback: PlannedFallback::OriginalInstruction,
+        } => {
+            for alternative in alternatives {
+                apply_alternative_to_evidence(decision.instr_id, alternative, evidence)?;
+            }
+        }
+        PlannedReplacement::BranchPreference { prefer_true } => {
+            evidence
+                .branch_prefer_true
+                .insert(decision.instr_id, *prefer_true);
+        }
+    }
+    Ok(())
+}
+
+fn apply_alternative_to_evidence(
+    instr_id: InstrId,
+    alternative: &PlannedAlternative,
+    evidence: &mut FunctionProfileEvidence,
+) -> Result<()> {
+    match alternative.action {
+        PlannedAction::DirectCall { function_id } => {
+            validate_alternative_guard(
+                alternative,
+                |guard| matches!(guard, PlannedGuard::FunctionId { function_id: guarded } if *guarded == function_id),
+                "direct-call alternative",
+            )?;
+            push_unique(
+                evidence
+                    .call_target_specializations
+                    .entry(instr_id)
+                    .or_default(),
+                function_id,
+            );
+        }
+        PlannedAction::SpecializedShape { family, shape } => {
+            validate_alternative_guard(
+                alternative,
+                |guard| matches!(guard, PlannedGuard::ObservedShape { family: guarded_family, shape: guarded_shape } if *guarded_family == family && *guarded_shape == shape),
+                "shape-specialization alternative",
+            )?;
+            push_unique(
+                shape_map_for_family(evidence, family)
+                    .entry(instr_id)
+                    .or_default(),
+                shape,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_alternative_guard(
+    alternative: &PlannedAlternative,
+    predicate: impl Fn(&PlannedGuard) -> bool,
+    context: &str,
+) -> Result<()> {
+    if alternative.guards.iter().any(predicate) {
+        Ok(())
+    } else {
+        bail!("{context} is missing the matching guard")
+    }
+}
+
+fn shape_map_for_family(
+    evidence: &mut FunctionProfileEvidence,
+    family: ShapeFamily,
+) -> &mut HashMap<InstrId, Vec<u64>> {
+    match family {
+        ShapeFamily::Operator => &mut evidence.operator_specializations,
+        ShapeFamily::GetItem => &mut evidence.getitem_specializations,
+        ShapeFamily::SetItem => &mut evidence.setitem_specializations,
     }
 }
 
@@ -565,6 +722,45 @@ mod tests {
         assert_eq!(
             decisions.last().map(|decision| &decision.replacement),
             Some(&PlannedReplacement::BranchPreference { prefer_true: true })
+        );
+
+        let plan = OptimizationPlan {
+            source: PythonModuleCacheSource::Project,
+            module_name: "pkg.mod".to_string(),
+            source_hash: 0x1234,
+            cache_identity: "test-cache".to_string(),
+            functions: vec![FunctionOptimizationPlan {
+                function_id,
+                qualname: "f".to_string(),
+                decisions,
+            }],
+        };
+        plan.validate_for_module(
+            Some(PythonModuleCacheSource::Project),
+            "pkg.mod",
+            0x1234,
+            "test-cache",
+        )
+        .unwrap();
+        let planned_evidence = plan.evidence_by_function().unwrap();
+        let planned_function = planned_evidence.get(&function_id).unwrap();
+        assert_eq!(
+            planned_function
+                .call_target_specializations
+                .get(&instr_id)
+                .unwrap(),
+            &vec![target_id]
+        );
+        assert_eq!(
+            planned_function
+                .operator_specializations
+                .get(&instr_id)
+                .unwrap(),
+            &vec![257]
+        );
+        assert_eq!(
+            planned_function.branch_prefer_true.get(&instr_id),
+            Some(&true)
         );
     }
 

@@ -484,7 +484,10 @@ so a later turn can resume without rediscovering context.
   artifact under the requested root, such as
   `$SOAC_WORK_DIR/modules/python-stdlib/typing/mod.opt`. Use
   `cargo run -p soac-inspector --bin print_optimization_plan -- --plan <mod.opt>`
-  to pretty-print it for inspection.
+  to pretty-print it for inspection. In `SOAC_OPT_MODE=verify|apply`, runtime
+  specialization looks for a matching `mod.opt` in the active module cache and
+  uses it before falling back to `profile.bin` counters for decision-backed
+  call, operator, getitem, setitem, and branch specializations.
 - `SOAC_CRANELIFT_OPT_LEVEL`
   Optional Cranelift process-JIT optimization level override:
   `none`, `speed`, or `speed_and_size`. Normal runtime and benchmark

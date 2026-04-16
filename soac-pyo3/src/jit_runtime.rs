@@ -458,15 +458,17 @@ fn create_module(py: Python<'_>, path: &str, spec: Py<PyAny>) -> PyResult<Py<PyA
     })?;
     let source_bytes = source.len();
     let source_hash = hash_module_source(&source);
+    let module_cache_source = module_cache_source_for_import_path(path);
     let module_info = ModuleInfo {
         hash: source_hash,
+        cache_source: Some(module_cache_source),
         indexed_module_keys: Vec::new(),
     };
     let session = soac_jit::CompileSession::process();
     let runtime_names_as_globals = module_name == "soac.runtime";
     let pre_optimization_cache = pre_optimization_module_cache(
         module_name.as_str(),
-        module_cache_source_for_import_path(path),
+        module_cache_source,
         source_hash,
         runtime_names_as_globals,
     )?;

@@ -357,7 +357,10 @@ globals are out of scope for now.
   module's binary optimization-decision artifact under `<root-dir>` using the
   stable module artifact path, such as `python-stdlib/typing/mod.opt`. Use
   `cargo run -p soac-inspector --bin print_optimization_plan -- --plan <mod.opt>`
-  to pretty-print it for inspection.
+  to pretty-print it for inspection. In `SOAC_OPT_MODE=verify|apply`, runtime
+  specialization looks for a matching `mod.opt` in the active module cache and
+  uses it before falling back to `profile.bin` counters for decision-backed
+  call, operator, getitem, setitem, and branch specializations.
 
 - `SOAC_JIT_PERF_HELPER_FRAMES=1`
   In `fn should_preserve_perf_helper_frames`, at

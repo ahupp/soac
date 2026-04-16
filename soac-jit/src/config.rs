@@ -2,6 +2,7 @@ use cranelift_codegen::isa::TargetIsa;
 use cranelift_codegen::settings;
 use cranelift_codegen::settings::Configurable;
 pub use soac_blockpy::codegen_cache::CachedCodegenModuleMetadata;
+use soac_blockpy::codegen_cache::module_optimization_plan_path as blockpy_module_optimization_plan_path;
 #[cfg(test)]
 pub(crate) use soac_blockpy::env_config::SOAC_JIT_EMIT_REFCOUNTS_ENV;
 pub(crate) use soac_blockpy::env_config::SpecializationMode;
@@ -157,6 +158,15 @@ pub fn pre_optimization_module_cache_metadata(
         build_identity,
         runtime_names_as_globals,
     )
+}
+
+pub fn module_optimization_plan_path(
+    cache_root: &Path,
+    source: PythonModuleCacheSource,
+    module_name: &str,
+) -> Result<PathBuf, String> {
+    blockpy_module_optimization_plan_path(cache_root, source, module_name)
+        .map_err(|err| err.to_string())
 }
 
 pub(crate) fn precompiled_library_path_from_env() -> Result<Option<PathBuf>, String> {

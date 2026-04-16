@@ -6,8 +6,10 @@ use crate::SOAC_RUNTIME_CLIF;
 #[cfg(test)]
 use crate::config::SOAC_JIT_EMIT_REFCOUNTS_ENV;
 use crate::config::{
-    CraneliftTargetConfig, SpecializationMode, behavior_change_indexed_stores_enabled,
-    counter_dump_input_path_from_env, jit_compile_workers, jit_refcount_emission_enabled,
+    CraneliftTargetConfig, PythonModuleCacheSource, SpecializationMode,
+    behavior_change_indexed_stores_enabled, counter_dump_input_path_from_env, jit_compile_workers,
+    jit_refcount_emission_enabled, module_cache_root_from_env_or_repo,
+    module_optimization_plan_path, pre_optimization_module_cache_identity,
     profiled_cold_blocks_enabled, soac_work_dir_from_env, specialization_mode_from_env,
     specialization_mode_is_profile,
 };
@@ -24,6 +26,7 @@ use crate::function_instantiation::{
 };
 use crate::module_constants::{ModuleCodegenConstants, ModuleConstantId};
 use crate::module_type::{CounterRuntimeSlot, SharedModuleState, build_counter_storage_layout};
+use crate::optimization_plan::{FunctionProfileEvidence, load_optimization_plan};
 use cranelift_codegen::cfg_printer::CFGPrinter;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::inline::{Inline, InlineCommand};
@@ -1676,7 +1679,7 @@ impl JitBatchPlan<'_> {
             }
             let module_plan = if let Some(shared_state) = batch_function.source.shared_state() {
                 let profile = SpecializationProfile::from_runtime_state(Some(shared_state))?;
-                if profile.has_existing_counter_dump() {
+                if profile.has_specialization_inputs() {
                     let direct_owner_attr_specializations_by_function = self
                         .function_compile_inputs
                         .iter()
@@ -12341,6 +12344,7 @@ fn collect_deopt_entry_counter_ids_by_kind(
 struct SpecializationProfile<'a> {
     module_name: Option<&'a str>,
     counter_dump_path: Option<Cow<'a, Path>>,
+    planned_evidence: HashMap<FunctionId, FunctionProfileEvidence>,
     behavior_change_indexed_stores: bool,
     profiled_cold_blocks: bool,
     guard_miss_deopt: bool,
@@ -12357,6 +12361,62 @@ struct FunctionSpecializationInputs {
     cold_block_labels: HashSet<BlockLabel>,
     behavior_change_indexed_stores: bool,
     guard_miss_deopt_stub: bool,
+}
+
+fn soac_repo_root_for_module_cache() -> Option<PathBuf> {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(Path::to_path_buf)
+}
+
+fn load_planned_evidence_for_runtime_state(
+    shared_state: Option<&SharedModuleState>,
+    specialization_mode: Option<SpecializationMode>,
+) -> Result<HashMap<FunctionId, FunctionProfileEvidence>, String> {
+    if !matches!(
+        specialization_mode,
+        Some(SpecializationMode::Verify | SpecializationMode::Apply)
+    ) {
+        return Ok(HashMap::new());
+    }
+    let Some(shared_state) = shared_state else {
+        return Ok(HashMap::new());
+    };
+    let repo_root = soac_repo_root_for_module_cache();
+    let Some(cache_root) = module_cache_root_from_env_or_repo(repo_root.as_deref())? else {
+        return Ok(HashMap::new());
+    };
+    let cache_identity = pre_optimization_module_cache_identity(
+        env!("SOAC_BUILD_IDENTITY"),
+        shared_state.module_name == "soac.runtime",
+    );
+    let candidate_sources = match shared_state.module_cache_source {
+        Some(source) => vec![source],
+        None => vec![
+            PythonModuleCacheSource::Project,
+            PythonModuleCacheSource::PythonStdlib,
+        ],
+    };
+    for source in candidate_sources {
+        let path = module_optimization_plan_path(
+            cache_root.as_path(),
+            source,
+            shared_state.module_name.as_str(),
+        )?;
+        if !path.exists() {
+            continue;
+        }
+        let plan = load_optimization_plan(path.as_path()).map_err(|err| err.to_string())?;
+        plan.validate_for_module(
+            Some(source),
+            shared_state.module_name.as_str(),
+            shared_state.source_hash,
+            cache_identity.as_str(),
+        )
+        .map_err(|err| err.to_string())?;
+        return plan.evidence_by_function().map_err(|err| err.to_string());
+    }
+    Ok(HashMap::new())
 }
 
 impl FunctionSpecializationInputs {
@@ -12391,9 +12451,12 @@ impl<'a> SpecializationProfile<'a> {
         } else {
             None
         };
+        let planned_evidence =
+            load_planned_evidence_for_runtime_state(shared_state, specialization_mode)?;
         Ok(Self {
             module_name: shared_state.map(|shared_state| shared_state.module_name.as_str()),
             counter_dump_path: counter_dump_path.map(Cow::Owned),
+            planned_evidence,
             behavior_change_indexed_stores: behavior_change_indexed_stores_enabled()?,
             profiled_cold_blocks: profiled_cold_blocks_enabled()?,
             guard_miss_deopt: matches!(
@@ -12410,6 +12473,7 @@ impl<'a> SpecializationProfile<'a> {
         Ok(Self {
             module_name: Some(module_name),
             counter_dump_path: counter_dump_path.map(Cow::Borrowed),
+            planned_evidence: HashMap::new(),
             behavior_change_indexed_stores: true,
             profiled_cold_blocks: profiled_cold_blocks_enabled()?,
             guard_miss_deopt: true,
@@ -12421,10 +12485,17 @@ impl<'a> SpecializationProfile<'a> {
             && existing_counter_dump_path(self.counter_dump_path.as_deref()).is_some()
     }
 
+    fn has_specialization_inputs(&self) -> bool {
+        !self.planned_evidence.is_empty() || self.has_existing_counter_dump()
+    }
+
     fn call_target_specializations(
         &self,
         function_id: FunctionId,
     ) -> Result<HashMap<InstrId, Vec<FunctionId>>, String> {
+        if let Some(evidence) = self.planned_evidence.get(&function_id) {
+            return Ok(evidence.call_target_specializations.clone());
+        }
         let Some(module_name) = self.module_name else {
             return Ok(HashMap::new());
         };
@@ -12438,6 +12509,9 @@ impl<'a> SpecializationProfile<'a> {
         &self,
         function_id: FunctionId,
     ) -> Result<HashMap<InstrId, Vec<u64>>, String> {
+        if let Some(evidence) = self.planned_evidence.get(&function_id) {
+            return Ok(evidence.operator_specializations.clone());
+        }
         let Some(module_name) = self.module_name else {
             return Ok(HashMap::new());
         };
@@ -12451,6 +12525,9 @@ impl<'a> SpecializationProfile<'a> {
         &self,
         function_id: FunctionId,
     ) -> Result<HashMap<InstrId, Vec<u64>>, String> {
+        if let Some(evidence) = self.planned_evidence.get(&function_id) {
+            return Ok(evidence.getitem_specializations.clone());
+        }
         let Some(module_name) = self.module_name else {
             return Ok(HashMap::new());
         };
@@ -12464,6 +12541,9 @@ impl<'a> SpecializationProfile<'a> {
         &self,
         function_id: FunctionId,
     ) -> Result<HashMap<InstrId, Vec<u64>>, String> {
+        if let Some(evidence) = self.planned_evidence.get(&function_id) {
+            return Ok(evidence.setitem_specializations.clone());
+        }
         let Some(module_name) = self.module_name else {
             return Ok(HashMap::new());
         };
@@ -12477,6 +12557,9 @@ impl<'a> SpecializationProfile<'a> {
         &self,
         function_id: FunctionId,
     ) -> Result<HashMap<InstrId, bool>, String> {
+        if let Some(evidence) = self.planned_evidence.get(&function_id) {
+            return Ok(evidence.branch_prefer_true.clone());
+        }
         let Some(module_name) = self.module_name else {
             return Ok(HashMap::new());
         };
@@ -24851,7 +24934,7 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
     let specialization_profile = SpecializationProfile::from_runtime_state(runtime_state)?;
     predeclare_specialization_type_imports(&mut jit_module, &specialization_profile)?;
     let mut direct_owner_attr_specializations_by_function = HashMap::new();
-    if runtime_state.is_some() && specialization_profile.has_existing_counter_dump() {
+    if runtime_state.is_some() && specialization_profile.has_specialization_inputs() {
         for function in &module.callable_defs {
             let direct_owner_attr_specializations = predeclare_direct_call_owner_type_imports(
                 &mut jit_module,
@@ -24866,7 +24949,7 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
         }
     }
     let jit_module_plan =
-        if runtime_state.is_some() && specialization_profile.has_existing_counter_dump() {
+        if runtime_state.is_some() && specialization_profile.has_specialization_inputs() {
             build_profiled_jit_module_plan(
                 module,
                 &specialization_profile,
