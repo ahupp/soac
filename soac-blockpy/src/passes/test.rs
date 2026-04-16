@@ -3535,6 +3535,34 @@ def make_counter(delta):
 }
 
 #[test]
+fn generator_resume_inherited_capture_is_not_rewritten_as_always_unbound() {
+    let source = r#"
+def code_template_gen(_it):
+    while True:
+        yield next(_it)
+"#;
+
+    let lowering = TrackedLowering::new(source);
+    let bb_module = lowering.bb_module();
+    let resume = bb_module
+        .callable_defs
+        .iter()
+        .find(|func| func.names.bind_name == "code_template_gen_resume")
+        .expect("missing synthetic resume function");
+
+    assert!(
+        resolved_function_uses_captured_source(resume),
+        "resume should load _it from its inherited closure capture:\n{}",
+        lowering.name_binding_text()
+    );
+    assert!(
+        !function_or_constants_use_text(bb_module, resume, "raise_deleted_name"),
+        "inherited closure captures are not statically unbound locals:\n{}",
+        lowering.name_binding_text()
+    );
+}
+
+#[test]
 fn lowers_outer_with_nested_nonlocal_inner() {
     let source = r#"
 def outer():

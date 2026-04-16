@@ -1425,7 +1425,7 @@ fn collect_always_unbound_local_names(
         .filter(|name| {
             matches!(
                 scope.effective_binding(name.as_str(), BindingPurpose::Load),
-                Some(EffectiveBinding::Local | EffectiveBinding::Cell(_))
+                Some(EffectiveBinding::Local | EffectiveBinding::Cell(CellBindingKind::Owner))
             )
         })
         .cloned()
