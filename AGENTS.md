@@ -123,7 +123,10 @@ current `@`. Do not treat another workspace's live `@` as a dependency.
 5. Add focused regression coverage for real bugs.
    For each CPython regression you fix, add a minimal reproducing integration
    test under `tests/` first.
-   If diagnosing a hang, add follow-up instrumentation where practical and leave behind a focused regression or assertion for that hang shape.
+   If diagnosing a hang, use `just capture-test-stacks <pid>` on the apparently
+   stuck test process or the `just test-all` child PID printed in progress
+   output, add follow-up instrumentation where practical, and leave behind a
+   focused regression or assertion for that hang shape.
    Avoid render-only tests for BlockPy/CLIF/inspector text. Prefer behavior,
    structure, or API tests; exact renderer output changes too often to be a
    useful default regression surface.
@@ -311,6 +314,13 @@ anything non-code affected the run. If there were no such issues, say
   and falls back to the full build path when they are stale or missing. The
   root pytest config defaults collection to `tests/`, so option-only invocations
   such as `just pytest-fast -q` do not recurse into vendored CPython tests.
+- `just capture-test-stacks <pid> [out]`
+  Hang diagnostic for test runs. Pass the PID printed by `just test-all` for
+  `cargo-test`/`pytest`, or the PID of a stuck `just`, `pytest`, or
+  `cargo test` process. The recipe walks the process tree and writes native
+  gdb stacks plus Python `py-bt` stacks, when available, to `logs/` by default.
+  It may need ptrace permission/CAP_SYS_PTRACE depending on host
+  `/proc/sys/kernel/yama/ptrace_scope`.
 - `just py ...`
   Best entrypoint for ad hoc transformed-runtime repros outside pytest.
 - `just py-fast ...`

@@ -801,6 +801,120 @@ pytest-fast *args='': build-test-runtime-fast
   #!/usr/bin/env bash
   just _pytest-run "$@"
 
+capture-test-stacks root_pid out="":
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cd "$REPO_ROOT"
+
+  ROOT_PID="{{root_pid}}"
+  if [[ ! "$ROOT_PID" =~ ^[0-9]+$ ]]; then
+    echo "usage: just capture-test-stacks <root-pid> [out]" >&2
+    echo "Use the pid printed by just test-all, or the pid of a hung just/pytest/cargo-test process." >&2
+    exit 2
+  fi
+  if ! kill -0 "$ROOT_PID" 2>/dev/null; then
+    echo "process $ROOT_PID does not exist or is not visible" >&2
+    exit 1
+  fi
+  if ! command -v gdb >/dev/null 2>&1; then
+    echo "gdb not found; install gdb before capturing native test stacks" >&2
+    exit 1
+  fi
+
+  collect_descendants() {
+    local parent="$1"
+    local child
+    while read -r child; do
+      [[ -n "$child" ]] || continue
+      printf '%s\n' "$child"
+      collect_descendants "$child"
+    done < <(pgrep -P "$parent" 2>/dev/null || true)
+  }
+
+  mapfile -t pids < <(
+    {
+      printf '%s\n' "$ROOT_PID"
+      collect_descendants "$ROOT_PID"
+    } | awk '!seen[$0]++'
+  )
+
+  OUT="{{out}}"
+  if [[ -z "$OUT" ]]; then
+    mkdir -p "$REPO_ROOT/logs"
+    OUT="$REPO_ROOT/logs/test-stacks-$(date -u +%Y%m%dT%H%M%SZ)-pid${ROOT_PID}.log"
+  fi
+  mkdir -p "$(dirname "$OUT")"
+
+  {
+    printf 'SOAC test stack capture\n'
+    printf 'timestamp_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'root_pid=%s\n' "$ROOT_PID"
+    printf 'pids=%s\n' "${pids[*]}"
+    printf '\n'
+  } >"$OUT"
+
+  GDB_TIMEOUT="${STACK_GDB_TIMEOUT:-20s}"
+  PYTHON_GDB="$REPO_ROOT/vendor/cpython/python-gdb.py"
+  capture_failures=0
+
+  for pid in "${pids[@]}"; do
+    {
+      printf '\n===== pid %s =====\n' "$pid"
+      if [[ -r "/proc/$pid/cmdline" ]]; then
+        printf 'cmdline: '
+        tr '\0' ' ' <"/proc/$pid/cmdline"
+        printf '\n'
+      fi
+      if [[ -r "/proc/$pid/status" ]]; then
+        sed -n '1,12p' "/proc/$pid/status"
+      fi
+      if [[ -e "/proc/$pid/cwd" ]]; then
+        printf 'cwd: %s\n' "$(readlink "/proc/$pid/cwd" 2>/dev/null || true)"
+      fi
+      printf '\n--- gdb: native and Python stacks ---\n'
+    } >>"$OUT"
+
+    if [[ ! -d "/proc/$pid" ]]; then
+      printf 'process exited before capture\n' >>"$OUT"
+      continue
+    fi
+
+    set +e
+    gdb_output="$(mktemp -t soac-test-stack-gdb.XXXXXX.log)"
+    if [[ -f "$PYTHON_GDB" ]]; then
+      timeout "$GDB_TIMEOUT" gdb -q -batch -p "$pid" \
+        -ex "set pagination off" \
+        -ex "set confirm off" \
+        -ex "source $PYTHON_GDB" \
+        -ex "info threads" \
+        -ex "thread apply all bt full" \
+        -ex "thread apply all py-bt" >"$gdb_output" 2>&1
+    else
+      timeout "$GDB_TIMEOUT" gdb -q -batch -p "$pid" \
+        -ex "set pagination off" \
+        -ex "set confirm off" \
+        -ex "info threads" \
+        -ex "thread apply all bt full" >"$gdb_output" 2>&1
+    fi
+    status=$?
+    set -e
+    cat "$gdb_output" >>"$OUT"
+    if [[ "$status" -ne 0 ]]; then
+      printf '\ngdb capture exited with status %s for pid %s\n' "$status" "$pid" >>"$OUT"
+      capture_failures=$((capture_failures + 1))
+    elif grep -Eq 'Could not attach to process|ptrace:' "$gdb_output"; then
+      printf '\ngdb could not attach to pid %s; check ptrace_scope/CAP_SYS_PTRACE permissions\n' "$pid" >>"$OUT"
+      capture_failures=$((capture_failures + 1))
+    fi
+    rm -f "$gdb_output"
+  done
+
+  echo "$OUT"
+  if [[ "$capture_failures" -ne 0 ]]; then
+    echo "stack capture incomplete for $capture_failures process(es); see $OUT" >&2
+    exit 1
+  fi
+
 py *args='': build-test-runtime
   #!/usr/bin/env bash
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
