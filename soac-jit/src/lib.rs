@@ -1543,7 +1543,7 @@ pub unsafe fn register_function_owner_types_for_module_keys(
 }
 
 unsafe fn ensure_clif_direct_entries_compiled(
-    py: Python<'_>,
+    _py: Python<'_>,
     data: &mut PyFunctionJitExtra,
 ) -> Result<(), ()> {
     if data.function_env.compiled_function.is_none() {
@@ -1555,70 +1555,68 @@ unsafe fn ensure_clif_direct_entries_compiled(
         let function_qualname = function.names.qualname.clone();
         let module_state = Arc::clone(&data.module_state);
         let compile_session = Arc::clone(&data.compile_session);
-        let compiled_function_result = py.detach(move || {
-            let compile_start = Instant::now();
-            match module_state
-                .lookup_or_compile_direct_function_handle(&compile_session, function.function_id)
-            {
-                Ok(Some((handle, compiled))) => {
-                    if !compiled
-                        && !jit::is_synthetic_class_helper_function(&function)
-                        && let Some(stats) = handle.jit_stats()
-                    {
-                        module_state.append_jit_codegen_log(
-                            &function,
-                            "direct_function_body",
-                            compile_start.elapsed(),
-                            "ok",
-                            None,
-                            Some(stats),
-                        );
-                    }
-                    Ok(handle)
-                }
-                Ok(None) => {
-                    let block_ptrs = vec![ptr::null_mut::<c_void>(); function.blocks.len()];
-                    let module_constant_ptrs = module_state.module_constant_ptrs();
-                    let compile_result = jit::compile_cranelift_run_bb_specialized_cached(
-                        &compile_session,
-                        block_ptrs.as_slice(),
-                        &module_state.lowered_module,
+        let compile_start = Instant::now();
+        let compiled_function_result = match module_state
+            .lookup_or_compile_direct_function_handle(&compile_session, function.function_id)
+        {
+            Ok(Some((handle, compiled))) => {
+                if !compiled
+                    && !jit::is_synthetic_class_helper_function(&function)
+                    && let Some(stats) = handle.jit_stats()
+                {
+                    module_state.append_jit_codegen_log(
                         &function,
-                        &module_state.codegen_constants,
-                        &module_state.lowered_module.counter_defs,
-                        &module_constant_ptrs,
-                        Some(module_state.as_ref()),
+                        "direct_function_body",
+                        compile_start.elapsed(),
+                        "ok",
+                        None,
+                        Some(stats),
                     );
-                    match compile_result {
-                        Ok(result) => {
-                            if result.compiled {
-                                module_state.append_jit_codegen_log(
-                                    &function,
-                                    "vectorcall_function_body",
-                                    compile_start.elapsed(),
-                                    "ok",
-                                    None,
-                                    result.stats.as_ref(),
-                                );
-                            }
-                            Ok(result.handle)
-                        }
-                        Err(err) => {
+                }
+                Ok(handle)
+            }
+            Ok(None) => {
+                let block_ptrs = vec![ptr::null_mut::<c_void>(); function.blocks.len()];
+                let module_constant_ptrs = module_state.module_constant_ptrs();
+                let compile_result = jit::compile_cranelift_run_bb_specialized_cached(
+                    &compile_session,
+                    block_ptrs.as_slice(),
+                    &module_state.lowered_module,
+                    &function,
+                    &module_state.codegen_constants,
+                    &module_state.lowered_module.counter_defs,
+                    &module_constant_ptrs,
+                    Some(module_state.as_ref()),
+                );
+                match compile_result {
+                    Ok(result) => {
+                        if result.compiled {
                             module_state.append_jit_codegen_log(
                                 &function,
                                 "vectorcall_function_body",
                                 compile_start.elapsed(),
-                                "error",
-                                Some(&err),
+                                "ok",
                                 None,
+                                result.stats.as_ref(),
                             );
-                            Err(err)
                         }
+                        Ok(result.handle)
+                    }
+                    Err(err) => {
+                        module_state.append_jit_codegen_log(
+                            &function,
+                            "vectorcall_function_body",
+                            compile_start.elapsed(),
+                            "error",
+                            Some(&err),
+                            None,
+                        );
+                        Err(err)
                     }
                 }
-                Err(err) => Err(err),
             }
-        });
+            Err(err) => Err(err),
+        };
         let compiled_function = match compiled_function_result {
             Ok(handle) => handle,
             Err(err) => {

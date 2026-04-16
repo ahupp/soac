@@ -3770,6 +3770,10 @@ impl ProcessJitCompileWaiter {
     }
 }
 
+fn wait_for_process_jit_compile(waiter: &ProcessJitCompileWaiter) -> Result<(), String> {
+    Python::try_attach(|py| py.detach(|| waiter.wait())).unwrap_or_else(|| waiter.wait())
+}
+
 impl ProcessJitModule {
     fn new(compile_session: &crate::session::CompileSession) -> Result<Self, String> {
         Ok(Self {
@@ -20636,7 +20640,7 @@ impl ProcessJitEngine {
         let mut plan = match reserved_batch_result {
             Ok(ReservedDirectFunctionBatch::Ready(_)) => return Ok(()),
             Ok(ReservedDirectFunctionBatch::Compiling(waiter)) => {
-                return waiter.wait();
+                return wait_for_process_jit_compile(&waiter);
             }
             Ok(ReservedDirectFunctionBatch::Reserved(plan)) => plan,
             Err(err) => {
@@ -20787,7 +20791,7 @@ impl ProcessJitEngine {
             ) {
                 Ok(DirectFunctionCompileAttempt::Done(result)) => return Ok(result),
                 Ok(DirectFunctionCompileAttempt::Wait(waiter)) => {
-                    let wait_result = waiter.wait();
+                    let wait_result = wait_for_process_jit_compile(&waiter);
                     if let Some(handle) = self.lookup_ready_direct_function(function)? {
                         return Ok(DirectFunctionCompileResult {
                             handle,

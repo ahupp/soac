@@ -124,6 +124,13 @@ def run_integration_module(tmp_path: Path):
     return _runner
 
 
+@pytest.fixture(autouse=True)
+def _restore_import_hook_state():
+    prior_meta_path = list(sys.meta_path)
+    yield
+    sys.meta_path[:] = prior_meta_path
+
+
 @pytest.hookimpl(hookwrapper=True, tryfirst=True)
 def pytest_runtest_makereport(item, call):
     outcome = yield
