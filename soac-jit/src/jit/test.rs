@@ -25,7 +25,7 @@ mod tests {
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyModule, PyModuleMethods, PyTuple};
     use pyo3::{Bound, Py, PyAny, PyErr, PyResult, Python, ffi};
     use ruff_python_ast as ast;
-    use soac_blockpy::passes::TypedPlannedResult as PlannedResult;
+    use soac_blockpy::passes::{TypedInstrExtra, TypedPlannedResult as PlannedResult};
     use std::collections::{HashMap, VecDeque};
     use std::ffi::c_void;
     use std::mem::size_of;
@@ -4691,6 +4691,63 @@ def build(values):
             &stack_slots,
             Some(&storage_layout),
         ));
+    }
+
+    #[test]
+    fn typed_planned_borrowed_local_input_still_requires_local_env_borrowability() {
+        let env = LocalEnv {
+            entries: vec![LocalEnvEntry {
+                location: Some(LocalLocation(0)),
+                name: "x".to_string(),
+                aliases: Vec::new(),
+                value: ir::Value::from_u32(1),
+                ref_kind: LocalRefKind::Owned,
+                storage: LocalEnvStorage::LocalOnly,
+                binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Owned),
+                py_facts: None,
+            }],
+        };
+        let stack_slots = StackSlots {
+            names: Vec::new(),
+            slots: Vec::new(),
+        };
+        let mut extra = TypedInstrExtra::default();
+        extra.set_planned_result(PlannedResult::PYOBJECT_BORROWED_LOCAL);
+        let expr = InstrTyped::Load(Load::<InstrTyped>::new(test_name("x")).with_extra(extra));
+
+        assert_eq!(
+            typed_expr_planned_pyobject_input_is_borrowed_from_local_env(
+                &expr,
+                &env,
+                &stack_slots,
+                None,
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            typed_expr_planned_pyobject_input_is_borrowed_from_local_env(
+                &expr,
+                &LocalEnv::default(),
+                &stack_slots,
+                None,
+            ),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn typed_planned_pyobject_ownership_preserves_immortal_result_facts() {
+        let mut extra = TypedInstrExtra::default();
+        extra.refine_result_facts(ValueFacts::PyObj(PyObjFacts::none_singleton()));
+        extra.set_planned_result(PlannedResult::PYOBJECT_IMMORTAL);
+        let expr =
+            InstrTyped::Load(Load::<InstrTyped>::new(test_runtime_name("NONE")).with_extra(extra));
+
+        let (ownership, facts) =
+            planned_owned_pyobject_result_for_typed_expr(&expr, &LocalEnv::default());
+
+        assert_eq!(ownership, ValueOwnership::Immortal);
+        assert!(facts.is_none());
     }
 
     fn local_env_store_test_state(

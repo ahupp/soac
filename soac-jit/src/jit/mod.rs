@@ -58,9 +58,10 @@ use soac_blockpy::passes::{
     TypedDirectCallGuardTest, TypedDirectCallGuardTestKind, TypedDirectCallableCall,
     TypedDirectCallableCallGuard, TypedDirectConstructorCallGuard, TypedDirectFunctionCallGuard,
     TypedDirectMethodCall, TypedDirectMethodCallGuard, TypedGetAttr, TypedGuardedCallableCall,
-    TypedGuardedMethodCall, TypedIndexedFieldGuard, TypedSetAttr, ValueFacts,
-    annotate_typed_function_planned_results, annotate_typed_function_result_demands,
-    annotate_typed_function_value_facts, assign_missing_codegen_function_instr_ids,
+    TypedGuardedMethodCall, TypedIndexedFieldGuard, TypedPlannedResult, TypedPyObjectOwnershipPlan,
+    TypedSetAttr, ValueFacts, annotate_typed_function_planned_results,
+    annotate_typed_function_result_demands, annotate_typed_function_value_facts,
+    assign_missing_codegen_function_instr_ids,
     build_cross_module_direct_method_inline_fragment_to_target,
     build_direct_method_inline_fragment_to_target, infer_module_value_facts,
     inline_direct_call_stores_with_callees, lower_codegen_function_to_typed,
@@ -6504,6 +6505,14 @@ fn typed_expr_pyobject_input_is_borrowed_from_local_env(
     local_env: &LocalEnv,
     ctx: &JitEmitCtx<'_>,
 ) -> bool {
+    if let Some(is_borrowed) = typed_expr_planned_pyobject_input_is_borrowed_from_local_env(
+        expr,
+        local_env,
+        &ctx.stack_slots,
+        ctx.storage_layout.as_ref(),
+    ) {
+        return is_borrowed;
+    }
     if !expr
         .result_demand()
         .map(ResultDemand::borrowed_ok)
@@ -6517,6 +6526,23 @@ fn typed_expr_pyobject_input_is_borrowed_from_local_env(
         &ctx.stack_slots,
         ctx.storage_layout.as_ref(),
     )
+}
+
+fn typed_expr_planned_pyobject_input_is_borrowed_from_local_env(
+    expr: &InstrTyped,
+    local_env: &LocalEnv,
+    stack_slots: &StackSlots,
+    storage_layout: Option<&StorageLayout>,
+) -> Option<bool> {
+    let TypedPlannedResult::PyObject { ownership } = expr.planned_result()? else {
+        return Some(false);
+    };
+    Some(match ownership {
+        TypedPyObjectOwnershipPlan::BorrowedLocal => {
+            typed_expr_is_borrowable_from_local_env(expr, local_env, stack_slots, storage_layout)
+        }
+        TypedPyObjectOwnershipPlan::Owned | TypedPyObjectOwnershipPlan::Immortal => false,
+    })
 }
 
 fn local_name_for_location<'a>(
@@ -9080,6 +9106,22 @@ fn py_facts_for_typed_expr_with_local_env(
         return op.extra().result_facts().and_then(ValueFacts::as_pyobj);
     }
     expr.result_facts().and_then(ValueFacts::as_pyobj)
+}
+
+fn planned_owned_pyobject_result_for_typed_expr(
+    expr: &InstrTyped,
+    local_env: &LocalEnv,
+) -> (ValueOwnership, PyObjFacts) {
+    let facts =
+        py_facts_for_typed_expr_with_local_env(expr, local_env).unwrap_or_else(PyObjFacts::unknown);
+    let ownership = match expr.planned_result() {
+        Some(TypedPlannedResult::PyObject {
+            ownership: TypedPyObjectOwnershipPlan::Immortal,
+        }) => ValueOwnership::Immortal,
+        _ if facts.is_immortal() => ValueOwnership::Immortal,
+        _ => ValueOwnership::Owned,
+    };
+    (ownership, facts)
 }
 
 fn local_ref_kind_for_typed_stored_value(
@@ -17184,13 +17226,26 @@ fn emit_owned_pyobject_result_for_demand(
 ) -> EmitResult {
     match demand {
         ResultDemand::EffectOnly => {
-            fb.ins().call(
-                emit_ctx.decref_ref,
-                &[emit_ctx.consts.thread_state_value, value],
-            );
+            if !facts.is_immortal() {
+                fb.ins().call(
+                    emit_ctx.decref_ref,
+                    &[emit_ctx.consts.thread_state_value, value],
+                );
+            }
             EmitResult::no_value()
         }
-        ResultDemand::PyObject { .. } => EmitResult::owned_pyobject(value, facts),
+        ResultDemand::PyObject { .. } => {
+            let ownership = if facts.is_immortal() {
+                ValueOwnership::Immortal
+            } else {
+                ValueOwnership::Owned
+            };
+            EmitResult::PyObject {
+                value,
+                ownership,
+                facts,
+            }
+        }
         ResultDemand::I32Bool01 => {
             panic!("owned PyObject result helper cannot satisfy I32Bool01 demand")
         }
@@ -18865,14 +18920,23 @@ fn emit_typed_codegen_stmt_result_with_local_env(
         )?;
         return Ok(match demand {
             ResultDemand::EffectOnly => {
-                fb.ins().call(
-                    emit_ctx.decref_ref,
-                    &[emit_ctx.consts.thread_state_value, value],
-                );
+                let (_, facts) = planned_owned_pyobject_result_for_typed_expr(expr, local_env);
+                if !facts.is_immortal() {
+                    fb.ins().call(
+                        emit_ctx.decref_ref,
+                        &[emit_ctx.consts.thread_state_value, value],
+                    );
+                }
                 EmitResult::no_value()
             }
             ResultDemand::PyObject { .. } => {
-                EmitResult::owned_pyobject(value, PyObjFacts::unknown())
+                let (ownership, facts) =
+                    planned_owned_pyobject_result_for_typed_expr(expr, local_env);
+                EmitResult::PyObject {
+                    value,
+                    ownership,
+                    facts,
+                }
             }
             ResultDemand::I32Bool01 => unreachable!("I32Bool01 handled before PyObject emission"),
             ResultDemand::I64 => unreachable!("I64 is not a generic PyObject statement demand"),
