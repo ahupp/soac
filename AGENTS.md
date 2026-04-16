@@ -308,7 +308,9 @@ anything non-code affected the run. If there were no such issues, say
   Fast transformed-runtime pytest entrypoint for repeated focused checks. It
   reuses the existing venv and debug extension when `vendor/cpython/python`,
   `soac_py/pyproject.toml`, `uv.lock`, and workspace Rust inputs are unchanged,
-  and falls back to the full build path when they are stale or missing.
+  and falls back to the full build path when they are stale or missing. The
+  root pytest config defaults collection to `tests/`, so option-only invocations
+  such as `just pytest-fast -q` do not recurse into vendored CPython tests.
 - `just py ...`
   Best entrypoint for ad hoc transformed-runtime repros outside pytest.
 - `just py-fast ...`
