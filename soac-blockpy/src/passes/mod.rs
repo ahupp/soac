@@ -8,6 +8,7 @@ pub(crate) mod core_await_lower;
 mod escape_analysis;
 mod global_index;
 mod inline_plan;
+mod inline_transform;
 mod instr_id;
 mod instrument;
 mod local_env_plan;
@@ -674,6 +675,9 @@ pub use escape_analysis::{
 };
 pub use inline_plan::{
     plan_module_inlining, FunctionInlinePlan, InlinePlanModule, StraightlineConstructorInlinePlan,
+};
+pub use inline_transform::{
+    build_single_block_inline_fragment, InlineFragment, InlineLocal, InlineUnsupportedReason,
 };
 pub use instr_id::{
     assign_function_instr_ids, assign_module_instr_ids, validate_codegen_instr_ids,
