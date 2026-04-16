@@ -431,6 +431,14 @@ anything non-code affected the run. If there were no such issues, say
   load/JIT-codegen trace by default. Set `SOAC_PYTEST_TRACE=1` to enable it
   when `SOAC_LOG` is unset. `SOAC_PYTEST_EVENTS_LOG` overrides the output path,
   which defaults to `logs/pytest_events.jsonl`.
+- `SOAC_PYTEST_BATCH_TIMEOUT` / `SOAC_PYTEST_PROGRESS_INTERVAL`
+  The parallel pytest runner used by `just pytest ...`, `just pytest-fast ...`,
+  and `just test-all` reports currently running batches every
+  `SOAC_PYTEST_PROGRESS_INTERVAL` seconds, default `10`, and kills any one
+  batch that exceeds `SOAC_PYTEST_BATCH_TIMEOUT` seconds, default `300`. Set
+  either value to `0` to disable that behavior. Use these live batch labels
+  before falling back to host-process inspection when sandbox process namespaces
+  hide the stuck pytest child.
 - `SOAC_RUN_SLOW_TESTS`
   `just pytest ...` and `just test-all` deselect pytest tests marked `slow` by
   default. Set `SOAC_RUN_SLOW_TESTS=1` to include intentionally expensive tests

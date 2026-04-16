@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import os
+import shlex
+import signal
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from math import ceil
 from pathlib import Path
+from threading import Lock
 
 
 REPO_ROOT = Path(os.environ["REPO_ROOT"])
@@ -22,12 +25,40 @@ class RunResult:
     returncode: int
     elapsed_s: float
     output: str
+    timed_out: bool = False
 
 
 @dataclass
 class PytestBatch:
     label: str
     selectors: list[str]
+
+
+@dataclass
+class ActiveBatch:
+    batch_id: int
+    label: str
+    selector_count: int
+    pid: int
+    start_s: float
+
+
+class BatchMonitor:
+    def __init__(self) -> None:
+        self._active: dict[int, ActiveBatch] = {}
+        self._lock = Lock()
+
+    def start(self, batch: ActiveBatch) -> None:
+        with self._lock:
+            self._active[batch.batch_id] = batch
+
+    def finish(self, batch_id: int) -> None:
+        with self._lock:
+            self._active.pop(batch_id, None)
+
+    def snapshot(self) -> list[ActiveBatch]:
+        with self._lock:
+            return sorted(self._active.values(), key=lambda batch: batch.start_s)
 
 
 def parse_jobs(raw: str, max_jobs: int) -> int:
@@ -38,6 +69,27 @@ def parse_jobs(raw: str, max_jobs: int) -> int:
     if jobs <= 0:
         return 0
     return min(jobs, max_jobs)
+
+
+def parse_nonnegative_float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        print(
+            f"[diet-python pytest] invalid {name}={raw!r}; expected seconds",
+            file=sys.stderr,
+        )
+        return default
+    if value < 0:
+        print(
+            f"[diet-python pytest] invalid {name}={raw!r}; expected nonnegative seconds",
+            file=sys.stderr,
+        )
+        return default
+    return value
 
 
 def is_simple_selector(arg: str) -> bool:
@@ -173,21 +225,77 @@ def pytest_cmd(args: list[str]) -> list[str]:
     ]
 
 
-def run_pytest(args: list[str], selector: str) -> RunResult:
+def terminate_process_group(proc: subprocess.Popen[str]) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except PermissionError:
+        proc.terminate()
+    try:
+        proc.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except PermissionError:
+        proc.kill()
+
+
+def run_pytest(
+    args: list[str],
+    batch: PytestBatch,
+    batch_id: int,
+    timeout_s: float,
+    monitor: BatchMonitor,
+) -> RunResult:
     cmd = pytest_cmd(args)
     start = time.monotonic()
-    proc = subprocess.run(
+    proc = subprocess.Popen(
         cmd,
         cwd=REPO_ROOT,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
+        start_new_session=True,
     )
+    monitor.start(
+        ActiveBatch(
+            batch_id=batch_id,
+            label=batch.label,
+            selector_count=len(batch.selectors),
+            pid=proc.pid,
+            start_s=start,
+        )
+    )
+    timed_out = False
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout_s if timeout_s > 0 else None)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        terminate_process_group(proc)
+        stdout, stderr = proc.communicate()
+    finally:
+        elapsed_s = time.monotonic() - start
+        monitor.finish(batch_id)
+    output = stdout + stderr
+    if timed_out:
+        output += (
+            "\n[diet-python pytest] batch timed out after "
+            f"{timeout_s:.1f}s: {shlex.join(cmd)}\n"
+        )
     elapsed_s = time.monotonic() - start
     return RunResult(
-        selector=selector,
-        returncode=proc.returncode,
+        selector=batch.label,
+        returncode=124 if timed_out else int(proc.returncode or 0),
         elapsed_s=elapsed_s,
-        output=proc.stdout + proc.stderr,
+        output=output,
+        timed_out=timed_out,
     )
 
 
@@ -199,6 +307,20 @@ def print_failure(result: RunResult) -> None:
     print(f"=== END FAIL {result.selector} ===")
 
 
+def print_running_batches(active: list[ActiveBatch], now_s: float) -> None:
+    if not active:
+        print("[diet-python pytest] no active pytest batches; waiting for workers")
+        return
+    print(f"[diet-python pytest] still running {len(active)} batch(es):")
+    for batch in active:
+        elapsed_s = now_s - batch.start_s
+        print(
+            "  - "
+            f"pid={batch.pid} elapsed={elapsed_s:.1f}s "
+            f"nodeids={batch.selector_count} {batch.label}"
+        )
+
+
 def main(argv: list[str]) -> int:
     if not argv:
         cmd = [str(VENV_PYTHON), "-m", "pytest", "--help"]
@@ -206,6 +328,10 @@ def main(argv: list[str]) -> int:
 
     tb = os.environ.get("PYTEST_TB", "native")
     jobs_env = os.environ.get("PYTEST_NUMPROCS", "auto")
+    batch_timeout_s = parse_nonnegative_float_env("SOAC_PYTEST_BATCH_TIMEOUT", 300.0)
+    progress_interval_s = parse_nonnegative_float_env(
+        "SOAC_PYTEST_PROGRESS_INTERVAL", 10.0
+    )
 
     if any(not is_simple_selector(arg) for arg in argv):
         return subprocess.run(
@@ -224,7 +350,7 @@ def main(argv: list[str]) -> int:
         ).returncode
 
     jobs = parse_jobs(jobs_env, max(1, len(nodeids)))
-    if jobs <= 1 or len(nodeids) <= 1:
+    if jobs <= 0:
         return subprocess.run(
             pytest_cmd([f"--tb={tb}", *argv]),
             cwd=REPO_ROOT,
@@ -236,24 +362,62 @@ def main(argv: list[str]) -> int:
         f"[diet-python pytest] running {len(nodeids)} test nodeids "
         f"in {len(batches)} batches across {jobs} workers"
     )
+    if batch_timeout_s > 0:
+        print(f"[diet-python pytest] per-batch timeout: {batch_timeout_s:.1f}s")
+    else:
+        print("[diet-python pytest] per-batch timeout: disabled")
+    if progress_interval_s > 0:
+        print(
+            f"[diet-python pytest] live batch report interval: {progress_interval_s:.1f}s"
+        )
+    else:
+        print("[diet-python pytest] live batch reports: disabled")
 
     results: list[RunResult] = []
+    monitor = BatchMonitor()
     with ThreadPoolExecutor(max_workers=jobs) as pool:
-        futures = {
+        futures: dict[Future[RunResult], PytestBatch] = {
             pool.submit(
                 run_pytest,
                 [f"--tb={tb}", *batch.selectors],
-                batch.label,
+                batch,
+                batch_id,
+                batch_timeout_s,
+                monitor,
             ): batch
-            for batch in batches
+            for batch_id, batch in enumerate(batches)
         }
-        for future in as_completed(futures):
-            result = future.result()
-            results.append(result)
-            status = "PASS" if result.returncode == 0 else "FAIL"
-            print(f"[{status}] {result.selector} ({result.elapsed_s:.2f}s)")
-            if result.returncode != 0:
-                print_failure(result)
+        pending = set(futures)
+        next_progress_s = time.monotonic() + progress_interval_s
+        while pending:
+            wait_timeout = None
+            if progress_interval_s > 0:
+                wait_timeout = max(0.0, next_progress_s - time.monotonic())
+            done, pending = wait(
+                pending,
+                timeout=wait_timeout,
+                return_when=FIRST_COMPLETED,
+            )
+            for future in done:
+                result = future.result()
+                results.append(result)
+                status = (
+                    "TIMEOUT"
+                    if result.timed_out
+                    else "PASS"
+                    if result.returncode == 0
+                    else "FAIL"
+                )
+                print(f"[{status}] {result.selector} ({result.elapsed_s:.2f}s)")
+                if result.returncode != 0:
+                    print_failure(result)
+            if progress_interval_s <= 0 or not pending:
+                continue
+            now_s = time.monotonic()
+            if now_s >= next_progress_s:
+                print_running_batches(monitor.snapshot(), now_s)
+                while next_progress_s <= now_s:
+                    next_progress_s += progress_interval_s
 
     failed = [result for result in results if result.returncode != 0]
     passed = len(results) - len(failed)

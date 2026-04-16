@@ -176,6 +176,16 @@ typed variables must use recognized values. Boolean knobs accept `1`, `true`,
 - `SOAC_PYTEST_EVENTS_LOG=/path/to/events.jsonl`
   Overrides the pytest trace output path used when `SOAC_PYTEST_TRACE=1`.
 
+- `SOAC_PYTEST_BATCH_TIMEOUT=<seconds>`
+  Per-batch timeout for the parallel pytest runner used by `just pytest ...`,
+  `just pytest-fast ...`, and `just test-all`. The default is `300` seconds.
+  Set to `0` to disable the timeout.
+
+- `SOAC_PYTEST_PROGRESS_INTERVAL=<seconds>`
+  Interval for live "currently running pytest batch" reports from the parallel
+  pytest runner. The default is `10` seconds. Set to `0` to disable live batch
+  reports.
+
 - `SOAC_RUN_SLOW_TESTS=1`
   Includes pytest tests marked `slow` in `just pytest ...` and `just test-all`.
   Slow tests are deselected by default so ordinary green runs skip intentionally
