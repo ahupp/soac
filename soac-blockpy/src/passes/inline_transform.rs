@@ -19,11 +19,14 @@ pub struct InlineLocal {
     pub location: LocalLocation,
 }
 
+pub type InlineValueBindings = HashMap<LocalLocation, InstrCodegen>;
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum InlineUnsupportedReason {
     MissingCallerStorageLayout,
     MissingCalleeStorageLayout,
     MissingCalleeLocal(LocalLocation),
+    RebindsBoundLocal(LocalLocation),
     MultipleBlocks { count: usize },
     BlockParams,
     ExceptionEdge,
@@ -35,10 +38,29 @@ pub fn build_single_block_inline_fragment(
     callee: &BlockPyFunction<CodegenModuleShape>,
     continuation: BlockLabel,
 ) -> Result<InlineFragment, InlineUnsupportedReason> {
+    build_single_block_inline_fragment_with_bindings(
+        caller,
+        callee,
+        continuation,
+        &InlineValueBindings::new(),
+    )
+}
+
+pub fn build_single_block_inline_fragment_with_bindings(
+    caller: &mut BlockPyFunction<CodegenModuleShape>,
+    callee: &BlockPyFunction<CodegenModuleShape>,
+    continuation: BlockLabel,
+    value_bindings: &InlineValueBindings,
+) -> Result<InlineFragment, InlineUnsupportedReason> {
     let callee_layout = callee
         .storage_layout
         .as_ref()
         .ok_or(InlineUnsupportedReason::MissingCalleeStorageLayout)?;
+    for location in value_bindings.keys().copied() {
+        if location.slot() as usize >= callee_layout.stack_slots().len() {
+            return Err(InlineUnsupportedReason::MissingCalleeLocal(location));
+        }
+    }
     if callee.blocks.len() != 1 {
         return Err(InlineUnsupportedReason::MultipleBlocks {
             count: callee.blocks.len(),
@@ -60,12 +82,18 @@ pub fn build_single_block_inline_fragment(
     for (slot, _name) in callee_layout.stack_slots().iter().enumerate() {
         let location =
             LocalLocation(u32::try_from(slot).expect("callee stack slot index should fit in u32"));
+        if value_bindings.contains_key(&location) {
+            continue;
+        }
         let fresh = allocate_inline_local(caller)?;
         locals.insert(location, fresh);
     }
     let return_local = allocate_inline_local(caller)?;
 
-    let mut remapper = InlineLocalRemapper { locals: &locals };
+    let mut remapper = InlineLocalRemapper {
+        locals: &locals,
+        value_bindings,
+    };
     let mut body = callee_block
         .body
         .iter()
@@ -125,6 +153,7 @@ impl InlineLocal {
 
 struct InlineLocalRemapper<'a> {
     locals: &'a HashMap<LocalLocation, InlineLocal>,
+    value_bindings: &'a InlineValueBindings,
 }
 
 impl TryMapInstr<InstrCodegen, InstrCodegen, InlineUnsupportedReason> for InlineLocalRemapper<'_> {
@@ -148,9 +177,30 @@ impl TryMapInstr<InstrCodegen, InstrCodegen, InlineUnsupportedReason> for Inline
             InstrCodegenOp::GetItem(op) => Ok(InstrCodegenOp::GetItem(op.try_map_children(self)?)),
             InstrCodegenOp::SetItem(op) => Ok(InstrCodegenOp::SetItem(op.try_map_children(self)?)),
             InstrCodegenOp::DelItem(op) => Ok(InstrCodegenOp::DelItem(op.try_map_children(self)?)),
-            InstrCodegenOp::Load(op) => Ok(InstrCodegenOp::Load(op.try_map_children(self)?)),
-            InstrCodegenOp::Store(op) => Ok(InstrCodegenOp::Store(op.try_map_children(self)?)),
-            InstrCodegenOp::Del(op) => Ok(InstrCodegenOp::Del(op.try_map_children(self)?)),
+            InstrCodegenOp::Load(op) => {
+                if let Some(location) = op.name.local_location() {
+                    if let Some(value) = self.value_bindings.get(&location) {
+                        return Ok(value.clone());
+                    }
+                }
+                Ok(InstrCodegenOp::Load(op.try_map_children(self)?))
+            }
+            InstrCodegenOp::Store(op) => {
+                if let Some(location) = op.name.local_location() {
+                    if self.value_bindings.contains_key(&location) {
+                        return Err(InlineUnsupportedReason::RebindsBoundLocal(location));
+                    }
+                }
+                Ok(InstrCodegenOp::Store(op.try_map_children(self)?))
+            }
+            InstrCodegenOp::Del(op) => {
+                if let Some(location) = op.name.local_location() {
+                    if self.value_bindings.contains_key(&location) {
+                        return Err(InlineUnsupportedReason::RebindsBoundLocal(location));
+                    }
+                }
+                Ok(InstrCodegenOp::Del(op.try_map_children(self)?))
+            }
             InstrCodegenOp::MakeCell(op) => {
                 Ok(InstrCodegenOp::MakeCell(op.try_map_children(self)?))
             }
@@ -169,6 +219,9 @@ impl TryMapInstr<InstrCodegen, InstrCodegen, InlineUnsupportedReason> for Inline
         let Some(location) = name.location.as_local() else {
             return Ok(name);
         };
+        if self.value_bindings.contains_key(&location) {
+            return Err(InlineUnsupportedReason::RebindsBoundLocal(location));
+        }
         let Some(fresh) = self.locals.get(&location) else {
             return Err(InlineUnsupportedReason::MissingCalleeLocal(location));
         };
@@ -181,7 +234,7 @@ impl TryMapInstr<InstrCodegen, InstrCodegen, InlineUnsupportedReason> for Inline
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block_py::{BlockParam, BlockParamRole};
+    use crate::block_py::{BlockParam, BlockParamRole, Load};
     use crate::lower_python_to_blockpy_for_testing;
 
     fn function_by_qualname<'a>(
@@ -193,6 +246,26 @@ mod tests {
             .iter()
             .find(|function| function.names.qualname == qualname)
             .unwrap_or_else(|| panic!("{qualname} should be present"))
+    }
+
+    fn local_location(function: &BlockPyFunction<CodegenModuleShape>, name: &str) -> LocalLocation {
+        let slot = function
+            .storage_layout
+            .as_ref()
+            .expect("function should have storage")
+            .stack_slots()
+            .iter()
+            .position(|slot_name| slot_name == name)
+            .unwrap_or_else(|| panic!("{name} should have a local slot"));
+        LocalLocation(u32::try_from(slot).expect("slot index should fit in u32"))
+    }
+
+    fn local_load(function: &BlockPyFunction<CodegenModuleShape>, name: &str) -> InstrCodegen {
+        Load::new(ResolvedName {
+            id: name.to_string().into(),
+            location: NameLocation::Local(local_location(function, name)),
+        })
+        .into()
     }
 
     #[test]
@@ -281,5 +354,86 @@ def caller(x, y):
                 .unwrap_err();
 
         assert_eq!(err, InlineUnsupportedReason::BlockParams);
+    }
+
+    #[test]
+    fn substitutes_bound_callee_locals_with_caller_values() {
+        let module = lower_python_to_blockpy_for_testing(
+            r#"
+def callee(a, b):
+    return a + b
+
+def caller(x, y):
+    return x
+"#,
+        )
+        .expect("transform should succeed")
+        .codegen_module;
+        let callee = function_by_qualname(&module, "callee");
+        let mut caller = function_by_qualname(&module, "caller").clone();
+        let original_slot_count = caller
+            .storage_layout
+            .as_ref()
+            .expect("caller should have storage")
+            .stack_slots()
+            .len();
+        let callee_a = local_location(callee, "a");
+        let callee_b = local_location(callee, "b");
+        let mut bindings = InlineValueBindings::new();
+        bindings.insert(callee_a, local_load(&caller, "x"));
+        bindings.insert(callee_b, local_load(&caller, "y"));
+
+        let fragment = build_single_block_inline_fragment_with_bindings(
+            &mut caller,
+            callee,
+            BlockLabel::from_index(10_001),
+            &bindings,
+        )
+        .unwrap();
+
+        assert!(!fragment.locals.contains_key(&callee_a));
+        assert!(!fragment.locals.contains_key(&callee_b));
+        assert_eq!(
+            caller
+                .storage_layout
+                .as_ref()
+                .expect("caller should have storage")
+                .stack_slots()
+                .len(),
+            original_slot_count + callee.storage_layout.as_ref().unwrap().stack_slots().len()
+                - bindings.len()
+                + 1
+        );
+    }
+
+    #[test]
+    fn rejects_store_to_bound_callee_local() {
+        let module = lower_python_to_blockpy_for_testing(
+            r#"
+def callee(a):
+    a = 1
+    return a
+
+def caller(x):
+    return x
+"#,
+        )
+        .expect("transform should succeed")
+        .codegen_module;
+        let callee = function_by_qualname(&module, "callee");
+        let mut caller = function_by_qualname(&module, "caller").clone();
+        let callee_a = local_location(callee, "a");
+        let mut bindings = InlineValueBindings::new();
+        bindings.insert(callee_a, local_load(&caller, "x"));
+
+        let err = build_single_block_inline_fragment_with_bindings(
+            &mut caller,
+            callee,
+            BlockLabel::from_index(10_002),
+            &bindings,
+        )
+        .unwrap_err();
+
+        assert_eq!(err, InlineUnsupportedReason::RebindsBoundLocal(callee_a));
     }
 }
