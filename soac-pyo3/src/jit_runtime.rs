@@ -76,10 +76,24 @@ fn install_soac_runtime_bootstrap_globals(
     let native_ext = PyModule::import(py, "_soac_ext")?;
     let normal_bootstrap = PyModule::import(py, "soac.bootstrap")?;
     let mut helpers = Vec::new();
-    for name in ["_entry_template", "code_with_freevars"] {
-        let helper = normal_bootstrap.getattr(name)?;
-        globals.set_item(name, &helper)?;
-        helpers.push((name, helper.unbind()));
+    for (source_name, global_name) in [
+        (
+            "ANNOTATION_FORWARDREF_MISSING",
+            "_ANNOTATION_FORWARDREF_MISSING",
+        ),
+        ("ELLIPSIS", "ELLIPSIS"),
+        ("EMPTY_TUPLE", "EMPTY_TUPLE"),
+        ("FALSE", "FALSE"),
+        ("ITER_COMPLETE", "ITER_COMPLETE"),
+        ("NO_DEFAULT", "NO_DEFAULT"),
+        ("NONE", "NONE"),
+        ("TRUE", "TRUE"),
+        ("_entry_template", "_entry_template"),
+        ("code_with_freevars", "code_with_freevars"),
+    ] {
+        let helper = normal_bootstrap.getattr(source_name)?;
+        globals.set_item(global_name, &helper)?;
+        helpers.push((global_name, helper.unbind()));
     }
     for name in ["import_", "import_attr"] {
         let helper = native_ext.getattr(name)?;

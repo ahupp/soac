@@ -2946,7 +2946,12 @@ impl ModuleConstantExtractor {
 
     fn extract_expr(&mut self, expr: &mut InstrResolved) {
         if matches!(expr, InstrResolved::Literal(_))
-            || matches!(expr, InstrResolved::Load(op) if op.name.is_runtime_name())
+            || matches!(
+                expr,
+                InstrResolved::Load(op)
+                    if op.name.is_runtime_name()
+                        && op.name.runtime_name_id() != Some(RuntimeName::Globals)
+            )
         {
             let meta = expr.meta();
             let index = u32::try_from(self.constants.len())
@@ -3074,7 +3079,9 @@ struct RuntimeNameGlobalNameRewriter;
 impl crate::block_py::VisitMut<InstrResolved> for RuntimeNameGlobalNameRewriter {
     fn visit_instr_mut(&mut self, expr: &mut InstrResolved) {
         if let InstrResolved::Load(op) = expr {
-            if op.name.location.is_runtime_name() {
+            if op.name.location.is_runtime_name()
+                && op.name.runtime_name_id() != Some(RuntimeName::Globals)
+            {
                 op.name.location = NameLocation::global_name();
             }
         }
