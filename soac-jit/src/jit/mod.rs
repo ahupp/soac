@@ -9124,6 +9124,41 @@ fn planned_owned_pyobject_result_for_typed_expr(
     (ownership, facts)
 }
 
+fn typed_local_load_direct_result_plan(
+    expr: &InstrTyped,
+    local_env: &LocalEnv,
+    stack_slots: &StackSlots,
+    storage_layout: Option<&StorageLayout>,
+    demand: ResultDemand,
+) -> Option<(ValueOwnership, PyObjFacts)> {
+    if !matches!(expr, InstrTyped::Load(op) if op.name.local_location().is_some()) {
+        return None;
+    }
+    if !typed_expr_is_borrowable_from_local_env(expr, local_env, stack_slots, storage_layout) {
+        return None;
+    }
+
+    let facts =
+        py_facts_for_typed_expr_with_local_env(expr, local_env).unwrap_or_else(PyObjFacts::unknown);
+    match demand {
+        ResultDemand::EffectOnly => Some((ValueOwnership::Borrowed, facts)),
+        ResultDemand::PyObject { borrowed_ok } => {
+            let ownership = match expr.planned_result() {
+                Some(TypedPlannedResult::PyObject {
+                    ownership: TypedPyObjectOwnershipPlan::Immortal,
+                }) => ValueOwnership::Immortal,
+                _ if facts.is_immortal() => ValueOwnership::Immortal,
+                Some(TypedPlannedResult::PyObject {
+                    ownership: TypedPyObjectOwnershipPlan::BorrowedLocal,
+                }) if borrowed_ok => ValueOwnership::Borrowed,
+                _ => return None,
+            };
+            Some((ownership, facts))
+        }
+        ResultDemand::I32Bool01 | ResultDemand::I64 | ResultDemand::I64Index => None,
+    }
+}
+
 fn local_ref_kind_for_typed_stored_value(
     value: &InstrTyped,
     ownership: ValueOwnership,
@@ -18811,6 +18846,12 @@ fn emit_typed_codegen_stmt_result_with_local_env(
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<EmitResult, String> {
+    if let Some(result) =
+        emit_typed_local_load_result_with_local_env(fb, expr, local_env, emit_ctx, demand)
+    {
+        return Ok(result);
+    }
+
     if let InstrTyped::CallTyped(op) = expr {
         if let Some(result) = emit_typed_codegen_call_result_with_local_env(
             fb,
@@ -18954,6 +18995,44 @@ fn emit_typed_codegen_stmt_result_with_local_env(
         codegen_env,
         func_imports,
     )
+}
+
+fn emit_typed_local_load_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    expr: &InstrTyped,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+) -> Option<EmitResult> {
+    let (ownership, facts) = typed_local_load_direct_result_plan(
+        expr,
+        local_env,
+        &emit_ctx.stack_slots,
+        emit_ctx.storage_layout.as_ref(),
+        demand,
+    )?;
+    let InstrTyped::Load(op) = expr else {
+        unreachable!("typed local load result plan only accepts loads");
+    };
+    let value = emit_resolved_name_load_with_local_env(
+        fb,
+        &op.name,
+        op.try_semantic_instr_id(),
+        local_env,
+        emit_ctx,
+        true,
+    );
+    Some(match demand {
+        ResultDemand::EffectOnly => EmitResult::no_value(),
+        ResultDemand::PyObject { .. } => EmitResult::PyObject {
+            value,
+            ownership,
+            facts,
+        },
+        ResultDemand::I32Bool01 | ResultDemand::I64 | ResultDemand::I64Index => unreachable!(
+            "typed local load borrowed result plan does not satisfy non-PyObject demands"
+        ),
+    })
 }
 
 fn emit_typed_codegen_i32_bool01_result_with_local_env(

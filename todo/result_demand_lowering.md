@@ -149,15 +149,16 @@ value facts, and simple producer shape into the final representation that
 codegen should consume. Current planning records effect-only results, borrowed
 local PyObject inputs, immortal PyObject values when facts prove them,
 `I32Bool01`, and `I64`. Codegen has started consuming planned results for safe
-ownership cases: borrowed local PyObject inputs still require the existing
-LocalEnv borrowability proof, and generic typed PyObject results preserve
-planned/fact-derived immortal ownership so discard paths do not emit useless
-immortal decrefs. Return values, local store RHS expressions, raise exception
-expressions, generic/direct call inputs, and operator/intrinsic inputs are
-annotated before JIT codegen and consumed directly from the typed instruction.
-Step 7 has started by annotating branch tests with `I32Bool01` demand and
-branch-table indices with `I64Index` demand; typed term emission consumes those
-annotations.
+ownership cases: borrowed local PyObject inputs and typed local-load results
+still require the existing LocalEnv borrowability proof, effect-only local loads
+avoid owned temporary materialization, and generic typed PyObject results
+preserve planned/fact-derived immortal ownership so discard paths do not emit
+useless immortal decrefs. Return values, local store RHS expressions, raise
+exception expressions, generic/direct call inputs, and operator/intrinsic inputs
+are annotated before JIT codegen and consumed directly from the typed
+instruction. Step 7 has started by annotating branch tests with `I32Bool01`
+demand and branch-table indices with `I64Index` demand; typed term emission
+consumes those annotations.
 
 1. Add `ResultDemand::{EffectOnly, PyObject { borrowed_ok }}` and an `EmitResult`
    wrapper near the existing `SoacValue`/LocalEnv codegen types.
@@ -182,10 +183,11 @@ annotations.
    intrinsic argument emission consumes that same helper path.
 6a. Add a BlockPy result-representation planning pass after demand planning.
     Started: the pass writes `TypedInstrExtra::planned_result` on the typed IR
-    node, and JIT codegen consumes it for borrowed local PyObject inputs and
-    immortal PyObject results. The current plan is conservative and
-    behavior-preserving; follow-up changes should keep moving individual typed
-    producers from ad hoc demand/facts checks to the planned representation.
+    node, and JIT codegen consumes it for borrowed local PyObject inputs,
+    typed local-load results, and immortal PyObject results. The current plan is
+    conservative and behavior-preserving; follow-up changes should keep moving
+    individual typed producers from ad hoc demand/facts checks to the planned
+    representation.
 7. Extend demand to `I32Bool01` and `I64Index` once the value-space/refcount
    representation can carry non-Python values cleanly. Started with branch-test
    `I32Bool01` demands and branch-table `I64Index` demands.

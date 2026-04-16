@@ -4750,6 +4750,87 @@ def build(values):
         assert!(facts.is_none());
     }
 
+    #[test]
+    fn typed_local_load_result_plan_uses_borrowed_and_immortal_plans() {
+        let env = LocalEnv {
+            entries: vec![LocalEnvEntry {
+                location: Some(LocalLocation(0)),
+                name: "x".to_string(),
+                aliases: Vec::new(),
+                value: ir::Value::from_u32(1),
+                ref_kind: LocalRefKind::Owned,
+                storage: LocalEnvStorage::LocalOnly,
+                binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Owned),
+                py_facts: None,
+            }],
+        };
+        let stack_slots = StackSlots {
+            names: Vec::new(),
+            slots: Vec::new(),
+        };
+
+        let mut borrowed_extra = TypedInstrExtra::default();
+        borrowed_extra.set_planned_result(PlannedResult::PYOBJECT_BORROWED_LOCAL);
+        let borrowed_expr =
+            InstrTyped::Load(Load::<InstrTyped>::new(test_name("x")).with_extra(borrowed_extra));
+        assert_eq!(
+            typed_local_load_direct_result_plan(
+                &borrowed_expr,
+                &env,
+                &stack_slots,
+                None,
+                ResultDemand::PYOBJECT_BORROWED_OK,
+            ),
+            Some((ValueOwnership::Borrowed, PyObjFacts::unknown()))
+        );
+        assert_eq!(
+            typed_local_load_direct_result_plan(
+                &borrowed_expr,
+                &env,
+                &stack_slots,
+                None,
+                ResultDemand::PYOBJECT_OWNED,
+            ),
+            None
+        );
+        assert_eq!(
+            typed_local_load_direct_result_plan(
+                &borrowed_expr,
+                &env,
+                &stack_slots,
+                None,
+                ResultDemand::EffectOnly,
+            ),
+            Some((ValueOwnership::Borrowed, PyObjFacts::unknown()))
+        );
+
+        let mut immortal_extra = TypedInstrExtra::default();
+        immortal_extra.refine_result_facts(ValueFacts::PyObj(PyObjFacts::none_singleton()));
+        immortal_extra.set_planned_result(PlannedResult::PYOBJECT_IMMORTAL);
+        let immortal_expr =
+            InstrTyped::Load(Load::<InstrTyped>::new(test_name("x")).with_extra(immortal_extra));
+        assert_eq!(
+            typed_local_load_direct_result_plan(
+                &immortal_expr,
+                &env,
+                &stack_slots,
+                None,
+                ResultDemand::PYOBJECT_OWNED,
+            ),
+            Some((ValueOwnership::Immortal, PyObjFacts::none_singleton()))
+        );
+        assert_eq!(
+            typed_local_load_direct_result_plan(
+                &immortal_expr,
+                &LocalEnv::default(),
+                &stack_slots,
+                None,
+                ResultDemand::PYOBJECT_OWNED,
+            ),
+            None
+        );
+    }
+
     fn local_env_store_test_state(
         stack_slot_names: &[&str],
         initial_storage: LocalEnvStorage,
