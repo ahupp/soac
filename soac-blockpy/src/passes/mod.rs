@@ -8,6 +8,7 @@ pub(crate) mod core_await_lower;
 mod escape_analysis;
 mod global_index;
 mod inline_plan;
+mod inline_sites;
 mod inline_transform;
 mod instr_id;
 mod instrument;
@@ -675,6 +676,9 @@ pub use escape_analysis::{
 };
 pub use inline_plan::{
     plan_module_inlining, FunctionInlinePlan, InlinePlanModule, StraightlineConstructorInlinePlan,
+};
+pub use inline_sites::{
+    collect_inline_call_sites, InlineCallSiteModule, StraightlineConstructorCallSite,
 };
 pub use inline_transform::{
     build_single_block_inline_fragment, build_single_block_inline_fragment_with_bindings,
