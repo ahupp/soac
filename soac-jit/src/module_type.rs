@@ -16,8 +16,10 @@ use soac_blockpy::block_py::{
     DeoptEntrySource, FunctionExecutionMode, FunctionId, RuntimeName,
 };
 use soac_blockpy::env_config::SoacEnvConfig;
-use soac_blockpy::passes::CodegenModuleShape;
-use soac_blockpy::passes::specialization_runtime_logging_enabled;
+use soac_blockpy::passes::{
+    CodegenModuleShape, InlinePlanModule, plan_module_inlining,
+    specialization_runtime_logging_enabled, summarize_module_escapes,
+};
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_int, c_void};
 use std::fs::{OpenOptions, create_dir_all};
@@ -63,6 +65,7 @@ pub fn hash_module_source(source: &str) -> u64 {
 
 pub struct SharedModuleState {
     pub lowered_module: BlockPyModule<CodegenModuleShape>,
+    pub inline_plan: InlinePlanModule,
     pub module_name: String,
     pub package_name: String,
     pub source_hash: u64,
@@ -780,8 +783,10 @@ fn build_shared_state_for_inspection_with_original_code(
     };
     let module_constant_objs =
         build_module_constant_objects(py, &codegen_constants, module_name, 0)?;
+    let inline_plan = plan_inline_candidates(&lowered_module);
     Ok(Arc::new(SharedModuleState {
         lowered_module,
+        inline_plan,
         module_name: module_name.to_string(),
         package_name: package_name.to_string(),
         source_hash: 0,
@@ -827,6 +832,11 @@ fn build_function_index_by_id(
     Ok(function_index_by_id)
 }
 
+fn plan_inline_candidates(module: &BlockPyModule<CodegenModuleShape>) -> InlinePlanModule {
+    let escape_summary = summarize_module_escapes(module);
+    plan_module_inlining(&escape_summary)
+}
+
 #[repr(C)]
 struct SoacExtModuleState {
     initialized: bool,
@@ -863,8 +873,10 @@ impl SoacExtModuleState {
             module_name.as_str(),
             source_hash,
         )?;
+        let inline_plan = plan_inline_candidates(&lowered_module);
         let shared_state = Arc::new(SharedModuleState {
             lowered_module,
+            inline_plan,
             module_name,
             package_name,
             source_hash,
@@ -1553,6 +1565,7 @@ def f():
             function_index_by_id: build_function_index_by_id(&lowered)
                 .expect("function index should build"),
             codegen_constants: ModuleCodegenConstants::collect_from_module(&lowered),
+            inline_plan: plan_inline_candidates(&lowered),
             source_hash: 0,
             storage_instance_key: allocate_shared_module_state_storage_key(),
             module_constant_objs: Vec::new(),
@@ -1627,6 +1640,7 @@ def f(x):
             function_index_by_id: build_function_index_by_id(&lowered)
                 .expect("function index should build"),
             codegen_constants: ModuleCodegenConstants::collect_from_module(&lowered),
+            inline_plan: plan_inline_candidates(&lowered),
             source_hash: 0,
             storage_instance_key: allocate_shared_module_state_storage_key(),
             module_constant_objs: Vec::new(),
@@ -1781,6 +1795,7 @@ def f():
             function_index_by_id: build_function_index_by_id(&lowered)
                 .expect("function index should build"),
             codegen_constants: ModuleCodegenConstants::collect_from_module(&lowered),
+            inline_plan: plan_inline_candidates(&lowered),
             source_hash: 0,
             storage_instance_key: allocate_shared_module_state_storage_key(),
             module_constant_objs: Vec::new(),

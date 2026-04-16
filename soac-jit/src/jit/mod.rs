@@ -47,13 +47,13 @@ use soac_blockpy::block_py::{
     StorageLayout, Store, Visit, WithMeta, operation as blockpy_intrinsics,
 };
 use soac_blockpy::passes::{
-    CodegenModuleShape, FactStore, FunctionRefcountPlan, InstrResolved, InstrTyped,
-    LocalEnvResumeBinding, LocalEnvResumeBindingState, LocalEnvResumePoint,
+    CodegenModuleShape, FactStore, FunctionRefcountPlan, InlinePlanModule, InstrResolved,
+    InstrTyped, LocalEnvResumeBinding, LocalEnvResumeBindingState, LocalEnvResumePoint,
     LocalEnvResumeStatePrecision, LocalEnvResumeValueSource, LocalRefState, PyExactType,
     PyObjFacts, RefcountActionKind, RefcountReleaseReason, RefcountSite, RuntimeHelperId,
     TypedCodegenModuleShape, ValueFacts, infer_module_value_facts, lower_codegen_function_to_typed,
-    lower_typed_function_if_tests_to_truthy, try_lower_typed_instr_to_codegen_legacy,
-    try_lower_typed_term_to_codegen_legacy,
+    lower_typed_function_if_tests_to_truthy, plan_module_inlining, summarize_module_escapes,
+    try_lower_typed_instr_to_codegen_legacy, try_lower_typed_term_to_codegen_legacy,
 };
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -5713,6 +5713,7 @@ struct JitEmitCtx<'mc> {
     function_id: FunctionId,
     function_kind: FunctionKind,
     shared_state: Option<&'mc crate::module_type::SharedModuleState>,
+    inline_plan: &'mc InlinePlanModule,
     module_constants: &'mc ModuleCodegenConstants,
     value_facts: &'mc FactStore,
     result_demand_plan: &'mc ResultDemandPlan,
@@ -6179,6 +6180,11 @@ impl JitEmitCtx<'_> {
 
 fn infer_jit_value_facts(module: &BlockPyModule<CodegenModuleShape>) -> FactStore {
     infer_module_value_facts(module)
+}
+
+fn plan_jit_inlining(module: &BlockPyModule<CodegenModuleShape>) -> InlinePlanModule {
+    let escape_summary = summarize_module_escapes(module);
+    plan_module_inlining(&escape_summary)
 }
 
 #[derive(Clone)]
@@ -19083,6 +19089,13 @@ fn build_cranelift_run_bb_specialized_function(
         ));
     }
     let result_demand_plan = plan_typed_result_demands(&typed_function);
+    let computed_inline_plan;
+    let inline_plan = if let Some(shared_state) = direct_call_resolver {
+        &shared_state.inline_plan
+    } else {
+        computed_inline_plan = plan_jit_inlining(module);
+        &computed_inline_plan
+    };
 
     let call_target_counter_ids =
         collect_runtime_counter_ids_by_kind(counter_defs, function.function_id, "call_hot_targets");
@@ -19774,6 +19787,7 @@ fn build_cranelift_run_bb_specialized_function(
                 function_id: function.function_id,
                 function_kind: function.kind,
                 shared_state: direct_call_resolver,
+                inline_plan,
                 module_constants,
                 value_facts,
                 result_demand_plan: &result_demand_plan,
@@ -19879,6 +19893,11 @@ fn build_cranelift_run_bb_specialized_function(
                     .deopt_resume_plan
                     .deopt_points_for_block(codegen_block.label)
                     .all(|point| point.id.function_id == function.function_id)
+            );
+            debug_assert!(
+                emit_ctx.inline_plan.functions.keys().all(
+                    |function_id| function_id.module_id() == module.module_name_gen.module_id()
+                )
             );
             emit_ctx.require_deopt_point_at_block_entry(codegen_block.label)?;
             let _block_refcount_plan = emit_ctx.refcount_plan.block(codegen_block.label);
