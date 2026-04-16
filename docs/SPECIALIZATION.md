@@ -429,8 +429,13 @@ apply/verify mode:
   - allocates with `dp_jit_pytype_generic_alloc`
   - when the BlockPy inline plan proves `__init__` is a straight-line
     field initializer from constructor parameters, emits those
-    `self.field = param` stores directly with the normal
-    `dp_jit_pyobject_setattr` helper and skips the `__init__` call
+    `self.field = param` stores directly and skips the `__init__` call
+  - if the profiled type-key layout has a matching field-index
+    specialization for the guarded constructor owner type, tries
+    `soac_runtime_store_field_indexed` for the inlined field store and
+    uses a cold `dp_jit_pyobject_setattr` fallback on guard miss
+  - otherwise uses the normal `dp_jit_pyobject_setattr` helper for each
+    inlined field store
   - otherwise directly calls the transformed `__init__`
   - finalizes direct `__init__` calls through
     `dp_jit_finish_constructor_init`, which enforces `__init__`
@@ -456,8 +461,8 @@ apply/verify mode:
   - initializer inlining currently covers only parameter-to-field
     stores, and only when the direct-call arg plan does not need the
     default-resolving entry path
-  - initializer inlining still uses ordinary Python attribute setting;
-    it does not yet lower the planned stores to indexed-field raw stores
+  - initializer indexed stores are limited to field names that also
+    have type-key layout profile input for the exact guarded owner type
 - Soundness boundary:
   - this path is intentionally restricted to types where the default
     `type.__call__` shape can be reproduced safely enough:

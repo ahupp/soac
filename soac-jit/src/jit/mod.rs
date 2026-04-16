@@ -11370,16 +11370,14 @@ fn emit_straightline_constructor_initializer_inline(
     let ptr_ty = ctx.consts.ptr_ty;
     let null_ptr = fb.ins().iconst(ptr_ty, 0);
     for (field_name, value) in field_values {
-        let attr = emit_owned_module_constant(
+        let set_result = emit_inlined_constructor_field_store(
             fb,
-            ctx.module_constants.require_unicode_constant_id(field_name),
+            allocated,
+            field_name,
+            value,
+            specialization,
             ctx,
         );
-        let set_inst = fb
-            .ins()
-            .call(ctx.pyobject_setattr_ref, &[allocated, attr, value]);
-        let set_result = fb.inst_results(set_inst)[0];
-        emit_release_owned_inputs(fb, ctx, &[attr]);
         let set_failed = fb
             .ins()
             .icmp(ir::condcodes::IntCC::Equal, set_result, null_ptr);
@@ -11399,6 +11397,95 @@ fn emit_straightline_constructor_initializer_inline(
     }
     emit_release_owned_inputs(fb, ctx, &owned_init_args);
     Some(allocated)
+}
+
+fn constructor_field_index_specialization<'a>(
+    ctx: &'a JitEmitCtx<'_>,
+    specialization: &DirectConstructorSpecialization,
+    field_name: &str,
+) -> Option<&'a FieldIndexSpecialization> {
+    ctx.field_index_specializations
+        .get(field_name)?
+        .iter()
+        .find(|field_specialization| {
+            field_specialization.owner_type_ref == specialization.owner_type_ref
+                && field_specialization.type_version == specialization.type_version
+        })
+}
+
+fn emit_inlined_constructor_field_store(
+    fb: &mut FunctionBuilder<'_>,
+    allocated: ir::Value,
+    field_name: &str,
+    value: ir::Value,
+    specialization: &DirectConstructorSpecialization,
+    ctx: &JitEmitCtx<'_>,
+) -> ir::Value {
+    let ptr_ty = ctx.consts.ptr_ty;
+    let attr = emit_owned_module_constant(
+        fb,
+        ctx.module_constants.require_unicode_constant_id(field_name),
+        ctx,
+    );
+
+    if ctx.behavior_change_indexed_stores
+        && let Some(field_specialization) =
+            constructor_field_index_specialization(ctx, specialization, field_name)
+    {
+        let i64_ty = ctx.consts.i64_ty;
+        let i32_ty = ctx.consts.i32_ty;
+        let zero_i32 = fb.ins().iconst(i32_ty, 0);
+        let expected_index = fb
+            .ins()
+            .iconst(i64_ty, i64::from(field_specialization.expected_index));
+        let direct_inst = fb.ins().call(
+            ctx.store_field_indexed_ref,
+            &[
+                ctx.consts.thread_state_value,
+                allocated,
+                attr,
+                expected_index,
+                value,
+            ],
+        );
+        let direct_result = fb.inst_results(direct_inst)[0];
+        let direct_missed = fb
+            .ins()
+            .icmp(ir::condcodes::IntCC::Equal, direct_result, zero_i32);
+        let fallback_block = fb.create_block();
+        fb.set_cold_block(fallback_block);
+        let done_block = fb.create_block();
+        fb.append_block_param(done_block, ptr_ty);
+        let none_const = emit_none_const(fb, ctx);
+        fb.ins().call(ctx.incref_ref, &[none_const]);
+        fb.ins().brif(
+            direct_missed,
+            fallback_block,
+            &[],
+            done_block,
+            &[ir::BlockArg::Value(none_const)],
+        );
+
+        fb.switch_to_block(fallback_block);
+        emit_release_owned_inputs(fb, ctx, &[none_const]);
+        let fallback_inst = fb
+            .ins()
+            .call(ctx.pyobject_setattr_ref, &[allocated, attr, value]);
+        let fallback_result = fb.inst_results(fallback_inst)[0];
+        fb.ins()
+            .jump(done_block, &[ir::BlockArg::Value(fallback_result)]);
+
+        fb.switch_to_block(done_block);
+        emit_release_owned_inputs(fb, ctx, &[attr]);
+        return fb.block_params(done_block)[0];
+    }
+
+    let set_inst = fb
+        .ins()
+        .call(ctx.pyobject_setattr_ref, &[allocated, attr, value]);
+    let set_result = fb.inst_results(set_inst)[0];
+    emit_release_owned_inputs(fb, ctx, &[attr]);
+    set_result
 }
 
 fn emit_direct_constructor_resolved_with_arg_values(

@@ -18465,8 +18465,18 @@ def f(x, y):
                             max_overcount: Some(0),
                         }],
                         module_keys: Vec::new(),
-                        type_keys: Vec::new(),
-                        type_table: Vec::new(),
+                        type_keys: vec![CounterDumpTypeKeyLayout {
+                            owner_type_id: 7,
+                            key: "x".to_string(),
+                            index: 0,
+                        }],
+                        type_table: vec![CounterDumpTypeTableEntry {
+                            type_id: 7,
+                            key: CounterDumpTypeKey {
+                                module_name: "counter_test".to_string(),
+                                qualname: "Record".to_string(),
+                            },
+                        }],
                     },
                 );
 
@@ -18532,6 +18542,18 @@ def f(x, y):
                     ffi::PyDict_SetItemString(module_dict, c"Record".as_ptr(), cls.as_ptr()) == 0,
                     "test module should accept Record binding"
                 );
+                let sys = PyModule::import(py, "sys").expect("sys should import");
+                let modules = sys
+                    .getattr("modules")
+                    .expect("sys.modules should exist")
+                    .cast_into::<pyo3::types::PyDict>()
+                    .expect("sys.modules should be a dict");
+                modules
+                    .set_item(
+                        "counter_test",
+                        pyo3::Bound::from_borrowed_ptr(py, module_obj),
+                    )
+                    .expect("test module should be import-resolvable while loading type keys");
                 crate::register_function_owner_types_for_module(module_obj)
                     .expect("owner types should register from explicit test module");
                 ffi::Py_DECREF(module_obj);
@@ -18600,7 +18622,19 @@ def f(x, y):
                 assert_eq!(
                     count_direct_calls_to_runtime_helpers(&built.ctx.func, &setattr_helpers),
                     1,
-                    "straight-line constructor initializer should emit the planned field store",
+                    "straight-line constructor initializer should keep a cold generic setattr fallback",
+                );
+                let indexed_setattr_helpers = declared_user_names_for_symbols(
+                    &built,
+                    &[SOAC_RUNTIME_STORE_FIELD_INDEXED_SYMBOL],
+                );
+                assert_eq!(
+                    count_direct_calls_to_runtime_helpers(
+                        &built.ctx.func,
+                        &indexed_setattr_helpers
+                    ),
+                    1,
+                    "straight-line constructor initializer should try the indexed field store before fallback",
                 );
                 assert!(
                     !function_contains_iconst_imm(&built.ctx.func, owner_type as i64),
@@ -18610,6 +18644,9 @@ def f(x, y):
                     !function_contains_iconst_imm(&built.ctx.func, init_function_ptr),
                     "constructor specialization should not bake the __init__ function pointer into the function body",
                 );
+                modules
+                    .del_item("counter_test")
+                    .expect("test module should be removed from sys.modules");
             })
         };
 
