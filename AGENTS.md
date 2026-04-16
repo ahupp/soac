@@ -342,7 +342,10 @@ so a later turn can resume without rediscovering context.
   existing `counters/profile.bin` result without rerunning the profile pass.
   `just benchmark` records the actual current `@` revision in the result header
   and does not accept a revision argument; switch revisions first with `jj edit`
-  or, if you intentionally want a fresh child revision, `jj new`.
+  or, if you intentionally want a fresh child revision, `jj new`. Unless the
+  caller explicitly sets `SOAC_MODULE_CACHE_DIR`, benchmark recipes keep the
+  BlockPy module cache under the current result's `counters/modules` directory
+  so in-place before/after revision runs cannot reuse another revision's cache.
   Report the specialized apply-pass median from the result directory's
   `benchmark.txt` unless I explicitly ask for the warm unspecialized baseline.
   The benchmark also reports an unsound `SOAC_JIT_EMIT_REFCOUNTS=0` diagnostic
@@ -458,7 +461,9 @@ so a later turn can resume without rediscovering context.
   `project/pkg/submod/mod.blockpy`; source hash and SOAC build identity are
   cache metadata, not filename components. `mod.profile` and `mod.opt` are the
   corresponding per-module profile-evidence and optimization-decision artifact
-  names.
+  names. Benchmark recipes override the Justfile's repo-local default when the
+  caller did not set this variable explicitly, using the benchmark result's
+  `counters/modules` directory instead.
 - `SOAC_PRECOMPILED_LIBRARY`
   Optional path to an offline-precompiled SOAC shared library. When set, runtime
   direct-function compilation first tries to load matching code by module name,

@@ -110,7 +110,10 @@ exports are intentionally omitted here.
   the repo root. Cached modules use stable per-module artifact paths such as
   `project/pkg/submod/mod.blockpy`, with source hash and build identity stored
   as cache metadata. `mod.profile` and `mod.opt` are reserved as the matching
-  per-module profile-evidence and optimization-decision artifacts.
+  per-module profile-evidence and optimization-decision artifacts. Benchmark
+  recipes override the Justfile's repo-local default when the caller did not set
+  this variable explicitly, so benchmark runs keep their module cache under the
+  current result's `counters/modules` directory.
 
 - `SOAC_PRECOMPILED_LIBRARY=/path/to/libsoac_precompiled.so`
   Optional runtime source for offline-precompiled direct function bodies. When
@@ -318,10 +321,11 @@ globals are out of scope for now.
   for finalized runs. It always records and prints the actual current `@`
   revision that it executed, so switch revisions first with `jj edit <rev>` if
   you want to benchmark some revision other than the current checkout. By
-  default it keeps only the benchmark log and raw
-  counter files (`profile.bin`, `verify.bin`, `events.jsonl`); it does
-  not run `perf` and it does not build inspector-based counter/CLIF
-  artifacts. The specialized apply phase reports both the default
+  default it keeps the benchmark log, raw counter files (`profile.bin`,
+  `verify.bin`, `events.jsonl`), and the revision-scoped BlockPy module cache
+  under `counters/modules`; it does not run `perf` and it does not build
+  inspector-based counter/CLIF artifacts. The specialized apply phase reports
+  both the default
   refcounts-enabled throughput and an additional unsound
   `SOAC_JIT_EMIT_REFCOUNTS=0` diagnostic throughput.
 
@@ -339,11 +343,13 @@ globals are out of scope for now.
   Offline precompile a counter-referenced set of cached BlockPy modules into
   relocatable object files and link them into a shared library. The counter file
   normally comes from a previous profile pass, and the matching pre-optimization
-  BlockPy cache entries must still exist under `SOAC_MODULE_CACHE_DIR`, under
-  `$SOAC_WORK_DIR/modules` when the cache directory is unset, or under
-  `<counters-dir>/modules` when precompiling from an explicit counter dump.
-  When `counters` is omitted, the recipe uses `$LAST_BENCHMARK_COUNTERS`.
-  Set `SOAC_PRECOMPILED_LIBRARY` to the resulting
+  BlockPy cache entries must still exist in the active module cache. With the
+  default benchmark cache isolation, that cache is the benchmark result's
+  `counters/modules` directory; when `counters` points at
+  `.../counters/profile.bin` and `SOAC_MODULE_CACHE_DIR` was not set explicitly,
+  the precompile recipe derives that cache path automatically. When `counters`
+  is omitted, the recipe uses `$LAST_BENCHMARK_COUNTERS`. Set
+  `SOAC_PRECOMPILED_LIBRARY` to the resulting
   `.so` to let runtime direct-function setup use matching precompiled entries.
 
 - `cargo run -p soac-inspector --bin decide_optimizations -- --counters <profile.bin> --module <mod.blockpy> --out <root-dir>`

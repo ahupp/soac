@@ -12,6 +12,7 @@ xdg_cache_home := env_var_or_default("XDG_CACHE_HOME", repo_root + "/.xdg/cache"
 xdg_data_home := env_var_or_default("XDG_DATA_HOME", repo_root + "/.xdg/data")
 xdg_runtime_dir := env_var_or_default("XDG_RUNTIME_DIR", repo_root + "/tmp")
 cargo_home := env_var_or_default("CARGO_HOME", repo_root + "/tmp/cargo-home")
+soac_module_cache_dir_from_env := env_var_or_default("SOAC_MODULE_CACHE_DIR", "")
 soac_module_cache_dir := env_var_or_default("SOAC_MODULE_CACHE_DIR", repo_root + "/soac-module-cache")
 pyo3_python := cpython_bin
 web_dir := repo_root + "/web"
@@ -43,6 +44,7 @@ export INSPECTOR_BIN := inspector_bin
 export PORT := port
 export HOST := host
 export URL := url
+export SOAC_MODULE_CACHE_DIR_FROM_ENV := soac_module_cache_dir_from_env
 export LAST_BENCHMARK_COUNTERS_DIR := last_benchmark_counters_dir
 export LAST_BENCHMARK_COUNTERS := last_benchmark_counters
 
@@ -1204,12 +1206,16 @@ benchmark-verify loops="100000" counters_dir="": (update-venv-offline) (build-ex
     echo "counter profile not found at $COUNTERS_DIR/profile.bin; run 'just benchmark' first or pass counters_dir=<dir>" >&2
     exit 1
   fi
+  if [[ -z "${SOAC_MODULE_CACHE_DIR_FROM_ENV:-}" ]]; then
+    export SOAC_MODULE_CACHE_DIR="$COUNTERS_DIR/modules"
+  fi
   rm -f "$COUNTERS_DIR/events.jsonl"
   rm -f "$COUNTERS_DIR/verify.bin"
 
   echo "jit transformed verify pass"
   echo "loops: {{loops}}"
   echo "counters dir: $COUNTERS_DIR"
+  echo "module cache dir: $SOAC_MODULE_CACHE_DIR"
   LOOPS="{{loops}}" \
   WARMUP_LOOPS="${WARMUP_LOOPS}" \
   BENCHMARK_CPU="${BENCHMARK_CPU}" \
@@ -1297,6 +1303,9 @@ benchmark benchmark_loops="1000000" verify_loops="100000" results_root="bench" r
 
   rm -rf "$result_dir"
   mkdir -p "$counters_dir"
+  if [[ -z "${SOAC_MODULE_CACHE_DIR_FROM_ENV:-}" ]]; then
+    export SOAC_MODULE_CACHE_DIR="$counters_dir/modules"
+  fi
   SOAC_BENCHMARK_EVENTS_LOG="$counters_dir/events.jsonl"
   rm -f "$SOAC_BENCHMARK_EVENTS_LOG"
 
@@ -1316,6 +1325,7 @@ benchmark benchmark_loops="1000000" verify_loops="100000" results_root="bench" r
     echo "benchmark cpu: $BENCHMARK_CPU"
     echo "benchmark constant clocks: $BENCHMARK_CONSTANT_CLOCKS"
     echo "cranelift opt level: $CRANELIFT_OPT_LEVEL"
+    echo "module cache dir: $SOAC_MODULE_CACHE_DIR"
     echo "apply refcount modes: disabled, enabled"
     echo
 
@@ -1386,6 +1396,12 @@ precompile-shared-library counters="" out="logs/libsoac_precompiled.so" object_d
     echo "counter profile not found at $COUNTERS; run 'just benchmark' first or pass counters=<profile.bin>" >&2
     exit 1
   fi
+  if [[ -z "${SOAC_MODULE_CACHE_DIR_FROM_ENV:-}" && "$(basename "$COUNTERS")" == "profile.bin" ]]; then
+    COUNTERS_PARENT="$(dirname "$COUNTERS")"
+    if [[ "$(basename "$COUNTERS_PARENT")" == "counters" ]]; then
+      export SOAC_MODULE_CACHE_DIR="$COUNTERS_PARENT/modules"
+    fi
+  fi
 
   OUT="{{out}}"
   if [[ "$OUT" != /* ]]; then
@@ -1415,6 +1431,9 @@ _benchmark-export-specialized-artifacts result_dir:
   fi
   COUNTERS_DIR="$RESULT_DIR/counters"
   CLIF_DIR="$RESULT_DIR/clif"
+  if [[ -z "${SOAC_MODULE_CACHE_DIR_FROM_ENV:-}" ]]; then
+    export SOAC_MODULE_CACHE_DIR="$COUNTERS_DIR/modules"
+  fi
 
   if [[ ! -f "$COUNTERS_DIR/profile.bin" ]]; then
     echo "counter profile not found at $COUNTERS_DIR/profile.bin; run 'just benchmark' first or pass result_dir=<dir>" >&2
@@ -1464,6 +1483,9 @@ _benchmark-run-specialized-perf result_dir perf_loops="10000000": ensure-cpython
     RESULT_DIR="$REPO_ROOT/$RESULT_DIR"
   fi
   COUNTERS_DIR="$RESULT_DIR/counters"
+  if [[ -z "${SOAC_MODULE_CACHE_DIR_FROM_ENV:-}" ]]; then
+    export SOAC_MODULE_CACHE_DIR="$COUNTERS_DIR/modules"
+  fi
   if [[ ! -f "$COUNTERS_DIR/profile.bin" ]]; then
     echo "counter profile not found at $COUNTERS_DIR/profile.bin; run 'just benchmark' first or pass result_dir=<dir>" >&2
     exit 1
@@ -1499,6 +1521,9 @@ _benchmark-add-deep-profile-artifacts result_dir perf_loops="10000000": ensure-c
     RESULT_DIR="$REPO_ROOT/$RESULT_DIR"
   fi
   COUNTERS_DIR="$RESULT_DIR/counters"
+  if [[ -z "${SOAC_MODULE_CACHE_DIR_FROM_ENV:-}" ]]; then
+    export SOAC_MODULE_CACHE_DIR="$COUNTERS_DIR/modules"
+  fi
   if [[ ! -f "$COUNTERS_DIR/profile.bin" ]]; then
     echo "counter profile not found at $COUNTERS_DIR/profile.bin; run 'just benchmark' first or pass result_dir=<dir>" >&2
     exit 1
@@ -1534,9 +1559,13 @@ benchmark-deep-profile-from-profile result_dir verify_loops="100000" perf_loops=
     echo "verify loops: {{verify_loops}}"
     echo "perf loops: {{perf_loops}}"
     echo "starting point: $COUNTERS_DIR/profile.bin"
+    if [[ -z "${SOAC_MODULE_CACHE_DIR_FROM_ENV:-}" ]]; then
+      export SOAC_MODULE_CACHE_DIR="$COUNTERS_DIR/modules"
+    fi
+    echo "module cache dir: $SOAC_MODULE_CACHE_DIR"
     echo
-    just benchmark-verify "{{verify_loops}}" "$COUNTERS_DIR"
-    just _benchmark-add-deep-profile-artifacts "$RESULT_DIR" "{{perf_loops}}"
+    SOAC_MODULE_CACHE_DIR="$SOAC_MODULE_CACHE_DIR" just benchmark-verify "{{verify_loops}}" "$COUNTERS_DIR"
+    SOAC_MODULE_CACHE_DIR="$SOAC_MODULE_CACHE_DIR" just _benchmark-add-deep-profile-artifacts "$RESULT_DIR" "{{perf_loops}}"
     echo
     echo "deep profile result: $RESULT_DIR"
   } 2>&1 | tee "$REPORT"
@@ -1549,8 +1578,13 @@ benchmark-deep-profile benchmark_loops="1000000" verify_loops="100000" perf_loop
   benchmark_log="$(mktemp "${TMPDIR:-/tmp}/soac_benchmark_deep_profile.XXXXXX")"
   trap 'rm -f "$benchmark_log"' EXIT
 
-  just benchmark "{{benchmark_loops}}" "{{verify_loops}}" "{{results_root}}" "{{result_mode}}" \
-    2>&1 | tee "$benchmark_log"
+  if [[ -z "${SOAC_MODULE_CACHE_DIR_FROM_ENV:-}" ]]; then
+    env -u SOAC_MODULE_CACHE_DIR just benchmark "{{benchmark_loops}}" "{{verify_loops}}" "{{results_root}}" "{{result_mode}}" \
+      2>&1 | tee "$benchmark_log"
+  else
+    just benchmark "{{benchmark_loops}}" "{{verify_loops}}" "{{results_root}}" "{{result_mode}}" \
+      2>&1 | tee "$benchmark_log"
+  fi
 
   RESULT_DIR="$(sed -n 's/^benchmark result: //p' "$benchmark_log" | tail -n 1)"
   if [[ -z "$RESULT_DIR" ]]; then
@@ -1564,7 +1598,11 @@ benchmark-deep-profile benchmark_loops="1000000" verify_loops="100000" perf_loop
     echo "date: $(date +%F)"
     echo "perf loops: {{perf_loops}}"
     echo
-    just _benchmark-add-deep-profile-artifacts "$RESULT_DIR" "{{perf_loops}}"
+    if [[ -z "${SOAC_MODULE_CACHE_DIR_FROM_ENV:-}" ]]; then
+      SOAC_MODULE_CACHE_DIR="$RESULT_DIR/counters/modules" just _benchmark-add-deep-profile-artifacts "$RESULT_DIR" "{{perf_loops}}"
+    else
+      just _benchmark-add-deep-profile-artifacts "$RESULT_DIR" "{{perf_loops}}"
+    fi
     echo
     echo "deep profile result: $RESULT_DIR"
   } 2>&1 | tee "$REPORT"
