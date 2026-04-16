@@ -2,7 +2,7 @@ use crate::block_py::pretty::BlockPyPrettyPrint;
 use crate::block_py::{FunctionId, LocalLocation};
 use crate::passes::{
     ConstructorFieldStore, ConstructorFieldValue, EscapeSummaryModule,
-    FieldInitializerConstructorSummary,
+    FieldInitializerConstructorSummary, NonEscapingConstructorAllocationSummary,
 };
 use std::collections::HashMap;
 
@@ -26,10 +26,21 @@ impl InlinePlanModule {
             .and_then(|plan| plan.straightline_constructor.as_ref())
     }
 
+    pub fn non_escaping_constructor_allocations(
+        &self,
+        function_id: FunctionId,
+    ) -> Option<&[NonEscapingConstructorAllocationSummary]> {
+        self.function(function_id)
+            .map(|plan| plan.non_escaping_constructor_allocations.as_slice())
+    }
+
     pub fn remap_function_ids(&mut self, remap: impl Fn(FunctionId) -> FunctionId + Copy) {
         self.functions = std::mem::take(&mut self.functions)
             .into_iter()
-            .map(|(function_id, plan)| (remap(function_id), plan))
+            .map(|(function_id, mut plan)| {
+                plan.remap_function_ids(remap);
+                (remap(function_id), plan)
+            })
             .collect();
     }
 }
@@ -51,6 +62,12 @@ impl BlockPyPrettyPrint for InlinePlanModule {
                     render_field_stores(&constructor.field_stores),
                 ));
             }
+            if !plan.non_escaping_constructor_allocations.is_empty() {
+                out.push_str(&format!(
+                    "{function_id}: non_escaping_constructor_allocations count={}\n",
+                    plan.non_escaping_constructor_allocations.len(),
+                ));
+            }
         }
         if out.is_empty() {
             "; no inline candidates\n".to_string()
@@ -65,6 +82,15 @@ impl BlockPyPrettyPrint for InlinePlanModule {
 )]
 pub struct FunctionInlinePlan {
     pub straightline_constructor: Option<StraightlineConstructorInlinePlan>,
+    pub non_escaping_constructor_allocations: Vec<NonEscapingConstructorAllocationSummary>,
+}
+
+impl FunctionInlinePlan {
+    fn remap_function_ids(&mut self, remap: impl Fn(FunctionId) -> FunctionId + Copy) {
+        for allocation in &mut self.non_escaping_constructor_allocations {
+            allocation.constructor_function_id = remap(allocation.constructor_function_id);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -83,14 +109,20 @@ pub fn plan_module_inlining(escape_summary: &EscapeSummaryModule) -> InlinePlanM
                 .straightline_field_initializer
                 .as_ref()
                 .map(straightline_constructor_plan);
-            straightline_constructor.map(|straightline_constructor| {
-                (
-                    *function_id,
-                    FunctionInlinePlan {
-                        straightline_constructor: Some(straightline_constructor),
-                    },
-                )
-            })
+            if straightline_constructor.is_none()
+                && summary.non_escaping_constructor_allocations.is_empty()
+            {
+                return None;
+            }
+            Some((
+                *function_id,
+                FunctionInlinePlan {
+                    straightline_constructor,
+                    non_escaping_constructor_allocations: summary
+                        .non_escaping_constructor_allocations
+                        .clone(),
+                },
+            ))
         })
         .collect();
     InlinePlanModule { functions }
@@ -182,5 +214,41 @@ class Box:
         assert!(inline_plan
             .straightline_constructor(function.function_id)
             .is_none());
+    }
+
+    #[test]
+    fn carries_non_escaping_constructor_allocations() {
+        let caller_id = FunctionId::new(1, 10);
+        let constructor_id = FunctionId::new(1, 20);
+        let escape_summary = EscapeSummaryModule {
+            functions: HashMap::from([(
+                caller_id,
+                crate::passes::FunctionEscapeSummary {
+                    non_escaping_constructor: None,
+                    straightline_field_initializer: None,
+                    non_escaping_constructor_allocations: vec![
+                        NonEscapingConstructorAllocationSummary {
+                            local_name: "box".to_string(),
+                            local_location: LocalLocation(0),
+                            constructor_function_id: constructor_id,
+                            call_instr_id: None,
+                            field_reads: vec![crate::passes::ConstructorFieldAccess {
+                                field_name: "value".to_string(),
+                            }],
+                            field_writes: Vec::new(),
+                        },
+                    ],
+                },
+            )]),
+        };
+
+        let inline_plan = plan_module_inlining(&escape_summary);
+        let allocations = inline_plan
+            .non_escaping_constructor_allocations(caller_id)
+            .expect("caller should have an inline plan");
+
+        assert_eq!(allocations.len(), 1);
+        assert_eq!(allocations[0].constructor_function_id, constructor_id);
+        assert_eq!(allocations[0].field_reads[0].field_name, "value");
     }
 }
