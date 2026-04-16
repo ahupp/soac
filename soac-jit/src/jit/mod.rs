@@ -18842,6 +18842,21 @@ fn emit_typed_codegen_stmt_with_local_env(
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<ir::Value, String> {
+    if let InstrTyped::LegacyStore(op) = expr
+        && op.name.location.is_global()
+    {
+        let mut intrinsic_state = LocalEnvCodegenIntrinsicEmitState {
+            fb,
+            local_env,
+            ctx: emit_ctx,
+            codegen_env,
+            func_imports,
+        };
+        if let Some(value) = intrinsics::emit_typed_operation(expr, &mut intrinsic_state) {
+            return Ok(value);
+        }
+    }
+
     if matches!(
         expr,
         InstrTyped::Truthy(_)
@@ -18966,6 +18981,24 @@ fn emit_typed_codegen_stmt_result_with_local_env(
             func_imports,
         )? {
             return Ok(result);
+        }
+        if op.name.location.is_global() {
+            let mut intrinsic_state = LocalEnvCodegenIntrinsicEmitState {
+                fb,
+                local_env,
+                ctx: emit_ctx,
+                codegen_env,
+                func_imports,
+            };
+            if let Some(value) = intrinsics::emit_typed_operation(expr, &mut intrinsic_state) {
+                let facts = expr
+                    .result_facts()
+                    .and_then(ValueFacts::as_pyobj)
+                    .unwrap_or_else(PyObjFacts::unknown);
+                return Ok(emit_owned_pyobject_result_for_demand(
+                    fb, value, facts, emit_ctx, demand,
+                ));
+            }
         }
     }
 

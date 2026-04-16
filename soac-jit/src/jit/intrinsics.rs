@@ -15,7 +15,7 @@ use cranelift_codegen::ir::InstBuilder;
 use cranelift_frontend::FunctionBuilder;
 use pyo3::ffi;
 use soac_blockpy::block_py::{
-    CounterId, HasSemanticInstrId, Instr, InstrCodegen, NameLike, NameLocation,
+    CounterId, HasSemanticInstrId, Instr, InstrCodegen, NameLike, NameLocation, ResolvedName,
 };
 use soac_blockpy::passes::{InstrTyped, PyExactType, PyObjFacts};
 use std::mem::offset_of;
@@ -1714,9 +1714,9 @@ fn emit_load<'fb>(
     state.finish_owned_result(result)
 }
 
-fn emit_store<'fb>(
-    op: &blockpy_intrinsics::Store<InstrCodegen>,
-    state: &mut impl OperationEmitState<'fb, InstrCodegen>,
+fn emit_store<'fb, E: Instr<Name = ResolvedName>>(
+    op: &blockpy_intrinsics::Store<E>,
+    state: &mut impl OperationEmitState<'fb, E>,
 ) -> ir::Value {
     let arg_values = state.emit_arg_values(&[&op.value]);
     let name_obj = state.emit_owned_string_constant(op.name.id_str());
@@ -1982,6 +1982,7 @@ pub(super) fn emit_typed_operation<'fb>(
         }),
         InstrTyped::LegacyUnaryOp(op) => emit_specialized_unary_op(op, state)
             .or_else(|| Some(emit_unary_op(op.kind, state, &[op.operand.as_ref()]))),
+        InstrTyped::LegacyStore(op) => op.name.location.is_global().then(|| emit_store(op, state)),
         _ => None,
     }
 }
