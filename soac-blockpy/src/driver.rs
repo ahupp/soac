@@ -347,7 +347,7 @@ fn finish_codegen_module_with_tracker(
     env_config: &SoacEnvConfig,
 ) -> Result<BlockPyModule<CodegenModuleShape>> {
     let PreOptimizationModule {
-        module: bb_codegen,
+        module: mut bb_codegen,
         prepared,
         cache_path_for_store,
     } = pre_optimization;
@@ -357,6 +357,18 @@ fn finish_codegen_module_with_tracker(
     let prepared = if let Some(prepared) = prepared {
         pass_tracker.record_timing("prepared_codegen_cache_use", || prepared)
     } else {
+        let initial_inline_plan = pass_tracker.record_timing("inline_candidate_plan", || {
+            let escape_summary = passes::summarize_module_escapes(&bb_codegen);
+            passes::plan_module_inlining(&escape_summary)
+        });
+        let inline_rewrite_stats = pass_tracker.record_timing("inline_direct_call_stores", || {
+            passes::inline_simple_direct_call_stores(&mut bb_codegen, &initial_inline_plan)
+        });
+        if inline_rewrite_stats.rewritten_stores != 0 {
+            pass_tracker.record_timing("validate_codegen_instr_ids_after_inline", || {
+                passes::validate_codegen_instr_ids(&bb_codegen).map_err(anyhow::Error::msg)
+            })?;
+        }
         let escape_summary = pass_tracker.run_pass("escape_summary", || {
             passes::summarize_module_escapes(&bb_codegen)
         });
