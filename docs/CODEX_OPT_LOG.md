@@ -21,6 +21,30 @@ benchmarked throughput delta, and the headline pre/post numbers.
 
 # Journal of Negative Results
 
+## 2026-04-16 - Not landed: typed generic positional call emission
+
+- jj change id: not landed (`tmvssnxt` while testing)
+- summary: Tried routing plain positional generic typed calls through typed
+  child emission so planned borrowed/immortal input ownership would survive the
+  call-emission boundary. The real refcount-enabled path regressed even after
+  preserving the fixed-arity effect-only helper shape. Verify counters showed
+  the attempt added `+505103` runtime INCREFs and `+505103` runtime DECREFs per
+  100k-loop pystone verify run, mostly in `Proc1`, so this should wait for a
+  more precise typed call emitter that does not increase ownership traffic.
+- throughput: `-2.23%` median with refcounts enabled
+- baseline benchmark:
+  - apply, refcounts enabled, 1M loops x3: `247509`, `253836`,
+    `259163 loops/s`
+  - apply, refcounts disabled, 1M loops x3: `324245`, `328681`,
+    `324769 loops/s`
+  - total pystone code size: `506663 bytes`
+- attempted benchmark:
+  - apply, refcounts enabled, 1M loops x3: `248181`, `246173`,
+    `260493 loops/s`
+  - apply, refcounts disabled, 1M loops x3: `352532`, `353217`,
+    `340215 loops/s`
+  - total pystone code size: `509615 bytes`
+
 ## 2026-04-15 - Not landed: Cranelift opt-level tuning for typing import
 
 - jj change id: not landed
