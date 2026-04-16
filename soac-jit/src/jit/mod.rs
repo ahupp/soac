@@ -9901,8 +9901,8 @@ impl<'a, 'b, 'mc, 'c, 'd, Env: JitCodegenEnv> intrinsics::OperationEmitState<'b,
                 self.func_imports,
             )
             .unwrap_or_else(|err| panic!("{err}"));
-            let (value, _) = value.expect_pyobject("typed intrinsic PyObject argument");
-            arg_values.push((value, borrowed_arg));
+            let (value, ownership, _) = value.expect_pyobject("typed intrinsic PyObject argument");
+            arg_values.push((value, borrowed_arg || !ownership.is_owned()));
         }
         arg_values
     }
@@ -11698,7 +11698,8 @@ fn emit_owned_bool_from_cond(
     ctx: &JitEmitCtx<'_>,
 ) -> ir::Value {
     let truth = emit_i32_bool01_from_cond(fb, cond, ctx);
-    let (bool_value, _) = emit_to_python_bool(fb, truth, ctx).expect_pyobject("bool materialize");
+    let (bool_value, _, _) =
+        emit_to_python_bool(fb, truth, ctx).expect_pyobject("bool materialize");
     bool_value
 }
 
@@ -11744,8 +11745,7 @@ fn emit_to_python_bool(
     let true_const = emit_true_const(fb, ctx);
     let false_const = emit_false_const(fb, ctx);
     let bool_value = fb.ins().select(is_true, true_const, false_const);
-    fb.ins().call(ctx.incref_ref, &[bool_value]);
-    SoacValue::pyobject(bool_value, PyObjFacts::bool_object())
+    SoacValue::immortal_pyobject(bool_value, PyObjFacts::bool_object())
 }
 
 fn emit_checked_owned_pyobject_result(
@@ -11849,7 +11849,8 @@ fn emit_owned_bool_from_i32_result(
     );
     fb.switch_to_block(ok_block);
     let truth = emit_i32_bool01_from_i32_result(fb, result, ctx);
-    let (bool_value, _) = emit_to_python_bool(fb, truth, ctx).expect_pyobject("bool materialize");
+    let (bool_value, _, _) =
+        emit_to_python_bool(fb, truth, ctx).expect_pyobject("bool materialize");
     bool_value
 }
 
@@ -11866,7 +11867,7 @@ fn emit_owned_bool_from_pyobject_truthiness(
     if invert {
         truth = emit_i32_bool01_not(fb, truth, ctx);
     }
-    let (bool_value, _) =
+    let (bool_value, _, _) =
         emit_to_python_bool(fb, truth, ctx).expect_pyobject("truthiness bool materialize");
     bool_value
 }
@@ -14962,8 +14963,16 @@ fn emit_truthy_from_owned_value(
         }
         SoacValue::PyObject {
             value: owned_value,
+            ownership,
             facts: py_facts,
-        } => emit_truthy_from_pyobject_value(fb, owned_value, py_facts, is_true_ref, ctx, true),
+        } => emit_truthy_from_pyobject_value(
+            fb,
+            owned_value,
+            py_facts,
+            is_true_ref,
+            ctx,
+            ownership.is_owned(),
+        ),
     }
 }
 
@@ -15040,7 +15049,14 @@ fn emit_codegen_expr_value_with_local_env(
         codegen_env,
         func_imports,
     );
-    SoacValue::pyobject(value, facts)
+    let ownership = if facts.is_immortal() {
+        ValueOwnership::Immortal
+    } else if borrowed {
+        ValueOwnership::Borrowed
+    } else {
+        ValueOwnership::Owned
+    };
+    SoacValue::pyobject_with_ownership(value, ownership, facts)
 }
 
 fn prepare_typed_guard_miss_dispatch_for_instr(
@@ -15559,7 +15575,14 @@ fn emit_typed_codegen_expr_value_with_local_env(
             emit_ctx,
             borrowed,
         );
-        return Ok(SoacValue::pyobject(value, facts));
+        let ownership = if facts.is_immortal() {
+            ValueOwnership::Immortal
+        } else if borrowed {
+            ValueOwnership::Borrowed
+        } else {
+            ValueOwnership::Owned
+        };
+        return Ok(SoacValue::pyobject_with_ownership(value, ownership, facts));
     }
 
     if let InstrTyped::Truthy(op) = expr {
@@ -15614,10 +15637,10 @@ fn emit_typed_codegen_expr_value_with_local_env(
         )? {
             let (value, ownership, facts) = result.expect_pyobject("typed call expression result");
             assert!(
-                ownership.is_owned(),
-                "typed call expression result should be an owned PyObject"
+                ownership.can_satisfy_pyobject_demand(ResultDemand::PYOBJECT_OWNED),
+                "typed call expression result should satisfy owned PyObject demand"
             );
-            return Ok(SoacValue::pyobject(value, facts));
+            return Ok(SoacValue::pyobject_with_ownership(value, ownership, facts));
         }
         let legacy_expr = try_lower_typed_instr_to_codegen_legacy(expr.clone())?;
         return Ok(emit_codegen_expr_value_with_local_env(
@@ -15644,10 +15667,10 @@ fn emit_typed_codegen_expr_value_with_local_env(
             let (value, ownership, facts) =
                 result.expect_pyobject("typed guarded callable call expression result");
             assert!(
-                ownership.is_owned(),
-                "typed guarded callable call expression result should be an owned PyObject"
+                ownership.can_satisfy_pyobject_demand(ResultDemand::PYOBJECT_OWNED),
+                "typed guarded callable call expression result should satisfy owned PyObject demand"
             );
-            return Ok(SoacValue::pyobject(value, facts));
+            return Ok(SoacValue::pyobject_with_ownership(value, ownership, facts));
         }
         let typed_call = op.clone().into_typed_call();
         let legacy_expr =
@@ -15676,10 +15699,10 @@ fn emit_typed_codegen_expr_value_with_local_env(
             let (value, ownership, facts) =
                 result.expect_pyobject("typed guarded method call expression result");
             assert!(
-                ownership.is_owned(),
-                "typed guarded method call expression result should be an owned PyObject"
+                ownership.can_satisfy_pyobject_demand(ResultDemand::PYOBJECT_OWNED),
+                "typed guarded method call expression result should satisfy owned PyObject demand"
             );
-            return Ok(SoacValue::pyobject(value, facts));
+            return Ok(SoacValue::pyobject_with_ownership(value, ownership, facts));
         }
         let typed_call = op.clone().into_typed_call();
         let legacy_expr =
@@ -15708,10 +15731,10 @@ fn emit_typed_codegen_expr_value_with_local_env(
         let (value, ownership, facts) =
             result.expect_pyobject("typed direct callable call expression result");
         assert!(
-            ownership.is_owned(),
-            "typed direct callable call expression result should be an owned PyObject"
+            ownership.can_satisfy_pyobject_demand(ResultDemand::PYOBJECT_OWNED),
+            "typed direct callable call expression result should satisfy owned PyObject demand"
         );
-        return Ok(SoacValue::pyobject(value, facts));
+        return Ok(SoacValue::pyobject_with_ownership(value, ownership, facts));
     }
 
     if let InstrTyped::DirectMethodCallTyped(op) = expr {
@@ -15727,10 +15750,10 @@ fn emit_typed_codegen_expr_value_with_local_env(
         let (value, ownership, facts) =
             result.expect_pyobject("typed direct method call expression result");
         assert!(
-            ownership.is_owned(),
-            "typed direct method call expression result should be an owned PyObject"
+            ownership.can_satisfy_pyobject_demand(ResultDemand::PYOBJECT_OWNED),
+            "typed direct method call expression result should satisfy owned PyObject demand"
         );
-        return Ok(SoacValue::pyobject(value, facts));
+        return Ok(SoacValue::pyobject_with_ownership(value, ownership, facts));
     }
 
     if let InstrTyped::DirectCallGuardTest(op) = expr {
@@ -17648,8 +17671,8 @@ fn emit_i64_result_for_demand(
                 emit_ctx.py_long_from_i64_ref,
                 emit_ctx,
             );
-            let (boxed, boxed_facts) = boxed.expect_pyobject("I64 Python object demand");
-            EmitResult::owned_pyobject(boxed, boxed_facts)
+            let (boxed, ownership, boxed_facts) = boxed.expect_pyobject("I64 Python object demand");
+            EmitResult::pyobject(boxed, ownership, boxed_facts)
         }
     }
 }
@@ -18184,7 +18207,8 @@ fn emit_typed_codegen_simple_positional_call_result_with_local_env(
         codegen_env,
         func_imports,
     )?;
-    let (callable, _) = callable_value.expect_pyobject("typed call callable");
+    let (callable, callable_ownership, _) = callable_value.expect_pyobject("typed call callable");
+    let callable_is_borrowed = !callable_ownership.is_owned();
     let mut arg_values = Vec::with_capacity(call.args.len());
     let mut arg_borrowed = Vec::with_capacity(call.args.len());
     for arg in &call.args {
@@ -18202,16 +18226,16 @@ fn emit_typed_codegen_simple_positional_call_result_with_local_env(
             codegen_env,
             func_imports,
         )?;
-        let (arg_value, _) = arg_value.expect_pyobject("typed positional call arg");
+        let (arg_value, arg_ownership, _) = arg_value.expect_pyobject("typed positional call arg");
         arg_values.push(arg_value);
-        arg_borrowed.push(false);
+        arg_borrowed.push(!arg_ownership.is_owned());
     }
 
     let result = if arg_values.len() <= 3 {
         emit_positional_call_three_result_with_arg_values(
             fb,
             callable,
-            false,
+            callable_is_borrowed,
             arg_values,
             arg_borrowed,
             emit_ctx,
@@ -18221,7 +18245,7 @@ fn emit_typed_codegen_simple_positional_call_result_with_local_env(
         emit_positional_vectorcall_result_with_arg_values(
             fb,
             callable,
-            false,
+            callable_is_borrowed,
             arg_values,
             arg_borrowed,
             emit_ctx,
@@ -18589,7 +18613,7 @@ fn emit_typed_direct_call_guard_test_value_with_local_env(
         codegen_env,
         func_imports,
     )?;
-    let (raw_value, facts) = value.expect_pyobject("typed direct-call guard input");
+    let (raw_value, ownership, facts) = value.expect_pyobject("typed direct-call guard input");
 
     let guard = match &op.kind {
         TypedDirectCallGuardTestKind::FunctionId { function_id } => {
@@ -18631,7 +18655,7 @@ fn emit_typed_direct_call_guard_test_value_with_local_env(
         }
     };
 
-    if !value_is_borrowed {
+    if ownership.is_owned() {
         emit_release_owned_pyobject(fb, raw_value, Some(facts), emit_ctx);
     }
     Ok(guard)
@@ -18659,10 +18683,10 @@ fn emit_codegen_direct_function_id_guard_test_value_with_local_env(
         codegen_env,
         func_imports,
     );
-    let (raw_value, facts) = value.expect_pyobject("direct function-id guard input");
+    let (raw_value, ownership, facts) = value.expect_pyobject("direct function-id guard input");
     let guard =
         emit_exact_function_id_match_bool01(fb, raw_value, op.function_id, emit_ctx, codegen_env)?;
-    if !value_is_borrowed {
+    if ownership.is_owned() {
         emit_release_owned_pyobject(fb, raw_value, Some(facts), emit_ctx);
     }
     Ok(guard)
@@ -18690,7 +18714,8 @@ fn emit_codegen_direct_receiver_type_version_guard_test_value_with_local_env(
         codegen_env,
         func_imports,
     );
-    let (raw_value, facts) = value.expect_pyobject("direct receiver type-version guard input");
+    let (raw_value, ownership, facts) =
+        value.expect_pyobject("direct receiver type-version guard input");
     let owner_type_ref = reloc_type_ref_from_typed_attr_owner_ref(&op.owner_type_ref)
         .ok_or_else(|| "invalid direct receiver guard owner type ref".to_string())?;
     let guard = match emit_type_ptr_value_for_ref(fb, codegen_env, emit_ctx, &owner_type_ref)? {
@@ -18703,7 +18728,7 @@ fn emit_codegen_direct_receiver_type_version_guard_test_value_with_local_env(
         ),
         None => emit_i32_bool01_const(fb, false, emit_ctx),
     };
-    if !value_is_borrowed {
+    if ownership.is_owned() {
         emit_release_owned_pyobject(fb, raw_value, Some(facts), emit_ctx);
     }
     Ok(guard)
@@ -18729,7 +18754,24 @@ fn emit_typed_codegen_expr_with_local_env(
         func_imports,
     )?;
     Ok(match value {
-        SoacValue::PyObject { value, .. } => value,
+        SoacValue::PyObject {
+            value,
+            ownership,
+            facts,
+        } => {
+            if !borrowed && matches!(ownership, ValueOwnership::Borrowed) {
+                fb.ins().call(emit_ctx.incref_ref, &[value]);
+            }
+            debug_assert!(
+                !borrowed || !ownership.is_owned(),
+                "borrowed PyObject request unexpectedly produced an owned value"
+            );
+            debug_assert!(
+                !matches!(ownership, ValueOwnership::Immortal) || facts.is_immortal(),
+                "immortal PyObject ownership should carry immortal facts"
+            );
+            value
+        }
         SoacValue::I32 {
             value: truth_i32,
             facts,
@@ -19089,13 +19131,12 @@ fn emit_typed_codegen_i64_index_result_with_local_env(
         codegen_env,
         func_imports,
     )?;
-    let (index_obj, _) = index_value.expect_pyobject("typed branch-table index");
+    let (index_obj, ownership, facts) = index_value.expect_pyobject("typed branch-table index");
     let index_i64_inst = fb.ins().call(pyobject_to_i64_ref, &[index_obj]);
     let index_i64 = fb.inst_results(index_i64_inst)[0];
-    fb.ins().call(
-        emit_ctx.decref_ref,
-        &[emit_ctx.consts.thread_state_value, index_obj],
-    );
+    if ownership.is_owned() {
+        emit_release_owned_pyobject(fb, index_obj, Some(facts), emit_ctx);
+    }
     Ok(EmitResult::i64(index_i64, IntFacts::i64_unknown()))
 }
 

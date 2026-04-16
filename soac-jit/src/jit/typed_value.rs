@@ -141,14 +141,48 @@ pub enum SoacRepr {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SoacValue {
-    PyObject { value: ir::Value, facts: PyObjFacts },
-    I32 { value: ir::Value, facts: IntFacts },
-    I64 { value: ir::Value, facts: IntFacts },
+    PyObject {
+        value: ir::Value,
+        ownership: ValueOwnership,
+        facts: PyObjFacts,
+    },
+    I32 {
+        value: ir::Value,
+        facts: IntFacts,
+    },
+    I64 {
+        value: ir::Value,
+        facts: IntFacts,
+    },
 }
 
 impl SoacValue {
     pub fn pyobject(value: ir::Value, facts: PyObjFacts) -> Self {
-        Self::PyObject { value, facts }
+        Self::owned_pyobject(value, facts)
+    }
+
+    pub fn pyobject_with_ownership(
+        value: ir::Value,
+        ownership: ValueOwnership,
+        facts: PyObjFacts,
+    ) -> Self {
+        Self::PyObject {
+            value,
+            ownership,
+            facts,
+        }
+    }
+
+    pub fn owned_pyobject(value: ir::Value, facts: PyObjFacts) -> Self {
+        Self::pyobject_with_ownership(value, ValueOwnership::Owned, facts)
+    }
+
+    pub fn borrowed_pyobject(value: ir::Value, facts: PyObjFacts) -> Self {
+        Self::pyobject_with_ownership(value, ValueOwnership::Borrowed, facts)
+    }
+
+    pub fn immortal_pyobject(value: ir::Value, facts: PyObjFacts) -> Self {
+        Self::pyobject_with_ownership(value, ValueOwnership::Immortal, facts)
     }
 
     pub fn i32(value: ir::Value, facts: IntFacts) -> Self {
@@ -177,9 +211,13 @@ impl SoacValue {
         }
     }
 
-    pub const fn as_pyobject(self) -> Option<(ir::Value, PyObjFacts)> {
+    pub const fn as_pyobject(self) -> Option<(ir::Value, ValueOwnership, PyObjFacts)> {
         match self {
-            Self::PyObject { value, facts } => Some((value, facts)),
+            Self::PyObject {
+                value,
+                ownership,
+                facts,
+            } => Some((value, ownership, facts)),
             Self::I32 { .. } | Self::I64 { .. } => None,
         }
     }
@@ -199,7 +237,7 @@ impl SoacValue {
     }
 
     #[track_caller]
-    pub fn expect_pyobject(self, context: &str) -> (ir::Value, PyObjFacts) {
+    pub fn expect_pyobject(self, context: &str) -> (ir::Value, ValueOwnership, PyObjFacts) {
         self.as_pyobject()
             .unwrap_or_else(|| panic!("{context}: expected PyObject value, got {:?}", self.repr()))
     }
@@ -408,6 +446,8 @@ mod tests {
     #[test]
     fn soac_value_preserves_representation_specific_facts() {
         let py = SoacValue::pyobject(value(1), PyObjFacts::none_singleton());
+        let borrowed_py = SoacValue::borrowed_pyobject(value(4), PyObjFacts::unknown());
+        let immortal_py = SoacValue::immortal_pyobject(value(5), PyObjFacts::bool_object());
         let i32_value = SoacValue::i32(value(2), IntFacts::i32_bool01());
         let i64_value = SoacValue::i64(value(3), IntFacts::i64_known(42));
 
@@ -417,7 +457,23 @@ mod tests {
         assert_eq!(py.raw_value(), value(1));
         assert_eq!(
             py.as_pyobject(),
-            Some((value(1), PyObjFacts::none_singleton()))
+            Some((
+                value(1),
+                ValueOwnership::Owned,
+                PyObjFacts::none_singleton()
+            ))
+        );
+        assert_eq!(
+            borrowed_py.as_pyobject(),
+            Some((value(4), ValueOwnership::Borrowed, PyObjFacts::unknown()))
+        );
+        assert_eq!(
+            immortal_py.as_pyobject(),
+            Some((
+                value(5),
+                ValueOwnership::Immortal,
+                PyObjFacts::bool_object()
+            ))
         );
         assert_eq!(i32_value.as_i32(), Some((value(2), IntFacts::i32_bool01())));
         assert_eq!(

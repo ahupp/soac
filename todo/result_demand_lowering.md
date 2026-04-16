@@ -135,14 +135,16 @@ result before returning `NoValue`.
 
 Status: step 1 has `ResultDemand`, `ValueOwnership`, and `EmitResult` wrappers;
 `ResultDemand` is now the BlockPy-owned `TypedResultDemand`, while
-`ValueOwnership` and `EmitResult` remain backend-shaped JIT values. Step 2 has
-started: statement-position JIT emission now requests `EffectOnly` through a
-typed result wrapper. LocalEnv-backed `Store` and `Del` producers now honor
-`EffectOnly` directly and return `NoValue`; generic `Call` and `CallDirect`
-statement producers now execute the call and discard owned results at the call
-boundary. Non-local cell/global producers still use the legacy object-producing
-path before the wrapper discards the result. Step 6 has moved from a
-codegen-local `HashMap<InstrId, ResultDemand>` sidecar to node-local
+`ValueOwnership`, `SoacValue`, and `EmitResult` remain backend-shaped JIT values.
+`SoacValue::PyObject` now carries ownership so typed expression helpers can
+preserve borrowed and immortal values instead of relying only on a separate
+borrowed flag. Step 2 has started: statement-position JIT emission now requests
+`EffectOnly` through a typed result wrapper. LocalEnv-backed `Store` and `Del`
+producers now honor `EffectOnly` directly and return `NoValue`; generic `Call`
+and `CallDirect` statement producers now execute the call and discard owned
+results at the call boundary. Non-local cell/global producers still use the
+legacy object-producing path before the wrapper discards the result. Step 6 has
+moved from a codegen-local `HashMap<InstrId, ResultDemand>` sidecar to node-local
 `TypedInstrExtra::demand` annotations on `InstrTyped`. Step 6 has also gained
 node-local `TypedInstrExtra::planned_result` annotations that combine demand,
 value facts, and simple producer shape into the final representation that
