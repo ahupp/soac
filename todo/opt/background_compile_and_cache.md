@@ -20,6 +20,24 @@ functions off the critical path?
 - Persist per-function lowered artifacts so a later process can skip pure lowering for unchanged
   source/runtime metadata.
 
+## Attached Reservation And Wait Follow-Up
+
+The current deadlock-avoidance shape can detach Python only around the reservation/wait path while
+keeping actual foreground compilation attached. That is a pragmatic split, but it is not the desired
+final model: the reservation and "someone else is compiling this function" wait should also be
+expressible without temporarily leaving the attached Python state.
+
+Target shape:
+
+- Model compile reservations so they never require running Python callbacks or touching Python object
+  state while holding the process JIT state lock.
+- Make waiters block without depending on `py.detach(...)`; the wait path should be a normal Rust
+  synchronization point with explicit ownership of any data needed after wake-up.
+- Keep foreground first-call compilation attached for paths that need Python-visible state, but make
+  the reservation/commit phases purely Rust-side and short.
+- Add a regression that exercises "foreground call waits for an in-flight background compile" without
+  requiring a detached Python wait.
+
 ## Success Signal
 
 - For benchmark/app server style workloads, hot functions are compiled before first hot-loop
