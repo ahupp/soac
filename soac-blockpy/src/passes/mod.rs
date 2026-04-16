@@ -683,10 +683,12 @@ pub use inline_sites::{
 pub use inline_transform::{
     bind_simple_direct_call_inline_args, build_single_block_inline_fragment,
     build_single_block_inline_fragment_to_target, build_single_block_inline_fragment_with_bindings,
-    InlineFragment, InlineLocal, InlineUnsupportedReason, InlineValueBindings,
+    inline_simple_direct_call_stores, InlineFragment, InlineLocal, InlineRewriteStats,
+    InlineUnsupportedReason, InlineValueBindings,
 };
 pub use instr_id::{
-    assign_function_instr_ids, assign_module_instr_ids, validate_codegen_instr_ids,
+    assign_function_instr_ids, assign_module_instr_ids, reassign_codegen_function_instr_ids,
+    reassign_codegen_module_instr_ids, validate_codegen_instr_ids,
 };
 pub use instrument::{
     CounterBuilder, CounterHandle, CounterSpec, InstrumentInstr, OptBlock, OptInstr,

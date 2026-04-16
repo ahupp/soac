@@ -1,9 +1,11 @@
 use crate::block_py::{
-    Block, BlockArg, BlockEdge, BlockLabel, BlockPyFunction, BlockTerm, CallArgPositional,
-    CallDirect, HasMeta, InstrCodegen, LocalLocation, MapInstr, Mappable, NameLocation, ParamKind,
-    ResolvedName, Store, TryMapInstr, WithMeta,
+    Block, BlockArg, BlockEdge, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm,
+    CallArgPositional, CallDirect, FunctionId, HasMeta, InstrCodegen, LocalLocation, MapInstr,
+    Mappable, NameLocation, ParamKind, ResolvedName, Store, TryMapInstr, WithMeta,
 };
-use crate::passes::{CodegenModuleShape, InstrCodegenOp};
+use crate::passes::{
+    reassign_codegen_function_instr_ids, CodegenModuleShape, InlinePlanModule, InstrCodegenOp,
+};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -22,6 +24,12 @@ pub struct InlineLocal {
 
 pub type InlineValueBindings = HashMap<LocalLocation, InstrCodegen>;
 
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct InlineRewriteStats {
+    pub rewritten_stores: usize,
+    pub skipped_candidates: usize,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum InlineUnsupportedReason {
     MissingCallerStorageLayout,
@@ -37,6 +45,147 @@ pub enum InlineUnsupportedReason {
     BlockParams,
     ExceptionEdge,
     NonReturnTerm,
+}
+
+pub fn inline_simple_direct_call_stores(
+    module: &mut BlockPyModule<CodegenModuleShape>,
+    inline_plan: &InlinePlanModule,
+) -> InlineRewriteStats {
+    let callees = module
+        .callable_defs
+        .iter()
+        .map(|function| (function.function_id, function.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut stats = InlineRewriteStats::default();
+    for function in &mut module.callable_defs {
+        if inline_simple_direct_call_stores_in_function(function, inline_plan, &callees, &mut stats)
+        {
+            reassign_codegen_function_instr_ids(function);
+        }
+    }
+    stats
+}
+
+fn inline_simple_direct_call_stores_in_function(
+    function: &mut BlockPyFunction<CodegenModuleShape>,
+    inline_plan: &InlinePlanModule,
+    callees: &HashMap<FunctionId, BlockPyFunction<CodegenModuleShape>>,
+    stats: &mut InlineRewriteStats,
+) -> bool {
+    let mut changed = false;
+    let original_blocks = std::mem::take(&mut function.blocks);
+    let mut rewritten_blocks = Vec::with_capacity(original_blocks.len());
+    for block in original_blocks {
+        match build_direct_store_rewrite(function, block, inline_plan, callees, stats) {
+            InlineBlockRewrite::Rewritten(blocks) => {
+                rewritten_blocks.extend(blocks);
+                changed = true;
+            }
+            InlineBlockRewrite::Unchanged(block) => rewritten_blocks.push(block),
+        }
+    }
+    function.blocks = rewritten_blocks;
+    changed
+}
+
+fn build_direct_store_rewrite(
+    caller: &mut BlockPyFunction<CodegenModuleShape>,
+    block: Block<InstrCodegen>,
+    inline_plan: &InlinePlanModule,
+    callees: &HashMap<FunctionId, BlockPyFunction<CodegenModuleShape>>,
+    stats: &mut InlineRewriteStats,
+) -> InlineBlockRewrite {
+    let Some(candidate) =
+        find_inline_store_candidate(&block, caller.function_id, inline_plan, callees)
+    else {
+        return InlineBlockRewrite::Unchanged(block);
+    };
+    let callee = callees
+        .get(&candidate.callee_id)
+        .expect("inline store candidate should have an existing callee");
+    let Ok(bindings) = bind_simple_direct_call_inline_args(callee, &candidate.call) else {
+        stats.skipped_candidates += 1;
+        return InlineBlockRewrite::Unchanged(block);
+    };
+
+    let continuation = caller.name_gen.next_block_name();
+    let Ok(mut fragment) = build_single_block_inline_fragment_to_target(
+        caller,
+        callee,
+        continuation,
+        &bindings,
+        candidate.target,
+    ) else {
+        stats.skipped_candidates += 1;
+        return InlineBlockRewrite::Unchanged(block);
+    };
+
+    let exc_edge = block.exc_edge.clone();
+    for fragment_block in &mut fragment.blocks {
+        fragment_block.exc_edge = exc_edge.clone();
+    }
+
+    let mut before = block.body;
+    let after = before.split_off(candidate.instr_index + 1);
+    before.truncate(candidate.instr_index);
+    let prelude = Block::new(
+        block.label,
+        before,
+        BlockTerm::Jump(BlockEdge::new(fragment.entry_label)),
+        block.params,
+        exc_edge.clone(),
+    );
+    let continuation_block = Block::new(continuation, after, block.term, Vec::new(), exc_edge);
+
+    let mut blocks = Vec::with_capacity(fragment.blocks.len() + 2);
+    blocks.push(prelude);
+    blocks.extend(fragment.blocks);
+    blocks.push(continuation_block);
+    stats.rewritten_stores += 1;
+    InlineBlockRewrite::Rewritten(blocks)
+}
+
+enum InlineBlockRewrite {
+    Rewritten(Vec<Block<InstrCodegen>>),
+    Unchanged(Block<InstrCodegen>),
+}
+
+struct InlineStoreCandidate {
+    instr_index: usize,
+    callee_id: FunctionId,
+    call: CallDirect<InstrCodegen>,
+    target: ResolvedName,
+}
+
+fn find_inline_store_candidate(
+    block: &Block<InstrCodegen>,
+    caller_id: FunctionId,
+    inline_plan: &InlinePlanModule,
+    callees: &HashMap<FunctionId, BlockPyFunction<CodegenModuleShape>>,
+) -> Option<InlineStoreCandidate> {
+    block
+        .body
+        .iter()
+        .enumerate()
+        .find_map(|(instr_index, instr)| {
+            let InstrCodegenOp::Store(store) = instr else {
+                return None;
+            };
+            let InstrCodegenOp::CallDirect(call) = store.value.as_ref() else {
+                return None;
+            };
+            if call.function_id == caller_id {
+                return None;
+            }
+            inline_plan.straightline_constructor(call.function_id)?;
+            callees.get(&call.function_id)?;
+            Some(InlineStoreCandidate {
+                instr_index,
+                callee_id: call.function_id,
+                call: call.clone(),
+                target: store.name.clone(),
+            })
+        })
 }
 
 pub fn bind_simple_direct_call_inline_args(
@@ -401,6 +550,9 @@ mod tests {
     use super::*;
     use crate::block_py::{BlockParam, BlockParamRole, CallDirect, InstrId, Load};
     use crate::lower_python_to_blockpy_for_testing;
+    use crate::passes::{
+        plan_module_inlining, summarize_module_escapes, validate_codegen_instr_ids,
+    };
 
     fn function_by_qualname<'a>(
         module: &'a crate::block_py::BlockPyModule<CodegenModuleShape>,
@@ -410,6 +562,17 @@ mod tests {
             .callable_defs
             .iter()
             .find(|function| function.names.qualname == qualname)
+            .unwrap_or_else(|| panic!("{qualname} should be present"))
+    }
+
+    fn function_index_by_qualname(
+        module: &crate::block_py::BlockPyModule<CodegenModuleShape>,
+        qualname: &str,
+    ) -> usize {
+        module
+            .callable_defs
+            .iter()
+            .position(|function| function.names.qualname == qualname)
             .unwrap_or_else(|| panic!("{qualname} should be present"))
     }
 
@@ -437,6 +600,14 @@ mod tests {
 
     fn local_load(function: &BlockPyFunction<CodegenModuleShape>, name: &str) -> InstrCodegen {
         Load::new(local_resolved_name(function, name)).into()
+    }
+
+    fn runtime_load(name: &str) -> InstrCodegen {
+        Load::new(ResolvedName {
+            id: name.to_string().into(),
+            location: NameLocation::RuntimeName,
+        })
+        .into()
     }
 
     #[test]
@@ -719,5 +890,127 @@ def caller(x):
         .unwrap_err();
 
         assert_eq!(err, InlineUnsupportedReason::RebindsBoundLocal(callee_a));
+    }
+
+    #[test]
+    fn rewrites_store_of_planned_direct_call_into_inline_blocks() {
+        let mut module = lower_python_to_blockpy_for_testing(
+            r#"
+class Box:
+    def __init__(self, value):
+        self.value = value
+
+def make(obj, x):
+    out = None
+    return out
+"#,
+        )
+        .expect("transform should succeed")
+        .codegen_module;
+        let inline_plan = plan_module_inlining(&summarize_module_escapes(&module));
+        let constructor_id =
+            module.callable_defs[function_index_by_qualname(&module, "Box.__init__")].function_id;
+        let make_index = function_index_by_qualname(&module, "make");
+        let original_block_label = module.callable_defs[make_index].blocks[0].label;
+        let out_target = local_resolved_name(&module.callable_defs[make_index], "out");
+        let obj_arg = local_load(&module.callable_defs[make_index], "obj");
+        let x_arg = local_load(&module.callable_defs[make_index], "x");
+        module.callable_defs[make_index].blocks[0]
+            .body
+            .push(InstrCodegen::Store(Store::new(
+                out_target,
+                InstrCodegen::CallDirect(CallDirect::new(
+                    runtime_load("Box.__init__"),
+                    constructor_id,
+                    vec![
+                        CallArgPositional::Positional(obj_arg),
+                        CallArgPositional::Positional(x_arg),
+                    ],
+                    Vec::new(),
+                )),
+            )));
+
+        let stats = inline_simple_direct_call_stores(&mut module, &inline_plan);
+
+        assert_eq!(
+            stats,
+            InlineRewriteStats {
+                rewritten_stores: 1,
+                skipped_candidates: 0,
+            }
+        );
+        validate_codegen_instr_ids(&module).expect("rewritten module should have valid instr ids");
+        let caller = function_by_qualname(&module, "make");
+        assert_eq!(caller.blocks.len(), 3);
+        let prelude = caller
+            .blocks
+            .iter()
+            .find(|block| block.label == original_block_label)
+            .expect("original block should become rewrite prelude");
+        let BlockTerm::Jump(edge) = &prelude.term else {
+            panic!("prelude should jump to inline fragment");
+        };
+        let fragment = caller
+            .blocks
+            .iter()
+            .find(|block| block.label == edge.target)
+            .expect("inline fragment should be inserted");
+        assert!(fragment
+            .body
+            .iter()
+            .any(|instr| matches!(instr, InstrCodegen::SetAttr(_))));
+        let BlockTerm::Jump(edge) = &fragment.term else {
+            panic!("inline fragment should jump to continuation");
+        };
+        assert!(edge.args.is_empty());
+        let continuation = caller
+            .blocks
+            .iter()
+            .find(|block| block.label == edge.target)
+            .expect("continuation should be inserted");
+        assert!(continuation.body.is_empty());
+        assert!(matches!(continuation.term, BlockTerm::Return(_)));
+    }
+
+    #[test]
+    fn leaves_unplanned_direct_call_store_unchanged() {
+        let mut module = lower_python_to_blockpy_for_testing(
+            r#"
+def callee(x):
+    return x
+
+def make(x):
+    out = None
+    return out
+"#,
+        )
+        .expect("transform should succeed")
+        .codegen_module;
+        let inline_plan = plan_module_inlining(&summarize_module_escapes(&module));
+        let callee_id =
+            module.callable_defs[function_index_by_qualname(&module, "callee")].function_id;
+        let make_index = function_index_by_qualname(&module, "make");
+        let original_block_count = module.callable_defs[make_index].blocks.len();
+        let out_target = local_resolved_name(&module.callable_defs[make_index], "out");
+        let x_arg = local_load(&module.callable_defs[make_index], "x");
+        module.callable_defs[make_index].blocks[0]
+            .body
+            .push(InstrCodegen::Store(Store::new(
+                out_target,
+                InstrCodegen::CallDirect(CallDirect::new(
+                    runtime_load("callee"),
+                    callee_id,
+                    vec![CallArgPositional::Positional(x_arg)],
+                    Vec::new(),
+                )),
+            )));
+
+        let stats = inline_simple_direct_call_stores(&mut module, &inline_plan);
+
+        assert_eq!(stats.rewritten_stores, 0);
+        assert_eq!(
+            module.callable_defs[make_index].blocks.len(),
+            original_block_count
+        );
     }
 }

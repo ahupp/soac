@@ -48,6 +48,22 @@ pub fn assign_function_instr_ids(function: &mut BlockPyFunction<CodegenUnidentif
     }
 }
 
+pub fn reassign_codegen_function_instr_ids(function: &mut BlockPyFunction<CodegenModuleShape>) {
+    for block in &mut function.blocks {
+        let mut assigner = BlockInstrIdAssigner {
+            block_label: block.label,
+            next_instr_index_in_block: 0,
+        };
+        assigner.visit_block_mut(block);
+    }
+}
+
+pub fn reassign_codegen_module_instr_ids(module: &mut BlockPyModule<CodegenModuleShape>) {
+    for function in &mut module.callable_defs {
+        reassign_codegen_function_instr_ids(function);
+    }
+}
+
 fn into_identified_function(
     mut function: BlockPyFunction<CodegenUnidentifiedModuleShape>,
 ) -> BlockPyFunction<CodegenModuleShape> {
