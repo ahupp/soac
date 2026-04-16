@@ -42,9 +42,9 @@ use soac_blockpy::block_py::{
     AbruptKind, BlockArg, BlockEdge, BlockLabel, BlockParamRole, BlockPyFunction, BlockPyModule,
     BlockTerm, CallArgKeyword, CallArgPositional, CallableScopeKind, CellLocation, ChildVisitable,
     CodegenBlock, CounterDef, CounterId, CounterScope, CounterSite, Del, DeoptEntrySource,
-    FunctionId, FunctionKind, HasMeta, HasSemanticInstrId, InstrCodegen, InstrId, InstrKey,
-    Literal, LocalLocation, NameLocation, ParamKind, ResolvedName, RuntimeName, StorageLayout,
-    Store, Visit, WithMeta, operation as blockpy_intrinsics,
+    FunctionExecutionMode, FunctionId, FunctionKind, HasMeta, HasSemanticInstrId, InstrCodegen,
+    InstrId, InstrKey, Literal, LocalLocation, NameLocation, ParamKind, ResolvedName, RuntimeName,
+    StorageLayout, Store, Visit, WithMeta, operation as blockpy_intrinsics,
 };
 use soac_blockpy::passes::{
     CodegenModuleShape, FactStore, FunctionRefcountPlan, InstrResolved, InstrTyped,
@@ -6357,6 +6357,7 @@ fn direct_call_target_function<'a>(
         .iter()
         .find(|function| function.function_id == function_id)
         .or_else(|| ctx.direct_call_target_functions.get(&function_id))
+        .filter(|function| function.execution_mode() == FunctionExecutionMode::Jit)
 }
 
 fn direct_call_positional_arg_count(args: &[CallArgPositional<InstrCodegen>]) -> usize {
@@ -16012,6 +16013,9 @@ fn collect_process_jit_batch_functions<'a>(
             .unwrap_or(ProcessJitBatchFunctionSource::ExplicitInputs),
     });
     while let Some(batch_function) = queue.pop_front() {
+        if batch_function.function.execution_mode() != FunctionExecutionMode::Jit {
+            continue;
+        }
         let mut direct_targets = collect_call_direct_targets(&batch_function.function);
         if let Some(shared_state) = batch_function.source.shared_state() {
             for targets in load_call_target_specializations(
@@ -16030,6 +16034,9 @@ fn collect_process_jit_batch_functions<'a>(
             if let Some(function) =
                 resolve_process_jit_batch_function(session, direct_call_resolver, function_id)?
             {
+                if function.function.execution_mode() != FunctionExecutionMode::Jit {
+                    continue;
+                }
                 if function.function.function_id.module_id() != root_module_id {
                     continue;
                 }
@@ -16043,6 +16050,9 @@ fn collect_process_jit_batch_functions<'a>(
             if let Some(function) =
                 resolve_process_jit_batch_function(session, direct_call_resolver, function_id)?
             {
+                if function.function.execution_mode() != FunctionExecutionMode::Jit {
+                    continue;
+                }
                 if function.function.function_id.module_id() != root_module_id {
                     continue;
                 }
@@ -16125,6 +16135,9 @@ impl ProcessJitEngine {
         &self,
         function: &BlockPyFunction<CodegenModuleShape>,
     ) -> Result<bool, String> {
+        if function.execution_mode() != FunctionExecutionMode::Jit {
+            return Ok(false);
+        }
         let state = self
             .state
             .lock()
@@ -16434,7 +16447,10 @@ impl ProcessJitEngine {
             .lowered_module
             .callable_defs
             .iter()
-            .filter(|function| function.function_id != FunctionId::global())
+            .filter(|function| {
+                function.function_id != FunctionId::global()
+                    && function.execution_mode() == FunctionExecutionMode::Jit
+            })
             .cloned()
             .map(|function| ProcessJitBatchFunction {
                 function,
@@ -16661,6 +16677,12 @@ impl ProcessJitEngine {
         module_constant_ptrs: &[*mut ffi::PyObject],
         direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
     ) -> Result<DirectFunctionCompileResult, String> {
+        if function.execution_mode() != FunctionExecutionMode::Jit {
+            return Err(format!(
+                "function {} id={} is marked for interpreted execution",
+                function.names.qualname, function.function_id
+            ));
+        }
         let mut background_wait_errors = 0usize;
         loop {
             match self.compile_direct_function_once(

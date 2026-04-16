@@ -29,6 +29,7 @@ fn lowers_await_to_yield_from_await_iter() {
             name_gen: test_name_gen(),
             names: FunctionName::new("f", "f", "f", "f"),
             kind: FunctionKind::Coroutine,
+            execution_mode: Default::default(),
             params: Default::default(),
             blocks: vec![Block {
                 label: structured_block.label,

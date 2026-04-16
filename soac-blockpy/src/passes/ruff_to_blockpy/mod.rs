@@ -4,7 +4,7 @@ use crate::block_py::cfg::{
 use crate::block_py::param_specs::ParamSpec;
 use crate::block_py::{
     Block, BlockBuilder, BlockEdge, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm,
-    CallableScopeInfo, FunctionKind, FunctionName, FunctionNameGen, Instr,
+    CallableScopeInfo, FunctionExecutionMode, FunctionKind, FunctionName, FunctionNameGen, Instr,
 };
 use crate::namegen::fresh_name;
 use crate::passes::ast_to_ast::context::Context;
@@ -480,6 +480,7 @@ pub(crate) fn build_core_blockpy_callable_def_from_runtime_input(
     scope: &CallableScopeInfo,
 ) -> BlockPyFunction<CoreModuleShapeWithAwaitAndYield> {
     let function_id = name_gen.function_id();
+    let execution_mode = default_execution_mode_for_function(&names);
     let mut blocks = Vec::new();
     let entry_label = lower_stmt_sequence_with_state::<crate::block_py::InstrWithAwaitAndYield>(
         context,
@@ -517,11 +518,23 @@ pub(crate) fn build_core_blockpy_callable_def_from_runtime_input(
         name_gen,
         names,
         kind: blockpy_kind,
+        execution_mode,
         params,
         blocks,
         doc,
         storage_layout: None,
         scope: scope.clone(),
+    }
+}
+
+fn default_execution_mode_for_function(names: &FunctionName) -> FunctionExecutionMode {
+    if names.bind_name == "_dp_module_init"
+        || names.bind_name.starts_with("_dp_class_ns_")
+        || names.bind_name.starts_with("_dp_define_class_")
+    {
+        FunctionExecutionMode::Interpreted
+    } else {
+        FunctionExecutionMode::Jit
     }
 }
 

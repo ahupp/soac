@@ -13,7 +13,7 @@ use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyAnyMethods, PyList, PyTuple};
 use soac_blockpy::block_py::{
     BlockPyFunction, BlockPyModule, CounterDef, CounterId, CounterScope, CounterSite,
-    DeoptEntrySource, FunctionId, RuntimeName,
+    DeoptEntrySource, FunctionExecutionMode, FunctionId, RuntimeName,
 };
 use soac_blockpy::env_config::SoacEnvConfig;
 use soac_blockpy::passes::CodegenModuleShape;
@@ -276,6 +276,9 @@ impl SharedModuleState {
             .lookup_function(function_id)
             .cloned()
             .ok_or_else(|| format!("missing direct-call target for function_id={function_id}"))?;
+        if function.execution_mode() == FunctionExecutionMode::Interpreted {
+            return Ok(None);
+        }
         if let Some(handle) =
             crate::jit::lookup_precompiled_direct_function_handle(compile_session, self, &function)?
         {

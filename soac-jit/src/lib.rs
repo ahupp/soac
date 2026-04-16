@@ -34,7 +34,7 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 #[cfg(test)]
 use pyo3::types::PyAnyMethods;
-use soac_blockpy::block_py::{FunctionId, FunctionKind, ParamKind};
+use soac_blockpy::block_py::{FunctionExecutionMode, FunctionId, FunctionKind, ParamKind};
 use soac_blockpy::passes::CodegenModuleShape;
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::any::Any;
@@ -2112,13 +2112,9 @@ pub unsafe fn register_clif_vectorcall(
     let func = function as *mut ffi::PyFunctionObject;
     if !PyFunction_GetSoacMetadata(function).is_null() {
         let data = unsafe { py_function_jit_extra(function)? };
-        if entry_interpreter_vectorcall_for_tests_enabled() {
+        if entry_interpreter_vectorcall_requested(data.function()?) {
             data.compiled_vectorcall_entry = None;
-            if *data.function()?.lowered_kind() == FunctionKind::Function {
-                PyFunction_SetVectorcall(func, Some(entry_interpreter_vectorcall_for_tests));
-            } else {
-                PyFunction_SetVectorcall(func, data.previous_vectorcall);
-            }
+            PyFunction_SetVectorcall(func, Some(entry_interpreter_vectorcall));
             return Ok(());
         }
         let param_count = data.binding_plan.param_count();
@@ -2154,6 +2150,21 @@ pub unsafe fn register_clif_vectorcall(
         })?;
     let blockpy_function_kind = *blockpy_function.lowered_kind();
     let blockpy_function_param_count = blockpy_function.params.len();
+    if entry_interpreter_vectorcall_requested(blockpy_function) {
+        let data_ptr = make_clif_function_data(function, function_id, module_runtime)?;
+        if PyFunction_SetSoacMetadata(
+            function,
+            function_id.packed(),
+            data_ptr,
+            Some(free_clif_function_data),
+        ) != 0
+        {
+            free_clif_function_data(data_ptr);
+            return Err(());
+        }
+        PyFunction_SetVectorcall(func, Some(entry_interpreter_vectorcall));
+        return Ok(());
+    }
     if entry_interpreter_vectorcall_for_tests_enabled() {
         let data_ptr = make_clif_function_data(function, function_id, module_runtime)?;
         if PyFunction_SetSoacMetadata(
@@ -2167,7 +2178,7 @@ pub unsafe fn register_clif_vectorcall(
             return Err(());
         }
         if blockpy_function_kind == FunctionKind::Function {
-            PyFunction_SetVectorcall(func, Some(entry_interpreter_vectorcall_for_tests));
+            PyFunction_SetVectorcall(func, Some(entry_interpreter_vectorcall));
         }
         return Ok(());
     }
@@ -2230,6 +2241,14 @@ fn entry_interpreter_vectorcall_for_tests_enabled() -> bool {
     FORCE_ENTRY_INTERPRETER_VECTORCALL_FOR_TESTS.load(Ordering::SeqCst)
 }
 
+fn entry_interpreter_vectorcall_requested(
+    function: &soac_blockpy::block_py::BlockPyFunction<CodegenModuleShape>,
+) -> bool {
+    function.execution_mode() == FunctionExecutionMode::Interpreted
+        || (entry_interpreter_vectorcall_for_tests_enabled()
+            && *function.lowered_kind() == FunctionKind::Function)
+}
+
 struct EntryInterpreterRecursiveCallGuard;
 
 impl Drop for EntryInterpreterRecursiveCallGuard {
@@ -2238,7 +2257,7 @@ impl Drop for EntryInterpreterRecursiveCallGuard {
     }
 }
 
-unsafe extern "C" fn entry_interpreter_vectorcall_for_tests(
+unsafe extern "C" fn entry_interpreter_vectorcall(
     callable: *mut ffi::PyObject,
     args: *const *mut ffi::PyObject,
     nargsf: usize,
@@ -2255,7 +2274,7 @@ unsafe extern "C" fn entry_interpreter_vectorcall_for_tests(
         Ok(Err(())) => ptr::null_mut(),
         Err(payload) => {
             let message = format!(
-                "panic in entry_interpreter_vectorcall_for_tests: {}",
+                "panic in entry_interpreter_vectorcall: {}",
                 panic_payload_to_string(payload)
             );
             if let Ok(c_msg) = CString::new(message) {
@@ -2263,7 +2282,7 @@ unsafe extern "C" fn entry_interpreter_vectorcall_for_tests(
             } else {
                 ffi::PyErr_SetString(
                     ffi::PyExc_RuntimeError,
-                    c"panic in entry_interpreter_vectorcall_for_tests".as_ptr(),
+                    c"panic in entry_interpreter_vectorcall".as_ptr(),
                 );
             }
             ptr::null_mut()

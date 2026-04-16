@@ -193,6 +193,7 @@ fn storage_layout_semantics_collects_structured_cell_ref_logical_names() {
         name_gen: test_name_gen(),
         names: FunctionName::new("f", "f", "f", "f"),
         kind: FunctionKind::Function,
+        execution_mode: Default::default(),
         params: ParamSpec::default(),
         blocks: vec![Block {
             label: BlockLabel::from_index(0),

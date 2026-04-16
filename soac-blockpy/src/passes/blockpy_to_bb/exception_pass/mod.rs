@@ -30,6 +30,7 @@ fn lower_function_try_jump_exception_flow(
         name_gen: function.name_gen,
         names: function.names,
         kind: function.kind,
+        execution_mode: function.execution_mode,
         params: function.params,
         blocks: function.blocks,
         doc: function.doc,

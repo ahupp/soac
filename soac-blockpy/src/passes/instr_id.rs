@@ -57,6 +57,7 @@ fn into_identified_function(
         name_gen: function.name_gen,
         names: function.names,
         kind: function.kind,
+        execution_mode: function.execution_mode,
         params: function.params,
         blocks: function.blocks,
         doc: function.doc,

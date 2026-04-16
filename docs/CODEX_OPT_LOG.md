@@ -803,3 +803,20 @@ benchmarked throughput delta, and the headline pre/post numbers.
   - specialized pass, 1M loops x3: `445109`, `450530`, `440886 loops/s`
   - pystone JIT code bytes: `277954`
   - pystone machine blocks: `17356`
+
+## 2026-04-16 - Interpret import-time module scaffolding
+
+- jj change id: `myxywzml`
+- summary: BlockPy functions now carry an execution-mode tag. Runtime JIT paths
+  skip functions tagged for interpretation, and import-time module/class
+  scaffolding (`_dp_module_init`, `_dp_class_ns_*`, and `_dp_define_class_*`)
+  runs through the interpreter instead of paying release JIT codegen during
+  broad import-hook loading.
+- load time: typing slow import release pytest time `4.72s -> 1.86s`; direct
+  release wall time `4.80s -> 1.83s`.
+- pre-change benchmark:
+  - release slow typing import pytest: `1 passed in 4.72s`, `4.95s` wall
+  - direct release slow typing import: `4.72s`, `4.80s` wall
+- post-change benchmark:
+  - release slow typing import pytest: `1 passed in 1.86s`, `2.07s` wall
+  - direct release slow typing import: `1.87s`, `1.83s` wall

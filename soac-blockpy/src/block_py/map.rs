@@ -145,6 +145,7 @@ where
             name_gen: func.name_gen,
             names: func.names,
             kind: func.kind,
+            execution_mode: func.execution_mode,
             params: func.params,
             blocks: func
                 .blocks
@@ -207,6 +208,7 @@ where
         name_gen: func.name_gen,
         names: func.names,
         kind: func.kind,
+        execution_mode: func.execution_mode,
         params: func.params,
         blocks: func.blocks.into_iter().map(&mut map_block).collect(),
         doc: func.doc,
@@ -312,6 +314,7 @@ where
             name_gen: func.name_gen,
             names: func.names,
             kind: func.kind,
+            execution_mode: func.execution_mode,
             params: func.params,
             blocks: func
                 .blocks

@@ -743,6 +743,18 @@ impl FunctionKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub enum FunctionExecutionMode {
+    Jit,
+    Interpreted,
+}
+
+impl Default for FunctionExecutionMode {
+    fn default() -> Self {
+        Self::Jit
+    }
+}
+
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct Block<I: Instr> {
     pub label: BlockLabel,
@@ -1109,6 +1121,7 @@ pub struct BlockPyFunction<P: ModuleShape> {
     pub name_gen: FunctionNameGen,
     pub names: FunctionName,
     pub kind: FunctionKind,
+    pub execution_mode: FunctionExecutionMode,
     pub params: ParamSpec,
     pub blocks: Vec<Block<P::Instr>>,
     pub doc: Option<String>,
@@ -1125,6 +1138,7 @@ impl<P: ModuleShape> Clone for BlockPyFunction<P> {
             name_gen: self.name_gen.share(),
             names: self.names.clone(),
             kind: self.kind,
+            execution_mode: self.execution_mode,
             params: self.params.clone(),
             blocks: self.blocks.clone(),
             doc: self.doc.clone(),
@@ -1137,6 +1151,10 @@ impl<P: ModuleShape> Clone for BlockPyFunction<P> {
 impl<P: ModuleShape> BlockPyFunction<P> {
     pub fn lowered_kind(&self) -> &FunctionKind {
         &self.kind
+    }
+
+    pub fn execution_mode(&self) -> FunctionExecutionMode {
+        self.execution_mode
     }
 
     pub fn storage_layout(&self) -> &Option<StorageLayout> {

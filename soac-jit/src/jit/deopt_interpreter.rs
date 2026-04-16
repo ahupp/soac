@@ -27,7 +27,19 @@ fn dense_block_for_label<'a>(
     label: BlockLabel,
 ) -> Option<&'a Block<InstrCodegen>> {
     let block = function.blocks.get(label.index())?;
-    (block.label == label).then_some(block)
+    if block.label == label {
+        return Some(block);
+    }
+
+    #[cfg(test)]
+    {
+        function.blocks.iter().find(|block| block.label == label)
+    }
+
+    #[cfg(not(test))]
+    {
+        None
+    }
 }
 
 unsafe extern "C" {

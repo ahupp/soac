@@ -3064,6 +3064,7 @@ def build(values):
             name_gen,
             names: FunctionName::new(name, name, name, name),
             kind: soac_blockpy::block_py::FunctionKind::Function,
+            execution_mode: Default::default(),
             params: ParamSpec::default(),
             blocks: vec![],
             doc: None,
@@ -16000,6 +16001,7 @@ def f(x, y):
             name_gen: caller_name_gen,
             names: FunctionName::new("caller", "caller", "caller", "caller"),
             kind: soac_blockpy::block_py::FunctionKind::Function,
+            execution_mode: Default::default(),
             params: caller_params,
             blocks: vec![CodegenBlock {
                 label: BlockLabel::from_index(0),
@@ -16184,6 +16186,7 @@ def f(x, y):
             name_gen: method_name_gen,
             names: FunctionName::new("Thing.f", "Thing.f", "Thing.f", "Thing.f"),
             kind: soac_blockpy::block_py::FunctionKind::Function,
+            execution_mode: Default::default(),
             params: ParamSpec {
                 params: vec![Param {
                     name: "self".into(),
@@ -16234,6 +16237,7 @@ def f(x, y):
             name_gen: caller_name_gen,
             names: FunctionName::new("caller", "caller", "caller", "caller"),
             kind: soac_blockpy::block_py::FunctionKind::Function,
+            execution_mode: Default::default(),
             params: caller_params,
             blocks: vec![CodegenBlock {
                 label: BlockLabel::from_index(0),
@@ -16494,6 +16498,7 @@ def f(x, y):
                 name_gen: method_name_gen,
                 names: FunctionName::new("Thing.f", "Thing.f", "Thing.f", "Thing.f"),
                 kind: soac_blockpy::block_py::FunctionKind::Function,
+                execution_mode: Default::default(),
                 params: ParamSpec {
                     params: vec![Param {
                         name: "self".into(),
@@ -16523,6 +16528,7 @@ def f(x, y):
                 name_gen: caller_name_gen,
                 names: FunctionName::new("caller", "caller", "caller", "caller"),
                 kind: soac_blockpy::block_py::FunctionKind::Function,
+                execution_mode: Default::default(),
                 params: ParamSpec {
                     params: vec![Param {
                         name: "obj".into(),
@@ -16815,6 +16821,7 @@ def f(x, y):
                 name_gen: caller_name_gen,
                 names: FunctionName::new("caller", "caller", "caller", "caller"),
                 kind: soac_blockpy::block_py::FunctionKind::Function,
+                execution_mode: Default::default(),
                 params: ParamSpec {
                     params: vec![Param {
                         name: "fn".into(),
@@ -18352,6 +18359,7 @@ def f(x, y):
                         "Record.__init__",
                     ),
                     kind: soac_blockpy::block_py::FunctionKind::Function,
+                    execution_mode: Default::default(),
                     params: ParamSpec {
                         params: vec![
                             Param {
@@ -18390,6 +18398,7 @@ def f(x, y):
                         "make_record",
                     ),
                     kind: soac_blockpy::block_py::FunctionKind::Function,
+                    execution_mode: Default::default(),
                     params: ParamSpec::default(),
                     blocks: vec![CodegenBlock {
                         label: BlockLabel::from_index(0),

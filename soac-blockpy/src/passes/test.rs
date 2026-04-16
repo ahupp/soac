@@ -1,8 +1,8 @@
 use crate::block_py::pretty::BlockPyPrettyPrint;
 use crate::block_py::{
     instr_any, BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional,
-    CallableScopeKind, CellBindingKind, CellLocation, ChildVisitable, FunctionKind, InstrResolved,
-    NameLike, NameLocation, ResolvedStorageBlock, ScopeExprNode,
+    CallableScopeKind, CellBindingKind, CellLocation, ChildVisitable, FunctionExecutionMode,
+    FunctionKind, InstrResolved, NameLike, NameLocation, ResolvedStorageBlock, ScopeExprNode,
 };
 use crate::block_py::{BindingKind, ClosureInit, ClosureSlot, ModuleNameGen};
 use crate::passes::ast_to_ast::ast_rewrite::rewrite_with_pass;
@@ -821,6 +821,27 @@ def f():
     assert!(saw_make_function);
     assert!(saw_empty_captures);
     assert!(saw_empty_defaults);
+}
+
+#[test]
+fn module_init_is_tagged_for_interpreted_execution() {
+    let bb_module = tracked_name_binding_module(
+        r#"
+VALUE = 1
+
+def f():
+    return VALUE
+"#,
+    )
+    .expect("transform should succeed")
+    .expect("bb module should be available");
+    let module_init = function_by_name(&bb_module, "_dp_module_init");
+    let f = function_by_name(&bb_module, "f");
+    assert_eq!(
+        module_init.execution_mode(),
+        FunctionExecutionMode::Interpreted
+    );
+    assert_eq!(f.execution_mode(), FunctionExecutionMode::Jit);
 }
 
 #[test]

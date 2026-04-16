@@ -1750,6 +1750,7 @@ pub(crate) fn lower_generator_like_function(
         name_gen,
         names,
         kind,
+        execution_mode,
         params,
         doc,
         scope,
@@ -1773,6 +1774,7 @@ pub(crate) fn lower_generator_like_function(
         name_gen: resume_name_gen,
         names: resume_names,
         kind: FunctionKind::Function,
+        execution_mode: Default::default(),
         params: resume_params.clone(),
         blocks: resume_blocks.clone(),
         doc: None,
@@ -1791,6 +1793,7 @@ pub(crate) fn lower_generator_like_function(
         name_gen,
         names: names.clone(),
         kind,
+        execution_mode,
         params: params.clone(),
         blocks: attach_exception_edges_to_blocks(
             vec![factory_block.clone()],
