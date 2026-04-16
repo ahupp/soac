@@ -6,7 +6,7 @@ use crate::passes::{
     CodegenModuleShape, EscapeSummaryModule, FactStore, InlinePlanModule, InstrCodegen,
     LocalEnvModulePlan, LocalEnvResumeModulePlan, RefcountPlan,
 };
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -14,10 +14,17 @@ use std::path::{Path, PathBuf};
 const CODEGEN_MODULE_CACHE_MAGIC: &[u8] = b"SOAC_BLOCKPY_CODEGEN_CACHE\0";
 const CODEGEN_MODULE_CACHE_FORMAT_VERSION: u32 = 4;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum PythonModuleCacheSource {
     Project,
     PythonStdlib,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleCacheArtifact {
+    CodegenModule,
+    Profile,
+    OptimizationPlan,
 }
 
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -41,8 +48,17 @@ impl CachedPreparedCodegen {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct CachedCodegenModuleMetadata {
+    pub source: PythonModuleCacheSource,
+    pub module_name: String,
+    pub source_hash: u64,
+    pub cache_identity: String,
+}
+
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct CachedCodegenModule {
+    pub metadata: CachedCodegenModuleMetadata,
     pub module: BlockPyModule<CodegenModuleShape>,
     pub prepared: Option<CachedPreparedCodegen>,
 }
@@ -56,17 +72,67 @@ impl PythonModuleCacheSource {
     }
 }
 
+impl ModuleCacheArtifact {
+    const fn file_name(self) -> &'static str {
+        match self {
+            Self::CodegenModule => "mod.blockpy",
+            Self::Profile => "mod.profile",
+            Self::OptimizationPlan => "mod.opt",
+        }
+    }
+}
+
+pub fn module_cache_artifact_path(
+    cache_root: impl AsRef<Path>,
+    source: PythonModuleCacheSource,
+    module_name: &str,
+    artifact: ModuleCacheArtifact,
+) -> Result<PathBuf> {
+    let mut path = cache_root.as_ref().join(source.subtree());
+    for component in module_cache_path_components(module_name)? {
+        path.push(component);
+    }
+    path.push(artifact.file_name());
+    Ok(path)
+}
+
 pub fn codegen_module_cache_path(
     cache_root: impl AsRef<Path>,
     source: PythonModuleCacheSource,
-    cache_key: &str,
+    module_name: &str,
 ) -> Result<PathBuf> {
-    let file_stem = cache_file_stem(cache_key)?;
-    Ok(cache_root
-        .as_ref()
-        .join(source.subtree())
-        .join("blockpy-codegen")
-        .join(format!("{file_stem}.blockpy.rkyv")))
+    module_cache_artifact_path(
+        cache_root,
+        source,
+        module_name,
+        ModuleCacheArtifact::CodegenModule,
+    )
+}
+
+pub fn module_profile_path(
+    cache_root: impl AsRef<Path>,
+    source: PythonModuleCacheSource,
+    module_name: &str,
+) -> Result<PathBuf> {
+    module_cache_artifact_path(
+        cache_root,
+        source,
+        module_name,
+        ModuleCacheArtifact::Profile,
+    )
+}
+
+pub fn module_optimization_plan_path(
+    cache_root: impl AsRef<Path>,
+    source: PythonModuleCacheSource,
+    module_name: &str,
+) -> Result<PathBuf> {
+    module_cache_artifact_path(
+        cache_root,
+        source,
+        module_name,
+        ModuleCacheArtifact::OptimizationPlan,
+    )
 }
 
 pub fn codegen_module_cache_key(source_hash: u64, build_identity: &str) -> String {
@@ -75,6 +141,7 @@ pub fn codegen_module_cache_key(source_hash: u64, build_identity: &str) -> Strin
 
 pub fn store_codegen_module_cache(
     path: impl AsRef<Path>,
+    metadata: &CachedCodegenModuleMetadata,
     module: &BlockPyModule<CodegenModuleShape>,
     prepared: Option<&CachedPreparedCodegen>,
 ) -> Result<()> {
@@ -85,6 +152,7 @@ pub fn store_codegen_module_cache(
     }
 
     let cache = CachedCodegenModule {
+        metadata: metadata.clone(),
         module: module.clone(),
         prepared: prepared.cloned(),
     };
@@ -128,6 +196,26 @@ pub fn load_codegen_module_cache(path: impl AsRef<Path>) -> Result<CachedCodegen
 
     rehydrate_codegen_module_generators(&mut cache.module);
     Ok(cache)
+}
+
+pub fn validate_codegen_module_cache_metadata(
+    loaded: &CachedCodegenModuleMetadata,
+    expected: &CachedCodegenModuleMetadata,
+) -> Result<()> {
+    if loaded == expected {
+        return Ok(());
+    }
+    bail!(
+        "BlockPy cache metadata mismatch: loaded source={:?} module={} source_hash=0x{:016x} cache_identity={:?}; expected source={:?} module={} source_hash=0x{:016x} cache_identity={:?}",
+        loaded.source,
+        loaded.module_name,
+        loaded.source_hash,
+        loaded.cache_identity,
+        expected.source,
+        expected.module_name,
+        expected.source_hash,
+        expected.cache_identity,
+    )
 }
 
 pub fn rehydrate_codegen_module_generators(module: &mut BlockPyModule<CodegenModuleShape>) {
@@ -268,18 +356,24 @@ fn aligned_archive_bytes(bytes: &[u8]) -> rkyv::util::AlignedVec {
     aligned
 }
 
-fn cache_file_stem(cache_key: &str) -> Result<&str> {
-    let valid = !cache_key.is_empty()
-        && cache_key
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
-    if valid {
-        Ok(cache_key)
-    } else {
-        Err(anyhow!(
-            "BlockPy cache key must be a non-empty ASCII alnum/_/- file stem: {cache_key:?}"
-        ))
+fn module_cache_path_components(module_name: &str) -> Result<Vec<&str>> {
+    if module_name.is_empty() {
+        bail!("module cache path requires a non-empty module name");
     }
+    let mut components = Vec::new();
+    for component in module_name.split('.') {
+        let valid = !component.is_empty()
+            && component != "."
+            && component != ".."
+            && !component
+                .bytes()
+                .any(|byte| matches!(byte, b'/' | b'\\' | 0));
+        if !valid {
+            bail!("module cache path component is invalid: {component:?} in {module_name:?}");
+        }
+        components.push(component);
+    }
+    Ok(components)
 }
 
 fn stable_hash(text: &str) -> u64 {
@@ -348,8 +442,11 @@ fn temp_cache_path(path: &Path) -> PathBuf {
 mod test {
     use super::{
         codegen_module_cache_key, codegen_module_cache_path, load_codegen_module_cache,
+        module_cache_artifact_path, module_optimization_plan_path, module_profile_path,
         remap_cached_codegen_module_function_ids, remap_codegen_module_function_ids,
-        store_codegen_module_cache, CachedPreparedCodegen, PythonModuleCacheSource,
+        store_codegen_module_cache, validate_codegen_module_cache_metadata,
+        CachedCodegenModuleMetadata, CachedPreparedCodegen, ModuleCacheArtifact,
+        PythonModuleCacheSource,
     };
     use crate::block_py::{
         walk_block, walk_expr, BlockPyModule, ChildVisitable, FunctionId, HasSemanticInstrId,
@@ -445,11 +542,13 @@ def g(y):
 
         let path = unique_cache_path();
         let _ = std::fs::remove_file(&path);
-        store_codegen_module_cache(&path, &module, None).expect("store codegen cache");
+        let metadata = test_metadata("pkg.mod", 0x1234, "build-a");
+        store_codegen_module_cache(&path, &metadata, &module, None).expect("store codegen cache");
 
-        let loaded = load_codegen_module_cache(&path)
-            .expect("load codegen cache")
-            .module;
+        let loaded_cache = load_codegen_module_cache(&path).expect("load codegen cache");
+        validate_codegen_module_cache_metadata(&loaded_cache.metadata, &metadata)
+            .expect("metadata should round-trip");
+        let loaded = loaded_cache.module;
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(summarize_module(&loaded), before);
@@ -485,14 +584,34 @@ def g(y):
         let root = PathBuf::from("/cache/root");
 
         assert_eq!(
-            codegen_module_cache_path(&root, PythonModuleCacheSource::Project, "abc_123-def")
+            codegen_module_cache_path(&root, PythonModuleCacheSource::Project, "pkg.submod")
                 .expect("project cache path"),
-            PathBuf::from("/cache/root/project/blockpy-codegen/abc_123-def.blockpy.rkyv")
+            PathBuf::from("/cache/root/project/pkg/submod/mod.blockpy")
         );
         assert_eq!(
-            codegen_module_cache_path(&root, PythonModuleCacheSource::PythonStdlib, "abc_123-def")
+            codegen_module_cache_path(&root, PythonModuleCacheSource::PythonStdlib, "typing")
                 .expect("stdlib cache path"),
-            PathBuf::from("/cache/root/python-stdlib/blockpy-codegen/abc_123-def.blockpy.rkyv")
+            PathBuf::from("/cache/root/python-stdlib/typing/mod.blockpy")
+        );
+        assert_eq!(
+            module_profile_path(&root, PythonModuleCacheSource::PythonStdlib, "typing")
+                .expect("stdlib profile path"),
+            PathBuf::from("/cache/root/python-stdlib/typing/mod.profile")
+        );
+        assert_eq!(
+            module_optimization_plan_path(&root, PythonModuleCacheSource::PythonStdlib, "typing")
+                .expect("stdlib optimization path"),
+            PathBuf::from("/cache/root/python-stdlib/typing/mod.opt")
+        );
+        assert_eq!(
+            module_cache_artifact_path(
+                &root,
+                PythonModuleCacheSource::Project,
+                "pkg.submod",
+                ModuleCacheArtifact::CodegenModule,
+            )
+            .expect("explicit artifact path"),
+            PathBuf::from("/cache/root/project/pkg/submod/mod.blockpy")
         );
 
         assert!(codegen_module_cache_path(
@@ -589,9 +708,13 @@ def outer(value):
 
         let path = unique_cache_path();
         let _ = std::fs::remove_file(&path);
-        store_codegen_module_cache(&path, &module, Some(&prepared)).expect("store codegen cache");
+        let metadata = test_metadata("pkg.prepared", 0x5678, "build-b");
+        store_codegen_module_cache(&path, &metadata, &module, Some(&prepared))
+            .expect("store codegen cache");
 
         let loaded = load_codegen_module_cache(&path).expect("load codegen cache");
+        validate_codegen_module_cache_metadata(&loaded.metadata, &metadata)
+            .expect("metadata should round-trip");
         let _ = std::fs::remove_file(&path);
         let loaded_prepared = loaded
             .prepared
@@ -643,6 +766,7 @@ def outer(value):
         .codegen_module;
         let prepared = prepared_codegen_for_module(&module);
         let mut cache = super::CachedCodegenModule {
+            metadata: test_metadata("pkg.remap", 0x9999, "build-c"),
             module,
             prepared: Some(prepared),
         };
@@ -736,6 +860,19 @@ def outer(value):
             "soac-blockpy-codegen-cache-test-{}-{unique}.rkyv",
             std::process::id()
         ))
+    }
+
+    fn test_metadata(
+        module_name: &str,
+        source_hash: u64,
+        cache_identity: &str,
+    ) -> CachedCodegenModuleMetadata {
+        CachedCodegenModuleMetadata {
+            source: PythonModuleCacheSource::Project,
+            module_name: module_name.to_string(),
+            source_hash,
+            cache_identity: cache_identity.to_string(),
+        }
     }
 
     fn prepared_codegen_for_module(

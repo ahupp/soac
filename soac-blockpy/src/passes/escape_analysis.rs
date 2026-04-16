@@ -951,6 +951,7 @@ mod tests {
             LoweringOptions {
                 runtime_names_as_globals: true,
                 pre_optimization_cache_path: None,
+                pre_optimization_cache_metadata: None,
             },
         )
         .expect("transform should succeed")

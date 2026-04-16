@@ -1,6 +1,7 @@
 use cranelift_codegen::isa::TargetIsa;
 use cranelift_codegen::settings;
 use cranelift_codegen::settings::Configurable;
+pub use soac_blockpy::codegen_cache::CachedCodegenModuleMetadata;
 #[cfg(test)]
 pub(crate) use soac_blockpy::env_config::SOAC_JIT_EMIT_REFCOUNTS_ENV;
 pub(crate) use soac_blockpy::env_config::SpecializationMode;
@@ -13,6 +14,7 @@ use soac_blockpy::env_config::{
     jit_refcount_emission_enabled_from_env,
     module_cache_root_from_env_or_repo as blockpy_module_cache_root_from_env_or_repo,
     pre_optimization_module_cache_identity as blockpy_pre_optimization_module_cache_identity,
+    pre_optimization_module_cache_metadata as blockpy_pre_optimization_module_cache_metadata,
     pre_optimization_module_cache_path as blockpy_pre_optimization_module_cache_path,
     precompiled_library_path_from_env as blockpy_precompiled_library_path_from_env,
     profiled_cold_blocks_enabled_from_env,
@@ -125,12 +127,32 @@ pub fn pre_optimization_module_cache_identity(
 
 pub fn pre_optimization_module_cache_path(
     cache_root: &Path,
+    source: PythonModuleCacheSource,
+    module_name: &str,
     source_hash: u64,
     build_identity: &str,
     runtime_names_as_globals: bool,
 ) -> Result<PathBuf, String> {
     blockpy_pre_optimization_module_cache_path(
         cache_root,
+        source,
+        module_name,
+        source_hash,
+        build_identity,
+        runtime_names_as_globals,
+    )
+}
+
+pub fn pre_optimization_module_cache_metadata(
+    source: PythonModuleCacheSource,
+    module_name: &str,
+    source_hash: u64,
+    build_identity: &str,
+    runtime_names_as_globals: bool,
+) -> CachedCodegenModuleMetadata {
+    blockpy_pre_optimization_module_cache_metadata(
+        source,
+        module_name,
         source_hash,
         build_identity,
         runtime_names_as_globals,
@@ -169,3 +191,4 @@ pub(crate) fn behavior_change_indexed_stores_enabled() -> Result<bool, String> {
 pub(crate) fn specialization_mode_from_env() -> Result<Option<SpecializationMode>, String> {
     blockpy_specialization_mode_from_env()
 }
+pub use soac_blockpy::codegen_cache::PythonModuleCacheSource;

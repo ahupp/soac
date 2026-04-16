@@ -2,7 +2,8 @@ use crate::block_py::pretty::BlockPyPrettyPrint;
 use crate::block_py::{BlockPyModule, CounterScope, ModuleNameGen};
 use crate::codegen_cache::{
     load_codegen_module_cache, remap_cached_codegen_module_function_ids,
-    store_codegen_module_cache, CachedCodegenModule, CachedPreparedCodegen,
+    store_codegen_module_cache, validate_codegen_module_cache_metadata, CachedCodegenModule,
+    CachedCodegenModuleMetadata, CachedPreparedCodegen,
 };
 use crate::env_config::SoacEnvConfig;
 use crate::pass_tracker::PassTracker;
@@ -36,12 +37,14 @@ pub(crate) struct AstToAstPassResult {
 pub struct LoweringOptions {
     pub runtime_names_as_globals: bool,
     pub pre_optimization_cache_path: Option<PathBuf>,
+    pub pre_optimization_cache_metadata: Option<CachedCodegenModuleMetadata>,
 }
 
 struct PreOptimizationModule {
     module: BlockPyModule<CodegenModuleShape>,
     prepared: Option<CachedPreparedCodegen>,
     cache_path_for_store: Option<PathBuf>,
+    cache_metadata_for_store: Option<CachedCodegenModuleMetadata>,
 }
 
 impl BlockPyPrettyPrint for AstToAstPassResult {
@@ -114,6 +117,9 @@ fn rewrite_pre_optimization_module_with_cache(
             });
             match loaded {
                 Ok(mut cache) => {
+                    if let Some(expected) = &options.pre_optimization_cache_metadata {
+                        validate_codegen_module_cache_metadata(&cache.metadata, expected)?;
+                    }
                     remap_cached_codegen_module_function_ids(&mut cache, module_name_gen);
                     let has_prepared = cache.prepared.is_some();
                     info!(
@@ -124,11 +130,16 @@ fn rewrite_pre_optimization_module_with_cache(
                         path = %cache_path.display(),
                         "blockpy_module_cache_hit",
                     );
-                    let CachedCodegenModule { module, prepared } = cache;
+                    let CachedCodegenModule {
+                        metadata: _,
+                        module,
+                        prepared,
+                    } = cache;
                     return Ok(PreOptimizationModule {
                         module: pass_tracker.run_pass("bb_codegen", || module),
                         prepared,
                         cache_path_for_store: None,
+                        cache_metadata_for_store: None,
                     });
                 }
                 Err(err) => {
@@ -162,6 +173,7 @@ fn rewrite_pre_optimization_module_with_cache(
             module,
             prepared: None,
             cache_path_for_store: Some(cache_path.clone()),
+            cache_metadata_for_store: options.pre_optimization_cache_metadata.clone(),
         })
     } else {
         let module = rewrite_pre_optimization_module_from_source(
@@ -174,6 +186,7 @@ fn rewrite_pre_optimization_module_with_cache(
             module,
             prepared: None,
             cache_path_for_store: None,
+            cache_metadata_for_store: None,
         })
     }
 }
@@ -313,12 +326,13 @@ fn rewrite_pre_optimization_module_from_source(
 
 fn store_pre_optimization_cache(
     cache_path: &Path,
+    metadata: &CachedCodegenModuleMetadata,
     module: &BlockPyModule<CodegenModuleShape>,
     prepared: &CachedPreparedCodegen,
     pass_tracker: &mut impl PassTracker,
 ) {
     let stored = pass_tracker.record_timing("bb_codegen_cache_store", || {
-        store_codegen_module_cache(cache_path, module, Some(prepared))
+        store_codegen_module_cache(cache_path, metadata, module, Some(prepared))
     });
     match stored {
         Ok(()) => {
@@ -350,6 +364,7 @@ fn finish_codegen_module_with_tracker(
         module: mut bb_codegen,
         prepared,
         cache_path_for_store,
+        cache_metadata_for_store,
     } = pre_optimization;
     pass_tracker.record_timing("validate_codegen_instr_ids", || {
         passes::validate_codegen_instr_ids(&bb_codegen).map_err(anyhow::Error::msg)
@@ -427,7 +442,15 @@ fn finish_codegen_module_with_tracker(
     };
 
     if let Some(cache_path) = &cache_path_for_store {
-        store_pre_optimization_cache(cache_path, &bb_codegen, &prepared, pass_tracker);
+        if let Some(metadata) = &cache_metadata_for_store {
+            store_pre_optimization_cache(
+                cache_path,
+                metadata,
+                &bb_codegen,
+                &prepared,
+                pass_tracker,
+            );
+        }
     }
 
     let CachedPreparedCodegen {

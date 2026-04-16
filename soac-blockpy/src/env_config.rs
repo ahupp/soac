@@ -1,5 +1,5 @@
 use crate::codegen_cache::{
-    codegen_module_cache_key, codegen_module_cache_path, PythonModuleCacheSource,
+    codegen_module_cache_path, CachedCodegenModuleMetadata, PythonModuleCacheSource,
 };
 use std::env::{self, VarError};
 use std::path::{Path, PathBuf};
@@ -184,6 +184,7 @@ impl SoacEnvConfig {
     pub fn module_cache_root_or_repo(&self, repo_root: Option<&Path>) -> Option<PathBuf> {
         self.module_cache_dir
             .clone()
+            .or_else(|| self.soac_work_dir.as_ref().map(|root| root.join("modules")))
             .or_else(|| repo_root.map(|root| root.join("soac-module-cache")))
     }
 
@@ -364,21 +365,33 @@ pub fn pre_optimization_module_cache_identity(
     format!("{build_identity};runtime_names_as_globals={runtime_names_as_globals}")
 }
 
-pub fn pre_optimization_module_cache_path(
-    cache_root: &Path,
+pub fn pre_optimization_module_cache_metadata(
+    source: PythonModuleCacheSource,
+    module_name: &str,
     source_hash: u64,
     build_identity: &str,
     runtime_names_as_globals: bool,
+) -> CachedCodegenModuleMetadata {
+    CachedCodegenModuleMetadata {
+        source,
+        module_name: module_name.to_string(),
+        source_hash,
+        cache_identity: pre_optimization_module_cache_identity(
+            build_identity,
+            runtime_names_as_globals,
+        ),
+    }
+}
+
+pub fn pre_optimization_module_cache_path(
+    cache_root: &Path,
+    source: PythonModuleCacheSource,
+    module_name: &str,
+    _source_hash: u64,
+    _build_identity: &str,
+    _runtime_names_as_globals: bool,
 ) -> Result<PathBuf, String> {
-    let cache_identity =
-        pre_optimization_module_cache_identity(build_identity, runtime_names_as_globals);
-    let cache_key = codegen_module_cache_key(source_hash, cache_identity.as_str());
-    codegen_module_cache_path(
-        cache_root,
-        PythonModuleCacheSource::Project,
-        cache_key.as_str(),
-    )
-    .map_err(|err| err.to_string())
+    codegen_module_cache_path(cache_root, source, module_name).map_err(|err| err.to_string())
 }
 
 pub fn compile_mode_from_env() -> Result<CompileMode, String> {

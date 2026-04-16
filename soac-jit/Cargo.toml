@@ -9,6 +9,7 @@ doctest = false
 
 [dependencies]
 soac-blockpy = { path = "../soac-blockpy" }
+anyhow = { version = "1.0.100", features = ["backtrace"] }
 ruff_python_ast = { workspace = true }
 pyo3 = { workspace = true, features = ["extension-module"] }
 tracing = "0.1"

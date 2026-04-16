@@ -1,6 +1,8 @@
 use soac_blockpy::block_py::{FunctionId, ModuleNameGen};
 use soac_blockpy::codegen_cache::{
+    CachedCodegenModuleMetadata, PythonModuleCacheSource, codegen_module_cache_path,
     load_codegen_module_cache, remap_cached_codegen_module_function_ids,
+    validate_codegen_module_cache_metadata,
 };
 use soac_jit::counter_dump::{CounterDumpFile, CounterDumpRecordView, CounterDumpRowView};
 use soac_jit::module_type::hash_module_source;
@@ -67,7 +69,7 @@ fn run_with_args(args: impl IntoIterator<Item = OsString>) -> Result<(), String>
         .ok_or_else(|| "missing required --out <shared-library>".to_string())?;
     let module_cache_dir = match args.module_cache_dir {
         Some(path) => path,
-        None => default_module_cache_dir()?,
+        None => default_module_cache_dir(counters_path.as_path())?,
     };
     let object_dir = args
         .object_dir
@@ -278,36 +280,20 @@ fn resolve_module_cache_path(
     module_ref: &CounterModuleRef,
     build_identity: Option<&str>,
 ) -> Result<PathBuf, String> {
-    if let Some(build_identity) = build_identity {
-        let path = module_cache_path_for_identity(cache_root, module_ref, build_identity)?;
-        if path.exists() {
-            return Ok(path);
-        }
-        return Err(format!(
-            "cached BlockPy module for module={} source_hash=0x{:016x} build_identity={} not found at {}",
-            module_ref.module_name,
-            module_ref.source_hash,
-            build_identity,
-            path.display()
-        ));
-    }
-
-    let current_path = module_cache_path_for_identity(cache_root, module_ref, SOAC_BUILD_IDENTITY)?;
-    if current_path.exists() {
-        return Ok(current_path);
-    }
-
-    let matches = matching_cache_paths_for_source_hash(cache_root, module_ref.source_hash)?;
+    let matches = matching_module_cache_paths(cache_root, module_ref, build_identity)?;
     match matches.as_slice() {
         [path] => Ok(path.clone()),
         [] => Err(format!(
-            "cached BlockPy module for module={} source_hash=0x{:016x} not found under {}",
+            "cached BlockPy module for module={} source_hash=0x{:016x}{} not found under {}",
             module_ref.module_name,
             module_ref.source_hash,
+            build_identity
+                .map(|identity| format!(" build_identity={identity}"))
+                .unwrap_or_default(),
             cache_root.display()
         )),
         _ => Err(format!(
-            "multiple cached BlockPy modules for module={} source_hash=0x{:016x}; pass --build-identity to select one: {}",
+            "multiple cached BlockPy modules for module={} source_hash=0x{:016x}; pass --build-identity or remove stale cache entries: {}",
             module_ref.module_name,
             module_ref.source_hash,
             matches
@@ -319,49 +305,77 @@ fn resolve_module_cache_path(
     }
 }
 
+#[cfg(test)]
 fn module_cache_path_for_identity(
     cache_root: &Path,
     module_ref: &CounterModuleRef,
     build_identity: &str,
 ) -> Result<PathBuf, String> {
+    module_cache_path_for_source(
+        cache_root,
+        PythonModuleCacheSource::Project,
+        module_ref,
+        build_identity,
+    )
+}
+
+#[cfg(test)]
+fn module_cache_path_for_source(
+    cache_root: &Path,
+    source: PythonModuleCacheSource,
+    module_ref: &CounterModuleRef,
+    build_identity: &str,
+) -> Result<PathBuf, String> {
     soac_jit::config::pre_optimization_module_cache_path(
         cache_root,
+        source,
+        module_ref.module_name.as_str(),
         module_ref.source_hash,
         build_identity,
         module_ref.module_name == SOAC_RUNTIME_MODULE_NAME,
     )
 }
 
-fn matching_cache_paths_for_source_hash(
+fn module_cache_metadata_for_source(
+    source: PythonModuleCacheSource,
+    module_ref: &CounterModuleRef,
+    build_identity: &str,
+) -> CachedCodegenModuleMetadata {
+    soac_jit::config::pre_optimization_module_cache_metadata(
+        source,
+        module_ref.module_name.as_str(),
+        module_ref.source_hash,
+        build_identity,
+        module_ref.module_name == SOAC_RUNTIME_MODULE_NAME,
+    )
+}
+
+fn matching_module_cache_paths(
     cache_root: &Path,
-    source_hash: u64,
+    module_ref: &CounterModuleRef,
+    build_identity: Option<&str>,
 ) -> Result<Vec<PathBuf>, String> {
-    let cache_dir = cache_root.join("project").join("blockpy-codegen");
-    let entries = match fs::read_dir(cache_dir.as_path()) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => {
-            return Err(format!(
-                "failed to read BlockPy module cache dir {}: {err}",
-                cache_dir.display()
-            ));
-        }
-    };
-    let prefix = format!("{source_hash:016x}-");
+    let identities = build_identity
+        .map(|identity| vec![identity.to_string()])
+        .unwrap_or_else(|| vec![SOAC_BUILD_IDENTITY.to_string()]);
     let mut matches = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|err| {
-            format!(
-                "failed to read BlockPy module cache entry in {}: {err}",
-                cache_dir.display()
-            )
-        })?;
-        let path = entry.path();
-        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+    for source in [
+        PythonModuleCacheSource::Project,
+        PythonModuleCacheSource::PythonStdlib,
+    ] {
+        let path = codegen_module_cache_path(cache_root, source, module_ref.module_name.as_str())
+            .map_err(|err| err.to_string())?;
+        if !path.exists() {
             continue;
-        };
-        if file_name.starts_with(prefix.as_str()) && file_name.ends_with(".blockpy.rkyv") {
-            matches.push(path);
+        }
+        let cache = load_codegen_module_cache(path.as_path())
+            .map_err(|err| format!("failed to load {}: {err}", path.display()))?;
+        for identity in &identities {
+            let expected = module_cache_metadata_for_source(source, module_ref, identity.as_str());
+            if validate_codegen_module_cache_metadata(&cache.metadata, &expected).is_ok() {
+                matches.push(path.clone());
+                break;
+            }
         }
     }
     matches.sort();
@@ -393,7 +407,16 @@ fn link_shared_library(
     }
 }
 
-fn default_module_cache_dir() -> Result<PathBuf, String> {
+fn default_module_cache_dir(counters_path: &Path) -> Result<PathBuf, String> {
+    if let Some(path) = soac_jit::config::module_cache_root_from_env_or_repo(None)? {
+        return Ok(path);
+    }
+    if let Some(parent) = counters_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        return Ok(parent.join("modules"));
+    }
     let repo_root = repo_root();
     soac_jit::config::module_cache_root_from_env_or_repo(Some(repo_root.as_path()))?
         .ok_or_else(|| "repo root fallback should always produce a module cache dir".to_string())
@@ -497,6 +520,7 @@ fn print_usage() {
 #[cfg(test)]
 mod test {
     use super::*;
+    use soac_blockpy::codegen_cache::store_codegen_module_cache;
     use soac_blockpy::{LoweringOptions, lower_python_to_blockpy_recorded_with_options};
     use soac_jit::counter_dump::{CounterDumpRecord, CounterDumpRow, parse_counter_dump_records};
     use soac_jit::module_type::hash_module_source;
@@ -537,15 +561,28 @@ mod test {
     #[test]
     fn resolves_exact_current_build_identity_cache_path() {
         let root = unique_temp_dir();
+        let source = "def f():\n    return 1\n";
         let module_ref = CounterModuleRef {
             module_name: "pkg.mod".to_string(),
-            source_hash: 0x1234,
+            source_hash: hash_module_source(source),
             module_id: Some(7),
         };
         let path = module_cache_path_for_identity(root.as_path(), &module_ref, SOAC_BUILD_IDENTITY)
             .unwrap();
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path.as_path(), b"not a real cache payload").unwrap();
+        lower_python_to_blockpy_recorded_with_options(
+            source,
+            ModuleNameGen::new(7),
+            LoweringOptions {
+                runtime_names_as_globals: false,
+                pre_optimization_cache_path: Some(path.clone()),
+                pre_optimization_cache_metadata: Some(module_cache_metadata_for_source(
+                    PythonModuleCacheSource::Project,
+                    &module_ref,
+                    SOAC_BUILD_IDENTITY,
+                )),
+            },
+        )
+        .unwrap();
 
         let resolved = resolve_module_cache_path(root.as_path(), &module_ref, None).unwrap();
 
@@ -554,29 +591,84 @@ mod test {
     }
 
     #[test]
-    fn cache_resolution_requires_build_identity_for_ambiguous_source_hash() {
+    fn cache_resolution_rejects_ambiguous_source_subtrees() {
         let root = unique_temp_dir();
+        let source = "def f():\n    return 1\n";
+        let lowered = lower_python_to_blockpy_recorded_with_options(
+            source,
+            ModuleNameGen::new(7),
+            LoweringOptions::default(),
+        )
+        .unwrap()
+        .codegen_module;
         let module_ref = CounterModuleRef {
             module_name: "pkg.mod".to_string(),
-            source_hash: 0x1234,
+            source_hash: hash_module_source(source),
             module_id: Some(7),
         };
-        let cache_dir = root.join("project").join("blockpy-codegen");
-        fs::create_dir_all(cache_dir.as_path()).unwrap();
-        fs::write(
-            cache_dir.join("0000000000001234-aaaaaaaaaaaaaaaa.blockpy.rkyv"),
-            b"a",
+        for source in [
+            PythonModuleCacheSource::Project,
+            PythonModuleCacheSource::PythonStdlib,
+        ] {
+            let path =
+                codegen_module_cache_path(root.as_path(), source, module_ref.module_name.as_str())
+                    .unwrap();
+            store_codegen_module_cache(
+                path.as_path(),
+                &module_cache_metadata_for_source(source, &module_ref, SOAC_BUILD_IDENTITY),
+                &lowered,
+                None,
+            )
+            .unwrap();
+        }
+
+        let err = resolve_module_cache_path(root.as_path(), &module_ref, None).unwrap_err();
+
+        assert!(err.contains("multiple cached BlockPy modules"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cache_resolution_ignores_stale_metadata() {
+        let root = unique_temp_dir();
+        let source = "def f():\n    return 1\n";
+        let lowered = lower_python_to_blockpy_recorded_with_options(
+            source,
+            ModuleNameGen::new(7),
+            LoweringOptions::default(),
+        )
+        .unwrap()
+        .codegen_module;
+        let module_ref = CounterModuleRef {
+            module_name: "pkg.mod".to_string(),
+            source_hash: hash_module_source(source),
+            module_id: Some(7),
+        };
+        let stale_ref = CounterModuleRef {
+            source_hash: 0x1234,
+            ..module_ref.clone()
+        };
+        let path = codegen_module_cache_path(
+            root.as_path(),
+            PythonModuleCacheSource::Project,
+            module_ref.module_name.as_str(),
         )
         .unwrap();
-        fs::write(
-            cache_dir.join("0000000000001234-bbbbbbbbbbbbbbbb.blockpy.rkyv"),
-            b"b",
+        store_codegen_module_cache(
+            path.as_path(),
+            &module_cache_metadata_for_source(
+                PythonModuleCacheSource::Project,
+                &stale_ref,
+                SOAC_BUILD_IDENTITY,
+            ),
+            &lowered,
+            None,
         )
         .unwrap();
 
         let err = resolve_module_cache_path(root.as_path(), &module_ref, None).unwrap_err();
 
-        assert!(err.contains("multiple cached BlockPy modules"));
+        assert!(err.contains("not found under"));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -599,6 +691,11 @@ mod test {
             LoweringOptions {
                 runtime_names_as_globals: true,
                 pre_optimization_cache_path: Some(runtime_cache_path),
+                pre_optimization_cache_metadata: Some(module_cache_metadata_for_source(
+                    PythonModuleCacheSource::Project,
+                    &runtime_ref,
+                    SOAC_BUILD_IDENTITY,
+                )),
             },
         )
         .unwrap();
@@ -655,6 +752,11 @@ mod test {
             LoweringOptions {
                 runtime_names_as_globals: false,
                 pre_optimization_cache_path: Some(cache_path.clone()),
+                pre_optimization_cache_metadata: Some(module_cache_metadata_for_source(
+                    PythonModuleCacheSource::Project,
+                    &module_ref,
+                    SOAC_BUILD_IDENTITY,
+                )),
             },
         )
         .unwrap();
@@ -677,6 +779,11 @@ mod test {
             LoweringOptions {
                 runtime_names_as_globals: true,
                 pre_optimization_cache_path: Some(runtime_cache_path),
+                pre_optimization_cache_metadata: Some(module_cache_metadata_for_source(
+                    PythonModuleCacheSource::Project,
+                    &runtime_ref,
+                    SOAC_BUILD_IDENTITY,
+                )),
             },
         )
         .unwrap();

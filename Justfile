@@ -37,7 +37,6 @@ export XDG_RUNTIME_DIR := xdg_runtime_dir
 export PYO3_PYTHON := pyo3_python
 export PYO3_PYTHON_REAL := pyo3_python
 export CARGO_HOME := cargo_home
-export SOAC_MODULE_CACHE_DIR := soac_module_cache_dir
 export PATH := uv_tool_bin_dir + ":" + env_var_or_default("PATH", "")
 export WEB_DIR := web_dir
 export INSPECTOR_BIN := inspector_bin
@@ -275,7 +274,7 @@ setup-dev-env:
     "$UV_TOOL_BIN_DIR" \
     "$XDG_CACHE_HOME" \
     "$XDG_DATA_HOME" \
-    "$SOAC_MODULE_CACHE_DIR" \
+    "{{soac_module_cache_dir}}" \
     "$XDG_RUNTIME_DIR"
 
   if [[ ! -x "$CPYTHON_BIN" ]]; then

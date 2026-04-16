@@ -357,8 +357,11 @@ anything non-code affected the run. If there were no such issues, say
 - Repo-local uv state
   `.envrc` and `Justfile` keep uv and XDG state under the repo with
   `UV_CACHE_DIR`, `UV_TOOL_DIR`, `UV_TOOL_BIN_DIR`, `XDG_CACHE_HOME`,
-  `XDG_DATA_HOME`, `XDG_RUNTIME_DIR`, and `SOAC_MODULE_CACHE_DIR`. The
-  `Justfile` respects pre-set values for those variables. `just setup-dev-env`
+  `XDG_DATA_HOME`, and `XDG_RUNTIME_DIR`. `just setup-dev-env` also creates or
+  symlinks repo-local `soac-module-cache`, but the `Justfile` does not export
+  `SOAC_MODULE_CACHE_DIR` by default so specialization runs can use
+  `$SOAC_WORK_DIR/modules` as their module-artifact root. The `Justfile`
+  respects pre-set values for those variables. `just setup-dev-env`
   installs the repo-local `ruff`
   command. Test and benchmark recipes use `UV_OFFLINE=1` for uv-backed venv
   refreshes; use `just update-venv` or rerun `just setup-dev-env` when
@@ -445,11 +448,14 @@ anything non-code affected the run. If there were no such issues, say
   such as broad import-hook coverage. Direct pytest invocations can also pass
   `--run-slow`.
 - `SOAC_MODULE_CACHE_DIR`
-  Directory for the shared pre-optimization BlockPy module cache. The cache uses
-  filenames keyed by source hash plus SOAC build identity, and cached modules
-  are remapped to the current `CompileSession` module id when loaded. `.envrc`
-  and the `Justfile` default this to `soac-module-cache`; set it explicitly
-  when running outside the recipes.
+  Optional directory for the shared pre-optimization BlockPy module cache. When
+  unset and `SOAC_WORK_DIR` is set, module artifacts default under
+  `$SOAC_WORK_DIR/modules`; otherwise they default to repo-local
+  `soac-module-cache`. Cached modules use per-module paths such as
+  `project/pkg/submod/mod.blockpy`; source hash and SOAC build identity are
+  cache metadata, not filename components. `mod.profile` and `mod.opt` are the
+  corresponding per-module profile-evidence and optimization-decision artifact
+  names.
 - `SOAC_PRECOMPILED_LIBRARY`
   Optional path to an offline-precompiled SOAC shared library. When set, runtime
   direct-function compilation first tries to load matching code by module name,
@@ -459,9 +465,16 @@ anything non-code affected the run. If there were no such issues, say
   Offline precompiles all modules referenced by a counter dump from cached
   pre-optimization BlockPy modules, writes per-module object files, and links a
   shared library. It expects matching module-cache entries in
-  `SOAC_MODULE_CACHE_DIR`; run a profile/benchmark pass first when the cache is
+  `SOAC_MODULE_CACHE_DIR`, in `$SOAC_WORK_DIR/modules` when the cache
+  directory is unset, or in `<counters-dir>/modules` when precompiling from an
+  explicit counter dump; run a profile/benchmark pass first when the cache is
   empty. Use `SOAC_PRECOMPILED_LIBRARY` to point runtime execution at the
   resulting shared library.
+- `cargo run -p soac-inspector --bin decide_optimizations -- --counters <profile.bin> --module <mod.blockpy> --out <root-dir>`
+  Standalone optimization-decision planner. It loads the counter dump once,
+  loads one cached BlockPy module, and writes the module's `mod.opt` artifact
+  under the requested root, such as
+  `$SOAC_WORK_DIR/modules/python-stdlib/typing/mod.opt`.
 - `SOAC_CRANELIFT_OPT_LEVEL`
   Optional Cranelift process-JIT optimization level override:
   `none`, `speed`, or `speed_and_size`. Normal runtime and benchmark

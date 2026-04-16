@@ -25,10 +25,13 @@ def _read_jsonl(path):
     ]
 
 
-def _soac_subprocess_env(module_root, *, work_dir=None, extra_env=None):
+def _soac_subprocess_env(module_root, *, work_dir=None, extra_env=None, module_cache_dir=True):
     env = dict(os.environ)
     env["SOAC_MODULE_ENABLED"] = f"path:{module_root}"
-    env["SOAC_MODULE_CACHE_DIR"] = str(module_root / "soac-module-cache")
+    if module_cache_dir:
+        env["SOAC_MODULE_CACHE_DIR"] = str(module_root / "soac-module-cache")
+    else:
+        env.pop("SOAC_MODULE_CACHE_DIR", None)
     if work_dir is not None:
         env["SOAC_WORK_DIR"] = str(work_dir)
     else:
@@ -290,13 +293,35 @@ def value():
     second = _run_soac_subprocess(script, env=env)
     _assert_subprocess_ok(second)
 
-    cache_files = list(cache_dir.rglob("*.blockpy.rkyv"))
+    cache_files = list(cache_dir.rglob("mod.blockpy"))
     assert cache_files
     rows = _read_jsonl(log_path)
     assert any(
         row.get("event") == "soac.blockpy_module_cache" and row.get("cache_hit") is True
         for row in rows
     )
+
+
+def test_soac_work_dir_is_default_module_artifact_root(tmp_path):
+    work_dir = tmp_path / "soac-work"
+    module_path = tmp_path / "work_dir_cache_case.py"
+    module_path.write_text("def read():\n    return 17\n", encoding="utf-8")
+
+    result = _run_soac_subprocess(
+        _import_and_run_script(
+            tmp_path,
+            "import work_dir_cache_case",
+            "assert work_dir_cache_case.read() == 17",
+        ),
+        env=_soac_subprocess_env(
+            tmp_path,
+            work_dir=work_dir,
+            module_cache_dir=False,
+        ),
+    )
+    _assert_subprocess_ok(result)
+
+    assert list((work_dir / "modules").rglob("mod.blockpy"))
 
 
 def test_soac_work_dir_is_default_event_log_dir(tmp_path):

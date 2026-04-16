@@ -4,6 +4,7 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyModule, PyTuple};
 use soac_blockpy::block_py::{BlockPyFunction, BlockPyModule, FunctionId};
+use soac_blockpy::codegen_cache::{CachedCodegenModuleMetadata, PythonModuleCacheSource};
 use soac_blockpy::passes::CodegenModuleShape;
 use soac_blockpy::{LoweringOptions, lower_python_to_blockpy_recorded_with_options};
 use soac_jit::config::module_cache_root_from_env_or_repo;
@@ -161,24 +162,47 @@ fn soac_repo_root() -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-fn pre_optimization_module_cache_path(
+fn module_cache_source_for_import_path(path: &str) -> PythonModuleCacheSource {
+    let import_path = Path::new(path);
+    if soac_repo_root()
+        .as_deref()
+        .is_some_and(|repo_root| import_path.starts_with(repo_root))
+    {
+        PythonModuleCacheSource::Project
+    } else {
+        PythonModuleCacheSource::PythonStdlib
+    }
+}
+
+fn pre_optimization_module_cache(
+    module_name: &str,
+    source: PythonModuleCacheSource,
     source_hash: u64,
     runtime_names_as_globals: bool,
-) -> PyResult<Option<PathBuf>> {
+) -> PyResult<Option<(PathBuf, CachedCodegenModuleMetadata)>> {
     let repo_root = soac_repo_root();
     let Some(cache_root) = module_cache_root_from_env_or_repo(repo_root.as_deref())
         .map_err(PyRuntimeError::new_err)?
     else {
         return Ok(None);
     };
-    soac_jit::config::pre_optimization_module_cache_path(
+    let path = soac_jit::config::pre_optimization_module_cache_path(
         cache_root.as_path(),
+        source,
+        module_name,
         source_hash,
         SOAC_BUILD_IDENTITY,
         runtime_names_as_globals,
     )
-    .map(Some)
-    .map_err(PyRuntimeError::new_err)
+    .map_err(PyRuntimeError::new_err)?;
+    let metadata = soac_jit::config::pre_optimization_module_cache_metadata(
+        source,
+        module_name,
+        source_hash,
+        SOAC_BUILD_IDENTITY,
+        runtime_names_as_globals,
+    );
+    Ok(Some((path, metadata)))
 }
 
 fn pending_module_load_timings() -> &'static Mutex<HashMap<usize, PendingModuleLoadTiming>> {
@@ -440,12 +464,18 @@ fn create_module(py: Python<'_>, path: &str, spec: Py<PyAny>) -> PyResult<Py<PyA
     };
     let session = soac_jit::CompileSession::process();
     let runtime_names_as_globals = module_name == "soac.runtime";
+    let pre_optimization_cache = pre_optimization_module_cache(
+        module_name.as_str(),
+        module_cache_source_for_import_path(path),
+        source_hash,
+        runtime_names_as_globals,
+    )?;
     let lowering_options = LoweringOptions {
         runtime_names_as_globals,
-        pre_optimization_cache_path: pre_optimization_module_cache_path(
-            source_hash,
-            runtime_names_as_globals,
-        )?,
+        pre_optimization_cache_path: pre_optimization_cache
+            .as_ref()
+            .map(|(path, _metadata)| path.clone()),
+        pre_optimization_cache_metadata: pre_optimization_cache.map(|(_path, metadata)| metadata),
     };
     let output = time_phase(&mut create_timings, "lower_blockpy", || {
         lower_python_to_blockpy_recorded_with_options(

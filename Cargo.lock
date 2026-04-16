@@ -1747,9 +1747,11 @@ dependencies = [
 name = "soac-inspector"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "axum",
  "http-body-util",
  "pyo3",
+ "rkyv",
  "serde",
  "serde_json",
  "soac-blockpy",
@@ -1763,6 +1765,7 @@ dependencies = [
 name = "soac-jit"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "cranelift-codegen",
  "cranelift-control",
  "cranelift-frontend",
