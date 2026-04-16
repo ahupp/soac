@@ -1,10 +1,11 @@
 use crate::block_py::pretty::BlockPyPrettyPrint;
 use crate::block_py::{
-    instr_any, BlockPyFunction, BlockPyModule, BlockTerm, CallArgPositional, InstrCodegen,
-    InstrCodegenOp, InstrResolved, Literal, LocalLocation, NameLike, NameLocation,
+    instr_any, BlockPyFunction, BlockPyModule, BlockTerm, CallArgPositional, FunctionId, HasMeta,
+    InstrCodegen, InstrCodegenOp, InstrId, InstrResolved, Literal, LocalLocation, NameLike,
+    NameLocation,
 };
 use crate::CodegenModuleShape;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(
     Clone, Debug, Default, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
@@ -43,7 +44,10 @@ impl EscapeSummaryModule {
     ) {
         self.functions = std::mem::take(&mut self.functions)
             .into_iter()
-            .map(|(function_id, summary)| (remap(function_id), summary))
+            .map(|(function_id, mut summary)| {
+                summary.remap_function_ids(remap);
+                (remap(function_id), summary)
+            })
             .collect();
     }
 }
@@ -60,6 +64,7 @@ impl BlockPyPrettyPrint for EscapeSummaryModule {
                 .expect("function id was collected from this summary map");
             if summary.non_escaping_constructor.is_none()
                 && summary.straightline_field_initializer.is_none()
+                && summary.non_escaping_constructor_allocations.is_empty()
             {
                 continue;
             }
@@ -76,6 +81,15 @@ impl BlockPyPrettyPrint for EscapeSummaryModule {
                     "  straightline_field_initializer self={} fields={}\n",
                     constructor.self_name,
                     render_field_stores(&constructor.field_stores),
+                ));
+            }
+            for allocation in &summary.non_escaping_constructor_allocations {
+                out.push_str(&format!(
+                    "  non_escaping_constructor_allocation local={} constructor={} reads={} writes={}\n",
+                    allocation.local_name,
+                    allocation.constructor_function_id,
+                    render_field_accesses(&allocation.field_reads),
+                    render_field_accesses(&allocation.field_writes),
                 ));
             }
         }
@@ -95,6 +109,14 @@ fn render_field_stores(stores: &[ConstructorFieldStore]) -> String {
         .join(", ")
 }
 
+fn render_field_accesses(accesses: &[ConstructorFieldAccess]) -> String {
+    accesses
+        .iter()
+        .map(|access| access.field_name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn render_field_value(value: &ConstructorFieldValue) -> String {
     match value {
         ConstructorFieldValue::Param { name, index, .. } => format!("param#{index}:{name}"),
@@ -110,6 +132,18 @@ fn render_field_value(value: &ConstructorFieldValue) -> String {
 pub struct FunctionEscapeSummary {
     pub non_escaping_constructor: Option<NonEscapingConstructorSummary>,
     pub straightline_field_initializer: Option<FieldInitializerConstructorSummary>,
+    pub non_escaping_constructor_allocations: Vec<NonEscapingConstructorAllocationSummary>,
+}
+
+impl FunctionEscapeSummary {
+    fn remap_function_ids(
+        &mut self,
+        remap: impl Fn(crate::block_py::FunctionId) -> crate::block_py::FunctionId + Copy,
+    ) {
+        for allocation in &mut self.non_escaping_constructor_allocations {
+            allocation.constructor_function_id = remap(allocation.constructor_function_id);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -133,6 +167,21 @@ pub struct ConstructorFieldStore {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct NonEscapingConstructorAllocationSummary {
+    pub local_name: String,
+    pub local_location: LocalLocation,
+    pub constructor_function_id: FunctionId,
+    pub call_instr_id: Option<InstrId>,
+    pub field_reads: Vec<ConstructorFieldAccess>,
+    pub field_writes: Vec<ConstructorFieldAccess>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct ConstructorFieldAccess {
+    pub field_name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum ConstructorFieldValue {
     Param {
         name: String,
@@ -150,7 +199,7 @@ pub enum ConstructorFieldValue {
 }
 
 pub fn summarize_module_escapes(module: &BlockPyModule<CodegenModuleShape>) -> EscapeSummaryModule {
-    let functions = module
+    let mut functions = module
         .callable_defs
         .iter()
         .map(|function| {
@@ -161,11 +210,194 @@ pub fn summarize_module_escapes(module: &BlockPyModule<CodegenModuleShape>) -> E
                     straightline_field_initializer: summarize_straightline_field_initializer(
                         module, function,
                     ),
+                    non_escaping_constructor_allocations: Vec::new(),
                 },
             )
         })
-        .collect();
+        .collect::<HashMap<_, _>>();
+    let straightline_constructor_ids = functions
+        .iter()
+        .filter_map(|(function_id, summary)| {
+            summary
+                .straightline_field_initializer
+                .as_ref()
+                .map(|_| *function_id)
+        })
+        .collect::<HashSet<_>>();
+    for function in &module.callable_defs {
+        let allocations = summarize_non_escaping_constructor_allocations(
+            module,
+            function,
+            &straightline_constructor_ids,
+        );
+        if let Some(summary) = functions.get_mut(&function.function_id) {
+            summary.non_escaping_constructor_allocations = allocations;
+        }
+    }
     EscapeSummaryModule { functions }
+}
+
+fn summarize_non_escaping_constructor_allocations(
+    module: &BlockPyModule<CodegenModuleShape>,
+    function: &BlockPyFunction<CodegenModuleShape>,
+    straightline_constructor_ids: &HashSet<FunctionId>,
+) -> Vec<NonEscapingConstructorAllocationSummary> {
+    let mut allocations = Vec::new();
+    for block in &function.blocks {
+        for (instr_index, instr) in block.body.iter().enumerate() {
+            let InstrCodegenOp::Store(store) = instr else {
+                continue;
+            };
+            let Some(local_location) = store.name.location.as_local() else {
+                continue;
+            };
+            let InstrCodegenOp::CallDirect(call) = store.value.as_ref() else {
+                continue;
+            };
+            if !straightline_constructor_ids.contains(&call.function_id) {
+                continue;
+            }
+            let Some(summary) = summarize_constructor_allocation_uses_in_block(
+                module,
+                local_location,
+                store.name.id_str().to_string(),
+                call.function_id,
+                call.meta().instr_id,
+                &block.body[instr_index + 1..],
+                &block.term,
+            ) else {
+                continue;
+            };
+            allocations.push(summary);
+        }
+    }
+    allocations
+}
+
+fn summarize_constructor_allocation_uses_in_block(
+    module: &BlockPyModule<CodegenModuleShape>,
+    local_location: LocalLocation,
+    local_name: String,
+    constructor_function_id: FunctionId,
+    call_instr_id: Option<InstrId>,
+    remaining_body: &[InstrCodegen],
+    term: &BlockTerm<InstrCodegen>,
+) -> Option<NonEscapingConstructorAllocationSummary> {
+    let mut summary = NonEscapingConstructorAllocationSummary {
+        local_name,
+        local_location,
+        constructor_function_id,
+        call_instr_id,
+        field_reads: Vec::new(),
+        field_writes: Vec::new(),
+    };
+    for instr in remaining_body {
+        if let InstrCodegenOp::Store(store) = instr {
+            if store.name.location.as_local() == Some(local_location) {
+                break;
+            }
+        }
+        if !record_allowed_constructor_local_use(module, local_location, instr, &mut summary) {
+            return None;
+        }
+    }
+    if !record_allowed_constructor_local_use_in_term(module, local_location, term, &mut summary) {
+        return None;
+    }
+    if summary.field_reads.is_empty() && summary.field_writes.is_empty() {
+        return None;
+    }
+    Some(summary)
+}
+
+fn record_allowed_constructor_local_use_in_term(
+    module: &BlockPyModule<CodegenModuleShape>,
+    local_location: LocalLocation,
+    term: &BlockTerm<InstrCodegen>,
+    summary: &mut NonEscapingConstructorAllocationSummary,
+) -> bool {
+    match term {
+        BlockTerm::Return(value) => {
+            record_allowed_constructor_local_use(module, local_location, value, summary)
+        }
+        BlockTerm::IfTerm(term) => {
+            record_allowed_constructor_local_use(module, local_location, &term.test, summary)
+        }
+        BlockTerm::BranchTable(term) => {
+            record_allowed_constructor_local_use(module, local_location, &term.index, summary)
+        }
+        BlockTerm::Raise(term) => term.exc.as_ref().is_none_or(|exc| {
+            record_allowed_constructor_local_use(module, local_location, exc, summary)
+        }),
+        BlockTerm::Jump(_) => true,
+    }
+}
+
+fn record_allowed_constructor_local_use(
+    module: &BlockPyModule<CodegenModuleShape>,
+    local_location: LocalLocation,
+    instr: &InstrCodegen,
+    summary: &mut NonEscapingConstructorAllocationSummary,
+) -> bool {
+    match instr {
+        InstrCodegenOp::GetAttr(getattr)
+            if is_local_load(&getattr.value, local_location)
+                && !instr_uses_local(&getattr.attr, local_location) =>
+        {
+            let Some(field_name) = constant_string(module, &getattr.attr) else {
+                return false;
+            };
+            summary
+                .field_reads
+                .push(ConstructorFieldAccess { field_name });
+            true
+        }
+        InstrCodegenOp::SetAttr(setattr)
+            if is_local_load(&setattr.value, local_location)
+                && !instr_uses_local(&setattr.attr, local_location)
+                && !instr_uses_local(&setattr.replacement, local_location) =>
+        {
+            let Some(field_name) = constant_string(module, &setattr.attr) else {
+                return false;
+            };
+            summary
+                .field_writes
+                .push(ConstructorFieldAccess { field_name });
+            true
+        }
+        _ => !instr_uses_local(instr, local_location),
+    }
+}
+
+fn is_local_load(instr: &InstrCodegen, local_location: LocalLocation) -> bool {
+    matches!(
+        instr,
+        InstrCodegenOp::Load(load) if load.name.location.as_local() == Some(local_location)
+    )
+}
+
+fn instr_uses_local(instr: &InstrCodegen, local_location: LocalLocation) -> bool {
+    instr_any(instr, |child| match child {
+        InstrCodegenOp::Load(load) => load.name.location.as_local() == Some(local_location),
+        _ => false,
+    })
+}
+
+fn constant_string(
+    module: &BlockPyModule<CodegenModuleShape>,
+    instr: &InstrCodegen,
+) -> Option<String> {
+    let InstrCodegenOp::Load(load) = instr else {
+        return None;
+    };
+    let constant_index = load.name.location.as_constant()? as usize;
+    match module.module_constants.get(constant_index)? {
+        InstrResolved::Literal(value) => match value.as_literal() {
+            Literal::StringLiteral(value) => Some(value.value.clone()),
+            Literal::BytesLiteral(_) | Literal::NumberLiteral(_) => None,
+        },
+        _ => None,
+    }
 }
 
 fn summarize_non_escaping_constructor(
@@ -579,6 +811,7 @@ fn instr_uses_self(instr: &InstrCodegen, self_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block_py::{CallArgPositional, CallDirect};
     use crate::lower_python_to_blockpy_for_testing;
 
     fn lowered(source: &str) -> BlockPyModule<CodegenModuleShape> {
@@ -596,6 +829,44 @@ mod tests {
             .iter()
             .find(|function| function.names.qualname == qualname)
             .unwrap_or_else(|| panic!("missing function {qualname}; got {module:?}"))
+    }
+
+    fn function_by_qualname_mut<'a>(
+        module: &'a mut BlockPyModule<CodegenModuleShape>,
+        qualname: &str,
+    ) -> &'a mut BlockPyFunction<CodegenModuleShape> {
+        module
+            .callable_defs
+            .iter_mut()
+            .find(|function| function.names.qualname == qualname)
+            .unwrap_or_else(|| panic!("missing function {qualname}"))
+    }
+
+    fn rewrite_first_box_call_as_direct(module: &mut BlockPyModule<CodegenModuleShape>) {
+        let constructor_id = function_by_qualname(module, "Box.__init__").function_id;
+        let function = function_by_qualname_mut(module, "make");
+        let Some(InstrCodegenOp::Store(store)) = function.blocks[0].body.first_mut() else {
+            panic!("make should start with a store");
+        };
+        let InstrCodegenOp::Call(call) = store.value.as_ref() else {
+            panic!("store value should start as a generic call");
+        };
+        let args: Vec<CallArgPositional<InstrCodegen>> = call
+            .args
+            .iter()
+            .map(|arg| match arg {
+                CallArgPositional::Positional(value) => {
+                    CallArgPositional::Positional(value.clone())
+                }
+                CallArgPositional::Starred(value) => CallArgPositional::Starred(value.clone()),
+            })
+            .collect();
+        *store.value = InstrCodegen::CallDirect(CallDirect::new(
+            (*call.func).clone(),
+            constructor_id,
+            args,
+            call.keywords.clone(),
+        ));
     }
 
     #[test]
@@ -700,5 +971,63 @@ class Box:
         assert!(summarize_module_escapes(&module)
             .non_escaping_constructor(function.function_id)
             .is_none());
+    }
+
+    #[test]
+    fn summarizes_local_constructor_allocation_used_for_field_read() {
+        let mut module = lowered(
+            r#"
+class Box:
+    def __init__(self, value):
+        self.value = value
+
+def make(x):
+    box = Box(x)
+    return box.value
+"#,
+        );
+        rewrite_first_box_call_as_direct(&mut module);
+        let make_id = function_by_qualname(&module, "make").function_id;
+
+        let escapes = summarize_module_escapes(&module);
+        let allocations = &escapes
+            .function(make_id)
+            .expect("make should have an escape summary")
+            .non_escaping_constructor_allocations;
+
+        assert_eq!(allocations.len(), 1);
+        assert_eq!(allocations[0].local_name, "box");
+        assert_eq!(
+            allocations[0].field_reads,
+            vec![ConstructorFieldAccess {
+                field_name: "value".to_string()
+            }]
+        );
+        assert!(allocations[0].field_writes.is_empty());
+    }
+
+    #[test]
+    fn rejects_local_constructor_allocation_returned_directly() {
+        let mut module = lowered(
+            r#"
+class Box:
+    def __init__(self, value):
+        self.value = value
+
+def make(x):
+    box = Box(x)
+    return box
+"#,
+        );
+        rewrite_first_box_call_as_direct(&mut module);
+        let make_id = function_by_qualname(&module, "make").function_id;
+
+        let escapes = summarize_module_escapes(&module);
+
+        assert!(escapes
+            .function(make_id)
+            .expect("make should have an escape summary")
+            .non_escaping_constructor_allocations
+            .is_empty());
     }
 }

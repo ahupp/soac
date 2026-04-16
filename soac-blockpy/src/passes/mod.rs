@@ -671,8 +671,9 @@ impl ModuleShape for CodegenUnidentifiedModuleShape {
 pub(crate) use blockpy_generators::lower_yield_in_lowered_core_blockpy_module_bundle;
 pub use blockpy_to_bb::{lower_try_jump_exception_flow, normalize_bb_module_strings};
 pub use escape_analysis::{
-    summarize_module_escapes, ConstructorFieldStore, ConstructorFieldValue, EscapeSummaryModule,
-    FieldInitializerConstructorSummary, FunctionEscapeSummary, NonEscapingConstructorSummary,
+    summarize_module_escapes, ConstructorFieldAccess, ConstructorFieldStore, ConstructorFieldValue,
+    EscapeSummaryModule, FieldInitializerConstructorSummary, FunctionEscapeSummary,
+    NonEscapingConstructorAllocationSummary, NonEscapingConstructorSummary,
 };
 pub use inline_plan::{
     plan_module_inlining, FunctionInlinePlan, InlinePlanModule, StraightlineConstructorInlinePlan,
