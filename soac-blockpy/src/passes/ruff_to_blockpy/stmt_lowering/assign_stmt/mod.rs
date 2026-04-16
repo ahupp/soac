@@ -40,20 +40,11 @@ pub(super) fn lower_target_object_with_setup<E: RuffToBlockPyExpr>(
     out: &mut BlockPyStmtBuilder<E>,
     loop_ctx: Option<&LoopContext>,
 ) -> Result<E, String> {
-    let meta = target_value.meta();
-    let maybe_name = match &target_value {
-        InstrRuff::ExprName(name) => Some(name.id.to_string()),
-        _ => None,
-    };
-    let value = crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
+    crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
         target_value,
         out,
         loop_ctx,
-    )?;
-    Ok(match maybe_name {
-        Some(name) => E::load_deleted_name(meta.node_index, meta.range, name, value),
-        None => value,
-    })
+    )
 }
 
 fn lower_assignment_target_into<E>(
@@ -280,15 +271,7 @@ pub(crate) fn build_for_target_assign_body(
 }
 
 pub(super) fn with_target_object_expr(value: Expr) -> Expr {
-    if let Expr::Name(name) = &value {
-        py_expr!(
-            "__soac__.load_deleted_name({name:literal}, {value:expr})",
-            name = name.id.as_str(),
-            value = value,
-        )
-    } else {
-        value
-    }
+    value
 }
 
 pub(super) fn rewrite_assignment_target<F>(

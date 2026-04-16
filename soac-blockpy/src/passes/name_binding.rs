@@ -409,23 +409,6 @@ fn rewrite_binding_delete(
     }
 }
 
-fn wrap_deleted_name_load_expr(
-    logical_name: String,
-    node_index: ast::AtomicNodeIndex,
-    range: ruff_text_size::TextRange,
-    value: InstrUnresolved,
-) -> InstrUnresolved {
-    core_runtime_positional_call_expr_with_meta(
-        "load_deleted_name",
-        node_index.clone(),
-        range,
-        vec![
-            core_string_expr(logical_name, node_index.clone(), range),
-            value,
-        ],
-    )
-}
-
 fn raise_deleted_name_expr(
     logical_name: String,
     node_index: ast::AtomicNodeIndex,
@@ -518,23 +501,12 @@ fn rewrite_deleted_name_loads_in_expr(
     scope: &CallableScopeInfo,
     storage_layout: &StorageLayout,
     resolver: &NameBindingMapper<'_>,
-    deleted_names: &HashSet<String>,
     always_unbound_names: &HashSet<String>,
 ) {
     if let Some(logical_name) = cell_load_logical_name(expr, scope, storage_layout) {
-        if deleted_names.contains(logical_name.as_str())
-            || always_unbound_names.contains(logical_name.as_str())
-        {
+        if always_unbound_names.contains(logical_name.as_str()) {
             let meta = expr.meta();
-            *expr = core_runtime_positional_call_expr_with_meta(
-                "load_deleted_name",
-                meta.node_index.clone(),
-                meta.range,
-                vec![
-                    core_string_expr(logical_name, meta.node_index.clone(), meta.range),
-                    expr.clone(),
-                ],
-            );
+            *expr = raise_deleted_name_expr(logical_name, meta.node_index.clone(), meta.range);
             return;
         }
     }
@@ -542,22 +514,12 @@ fn rewrite_deleted_name_loads_in_expr(
         InstrUnresolved::Load(op) => {
             let meta = op.meta();
             let always_unbound = always_unbound_names.contains(op.name.id_str());
-            let deleted = deleted_names.contains(op.name.id_str());
-            if always_unbound || deleted {
-                *expr = if always_unbound {
-                    raise_deleted_name_expr(
-                        op.name.id_str().to_string(),
-                        meta.node_index.clone(),
-                        meta.range,
-                    )
-                } else {
-                    wrap_deleted_name_load_expr(
-                        op.name.id_str().to_string(),
-                        meta.node_index.clone(),
-                        meta.range,
-                        expr.clone(),
-                    )
-                };
+            if always_unbound {
+                *expr = raise_deleted_name_expr(
+                    op.name.id_str().to_string(),
+                    meta.node_index.clone(),
+                    meta.range,
+                );
                 return;
             }
             if let UnresolvedName::SourceName(_) = &op.name {
@@ -571,22 +533,12 @@ fn rewrite_deleted_name_loads_in_expr(
                         logical_name_for_local_location(storage_layout, location)
                     {
                         let always_unbound = always_unbound_names.contains(logical_name.as_str());
-                        let deleted = deleted_names.contains(logical_name.as_str());
-                        if always_unbound || deleted {
-                            *expr = if always_unbound {
-                                raise_deleted_name_expr(
-                                    logical_name,
-                                    meta.node_index.clone(),
-                                    meta.range,
-                                )
-                            } else {
-                                wrap_deleted_name_load_expr(
-                                    logical_name,
-                                    meta.node_index.clone(),
-                                    meta.range,
-                                    expr.clone(),
-                                )
-                            };
+                        if always_unbound {
+                            *expr = raise_deleted_name_expr(
+                                logical_name,
+                                meta.node_index.clone(),
+                                meta.range,
+                            );
                         }
                     }
                 }
@@ -608,7 +560,6 @@ fn rewrite_deleted_name_loads_in_expr(
                 scope: &'a CallableScopeInfo,
                 storage_layout: &'a StorageLayout,
                 resolver: &'a NameBindingMapper<'a>,
-                deleted_names: &'a HashSet<String>,
                 always_unbound_names: &'a HashSet<String>,
             }
 
@@ -619,7 +570,6 @@ fn rewrite_deleted_name_loads_in_expr(
                         self.scope,
                         self.storage_layout,
                         self.resolver,
-                        self.deleted_names,
                         self.always_unbound_names,
                     );
                 }
@@ -629,7 +579,6 @@ fn rewrite_deleted_name_loads_in_expr(
                 scope,
                 storage_layout,
                 resolver,
-                deleted_names,
                 always_unbound_names,
             });
         }
@@ -640,7 +589,6 @@ fn rewrite_deleted_name_loads_in_expr(
                     scope,
                     storage_layout,
                     resolver,
-                    deleted_names,
                     always_unbound_names,
                 );
             });
@@ -670,7 +618,6 @@ fn core_name_expr(
                 | "FALSE"
                 | "ELLIPSIS"
                 | "globals"
-                | "load_deleted_name"
                 | "raise_deleted_name"
                 | "class_lookup_global"
                 | "class_lookup_cell"
@@ -782,25 +729,7 @@ fn quiet_delete_marker_target(expr: &InstrUnresolved) -> Option<ast::name::Name>
         return None;
     }
     match &args[0] {
-        CallArgPositional::Positional(expr) => {
-            let InstrUnresolved::Call(nested_call) = expr else {
-                return raw_load_name(expr).map(ast::name::Name::new);
-            };
-            if !nested_call.keywords.is_empty()
-                || nested_call.args.len() != 2
-                || !raw_load_name(nested_call.func.as_ref())
-                    .as_ref()
-                    .is_some_and(|name| name == "load_deleted_name")
-            {
-                return raw_load_name(expr).map(ast::name::Name::new);
-            }
-            match &nested_call.args[1] {
-                CallArgPositional::Positional(expr) => {
-                    raw_load_name(expr).map(ast::name::Name::new)
-                }
-                _ => None,
-            }
-        }
+        CallArgPositional::Positional(expr) => raw_load_name(expr).map(ast::name::Name::new),
         _ => None,
     }
 }
@@ -963,20 +892,6 @@ fn logical_name_for_cell_bound_name(
     }
     let storage_name = resolve_cell_storage_name(scope, name)?;
     scope.logical_name_for_cell_storage(storage_name.as_str())
-}
-
-fn del_deref_logical_name(
-    expr: &InstrUnresolved,
-    scope: &CallableScopeInfo,
-    _storage_layout: &StorageLayout,
-) -> Option<String> {
-    let InstrUnresolved::Del(op) = expr else {
-        return None;
-    };
-    if op.quietly {
-        return None;
-    }
-    logical_name_for_cell_bound_name(scope, &op.name)
 }
 
 fn store_cell_runtime_logical_name(
@@ -1196,49 +1111,14 @@ fn unresolved_semantic_delete_target(
     Some((op.name.clone().name(), op.meta()))
 }
 
-fn collect_deleted_names_in_stmt(
-    stmt: &CoreStmt,
-    scope: &CallableScopeInfo,
-    storage_layout: &StorageLayout,
-    names: &mut HashSet<String>,
-) {
-    match stmt {
-        InstrUnresolved::Del(op)
-            if !op.name.is_runtime_name()
-                && !is_internal_symbol(op.name.id_str())
-                && scope.has_local_def(op.name.id_str()) =>
-        {
-            names.insert(op.name.id_str().to_string());
-        }
-        _ => {
-            if let Some((target, _meta)) = unresolved_semantic_delete_target(stmt) {
-                if scope.has_local_def(target.as_str()) {
-                    names.insert(target.to_string());
-                }
-            }
-        }
-    }
-    if let Some(name) = del_deref_logical_name(stmt, scope, storage_layout) {
-        names.insert(name);
-    }
-}
-
 fn rewrite_deleted_name_loads_in_stmt(
     stmt: &mut CoreStmt,
     scope: &CallableScopeInfo,
     storage_layout: &StorageLayout,
     resolver: &NameBindingMapper<'_>,
-    deleted_names: &HashSet<String>,
     always_unbound_names: &HashSet<String>,
 ) {
-    rewrite_deleted_name_loads_in_expr(
-        stmt,
-        scope,
-        storage_layout,
-        resolver,
-        deleted_names,
-        always_unbound_names,
-    )
+    rewrite_deleted_name_loads_in_expr(stmt, scope, storage_layout, resolver, always_unbound_names)
 }
 
 fn rewrite_deleted_name_loads_in_term(
@@ -1246,14 +1126,12 @@ fn rewrite_deleted_name_loads_in_term(
     scope: &CallableScopeInfo,
     storage_layout: &StorageLayout,
     resolver: &NameBindingMapper<'_>,
-    deleted_names: &HashSet<String>,
     always_unbound_names: &HashSet<String>,
 ) {
     struct RewriteTermVisitor<'a> {
         scope: &'a CallableScopeInfo,
         storage_layout: &'a StorageLayout,
         resolver: &'a NameBindingMapper<'a>,
-        deleted_names: &'a HashSet<String>,
         always_unbound_names: &'a HashSet<String>,
     }
 
@@ -1264,7 +1142,6 @@ fn rewrite_deleted_name_loads_in_term(
                 self.scope,
                 self.storage_layout,
                 self.resolver,
-                self.deleted_names,
                 self.always_unbound_names,
             );
         }
@@ -1275,7 +1152,6 @@ fn rewrite_deleted_name_loads_in_term(
             scope,
             storage_layout,
             resolver,
-            deleted_names,
             always_unbound_names,
         },
         term,
@@ -1497,20 +1373,6 @@ fn sync_cell_backed_block_params_in_block(
         return;
     }
     block.body.splice(0..0, sync_stmts);
-}
-
-fn collect_deleted_names_in_blocks(
-    blocks: &[crate::block_py::Block<InstrUnresolved>],
-    scope: &CallableScopeInfo,
-    storage_layout: &StorageLayout,
-) -> HashSet<String> {
-    let mut names = HashSet::new();
-    for block in blocks {
-        for stmt in &block.body {
-            collect_deleted_names_in_stmt(stmt, scope, storage_layout, &mut names);
-        }
-    }
-    names
 }
 
 fn collect_runtime_bound_local_names_in_stmt(
@@ -2856,9 +2718,8 @@ fn lower_name_binding_callable(
         .storage_layout
         .as_ref()
         .expect("name binding should have storage layout before cell-location analysis");
-    let deleted_names = collect_deleted_names_in_blocks(&lowered.blocks, &scope, storage_layout);
     let always_unbound_names = collect_always_unbound_local_names(&lowered);
-    if !deleted_names.is_empty() || !always_unbound_names.is_empty() {
+    if !always_unbound_names.is_empty() {
         for block in &mut lowered.blocks {
             for stmt in &mut block.body {
                 rewrite_deleted_name_loads_in_stmt(
@@ -2866,7 +2727,6 @@ fn lower_name_binding_callable(
                     &scope,
                     storage_layout,
                     &mapper,
-                    &deleted_names,
                     &always_unbound_names,
                 );
             }
@@ -2875,7 +2735,6 @@ fn lower_name_binding_callable(
                 &scope,
                 storage_layout,
                 &mapper,
-                &deleted_names,
                 &always_unbound_names,
             );
         }

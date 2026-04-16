@@ -426,6 +426,12 @@ impl ModuleConstantCollector {
             InstrCodegen::CalleeFunctionId(op) => {
                 self.collect_expr(op.value.as_ref());
             }
+            InstrCodegen::DirectFunctionIdGuardTest(op) => {
+                self.collect_expr(op.value.as_ref());
+            }
+            InstrCodegen::DirectReceiverTypeVersionGuardTest(op) => {
+                self.collect_expr(op.value.as_ref());
+            }
             InstrCodegen::Call(call) => {
                 if let Some(const_bytes) = self.string_constant_bytes_for_specialized_codegen(expr)
                 {
@@ -532,7 +538,6 @@ impl ModuleConstantCollector {
         call: &blockpy_intrinsics::Call<InstrCodegen>,
     ) -> Option<Vec<u8>> {
         match helper_name_for_codegen_expr(call.func.as_ref(), &self.constants) {
-            Some("load_deleted_name") if call.args.len() == 2 => {}
             Some("raise_deleted_name") if call.args.len() == 1 => {}
             _ => return None,
         }

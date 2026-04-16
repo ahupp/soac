@@ -3,7 +3,7 @@ use crate::block_py::{
     HasSemanticInstrId, InstrCodegen, InstrId, InstrKey, Visit, VisitMut, WithMeta,
 };
 use crate::passes::{CodegenModuleShape, CodegenUnidentifiedModuleShape};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 struct BlockInstrIdAssigner {
     block_label: BlockLabel,
@@ -53,6 +53,99 @@ pub fn reassign_codegen_function_instr_ids(function: &mut BlockPyFunction<Codege
         let mut assigner = BlockInstrIdAssigner {
             block_label: block.label,
             next_instr_index_in_block: 0,
+        };
+        assigner.visit_block_mut(block);
+    }
+}
+
+struct MissingBlockInstrIdAssigner<'a> {
+    block_label: BlockLabel,
+    next_instr_index_in_block: u32,
+    used: &'a mut HashSet<InstrId>,
+}
+
+impl MissingBlockInstrIdAssigner<'_> {
+    fn assign<I>(&mut self, expr: &mut I)
+    where
+        I: crate::block_py::Instr + ChildVisitable<I> + HasMeta + WithMeta + Clone,
+    {
+        if expr.try_semantic_instr_id().is_some() {
+            return;
+        }
+        while self.used.contains(&InstrId::new(
+            self.block_label,
+            self.next_instr_index_in_block,
+        )) {
+            self.next_instr_index_in_block = self
+                .next_instr_index_in_block
+                .checked_add(1)
+                .expect("per-block instruction count should fit in u32");
+        }
+        let mut meta = expr.meta();
+        let instr_id = InstrId::new(self.block_label, self.next_instr_index_in_block);
+        meta.instr_id = Some(instr_id);
+        self.used.insert(instr_id);
+        self.next_instr_index_in_block = self
+            .next_instr_index_in_block
+            .checked_add(1)
+            .expect("per-block instruction count should fit in u32");
+        *expr = expr.clone().with_meta(meta);
+    }
+}
+
+impl VisitMut<InstrCodegen> for MissingBlockInstrIdAssigner<'_> {
+    fn visit_instr_mut(&mut self, expr: &mut InstrCodegen)
+    where
+        InstrCodegen: ChildVisitable<InstrCodegen>,
+    {
+        self.assign(expr);
+        walk_expr_mut(self, expr);
+    }
+}
+
+pub fn assign_missing_codegen_function_instr_ids(
+    function: &mut BlockPyFunction<CodegenModuleShape>,
+) {
+    let mut next_by_block = HashMap::new();
+    let mut used = HashSet::new();
+    {
+        struct MaxIdCollector<'a> {
+            next_by_block: &'a mut HashMap<BlockLabel, u32>,
+            used: &'a mut HashSet<InstrId>,
+        }
+
+        impl Visit<InstrCodegen> for MaxIdCollector<'_> {
+            fn visit_instr(&mut self, expr: &InstrCodegen)
+            where
+                InstrCodegen: ChildVisitable<InstrCodegen>,
+            {
+                if let Some(instr_id) = expr.try_semantic_instr_id() {
+                    self.used.insert(instr_id);
+                    let next = instr_id
+                        .instr_index_in_block()
+                        .checked_add(1)
+                        .expect("per-block instruction count should fit in u32");
+                    self.next_by_block
+                        .entry(instr_id.block_label())
+                        .and_modify(|current| *current = (*current).max(next))
+                        .or_insert(next);
+                }
+                crate::block_py::walk_expr(self, expr);
+            }
+        }
+
+        let mut collector = MaxIdCollector {
+            next_by_block: &mut next_by_block,
+            used: &mut used,
+        };
+        collector.visit_fn(function);
+    }
+
+    for block in &mut function.blocks {
+        let mut assigner = MissingBlockInstrIdAssigner {
+            block_label: block.label,
+            next_instr_index_in_block: next_by_block.remove(&block.label).unwrap_or(0),
+            used: &mut used,
         };
         assigner.visit_block_mut(block);
     }

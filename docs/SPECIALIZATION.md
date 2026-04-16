@@ -256,6 +256,13 @@ apply/verify mode:
 
 - Constant-string `GetAttr` sites with a recorded key index get a
   guard on exact owner type and owner type version.
+- After codegen-to-typed lowering, these sites are represented as
+  `GetAttrTyped` / `SetAttrTyped` operations annotated with a profiled
+  indexed-field access plan. The typed plan carries the selected
+  owner/type-version/index guard chain so codegen consumes the explicit
+  plan instead of reselecting guards from the raw counter tables.
+  Generic typed attribute operations still lower directly to normal
+  CPython attribute access.
 - After that guard, the inlineable local-runtime helper checks the
   currently attached split dict, or the object's CPython inline-values
   block when no dict has been materialized, for the expected key at the
@@ -302,6 +309,30 @@ apply/verify mode:
 
 ## Direct Function Calls
 
+Before typed JIT emission, legacy `Call` nodes lower to `TypedCall` nodes. In
+apply/verify mode, call-target profile replay annotates each eligible
+`TypedCall` with a `TypedCallAccessPlan`. Compatible profiled targets become
+guarded ordinary-call, constructor-call, or method-call plans with the selected
+`FunctionId`, owner/type-version guard when needed, and direct-entry argument
+plan. A typed lowering pass turns guarded ordinary/constructor calls into
+`InstrTyped::GuardedCallableCallTyped` and guarded methods into
+`InstrTyped::GuardedMethodCallTyped`. The typed IR also has
+`InstrTyped::DirectCallGuardTest` for exact callee-function-id checks and
+owner/type-version checks, `InstrTyped::DirectCallableCallTyped` for direct
+ordinary-function and constructor-call arms, and
+`InstrTyped::DirectMethodCallTyped` for the direct arm of a method
+specialization where the receiver has already passed the owner/type-version
+guard. These are the explicit primitives that the next CFG rewrite will use
+when expanding guarded calls into guard/deopt plus direct-call arms.
+Incompatible call shapes keep the raw profiled target list instead. This
+keeps the guard selection visible in the typed value space rather than requiring
+codegen-only map lookups to rediscover it. The call-access annotator derives
+method names and simple call shapes from `InstrTyped` directly; legacy lowering
+is reserved for the later mechanical emission path. Result-demand planning runs
+after this typed call-access lowering so it sees the guarded-call/direct-call
+typed nodes, not only generic calls. The JIT emitter still materializes the
+full guarded call blocks today.
+
 ### Counted Input
 
 - Source input is `call_hot_targets`.
@@ -336,14 +367,59 @@ apply/verify mode:
   guard.
 - On miss it falls back to normal Python vectorcall lowering.
 
+### Explicit CFG Representation
+
+- The BlockPy codegen IR has a first-class `DirectFunctionIdGuardTest`
+  expression. It evaluates a callable once, compares the callable's SOAC
+  `FunctionId` metadata against a profiled target, and produces a boolean value
+  for an ordinary `IfTerm`.
+- `rewrite_profiled_function_call_store_sites`, at
+  `soac-blockpy/src/passes/direct_call_transform.rs`, rewrites simple
+  `Store(name, Call(...))` sites into explicit BlockPy CFG:
+  - evaluate the callable into one generated compiler temp
+  - evaluate each positional argument once, left-to-right, into generated
+    compiler temps before the guard
+  - test each hot `FunctionId` with `DirectFunctionIdGuardTest`
+  - emit a hot arm that stores `CallDirect(temp, target, temp_args)` into the
+    original destination
+  - emit a fallback arm that stores the original generic `Call(temp, temp_args)`
+    result into the original destination
+  - delete the compiler temps before joining the continuation block
+- The rewrite only consumes profiled targets that match the ordinary direct-call
+  / BlockPy inliner shape: positional-only-or-normal parameters, no keywords,
+  no starred args, and positional inputs that can bind through the direct-entry
+  argument plan. Omitted trailing/defaulted parameters are passed as default
+  sentinels and resolved by the callee's default-resolving direct entry.
+  Method and constructor-shaped targets, including `__init__`, are left as
+  generic calls here so the typed method/constructor specialization path can
+  still handle them.
+- In apply/verify mode with an existing profile dump, JIT module planning clones
+  the lowered codegen module, applies this rewrite, runs the normal BlockPy
+  direct-call inliner / scalar-replacement cleanup on the rewritten CFG, then
+  recomputes value facts, LocalEnv planning, refcount ownership, and deopt
+  resume planning from the rewritten module. Codegen and runtime deopt tables
+  therefore see the same CFG.
+- JIT codegen has a direct boolean lowering for `IfTerm` tests that are
+  `DirectFunctionIdGuardTest`, so the guard does not round-trip through Python
+  truthiness. The deopt interpreter also supports the guard expression for
+  continuation paths.
+- This representation is intended to make profiled direct calls visible before
+  BlockPy inlining and scalar replacement, rather than hiding the guard/direct
+  call decision inside late codegen.
+
 ### Limitations / Soundness / Extensions
 
 - Current limitations:
   - keywords are excluded
   - starred / unpacked args are excluded
+  - bound method and constructor targets are excluded here and remain handled by
+    typed call specialization
   - variadic target params are excluded
   - required keyword-only target params are excluded unless they have a
     default value
+  - `__init__` targets are excluded from the ordinary function-call rewrite;
+    constructor specialization owns class-call semantics because the `self`
+    object must come from the guarded constructor allocation path
 - Soundness boundary:
   - this is sound as long as the `FunctionId` metadata attached to
     transformed Python functions stays correct
@@ -362,12 +438,94 @@ apply/verify mode:
 - Source input is also `call_hot_targets`.
 - This specialization is only considered when the call target is a
   `GetAttr`, in `direct_method_specializations_for_call_site`, at
-  `soac-jit/src/jit/mod.rs:2722`.
+  `soac-jit/src/jit/call_specialization.rs`.
 - The profiled hot target is still the method function's `FunctionId`.
 - The specialization then refines that with owner-type metadata from
+  either predeclared owner-attribute specializations or
   `lookup_exact_owner_types_for_method`, called from
-  `direct_method_specializations_for_call_site`, at
-  `soac-jit/src/jit/mod.rs:2766`.
+  `direct_method_specializations_for_call_site`.
+- The selected method fast path is first represented in the typed call as
+  `TypedCallAccessPlan::GuardedMethod`, including the target `FunctionId`,
+  method name, owner/type-version guard, and direct-entry argument plan. A
+  follow-up typed lowering pass then turns that call into
+  `InstrTyped::GuardedMethodCallTyped`, so later BlockPy/JIT stages can see an
+  explicit guarded-method operation rather than rediscovering it in codegen.
+  This is intentionally available without a live Python resolver when profile
+  replay supplies predeclared owner-attribute metadata.
+- Runtime protocol calls can also select a guarded method fast path when the
+  protocol call's receiver is itself a profiled constructor result. The first
+  supported case is `iter(receiver)`: profile replay uses the constructor
+  target plus owner/type-version metadata to derive the receiver owner's
+  transformed `__iter__` method, and records that as
+  `TypedCallAccessPlan::GuardedRuntimeProtocolMethod`. The generic fallback
+  remains the original runtime `iter(receiver)` call.
+- Direct call guard predicates are representable as
+  `InstrTyped::DirectCallGuardTest`. They currently emit the same exact
+  function-id and owner/type-version tests used by the guarded-call JIT path,
+  and are intended to become the branch conditions in the explicit CFG
+  expansion.
+- Direct method fast paths are representable as
+  `InstrTyped::DirectMethodCallTyped`. They carry the selected `FunctionId`,
+  method name, owner/type-version identity, receiver expression, explicit args,
+  and direct-entry argument plan. The current JIT can emit this node directly.
+- Direct ordinary-function and constructor fast paths are representable as
+  `InstrTyped::DirectCallableCallTyped`. They carry the callable expression,
+  explicit positional args, and either a selected function guard or a selected
+  constructor owner/type-version guard. The current JIT can emit this node
+  directly; the next step is to have guarded-call expansion create it in the
+  guarded success arm.
+- Typed call access plans are validated before specialized JIT emission, and
+  typed calls use the selected plan as the source of truth. If annotation leaves
+  a typed call as generic/profiled-only, codegen does not rediscover a guarded
+  direct-call shape behind the typed representation.
+
+### Explicit CFG Representation
+
+- The BlockPy codegen IR has a first-class
+  `DirectReceiverTypeVersionGuardTest` expression. It evaluates a receiver
+  once, compares the receiver's exact type and the type's version tag against
+  a selected owner-method specialization, and produces a boolean value for an
+  ordinary `IfTerm`.
+- `rewrite_profiled_no_arg_method_call_store_sites`, at
+  `soac-jit/src/jit/mod.rs`, rewrites simple `Store(name,
+  Call(GetAttr(receiver, "method"), []))` sites when profile replay identifies
+  a transformed method target. It prefers owner/type-version metadata when
+  present, and can fall back to guarding the bound method's transformed
+  function id when owner metadata is not available:
+  - evaluate the receiver once into a generated compiler temp
+  - test each selected owner/type-version with
+    `DirectReceiverTypeVersionGuardTest`
+  - or load the bound method once and test the method callable with
+    `DirectFunctionIdGuardTest`
+  - emit a hot arm that inlines the selected method body with the temp receiver
+    as `self`
+  - emit a fallback arm that performs the original attribute lookup and generic
+    call through the same temp receiver
+  - delete generated receiver/callable temps before joining the continuation
+    block
+- The same planning pass also recognizes `Store(name, iter(constructor(...)))`
+  when the constructor call has a profiled transformed target. It evaluates the
+  constructor once into a generated receiver temp, guards the constructed
+  object's exact owner type/version, inlines the selected `__iter__` method on
+  the hot arm, and keeps the original `iter(receiver_temp)` expression as the
+  fallback arm. Synthetic `CallDirect` receiver expressions are only emitted
+  when the constructor is already proven by the inline plan to be a
+  straight-line field initializer; non-straight-line constructors stay as
+  ordinary constructor calls so the constructor-specialization path owns
+  allocation and `self` binding. This is intentionally a runtime-protocol
+  rewrite rather than a range-specific optimization.
+- If the rewritten method call sits in a synthetic `for`-loop fetch block with a
+  `StopIteration` handler, inlined exact `raise StopIteration` terms are
+  rewritten to jump directly to the loop-exit arm. The recognizer looks through
+  copied module-constant loads so cross-module inlining of runtime helpers keeps
+  the same shape.
+- In apply/verify mode with an existing profile dump, JIT module planning
+  applies this no-arg method rewrite before ordinary direct-call inlining,
+  scalar replacement, value-fact inference, LocalEnv planning, refcount
+  ownership planning, and deopt-resume planning. Codegen and runtime deopt
+  tables therefore see the same rewritten CFG.
+- The deopt interpreter also supports `DirectReceiverTypeVersionGuardTest`, so
+  continuation paths can execute the same explicit guard expression.
 
 ### Codegen
 
@@ -387,13 +545,25 @@ apply/verify mode:
 
 - Current limitations:
   - only constant-string `GetAttr` call targets
+  - runtime protocol method CFG rewriting currently only supports
+    `iter(constructor(...)) -> receiver.__iter__()`
+  - runtime protocol receiver `CallDirect` synthesis is limited to constructors
+    with straight-line inline-plan summaries
   - no keywords or starred / unpacked args
+  - the pre-codegen CFG rewrite is currently limited to no-argument method
+    calls and recognized runtime protocol calls stored directly into a local
   - explicit args plus the implicit receiver must bind to the target's
     direct-entry parameter slots
-  - only methods backed by transformed Python functions with registered
-    owner-type metadata
+  - only methods backed by transformed Python functions available through the
+    current compile session
+  - guarded calls, direct callable calls, direct method calls, and guard tests
+    now have explicit typed instructions; the no-arg method-store case also has
+    an explicit CFG rewrite, while broader guarded-call CFG expansion is still
+    pending
 - Soundness boundary:
   - relies on exact owner type and type-version guards
+  - or on the bound method object still resolving to the same transformed
+    function id before taking the callable-identity inline arm
   - if owner-type invalidation misses a real semantic mutation, this
     path could become unsound
 - Natural extensions:
@@ -443,6 +613,32 @@ apply/verify mode:
   - finalizes direct `__init__` calls through
     `dp_jit_finish_constructor_init`, which enforces `__init__`
     returning `None`
+- Before JIT codegen, `scalar_replace_non_escaping_constructor_allocations`
+  can remove a local constructor allocation entirely when escape analysis
+  proves the object is used only for field reads/writes in the same block or a
+  straight-line chain of no-arg jumps through single-predecessor, no-param
+  successor blocks. The pass initializes one compiler local per constructor
+  argument in original call-argument order, initializes one compiler local per
+  constructor field from those argument locals, rewrites matching
+  `GetAttr`/`SetAttr` roots to local loads/stores, tracks plain local aliases
+  for the scalarized object, and can clone a bounded alias-dependent CFG suffix
+  when the allocation path shares successor blocks with non-allocation paths.
+  It still rejects objects whose aliases cannot be proven to dominate all
+  active uses.
+- Before JIT codegen, `inline_direct_call_stores_with_callees` can also inline
+  small `CallDirect` store sites, not just constructor initializers. The
+  conservative subset requires positional-only/ordinary parameters, exact arity,
+  no keywords or starred arguments, no callee block params, no callee exception
+  edges, and at most sixteen callee blocks. Cross-module callees are allowed
+  when the caller can carry a planned-module constant table: callee constants
+  are copied into the caller module, runtime globals are rewritten to
+  `RuntimeName`, and the process JIT installs a separate constant-object
+  binding for the planned module so generated code and deopt continuations see
+  the remapped slots. Return blocks store into the original caller target and
+  jump to the continuation; explicit raise blocks inherit the caller exception
+  edge. This is the BlockPy-level building block for later converting inlined
+  `raise StopIteration` inside synthetic loop fetch regions into direct
+  loop-exit jumps.
 - Helper entrypoints are:
   - `pytype_generic_alloc_hook`, at
     `soac-jit/src/jit/specialized_helpers.rs:107`
@@ -465,6 +661,11 @@ apply/verify mode:
     stores
   - initializer indexed stores are limited to field names that also
     have type-key layout profile input for the exact guarded owner type
+  - scalar replacement currently covers only non-escaping constructor
+    results whose uses stay in the allocation block or a bounded
+    alias-dependent CFG suffix, constructor fields initialized directly from
+    positional parameters, and plain local aliases whose definitions dominate
+    their active uses
 - Soundness boundary:
   - this path is intentionally restricted to types where the default
     `type.__call__` shape can be reproduced safely enough:

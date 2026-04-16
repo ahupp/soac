@@ -37,24 +37,39 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch};
 use cranelift_jit::{ArenaMemoryProvider, JITBuilder, JITModule};
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module, ModuleReloc};
 use cranelift_reader::parse_functions;
-use pyo3::ffi;
+use pyo3::{Py, PyAny, Python, ffi};
 use soac_blockpy::block_py::{
-    AbruptKind, BlockArg, BlockEdge, BlockLabel, BlockParamRole, BlockPyFunction, BlockPyModule,
-    BlockTerm, CallArgKeyword, CallArgPositional, CallableScopeKind, CellLocation, ChildVisitable,
-    CodegenBlock, CounterDef, CounterId, CounterScope, CounterSite, Del, DeoptEntrySource,
-    FunctionExecutionMode, FunctionId, FunctionKind, HasMeta, HasSemanticInstrId, InstrCodegen,
-    InstrId, InstrKey, Literal, LocalLocation, NameLocation, ParamKind, ResolvedName, RuntimeName,
-    StorageLayout, Store, Visit, WithMeta, operation as blockpy_intrinsics,
+    AbruptKind, Block, BlockArg, BlockEdge, BlockLabel, BlockParamRole, BlockPyFunction,
+    BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional, CallDirect,
+    CallableScopeKind, CellLocation, ChildVisitable, CodegenBlock, CounterDef, CounterId,
+    CounterScope, CounterSite, Del, DeoptEntrySource, FunctionExecutionMode, FunctionId,
+    FunctionKind, GetAttr, HasMeta, HasSemanticInstrId, InstrCodegen, InstrId, InstrKey, Literal,
+    Load, LocalLocation, Meta, NameLocation, ParamKind, ResolvedName, RuntimeName, StorageLayout,
+    Store, Visit, VisitMut, WithMeta, operation as blockpy_intrinsics,
 };
 use soac_blockpy::passes::{
-    CodegenModuleShape, ConstructorFieldValue, FactStore, FunctionRefcountPlan, InlinePlanModule,
-    InstrResolved, InstrTyped, LocalEnvResumeBinding, LocalEnvResumeBindingState,
+    CodegenModuleShape, ConstructorFieldValue, DirectFunctionIdGuardTest,
+    DirectReceiverTypeVersionGuardTest, FactStore, FunctionRefcountPlan, InlineCallee,
+    InlinePlanModule, InstrResolved, InstrTyped, LocalEnvResumeBinding, LocalEnvResumeBindingState,
     LocalEnvResumePoint, LocalEnvResumeStatePrecision, LocalEnvResumeValueSource, LocalRefState,
     PyExactType, PyObjFacts, RefcountActionKind, RefcountReleaseReason, RefcountSite,
-    RuntimeHelperId, TypedCodegenModuleShape, ValueFacts, infer_module_value_facts,
-    lower_codegen_function_to_typed, lower_typed_function_if_tests_to_truthy, plan_module_inlining,
-    summarize_module_escapes, try_lower_typed_instr_to_codegen_legacy,
-    try_lower_typed_term_to_codegen_legacy,
+    RuntimeHelperId, TypedAttrAccessPlan, TypedAttrOwnerRef, TypedCall, TypedCallAccessPlan,
+    TypedCodegenModuleShape, TypedDirectCallArgPlan, TypedDirectCallArgSource,
+    TypedDirectCallGuardTest, TypedDirectCallGuardTestKind, TypedDirectCallableCall,
+    TypedDirectCallableCallGuard, TypedDirectConstructorCallGuard, TypedDirectFunctionCallGuard,
+    TypedDirectMethodCall, TypedDirectMethodCallGuard, TypedGetAttr, TypedGuardedCallableCall,
+    TypedGuardedMethodCall, TypedIndexedFieldGuard, TypedSetAttr, ValueFacts,
+    assign_missing_codegen_function_instr_ids,
+    build_cross_module_direct_method_inline_fragment_to_target,
+    build_direct_method_inline_fragment_to_target, infer_module_value_facts,
+    inline_direct_call_stores_with_callees, lower_codegen_function_to_typed,
+    lower_typed_function_call_access_plan_instrs, lower_typed_function_if_tests_to_truthy,
+    plan_module_inlining, rewrite_profiled_function_call_store_sites,
+    rewrite_static_runtime_constructor_call_stores,
+    scalar_replace_non_escaping_constructor_allocations,
+    straightline_field_initializer_rejection_reason, summarize_module_escapes,
+    try_lower_typed_instr_to_codegen_legacy, try_lower_typed_term_to_codegen_legacy,
+    validate_codegen_instr_ids, validate_typed_function_call_access_plans,
 };
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -92,6 +107,7 @@ pub(crate) use deopt_interpreter::{
     BlockPyEntryRuntimeContext, run_blockpy_function_from_entry,
     run_blockpy_function_from_vectorcall_entry,
 };
+mod call_specialization;
 mod direct_abi;
 mod intrinsics;
 mod jitdump;
@@ -103,6 +119,10 @@ mod signal_diagnostics;
 mod specialized_helpers;
 mod typed_value;
 
+use call_specialization::{
+    CallSpecializationCtx, annotate_typed_call_accesses, collect_runtime_protocol_method_targets,
+    direct_constructor_owner_attr_specializations_from_source,
+};
 use direct_abi::{
     ArgOwnership, DirectCallableDesc, DirectEntry, DirectTargetId, ErrorAbi, HiddenArgAbi,
     ParamAbi, PyLongI64Coercion, ResultAbi,
@@ -190,6 +210,17 @@ fn cpython_type_symbol_name(symbol: CpythonTypeSymbol) -> &'static str {
         CpythonTypeSymbol::Type => "PyType_Type",
         CpythonTypeSymbol::Long => "PyLong_Type",
         CpythonTypeSymbol::List => "PyList_Type",
+    }
+}
+
+fn cpython_type_symbol_from_name(name: &str) -> Option<CpythonTypeSymbol> {
+    match name {
+        "PyFunction_Type" => Some(CpythonTypeSymbol::Function),
+        "PyMethod_Type" => Some(CpythonTypeSymbol::Method),
+        "PyType_Type" => Some(CpythonTypeSymbol::Type),
+        "PyLong_Type" => Some(CpythonTypeSymbol::Long),
+        "PyList_Type" => Some(CpythonTypeSymbol::List),
+        _ => None,
     }
 }
 
@@ -1034,6 +1065,11 @@ static DP_JIT_VECTORCALL_COMPILE_FUNCTION_ENV_IMPORT: ImportSpec = ImportSpec::n
     &[SigType::Pointer, SigType::Pointer],
     &[SigType::Pointer],
 );
+static DP_JIT_DIRECT_COMPILE_FUNCTION_ENV_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_direct_compile_function_env",
+    &[SigType::Pointer, SigType::Pointer],
+    &[SigType::Pointer],
+);
 static SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_IMPORT: ImportSpec = ImportSpec::new(
     SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_SYMBOL,
     &[
@@ -1098,6 +1134,7 @@ static JIT_RUNTIME_IMPORT_SPECS: &[&ImportSpec] = &[
     &DP_JIT_DEOPT_RESUME_IMPORT,
     &DP_JIT_VECTORCALL_BIND_DIRECT_ARGS_IMPORT,
     &DP_JIT_VECTORCALL_COMPILE_FUNCTION_ENV_IMPORT,
+    &DP_JIT_DIRECT_COMPILE_FUNCTION_ENV_IMPORT,
     &SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_IMPORT,
 ];
 
@@ -1299,11 +1336,17 @@ fn predeclare_direct_call_owner_type_imports(
 
     let call_sites =
         collect_profiled_direct_call_sites(module, function, &call_target_specializations);
+    let mut constructor_owner_lookups = 0usize;
+    let mut constructor_owner_matches = 0usize;
+    let mut method_owner_lookups = 0usize;
+    let mut method_owner_matches = 0usize;
     for call_site in call_sites {
         for function_id in call_site.targets.iter().copied() {
+            constructor_owner_lookups += 1;
             if let Ok(owner_types) =
                 unsafe { crate::lookup_exact_owner_types_for_constructor(function_id) }
             {
+                constructor_owner_matches += owner_types.len();
                 for owner in owner_types {
                     let Some(owner_type_ref) = reloc_type_ref_for_type(owner.owner_type)? else {
                         continue;
@@ -1317,10 +1360,14 @@ fn predeclare_direct_call_owner_type_imports(
                         });
                 }
             }
-            if let Some(method_name) = call_site.method_name.as_deref()
-                && let Ok(owner_types) =
-                    unsafe { crate::lookup_exact_owner_types_for_method(function_id, method_name) }
-            {
+            if let Some(method_name) = call_site.method_name.as_deref() {
+                method_owner_lookups += 1;
+                let Ok(owner_types) = (unsafe {
+                    crate::lookup_exact_owner_types_for_method(function_id, method_name)
+                }) else {
+                    continue;
+                };
+                method_owner_matches += owner_types.len();
                 for owner in owner_types {
                     let Some(owner_type_ref) = reloc_type_ref_for_type(owner.owner_type)? else {
                         continue;
@@ -1335,6 +1382,19 @@ fn predeclare_direct_call_owner_type_imports(
                 }
             }
         }
+    }
+    if constructor_owner_lookups != 0 || method_owner_lookups != 0 {
+        info!(
+            target: "soac_jit_owner_attr_predeclare",
+            module_id = module.module_name_gen.module_id(),
+            function_id = %function.function_id,
+            qualname = %function.names.qualname,
+            constructor_owner_lookups,
+            constructor_owner_matches,
+            method_owner_lookups,
+            method_owner_matches,
+            "soac_jit_owner_attr_predeclare"
+        );
     }
     Ok(out)
 }
@@ -1453,6 +1513,7 @@ unsafe impl<'a> Sync for DirectFunctionCompileInputs<'a> {}
 
 struct ReservedJitFunctionCompileInputs {
     module_constant_ptrs: Vec<*mut ffi::PyObject>,
+    module_constant_owners: Option<Arc<Vec<Py<PyAny>>>>,
     counter_slots_by_id: Vec<CounterRuntimeSlot>,
     module_constant_object_data_ids: Vec<DataId>,
     scalar_counter_data_id: Option<DataId>,
@@ -1611,7 +1672,31 @@ impl JitBatchPlan<'_> {
                 continue;
             }
             let module_plan = if let Some(shared_state) = batch_function.source.shared_state() {
-                shared_state.jit_module_plan()?
+                let profile = SpecializationProfile::from_runtime_state(Some(shared_state))?;
+                if profile.has_existing_counter_dump() {
+                    let direct_owner_attr_specializations_by_function = self
+                        .function_compile_inputs
+                        .iter()
+                        .filter_map(|(index, reserved_inputs)| {
+                            (reserved_inputs.module_constant_binding_key == binding_key
+                                && !reserved_inputs.direct_owner_attr_specializations.is_empty())
+                            .then(|| {
+                                (
+                                    self.batch_functions[*index].function.function_id,
+                                    reserved_inputs.direct_owner_attr_specializations.clone(),
+                                )
+                            })
+                        })
+                        .collect::<HashMap<_, _>>();
+                    build_profiled_jit_module_plan(
+                        &shared_state.lowered_module,
+                        &profile,
+                        Some(inputs.session.as_ref()),
+                        &direct_owner_attr_specializations_by_function,
+                    )?
+                } else {
+                    shared_state.jit_module_plan()?
+                }
             } else {
                 build_jit_module_plan(inputs.module)?
             };
@@ -1619,25 +1704,1591 @@ impl JitBatchPlan<'_> {
         }
         Ok(())
     }
+
+    fn refresh_planned_module_constant_bindings(
+        &mut self,
+        state: &mut ProcessJitState,
+        jit_module: &mut JITModule,
+    ) -> Result<(), String> {
+        let mut refreshed = HashMap::new();
+        for batch_function_index in &self.function_indices_to_define {
+            let batch_function = &self.batch_functions[*batch_function_index];
+            let Some(shared_state) = batch_function.source.shared_state() else {
+                continue;
+            };
+            let binding_key = self
+                .function_compile_inputs
+                .get(batch_function_index)
+                .expect("reserved JIT batch function should have compile inputs")
+                .module_constant_binding_key;
+            if refreshed.contains_key(&binding_key) {
+                continue;
+            }
+            let module_plan = self
+                .module_plans
+                .get(&binding_key)
+                .expect("JIT module plan should be precomputed before refreshing constants");
+            let planned_module = module_plan.module.as_ref();
+            let codegen_constants = collect_codegen_constants_for_module_name(
+                shared_state.module_name.as_str(),
+                planned_module,
+            );
+            let owners = Python::attach(|py| {
+                crate::module_type::build_module_constant_objects(
+                    py,
+                    &codegen_constants,
+                    shared_state.module_name.as_str(),
+                    shared_state.source_hash(),
+                )
+                .map_err(|err| err.to_string())
+            })?;
+            let ptrs = owners.iter().map(|obj| obj.as_ptr()).collect::<Vec<_>>();
+            let owners = Arc::new(owners);
+            let object_binding_key =
+                planned_module as *const BlockPyModule<CodegenModuleShape> as usize;
+            let symbol_prefix =
+                module_constant_symbol_prefix_for_instance(planned_module, object_binding_key);
+            let data_ids = state.ensure_module_constant_objects(
+                jit_module,
+                ptrs.as_slice(),
+                object_binding_key,
+                symbol_prefix.as_str(),
+            )?;
+            refreshed.insert(binding_key, (ptrs, owners, data_ids));
+        }
+
+        for reserved_inputs in self.function_compile_inputs.values_mut() {
+            let Some((ptrs, owners, data_ids)) =
+                refreshed.get(&reserved_inputs.module_constant_binding_key)
+            else {
+                continue;
+            };
+            reserved_inputs.module_constant_ptrs = ptrs.clone();
+            reserved_inputs.module_constant_owners = Some(Arc::clone(owners));
+            reserved_inputs.module_constant_object_data_ids = data_ids.clone();
+        }
+        Ok(())
+    }
 }
 
 pub(crate) struct JitModulePlan {
+    module: Arc<BlockPyModule<CodegenModuleShape>>,
     value_facts: FactStore,
     locals: PlannedJitModuleLocals,
     deopt_resume: PlannedJitDeoptResumeModule,
 }
 
-fn build_jit_module_plan(
+fn collect_codegen_constants_for_module_name(
+    module_name: &str,
     module: &BlockPyModule<CodegenModuleShape>,
+) -> ModuleCodegenConstants {
+    if module_name == "soac.runtime" {
+        ModuleCodegenConstants::collect_from_runtime_module(module)
+    } else {
+        ModuleCodegenConstants::collect_from_module(module)
+    }
+}
+
+fn build_jit_module_plan_from_owned_module(
+    module: BlockPyModule<CodegenModuleShape>,
 ) -> Result<Arc<JitModulePlan>, String> {
-    let value_facts = infer_jit_value_facts(module);
-    let locals = plan_jit_module_locals(module, &value_facts)?;
-    let deopt_resume = plan_jit_deopt_resume_module(module, &value_facts)?;
+    let value_facts = infer_jit_value_facts(&module);
+    let locals = plan_jit_module_locals(&module, &value_facts)?;
+    let deopt_resume = plan_jit_deopt_resume_module(&module, &value_facts)?;
     Ok(Arc::new(JitModulePlan {
+        module: Arc::new(module),
         value_facts,
         locals,
         deopt_resume,
     }))
+}
+
+fn build_jit_module_plan(
+    module: &BlockPyModule<CodegenModuleShape>,
+) -> Result<Arc<JitModulePlan>, String> {
+    build_jit_module_plan_from_owned_module(module.clone())
+}
+
+fn build_profiled_jit_module_plan(
+    module: &BlockPyModule<CodegenModuleShape>,
+    profile: &SpecializationProfile<'_>,
+    compile_session: Option<&crate::session::CompileSession>,
+    direct_owner_attr_specializations_by_function: &HashMap<
+        FunctionId,
+        HashMap<DirectOwnerAttrKey, Vec<DirectOwnerAttrSpecialization>>,
+    >,
+) -> Result<Arc<JitModulePlan>, String> {
+    let mut planned_module = module.clone();
+    let (callees, inline_callees, mut external_inline_plan) = build_profiled_inline_callee_maps(
+        &planned_module,
+        profile,
+        compile_session,
+        direct_owner_attr_specializations_by_function,
+    )?;
+    let mut straightline_constructor_ids = straightline_constructor_ids_in_plan(
+        &plan_module_inlining(&summarize_module_escapes(&planned_module)),
+    );
+    straightline_constructor_ids
+        .extend(straightline_constructor_ids_in_plan(&external_inline_plan));
+    let mut rewritten_store_count = 0usize;
+    let mut runtime_constructor_function_ids = HashSet::new();
+    let module_constants = &mut planned_module.module_constants;
+    let empty_direct_owner_attr_specializations = HashMap::new();
+    let planned_module_id = planned_module.module_name_gen.module_id();
+    for function in &mut planned_module.callable_defs {
+        let call_target_specializations =
+            profile.call_target_specializations(function.function_id)?;
+        if call_target_specializations.is_empty() {
+            continue;
+        }
+        let direct_owner_attr_specializations = direct_owner_attr_specializations_by_function
+            .get(&function.function_id)
+            .unwrap_or(&empty_direct_owner_attr_specializations);
+        let stats = rewrite_profiled_no_arg_method_call_store_sites(
+            function,
+            module_constants,
+            &call_target_specializations,
+            direct_owner_attr_specializations,
+            &inline_callees,
+            &straightline_constructor_ids,
+            &mut runtime_constructor_function_ids,
+        );
+        if stats.total_attempts() != 0 {
+            info!(
+                target: "soac_jit_profiled_method_inline",
+                module_id = planned_module_id,
+                function_id = %function.function_id,
+                qualname = %function.names.qualname,
+                candidate_stores = stats.candidate_stores,
+                missing_callee_targets = stats.missing_callee_targets,
+                missing_owner_guard_targets = stats.missing_owner_guard_targets,
+                owner_fragment_unsupported_targets = stats.owner_fragment_unsupported_targets,
+                callable_fragment_unsupported_targets = stats.callable_fragment_unsupported_targets,
+                stop_iteration_candidate_exc_edges = stats.stop_iteration_candidate_exc_edges,
+                stop_iteration_current_exception_edges = stats.stop_iteration_current_exception_edges,
+                stop_iteration_handler_blocks = stats.stop_iteration_handler_blocks,
+                stop_iteration_handler_if_terms = stats.stop_iteration_handler_if_terms,
+                stop_iteration_handler_test_matches = stats.stop_iteration_handler_test_matches,
+                stop_iteration_handler_targets = stats.stop_iteration_handler_targets,
+                stop_iteration_raises_rewritten = stats.stop_iteration_raises_rewritten,
+                static_runtime_constructor_calls_rewritten =
+                    stats.static_runtime_constructor_calls_rewritten,
+                rewritten_stores = stats.rewritten_stores,
+                "soac_jit_profiled_method_inline"
+            );
+        }
+        rewritten_store_count += stats.rewritten_stores;
+        let stats = rewrite_profiled_function_call_store_sites(
+            function,
+            &call_target_specializations,
+            &callees,
+        );
+        if stats.rewritten_stores != 0
+            || stats.skipped_empty_targets != 0
+            || stats.skipped_incompatible_targets != 0
+        {
+            info!(
+                target: "soac_jit_profiled_direct_call_rewrite",
+                module_id = planned_module_id,
+                function_id = %function.function_id,
+                qualname = %function.names.qualname,
+                rewritten_stores = stats.rewritten_stores,
+                skipped_empty_targets = stats.skipped_empty_targets,
+                skipped_incompatible_targets = stats.skipped_incompatible_targets,
+                skipped_missing_callee_targets = stats.skipped_missing_callee_targets,
+                skipped_arity_mismatch_targets = stats.skipped_arity_mismatch_targets,
+                skipped_unsupported_init_targets = stats.skipped_unsupported_init_targets,
+                skipped_missing_storage_layout_targets = stats.skipped_missing_storage_layout_targets,
+                skipped_unsupported_param_kind_targets =
+                    stats.skipped_unsupported_param_kind_targets,
+                skipped_missing_param_storage_targets = stats.skipped_missing_param_storage_targets,
+                "soac_jit_profiled_direct_call_rewrite"
+            );
+        }
+        rewritten_store_count += stats.rewritten_stores;
+    }
+    if rewritten_store_count != 0 {
+        validate_codegen_instr_ids(&planned_module)
+            .map_err(|err| format!("profiled direct-call rewrite validation failed: {err}"))?;
+        extend_external_inline_plan_for_function_ids(
+            &mut external_inline_plan,
+            &runtime_constructor_function_ids,
+            compile_session,
+        )?;
+        let mut inline_plan = plan_jit_inlining(&planned_module);
+        inline_plan
+            .functions
+            .extend(external_inline_plan.functions.clone());
+        let runtime_constructor_inline_plan_hits = runtime_constructor_function_ids
+            .iter()
+            .filter(|function_id| {
+                inline_plan
+                    .straightline_constructor(**function_id)
+                    .is_some()
+            })
+            .count();
+        let inline_stats = inline_direct_call_stores_with_callees(
+            &mut planned_module,
+            &inline_plan,
+            &inline_callees,
+        );
+        let scalar_replacement_stats =
+            scalar_replace_non_escaping_constructor_allocations(&mut planned_module, &inline_plan);
+        if inline_stats.rewritten_stores != 0
+            || inline_stats.skipped_candidates != 0
+            || scalar_replacement_stats.candidate_allocations != 0
+            || scalar_replacement_stats.planned_allocations != 0
+            || scalar_replacement_stats.replaced_allocations != 0
+            || scalar_replacement_stats.skipped_allocations != 0
+            || scalar_replacement_stats.skipped_unbuildable_allocations != 0
+            || scalar_replacement_stats.skipped_live_alias_control_flow_allocations != 0
+        {
+            info!(
+                target: "soac_jit_profiled_inline_plan",
+                module_id = planned_module_id,
+                inline_rewritten_stores = inline_stats.rewritten_stores,
+                inline_skipped_candidates = inline_stats.skipped_candidates,
+                scalar_candidate_allocations = scalar_replacement_stats.candidate_allocations,
+                scalar_planned_allocations = scalar_replacement_stats.planned_allocations,
+                scalar_replaced_allocations = scalar_replacement_stats.replaced_allocations,
+                scalar_skipped_allocations = scalar_replacement_stats.skipped_allocations,
+                scalar_skipped_unbuildable_allocations =
+                    scalar_replacement_stats.skipped_unbuildable_allocations,
+                scalar_skipped_live_alias_control_flow_allocations =
+                    scalar_replacement_stats.skipped_live_alias_control_flow_allocations,
+                runtime_constructor_function_ids = runtime_constructor_function_ids.len(),
+                runtime_constructor_function_id_values = ?runtime_constructor_function_ids,
+                runtime_constructor_inline_plan_hits = runtime_constructor_inline_plan_hits,
+                "soac_jit_profiled_inline_plan"
+            );
+        }
+        if inline_stats.rewritten_stores != 0 || scalar_replacement_stats.replaced_allocations != 0
+        {
+            validate_codegen_instr_ids(&planned_module).map_err(|err| {
+                format!("profiled direct-call inline rewrite validation failed: {err}")
+            })?;
+        }
+    }
+    build_jit_module_plan_from_owned_module(planned_module)
+}
+
+fn build_profiled_inline_callee_maps(
+    module: &BlockPyModule<CodegenModuleShape>,
+    profile: &SpecializationProfile<'_>,
+    compile_session: Option<&crate::session::CompileSession>,
+    direct_owner_attr_specializations_by_function: &HashMap<
+        FunctionId,
+        HashMap<DirectOwnerAttrKey, Vec<DirectOwnerAttrSpecialization>>,
+    >,
+) -> Result<
+    (
+        HashMap<FunctionId, BlockPyFunction<CodegenModuleShape>>,
+        HashMap<FunctionId, InlineCallee>,
+        InlinePlanModule,
+    ),
+    String,
+> {
+    let mut callee_functions = module
+        .callable_defs
+        .iter()
+        .map(|function| (function.function_id, function.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut inline_callees = module
+        .callable_defs
+        .iter()
+        .map(|function| {
+            (
+                function.function_id,
+                InlineCallee::same_module(function.clone()),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut target_ids = HashSet::new();
+    let mut external_inline_plan = InlinePlanModule::default();
+    for function in &module.callable_defs {
+        let call_target_specializations =
+            profile.call_target_specializations(function.function_id)?;
+        for targets in call_target_specializations.values() {
+            target_ids.extend(targets.iter().copied());
+        }
+        if let Some(direct_owner_attr_specializations) =
+            direct_owner_attr_specializations_by_function.get(&function.function_id)
+        {
+            target_ids.extend(collect_runtime_iter_method_target_ids(
+                function,
+                module.module_constants.as_slice(),
+                direct_owner_attr_specializations,
+                &call_target_specializations,
+            ));
+        }
+    }
+    for function_id in target_ids {
+        if callee_functions.contains_key(&function_id) {
+            continue;
+        }
+        let Some(compile_session) = compile_session else {
+            continue;
+        };
+        let Some((shared_state, function)) = compile_session.lookup_shared_function(function_id)?
+        else {
+            continue;
+        };
+        let shared_inline_plan =
+            plan_module_inlining(&summarize_module_escapes(&shared_state.lowered_module));
+        external_inline_plan
+            .functions
+            .extend(shared_inline_plan.functions);
+        callee_functions.insert(function_id, function.clone());
+        inline_callees.insert(
+            function_id,
+            InlineCallee::cross_module(
+                function,
+                shared_state.lowered_module.module_constants.clone(),
+            ),
+        );
+    }
+    Ok((callee_functions, inline_callees, external_inline_plan))
+}
+
+fn straightline_constructor_ids_in_plan(inline_plan: &InlinePlanModule) -> HashSet<FunctionId> {
+    inline_plan
+        .functions
+        .iter()
+        .filter_map(|(function_id, plan)| {
+            plan.straightline_constructor.as_ref().map(|_| *function_id)
+        })
+        .collect()
+}
+
+fn extend_external_inline_plan_for_function_ids(
+    external_inline_plan: &mut InlinePlanModule,
+    function_ids: &HashSet<FunctionId>,
+    compile_session: Option<&crate::session::CompileSession>,
+) -> Result<(), String> {
+    for function_id in function_ids {
+        if external_inline_plan.functions.contains_key(function_id) {
+            continue;
+        }
+        let Some(compile_session) = compile_session else {
+            continue;
+        };
+        let Some(shared_state) =
+            compile_session.shared_module_state_for_function_id(*function_id)?
+        else {
+            info!(
+                target: "soac_jit_external_inline_plan",
+                requested_function_id = %function_id,
+                "missing shared module state for external inline plan function id"
+            );
+            continue;
+        };
+        let requested_function = shared_state.lookup_function(*function_id);
+        let requested_qualname = requested_function
+            .map(|function| function.names.qualname.as_str())
+            .unwrap_or("<missing>");
+        let shared_inline_plan =
+            plan_module_inlining(&summarize_module_escapes(&shared_state.lowered_module));
+        let requested_has_straightline_constructor = shared_inline_plan
+            .straightline_constructor(*function_id)
+            .is_some();
+        let requested_rejection_reason = requested_function
+            .and_then(|function| {
+                straightline_field_initializer_rejection_reason(
+                    &shared_state.lowered_module,
+                    function,
+                )
+            })
+            .unwrap_or_else(|| "<none>".to_string());
+        let straightline_constructor_count = shared_inline_plan
+            .functions
+            .values()
+            .filter(|plan| plan.straightline_constructor.is_some())
+            .count();
+        info!(
+            target: "soac_jit_external_inline_plan",
+            requested_function_id = %function_id,
+            requested_qualname,
+            shared_module_id = shared_state.module_id(),
+            shared_module_name = %shared_state.module_name,
+            requested_has_straightline_constructor,
+            requested_rejection_reason,
+            straightline_constructor_count,
+            "extended external inline plan from shared module"
+        );
+        external_inline_plan
+            .functions
+            .extend(shared_inline_plan.functions);
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct ProfiledMethodInlineRewriteStats {
+    candidate_stores: usize,
+    missing_callee_targets: usize,
+    missing_owner_guard_targets: usize,
+    owner_fragment_unsupported_targets: usize,
+    callable_fragment_unsupported_targets: usize,
+    stop_iteration_candidate_exc_edges: usize,
+    stop_iteration_current_exception_edges: usize,
+    stop_iteration_handler_blocks: usize,
+    stop_iteration_handler_if_terms: usize,
+    stop_iteration_handler_test_matches: usize,
+    stop_iteration_handler_targets: usize,
+    stop_iteration_raises_rewritten: usize,
+    static_runtime_constructor_calls_rewritten: usize,
+    rewritten_stores: usize,
+}
+
+impl ProfiledMethodInlineRewriteStats {
+    fn total_attempts(&self) -> usize {
+        self.candidate_stores
+            + self.missing_callee_targets
+            + self.missing_owner_guard_targets
+            + self.owner_fragment_unsupported_targets
+            + self.callable_fragment_unsupported_targets
+            + self.stop_iteration_candidate_exc_edges
+            + self.stop_iteration_current_exception_edges
+            + self.stop_iteration_handler_blocks
+            + self.stop_iteration_handler_if_terms
+            + self.stop_iteration_handler_test_matches
+            + self.stop_iteration_handler_targets
+            + self.stop_iteration_raises_rewritten
+            + self.static_runtime_constructor_calls_rewritten
+            + self.rewritten_stores
+    }
+}
+
+struct ProfiledMethodInlineCandidate {
+    instr_index: usize,
+    target: ResolvedName,
+    receiver: InstrCodegen,
+    attr: InstrCodegen,
+    method_name: String,
+    instr_id: InstrId,
+}
+
+struct ProfiledMethodInlineFragment {
+    guard: DirectOwnerAttrSpecialization,
+    entry_label: BlockLabel,
+    blocks: Vec<Block<InstrCodegen>>,
+}
+
+struct ProfiledMethodCallableGuardFragment {
+    function_id: FunctionId,
+    entry_label: BlockLabel,
+    blocks: Vec<Block<InstrCodegen>>,
+}
+
+struct ProfiledRuntimeIterInlineCandidate {
+    instr_index: usize,
+    target: ResolvedName,
+    func: InstrCodegen,
+    receiver: InstrCodegen,
+    constructor_instr_id: InstrId,
+}
+
+fn rewrite_profiled_no_arg_method_call_store_sites(
+    function: &mut BlockPyFunction<CodegenModuleShape>,
+    caller_constants: &mut Vec<InstrResolved>,
+    targets_by_instr_id: &HashMap<InstrId, Vec<FunctionId>>,
+    direct_owner_attr_specializations: &HashMap<
+        DirectOwnerAttrKey,
+        Vec<DirectOwnerAttrSpecialization>,
+    >,
+    callees: &HashMap<FunctionId, InlineCallee>,
+    straightline_constructor_ids: &HashSet<FunctionId>,
+    runtime_constructor_function_ids: &mut HashSet<FunctionId>,
+) -> ProfiledMethodInlineRewriteStats {
+    let mut stats = ProfiledMethodInlineRewriteStats::default();
+    let original_blocks = std::mem::take(&mut function.blocks);
+    let original_block_by_label = original_blocks
+        .iter()
+        .cloned()
+        .map(|block| (block.label, block))
+        .collect::<HashMap<_, _>>();
+    let mut rewritten_blocks = Vec::with_capacity(original_blocks.len());
+    for block in original_blocks {
+        match rewrite_profiled_no_arg_method_call_store_block(
+            function,
+            caller_constants,
+            block.clone(),
+            targets_by_instr_id,
+            direct_owner_attr_specializations,
+            callees,
+            straightline_constructor_ids,
+            &original_block_by_label,
+            &mut stats,
+            runtime_constructor_function_ids,
+        ) {
+            Some(blocks) => {
+                stats.rewritten_stores += 1;
+                rewritten_blocks.extend(blocks);
+            }
+            None => rewritten_blocks.push(block),
+        }
+    }
+    function.blocks = rewritten_blocks;
+    if stats.rewritten_stores != 0 {
+        assign_missing_codegen_function_instr_ids(function);
+    }
+    stats
+}
+
+fn rewrite_profiled_no_arg_method_call_store_block(
+    function: &mut BlockPyFunction<CodegenModuleShape>,
+    caller_constants: &mut Vec<InstrResolved>,
+    block: Block<InstrCodegen>,
+    targets_by_instr_id: &HashMap<InstrId, Vec<FunctionId>>,
+    direct_owner_attr_specializations: &HashMap<
+        DirectOwnerAttrKey,
+        Vec<DirectOwnerAttrSpecialization>,
+    >,
+    callees: &HashMap<FunctionId, InlineCallee>,
+    straightline_constructor_ids: &HashSet<FunctionId>,
+    original_block_by_label: &HashMap<BlockLabel, Block<InstrCodegen>>,
+    stats: &mut ProfiledMethodInlineRewriteStats,
+    runtime_constructor_function_ids: &mut HashSet<FunctionId>,
+) -> Option<Vec<Block<InstrCodegen>>> {
+    let Some(candidate) = find_profiled_no_arg_method_inline_candidate(
+        caller_constants.as_slice(),
+        &block,
+        targets_by_instr_id,
+    ) else {
+        return rewrite_profiled_runtime_iter_call_store_block(
+            function,
+            caller_constants,
+            block,
+            targets_by_instr_id,
+            direct_owner_attr_specializations,
+            callees,
+            straightline_constructor_ids,
+            stats,
+            runtime_constructor_function_ids,
+        );
+    };
+    stats.candidate_stores += 1;
+    let targets = targets_by_instr_id.get(&candidate.instr_id)?;
+    let continuation_label = function.name_gen.next_block_name();
+    let receiver_temp =
+        soac_blockpy::passes::allocate_codegen_stack_temp(function, "direct_method_receiver");
+    let receiver_temp_name = receiver_temp.resolved_name();
+    let exc_edge = block.exc_edge.clone();
+
+    let mut fragments = Vec::new();
+    for function_id in dedup_function_ids(targets) {
+        let Some(callee) = callees.get(&function_id) else {
+            stats.missing_callee_targets += 1;
+            continue;
+        };
+        let key = DirectOwnerAttrKey::new(function_id, candidate.method_name.as_str());
+        let Some(guards) = direct_owner_attr_specializations.get(&key) else {
+            stats.missing_owner_guard_targets += 1;
+            continue;
+        };
+        for guard in guards {
+            let fragment_result = match callee.module_constants() {
+                Some(callee_constants) => {
+                    build_cross_module_direct_method_inline_fragment_to_target(
+                        function,
+                        caller_constants,
+                        callee.function(),
+                        callee_constants,
+                        continuation_label,
+                        load_codegen_temp(&receiver_temp_name),
+                        &[],
+                        candidate.target.clone(),
+                    )
+                }
+                None => build_direct_method_inline_fragment_to_target(
+                    function,
+                    callee.function(),
+                    continuation_label,
+                    load_codegen_temp(&receiver_temp_name),
+                    &[],
+                    candidate.target.clone(),
+                ),
+            };
+            let Ok(mut fragment) = fragment_result else {
+                stats.owner_fragment_unsupported_targets += 1;
+                continue;
+            };
+            for fragment_block in &mut fragment.blocks {
+                fragment_block.exc_edge = exc_edge.clone();
+            }
+            stats.static_runtime_constructor_calls_rewritten +=
+                rewrite_static_runtime_constructor_call_stores(
+                    &mut fragment.blocks,
+                    caller_constants.as_slice(),
+                    |runtime_name| {
+                        record_runtime_constructor_function_id(
+                            runtime_name,
+                            runtime_constructor_function_ids,
+                        )
+                    },
+                );
+            if let Some(stop_iteration_target) = stop_iteration_handler_target(
+                exc_edge.as_ref(),
+                original_block_by_label,
+                caller_constants.as_slice(),
+                stats,
+            ) {
+                stats.stop_iteration_handler_targets += 1;
+                stats.stop_iteration_raises_rewritten += rewrite_inlined_stop_iteration_raises(
+                    &mut fragment.blocks,
+                    stop_iteration_target,
+                    caller_constants.as_slice(),
+                );
+            }
+            append_cleanup_before_method_inline_exit(
+                &mut fragment.blocks,
+                continuation_label,
+                &receiver_temp_name,
+            );
+            fragments.push(ProfiledMethodInlineFragment {
+                guard: guard.clone(),
+                entry_label: fragment.entry_label,
+                blocks: fragment.blocks,
+            });
+        }
+    }
+    if fragments.is_empty() {
+        return rewrite_profiled_no_arg_method_call_store_block_with_callable_guard(
+            function,
+            caller_constants,
+            block,
+            candidate,
+            targets.as_slice(),
+            callees,
+            original_block_by_label,
+            stats,
+            runtime_constructor_function_ids,
+        );
+    }
+
+    let mut before = block.body;
+    let after = before.split_off(candidate.instr_index + 1);
+    before.truncate(candidate.instr_index);
+    before.push(
+        Store::new(receiver_temp_name.clone(), candidate.receiver)
+            .with_meta(Meta::synthetic())
+            .into(),
+    );
+
+    let generic_label = function.name_gen.next_block_name();
+    let guard_labels = (0..fragments.len().saturating_sub(1))
+        .map(|_| function.name_gen.next_block_name())
+        .collect::<Vec<_>>();
+
+    let entry_term = receiver_type_version_guard_term(
+        &receiver_temp_name,
+        &fragments[0],
+        guard_labels.first().copied().unwrap_or(generic_label),
+    );
+    let entry = Block::new(
+        block.label,
+        before,
+        entry_term,
+        block.params,
+        exc_edge.clone(),
+    );
+
+    let mut blocks = Vec::with_capacity(fragments.len() * 2 + 3);
+    blocks.push(entry);
+
+    for (guard_index, guard_label) in guard_labels.iter().copied().enumerate() {
+        let target_index = guard_index + 1;
+        let else_label = guard_labels
+            .get(guard_index + 1)
+            .copied()
+            .unwrap_or(generic_label);
+        blocks.push(Block::new(
+            guard_label,
+            Vec::new(),
+            receiver_type_version_guard_term(
+                &receiver_temp_name,
+                &fragments[target_index],
+                else_label,
+            ),
+            Vec::new(),
+            exc_edge.clone(),
+        ));
+    }
+
+    for fragment in fragments {
+        blocks.extend(fragment.blocks);
+    }
+
+    blocks.push(Block::new(
+        generic_label,
+        vec![
+            Store::new(
+                candidate.target,
+                InstrCodegen::Call(
+                    Call::new(
+                        InstrCodegen::GetAttr(
+                            GetAttr::new(load_codegen_temp(&receiver_temp_name), candidate.attr)
+                                .with_meta(Meta::synthetic()),
+                        ),
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                    .with_meta(Meta::synthetic()),
+                ),
+            )
+            .with_meta(Meta::synthetic())
+            .into(),
+            Del::new(receiver_temp_name.clone(), false)
+                .with_meta(Meta::synthetic())
+                .into(),
+        ],
+        BlockTerm::Jump(BlockEdge::new(continuation_label)),
+        Vec::new(),
+        exc_edge.clone(),
+    ));
+
+    blocks.push(Block::new(
+        continuation_label,
+        after,
+        block.term,
+        Vec::new(),
+        exc_edge,
+    ));
+
+    Some(blocks)
+}
+
+fn rewrite_profiled_runtime_iter_call_store_block(
+    function: &mut BlockPyFunction<CodegenModuleShape>,
+    caller_constants: &mut Vec<InstrResolved>,
+    block: Block<InstrCodegen>,
+    targets_by_instr_id: &HashMap<InstrId, Vec<FunctionId>>,
+    direct_owner_attr_specializations: &HashMap<
+        DirectOwnerAttrKey,
+        Vec<DirectOwnerAttrSpecialization>,
+    >,
+    callees: &HashMap<FunctionId, InlineCallee>,
+    straightline_constructor_ids: &HashSet<FunctionId>,
+    stats: &mut ProfiledMethodInlineRewriteStats,
+    runtime_constructor_function_ids: &mut HashSet<FunctionId>,
+) -> Option<Vec<Block<InstrCodegen>>> {
+    let candidate = find_profiled_runtime_iter_inline_candidate(
+        caller_constants.as_slice(),
+        &block,
+        targets_by_instr_id,
+    )?;
+    stats.candidate_stores += 1;
+    let targets = targets_by_instr_id.get(&candidate.constructor_instr_id)?;
+    let continuation_label = function.name_gen.next_block_name();
+    let receiver_temp =
+        soac_blockpy::passes::allocate_codegen_stack_temp(function, "runtime_iter_receiver");
+    let receiver_temp_name = receiver_temp.resolved_name();
+    let exc_edge = block.exc_edge.clone();
+
+    let mut fragments = Vec::new();
+    let mut fragment_constructor_function_ids = Vec::new();
+    for function_id in dedup_function_ids(targets) {
+        for guard in direct_constructor_owner_attr_specializations_from_source(
+            Some(direct_owner_attr_specializations),
+            function_id,
+        ) {
+            let iter_function_id =
+                match owner_attr_function_id_for_type_ref(&guard.owner_type_ref, "__iter__") {
+                    Ok(Some(function_id)) => function_id,
+                    Ok(None) | Err(_) => {
+                        stats.missing_owner_guard_targets += 1;
+                        continue;
+                    }
+                };
+            let Some(callee) = callees.get(&iter_function_id) else {
+                stats.missing_callee_targets += 1;
+                continue;
+            };
+            let fragment_result = match callee.module_constants() {
+                Some(callee_constants) => {
+                    build_cross_module_direct_method_inline_fragment_to_target(
+                        function,
+                        caller_constants,
+                        callee.function(),
+                        callee_constants,
+                        continuation_label,
+                        load_codegen_temp(&receiver_temp_name),
+                        &[],
+                        candidate.target.clone(),
+                    )
+                }
+                None => build_direct_method_inline_fragment_to_target(
+                    function,
+                    callee.function(),
+                    continuation_label,
+                    load_codegen_temp(&receiver_temp_name),
+                    &[],
+                    candidate.target.clone(),
+                ),
+            };
+            let Ok(mut fragment) = fragment_result else {
+                stats.owner_fragment_unsupported_targets += 1;
+                continue;
+            };
+            for fragment_block in &mut fragment.blocks {
+                fragment_block.exc_edge = exc_edge.clone();
+            }
+            stats.static_runtime_constructor_calls_rewritten +=
+                rewrite_static_runtime_constructor_call_stores(
+                    &mut fragment.blocks,
+                    caller_constants.as_slice(),
+                    |runtime_name| {
+                        record_runtime_constructor_function_id(
+                            runtime_name,
+                            runtime_constructor_function_ids,
+                        )
+                    },
+                );
+            append_cleanup_before_method_inline_exit(
+                &mut fragment.blocks,
+                continuation_label,
+                &receiver_temp_name,
+            );
+            fragments.push(ProfiledMethodInlineFragment {
+                guard,
+                entry_label: fragment.entry_label,
+                blocks: fragment.blocks,
+            });
+            fragment_constructor_function_ids.push(function_id);
+        }
+    }
+    if fragments.is_empty() {
+        return None;
+    }
+    let scalarizable_constructor_function_id =
+        if let [function_id] = fragment_constructor_function_ids.as_slice() {
+            Some(*function_id)
+        } else {
+            None
+        };
+
+    let mut before = block.body;
+    let after = before.split_off(candidate.instr_index + 1);
+    before.truncate(candidate.instr_index);
+    let receiver_for_store = scalarizable_profiled_constructor_receiver(
+        candidate.receiver,
+        scalarizable_constructor_function_id,
+        straightline_constructor_ids,
+    );
+    before.push(
+        Store::new(receiver_temp_name.clone(), receiver_for_store)
+            .with_meta(Meta::synthetic())
+            .into(),
+    );
+
+    let generic_label = function.name_gen.next_block_name();
+    let guard_labels = (0..fragments.len().saturating_sub(1))
+        .map(|_| function.name_gen.next_block_name())
+        .collect::<Vec<_>>();
+
+    let entry_term = receiver_type_version_guard_term(
+        &receiver_temp_name,
+        &fragments[0],
+        guard_labels.first().copied().unwrap_or(generic_label),
+    );
+    let entry = Block::new(
+        block.label,
+        before,
+        entry_term,
+        block.params,
+        exc_edge.clone(),
+    );
+
+    let mut blocks = Vec::with_capacity(fragments.len() * 2 + 3);
+    blocks.push(entry);
+
+    for (guard_index, guard_label) in guard_labels.iter().copied().enumerate() {
+        let target_index = guard_index + 1;
+        let else_label = guard_labels
+            .get(guard_index + 1)
+            .copied()
+            .unwrap_or(generic_label);
+        blocks.push(Block::new(
+            guard_label,
+            Vec::new(),
+            receiver_type_version_guard_term(
+                &receiver_temp_name,
+                &fragments[target_index],
+                else_label,
+            ),
+            Vec::new(),
+            exc_edge.clone(),
+        ));
+    }
+
+    for fragment in fragments {
+        blocks.extend(fragment.blocks);
+    }
+
+    blocks.push(Block::new(
+        generic_label,
+        vec![
+            Store::new(
+                candidate.target,
+                InstrCodegen::Call(
+                    Call::new(
+                        candidate.func,
+                        vec![CallArgPositional::Positional(load_codegen_temp(
+                            &receiver_temp_name,
+                        ))],
+                        Vec::new(),
+                    )
+                    .with_meta(Meta::synthetic()),
+                ),
+            )
+            .with_meta(Meta::synthetic())
+            .into(),
+            Del::new(receiver_temp_name.clone(), false)
+                .with_meta(Meta::synthetic())
+                .into(),
+        ],
+        BlockTerm::Jump(BlockEdge::new(continuation_label)),
+        Vec::new(),
+        exc_edge.clone(),
+    ));
+
+    blocks.push(Block::new(
+        continuation_label,
+        after,
+        block.term,
+        Vec::new(),
+        exc_edge,
+    ));
+
+    Some(blocks)
+}
+
+fn scalarizable_profiled_constructor_receiver(
+    receiver: InstrCodegen,
+    constructor_function_id: Option<FunctionId>,
+    straightline_constructor_ids: &HashSet<FunctionId>,
+) -> InstrCodegen {
+    let Some(constructor_function_id) = constructor_function_id else {
+        return receiver;
+    };
+    if !straightline_constructor_ids.contains(&constructor_function_id) {
+        return receiver;
+    }
+    let InstrCodegen::Call(call) = receiver else {
+        return receiver;
+    };
+    let meta = call.meta();
+    InstrCodegen::CallDirect(
+        CallDirect::new(call.func, constructor_function_id, call.args, call.keywords)
+            .with_meta(meta),
+    )
+}
+
+fn record_runtime_constructor_function_id(
+    runtime_name: RuntimeName,
+    runtime_constructor_function_ids: &mut HashSet<FunctionId>,
+) -> Option<FunctionId> {
+    let function_id = runtime_constructor_function_id(runtime_name)?;
+    runtime_constructor_function_ids.insert(function_id);
+    Some(function_id)
+}
+
+fn runtime_constructor_function_id(runtime_name: RuntimeName) -> Option<FunctionId> {
+    let obj = unsafe { crate::module_constants::load_runtime_name_owned_by_id(runtime_name) };
+    if obj.is_null() {
+        unsafe { ffi::PyErr_Clear() };
+        return None;
+    }
+    let function_id = unsafe {
+        if ffi::PyType_Check(obj) == 0 {
+            ffi::Py_DECREF(obj);
+            return None;
+        }
+        let owner_type = obj.cast::<ffi::PyTypeObject>();
+        let function_id =
+            reloc_type_ref_for_type(owner_type)
+                .ok()
+                .flatten()
+                .and_then(|owner_type_ref| {
+                    owner_attr_function_id_for_type_ref(&owner_type_ref, "__init__")
+                        .ok()
+                        .flatten()
+                });
+        ffi::Py_DECREF(obj);
+        function_id
+    };
+    function_id
+}
+
+fn rewrite_profiled_no_arg_method_call_store_block_with_callable_guard(
+    function: &mut BlockPyFunction<CodegenModuleShape>,
+    caller_constants: &mut Vec<InstrResolved>,
+    block: Block<InstrCodegen>,
+    candidate: ProfiledMethodInlineCandidate,
+    targets: &[FunctionId],
+    callees: &HashMap<FunctionId, InlineCallee>,
+    original_block_by_label: &HashMap<BlockLabel, Block<InstrCodegen>>,
+    stats: &mut ProfiledMethodInlineRewriteStats,
+    runtime_constructor_function_ids: &mut HashSet<FunctionId>,
+) -> Option<Vec<Block<InstrCodegen>>> {
+    let continuation_label = function.name_gen.next_block_name();
+    let receiver_temp =
+        soac_blockpy::passes::allocate_codegen_stack_temp(function, "direct_method_receiver");
+    let receiver_temp_name = receiver_temp.resolved_name();
+    let method_temp =
+        soac_blockpy::passes::allocate_codegen_stack_temp(function, "direct_method_callable");
+    let method_temp_name = method_temp.resolved_name();
+    let exc_edge = block.exc_edge.clone();
+    let stop_iteration_target = stop_iteration_handler_target(
+        exc_edge.as_ref(),
+        original_block_by_label,
+        caller_constants.as_slice(),
+        stats,
+    );
+
+    let mut fragments = Vec::new();
+    for function_id in dedup_function_ids(targets) {
+        let Some(callee) = callees.get(&function_id) else {
+            stats.missing_callee_targets += 1;
+            continue;
+        };
+        let fragment_result = match callee.module_constants() {
+            Some(callee_constants) => build_cross_module_direct_method_inline_fragment_to_target(
+                function,
+                caller_constants,
+                callee.function(),
+                callee_constants,
+                continuation_label,
+                load_codegen_temp(&receiver_temp_name),
+                &[],
+                candidate.target.clone(),
+            ),
+            None => build_direct_method_inline_fragment_to_target(
+                function,
+                callee.function(),
+                continuation_label,
+                load_codegen_temp(&receiver_temp_name),
+                &[],
+                candidate.target.clone(),
+            ),
+        };
+        let Ok(mut fragment) = fragment_result else {
+            stats.callable_fragment_unsupported_targets += 1;
+            continue;
+        };
+        for fragment_block in &mut fragment.blocks {
+            fragment_block.exc_edge = exc_edge.clone();
+        }
+        stats.static_runtime_constructor_calls_rewritten +=
+            rewrite_static_runtime_constructor_call_stores(
+                &mut fragment.blocks,
+                caller_constants.as_slice(),
+                |runtime_name| {
+                    record_runtime_constructor_function_id(
+                        runtime_name,
+                        runtime_constructor_function_ids,
+                    )
+                },
+            );
+        if let Some(stop_iteration_target) = stop_iteration_target {
+            stats.stop_iteration_handler_targets += 1;
+            stats.stop_iteration_raises_rewritten += rewrite_inlined_stop_iteration_raises(
+                &mut fragment.blocks,
+                stop_iteration_target,
+                caller_constants.as_slice(),
+            );
+        }
+        append_cleanup_before_method_inline_exit(
+            &mut fragment.blocks,
+            continuation_label,
+            &method_temp_name,
+        );
+        append_cleanup_before_method_inline_exit(
+            &mut fragment.blocks,
+            continuation_label,
+            &receiver_temp_name,
+        );
+        fragments.push(ProfiledMethodCallableGuardFragment {
+            function_id,
+            entry_label: fragment.entry_label,
+            blocks: fragment.blocks,
+        });
+    }
+    if fragments.is_empty() {
+        return None;
+    }
+
+    let mut before = block.body;
+    let after = before.split_off(candidate.instr_index + 1);
+    before.truncate(candidate.instr_index);
+    before.push(
+        Store::new(receiver_temp_name.clone(), candidate.receiver)
+            .with_meta(Meta::synthetic())
+            .into(),
+    );
+    before.push(
+        Store::new(
+            method_temp_name.clone(),
+            InstrCodegen::GetAttr(
+                GetAttr::new(load_codegen_temp(&receiver_temp_name), candidate.attr)
+                    .with_meta(Meta::synthetic()),
+            ),
+        )
+        .with_meta(Meta::synthetic())
+        .into(),
+    );
+
+    let generic_label = function.name_gen.next_block_name();
+    let guard_labels = (0..fragments.len().saturating_sub(1))
+        .map(|_| function.name_gen.next_block_name())
+        .collect::<Vec<_>>();
+
+    let entry_term = callable_function_id_guard_term(
+        &method_temp_name,
+        fragments[0].function_id,
+        fragments[0].entry_label,
+        guard_labels.first().copied().unwrap_or(generic_label),
+    );
+    let entry = Block::new(
+        block.label,
+        before,
+        entry_term,
+        block.params,
+        exc_edge.clone(),
+    );
+
+    let mut blocks = Vec::with_capacity(fragments.len() * 2 + 3);
+    blocks.push(entry);
+
+    for (guard_index, guard_label) in guard_labels.iter().copied().enumerate() {
+        let target_index = guard_index + 1;
+        let else_label = guard_labels
+            .get(guard_index + 1)
+            .copied()
+            .unwrap_or(generic_label);
+        blocks.push(Block::new(
+            guard_label,
+            Vec::new(),
+            callable_function_id_guard_term(
+                &method_temp_name,
+                fragments[target_index].function_id,
+                fragments[target_index].entry_label,
+                else_label,
+            ),
+            Vec::new(),
+            exc_edge.clone(),
+        ));
+    }
+
+    for fragment in fragments {
+        blocks.extend(fragment.blocks);
+    }
+
+    blocks.push(Block::new(
+        generic_label,
+        vec![
+            Store::new(
+                candidate.target,
+                InstrCodegen::Call(
+                    Call::new(load_codegen_temp(&method_temp_name), Vec::new(), Vec::new())
+                        .with_meta(Meta::synthetic()),
+                ),
+            )
+            .with_meta(Meta::synthetic())
+            .into(),
+            Del::new(method_temp_name.clone(), false)
+                .with_meta(Meta::synthetic())
+                .into(),
+            Del::new(receiver_temp_name.clone(), false)
+                .with_meta(Meta::synthetic())
+                .into(),
+        ],
+        BlockTerm::Jump(BlockEdge::new(continuation_label)),
+        Vec::new(),
+        exc_edge.clone(),
+    ));
+
+    blocks.push(Block::new(
+        continuation_label,
+        after,
+        block.term,
+        Vec::new(),
+        exc_edge,
+    ));
+
+    Some(blocks)
+}
+
+fn callable_function_id_guard_term(
+    callable_temp_name: &ResolvedName,
+    function_id: FunctionId,
+    then_label: BlockLabel,
+    else_label: BlockLabel,
+) -> BlockTerm<InstrCodegen> {
+    BlockTerm::IfTerm(soac_blockpy::block_py::TermIf {
+        test: InstrCodegen::DirectFunctionIdGuardTest(
+            DirectFunctionIdGuardTest::new(load_codegen_temp(callable_temp_name), function_id)
+                .with_meta(Meta::synthetic()),
+        ),
+        then_label,
+        else_label,
+    })
+}
+
+fn stop_iteration_handler_target(
+    exc_edge: Option<&BlockEdge>,
+    original_block_by_label: &HashMap<BlockLabel, Block<InstrCodegen>>,
+    module_constants: &[InstrResolved],
+    stats: &mut ProfiledMethodInlineRewriteStats,
+) -> Option<BlockLabel> {
+    let exc_edge = exc_edge?;
+    stats.stop_iteration_candidate_exc_edges += 1;
+    if !matches!(exc_edge.args.as_slice(), [BlockArg::CurrentException]) {
+        return None;
+    }
+    stats.stop_iteration_current_exception_edges += 1;
+    let handler = original_block_by_label.get(&exc_edge.target)?;
+    stats.stop_iteration_handler_blocks += 1;
+    let BlockTerm::IfTerm(if_term) = &handler.term else {
+        return None;
+    };
+    stats.stop_iteration_handler_if_terms += 1;
+    if is_exception_matches_stop_iteration_test(&if_term.test, module_constants) {
+        stats.stop_iteration_handler_test_matches += 1;
+        Some(if_term.then_label)
+    } else {
+        None
+    }
+}
+
+fn rewrite_inlined_stop_iteration_raises(
+    blocks: &mut [Block<InstrCodegen>],
+    stop_iteration_target: BlockLabel,
+    module_constants: &[InstrResolved],
+) -> usize {
+    let mut rewritten = 0usize;
+    for block in blocks {
+        if let BlockTerm::Raise(raise) = &block.term
+            && raise
+                .exc
+                .as_ref()
+                .is_some_and(|expr| is_stop_iteration_expr(expr, module_constants))
+        {
+            block.term = BlockTerm::Jump(BlockEdge::new(stop_iteration_target));
+            rewritten += 1;
+        }
+    }
+    rewritten
+}
+
+fn is_exception_matches_stop_iteration_test(
+    expr: &InstrCodegen,
+    module_constants: &[InstrResolved],
+) -> bool {
+    match expr {
+        InstrCodegen::Call(call) => {
+            call.keywords.is_empty()
+                && is_runtime_name_expr(
+                    call.func.as_ref(),
+                    RuntimeName::ExceptionMatches,
+                    module_constants,
+                )
+                && matches!(
+                    call.args.as_slice(),
+                    [
+                        CallArgPositional::Positional(_),
+                        CallArgPositional::Positional(stop_iteration),
+                    ] if is_stop_iteration_expr(stop_iteration, module_constants)
+                )
+        }
+        InstrCodegen::CallDirect(call) => {
+            call.keywords.is_empty()
+                && is_runtime_name_expr(
+                    call.callable.as_ref(),
+                    RuntimeName::ExceptionMatches,
+                    module_constants,
+                )
+                && matches!(
+                    call.args.as_slice(),
+                    [
+                        CallArgPositional::Positional(_),
+                        CallArgPositional::Positional(stop_iteration),
+                    ] if is_stop_iteration_expr(stop_iteration, module_constants)
+                )
+        }
+        _ => false,
+    }
+}
+
+fn is_stop_iteration_expr(expr: &InstrCodegen, module_constants: &[InstrResolved]) -> bool {
+    is_runtime_name_expr(expr, RuntimeName::StopIteration, module_constants)
+}
+
+fn is_runtime_name_expr(
+    expr: &InstrCodegen,
+    runtime_name: RuntimeName,
+    module_constants: &[InstrResolved],
+) -> bool {
+    let InstrCodegen::Load(load) = expr else {
+        return false;
+    };
+    if load.name.location == NameLocation::RuntimeName(runtime_name)
+        || load.name.id.as_str() == runtime_name.name()
+    {
+        return true;
+    }
+    let NameLocation::Constant(constant_index) = load.name.location else {
+        return false;
+    };
+    module_constants
+        .get(constant_index as usize)
+        .is_some_and(|constant| is_resolved_runtime_name_expr(constant, runtime_name))
+}
+
+fn is_resolved_runtime_name_expr(expr: &InstrResolved, runtime_name: RuntimeName) -> bool {
+    matches!(
+        expr,
+        InstrResolved::Load(load)
+            if load.name.location == NameLocation::RuntimeName(runtime_name)
+                || load.name.id.as_str() == runtime_name.name()
+    )
+}
+
+fn collect_runtime_iter_method_target_ids(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    module_constants: &[InstrResolved],
+    direct_owner_attr_specializations: &HashMap<
+        DirectOwnerAttrKey,
+        Vec<DirectOwnerAttrSpecialization>,
+    >,
+    targets_by_instr_id: &HashMap<InstrId, Vec<FunctionId>>,
+) -> HashSet<FunctionId> {
+    struct Collector<'a> {
+        module_constants: &'a [InstrResolved],
+        direct_owner_attr_specializations:
+            &'a HashMap<DirectOwnerAttrKey, Vec<DirectOwnerAttrSpecialization>>,
+        targets_by_instr_id: &'a HashMap<InstrId, Vec<FunctionId>>,
+        out: &'a mut HashSet<FunctionId>,
+    }
+
+    impl Visit<InstrCodegen> for Collector<'_> {
+        fn visit_instr(&mut self, expr: &InstrCodegen) {
+            if let InstrCodegen::Call(call) = expr {
+                self.collect_call(call);
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    impl Collector<'_> {
+        fn collect_call(&mut self, call: &Call<InstrCodegen>) {
+            if !is_runtime_name_expr(call.func.as_ref(), RuntimeName::Iter, self.module_constants)
+                || !call.keywords.is_empty()
+                || call.args.len() != 1
+            {
+                return;
+            }
+            let CallArgPositional::Positional(receiver) = &call.args[0] else {
+                return;
+            };
+            let InstrCodegen::Call(constructor_call) = receiver else {
+                return;
+            };
+            let Some(instr_id) = constructor_call.try_semantic_instr_id() else {
+                return;
+            };
+            let Some(targets) = self.targets_by_instr_id.get(&instr_id) else {
+                return;
+            };
+            for function_id in targets {
+                for owner in direct_constructor_owner_attr_specializations_from_source(
+                    Some(self.direct_owner_attr_specializations),
+                    *function_id,
+                ) {
+                    let Ok(Some(iter_function_id)) =
+                        owner_attr_function_id_for_type_ref(&owner.owner_type_ref, "__iter__")
+                    else {
+                        continue;
+                    };
+                    self.out.insert(iter_function_id);
+                }
+            }
+        }
+    }
+
+    let mut out = HashSet::new();
+    let mut collector = Collector {
+        module_constants,
+        direct_owner_attr_specializations,
+        targets_by_instr_id,
+        out: &mut out,
+    };
+    collector.visit_fn(function);
+    out
+}
+
+fn find_profiled_no_arg_method_inline_candidate(
+    module_constants: &[InstrResolved],
+    block: &Block<InstrCodegen>,
+    targets_by_instr_id: &HashMap<InstrId, Vec<FunctionId>>,
+) -> Option<ProfiledMethodInlineCandidate> {
+    block
+        .body
+        .iter()
+        .enumerate()
+        .find_map(|(instr_index, instr)| {
+            let InstrCodegen::Store(store) = instr else {
+                return None;
+            };
+            let InstrCodegen::Call(call) = store.value.as_ref() else {
+                return None;
+            };
+            if !call.args.is_empty() || !call.keywords.is_empty() {
+                return None;
+            }
+            let instr_id = call.try_semantic_instr_id()?;
+            if targets_by_instr_id.get(&instr_id).is_none_or(Vec::is_empty) {
+                return None;
+            }
+            let InstrCodegen::GetAttr(getattr) = call.func.as_ref() else {
+                return None;
+            };
+            let method_name =
+                codegen_constant_string_value_from_slice(module_constants, getattr.attr.as_ref())?;
+            Some(ProfiledMethodInlineCandidate {
+                instr_index,
+                target: store.name.clone(),
+                receiver: (*getattr.value).clone(),
+                attr: (*getattr.attr).clone(),
+                method_name: method_name.to_string(),
+                instr_id,
+            })
+        })
+}
+
+fn find_profiled_runtime_iter_inline_candidate(
+    module_constants: &[InstrResolved],
+    block: &Block<InstrCodegen>,
+    targets_by_instr_id: &HashMap<InstrId, Vec<FunctionId>>,
+) -> Option<ProfiledRuntimeIterInlineCandidate> {
+    block
+        .body
+        .iter()
+        .enumerate()
+        .find_map(|(instr_index, instr)| {
+            let InstrCodegen::Store(store) = instr else {
+                return None;
+            };
+            let InstrCodegen::Call(call) = store.value.as_ref() else {
+                return None;
+            };
+            if !is_runtime_name_expr(call.func.as_ref(), RuntimeName::Iter, module_constants)
+                || !call.keywords.is_empty()
+                || call.args.len() != 1
+            {
+                return None;
+            }
+            let CallArgPositional::Positional(receiver) = &call.args[0] else {
+                return None;
+            };
+            let InstrCodegen::Call(constructor_call) = receiver else {
+                return None;
+            };
+            let constructor_instr_id = constructor_call.try_semantic_instr_id()?;
+            if targets_by_instr_id
+                .get(&constructor_instr_id)
+                .is_none_or(Vec::is_empty)
+            {
+                return None;
+            }
+            Some(ProfiledRuntimeIterInlineCandidate {
+                instr_index,
+                target: store.name.clone(),
+                func: (*call.func).clone(),
+                receiver: (*receiver).clone(),
+                constructor_instr_id,
+            })
+        })
+}
+
+fn codegen_constant_string_value_from_slice<'a>(
+    module_constants: &'a [InstrResolved],
+    expr: &InstrCodegen,
+) -> Option<&'a str> {
+    let InstrCodegen::Load(load) = expr else {
+        return None;
+    };
+    let NameLocation::Constant(constant_index) = load.name.location else {
+        return None;
+    };
+    let InstrResolved::Literal(literal) = module_constants.get(constant_index as usize)? else {
+        return None;
+    };
+    let Literal::StringLiteral(literal) = literal.as_literal() else {
+        return None;
+    };
+    Some(literal.value.as_str())
+}
+
+fn receiver_type_version_guard_term(
+    receiver_temp_name: &ResolvedName,
+    fragment: &ProfiledMethodInlineFragment,
+    else_label: BlockLabel,
+) -> BlockTerm<InstrCodegen> {
+    BlockTerm::IfTerm(soac_blockpy::block_py::TermIf {
+        test: InstrCodegen::DirectReceiverTypeVersionGuardTest(
+            DirectReceiverTypeVersionGuardTest::new(
+                load_codegen_temp(receiver_temp_name),
+                typed_attr_owner_ref_from_reloc_type_ref(&fragment.guard.owner_type_ref),
+                fragment.guard.type_version,
+            )
+            .with_meta(Meta::synthetic()),
+        ),
+        then_label: fragment.entry_label,
+        else_label,
+    })
+}
+
+fn append_cleanup_before_method_inline_exit(
+    blocks: &mut [Block<InstrCodegen>],
+    continuation_label: BlockLabel,
+    receiver_temp_name: &ResolvedName,
+) {
+    for block in blocks {
+        match &block.term {
+            BlockTerm::Jump(edge) if edge.target == continuation_label => {
+                block.body.push(
+                    Del::new(receiver_temp_name.clone(), false)
+                        .with_meta(Meta::synthetic())
+                        .into(),
+                );
+            }
+            BlockTerm::Raise(_) => {
+                block.body.push(
+                    Del::new(receiver_temp_name.clone(), false)
+                        .with_meta(Meta::synthetic())
+                        .into(),
+                );
+            }
+            BlockTerm::Jump(_)
+            | BlockTerm::IfTerm(_)
+            | BlockTerm::BranchTable(_)
+            | BlockTerm::Return(_) => {}
+        }
+    }
+}
+
+fn load_codegen_temp(temp_name: &ResolvedName) -> InstrCodegen {
+    InstrCodegen::Load(Load::new(temp_name.clone()).with_meta(Meta::synthetic()))
+}
+
+fn dedup_function_ids(function_ids: &[FunctionId]) -> Vec<FunctionId> {
+    let mut seen = HashSet::new();
+    function_ids
+        .iter()
+        .copied()
+        .filter(|function_id| seen.insert(*function_id))
+        .collect()
 }
 
 impl SharedModuleState {
@@ -2444,6 +4095,7 @@ impl ProcessJitState {
             )?;
             return Ok(ReservedJitFunctionCompileInputs {
                 module_constant_ptrs,
+                module_constant_owners: None,
                 counter_slots_by_id: shared_state.counter_slots_by_id().to_vec(),
                 module_constant_object_data_ids,
                 scalar_counter_data_id,
@@ -2495,6 +4147,7 @@ impl ProcessJitState {
         )?;
         Ok(ReservedJitFunctionCompileInputs {
             module_constant_ptrs,
+            module_constant_owners: None,
             counter_slots_by_id: counter_slots_by_id.into_vec(),
             module_constant_object_data_ids,
             scalar_counter_data_id,
@@ -2691,44 +4344,52 @@ impl ProcessJitState {
         batch_function_index: usize,
     ) -> Result<CompiledJitFunction, String> {
         let batch_function = &plan.batch_functions[batch_function_index];
-        let function = &batch_function.function;
-        let placeholder_blocks;
-        let function_blocks = if function.function_id == plan.root_function_id {
-            inputs.blocks
-        } else {
-            placeholder_blocks =
-                vec![std::ptr::null_mut::<std::ffi::c_void>(); function.blocks.len()];
-            placeholder_blocks.as_slice()
-        };
+        let original_function = &batch_function.function;
         let reserved_inputs = plan
             .function_compile_inputs
             .get(&batch_function_index)
             .expect("reserved JIT batch function should have compile inputs");
-        let (
-            function_module,
-            function_module_constants,
-            function_counter_defs,
-            function_direct_call_resolver,
-        ) = if let Some(shared_state) = batch_function.source.shared_state() {
-            (
-                &shared_state.lowered_module,
-                &shared_state.codegen_constants,
-                shared_state.lowered_module.counter_defs.as_slice(),
-                Some(shared_state),
-            )
-        } else {
-            (
-                inputs.module,
-                inputs.module_constants,
-                inputs.counter_defs,
-                None,
-            )
-        };
         let function_module_constant_binding_key = reserved_inputs.module_constant_binding_key;
         let function_module_plan = plan
             .module_plans
             .get(&function_module_constant_binding_key)
             .expect("JIT module plan should be precomputed before worker codegen");
+        let function_module = function_module_plan.module.as_ref();
+        let function = function_module
+            .callable_defs
+            .iter()
+            .find(|candidate| candidate.function_id == original_function.function_id)
+            .ok_or_else(|| {
+                format!(
+                    "planned JIT module is missing function {} ({})",
+                    original_function.function_id, original_function.names.qualname
+                )
+            })?;
+        let planned_module_constants;
+        let (function_module_constants, function_direct_call_resolver) =
+            if let Some(shared_state) = batch_function.source.shared_state() {
+                planned_module_constants = collect_codegen_constants_for_module_name(
+                    shared_state.module_name.as_str(),
+                    function_module,
+                );
+                (&planned_module_constants, Some(shared_state))
+            } else {
+                (inputs.module_constants, None)
+            };
+        let empty_blocks = Vec::new();
+        let placeholder_blocks;
+        let function_blocks = if function.function_id == plan.root_function_id {
+            if inputs.blocks.len() == function.blocks.len() {
+                inputs.blocks
+            } else {
+                empty_blocks.as_slice()
+            }
+        } else {
+            placeholder_blocks =
+                vec![std::ptr::null_mut::<std::ffi::c_void>(); function.blocks.len()];
+            placeholder_blocks.as_slice()
+        };
+        let function_counter_defs = function_module.counter_defs.as_slice();
         let function_jit_local_plan = function_module_plan
             .locals
             .function(function.function_id)
@@ -2747,10 +4408,11 @@ impl ProcessJitState {
                     function.function_id, function.names.qualname
                 )
             })?;
-        let function_deopt_table = Arc::new(RuntimeJitDeoptTable::from_plan(
+        let function_deopt_table = Arc::new(RuntimeJitDeoptTable::from_plan_with_owned_constants(
             function,
             function_jit_deopt_resume_plan,
             reserved_inputs.module_constant_ptrs.as_slice(),
+            reserved_inputs.module_constant_owners.clone(),
         )?);
         let built = build_cranelift_run_bb_specialized_function(
             codegen_env,
@@ -3280,6 +4942,8 @@ pub(crate) struct RuntimeJitDeoptTable {
     function_id: FunctionId,
     function: Box<BlockPyFunction<CodegenModuleShape>>,
     module_constant_ptrs: Vec<ObjPtr>,
+    #[cfg(not(test))]
+    _module_constant_owners: Option<Arc<Vec<Py<PyAny>>>>,
     points: Vec<RuntimeJitDeoptRecord>,
 }
 
@@ -3647,6 +5311,17 @@ impl RuntimeJitDeoptTable {
         plan: &PlannedJitDeoptResumeFunction,
         module_constant_ptrs: &[*mut ffi::PyObject],
     ) -> Result<Self, String> {
+        Self::from_plan_with_owned_constants(function, plan, module_constant_ptrs, None)
+    }
+
+    fn from_plan_with_owned_constants(
+        function: &BlockPyFunction<CodegenModuleShape>,
+        plan: &PlannedJitDeoptResumeFunction,
+        module_constant_ptrs: &[*mut ffi::PyObject],
+        #[cfg_attr(test, allow(unused_variables))] module_constant_owners: Option<
+            Arc<Vec<Py<PyAny>>>,
+        >,
+    ) -> Result<Self, String> {
         let mut points = Vec::with_capacity(plan.deopt_points.len());
         for deopt_point in &plan.deopt_points {
             let entry = plan.entry(deopt_point.resume_point).ok_or_else(|| {
@@ -3673,6 +5348,8 @@ impl RuntimeJitDeoptTable {
                 .iter()
                 .map(|ptr| ptr.cast::<c_void>())
                 .collect(),
+            #[cfg(not(test))]
+            _module_constant_owners: module_constant_owners,
             points,
         };
         table.validate_against_plan(plan)?;
@@ -3951,10 +5628,119 @@ fn typed_nested_guard_scan_expr(expr: &InstrTyped, saw_replay_unsafe_effect: &mu
         InstrTyped::LegacyCalleeFunctionId(op) => {
             typed_nested_guard_scan_expr(op.value.as_ref(), saw_replay_unsafe_effect)
         }
+        InstrTyped::CallTyped(op) => {
+            if op.args.is_empty()
+                && op.keywords.is_empty()
+                && let InstrTyped::GetAttrTyped(getattr) = op.func.as_ref()
+            {
+                // Direct-method guard code evaluates only the receiver before the guard.
+                // Keep this no-arg only until argument guard points carry their own
+                // precise resume state.
+                return typed_nested_guard_scan_expr(
+                    getattr.value.as_ref(),
+                    saw_replay_unsafe_effect,
+                ) && nested_guard_candidate_seen_before_replay_unsafe_effect(
+                    true,
+                    *saw_replay_unsafe_effect,
+                ) && mark_replay_unsafe_effect(saw_replay_unsafe_effect);
+            }
+            typed_nested_guard_scan_expr(op.func.as_ref(), saw_replay_unsafe_effect)
+                && typed_nested_guard_scan_positional_args(
+                    op.args.as_slice(),
+                    saw_replay_unsafe_effect,
+                )
+                && typed_nested_guard_scan_keyword_args(
+                    op.keywords.as_slice(),
+                    saw_replay_unsafe_effect,
+                )
+                && nested_guard_candidate_seen_before_replay_unsafe_effect(
+                    true,
+                    *saw_replay_unsafe_effect,
+                )
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::GuardedCallableCallTyped(op) => {
+            typed_nested_guard_scan_expr(op.func.as_ref(), saw_replay_unsafe_effect)
+                && typed_nested_guard_scan_positional_args(
+                    op.args.as_slice(),
+                    saw_replay_unsafe_effect,
+                )
+                && typed_nested_guard_scan_keyword_args(
+                    op.keywords.as_slice(),
+                    saw_replay_unsafe_effect,
+                )
+                && nested_guard_candidate_seen_before_replay_unsafe_effect(
+                    true,
+                    *saw_replay_unsafe_effect,
+                )
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::GuardedMethodCallTyped(op) => {
+            if op.args.is_empty()
+                && op.keywords.is_empty()
+                && let InstrTyped::GetAttrTyped(getattr) = op.func.as_ref()
+            {
+                // Direct-method guard code evaluates only the receiver before the guard.
+                // Keep this no-arg only until argument guard points carry their own
+                // precise resume state.
+                return typed_nested_guard_scan_expr(
+                    getattr.value.as_ref(),
+                    saw_replay_unsafe_effect,
+                ) && nested_guard_candidate_seen_before_replay_unsafe_effect(
+                    true,
+                    *saw_replay_unsafe_effect,
+                ) && mark_replay_unsafe_effect(saw_replay_unsafe_effect);
+            }
+            typed_nested_guard_scan_expr(op.func.as_ref(), saw_replay_unsafe_effect)
+                && typed_nested_guard_scan_positional_args(
+                    op.args.as_slice(),
+                    saw_replay_unsafe_effect,
+                )
+                && typed_nested_guard_scan_keyword_args(
+                    op.keywords.as_slice(),
+                    saw_replay_unsafe_effect,
+                )
+                && nested_guard_candidate_seen_before_replay_unsafe_effect(
+                    true,
+                    *saw_replay_unsafe_effect,
+                )
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::DirectCallableCallTyped(op) => {
+            typed_nested_guard_scan_expr(op.func.as_ref(), saw_replay_unsafe_effect)
+                && typed_nested_guard_scan_positional_args(
+                    op.args.as_slice(),
+                    saw_replay_unsafe_effect,
+                )
+                && nested_guard_candidate_seen_before_replay_unsafe_effect(
+                    true,
+                    *saw_replay_unsafe_effect,
+                )
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::DirectMethodCallTyped(op) => {
+            typed_nested_guard_scan_expr(op.receiver.as_ref(), saw_replay_unsafe_effect)
+                && typed_nested_guard_scan_positional_args(
+                    op.args.as_slice(),
+                    saw_replay_unsafe_effect,
+                )
+                && nested_guard_candidate_seen_before_replay_unsafe_effect(
+                    true,
+                    *saw_replay_unsafe_effect,
+                )
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::DirectCallGuardTest(op) => {
+            typed_nested_guard_scan_expr(op.value.as_ref(), saw_replay_unsafe_effect)
+                && nested_guard_candidate_seen_before_replay_unsafe_effect(
+                    true,
+                    *saw_replay_unsafe_effect,
+                )
+        }
         InstrTyped::LegacyCall(op) => {
             if op.args.is_empty()
                 && op.keywords.is_empty()
-                && let InstrTyped::LegacyGetAttr(getattr) = op.func.as_ref()
+                && let InstrTyped::GetAttrTyped(getattr) = op.func.as_ref()
             {
                 // Direct-method guard code evaluates only the receiver before the guard.
                 // Keep this no-arg only until argument guard points carry their own
@@ -3992,6 +5778,25 @@ fn typed_nested_guard_scan_expr(expr: &InstrTyped, saw_replay_unsafe_effect: &mu
                     op.keywords.as_slice(),
                     saw_replay_unsafe_effect,
                 )
+                && nested_guard_candidate_seen_before_replay_unsafe_effect(
+                    true,
+                    *saw_replay_unsafe_effect,
+                )
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::GetAttrTyped(op) => {
+            typed_nested_guard_scan_expr(op.value.as_ref(), saw_replay_unsafe_effect)
+                && typed_nested_guard_scan_expr(op.attr.as_ref(), saw_replay_unsafe_effect)
+                && nested_guard_candidate_seen_before_replay_unsafe_effect(
+                    true,
+                    *saw_replay_unsafe_effect,
+                )
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::SetAttrTyped(op) => {
+            typed_nested_guard_scan_expr(op.value.as_ref(), saw_replay_unsafe_effect)
+                && typed_nested_guard_scan_expr(op.attr.as_ref(), saw_replay_unsafe_effect)
+                && typed_nested_guard_scan_expr(op.replacement.as_ref(), saw_replay_unsafe_effect)
                 && nested_guard_candidate_seen_before_replay_unsafe_effect(
                     true,
                     *saw_replay_unsafe_effect,
@@ -4180,6 +5985,12 @@ fn runtime_jit_deopt_expr_supported(
         }
         InstrCodegen::CalleeFunctionId(callee) => {
             runtime_jit_deopt_expr_supported(&callee.value, support)
+        }
+        InstrCodegen::DirectFunctionIdGuardTest(guard) => {
+            runtime_jit_deopt_expr_supported(&guard.value, support)
+        }
+        InstrCodegen::DirectReceiverTypeVersionGuardTest(guard) => {
+            runtime_jit_deopt_expr_supported(&guard.value, support)
         }
         InstrCodegen::Call(call) => {
             runtime_jit_deopt_call_parts_supported(&call.func, &call.args, &call.keywords, support)
@@ -4673,6 +6484,58 @@ fn codegen_expr_pyobject_input_is_borrowed_from_local_env(
     )
 }
 
+fn typed_expr_is_borrowable_from_local_env(
+    expr: &InstrTyped,
+    local_env: &LocalEnv,
+    stack_slots: &StackSlots,
+    storage_layout: Option<&StorageLayout>,
+) -> bool {
+    match expr {
+        InstrTyped::Load(op) => {
+            let Some(location) = op.name.local_location() else {
+                return false;
+            };
+            if local_env.entry_index_for_location(location).is_some() {
+                return true;
+            }
+            storage_layout
+                .and_then(|layout| layout.stack_slots().get(location.slot() as usize))
+                .is_some_and(|name| {
+                    local_env.entry_index_for_name(name).is_some() || stack_slots.has_name(name)
+                })
+        }
+        _ => false,
+    }
+}
+
+fn planned_pyobject_input_borrowed_ok_for_typed_expr(
+    result_demand_plan: &ResultDemandPlan,
+    expr: &InstrTyped,
+) -> Option<bool> {
+    let instr_id = expr.try_semantic_instr_id()?;
+    result_demand_plan
+        .demand_for_instr_id(instr_id)
+        .map(ResultDemand::borrowed_ok)
+}
+
+fn typed_expr_pyobject_input_is_borrowed_from_local_env(
+    expr: &InstrTyped,
+    local_env: &LocalEnv,
+    ctx: &JitEmitCtx<'_>,
+) -> bool {
+    let planned_borrowed_ok =
+        planned_pyobject_input_borrowed_ok_for_typed_expr(ctx.result_demand_plan, expr);
+    if !planned_borrowed_ok.unwrap_or(true) {
+        return false;
+    }
+    typed_expr_is_borrowable_from_local_env(
+        expr,
+        local_env,
+        &ctx.stack_slots,
+        ctx.storage_layout.as_ref(),
+    )
+}
+
 fn local_name_for_location<'a>(
     storage_layout: &'a StorageLayout,
     location: LocalLocation,
@@ -5000,25 +6863,6 @@ fn codegen_expr_runtime_helper(
         })
 }
 
-fn load_deleted_name_arg<'a>(
-    expr: &'a InstrCodegen,
-    module_constants: &'a ModuleCodegenConstants,
-) -> Option<&'a InstrCodegen> {
-    let InstrCodegen::Call(call) = expr else {
-        return None;
-    };
-    if !call.keywords.is_empty() || call.args.len() != 2 {
-        return None;
-    }
-    if codegen_expr_helper_name(call.func.as_ref(), module_constants) != Some("load_deleted_name") {
-        return None;
-    }
-    let CallArgPositional::Positional(value) = &call.args[1] else {
-        return None;
-    };
-    Some(value)
-}
-
 struct SuperInstanceArg {
     value: ir::Value,
     is_borrowed: bool,
@@ -5062,29 +6906,13 @@ fn emit_super_instance_arg_with_local_env(
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> SuperInstanceArg {
-    if let Some(value_expr) = load_deleted_name_arg(instance_expr, ctx.module_constants) {
-        if let Some((value, is_deleted)) =
-            emit_local_value_for_super_deleted_name_arg(fb, value_expr, local_env, ctx)
-        {
-            return SuperInstanceArg {
-                value,
-                is_borrowed: true,
-                is_deleted: Some(is_deleted),
-            };
-        }
-        let value = emit_codegen_expr_with_local_env(
-            fb,
-            value_expr,
-            local_env,
-            ctx,
-            false,
-            codegen_env,
-            func_imports,
-        );
+    if let Some((value, is_deleted)) =
+        emit_local_value_for_super_deleted_name_arg(fb, instance_expr, local_env, ctx)
+    {
         return SuperInstanceArg {
             value,
-            is_borrowed: false,
-            is_deleted: None,
+            is_borrowed: true,
+            is_deleted: Some(is_deleted),
         };
     }
     let instance_is_borrowed =
@@ -5293,11 +7121,11 @@ fn load_py_function_soac_metadata_obj(
     )
 }
 
-fn emit_direct_function_env_load(
+fn emit_resolved_direct_function_metadata_and_env(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
     ctx: &JitEmitCtx<'_>,
-) -> ir::Value {
+) -> (ir::Value, ir::Value) {
     let ptr_ty = ctx.consts.ptr_ty;
     let null_ptr = fb.ins().iconst(ptr_ty, 0);
 
@@ -5306,17 +7134,14 @@ fn emit_direct_function_env_load(
         .ins()
         .icmp(ir::condcodes::IntCC::Equal, metadata, null_ptr);
     let load_env_block = fb.create_block();
-    let env_ok_block = fb.create_block();
+    let compile_block = fb.create_block();
+    fb.set_cold_block(compile_block);
     let done_block = fb.create_block();
     fb.append_block_param(done_block, ptr_ty);
+    fb.append_block_param(done_block, ptr_ty);
 
-    fb.ins().brif(
-        metadata_is_null,
-        done_block,
-        &[ir::BlockArg::Value(null_ptr)],
-        load_env_block,
-        &[],
-    );
+    fb.ins()
+        .brif(metadata_is_null, compile_block, &[], load_env_block, &[]);
 
     fb.switch_to_block(load_env_block);
     let env = fb.ins().load(
@@ -5328,17 +7153,110 @@ fn emit_direct_function_env_load(
     let env_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, env, null_ptr);
     fb.ins().brif(
         env_is_null,
+        compile_block,
+        &[],
         done_block,
-        &[ir::BlockArg::Value(null_ptr)],
-        env_ok_block,
+        &[ir::BlockArg::Value(metadata), ir::BlockArg::Value(env)],
+    );
+
+    fb.switch_to_block(compile_block);
+    let compiled_env_inst = fb
+        .ins()
+        .call(ctx.direct_compile_function_env_ref, &[callable, metadata]);
+    let compiled_env = fb.inst_results(compiled_env_inst)[0];
+    let compiled_env_is_null = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, compiled_env, null_ptr);
+    fb.ins().brif(
+        compiled_env_is_null,
+        ctx.consts.step_null_block,
+        &step_null_block_args(ctx),
+        done_block,
+        &[
+            ir::BlockArg::Value(metadata),
+            ir::BlockArg::Value(compiled_env),
+        ],
+    );
+
+    fb.switch_to_block(done_block);
+    (
+        fb.block_params(done_block)[0],
+        fb.block_params(done_block)[1],
+    )
+}
+
+fn emit_resolved_direct_entry_ptr(
+    fb: &mut FunctionBuilder<'_>,
+    callable: ir::Value,
+    metadata: ir::Value,
+    function_env: ir::Value,
+    entry_kind: DirectCallEntryKind,
+    ctx: &JitEmitCtx<'_>,
+) -> (ir::Value, ir::Value) {
+    let ptr_ty = ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let offset = match entry_kind {
+        DirectCallEntryKind::Core => FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET,
+        DirectCallEntryKind::DefaultResolving => FUNCTION_ENV_DEFAULT_DIRECT_CODE_PTR_OFFSET,
+    };
+    let initial_callee_ptr = load_function_env_obj(fb, ptr_ty, function_env, offset);
+    let initial_callee_is_null =
+        fb.ins()
+            .icmp(ir::condcodes::IntCC::Equal, initial_callee_ptr, null_ptr);
+    let compile_block = fb.create_block();
+    fb.set_cold_block(compile_block);
+    let ready_block = fb.create_block();
+    fb.append_block_param(ready_block, ptr_ty);
+    fb.append_block_param(ready_block, ptr_ty);
+    fb.ins().brif(
+        initial_callee_is_null,
+        compile_block,
+        &[],
+        ready_block,
+        &[
+            ir::BlockArg::Value(function_env),
+            ir::BlockArg::Value(initial_callee_ptr),
+        ],
+    );
+
+    fb.switch_to_block(compile_block);
+    let compiled_env_inst = fb
+        .ins()
+        .call(ctx.direct_compile_function_env_ref, &[callable, metadata]);
+    let compiled_env = fb.inst_results(compiled_env_inst)[0];
+    let compiled_env_is_null = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, compiled_env, null_ptr);
+    let compiled_env_ok = fb.create_block();
+    fb.ins().brif(
+        compiled_env_is_null,
+        ctx.consts.step_null_block,
+        &step_null_block_args(ctx),
+        compiled_env_ok,
         &[],
     );
 
-    fb.switch_to_block(env_ok_block);
-    fb.ins().jump(done_block, &[ir::BlockArg::Value(env)]);
+    fb.switch_to_block(compiled_env_ok);
+    let compiled_callee_ptr = load_function_env_obj(fb, ptr_ty, compiled_env, offset);
+    let compiled_callee_is_null =
+        fb.ins()
+            .icmp(ir::condcodes::IntCC::Equal, compiled_callee_ptr, null_ptr);
+    fb.ins().brif(
+        compiled_callee_is_null,
+        ctx.consts.step_null_block,
+        &step_null_block_args(ctx),
+        ready_block,
+        &[
+            ir::BlockArg::Value(compiled_env),
+            ir::BlockArg::Value(compiled_callee_ptr),
+        ],
+    );
 
-    fb.switch_to_block(done_block);
-    fb.block_params(done_block)[0]
+    fb.switch_to_block(ready_block);
+    (
+        fb.block_params(ready_block)[0],
+        fb.block_params(ready_block)[1],
+    )
 }
 
 fn emit_take_current_raised_exception(
@@ -5633,6 +7551,34 @@ fn insert_typed_child_demands(plan: &mut ResultDemandPlan, expr: &InstrTyped) {
             plan.insert_instr(store.value.as_ref(), ResultDemand::PYOBJECT_OWNED);
             insert_typed_child_demands(plan, store.value.as_ref());
         }
+        InstrTyped::CallTyped(call) => {
+            plan.insert_instr(call.func.as_ref(), ResultDemand::PYOBJECT_BORROWED_OK);
+            insert_typed_child_demands(plan, call.func.as_ref());
+            insert_call_arg_input_demands(plan, call.args.as_slice(), call.keywords.as_slice());
+        }
+        InstrTyped::GuardedCallableCallTyped(call) => {
+            plan.insert_instr(call.func.as_ref(), ResultDemand::PYOBJECT_BORROWED_OK);
+            insert_typed_child_demands(plan, call.func.as_ref());
+            insert_call_arg_input_demands(plan, call.args.as_slice(), call.keywords.as_slice());
+        }
+        InstrTyped::GuardedMethodCallTyped(call) => {
+            plan.insert_instr(call.func.as_ref(), ResultDemand::PYOBJECT_BORROWED_OK);
+            insert_typed_child_demands(plan, call.func.as_ref());
+            insert_call_arg_input_demands(plan, call.args.as_slice(), call.keywords.as_slice());
+        }
+        InstrTyped::DirectCallableCallTyped(call) => {
+            plan.insert_instr(call.func.as_ref(), ResultDemand::PYOBJECT_BORROWED_OK);
+            insert_typed_child_demands(plan, call.func.as_ref());
+            insert_call_arg_input_demands(plan, call.args.as_slice(), &[]);
+        }
+        InstrTyped::DirectMethodCallTyped(call) => {
+            plan.insert_instr(call.receiver.as_ref(), ResultDemand::PYOBJECT_BORROWED_OK);
+            insert_typed_child_demands(plan, call.receiver.as_ref());
+            insert_call_arg_input_demands(plan, call.args.as_slice(), &[]);
+        }
+        InstrTyped::DirectCallGuardTest(op) => {
+            insert_pyobject_borrowed_input_demand(plan, op.value.as_ref());
+        }
         InstrTyped::LegacyCall(call) => {
             plan.insert_instr(call.func.as_ref(), ResultDemand::PYOBJECT_BORROWED_OK);
             insert_typed_child_demands(plan, call.func.as_ref());
@@ -5642,6 +7588,15 @@ fn insert_typed_child_demands(plan: &mut ResultDemandPlan, expr: &InstrTyped) {
             plan.insert_instr(call.callable.as_ref(), ResultDemand::PYOBJECT_BORROWED_OK);
             insert_typed_child_demands(plan, call.callable.as_ref());
             insert_call_arg_input_demands(plan, call.args.as_slice(), call.keywords.as_slice());
+        }
+        InstrTyped::GetAttrTyped(op) => {
+            insert_pyobject_borrowed_input_demand(plan, op.value.as_ref());
+            insert_pyobject_borrowed_input_demand(plan, op.attr.as_ref());
+        }
+        InstrTyped::SetAttrTyped(op) => {
+            insert_pyobject_borrowed_input_demand(plan, op.value.as_ref());
+            insert_pyobject_borrowed_input_demand(plan, op.attr.as_ref());
+            insert_pyobject_borrowed_input_demand(plan, op.replacement.as_ref());
         }
         InstrTyped::LegacyGetAttr(op) => {
             insert_pyobject_borrowed_input_demand(plan, op.value.as_ref());
@@ -5740,6 +7695,7 @@ struct JitEmitCtx<'mc> {
     store_field_indexed_ref: ir::FuncRef,
     load_runtime_obj_by_id_ref: ir::FuncRef,
     enter_recursive_ref: ir::FuncRef,
+    direct_compile_function_env_ref: ir::FuncRef,
     pyobject_getattr_ref: ir::FuncRef,
     pyobject_setattr_ref: ir::FuncRef,
     pyobject_getitem_ref: ir::FuncRef,
@@ -6234,6 +8190,94 @@ struct DirectFunctionSpecialization {
     arg_plan: DirectCallArgPlan,
 }
 
+fn direct_call_arg_plan_from_typed(plan: &TypedDirectCallArgPlan) -> DirectCallArgPlan {
+    DirectCallArgPlan {
+        sources: plan
+            .sources
+            .iter()
+            .map(|source| match source {
+                TypedDirectCallArgSource::Provided(index) => DirectCallArgSource::Provided(*index),
+                TypedDirectCallArgSource::DefaultSentinel => DirectCallArgSource::DefaultSentinel,
+            })
+            .collect(),
+    }
+}
+
+fn direct_function_specializations_from_typed_guards(
+    guards: &[TypedDirectFunctionCallGuard],
+) -> Vec<DirectFunctionSpecialization> {
+    guards
+        .iter()
+        .map(|guard| DirectFunctionSpecialization {
+            function_id: guard.function_id,
+            arg_plan: direct_call_arg_plan_from_typed(&guard.arg_plan),
+        })
+        .collect()
+}
+
+fn direct_constructor_specializations_from_typed_guards(
+    guards: &[TypedDirectConstructorCallGuard],
+) -> Vec<DirectConstructorSpecialization> {
+    guards
+        .iter()
+        .filter_map(direct_constructor_specialization_from_typed_guard)
+        .collect()
+}
+
+fn direct_constructor_specialization_from_typed_guard(
+    guard: &TypedDirectConstructorCallGuard,
+) -> Option<DirectConstructorSpecialization> {
+    let owner_type_ref = reloc_type_ref_from_typed_attr_owner_ref(&guard.owner_type_ref)?;
+    Some(DirectConstructorSpecialization {
+        function_id: guard.function_id,
+        init_function_ref: RelocCallableRef::OwnerAttr {
+            owner_type_ref: owner_type_ref.clone(),
+            attr_name: "__init__".to_string(),
+        },
+        owner_type_ref,
+        type_version: guard.type_version,
+        arg_plan: direct_call_arg_plan_from_typed(&guard.arg_plan),
+    })
+}
+
+fn direct_method_specializations_from_typed_guards(
+    guards: &[TypedDirectMethodCallGuard],
+    method_name: &str,
+) -> Vec<DirectMethodSpecialization> {
+    guards
+        .iter()
+        .filter_map(|guard| {
+            let owner_type_ref = reloc_type_ref_from_typed_attr_owner_ref(&guard.owner_type_ref)?;
+            Some(DirectMethodSpecialization {
+                function_id: guard.function_id,
+                descriptor_function_ref: RelocCallableRef::OwnerAttr {
+                    owner_type_ref: owner_type_ref.clone(),
+                    attr_name: method_name.to_string(),
+                },
+                owner_type_ref,
+                type_version: guard.type_version,
+                arg_plan: direct_call_arg_plan_from_typed(&guard.arg_plan),
+            })
+        })
+        .collect()
+}
+
+fn direct_method_specialization_from_typed_call(
+    call: &TypedDirectMethodCall<InstrTyped>,
+) -> Option<DirectMethodSpecialization> {
+    let owner_type_ref = reloc_type_ref_from_typed_attr_owner_ref(&call.guard.owner_type_ref)?;
+    Some(DirectMethodSpecialization {
+        function_id: call.guard.function_id,
+        descriptor_function_ref: RelocCallableRef::OwnerAttr {
+            owner_type_ref: owner_type_ref.clone(),
+            attr_name: call.method_name.clone(),
+        },
+        owner_type_ref,
+        type_version: call.guard.type_version,
+        arg_plan: direct_call_arg_plan_from_typed(&call.guard.arg_plan),
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DirectCallArgPlan {
     sources: Vec<DirectCallArgSource>,
@@ -6533,6 +8577,16 @@ struct FieldIndexSpecialization {
     type_version: u32,
 }
 
+impl FieldIndexSpecialization {
+    fn to_typed_guard(&self) -> TypedIndexedFieldGuard {
+        TypedIndexedFieldGuard {
+            expected_index: self.expected_index,
+            owner_type_ref: typed_attr_owner_ref_from_reloc_type_ref(&self.owner_type_ref),
+            type_version: self.type_version,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum CpythonTypeSymbol {
     Function,
@@ -6546,6 +8600,45 @@ enum CpythonTypeSymbol {
 enum RelocTypeRef {
     CpythonTypeSymbol(CpythonTypeSymbol),
     TypeKey(CounterDumpTypeKey),
+}
+
+fn typed_attr_owner_ref_from_reloc_type_ref(owner_type_ref: &RelocTypeRef) -> TypedAttrOwnerRef {
+    match owner_type_ref {
+        RelocTypeRef::CpythonTypeSymbol(symbol) => {
+            TypedAttrOwnerRef::CpythonTypeSymbol(cpython_type_symbol_name(*symbol).to_string())
+        }
+        RelocTypeRef::TypeKey(type_key) => TypedAttrOwnerRef::TypeKey {
+            module_name: type_key.module_name.clone(),
+            qualname: type_key.qualname.clone(),
+        },
+    }
+}
+
+fn reloc_type_ref_from_typed_attr_owner_ref(
+    owner_type_ref: &TypedAttrOwnerRef,
+) -> Option<RelocTypeRef> {
+    match owner_type_ref {
+        TypedAttrOwnerRef::CpythonTypeSymbol(symbol_name) => {
+            cpython_type_symbol_from_name(symbol_name).map(RelocTypeRef::CpythonTypeSymbol)
+        }
+        TypedAttrOwnerRef::TypeKey {
+            module_name,
+            qualname,
+        } => Some(RelocTypeRef::TypeKey(CounterDumpTypeKey {
+            module_name: module_name.clone(),
+            qualname: qualname.clone(),
+        })),
+    }
+}
+
+fn field_index_specialization_from_typed_guard(
+    guard: &TypedIndexedFieldGuard,
+) -> Option<FieldIndexSpecialization> {
+    Some(FieldIndexSpecialization {
+        expected_index: guard.expected_index,
+        owner_type_ref: reloc_type_ref_from_typed_attr_owner_ref(&guard.owner_type_ref)?,
+        type_version: guard.type_version,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -7152,9 +9245,20 @@ fn local_ref_kind_for_stored_value(value: &InstrCodegen, ctx: &JitEmitCtx<'_>) -
 
 fn py_facts_for_codegen_expr_with_local_env(
     expr: &InstrCodegen,
-    _local_env: &LocalEnv,
+    local_env: &LocalEnv,
     ctx: &JitEmitCtx<'_>,
 ) -> Option<PyObjFacts> {
+    if let InstrCodegen::Load(op) = expr {
+        if let Some(py_facts) = local_env.py_facts_for_load(&op.name) {
+            return Some(py_facts);
+        }
+        if op.name.location.as_constant().is_some_and(|index| {
+            ctx.module_constants
+                .constant_is_int(ModuleConstantId(index as usize))
+        }) {
+            return Some(PyObjFacts::exact_type(PyExactType::Int));
+        }
+    }
     ctx.value_facts_for_expr(expr)
         .and_then(ValueFacts::as_pyobj)
 }
@@ -7882,9 +9986,7 @@ impl<'a, 'b, 'mc, 'c, 'd, Env: JitCodegenEnv> intrinsics::OperationEmitState<'b,
     }
 
     fn py_facts_for_arg(&self, arg: &InstrCodegen) -> PyObjFacts {
-        self.ctx
-            .value_facts_for_expr(arg)
-            .and_then(ValueFacts::as_pyobj)
+        py_facts_for_codegen_expr_with_local_env(arg, self.local_env, self.ctx)
             .unwrap_or_else(PyObjFacts::unknown)
     }
 
@@ -9874,6 +11976,86 @@ pub(super) fn codegen_constant_string_value<'a>(
     module_constant_string_value(module, constant_index)
 }
 
+pub(super) fn typed_constant_string_value<'a>(
+    module: &'a BlockPyModule<CodegenModuleShape>,
+    expr: &InstrTyped,
+) -> Option<&'a str> {
+    let InstrTyped::Load(load) = expr else {
+        return None;
+    };
+    let NameLocation::Constant(constant_index) = load.name.location else {
+        return None;
+    };
+    module_constant_string_value(module, constant_index)
+}
+
+fn annotate_typed_attr_accesses(
+    module: &BlockPyModule<CodegenModuleShape>,
+    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    field_index_specializations: &HashMap<String, Vec<FieldIndexSpecialization>>,
+    specialize_stores: bool,
+) -> usize {
+    struct Annotator<'a> {
+        module: &'a BlockPyModule<CodegenModuleShape>,
+        field_index_specializations: &'a HashMap<String, Vec<FieldIndexSpecialization>>,
+        specialize_stores: bool,
+        count: usize,
+    }
+
+    impl VisitMut<InstrTyped> for Annotator<'_> {
+        fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+            match expr {
+                InstrTyped::GetAttrTyped(op) => {
+                    if let Some(guards) = typed_constant_string_value(self.module, op.attr.as_ref())
+                        .and_then(|attr_name| self.field_index_specializations.get(attr_name))
+                        .filter(|specializations| !specializations.is_empty())
+                        .map(|specializations| {
+                            specializations
+                                .iter()
+                                .map(FieldIndexSpecialization::to_typed_guard)
+                                .collect::<Vec<_>>()
+                        })
+                    {
+                        op.access = TypedAttrAccessPlan::ProfiledIndexedField { guards };
+                        self.count += 1;
+                    }
+                }
+                InstrTyped::SetAttrTyped(op) if self.specialize_stores => {
+                    if let Some(guards) = typed_constant_string_value(self.module, op.attr.as_ref())
+                        .and_then(|attr_name| self.field_index_specializations.get(attr_name))
+                        .filter(|specializations| !specializations.is_empty())
+                        .map(|specializations| {
+                            specializations
+                                .iter()
+                                .map(FieldIndexSpecialization::to_typed_guard)
+                                .collect::<Vec<_>>()
+                        })
+                    {
+                        op.access = TypedAttrAccessPlan::ProfiledIndexedField { guards };
+                        self.count += 1;
+                    }
+                }
+                _ => {}
+            }
+            expr.visit_children_mut(self);
+        }
+    }
+
+    let mut annotator = Annotator {
+        module,
+        field_index_specializations,
+        specialize_stores,
+        count: 0,
+    };
+    for block in &mut function.blocks {
+        for instr in &mut block.body {
+            annotator.visit_instr_mut(instr);
+        }
+        annotator.visit_term_mut(&mut block.term);
+    }
+    annotator.count
+}
+
 fn direct_method_owner_attr_specializations(
     ctx: &JitEmitCtx<'_>,
     function_id: FunctionId,
@@ -9928,9 +12110,25 @@ fn direct_constructor_owner_attr_specializations(
         .collect()
 }
 
+fn call_site_profiled_targets<'a>(
+    call: &blockpy_intrinsics::Call<InstrCodegen>,
+    ctx: &'a JitEmitCtx<'_>,
+    profiled_targets: Option<&'a [FunctionId]>,
+) -> Option<&'a [FunctionId]> {
+    if let Some(targets) = profiled_targets.filter(|targets| !targets.is_empty()) {
+        return Some(targets);
+    }
+    let instr_id = call.try_semantic_instr_id()?;
+    ctx.call_target_specializations
+        .get(&instr_id)
+        .map(Vec::as_slice)
+        .filter(|targets| !targets.is_empty())
+}
+
 fn direct_method_specializations_for_call_site(
     call: &blockpy_intrinsics::Call<InstrCodegen>,
     ctx: &JitEmitCtx<'_>,
+    profiled_targets: Option<&[FunctionId]>,
 ) -> Vec<DirectMethodSpecialization> {
     if ctx.shared_state.is_none() {
         return Vec::new();
@@ -9941,10 +12139,7 @@ fn direct_method_specializations_for_call_site(
     let Some(method_name) = codegen_constant_string_value(ctx.module, getattr.attr.as_ref()) else {
         return Vec::new();
     };
-    let Some(instr_id) = call.try_semantic_instr_id() else {
-        return Vec::new();
-    };
-    let Some(targets) = ctx.call_target_specializations.get(&instr_id) else {
+    let Some(targets) = call_site_profiled_targets(call, ctx, profiled_targets) else {
         return Vec::new();
     };
     let explicit_positional_arg_count = direct_call_positional_arg_count(&call.args);
@@ -9952,6 +12147,10 @@ fn direct_method_specializations_for_call_site(
     let has_keywords = !call.keywords.is_empty();
     let mut out = Vec::new();
     for function_id in targets.iter().copied() {
+        let owners = direct_method_owner_attr_specializations(ctx, function_id, method_name);
+        if owners.is_empty() {
+            continue;
+        }
         let Some(target_function) = direct_call_target_function(ctx, function_id) else {
             ctx.direct_edge_stats
                 .record_profiled_missing_target_candidate();
@@ -9971,7 +12170,7 @@ fn direct_method_specializations_for_call_site(
                 continue;
             }
         };
-        for owner in direct_method_owner_attr_specializations(ctx, function_id, method_name) {
+        for owner in owners {
             out.push(DirectMethodSpecialization {
                 function_id,
                 descriptor_function_ref: RelocCallableRef::OwnerAttr {
@@ -9990,14 +12189,12 @@ fn direct_method_specializations_for_call_site(
 fn direct_constructor_specializations_for_call_site(
     call: &blockpy_intrinsics::Call<InstrCodegen>,
     ctx: &JitEmitCtx<'_>,
+    profiled_targets: Option<&[FunctionId]>,
 ) -> Vec<DirectConstructorSpecialization> {
     if ctx.shared_state.is_none() {
         return Vec::new();
     }
-    let Some(instr_id) = call.try_semantic_instr_id() else {
-        return Vec::new();
-    };
-    let Some(targets) = ctx.call_target_specializations.get(&instr_id) else {
+    let Some(targets) = call_site_profiled_targets(call, ctx, profiled_targets) else {
         return Vec::new();
     };
     let explicit_positional_arg_count = direct_call_positional_arg_count(&call.args);
@@ -10005,6 +12202,10 @@ fn direct_constructor_specializations_for_call_site(
     let has_keywords = !call.keywords.is_empty();
     let mut out = Vec::new();
     for function_id in targets.iter().copied() {
+        let owners = direct_constructor_owner_attr_specializations(ctx, function_id);
+        if owners.is_empty() {
+            continue;
+        }
         let Some(target_function) = direct_call_target_function(ctx, function_id) else {
             ctx.direct_edge_stats
                 .record_profiled_missing_target_candidate();
@@ -10024,7 +12225,7 @@ fn direct_constructor_specializations_for_call_site(
                 continue;
             }
         };
-        for owner in direct_constructor_owner_attr_specializations(ctx, function_id) {
+        for owner in owners {
             out.push(DirectConstructorSpecialization {
                 function_id,
                 init_function_ref: RelocCallableRef::OwnerAttr {
@@ -10239,6 +12440,11 @@ impl<'a> SpecializationProfile<'a> {
             profiled_cold_blocks: profiled_cold_blocks_enabled()?,
             guard_miss_deopt: true,
         })
+    }
+
+    fn has_existing_counter_dump(&self) -> bool {
+        self.module_name.is_some()
+            && existing_counter_dump_path(self.counter_dump_path.as_deref()).is_some()
     }
 
     fn call_target_specializations(
@@ -10612,6 +12818,24 @@ fn resolve_reloc_callable_ref_to_object(
     }
 }
 
+fn owner_attr_function_id_for_type_ref(
+    owner_type_ref: &RelocTypeRef,
+    attr_name: &str,
+) -> Result<Option<FunctionId>, String> {
+    let callable_ref = RelocCallableRef::OwnerAttr {
+        owner_type_ref: owner_type_ref.clone(),
+        attr_name: attr_name.to_string(),
+    };
+    let Some(callable) = resolve_reloc_callable_ref_to_object(&callable_ref)? else {
+        return Ok(None);
+    };
+    let packed = unsafe { crate::PyFunction_GetSoacFunctionId(callable as *mut ffi::PyObject) };
+    if packed == FunctionId::global().packed() {
+        return Ok(None);
+    }
+    Ok(Some(FunctionId::from_packed(packed)))
+}
+
 fn ensure_reloc_callable_symbol_registered(
     callable_ref: &RelocCallableRef,
 ) -> Result<bool, String> {
@@ -10929,6 +13153,140 @@ pub(super) fn emit_exact_type_version_match(
     fb.ins().band(type_matches, version_matches)
 }
 
+fn emit_exact_receiver_type_version_match_bool01(
+    fb: &mut FunctionBuilder<'_>,
+    receiver: ir::Value,
+    expected_type: ir::Value,
+    expected_version: u32,
+    ctx: &JitEmitCtx<'_>,
+) -> SoacValue {
+    let i32_ty = ctx.consts.i32_ty;
+    let null_ptr = fb.ins().iconst(ctx.consts.ptr_ty, 0);
+    let zero_i32 = fb.ins().iconst(i32_ty, 0);
+    let done_block = fb.create_block();
+    let non_null_block = fb.create_block();
+    fb.append_block_param(done_block, i32_ty);
+
+    let is_null = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, receiver, null_ptr);
+    fb.ins().brif(
+        is_null,
+        done_block,
+        &[ir::BlockArg::Value(zero_i32)],
+        non_null_block,
+        &[],
+    );
+
+    fb.switch_to_block(non_null_block);
+    let is_match = emit_exact_type_version_match(fb, receiver, expected_type, expected_version);
+    let truth = emit_i32_bool01_from_cond(fb, is_match, ctx).expect_i32_bool01("receiver guard");
+    fb.ins().jump(done_block, &[ir::BlockArg::Value(truth)]);
+
+    fb.switch_to_block(done_block);
+    SoacValue::i32(fb.block_params(done_block)[0], IntFacts::i32_bool01())
+}
+
+fn emit_exact_callable_type_version_match_bool01(
+    fb: &mut FunctionBuilder<'_>,
+    callable: ir::Value,
+    expected_type: ir::Value,
+    expected_version: u32,
+    ctx: &JitEmitCtx<'_>,
+) -> SoacValue {
+    let i32_ty = ctx.consts.i32_ty;
+    let null_ptr = fb.ins().iconst(ctx.consts.ptr_ty, 0);
+    let zero_i32 = fb.ins().iconst(i32_ty, 0);
+    let done_block = fb.create_block();
+    let non_null_block = fb.create_block();
+    let version_block = fb.create_block();
+    let miss_block = fb.create_block();
+    fb.append_block_param(done_block, i32_ty);
+
+    let is_null = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, callable, null_ptr);
+    fb.ins().brif(
+        is_null,
+        done_block,
+        &[ir::BlockArg::Value(zero_i32)],
+        non_null_block,
+        &[],
+    );
+
+    fb.switch_to_block(non_null_block);
+    let type_matches = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, callable, expected_type);
+    fb.ins()
+        .brif(type_matches, version_block, &[], miss_block, &[]);
+
+    fb.switch_to_block(version_block);
+    let actual_version = fb.ins().load(
+        ir::types::I32,
+        ir::MemFlags::trusted(),
+        callable,
+        offset_of!(ffi::PyTypeObject, tp_version_tag) as i32,
+    );
+    let version_matches = fb.ins().icmp_imm(
+        ir::condcodes::IntCC::Equal,
+        actual_version,
+        i64::from(expected_version),
+    );
+    let truth = emit_i32_bool01_from_cond(fb, version_matches, ctx)
+        .expect_i32_bool01("callable type guard");
+    fb.ins().jump(done_block, &[ir::BlockArg::Value(truth)]);
+
+    fb.switch_to_block(miss_block);
+    fb.ins().jump(done_block, &[ir::BlockArg::Value(zero_i32)]);
+
+    fb.switch_to_block(done_block);
+    SoacValue::i32(fb.block_params(done_block)[0], IntFacts::i32_bool01())
+}
+
+fn emit_exact_function_id_match_bool01(
+    fb: &mut FunctionBuilder<'_>,
+    callable: ir::Value,
+    expected_function_id: FunctionId,
+    ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+) -> Result<SoacValue, String> {
+    let i32_ty = ctx.consts.i32_ty;
+    let ptr_ty = ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let zero_i32 = fb.ins().iconst(i32_ty, 0);
+    let done_block = fb.create_block();
+    let non_null_block = fb.create_block();
+    fb.append_block_param(done_block, i32_ty);
+
+    let is_null = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, callable, null_ptr);
+    fb.ins().brif(
+        is_null,
+        done_block,
+        &[ir::BlockArg::Value(zero_i32)],
+        non_null_block,
+        &[],
+    );
+
+    fb.switch_to_block(non_null_block);
+    let actual_id = emit_callee_function_id_checked(fb, callable, ctx, codegen_env);
+    let id_matches = fb.ins().icmp_imm(
+        ir::condcodes::IntCC::Equal,
+        actual_id,
+        expected_function_id.packed() as i64,
+    );
+    let truth = emit_i32_bool01_from_cond(fb, id_matches, ctx).expect_i32_bool01("function guard");
+    fb.ins().jump(done_block, &[ir::BlockArg::Value(truth)]);
+
+    fb.switch_to_block(done_block);
+    Ok(SoacValue::i32(
+        fb.block_params(done_block)[0],
+        IntFacts::i32_bool01(),
+    ))
+}
+
 fn emit_callee_function_id_checked(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
@@ -11224,23 +13582,10 @@ fn emit_direct_call_resolved_raw_with_arg_values(
     codegen_env: &mut impl JitCodegenEnv,
 ) -> ir::Value {
     debug_assert_eq!(arg_values.len(), target_function.params.len());
-    let ptr_ty = ctx.consts.ptr_ty;
-    let null_ptr = fb.ins().iconst(ptr_ty, 0);
     ctx.direct_edge_stats.record_resolved_direct_edge();
 
-    let function_env = emit_direct_function_env_load(fb, callable, ctx);
-    let function_env_is_null = fb
-        .ins()
-        .icmp(ir::condcodes::IntCC::Equal, function_env, null_ptr);
-    let function_env_ok_block = fb.create_block();
-    fb.ins().brif(
-        function_env_is_null,
-        ctx.consts.step_null_block,
-        &step_null_block_args(ctx),
-        function_env_ok_block,
-        &[],
-    );
-    fb.switch_to_block(function_env_ok_block);
+    let (function_metadata, function_env) =
+        emit_resolved_direct_function_metadata_and_env(fb, callable, ctx);
 
     let enter_inst = fb
         .ins()
@@ -11276,11 +13621,15 @@ fn emit_direct_call_resolved_raw_with_arg_values(
         fb.ins().call(func_ref, &call_args)
     } else {
         ctx.direct_edge_stats.record_function_env_indirect_edge();
-        let offset = match entry_kind {
-            DirectCallEntryKind::Core => FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET,
-            DirectCallEntryKind::DefaultResolving => FUNCTION_ENV_DEFAULT_DIRECT_CODE_PTR_OFFSET,
-        };
-        let callee_ptr = load_function_env_obj(fb, ptr_ty, function_env, offset);
+        let (function_env, callee_ptr) = emit_resolved_direct_entry_ptr(
+            fb,
+            callable,
+            function_metadata,
+            function_env,
+            entry_kind,
+            ctx,
+        );
+        call_args[0] = function_env;
         let direct_sig =
             fb.import_signature(make_direct_function_signature(codegen_env, target_function));
         fb.ins().call_indirect(direct_sig, callee_ptr, &call_args)
@@ -11347,7 +13696,7 @@ fn emit_straightline_constructor_initializer_inline(
     specialization: &DirectConstructorSpecialization,
     target_function: &BlockPyFunction<CodegenModuleShape>,
     ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
 ) -> Option<ir::Value> {
     let plan = ctx
         .inline_plan
@@ -11379,7 +13728,7 @@ fn emit_straightline_constructor_initializer_inline(
         specialization,
         target_function,
         ctx,
-        jit_module,
+        codegen_env,
     )?;
     let mut field_values = Vec::with_capacity(field_stores.len());
     for (field_name, index) in field_stores {
@@ -11433,33 +13782,22 @@ fn emit_resolved_straightline_constructor_init_args(
     specialization: &DirectConstructorSpecialization,
     target_function: &BlockPyFunction<CodegenModuleShape>,
     ctx: &JitEmitCtx<'_>,
-    jit_module: &mut JITModule,
+    codegen_env: &mut impl JitCodegenEnv,
 ) -> Option<(Vec<ir::Value>, Vec<bool>)> {
     if !specialization.arg_plan.requires_default_resolving_entry() {
         return Some((init_arg_values.to_vec(), init_arg_borrowed.to_vec()));
     }
 
     let init_callable =
-        emit_callable_ptr_value_for_ref(fb, jit_module, ctx, &specialization.init_function_ref)
+        emit_callable_ptr_value_for_ref(fb, codegen_env, ctx, &specialization.init_function_ref)
             .unwrap_or_else(|err| panic!("failed to bind constructor callable symbol: {err}"))?;
     let ptr_ty = ctx.consts.ptr_ty;
     let null_ptr = fb.ins().iconst(ptr_ty, 0);
     let missing_block = fb.create_block();
     fb.set_cold_block(missing_block);
 
-    let function_env = emit_direct_function_env_load(fb, init_callable, ctx);
-    let function_env_is_null = fb
-        .ins()
-        .icmp(ir::condcodes::IntCC::Equal, function_env, null_ptr);
-    let function_env_ok_block = fb.create_block();
-    fb.ins().brif(
-        function_env_is_null,
-        missing_block,
-        &[],
-        function_env_ok_block,
-        &[],
-    );
-    fb.switch_to_block(function_env_ok_block);
+    let (_function_metadata, function_env) =
+        emit_resolved_direct_function_metadata_and_env(fb, init_callable, ctx);
     let function_data = fb
         .ins()
         .iadd_imm(function_env, i64::from(FUNCTION_ENV_RUNTIME_OBJECTS_OFFSET));
@@ -11691,7 +14029,7 @@ fn emit_direct_constructor_resolved_with_arg_values(
         specialization,
         target_function,
         ctx,
-        jit_module,
+        codegen_env,
     ) {
         return result;
     }
@@ -11976,6 +14314,22 @@ fn emit_call_direct_expr_with_local_env(
             func_imports,
         );
     };
+    if target_function.names.fn_name == "__init__"
+        && !call_direct_callable_is_explicit_init_attr(call, ctx)
+    {
+        ctx.direct_edge_stats
+            .record_call_direct_unsupported_shape_fallback();
+        let fallback = fallback_call();
+        return emit_codegen_expr_with_local_env(
+            fb,
+            &fallback,
+            local_env,
+            ctx,
+            false,
+            codegen_env,
+            func_imports,
+        );
+    }
 
     let arg_plan = match validate_direct_call_compatibility(
         target_function,
@@ -12038,6 +14392,16 @@ fn emit_call_direct_expr_with_local_env(
         codegen_env,
         func_imports,
     )
+}
+
+fn call_direct_callable_is_explicit_init_attr(
+    call: &soac_blockpy::block_py::CallDirect<InstrCodegen>,
+    ctx: &JitEmitCtx<'_>,
+) -> bool {
+    let InstrCodegen::GetAttr(getattr) = call.callable.as_ref() else {
+        return false;
+    };
+    codegen_constant_string_value(ctx.module, getattr.attr.as_ref()) == Some("__init__")
 }
 
 fn abrupt_kind_tag(kind: AbruptKind) -> i64 {
@@ -12419,7 +14783,41 @@ fn block_exception_name(
     function: &BlockPyFunction<CodegenModuleShape>,
     label: BlockLabel,
 ) -> Option<&str> {
-    function.blocks[label.index()].exception_param()
+    function
+        .blocks
+        .iter()
+        .find(|block| block.label == label)
+        .unwrap_or_else(|| {
+            panic!(
+                "function {} ({}) references unknown block label {}",
+                function.function_id, function.names.qualname, label
+            )
+        })
+        .exception_param()
+}
+
+fn codegen_block_indices_by_label(
+    function: &BlockPyFunction<CodegenModuleShape>,
+) -> HashMap<BlockLabel, usize> {
+    function
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| (block.label, index))
+        .collect()
+}
+
+fn codegen_block_index_for_label(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    block_indices_by_label: &HashMap<BlockLabel, usize>,
+    label: BlockLabel,
+) -> Result<usize, String> {
+    block_indices_by_label.get(&label).copied().ok_or_else(|| {
+        format!(
+            "function {} ({}) references unknown block label {}",
+            function.function_id, function.names.qualname, label
+        )
+    })
 }
 
 fn emit_planned_local_releases_for_reason_with_local_env(
@@ -12672,6 +15070,498 @@ fn emit_codegen_expr_value_with_local_env(
     SoacValue::pyobject(value, facts)
 }
 
+fn prepare_typed_guard_miss_dispatch_for_instr(
+    emit_ctx: &JitEmitCtx<'_>,
+    instr_id: InstrId,
+    pre_guard_operands: &[&InstrTyped],
+    fallback_block: ir::Block,
+) -> JitGuardMissDispatch {
+    let legacy_operands = pre_guard_operands
+        .iter()
+        .map(|operand| try_lower_typed_instr_to_codegen_legacy((*operand).clone()))
+        .collect::<Result<Vec<_>, _>>();
+    let Ok(legacy_operands) = legacy_operands else {
+        return JitGuardMissDispatch::FallbackBlock(fallback_block);
+    };
+    let legacy_operand_refs = legacy_operands.iter().collect::<Vec<_>>();
+    let guard_miss_resume_point =
+        emit_ctx
+            .guard_miss_resume_point
+            .unwrap_or(LocalEnvResumePoint::BeforeInstr {
+                key: InstrKey::new(emit_ctx.function_id, instr_id),
+            });
+    prepare_optional_guard_miss_dispatch(
+        emit_ctx.guard_miss_target_for_resume_point(
+            guard_miss_resume_point,
+            &legacy_operand_refs,
+            fallback_block,
+        ),
+        fallback_block,
+        emit_ctx.guard_miss_deopt_stub_ref,
+    )
+}
+
+fn emit_typed_guard_miss_deopt_resume_return(
+    fb: &mut FunctionBuilder<'_>,
+    local_env: &LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    block: ir::Block,
+    fallback_counter_id: Option<CounterId>,
+    owned_inputs: &[ir::Value],
+    target: JitDeoptExitRef,
+    deopt_resume_ref: ir::FuncRef,
+) {
+    fb.switch_to_block(block);
+    fb.set_cold_block(block);
+    if let Some(counter_id) = fallback_counter_id {
+        let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+    }
+    emit_release_owned_inputs(fb, emit_ctx, owned_inputs);
+    let deopt_result = emit_deopt_resume_call_with_local_env(
+        fb,
+        target,
+        deopt_resume_ref,
+        emit_ctx.consts.block_const,
+        emit_ctx,
+        local_env,
+    );
+    emit_deopt_result_return_or_step_null(fb, emit_ctx, deopt_result);
+}
+
+fn emit_typed_getattr_fallback(
+    fb: &mut FunctionBuilder<'_>,
+    op: &TypedGetAttr<InstrTyped>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<SoacValue, String> {
+    let value = emit_typed_codegen_expr_with_local_env(
+        fb,
+        op.value.as_ref(),
+        local_env,
+        emit_ctx,
+        false,
+        codegen_env,
+        func_imports,
+    )?;
+    let attr = emit_typed_codegen_expr_with_local_env(
+        fb,
+        op.attr.as_ref(),
+        local_env,
+        emit_ctx,
+        false,
+        codegen_env,
+        func_imports,
+    )?;
+    if let Some(counter_id) = emit_ctx
+        .field_indexed_fallback_counter_ids
+        .get(&op.semantic_instr_id())
+        .copied()
+    {
+        let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+    }
+    let getattr_inst = fb.ins().call(emit_ctx.pyobject_getattr_ref, &[value, attr]);
+    let result = emit_decref_owned_inputs_after_nullable_result(
+        fb,
+        emit_ctx,
+        fb.inst_results(getattr_inst)[0],
+        &[value, attr],
+    );
+    Ok(SoacValue::pyobject(result, PyObjFacts::unknown()))
+}
+
+fn emit_typed_setattr_fallback(
+    fb: &mut FunctionBuilder<'_>,
+    op: &TypedSetAttr<InstrTyped>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<SoacValue, String> {
+    let value = emit_typed_codegen_expr_with_local_env(
+        fb,
+        op.value.as_ref(),
+        local_env,
+        emit_ctx,
+        false,
+        codegen_env,
+        func_imports,
+    )?;
+    let attr = emit_typed_codegen_expr_with_local_env(
+        fb,
+        op.attr.as_ref(),
+        local_env,
+        emit_ctx,
+        false,
+        codegen_env,
+        func_imports,
+    )?;
+    let replacement = emit_typed_codegen_expr_with_local_env(
+        fb,
+        op.replacement.as_ref(),
+        local_env,
+        emit_ctx,
+        false,
+        codegen_env,
+        func_imports,
+    )?;
+    if let Some(counter_id) = emit_ctx
+        .field_indexed_fallback_counter_ids
+        .get(&op.semantic_instr_id())
+        .copied()
+    {
+        let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+    }
+    let setattr_inst = fb
+        .ins()
+        .call(emit_ctx.pyobject_setattr_ref, &[value, attr, replacement]);
+    let result = emit_decref_owned_inputs_after_nullable_result(
+        fb,
+        emit_ctx,
+        fb.inst_results(setattr_inst)[0],
+        &[value, attr, replacement],
+    );
+    Ok(SoacValue::pyobject(result, PyObjFacts::unknown()))
+}
+
+fn emit_typed_profiled_indexed_getattr(
+    fb: &mut FunctionBuilder<'_>,
+    op: &TypedGetAttr<InstrTyped>,
+    guards: &[TypedIndexedFieldGuard],
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<Option<SoacValue>, String> {
+    let instr_id = op.semantic_instr_id();
+    if guards.is_empty() {
+        return Ok(None);
+    }
+    let specializations = guards
+        .iter()
+        .filter_map(field_index_specialization_from_typed_guard)
+        .collect::<Vec<_>>();
+    if specializations.is_empty() {
+        return Ok(None);
+    }
+    let value = emit_typed_codegen_expr_with_local_env(
+        fb,
+        op.value.as_ref(),
+        local_env,
+        emit_ctx,
+        false,
+        codegen_env,
+        func_imports,
+    )?;
+    let attr = emit_typed_codegen_expr_with_local_env(
+        fb,
+        op.attr.as_ref(),
+        local_env,
+        emit_ctx,
+        false,
+        codegen_env,
+        func_imports,
+    )?;
+    let arg_values = [value, attr];
+    let ptr_ty = emit_ctx.consts.ptr_ty;
+    let i64_ty = emit_ctx.consts.i64_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let hit_counter_id = emit_ctx
+        .field_indexed_hit_counter_ids
+        .get(&instr_id)
+        .copied();
+    let fallback_counter_id = emit_ctx
+        .field_indexed_fallback_counter_ids
+        .get(&instr_id)
+        .copied();
+
+    let result_block = fb.create_block();
+    fb.append_block_param(result_block, ptr_ty);
+    let fallback_block = fb.create_block();
+    fb.set_cold_block(fallback_block);
+    let pre_guard_operands = [op.value.as_ref(), op.attr.as_ref()];
+    let guard_miss_dispatch = prepare_typed_guard_miss_dispatch_for_instr(
+        emit_ctx,
+        instr_id,
+        &pre_guard_operands,
+        fallback_block,
+    );
+
+    for (index, specialization) in specializations.iter().enumerate() {
+        let Some(owner_type) =
+            emit_type_ptr_value_for_ref(fb, codegen_env, emit_ctx, &specialization.owner_type_ref)
+                .unwrap_or_else(|err| {
+                    panic!("failed to bind field-indexed get type symbol: {err}");
+                })
+        else {
+            continue;
+        };
+        let maybe_direct_block = fb.create_block();
+        let direct_block = fb.create_block();
+        fb.append_block_param(direct_block, ptr_ty);
+        let next_guard_block = if index + 1 == specializations.len() {
+            fallback_block
+        } else {
+            fb.create_block()
+        };
+        let expected_index = fb
+            .ins()
+            .iconst(i64_ty, i64::from(specialization.expected_index));
+        let type_matches =
+            emit_exact_type_version_match(fb, value, owner_type, specialization.type_version);
+        fb.ins()
+            .brif(type_matches, maybe_direct_block, &[], next_guard_block, &[]);
+
+        fb.switch_to_block(maybe_direct_block);
+        let direct_inst = fb.ins().call(
+            emit_ctx.probe_field_indexed_ref,
+            &[value, attr, expected_index],
+        );
+        let direct_value = fb.inst_results(direct_inst)[0];
+        let direct_is_null = fb
+            .ins()
+            .icmp(ir::condcodes::IntCC::Equal, direct_value, null_ptr);
+        fb.ins().brif(
+            direct_is_null,
+            guard_miss_dispatch.branch_block(),
+            &[],
+            direct_block,
+            &[ir::BlockArg::Value(direct_value)],
+        );
+
+        fb.switch_to_block(direct_block);
+        let direct_value = fb.block_params(direct_block)[0];
+        fb.ins().call(emit_ctx.incref_ref, &[direct_value]);
+        if let Some(counter_id) = hit_counter_id {
+            let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+        }
+        emit_release_owned_inputs(fb, emit_ctx, &arg_values);
+        fb.ins()
+            .jump(result_block, &[ir::BlockArg::Value(direct_value)]);
+
+        if index + 1 != specializations.len() {
+            fb.switch_to_block(next_guard_block);
+        }
+    }
+
+    match guard_miss_dispatch {
+        JitGuardMissDispatch::FallbackBlock(fallback_block) => {
+            fb.switch_to_block(fallback_block);
+            if let Some(counter_id) = fallback_counter_id {
+                let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+            }
+            let getattr_inst = fb.ins().call(emit_ctx.pyobject_getattr_ref, &[value, attr]);
+            let fallback_value = emit_decref_owned_inputs_after_nullable_result(
+                fb,
+                emit_ctx,
+                fb.inst_results(getattr_inst)[0],
+                &arg_values,
+            );
+            fb.ins()
+                .jump(result_block, &[ir::BlockArg::Value(fallback_value)]);
+        }
+        JitGuardMissDispatch::DeoptResume {
+            block,
+            target,
+            deopt_resume_ref,
+        } => {
+            emit_typed_guard_miss_deopt_resume_return(
+                fb,
+                local_env,
+                emit_ctx,
+                block,
+                fallback_counter_id,
+                &arg_values,
+                target,
+                deopt_resume_ref,
+            );
+        }
+    }
+
+    fb.switch_to_block(result_block);
+    let result = fb.block_params(result_block)[0];
+    Ok(Some(SoacValue::pyobject(result, PyObjFacts::unknown())))
+}
+
+fn emit_typed_profiled_indexed_setattr(
+    fb: &mut FunctionBuilder<'_>,
+    op: &TypedSetAttr<InstrTyped>,
+    guards: &[TypedIndexedFieldGuard],
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<Option<SoacValue>, String> {
+    if !emit_ctx.behavior_change_indexed_stores {
+        return Ok(None);
+    }
+    let instr_id = op.semantic_instr_id();
+    if guards.is_empty() {
+        return Ok(None);
+    }
+    let specializations = guards
+        .iter()
+        .filter_map(field_index_specialization_from_typed_guard)
+        .collect::<Vec<_>>();
+    if specializations.is_empty() {
+        return Ok(None);
+    }
+    let value = emit_typed_codegen_expr_with_local_env(
+        fb,
+        op.value.as_ref(),
+        local_env,
+        emit_ctx,
+        false,
+        codegen_env,
+        func_imports,
+    )?;
+    let attr = emit_typed_codegen_expr_with_local_env(
+        fb,
+        op.attr.as_ref(),
+        local_env,
+        emit_ctx,
+        false,
+        codegen_env,
+        func_imports,
+    )?;
+    let replacement = emit_typed_codegen_expr_with_local_env(
+        fb,
+        op.replacement.as_ref(),
+        local_env,
+        emit_ctx,
+        false,
+        codegen_env,
+        func_imports,
+    )?;
+    let arg_values = [value, attr, replacement];
+    let ptr_ty = emit_ctx.consts.ptr_ty;
+    let i64_ty = emit_ctx.consts.i64_ty;
+    let zero_i32 = fb.ins().iconst(emit_ctx.consts.i32_ty, 0);
+    let hit_counter_id = emit_ctx
+        .field_indexed_hit_counter_ids
+        .get(&instr_id)
+        .copied();
+    let fallback_counter_id = emit_ctx
+        .field_indexed_fallback_counter_ids
+        .get(&instr_id)
+        .copied();
+
+    let result_block = fb.create_block();
+    fb.append_block_param(result_block, ptr_ty);
+    let fallback_block = fb.create_block();
+    fb.set_cold_block(fallback_block);
+    let pre_guard_operands = [op.value.as_ref(), op.attr.as_ref(), op.replacement.as_ref()];
+    let guard_miss_dispatch = prepare_typed_guard_miss_dispatch_for_instr(
+        emit_ctx,
+        instr_id,
+        &pre_guard_operands,
+        fallback_block,
+    );
+
+    for (index, specialization) in specializations.iter().enumerate() {
+        let Some(owner_type) =
+            emit_type_ptr_value_for_ref(fb, codegen_env, emit_ctx, &specialization.owner_type_ref)
+                .unwrap_or_else(|err| {
+                    panic!("failed to bind field-indexed set type symbol: {err}");
+                })
+        else {
+            continue;
+        };
+        let maybe_direct_block = fb.create_block();
+        let direct_block = fb.create_block();
+        let next_guard_block = if index + 1 == specializations.len() {
+            fallback_block
+        } else {
+            fb.create_block()
+        };
+        let expected_index = fb
+            .ins()
+            .iconst(i64_ty, i64::from(specialization.expected_index));
+        let type_matches =
+            emit_exact_type_version_match(fb, value, owner_type, specialization.type_version);
+        fb.ins()
+            .brif(type_matches, maybe_direct_block, &[], next_guard_block, &[]);
+
+        fb.switch_to_block(maybe_direct_block);
+        let direct_inst = fb.ins().call(
+            emit_ctx.store_field_indexed_ref,
+            &[
+                emit_ctx.consts.thread_state_value,
+                value,
+                attr,
+                expected_index,
+                replacement,
+            ],
+        );
+        let direct_result = fb.inst_results(direct_inst)[0];
+        let direct_missed = fb
+            .ins()
+            .icmp(ir::condcodes::IntCC::Equal, direct_result, zero_i32);
+        fb.ins().brif(
+            direct_missed,
+            guard_miss_dispatch.branch_block(),
+            &[],
+            direct_block,
+            &[],
+        );
+
+        fb.switch_to_block(direct_block);
+        if let Some(counter_id) = hit_counter_id {
+            let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+        }
+        let none_const = emit_none_const(fb, emit_ctx);
+        fb.ins().call(emit_ctx.incref_ref, &[none_const]);
+        emit_release_owned_inputs(fb, emit_ctx, &arg_values);
+        fb.ins()
+            .jump(result_block, &[ir::BlockArg::Value(none_const)]);
+
+        if index + 1 != specializations.len() {
+            fb.switch_to_block(next_guard_block);
+        }
+    }
+
+    match guard_miss_dispatch {
+        JitGuardMissDispatch::FallbackBlock(fallback_block) => {
+            fb.switch_to_block(fallback_block);
+            if let Some(counter_id) = fallback_counter_id {
+                let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+            }
+            let setattr_inst = fb
+                .ins()
+                .call(emit_ctx.pyobject_setattr_ref, &[value, attr, replacement]);
+            let fallback_value = emit_decref_owned_inputs_after_nullable_result(
+                fb,
+                emit_ctx,
+                fb.inst_results(setattr_inst)[0],
+                &arg_values,
+            );
+            fb.ins()
+                .jump(result_block, &[ir::BlockArg::Value(fallback_value)]);
+        }
+        JitGuardMissDispatch::DeoptResume {
+            block,
+            target,
+            deopt_resume_ref,
+        } => {
+            emit_typed_guard_miss_deopt_resume_return(
+                fb,
+                local_env,
+                emit_ctx,
+                block,
+                fallback_counter_id,
+                &arg_values,
+                target,
+                deopt_resume_ref,
+            );
+        }
+    }
+
+    fb.switch_to_block(result_block);
+    let result = fb.block_params(result_block)[0];
+    Ok(Some(SoacValue::pyobject(result, PyObjFacts::unknown())))
+}
+
 #[allow(dead_code)]
 fn emit_typed_codegen_expr_value_with_local_env(
     fb: &mut FunctionBuilder<'_>,
@@ -12729,6 +15619,190 @@ fn emit_typed_codegen_expr_value_with_local_env(
             codegen_env,
             func_imports,
         ));
+    }
+
+    if let InstrTyped::CallTyped(op) = expr {
+        if let Some(result) = emit_typed_codegen_call_result_with_local_env(
+            fb,
+            op,
+            local_env,
+            emit_ctx,
+            ResultDemand::PYOBJECT_OWNED,
+            codegen_env,
+            func_imports,
+        )? {
+            let (value, ownership, facts) = result.expect_pyobject("typed call expression result");
+            assert!(
+                ownership.is_owned(),
+                "typed call expression result should be an owned PyObject"
+            );
+            return Ok(SoacValue::pyobject(value, facts));
+        }
+        let legacy_expr = try_lower_typed_instr_to_codegen_legacy(expr.clone())?;
+        return Ok(emit_codegen_expr_value_with_local_env(
+            fb,
+            &legacy_expr,
+            local_env,
+            emit_ctx,
+            borrowed,
+            codegen_env,
+            func_imports,
+        ));
+    }
+
+    if let InstrTyped::GuardedCallableCallTyped(op) = expr {
+        if let Some(result) = emit_typed_codegen_guarded_callable_call_result_with_local_env(
+            fb,
+            op,
+            local_env,
+            emit_ctx,
+            ResultDemand::PYOBJECT_OWNED,
+            codegen_env,
+            func_imports,
+        )? {
+            let (value, ownership, facts) =
+                result.expect_pyobject("typed guarded callable call expression result");
+            assert!(
+                ownership.is_owned(),
+                "typed guarded callable call expression result should be an owned PyObject"
+            );
+            return Ok(SoacValue::pyobject(value, facts));
+        }
+        let typed_call = op.clone().into_typed_call();
+        let legacy_expr =
+            try_lower_typed_instr_to_codegen_legacy(InstrTyped::CallTyped(typed_call))?;
+        return Ok(emit_codegen_expr_value_with_local_env(
+            fb,
+            &legacy_expr,
+            local_env,
+            emit_ctx,
+            borrowed,
+            codegen_env,
+            func_imports,
+        ));
+    }
+
+    if let InstrTyped::GuardedMethodCallTyped(op) = expr {
+        if let Some(result) = emit_typed_codegen_guarded_method_call_result_with_local_env(
+            fb,
+            op,
+            local_env,
+            emit_ctx,
+            ResultDemand::PYOBJECT_OWNED,
+            codegen_env,
+            func_imports,
+        )? {
+            let (value, ownership, facts) =
+                result.expect_pyobject("typed guarded method call expression result");
+            assert!(
+                ownership.is_owned(),
+                "typed guarded method call expression result should be an owned PyObject"
+            );
+            return Ok(SoacValue::pyobject(value, facts));
+        }
+        let typed_call = op.clone().into_typed_call();
+        let legacy_expr =
+            try_lower_typed_instr_to_codegen_legacy(InstrTyped::CallTyped(typed_call))?;
+        return Ok(emit_codegen_expr_value_with_local_env(
+            fb,
+            &legacy_expr,
+            local_env,
+            emit_ctx,
+            borrowed,
+            codegen_env,
+            func_imports,
+        ));
+    }
+
+    if let InstrTyped::DirectCallableCallTyped(op) = expr {
+        let result = emit_typed_codegen_direct_callable_call_result_with_local_env(
+            fb,
+            op,
+            local_env,
+            emit_ctx,
+            ResultDemand::PYOBJECT_OWNED,
+            codegen_env,
+            func_imports,
+        )?;
+        let (value, ownership, facts) =
+            result.expect_pyobject("typed direct callable call expression result");
+        assert!(
+            ownership.is_owned(),
+            "typed direct callable call expression result should be an owned PyObject"
+        );
+        return Ok(SoacValue::pyobject(value, facts));
+    }
+
+    if let InstrTyped::DirectMethodCallTyped(op) = expr {
+        let result = emit_typed_codegen_direct_method_call_result_with_local_env(
+            fb,
+            op,
+            local_env,
+            emit_ctx,
+            ResultDemand::PYOBJECT_OWNED,
+            codegen_env,
+            func_imports,
+        )?;
+        let (value, ownership, facts) =
+            result.expect_pyobject("typed direct method call expression result");
+        assert!(
+            ownership.is_owned(),
+            "typed direct method call expression result should be an owned PyObject"
+        );
+        return Ok(SoacValue::pyobject(value, facts));
+    }
+
+    if let InstrTyped::DirectCallGuardTest(op) = expr {
+        return emit_typed_direct_call_guard_test_value_with_local_env(
+            fb,
+            op,
+            local_env,
+            emit_ctx,
+            codegen_env,
+            func_imports,
+        );
+    }
+
+    if let InstrTyped::GetAttrTyped(op) = expr
+        && let TypedAttrAccessPlan::ProfiledIndexedField { guards } = &op.access
+    {
+        let maybe_value = emit_typed_profiled_indexed_getattr(
+            fb,
+            op,
+            guards,
+            local_env,
+            emit_ctx,
+            codegen_env,
+            func_imports,
+        )?;
+        if let Some(value) = maybe_value {
+            return Ok(value);
+        }
+    }
+
+    if let InstrTyped::SetAttrTyped(op) = expr
+        && let TypedAttrAccessPlan::ProfiledIndexedField { guards } = &op.access
+    {
+        let maybe_value = emit_typed_profiled_indexed_setattr(
+            fb,
+            op,
+            guards,
+            local_env,
+            emit_ctx,
+            codegen_env,
+            func_imports,
+        )?;
+        if let Some(value) = maybe_value {
+            return Ok(value);
+        }
+    }
+
+    if let InstrTyped::GetAttrTyped(op) = expr {
+        return emit_typed_getattr_fallback(fb, op, local_env, emit_ctx, codegen_env, func_imports);
+    }
+
+    if let InstrTyped::SetAttrTyped(op) = expr {
+        return emit_typed_setattr_fallback(fb, op, local_env, emit_ctx, codegen_env, func_imports);
     }
 
     let legacy_expr = try_lower_typed_instr_to_codegen_legacy(expr.clone())?;
@@ -12858,8 +15932,8 @@ fn emit_codegen_simple_call_effect_only_with_local_env(
     }
 
     let site_instr_id = call.try_semantic_instr_id();
-    if !direct_constructor_specializations_for_call_site(call, emit_ctx).is_empty()
-        || !direct_method_specializations_for_call_site(call, emit_ctx).is_empty()
+    if !direct_constructor_specializations_for_call_site(call, emit_ctx, None).is_empty()
+        || !direct_method_specializations_for_call_site(call, emit_ctx, None).is_empty()
         || site_instr_id
             .and_then(|site_instr_id| emit_ctx.call_target_specializations.get(&site_instr_id))
             .is_some_and(|targets| !targets.is_empty())
@@ -12920,6 +15994,8 @@ fn emit_codegen_simple_call_with_local_env(
     call: &soac_blockpy::block_py::Call<InstrCodegen>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
+    profiled_targets: Option<&[FunctionId]>,
+    typed_access: Option<&TypedCallAccessPlan>,
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Option<ir::Value> {
@@ -13090,74 +16166,6 @@ fn emit_codegen_simple_call_with_local_env(
             );
             return Some(null_ptr);
         }
-        if helper_id == RuntimeHelperId::LoadDeletedName
-            && simple_args.len() == 2
-            && let Some(name) = codegen_expr_const_string(simple_args[0], emit_ctx.module_constants)
-        {
-            let name_obj = emit_owned_module_constant(
-                fb,
-                emit_ctx
-                    .module_constants
-                    .require_unicode_constant_id(name.as_str()),
-                emit_ctx,
-            );
-            let value_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
-                simple_args[1],
-                local_env,
-                emit_ctx,
-            );
-            let value_obj = emit_codegen_expr_with_local_env(
-                fb,
-                simple_args[1],
-                local_env,
-                emit_ctx,
-                value_borrowed,
-                codegen_env,
-                func_imports,
-            );
-            let value_is_null = fb
-                .ins()
-                .icmp(ir::condcodes::IntCC::Equal, value_obj, null_ptr);
-            let deleted_block = fb.create_block();
-            let value_ok_block = fb.create_block();
-            fb.append_block_param(value_ok_block, ptr_ty);
-            fb.ins().brif(
-                value_is_null,
-                deleted_block,
-                &[],
-                value_ok_block,
-                &[ir::BlockArg::Value(value_obj)],
-            );
-
-            fb.switch_to_block(deleted_block);
-            fb.ins()
-                .call(emit_ctx.raise_deleted_name_error_ref, &[name_obj]);
-            emit_release_owned_inputs(fb, emit_ctx, &[name_obj]);
-            if !value_borrowed {
-                emit_decref_if_not_null(
-                    fb,
-                    emit_ctx.consts.ptr_ty,
-                    emit_ctx.decref_ref,
-                    emit_ctx.consts.thread_state_value,
-                    value_obj,
-                );
-            }
-            fb.ins().jump(
-                emit_ctx.consts.step_null_block,
-                &step_null_block_args(emit_ctx),
-            );
-
-            fb.switch_to_block(value_ok_block);
-            let value_obj = fb.block_params(value_ok_block)[0];
-            fb.ins().call(
-                emit_ctx.decref_ref,
-                &[emit_ctx.consts.thread_state_value, name_obj],
-            );
-            if value_borrowed {
-                fb.ins().call(emit_ctx.incref_ref, &[value_obj]);
-            }
-            return Some(value_obj);
-        }
         if helper_id == RuntimeHelperId::CellRef && simple_args.len() == 1 {
             let InstrCodegen::Load(cell_name) = simple_args[0] else {
                 panic!(
@@ -13195,50 +16203,193 @@ fn emit_codegen_simple_call_with_local_env(
                     .get(&site_instr_id)
             })
             .copied();
-        let constructor_specializations =
-            direct_constructor_specializations_for_call_site(call, emit_ctx);
-        let direct_specializations = site_instr_id
-            .and_then(|site_instr_id| emit_ctx.call_target_specializations.get(&site_instr_id))
-            .map(|targets| {
-                targets
-                    .iter()
-                    .copied()
-                    .filter_map(|function_id| {
-                        let Some(target_function) =
-                            direct_call_target_function(emit_ctx, function_id)
-                        else {
-                            emit_ctx
-                                .direct_edge_stats
-                                .record_profiled_missing_target_candidate();
-                            return None;
-                        };
-                        let arg_plan = match validate_direct_call_compatibility(
-                            target_function,
-                            emit_ctx.direct_call_functions,
-                            simple_args.len(),
-                            0,
-                            false,
-                            false,
-                        ) {
-                            Ok(arg_plan) => arg_plan,
-                            Err(incompatibility) => {
-                                record_profiled_direct_call_incompatibility(
-                                    emit_ctx.direct_edge_stats,
-                                    incompatibility,
-                                );
-                                return None;
-                            }
-                        };
-                        Some(DirectFunctionSpecialization {
-                            function_id,
-                            arg_plan,
-                        })
+        if let Some(TypedCallAccessPlan::GuardedRuntimeProtocolMethod {
+            runtime_name,
+            method_name,
+            method_guards,
+        }) = typed_access
+            && *runtime_name == RuntimeName::Iter
+            && simple_args.len() == 1
+        {
+            let direct_method_specializations =
+                direct_method_specializations_from_typed_guards(method_guards, method_name);
+            if !direct_method_specializations.is_empty() {
+                let receiver_expr = simple_args[0];
+                let receiver_is_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
+                    receiver_expr,
+                    local_env,
+                    emit_ctx,
+                );
+                let receiver = emit_codegen_expr_with_local_env(
+                    fb,
+                    receiver_expr,
+                    local_env,
+                    emit_ctx,
+                    receiver_is_borrowed,
+                    codegen_env,
+                    func_imports,
+                );
+                let result_block = fb.create_block();
+                fb.append_block_param(result_block, ptr_ty);
+                let generic_block = fb.create_block();
+                fb.set_cold_block(generic_block);
+
+                for (index, specialization) in direct_method_specializations.iter().enumerate() {
+                    let expected_type = emit_type_ptr_value_for_ref(
+                        fb,
+                        codegen_env,
+                        emit_ctx,
+                        &specialization.owner_type_ref,
+                    )
+                    .unwrap_or_else(|err| {
+                        panic!("failed to bind runtime protocol method type symbol: {err}");
                     })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let direct_method_specializations =
-            direct_method_specializations_for_call_site(call, emit_ctx);
+                    .expect("runtime protocol method type symbol should be available");
+                    let direct_block = fb.create_block();
+                    let miss_block = if index + 1 == direct_method_specializations.len() {
+                        generic_block
+                    } else {
+                        fb.create_block()
+                    };
+                    let is_match = emit_exact_type_version_match(
+                        fb,
+                        receiver,
+                        expected_type,
+                        specialization.type_version,
+                    );
+                    fb.ins().brif(is_match, direct_block, &[], miss_block, &[]);
+
+                    fb.switch_to_block(direct_block);
+                    let target_function =
+                        direct_call_target_function(emit_ctx, specialization.function_id)
+                            .expect("runtime protocol method specialization target should exist");
+                    if let Some(counter_id) = call_target_counter {
+                        let callee_id = fb.ins().iconst(
+                            emit_ctx.consts.i64_ty,
+                            specialization.function_id.packed() as i64,
+                        );
+                        emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
+                    }
+                    if let Some(counter_id) = direct_hit_counter_id {
+                        let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+                    }
+                    let direct_result = emit_direct_method_resolved_with_args_from_local_env(
+                        fb,
+                        receiver,
+                        receiver_is_borrowed,
+                        &[],
+                        specialization,
+                        target_function,
+                        local_env,
+                        emit_ctx,
+                        codegen_env,
+                        func_imports,
+                    );
+                    fb.ins()
+                        .jump(result_block, &[ir::BlockArg::Value(direct_result)]);
+                    if index + 1 != direct_method_specializations.len() {
+                        fb.switch_to_block(miss_block);
+                    }
+                }
+
+                fb.switch_to_block(generic_block);
+                emit_ctx
+                    .direct_edge_stats
+                    .record_guarded_generic_fallback_block();
+                let callable = emit_checked_runtime_name_object(fb, *runtime_name, emit_ctx);
+                if let Some(counter_id) = call_target_counter {
+                    let callee_id =
+                        emit_callee_function_id_checked(fb, callable, emit_ctx, codegen_env);
+                    emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
+                }
+                if let Some(counter_id) = direct_fallback_counter_id {
+                    let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+                }
+                let (generic_result, _, _) = emit_positional_call_three_result_with_arg_values(
+                    fb,
+                    callable,
+                    false,
+                    vec![receiver],
+                    vec![receiver_is_borrowed],
+                    emit_ctx,
+                    ResultDemand::PYOBJECT_OWNED,
+                )
+                .expect_pyobject("guarded runtime protocol method fallback");
+                fb.ins()
+                    .jump(result_block, &[ir::BlockArg::Value(generic_result)]);
+                fb.switch_to_block(result_block);
+                return Some(fb.block_params(result_block)[0]);
+            }
+        }
+        let (constructor_specializations, direct_specializations) = match typed_access {
+            Some(TypedCallAccessPlan::GuardedCallable {
+                function_guards,
+                constructor_guards,
+            }) => (
+                direct_constructor_specializations_from_typed_guards(constructor_guards),
+                direct_function_specializations_from_typed_guards(function_guards),
+            ),
+            Some(_) => (Vec::new(), Vec::new()),
+            _ => {
+                let constructor_specializations = direct_constructor_specializations_for_call_site(
+                    call,
+                    emit_ctx,
+                    profiled_targets,
+                );
+                let direct_specializations =
+                    call_site_profiled_targets(call, emit_ctx, profiled_targets)
+                        .map(|targets| {
+                            targets
+                                .iter()
+                                .copied()
+                                .filter_map(|function_id| {
+                                    let Some(target_function) =
+                                        direct_call_target_function(emit_ctx, function_id)
+                                    else {
+                                        emit_ctx
+                                            .direct_edge_stats
+                                            .record_profiled_missing_target_candidate();
+                                        return None;
+                                    };
+                                    if target_function.names.fn_name == "__init__" {
+                                        return None;
+                                    }
+                                    let arg_plan = match validate_direct_call_compatibility(
+                                        target_function,
+                                        emit_ctx.direct_call_functions,
+                                        simple_args.len(),
+                                        0,
+                                        false,
+                                        false,
+                                    ) {
+                                        Ok(arg_plan) => arg_plan,
+                                        Err(incompatibility) => {
+                                            record_profiled_direct_call_incompatibility(
+                                                emit_ctx.direct_edge_stats,
+                                                incompatibility,
+                                            );
+                                            return None;
+                                        }
+                                    };
+                                    Some(DirectFunctionSpecialization {
+                                        function_id,
+                                        arg_plan,
+                                    })
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                (constructor_specializations, direct_specializations)
+            }
+        };
+        let direct_method_specializations = match typed_access {
+            Some(TypedCallAccessPlan::GuardedMethod {
+                method_name,
+                method_guards,
+            }) => direct_method_specializations_from_typed_guards(method_guards, method_name),
+            Some(_) => Vec::new(),
+            _ => direct_method_specializations_for_call_site(call, emit_ctx, profiled_targets),
+        };
         if !direct_method_specializations.is_empty() {
             let InstrCodegen::GetAttr(getattr) = call.func.as_ref() else {
                 unreachable!("direct method specializations require GetAttr call target");
@@ -14084,6 +17235,8 @@ fn emit_codegen_expr_with_local_env(
             call,
             local_env,
             emit_ctx,
+            None,
+            None,
             codegen_env,
             func_imports,
         ) {
@@ -14905,12 +18058,367 @@ fn emit_codegen_call_result_with_local_env(
         call,
         local_env,
         emit_ctx,
+        None,
+        None,
         codegen_env,
         func_imports,
     )
     .map(|value| {
         emit_owned_pyobject_result_for_demand(fb, value, PyObjFacts::unknown(), emit_ctx, demand)
     })
+}
+
+fn emit_typed_codegen_call_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    call: &TypedCall<InstrTyped>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<Option<EmitResult>, String> {
+    let legacy_call =
+        match try_lower_typed_instr_to_codegen_legacy(InstrTyped::CallTyped(call.clone())) {
+            Ok(InstrCodegen::Call(legacy_call)) => legacy_call,
+            Ok(_) => unreachable!("typed call should lower to a legacy call"),
+            Err(_) => {
+                return emit_typed_codegen_simple_positional_call_result_with_local_env(
+                    fb,
+                    call,
+                    local_env,
+                    emit_ctx,
+                    demand,
+                    codegen_env,
+                    func_imports,
+                );
+            }
+        };
+    if let Some(result) = emit_runtime_builtin_primitive_call_result_with_local_env(
+        fb,
+        &legacy_call,
+        local_env,
+        emit_ctx,
+        demand,
+        codegen_env,
+        func_imports,
+    ) {
+        return Ok(Some(result));
+    }
+    if demand == ResultDemand::EffectOnly
+        && let Some(result) = emit_codegen_simple_call_effect_only_with_local_env(
+            fb,
+            &legacy_call,
+            local_env,
+            emit_ctx,
+            codegen_env,
+            func_imports,
+        )
+    {
+        return Ok(Some(result));
+    }
+    let guarded_targets;
+    let profiled_targets = match &call.access {
+        TypedCallAccessPlan::Generic => None,
+        TypedCallAccessPlan::ProfiledCallableTargets { targets }
+        | TypedCallAccessPlan::ProfiledMethodTargets { targets } => Some(targets.as_slice()),
+        TypedCallAccessPlan::GuardedCallable {
+            function_guards,
+            constructor_guards,
+        } => {
+            guarded_targets = function_guards
+                .iter()
+                .map(|guard| guard.function_id)
+                .chain(constructor_guards.iter().map(|guard| guard.function_id))
+                .collect::<Vec<_>>();
+            Some(guarded_targets.as_slice())
+        }
+        TypedCallAccessPlan::GuardedMethod { method_guards, .. } => {
+            guarded_targets = method_guards
+                .iter()
+                .map(|guard| guard.function_id)
+                .collect::<Vec<_>>();
+            Some(guarded_targets.as_slice())
+        }
+        TypedCallAccessPlan::GuardedRuntimeProtocolMethod { method_guards, .. } => {
+            guarded_targets = method_guards
+                .iter()
+                .map(|guard| guard.function_id)
+                .collect::<Vec<_>>();
+            Some(guarded_targets.as_slice())
+        }
+    };
+    Ok(emit_codegen_simple_call_with_local_env(
+        fb,
+        &legacy_call,
+        local_env,
+        emit_ctx,
+        profiled_targets,
+        Some(&call.access),
+        codegen_env,
+        func_imports,
+    )
+    .map(|value| {
+        emit_owned_pyobject_result_for_demand(fb, value, PyObjFacts::unknown(), emit_ctx, demand)
+    }))
+}
+
+fn emit_typed_codegen_simple_positional_call_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    call: &TypedCall<InstrTyped>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<Option<EmitResult>, String> {
+    if !call.keywords.is_empty() {
+        return Err(
+            "typed call with typed-only children and keyword args is not supported".to_string(),
+        );
+    }
+
+    let callable_value = emit_typed_codegen_expr_value_with_local_env(
+        fb,
+        call.func.as_ref(),
+        local_env,
+        emit_ctx,
+        false,
+        codegen_env,
+        func_imports,
+    )?;
+    let (callable, _) = callable_value.expect_pyobject("typed call callable");
+    let mut arg_values = Vec::with_capacity(call.args.len());
+    let mut arg_borrowed = Vec::with_capacity(call.args.len());
+    for arg in &call.args {
+        let CallArgPositional::Positional(arg) = arg else {
+            return Err(
+                "typed call with typed-only children and starred args is not supported".to_string(),
+            );
+        };
+        let arg_value = emit_typed_codegen_expr_value_with_local_env(
+            fb,
+            arg,
+            local_env,
+            emit_ctx,
+            false,
+            codegen_env,
+            func_imports,
+        )?;
+        let (arg_value, _) = arg_value.expect_pyobject("typed positional call arg");
+        arg_values.push(arg_value);
+        arg_borrowed.push(false);
+    }
+
+    let result = if arg_values.len() <= 3 {
+        emit_positional_call_three_result_with_arg_values(
+            fb,
+            callable,
+            false,
+            arg_values,
+            arg_borrowed,
+            emit_ctx,
+            demand,
+        )
+    } else {
+        emit_positional_vectorcall_result_with_arg_values(
+            fb,
+            callable,
+            false,
+            arg_values,
+            arg_borrowed,
+            emit_ctx,
+            demand,
+        )
+    };
+    Ok(Some(result))
+}
+
+fn emit_typed_codegen_guarded_callable_call_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    call: &TypedGuardedCallableCall<InstrTyped>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<Option<EmitResult>, String> {
+    let typed_call = call.clone().into_typed_call();
+    emit_typed_codegen_call_result_with_local_env(
+        fb,
+        &typed_call,
+        local_env,
+        emit_ctx,
+        demand,
+        codegen_env,
+        func_imports,
+    )
+}
+
+fn emit_typed_codegen_guarded_method_call_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    call: &TypedGuardedMethodCall<InstrTyped>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<Option<EmitResult>, String> {
+    let typed_call = call.clone().into_typed_call();
+    emit_typed_codegen_call_result_with_local_env(
+        fb,
+        &typed_call,
+        local_env,
+        emit_ctx,
+        demand,
+        codegen_env,
+        func_imports,
+    )
+}
+
+fn emit_typed_codegen_direct_callable_call_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    call: &TypedDirectCallableCall<InstrTyped>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<EmitResult, String> {
+    let func_expr = try_lower_typed_instr_to_codegen_legacy(*call.func.clone())?;
+    let callable_is_borrowed =
+        codegen_expr_pyobject_input_is_borrowed_from_local_env(&func_expr, local_env, emit_ctx);
+    let callable = emit_codegen_expr_with_local_env(
+        fb,
+        &func_expr,
+        local_env,
+        emit_ctx,
+        callable_is_borrowed,
+        codegen_env,
+        func_imports,
+    );
+    let mut arg_exprs = Vec::with_capacity(call.args.len());
+    for arg in &call.args {
+        let CallArgPositional::Positional(arg) = arg else {
+            return Err("typed direct callable call does not support starred args".to_string());
+        };
+        arg_exprs.push(try_lower_typed_instr_to_codegen_legacy(arg.clone())?);
+    }
+    let arg_refs = arg_exprs.iter().collect::<Vec<_>>();
+    let result = match &call.guard {
+        TypedDirectCallableCallGuard::Function(guard) => {
+            let target_function = direct_call_target_function(emit_ctx, guard.function_id)
+                .ok_or_else(|| {
+                    format!(
+                        "typed direct callable call target {:?} is unavailable",
+                        guard.function_id
+                    )
+                })?;
+            let arg_plan = direct_call_arg_plan_from_typed(&guard.arg_plan);
+            emit_direct_call_resolved_with_arg_plan_from_local_env(
+                fb,
+                callable,
+                callable_is_borrowed,
+                arg_refs.as_slice(),
+                &arg_plan,
+                target_function,
+                local_env,
+                emit_ctx,
+                codegen_env,
+                func_imports,
+            )
+        }
+        TypedDirectCallableCallGuard::Constructor(guard) => {
+            let specialization = direct_constructor_specialization_from_typed_guard(guard)
+                .ok_or_else(|| {
+                    "typed direct constructor call has invalid owner type ref".to_string()
+                })?;
+            let target_function = direct_call_target_function(emit_ctx, specialization.function_id)
+                .ok_or_else(|| {
+                    format!(
+                        "typed direct constructor call target {:?} is unavailable",
+                        specialization.function_id
+                    )
+                })?;
+            emit_direct_constructor_resolved_with_args_from_local_env(
+                fb,
+                callable,
+                callable_is_borrowed,
+                arg_refs.as_slice(),
+                &specialization,
+                target_function,
+                local_env,
+                emit_ctx,
+                codegen_env,
+                func_imports,
+            )
+        }
+    };
+    Ok(emit_owned_pyobject_result_for_demand(
+        fb,
+        result,
+        PyObjFacts::unknown(),
+        emit_ctx,
+        demand,
+    ))
+}
+
+fn emit_typed_codegen_direct_method_call_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    call: &TypedDirectMethodCall<InstrTyped>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<EmitResult, String> {
+    let specialization = direct_method_specialization_from_typed_call(call)
+        .ok_or_else(|| "typed direct method call has invalid owner type ref".to_string())?;
+    let target_function = direct_call_target_function(emit_ctx, specialization.function_id)
+        .ok_or_else(|| {
+            format!(
+                "typed direct method call target {:?} is unavailable",
+                specialization.function_id
+            )
+        })?;
+    let receiver_expr = try_lower_typed_instr_to_codegen_legacy(*call.receiver.clone())?;
+    let receiver_is_borrowed =
+        codegen_expr_pyobject_input_is_borrowed_from_local_env(&receiver_expr, local_env, emit_ctx);
+    let receiver = emit_codegen_expr_with_local_env(
+        fb,
+        &receiver_expr,
+        local_env,
+        emit_ctx,
+        receiver_is_borrowed,
+        codegen_env,
+        func_imports,
+    );
+    let mut arg_exprs = Vec::with_capacity(call.args.len());
+    for arg in &call.args {
+        let CallArgPositional::Positional(arg) = arg else {
+            return Err("typed direct method call does not support starred args".to_string());
+        };
+        arg_exprs.push(try_lower_typed_instr_to_codegen_legacy(arg.clone())?);
+    }
+    let arg_refs = arg_exprs.iter().collect::<Vec<_>>();
+    let result = emit_direct_method_resolved_with_args_from_local_env(
+        fb,
+        receiver,
+        receiver_is_borrowed,
+        arg_refs.as_slice(),
+        &specialization,
+        target_function,
+        local_env,
+        emit_ctx,
+        codegen_env,
+        func_imports,
+    );
+    Ok(emit_owned_pyobject_result_for_demand(
+        fb,
+        result,
+        PyObjFacts::unknown(),
+        emit_ctx,
+        demand,
+    ))
 }
 
 fn emit_codegen_call_direct_result_with_local_env(
@@ -15061,6 +18569,148 @@ fn emit_resolved_name_load_with_local_env(
     panic!("Load should be resolved before codegen: {name:?}");
 }
 
+fn emit_typed_direct_call_guard_test_value_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    op: &TypedDirectCallGuardTest<InstrTyped>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<SoacValue, String> {
+    let value_is_borrowed = typed_expr_pyobject_input_is_borrowed_from_local_env(
+        op.value.as_ref(),
+        local_env,
+        emit_ctx,
+    );
+    let value = emit_typed_codegen_expr_value_with_local_env(
+        fb,
+        op.value.as_ref(),
+        local_env,
+        emit_ctx,
+        value_is_borrowed,
+        codegen_env,
+        func_imports,
+    )?;
+    let (raw_value, facts) = value.expect_pyobject("typed direct-call guard input");
+
+    let guard = match &op.kind {
+        TypedDirectCallGuardTestKind::FunctionId { function_id } => {
+            emit_exact_function_id_match_bool01(fb, raw_value, *function_id, emit_ctx, codegen_env)?
+        }
+        TypedDirectCallGuardTestKind::ExactCallableTypeVersion {
+            owner_type_ref,
+            type_version,
+        } => {
+            let owner_type_ref = reloc_type_ref_from_typed_attr_owner_ref(owner_type_ref)
+                .ok_or_else(|| "invalid typed callable guard owner type ref".to_string())?;
+            match emit_type_ptr_value_for_ref(fb, codegen_env, emit_ctx, &owner_type_ref)? {
+                Some(expected_type) => emit_exact_callable_type_version_match_bool01(
+                    fb,
+                    raw_value,
+                    expected_type,
+                    *type_version,
+                    emit_ctx,
+                ),
+                None => emit_i32_bool01_const(fb, false, emit_ctx),
+            }
+        }
+        TypedDirectCallGuardTestKind::ExactReceiverTypeVersion {
+            owner_type_ref,
+            type_version,
+        } => {
+            let owner_type_ref = reloc_type_ref_from_typed_attr_owner_ref(owner_type_ref)
+                .ok_or_else(|| "invalid typed receiver guard owner type ref".to_string())?;
+            match emit_type_ptr_value_for_ref(fb, codegen_env, emit_ctx, &owner_type_ref)? {
+                Some(expected_type) => emit_exact_receiver_type_version_match_bool01(
+                    fb,
+                    raw_value,
+                    expected_type,
+                    *type_version,
+                    emit_ctx,
+                ),
+                None => emit_i32_bool01_const(fb, false, emit_ctx),
+            }
+        }
+    };
+
+    if !value_is_borrowed {
+        emit_release_owned_pyobject(fb, raw_value, Some(facts), emit_ctx);
+    }
+    Ok(guard)
+}
+
+fn emit_codegen_direct_function_id_guard_test_value_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    op: &DirectFunctionIdGuardTest<InstrCodegen>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<SoacValue, String> {
+    let value_is_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
+        op.value.as_ref(),
+        local_env,
+        emit_ctx,
+    );
+    let value = emit_codegen_expr_value_with_local_env(
+        fb,
+        op.value.as_ref(),
+        local_env,
+        emit_ctx,
+        value_is_borrowed,
+        codegen_env,
+        func_imports,
+    );
+    let (raw_value, facts) = value.expect_pyobject("direct function-id guard input");
+    let guard =
+        emit_exact_function_id_match_bool01(fb, raw_value, op.function_id, emit_ctx, codegen_env)?;
+    if !value_is_borrowed {
+        emit_release_owned_pyobject(fb, raw_value, Some(facts), emit_ctx);
+    }
+    Ok(guard)
+}
+
+fn emit_codegen_direct_receiver_type_version_guard_test_value_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    op: &DirectReceiverTypeVersionGuardTest<InstrCodegen>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<SoacValue, String> {
+    let value_is_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
+        op.value.as_ref(),
+        local_env,
+        emit_ctx,
+    );
+    let value = emit_codegen_expr_value_with_local_env(
+        fb,
+        op.value.as_ref(),
+        local_env,
+        emit_ctx,
+        value_is_borrowed,
+        codegen_env,
+        func_imports,
+    );
+    let (raw_value, facts) = value.expect_pyobject("direct receiver type-version guard input");
+    let owner_type_ref = reloc_type_ref_from_typed_attr_owner_ref(&op.owner_type_ref)
+        .ok_or_else(|| "invalid direct receiver guard owner type ref".to_string())?;
+    let guard = match emit_type_ptr_value_for_ref(fb, codegen_env, emit_ctx, &owner_type_ref)? {
+        Some(expected_type) => emit_exact_receiver_type_version_match_bool01(
+            fb,
+            raw_value,
+            expected_type,
+            op.type_version,
+            emit_ctx,
+        ),
+        None => emit_i32_bool01_const(fb, false, emit_ctx),
+    };
+    if !value_is_borrowed {
+        emit_release_owned_pyobject(fb, raw_value, Some(facts), emit_ctx);
+    }
+    Ok(guard)
+}
+
 #[allow(dead_code)]
 fn emit_typed_codegen_expr_with_local_env(
     fb: &mut FunctionBuilder<'_>,
@@ -15157,7 +18807,15 @@ fn emit_typed_codegen_stmt_with_local_env(
 ) -> Result<ir::Value, String> {
     if matches!(
         expr,
-        InstrTyped::Truthy(_) | InstrTyped::Load(_) | InstrTyped::BinOp(_)
+        InstrTyped::Truthy(_)
+            | InstrTyped::Load(_)
+            | InstrTyped::BinOp(_)
+            | InstrTyped::CallTyped(_)
+            | InstrTyped::GuardedCallableCallTyped(_)
+            | InstrTyped::GuardedMethodCallTyped(_)
+            | InstrTyped::DirectCallableCallTyped(_)
+            | InstrTyped::DirectMethodCallTyped(_)
+            | InstrTyped::DirectCallGuardTest(_)
     ) {
         return emit_typed_codegen_expr_with_local_env(
             fb,
@@ -15190,6 +18848,68 @@ fn emit_typed_codegen_stmt_result_with_local_env(
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<EmitResult, String> {
+    if let InstrTyped::CallTyped(op) = expr {
+        if let Some(result) = emit_typed_codegen_call_result_with_local_env(
+            fb,
+            op,
+            local_env,
+            emit_ctx,
+            demand,
+            codegen_env,
+            func_imports,
+        )? {
+            return Ok(result);
+        }
+    }
+    if let InstrTyped::GuardedCallableCallTyped(op) = expr {
+        if let Some(result) = emit_typed_codegen_guarded_callable_call_result_with_local_env(
+            fb,
+            op,
+            local_env,
+            emit_ctx,
+            demand,
+            codegen_env,
+            func_imports,
+        )? {
+            return Ok(result);
+        }
+    }
+    if let InstrTyped::GuardedMethodCallTyped(op) = expr {
+        if let Some(result) = emit_typed_codegen_guarded_method_call_result_with_local_env(
+            fb,
+            op,
+            local_env,
+            emit_ctx,
+            demand,
+            codegen_env,
+            func_imports,
+        )? {
+            return Ok(result);
+        }
+    }
+    if let InstrTyped::DirectCallableCallTyped(op) = expr {
+        return emit_typed_codegen_direct_callable_call_result_with_local_env(
+            fb,
+            op,
+            local_env,
+            emit_ctx,
+            demand,
+            codegen_env,
+            func_imports,
+        );
+    }
+    if let InstrTyped::DirectMethodCallTyped(op) = expr {
+        return emit_typed_codegen_direct_method_call_result_with_local_env(
+            fb,
+            op,
+            local_env,
+            emit_ctx,
+            demand,
+            codegen_env,
+            func_imports,
+        );
+    }
+
     if let InstrTyped::LegacyStore(op) = expr {
         if let Some(result) = emit_typed_local_store_result_with_local_env(
             fb,
@@ -15207,7 +18927,15 @@ fn emit_typed_codegen_stmt_result_with_local_env(
 
     if matches!(
         expr,
-        InstrTyped::Truthy(_) | InstrTyped::Load(_) | InstrTyped::BinOp(_)
+        InstrTyped::Truthy(_)
+            | InstrTyped::Load(_)
+            | InstrTyped::BinOp(_)
+            | InstrTyped::CallTyped(_)
+            | InstrTyped::GuardedCallableCallTyped(_)
+            | InstrTyped::GuardedMethodCallTyped(_)
+            | InstrTyped::DirectCallableCallTyped(_)
+            | InstrTyped::DirectMethodCallTyped(_)
+            | InstrTyped::DirectCallGuardTest(_)
     ) {
         if demand == ResultDemand::I32_BOOL01 {
             return emit_typed_codegen_i32_bool01_result_with_local_env(
@@ -15288,15 +19016,34 @@ fn emit_typed_codegen_i64_index_result_with_local_env(
     func_imports: &mut FuncBuildImports<'_>,
     pyobject_to_i64_ref: ir::FuncRef,
 ) -> Result<EmitResult, String> {
-    let legacy_expr = try_lower_typed_instr_to_codegen_legacy(expr.clone())?;
-    let index_i64 = emit_branch_index_i64(
+    if let Ok(legacy_expr) = try_lower_typed_instr_to_codegen_legacy(expr.clone()) {
+        let index_i64 = emit_branch_index_i64(
+            fb,
+            &legacy_expr,
+            local_env,
+            emit_ctx,
+            codegen_env,
+            func_imports,
+            pyobject_to_i64_ref,
+        );
+        return Ok(EmitResult::i64(index_i64, IntFacts::i64_unknown()));
+    }
+
+    let index_value = emit_typed_codegen_expr_value_with_local_env(
         fb,
-        &legacy_expr,
+        expr,
         local_env,
         emit_ctx,
+        false,
         codegen_env,
         func_imports,
-        pyobject_to_i64_ref,
+    )?;
+    let (index_obj, _) = index_value.expect_pyobject("typed branch-table index");
+    let index_i64_inst = fb.ins().call(pyobject_to_i64_ref, &[index_obj]);
+    let index_i64 = fb.inst_results(index_i64_inst)[0];
+    fb.ins().call(
+        emit_ctx.decref_ref,
+        &[emit_ctx.consts.thread_state_value, index_obj],
     );
     Ok(EmitResult::i64(index_i64, IntFacts::i64_unknown()))
 }
@@ -15432,7 +19179,9 @@ fn emit_codegen_if_target_arm(
     target_exception_name: Option<&str>,
     release_reason: RefcountReleaseReason,
     current_exception_name: Option<&str>,
+    function: &BlockPyFunction<CodegenModuleShape>,
     exec_blocks: &[ir::Block],
+    block_indices_by_label: &HashMap<BlockLabel, usize>,
     implicit_target_transports: &[EdgeTransportPlan],
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
@@ -15440,7 +19189,8 @@ fn emit_codegen_if_target_arm(
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<(), String> {
     fb.switch_to_block(branch_block);
-    let target_index = target_label.index();
+    let target_index =
+        codegen_block_index_for_label(function, block_indices_by_label, target_label)?;
     let edge_transport = &implicit_target_transports[target_index];
     let mut jump_args = Vec::with_capacity(edge_transport.target_args.len());
     let (prepared_args, forwarded_locations) = emit_planned_target_args_codegen_from_local_env(
@@ -15494,6 +19244,7 @@ fn emit_codegen_if_truth_i32(
     current_exception_name: Option<&str>,
     function: &BlockPyFunction<CodegenModuleShape>,
     exec_blocks: &[ir::Block],
+    block_indices_by_label: &HashMap<BlockLabel, usize>,
     implicit_target_transports: &[EdgeTransportPlan],
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
@@ -15542,7 +19293,9 @@ fn emit_codegen_if_truth_i32(
             RefcountReleaseReason::IfElse { target: hot_label }
         },
         current_exception_name,
+        function,
         exec_blocks,
+        block_indices_by_label,
         implicit_target_transports,
         &mut hot_local_env,
         emit_ctx,
@@ -15563,7 +19316,9 @@ fn emit_codegen_if_truth_i32(
             RefcountReleaseReason::IfElse { target: cold_label }
         },
         current_exception_name,
+        function,
         exec_blocks,
+        block_indices_by_label,
         implicit_target_transports,
         &mut cold_local_env,
         emit_ctx,
@@ -15612,6 +19367,7 @@ fn emit_codegen_branch_table_from_i64(
     index_i64: ir::Value,
     function: &BlockPyFunction<CodegenModuleShape>,
     exec_blocks: &[ir::Block],
+    block_indices_by_label: &HashMap<BlockLabel, usize>,
     implicit_target_transports: &[EdgeTransportPlan],
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
@@ -15649,7 +19405,8 @@ fn emit_codegen_branch_table_from_i64(
 
     for (target_label, case_block) in targets.iter().zip(case_blocks.iter()) {
         fb.switch_to_block(*case_block);
-        let target_index = target_label.index();
+        let target_index =
+            codegen_block_index_for_label(function, block_indices_by_label, *target_label)?;
         let edge_transport = &implicit_target_transports[target_index];
         let mut case_local_env = local_env.clone();
         let mut case_jump_args = Vec::with_capacity(edge_transport.target_args.len());
@@ -15697,7 +19454,8 @@ fn emit_codegen_branch_table_from_i64(
     }
 
     fb.switch_to_block(default_block);
-    let default_index = default_label.index();
+    let default_index =
+        codegen_block_index_for_label(function, block_indices_by_label, default_label)?;
     let edge_transport = &implicit_target_transports[default_index];
     let mut default_local_env = local_env.clone();
     let mut default_jump_args = Vec::with_capacity(edge_transport.target_args.len());
@@ -15886,6 +19644,7 @@ fn emit_codegen_term(
     term: &BlockTerm<InstrCodegen>,
     function: &BlockPyFunction<CodegenModuleShape>,
     exec_blocks: &[ir::Block],
+    block_indices_by_label: &HashMap<BlockLabel, usize>,
     jump_edge_transports: &[Option<EdgeTransportPlan>],
     implicit_target_transports: &[EdgeTransportPlan],
     local_env: &mut LocalEnv,
@@ -15901,8 +19660,14 @@ fn emit_codegen_term(
 
     match term {
         BlockTerm::Jump(target_label) => {
-            let target_index = target_label.target.index();
-            let edge_transport = jump_edge_transports[source_label.index()]
+            let target_index = codegen_block_index_for_label(
+                function,
+                block_indices_by_label,
+                target_label.target,
+            )?;
+            let source_index =
+                codegen_block_index_for_label(function, block_indices_by_label, source_label)?;
+            let edge_transport = jump_edge_transports[source_index]
                 .as_ref()
                 .expect("jump term should have a planned edge transport");
             let mut jump_args = Vec::with_capacity(edge_transport.target_args.len());
@@ -15950,17 +19715,43 @@ fn emit_codegen_term(
         }
         BlockTerm::IfTerm(if_term) => {
             let test_instr_id = if_term.test.try_semantic_instr_id();
-            let test_value = emit_codegen_expr_value_with_local_env(
-                fb,
-                &if_term.test,
-                local_env,
-                emit_ctx,
-                false,
-                codegen_env,
-                func_imports,
-            );
-            let truth = emit_truthy_from_owned_value(fb, test_value, is_true_ref, emit_ctx);
-            let truth_i32 = truth.expect_i32_bool01("if condition truthiness");
+            let truth_i32 = match &if_term.test {
+                InstrCodegen::DirectFunctionIdGuardTest(guard) => {
+                    emit_codegen_direct_function_id_guard_test_value_with_local_env(
+                        fb,
+                        guard,
+                        local_env,
+                        emit_ctx,
+                        codegen_env,
+                        func_imports,
+                    )?
+                    .expect_i32_bool01("direct function-id guard")
+                }
+                InstrCodegen::DirectReceiverTypeVersionGuardTest(guard) => {
+                    emit_codegen_direct_receiver_type_version_guard_test_value_with_local_env(
+                        fb,
+                        guard,
+                        local_env,
+                        emit_ctx,
+                        codegen_env,
+                        func_imports,
+                    )?
+                    .expect_i32_bool01("direct receiver type-version guard")
+                }
+                _ => {
+                    let test_value = emit_codegen_expr_value_with_local_env(
+                        fb,
+                        &if_term.test,
+                        local_env,
+                        emit_ctx,
+                        false,
+                        codegen_env,
+                        func_imports,
+                    );
+                    let truth = emit_truthy_from_owned_value(fb, test_value, is_true_ref, emit_ctx);
+                    truth.expect_i32_bool01("if condition truthiness")
+                }
+            };
             emit_codegen_if_truth_i32(
                 fb,
                 source_label,
@@ -15971,6 +19762,7 @@ fn emit_codegen_term(
                 current_exception_name,
                 function,
                 exec_blocks,
+                block_indices_by_label,
                 implicit_target_transports,
                 local_env,
                 emit_ctx,
@@ -15996,6 +19788,7 @@ fn emit_codegen_term(
                 index_i64,
                 function,
                 exec_blocks,
+                block_indices_by_label,
                 implicit_target_transports,
                 local_env,
                 emit_ctx,
@@ -16063,6 +19856,7 @@ fn emit_typed_codegen_term(
     term: &BlockTerm<InstrTyped>,
     function: &BlockPyFunction<CodegenModuleShape>,
     exec_blocks: &[ir::Block],
+    block_indices_by_label: &HashMap<BlockLabel, usize>,
     jump_edge_transports: &[Option<EdgeTransportPlan>],
     implicit_target_transports: &[EdgeTransportPlan],
     local_env: &mut LocalEnv,
@@ -16113,6 +19907,7 @@ fn emit_typed_codegen_term(
             current_exception_name,
             function,
             exec_blocks,
+            block_indices_by_label,
             implicit_target_transports,
             local_env,
             emit_ctx,
@@ -16249,6 +20044,7 @@ fn emit_typed_codegen_term(
             index_i64,
             function,
             exec_blocks,
+            block_indices_by_label,
             implicit_target_transports,
             local_env,
             emit_ctx,
@@ -16265,6 +20061,7 @@ fn emit_typed_codegen_term(
         &legacy_term,
         function,
         exec_blocks,
+        block_indices_by_label,
         jump_edge_transports,
         implicit_target_transports,
         local_env,
@@ -16974,6 +20771,39 @@ impl ProcessJitEngine {
             self.fail_reserved_direct_function_batch(&plan, &err);
             return Err(err);
         }
+        let refresh_start = Instant::now();
+        let refresh_result = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| "process JIT state lock poisoned".to_string())?;
+            let mut jit_module = self.module.lock_for_serial_phase()?;
+            let _guard = ProcessJitCompileGuard::enter();
+            let result = plan.refresh_planned_module_constant_bindings(&mut state, &mut jit_module);
+            if result.is_ok() {
+                plan.module_declarations = JitModuleDeclarationSnapshot::from_module(&jit_module);
+            }
+            result
+        };
+        if let Err(err) = refresh_result {
+            emit_jit_batch_codegen_log(
+                function,
+                direct_call_resolver,
+                "error",
+                "constant-refresh",
+                Some(&err),
+                plan.batch_functions.len(),
+                plan.function_indices_to_define.len(),
+                Duration::ZERO,
+                reservation_elapsed,
+                refresh_start.elapsed(),
+                Duration::ZERO,
+                total_start.elapsed(),
+                JitBatchWorkerMetrics::default(),
+            );
+            self.fail_reserved_direct_function_batch(&plan, &err);
+            return Err(err);
+        }
         let batch_function_count = plan.batch_functions.len();
         let functions_to_define_count = plan.function_indices_to_define.len();
         let codegen_start = Instant::now();
@@ -17204,6 +21034,39 @@ impl ProcessJitEngine {
                 batch_collect_elapsed,
                 reservation_elapsed,
                 Duration::ZERO,
+                Duration::ZERO,
+                total_start.elapsed(),
+                JitBatchWorkerMetrics::default(),
+            );
+            self.fail_reserved_direct_function_batch(&plan, &err);
+            return Err(err);
+        }
+        let refresh_start = Instant::now();
+        let refresh_result = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| "process JIT state lock poisoned".to_string())?;
+            let mut jit_module = self.module.lock_for_serial_phase()?;
+            let _guard = ProcessJitCompileGuard::enter();
+            let result = plan.refresh_planned_module_constant_bindings(&mut state, &mut jit_module);
+            if result.is_ok() {
+                plan.module_declarations = JitModuleDeclarationSnapshot::from_module(&jit_module);
+            }
+            result
+        };
+        if let Err(err) = refresh_result {
+            emit_jit_batch_codegen_log(
+                function,
+                direct_call_resolver,
+                "error",
+                "constant-refresh",
+                Some(&err),
+                plan.batch_functions.len(),
+                plan.function_indices_to_define.len(),
+                batch_collect_elapsed,
+                reservation_elapsed,
+                refresh_start.elapsed(),
                 Duration::ZERO,
                 total_start.elapsed(),
                 JitBatchWorkerMetrics::default(),
@@ -18951,12 +22814,14 @@ fn precompile_codegen_module_to_object_bytes(
         });
     }
 
-    let value_facts = infer_jit_value_facts(module);
-    let jit_module_local_plan = plan_jit_module_locals(module, &value_facts)?;
-    let jit_module_deopt_resume_plan = plan_jit_deopt_resume_module(module, &value_facts)?;
+    let specialization_profile =
+        SpecializationProfile::from_precompile(module_name, counter_dump_path)?;
+    let jit_module_plan =
+        build_profiled_jit_module_plan(module, &specialization_profile, None, &HashMap::new())?;
+    let planned_module = jit_module_plan.module.as_ref();
     let mut predeclared = HashMap::new();
     let mut symbol_scopes = HashMap::new();
-    for function in &module.callable_defs {
+    for function in &planned_module.callable_defs {
         let symbol_scope = precompiled_direct_function_symbol_scope_for_module_identity(
             module_name,
             source_hash,
@@ -18967,12 +22832,11 @@ fn precompile_codegen_module_to_object_bytes(
         predeclared.insert(function.function_id, declared);
         symbol_scopes.insert(function.function_id, symbol_scope);
     }
-    let specialization_profile =
-        SpecializationProfile::from_precompile(module_name, counter_dump_path)?;
-    for function in &module.callable_defs {
+    for function in &planned_module.callable_defs {
         let placeholder_blocks =
             vec![std::ptr::null_mut::<std::ffi::c_void>(); function.blocks.len()];
-        let jit_local_plan = jit_module_local_plan
+        let jit_local_plan = jit_module_plan
+            .locals
             .function(function.function_id)
             .ok_or_else(|| {
                 format!(
@@ -18980,7 +22844,8 @@ fn precompile_codegen_module_to_object_bytes(
                     function.function_id, function.names.qualname
                 )
             })?;
-        let jit_deopt_resume_plan = jit_module_deopt_resume_plan
+        let jit_deopt_resume_plan = jit_module_plan
+            .deopt_resume
             .function(function.function_id)
             .ok_or_else(|| {
                 format!(
@@ -18991,13 +22856,13 @@ fn precompile_codegen_module_to_object_bytes(
         let built = build_cranelift_run_bb_specialized_function(
             &mut jit_module,
             placeholder_blocks.as_slice(),
-            module,
+            planned_module,
             function,
-            &value_facts,
+            &jit_module_plan.value_facts,
             jit_local_plan,
             jit_deopt_resume_plan,
             &module_constants,
-            module.counter_defs.as_slice(),
+            planned_module.counter_defs.as_slice(),
             module_constant_object_data_ids.as_slice(),
             counter_slots_by_id.as_ref(),
             scalar_counter_data_id,
@@ -19330,6 +23195,121 @@ struct BuildSpecializedFunctionOptions {
     specialization_inputs: Option<FunctionSpecializationInputs>,
 }
 
+struct PreparedSpecializedTypedFunction {
+    typed_function: BlockPyFunction<TypedCodegenModuleShape>,
+    result_demand_plan: ResultDemandPlan,
+}
+
+fn block_edge_shape(edge: Option<&BlockEdge>) -> Option<(BlockLabel, usize)> {
+    edge.map(|edge| (edge.target.clone(), edge.args.len()))
+}
+
+fn block_term_shape<I: soac_blockpy::block_py::Instr>(
+    term: &BlockTerm<I>,
+) -> (&'static str, Vec<(BlockLabel, usize)>) {
+    match term {
+        BlockTerm::Jump(edge) => ("jump", vec![(edge.target.clone(), edge.args.len())]),
+        BlockTerm::IfTerm(if_term) => (
+            "if",
+            vec![
+                (if_term.then_label.clone(), 0),
+                (if_term.else_label.clone(), 0),
+            ],
+        ),
+        BlockTerm::BranchTable(branch) => {
+            let mut edges = branch
+                .targets
+                .iter()
+                .cloned()
+                .map(|target| (target, 0))
+                .collect::<Vec<_>>();
+            edges.push((branch.default_label.clone(), 0));
+            ("branch_table", edges)
+        }
+        BlockTerm::Raise(_) => ("raise", Vec::new()),
+        BlockTerm::Return(_) => ("return", Vec::new()),
+    }
+}
+
+fn validate_typed_function_preserves_codegen_cfg(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    typed_function: &BlockPyFunction<TypedCodegenModuleShape>,
+) -> Result<(), String> {
+    if typed_function.blocks.len() != function.blocks.len() {
+        return Err(format!(
+            "typed specialized JIT function block count mismatch: {} != {}",
+            typed_function.blocks.len(),
+            function.blocks.len()
+        ));
+    }
+    for (index, (codegen_block, typed_block)) in function
+        .blocks
+        .iter()
+        .zip(typed_function.blocks.iter())
+        .enumerate()
+    {
+        if typed_block.label != codegen_block.label {
+            return Err(format!(
+                "typed specialized JIT block {index} label mismatch: {} != {}",
+                typed_block.label, codegen_block.label
+            ));
+        }
+        if typed_block.params != codegen_block.params {
+            return Err(format!(
+                "typed specialized JIT block {} param mismatch",
+                codegen_block.label
+            ));
+        }
+        if block_edge_shape(typed_block.exc_edge.as_ref())
+            != block_edge_shape(codegen_block.exc_edge.as_ref())
+        {
+            return Err(format!(
+                "typed specialized JIT block {} exception edge mismatch",
+                codegen_block.label
+            ));
+        }
+        if block_term_shape(&typed_block.term) != block_term_shape(&codegen_block.term) {
+            return Err(format!(
+                "typed specialized JIT block {} terminator CFG mismatch",
+                codegen_block.label
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn prepare_specialized_typed_function(
+    module: &BlockPyModule<CodegenModuleShape>,
+    function: &BlockPyFunction<CodegenModuleShape>,
+    field_index_specializations: &HashMap<String, Vec<FieldIndexSpecialization>>,
+    specialize_field_stores: bool,
+    call_specialization_ctx: &CallSpecializationCtx<'_>,
+    call_target_specializations: &HashMap<InstrId, Vec<FunctionId>>,
+) -> Result<PreparedSpecializedTypedFunction, String> {
+    let mut typed_function =
+        lower_typed_function_if_tests_to_truthy(lower_codegen_function_to_typed(function.clone()));
+
+    annotate_typed_attr_accesses(
+        module,
+        &mut typed_function,
+        field_index_specializations,
+        specialize_field_stores,
+    );
+    annotate_typed_call_accesses(
+        &mut typed_function,
+        call_specialization_ctx,
+        call_target_specializations,
+    );
+    lower_typed_function_call_access_plan_instrs(&mut typed_function);
+    validate_typed_function_call_access_plans(&typed_function)?;
+    validate_typed_function_preserves_codegen_cfg(function, &typed_function)?;
+    let result_demand_plan = plan_typed_result_demands(&typed_function);
+    Ok(PreparedSpecializedTypedFunction {
+        typed_function,
+        result_demand_plan,
+    })
+}
+
 fn build_cranelift_run_bb_specialized_function(
     codegen_env: &mut impl JitCodegenEnv,
     blocks: &[ObjPtr],
@@ -19375,23 +23355,8 @@ fn build_cranelift_run_bb_specialized_function(
         }
     }
     jit_deopt_resume_plan.validate_for_function(function)?;
-    let typed_function =
-        lower_typed_function_if_tests_to_truthy(lower_codegen_function_to_typed(function.clone()));
-    if typed_function.blocks.len() != function.blocks.len() {
-        return Err(format!(
-            "typed specialized JIT function block count mismatch: {} != {}",
-            typed_function.blocks.len(),
-            function.blocks.len()
-        ));
-    }
-    let result_demand_plan = plan_typed_result_demands(&typed_function);
-    let computed_inline_plan;
-    let inline_plan = if let Some(shared_state) = direct_call_resolver {
-        &shared_state.inline_plan
-    } else {
-        computed_inline_plan = plan_jit_inlining(module);
-        &computed_inline_plan
-    };
+    let computed_inline_plan = plan_jit_inlining(module);
+    let inline_plan = &computed_inline_plan;
 
     let call_target_counter_ids =
         collect_runtime_counter_ids_by_kind(counter_defs, function.function_id, "call_hot_targets");
@@ -19531,6 +23496,12 @@ fn build_cranelift_run_bb_specialized_function(
     for targets in call_target_specializations.values() {
         direct_call_targets.extend(targets.iter().copied());
     }
+    direct_call_targets.extend(collect_runtime_protocol_method_targets(
+        function,
+        module_constants,
+        options.direct_owner_attr_specializations.as_ref(),
+        &call_target_specializations,
+    ));
     let empty_direct_functions = HashMap::new();
     let direct_call_functions = predeclared_direct_functions.unwrap_or(&empty_direct_functions);
     let mut direct_call_target_functions = HashMap::new();
@@ -19553,6 +23524,25 @@ fn build_cranelift_run_bb_specialized_function(
         };
         direct_call_target_functions.insert(function_id, target_function);
     }
+    let direct_edge_stats = DirectEdgeStats::default();
+    let call_specialization_ctx = CallSpecializationCtx {
+        module,
+        direct_call_resolver,
+        direct_call_target_functions: &direct_call_target_functions,
+        direct_owner_attr_specializations: options.direct_owner_attr_specializations.as_ref(),
+        direct_edge_stats: &direct_edge_stats,
+    };
+    let PreparedSpecializedTypedFunction {
+        typed_function,
+        result_demand_plan,
+    } = prepare_specialized_typed_function(
+        module,
+        function,
+        &field_index_specializations,
+        behavior_change_indexed_stores,
+        &call_specialization_ctx,
+        &call_target_specializations,
+    )?;
     let ptr_ty = codegen_env.codegen_target_config().pointer_type();
     let i64_ty = ir::types::I64;
     let mut module_imports = ModuleFuncImports::new();
@@ -19601,11 +23591,11 @@ fn build_cranelift_run_bb_specialized_function(
     ctx.func.signature = main_sig;
     let mut builder_ctx = FunctionBuilderContext::new();
     let mut block_annotations = ClifBlockDisplayAnnotations::new();
-    let direct_edge_stats = DirectEdgeStats::default();
     {
         let mut fb = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
         let entry_block = fb.create_block();
         let mut exec_blocks = Vec::with_capacity(block_count);
+        let block_indices_by_label = codegen_block_indices_by_label(function);
         let runtime_block_params = &jit_local_plan.runtime_block_params;
         let implicit_target_transports = &jit_local_plan.implicit_target_transports;
         let jump_edge_transports = &jit_local_plan.jump_edge_transports;
@@ -19787,6 +23777,11 @@ fn build_cranelift_run_bb_specialized_function(
             &mut fb.func,
             &DP_JIT_ENTER_RECURSIVE_CALL_IMPORT,
         );
+        let direct_compile_function_env_ref = func_imports.get_or_panic(
+            codegen_env,
+            &mut fb.func,
+            &DP_JIT_DIRECT_COMPILE_FUNCTION_ENV_IMPORT,
+        );
         let pytype_generic_alloc_ref = func_imports.get_or_panic(
             codegen_env,
             &mut fb.func,
@@ -19872,7 +23867,7 @@ fn build_cranelift_run_bb_specialized_function(
             &DP_JIT_RAISE_DELETED_NAME_ERROR_IMPORT,
         );
         let raise_missing_required_argument_ref = func_imports.get_or_panic(
-            jit_module,
+            codegen_env,
             &mut fb.func,
             &DP_JIT_RAISE_MISSING_REQUIRED_ARGUMENT_IMPORT,
         );
@@ -20132,6 +24127,7 @@ fn build_cranelift_run_bb_specialized_function(
                 store_field_indexed_ref,
                 load_runtime_obj_by_id_ref,
                 enter_recursive_ref,
+                direct_compile_function_env_ref,
                 pyobject_getattr_ref,
                 pyobject_setattr_ref,
                 pyobject_getitem_ref,
@@ -20233,6 +24229,7 @@ fn build_cranelift_run_bb_specialized_function(
                 &typed_function.blocks[index].term,
                 function,
                 &exec_blocks,
+                &block_indices_by_label,
                 jump_edge_transports,
                 implicit_target_transports,
                 &mut local_env,
@@ -20561,22 +24558,93 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
 
     let builder = new_jit_builder()?;
     let mut jit_module = JITModule::new(builder);
-    let module_constant_ptrs = runtime_state
-        .map(SharedModuleState::module_constant_ptrs)
-        .unwrap_or_else(|| placeholder_module_constant_ptrs(module_constants.len()));
+    let specialization_profile = SpecializationProfile::from_runtime_state(runtime_state)?;
+    predeclare_specialization_type_imports(&mut jit_module, &specialization_profile)?;
+    let mut direct_owner_attr_specializations_by_function = HashMap::new();
+    if runtime_state.is_some() && specialization_profile.has_existing_counter_dump() {
+        for function in &module.callable_defs {
+            let direct_owner_attr_specializations = predeclare_direct_call_owner_type_imports(
+                &mut jit_module,
+                module,
+                function,
+                &specialization_profile,
+            )?;
+            if !direct_owner_attr_specializations.is_empty() {
+                direct_owner_attr_specializations_by_function
+                    .insert(function.function_id, direct_owner_attr_specializations);
+            }
+        }
+    }
+    let jit_module_plan =
+        if runtime_state.is_some() && specialization_profile.has_existing_counter_dump() {
+            build_profiled_jit_module_plan(
+                module,
+                &specialization_profile,
+                Some(compile_session),
+                &direct_owner_attr_specializations_by_function,
+            )?
+        } else {
+            build_jit_module_plan(module)?
+        };
+    let render_module = jit_module_plan.module.as_ref();
+    let render_function = render_module
+        .callable_defs
+        .iter()
+        .find(|candidate| candidate.function_id == function.function_id)
+        .ok_or_else(|| {
+            format!(
+                "planned specialized JIT module is missing function {} ({})",
+                function.function_id, function.names.qualname
+            )
+        })?;
+    let placeholder_blocks;
+    let render_blocks = if blocks.len() == render_function.blocks.len() {
+        blocks
+    } else {
+        placeholder_blocks =
+            vec![std::ptr::null_mut::<std::ffi::c_void>(); render_function.blocks.len()];
+        placeholder_blocks.as_slice()
+    };
+    let planned_module_constants;
+    let render_module_constants = if let Some(shared_state) = runtime_state {
+        planned_module_constants = collect_codegen_constants_for_module_name(
+            shared_state.module_name.as_str(),
+            render_module,
+        );
+        &planned_module_constants
+    } else {
+        module_constants
+    };
+    let module_constant_owners = runtime_state
+        .map(|shared_state| {
+            Python::attach(|py| {
+                crate::module_type::build_module_constant_objects(
+                    py,
+                    render_module_constants,
+                    shared_state.module_name.as_str(),
+                    shared_state.source_hash(),
+                )
+                .map_err(|err| err.to_string())
+            })
+        })
+        .transpose()?;
+    let module_constant_ptrs = module_constant_owners
+        .as_ref()
+        .map(|owners| owners.iter().map(|obj| obj.as_ptr()).collect::<Vec<_>>())
+        .unwrap_or_else(|| placeholder_module_constant_ptrs(render_module_constants.len()));
     let counter_defs = runtime_state
-        .map(|state| state.lowered_module.counter_defs.as_slice())
+        .map(|_| render_module.counter_defs.as_slice())
         .unwrap_or(module.counter_defs.as_slice());
     let (counter_slots_by_id, scalar_counter_count, top_value_counter_count) =
         build_counter_storage_layout(counter_defs)?;
     let module_constant_object_data_ids =
-        declare_module_constant_object_data(&mut jit_module, module, &module_constant_ptrs)?;
+        declare_module_constant_object_data(&mut jit_module, render_module, &module_constant_ptrs)?;
     let scalar_counter_data_id = if scalar_counter_count == 0 {
         None
     } else {
         Some(define_scalar_counter_storage_data(
             &mut jit_module,
-            module,
+            render_module,
             scalar_counter_count,
         )?)
     };
@@ -20590,38 +24658,43 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
     } else {
         Some(define_top_value_counter_storage_data(
             &mut jit_module,
-            module,
+            render_module,
             top_value_counter_count,
         )?)
     };
-    let value_facts = infer_jit_value_facts(module);
-    let jit_module_local_plan = plan_jit_module_locals(module, &value_facts)?;
-    let jit_module_deopt_resume_plan = plan_jit_deopt_resume_module(module, &value_facts)?;
-    let jit_local_plan = jit_module_local_plan
-        .function(function.function_id)
+    let jit_local_plan = jit_module_plan
+        .locals
+        .function(render_function.function_id)
         .ok_or_else(|| {
             format!(
                 "missing JIT local plan for function {} ({})",
-                function.function_id, function.names.qualname
+                render_function.function_id, render_function.names.qualname
             )
         })?;
-    let jit_deopt_resume_plan = jit_module_deopt_resume_plan
-        .function(function.function_id)
+    let jit_deopt_resume_plan = jit_module_plan
+        .deopt_resume
+        .function(render_function.function_id)
         .ok_or_else(|| {
             format!(
                 "missing JIT deopt resume plan for function {} ({})",
-                function.function_id, function.names.qualname
+                render_function.function_id, render_function.names.qualname
             )
         })?;
+    let specialization_inputs =
+        FunctionSpecializationInputs::from_profile(&specialization_profile, render_function)?;
+    let direct_owner_attr_specializations = direct_owner_attr_specializations_by_function
+        .get(&render_function.function_id)
+        .cloned()
+        .unwrap_or_default();
     let built = build_cranelift_run_bb_specialized_function(
         &mut jit_module,
-        blocks,
-        module,
-        function,
-        &value_facts,
+        render_blocks,
+        render_module,
+        render_function,
+        &jit_module_plan.value_facts,
         jit_local_plan,
         jit_deopt_resume_plan,
-        module_constants,
+        render_module_constants,
         counter_defs,
         module_constant_object_data_ids.as_slice(),
         counter_slots_by_id.as_ref(),
@@ -20629,10 +24702,14 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
         top_value_counter_data_id,
         compile_session,
         runtime_state,
-        Some(&SpecializationProfile::from_runtime_state(runtime_state)?),
+        Some(&specialization_profile),
         None,
         None,
-        BuildSpecializedFunctionOptions::default(),
+        BuildSpecializedFunctionOptions {
+            direct_owner_attr_specializations: Some(direct_owner_attr_specializations),
+            specialization_inputs: Some(specialization_inputs),
+            ..BuildSpecializedFunctionOptions::default()
+        },
     )?;
     let mut out = String::new();
     out.push_str("; import fn aliases (Cranelift display id -> symbol)\n");

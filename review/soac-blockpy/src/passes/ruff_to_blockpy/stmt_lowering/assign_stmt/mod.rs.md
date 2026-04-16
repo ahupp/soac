@@ -3,7 +3,7 @@
 ## File Responsibilities
 
 Lowers assignment targets and assignment statements, including name stores, attribute/subscript
-stores, tuple/list unpacking, target-object deleted-name checks, and temporary binding/cleanup for
+stores, tuple/list unpacking, target-object lowering, and temporary binding/cleanup for
 multi-target evaluation order.
 
 ## Datatypes
@@ -17,8 +17,7 @@ multi-target evaluation order.
 - `temp_load_expr`: builds a load expression for a temp.
 - `bind_temp`: stores a value into a temp and returns a load of that temp.
 - `delete_temp`: emits a delete of a temp.
-- `lower_target_object_with_setup`: lowers an assignment/delete target object, wrapping name objects
-  in `load_deleted_name` to preserve deleted-name behavior.
+- `lower_target_object_with_setup`: lowers an assignment/delete target object with setup statements.
 - `lower_assignment_target_into`: recursively lowers assignment to names, attributes, subscripts,
   tuple targets, and list targets.
 - `lower_unpack_target_into`: calls `__soac__.unpack`, binds the result, assigns each unpacked item,
@@ -28,7 +27,7 @@ multi-target evaluation order.
   the temp.
 - `build_for_target_assign_body`: builds the small assignment/delete sequence used to bind for-loop
   targets from the loop temporary.
-- `with_target_object_expr`: AST-level helper wrapping name target objects with `load_deleted_name`.
+- `with_target_object_expr`: AST-level helper for assignment target object rewrites.
 - `rewrite_assignment_target`: AST-level assignment target rewrite used by structured with-stmt
   desugaring.
 - `rewrite_unpack_target`: AST-level unpack assignment rewrite used before BlockPy lowering.
@@ -38,4 +37,3 @@ multi-target evaluation order.
 - `soac-blockpy/src/passes/ruff_to_blockpy/stmt_lowering/mod.rs`
 - `soac-blockpy/src/passes/ruff_to_blockpy/expr_lowering/mod.rs`
 - `soac-blockpy/src/passes/ast_to_ast/expr_utils.rs`
-

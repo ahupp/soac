@@ -5,10 +5,10 @@ use soac_blockpy::block_py::{
     CalleeFunctionId, CellLocation, CellRef, ChildVisitable, ClosureInit, ClosureSlot,
     CodegenBlock, CounterDef, CounterSite, Del, DelItem, FunctionId, FunctionKind, FunctionName,
     GetAttr, GetItem, HasMeta, HasSemanticInstrId, IncrementCounter, InstrCodegen, InstrResolved,
-    Literal, LiteralValue, Load, LocalLocation, MakeCell, Meta, ModuleNameGen, NameLocation,
-    NumberLiteral, NumberLiteralValue, Param, ParamKind, ParamSpec, ResolvedName, RuntimeName,
-    SetAttr, SetItem, StorageLayout, Store, StringLiteral, Tuple, UnaryOp, UnaryOpKind, Visit,
-    VisitMut, WithMeta,
+    Literal, LiteralValue, Load, LocalLocation, MakeCell, Meta, ModuleNameGen, NameLike,
+    NameLocation, NumberLiteral, NumberLiteralValue, Param, ParamKind, ParamSpec, ResolvedName,
+    RuntimeName, SetAttr, SetItem, StorageLayout, Store, StringLiteral, Tuple, UnaryOp,
+    UnaryOpKind, Visit, VisitMut, WithMeta,
 };
 use soac_blockpy::passes::{
     CodegenModuleShape, instrument_bb_module_with_block_entry_counters,
@@ -3167,7 +3167,7 @@ def build(values):
             top_value_counter_data_id,
             compile_session,
             direct_call_resolver,
-            &specialization_profile,
+            Some(&specialization_profile),
             symbol_scope,
             predeclared_direct_functions,
             options,
@@ -3256,6 +3256,70 @@ def build(values):
             &module,
             &function,
             &module_constants,
+        );
+    }
+
+    #[test]
+    fn specialized_jit_receiver_type_version_guard_terms_compile_directly() {
+        let mut constants = TestConstantPool::default();
+        let function = test_function();
+        let entry_label = function.name_gen.next_block_name();
+        let then_label = function.name_gen.next_block_name();
+        let else_label = function.name_gen.next_block_name();
+        let entry = CodegenBlock {
+            label: entry_label,
+            body: vec![],
+            term: BlockTerm::IfTerm(soac_blockpy::block_py::TermIf {
+                test: InstrCodegen::DirectReceiverTypeVersionGuardTest(
+                    DirectReceiverTypeVersionGuardTest::new(
+                        constants.int_expr(1),
+                        TypedAttrOwnerRef::CpythonTypeSymbol(
+                            cpython_type_symbol_name(CpythonTypeSymbol::Long).to_string(),
+                        ),
+                        0,
+                    ),
+                ),
+                then_label,
+                else_label,
+            }),
+            params: vec![],
+            exc_edge: None,
+        };
+        let then_block = CodegenBlock {
+            label: then_label,
+            body: vec![],
+            term: ret_term(constants.int_expr(1)),
+            params: vec![],
+            exc_edge: None,
+        };
+        let else_block = CodegenBlock {
+            label: else_label,
+            body: vec![],
+            term: ret_term(constants.int_expr(0)),
+            params: vec![],
+            exc_edge: None,
+        };
+        let function = with_test_blocks(function, vec![entry, then_block, else_block]);
+        let module = BlockPyModule {
+            module_name_gen: ModuleNameGen::new(0),
+            global_names: Vec::new(),
+            callable_defs: vec![function.clone()],
+            module_constants: constants.module_constants,
+            counter_defs: Vec::new(),
+        };
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let built = build_test_specialized_function(
+            &[1usize as ObjPtr, 2usize as ObjPtr, 3usize as ObjPtr],
+            &module,
+            &function,
+            &module_constants,
+        );
+        let truthiness_helpers = import_user_names_for_symbols(&built, &["dp_jit_is_true"]);
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &truthiness_helpers),
+            0,
+            "receiver type/version guard terms should lower to direct bool tests, not Python truthiness"
         );
     }
 
@@ -3512,6 +3576,72 @@ def build(values):
         );
         assert_eq!(
             plan.demand_for_instr_id(keyword_instr_id),
+            Some(ResultDemand::PYOBJECT_BORROWED_OK)
+        );
+    }
+
+    #[test]
+    fn typed_result_demand_plan_marks_lowered_guarded_call_inputs_borrowed_ok() {
+        let mut constants = TestConstantPool::default();
+        let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+        let func_instr_id = InstrId::new(BlockLabel::from_index(0), 1);
+        let positional_instr_id = InstrId::new(BlockLabel::from_index(0), 2);
+        let call = with_instr_id(
+            op_expr(Call::new(
+                with_instr_id(name_expr(test_runtime_name("callable")), func_instr_id),
+                vec![CallArgPositional::Positional(with_instr_id(
+                    constants.int_expr(1),
+                    positional_instr_id,
+                ))],
+                Vec::<CallArgKeyword<InstrCodegen>>::new(),
+            )),
+            call_instr_id,
+        );
+        let function =
+            with_single_test_block(test_function(), vec![call], ret_term(constants.int_expr(2)));
+        let mut typed_function = lower_codegen_function_to_typed(function);
+        let first_instr = typed_function.blocks[0]
+            .body
+            .first_mut()
+            .expect("test block should contain call");
+        let soac_blockpy::passes::InstrTyped::CallTyped(call) = first_instr else {
+            panic!("test call should lower to typed call");
+        };
+        call.access = soac_blockpy::passes::TypedCallAccessPlan::GuardedCallable {
+            function_guards: vec![soac_blockpy::passes::TypedDirectFunctionCallGuard {
+                function_id: FunctionId::new(0, 1),
+                arg_plan: soac_blockpy::passes::TypedDirectCallArgPlan {
+                    sources: vec![soac_blockpy::passes::TypedDirectCallArgSource::Provided(0)],
+                },
+            }],
+            constructor_guards: Vec::new(),
+        };
+
+        assert_eq!(
+            lower_typed_function_call_access_plan_instrs(&mut typed_function),
+            1
+        );
+        assert!(
+            matches!(
+                typed_function.blocks[0].body.first(),
+                Some(soac_blockpy::passes::InstrTyped::GuardedCallableCallTyped(
+                    _
+                ))
+            ),
+            "guarded call plan should lower before demand planning"
+        );
+        let plan = plan_typed_result_demands(&typed_function);
+
+        assert_eq!(
+            plan.demand_for_instr_id(call_instr_id),
+            Some(ResultDemand::EffectOnly)
+        );
+        assert_eq!(
+            plan.demand_for_instr_id(func_instr_id),
+            Some(ResultDemand::PYOBJECT_BORROWED_OK)
+        );
+        assert_eq!(
+            plan.demand_for_instr_id(positional_instr_id),
             Some(ResultDemand::PYOBJECT_BORROWED_OK)
         );
     }
@@ -17056,6 +17186,293 @@ def f(x, y):
     }
 
     #[test]
+    fn profiled_store_call_rewrite_feeds_blockpy_inliner() {
+        let soac_work_dir = fresh_test_work_dir("profiled-store-call-inline-plan");
+        let profile_path = soac_work_dir.join("profile.bin");
+        let module_name = "profiled_store_call_inline_plan_test";
+        let module_name_gen = ModuleNameGen::new(0);
+        let mut callee_function = test_function_in_module(&module_name_gen, "callee");
+        callee_function.params.params.push(Param {
+            name: "x".into(),
+            kind: ParamKind::Any,
+            has_default: false,
+        });
+        callee_function = with_single_test_block(
+            callee_function,
+            vec![],
+            ret_term(name_expr(test_local_name("x", 0))),
+        );
+        set_stack_slots(&mut callee_function, &["x"]);
+
+        let mut caller_function = test_function_in_module(&module_name_gen, "caller");
+        caller_function.params.params.extend([
+            Param {
+                name: "fn".into(),
+                kind: ParamKind::Any,
+                has_default: false,
+            },
+            Param {
+                name: "x".into(),
+                kind: ParamKind::Any,
+                has_default: false,
+            },
+        ]);
+        let caller_block_label = caller_function.name_gen.next_block_name();
+        let call_instr_id = InstrId::new(caller_block_label, 1);
+        caller_function = with_test_blocks(
+            caller_function,
+            vec![CodegenBlock {
+                label: caller_block_label,
+                body: vec![assign_stmt(
+                    test_local_name("y", 2),
+                    with_instr_id(
+                        op_expr(Call::new(
+                            name_expr(test_local_name("fn", 0)),
+                            vec![CallArgPositional::Positional(name_expr(test_local_name(
+                                "x", 1,
+                            )))],
+                            Vec::<CallArgKeyword<InstrCodegen>>::new(),
+                        )),
+                        call_instr_id,
+                    ),
+                )],
+                term: ret_term(name_expr(test_local_name("y", 2))),
+                params: vec![],
+                exc_edge: None,
+            }],
+        );
+        set_stack_slots(&mut caller_function, &["fn", "x", "y"]);
+        let module = test_module(
+            module_name_gen,
+            vec![callee_function.clone(), caller_function.clone()],
+        );
+        write_test_counter_dump(
+            profile_path.as_path(),
+            &CounterDumpRecord {
+                source_hash: 0,
+                module_name: module_name.to_string(),
+                package_name: None,
+                rows: vec![CounterDumpRow {
+                    counter_id: 0,
+                    scope: "this".to_string(),
+                    kind: "call_hot_targets".to_string(),
+                    site_kind: "runtime".to_string(),
+                    function_id: Some(caller_function.function_id),
+                    current_function_id: Some(caller_function.function_id),
+                    instr_id: Some(call_instr_id),
+                    function_qualname: Some(caller_function.names.qualname.clone()),
+                    block_label: None,
+                    value: 1,
+                    observed_value: Some(callee_function.function_id.packed()),
+                    max_overcount: Some(0),
+                }],
+                module_keys: Vec::new(),
+                type_keys: Vec::new(),
+                type_table: Vec::new(),
+            },
+        );
+        let profile =
+            SpecializationProfile::from_precompile(module_name, Some(profile_path.as_path()))
+                .expect("test specialization profile should construct");
+        let plan = build_profiled_jit_module_plan(&module, &profile, None, &HashMap::new())
+            .expect("profiled JIT module plan should build");
+        let planned_caller = plan
+            .module
+            .callable_defs
+            .iter()
+            .find(|function| function.function_id == caller_function.function_id)
+            .expect("planned module should keep caller");
+
+        assert!(
+            planned_caller.blocks.iter().any(|block| {
+                matches!(
+                    &block.term,
+                    BlockTerm::IfTerm(term)
+                        if matches!(term.test, InstrCodegen::DirectFunctionIdGuardTest(_))
+                )
+            }),
+            "profiled rewrite should keep the function-id guard explicit"
+        );
+        assert!(
+            !planned_caller
+                .blocks
+                .iter()
+                .flat_map(|block| &block.body)
+                .any(|instr| matches!(instr, InstrCodegen::Store(store) if matches!(store.value.as_ref(), InstrCodegen::CallDirect(_)))),
+            "profiled hot CallDirect store should be consumed by the BlockPy inliner"
+        );
+    }
+
+    #[test]
+    fn profiled_no_arg_method_store_rewrite_uses_receiver_guard_and_inlines_target() {
+        let soac_work_dir = fresh_test_work_dir("profiled-method-call-inline-plan");
+        let profile_path = soac_work_dir.join("profile.bin");
+        let module_name = "profiled_method_call_inline_plan_test";
+        let module_name_gen = ModuleNameGen::new(0);
+        let mut constants = TestConstantPool::default();
+
+        let mut next_function = test_function_in_module(&module_name_gen, "IterRange.__next__");
+        next_function.params.params.push(Param {
+            name: "self".into(),
+            kind: ParamKind::Any,
+            has_default: false,
+        });
+        next_function = with_single_test_block(
+            next_function,
+            vec![],
+            ret_term(name_expr(test_local_name("self", 0))),
+        );
+        set_stack_slots(&mut next_function, &["self"]);
+
+        let mut caller_function = test_function_in_module(&module_name_gen, "caller");
+        caller_function.params.params.push(Param {
+            name: "it".into(),
+            kind: ParamKind::Any,
+            has_default: false,
+        });
+        let caller_block_label = caller_function.name_gen.next_block_name();
+        let call_instr_id = InstrId::new(caller_block_label, 1);
+        caller_function = with_test_blocks(
+            caller_function,
+            vec![CodegenBlock {
+                label: caller_block_label,
+                body: vec![assign_stmt(
+                    test_local_name("y", 1),
+                    with_instr_id(
+                        op_expr(Call::new(
+                            op_expr(GetAttr::new(
+                                name_expr(test_local_name("it", 0)),
+                                constants.string_expr("__next__"),
+                            )),
+                            Vec::<CallArgPositional<InstrCodegen>>::new(),
+                            Vec::<CallArgKeyword<InstrCodegen>>::new(),
+                        )),
+                        call_instr_id,
+                    ),
+                )],
+                term: ret_term(name_expr(test_local_name("y", 1))),
+                params: vec![],
+                exc_edge: None,
+            }],
+        );
+        set_stack_slots(&mut caller_function, &["it", "y"]);
+
+        let mut module = test_module(
+            module_name_gen,
+            vec![next_function.clone(), caller_function.clone()],
+        );
+        module.module_constants = constants.module_constants;
+        write_test_counter_dump(
+            profile_path.as_path(),
+            &CounterDumpRecord {
+                source_hash: 0,
+                module_name: module_name.to_string(),
+                package_name: None,
+                rows: vec![CounterDumpRow {
+                    counter_id: 0,
+                    scope: "this".to_string(),
+                    kind: "call_hot_targets".to_string(),
+                    site_kind: "runtime".to_string(),
+                    function_id: Some(caller_function.function_id),
+                    current_function_id: Some(caller_function.function_id),
+                    instr_id: Some(call_instr_id),
+                    function_qualname: Some(caller_function.names.qualname.clone()),
+                    block_label: None,
+                    value: 1,
+                    observed_value: Some(next_function.function_id.packed()),
+                    max_overcount: Some(0),
+                }],
+                module_keys: Vec::new(),
+                type_keys: Vec::new(),
+                type_table: Vec::new(),
+            },
+        );
+        let profile =
+            SpecializationProfile::from_precompile(module_name, Some(profile_path.as_path()))
+                .expect("test specialization profile should construct");
+        let direct_owner_attr_specializations = HashMap::from([(
+            caller_function.function_id,
+            HashMap::from([(
+                DirectOwnerAttrKey::new(next_function.function_id, "__next__"),
+                vec![DirectOwnerAttrSpecialization {
+                    owner_type_ref: RelocTypeRef::TypeKey(CounterDumpTypeKey {
+                        module_name: module_name.to_string(),
+                        qualname: "IterRange".to_string(),
+                    }),
+                    type_version: 1,
+                }],
+            )]),
+        )]);
+        let plan = build_profiled_jit_module_plan(
+            &module,
+            &profile,
+            None,
+            &direct_owner_attr_specializations,
+        )
+        .expect("profiled JIT module plan should build");
+        let planned_caller = plan
+            .module
+            .callable_defs
+            .iter()
+            .find(|function| function.function_id == caller_function.function_id)
+            .expect("planned module should keep caller");
+
+        assert!(
+            planned_caller.blocks.iter().any(|block| {
+                matches!(
+                    &block.term,
+                    BlockTerm::IfTerm(term)
+                        if matches!(
+                            term.test,
+                            InstrCodegen::DirectReceiverTypeVersionGuardTest(_)
+                        )
+                )
+            }),
+            "profiled method rewrite should guard the receiver type/version explicitly"
+        );
+        assert!(
+            planned_caller
+                .blocks
+                .iter()
+                .flat_map(|block| &block.body)
+                .any(|instr| matches!(instr, InstrCodegen::Store(store) if store.name.id_str() == "y" && matches!(store.value.as_ref(), InstrCodegen::Load(_)))),
+            "hot method arm should inline the callee body into a direct local store"
+        );
+    }
+
+    #[test]
+    fn profiled_runtime_iter_receiver_call_direct_requires_straightline_constructor() {
+        let constructor_id = FunctionId::new(7, 11);
+        let receiver = InstrCodegen::Call(Call::new(
+            name_expr(test_global_name("RangeLike")),
+            vec![CallArgPositional::Positional(name_expr(test_local_name(
+                "n", 0,
+            )))],
+            Vec::<CallArgKeyword<InstrCodegen>>::new(),
+        ));
+
+        let unchanged = scalarizable_profiled_constructor_receiver(
+            receiver.clone(),
+            Some(constructor_id),
+            &HashSet::new(),
+        );
+        assert!(
+            matches!(unchanged, InstrCodegen::Call(_)),
+            "non-straightline constructors must stay as ordinary constructor calls"
+        );
+
+        let rewritten = scalarizable_profiled_constructor_receiver(
+            receiver,
+            Some(constructor_id),
+            &HashSet::from([constructor_id]),
+        );
+        let InstrCodegen::CallDirect(call) = rewritten else {
+            panic!("straightline constructors should become scalar-replacement candidates");
+        };
+        assert_eq!(call.function_id, constructor_id);
+    }
+
+    #[test]
     fn indexed_global_body_guard_miss_can_target_cold_deopt_stub() {
         let function = with_single_test_block(
             test_function(),
@@ -18049,32 +18466,13 @@ def f(x, y):
     #[test]
     fn render_specialized_jit_deleted_name_checks_use_null_unbound_state() {
         let blocks = [1usize as ObjPtr];
-        let mut constants = TestConstantPool::default();
-        let mut function = with_single_test_block(
-            test_function(),
-            vec![],
-            ret_term(op_expr(Call::new(
-                name_expr(test_runtime_name("load_deleted_name")),
-                vec![
-                    CallArgPositional::Positional(constants.string_expr("x")),
-                    CallArgPositional::Positional(name_expr(test_name("x"))),
-                ],
-                vec![],
-            ))),
-        );
+        let mut function =
+            with_single_test_block(test_function(), vec![], ret_term(name_expr(test_name("x"))));
         set_stack_slots(&mut function, &["x"]);
-        let rendered = render_test_jit_function_with_module_constants(
-            &function,
-            &blocks,
-            constants.module_constants,
-        );
+        let rendered = render_test_jit_function(&function, &blocks);
         assert!(
             rendered.contains("call dp_jit_raise_deleted_name_error"),
-            "deleted-name lowering should keep only the cold-path error helper:\n{rendered}"
-        );
-        assert!(
-            !rendered.contains("call dp_jit_load_deleted_name_obj"),
-            "deleted-name lowering should avoid calling the Python helper:\n{rendered}"
+            "maybe-unbound local loads should lower through the null/unbound state:\n{rendered}"
         );
     }
 

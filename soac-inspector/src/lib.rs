@@ -14,9 +14,11 @@ use soac_blockpy::passes::{
     render_local_env_resume_function_plan, render_local_env_resume_module_plan,
 };
 use soac_jit::module_constants::ModuleCodegenConstants;
-use soac_jit::module_type::build_shared_state_for_inspection;
+use soac_jit::module_type::{
+    build_shared_state_for_inspection, build_shared_state_for_inspection_with_placeholder_constants,
+};
 use soac_jit::{
-    plan_jit_deopt_resume_module, plan_jit_module_locals,
+    CompileSession, plan_jit_deopt_resume_module, plan_jit_module_locals,
     render_cranelift_run_bb_specialized_with_runtime_state_and_cfg, render_jit_deopt_resume_module,
     render_jit_function_locals, render_jit_module_locals,
 };
@@ -466,6 +468,14 @@ fn execute_module_for_runtime_render_state(
         .map_err(|err| err.to_string())?
         .call1((&module,))
         .map_err(|err| err.to_string())?;
+    register_function_owner_types_for_rendered_module(py, module.as_any(), indexed_module_keys)
+}
+
+fn register_function_owner_types_for_rendered_module(
+    py: Python<'_>,
+    module: &Bound<'_, PyAny>,
+    indexed_module_keys: &[String],
+) -> Result<(), String> {
     unsafe {
         soac_jit::register_function_owner_types_for_module_keys(
             module.as_ptr(),
@@ -479,6 +489,22 @@ fn execute_module_for_runtime_render_state(
             PyErr::fetch(py).to_string()
         }
     })
+}
+
+fn lower_soac_runtime_for_render_state(
+    repo_root: &Path,
+) -> Result<BlockPyModule<CodegenModuleShape>, String> {
+    let source_path = repo_root
+        .join("soac_py")
+        .join("src")
+        .join("soac")
+        .join("runtime.py");
+    let source = std::fs::read_to_string(source_path.as_path())
+        .map_err(|err| format!("failed to read {}: {err}", source_path.display()))?;
+    match profile_module_id_from_env("soac.runtime")? {
+        Some(module_id) => lower_source_to_codegen_module_with_module_id(&source, module_id),
+        None => lower_source_to_codegen_module(&source),
+    }
 }
 
 fn corresponding_runtime_function<'a>(
@@ -513,11 +539,28 @@ pub fn render_jit_clif_for_module_with_options(
         .cloned()
         .ok_or_else(|| format!("no specialized JIT plan for {module_name}.fn#{function_id}"))?;
     let module_constants = ModuleCodegenConstants::collect_from_module(module);
-    let compile_session = soac_jit::CompileSession::new();
+    let standalone_compile_session;
+    let process_compile_session;
+    let compile_session: &CompileSession = if options.load_runtime_specializations {
+        process_compile_session = Some(CompileSession::process());
+        process_compile_session.as_deref().unwrap()
+    } else {
+        standalone_compile_session = CompileSession::new();
+        &standalone_compile_session
+    };
     prepare_python();
     let (rendered, resolved_qualname, resolved_function_id, entry_label) = Python::attach(|py| {
         ensure_python_support_paths(py, repo_root).map_err(|err| err.error)?;
-        PyModule::import(py, "soac.runtime").map_err(|err| err.to_string())?;
+        if options.load_runtime_specializations {
+            PyModule::import(py, "soac.import_hook")
+                .map_err(|err| err.to_string())?
+                .getattr("install")
+                .map_err(|err| err.to_string())?
+                .call0()
+                .map_err(|err| err.to_string())?;
+        } else {
+            PyModule::import(py, "soac.runtime").map_err(|err| err.to_string())?;
+        }
         let runtime_state = if options.load_runtime_specializations {
             if let Some(source_path) = options.runtime_source_path.as_deref() {
                 execute_module_for_runtime_render_state(
@@ -526,7 +569,28 @@ pub fn render_jit_clif_for_module_with_options(
                     module_name,
                     &module.global_names,
                 )?;
+            } else {
+                PyModule::import(py, "soac.runtime").map_err(|err| err.to_string())?;
             }
+            let runtime_module =
+                PyModule::import(py, "soac.runtime").map_err(|err| err.to_string())?;
+            let runtime_lowered = lower_soac_runtime_for_render_state(repo_root)?;
+            register_function_owner_types_for_rendered_module(
+                py,
+                runtime_module.as_any(),
+                &runtime_lowered.global_names,
+            )?;
+            let runtime_shared_state =
+                build_shared_state_for_inspection_with_placeholder_constants(
+                    py,
+                    runtime_lowered,
+                    "soac.runtime",
+                    "soac",
+                )
+                .map_err(|err| err.to_string())?;
+            compile_session
+                .retain_shared_module_state_for_inspection(runtime_shared_state)
+                .map_err(|err| err.to_string())?;
             Some(
                 build_shared_state_for_inspection(py, module.clone(), module_name, "")
                     .map_err(|err| err.to_string())?,

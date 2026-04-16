@@ -95,6 +95,13 @@ impl CompileSession {
         Ok(())
     }
 
+    pub fn retain_shared_module_state_for_inspection(
+        &self,
+        shared_state: Arc<SharedModuleState>,
+    ) -> Result<(), String> {
+        self.retain_shared_module_state(shared_state)
+    }
+
     pub fn shared_module_state_for_function_id(
         &self,
         function_id: FunctionId,

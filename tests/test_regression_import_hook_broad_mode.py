@@ -767,6 +767,7 @@ assert not os.path.exists(root)
 def test_import_hook_can_transform_soac_runtime_in_fresh_process(monkeypatch, tmp_path):
     script = """
 import sys
+import ctypes
 
 assert "soac.runtime" not in sys.modules
 from soac import import_hook
@@ -784,6 +785,31 @@ for name in ("globals", "locals", "eval", "exec"):
         assert "frame-sensitive globals/locals/eval/exec" in str(exc)
     else:
         raise AssertionError(f"soac.runtime.{name} should fail explicitly")
+
+get_function_id = ctypes.pythonapi.PyFunction_GetSoacFunctionId
+get_function_id.argtypes = [ctypes.py_object]
+get_function_id.restype = ctypes.c_uint64
+get_function_metadata = ctypes.pythonapi.PyFunction_GetSoacMetadata
+get_function_metadata.argtypes = [ctypes.py_object]
+get_function_metadata.restype = ctypes.c_void_p
+get_type_function_id = ctypes.pythonapi.PyType_GetSoacFunctionId
+get_type_function_id.argtypes = [ctypes.py_object]
+get_type_function_id.restype = ctypes.c_uint64
+
+runtime_functions = (
+    runtime.range.__dict__["__init__"],
+    runtime.range.__dict__["__iter__"],
+    runtime.IterRange.__dict__["__init__"],
+    runtime.IterRange.__dict__["__next__"],
+)
+for function in runtime_functions:
+    assert get_function_id(function) != 0
+    assert get_function_metadata(function) is not None
+
+assert get_type_function_id(runtime.range) == get_function_id(runtime.range.__dict__["__init__"])
+assert get_type_function_id(runtime.IterRange) == get_function_id(
+    runtime.IterRange.__dict__["__init__"]
+)
 """
     env = os.environ.copy()
     env.pop("SOAC_MODULE_ENABLED", None)

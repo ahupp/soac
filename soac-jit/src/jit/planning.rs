@@ -147,6 +147,30 @@ fn check_local_has_storage_layout_entry(
     ));
 }
 
+fn block_indices_by_label(
+    function: &BlockPyFunction<CodegenModuleShape>,
+) -> HashMap<BlockLabel, usize> {
+    function
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| (block.label, index))
+        .collect()
+}
+
+fn block_index_for_label(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    block_indices_by_label: &HashMap<BlockLabel, usize>,
+    label: BlockLabel,
+) -> usize {
+    *block_indices_by_label.get(&label).unwrap_or_else(|| {
+        panic!(
+            "function {} ({}) references unknown block label {}",
+            function.function_id, function.names.qualname, label
+        )
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct BlockExcDispatchPlan {
     pub target_index: usize,
@@ -514,6 +538,7 @@ impl PlannedJitFunctionLocals {
         function: &BlockPyFunction<CodegenModuleShape>,
     ) -> Result<(), String> {
         let block_count = function.blocks.len();
+        let block_indices_by_label = block_indices_by_label(function);
         if self.runtime_block_params.len() != block_count
             || self.implicit_target_transports.len() != block_count
             || self.jump_edge_transports.len() != block_count
@@ -601,7 +626,9 @@ impl PlannedJitFunctionLocals {
                 let Some(exc_edge) = block.exc_edge.as_ref() else {
                     unreachable!("presence checked above");
                 };
-                if dispatch.target_index != exc_edge.target.index() {
+                let expected_target_index =
+                    block_index_for_label(function, &block_indices_by_label, exc_edge.target);
+                if dispatch.target_index != expected_target_index {
                     return Err(format!(
                         "exception dispatch target mismatch for function {} ({}) block {}",
                         function.function_id, function.names.qualname, block.label
@@ -1433,12 +1460,14 @@ pub fn planned_jump_edge_transports_for_function(
     runtime_block_params: &[Vec<RuntimeBlockParamPlan>],
 ) -> Vec<Option<EdgeTransportPlan>> {
     let no_slot_writes = HashSet::new();
+    let block_indices_by_label = block_indices_by_label(function);
     function
         .blocks
         .iter()
         .map(|block| match &block.term {
             BlockTerm::Jump(target) => {
-                let target_index = target.target.index();
+                let target_index =
+                    block_index_for_label(function, &block_indices_by_label, target.target);
                 let target_block = &function.blocks[target_index];
                 Some(plan_edge_transport(
                     &target_block.param_name_vec(),
@@ -1459,7 +1488,8 @@ pub fn exc_dispatch_plan(
     refcount_plan: &FunctionRefcountPlan,
 ) -> Option<BlockExcDispatchPlan> {
     let exc_edge = block.exc_edge.as_ref()?;
-    let target_index = exc_edge.target.index();
+    let block_indices_by_label = block_indices_by_label(function);
+    let target_index = block_index_for_label(function, &block_indices_by_label, exc_edge.target);
     let target_block = &function.blocks[target_index];
     let stack_slot_name_set = function
         .storage_layout()
@@ -1556,6 +1586,7 @@ pub fn plan_jit_function_locals_from_plans(
     refcount_plan: FunctionRefcountPlan,
 ) -> Result<PlannedJitFunctionLocals, String> {
     let _refcount_plan_check = check_refcount_plan_against_current_jit(function, &refcount_plan)?;
+    let block_indices_by_label = block_indices_by_label(function);
     let runtime_block_params = planned_jit_params_for_function(function, &local_plan)?;
     let implicit_target_transports =
         planned_implicit_target_transports_for_function(function, &runtime_block_params);
@@ -1573,7 +1604,11 @@ pub fn plan_jit_function_locals_from_plans(
             let runtime_target_params = block
                 .exc_edge
                 .as_ref()
-                .map(|edge| runtime_block_params[edge.target.index()].as_slice())
+                .map(|edge| {
+                    let target_index =
+                        block_index_for_label(function, &block_indices_by_label, edge.target);
+                    runtime_block_params[target_index].as_slice()
+                })
                 .unwrap_or(&[]);
             exc_dispatch_plan(function, block, runtime_target_params, &refcount_plan)
         })
@@ -1628,6 +1663,51 @@ mod tests {
             .iter()
             .find(|binding| binding.name == name)
             .unwrap_or_else(|| panic!("missing planned local binding {name}"))
+    }
+
+    fn sparsely_relabel_function_blocks(function: &mut BlockPyFunction<CodegenModuleShape>) {
+        let relabel = function
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(index, block)| (block.label, BlockLabel::from_index(index * 3 + 2)))
+            .collect::<HashMap<_, _>>();
+        for block in &mut function.blocks {
+            block.label = *relabel
+                .get(&block.label)
+                .expect("sparse relabel should cover every block");
+            match &mut block.term {
+                BlockTerm::Jump(edge) => {
+                    edge.target = *relabel
+                        .get(&edge.target)
+                        .expect("sparse relabel should cover every jump target");
+                }
+                BlockTerm::IfTerm(if_term) => {
+                    if_term.then_label = *relabel
+                        .get(&if_term.then_label)
+                        .expect("sparse relabel should cover every then target");
+                    if_term.else_label = *relabel
+                        .get(&if_term.else_label)
+                        .expect("sparse relabel should cover every else target");
+                }
+                BlockTerm::BranchTable(branch) => {
+                    for target in &mut branch.targets {
+                        *target = *relabel
+                            .get(target)
+                            .expect("sparse relabel should cover every branch target");
+                    }
+                    branch.default_label = *relabel
+                        .get(&branch.default_label)
+                        .expect("sparse relabel should cover every branch default");
+                }
+                BlockTerm::Raise(_) | BlockTerm::Return(_) => {}
+            }
+            if let Some(exc_edge) = &mut block.exc_edge {
+                exc_edge.target = *relabel
+                    .get(&exc_edge.target)
+                    .expect("sparse relabel should cover every exception target");
+            }
+        }
     }
 
     #[test]
@@ -1730,12 +1810,15 @@ def f(flag):
         let plan = plan_function_locals(function, &facts);
         let runtime_params =
             planned_jit_params_for_function(function, &plan).expect("runtime params should bind");
+        let block_indices_by_label = block_indices_by_label(function);
 
-        let then_params = &runtime_params[if_term.then_label.index()];
+        let then_params = &runtime_params
+            [block_index_for_label(function, &block_indices_by_label, if_term.then_label)];
         assert!(then_params.iter().any(|param| param.arg_name == "x"));
         assert!(then_params.iter().any(|param| param.arg_name == "y"));
 
-        let else_params = &runtime_params[if_term.else_label.index()];
+        let else_params = &runtime_params
+            [block_index_for_label(function, &block_indices_by_label, if_term.else_label)];
         assert!(else_params.iter().any(|param| param.arg_name == "y"));
         assert!(else_params.iter().any(|param| param.arg_name == "x"));
     }
@@ -1766,7 +1849,9 @@ def f(flag):
         let plan = plan_function_locals(function, &facts);
         let runtime_params =
             planned_jit_params_for_function(function, &plan).expect("runtime params should bind");
-        let then_params = &runtime_params[if_term.then_label.index()];
+        let block_indices_by_label = block_indices_by_label(function);
+        let then_params = &runtime_params
+            [block_index_for_label(function, &block_indices_by_label, if_term.then_label)];
         let x = then_params
             .iter()
             .find(|param| param.arg_name == "x")
@@ -1849,8 +1934,11 @@ def f(flag):
         let runtime_params =
             planned_jit_params_for_function(function, &plan).expect("runtime params should bind");
         let seeds = planned_stack_slot_entry_seeds_for_function(function, &plan);
+        let block_indices_by_label = block_indices_by_label(function);
+        let else_index =
+            block_index_for_label(function, &block_indices_by_label, if_term.else_label);
 
-        let else_params = &runtime_params[if_term.else_label.index()];
+        let else_params = &runtime_params[else_index];
         let x = else_params
             .iter()
             .find(|param| param.binding.name == "x")
@@ -1865,7 +1953,7 @@ def f(flag):
             ParamProvenance::ForwardedLocal(x.binding.location)
         );
         assert!(
-            seeds[if_term.else_label.index()]
+            seeds[else_index]
                 .iter()
                 .all(|seed| seed.binding.name != "x"),
             "cleanup-only locals should not require stack-slot entry seeds"
@@ -1948,6 +2036,8 @@ def f(flag):
         let entry_label = function.entry_block().label;
         let entry_plan = plan.block(entry_label).expect("missing entry local plan");
         let entry_x = binding_for_name(entry_plan, "x");
+        let block_indices_by_label = block_indices_by_label(function);
+        let entry_index = block_index_for_label(function, &block_indices_by_label, entry_label);
 
         assert_eq!(entry_x.storage, PlannedLocalStorage::BlockParam);
         assert_eq!(entry_x.param_facts.binding, ParamBindingFacts::MaybeUnbound);
@@ -1957,13 +2047,13 @@ def f(flag):
             ParamProvenance::SyntheticUnbound(entry_x.location)
         );
         assert!(
-            runtime_params[entry_label.index()]
+            runtime_params[entry_index]
                 .iter()
                 .any(|param| param.arg_name == "x"),
             "entry maybe-unbound local should be initialized as a runtime block param"
         );
         assert!(
-            seeds[entry_label.index()]
+            seeds[entry_index]
                 .iter()
                 .all(|seed| seed.binding.name != "x"),
             "entry maybe-unbound local should not require a stack-slot seed"
@@ -2212,6 +2302,30 @@ def f(flag):
     }
 
     #[test]
+    fn jit_local_planning_accepts_sparse_block_labels() {
+        let (mut lowered, function_index) = lowered_function(
+            r#"
+def f(flag):
+    x = []
+    if flag:
+        y = x
+    else:
+        y = []
+    return y
+"#,
+            "f",
+        );
+        sparsely_relabel_function_blocks(&mut lowered.callable_defs[function_index]);
+        let facts = infer_module_value_facts(&lowered);
+        let function = &lowered.callable_defs[function_index];
+        let plan = plan_jit_function_locals(&lowered, function, &facts)
+            .expect("JIT planning should not assume dense block labels");
+
+        plan.validate_for_function(function)
+            .expect("sparse-label JIT local plan should validate");
+    }
+
+    #[test]
     fn planned_jit_deopt_resume_module_wraps_validated_local_env_resume_plan() {
         let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
             r#"
@@ -2308,7 +2422,9 @@ def f():
             .find(|block| block.exc_edge.is_some())
             .expect("expected exception edge source block");
         let exc_edge = source_block.exc_edge.as_ref().expect("checked above");
-        let runtime_target_params = &runtime_params[exc_edge.target.index()];
+        let block_indices_by_label = block_indices_by_label(function);
+        let runtime_target_params = &runtime_params
+            [block_index_for_label(function, &block_indices_by_label, exc_edge.target)];
         let dispatch_plan = exc_dispatch_plan(
             function,
             source_block,
@@ -2352,10 +2468,15 @@ def f():
             .blocks
             .iter()
             .filter_map(|block| {
+                let block_indices_by_label = block_indices_by_label(function);
                 let runtime_target_params = block
                     .exc_edge
                     .as_ref()
-                    .map(|edge| runtime_params[edge.target.index()].as_slice())
+                    .map(|edge| {
+                        let target_index =
+                            block_index_for_label(function, &block_indices_by_label, edge.target);
+                        runtime_params[target_index].as_slice()
+                    })
                     .unwrap_or(&[]);
                 exc_dispatch_plan(function, block, runtime_target_params, &refcount_plan)
             })

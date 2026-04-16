@@ -5,6 +5,7 @@ pub(crate) mod blockpy_expr_simplify;
 mod blockpy_generators;
 pub mod blockpy_to_bb;
 pub(crate) mod core_await_lower;
+mod direct_call_transform;
 mod escape_analysis;
 mod global_index;
 mod inline_plan;
@@ -27,14 +28,15 @@ use crate::block_py::{
     ExprEllipsisLiteral, ExprFString, ExprGenerator, ExprIf, ExprIpyEscapeCommand, ExprLambda,
     ExprList, ExprListComp, ExprName, ExprNamed, ExprNoneLiteral, ExprNumberLiteral, ExprSet,
     ExprSetComp, ExprSlice, ExprStarred, ExprStringLiteral, ExprSubscript, ExprTString, ExprTuple,
-    GetAttr, GetItem, HasMeta, IdentifiedInstr, IncrementCounter, Instr, InstrWithConstantNone,
-    LiteralValue, Load, MakeCell, MakeFunction, MakeFunctionWithClosure, MapFunction, MapInstr,
-    MapModule, Mappable, Meta, ModuleShape, NameLike, ResolvedName, SetAttr, SetItem,
-    StmtAnnAssign, StmtAssert, StmtAssign, StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue,
-    StmtDelete, StmtExpr, StmtFor, StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom,
-    StmtIpyEscapeCommand, StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry,
-    StmtTypeAlias, StmtWhile, StmtWith, Store, TryMapInstr, TryMapModule, TryMapTerm, Tuple,
-    UnaryOp, UnresolvedName, WithMeta, Yield, YieldFrom,
+    FunctionId, GetAttr, GetItem, HasMeta, IdentifiedInstr, IncrementCounter, Instr,
+    InstrWithConstantNone, LiteralValue, Load, LocalLocation, MakeCell, MakeFunction,
+    MakeFunctionWithClosure, MapFunction, MapInstr, MapModule, Mappable, Meta, ModuleShape,
+    NameLike, NameLocation, ResolvedName, RuntimeName, SetAttr, SetItem, StmtAnnAssign, StmtAssert,
+    StmtAssign, StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue, StmtDelete, StmtExpr,
+    StmtFor, StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom, StmtIpyEscapeCommand,
+    StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry, StmtTypeAlias, StmtWhile,
+    StmtWith, Store, TryMapInstr, TryMapModule, TryMapTerm, Tuple, UnaryOp, UnresolvedName, Visit,
+    VisitMut, WithMeta, Yield, YieldFrom,
 };
 use ruff_python_ast::{self as ast};
 use soac_macros::{enum_broadcast, DelegateMatchDefault};
@@ -133,6 +135,10 @@ pub enum InstrCodegenOp {
     BinOp(#[rkyv(omit_bounds)] BinOp<Self>),
     UnaryOp(#[rkyv(omit_bounds)] UnaryOp<Self>),
     CalleeFunctionId(#[rkyv(omit_bounds)] CalleeFunctionId<Self>),
+    DirectFunctionIdGuardTest(#[rkyv(omit_bounds)] DirectFunctionIdGuardTest<Self>),
+    DirectReceiverTypeVersionGuardTest(
+        #[rkyv(omit_bounds)] DirectReceiverTypeVersionGuardTest<Self>,
+    ),
     Tuple(#[rkyv(omit_bounds)] Tuple<Self>),
     Call(#[rkyv(omit_bounds)] Call<Self>),
     CallDirect(#[rkyv(omit_bounds)] CallDirect<Self>),
@@ -154,6 +160,187 @@ pub type InstrCodegen = InstrCodegenOp;
 
 impl Instr for InstrCodegenOp {
     type Name = ResolvedName;
+}
+
+#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct DirectFunctionIdGuardTest<E: Instr> {
+    _meta: Meta,
+    pub value: Box<E>,
+    pub function_id: FunctionId,
+}
+
+impl<E: Instr> DirectFunctionIdGuardTest<E> {
+    pub fn new(value: impl Into<Box<E>>, function_id: FunctionId) -> Self {
+        Self {
+            _meta: Meta::default(),
+            value: value.into(),
+            function_id,
+        }
+    }
+}
+
+impl<E: Instr + std::fmt::Debug> std::fmt::Debug for DirectFunctionIdGuardTest<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DirectFunctionIdGuardTest")
+            .field("value", &self.value)
+            .field("function_id", &self.function_id)
+            .finish()
+    }
+}
+
+impl<E: Instr> HasMeta for DirectFunctionIdGuardTest<E> {
+    fn meta(&self) -> Meta {
+        self._meta.clone()
+    }
+}
+
+impl<E: Instr> WithMeta for DirectFunctionIdGuardTest<E> {
+    fn with_meta(mut self, meta: Meta) -> Self {
+        self._meta = meta;
+        self
+    }
+}
+
+impl<E> ChildVisitable<E> for DirectFunctionIdGuardTest<E>
+where
+    E: Instr + ChildVisitable<E>,
+{
+    fn visit_children<V>(&self, visitor: &mut V)
+    where
+        V: crate::block_py::Visit<E> + ?Sized,
+    {
+        visitor.visit_instr(&self.value);
+    }
+
+    fn visit_children_mut<V>(&mut self, visitor: &mut V)
+    where
+        V: crate::block_py::VisitMut<E> + ?Sized,
+    {
+        visitor.visit_instr_mut(&mut self.value);
+    }
+}
+
+impl<E: Instr> Mappable<E> for DirectFunctionIdGuardTest<E> {
+    type Mapped<T: Instr> = DirectFunctionIdGuardTest<T>;
+
+    fn map_children<T, M>(self, map: &mut M) -> Self::Mapped<T>
+    where
+        T: Instr,
+        M: MapInstr<E, T>,
+    {
+        DirectFunctionIdGuardTest {
+            _meta: self._meta,
+            value: Box::new(map.map_instr(*self.value)),
+            function_id: self.function_id,
+        }
+    }
+
+    fn try_map_children<T, Error, M>(self, map: &mut M) -> Result<Self::Mapped<T>, Error>
+    where
+        T: Instr,
+        M: TryMapInstr<E, T, Error>,
+    {
+        Ok(DirectFunctionIdGuardTest {
+            _meta: self._meta,
+            value: Box::new(map.try_map_instr(*self.value)?),
+            function_id: self.function_id,
+        })
+    }
+}
+
+#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct DirectReceiverTypeVersionGuardTest<E: Instr> {
+    _meta: Meta,
+    pub value: Box<E>,
+    pub owner_type_ref: TypedAttrOwnerRef,
+    pub type_version: u32,
+}
+
+impl<E: Instr> DirectReceiverTypeVersionGuardTest<E> {
+    pub fn new(
+        value: impl Into<Box<E>>,
+        owner_type_ref: TypedAttrOwnerRef,
+        type_version: u32,
+    ) -> Self {
+        Self {
+            _meta: Meta::default(),
+            value: value.into(),
+            owner_type_ref,
+            type_version,
+        }
+    }
+}
+
+impl<E: Instr + std::fmt::Debug> std::fmt::Debug for DirectReceiverTypeVersionGuardTest<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DirectReceiverTypeVersionGuardTest")
+            .field("value", &self.value)
+            .field("owner_type_ref", &self.owner_type_ref)
+            .field("type_version", &self.type_version)
+            .finish()
+    }
+}
+
+impl<E: Instr> HasMeta for DirectReceiverTypeVersionGuardTest<E> {
+    fn meta(&self) -> Meta {
+        self._meta.clone()
+    }
+}
+
+impl<E: Instr> WithMeta for DirectReceiverTypeVersionGuardTest<E> {
+    fn with_meta(mut self, meta: Meta) -> Self {
+        self._meta = meta;
+        self
+    }
+}
+
+impl<E> ChildVisitable<E> for DirectReceiverTypeVersionGuardTest<E>
+where
+    E: Instr + ChildVisitable<E>,
+{
+    fn visit_children<V>(&self, visitor: &mut V)
+    where
+        V: crate::block_py::Visit<E> + ?Sized,
+    {
+        visitor.visit_instr(&self.value);
+    }
+
+    fn visit_children_mut<V>(&mut self, visitor: &mut V)
+    where
+        V: crate::block_py::VisitMut<E> + ?Sized,
+    {
+        visitor.visit_instr_mut(&mut self.value);
+    }
+}
+
+impl<E: Instr> Mappable<E> for DirectReceiverTypeVersionGuardTest<E> {
+    type Mapped<T: Instr> = DirectReceiverTypeVersionGuardTest<T>;
+
+    fn map_children<T, M>(self, map: &mut M) -> Self::Mapped<T>
+    where
+        T: Instr,
+        M: MapInstr<E, T>,
+    {
+        DirectReceiverTypeVersionGuardTest {
+            _meta: self._meta,
+            value: Box::new(map.map_instr(*self.value)),
+            owner_type_ref: self.owner_type_ref,
+            type_version: self.type_version,
+        }
+    }
+
+    fn try_map_children<T, Error, M>(self, map: &mut M) -> Result<Self::Mapped<T>, Error>
+    where
+        T: Instr,
+        M: TryMapInstr<E, T, Error>,
+    {
+        Ok(DirectReceiverTypeVersionGuardTest {
+            _meta: self._meta,
+            value: Box::new(map.try_map_instr(*self.value)?),
+            owner_type_ref: self.owner_type_ref,
+            type_version: self.type_version,
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -243,6 +430,1074 @@ impl<E: Instr> Mappable<E> for TypedTruthy<E> {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TypedDirectCallArgSource {
+    Provided(usize),
+    DefaultSentinel,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypedDirectCallArgPlan {
+    pub sources: Vec<TypedDirectCallArgSource>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypedDirectFunctionCallGuard {
+    pub function_id: FunctionId,
+    pub arg_plan: TypedDirectCallArgPlan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypedDirectMethodCallGuard {
+    pub function_id: FunctionId,
+    pub owner_type_ref: TypedAttrOwnerRef,
+    pub type_version: u32,
+    pub arg_plan: TypedDirectCallArgPlan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypedDirectConstructorCallGuard {
+    pub function_id: FunctionId,
+    pub owner_type_ref: TypedAttrOwnerRef,
+    pub type_version: u32,
+    pub arg_plan: TypedDirectCallArgPlan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TypedDirectCallableCallGuard {
+    Function(TypedDirectFunctionCallGuard),
+    Constructor(TypedDirectConstructorCallGuard),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TypedCallAccessPlan {
+    Generic,
+    ProfiledCallableTargets {
+        targets: Vec<FunctionId>,
+    },
+    ProfiledMethodTargets {
+        targets: Vec<FunctionId>,
+    },
+    GuardedCallable {
+        function_guards: Vec<TypedDirectFunctionCallGuard>,
+        constructor_guards: Vec<TypedDirectConstructorCallGuard>,
+    },
+    GuardedMethod {
+        method_name: String,
+        method_guards: Vec<TypedDirectMethodCallGuard>,
+    },
+    GuardedRuntimeProtocolMethod {
+        runtime_name: RuntimeName,
+        method_name: String,
+        method_guards: Vec<TypedDirectMethodCallGuard>,
+    },
+}
+
+#[derive(Clone)]
+pub struct TypedCall<E: Instr> {
+    _meta: Meta,
+    pub func: Box<E>,
+    pub args: Vec<CallArgPositional<E>>,
+    pub keywords: Vec<CallArgKeyword<E>>,
+    pub access: TypedCallAccessPlan,
+}
+
+impl<E: Instr> TypedCall<E> {
+    pub fn generic(
+        func: impl Into<Box<E>>,
+        args: impl Into<Vec<CallArgPositional<E>>>,
+        keywords: impl Into<Vec<CallArgKeyword<E>>>,
+    ) -> Self {
+        Self {
+            _meta: Meta::default(),
+            func: func.into(),
+            args: args.into(),
+            keywords: keywords.into(),
+            access: TypedCallAccessPlan::Generic,
+        }
+    }
+
+    pub fn from_legacy(op: Call<E>) -> Self {
+        Self {
+            _meta: op.meta(),
+            func: op.func,
+            args: op.args,
+            keywords: op.keywords,
+            access: TypedCallAccessPlan::Generic,
+        }
+    }
+
+    pub fn into_legacy(self) -> Call<E> {
+        Call::new(self.func, self.args, self.keywords).with_meta(self._meta)
+    }
+}
+
+impl<E: Instr + std::fmt::Debug> std::fmt::Debug for TypedCall<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TypedCall")
+            .field("func", &self.func)
+            .field("args", &self.args)
+            .field("keywords", &self.keywords)
+            .field("access", &self.access)
+            .finish()
+    }
+}
+
+impl<E: Instr> HasMeta for TypedCall<E> {
+    fn meta(&self) -> Meta {
+        self._meta.clone()
+    }
+}
+
+impl<E: Instr> WithMeta for TypedCall<E> {
+    fn with_meta(mut self, meta: Meta) -> Self {
+        self._meta = meta;
+        self
+    }
+}
+
+impl<E> ChildVisitable<E> for TypedCall<E>
+where
+    E: Instr + ChildVisitable<E>,
+{
+    fn visit_children<V>(&self, visitor: &mut V)
+    where
+        V: crate::block_py::Visit<E> + ?Sized,
+    {
+        visitor.visit_instr(&self.func);
+        for arg in &self.args {
+            visitor.visit_instr(arg.expr());
+        }
+        for keyword in &self.keywords {
+            visitor.visit_instr(keyword.expr());
+        }
+    }
+
+    fn visit_children_mut<V>(&mut self, visitor: &mut V)
+    where
+        V: crate::block_py::VisitMut<E> + ?Sized,
+    {
+        visitor.visit_instr_mut(&mut self.func);
+        for arg in &mut self.args {
+            visitor.visit_instr_mut(arg.expr_mut());
+        }
+        for keyword in &mut self.keywords {
+            visitor.visit_instr_mut(keyword.expr_mut());
+        }
+    }
+}
+
+impl<E: Instr> Mappable<E> for TypedCall<E> {
+    type Mapped<T: Instr> = TypedCall<T>;
+
+    fn map_children<T, M>(self, map: &mut M) -> Self::Mapped<T>
+    where
+        T: Instr,
+        M: MapInstr<E, T>,
+    {
+        TypedCall {
+            _meta: self._meta,
+            func: Box::new(map.map_instr(*self.func)),
+            args: self
+                .args
+                .into_iter()
+                .map(|arg| arg.map_instr(|expr| map.map_instr(expr)))
+                .collect(),
+            keywords: self
+                .keywords
+                .into_iter()
+                .map(|keyword| keyword.map_instr(|expr| map.map_instr(expr)))
+                .collect(),
+            access: self.access,
+        }
+    }
+
+    fn try_map_children<T, Error, M>(self, map: &mut M) -> Result<Self::Mapped<T>, Error>
+    where
+        T: Instr,
+        M: TryMapInstr<E, T, Error>,
+    {
+        Ok(TypedCall {
+            _meta: self._meta,
+            func: Box::new(map.try_map_instr(*self.func)?),
+            args: self
+                .args
+                .into_iter()
+                .map(|arg| arg.try_map_instr(|expr| map.try_map_instr(expr)))
+                .collect::<Result<Vec<_>, _>>()?,
+            keywords: self
+                .keywords
+                .into_iter()
+                .map(|keyword| keyword.try_map_instr(|expr| map.try_map_instr(expr)))
+                .collect::<Result<Vec<_>, _>>()?,
+            access: self.access,
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct TypedDirectCallableCall<E: Instr> {
+    _meta: Meta,
+    pub func: Box<E>,
+    pub args: Vec<CallArgPositional<E>>,
+    pub guard: TypedDirectCallableCallGuard,
+}
+
+impl<E: Instr> TypedDirectCallableCall<E> {
+    pub fn new(
+        func: impl Into<Box<E>>,
+        args: impl Into<Vec<CallArgPositional<E>>>,
+        guard: TypedDirectCallableCallGuard,
+    ) -> Self {
+        Self {
+            _meta: Meta::default(),
+            func: func.into(),
+            args: args.into(),
+            guard,
+        }
+    }
+}
+
+impl<E: Instr + std::fmt::Debug> std::fmt::Debug for TypedDirectCallableCall<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TypedDirectCallableCall")
+            .field("func", &self.func)
+            .field("args", &self.args)
+            .field("guard", &self.guard)
+            .finish()
+    }
+}
+
+impl<E: Instr> HasMeta for TypedDirectCallableCall<E> {
+    fn meta(&self) -> Meta {
+        self._meta.clone()
+    }
+}
+
+impl<E: Instr> WithMeta for TypedDirectCallableCall<E> {
+    fn with_meta(mut self, meta: Meta) -> Self {
+        self._meta = meta;
+        self
+    }
+}
+
+impl<E> ChildVisitable<E> for TypedDirectCallableCall<E>
+where
+    E: Instr + ChildVisitable<E>,
+{
+    fn visit_children<V>(&self, visitor: &mut V)
+    where
+        V: crate::block_py::Visit<E> + ?Sized,
+    {
+        visitor.visit_instr(&self.func);
+        for arg in &self.args {
+            visitor.visit_instr(arg.expr());
+        }
+    }
+
+    fn visit_children_mut<V>(&mut self, visitor: &mut V)
+    where
+        V: crate::block_py::VisitMut<E> + ?Sized,
+    {
+        visitor.visit_instr_mut(&mut self.func);
+        for arg in &mut self.args {
+            visitor.visit_instr_mut(arg.expr_mut());
+        }
+    }
+}
+
+impl<E: Instr> Mappable<E> for TypedDirectCallableCall<E> {
+    type Mapped<T: Instr> = TypedDirectCallableCall<T>;
+
+    fn map_children<T, M>(self, map: &mut M) -> Self::Mapped<T>
+    where
+        T: Instr,
+        M: MapInstr<E, T>,
+    {
+        TypedDirectCallableCall {
+            _meta: self._meta,
+            func: Box::new(map.map_instr(*self.func)),
+            args: self
+                .args
+                .into_iter()
+                .map(|arg| arg.map_instr(|expr| map.map_instr(expr)))
+                .collect(),
+            guard: self.guard,
+        }
+    }
+
+    fn try_map_children<T, Error, M>(self, map: &mut M) -> Result<Self::Mapped<T>, Error>
+    where
+        T: Instr,
+        M: TryMapInstr<E, T, Error>,
+    {
+        Ok(TypedDirectCallableCall {
+            _meta: self._meta,
+            func: Box::new(map.try_map_instr(*self.func)?),
+            args: self
+                .args
+                .into_iter()
+                .map(|arg| arg.try_map_instr(|expr| map.try_map_instr(expr)))
+                .collect::<Result<Vec<_>, _>>()?,
+            guard: self.guard,
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct TypedGuardedCallableCall<E: Instr> {
+    _meta: Meta,
+    pub func: Box<E>,
+    pub args: Vec<CallArgPositional<E>>,
+    pub keywords: Vec<CallArgKeyword<E>>,
+    pub function_guards: Vec<TypedDirectFunctionCallGuard>,
+    pub constructor_guards: Vec<TypedDirectConstructorCallGuard>,
+}
+
+impl<E: Instr> TypedGuardedCallableCall<E> {
+    pub fn from_typed_call(
+        call: TypedCall<E>,
+        function_guards: Vec<TypedDirectFunctionCallGuard>,
+        constructor_guards: Vec<TypedDirectConstructorCallGuard>,
+    ) -> Self {
+        Self {
+            _meta: call._meta,
+            func: call.func,
+            args: call.args,
+            keywords: call.keywords,
+            function_guards,
+            constructor_guards,
+        }
+    }
+
+    pub fn into_typed_call(self) -> TypedCall<E> {
+        TypedCall {
+            _meta: self._meta,
+            func: self.func,
+            args: self.args,
+            keywords: self.keywords,
+            access: TypedCallAccessPlan::GuardedCallable {
+                function_guards: self.function_guards,
+                constructor_guards: self.constructor_guards,
+            },
+        }
+    }
+}
+
+impl<E: Instr + std::fmt::Debug> std::fmt::Debug for TypedGuardedCallableCall<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TypedGuardedCallableCall")
+            .field("func", &self.func)
+            .field("args", &self.args)
+            .field("keywords", &self.keywords)
+            .field("function_guards", &self.function_guards)
+            .field("constructor_guards", &self.constructor_guards)
+            .finish()
+    }
+}
+
+impl<E: Instr> HasMeta for TypedGuardedCallableCall<E> {
+    fn meta(&self) -> Meta {
+        self._meta.clone()
+    }
+}
+
+impl<E: Instr> WithMeta for TypedGuardedCallableCall<E> {
+    fn with_meta(mut self, meta: Meta) -> Self {
+        self._meta = meta;
+        self
+    }
+}
+
+impl<E> ChildVisitable<E> for TypedGuardedCallableCall<E>
+where
+    E: Instr + ChildVisitable<E>,
+{
+    fn visit_children<V>(&self, visitor: &mut V)
+    where
+        V: crate::block_py::Visit<E> + ?Sized,
+    {
+        visitor.visit_instr(&self.func);
+        for arg in &self.args {
+            visitor.visit_instr(arg.expr());
+        }
+        for keyword in &self.keywords {
+            visitor.visit_instr(keyword.expr());
+        }
+    }
+
+    fn visit_children_mut<V>(&mut self, visitor: &mut V)
+    where
+        V: crate::block_py::VisitMut<E> + ?Sized,
+    {
+        visitor.visit_instr_mut(&mut self.func);
+        for arg in &mut self.args {
+            visitor.visit_instr_mut(arg.expr_mut());
+        }
+        for keyword in &mut self.keywords {
+            visitor.visit_instr_mut(keyword.expr_mut());
+        }
+    }
+}
+
+impl<E: Instr> Mappable<E> for TypedGuardedCallableCall<E> {
+    type Mapped<T: Instr> = TypedGuardedCallableCall<T>;
+
+    fn map_children<T, M>(self, map: &mut M) -> Self::Mapped<T>
+    where
+        T: Instr,
+        M: MapInstr<E, T>,
+    {
+        TypedGuardedCallableCall {
+            _meta: self._meta,
+            func: Box::new(map.map_instr(*self.func)),
+            args: self
+                .args
+                .into_iter()
+                .map(|arg| arg.map_instr(|expr| map.map_instr(expr)))
+                .collect(),
+            keywords: self
+                .keywords
+                .into_iter()
+                .map(|keyword| keyword.map_instr(|expr| map.map_instr(expr)))
+                .collect(),
+            function_guards: self.function_guards,
+            constructor_guards: self.constructor_guards,
+        }
+    }
+
+    fn try_map_children<T, Error, M>(self, map: &mut M) -> Result<Self::Mapped<T>, Error>
+    where
+        T: Instr,
+        M: TryMapInstr<E, T, Error>,
+    {
+        Ok(TypedGuardedCallableCall {
+            _meta: self._meta,
+            func: Box::new(map.try_map_instr(*self.func)?),
+            args: self
+                .args
+                .into_iter()
+                .map(|arg| arg.try_map_instr(|expr| map.try_map_instr(expr)))
+                .collect::<Result<Vec<_>, _>>()?,
+            keywords: self
+                .keywords
+                .into_iter()
+                .map(|keyword| keyword.try_map_instr(|expr| map.try_map_instr(expr)))
+                .collect::<Result<Vec<_>, _>>()?,
+            function_guards: self.function_guards,
+            constructor_guards: self.constructor_guards,
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct TypedGuardedMethodCall<E: Instr> {
+    _meta: Meta,
+    pub func: Box<E>,
+    pub args: Vec<CallArgPositional<E>>,
+    pub keywords: Vec<CallArgKeyword<E>>,
+    pub method_name: String,
+    pub method_guards: Vec<TypedDirectMethodCallGuard>,
+}
+
+impl<E: Instr> TypedGuardedMethodCall<E> {
+    pub fn from_typed_call(
+        call: TypedCall<E>,
+        method_name: String,
+        method_guards: Vec<TypedDirectMethodCallGuard>,
+    ) -> Self {
+        Self {
+            _meta: call._meta,
+            func: call.func,
+            args: call.args,
+            keywords: call.keywords,
+            method_name,
+            method_guards,
+        }
+    }
+
+    pub fn into_typed_call(self) -> TypedCall<E> {
+        TypedCall {
+            _meta: self._meta,
+            func: self.func,
+            args: self.args,
+            keywords: self.keywords,
+            access: TypedCallAccessPlan::GuardedMethod {
+                method_name: self.method_name,
+                method_guards: self.method_guards,
+            },
+        }
+    }
+}
+
+impl<E: Instr + std::fmt::Debug> std::fmt::Debug for TypedGuardedMethodCall<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TypedGuardedMethodCall")
+            .field("func", &self.func)
+            .field("args", &self.args)
+            .field("keywords", &self.keywords)
+            .field("method_name", &self.method_name)
+            .field("method_guards", &self.method_guards)
+            .finish()
+    }
+}
+
+impl<E: Instr> HasMeta for TypedGuardedMethodCall<E> {
+    fn meta(&self) -> Meta {
+        self._meta.clone()
+    }
+}
+
+impl<E: Instr> WithMeta for TypedGuardedMethodCall<E> {
+    fn with_meta(mut self, meta: Meta) -> Self {
+        self._meta = meta;
+        self
+    }
+}
+
+impl<E> ChildVisitable<E> for TypedGuardedMethodCall<E>
+where
+    E: Instr + ChildVisitable<E>,
+{
+    fn visit_children<V>(&self, visitor: &mut V)
+    where
+        V: crate::block_py::Visit<E> + ?Sized,
+    {
+        visitor.visit_instr(&self.func);
+        for arg in &self.args {
+            visitor.visit_instr(arg.expr());
+        }
+        for keyword in &self.keywords {
+            visitor.visit_instr(keyword.expr());
+        }
+    }
+
+    fn visit_children_mut<V>(&mut self, visitor: &mut V)
+    where
+        V: crate::block_py::VisitMut<E> + ?Sized,
+    {
+        visitor.visit_instr_mut(&mut self.func);
+        for arg in &mut self.args {
+            visitor.visit_instr_mut(arg.expr_mut());
+        }
+        for keyword in &mut self.keywords {
+            visitor.visit_instr_mut(keyword.expr_mut());
+        }
+    }
+}
+
+impl<E: Instr> Mappable<E> for TypedGuardedMethodCall<E> {
+    type Mapped<T: Instr> = TypedGuardedMethodCall<T>;
+
+    fn map_children<T, M>(self, map: &mut M) -> Self::Mapped<T>
+    where
+        T: Instr,
+        M: MapInstr<E, T>,
+    {
+        TypedGuardedMethodCall {
+            _meta: self._meta,
+            func: Box::new(map.map_instr(*self.func)),
+            args: self
+                .args
+                .into_iter()
+                .map(|arg| arg.map_instr(|expr| map.map_instr(expr)))
+                .collect(),
+            keywords: self
+                .keywords
+                .into_iter()
+                .map(|keyword| keyword.map_instr(|expr| map.map_instr(expr)))
+                .collect(),
+            method_name: self.method_name,
+            method_guards: self.method_guards,
+        }
+    }
+
+    fn try_map_children<T, Error, M>(self, map: &mut M) -> Result<Self::Mapped<T>, Error>
+    where
+        T: Instr,
+        M: TryMapInstr<E, T, Error>,
+    {
+        Ok(TypedGuardedMethodCall {
+            _meta: self._meta,
+            func: Box::new(map.try_map_instr(*self.func)?),
+            args: self
+                .args
+                .into_iter()
+                .map(|arg| arg.try_map_instr(|expr| map.try_map_instr(expr)))
+                .collect::<Result<Vec<_>, _>>()?,
+            keywords: self
+                .keywords
+                .into_iter()
+                .map(|keyword| keyword.try_map_instr(|expr| map.try_map_instr(expr)))
+                .collect::<Result<Vec<_>, _>>()?,
+            method_name: self.method_name,
+            method_guards: self.method_guards,
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct TypedDirectMethodCall<E: Instr> {
+    _meta: Meta,
+    pub receiver: Box<E>,
+    pub args: Vec<CallArgPositional<E>>,
+    pub method_name: String,
+    pub guard: TypedDirectMethodCallGuard,
+}
+
+impl<E: Instr> TypedDirectMethodCall<E> {
+    pub fn new(
+        receiver: impl Into<Box<E>>,
+        args: impl Into<Vec<CallArgPositional<E>>>,
+        method_name: impl Into<String>,
+        guard: TypedDirectMethodCallGuard,
+    ) -> Self {
+        Self {
+            _meta: Meta::default(),
+            receiver: receiver.into(),
+            args: args.into(),
+            method_name: method_name.into(),
+            guard,
+        }
+    }
+}
+
+impl<E: Instr + std::fmt::Debug> std::fmt::Debug for TypedDirectMethodCall<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TypedDirectMethodCall")
+            .field("receiver", &self.receiver)
+            .field("args", &self.args)
+            .field("method_name", &self.method_name)
+            .field("guard", &self.guard)
+            .finish()
+    }
+}
+
+impl<E: Instr> HasMeta for TypedDirectMethodCall<E> {
+    fn meta(&self) -> Meta {
+        self._meta.clone()
+    }
+}
+
+impl<E: Instr> WithMeta for TypedDirectMethodCall<E> {
+    fn with_meta(mut self, meta: Meta) -> Self {
+        self._meta = meta;
+        self
+    }
+}
+
+impl<E> ChildVisitable<E> for TypedDirectMethodCall<E>
+where
+    E: Instr + ChildVisitable<E>,
+{
+    fn visit_children<V>(&self, visitor: &mut V)
+    where
+        V: crate::block_py::Visit<E> + ?Sized,
+    {
+        visitor.visit_instr(&self.receiver);
+        for arg in &self.args {
+            visitor.visit_instr(arg.expr());
+        }
+    }
+
+    fn visit_children_mut<V>(&mut self, visitor: &mut V)
+    where
+        V: crate::block_py::VisitMut<E> + ?Sized,
+    {
+        visitor.visit_instr_mut(&mut self.receiver);
+        for arg in &mut self.args {
+            visitor.visit_instr_mut(arg.expr_mut());
+        }
+    }
+}
+
+impl<E: Instr> Mappable<E> for TypedDirectMethodCall<E> {
+    type Mapped<T: Instr> = TypedDirectMethodCall<T>;
+
+    fn map_children<T, M>(self, map: &mut M) -> Self::Mapped<T>
+    where
+        T: Instr,
+        M: MapInstr<E, T>,
+    {
+        TypedDirectMethodCall {
+            _meta: self._meta,
+            receiver: Box::new(map.map_instr(*self.receiver)),
+            args: self
+                .args
+                .into_iter()
+                .map(|arg| arg.map_instr(|expr| map.map_instr(expr)))
+                .collect(),
+            method_name: self.method_name,
+            guard: self.guard,
+        }
+    }
+
+    fn try_map_children<T, Error, M>(self, map: &mut M) -> Result<Self::Mapped<T>, Error>
+    where
+        T: Instr,
+        M: TryMapInstr<E, T, Error>,
+    {
+        Ok(TypedDirectMethodCall {
+            _meta: self._meta,
+            receiver: Box::new(map.try_map_instr(*self.receiver)?),
+            args: self
+                .args
+                .into_iter()
+                .map(|arg| arg.try_map_instr(|expr| map.try_map_instr(expr)))
+                .collect::<Result<Vec<_>, _>>()?,
+            method_name: self.method_name,
+            guard: self.guard,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TypedDirectCallGuardTestKind {
+    FunctionId {
+        function_id: FunctionId,
+    },
+    ExactCallableTypeVersion {
+        owner_type_ref: TypedAttrOwnerRef,
+        type_version: u32,
+    },
+    ExactReceiverTypeVersion {
+        owner_type_ref: TypedAttrOwnerRef,
+        type_version: u32,
+    },
+}
+
+#[derive(Clone)]
+pub struct TypedDirectCallGuardTest<E: Instr> {
+    _meta: Meta,
+    pub value: Box<E>,
+    pub kind: TypedDirectCallGuardTestKind,
+}
+
+impl<E: Instr> TypedDirectCallGuardTest<E> {
+    pub fn new(value: impl Into<Box<E>>, kind: TypedDirectCallGuardTestKind) -> Self {
+        Self {
+            _meta: Meta::default(),
+            value: value.into(),
+            kind,
+        }
+    }
+}
+
+impl<E: Instr + std::fmt::Debug> std::fmt::Debug for TypedDirectCallGuardTest<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TypedDirectCallGuardTest")
+            .field("value", &self.value)
+            .field("kind", &self.kind)
+            .finish()
+    }
+}
+
+impl<E: Instr> HasMeta for TypedDirectCallGuardTest<E> {
+    fn meta(&self) -> Meta {
+        self._meta.clone()
+    }
+}
+
+impl<E: Instr> WithMeta for TypedDirectCallGuardTest<E> {
+    fn with_meta(mut self, meta: Meta) -> Self {
+        self._meta = meta;
+        self
+    }
+}
+
+impl<E> ChildVisitable<E> for TypedDirectCallGuardTest<E>
+where
+    E: Instr + ChildVisitable<E>,
+{
+    fn visit_children<V>(&self, visitor: &mut V)
+    where
+        V: crate::block_py::Visit<E> + ?Sized,
+    {
+        visitor.visit_instr(&self.value);
+    }
+
+    fn visit_children_mut<V>(&mut self, visitor: &mut V)
+    where
+        V: crate::block_py::VisitMut<E> + ?Sized,
+    {
+        visitor.visit_instr_mut(&mut self.value);
+    }
+}
+
+impl<E: Instr> Mappable<E> for TypedDirectCallGuardTest<E> {
+    type Mapped<T: Instr> = TypedDirectCallGuardTest<T>;
+
+    fn map_children<T, M>(self, map: &mut M) -> Self::Mapped<T>
+    where
+        T: Instr,
+        M: MapInstr<E, T>,
+    {
+        TypedDirectCallGuardTest {
+            _meta: self._meta,
+            value: Box::new(map.map_instr(*self.value)),
+            kind: self.kind,
+        }
+    }
+
+    fn try_map_children<T, Error, M>(self, map: &mut M) -> Result<Self::Mapped<T>, Error>
+    where
+        T: Instr,
+        M: TryMapInstr<E, T, Error>,
+    {
+        Ok(TypedDirectCallGuardTest {
+            _meta: self._meta,
+            value: Box::new(map.try_map_instr(*self.value)?),
+            kind: self.kind,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub enum TypedAttrOwnerRef {
+    CpythonTypeSymbol(String),
+    TypeKey {
+        module_name: String,
+        qualname: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypedIndexedFieldGuard {
+    pub expected_index: u32,
+    pub owner_type_ref: TypedAttrOwnerRef,
+    pub type_version: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TypedAttrAccessPlan {
+    Generic,
+    ProfiledIndexedField { guards: Vec<TypedIndexedFieldGuard> },
+}
+
+#[derive(Clone)]
+pub struct TypedGetAttr<E: Instr> {
+    _meta: Meta,
+    pub value: Box<E>,
+    pub attr: Box<E>,
+    pub access: TypedAttrAccessPlan,
+}
+
+impl<E: Instr> TypedGetAttr<E> {
+    pub fn generic(value: impl Into<Box<E>>, attr: impl Into<Box<E>>) -> Self {
+        Self {
+            _meta: Meta::default(),
+            value: value.into(),
+            attr: attr.into(),
+            access: TypedAttrAccessPlan::Generic,
+        }
+    }
+
+    pub fn from_legacy(op: GetAttr<E>) -> Self {
+        Self {
+            _meta: op.meta(),
+            value: op.value,
+            attr: op.attr,
+            access: TypedAttrAccessPlan::Generic,
+        }
+    }
+
+    pub fn into_legacy(self) -> GetAttr<E> {
+        GetAttr::new(self.value, self.attr).with_meta(self._meta)
+    }
+}
+
+impl<E: Instr + std::fmt::Debug> std::fmt::Debug for TypedGetAttr<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TypedGetAttr")
+            .field("value", &self.value)
+            .field("attr", &self.attr)
+            .field("access", &self.access)
+            .finish()
+    }
+}
+
+impl<E: Instr> HasMeta for TypedGetAttr<E> {
+    fn meta(&self) -> Meta {
+        self._meta.clone()
+    }
+}
+
+impl<E: Instr> WithMeta for TypedGetAttr<E> {
+    fn with_meta(mut self, meta: Meta) -> Self {
+        self._meta = meta;
+        self
+    }
+}
+
+impl<E> ChildVisitable<E> for TypedGetAttr<E>
+where
+    E: Instr + ChildVisitable<E>,
+{
+    fn visit_children<V>(&self, visitor: &mut V)
+    where
+        V: crate::block_py::Visit<E> + ?Sized,
+    {
+        visitor.visit_instr(&self.value);
+        visitor.visit_instr(&self.attr);
+    }
+
+    fn visit_children_mut<V>(&mut self, visitor: &mut V)
+    where
+        V: crate::block_py::VisitMut<E> + ?Sized,
+    {
+        visitor.visit_instr_mut(&mut self.value);
+        visitor.visit_instr_mut(&mut self.attr);
+    }
+}
+
+impl<E: Instr> Mappable<E> for TypedGetAttr<E> {
+    type Mapped<T: Instr> = TypedGetAttr<T>;
+
+    fn map_children<T, M>(self, map: &mut M) -> Self::Mapped<T>
+    where
+        T: Instr,
+        M: MapInstr<E, T>,
+    {
+        TypedGetAttr {
+            _meta: self._meta,
+            value: Box::new(map.map_instr(*self.value)),
+            attr: Box::new(map.map_instr(*self.attr)),
+            access: self.access,
+        }
+    }
+
+    fn try_map_children<T, Error, M>(self, map: &mut M) -> Result<Self::Mapped<T>, Error>
+    where
+        T: Instr,
+        M: TryMapInstr<E, T, Error>,
+    {
+        Ok(TypedGetAttr {
+            _meta: self._meta,
+            value: Box::new(map.try_map_instr(*self.value)?),
+            attr: Box::new(map.try_map_instr(*self.attr)?),
+            access: self.access,
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct TypedSetAttr<E: Instr> {
+    _meta: Meta,
+    pub value: Box<E>,
+    pub attr: Box<E>,
+    pub replacement: Box<E>,
+    pub access: TypedAttrAccessPlan,
+}
+
+impl<E: Instr> TypedSetAttr<E> {
+    pub fn generic(
+        value: impl Into<Box<E>>,
+        attr: impl Into<Box<E>>,
+        replacement: impl Into<Box<E>>,
+    ) -> Self {
+        Self {
+            _meta: Meta::default(),
+            value: value.into(),
+            attr: attr.into(),
+            replacement: replacement.into(),
+            access: TypedAttrAccessPlan::Generic,
+        }
+    }
+
+    pub fn from_legacy(op: SetAttr<E>) -> Self {
+        Self {
+            _meta: op.meta(),
+            value: op.value,
+            attr: op.attr,
+            replacement: op.replacement,
+            access: TypedAttrAccessPlan::Generic,
+        }
+    }
+
+    pub fn into_legacy(self) -> SetAttr<E> {
+        SetAttr::new(self.value, self.attr, self.replacement).with_meta(self._meta)
+    }
+}
+
+impl<E: Instr + std::fmt::Debug> std::fmt::Debug for TypedSetAttr<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TypedSetAttr")
+            .field("value", &self.value)
+            .field("attr", &self.attr)
+            .field("replacement", &self.replacement)
+            .field("access", &self.access)
+            .finish()
+    }
+}
+
+impl<E: Instr> HasMeta for TypedSetAttr<E> {
+    fn meta(&self) -> Meta {
+        self._meta.clone()
+    }
+}
+
+impl<E: Instr> WithMeta for TypedSetAttr<E> {
+    fn with_meta(mut self, meta: Meta) -> Self {
+        self._meta = meta;
+        self
+    }
+}
+
+impl<E> ChildVisitable<E> for TypedSetAttr<E>
+where
+    E: Instr + ChildVisitable<E>,
+{
+    fn visit_children<V>(&self, visitor: &mut V)
+    where
+        V: crate::block_py::Visit<E> + ?Sized,
+    {
+        visitor.visit_instr(&self.value);
+        visitor.visit_instr(&self.attr);
+        visitor.visit_instr(&self.replacement);
+    }
+
+    fn visit_children_mut<V>(&mut self, visitor: &mut V)
+    where
+        V: crate::block_py::VisitMut<E> + ?Sized,
+    {
+        visitor.visit_instr_mut(&mut self.value);
+        visitor.visit_instr_mut(&mut self.attr);
+        visitor.visit_instr_mut(&mut self.replacement);
+    }
+}
+
+impl<E: Instr> Mappable<E> for TypedSetAttr<E> {
+    type Mapped<T: Instr> = TypedSetAttr<T>;
+
+    fn map_children<T, M>(self, map: &mut M) -> Self::Mapped<T>
+    where
+        T: Instr,
+        M: MapInstr<E, T>,
+    {
+        TypedSetAttr {
+            _meta: self._meta,
+            value: Box::new(map.map_instr(*self.value)),
+            attr: Box::new(map.map_instr(*self.attr)),
+            replacement: Box::new(map.map_instr(*self.replacement)),
+            access: self.access,
+        }
+    }
+
+    fn try_map_children<T, Error, M>(self, map: &mut M) -> Result<Self::Mapped<T>, Error>
+    where
+        T: Instr,
+        M: TryMapInstr<E, T, Error>,
+    {
+        Ok(TypedSetAttr {
+            _meta: self._meta,
+            value: Box::new(map.try_map_instr(*self.value)?),
+            attr: Box::new(map.try_map_instr(*self.attr)?),
+            replacement: Box::new(map.try_map_instr(*self.replacement)?),
+            access: self.access,
+        })
+    }
+}
+
 #[derive(Clone, derive_more::From, DelegateMatchDefault)]
 #[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, Debug)]
 pub enum InstrTyped {
@@ -252,8 +1507,16 @@ pub enum InstrTyped {
     LegacyTuple(Tuple<Self>),
     LegacyUnaryOp(UnaryOp<Self>),
     LegacyCalleeFunctionId(CalleeFunctionId<Self>),
+    CallTyped(TypedCall<Self>),
+    GuardedCallableCallTyped(TypedGuardedCallableCall<Self>),
+    GuardedMethodCallTyped(TypedGuardedMethodCall<Self>),
+    DirectCallableCallTyped(TypedDirectCallableCall<Self>),
+    DirectMethodCallTyped(TypedDirectMethodCall<Self>),
+    DirectCallGuardTest(TypedDirectCallGuardTest<Self>),
     LegacyCall(Call<Self>),
     LegacyCallDirect(CallDirect<Self>),
+    GetAttrTyped(TypedGetAttr<Self>),
+    SetAttrTyped(TypedSetAttr<Self>),
     LegacyGetAttr(GetAttr<Self>),
     LegacySetAttr(SetAttr<Self>),
     LegacyGetItem(GetItem<Self>),
@@ -314,10 +1577,41 @@ impl MapInstr<InstrCodegen, InstrTyped> for CodegenToTyped {
             InstrCodegenOp::CalleeFunctionId(op) => {
                 InstrTyped::LegacyCalleeFunctionId(op.map_children(self))
             }
-            InstrCodegenOp::Call(op) => InstrTyped::LegacyCall(op.map_children(self)),
+            InstrCodegenOp::DirectFunctionIdGuardTest(op) => {
+                let meta = op.meta();
+                InstrTyped::DirectCallGuardTest(
+                    TypedDirectCallGuardTest::new(
+                        self.map_instr(*op.value),
+                        TypedDirectCallGuardTestKind::FunctionId {
+                            function_id: op.function_id,
+                        },
+                    )
+                    .with_meta(meta),
+                )
+            }
+            InstrCodegenOp::DirectReceiverTypeVersionGuardTest(op) => {
+                let meta = op.meta();
+                InstrTyped::DirectCallGuardTest(
+                    TypedDirectCallGuardTest::new(
+                        self.map_instr(*op.value),
+                        TypedDirectCallGuardTestKind::ExactReceiverTypeVersion {
+                            owner_type_ref: op.owner_type_ref,
+                            type_version: op.type_version,
+                        },
+                    )
+                    .with_meta(meta),
+                )
+            }
+            InstrCodegenOp::Call(op) => {
+                InstrTyped::CallTyped(TypedCall::from_legacy(op.map_children(self)))
+            }
             InstrCodegenOp::CallDirect(op) => InstrTyped::LegacyCallDirect(op.map_children(self)),
-            InstrCodegenOp::GetAttr(op) => InstrTyped::LegacyGetAttr(op.map_children(self)),
-            InstrCodegenOp::SetAttr(op) => InstrTyped::LegacySetAttr(op.map_children(self)),
+            InstrCodegenOp::GetAttr(op) => {
+                InstrTyped::GetAttrTyped(TypedGetAttr::from_legacy(op.map_children(self)))
+            }
+            InstrCodegenOp::SetAttr(op) => {
+                InstrTyped::SetAttrTyped(TypedSetAttr::from_legacy(op.map_children(self)))
+            }
             InstrCodegenOp::GetItem(op) => InstrTyped::LegacyGetItem(op.map_children(self)),
             InstrCodegenOp::SetItem(op) => InstrTyped::LegacySetItem(op.map_children(self)),
             InstrCodegenOp::DelItem(op) => InstrTyped::LegacyDelItem(op.map_children(self)),
@@ -377,6 +1671,304 @@ pub fn lower_typed_if_tests_to_truthy(
     module
 }
 
+pub fn lower_typed_function_call_access_plan_instrs(
+    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+) -> usize {
+    struct Rewriter {
+        count: usize,
+    }
+
+    impl VisitMut<InstrTyped> for Rewriter {
+        fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+            expr.visit_children_mut(self);
+            let InstrTyped::CallTyped(call) = expr else {
+                return;
+            };
+            let should_lower = matches!(
+                call.access,
+                TypedCallAccessPlan::GuardedCallable { .. }
+                    | TypedCallAccessPlan::GuardedMethod { .. }
+            );
+            if !should_lower {
+                return;
+            }
+            let old_expr = std::mem::replace(expr, InstrTyped::constant_none());
+            let InstrTyped::CallTyped(mut call) = old_expr else {
+                unreachable!("checked call shape before replacing typed instruction")
+            };
+            match std::mem::replace(&mut call.access, TypedCallAccessPlan::Generic) {
+                TypedCallAccessPlan::GuardedCallable {
+                    function_guards,
+                    constructor_guards,
+                } => {
+                    *expr = InstrTyped::GuardedCallableCallTyped(
+                        TypedGuardedCallableCall::from_typed_call(
+                            call,
+                            function_guards,
+                            constructor_guards,
+                        ),
+                    );
+                }
+                TypedCallAccessPlan::GuardedMethod {
+                    method_name,
+                    method_guards,
+                } => {
+                    *expr = InstrTyped::GuardedMethodCallTyped(
+                        TypedGuardedMethodCall::from_typed_call(call, method_name, method_guards),
+                    );
+                }
+                _ => unreachable!("checked guarded call access before replacing typed instruction"),
+            };
+            self.count += 1;
+        }
+    }
+
+    let mut rewriter = Rewriter { count: 0 };
+    rewriter.visit_fn_mut(function);
+    rewriter.count
+}
+
+pub fn validate_typed_function_call_access_plans(
+    function: &BlockPyFunction<TypedCodegenModuleShape>,
+) -> Result<(), String> {
+    struct Validator {
+        function_id: FunctionId,
+        error: Option<String>,
+    }
+
+    impl Visit<InstrTyped> for Validator {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            if self.error.is_some() {
+                return;
+            }
+            if let InstrTyped::CallTyped(call) = expr {
+                if let Err(err) = validate_typed_call_access_plan(call) {
+                    self.error = Some(format!(
+                        "invalid typed call access plan in function {:?}: {err}",
+                        self.function_id
+                    ));
+                    return;
+                }
+            }
+            if let InstrTyped::GuardedCallableCallTyped(op) = expr {
+                let call = op.clone().into_typed_call();
+                if let Err(err) = validate_typed_call_access_plan(&call) {
+                    self.error = Some(format!(
+                        "invalid typed call access plan in function {:?}: {err}",
+                        self.function_id
+                    ));
+                    return;
+                }
+            }
+            if let InstrTyped::GuardedMethodCallTyped(op) = expr {
+                let call = op.clone().into_typed_call();
+                if let Err(err) = validate_typed_call_access_plan(&call) {
+                    self.error = Some(format!(
+                        "invalid typed call access plan in function {:?}: {err}",
+                        self.function_id
+                    ));
+                    return;
+                }
+            }
+            if let InstrTyped::DirectCallableCallTyped(op) = expr {
+                if let Err(err) = validate_typed_direct_callable_call(op) {
+                    self.error = Some(format!(
+                        "invalid typed direct callable call in function {:?}: {err}",
+                        self.function_id
+                    ));
+                    return;
+                }
+            }
+            if let InstrTyped::DirectMethodCallTyped(op) = expr {
+                if let Err(err) = validate_typed_direct_method_call(op) {
+                    self.error = Some(format!(
+                        "invalid typed direct method call in function {:?}: {err}",
+                        self.function_id
+                    ));
+                    return;
+                }
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut validator = Validator {
+        function_id: function.function_id,
+        error: None,
+    };
+    for block in &function.blocks {
+        for instr in &block.body {
+            validator.visit_instr(instr);
+            if let Some(err) = validator.error.take() {
+                return Err(err);
+            }
+        }
+        validator.visit_term(&block.term);
+        if let Some(err) = validator.error.take() {
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_typed_module_call_access_plans(
+    module: &BlockPyModule<TypedCodegenModuleShape>,
+) -> Result<(), String> {
+    for function in &module.callable_defs {
+        validate_typed_function_call_access_plans(function)?;
+    }
+    Ok(())
+}
+
+fn validate_typed_call_access_plan(call: &TypedCall<InstrTyped>) -> Result<(), String> {
+    match &call.access {
+        TypedCallAccessPlan::Generic
+        | TypedCallAccessPlan::ProfiledCallableTargets { .. }
+        | TypedCallAccessPlan::ProfiledMethodTargets { .. } => Ok(()),
+        TypedCallAccessPlan::GuardedCallable {
+            function_guards,
+            constructor_guards,
+        } => {
+            validate_typed_call_simple_shape(call)?;
+            for guard in function_guards {
+                validate_typed_direct_call_arg_plan(call, &guard.arg_plan, 0)?;
+            }
+            for guard in constructor_guards {
+                validate_typed_direct_call_arg_plan(call, &guard.arg_plan, 1)?;
+            }
+            Ok(())
+        }
+        TypedCallAccessPlan::GuardedMethod {
+            method_name,
+            method_guards,
+        } => {
+            validate_typed_call_simple_shape(call)?;
+            if method_name.is_empty() {
+                return Err("guarded method call requires a non-empty method name".to_string());
+            }
+            if !matches!(
+                call.func.as_ref(),
+                InstrTyped::GetAttrTyped(_) | InstrTyped::LegacyGetAttr(_)
+            ) {
+                return Err("guarded method call requires a GetAttr call target".to_string());
+            }
+            for guard in method_guards {
+                validate_typed_direct_call_arg_plan(call, &guard.arg_plan, 1)?;
+            }
+            Ok(())
+        }
+        TypedCallAccessPlan::GuardedRuntimeProtocolMethod {
+            runtime_name,
+            method_name,
+            method_guards,
+        } => {
+            validate_typed_call_simple_shape(call)?;
+            if *runtime_name != RuntimeName::Iter {
+                return Err(format!(
+                    "guarded runtime protocol call does not support runtime name {runtime_name:?}"
+                ));
+            }
+            if method_name.is_empty() {
+                return Err(
+                    "guarded runtime protocol call requires a non-empty method name".to_string(),
+                );
+            }
+            let explicit_positional_arg_count =
+                validate_typed_direct_call_positional_args(call.args.as_slice())?;
+            if explicit_positional_arg_count != 1 {
+                return Err(format!(
+                    "guarded iter protocol call requires exactly one receiver arg, got {explicit_positional_arg_count}"
+                ));
+            }
+            for guard in method_guards {
+                validate_typed_direct_call_arg_sources(&guard.arg_plan, 1)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_typed_call_simple_shape(call: &TypedCall<InstrTyped>) -> Result<(), String> {
+    validate_typed_direct_call_positional_args(call.args.as_slice())?;
+    if !call.keywords.is_empty() {
+        return Err("guarded direct call plans do not support keyword args".to_string());
+    }
+    Ok(())
+}
+
+fn validate_typed_direct_callable_call(
+    call: &TypedDirectCallableCall<InstrTyped>,
+) -> Result<(), String> {
+    let explicit_positional_arg_count =
+        validate_typed_direct_call_positional_args(call.args.as_slice())?;
+    match &call.guard {
+        TypedDirectCallableCallGuard::Function(guard) => {
+            validate_typed_direct_call_arg_sources(&guard.arg_plan, explicit_positional_arg_count)
+        }
+        TypedDirectCallableCallGuard::Constructor(guard) => validate_typed_direct_call_arg_sources(
+            &guard.arg_plan,
+            explicit_positional_arg_count + 1,
+        ),
+    }
+}
+
+fn validate_typed_direct_method_call(
+    call: &TypedDirectMethodCall<InstrTyped>,
+) -> Result<(), String> {
+    if call.method_name.is_empty() {
+        return Err("typed direct method call requires a non-empty method name".to_string());
+    }
+    let explicit_positional_arg_count =
+        validate_typed_direct_call_positional_args(call.args.as_slice())?;
+    validate_typed_direct_call_arg_sources(&call.guard.arg_plan, explicit_positional_arg_count + 1)
+}
+
+fn validate_typed_direct_call_positional_args(
+    args: &[CallArgPositional<InstrTyped>],
+) -> Result<usize, String> {
+    let mut explicit_positional_arg_count = 0;
+    for arg in args {
+        match arg {
+            CallArgPositional::Positional(_) => explicit_positional_arg_count += 1,
+            CallArgPositional::Starred(_) => {
+                return Err("guarded direct call plans do not support starred args".to_string());
+            }
+        }
+    }
+    Ok(explicit_positional_arg_count)
+}
+
+fn validate_typed_direct_call_arg_plan(
+    call: &TypedCall<InstrTyped>,
+    plan: &TypedDirectCallArgPlan,
+    implicit_positional_arg_count: usize,
+) -> Result<(), String> {
+    let explicit_positional_arg_count =
+        validate_typed_direct_call_positional_args(call.args.as_slice())?;
+    let provided_positional_arg_count =
+        implicit_positional_arg_count + explicit_positional_arg_count;
+    validate_typed_direct_call_arg_sources(plan, provided_positional_arg_count)
+}
+
+fn validate_typed_direct_call_arg_sources(
+    plan: &TypedDirectCallArgPlan,
+    provided_positional_arg_count: usize,
+) -> Result<(), String> {
+    for source in &plan.sources {
+        match source {
+            TypedDirectCallArgSource::Provided(index)
+                if *index >= provided_positional_arg_count =>
+            {
+                return Err(format!(
+                    "direct call arg plan references provided arg {index}, but only {provided_positional_arg_count} args are available"
+                ));
+            }
+            TypedDirectCallArgSource::Provided(_) | TypedDirectCallArgSource::DefaultSentinel => {}
+        }
+    }
+    Ok(())
+}
+
 struct TypedToCodegen;
 
 impl TryMapInstr<InstrTyped, InstrCodegen, String> for TypedToCodegen {
@@ -394,9 +1986,65 @@ impl TryMapInstr<InstrTyped, InstrCodegen, String> for TypedToCodegen {
             InstrTyped::LegacyCalleeFunctionId(op) => {
                 InstrCodegenOp::CalleeFunctionId(op.try_map_children(self)?)
             }
+            InstrTyped::DirectCallGuardTest(op) => {
+                let meta = op.meta();
+                match op.kind {
+                    TypedDirectCallGuardTestKind::FunctionId { function_id } => {
+                        InstrCodegenOp::DirectFunctionIdGuardTest(
+                            DirectFunctionIdGuardTest::new(
+                                self.try_map_instr(*op.value)?,
+                                function_id,
+                            )
+                            .with_meta(meta),
+                        )
+                    }
+                    TypedDirectCallGuardTestKind::ExactReceiverTypeVersion {
+                        owner_type_ref,
+                        type_version,
+                    } => InstrCodegenOp::DirectReceiverTypeVersionGuardTest(
+                        DirectReceiverTypeVersionGuardTest::new(
+                            self.try_map_instr(*op.value)?,
+                            owner_type_ref,
+                            type_version,
+                        )
+                        .with_meta(meta),
+                    ),
+                    TypedDirectCallGuardTestKind::ExactCallableTypeVersion { .. } => {
+                        return Err(
+                            "callable type-version direct-call guard test requires typed codegen emission"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            InstrTyped::CallTyped(op) => {
+                InstrCodegenOp::Call(op.try_map_children(self)?.into_legacy())
+            }
+            InstrTyped::GuardedCallableCallTyped(_) => {
+                return Err(
+                    "typed guarded callable call requires typed codegen emission".to_string(),
+                );
+            }
+            InstrTyped::GuardedMethodCallTyped(_) => {
+                return Err("typed guarded method call requires typed codegen emission".to_string());
+            }
+            InstrTyped::DirectCallableCallTyped(_) => {
+                return Err(
+                    "typed direct callable call requires typed codegen emission".to_string()
+                );
+            }
+            InstrTyped::DirectMethodCallTyped(_) => {
+                return Err("typed direct method call requires typed codegen emission".to_string());
+            }
             InstrTyped::LegacyCall(op) => InstrCodegenOp::Call(op.try_map_children(self)?),
             InstrTyped::LegacyCallDirect(op) => {
                 InstrCodegenOp::CallDirect(op.try_map_children(self)?)
+            }
+            InstrTyped::GetAttrTyped(op) => {
+                InstrCodegenOp::GetAttr(op.try_map_children(self)?.into_legacy())
+            }
+            InstrTyped::SetAttrTyped(op) => {
+                InstrCodegenOp::SetAttr(op.try_map_children(self)?.into_legacy())
             }
             InstrTyped::LegacyGetAttr(op) => InstrCodegenOp::GetAttr(op.try_map_children(self)?),
             InstrTyped::LegacySetAttr(op) => InstrCodegenOp::SetAttr(op.try_map_children(self)?),
@@ -432,6 +2080,7 @@ pub fn try_lower_typed_term_to_codegen_legacy(
 pub fn try_lower_typed_module_to_codegen_legacy(
     module: BlockPyModule<TypedCodegenModuleShape>,
 ) -> Result<BlockPyModule<CodegenModuleShape>, String> {
+    validate_typed_module_call_access_plans(&module)?;
     TypedToCodegen.try_map_module(module)
 }
 
@@ -654,6 +2303,51 @@ impl ModuleShape for CodegenModuleShape {
     type Instr = InstrCodegen;
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CodegenTempLocal {
+    pub name: String,
+    pub location: LocalLocation,
+}
+
+impl CodegenTempLocal {
+    pub fn resolved_name(&self) -> ResolvedName {
+        ResolvedName {
+            id: self.name.clone().into(),
+            location: NameLocation::Local(self.location),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum CodegenTempAllocationError {
+    MissingStorageLayout,
+}
+
+pub fn try_allocate_codegen_stack_temp(
+    function: &mut BlockPyFunction<CodegenModuleShape>,
+    prefix: &str,
+) -> Result<CodegenTempLocal, CodegenTempAllocationError> {
+    let name = function.name_gen.next_tmp_name(prefix).as_str().to_string();
+    let layout = function
+        .storage_layout
+        .as_mut()
+        .ok_or(CodegenTempAllocationError::MissingStorageLayout)?;
+    let location = LocalLocation(
+        u32::try_from(layout.stack_slots().len())
+            .expect("codegen stack slot index should fit in u32"),
+    );
+    layout.ensure_stack_slot(name.clone());
+    Ok(CodegenTempLocal { name, location })
+}
+
+pub fn allocate_codegen_stack_temp(
+    function: &mut BlockPyFunction<CodegenModuleShape>,
+    prefix: &str,
+) -> CodegenTempLocal {
+    try_allocate_codegen_stack_temp(function, prefix)
+        .expect("codegen function should have storage before allocating stack temp")
+}
+
 #[derive(Debug, Clone)]
 pub struct TypedCodegenModuleShape;
 
@@ -670,9 +2364,13 @@ impl ModuleShape for CodegenUnidentifiedModuleShape {
 
 pub(crate) use blockpy_generators::lower_yield_in_lowered_core_blockpy_module_bundle;
 pub use blockpy_to_bb::{lower_try_jump_exception_flow, normalize_bb_module_strings};
+pub use direct_call_transform::{
+    rewrite_profiled_function_call_store_sites, DirectCallStoreRewriteStats,
+};
 pub use escape_analysis::{
-    summarize_module_escapes, ConstructorFieldAccess, ConstructorFieldStore, ConstructorFieldValue,
-    EscapeSummaryModule, FieldInitializerConstructorSummary, FunctionEscapeSummary,
+    straightline_field_initializer_rejection_reason, summarize_module_escapes,
+    ConstructorFieldAccess, ConstructorFieldStore, ConstructorFieldValue, EscapeSummaryModule,
+    FieldInitializerConstructorSummary, FunctionEscapeSummary,
     NonEscapingConstructorAllocationSummary, NonEscapingConstructorSummary,
 };
 pub use inline_plan::{
@@ -682,14 +2380,19 @@ pub use inline_sites::{
     collect_inline_call_sites, InlineCallSiteModule, StraightlineConstructorCallSite,
 };
 pub use inline_transform::{
-    bind_simple_direct_call_inline_args, build_single_block_inline_fragment,
+    bind_simple_direct_call_inline_args, bind_simple_direct_method_inline_args,
+    build_cross_module_direct_method_inline_fragment_to_target,
+    build_direct_method_inline_fragment_to_target, build_single_block_inline_fragment,
     build_single_block_inline_fragment_to_target, build_single_block_inline_fragment_with_bindings,
-    inline_simple_direct_call_stores, InlineFragment, InlineLocal, InlineRewriteStats,
-    InlineUnsupportedReason, InlineValueBindings,
+    inline_direct_call_stores_with_callees, inline_simple_direct_call_stores,
+    rewrite_static_runtime_constructor_call_stores,
+    scalar_replace_non_escaping_constructor_allocations, InlineCallee, InlineFragment, InlineLocal,
+    InlineRewriteStats, InlineUnsupportedReason, InlineValueBindings, ScalarReplacementStats,
 };
 pub use instr_id::{
-    assign_function_instr_ids, assign_module_instr_ids, reassign_codegen_function_instr_ids,
-    reassign_codegen_module_instr_ids, validate_codegen_instr_ids,
+    assign_function_instr_ids, assign_missing_codegen_function_instr_ids, assign_module_instr_ids,
+    reassign_codegen_function_instr_ids, reassign_codegen_module_instr_ids,
+    validate_codegen_instr_ids,
 };
 pub use instrument::{
     CounterBuilder, CounterHandle, CounterSpec, InstrumentInstr, OptBlock, OptInstr,
@@ -744,7 +2447,7 @@ pub fn relabel_dense_bb_module<P: ModuleShape>(module: &mut BlockPyModule<P>) {
 #[cfg(test)]
 mod typed_codegen_tests {
     use super::*;
-    use crate::block_py::{ChildVisitable, Visit};
+    use crate::block_py::{ChildVisitable, Visit, VisitMut};
 
     #[derive(Default)]
     struct LegacyInstrCounter {
@@ -752,6 +2455,14 @@ mod typed_codegen_tests {
         truthy: usize,
         loads: usize,
         binops: usize,
+        typed_calls: usize,
+        guarded_callable_calls: usize,
+        guarded_method_calls: usize,
+        direct_callable_calls: usize,
+        direct_method_calls: usize,
+        direct_call_guard_tests: usize,
+        typed_getattrs: usize,
+        typed_setattrs: usize,
         non_legacy: usize,
     }
 
@@ -769,6 +2480,30 @@ mod typed_codegen_tests {
             }
             if matches!(expr, InstrTyped::BinOp(_)) {
                 self.binops += 1;
+            }
+            if matches!(expr, InstrTyped::CallTyped(_)) {
+                self.typed_calls += 1;
+            }
+            if matches!(expr, InstrTyped::GuardedCallableCallTyped(_)) {
+                self.guarded_callable_calls += 1;
+            }
+            if matches!(expr, InstrTyped::GuardedMethodCallTyped(_)) {
+                self.guarded_method_calls += 1;
+            }
+            if matches!(expr, InstrTyped::DirectCallableCallTyped(_)) {
+                self.direct_callable_calls += 1;
+            }
+            if matches!(expr, InstrTyped::DirectMethodCallTyped(_)) {
+                self.direct_method_calls += 1;
+            }
+            if matches!(expr, InstrTyped::DirectCallGuardTest(_)) {
+                self.direct_call_guard_tests += 1;
+            }
+            if matches!(expr, InstrTyped::GetAttrTyped(_)) {
+                self.typed_getattrs += 1;
+            }
+            if matches!(expr, InstrTyped::SetAttrTyped(_)) {
+                self.typed_setattrs += 1;
             }
             expr.visit_children(self);
         }
@@ -806,6 +2541,60 @@ mod typed_codegen_tests {
         counter
     }
 
+    fn typed_function_by_qualname_mut<'a>(
+        module: &'a mut BlockPyModule<TypedCodegenModuleShape>,
+        qualname: &str,
+    ) -> &'a mut BlockPyFunction<TypedCodegenModuleShape> {
+        module
+            .callable_defs
+            .iter_mut()
+            .find(|function| function.names.qualname == qualname)
+            .unwrap_or_else(|| panic!("missing typed function {qualname}"))
+    }
+
+    fn codegen_function_id_by_qualname(
+        module: &BlockPyModule<CodegenModuleShape>,
+        qualname: &str,
+    ) -> FunctionId {
+        module
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == qualname)
+            .unwrap_or_else(|| panic!("missing codegen function {qualname}"))
+            .function_id
+    }
+
+    fn replace_first_typed_call_access(
+        function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+        access: TypedCallAccessPlan,
+    ) {
+        struct Replacer {
+            access: Option<TypedCallAccessPlan>,
+        }
+
+        impl VisitMut<InstrTyped> for Replacer {
+            fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+                if let Some(access) = self.access.take() {
+                    if let InstrTyped::CallTyped(call) = expr {
+                        call.access = access;
+                        return;
+                    }
+                    self.access = Some(access);
+                }
+                expr.visit_children_mut(self);
+            }
+        }
+
+        let mut replacer = Replacer {
+            access: Some(access),
+        };
+        replacer.visit_fn_mut(function);
+        assert!(
+            replacer.access.is_none(),
+            "test function should contain a typed call"
+        );
+    }
+
     #[test]
     fn lower_codegen_module_to_typed_keeps_loads_first_class() {
         let lowered =
@@ -833,7 +2622,42 @@ mod typed_codegen_tests {
         assert!(counter.binops > 0);
         assert!(counter.loads > 0);
         assert_eq!(counter.truthy, 0);
-        assert_eq!(counter.non_legacy, counter.loads + counter.binops);
+        assert_eq!(
+            counter.non_legacy,
+            counter.loads
+                + counter.binops
+                + counter.typed_calls
+                + counter.guarded_callable_calls
+                + counter.guarded_method_calls
+                + counter.direct_callable_calls
+                + counter.direct_method_calls
+                + counter.direct_call_guard_tests
+                + counter.typed_getattrs
+                + counter.typed_setattrs
+        );
+    }
+
+    #[test]
+    fn lower_codegen_module_to_typed_makes_attrs_first_class() {
+        let lowered = crate::lower_python_to_blockpy_for_testing(
+            "def f(obj, value):\n    obj.x = value\n    return obj.x\n",
+        )
+        .expect("source should lower");
+
+        let typed = lower_codegen_module_to_typed(lowered.codegen_module);
+
+        let mut counter = LegacyInstrCounter::default();
+        for function in &typed.callable_defs {
+            for block in &function.blocks {
+                for instr in &block.body {
+                    counter.visit_instr(instr);
+                }
+                counter.visit_term(&block.term);
+            }
+        }
+
+        assert!(counter.typed_getattrs > 0);
+        assert!(counter.typed_setattrs > 0);
     }
 
     #[test]
@@ -886,11 +2710,298 @@ mod typed_codegen_tests {
         assert!(counter.loads > 0);
         assert_eq!(
             counter.non_legacy,
-            counter.truthy + counter.loads + counter.binops
+            counter.truthy
+                + counter.loads
+                + counter.binops
+                + counter.typed_calls
+                + counter.guarded_callable_calls
+                + counter.guarded_method_calls
+                + counter.direct_callable_calls
+                + counter.direct_method_calls
+                + counter.direct_call_guard_tests
+                + counter.typed_getattrs
+                + counter.typed_setattrs
         );
         assert!(
             try_lower_typed_module_to_codegen_legacy(typed).is_err(),
             "typed truthiness should not silently lower through the legacy adapter"
+        );
+    }
+
+    #[test]
+    fn validates_guarded_method_typed_call_access_plan_shape() {
+        let lowered = crate::lower_python_to_blockpy_for_testing(
+            "class IterRange:\n    def __next__(self):\n        return 1\n\n\
+def caller(it):\n    return it.__next__()\n",
+        )
+        .expect("source should lower");
+        let next_id =
+            codegen_function_id_by_qualname(&lowered.codegen_module, "IterRange.__next__");
+        let mut typed = lower_codegen_module_to_typed(lowered.codegen_module);
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        replace_first_typed_call_access(
+            caller,
+            TypedCallAccessPlan::GuardedMethod {
+                method_name: "__next__".to_string(),
+                method_guards: vec![TypedDirectMethodCallGuard {
+                    function_id: next_id,
+                    owner_type_ref: TypedAttrOwnerRef::TypeKey {
+                        module_name: "__main__".to_string(),
+                        qualname: "IterRange".to_string(),
+                    },
+                    type_version: 1,
+                    arg_plan: TypedDirectCallArgPlan {
+                        sources: vec![TypedDirectCallArgSource::Provided(0)],
+                    },
+                }],
+            },
+        );
+
+        validate_typed_function_call_access_plans(caller).expect("guarded method shape is valid");
+    }
+
+    #[test]
+    fn lowers_guarded_callable_typed_call_access_plan_to_instr() {
+        let lowered = crate::lower_python_to_blockpy_for_testing(
+            "def add(a, b):\n    return a + b\n\n\
+def caller(a, b):\n    return add(a, b)\n",
+        )
+        .expect("source should lower");
+        let add_id = codegen_function_id_by_qualname(&lowered.codegen_module, "add");
+        let mut typed = lower_codegen_module_to_typed(lowered.codegen_module);
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        replace_first_typed_call_access(
+            caller,
+            TypedCallAccessPlan::GuardedCallable {
+                function_guards: vec![TypedDirectFunctionCallGuard {
+                    function_id: add_id,
+                    arg_plan: TypedDirectCallArgPlan {
+                        sources: vec![
+                            TypedDirectCallArgSource::Provided(0),
+                            TypedDirectCallArgSource::Provided(1),
+                        ],
+                    },
+                }],
+                constructor_guards: Vec::new(),
+            },
+        );
+
+        assert_eq!(lower_typed_function_call_access_plan_instrs(caller), 1);
+        validate_typed_function_call_access_plans(caller)
+            .expect("lowered guarded callable shape is valid");
+
+        let mut counter = LegacyInstrCounter::default();
+        for block in &caller.blocks {
+            for instr in &block.body {
+                counter.visit_instr(instr);
+            }
+            counter.visit_term(&block.term);
+        }
+        assert_eq!(counter.typed_calls, 0);
+        assert_eq!(counter.guarded_callable_calls, 1);
+    }
+
+    #[test]
+    fn lowers_guarded_method_typed_call_access_plan_to_instr() {
+        let lowered = crate::lower_python_to_blockpy_for_testing(
+            "class IterRange:\n    def __next__(self):\n        return 1\n\n\
+def caller(it):\n    return it.__next__()\n",
+        )
+        .expect("source should lower");
+        let next_id =
+            codegen_function_id_by_qualname(&lowered.codegen_module, "IterRange.__next__");
+        let mut typed = lower_codegen_module_to_typed(lowered.codegen_module);
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        replace_first_typed_call_access(
+            caller,
+            TypedCallAccessPlan::GuardedMethod {
+                method_name: "__next__".to_string(),
+                method_guards: vec![TypedDirectMethodCallGuard {
+                    function_id: next_id,
+                    owner_type_ref: TypedAttrOwnerRef::TypeKey {
+                        module_name: "__main__".to_string(),
+                        qualname: "IterRange".to_string(),
+                    },
+                    type_version: 1,
+                    arg_plan: TypedDirectCallArgPlan {
+                        sources: vec![TypedDirectCallArgSource::Provided(0)],
+                    },
+                }],
+            },
+        );
+
+        assert_eq!(lower_typed_function_call_access_plan_instrs(caller), 1);
+        validate_typed_function_call_access_plans(caller)
+            .expect("lowered guarded method shape is valid");
+
+        let mut counter = LegacyInstrCounter::default();
+        for block in &caller.blocks {
+            for instr in &block.body {
+                counter.visit_instr(instr);
+            }
+            counter.visit_term(&block.term);
+        }
+        assert_eq!(counter.typed_calls, 0);
+        assert_eq!(counter.guarded_method_calls, 1);
+    }
+
+    #[test]
+    fn rejects_guarded_method_typed_call_access_without_getattr_target() {
+        let lowered =
+            crate::lower_python_to_blockpy_for_testing("def caller(fn):\n    return fn()\n")
+                .expect("source should lower");
+        let caller_id = codegen_function_id_by_qualname(&lowered.codegen_module, "caller");
+        let mut typed = lower_codegen_module_to_typed(lowered.codegen_module);
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        replace_first_typed_call_access(
+            caller,
+            TypedCallAccessPlan::GuardedMethod {
+                method_name: "__call__".to_string(),
+                method_guards: vec![TypedDirectMethodCallGuard {
+                    function_id: caller_id,
+                    owner_type_ref: TypedAttrOwnerRef::TypeKey {
+                        module_name: "__main__".to_string(),
+                        qualname: "Caller".to_string(),
+                    },
+                    type_version: 1,
+                    arg_plan: TypedDirectCallArgPlan {
+                        sources: vec![TypedDirectCallArgSource::Provided(0)],
+                    },
+                }],
+            },
+        );
+
+        let err = validate_typed_function_call_access_plans(caller)
+            .expect_err("guarded method without GetAttr should be rejected");
+        assert!(err.contains("requires a GetAttr call target"));
+    }
+
+    #[test]
+    fn direct_call_guard_test_is_first_class_typed_instr() {
+        let load: InstrTyped = runtime_name_load("NONE");
+        let guard = InstrTyped::DirectCallGuardTest(TypedDirectCallGuardTest::new(
+            load,
+            TypedDirectCallGuardTestKind::FunctionId {
+                function_id: FunctionId::new(0, 7),
+            },
+        ));
+
+        let mut counter = LegacyInstrCounter::default();
+        counter.visit_instr(&guard);
+
+        assert_eq!(counter.direct_call_guard_tests, 1);
+        assert_eq!(
+            counter.non_legacy,
+            counter.loads + counter.direct_call_guard_tests
+        );
+        assert!(
+            matches!(
+                try_lower_typed_instr_to_codegen_legacy(guard),
+                Ok(InstrCodegen::DirectFunctionIdGuardTest(_))
+            ),
+            "function-id direct-call guards should lower to the codegen guard representation"
+        );
+
+        let receiver_guard = InstrTyped::DirectCallGuardTest(TypedDirectCallGuardTest::new(
+            runtime_name_load::<InstrTyped>("NONE"),
+            TypedDirectCallGuardTestKind::ExactReceiverTypeVersion {
+                owner_type_ref: TypedAttrOwnerRef::TypeKey {
+                    module_name: "__main__".to_string(),
+                    qualname: "Receiver".to_string(),
+                },
+                type_version: 1,
+            },
+        ));
+        assert!(
+            matches!(
+                try_lower_typed_instr_to_codegen_legacy(receiver_guard),
+                Ok(InstrCodegen::DirectReceiverTypeVersionGuardTest(_))
+            ),
+            "receiver type-version direct-call guards should lower to the codegen guard representation"
+        );
+
+        let non_function_guard = InstrTyped::DirectCallGuardTest(TypedDirectCallGuardTest::new(
+            runtime_name_load::<InstrTyped>("NONE"),
+            TypedDirectCallGuardTestKind::ExactCallableTypeVersion {
+                owner_type_ref: TypedAttrOwnerRef::TypeKey {
+                    module_name: "__main__".to_string(),
+                    qualname: "Callable".to_string(),
+                },
+                type_version: 1,
+            },
+        ));
+        assert!(
+            try_lower_typed_instr_to_codegen_legacy(non_function_guard).is_err(),
+            "callable type-version direct-call guard tests still require typed codegen emission"
+        );
+    }
+
+    #[test]
+    fn direct_callable_call_is_first_class_typed_instr() {
+        let func: InstrTyped = runtime_name_load("NONE");
+        let arg: InstrTyped = runtime_name_load("NONE");
+        let direct_call = InstrTyped::DirectCallableCallTyped(TypedDirectCallableCall::new(
+            func,
+            vec![CallArgPositional::Positional(arg)],
+            TypedDirectCallableCallGuard::Function(TypedDirectFunctionCallGuard {
+                function_id: FunctionId::new(0, 8),
+                arg_plan: TypedDirectCallArgPlan {
+                    sources: vec![TypedDirectCallArgSource::Provided(0)],
+                },
+            }),
+        ));
+
+        let mut counter = LegacyInstrCounter::default();
+        counter.visit_instr(&direct_call);
+
+        assert_eq!(counter.direct_callable_calls, 1);
+        assert_eq!(counter.loads, 2);
+        assert_eq!(
+            counter.non_legacy,
+            counter.loads + counter.direct_callable_calls
+        );
+        assert!(
+            try_lower_typed_instr_to_codegen_legacy(direct_call).is_err(),
+            "typed direct callable calls should not silently lower through the legacy adapter"
+        );
+    }
+
+    #[test]
+    fn direct_method_call_is_first_class_typed_instr() {
+        let receiver: InstrTyped = runtime_name_load("NONE");
+        let arg: InstrTyped = runtime_name_load("NONE");
+        let direct_call = InstrTyped::DirectMethodCallTyped(TypedDirectMethodCall::new(
+            receiver,
+            vec![CallArgPositional::Positional(arg)],
+            "__next__",
+            TypedDirectMethodCallGuard {
+                function_id: FunctionId::new(0, 9),
+                owner_type_ref: TypedAttrOwnerRef::TypeKey {
+                    module_name: "__main__".to_string(),
+                    qualname: "IterRange".to_string(),
+                },
+                type_version: 1,
+                arg_plan: TypedDirectCallArgPlan {
+                    sources: vec![
+                        TypedDirectCallArgSource::Provided(0),
+                        TypedDirectCallArgSource::Provided(1),
+                    ],
+                },
+            },
+        ));
+
+        let mut counter = LegacyInstrCounter::default();
+        counter.visit_instr(&direct_call);
+
+        assert_eq!(counter.direct_method_calls, 1);
+        assert_eq!(counter.loads, 2);
+        assert_eq!(
+            counter.non_legacy,
+            counter.loads + counter.direct_method_calls
+        );
+        assert!(
+            try_lower_typed_instr_to_codegen_legacy(direct_call).is_err(),
+            "typed direct method calls should not silently lower through the legacy adapter"
         );
     }
 }

@@ -1,6 +1,7 @@
 use super::{
     FunctionRuntimeDataLayout, RuntimeFunctionEntryPlan, RuntimeJitDeoptCursor,
-    RuntimeJitDeoptInvocation, RuntimeJitDeoptLocals, specialized_helpers::ObjPtr,
+    RuntimeJitDeoptInvocation, RuntimeJitDeoptLocals, reloc_type_ref_from_typed_attr_owner_ref,
+    resolve_reloc_type_ref_to_type, specialized_helpers::ObjPtr,
 };
 use crate::function_instantiation::{
     make_function_in_shared_state, make_function_kind_abi_tag, soac_jit_make_function_with_closure,
@@ -13,33 +14,28 @@ use pyo3::types::PyAny;
 use pyo3::{Bound, Python};
 use soac_blockpy::block_py::{
     AbruptKind, BinOp, BinOpKind, Block, BlockArg, BlockEdge, BlockLabel, BlockTerm,
-    CallArgKeyword, CallArgPositional, CalleeFunctionId, CellLocation, InstrCodegen,
-    LocalLocation, NameLocation, ParamKind, RuntimeName, UnaryOp, UnaryOpKind,
+    CallArgKeyword, CallArgPositional, CalleeFunctionId, CellLocation, InstrCodegen, LocalLocation,
+    NameLocation, ParamKind, RuntimeName, UnaryOp, UnaryOpKind,
 };
 use soac_blockpy::block_py::{BlockPyFunction, FunctionKind};
-use soac_blockpy::passes::CodegenModuleShape;
+use soac_blockpy::passes::{
+    CodegenModuleShape, DirectFunctionIdGuardTest, DirectReceiverTypeVersionGuardTest,
+};
 use std::ffi::{c_int, c_void};
 use std::ptr;
 use std::sync::Arc;
 
-fn dense_block_for_label<'a>(
+fn block_for_label<'a>(
     function: &'a BlockPyFunction<CodegenModuleShape>,
     label: BlockLabel,
 ) -> Option<&'a Block<InstrCodegen>> {
-    let block = function.blocks.get(label.index())?;
-    if block.label == label {
+    if let Some(block) = function.blocks.get(label.index())
+        && block.label == label
+    {
         return Some(block);
     }
 
-    #[cfg(test)]
-    {
-        function.blocks.iter().find(|block| block.label == label)
-    }
-
-    #[cfg(not(test))]
-    {
-        None
-    }
+    function.blocks.iter().find(|block| block.label == label)
 }
 
 unsafe extern "C" {
@@ -673,9 +669,9 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
         'execute: loop {
             let block_label = cursor.block();
             let start_body_index = cursor.body_index();
-            let block = dense_block_for_label(function, block_label).ok_or_else(|| {
+            let block = block_for_label(function, block_label).ok_or_else(|| {
                 format!(
-                    "deopt continuation expected dense block {block_label} in function {}",
+                    "deopt continuation expected block {block_label} in function {}",
                     function.function_id
                 )
             })?;
@@ -822,9 +818,9 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
         edge: &BlockEdge,
     ) -> Result<Option<RuntimeJitDeoptCursor>, String> {
         let function = self.source.function();
-        let target_block = dense_block_for_label(function, edge.target).ok_or_else(|| {
+        let target_block = block_for_label(function, edge.target).ok_or_else(|| {
             format!(
-                "deopt continuation expected dense jump target {} in function {}",
+                "deopt continuation expected jump target {} in function {}",
                 edge.target, function.function_id
             )
         })?;
@@ -854,9 +850,13 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
         // explicit args overwrite the corresponding target params by position.
         for (param, arg) in target_params.iter().zip(edge.args.iter()) {
             let value = match arg {
-                BlockArg::Name(name) => unsafe { self.execute_block_arg_name_owned(name)? },
+                BlockArg::Name(name) => unsafe {
+                    self.execute_block_arg_name_owned(name.as_str())?
+                },
                 BlockArg::None => owned_none(),
-                BlockArg::AbruptKind(kind) => unsafe { execute_abrupt_kind_arg_owned(*kind) },
+                BlockArg::AbruptKind(kind) => unsafe {
+                    execute_abrupt_kind_arg_owned(kind.clone())
+                },
                 BlockArg::CurrentException => unsafe { self.current_exception_arg_owned() },
             };
             if value.is_null() {
@@ -916,14 +916,18 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             InstrCodegen::CalleeFunctionId(callee) => unsafe {
                 self.execute_callee_function_id_owned(callee)
             },
+            InstrCodegen::DirectFunctionIdGuardTest(guard) => unsafe {
+                self.execute_direct_function_id_guard_test_owned(guard)
+            },
+            InstrCodegen::DirectReceiverTypeVersionGuardTest(guard) => unsafe {
+                self.execute_direct_receiver_type_version_guard_test_owned(guard)
+            },
             InstrCodegen::Tuple(tuple) => unsafe { self.execute_tuple_owned(tuple) },
             InstrCodegen::Call(call) => unsafe { self.execute_call_owned(call) },
             InstrCodegen::CallDirect(call) => unsafe { self.execute_call_direct_owned(call) },
             InstrCodegen::Store(store) => unsafe { self.execute_store_owned(store) },
             InstrCodegen::Del(del) => unsafe { self.execute_del_owned(del) },
-            InstrCodegen::IncrementCounter(_) => unsafe {
-                self.execute_runtime_name_deopt(RuntimeName::None)
-            },
+            InstrCodegen::IncrementCounter(_) => Ok(owned_none()),
             InstrCodegen::MakeCell(make_cell) => unsafe { self.execute_make_cell_owned(make_cell) },
             InstrCodegen::MakeFunctionWithClosure(make_function) => unsafe {
                 self.execute_make_function_with_closure_owned(make_function)
@@ -1431,6 +1435,46 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
         }
         Ok(unsafe { ffi::PyLong_FromLongLong(packed as i64).cast() })
+    }
+
+    #[cold]
+    unsafe fn execute_direct_function_id_guard_test_owned(
+        &mut self,
+        guard: &DirectFunctionIdGuardTest<InstrCodegen>,
+    ) -> Result<ObjPtr, String> {
+        let callable = unsafe { self.execute_expr_owned(&guard.value)? };
+        if callable.is_null() {
+            return Ok(ptr::null_mut());
+        }
+        let packed = unsafe { callable_soac_function_id(callable.cast::<ffi::PyObject>()) };
+        unsafe {
+            ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
+        }
+        Ok(unsafe {
+            ffi::PyBool_FromLong((packed == guard.function_id.packed()) as libc::c_long).cast()
+        })
+    }
+
+    #[cold]
+    unsafe fn execute_direct_receiver_type_version_guard_test_owned(
+        &mut self,
+        guard: &DirectReceiverTypeVersionGuardTest<InstrCodegen>,
+    ) -> Result<ObjPtr, String> {
+        let receiver = unsafe { self.execute_expr_owned(&guard.value)? };
+        if receiver.is_null() {
+            return Ok(ptr::null_mut());
+        }
+        let expected = reloc_type_ref_from_typed_attr_owner_ref(&guard.owner_type_ref)
+            .and_then(|owner_type_ref| resolve_reloc_type_ref_to_type(&owner_type_ref).ok())
+            .flatten();
+        let matched = expected.is_some_and(|expected| unsafe {
+            let actual = ffi::Py_TYPE(receiver.cast::<ffi::PyObject>());
+            actual == expected && (*actual).tp_version_tag == guard.type_version
+        });
+        unsafe {
+            ffi::Py_DECREF(receiver.cast::<ffi::PyObject>());
+        }
+        Ok(unsafe { ffi::PyBool_FromLong(matched as libc::c_long).cast() })
     }
 
     #[cold]

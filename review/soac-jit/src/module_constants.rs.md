@@ -45,9 +45,9 @@ runtime module itself is being loaded, plus support for experimental static comp
   exception.
 - `should_include_in_locals_snapshot`: filters internal names from locals snapshots.
 - `ModuleConstantCollector::collect_function`, `collect_stmt`, `collect_term`, `collect_block_args`, `collect_expr`: traverse
-  lowered codegen IR to intern constants needed by locals, globals, attributes, deleted-name helpers, calls, and abrupt-kind
+  lowered codegen IR to intern constants needed by locals, globals, attributes, deleted-name errors, calls, and abrupt-kind
   transport.
-- `ModuleConstantCollector::deleted_name_arg_bytes`: recognizes `load_deleted_name` calls and extracts their name argument.
+- `ModuleConstantCollector::deleted_name_arg_bytes`: recognizes `raise_deleted_name` calls and extracts their name argument.
 - `ModuleConstantCollector::string_constant_bytes_for_specialized_codegen`: recovers string bytes from constants or `str(...)`
   wrappers used by specialized codegen.
 - `Visit::visit_instr` for `ModuleConstantCollector`: delegates visitor traversal into `collect_expr`.
@@ -60,4 +60,3 @@ runtime module itself is being loaded, plus support for experimental static comp
 - `soac-jit/src/module_type.rs`
 - `soac_py/src/soac/runtime.py`
 - `soac-blockpy/src/block_py.rs`
-

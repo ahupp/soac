@@ -66,8 +66,8 @@ pub enum ProvenanceFact {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum RuntimeHelperId {
     Globals,
+    Index,
     Str,
-    LoadDeletedName,
     RaiseDeletedName,
     CellRef,
     NextOrSentinel,
@@ -100,8 +100,8 @@ impl RuntimeHelperId {
     pub fn from_runtime_symbol(name: &str) -> Option<Self> {
         match name.as_bytes() {
             b"globals" => Some(Self::Globals),
+            b"_index" => Some(Self::Index),
             b"str" => Some(Self::Str),
-            b"load_deleted_name" => Some(Self::LoadDeletedName),
             b"raise_deleted_name" => Some(Self::RaiseDeletedName),
             b"cell_ref" => Some(Self::CellRef),
             b"next_or_sentinel" => Some(Self::NextOrSentinel),
@@ -373,9 +373,9 @@ impl ValueFacts {
 
 const fn runtime_helper_result(helper: RuntimeHelperId) -> ValueFacts {
     match helper {
+        RuntimeHelperId::Index => ValueFacts::PyObj(PyObjFacts::exact_type(PyExactType::Int)),
         RuntimeHelperId::Str => ValueFacts::PyObj(PyObjFacts::exact_type(PyExactType::Str)),
         RuntimeHelperId::Globals
-        | RuntimeHelperId::LoadDeletedName
         | RuntimeHelperId::RaiseDeletedName
         | RuntimeHelperId::CellRef
         | RuntimeHelperId::NextOrSentinel
@@ -392,8 +392,8 @@ const fn runtime_helper_result(helper: RuntimeHelperId) -> ValueFacts {
 const fn runtime_helper_throw_spec(helper: RuntimeHelperId) -> ThrowSpec {
     match helper {
         RuntimeHelperId::Globals | RuntimeHelperId::CellRef => ThrowSpec::Never,
-        RuntimeHelperId::Str
-        | RuntimeHelperId::LoadDeletedName
+        RuntimeHelperId::Index
+        | RuntimeHelperId::Str
         | RuntimeHelperId::RaiseDeletedName
         | RuntimeHelperId::NextOrSentinel
         | RuntimeHelperId::TupleFromIter
@@ -521,6 +521,16 @@ impl FunctionFactInferer<'_> {
                     ValueFacts::unknown_pyobj()
                 }
             }
+            InstrCodegen::BinOp(op) => infer_binop_result_facts(
+                op.kind,
+                self.infer_expr_facts(&op.left),
+                self.infer_expr_facts(&op.right),
+            )
+            .unwrap_or_else(ValueFacts::unknown_pyobj),
+            InstrCodegen::UnaryOp(op) => {
+                infer_unary_result_facts(op.kind, self.infer_expr_facts(&op.operand))
+                    .unwrap_or_else(ValueFacts::unknown_pyobj)
+            }
             InstrCodegen::Tuple(_) => ValueFacts::PyObj(PyObjFacts::known_not_none()),
             _ => ValueFacts::unknown_pyobj(),
         }
@@ -534,6 +544,16 @@ impl FunctionFactInferer<'_> {
                 .and_then(|location| env.local_pyobj_fact(location))
                 .map(ValueFacts::PyObj)
                 .unwrap_or_else(|| self.infer_expr_facts(expr)),
+            InstrCodegen::BinOp(op) => infer_binop_result_facts(
+                op.kind,
+                self.infer_expr_facts_in_env(&op.left, env),
+                self.infer_expr_facts_in_env(&op.right, env),
+            )
+            .unwrap_or_else(ValueFacts::unknown_pyobj),
+            InstrCodegen::UnaryOp(op) => {
+                infer_unary_result_facts(op.kind, self.infer_expr_facts_in_env(&op.operand, env))
+                    .unwrap_or_else(ValueFacts::unknown_pyobj)
+            }
             _ => self.infer_expr_facts(expr),
         }
     }
@@ -742,6 +762,73 @@ fn local_load_location(expr: &InstrCodegen) -> Option<LocalLocation> {
         InstrCodegen::Load(op) => op.name.local_location(),
         _ => None,
     }
+}
+
+fn is_exact_int_fact(facts: ValueFacts) -> bool {
+    facts
+        .as_pyobj()
+        .is_some_and(|py_facts| py_facts.is_exact_type(PyExactType::Int))
+}
+
+fn infer_binop_result_facts(
+    kind: BinOpKind,
+    left: ValueFacts,
+    right: ValueFacts,
+) -> Option<ValueFacts> {
+    if !(is_exact_int_fact(left) && is_exact_int_fact(right)) {
+        return None;
+    }
+    let py_facts = match kind {
+        BinOpKind::Eq
+        | BinOpKind::Ne
+        | BinOpKind::Lt
+        | BinOpKind::Le
+        | BinOpKind::Gt
+        | BinOpKind::Ge => PyObjFacts::bool_object(),
+        BinOpKind::Add
+        | BinOpKind::Sub
+        | BinOpKind::Mul
+        | BinOpKind::FloorDiv
+        | BinOpKind::Mod
+        | BinOpKind::LShift
+        | BinOpKind::RShift
+        | BinOpKind::Or
+        | BinOpKind::Xor
+        | BinOpKind::And
+        | BinOpKind::InplaceAdd
+        | BinOpKind::InplaceSub
+        | BinOpKind::InplaceMul
+        | BinOpKind::InplaceFloorDiv
+        | BinOpKind::InplaceMod
+        | BinOpKind::InplaceLShift
+        | BinOpKind::InplaceRShift
+        | BinOpKind::InplaceOr
+        | BinOpKind::InplaceXor
+        | BinOpKind::InplaceAnd => PyObjFacts::exact_type(PyExactType::Int),
+        BinOpKind::TrueDiv | BinOpKind::InplaceTrueDiv => {
+            PyObjFacts::exact_type(PyExactType::Float)
+        }
+        BinOpKind::Pow
+        | BinOpKind::InplacePow
+        | BinOpKind::MatMul
+        | BinOpKind::InplaceMatMul
+        | BinOpKind::Contains
+        | BinOpKind::Is => return None,
+    };
+    Some(ValueFacts::PyObj(py_facts))
+}
+
+fn infer_unary_result_facts(kind: UnaryOpKind, operand: ValueFacts) -> Option<ValueFacts> {
+    if !is_exact_int_fact(operand) {
+        return None;
+    }
+    let py_facts = match kind {
+        UnaryOpKind::Pos | UnaryOpKind::Neg | UnaryOpKind::Invert => {
+            PyObjFacts::exact_type(PyExactType::Int)
+        }
+        UnaryOpKind::Not | UnaryOpKind::Truth => PyObjFacts::bool_object(),
+    };
+    Some(ValueFacts::PyObj(py_facts))
 }
 
 fn infer_runtime_name_load_facts(name: &impl NameLike) -> Option<ValueFacts> {
@@ -1031,6 +1118,10 @@ def f(x, flag):
     #[test]
     fn runtime_helper_ids_are_resolved_from_runtime_symbols() {
         assert_eq!(
+            RuntimeHelperId::from_runtime_symbol("_index"),
+            Some(RuntimeHelperId::Index)
+        );
+        assert_eq!(
             RuntimeHelperId::from_runtime_symbol("next_or_sentinel"),
             Some(RuntimeHelperId::NextOrSentinel)
         );
@@ -1052,6 +1143,32 @@ def f(x, flag):
             panic!("str should return a Python object");
         };
         assert!(result_facts.is_exact_type(PyExactType::Str));
+
+        let signature = RuntimeHelperId::Index.signature();
+        assert_eq!(signature.throws, ThrowSpec::ThrowsOnNullPyObj);
+        let ValueFacts::PyObj(result_facts) = signature.result else {
+            panic!("_index should return a Python object");
+        };
+        assert!(result_facts.is_exact_type(PyExactType::Int));
+    }
+
+    #[test]
+    fn infers_exact_int_operator_facts_from_exact_int_locals() {
+        let (then_entry, _) = branch_entry_envs("x = 1\ny = 2\nz = x + y\nw = z < y", "w is True");
+        let facts = local_py_facts(&then_entry);
+
+        assert!(
+            facts
+                .iter()
+                .any(|fact| fact.is_exact_type(PyExactType::Int)),
+            "expected at least one propagated exact-int local fact"
+        );
+        assert!(
+            facts
+                .iter()
+                .any(|fact| fact.is_exact_type(PyExactType::Bool)),
+            "expected at least one propagated bool local fact"
+        );
     }
 
     #[test]

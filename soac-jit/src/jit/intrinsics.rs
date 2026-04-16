@@ -17,7 +17,7 @@ use pyo3::ffi;
 use soac_blockpy::block_py::{
     CounterId, HasSemanticInstrId, Instr, InstrCodegen, NameLike, NameLocation,
 };
-use soac_blockpy::passes::PyObjFacts;
+use soac_blockpy::passes::{PyExactType, PyObjFacts};
 use std::mem::offset_of;
 
 pub(super) trait OperationEmitState<'fb, E> {
@@ -1181,6 +1181,14 @@ fn emit_specialized_binop<'fb>(
     let instr_id = op.semantic_instr_id();
     let ptr_ty = state.ctx().consts.ptr_ty;
     let i64_ty = state.ctx().consts.i64_ty;
+    let exact_int_kind = ExactIntBinaryOpKind::from_binop_kind(op.kind);
+    let facts_prove_exact_int = exact_int_kind.is_some()
+        && state
+            .py_facts_for_arg(op.left.as_ref())
+            .is_exact_type(PyExactType::Int)
+        && state
+            .py_facts_for_arg(op.right.as_ref())
+            .is_exact_type(PyExactType::Int);
     let counter_id = state
         .ctx()
         .operator_shape_counter_ids
@@ -1204,12 +1212,16 @@ fn emit_specialized_binop<'fb>(
         .unwrap_or_default();
     let specialized_hit_counter_id = specialized_hit_counter_id;
     let specialized_fallback_counter_id = specialized_fallback_counter_id;
-    if counter_id.is_none() && hot_shapes.is_empty() {
+    if counter_id.is_none() && hot_shapes.is_empty() && !facts_prove_exact_int {
         return None;
     }
 
     let arg_values = state.emit_arg_values(&[op.left.as_ref(), op.right.as_ref()]);
-    let shape = emit_binary_operator_shape_from_values(state, &arg_values);
+    let shape = if counter_id.is_some() || (!facts_prove_exact_int && !hot_shapes.is_empty()) {
+        Some(emit_binary_operator_shape_from_values(state, &arg_values))
+    } else {
+        None
+    };
     if let Some(counter_id) = counter_id {
         let counter_slot =
             super::top_value_counter_slot_for_id(state.ctx().counter_slots_by_id, counter_id)
@@ -1235,14 +1247,22 @@ fn emit_specialized_binop<'fb>(
             state.fb(),
             top_value_counter_base_value,
             counter_slot,
-            shape,
+            shape.expect("operator shape should be materialized when recording a counter"),
             record_top_value_sample_ref,
         );
     }
 
-    let Some(exact_int_kind) = ExactIntBinaryOpKind::from_binop_kind(op.kind) else {
+    let Some(exact_int_kind) = exact_int_kind else {
         return Some(emit_binop_with_arg_values(op.kind, state, &arg_values));
     };
+    if facts_prove_exact_int {
+        increment_counter_with_state(state, specialized_hit_counter_id);
+        return Some(emit_exact_long_binary_op(
+            exact_int_kind,
+            state,
+            &arg_values,
+        ));
+    }
     let exact_int_shape = pack_binary_shape(ExactTypeTag::Int, ExactTypeTag::Int);
     let supports_exact_int = hot_shapes.into_iter().any(|shape| {
         unpack_binary_shape(shape)
@@ -1261,10 +1281,11 @@ fn emit_specialized_binop<'fb>(
         state.prepare_guard_miss_dispatch_for_instr(instr_id, &pre_guard_operands, generic_block);
     let direct_block = state.fb().create_block();
     let expected_shape = state.fb().ins().iconst(i64_ty, exact_int_shape as i64);
-    let is_match = state
-        .fb()
-        .ins()
-        .icmp(ir::condcodes::IntCC::Equal, shape, expected_shape);
+    let is_match =
+        state
+            .fb()
+            .ins()
+            .icmp(ir::condcodes::IntCC::Equal, shape.unwrap(), expected_shape);
     state.fb().ins().brif(
         is_match,
         direct_block,
@@ -1317,6 +1338,9 @@ fn emit_specialized_unary_op<'fb>(
     let instr_id = op.semantic_instr_id();
     let ptr_ty = state.ctx().consts.ptr_ty;
     let i64_ty = state.ctx().consts.i64_ty;
+    let facts_prove_exact_int = state
+        .py_facts_for_arg(op.operand.as_ref())
+        .is_exact_type(PyExactType::Int);
     let counter_id = state
         .ctx()
         .operator_shape_counter_ids
@@ -1340,12 +1364,16 @@ fn emit_specialized_unary_op<'fb>(
         .unwrap_or_default();
     let specialized_hit_counter_id = specialized_hit_counter_id;
     let specialized_fallback_counter_id = specialized_fallback_counter_id;
-    if counter_id.is_none() && hot_shapes.is_empty() {
+    if counter_id.is_none() && hot_shapes.is_empty() && !facts_prove_exact_int {
         return None;
     }
 
     let arg_values = state.emit_arg_values(&[op.operand.as_ref()]);
-    let shape = emit_unary_operator_shape_from_values(state, &arg_values);
+    let shape = if counter_id.is_some() || (!facts_prove_exact_int && !hot_shapes.is_empty()) {
+        Some(emit_unary_operator_shape_from_values(state, &arg_values))
+    } else {
+        None
+    };
     if let Some(counter_id) = counter_id {
         let counter_slot =
             super::top_value_counter_slot_for_id(state.ctx().counter_slots_by_id, counter_id)
@@ -1371,12 +1399,16 @@ fn emit_specialized_unary_op<'fb>(
             state.fb(),
             top_value_counter_base_value,
             counter_slot,
-            shape,
+            shape.expect("operator shape should be materialized when recording a counter"),
             record_top_value_sample_ref,
         );
     }
 
     let exact_int_kind = ExactIntUnaryOpKind::from_unary_op_kind(op.kind);
+    if facts_prove_exact_int {
+        increment_counter_with_state(state, specialized_hit_counter_id);
+        return Some(emit_exact_long_unary_op(exact_int_kind, state, &arg_values));
+    }
     let exact_int_shape = pack_unary_shape(ExactTypeTag::Int);
     let supports_exact_int = hot_shapes
         .into_iter()
@@ -1399,10 +1431,11 @@ fn emit_specialized_unary_op<'fb>(
         state.prepare_guard_miss_dispatch_for_instr(instr_id, &pre_guard_operands, generic_block);
     let direct_block = state.fb().create_block();
     let expected_shape = state.fb().ins().iconst(i64_ty, exact_int_shape as i64);
-    let is_match = state
-        .fb()
-        .ins()
-        .icmp(ir::condcodes::IntCC::Equal, shape, expected_shape);
+    let is_match =
+        state
+            .fb()
+            .ins()
+            .icmp(ir::condcodes::IntCC::Equal, shape.unwrap(), expected_shape);
     state.fb().ins().brif(
         is_match,
         direct_block,
@@ -1839,6 +1872,8 @@ pub(super) fn emit_operation<'fb>(
 ) -> Option<ir::Value> {
     match operation {
         InstrCodegen::CalleeFunctionId(_) => None,
+        InstrCodegen::DirectFunctionIdGuardTest(_)
+        | InstrCodegen::DirectReceiverTypeVersionGuardTest(_) => None,
         InstrCodegen::Tuple(_) => None,
         InstrCodegen::Call(_) => None,
         InstrCodegen::CallDirect(_) => None,

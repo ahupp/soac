@@ -19,7 +19,6 @@ Python-level runtime support module for lowered SOAC programs. It exposes runtim
 - Builtin/runtime aliases: binds selected builtins, typing objects, and `soac.sim` operation helpers into stable runtime names.
 - `_unsupported_frame_builtin`: raises for frame-sensitive builtins (`locals`, `eval`, `exec`) that transformed code cannot support directly.
 - `tuple_values`, `tuple_from_iter`, `eval_string_literal`, `__deepcopy__`, `templatelib_Template`, and `templatelib_Interpolation`: simple construction/evaluation helpers used by lowered code.
-- `load_deleted_name`: raises when a deleted-name sentinel is loaded.
 - `bb_trace_enter`: optional basic-block trace printer controlled by `SOAC_EXEC_TRACE`.
 - Generator support helpers: `_yieldfrom_cell_value`, `_current_yieldfrom`, `_is_cancelled_error`, `_reraise_control_flow`, `_clear_cell`, `_mark_closed`, `_normalize_throw_exc`, and `_current_throw_context`.
 - `ClosureGenerator` methods: initialize generator state, implement iteration/send/throw/close, propagate cancellation/control-flow, and expose `gi_yieldfrom`.
@@ -39,4 +38,3 @@ Python-level runtime support module for lowered SOAC programs. It exposes runtim
 - `soac-pyo3/src/jit_runtime.rs`
 - `soac_py/src/soac/sim.py`
 - `docs/RUNTIME_FUNCTIONS.md`
-

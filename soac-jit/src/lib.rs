@@ -1542,9 +1542,8 @@ pub unsafe fn register_function_owner_types_for_module_keys(
     register_function_owner_types_for_globals(globals, module_name, indexed_module_keys)
 }
 
-unsafe fn ensure_clif_vectorcall_compiled(
+unsafe fn ensure_clif_direct_entries_compiled(
     _py: Python<'_>,
-    callable: *mut ffi::PyObject,
     data: &mut PyFunctionJitExtra,
 ) -> Result<(), ()> {
     if data.function_env.compiled_function.is_none() {
@@ -1715,6 +1714,15 @@ unsafe fn ensure_clif_vectorcall_compiled(
         );
         return Err(());
     }
+    Ok(())
+}
+
+unsafe fn ensure_clif_vectorcall_compiled(
+    py: Python<'_>,
+    callable: *mut ffi::PyObject,
+    data: &mut PyFunctionJitExtra,
+) -> Result<(), ()> {
+    unsafe { ensure_clif_direct_entries_compiled(py, data)? };
     if data.compiled_vectorcall_entry.is_none() {
         let param_count = data.binding_plan.param_count();
         let entry = match data
@@ -2095,6 +2103,74 @@ pub(crate) unsafe extern "C" fn vectorcall_compile_function_env(
             ptr::null_mut()
         }
     }
+}
+
+pub(crate) unsafe extern "C" fn direct_compile_function_env(
+    callable: *mut c_void,
+    data_ptr: *mut c_void,
+) -> *mut c_void {
+    match panic::catch_unwind(AssertUnwindSafe(|| {
+        if callable.is_null()
+            || data_ptr.is_null()
+            || ffi::PyFunction_Check(callable as *mut ffi::PyObject) == 0
+        {
+            ffi::PyErr_SetString(
+                ffi::PyExc_RuntimeError,
+                b"invalid direct function env compile input\0".as_ptr() as *const i8,
+            );
+            return ptr::null_mut();
+        }
+        let py = Python::assume_attached();
+        let data = &mut *(data_ptr as *mut PyFunctionJitExtra);
+        match ensure_clif_direct_entries_compiled(py, data) {
+            Ok(()) => data.function_env_ptr,
+            Err(()) => ptr::null_mut(),
+        }
+    })) {
+        Ok(value) => value,
+        Err(payload) => {
+            let message = format!(
+                "panic in direct_compile_function_env: {}",
+                panic_payload_to_string(payload)
+            );
+            if let Ok(c_msg) = CString::new(message) {
+                ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
+            } else {
+                ffi::PyErr_SetString(
+                    ffi::PyExc_RuntimeError,
+                    b"panic in direct_compile_function_env\0".as_ptr() as *const i8,
+                );
+            }
+            ptr::null_mut()
+        }
+    }
+}
+
+pub(crate) unsafe fn register_clif_direct_metadata(
+    function: *mut ffi::PyObject,
+    function_id: FunctionId,
+    module_runtime: jit::ModuleRuntimeContext,
+) -> Result<(), ()> {
+    if ffi::PyFunction_Check(function) == 0 {
+        ffi::PyErr_SetString(
+            ffi::PyExc_TypeError,
+            b"register_clif_direct_metadata expects a Python function\0".as_ptr() as *const c_char,
+        );
+        return Err(());
+    }
+    let _watcher = function_owner_type_registry()?;
+    let data_ptr = make_clif_function_data(function, function_id, module_runtime)?;
+    if PyFunction_SetSoacMetadata(
+        function,
+        function_id.packed(),
+        data_ptr,
+        Some(free_clif_function_data),
+    ) != 0
+    {
+        free_clif_function_data(data_ptr);
+        return Err(());
+    }
+    Ok(())
 }
 
 pub unsafe fn register_clif_vectorcall(

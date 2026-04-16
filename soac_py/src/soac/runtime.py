@@ -75,13 +75,6 @@ def _unsupported_frame_builtin(*args, **kwargs):
     )
 
 
-globals = _unsupported_frame_builtin
-locals = _unsupported_frame_builtin
-eval = _unsupported_frame_builtin
-# `exec` is a keyword, so expose soac.runtime.exec through the module dict.
-vars(_sys.modules[__name__])["exec"] = _unsupported_frame_builtin
-
-
 def tuple_from_iter(value):
     return _builtins.tuple(value)
 
@@ -136,11 +129,6 @@ def templatelib_Template(*parts):
 
 def templatelib_Interpolation(value, expr_text, conversion, format_spec):
     return _templatelib_Interpolation_type(value, expr_text, conversion, format_spec)
-
-
-def load_deleted_name(name, value):
-    del name
-    return value
 
 
 def raise_deleted_name(name):
@@ -1146,3 +1134,13 @@ class _AwaitIterWrapper:
 
 
 _SOAC_RUNTIME_READY = True
+
+# These public runtime names intentionally fail when user code tries to use
+# frame-sensitive builtins. Keep the rebinding at the end: transformed
+# `soac.runtime` module init emits internal `globals()` calls while building
+# classes and annotation defaults, and those must still resolve to builtins.
+globals = _unsupported_frame_builtin
+locals = _unsupported_frame_builtin
+eval = _unsupported_frame_builtin
+# `exec` is a keyword, so expose soac.runtime.exec through the module dict.
+vars(_sys.modules[__name__])["exec"] = _unsupported_frame_builtin

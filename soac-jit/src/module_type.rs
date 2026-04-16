@@ -714,7 +714,7 @@ fn build_counter_storage(
     ))
 }
 
-fn build_module_constant_objects(
+pub(crate) fn build_module_constant_objects(
     py: Python<'_>,
     codegen_constants: &ModuleCodegenConstants,
     module_name: &str,
@@ -747,6 +747,44 @@ pub fn build_shared_state_for_inspection(
         package_name,
         HashMap::new(),
     )
+}
+
+pub fn build_shared_state_for_inspection_with_placeholder_constants(
+    py: Python<'_>,
+    lowered_module: BlockPyModule<CodegenModuleShape>,
+    module_name: &str,
+    package_name: &str,
+) -> PyResult<Arc<SharedModuleState>> {
+    let function_index_by_id = build_function_index_by_id(&lowered_module)?;
+    let (counter_slots_by_id, counter_values, top_value_counters) =
+        build_counter_storage(&lowered_module.counter_defs)?;
+    let codegen_constants = if module_name == "soac.runtime" {
+        ModuleCodegenConstants::collect_from_runtime_module(&lowered_module)
+    } else {
+        ModuleCodegenConstants::collect_from_module(&lowered_module)
+    };
+    let module_constant_objs = (0..codegen_constants.len())
+        .map(|_| py.None())
+        .collect::<Vec<_>>();
+    let inline_plan = plan_inline_candidates(&lowered_module);
+    Ok(Arc::new(SharedModuleState {
+        lowered_module,
+        inline_plan,
+        module_name: module_name.to_string(),
+        package_name: package_name.to_string(),
+        source_hash: 0,
+        codegen_constants,
+        storage_instance_key: allocate_shared_module_state_storage_key(),
+        function_index_by_id,
+        original_code_by_function_id: HashMap::new(),
+        module_constant_objs,
+        runtime_name_cache: build_runtime_name_cache(),
+        counter_slots_by_id,
+        counter_values,
+        top_value_counters,
+        precompiled_module_runtime: OnceLock::new(),
+        jit_module_plan: OnceLock::new(),
+    }))
 }
 
 #[cfg(test)]

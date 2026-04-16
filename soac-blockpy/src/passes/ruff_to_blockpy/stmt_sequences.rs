@@ -1,6 +1,8 @@
 use super::stmt_lowering::{lower_instr_into_with_expr, plan_instr_head_for_blockpy};
 use super::*;
-use crate::block_py::{BlockTerm, Instr, TermRaise};
+use crate::block_py::{
+    BlockTerm, Call, CallArgPositional, ExprAttribute, Instr, TermRaise, WithMeta,
+};
 use crate::passes::ast_to_ast::context::Context;
 use crate::passes::InstrRuff;
 
@@ -269,6 +271,116 @@ where
     )
 }
 
+fn synthetic_name_expr(name: &str) -> InstrRuff {
+    crate::passes::ast_to_instr::from_ast_expr(py_expr!("{name:id}", name = name))
+}
+
+fn runtime_helper_expr(name: &'static str) -> InstrRuff {
+    InstrRuff::ExprAttribute(
+        ExprAttribute::new(
+            synthetic_name_expr("__soac__"),
+            ast::Identifier::new(name, Default::default()),
+            ast::ExprContext::Load,
+        )
+        .with_meta(crate::block_py::Meta::synthetic()),
+    )
+}
+
+fn synthetic_assign(target: InstrRuff, value: InstrRuff) -> InstrRuff {
+    crate::block_py::StmtAssign::new(vec![target], value)
+        .with_meta(crate::block_py::Meta::synthetic())
+        .into()
+}
+
+fn stop_iteration_handler_with_body(body: Vec<InstrRuff>) -> ast::ExceptHandler {
+    let ast::Stmt::Try(mut try_stmt) = py_stmt!(
+        r#"
+try:
+    pass
+except StopIteration:
+    pass
+"#
+    ) else {
+        unreachable!("synthetic StopIteration handler should parse as try statement");
+    };
+    assert_eq!(
+        try_stmt.handlers.len(),
+        1,
+        "synthetic StopIteration handler should contain one handler"
+    );
+    let handler = try_stmt.handlers.remove(0);
+    let ast::ExceptHandler::ExceptHandler(mut handler) = handler;
+    handler.body = body
+        .into_iter()
+        .map(crate::passes::ast_to_instr::into_ast_stmt)
+        .collect();
+    ast::ExceptHandler::ExceptHandler(handler)
+}
+
+fn expand_sync_for_stmt(
+    for_stmt: crate::block_py::StmtFor<InstrRuff>,
+    iter_name: &str,
+    tmp_name: &str,
+    assign_body: Vec<InstrRuff>,
+) -> Vec<InstrRuff> {
+    assert!(
+        !for_stmt.is_async,
+        "async for still lowers through the sentinel helper"
+    );
+
+    let iter_value: InstrRuff = Call::new(
+        runtime_helper_expr("iter"),
+        vec![CallArgPositional::Positional(*for_stmt.iter)],
+        Vec::new(),
+    )
+    .with_meta(crate::block_py::Meta::synthetic())
+    .into();
+    let iter_assign = synthetic_assign(synthetic_name_expr(&iter_name), iter_value);
+
+    let next_attr: InstrRuff = ExprAttribute::new(
+        synthetic_name_expr(&iter_name),
+        ast::Identifier::new("__next__", Default::default()),
+        ast::ExprContext::Load,
+    )
+    .with_meta(crate::block_py::Meta::synthetic())
+    .into();
+    let next_call: InstrRuff = Call::new(next_attr, Vec::new(), Vec::new())
+        .with_meta(crate::block_py::Meta::synthetic())
+        .into();
+    let next_assign = synthetic_assign(synthetic_name_expr(&tmp_name), next_call);
+
+    let mut stop_body = for_stmt.orelse;
+    stop_body.push(
+        crate::block_py::StmtBreak::new()
+            .with_meta(crate::block_py::Meta::synthetic())
+            .into(),
+    );
+
+    let fetch_next = crate::block_py::StmtTry::new(
+        vec![next_assign],
+        vec![stop_iteration_handler_with_body(stop_body)],
+        Vec::new(),
+        Vec::new(),
+        false,
+    )
+    .with_meta(crate::block_py::Meta::synthetic())
+    .into();
+
+    let mut while_body = vec![fetch_next];
+    while_body.extend(assign_body);
+    while_body.extend(for_stmt.body);
+
+    let while_stmt: InstrRuff = crate::block_py::StmtWhile::new(
+        crate::passes::ast_to_instr::from_ast_expr(py_expr!("True")),
+        while_body,
+        Vec::new(),
+    )
+    .with_meta(crate::block_py::Meta::synthetic())
+    .into();
+
+    vec![iter_assign, while_stmt]
+}
+
 pub(crate) fn lower_stmt_sequence_with_state<E>(
     context: &Context,
     stmts: &[InstrRuff],
@@ -376,8 +488,6 @@ where
             StmtSequenceHeadPlan::For(for_stmt) => {
                 let iter_name = name_gen.next_tmp_name("iter");
                 let tmp_name = name_gen.next_tmp_name("tmp");
-                let loop_check_label = name_gen.next_block_name();
-                let loop_continue_label = loop_check_label.clone();
                 let assign_body = build_for_target_assign_body(
                     *for_stmt.target.clone(),
                     crate::passes::ast_to_instr::from_ast_expr(py_expr!(
@@ -386,6 +496,21 @@ where
                     )),
                     tmp_name.as_str(),
                 );
+                if !for_stmt.is_async {
+                    let mut expanded = linear;
+                    expanded.extend(expand_sync_for_stmt(
+                        for_stmt,
+                        iter_name.as_str(),
+                        tmp_name.as_str(),
+                        assign_body,
+                    ));
+                    expanded.extend_from_slice(&stmts[index + 1..]);
+                    return lower_instr_stmt_sequence_with_state(
+                        context, &expanded, targets, blocks, name_gen,
+                    );
+                }
+                let loop_check_label = name_gen.next_block_name();
+                let loop_continue_label = loop_check_label.clone();
                 return lower_for_stmt_sequence_head(
                     context,
                     name_gen,

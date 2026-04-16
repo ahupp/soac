@@ -957,46 +957,36 @@ fn state_for_py_facts(facts: PyObjFacts) -> LocalRefState {
 
 #[derive(Clone, Debug, Default)]
 struct LocalLiveness {
-    live_in_by_block: Vec<LocalBitSet>,
+    live_in_by_block: HashMap<BlockLabel, LocalBitSet>,
 }
 
 impl LocalLiveness {
     fn live_in(&self, label: BlockLabel) -> Option<&LocalBitSet> {
-        self.live_in_by_block.get(label.index())
+        self.live_in_by_block.get(&label)
     }
 
-    fn into_hash_map(self, labels: &[BlockLabel]) -> HashMap<BlockLabel, HashSet<LocalLocation>> {
-        labels
-            .iter()
-            .copied()
-            .filter_map(|label| {
-                self.live_in_by_block
-                    .get(label.index())
-                    .map(|live_in| (label, live_in.to_hash_set()))
-            })
+    fn into_hash_map(self, _labels: &[BlockLabel]) -> HashMap<BlockLabel, HashSet<LocalLocation>> {
+        self.live_in_by_block
+            .into_iter()
+            .map(|(label, live_in)| (label, live_in.to_hash_set()))
             .collect()
     }
 }
 
 #[derive(Clone, Debug, Default)]
 struct LocalMustBound {
-    must_bound_in_by_block: Vec<LocalBitSet>,
+    must_bound_in_by_block: HashMap<BlockLabel, LocalBitSet>,
 }
 
 impl LocalMustBound {
     fn live_in(&self, label: BlockLabel) -> Option<&LocalBitSet> {
-        self.must_bound_in_by_block.get(label.index())
+        self.must_bound_in_by_block.get(&label)
     }
 
-    fn into_hash_map(self, labels: &[BlockLabel]) -> HashMap<BlockLabel, HashSet<LocalLocation>> {
-        labels
-            .iter()
-            .copied()
-            .filter_map(|label| {
-                self.must_bound_in_by_block
-                    .get(label.index())
-                    .map(|must_bound| (label, must_bound.to_hash_set()))
-            })
+    fn into_hash_map(self, _labels: &[BlockLabel]) -> HashMap<BlockLabel, HashSet<LocalLocation>> {
+        self.must_bound_in_by_block
+            .into_iter()
+            .map(|(label, must_bound)| (label, must_bound.to_hash_set()))
             .collect()
     }
 }
@@ -1130,9 +1120,13 @@ fn compute_local_liveness(
     let successors_by_block = function
         .blocks
         .iter()
-        .map(block_successors)
-        .collect::<Vec<_>>();
-    let mut live_in_by_block = vec![LocalBitSet::empty(local_count); function.blocks.len()];
+        .map(|block| (block.label, block_successors(block)))
+        .collect::<HashMap<_, _>>();
+    let mut live_in_by_block = function
+        .blocks
+        .iter()
+        .map(|block| (block.label, LocalBitSet::empty(local_count)))
+        .collect::<HashMap<_, _>>();
 
     let mut changed = true;
     while changed {
@@ -1142,8 +1136,11 @@ fn compute_local_liveness(
                 .get(&block.label)
                 .expect("liveness effects should exist for every block");
             let mut live_out = LocalBitSet::empty(local_count);
-            for successor in &successors_by_block[block.label.index()] {
-                if let Some(successor_live_in) = live_in_by_block.get(successor.index()) {
+            for successor in successors_by_block
+                .get(&block.label)
+                .expect("liveness successors should exist for every block")
+            {
+                if let Some(successor_live_in) = live_in_by_block.get(successor) {
                     live_out.union_with(successor_live_in);
                 }
             }
@@ -1153,7 +1150,9 @@ fn compute_local_liveness(
             let defs = LocalBitSet::from_locations(local_count, effects.defs.iter().copied());
             live_out.difference_with(&defs);
             new_live_in.union_with(&live_out);
-            let entry = &mut live_in_by_block[block.label.index()];
+            let entry = live_in_by_block
+                .get_mut(&block.label)
+                .expect("liveness entry should exist for every block");
             if *entry != new_live_in {
                 *entry = new_live_in;
                 changed = true;
@@ -1178,13 +1177,19 @@ fn compute_local_must_bound(
     let successors_by_block = function
         .blocks
         .iter()
-        .map(block_successors)
-        .collect::<Vec<_>>();
-    let mut predecessors_by_block = vec![Vec::new(); function.blocks.len()];
-    for (source_index, successors) in successors_by_block.iter().enumerate() {
-        let source = labels[source_index];
+        .map(|block| (block.label, block_successors(block)))
+        .collect::<HashMap<_, _>>();
+    let mut predecessors_by_block = labels
+        .iter()
+        .copied()
+        .map(|label| (label, Vec::new()))
+        .collect::<HashMap<_, _>>();
+    for (source, successors) in &successors_by_block {
         for successor in successors {
-            predecessors_by_block[successor.index()].push(source);
+            predecessors_by_block
+                .get_mut(successor)
+                .expect("must-bound predecessor target should exist")
+                .push(*source);
         }
     }
 
@@ -1201,26 +1206,34 @@ fn compute_local_must_bound(
         .iter()
         .copied()
         .map(|label| {
-            if label == entry_label {
+            let state = if label == entry_label {
                 entry_bound.clone()
             } else {
                 LocalBitSet::full(local_count)
-            }
+            };
+            (label, state)
         })
-        .collect::<Vec<_>>();
+        .collect::<HashMap<_, _>>();
     let mut must_bound_out_by_block = labels
         .iter()
         .copied()
         .map(|label| {
-            let initial_in = &must_bound_in_by_block[label.index()];
-            transfer_must_bound_through_block(
+            let initial_in = must_bound_in_by_block
+                .get(&label)
+                .expect("must-bound entry should exist for every block");
+            let out = transfer_must_bound_through_block(
                 function,
-                &function.blocks[label.index()],
+                function
+                    .blocks
+                    .iter()
+                    .find(|block| block.label == label)
+                    .expect("must-bound block should exist for label"),
                 initial_in,
                 &owned_cell_locations,
-            )
+            );
+            (label, out)
         })
-        .collect::<Vec<_>>();
+        .collect::<HashMap<_, _>>();
 
     let mut changed = true;
     while changed {
@@ -1229,13 +1242,20 @@ fn compute_local_must_bound(
             let new_in = if block.label == entry_label {
                 entry_bound.clone()
             } else {
-                let predecessors = &predecessors_by_block[block.label.index()];
+                let predecessors = predecessors_by_block
+                    .get(&block.label)
+                    .expect("must-bound predecessors should exist for every block");
                 if predecessors.is_empty() {
                     LocalBitSet::empty(local_count)
                 } else {
-                    let mut intersection = must_bound_out_by_block[predecessors[0].index()].clone();
+                    let mut intersection = must_bound_out_by_block
+                        .get(&predecessors[0])
+                        .expect("must-bound predecessor out should exist")
+                        .clone();
                     for predecessor in &predecessors[1..] {
-                        let predecessor_out = &must_bound_out_by_block[predecessor.index()];
+                        let predecessor_out = must_bound_out_by_block
+                            .get(predecessor)
+                            .expect("must-bound predecessor out should exist");
                         intersection.intersect_with(predecessor_out);
                     }
                     intersection
@@ -1243,12 +1263,16 @@ fn compute_local_must_bound(
             };
             let new_out =
                 transfer_must_bound_through_block(function, block, &new_in, &owned_cell_locations);
-            let in_entry = &mut must_bound_in_by_block[block.label.index()];
+            let in_entry = must_bound_in_by_block
+                .get_mut(&block.label)
+                .expect("must-bound in entry should exist for every block");
             if *in_entry != new_in {
                 *in_entry = new_in;
                 changed = true;
             }
-            let out_entry = &mut must_bound_out_by_block[block.label.index()];
+            let out_entry = must_bound_out_by_block
+                .get_mut(&block.label)
+                .expect("must-bound out entry should exist for every block");
             if *out_entry != new_out {
                 *out_entry = new_out;
                 changed = true;
@@ -1765,9 +1789,11 @@ fn expected_release_actions(
 #[cfg(test)]
 mod tests {
     use super::{
+        compute_function_local_live_ins, compute_function_local_must_bound_ins,
         forwarded_locations, plan_ownership_effects, validate_ownership_effects, LocalRefState,
         RefcountActionKind, RefcountReleaseReason,
     };
+    use crate::block_py::cfg::RelabelBlockTargets;
     use crate::block_py::{BlockArg, BlockLabel, BlockTerm, LocalLocation};
     use crate::lower_python_to_blockpy_for_testing;
     use crate::passes::infer_module_value_facts;
@@ -2068,6 +2094,59 @@ def outer():
             forwarded,
             HashSet::from([LocalLocation(10), LocalLocation(3)]),
             "explicit edge args should preserve the source local location rather than the tail target param name",
+        );
+    }
+
+    #[test]
+    fn local_dataflow_accepts_sparse_block_labels() {
+        let lowered = lower_python_to_blockpy_for_testing(
+            r#"
+def f(flag):
+    x = []
+    if flag:
+        x = [1]
+    return x
+"#,
+        )
+        .expect("transform should succeed")
+        .codegen_module;
+        let mut function = lowered
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "f")
+            .expect("missing lowered function f")
+            .clone();
+        let relabel = function
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(index, block)| (block.label, BlockLabel::from_index(index * 3)))
+            .collect::<HashMap<_, _>>();
+        for block in &mut function.blocks {
+            block.label = *relabel
+                .get(&block.label)
+                .expect("test relabel should cover block");
+            block.term.relabel_targets(&relabel);
+            if let Some(exc_edge) = &mut block.exc_edge {
+                exc_edge.target = *relabel
+                    .get(&exc_edge.target)
+                    .expect("test relabel should cover exception target");
+            }
+        }
+
+        let labels = function
+            .blocks
+            .iter()
+            .map(|block| block.label)
+            .collect::<HashSet<_>>();
+
+        let live_ins = compute_function_local_live_ins(&function);
+        let must_bound_ins = compute_function_local_must_bound_ins(&function);
+
+        assert_eq!(live_ins.keys().copied().collect::<HashSet<_>>(), labels);
+        assert_eq!(
+            must_bound_ins.keys().copied().collect::<HashSet<_>>(),
+            labels
         );
     }
 

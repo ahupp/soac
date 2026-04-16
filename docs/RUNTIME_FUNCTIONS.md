@@ -163,6 +163,7 @@ Registered call targets implemented outside `specialized_helpers.rs`:
 ```text
 dp_jit_vectorcall_bind_direct_args
 dp_jit_vectorcall_compile_function_env
+dp_jit_direct_compile_function_env
 ```
 
 ## Synthetic Inter-Pass Markers
@@ -207,7 +208,6 @@ eval_string_literal
 __deepcopy__
 templatelib_Template
 templatelib_Interpolation
-load_deleted_name
 bb_trace_enter
 _yieldfrom_cell_value
 _current_yieldfrom

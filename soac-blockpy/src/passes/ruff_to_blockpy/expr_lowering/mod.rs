@@ -8,7 +8,6 @@ use crate::passes::ast_to_ast::string_templates::lower_string_templates_in_instr
 use crate::passes::ruff_to_blockpy::stmt_lowering::BlockPyStmtBuilder;
 use crate::passes::ruff_to_blockpy::LoopContext;
 use crate::passes::InstrRuff;
-use crate::py_expr;
 use ruff_python_ast::{self as ast};
 use ruff_text_size::TextRange;
 
@@ -48,13 +47,6 @@ pub(crate) trait RuffToBlockPyExpr:
         op: ast::Operator,
         left: Self,
         right: Self,
-    ) -> Self;
-
-    fn load_deleted_name(
-        node_index: ast::AtomicNodeIndex,
-        range: TextRange,
-        name: String,
-        value: Self,
     ) -> Self;
 
     fn get_attr(
@@ -127,23 +119,6 @@ impl RuffToBlockPyExpr for InstrWithAwaitAndYield {
         operation::BinOp::new(kind, Box::new(left), Box::new(right))
             .with_meta(meta)
             .into()
-    }
-
-    fn load_deleted_name(
-        node_index: ast::AtomicNodeIndex,
-        range: TextRange,
-        name: String,
-        value: Self,
-    ) -> Self {
-        Self::helper_call(
-            node_index,
-            range,
-            "load_deleted_name",
-            vec![
-                InstrWithAwaitAndYield::from_ast_expr(py_expr!("{name:literal}", name = name)),
-                value,
-            ],
-        )
     }
 
     fn get_attr(

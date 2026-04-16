@@ -526,8 +526,27 @@ pub fn instantiate_bb_function(
     entry.setattr("__module__", module_name)?;
     // soac.runtime's source helpers are the runtime ABI for other transformed
     // modules. Keep them on their source implementation so calls from generated
-    // code do not switch onto the runtime module's function environment.
-    if !keep_source_runtime_helper {
+    // code do not implicitly replace their vectorcall entry. Still attach full
+    // direct-call metadata so profiled generated code can explicitly compile
+    // and call runtime class methods such as range.__iter__ and IterRange.__next__.
+    if keep_source_runtime_helper {
+        let owned_runtime =
+            unsafe { clone_module_runtime_context(module_runtime) }.map_err(|_| {
+                if unsafe { ffi::PyErr_Occurred() }.is_null() {
+                    PyRuntimeError::new_err("failed to clone module runtime context")
+                } else {
+                    PyErr::fetch(py)
+                }
+            })?;
+        unsafe {
+            crate::register_clif_direct_metadata(
+                entry.as_ptr(),
+                function.function_id,
+                owned_runtime,
+            )
+        }
+        .map_err(|()| PyErr::fetch(py))?;
+    } else {
         register_jit_vectorcall(py, &entry, function.function_id, module_runtime)?;
     }
     Ok(entry.unbind())

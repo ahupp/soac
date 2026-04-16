@@ -2321,7 +2321,6 @@ def f():
     let lowered = TrackedLowering::new(source);
     let blockpy_module = lowered.blockpy_module();
     let f = blockpy_function_by_name(&blockpy_module, "f");
-    assert!(!blockpy_function_has_root_name(f, "__dp_load_deleted_name"));
     assert!(!blockpy_function_has_store_name(f, "x"));
 
     assert!(
@@ -3230,7 +3229,11 @@ def run(items):
         .expect("bb module should be available");
     let run = function_by_name(&bb_module, "run");
     assert!(
-        function_or_constants_use_text(&bb_module, run, "next_or_sentinel"),
+        !function_or_constants_use_text(&bb_module, run, "next_or_sentinel"),
+        "{run:?}"
+    );
+    assert!(
+        function_or_constants_use_text(&bb_module, run, "StopIteration"),
         "{run:?}"
     );
     assert!(

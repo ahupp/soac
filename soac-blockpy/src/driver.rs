@@ -361,10 +361,19 @@ fn finish_codegen_module_with_tracker(
             let escape_summary = passes::summarize_module_escapes(&bb_codegen);
             passes::plan_module_inlining(&escape_summary)
         });
+        let scalar_replacement_stats =
+            pass_tracker.record_timing("scalar_replace_constructor_allocations", || {
+                passes::scalar_replace_non_escaping_constructor_allocations(
+                    &mut bb_codegen,
+                    &initial_inline_plan,
+                )
+            });
         let inline_rewrite_stats = pass_tracker.record_timing("inline_direct_call_stores", || {
             passes::inline_simple_direct_call_stores(&mut bb_codegen, &initial_inline_plan)
         });
-        if inline_rewrite_stats.rewritten_stores != 0 {
+        if scalar_replacement_stats.replaced_allocations != 0
+            || inline_rewrite_stats.rewritten_stores != 0
+        {
             pass_tracker.record_timing("validate_codegen_instr_ids_after_inline", || {
                 passes::validate_codegen_instr_ids(&bb_codegen).map_err(anyhow::Error::msg)
             })?;

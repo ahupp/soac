@@ -1,8 +1,7 @@
 use crate::block_py::pretty::BlockPyPrettyPrint;
 use crate::block_py::{
-    instr_any, BlockPyFunction, BlockPyModule, BlockTerm, CallArgPositional, FunctionId, HasMeta,
-    InstrCodegen, InstrCodegenOp, InstrId, InstrResolved, Literal, LocalLocation, NameLike,
-    NameLocation,
+    instr_any, Block, BlockPyFunction, BlockPyModule, BlockTerm, FunctionId, HasMeta, InstrCodegen,
+    InstrCodegenOp, InstrId, InstrResolved, Literal, LocalLocation, NameLike, NameLocation,
 };
 use crate::CodegenModuleShape;
 use std::collections::{HashMap, HashSet};
@@ -243,6 +242,12 @@ fn summarize_non_escaping_constructor_allocations(
     straightline_constructor_ids: &HashSet<FunctionId>,
 ) -> Vec<NonEscapingConstructorAllocationSummary> {
     let mut allocations = Vec::new();
+    let block_by_label = function
+        .blocks
+        .iter()
+        .map(|block| (block.label, block))
+        .collect::<HashMap<_, _>>();
+    let normal_predecessor_counts = normal_predecessor_counts(function);
     for block in &function.blocks {
         for (instr_index, instr) in block.body.iter().enumerate() {
             let InstrCodegenOp::Store(store) = instr else {
@@ -265,6 +270,8 @@ fn summarize_non_escaping_constructor_allocations(
                 call.meta().instr_id,
                 &block.body[instr_index + 1..],
                 &block.term,
+                &block_by_label,
+                &normal_predecessor_counts,
             ) else {
                 continue;
             };
@@ -282,6 +289,8 @@ fn summarize_constructor_allocation_uses_in_block(
     call_instr_id: Option<InstrId>,
     remaining_body: &[InstrCodegen],
     term: &BlockTerm<InstrCodegen>,
+    block_by_label: &HashMap<crate::block_py::BlockLabel, &Block<InstrCodegen>>,
+    normal_predecessor_counts: &HashMap<crate::block_py::BlockLabel, usize>,
 ) -> Option<NonEscapingConstructorAllocationSummary> {
     let mut summary = NonEscapingConstructorAllocationSummary {
         local_name,
@@ -291,18 +300,76 @@ fn summarize_constructor_allocation_uses_in_block(
         field_reads: Vec::new(),
         field_writes: Vec::new(),
     };
-    for instr in remaining_body {
-        if let InstrCodegenOp::Store(store) = instr {
-            if store.name.location.as_local() == Some(local_location) {
+    let mut aliases = HashSet::from([local_location]);
+    let mut current_body = remaining_body;
+    let mut current_term = term;
+    let mut visited_jump_targets = HashSet::new();
+    loop {
+        for instr in current_body {
+            if let InstrCodegenOp::Store(store) = instr {
+                if store.name.location.as_local() == Some(local_location) {
+                    break;
+                }
+                if let Some(target_location) = store.name.location.as_local() {
+                    if is_local_alias_load(&store.value, &aliases) {
+                        aliases.insert(target_location);
+                        continue;
+                    }
+                    aliases.remove(&target_location);
+                }
+            }
+            if let InstrCodegenOp::Del(del) = instr {
+                if let Some(location) = del.name.location.as_local() {
+                    if aliases.remove(&location) {
+                        continue;
+                    }
+                }
+            }
+            if !record_allowed_constructor_local_use(module, &aliases, instr, &mut summary) {
+                return None;
+            }
+        }
+        match current_term {
+            BlockTerm::Jump(edge)
+                if edge.args.is_empty()
+                    && normal_predecessor_counts.get(&edge.target).copied() == Some(1) =>
+            {
+                if !visited_jump_targets.insert(edge.target) {
+                    return None;
+                }
+                let target = block_by_label.get(&edge.target)?;
+                if !target.params.is_empty() {
+                    return None;
+                }
+                current_body = target.body.as_slice();
+                current_term = &target.term;
+            }
+            BlockTerm::IfTerm(term)
+                if direct_receiver_type_guard_uses_alias(&term.test, &aliases)
+                    && normal_predecessor_counts.get(&term.then_label).copied() == Some(1) =>
+            {
+                if !visited_jump_targets.insert(term.then_label) {
+                    return None;
+                }
+                let target = block_by_label.get(&term.then_label)?;
+                if !target.params.is_empty() {
+                    return None;
+                }
+                current_body = target.body.as_slice();
+                current_term = &target.term;
+            }
+            _ => {
+                if !record_allowed_constructor_local_use_in_term(
+                    module,
+                    &aliases,
+                    current_term,
+                    &mut summary,
+                ) {
+                    return None;
+                }
                 break;
             }
         }
-        if !record_allowed_constructor_local_use(module, local_location, instr, &mut summary) {
-            return None;
-        }
-    }
-    if !record_allowed_constructor_local_use_in_term(module, local_location, term, &mut summary) {
-        return None;
     }
     if summary.field_reads.is_empty() && summary.field_writes.is_empty() {
         return None;
@@ -310,39 +377,77 @@ fn summarize_constructor_allocation_uses_in_block(
     Some(summary)
 }
 
+fn normal_predecessor_counts(
+    function: &BlockPyFunction<CodegenModuleShape>,
+) -> HashMap<crate::block_py::BlockLabel, usize> {
+    let mut counts = HashMap::new();
+    for block in &function.blocks {
+        match &block.term {
+            BlockTerm::Jump(edge) => {
+                *counts.entry(edge.target).or_insert(0) += 1;
+            }
+            BlockTerm::IfTerm(term) => {
+                *counts.entry(term.then_label).or_insert(0) += 1;
+                *counts.entry(term.else_label).or_insert(0) += 1;
+            }
+            BlockTerm::BranchTable(term) => {
+                for target in &term.targets {
+                    *counts.entry(*target).or_insert(0) += 1;
+                }
+                *counts.entry(term.default_label).or_insert(0) += 1;
+            }
+            BlockTerm::Raise(_) | BlockTerm::Return(_) => {}
+        }
+    }
+    counts
+}
+
+fn direct_receiver_type_guard_uses_alias(
+    instr: &InstrCodegen,
+    aliases: &HashSet<LocalLocation>,
+) -> bool {
+    let InstrCodegenOp::DirectReceiverTypeVersionGuardTest(test) = instr else {
+        return false;
+    };
+    is_local_alias_load(&test.value, aliases)
+}
+
 fn record_allowed_constructor_local_use_in_term(
     module: &BlockPyModule<CodegenModuleShape>,
-    local_location: LocalLocation,
+    aliases: &HashSet<LocalLocation>,
     term: &BlockTerm<InstrCodegen>,
     summary: &mut NonEscapingConstructorAllocationSummary,
 ) -> bool {
     match term {
         BlockTerm::Return(value) => {
-            record_allowed_constructor_local_use(module, local_location, value, summary)
+            record_allowed_constructor_local_use(module, aliases, value, summary)
         }
         BlockTerm::IfTerm(term) => {
-            record_allowed_constructor_local_use(module, local_location, &term.test, summary)
+            aliases.is_empty()
+                && record_allowed_constructor_local_use(module, aliases, &term.test, summary)
         }
         BlockTerm::BranchTable(term) => {
-            record_allowed_constructor_local_use(module, local_location, &term.index, summary)
+            aliases.is_empty()
+                && record_allowed_constructor_local_use(module, aliases, &term.index, summary)
         }
-        BlockTerm::Raise(term) => term.exc.as_ref().is_none_or(|exc| {
-            record_allowed_constructor_local_use(module, local_location, exc, summary)
-        }),
-        BlockTerm::Jump(_) => true,
+        BlockTerm::Raise(term) => term
+            .exc
+            .as_ref()
+            .is_none_or(|exc| record_allowed_constructor_local_use(module, aliases, exc, summary)),
+        BlockTerm::Jump(_) => aliases.is_empty(),
     }
 }
 
 fn record_allowed_constructor_local_use(
     module: &BlockPyModule<CodegenModuleShape>,
-    local_location: LocalLocation,
+    aliases: &HashSet<LocalLocation>,
     instr: &InstrCodegen,
     summary: &mut NonEscapingConstructorAllocationSummary,
 ) -> bool {
     match instr {
         InstrCodegenOp::GetAttr(getattr)
-            if is_local_load(&getattr.value, local_location)
-                && !instr_uses_local(&getattr.attr, local_location) =>
+            if is_local_alias_load(&getattr.value, aliases)
+                && !instr_uses_any_local(&getattr.attr, aliases) =>
         {
             let Some(field_name) = constant_string(module, &getattr.attr) else {
                 return false;
@@ -353,9 +458,9 @@ fn record_allowed_constructor_local_use(
             true
         }
         InstrCodegenOp::SetAttr(setattr)
-            if is_local_load(&setattr.value, local_location)
-                && !instr_uses_local(&setattr.attr, local_location)
-                && !instr_uses_local(&setattr.replacement, local_location) =>
+            if is_local_alias_load(&setattr.value, aliases)
+                && !instr_uses_any_local(&setattr.attr, aliases)
+                && !instr_uses_any_local(&setattr.replacement, aliases) =>
         {
             let Some(field_name) = constant_string(module, &setattr.attr) else {
                 return false;
@@ -365,20 +470,27 @@ fn record_allowed_constructor_local_use(
                 .push(ConstructorFieldAccess { field_name });
             true
         }
-        _ => !instr_uses_local(instr, local_location),
+        _ => !instr_uses_any_local(instr, aliases),
     }
 }
 
-fn is_local_load(instr: &InstrCodegen, local_location: LocalLocation) -> bool {
-    matches!(
-        instr,
-        InstrCodegenOp::Load(load) if load.name.location.as_local() == Some(local_location)
-    )
+fn is_local_alias_load(instr: &InstrCodegen, aliases: &HashSet<LocalLocation>) -> bool {
+    let InstrCodegenOp::Load(load) = instr else {
+        return false;
+    };
+    load.name
+        .location
+        .as_local()
+        .is_some_and(|location| aliases.contains(&location))
 }
 
-fn instr_uses_local(instr: &InstrCodegen, local_location: LocalLocation) -> bool {
+fn instr_uses_any_local(instr: &InstrCodegen, aliases: &HashSet<LocalLocation>) -> bool {
     instr_any(instr, |child| match child {
-        InstrCodegenOp::Load(load) => load.name.location.as_local() == Some(local_location),
+        InstrCodegenOp::Load(load) => load
+            .name
+            .location
+            .as_local()
+            .is_some_and(|location| aliases.contains(&location)),
         _ => false,
     })
 }
@@ -429,17 +541,44 @@ fn summarize_straightline_field_initializer(
     })
 }
 
+pub fn straightline_field_initializer_rejection_reason(
+    module: &BlockPyModule<CodegenModuleShape>,
+    function: &BlockPyFunction<CodegenModuleShape>,
+) -> Option<String> {
+    summarize_constructor_with_mode_result(
+        module,
+        function,
+        ConstructorSummaryMode::StraightlineFieldInitializer,
+    )
+    .err()
+}
+
 fn summarize_constructor_with_mode(
     module: &BlockPyModule<CodegenModuleShape>,
     function: &BlockPyFunction<CodegenModuleShape>,
     mode: ConstructorSummaryMode,
 ) -> Option<ConstructorSummary> {
+    summarize_constructor_with_mode_result(module, function, mode).ok()
+}
+
+fn summarize_constructor_with_mode_result(
+    module: &BlockPyModule<CodegenModuleShape>,
+    function: &BlockPyFunction<CodegenModuleShape>,
+    mode: ConstructorSummaryMode,
+) -> Result<ConstructorSummary, String> {
     if !function.names.qualname.ends_with(".__init__") {
-        return None;
+        return Err("function qualname is not a constructor __init__".to_string());
     }
-    let self_param = function.params.params.first()?;
+    let self_param = function
+        .params
+        .params
+        .first()
+        .ok_or_else(|| "constructor has no self parameter".to_string())?;
     if self_param.name != "self" {
-        return None;
+        return Err(format!(
+            "constructor first parameter is {}, not self",
+            self_param.name
+        ));
     }
 
     let mut summary = ConstructorBuilder {
@@ -453,11 +592,7 @@ fn summarize_constructor_with_mode(
         rejected: None,
     };
     summary.scan_function();
-    summary.finish().map(|summary| ConstructorSummary {
-        self_name: summary.self_name,
-        self_location: summary.self_location,
-        field_stores: summary.field_stores,
-    })
+    summary.finish()
 }
 
 struct ConstructorSummary {
@@ -612,11 +747,14 @@ impl ConstructorBuilder<'_> {
         }
     }
 
-    fn finish(self) -> Option<NonEscapingConstructorSummary> {
-        if self.rejected.is_some() || self.field_stores.is_empty() {
-            return None;
+    fn finish(self) -> Result<ConstructorSummary, String> {
+        if let Some(reason) = self.rejected {
+            return Err(reason);
         }
-        Some(NonEscapingConstructorSummary {
+        if self.field_stores.is_empty() {
+            return Err("constructor has no self field stores".to_string());
+        }
+        Ok(ConstructorSummary {
             self_name: self.self_name,
             self_location: self.self_location,
             field_stores: self.field_stores,
@@ -635,7 +773,7 @@ impl ConstructorBuilder<'_> {
 
     fn value_alias(&mut self, instr: &InstrCodegen) -> Option<ValueAlias> {
         let InstrCodegenOp::Load(load) = instr else {
-            return self.checked_load_deleted_alias(instr);
+            return None;
         };
         if load.name.id_str() == self.self_name {
             if let NameLocation::Local(location) = load.name.location {
@@ -670,24 +808,9 @@ impl ConstructorBuilder<'_> {
             }),
             NameLocation::GlobalName
             | NameLocation::Global(_)
-            | NameLocation::RuntimeName
+            | NameLocation::RuntimeName(_)
             | NameLocation::Cell(_) => None,
         }
-    }
-
-    fn checked_load_deleted_alias(&mut self, instr: &InstrCodegen) -> Option<ValueAlias> {
-        let InstrCodegenOp::Call(call) = instr else {
-            return None;
-        };
-        if self.constant_load_name(&call.func)? != "load_deleted_name" {
-            return None;
-        }
-        let [CallArgPositional::Positional(_name), CallArgPositional::Positional(value)] =
-            call.args.as_slice()
-        else {
-            return None;
-        };
-        self.value_alias(value)
     }
 
     fn constant_string(&self, instr: &InstrCodegen) -> Option<String> {
@@ -704,22 +827,19 @@ impl ConstructorBuilder<'_> {
         }
     }
 
-    fn constant_load_name(&self, instr: &InstrCodegen) -> Option<String> {
-        let InstrCodegenOp::Load(load) = instr else {
-            return None;
-        };
-        let constant_index = load.name.location.as_constant()? as usize;
-        match self.module.module_constants.get(constant_index)? {
-            InstrResolved::Load(load) => Some(load.name.id_str().to_string()),
-            _ => None,
-        }
-    }
-
     fn is_runtime_none(&self, instr: &InstrCodegen) -> bool {
         let InstrCodegenOp::Load(load) = instr else {
             return false;
         };
-        if load.name.location == NameLocation::RuntimeName && load.name.id_str() == "NONE" {
+        if load.name.id_str() == "NONE"
+            && matches!(
+                load.name.location,
+                NameLocation::RuntimeName(_) | NameLocation::GlobalName | NameLocation::Global(_)
+            )
+        {
+            return true;
+        }
+        if load.name.is_runtime_symbol("NONE") {
             return true;
         }
         let Some(constant_index) = load.name.location.as_constant() else {
@@ -728,7 +848,7 @@ impl ConstructorBuilder<'_> {
         matches!(
             self.module.module_constants.get(constant_index as usize),
             Some(InstrResolved::Load(load))
-                if load.name.location == NameLocation::RuntimeName && load.name.id_str() == "NONE"
+                if load.name.is_runtime_symbol("NONE")
         )
     }
 
@@ -779,7 +899,7 @@ impl ConstructorBuilder<'_> {
             }),
             NameLocation::GlobalName
             | NameLocation::Global(_)
-            | NameLocation::RuntimeName
+            | NameLocation::RuntimeName(_)
             | NameLocation::Cell(_) => None,
         }
     }
@@ -811,13 +931,30 @@ fn instr_uses_self(instr: &InstrCodegen, self_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block_py::ModuleNameGen;
     use crate::block_py::{CallArgPositional, CallDirect};
-    use crate::lower_python_to_blockpy_for_testing;
+    use crate::{
+        lower_python_to_blockpy_for_testing, lower_python_to_blockpy_recorded_with_options,
+        LoweringOptions,
+    };
 
     fn lowered(source: &str) -> BlockPyModule<CodegenModuleShape> {
         lower_python_to_blockpy_for_testing(source)
             .expect("transform should succeed")
             .codegen_module
+    }
+
+    fn lowered_with_runtime_names_as_globals(source: &str) -> BlockPyModule<CodegenModuleShape> {
+        lower_python_to_blockpy_recorded_with_options(
+            source,
+            ModuleNameGen::new(0),
+            LoweringOptions {
+                runtime_names_as_globals: true,
+                pre_optimization_cache_path: None,
+            },
+        )
+        .expect("transform should succeed")
+        .codegen_module
     }
 
     fn function_by_qualname<'a>(
@@ -915,6 +1052,50 @@ class IterRange:
                 .field_stores,
             summary.field_stores
         );
+    }
+
+    #[test]
+    fn summarizes_runtime_iterrange_init_as_field_initializer() {
+        let module = lowered(include_str!("../../../soac_py/src/soac/runtime.py"));
+        let function = function_by_qualname(&module, "IterRange.__init__");
+        let escapes = summarize_module_escapes(&module);
+        let summary = escapes
+            .straightline_field_initializer(function.function_id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "runtime IterRange.__init__ should be summarized as a straightline field initializer:\nfunction={function:#?}\nescapes={}",
+                    escapes.pretty_print()
+                )
+            });
+        let fields = summary
+            .field_stores
+            .iter()
+            .map(|store| store.field_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(fields, ["current", "stop", "step"]);
+    }
+
+    #[test]
+    fn summarizes_runtime_iterrange_init_with_runtime_names_as_globals() {
+        let module = lowered_with_runtime_names_as_globals(include_str!(
+            "../../../soac_py/src/soac/runtime.py"
+        ));
+        let function = function_by_qualname(&module, "IterRange.__init__");
+        let escapes = summarize_module_escapes(&module);
+        let summary = escapes
+            .straightline_field_initializer(function.function_id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "runtime IterRange.__init__ should summarize when runtime helper loads are global names:\nfunction={function:#?}\nescapes={}",
+                    escapes.pretty_print()
+                )
+            });
+        let fields = summary
+            .field_stores
+            .iter()
+            .map(|store| store.field_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(fields, ["current", "stop", "step"]);
     }
 
     #[test]

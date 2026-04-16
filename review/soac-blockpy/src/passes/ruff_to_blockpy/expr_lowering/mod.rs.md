@@ -21,7 +21,6 @@ value construction, and special recognition of core `__soac__` helper calls.
 - `RuffToBlockPyExpr::from_lowered_expr`: converts lowered Ruff expression into target expression.
 - `RuffToBlockPyExpr::helper_call`: builds a runtime helper call in the target expression type.
 - `RuffToBlockPyExpr::lower_augassign_value`: builds the value operation for augmented assignment.
-- `RuffToBlockPyExpr::load_deleted_name`: wraps a load so deleted-name errors can be preserved.
 - `RuffToBlockPyExpr::{get_attr,set_attr,get_item,set_item,del_item}`: build core attribute and
   item operations.
 - `inplace_kind`: maps Ruff augmented operators to BlockPy binary operation kinds.
@@ -49,4 +48,3 @@ value construction, and special recognition of core `__soac__` helper calls.
 - `soac-blockpy/src/passes/ruff_to_blockpy/expr_lowering/boolop_compare/mod.rs`
 - `soac-blockpy/src/block_py/operation.rs`
 - `soac-blockpy/src/block_py/mod.rs`
-

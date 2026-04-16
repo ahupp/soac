@@ -116,10 +116,10 @@ mod tests {
             .unwrap_or_else(|| panic!("{qualname} should be present"))
     }
 
-    fn runtime_load(name: &str) -> InstrCodegen {
+    fn global_load(name: &str) -> InstrCodegen {
         Load::new(ResolvedName {
             id: name.to_string().into(),
-            location: NameLocation::RuntimeName,
+            location: NameLocation::GlobalName,
         })
         .into()
     }
@@ -146,9 +146,9 @@ def make(x):
         module.callable_defs[make_index].blocks[0]
             .body
             .push(InstrCodegen::CallDirect(CallDirect::new(
-                runtime_load("Box"),
+                global_load("Box"),
                 constructor_id,
-                vec![CallArgPositional::Positional(runtime_load("x"))],
+                vec![CallArgPositional::Positional(global_load("x"))],
                 Vec::new(),
             )));
         let inline_plan = plan_module_inlining(&summarize_module_escapes(&module));
