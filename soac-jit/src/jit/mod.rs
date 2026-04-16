@@ -15617,11 +15617,8 @@ fn emit_typed_codegen_expr_value_with_local_env(
             func_imports,
         };
         if let Some(value) = intrinsics::emit_typed_operation(expr, &mut intrinsic_state) {
-            let facts = expr
-                .result_facts()
-                .and_then(ValueFacts::as_pyobj)
-                .unwrap_or_else(PyObjFacts::unknown);
-            return Ok(SoacValue::pyobject(value, facts));
+            let (ownership, facts) = planned_owned_pyobject_result_for_typed_expr(expr, local_env);
+            return Ok(SoacValue::pyobject_with_ownership(value, ownership, facts));
         }
     }
 
@@ -18850,6 +18847,7 @@ fn emit_typed_codegen_stmt_with_local_env(
         InstrTyped::Truthy(_)
             | InstrTyped::Load(_)
             | InstrTyped::BinOp(_)
+            | InstrTyped::LegacyUnaryOp(_)
             | InstrTyped::CallTyped(_)
             | InstrTyped::GuardedCallableCallTyped(_)
             | InstrTyped::GuardedMethodCallTyped(_)

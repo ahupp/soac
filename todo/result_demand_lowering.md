@@ -155,12 +155,14 @@ ownership cases: borrowed local PyObject inputs and typed local-load results
 still require the existing LocalEnv borrowability proof, effect-only local loads
 avoid owned temporary materialization, and generic typed PyObject results
 preserve planned/fact-derived immortal ownership so discard paths do not emit
-useless immortal decrefs. Return values, local store RHS expressions, raise
-exception expressions, generic/direct call inputs, and operator/intrinsic inputs
-are annotated before JIT codegen and consumed directly from the typed
-instruction. Step 7 has started by annotating branch tests with `I32Bool01`
-demand and branch-table indices with `I64Index` demand; typed term emission
-consumes those annotations.
+useless immortal decrefs. Typed operator emission now also preserves
+planned/fact-derived PyObject ownership when wrapping intrinsic results back
+into `SoacValue`. Return values, local store RHS expressions, raise exception
+expressions, generic/direct call inputs, and operator/intrinsic inputs are
+annotated before JIT codegen and consumed directly from the typed instruction.
+Step 7 has started by annotating branch tests with `I32Bool01` demand and
+branch-table indices with `I64Index` demand; typed term emission consumes those
+annotations.
 
 1. Add `ResultDemand::{EffectOnly, PyObject { borrowed_ok }}` and an `EmitResult`
    wrapper near the existing `SoacValue`/LocalEnv codegen types.

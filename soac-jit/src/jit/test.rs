@@ -4748,6 +4748,20 @@ def build(values):
 
         assert_eq!(ownership, ValueOwnership::Immortal);
         assert!(facts.is_none());
+
+        let mut op_extra = TypedInstrExtra::default();
+        op_extra.refine_result_facts(ValueFacts::PyObj(PyObjFacts::bool_object()));
+        op_extra.set_planned_result(PlannedResult::PYOBJECT_IMMORTAL);
+        let operand = InstrTyped::Load(Load::<InstrTyped>::new(test_runtime_name("NONE")));
+        let expr = InstrTyped::LegacyUnaryOp(
+            UnaryOp::new(UnaryOpKind::Not, Box::new(operand)).with_extra(op_extra),
+        );
+
+        let (ownership, facts) =
+            planned_owned_pyobject_result_for_typed_expr(&expr, &LocalEnv::default());
+
+        assert_eq!(ownership, ValueOwnership::Immortal);
+        assert!(facts.is_exact_type(PyExactType::Bool));
     }
 
     #[test]
