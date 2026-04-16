@@ -47,13 +47,14 @@ use soac_blockpy::block_py::{
     StorageLayout, Store, Visit, WithMeta, operation as blockpy_intrinsics,
 };
 use soac_blockpy::passes::{
-    CodegenModuleShape, FactStore, FunctionRefcountPlan, InlinePlanModule, InstrResolved,
-    InstrTyped, LocalEnvResumeBinding, LocalEnvResumeBindingState, LocalEnvResumePoint,
-    LocalEnvResumeStatePrecision, LocalEnvResumeValueSource, LocalRefState, PyExactType,
-    PyObjFacts, RefcountActionKind, RefcountReleaseReason, RefcountSite, RuntimeHelperId,
-    TypedCodegenModuleShape, ValueFacts, infer_module_value_facts, lower_codegen_function_to_typed,
-    lower_typed_function_if_tests_to_truthy, plan_module_inlining, summarize_module_escapes,
-    try_lower_typed_instr_to_codegen_legacy, try_lower_typed_term_to_codegen_legacy,
+    CodegenModuleShape, ConstructorFieldValue, FactStore, FunctionRefcountPlan, InlinePlanModule,
+    InstrResolved, InstrTyped, LocalEnvResumeBinding, LocalEnvResumeBindingState,
+    LocalEnvResumePoint, LocalEnvResumeStatePrecision, LocalEnvResumeValueSource, LocalRefState,
+    PyExactType, PyObjFacts, RefcountActionKind, RefcountReleaseReason, RefcountSite,
+    RuntimeHelperId, TypedCodegenModuleShape, ValueFacts, infer_module_value_facts,
+    lower_codegen_function_to_typed, lower_typed_function_if_tests_to_truthy, plan_module_inlining,
+    summarize_module_escapes, try_lower_typed_instr_to_codegen_legacy,
+    try_lower_typed_term_to_codegen_legacy,
 };
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -11337,6 +11338,69 @@ fn emit_direct_call_resolved_with_arg_values(
     fb.block_params(call_ok_block)[0]
 }
 
+fn emit_straightline_constructor_initializer_inline(
+    fb: &mut FunctionBuilder<'_>,
+    allocated: ir::Value,
+    init_arg_values: &[ir::Value],
+    init_arg_borrowed: &[bool],
+    specialization: &DirectConstructorSpecialization,
+    ctx: &JitEmitCtx<'_>,
+) -> Option<ir::Value> {
+    if specialization.arg_plan.requires_default_resolving_entry() {
+        return None;
+    }
+    let plan = ctx
+        .inline_plan
+        .straightline_constructor(specialization.function_id)?;
+    let mut field_values = Vec::with_capacity(plan.field_stores.len());
+    for store in &plan.field_stores {
+        let ConstructorFieldValue::Param { index, .. } = store.value else {
+            return None;
+        };
+        let value = *init_arg_values.get(index)?;
+        field_values.push((store.field_name.as_str(), value));
+    }
+
+    let owned_init_args = init_arg_values
+        .iter()
+        .copied()
+        .zip(init_arg_borrowed.iter().copied())
+        .filter_map(|(value, borrowed)| (!borrowed).then_some(value))
+        .collect::<Vec<_>>();
+    let ptr_ty = ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    for (field_name, value) in field_values {
+        let attr = emit_owned_module_constant(
+            fb,
+            ctx.module_constants.require_unicode_constant_id(field_name),
+            ctx,
+        );
+        let set_inst = fb
+            .ins()
+            .call(ctx.pyobject_setattr_ref, &[allocated, attr, value]);
+        let set_result = fb.inst_results(set_inst)[0];
+        emit_release_owned_inputs(fb, ctx, &[attr]);
+        let set_failed = fb
+            .ins()
+            .icmp(ir::condcodes::IntCC::Equal, set_result, null_ptr);
+        let set_ok_block = fb.create_block();
+        let set_fail_block = fb.create_block();
+        fb.ins()
+            .brif(set_failed, set_fail_block, &[], set_ok_block, &[]);
+
+        fb.switch_to_block(set_fail_block);
+        emit_release_owned_inputs(fb, ctx, &[allocated]);
+        emit_release_owned_inputs(fb, ctx, &owned_init_args);
+        fb.ins()
+            .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
+
+        fb.switch_to_block(set_ok_block);
+        emit_release_owned_inputs(fb, ctx, &[set_result]);
+    }
+    emit_release_owned_inputs(fb, ctx, &owned_init_args);
+    Some(allocated)
+}
+
 fn emit_direct_constructor_resolved_with_arg_values(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
@@ -11399,6 +11463,16 @@ fn emit_direct_constructor_resolved_with_arg_values(
         provided_arg_borrowed,
         ptr_ty,
     );
+    if let Some(result) = emit_straightline_constructor_initializer_inline(
+        fb,
+        allocated,
+        init_arg_values.as_slice(),
+        init_arg_borrowed.as_slice(),
+        specialization,
+        ctx,
+    ) {
+        return result;
+    }
     let init_callable =
         emit_callable_ptr_value_for_ref(fb, codegen_env, ctx, &specialization.init_function_ref)
             .unwrap_or_else(|err| panic!("failed to bind constructor callable symbol: {err}"))

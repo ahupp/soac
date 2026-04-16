@@ -13365,6 +13365,12 @@ def g():
 
     #[test]
     fn jit_refcount_emission_env_defaults_to_enabled() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "jit_refcount_emission_env_defaults_to_enabled",
+        ) {
+            return;
+        }
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         {
             let _env = EnvVarGuard::remove(SOAC_JIT_EMIT_REFCOUNTS_ENV);
@@ -13396,6 +13402,12 @@ def g():
 
     #[test]
     fn runtime_support_inliner_uses_noop_refcount_helpers_when_disabled() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "runtime_support_inliner_uses_noop_refcount_helpers_when_disabled",
+        ) {
+            return;
+        }
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         let disabled_insts = {
             let _env = EnvVarGuard::set(SOAC_JIT_EMIT_REFCOUNTS_ENV, "0");
@@ -18348,6 +18360,7 @@ def f(x, y):
                 let init_function_id = init_name_gen.function_id();
                 let caller_name_gen = module_name_gen.next_function_name_gen();
                 let caller_function_id = caller_name_gen.function_id();
+                let field_name = constants.string_expr("x");
 
                 let mut init_function = BlockPyFunction {
                     function_id: init_function_id,
@@ -18376,7 +18389,11 @@ def f(x, y):
                     },
                     blocks: vec![CodegenBlock {
                         label: BlockLabel::from_index(0),
-                        body: vec![],
+                        body: vec![op_expr(SetAttr::new(
+                            name_expr(test_local_name("self", 0)),
+                            field_name,
+                            name_expr(test_local_name("x", 1)),
+                        ))],
                         term: ret_term(none_expr()),
                         params: vec![],
                         exc_edge: None,
@@ -18575,8 +18592,15 @@ def f(x, y):
                 );
                 assert_eq!(
                     count_direct_calls_to_runtime_helpers(&built.ctx.func, &finish_helpers),
+                    0,
+                    "straight-line constructor initializer should inline instead of calling __init__",
+                );
+                let setattr_helpers =
+                    import_user_names_for_symbols(&built, &[DP_JIT_PYOBJECT_SETATTR_IMPORT.symbol]);
+                assert_eq!(
+                    count_direct_calls_to_runtime_helpers(&built.ctx.func, &setattr_helpers),
                     1,
-                    "constructor specialization should validate __init__ results in the fast path",
+                    "straight-line constructor initializer should emit the planned field store",
                 );
                 assert!(
                     !function_contains_iconst_imm(&built.ctx.func, owner_type as i64),

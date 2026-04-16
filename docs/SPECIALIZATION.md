@@ -427,9 +427,14 @@ apply/verify mode:
   - guards exact callee object identity against the profiled owner type
   - guards the owner type version
   - allocates with `dp_jit_pytype_generic_alloc`
-  - directly calls the transformed `__init__`
-  - finalizes through `dp_jit_finish_constructor_init`, which enforces
-    `__init__` returning `None`
+  - when the BlockPy inline plan proves `__init__` is a straight-line
+    field initializer from constructor parameters, emits those
+    `self.field = param` stores directly with the normal
+    `dp_jit_pyobject_setattr` helper and skips the `__init__` call
+  - otherwise directly calls the transformed `__init__`
+  - finalizes direct `__init__` calls through
+    `dp_jit_finish_constructor_init`, which enforces `__init__`
+    returning `None`
 - Helper entrypoints are:
   - `pytype_generic_alloc_hook`, at
     `soac-jit/src/jit/specialized_helpers.rs:107`
@@ -448,6 +453,11 @@ apply/verify mode:
   - no custom `tp_new`
   - no custom allocator
   - no abstract types
+  - initializer inlining currently covers only parameter-to-field
+    stores, and only when the direct-call arg plan does not need the
+    default-resolving entry path
+  - initializer inlining still uses ordinary Python attribute setting;
+    it does not yet lower the planned stores to indexed-field raw stores
 - Soundness boundary:
   - this path is intentionally restricted to types where the default
     `type.__call__` shape can be reproduced safely enough:
