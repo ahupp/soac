@@ -244,8 +244,10 @@ Run `jj workspace update-stale` and rebase your live work onto the new
 peer workspace's live `@`.
 
 18. Report the result: run `jj diff --stat` on the completed change and
-report its output, then describe the next step. If I did not ask to
-approve each step after the plan, continue with the next step.
+report its output. At the end of each completed turn or substantial pass,
+summarize what is currently being worked on, the state it is in, and the
+next concrete steps for that work. If I did not ask to approve each step
+after the plan, continue with the next step.
 
 The goal of the `jj` workflow is to keep `main` as the clear shared
 synchronization point without letting one codex instance rewrite another
@@ -296,7 +298,8 @@ is no actionable improvement, say nothing about it.
 
 When reporting a completed pass, include a short `Environment notes` line if
 anything non-code affected the run. If there were no such issues, say
-`Environment notes: none`.
+`Environment notes: none`. Also include the current work thread and next steps
+so a later turn can resume without rediscovering context.
 
 
 ## APPENDIX
