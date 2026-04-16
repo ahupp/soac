@@ -210,13 +210,38 @@ isolated quickly.
 
 ## Next Implementation Slices
 
+This TODO is not ready to move to `todo/doneish/`. The core process-owned
+`JITModule` migration is in place, including shared direct-function symbols,
+recursive batch declaration, cross-module lookup through `CompileSession`, and
+background/parallel batch compilation. The remaining work is the follow-on
+direct-call architecture that makes those symbols easier to reason about and
+optimize.
+
 1. Add direct-call dependency tracking.
    - Record caller/callee edges, emitted direct calls, deferred edges, and
      generic fallback reasons in a queryable shared graph.
 
-2. Benchmark before inlining.
+2. Make direct-call shape validation explicit.
+   - Validate arity, receiver handling, keyword support/rejection, and result
+     contract before CLIF lowering chooses the direct-call path.
+
+3. Add generation/versioning policy.
+   - Keep the current compile-once behavior explicit, and define how future
+     invalidation or re-specialization creates a new generation instead of
+     silently replacing code behind existing callers.
+
+4. Extend observability from trace summaries to queryable JIT state.
+   - Keep the existing `soac_jit_direct_edges` tracing, but add an inspectable
+     edge graph or dump that can answer why each caller/callee edge is direct,
+     deferred, or generic fallback.
+
+5. Benchmark before inlining.
    - Measure direct-call heavy workloads before changing the inliner.
    - Record any finalized performance result in `docs/CODEX_OPT_LOG.md`.
+
+6. Add inlining only after the above is stable.
+   - Start with small leaf functions and conservative control-flow/exceptions
+     restrictions over the shared call graph.
 
 ## Challenging Parts
 
