@@ -1,6 +1,7 @@
 use crate::block_py::{
-    Block, BlockArg, BlockEdge, BlockLabel, BlockPyFunction, BlockTerm, HasMeta, InstrCodegen,
-    LocalLocation, Mappable, NameLocation, ResolvedName, Store, TryMapInstr, WithMeta,
+    Block, BlockArg, BlockEdge, BlockLabel, BlockPyFunction, BlockTerm, CallArgPositional,
+    CallDirect, HasMeta, InstrCodegen, LocalLocation, Mappable, NameLocation, ParamKind,
+    ResolvedName, Store, TryMapInstr, WithMeta,
 };
 use crate::passes::{CodegenModuleShape, InstrCodegenOp};
 use std::collections::HashMap;
@@ -26,11 +27,62 @@ pub enum InlineUnsupportedReason {
     MissingCallerStorageLayout,
     MissingCalleeStorageLayout,
     MissingCalleeLocal(LocalLocation),
+    MissingParameterLocal(String),
     RebindsBoundLocal(LocalLocation),
+    ArityMismatch { expected: usize, actual: usize },
+    KeywordArguments,
+    StarredArguments,
+    UnsupportedParameterKind { name: String, kind: ParamKind },
     MultipleBlocks { count: usize },
     BlockParams,
     ExceptionEdge,
     NonReturnTerm,
+}
+
+pub fn bind_simple_direct_call_inline_args(
+    callee: &BlockPyFunction<CodegenModuleShape>,
+    call: &CallDirect<InstrCodegen>,
+) -> Result<InlineValueBindings, InlineUnsupportedReason> {
+    if !call.keywords.is_empty() {
+        return Err(InlineUnsupportedReason::KeywordArguments);
+    }
+    if call
+        .args
+        .iter()
+        .any(|arg| matches!(arg, CallArgPositional::Starred(_)))
+    {
+        return Err(InlineUnsupportedReason::StarredArguments);
+    }
+
+    let supported_params = callee
+        .params
+        .iter()
+        .map(|param| {
+            if matches!(param.kind, ParamKind::PosOnly | ParamKind::Any) {
+                Ok(param)
+            } else {
+                Err(InlineUnsupportedReason::UnsupportedParameterKind {
+                    name: param.name.clone(),
+                    kind: param.kind,
+                })
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let expected = supported_params.len();
+    let actual = call.args.len();
+    if expected != actual {
+        return Err(InlineUnsupportedReason::ArityMismatch { expected, actual });
+    }
+
+    let mut bindings = InlineValueBindings::new();
+    for (param, arg) in supported_params.into_iter().zip(&call.args) {
+        let location = parameter_local_location(callee, &param.name)?;
+        let CallArgPositional::Positional(value) = arg else {
+            unreachable!("starred arguments were rejected before binding");
+        };
+        bindings.insert(location, value.clone());
+    }
+    Ok(bindings)
 }
 
 pub fn build_single_block_inline_fragment(
@@ -142,6 +194,28 @@ fn allocate_inline_local(
     Ok(InlineLocal { name, location })
 }
 
+fn parameter_local_location(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    name: &str,
+) -> Result<LocalLocation, InlineUnsupportedReason> {
+    let layout = function
+        .storage_layout
+        .as_ref()
+        .ok_or(InlineUnsupportedReason::MissingCalleeStorageLayout)?;
+    let Some(slot) = layout
+        .stack_slots()
+        .iter()
+        .position(|slot_name| slot_name == name)
+    else {
+        return Err(InlineUnsupportedReason::MissingParameterLocal(
+            name.to_string(),
+        ));
+    };
+    Ok(LocalLocation(
+        u32::try_from(slot).expect("parameter stack slot index should fit in u32"),
+    ))
+}
+
 impl InlineLocal {
     fn resolved_name(&self) -> ResolvedName {
         ResolvedName {
@@ -234,7 +308,7 @@ impl TryMapInstr<InstrCodegen, InstrCodegen, InlineUnsupportedReason> for Inline
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block_py::{BlockParam, BlockParamRole, Load};
+    use crate::block_py::{BlockParam, BlockParamRole, CallDirect, Load};
     use crate::lower_python_to_blockpy_for_testing;
 
     fn function_by_qualname<'a>(
@@ -266,6 +340,62 @@ mod tests {
             location: NameLocation::Local(local_location(function, name)),
         })
         .into()
+    }
+
+    #[test]
+    fn binds_simple_positional_call_args_to_callee_param_locals() {
+        let module = lower_python_to_blockpy_for_testing(
+            r#"
+def callee(a, b):
+    return a + b
+
+def caller(x, y):
+    return x
+"#,
+        )
+        .expect("transform should succeed")
+        .codegen_module;
+        let callee = function_by_qualname(&module, "callee");
+        let caller = function_by_qualname(&module, "caller");
+        let call = CallDirect::new(
+            local_load(caller, "x"),
+            callee.function_id,
+            vec![
+                CallArgPositional::Positional(local_load(caller, "x")),
+                CallArgPositional::Positional(local_load(caller, "y")),
+            ],
+            Vec::new(),
+        );
+
+        let bindings = bind_simple_direct_call_inline_args(callee, &call).unwrap();
+
+        assert_eq!(bindings.len(), 2);
+        assert!(bindings.contains_key(&local_location(callee, "a")));
+        assert!(bindings.contains_key(&local_location(callee, "b")));
+    }
+
+    #[test]
+    fn rejects_simple_positional_binding_when_arity_differs() {
+        let module = lower_python_to_blockpy_for_testing("def callee(a, b):\n    return a\n")
+            .expect("transform should succeed")
+            .codegen_module;
+        let callee = function_by_qualname(&module, "callee");
+        let call = CallDirect::new(
+            local_load(callee, "a"),
+            callee.function_id,
+            vec![CallArgPositional::Positional(local_load(callee, "a"))],
+            Vec::new(),
+        );
+
+        let err = bind_simple_direct_call_inline_args(callee, &call).unwrap_err();
+
+        assert_eq!(
+            err,
+            InlineUnsupportedReason::ArityMismatch {
+                expected: 2,
+                actual: 1
+            }
+        );
     }
 
     #[test]

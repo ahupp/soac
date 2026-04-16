@@ -681,8 +681,9 @@ pub use inline_sites::{
     collect_inline_call_sites, InlineCallSiteModule, StraightlineConstructorCallSite,
 };
 pub use inline_transform::{
-    build_single_block_inline_fragment, build_single_block_inline_fragment_with_bindings,
-    InlineFragment, InlineLocal, InlineUnsupportedReason, InlineValueBindings,
+    bind_simple_direct_call_inline_args, build_single_block_inline_fragment,
+    build_single_block_inline_fragment_with_bindings, InlineFragment, InlineLocal,
+    InlineUnsupportedReason, InlineValueBindings,
 };
 pub use instr_id::{
     assign_function_instr_ids, assign_module_instr_ids, validate_codegen_instr_ids,
