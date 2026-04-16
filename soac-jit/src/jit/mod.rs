@@ -14151,6 +14151,81 @@ fn emit_direct_call_resolved_with_arg_plan_from_local_env(
     )
 }
 
+fn emit_typed_pyobject_input_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    expr: &InstrTyped,
+    local_env: &mut LocalEnv,
+    ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+    site: &str,
+) -> Result<(ir::Value, bool), String> {
+    let borrowed = typed_expr_pyobject_input_is_borrowed_from_local_env(expr, local_env, ctx);
+    let value = emit_typed_codegen_expr_value_with_local_env(
+        fb,
+        expr,
+        local_env,
+        ctx,
+        borrowed,
+        codegen_env,
+        func_imports,
+    )?;
+    let (value, ownership, _) = value.expect_pyobject(site);
+    Ok((value, !ownership.is_owned()))
+}
+
+fn emit_typed_direct_call_resolved_with_arg_plan_from_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    callable: ir::Value,
+    callable_is_borrowed: bool,
+    args: &[&InstrTyped],
+    arg_plan: &DirectCallArgPlan,
+    target_function: &BlockPyFunction<CodegenModuleShape>,
+    local_env: &mut LocalEnv,
+    ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<ir::Value, String> {
+    let ptr_ty = ctx.consts.ptr_ty;
+    let mut provided_arg_values: Vec<ir::Value> = Vec::with_capacity(args.len());
+    let mut provided_arg_borrowed: Vec<bool> = Vec::with_capacity(args.len());
+    for arg in args {
+        let (value, borrowed) = emit_typed_pyobject_input_with_local_env(
+            fb,
+            arg,
+            local_env,
+            ctx,
+            codegen_env,
+            func_imports,
+            "typed direct-call arg",
+        )?;
+        provided_arg_values.push(value);
+        provided_arg_borrowed.push(borrowed);
+    }
+    let (arg_values, arg_borrowed) = emit_direct_call_args_from_plan(
+        fb,
+        arg_plan,
+        provided_arg_values,
+        provided_arg_borrowed,
+        ptr_ty,
+    );
+    Ok(emit_direct_call_resolved_with_arg_values(
+        fb,
+        callable,
+        callable_is_borrowed,
+        arg_values,
+        arg_borrowed,
+        if arg_plan.requires_default_resolving_entry() {
+            DirectCallEntryKind::DefaultResolving
+        } else {
+            DirectCallEntryKind::Core
+        },
+        target_function,
+        ctx,
+        codegen_env,
+    ))
+}
+
 fn emit_direct_constructor_resolved_with_args_from_local_env(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
@@ -14190,6 +14265,46 @@ fn emit_direct_constructor_resolved_with_args_from_local_env(
         ctx,
         codegen_env,
     )
+}
+
+fn emit_typed_direct_constructor_resolved_with_args_from_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    callable: ir::Value,
+    callable_is_borrowed: bool,
+    args: &[&InstrTyped],
+    specialization: &DirectConstructorSpecialization,
+    target_function: &BlockPyFunction<CodegenModuleShape>,
+    local_env: &mut LocalEnv,
+    ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<ir::Value, String> {
+    let mut arg_values = Vec::with_capacity(args.len());
+    let mut arg_borrowed = Vec::with_capacity(args.len());
+    for arg in args {
+        let (value, borrowed) = emit_typed_pyobject_input_with_local_env(
+            fb,
+            arg,
+            local_env,
+            ctx,
+            codegen_env,
+            func_imports,
+            "typed direct-constructor arg",
+        )?;
+        arg_values.push(value);
+        arg_borrowed.push(borrowed);
+    }
+    Ok(emit_direct_constructor_resolved_with_arg_values(
+        fb,
+        callable,
+        callable_is_borrowed,
+        arg_values,
+        arg_borrowed,
+        specialization,
+        target_function,
+        ctx,
+        codegen_env,
+    ))
 }
 
 fn emit_direct_method_resolved_with_args_from_local_env(
@@ -14253,6 +14368,68 @@ fn emit_direct_method_resolved_with_args_from_local_env(
         ctx,
         codegen_env,
     )
+}
+
+fn emit_typed_direct_method_resolved_with_args_from_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    receiver: ir::Value,
+    receiver_is_borrowed: bool,
+    args: &[&InstrTyped],
+    specialization: &DirectMethodSpecialization,
+    target_function: &BlockPyFunction<CodegenModuleShape>,
+    local_env: &mut LocalEnv,
+    ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<ir::Value, String> {
+    let ptr_ty = ctx.consts.ptr_ty;
+    let mut provided_arg_values = Vec::with_capacity(args.len() + 1);
+    let mut provided_arg_borrowed = Vec::with_capacity(args.len() + 1);
+    provided_arg_values.push(receiver);
+    provided_arg_borrowed.push(receiver_is_borrowed);
+    for arg in args {
+        let (value, borrowed) = emit_typed_pyobject_input_with_local_env(
+            fb,
+            arg,
+            local_env,
+            ctx,
+            codegen_env,
+            func_imports,
+            "typed direct-method arg",
+        )?;
+        provided_arg_values.push(value);
+        provided_arg_borrowed.push(borrowed);
+    }
+    let (arg_values, arg_borrowed) = emit_direct_call_args_from_plan(
+        fb,
+        &specialization.arg_plan,
+        provided_arg_values,
+        provided_arg_borrowed,
+        ptr_ty,
+    );
+    let callable = emit_callable_ptr_value_for_ref(
+        fb,
+        codegen_env,
+        ctx,
+        &specialization.descriptor_function_ref,
+    )
+    .unwrap_or_else(|err| panic!("failed to bind direct method callable symbol: {err}"))
+    .expect("direct method callable symbol should be available");
+    Ok(emit_direct_call_resolved_with_arg_values(
+        fb,
+        callable,
+        true,
+        arg_values,
+        arg_borrowed,
+        if specialization.arg_plan.requires_default_resolving_entry() {
+            DirectCallEntryKind::DefaultResolving
+        } else {
+            DirectCallEntryKind::Core
+        },
+        target_function,
+        ctx,
+        codegen_env,
+    ))
 }
 
 fn emit_call_direct_expr_with_local_env(
@@ -18195,17 +18372,15 @@ fn emit_typed_codegen_simple_positional_call_result_with_local_env(
         );
     }
 
-    let callable_value = emit_typed_codegen_expr_value_with_local_env(
+    let (callable, callable_is_borrowed) = emit_typed_pyobject_input_with_local_env(
         fb,
         call.func.as_ref(),
         local_env,
         emit_ctx,
-        false,
         codegen_env,
         func_imports,
+        "typed call callable",
     )?;
-    let (callable, callable_ownership, _) = callable_value.expect_pyobject("typed call callable");
-    let callable_is_borrowed = !callable_ownership.is_owned();
     let mut arg_values = Vec::with_capacity(call.args.len());
     let mut arg_borrowed = Vec::with_capacity(call.args.len());
     for arg in &call.args {
@@ -18214,18 +18389,17 @@ fn emit_typed_codegen_simple_positional_call_result_with_local_env(
                 "typed call with typed-only children and starred args is not supported".to_string(),
             );
         };
-        let arg_value = emit_typed_codegen_expr_value_with_local_env(
+        let (arg_value, arg_is_borrowed) = emit_typed_pyobject_input_with_local_env(
             fb,
             arg,
             local_env,
             emit_ctx,
-            false,
             codegen_env,
             func_imports,
+            "typed positional call arg",
         )?;
-        let (arg_value, arg_ownership, _) = arg_value.expect_pyobject("typed positional call arg");
         arg_values.push(arg_value);
-        arg_borrowed.push(!arg_ownership.is_owned());
+        arg_borrowed.push(arg_is_borrowed);
     }
 
     let result = if arg_values.len() <= 3 {
@@ -18303,26 +18477,22 @@ fn emit_typed_codegen_direct_callable_call_result_with_local_env(
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<EmitResult, String> {
-    let func_expr = try_lower_typed_instr_to_codegen_legacy(*call.func.clone())?;
-    let callable_is_borrowed =
-        codegen_expr_pyobject_input_is_borrowed_from_local_env(&func_expr, local_env, emit_ctx);
-    let callable = emit_codegen_expr_with_local_env(
+    let (callable, callable_is_borrowed) = emit_typed_pyobject_input_with_local_env(
         fb,
-        &func_expr,
+        call.func.as_ref(),
         local_env,
         emit_ctx,
-        callable_is_borrowed,
         codegen_env,
         func_imports,
-    );
-    let mut arg_exprs = Vec::with_capacity(call.args.len());
+        "typed direct callable",
+    )?;
+    let mut arg_refs = Vec::with_capacity(call.args.len());
     for arg in &call.args {
         let CallArgPositional::Positional(arg) = arg else {
             return Err("typed direct callable call does not support starred args".to_string());
         };
-        arg_exprs.push(try_lower_typed_instr_to_codegen_legacy(arg.clone())?);
+        arg_refs.push(arg);
     }
-    let arg_refs = arg_exprs.iter().collect::<Vec<_>>();
     let result = match &call.guard {
         TypedDirectCallableCallGuard::Function(guard) => {
             let target_function = direct_call_target_function(emit_ctx, guard.function_id)
@@ -18333,7 +18503,7 @@ fn emit_typed_codegen_direct_callable_call_result_with_local_env(
                     )
                 })?;
             let arg_plan = direct_call_arg_plan_from_typed(&guard.arg_plan);
-            emit_direct_call_resolved_with_arg_plan_from_local_env(
+            emit_typed_direct_call_resolved_with_arg_plan_from_local_env(
                 fb,
                 callable,
                 callable_is_borrowed,
@@ -18344,7 +18514,7 @@ fn emit_typed_codegen_direct_callable_call_result_with_local_env(
                 emit_ctx,
                 codegen_env,
                 func_imports,
-            )
+            )?
         }
         TypedDirectCallableCallGuard::Constructor(guard) => {
             let specialization = direct_constructor_specialization_from_typed_guard(guard)
@@ -18358,7 +18528,7 @@ fn emit_typed_codegen_direct_callable_call_result_with_local_env(
                         specialization.function_id
                     )
                 })?;
-            emit_direct_constructor_resolved_with_args_from_local_env(
+            emit_typed_direct_constructor_resolved_with_args_from_local_env(
                 fb,
                 callable,
                 callable_is_borrowed,
@@ -18369,7 +18539,7 @@ fn emit_typed_codegen_direct_callable_call_result_with_local_env(
                 emit_ctx,
                 codegen_env,
                 func_imports,
-            )
+            )?
         }
     };
     Ok(emit_owned_pyobject_result_for_demand(
@@ -18399,27 +18569,23 @@ fn emit_typed_codegen_direct_method_call_result_with_local_env(
                 specialization.function_id
             )
         })?;
-    let receiver_expr = try_lower_typed_instr_to_codegen_legacy(*call.receiver.clone())?;
-    let receiver_is_borrowed =
-        codegen_expr_pyobject_input_is_borrowed_from_local_env(&receiver_expr, local_env, emit_ctx);
-    let receiver = emit_codegen_expr_with_local_env(
+    let (receiver, receiver_is_borrowed) = emit_typed_pyobject_input_with_local_env(
         fb,
-        &receiver_expr,
+        call.receiver.as_ref(),
         local_env,
         emit_ctx,
-        receiver_is_borrowed,
         codegen_env,
         func_imports,
-    );
-    let mut arg_exprs = Vec::with_capacity(call.args.len());
+        "typed direct-method receiver",
+    )?;
+    let mut arg_refs = Vec::with_capacity(call.args.len());
     for arg in &call.args {
         let CallArgPositional::Positional(arg) = arg else {
             return Err("typed direct method call does not support starred args".to_string());
         };
-        arg_exprs.push(try_lower_typed_instr_to_codegen_legacy(arg.clone())?);
+        arg_refs.push(arg);
     }
-    let arg_refs = arg_exprs.iter().collect::<Vec<_>>();
-    let result = emit_direct_method_resolved_with_args_from_local_env(
+    let result = emit_typed_direct_method_resolved_with_args_from_local_env(
         fb,
         receiver,
         receiver_is_borrowed,
@@ -18430,7 +18596,7 @@ fn emit_typed_codegen_direct_method_call_result_with_local_env(
         emit_ctx,
         codegen_env,
         func_imports,
-    );
+    )?;
     Ok(emit_owned_pyobject_result_for_demand(
         fb,
         result,

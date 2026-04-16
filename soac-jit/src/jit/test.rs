@@ -3817,6 +3817,30 @@ def build(values):
     }
 
     #[test]
+    fn typed_planned_result_extra_marks_direct_call_local_inputs_borrowed() {
+        let mut constants = TestConstantPool::default();
+        let positional_instr_id = InstrId::new(BlockLabel::from_index(0), 2);
+        let call = InstrCodegen::CallDirect(CallDirect::new(
+            name_expr(test_global_name("callee")),
+            FunctionId::new(0, 1),
+            vec![CallArgPositional::Positional(with_instr_id(
+                name_expr(test_name("x")),
+                positional_instr_id,
+            ))],
+            Vec::<CallArgKeyword<InstrCodegen>>::new(),
+        ));
+        let function =
+            with_single_test_block(test_function(), vec![call], ret_term(constants.int_expr(2)));
+        let typed_function = lower_codegen_function_to_typed(function);
+        let typed_function = annotate_test_result_demands_and_plans(typed_function);
+
+        assert_eq!(
+            typed_planned_result_for_instr_id(&typed_function, positional_instr_id),
+            Some(PlannedResult::PYOBJECT_BORROWED_LOCAL)
+        );
+    }
+
+    #[test]
     fn runtime_builtin_primitive_recognition_requires_static_runtime_name() {
         let mut module = test_module(ModuleNameGen::new(0), vec![test_function()]);
         module
