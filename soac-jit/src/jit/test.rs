@@ -25,6 +25,7 @@ mod tests {
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyModule, PyModuleMethods, PyTuple};
     use pyo3::{Bound, Py, PyAny, PyErr, PyResult, Python, ffi};
     use ruff_python_ast as ast;
+    use soac_blockpy::passes::TypedPlannedResult as PlannedResult;
     use std::collections::{HashMap, VecDeque};
     use std::ffi::c_void;
     use std::mem::size_of;
@@ -3493,6 +3494,14 @@ def build(values):
         function
     }
 
+    fn annotate_test_result_demands_and_plans(
+        mut function: BlockPyFunction<TypedCodegenModuleShape>,
+    ) -> BlockPyFunction<TypedCodegenModuleShape> {
+        annotate_typed_function_result_demands(&mut function);
+        annotate_typed_function_planned_results(&mut function);
+        function
+    }
+
     fn typed_demand_for_instr_id(
         function: &BlockPyFunction<TypedCodegenModuleShape>,
         instr_id: InstrId,
@@ -3519,6 +3528,34 @@ def build(values):
         finder.demand
     }
 
+    fn typed_planned_result_for_instr_id(
+        function: &BlockPyFunction<TypedCodegenModuleShape>,
+        instr_id: InstrId,
+    ) -> Option<PlannedResult> {
+        struct Finder {
+            instr_id: InstrId,
+            planned_result: Option<PlannedResult>,
+        }
+
+        impl Visit<InstrTyped> for Finder {
+            fn visit_instr(&mut self, expr: &InstrTyped) {
+                if self.planned_result.is_none()
+                    && expr.try_semantic_instr_id() == Some(self.instr_id)
+                {
+                    self.planned_result = expr.planned_result();
+                }
+                expr.visit_children(self);
+            }
+        }
+
+        let mut finder = Finder {
+            instr_id,
+            planned_result: None,
+        };
+        finder.visit_fn(function);
+        finder.planned_result
+    }
+
     #[test]
     fn typed_result_demand_extra_marks_statement_roots_effect_only() {
         let mut constants = TestConstantPool::default();
@@ -3535,6 +3572,69 @@ def build(values):
         assert_eq!(
             typed_demand_for_instr_id(&typed_function, instr_id),
             Some(ResultDemand::EffectOnly)
+        );
+    }
+
+    #[test]
+    fn typed_planned_result_extra_marks_statement_roots_effect_only() {
+        let mut constants = TestConstantPool::default();
+        let instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+        let function = with_single_test_block(
+            test_function(),
+            vec![expr_stmt(with_instr_id(constants.int_expr(1), instr_id))],
+            ret_term(constants.int_expr(2)),
+        );
+        let typed_function =
+            lower_typed_function_if_tests_to_truthy(lower_codegen_function_to_typed(function));
+        let typed_function = annotate_test_result_demands_and_plans(typed_function);
+
+        assert_eq!(
+            typed_planned_result_for_instr_id(&typed_function, instr_id),
+            Some(PlannedResult::EffectOnly)
+        );
+    }
+
+    #[test]
+    fn typed_planned_result_extra_marks_borrowed_local_for_borrowed_input_demand() {
+        let mut constants = TestConstantPool::default();
+        let arg_instr_id = InstrId::new(BlockLabel::from_index(0), 2);
+        let call = op_expr(Call::new(
+            name_expr(test_runtime_name("callable")),
+            vec![CallArgPositional::Positional(with_instr_id(
+                name_expr(test_name("x")),
+                arg_instr_id,
+            ))],
+            Vec::<CallArgKeyword<InstrCodegen>>::new(),
+        ));
+        let function =
+            with_single_test_block(test_function(), vec![call], ret_term(constants.int_expr(1)));
+        let typed_function = lower_codegen_function_to_typed(function);
+        let typed_function = annotate_test_result_demands_and_plans(typed_function);
+
+        assert_eq!(
+            typed_planned_result_for_instr_id(&typed_function, arg_instr_id),
+            Some(PlannedResult::PYOBJECT_BORROWED_LOCAL)
+        );
+    }
+
+    #[test]
+    fn typed_planned_result_extra_marks_immortal_pyobject_from_value_facts() {
+        let return_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+        let function = with_single_test_block(
+            test_function(),
+            vec![],
+            ret_term(with_instr_id(none_expr(), return_instr_id)),
+        );
+        let module = test_module(ModuleNameGen::new(0), vec![function]);
+        let facts = infer_module_value_facts(&module);
+        let mut typed_function = lower_codegen_function_to_typed(module.callable_defs[0].clone());
+        annotate_typed_function_value_facts(&mut typed_function, &facts);
+        refresh_typed_function_value_facts(&mut typed_function);
+        let typed_function = annotate_test_result_demands_and_plans(typed_function);
+
+        assert_eq!(
+            typed_planned_result_for_instr_id(&typed_function, return_instr_id),
+            Some(PlannedResult::PYOBJECT_IMMORTAL)
         );
     }
 

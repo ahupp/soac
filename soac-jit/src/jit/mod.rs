@@ -59,8 +59,8 @@ use soac_blockpy::passes::{
     TypedDirectCallableCallGuard, TypedDirectConstructorCallGuard, TypedDirectFunctionCallGuard,
     TypedDirectMethodCall, TypedDirectMethodCallGuard, TypedGetAttr, TypedGuardedCallableCall,
     TypedGuardedMethodCall, TypedIndexedFieldGuard, TypedSetAttr, ValueFacts,
-    annotate_typed_function_result_demands, annotate_typed_function_value_facts,
-    assign_missing_codegen_function_instr_ids,
+    annotate_typed_function_planned_results, annotate_typed_function_result_demands,
+    annotate_typed_function_value_facts, assign_missing_codegen_function_instr_ids,
     build_cross_module_direct_method_inline_fragment_to_target,
     build_direct_method_inline_fragment_to_target, infer_module_value_facts,
     inline_direct_call_stores_with_callees, lower_codegen_function_to_typed,
@@ -23215,6 +23215,7 @@ fn prepare_specialized_typed_function(
     lower_typed_function_call_access_plan_instrs(&mut typed_function);
     refresh_typed_function_value_facts(&mut typed_function);
     annotate_typed_function_result_demands(&mut typed_function);
+    annotate_typed_function_planned_results(&mut typed_function);
     validate_typed_function_call_access_plans(&typed_function)?;
     validate_typed_function_value_facts(&typed_function)?;
     validate_typed_function_preserves_codegen_cfg(function, &typed_function)?;

@@ -1620,10 +1620,42 @@ impl TypedResultDemand {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TypedPyObjectOwnershipPlan {
+    Owned,
+    BorrowedLocal,
+    Immortal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TypedPlannedResult {
+    EffectOnly,
+    PyObject {
+        ownership: TypedPyObjectOwnershipPlan,
+    },
+    I32Bool01,
+    I64,
+}
+
+impl TypedPlannedResult {
+    pub const PYOBJECT_OWNED: Self = Self::PyObject {
+        ownership: TypedPyObjectOwnershipPlan::Owned,
+    };
+    pub const PYOBJECT_BORROWED_LOCAL: Self = Self::PyObject {
+        ownership: TypedPyObjectOwnershipPlan::BorrowedLocal,
+    };
+    pub const PYOBJECT_IMMORTAL: Self = Self::PyObject {
+        ownership: TypedPyObjectOwnershipPlan::Immortal,
+    };
+    pub const I32_BOOL01: Self = Self::I32Bool01;
+    pub const I64_VALUE: Self = Self::I64;
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TypedInstrExtra {
     pub result_facts: Option<ValueFacts>,
     pub demand: Option<TypedResultDemand>,
+    pub planned_result: Option<TypedPlannedResult>,
 }
 
 impl TypedInstrExtra {
@@ -1657,6 +1689,22 @@ impl TypedInstrExtra {
 
     pub fn clear_demand(&mut self) -> bool {
         self.demand.take().is_some()
+    }
+
+    pub fn planned_result(&self) -> Option<TypedPlannedResult> {
+        self.planned_result
+    }
+
+    pub fn set_planned_result(&mut self, planned_result: TypedPlannedResult) -> bool {
+        if self.planned_result == Some(planned_result) {
+            return false;
+        }
+        self.planned_result = Some(planned_result);
+        true
+    }
+
+    pub fn clear_planned_result(&mut self) -> bool {
+        self.planned_result.take().is_some()
     }
 }
 
@@ -1751,6 +1799,10 @@ impl InstrTyped {
 
     pub fn result_demand(&self) -> Option<TypedResultDemand> {
         self.typed_extra().and_then(TypedInstrExtra::demand)
+    }
+
+    pub fn planned_result(&self) -> Option<TypedPlannedResult> {
+        self.typed_extra().and_then(TypedInstrExtra::planned_result)
     }
 }
 
@@ -1893,6 +1945,21 @@ pub fn annotate_typed_function_value_facts(
 fn set_typed_instr_demand(expr: &mut InstrTyped, demand: TypedResultDemand) -> usize {
     expr.typed_extra_mut()
         .map(|extra| usize::from(extra.set_demand(demand)))
+        .unwrap_or(0)
+}
+
+fn set_typed_instr_planned_result(
+    expr: &mut InstrTyped,
+    planned_result: TypedPlannedResult,
+) -> usize {
+    expr.typed_extra_mut()
+        .map(|extra| usize::from(extra.set_planned_result(planned_result)))
+        .unwrap_or(0)
+}
+
+fn clear_typed_instr_planned_result(expr: &mut InstrTyped) -> usize {
+    expr.typed_extra_mut()
+        .map(|extra| usize::from(extra.clear_planned_result()))
         .unwrap_or(0)
 }
 
@@ -2092,6 +2159,62 @@ pub fn annotate_typed_function_result_demands(
         }
     }
     changed
+}
+
+pub fn annotate_typed_module_planned_results(
+    module: &mut BlockPyModule<TypedCodegenModuleShape>,
+) -> usize {
+    module
+        .callable_defs
+        .iter_mut()
+        .map(annotate_typed_function_planned_results)
+        .sum()
+}
+
+pub fn annotate_typed_function_planned_results(
+    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+) -> usize {
+    struct Annotator {
+        changed: usize,
+    }
+
+    impl VisitMut<InstrTyped> for Annotator {
+        fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+            expr.visit_children_mut(self);
+            if let Some(planned_result) = plan_typed_instr_result(expr) {
+                self.changed += set_typed_instr_planned_result(expr, planned_result);
+            } else {
+                self.changed += clear_typed_instr_planned_result(expr);
+            }
+        }
+    }
+
+    let mut annotator = Annotator { changed: 0 };
+    annotator.visit_fn_mut(function);
+    annotator.changed
+}
+
+fn plan_typed_instr_result(expr: &InstrTyped) -> Option<TypedPlannedResult> {
+    let demand = expr.result_demand()?;
+    Some(match demand {
+        TypedResultDemand::EffectOnly => TypedPlannedResult::EffectOnly,
+        TypedResultDemand::PyObject { borrowed_ok } => {
+            let ownership = match expr.result_facts().and_then(ValueFacts::as_pyobj) {
+                Some(py_facts) if py_facts.is_immortal() => TypedPyObjectOwnershipPlan::Immortal,
+                _ if borrowed_ok && typed_instr_is_local_load(expr) => {
+                    TypedPyObjectOwnershipPlan::BorrowedLocal
+                }
+                _ => TypedPyObjectOwnershipPlan::Owned,
+            };
+            TypedPlannedResult::PyObject { ownership }
+        }
+        TypedResultDemand::I32Bool01 => TypedPlannedResult::I32Bool01,
+        TypedResultDemand::I64 | TypedResultDemand::I64Index => TypedPlannedResult::I64,
+    })
+}
+
+fn typed_instr_is_local_load(expr: &InstrTyped) -> bool {
+    matches!(expr, InstrTyped::Load(op) if op.name.local_location().is_some())
 }
 
 pub fn refresh_typed_function_value_facts(
