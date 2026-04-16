@@ -7,6 +7,7 @@ pub mod blockpy_to_bb;
 pub(crate) mod core_await_lower;
 mod escape_analysis;
 mod global_index;
+mod inline_plan;
 mod instr_id;
 mod instrument;
 mod local_env_plan;
@@ -669,7 +670,10 @@ pub(crate) use blockpy_generators::lower_yield_in_lowered_core_blockpy_module_bu
 pub use blockpy_to_bb::{lower_try_jump_exception_flow, normalize_bb_module_strings};
 pub use escape_analysis::{
     summarize_module_escapes, ConstructorFieldStore, ConstructorFieldValue, EscapeSummaryModule,
-    FunctionEscapeSummary, NonEscapingConstructorSummary,
+    FieldInitializerConstructorSummary, FunctionEscapeSummary, NonEscapingConstructorSummary,
+};
+pub use inline_plan::{
+    plan_module_inlining, FunctionInlinePlan, InlinePlanModule, StraightlineConstructorInlinePlan,
 };
 pub use instr_id::{
     assign_function_instr_ids, assign_module_instr_ids, validate_codegen_instr_ids,

@@ -360,6 +360,9 @@ fn finish_codegen_module_with_tracker(
         let escape_summary = pass_tracker.run_pass("escape_summary", || {
             passes::summarize_module_escapes(&bb_codegen)
         });
+        let inline_plan = pass_tracker.run_pass("inline_plan", || {
+            passes::plan_module_inlining(&escape_summary)
+        });
         let value_facts: passes::FactStore = pass_tracker.record_timing("value_facts", || {
             passes::infer_module_value_facts(&bb_codegen)
         });
@@ -394,6 +397,7 @@ fn finish_codegen_module_with_tracker(
         })?;
         CachedPreparedCodegen {
             escape_summary,
+            inline_plan,
             value_facts,
             ownership_plan,
             local_env_plan,
