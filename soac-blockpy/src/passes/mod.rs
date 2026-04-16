@@ -1589,9 +1589,41 @@ pub enum InstrTyped {
 
 pub type InstrTypedCodegen = InstrTyped;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TypedResultDemand {
+    EffectOnly,
+    PyObject { borrowed_ok: bool },
+    I32Bool01,
+    I64,
+    I64Index,
+}
+
+impl TypedResultDemand {
+    pub const PYOBJECT_OWNED: Self = Self::PyObject { borrowed_ok: false };
+    pub const PYOBJECT_BORROWED_OK: Self = Self::PyObject { borrowed_ok: true };
+    pub const I32_BOOL01: Self = Self::I32Bool01;
+    pub const I64_VALUE: Self = Self::I64;
+    pub const I64_INDEX: Self = Self::I64Index;
+
+    pub const fn needs_value(self) -> bool {
+        matches!(
+            self,
+            Self::PyObject { .. } | Self::I32Bool01 | Self::I64 | Self::I64Index
+        )
+    }
+
+    pub const fn borrowed_ok(self) -> bool {
+        match self {
+            Self::EffectOnly | Self::I32Bool01 | Self::I64 | Self::I64Index => false,
+            Self::PyObject { borrowed_ok } => borrowed_ok,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TypedInstrExtra {
     pub result_facts: Option<ValueFacts>,
+    pub demand: Option<TypedResultDemand>,
 }
 
 impl TypedInstrExtra {
@@ -1609,6 +1641,22 @@ impl TypedInstrExtra {
 
     pub fn clear_result_facts(&mut self) -> bool {
         self.result_facts.take().is_some()
+    }
+
+    pub fn demand(&self) -> Option<TypedResultDemand> {
+        self.demand
+    }
+
+    pub fn set_demand(&mut self, demand: TypedResultDemand) -> bool {
+        if self.demand == Some(demand) {
+            return false;
+        }
+        self.demand = Some(demand);
+        true
+    }
+
+    pub fn clear_demand(&mut self) -> bool {
+        self.demand.take().is_some()
     }
 }
 
@@ -1699,6 +1747,10 @@ impl InstrTyped {
 
     pub fn result_facts(&self) -> Option<ValueFacts> {
         self.typed_extra().and_then(TypedInstrExtra::result_facts)
+    }
+
+    pub fn result_demand(&self) -> Option<TypedResultDemand> {
+        self.typed_extra().and_then(TypedInstrExtra::demand)
     }
 }
 
@@ -1836,6 +1888,210 @@ pub fn annotate_typed_function_value_facts(
     };
     annotator.visit_fn_mut(function);
     annotator.changed
+}
+
+fn set_typed_instr_demand(expr: &mut InstrTyped, demand: TypedResultDemand) -> usize {
+    expr.typed_extra_mut()
+        .map(|extra| usize::from(extra.set_demand(demand)))
+        .unwrap_or(0)
+}
+
+fn annotate_call_arg_input_demands(
+    args: &mut [CallArgPositional<InstrTyped>],
+    keywords: &mut [CallArgKeyword<InstrTyped>],
+) -> usize {
+    let mut changed = 0;
+    for arg in args {
+        changed += annotate_pyobject_borrowed_input_demand(arg.expr_mut());
+    }
+    for keyword in keywords {
+        changed += annotate_pyobject_borrowed_input_demand(keyword.expr_mut());
+    }
+    changed
+}
+
+fn annotate_pyobject_borrowed_input_demand(expr: &mut InstrTyped) -> usize {
+    let mut changed = set_typed_instr_demand(expr, TypedResultDemand::PYOBJECT_BORROWED_OK);
+    changed += annotate_typed_child_demands(expr);
+    changed
+}
+
+fn annotate_typed_child_demands(expr: &mut InstrTyped) -> usize {
+    match expr {
+        InstrTyped::BinOp(op) => {
+            annotate_pyobject_borrowed_input_demand(op.left.as_mut())
+                + annotate_pyobject_borrowed_input_demand(op.right.as_mut())
+        }
+        InstrTyped::LegacyUnaryOp(op) => {
+            annotate_pyobject_borrowed_input_demand(op.operand.as_mut())
+        }
+        InstrTyped::LegacyTuple(op) => op
+            .values
+            .iter_mut()
+            .map(annotate_pyobject_borrowed_input_demand)
+            .sum(),
+        InstrTyped::LegacyCalleeFunctionId(op) => {
+            annotate_pyobject_borrowed_input_demand(op.value.as_mut())
+        }
+        InstrTyped::LegacyStore(store) => {
+            let mut changed =
+                set_typed_instr_demand(store.value.as_mut(), TypedResultDemand::PYOBJECT_OWNED);
+            changed += annotate_typed_child_demands(store.value.as_mut());
+            changed
+        }
+        InstrTyped::CallTyped(call) => {
+            let mut changed =
+                set_typed_instr_demand(call.func.as_mut(), TypedResultDemand::PYOBJECT_BORROWED_OK);
+            changed += annotate_typed_child_demands(call.func.as_mut());
+            changed += annotate_call_arg_input_demands(
+                call.args.as_mut_slice(),
+                call.keywords.as_mut_slice(),
+            );
+            changed
+        }
+        InstrTyped::GuardedCallableCallTyped(call) => {
+            let mut changed =
+                set_typed_instr_demand(call.func.as_mut(), TypedResultDemand::PYOBJECT_BORROWED_OK);
+            changed += annotate_typed_child_demands(call.func.as_mut());
+            changed += annotate_call_arg_input_demands(
+                call.args.as_mut_slice(),
+                call.keywords.as_mut_slice(),
+            );
+            changed
+        }
+        InstrTyped::GuardedMethodCallTyped(call) => {
+            let mut changed =
+                set_typed_instr_demand(call.func.as_mut(), TypedResultDemand::PYOBJECT_BORROWED_OK);
+            changed += annotate_typed_child_demands(call.func.as_mut());
+            changed += annotate_call_arg_input_demands(
+                call.args.as_mut_slice(),
+                call.keywords.as_mut_slice(),
+            );
+            changed
+        }
+        InstrTyped::DirectCallableCallTyped(call) => {
+            let mut changed =
+                set_typed_instr_demand(call.func.as_mut(), TypedResultDemand::PYOBJECT_BORROWED_OK);
+            changed += annotate_typed_child_demands(call.func.as_mut());
+            changed += annotate_call_arg_input_demands(call.args.as_mut_slice(), &mut []);
+            changed
+        }
+        InstrTyped::DirectMethodCallTyped(call) => {
+            let mut changed = set_typed_instr_demand(
+                call.receiver.as_mut(),
+                TypedResultDemand::PYOBJECT_BORROWED_OK,
+            );
+            changed += annotate_typed_child_demands(call.receiver.as_mut());
+            changed += annotate_call_arg_input_demands(call.args.as_mut_slice(), &mut []);
+            changed
+        }
+        InstrTyped::DirectCallGuardTest(op) => {
+            annotate_pyobject_borrowed_input_demand(op.value.as_mut())
+        }
+        InstrTyped::LegacyCall(call) => {
+            let mut changed =
+                set_typed_instr_demand(call.func.as_mut(), TypedResultDemand::PYOBJECT_BORROWED_OK);
+            changed += annotate_typed_child_demands(call.func.as_mut());
+            changed += annotate_call_arg_input_demands(
+                call.args.as_mut_slice(),
+                call.keywords.as_mut_slice(),
+            );
+            changed
+        }
+        InstrTyped::LegacyCallDirect(call) => {
+            let mut changed = set_typed_instr_demand(
+                call.callable.as_mut(),
+                TypedResultDemand::PYOBJECT_BORROWED_OK,
+            );
+            changed += annotate_typed_child_demands(call.callable.as_mut());
+            changed += annotate_call_arg_input_demands(
+                call.args.as_mut_slice(),
+                call.keywords.as_mut_slice(),
+            );
+            changed
+        }
+        InstrTyped::GetAttrTyped(op) => {
+            annotate_pyobject_borrowed_input_demand(op.value.as_mut())
+                + annotate_pyobject_borrowed_input_demand(op.attr.as_mut())
+        }
+        InstrTyped::SetAttrTyped(op) => {
+            annotate_pyobject_borrowed_input_demand(op.value.as_mut())
+                + annotate_pyobject_borrowed_input_demand(op.attr.as_mut())
+                + annotate_pyobject_borrowed_input_demand(op.replacement.as_mut())
+        }
+        InstrTyped::LegacyGetAttr(op) => {
+            annotate_pyobject_borrowed_input_demand(op.value.as_mut())
+                + annotate_pyobject_borrowed_input_demand(op.attr.as_mut())
+        }
+        InstrTyped::LegacySetAttr(op) => {
+            annotate_pyobject_borrowed_input_demand(op.value.as_mut())
+                + annotate_pyobject_borrowed_input_demand(op.attr.as_mut())
+                + annotate_pyobject_borrowed_input_demand(op.replacement.as_mut())
+        }
+        InstrTyped::LegacyGetItem(op) => {
+            annotate_pyobject_borrowed_input_demand(op.value.as_mut())
+                + annotate_pyobject_borrowed_input_demand(op.index.as_mut())
+        }
+        InstrTyped::LegacySetItem(op) => {
+            annotate_pyobject_borrowed_input_demand(op.value.as_mut())
+                + annotate_pyobject_borrowed_input_demand(op.index.as_mut())
+                + annotate_pyobject_borrowed_input_demand(op.replacement.as_mut())
+        }
+        InstrTyped::LegacyDelItem(op) => {
+            annotate_pyobject_borrowed_input_demand(op.value.as_mut())
+                + annotate_pyobject_borrowed_input_demand(op.index.as_mut())
+        }
+        InstrTyped::LegacyMakeFunctionWithClosure(op) => {
+            annotate_pyobject_borrowed_input_demand(op.captures.as_mut())
+                + annotate_pyobject_borrowed_input_demand(op.param_defaults.as_mut())
+                + annotate_pyobject_borrowed_input_demand(op.annotate_fn.as_mut())
+        }
+        _ => 0,
+    }
+}
+
+pub fn annotate_typed_module_result_demands(
+    module: &mut BlockPyModule<TypedCodegenModuleShape>,
+) -> usize {
+    module
+        .callable_defs
+        .iter_mut()
+        .map(annotate_typed_function_result_demands)
+        .sum()
+}
+
+pub fn annotate_typed_function_result_demands(
+    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+) -> usize {
+    let mut changed = 0;
+    for block in &mut function.blocks {
+        for expr in &mut block.body {
+            changed += set_typed_instr_demand(expr, TypedResultDemand::EffectOnly);
+            changed += annotate_typed_child_demands(expr);
+        }
+        match &mut block.term {
+            BlockTerm::IfTerm(if_term) => {
+                changed += set_typed_instr_demand(&mut if_term.test, TypedResultDemand::I32_BOOL01);
+                changed += annotate_typed_child_demands(&mut if_term.test);
+            }
+            BlockTerm::BranchTable(branch) => {
+                changed += set_typed_instr_demand(&mut branch.index, TypedResultDemand::I64_INDEX);
+                changed += annotate_typed_child_demands(&mut branch.index);
+            }
+            BlockTerm::Return(value) => {
+                changed += set_typed_instr_demand(value, TypedResultDemand::PYOBJECT_OWNED);
+                changed += annotate_typed_child_demands(value);
+            }
+            BlockTerm::Raise(raise_stmt) => {
+                if let Some(exc) = raise_stmt.exc.as_mut() {
+                    changed += set_typed_instr_demand(exc, TypedResultDemand::PYOBJECT_OWNED);
+                    changed += annotate_typed_child_demands(exc);
+                }
+            }
+            BlockTerm::Jump(_) => {}
+        }
+    }
+    changed
 }
 
 pub fn refresh_typed_function_value_facts(

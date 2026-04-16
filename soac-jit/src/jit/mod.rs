@@ -59,7 +59,8 @@ use soac_blockpy::passes::{
     TypedDirectCallableCallGuard, TypedDirectConstructorCallGuard, TypedDirectFunctionCallGuard,
     TypedDirectMethodCall, TypedDirectMethodCallGuard, TypedGetAttr, TypedGuardedCallableCall,
     TypedGuardedMethodCall, TypedIndexedFieldGuard, TypedSetAttr, ValueFacts,
-    annotate_typed_function_value_facts, assign_missing_codegen_function_instr_ids,
+    annotate_typed_function_result_demands, annotate_typed_function_value_facts,
+    assign_missing_codegen_function_instr_ids,
     build_cross_module_direct_method_inline_fragment_to_target,
     build_direct_method_inline_fragment_to_target, infer_module_value_facts,
     inline_direct_call_stores_with_callees, lower_codegen_function_to_typed,
@@ -6457,26 +6458,11 @@ fn codegen_expr_is_borrowable_from_local_env(
     }
 }
 
-fn planned_pyobject_input_borrowed_ok_for_codegen_expr(
-    result_demand_plan: &ResultDemandPlan,
-    expr: &InstrCodegen,
-) -> Option<bool> {
-    let instr_id = expr.try_semantic_instr_id()?;
-    result_demand_plan
-        .demand_for_instr_id(instr_id)
-        .map(ResultDemand::borrowed_ok)
-}
-
 fn codegen_expr_pyobject_input_is_borrowed_from_local_env(
     expr: &InstrCodegen,
     local_env: &LocalEnv,
     ctx: &JitEmitCtx<'_>,
 ) -> bool {
-    let planned_borrowed_ok =
-        planned_pyobject_input_borrowed_ok_for_codegen_expr(ctx.result_demand_plan, expr);
-    if !planned_borrowed_ok.unwrap_or(true) {
-        return false;
-    }
     codegen_expr_is_borrowable_from_local_env(
         expr,
         local_env,
@@ -6509,24 +6495,16 @@ fn typed_expr_is_borrowable_from_local_env(
     }
 }
 
-fn planned_pyobject_input_borrowed_ok_for_typed_expr(
-    result_demand_plan: &ResultDemandPlan,
-    expr: &InstrTyped,
-) -> Option<bool> {
-    let instr_id = expr.try_semantic_instr_id()?;
-    result_demand_plan
-        .demand_for_instr_id(instr_id)
-        .map(ResultDemand::borrowed_ok)
-}
-
 fn typed_expr_pyobject_input_is_borrowed_from_local_env(
     expr: &InstrTyped,
     local_env: &LocalEnv,
     ctx: &JitEmitCtx<'_>,
 ) -> bool {
-    let planned_borrowed_ok =
-        planned_pyobject_input_borrowed_ok_for_typed_expr(ctx.result_demand_plan, expr);
-    if !planned_borrowed_ok.unwrap_or(true) {
+    if !expr
+        .result_demand()
+        .map(ResultDemand::borrowed_ok)
+        .unwrap_or(true)
+    {
         return false;
     }
     typed_expr_is_borrowable_from_local_env(
@@ -7488,182 +7466,6 @@ impl ModuleConstantAccessTable {
     }
 }
 
-#[derive(Clone, Debug, Default)]
-struct ResultDemandPlan {
-    demands_by_instr_id: HashMap<InstrId, ResultDemand>,
-}
-
-impl ResultDemandPlan {
-    fn insert_instr(&mut self, expr: &InstrTyped, demand: ResultDemand) {
-        if let Some(instr_id) = expr.try_semantic_instr_id() {
-            self.demands_by_instr_id.insert(instr_id, demand);
-        }
-    }
-
-    fn demand_for_instr_id(&self, instr_id: InstrId) -> Option<ResultDemand> {
-        self.demands_by_instr_id.get(&instr_id).copied()
-    }
-
-    fn demand_for_typed_stmt(&self, expr: &InstrTyped) -> ResultDemand {
-        expr.try_semantic_instr_id()
-            .and_then(|instr_id| self.demand_for_instr_id(instr_id))
-            .unwrap_or(ResultDemand::EffectOnly)
-    }
-}
-
-fn insert_call_arg_input_demands(
-    plan: &mut ResultDemandPlan,
-    args: &[CallArgPositional<InstrTyped>],
-    keywords: &[CallArgKeyword<InstrTyped>],
-) {
-    for arg in args {
-        let value = arg.expr();
-        insert_pyobject_borrowed_input_demand(plan, value);
-    }
-    for keyword in keywords {
-        let value = keyword.expr();
-        insert_pyobject_borrowed_input_demand(plan, value);
-    }
-}
-
-fn insert_pyobject_borrowed_input_demand(plan: &mut ResultDemandPlan, expr: &InstrTyped) {
-    plan.insert_instr(expr, ResultDemand::PYOBJECT_BORROWED_OK);
-    insert_typed_child_demands(plan, expr);
-}
-
-fn insert_typed_child_demands(plan: &mut ResultDemandPlan, expr: &InstrTyped) {
-    match expr {
-        InstrTyped::BinOp(op) => {
-            insert_pyobject_borrowed_input_demand(plan, op.left.as_ref());
-            insert_pyobject_borrowed_input_demand(plan, op.right.as_ref());
-        }
-        InstrTyped::LegacyUnaryOp(op) => {
-            insert_pyobject_borrowed_input_demand(plan, op.operand.as_ref());
-        }
-        InstrTyped::LegacyTuple(op) => {
-            for value in &op.values {
-                insert_pyobject_borrowed_input_demand(plan, value);
-            }
-        }
-        InstrTyped::LegacyCalleeFunctionId(op) => {
-            insert_pyobject_borrowed_input_demand(plan, op.value.as_ref());
-        }
-        InstrTyped::LegacyStore(store) => {
-            plan.insert_instr(store.value.as_ref(), ResultDemand::PYOBJECT_OWNED);
-            insert_typed_child_demands(plan, store.value.as_ref());
-        }
-        InstrTyped::CallTyped(call) => {
-            plan.insert_instr(call.func.as_ref(), ResultDemand::PYOBJECT_BORROWED_OK);
-            insert_typed_child_demands(plan, call.func.as_ref());
-            insert_call_arg_input_demands(plan, call.args.as_slice(), call.keywords.as_slice());
-        }
-        InstrTyped::GuardedCallableCallTyped(call) => {
-            plan.insert_instr(call.func.as_ref(), ResultDemand::PYOBJECT_BORROWED_OK);
-            insert_typed_child_demands(plan, call.func.as_ref());
-            insert_call_arg_input_demands(plan, call.args.as_slice(), call.keywords.as_slice());
-        }
-        InstrTyped::GuardedMethodCallTyped(call) => {
-            plan.insert_instr(call.func.as_ref(), ResultDemand::PYOBJECT_BORROWED_OK);
-            insert_typed_child_demands(plan, call.func.as_ref());
-            insert_call_arg_input_demands(plan, call.args.as_slice(), call.keywords.as_slice());
-        }
-        InstrTyped::DirectCallableCallTyped(call) => {
-            plan.insert_instr(call.func.as_ref(), ResultDemand::PYOBJECT_BORROWED_OK);
-            insert_typed_child_demands(plan, call.func.as_ref());
-            insert_call_arg_input_demands(plan, call.args.as_slice(), &[]);
-        }
-        InstrTyped::DirectMethodCallTyped(call) => {
-            plan.insert_instr(call.receiver.as_ref(), ResultDemand::PYOBJECT_BORROWED_OK);
-            insert_typed_child_demands(plan, call.receiver.as_ref());
-            insert_call_arg_input_demands(plan, call.args.as_slice(), &[]);
-        }
-        InstrTyped::DirectCallGuardTest(op) => {
-            insert_pyobject_borrowed_input_demand(plan, op.value.as_ref());
-        }
-        InstrTyped::LegacyCall(call) => {
-            plan.insert_instr(call.func.as_ref(), ResultDemand::PYOBJECT_BORROWED_OK);
-            insert_typed_child_demands(plan, call.func.as_ref());
-            insert_call_arg_input_demands(plan, call.args.as_slice(), call.keywords.as_slice());
-        }
-        InstrTyped::LegacyCallDirect(call) => {
-            plan.insert_instr(call.callable.as_ref(), ResultDemand::PYOBJECT_BORROWED_OK);
-            insert_typed_child_demands(plan, call.callable.as_ref());
-            insert_call_arg_input_demands(plan, call.args.as_slice(), call.keywords.as_slice());
-        }
-        InstrTyped::GetAttrTyped(op) => {
-            insert_pyobject_borrowed_input_demand(plan, op.value.as_ref());
-            insert_pyobject_borrowed_input_demand(plan, op.attr.as_ref());
-        }
-        InstrTyped::SetAttrTyped(op) => {
-            insert_pyobject_borrowed_input_demand(plan, op.value.as_ref());
-            insert_pyobject_borrowed_input_demand(plan, op.attr.as_ref());
-            insert_pyobject_borrowed_input_demand(plan, op.replacement.as_ref());
-        }
-        InstrTyped::LegacyGetAttr(op) => {
-            insert_pyobject_borrowed_input_demand(plan, op.value.as_ref());
-            insert_pyobject_borrowed_input_demand(plan, op.attr.as_ref());
-        }
-        InstrTyped::LegacySetAttr(op) => {
-            insert_pyobject_borrowed_input_demand(plan, op.value.as_ref());
-            insert_pyobject_borrowed_input_demand(plan, op.attr.as_ref());
-            insert_pyobject_borrowed_input_demand(plan, op.replacement.as_ref());
-        }
-        InstrTyped::LegacyGetItem(op) => {
-            insert_pyobject_borrowed_input_demand(plan, op.value.as_ref());
-            insert_pyobject_borrowed_input_demand(plan, op.index.as_ref());
-        }
-        InstrTyped::LegacySetItem(op) => {
-            insert_pyobject_borrowed_input_demand(plan, op.value.as_ref());
-            insert_pyobject_borrowed_input_demand(plan, op.index.as_ref());
-            insert_pyobject_borrowed_input_demand(plan, op.replacement.as_ref());
-        }
-        InstrTyped::LegacyDelItem(op) => {
-            insert_pyobject_borrowed_input_demand(plan, op.value.as_ref());
-            insert_pyobject_borrowed_input_demand(plan, op.index.as_ref());
-        }
-        InstrTyped::LegacyMakeFunctionWithClosure(op) => {
-            insert_pyobject_borrowed_input_demand(plan, op.captures.as_ref());
-            insert_pyobject_borrowed_input_demand(plan, op.param_defaults.as_ref());
-            insert_pyobject_borrowed_input_demand(plan, op.annotate_fn.as_ref());
-        }
-        _ => {}
-    }
-}
-
-fn plan_typed_result_demands(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
-) -> ResultDemandPlan {
-    let mut plan = ResultDemandPlan::default();
-    for block in &function.blocks {
-        for expr in &block.body {
-            plan.insert_instr(expr, ResultDemand::EffectOnly);
-            insert_typed_child_demands(&mut plan, expr);
-        }
-        if let BlockTerm::IfTerm(if_term) = &block.term {
-            plan.insert_instr(&if_term.test, ResultDemand::I32_BOOL01);
-        }
-        if let BlockTerm::BranchTable(branch) = &block.term {
-            plan.insert_instr(&branch.index, ResultDemand::I64_INDEX);
-        }
-        if let BlockTerm::Return(value) = &block.term {
-            plan.insert_instr(value, ResultDemand::PYOBJECT_OWNED);
-        }
-        if let BlockTerm::Raise(raise_stmt) = &block.term
-            && let Some(exc) = raise_stmt.exc.as_ref()
-        {
-            plan.insert_instr(exc, ResultDemand::PYOBJECT_OWNED);
-            insert_typed_child_demands(&mut plan, exc);
-        }
-        match &block.term {
-            BlockTerm::IfTerm(if_term) => insert_typed_child_demands(&mut plan, &if_term.test),
-            BlockTerm::BranchTable(branch) => insert_typed_child_demands(&mut plan, &branch.index),
-            BlockTerm::Return(value) => insert_typed_child_demands(&mut plan, value),
-            BlockTerm::Raise(_) | BlockTerm::Jump(_) => {}
-        }
-    }
-    plan
-}
-
 #[derive(Clone)]
 struct JitEmitCtx<'mc> {
     module: &'mc BlockPyModule<CodegenModuleShape>,
@@ -7673,7 +7475,6 @@ struct JitEmitCtx<'mc> {
     inline_plan: &'mc InlinePlanModule,
     module_constants: &'mc ModuleCodegenConstants,
     value_facts: &'mc FactStore,
-    result_demand_plan: &'mc ResultDemandPlan,
     deopt_resume_plan: &'mc PlannedJitDeoptResumeFunction,
     refcount_plan: &'mc FunctionRefcountPlan,
     counter_slots_by_id: &'mc [CounterRuntimeSlot],
@@ -9556,8 +9357,7 @@ fn emit_typed_local_store_result_with_local_env(
 
     let value_demand = op
         .value
-        .try_semantic_instr_id()
-        .and_then(|instr_id| emit_ctx.result_demand_plan.demand_for_instr_id(instr_id))
+        .result_demand()
         .unwrap_or(ResultDemand::PYOBJECT_OWNED);
     let value_result = match value_demand {
         ResultDemand::PyObject { borrowed_ok: false } => {
@@ -19265,7 +19065,7 @@ fn emit_typed_codegen_ops(
             expr,
             local_env,
             stmt_emit_ctx,
-            stmt_emit_ctx.result_demand_plan.demand_for_typed_stmt(expr),
+            expr.result_demand().unwrap_or(ResultDemand::EffectOnly),
             codegen_env,
             func_imports,
         )?;
@@ -19982,8 +19782,9 @@ fn emit_typed_codegen_term(
             .then(|| emit_ctx.with_guard_miss_resume_point(term_guard_miss_resume_point));
         let emit_ctx = term_emit_ctx.as_ref().unwrap_or(emit_ctx);
         let test_instr_id = if_term.test.try_semantic_instr_id();
-        let demand = test_instr_id
-            .and_then(|instr_id| emit_ctx.result_demand_plan.demand_for_instr_id(instr_id))
+        let demand = if_term
+            .test
+            .result_demand()
             .unwrap_or(ResultDemand::I32_BOOL01);
         let truth = match demand {
             ResultDemand::I32Bool01 => emit_typed_codegen_i32_bool01_result_with_local_env(
@@ -20024,9 +19825,8 @@ fn emit_typed_codegen_term(
         let term_emit_ctx = typed_nested_guard_misses_can_resume_before_instr(value)
             .then(|| emit_ctx.with_guard_miss_resume_point(term_guard_miss_resume_point));
         let emit_ctx = term_emit_ctx.as_ref().unwrap_or(emit_ctx);
-        let value_instr_id = value.try_semantic_instr_id();
-        let demand = value_instr_id
-            .and_then(|instr_id| emit_ctx.result_demand_plan.demand_for_instr_id(instr_id))
+        let demand = value
+            .result_demand()
             .unwrap_or(ResultDemand::PYOBJECT_OWNED);
         let result = match demand {
             ResultDemand::PyObject { borrowed_ok: false } => {
@@ -20068,9 +19868,8 @@ fn emit_typed_codegen_term(
             // Do not propagate BeforeTerm to the exception expression yet:
             // emit_load_raise_from_function has already run, so resuming before
             // the term would replay that prework.
-            let exc_instr_id = exc_expr.try_semantic_instr_id();
-            let demand = exc_instr_id
-                .and_then(|instr_id| emit_ctx.result_demand_plan.demand_for_instr_id(instr_id))
+            let demand = exc_expr
+                .result_demand()
                 .unwrap_or(ResultDemand::PYOBJECT_OWNED);
             let result = match demand {
                 ResultDemand::PyObject { borrowed_ok: false } => {
@@ -20119,9 +19918,9 @@ fn emit_typed_codegen_term(
         let term_emit_ctx = typed_nested_guard_misses_can_resume_before_instr(&branch.index)
             .then(|| emit_ctx.with_guard_miss_resume_point(term_guard_miss_resume_point));
         let emit_ctx = term_emit_ctx.as_ref().unwrap_or(emit_ctx);
-        let index_instr_id = branch.index.try_semantic_instr_id();
-        let demand = index_instr_id
-            .and_then(|instr_id| emit_ctx.result_demand_plan.demand_for_instr_id(instr_id))
+        let demand = branch
+            .index
+            .result_demand()
             .unwrap_or(ResultDemand::I64_INDEX);
         let index = match demand {
             ResultDemand::I64Index => emit_typed_codegen_i64_index_result_with_local_env(
@@ -23304,7 +23103,6 @@ struct BuildSpecializedFunctionOptions {
 
 struct PreparedSpecializedTypedFunction {
     typed_function: BlockPyFunction<TypedCodegenModuleShape>,
-    result_demand_plan: ResultDemandPlan,
 }
 
 fn block_edge_shape(edge: Option<&BlockEdge>) -> Option<(BlockLabel, usize)> {
@@ -23412,14 +23210,11 @@ fn prepare_specialized_typed_function(
     );
     lower_typed_function_call_access_plan_instrs(&mut typed_function);
     refresh_typed_function_value_facts(&mut typed_function);
+    annotate_typed_function_result_demands(&mut typed_function);
     validate_typed_function_call_access_plans(&typed_function)?;
     validate_typed_function_value_facts(&typed_function)?;
     validate_typed_function_preserves_codegen_cfg(function, &typed_function)?;
-    let result_demand_plan = plan_typed_result_demands(&typed_function);
-    Ok(PreparedSpecializedTypedFunction {
-        typed_function,
-        result_demand_plan,
-    })
+    Ok(PreparedSpecializedTypedFunction { typed_function })
 }
 
 fn build_cranelift_run_bb_specialized_function(
@@ -23644,10 +23439,7 @@ fn build_cranelift_run_bb_specialized_function(
         direct_owner_attr_specializations: options.direct_owner_attr_specializations.as_ref(),
         direct_edge_stats: &direct_edge_stats,
     };
-    let PreparedSpecializedTypedFunction {
-        typed_function,
-        result_demand_plan,
-    } = prepare_specialized_typed_function(
+    let PreparedSpecializedTypedFunction { typed_function } = prepare_specialized_typed_function(
         module,
         function,
         value_facts,
@@ -24199,7 +23991,6 @@ fn build_cranelift_run_bb_specialized_function(
                 inline_plan,
                 module_constants,
                 value_facts,
-                result_demand_plan: &result_demand_plan,
                 deopt_resume_plan: jit_deopt_resume_plan,
                 refcount_plan,
                 counter_slots_by_id,

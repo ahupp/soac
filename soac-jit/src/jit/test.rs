@@ -3486,8 +3486,41 @@ def build(values):
         build_test_specialized_function(&[1usize as ObjPtr], &module, &function, &module_constants);
     }
 
+    fn annotate_test_result_demands(
+        mut function: BlockPyFunction<TypedCodegenModuleShape>,
+    ) -> BlockPyFunction<TypedCodegenModuleShape> {
+        annotate_typed_function_result_demands(&mut function);
+        function
+    }
+
+    fn typed_demand_for_instr_id(
+        function: &BlockPyFunction<TypedCodegenModuleShape>,
+        instr_id: InstrId,
+    ) -> Option<ResultDemand> {
+        struct Finder {
+            instr_id: InstrId,
+            demand: Option<ResultDemand>,
+        }
+
+        impl Visit<InstrTyped> for Finder {
+            fn visit_instr(&mut self, expr: &InstrTyped) {
+                if self.demand.is_none() && expr.try_semantic_instr_id() == Some(self.instr_id) {
+                    self.demand = expr.result_demand();
+                }
+                expr.visit_children(self);
+            }
+        }
+
+        let mut finder = Finder {
+            instr_id,
+            demand: None,
+        };
+        finder.visit_fn(function);
+        finder.demand
+    }
+
     #[test]
-    fn typed_result_demand_plan_marks_statement_roots_effect_only() {
+    fn typed_result_demand_extra_marks_statement_roots_effect_only() {
         let mut constants = TestConstantPool::default();
         let instr_id = InstrId::new(BlockLabel::from_index(0), 0);
         let function = with_single_test_block(
@@ -3497,16 +3530,16 @@ def build(values):
         );
         let typed_function =
             lower_typed_function_if_tests_to_truthy(lower_codegen_function_to_typed(function));
-        let plan = plan_typed_result_demands(&typed_function);
+        let typed_function = annotate_test_result_demands(typed_function);
 
         assert_eq!(
-            plan.demand_for_instr_id(instr_id),
+            typed_demand_for_instr_id(&typed_function, instr_id),
             Some(ResultDemand::EffectOnly)
         );
     }
 
     #[test]
-    fn typed_result_demand_plan_marks_local_store_rhs_pyobject_owned() {
+    fn typed_result_demand_extra_marks_local_store_rhs_pyobject_owned() {
         let mut constants = TestConstantPool::default();
         let store_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
         let rhs_instr_id = InstrId::new(BlockLabel::from_index(0), 1);
@@ -3524,20 +3557,20 @@ def build(values):
         );
         let typed_function =
             lower_typed_function_if_tests_to_truthy(lower_codegen_function_to_typed(function));
-        let plan = plan_typed_result_demands(&typed_function);
+        let typed_function = annotate_test_result_demands(typed_function);
 
         assert_eq!(
-            plan.demand_for_instr_id(store_instr_id),
+            typed_demand_for_instr_id(&typed_function, store_instr_id),
             Some(ResultDemand::EffectOnly)
         );
         assert_eq!(
-            plan.demand_for_instr_id(rhs_instr_id),
+            typed_demand_for_instr_id(&typed_function, rhs_instr_id),
             Some(ResultDemand::PYOBJECT_OWNED)
         );
     }
 
     #[test]
-    fn typed_result_demand_plan_marks_call_inputs_pyobject_borrowed_ok() {
+    fn typed_result_demand_extra_marks_call_inputs_pyobject_borrowed_ok() {
         let mut constants = TestConstantPool::default();
         let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
         let func_instr_id = InstrId::new(BlockLabel::from_index(0), 1);
@@ -3560,28 +3593,28 @@ def build(values):
         let function =
             with_single_test_block(test_function(), vec![call], ret_term(constants.int_expr(3)));
         let typed_function = lower_codegen_function_to_typed(function);
-        let plan = plan_typed_result_demands(&typed_function);
+        let typed_function = annotate_test_result_demands(typed_function);
 
         assert_eq!(
-            plan.demand_for_instr_id(call_instr_id),
+            typed_demand_for_instr_id(&typed_function, call_instr_id),
             Some(ResultDemand::EffectOnly)
         );
         assert_eq!(
-            plan.demand_for_instr_id(func_instr_id),
+            typed_demand_for_instr_id(&typed_function, func_instr_id),
             Some(ResultDemand::PYOBJECT_BORROWED_OK)
         );
         assert_eq!(
-            plan.demand_for_instr_id(positional_instr_id),
+            typed_demand_for_instr_id(&typed_function, positional_instr_id),
             Some(ResultDemand::PYOBJECT_BORROWED_OK)
         );
         assert_eq!(
-            plan.demand_for_instr_id(keyword_instr_id),
+            typed_demand_for_instr_id(&typed_function, keyword_instr_id),
             Some(ResultDemand::PYOBJECT_BORROWED_OK)
         );
     }
 
     #[test]
-    fn typed_result_demand_plan_marks_lowered_guarded_call_inputs_borrowed_ok() {
+    fn typed_result_demand_extra_marks_lowered_guarded_call_inputs_borrowed_ok() {
         let mut constants = TestConstantPool::default();
         let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
         let func_instr_id = InstrId::new(BlockLabel::from_index(0), 1);
@@ -3630,24 +3663,24 @@ def build(values):
             ),
             "guarded call plan should lower before demand planning"
         );
-        let plan = plan_typed_result_demands(&typed_function);
+        let typed_function = annotate_test_result_demands(typed_function);
 
         assert_eq!(
-            plan.demand_for_instr_id(call_instr_id),
+            typed_demand_for_instr_id(&typed_function, call_instr_id),
             Some(ResultDemand::EffectOnly)
         );
         assert_eq!(
-            plan.demand_for_instr_id(func_instr_id),
+            typed_demand_for_instr_id(&typed_function, func_instr_id),
             Some(ResultDemand::PYOBJECT_BORROWED_OK)
         );
         assert_eq!(
-            plan.demand_for_instr_id(positional_instr_id),
+            typed_demand_for_instr_id(&typed_function, positional_instr_id),
             Some(ResultDemand::PYOBJECT_BORROWED_OK)
         );
     }
 
     #[test]
-    fn typed_result_demand_plan_marks_direct_call_inputs_pyobject_borrowed_ok() {
+    fn typed_result_demand_extra_marks_direct_call_inputs_pyobject_borrowed_ok() {
         let mut constants = TestConstantPool::default();
         let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
         let callable_instr_id = InstrId::new(BlockLabel::from_index(0), 1);
@@ -3667,18 +3700,18 @@ def build(values):
         let function =
             with_single_test_block(test_function(), vec![call], ret_term(constants.int_expr(2)));
         let typed_function = lower_codegen_function_to_typed(function);
-        let plan = plan_typed_result_demands(&typed_function);
+        let typed_function = annotate_test_result_demands(typed_function);
 
         assert_eq!(
-            plan.demand_for_instr_id(call_instr_id),
+            typed_demand_for_instr_id(&typed_function, call_instr_id),
             Some(ResultDemand::EffectOnly)
         );
         assert_eq!(
-            plan.demand_for_instr_id(callable_instr_id),
+            typed_demand_for_instr_id(&typed_function, callable_instr_id),
             Some(ResultDemand::PYOBJECT_BORROWED_OK)
         );
         assert_eq!(
-            plan.demand_for_instr_id(positional_instr_id),
+            typed_demand_for_instr_id(&typed_function, positional_instr_id),
             Some(ResultDemand::PYOBJECT_BORROWED_OK)
         );
     }
@@ -3914,49 +3947,34 @@ def build(values):
     }
 
     #[test]
-    fn planned_pyobject_input_borrowed_ok_for_codegen_expr_uses_result_demand_plan() {
+    fn typed_result_demand_is_node_local_without_instr_id() {
         let mut constants = TestConstantPool::default();
-        let borrowed_id = InstrId::new(BlockLabel::from_index(0), 1);
-        let owned_id = InstrId::new(BlockLabel::from_index(0), 2);
-        let bool_id = InstrId::new(BlockLabel::from_index(0), 3);
-        let missing_id = InstrId::new(BlockLabel::from_index(0), 4);
-        let borrowed_expr = with_instr_id(constants.int_expr(1), borrowed_id);
-        let owned_expr = with_instr_id(constants.int_expr(2), owned_id);
-        let bool_expr = with_instr_id(constants.int_expr(3), bool_id);
-        let missing_expr = with_instr_id(constants.int_expr(4), missing_id);
-        let no_id_expr = constants.int_expr(5);
-        let mut plan = ResultDemandPlan::default();
-        plan.demands_by_instr_id
-            .insert(borrowed_id, ResultDemand::PYOBJECT_BORROWED_OK);
-        plan.demands_by_instr_id
-            .insert(owned_id, ResultDemand::PYOBJECT_OWNED);
-        plan.demands_by_instr_id
-            .insert(bool_id, ResultDemand::I32_BOOL01);
+        let call = op_expr(Call::new(
+            name_expr(test_runtime_name("callable")),
+            vec![CallArgPositional::Positional(constants.int_expr(1))],
+            Vec::<CallArgKeyword<InstrCodegen>>::new(),
+        ));
+        let function =
+            with_single_test_block(test_function(), vec![call], ret_term(constants.int_expr(2)));
+        let typed_function =
+            annotate_test_result_demands(lower_codegen_function_to_typed(function));
+        let Some(InstrTyped::CallTyped(call)) = typed_function.blocks[0].body.first() else {
+            panic!("test call should lower to typed call");
+        };
 
+        assert_eq!(call.extra.demand(), Some(ResultDemand::EffectOnly));
         assert_eq!(
-            planned_pyobject_input_borrowed_ok_for_codegen_expr(&plan, &borrowed_expr),
-            Some(true)
+            call.func.result_demand(),
+            Some(ResultDemand::PYOBJECT_BORROWED_OK)
         );
         assert_eq!(
-            planned_pyobject_input_borrowed_ok_for_codegen_expr(&plan, &owned_expr),
-            Some(false)
-        );
-        assert_eq!(
-            planned_pyobject_input_borrowed_ok_for_codegen_expr(&plan, &bool_expr),
-            Some(false)
-        );
-        assert_eq!(
-            planned_pyobject_input_borrowed_ok_for_codegen_expr(&plan, &missing_expr),
-            None
-        );
-        assert_eq!(
-            planned_pyobject_input_borrowed_ok_for_codegen_expr(&plan, &no_id_expr),
-            None
+            call.args[0].expr().result_demand(),
+            Some(ResultDemand::PYOBJECT_BORROWED_OK)
         );
     }
 
     #[test]
-    fn typed_result_demand_plan_marks_intrinsic_inputs_pyobject_borrowed_ok() {
+    fn typed_result_demand_extra_marks_intrinsic_inputs_pyobject_borrowed_ok() {
         let mut constants = TestConstantPool::default();
         let binop_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
         let left_instr_id = InstrId::new(BlockLabel::from_index(0), 1);
@@ -3975,24 +3993,24 @@ def build(values):
             ret_term(constants.int_expr(3)),
         );
         let typed_function = lower_codegen_function_to_typed(function);
-        let plan = plan_typed_result_demands(&typed_function);
+        let typed_function = annotate_test_result_demands(typed_function);
 
         assert_eq!(
-            plan.demand_for_instr_id(binop_instr_id),
+            typed_demand_for_instr_id(&typed_function, binop_instr_id),
             Some(ResultDemand::EffectOnly)
         );
         assert_eq!(
-            plan.demand_for_instr_id(left_instr_id),
+            typed_demand_for_instr_id(&typed_function, left_instr_id),
             Some(ResultDemand::PYOBJECT_BORROWED_OK)
         );
         assert_eq!(
-            plan.demand_for_instr_id(right_instr_id),
+            typed_demand_for_instr_id(&typed_function, right_instr_id),
             Some(ResultDemand::PYOBJECT_BORROWED_OK)
         );
     }
 
     #[test]
-    fn typed_result_demand_plan_marks_branch_tests_i32_bool01() {
+    fn typed_result_demand_extra_marks_branch_tests_i32_bool01() {
         let mut constants = TestConstantPool::default();
         let function = test_function();
         let entry_label = function.name_gen.next_block_name();
@@ -4027,16 +4045,16 @@ def build(values):
         let function = with_test_blocks(function, vec![entry, then_block, else_block]);
         let typed_function =
             lower_typed_function_if_tests_to_truthy(lower_codegen_function_to_typed(function));
-        let plan = plan_typed_result_demands(&typed_function);
+        let typed_function = annotate_test_result_demands(typed_function);
 
         assert_eq!(
-            plan.demand_for_instr_id(test_instr_id),
+            typed_demand_for_instr_id(&typed_function, test_instr_id),
             Some(ResultDemand::I32_BOOL01)
         );
     }
 
     #[test]
-    fn typed_result_demand_plan_marks_branch_table_indices_i64_index() {
+    fn typed_result_demand_extra_marks_branch_table_indices_i64_index() {
         let mut constants = TestConstantPool::default();
         let function = test_function();
         let entry_label = function.name_gen.next_block_name();
@@ -4070,16 +4088,16 @@ def build(values):
         };
         let function = with_test_blocks(function, vec![entry, case_block, default_block]);
         let typed_function = lower_codegen_function_to_typed(function);
-        let plan = plan_typed_result_demands(&typed_function);
+        let typed_function = annotate_test_result_demands(typed_function);
 
         assert_eq!(
-            plan.demand_for_instr_id(index_instr_id),
+            typed_demand_for_instr_id(&typed_function, index_instr_id),
             Some(ResultDemand::I64_INDEX)
         );
     }
 
     #[test]
-    fn typed_result_demand_plan_marks_return_values_pyobject_owned() {
+    fn typed_result_demand_extra_marks_return_values_pyobject_owned() {
         let mut constants = TestConstantPool::default();
         let return_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
         let function = with_single_test_block(
@@ -4088,16 +4106,16 @@ def build(values):
             ret_term(with_instr_id(constants.int_expr(2), return_instr_id)),
         );
         let typed_function = lower_codegen_function_to_typed(function);
-        let plan = plan_typed_result_demands(&typed_function);
+        let typed_function = annotate_test_result_demands(typed_function);
 
         assert_eq!(
-            plan.demand_for_instr_id(return_instr_id),
+            typed_demand_for_instr_id(&typed_function, return_instr_id),
             Some(ResultDemand::PYOBJECT_OWNED)
         );
     }
 
     #[test]
-    fn typed_result_demand_plan_marks_raise_values_pyobject_owned() {
+    fn typed_result_demand_extra_marks_raise_values_pyobject_owned() {
         let mut constants = TestConstantPool::default();
         let raise_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
         let function = with_single_test_block(
@@ -4108,10 +4126,10 @@ def build(values):
             }),
         );
         let typed_function = lower_codegen_function_to_typed(function);
-        let plan = plan_typed_result_demands(&typed_function);
+        let typed_function = annotate_test_result_demands(typed_function);
 
         assert_eq!(
-            plan.demand_for_instr_id(raise_instr_id),
+            typed_demand_for_instr_id(&typed_function, raise_instr_id),
             Some(ResultDemand::PYOBJECT_OWNED)
         );
     }

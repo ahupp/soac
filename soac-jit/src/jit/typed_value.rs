@@ -1,5 +1,6 @@
 use cranelift_codegen::ir;
 use soac_blockpy::passes::PyObjFacts;
+pub use soac_blockpy::passes::TypedResultDemand as ResultDemand;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IntWidth {
@@ -223,37 +224,6 @@ impl SoacValue {
             "{context}: expected normalized I32 0/1 value, got {facts:?}"
         );
         value
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ResultDemand {
-    EffectOnly,
-    PyObject { borrowed_ok: bool },
-    I32Bool01,
-    I64,
-    I64Index,
-}
-
-impl ResultDemand {
-    pub const PYOBJECT_OWNED: Self = Self::PyObject { borrowed_ok: false };
-    pub const PYOBJECT_BORROWED_OK: Self = Self::PyObject { borrowed_ok: true };
-    pub const I32_BOOL01: Self = Self::I32Bool01;
-    pub const I64_VALUE: Self = Self::I64;
-    pub const I64_INDEX: Self = Self::I64Index;
-
-    pub const fn needs_value(self) -> bool {
-        matches!(
-            self,
-            Self::PyObject { .. } | Self::I32Bool01 | Self::I64 | Self::I64Index
-        )
-    }
-
-    pub const fn borrowed_ok(self) -> bool {
-        match self {
-            Self::EffectOnly | Self::I32Bool01 | Self::I64 | Self::I64Index => false,
-            Self::PyObject { borrowed_ok } => borrowed_ok,
-        }
     }
 }
 

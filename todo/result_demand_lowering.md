@@ -133,32 +133,22 @@ result before returning `NoValue`.
 
 ## Implementation Order
 
-Status: step 1 has the initial codegen-local `ResultDemand`, `ValueOwnership`,
-and `EmitResult` wrappers in `soac-jit/src/jit/typed_value.rs`. Step 2 has
+Status: step 1 has `ResultDemand`, `ValueOwnership`, and `EmitResult` wrappers;
+`ResultDemand` is now the BlockPy-owned `TypedResultDemand`, while
+`ValueOwnership` and `EmitResult` remain backend-shaped JIT values. Step 2 has
 started: statement-position JIT emission now requests `EffectOnly` through a
 typed result wrapper. LocalEnv-backed `Store` and `Del` producers now honor
 `EffectOnly` directly and return `NoValue`; generic `Call` and `CallDirect`
 statement producers now execute the call and discard owned results at the call
 boundary. Non-local cell/global producers still use the legacy object-producing
-path before the wrapper discards the result. Step 6 has started with a
-codegen-local demand plan keyed by semantic instruction id for statement roots;
-it currently preserves existing `EffectOnly` behavior while providing the table
-that later term and typed-value demands can share. Step 7 has started by marking
-branch tests with `I32Bool01` demand in that same table. Step 7 also marks
-branch-table indices with `I64Index` demand and routes typed branch-table term
-emission through the planned integer index result. Return expressions are now
-planned as owned `PyObject` demand and typed return emission consumes that
-planned result before entering the shared return cleanup path. Local store RHS
-expressions are now also planned as owned `PyObject` demand, and typed LocalEnv
-store emission consumes that child demand before installing the value. Raise
-exception expressions are now planned as owned `PyObject` demand and typed raise
-emission consumes that demand before entering the shared raise path. Generic and
-direct call callable/argument inputs are now planned as borrowed-ok `PyObject`
-demands. Generic/direct call emitters now consult those planned demands before
-requesting borrowed inputs, while still using local borrowability as the
-producer capability check. Operator/intrinsic inputs are now also planned as
-borrowed-ok `PyObject` demands and intrinsic argument emission consumes that same
-helper path.
+path before the wrapper discards the result. Step 6 has moved from a
+codegen-local `HashMap<InstrId, ResultDemand>` sidecar to node-local
+`TypedInstrExtra::demand` annotations on `InstrTyped`. Return values, local
+store RHS expressions, raise exception expressions, generic/direct call inputs,
+and operator/intrinsic inputs are annotated before JIT codegen and consumed
+directly from the typed instruction. Step 7 has started by annotating branch
+tests with `I32Bool01` demand and branch-table indices with `I64Index` demand;
+typed term emission consumes those annotations.
 
 1. Add `ResultDemand::{EffectOnly, PyObject { borrowed_ok }}` and an `EmitResult`
    wrapper near the existing `SoacValue`/LocalEnv codegen types.
@@ -170,21 +160,23 @@ helper path.
 5. Convert generic calls so `EffectOnly` calls still execute and then discard the
    owned result internally. Done for the JIT statement-result boundary; follow-up
    work can push demand deeper into individual call specializations.
-6. Add a later BlockPy demand-planning pass keyed by semantic `InstrId`, after
-   name binding / simplification / instrumentation and before JIT planning.
-   Started in JIT codegen as a local plan for statement-root demands; this can
-   move earlier once more consumers need planned typed demands. Return values are
-   now planned as owned `PyObject` demand. Local store RHS values are also
-   planned as owned `PyObject` demand for the typed LocalEnv store path. Raise
-   exception values are planned as owned `PyObject` demand for the typed raise
-   path. Generic and direct call inputs are planned as borrowed-ok `PyObject`
-   demand and the generic/direct call emitters consume those demands through a
-   shared call-input borrow helper. Operator/intrinsic inputs are planned as
-   borrowed-ok `PyObject` demand and intrinsic argument emission consumes that
-   same helper path.
+6. Add a BlockPy demand-planning pass after typed call/access lowering and
+   before JIT codegen. Done for current result demands: the pass writes
+   `TypedInstrExtra::demand` on the typed IR node instead of building a
+   codegen-local sidecar map. Return values are planned as owned `PyObject`
+   demand. Local store RHS values are planned as owned `PyObject` demand for the
+   typed LocalEnv store path. Raise exception values are planned as owned
+   `PyObject` demand for the typed raise path. Generic and direct call inputs are
+   planned as borrowed-ok `PyObject` demand and the generic/direct call emitters
+   consume those demands through a shared call-input borrow helper.
+   Operator/intrinsic inputs are planned as borrowed-ok `PyObject` demand and
+   intrinsic argument emission consumes that same helper path.
 7. Extend demand to `I32Bool01` and `I64Index` once the value-space/refcount
    representation can carry non-Python values cleanly. Started with branch-test
    `I32Bool01` demands and branch-table `I64Index` demands.
 
-Production paths should be strict about missing semantic instruction ids. Tests
-should use builders that assign ids instead of silently defaulting demands.
+Production codegen should read demand from `InstrTyped` extras. Missing demand
+means only that a producer has not been annotated yet; statement roots default to
+`EffectOnly` while strict typed consumers such as return/store/raise should keep
+checking for the demand shape they require. Tests should prefer assertions on
+the typed instruction extras rather than reconstructing sidecar maps.
