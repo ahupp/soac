@@ -5,11 +5,13 @@ use crate::block_py::{
     TryMapTerm, WithMeta,
 };
 use crate::passes::{
-    allocate_codegen_stack_temp, reassign_codegen_function_instr_ids,
-    try_allocate_codegen_stack_temp, CodegenModuleShape, ConstructorFieldValue, InlinePlanModule,
-    InstrCodegenOp, InstrResolved,
+    allocate_codegen_stack_temp, plan_module_inlining, reassign_codegen_function_instr_ids,
+    summarize_module_escapes, try_allocate_codegen_stack_temp, CodegenModuleShape,
+    ConstructorFieldValue, InlinePlanModule, InstrCodegenOp, InstrResolved,
 };
 use std::collections::{HashMap, HashSet};
+
+pub const DEFAULT_INLINE_SCALAR_FIXED_POINT_ITERATIONS: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct InlineFragment {
@@ -41,6 +43,35 @@ pub struct ScalarReplacementStats {
     pub skipped_allocations: usize,
     pub skipped_unbuildable_allocations: usize,
     pub skipped_live_alias_control_flow_allocations: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct InlineScalarRewriteStats {
+    pub iterations: usize,
+    pub inline_rewrite: InlineRewriteStats,
+    pub scalar_replacement: ScalarReplacementStats,
+    pub hit_iteration_limit: bool,
+}
+
+impl InlineScalarRewriteStats {
+    fn record_iteration(
+        &mut self,
+        inline_rewrite: InlineRewriteStats,
+        scalar_replacement: ScalarReplacementStats,
+    ) {
+        self.iterations += 1;
+        self.inline_rewrite.rewritten_stores += inline_rewrite.rewritten_stores;
+        self.inline_rewrite.skipped_candidates += inline_rewrite.skipped_candidates;
+        self.scalar_replacement.candidate_allocations += scalar_replacement.candidate_allocations;
+        self.scalar_replacement.planned_allocations += scalar_replacement.planned_allocations;
+        self.scalar_replacement.replaced_allocations += scalar_replacement.replaced_allocations;
+        self.scalar_replacement.skipped_allocations += scalar_replacement.skipped_allocations;
+        self.scalar_replacement.skipped_unbuildable_allocations +=
+            scalar_replacement.skipped_unbuildable_allocations;
+        self.scalar_replacement
+            .skipped_live_alias_control_flow_allocations +=
+            scalar_replacement.skipped_live_alias_control_flow_allocations;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +147,51 @@ pub fn inline_simple_direct_call_stores(
         })
         .collect::<HashMap<_, _>>();
     inline_direct_call_stores_with_callees(module, inline_plan, &callees)
+}
+
+pub fn inline_and_scalar_replace_until_fixed_point(
+    module: &mut BlockPyModule<CodegenModuleShape>,
+) -> InlineScalarRewriteStats {
+    inline_and_scalar_replace_with_callees_until_fixed_point(
+        module,
+        &InlinePlanModule::default(),
+        &HashMap::new(),
+    )
+}
+
+pub fn inline_and_scalar_replace_with_callees_until_fixed_point(
+    module: &mut BlockPyModule<CodegenModuleShape>,
+    external_inline_plan: &InlinePlanModule,
+    extra_callees: &HashMap<FunctionId, InlineCallee>,
+) -> InlineScalarRewriteStats {
+    let mut stats = InlineScalarRewriteStats::default();
+    for iteration in 0..DEFAULT_INLINE_SCALAR_FIXED_POINT_ITERATIONS {
+        let mut inline_plan = plan_module_inlining(&summarize_module_escapes(module));
+        inline_plan
+            .functions
+            .extend(external_inline_plan.functions.clone());
+        let mut callees = extra_callees.clone();
+        for function in &module.callable_defs {
+            callees.insert(
+                function.function_id,
+                InlineCallee::same_module(function.clone()),
+            );
+        }
+
+        let inline_rewrite = inline_direct_call_stores_with_callees(module, &inline_plan, &callees);
+        let scalar_replacement =
+            scalar_replace_non_escaping_constructor_allocations(module, &inline_plan);
+        let changed =
+            inline_rewrite.rewritten_stores != 0 || scalar_replacement.replaced_allocations != 0;
+        stats.record_iteration(inline_rewrite, scalar_replacement);
+        if !changed {
+            return stats;
+        }
+        if iteration + 1 == DEFAULT_INLINE_SCALAR_FIXED_POINT_ITERATIONS {
+            stats.hit_iteration_limit = true;
+        }
+    }
+    stats
 }
 
 pub fn inline_direct_call_stores_with_callees(
@@ -2737,6 +2813,39 @@ mod tests {
         .into()
     }
 
+    fn rewrite_first_store_call_to_direct(
+        module: &mut crate::block_py::BlockPyModule<CodegenModuleShape>,
+        qualname: &str,
+        function_id: FunctionId,
+    ) {
+        let function_index = function_index_by_qualname(module, qualname);
+        let function = &mut module.callable_defs[function_index];
+        let store = function
+            .blocks
+            .iter_mut()
+            .flat_map(|block| block.body.iter_mut())
+            .find_map(|instr| {
+                let InstrCodegen::Store(store) = instr else {
+                    return None;
+                };
+                matches!(store.value.as_ref(), InstrCodegen::Call(_)).then_some(store)
+            })
+            .unwrap_or_else(|| panic!("{qualname} should have a store-call site"));
+        let InstrCodegen::Call(call) = store.value.as_ref() else {
+            panic!("{qualname} store-call site should still be generic");
+        };
+        let meta = call.meta();
+        *store.value = InstrCodegen::CallDirect(
+            CallDirect::new(
+                call.func.clone(),
+                function_id,
+                call.args.clone(),
+                call.keywords.clone(),
+            )
+            .with_meta(meta),
+        );
+    }
+
     fn string_constant_value(constants: &[InstrResolved], index: u32) -> String {
         let Some(InstrResolved::Literal(value)) = constants.get(index as usize) else {
             panic!("constant {index} should be a literal");
@@ -3696,6 +3805,76 @@ def make(x):
                 .flat_map(|block| block.body.iter())
                 .any(|instr| matches!(instr, InstrCodegen::CallDirect(_))),
             "direct call should be removed after inlining: {make:#?}"
+        );
+    }
+
+    #[test]
+    fn fixed_point_scalar_replaces_allocation_exposed_by_nested_inlining() {
+        let mut module = lower_python_to_blockpy_for_testing(
+            r#"
+class Box:
+    def __init__(self, value):
+        self.value = value
+
+def build_box(x):
+    out = Box(x)
+    return out
+
+def make_box(x):
+    out = build_box(x)
+    return out
+
+def caller(x):
+    y = make_box(x)
+    return y.value
+"#,
+        )
+        .expect("transform should succeed")
+        .codegen_module;
+        let constructor_id =
+            module.callable_defs[function_index_by_qualname(&module, "Box.__init__")].function_id;
+        let build_box_id =
+            module.callable_defs[function_index_by_qualname(&module, "build_box")].function_id;
+        let make_box_id =
+            module.callable_defs[function_index_by_qualname(&module, "make_box")].function_id;
+        rewrite_first_store_call_to_direct(&mut module, "build_box", constructor_id);
+        rewrite_first_store_call_to_direct(&mut module, "make_box", build_box_id);
+        rewrite_first_store_call_to_direct(&mut module, "caller", make_box_id);
+
+        let stats = inline_and_scalar_replace_until_fixed_point(&mut module);
+
+        assert!(
+            stats.iterations >= 2,
+            "nested direct calls should require a follow-up fixed-point iteration: {stats:#?}"
+        );
+        assert!(
+            stats.inline_rewrite.rewritten_stores >= 2,
+            "fixed-point inline pass should inline the factory chain: {stats:#?}"
+        );
+        assert_eq!(
+            stats.scalar_replacement.replaced_allocations, 1,
+            "constructor allocation exposed in caller should be scalarized: {stats:#?}"
+        );
+        validate_codegen_instr_ids(&module).expect("rewritten module should keep semantic ids");
+        let caller = function_by_qualname(&module, "caller");
+        assert!(
+            !caller
+                .blocks
+                .iter()
+                .flat_map(|block| block.body.iter())
+                .any(|instr| instr_any(instr, |child| matches!(
+                    child,
+                    InstrCodegen::CallDirect(_)
+                ))),
+            "caller should not retain direct calls after fixed-point inlining: {caller:#?}"
+        );
+        assert!(
+            !caller
+                .blocks
+                .iter()
+                .flat_map(|block| block.body.iter())
+                .any(|instr| instr_any(instr, |child| matches!(child, InstrCodegen::GetAttr(_)))),
+            "caller field read should be replaced with scalar local load: {caller:#?}"
         );
     }
 }

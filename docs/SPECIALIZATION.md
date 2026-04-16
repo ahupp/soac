@@ -522,8 +522,11 @@ full guarded call blocks today.
 - In apply/verify mode with an existing profile dump, JIT module planning
   applies this no-arg method rewrite before ordinary direct-call inlining,
   scalar replacement, value-fact inference, LocalEnv planning, refcount
-  ownership planning, and deopt-resume planning. Codegen and runtime deopt
-  tables therefore see the same rewritten CFG.
+  ownership planning, and deopt-resume planning. Direct-call inlining and
+  constructor scalar replacement then run as a bounded fixed point, so a
+  method inline can expose a constructor call and the follow-up scalar pass can
+  remove that temporary allocation before value facts and codegen see the CFG.
+  Codegen and runtime deopt tables therefore see the same rewritten CFG.
 - The deopt interpreter also supports `DirectReceiverTypeVersionGuardTest`, so
   continuation paths can execute the same explicit guard expression.
 
@@ -625,6 +628,12 @@ full guarded call blocks today.
   when the allocation path shares successor blocks with non-allocation paths.
   It still rejects objects whose aliases cannot be proven to dominate all
   active uses.
+- Direct-call inlining and constructor scalar replacement run as a bounded
+  fixed point before value-fact inference. This lets a direct-call inline expose
+  another direct call or constructor allocation, then lets the next iteration
+  inline or scalarize the newly visible shape. The current bound is deliberately
+  small; hitting it leaves the remaining BlockPy unchanged rather than
+  broadening the rewrite unsafely.
 - Before JIT codegen, `inline_direct_call_stores_with_callees` can also inline
   small `CallDirect` store sites, not just constructor initializers. The
   conservative subset requires positional-only/ordinary parameters, exact arity,
@@ -814,7 +823,12 @@ exact-list/exact-int arms and share generic fallback paths.
   - compares it against the profiled exact-int shape
   - skips the shape guard when value facts already prove both operands are
     exact `int`
-  - on hit, calls the profiled `PyLong` number slot helper
+  - for profiled-only exact-int shapes, calls the profiled `PyLong` number
+    slot helper
+  - for fact-proven exact-int shapes, guards that both runtime objects are
+    compact exact `PyLong` objects, unboxes them, performs supported arithmetic
+    as machine `i64`, boxes the result with `PyLong_FromLongLong`, and deopts
+    or falls back on type/compactness/overflow miss
   - on miss in `verify`/`apply` mode, uses a cold
     `dp_jit_deopt_resume` continuation when both operands are safe to
     replay
@@ -833,8 +847,8 @@ exact-list/exact-int arms and share generic fallback paths.
   - excluded binops still always use generic lowering
 - Soundness boundary:
   - specialization is guarded by exact observed type-shape match
-  - fact-proven exact-int operands may use the same direct helper without
-    a runtime shape guard
+  - fact-proven exact-int operands still guard exact runtime `PyLong` layout
+    before direct compact-long memory access
   - unsupported or mismatched shapes either deopt to the generic
     continuation or fall back to generic lowering
 - Natural extensions:
@@ -897,8 +911,12 @@ exact-list/exact-int arms and share generic fallback paths.
   `emit_specialized_binop`, at
   `soac-jit/src/jit/intrinsics.rs`.
 - If the profiled shape is exact `int`/`int`, comparisons such as
-  `Eq`, `Ne`, `Lt`, `Le`, `Gt`, and `Ge` use the direct exact-int
-  helper path instead of generic `PyObject_RichCompare` lowering.
+  `Eq`, `Ne`, `Lt`, `Le`, `Gt`, and `Ge` use the direct exact-int helper path
+  instead of generic `PyObject_RichCompare` lowering.
+- If value facts prove both operands are exact `int`, comparison codegen
+  guards compact exact `PyLong` layout, unboxes both operands, emits a direct
+  integer comparison, and materializes the boolean singleton without calling
+  either `PyObject_RichCompare` or the profiled helper.
 - On guard miss, comparison specialization uses the same deopt-or-fallback
   behavior as exact-int binary operators.
 

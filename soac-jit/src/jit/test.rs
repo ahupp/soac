@@ -14688,6 +14688,91 @@ def f(x):
         );
     }
 
+    fn build_fact_proven_exact_int_binop(kind: BinOpKind) -> BuiltSpecializedFunction {
+        let blocks = [1usize as ObjPtr];
+        let mut constants = TestConstantPool::default();
+        let function = with_single_test_block(
+            test_function(),
+            vec![],
+            ret_term(op_expr(BinOp::new(
+                kind,
+                constants.int_expr(1),
+                constants.int_expr(2),
+            ))),
+        );
+        let mut module = test_module(ModuleNameGen::new(0), vec![function]);
+        module.module_constants = constants.module_constants;
+        let function = module.callable_defs[0].clone();
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        build_test_jit_function_with_constants_and_options(
+            &module,
+            &function,
+            &blocks,
+            &module_constants,
+            BuildSpecializedFunctionOptions {
+                guard_miss_deopt_stub: true,
+                ..BuildSpecializedFunctionOptions::default()
+            },
+        )
+    }
+
+    #[test]
+    fn facts_proven_exact_int_binop_uses_compact_long_fast_path() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "facts_proven_exact_int_binop_uses_compact_long_fast_path",
+        ) {
+            return;
+        }
+        let built = build_fact_proven_exact_int_binop(BinOpKind::Add);
+        let box_helpers = import_user_names_for_symbols(&built, &["PyLong_FromLongLong"]);
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &box_helpers),
+            1,
+            "facts-proven exact-int add should box the machine result directly",
+        );
+        let generic_helpers =
+            import_user_names_for_symbols(&built, &["PyNumber_Add", "dp_jit_exact_long_add_slot"]);
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &generic_helpers),
+            0,
+            "facts-proven exact-int add should not call generic or profiled PyLong helpers",
+        );
+        let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
+        assert_eq!(
+            count_cold_block_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
+            1,
+            "facts-proven exact-int guard miss should use the cold deopt path",
+        );
+    }
+
+    #[test]
+    fn facts_proven_exact_int_compare_uses_compact_long_fast_path() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "facts_proven_exact_int_compare_uses_compact_long_fast_path",
+        ) {
+            return;
+        }
+        let built = build_fact_proven_exact_int_binop(BinOpKind::Lt);
+        let generic_helpers = import_user_names_for_symbols(
+            &built,
+            &["PyObject_RichCompare", "dp_jit_exact_long_richcompare_slot"],
+        );
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &generic_helpers),
+            0,
+            "facts-proven exact-int compare should not call generic or profiled compare helpers",
+        );
+        let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
+        assert_eq!(
+            count_cold_block_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
+            1,
+            "facts-proven exact-int compare guard miss should use the cold deopt path",
+        );
+    }
+
     #[test]
     fn specialized_jit_exact_int_binop_guard_miss_deopts_for_replay_safe_operands() {
         if crate::run_test_in_isolated_process_if_needed(

@@ -521,6 +521,21 @@ impl FunctionFactInferer<'_> {
                     ValueFacts::unknown_pyobj()
                 }
             }
+            InstrCodegen::CallDirect(op) => {
+                if op.keywords.is_empty()
+                    && op
+                        .args
+                        .iter()
+                        .all(|arg| matches!(arg, crate::block_py::CallArgPositional::Positional(_)))
+                {
+                    self.infer_expr_facts(op.callable.as_ref())
+                        .runtime_helper()
+                        .map(|helper| helper.signature().result)
+                        .unwrap_or_else(ValueFacts::unknown_pyobj)
+                } else {
+                    ValueFacts::unknown_pyobj()
+                }
+            }
             InstrCodegen::BinOp(op) => infer_binop_result_facts(
                 op.kind,
                 self.infer_expr_facts(&op.left),
@@ -926,7 +941,11 @@ mod test {
         infer_module_value_facts, BoolSingletonFact, CallableFact, EnvFacts, PyExactType,
         PyObjFacts, RefcountFact, RuntimeHelperId, ThrowSpec, ValueFacts,
     };
-    use crate::block_py::{BlockTerm, ChildVisitable, HasSemanticInstrId, InstrCodegen, Visit};
+    use crate::block_py::{
+        BlockTerm, CallArgPositional, CallDirect, ChildVisitable, FunctionId, HasMeta,
+        HasSemanticInstrId, InstrCodegen, Load, NameLocation, ResolvedName, RuntimeName, Visit,
+        WithMeta,
+    };
     use crate::lower_python_to_blockpy_for_testing;
 
     struct ReturnExprFinder {
@@ -971,6 +990,68 @@ def f():
         let facts = infer_module_value_facts(&lowered);
         let Some(ValueFacts::PyObj(py_facts)) = facts.fact_for(none_key) else {
             panic!("missing facts for returned expression");
+        };
+        py_facts
+    }
+
+    fn returned_direct_runtime_helper_py_facts(runtime_name: RuntimeName) -> PyObjFacts {
+        let mut lowered = lower_python_to_blockpy_for_testing(
+            r#"
+def f(x):
+    return x
+"#,
+        )
+        .expect("transform should succeed")
+        .codegen_module;
+        let function = lowered
+            .callable_defs
+            .iter_mut()
+            .find(|function| function.names.qualname == "f")
+            .expect("missing lowered function f");
+        let x_location = function
+            .storage_layout
+            .as_ref()
+            .expect("function should have storage")
+            .stack_slots()
+            .iter()
+            .position(|name| name == "x")
+            .map(|slot| crate::block_py::LocalLocation(slot as u32))
+            .expect("x should have a local slot");
+        let block = function
+            .blocks
+            .first_mut()
+            .expect("function should have an entry block");
+        let BlockTerm::Return(return_value) = &mut block.term else {
+            panic!("test function should return directly");
+        };
+        let meta = return_value.meta();
+        *return_value = InstrCodegen::CallDirect(
+            CallDirect::new(
+                InstrCodegen::Load(Load::new(ResolvedName {
+                    id: runtime_name.name().to_string().into(),
+                    location: NameLocation::RuntimeName(runtime_name),
+                })),
+                FunctionId::new(42, runtime_name as u32),
+                vec![CallArgPositional::Positional(InstrCodegen::Load(
+                    Load::new(ResolvedName {
+                        id: "x".to_string().into(),
+                        location: NameLocation::Local(x_location),
+                    }),
+                ))],
+                Vec::new(),
+            )
+            .with_meta(meta),
+        );
+
+        let mut finder = ReturnExprFinder {
+            key: None,
+            function_id: function.function_id,
+        };
+        finder.visit_fn(function);
+        let key = finder.key.expect("expected a return expression");
+        let facts = infer_module_value_facts(&lowered);
+        let Some(ValueFacts::PyObj(py_facts)) = facts.fact_for(key) else {
+            panic!("missing facts for direct runtime helper return");
         };
         py_facts
     }
@@ -1153,6 +1234,15 @@ def f(x, flag):
             panic!("_index should return a Python object");
         };
         assert!(result_facts.is_exact_type(PyExactType::Int));
+    }
+
+    #[test]
+    fn infers_direct_runtime_helper_call_result_facts() {
+        let py_facts = returned_direct_runtime_helper_py_facts(RuntimeName::Index);
+        assert!(py_facts.is_exact_type(PyExactType::Int));
+
+        let py_facts = returned_direct_runtime_helper_py_facts(RuntimeName::Str);
+        assert!(py_facts.is_exact_type(PyExactType::Str));
     }
 
     #[test]

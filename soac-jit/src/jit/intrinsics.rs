@@ -1,6 +1,6 @@
 use super::operation_specializations;
 use super::{
-    ImportSpec, JitDeoptExitRef, JitEmitCtx, JitGuardMissDispatch, RelocTypeRef,
+    CpythonTypeSymbol, ImportSpec, JitDeoptExitRef, JitEmitCtx, JitGuardMissDispatch, RelocTypeRef,
     SOAC_RUNTIME_LOAD_GLOBAL_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_IMPORT, SigType,
     codegen_constant_string_value, emit_exact_type_version_match, emit_increment_counter_slot,
     emit_owned_module_constant_from_parts, step_null_block_args,
@@ -19,6 +19,22 @@ use soac_blockpy::block_py::{
 };
 use soac_blockpy::passes::{InstrTyped, PyExactType, PyObjFacts};
 use std::mem::offset_of;
+
+const PY_LONG_SIGN_MASK: i64 = 3;
+const PY_LONG_NON_SIZE_BITS: i64 = 3;
+const PYLONG_COMPACT_TAG_LIMIT: i64 = 2 << PY_LONG_NON_SIZE_BITS;
+
+#[repr(C)]
+struct RawPyLongValue {
+    lv_tag: usize,
+    ob_digit: [u32; 1],
+}
+
+#[repr(C)]
+struct RawPyLongObject {
+    ob_base: ffi::PyObject,
+    long_value: RawPyLongValue,
+}
 
 pub(super) trait OperationEmitState<'fb, E> {
     fn ctx(&self) -> &JitEmitCtx<'_>;
@@ -173,6 +189,11 @@ define_owned_import_spec!(
     PYNUMBER_ADD_IMPORT,
     "PyNumber_Add",
     &[SigType::Pointer, SigType::Pointer]
+);
+define_owned_import_spec!(
+    PYLONG_FROM_LONGLONG_IMPORT,
+    "PyLong_FromLongLong",
+    &[SigType::I64]
 );
 define_owned_import_spec!(
     PYNUMBER_SUBTRACT_IMPORT,
@@ -399,6 +420,7 @@ static DP_JIT_EXACT_LONG_UNARY_OP_IMPORT: ImportSpec = ImportSpec::new(
 
 pub(super) static OPERATION_IMPORT_SPECS: &[&ImportSpec] = &[
     &PYNUMBER_ADD_IMPORT,
+    &PYLONG_FROM_LONGLONG_IMPORT,
     &PYNUMBER_SUBTRACT_IMPORT,
     &PYNUMBER_MULTIPLY_IMPORT,
     &PYNUMBER_MATMUL_IMPORT,
@@ -993,6 +1015,216 @@ fn emit_exact_long_binary_op<'fb, E>(
     state.finish_owned_result(result)
 }
 
+fn emit_guarded_compact_long_i64<'fb, E>(
+    state: &mut impl OperationEmitState<'fb, E>,
+    value: ir::Value,
+    guard_miss_block: ir::Block,
+) -> ir::Value {
+    let ptr_ty = state.ctx().consts.ptr_ty;
+    let i64_ty = state.ctx().consts.i64_ty;
+    let i32_ty = state.ctx().consts.i32_ty;
+    let py_long_type = state
+        .emit_type_ptr_value(&RelocTypeRef::CpythonTypeSymbol(CpythonTypeSymbol::Long))
+        .expect("PyLong_Type symbol should bind during JIT codegen");
+
+    let value_not_null_block = state.fb().create_block();
+    let is_null = state
+        .fb()
+        .ins()
+        .icmp_imm(ir::condcodes::IntCC::Equal, value, 0);
+    state
+        .fb()
+        .ins()
+        .brif(is_null, guard_miss_block, &[], value_not_null_block, &[]);
+
+    state.fb().switch_to_block(value_not_null_block);
+    let object_type = state.fb().ins().load(
+        ptr_ty,
+        ir::MemFlags::trusted(),
+        value,
+        PYOBJECT_OB_TYPE_OFFSET,
+    );
+    let is_long = state
+        .fb()
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, object_type, py_long_type);
+    let compact_tag_block = state.fb().create_block();
+    state
+        .fb()
+        .ins()
+        .brif(is_long, compact_tag_block, &[], guard_miss_block, &[]);
+
+    state.fb().switch_to_block(compact_tag_block);
+    let lv_tag_offset =
+        offset_of!(RawPyLongObject, long_value) as i32 + offset_of!(RawPyLongValue, lv_tag) as i32;
+    let digit_offset = offset_of!(RawPyLongObject, long_value) as i32
+        + offset_of!(RawPyLongValue, ob_digit) as i32;
+    let lv_tag = state
+        .fb()
+        .ins()
+        .load(i64_ty, ir::MemFlags::trusted(), value, lv_tag_offset);
+    let is_compact_long = state.fb().ins().icmp_imm(
+        ir::condcodes::IntCC::UnsignedLessThan,
+        lv_tag,
+        PYLONG_COMPACT_TAG_LIMIT,
+    );
+    let digit_i32 = state
+        .fb()
+        .ins()
+        .load(i32_ty, ir::MemFlags::trusted(), value, digit_offset);
+    let digit_i64 = state.fb().ins().uextend(i64_ty, digit_i32);
+    let sign_mask = state.fb().ins().iconst(i64_ty, PY_LONG_SIGN_MASK);
+    let sign_bits = state.fb().ins().band(lv_tag, sign_mask);
+    let one = state.fb().ins().iconst(i64_ty, 1);
+    let sign = state.fb().ins().isub(one, sign_bits);
+    let signed_value = state.fb().ins().imul(sign, digit_i64);
+    let value_block = state.fb().create_block();
+    state.fb().append_block_param(value_block, i64_ty);
+    state.fb().ins().brif(
+        is_compact_long,
+        value_block,
+        &[ir::BlockArg::Value(signed_value)],
+        guard_miss_block,
+        &[],
+    );
+
+    state.fb().switch_to_block(value_block);
+    state.fb().block_params(value_block)[0]
+}
+
+fn emit_i64_overflow_guard<'fb, E>(
+    state: &mut impl OperationEmitState<'fb, E>,
+    value: ir::Value,
+    overflow: ir::Value,
+    guard_miss_block: ir::Block,
+) -> ir::Value {
+    let i64_ty = state.ctx().consts.i64_ty;
+    let value_ok_block = state.fb().create_block();
+    state.fb().append_block_param(value_ok_block, i64_ty);
+    state.fb().ins().brif(
+        overflow,
+        guard_miss_block,
+        &[],
+        value_ok_block,
+        &[ir::BlockArg::Value(value)],
+    );
+    state.fb().switch_to_block(value_ok_block);
+    state.fb().block_params(value_ok_block)[0]
+}
+
+fn emit_compact_long_compare<'fb, E>(
+    kind: ExactIntBinaryOpKind,
+    state: &mut impl OperationEmitState<'fb, E>,
+    lhs: ir::Value,
+    rhs: ir::Value,
+) -> Option<ir::Value> {
+    let cond = match kind {
+        ExactIntBinaryOpKind::Eq => ir::condcodes::IntCC::Equal,
+        ExactIntBinaryOpKind::Ne => ir::condcodes::IntCC::NotEqual,
+        ExactIntBinaryOpKind::Lt => ir::condcodes::IntCC::SignedLessThan,
+        ExactIntBinaryOpKind::Le => ir::condcodes::IntCC::SignedLessThanOrEqual,
+        ExactIntBinaryOpKind::Gt => ir::condcodes::IntCC::SignedGreaterThan,
+        ExactIntBinaryOpKind::Ge => ir::condcodes::IntCC::SignedGreaterThanOrEqual,
+        _ => return None,
+    };
+    let result = state.fb().ins().icmp(cond, lhs, rhs);
+    Some(state.emit_owned_bool_from_cond(result))
+}
+
+fn emit_compact_long_arithmetic<'fb, E>(
+    kind: ExactIntBinaryOpKind,
+    state: &mut impl OperationEmitState<'fb, E>,
+    lhs: ir::Value,
+    rhs: ir::Value,
+    guard_miss_block: ir::Block,
+) -> Option<ir::Value> {
+    let (value, overflow) = match kind {
+        ExactIntBinaryOpKind::Add => state.fb().ins().sadd_overflow(lhs, rhs),
+        ExactIntBinaryOpKind::Sub => state.fb().ins().ssub_overflow(lhs, rhs),
+        ExactIntBinaryOpKind::Mul => state.fb().ins().smul_overflow(lhs, rhs),
+        _ => return None,
+    };
+    let value = emit_i64_overflow_guard(state, value, overflow, guard_miss_block);
+    let py_long_from_i64_ref = state.import_func(&PYLONG_FROM_LONGLONG_IMPORT);
+    let call_inst = state.fb().ins().call(py_long_from_i64_ref, &[value]);
+    Some(state.fb().inst_results(call_inst)[0])
+}
+
+fn emit_compact_long_binary_op_or_deopt<'fb, E>(
+    kind: ExactIntBinaryOpKind,
+    state: &mut impl OperationEmitState<'fb, E>,
+    instr_id: soac_blockpy::block_py::InstrId,
+    pre_guard_operands: &[&E],
+    arg_values: &[(ir::Value, bool)],
+    fallback_counter_id: Option<CounterId>,
+) -> Option<ir::Value>
+where
+    E: Instr,
+{
+    if !matches!(
+        kind,
+        ExactIntBinaryOpKind::Add
+            | ExactIntBinaryOpKind::Sub
+            | ExactIntBinaryOpKind::Mul
+            | ExactIntBinaryOpKind::Eq
+            | ExactIntBinaryOpKind::Ne
+            | ExactIntBinaryOpKind::Lt
+            | ExactIntBinaryOpKind::Le
+            | ExactIntBinaryOpKind::Gt
+            | ExactIntBinaryOpKind::Ge
+    ) {
+        return None;
+    }
+
+    let ptr_ty = state.ctx().consts.ptr_ty;
+    let result_block = state.fb().create_block();
+    state.fb().append_block_param(result_block, ptr_ty);
+    let fallback_block = state.fb().create_block();
+    state.fb().set_cold_block(fallback_block);
+    let guard_miss_dispatch =
+        state.prepare_guard_miss_dispatch_for_instr(instr_id, pre_guard_operands, fallback_block);
+    let guard_miss_block = guard_miss_dispatch.branch_block();
+
+    let lhs = emit_guarded_compact_long_i64(state, arg_values[0].0, guard_miss_block);
+    let rhs = emit_guarded_compact_long_i64(state, arg_values[1].0, guard_miss_block);
+    let direct_result = emit_compact_long_compare(kind, state, lhs, rhs)
+        .or_else(|| emit_compact_long_arithmetic(kind, state, lhs, rhs, guard_miss_block))?;
+    state.release_arg_values(arg_values);
+    let direct_result = state.finish_owned_result(direct_result);
+    state
+        .fb()
+        .ins()
+        .jump(result_block, &[ir::BlockArg::Value(direct_result)]);
+
+    match guard_miss_dispatch {
+        JitGuardMissDispatch::FallbackBlock(fallback_block) => {
+            state.fb().switch_to_block(fallback_block);
+            increment_counter_with_state(state, fallback_counter_id);
+            let fallback_result = emit_exact_long_binary_op(kind, state, arg_values);
+            state
+                .fb()
+                .ins()
+                .jump(result_block, &[ir::BlockArg::Value(fallback_result)]);
+        }
+        JitGuardMissDispatch::DeoptResume {
+            block,
+            target,
+            deopt_resume_ref,
+        } => {
+            state.emit_guard_miss_deopt_resume_return(
+                block,
+                fallback_counter_id,
+                arg_values,
+                target,
+                deopt_resume_ref,
+            );
+        }
+    }
+
+    state.fb().switch_to_block(result_block);
+    Some(state.fb().block_params(result_block)[0])
+}
+
 fn emit_exact_long_unary_op<'fb, E>(
     kind: ExactIntUnaryOpKind,
     state: &mut impl OperationEmitState<'fb, E>,
@@ -1291,6 +1523,16 @@ where
     };
     if facts_prove_exact_int {
         increment_counter_with_state(state, specialized_hit_counter_id);
+        if let Some(result) = emit_compact_long_binary_op_or_deopt(
+            exact_int_kind,
+            state,
+            instr_id,
+            &[op.left.as_ref(), op.right.as_ref()],
+            &arg_values,
+            specialized_fallback_counter_id,
+        ) {
+            return Some(result);
+        }
         return Some(emit_exact_long_binary_op(
             exact_int_kind,
             state,

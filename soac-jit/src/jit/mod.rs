@@ -14171,7 +14171,7 @@ fn emit_typed_pyobject_input_with_local_env(
         func_imports,
     )?;
     let (value, ownership, _) = value.expect_pyobject(site);
-    Ok((value, !ownership.is_owned()))
+    Ok((value, borrowed || !ownership.is_owned()))
 }
 
 fn emit_typed_direct_call_resolved_with_arg_plan_from_local_env(

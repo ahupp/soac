@@ -834,3 +834,20 @@ benchmarked throughput delta, and the headline pre/post numbers.
 - post-change benchmark:
   - release slow typing import pytest: `1 passed in 1.86s`, `2.07s` wall
   - direct release slow typing import: `1.87s`, `1.83s` wall
+
+## 2026-04-16 - Fixed-point range scalarization and exact-int compact ops
+
+- jj change id: `ssnxnmuy`
+- summary: Direct-call inlining and constructor scalar replacement now run to a
+  small fixed point before value facts/JIT planning. Direct runtime-helper calls
+  preserve result facts, and fact-proven exact-int arithmetic/comparison lowers
+  to compact `PyLong` machine-int fast paths with cold deopt-on-miss in
+  apply/verify mode.
+- throughput: `-10.65%` specialized pystone median; no-refcount diagnostic
+  `+4.74%`
+- pre-change benchmark:
+  - specialized pass, 1M loops x1: `259050 loops/s`
+  - no-refcount diagnostic, 1M loops x1: `334356 loops/s`
+- post-change benchmark:
+  - specialized pass, 1M loops x1: `231468 loops/s`
+  - no-refcount diagnostic, 1M loops x1: `350192 loops/s`

@@ -2264,6 +2264,11 @@ fn infer_typed_instr_result_facts(expr: &InstrTyped) -> Option<ValueFacts> {
             op.args.as_slice(),
             op.keywords.as_slice(),
         ),
+        InstrTyped::LegacyCallDirect(op) => infer_typed_call_result_facts(
+            op.callable.as_ref(),
+            op.args.as_slice(),
+            op.keywords.as_slice(),
+        ),
         _ => None,
     }
 }
@@ -2748,14 +2753,30 @@ impl TryMapInstr<InstrTyped, InstrCodegen, String> for TypedToCodegen {
     }
 }
 
+#[track_caller]
 pub fn try_lower_typed_instr_to_codegen_legacy(instr: InstrTyped) -> Result<InstrCodegen, String> {
-    TypedToCodegen.try_map_instr(instr)
+    let caller = std::panic::Location::caller();
+    TypedToCodegen.try_map_instr(instr).map_err(|err| {
+        format!(
+            "{err} [typed_to_codegen_legacy caller={}:{}]",
+            caller.file(),
+            caller.line()
+        )
+    })
 }
 
+#[track_caller]
 pub fn try_lower_typed_term_to_codegen_legacy(
     term: BlockTerm<InstrTyped>,
 ) -> Result<BlockTerm<InstrCodegen>, String> {
-    TypedToCodegen.try_map_term(term)
+    let caller = std::panic::Location::caller();
+    TypedToCodegen.try_map_term(term).map_err(|err| {
+        format!(
+            "{err} [typed_to_codegen_legacy caller={}:{}]",
+            caller.file(),
+            caller.line()
+        )
+    })
 }
 
 pub fn try_lower_typed_module_to_codegen_legacy(
@@ -3070,10 +3091,13 @@ pub use inline_transform::{
     build_cross_module_direct_method_inline_fragment_to_target,
     build_direct_method_inline_fragment_to_target, build_single_block_inline_fragment,
     build_single_block_inline_fragment_to_target, build_single_block_inline_fragment_with_bindings,
+    inline_and_scalar_replace_until_fixed_point,
+    inline_and_scalar_replace_with_callees_until_fixed_point,
     inline_direct_call_stores_with_callees, inline_simple_direct_call_stores,
     rewrite_static_runtime_constructor_call_stores,
     scalar_replace_non_escaping_constructor_allocations, InlineCallee, InlineFragment, InlineLocal,
-    InlineRewriteStats, InlineUnsupportedReason, InlineValueBindings, ScalarReplacementStats,
+    InlineRewriteStats, InlineScalarRewriteStats, InlineUnsupportedReason, InlineValueBindings,
+    ScalarReplacementStats,
 };
 pub use instr_id::{
     assign_function_instr_ids, assign_missing_codegen_function_instr_ids, assign_module_instr_ids,
