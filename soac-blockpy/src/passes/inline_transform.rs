@@ -11,7 +11,7 @@ pub struct InlineFragment {
     pub entry_label: BlockLabel,
     pub blocks: Vec<Block<InstrCodegen>>,
     pub locals: HashMap<LocalLocation, InlineLocal>,
-    pub return_local: InlineLocal,
+    pub return_local: Option<InlineLocal>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -104,6 +104,38 @@ pub fn build_single_block_inline_fragment_with_bindings(
     continuation: BlockLabel,
     value_bindings: &InlineValueBindings,
 ) -> Result<InlineFragment, InlineUnsupportedReason> {
+    build_single_block_inline_fragment_impl(
+        caller,
+        callee,
+        continuation,
+        value_bindings,
+        InlineReturnPlacement::FreshContinuationArg,
+    )
+}
+
+pub fn build_single_block_inline_fragment_to_target(
+    caller: &mut BlockPyFunction<CodegenModuleShape>,
+    callee: &BlockPyFunction<CodegenModuleShape>,
+    continuation: BlockLabel,
+    value_bindings: &InlineValueBindings,
+    return_target: ResolvedName,
+) -> Result<InlineFragment, InlineUnsupportedReason> {
+    build_single_block_inline_fragment_impl(
+        caller,
+        callee,
+        continuation,
+        value_bindings,
+        InlineReturnPlacement::StoreTo(return_target),
+    )
+}
+
+fn build_single_block_inline_fragment_impl(
+    caller: &mut BlockPyFunction<CodegenModuleShape>,
+    callee: &BlockPyFunction<CodegenModuleShape>,
+    continuation: BlockLabel,
+    value_bindings: &InlineValueBindings,
+    return_placement: InlineReturnPlacement,
+) -> Result<InlineFragment, InlineUnsupportedReason> {
     let callee_layout = callee
         .storage_layout
         .as_ref()
@@ -140,7 +172,17 @@ pub fn build_single_block_inline_fragment_with_bindings(
         let fresh = allocate_inline_local(caller)?;
         locals.insert(location, fresh);
     }
-    let return_local = allocate_inline_local(caller)?;
+    let (return_target, return_local, continuation_args) = match return_placement {
+        InlineReturnPlacement::FreshContinuationArg => {
+            let return_local = allocate_inline_local(caller)?;
+            (
+                return_local.resolved_name(),
+                Some(return_local.clone()),
+                vec![BlockArg::Name(return_local.name)],
+            )
+        }
+        InlineReturnPlacement::StoreTo(target) => (target, None, Vec::new()),
+    };
 
     let mut remapper = InlineLocalRemapper {
         locals: &locals,
@@ -155,17 +197,16 @@ pub fn build_single_block_inline_fragment_with_bindings(
     let return_value = remapper.try_map_instr(return_value.clone())?;
     let return_meta = return_value.meta();
     body.push(
-        Store::new(return_local.resolved_name(), Box::new(return_value))
+        Store::new(return_target, Box::new(return_value))
             .with_meta(return_meta)
             .into(),
     );
 
     let entry_label = caller.name_gen.next_block_name();
-    let return_arg = BlockArg::Name(return_local.name.clone());
     let block = Block::new(
         entry_label,
         body,
-        BlockTerm::Jump(BlockEdge::with_args(continuation, vec![return_arg])),
+        BlockTerm::Jump(BlockEdge::with_args(continuation, continuation_args)),
         Vec::new(),
         None,
     );
@@ -176,6 +217,11 @@ pub fn build_single_block_inline_fragment_with_bindings(
         locals,
         return_local,
     })
+}
+
+enum InlineReturnPlacement {
+    FreshContinuationArg,
+    StoreTo(ResolvedName),
 }
 
 fn allocate_inline_local(
@@ -334,12 +380,18 @@ mod tests {
         LocalLocation(u32::try_from(slot).expect("slot index should fit in u32"))
     }
 
-    fn local_load(function: &BlockPyFunction<CodegenModuleShape>, name: &str) -> InstrCodegen {
-        Load::new(ResolvedName {
+    fn local_resolved_name(
+        function: &BlockPyFunction<CodegenModuleShape>,
+        name: &str,
+    ) -> ResolvedName {
+        ResolvedName {
             id: name.to_string().into(),
             location: NameLocation::Local(local_location(function, name)),
-        })
-        .into()
+        }
+    }
+
+    fn local_load(function: &BlockPyFunction<CodegenModuleShape>, name: &str) -> InstrCodegen {
+        Load::new(local_resolved_name(function, name)).into()
     }
 
     #[test]
@@ -443,17 +495,21 @@ def caller(x, y):
         };
         assert_eq!(edge.target, continuation);
         assert_eq!(edge.args.len(), 1);
+        let return_local = fragment
+            .return_local
+            .as_ref()
+            .expect("default fragment should create a synthetic return local");
         let BlockArg::Name(return_arg) = &edge.args[0] else {
             panic!("continuation argument should name the synthetic return local");
         };
-        assert_eq!(return_arg, &fragment.return_local.name);
+        assert_eq!(return_arg, &return_local.name);
 
         let Some(InstrCodegen::Store(return_store)) = fragment.blocks[0].body.last() else {
             panic!("inlined block should store the return value before jumping");
         };
         assert_eq!(
             return_store.name.local_location(),
-            Some(fragment.return_local.location)
+            Some(return_local.location)
         );
 
         for (callee_location, fresh) in &fragment.locals {
@@ -484,6 +540,50 @@ def caller(x, y):
                 .unwrap_err();
 
         assert_eq!(err, InlineUnsupportedReason::BlockParams);
+    }
+
+    #[test]
+    fn can_store_return_into_explicit_target_without_continuation_arg() {
+        let module = lower_python_to_blockpy_for_testing(
+            r#"
+def callee(a):
+    return a
+
+def caller(x):
+    out = None
+    return out
+"#,
+        )
+        .expect("transform should succeed")
+        .codegen_module;
+        let callee = function_by_qualname(&module, "callee");
+        let mut caller = function_by_qualname(&module, "caller").clone();
+        let callee_a = local_location(callee, "a");
+        let mut bindings = InlineValueBindings::new();
+        bindings.insert(callee_a, local_load(&caller, "x"));
+        let return_target = local_resolved_name(&caller, "out");
+
+        let fragment = build_single_block_inline_fragment_to_target(
+            &mut caller,
+            callee,
+            BlockLabel::from_index(10_003),
+            &bindings,
+            return_target,
+        )
+        .unwrap();
+
+        assert!(fragment.return_local.is_none());
+        let BlockTerm::Jump(edge) = &fragment.blocks[0].term else {
+            panic!("inlined block should jump to continuation");
+        };
+        assert!(edge.args.is_empty());
+        let Some(InstrCodegen::Store(return_store)) = fragment.blocks[0].body.last() else {
+            panic!("inlined block should store the return value before jumping");
+        };
+        assert_eq!(
+            return_store.name.local_location(),
+            Some(local_location(&caller, "out"))
+        );
     }
 
     #[test]
