@@ -156,14 +156,15 @@ define_operation! {
 }
 
 #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub struct Call<E> {
+pub struct Call<E: Instr> {
     _meta: Meta,
+    pub extra: E::Extra,
     pub func: Box<E>,
     pub args: Vec<CallArgPositional<E>>,
     pub keywords: Vec<CallArgKeyword<E>>,
 }
 
-impl<E: fmt::Debug> fmt::Debug for Call<E> {
+impl<E: Instr + fmt::Debug> fmt::Debug for Call<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:?}(", self.func)?;
         let mut first = true;
@@ -191,7 +192,7 @@ impl<E: fmt::Debug> fmt::Debug for Call<E> {
     }
 }
 
-impl<E> Call<E> {
+impl<E: Instr> Call<E> {
     pub fn new(
         func: impl Into<Box<E>>,
         args: impl Into<Vec<CallArgPositional<E>>>,
@@ -199,20 +200,34 @@ impl<E> Call<E> {
     ) -> Self {
         Self {
             _meta: Meta::default(),
+            extra: Default::default(),
             func: func.into(),
             args: args.into(),
             keywords: keywords.into(),
         }
     }
+
+    pub fn with_extra(mut self, extra: E::Extra) -> Self {
+        self.extra = extra;
+        self
+    }
+
+    pub fn extra(&self) -> &E::Extra {
+        &self.extra
+    }
+
+    pub fn extra_mut(&mut self) -> &mut E::Extra {
+        &mut self.extra
+    }
 }
 
-impl<E> HasMeta for Call<E> {
+impl<E: Instr> HasMeta for Call<E> {
     fn meta(&self) -> Meta {
         self._meta.clone()
     }
 }
 
-impl<E> WithMeta for Call<E> {
+impl<E: Instr> WithMeta for Call<E> {
     fn with_meta(mut self, meta: Meta) -> Self {
         self._meta = meta;
         self
@@ -260,6 +275,7 @@ impl<E: Instr> Mappable<E> for Call<E> {
     {
         Call {
             _meta: self._meta,
+            extra: Default::default(),
             func: Box::new(map.map_instr(*self.func)),
             args: self
                 .args
@@ -281,6 +297,49 @@ impl<E: Instr> Mappable<E> for Call<E> {
     {
         Ok(Call {
             _meta: self._meta,
+            extra: Default::default(),
+            func: Box::new(map.try_map_instr(*self.func)?),
+            args: self
+                .args
+                .into_iter()
+                .map(|arg| arg.try_map_instr(|expr| map.try_map_instr(expr)))
+                .collect::<Result<Vec<_>, _>>()?,
+            keywords: self
+                .keywords
+                .into_iter()
+                .map(|keyword| keyword.try_map_instr(|expr| map.try_map_instr(expr)))
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+
+    fn map_same_children<M>(self, map: &mut M) -> Self::Mapped<E>
+    where
+        M: MapInstr<E, E>,
+    {
+        Call {
+            _meta: self._meta,
+            extra: self.extra,
+            func: Box::new(map.map_instr(*self.func)),
+            args: self
+                .args
+                .into_iter()
+                .map(|arg| arg.map_instr(|expr| map.map_instr(expr)))
+                .collect(),
+            keywords: self
+                .keywords
+                .into_iter()
+                .map(|keyword| keyword.map_instr(|expr| map.map_instr(expr)))
+                .collect(),
+        }
+    }
+
+    fn try_map_same_children<Error, M>(self, map: &mut M) -> Result<Self::Mapped<E>, Error>
+    where
+        M: TryMapInstr<E, E, Error>,
+    {
+        Ok(Call {
+            _meta: self._meta,
+            extra: self.extra,
             func: Box::new(map.try_map_instr(*self.func)?),
             args: self
                 .args
@@ -303,15 +362,16 @@ define_operation! {
 }
 
 #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub struct CallDirect<E> {
+pub struct CallDirect<E: Instr> {
     _meta: Meta,
+    pub extra: E::Extra,
     pub callable: Box<E>,
     pub function_id: FunctionId,
     pub args: Vec<CallArgPositional<E>>,
     pub keywords: Vec<CallArgKeyword<E>>,
 }
 
-impl<E: fmt::Debug> fmt::Debug for CallDirect<E> {
+impl<E: Instr + fmt::Debug> fmt::Debug for CallDirect<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "CallDirect({}, {:?}", self.function_id, self.callable)?;
         for arg in &self.args {
@@ -332,7 +392,7 @@ impl<E: fmt::Debug> fmt::Debug for CallDirect<E> {
     }
 }
 
-impl<E> CallDirect<E> {
+impl<E: Instr> CallDirect<E> {
     pub fn new(
         callable: impl Into<Box<E>>,
         function_id: FunctionId,
@@ -341,21 +401,35 @@ impl<E> CallDirect<E> {
     ) -> Self {
         Self {
             _meta: Meta::default(),
+            extra: Default::default(),
             callable: callable.into(),
             function_id,
             args: args.into(),
             keywords: keywords.into(),
         }
     }
+
+    pub fn with_extra(mut self, extra: E::Extra) -> Self {
+        self.extra = extra;
+        self
+    }
+
+    pub fn extra(&self) -> &E::Extra {
+        &self.extra
+    }
+
+    pub fn extra_mut(&mut self) -> &mut E::Extra {
+        &mut self.extra
+    }
 }
 
-impl<E> HasMeta for CallDirect<E> {
+impl<E: Instr> HasMeta for CallDirect<E> {
     fn meta(&self) -> Meta {
         self._meta.clone()
     }
 }
 
-impl<E> WithMeta for CallDirect<E> {
+impl<E: Instr> WithMeta for CallDirect<E> {
     fn with_meta(mut self, meta: Meta) -> Self {
         self._meta = meta;
         self
@@ -403,6 +477,7 @@ impl<E: Instr> Mappable<E> for CallDirect<E> {
     {
         CallDirect {
             _meta: self._meta,
+            extra: Default::default(),
             callable: map.map_instr(*self.callable).into(),
             function_id: self.function_id,
             args: self
@@ -425,6 +500,51 @@ impl<E: Instr> Mappable<E> for CallDirect<E> {
     {
         Ok(CallDirect {
             _meta: self._meta,
+            extra: Default::default(),
+            callable: map.try_map_instr(*self.callable)?.into(),
+            function_id: self.function_id,
+            args: self
+                .args
+                .into_iter()
+                .map(|arg| arg.try_map_instr(|expr| map.try_map_instr(expr)))
+                .collect::<Result<Vec<_>, _>>()?,
+            keywords: self
+                .keywords
+                .into_iter()
+                .map(|keyword| keyword.try_map_instr(|expr| map.try_map_instr(expr)))
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+
+    fn map_same_children<M>(self, map: &mut M) -> Self::Mapped<E>
+    where
+        M: MapInstr<E, E>,
+    {
+        CallDirect {
+            _meta: self._meta,
+            extra: self.extra,
+            callable: map.map_instr(*self.callable).into(),
+            function_id: self.function_id,
+            args: self
+                .args
+                .into_iter()
+                .map(|arg| arg.map_instr(|expr| map.map_instr(expr)))
+                .collect(),
+            keywords: self
+                .keywords
+                .into_iter()
+                .map(|keyword| keyword.map_instr(|expr| map.map_instr(expr)))
+                .collect(),
+        }
+    }
+
+    fn try_map_same_children<Error, M>(self, map: &mut M) -> Result<Self::Mapped<E>, Error>
+    where
+        M: TryMapInstr<E, E, Error>,
+    {
+        Ok(CallDirect {
+            _meta: self._meta,
+            extra: self.extra,
             callable: map.try_map_instr(*self.callable)?.into(),
             function_id: self.function_id,
             args: self
@@ -481,6 +601,7 @@ define_operation! {
 #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct Load<I: Instr> {
     _meta: Meta,
+    pub extra: I::Extra,
     pub name: I::Name,
 }
 
@@ -494,8 +615,22 @@ impl<I: Instr> Load<I> {
     pub fn new(name: impl Into<I::Name>) -> Self {
         Self {
             _meta: Meta::default(),
+            extra: Default::default(),
             name: name.into(),
         }
+    }
+
+    pub fn with_extra(mut self, extra: I::Extra) -> Self {
+        self.extra = extra;
+        self
+    }
+
+    pub fn extra(&self) -> &I::Extra {
+        &self.extra
+    }
+
+    pub fn extra_mut(&mut self) -> &mut I::Extra {
+        &mut self.extra
     }
 }
 
@@ -539,6 +674,7 @@ impl<I: Instr> Mappable<I> for Load<I> {
     {
         Load {
             _meta: self._meta,
+            extra: Default::default(),
             name: map.map_name(self.name),
         }
     }
@@ -550,6 +686,29 @@ impl<I: Instr> Mappable<I> for Load<I> {
     {
         Ok(Load {
             _meta: self._meta,
+            extra: Default::default(),
+            name: map.try_map_name(self.name)?,
+        })
+    }
+
+    fn map_same_children<M>(self, map: &mut M) -> Self::Mapped<I>
+    where
+        M: MapInstr<I, I>,
+    {
+        Load {
+            _meta: self._meta,
+            extra: self.extra,
+            name: map.map_name(self.name),
+        }
+    }
+
+    fn try_map_same_children<Error, M>(self, map: &mut M) -> Result<Self::Mapped<I>, Error>
+    where
+        M: TryMapInstr<I, I, Error>,
+    {
+        Ok(Load {
+            _meta: self._meta,
+            extra: self.extra,
             name: map.try_map_name(self.name)?,
         })
     }
@@ -558,6 +717,7 @@ impl<I: Instr> Mappable<I> for Load<I> {
 #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct Store<I: Instr> {
     _meta: Meta,
+    pub extra: I::Extra,
     pub name: I::Name,
     pub value: Box<I>,
 }
@@ -581,9 +741,23 @@ impl<I: Instr> Store<I> {
     pub fn new(name: impl Into<I::Name>, value: impl Into<Box<I>>) -> Self {
         Self {
             _meta: Meta::default(),
+            extra: Default::default(),
             name: name.into(),
             value: value.into(),
         }
+    }
+
+    pub fn with_extra(mut self, extra: I::Extra) -> Self {
+        self.extra = extra;
+        self
+    }
+
+    pub fn extra(&self) -> &I::Extra {
+        &self.extra
+    }
+
+    pub fn extra_mut(&mut self) -> &mut I::Extra {
+        &mut self.extra
     }
 }
 
@@ -629,6 +803,7 @@ impl<I: Instr> Mappable<I> for Store<I> {
     {
         Store {
             _meta: self._meta,
+            extra: Default::default(),
             name: map.map_name(self.name),
             value: Box::new(map.map_instr(*self.value)),
         }
@@ -641,6 +816,31 @@ impl<I: Instr> Mappable<I> for Store<I> {
     {
         Ok(Store {
             _meta: self._meta,
+            extra: Default::default(),
+            name: map.try_map_name(self.name)?,
+            value: Box::new(map.try_map_instr(*self.value)?),
+        })
+    }
+
+    fn map_same_children<M>(self, map: &mut M) -> Self::Mapped<I>
+    where
+        M: MapInstr<I, I>,
+    {
+        Store {
+            _meta: self._meta,
+            extra: self.extra,
+            name: map.map_name(self.name),
+            value: Box::new(map.map_instr(*self.value)),
+        }
+    }
+
+    fn try_map_same_children<Error, M>(self, map: &mut M) -> Result<Self::Mapped<I>, Error>
+    where
+        M: TryMapInstr<I, I, Error>,
+    {
+        Ok(Store {
+            _meta: self._meta,
+            extra: self.extra,
             name: map.try_map_name(self.name)?,
             value: Box::new(map.try_map_instr(*self.value)?),
         })
@@ -650,6 +850,7 @@ impl<I: Instr> Mappable<I> for Store<I> {
 #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct Del<I: Instr> {
     _meta: Meta,
+    pub extra: I::Extra,
     pub name: I::Name,
     pub quietly: bool,
 }
@@ -667,9 +868,23 @@ impl<I: Instr> Del<I> {
     pub fn new(name: impl Into<I::Name>, quietly: bool) -> Self {
         Self {
             _meta: Meta::default(),
+            extra: Default::default(),
             name: name.into(),
             quietly,
         }
+    }
+
+    pub fn with_extra(mut self, extra: I::Extra) -> Self {
+        self.extra = extra;
+        self
+    }
+
+    pub fn extra(&self) -> &I::Extra {
+        &self.extra
+    }
+
+    pub fn extra_mut(&mut self) -> &mut I::Extra {
+        &mut self.extra
     }
 }
 
@@ -713,6 +928,7 @@ impl<I: Instr> Mappable<I> for Del<I> {
     {
         Del {
             _meta: self._meta,
+            extra: Default::default(),
             name: map.map_name(self.name),
             quietly: self.quietly,
         }
@@ -725,6 +941,31 @@ impl<I: Instr> Mappable<I> for Del<I> {
     {
         Ok(Del {
             _meta: self._meta,
+            extra: Default::default(),
+            name: map.try_map_name(self.name)?,
+            quietly: self.quietly,
+        })
+    }
+
+    fn map_same_children<M>(self, map: &mut M) -> Self::Mapped<I>
+    where
+        M: MapInstr<I, I>,
+    {
+        Del {
+            _meta: self._meta,
+            extra: self.extra,
+            name: map.map_name(self.name),
+            quietly: self.quietly,
+        }
+    }
+
+    fn try_map_same_children<Error, M>(self, map: &mut M) -> Result<Self::Mapped<I>, Error>
+    where
+        M: TryMapInstr<I, I, Error>,
+    {
+        Ok(Del {
+            _meta: self._meta,
+            extra: self.extra,
             name: map.try_map_name(self.name)?,
             quietly: self.quietly,
         })
@@ -1183,5 +1424,63 @@ define_ruff_operation! {
     pub struct StmtIpyEscapeCommand {
         kind: ast::IpyEscapeKind,
         value: Box<str>,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::UnresolvedName;
+    use super::*;
+
+    #[derive(Clone, Debug)]
+    enum TestInstr {}
+
+    impl Instr for TestInstr {
+        type Name = UnresolvedName;
+        type Extra = &'static str;
+    }
+
+    #[derive(Clone, Debug)]
+    enum OtherInstr {}
+
+    impl Instr for OtherInstr {
+        type Name = UnresolvedName;
+        type Extra = &'static str;
+    }
+
+    struct TestToOther;
+
+    impl MapInstr<TestInstr, OtherInstr> for TestToOther {
+        fn map_instr(&mut self, instr: TestInstr) -> OtherInstr {
+            match instr {}
+        }
+
+        fn map_name(&mut self, name: UnresolvedName) -> UnresolvedName {
+            name
+        }
+    }
+
+    #[test]
+    fn same_child_mapping_preserves_handwritten_operation_extra() {
+        let op = Load::<TestInstr>::new("x").with_extra("borrowed");
+        let mapped = op.map_same_children(&mut |instr| instr);
+
+        assert_eq!(*mapped.extra(), "borrowed");
+    }
+
+    #[test]
+    fn same_child_mapping_preserves_macro_operation_extra() {
+        let op = Tuple::<TestInstr>::new(Vec::new()).with_extra("effect-only");
+        let mapped = op.map_same_children(&mut |instr| instr);
+
+        assert_eq!(*mapped.extra(), "effect-only");
+    }
+
+    #[test]
+    fn cross_instr_mapping_uses_destination_default_extra() {
+        let op = Load::<TestInstr>::new("x").with_extra("borrowed");
+        let mapped: Load<OtherInstr> = op.map_children(&mut TestToOther);
+
+        assert_eq!(*mapped.extra(), "");
     }
 }

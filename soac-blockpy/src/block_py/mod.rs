@@ -557,6 +557,7 @@ pub trait NameLike: Clone + fmt::Debug {
 
 pub trait Instr: Clone + fmt::Debug + Sized {
     type Name: NameLike;
+    type Extra: Clone + fmt::Debug + Default;
 }
 
 pub trait InstrWithConstantNone: Instr {

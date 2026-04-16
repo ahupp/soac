@@ -113,6 +113,7 @@ impl ModuleShape for RuffModuleShape {
 
 impl Instr for InstrRuff {
     type Name = UnresolvedName;
+    type Extra = ();
 }
 
 impl InstrWithConstantNone for InstrRuff {
@@ -160,11 +161,13 @@ pub type InstrCodegen = InstrCodegenOp;
 
 impl Instr for InstrCodegenOp {
     type Name = ResolvedName;
+    type Extra = ();
 }
 
 #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct DirectFunctionIdGuardTest<E: Instr> {
     _meta: Meta,
+    pub extra: E::Extra,
     pub value: Box<E>,
     pub function_id: FunctionId,
 }
@@ -173,6 +176,7 @@ impl<E: Instr> DirectFunctionIdGuardTest<E> {
     pub fn new(value: impl Into<Box<E>>, function_id: FunctionId) -> Self {
         Self {
             _meta: Meta::default(),
+            extra: Default::default(),
             value: value.into(),
             function_id,
         }
@@ -230,6 +234,7 @@ impl<E: Instr> Mappable<E> for DirectFunctionIdGuardTest<E> {
     {
         DirectFunctionIdGuardTest {
             _meta: self._meta,
+            extra: Default::default(),
             value: Box::new(map.map_instr(*self.value)),
             function_id: self.function_id,
         }
@@ -242,6 +247,7 @@ impl<E: Instr> Mappable<E> for DirectFunctionIdGuardTest<E> {
     {
         Ok(DirectFunctionIdGuardTest {
             _meta: self._meta,
+            extra: Default::default(),
             value: Box::new(map.try_map_instr(*self.value)?),
             function_id: self.function_id,
         })
@@ -251,6 +257,7 @@ impl<E: Instr> Mappable<E> for DirectFunctionIdGuardTest<E> {
 #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct DirectReceiverTypeVersionGuardTest<E: Instr> {
     _meta: Meta,
+    pub extra: E::Extra,
     pub value: Box<E>,
     pub owner_type_ref: TypedAttrOwnerRef,
     pub type_version: u32,
@@ -264,6 +271,7 @@ impl<E: Instr> DirectReceiverTypeVersionGuardTest<E> {
     ) -> Self {
         Self {
             _meta: Meta::default(),
+            extra: Default::default(),
             value: value.into(),
             owner_type_ref,
             type_version,
@@ -323,6 +331,7 @@ impl<E: Instr> Mappable<E> for DirectReceiverTypeVersionGuardTest<E> {
     {
         DirectReceiverTypeVersionGuardTest {
             _meta: self._meta,
+            extra: Default::default(),
             value: Box::new(map.map_instr(*self.value)),
             owner_type_ref: self.owner_type_ref,
             type_version: self.type_version,
@@ -336,6 +345,7 @@ impl<E: Instr> Mappable<E> for DirectReceiverTypeVersionGuardTest<E> {
     {
         Ok(DirectReceiverTypeVersionGuardTest {
             _meta: self._meta,
+            extra: Default::default(),
             value: Box::new(map.try_map_instr(*self.value)?),
             owner_type_ref: self.owner_type_ref,
             type_version: self.type_version,
@@ -346,6 +356,7 @@ impl<E: Instr> Mappable<E> for DirectReceiverTypeVersionGuardTest<E> {
 #[derive(Clone)]
 pub struct TypedTruthy<E: Instr> {
     _meta: Meta,
+    pub extra: E::Extra,
     value: Box<E>,
 }
 
@@ -353,6 +364,7 @@ impl<E: Instr> TypedTruthy<E> {
     pub fn new(value: impl Into<Box<E>>) -> Self {
         Self {
             _meta: Meta::default(),
+            extra: Default::default(),
             value: value.into(),
         }
     }
@@ -414,6 +426,7 @@ impl<E: Instr> Mappable<E> for TypedTruthy<E> {
     {
         TypedTruthy {
             _meta: self._meta,
+            extra: Default::default(),
             value: Box::new(map.map_instr(*self.value)),
         }
     }
@@ -425,6 +438,7 @@ impl<E: Instr> Mappable<E> for TypedTruthy<E> {
     {
         Ok(TypedTruthy {
             _meta: self._meta,
+            extra: Default::default(),
             value: Box::new(map.try_map_instr(*self.value)?),
         })
     }
@@ -496,6 +510,7 @@ pub enum TypedCallAccessPlan {
 #[derive(Clone)]
 pub struct TypedCall<E: Instr> {
     _meta: Meta,
+    pub extra: E::Extra,
     pub func: Box<E>,
     pub args: Vec<CallArgPositional<E>>,
     pub keywords: Vec<CallArgKeyword<E>>,
@@ -510,6 +525,7 @@ impl<E: Instr> TypedCall<E> {
     ) -> Self {
         Self {
             _meta: Meta::default(),
+            extra: Default::default(),
             func: func.into(),
             args: args.into(),
             keywords: keywords.into(),
@@ -520,6 +536,7 @@ impl<E: Instr> TypedCall<E> {
     pub fn from_legacy(op: Call<E>) -> Self {
         Self {
             _meta: op.meta(),
+            extra: op.extra,
             func: op.func,
             args: op.args,
             keywords: op.keywords,
@@ -528,7 +545,9 @@ impl<E: Instr> TypedCall<E> {
     }
 
     pub fn into_legacy(self) -> Call<E> {
-        Call::new(self.func, self.args, self.keywords).with_meta(self._meta)
+        Call::new(self.func, self.args, self.keywords)
+            .with_extra(self.extra)
+            .with_meta(self._meta)
     }
 }
 
@@ -597,6 +616,7 @@ impl<E: Instr> Mappable<E> for TypedCall<E> {
     {
         TypedCall {
             _meta: self._meta,
+            extra: Default::default(),
             func: Box::new(map.map_instr(*self.func)),
             args: self
                 .args
@@ -619,6 +639,7 @@ impl<E: Instr> Mappable<E> for TypedCall<E> {
     {
         Ok(TypedCall {
             _meta: self._meta,
+            extra: Default::default(),
             func: Box::new(map.try_map_instr(*self.func)?),
             args: self
                 .args
@@ -638,6 +659,7 @@ impl<E: Instr> Mappable<E> for TypedCall<E> {
 #[derive(Clone)]
 pub struct TypedDirectCallableCall<E: Instr> {
     _meta: Meta,
+    pub extra: E::Extra,
     pub func: Box<E>,
     pub args: Vec<CallArgPositional<E>>,
     pub guard: TypedDirectCallableCallGuard,
@@ -651,6 +673,7 @@ impl<E: Instr> TypedDirectCallableCall<E> {
     ) -> Self {
         Self {
             _meta: Meta::default(),
+            extra: Default::default(),
             func: func.into(),
             args: args.into(),
             guard,
@@ -716,6 +739,7 @@ impl<E: Instr> Mappable<E> for TypedDirectCallableCall<E> {
     {
         TypedDirectCallableCall {
             _meta: self._meta,
+            extra: Default::default(),
             func: Box::new(map.map_instr(*self.func)),
             args: self
                 .args
@@ -733,6 +757,7 @@ impl<E: Instr> Mappable<E> for TypedDirectCallableCall<E> {
     {
         Ok(TypedDirectCallableCall {
             _meta: self._meta,
+            extra: Default::default(),
             func: Box::new(map.try_map_instr(*self.func)?),
             args: self
                 .args
@@ -747,6 +772,7 @@ impl<E: Instr> Mappable<E> for TypedDirectCallableCall<E> {
 #[derive(Clone)]
 pub struct TypedGuardedCallableCall<E: Instr> {
     _meta: Meta,
+    pub extra: E::Extra,
     pub func: Box<E>,
     pub args: Vec<CallArgPositional<E>>,
     pub keywords: Vec<CallArgKeyword<E>>,
@@ -762,6 +788,7 @@ impl<E: Instr> TypedGuardedCallableCall<E> {
     ) -> Self {
         Self {
             _meta: call._meta,
+            extra: call.extra,
             func: call.func,
             args: call.args,
             keywords: call.keywords,
@@ -773,6 +800,7 @@ impl<E: Instr> TypedGuardedCallableCall<E> {
     pub fn into_typed_call(self) -> TypedCall<E> {
         TypedCall {
             _meta: self._meta,
+            extra: self.extra,
             func: self.func,
             args: self.args,
             keywords: self.keywords,
@@ -850,6 +878,7 @@ impl<E: Instr> Mappable<E> for TypedGuardedCallableCall<E> {
     {
         TypedGuardedCallableCall {
             _meta: self._meta,
+            extra: Default::default(),
             func: Box::new(map.map_instr(*self.func)),
             args: self
                 .args
@@ -873,6 +902,7 @@ impl<E: Instr> Mappable<E> for TypedGuardedCallableCall<E> {
     {
         Ok(TypedGuardedCallableCall {
             _meta: self._meta,
+            extra: Default::default(),
             func: Box::new(map.try_map_instr(*self.func)?),
             args: self
                 .args
@@ -893,6 +923,7 @@ impl<E: Instr> Mappable<E> for TypedGuardedCallableCall<E> {
 #[derive(Clone)]
 pub struct TypedGuardedMethodCall<E: Instr> {
     _meta: Meta,
+    pub extra: E::Extra,
     pub func: Box<E>,
     pub args: Vec<CallArgPositional<E>>,
     pub keywords: Vec<CallArgKeyword<E>>,
@@ -908,6 +939,7 @@ impl<E: Instr> TypedGuardedMethodCall<E> {
     ) -> Self {
         Self {
             _meta: call._meta,
+            extra: call.extra,
             func: call.func,
             args: call.args,
             keywords: call.keywords,
@@ -919,6 +951,7 @@ impl<E: Instr> TypedGuardedMethodCall<E> {
     pub fn into_typed_call(self) -> TypedCall<E> {
         TypedCall {
             _meta: self._meta,
+            extra: self.extra,
             func: self.func,
             args: self.args,
             keywords: self.keywords,
@@ -996,6 +1029,7 @@ impl<E: Instr> Mappable<E> for TypedGuardedMethodCall<E> {
     {
         TypedGuardedMethodCall {
             _meta: self._meta,
+            extra: Default::default(),
             func: Box::new(map.map_instr(*self.func)),
             args: self
                 .args
@@ -1019,6 +1053,7 @@ impl<E: Instr> Mappable<E> for TypedGuardedMethodCall<E> {
     {
         Ok(TypedGuardedMethodCall {
             _meta: self._meta,
+            extra: Default::default(),
             func: Box::new(map.try_map_instr(*self.func)?),
             args: self
                 .args
@@ -1039,6 +1074,7 @@ impl<E: Instr> Mappable<E> for TypedGuardedMethodCall<E> {
 #[derive(Clone)]
 pub struct TypedDirectMethodCall<E: Instr> {
     _meta: Meta,
+    pub extra: E::Extra,
     pub receiver: Box<E>,
     pub args: Vec<CallArgPositional<E>>,
     pub method_name: String,
@@ -1054,6 +1090,7 @@ impl<E: Instr> TypedDirectMethodCall<E> {
     ) -> Self {
         Self {
             _meta: Meta::default(),
+            extra: Default::default(),
             receiver: receiver.into(),
             args: args.into(),
             method_name: method_name.into(),
@@ -1121,6 +1158,7 @@ impl<E: Instr> Mappable<E> for TypedDirectMethodCall<E> {
     {
         TypedDirectMethodCall {
             _meta: self._meta,
+            extra: Default::default(),
             receiver: Box::new(map.map_instr(*self.receiver)),
             args: self
                 .args
@@ -1139,6 +1177,7 @@ impl<E: Instr> Mappable<E> for TypedDirectMethodCall<E> {
     {
         Ok(TypedDirectMethodCall {
             _meta: self._meta,
+            extra: Default::default(),
             receiver: Box::new(map.try_map_instr(*self.receiver)?),
             args: self
                 .args
@@ -1169,6 +1208,7 @@ pub enum TypedDirectCallGuardTestKind {
 #[derive(Clone)]
 pub struct TypedDirectCallGuardTest<E: Instr> {
     _meta: Meta,
+    pub extra: E::Extra,
     pub value: Box<E>,
     pub kind: TypedDirectCallGuardTestKind,
 }
@@ -1177,6 +1217,7 @@ impl<E: Instr> TypedDirectCallGuardTest<E> {
     pub fn new(value: impl Into<Box<E>>, kind: TypedDirectCallGuardTestKind) -> Self {
         Self {
             _meta: Meta::default(),
+            extra: Default::default(),
             value: value.into(),
             kind,
         }
@@ -1234,6 +1275,7 @@ impl<E: Instr> Mappable<E> for TypedDirectCallGuardTest<E> {
     {
         TypedDirectCallGuardTest {
             _meta: self._meta,
+            extra: Default::default(),
             value: Box::new(map.map_instr(*self.value)),
             kind: self.kind,
         }
@@ -1246,6 +1288,7 @@ impl<E: Instr> Mappable<E> for TypedDirectCallGuardTest<E> {
     {
         Ok(TypedDirectCallGuardTest {
             _meta: self._meta,
+            extra: Default::default(),
             value: Box::new(map.try_map_instr(*self.value)?),
             kind: self.kind,
         })
@@ -1277,6 +1320,7 @@ pub enum TypedAttrAccessPlan {
 #[derive(Clone)]
 pub struct TypedGetAttr<E: Instr> {
     _meta: Meta,
+    pub extra: E::Extra,
     pub value: Box<E>,
     pub attr: Box<E>,
     pub access: TypedAttrAccessPlan,
@@ -1286,6 +1330,7 @@ impl<E: Instr> TypedGetAttr<E> {
     pub fn generic(value: impl Into<Box<E>>, attr: impl Into<Box<E>>) -> Self {
         Self {
             _meta: Meta::default(),
+            extra: Default::default(),
             value: value.into(),
             attr: attr.into(),
             access: TypedAttrAccessPlan::Generic,
@@ -1295,6 +1340,7 @@ impl<E: Instr> TypedGetAttr<E> {
     pub fn from_legacy(op: GetAttr<E>) -> Self {
         Self {
             _meta: op.meta(),
+            extra: op.extra,
             value: op.value,
             attr: op.attr,
             access: TypedAttrAccessPlan::Generic,
@@ -1302,7 +1348,9 @@ impl<E: Instr> TypedGetAttr<E> {
     }
 
     pub fn into_legacy(self) -> GetAttr<E> {
-        GetAttr::new(self.value, self.attr).with_meta(self._meta)
+        GetAttr::new(self.value, self.attr)
+            .with_extra(self.extra)
+            .with_meta(self._meta)
     }
 }
 
@@ -1360,6 +1408,7 @@ impl<E: Instr> Mappable<E> for TypedGetAttr<E> {
     {
         TypedGetAttr {
             _meta: self._meta,
+            extra: Default::default(),
             value: Box::new(map.map_instr(*self.value)),
             attr: Box::new(map.map_instr(*self.attr)),
             access: self.access,
@@ -1373,6 +1422,7 @@ impl<E: Instr> Mappable<E> for TypedGetAttr<E> {
     {
         Ok(TypedGetAttr {
             _meta: self._meta,
+            extra: Default::default(),
             value: Box::new(map.try_map_instr(*self.value)?),
             attr: Box::new(map.try_map_instr(*self.attr)?),
             access: self.access,
@@ -1383,6 +1433,7 @@ impl<E: Instr> Mappable<E> for TypedGetAttr<E> {
 #[derive(Clone)]
 pub struct TypedSetAttr<E: Instr> {
     _meta: Meta,
+    pub extra: E::Extra,
     pub value: Box<E>,
     pub attr: Box<E>,
     pub replacement: Box<E>,
@@ -1397,6 +1448,7 @@ impl<E: Instr> TypedSetAttr<E> {
     ) -> Self {
         Self {
             _meta: Meta::default(),
+            extra: Default::default(),
             value: value.into(),
             attr: attr.into(),
             replacement: replacement.into(),
@@ -1407,6 +1459,7 @@ impl<E: Instr> TypedSetAttr<E> {
     pub fn from_legacy(op: SetAttr<E>) -> Self {
         Self {
             _meta: op.meta(),
+            extra: op.extra,
             value: op.value,
             attr: op.attr,
             replacement: op.replacement,
@@ -1415,7 +1468,9 @@ impl<E: Instr> TypedSetAttr<E> {
     }
 
     pub fn into_legacy(self) -> SetAttr<E> {
-        SetAttr::new(self.value, self.attr, self.replacement).with_meta(self._meta)
+        SetAttr::new(self.value, self.attr, self.replacement)
+            .with_extra(self.extra)
+            .with_meta(self._meta)
     }
 }
 
@@ -1476,6 +1531,7 @@ impl<E: Instr> Mappable<E> for TypedSetAttr<E> {
     {
         TypedSetAttr {
             _meta: self._meta,
+            extra: Default::default(),
             value: Box::new(map.map_instr(*self.value)),
             attr: Box::new(map.map_instr(*self.attr)),
             replacement: Box::new(map.map_instr(*self.replacement)),
@@ -1490,6 +1546,7 @@ impl<E: Instr> Mappable<E> for TypedSetAttr<E> {
     {
         Ok(TypedSetAttr {
             _meta: self._meta,
+            extra: Default::default(),
             value: Box::new(map.try_map_instr(*self.value)?),
             attr: Box::new(map.try_map_instr(*self.attr)?),
             replacement: Box::new(map.try_map_instr(*self.replacement)?),
@@ -1558,6 +1615,7 @@ impl InstrTyped {
 
 impl Instr for InstrTyped {
     type Name = ResolvedName;
+    type Extra = ();
 }
 
 impl InstrWithConstantNone for InstrTyped {
@@ -2089,6 +2147,7 @@ where
     I: Instr,
 {
     type Name = I::Name;
+    type Extra = I::Extra;
 }
 
 impl InstrWithConstantNone for InstrCodegenOp {
@@ -2124,6 +2183,7 @@ pub enum InstrWithAwaitAndYield {
 
 impl Instr for InstrWithAwaitAndYield {
     type Name = UnresolvedName;
+    type Extra = ();
 }
 
 impl InstrWithConstantNone for InstrWithAwaitAndYield {
@@ -2158,6 +2218,7 @@ pub enum InstrWithYield {
 
 impl Instr for InstrWithYield {
     type Name = UnresolvedName;
+    type Extra = ();
 }
 
 impl InstrWithConstantNone for InstrWithYield {
@@ -2212,6 +2273,7 @@ pub enum InstrLow<N: NameLike> {
 
 impl<N: NameLike> Instr for InstrLow<N> {
     type Name = N;
+    type Extra = ();
 }
 
 impl<N: NameLike> InstrWithConstantNone for InstrLow<N> {
@@ -2260,6 +2322,7 @@ pub enum InstrResolved {
 
 impl Instr for InstrResolved {
     type Name = ResolvedName;
+    type Extra = ();
 }
 
 impl InstrWithConstantNone for InstrResolved {
