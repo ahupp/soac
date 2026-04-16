@@ -64,12 +64,13 @@ use soac_blockpy::passes::{
     build_direct_method_inline_fragment_to_target, infer_module_value_facts,
     inline_direct_call_stores_with_callees, lower_codegen_function_to_typed,
     lower_typed_function_call_access_plan_instrs, lower_typed_function_if_tests_to_truthy,
-    plan_module_inlining, rewrite_profiled_function_call_store_sites,
-    rewrite_static_runtime_constructor_call_stores,
+    plan_module_inlining, refresh_typed_function_value_facts,
+    rewrite_profiled_function_call_store_sites, rewrite_static_runtime_constructor_call_stores,
     scalar_replace_non_escaping_constructor_allocations,
     straightline_field_initializer_rejection_reason, summarize_module_escapes,
     try_lower_typed_instr_to_codegen_legacy, try_lower_typed_term_to_codegen_legacy,
     validate_codegen_instr_ids, validate_typed_function_call_access_plans,
+    validate_typed_function_value_facts,
 };
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -9266,17 +9267,10 @@ fn py_facts_for_codegen_expr_with_local_env(
 fn py_facts_for_typed_expr_with_local_env(
     expr: &InstrTyped,
     local_env: &LocalEnv,
-    ctx: &JitEmitCtx<'_>,
 ) -> Option<PyObjFacts> {
     if let InstrTyped::Load(op) = expr {
         if let Some(py_facts) = local_env.py_facts_for_load(&op.name) {
             return Some(py_facts);
-        }
-        if op.name.location.as_constant().is_some_and(|index| {
-            ctx.module_constants
-                .constant_is_int(ModuleConstantId(index as usize))
-        }) {
-            return Some(PyObjFacts::exact_type(PyExactType::Int));
         }
         return op.extra().result_facts().and_then(ValueFacts::as_pyobj);
     }
@@ -9286,7 +9280,6 @@ fn py_facts_for_typed_expr_with_local_env(
 fn local_ref_kind_for_typed_stored_value(
     value: &InstrTyped,
     ownership: ValueOwnership,
-    _ctx: &JitEmitCtx<'_>,
 ) -> LocalRefKind {
     if matches!(ownership, ValueOwnership::Immortal) {
         return LocalRefKind::Immortal;
@@ -9586,8 +9579,7 @@ fn emit_typed_local_store_result_with_local_env(
     };
     let (value, ownership, value_py_facts) = value_result.expect_pyobject("typed local store RHS");
     let value_py_facts = if matches!(emit_ctx.function_kind, FunctionKind::Function) {
-        py_facts_for_typed_expr_with_local_env(&op.value, local_env, emit_ctx)
-            .unwrap_or(value_py_facts)
+        py_facts_for_typed_expr_with_local_env(&op.value, local_env).unwrap_or(value_py_facts)
     } else {
         value_py_facts
     };
@@ -9599,7 +9591,7 @@ fn emit_typed_local_store_result_with_local_env(
     let value_ref_kind = match planned_typed_local_store_effect(expr, location, emit_ctx) {
         Some(PlannedLocalStoreEffect::Rebind(ref_kind)) => ref_kind,
         Some(PlannedLocalStoreEffect::Delete) => unreachable!(),
-        None => local_ref_kind_for_typed_stored_value(&op.value, ownership, emit_ctx),
+        None => local_ref_kind_for_typed_stored_value(&op.value, ownership),
     };
     local_env.store_location(
         fb,
@@ -9907,37 +9899,6 @@ impl<'a, 'b, 'mc, 'c, 'd, Env: JitCodegenEnv> intrinsics::OperationEmitState<'b,
         arg_values
     }
 
-    fn release_arg_values(&mut self, arg_values: &[(ir::Value, bool)]) {
-        for (value, borrowed_arg) in arg_values {
-            if !borrowed_arg {
-                self.fb.ins().call(
-                    self.ctx.decref_ref,
-                    &[self.ctx.consts.thread_state_value, *value],
-                );
-            }
-        }
-    }
-
-    fn finish_owned_result(&mut self, value: ir::Value) -> ir::Value {
-        let null_ptr = self.fb.ins().iconst(self.ctx.consts.ptr_ty, 0);
-        let value_is_null = self
-            .fb
-            .ins()
-            .icmp(ir::condcodes::IntCC::Equal, value, null_ptr);
-        let value_ok_block = self.fb.create_block();
-        self.fb
-            .append_block_param(value_ok_block, self.ctx.consts.ptr_ty);
-        self.fb.ins().brif(
-            value_is_null,
-            self.ctx.consts.step_null_block,
-            &step_null_block_args(self.ctx),
-            value_ok_block,
-            &[ir::BlockArg::Value(value)],
-        );
-        self.fb.switch_to_block(value_ok_block);
-        self.fb.block_params(value_ok_block)[0]
-    }
-
     fn emit_owned_bool_from_i32_result(&mut self, result: ir::Value) -> ir::Value {
         emit_owned_bool_from_i32_result(self.fb, result, self.ctx)
     }
@@ -9999,6 +9960,146 @@ impl<'a, 'b, 'mc, 'c, 'd, Env: JitCodegenEnv> intrinsics::OperationEmitState<'b,
                 pre_guard_operands,
                 fallback_block,
             ),
+            fallback_block,
+            self.ctx.guard_miss_deopt_stub_ref,
+        )
+    }
+
+    fn emit_deopt_resume_result(
+        &mut self,
+        target: JitDeoptExitRef,
+        deopt_resume_ref: ir::FuncRef,
+    ) -> ir::Value {
+        let (live_values_base, live_value_count) =
+            emit_deopt_live_value_buffer(self.fb, target, self.ctx, self.local_env)
+                .unwrap_or_else(|err| panic!("{err}"));
+        emit_deopt_resume_call(
+            self.fb,
+            target,
+            deopt_resume_ref,
+            self.ctx.consts.block_const,
+            live_values_base,
+            live_value_count,
+            self.ctx.consts.ptr_ty,
+            self.ctx.consts.i64_ty,
+        )
+    }
+}
+
+impl<'a, 'b, 'mc, 'c, 'd, Env: JitCodegenEnv> intrinsics::OperationEmitState<'b, InstrTyped>
+    for LocalEnvCodegenIntrinsicEmitState<'a, 'b, 'mc, 'c, 'd, Env>
+{
+    fn ctx(&self) -> &JitEmitCtx<'mc> {
+        self.ctx
+    }
+
+    fn fb(&mut self) -> &mut FunctionBuilder<'b> {
+        self.fb
+    }
+
+    fn import_func(&mut self, spec: &'static ImportSpec) -> ir::FuncRef {
+        self.func_imports
+            .get_or_panic(self.codegen_env, &mut self.fb.func, spec)
+    }
+
+    fn emit_arg_values(&mut self, args: &[&InstrTyped]) -> Vec<(ir::Value, bool)> {
+        let mut arg_values = Vec::with_capacity(args.len());
+        for arg in args {
+            let borrowed_arg = typed_expr_pyobject_input_is_borrowed_from_local_env(
+                arg,
+                &*self.local_env,
+                self.ctx,
+            );
+            let value = emit_typed_codegen_expr_value_with_local_env(
+                self.fb,
+                arg,
+                &mut *self.local_env,
+                self.ctx,
+                borrowed_arg,
+                self.codegen_env,
+                self.func_imports,
+            )
+            .unwrap_or_else(|err| panic!("{err}"));
+            let (value, _) = value.expect_pyobject("typed intrinsic PyObject argument");
+            arg_values.push((value, borrowed_arg));
+        }
+        arg_values
+    }
+
+    fn emit_owned_bool_from_i32_result(&mut self, result: ir::Value) -> ir::Value {
+        emit_owned_bool_from_i32_result(self.fb, result, self.ctx)
+    }
+
+    fn emit_owned_bool_from_cond(&mut self, cond: ir::Value) -> ir::Value {
+        emit_owned_bool_from_cond(self.fb, cond, self.ctx)
+    }
+
+    fn emit_owned_bool_from_pyobject_truthiness(
+        &mut self,
+        value: ir::Value,
+        facts: PyObjFacts,
+        borrowed: bool,
+        invert: bool,
+    ) -> ir::Value {
+        let is_true_ref = self.func_imports.get_or_panic(
+            self.codegen_env,
+            &mut self.fb.func,
+            &DP_JIT_IS_TRUE_IMPORT,
+        );
+        emit_owned_bool_from_pyobject_truthiness(
+            self.fb,
+            value,
+            facts,
+            borrowed,
+            invert,
+            is_true_ref,
+            self.ctx,
+        )
+    }
+
+    fn emit_type_ptr_value(&mut self, owner_type_ref: &RelocTypeRef) -> Option<ir::Value> {
+        emit_type_ptr_value_for_ref(self.fb, self.codegen_env, self.ctx, owner_type_ref)
+            .unwrap_or_else(|err| {
+                panic!("failed to bind type symbol during JIT codegen: {err}");
+            })
+    }
+
+    fn py_facts_for_arg(&self, arg: &InstrTyped) -> PyObjFacts {
+        py_facts_for_typed_expr_with_local_env(arg, self.local_env)
+            .unwrap_or_else(PyObjFacts::unknown)
+    }
+
+    fn prepare_guard_miss_dispatch_for_instr(
+        &mut self,
+        instr_id: InstrId,
+        pre_guard_operands: &[&InstrTyped],
+        fallback_block: ir::Block,
+    ) -> JitGuardMissDispatch {
+        let guard_miss_resume_point =
+            self.ctx
+                .guard_miss_resume_point
+                .unwrap_or(LocalEnvResumePoint::BeforeInstr {
+                    key: InstrKey::new(self.ctx.function_id, instr_id),
+                });
+        let legacy_operands = pre_guard_operands
+            .iter()
+            .map(|operand| try_lower_typed_instr_to_codegen_legacy((*operand).clone()))
+            .collect::<Result<Vec<_>, _>>();
+        let guard_miss_target = legacy_operands
+            .as_ref()
+            .map(|legacy_operands| {
+                let legacy_operand_refs = legacy_operands.iter().collect::<Vec<_>>();
+                self.ctx.guard_miss_target_for_resume_point(
+                    guard_miss_resume_point,
+                    &legacy_operand_refs,
+                    fallback_block,
+                )
+            })
+            .unwrap_or(Err(
+                RuntimeJitDeoptUnsupportedReason::ReplayUnsafeGuardOperand,
+            ));
+        prepare_optional_guard_miss_dispatch(
+            guard_miss_target,
             fallback_block,
             self.ctx.guard_miss_deopt_stub_ref,
         )
@@ -15599,17 +15700,25 @@ fn emit_typed_codegen_expr_value_with_local_env(
         ));
     }
 
-    if let InstrTyped::BinOp(_) = expr {
-        let legacy_expr = try_lower_typed_instr_to_codegen_legacy(expr.clone())?;
-        return Ok(emit_codegen_expr_value_with_local_env(
+    if matches!(expr, InstrTyped::BinOp(_) | InstrTyped::LegacyUnaryOp(_)) {
+        assert!(
+            !borrowed,
+            "typed operation expression must not use borrowed result"
+        );
+        let mut intrinsic_state = LocalEnvCodegenIntrinsicEmitState {
             fb,
-            &legacy_expr,
             local_env,
-            emit_ctx,
-            borrowed,
+            ctx: emit_ctx,
             codegen_env,
             func_imports,
-        ));
+        };
+        if let Some(value) = intrinsics::emit_typed_operation(expr, &mut intrinsic_state) {
+            let facts = expr
+                .result_facts()
+                .and_then(ValueFacts::as_pyobj)
+                .unwrap_or_else(PyObjFacts::unknown);
+            return Ok(SoacValue::pyobject(value, facts));
+        }
     }
 
     if let InstrTyped::CallTyped(op) = expr {
@@ -17162,7 +17271,7 @@ fn emit_codegen_expr_with_local_env(
             codegen_env,
             func_imports,
         };
-        return intrinsics::OperationEmitState::finish_owned_result(
+        return intrinsics::OperationEmitState::<InstrCodegen>::finish_owned_result(
             &mut intrinsic_state,
             call_value,
         );
@@ -17184,7 +17293,11 @@ fn emit_codegen_expr_with_local_env(
             codegen_env,
             func_imports,
         };
-        return intrinsics::emit_del_deref_raw_cell(raw_cell, op.quietly, &mut intrinsic_state);
+        return intrinsics::emit_del_deref_raw_cell::<InstrCodegen>(
+            raw_cell,
+            op.quietly,
+            &mut intrinsic_state,
+        );
     }
     if let InstrCodegen::CallDirect(call) = expr {
         assert!(
@@ -20554,6 +20667,9 @@ impl ProcessJitEngine {
         session: Arc<crate::session::CompileSession>,
         shared_state: Arc<crate::module_type::SharedModuleState>,
     ) -> Result<(), String> {
+        if !crate::config::background_jit_enabled()? {
+            return Ok(());
+        }
         if specialization_mode_from_env()?.is_some() {
             return Ok(());
         }
@@ -23280,6 +23396,7 @@ fn prepare_specialized_typed_function(
 ) -> Result<PreparedSpecializedTypedFunction, String> {
     let mut typed_function = lower_codegen_function_to_typed(function.clone());
     annotate_typed_function_value_facts(&mut typed_function, value_facts);
+    validate_typed_function_value_facts(&typed_function)?;
     let mut typed_function = lower_typed_function_if_tests_to_truthy(typed_function);
 
     annotate_typed_attr_accesses(
@@ -23294,7 +23411,9 @@ fn prepare_specialized_typed_function(
         call_target_specializations,
     );
     lower_typed_function_call_access_plan_instrs(&mut typed_function);
+    refresh_typed_function_value_facts(&mut typed_function);
     validate_typed_function_call_access_plans(&typed_function)?;
+    validate_typed_function_value_facts(&typed_function)?;
     validate_typed_function_preserves_codegen_cfg(function, &typed_function)?;
     let result_demand_plan = plan_typed_result_demands(&typed_function);
     Ok(PreparedSpecializedTypedFunction {

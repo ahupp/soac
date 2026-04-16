@@ -646,6 +646,7 @@ time.sleep(0.25)
 """
     env = os.environ.copy()
     env.pop("SOAC_OPT_MODE", None)
+    env["SOAC_BACKGROUND_JIT"] = "1"
     env["SOAC_MODULE_ENABLED"] = f"path:{tmp_path}"
     env["SOAC_LOG"] = f"soac_jit_codegen=info;json={log_path}"
     result = subprocess.run(
@@ -669,6 +670,45 @@ time.sleep(0.25)
     }
     assert "recursive_bg_pkg.parent" in background_modules
     assert "recursive_bg_pkg.child" not in background_modules
+
+
+def test_immediate_call_does_not_deadlock_with_background_jit(tmp_path):
+    package_dir = tmp_path / "immediate_bg_pkg"
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "mod.py").write_text(
+        """
+def identity(value):
+    return value
+""",
+        encoding="utf-8",
+    )
+
+    script = f"""
+import sys
+
+sys.path.insert(0, {str(tmp_path)!r})
+from soac import import_hook
+
+import_hook.install()
+from immediate_bg_pkg import mod
+
+assert mod.identity(4) == 4
+"""
+    env = os.environ.copy()
+    env.pop("SOAC_OPT_MODE", None)
+    env["SOAC_BACKGROUND_JIT"] = "1"
+    env["SOAC_MODULE_ENABLED"] = f"path:{package_dir}"
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        env=env,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @BROAD_MODE_SLOW

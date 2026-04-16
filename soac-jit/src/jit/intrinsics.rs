@@ -3,7 +3,7 @@ use super::{
     ImportSpec, JitDeoptExitRef, JitEmitCtx, JitGuardMissDispatch, RelocTypeRef,
     SOAC_RUNTIME_LOAD_GLOBAL_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_IMPORT, SigType,
     codegen_constant_string_value, emit_exact_type_version_match, emit_increment_counter_slot,
-    emit_owned_module_constant_from_parts,
+    emit_owned_module_constant_from_parts, step_null_block_args,
 };
 use crate::jit::blockpy_intrinsics;
 use crate::operator_specialization::{
@@ -17,7 +17,7 @@ use pyo3::ffi;
 use soac_blockpy::block_py::{
     CounterId, HasSemanticInstrId, Instr, InstrCodegen, NameLike, NameLocation,
 };
-use soac_blockpy::passes::{PyExactType, PyObjFacts};
+use soac_blockpy::passes::{InstrTyped, PyExactType, PyObjFacts};
 use std::mem::offset_of;
 
 pub(super) trait OperationEmitState<'fb, E> {
@@ -25,8 +25,39 @@ pub(super) trait OperationEmitState<'fb, E> {
     fn fb(&mut self) -> &mut FunctionBuilder<'fb>;
     fn import_func(&mut self, spec: &'static ImportSpec) -> ir::FuncRef;
     fn emit_arg_values(&mut self, args: &[&E]) -> Vec<(ir::Value, bool)>;
-    fn release_arg_values(&mut self, arg_values: &[(ir::Value, bool)]);
-    fn finish_owned_result(&mut self, value: ir::Value) -> ir::Value;
+    fn release_arg_values(&mut self, arg_values: &[(ir::Value, bool)]) {
+        let thread_state_value = self.ctx().consts.thread_state_value;
+        let decref_ref = self.ctx().decref_ref;
+        for (value, borrowed_arg) in arg_values {
+            if !borrowed_arg {
+                self.fb()
+                    .ins()
+                    .call(decref_ref, &[thread_state_value, *value]);
+            }
+        }
+    }
+
+    fn finish_owned_result(&mut self, value: ir::Value) -> ir::Value {
+        let ptr_ty = self.ctx().consts.ptr_ty;
+        let step_null_block = self.ctx().consts.step_null_block;
+        let step_null_args = step_null_block_args(self.ctx());
+        let null_ptr = self.fb().ins().iconst(ptr_ty, 0);
+        let value_is_null = self
+            .fb()
+            .ins()
+            .icmp(ir::condcodes::IntCC::Equal, value, null_ptr);
+        let value_ok_block = self.fb().create_block();
+        self.fb().append_block_param(value_ok_block, ptr_ty);
+        self.fb().ins().brif(
+            value_is_null,
+            step_null_block,
+            &step_null_args,
+            value_ok_block,
+            &[ir::BlockArg::Value(value)],
+        );
+        self.fb().switch_to_block(value_ok_block);
+        self.fb().block_params(value_ok_block)[0]
+    }
     fn emit_owned_bool_from_i32_result(&mut self, result: ir::Value) -> ir::Value;
     fn emit_owned_bool_from_cond(&mut self, cond: ir::Value) -> ir::Value;
     fn emit_owned_bool_from_pyobject_truthiness(
@@ -1174,10 +1205,13 @@ fn emit_unary_op<'fb, E>(
     emit_unary_op_with_arg_and_values(kind, state, *arg, &arg_values)
 }
 
-fn emit_specialized_binop<'fb>(
-    op: &blockpy_intrinsics::BinOp<InstrCodegen>,
-    state: &mut impl OperationEmitState<'fb, InstrCodegen>,
-) -> Option<ir::Value> {
+fn emit_specialized_binop<'fb, E>(
+    op: &blockpy_intrinsics::BinOp<E>,
+    state: &mut impl OperationEmitState<'fb, E>,
+) -> Option<ir::Value>
+where
+    E: Instr,
+{
     let instr_id = op.semantic_instr_id();
     let ptr_ty = state.ctx().consts.ptr_ty;
     let i64_ty = state.ctx().consts.i64_ty;
@@ -1331,10 +1365,13 @@ fn emit_specialized_binop<'fb>(
     Some(state.fb().block_params(result_block)[0])
 }
 
-fn emit_specialized_unary_op<'fb>(
-    op: &blockpy_intrinsics::UnaryOp<InstrCodegen>,
-    state: &mut impl OperationEmitState<'fb, InstrCodegen>,
-) -> Option<ir::Value> {
+fn emit_specialized_unary_op<'fb, E>(
+    op: &blockpy_intrinsics::UnaryOp<E>,
+    state: &mut impl OperationEmitState<'fb, E>,
+) -> Option<ir::Value>
+where
+    E: Instr,
+{
     let instr_id = op.semantic_instr_id();
     let ptr_ty = state.ctx().consts.ptr_ty;
     let i64_ty = state.ctx().consts.i64_ty;
@@ -1928,5 +1965,23 @@ pub(super) fn emit_operation<'fb>(
         InstrCodegen::MakeFunctionWithClosure(_) => None,
         InstrCodegen::Store(op) => op.name.location.is_global().then(|| emit_store(op, state)),
         InstrCodegen::Del(op) => op.name.location.is_global().then(|| emit_del(op, state)),
+    }
+}
+
+pub(super) fn emit_typed_operation<'fb>(
+    operation: &InstrTyped,
+    state: &mut impl OperationEmitState<'fb, InstrTyped>,
+) -> Option<ir::Value> {
+    match operation {
+        InstrTyped::BinOp(op) => emit_specialized_binop(op, state).or_else(|| {
+            Some(emit_binop(
+                op.kind,
+                state,
+                &[op.left.as_ref(), op.right.as_ref()],
+            ))
+        }),
+        InstrTyped::LegacyUnaryOp(op) => emit_specialized_unary_op(op, state)
+            .or_else(|| Some(emit_unary_op(op.kind, state, &[op.operand.as_ref()]))),
+        _ => None,
     }
 }

@@ -10,6 +10,7 @@ pub const SOAC_CRANELIFT_OPT_LEVEL_ENV: &str = "SOAC_CRANELIFT_OPT_LEVEL";
 pub const SOAC_ENABLE_PROFILED_COLD_BLOCKS_ENV: &str = "SOAC_ENABLE_PROFILED_COLD_BLOCKS";
 pub const SOAC_JIT_EMIT_REFCOUNTS_ENV: &str = "SOAC_JIT_EMIT_REFCOUNTS";
 pub const SOAC_JIT_COMPILE_WORKERS_ENV: &str = "SOAC_JIT_COMPILE_WORKERS";
+pub const SOAC_BACKGROUND_JIT_ENV: &str = "SOAC_BACKGROUND_JIT";
 pub const SOAC_MODULE_CACHE_DIR_ENV: &str = "SOAC_MODULE_CACHE_DIR";
 pub const SOAC_PRECOMPILED_LIBRARY_ENV: &str = "SOAC_PRECOMPILED_LIBRARY";
 pub const SOAC_COMPILE_MODE_ENV: &str = "SOAC_COMPILE_MODE";
@@ -98,6 +99,7 @@ pub struct SoacEnvConfig {
     module_cache_dir: Option<PathBuf>,
     compile_mode: CompileMode,
     jit_compile_workers: Option<usize>,
+    background_jit_enabled: bool,
     jit_perf_helper_frames_enabled: bool,
     soac_exec_trace: Option<String>,
     soac_log: SoacLogConfig,
@@ -121,6 +123,7 @@ impl SoacEnvConfig {
             SOAC_JIT_COMPILE_WORKERS_ENV,
             env_string(SOAC_JIT_COMPILE_WORKERS_ENV)?.as_deref(),
         )?;
+        let background_jit_enabled = env_bool(SOAC_BACKGROUND_JIT_ENV, true)?;
         let jit_perf_helper_frames_enabled = env_bool(SOAC_JIT_PERF_HELPER_FRAMES_ENV, false)?;
         let soac_exec_trace = env_string(SOAC_EXEC_TRACE_ENV)?;
         let soac_log_raw = env_string(SOAC_LOG_ENV)?;
@@ -138,6 +141,7 @@ impl SoacEnvConfig {
             module_cache_dir,
             compile_mode,
             jit_compile_workers,
+            background_jit_enabled,
             jit_perf_helper_frames_enabled,
             soac_exec_trace,
             soac_log,
@@ -193,6 +197,10 @@ impl SoacEnvConfig {
 
     pub fn jit_compile_workers(&self) -> Option<usize> {
         self.jit_compile_workers
+    }
+
+    pub fn background_jit_enabled(&self) -> bool {
+        self.background_jit_enabled
     }
 
     pub fn jit_perf_helper_frames_enabled(&self) -> bool {
@@ -381,6 +389,10 @@ pub fn eager_clif_compile_requested_from_env() -> Result<bool, String> {
     Ok(SoacEnvConfig::from_env()?.eager_clif_compile_requested())
 }
 
+pub fn background_jit_enabled_from_env() -> Result<bool, String> {
+    Ok(SoacEnvConfig::from_env()?.background_jit_enabled())
+}
+
 pub fn jit_compile_workers_from_env() -> Result<Option<usize>, String> {
     Ok(SoacEnvConfig::from_env()?.jit_compile_workers())
 }
@@ -490,6 +502,7 @@ mod tests {
             EnvVarGuard::remove(SOAC_PRECOMPILED_LIBRARY_ENV),
             EnvVarGuard::remove(SOAC_COMPILE_MODE_ENV),
             EnvVarGuard::remove(SOAC_JIT_COMPILE_WORKERS_ENV),
+            EnvVarGuard::remove(SOAC_BACKGROUND_JIT_ENV),
             EnvVarGuard::remove(SOAC_JIT_PERF_HELPER_FRAMES_ENV),
             EnvVarGuard::remove(SOAC_LOG_ENV),
             EnvVarGuard::remove(SOAC_EXEC_TRACE_ENV),
@@ -518,6 +531,7 @@ mod tests {
         assert_eq!(config.cranelift_opt_level(), "speed");
         assert_eq!(config.compile_mode(), CompileMode::Lazy);
         assert_eq!(config.jit_compile_workers(), None);
+        assert!(config.background_jit_enabled());
         assert!(config.jit_refcount_emission_enabled());
         assert!(!config.jit_perf_helper_frames_enabled());
     }
@@ -544,6 +558,7 @@ mod tests {
             (SOAC_JIT_EMIT_REFCOUNTS_ENV, ""),
             (SOAC_COMPILE_MODE_ENV, "always"),
             (SOAC_JIT_COMPILE_WORKERS_ENV, "0"),
+            (SOAC_BACKGROUND_JIT_ENV, "sometimes"),
             (SOAC_JIT_PERF_HELPER_FRAMES_ENV, "2"),
         ] {
             let _guards = clear_soac_config_env();

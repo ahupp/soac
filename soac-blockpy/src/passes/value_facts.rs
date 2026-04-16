@@ -770,7 +770,7 @@ fn is_exact_int_fact(facts: ValueFacts) -> bool {
         .is_some_and(|py_facts| py_facts.is_exact_type(PyExactType::Int))
 }
 
-fn infer_binop_result_facts(
+pub(crate) fn infer_binop_result_facts(
     kind: BinOpKind,
     left: ValueFacts,
     right: ValueFacts,
@@ -818,7 +818,10 @@ fn infer_binop_result_facts(
     Some(ValueFacts::PyObj(py_facts))
 }
 
-fn infer_unary_result_facts(kind: UnaryOpKind, operand: ValueFacts) -> Option<ValueFacts> {
+pub(crate) fn infer_unary_result_facts(
+    kind: UnaryOpKind,
+    operand: ValueFacts,
+) -> Option<ValueFacts> {
     if !is_exact_int_fact(operand) {
         return None;
     }

@@ -768,6 +768,7 @@ _pytest-run *args='': ensure-venv
   fi
 
   export SOAC_CRANELIFT_OPT_LEVEL="${SOAC_CRANELIFT_OPT_LEVEL:-none}"
+  export SOAC_BACKGROUND_JIT="${SOAC_BACKGROUND_JIT:-0}"
   SOAC_PYTEST_EVENTS_LOG="${SOAC_PYTEST_EVENTS_LOG:-$REPO_ROOT/logs/pytest_events.jsonl}"
   if [[ -z "${SOAC_LOG:-}" && "${SOAC_PYTEST_TRACE:-0}" =~ ^(1|true|yes|on)$ ]]; then
     rm -f "$SOAC_PYTEST_EVENTS_LOG"

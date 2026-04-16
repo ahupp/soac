@@ -1838,6 +1838,110 @@ pub fn annotate_typed_function_value_facts(
     annotator.changed
 }
 
+pub fn refresh_typed_function_value_facts(
+    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+) -> usize {
+    struct Refresher {
+        changed: usize,
+    }
+
+    impl VisitMut<InstrTyped> for Refresher {
+        fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+            expr.visit_children_mut(self);
+            let Some(facts) = infer_typed_instr_result_facts(expr) else {
+                return;
+            };
+            if let Some(extra) = expr.typed_extra_mut() {
+                self.changed += usize::from(extra.refine_result_facts(facts));
+            }
+        }
+    }
+
+    let mut refresher = Refresher { changed: 0 };
+    refresher.visit_fn_mut(function);
+    refresher.changed
+}
+
+fn infer_typed_instr_result_facts(expr: &InstrTyped) -> Option<ValueFacts> {
+    match expr {
+        InstrTyped::Truthy(_) => Some(ValueFacts::Bool(BoolFacts)),
+        InstrTyped::Load(op) => op.extra().result_facts(),
+        InstrTyped::BinOp(op) => value_facts::infer_binop_result_facts(
+            op.kind,
+            op.left.result_facts()?,
+            op.right.result_facts()?,
+        ),
+        InstrTyped::LegacyUnaryOp(op) => {
+            value_facts::infer_unary_result_facts(op.kind, op.operand.result_facts()?)
+        }
+        InstrTyped::LegacyTuple(_) => Some(ValueFacts::PyObj(PyObjFacts::known_not_none())),
+        InstrTyped::CallTyped(op) => infer_typed_call_result_facts(
+            op.func.as_ref(),
+            op.args.as_slice(),
+            op.keywords.as_slice(),
+        ),
+        InstrTyped::LegacyCall(op) => infer_typed_call_result_facts(
+            op.func.as_ref(),
+            op.args.as_slice(),
+            op.keywords.as_slice(),
+        ),
+        _ => None,
+    }
+}
+
+fn infer_typed_call_result_facts(
+    func: &InstrTyped,
+    args: &[CallArgPositional<InstrTyped>],
+    keywords: &[CallArgKeyword<InstrTyped>],
+) -> Option<ValueFacts> {
+    if !keywords.is_empty()
+        || !args
+            .iter()
+            .all(|arg| matches!(arg, CallArgPositional::Positional(_)))
+    {
+        return None;
+    }
+    func.result_facts()?
+        .runtime_helper()
+        .map(|helper| helper.signature().result)
+}
+
+pub fn validate_typed_function_value_facts(
+    function: &BlockPyFunction<TypedCodegenModuleShape>,
+) -> Result<(), String> {
+    struct Validator<'a> {
+        function: &'a BlockPyFunction<TypedCodegenModuleShape>,
+        errors: Vec<String>,
+    }
+
+    impl Visit<InstrTyped> for Validator<'_> {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            if let Some(instr_id) = expr.meta().instr_id {
+                if let Some(extra) = expr.typed_extra() {
+                    if extra.result_facts().is_none() {
+                        self.errors.push(format!(
+                            "typed instruction {} in function {} has no embedded result facts",
+                            instr_id, self.function.names.qualname
+                        ));
+                    }
+                }
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut validator = Validator {
+        function,
+        errors: Vec::new(),
+    };
+    validator.visit_fn(function);
+    if validator.errors.is_empty() {
+        Ok(())
+    } else {
+        Err(validator.errors.join("; "))
+    }
+}
+
 pub fn lower_typed_function_if_tests_to_truthy(
     mut function: BlockPyFunction<TypedCodegenModuleShape>,
 ) -> BlockPyFunction<TypedCodegenModuleShape> {
@@ -1848,7 +1952,11 @@ pub fn lower_typed_function_if_tests_to_truthy(
             }
             let old_test = std::mem::replace(&mut if_term.test, InstrTyped::constant_none());
             let meta = old_test.meta();
-            if_term.test = InstrTyped::Truthy(TypedTruthy::new(old_test).with_meta(meta));
+            let mut truthy = TypedTruthy::new(old_test).with_meta(meta);
+            truthy
+                .extra
+                .refine_result_facts(ValueFacts::Bool(BoolFacts));
+            if_term.test = InstrTyped::Truthy(truthy);
         }
     }
     function
@@ -2745,6 +2853,7 @@ mod typed_codegen_tests {
         extras: usize,
         facts: usize,
         none_singletons: usize,
+        bools: usize,
     }
 
     impl Visit<InstrTyped> for TypedExtraFactCounter {
@@ -2755,6 +2864,9 @@ mod typed_codegen_tests {
                     self.facts += 1;
                     if facts.as_pyobj().is_some_and(PyObjFacts::is_none) {
                         self.none_singletons += 1;
+                    }
+                    if matches!(facts, ValueFacts::Bool(_)) {
+                        self.bools += 1;
                     }
                 }
             }
@@ -2893,6 +3005,85 @@ mod typed_codegen_tests {
         assert!(changed > 0);
         assert!(counter.facts > 0);
         assert!(counter.none_singletons > 0);
+    }
+
+    #[test]
+    fn validate_typed_function_value_facts_requires_embedded_result_facts() {
+        let lowered = crate::lower_python_to_blockpy_for_testing("def f():\n    return None\n")
+            .expect("source should lower");
+        let facts = infer_module_value_facts(&lowered.codegen_module);
+        let mut typed = lower_codegen_module_to_typed(lowered.codegen_module);
+
+        let function = typed_function_by_qualname_mut(&mut typed, "f");
+        assert!(
+            validate_typed_function_value_facts(function).is_err(),
+            "typed facts validation should reject an unannotated typed function"
+        );
+
+        annotate_typed_function_value_facts(function, &facts);
+        validate_typed_function_value_facts(function)
+            .expect("annotated typed function should validate");
+    }
+
+    #[test]
+    fn lower_typed_if_tests_to_truthy_embeds_bool_result_facts() {
+        let lowered = crate::lower_python_to_blockpy_for_testing(
+            "def f(value):\n    if value:\n        return None\n    return None\n",
+        )
+        .expect("source should lower");
+        let facts = infer_module_value_facts(&lowered.codegen_module);
+        let mut typed = lower_codegen_module_to_typed(lowered.codegen_module);
+        let function = typed_function_by_qualname_mut(&mut typed, "f");
+
+        annotate_typed_function_value_facts(function, &facts);
+        let function = lower_typed_function_if_tests_to_truthy(function.clone());
+        validate_typed_function_value_facts(&function)
+            .expect("truthy-lowered typed function should carry result facts");
+
+        let mut counter = TypedExtraFactCounter::default();
+        counter.visit_fn(&function);
+        assert!(counter.bools > 0);
+    }
+
+    #[test]
+    fn refresh_typed_function_value_facts_recovers_binop_result_facts() {
+        struct FirstBinOpFactClearer {
+            cleared: bool,
+        }
+
+        impl VisitMut<InstrTyped> for FirstBinOpFactClearer {
+            fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+                if !self.cleared {
+                    if let InstrTyped::BinOp(op) = expr {
+                        self.cleared = op.extra_mut().clear_result_facts();
+                        return;
+                    }
+                }
+                expr.visit_children_mut(self);
+            }
+        }
+
+        let lowered = crate::lower_python_to_blockpy_for_testing("def f():\n    return 1 + 2\n")
+            .expect("source should lower");
+        let facts = infer_module_value_facts(&lowered.codegen_module);
+        let mut typed = lower_codegen_module_to_typed(lowered.codegen_module);
+        let function = typed_function_by_qualname_mut(&mut typed, "f");
+
+        annotate_typed_function_value_facts(function, &facts);
+        let mut clearer = FirstBinOpFactClearer { cleared: false };
+        clearer.visit_fn_mut(function);
+        assert!(
+            clearer.cleared,
+            "test function should contain an annotated typed binop"
+        );
+        assert!(
+            validate_typed_function_value_facts(function).is_err(),
+            "clearing binop facts should break typed fact validation"
+        );
+
+        assert!(refresh_typed_function_value_facts(function) > 0);
+        validate_typed_function_value_facts(function)
+            .expect("refreshed typed function should validate");
     }
 
     #[test]

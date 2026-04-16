@@ -496,7 +496,7 @@ where
                     )),
                     tmp_name.as_str(),
                 );
-                if !for_stmt.is_async {
+                if !for_stmt.is_async && for_stmt.orelse.is_empty() {
                     let mut expanded = linear;
                     expanded.extend(expand_sync_for_stmt(
                         for_stmt,
@@ -509,6 +509,10 @@ where
                         context, &expanded, targets, blocks, name_gen,
                     );
                 }
+                // A sync `for...else` cannot be desugared into a synthetic
+                // `while True` with the else body inside its StopIteration
+                // handler: user `break`/`continue` in the else clause target
+                // the surrounding real loop, not the completed synthetic loop.
                 let loop_check_label = name_gen.next_block_name();
                 let loop_continue_label = loop_check_label.clone();
                 return lower_for_stmt_sequence_head(

@@ -14259,21 +14259,17 @@ def f(x):
     #[test]
     fn render_specialized_jit_operator_calls_use_python_capi() {
         let blocks = [1usize as ObjPtr];
-        let mut constants = TestConstantPool::default();
-        let function = with_single_test_block(
+        let mut function = with_single_test_block(
             test_function(),
             vec![],
             ret_term(op_expr(BinOp::new(
                 BinOpKind::Add,
-                constants.int_expr(1),
-                constants.int_expr(2),
+                name_expr(test_name("a")),
+                name_expr(test_local_name("b", 1)),
             ))),
         );
-        let rendered = render_test_jit_function_with_module_constants(
-            &function,
-            &blocks,
-            constants.module_constants,
-        );
+        set_stack_slots(&mut function, &["a", "b"]);
+        let rendered = render_test_jit_function_with_module_constants(&function, &blocks, vec![]);
         assert!(
             rendered.contains("call PyNumber_Add"),
             "operator lowering should use PyNumber_Add in rendered CLIF:\n{rendered}"
@@ -14287,21 +14283,17 @@ def f(x):
     #[test]
     fn render_specialized_jit_compare_calls_use_richcompare() {
         let blocks = [1usize as ObjPtr];
-        let mut constants = TestConstantPool::default();
-        let function = with_single_test_block(
+        let mut function = with_single_test_block(
             test_function(),
             vec![],
             ret_term(op_expr(BinOp::new(
                 BinOpKind::Lt,
-                constants.int_expr(1),
-                constants.int_expr(2),
+                name_expr(test_name("a")),
+                name_expr(test_local_name("b", 1)),
             ))),
         );
-        let rendered = render_test_jit_function_with_module_constants(
-            &function,
-            &blocks,
-            constants.module_constants,
-        );
+        set_stack_slots(&mut function, &["a", "b"]);
+        let rendered = render_test_jit_function_with_module_constants(&function, &blocks, vec![]);
         assert!(
             rendered.contains("call PyObject_RichCompare"),
             "comparison lowering should use PyObject_RichCompare in rendered CLIF:\n{rendered}"
@@ -14317,8 +14309,21 @@ def f(x):
             return;
         }
         let blocks = [1usize as ObjPtr];
-        let mut constants = TestConstantPool::default();
         let mut function = test_function();
+        function.params = ParamSpec {
+            params: vec![
+                Param {
+                    name: "a".into(),
+                    kind: ParamKind::Any,
+                    has_default: false,
+                },
+                Param {
+                    name: "b".into(),
+                    kind: ParamKind::Any,
+                    has_default: false,
+                },
+            ],
+        };
         let block_label = function.name_gen.next_block_name();
         let instr_id = InstrId::new(block_label, 0);
         let block = CodegenBlock {
@@ -14327,8 +14332,8 @@ def f(x):
             term: ret_term(with_instr_id(
                 op_expr(BinOp::new(
                     BinOpKind::Add,
-                    constants.int_expr(1),
-                    constants.int_expr(2),
+                    name_expr(test_name("a")),
+                    name_expr(test_local_name("b", 1)),
                 )),
                 instr_id,
             )),
@@ -14336,8 +14341,8 @@ def f(x):
             exc_edge: None,
         };
         function.blocks = vec![block];
-        let mut baseline_module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
-        baseline_module.module_constants = constants.module_constants.clone();
+        set_stack_slots(&mut function, &["a", "b"]);
+        let baseline_module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
         let baseline_function = baseline_module.callable_defs[0].clone();
         let baseline_module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&baseline_module);
@@ -14351,7 +14356,7 @@ def f(x):
         let (_jit_module, built) = build_test_jit_function_with_operator_specializations(
             &function,
             &blocks,
-            constants.module_constants,
+            Vec::new(),
             &[(
                 instr_id,
                 crate::operator_specialization::pack_binary_shape(
@@ -14655,8 +14660,21 @@ def f(x):
             return;
         }
         let blocks = [1usize as ObjPtr];
-        let mut constants = TestConstantPool::default();
         let mut function = test_function();
+        function.params = ParamSpec {
+            params: vec![
+                Param {
+                    name: "a".into(),
+                    kind: ParamKind::Any,
+                    has_default: false,
+                },
+                Param {
+                    name: "b".into(),
+                    kind: ParamKind::Any,
+                    has_default: false,
+                },
+            ],
+        };
         let block_label = function.name_gen.next_block_name();
         let instr_id = InstrId::new(block_label, 0);
         let block = CodegenBlock {
@@ -14665,8 +14683,8 @@ def f(x):
             term: ret_term(with_instr_id(
                 op_expr(BinOp::new(
                     BinOpKind::Lt,
-                    constants.int_expr(1),
-                    constants.int_expr(2),
+                    name_expr(test_name("a")),
+                    name_expr(test_local_name("b", 1)),
                 )),
                 instr_id,
             )),
@@ -14674,8 +14692,8 @@ def f(x):
             exc_edge: None,
         };
         function.blocks = vec![block];
-        let mut baseline_module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
-        baseline_module.module_constants = constants.module_constants.clone();
+        set_stack_slots(&mut function, &["a", "b"]);
+        let baseline_module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
         let baseline_function = baseline_module.callable_defs[0].clone();
         let baseline_module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&baseline_module);
@@ -14689,7 +14707,7 @@ def f(x):
         let (_jit_module, built) = build_test_jit_function_with_operator_specializations(
             &function,
             &blocks,
-            constants.module_constants,
+            Vec::new(),
             &[(
                 instr_id,
                 crate::operator_specialization::pack_binary_shape(
@@ -14991,8 +15009,14 @@ def f(x):
             return;
         }
         let blocks = [1usize as ObjPtr];
-        let mut constants = TestConstantPool::default();
         let mut function = test_function();
+        function.params = ParamSpec {
+            params: vec![Param {
+                name: "value".into(),
+                kind: ParamKind::Any,
+                has_default: false,
+            }],
+        };
         let block_label = function.name_gen.next_block_name();
         let instr_id = InstrId::new(block_label, 0);
         let block = CodegenBlock {
@@ -15001,7 +15025,7 @@ def f(x):
             term: ret_term(with_instr_id(
                 op_expr(soac_blockpy::block_py::UnaryOp::new(
                     soac_blockpy::block_py::UnaryOpKind::Neg,
-                    constants.int_expr(1),
+                    name_expr(test_name("value")),
                 )),
                 instr_id,
             )),
@@ -15009,8 +15033,8 @@ def f(x):
             exc_edge: None,
         };
         function.blocks = vec![block];
-        let mut baseline_module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
-        baseline_module.module_constants = constants.module_constants.clone();
+        set_stack_slots(&mut function, &["value"]);
+        let baseline_module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
         let baseline_function = baseline_module.callable_defs[0].clone();
         let baseline_module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&baseline_module);
@@ -15024,7 +15048,7 @@ def f(x):
         let (_jit_module, built) = build_test_jit_function_with_operator_specializations(
             &function,
             &blocks,
-            constants.module_constants,
+            Vec::new(),
             &[(
                 instr_id,
                 crate::operator_specialization::pack_unary_shape(
@@ -15634,21 +15658,17 @@ def f(x, y):
     #[test]
     fn render_specialized_jit_pow_calls_use_pynumber_power() {
         let blocks = [1usize as ObjPtr];
-        let mut constants = TestConstantPool::default();
-        let function = with_single_test_block(
+        let mut function = with_single_test_block(
             test_function(),
             vec![],
             ret_term(op_expr(BinOp::new(
                 BinOpKind::Pow,
-                constants.int_expr(2),
-                constants.int_expr(3),
+                name_expr(test_name("a")),
+                name_expr(test_local_name("b", 1)),
             ))),
         );
-        let rendered = render_test_jit_function_with_module_constants(
-            &function,
-            &blocks,
-            constants.module_constants,
-        );
+        set_stack_slots(&mut function, &["a", "b"]);
+        let rendered = render_test_jit_function_with_module_constants(&function, &blocks, vec![]);
         assert!(
             rendered.contains("call PyNumber_Power"),
             "power lowering should use PyNumber_Power in rendered CLIF:\n{rendered}"
@@ -15658,21 +15678,17 @@ def f(x, y):
     #[test]
     fn render_specialized_jit_inplace_pow_calls_use_pynumber_inplace_power() {
         let blocks = [1usize as ObjPtr];
-        let mut constants = TestConstantPool::default();
-        let function = with_single_test_block(
+        let mut function = with_single_test_block(
             test_function(),
             vec![],
             ret_term(op_expr(BinOp::new(
                 BinOpKind::InplacePow,
-                constants.int_expr(2),
-                constants.int_expr(3),
+                name_expr(test_name("a")),
+                name_expr(test_local_name("b", 1)),
             ))),
         );
-        let rendered = render_test_jit_function_with_module_constants(
-            &function,
-            &blocks,
-            constants.module_constants,
-        );
+        set_stack_slots(&mut function, &["a", "b"]);
+        let rendered = render_test_jit_function_with_module_constants(&function, &blocks, vec![]);
         assert!(
             rendered.contains("call PyNumber_InPlacePower"),
             "inplace power lowering should use PyNumber_InPlacePower in rendered CLIF:\n{rendered}"

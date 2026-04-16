@@ -1543,82 +1543,84 @@ pub unsafe fn register_function_owner_types_for_module_keys(
 }
 
 unsafe fn ensure_clif_direct_entries_compiled(
-    _py: Python<'_>,
+    py: Python<'_>,
     data: &mut PyFunctionJitExtra,
 ) -> Result<(), ()> {
     if data.function_env.compiled_function.is_none() {
         let function = data
             .function()
             .map(soac_blockpy::block_py::BlockPyFunction::clone)?;
-        let compile_start = Instant::now();
-        let compiled_function = match data
-            .module_state
-            .lookup_or_compile_direct_function_handle(&data.compile_session, function.function_id)
-        {
-            Ok(Some((handle, compiled))) => {
-                if !compiled
-                    && !jit::is_synthetic_class_helper_function(&function)
-                    && let Some(stats) = handle.jit_stats()
-                {
-                    data.module_state.append_jit_codegen_log(
-                        &function,
-                        "direct_function_body",
-                        compile_start.elapsed(),
-                        "ok",
-                        None,
-                        Some(stats),
-                    );
+        let ensure_start = Instant::now();
+        let function_block_count = function.blocks.len();
+        let function_qualname = function.names.qualname.clone();
+        let module_state = Arc::clone(&data.module_state);
+        let compile_session = Arc::clone(&data.compile_session);
+        let compiled_function_result = py.detach(move || {
+            let compile_start = Instant::now();
+            match module_state
+                .lookup_or_compile_direct_function_handle(&compile_session, function.function_id)
+            {
+                Ok(Some((handle, compiled))) => {
+                    if !compiled
+                        && !jit::is_synthetic_class_helper_function(&function)
+                        && let Some(stats) = handle.jit_stats()
+                    {
+                        module_state.append_jit_codegen_log(
+                            &function,
+                            "direct_function_body",
+                            compile_start.elapsed(),
+                            "ok",
+                            None,
+                            Some(stats),
+                        );
+                    }
+                    Ok(handle)
                 }
-                handle
-            }
-            Ok(None) => {
-                let block_ptrs = vec![ptr::null_mut::<c_void>(); function.blocks.len()];
-                let module_constant_ptrs = data.module_state.module_constant_ptrs();
-                let compile_result = jit::compile_cranelift_run_bb_specialized_cached(
-                    &data.compile_session,
-                    block_ptrs.as_slice(),
-                    &data.module_state.lowered_module,
-                    &function,
-                    &data.module_state.codegen_constants,
-                    &data.module_state.lowered_module.counter_defs,
-                    &module_constant_ptrs,
-                    Some(data.module_state.as_ref()),
-                );
-                match compile_result {
-                    Ok(result) => {
-                        if result.compiled {
-                            data.module_state.append_jit_codegen_log(
+                Ok(None) => {
+                    let block_ptrs = vec![ptr::null_mut::<c_void>(); function.blocks.len()];
+                    let module_constant_ptrs = module_state.module_constant_ptrs();
+                    let compile_result = jit::compile_cranelift_run_bb_specialized_cached(
+                        &compile_session,
+                        block_ptrs.as_slice(),
+                        &module_state.lowered_module,
+                        &function,
+                        &module_state.codegen_constants,
+                        &module_state.lowered_module.counter_defs,
+                        &module_constant_ptrs,
+                        Some(module_state.as_ref()),
+                    );
+                    match compile_result {
+                        Ok(result) => {
+                            if result.compiled {
+                                module_state.append_jit_codegen_log(
+                                    &function,
+                                    "vectorcall_function_body",
+                                    compile_start.elapsed(),
+                                    "ok",
+                                    None,
+                                    result.stats.as_ref(),
+                                );
+                            }
+                            Ok(result.handle)
+                        }
+                        Err(err) => {
+                            module_state.append_jit_codegen_log(
                                 &function,
                                 "vectorcall_function_body",
                                 compile_start.elapsed(),
-                                "ok",
+                                "error",
+                                Some(&err),
                                 None,
-                                result.stats.as_ref(),
                             );
+                            Err(err)
                         }
-                        result.handle
-                    }
-                    Err(err) => {
-                        data.module_state.append_jit_codegen_log(
-                            &function,
-                            "vectorcall_function_body",
-                            compile_start.elapsed(),
-                            "error",
-                            Some(&err),
-                            None,
-                        );
-                        if let Ok(c_msg) = CString::new(err) {
-                            ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
-                        } else {
-                            ffi::PyErr_SetString(
-                                ffi::PyExc_RuntimeError,
-                                b"failed to compile CLIF function body\0".as_ptr() as *const i8,
-                            );
-                        }
-                        return Err(());
                     }
                 }
+                Err(err) => Err(err),
             }
+        });
+        let compiled_function = match compiled_function_result {
+            Ok(handle) => handle,
             Err(err) => {
                 if let Ok(c_msg) = CString::new(err) {
                     ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
@@ -1684,12 +1686,10 @@ unsafe fn ensure_clif_direct_entries_compiled(
         };
         data.function_env.set_deopt_table_ptr(deopt_table_ptr);
         data.function_env.compiled_function = Some(compiled_function);
-        let elapsed_ms = compile_start.elapsed().as_secs_f64() * 1000.0;
+        let elapsed_ms = ensure_start.elapsed().as_secs_f64() * 1000.0;
         info!(
             "soac_jit_precompile module={} qualname={} blocks={} elapsed_ms={elapsed_ms:.3}",
-            data.module_state.module_name,
-            function.names.qualname,
-            function.blocks.len(),
+            data.module_state.module_name, function_qualname, function_block_count,
         );
     }
     if data.function_env.direct_code_ptr().is_null() {

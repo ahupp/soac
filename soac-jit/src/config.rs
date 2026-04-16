@@ -5,6 +5,7 @@ use cranelift_codegen::settings::Configurable;
 pub(crate) use soac_blockpy::env_config::SOAC_JIT_EMIT_REFCOUNTS_ENV;
 pub(crate) use soac_blockpy::env_config::SpecializationMode;
 use soac_blockpy::env_config::{
+    background_jit_enabled_from_env,
     counter_dump_input_path_from_env as blockpy_counter_dump_input_path_from_env,
     counter_dump_output_path_from_env as blockpy_counter_dump_output_path_from_env,
     cranelift_opt_level_from_env, eager_clif_compile_requested_from_env,
@@ -146,6 +147,10 @@ pub fn eager_clif_compile_requested() -> Result<bool, String> {
 
 pub(crate) fn jit_compile_workers() -> Result<Option<usize>, String> {
     jit_compile_workers_from_env()
+}
+
+pub(crate) fn background_jit_enabled() -> Result<bool, String> {
+    background_jit_enabled_from_env()
 }
 
 pub(crate) fn jit_perf_helper_frames_enabled() -> Result<bool, String> {
