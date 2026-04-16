@@ -156,6 +156,7 @@ mod test {
     use soac_blockpy::{LoweringOptions, lower_python_to_blockpy_recorded_with_options};
     use soac_jit::counter_dump::{CounterDumpRecord, CounterDumpRow};
     use soac_jit::module_type::hash_module_source;
+    use soac_jit::optimization_plan::PlannedReplacement;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const TEST_BUILD_IDENTITY: &str = "test-build-identity";
@@ -231,6 +232,10 @@ mod test {
         assert_eq!(plan.functions.len(), 1);
         assert_eq!(plan.functions[0].function_id, function_id);
         assert_eq!(plan.functions[0].decisions.len(), 2);
+        assert!(matches!(
+            plan.functions[0].decisions[0].replacement,
+            PlannedReplacement::Guarded { .. }
+        ));
         let _ = fs::remove_dir_all(root);
     }
 

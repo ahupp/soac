@@ -38,27 +38,50 @@ pub struct FunctionOptimizationPlan {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub enum OptimizationDecision {
-    CallTargets {
-        instr_id: InstrId,
-        targets: Vec<FunctionId>,
-    },
-    OperatorShapes {
-        instr_id: InstrId,
-        shapes: Vec<u64>,
-    },
-    GetItemShapes {
-        instr_id: InstrId,
-        shapes: Vec<u64>,
-    },
-    SetItemShapes {
-        instr_id: InstrId,
-        shapes: Vec<u64>,
+pub struct OptimizationDecision {
+    pub instr_id: InstrId,
+    pub replacement: PlannedReplacement,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub enum PlannedReplacement {
+    Guarded {
+        alternatives: Vec<PlannedAlternative>,
+        fallback: PlannedFallback,
     },
     BranchPreference {
-        instr_id: InstrId,
         prefer_true: bool,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct PlannedAlternative {
+    pub guards: Vec<PlannedGuard>,
+    pub action: PlannedAction,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub enum PlannedGuard {
+    FunctionId { function_id: FunctionId },
+    ObservedShape { family: ShapeFamily, shape: u64 },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub enum PlannedAction {
+    DirectCall { function_id: FunctionId },
+    SpecializedShape { family: ShapeFamily, shape: u64 },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub enum PlannedFallback {
+    OriginalInstruction,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub enum ShapeFamily {
+    Operator,
+    GetItem,
+    SetItem,
 }
 
 impl ProfileEvidenceStore {
@@ -237,12 +260,12 @@ fn decisions_from_evidence(evidence: &FunctionProfileEvidence) -> Vec<Optimizati
     let mut branch_decisions = evidence
         .branch_prefer_true
         .iter()
-        .map(
-            |(instr_id, prefer_true)| OptimizationDecision::BranchPreference {
-                instr_id: *instr_id,
+        .map(|(instr_id, prefer_true)| OptimizationDecision {
+            instr_id: *instr_id,
+            replacement: PlannedReplacement::BranchPreference {
                 prefer_true: *prefer_true,
             },
-        )
+        })
         .collect::<Vec<_>>();
     branch_decisions.sort_by_key(decision_instr_id);
     decisions.extend(branch_decisions);
@@ -260,9 +283,17 @@ fn extend_call_target_decisions(
     for (instr_id, values) in entries {
         let mut values = values.clone();
         values.sort();
-        decisions.push(OptimizationDecision::CallTargets {
+        decisions.push(OptimizationDecision {
             instr_id: *instr_id,
-            targets: values,
+            replacement: guarded_replacement(
+                values
+                    .into_iter()
+                    .map(|function_id| PlannedAlternative {
+                        guards: vec![PlannedGuard::FunctionId { function_id }],
+                        action: PlannedAction::DirectCall { function_id },
+                    })
+                    .collect(),
+            ),
         });
     }
 }
@@ -277,19 +308,18 @@ fn extend_instr_u64_decisions(
     for (instr_id, values) in entries {
         let mut values = values.clone();
         values.sort();
-        decisions.push(match kind {
-            U64DecisionKind::Operator => OptimizationDecision::OperatorShapes {
-                instr_id: *instr_id,
-                shapes: values,
-            },
-            U64DecisionKind::GetItem => OptimizationDecision::GetItemShapes {
-                instr_id: *instr_id,
-                shapes: values,
-            },
-            U64DecisionKind::SetItem => OptimizationDecision::SetItemShapes {
-                instr_id: *instr_id,
-                shapes: values,
-            },
+        let family = kind.shape_family();
+        decisions.push(OptimizationDecision {
+            instr_id: *instr_id,
+            replacement: guarded_replacement(
+                values
+                    .into_iter()
+                    .map(|shape| PlannedAlternative {
+                        guards: vec![PlannedGuard::ObservedShape { family, shape }],
+                        action: PlannedAction::SpecializedShape { family, shape },
+                    })
+                    .collect(),
+            ),
         });
     }
 }
@@ -301,23 +331,140 @@ enum U64DecisionKind {
     SetItem,
 }
 
+impl U64DecisionKind {
+    const fn shape_family(self) -> ShapeFamily {
+        match self {
+            Self::Operator => ShapeFamily::Operator,
+            Self::GetItem => ShapeFamily::GetItem,
+            Self::SetItem => ShapeFamily::SetItem,
+        }
+    }
+}
+
+fn guarded_replacement(alternatives: Vec<PlannedAlternative>) -> PlannedReplacement {
+    PlannedReplacement::Guarded {
+        alternatives,
+        fallback: PlannedFallback::OriginalInstruction,
+    }
+}
+
 fn decision_variant_rank(decision: &OptimizationDecision) -> u8 {
-    match decision {
-        OptimizationDecision::CallTargets { .. } => 0,
-        OptimizationDecision::OperatorShapes { .. } => 1,
-        OptimizationDecision::GetItemShapes { .. } => 2,
-        OptimizationDecision::SetItemShapes { .. } => 3,
-        OptimizationDecision::BranchPreference { .. } => 4,
+    match &decision.replacement {
+        PlannedReplacement::Guarded {
+            alternatives,
+            fallback: _,
+        } => alternatives
+            .first()
+            .map(|alternative| match alternative.action {
+                PlannedAction::DirectCall { .. } => 0,
+                PlannedAction::SpecializedShape {
+                    family: ShapeFamily::Operator,
+                    ..
+                } => 1,
+                PlannedAction::SpecializedShape {
+                    family: ShapeFamily::GetItem,
+                    ..
+                } => 2,
+                PlannedAction::SpecializedShape {
+                    family: ShapeFamily::SetItem,
+                    ..
+                } => 3,
+            })
+            .unwrap_or(4),
+        PlannedReplacement::BranchPreference { .. } => 5,
     }
 }
 
 fn decision_instr_id(decision: &OptimizationDecision) -> InstrId {
-    match decision {
-        OptimizationDecision::CallTargets { instr_id, .. }
-        | OptimizationDecision::OperatorShapes { instr_id, .. }
-        | OptimizationDecision::GetItemShapes { instr_id, .. }
-        | OptimizationDecision::SetItemShapes { instr_id, .. }
-        | OptimizationDecision::BranchPreference { instr_id, .. } => *instr_id,
+    decision.instr_id
+}
+
+pub fn format_optimization_plan(plan: &OptimizationPlan) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "module {} source={:?} source_hash=0x{:016x} cache_identity={}\n",
+        plan.module_name, plan.source, plan.source_hash, plan.cache_identity
+    ));
+    for function in &plan.functions {
+        out.push_str(&format!(
+            "function {} {}\n",
+            function.function_id, function.qualname
+        ));
+        for decision in &function.decisions {
+            out.push_str("  ");
+            out.push_str(&format_decision(decision));
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn format_decision(decision: &OptimizationDecision) -> String {
+    match &decision.replacement {
+        PlannedReplacement::Guarded {
+            alternatives,
+            fallback,
+        } => {
+            let alternatives = alternatives
+                .iter()
+                .map(format_alternative)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "instr_id={} => Guard([{}], {})",
+                decision.instr_id,
+                alternatives,
+                format_fallback(fallback)
+            )
+        }
+        PlannedReplacement::BranchPreference { prefer_true } => {
+            format!(
+                "instr_id={} => BranchPreference(prefer_true={prefer_true})",
+                decision.instr_id
+            )
+        }
+    }
+}
+
+fn format_alternative(alternative: &PlannedAlternative) -> String {
+    let guards = alternative
+        .guards
+        .iter()
+        .map(format_guard)
+        .collect::<Vec<_>>()
+        .join(" && ");
+    format!("({guards}) => {}", format_action(&alternative.action))
+}
+
+fn format_guard(guard: &PlannedGuard) -> String {
+    match guard {
+        PlannedGuard::FunctionId { function_id } => format!("FunctionId({function_id})"),
+        PlannedGuard::ObservedShape { family, shape } => {
+            format!("{}Shape({shape})", format_shape_family(*family))
+        }
+    }
+}
+
+fn format_action(action: &PlannedAction) -> String {
+    match action {
+        PlannedAction::DirectCall { function_id } => format!("DirectCall({function_id})"),
+        PlannedAction::SpecializedShape { family, shape } => {
+            format!("Specialized{}({shape})", format_shape_family(*family))
+        }
+    }
+}
+
+fn format_fallback(fallback: &PlannedFallback) -> &'static str {
+    match fallback {
+        PlannedFallback::OriginalInstruction => "OriginalInstruction",
+    }
+}
+
+fn format_shape_family(family: ShapeFamily) -> &'static str {
+    match family {
+        ShapeFamily::Operator => "Operator",
+        ShapeFamily::GetItem => "GetItem",
+        ShapeFamily::SetItem => "SetItem",
     }
 }
 
@@ -399,6 +546,26 @@ mod tests {
             &vec![257]
         );
         assert_eq!(evidence.branch_prefer_true.get(&instr_id), Some(&true));
+
+        let decisions = decisions_from_evidence(&evidence);
+        assert!(matches!(
+            decisions[0].replacement,
+            PlannedReplacement::Guarded { .. }
+        ));
+        assert_eq!(decisions[0].instr_id, instr_id);
+        let PlannedReplacement::Guarded { alternatives, .. } = &decisions[0].replacement else {
+            unreachable!("first decision is checked as guarded above");
+        };
+        assert_eq!(
+            alternatives[0].action,
+            PlannedAction::DirectCall {
+                function_id: target_id
+            }
+        );
+        assert_eq!(
+            decisions.last().map(|decision| &decision.replacement),
+            Some(&PlannedReplacement::BranchPreference { prefer_true: true })
+        );
     }
 
     fn row(

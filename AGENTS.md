@@ -480,9 +480,11 @@ so a later turn can resume without rediscovering context.
   resulting shared library.
 - `cargo run -p soac-inspector --bin decide_optimizations -- --counters <profile.bin> --module <mod.blockpy> --out <root-dir>`
   Standalone optimization-decision planner. It loads the counter dump once,
-  loads one cached BlockPy module, and writes the module's `mod.opt` artifact
-  under the requested root, such as
-  `$SOAC_WORK_DIR/modules/python-stdlib/typing/mod.opt`.
+  loads one cached BlockPy module, and writes the module's binary `mod.opt`
+  artifact under the requested root, such as
+  `$SOAC_WORK_DIR/modules/python-stdlib/typing/mod.opt`. Use
+  `cargo run -p soac-inspector --bin print_optimization_plan -- --plan <mod.opt>`
+  to pretty-print it for inspection.
 - `SOAC_CRANELIFT_OPT_LEVEL`
   Optional Cranelift process-JIT optimization level override:
   `none`, `speed`, or `speed_and_size`. Normal runtime and benchmark

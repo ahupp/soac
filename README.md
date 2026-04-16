@@ -354,8 +354,10 @@ globals are out of scope for now.
 
 - `cargo run -p soac-inspector --bin decide_optimizations -- --counters <profile.bin> --module <mod.blockpy> --out <root-dir>`
   Load a counter dump once, load one cached BlockPy module, and write that
-  module's optimization-decision artifact under `<root-dir>` using the stable
-  module artifact path, such as `python-stdlib/typing/mod.opt`.
+  module's binary optimization-decision artifact under `<root-dir>` using the
+  stable module artifact path, such as `python-stdlib/typing/mod.opt`. Use
+  `cargo run -p soac-inspector --bin print_optimization_plan -- --plan <mod.opt>`
+  to pretty-print it for inspection.
 
 - `SOAC_JIT_PERF_HELPER_FRAMES=1`
   In `fn should_preserve_perf_helper_frames`, at
