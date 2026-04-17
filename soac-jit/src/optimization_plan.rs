@@ -6,7 +6,7 @@ use soac_blockpy::block_py::{
 };
 use soac_blockpy::codegen_cache::{CachedCodegenModuleMetadata, PythonModuleCacheSource};
 use soac_blockpy::passes::{CodegenModuleShape, InstrResolved};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -25,6 +25,8 @@ pub struct ProfileEvidenceStore {
     functions: HashMap<(String, FunctionId), FunctionProfileEvidence>,
     module_source_hashes: HashMap<String, u64>,
     function_targets: HashMap<FunctionId, PlannedFunctionTarget>,
+    module_targets_by_runtime_id: HashMap<u32, PlannedModuleTarget>,
+    ambiguous_module_runtime_ids: HashSet<u32>,
     field_index_specializations_by_attr: HashMap<String, Vec<PlannedIndexedFieldSpecialization>>,
 }
 
@@ -104,6 +106,12 @@ pub struct PlannedFunctionTarget {
     pub function_id: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlannedModuleTarget {
+    module_name: String,
+    source_hash: u64,
+}
+
 #[derive(
     Clone, Debug, PartialEq, Eq, PartialOrd, Ord, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
@@ -165,23 +173,17 @@ impl ProfileEvidenceStore {
                 let Some(function_id) = row.function_id else {
                     continue;
                 };
-                store
-                    .function_targets
-                    .entry(function_id)
-                    .or_insert_with(|| PlannedFunctionTarget {
-                        module_name: module_name.clone(),
-                        source_hash: record.source_hash(),
-                        function_id: function_id.function_id(),
-                    });
+                store.record_function_target(
+                    function_id,
+                    module_name.as_str(),
+                    record.source_hash(),
+                );
                 if let Some(current_function_id) = row.current_function_id {
-                    store
-                        .function_targets
-                        .entry(current_function_id)
-                        .or_insert_with(|| PlannedFunctionTarget {
-                            module_name: module_name.clone(),
-                            source_hash: record.source_hash(),
-                            function_id: current_function_id.function_id(),
-                        });
+                    store.record_function_target(
+                        current_function_id,
+                        module_name.as_str(),
+                        record.source_hash(),
+                    );
                 }
                 let Some(instr_id) = row.instr_id else {
                     continue;
@@ -300,8 +302,26 @@ impl ProfileEvidenceStore {
         self.module_source_hashes.get(module_name).copied()
     }
 
-    pub fn function_target(&self, function_id: FunctionId) -> Option<&PlannedFunctionTarget> {
-        self.function_targets.get(&function_id)
+    pub fn function_target(&self, function_id: FunctionId) -> Option<PlannedFunctionTarget> {
+        if function_id == FunctionId::global()
+            || self
+                .ambiguous_module_runtime_ids
+                .contains(&function_id.module_id())
+        {
+            return None;
+        }
+        self.function_targets
+            .get(&function_id)
+            .cloned()
+            .or_else(|| {
+                self.module_targets_by_runtime_id
+                    .get(&function_id.module_id())
+                    .map(|module_target| PlannedFunctionTarget {
+                        module_name: module_target.module_name.clone(),
+                        source_hash: module_target.source_hash,
+                        function_id: function_id.function_id(),
+                    })
+            })
     }
 
     pub fn field_index_specializations_for_attr(
@@ -311,6 +331,47 @@ impl ProfileEvidenceStore {
         self.field_index_specializations_by_attr
             .get(attr_name)
             .map(Vec::as_slice)
+    }
+}
+
+impl ProfileEvidenceStore {
+    fn record_function_target(
+        &mut self,
+        function_id: FunctionId,
+        module_name: &str,
+        source_hash: u64,
+    ) {
+        if function_id == FunctionId::global() {
+            return;
+        }
+        self.record_module_target(function_id.module_id(), module_name, source_hash);
+        self.function_targets
+            .entry(function_id)
+            .or_insert_with(|| PlannedFunctionTarget {
+                module_name: module_name.to_string(),
+                source_hash,
+                function_id: function_id.function_id(),
+            });
+    }
+
+    fn record_module_target(&mut self, module_id: u32, module_name: &str, source_hash: u64) {
+        if self.ambiguous_module_runtime_ids.contains(&module_id) {
+            return;
+        }
+        let target = PlannedModuleTarget {
+            module_name: module_name.to_string(),
+            source_hash,
+        };
+        match self.module_targets_by_runtime_id.get(&module_id) {
+            Some(existing) if existing != &target => {
+                self.module_targets_by_runtime_id.remove(&module_id);
+                self.ambiguous_module_runtime_ids.insert(module_id);
+            }
+            Some(_) => {}
+            None => {
+                self.module_targets_by_runtime_id.insert(module_id, target);
+            }
+        }
     }
 }
 
@@ -737,8 +798,8 @@ fn decisions_for_function(
     decisions_from_evidence(&evidence, |function_id| {
         local_function_targets
             .get(&function_id)
-            .or_else(|| evidence_store.function_target(function_id))
             .cloned()
+            .or_else(|| evidence_store.function_target(function_id))
     })
 }
 
@@ -1133,6 +1194,76 @@ mod tests {
         assert_eq!(
             planned_function.branch_prefer_true.get(&instr_id),
             Some(&true)
+        );
+    }
+
+    #[test]
+    fn profile_evidence_store_synthesizes_targets_from_loaded_module_identity() {
+        let caller_id = FunctionId::new(7, 1);
+        let target_id = FunctionId::new(8, 2);
+        let unrelated_callee_id = FunctionId::new(8, 99);
+        let instr_id = InstrId::new(BlockLabel::from_index(3), 4);
+        let caller_record = CounterDumpRecord {
+            source_hash: 0x1234,
+            module_name: "pkg.caller".to_string(),
+            package_name: None,
+            rows: vec![row(
+                "call_hot_targets",
+                caller_id,
+                instr_id,
+                1,
+                Some(target_id.packed()),
+            )],
+            module_keys: Vec::new(),
+            type_keys: Vec::new(),
+            type_table: Vec::new(),
+        };
+        let callee_record = CounterDumpRecord {
+            source_hash: 0x5678,
+            module_name: "pkg.callee".to_string(),
+            package_name: None,
+            rows: vec![row(
+                "operator_hot_shapes",
+                unrelated_callee_id,
+                instr_id,
+                1,
+                Some(257),
+            )],
+            module_keys: Vec::new(),
+            type_keys: Vec::new(),
+            type_table: Vec::new(),
+        };
+        let path = unique_counter_path();
+        let mut bytes = caller_record.encode().unwrap();
+        bytes.extend_from_slice(callee_record.encode().unwrap().as_slice());
+        fs::write(path.as_path(), bytes).unwrap();
+
+        let store = ProfileEvidenceStore::from_counter_dump(path.as_path()).unwrap();
+        let _ = fs::remove_file(path);
+        let synthesized = store
+            .function_target(target_id)
+            .expect("known module id should synthesize target metadata");
+        assert_eq!(
+            synthesized,
+            PlannedFunctionTarget {
+                module_name: "pkg.callee".to_string(),
+                source_hash: 0x5678,
+                function_id: target_id.function_id(),
+            }
+        );
+
+        let decisions =
+            decisions_from_evidence(&store.for_function("pkg.caller", caller_id), |id| {
+                store.function_target(id)
+            });
+        let PlannedReplacement::Guarded { alternatives, .. } = &decisions[0].replacement else {
+            unreachable!("call target decision should be guarded");
+        };
+        assert_eq!(
+            alternatives[0].action,
+            PlannedAction::DirectCall {
+                target: synthesized,
+            }
         );
     }
 

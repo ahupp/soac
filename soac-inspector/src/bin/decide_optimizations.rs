@@ -202,13 +202,16 @@ mod test {
             .expect("test module should contain f");
         let instr_id = InstrId::new(BlockLabel::from_index(0), 0);
         let counters_path = root.join("profile.bin");
-        fs::write(
-            counters_path.as_path(),
-            counter_record(module_name, source_hash, function_id, instr_id)
+        let mut counters = counter_record(module_name, source_hash, function_id, instr_id)
+            .encode()
+            .unwrap();
+        counters.extend_from_slice(
+            counter_record_for_module_identity("pkg.callee", 0x5678, FunctionId::new(8, 99))
                 .encode()
-                .unwrap(),
-        )
-        .unwrap();
+                .unwrap()
+                .as_slice(),
+        );
+        fs::write(counters_path.as_path(), counters).unwrap();
         let out_root = root.join("modules-out");
 
         run_with_args([
@@ -239,6 +242,23 @@ mod test {
             plan.functions[0].decisions[0].replacement,
             PlannedReplacement::Guarded { .. }
         ));
+        assert!(
+            plan.functions[0].decisions.iter().any(|decision| {
+                let PlannedReplacement::Guarded { alternatives, .. } = &decision.replacement else {
+                    return false;
+                };
+                alternatives.iter().any(|alternative| {
+                    matches!(
+                        alternative.action,
+                        PlannedAction::DirectCall { ref target }
+                            if target.module_name == "pkg.callee"
+                                && target.source_hash == 0x5678
+                                && target.function_id == 2
+                    )
+                })
+            }),
+            "expected a cross-module direct-call decision"
+        );
         assert!(
             plan.functions[0].decisions.iter().any(|decision| {
                 let PlannedReplacement::Guarded { alternatives, .. } = &decision.replacement else {
@@ -282,7 +302,7 @@ mod test {
                     function_qualname: Some("f".to_string()),
                     block_label: Some("bb0".to_string()),
                     value: 1,
-                    observed_value: Some(FunctionId::new(7, 2).packed()),
+                    observed_value: Some(FunctionId::new(8, 2).packed()),
                     max_overcount: None,
                 },
                 CounterDumpRow {
@@ -299,20 +319,6 @@ mod test {
                     observed_value: Some(257),
                     max_overcount: None,
                 },
-                CounterDumpRow {
-                    counter_id: 2,
-                    scope: "function".to_string(),
-                    kind: "function_metadata".to_string(),
-                    site_kind: "function_metadata".to_string(),
-                    function_id: Some(FunctionId::new(7, 2)),
-                    current_function_id: Some(FunctionId::new(7, 2)),
-                    instr_id: None,
-                    function_qualname: Some("callee".to_string()),
-                    block_label: None,
-                    value: 0,
-                    observed_value: None,
-                    max_overcount: None,
-                },
             ],
             module_keys: Vec::new(),
             type_keys: vec![CounterDumpTypeKeyLayout {
@@ -327,6 +333,35 @@ mod test {
                     qualname: "Point".to_string(),
                 },
             }],
+        }
+    }
+
+    fn counter_record_for_module_identity(
+        module_name: &str,
+        source_hash: u64,
+        function_id: FunctionId,
+    ) -> CounterDumpRecord {
+        CounterDumpRecord {
+            source_hash,
+            module_name: module_name.to_string(),
+            package_name: None,
+            rows: vec![CounterDumpRow {
+                counter_id: 0,
+                scope: "function".to_string(),
+                kind: "operator_hot_shapes".to_string(),
+                site_kind: "operator_hot_shapes".to_string(),
+                function_id: Some(function_id),
+                current_function_id: Some(function_id),
+                instr_id: Some(InstrId::new(BlockLabel::from_index(0), 0)),
+                function_qualname: Some("unrelated".to_string()),
+                block_label: Some("bb0".to_string()),
+                value: 1,
+                observed_value: Some(257),
+                max_overcount: None,
+            }],
+            module_keys: Vec::new(),
+            type_keys: Vec::new(),
+            type_table: Vec::new(),
         }
     }
 
