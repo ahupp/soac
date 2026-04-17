@@ -12884,20 +12884,17 @@ fn planned_evidence_for_shared_state(
 ) -> Result<HashMap<FunctionId, FunctionProfileEvidence>, String> {
     let mut evidence_by_function = HashMap::new();
     for planned_function in &plan.functions {
-        let current_function_id = FunctionId::new(
-            shared_state.module_id(),
-            planned_function.function_id.function_id(),
-        );
+        let current_function_id = planned_function.runtime_function_id(shared_state.module_id());
         let current_function = shared_state
             .lookup_function(current_function_id)
             .ok_or_else(|| {
                 format!(
                     "optimization plan for module {} references missing function id {} ({})",
-                    plan.module_name, planned_function.function_id, planned_function.qualname
+                    plan.module_name, planned_function.local_function_id, planned_function.qualname
                 )
             })?;
         let evidence = plan
-            .evidence_for_function(planned_function.function_id, |target| {
+            .evidence_for_local_function(planned_function.local_function_id, |target| {
                 resolve_planned_function_target(shared_state, compile_session, target)
                     .map_err(anyhow::Error::msg)
             })
@@ -12938,21 +12935,21 @@ fn planned_evidence_for_precompile(
     };
     let mut evidence_by_function = HashMap::new();
     for planned_function in &plan.functions {
-        let current_function_id =
-            FunctionId::new(module_id, planned_function.function_id.function_id());
+        let current_function_id = planned_function.runtime_function_id(module_id);
         if !has_function(current_function_id) {
             return Err(format!(
                 "optimization plan for module {} references missing function id {} ({})",
-                plan.module_name, planned_function.function_id, planned_function.qualname
+                plan.module_name, planned_function.local_function_id, planned_function.qualname
             ));
         }
         let evidence = plan
-            .evidence_for_function(planned_function.function_id, |target| {
+            .evidence_for_local_function(planned_function.local_function_id, |target| {
                 if target.module_name != module_name || target.source_hash != source_hash {
                     return Ok(module_index
                         .and_then(|module_index| module_index.function_id_for_target(target)));
                 }
-                let target_function_id = FunctionId::new(module_id, target.function_id);
+                let target_function_id =
+                    FunctionId::new(module_id, target.local_function_id().as_u32());
                 Ok(has_function(target_function_id).then_some(target_function_id))
             })
             .map_err(|err| err.to_string())?;
@@ -12994,7 +12991,10 @@ fn resolve_planned_function_target(
         target_shared_state_owner = target_shared_state;
         target_shared_state_owner.as_ref()
     };
-    let function_id = FunctionId::new(target_shared_state.module_id(), target.function_id);
+    let function_id = FunctionId::new(
+        target_shared_state.module_id(),
+        target.local_function_id().as_u32(),
+    );
     Ok(target_shared_state
         .lookup_function(function_id)
         .map(|function| function.function_id))
@@ -24330,7 +24330,7 @@ impl PrecompileModuleIndex {
         let module = self
             .modules_by_identity
             .get(&(target.module_name.clone(), target.source_hash))?;
-        let function_id = FunctionId::new(module.module_id, target.function_id);
+        let function_id = FunctionId::new(module.module_id, target.local_function_id().as_u32());
         self.function(function_id).map(|_| function_id)
     }
 

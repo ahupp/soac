@@ -16619,7 +16619,7 @@ def f(x, y):
             source_hash,
             cache_identity: cache_identity.clone(),
             functions: vec![FunctionOptimizationPlan {
-                function_id: FunctionId::new(999, caller_function_id.function_id()),
+                local_function_id: caller_function_id.local_function_id(),
                 qualname: "caller".to_string(),
                 decisions: vec![OptimizationDecision {
                     instr_id,
@@ -16718,7 +16718,7 @@ def f(x, y):
             source_hash: caller_source_hash,
             cache_identity: cache_identity.clone(),
             functions: vec![FunctionOptimizationPlan {
-                function_id: FunctionId::new(999, caller_function_id.function_id()),
+                local_function_id: caller_function_id.local_function_id(),
                 qualname: "caller".to_string(),
                 decisions: vec![OptimizationDecision {
                     instr_id,
@@ -16847,7 +16847,7 @@ def f(x, y):
             source_hash: caller_source_hash,
             cache_identity: cache_identity.clone(),
             functions: vec![FunctionOptimizationPlan {
-                function_id: FunctionId::new(999, caller_function_id.function_id()),
+                local_function_id: caller_function_id.local_function_id(),
                 qualname: "caller".to_string(),
                 decisions: vec![OptimizationDecision {
                     instr_id: call_instr_id,
@@ -16930,7 +16930,7 @@ def f(x, y):
             source_hash,
             cache_identity: cache_identity.clone(),
             functions: vec![FunctionOptimizationPlan {
-                function_id: FunctionId::new(999, caller_function_id.function_id()),
+                local_function_id: caller_function_id.local_function_id(),
                 qualname: "caller".to_string(),
                 decisions: vec![OptimizationDecision {
                     instr_id,
@@ -17009,9 +17009,6 @@ def f(x, y):
             let shared_state =
                 crate::module_type::build_shared_state_for_testing(py, module, module_name, "")
                     .expect("shared state should build");
-            let planned_module_id = 42;
-            let planned_caller_function_id =
-                FunctionId::new(planned_module_id, caller_function_id.function_id());
             let planned_callee_target = PlannedFunctionTarget {
                 module_name: module_name.to_string(),
                 source_hash: shared_state.source_hash,
@@ -17027,7 +17024,7 @@ def f(x, y):
                 source_hash: shared_state.source_hash,
                 cache_identity,
                 functions: vec![FunctionOptimizationPlan {
-                    function_id: planned_caller_function_id,
+                    local_function_id: caller_function_id.local_function_id(),
                     // Runtime plan loading must use the module-local function id,
                     // not qualname, so duplicate function names remain distinct.
                     qualname: "callee".to_string(),
@@ -17169,7 +17166,6 @@ def f(x, y):
             session
                 .retain_shared_module_state(std::sync::Arc::clone(&callee_state))
                 .expect("callee state should be retained");
-            let planned_module_id = 777;
             let instr_id = InstrId::new(BlockLabel::from_index(0), 0);
             let planned_callee_target = PlannedFunctionTarget {
                 module_name: callee_module_name.to_string(),
@@ -17185,10 +17181,7 @@ def f(x, y):
                     caller_state.module_name == "soac.runtime",
                 ),
                 functions: vec![FunctionOptimizationPlan {
-                    function_id: FunctionId::new(
-                        planned_module_id,
-                        caller_function_id.function_id(),
-                    ),
+                    local_function_id: caller_function_id.local_function_id(),
                     qualname: "duplicate".to_string(),
                     decisions: vec![OptimizationDecision {
                         instr_id,
@@ -17328,7 +17321,7 @@ def f(x, y):
                     caller_state.module_name == "soac.runtime",
                 ),
                 functions: vec![FunctionOptimizationPlan {
-                    function_id: FunctionId::new(888, caller_function_id.function_id()),
+                    local_function_id: caller_function_id.local_function_id(),
                     qualname: "caller".to_string(),
                     decisions: vec![OptimizationDecision {
                         instr_id: call_instr_id,

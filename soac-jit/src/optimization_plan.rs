@@ -41,14 +41,14 @@ pub struct OptimizationPlan {
 
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct FunctionOptimizationPlan {
-    pub function_id: FunctionId,
+    pub local_function_id: LocalFunctionId,
     pub qualname: String,
     pub decisions: Vec<OptimizationDecision>,
 }
 
 impl FunctionOptimizationPlan {
-    pub const fn local_function_id(&self) -> LocalFunctionId {
-        self.function_id.local_function_id()
+    pub const fn runtime_function_id(&self, module_id: u32) -> FunctionId {
+        FunctionId::new(module_id, self.local_function_id.as_u32())
     }
 }
 
@@ -451,13 +451,13 @@ impl OptimizationPlan {
                     &evidence,
                 );
                 (!decisions.is_empty()).then(|| FunctionOptimizationPlan {
-                    function_id: function.function_id,
+                    local_function_id: function.function_id.local_function_id(),
                     qualname: function.names.qualname.clone(),
                     decisions,
                 })
             })
             .collect::<Vec<_>>();
-        functions.sort_by_key(|function| function.function_id);
+        functions.sort_by_key(|function| function.local_function_id);
         Self {
             source: metadata.source,
             module_name: metadata.module_name.clone(),
@@ -504,15 +504,15 @@ impl OptimizationPlan {
         Ok(())
     }
 
-    pub fn evidence_for_function(
+    pub fn evidence_for_local_function(
         &self,
-        function_id: FunctionId,
+        local_function_id: LocalFunctionId,
         call_target_resolver: impl Fn(&PlannedFunctionTarget) -> Result<Option<FunctionId>>,
     ) -> Result<FunctionProfileEvidence> {
         let Some(function) = self
             .functions
             .iter()
-            .find(|function| function.function_id == function_id)
+            .find(|function| function.local_function_id == local_function_id)
         else {
             return Ok(FunctionProfileEvidence::default());
         };
@@ -523,17 +523,17 @@ impl OptimizationPlan {
         Ok(evidence)
     }
 
-    pub fn evidence_by_function(
+    pub fn evidence_by_local_function(
         &self,
         call_target_resolver: impl Fn(&PlannedFunctionTarget) -> Result<Option<FunctionId>>,
-    ) -> Result<HashMap<FunctionId, FunctionProfileEvidence>> {
+    ) -> Result<HashMap<LocalFunctionId, FunctionProfileEvidence>> {
         let mut out = HashMap::new();
         for function in &self.functions {
             let mut evidence = FunctionProfileEvidence::default();
             for decision in &function.decisions {
                 apply_decision_to_evidence(decision, &mut evidence, &call_target_resolver)?;
             }
-            out.insert(function.function_id, evidence);
+            out.insert(function.local_function_id, evidence);
         }
         Ok(out)
     }
@@ -946,7 +946,7 @@ pub fn format_optimization_plan(plan: &OptimizationPlan) -> String {
     for function in &plan.functions {
         out.push_str(&format!(
             "function {} {}\n",
-            function.function_id, function.qualname
+            function.local_function_id, function.qualname
         ));
         for decision in &function.decisions {
             out.push_str("  ");
@@ -1106,11 +1106,7 @@ mod tests {
         let function_id = FunctionId::new(7, 1);
         let instr_id = InstrId::new(BlockLabel::from_index(3), 4);
         let target_id = FunctionId::new(7, 2);
-        let target = PlannedFunctionTarget {
-            module_name: "pkg.mod".to_string(),
-            source_hash: 0x1234,
-            function_id: target_id.function_id(),
-        };
+        let target = PlannedFunctionTarget::new("pkg.mod", 0x1234, target_id.local_function_id());
         let field_specialization = PlannedIndexedFieldSpecialization {
             owner_type: PlannedTypeKey {
                 module_name: "pkg.types".to_string(),
@@ -1211,7 +1207,7 @@ mod tests {
             source_hash: 0x1234,
             cache_identity: "test-cache".to_string(),
             functions: vec![FunctionOptimizationPlan {
-                function_id,
+                local_function_id: function_id.local_function_id(),
                 qualname: "f".to_string(),
                 decisions,
             }],
@@ -1224,11 +1220,13 @@ mod tests {
         )
         .unwrap();
         let planned_evidence = plan
-            .evidence_by_function(|planned_target| {
+            .evidence_by_local_function(|planned_target| {
                 Ok((planned_target == &target).then_some(target_id))
             })
             .unwrap();
-        let planned_function = planned_evidence.get(&function_id).unwrap();
+        let planned_function = planned_evidence
+            .get(&function_id.local_function_id())
+            .unwrap();
         assert_eq!(
             planned_function
                 .call_target_specializations
@@ -1304,11 +1302,7 @@ mod tests {
             .expect("known module id should synthesize target metadata");
         assert_eq!(
             synthesized,
-            PlannedFunctionTarget {
-                module_name: "pkg.callee".to_string(),
-                source_hash: 0x5678,
-                function_id: target_id.function_id(),
-            }
+            PlannedFunctionTarget::new("pkg.callee", 0x5678, target_id.local_function_id())
         );
 
         let decisions =

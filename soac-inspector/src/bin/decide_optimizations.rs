@@ -334,7 +334,10 @@ mod test {
         assert_eq!(plan.module_name, module_name);
         assert_eq!(plan.source_hash, source_hash);
         assert_eq!(plan.functions.len(), 1);
-        assert_eq!(plan.functions[0].function_id, function_id);
+        assert_eq!(
+            plan.functions[0].local_function_id,
+            function_id.local_function_id()
+        );
         assert_eq!(plan.functions[0].decisions.len(), 3);
         assert!(matches!(
             plan.functions[0].decisions[0].replacement,
@@ -351,7 +354,7 @@ mod test {
                         PlannedAction::DirectCall { ref target }
                             if target.module_name == "pkg.callee"
                                 && target.source_hash == 0x5678
-                                && target.function_id == 2
+                                && target.local_function_id().as_u32() == 2
                     )
                 })
             }),
