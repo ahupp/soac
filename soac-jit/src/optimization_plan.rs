@@ -37,8 +37,8 @@ pub struct ProfileEvidenceStore {
     functions: HashMap<PersistentFunctionId, PersistentFunctionProfileEvidence>,
     module_source_hashes: HashMap<String, u64>,
     function_targets: HashMap<RuntimeFunctionId, PersistentFunctionId>,
-    module_targets_by_runtime_id: HashMap<u32, PlannedModuleTarget>,
-    ambiguous_module_runtime_ids: HashSet<u32>,
+    module_targets_by_runtime_id: HashMap<RuntimeModuleId, PlannedModuleTarget>,
+    ambiguous_module_runtime_ids: HashSet<RuntimeModuleId>,
     field_index_specializations_by_attr: HashMap<String, Vec<PlannedIndexedFieldSpecialization>>,
 }
 
@@ -366,7 +366,7 @@ impl ProfileEvidenceStore {
         if function_id == RuntimeFunctionId::global()
             || self
                 .ambiguous_module_runtime_ids
-                .contains(&function_id.runtime_module_id().as_u32())
+                .contains(&function_id.runtime_module_id())
         {
             return None;
         }
@@ -375,7 +375,7 @@ impl ProfileEvidenceStore {
             .cloned()
             .or_else(|| {
                 self.module_targets_by_runtime_id
-                    .get(&function_id.runtime_module_id().as_u32())
+                    .get(&function_id.runtime_module_id())
                     .map(|module_target| {
                         PersistentFunctionId::new(
                             ModuleContentId::new(
@@ -419,11 +419,7 @@ impl ProfileEvidenceStore {
         if function_id == RuntimeFunctionId::global() {
             return;
         }
-        self.record_module_target(
-            function_id.runtime_module_id().as_u32(),
-            module_name,
-            source_hash,
-        );
+        self.record_module_target(function_id.runtime_module_id(), module_name, source_hash);
         self.function_targets.entry(function_id).or_insert_with(|| {
             PersistentFunctionId::new(
                 ModuleContentId::new(module_name, source_hash),
@@ -432,7 +428,12 @@ impl ProfileEvidenceStore {
         });
     }
 
-    fn record_module_target(&mut self, module_id: u32, module_name: &str, source_hash: u64) {
+    fn record_module_target(
+        &mut self,
+        module_id: RuntimeModuleId,
+        module_name: &str,
+        source_hash: u64,
+    ) {
         if self.ambiguous_module_runtime_ids.contains(&module_id) {
             return;
         }
