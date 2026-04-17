@@ -87,6 +87,26 @@ benchmarked throughput delta, and the headline pre/post numbers.
 
 # Journal of Negative Results
 
+## 2026-04-17 - Not landed: exact-int branch comparison i32 result
+
+- jj change id: not landed (`poorvsyp` while testing)
+- summary: Tried satisfying `I32Bool01` branch demand directly from profiled
+  exact-int comparison specialization. The first version deopted on
+  non-compact exact ints and exposed incorrect branch-term deopt state for long
+  pystone timing values; the corrected version used a cold local PyLong
+  richcompare fallback. Refcount counters were unchanged, code size grew, and
+  throughput regressed, so this should wait for a cleaner typed operation result
+  ABI instead of adding another codegen-side special case.
+- throughput: `-4.58%` median with refcounts enabled
+- baseline benchmark:
+  - apply, refcounts enabled, 1M loops x3 median: `261529 loops/s`
+  - apply, refcounts disabled, 1M loops x3 median: `344087 loops/s`
+  - total pystone code size: `392208 bytes`
+- attempted benchmark:
+  - apply, refcounts enabled, 1M loops x3 median: `249551 loops/s`
+  - apply, refcounts disabled, 1M loops x3 median: `333610 loops/s`
+  - total pystone code size: `395802 bytes`
+
 ## 2026-04-17 - Not landed: borrowed indexed-field GetAttr results
 
 - jj change id: not landed (`rpyppuvu` while testing)
