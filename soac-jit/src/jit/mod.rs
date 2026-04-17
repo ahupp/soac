@@ -50,8 +50,9 @@ use soac_blockpy::block_py::{
     CallableScopeKind, CellLocation, ChildVisitable, CodegenBlock, CounterDef, CounterId,
     CounterScope, CounterSite, Del, DeoptEntrySource, FunctionExecutionMode, FunctionId,
     FunctionKind, GetAttr, HasMeta, HasSemanticInstrId, InstrCodegen, InstrId, InstrKey, Literal,
-    Load, LocalLocation, Meta, NameLocation, ParamKind, PersistentFunctionId, ResolvedName,
-    RuntimeName, StorageLayout, Store, Visit, VisitMut, WithMeta, operation as blockpy_intrinsics,
+    Load, LocalFunctionId, LocalLocation, Meta, ModuleContentId, NameLocation, ParamKind,
+    PersistentFunctionId, ResolvedName, RuntimeName, StorageLayout, Store, Visit, VisitMut,
+    WithMeta, operation as blockpy_intrinsics,
 };
 use soac_blockpy::passes::{
     CodegenModuleShape, ConstructorFieldValue, DirectFunctionIdGuardTest,
@@ -388,26 +389,41 @@ fn precompiled_direct_function_symbol_scope_for_shared_state(
     shared_state: &SharedModuleState,
     function_id: FunctionId,
 ) -> String {
-    precompiled_direct_function_symbol_scope_for_module_identity(
+    let persistent = persistent_function_id_for_module_function(
         shared_state.module_name.as_str(),
         shared_state.source_hash(),
-        function_id,
+        function_id.local_function_id(),
+    );
+    precompiled_direct_function_symbol_scope_for_persistent(&persistent)
+}
+
+fn module_content_id_for_module_identity(module_name: &str, source_hash: u64) -> ModuleContentId {
+    ModuleContentId::new(module_name, source_hash)
+}
+
+fn persistent_function_id_for_module_function(
+    module_name: &str,
+    source_hash: u64,
+    local_function_id: LocalFunctionId,
+) -> PersistentFunctionId {
+    PersistentFunctionId::new(
+        module_content_id_for_module_identity(module_name, source_hash),
+        local_function_id,
     )
 }
 
-fn precompiled_direct_function_symbol_scope_for_module_identity(
-    module_name: &str,
-    source_hash: u64,
-    function_id: FunctionId,
+fn precompiled_direct_function_symbol_scope_for_persistent(
+    function: &PersistentFunctionId,
 ) -> String {
     let mut scope = String::from("shared_");
-    push_shared_module_symbol_identity(&mut scope, module_name, source_hash, None);
+    push_shared_module_symbol_identity(
+        &mut scope,
+        function.module.module_name.as_str(),
+        function.module.source_hash,
+        None,
+    );
     scope.push_str("_fn_");
-    if source_hash == 0 {
-        scope.push_str(function_id.packed().to_string().as_str());
-    } else {
-        scope.push_str(function_id.function_id().to_string().as_str());
-    }
+    scope.push_str(function.local.as_u32().to_string().as_str());
     scope
 }
 
@@ -24267,6 +24283,7 @@ pub struct PrecompileModuleIndexEntry<'a> {
 struct PrecompileIndexedFunction {
     module_name: String,
     source_hash: u64,
+    persistent_id: PersistentFunctionId,
     function: BlockPyFunction<CodegenModuleShape>,
     module_constants: Vec<InstrResolved>,
 }
@@ -24318,6 +24335,11 @@ impl PrecompileModuleIndex {
             let indexed = PrecompileIndexedFunction {
                 module_name: entry.module_name.to_string(),
                 source_hash: entry.source_hash,
+                persistent_id: persistent_function_id_for_module_function(
+                    entry.module_name,
+                    entry.source_hash,
+                    function.function_id.local_function_id(),
+                ),
                 function: function.clone(),
                 module_constants: entry.module.module_constants.clone(),
             };
@@ -24356,13 +24378,9 @@ impl PrecompileModuleIndex {
 
     fn precompiled_symbol_scope_for_function(&self, function_id: FunctionId) -> Option<String> {
         let function = self.function(function_id)?;
-        Some(
-            precompiled_direct_function_symbol_scope_for_module_identity(
-                function.module_name.as_str(),
-                function.source_hash,
-                function_id,
-            ),
-        )
+        Some(precompiled_direct_function_symbol_scope_for_persistent(
+            &function.persistent_id,
+        ))
     }
 }
 
@@ -24668,11 +24686,12 @@ fn precompile_codegen_module_to_object_bytes(
     let mut predeclared = HashMap::new();
     let mut symbol_scopes = HashMap::new();
     for function in &planned_module.callable_defs {
-        let symbol_scope = precompiled_direct_function_symbol_scope_for_module_identity(
+        let persistent_id = persistent_function_id_for_module_function(
             module_name,
             source_hash,
-            function.function_id,
+            function.function_id.local_function_id(),
         );
+        let symbol_scope = precompiled_direct_function_symbol_scope_for_persistent(&persistent_id);
         let (_sig, declared) =
             declare_direct_function(&mut jit_module, function, Some(symbol_scope.as_str()))?;
         predeclared.insert(function.function_id, declared);

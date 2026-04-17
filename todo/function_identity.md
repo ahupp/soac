@@ -129,5 +129,8 @@ Use explicit resolution steps at artifact boundaries:
    Done for optimization-decision input: counter-derived call targets are now
    stored as `PersistentFunctionId` values before `.opt` decisions are built.
 7. Change precompile indexing and symbol generation to accept persistent ids.
+   Done for shared-library direct-function symbol generation: object symbol
+   scopes are now built from `PersistentFunctionId` rather than accepting a
+   process-local `FunctionId`.
 8. Finally rename the old `FunctionId` to `RuntimeFunctionId` once remaining
    call sites are forced through the right conversion boundary.

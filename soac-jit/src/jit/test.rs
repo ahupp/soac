@@ -690,41 +690,48 @@ def f():
 
     #[test]
     fn precompiled_symbol_scopes_use_source_hash_and_logical_function_id() {
-        let cached_scope = precompiled_direct_function_symbol_scope_for_module_identity(
-            "pkg.mod",
-            0x1234,
-            FunctionId::new(1, 7),
-        );
-        let remapped_scope = precompiled_direct_function_symbol_scope_for_module_identity(
-            "pkg.mod",
-            0x1234,
-            FunctionId::new(42, 7),
-        );
+        let cached_id =
+            persistent_function_id_for_module_function("pkg.mod", 0x1234, LocalFunctionId::new(7));
+        let remapped_id =
+            persistent_function_id_for_module_function("pkg.mod", 0x1234, LocalFunctionId::new(7));
+        let cached_scope = precompiled_direct_function_symbol_scope_for_persistent(&cached_id);
+        let remapped_scope = precompiled_direct_function_symbol_scope_for_persistent(&remapped_id);
         assert_eq!(
             cached_scope, remapped_scope,
             "precompiled symbols must survive module id remapping after cache load"
         );
         assert_ne!(
             cached_scope,
-            precompiled_direct_function_symbol_scope_for_module_identity(
-                "pkg.mod",
-                0x1234,
-                FunctionId::new(1, 8)
+            precompiled_direct_function_symbol_scope_for_persistent(
+                &persistent_function_id_for_module_function(
+                    "pkg.mod",
+                    0x1234,
+                    LocalFunctionId::new(8),
+                )
             ),
             "distinct logical function ids need distinct direct entry symbols"
         );
         assert_ne!(
-            precompiled_direct_function_symbol_scope_for_module_identity(
-                "pkg.mod",
-                0,
-                FunctionId::new(1, 7)
+            cached_scope,
+            precompiled_direct_function_symbol_scope_for_persistent(
+                &persistent_function_id_for_module_function(
+                    "pkg.mod",
+                    0x4321,
+                    LocalFunctionId::new(7),
+                )
             ),
-            precompiled_direct_function_symbol_scope_for_module_identity(
-                "pkg.mod",
-                0,
-                FunctionId::new(42, 7)
+            "distinct source hashes need distinct direct entry symbols"
+        );
+        assert_ne!(
+            cached_scope,
+            precompiled_direct_function_symbol_scope_for_persistent(
+                &persistent_function_id_for_module_function(
+                    "other.mod",
+                    0x1234,
+                    LocalFunctionId::new(7),
+                )
             ),
-            "source-less modules still need packed function ids to avoid collisions"
+            "distinct module names need distinct direct entry symbols"
         );
     }
 
@@ -16948,11 +16955,13 @@ def f(x, y):
             Some(&module_index),
         )
         .expect("precompile should emit an object that imports the cross-module target");
-        let callee_scope = precompiled_direct_function_symbol_scope_for_module_identity(
+        let callee_persistent_id = persistent_function_id_for_module_function(
             callee_module_name,
             callee_source_hash,
-            callee_function_id,
+            callee_function_id.local_function_id(),
         );
+        let callee_scope =
+            precompiled_direct_function_symbol_scope_for_persistent(&callee_persistent_id);
         let callee_symbol = direct_function_symbol(&callee, Some(callee_scope.as_str()));
         assert!(
             object
