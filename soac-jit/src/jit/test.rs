@@ -18113,6 +18113,35 @@ def f(x, y):
     }
 
     #[test]
+    fn indexed_global_guard_miss_deopt_disabled_when_refcount_emission_is_disabled() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "indexed_global_guard_miss_deopt_disabled_when_refcount_emission_is_disabled",
+        ) {
+            return;
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let _refcount_env = EnvVarGuard::set(SOAC_JIT_EMIT_REFCOUNTS_ENV, "0");
+            let built = build_indexed_global_guard_miss_with_runtime_profile(py, "verify");
+            let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
+            let slow_global_helpers =
+                import_user_names_for_symbols(&built, &["soac_runtime_load_global_slow"]);
+            assert_eq!(
+                count_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
+                0,
+                "disabled refcount emission should keep guard misses out of ownership-sensitive deopt replay"
+            );
+            assert_eq!(
+                count_direct_calls_to_runtime_helpers(&built.ctx.func, &slow_global_helpers),
+                1,
+                "disabled refcount emission should preserve the local slow global-load fallback"
+            );
+        });
+    }
+
+    #[test]
     fn indexed_global_guard_miss_deopt_disabled_by_profile_mode_runtime_profile() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),

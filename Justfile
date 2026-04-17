@@ -1267,7 +1267,7 @@ benchmark benchmark_loops="1000000" verify_loops="100000" results_root="bench" r
     echo "benchmark constant clocks: $BENCHMARK_CONSTANT_CLOCKS"
     echo "cranelift opt level: $CRANELIFT_OPT_LEVEL"
     echo "module cache dir: $SOAC_MODULE_CACHE_DIR"
-    echo "apply refcount modes: disabled, enabled"
+    echo "apply refcount modes: enabled, disabled diagnostic"
     echo
 
     echo "jit transformed profile pass"
@@ -1302,19 +1302,34 @@ benchmark benchmark_loops="1000000" verify_loops="100000" results_root="bench" r
       echo "jit transformed specialized apply pass (${site_count:-0} callsites, refcounts $refcount_label)"
       for run in $(seq 1 "$SPECIALIZED_RUNS"); do
         echo "specialized run $run/$SPECIALIZED_RUNS"
-        LOOPS="$BENCHMARK_LOOPS" \
-        WARMUP_LOOPS="$WARMUP_LOOPS" \
-        BENCHMARK_CPU="$BENCHMARK_CPU" \
-        BENCHMARK_CONSTANT_CLOCKS="$BENCHMARK_CONSTANT_CLOCKS" \
-        SOAC_WORK_DIR="$counters_dir" \
-        SOAC_CRANELIFT_OPT_LEVEL="$CRANELIFT_OPT_LEVEL" \
-        SOAC_OPT_MODE=apply \
-        SOAC_JIT_EMIT_REFCOUNTS="$refcount_env" \
-          "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
+        if LOOPS="$BENCHMARK_LOOPS" \
+          WARMUP_LOOPS="$WARMUP_LOOPS" \
+          BENCHMARK_CPU="$BENCHMARK_CPU" \
+          BENCHMARK_CONSTANT_CLOCKS="$BENCHMARK_CONSTANT_CLOCKS" \
+          SOAC_WORK_DIR="$counters_dir" \
+          SOAC_CRANELIFT_OPT_LEVEL="$CRANELIFT_OPT_LEVEL" \
+          SOAC_OPT_MODE=apply \
+          SOAC_JIT_EMIT_REFCOUNTS="$refcount_env" \
+            "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
+        then
+          :
+        else
+          status=$?
+          echo "specialized run $run/$SPECIALIZED_RUNS failed with exit code $status"
+          return "$status"
+        fi
       done
     }
-    run_apply_pass disabled 0
     run_apply_pass enabled 1
+
+    set +e
+    run_apply_pass disabled 0
+    diagnostic_status=$?
+    set -e
+    if [[ "$diagnostic_status" -ne 0 ]]; then
+      echo
+      echo "diagnostic no-refcount apply pass failed with exit code $diagnostic_status"
+    fi
   } 2>&1 | tee "$report"
 
   "$VENV_DIR/bin/python" "$REPO_ROOT/scripts/summarize_benchmark_result.py" \

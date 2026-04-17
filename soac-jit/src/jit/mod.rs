@@ -25992,7 +25992,8 @@ fn build_cranelift_run_bb_specialized_function(
             &mut fb.func,
             &SOAC_RUNTIME_LOAD_GLOBAL_SLOW_IMPORT,
         );
-        let guard_miss_deopt_stub_ref = (options.guard_miss_deopt_stub || guard_miss_deopt_stub)
+        let guard_miss_deopt_stub_ref = (jit_refcount_emission_enabled()?
+            && (options.guard_miss_deopt_stub || guard_miss_deopt_stub))
             .then(|| {
                 func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_DEOPT_RESUME_IMPORT)
             });

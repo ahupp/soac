@@ -375,8 +375,10 @@ so a later turn can resume without rediscovering context.
   so in-place before/after revision runs cannot reuse another revision's cache.
   Report the specialized apply-pass median from the result directory's
   `benchmark.txt` unless I explicitly ask for the warm unspecialized baseline.
-  The benchmark also reports an unsound `SOAC_JIT_EMIT_REFCOUNTS=0` diagnostic
-  apply median; keep the default refcounts-enabled median as the headline.
+  The benchmark also attempts an unsound `SOAC_JIT_EMIT_REFCOUNTS=0` diagnostic
+  apply pass after the default refcounts-enabled pass. Keep the default
+  refcounts-enabled median as the headline; if the diagnostic fails, report the
+  failure without treating it as a failed production benchmark.
 - `soac.ipython`
   IPython extension for interactive optimization inspection. Launch it with
   `just ipython`, load it with `%load_ext soac.ipython`, profile a top-level
@@ -544,7 +546,8 @@ so a later turn can resume without rediscovering context.
   Refcount emission is enabled by default. Set to `0`, `false`, `no`, or `off`
   to inline generated JIT INCREF/DECREF helper calls as no-ops. This is an
   intentionally unsound performance experiment knob and leaks Python
-  references.
+  references. It also disables guard-miss deopt replay, because the replay
+  interpreter depends on normal owned-reference bookkeeping from generated code.
 - `BEHAVIOR_CHANGE`
   Source comments with this exact tag mark intentional CPython-visible
   compatibility changes. Current examples: apply-mode raw indexed

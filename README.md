@@ -223,7 +223,9 @@ typed variables must use recognized values. Boolean knobs accept `1`, `true`,
   Disable generated JIT INCREF/DECREF emission by inlining the SOAC runtime
   refcount helpers as no-ops. Refcount emission is enabled by default; only
   `0`, `false`, `no`, or `off` disable it. This is an intentionally unsound
-  performance experiment knob and leaks Python references.
+  performance experiment knob and leaks Python references. It also disables
+  guard-miss deopt replay, because the replay interpreter depends on normal
+  owned-reference bookkeeping from generated code.
 
 ## Counters And Specialization
 
