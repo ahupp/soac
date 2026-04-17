@@ -738,9 +738,14 @@ def add(a, b):
         .expect("lowering precompile smoke source should succeed")
         .codegen_module;
 
-        let object =
-            precompile_codegen_module_to_object_bytes("precompile_smoke", 0x1234, &lowered, None)
-                .expect("precompile should emit object bytes");
+        let object = precompile_codegen_module_to_object_bytes(
+            "precompile_smoke",
+            0x1234,
+            &lowered,
+            None,
+            None,
+        )
+        .expect("precompile should emit object bytes");
         assert!(
             object.function_count >= lowered.callable_defs.len(),
             "object should contain generated functions plus runtime support"
@@ -808,9 +813,14 @@ def get_value():
             module_constant_symbol_prefix_for_module_identity(module_name, source_hash);
         let constant_symbol = module_constant_object_symbol(symbol_prefix.as_str(), constant_id);
 
-        let object =
-            precompile_codegen_module_to_object_bytes(module_name, source_hash, &lowered, None)
-                .expect("precompile should emit object bytes");
+        let object = precompile_codegen_module_to_object_bytes(
+            module_name,
+            source_hash,
+            &lowered,
+            None,
+            None,
+        )
+        .expect("precompile should emit object bytes");
 
         assert!(
             object
@@ -849,9 +859,14 @@ def get_value():
             module_constant_symbol_prefix_for_module_identity(module_name, source_hash);
         let constant_symbol = module_constant_object_symbol(symbol_prefix.as_str(), constant_id);
 
-        let object =
-            precompile_codegen_module_to_object_bytes(module_name, source_hash, &lowered, None)
-                .expect("precompile should emit object bytes");
+        let object = precompile_codegen_module_to_object_bytes(
+            module_name,
+            source_hash,
+            &lowered,
+            None,
+            None,
+        )
+        .expect("precompile should emit object bytes");
 
         assert!(
             object
@@ -888,9 +903,14 @@ def get_value():
             module_constant_symbol_prefix_for_module_identity(module_name, source_hash);
         let constant_symbol = module_constant_object_symbol(symbol_prefix.as_str(), constant_id);
 
-        let object =
-            precompile_codegen_module_to_object_bytes(module_name, source_hash, &lowered, None)
-                .expect("precompile should emit object bytes");
+        let object = precompile_codegen_module_to_object_bytes(
+            module_name,
+            source_hash,
+            &lowered,
+            None,
+            None,
+        )
+        .expect("precompile should emit object bytes");
 
         assert!(
             object
@@ -928,9 +948,14 @@ def get_value():
             module_constant_symbol_prefix_for_module_identity(module_name, source_hash);
         let constant_symbol = module_constant_object_symbol(symbol_prefix.as_str(), constant_id);
 
-        let object =
-            precompile_codegen_module_to_object_bytes(module_name, source_hash, &lowered, None)
-                .expect("precompile should emit object bytes");
+        let object = precompile_codegen_module_to_object_bytes(
+            module_name,
+            source_hash,
+            &lowered,
+            None,
+            None,
+        )
+        .expect("precompile should emit object bytes");
 
         assert!(
             object
@@ -16214,6 +16239,159 @@ def f(x, y):
     }
 
     #[test]
+    fn precompile_profile_loads_module_optimization_plan_by_function_id() {
+        let module_cache_root = fresh_test_work_dir("planned-precompile-modules");
+        let module_name = "planned_precompile_profile_test";
+        let source_hash = 0xabcdef01;
+        let module_name_gen = ModuleNameGen::new(37);
+        let callee = with_single_test_block(
+            test_function_in_module(&module_name_gen, "callee"),
+            vec![],
+            ret_term(none_expr()),
+        );
+        let caller = with_single_test_block(
+            test_function_in_module(&module_name_gen, "caller"),
+            vec![],
+            ret_term(none_expr()),
+        );
+        let callee_function_id = callee.function_id;
+        let caller_function_id = caller.function_id;
+        let module = test_module(module_name_gen, vec![callee, caller]);
+        let instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+        let planned_target = PlannedFunctionTarget {
+            module_name: module_name.to_string(),
+            source_hash,
+            function_id: callee_function_id.function_id(),
+        };
+        let cache_identity = pre_optimization_module_cache_identity(
+            env!("SOAC_BUILD_IDENTITY"),
+            module_name == "soac.runtime",
+        );
+        let plan = OptimizationPlan {
+            source: PythonModuleCacheSource::Project,
+            module_name: module_name.to_string(),
+            source_hash,
+            cache_identity: cache_identity.clone(),
+            functions: vec![FunctionOptimizationPlan {
+                function_id: FunctionId::new(999, caller_function_id.function_id()),
+                qualname: "caller".to_string(),
+                decisions: vec![OptimizationDecision {
+                    instr_id,
+                    replacement: PlannedReplacement::Guarded {
+                        alternatives: vec![PlannedAlternative {
+                            guards: vec![PlannedGuard::FunctionTarget {
+                                target: planned_target.clone(),
+                            }],
+                            action: PlannedAction::DirectCall {
+                                target: planned_target,
+                            },
+                        }],
+                        fallback: PlannedFallback::OriginalInstruction,
+                    },
+                }],
+            }],
+        };
+        let plan_path = module_optimization_plan_path(
+            module_cache_root.as_path(),
+            PythonModuleCacheSource::Project,
+            module_name,
+        )
+        .expect("test optimization plan path should build");
+        write_test_optimization_plan(plan_path.as_path(), &plan);
+
+        let evidence = planned_evidence_for_precompile(
+            Some(PrecompileOptimizationPlanInput {
+                path: plan_path.as_path(),
+                source: PythonModuleCacheSource::Project,
+                cache_identity: cache_identity.as_str(),
+            }),
+            module_name,
+            source_hash,
+            &module,
+        )
+        .expect("precompile should load planned same-module evidence");
+        assert_eq!(
+            evidence
+                .get(&caller_function_id)
+                .and_then(|evidence| evidence.call_target_specializations.get(&instr_id)),
+            Some(&vec![callee_function_id]),
+            "precompile plan loading should remap planned function ids onto the cached module ids"
+        );
+    }
+
+    #[test]
+    fn precompile_plan_skips_unresolved_cross_module_targets_without_shadowing_counters() {
+        let module_cache_root = fresh_test_work_dir("planned-precompile-cross-module-skip");
+        let module_name = "planned_precompile_cross_module_caller";
+        let source_hash = 0xabcdef02;
+        let module_name_gen = ModuleNameGen::new(38);
+        let caller = with_single_test_block(
+            test_function_in_module(&module_name_gen, "caller"),
+            vec![],
+            ret_term(none_expr()),
+        );
+        let caller_function_id = caller.function_id;
+        let module = test_module(module_name_gen, vec![caller]);
+        let instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+        let planned_target = PlannedFunctionTarget {
+            module_name: "planned_precompile_cross_module_callee".to_string(),
+            source_hash: 0xdecafbad,
+            function_id: 7,
+        };
+        let cache_identity = pre_optimization_module_cache_identity(
+            env!("SOAC_BUILD_IDENTITY"),
+            module_name == "soac.runtime",
+        );
+        let plan = OptimizationPlan {
+            source: PythonModuleCacheSource::Project,
+            module_name: module_name.to_string(),
+            source_hash,
+            cache_identity: cache_identity.clone(),
+            functions: vec![FunctionOptimizationPlan {
+                function_id: FunctionId::new(999, caller_function_id.function_id()),
+                qualname: "caller".to_string(),
+                decisions: vec![OptimizationDecision {
+                    instr_id,
+                    replacement: PlannedReplacement::Guarded {
+                        alternatives: vec![PlannedAlternative {
+                            guards: vec![PlannedGuard::FunctionTarget {
+                                target: planned_target.clone(),
+                            }],
+                            action: PlannedAction::DirectCall {
+                                target: planned_target,
+                            },
+                        }],
+                        fallback: PlannedFallback::OriginalInstruction,
+                    },
+                }],
+            }],
+        };
+        let plan_path = module_optimization_plan_path(
+            module_cache_root.as_path(),
+            PythonModuleCacheSource::Project,
+            module_name,
+        )
+        .expect("test optimization plan path should build");
+        write_test_optimization_plan(plan_path.as_path(), &plan);
+
+        let evidence = planned_evidence_for_precompile(
+            Some(PrecompileOptimizationPlanInput {
+                path: plan_path.as_path(),
+                source: PythonModuleCacheSource::Project,
+                cache_identity: cache_identity.as_str(),
+            }),
+            module_name,
+            source_hash,
+            &module,
+        )
+        .expect("precompile should ignore unresolved cross-module planned targets");
+        assert!(
+            !evidence.contains_key(&caller_function_id),
+            "an unresolved precompile-only plan should not shadow counter fallback for the function"
+        );
+    }
+
+    #[test]
     fn specialization_profile_loads_module_optimization_plan() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
@@ -18182,9 +18360,12 @@ def f(x, y):
                 type_table: Vec::new(),
             },
         );
-        let profile =
-            SpecializationProfile::from_precompile(module_name, Some(profile_path.as_path()))
-                .expect("test specialization profile should construct");
+        let profile = SpecializationProfile::from_precompile(
+            module_name,
+            Some(profile_path.as_path()),
+            HashMap::new(),
+        )
+        .expect("test specialization profile should construct");
         let plan = build_profiled_jit_module_plan(&module, &profile, None, &HashMap::new())
             .expect("profiled JIT module plan should build");
         let planned_caller = plan
@@ -18298,9 +18479,12 @@ def f(x, y):
                 type_table: Vec::new(),
             },
         );
-        let profile =
-            SpecializationProfile::from_precompile(module_name, Some(profile_path.as_path()))
-                .expect("test specialization profile should construct");
+        let profile = SpecializationProfile::from_precompile(
+            module_name,
+            Some(profile_path.as_path()),
+            HashMap::new(),
+        )
+        .expect("test specialization profile should construct");
         let direct_owner_attr_specializations = HashMap::from([(
             caller_function.function_id,
             HashMap::from([(

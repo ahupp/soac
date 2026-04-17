@@ -12479,6 +12479,69 @@ fn planned_evidence_for_shared_state(
     Ok(evidence_by_function)
 }
 
+fn planned_evidence_for_precompile(
+    plan_input: Option<PrecompileOptimizationPlanInput<'_>>,
+    module_name: &str,
+    source_hash: u64,
+    module: &BlockPyModule<CodegenModuleShape>,
+) -> Result<HashMap<FunctionId, FunctionProfileEvidence>, String> {
+    let Some(plan_input) = plan_input else {
+        return Ok(HashMap::new());
+    };
+    if !plan_input.path.exists() {
+        return Ok(HashMap::new());
+    }
+    let plan = load_optimization_plan(plan_input.path).map_err(|err| err.to_string())?;
+    plan.validate_for_module(
+        Some(plan_input.source),
+        module_name,
+        source_hash,
+        plan_input.cache_identity,
+    )
+    .map_err(|err| err.to_string())?;
+
+    let module_id = module.module_name_gen.module_id();
+    let has_function = |function_id: FunctionId| {
+        module
+            .callable_defs
+            .iter()
+            .any(|function| function.function_id == function_id)
+    };
+    let mut evidence_by_function = HashMap::new();
+    for planned_function in &plan.functions {
+        let current_function_id =
+            FunctionId::new(module_id, planned_function.function_id.function_id());
+        if !has_function(current_function_id) {
+            return Err(format!(
+                "optimization plan for module {} references missing function id {} ({})",
+                plan.module_name, planned_function.function_id, planned_function.qualname
+            ));
+        }
+        let evidence = plan
+            .evidence_for_function(planned_function.function_id, |target| {
+                if target.module_name != module_name || target.source_hash != source_hash {
+                    return Ok(None);
+                }
+                let target_function_id = FunctionId::new(module_id, target.function_id);
+                Ok(has_function(target_function_id).then_some(target_function_id))
+            })
+            .map_err(|err| err.to_string())?;
+        if !function_profile_evidence_is_empty(&evidence) {
+            evidence_by_function.insert(current_function_id, evidence);
+        }
+    }
+    Ok(evidence_by_function)
+}
+
+fn function_profile_evidence_is_empty(evidence: &FunctionProfileEvidence) -> bool {
+    evidence.call_target_specializations.is_empty()
+        && evidence.operator_specializations.is_empty()
+        && evidence.getitem_specializations.is_empty()
+        && evidence.setitem_specializations.is_empty()
+        && evidence.field_index_specializations.is_empty()
+        && evidence.branch_prefer_true.is_empty()
+}
+
 fn resolve_planned_function_target(
     shared_state: &SharedModuleState,
     compile_session: Option<&crate::session::CompileSession>,
@@ -12566,11 +12629,12 @@ impl<'a> SpecializationProfile<'a> {
     fn from_precompile(
         module_name: &'a str,
         counter_dump_path: Option<&'a Path>,
+        planned_evidence: HashMap<FunctionId, FunctionProfileEvidence>,
     ) -> Result<Self, String> {
         Ok(Self {
             module_name: Some(module_name),
             counter_dump_path: counter_dump_path.map(Cow::Borrowed),
-            planned_evidence: HashMap::new(),
+            planned_evidence,
             behavior_change_indexed_stores: true,
             profiled_cold_blocks: profiled_cold_blocks_enabled()?,
             guard_miss_deopt: true,
@@ -23711,6 +23775,13 @@ pub struct PrecompileObjectSummary {
     pub object_size_bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct PrecompileOptimizationPlanInput<'a> {
+    pub path: &'a Path,
+    pub source: PythonModuleCacheSource,
+    pub cache_identity: &'a str,
+}
+
 fn compile_runtime_support_clif_for_object(
     jit_module: &mut JITModule,
     object_isa: &dyn TargetIsa,
@@ -23777,6 +23848,7 @@ pub fn precompile_codegen_module_to_object_file(
     source_hash: u64,
     module: &BlockPyModule<CodegenModuleShape>,
     counter_dump_path: Option<&Path>,
+    optimization_plan: Option<PrecompileOptimizationPlanInput<'_>>,
     output_path: &Path,
 ) -> Result<PrecompileObjectSummary, String> {
     let bytes = precompile_codegen_module_to_object_bytes(
@@ -23784,6 +23856,7 @@ pub fn precompile_codegen_module_to_object_file(
         source_hash,
         module,
         counter_dump_path,
+        optimization_plan,
     )?;
     if let Some(parent) = output_path
         .parent()
@@ -23827,6 +23900,7 @@ fn precompile_codegen_module_to_object_bytes(
     source_hash: u64,
     module: &BlockPyModule<CodegenModuleShape>,
     counter_dump_path: Option<&Path>,
+    optimization_plan: Option<PrecompileOptimizationPlanInput<'_>>,
 ) -> Result<PrecompiledObjectBytes, String> {
     let compile_session = crate::session::CompileSession::new();
     let object_isa = CraneliftTargetConfig::object_from_env()?.build_isa()?;
@@ -23945,8 +24019,10 @@ fn precompile_codegen_module_to_object_bytes(
         });
     }
 
+    let planned_evidence =
+        planned_evidence_for_precompile(optimization_plan, module_name, source_hash, module)?;
     let specialization_profile =
-        SpecializationProfile::from_precompile(module_name, counter_dump_path)?;
+        SpecializationProfile::from_precompile(module_name, counter_dump_path, planned_evidence)?;
     let jit_module_plan =
         build_profiled_jit_module_plan(module, &specialization_profile, None, &HashMap::new())?;
     let planned_module = jit_module_plan.module.as_ref();

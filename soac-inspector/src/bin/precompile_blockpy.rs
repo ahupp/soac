@@ -1,12 +1,12 @@
 use soac_blockpy::block_py::{FunctionId, ModuleNameGen};
 use soac_blockpy::codegen_cache::{
     CachedCodegenModuleMetadata, PythonModuleCacheSource, codegen_module_cache_path,
-    load_codegen_module_cache, remap_cached_codegen_module_function_ids,
-    validate_codegen_module_cache_metadata,
+    load_codegen_module_cache, module_optimization_plan_path,
+    remap_cached_codegen_module_function_ids, validate_codegen_module_cache_metadata,
 };
 use soac_jit::counter_dump::{CounterDumpFile, CounterDumpRecordView, CounterDumpRowView};
 use soac_jit::module_type::hash_module_source;
-use soac_jit::precompile_codegen_module_to_object_file;
+use soac_jit::{PrecompileOptimizationPlanInput, precompile_codegen_module_to_object_file};
 use std::collections::HashSet;
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -123,7 +123,19 @@ fn run_with_args(args: impl IntoIterator<Item = OsString>) -> Result<(), String>
         if let Some(module_id) = module_ref.module_id {
             remap_cached_codegen_module_function_ids(&mut cache, ModuleNameGen::new(module_id));
         }
+        let metadata = cache.metadata.clone();
         let module = cache.module;
+        let optimization_plan_path = module_optimization_plan_path(
+            module_cache_dir.as_path(),
+            metadata.source,
+            module_ref.module_name.as_str(),
+        )
+        .map_err(|err| err.to_string())?;
+        let optimization_plan = PrecompileOptimizationPlanInput {
+            path: optimization_plan_path.as_path(),
+            source: metadata.source,
+            cache_identity: metadata.cache_identity.as_str(),
+        };
 
         let object_path = object_dir.join(object_file_name(&module_ref));
         let summary = precompile_codegen_module_to_object_file(
@@ -131,6 +143,7 @@ fn run_with_args(args: impl IntoIterator<Item = OsString>) -> Result<(), String>
             module_ref.source_hash,
             &module,
             Some(counters_path.as_path()),
+            Some(optimization_plan),
             object_path.as_path(),
         )?;
         println!(
