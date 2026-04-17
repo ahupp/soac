@@ -6,12 +6,9 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 use serde_json::json;
-use soac_blockpy::codegen_cache::{load_codegen_module_cache, module_optimization_plan_path};
 use soac_blockpy::{lower_python_to_blockpy_for_testing, ruff_ast_to_string};
 use soac_jit::counter_dump::CounterDumpFile;
-use soac_jit::optimization_plan::{OptimizationPlan, ProfileEvidenceStore};
-use std::fs::{self, File};
-use std::io::Write;
+use soac_jit::optimization_plan::generate_optimization_plans_for_counter_dump;
 use std::path::{Path, PathBuf};
 use tracing::trace;
 
@@ -136,96 +133,9 @@ fn decide_optimizations_for_counter_dump(
     let out_root = out_root
         .map(PathBuf::from)
         .unwrap_or_else(|| module_root.to_path_buf());
-    let evidence_store = ProfileEvidenceStore::from_counter_dump(counters_path)
-        .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
-    let module_paths =
-        cached_module_paths_under_root(module_root).map_err(PyRuntimeError::new_err)?;
-    let mut written = 0usize;
-    for module_path in module_paths {
-        let cache = load_codegen_module_cache(module_path.as_path())
-            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
-        let Some(source_hash) =
-            evidence_store.module_source_hash(cache.metadata.module_name.as_str())
-        else {
-            continue;
-        };
-        if source_hash != cache.metadata.source_hash {
-            return Err(PyRuntimeError::new_err(format!(
-                "counter dump source hash for module {} is 0x{source_hash:016x}, but cached BlockPy module has 0x{:016x}",
-                cache.metadata.module_name, cache.metadata.source_hash
-            )));
-        }
-        let plan = OptimizationPlan::from_evidence(&cache.metadata, &cache.module, &evidence_store);
-        let output_path = module_optimization_plan_path(
-            out_root.as_path(),
-            cache.metadata.source,
-            cache.metadata.module_name.as_str(),
-        )
-        .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
-        write_optimization_plan(output_path.as_path(), &plan).map_err(PyRuntimeError::new_err)?;
-        written += 1;
-    }
-    Ok(written)
-}
-
-fn cached_module_paths_under_root(root: &Path) -> Result<Vec<PathBuf>, String> {
-    let mut out = Vec::new();
-    collect_cached_module_paths(root, &mut out)?;
-    out.sort();
-    Ok(out)
-}
-
-fn collect_cached_module_paths(path: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
-    let metadata = fs::metadata(path)
-        .map_err(|err| format!("read module cache path metadata {}: {err}", path.display()))?;
-    if metadata.is_file() {
-        if path.file_name().and_then(|name| name.to_str()) == Some("mod.blockpy") {
-            out.push(path.to_path_buf());
-        }
-        return Ok(());
-    }
-    if !metadata.is_dir() {
-        return Ok(());
-    }
-    for entry in fs::read_dir(path)
-        .map_err(|err| format!("read module cache directory {}: {err}", path.display()))?
-    {
-        let entry = entry.map_err(|err| format!("read entry in {}: {err}", path.display()))?;
-        collect_cached_module_paths(entry.path().as_path(), out)?;
-    }
-    Ok(())
-}
-
-fn write_optimization_plan(path: &Path, plan: &OptimizationPlan) -> Result<(), String> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)
-            .map_err(|err| format!("create optimization plan dir {}: {err}", parent.display()))?;
-    }
-    let archive = rkyv::to_bytes::<rkyv::rancor::Error>(plan)
-        .map_err(|err| format!("serialize optimization plan: {err}"))?;
-    let temp_path = path.with_extension("opt.tmp");
-    {
-        let mut temp_file = File::create(temp_path.as_path()).map_err(|err| {
-            format!(
-                "create temporary optimization plan {}: {err}",
-                temp_path.display()
-            )
-        })?;
-        temp_file
-            .write_all(archive.as_ref())
-            .map_err(|err| format!("write optimization plan {}: {err}", temp_path.display()))?;
-    }
-    fs::rename(temp_path.as_path(), path).map_err(|err| {
-        format!(
-            "publish optimization plan {} -> {}: {err}",
-            temp_path.display(),
-            path.display()
-        )
-    })?;
-    Ok(())
+    generate_optimization_plans_for_counter_dump(counters_path, module_root, out_root.as_path())
+        .map(|summary| summary.written())
+        .map_err(|err| PyRuntimeError::new_err(err.to_string()))
 }
 
 #[pymodule]

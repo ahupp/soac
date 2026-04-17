@@ -1010,163 +1010,58 @@ _test-all-test-phase:
     fi
   }
 
-  run_parallel_step() {
-    local pid_var="$1"
-    local label="$2"
-    local log_path="$3"
-    local status_path="$4"
-    shift 4
-    (
-      local timing_name="$1"
-      shift
-      local start_s end_s elapsed_s status
-      start_s="$(date +%s.%N)"
-      set +e
-      line_buffer "$@" 2>&1 \
-        | awk -v label="$label" '{ printf "[diet-python test-all][%s] %s\n", label, $0; fflush(); }' \
-        | tee "$log_path"
-      status=${PIPESTATUS[0]}
-      set -e
-      end_s="$(date +%s.%N)"
-      elapsed_s="$(awk -v start="$start_s" -v end="$end_s" 'BEGIN { printf "%.3f", end - start }')"
-      printf '%s\n' "$status" >"$status_path"
-      printf '[diet-python timing] %s=%s\n' "$timing_name" "$elapsed_s"
-      exit "$status"
-    ) &
-    printf -v "$pid_var" '%s' "$!"
-  }
-
-  kill_process_tree() {
-    local pid="$1"
-    local signal="$2"
-    local children=()
-
-    if command -v pgrep >/dev/null 2>&1; then
-      mapfile -t children < <(pgrep -P "$pid" 2>/dev/null || true)
-    fi
-
-    local child
-    for child in "${children[@]}"; do
-      if [ -n "$child" ]; then
-        kill_process_tree "$child" "$signal"
-      fi
-    done
-
-    kill -"$signal" "$pid" 2>/dev/null || true
-  }
-
-  terminate_parallel_step() {
+  run_serial_step() {
     local label="$1"
-    local pid="$2"
+    local log_path="$2"
+    local status_path="$3"
+    local timing_name="$4"
+    shift 4
+    local start_s end_s elapsed_s status
 
-    if ! kill -0 "$pid" 2>/dev/null; then
-      return
+    echo "[diet-python test-all] started: $label"
+    start_s="$(date +%s.%N)"
+    set +e
+    line_buffer "$@" 2>&1 \
+      | awk -v label="$label" '{ printf "[diet-python test-all][%s] %s\n", label, $0; fflush(); }' \
+      | tee "$log_path"
+    status=${PIPESTATUS[0]}
+    set -e
+    end_s="$(date +%s.%N)"
+    elapsed_s="$(awk -v start="$start_s" -v end="$end_s" 'BEGIN { printf "%.3f", end - start }')"
+    printf '%s\n' "$status" >"$status_path"
+    printf '[diet-python timing] %s=%s\n' "$timing_name" "$elapsed_s"
+
+    if [ "$status" -eq 0 ]; then
+      echo "[diet-python test-all] completed: $label"
+    else
+      echo "[diet-python test-all] step failed: $label (exit $status)" >&2
     fi
-
-    echo "[diet-python test-all] terminating: $label (pid $pid)" >&2
-    kill_process_tree "$pid" TERM
-
-    local attempt
-    for attempt in {1..20}; do
-      if ! kill -0 "$pid" 2>/dev/null; then
-        return
-      fi
-      sleep 0.25
-    done
-
-    if kill -0 "$pid" 2>/dev/null; then
-      echo "[diet-python test-all] force terminating: $label (pid $pid)" >&2
-      kill_process_tree "$pid" KILL
-    fi
+    return "$status"
   }
 
   overall_status=0
-  parallel_log_dir="$(mktemp -d)"
-  cargo_test_log="$parallel_log_dir/cargo-test.log"
-  pytest_log="$parallel_log_dir/pytest.log"
-  cargo_test_status_file="$parallel_log_dir/cargo-test.status"
-  pytest_status_file="$parallel_log_dir/pytest.status"
+  test_log_dir="$(mktemp -d)"
+  cargo_test_log="$test_log_dir/cargo-test.log"
+  pytest_log="$test_log_dir/pytest.log"
+  cargo_test_status_file="$test_log_dir/cargo-test.status"
+  pytest_status_file="$test_log_dir/pytest.status"
 
   # Some soac-jit tests share CPython process state and JIT finalization state.
-  # Keep the Rust harness serial here so the full gate is deterministic.
-  run_parallel_step cargo_test_pid cargo-test "$cargo_test_log" "$cargo_test_status_file" cargo_test_s cargo test -- --test-threads=1
-  run_parallel_step pytest_pid pytest "$pytest_log" "$pytest_status_file" pytest_s just _pytest-run tests/
-
-  cargo_test_status=0
-  pytest_status=0
-  pytest_cancelled=0
-  cargo_test_reported=0
-  pytest_reported=0
-  phase_start_s="$(date +%s)"
-  next_progress_s="$phase_start_s"
-
-  echo "[diet-python test-all] started: cargo-test (pid $cargo_test_pid)"
-  echo "[diet-python test-all] started: pytest (pid $pytest_pid)"
-
-  while [ ! -f "$cargo_test_status_file" ] || [ ! -f "$pytest_status_file" ]; do
-    now_s="$(date +%s)"
-
-    if [ "$cargo_test_reported" -eq 0 ] && [ -f "$cargo_test_status_file" ]; then
-      cargo_test_reported=1
-      echo "[diet-python test-all] completed: cargo-test"
-      cargo_test_status="$(cat "$cargo_test_status_file")"
-      if [ "$cargo_test_status" -ne 0 ] && [ ! -f "$pytest_status_file" ]; then
-        pytest_cancelled=1
-        echo "[diet-python test-all] cargo-test failed; terminating pytest early" >&2
-        terminate_parallel_step pytest "$pytest_pid"
-        break
-      fi
-    fi
-
-    if [ "$pytest_reported" -eq 0 ] && [ -f "$pytest_status_file" ]; then
-      pytest_reported=1
-      echo "[diet-python test-all] completed: pytest"
-    fi
-
-    if [ ! -f "$cargo_test_status_file" ] || [ ! -f "$pytest_status_file" ]; then
-      if [ "$now_s" -ge "$next_progress_s" ]; then
-        running_steps=()
-        if [ ! -f "$cargo_test_status_file" ]; then
-          running_steps+=("cargo-test")
-        fi
-        if [ ! -f "$pytest_status_file" ]; then
-          running_steps+=("pytest")
-        fi
-        elapsed_s=$(( now_s - phase_start_s ))
-        echo "[diet-python test-all] still running after ${elapsed_s}s: ${running_steps[*]}"
-        next_progress_s=$(( now_s + 10 ))
-      fi
-      sleep 1
-    fi
-  done
-
-  if wait "$cargo_test_pid"; then
-    cargo_test_status=0
-  else
-    cargo_test_status=$?
-  fi
-  if wait "$pytest_pid"; then
-    pytest_status=0
-  else
-    pytest_status=$?
-  fi
-
-  if [ -f "$cargo_test_status_file" ]; then
-    cargo_test_status="$(cat "$cargo_test_status_file")"
-  fi
-  if [ -f "$pytest_status_file" ]; then
-    pytest_status="$(cat "$pytest_status_file")"
-  fi
+  # Keep the Rust harness serial here so the full gate is deterministic. Pytest
+  # imports a symlink to target/debug/lib_soac_ext.so, so running it while cargo
+  # relinks test artifacts can load a mismatched extension.
+  set +e
+  run_serial_step cargo-test "$cargo_test_log" "$cargo_test_status_file" cargo_test_s cargo test -- --test-threads=1
+  cargo_test_status=$?
+  run_serial_step pytest "$pytest_log" "$pytest_status_file" pytest_s just _pytest-run tests/
+  pytest_status=$?
+  set -e
 
   if [ "$cargo_test_status" -ne 0 ]; then
-    echo "[diet-python test-all] step failed: cargo-test (exit $cargo_test_status)" >&2
     overall_status="$cargo_test_status"
   fi
 
-  if [ "$pytest_cancelled" -eq 1 ]; then
-    echo "[diet-python test-all] step cancelled: pytest (cargo-test failed)" >&2
-  elif [ "$pytest_status" -ne 0 ]; then
-    echo "[diet-python test-all] step failed: pytest (exit $pytest_status)" >&2
+  if [ "$pytest_status" -ne 0 ]; then
     if [ "$overall_status" -eq 0 ]; then
       overall_status="$pytest_status"
     fi

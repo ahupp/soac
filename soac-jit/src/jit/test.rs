@@ -3023,6 +3023,9 @@ def build(values):
                 std::process::id(),
                 NEXT_TEST_WORK_DIR_ID.fetch_add(1, Ordering::Relaxed)
             ));
+        if work_dir.exists() {
+            std::fs::remove_dir_all(&work_dir).expect("stale test work dir should be removable");
+        }
         std::fs::create_dir_all(&work_dir).expect("test work dir should exist");
         work_dir
     }
@@ -6108,9 +6111,12 @@ def build(values):
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
         let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
+        let old_soac_module_cache_dir = std::env::var_os("SOAC_MODULE_CACHE_DIR");
         let soac_work_dir = fresh_test_work_dir("test-work");
+        let module_cache_root = soac_work_dir.join("modules");
         unsafe {
             std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
+            std::env::set_var("SOAC_MODULE_CACHE_DIR", &module_cache_root);
             std::env::set_var("SOAC_OPT_MODE", "verify");
         }
         crate::initialize_test_python();
@@ -6197,6 +6203,10 @@ class Point:
             match old_soac_opt_mode {
                 Some(value) => std::env::set_var("SOAC_OPT_MODE", value),
                 None => std::env::remove_var("SOAC_OPT_MODE"),
+            }
+            match old_soac_module_cache_dir {
+                Some(value) => std::env::set_var("SOAC_MODULE_CACHE_DIR", value),
+                None => std::env::remove_var("SOAC_MODULE_CACHE_DIR"),
             }
         }
     }
@@ -6295,9 +6305,12 @@ class Point:
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
         let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
+        let old_soac_module_cache_dir = std::env::var_os("SOAC_MODULE_CACHE_DIR");
         let soac_work_dir = fresh_test_work_dir("test-work");
+        let module_cache_root = soac_work_dir.join("modules");
         unsafe {
             std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
+            std::env::set_var("SOAC_MODULE_CACHE_DIR", &module_cache_root);
             std::env::set_var("SOAC_OPT_MODE", "apply");
         }
         crate::initialize_test_python();
@@ -6525,6 +6538,10 @@ def write_point(point, value):
             match old_soac_opt_mode {
                 Some(value) => std::env::set_var("SOAC_OPT_MODE", value),
                 None => std::env::remove_var("SOAC_OPT_MODE"),
+            }
+            match old_soac_module_cache_dir {
+                Some(value) => std::env::set_var("SOAC_MODULE_CACHE_DIR", value),
+                None => std::env::remove_var("SOAC_MODULE_CACHE_DIR"),
             }
         }
     }
@@ -6856,9 +6873,12 @@ class Record:
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
         let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
+        let old_soac_module_cache_dir = std::env::var_os("SOAC_MODULE_CACHE_DIR");
         let soac_work_dir = fresh_test_work_dir("test-work");
+        let module_cache_root = soac_work_dir.join("modules");
         unsafe {
             std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
+            std::env::set_var("SOAC_MODULE_CACHE_DIR", &module_cache_root);
             std::env::set_var("SOAC_OPT_MODE", "apply");
         }
         crate::initialize_test_python();
@@ -7084,6 +7104,10 @@ def read_point(point):
             match old_soac_opt_mode {
                 Some(value) => std::env::set_var("SOAC_OPT_MODE", value),
                 None => std::env::remove_var("SOAC_OPT_MODE"),
+            }
+            match old_soac_module_cache_dir {
+                Some(value) => std::env::set_var("SOAC_MODULE_CACHE_DIR", value),
+                None => std::env::remove_var("SOAC_MODULE_CACHE_DIR"),
             }
         }
     }
@@ -20797,9 +20821,12 @@ def f(x, y):
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
         let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
+        let old_soac_module_cache_dir = std::env::var_os("SOAC_MODULE_CACHE_DIR");
         let soac_work_dir = fresh_test_work_dir("test-work");
+        let module_cache_root = soac_work_dir.join("modules");
         unsafe {
             std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
+            std::env::set_var("SOAC_MODULE_CACHE_DIR", &module_cache_root);
             std::env::set_var("SOAC_OPT_MODE", "apply");
         }
         crate::initialize_test_python();
@@ -21109,6 +21136,10 @@ def f(x, y):
         match old_soac_opt_mode {
             Some(value) => unsafe { std::env::set_var("SOAC_OPT_MODE", value) },
             None => unsafe { std::env::remove_var("SOAC_OPT_MODE") },
+        }
+        match old_soac_module_cache_dir {
+            Some(value) => unsafe { std::env::set_var("SOAC_MODULE_CACHE_DIR", value) },
+            None => unsafe { std::env::remove_var("SOAC_MODULE_CACHE_DIR") },
         }
     }
 }

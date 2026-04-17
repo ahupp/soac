@@ -1,13 +1,11 @@
-use anyhow::{Context, Result, anyhow, bail};
-use soac_blockpy::codegen_cache::{
-    CachedCodegenModule, load_codegen_module_cache, module_optimization_plan_path,
+use anyhow::{Result, anyhow, bail};
+use soac_jit::optimization_plan::{
+    CachedModuleOptimizationInput, ProfileEvidenceStore, cached_module_paths_under_root,
+    generate_optimization_plans_for_cached_modules,
 };
-use soac_jit::optimization_plan::{OptimizationPlan, ProfileEvidenceStore};
 use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
-use std::fs::{self, File};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default)]
@@ -43,31 +41,29 @@ fn run_with_args(args: impl IntoIterator<Item = OsString>) -> Result<()> {
     let evidence_store = ProfileEvidenceStore::from_counter_dump(counters_path)?;
     let module_inputs = module_inputs_for_args(&args, out_root)?;
 
-    let mut written = 0usize;
-    let mut skipped = 0usize;
-    for (module_path, strict) in module_inputs {
-        match decide_module_optimizations(&evidence_store, module_path.as_path(), out_root, strict)?
-        {
-            Some(report) => {
-                written += 1;
-                println!(
-                    "wrote {} for module={} source_hash=0x{:016x} ({} functions)",
-                    report.output_path.display(),
-                    report.module_name,
-                    report.source_hash,
-                    report.function_count
-                );
-            }
-            None => {
-                skipped += 1;
-            }
-        }
+    let summary =
+        generate_optimization_plans_for_cached_modules(&evidence_store, module_inputs, out_root)?;
+    for report in &summary.reports {
+        println!(
+            "wrote {} for module={} source_hash=0x{:016x} ({} functions)",
+            report.output_path.display(),
+            report.module_name,
+            report.source_hash,
+            report.function_count
+        );
     }
-    println!("optimization decisions: wrote {written} module plan(s), skipped {skipped} module(s)");
+    println!(
+        "optimization decisions: wrote {} module plan(s), skipped {} module(s)",
+        summary.written(),
+        summary.skipped
+    );
     Ok(())
 }
 
-fn module_inputs_for_args(args: &Args, out_root: &Path) -> Result<Vec<(PathBuf, bool)>> {
+fn module_inputs_for_args(
+    args: &Args,
+    out_root: &Path,
+) -> Result<Vec<CachedModuleOptimizationInput>> {
     let mut module_inputs = BTreeMap::<PathBuf, bool>::new();
     for module_path in &args.modules {
         module_inputs.insert(module_path.clone(), true);
@@ -90,124 +86,10 @@ fn module_inputs_for_args(args: &Args, out_root: &Path) -> Result<Vec<(PathBuf, 
             "missing module input: pass --module <mod.blockpy> or use an output root containing cached modules"
         );
     }
-    Ok(module_inputs.into_iter().collect())
-}
-
-#[derive(Debug)]
-struct ModuleDecisionReport {
-    output_path: PathBuf,
-    module_name: String,
-    source_hash: u64,
-    function_count: usize,
-}
-
-fn decide_module_optimizations(
-    evidence_store: &ProfileEvidenceStore,
-    module_path: &Path,
-    out_root: &Path,
-    strict: bool,
-) -> Result<Option<ModuleDecisionReport>> {
-    let cache = load_codegen_module_cache(module_path)
-        .with_context(|| format!("load BlockPy module cache {}", module_path.display()))?;
-    if !validate_counter_evidence_matches_module(evidence_store, &cache, strict)? {
-        return Ok(None);
-    }
-    let plan = OptimizationPlan::from_evidence(&cache.metadata, &cache.module, evidence_store);
-    let output_path = module_optimization_plan_path(
-        out_root,
-        cache.metadata.source,
-        cache.metadata.module_name.as_str(),
-    )
-    .with_context(|| {
-        format!(
-            "construct optimization plan output path for module {}",
-            cache.metadata.module_name
-        )
-    })?;
-    write_optimization_plan(output_path.as_path(), &plan)?;
-    Ok(Some(ModuleDecisionReport {
-        output_path,
-        module_name: plan.module_name,
-        source_hash: plan.source_hash,
-        function_count: plan.functions.len(),
-    }))
-}
-
-fn validate_counter_evidence_matches_module(
-    evidence_store: &ProfileEvidenceStore,
-    cache: &CachedCodegenModule,
-    strict: bool,
-) -> Result<bool> {
-    match evidence_store.module_source_hash(cache.metadata.module_name.as_str()) {
-        Some(source_hash) if source_hash == cache.metadata.source_hash => Ok(true),
-        Some(source_hash) => bail!(
-            "counter dump source hash for module {} is 0x{source_hash:016x}, but cached BlockPy module has 0x{:016x}",
-            cache.metadata.module_name,
-            cache.metadata.source_hash
-        ),
-        None if strict => bail!(
-            "counter dump does not contain module {}",
-            cache.metadata.module_name
-        ),
-        None => Ok(false),
-    }
-}
-
-fn cached_module_paths_under_root(root: &Path) -> Result<Vec<PathBuf>> {
-    let mut out = Vec::new();
-    collect_cached_module_paths(root, &mut out)?;
-    out.sort();
-    Ok(out)
-}
-
-fn collect_cached_module_paths(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    let metadata = fs::metadata(path)
-        .with_context(|| format!("read module cache path metadata {}", path.display()))?;
-    if metadata.is_file() {
-        if path.file_name().and_then(|name| name.to_str()) == Some("mod.blockpy") {
-            out.push(path.to_path_buf());
-        }
-        return Ok(());
-    }
-    if !metadata.is_dir() {
-        return Ok(());
-    }
-    let entries = fs::read_dir(path)
-        .with_context(|| format!("read module cache directory {}", path.display()))?;
-    for entry in entries {
-        let entry = entry.with_context(|| format!("read entry in {}", path.display()))?;
-        collect_cached_module_paths(entry.path().as_path(), out)?;
-    }
-    Ok(())
-}
-
-fn write_optimization_plan(path: &Path, plan: &OptimizationPlan) -> Result<()> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create optimization plan dir {}", parent.display()))?;
-    }
-    let archive = rkyv::to_bytes::<rkyv::rancor::Error>(plan)
-        .map_err(|err| anyhow!("serialize optimization plan: {err}"))?;
-    let temp_path = path.with_extension("opt.tmp");
-    {
-        let mut temp_file = File::create(temp_path.as_path()).with_context(|| {
-            format!("create temporary optimization plan {}", temp_path.display())
-        })?;
-        temp_file
-            .write_all(archive.as_ref())
-            .with_context(|| format!("write optimization plan {}", temp_path.display()))?;
-    }
-    fs::rename(temp_path.as_path(), path).with_context(|| {
-        format!(
-            "publish optimization plan {} -> {}",
-            temp_path.display(),
-            path.display()
-        )
-    })?;
-    Ok(())
+    Ok(module_inputs
+        .into_iter()
+        .map(|(module_path, strict)| CachedModuleOptimizationInput::new(module_path, strict))
+        .collect())
 }
 
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Args> {
@@ -250,6 +132,7 @@ mod test {
     use soac_blockpy::block_py::{BlockLabel, InstrId, ModuleNameGen, RuntimeFunctionId};
     use soac_blockpy::codegen_cache::{
         CachedCodegenModuleMetadata, PythonModuleCacheSource, codegen_module_cache_path,
+        module_optimization_plan_path,
     };
     use soac_blockpy::{LoweringOptions, lower_python_to_blockpy_recorded_with_options};
     use soac_jit::counter_dump::{
@@ -257,7 +140,8 @@ mod test {
         CounterDumpTypeTableEntry,
     };
     use soac_jit::module_type::hash_module_source;
-    use soac_jit::optimization_plan::{PlannedAction, PlannedReplacement};
+    use soac_jit::optimization_plan::{OptimizationPlan, PlannedAction, PlannedReplacement};
+    use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const TEST_BUILD_IDENTITY: &str = "test-build-identity";

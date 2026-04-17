@@ -6,11 +6,15 @@ use soac_blockpy::block_py::{
     RuntimeFunctionId, RuntimeModuleId, SerializedFunctionDebugName, SerializedFunctionId,
     SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity, Visit,
 };
-use soac_blockpy::codegen_cache::{CachedCodegenModuleMetadata, PythonModuleCacheSource};
+use soac_blockpy::codegen_cache::{
+    CachedCodegenModule, CachedCodegenModuleMetadata, PythonModuleCacheSource,
+    load_codegen_module_cache, module_optimization_plan_path,
+};
 use soac_blockpy::passes::{CodegenModuleShape, InstrResolved};
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::path::Path;
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FunctionProfileEvidence {
@@ -770,6 +774,182 @@ pub fn load_optimization_plan(path: &Path) -> Result<OptimizationPlan> {
         fs::read(path).with_context(|| format!("read optimization plan {}", path.display()))?;
     rkyv::from_bytes::<OptimizationPlan, rkyv::rancor::Error>(bytes.as_slice())
         .map_err(|err| anyhow::anyhow!("deserialize optimization plan {}: {err}", path.display()))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CachedModuleOptimizationInput {
+    pub module_path: PathBuf,
+    pub strict: bool,
+}
+
+impl CachedModuleOptimizationInput {
+    pub fn new(module_path: PathBuf, strict: bool) -> Self {
+        Self {
+            module_path,
+            strict,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModuleOptimizationPlanReport {
+    pub output_path: PathBuf,
+    pub module_name: String,
+    pub source_hash: u64,
+    pub function_count: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OptimizationPlanGenerationSummary {
+    pub reports: Vec<ModuleOptimizationPlanReport>,
+    pub skipped: usize,
+}
+
+impl OptimizationPlanGenerationSummary {
+    pub fn written(&self) -> usize {
+        self.reports.len()
+    }
+}
+
+pub fn generate_optimization_plans_for_counter_dump(
+    counters_path: &Path,
+    module_root: &Path,
+    out_root: &Path,
+) -> Result<OptimizationPlanGenerationSummary> {
+    let evidence_store = ProfileEvidenceStore::from_counter_dump(counters_path)?;
+    let module_inputs = cached_module_paths_under_root(module_root)?
+        .into_iter()
+        .map(|module_path| CachedModuleOptimizationInput::new(module_path, false));
+    generate_optimization_plans_for_cached_modules(&evidence_store, module_inputs, out_root)
+}
+
+pub fn generate_optimization_plans_for_cached_modules(
+    evidence_store: &ProfileEvidenceStore,
+    module_inputs: impl IntoIterator<Item = CachedModuleOptimizationInput>,
+    out_root: &Path,
+) -> Result<OptimizationPlanGenerationSummary> {
+    let mut summary = OptimizationPlanGenerationSummary::default();
+    for module_input in module_inputs {
+        match generate_module_optimization_plan(
+            evidence_store,
+            module_input.module_path.as_path(),
+            out_root,
+            module_input.strict,
+        )? {
+            Some(report) => summary.reports.push(report),
+            None => summary.skipped += 1,
+        }
+    }
+    Ok(summary)
+}
+
+pub fn generate_module_optimization_plan(
+    evidence_store: &ProfileEvidenceStore,
+    module_path: &Path,
+    out_root: &Path,
+    strict: bool,
+) -> Result<Option<ModuleOptimizationPlanReport>> {
+    let cache = load_codegen_module_cache(module_path)
+        .with_context(|| format!("load BlockPy module cache {}", module_path.display()))?;
+    if !counter_evidence_matches_cached_module(evidence_store, &cache, strict)? {
+        return Ok(None);
+    }
+    let plan = OptimizationPlan::from_evidence(&cache.metadata, &cache.module, evidence_store);
+    let output_path = module_optimization_plan_path(
+        out_root,
+        cache.metadata.source,
+        cache.metadata.module_name.as_str(),
+    )
+    .with_context(|| {
+        format!(
+            "construct optimization plan output path for module {}",
+            cache.metadata.module_name
+        )
+    })?;
+    write_optimization_plan(output_path.as_path(), &plan)?;
+    Ok(Some(ModuleOptimizationPlanReport {
+        output_path,
+        module_name: plan.module_name,
+        source_hash: plan.source_hash,
+        function_count: plan.functions.len(),
+    }))
+}
+
+fn counter_evidence_matches_cached_module(
+    evidence_store: &ProfileEvidenceStore,
+    cache: &CachedCodegenModule,
+    strict: bool,
+) -> Result<bool> {
+    match evidence_store.module_source_hash(cache.metadata.module_name.as_str()) {
+        Some(source_hash) if source_hash == cache.metadata.source_hash => Ok(true),
+        Some(source_hash) => bail!(
+            "counter dump source hash for module {} is 0x{source_hash:016x}, but cached BlockPy module has 0x{:016x}",
+            cache.metadata.module_name,
+            cache.metadata.source_hash
+        ),
+        None if strict => bail!(
+            "counter dump does not contain module {}",
+            cache.metadata.module_name
+        ),
+        None => Ok(false),
+    }
+}
+
+pub fn cached_module_paths_under_root(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    collect_cached_module_paths(root, &mut out)?;
+    out.sort();
+    Ok(out)
+}
+
+fn collect_cached_module_paths(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("read module cache path metadata {}", path.display()))?;
+    if metadata.is_file() {
+        if path.file_name().and_then(|name| name.to_str()) == Some("mod.blockpy") {
+            out.push(path.to_path_buf());
+        }
+        return Ok(());
+    }
+    if !metadata.is_dir() {
+        return Ok(());
+    }
+    let entries = fs::read_dir(path)
+        .with_context(|| format!("read module cache directory {}", path.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("read entry in {}", path.display()))?;
+        collect_cached_module_paths(entry.path().as_path(), out)?;
+    }
+    Ok(())
+}
+
+pub fn write_optimization_plan(path: &Path, plan: &OptimizationPlan) -> Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create optimization plan dir {}", parent.display()))?;
+    }
+    let archive = rkyv::to_bytes::<rkyv::rancor::Error>(plan)
+        .map_err(|err| anyhow::anyhow!("serialize optimization plan: {err}"))?;
+    let temp_path = path.with_extension("opt.tmp");
+    {
+        let mut temp_file = File::create(temp_path.as_path()).with_context(|| {
+            format!("create temporary optimization plan {}", temp_path.display())
+        })?;
+        temp_file
+            .write_all(archive.as_ref())
+            .with_context(|| format!("write optimization plan {}", temp_path.display()))?;
+    }
+    fs::rename(temp_path.as_path(), path).with_context(|| {
+        format!(
+            "publish optimization plan {} -> {}",
+            temp_path.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
 }
 
 fn validate_alternative_guard(

@@ -189,6 +189,7 @@ struct RawPyThreadState {
 unsafe extern "C" {
     fn _Py_Dealloc(obj: *mut RawPyObject);
     fn PyErr_SetNone(exception: *mut c_void);
+    fn PyObject_RichCompareBool(left: *mut c_void, right: *mut c_void, opid: c_int) -> c_int;
     fn PyUnicode_FromOrdinal(ordinal: i32) -> *mut c_void;
     fn PyUnicode_GetLength(unicode: *mut c_void) -> isize;
     fn PyUnicode_ReadChar(unicode: *mut c_void, index: isize) -> u32;
@@ -231,6 +232,18 @@ unsafe fn dict_unicode_entries(keys: *mut RawPyDictKeysObject) -> *mut RawPyDict
 #[inline(always)]
 unsafe fn indexed_key(keys: *mut RawPyDictKeysObject, index: isize) -> *mut RawPyObject {
     unsafe { (*dict_unicode_entries(keys).offset(index)).me_key }
+}
+
+#[inline(always)]
+unsafe fn dict_key_matches(actual: *mut RawPyObject, expected: *mut RawPyObject) -> bool {
+    const PY_EQ: c_int = 2;
+    actual == expected
+        || (!actual.is_null()
+            && !expected.is_null()
+            && unsafe {
+                PyObject_RichCompareBool(actual.cast::<c_void>(), expected.cast::<c_void>(), PY_EQ)
+                    == 1
+            })
 }
 
 #[inline(always)]
@@ -578,7 +591,7 @@ macro_rules! probe_split_values {
             || unsafe { (*keys).dk_kind } != DICT_KEYS_SPLIT
             || index < 0
             || unsafe { index >= (*values).capacity.into() }
-            || unsafe { indexed_key(keys, index) } != key
+            || !unsafe { dict_key_matches(indexed_key(keys, index), key) }
         {
             core::ptr::null_mut()
         } else {
@@ -823,7 +836,7 @@ pub unsafe extern "C" fn soac_runtime_store_field_indexed(
         || values.is_null()
         || unsafe { (*keys).dk_kind } != DICT_KEYS_SPLIT
         || unsafe { index >= (*values).capacity.into() }
-        || unsafe { indexed_key(keys, index) } != key
+        || !unsafe { dict_key_matches(indexed_key(keys, index), key) }
     {
         return 0;
     }

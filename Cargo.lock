@@ -1799,7 +1799,6 @@ name = "soac-pyo3"
 version = "0.1.0"
 dependencies = [
  "pyo3",
- "rkyv",
  "serde_json",
  "soac-blockpy",
  "soac-jit",

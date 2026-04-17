@@ -8,7 +8,9 @@ use pyo3::exceptions::{
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyFunction, PyModule, PyString, PyTuple};
-use soac_blockpy::block_py::{BlockPyFunction, FunctionKind, ParamKind, RuntimeFunctionId};
+use soac_blockpy::block_py::{
+    BlockPyFunction, FunctionExecutionMode, FunctionKind, ParamKind, RuntimeFunctionId,
+};
 use soac_blockpy::passes::CodegenModuleShape;
 use std::ffi::{CString, c_void};
 use std::panic::{self, AssertUnwindSafe};
@@ -110,6 +112,13 @@ fn maybe_eager_compile_clif_entry(
     function_id: RuntimeFunctionId,
 ) -> PyResult<()> {
     if !eager_clif_compile_requested().map_err(PyRuntimeError::new_err)? {
+        return Ok(());
+    }
+    if module_runtime
+        .shared_module_state_owner
+        .lookup_function(function_id)
+        .is_some_and(|function| function.execution_mode() != FunctionExecutionMode::Jit)
+    {
         return Ok(());
     }
     let start = Instant::now();

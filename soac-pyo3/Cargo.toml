@@ -15,4 +15,3 @@ soac-jit = { path = "../soac-jit" }
 pyo3 = { workspace = true, features = ["extension-module"] }
 tracing = "0.1"
 serde_json = "1"
-rkyv = { version = "0.8", features = ["alloc"] }

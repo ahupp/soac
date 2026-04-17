@@ -1295,14 +1295,12 @@ fn predeclare_specialization_type_imports(
     jit_module: &mut JITModule,
     profile: &SpecializationProfile<'_>,
 ) -> Result<(), String> {
+    let planned_fields = profile.planned_field_index_specializations();
+    prime_planned_field_index_layouts(planned_fields.iter().copied())?;
     let mut type_refs = HashSet::new();
-    for evidence in profile.planned_evidence.values() {
-        for planned_specializations in evidence.field_index_specializations.values() {
-            for planned in planned_specializations {
-                if let Some(specialization) = field_index_specialization_from_planned(planned)? {
-                    type_refs.insert(specialization.owner_type_ref);
-                }
-            }
+    for planned in planned_fields {
+        if let Some(specialization) = field_index_specialization_from_primed_planned(planned)? {
+            type_refs.insert(specialization.owner_type_ref);
         }
     }
     for type_ref in type_refs {
@@ -4163,15 +4161,15 @@ impl ProcessJitState {
                 Some(inputs.session.as_ref()),
             )?;
             predeclare_specialization_type_imports(jit_module, &specialization_profile)?;
-            let specialization_inputs = FunctionSpecializationInputs::from_profile(
-                &specialization_profile,
-                &batch_function.function,
-            )?;
             let direct_owner_attr_specializations = predeclare_direct_call_owner_type_imports(
                 jit_module,
                 &shared_state.lowered_module,
                 &batch_function.function,
                 &specialization_profile,
+            )?;
+            let specialization_inputs = FunctionSpecializationInputs::from_profile(
+                &specialization_profile,
+                &batch_function.function,
             )?;
             return Ok(ReservedJitFunctionCompileInputs {
                 module_constant_ptrs,
@@ -7651,6 +7649,9 @@ fn emit_resolved_direct_entry_ptr(
             .icmp(ir::condcodes::IntCC::Equal, initial_callee_ptr, null_ptr);
     let compile_block = fb.create_block();
     fb.set_cold_block(compile_block);
+    let check_deopt_block = fb.create_block();
+    fb.append_block_param(check_deopt_block, ptr_ty);
+    fb.append_block_param(check_deopt_block, ptr_ty);
     let ready_block = fb.create_block();
     fb.append_block_param(ready_block, ptr_ty);
     fb.append_block_param(ready_block, ptr_ty);
@@ -7658,10 +7659,29 @@ fn emit_resolved_direct_entry_ptr(
         initial_callee_is_null,
         compile_block,
         &[],
-        ready_block,
+        check_deopt_block,
         &[
             ir::BlockArg::Value(function_env),
             ir::BlockArg::Value(initial_callee_ptr),
+        ],
+    );
+
+    fb.switch_to_block(check_deopt_block);
+    let ready_env = fb.block_params(check_deopt_block)[0];
+    let ready_callee = fb.block_params(check_deopt_block)[1];
+    let deopt_table =
+        load_function_env_obj(fb, ptr_ty, ready_env, FUNCTION_ENV_DEOPT_TABLE_PTR_OFFSET);
+    let deopt_table_is_null = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, deopt_table, null_ptr);
+    fb.ins().brif(
+        deopt_table_is_null,
+        compile_block,
+        &[],
+        ready_block,
+        &[
+            ir::BlockArg::Value(ready_env),
+            ir::BlockArg::Value(ready_callee),
         ],
     );
 
@@ -7687,8 +7707,29 @@ fn emit_resolved_direct_entry_ptr(
     let compiled_callee_is_null =
         fb.ins()
             .icmp(ir::condcodes::IntCC::Equal, compiled_callee_ptr, null_ptr);
+    let compiled_check_deopt_block = fb.create_block();
+    fb.append_block_param(compiled_check_deopt_block, ptr_ty);
     fb.ins().brif(
         compiled_callee_is_null,
+        ctx.consts.step_null_block,
+        &step_null_block_args(ctx),
+        compiled_check_deopt_block,
+        &[ir::BlockArg::Value(compiled_callee_ptr)],
+    );
+
+    fb.switch_to_block(compiled_check_deopt_block);
+    let compiled_callee_ptr = fb.block_params(compiled_check_deopt_block)[0];
+    let compiled_deopt_table = load_function_env_obj(
+        fb,
+        ptr_ty,
+        compiled_env,
+        FUNCTION_ENV_DEOPT_TABLE_PTR_OFFSET,
+    );
+    let compiled_deopt_table_is_null =
+        fb.ins()
+            .icmp(ir::condcodes::IntCC::Equal, compiled_deopt_table, null_ptr);
+    fb.ins().brif(
+        compiled_deopt_table_is_null,
         ctx.consts.step_null_block,
         &step_null_block_args(ctx),
         ready_block,
@@ -13228,16 +13269,16 @@ impl FunctionSpecializationInputs {
         profile: &SpecializationProfile<'_>,
         function: &BlockPyFunction<CodegenModuleShape>,
     ) -> Result<Self, String> {
+        let (field_index_specializations, field_index_specializations_by_instr) =
+            profile.field_index_specialization_maps(function.function_id)?;
         Ok(Self {
             call_target_specializations: profile
                 .call_target_specializations(function.function_id)?,
             operator_specializations: profile.operator_specializations(function.function_id)?,
             getitem_specializations: profile.getitem_specializations(function.function_id)?,
             setitem_specializations: profile.setitem_specializations(function.function_id)?,
-            field_index_specializations: profile
-                .field_index_specializations(function.function_id)?,
-            field_index_specializations_by_instr: profile
-                .field_index_specializations_by_instr(function.function_id)?,
+            field_index_specializations,
+            field_index_specializations_by_instr,
             branch_prefer_true: profile.branch_preferences(function.function_id)?,
             cold_block_labels: profile.cold_block_labels(function)?,
             behavior_change_indexed_stores: profile.behavior_change_indexed_stores
@@ -13304,6 +13345,14 @@ impl<'a> SpecializationProfile<'a> {
             || (self.profiled_cold_blocks && self.has_existing_counter_dump())
     }
 
+    fn planned_field_index_specializations(&self) -> Vec<&PlannedIndexedFieldSpecialization> {
+        self.planned_evidence
+            .values()
+            .flat_map(|evidence| evidence.field_index_specializations.values())
+            .flat_map(|specializations| specializations.iter())
+            .collect()
+    }
+
     fn call_target_specializations(
         &self,
         function_id: RuntimeFunctionId,
@@ -13359,47 +13408,46 @@ impl<'a> SpecializationProfile<'a> {
             .unwrap_or_default())
     }
 
-    fn field_index_specializations(
-        &self,
-        _function_id: RuntimeFunctionId,
-    ) -> Result<HashMap<String, Vec<FieldIndexSpecialization>>, String> {
-        let mut out = HashMap::<String, Vec<FieldIndexSpecialization>>::new();
-        for evidence in self.planned_evidence.values() {
-            for planned_specializations in evidence.field_index_specializations.values() {
-                for planned in planned_specializations {
-                    if let Some(specialization) = field_index_specialization_from_planned(planned)?
-                    {
-                        push_unique_specialization(
-                            out.entry(planned.attr_name.clone()).or_default(),
-                            specialization,
-                        );
-                    }
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    fn field_index_specializations_by_instr(
+    fn field_index_specialization_maps(
         &self,
         function_id: RuntimeFunctionId,
-    ) -> Result<HashMap<InstrId, Vec<FieldIndexSpecialization>>, String> {
+    ) -> Result<
+        (
+            HashMap<String, Vec<FieldIndexSpecialization>>,
+            HashMap<InstrId, Vec<FieldIndexSpecialization>>,
+        ),
+        String,
+    > {
+        let planned_fields = self.planned_field_index_specializations();
+        prime_planned_field_index_layouts(planned_fields.iter().copied())?;
+        let mut by_attr = HashMap::<String, Vec<FieldIndexSpecialization>>::new();
+        for planned in planned_fields {
+            if let Some(specialization) = field_index_specialization_from_primed_planned(planned)? {
+                push_unique_specialization(
+                    by_attr.entry(planned.attr_name.clone()).or_default(),
+                    specialization,
+                );
+            }
+        }
+
         let Some(evidence) = self.planned_evidence.get(&function_id) else {
-            return Ok(HashMap::new());
+            return Ok((by_attr, HashMap::new()));
         };
-        let mut out = HashMap::new();
+        let mut by_instr = HashMap::new();
         for (instr_id, planned_specializations) in &evidence.field_index_specializations {
             let mut specializations = Vec::new();
             for planned in planned_specializations {
-                if let Some(specialization) = field_index_specialization_from_planned(planned)? {
+                if let Some(specialization) =
+                    field_index_specialization_from_primed_planned(planned)?
+                {
                     push_unique_specialization(&mut specializations, specialization);
                 }
             }
             if !specializations.is_empty() {
-                out.insert(*instr_id, specializations);
+                by_instr.insert(*instr_id, specializations);
             }
         }
-        Ok(out)
+        Ok((by_attr, by_instr))
     }
 
     fn cold_block_labels(
@@ -13844,9 +13892,19 @@ fn prime_field_index_layout(
     }
     let none = unsafe { ffi::Py_None() };
     for layout in layouts {
-        let key = CString::new(layout.key.as_str())
+        let key_name = CString::new(layout.key.as_str())
             .map_err(|_| format!("field specialization attr contains NUL: {:?}", layout.key))?;
-        if unsafe { ffi::PyObject_SetAttrString(temp_instance, key.as_ptr(), none) } != 0 {
+        let key = unsafe { ffi::PyUnicode_InternFromString(key_name.as_ptr()) };
+        if key.is_null() {
+            unsafe {
+                ffi::Py_DECREF(temp_instance);
+                ffi::PyErr_Clear();
+            }
+            return Ok(());
+        }
+        let set_result = unsafe { ffi::PyObject_SetAttr(temp_instance, key, none) };
+        unsafe { ffi::Py_DECREF(key) };
+        if set_result != 0 {
             unsafe {
                 ffi::Py_DECREF(temp_instance);
                 ffi::PyErr_Clear();
@@ -13915,24 +13973,52 @@ fn field_index_specialization_for_type(
     }))
 }
 
-fn field_index_specialization_from_planned(
-    planned: &PlannedIndexedFieldSpecialization,
-) -> Result<Option<FieldIndexSpecialization>, String> {
-    let type_key = CounterDumpTypeKey {
+fn planned_field_index_type_key(planned: &PlannedIndexedFieldSpecialization) -> CounterDumpTypeKey {
+    CounterDumpTypeKey {
         module_name: planned.owner_type.module_name.clone(),
         qualname: planned.owner_type.qualname.clone(),
-    };
+    }
+}
+
+fn prime_planned_field_index_layouts<'a>(
+    planned_fields: impl IntoIterator<Item = &'a PlannedIndexedFieldSpecialization>,
+) -> Result<(), String> {
+    let mut layouts_by_type = HashMap::<CounterDumpTypeKey, Vec<CollectedTypeKeyLayout>>::new();
+    let mut seen_layouts = HashSet::<(CounterDumpTypeKey, String, u32)>::new();
+    for planned in planned_fields {
+        let type_key = planned_field_index_type_key(planned);
+        if !seen_layouts.insert((
+            type_key.clone(),
+            planned.attr_name.clone(),
+            planned.expected_index,
+        )) {
+            continue;
+        }
+        layouts_by_type
+            .entry(type_key)
+            .or_default()
+            .push(CollectedTypeKeyLayout {
+                owner_type_id: 0,
+                key: planned.attr_name.clone(),
+                index: planned.expected_index,
+            });
+    }
+    for (type_key, layouts) in layouts_by_type {
+        let Some(owner_type) = resolve_type_key_to_type(&type_key)? else {
+            continue;
+        };
+        prime_field_index_layout(owner_type, layouts.as_slice())?;
+    }
+    Ok(())
+}
+
+fn field_index_specialization_from_primed_planned(
+    planned: &PlannedIndexedFieldSpecialization,
+) -> Result<Option<FieldIndexSpecialization>, String> {
+    let type_key = planned_field_index_type_key(planned);
     let Some(owner_type) = resolve_type_key_to_type(&type_key)? else {
         return Ok(None);
     };
-    prime_field_index_layout(
-        owner_type,
-        &[CollectedTypeKeyLayout {
-            owner_type_id: 0,
-            key: planned.attr_name.clone(),
-            index: planned.expected_index,
-        }],
-    )?;
     field_index_specialization_for_type(
         owner_type,
         planned.attr_name.as_str(),
@@ -14514,6 +14600,15 @@ fn emit_direct_call_resolved_raw_with_arg_values(
             DirectCallEntryKind::Core => Some(function.func_id),
             DirectCallEntryKind::DefaultResolving => function.default_func_id,
         }) {
+        let (function_env, _callee_ptr) = emit_resolved_direct_entry_ptr(
+            fb,
+            callable,
+            function_metadata,
+            function_env,
+            entry_kind,
+            ctx,
+        );
+        call_args[0] = function_env;
         let func_ref = codegen_env
             .codegen_declare_func_in_func(direct_func_id, &mut fb.func)
             .expect("reserved direct function should be declared in codegen env");
