@@ -3165,8 +3165,10 @@ def build(values):
                     function.function_id, function.names.qualname
                 )
             })?;
-        let specialization_profile =
-            SpecializationProfile::from_runtime_state(direct_call_resolver)?;
+        let specialization_profile = SpecializationProfile::from_runtime_state_with_session(
+            direct_call_resolver,
+            Some(compile_session),
+        )?;
         build_cranelift_run_bb_specialized_function(
             jit_module,
             blocks,
@@ -16275,8 +16277,11 @@ def f(x, y):
             .expect("test optimization plan path should build");
             write_test_optimization_plan(plan_path.as_path(), &plan);
 
-            let profile = SpecializationProfile::from_runtime_state(Some(shared_state.as_ref()))
-                .expect("specialization profile should load planned evidence");
+            let profile = SpecializationProfile::from_runtime_state_with_session(
+                Some(shared_state.as_ref()),
+                None,
+            )
+            .expect("specialization profile should load planned evidence");
             assert!(
                 profile.has_specialization_inputs(),
                 "mod.opt should count as specialization input even without a counter dump"
@@ -16305,6 +16310,119 @@ def f(x, y):
                     .unwrap()
                     .get(&instr_id),
                 Some(&false)
+            );
+        });
+    }
+
+    #[test]
+    fn specialization_profile_resolves_cross_module_plan_targets_by_function_id() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "specialization_profile_resolves_cross_module_plan_targets_by_function_id",
+        ) {
+            return;
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let module_cache_root = fresh_test_work_dir("planned-cross-module-specializations");
+            let _cache_dir =
+                EnvVarGuard::set_os("SOAC_MODULE_CACHE_DIR", module_cache_root.as_os_str());
+            let _work_dir = EnvVarGuard::remove("SOAC_WORK_DIR");
+            let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "verify");
+            let session = std::sync::Arc::new(crate::session::CompileSession::new());
+            let caller_module_name = "planned_cross_module_caller_test";
+            let callee_module_name = "planned_cross_module_callee_test";
+            let caller_module_name_gen = ModuleNameGen::new(101);
+            let callee_module_name_gen = ModuleNameGen::new(102);
+            let caller = with_single_test_block(
+                test_function_in_module(&caller_module_name_gen, "duplicate"),
+                vec![],
+                ret_term(none_expr()),
+            );
+            let callee = with_single_test_block(
+                test_function_in_module(&callee_module_name_gen, "duplicate"),
+                vec![],
+                ret_term(none_expr()),
+            );
+            let caller_function_id = caller.function_id;
+            let callee_function_id = callee.function_id;
+            let caller_state = crate::module_type::build_shared_state_for_testing(
+                py,
+                test_module(caller_module_name_gen, vec![caller]),
+                caller_module_name,
+                "",
+            )
+            .expect("caller shared state should build");
+            let callee_state = crate::module_type::build_shared_state_for_testing(
+                py,
+                test_module(callee_module_name_gen, vec![callee]),
+                callee_module_name,
+                "",
+            )
+            .expect("callee shared state should build");
+            session
+                .retain_shared_module_state(std::sync::Arc::clone(&caller_state))
+                .expect("caller state should be retained");
+            session
+                .retain_shared_module_state(std::sync::Arc::clone(&callee_state))
+                .expect("callee state should be retained");
+            let planned_module_id = 777;
+            let instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+            let planned_callee_target = PlannedFunctionTarget {
+                module_name: callee_module_name.to_string(),
+                source_hash: callee_state.source_hash,
+                function_id: callee_function_id.function_id(),
+            };
+            let plan = OptimizationPlan {
+                source: PythonModuleCacheSource::Project,
+                module_name: caller_module_name.to_string(),
+                source_hash: caller_state.source_hash,
+                cache_identity: pre_optimization_module_cache_identity(
+                    env!("SOAC_BUILD_IDENTITY"),
+                    caller_state.module_name == "soac.runtime",
+                ),
+                functions: vec![FunctionOptimizationPlan {
+                    function_id: FunctionId::new(
+                        planned_module_id,
+                        caller_function_id.function_id(),
+                    ),
+                    qualname: "duplicate".to_string(),
+                    decisions: vec![OptimizationDecision {
+                        instr_id,
+                        replacement: PlannedReplacement::Guarded {
+                            alternatives: vec![PlannedAlternative {
+                                guards: vec![PlannedGuard::FunctionTarget {
+                                    target: planned_callee_target.clone(),
+                                }],
+                                action: PlannedAction::DirectCall {
+                                    target: planned_callee_target,
+                                },
+                            }],
+                            fallback: PlannedFallback::OriginalInstruction,
+                        },
+                    }],
+                }],
+            };
+            let plan_path = module_optimization_plan_path(
+                module_cache_root.as_path(),
+                PythonModuleCacheSource::Project,
+                caller_module_name,
+            )
+            .expect("test optimization plan path should build");
+            write_test_optimization_plan(plan_path.as_path(), &plan);
+
+            let profile = SpecializationProfile::from_runtime_state_with_session(
+                Some(caller_state.as_ref()),
+                Some(session.as_ref()),
+            )
+            .expect("specialization profile should load planned evidence");
+            assert_eq!(
+                profile
+                    .call_target_specializations(caller_function_id)
+                    .unwrap()
+                    .get(&instr_id),
+                Some(&vec![callee_function_id])
             );
         });
     }

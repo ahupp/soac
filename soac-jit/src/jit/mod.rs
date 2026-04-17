@@ -1690,7 +1690,10 @@ impl JitBatchPlan<'_> {
                 continue;
             }
             let module_plan = if let Some(shared_state) = batch_function.source.shared_state() {
-                let profile = SpecializationProfile::from_runtime_state(Some(shared_state))?;
+                let profile = SpecializationProfile::from_runtime_state_with_session(
+                    Some(shared_state),
+                    Some(inputs.session.as_ref()),
+                )?;
                 if profile.has_specialization_inputs() {
                     let direct_owner_attr_specializations_by_function = self
                         .function_compile_inputs
@@ -4102,8 +4105,10 @@ impl ProcessJitState {
                 scalar_counter_data_id,
                 Some(symbol_scope.as_str()),
             )?;
-            let specialization_profile =
-                SpecializationProfile::from_runtime_state(Some(shared_state))?;
+            let specialization_profile = SpecializationProfile::from_runtime_state_with_session(
+                Some(shared_state),
+                Some(inputs.session.as_ref()),
+            )?;
             predeclare_specialization_type_imports(jit_module, &specialization_profile)?;
             let specialization_inputs = FunctionSpecializationInputs::from_profile(
                 &specialization_profile,
@@ -4160,8 +4165,10 @@ impl ProcessJitState {
             scalar_counter_data_id,
             None,
         )?;
-        let specialization_profile =
-            SpecializationProfile::from_runtime_state(inputs.direct_call_resolver)?;
+        let specialization_profile = SpecializationProfile::from_runtime_state_with_session(
+            inputs.direct_call_resolver,
+            Some(inputs.session.as_ref()),
+        )?;
         predeclare_specialization_type_imports(jit_module, &specialization_profile)?;
         let specialization_inputs = FunctionSpecializationInputs::from_profile(
             &specialization_profile,
@@ -12396,6 +12403,7 @@ fn soac_repo_root_for_module_cache() -> Option<PathBuf> {
 
 fn load_planned_evidence_for_runtime_state(
     shared_state: Option<&SharedModuleState>,
+    compile_session: Option<&crate::session::CompileSession>,
     specialization_mode: Option<SpecializationMode>,
 ) -> Result<HashMap<FunctionId, FunctionProfileEvidence>, String> {
     if !matches!(
@@ -12439,7 +12447,7 @@ fn load_planned_evidence_for_runtime_state(
             cache_identity.as_str(),
         )
         .map_err(|err| err.to_string())?;
-        return planned_evidence_for_shared_state(&plan, shared_state);
+        return planned_evidence_for_shared_state(&plan, shared_state, compile_session);
     }
     Ok(HashMap::new())
 }
@@ -12447,6 +12455,7 @@ fn load_planned_evidence_for_runtime_state(
 fn planned_evidence_for_shared_state(
     plan: &OptimizationPlan,
     shared_state: &SharedModuleState,
+    compile_session: Option<&crate::session::CompileSession>,
 ) -> Result<HashMap<FunctionId, FunctionProfileEvidence>, String> {
     let mut evidence_by_function = HashMap::new();
     for planned_function in &plan.functions {
@@ -12464,7 +12473,8 @@ fn planned_evidence_for_shared_state(
             })?;
         let evidence = plan
             .evidence_for_function(planned_function.function_id, |target| {
-                Ok(resolve_planned_function_target(shared_state, target))
+                resolve_planned_function_target(shared_state, compile_session, target)
+                    .map_err(anyhow::Error::msg)
             })
             .map_err(|err| err.to_string())?;
         evidence_by_function.insert(current_function.function_id, evidence);
@@ -12474,17 +12484,30 @@ fn planned_evidence_for_shared_state(
 
 fn resolve_planned_function_target(
     shared_state: &SharedModuleState,
+    compile_session: Option<&crate::session::CompileSession>,
     target: &PlannedFunctionTarget,
-) -> Option<FunctionId> {
-    if target.module_name != shared_state.module_name
-        || target.source_hash != shared_state.source_hash
+) -> Result<Option<FunctionId>, String> {
+    let target_shared_state_owner;
+    let target_shared_state = if target.module_name == shared_state.module_name
+        && target.source_hash == shared_state.source_hash
     {
-        return None;
-    }
-    let function_id = FunctionId::new(shared_state.module_id(), target.function_id);
-    shared_state
+        shared_state
+    } else {
+        let Some(compile_session) = compile_session else {
+            return Ok(None);
+        };
+        let Some(target_shared_state) = compile_session
+            .shared_module_state_for_identity(&target.module_name, target.source_hash)?
+        else {
+            return Ok(None);
+        };
+        target_shared_state_owner = target_shared_state;
+        target_shared_state_owner.as_ref()
+    };
+    let function_id = FunctionId::new(target_shared_state.module_id(), target.function_id);
+    Ok(target_shared_state
         .lookup_function(function_id)
-        .map(|function| function.function_id)
+        .map(|function| function.function_id))
 }
 
 impl FunctionSpecializationInputs {
@@ -12513,7 +12536,10 @@ impl FunctionSpecializationInputs {
 }
 
 impl<'a> SpecializationProfile<'a> {
-    fn from_runtime_state(shared_state: Option<&'a SharedModuleState>) -> Result<Self, String> {
+    fn from_runtime_state_with_session(
+        shared_state: Option<&'a SharedModuleState>,
+        compile_session: Option<&crate::session::CompileSession>,
+    ) -> Result<Self, String> {
         let specialization_mode = specialization_mode_from_env()?;
         let counter_dump_path = if shared_state.is_some()
             && specialization_mode != Some(crate::config::SpecializationMode::Profile)
@@ -12522,8 +12548,11 @@ impl<'a> SpecializationProfile<'a> {
         } else {
             None
         };
-        let planned_evidence =
-            load_planned_evidence_for_runtime_state(shared_state, specialization_mode)?;
+        let planned_evidence = load_planned_evidence_for_runtime_state(
+            shared_state,
+            compile_session,
+            specialization_mode,
+        )?;
         Ok(Self {
             module_name: shared_state.map(|shared_state| shared_state.module_name.as_str()),
             counter_dump_path: counter_dump_path.map(Cow::Owned),
@@ -25156,7 +25185,10 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
 
     let builder = new_jit_builder()?;
     let mut jit_module = JITModule::new(builder);
-    let specialization_profile = SpecializationProfile::from_runtime_state(runtime_state)?;
+    let specialization_profile = SpecializationProfile::from_runtime_state_with_session(
+        runtime_state,
+        Some(compile_session),
+    )?;
     predeclare_specialization_type_imports(&mut jit_module, &specialization_profile)?;
     let mut direct_owner_attr_specializations_by_function = HashMap::new();
     if runtime_state.is_some() && specialization_profile.has_specialization_inputs() {

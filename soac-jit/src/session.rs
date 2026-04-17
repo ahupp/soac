@@ -34,18 +34,33 @@ pub struct CompileSession {
 struct SharedModuleStateRegistry {
     retained: Vec<Arc<SharedModuleState>>,
     by_module_id: HashMap<u32, usize>,
+    by_module_identity: HashMap<(String, u64), usize>,
 }
 
 impl SharedModuleStateRegistry {
     fn retain(&mut self, shared_state: Arc<SharedModuleState>) {
         let module_id = shared_state.lowered_module.module_name_gen.module_id();
+        let module_identity = (shared_state.module_name.clone(), shared_state.source_hash());
         let index = self.retained.len();
         self.retained.push(shared_state);
         self.by_module_id.insert(module_id, index);
+        self.by_module_identity.insert(module_identity, index);
     }
 
     fn for_function_id(&self, function_id: FunctionId) -> Option<Arc<SharedModuleState>> {
         let index = self.by_module_id.get(&function_id.module_id()).copied()?;
+        self.retained.get(index).cloned()
+    }
+
+    fn for_module_identity(
+        &self,
+        module_name: &str,
+        source_hash: u64,
+    ) -> Option<Arc<SharedModuleState>> {
+        let index = self
+            .by_module_identity
+            .get(&(module_name.to_string(), source_hash))
+            .copied()?;
         self.retained.get(index).cloned()
     }
 
@@ -111,6 +126,18 @@ impl CompileSession {
             .lock()
             .map_err(|_| "compile session shared module state lock poisoned".to_string())?
             .for_function_id(function_id))
+    }
+
+    pub fn shared_module_state_for_identity(
+        &self,
+        module_name: &str,
+        source_hash: u64,
+    ) -> Result<Option<Arc<SharedModuleState>>, String> {
+        Ok(self
+            .shared_module_states
+            .lock()
+            .map_err(|_| "compile session shared module state lock poisoned".to_string())?
+            .for_module_identity(module_name, source_hash))
     }
 
     pub fn lookup_shared_function(
