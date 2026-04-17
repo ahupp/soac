@@ -53,6 +53,30 @@ benchmarked throughput delta, and the headline pre/post numbers.
 
 # Journal of Negative Results
 
+## 2026-04-17 - Not landed: typed item intrinsic and effect-only setitem emission
+
+- jj change id: not landed (`tmxwusyv` while testing)
+- summary: Tried routing typed getitem/setitem/delitem through typed intrinsic
+  emission so planned operand ownership survived item specialization. A follow-up
+  effect-only setitem path skipped owned `None` materialization on exact-list
+  specialized store hits. Code size improved, but verify counters, including
+  runtime INCREF/DECREF totals, were unchanged and pystone throughput was flat to
+  slightly negative. The extra codegen complexity is not justified without a
+  clearer counter or throughput win.
+- throughput: `-0.31%` median with refcounts enabled
+- baseline benchmark:
+  - apply, refcounts enabled, 1M loops x3: `262821`, `264473`,
+    `264513 loops/s`
+  - apply, refcounts disabled, 1M loops x3: `351698`, `356883`,
+    `359373 loops/s`
+  - total pystone code size: `485210 bytes`
+- attempted benchmark:
+  - apply, refcounts enabled, 1M loops x3: `239322`, `263655`,
+    `265600 loops/s`
+  - apply, refcounts disabled, 1M loops x3: `334710`, `353713`,
+    `341393 loops/s`
+  - total pystone code size: `483874 bytes`
+
 ## 2026-04-16 - Not landed: typed generic positional call emission
 
 - jj change id: not landed (`tmvssnxt` while testing)
