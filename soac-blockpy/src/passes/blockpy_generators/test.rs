@@ -6,9 +6,9 @@ use super::{
 use crate::block_py::{
     core_call_expr_with_meta, BinOpKind, BindingKind, BindingPurpose, Block, BlockBuilder,
     BlockLabel, BlockTerm, CallArgPositional, CallableScopeInfo, CallableScopeKind,
-    CellBindingKind, ClosureInit, ClosureSlot, FunctionId, FunctionName, HasMeta, InstrUnresolved,
-    InstrWithYield, Literal, Meta, NameLike, StorageLayout, TryMapTerm, UnaryOpKind, WithMeta,
-    Yield,
+    CellBindingKind, ClosureInit, ClosureSlot, FunctionName, HasMeta, InstrUnresolved,
+    InstrWithYield, Literal, Meta, NameLike, RuntimeFunctionId, StorageLayout, TryMapTerm,
+    UnaryOpKind, WithMeta, Yield,
 };
 use crate::passes::ast_to_ast::scope_helpers::is_internal_symbol;
 use crate::passes::InstrRuff;
@@ -51,7 +51,7 @@ fn generator_resume_source_semantic(layout: &StorageLayout) -> CallableScopeInfo
 fn build_closure_backed_generator_factory_block(
     _factory_label: &str,
     visible_names: &FunctionName,
-    resume_function_id: FunctionId,
+    resume_function_id: RuntimeFunctionId,
     _resume_state_order: &[String],
     _layout: &StorageLayout,
     is_coroutine: bool,
@@ -469,7 +469,7 @@ fn builds_closure_backed_generator_factory_block() {
     let block = build_closure_backed_generator_factory_block(
         "_dp_bb_demo_factory",
         &FunctionName::new("gen", "gen", "gen", "gen"),
-        FunctionId::new(0, 1),
+        RuntimeFunctionId::new(0, 1),
         &[
             "_dp_cell_captured".to_string(),
             "_dp_cell_x".to_string(),

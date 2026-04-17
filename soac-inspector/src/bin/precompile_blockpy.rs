@@ -1,4 +1,4 @@
-use soac_blockpy::block_py::{BlockPyModule, FunctionId, ModuleNameGen};
+use soac_blockpy::block_py::{BlockPyModule, ModuleNameGen, RuntimeFunctionId};
 use soac_blockpy::codegen_cache::{
     CachedCodegenModuleMetadata, PythonModuleCacheSource, codegen_module_cache_path,
     load_codegen_module_cache, module_optimization_plan_path,
@@ -291,7 +291,7 @@ fn module_id_for_record(record: &CounterDumpRecordView<'_>) -> Result<Option<u32
     for row_index in 0..record.row_count() {
         let row = record.row(row_index)?;
         for function_id in row_function_ids(&row) {
-            if function_id == FunctionId::global() {
+            if function_id == RuntimeFunctionId::global() {
                 continue;
             }
             match module_id {
@@ -311,7 +311,7 @@ fn module_id_for_record(record: &CounterDumpRecordView<'_>) -> Result<Option<u32
     Ok(module_id)
 }
 
-fn row_function_ids(row: &CounterDumpRowView<'_>) -> impl IntoIterator<Item = FunctionId> {
+fn row_function_ids(row: &CounterDumpRowView<'_>) -> impl IntoIterator<Item = RuntimeFunctionId> {
     [row.function_id, row.current_function_id]
         .into_iter()
         .flatten()
@@ -571,8 +571,8 @@ mod test {
 
     #[test]
     fn counter_modules_dedup_by_module_source_and_module_id() {
-        let record = counter_record("pkg.mod", 0x1234, Some(FunctionId::new(7, 1)));
-        let other_record = counter_record("pkg.mod", 0x1234, Some(FunctionId::new(7, 2)));
+        let record = counter_record("pkg.mod", 0x1234, Some(RuntimeFunctionId::new(7, 1)));
+        let other_record = counter_record("pkg.mod", 0x1234, Some(RuntimeFunctionId::new(7, 2)));
         let bytes = [record.encode().unwrap(), other_record.encode().unwrap()].concat();
         let records = parse_counter_dump_records(bytes.as_slice()).unwrap();
 
@@ -590,8 +590,10 @@ mod test {
 
     #[test]
     fn counter_modules_reject_mixed_module_ids_in_one_record() {
-        let mut record = counter_record("pkg.mod", 0x1234, Some(FunctionId::new(7, 1)));
-        record.rows.push(counter_row(Some(FunctionId::new(8, 1))));
+        let mut record = counter_record("pkg.mod", 0x1234, Some(RuntimeFunctionId::new(7, 1)));
+        record
+            .rows
+            .push(counter_row(Some(RuntimeFunctionId::new(8, 1))));
         let bytes = record.encode().unwrap();
         let records = parse_counter_dump_records(bytes.as_slice()).unwrap();
 
@@ -865,7 +867,7 @@ mod test {
     fn counter_record(
         module_name: &str,
         source_hash: u64,
-        function_id: Option<FunctionId>,
+        function_id: Option<RuntimeFunctionId>,
     ) -> CounterDumpRecord {
         CounterDumpRecord {
             source_hash,
@@ -878,7 +880,7 @@ mod test {
         }
     }
 
-    fn counter_row(function_id: Option<FunctionId>) -> CounterDumpRow {
+    fn counter_row(function_id: Option<RuntimeFunctionId>) -> CounterDumpRow {
         CounterDumpRow {
             counter_id: 0,
             scope: "function".to_string(),

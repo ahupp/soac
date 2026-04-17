@@ -4,7 +4,7 @@ compile_error!("counter dump format currently requires little-endian hosts");
 use memmap2::Mmap;
 use rkyv::rancor::Error as RkyvError;
 use rkyv::{Archive, Deserialize, Serialize};
-use soac_blockpy::block_py::{BlockLabel, FunctionId, InstrId};
+use soac_blockpy::block_py::{BlockLabel, InstrId, RuntimeFunctionId};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Write;
@@ -23,8 +23,8 @@ pub struct CounterDumpRow {
     pub scope: String,
     pub kind: String,
     pub site_kind: String,
-    pub function_id: Option<FunctionId>,
-    pub current_function_id: Option<FunctionId>,
+    pub function_id: Option<RuntimeFunctionId>,
+    pub current_function_id: Option<RuntimeFunctionId>,
     pub instr_id: Option<InstrId>,
     pub function_qualname: Option<String>,
     pub block_label: Option<String>,
@@ -84,8 +84,8 @@ pub struct CounterDumpRowView<'a> {
     pub scope: &'a str,
     pub kind: &'a str,
     pub site_kind: &'a str,
-    pub function_id: Option<FunctionId>,
-    pub current_function_id: Option<FunctionId>,
+    pub function_id: Option<RuntimeFunctionId>,
+    pub current_function_id: Option<RuntimeFunctionId>,
     pub instr_id: Option<InstrId>,
     pub function_qualname: Option<&'a str>,
     pub block_label: Option<&'a str>,
@@ -172,9 +172,9 @@ struct CounterDumpTypeTableEntryArchive {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CallTargetSpecializationEntry {
     module_name: String,
-    site_function_id: FunctionId,
+    site_function_id: RuntimeFunctionId,
     instr_id: InstrId,
-    observed_function_id: FunctionId,
+    observed_function_id: RuntimeFunctionId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -256,11 +256,11 @@ impl CounterDumpRowArchive {
             site_kind: row.site_kind.clone(),
             function_id: row
                 .function_id
-                .map(FunctionId::to_packed_runtime_u64)
+                .map(RuntimeFunctionId::to_packed_runtime_u64)
                 .unwrap_or(COUNTER_DUMP_NONE_FUNCTION_ID),
             current_function_id: row
                 .current_function_id
-                .map(FunctionId::to_packed_runtime_u64)
+                .map(RuntimeFunctionId::to_packed_runtime_u64)
                 .unwrap_or(COUNTER_DUMP_NONE_FUNCTION_ID),
             instr_block_label: instr_id
                 .map(|instr_id| instr_id.block_label().as_u32())
@@ -365,9 +365,10 @@ impl<'a> CounterDumpRecordView<'a> {
             kind: row.kind.as_str(),
             site_kind: row.site_kind.as_str(),
             function_id: (function_id != COUNTER_DUMP_NONE_FUNCTION_ID)
-                .then_some(FunctionId::from_packed_runtime_u64(function_id)),
-            current_function_id: (current_function_id != COUNTER_DUMP_NONE_FUNCTION_ID)
-                .then_some(FunctionId::from_packed_runtime_u64(current_function_id)),
+                .then_some(RuntimeFunctionId::from_packed_runtime_u64(function_id)),
+            current_function_id: (current_function_id != COUNTER_DUMP_NONE_FUNCTION_ID).then_some(
+                RuntimeFunctionId::from_packed_runtime_u64(current_function_id),
+            ),
             instr_id: if row.has_instr_id {
                 Some(InstrId::new(
                     BlockLabel::from_index(instr_block_label as usize),
@@ -530,8 +531,8 @@ fn call_target_specialization_entries(
             if observed_value == 0 {
                 continue;
             }
-            let observed_function_id = FunctionId::from_packed_runtime_u64(observed_value);
-            if observed_function_id == FunctionId::global() {
+            let observed_function_id = RuntimeFunctionId::from_packed_runtime_u64(observed_value);
+            if observed_function_id == RuntimeFunctionId::global() {
                 continue;
             }
             entries.push(CallTargetSpecializationEntry {
@@ -548,7 +549,7 @@ fn call_target_specialization_entries(
 fn observed_value_entries_for_kind(
     records: &[CounterDumpRecordView<'_>],
     kind: &str,
-) -> Result<Vec<(String, FunctionId, InstrId, u64)>, String> {
+) -> Result<Vec<(String, RuntimeFunctionId, InstrId, u64)>, String> {
     let mut entries = Vec::new();
     for record in records {
         let module_name = record.module_name()?.to_string();
@@ -631,10 +632,10 @@ pub fn render_call_target_specializations(
 pub fn collect_call_target_specializations_for_function(
     records: &[CounterDumpRecordView<'_>],
     module_name: &str,
-    function_id: FunctionId,
-) -> Result<HashMap<InstrId, Vec<FunctionId>>, String> {
-    let mut out = HashMap::<InstrId, Vec<FunctionId>>::new();
-    let mut seen_targets = HashSet::<(InstrId, FunctionId)>::new();
+    function_id: RuntimeFunctionId,
+) -> Result<HashMap<InstrId, Vec<RuntimeFunctionId>>, String> {
+    let mut out = HashMap::<InstrId, Vec<RuntimeFunctionId>>::new();
+    let mut seen_targets = HashSet::<(InstrId, RuntimeFunctionId)>::new();
     for entry in call_target_specialization_entries(records)? {
         if entry.module_name != module_name || entry.site_function_id != function_id {
             continue;
@@ -651,8 +652,8 @@ pub fn collect_call_target_specializations_for_function(
 pub fn read_call_target_specializations_from_file(
     path: &Path,
     module_name: &str,
-    function_id: FunctionId,
-) -> Result<HashMap<InstrId, Vec<FunctionId>>, String> {
+    function_id: RuntimeFunctionId,
+) -> Result<HashMap<InstrId, Vec<RuntimeFunctionId>>, String> {
     let dump = CounterDumpFile::open(path)?;
     let records = dump.records()?;
     collect_call_target_specializations_for_function(records.as_slice(), module_name, function_id)
@@ -661,7 +662,7 @@ pub fn read_call_target_specializations_from_file(
 pub fn collect_operator_specializations_for_function(
     records: &[CounterDumpRecordView<'_>],
     module_name: &str,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
 ) -> Result<HashMap<InstrId, Vec<u64>>, String> {
     let mut out = HashMap::<InstrId, Vec<u64>>::new();
     let mut seen_targets = HashSet::<(InstrId, u64)>::new();
@@ -681,7 +682,7 @@ pub fn collect_operator_specializations_for_function(
 pub fn collect_getitem_specializations_for_function(
     records: &[CounterDumpRecordView<'_>],
     module_name: &str,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
 ) -> Result<HashMap<InstrId, Vec<u64>>, String> {
     collect_item_specializations_for_function(
         records,
@@ -694,7 +695,7 @@ pub fn collect_getitem_specializations_for_function(
 pub fn collect_setitem_specializations_for_function(
     records: &[CounterDumpRecordView<'_>],
     module_name: &str,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
 ) -> Result<HashMap<InstrId, Vec<u64>>, String> {
     collect_item_specializations_for_function(
         records,
@@ -707,7 +708,7 @@ pub fn collect_setitem_specializations_for_function(
 fn collect_item_specializations_for_function(
     records: &[CounterDumpRecordView<'_>],
     module_name: &str,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     counter_kind: &str,
 ) -> Result<HashMap<InstrId, Vec<u64>>, String> {
     let mut out = HashMap::<InstrId, Vec<u64>>::new();
@@ -728,7 +729,7 @@ fn collect_item_specializations_for_function(
 pub fn collect_branch_preferences_for_function(
     records: &[CounterDumpRecordView<'_>],
     module_name: &str,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
 ) -> Result<HashMap<InstrId, bool>, String> {
     let mut counts = HashMap::<InstrId, [u64; 2]>::new();
     for record in records {
@@ -775,7 +776,7 @@ fn parse_block_label_text(text: &str) -> Option<BlockLabel> {
 pub fn collect_block_entry_counts_for_function(
     records: &[CounterDumpRecordView<'_>],
     module_name: &str,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
 ) -> Result<HashMap<BlockLabel, u64>, String> {
     let mut out = HashMap::<BlockLabel, u64>::new();
     for record in records {
@@ -887,7 +888,7 @@ pub fn collect_type_table(
 pub fn read_operator_specializations_from_file(
     path: &Path,
     module_name: &str,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
 ) -> Result<HashMap<InstrId, Vec<u64>>, String> {
     let dump = CounterDumpFile::open(path)?;
     let records = dump.records()?;
@@ -897,7 +898,7 @@ pub fn read_operator_specializations_from_file(
 pub fn read_getitem_specializations_from_file(
     path: &Path,
     module_name: &str,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
 ) -> Result<HashMap<InstrId, Vec<u64>>, String> {
     let dump = CounterDumpFile::open(path)?;
     let records = dump.records()?;
@@ -907,7 +908,7 @@ pub fn read_getitem_specializations_from_file(
 pub fn read_setitem_specializations_from_file(
     path: &Path,
     module_name: &str,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
 ) -> Result<HashMap<InstrId, Vec<u64>>, String> {
     let dump = CounterDumpFile::open(path)?;
     let records = dump.records()?;
@@ -917,7 +918,7 @@ pub fn read_setitem_specializations_from_file(
 pub fn read_branch_preferences_from_file(
     path: &Path,
     module_name: &str,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
 ) -> Result<HashMap<InstrId, bool>, String> {
     let dump = CounterDumpFile::open(path)?;
     let records = dump.records()?;
@@ -927,7 +928,7 @@ pub fn read_branch_preferences_from_file(
 pub fn read_block_entry_counts_from_file(
     path: &Path,
     module_name: &str,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
 ) -> Result<HashMap<BlockLabel, u64>, String> {
     let dump = CounterDumpFile::open(path)?;
     let records = dump.records()?;
@@ -1069,8 +1070,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "block_entry".to_string(),
                     site_kind: "block_entry".to_string(),
-                    function_id: Some(FunctionId::new(1, 7)),
-                    current_function_id: Some(FunctionId::new(1, 7)),
+                    function_id: Some(RuntimeFunctionId::new(1, 7)),
+                    current_function_id: Some(RuntimeFunctionId::new(1, 7)),
                     instr_id: None,
                     function_qualname: Some("f".to_string()),
                     block_label: Some("bb0".to_string()),
@@ -1083,8 +1084,8 @@ mod tests {
                     scope: "global".to_string(),
                     kind: "runtime_incref".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(FunctionId::global()),
-                    current_function_id: Some(FunctionId::global()),
+                    function_id: Some(RuntimeFunctionId::global()),
+                    current_function_id: Some(RuntimeFunctionId::global()),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(5), 3)),
                     function_qualname: None,
                     block_label: None,
@@ -1116,13 +1117,13 @@ mod tests {
         assert_eq!(record.row_count(), 2);
         let first_row = record.row(0).expect("first row");
         assert_eq!(first_row.counter_id, 3);
-        assert_eq!(first_row.function_id, Some(FunctionId::new(1, 7)));
+        assert_eq!(first_row.function_id, Some(RuntimeFunctionId::new(1, 7)));
         assert_eq!(first_row.instr_id, None);
         assert_eq!(first_row.block_label, Some("bb0"));
         assert_eq!(first_row.value, 11);
         let second_row = record.row(1).expect("second row");
         assert_eq!(second_row.counter_id, 4);
-        assert_eq!(second_row.function_id, Some(FunctionId::global()));
+        assert_eq!(second_row.function_id, Some(RuntimeFunctionId::global()));
         assert_eq!(
             second_row.instr_id,
             Some(InstrId::new(BlockLabel::from_index(5), 3))
@@ -1157,8 +1158,8 @@ mod tests {
                 scope: "this".to_string(),
                 kind: "block_entry".to_string(),
                 site_kind: "block_entry".to_string(),
-                function_id: Some(FunctionId::new(1, 7)),
-                current_function_id: Some(FunctionId::new(1, 7)),
+                function_id: Some(RuntimeFunctionId::new(1, 7)),
+                current_function_id: Some(RuntimeFunctionId::new(1, 7)),
                 instr_id: None,
                 function_qualname: Some("f".to_string()),
                 block_label: Some("bb0".to_string()),
@@ -1179,8 +1180,8 @@ mod tests {
                 scope: "global".to_string(),
                 kind: "runtime_incref".to_string(),
                 site_kind: "runtime".to_string(),
-                function_id: Some(FunctionId::global()),
-                current_function_id: Some(FunctionId::global()),
+                function_id: Some(RuntimeFunctionId::global()),
+                current_function_id: Some(RuntimeFunctionId::global()),
                 instr_id: Some(InstrId::new(BlockLabel::from_index(5), 3)),
                 function_qualname: None,
                 block_label: None,
@@ -1215,8 +1216,11 @@ mod tests {
         assert_eq!(first_row.scope, "this");
         assert_eq!(first_row.kind, "block_entry");
         assert_eq!(first_row.site_kind, "block_entry");
-        assert_eq!(first_row.function_id, Some(FunctionId::new(1, 7)));
-        assert_eq!(first_row.current_function_id, Some(FunctionId::new(1, 7)));
+        assert_eq!(first_row.function_id, Some(RuntimeFunctionId::new(1, 7)));
+        assert_eq!(
+            first_row.current_function_id,
+            Some(RuntimeFunctionId::new(1, 7))
+        );
         assert_eq!(first_row.instr_id, None);
         assert_eq!(first_row.function_qualname, Some("f"));
         assert_eq!(first_row.block_label, Some("bb0"));
@@ -1230,8 +1234,11 @@ mod tests {
         assert_eq!(second_row.scope, "global");
         assert_eq!(second_row.kind, "runtime_incref");
         assert_eq!(second_row.site_kind, "runtime");
-        assert_eq!(second_row.function_id, Some(FunctionId::global()));
-        assert_eq!(second_row.current_function_id, Some(FunctionId::global()));
+        assert_eq!(second_row.function_id, Some(RuntimeFunctionId::global()));
+        assert_eq!(
+            second_row.current_function_id,
+            Some(RuntimeFunctionId::global())
+        );
         assert_eq!(
             second_row.instr_id,
             Some(InstrId::new(BlockLabel::from_index(5), 3))
@@ -1404,13 +1411,13 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "call_hot_targets".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(FunctionId::new(1, 7)),
-                    current_function_id: Some(FunctionId::new(1, 7)),
+                    function_id: Some(RuntimeFunctionId::new(1, 7)),
+                    current_function_id: Some(RuntimeFunctionId::new(1, 7)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(2), 4)),
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
                     value: 11,
-                    observed_value: Some(FunctionId::new(1, 9).to_packed_runtime_u64()),
+                    observed_value: Some(RuntimeFunctionId::new(1, 9).to_packed_runtime_u64()),
                     max_overcount: Some(1),
                 },
                 CounterDumpRow {
@@ -1418,13 +1425,13 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "call_hot_targets".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(FunctionId::new(1, 7)),
-                    current_function_id: Some(FunctionId::new(1, 7)),
+                    function_id: Some(RuntimeFunctionId::new(1, 7)),
+                    current_function_id: Some(RuntimeFunctionId::new(1, 7)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(2), 4)),
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
                     value: 5,
-                    observed_value: Some(FunctionId::new(1, 10).to_packed_runtime_u64()),
+                    observed_value: Some(RuntimeFunctionId::new(1, 10).to_packed_runtime_u64()),
                     max_overcount: Some(0),
                 },
                 CounterDumpRow {
@@ -1432,13 +1439,13 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "call_hot_targets".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(FunctionId::new(1, 8)),
-                    current_function_id: Some(FunctionId::new(1, 8)),
+                    function_id: Some(RuntimeFunctionId::new(1, 8)),
+                    current_function_id: Some(RuntimeFunctionId::new(1, 8)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(3), 1)),
                     function_qualname: Some("pkg.mod.g".to_string()),
                     block_label: None,
                     value: 4,
-                    observed_value: Some(FunctionId::global().to_packed_runtime_u64()),
+                    observed_value: Some(RuntimeFunctionId::global().to_packed_runtime_u64()),
                     max_overcount: Some(0),
                 },
                 CounterDumpRow {
@@ -1446,8 +1453,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "call_hot_targets".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(FunctionId::new(1, 8)),
-                    current_function_id: Some(FunctionId::new(1, 8)),
+                    function_id: Some(RuntimeFunctionId::new(1, 8)),
+                    current_function_id: Some(RuntimeFunctionId::new(1, 8)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(3), 2)),
                     function_qualname: Some("pkg.mod.h".to_string()),
                     block_label: None,
@@ -1468,12 +1475,15 @@ mod tests {
         let collected = collect_call_target_specializations_for_function(
             &records,
             "mod",
-            FunctionId::new(1, 7),
+            RuntimeFunctionId::new(1, 7),
         )
         .expect("specializations should collect");
         assert_eq!(
             collected.get(&InstrId::new(BlockLabel::from_index(2), 4)),
-            Some(&vec![FunctionId::new(1, 9), FunctionId::new(1, 10)])
+            Some(&vec![
+                RuntimeFunctionId::new(1, 9),
+                RuntimeFunctionId::new(1, 10)
+            ])
         );
     }
 
@@ -1492,8 +1502,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "operator_hot_shapes".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(FunctionId::new(1, 7)),
-                    current_function_id: Some(FunctionId::new(1, 7)),
+                    function_id: Some(RuntimeFunctionId::new(1, 7)),
+                    current_function_id: Some(RuntimeFunctionId::new(1, 7)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(2), 4)),
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
@@ -1506,8 +1516,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "operator_hot_shapes".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(FunctionId::new(1, 7)),
-                    current_function_id: Some(FunctionId::new(1, 7)),
+                    function_id: Some(RuntimeFunctionId::new(1, 7)),
+                    current_function_id: Some(RuntimeFunctionId::new(1, 7)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(2), 4)),
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
@@ -1520,8 +1530,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "operator_hot_shapes".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(FunctionId::new(1, 7)),
-                    current_function_id: Some(FunctionId::new(1, 7)),
+                    function_id: Some(RuntimeFunctionId::new(1, 7)),
+                    current_function_id: Some(RuntimeFunctionId::new(1, 7)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(2), 4)),
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
@@ -1534,8 +1544,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "operator_hot_shapes".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(FunctionId::new(1, 8)),
-                    current_function_id: Some(FunctionId::new(1, 8)),
+                    function_id: Some(RuntimeFunctionId::new(1, 8)),
+                    current_function_id: Some(RuntimeFunctionId::new(1, 8)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(3), 1)),
                     function_qualname: Some("pkg.mod.g".to_string()),
                     block_label: None,
@@ -1548,8 +1558,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "operator_hot_shapes".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(FunctionId::new(1, 7)),
-                    current_function_id: Some(FunctionId::new(1, 7)),
+                    function_id: Some(RuntimeFunctionId::new(1, 7)),
+                    current_function_id: Some(RuntimeFunctionId::new(1, 7)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(2), 4)),
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
@@ -1563,9 +1573,12 @@ mod tests {
         let bytes = record.encode().expect("counter dump should encode");
         let records =
             parse_counter_dump_records(bytes.as_slice()).expect("counter dump should parse");
-        let collected =
-            collect_operator_specializations_for_function(&records, "mod", FunctionId::new(1, 7))
-                .expect("operator specializations should collect");
+        let collected = collect_operator_specializations_for_function(
+            &records,
+            "mod",
+            RuntimeFunctionId::new(1, 7),
+        )
+        .expect("operator specializations should collect");
         assert_eq!(
             collected.get(&InstrId::new(BlockLabel::from_index(2), 4)),
             Some(&vec![1, 257])
@@ -1591,8 +1604,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "getitem_hot_shapes".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(FunctionId::new(1, 7)),
-                    current_function_id: Some(FunctionId::new(1, 7)),
+                    function_id: Some(RuntimeFunctionId::new(1, 7)),
+                    current_function_id: Some(RuntimeFunctionId::new(1, 7)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(2), 4)),
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
@@ -1605,8 +1618,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "getitem_hot_shapes".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(FunctionId::new(1, 7)),
-                    current_function_id: Some(FunctionId::new(1, 7)),
+                    function_id: Some(RuntimeFunctionId::new(1, 7)),
+                    current_function_id: Some(RuntimeFunctionId::new(1, 7)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(2), 4)),
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
@@ -1619,8 +1632,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "getitem_hot_shapes".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(FunctionId::new(1, 8)),
-                    current_function_id: Some(FunctionId::new(1, 8)),
+                    function_id: Some(RuntimeFunctionId::new(1, 8)),
+                    current_function_id: Some(RuntimeFunctionId::new(1, 8)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(3), 1)),
                     function_qualname: Some("pkg.mod.g".to_string()),
                     block_label: None,
@@ -1633,8 +1646,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "getitem_hot_shapes".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(FunctionId::new(1, 7)),
-                    current_function_id: Some(FunctionId::new(1, 7)),
+                    function_id: Some(RuntimeFunctionId::new(1, 7)),
+                    current_function_id: Some(RuntimeFunctionId::new(1, 7)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(2), 4)),
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
@@ -1648,9 +1661,12 @@ mod tests {
         let bytes = record.encode().expect("counter dump should encode");
         let records =
             parse_counter_dump_records(bytes.as_slice()).expect("counter dump should parse");
-        let collected =
-            collect_getitem_specializations_for_function(&records, "mod", FunctionId::new(1, 7))
-                .expect("getitem specializations should collect");
+        let collected = collect_getitem_specializations_for_function(
+            &records,
+            "mod",
+            RuntimeFunctionId::new(1, 7),
+        )
+        .expect("getitem specializations should collect");
         assert_eq!(
             collected.get(&InstrId::new(BlockLabel::from_index(2), 4)),
             Some(&vec![1])
@@ -1676,8 +1692,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "setitem_hot_shapes".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(FunctionId::new(1, 7)),
-                    current_function_id: Some(FunctionId::new(1, 7)),
+                    function_id: Some(RuntimeFunctionId::new(1, 7)),
+                    current_function_id: Some(RuntimeFunctionId::new(1, 7)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(2), 4)),
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
@@ -1690,8 +1706,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "setitem_hot_shapes".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(FunctionId::new(1, 7)),
-                    current_function_id: Some(FunctionId::new(1, 7)),
+                    function_id: Some(RuntimeFunctionId::new(1, 7)),
+                    current_function_id: Some(RuntimeFunctionId::new(1, 7)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(2), 4)),
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
@@ -1704,8 +1720,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "setitem_hot_shapes".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(FunctionId::new(1, 8)),
-                    current_function_id: Some(FunctionId::new(1, 8)),
+                    function_id: Some(RuntimeFunctionId::new(1, 8)),
+                    current_function_id: Some(RuntimeFunctionId::new(1, 8)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(3), 1)),
                     function_qualname: Some("pkg.mod.g".to_string()),
                     block_label: None,
@@ -1718,8 +1734,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "setitem_hot_shapes".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(FunctionId::new(1, 7)),
-                    current_function_id: Some(FunctionId::new(1, 7)),
+                    function_id: Some(RuntimeFunctionId::new(1, 7)),
+                    current_function_id: Some(RuntimeFunctionId::new(1, 7)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(2), 4)),
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
@@ -1733,9 +1749,12 @@ mod tests {
         let bytes = record.encode().expect("counter dump should encode");
         let records =
             parse_counter_dump_records(bytes.as_slice()).expect("counter dump should parse");
-        let collected =
-            collect_setitem_specializations_for_function(&records, "mod", FunctionId::new(1, 7))
-                .expect("setitem specializations should collect");
+        let collected = collect_setitem_specializations_for_function(
+            &records,
+            "mod",
+            RuntimeFunctionId::new(1, 7),
+        )
+        .expect("setitem specializations should collect");
         assert_eq!(
             collected.get(&InstrId::new(BlockLabel::from_index(2), 4)),
             Some(&vec![1])
@@ -1763,8 +1782,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "branch_outcomes".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(FunctionId::new(1, 7)),
-                    current_function_id: Some(FunctionId::new(1, 7)),
+                    function_id: Some(RuntimeFunctionId::new(1, 7)),
+                    current_function_id: Some(RuntimeFunctionId::new(1, 7)),
                     instr_id: Some(hot_false_site),
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
@@ -1777,8 +1796,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "branch_outcomes".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(FunctionId::new(1, 7)),
-                    current_function_id: Some(FunctionId::new(1, 7)),
+                    function_id: Some(RuntimeFunctionId::new(1, 7)),
+                    current_function_id: Some(RuntimeFunctionId::new(1, 7)),
                     instr_id: Some(hot_false_site),
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
@@ -1791,8 +1810,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "branch_outcomes".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(FunctionId::new(1, 7)),
-                    current_function_id: Some(FunctionId::new(1, 7)),
+                    function_id: Some(RuntimeFunctionId::new(1, 7)),
+                    current_function_id: Some(RuntimeFunctionId::new(1, 7)),
                     instr_id: Some(hot_true_site),
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
@@ -1807,7 +1826,7 @@ mod tests {
         let records =
             parse_counter_dump_records(bytes.as_slice()).expect("counter dump should parse");
         let collected =
-            collect_branch_preferences_for_function(&records, "mod", FunctionId::new(1, 7))
+            collect_branch_preferences_for_function(&records, "mod", RuntimeFunctionId::new(1, 7))
                 .expect("branch preferences should collect");
 
         assert_eq!(collected.get(&hot_false_site), Some(&false));

@@ -1,9 +1,9 @@
 use crate::counter_dump::{CounterDumpFile, collect_type_key_layouts, collect_type_table};
 use anyhow::{Context, Result, bail};
 use soac_blockpy::block_py::{
-    BlockPyFunction, BlockPyModule, ChildVisitable, FunctionId, HasSemanticInstrId, InstrCodegen,
-    InstrId, Literal, LocalFunctionId, ModuleContentId, NameLocation, PersistentFunctionId,
-    SerializedFunctionDebugName, SerializedFunctionId, SerializedIdentityTables,
+    BlockPyFunction, BlockPyModule, ChildVisitable, HasSemanticInstrId, InstrCodegen, InstrId,
+    Literal, LocalFunctionId, ModuleContentId, NameLocation, PersistentFunctionId,
+    RuntimeFunctionId, SerializedFunctionDebugName, SerializedFunctionId, SerializedIdentityTables,
     SerializedModuleId, SerializedModuleIdentity, Visit,
 };
 use soac_blockpy::codegen_cache::{CachedCodegenModuleMetadata, PythonModuleCacheSource};
@@ -14,7 +14,7 @@ use std::path::Path;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FunctionProfileEvidence {
-    pub call_target_specializations: HashMap<InstrId, Vec<FunctionId>>,
+    pub call_target_specializations: HashMap<InstrId, Vec<RuntimeFunctionId>>,
     pub operator_specializations: HashMap<InstrId, Vec<u64>>,
     pub getitem_specializations: HashMap<InstrId, Vec<u64>>,
     pub setitem_specializations: HashMap<InstrId, Vec<u64>>,
@@ -36,7 +36,7 @@ struct PersistentFunctionProfileEvidence {
 pub struct ProfileEvidenceStore {
     functions: HashMap<PersistentFunctionId, PersistentFunctionProfileEvidence>,
     module_source_hashes: HashMap<String, u64>,
-    function_targets: HashMap<FunctionId, PersistentFunctionId>,
+    function_targets: HashMap<RuntimeFunctionId, PersistentFunctionId>,
     module_targets_by_runtime_id: HashMap<u32, PlannedModuleTarget>,
     ambiguous_module_runtime_ids: HashSet<u32>,
     field_index_specializations_by_attr: HashMap<String, Vec<PlannedIndexedFieldSpecialization>>,
@@ -63,8 +63,8 @@ impl FunctionOptimizationPlan {
         self.function.local_function_id()
     }
 
-    pub const fn runtime_function_id(&self, module_id: u32) -> FunctionId {
-        FunctionId::new(module_id, self.local_function_id().as_u32())
+    pub const fn runtime_function_id(&self, module_id: u32) -> RuntimeFunctionId {
+        RuntimeFunctionId::new(module_id, self.local_function_id().as_u32())
     }
 }
 
@@ -244,8 +244,8 @@ impl ProfileEvidenceStore {
                         if observed_value == 0 {
                             continue;
                         }
-                        let observed = FunctionId::from_packed_runtime_u64(observed_value);
-                        if observed == FunctionId::global() {
+                        let observed = RuntimeFunctionId::from_packed_runtime_u64(observed_value);
+                        if observed == RuntimeFunctionId::global() {
                             continue;
                         }
                         let Some(observed) = store.function_target(observed) else {
@@ -348,7 +348,7 @@ impl ProfileEvidenceStore {
         &self,
         module_name: &str,
         source_hash: u64,
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
     ) -> PersistentFunctionProfileEvidence {
         let function_id =
             persistent_function_id_for_counter_row(module_name, source_hash, function_id);
@@ -362,8 +362,8 @@ impl ProfileEvidenceStore {
         self.module_source_hashes.get(module_name).copied()
     }
 
-    pub fn function_target(&self, function_id: FunctionId) -> Option<PersistentFunctionId> {
-        if function_id == FunctionId::global()
+    pub fn function_target(&self, function_id: RuntimeFunctionId) -> Option<PersistentFunctionId> {
+        if function_id == RuntimeFunctionId::global()
             || self
                 .ambiguous_module_runtime_ids
                 .contains(&function_id.runtime_module_id().as_u32())
@@ -401,7 +401,7 @@ impl ProfileEvidenceStore {
 fn persistent_function_id_for_counter_row(
     module_name: &str,
     source_hash: u64,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
 ) -> PersistentFunctionId {
     PersistentFunctionId::new(
         ModuleContentId::new(module_name, source_hash),
@@ -412,11 +412,11 @@ fn persistent_function_id_for_counter_row(
 impl ProfileEvidenceStore {
     fn record_function_target(
         &mut self,
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
         module_name: &str,
         source_hash: u64,
     ) {
-        if function_id == FunctionId::global() {
+        if function_id == RuntimeFunctionId::global() {
             return;
         }
         self.record_module_target(
@@ -663,7 +663,7 @@ impl OptimizationPlan {
     pub fn evidence_for_local_function(
         &self,
         local_function_id: LocalFunctionId,
-        call_target_resolver: impl Fn(&PersistentFunctionId) -> Result<Option<FunctionId>>,
+        call_target_resolver: impl Fn(&PersistentFunctionId) -> Result<Option<RuntimeFunctionId>>,
     ) -> Result<FunctionProfileEvidence> {
         let Some(function) = self
             .functions
@@ -681,7 +681,7 @@ impl OptimizationPlan {
 
     pub fn evidence_by_local_function(
         &self,
-        call_target_resolver: impl Fn(&PersistentFunctionId) -> Result<Option<FunctionId>>,
+        call_target_resolver: impl Fn(&PersistentFunctionId) -> Result<Option<RuntimeFunctionId>>,
     ) -> Result<HashMap<LocalFunctionId, FunctionProfileEvidence>> {
         let mut out = HashMap::new();
         for function in &self.functions {
@@ -698,7 +698,7 @@ impl OptimizationPlan {
         &self,
         decision: &OptimizationDecision,
         evidence: &mut FunctionProfileEvidence,
-        call_target_resolver: &impl Fn(&PersistentFunctionId) -> Result<Option<FunctionId>>,
+        call_target_resolver: &impl Fn(&PersistentFunctionId) -> Result<Option<RuntimeFunctionId>>,
     ) -> Result<()> {
         match &decision.replacement {
             PlannedReplacement::Guarded {
@@ -728,7 +728,7 @@ impl OptimizationPlan {
         instr_id: InstrId,
         alternative: &PlannedAlternative,
         evidence: &mut FunctionProfileEvidence,
-        call_target_resolver: &impl Fn(&PersistentFunctionId) -> Result<Option<FunctionId>>,
+        call_target_resolver: &impl Fn(&PersistentFunctionId) -> Result<Option<RuntimeFunctionId>>,
     ) -> Result<()> {
         match &alternative.action {
             PlannedAction::DirectCall { target } => {
@@ -1264,9 +1264,9 @@ mod tests {
 
     #[test]
     fn profile_evidence_store_loads_counter_dump_once_into_function_views() {
-        let function_id = FunctionId::new(7, 1);
+        let function_id = RuntimeFunctionId::new(7, 1);
         let instr_id = InstrId::new(BlockLabel::from_index(3), 4);
-        let target_id = FunctionId::new(7, 2);
+        let target_id = RuntimeFunctionId::new(7, 2);
         let target_persistent = PersistentFunctionId::new(
             ModuleContentId::new("pkg.mod", 0x1234),
             target_id.local_function_id(),
@@ -1441,9 +1441,9 @@ mod tests {
 
     #[test]
     fn profile_evidence_store_synthesizes_targets_from_loaded_module_identity() {
-        let caller_id = FunctionId::new(7, 1);
-        let target_id = FunctionId::new(8, 2);
-        let unrelated_callee_id = FunctionId::new(8, 99);
+        let caller_id = RuntimeFunctionId::new(7, 1);
+        let target_id = RuntimeFunctionId::new(8, 2);
+        let unrelated_callee_id = RuntimeFunctionId::new(8, 99);
         let instr_id = InstrId::new(BlockLabel::from_index(3), 4);
         let caller_record = CounterDumpRecord {
             source_hash: 0x1234,
@@ -1540,7 +1540,7 @@ mod tests {
 
     fn row(
         kind: &str,
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
         instr_id: InstrId,
         value: u64,
         observed_value: Option<u64>,

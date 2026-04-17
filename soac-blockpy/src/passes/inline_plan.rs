@@ -1,5 +1,5 @@
 use crate::block_py::pretty::BlockPyPrettyPrint;
-use crate::block_py::{FunctionId, LocalLocation};
+use crate::block_py::{LocalLocation, RuntimeFunctionId};
 use crate::passes::{
     ConstructorFieldStore, ConstructorFieldValue, EscapeSummaryModule,
     FieldInitializerConstructorSummary, NonEscapingConstructorAllocationSummary,
@@ -10,17 +10,17 @@ use std::collections::HashMap;
     Clone, Debug, Default, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
 pub struct InlinePlanModule {
-    pub functions: HashMap<FunctionId, FunctionInlinePlan>,
+    pub functions: HashMap<RuntimeFunctionId, FunctionInlinePlan>,
 }
 
 impl InlinePlanModule {
-    pub fn function(&self, function_id: FunctionId) -> Option<&FunctionInlinePlan> {
+    pub fn function(&self, function_id: RuntimeFunctionId) -> Option<&FunctionInlinePlan> {
         self.functions.get(&function_id)
     }
 
     pub fn straightline_constructor(
         &self,
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
     ) -> Option<&StraightlineConstructorInlinePlan> {
         self.function(function_id)
             .and_then(|plan| plan.straightline_constructor.as_ref())
@@ -28,13 +28,16 @@ impl InlinePlanModule {
 
     pub fn non_escaping_constructor_allocations(
         &self,
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
     ) -> Option<&[NonEscapingConstructorAllocationSummary]> {
         self.function(function_id)
             .map(|plan| plan.non_escaping_constructor_allocations.as_slice())
     }
 
-    pub fn remap_function_ids(&mut self, remap: impl Fn(FunctionId) -> FunctionId + Copy) {
+    pub fn remap_function_ids(
+        &mut self,
+        remap: impl Fn(RuntimeFunctionId) -> RuntimeFunctionId + Copy,
+    ) {
         self.functions = std::mem::take(&mut self.functions)
             .into_iter()
             .map(|(function_id, mut plan)| {
@@ -86,7 +89,10 @@ pub struct FunctionInlinePlan {
 }
 
 impl FunctionInlinePlan {
-    fn remap_function_ids(&mut self, remap: impl Fn(FunctionId) -> FunctionId + Copy) {
+    fn remap_function_ids(
+        &mut self,
+        remap: impl Fn(RuntimeFunctionId) -> RuntimeFunctionId + Copy,
+    ) {
         for allocation in &mut self.non_escaping_constructor_allocations {
             allocation.constructor_function_id = remap(allocation.constructor_function_id);
         }
@@ -218,8 +224,8 @@ class Box:
 
     #[test]
     fn carries_non_escaping_constructor_allocations() {
-        let caller_id = FunctionId::new(1, 10);
-        let constructor_id = FunctionId::new(1, 20);
+        let caller_id = RuntimeFunctionId::new(1, 10);
+        let constructor_id = RuntimeFunctionId::new(1, 20);
         let escape_summary = EscapeSummaryModule {
             functions: HashMap::from([(
                 caller_id,

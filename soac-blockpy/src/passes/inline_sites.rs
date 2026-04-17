@@ -1,6 +1,6 @@
 use crate::block_py::{
     walk_block, walk_expr, BlockLabel, BlockPyModule, CallArgKeyword, CallArgPositional,
-    ChildVisitable, FunctionId, HasMeta, InstrCodegen, InstrId, Visit,
+    ChildVisitable, HasMeta, InstrCodegen, InstrId, RuntimeFunctionId, Visit,
 };
 use crate::passes::{CodegenModuleShape, InlinePlanModule, InstrCodegenOp};
 
@@ -11,8 +11,8 @@ pub struct InlineCallSiteModule {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StraightlineConstructorCallSite {
-    pub caller_function_id: FunctionId,
-    pub callee_function_id: FunctionId,
+    pub caller_function_id: RuntimeFunctionId,
+    pub callee_function_id: RuntimeFunctionId,
     pub block_label: BlockLabel,
     pub instr_id: Option<InstrId>,
     pub positional_arg_count: usize,
@@ -43,7 +43,7 @@ pub fn collect_inline_call_sites(
 struct InlineCallSiteCollector<'a> {
     inline_plan: &'a InlinePlanModule,
     sites: &'a mut InlineCallSiteModule,
-    caller_function_id: FunctionId,
+    caller_function_id: RuntimeFunctionId,
     block_label: BlockLabel,
 }
 

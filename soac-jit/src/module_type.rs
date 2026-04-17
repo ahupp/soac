@@ -13,7 +13,7 @@ use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyAnyMethods, PyList, PyTuple};
 use soac_blockpy::block_py::{
     BlockPyFunction, BlockPyModule, CounterDef, CounterId, CounterScope, CounterSite,
-    DeoptEntrySource, FunctionExecutionMode, FunctionId, RuntimeName,
+    DeoptEntrySource, FunctionExecutionMode, RuntimeFunctionId, RuntimeName,
 };
 use soac_blockpy::codegen_cache::PythonModuleCacheSource;
 use soac_blockpy::env_config::SoacEnvConfig;
@@ -74,8 +74,8 @@ pub struct SharedModuleState {
     pub module_cache_source: Option<PythonModuleCacheSource>,
     pub codegen_constants: ModuleCodegenConstants,
     storage_instance_key: usize,
-    function_index_by_id: HashMap<FunctionId, usize>,
-    original_code_by_function_id: HashMap<FunctionId, Py<PyAny>>,
+    function_index_by_id: HashMap<RuntimeFunctionId, usize>,
+    original_code_by_function_id: HashMap<RuntimeFunctionId, Py<PyAny>>,
     module_constant_objs: Vec<Py<PyAny>>,
     // Each non-null slot owns one runtime-name reference for this module state; lookups return a
     // fresh owned reference by INCREFing the cached pointer.
@@ -168,7 +168,7 @@ impl SharedModuleState {
 
     pub fn lookup_function(
         &self,
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
     ) -> Option<&BlockPyFunction<CodegenModuleShape>> {
         let function_index = self.function_index_by_id.get(&function_id).copied()?;
         let function = self.lowered_module.callable_defs.get(function_index)?;
@@ -179,9 +179,9 @@ impl SharedModuleState {
     pub(crate) fn lookup_direct_call_target_function(
         &self,
         compile_session: &crate::session::CompileSession,
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
     ) -> Result<Option<BlockPyFunction<CodegenModuleShape>>, String> {
-        if function_id == FunctionId::global() {
+        if function_id == RuntimeFunctionId::global() {
             return Ok(None);
         }
         if let Some(function) = self.lookup_function(function_id) {
@@ -195,7 +195,7 @@ impl SharedModuleState {
             .map(|(_shared_state, function)| function))
     }
 
-    pub fn lookup_original_code(&self, function_id: FunctionId) -> Option<&Py<PyAny>> {
+    pub fn lookup_original_code(&self, function_id: RuntimeFunctionId) -> Option<&Py<PyAny>> {
         self.original_code_by_function_id.get(&function_id)
     }
 
@@ -261,12 +261,12 @@ impl SharedModuleState {
     pub(crate) fn lookup_or_compile_direct_function_handle(
         &self,
         compile_session: &Arc<crate::session::CompileSession>,
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
     ) -> Result<Option<(Arc<crate::jit::CompiledFunctionHandle>, bool)>, String> {
-        if function_id == FunctionId::global() {
+        if function_id == RuntimeFunctionId::global() {
             return Ok(None);
         }
-        if function_id != FunctionId::global()
+        if function_id != RuntimeFunctionId::global()
             && function_id.runtime_module_id().as_u32() != self.module_id()
         {
             let Some((shared_state, _function)) =
@@ -485,8 +485,8 @@ impl SharedModuleState {
                     instr_id,
                 } => (
                     "runtime".to_string(),
-                    Some(function_id.unwrap_or(FunctionId::global())),
-                    Some(function_id.unwrap_or(FunctionId::global())),
+                    Some(function_id.unwrap_or(RuntimeFunctionId::global())),
+                    Some(function_id.unwrap_or(RuntimeFunctionId::global())),
                     *instr_id,
                     function_id.and_then(|function_id| {
                         self.lookup_function(function_id)
@@ -807,7 +807,7 @@ pub(crate) fn build_shared_state_for_testing_with_original_code(
     lowered_module: BlockPyModule<CodegenModuleShape>,
     module_name: &str,
     package_name: &str,
-    original_code_by_function_id: HashMap<FunctionId, Py<PyAny>>,
+    original_code_by_function_id: HashMap<RuntimeFunctionId, Py<PyAny>>,
 ) -> PyResult<Arc<SharedModuleState>> {
     build_shared_state_for_inspection_with_original_code(
         py,
@@ -823,7 +823,7 @@ fn build_shared_state_for_inspection_with_original_code(
     lowered_module: BlockPyModule<CodegenModuleShape>,
     module_name: &str,
     package_name: &str,
-    original_code_by_function_id: HashMap<FunctionId, Py<PyAny>>,
+    original_code_by_function_id: HashMap<RuntimeFunctionId, Py<PyAny>>,
 ) -> PyResult<Arc<SharedModuleState>> {
     let function_index_by_id = build_function_index_by_id(&lowered_module)?;
     let (counter_slots_by_id, counter_values, top_value_counters) =
@@ -869,7 +869,7 @@ pub(crate) fn build_shared_state_for_testing(
 
 fn build_function_index_by_id(
     module: &BlockPyModule<CodegenModuleShape>,
-) -> PyResult<HashMap<FunctionId, usize>> {
+) -> PyResult<HashMap<RuntimeFunctionId, usize>> {
     let mut function_index_by_id = HashMap::with_capacity(module.callable_defs.len());
     for (function_index, function) in module.callable_defs.iter().enumerate() {
         if function_index_by_id
@@ -902,7 +902,7 @@ impl SoacExtModuleState {
         py: Python<'_>,
         compile_session: &Arc<crate::session::CompileSession>,
         lowered_module: BlockPyModule<CodegenModuleShape>,
-        original_code_by_function_id: HashMap<FunctionId, Py<PyAny>>,
+        original_code_by_function_id: HashMap<RuntimeFunctionId, Py<PyAny>>,
         module_name: String,
         package_name: String,
         source_hash: u64,
@@ -1533,7 +1533,7 @@ impl SoacExtModule {
         compile_session: &Arc<crate::session::CompileSession>,
         mut lowered_module: BlockPyModule<CodegenModuleShape>,
         mut module_info: ModuleInfo,
-        original_code_by_function_id: HashMap<FunctionId, Py<PyAny>>,
+        original_code_by_function_id: HashMap<RuntimeFunctionId, Py<PyAny>>,
     ) -> PyResult<Py<PyAny>> {
         ensure_module_dict_metadata_names(&mut lowered_module.global_names);
         module_info.indexed_module_keys = lowered_module.global_names.clone();
@@ -1741,7 +1741,7 @@ def f(x):
                 scope: CounterScope::Function,
                 kind: "runtime_incref".to_string(),
                 site: CounterSite::Runtime {
-                    function_id: Some(FunctionId::new(0, 7)),
+                    function_id: Some(RuntimeFunctionId::new(0, 7)),
                     instr_id: None,
                 },
             },
@@ -1750,7 +1750,7 @@ def f(x):
                 scope: CounterScope::Function,
                 kind: "runtime_incref".to_string(),
                 site: CounterSite::Runtime {
-                    function_id: Some(FunctionId::new(0, 7)),
+                    function_id: Some(RuntimeFunctionId::new(0, 7)),
                     instr_id: None,
                 },
             },
@@ -1777,7 +1777,7 @@ def f(x):
                 scope: CounterScope::This,
                 kind: "block_entry".to_string(),
                 site: CounterSite::BlockEntry {
-                    function_id: FunctionId::new(0, 7),
+                    function_id: RuntimeFunctionId::new(0, 7),
                     block_label: soac_blockpy::block_py::BlockLabel::from_index(0),
                 },
             },

@@ -3,11 +3,11 @@ use soac_blockpy::block_py::{
     AbruptKind, BinOp, BinOpKind, BlockArg, BlockEdge, BlockLabel, BlockParam, BlockParamRole,
     BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional, CallDirect,
     CalleeFunctionId, CellLocation, CellRef, ChildVisitable, ClosureInit, ClosureSlot,
-    CodegenBlock, CounterDef, CounterSite, Del, DelItem, FunctionId, FunctionKind, FunctionName,
-    GetAttr, GetItem, HasMeta, HasSemanticInstrId, IncrementCounter, InstrCodegen, InstrResolved,
-    Literal, LiteralValue, Load, LocalFunctionId, LocalLocation, MakeCell, Meta, ModuleNameGen,
-    NameLike, NameLocation, NumberLiteral, NumberLiteralValue, Param, ParamKind, ParamSpec,
-    ResolvedName, RuntimeName, SerializedFunctionDebugName, SerializedFunctionId,
+    CodegenBlock, CounterDef, CounterSite, Del, DelItem, FunctionKind, FunctionName, GetAttr,
+    GetItem, HasMeta, HasSemanticInstrId, IncrementCounter, InstrCodegen, InstrResolved, Literal,
+    LiteralValue, Load, LocalFunctionId, LocalLocation, MakeCell, Meta, ModuleNameGen, NameLike,
+    NameLocation, NumberLiteral, NumberLiteralValue, Param, ParamKind, ParamSpec, ResolvedName,
+    RuntimeFunctionId, RuntimeName, SerializedFunctionDebugName, SerializedFunctionId,
     SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity, SetAttr, SetItem,
     StorageLayout, Store, StringLiteral, Tuple, UnaryOp, UnaryOpKind, Visit, VisitMut, WithMeta,
 };
@@ -641,11 +641,11 @@ def f():
             assert_ne!(
                 direct_function_symbol_scope_for_shared_state(
                     first.as_ref(),
-                    FunctionId::new(0, 1)
+                    RuntimeFunctionId::new(0, 1)
                 ),
                 direct_function_symbol_scope_for_shared_state(
                     second.as_ref(),
-                    FunctionId::new(0, 1)
+                    RuntimeFunctionId::new(0, 1)
                 )
             );
         });
@@ -1281,7 +1281,7 @@ def add_default(left, right=9):
     }
 
     type OriginalCodeByQualname = HashMap<String, VecDeque<Py<PyAny>>>;
-    type OriginalCodeMap = HashMap<FunctionId, Py<PyAny>>;
+    type OriginalCodeMap = HashMap<RuntimeFunctionId, Py<PyAny>>;
 
     fn compile_original_module_code_for_test(py: Python<'_>, source: &str) -> PyResult<Py<PyAny>> {
         let code = PyModule::import(py, "builtins")?
@@ -3043,7 +3043,7 @@ def build(values):
 
     fn test_serialized_function_id(
         serialized_module_id: u32,
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
     ) -> SerializedFunctionId {
         SerializedFunctionId::new(
             SerializedModuleId::new(serialized_module_id),
@@ -3053,7 +3053,7 @@ def build(values):
 
     fn test_planned_function_target(
         serialized_module_id: u32,
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
     ) -> PlannedFunctionTarget {
         PlannedFunctionTarget::new(test_serialized_function_id(
             serialized_module_id,
@@ -3230,7 +3230,7 @@ def build(values):
         compile_session: &crate::session::CompileSession,
         direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
         symbol_scope: Option<&str>,
-        predeclared_direct_functions: Option<&HashMap<FunctionId, DeclaredJitFunction>>,
+        predeclared_direct_functions: Option<&HashMap<RuntimeFunctionId, DeclaredJitFunction>>,
         options: BuildSpecializedFunctionOptions,
     ) -> Result<BuiltSpecializedFunction, String> {
         let value_facts = infer_jit_value_facts(module);
@@ -3872,7 +3872,7 @@ def build(values):
         };
         call.access = soac_blockpy::passes::TypedCallAccessPlan::GuardedCallable {
             function_guards: vec![soac_blockpy::passes::TypedDirectFunctionCallGuard {
-                function_id: FunctionId::new(0, 1),
+                function_id: RuntimeFunctionId::new(0, 1),
                 arg_plan: soac_blockpy::passes::TypedDirectCallArgPlan {
                     sources: vec![soac_blockpy::passes::TypedDirectCallArgSource::Provided(0)],
                 },
@@ -3918,7 +3918,7 @@ def build(values):
         let call = with_instr_id(
             InstrCodegen::CallDirect(CallDirect::new(
                 with_instr_id(name_expr(test_global_name("callee")), callable_instr_id),
-                FunctionId::new(0, 1),
+                RuntimeFunctionId::new(0, 1),
                 vec![CallArgPositional::Positional(with_instr_id(
                     constants.int_expr(1),
                     positional_instr_id,
@@ -3952,7 +3952,7 @@ def build(values):
         let positional_instr_id = InstrId::new(BlockLabel::from_index(0), 2);
         let call = InstrCodegen::CallDirect(CallDirect::new(
             name_expr(test_global_name("callee")),
-            FunctionId::new(0, 1),
+            RuntimeFunctionId::new(0, 1),
             vec![CallArgPositional::Positional(with_instr_id(
                 name_expr(test_name("x")),
                 positional_instr_id,
@@ -4388,7 +4388,7 @@ def build(values):
         );
     }
 
-    fn direct_call_expr(function_id: FunctionId) -> InstrCodegen {
+    fn direct_call_expr(function_id: RuntimeFunctionId) -> InstrCodegen {
         InstrCodegen::CallDirect(CallDirect::new(
             none_expr(),
             function_id,
@@ -8480,7 +8480,7 @@ def f(x):
             vec![],
             ret_term(InstrCodegen::CallDirect(CallDirect::new(
                 name_expr(test_constant_name(0)),
-                FunctionId::new(0, 999),
+                RuntimeFunctionId::new(0, 999),
                 vec![CallArgPositional::Positional(name_expr(
                     test_constant_name(1),
                 ))],
@@ -10934,7 +10934,7 @@ def g():
                 assert_eq!(
                     crate::PyFunction_SetSoacMetadata(
                         callable,
-                        FunctionId::from_packed_runtime_u64(1).to_packed_runtime_u64(),
+                        RuntimeFunctionId::from_packed_runtime_u64(1).to_packed_runtime_u64(),
                         std::ptr::null_mut(),
                         None,
                     ),
@@ -12171,7 +12171,7 @@ def g():
                 vec![],
                 ret_term(InstrCodegen::CallDirect(CallDirect::new(
                     name_expr(test_constant_name(0)),
-                    FunctionId::new(0, 999),
+                    RuntimeFunctionId::new(0, 999),
                     vec![CallArgPositional::Positional(name_expr(
                         test_constant_name(1),
                     ))],
@@ -19206,7 +19206,7 @@ def f(x, y):
 
     #[test]
     fn profiled_runtime_iter_receiver_call_direct_requires_straightline_constructor() {
-        let constructor_id = FunctionId::new(7, 11);
+        let constructor_id = RuntimeFunctionId::new(7, 11);
         let receiver = InstrCodegen::Call(Call::new(
             name_expr(test_global_name("RangeLike")),
             vec![CallArgPositional::Positional(name_expr(test_local_name(

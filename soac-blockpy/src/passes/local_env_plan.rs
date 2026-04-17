@@ -6,8 +6,8 @@
 //! stack-slot loads, or another resume-state representation.
 
 use crate::block_py::{
-    BlockLabel, BlockPyFunction, BlockPyModule, FunctionId, HasSemanticInstrId, InstrCodegen,
-    InstrKey, LocalLocation,
+    BlockLabel, BlockPyFunction, BlockPyModule, HasSemanticInstrId, InstrCodegen, InstrKey,
+    LocalLocation, RuntimeFunctionId,
 };
 use crate::passes::ownership_effects::{
     compute_function_local_live_ins, compute_function_local_must_bound_ins,
@@ -110,15 +110,18 @@ impl FunctionLocalPlan {
     Clone, Debug, Default, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
 pub struct LocalEnvModulePlan {
-    pub functions: HashMap<FunctionId, FunctionLocalPlan>,
+    pub functions: HashMap<RuntimeFunctionId, FunctionLocalPlan>,
 }
 
 impl LocalEnvModulePlan {
-    pub fn function(&self, function_id: FunctionId) -> Option<&FunctionLocalPlan> {
+    pub fn function(&self, function_id: RuntimeFunctionId) -> Option<&FunctionLocalPlan> {
         self.functions.get(&function_id)
     }
 
-    pub fn remap_function_ids(&mut self, remap: impl Fn(FunctionId) -> FunctionId + Copy) {
+    pub fn remap_function_ids(
+        &mut self,
+        remap: impl Fn(RuntimeFunctionId) -> RuntimeFunctionId + Copy,
+    ) {
         self.functions = std::mem::take(&mut self.functions)
             .into_iter()
             .map(|(function_id, plan)| (remap(function_id), plan))
@@ -148,20 +151,20 @@ pub enum LocalEnvResumeStatePrecision {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum LocalEnvResumePoint {
     BlockEntry {
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
         block: BlockLabel,
     },
     BeforeInstr {
         key: InstrKey,
     },
     BeforeTerm {
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
         block: BlockLabel,
     },
 }
 
 impl LocalEnvResumePoint {
-    pub const fn function_id(self) -> FunctionId {
+    pub const fn function_id(self) -> RuntimeFunctionId {
         match self {
             Self::BlockEntry { function_id, .. } | Self::BeforeTerm { function_id, .. } => {
                 function_id
@@ -177,7 +180,10 @@ impl LocalEnvResumePoint {
         }
     }
 
-    pub fn remap_function_ids(&mut self, remap: impl Fn(FunctionId) -> FunctionId + Copy) {
+    pub fn remap_function_ids(
+        &mut self,
+        remap: impl Fn(RuntimeFunctionId) -> RuntimeFunctionId + Copy,
+    ) {
         match self {
             Self::BlockEntry { function_id, .. } | Self::BeforeTerm { function_id, .. } => {
                 *function_id = remap(*function_id);
@@ -225,7 +231,10 @@ pub enum LocalEnvResumeValueSource {
 }
 
 impl LocalEnvResumeValueSource {
-    pub fn remap_function_ids(&mut self, remap: impl Fn(FunctionId) -> FunctionId + Copy) {
+    pub fn remap_function_ids(
+        &mut self,
+        remap: impl Fn(RuntimeFunctionId) -> RuntimeFunctionId + Copy,
+    ) {
         if let Self::StoredValue(key) = self {
             key.function_id = remap(key.function_id);
         }
@@ -256,7 +265,7 @@ impl FunctionLocalEnvResumePlan {
 
     pub fn block_entry(
         &self,
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
         block: BlockLabel,
     ) -> Option<&LocalEnvResumeEntry> {
         self.entry(LocalEnvResumePoint::BlockEntry { function_id, block })
@@ -268,7 +277,7 @@ impl FunctionLocalEnvResumePlan {
 
     pub fn before_term(
         &self,
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
         block: BlockLabel,
     ) -> Option<&LocalEnvResumeEntry> {
         self.entry(LocalEnvResumePoint::BeforeTerm { function_id, block })
@@ -283,7 +292,10 @@ impl FunctionLocalEnvResumePlan {
             .filter(move |entry| entry.point.block_label() == block)
     }
 
-    pub fn remap_function_ids(&mut self, remap: impl Fn(FunctionId) -> FunctionId + Copy) {
+    pub fn remap_function_ids(
+        &mut self,
+        remap: impl Fn(RuntimeFunctionId) -> RuntimeFunctionId + Copy,
+    ) {
         for entry in &mut self.entries {
             entry.point.remap_function_ids(remap);
             for binding in &mut entry.locals {
@@ -297,15 +309,18 @@ impl FunctionLocalEnvResumePlan {
     Clone, Debug, Default, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
 pub struct LocalEnvResumeModulePlan {
-    pub functions: HashMap<FunctionId, FunctionLocalEnvResumePlan>,
+    pub functions: HashMap<RuntimeFunctionId, FunctionLocalEnvResumePlan>,
 }
 
 impl LocalEnvResumeModulePlan {
-    pub fn function(&self, function_id: FunctionId) -> Option<&FunctionLocalEnvResumePlan> {
+    pub fn function(&self, function_id: RuntimeFunctionId) -> Option<&FunctionLocalEnvResumePlan> {
         self.functions.get(&function_id)
     }
 
-    pub fn remap_function_ids(&mut self, remap: impl Fn(FunctionId) -> FunctionId + Copy) {
+    pub fn remap_function_ids(
+        &mut self,
+        remap: impl Fn(RuntimeFunctionId) -> RuntimeFunctionId + Copy,
+    ) {
         self.functions = std::mem::take(&mut self.functions)
             .into_iter()
             .map(|(function_id, mut plan)| {
@@ -789,7 +804,7 @@ fn resume_value_source_for_planned_local(
 }
 
 fn transfer_resume_local_state(
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     instr: &InstrCodegen,
     facts: &FactStore,
     locals: &mut [LocalEnvResumeBinding],

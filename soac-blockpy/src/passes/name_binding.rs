@@ -5,10 +5,11 @@ use crate::block_py::{
     BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgPositional, CallableScopeInfo,
     CallableScopeKind, CellBindingKind, CellCaptureBinding, CellLocation, CellRef, CellRefForName,
     ChildVisitable, ClassBodyFallback, ClosureInit, ClosureSlot, Del, DelItem, EffectiveBinding,
-    FunctionId, FunctionKind, HasMeta, InstrLow, InstrResolved, InstrUnresolved, IntLiteral, Load,
+    FunctionKind, HasMeta, InstrLow, InstrResolved, InstrUnresolved, IntLiteral, Load,
     LocalLocation, MakeCell, MakeFunction, MakeFunctionWithClosure, MapFunction, MapInstr,
-    Mappable, NameLike, NameLocation, NumberLiteral, NumberLiteralValue, ResolvedName, RuntimeName,
-    SetItem, StorageLayout, Store, StringLiteral, Tuple, UnresolvedName, Visit, VisitMut, WithMeta,
+    Mappable, NameLike, NameLocation, NumberLiteral, NumberLiteralValue, ResolvedName,
+    RuntimeFunctionId, RuntimeName, SetItem, StorageLayout, Store, StringLiteral, Tuple,
+    UnresolvedName, Visit, VisitMut, WithMeta,
 };
 use crate::passes::ruff_to_blockpy::{
     populate_exception_edge_args, rewrite_current_exception_in_core_blocks,
@@ -908,7 +909,7 @@ fn store_cell_runtime_logical_name(
 struct NameBindingMapper<'a> {
     scope: &'a CallableScopeInfo,
     callee_make_function_captures:
-        &'a HashMap<crate::block_py::FunctionId, Vec<CellCaptureBinding>>,
+        &'a HashMap<crate::block_py::RuntimeFunctionId, Vec<CellCaptureBinding>>,
     local_slots: HashMap<String, u32>,
 }
 
@@ -2112,7 +2113,10 @@ fn locate_names_in_callable(
     mapper.map_fn(callable)
 }
 
-fn collect_make_function_callee_ids_in_expr(expr: &InstrUnresolved, out: &mut Vec<FunctionId>) {
+fn collect_make_function_callee_ids_in_expr(
+    expr: &InstrUnresolved,
+    out: &mut Vec<RuntimeFunctionId>,
+) {
     match expr {
         InstrUnresolved::Literal(_) => {}
         InstrUnresolved::MakeFunction(op) => {
@@ -2120,7 +2124,7 @@ fn collect_make_function_callee_ids_in_expr(expr: &InstrUnresolved, out: &mut Ve
         }
         _ => {
             struct CalleeVisitor<'a> {
-                out: &'a mut Vec<FunctionId>,
+                out: &'a mut Vec<RuntimeFunctionId>,
             }
 
             impl crate::block_py::Visit<InstrUnresolved> for CalleeVisitor<'_> {
@@ -2136,7 +2140,7 @@ fn collect_make_function_callee_ids_in_expr(expr: &InstrUnresolved, out: &mut Ve
 
 fn collect_make_function_callee_ids(
     callable: &BlockPyFunction<CoreModuleShape>,
-) -> Vec<FunctionId> {
+) -> Vec<RuntimeFunctionId> {
     let mut out = Vec::new();
     for block in &callable.blocks {
         for stmt in &block.body {
@@ -2149,16 +2153,16 @@ fn collect_make_function_callee_ids(
     out
 }
 
-fn collect_make_function_callee_ids_in_stmt(stmt: &CoreStmt, out: &mut Vec<FunctionId>) {
+fn collect_make_function_callee_ids_in_stmt(stmt: &CoreStmt, out: &mut Vec<RuntimeFunctionId>) {
     collect_make_function_callee_ids_in_expr(stmt, out)
 }
 
 fn collect_make_function_callee_ids_in_term(
     term: &BlockTerm<InstrUnresolved>,
-    out: &mut Vec<FunctionId>,
+    out: &mut Vec<RuntimeFunctionId>,
 ) {
     struct CalleeVisitor<'a> {
-        out: &'a mut Vec<FunctionId>,
+        out: &'a mut Vec<RuntimeFunctionId>,
     }
 
     impl crate::block_py::Visit<InstrUnresolved> for CalleeVisitor<'_> {
@@ -2171,11 +2175,11 @@ fn collect_make_function_callee_ids_in_term(
 }
 
 fn compute_callable_storage_layout_for_name_binding(
-    function_id: FunctionId,
-    callable_by_id: &HashMap<FunctionId, &BlockPyFunction<CoreModuleShape>>,
-    make_function_callees: &HashMap<FunctionId, Vec<FunctionId>>,
-    memo: &mut HashMap<FunctionId, Option<StorageLayout>>,
-    visiting: &mut HashSet<FunctionId>,
+    function_id: RuntimeFunctionId,
+    callable_by_id: &HashMap<RuntimeFunctionId, &BlockPyFunction<CoreModuleShape>>,
+    make_function_callees: &HashMap<RuntimeFunctionId, Vec<RuntimeFunctionId>>,
+    memo: &mut HashMap<RuntimeFunctionId, Option<StorageLayout>>,
+    visiting: &mut HashSet<RuntimeFunctionId>,
 ) -> Option<StorageLayout> {
     if let Some(layout) = memo.get(&function_id) {
         return layout.clone();
@@ -2399,7 +2403,7 @@ fn ensure_module_storage_layouts(
 
 fn compute_module_make_function_capture_names(
     callable_defs: &[BlockPyFunction<CoreModuleShape>],
-) -> HashMap<FunctionId, Vec<CellCaptureBinding>> {
+) -> HashMap<RuntimeFunctionId, Vec<CellCaptureBinding>> {
     fn make_function_capture_source_name(scope: &CallableScopeInfo, logical_name: &str) -> String {
         if scope.binding_kind(logical_name).is_some()
             || scope
@@ -2444,11 +2448,11 @@ fn compute_module_make_function_capture_names(
     }
 
     fn compute_callable_make_function_capture_bindings_for_name_binding(
-        function_id: FunctionId,
-        callable_by_id: &HashMap<FunctionId, &BlockPyFunction<CoreModuleShape>>,
-        make_function_callees: &HashMap<FunctionId, Vec<FunctionId>>,
-        memo: &mut HashMap<FunctionId, Vec<CellCaptureBinding>>,
-        visiting: &mut HashSet<FunctionId>,
+        function_id: RuntimeFunctionId,
+        callable_by_id: &HashMap<RuntimeFunctionId, &BlockPyFunction<CoreModuleShape>>,
+        make_function_callees: &HashMap<RuntimeFunctionId, Vec<RuntimeFunctionId>>,
+        memo: &mut HashMap<RuntimeFunctionId, Vec<CellCaptureBinding>>,
+        visiting: &mut HashSet<RuntimeFunctionId>,
     ) -> Vec<CellCaptureBinding> {
         if let Some(captures) = memo.get(&function_id) {
             return captures.clone();
@@ -2702,7 +2706,10 @@ fn populate_jump_edge_args(blocks: &mut [crate::block_py::ResolvedStorageBlock])
 
 fn lower_name_binding_callable(
     callable: BlockPyFunction<CoreModuleShape>,
-    callee_make_function_captures: &HashMap<crate::block_py::FunctionId, Vec<CellCaptureBinding>>,
+    callee_make_function_captures: &HashMap<
+        crate::block_py::RuntimeFunctionId,
+        Vec<CellCaptureBinding>,
+    >,
 ) -> BlockPyFunction<ResolvedStorageModuleShape> {
     let scope = callable.scope.clone();
     let local_slots = collect_local_slot_locations(&callable);

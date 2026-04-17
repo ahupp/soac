@@ -247,7 +247,7 @@ fn print_usage() {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soac_blockpy::block_py::{BlockLabel, FunctionId, InstrId, ModuleNameGen};
+    use soac_blockpy::block_py::{BlockLabel, InstrId, ModuleNameGen, RuntimeFunctionId};
     use soac_blockpy::codegen_cache::{
         CachedCodegenModuleMetadata, PythonModuleCacheSource, codegen_module_cache_path,
     };
@@ -304,7 +304,7 @@ mod test {
             .encode()
             .unwrap();
         counters.extend_from_slice(
-            counter_record_for_module_identity("pkg.callee", 0x5678, FunctionId::new(8, 99))
+            counter_record_for_module_identity("pkg.callee", 0x5678, RuntimeFunctionId::new(8, 99))
                 .encode()
                 .unwrap()
                 .as_slice(),
@@ -512,7 +512,7 @@ mod test {
 
     struct StoredTestModule {
         source_hash: u64,
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
     }
 
     fn store_test_module(
@@ -559,7 +559,7 @@ mod test {
     fn counter_record(
         module_name: &str,
         source_hash: u64,
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
         instr_id: InstrId,
     ) -> CounterDumpRecord {
         CounterDumpRecord {
@@ -578,7 +578,7 @@ mod test {
                     function_qualname: Some("f".to_string()),
                     block_label: Some("bb0".to_string()),
                     value: 1,
-                    observed_value: Some(FunctionId::new(8, 2).to_packed_runtime_u64()),
+                    observed_value: Some(RuntimeFunctionId::new(8, 2).to_packed_runtime_u64()),
                     max_overcount: None,
                 },
                 CounterDumpRow {
@@ -615,7 +615,7 @@ mod test {
     fn counter_record_for_module_identity(
         module_name: &str,
         source_hash: u64,
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
     ) -> CounterDumpRecord {
         CounterDumpRecord {
             source_hash,

@@ -9,11 +9,11 @@ use crate::block_py::{
     BindingPurpose, BindingTarget, Block, BlockArg, BlockBuilder, BlockEdge, BlockLabel,
     BlockParam, BlockParamRole, BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword,
     CallArgPositional, CallableScopeInfo, CellBindingKind, CellRefForName, ClosureInit,
-    ClosureSlot, FunctionId, FunctionKind, FunctionName, FunctionNameGen, GetAttr, Instr,
-    InstrUnresolved, InstrWithConstantNone, InstrWithYield, Load, MakeFunction, Mappable,
-    ModuleNameGen, NameLike, NumberLiteral, NumberLiteralValue, ScopeExprNode, StorageLayout,
-    Store, StringLiteral, TermBranchTable, TermIf, TermRaise, TryMapFunction, TryMapInstr,
-    TryMapTerm, Tuple, UnaryOp, UnaryOpKind, UnresolvedName, WithMeta,
+    ClosureSlot, FunctionKind, FunctionName, FunctionNameGen, GetAttr, Instr, InstrUnresolved,
+    InstrWithConstantNone, InstrWithYield, Load, MakeFunction, Mappable, ModuleNameGen, NameLike,
+    NumberLiteral, NumberLiteralValue, RuntimeFunctionId, ScopeExprNode, StorageLayout, Store,
+    StringLiteral, TermBranchTable, TermIf, TermRaise, TryMapFunction, TryMapInstr, TryMapTerm,
+    Tuple, UnaryOp, UnaryOpKind, UnresolvedName, WithMeta,
 };
 use crate::passes::ast_to_ast::scope_helpers::is_internal_symbol;
 use crate::passes::ruff_to_blockpy::{attach_exception_edges_to_blocks, lowered_exception_edges};
@@ -397,7 +397,7 @@ fn core_generator_code(async_gen: bool, name: &str, qualname: &str) -> InstrUnre
 }
 
 fn core_make_function(
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     kind: FunctionKind,
     param_defaults: InstrUnresolved,
     annotate_fn: InstrUnresolved,
@@ -599,7 +599,7 @@ fn generator_resume_declared_param_indices(
 
 fn build_factory_block(
     visible_names: &FunctionName,
-    resume_function_id: FunctionId,
+    resume_function_id: RuntimeFunctionId,
     kind: FunctionKind,
     cleanup_cell_names: &[String],
 ) -> LinearCoreBlock {

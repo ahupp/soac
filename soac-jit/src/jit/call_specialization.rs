@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use soac_blockpy::block_py::{
-    BlockPyFunction, CallArgKeyword, CallArgPositional, ChildVisitable, FunctionId,
-    HasSemanticInstrId, Instr, InstrId, NameLocation, ParamKind, RuntimeName, Visit, VisitMut,
+    BlockPyFunction, CallArgKeyword, CallArgPositional, ChildVisitable, HasSemanticInstrId, Instr,
+    InstrId, NameLocation, ParamKind, RuntimeFunctionId, RuntimeName, Visit, VisitMut,
 };
 use soac_blockpy::passes::{
     CodegenModuleShape, InstrCodegen, InstrTyped, TypedCall, TypedCallAccessPlan,
@@ -21,7 +21,8 @@ use crate::module_constants::{ModuleCodegenConstants, ModuleConstantId};
 pub(super) struct CallSpecializationCtx<'a> {
     pub module: &'a soac_blockpy::block_py::BlockPyModule<CodegenModuleShape>,
     pub direct_call_resolver: Option<&'a crate::module_type::SharedModuleState>,
-    pub direct_call_target_functions: &'a HashMap<FunctionId, BlockPyFunction<CodegenModuleShape>>,
+    pub direct_call_target_functions:
+        &'a HashMap<RuntimeFunctionId, BlockPyFunction<CodegenModuleShape>>,
     pub direct_owner_attr_specializations:
         Option<&'a HashMap<DirectOwnerAttrKey, Vec<DirectOwnerAttrSpecialization>>>,
     pub direct_edge_stats: &'a DirectEdgeStats,
@@ -30,11 +31,11 @@ pub(super) struct CallSpecializationCtx<'a> {
 pub(super) fn annotate_typed_call_accesses(
     function: &mut BlockPyFunction<TypedCodegenModuleShape>,
     ctx: &CallSpecializationCtx<'_>,
-    call_target_specializations: &HashMap<InstrId, Vec<FunctionId>>,
+    call_target_specializations: &HashMap<InstrId, Vec<RuntimeFunctionId>>,
 ) -> usize {
     struct Annotator<'a> {
         ctx: &'a CallSpecializationCtx<'a>,
-        call_target_specializations: &'a HashMap<InstrId, Vec<FunctionId>>,
+        call_target_specializations: &'a HashMap<InstrId, Vec<RuntimeFunctionId>>,
         count: usize,
     }
 
@@ -96,14 +97,14 @@ pub(super) fn collect_runtime_protocol_method_targets(
     direct_owner_attr_specializations: Option<
         &HashMap<DirectOwnerAttrKey, Vec<DirectOwnerAttrSpecialization>>,
     >,
-    call_target_specializations: &HashMap<InstrId, Vec<FunctionId>>,
-) -> HashSet<FunctionId> {
+    call_target_specializations: &HashMap<InstrId, Vec<RuntimeFunctionId>>,
+) -> HashSet<RuntimeFunctionId> {
     struct Collector<'a> {
         module_constants: &'a ModuleCodegenConstants,
         direct_owner_attr_specializations:
             Option<&'a HashMap<DirectOwnerAttrKey, Vec<DirectOwnerAttrSpecialization>>>,
-        call_target_specializations: &'a HashMap<InstrId, Vec<FunctionId>>,
-        out: &'a mut HashSet<FunctionId>,
+        call_target_specializations: &'a HashMap<InstrId, Vec<RuntimeFunctionId>>,
+        out: &'a mut HashSet<RuntimeFunctionId>,
     }
 
     impl Visit<InstrCodegen> for Collector<'_> {
@@ -167,7 +168,7 @@ pub(super) fn collect_runtime_protocol_method_targets(
 fn guarded_typed_call_access_plan(
     op: &TypedCall<InstrTyped>,
     ctx: &CallSpecializationCtx<'_>,
-    targets: &[FunctionId],
+    targets: &[RuntimeFunctionId],
 ) -> Option<TypedCallAccessPlan> {
     if matches!(
         op.func.as_ref(),
@@ -228,7 +229,7 @@ fn guarded_typed_call_access_plan(
 fn guarded_runtime_protocol_call_access_plan(
     op: &TypedCall<InstrTyped>,
     ctx: &CallSpecializationCtx<'_>,
-    call_target_specializations: &HashMap<InstrId, Vec<FunctionId>>,
+    call_target_specializations: &HashMap<InstrId, Vec<RuntimeFunctionId>>,
 ) -> Option<TypedCallAccessPlan> {
     if typed_static_runtime_name(ctx, op.func.as_ref())? != RuntimeName::Iter {
         return None;
@@ -251,7 +252,7 @@ fn guarded_runtime_protocol_call_access_plan(
 fn runtime_iter_method_guards_for_receiver_expr(
     ctx: &CallSpecializationCtx<'_>,
     receiver: &InstrTyped,
-    call_target_specializations: &HashMap<InstrId, Vec<FunctionId>>,
+    call_target_specializations: &HashMap<InstrId, Vec<RuntimeFunctionId>>,
 ) -> Vec<TypedDirectMethodCallGuard> {
     let Some(constructor_call) = receiver_constructor_call(receiver) else {
         return Vec::new();
@@ -370,7 +371,7 @@ fn codegen_receiver_constructor_call(
 
 #[derive(Clone)]
 struct DirectMethodSpecialization {
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     owner_type_ref: super::RelocTypeRef,
     type_version: u32,
     arg_plan: DirectCallArgPlan,
@@ -378,7 +379,7 @@ struct DirectMethodSpecialization {
 
 #[derive(Clone)]
 struct DirectConstructorSpecialization {
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     owner_type_ref: super::RelocTypeRef,
     type_version: u32,
     arg_plan: DirectCallArgPlan,
@@ -399,7 +400,7 @@ fn typed_method_call_name(ctx: &CallSpecializationCtx<'_>, func: &InstrTyped) ->
 
 fn direct_method_specializations_for_shape(
     ctx: &CallSpecializationCtx<'_>,
-    targets: &[FunctionId],
+    targets: &[RuntimeFunctionId],
     method_name: &str,
     shape: &SimpleCallShape,
 ) -> Vec<DirectMethodSpecialization> {
@@ -444,7 +445,7 @@ fn direct_method_specializations_for_shape(
 
 fn direct_constructor_specializations_for_shape(
     ctx: &CallSpecializationCtx<'_>,
-    targets: &[FunctionId],
+    targets: &[RuntimeFunctionId],
     shape: &SimpleCallShape,
 ) -> Vec<DirectConstructorSpecialization> {
     if ctx.direct_call_resolver.is_none() && ctx.direct_owner_attr_specializations.is_none() {
@@ -488,7 +489,7 @@ fn direct_constructor_specializations_for_shape(
 
 fn direct_function_specializations_for_shape(
     ctx: &CallSpecializationCtx<'_>,
-    targets: &[FunctionId],
+    targets: &[RuntimeFunctionId],
     shape: &SimpleCallShape,
     record_incompatibilities: bool,
 ) -> Vec<DirectFunctionSpecialization> {
@@ -529,7 +530,7 @@ fn direct_function_specializations_for_shape(
 
 fn direct_method_owner_attr_specializations(
     ctx: &CallSpecializationCtx<'_>,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     method_name: &str,
 ) -> Vec<DirectOwnerAttrSpecialization> {
     let key = DirectOwnerAttrKey::new(function_id, method_name);
@@ -557,7 +558,7 @@ fn direct_method_owner_attr_specializations(
 
 fn direct_constructor_owner_attr_specializations(
     ctx: &CallSpecializationCtx<'_>,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
 ) -> Vec<DirectOwnerAttrSpecialization> {
     direct_constructor_owner_attr_specializations_from_source(
         ctx.direct_owner_attr_specializations,
@@ -569,7 +570,7 @@ pub(super) fn direct_constructor_owner_attr_specializations_from_source(
     direct_owner_attr_specializations: Option<
         &HashMap<DirectOwnerAttrKey, Vec<DirectOwnerAttrSpecialization>>,
     >,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
 ) -> Vec<DirectOwnerAttrSpecialization> {
     let key = DirectOwnerAttrKey::new(function_id, "__init__");
     if let Some(predeclared) = direct_owner_attr_specializations {
@@ -595,7 +596,7 @@ pub(super) fn direct_constructor_owner_attr_specializations_from_source(
 
 fn direct_call_target_function<'a>(
     ctx: &'a CallSpecializationCtx<'_>,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
 ) -> Option<&'a BlockPyFunction<CodegenModuleShape>> {
     ctx.module
         .callable_defs
@@ -788,7 +789,11 @@ mod tests {
 
     fn annotate_caller_for_single_target(
         source: &str,
-    ) -> (usize, Vec<(InstrId, TypedCallAccessPlan)>, FunctionId) {
+    ) -> (
+        usize,
+        Vec<(InstrId, TypedCallAccessPlan)>,
+        RuntimeFunctionId,
+    ) {
         let module = lowered_module(source);
         let callee_id = function_by_qualname(&module, "callee").function_id;
         let mut typed_module = lower_codegen_module_to_typed(module.clone());

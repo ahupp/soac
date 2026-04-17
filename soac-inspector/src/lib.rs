@@ -7,7 +7,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use soac_blockpy::block_py::{BlockPyFunction, BlockPyModule, FunctionId, ModuleNameGen};
+use soac_blockpy::block_py::{BlockPyFunction, BlockPyModule, ModuleNameGen, RuntimeFunctionId};
 use soac_blockpy::passes::{
     CodegenModuleShape, infer_module_value_facts, plan_local_env_module,
     plan_local_env_resume_module, render_local_env_function_plan, render_local_env_module_plan,
@@ -350,7 +350,7 @@ pub fn profile_module_id_from_env(module_name: &str) -> Result<Option<u32>, Stri
             let Some(function_id) = row.function_id else {
                 continue;
             };
-            if function_id == FunctionId::global() {
+            if function_id == RuntimeFunctionId::global() {
                 continue;
             }
             return Ok(Some(function_id.runtime_module_id().as_u32()));
@@ -374,7 +374,7 @@ fn inspect_pipeline_payload(source: &str) -> Result<Value, ApiError> {
 pub fn jit_debug_plan(
     module_name: &str,
     module: &BlockPyModule<CodegenModuleShape>,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
 ) -> Result<String, String> {
     let facts = infer_module_value_facts(module);
     let Some(function) = module
@@ -416,7 +416,7 @@ pub fn render_jit_clif_for_module(
     repo_root: &Path,
     module_name: &str,
     module: &BlockPyModule<CodegenModuleShape>,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
 ) -> Result<JitClifResponse, String> {
     render_jit_clif_for_module_with_options(
         repo_root,
@@ -530,7 +530,7 @@ pub fn render_jit_clif_for_module_with_options(
     repo_root: &Path,
     module_name: &str,
     module: &BlockPyModule<CodegenModuleShape>,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     options: JitClifRenderOptions,
 ) -> Result<JitClifResponse, String> {
     let function = module
@@ -679,7 +679,7 @@ pub fn render_jit_clif_for_module_with_options(
 fn render_jit_clif(
     repo_root: &Path,
     source: &str,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     qualname: Option<&str>,
     entry_label: &str,
 ) -> Result<JitClifResponse, ApiError> {
@@ -734,9 +734,9 @@ async fn handle_speedscope_profile(
     ))
 }
 
-fn parse_packed_function_id(raw: &str) -> Result<FunctionId, ApiError> {
+fn parse_packed_function_id(raw: &str) -> Result<RuntimeFunctionId, ApiError> {
     raw.parse::<u64>()
-        .map(FunctionId::from_packed_runtime_u64)
+        .map(RuntimeFunctionId::from_packed_runtime_u64)
         .map_err(|err| ApiError::bad_request(format!("invalid functionId '{raw}': {err}")))
 }
 

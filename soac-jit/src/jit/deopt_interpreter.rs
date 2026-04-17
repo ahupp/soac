@@ -241,7 +241,7 @@ impl<'inv, 'data> BlockPyFrameSource<'inv, 'data> {
     fn instantiate_entry_function(
         &self,
         py: Python<'_>,
-        function_id: soac_blockpy::block_py::FunctionId,
+        function_id: soac_blockpy::block_py::RuntimeFunctionId,
         expected_kind: FunctionKind,
         captures: &Bound<'_, PyAny>,
         param_defaults: &Bound<'_, PyAny>,

@@ -8,7 +8,8 @@
 
 use crate::block_py::{
     Block, BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, CellLocation,
-    ChildVisitable, FunctionId, HasSemanticInstrId, InstrCodegen, InstrKey, LocalLocation, Visit,
+    ChildVisitable, HasSemanticInstrId, InstrCodegen, InstrKey, LocalLocation, RuntimeFunctionId,
+    Visit,
 };
 use crate::passes::{CodegenModuleShape, FactStore, PyObjFacts, ValueFacts};
 use std::collections::{HashMap, HashSet};
@@ -36,7 +37,7 @@ pub struct RefcountLocal {
 pub enum RefcountSite {
     Instr(InstrKey),
     Term {
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
         block_label: BlockLabel,
     },
 }
@@ -95,7 +96,10 @@ impl FunctionRefcountPlan {
         self.blocks.get(&label)
     }
 
-    pub fn remap_function_ids(&mut self, remap: impl Fn(FunctionId) -> FunctionId + Copy) {
+    pub fn remap_function_ids(
+        &mut self,
+        remap: impl Fn(RuntimeFunctionId) -> RuntimeFunctionId + Copy,
+    ) {
         for block in self.blocks.values_mut() {
             for action in &mut block.actions {
                 action.site.remap_function_ids(remap);
@@ -108,15 +112,18 @@ impl FunctionRefcountPlan {
     Clone, Debug, Default, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
 pub struct RefcountPlan {
-    pub functions: HashMap<FunctionId, FunctionRefcountPlan>,
+    pub functions: HashMap<RuntimeFunctionId, FunctionRefcountPlan>,
 }
 
 impl RefcountPlan {
-    pub fn function(&self, function_id: FunctionId) -> Option<&FunctionRefcountPlan> {
+    pub fn function(&self, function_id: RuntimeFunctionId) -> Option<&FunctionRefcountPlan> {
         self.functions.get(&function_id)
     }
 
-    pub fn remap_function_ids(&mut self, remap: impl Fn(FunctionId) -> FunctionId + Copy) {
+    pub fn remap_function_ids(
+        &mut self,
+        remap: impl Fn(RuntimeFunctionId) -> RuntimeFunctionId + Copy,
+    ) {
         self.functions = std::mem::take(&mut self.functions)
             .into_iter()
             .map(|(function_id, mut plan)| {
@@ -128,7 +135,10 @@ impl RefcountPlan {
 }
 
 impl RefcountSite {
-    pub fn remap_function_ids(&mut self, remap: impl Fn(FunctionId) -> FunctionId + Copy) {
+    pub fn remap_function_ids(
+        &mut self,
+        remap: impl Fn(RuntimeFunctionId) -> RuntimeFunctionId + Copy,
+    ) {
         match self {
             Self::Instr(key) => {
                 key.function_id = remap(key.function_id);
@@ -937,7 +947,7 @@ fn initial_block_env(
 }
 
 fn state_for_expr(
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     expr: &InstrCodegen,
     facts: &FactStore,
 ) -> LocalRefState {
@@ -1620,7 +1630,7 @@ fn preserved_locations(
 }
 
 fn release_unforwarded_locals(
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     block_label: BlockLabel,
     env: &HashMap<LocalLocation, LocalRefState>,
     locals: &HashMap<LocalLocation, RefcountLocal>,
@@ -1645,7 +1655,7 @@ fn release_unforwarded_locals(
 }
 
 fn release_all_live_locals(
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     block_label: BlockLabel,
     env: &HashMap<LocalLocation, LocalRefState>,
     locals: &HashMap<LocalLocation, RefcountLocal>,
@@ -1677,7 +1687,7 @@ fn sorted_live_releases(
 }
 
 fn push_release_action(
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     block_label: BlockLabel,
     locals: &HashMap<LocalLocation, RefcountLocal>,
     location: LocalLocation,

@@ -1,6 +1,6 @@
 use crate::block_py::{
-    walk_expr_mut, walk_module_mut, BlockPyFunction, BlockPyModule, CounterSite, FunctionId,
-    FunctionNameGen, ModuleNameGen, VisitMut,
+    walk_expr_mut, walk_module_mut, BlockPyFunction, BlockPyModule, CounterSite, FunctionNameGen,
+    ModuleNameGen, RuntimeFunctionId, VisitMut,
 };
 use crate::passes::{
     CodegenModuleShape, EscapeSummaryModule, FactStore, InlinePlanModule, InstrCodegen,
@@ -38,7 +38,10 @@ pub struct CachedPreparedCodegen {
 }
 
 impl CachedPreparedCodegen {
-    pub fn remap_function_ids(&mut self, remap: impl Fn(FunctionId) -> FunctionId + Copy) {
+    pub fn remap_function_ids(
+        &mut self,
+        remap: impl Fn(RuntimeFunctionId) -> RuntimeFunctionId + Copy,
+    ) {
         self.escape_summary.remap_function_ids(remap);
         self.inline_plan.remap_function_ids(remap);
         self.value_facts.remap_function_ids(remap);
@@ -284,11 +287,11 @@ struct FunctionIdRemapper {
 }
 
 impl FunctionIdRemapper {
-    fn remap(&self, function_id: FunctionId) -> FunctionId {
-        if function_id == FunctionId::global() {
+    fn remap(&self, function_id: RuntimeFunctionId) -> RuntimeFunctionId {
+        if function_id == RuntimeFunctionId::global() {
             function_id
         } else {
-            FunctionId::new(self.new_module_id, function_id.local_function_id().as_u32())
+            RuntimeFunctionId::new(self.new_module_id, function_id.local_function_id().as_u32())
         }
     }
 }
@@ -455,8 +458,8 @@ mod test {
         PythonModuleCacheSource,
     };
     use crate::block_py::{
-        walk_block, walk_expr, BlockPyModule, ChildVisitable, FunctionId, HasSemanticInstrId,
-        InstrCodegen, ModuleNameGen, Visit,
+        walk_block, walk_expr, BlockPyModule, ChildVisitable, HasSemanticInstrId, InstrCodegen,
+        ModuleNameGen, RuntimeFunctionId, Visit,
     };
     use crate::lower_python_to_blockpy_for_testing;
     use crate::passes::{self, CodegenModuleShape};
@@ -473,8 +476,8 @@ mod test {
 
     #[derive(Debug, PartialEq)]
     struct FunctionSummary {
-        function_id: FunctionId,
-        name_gen_function_id: FunctionId,
+        function_id: RuntimeFunctionId,
+        name_gen_function_id: RuntimeFunctionId,
         qualname: String,
         block_labels: Vec<u32>,
         block_body_lens: Vec<usize>,
@@ -501,9 +504,9 @@ mod test {
 
     fn collect_make_function_with_closure_ids(
         module: &BlockPyModule<CodegenModuleShape>,
-    ) -> Vec<FunctionId> {
+    ) -> Vec<RuntimeFunctionId> {
         struct Collector {
-            function_ids: Vec<FunctionId>,
+            function_ids: Vec<RuntimeFunctionId>,
         }
 
         impl Visit<InstrCodegen> for Collector {

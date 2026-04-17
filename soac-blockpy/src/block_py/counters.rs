@@ -28,17 +28,17 @@ pub enum CounterScope {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum CounterSite {
     BlockEntry {
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
         block_label: BlockLabel,
     },
     DeoptEntry {
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
         source: DeoptEntrySource,
     },
     // `instr_id` names the semantic instruction site being observed. Synthetic
     // instrumentation instructions may have no semantic id of their own.
     Runtime {
-        function_id: Option<FunctionId>,
+        function_id: Option<RuntimeFunctionId>,
         instr_id: Option<InstrId>,
     },
 }

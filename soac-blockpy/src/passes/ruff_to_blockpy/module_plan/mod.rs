@@ -144,7 +144,7 @@ fn try_lower_function_to_core_blockpy_bundle(
 }
 
 fn build_lowered_function_instantiation_expr(
-    function_id: crate::block_py::FunctionId,
+    function_id: crate::block_py::RuntimeFunctionId,
     decorator_exprs: Vec<Expr>,
     param_defaults: &[Expr],
     annotate_fn_expr: Expr,

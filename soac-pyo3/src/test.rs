@@ -294,7 +294,7 @@ fn transformed_module_methods_register_owner_types_for_lookup() {
         let function = class_dict_function(owner_type, c"f");
         let function_id = soac_jit::registered_clif_function_id(function)
             .expect("registered function id lookup should succeed")
-            .expect("transformed method should carry a FunctionId");
+            .expect("transformed method should carry a RuntimeFunctionId");
         let owners = soac_jit::lookup_exact_owner_types_for_method(function_id, "f")
             .expect("exact owner lookup should succeed");
         assert_eq!(
@@ -308,7 +308,7 @@ fn transformed_module_methods_register_owner_types_for_lookup() {
         let init_function = class_dict_function(owner_type, c"__init__");
         let init_function_id = soac_jit::registered_clif_function_id(init_function)
             .expect("registered __init__ function id lookup should succeed")
-            .expect("transformed __init__ should carry a FunctionId");
+            .expect("transformed __init__ should carry a RuntimeFunctionId");
         let constructor_owners =
             soac_jit::lookup_exact_owner_types_for_constructor(init_function_id)
                 .expect("exact constructor owner lookup should succeed");

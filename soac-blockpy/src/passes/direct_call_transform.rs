@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::block_py::{
     Block, BlockEdge, BlockLabel, BlockPyFunction, BlockTerm, Call, CallArgPositional, CallDirect,
-    Del, FunctionId, HasSemanticInstrId, InstrId, Load, Meta, ParamKind, ResolvedName, Store,
-    TermIf, WithMeta,
+    Del, HasSemanticInstrId, InstrId, Load, Meta, ParamKind, ResolvedName, RuntimeFunctionId,
+    Store, TermIf, WithMeta,
 };
 
 use super::{
@@ -28,7 +28,7 @@ struct StoreCallCandidate {
     instr_index: usize,
     target: ResolvedName,
     call: Call<InstrCodegen>,
-    targets: Vec<FunctionId>,
+    targets: Vec<RuntimeFunctionId>,
 }
 
 enum StoreCallRewrite {
@@ -38,8 +38,8 @@ enum StoreCallRewrite {
 
 pub fn rewrite_profiled_function_call_store_sites(
     function: &mut BlockPyFunction<CodegenModuleShape>,
-    targets_by_instr_id: &HashMap<InstrId, Vec<FunctionId>>,
-    callees: &HashMap<FunctionId, BlockPyFunction<CodegenModuleShape>>,
+    targets_by_instr_id: &HashMap<InstrId, Vec<RuntimeFunctionId>>,
+    callees: &HashMap<RuntimeFunctionId, BlockPyFunction<CodegenModuleShape>>,
 ) -> DirectCallStoreRewriteStats {
     let mut stats = DirectCallStoreRewriteStats::default();
     let original_blocks = std::mem::take(&mut function.blocks);
@@ -69,8 +69,8 @@ pub fn rewrite_profiled_function_call_store_sites(
 fn rewrite_profiled_function_call_store_block(
     function: &mut BlockPyFunction<CodegenModuleShape>,
     block: Block<InstrCodegen>,
-    targets_by_instr_id: &HashMap<InstrId, Vec<FunctionId>>,
-    callees: &HashMap<FunctionId, BlockPyFunction<CodegenModuleShape>>,
+    targets_by_instr_id: &HashMap<InstrId, Vec<RuntimeFunctionId>>,
+    callees: &HashMap<RuntimeFunctionId, BlockPyFunction<CodegenModuleShape>>,
     stats: &mut DirectCallStoreRewriteStats,
 ) -> StoreCallRewrite {
     let Some(candidate) = find_store_call_candidate(&block, targets_by_instr_id) else {
@@ -242,7 +242,7 @@ fn rewrite_profiled_function_call_store_block(
 
 fn find_store_call_candidate(
     block: &Block<InstrCodegen>,
-    targets_by_instr_id: &HashMap<InstrId, Vec<FunctionId>>,
+    targets_by_instr_id: &HashMap<InstrId, Vec<RuntimeFunctionId>>,
 ) -> Option<StoreCallCandidate> {
     block
         .body
@@ -277,10 +277,10 @@ fn positional_arg_exprs(args: Vec<CallArgPositional<InstrCodegen>>) -> Option<Ve
 
 fn compatible_inline_targets(
     positional_arg_count: usize,
-    targets: Vec<FunctionId>,
-    callees: &HashMap<FunctionId, BlockPyFunction<CodegenModuleShape>>,
+    targets: Vec<RuntimeFunctionId>,
+    callees: &HashMap<RuntimeFunctionId, BlockPyFunction<CodegenModuleShape>>,
     stats: &mut DirectCallStoreRewriteStats,
-) -> Vec<FunctionId> {
+) -> Vec<RuntimeFunctionId> {
     targets
         .into_iter()
         .filter(|target| {
@@ -374,7 +374,7 @@ fn simple_positional_inline_incompatibility(
     None
 }
 
-fn dedup_targets(targets: &[FunctionId]) -> Vec<FunctionId> {
+fn dedup_targets(targets: &[RuntimeFunctionId]) -> Vec<RuntimeFunctionId> {
     let mut seen = HashSet::new();
     targets
         .iter()
@@ -385,7 +385,7 @@ fn dedup_targets(targets: &[FunctionId]) -> Vec<FunctionId> {
 
 fn guard_term_for_target(
     temp_name: &ResolvedName,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     meta: Meta,
     then_label: BlockLabel,
     else_label: BlockLabel,
@@ -450,7 +450,7 @@ mod tests {
 
     fn callee_map(
         module: &BlockPyModule<CodegenModuleShape>,
-    ) -> HashMap<FunctionId, BlockPyFunction<CodegenModuleShape>> {
+    ) -> HashMap<RuntimeFunctionId, BlockPyFunction<CodegenModuleShape>> {
         module
             .callable_defs
             .iter()

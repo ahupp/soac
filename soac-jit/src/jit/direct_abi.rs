@@ -4,7 +4,7 @@
 //! function entries so the later direct-call migration uses the same model.
 
 use super::typed_value::ValueOwnership;
-use soac_blockpy::block_py::FunctionId;
+use soac_blockpy::block_py::RuntimeFunctionId;
 use soac_blockpy::passes::PyExactType;
 
 pub(super) const SOAC_RUNTIME_BUILTIN_ORD_I64_SYMBOL: &str = "soac_runtime_builtin_ord_i64";
@@ -13,7 +13,7 @@ pub(super) const SOAC_RUNTIME_BUILTIN_LEN_I64_SYMBOL: &str = "soac_runtime_built
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum DirectTargetId {
-    PythonFunction(FunctionId),
+    PythonFunction(RuntimeFunctionId),
     RuntimePrimitive(RuntimePrimitiveId),
 }
 

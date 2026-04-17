@@ -246,15 +246,15 @@ fn all_paths_end_in_fallthrough<I: Instr>(
 mod tests {
     use super::*;
     use crate::block_py::{
-        BlockEdge, Call, CallArgPositional, CallDirect, CalleeFunctionId, FunctionId, HasMeta,
+        BlockEdge, Call, CallArgPositional, CallDirect, CalleeFunctionId, HasMeta,
         HasSemanticInstrId, InstrCodegen, InstrId, InstrWithConstantNone, Load, Meta, NameLocation,
-        ResolvedName, RuntimeName, TermBranchTable, WithMeta,
+        ResolvedName, RuntimeFunctionId, RuntimeName, TermBranchTable, WithMeta,
     };
     use crate::passes::InstrRuff;
     use crate::py_expr;
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct CallHotTargetsCounterSpec {
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
         instr_id: InstrId,
     }
 
@@ -277,12 +277,12 @@ mod tests {
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct HotCallTargets {
-        most_frequent: FunctionId,
-        second_most_frequent: FunctionId,
+        most_frequent: RuntimeFunctionId,
+        second_most_frequent: RuntimeFunctionId,
     }
 
     struct ExampleCallHotTargetRule {
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
         entry_label: BlockLabel,
         hot0_label: BlockLabel,
         hot1_label: BlockLabel,
@@ -311,8 +311,8 @@ mod tests {
                 return OptInstr::Instr(instr.clone());
             };
             let hot_targets = HotCallTargets {
-                most_frequent: FunctionId::new(9, 11),
-                second_most_frequent: FunctionId::new(9, 12),
+                most_frequent: RuntimeFunctionId::new(9, 11),
+                second_most_frequent: RuntimeFunctionId::new(9, 12),
             };
             let meta = call.meta();
 
@@ -401,7 +401,7 @@ mod tests {
             CounterScope::This,
             "call_hot_targets",
             CounterSite::Runtime {
-                function_id: Some(FunctionId::new(1, 2)),
+                function_id: Some(RuntimeFunctionId::new(1, 2)),
                 instr_id: Some(InstrId::new(BlockLabel::from_index(3), 4)),
             },
         );
@@ -421,7 +421,7 @@ mod tests {
     #[test]
     fn counter_builder_reuses_existing_definition() {
         let site = CounterSite::Runtime {
-            function_id: Some(FunctionId::new(1, 2)),
+            function_id: Some(RuntimeFunctionId::new(1, 2)),
             instr_id: Some(InstrId::new(BlockLabel::from_index(0), 7)),
         };
         let mut defs = vec![CounterDef {
@@ -444,7 +444,7 @@ mod tests {
     #[test]
     fn counter_builder_defines_from_counter_spec() {
         let spec = CallHotTargetsCounterSpec {
-            function_id: FunctionId::new(1, 2),
+            function_id: RuntimeFunctionId::new(1, 2),
             instr_id: InstrId::new(BlockLabel::from_index(3), 4),
         };
         let mut defs = Vec::new();
@@ -456,7 +456,7 @@ mod tests {
         assert_eq!(
             defs[0].site,
             CounterSite::Runtime {
-                function_id: Some(FunctionId::new(1, 2)),
+                function_id: Some(RuntimeFunctionId::new(1, 2)),
                 instr_id: Some(InstrId::new(BlockLabel::from_index(3), 4)),
             }
         );
@@ -516,7 +516,7 @@ mod tests {
 
     #[test]
     fn example_call_rule_matches_calls_and_builds_specialization_fragment() {
-        let function_id = FunctionId::new(7, 8);
+        let function_id = RuntimeFunctionId::new(7, 8);
         let rule = ExampleCallHotTargetRule {
             function_id,
             entry_label: BlockLabel::from_index(10),

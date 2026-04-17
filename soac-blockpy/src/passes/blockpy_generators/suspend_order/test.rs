@@ -1,8 +1,8 @@
 use super::*;
 use crate::block_py::{
     BinOp, BinOpKind, Block, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm,
-    CallArgPositional, CallableScopeInfo, FunctionId, FunctionKind, FunctionName,
-    InstrWithAwaitAndYield, InstrWithYield, Meta, ModuleNameGen, Store, UnresolvedName, WithMeta,
+    CallArgPositional, CallableScopeInfo, FunctionKind, FunctionName, InstrWithAwaitAndYield,
+    InstrWithYield, Meta, ModuleNameGen, RuntimeFunctionId, Store, UnresolvedName, WithMeta,
     YieldFrom,
 };
 use crate::passes::core_await_lower::lower_awaits_in_core_blockpy_module;
@@ -28,7 +28,7 @@ fn test_callable_def_with_yield_block(
     block: Block<InstrWithYield>,
 ) -> BlockPyFunction<CoreModuleShapeWithYield> {
     BlockPyFunction {
-        function_id: FunctionId::new(0, 1),
+        function_id: RuntimeFunctionId::new(0, 1),
         name_gen: test_name_gen(),
         names: FunctionName::new("f", "f", "f", "f"),
         kind: FunctionKind::Generator,
@@ -46,7 +46,7 @@ fn lower_awaits_in_test_block(block: Block<InstrWithAwaitAndYield>) -> Block<Ins
         module_name_gen: ModuleNameGen::new(0),
         global_names: Vec::new(),
         callable_defs: vec![BlockPyFunction::<CoreModuleShapeWithAwaitAndYield> {
-            function_id: FunctionId::new(0, 1),
+            function_id: RuntimeFunctionId::new(0, 1),
             name_gen: test_name_gen(),
             names: FunctionName::new("f", "f", "f", "f"),
             kind: FunctionKind::Coroutine,

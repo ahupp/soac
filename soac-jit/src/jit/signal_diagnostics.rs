@@ -1,5 +1,5 @@
 use libc::{c_int, c_void};
-use soac_blockpy::block_py::FunctionId;
+use soac_blockpy::block_py::RuntimeFunctionId;
 use std::ptr;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
@@ -74,7 +74,7 @@ pub(crate) fn register_jit_code_range(
     symbol: &str,
     code_ptr: *const u8,
     code_size: usize,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     function_qualname: &str,
     entry_kind: &str,
     bb_offsets: &[usize],

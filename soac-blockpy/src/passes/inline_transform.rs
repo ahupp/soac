@@ -1,8 +1,8 @@
 use crate::block_py::{
     instr_any, Block, BlockArg, BlockEdge, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm,
-    CallArgPositional, CallDirect, FunctionId, HasMeta, InstrCodegen, Literal, LocalLocation,
-    MapInstr, Mappable, NameLocation, ParamKind, ResolvedName, RuntimeName, Store, TryMapInstr,
-    TryMapTerm, WithMeta,
+    CallArgPositional, CallDirect, HasMeta, InstrCodegen, Literal, LocalLocation, MapInstr,
+    Mappable, NameLocation, ParamKind, ResolvedName, RuntimeFunctionId, RuntimeName, Store,
+    TryMapInstr, TryMapTerm, WithMeta,
 };
 use crate::passes::{
     allocate_codegen_stack_temp, plan_module_inlining, reassign_codegen_function_instr_ids,
@@ -162,7 +162,7 @@ pub fn inline_and_scalar_replace_until_fixed_point(
 pub fn inline_and_scalar_replace_with_callees_until_fixed_point(
     module: &mut BlockPyModule<CodegenModuleShape>,
     external_inline_plan: &InlinePlanModule,
-    extra_callees: &HashMap<FunctionId, InlineCallee>,
+    extra_callees: &HashMap<RuntimeFunctionId, InlineCallee>,
 ) -> InlineScalarRewriteStats {
     let mut stats = InlineScalarRewriteStats::default();
     for iteration in 0..DEFAULT_INLINE_SCALAR_FIXED_POINT_ITERATIONS {
@@ -197,7 +197,7 @@ pub fn inline_and_scalar_replace_with_callees_until_fixed_point(
 pub fn inline_direct_call_stores_with_callees(
     module: &mut BlockPyModule<CodegenModuleShape>,
     inline_plan: &InlinePlanModule,
-    callees: &HashMap<FunctionId, InlineCallee>,
+    callees: &HashMap<RuntimeFunctionId, InlineCallee>,
 ) -> InlineRewriteStats {
     let mut stats = InlineRewriteStats::default();
     let module_constants = &mut module.module_constants;
@@ -218,7 +218,7 @@ pub fn inline_direct_call_stores_with_callees(
 pub fn rewrite_static_runtime_constructor_call_stores(
     blocks: &mut [Block<InstrCodegen>],
     module_constants: &[InstrResolved],
-    mut constructor_for_runtime_name: impl FnMut(RuntimeName) -> Option<FunctionId>,
+    mut constructor_for_runtime_name: impl FnMut(RuntimeName) -> Option<RuntimeFunctionId>,
 ) -> usize {
     let mut rewritten = 0;
     for block in blocks {
@@ -315,7 +315,7 @@ pub fn scalar_replace_non_escaping_constructor_allocations(
 
 fn count_scalar_replacement_candidate_allocations(
     function: &BlockPyFunction<CodegenModuleShape>,
-    straightline_constructor_ids: &HashSet<FunctionId>,
+    straightline_constructor_ids: &HashSet<RuntimeFunctionId>,
 ) -> usize {
     function
         .blocks
@@ -339,7 +339,7 @@ fn count_scalar_replacement_candidate_allocations(
 fn scalar_replace_non_escaping_constructor_allocations_in_function(
     function: &mut BlockPyFunction<CodegenModuleShape>,
     inline_plan: &InlinePlanModule,
-    straightline_constructor_ids: &HashSet<FunctionId>,
+    straightline_constructor_ids: &HashSet<RuntimeFunctionId>,
     constants: &[InstrResolved],
     stats: &mut ScalarReplacementStats,
 ) -> bool {
@@ -388,7 +388,7 @@ fn inline_simple_direct_call_stores_in_function(
     function: &mut BlockPyFunction<CodegenModuleShape>,
     module_constants: &mut Vec<InstrResolved>,
     _inline_plan: &InlinePlanModule,
-    callees: &HashMap<FunctionId, InlineCallee>,
+    callees: &HashMap<RuntimeFunctionId, InlineCallee>,
     stats: &mut InlineRewriteStats,
 ) -> bool {
     let mut changed = false;
@@ -425,7 +425,7 @@ fn build_direct_store_rewrite(
     caller_constants: &mut Vec<InstrResolved>,
     block: Block<InstrCodegen>,
     _inline_plan: &InlinePlanModule,
-    callees: &HashMap<FunctionId, InlineCallee>,
+    callees: &HashMap<RuntimeFunctionId, InlineCallee>,
     original_block_by_label: &HashMap<BlockLabel, Block<InstrCodegen>>,
     stats: &mut InlineRewriteStats,
 ) -> InlineBlockRewrite {
@@ -634,7 +634,7 @@ fn try_scalar_replace_block_chain(
     blocks: &mut Vec<Block<InstrCodegen>>,
     start_block_index: usize,
     inline_plan: &InlinePlanModule,
-    straightline_constructor_ids: &HashSet<FunctionId>,
+    straightline_constructor_ids: &HashSet<RuntimeFunctionId>,
     constants: &[InstrResolved],
     block_index_by_label: &HashMap<BlockLabel, usize>,
     normal_predecessor_counts: &HashMap<BlockLabel, usize>,
@@ -674,7 +674,7 @@ fn try_scalar_replace_block_chain_in_place(
     blocks: &mut Vec<Block<InstrCodegen>>,
     start_block_index: usize,
     inline_plan: &InlinePlanModule,
-    straightline_constructor_ids: &HashSet<FunctionId>,
+    straightline_constructor_ids: &HashSet<RuntimeFunctionId>,
     constants: &[InstrResolved],
     block_index_by_label: &HashMap<BlockLabel, usize>,
     normal_predecessor_counts: &HashMap<BlockLabel, usize>,
@@ -794,7 +794,7 @@ fn try_scalar_replace_reachable_control_flow(
     blocks: &mut Vec<Block<InstrCodegen>>,
     start_block_index: usize,
     inline_plan: &InlinePlanModule,
-    straightline_constructor_ids: &HashSet<FunctionId>,
+    straightline_constructor_ids: &HashSet<RuntimeFunctionId>,
     constants: &[InstrResolved],
     block_index_by_label: &HashMap<BlockLabel, usize>,
 ) -> ScalarReplacementAttempt {
@@ -821,7 +821,7 @@ fn try_scalar_replace_reachable_control_flow_in_place(
     blocks: &mut Vec<Block<InstrCodegen>>,
     start_block_index: usize,
     inline_plan: &InlinePlanModule,
-    straightline_constructor_ids: &HashSet<FunctionId>,
+    straightline_constructor_ids: &HashSet<RuntimeFunctionId>,
     constants: &[InstrResolved],
     block_index_by_label: &HashMap<BlockLabel, usize>,
 ) -> ScalarReplacementAttempt {
@@ -1485,7 +1485,7 @@ struct ScalarizedAllocationCandidate {
 
 fn find_scalarizable_allocation_candidate(
     block: &Block<InstrCodegen>,
-    straightline_constructor_ids: &HashSet<FunctionId>,
+    straightline_constructor_ids: &HashSet<RuntimeFunctionId>,
 ) -> Option<ScalarizedAllocationCandidate> {
     block
         .body
@@ -1958,15 +1958,15 @@ fn constant_string_from_constants(
 
 struct InlineStoreCandidate {
     instr_index: usize,
-    callee_id: FunctionId,
+    callee_id: RuntimeFunctionId,
     call: CallDirect<InstrCodegen>,
     target: ResolvedName,
 }
 
 fn find_inline_store_candidate(
     block: &Block<InstrCodegen>,
-    caller_id: FunctionId,
-    callees: &HashMap<FunctionId, InlineCallee>,
+    caller_id: RuntimeFunctionId,
+    callees: &HashMap<RuntimeFunctionId, InlineCallee>,
 ) -> Option<InlineStoreCandidate> {
     block
         .body
@@ -2816,7 +2816,7 @@ mod tests {
     fn rewrite_first_store_call_to_direct(
         module: &mut crate::block_py::BlockPyModule<CodegenModuleShape>,
         qualname: &str,
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
     ) {
         let function_index = function_index_by_qualname(module, qualname);
         let function = &mut module.callable_defs[function_index];
@@ -2885,7 +2885,7 @@ mod tests {
 
     #[test]
     fn rewrites_static_runtime_constructor_calls_to_direct_calls() {
-        let constructor_id = FunctionId::new(42, 7);
+        let constructor_id = RuntimeFunctionId::new(42, 7);
         let constants = vec![Load::new(ResolvedName {
             id: RuntimeName::IterRange.name().to_string().into(),
             location: NameLocation::RuntimeName(RuntimeName::IterRange),

@@ -1,6 +1,6 @@
 use crate::jit::ProcessJitEngine;
 use crate::module_type::SharedModuleState;
-use soac_blockpy::block_py::{BlockPyFunction, FunctionId, ModuleNameGen};
+use soac_blockpy::block_py::{BlockPyFunction, ModuleNameGen, RuntimeFunctionId};
 use soac_blockpy::passes::CodegenModuleShape;
 use std::collections::HashMap;
 use std::fmt;
@@ -47,7 +47,7 @@ impl SharedModuleStateRegistry {
         self.by_module_identity.insert(module_identity, index);
     }
 
-    fn for_function_id(&self, function_id: FunctionId) -> Option<Arc<SharedModuleState>> {
+    fn for_function_id(&self, function_id: RuntimeFunctionId) -> Option<Arc<SharedModuleState>> {
         let index = self
             .by_module_id
             .get(&function_id.runtime_module_id().as_u32())
@@ -122,7 +122,7 @@ impl CompileSession {
 
     pub fn shared_module_state_for_function_id(
         &self,
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
     ) -> Result<Option<Arc<SharedModuleState>>, String> {
         Ok(self
             .shared_module_states
@@ -145,9 +145,9 @@ impl CompileSession {
 
     pub fn lookup_shared_function(
         &self,
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
     ) -> Result<Option<(Arc<SharedModuleState>, BlockPyFunction<CodegenModuleShape>)>, String> {
-        if function_id == FunctionId::global() {
+        if function_id == RuntimeFunctionId::global() {
             return Ok(None);
         }
         let Some(shared_state) = self.shared_module_state_for_function_id(function_id)? else {
@@ -224,7 +224,9 @@ mod test {
         assert_eq!(session.retained_shared_module_state_count().unwrap(), 0);
         assert!(
             session
-                .shared_module_state_for_function_id(soac_blockpy::block_py::FunctionId::new(7, 1))
+                .shared_module_state_for_function_id(
+                    soac_blockpy::block_py::RuntimeFunctionId::new(7, 1)
+                )
                 .unwrap()
                 .is_none()
         );

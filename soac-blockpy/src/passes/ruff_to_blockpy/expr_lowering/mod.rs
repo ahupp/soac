@@ -1,6 +1,6 @@
 use crate::block_py::{
-    core_runtime_positional_call_expr_with_meta, literal_expr, operation, Del, FunctionId,
-    FunctionKind, HasMeta, InstrWithAwaitAndYield, InstrWithConstantNone, Meta, Store,
+    core_runtime_positional_call_expr_with_meta, literal_expr, operation, Del, FunctionKind,
+    HasMeta, InstrWithAwaitAndYield, InstrWithConstantNone, Meta, RuntimeFunctionId, Store,
     StringLiteral, UnresolvedName, WithMeta,
 };
 use crate::namegen::fresh_name;
@@ -245,7 +245,7 @@ fn make_function_kind_from_literal(expr: &InstrRuff) -> Option<FunctionKind> {
     })
 }
 
-fn make_function_id_from_literal(expr: &InstrRuff) -> Option<FunctionId> {
+fn make_function_id_from_literal(expr: &InstrRuff) -> Option<RuntimeFunctionId> {
     let InstrRuff::ExprNumberLiteral(number) = expr else {
         return None;
     };
@@ -256,7 +256,7 @@ fn make_function_id_from_literal(expr: &InstrRuff) -> Option<FunctionId> {
         .to_string()
         .parse()
         .ok()
-        .map(FunctionId::from_packed_runtime_u64)
+        .map(RuntimeFunctionId::from_packed_runtime_u64)
 }
 
 fn string_literal_value(expr: &InstrRuff) -> Option<String> {

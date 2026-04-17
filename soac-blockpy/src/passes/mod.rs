@@ -28,15 +28,15 @@ use crate::block_py::{
     ExprEllipsisLiteral, ExprFString, ExprGenerator, ExprIf, ExprIpyEscapeCommand, ExprLambda,
     ExprList, ExprListComp, ExprName, ExprNamed, ExprNoneLiteral, ExprNumberLiteral, ExprSet,
     ExprSetComp, ExprSlice, ExprStarred, ExprStringLiteral, ExprSubscript, ExprTString, ExprTuple,
-    FunctionId, GetAttr, GetItem, HasMeta, IdentifiedInstr, IncrementCounter, Instr, InstrKey,
+    GetAttr, GetItem, HasMeta, IdentifiedInstr, IncrementCounter, Instr, InstrKey,
     InstrWithConstantNone, LiteralValue, Load, LocalLocation, MakeCell, MakeFunction,
     MakeFunctionWithClosure, MapFunction, MapInstr, MapModule, Mappable, Meta, ModuleShape,
-    NameLike, NameLocation, ResolvedName, RuntimeName, SetAttr, SetItem, StmtAnnAssign, StmtAssert,
-    StmtAssign, StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue, StmtDelete, StmtExpr,
-    StmtFor, StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom, StmtIpyEscapeCommand,
-    StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry, StmtTypeAlias, StmtWhile,
-    StmtWith, Store, TryMapInstr, TryMapModule, TryMapTerm, Tuple, UnaryOp, UnresolvedName, Visit,
-    VisitMut, WithMeta, Yield, YieldFrom,
+    NameLike, NameLocation, ResolvedName, RuntimeFunctionId, RuntimeName, SetAttr, SetItem,
+    StmtAnnAssign, StmtAssert, StmtAssign, StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue,
+    StmtDelete, StmtExpr, StmtFor, StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom,
+    StmtIpyEscapeCommand, StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry,
+    StmtTypeAlias, StmtWhile, StmtWith, Store, TryMapInstr, TryMapModule, TryMapTerm, Tuple,
+    UnaryOp, UnresolvedName, Visit, VisitMut, WithMeta, Yield, YieldFrom,
 };
 use ruff_python_ast::{self as ast};
 use soac_macros::{enum_broadcast, DelegateMatchDefault};
@@ -169,11 +169,11 @@ pub struct DirectFunctionIdGuardTest<E: Instr> {
     _meta: Meta,
     pub extra: E::Extra,
     pub value: Box<E>,
-    pub function_id: FunctionId,
+    pub function_id: RuntimeFunctionId,
 }
 
 impl<E: Instr> DirectFunctionIdGuardTest<E> {
-    pub fn new(value: impl Into<Box<E>>, function_id: FunctionId) -> Self {
+    pub fn new(value: impl Into<Box<E>>, function_id: RuntimeFunctionId) -> Self {
         Self {
             _meta: Meta::default(),
             extra: Default::default(),
@@ -457,13 +457,13 @@ pub struct TypedDirectCallArgPlan {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TypedDirectFunctionCallGuard {
-    pub function_id: FunctionId,
+    pub function_id: RuntimeFunctionId,
     pub arg_plan: TypedDirectCallArgPlan,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TypedDirectMethodCallGuard {
-    pub function_id: FunctionId,
+    pub function_id: RuntimeFunctionId,
     pub owner_type_ref: TypedAttrOwnerRef,
     pub type_version: u32,
     pub arg_plan: TypedDirectCallArgPlan,
@@ -471,7 +471,7 @@ pub struct TypedDirectMethodCallGuard {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TypedDirectConstructorCallGuard {
-    pub function_id: FunctionId,
+    pub function_id: RuntimeFunctionId,
     pub owner_type_ref: TypedAttrOwnerRef,
     pub type_version: u32,
     pub arg_plan: TypedDirectCallArgPlan,
@@ -487,10 +487,10 @@ pub enum TypedDirectCallableCallGuard {
 pub enum TypedCallAccessPlan {
     Generic,
     ProfiledCallableTargets {
-        targets: Vec<FunctionId>,
+        targets: Vec<RuntimeFunctionId>,
     },
     ProfiledMethodTargets {
-        targets: Vec<FunctionId>,
+        targets: Vec<RuntimeFunctionId>,
     },
     GuardedCallable {
         function_guards: Vec<TypedDirectFunctionCallGuard>,
@@ -1192,8 +1192,8 @@ impl<E: Instr> Mappable<E> for TypedDirectMethodCall<E> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TypedDirectCallGuardTestKind {
-    FunctionId {
-        function_id: FunctionId,
+    RuntimeFunctionId {
+        function_id: RuntimeFunctionId,
     },
     ExactCallableTypeVersion {
         owner_type_ref: TypedAttrOwnerRef,
@@ -1833,7 +1833,7 @@ impl MapInstr<InstrCodegen, InstrTyped> for CodegenToTyped {
                 InstrTyped::DirectCallGuardTest(
                     TypedDirectCallGuardTest::new(
                         self.map_instr(*op.value),
-                        TypedDirectCallGuardTestKind::FunctionId {
+                        TypedDirectCallGuardTestKind::RuntimeFunctionId {
                             function_id: op.function_id,
                         },
                     )
@@ -1911,7 +1911,7 @@ pub fn annotate_typed_function_value_facts(
     facts: &FactStore,
 ) -> usize {
     struct Annotator<'a> {
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
         facts: &'a FactStore,
         changed: usize,
     }
@@ -2423,7 +2423,7 @@ pub fn validate_typed_function_call_access_plans(
     function: &BlockPyFunction<TypedCodegenModuleShape>,
 ) -> Result<(), String> {
     struct Validator {
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
         error: Option<String>,
     }
 
@@ -2680,7 +2680,7 @@ impl TryMapInstr<InstrTyped, InstrCodegen, String> for TypedToCodegen {
             InstrTyped::DirectCallGuardTest(op) => {
                 let meta = op.meta();
                 match op.kind {
-                    TypedDirectCallGuardTestKind::FunctionId { function_id } => {
+                    TypedDirectCallGuardTestKind::RuntimeFunctionId { function_id } => {
                         InstrCodegenOp::DirectFunctionIdGuardTest(
                             DirectFunctionIdGuardTest::new(
                                 self.try_map_instr(*op.value)?,
@@ -3306,7 +3306,7 @@ mod typed_codegen_tests {
     fn codegen_function_id_by_qualname(
         module: &BlockPyModule<CodegenModuleShape>,
         qualname: &str,
-    ) -> FunctionId {
+    ) -> RuntimeFunctionId {
         module
             .callable_defs
             .iter()
@@ -3738,8 +3738,8 @@ def caller(it):\n    return it.__next__()\n",
         let load: InstrTyped = runtime_name_load("NONE");
         let guard = InstrTyped::DirectCallGuardTest(TypedDirectCallGuardTest::new(
             load,
-            TypedDirectCallGuardTestKind::FunctionId {
-                function_id: FunctionId::new(0, 7),
+            TypedDirectCallGuardTestKind::RuntimeFunctionId {
+                function_id: RuntimeFunctionId::new(0, 7),
             },
         ));
 
@@ -3801,7 +3801,7 @@ def caller(it):\n    return it.__next__()\n",
             func,
             vec![CallArgPositional::Positional(arg)],
             TypedDirectCallableCallGuard::Function(TypedDirectFunctionCallGuard {
-                function_id: FunctionId::new(0, 8),
+                function_id: RuntimeFunctionId::new(0, 8),
                 arg_plan: TypedDirectCallArgPlan {
                     sources: vec![TypedDirectCallArgSource::Provided(0)],
                 },
@@ -3832,7 +3832,7 @@ def caller(it):\n    return it.__next__()\n",
             vec![CallArgPositional::Positional(arg)],
             "__next__",
             TypedDirectMethodCallGuard {
-                function_id: FunctionId::new(0, 9),
+                function_id: RuntimeFunctionId::new(0, 9),
                 owner_type_ref: TypedAttrOwnerRef::TypeKey {
                     module_name: "__main__".to_string(),
                     qualname: "IterRange".to_string(),

@@ -8,7 +8,7 @@ use pyo3::exceptions::{
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyFunction, PyModule, PyString, PyTuple};
-use soac_blockpy::block_py::{BlockPyFunction, FunctionId, FunctionKind, ParamKind};
+use soac_blockpy::block_py::{BlockPyFunction, FunctionKind, ParamKind, RuntimeFunctionId};
 use soac_blockpy::passes::CodegenModuleShape;
 use std::ffi::{CString, c_void};
 use std::panic::{self, AssertUnwindSafe};
@@ -89,7 +89,7 @@ fn tuple_strings(py: Python<'_>, tuple: &Bound<'_, PyTuple>) -> PyResult<Vec<Str
 fn register_clif_vectorcall_raw(
     py: Python<'_>,
     func: &Bound<'_, PyAny>,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     module_runtime: ModuleRuntimeContext,
 ) -> PyResult<()> {
     unsafe {
@@ -107,7 +107,7 @@ fn maybe_eager_compile_clif_entry(
     py: Python<'_>,
     func: &Bound<'_, PyAny>,
     module_runtime: &ModuleRuntimeContext,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
 ) -> PyResult<()> {
     if !eager_clif_compile_requested().map_err(PyRuntimeError::new_err)? {
         return Ok(());
@@ -143,7 +143,7 @@ fn maybe_eager_compile_clif_entry(
 fn register_jit_vectorcall(
     py: Python<'_>,
     func: &Bound<'_, PyAny>,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     module_runtime: &ModuleRuntimeContext,
 ) -> PyResult<()> {
     let owned_runtime = unsafe { clone_module_runtime_context(module_runtime) }.map_err(|_| {
@@ -644,7 +644,7 @@ fn mark_coroutine_function(py: Python<'_>, func: &Bound<'_, PyAny>) -> PyResult<
 
 fn lookup_shared_function(
     compile_session: &Arc<CompileSession>,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
 ) -> PyResult<(Arc<SharedModuleState>, BlockPyFunction<CodegenModuleShape>)> {
     compile_session
         .lookup_shared_function(function_id)
@@ -709,7 +709,7 @@ fn instantiate_shared_function(
 
 pub fn make_function(
     py: Python<'_>,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     expected_kind: FunctionKind,
     captures: &Bound<'_, PyAny>,
     param_defaults: &Bound<'_, PyAny>,
@@ -735,7 +735,7 @@ pub(crate) fn make_function_in_shared_state(
     py: Python<'_>,
     compile_session: Arc<CompileSession>,
     shared_state: Arc<SharedModuleState>,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     expected_kind: FunctionKind,
     captures: &Bound<'_, PyAny>,
     param_defaults: &Bound<'_, PyAny>,
@@ -781,7 +781,7 @@ pub fn make_function_from_python_args(
     let module_globals = module_globals.unwrap_or_else(|| py.None());
     make_function(
         py,
-        FunctionId::from_packed_runtime_u64(function_id),
+        RuntimeFunctionId::from_packed_runtime_u64(function_id),
         expected_kind,
         captures.bind(py).as_any(),
         param_defaults.bind(py).as_any(),
@@ -835,7 +835,7 @@ pub unsafe extern "C" fn soac_jit_make_function_with_closure(
         let module_globals = unsafe { Bound::from_borrowed_ptr(py, module_globals) };
         match make_function(
             py,
-            FunctionId::from_packed_runtime_u64(function_id),
+            RuntimeFunctionId::from_packed_runtime_u64(function_id),
             expected_kind,
             &captures,
             &param_defaults,

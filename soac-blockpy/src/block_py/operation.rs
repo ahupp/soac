@@ -1,7 +1,7 @@
 use super::operation_macro::{define_operation, define_ruff_operation};
 use super::{
-    CallArgKeyword, CallArgPositional, CellLocation, ChildVisitable, FunctionId, FunctionKind,
-    HasMeta, Instr, MapInstr, Mappable, Meta, NameLike, TryMapInstr, WithMeta,
+    CallArgKeyword, CallArgPositional, CellLocation, ChildVisitable, FunctionKind, HasMeta, Instr,
+    MapInstr, Mappable, Meta, NameLike, RuntimeFunctionId, TryMapInstr, WithMeta,
 };
 use ruff_python_ast::{self as ast};
 use std::fmt;
@@ -366,7 +366,7 @@ pub struct CallDirect<E: Instr> {
     _meta: Meta,
     pub extra: E::Extra,
     pub callable: Box<E>,
-    pub function_id: FunctionId,
+    pub function_id: RuntimeFunctionId,
     pub args: Vec<CallArgPositional<E>>,
     pub keywords: Vec<CallArgKeyword<E>>,
 }
@@ -395,7 +395,7 @@ impl<E: Instr + fmt::Debug> fmt::Debug for CallDirect<E> {
 impl<E: Instr> CallDirect<E> {
     pub fn new(
         callable: impl Into<Box<E>>,
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
         args: impl Into<Vec<CallArgPositional<E>>>,
         keywords: impl Into<Vec<CallArgKeyword<E>>>,
     ) -> Self {
@@ -1002,7 +1002,7 @@ define_operation! {
 
 define_operation! {
     pub struct MakeFunction<E> {
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
         kind: FunctionKind,
         param_defaults: Box<E>,
         annotate_fn: Box<E>,
@@ -1010,18 +1010,18 @@ define_operation! {
 }
 
 impl<E: Instr> MakeFunction<E> {
-    pub fn function_id(&self) -> FunctionId {
+    pub fn function_id(&self) -> RuntimeFunctionId {
         self.function_id
     }
 
-    pub fn set_function_id(&mut self, function_id: FunctionId) {
+    pub fn set_function_id(&mut self, function_id: RuntimeFunctionId) {
         self.function_id = function_id;
     }
 }
 
 define_operation! {
     pub struct MakeFunctionWithClosure<E> {
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
         kind: FunctionKind,
         captures: Box<E>,
         param_defaults: Box<E>,
@@ -1030,11 +1030,11 @@ define_operation! {
 }
 
 impl<E: Instr> MakeFunctionWithClosure<E> {
-    pub fn function_id(&self) -> FunctionId {
+    pub fn function_id(&self) -> RuntimeFunctionId {
         self.function_id
     }
 
-    pub fn set_function_id(&mut self, function_id: FunctionId) {
+    pub fn set_function_id(&mut self, function_id: RuntimeFunctionId) {
         self.function_id = function_id;
     }
 }

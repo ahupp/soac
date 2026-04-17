@@ -3,7 +3,7 @@ use pyo3::exceptions::{PyOSError, PyRuntimeError, PyTypeError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyModule, PyTuple};
-use soac_blockpy::block_py::{BlockPyFunction, BlockPyModule, FunctionId};
+use soac_blockpy::block_py::{BlockPyFunction, BlockPyModule, RuntimeFunctionId};
 use soac_blockpy::codegen_cache::{CachedCodegenModuleMetadata, PythonModuleCacheSource};
 use soac_blockpy::passes::CodegenModuleShape;
 use soac_blockpy::{LoweringOptions, lower_python_to_blockpy_recorded_with_options};
@@ -104,7 +104,7 @@ fn install_soac_runtime_bootstrap_globals(
     Ok(SoacRuntimeBootstrapGlobals { helpers })
 }
 
-type OriginalCodeMap = HashMap<FunctionId, Py<PyAny>>;
+type OriginalCodeMap = HashMap<RuntimeFunctionId, Py<PyAny>>;
 type OriginalCodeByQualname = HashMap<String, VecDeque<Py<PyAny>>>;
 
 #[derive(Clone)]

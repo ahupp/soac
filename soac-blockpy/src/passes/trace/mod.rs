@@ -271,7 +271,7 @@ pub fn instrument_bb_module_with_call_target_counters(
 
     fn define_operation_shape_counters(
         counters: &mut CounterBuilder<'_>,
-        function_id: crate::block_py::FunctionId,
+        function_id: crate::block_py::RuntimeFunctionId,
         instr_id: crate::block_py::InstrId,
         shape_kind: &'static str,
         hit_kind: &'static str,
@@ -305,7 +305,7 @@ pub fn instrument_bb_module_with_call_target_counters(
 
     fn define_indexed_hit_fallback_counters(
         counters: &mut CounterBuilder<'_>,
-        function_id: crate::block_py::FunctionId,
+        function_id: crate::block_py::RuntimeFunctionId,
         instr_id: crate::block_py::InstrId,
         hit_kind: &'static str,
         fallback_kind: &'static str,
@@ -329,7 +329,7 @@ pub fn instrument_bb_module_with_call_target_counters(
     }
 
     struct SpecializationCandidateCounterCollector<'a, 'b> {
-        function_id: crate::block_py::FunctionId,
+        function_id: crate::block_py::RuntimeFunctionId,
         counters: &'a mut CounterBuilder<'b>,
     }
 

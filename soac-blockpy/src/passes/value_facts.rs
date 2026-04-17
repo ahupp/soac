@@ -1,7 +1,7 @@
 use crate::block_py::{
     BinOpKind, Block, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, ChildVisitable,
-    FunctionId, HasSemanticInstrId, InstrCodegen, InstrKey, InstrResolved, Literal, LocalLocation,
-    NameLike, NumberLiteralValue, UnaryOpKind, Visit,
+    HasSemanticInstrId, InstrCodegen, InstrKey, InstrResolved, Literal, LocalLocation, NameLike,
+    NumberLiteralValue, RuntimeFunctionId, UnaryOpKind, Visit,
 };
 use crate::passes::CodegenModuleShape;
 use std::collections::HashMap;
@@ -452,7 +452,7 @@ impl EnvFacts {
 )]
 pub struct FactStore {
     expr_facts: HashMap<InstrKey, ValueFacts>,
-    block_entry_facts: HashMap<(FunctionId, BlockLabel), EnvFacts>,
+    block_entry_facts: HashMap<(RuntimeFunctionId, BlockLabel), EnvFacts>,
 }
 
 impl FactStore {
@@ -462,7 +462,7 @@ impl FactStore {
 
     pub fn block_entry_fact(
         &self,
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
         label: BlockLabel,
     ) -> Option<&EnvFacts> {
         self.block_entry_facts.get(&(function_id, label))
@@ -472,13 +472,18 @@ impl FactStore {
         self.expr_facts.iter().map(|(key, facts)| (*key, *facts))
     }
 
-    pub fn block_entry_facts(&self) -> impl Iterator<Item = ((FunctionId, BlockLabel), &EnvFacts)> {
+    pub fn block_entry_facts(
+        &self,
+    ) -> impl Iterator<Item = ((RuntimeFunctionId, BlockLabel), &EnvFacts)> {
         self.block_entry_facts
             .iter()
             .map(|(key, facts)| (*key, facts))
     }
 
-    pub fn remap_function_ids(&mut self, remap: impl Fn(FunctionId) -> FunctionId + Copy) {
+    pub fn remap_function_ids(
+        &mut self,
+        remap: impl Fn(RuntimeFunctionId) -> RuntimeFunctionId + Copy,
+    ) {
         self.expr_facts = std::mem::take(&mut self.expr_facts)
             .into_iter()
             .map(|(mut key, facts)| {
@@ -957,15 +962,15 @@ mod test {
         PyExactType, PyObjFacts, RefcountFact, RuntimeHelperId, ThrowSpec, ValueFacts,
     };
     use crate::block_py::{
-        BlockTerm, CallArgPositional, CallDirect, ChildVisitable, FunctionId, HasMeta,
-        HasSemanticInstrId, InstrCodegen, Load, NameLocation, ResolvedName, RuntimeName, Visit,
+        BlockTerm, CallArgPositional, CallDirect, ChildVisitable, HasMeta, HasSemanticInstrId,
+        InstrCodegen, Load, NameLocation, ResolvedName, RuntimeFunctionId, RuntimeName, Visit,
         WithMeta,
     };
     use crate::lower_python_to_blockpy_for_testing;
 
     struct ReturnExprFinder {
         key: Option<crate::block_py::InstrKey>,
-        function_id: crate::block_py::FunctionId,
+        function_id: crate::block_py::RuntimeFunctionId,
     }
 
     impl Visit<InstrCodegen> for ReturnExprFinder {
@@ -980,7 +985,7 @@ mod test {
 
     struct FirstMatchingInstrFinder {
         key: Option<crate::block_py::InstrKey>,
-        function_id: crate::block_py::FunctionId,
+        function_id: crate::block_py::RuntimeFunctionId,
         matches: fn(&InstrCodegen) -> bool,
     }
 
@@ -1099,7 +1104,7 @@ def f(x):
                     id: runtime_name.name().to_string().into(),
                     location: NameLocation::RuntimeName(runtime_name),
                 })),
-                FunctionId::new(42, runtime_name as u32),
+                RuntimeFunctionId::new(42, runtime_name as u32),
                 vec![CallArgPositional::Positional(InstrCodegen::Load(
                     Load::new(ResolvedName {
                         id: "x".to_string().into(),

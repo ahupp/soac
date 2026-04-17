@@ -1,6 +1,6 @@
 use soac_blockpy::block_py::{
-    BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, CodegenBlock, FunctionId,
-    LocalLocation,
+    BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, CodegenBlock, LocalLocation,
+    RuntimeFunctionId,
 };
 pub use soac_blockpy::passes::{
     BlockParamFacts, FunctionLocalPlan, LocalRefKind, ParamBindingFacts, ParamProvenance,
@@ -229,7 +229,7 @@ pub struct PlannedJitFunctionLocals {
 
 #[derive(Clone, Debug, Default)]
 pub struct PlannedJitModuleLocals {
-    pub functions: HashMap<FunctionId, PlannedJitFunctionLocals>,
+    pub functions: HashMap<RuntimeFunctionId, PlannedJitFunctionLocals>,
 }
 
 #[derive(Clone, Debug)]
@@ -240,12 +240,12 @@ pub struct PlannedJitDeoptResumeFunction {
 
 #[derive(Clone, Debug, Default)]
 pub struct PlannedJitDeoptResumeModule {
-    pub functions: HashMap<FunctionId, PlannedJitDeoptResumeFunction>,
+    pub functions: HashMap<RuntimeFunctionId, PlannedJitDeoptResumeFunction>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PlannedJitDeoptPointId {
-    pub function_id: FunctionId,
+    pub function_id: RuntimeFunctionId,
     pub ordinal: usize,
 }
 
@@ -259,7 +259,7 @@ pub struct PlannedJitDeoptPoint {
 }
 
 impl PlannedJitModuleLocals {
-    pub fn function(&self, function_id: FunctionId) -> Option<&PlannedJitFunctionLocals> {
+    pub fn function(&self, function_id: RuntimeFunctionId) -> Option<&PlannedJitFunctionLocals> {
         self.functions.get(&function_id)
     }
 
@@ -405,7 +405,10 @@ impl PlannedJitDeoptResumeFunction {
 }
 
 impl PlannedJitDeoptResumeModule {
-    pub fn function(&self, function_id: FunctionId) -> Option<&PlannedJitDeoptResumeFunction> {
+    pub fn function(
+        &self,
+        function_id: RuntimeFunctionId,
+    ) -> Option<&PlannedJitDeoptResumeFunction> {
         self.functions.get(&function_id)
     }
 
@@ -940,7 +943,7 @@ pub fn plan_jit_deopt_resume_module_from_passes(
 }
 
 fn planned_deopt_points_from_resume_plan(
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     resume_plan: &FunctionLocalEnvResumePlan,
 ) -> Vec<PlannedJitDeoptPoint> {
     resume_plan

@@ -48,11 +48,11 @@ use soac_blockpy::block_py::{
     AbruptKind, Block, BlockArg, BlockEdge, BlockLabel, BlockParamRole, BlockPyFunction,
     BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional, CallDirect,
     CallableScopeKind, CellLocation, ChildVisitable, CodegenBlock, CounterDef, CounterId,
-    CounterScope, CounterSite, Del, DeoptEntrySource, FunctionExecutionMode, FunctionId,
-    FunctionKind, GetAttr, HasMeta, HasSemanticInstrId, InstrCodegen, InstrId, InstrKey, Literal,
-    Load, LocalFunctionId, LocalLocation, Meta, ModuleContentId, NameLocation, ParamKind,
-    PersistentFunctionId, ResolvedName, RuntimeName, StorageLayout, Store, Visit, VisitMut,
-    WithMeta, operation as blockpy_intrinsics,
+    CounterScope, CounterSite, Del, DeoptEntrySource, FunctionExecutionMode, FunctionKind, GetAttr,
+    HasMeta, HasSemanticInstrId, InstrCodegen, InstrId, InstrKey, Literal, Load, LocalFunctionId,
+    LocalLocation, Meta, ModuleContentId, NameLocation, ParamKind, PersistentFunctionId,
+    ResolvedName, RuntimeFunctionId, RuntimeName, StorageLayout, Store, Visit, VisitMut, WithMeta,
+    operation as blockpy_intrinsics,
 };
 use soac_blockpy::passes::{
     CodegenModuleShape, ConstructorFieldValue, DirectFunctionIdGuardTest,
@@ -376,7 +376,7 @@ fn top_value_counter_storage_symbol_for_shared_state(shared_state: &SharedModule
 
 fn direct_function_symbol_scope_for_shared_state(
     shared_state: &SharedModuleState,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
 ) -> String {
     let mut scope = String::from("shared_");
     push_shared_module_symbol_identity_for_shared_state(&mut scope, shared_state);
@@ -387,7 +387,7 @@ fn direct_function_symbol_scope_for_shared_state(
 
 fn precompiled_direct_function_symbol_scope_for_shared_state(
     shared_state: &SharedModuleState,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
 ) -> String {
     let persistent = persistent_function_id_for_module_function(
         shared_state.module_name.as_str(),
@@ -1312,17 +1312,17 @@ fn predeclare_specialization_type_imports(
 
 struct ProfiledDirectCallSite {
     method_name: Option<String>,
-    targets: Vec<FunctionId>,
+    targets: Vec<RuntimeFunctionId>,
 }
 
 fn collect_profiled_direct_call_sites(
     module: &BlockPyModule<CodegenModuleShape>,
     function: &BlockPyFunction<CodegenModuleShape>,
-    call_target_specializations: &HashMap<InstrId, Vec<FunctionId>>,
+    call_target_specializations: &HashMap<InstrId, Vec<RuntimeFunctionId>>,
 ) -> Vec<ProfiledDirectCallSite> {
     struct Collector<'a> {
         module: &'a BlockPyModule<CodegenModuleShape>,
-        call_target_specializations: &'a HashMap<InstrId, Vec<FunctionId>>,
+        call_target_specializations: &'a HashMap<InstrId, Vec<RuntimeFunctionId>>,
         out: Vec<ProfiledDirectCallSite>,
     }
 
@@ -1516,7 +1516,7 @@ struct DeclaredJitFunction {
 }
 
 struct CompiledJitFunction {
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     function_qualname: String,
     param_count: usize,
     main_id: FuncId,
@@ -1590,15 +1590,15 @@ struct JitDataDeclarationSnapshot {
 }
 
 struct JitBatchPlan<'a> {
-    root_function_id: FunctionId,
+    root_function_id: RuntimeFunctionId,
     batch_functions: Vec<ProcessJitBatchFunction<'a>>,
     function_indices_to_define: Vec<usize>,
     function_compile_inputs: HashMap<usize, ReservedJitFunctionCompileInputs>,
-    compile_waiters: HashMap<FunctionId, Arc<ProcessJitCompileWaiter>>,
+    compile_waiters: HashMap<RuntimeFunctionId, Arc<ProcessJitCompileWaiter>>,
     module_declarations: JitModuleDeclarationSnapshot,
     isa: OwnedTargetIsa,
     module_plans: HashMap<usize, Arc<JitModulePlan>>,
-    predeclared: HashMap<FunctionId, DeclaredJitFunction>,
+    predeclared: HashMap<RuntimeFunctionId, DeclaredJitFunction>,
 }
 
 enum ReservedDirectFunctionBatch<'a> {
@@ -1853,7 +1853,7 @@ fn build_profiled_jit_module_plan(
     compile_session: Option<&crate::session::CompileSession>,
     precompile_module_index: Option<&PrecompileModuleIndex>,
     direct_owner_attr_specializations_by_function: &HashMap<
-        FunctionId,
+        RuntimeFunctionId,
         HashMap<DirectOwnerAttrKey, Vec<DirectOwnerAttrSpecialization>>,
     >,
 ) -> Result<Arc<JitModulePlan>, String> {
@@ -2019,13 +2019,13 @@ fn build_profiled_inline_callee_maps(
     compile_session: Option<&crate::session::CompileSession>,
     precompile_module_index: Option<&PrecompileModuleIndex>,
     direct_owner_attr_specializations_by_function: &HashMap<
-        FunctionId,
+        RuntimeFunctionId,
         HashMap<DirectOwnerAttrKey, Vec<DirectOwnerAttrSpecialization>>,
     >,
 ) -> Result<
     (
-        HashMap<FunctionId, BlockPyFunction<CodegenModuleShape>>,
-        HashMap<FunctionId, InlineCallee>,
+        HashMap<RuntimeFunctionId, BlockPyFunction<CodegenModuleShape>>,
+        HashMap<RuntimeFunctionId, InlineCallee>,
         InlinePlanModule,
     ),
     String,
@@ -2111,7 +2111,9 @@ fn build_profiled_inline_callee_maps(
     Ok((callee_functions, inline_callees, external_inline_plan))
 }
 
-fn straightline_constructor_ids_in_plan(inline_plan: &InlinePlanModule) -> HashSet<FunctionId> {
+fn straightline_constructor_ids_in_plan(
+    inline_plan: &InlinePlanModule,
+) -> HashSet<RuntimeFunctionId> {
     inline_plan
         .functions
         .iter()
@@ -2123,7 +2125,7 @@ fn straightline_constructor_ids_in_plan(inline_plan: &InlinePlanModule) -> HashS
 
 fn extend_external_inline_plan_for_function_ids(
     external_inline_plan: &mut InlinePlanModule,
-    function_ids: &HashSet<FunctionId>,
+    function_ids: &HashSet<RuntimeFunctionId>,
     compile_session: Option<&crate::session::CompileSession>,
     precompile_module_index: Option<&PrecompileModuleIndex>,
 ) -> Result<(), String> {
@@ -2246,7 +2248,7 @@ struct ProfiledMethodInlineFragment {
 }
 
 struct ProfiledMethodCallableGuardFragment {
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     entry_label: BlockLabel,
     blocks: Vec<Block<InstrCodegen>>,
 }
@@ -2262,14 +2264,14 @@ struct ProfiledRuntimeIterInlineCandidate {
 fn rewrite_profiled_no_arg_method_call_store_sites(
     function: &mut BlockPyFunction<CodegenModuleShape>,
     caller_constants: &mut Vec<InstrResolved>,
-    targets_by_instr_id: &HashMap<InstrId, Vec<FunctionId>>,
+    targets_by_instr_id: &HashMap<InstrId, Vec<RuntimeFunctionId>>,
     direct_owner_attr_specializations: &HashMap<
         DirectOwnerAttrKey,
         Vec<DirectOwnerAttrSpecialization>,
     >,
-    callees: &HashMap<FunctionId, InlineCallee>,
-    straightline_constructor_ids: &HashSet<FunctionId>,
-    runtime_constructor_function_ids: &mut HashSet<FunctionId>,
+    callees: &HashMap<RuntimeFunctionId, InlineCallee>,
+    straightline_constructor_ids: &HashSet<RuntimeFunctionId>,
+    runtime_constructor_function_ids: &mut HashSet<RuntimeFunctionId>,
 ) -> ProfiledMethodInlineRewriteStats {
     let mut stats = ProfiledMethodInlineRewriteStats::default();
     let original_blocks = std::mem::take(&mut function.blocks);
@@ -2310,16 +2312,16 @@ fn rewrite_profiled_no_arg_method_call_store_block(
     function: &mut BlockPyFunction<CodegenModuleShape>,
     caller_constants: &mut Vec<InstrResolved>,
     block: Block<InstrCodegen>,
-    targets_by_instr_id: &HashMap<InstrId, Vec<FunctionId>>,
+    targets_by_instr_id: &HashMap<InstrId, Vec<RuntimeFunctionId>>,
     direct_owner_attr_specializations: &HashMap<
         DirectOwnerAttrKey,
         Vec<DirectOwnerAttrSpecialization>,
     >,
-    callees: &HashMap<FunctionId, InlineCallee>,
-    straightline_constructor_ids: &HashSet<FunctionId>,
+    callees: &HashMap<RuntimeFunctionId, InlineCallee>,
+    straightline_constructor_ids: &HashSet<RuntimeFunctionId>,
     original_block_by_label: &HashMap<BlockLabel, Block<InstrCodegen>>,
     stats: &mut ProfiledMethodInlineRewriteStats,
-    runtime_constructor_function_ids: &mut HashSet<FunctionId>,
+    runtime_constructor_function_ids: &mut HashSet<RuntimeFunctionId>,
 ) -> Option<Vec<Block<InstrCodegen>>> {
     let Some(candidate) = find_profiled_no_arg_method_inline_candidate(
         caller_constants.as_slice(),
@@ -2533,15 +2535,15 @@ fn rewrite_profiled_runtime_iter_call_store_block(
     function: &mut BlockPyFunction<CodegenModuleShape>,
     caller_constants: &mut Vec<InstrResolved>,
     block: Block<InstrCodegen>,
-    targets_by_instr_id: &HashMap<InstrId, Vec<FunctionId>>,
+    targets_by_instr_id: &HashMap<InstrId, Vec<RuntimeFunctionId>>,
     direct_owner_attr_specializations: &HashMap<
         DirectOwnerAttrKey,
         Vec<DirectOwnerAttrSpecialization>,
     >,
-    callees: &HashMap<FunctionId, InlineCallee>,
-    straightline_constructor_ids: &HashSet<FunctionId>,
+    callees: &HashMap<RuntimeFunctionId, InlineCallee>,
+    straightline_constructor_ids: &HashSet<RuntimeFunctionId>,
     stats: &mut ProfiledMethodInlineRewriteStats,
-    runtime_constructor_function_ids: &mut HashSet<FunctionId>,
+    runtime_constructor_function_ids: &mut HashSet<RuntimeFunctionId>,
 ) -> Option<Vec<Block<InstrCodegen>>> {
     let candidate = find_profiled_runtime_iter_inline_candidate(
         caller_constants.as_slice(),
@@ -2736,8 +2738,8 @@ fn rewrite_profiled_runtime_iter_call_store_block(
 
 fn scalarizable_profiled_constructor_receiver(
     receiver: InstrCodegen,
-    constructor_function_id: Option<FunctionId>,
-    straightline_constructor_ids: &HashSet<FunctionId>,
+    constructor_function_id: Option<RuntimeFunctionId>,
+    straightline_constructor_ids: &HashSet<RuntimeFunctionId>,
 ) -> InstrCodegen {
     let Some(constructor_function_id) = constructor_function_id else {
         return receiver;
@@ -2757,14 +2759,14 @@ fn scalarizable_profiled_constructor_receiver(
 
 fn record_runtime_constructor_function_id(
     runtime_name: RuntimeName,
-    runtime_constructor_function_ids: &mut HashSet<FunctionId>,
-) -> Option<FunctionId> {
+    runtime_constructor_function_ids: &mut HashSet<RuntimeFunctionId>,
+) -> Option<RuntimeFunctionId> {
     let function_id = runtime_constructor_function_id(runtime_name)?;
     runtime_constructor_function_ids.insert(function_id);
     Some(function_id)
 }
 
-fn runtime_constructor_function_id(runtime_name: RuntimeName) -> Option<FunctionId> {
+fn runtime_constructor_function_id(runtime_name: RuntimeName) -> Option<RuntimeFunctionId> {
     let obj = unsafe { crate::module_constants::load_runtime_name_owned_by_id(runtime_name) };
     if obj.is_null() {
         unsafe { ffi::PyErr_Clear() };
@@ -2796,11 +2798,11 @@ fn rewrite_profiled_no_arg_method_call_store_block_with_callable_guard(
     caller_constants: &mut Vec<InstrResolved>,
     block: Block<InstrCodegen>,
     candidate: ProfiledMethodInlineCandidate,
-    targets: &[FunctionId],
-    callees: &HashMap<FunctionId, InlineCallee>,
+    targets: &[RuntimeFunctionId],
+    callees: &HashMap<RuntimeFunctionId, InlineCallee>,
     original_block_by_label: &HashMap<BlockLabel, Block<InstrCodegen>>,
     stats: &mut ProfiledMethodInlineRewriteStats,
-    runtime_constructor_function_ids: &mut HashSet<FunctionId>,
+    runtime_constructor_function_ids: &mut HashSet<RuntimeFunctionId>,
 ) -> Option<Vec<Block<InstrCodegen>>> {
     let continuation_label = function.name_gen.next_block_name();
     let receiver_temp =
@@ -2992,7 +2994,7 @@ fn rewrite_profiled_no_arg_method_call_store_block_with_callable_guard(
 
 fn callable_function_id_guard_term(
     callable_temp_name: &ResolvedName,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     then_label: BlockLabel,
     else_label: BlockLabel,
 ) -> BlockTerm<InstrCodegen> {
@@ -3132,14 +3134,14 @@ fn collect_runtime_iter_method_target_ids(
         DirectOwnerAttrKey,
         Vec<DirectOwnerAttrSpecialization>,
     >,
-    targets_by_instr_id: &HashMap<InstrId, Vec<FunctionId>>,
-) -> HashSet<FunctionId> {
+    targets_by_instr_id: &HashMap<InstrId, Vec<RuntimeFunctionId>>,
+) -> HashSet<RuntimeFunctionId> {
     struct Collector<'a> {
         module_constants: &'a [InstrResolved],
         direct_owner_attr_specializations:
             &'a HashMap<DirectOwnerAttrKey, Vec<DirectOwnerAttrSpecialization>>,
-        targets_by_instr_id: &'a HashMap<InstrId, Vec<FunctionId>>,
-        out: &'a mut HashSet<FunctionId>,
+        targets_by_instr_id: &'a HashMap<InstrId, Vec<RuntimeFunctionId>>,
+        out: &'a mut HashSet<RuntimeFunctionId>,
     }
 
     impl Visit<InstrCodegen> for Collector<'_> {
@@ -3201,7 +3203,7 @@ fn collect_runtime_iter_method_target_ids(
 fn find_profiled_no_arg_method_inline_candidate(
     module_constants: &[InstrResolved],
     block: &Block<InstrCodegen>,
-    targets_by_instr_id: &HashMap<InstrId, Vec<FunctionId>>,
+    targets_by_instr_id: &HashMap<InstrId, Vec<RuntimeFunctionId>>,
 ) -> Option<ProfiledMethodInlineCandidate> {
     block
         .body
@@ -3240,7 +3242,7 @@ fn find_profiled_no_arg_method_inline_candidate(
 fn find_profiled_runtime_iter_inline_candidate(
     module_constants: &[InstrResolved],
     block: &Block<InstrCodegen>,
-    targets_by_instr_id: &HashMap<InstrId, Vec<FunctionId>>,
+    targets_by_instr_id: &HashMap<InstrId, Vec<RuntimeFunctionId>>,
 ) -> Option<ProfiledRuntimeIterInlineCandidate> {
     block
         .body
@@ -3353,7 +3355,7 @@ fn load_codegen_temp(temp_name: &ResolvedName) -> InstrCodegen {
     InstrCodegen::Load(Load::new(temp_name.clone()).with_meta(Meta::synthetic()))
 }
 
-fn dedup_function_ids(function_ids: &[FunctionId]) -> Vec<FunctionId> {
+fn dedup_function_ids(function_ids: &[RuntimeFunctionId]) -> Vec<RuntimeFunctionId> {
     let mut seen = HashSet::new();
     function_ids
         .iter()
@@ -3706,7 +3708,7 @@ struct ProcessJitModule {
 }
 
 struct ProcessJitState {
-    direct_functions: HashMap<FunctionId, ProcessJitFunctionEntry>,
+    direct_functions: HashMap<RuntimeFunctionId, ProcessJitFunctionEntry>,
     module_constant_objects: HashMap<usize, ModuleConstantObjectBinding>,
     scalar_counter_storage: HashMap<usize, ScalarCounterStorageBinding>,
     top_value_counter_storage: HashMap<usize, TopValueCounterStorageBinding>,
@@ -4002,7 +4004,7 @@ impl ProcessJitState {
         Ok(declared)
     }
 
-    fn is_direct_function_ready(&self, function_id: FunctionId) -> bool {
+    fn is_direct_function_ready(&self, function_id: RuntimeFunctionId) -> bool {
         self.direct_functions
             .get(&function_id)
             .is_some_and(|entry| entry.ready_entry().is_some())
@@ -4031,7 +4033,7 @@ impl ProcessJitState {
     fn mark_direct_function_ready(
         &mut self,
         session: &Arc<crate::session::CompileSession>,
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
         code_ptr: *const u8,
         default_code_ptr: *const u8,
         param_count: usize,
@@ -4644,7 +4646,14 @@ impl ProcessJitState {
         jit_module: &mut JITModule,
         session: &Arc<crate::session::CompileSession>,
         compiled_functions: Vec<CompiledJitFunction>,
-    ) -> Result<Vec<(FunctionId, Arc<CompiledFunctionHandle>, JitCodegenStats)>, String> {
+    ) -> Result<
+        Vec<(
+            RuntimeFunctionId,
+            Arc<CompiledFunctionHandle>,
+            JitCodegenStats,
+        )>,
+        String,
+    > {
         for defined in &compiled_functions {
             define_compiled_function_bytes(
                 jit_module,
@@ -5018,7 +5027,7 @@ enum CompiledRunnerEntry {
 
 #[derive(Clone, Debug)]
 pub(crate) struct RuntimeJitDeoptTable {
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     function: Box<BlockPyFunction<CodegenModuleShape>>,
     module_constant_ptrs: Vec<ObjPtr>,
     #[cfg(not(test))]
@@ -5372,7 +5381,7 @@ impl RuntimeJitDeoptRecord {
         Ok(())
     }
 
-    pub(crate) fn describe(&self, function_id: FunctionId) -> String {
+    pub(crate) fn describe(&self, function_id: RuntimeFunctionId) -> String {
         format!(
             "function {}, record {}, resume_point {:?}, precision {:?}, locals {}, continuation {:?}",
             function_id,
@@ -5471,7 +5480,7 @@ impl RuntimeJitDeoptTable {
         Ok(())
     }
 
-    pub(crate) fn function_id(&self) -> FunctionId {
+    pub(crate) fn function_id(&self) -> RuntimeFunctionId {
         self.function_id
     }
 
@@ -7893,7 +7902,7 @@ impl ModuleConstantAccessTable {
 #[derive(Clone)]
 struct JitEmitCtx<'mc> {
     module: &'mc BlockPyModule<CodegenModuleShape>,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     function_kind: FunctionKind,
     shared_state: Option<&'mc crate::module_type::SharedModuleState>,
     inline_plan: &'mc InlinePlanModule,
@@ -7942,10 +7951,11 @@ struct JitEmitCtx<'mc> {
     exception_state_slots: ExceptionStateSlots,
     pop_handled_exception_ref: ir::FuncRef,
     direct_edge_stats: &'mc DirectEdgeStats,
-    direct_call_target_functions: &'mc HashMap<FunctionId, BlockPyFunction<CodegenModuleShape>>,
-    direct_call_functions: &'mc HashMap<FunctionId, DeclaredJitFunction>,
+    direct_call_target_functions:
+        &'mc HashMap<RuntimeFunctionId, BlockPyFunction<CodegenModuleShape>>,
+    direct_call_functions: &'mc HashMap<RuntimeFunctionId, DeclaredJitFunction>,
     call_target_counter_ids: &'mc HashMap<InstrId, CounterId>,
-    call_target_specializations: &'mc HashMap<InstrId, Vec<FunctionId>>,
+    call_target_specializations: &'mc HashMap<InstrId, Vec<RuntimeFunctionId>>,
     direct_owner_attr_specializations:
         Option<&'mc HashMap<DirectOwnerAttrKey, Vec<DirectOwnerAttrSpecialization>>>,
     call_direct_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
@@ -8379,7 +8389,7 @@ fn plan_jit_inlining(module: &BlockPyModule<CodegenModuleShape>) -> InlinePlanMo
 
 #[derive(Clone)]
 struct DirectMethodSpecialization {
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     descriptor_function_ref: RelocCallableRef,
     owner_type_ref: RelocTypeRef,
     type_version: u32,
@@ -8388,7 +8398,7 @@ struct DirectMethodSpecialization {
 
 #[derive(Clone)]
 struct DirectConstructorSpecialization {
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     init_function_ref: RelocCallableRef,
     owner_type_ref: RelocTypeRef,
     type_version: u32,
@@ -8397,12 +8407,12 @@ struct DirectConstructorSpecialization {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct DirectOwnerAttrKey {
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     attr_name: String,
 }
 
 impl DirectOwnerAttrKey {
-    fn new(function_id: FunctionId, attr_name: &str) -> Self {
+    fn new(function_id: RuntimeFunctionId, attr_name: &str) -> Self {
         Self {
             function_id,
             attr_name: attr_name.to_string(),
@@ -8418,7 +8428,7 @@ struct DirectOwnerAttrSpecialization {
 
 #[derive(Clone)]
 struct DirectFunctionSpecialization {
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     arg_plan: DirectCallArgPlan,
 }
 
@@ -8650,7 +8660,7 @@ impl DirectEdgeStats {
 
 fn direct_call_target_function<'a>(
     ctx: &'a JitEmitCtx<'_>,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
 ) -> Option<&'a BlockPyFunction<CodegenModuleShape>> {
     ctx.module
         .callable_defs
@@ -8770,7 +8780,7 @@ fn param_runtime_default_slot(
 
 fn validate_direct_call_compatibility(
     target_function: &BlockPyFunction<CodegenModuleShape>,
-    _direct_call_functions: &HashMap<FunctionId, DeclaredJitFunction>,
+    _direct_call_functions: &HashMap<RuntimeFunctionId, DeclaredJitFunction>,
     explicit_positional_arg_count: usize,
     implicit_positional_arg_count: usize,
     has_starred_arguments: bool,
@@ -11022,7 +11032,7 @@ fn lookup_counter_id(
 
 fn lookup_runtime_counter_id(
     counter_defs: &[CounterDef],
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     kind: &str,
 ) -> Option<CounterId> {
     lookup_counter_id(
@@ -12507,7 +12517,7 @@ fn annotate_typed_attr_accesses(
 
 fn direct_method_owner_attr_specializations(
     ctx: &JitEmitCtx<'_>,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     method_name: &str,
 ) -> Vec<DirectOwnerAttrSpecialization> {
     let key = DirectOwnerAttrKey::new(function_id, method_name);
@@ -12535,7 +12545,7 @@ fn direct_method_owner_attr_specializations(
 
 fn direct_constructor_owner_attr_specializations(
     ctx: &JitEmitCtx<'_>,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
 ) -> Vec<DirectOwnerAttrSpecialization> {
     let key = DirectOwnerAttrKey::new(function_id, "__init__");
     if let Some(predeclared) = ctx.direct_owner_attr_specializations {
@@ -12562,8 +12572,8 @@ fn direct_constructor_owner_attr_specializations(
 fn call_site_profiled_targets<'a>(
     call: &blockpy_intrinsics::Call<InstrCodegen>,
     ctx: &'a JitEmitCtx<'_>,
-    profiled_targets: Option<&'a [FunctionId]>,
-) -> Option<&'a [FunctionId]> {
+    profiled_targets: Option<&'a [RuntimeFunctionId]>,
+) -> Option<&'a [RuntimeFunctionId]> {
     if let Some(targets) = profiled_targets.filter(|targets| !targets.is_empty()) {
         return Some(targets);
     }
@@ -12577,7 +12587,7 @@ fn call_site_profiled_targets<'a>(
 fn direct_method_specializations_for_call_site(
     call: &blockpy_intrinsics::Call<InstrCodegen>,
     ctx: &JitEmitCtx<'_>,
-    profiled_targets: Option<&[FunctionId]>,
+    profiled_targets: Option<&[RuntimeFunctionId]>,
 ) -> Vec<DirectMethodSpecialization> {
     if ctx.shared_state.is_none() {
         return Vec::new();
@@ -12638,7 +12648,7 @@ fn direct_method_specializations_for_call_site(
 fn direct_constructor_specializations_for_call_site(
     call: &blockpy_intrinsics::Call<InstrCodegen>,
     ctx: &JitEmitCtx<'_>,
-    profiled_targets: Option<&[FunctionId]>,
+    profiled_targets: Option<&[RuntimeFunctionId]>,
 ) -> Vec<DirectConstructorSpecialization> {
     if ctx.shared_state.is_none() {
         return Vec::new();
@@ -12692,9 +12702,9 @@ fn direct_constructor_specializations_for_call_site(
 
 fn collect_call_direct_targets(
     function: &BlockPyFunction<CodegenModuleShape>,
-) -> HashSet<FunctionId> {
+) -> HashSet<RuntimeFunctionId> {
     struct CallDirectTargetCollector<'a> {
-        out: &'a mut HashSet<FunctionId>,
+        out: &'a mut HashSet<RuntimeFunctionId>,
     }
 
     impl Visit<InstrCodegen> for CallDirectTargetCollector<'_> {
@@ -12726,9 +12736,9 @@ fn codegen_expr_const_i64(
 
 fn collect_make_function_targets(
     function: &BlockPyFunction<CodegenModuleShape>,
-) -> HashSet<FunctionId> {
+) -> HashSet<RuntimeFunctionId> {
     struct MakeFunctionTargetCollector<'a> {
-        out: &'a mut HashSet<FunctionId>,
+        out: &'a mut HashSet<RuntimeFunctionId>,
     }
 
     impl Visit<InstrCodegen> for MakeFunctionTargetCollector<'_> {
@@ -12755,7 +12765,7 @@ pub(crate) fn is_synthetic_class_helper_function(
 
 fn collect_runtime_counter_ids_by_kind(
     counter_defs: &[CounterDef],
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     kind: &str,
 ) -> HashMap<InstrId, CounterId> {
     counter_defs
@@ -12788,7 +12798,7 @@ fn deopt_entry_source_for_resume_point(point: LocalEnvResumePoint) -> DeoptEntry
 
 fn collect_deopt_entry_counter_ids_by_kind(
     counter_defs: &[CounterDef],
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     kind: &str,
     deopt_resume_plan: &PlannedJitDeoptResumeFunction,
 ) -> HashMap<usize, CounterId> {
@@ -12816,7 +12826,7 @@ fn collect_deopt_entry_counter_ids_by_kind(
 struct SpecializationProfile<'a> {
     module_name: Option<&'a str>,
     counter_dump_path: Option<Cow<'a, Path>>,
-    planned_evidence: HashMap<FunctionId, FunctionProfileEvidence>,
+    planned_evidence: HashMap<RuntimeFunctionId, FunctionProfileEvidence>,
     behavior_change_indexed_stores: bool,
     profiled_cold_blocks: bool,
     guard_miss_deopt: bool,
@@ -12824,7 +12834,7 @@ struct SpecializationProfile<'a> {
 
 #[derive(Clone, Debug)]
 struct FunctionSpecializationInputs {
-    call_target_specializations: HashMap<InstrId, Vec<FunctionId>>,
+    call_target_specializations: HashMap<InstrId, Vec<RuntimeFunctionId>>,
     operator_specializations: HashMap<InstrId, Vec<u64>>,
     getitem_specializations: HashMap<InstrId, Vec<u64>>,
     setitem_specializations: HashMap<InstrId, Vec<u64>>,
@@ -12846,7 +12856,7 @@ fn load_planned_evidence_for_runtime_state(
     shared_state: Option<&SharedModuleState>,
     compile_session: Option<&crate::session::CompileSession>,
     specialization_mode: Option<SpecializationMode>,
-) -> Result<HashMap<FunctionId, FunctionProfileEvidence>, String> {
+) -> Result<HashMap<RuntimeFunctionId, FunctionProfileEvidence>, String> {
     if !matches!(
         specialization_mode,
         Some(SpecializationMode::Verify | SpecializationMode::Apply)
@@ -12897,7 +12907,7 @@ fn planned_evidence_for_shared_state(
     plan: &OptimizationPlan,
     shared_state: &SharedModuleState,
     compile_session: Option<&crate::session::CompileSession>,
-) -> Result<HashMap<FunctionId, FunctionProfileEvidence>, String> {
+) -> Result<HashMap<RuntimeFunctionId, FunctionProfileEvidence>, String> {
     let mut evidence_by_function = HashMap::new();
     for planned_function in &plan.functions {
         let current_function_id = planned_function.runtime_function_id(shared_state.module_id());
@@ -12929,7 +12939,7 @@ fn planned_evidence_for_precompile(
     module_name: &str,
     source_hash: u64,
     module: &BlockPyModule<CodegenModuleShape>,
-) -> Result<HashMap<FunctionId, FunctionProfileEvidence>, String> {
+) -> Result<HashMap<RuntimeFunctionId, FunctionProfileEvidence>, String> {
     let Some(plan_input) = plan_input else {
         return Ok(HashMap::new());
     };
@@ -12946,7 +12956,7 @@ fn planned_evidence_for_precompile(
     .map_err(|err| err.to_string())?;
 
     let module_id = module.module_name_gen.module_id();
-    let has_function = |function_id: FunctionId| {
+    let has_function = |function_id: RuntimeFunctionId| {
         module
             .callable_defs
             .iter()
@@ -12972,7 +12982,7 @@ fn planned_evidence_for_precompile(
                     return Ok(module_index
                         .and_then(|module_index| module_index.function_id_for_target(target)));
                 }
-                let target_function_id = FunctionId::new(module_id, target.local.as_u32());
+                let target_function_id = RuntimeFunctionId::new(module_id, target.local.as_u32());
                 Ok(has_function(target_function_id).then_some(target_function_id))
             })
             .map_err(|err| err.to_string())?;
@@ -12996,7 +13006,7 @@ fn resolve_planned_function_target(
     shared_state: &SharedModuleState,
     compile_session: Option<&crate::session::CompileSession>,
     target: &PersistentFunctionId,
-) -> Result<Option<FunctionId>, String> {
+) -> Result<Option<RuntimeFunctionId>, String> {
     let target_shared_state_owner;
     let target_shared_state = if target.module.module_name == shared_state.module_name
         && target.module.source_hash == shared_state.source_hash
@@ -13016,7 +13026,8 @@ fn resolve_planned_function_target(
         target_shared_state_owner = target_shared_state;
         target_shared_state_owner.as_ref()
     };
-    let function_id = FunctionId::new(target_shared_state.module_id(), target.local.as_u32());
+    let function_id =
+        RuntimeFunctionId::new(target_shared_state.module_id(), target.local.as_u32());
     Ok(target_shared_state
         .lookup_function(function_id)
         .map(|function| function.function_id))
@@ -13081,7 +13092,7 @@ impl<'a> SpecializationProfile<'a> {
     fn from_precompile(
         module_name: &'a str,
         counter_dump_path: Option<&'a Path>,
-        planned_evidence: HashMap<FunctionId, FunctionProfileEvidence>,
+        planned_evidence: HashMap<RuntimeFunctionId, FunctionProfileEvidence>,
     ) -> Result<Self, String> {
         Ok(Self {
             module_name: Some(module_name),
@@ -13104,8 +13115,8 @@ impl<'a> SpecializationProfile<'a> {
 
     fn call_target_specializations(
         &self,
-        function_id: FunctionId,
-    ) -> Result<HashMap<InstrId, Vec<FunctionId>>, String> {
+        function_id: RuntimeFunctionId,
+    ) -> Result<HashMap<InstrId, Vec<RuntimeFunctionId>>, String> {
         if let Some(evidence) = self.planned_evidence.get(&function_id) {
             return Ok(evidence.call_target_specializations.clone());
         }
@@ -13120,7 +13131,7 @@ impl<'a> SpecializationProfile<'a> {
 
     fn operator_specializations(
         &self,
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
     ) -> Result<HashMap<InstrId, Vec<u64>>, String> {
         if let Some(evidence) = self.planned_evidence.get(&function_id) {
             return Ok(evidence.operator_specializations.clone());
@@ -13136,7 +13147,7 @@ impl<'a> SpecializationProfile<'a> {
 
     fn getitem_specializations(
         &self,
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
     ) -> Result<HashMap<InstrId, Vec<u64>>, String> {
         if let Some(evidence) = self.planned_evidence.get(&function_id) {
             return Ok(evidence.getitem_specializations.clone());
@@ -13152,7 +13163,7 @@ impl<'a> SpecializationProfile<'a> {
 
     fn setitem_specializations(
         &self,
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
     ) -> Result<HashMap<InstrId, Vec<u64>>, String> {
         if let Some(evidence) = self.planned_evidence.get(&function_id) {
             return Ok(evidence.setitem_specializations.clone());
@@ -13168,7 +13179,7 @@ impl<'a> SpecializationProfile<'a> {
 
     fn branch_preferences(
         &self,
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
     ) -> Result<HashMap<InstrId, bool>, String> {
         if let Some(evidence) = self.planned_evidence.get(&function_id) {
             return Ok(evidence.branch_prefer_true.clone());
@@ -13193,7 +13204,7 @@ impl<'a> SpecializationProfile<'a> {
 
     fn field_index_specializations(
         &self,
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
     ) -> Result<HashMap<String, Vec<FieldIndexSpecialization>>, String> {
         if self.planned_evidence.contains_key(&function_id) {
             return Ok(HashMap::new());
@@ -13203,7 +13214,7 @@ impl<'a> SpecializationProfile<'a> {
 
     fn field_index_specializations_by_instr(
         &self,
-        function_id: FunctionId,
+        function_id: RuntimeFunctionId,
     ) -> Result<HashMap<InstrId, Vec<FieldIndexSpecialization>>, String> {
         let Some(evidence) = self.planned_evidence.get(&function_id) else {
             return Ok(HashMap::new());
@@ -13246,8 +13257,8 @@ fn existing_counter_dump_path(path: Option<&Path>) -> Option<&Path> {
 
 fn load_call_target_specializations(
     module_name: &str,
-    function_id: FunctionId,
-) -> Result<HashMap<InstrId, Vec<FunctionId>>, String> {
+    function_id: RuntimeFunctionId,
+) -> Result<HashMap<InstrId, Vec<RuntimeFunctionId>>, String> {
     if specialization_mode_is_profile()? {
         return Ok(HashMap::new());
     }
@@ -13523,7 +13534,7 @@ fn resolve_reloc_callable_ref_to_object(
 fn owner_attr_function_id_for_type_ref(
     owner_type_ref: &RelocTypeRef,
     attr_name: &str,
-) -> Result<Option<FunctionId>, String> {
+) -> Result<Option<RuntimeFunctionId>, String> {
     let callable_ref = RelocCallableRef::OwnerAttr {
         owner_type_ref: owner_type_ref.clone(),
         attr_name: attr_name.to_string(),
@@ -13532,10 +13543,10 @@ fn owner_attr_function_id_for_type_ref(
         return Ok(None);
     };
     let packed = unsafe { crate::PyFunction_GetSoacFunctionId(callable as *mut ffi::PyObject) };
-    if packed == FunctionId::global().to_packed_runtime_u64() {
+    if packed == RuntimeFunctionId::global().to_packed_runtime_u64() {
         return Ok(None);
     }
-    Ok(Some(FunctionId::from_packed_runtime_u64(packed)))
+    Ok(Some(RuntimeFunctionId::from_packed_runtime_u64(packed)))
 }
 
 fn ensure_reloc_callable_symbol_registered(
@@ -13983,7 +13994,7 @@ fn emit_exact_callable_type_version_match_bool01(
 fn emit_exact_function_id_match_bool01(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
-    expected_function_id: FunctionId,
+    expected_function_id: RuntimeFunctionId,
     ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
 ) -> Result<SoacValue, String> {
@@ -17140,7 +17151,7 @@ fn emit_codegen_simple_call_with_local_env(
     call: &soac_blockpy::block_py::Call<InstrCodegen>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
-    profiled_targets: Option<&[FunctionId]>,
+    profiled_targets: Option<&[RuntimeFunctionId]>,
     typed_access: Option<&TypedCallAccessPlan>,
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
@@ -19397,7 +19408,7 @@ fn emit_typed_codegen_direct_callable_specialization_result_with_local_env(
     fb: &mut FunctionBuilder<'_>,
     call: &TypedCall<InstrTyped>,
     legacy_call: &soac_blockpy::block_py::Call<InstrCodegen>,
-    profiled_targets: Option<&[FunctionId]>,
+    profiled_targets: Option<&[RuntimeFunctionId]>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     demand: ResultDemand,
@@ -20110,7 +20121,7 @@ fn emit_typed_direct_call_guard_test_value_with_local_env(
     let (raw_value, ownership, facts) = value.expect_pyobject("typed direct-call guard input");
 
     let guard = match &op.kind {
-        TypedDirectCallGuardTestKind::FunctionId { function_id } => {
+        TypedDirectCallGuardTestKind::RuntimeFunctionId { function_id } => {
             emit_exact_function_id_match_bool01(fb, raw_value, *function_id, emit_ctx, codegen_env)?
         }
         TypedDirectCallGuardTestKind::ExactCallableTypeVersion {
@@ -21883,9 +21894,9 @@ fn collect_process_jit_batch_functions<'a>(
 fn resolve_process_jit_batch_function<'a>(
     session: &Arc<crate::session::CompileSession>,
     direct_call_resolver: Option<&'a crate::module_type::SharedModuleState>,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
 ) -> Result<Option<ProcessJitBatchFunction<'a>>, String> {
-    if function_id == FunctionId::global() {
+    if function_id == RuntimeFunctionId::global() {
         return Ok(None);
     }
     if let Some(shared_state) = direct_call_resolver
@@ -21994,7 +22005,7 @@ impl ProcessJitEngine {
 
     fn streaming_batch_direct_dependencies(
         plan: &JitBatchPlan<'_>,
-    ) -> Result<HashMap<FunctionId, HashSet<FunctionId>>, String> {
+    ) -> Result<HashMap<RuntimeFunctionId, HashSet<RuntimeFunctionId>>, String> {
         let function_ids_to_define: HashSet<_> = plan
             .function_indices_to_define
             .iter()
@@ -22022,9 +22033,9 @@ impl ProcessJitEngine {
     }
 
     fn take_streaming_commit_ready_functions(
-        pending: &mut HashMap<FunctionId, CompiledJitFunction>,
-        remaining: &HashSet<FunctionId>,
-        dependencies: &HashMap<FunctionId, HashSet<FunctionId>>,
+        pending: &mut HashMap<RuntimeFunctionId, CompiledJitFunction>,
+        remaining: &HashSet<RuntimeFunctionId>,
+        dependencies: &HashMap<RuntimeFunctionId, HashSet<RuntimeFunctionId>>,
     ) -> Vec<CompiledJitFunction> {
         let mut commit_ids: HashSet<_> = pending.keys().copied().collect();
         let mut changed = true;
@@ -22264,7 +22275,7 @@ impl ProcessJitEngine {
             .callable_defs
             .iter()
             .filter(|function| {
-                function.function_id != FunctionId::global()
+                function.function_id != RuntimeFunctionId::global()
                     && function.execution_mode() == FunctionExecutionMode::Jit
             })
             .cloned()
@@ -23395,7 +23406,7 @@ fn record_jit_bb_map(
     symbol: &str,
     code_id: u64,
     artifact: &DefinedFunctionArtifact,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     function_qualname: &str,
     entry_kind: &str,
 ) {
@@ -23443,7 +23454,7 @@ fn register_jit_signal_diagnostics(
     symbol: &str,
     code_ptr: *const u8,
     artifact: &DefinedFunctionArtifact,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     function_qualname: &str,
     entry_kind: &str,
 ) {
@@ -23661,7 +23672,7 @@ fn default_direct_function_symbol(
     scoped_jit_symbol(&base, symbol_scope)
 }
 
-fn direct_function_symbol_scope(function_id: FunctionId, symbol_id: u64) -> String {
+fn direct_function_symbol_scope(function_id: RuntimeFunctionId, symbol_id: u64) -> String {
     format!("fn_{}_{}", function_id.to_packed_runtime_u64(), symbol_id)
 }
 
@@ -24304,8 +24315,8 @@ struct PrecompileIndexedModule {
 #[derive(Debug, Clone, Default)]
 pub struct PrecompileModuleIndex {
     modules_by_identity: HashMap<(String, u64), PrecompileIndexedModule>,
-    functions_by_id: HashMap<FunctionId, PrecompileIndexedFunction>,
-    ambiguous_function_ids: HashSet<FunctionId>,
+    functions_by_id: HashMap<RuntimeFunctionId, PrecompileIndexedFunction>,
+    ambiguous_function_ids: HashSet<RuntimeFunctionId>,
 }
 
 impl PrecompileModuleIndex {
@@ -24361,29 +24372,35 @@ impl PrecompileModuleIndex {
         Ok(())
     }
 
-    fn function_id_for_target(&self, target: &PersistentFunctionId) -> Option<FunctionId> {
+    fn function_id_for_target(&self, target: &PersistentFunctionId) -> Option<RuntimeFunctionId> {
         let module = self
             .modules_by_identity
             .get(&(target.module.module_name.clone(), target.module.source_hash))?;
-        let function_id = FunctionId::new(module.module_id, target.local.as_u32());
+        let function_id = RuntimeFunctionId::new(module.module_id, target.local.as_u32());
         self.function(function_id).map(|_| function_id)
     }
 
-    fn function(&self, function_id: FunctionId) -> Option<&PrecompileIndexedFunction> {
+    fn function(&self, function_id: RuntimeFunctionId) -> Option<&PrecompileIndexedFunction> {
         if self.ambiguous_function_ids.contains(&function_id) {
             return None;
         }
         self.functions_by_id.get(&function_id)
     }
 
-    fn inline_plan_for_function(&self, function_id: FunctionId) -> Option<&InlinePlanModule> {
+    fn inline_plan_for_function(
+        &self,
+        function_id: RuntimeFunctionId,
+    ) -> Option<&InlinePlanModule> {
         let function = self.function(function_id)?;
         self.modules_by_identity
             .get(&(function.module_name.clone(), function.source_hash))
             .map(|module| &module.inline_plan)
     }
 
-    fn precompiled_symbol_scope_for_function(&self, function_id: FunctionId) -> Option<String> {
+    fn precompiled_symbol_scope_for_function(
+        &self,
+        function_id: RuntimeFunctionId,
+    ) -> Option<String> {
         let function = self.function(function_id)?;
         Some(precompiled_direct_function_symbol_scope_for_persistent(
             &function.persistent_id,
@@ -24395,7 +24412,7 @@ fn precompile_external_direct_call_target_functions(
     module: &BlockPyModule<CodegenModuleShape>,
     profile: &SpecializationProfile<'_>,
     module_index: Option<&PrecompileModuleIndex>,
-) -> Result<HashMap<FunctionId, BlockPyFunction<CodegenModuleShape>>, String> {
+) -> Result<HashMap<RuntimeFunctionId, BlockPyFunction<CodegenModuleShape>>, String> {
     let Some(module_index) = module_index else {
         return Ok(HashMap::new());
     };
@@ -25082,7 +25099,8 @@ struct BuildSpecializedFunctionOptions {
     direct_owner_attr_specializations:
         Option<HashMap<DirectOwnerAttrKey, Vec<DirectOwnerAttrSpecialization>>>,
     specialization_inputs: Option<FunctionSpecializationInputs>,
-    external_direct_call_target_functions: HashMap<FunctionId, BlockPyFunction<CodegenModuleShape>>,
+    external_direct_call_target_functions:
+        HashMap<RuntimeFunctionId, BlockPyFunction<CodegenModuleShape>>,
 }
 
 struct PreparedSpecializedTypedFunction {
@@ -25175,7 +25193,7 @@ fn prepare_specialized_typed_function(
     field_index_specializations_by_instr: &HashMap<InstrId, Vec<FieldIndexSpecialization>>,
     specialize_field_stores: bool,
     call_specialization_ctx: &CallSpecializationCtx<'_>,
-    call_target_specializations: &HashMap<InstrId, Vec<FunctionId>>,
+    call_target_specializations: &HashMap<InstrId, Vec<RuntimeFunctionId>>,
 ) -> Result<PreparedSpecializedTypedFunction, String> {
     let mut typed_function = lower_codegen_function_to_typed(function.clone());
     annotate_typed_function_value_facts(&mut typed_function, value_facts);
@@ -25222,7 +25240,7 @@ fn build_cranelift_run_bb_specialized_function(
     direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
     specialization_profile: Option<&SpecializationProfile<'_>>,
     symbol_scope: Option<&str>,
-    predeclared_direct_functions: Option<&HashMap<FunctionId, DeclaredJitFunction>>,
+    predeclared_direct_functions: Option<&HashMap<RuntimeFunctionId, DeclaredJitFunction>>,
     options: BuildSpecializedFunctionOptions,
 ) -> Result<BuiltSpecializedFunction, String> {
     let block_count = function.blocks.len();
@@ -27082,7 +27100,7 @@ fn define_shared_vectorcall_trampoline(
         symbol_name,
         code_ptr.cast::<u8>(),
         &main_artifact,
-        FunctionId::global(),
+        RuntimeFunctionId::global(),
         symbol_name,
         "direct_vectorcall_trampoline",
     );

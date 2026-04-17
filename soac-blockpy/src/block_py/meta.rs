@@ -1,4 +1,4 @@
-use super::{BlockLabel, FunctionId};
+use super::{BlockLabel, RuntimeFunctionId};
 use ruff_python_ast::{self as ast, HasNodeIndex};
 use ruff_text_size::{Ranged, TextRange};
 use std::fmt;
@@ -60,12 +60,12 @@ impl fmt::Display for InstrId {
 )]
 #[rkyv(derive(Hash, PartialEq, Eq, Debug))]
 pub struct InstrKey {
-    pub function_id: FunctionId,
+    pub function_id: RuntimeFunctionId,
     pub instr_id: InstrId,
 }
 
 impl InstrKey {
-    pub const fn new(function_id: FunctionId, instr_id: InstrId) -> Self {
+    pub const fn new(function_id: RuntimeFunctionId, instr_id: InstrId) -> Self {
         Self {
             function_id,
             instr_id,
@@ -173,7 +173,7 @@ pub trait HasSemanticInstrId: HasMeta {
             .expect("semantic codegen instruction id should be assigned")
     }
 
-    fn semantic_instr_key(&self, function_id: FunctionId) -> InstrKey {
+    fn semantic_instr_key(&self, function_id: RuntimeFunctionId) -> InstrKey {
         InstrKey::new(function_id, self.semantic_instr_id())
     }
 }

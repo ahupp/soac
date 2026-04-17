@@ -35,7 +35,7 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 #[cfg(test)]
 use pyo3::types::PyAnyMethods;
-use soac_blockpy::block_py::{FunctionExecutionMode, FunctionId, FunctionKind, ParamKind};
+use soac_blockpy::block_py::{FunctionExecutionMode, FunctionKind, ParamKind, RuntimeFunctionId};
 use soac_blockpy::passes::CodegenModuleShape;
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::any::Any;
@@ -392,7 +392,7 @@ struct FunctionEnv {
 #[repr(C)]
 struct PyFunctionJitExtra {
     function_env_ptr: *mut c_void,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     function_env: Box<FunctionEnv>,
     binding_plan: DirectArgBindingPlan,
     entry_plan: jit::RuntimeFunctionEntryPlan,
@@ -932,7 +932,7 @@ pub unsafe fn start_background_jit_compile_for_module(
 
 unsafe fn make_clif_function_data(
     callable: *mut ffi::PyObject,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     module_runtime: jit::ModuleRuntimeContext,
 ) -> Result<*mut c_void, ()> {
     let module_state = module_runtime.shared_module_state_owner.clone();
@@ -999,7 +999,7 @@ unsafe fn py_function_jit_extra(
 
 pub unsafe fn registered_clif_function_id(
     function: *mut ffi::PyObject,
-) -> Result<Option<FunctionId>, ()> {
+) -> Result<Option<RuntimeFunctionId>, ()> {
     if ffi::PyFunction_Check(function) == 0 {
         return Ok(None);
     }
@@ -1007,12 +1007,12 @@ pub unsafe fn registered_clif_function_id(
     if packed == 0 {
         return Ok(None);
     }
-    Ok(Some(FunctionId::from_packed_runtime_u64(packed)))
+    Ok(Some(RuntimeFunctionId::from_packed_runtime_u64(packed)))
 }
 
 pub unsafe fn registered_clif_type_function_id(
     type_obj: *mut ffi::PyObject,
-) -> Result<Option<FunctionId>, ()> {
+) -> Result<Option<RuntimeFunctionId>, ()> {
     if ffi::PyType_Check(type_obj) == 0 {
         return Ok(None);
     }
@@ -1024,7 +1024,7 @@ pub unsafe fn registered_clif_type_function_id(
     if packed == 0 {
         return Ok(None);
     }
-    Ok(Some(FunctionId::from_packed_runtime_u64(packed)))
+    Ok(Some(RuntimeFunctionId::from_packed_runtime_u64(packed)))
 }
 
 unsafe fn register_owner_type_for_function(
@@ -1203,7 +1203,7 @@ unsafe fn lookup_exact_owner_types_for_constructor_object(
 }
 
 pub unsafe fn lookup_exact_owner_types_for_method(
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     method_name: &str,
 ) -> Result<Vec<DirectMethodOwnerType>, ()> {
     let Ok(registry) = function_owner_type_registry() else {
@@ -1274,7 +1274,7 @@ pub unsafe fn lookup_exact_owner_types_for_method(
 }
 
 pub unsafe fn lookup_exact_owner_types_for_constructor(
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
 ) -> Result<Vec<DirectConstructorOwnerType>, ()> {
     let Ok(registry) = function_owner_type_registry() else {
         return Ok(Vec::new());
@@ -2147,7 +2147,7 @@ pub(crate) unsafe extern "C" fn direct_compile_function_env(
 
 pub(crate) unsafe fn register_clif_direct_metadata(
     function: *mut ffi::PyObject,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     module_runtime: jit::ModuleRuntimeContext,
 ) -> Result<(), ()> {
     if ffi::PyFunction_Check(function) == 0 {
@@ -2174,7 +2174,7 @@ pub(crate) unsafe fn register_clif_direct_metadata(
 
 pub unsafe fn register_clif_vectorcall(
     function: *mut ffi::PyObject,
-    function_id: FunctionId,
+    function_id: RuntimeFunctionId,
     module_runtime: jit::ModuleRuntimeContext,
 ) -> Result<(), ()> {
     if ffi::PyFunction_Check(function) == 0 {
@@ -2653,7 +2653,7 @@ mod tests {
         Python::attach(|py| unsafe {
             TEST_SOAC_METADATA_DROPS.store(0, Ordering::SeqCst);
             let function = make_test_function(py);
-            let function_id = FunctionId::new(7, 11);
+            let function_id = RuntimeFunctionId::new(7, 11);
             let metadata = Box::into_raw(Box::new(123usize)) as *mut c_void;
             assert_eq!(
                 PyFunction_SetSoacMetadata(
@@ -2711,7 +2711,7 @@ mod tests {
             TEST_SOAC_METADATA_DROPS.store(0, Ordering::SeqCst);
             let (_module, cls) = make_test_module(py);
             let class_obj = cls.as_ptr();
-            let function_id = FunctionId::new(9, 3);
+            let function_id = RuntimeFunctionId::new(9, 3);
             let metadata = Box::into_raw(Box::new(321usize)) as *mut c_void;
             assert_eq!(
                 PyType_SetSoacMetadata(
@@ -2769,7 +2769,7 @@ mod tests {
             let (module, cls) = make_test_module(py);
             let owner_type = cls.as_ptr() as *mut ffi::PyTypeObject;
             let init_function = class_dict_function(owner_type, c"__init__");
-            let function_id = FunctionId::new(10, 4);
+            let function_id = RuntimeFunctionId::new(10, 4);
             assert_eq!(
                 PyFunction_SetSoacMetadata(
                     init_function,
@@ -2871,7 +2871,7 @@ mod tests {
             let (module, cls) = make_test_module(py);
             let owner_type = cls.as_ptr() as *mut ffi::PyTypeObject;
             let init_function = class_dict_function(owner_type, c"__init__");
-            let function_id = FunctionId::new(10, 7);
+            let function_id = RuntimeFunctionId::new(10, 7);
             assert_eq!(
                 PyFunction_SetSoacMetadata(
                     init_function,
@@ -2905,7 +2905,7 @@ mod tests {
             );
             let owner_type = cls.as_ptr() as *mut ffi::PyTypeObject;
             let init_function = class_dict_function(owner_type, c"__init__");
-            let function_id = FunctionId::new(10, 8);
+            let function_id = RuntimeFunctionId::new(10, 8);
             assert_eq!(
                 PyFunction_SetSoacMetadata(
                     init_function,

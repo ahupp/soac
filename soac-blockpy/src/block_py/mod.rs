@@ -61,7 +61,7 @@ pub(crate) use map::{
 };
 pub use map::{MapInstr, Mappable, TryMapInstr};
 pub use name_gen::{
-    BlockLabel, FunctionId, FunctionNameGen, LocalFunctionId, ModuleContentId, ModuleNameGen,
+    BlockLabel, FunctionNameGen, LocalFunctionId, ModuleContentId, ModuleNameGen,
     PersistentFunctionId, RuntimeFunctionId, RuntimeModuleId, SerializedFunctionDebugName,
     SerializedFunctionId, SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity,
 };
@@ -1120,7 +1120,7 @@ impl FunctionName {
 
 #[derive(Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct BlockPyFunction<P: ModuleShape> {
-    pub function_id: FunctionId,
+    pub function_id: RuntimeFunctionId,
     #[rkyv(with = rkyv::with::Skip)]
     pub name_gen: FunctionNameGen,
     pub names: FunctionName,

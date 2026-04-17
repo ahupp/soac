@@ -1,7 +1,8 @@
 use crate::block_py::pretty::BlockPyPrettyPrint;
 use crate::block_py::{
-    instr_any, Block, BlockPyFunction, BlockPyModule, BlockTerm, FunctionId, HasMeta, InstrCodegen,
+    instr_any, Block, BlockPyFunction, BlockPyModule, BlockTerm, HasMeta, InstrCodegen,
     InstrCodegenOp, InstrId, InstrResolved, Literal, LocalLocation, NameLike, NameLocation,
+    RuntimeFunctionId,
 };
 use crate::CodegenModuleShape;
 use std::collections::{HashMap, HashSet};
@@ -10,20 +11,20 @@ use std::collections::{HashMap, HashSet};
     Clone, Debug, Default, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
 pub struct EscapeSummaryModule {
-    pub functions: HashMap<crate::block_py::FunctionId, FunctionEscapeSummary>,
+    pub functions: HashMap<crate::block_py::RuntimeFunctionId, FunctionEscapeSummary>,
 }
 
 impl EscapeSummaryModule {
     pub fn function(
         &self,
-        function_id: crate::block_py::FunctionId,
+        function_id: crate::block_py::RuntimeFunctionId,
     ) -> Option<&FunctionEscapeSummary> {
         self.functions.get(&function_id)
     }
 
     pub fn non_escaping_constructor(
         &self,
-        function_id: crate::block_py::FunctionId,
+        function_id: crate::block_py::RuntimeFunctionId,
     ) -> Option<&NonEscapingConstructorSummary> {
         self.function(function_id)
             .and_then(|summary| summary.non_escaping_constructor.as_ref())
@@ -31,7 +32,7 @@ impl EscapeSummaryModule {
 
     pub fn straightline_field_initializer(
         &self,
-        function_id: crate::block_py::FunctionId,
+        function_id: crate::block_py::RuntimeFunctionId,
     ) -> Option<&FieldInitializerConstructorSummary> {
         self.function(function_id)
             .and_then(|summary| summary.straightline_field_initializer.as_ref())
@@ -39,7 +40,7 @@ impl EscapeSummaryModule {
 
     pub fn remap_function_ids(
         &mut self,
-        remap: impl Fn(crate::block_py::FunctionId) -> crate::block_py::FunctionId + Copy,
+        remap: impl Fn(crate::block_py::RuntimeFunctionId) -> crate::block_py::RuntimeFunctionId + Copy,
     ) {
         self.functions = std::mem::take(&mut self.functions)
             .into_iter()
@@ -137,7 +138,7 @@ pub struct FunctionEscapeSummary {
 impl FunctionEscapeSummary {
     fn remap_function_ids(
         &mut self,
-        remap: impl Fn(crate::block_py::FunctionId) -> crate::block_py::FunctionId + Copy,
+        remap: impl Fn(crate::block_py::RuntimeFunctionId) -> crate::block_py::RuntimeFunctionId + Copy,
     ) {
         for allocation in &mut self.non_escaping_constructor_allocations {
             allocation.constructor_function_id = remap(allocation.constructor_function_id);
@@ -169,7 +170,7 @@ pub struct ConstructorFieldStore {
 pub struct NonEscapingConstructorAllocationSummary {
     pub local_name: String,
     pub local_location: LocalLocation,
-    pub constructor_function_id: FunctionId,
+    pub constructor_function_id: RuntimeFunctionId,
     pub call_instr_id: Option<InstrId>,
     pub field_reads: Vec<ConstructorFieldAccess>,
     pub field_writes: Vec<ConstructorFieldAccess>,
@@ -239,7 +240,7 @@ pub fn summarize_module_escapes(module: &BlockPyModule<CodegenModuleShape>) -> E
 fn summarize_non_escaping_constructor_allocations(
     module: &BlockPyModule<CodegenModuleShape>,
     function: &BlockPyFunction<CodegenModuleShape>,
-    straightline_constructor_ids: &HashSet<FunctionId>,
+    straightline_constructor_ids: &HashSet<RuntimeFunctionId>,
 ) -> Vec<NonEscapingConstructorAllocationSummary> {
     let mut allocations = Vec::new();
     let block_by_label = function
@@ -285,7 +286,7 @@ fn summarize_constructor_allocation_uses_in_block(
     module: &BlockPyModule<CodegenModuleShape>,
     local_location: LocalLocation,
     local_name: String,
-    constructor_function_id: FunctionId,
+    constructor_function_id: RuntimeFunctionId,
     call_instr_id: Option<InstrId>,
     remaining_body: &[InstrCodegen],
     term: &BlockTerm<InstrCodegen>,
