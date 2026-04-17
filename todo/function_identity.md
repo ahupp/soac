@@ -25,9 +25,9 @@ pub struct RuntimeModuleId(u32);
 // Valid only inside one running process / CompileSession.
 pub struct RuntimeFunctionId(u64);
 
-// Valid only inside one serialized artifact after reading its side tables.
+// Valid only inside one serialized artifact after reading its module side table.
 pub struct SerializedModuleId(u32);
-pub struct SerializedFunctionId(u32);
+pub struct SerializedFunctionId(u64);
 
 pub struct ModuleContentId {
     pub module_name: String,
@@ -48,12 +48,13 @@ through a module table before optimization decisions are built.
 ## Serialized side tables
 
 Do not repeat `{module_name, source_hash, local_function_id}` at every use site.
-Persist compact ids plus side tables:
+Persist compact ids plus side tables. The serialized function id can stay
+packed, but its module half is a serialized module-table index, not a
+process-local runtime module id:
 
 ```rust
 pub struct SerializedIdentityTables {
     pub modules: Vec<SerializedModuleIdentity>,
-    pub functions: Vec<SerializedFunctionIdentity>,
     pub debug_names: Vec<SerializedFunctionDebugName>,
 }
 
@@ -63,10 +64,8 @@ pub struct SerializedModuleIdentity {
     pub cache_identity: Option<String>,
 }
 
-pub struct SerializedFunctionIdentity {
-    pub module: SerializedModuleId,
-    pub local: LocalFunctionId,
-}
+// high 32 bits = SerializedModuleId, low 32 bits = LocalFunctionId.
+pub struct SerializedFunctionId(u64);
 
 pub struct SerializedFunctionDebugName {
     pub function: SerializedFunctionId,
@@ -74,9 +73,9 @@ pub struct SerializedFunctionDebugName {
 }
 ```
 
-Important invariant: `SerializedFunctionIdentity` is identity-only. Do not put
-`qualname` or other display/debug metadata in it. Debug metadata is looked up
-through a separate side table keyed by `SerializedFunctionId`.
+Important invariant: `SerializedFunctionId` is artifact-local identity only. Do
+not put `qualname` or other display/debug metadata in it. Debug metadata is
+looked up through a separate side table keyed by `SerializedFunctionId`.
 
 This keeps the hot/persistent shape compact while making it clear that qualnames
 are not part of identity. Duplicate local/generated/nested qualnames are allowed
@@ -92,7 +91,7 @@ Use explicit resolution steps at artifact boundaries:
    - resolve observed call targets into `PersistentFunctionId`.
 
 2. Optimization decision output:
-   - write one module/function side table for the artifact;
+   - write one module side table for the artifact;
    - decisions refer to `SerializedFunctionId`;
    - optional debug output resolves `SerializedFunctionId` through
      `debug_names`.
@@ -119,8 +118,9 @@ Use explicit resolution steps at artifact boundaries:
 3. Introduce `PersistentFunctionId` and use it for optimization-plan targets.
 4. Change `FunctionOptimizationPlan` to store `LocalFunctionId`; the enclosing
    plan already identifies the module.
-5. Add serialized module/function/debug side tables for `.opt` and counter-derived
-   decision artifacts.
+5. Add serialized module/debug side tables for `.opt` and counter-derived
+   decision artifacts; use packed `SerializedFunctionId` values whose module
+   half indexes the serialized module table.
 6. Teach `ProfileEvidenceStore` to resolve raw counter ids once at load time.
 7. Change precompile indexing and symbol generation to accept persistent ids.
 8. Finally rename the old `FunctionId` to `RuntimeFunctionId` once remaining

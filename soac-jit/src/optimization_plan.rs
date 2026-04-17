@@ -2,7 +2,7 @@ use crate::counter_dump::{CounterDumpFile, collect_type_key_layouts, collect_typ
 use anyhow::{Context, Result, bail};
 use soac_blockpy::block_py::{
     BlockPyFunction, BlockPyModule, ChildVisitable, FunctionId, HasSemanticInstrId, InstrCodegen,
-    InstrId, Literal, NameLocation, Visit,
+    InstrId, Literal, LocalFunctionId, ModuleContentId, NameLocation, PersistentFunctionId, Visit,
 };
 use soac_blockpy::codegen_cache::{CachedCodegenModuleMetadata, PythonModuleCacheSource};
 use soac_blockpy::passes::{CodegenModuleShape, InstrResolved};
@@ -44,6 +44,12 @@ pub struct FunctionOptimizationPlan {
     pub function_id: FunctionId,
     pub qualname: String,
     pub decisions: Vec<OptimizationDecision>,
+}
+
+impl FunctionOptimizationPlan {
+    pub const fn local_function_id(&self) -> LocalFunctionId {
+        self.function_id.local_function_id()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -104,6 +110,40 @@ pub struct PlannedFunctionTarget {
     pub module_name: String,
     pub source_hash: u64,
     pub function_id: u32,
+}
+
+impl PlannedFunctionTarget {
+    pub fn new(
+        module_name: impl Into<String>,
+        source_hash: u64,
+        function_id: LocalFunctionId,
+    ) -> Self {
+        Self {
+            module_name: module_name.into(),
+            source_hash,
+            function_id: function_id.as_u32(),
+        }
+    }
+
+    pub fn from_persistent(function: PersistentFunctionId) -> Self {
+        Self::new(
+            function.module.module_name,
+            function.module.source_hash,
+            function.local,
+        )
+    }
+
+    pub fn module_content_id(&self) -> ModuleContentId {
+        ModuleContentId::new(self.module_name.clone(), self.source_hash)
+    }
+
+    pub fn persistent_id(&self) -> PersistentFunctionId {
+        PersistentFunctionId::new(self.module_content_id(), self.local_function_id())
+    }
+
+    pub const fn local_function_id(&self) -> LocalFunctionId {
+        LocalFunctionId::new(self.function_id)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -316,10 +356,12 @@ impl ProfileEvidenceStore {
             .or_else(|| {
                 self.module_targets_by_runtime_id
                     .get(&function_id.module_id())
-                    .map(|module_target| PlannedFunctionTarget {
-                        module_name: module_target.module_name.clone(),
-                        source_hash: module_target.source_hash,
-                        function_id: function_id.function_id(),
+                    .map(|module_target| {
+                        PlannedFunctionTarget::new(
+                            module_target.module_name.clone(),
+                            module_target.source_hash,
+                            function_id.local_function_id(),
+                        )
                     })
             })
     }
@@ -345,13 +387,9 @@ impl ProfileEvidenceStore {
             return;
         }
         self.record_module_target(function_id.module_id(), module_name, source_hash);
-        self.function_targets
-            .entry(function_id)
-            .or_insert_with(|| PlannedFunctionTarget {
-                module_name: module_name.to_string(),
-                source_hash,
-                function_id: function_id.function_id(),
-            });
+        self.function_targets.entry(function_id).or_insert_with(|| {
+            PlannedFunctionTarget::new(module_name, source_hash, function_id.local_function_id())
+        });
     }
 
     fn record_module_target(&mut self, module_id: u32, module_name: &str, source_hash: u64) {
@@ -376,6 +414,10 @@ impl ProfileEvidenceStore {
 }
 
 impl OptimizationPlan {
+    pub fn module_content_id(&self) -> ModuleContentId {
+        ModuleContentId::new(self.module_name.clone(), self.source_hash)
+    }
+
     pub fn from_evidence(
         metadata: &CachedCodegenModuleMetadata,
         module: &BlockPyModule<CodegenModuleShape>,
@@ -387,11 +429,11 @@ impl OptimizationPlan {
             .map(|function| {
                 (
                     function.function_id,
-                    PlannedFunctionTarget {
-                        module_name: metadata.module_name.clone(),
-                        source_hash: metadata.source_hash,
-                        function_id: function.function_id.function_id(),
-                    },
+                    PlannedFunctionTarget::new(
+                        metadata.module_name.clone(),
+                        metadata.source_hash,
+                        function.function_id.local_function_id(),
+                    ),
                 )
             })
             .collect::<HashMap<_, _>>();
@@ -983,7 +1025,9 @@ fn format_action(action: &PlannedAction) -> String {
 fn format_function_target(target: &PlannedFunctionTarget) -> String {
     format!(
         "{}:{}#0x{:016x}",
-        target.module_name, target.function_id, target.source_hash
+        target.module_name,
+        target.local_function_id(),
+        target.source_hash
     )
 }
 
@@ -1041,6 +1085,21 @@ mod tests {
     use soac_blockpy::block_py::{BlockLabel, InstrId};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn planned_function_target_roundtrips_persistent_identity_without_qualname() {
+        let persistent = PersistentFunctionId::new(
+            ModuleContentId::new("pkg.mod", 0x1234),
+            LocalFunctionId::new(7),
+        );
+
+        let target = PlannedFunctionTarget::from_persistent(persistent.clone());
+
+        assert_eq!(target.module_name, "pkg.mod");
+        assert_eq!(target.source_hash, 0x1234);
+        assert_eq!(target.local_function_id(), LocalFunctionId::new(7));
+        assert_eq!(target.persistent_id(), persistent);
+    }
 
     #[test]
     fn profile_evidence_store_loads_counter_dump_once_into_function_views() {

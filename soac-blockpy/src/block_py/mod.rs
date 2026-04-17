@@ -60,7 +60,11 @@ pub(crate) use map::{
     TryMapBlock, TryMapFunction, TryMapModule, TryMapTerm,
 };
 pub use map::{MapInstr, Mappable, TryMapInstr};
-pub use name_gen::{BlockLabel, FunctionId, FunctionNameGen, ModuleNameGen};
+pub use name_gen::{
+    BlockLabel, FunctionId, FunctionNameGen, LocalFunctionId, ModuleContentId, ModuleNameGen,
+    PersistentFunctionId, RuntimeFunctionId, RuntimeModuleId, SerializedFunctionDebugName,
+    SerializedFunctionId, SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity,
+};
 pub(crate) use validate::validate_module;
 #[allow(unused_imports)]
 pub(crate) use visit::{
