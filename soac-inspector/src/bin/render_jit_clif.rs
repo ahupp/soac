@@ -1,7 +1,7 @@
 use soac_blockpy::block_py::RuntimeFunctionId;
 use soac_inspector::{
     JitClifRenderOptions, jit_debug_plan, lower_source_to_codegen_module,
-    lower_source_to_codegen_module_with_module_id, profile_module_id_from_env,
+    lower_source_to_codegen_module_with_module_id, profile_module_identity_from_env,
     render_jit_clif_for_module_with_options,
 };
 use std::fs;
@@ -117,11 +117,12 @@ fn main() -> Result<(), String> {
             .unwrap_or("render_jit_clif")
             .to_string()
     });
-    let profile_module_id = if args.specialized {
-        profile_module_id_from_env(&module_name)?
+    let profile_module_identity = if args.specialized {
+        profile_module_identity_from_env(&module_name)?
     } else {
         None
     };
+    let profile_module_id = profile_module_identity.map(|identity| identity.module_id);
     let function_id = profile_module_id
         .filter(|_| args.function_id.runtime_module_id().as_u32() == 0)
         .map(|module_id| {
@@ -149,6 +150,7 @@ fn main() -> Result<(), String> {
         JitClifRenderOptions {
             load_runtime_specializations: args.specialized,
             runtime_source_path: args.specialized.then_some(source_path.clone()),
+            module_source_hash: profile_module_identity.map(|identity| identity.source_hash),
         },
     )?;
     if let Some(path) = args.cfg_dot_out {

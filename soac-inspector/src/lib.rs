@@ -15,7 +15,8 @@ use soac_blockpy::passes::{
 };
 use soac_jit::module_constants::ModuleCodegenConstants;
 use soac_jit::module_type::{
-    build_shared_state_for_inspection, build_shared_state_for_inspection_with_placeholder_constants,
+    build_shared_state_for_inspection_with_placeholder_constants_and_source_hash,
+    build_shared_state_for_inspection_with_source_hash,
 };
 use soac_jit::{
     CompileSession, plan_jit_deopt_resume_module, plan_jit_module_locals,
@@ -75,6 +76,7 @@ pub struct JitClifResponse {
 pub struct JitClifRenderOptions {
     pub load_runtime_specializations: bool,
     pub runtime_source_path: Option<PathBuf>,
+    pub module_source_hash: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -294,7 +296,15 @@ pub fn lower_source_to_codegen_module_with_module_id(
     Ok(output.codegen_module)
 }
 
-pub fn profile_module_id_from_env(module_name: &str) -> Result<Option<u32>, String> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProfileModuleIdentity {
+    pub module_id: u32,
+    pub source_hash: u64,
+}
+
+pub fn profile_module_identity_from_env(
+    module_name: &str,
+) -> Result<Option<ProfileModuleIdentity>, String> {
     let Some(path) = soac_jit::config::counter_dump_input_path_from_env()? else {
         return Ok(None);
     };
@@ -315,10 +325,17 @@ pub fn profile_module_id_from_env(module_name: &str) -> Result<Option<u32>, Stri
             if function_id == RuntimeFunctionId::global() {
                 continue;
             }
-            return Ok(Some(function_id.runtime_module_id().as_u32()));
+            return Ok(Some(ProfileModuleIdentity {
+                module_id: function_id.runtime_module_id().as_u32(),
+                source_hash: record.source_hash(),
+            }));
         }
     }
     Ok(None)
+}
+
+pub fn profile_module_id_from_env(module_name: &str) -> Result<Option<u32>, String> {
+    Ok(profile_module_identity_from_env(module_name)?.map(|identity| identity.module_id))
 }
 
 fn next_web_module_name() -> String {
@@ -455,7 +472,7 @@ fn register_function_owner_types_for_rendered_module(
 
 fn lower_soac_runtime_for_render_state(
     repo_root: &Path,
-) -> Result<BlockPyModule<CodegenModuleShape>, String> {
+) -> Result<(BlockPyModule<CodegenModuleShape>, u64), String> {
     let source_path = repo_root
         .join("soac_py")
         .join("src")
@@ -463,10 +480,19 @@ fn lower_soac_runtime_for_render_state(
         .join("runtime.py");
     let source = std::fs::read_to_string(source_path.as_path())
         .map_err(|err| format!("failed to read {}: {err}", source_path.display()))?;
-    match profile_module_id_from_env("soac.runtime")? {
-        Some(module_id) => lower_source_to_codegen_module_with_module_id(&source, module_id),
+    let profile_identity = profile_module_identity_from_env("soac.runtime")?;
+    let module = match profile_identity {
+        Some(identity) => {
+            lower_source_to_codegen_module_with_module_id(&source, identity.module_id)
+        }
         None => lower_source_to_codegen_module(&source),
-    }
+    }?;
+    Ok((
+        module,
+        profile_identity
+            .map(|identity| identity.source_hash)
+            .unwrap_or(0),
+    ))
 }
 
 fn corresponding_runtime_function<'a>(
@@ -537,26 +563,34 @@ pub fn render_jit_clif_for_module_with_options(
             }
             let runtime_module =
                 PyModule::import(py, "soac.runtime").map_err(|err| err.to_string())?;
-            let runtime_lowered = lower_soac_runtime_for_render_state(repo_root)?;
+            let (runtime_lowered, runtime_source_hash) =
+                lower_soac_runtime_for_render_state(repo_root)?;
             register_function_owner_types_for_rendered_module(
                 py,
                 runtime_module.as_any(),
                 &runtime_lowered.global_names,
             )?;
             let runtime_shared_state =
-                build_shared_state_for_inspection_with_placeholder_constants(
+                build_shared_state_for_inspection_with_placeholder_constants_and_source_hash(
                     py,
                     runtime_lowered,
                     "soac.runtime",
                     "soac",
+                    runtime_source_hash,
                 )
                 .map_err(|err| err.to_string())?;
             compile_session
                 .retain_shared_module_state_for_inspection(runtime_shared_state)
                 .map_err(|err| err.to_string())?;
             Some(
-                build_shared_state_for_inspection(py, module.clone(), module_name, "")
-                    .map_err(|err| err.to_string())?,
+                build_shared_state_for_inspection_with_source_hash(
+                    py,
+                    module.clone(),
+                    module_name,
+                    "",
+                    options.module_source_hash.unwrap_or(0),
+                )
+                .map_err(|err| err.to_string())?,
             )
         } else {
             None

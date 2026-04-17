@@ -762,6 +762,23 @@ pub fn build_shared_state_for_inspection(
     )
 }
 
+pub fn build_shared_state_for_inspection_with_source_hash(
+    py: Python<'_>,
+    lowered_module: BlockPyModule<CodegenModuleShape>,
+    module_name: &str,
+    package_name: &str,
+    source_hash: u64,
+) -> PyResult<Arc<SharedModuleState>> {
+    build_shared_state_for_inspection_with_original_code_and_source_hash(
+        py,
+        lowered_module,
+        module_name,
+        package_name,
+        source_hash,
+        HashMap::new(),
+    )
+}
+
 pub fn build_shared_state_for_inspection_with_placeholder_constants(
     py: Python<'_>,
     lowered_module: BlockPyModule<CodegenModuleShape>,
@@ -801,6 +818,46 @@ pub fn build_shared_state_for_inspection_with_placeholder_constants(
     }))
 }
 
+pub fn build_shared_state_for_inspection_with_placeholder_constants_and_source_hash(
+    py: Python<'_>,
+    lowered_module: BlockPyModule<CodegenModuleShape>,
+    module_name: &str,
+    package_name: &str,
+    source_hash: u64,
+) -> PyResult<Arc<SharedModuleState>> {
+    let function_index_by_id = build_function_index_by_id(&lowered_module)?;
+    let (counter_slots_by_id, counter_values, top_value_counters) =
+        build_counter_storage(&lowered_module.counter_defs)?;
+    let codegen_constants = if module_name == "soac.runtime" {
+        ModuleCodegenConstants::collect_from_runtime_module(&lowered_module)
+    } else {
+        ModuleCodegenConstants::collect_from_module(&lowered_module)
+    };
+    let module_constant_objs = (0..codegen_constants.len())
+        .map(|_| py.None())
+        .collect::<Vec<_>>();
+    let inline_plan = plan_inline_candidates(&lowered_module);
+    Ok(Arc::new(SharedModuleState {
+        lowered_module,
+        inline_plan,
+        module_name: module_name.to_string(),
+        package_name: package_name.to_string(),
+        source_hash,
+        module_cache_source: None,
+        codegen_constants,
+        storage_instance_key: allocate_shared_module_state_storage_key(),
+        function_index_by_id,
+        original_code_by_function_id: HashMap::new(),
+        module_constant_objs,
+        runtime_name_cache: build_runtime_name_cache(),
+        counter_slots_by_id,
+        counter_values,
+        top_value_counters,
+        precompiled_module_runtime: OnceLock::new(),
+        jit_module_plan: OnceLock::new(),
+    }))
+}
+
 #[cfg(test)]
 pub(crate) fn build_shared_state_for_testing_with_original_code(
     py: Python<'_>,
@@ -825,6 +882,24 @@ fn build_shared_state_for_inspection_with_original_code(
     package_name: &str,
     original_code_by_function_id: HashMap<RuntimeFunctionId, Py<PyAny>>,
 ) -> PyResult<Arc<SharedModuleState>> {
+    build_shared_state_for_inspection_with_original_code_and_source_hash(
+        py,
+        lowered_module,
+        module_name,
+        package_name,
+        0,
+        original_code_by_function_id,
+    )
+}
+
+fn build_shared_state_for_inspection_with_original_code_and_source_hash(
+    py: Python<'_>,
+    lowered_module: BlockPyModule<CodegenModuleShape>,
+    module_name: &str,
+    package_name: &str,
+    source_hash: u64,
+    original_code_by_function_id: HashMap<FunctionId, Py<PyAny>>,
+) -> PyResult<Arc<SharedModuleState>> {
     let function_index_by_id = build_function_index_by_id(&lowered_module)?;
     let (counter_slots_by_id, counter_values, top_value_counters) =
         build_counter_storage(&lowered_module.counter_defs)?;
@@ -834,14 +909,14 @@ fn build_shared_state_for_inspection_with_original_code(
         ModuleCodegenConstants::collect_from_module(&lowered_module)
     };
     let module_constant_objs =
-        build_module_constant_objects(py, &codegen_constants, module_name, 0)?;
+        build_module_constant_objects(py, &codegen_constants, module_name, source_hash)?;
     let inline_plan = plan_inline_candidates(&lowered_module);
     Ok(Arc::new(SharedModuleState {
         lowered_module,
         inline_plan,
         module_name: module_name.to_string(),
         package_name: package_name.to_string(),
-        source_hash: 0,
+        source_hash,
         module_cache_source: None,
         codegen_constants,
         storage_instance_key: allocate_shared_module_state_storage_key(),

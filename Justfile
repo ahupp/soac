@@ -1420,23 +1420,23 @@ _benchmark-export-specialized-artifacts result_dir:
   rm -rf "$CLIF_DIR"
   mkdir -p "$CLIF_DIR"
 
-  cargo run -p soac-inspector --bin inspect_counters -- \
+  cargo run --release -p soac-inspector --bin inspect_counters -- \
     "$COUNTERS_DIR/profile.bin" > "$RESULT_DIR/profile_counters.txt"
-  cargo run -p soac-inspector --bin inspect_counters -- \
+  cargo run --release -p soac-inspector --bin inspect_counters -- \
     "$COUNTERS_DIR/verify.bin" > "$RESULT_DIR/verify_counters.txt"
-  cargo run -p soac-inspector --bin inspect_counters -- \
+  cargo run --release -p soac-inspector --bin inspect_counters -- \
     --specializations "$COUNTERS_DIR/profile.bin" > "$RESULT_DIR/profile_specializations.txt"
-  cargo run -p soac-inspector --bin inspect_counters -- \
+  cargo run --release -p soac-inspector --bin inspect_counters -- \
     --specializations "$COUNTERS_DIR/verify.bin" > "$RESULT_DIR/verify_specializations.txt"
 
-  cargo run -q -p soac-inspector --bin list_jit_functions -- "$PYSTONE_SOURCE" \
+  cargo run -q --release -p soac-inspector --bin list_jit_functions -- "$PYSTONE_SOURCE" \
     > "$CLIF_DIR/functions.tsv"
   while IFS=$'\t' read -r function_id qualname; do
     safe_qualname="$(printf '%s' "$qualname" | tr -cs '[:alnum:]_.' '_')"
     output_base="$CLIF_DIR/fn_${function_id}_${safe_qualname}"
     SOAC_WORK_DIR="$COUNTERS_DIR" \
     SOAC_OPT_MODE=apply \
-      cargo run -q -p soac-inspector --bin render_jit_clif -- \
+      cargo run -q --release -p soac-inspector --bin render_jit_clif -- \
         --specialized --module-name pystone \
         --cfg-dot-out "$output_base.cfg.dot" \
         --vcode-out "$output_base.vcode" \
