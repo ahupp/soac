@@ -203,7 +203,18 @@ impl fmt::Display for SerializedFunctionId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 #[rkyv(derive(Hash, PartialEq, Eq, Debug))]
 pub struct ModuleContentId {
     pub module_name: String,
@@ -219,7 +230,18 @@ impl ModuleContentId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 #[rkyv(derive(Hash, PartialEq, Eq, Debug))]
 pub struct PersistentFunctionId {
     pub module: ModuleContentId,

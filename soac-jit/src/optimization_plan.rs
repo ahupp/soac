@@ -22,9 +22,19 @@ pub struct FunctionProfileEvidence {
     pub branch_prefer_true: HashMap<InstrId, bool>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct PersistentFunctionProfileEvidence {
+    call_target_specializations: HashMap<InstrId, Vec<PersistentFunctionId>>,
+    operator_specializations: HashMap<InstrId, Vec<u64>>,
+    getitem_specializations: HashMap<InstrId, Vec<u64>>,
+    setitem_specializations: HashMap<InstrId, Vec<u64>>,
+    field_index_specializations: HashMap<InstrId, Vec<PlannedIndexedFieldSpecialization>>,
+    branch_prefer_true: HashMap<InstrId, bool>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ProfileEvidenceStore {
-    functions: HashMap<(String, FunctionId), FunctionProfileEvidence>,
+    functions: HashMap<PersistentFunctionId, PersistentFunctionProfileEvidence>,
     module_source_hashes: HashMap<String, u64>,
     function_targets: HashMap<FunctionId, PersistentFunctionId>,
     module_targets_by_runtime_id: HashMap<u32, PlannedModuleTarget>,
@@ -171,7 +181,7 @@ impl ProfileEvidenceStore {
             .map_err(anyhow::Error::msg)
             .with_context(|| format!("read counter dump records from {}", path.display()))?;
         let mut store = Self::default();
-        let mut branch_counts = HashMap::<(String, FunctionId, InstrId), [u64; 2]>::new();
+        let mut branch_counts = HashMap::<(PersistentFunctionId, InstrId), [u64; 2]>::new();
 
         for record in &records {
             let module_name = record
@@ -205,13 +215,27 @@ impl ProfileEvidenceStore {
                         record.source_hash(),
                     );
                 }
+            }
+        }
+
+        for record in &records {
+            let module_name = record
+                .module_name()
+                .map_err(anyhow::Error::msg)?
+                .to_string();
+            for row_index in 0..record.row_count() {
+                let row = record.row(row_index).map_err(anyhow::Error::msg)?;
+                let Some(function_id) = row.function_id else {
+                    continue;
+                };
+                let function_id = persistent_function_id_for_counter_row(
+                    module_name.as_str(),
+                    record.source_hash(),
+                    function_id,
+                );
                 let Some(instr_id) = row.instr_id else {
                     continue;
                 };
-                let function = store
-                    .functions
-                    .entry((module_name.clone(), function_id))
-                    .or_default();
                 match row.kind {
                     "call_hot_targets" => {
                         let Some(observed_value) = row.observed_value else {
@@ -224,6 +248,10 @@ impl ProfileEvidenceStore {
                         if observed == FunctionId::global() {
                             continue;
                         }
+                        let Some(observed) = store.function_target(observed) else {
+                            continue;
+                        };
+                        let function = store.functions.entry(function_id.clone()).or_default();
                         push_unique(
                             function
                                 .call_target_specializations
@@ -232,21 +260,30 @@ impl ProfileEvidenceStore {
                             observed,
                         );
                     }
-                    "operator_hot_shapes" => push_observed_shape(
-                        &mut function.operator_specializations,
-                        instr_id,
-                        row.observed_value,
-                    ),
-                    "getitem_hot_shapes" => push_observed_shape(
-                        &mut function.getitem_specializations,
-                        instr_id,
-                        row.observed_value,
-                    ),
-                    "setitem_hot_shapes" => push_observed_shape(
-                        &mut function.setitem_specializations,
-                        instr_id,
-                        row.observed_value,
-                    ),
+                    "operator_hot_shapes" => {
+                        let function = store.functions.entry(function_id.clone()).or_default();
+                        push_observed_shape(
+                            &mut function.operator_specializations,
+                            instr_id,
+                            row.observed_value,
+                        );
+                    }
+                    "getitem_hot_shapes" => {
+                        let function = store.functions.entry(function_id.clone()).or_default();
+                        push_observed_shape(
+                            &mut function.getitem_specializations,
+                            instr_id,
+                            row.observed_value,
+                        );
+                    }
+                    "setitem_hot_shapes" => {
+                        let function = store.functions.entry(function_id.clone()).or_default();
+                        push_observed_shape(
+                            &mut function.setitem_specializations,
+                            instr_id,
+                            row.observed_value,
+                        );
+                    }
                     "branch_outcomes" => {
                         let Some(slot) = row
                             .observed_value
@@ -256,7 +293,7 @@ impl ProfileEvidenceStore {
                         };
                         if slot < 2 {
                             let counts = branch_counts
-                                .entry((module_name.clone(), function_id, instr_id))
+                                .entry((function_id.clone(), instr_id))
                                 .or_default();
                             counts[slot] = counts[slot].saturating_add(row.value);
                         }
@@ -292,13 +329,13 @@ impl ProfileEvidenceStore {
             }
         }
 
-        for ((module_name, function_id, instr_id), [false_count, true_count]) in branch_counts {
+        for ((function_id, instr_id), [false_count, true_count]) in branch_counts {
             if false_count == 0 && true_count == 0 {
                 continue;
             }
             store
                 .functions
-                .entry((module_name, function_id))
+                .entry(function_id)
                 .or_default()
                 .branch_prefer_true
                 .insert(instr_id, true_count >= false_count);
@@ -307,13 +344,16 @@ impl ProfileEvidenceStore {
         Ok(store)
     }
 
-    pub fn for_function(
+    fn for_function(
         &self,
         module_name: &str,
+        source_hash: u64,
         function_id: FunctionId,
-    ) -> FunctionProfileEvidence {
+    ) -> PersistentFunctionProfileEvidence {
+        let function_id =
+            persistent_function_id_for_counter_row(module_name, source_hash, function_id);
         self.functions
-            .get(&(module_name.to_string(), function_id))
+            .get(&function_id)
             .cloned()
             .unwrap_or_default()
     }
@@ -356,6 +396,17 @@ impl ProfileEvidenceStore {
             .get(attr_name)
             .map(Vec::as_slice)
     }
+}
+
+fn persistent_function_id_for_counter_row(
+    module_name: &str,
+    source_hash: u64,
+    function_id: FunctionId,
+) -> PersistentFunctionId {
+    PersistentFunctionId::new(
+        ModuleContentId::new(module_name, source_hash),
+        function_id.local_function_id(),
+    )
 }
 
 impl ProfileEvidenceStore {
@@ -502,25 +553,15 @@ impl OptimizationPlan {
         let mut identity_builder = OptimizationPlanIdentityBuilder::new(metadata);
         let current_module =
             ModuleContentId::new(metadata.module_name.clone(), metadata.source_hash);
-        let local_function_targets = module
-            .callable_defs
-            .iter()
-            .map(|function| {
-                (
-                    function.function_id,
-                    PersistentFunctionId::new(
-                        current_module.clone(),
-                        function.function_id.local_function_id(),
-                    ),
-                )
-            })
-            .collect::<HashMap<_, _>>();
         let mut functions = module
             .callable_defs
             .iter()
             .filter_map(|function| {
-                let evidence = evidence_store
-                    .for_function(metadata.module_name.as_str(), function.function_id);
+                let evidence = evidence_store.for_function(
+                    metadata.module_name.as_str(),
+                    metadata.source_hash,
+                    function.function_id,
+                );
                 let serialized_function =
                     identity_builder.function_id_for_persistent(PersistentFunctionId::new(
                         current_module.clone(),
@@ -532,15 +573,9 @@ impl OptimizationPlan {
                     evidence_store,
                     &evidence,
                     |function_id| {
-                        local_function_targets
-                            .get(&function_id)
-                            .cloned()
-                            .or_else(|| evidence_store.function_target(function_id))
-                            .map(|persistent| {
-                                PlannedFunctionTarget::new(
-                                    identity_builder.function_id_for_persistent(persistent),
-                                )
-                            })
+                        PlannedFunctionTarget::new(
+                            identity_builder.function_id_for_persistent(function_id),
+                        )
                     },
                 );
                 (!decisions.is_empty()).then(|| FunctionOptimizationPlan {
@@ -772,8 +807,8 @@ fn shape_map_for_family(
 }
 
 fn decisions_from_evidence(
-    evidence: &FunctionProfileEvidence,
-    mut function_target_resolver: impl FnMut(FunctionId) -> Option<PlannedFunctionTarget>,
+    evidence: &PersistentFunctionProfileEvidence,
+    mut function_target_resolver: impl FnMut(PersistentFunctionId) -> PlannedFunctionTarget,
 ) -> Vec<OptimizationDecision> {
     let mut decisions = Vec::new();
     extend_call_target_decisions(
@@ -816,8 +851,8 @@ fn decisions_from_evidence(
 
 fn extend_call_target_decisions(
     decisions: &mut Vec<OptimizationDecision>,
-    values_by_instr: &HashMap<InstrId, Vec<FunctionId>>,
-    function_target_resolver: &mut impl FnMut(FunctionId) -> Option<PlannedFunctionTarget>,
+    values_by_instr: &HashMap<InstrId, Vec<PersistentFunctionId>>,
+    function_target_resolver: &mut impl FnMut(PersistentFunctionId) -> PlannedFunctionTarget,
 ) {
     let mut entries = values_by_instr.iter().collect::<Vec<_>>();
     entries.sort_by_key(|(instr_id, _values)| **instr_id);
@@ -826,7 +861,7 @@ fn extend_call_target_decisions(
         values.sort();
         let alternatives = values
             .into_iter()
-            .filter_map(&mut *function_target_resolver)
+            .map(&mut *function_target_resolver)
             .map(|target| PlannedAlternative {
                 guards: vec![PlannedGuard::FunctionTarget {
                     target: target.clone(),
@@ -952,8 +987,8 @@ fn decisions_for_function(
     module: &BlockPyModule<CodegenModuleShape>,
     function: &BlockPyFunction<CodegenModuleShape>,
     evidence_store: &ProfileEvidenceStore,
-    evidence: &FunctionProfileEvidence,
-    function_target_resolver: impl FnMut(FunctionId) -> Option<PlannedFunctionTarget>,
+    evidence: &PersistentFunctionProfileEvidence,
+    function_target_resolver: impl FnMut(PersistentFunctionId) -> PlannedFunctionTarget,
 ) -> Vec<OptimizationDecision> {
     let mut evidence = evidence.clone();
     add_field_index_evidence_for_function(module, function, evidence_store, &mut evidence);
@@ -964,12 +999,12 @@ fn add_field_index_evidence_for_function(
     module: &BlockPyModule<CodegenModuleShape>,
     function: &BlockPyFunction<CodegenModuleShape>,
     evidence_store: &ProfileEvidenceStore,
-    evidence: &mut FunctionProfileEvidence,
+    evidence: &mut PersistentFunctionProfileEvidence,
 ) {
     struct Collector<'a> {
         module: &'a BlockPyModule<CodegenModuleShape>,
         evidence_store: &'a ProfileEvidenceStore,
-        evidence: &'a mut FunctionProfileEvidence,
+        evidence: &'a mut PersistentFunctionProfileEvidence,
     }
 
     impl Collector<'_> {
@@ -1286,13 +1321,13 @@ mod tests {
         fs::write(path.as_path(), record.encode().unwrap()).unwrap();
 
         let store = ProfileEvidenceStore::from_counter_dump(path.as_path()).unwrap();
-        let evidence = store.for_function("pkg.mod", function_id);
+        let evidence = store.for_function("pkg.mod", 0x1234, function_id);
         let _ = fs::remove_file(path);
 
         assert_eq!(store.module_source_hash("pkg.mod"), Some(0x1234));
         assert_eq!(
             evidence.call_target_specializations.get(&instr_id).unwrap(),
-            &vec![target_id]
+            &vec![target_persistent.clone()]
         );
         assert_eq!(
             evidence.operator_specializations.get(&instr_id).unwrap(),
@@ -1309,7 +1344,8 @@ mod tests {
             .field_index_specializations
             .insert(instr_id, vec![field_specialization.clone()]);
         let decisions = decisions_from_evidence(&evidence, |function_id| {
-            (function_id == target_id).then(|| target.clone())
+            assert_eq!(function_id, target_persistent);
+            target.clone()
         });
         assert!(matches!(
             decisions[0].replacement,
@@ -1458,8 +1494,9 @@ mod tests {
         ));
 
         let decisions =
-            decisions_from_evidence(&store.for_function("pkg.caller", caller_id), |id| {
-                (id == target_id).then(|| serialized_target.clone())
+            decisions_from_evidence(&store.for_function("pkg.caller", 0x1234, caller_id), |id| {
+                assert_eq!(id, synthesized);
+                serialized_target.clone()
             });
         let PlannedReplacement::Guarded { alternatives, .. } = &decisions[0].replacement else {
             unreachable!("call target decision should be guarded");

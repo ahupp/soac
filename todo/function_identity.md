@@ -126,6 +126,8 @@ Use explicit resolution steps at artifact boundaries:
    decision artifacts; use packed `SerializedFunctionId` values whose module
    half indexes the serialized module table. Done for `.opt` decisions.
 6. Teach `ProfileEvidenceStore` to resolve raw counter ids once at load time.
+   Done for optimization-decision input: counter-derived call targets are now
+   stored as `PersistentFunctionId` values before `.opt` decisions are built.
 7. Change precompile indexing and symbol generation to accept persistent ids.
 8. Finally rename the old `FunctionId` to `RuntimeFunctionId` once remaining
    call sites are forced through the right conversion boundary.
