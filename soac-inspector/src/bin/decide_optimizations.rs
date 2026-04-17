@@ -333,9 +333,11 @@ mod test {
             rkyv::from_bytes::<OptimizationPlan, rkyv::rancor::Error>(bytes.as_slice()).unwrap();
         assert_eq!(plan.module_name, module_name);
         assert_eq!(plan.source_hash, source_hash);
+        assert_eq!(plan.identity_tables.modules[0].module_name, module_name);
+        assert_eq!(plan.identity_tables.modules[0].source_hash, source_hash);
         assert_eq!(plan.functions.len(), 1);
         assert_eq!(
-            plan.functions[0].local_function_id,
+            plan.functions[0].local_function_id(),
             function_id.local_function_id()
         );
         assert_eq!(plan.functions[0].decisions.len(), 3);
@@ -349,13 +351,15 @@ mod test {
                     return false;
                 };
                 alternatives.iter().any(|alternative| {
-                    matches!(
-                        alternative.action,
-                        PlannedAction::DirectCall { ref target }
-                            if target.module_name == "pkg.callee"
-                                && target.source_hash == 0x5678
-                                && target.local_function_id().as_u32() == 2
-                    )
+                    let PlannedAction::DirectCall { ref target } = alternative.action else {
+                        return false;
+                    };
+                    let target = plan
+                        .persistent_function_id(target.function)
+                        .expect("direct-call target should resolve through plan identity table");
+                    target.module.module_name == "pkg.callee"
+                        && target.module.source_hash == 0x5678
+                        && target.local.as_u32() == 2
                 })
             }),
             "expected a cross-module direct-call decision"

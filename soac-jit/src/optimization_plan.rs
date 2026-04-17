@@ -2,7 +2,9 @@ use crate::counter_dump::{CounterDumpFile, collect_type_key_layouts, collect_typ
 use anyhow::{Context, Result, bail};
 use soac_blockpy::block_py::{
     BlockPyFunction, BlockPyModule, ChildVisitable, FunctionId, HasSemanticInstrId, InstrCodegen,
-    InstrId, Literal, LocalFunctionId, ModuleContentId, NameLocation, PersistentFunctionId, Visit,
+    InstrId, Literal, LocalFunctionId, ModuleContentId, NameLocation, PersistentFunctionId,
+    SerializedFunctionDebugName, SerializedFunctionId, SerializedIdentityTables,
+    SerializedModuleId, SerializedModuleIdentity, Visit,
 };
 use soac_blockpy::codegen_cache::{CachedCodegenModuleMetadata, PythonModuleCacheSource};
 use soac_blockpy::passes::{CodegenModuleShape, InstrResolved};
@@ -24,7 +26,7 @@ pub struct FunctionProfileEvidence {
 pub struct ProfileEvidenceStore {
     functions: HashMap<(String, FunctionId), FunctionProfileEvidence>,
     module_source_hashes: HashMap<String, u64>,
-    function_targets: HashMap<FunctionId, PlannedFunctionTarget>,
+    function_targets: HashMap<FunctionId, PersistentFunctionId>,
     module_targets_by_runtime_id: HashMap<u32, PlannedModuleTarget>,
     ambiguous_module_runtime_ids: HashSet<u32>,
     field_index_specializations_by_attr: HashMap<String, Vec<PlannedIndexedFieldSpecialization>>,
@@ -36,19 +38,23 @@ pub struct OptimizationPlan {
     pub module_name: String,
     pub source_hash: u64,
     pub cache_identity: String,
+    pub identity_tables: SerializedIdentityTables,
     pub functions: Vec<FunctionOptimizationPlan>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct FunctionOptimizationPlan {
-    pub local_function_id: LocalFunctionId,
-    pub qualname: String,
+    pub function: SerializedFunctionId,
     pub decisions: Vec<OptimizationDecision>,
 }
 
 impl FunctionOptimizationPlan {
+    pub const fn local_function_id(&self) -> LocalFunctionId {
+        self.function.local_function_id()
+    }
+
     pub const fn runtime_function_id(&self, module_id: u32) -> FunctionId {
-        FunctionId::new(module_id, self.local_function_id.as_u32())
+        FunctionId::new(module_id, self.local_function_id().as_u32())
     }
 }
 
@@ -107,42 +113,16 @@ pub enum PlannedAction {
     Clone, Debug, PartialEq, Eq, PartialOrd, Ord, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
 pub struct PlannedFunctionTarget {
-    pub module_name: String,
-    pub source_hash: u64,
-    pub function_id: u32,
+    pub function: SerializedFunctionId,
 }
 
 impl PlannedFunctionTarget {
-    pub fn new(
-        module_name: impl Into<String>,
-        source_hash: u64,
-        function_id: LocalFunctionId,
-    ) -> Self {
-        Self {
-            module_name: module_name.into(),
-            source_hash,
-            function_id: function_id.as_u32(),
-        }
-    }
-
-    pub fn from_persistent(function: PersistentFunctionId) -> Self {
-        Self::new(
-            function.module.module_name,
-            function.module.source_hash,
-            function.local,
-        )
-    }
-
-    pub fn module_content_id(&self) -> ModuleContentId {
-        ModuleContentId::new(self.module_name.clone(), self.source_hash)
-    }
-
-    pub fn persistent_id(&self) -> PersistentFunctionId {
-        PersistentFunctionId::new(self.module_content_id(), self.local_function_id())
+    pub const fn new(function: SerializedFunctionId) -> Self {
+        Self { function }
     }
 
     pub const fn local_function_id(&self) -> LocalFunctionId {
-        LocalFunctionId::new(self.function_id)
+        self.function.local_function_id()
     }
 }
 
@@ -342,7 +322,7 @@ impl ProfileEvidenceStore {
         self.module_source_hashes.get(module_name).copied()
     }
 
-    pub fn function_target(&self, function_id: FunctionId) -> Option<PlannedFunctionTarget> {
+    pub fn function_target(&self, function_id: FunctionId) -> Option<PersistentFunctionId> {
         if function_id == FunctionId::global()
             || self
                 .ambiguous_module_runtime_ids
@@ -357,9 +337,11 @@ impl ProfileEvidenceStore {
                 self.module_targets_by_runtime_id
                     .get(&function_id.module_id())
                     .map(|module_target| {
-                        PlannedFunctionTarget::new(
-                            module_target.module_name.clone(),
-                            module_target.source_hash,
+                        PersistentFunctionId::new(
+                            ModuleContentId::new(
+                                module_target.module_name.clone(),
+                                module_target.source_hash,
+                            ),
                             function_id.local_function_id(),
                         )
                     })
@@ -388,7 +370,10 @@ impl ProfileEvidenceStore {
         }
         self.record_module_target(function_id.module_id(), module_name, source_hash);
         self.function_targets.entry(function_id).or_insert_with(|| {
-            PlannedFunctionTarget::new(module_name, source_hash, function_id.local_function_id())
+            PersistentFunctionId::new(
+                ModuleContentId::new(module_name, source_hash),
+                function_id.local_function_id(),
+            )
         });
     }
 
@@ -413,9 +398,100 @@ impl ProfileEvidenceStore {
     }
 }
 
+struct OptimizationPlanIdentityBuilder {
+    tables: SerializedIdentityTables,
+    modules_by_content: HashMap<ModuleContentId, SerializedModuleId>,
+}
+
+impl OptimizationPlanIdentityBuilder {
+    fn new(metadata: &CachedCodegenModuleMetadata) -> Self {
+        let mut builder = Self {
+            tables: SerializedIdentityTables::default(),
+            modules_by_content: HashMap::new(),
+        };
+        builder.intern_module(
+            ModuleContentId::new(metadata.module_name.clone(), metadata.source_hash),
+            Some(metadata.cache_identity.clone()),
+        );
+        builder
+    }
+
+    fn function_id_for_persistent(
+        &mut self,
+        function: PersistentFunctionId,
+    ) -> SerializedFunctionId {
+        let module_id = self.intern_module(function.module, None);
+        SerializedFunctionId::new(module_id, function.local)
+    }
+
+    fn add_debug_name(&mut self, function: SerializedFunctionId, qualname: impl Into<String>) {
+        self.tables.debug_names.push(SerializedFunctionDebugName {
+            function,
+            qualname: qualname.into(),
+        });
+    }
+
+    fn finish(self) -> SerializedIdentityTables {
+        self.tables
+    }
+
+    fn intern_module(
+        &mut self,
+        module: ModuleContentId,
+        cache_identity: Option<String>,
+    ) -> SerializedModuleId {
+        if let Some(module_id) = self.modules_by_content.get(&module) {
+            if let Some(cache_identity) = cache_identity
+                && let Some(identity) = self.tables.modules.get_mut(module_id.as_u32() as usize)
+                && identity.cache_identity.is_none()
+            {
+                identity.cache_identity = Some(cache_identity);
+            }
+            return *module_id;
+        }
+        let module_id = SerializedModuleId::new(self.tables.modules.len() as u32);
+        self.tables.modules.push(SerializedModuleIdentity {
+            module_name: module.module_name.clone(),
+            source_hash: module.source_hash,
+            cache_identity,
+        });
+        self.modules_by_content.insert(module, module_id);
+        module_id
+    }
+}
+
 impl OptimizationPlan {
     pub fn module_content_id(&self) -> ModuleContentId {
         ModuleContentId::new(self.module_name.clone(), self.source_hash)
+    }
+
+    pub fn persistent_function_id(
+        &self,
+        function: SerializedFunctionId,
+    ) -> Result<PersistentFunctionId> {
+        let module_index = function.module_id().as_u32() as usize;
+        let module = self
+            .identity_tables
+            .modules
+            .get(module_index)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "optimization plan references missing serialized module id {}",
+                    function.module_id()
+                )
+            })?;
+        Ok(PersistentFunctionId::new(
+            ModuleContentId::new(module.module_name.clone(), module.source_hash),
+            function.local_function_id(),
+        ))
+    }
+
+    pub fn debug_name_for_function(&self, function: SerializedFunctionId) -> Option<&str> {
+        self.identity_tables
+            .debug_names
+            .iter()
+            .find(|debug_name| debug_name.function == function)
+            .map(|debug_name| debug_name.qualname.as_str())
     }
 
     pub fn from_evidence(
@@ -423,15 +499,17 @@ impl OptimizationPlan {
         module: &BlockPyModule<CodegenModuleShape>,
         evidence_store: &ProfileEvidenceStore,
     ) -> Self {
+        let mut identity_builder = OptimizationPlanIdentityBuilder::new(metadata);
+        let current_module =
+            ModuleContentId::new(metadata.module_name.clone(), metadata.source_hash);
         let local_function_targets = module
             .callable_defs
             .iter()
             .map(|function| {
                 (
                     function.function_id,
-                    PlannedFunctionTarget::new(
-                        metadata.module_name.clone(),
-                        metadata.source_hash,
+                    PersistentFunctionId::new(
+                        current_module.clone(),
                         function.function_id.local_function_id(),
                     ),
                 )
@@ -443,26 +521,54 @@ impl OptimizationPlan {
             .filter_map(|function| {
                 let evidence = evidence_store
                     .for_function(metadata.module_name.as_str(), function.function_id);
+                let serialized_function =
+                    identity_builder.function_id_for_persistent(PersistentFunctionId::new(
+                        current_module.clone(),
+                        function.function_id.local_function_id(),
+                    ));
                 let decisions = decisions_for_function(
                     module,
                     function,
                     evidence_store,
-                    &local_function_targets,
                     &evidence,
+                    |function_id| {
+                        local_function_targets
+                            .get(&function_id)
+                            .cloned()
+                            .or_else(|| evidence_store.function_target(function_id))
+                            .map(|persistent| {
+                                PlannedFunctionTarget::new(
+                                    identity_builder.function_id_for_persistent(persistent),
+                                )
+                            })
+                    },
                 );
                 (!decisions.is_empty()).then(|| FunctionOptimizationPlan {
-                    local_function_id: function.function_id.local_function_id(),
-                    qualname: function.names.qualname.clone(),
+                    function: serialized_function,
                     decisions,
                 })
             })
             .collect::<Vec<_>>();
-        functions.sort_by_key(|function| function.local_function_id);
+        for function in &functions {
+            identity_builder.add_debug_name(
+                function.function,
+                module
+                    .callable_defs
+                    .iter()
+                    .find(|callable| {
+                        callable.function_id.local_function_id() == function.local_function_id()
+                    })
+                    .map(|callable| callable.names.qualname.clone())
+                    .unwrap_or_else(|| "<unknown>".to_string()),
+            );
+        }
+        functions.sort_by_key(|function| function.local_function_id());
         Self {
             source: metadata.source,
             module_name: metadata.module_name.clone(),
             source_hash: metadata.source_hash,
             cache_identity: metadata.cache_identity.clone(),
+            identity_tables: identity_builder.finish(),
             functions,
         }
     }
@@ -501,41 +607,137 @@ impl OptimizationPlan {
                 self.cache_identity
             );
         }
+        let current_module =
+            self.identity_tables.modules.first().ok_or_else(|| {
+                anyhow::anyhow!("optimization plan has no serialized module table")
+            })?;
+        if current_module.module_name != module_name || current_module.source_hash != source_hash {
+            bail!(
+                "optimization plan primary module is {} source_hash=0x{:016x}, expected {module_name} source_hash=0x{source_hash:016x}",
+                current_module.module_name,
+                current_module.source_hash
+            );
+        }
         Ok(())
     }
 
     pub fn evidence_for_local_function(
         &self,
         local_function_id: LocalFunctionId,
-        call_target_resolver: impl Fn(&PlannedFunctionTarget) -> Result<Option<FunctionId>>,
+        call_target_resolver: impl Fn(&PersistentFunctionId) -> Result<Option<FunctionId>>,
     ) -> Result<FunctionProfileEvidence> {
         let Some(function) = self
             .functions
             .iter()
-            .find(|function| function.local_function_id == local_function_id)
+            .find(|function| function.local_function_id() == local_function_id)
         else {
             return Ok(FunctionProfileEvidence::default());
         };
         let mut evidence = FunctionProfileEvidence::default();
         for decision in &function.decisions {
-            apply_decision_to_evidence(decision, &mut evidence, &call_target_resolver)?;
+            self.apply_decision_to_evidence(decision, &mut evidence, &call_target_resolver)?;
         }
         Ok(evidence)
     }
 
     pub fn evidence_by_local_function(
         &self,
-        call_target_resolver: impl Fn(&PlannedFunctionTarget) -> Result<Option<FunctionId>>,
+        call_target_resolver: impl Fn(&PersistentFunctionId) -> Result<Option<FunctionId>>,
     ) -> Result<HashMap<LocalFunctionId, FunctionProfileEvidence>> {
         let mut out = HashMap::new();
         for function in &self.functions {
             let mut evidence = FunctionProfileEvidence::default();
             for decision in &function.decisions {
-                apply_decision_to_evidence(decision, &mut evidence, &call_target_resolver)?;
+                self.apply_decision_to_evidence(decision, &mut evidence, &call_target_resolver)?;
             }
-            out.insert(function.local_function_id, evidence);
+            out.insert(function.local_function_id(), evidence);
         }
         Ok(out)
+    }
+
+    fn apply_decision_to_evidence(
+        &self,
+        decision: &OptimizationDecision,
+        evidence: &mut FunctionProfileEvidence,
+        call_target_resolver: &impl Fn(&PersistentFunctionId) -> Result<Option<FunctionId>>,
+    ) -> Result<()> {
+        match &decision.replacement {
+            PlannedReplacement::Guarded {
+                alternatives,
+                fallback: PlannedFallback::OriginalInstruction,
+            } => {
+                for alternative in alternatives {
+                    self.apply_alternative_to_evidence(
+                        decision.instr_id,
+                        alternative,
+                        evidence,
+                        call_target_resolver,
+                    )?;
+                }
+            }
+            PlannedReplacement::BranchPreference { prefer_true } => {
+                evidence
+                    .branch_prefer_true
+                    .insert(decision.instr_id, *prefer_true);
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_alternative_to_evidence(
+        &self,
+        instr_id: InstrId,
+        alternative: &PlannedAlternative,
+        evidence: &mut FunctionProfileEvidence,
+        call_target_resolver: &impl Fn(&PersistentFunctionId) -> Result<Option<FunctionId>>,
+    ) -> Result<()> {
+        match &alternative.action {
+            PlannedAction::DirectCall { target } => {
+                validate_alternative_guard(
+                    alternative,
+                    |guard| matches!(guard, PlannedGuard::FunctionTarget { target: guarded } if guarded == target),
+                    "direct-call alternative",
+                )?;
+                let persistent_target = self.persistent_function_id(target.function)?;
+                if let Some(function_id) = call_target_resolver(&persistent_target)? {
+                    push_unique(
+                        evidence
+                            .call_target_specializations
+                            .entry(instr_id)
+                            .or_default(),
+                        function_id,
+                    );
+                }
+            }
+            PlannedAction::SpecializedShape { family, shape } => {
+                validate_alternative_guard(
+                    alternative,
+                    |guard| matches!(guard, PlannedGuard::ObservedShape { family: guarded_family, shape: guarded_shape } if guarded_family == family && guarded_shape == shape),
+                    "shape-specialization alternative",
+                )?;
+                push_unique(
+                    shape_map_for_family(evidence, *family)
+                        .entry(instr_id)
+                        .or_default(),
+                    *shape,
+                );
+            }
+            PlannedAction::IndexedField { specialization } => {
+                validate_alternative_guard(
+                    alternative,
+                    |guard| matches!(guard, PlannedGuard::IndexedField { specialization: guarded } if guarded == specialization),
+                    "field-index alternative",
+                )?;
+                push_unique(
+                    evidence
+                        .field_index_specializations
+                        .entry(instr_id)
+                        .or_default(),
+                    specialization.clone(),
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -544,88 +746,6 @@ pub fn load_optimization_plan(path: &Path) -> Result<OptimizationPlan> {
         fs::read(path).with_context(|| format!("read optimization plan {}", path.display()))?;
     rkyv::from_bytes::<OptimizationPlan, rkyv::rancor::Error>(bytes.as_slice())
         .map_err(|err| anyhow::anyhow!("deserialize optimization plan {}: {err}", path.display()))
-}
-
-fn apply_decision_to_evidence(
-    decision: &OptimizationDecision,
-    evidence: &mut FunctionProfileEvidence,
-    call_target_resolver: &impl Fn(&PlannedFunctionTarget) -> Result<Option<FunctionId>>,
-) -> Result<()> {
-    match &decision.replacement {
-        PlannedReplacement::Guarded {
-            alternatives,
-            fallback: PlannedFallback::OriginalInstruction,
-        } => {
-            for alternative in alternatives {
-                apply_alternative_to_evidence(
-                    decision.instr_id,
-                    alternative,
-                    evidence,
-                    call_target_resolver,
-                )?;
-            }
-        }
-        PlannedReplacement::BranchPreference { prefer_true } => {
-            evidence
-                .branch_prefer_true
-                .insert(decision.instr_id, *prefer_true);
-        }
-    }
-    Ok(())
-}
-
-fn apply_alternative_to_evidence(
-    instr_id: InstrId,
-    alternative: &PlannedAlternative,
-    evidence: &mut FunctionProfileEvidence,
-    call_target_resolver: &impl Fn(&PlannedFunctionTarget) -> Result<Option<FunctionId>>,
-) -> Result<()> {
-    match &alternative.action {
-        PlannedAction::DirectCall { target } => {
-            validate_alternative_guard(
-                alternative,
-                |guard| matches!(guard, PlannedGuard::FunctionTarget { target: guarded } if guarded == target),
-                "direct-call alternative",
-            )?;
-            if let Some(function_id) = call_target_resolver(target)? {
-                push_unique(
-                    evidence
-                        .call_target_specializations
-                        .entry(instr_id)
-                        .or_default(),
-                    function_id,
-                );
-            }
-        }
-        PlannedAction::SpecializedShape { family, shape } => {
-            validate_alternative_guard(
-                alternative,
-                |guard| matches!(guard, PlannedGuard::ObservedShape { family: guarded_family, shape: guarded_shape } if guarded_family == family && guarded_shape == shape),
-                "shape-specialization alternative",
-            )?;
-            push_unique(
-                shape_map_for_family(evidence, *family)
-                    .entry(instr_id)
-                    .or_default(),
-                *shape,
-            );
-        }
-        PlannedAction::IndexedField { specialization } => {
-            validate_alternative_guard(
-                alternative,
-                |guard| matches!(guard, PlannedGuard::IndexedField { specialization: guarded } if guarded == specialization),
-                "field-index alternative",
-            )?;
-            push_unique(
-                evidence
-                    .field_index_specializations
-                    .entry(instr_id)
-                    .or_default(),
-                specialization.clone(),
-            );
-        }
-    }
-    Ok(())
 }
 
 fn validate_alternative_guard(
@@ -653,13 +773,13 @@ fn shape_map_for_family(
 
 fn decisions_from_evidence(
     evidence: &FunctionProfileEvidence,
-    function_target_resolver: impl Fn(FunctionId) -> Option<PlannedFunctionTarget>,
+    mut function_target_resolver: impl FnMut(FunctionId) -> Option<PlannedFunctionTarget>,
 ) -> Vec<OptimizationDecision> {
     let mut decisions = Vec::new();
     extend_call_target_decisions(
         &mut decisions,
         &evidence.call_target_specializations,
-        &function_target_resolver,
+        &mut function_target_resolver,
     );
     extend_instr_u64_decisions(
         &mut decisions,
@@ -697,7 +817,7 @@ fn decisions_from_evidence(
 fn extend_call_target_decisions(
     decisions: &mut Vec<OptimizationDecision>,
     values_by_instr: &HashMap<InstrId, Vec<FunctionId>>,
-    function_target_resolver: &impl Fn(FunctionId) -> Option<PlannedFunctionTarget>,
+    function_target_resolver: &mut impl FnMut(FunctionId) -> Option<PlannedFunctionTarget>,
 ) {
     let mut entries = values_by_instr.iter().collect::<Vec<_>>();
     entries.sort_by_key(|(instr_id, _values)| **instr_id);
@@ -706,7 +826,7 @@ fn extend_call_target_decisions(
         values.sort();
         let alternatives = values
             .into_iter()
-            .filter_map(function_target_resolver)
+            .filter_map(&mut *function_target_resolver)
             .map(|target| PlannedAlternative {
                 guards: vec![PlannedGuard::FunctionTarget {
                     target: target.clone(),
@@ -832,17 +952,12 @@ fn decisions_for_function(
     module: &BlockPyModule<CodegenModuleShape>,
     function: &BlockPyFunction<CodegenModuleShape>,
     evidence_store: &ProfileEvidenceStore,
-    local_function_targets: &HashMap<FunctionId, PlannedFunctionTarget>,
     evidence: &FunctionProfileEvidence,
+    function_target_resolver: impl FnMut(FunctionId) -> Option<PlannedFunctionTarget>,
 ) -> Vec<OptimizationDecision> {
     let mut evidence = evidence.clone();
     add_field_index_evidence_for_function(module, function, evidence_store, &mut evidence);
-    decisions_from_evidence(&evidence, |function_id| {
-        local_function_targets
-            .get(&function_id)
-            .cloned()
-            .or_else(|| evidence_store.function_target(function_id))
-    })
+    decisions_from_evidence(&evidence, function_target_resolver)
 }
 
 fn add_field_index_evidence_for_function(
@@ -946,18 +1061,20 @@ pub fn format_optimization_plan(plan: &OptimizationPlan) -> String {
     for function in &plan.functions {
         out.push_str(&format!(
             "function {} {}\n",
-            function.local_function_id, function.qualname
+            function.function,
+            plan.debug_name_for_function(function.function)
+                .unwrap_or("<unknown>")
         ));
         for decision in &function.decisions {
             out.push_str("  ");
-            out.push_str(&format_decision(decision));
+            out.push_str(&format_decision(plan, decision));
             out.push('\n');
         }
     }
     out
 }
 
-fn format_decision(decision: &OptimizationDecision) -> String {
+fn format_decision(plan: &OptimizationPlan, decision: &OptimizationDecision) -> String {
     match &decision.replacement {
         PlannedReplacement::Guarded {
             alternatives,
@@ -965,7 +1082,7 @@ fn format_decision(decision: &OptimizationDecision) -> String {
         } => {
             let alternatives = alternatives
                 .iter()
-                .map(format_alternative)
+                .map(|alternative| format_alternative(plan, alternative))
                 .collect::<Vec<_>>()
                 .join(", ");
             format!(
@@ -984,20 +1101,20 @@ fn format_decision(decision: &OptimizationDecision) -> String {
     }
 }
 
-fn format_alternative(alternative: &PlannedAlternative) -> String {
+fn format_alternative(plan: &OptimizationPlan, alternative: &PlannedAlternative) -> String {
     let guards = alternative
         .guards
         .iter()
-        .map(format_guard)
+        .map(|guard| format_guard(plan, guard))
         .collect::<Vec<_>>()
         .join(" && ");
-    format!("({guards}) => {}", format_action(&alternative.action))
+    format!("({guards}) => {}", format_action(plan, &alternative.action))
 }
 
-fn format_guard(guard: &PlannedGuard) -> String {
+fn format_guard(plan: &OptimizationPlan, guard: &PlannedGuard) -> String {
     match guard {
         PlannedGuard::FunctionTarget { target } => {
-            format!("FunctionTarget({})", format_function_target(target))
+            format!("FunctionTarget({})", format_function_target(plan, target))
         }
         PlannedGuard::ObservedShape { family, shape } => {
             format!("{}Shape({shape})", format_shape_family(*family))
@@ -1008,10 +1125,10 @@ fn format_guard(guard: &PlannedGuard) -> String {
     }
 }
 
-fn format_action(action: &PlannedAction) -> String {
+fn format_action(plan: &OptimizationPlan, action: &PlannedAction) -> String {
     match action {
         PlannedAction::DirectCall { target } => {
-            format!("DirectCall({})", format_function_target(target))
+            format!("DirectCall({})", format_function_target(plan, target))
         }
         PlannedAction::SpecializedShape { family, shape } => {
             format!("Specialized{}({shape})", format_shape_family(*family))
@@ -1022,13 +1139,14 @@ fn format_action(action: &PlannedAction) -> String {
     }
 }
 
-fn format_function_target(target: &PlannedFunctionTarget) -> String {
-    format!(
-        "{}:{}#0x{:016x}",
-        target.module_name,
-        target.local_function_id(),
-        target.source_hash
-    )
+fn format_function_target(plan: &OptimizationPlan, target: &PlannedFunctionTarget) -> String {
+    match plan.persistent_function_id(target.function) {
+        Ok(function) => format!(
+            "{}:{}#0x{:016x}",
+            function.module.module_name, function.local, function.module.source_hash
+        ),
+        Err(_) => target.function.to_string(),
+    }
 }
 
 fn format_indexed_field(specialization: &PlannedIndexedFieldSpecialization) -> String {
@@ -1092,13 +1210,17 @@ mod tests {
             ModuleContentId::new("pkg.mod", 0x1234),
             LocalFunctionId::new(7),
         );
+        let target = PlannedFunctionTarget::new(SerializedFunctionId::new(
+            SerializedModuleId::new(0),
+            persistent.local,
+        ));
+        let plan = test_plan_with_module("pkg.mod", 0x1234, target.function);
 
-        let target = PlannedFunctionTarget::from_persistent(persistent.clone());
-
-        assert_eq!(target.module_name, "pkg.mod");
-        assert_eq!(target.source_hash, 0x1234);
         assert_eq!(target.local_function_id(), LocalFunctionId::new(7));
-        assert_eq!(target.persistent_id(), persistent);
+        assert_eq!(
+            plan.persistent_function_id(target.function).unwrap(),
+            persistent
+        );
     }
 
     #[test]
@@ -1106,7 +1228,14 @@ mod tests {
         let function_id = FunctionId::new(7, 1);
         let instr_id = InstrId::new(BlockLabel::from_index(3), 4);
         let target_id = FunctionId::new(7, 2);
-        let target = PlannedFunctionTarget::new("pkg.mod", 0x1234, target_id.local_function_id());
+        let target_persistent = PersistentFunctionId::new(
+            ModuleContentId::new("pkg.mod", 0x1234),
+            target_id.local_function_id(),
+        );
+        let target = PlannedFunctionTarget::new(SerializedFunctionId::new(
+            SerializedModuleId::new(0),
+            target_id.local_function_id(),
+        ));
         let field_specialization = PlannedIndexedFieldSpecialization {
             owner_type: PlannedTypeKey {
                 module_name: "pkg.types".to_string(),
@@ -1206,9 +1335,25 @@ mod tests {
             module_name: "pkg.mod".to_string(),
             source_hash: 0x1234,
             cache_identity: "test-cache".to_string(),
+            identity_tables: SerializedIdentityTables {
+                modules: vec![SerializedModuleIdentity {
+                    module_name: "pkg.mod".to_string(),
+                    source_hash: 0x1234,
+                    cache_identity: Some("test-cache".to_string()),
+                }],
+                debug_names: vec![SerializedFunctionDebugName {
+                    function: SerializedFunctionId::new(
+                        SerializedModuleId::new(0),
+                        function_id.local_function_id(),
+                    ),
+                    qualname: "f".to_string(),
+                }],
+            },
             functions: vec![FunctionOptimizationPlan {
-                local_function_id: function_id.local_function_id(),
-                qualname: "f".to_string(),
+                function: SerializedFunctionId::new(
+                    SerializedModuleId::new(0),
+                    function_id.local_function_id(),
+                ),
                 decisions,
             }],
         };
@@ -1221,7 +1366,7 @@ mod tests {
         .unwrap();
         let planned_evidence = plan
             .evidence_by_local_function(|planned_target| {
-                Ok((planned_target == &target).then_some(target_id))
+                Ok((planned_target == &target_persistent).then_some(target_id))
             })
             .unwrap();
         let planned_function = planned_evidence
@@ -1302,12 +1447,19 @@ mod tests {
             .expect("known module id should synthesize target metadata");
         assert_eq!(
             synthesized,
-            PlannedFunctionTarget::new("pkg.callee", 0x5678, target_id.local_function_id())
+            PersistentFunctionId::new(
+                ModuleContentId::new("pkg.callee", 0x5678),
+                target_id.local_function_id()
+            )
         );
+        let serialized_target = PlannedFunctionTarget::new(SerializedFunctionId::new(
+            SerializedModuleId::new(0),
+            target_id.local_function_id(),
+        ));
 
         let decisions =
             decisions_from_evidence(&store.for_function("pkg.caller", caller_id), |id| {
-                store.function_target(id)
+                (id == target_id).then(|| serialized_target.clone())
             });
         let PlannedReplacement::Guarded { alternatives, .. } = &decisions[0].replacement else {
             unreachable!("call target decision should be guarded");
@@ -1315,9 +1467,34 @@ mod tests {
         assert_eq!(
             alternatives[0].action,
             PlannedAction::DirectCall {
-                target: synthesized,
+                target: serialized_target,
             }
         );
+    }
+
+    fn test_plan_with_module(
+        module_name: &str,
+        source_hash: u64,
+        function: SerializedFunctionId,
+    ) -> OptimizationPlan {
+        OptimizationPlan {
+            source: PythonModuleCacheSource::Project,
+            module_name: module_name.to_string(),
+            source_hash,
+            cache_identity: "test-cache".to_string(),
+            identity_tables: SerializedIdentityTables {
+                modules: vec![SerializedModuleIdentity {
+                    module_name: module_name.to_string(),
+                    source_hash,
+                    cache_identity: Some("test-cache".to_string()),
+                }],
+                debug_names: vec![SerializedFunctionDebugName {
+                    function,
+                    qualname: "f".to_string(),
+                }],
+            },
+            functions: Vec::new(),
+        }
     }
 
     fn row(

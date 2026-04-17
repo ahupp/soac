@@ -27,8 +27,8 @@ use crate::function_instantiation::{
 use crate::module_constants::{ModuleCodegenConstants, ModuleConstantId};
 use crate::module_type::{CounterRuntimeSlot, SharedModuleState, build_counter_storage_layout};
 use crate::optimization_plan::{
-    FunctionProfileEvidence, OptimizationPlan, PlannedFunctionTarget,
-    PlannedIndexedFieldSpecialization, load_optimization_plan,
+    FunctionProfileEvidence, OptimizationPlan, PlannedIndexedFieldSpecialization,
+    load_optimization_plan,
 };
 use cranelift_codegen::cfg_printer::CFGPrinter;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
@@ -50,8 +50,8 @@ use soac_blockpy::block_py::{
     CallableScopeKind, CellLocation, ChildVisitable, CodegenBlock, CounterDef, CounterId,
     CounterScope, CounterSite, Del, DeoptEntrySource, FunctionExecutionMode, FunctionId,
     FunctionKind, GetAttr, HasMeta, HasSemanticInstrId, InstrCodegen, InstrId, InstrKey, Literal,
-    Load, LocalLocation, Meta, NameLocation, ParamKind, ResolvedName, RuntimeName, StorageLayout,
-    Store, Visit, VisitMut, WithMeta, operation as blockpy_intrinsics,
+    Load, LocalLocation, Meta, NameLocation, ParamKind, PersistentFunctionId, ResolvedName,
+    RuntimeName, StorageLayout, Store, Visit, VisitMut, WithMeta, operation as blockpy_intrinsics,
 };
 use soac_blockpy::passes::{
     CodegenModuleShape, ConstructorFieldValue, DirectFunctionIdGuardTest,
@@ -12890,11 +12890,14 @@ fn planned_evidence_for_shared_state(
             .ok_or_else(|| {
                 format!(
                     "optimization plan for module {} references missing function id {} ({})",
-                    plan.module_name, planned_function.local_function_id, planned_function.qualname
+                    plan.module_name,
+                    planned_function.local_function_id(),
+                    plan.debug_name_for_function(planned_function.function)
+                        .unwrap_or("<unknown>")
                 )
             })?;
         let evidence = plan
-            .evidence_for_local_function(planned_function.local_function_id, |target| {
+            .evidence_for_local_function(planned_function.local_function_id(), |target| {
                 resolve_planned_function_target(shared_state, compile_session, target)
                     .map_err(anyhow::Error::msg)
             })
@@ -12939,17 +12942,21 @@ fn planned_evidence_for_precompile(
         if !has_function(current_function_id) {
             return Err(format!(
                 "optimization plan for module {} references missing function id {} ({})",
-                plan.module_name, planned_function.local_function_id, planned_function.qualname
+                plan.module_name,
+                planned_function.local_function_id(),
+                plan.debug_name_for_function(planned_function.function)
+                    .unwrap_or("<unknown>")
             ));
         }
         let evidence = plan
-            .evidence_for_local_function(planned_function.local_function_id, |target| {
-                if target.module_name != module_name || target.source_hash != source_hash {
+            .evidence_for_local_function(planned_function.local_function_id(), |target| {
+                if target.module.module_name != module_name
+                    || target.module.source_hash != source_hash
+                {
                     return Ok(module_index
                         .and_then(|module_index| module_index.function_id_for_target(target)));
                 }
-                let target_function_id =
-                    FunctionId::new(module_id, target.local_function_id().as_u32());
+                let target_function_id = FunctionId::new(module_id, target.local.as_u32());
                 Ok(has_function(target_function_id).then_some(target_function_id))
             })
             .map_err(|err| err.to_string())?;
@@ -12972,29 +12979,28 @@ fn function_profile_evidence_is_empty(evidence: &FunctionProfileEvidence) -> boo
 fn resolve_planned_function_target(
     shared_state: &SharedModuleState,
     compile_session: Option<&crate::session::CompileSession>,
-    target: &PlannedFunctionTarget,
+    target: &PersistentFunctionId,
 ) -> Result<Option<FunctionId>, String> {
     let target_shared_state_owner;
-    let target_shared_state = if target.module_name == shared_state.module_name
-        && target.source_hash == shared_state.source_hash
+    let target_shared_state = if target.module.module_name == shared_state.module_name
+        && target.module.source_hash == shared_state.source_hash
     {
         shared_state
     } else {
         let Some(compile_session) = compile_session else {
             return Ok(None);
         };
-        let Some(target_shared_state) = compile_session
-            .shared_module_state_for_identity(&target.module_name, target.source_hash)?
+        let Some(target_shared_state) = compile_session.shared_module_state_for_identity(
+            &target.module.module_name,
+            target.module.source_hash,
+        )?
         else {
             return Ok(None);
         };
         target_shared_state_owner = target_shared_state;
         target_shared_state_owner.as_ref()
     };
-    let function_id = FunctionId::new(
-        target_shared_state.module_id(),
-        target.local_function_id().as_u32(),
-    );
+    let function_id = FunctionId::new(target_shared_state.module_id(), target.local.as_u32());
     Ok(target_shared_state
         .lookup_function(function_id)
         .map(|function| function.function_id))
@@ -24326,11 +24332,11 @@ impl PrecompileModuleIndex {
         Ok(())
     }
 
-    fn function_id_for_target(&self, target: &PlannedFunctionTarget) -> Option<FunctionId> {
+    fn function_id_for_target(&self, target: &PersistentFunctionId) -> Option<FunctionId> {
         let module = self
             .modules_by_identity
-            .get(&(target.module_name.clone(), target.source_hash))?;
-        let function_id = FunctionId::new(module.module_id, target.local_function_id().as_u32());
+            .get(&(target.module.module_name.clone(), target.module.source_hash))?;
+        let function_id = FunctionId::new(module.module_id, target.local.as_u32());
         self.function(function_id).map(|_| function_id)
     }
 

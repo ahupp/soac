@@ -110,17 +110,21 @@ Use explicit resolution steps at artifact boundaries:
 
 ## Migration plan
 
-1. Add the newtypes while keeping the existing `FunctionId` storage.
+1. Add the newtypes while keeping the existing `FunctionId` storage. Done.
 2. Rename the existing packed accessors to expose their lifetime:
    - `module_id()` -> `runtime_module_id()`;
    - `function_id()` -> `local_function_id()`;
    - `packed()` -> `to_packed_runtime_u64()`.
 3. Introduce `PersistentFunctionId` and use it for optimization-plan targets.
+   Done for runtime/precompile resolution; serialized targets now resolve to
+   `PersistentFunctionId` before they are mapped to process-local ids.
 4. Change `FunctionOptimizationPlan` to store `LocalFunctionId`; the enclosing
-   plan already identifies the module.
+   plan already identifies the module. Done as an intermediate step; `.opt`
+   artifacts now store a compact `SerializedFunctionId` so future cross-module
+   plan sections can use the same representation.
 5. Add serialized module/debug side tables for `.opt` and counter-derived
    decision artifacts; use packed `SerializedFunctionId` values whose module
-   half indexes the serialized module table.
+   half indexes the serialized module table. Done for `.opt` decisions.
 6. Teach `ProfileEvidenceStore` to resolve raw counter ids once at load time.
 7. Change precompile indexing and symbol generation to accept persistent ids.
 8. Finally rename the old `FunctionId` to `RuntimeFunctionId` once remaining

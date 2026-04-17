@@ -5,10 +5,11 @@ use soac_blockpy::block_py::{
     CalleeFunctionId, CellLocation, CellRef, ChildVisitable, ClosureInit, ClosureSlot,
     CodegenBlock, CounterDef, CounterSite, Del, DelItem, FunctionId, FunctionKind, FunctionName,
     GetAttr, GetItem, HasMeta, HasSemanticInstrId, IncrementCounter, InstrCodegen, InstrResolved,
-    Literal, LiteralValue, Load, LocalLocation, MakeCell, Meta, ModuleNameGen, NameLike,
-    NameLocation, NumberLiteral, NumberLiteralValue, Param, ParamKind, ParamSpec, ResolvedName,
-    RuntimeName, SetAttr, SetItem, StorageLayout, Store, StringLiteral, Tuple, UnaryOp,
-    UnaryOpKind, Visit, VisitMut, WithMeta,
+    Literal, LiteralValue, Load, LocalFunctionId, LocalLocation, MakeCell, Meta, ModuleNameGen,
+    NameLike, NameLocation, NumberLiteral, NumberLiteralValue, Param, ParamKind, ParamSpec,
+    ResolvedName, RuntimeName, SerializedFunctionDebugName, SerializedFunctionId,
+    SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity, SetAttr, SetItem,
+    StorageLayout, Store, StringLiteral, Tuple, UnaryOp, UnaryOpKind, Visit, VisitMut, WithMeta,
 };
 use soac_blockpy::passes::{
     CodegenModuleShape, instrument_bb_module_with_block_entry_counters,
@@ -3031,6 +3032,55 @@ def build(values):
         let archive = rkyv::to_bytes::<rkyv::rancor::Error>(plan)
             .expect("test optimization plan should serialize");
         std::fs::write(path, archive.as_ref()).expect("test optimization plan should be writable");
+    }
+
+    fn test_serialized_function_id(
+        serialized_module_id: u32,
+        function_id: FunctionId,
+    ) -> SerializedFunctionId {
+        SerializedFunctionId::new(
+            SerializedModuleId::new(serialized_module_id),
+            function_id.local_function_id(),
+        )
+    }
+
+    fn test_planned_function_target(
+        serialized_module_id: u32,
+        function_id: FunctionId,
+    ) -> PlannedFunctionTarget {
+        PlannedFunctionTarget::new(test_serialized_function_id(
+            serialized_module_id,
+            function_id,
+        ))
+    }
+
+    fn test_plan_identities(
+        module_name: &str,
+        source_hash: u64,
+        cache_identity: &str,
+        debug_function: SerializedFunctionId,
+        debug_qualname: &str,
+        extra_modules: &[(&str, u64)],
+    ) -> SerializedIdentityTables {
+        let mut modules = vec![SerializedModuleIdentity {
+            module_name: module_name.to_string(),
+            source_hash,
+            cache_identity: Some(cache_identity.to_string()),
+        }];
+        for (module_name, source_hash) in extra_modules {
+            modules.push(SerializedModuleIdentity {
+                module_name: (*module_name).to_string(),
+                source_hash: *source_hash,
+                cache_identity: None,
+            });
+        }
+        SerializedIdentityTables {
+            modules,
+            debug_names: vec![SerializedFunctionDebugName {
+                function: debug_function,
+                qualname: debug_qualname.to_string(),
+            }],
+        }
     }
 
     fn cached_split_key_layout(
@@ -16604,23 +16654,27 @@ def f(x, y):
         let caller_function_id = caller.function_id;
         let module = test_module(module_name_gen, vec![callee, caller]);
         let instr_id = InstrId::new(BlockLabel::from_index(0), 0);
-        let planned_target = PlannedFunctionTarget {
-            module_name: module_name.to_string(),
-            source_hash,
-            function_id: callee_function_id.function_id(),
-        };
+        let planned_target = test_planned_function_target(0, callee_function_id);
         let cache_identity = pre_optimization_module_cache_identity(
             env!("SOAC_BUILD_IDENTITY"),
             module_name == "soac.runtime",
         );
+        let planned_caller_function = test_serialized_function_id(0, caller_function_id);
         let plan = OptimizationPlan {
             source: PythonModuleCacheSource::Project,
             module_name: module_name.to_string(),
             source_hash,
             cache_identity: cache_identity.clone(),
+            identity_tables: test_plan_identities(
+                module_name,
+                source_hash,
+                cache_identity.as_str(),
+                planned_caller_function,
+                "caller",
+                &[],
+            ),
             functions: vec![FunctionOptimizationPlan {
-                local_function_id: caller_function_id.local_function_id(),
-                qualname: "caller".to_string(),
+                function: planned_caller_function,
                 decisions: vec![OptimizationDecision {
                     instr_id,
                     replacement: PlannedReplacement::Guarded {
@@ -16703,23 +16757,27 @@ def f(x, y):
         ])
         .expect("precompile module index should build");
         let instr_id = InstrId::new(BlockLabel::from_index(0), 0);
-        let planned_target = PlannedFunctionTarget {
-            module_name: callee_module_name.to_string(),
-            source_hash: callee_source_hash,
-            function_id: callee_function_id.function_id(),
-        };
+        let planned_target = test_planned_function_target(1, callee_function_id);
         let cache_identity = pre_optimization_module_cache_identity(
             env!("SOAC_BUILD_IDENTITY"),
             caller_module_name == "soac.runtime",
         );
+        let planned_caller_function = test_serialized_function_id(0, caller_function_id);
         let plan = OptimizationPlan {
             source: PythonModuleCacheSource::Project,
             module_name: caller_module_name.to_string(),
             source_hash: caller_source_hash,
             cache_identity: cache_identity.clone(),
+            identity_tables: test_plan_identities(
+                caller_module_name,
+                caller_source_hash,
+                cache_identity.as_str(),
+                planned_caller_function,
+                "caller",
+                &[(callee_module_name, callee_source_hash)],
+            ),
             functions: vec![FunctionOptimizationPlan {
-                local_function_id: caller_function_id.local_function_id(),
-                qualname: "caller".to_string(),
+                function: planned_caller_function,
                 decisions: vec![OptimizationDecision {
                     instr_id,
                     replacement: PlannedReplacement::Guarded {
@@ -16832,23 +16890,27 @@ def f(x, y):
             },
         ])
         .expect("precompile module index should build");
-        let planned_target = PlannedFunctionTarget {
-            module_name: callee_module_name.to_string(),
-            source_hash: callee_source_hash,
-            function_id: callee_function_id.function_id(),
-        };
+        let planned_target = test_planned_function_target(1, callee_function_id);
         let cache_identity = pre_optimization_module_cache_identity(
             env!("SOAC_BUILD_IDENTITY"),
             caller_module_name == "soac.runtime",
         );
+        let planned_caller_function = test_serialized_function_id(0, caller_function_id);
         let plan = OptimizationPlan {
             source: PythonModuleCacheSource::Project,
             module_name: caller_module_name.to_string(),
             source_hash: caller_source_hash,
             cache_identity: cache_identity.clone(),
+            identity_tables: test_plan_identities(
+                caller_module_name,
+                caller_source_hash,
+                cache_identity.as_str(),
+                planned_caller_function,
+                "caller",
+                &[(callee_module_name, callee_source_hash)],
+            ),
             functions: vec![FunctionOptimizationPlan {
-                local_function_id: caller_function_id.local_function_id(),
-                qualname: "caller".to_string(),
+                function: planned_caller_function,
                 decisions: vec![OptimizationDecision {
                     instr_id: call_instr_id,
                     replacement: PlannedReplacement::Guarded {
@@ -16915,23 +16977,30 @@ def f(x, y):
         let caller_function_id = caller.function_id;
         let module = test_module(module_name_gen, vec![caller]);
         let instr_id = InstrId::new(BlockLabel::from_index(0), 0);
-        let planned_target = PlannedFunctionTarget {
-            module_name: "planned_precompile_cross_module_callee".to_string(),
-            source_hash: 0xdecafbad,
-            function_id: 7,
-        };
+        let planned_target = PlannedFunctionTarget::new(SerializedFunctionId::new(
+            SerializedModuleId::new(1),
+            LocalFunctionId::new(7),
+        ));
         let cache_identity = pre_optimization_module_cache_identity(
             env!("SOAC_BUILD_IDENTITY"),
             module_name == "soac.runtime",
         );
+        let planned_caller_function = test_serialized_function_id(0, caller_function_id);
         let plan = OptimizationPlan {
             source: PythonModuleCacheSource::Project,
             module_name: module_name.to_string(),
             source_hash,
             cache_identity: cache_identity.clone(),
+            identity_tables: test_plan_identities(
+                module_name,
+                source_hash,
+                cache_identity.as_str(),
+                planned_caller_function,
+                "caller",
+                &[("planned_precompile_cross_module_callee", 0xdecafbad)],
+            ),
             functions: vec![FunctionOptimizationPlan {
-                local_function_id: caller_function_id.local_function_id(),
-                qualname: "caller".to_string(),
+                function: planned_caller_function,
                 decisions: vec![OptimizationDecision {
                     instr_id,
                     replacement: PlannedReplacement::Guarded {
@@ -17009,25 +17078,29 @@ def f(x, y):
             let shared_state =
                 crate::module_type::build_shared_state_for_testing(py, module, module_name, "")
                     .expect("shared state should build");
-            let planned_callee_target = PlannedFunctionTarget {
-                module_name: module_name.to_string(),
-                source_hash: shared_state.source_hash,
-                function_id: callee_function_id.function_id(),
-            };
+            let planned_callee_target = test_planned_function_target(0, callee_function_id);
             let cache_identity = pre_optimization_module_cache_identity(
                 env!("SOAC_BUILD_IDENTITY"),
                 shared_state.module_name == "soac.runtime",
             );
+            let planned_caller_function = test_serialized_function_id(0, caller_function_id);
             let plan = OptimizationPlan {
                 source: PythonModuleCacheSource::Project,
                 module_name: module_name.to_string(),
                 source_hash: shared_state.source_hash,
-                cache_identity,
+                cache_identity: cache_identity.clone(),
+                identity_tables: test_plan_identities(
+                    module_name,
+                    shared_state.source_hash,
+                    cache_identity.as_str(),
+                    planned_caller_function,
+                    "callee",
+                    &[],
+                ),
                 functions: vec![FunctionOptimizationPlan {
-                    local_function_id: caller_function_id.local_function_id(),
+                    function: planned_caller_function,
                     // Runtime plan loading must use the module-local function id,
                     // not qualname, so duplicate function names remain distinct.
-                    qualname: "callee".to_string(),
                     decisions: vec![
                         OptimizationDecision {
                             instr_id,
@@ -17167,22 +17240,27 @@ def f(x, y):
                 .retain_shared_module_state(std::sync::Arc::clone(&callee_state))
                 .expect("callee state should be retained");
             let instr_id = InstrId::new(BlockLabel::from_index(0), 0);
-            let planned_callee_target = PlannedFunctionTarget {
-                module_name: callee_module_name.to_string(),
-                source_hash: callee_state.source_hash,
-                function_id: callee_function_id.function_id(),
-            };
+            let planned_callee_target = test_planned_function_target(1, callee_function_id);
+            let planned_caller_function = test_serialized_function_id(0, caller_function_id);
+            let cache_identity = pre_optimization_module_cache_identity(
+                env!("SOAC_BUILD_IDENTITY"),
+                caller_state.module_name == "soac.runtime",
+            );
             let plan = OptimizationPlan {
                 source: PythonModuleCacheSource::Project,
                 module_name: caller_module_name.to_string(),
                 source_hash: caller_state.source_hash,
-                cache_identity: pre_optimization_module_cache_identity(
-                    env!("SOAC_BUILD_IDENTITY"),
-                    caller_state.module_name == "soac.runtime",
+                cache_identity: cache_identity.clone(),
+                identity_tables: test_plan_identities(
+                    caller_module_name,
+                    caller_state.source_hash,
+                    cache_identity.as_str(),
+                    planned_caller_function,
+                    "duplicate",
+                    &[(callee_module_name, callee_state.source_hash)],
                 ),
                 functions: vec![FunctionOptimizationPlan {
-                    local_function_id: caller_function_id.local_function_id(),
-                    qualname: "duplicate".to_string(),
+                    function: planned_caller_function,
                     decisions: vec![OptimizationDecision {
                         instr_id,
                         replacement: PlannedReplacement::Guarded {
@@ -17307,22 +17385,27 @@ def f(x, y):
                 .retain_shared_module_state(std::sync::Arc::clone(&callee_state))
                 .expect("callee state should be retained");
 
-            let planned_callee_target = PlannedFunctionTarget {
-                module_name: callee_module_name.to_string(),
-                source_hash: callee_state.source_hash,
-                function_id: callee_function_id.function_id(),
-            };
+            let planned_callee_target = test_planned_function_target(1, callee_function_id);
+            let planned_caller_function = test_serialized_function_id(0, caller_function_id);
+            let cache_identity = pre_optimization_module_cache_identity(
+                env!("SOAC_BUILD_IDENTITY"),
+                caller_state.module_name == "soac.runtime",
+            );
             let plan = OptimizationPlan {
                 source: PythonModuleCacheSource::Project,
                 module_name: caller_module_name.to_string(),
                 source_hash: caller_state.source_hash,
-                cache_identity: pre_optimization_module_cache_identity(
-                    env!("SOAC_BUILD_IDENTITY"),
-                    caller_state.module_name == "soac.runtime",
+                cache_identity: cache_identity.clone(),
+                identity_tables: test_plan_identities(
+                    caller_module_name,
+                    caller_state.source_hash,
+                    cache_identity.as_str(),
+                    planned_caller_function,
+                    "caller",
+                    &[(callee_module_name, callee_state.source_hash)],
                 ),
                 functions: vec![FunctionOptimizationPlan {
-                    local_function_id: caller_function_id.local_function_id(),
-                    qualname: "caller".to_string(),
+                    function: planned_caller_function,
                     decisions: vec![OptimizationDecision {
                         instr_id: call_instr_id,
                         replacement: PlannedReplacement::Guarded {
