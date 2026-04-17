@@ -27,7 +27,8 @@ use crate::function_instantiation::{
 use crate::module_constants::{ModuleCodegenConstants, ModuleConstantId};
 use crate::module_type::{CounterRuntimeSlot, SharedModuleState, build_counter_storage_layout};
 use crate::optimization_plan::{
-    FunctionProfileEvidence, PlannedIndexedFieldSpecialization, load_optimization_plan,
+    FunctionProfileEvidence, OptimizationPlan, PlannedIndexedFieldSpecialization,
+    load_optimization_plan,
 };
 use cranelift_codegen::cfg_printer::CFGPrinter;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
@@ -12438,9 +12439,67 @@ fn load_planned_evidence_for_runtime_state(
             cache_identity.as_str(),
         )
         .map_err(|err| err.to_string())?;
-        return plan.evidence_by_function().map_err(|err| err.to_string());
+        return planned_evidence_for_shared_state(&plan, shared_state);
     }
     Ok(HashMap::new())
+}
+
+fn planned_evidence_for_shared_state(
+    plan: &OptimizationPlan,
+    shared_state: &SharedModuleState,
+) -> Result<HashMap<FunctionId, FunctionProfileEvidence>, String> {
+    let mut evidence_by_function = HashMap::new();
+    for planned_function in &plan.functions {
+        let current_function = shared_state
+            .lowered_module
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == planned_function.qualname)
+            .ok_or_else(|| {
+                format!(
+                    "optimization plan for module {} references missing function {} ({})",
+                    plan.module_name, planned_function.qualname, planned_function.function_id
+                )
+            })?;
+        let mut evidence = plan
+            .evidence_for_function(planned_function.function_id)
+            .map_err(|err| err.to_string())?;
+        remap_same_module_call_targets(
+            &mut evidence,
+            planned_function.function_id.module_id(),
+            shared_state.module_id(),
+            shared_state,
+        )?;
+        evidence_by_function.insert(current_function.function_id, evidence);
+    }
+    Ok(evidence_by_function)
+}
+
+fn remap_same_module_call_targets(
+    evidence: &mut FunctionProfileEvidence,
+    planned_module_id: u32,
+    current_module_id: u32,
+    shared_state: &SharedModuleState,
+) -> Result<(), String> {
+    if planned_module_id == current_module_id {
+        return Ok(());
+    }
+    for targets in evidence.call_target_specializations.values_mut() {
+        for target in targets {
+            if target.module_id() != planned_module_id {
+                continue;
+            }
+            let remapped = FunctionId::new(current_module_id, target.function_id());
+            if shared_state.lookup_function(remapped).is_none() {
+                return Err(format!(
+                    "optimization plan remapped same-module direct-call target {target} to missing current function {remapped} in module {}",
+                    shared_state.module_name
+                ));
+            }
+            *target = remapped;
+        }
+    }
+    Ok(())
 }
 
 impl FunctionSpecializationInputs {

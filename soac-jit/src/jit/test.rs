@@ -16204,6 +16204,11 @@ def f(x, y):
             let shared_state =
                 crate::module_type::build_shared_state_for_testing(py, module, module_name, "")
                     .expect("shared state should build");
+            let planned_module_id = 42;
+            let planned_callee_function_id =
+                FunctionId::new(planned_module_id, callee_function_id.function_id());
+            let planned_caller_function_id =
+                FunctionId::new(planned_module_id, caller_function_id.function_id());
             let cache_identity = pre_optimization_module_cache_identity(
                 env!("SOAC_BUILD_IDENTITY"),
                 shared_state.module_name == "soac.runtime",
@@ -16214,7 +16219,7 @@ def f(x, y):
                 source_hash: shared_state.source_hash,
                 cache_identity,
                 functions: vec![FunctionOptimizationPlan {
-                    function_id: caller_function_id,
+                    function_id: planned_caller_function_id,
                     qualname: "caller".to_string(),
                     decisions: vec![
                         OptimizationDecision {
@@ -16222,10 +16227,10 @@ def f(x, y):
                             replacement: PlannedReplacement::Guarded {
                                 alternatives: vec![PlannedAlternative {
                                     guards: vec![PlannedGuard::FunctionId {
-                                        function_id: callee_function_id,
+                                        function_id: planned_callee_function_id,
                                     }],
                                     action: PlannedAction::DirectCall {
-                                        function_id: callee_function_id,
+                                        function_id: planned_callee_function_id,
                                     },
                                 }],
                                 fallback: PlannedFallback::OriginalInstruction,
