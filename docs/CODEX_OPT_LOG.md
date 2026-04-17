@@ -87,6 +87,26 @@ benchmarked throughput delta, and the headline pre/post numbers.
 
 # Journal of Negative Results
 
+## 2026-04-17 - Not landed: borrowed indexed-field GetAttr results
+
+- jj change id: not landed (`rpyppuvu` while testing)
+- summary: Tried planning borrowed-ok profiled indexed `GetAttr` results as
+  borrowed-field candidates and skipping the direct-hit `INCREF` only when the
+  receiver was already live and guard misses deopted instead of merging with an
+  owned fallback. Pystone field indexed hit/fallback counts and runtime
+  INCREF/DECREF counters were unchanged, so the added ownership shape did not
+  reach the hot refcount path in this benchmark. Throughput regressed slightly
+  and code size increased.
+- throughput: `-0.66%` median with refcounts enabled
+- baseline benchmark:
+  - apply, refcounts enabled, 1M loops x3 median: `258974 loops/s`
+  - apply, refcounts disabled, 1M loops x3 median: `346176 loops/s`
+  - total pystone code size: `392208 bytes`
+- attempted benchmark:
+  - apply, refcounts enabled, 1M loops x3 median: `257265 loops/s`
+  - apply, refcounts disabled, 1M loops x3 median: `338445 loops/s`
+  - total pystone code size: `392432 bytes`
+
 ## 2026-04-17 - Not landed: typed item intrinsic and effect-only setitem emission
 
 - jj change id: not landed (`tmxwusyv` while testing)
