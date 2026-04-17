@@ -14113,7 +14113,12 @@ fn prime_planned_field_index_layouts<'a>(
                 index: planned.expected_index,
             });
     }
-    for (type_key, layouts) in layouts_by_type {
+    for (type_key, mut layouts) in layouts_by_type {
+        layouts.sort_by(|lhs, rhs| {
+            lhs.index
+                .cmp(&rhs.index)
+                .then_with(|| lhs.key.cmp(&rhs.key))
+        });
         let Some(owner_type) = resolve_type_key_to_type(&type_key)? else {
             continue;
         };

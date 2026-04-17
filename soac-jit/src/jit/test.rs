@@ -25,7 +25,7 @@ mod tests {
     use crate::optimization_plan::{
         FunctionOptimizationPlan, OptimizationDecision, OptimizationPlan, PlannedAction,
         PlannedAlternative, PlannedFallback, PlannedFunctionTarget, PlannedGuard,
-        PlannedReplacement, ShapeFamily,
+        PlannedIndexedFieldSpecialization, PlannedReplacement, PlannedTypeKey, ShapeFamily,
     };
     use cranelift_codegen::cursor::Cursor;
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyModule, PyModuleMethods, PyTuple};
@@ -6290,6 +6290,87 @@ class Point:
 
             modules
                 .del_item("field_type_test")
+                .expect("test module should be removed");
+        });
+    }
+
+    #[test]
+    fn planned_field_index_layout_priming_uses_profiled_index_order() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+
+        Python::attach(|py| {
+            let module_name = "planned_field_type_test";
+            let module = PyModule::from_code(
+                py,
+                c"
+class Record:
+    pass
+",
+                c"planned_field_type_test.py",
+                c"planned_field_type_test",
+            )
+            .expect("test module should execute");
+            let sys = PyModule::import(py, "sys").expect("sys should import");
+            let modules = sys
+                .getattr("modules")
+                .expect("sys.modules should exist")
+                .cast_into::<pyo3::types::PyDict>()
+                .expect("sys.modules should be a dict");
+            modules
+                .set_item(module_name, module.as_any())
+                .expect("test module should be registered");
+            let owner_type = module
+                .getattr("Record")
+                .expect("Record should exist")
+                .as_ptr() as *mut ffi::PyTypeObject;
+
+            assert!(
+                unsafe { owner_type_supports_field_layout_priming(owner_type) },
+                "expected Record to support field-layout priming"
+            );
+            assert_eq!(
+                cached_split_key_layout(py, owner_type),
+                Vec::<(String, u32)>::new()
+            );
+
+            let owner_type_key = PlannedTypeKey {
+                module_name: module_name.to_string(),
+                qualname: "Record".to_string(),
+            };
+            let planned_fields = [
+                ("IntComp", 3),
+                ("PtrComp", 0),
+                ("StringComp", 4),
+                ("Discr", 1),
+                ("EnumComp", 2),
+            ]
+            .into_iter()
+            .map(
+                |(attr_name, expected_index)| PlannedIndexedFieldSpecialization {
+                    owner_type: owner_type_key.clone(),
+                    attr_name: attr_name.to_string(),
+                    expected_index,
+                },
+            )
+            .collect::<Vec<_>>();
+
+            prime_planned_field_index_layouts(planned_fields.iter())
+                .expect("planned field-layout priming should succeed");
+
+            assert!(
+                cached_split_key_layout(py, owner_type).starts_with(&[
+                    ("PtrComp".to_string(), 0),
+                    ("Discr".to_string(), 1),
+                    ("EnumComp".to_string(), 2),
+                    ("IntComp".to_string(), 3),
+                    ("StringComp".to_string(), 4),
+                ]),
+                "planned priming should replay the profiled split-key order"
+            );
+
+            modules
+                .del_item(module_name)
                 .expect("test module should be removed");
         });
     }

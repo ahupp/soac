@@ -1025,3 +1025,20 @@ benchmarked throughput delta, and the headline pre/post numbers.
   - specialized pass, 1M loops x3: `260428`, `260904`, `256758 loops/s`
   - no-refcount diagnostic, 1M loops x3: `344871`, `341789`, `335818 loops/s`
   - pystone JIT code bytes: `374554`
+
+## 2026-04-18 - Replay planned field layouts by index
+
+- jj change id: `noupmxss`
+- summary: planned indexed-field layout priming now replays owner-type keys in
+  profiled `expected_index` order instead of `HashMap` iteration order. The bad
+  order changed `pystone.Record` split-dict key indexes during verify/apply, so
+  indexed-field guards missed even though the optimization plan contained the
+  right field decisions.
+- throughput: `+385.38%` specialized pystone median; no-refcount diagnostic
+  `+14.55%`
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `50959`, `53673`, `116568 loops/s`
+  - no-refcount diagnostic, 1M loops x3: `284496`, `310252`, `299339 loops/s`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `260255`, `262657`, `260516 loops/s`
+  - no-refcount diagnostic, 1M loops x3: `342902`, `345126`, `342299 loops/s`
