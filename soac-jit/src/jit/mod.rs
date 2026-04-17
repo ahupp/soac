@@ -13027,8 +13027,10 @@ fn resolve_planned_function_target(
         target_shared_state_owner = target_shared_state;
         target_shared_state_owner.as_ref()
     };
-    let function_id =
-        RuntimeFunctionId::from_raw_parts(target_shared_state.module_id(), target.local.as_u32());
+    let function_id = RuntimeFunctionId::new(
+        RuntimeModuleId::new(target_shared_state.module_id()),
+        target.local,
+    );
     Ok(target_shared_state
         .lookup_function(function_id)
         .map(|function| function.function_id))
@@ -24309,7 +24311,7 @@ struct PrecompileIndexedFunction {
 
 #[derive(Debug, Clone)]
 struct PrecompileIndexedModule {
-    module_id: u32,
+    module_id: RuntimeModuleId,
     inline_plan: InlinePlanModule,
 }
 
@@ -24333,7 +24335,7 @@ impl PrecompileModuleIndex {
 
     fn insert(&mut self, entry: PrecompileModuleIndexEntry<'_>) -> Result<(), String> {
         let identity = (entry.module_name.to_string(), entry.source_hash);
-        let module_id = entry.module.module_name_gen.module_id();
+        let module_id = entry.module.module_name_gen.runtime_module_id();
         if self
             .modules_by_identity
             .insert(
@@ -24377,8 +24379,7 @@ impl PrecompileModuleIndex {
         let module = self
             .modules_by_identity
             .get(&(target.module.module_name.clone(), target.module.source_hash))?;
-        let function_id =
-            RuntimeFunctionId::from_raw_parts(module.module_id, target.local.as_u32());
+        let function_id = RuntimeFunctionId::new(module.module_id, target.local);
         self.function(function_id).map(|_| function_id)
     }
 

@@ -421,6 +421,10 @@ impl ModuleNameGen {
         self.module_id.as_u32()
     }
 
+    pub fn runtime_module_id(&self) -> RuntimeModuleId {
+        self.module_id
+    }
+
     pub fn next_function_name_gen(&self) -> FunctionNameGen {
         let function_id = RuntimeFunctionId::new(
             self.module_id,

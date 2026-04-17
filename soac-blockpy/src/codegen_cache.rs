@@ -1,6 +1,6 @@
 use crate::block_py::{
     walk_expr_mut, walk_module_mut, BlockPyFunction, BlockPyModule, CounterSite, FunctionNameGen,
-    ModuleNameGen, RuntimeFunctionId, VisitMut,
+    ModuleNameGen, RuntimeFunctionId, RuntimeModuleId, VisitMut,
 };
 use crate::passes::{
     CodegenModuleShape, EscapeSummaryModule, FactStore, InlinePlanModule, InstrCodegen,
@@ -235,7 +235,7 @@ pub fn remap_codegen_module_function_ids(
     remap_codegen_module_function_ids_with_remapper(
         module,
         FunctionIdRemapper {
-            new_module_id: module_name_gen.module_id(),
+            new_module_id: module_name_gen.runtime_module_id(),
         },
     );
 }
@@ -245,7 +245,7 @@ pub fn remap_cached_codegen_module_function_ids(
     module_name_gen: ModuleNameGen,
 ) {
     let remapper = FunctionIdRemapper {
-        new_module_id: module_name_gen.module_id(),
+        new_module_id: module_name_gen.runtime_module_id(),
     };
     remap_codegen_module_function_ids_with_remapper(&mut cache.module, remapper);
     if let Some(prepared) = &mut cache.prepared {
@@ -283,7 +283,7 @@ fn remap_codegen_module_function_ids_with_remapper(
 
 #[derive(Clone, Copy)]
 struct FunctionIdRemapper {
-    new_module_id: u32,
+    new_module_id: RuntimeModuleId,
 }
 
 impl FunctionIdRemapper {
@@ -291,10 +291,7 @@ impl FunctionIdRemapper {
         if function_id == RuntimeFunctionId::global() {
             function_id
         } else {
-            RuntimeFunctionId::from_raw_parts(
-                self.new_module_id,
-                function_id.local_function_id().as_u32(),
-            )
+            RuntimeFunctionId::new(self.new_module_id, function_id.local_function_id())
         }
     }
 }
