@@ -1,12 +1,16 @@
-use soac_blockpy::block_py::{FunctionId, ModuleNameGen};
+use soac_blockpy::block_py::{BlockPyModule, FunctionId, ModuleNameGen};
 use soac_blockpy::codegen_cache::{
     CachedCodegenModuleMetadata, PythonModuleCacheSource, codegen_module_cache_path,
     load_codegen_module_cache, module_optimization_plan_path,
     remap_cached_codegen_module_function_ids, validate_codegen_module_cache_metadata,
 };
+use soac_blockpy::passes::CodegenModuleShape;
 use soac_jit::counter_dump::{CounterDumpFile, CounterDumpRecordView, CounterDumpRowView};
 use soac_jit::module_type::hash_module_source;
-use soac_jit::{PrecompileOptimizationPlanInput, precompile_codegen_module_to_object_file};
+use soac_jit::{
+    PrecompileModuleIndex, PrecompileModuleIndexEntry, PrecompileOptimizationPlanInput,
+    precompile_codegen_module_to_object_file,
+};
 use std::collections::HashSet;
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -40,6 +44,13 @@ struct CompiledModuleObject {
     function_count: usize,
     data_object_count: usize,
     object_size_bytes: usize,
+}
+
+#[derive(Debug)]
+struct LoadedModule {
+    module_ref: CounterModuleRef,
+    metadata: CachedCodegenModuleMetadata,
+    module: BlockPyModule<CodegenModuleShape>,
 }
 
 fn main() {
@@ -111,7 +122,7 @@ fn run_with_args(args: impl IntoIterator<Item = OsString>) -> Result<(), String>
         })?;
     }
 
-    let mut compiled = Vec::new();
+    let mut loaded_modules = Vec::new();
     for module_ref in modules {
         let cache_path = resolve_module_cache_path(
             module_cache_dir.as_path(),
@@ -124,7 +135,24 @@ fn run_with_args(args: impl IntoIterator<Item = OsString>) -> Result<(), String>
             remap_cached_codegen_module_function_ids(&mut cache, ModuleNameGen::new(module_id));
         }
         let metadata = cache.metadata.clone();
-        let module = cache.module;
+        loaded_modules.push(LoadedModule {
+            module_ref,
+            metadata,
+            module: cache.module,
+        });
+    }
+    let module_index = PrecompileModuleIndex::from_entries(loaded_modules.iter().map(|loaded| {
+        PrecompileModuleIndexEntry {
+            module_name: loaded.module_ref.module_name.as_str(),
+            source_hash: loaded.module_ref.source_hash,
+            module: &loaded.module,
+        }
+    }))?;
+
+    let mut compiled = Vec::new();
+    for loaded in loaded_modules {
+        let module_ref = loaded.module_ref;
+        let metadata = loaded.metadata;
         let optimization_plan_path = module_optimization_plan_path(
             module_cache_dir.as_path(),
             metadata.source,
@@ -141,9 +169,10 @@ fn run_with_args(args: impl IntoIterator<Item = OsString>) -> Result<(), String>
         let summary = precompile_codegen_module_to_object_file(
             module_ref.module_name.as_str(),
             module_ref.source_hash,
-            &module,
+            &loaded.module,
             Some(counters_path.as_path()),
             Some(optimization_plan),
+            Some(&module_index),
             object_path.as_path(),
         )?;
         println!(

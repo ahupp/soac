@@ -1713,6 +1713,7 @@ impl JitBatchPlan<'_> {
                         &shared_state.lowered_module,
                         &profile,
                         Some(inputs.session.as_ref()),
+                        None,
                         &direct_owner_attr_specializations_by_function,
                     )?
                 } else {
@@ -1834,6 +1835,7 @@ fn build_profiled_jit_module_plan(
     module: &BlockPyModule<CodegenModuleShape>,
     profile: &SpecializationProfile<'_>,
     compile_session: Option<&crate::session::CompileSession>,
+    precompile_module_index: Option<&PrecompileModuleIndex>,
     direct_owner_attr_specializations_by_function: &HashMap<
         FunctionId,
         HashMap<DirectOwnerAttrKey, Vec<DirectOwnerAttrSpecialization>>,
@@ -1844,6 +1846,7 @@ fn build_profiled_jit_module_plan(
         &planned_module,
         profile,
         compile_session,
+        precompile_module_index,
         direct_owner_attr_specializations_by_function,
     )?;
     let mut straightline_constructor_ids = straightline_constructor_ids_in_plan(
@@ -1935,6 +1938,7 @@ fn build_profiled_jit_module_plan(
             &mut external_inline_plan,
             &runtime_constructor_function_ids,
             compile_session,
+            precompile_module_index,
         )?;
         let mut inline_plan = plan_jit_inlining(&planned_module);
         inline_plan
@@ -1997,6 +2001,7 @@ fn build_profiled_inline_callee_maps(
     module: &BlockPyModule<CodegenModuleShape>,
     profile: &SpecializationProfile<'_>,
     compile_session: Option<&crate::session::CompileSession>,
+    precompile_module_index: Option<&PrecompileModuleIndex>,
     direct_owner_attr_specializations_by_function: &HashMap<
         FunctionId,
         HashMap<DirectOwnerAttrKey, Vec<DirectOwnerAttrSpecialization>>,
@@ -2047,6 +2052,25 @@ fn build_profiled_inline_callee_maps(
         if callee_functions.contains_key(&function_id) {
             continue;
         }
+        if let Some(precompile_module_index) = precompile_module_index
+            && let Some(target) = precompile_module_index.function(function_id)
+        {
+            if let Some(inline_plan) = precompile_module_index.inline_plan_for_function(function_id)
+            {
+                external_inline_plan
+                    .functions
+                    .extend(inline_plan.functions.clone());
+            }
+            callee_functions.insert(function_id, target.function.clone());
+            inline_callees.insert(
+                function_id,
+                InlineCallee::cross_module(
+                    target.function.clone(),
+                    target.module_constants.clone(),
+                ),
+            );
+            continue;
+        }
         let Some(compile_session) = compile_session else {
             continue;
         };
@@ -2085,9 +2109,19 @@ fn extend_external_inline_plan_for_function_ids(
     external_inline_plan: &mut InlinePlanModule,
     function_ids: &HashSet<FunctionId>,
     compile_session: Option<&crate::session::CompileSession>,
+    precompile_module_index: Option<&PrecompileModuleIndex>,
 ) -> Result<(), String> {
     for function_id in function_ids {
         if external_inline_plan.functions.contains_key(function_id) {
+            continue;
+        }
+        if let Some(precompile_module_index) = precompile_module_index
+            && let Some(inline_plan) =
+                precompile_module_index.inline_plan_for_function(*function_id)
+        {
+            external_inline_plan
+                .functions
+                .extend(inline_plan.functions.clone());
             continue;
         }
         let Some(compile_session) = compile_session else {
@@ -12481,6 +12515,7 @@ fn planned_evidence_for_shared_state(
 
 fn planned_evidence_for_precompile(
     plan_input: Option<PrecompileOptimizationPlanInput<'_>>,
+    module_index: Option<&PrecompileModuleIndex>,
     module_name: &str,
     source_hash: u64,
     module: &BlockPyModule<CodegenModuleShape>,
@@ -12520,7 +12555,8 @@ fn planned_evidence_for_precompile(
         let evidence = plan
             .evidence_for_function(planned_function.function_id, |target| {
                 if target.module_name != module_name || target.source_hash != source_hash {
-                    return Ok(None);
+                    return Ok(module_index
+                        .and_then(|module_index| module_index.function_id_for_target(target)));
                 }
                 let target_function_id = FunctionId::new(module_id, target.function_id);
                 Ok(has_function(target_function_id).then_some(target_function_id))
@@ -23252,6 +23288,32 @@ fn declare_direct_function(
     ))
 }
 
+fn declare_imported_direct_function(
+    codegen_env: &mut impl JitCodegenEnv,
+    function: &BlockPyFunction<CodegenModuleShape>,
+    symbol_scope: &str,
+) -> Result<DeclaredJitFunction, String> {
+    let sig = make_direct_function_signature(codegen_env, function);
+    let symbol = direct_function_symbol(function, Some(symbol_scope));
+    let func_id = declare_import_fn(codegen_env, &symbol, &sig)?;
+    let (default_func_id, default_symbol) = if function_has_default_resolving_direct_entry(function)
+    {
+        let default_symbol = default_direct_function_symbol(function, Some(symbol_scope));
+        (
+            Some(declare_import_fn(codegen_env, &default_symbol, &sig)?),
+            Some(default_symbol),
+        )
+    } else {
+        (None, None)
+    };
+    Ok(DeclaredJitFunction {
+        func_id,
+        default_func_id,
+        symbol,
+        default_symbol,
+    })
+}
+
 fn build_default_resolving_direct_adapter(
     codegen_env: &mut impl JitCodegenEnv,
     function: &BlockPyFunction<CodegenModuleShape>,
@@ -23776,6 +23838,146 @@ pub struct PrecompileObjectSummary {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct PrecompileModuleIndexEntry<'a> {
+    pub module_name: &'a str,
+    pub source_hash: u64,
+    pub module: &'a BlockPyModule<CodegenModuleShape>,
+}
+
+#[derive(Debug, Clone)]
+struct PrecompileIndexedFunction {
+    module_name: String,
+    source_hash: u64,
+    function: BlockPyFunction<CodegenModuleShape>,
+    module_constants: Vec<InstrResolved>,
+}
+
+#[derive(Debug, Clone)]
+struct PrecompileIndexedModule {
+    module_id: u32,
+    inline_plan: InlinePlanModule,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PrecompileModuleIndex {
+    modules_by_identity: HashMap<(String, u64), PrecompileIndexedModule>,
+    functions_by_id: HashMap<FunctionId, PrecompileIndexedFunction>,
+    ambiguous_function_ids: HashSet<FunctionId>,
+}
+
+impl PrecompileModuleIndex {
+    pub fn from_entries<'a>(
+        entries: impl IntoIterator<Item = PrecompileModuleIndexEntry<'a>>,
+    ) -> Result<Self, String> {
+        let mut index = Self::default();
+        for entry in entries {
+            index.insert(entry)?;
+        }
+        Ok(index)
+    }
+
+    fn insert(&mut self, entry: PrecompileModuleIndexEntry<'_>) -> Result<(), String> {
+        let identity = (entry.module_name.to_string(), entry.source_hash);
+        let module_id = entry.module.module_name_gen.module_id();
+        if self
+            .modules_by_identity
+            .insert(
+                identity.clone(),
+                PrecompileIndexedModule {
+                    module_id,
+                    inline_plan: plan_module_inlining(&summarize_module_escapes(entry.module)),
+                },
+            )
+            .is_some()
+        {
+            return Err(format!(
+                "duplicate precompile module identity: module={} source_hash=0x{:016x}",
+                entry.module_name, entry.source_hash
+            ));
+        }
+        for function in &entry.module.callable_defs {
+            let indexed = PrecompileIndexedFunction {
+                module_name: entry.module_name.to_string(),
+                source_hash: entry.source_hash,
+                function: function.clone(),
+                module_constants: entry.module.module_constants.clone(),
+            };
+            if let Some(previous) = self.functions_by_id.insert(function.function_id, indexed)
+                && (previous.module_name != entry.module_name
+                    || previous.source_hash != entry.source_hash)
+            {
+                self.functions_by_id.remove(&function.function_id);
+                self.ambiguous_function_ids.insert(function.function_id);
+            }
+        }
+        Ok(())
+    }
+
+    fn function_id_for_target(&self, target: &PlannedFunctionTarget) -> Option<FunctionId> {
+        let module = self
+            .modules_by_identity
+            .get(&(target.module_name.clone(), target.source_hash))?;
+        let function_id = FunctionId::new(module.module_id, target.function_id);
+        self.function(function_id).map(|_| function_id)
+    }
+
+    fn function(&self, function_id: FunctionId) -> Option<&PrecompileIndexedFunction> {
+        if self.ambiguous_function_ids.contains(&function_id) {
+            return None;
+        }
+        self.functions_by_id.get(&function_id)
+    }
+
+    fn inline_plan_for_function(&self, function_id: FunctionId) -> Option<&InlinePlanModule> {
+        let function = self.function(function_id)?;
+        self.modules_by_identity
+            .get(&(function.module_name.clone(), function.source_hash))
+            .map(|module| &module.inline_plan)
+    }
+
+    fn precompiled_symbol_scope_for_function(&self, function_id: FunctionId) -> Option<String> {
+        let function = self.function(function_id)?;
+        Some(
+            precompiled_direct_function_symbol_scope_for_module_identity(
+                function.module_name.as_str(),
+                function.source_hash,
+                function_id,
+            ),
+        )
+    }
+}
+
+fn precompile_external_direct_call_target_functions(
+    module: &BlockPyModule<CodegenModuleShape>,
+    profile: &SpecializationProfile<'_>,
+    module_index: Option<&PrecompileModuleIndex>,
+) -> Result<HashMap<FunctionId, BlockPyFunction<CodegenModuleShape>>, String> {
+    let Some(module_index) = module_index else {
+        return Ok(HashMap::new());
+    };
+    let current_module_id = module.module_name_gen.module_id();
+    let mut target_ids = HashSet::new();
+    for function in &module.callable_defs {
+        target_ids.extend(collect_call_direct_targets(function));
+        for targets in profile
+            .call_target_specializations(function.function_id)?
+            .values()
+        {
+            target_ids.extend(targets.iter().copied());
+        }
+    }
+    Ok(target_ids
+        .into_iter()
+        .filter(|function_id| function_id.module_id() != current_module_id)
+        .filter_map(|function_id| {
+            module_index
+                .function(function_id)
+                .map(|target| (function_id, target.function.clone()))
+        })
+        .collect())
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct PrecompileOptimizationPlanInput<'a> {
     pub path: &'a Path,
     pub source: PythonModuleCacheSource,
@@ -23849,6 +24051,7 @@ pub fn precompile_codegen_module_to_object_file(
     module: &BlockPyModule<CodegenModuleShape>,
     counter_dump_path: Option<&Path>,
     optimization_plan: Option<PrecompileOptimizationPlanInput<'_>>,
+    module_index: Option<&PrecompileModuleIndex>,
     output_path: &Path,
 ) -> Result<PrecompileObjectSummary, String> {
     let bytes = precompile_codegen_module_to_object_bytes(
@@ -23857,6 +24060,7 @@ pub fn precompile_codegen_module_to_object_file(
         module,
         counter_dump_path,
         optimization_plan,
+        module_index,
     )?;
     if let Some(parent) = output_path
         .parent()
@@ -23901,6 +24105,7 @@ fn precompile_codegen_module_to_object_bytes(
     module: &BlockPyModule<CodegenModuleShape>,
     counter_dump_path: Option<&Path>,
     optimization_plan: Option<PrecompileOptimizationPlanInput<'_>>,
+    module_index: Option<&PrecompileModuleIndex>,
 ) -> Result<PrecompiledObjectBytes, String> {
     let compile_session = crate::session::CompileSession::new();
     let object_isa = CraneliftTargetConfig::object_from_env()?.build_isa()?;
@@ -24019,13 +24224,28 @@ fn precompile_codegen_module_to_object_bytes(
         });
     }
 
-    let planned_evidence =
-        planned_evidence_for_precompile(optimization_plan, module_name, source_hash, module)?;
+    let planned_evidence = planned_evidence_for_precompile(
+        optimization_plan,
+        module_index,
+        module_name,
+        source_hash,
+        module,
+    )?;
     let specialization_profile =
         SpecializationProfile::from_precompile(module_name, counter_dump_path, planned_evidence)?;
-    let jit_module_plan =
-        build_profiled_jit_module_plan(module, &specialization_profile, None, &HashMap::new())?;
+    let jit_module_plan = build_profiled_jit_module_plan(
+        module,
+        &specialization_profile,
+        None,
+        module_index,
+        &HashMap::new(),
+    )?;
     let planned_module = jit_module_plan.module.as_ref();
+    let external_direct_call_target_functions = precompile_external_direct_call_target_functions(
+        planned_module,
+        &specialization_profile,
+        module_index,
+    )?;
     let mut predeclared = HashMap::new();
     let mut symbol_scopes = HashMap::new();
     for function in &planned_module.callable_defs {
@@ -24038,6 +24258,21 @@ fn precompile_codegen_module_to_object_bytes(
             declare_direct_function(&mut jit_module, function, Some(symbol_scope.as_str()))?;
         predeclared.insert(function.function_id, declared);
         symbol_scopes.insert(function.function_id, symbol_scope);
+    }
+    if let Some(module_index) = module_index {
+        for (function_id, function) in &external_direct_call_target_functions {
+            if predeclared.contains_key(function_id) {
+                continue;
+            }
+            let Some(symbol_scope) =
+                module_index.precompiled_symbol_scope_for_function(*function_id)
+            else {
+                continue;
+            };
+            let declared =
+                declare_imported_direct_function(&mut jit_module, function, symbol_scope.as_str())?;
+            predeclared.insert(*function_id, declared);
+        }
     }
     for function in &planned_module.callable_defs {
         let placeholder_blocks =
@@ -24081,6 +24316,8 @@ fn precompile_codegen_module_to_object_bytes(
             Some(&predeclared),
             BuildSpecializedFunctionOptions {
                 module_constant_accesses: module_constant_access_table.clone(),
+                external_direct_call_target_functions: external_direct_call_target_functions
+                    .clone(),
                 ..BuildSpecializedFunctionOptions::default()
             },
         )
@@ -24400,6 +24637,7 @@ struct BuildSpecializedFunctionOptions {
     direct_owner_attr_specializations:
         Option<HashMap<DirectOwnerAttrKey, Vec<DirectOwnerAttrSpecialization>>>,
     specialization_inputs: Option<FunctionSpecializationInputs>,
+    external_direct_call_target_functions: HashMap<FunctionId, BlockPyFunction<CodegenModuleShape>>,
 }
 
 struct PreparedSpecializedTypedFunction {
@@ -24717,12 +24955,13 @@ fn build_cranelift_run_bb_specialized_function(
     ));
     let empty_direct_functions = HashMap::new();
     let direct_call_functions = predeclared_direct_functions.unwrap_or(&empty_direct_functions);
-    let mut direct_call_target_functions = HashMap::new();
+    let mut direct_call_target_functions = options.external_direct_call_target_functions.clone();
     for function_id in direct_call_targets {
         if module
             .callable_defs
             .iter()
             .any(|function| function.function_id == function_id)
+            || direct_call_target_functions.contains_key(&function_id)
         {
             continue;
         }
@@ -25796,6 +26035,7 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
                 module,
                 &specialization_profile,
                 Some(compile_session),
+                None,
                 &direct_owner_attr_specializations_by_function,
             )?
         } else {

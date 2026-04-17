@@ -744,6 +744,7 @@ def add(a, b):
             &lowered,
             None,
             None,
+            None,
         )
         .expect("precompile should emit object bytes");
         assert!(
@@ -819,6 +820,7 @@ def get_value():
             &lowered,
             None,
             None,
+            None,
         )
         .expect("precompile should emit object bytes");
 
@@ -865,6 +867,7 @@ def get_value():
             &lowered,
             None,
             None,
+            None,
         )
         .expect("precompile should emit object bytes");
 
@@ -907,6 +910,7 @@ def get_value():
             module_name,
             source_hash,
             &lowered,
+            None,
             None,
             None,
         )
@@ -952,6 +956,7 @@ def get_value():
             module_name,
             source_hash,
             &lowered,
+            None,
             None,
             None,
         )
@@ -16305,6 +16310,7 @@ def f(x, y):
                 source: PythonModuleCacheSource::Project,
                 cache_identity: cache_identity.as_str(),
             }),
+            None,
             module_name,
             source_hash,
             &module,
@@ -16316,6 +16322,241 @@ def f(x, y):
                 .and_then(|evidence| evidence.call_target_specializations.get(&instr_id)),
             Some(&vec![callee_function_id]),
             "precompile plan loading should remap planned function ids onto the cached module ids"
+        );
+    }
+
+    #[test]
+    fn precompile_profile_resolves_cross_module_plan_targets_by_function_id() {
+        let module_cache_root = fresh_test_work_dir("planned-precompile-cross-module");
+        let caller_module_name = "planned_precompile_cross_module_caller";
+        let callee_module_name = "planned_precompile_cross_module_callee";
+        let caller_source_hash = 0xabcdef03;
+        let callee_source_hash = 0xabcdef04;
+        let caller_module_name_gen = ModuleNameGen::new(39);
+        let callee_module_name_gen = ModuleNameGen::new(40);
+        let caller = with_single_test_block(
+            test_function_in_module(&caller_module_name_gen, "caller"),
+            vec![],
+            ret_term(none_expr()),
+        );
+        let callee = with_single_test_block(
+            test_function_in_module(&callee_module_name_gen, "callee"),
+            vec![],
+            ret_term(none_expr()),
+        );
+        let caller_function_id = caller.function_id;
+        let callee_function_id = callee.function_id;
+        let caller_module = test_module(caller_module_name_gen, vec![caller]);
+        let callee_module = test_module(callee_module_name_gen, vec![callee]);
+        let module_index = PrecompileModuleIndex::from_entries([
+            PrecompileModuleIndexEntry {
+                module_name: caller_module_name,
+                source_hash: caller_source_hash,
+                module: &caller_module,
+            },
+            PrecompileModuleIndexEntry {
+                module_name: callee_module_name,
+                source_hash: callee_source_hash,
+                module: &callee_module,
+            },
+        ])
+        .expect("precompile module index should build");
+        let instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+        let planned_target = PlannedFunctionTarget {
+            module_name: callee_module_name.to_string(),
+            source_hash: callee_source_hash,
+            function_id: callee_function_id.function_id(),
+        };
+        let cache_identity = pre_optimization_module_cache_identity(
+            env!("SOAC_BUILD_IDENTITY"),
+            caller_module_name == "soac.runtime",
+        );
+        let plan = OptimizationPlan {
+            source: PythonModuleCacheSource::Project,
+            module_name: caller_module_name.to_string(),
+            source_hash: caller_source_hash,
+            cache_identity: cache_identity.clone(),
+            functions: vec![FunctionOptimizationPlan {
+                function_id: FunctionId::new(999, caller_function_id.function_id()),
+                qualname: "caller".to_string(),
+                decisions: vec![OptimizationDecision {
+                    instr_id,
+                    replacement: PlannedReplacement::Guarded {
+                        alternatives: vec![PlannedAlternative {
+                            guards: vec![PlannedGuard::FunctionTarget {
+                                target: planned_target.clone(),
+                            }],
+                            action: PlannedAction::DirectCall {
+                                target: planned_target,
+                            },
+                        }],
+                        fallback: PlannedFallback::OriginalInstruction,
+                    },
+                }],
+            }],
+        };
+        let plan_path = module_optimization_plan_path(
+            module_cache_root.as_path(),
+            PythonModuleCacheSource::Project,
+            caller_module_name,
+        )
+        .expect("test optimization plan path should build");
+        write_test_optimization_plan(plan_path.as_path(), &plan);
+
+        let evidence = planned_evidence_for_precompile(
+            Some(PrecompileOptimizationPlanInput {
+                path: plan_path.as_path(),
+                source: PythonModuleCacheSource::Project,
+                cache_identity: cache_identity.as_str(),
+            }),
+            Some(&module_index),
+            caller_module_name,
+            caller_source_hash,
+            &caller_module,
+        )
+        .expect("precompile should resolve indexed cross-module planned targets");
+        assert_eq!(
+            evidence
+                .get(&caller_function_id)
+                .and_then(|evidence| evidence.call_target_specializations.get(&instr_id)),
+            Some(&vec![callee_function_id]),
+            "precompile plan loading should remap cross-module target ids through the module index"
+        );
+    }
+
+    #[test]
+    fn precompile_codegen_module_imports_cross_module_direct_symbol_from_plan() {
+        let module_cache_root = fresh_test_work_dir("planned-precompile-cross-module-codegen");
+        let caller_module_name = "planned_precompile_cross_module_codegen_caller";
+        let callee_module_name = "planned_precompile_cross_module_codegen_callee";
+        let caller_source_hash = 0xabcdef05;
+        let callee_source_hash = 0xabcdef06;
+        let caller_module_name_gen = ModuleNameGen::new(41);
+        let callee_module_name_gen = ModuleNameGen::new(42);
+        let callee = with_single_test_block(
+            test_function_in_module(&callee_module_name_gen, "callee"),
+            vec![],
+            ret_term(none_expr()),
+        );
+        let callee_function_id = callee.function_id;
+
+        let caller_name_gen = caller_module_name_gen.next_function_name_gen();
+        let caller_function_id = caller_name_gen.function_id();
+        let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+        let mut caller = BlockPyFunction {
+            function_id: caller_function_id,
+            name_gen: caller_name_gen,
+            names: FunctionName::new("caller", "caller", "caller", "caller"),
+            kind: soac_blockpy::block_py::FunctionKind::Function,
+            execution_mode: Default::default(),
+            params: ParamSpec {
+                params: vec![Param {
+                    name: "fn".into(),
+                    kind: ParamKind::Any,
+                    has_default: false,
+                }],
+            },
+            blocks: vec![CodegenBlock {
+                label: BlockLabel::from_index(0),
+                body: vec![],
+                term: ret_term(with_instr_id(
+                    op_expr(Call::new(
+                        name_expr(test_name("fn")),
+                        Vec::<CallArgPositional<InstrCodegen>>::new(),
+                        Vec::<CallArgKeyword<InstrCodegen>>::new(),
+                    )),
+                    call_instr_id,
+                )),
+                params: vec![],
+                exc_edge: None,
+            }],
+            doc: None,
+            storage_layout: None,
+            scope: Default::default(),
+        };
+        set_stack_slots(&mut caller, &["fn"]);
+
+        let caller_module = test_module(caller_module_name_gen, vec![caller]);
+        let callee_module = test_module(callee_module_name_gen, vec![callee.clone()]);
+        let module_index = PrecompileModuleIndex::from_entries([
+            PrecompileModuleIndexEntry {
+                module_name: caller_module_name,
+                source_hash: caller_source_hash,
+                module: &caller_module,
+            },
+            PrecompileModuleIndexEntry {
+                module_name: callee_module_name,
+                source_hash: callee_source_hash,
+                module: &callee_module,
+            },
+        ])
+        .expect("precompile module index should build");
+        let planned_target = PlannedFunctionTarget {
+            module_name: callee_module_name.to_string(),
+            source_hash: callee_source_hash,
+            function_id: callee_function_id.function_id(),
+        };
+        let cache_identity = pre_optimization_module_cache_identity(
+            env!("SOAC_BUILD_IDENTITY"),
+            caller_module_name == "soac.runtime",
+        );
+        let plan = OptimizationPlan {
+            source: PythonModuleCacheSource::Project,
+            module_name: caller_module_name.to_string(),
+            source_hash: caller_source_hash,
+            cache_identity: cache_identity.clone(),
+            functions: vec![FunctionOptimizationPlan {
+                function_id: FunctionId::new(999, caller_function_id.function_id()),
+                qualname: "caller".to_string(),
+                decisions: vec![OptimizationDecision {
+                    instr_id: call_instr_id,
+                    replacement: PlannedReplacement::Guarded {
+                        alternatives: vec![PlannedAlternative {
+                            guards: vec![PlannedGuard::FunctionTarget {
+                                target: planned_target.clone(),
+                            }],
+                            action: PlannedAction::DirectCall {
+                                target: planned_target,
+                            },
+                        }],
+                        fallback: PlannedFallback::OriginalInstruction,
+                    },
+                }],
+            }],
+        };
+        let plan_path = module_optimization_plan_path(
+            module_cache_root.as_path(),
+            PythonModuleCacheSource::Project,
+            caller_module_name,
+        )
+        .expect("test optimization plan path should build");
+        write_test_optimization_plan(plan_path.as_path(), &plan);
+
+        let object = precompile_codegen_module_to_object_bytes(
+            caller_module_name,
+            caller_source_hash,
+            &caller_module,
+            None,
+            Some(PrecompileOptimizationPlanInput {
+                path: plan_path.as_path(),
+                source: PythonModuleCacheSource::Project,
+                cache_identity: cache_identity.as_str(),
+            }),
+            Some(&module_index),
+        )
+        .expect("precompile should emit an object that imports the cross-module target");
+        let callee_scope = precompiled_direct_function_symbol_scope_for_module_identity(
+            callee_module_name,
+            callee_source_hash,
+            callee_function_id,
+        );
+        let callee_symbol = direct_function_symbol(&callee, Some(callee_scope.as_str()));
+        assert!(
+            object
+                .object
+                .windows(callee_symbol.len())
+                .any(|window| window == callee_symbol.as_bytes()),
+            "precompiled caller object should reference the callee direct-entry symbol {callee_symbol}"
         );
     }
 
@@ -16380,6 +16621,7 @@ def f(x, y):
                 source: PythonModuleCacheSource::Project,
                 cache_identity: cache_identity.as_str(),
             }),
+            None,
             module_name,
             source_hash,
             &module,
@@ -18366,7 +18608,7 @@ def f(x, y):
             HashMap::new(),
         )
         .expect("test specialization profile should construct");
-        let plan = build_profiled_jit_module_plan(&module, &profile, None, &HashMap::new())
+        let plan = build_profiled_jit_module_plan(&module, &profile, None, None, &HashMap::new())
             .expect("profiled JIT module plan should build");
         let planned_caller = plan
             .module
@@ -18501,6 +18743,7 @@ def f(x, y):
         let plan = build_profiled_jit_module_plan(
             &module,
             &profile,
+            None,
             None,
             &direct_owner_attr_specializations,
         )
