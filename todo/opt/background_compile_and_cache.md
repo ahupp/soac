@@ -16,6 +16,9 @@ functions off the critical path?
   preparation.
 - Keep first-call behavior correct: if a function is called before background compile finishes, use
   the current synchronous lazy compile and cancel/reuse the background job.
+- If Python reaches a function whose compilation is queued but not yet running, remove that job from
+  the queue and compile it synchronously on the calling thread. If a worker is already compiling it,
+  block until that worker publishes the compiled result.
 - Use the named counters directory to decide which function ids get precompiled.
 - Persist per-function lowered artifacts so a later process can skip pure lowering for unchanged
   source/runtime metadata.
