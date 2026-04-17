@@ -16469,6 +16469,195 @@ def f(x, y):
     }
 
     #[test]
+    fn specialized_jit_uses_cross_module_direct_call_from_optimization_plan() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "specialized_jit_uses_cross_module_direct_call_from_optimization_plan",
+        ) {
+            return;
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let module_cache_root = fresh_test_work_dir("planned-cross-module-direct-codegen");
+            let _cache_dir =
+                EnvVarGuard::set_os("SOAC_MODULE_CACHE_DIR", module_cache_root.as_os_str());
+            let _work_dir = EnvVarGuard::remove("SOAC_WORK_DIR");
+            let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "verify");
+            let session = std::sync::Arc::new(crate::session::CompileSession::new());
+            let caller_module_name = "planned_cross_module_direct_codegen_caller_test";
+            let callee_module_name = "planned_cross_module_direct_codegen_callee_test";
+            let caller_module_name_gen = ModuleNameGen::new(103);
+            let callee_module_name_gen = ModuleNameGen::new(104);
+            let callee = with_single_test_block(
+                test_function_in_module(&callee_module_name_gen, "callee"),
+                vec![],
+                ret_term(none_expr()),
+            );
+            let callee_function_id = callee.function_id;
+
+            let caller_name_gen = caller_module_name_gen.next_function_name_gen();
+            let caller_function_id = caller_name_gen.function_id();
+            let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+            let mut caller = BlockPyFunction {
+                function_id: caller_function_id,
+                name_gen: caller_name_gen,
+                names: FunctionName::new("caller", "caller", "caller", "caller"),
+                kind: soac_blockpy::block_py::FunctionKind::Function,
+                execution_mode: Default::default(),
+                params: ParamSpec {
+                    params: vec![Param {
+                        name: "fn".into(),
+                        kind: ParamKind::Any,
+                        has_default: false,
+                    }],
+                },
+                blocks: vec![CodegenBlock {
+                    label: BlockLabel::from_index(0),
+                    body: vec![],
+                    term: ret_term(with_instr_id(
+                        op_expr(Call::new(
+                            name_expr(test_name("fn")),
+                            Vec::<CallArgPositional<InstrCodegen>>::new(),
+                            Vec::<CallArgKeyword<InstrCodegen>>::new(),
+                        )),
+                        call_instr_id,
+                    )),
+                    params: vec![],
+                    exc_edge: None,
+                }],
+                doc: None,
+                storage_layout: None,
+                scope: Default::default(),
+            };
+            set_stack_slots(&mut caller, &["fn"]);
+
+            let caller_state = crate::module_type::build_shared_state_for_testing(
+                py,
+                test_module(caller_module_name_gen, vec![caller]),
+                caller_module_name,
+                "",
+            )
+            .expect("caller shared state should build");
+            let callee_state = crate::module_type::build_shared_state_for_testing(
+                py,
+                test_module(callee_module_name_gen, vec![callee]),
+                callee_module_name,
+                "",
+            )
+            .expect("callee shared state should build");
+            session
+                .retain_shared_module_state(std::sync::Arc::clone(&caller_state))
+                .expect("caller state should be retained");
+            session
+                .retain_shared_module_state(std::sync::Arc::clone(&callee_state))
+                .expect("callee state should be retained");
+
+            let planned_callee_target = PlannedFunctionTarget {
+                module_name: callee_module_name.to_string(),
+                source_hash: callee_state.source_hash,
+                function_id: callee_function_id.function_id(),
+            };
+            let plan = OptimizationPlan {
+                source: PythonModuleCacheSource::Project,
+                module_name: caller_module_name.to_string(),
+                source_hash: caller_state.source_hash,
+                cache_identity: pre_optimization_module_cache_identity(
+                    env!("SOAC_BUILD_IDENTITY"),
+                    caller_state.module_name == "soac.runtime",
+                ),
+                functions: vec![FunctionOptimizationPlan {
+                    function_id: FunctionId::new(888, caller_function_id.function_id()),
+                    qualname: "caller".to_string(),
+                    decisions: vec![OptimizationDecision {
+                        instr_id: call_instr_id,
+                        replacement: PlannedReplacement::Guarded {
+                            alternatives: vec![PlannedAlternative {
+                                guards: vec![PlannedGuard::FunctionTarget {
+                                    target: planned_callee_target.clone(),
+                                }],
+                                action: PlannedAction::DirectCall {
+                                    target: planned_callee_target,
+                                },
+                            }],
+                            fallback: PlannedFallback::OriginalInstruction,
+                        },
+                    }],
+                }],
+            };
+            let plan_path = module_optimization_plan_path(
+                module_cache_root.as_path(),
+                PythonModuleCacheSource::Project,
+                caller_module_name,
+            )
+            .expect("test optimization plan path should build");
+            write_test_optimization_plan(plan_path.as_path(), &plan);
+
+            let caller_function = caller_state.lowered_module.callable_defs[0].clone();
+            let compile_session = session.as_ref();
+            let mut jit_module =
+                new_jit_module(compile_session).expect("test jit module should construct");
+            let module_constant_ptrs = caller_state.module_constant_ptrs();
+            let module_constant_object_data_ids = declare_module_constant_object_data(
+                &mut jit_module,
+                &caller_state.lowered_module,
+                &module_constant_ptrs,
+            )
+            .expect("module constant object data should declare");
+            let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
+                define_test_counter_storage(
+                    &mut jit_module,
+                    &caller_state.lowered_module,
+                    caller_state.lowered_module.counter_defs.as_slice(),
+                );
+            let blocks = vec![std::ptr::null_mut::<c_void>(); caller_function.blocks.len()];
+            let built = build_test_cranelift_run_bb_specialized_function(
+                &mut jit_module,
+                blocks.as_slice(),
+                &caller_state.lowered_module,
+                &caller_function,
+                &caller_state.codegen_constants,
+                caller_state.lowered_module.counter_defs.as_slice(),
+                module_constant_object_data_ids.as_slice(),
+                counter_slots_by_id.as_ref(),
+                scalar_counter_data_id,
+                top_value_counter_data_id,
+                compile_session,
+                Some(caller_state.as_ref()),
+                None,
+                None,
+                BuildSpecializedFunctionOptions::default(),
+            )
+            .expect("caller JIT build should consume planned direct-call evidence");
+
+            let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
+            let generic_call_helpers = import_user_names_for_symbols(
+                &built,
+                &[
+                    DP_JIT_PY_CALL_OBJECT_IMPORT.symbol,
+                    DP_JIT_PY_VECTORCALL_IMPORT.symbol,
+                    DP_JIT_PY_CALL_WITH_KW_IMPORT.symbol,
+                    DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT.symbol,
+                ],
+            );
+            assert!(
+                count_indirect_calls(&built.ctx.func) >= 1,
+                "planned cross-module direct call should indirect through the callee FunctionEnv.direct_code_ptr",
+            );
+            assert_eq!(
+                count_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
+                1,
+                "planned direct-call guard miss should deopt instead of emitting a generic fallback",
+            );
+            assert_eq!(
+                count_direct_calls_to_runtime_helpers(&built.ctx.func, &generic_call_helpers),
+                0,
+                "planned cross-module direct call should not use generic Python call helpers",
+            );
+        });
+    }
+
+    #[test]
     fn specialized_jit_assignment_to_direct_entry_param_avoids_stack_mirror() {
         let blocks = [1usize as ObjPtr];
         let mut constants = TestConstantPool::default();
