@@ -101,7 +101,7 @@ pub enum PlannedAction {
 pub struct PlannedFunctionTarget {
     pub module_name: String,
     pub source_hash: u64,
-    pub qualname: String,
+    pub function_id: u32,
 }
 
 #[derive(
@@ -165,25 +165,23 @@ impl ProfileEvidenceStore {
                 let Some(function_id) = row.function_id else {
                     continue;
                 };
-                if let Some(function_qualname) = row.function_qualname.as_ref() {
+                store
+                    .function_targets
+                    .entry(function_id)
+                    .or_insert_with(|| PlannedFunctionTarget {
+                        module_name: module_name.clone(),
+                        source_hash: record.source_hash(),
+                        function_id: function_id.function_id(),
+                    });
+                if let Some(current_function_id) = row.current_function_id {
                     store
                         .function_targets
-                        .entry(function_id)
+                        .entry(current_function_id)
                         .or_insert_with(|| PlannedFunctionTarget {
                             module_name: module_name.clone(),
                             source_hash: record.source_hash(),
-                            qualname: function_qualname.to_string(),
+                            function_id: current_function_id.function_id(),
                         });
-                    if let Some(current_function_id) = row.current_function_id {
-                        store
-                            .function_targets
-                            .entry(current_function_id)
-                            .or_insert_with(|| PlannedFunctionTarget {
-                                module_name: module_name.clone(),
-                                source_hash: record.source_hash(),
-                                qualname: function_qualname.to_string(),
-                            });
-                    }
                 }
                 let Some(instr_id) = row.instr_id else {
                     continue;
@@ -331,7 +329,7 @@ impl OptimizationPlan {
                     PlannedFunctionTarget {
                         module_name: metadata.module_name.clone(),
                         source_hash: metadata.source_hash,
-                        qualname: function.names.qualname.clone(),
+                        function_id: function.function_id.function_id(),
                     },
                 )
             })
@@ -924,7 +922,7 @@ fn format_action(action: &PlannedAction) -> String {
 fn format_function_target(target: &PlannedFunctionTarget) -> String {
     format!(
         "{}:{}#0x{:016x}",
-        target.module_name, target.qualname, target.source_hash
+        target.module_name, target.function_id, target.source_hash
     )
 }
 
@@ -991,7 +989,7 @@ mod tests {
         let target = PlannedFunctionTarget {
             module_name: "pkg.mod".to_string(),
             source_hash: 0x1234,
-            qualname: "callee".to_string(),
+            function_id: target_id.function_id(),
         };
         let field_specialization = PlannedIndexedFieldSpecialization {
             owner_type: PlannedTypeKey {

@@ -12450,28 +12450,23 @@ fn planned_evidence_for_shared_state(
 ) -> Result<HashMap<FunctionId, FunctionProfileEvidence>, String> {
     let mut evidence_by_function = HashMap::new();
     for planned_function in &plan.functions {
+        let current_function_id = FunctionId::new(
+            shared_state.module_id(),
+            planned_function.function_id.function_id(),
+        );
         let current_function = shared_state
-            .lowered_module
-            .callable_defs
-            .iter()
-            .find(|function| function.names.qualname == planned_function.qualname)
+            .lookup_function(current_function_id)
             .ok_or_else(|| {
                 format!(
-                    "optimization plan for module {} references missing function {} ({})",
-                    plan.module_name, planned_function.qualname, planned_function.function_id
+                    "optimization plan for module {} references missing function id {} ({})",
+                    plan.module_name, planned_function.function_id, planned_function.qualname
                 )
             })?;
-        let mut evidence = plan
+        let evidence = plan
             .evidence_for_function(planned_function.function_id, |target| {
                 Ok(resolve_planned_function_target(shared_state, target))
             })
             .map_err(|err| err.to_string())?;
-        remap_same_module_call_targets(
-            &mut evidence,
-            planned_function.function_id.module_id(),
-            shared_state.module_id(),
-            shared_state,
-        )?;
         evidence_by_function.insert(current_function.function_id, evidence);
     }
     Ok(evidence_by_function)
@@ -12486,39 +12481,10 @@ fn resolve_planned_function_target(
     {
         return None;
     }
+    let function_id = FunctionId::new(shared_state.module_id(), target.function_id);
     shared_state
-        .lowered_module
-        .callable_defs
-        .iter()
-        .find(|function| function.names.qualname == target.qualname)
+        .lookup_function(function_id)
         .map(|function| function.function_id)
-}
-
-fn remap_same_module_call_targets(
-    evidence: &mut FunctionProfileEvidence,
-    planned_module_id: u32,
-    current_module_id: u32,
-    shared_state: &SharedModuleState,
-) -> Result<(), String> {
-    if planned_module_id == current_module_id {
-        return Ok(());
-    }
-    for targets in evidence.call_target_specializations.values_mut() {
-        for target in targets {
-            if target.module_id() != planned_module_id {
-                continue;
-            }
-            let remapped = FunctionId::new(current_module_id, target.function_id());
-            if shared_state.lookup_function(remapped).is_none() {
-                return Err(format!(
-                    "optimization plan remapped same-module direct-call target {target} to missing current function {remapped} in module {}",
-                    shared_state.module_name
-                ));
-            }
-            *target = remapped;
-        }
-    }
-    Ok(())
 }
 
 impl FunctionSpecializationInputs {

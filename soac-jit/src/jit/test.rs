@@ -16211,7 +16211,7 @@ def f(x, y):
             let planned_callee_target = PlannedFunctionTarget {
                 module_name: module_name.to_string(),
                 source_hash: shared_state.source_hash,
-                qualname: "callee".to_string(),
+                function_id: callee_function_id.function_id(),
             };
             let cache_identity = pre_optimization_module_cache_identity(
                 env!("SOAC_BUILD_IDENTITY"),
@@ -16224,7 +16224,9 @@ def f(x, y):
                 cache_identity,
                 functions: vec![FunctionOptimizationPlan {
                     function_id: planned_caller_function_id,
-                    qualname: "caller".to_string(),
+                    // Runtime plan loading must use the module-local function id,
+                    // not qualname, so duplicate function names remain distinct.
+                    qualname: "callee".to_string(),
                     decisions: vec![
                         OptimizationDecision {
                             instr_id,
