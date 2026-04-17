@@ -15602,9 +15602,10 @@ fn emit_typed_setattr_fallback(
     op: &TypedSetAttr<InstrTyped>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
-) -> Result<SoacValue, String> {
+) -> Result<EmitResult, String> {
     let (value, value_is_borrowed) = emit_typed_pyobject_input_with_local_env(
         fb,
         op.value.as_ref(),
@@ -15652,8 +15653,13 @@ fn emit_typed_setattr_fallback(
         fb.inst_results(setattr_inst)[0],
         owned_inputs.as_slice(),
     );
-    let result = emit_checked_owned_pyobject_result(fb, result, emit_ctx);
-    Ok(SoacValue::pyobject(result, PyObjFacts::unknown()))
+    Ok(emit_checked_owned_pyobject_result_for_demand(
+        fb,
+        result,
+        PyObjFacts::none_singleton(),
+        emit_ctx,
+        demand,
+    ))
 }
 
 fn emit_typed_profiled_indexed_getattr(
@@ -15824,12 +15830,20 @@ fn emit_typed_profiled_indexed_setattr(
     guards: &[TypedIndexedFieldGuard],
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
-) -> Result<Option<SoacValue>, String> {
+) -> Result<Option<EmitResult>, String> {
     if !emit_ctx.behavior_change_indexed_stores {
         return Ok(None);
     }
+    let result_needs_pyobject = match demand {
+        ResultDemand::EffectOnly => false,
+        ResultDemand::PyObject { .. } => true,
+        ResultDemand::I32Bool01 | ResultDemand::I64 | ResultDemand::I64Index => {
+            panic!("typed setattr cannot satisfy non-PyObject demand {demand:?}")
+        }
+    };
     let instr_id = op.semantic_instr_id();
     if guards.is_empty() {
         return Ok(None);
@@ -15885,7 +15899,9 @@ fn emit_typed_profiled_indexed_setattr(
         .copied();
 
     let result_block = fb.create_block();
-    fb.append_block_param(result_block, ptr_ty);
+    if result_needs_pyobject {
+        fb.append_block_param(result_block, ptr_ty);
+    }
     let fallback_block = fb.create_block();
     fb.set_cold_block(fallback_block);
     let pre_guard_operands = [op.value.as_ref(), op.attr.as_ref(), op.replacement.as_ref()];
@@ -15947,11 +15963,16 @@ fn emit_typed_profiled_indexed_setattr(
         if let Some(counter_id) = hit_counter_id {
             let _ = emit_increment_counter(fb, counter_id, emit_ctx);
         }
-        let none_const = emit_none_const(fb, emit_ctx);
-        fb.ins().call(emit_ctx.incref_ref, &[none_const]);
-        emit_release_owned_inputs(fb, emit_ctx, owned_inputs.as_slice());
-        fb.ins()
-            .jump(result_block, &[ir::BlockArg::Value(none_const)]);
+        if result_needs_pyobject {
+            let none_const = emit_none_const(fb, emit_ctx);
+            fb.ins().call(emit_ctx.incref_ref, &[none_const]);
+            emit_release_owned_inputs(fb, emit_ctx, owned_inputs.as_slice());
+            fb.ins()
+                .jump(result_block, &[ir::BlockArg::Value(none_const)]);
+        } else {
+            emit_release_owned_inputs(fb, emit_ctx, owned_inputs.as_slice());
+            fb.ins().jump(result_block, &[]);
+        }
 
         if index + 1 != specializations.len() {
             fb.switch_to_block(next_guard_block);
@@ -15973,9 +15994,23 @@ fn emit_typed_profiled_indexed_setattr(
                 fb.inst_results(setattr_inst)[0],
                 owned_inputs.as_slice(),
             );
-            let fallback_value = emit_checked_owned_pyobject_result(fb, fallback_value, emit_ctx);
-            fb.ins()
-                .jump(result_block, &[ir::BlockArg::Value(fallback_value)]);
+            let fallback_result = emit_checked_owned_pyobject_result_for_demand(
+                fb,
+                fallback_value,
+                PyObjFacts::none_singleton(),
+                emit_ctx,
+                demand,
+            );
+            if result_needs_pyobject {
+                let (fallback_value, ownership, _) =
+                    fallback_result.expect_pyobject("typed indexed setattr fallback result");
+                debug_assert!(ownership.is_owned());
+                fb.ins()
+                    .jump(result_block, &[ir::BlockArg::Value(fallback_value)]);
+            } else {
+                debug_assert!(matches!(fallback_result, EmitResult::NoValue));
+                fb.ins().jump(result_block, &[]);
+            }
         }
         JitGuardMissDispatch::DeoptResume {
             block,
@@ -15996,8 +16031,12 @@ fn emit_typed_profiled_indexed_setattr(
     }
 
     fb.switch_to_block(result_block);
-    let result = fb.block_params(result_block)[0];
-    Ok(Some(SoacValue::pyobject(result, PyObjFacts::unknown())))
+    Ok(Some(if result_needs_pyobject {
+        let result = fb.block_params(result_block)[0];
+        EmitResult::owned_pyobject(result, PyObjFacts::none_singleton())
+    } else {
+        EmitResult::no_value()
+    }))
 }
 
 #[allow(dead_code)]
@@ -16239,11 +16278,18 @@ fn emit_typed_codegen_expr_value_with_local_env(
             guards,
             local_env,
             emit_ctx,
+            ResultDemand::PYOBJECT_OWNED,
             codegen_env,
             func_imports,
         )?;
         if let Some(value) = maybe_value {
-            return Ok(value);
+            let (value, ownership, facts) =
+                value.expect_pyobject("typed indexed setattr expression result");
+            assert!(
+                ownership.can_satisfy_pyobject_demand(ResultDemand::PYOBJECT_OWNED),
+                "typed indexed setattr expression result should satisfy owned PyObject demand"
+            );
+            return Ok(SoacValue::pyobject_with_ownership(value, ownership, facts));
         }
     }
 
@@ -16252,7 +16298,21 @@ fn emit_typed_codegen_expr_value_with_local_env(
     }
 
     if let InstrTyped::SetAttrTyped(op) = expr {
-        return emit_typed_setattr_fallback(fb, op, local_env, emit_ctx, codegen_env, func_imports);
+        let result = emit_typed_setattr_fallback(
+            fb,
+            op,
+            local_env,
+            emit_ctx,
+            ResultDemand::PYOBJECT_OWNED,
+            codegen_env,
+            func_imports,
+        )?;
+        let (value, ownership, facts) = result.expect_pyobject("typed setattr expression result");
+        assert!(
+            ownership.can_satisfy_pyobject_demand(ResultDemand::PYOBJECT_OWNED),
+            "typed setattr expression result should satisfy owned PyObject demand"
+        );
+        return Ok(SoacValue::pyobject_with_ownership(value, ownership, facts));
     }
 
     let legacy_expr = try_lower_typed_instr_to_codegen_legacy(expr.clone())?;
@@ -19880,6 +19940,31 @@ fn emit_typed_codegen_stmt_result_with_local_env(
     }
     if let InstrTyped::DirectMethodCallTyped(op) = expr {
         return emit_typed_codegen_direct_method_call_result_with_local_env(
+            fb,
+            op,
+            local_env,
+            emit_ctx,
+            demand,
+            codegen_env,
+            func_imports,
+        );
+    }
+    if let InstrTyped::SetAttrTyped(op) = expr {
+        if let TypedAttrAccessPlan::ProfiledIndexedField { guards } = &op.access {
+            if let Some(result) = emit_typed_profiled_indexed_setattr(
+                fb,
+                op,
+                guards,
+                local_env,
+                emit_ctx,
+                demand,
+                codegen_env,
+                func_imports,
+            )? {
+                return Ok(result);
+            }
+        }
+        return emit_typed_setattr_fallback(
             fb,
             op,
             local_env,

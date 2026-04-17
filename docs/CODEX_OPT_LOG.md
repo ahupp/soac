@@ -5,6 +5,19 @@ optimization attempts made by Codex agents. Keep entries succinct: what
 changed or was tried, which jj change id carried it when landed, the
 benchmarked throughput delta, and the headline pre/post numbers.
 
+## 2026-04-17 - Emit effect-only typed setattr without None materialization
+
+- jj change id: `nlzrurom`
+- summary: Typed `SetAttr` statement emission now consumes effect-only demand at
+  the indexed-field producer, so fast store hits return `NoValue` instead of
+  materializing and increfing an owned `None`.
+- throughput: `+1.47%` median
+- pre-change benchmark: apply, refcounts enabled, 1M loops x3 median
+  `255234 loops/s`; total pystone code size `396565 bytes`
+- post-change benchmark: apply, refcounts enabled, 1M loops x3 median
+  `258974 loops/s`; total pystone code size `392208 bytes`
+- refcount counters: unchanged in a 100k-loop verify run
+
 ## 2026-04-17 - Use side-effect result facts for statement discards
 
 - jj change id: `nlmuuwvl`

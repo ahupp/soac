@@ -176,6 +176,10 @@ recognize their immortal result instead of special-casing helper names in
 codegen. The generic statement-result discard boundary now consumes those facts
 for legacy-shaped producers too, so effect-only side-effect statements can skip
 discard `DECREF`s when the produced value is known immortal.
+Typed `SetAttr` statement emission now consumes effect-only demand at the
+indexed-field producer. On fast-path hits it performs the store and releases
+owned inputs without materializing or increfing an owned `None`; expression
+paths still request and receive an owned `None` result.
 Return values, local store RHS expressions, raise exception expressions,
 generic/direct call inputs, and operator/intrinsic inputs are annotated before
 JIT codegen and consumed directly from the typed instruction.
