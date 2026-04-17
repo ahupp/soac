@@ -25627,6 +25627,96 @@ fn prepare_specialized_typed_function(
     Ok(PreparedSpecializedTypedFunction { typed_function })
 }
 
+fn instr_typed_variant_name(expr: &InstrTyped) -> &'static str {
+    match expr {
+        InstrTyped::Truthy(_) => "Truthy",
+        InstrTyped::Load(_) => "Load",
+        InstrTyped::BinOp(_) => "BinOp",
+        InstrTyped::LegacyTuple(_) => "LegacyTuple",
+        InstrTyped::LegacyUnaryOp(_) => "LegacyUnaryOp",
+        InstrTyped::LegacyCalleeFunctionId(_) => "LegacyCalleeFunctionId",
+        InstrTyped::CallTyped(_) => "CallTyped",
+        InstrTyped::GuardedCallableCallTyped(_) => "GuardedCallableCallTyped",
+        InstrTyped::GuardedMethodCallTyped(_) => "GuardedMethodCallTyped",
+        InstrTyped::DirectCallableCallTyped(_) => "DirectCallableCallTyped",
+        InstrTyped::DirectMethodCallTyped(_) => "DirectMethodCallTyped",
+        InstrTyped::DirectCallGuardTest(_) => "DirectCallGuardTest",
+        InstrTyped::LegacyCall(_) => "LegacyCall",
+        InstrTyped::LegacyCallDirect(_) => "LegacyCallDirect",
+        InstrTyped::GetAttrTyped(_) => "GetAttrTyped",
+        InstrTyped::SetAttrTyped(_) => "SetAttrTyped",
+        InstrTyped::LegacyGetAttr(_) => "LegacyGetAttr",
+        InstrTyped::LegacySetAttr(_) => "LegacySetAttr",
+        InstrTyped::LegacyGetItem(_) => "LegacyGetItem",
+        InstrTyped::LegacySetItem(_) => "LegacySetItem",
+        InstrTyped::LegacyDelItem(_) => "LegacyDelItem",
+        InstrTyped::LegacyStore(_) => "LegacyStore",
+        InstrTyped::LegacyDel(_) => "LegacyDel",
+        InstrTyped::LegacyMakeCell(_) => "LegacyMakeCell",
+        InstrTyped::LegacyIncrementCounter(_) => "LegacyIncrementCounter",
+        InstrTyped::LegacyCellRef(_) => "LegacyCellRef",
+        InstrTyped::LegacyMakeFunctionWithClosure(_) => "LegacyMakeFunctionWithClosure",
+    }
+}
+
+fn render_instr_typed_preorder_extras(
+    function: &BlockPyFunction<TypedCodegenModuleShape>,
+) -> String {
+    struct ExtraRenderer<'a> {
+        out: &'a mut String,
+        block_label: Option<BlockLabel>,
+        ordinal: usize,
+    }
+
+    impl Visit<InstrTyped> for ExtraRenderer<'_> {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            let block_label = self
+                .block_label
+                .map(|label| label.to_string())
+                .unwrap_or_else(|| "<unknown>".to_string());
+            let instr_id = expr
+                .try_semantic_instr_id()
+                .map(|instr_id| instr_id.to_string())
+                .unwrap_or_else(|| "<synthetic>".to_string());
+            match expr.typed_extra() {
+                Some(extra) => {
+                    self.out.push_str(&format!(
+                        "; typed_expr[{}] block={} instr_id={} kind={} extra={:?}\n",
+                        self.ordinal,
+                        block_label,
+                        instr_id,
+                        instr_typed_variant_name(expr),
+                        extra
+                    ));
+                }
+                None => {
+                    self.out.push_str(&format!(
+                        "; typed_expr[{}] block={} instr_id={} kind={} extra=<none>\n",
+                        self.ordinal,
+                        block_label,
+                        instr_id,
+                        instr_typed_variant_name(expr)
+                    ));
+                }
+            }
+            self.ordinal += 1;
+            expr.visit_children(self);
+        }
+    }
+
+    let mut out = String::new();
+    let mut renderer = ExtraRenderer {
+        out: &mut out,
+        block_label: None,
+        ordinal: 0,
+    };
+    for block in &function.blocks {
+        renderer.block_label = Some(block.label);
+        renderer.visit_block(block);
+    }
+    out
+}
+
 fn build_cranelift_run_bb_specialized_function(
     codegen_env: &mut impl JitCodegenEnv,
     blocks: &[ObjPtr],
@@ -26857,6 +26947,142 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_cfg(
             None,
         )
     }
+}
+
+pub unsafe fn render_instr_typed_for_codegen_with_runtime_state(
+    compile_session: &crate::session::CompileSession,
+    module: &BlockPyModule<CodegenModuleShape>,
+    function: &soac_blockpy::block_py::BlockPyFunction<CodegenModuleShape>,
+    runtime_state: Option<&SharedModuleState>,
+) -> Result<String, String> {
+    let builder = new_jit_builder()?;
+    let mut jit_module = JITModule::new(builder);
+    let specialization_profile = SpecializationProfile::from_runtime_state_with_session(
+        runtime_state,
+        Some(compile_session),
+    )?;
+    predeclare_specialization_type_imports(&mut jit_module, &specialization_profile)?;
+    let mut direct_owner_attr_specializations_by_function = HashMap::new();
+    if runtime_state.is_some() && specialization_profile.has_specialization_inputs() {
+        for function in &module.callable_defs {
+            let direct_owner_attr_specializations = predeclare_direct_call_owner_type_imports(
+                &mut jit_module,
+                module,
+                function,
+                &specialization_profile,
+            )?;
+            if !direct_owner_attr_specializations.is_empty() {
+                direct_owner_attr_specializations_by_function
+                    .insert(function.function_id, direct_owner_attr_specializations);
+            }
+        }
+    }
+    let jit_module_plan =
+        if runtime_state.is_some() && specialization_profile.has_specialization_inputs() {
+            build_profiled_jit_module_plan(
+                module,
+                &specialization_profile,
+                Some(compile_session),
+                None,
+                &direct_owner_attr_specializations_by_function,
+            )?
+        } else {
+            build_jit_module_plan(module)?
+        };
+    let render_module = jit_module_plan.module.as_ref();
+    let render_function = render_module
+        .callable_defs
+        .iter()
+        .find(|candidate| candidate.function_id == function.function_id)
+        .ok_or_else(|| {
+            format!(
+                "planned specialized JIT module is missing function {} ({})",
+                function.function_id, function.names.qualname
+            )
+        })?;
+    let specialization_inputs =
+        FunctionSpecializationInputs::from_profile(&specialization_profile, render_function)?;
+    let direct_owner_attr_specializations = direct_owner_attr_specializations_by_function
+        .get(&render_function.function_id)
+        .cloned()
+        .unwrap_or_default();
+    let render_module_constants = if let Some(shared_state) = runtime_state {
+        collect_codegen_constants_for_module_name(shared_state.module_name.as_str(), render_module)
+    } else {
+        ModuleCodegenConstants::collect_from_module(render_module)
+    };
+    let mut direct_call_targets = collect_call_direct_targets(render_function);
+    for targets in specialization_inputs.call_target_specializations.values() {
+        direct_call_targets.extend(targets.iter().copied());
+    }
+    direct_call_targets.extend(collect_runtime_protocol_method_targets(
+        render_function,
+        &render_module_constants,
+        Some(&direct_owner_attr_specializations),
+        &specialization_inputs.call_target_specializations,
+    ));
+    let mut direct_call_target_functions = HashMap::new();
+    for function_id in direct_call_targets {
+        if render_module
+            .callable_defs
+            .iter()
+            .any(|function| function.function_id == function_id)
+            || direct_call_target_functions.contains_key(&function_id)
+        {
+            continue;
+        }
+        let Some(target_function) = runtime_state
+            .map(|shared_state| {
+                shared_state.lookup_direct_call_target_function(compile_session, function_id)
+            })
+            .transpose()?
+            .flatten()
+        else {
+            continue;
+        };
+        direct_call_target_functions.insert(function_id, target_function);
+    }
+    let direct_edge_stats = DirectEdgeStats::default();
+    let call_specialization_ctx = CallSpecializationCtx {
+        module: render_module,
+        direct_call_resolver: runtime_state,
+        direct_call_target_functions: &direct_call_target_functions,
+        direct_owner_attr_specializations: Some(&direct_owner_attr_specializations),
+        direct_edge_stats: &direct_edge_stats,
+    };
+    let PreparedSpecializedTypedFunction { typed_function } = prepare_specialized_typed_function(
+        render_module,
+        render_function,
+        &jit_module_plan.value_facts,
+        &specialization_inputs.field_index_specializations,
+        &specialization_inputs.field_index_specializations_by_instr,
+        specialization_inputs.behavior_change_indexed_stores,
+        &call_specialization_ctx,
+        &specialization_inputs.call_target_specializations,
+    )?;
+
+    let mut out = String::new();
+    out.push_str("; ---- InstrTyped input to specialized codegen ----\n");
+    out.push_str(&format!(
+        "; module: {}\n",
+        runtime_state
+            .map(|shared_state| shared_state.module_name.as_str())
+            .unwrap_or("<standalone>")
+    ));
+    out.push_str(&format!("; function: {}\n", render_function.names.qualname));
+    out.push_str(&format!(
+        "; function_id: {}\n\n",
+        render_function.function_id
+    ));
+    out.push_str("; ---- typed nodes and embedded extras, preorder ----\n");
+    out.push_str(&render_instr_typed_preorder_extras(&typed_function));
+    out.push('\n');
+    out.push_str("; ---- BlockPyFunction<TypedCodegenModuleShape> debug ----\n");
+    out.push_str(&format!("{typed_function:#?}"));
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    Ok(out)
 }
 
 pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(

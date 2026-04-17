@@ -16,15 +16,16 @@ to run locally.
 1. Run the bundled collector from the repo root, passing the source on stdin:
 
 ```bash
-just py .codex/skills/soac-clif-snippet/scripts/profile_snippet_clif.py \
+just py-fast .codex/skills/soac-clif-snippet/scripts/profile_snippet_clif.py \
   --workload '"add(1, 1)"' <<'PY'
 def add(a, b):
     return a + b
 PY
 ```
 
-`just py` forwards arguments through its shell recipe, so keep the extra inner
-quotes around workloads containing parentheses or spaces.
+`just py-fast` forwards arguments through its shell recipe and falls back to the
+full runtime setup when inputs are stale, so keep the extra inner quotes around
+workloads containing parentheses or spaces.
 
 If the workload call does not directly identify the function to inspect, pass
 `--function <qualname>`.
@@ -35,6 +36,7 @@ If the workload call does not directly identify the function to inspect, pass
 - workload and result repr
 - module/function metadata
 - decoded specialization counters
+- InstrTyped input to specialized codegen
 - specialized CLIF
 
 3. Produce annotated CLIF in the answer:
@@ -61,6 +63,7 @@ The script writes one directory under `work/logs/soac-clif-snippets/`:
 - `result_repr.txt`
 - `counters/profile.bin`
 - `specializations.txt`
+- `instr_typed.txt`
 - `specialized.clif`
 - `annotation_context.md`
 - `metadata.json`

@@ -20,7 +20,8 @@ use soac_jit::module_type::{
 };
 use soac_jit::{
     CompileSession, plan_jit_deopt_resume_module, plan_jit_module_locals,
-    render_cranelift_run_bb_specialized_with_runtime_state_and_cfg, render_jit_deopt_resume_module,
+    render_cranelift_run_bb_specialized_with_runtime_state_and_cfg,
+    render_instr_typed_for_codegen_with_runtime_state, render_jit_deopt_resume_module,
     render_jit_function_locals, render_jit_module_locals,
 };
 use std::ffi::c_void;
@@ -69,6 +70,13 @@ pub struct JitClifResponse {
     pub cfg_dot: String,
     #[serde(rename = "vcodeDisasm")]
     pub vcode_disasm: String,
+    pub resolved_entry: String,
+}
+
+#[derive(Serialize)]
+pub struct InstrTypedRenderResponse {
+    #[serde(rename = "instrTyped")]
+    pub instr_typed: String,
     pub resolved_entry: String,
 }
 
@@ -663,6 +671,160 @@ pub fn render_jit_clif_for_module_with_options(
         clif: rendered.clif,
         cfg_dot: rendered.cfg_dot,
         vcode_disasm: rendered.vcode_disasm,
+        resolved_entry: format!(
+            "{}::__dp_fn_{}::{}",
+            resolved_qualname,
+            resolved_function_id.to_packed_runtime_u64(),
+            entry_label
+        ),
+    })
+}
+
+pub fn render_instr_typed_for_module_with_options(
+    repo_root: &Path,
+    module_name: &str,
+    module: &BlockPyModule<CodegenModuleShape>,
+    function_id: RuntimeFunctionId,
+    options: JitClifRenderOptions,
+) -> Result<InstrTypedRenderResponse, String> {
+    let function = module
+        .callable_defs
+        .iter()
+        .find(|function| function.function_id == function_id)
+        .cloned()
+        .ok_or_else(|| format!("no specialized JIT plan for {module_name}.fn#{function_id}"))?;
+    let standalone_compile_session;
+    let process_compile_session;
+    let compile_session: &CompileSession = if options.load_runtime_specializations {
+        process_compile_session = Some(CompileSession::process());
+        process_compile_session.as_deref().unwrap()
+    } else {
+        standalone_compile_session = CompileSession::new();
+        &standalone_compile_session
+    };
+    prepare_python();
+    let (instr_typed, resolved_qualname, resolved_function_id, entry_label) =
+        Python::attach(|py| {
+            ensure_python_support_paths(py, repo_root).map_err(|err| err.error)?;
+            if options.load_runtime_specializations {
+                PyModule::import(py, "soac.import_hook")
+                    .map_err(|err| err.to_string())?
+                    .getattr("install")
+                    .map_err(|err| err.to_string())?
+                    .call0()
+                    .map_err(|err| err.to_string())?;
+            } else {
+                PyModule::import(py, "soac.runtime").map_err(|err| err.to_string())?;
+            }
+            let runtime_state = if options.load_runtime_specializations {
+                if let Some(source_path) = options.runtime_source_path.as_deref() {
+                    execute_module_for_runtime_render_state(
+                        py,
+                        source_path,
+                        module_name,
+                        &module.global_names,
+                    )?;
+                } else {
+                    PyModule::import(py, "soac.runtime").map_err(|err| err.to_string())?;
+                }
+                let runtime_module =
+                    PyModule::import(py, "soac.runtime").map_err(|err| err.to_string())?;
+                let (runtime_lowered, runtime_source_hash) =
+                    lower_soac_runtime_for_render_state(repo_root)?;
+                register_function_owner_types_for_rendered_module(
+                    py,
+                    runtime_module.as_any(),
+                    &runtime_lowered.global_names,
+                )?;
+                let runtime_shared_state =
+                    build_shared_state_for_inspection_with_placeholder_constants_and_source_hash(
+                        py,
+                        runtime_lowered,
+                        "soac.runtime",
+                        "soac",
+                        runtime_source_hash,
+                    )
+                    .map_err(|err| err.to_string())?;
+                compile_session
+                    .retain_shared_module_state_for_inspection(runtime_shared_state)
+                    .map_err(|err| err.to_string())?;
+                Some(
+                    build_shared_state_for_inspection_with_source_hash(
+                        py,
+                        module.clone(),
+                        module_name,
+                        "",
+                        options.module_source_hash.unwrap_or(0),
+                    )
+                    .map_err(|err| err.to_string())?,
+                )
+            } else {
+                None
+            };
+
+            let (instr_typed, resolved_qualname, resolved_function_id, entry_label) =
+                if let Some(shared_state) = runtime_state.as_deref() {
+                    let render_function = corresponding_runtime_function(
+                        &shared_state.lowered_module,
+                        &function,
+                    )
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!(
+                            "runtime module for {module_name} did not contain function {} ({})",
+                            function.function_id, function.names.qualname
+                        )
+                    })?;
+                    let instr_typed = unsafe {
+                        render_instr_typed_for_codegen_with_runtime_state(
+                            compile_session,
+                            &shared_state.lowered_module,
+                            &render_function,
+                            Some(shared_state),
+                        )
+                    }?;
+                    let entry_label = render_function
+                        .blocks
+                        .first()
+                        .map(|block| block.label.to_string())
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    (
+                        instr_typed,
+                        render_function.names.qualname.to_string(),
+                        render_function.function_id,
+                        entry_label,
+                    )
+                } else {
+                    let instr_typed = unsafe {
+                        render_instr_typed_for_codegen_with_runtime_state(
+                            compile_session,
+                            module,
+                            &function,
+                            None,
+                        )
+                    }?;
+                    let entry_label = function
+                        .blocks
+                        .first()
+                        .map(|block| block.label.to_string())
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    (
+                        instr_typed,
+                        function.names.qualname.to_string(),
+                        function.function_id,
+                        entry_label,
+                    )
+                };
+
+            Ok::<_, String>((
+                instr_typed,
+                resolved_qualname,
+                resolved_function_id,
+                entry_label,
+            ))
+        })?;
+    Ok(InstrTypedRenderResponse {
+        instr_typed,
         resolved_entry: format!(
             "{}::__dp_fn_{}::{}",
             resolved_qualname,

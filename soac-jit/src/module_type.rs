@@ -898,7 +898,7 @@ fn build_shared_state_for_inspection_with_original_code_and_source_hash(
     module_name: &str,
     package_name: &str,
     source_hash: u64,
-    original_code_by_function_id: HashMap<FunctionId, Py<PyAny>>,
+    original_code_by_function_id: HashMap<RuntimeFunctionId, Py<PyAny>>,
 ) -> PyResult<Arc<SharedModuleState>> {
     let function_index_by_id = build_function_index_by_id(&lowered_module)?;
     let (counter_slots_by_id, counter_values, top_value_counters) =

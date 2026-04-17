@@ -7202,6 +7202,9 @@ def read_point(point):
         let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", mode);
         let soac_work_dir = fresh_test_work_dir("field-getattr-deopt");
         let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
+        let module_cache_root = fresh_test_work_dir("field-indexed-plan-cache");
+        let _module_cache =
+            EnvVarGuard::set_os("SOAC_MODULE_CACHE_DIR", module_cache_root.as_os_str());
         let owner_module = PyModule::from_code(
             py,
             c"

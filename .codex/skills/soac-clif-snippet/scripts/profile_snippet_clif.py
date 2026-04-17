@@ -54,14 +54,22 @@ def main() -> int:
         function_id=function_id,
         counters_dir=counters_dir,
     )
+    instr_typed = render_specialized_instr_typed(
+        module_name=module_name,
+        source_path=source_path,
+        function_id=function_id,
+        counters_dir=counters_dir,
+    )
 
     specializations_path = artifact_dir / "specializations.txt"
     clif_path = artifact_dir / "specialized.clif"
+    instr_typed_path = artifact_dir / "instr_typed.txt"
     context_path = artifact_dir / "annotation_context.md"
     metadata_path = artifact_dir / "metadata.json"
 
     specializations_path.write_text(specializations, encoding="utf-8")
     clif_path.write_text(clif, encoding="utf-8")
+    instr_typed_path.write_text(instr_typed, encoding="utf-8")
     metadata = {
         "artifact_dir": str(artifact_dir),
         "module_name": module_name,
@@ -73,6 +81,7 @@ def main() -> int:
         "profile_dump": str(profile_dump),
         "specializations_path": str(specializations_path),
         "clif_path": str(clif_path),
+        "instr_typed_path": str(instr_typed_path),
         "annotation_context_path": str(context_path),
     }
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
@@ -81,6 +90,7 @@ def main() -> int:
             metadata=metadata,
             source=source_path.read_text(encoding="utf-8"),
             specializations=specializations,
+            instr_typed=instr_typed,
             clif=clif,
         ),
         encoding="utf-8",
@@ -89,6 +99,7 @@ def main() -> int:
     print(f"artifact_dir: {artifact_dir}")
     print(f"annotation_context: {context_path}")
     print(f"specialized_clif: {clif_path}")
+    print(f"instr_typed: {instr_typed_path}")
     print(f"specializations: {specializations_path}")
     print(f"metadata: {metadata_path}")
     return 0
@@ -261,6 +272,29 @@ def render_specialized_clif(
     ).stdout
 
 
+def render_specialized_instr_typed(
+    *,
+    module_name: str,
+    source_path: Path,
+    function_id: str,
+    counters_dir: Path,
+) -> str:
+    env = {
+        **os.environ,
+        "SOAC_WORK_DIR": str(counters_dir),
+        "SOAC_OPT_MODE": "apply",
+    }
+    return run_inspector(
+        "render_instr_typed",
+        "--specialized",
+        "--module-name",
+        module_name,
+        str(source_path),
+        function_id,
+        env=env,
+    ).stdout
+
+
 def run_inspector(
     bin_name: str,
     *args: str,
@@ -291,6 +325,7 @@ def annotation_context(
     metadata: dict[str, Any],
     source: str,
     specializations: str,
+    instr_typed: str,
     clif: str,
 ) -> str:
     return f"""# SOAC CLIF Annotation Context
@@ -319,6 +354,12 @@ purposes as inferred.
 
 ```text
 {specializations.rstrip()}
+```
+
+## InstrTyped Input To Codegen
+
+```text
+{instr_typed.rstrip()}
 ```
 
 ## Specialized CLIF
