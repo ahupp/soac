@@ -160,6 +160,12 @@ planned/fact-derived PyObject ownership when wrapping intrinsic results back
 into `SoacValue`. Typed direct-call emission now keeps callable, receiver, and
 argument inputs in typed form long enough to consume planned borrowed/immortal
 input ownership instead of dropping back to legacy expression-shape checks.
+Plain positional generic typed calls now use the same typed input emission path
+when no runtime-helper, unpacking, keyword, or direct-specialization case needs
+the legacy call emitter.
+Typed attribute get/set fallback and indexed field get/set emission now also
+consume typed PyObject input ownership and release only operands that were
+actually materialized as owned temporaries.
 Return values, local store RHS expressions, raise exception expressions,
 generic/direct call inputs, and operator/intrinsic inputs are annotated before
 JIT codegen and consumed directly from the typed instruction.
@@ -184,8 +190,9 @@ annotations.
    demand. Local store RHS values are planned as owned `PyObject` demand for the
    typed LocalEnv store path. Raise exception values are planned as owned
    `PyObject` demand for the typed raise path. Generic and direct call inputs are
-   planned as borrowed-ok `PyObject` demand and the typed direct-call emitters
-   consume those demands through a shared typed call-input helper.
+   planned as borrowed-ok `PyObject` demand and the typed generic positional-call
+   and direct-call emitters consume those demands through a shared typed
+   call-input helper.
    Operator/intrinsic inputs are planned as borrowed-ok `PyObject` demand and
    intrinsic argument emission consumes that same helper path.
 6a. Add a BlockPy result-representation planning pass after demand planning.

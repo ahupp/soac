@@ -14350,6 +14350,16 @@ fn emit_typed_pyobject_input_with_local_env(
     Ok((value, borrowed || !ownership.is_owned()))
 }
 
+fn push_owned_typed_input_cleanup(
+    owned_inputs: &mut Vec<ir::Value>,
+    value: ir::Value,
+    input_needs_no_cleanup: bool,
+) {
+    if !input_needs_no_cleanup {
+        owned_inputs.push(value);
+    }
+}
+
 fn emit_typed_direct_call_resolved_with_arg_plan_from_local_env(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
@@ -15478,24 +15488,27 @@ fn emit_typed_getattr_fallback(
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<SoacValue, String> {
-    let value = emit_typed_codegen_expr_with_local_env(
+    let (value, value_is_borrowed) = emit_typed_pyobject_input_with_local_env(
         fb,
         op.value.as_ref(),
         local_env,
         emit_ctx,
-        false,
         codegen_env,
         func_imports,
+        "typed getattr receiver",
     )?;
-    let attr = emit_typed_codegen_expr_with_local_env(
+    let (attr, attr_is_borrowed) = emit_typed_pyobject_input_with_local_env(
         fb,
         op.attr.as_ref(),
         local_env,
         emit_ctx,
-        false,
         codegen_env,
         func_imports,
+        "typed getattr attr",
     )?;
+    let mut owned_inputs = Vec::with_capacity(2);
+    push_owned_typed_input_cleanup(&mut owned_inputs, value, value_is_borrowed);
+    push_owned_typed_input_cleanup(&mut owned_inputs, attr, attr_is_borrowed);
     if let Some(counter_id) = emit_ctx
         .field_indexed_fallback_counter_ids
         .get(&op.semantic_instr_id())
@@ -15508,8 +15521,9 @@ fn emit_typed_getattr_fallback(
         fb,
         emit_ctx,
         fb.inst_results(getattr_inst)[0],
-        &[value, attr],
+        owned_inputs.as_slice(),
     );
+    let result = emit_checked_owned_pyobject_result(fb, result, emit_ctx);
     Ok(SoacValue::pyobject(result, PyObjFacts::unknown()))
 }
 
@@ -15521,33 +15535,37 @@ fn emit_typed_setattr_fallback(
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<SoacValue, String> {
-    let value = emit_typed_codegen_expr_with_local_env(
+    let (value, value_is_borrowed) = emit_typed_pyobject_input_with_local_env(
         fb,
         op.value.as_ref(),
         local_env,
         emit_ctx,
-        false,
         codegen_env,
         func_imports,
+        "typed setattr receiver",
     )?;
-    let attr = emit_typed_codegen_expr_with_local_env(
+    let (attr, attr_is_borrowed) = emit_typed_pyobject_input_with_local_env(
         fb,
         op.attr.as_ref(),
         local_env,
         emit_ctx,
-        false,
         codegen_env,
         func_imports,
+        "typed setattr attr",
     )?;
-    let replacement = emit_typed_codegen_expr_with_local_env(
+    let (replacement, replacement_is_borrowed) = emit_typed_pyobject_input_with_local_env(
         fb,
         op.replacement.as_ref(),
         local_env,
         emit_ctx,
-        false,
         codegen_env,
         func_imports,
+        "typed setattr replacement",
     )?;
+    let mut owned_inputs = Vec::with_capacity(3);
+    push_owned_typed_input_cleanup(&mut owned_inputs, value, value_is_borrowed);
+    push_owned_typed_input_cleanup(&mut owned_inputs, attr, attr_is_borrowed);
+    push_owned_typed_input_cleanup(&mut owned_inputs, replacement, replacement_is_borrowed);
     if let Some(counter_id) = emit_ctx
         .field_indexed_fallback_counter_ids
         .get(&op.semantic_instr_id())
@@ -15562,8 +15580,9 @@ fn emit_typed_setattr_fallback(
         fb,
         emit_ctx,
         fb.inst_results(setattr_inst)[0],
-        &[value, attr, replacement],
+        owned_inputs.as_slice(),
     );
+    let result = emit_checked_owned_pyobject_result(fb, result, emit_ctx);
     Ok(SoacValue::pyobject(result, PyObjFacts::unknown()))
 }
 
@@ -15587,25 +15606,27 @@ fn emit_typed_profiled_indexed_getattr(
     if specializations.is_empty() {
         return Ok(None);
     }
-    let value = emit_typed_codegen_expr_with_local_env(
+    let (value, value_is_borrowed) = emit_typed_pyobject_input_with_local_env(
         fb,
         op.value.as_ref(),
         local_env,
         emit_ctx,
-        false,
         codegen_env,
         func_imports,
+        "typed indexed getattr receiver",
     )?;
-    let attr = emit_typed_codegen_expr_with_local_env(
+    let (attr, attr_is_borrowed) = emit_typed_pyobject_input_with_local_env(
         fb,
         op.attr.as_ref(),
         local_env,
         emit_ctx,
-        false,
         codegen_env,
         func_imports,
+        "typed indexed getattr attr",
     )?;
-    let arg_values = [value, attr];
+    let mut owned_inputs = Vec::with_capacity(2);
+    push_owned_typed_input_cleanup(&mut owned_inputs, value, value_is_borrowed);
+    push_owned_typed_input_cleanup(&mut owned_inputs, attr, attr_is_borrowed);
     let ptr_ty = emit_ctx.consts.ptr_ty;
     let i64_ty = emit_ctx.consts.i64_ty;
     let null_ptr = fb.ins().iconst(ptr_ty, 0);
@@ -15678,7 +15699,7 @@ fn emit_typed_profiled_indexed_getattr(
         if let Some(counter_id) = hit_counter_id {
             let _ = emit_increment_counter(fb, counter_id, emit_ctx);
         }
-        emit_release_owned_inputs(fb, emit_ctx, &arg_values);
+        emit_release_owned_inputs(fb, emit_ctx, owned_inputs.as_slice());
         fb.ins()
             .jump(result_block, &[ir::BlockArg::Value(direct_value)]);
 
@@ -15698,8 +15719,9 @@ fn emit_typed_profiled_indexed_getattr(
                 fb,
                 emit_ctx,
                 fb.inst_results(getattr_inst)[0],
-                &arg_values,
+                owned_inputs.as_slice(),
             );
+            let fallback_value = emit_checked_owned_pyobject_result(fb, fallback_value, emit_ctx);
             fb.ins()
                 .jump(result_block, &[ir::BlockArg::Value(fallback_value)]);
         }
@@ -15714,7 +15736,7 @@ fn emit_typed_profiled_indexed_getattr(
                 emit_ctx,
                 block,
                 fallback_counter_id,
-                &arg_values,
+                owned_inputs.as_slice(),
                 target,
                 deopt_resume_ref,
             );
@@ -15749,34 +15771,37 @@ fn emit_typed_profiled_indexed_setattr(
     if specializations.is_empty() {
         return Ok(None);
     }
-    let value = emit_typed_codegen_expr_with_local_env(
+    let (value, value_is_borrowed) = emit_typed_pyobject_input_with_local_env(
         fb,
         op.value.as_ref(),
         local_env,
         emit_ctx,
-        false,
         codegen_env,
         func_imports,
+        "typed indexed setattr receiver",
     )?;
-    let attr = emit_typed_codegen_expr_with_local_env(
+    let (attr, attr_is_borrowed) = emit_typed_pyobject_input_with_local_env(
         fb,
         op.attr.as_ref(),
         local_env,
         emit_ctx,
-        false,
         codegen_env,
         func_imports,
+        "typed indexed setattr attr",
     )?;
-    let replacement = emit_typed_codegen_expr_with_local_env(
+    let (replacement, replacement_is_borrowed) = emit_typed_pyobject_input_with_local_env(
         fb,
         op.replacement.as_ref(),
         local_env,
         emit_ctx,
-        false,
         codegen_env,
         func_imports,
+        "typed indexed setattr replacement",
     )?;
-    let arg_values = [value, attr, replacement];
+    let mut owned_inputs = Vec::with_capacity(3);
+    push_owned_typed_input_cleanup(&mut owned_inputs, value, value_is_borrowed);
+    push_owned_typed_input_cleanup(&mut owned_inputs, attr, attr_is_borrowed);
+    push_owned_typed_input_cleanup(&mut owned_inputs, replacement, replacement_is_borrowed);
     let ptr_ty = emit_ctx.consts.ptr_ty;
     let i64_ty = emit_ctx.consts.i64_ty;
     let zero_i32 = fb.ins().iconst(emit_ctx.consts.i32_ty, 0);
@@ -15854,7 +15879,7 @@ fn emit_typed_profiled_indexed_setattr(
         }
         let none_const = emit_none_const(fb, emit_ctx);
         fb.ins().call(emit_ctx.incref_ref, &[none_const]);
-        emit_release_owned_inputs(fb, emit_ctx, &arg_values);
+        emit_release_owned_inputs(fb, emit_ctx, owned_inputs.as_slice());
         fb.ins()
             .jump(result_block, &[ir::BlockArg::Value(none_const)]);
 
@@ -15876,8 +15901,9 @@ fn emit_typed_profiled_indexed_setattr(
                 fb,
                 emit_ctx,
                 fb.inst_results(setattr_inst)[0],
-                &arg_values,
+                owned_inputs.as_slice(),
             );
+            let fallback_value = emit_checked_owned_pyobject_result(fb, fallback_value, emit_ctx);
             fb.ins()
                 .jump(result_block, &[ir::BlockArg::Value(fallback_value)]);
         }
@@ -15892,7 +15918,7 @@ fn emit_typed_profiled_indexed_setattr(
                 emit_ctx,
                 block,
                 fallback_counter_id,
-                &arg_values,
+                owned_inputs.as_slice(),
                 target,
                 deopt_resume_ref,
             );
@@ -16198,6 +16224,42 @@ fn simple_call_parts(call: &soac_blockpy::block_py::Call<InstrCodegen>) -> Simpl
         simple_keywords,
         has_unpack,
     }
+}
+
+fn typed_call_can_emit_simple_positional_with_typed_inputs(
+    call: &TypedCall<InstrTyped>,
+    legacy_call: &soac_blockpy::block_py::Call<InstrCodegen>,
+    emit_ctx: &JitEmitCtx<'_>,
+) -> bool {
+    if !matches!(call.access, TypedCallAccessPlan::Generic) {
+        return false;
+    }
+    let SimpleCallParts {
+        simple_args,
+        simple_keywords,
+        has_unpack,
+    } = simple_call_parts(legacy_call);
+    if has_unpack || !simple_keywords.is_empty() {
+        return false;
+    }
+    if codegen_expr_runtime_helper(legacy_call.func.as_ref(), emit_ctx).is_some() {
+        return false;
+    }
+    if simple_args.len() == 3
+        && matches!(
+            codegen_expr_helper_name(legacy_call.func.as_ref(), emit_ctx.module_constants),
+            Some("call_super")
+        )
+    {
+        return false;
+    }
+
+    let site_instr_id = legacy_call.try_semantic_instr_id();
+    direct_constructor_specializations_for_call_site(legacy_call, emit_ctx, None).is_empty()
+        && direct_method_specializations_for_call_site(legacy_call, emit_ctx, None).is_empty()
+        && site_instr_id
+            .and_then(|site_instr_id| emit_ctx.call_target_specializations.get(&site_instr_id))
+            .is_none_or(Vec::is_empty)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -18487,6 +18549,17 @@ fn emit_typed_codegen_call_result_with_local_env(
     {
         return Ok(Some(result));
     }
+    if typed_call_can_emit_simple_positional_with_typed_inputs(call, &legacy_call, emit_ctx) {
+        return emit_typed_codegen_simple_positional_call_result_with_local_env(
+            fb,
+            call,
+            local_env,
+            emit_ctx,
+            demand,
+            codegen_env,
+            func_imports,
+        );
+    }
     let guarded_targets;
     let profiled_targets = match &call.access {
         TypedCallAccessPlan::Generic => None,
@@ -18578,7 +18651,16 @@ fn emit_typed_codegen_simple_positional_call_result_with_local_env(
         arg_borrowed.push(arg_is_borrowed);
     }
 
-    let result = if arg_values.len() <= 3 {
+    if let Some(counter_id) = call
+        .try_semantic_instr_id()
+        .and_then(|site_instr_id| emit_ctx.call_target_counter_ids.get(&site_instr_id))
+        .copied()
+    {
+        let callee_id = emit_callee_function_id_checked(fb, callable, emit_ctx, codegen_env);
+        emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
+    }
+
+    let result = if demand == ResultDemand::EffectOnly && arg_values.len() <= 3 {
         emit_positional_call_three_result_with_arg_values(
             fb,
             callable,

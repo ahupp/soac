@@ -5,6 +5,22 @@ optimization attempts made by Codex agents. Keep entries succinct: what
 changed or was tried, which jj change id carried it when landed, the
 benchmarked throughput delta, and the headline pre/post numbers.
 
+## 2026-04-17 - Preserve typed attribute operand ownership
+
+- jj change id: `snwwtlsy`
+- summary: Plain positional generic typed calls now keep typed child operands
+  through call emission, while typed attribute get/set fallback and indexed
+  field paths release only operands materialized as owned temporaries. Typed
+  attribute fallback results are checked before they can become call arguments.
+- throughput: `+1.73%` median
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `255841`, `253211`, `259156 loops/s`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `260964`, `259035`, `260256 loops/s`
+- refcount counters: `-101000` INCREF and `-101000` DECREF in a 100k-loop
+  verify run
+- code size: `506879` to `506671 bytes` total pystone code size
+
 ## 2026-04-16 - Consume planned typed call input ownership
 
 - jj change id: `ntomvpmx`
