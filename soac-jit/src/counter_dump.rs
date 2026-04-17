@@ -1070,8 +1070,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "block_entry".to_string(),
                     site_kind: "block_entry".to_string(),
-                    function_id: Some(RuntimeFunctionId::new(1, 7)),
-                    current_function_id: Some(RuntimeFunctionId::new(1, 7)),
+                    function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
+                    current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
                     instr_id: None,
                     function_qualname: Some("f".to_string()),
                     block_label: Some("bb0".to_string()),
@@ -1117,7 +1117,10 @@ mod tests {
         assert_eq!(record.row_count(), 2);
         let first_row = record.row(0).expect("first row");
         assert_eq!(first_row.counter_id, 3);
-        assert_eq!(first_row.function_id, Some(RuntimeFunctionId::new(1, 7)));
+        assert_eq!(
+            first_row.function_id,
+            Some(RuntimeFunctionId::from_raw_parts(1, 7))
+        );
         assert_eq!(first_row.instr_id, None);
         assert_eq!(first_row.block_label, Some("bb0"));
         assert_eq!(first_row.value, 11);
@@ -1158,8 +1161,8 @@ mod tests {
                 scope: "this".to_string(),
                 kind: "block_entry".to_string(),
                 site_kind: "block_entry".to_string(),
-                function_id: Some(RuntimeFunctionId::new(1, 7)),
-                current_function_id: Some(RuntimeFunctionId::new(1, 7)),
+                function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
+                current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
                 instr_id: None,
                 function_qualname: Some("f".to_string()),
                 block_label: Some("bb0".to_string()),
@@ -1216,10 +1219,13 @@ mod tests {
         assert_eq!(first_row.scope, "this");
         assert_eq!(first_row.kind, "block_entry");
         assert_eq!(first_row.site_kind, "block_entry");
-        assert_eq!(first_row.function_id, Some(RuntimeFunctionId::new(1, 7)));
+        assert_eq!(
+            first_row.function_id,
+            Some(RuntimeFunctionId::from_raw_parts(1, 7))
+        );
         assert_eq!(
             first_row.current_function_id,
-            Some(RuntimeFunctionId::new(1, 7))
+            Some(RuntimeFunctionId::from_raw_parts(1, 7))
         );
         assert_eq!(first_row.instr_id, None);
         assert_eq!(first_row.function_qualname, Some("f"));
@@ -1411,13 +1417,15 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "call_hot_targets".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(RuntimeFunctionId::new(1, 7)),
-                    current_function_id: Some(RuntimeFunctionId::new(1, 7)),
+                    function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
+                    current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(2), 4)),
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
                     value: 11,
-                    observed_value: Some(RuntimeFunctionId::new(1, 9).to_packed_runtime_u64()),
+                    observed_value: Some(
+                        RuntimeFunctionId::from_raw_parts(1, 9).to_packed_runtime_u64(),
+                    ),
                     max_overcount: Some(1),
                 },
                 CounterDumpRow {
@@ -1425,13 +1433,15 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "call_hot_targets".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(RuntimeFunctionId::new(1, 7)),
-                    current_function_id: Some(RuntimeFunctionId::new(1, 7)),
+                    function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
+                    current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(2), 4)),
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
                     value: 5,
-                    observed_value: Some(RuntimeFunctionId::new(1, 10).to_packed_runtime_u64()),
+                    observed_value: Some(
+                        RuntimeFunctionId::from_raw_parts(1, 10).to_packed_runtime_u64(),
+                    ),
                     max_overcount: Some(0),
                 },
                 CounterDumpRow {
@@ -1439,8 +1449,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "call_hot_targets".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(RuntimeFunctionId::new(1, 8)),
-                    current_function_id: Some(RuntimeFunctionId::new(1, 8)),
+                    function_id: Some(RuntimeFunctionId::from_raw_parts(1, 8)),
+                    current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 8)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(3), 1)),
                     function_qualname: Some("pkg.mod.g".to_string()),
                     block_label: None,
@@ -1453,8 +1463,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "call_hot_targets".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(RuntimeFunctionId::new(1, 8)),
-                    current_function_id: Some(RuntimeFunctionId::new(1, 8)),
+                    function_id: Some(RuntimeFunctionId::from_raw_parts(1, 8)),
+                    current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 8)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(3), 2)),
                     function_qualname: Some("pkg.mod.h".to_string()),
                     block_label: None,
@@ -1475,14 +1485,14 @@ mod tests {
         let collected = collect_call_target_specializations_for_function(
             &records,
             "mod",
-            RuntimeFunctionId::new(1, 7),
+            RuntimeFunctionId::from_raw_parts(1, 7),
         )
         .expect("specializations should collect");
         assert_eq!(
             collected.get(&InstrId::new(BlockLabel::from_index(2), 4)),
             Some(&vec![
-                RuntimeFunctionId::new(1, 9),
-                RuntimeFunctionId::new(1, 10)
+                RuntimeFunctionId::from_raw_parts(1, 9),
+                RuntimeFunctionId::from_raw_parts(1, 10)
             ])
         );
     }
@@ -1502,8 +1512,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "operator_hot_shapes".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(RuntimeFunctionId::new(1, 7)),
-                    current_function_id: Some(RuntimeFunctionId::new(1, 7)),
+                    function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
+                    current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(2), 4)),
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
@@ -1516,8 +1526,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "operator_hot_shapes".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(RuntimeFunctionId::new(1, 7)),
-                    current_function_id: Some(RuntimeFunctionId::new(1, 7)),
+                    function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
+                    current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(2), 4)),
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
@@ -1530,8 +1540,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "operator_hot_shapes".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(RuntimeFunctionId::new(1, 7)),
-                    current_function_id: Some(RuntimeFunctionId::new(1, 7)),
+                    function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
+                    current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(2), 4)),
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
@@ -1544,8 +1554,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "operator_hot_shapes".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(RuntimeFunctionId::new(1, 8)),
-                    current_function_id: Some(RuntimeFunctionId::new(1, 8)),
+                    function_id: Some(RuntimeFunctionId::from_raw_parts(1, 8)),
+                    current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 8)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(3), 1)),
                     function_qualname: Some("pkg.mod.g".to_string()),
                     block_label: None,
@@ -1558,8 +1568,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "operator_hot_shapes".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(RuntimeFunctionId::new(1, 7)),
-                    current_function_id: Some(RuntimeFunctionId::new(1, 7)),
+                    function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
+                    current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(2), 4)),
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
@@ -1576,7 +1586,7 @@ mod tests {
         let collected = collect_operator_specializations_for_function(
             &records,
             "mod",
-            RuntimeFunctionId::new(1, 7),
+            RuntimeFunctionId::from_raw_parts(1, 7),
         )
         .expect("operator specializations should collect");
         assert_eq!(
@@ -1604,8 +1614,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "getitem_hot_shapes".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(RuntimeFunctionId::new(1, 7)),
-                    current_function_id: Some(RuntimeFunctionId::new(1, 7)),
+                    function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
+                    current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(2), 4)),
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
@@ -1618,8 +1628,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "getitem_hot_shapes".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(RuntimeFunctionId::new(1, 7)),
-                    current_function_id: Some(RuntimeFunctionId::new(1, 7)),
+                    function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
+                    current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(2), 4)),
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
@@ -1632,8 +1642,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "getitem_hot_shapes".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(RuntimeFunctionId::new(1, 8)),
-                    current_function_id: Some(RuntimeFunctionId::new(1, 8)),
+                    function_id: Some(RuntimeFunctionId::from_raw_parts(1, 8)),
+                    current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 8)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(3), 1)),
                     function_qualname: Some("pkg.mod.g".to_string()),
                     block_label: None,
@@ -1646,8 +1656,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "getitem_hot_shapes".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(RuntimeFunctionId::new(1, 7)),
-                    current_function_id: Some(RuntimeFunctionId::new(1, 7)),
+                    function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
+                    current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(2), 4)),
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
@@ -1664,7 +1674,7 @@ mod tests {
         let collected = collect_getitem_specializations_for_function(
             &records,
             "mod",
-            RuntimeFunctionId::new(1, 7),
+            RuntimeFunctionId::from_raw_parts(1, 7),
         )
         .expect("getitem specializations should collect");
         assert_eq!(
@@ -1692,8 +1702,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "setitem_hot_shapes".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(RuntimeFunctionId::new(1, 7)),
-                    current_function_id: Some(RuntimeFunctionId::new(1, 7)),
+                    function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
+                    current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(2), 4)),
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
@@ -1706,8 +1716,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "setitem_hot_shapes".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(RuntimeFunctionId::new(1, 7)),
-                    current_function_id: Some(RuntimeFunctionId::new(1, 7)),
+                    function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
+                    current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(2), 4)),
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
@@ -1720,8 +1730,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "setitem_hot_shapes".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(RuntimeFunctionId::new(1, 8)),
-                    current_function_id: Some(RuntimeFunctionId::new(1, 8)),
+                    function_id: Some(RuntimeFunctionId::from_raw_parts(1, 8)),
+                    current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 8)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(3), 1)),
                     function_qualname: Some("pkg.mod.g".to_string()),
                     block_label: None,
@@ -1734,8 +1744,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "setitem_hot_shapes".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(RuntimeFunctionId::new(1, 7)),
-                    current_function_id: Some(RuntimeFunctionId::new(1, 7)),
+                    function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
+                    current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(2), 4)),
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
@@ -1752,7 +1762,7 @@ mod tests {
         let collected = collect_setitem_specializations_for_function(
             &records,
             "mod",
-            RuntimeFunctionId::new(1, 7),
+            RuntimeFunctionId::from_raw_parts(1, 7),
         )
         .expect("setitem specializations should collect");
         assert_eq!(
@@ -1782,8 +1792,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "branch_outcomes".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(RuntimeFunctionId::new(1, 7)),
-                    current_function_id: Some(RuntimeFunctionId::new(1, 7)),
+                    function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
+                    current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
                     instr_id: Some(hot_false_site),
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
@@ -1796,8 +1806,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "branch_outcomes".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(RuntimeFunctionId::new(1, 7)),
-                    current_function_id: Some(RuntimeFunctionId::new(1, 7)),
+                    function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
+                    current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
                     instr_id: Some(hot_false_site),
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
@@ -1810,8 +1820,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "branch_outcomes".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(RuntimeFunctionId::new(1, 7)),
-                    current_function_id: Some(RuntimeFunctionId::new(1, 7)),
+                    function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
+                    current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
                     instr_id: Some(hot_true_site),
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
@@ -1825,9 +1835,12 @@ mod tests {
         let bytes = record.encode().expect("counter dump should encode");
         let records =
             parse_counter_dump_records(bytes.as_slice()).expect("counter dump should parse");
-        let collected =
-            collect_branch_preferences_for_function(&records, "mod", RuntimeFunctionId::new(1, 7))
-                .expect("branch preferences should collect");
+        let collected = collect_branch_preferences_for_function(
+            &records,
+            "mod",
+            RuntimeFunctionId::from_raw_parts(1, 7),
+        )
+        .expect("branch preferences should collect");
 
         assert_eq!(collected.get(&hot_false_site), Some(&false));
         assert_eq!(collected.get(&hot_true_site), Some(&true));

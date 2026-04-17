@@ -2653,7 +2653,7 @@ mod tests {
         Python::attach(|py| unsafe {
             TEST_SOAC_METADATA_DROPS.store(0, Ordering::SeqCst);
             let function = make_test_function(py);
-            let function_id = RuntimeFunctionId::new(7, 11);
+            let function_id = RuntimeFunctionId::from_raw_parts(7, 11);
             let metadata = Box::into_raw(Box::new(123usize)) as *mut c_void;
             assert_eq!(
                 PyFunction_SetSoacMetadata(
@@ -2711,7 +2711,7 @@ mod tests {
             TEST_SOAC_METADATA_DROPS.store(0, Ordering::SeqCst);
             let (_module, cls) = make_test_module(py);
             let class_obj = cls.as_ptr();
-            let function_id = RuntimeFunctionId::new(9, 3);
+            let function_id = RuntimeFunctionId::from_raw_parts(9, 3);
             let metadata = Box::into_raw(Box::new(321usize)) as *mut c_void;
             assert_eq!(
                 PyType_SetSoacMetadata(
@@ -2769,7 +2769,7 @@ mod tests {
             let (module, cls) = make_test_module(py);
             let owner_type = cls.as_ptr() as *mut ffi::PyTypeObject;
             let init_function = class_dict_function(owner_type, c"__init__");
-            let function_id = RuntimeFunctionId::new(10, 4);
+            let function_id = RuntimeFunctionId::from_raw_parts(10, 4);
             assert_eq!(
                 PyFunction_SetSoacMetadata(
                     init_function,
@@ -2871,7 +2871,7 @@ mod tests {
             let (module, cls) = make_test_module(py);
             let owner_type = cls.as_ptr() as *mut ffi::PyTypeObject;
             let init_function = class_dict_function(owner_type, c"__init__");
-            let function_id = RuntimeFunctionId::new(10, 7);
+            let function_id = RuntimeFunctionId::from_raw_parts(10, 7);
             assert_eq!(
                 PyFunction_SetSoacMetadata(
                     init_function,
@@ -2905,7 +2905,7 @@ mod tests {
             );
             let owner_type = cls.as_ptr() as *mut ffi::PyTypeObject;
             let init_function = class_dict_function(owner_type, c"__init__");
-            let function_id = RuntimeFunctionId::new(10, 8);
+            let function_id = RuntimeFunctionId::from_raw_parts(10, 8);
             assert_eq!(
                 PyFunction_SetSoacMetadata(
                     init_function,

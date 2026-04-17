@@ -2885,7 +2885,7 @@ mod tests {
 
     #[test]
     fn rewrites_static_runtime_constructor_calls_to_direct_calls() {
-        let constructor_id = RuntimeFunctionId::new(42, 7);
+        let constructor_id = RuntimeFunctionId::from_raw_parts(42, 7);
         let constants = vec![Load::new(ResolvedName {
             id: RuntimeName::IterRange.name().to_string().into(),
             location: NameLocation::RuntimeName(RuntimeName::IterRange),

@@ -225,7 +225,7 @@ mod test {
         assert!(
             session
                 .shared_module_state_for_function_id(
-                    soac_blockpy::block_py::RuntimeFunctionId::new(7, 1)
+                    soac_blockpy::block_py::RuntimeFunctionId::from_raw_parts(7, 1)
                 )
                 .unwrap()
                 .is_none()

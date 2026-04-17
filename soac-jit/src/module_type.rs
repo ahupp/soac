@@ -1741,7 +1741,7 @@ def f(x):
                 scope: CounterScope::Function,
                 kind: "runtime_incref".to_string(),
                 site: CounterSite::Runtime {
-                    function_id: Some(RuntimeFunctionId::new(0, 7)),
+                    function_id: Some(RuntimeFunctionId::from_raw_parts(0, 7)),
                     instr_id: None,
                 },
             },
@@ -1750,7 +1750,7 @@ def f(x):
                 scope: CounterScope::Function,
                 kind: "runtime_incref".to_string(),
                 site: CounterSite::Runtime {
-                    function_id: Some(RuntimeFunctionId::new(0, 7)),
+                    function_id: Some(RuntimeFunctionId::from_raw_parts(0, 7)),
                     instr_id: None,
                 },
             },
@@ -1777,7 +1777,7 @@ def f(x):
                 scope: CounterScope::This,
                 kind: "block_entry".to_string(),
                 site: CounterSite::BlockEntry {
-                    function_id: RuntimeFunctionId::new(0, 7),
+                    function_id: RuntimeFunctionId::from_raw_parts(0, 7),
                     block_label: soac_blockpy::block_py::BlockLabel::from_index(0),
                 },
             },

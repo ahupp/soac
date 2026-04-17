@@ -28,7 +28,7 @@ fn test_callable_def_with_yield_block(
     block: Block<InstrWithYield>,
 ) -> BlockPyFunction<CoreModuleShapeWithYield> {
     BlockPyFunction {
-        function_id: RuntimeFunctionId::new(0, 1),
+        function_id: RuntimeFunctionId::from_raw_parts(0, 1),
         name_gen: test_name_gen(),
         names: FunctionName::new("f", "f", "f", "f"),
         kind: FunctionKind::Generator,
@@ -46,7 +46,7 @@ fn lower_awaits_in_test_block(block: Block<InstrWithAwaitAndYield>) -> Block<Ins
         module_name_gen: ModuleNameGen::new(0),
         global_names: Vec::new(),
         callable_defs: vec![BlockPyFunction::<CoreModuleShapeWithAwaitAndYield> {
-            function_id: RuntimeFunctionId::new(0, 1),
+            function_id: RuntimeFunctionId::from_raw_parts(0, 1),
             name_gen: test_name_gen(),
             names: FunctionName::new("f", "f", "f", "f"),
             kind: FunctionKind::Coroutine,

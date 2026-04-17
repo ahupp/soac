@@ -291,7 +291,10 @@ impl FunctionIdRemapper {
         if function_id == RuntimeFunctionId::global() {
             function_id
         } else {
-            RuntimeFunctionId::new(self.new_module_id, function_id.local_function_id().as_u32())
+            RuntimeFunctionId::from_raw_parts(
+                self.new_module_id,
+                function_id.local_function_id().as_u32(),
+            )
         }
     }
 }

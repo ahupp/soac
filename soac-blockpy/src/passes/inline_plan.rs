@@ -224,8 +224,8 @@ class Box:
 
     #[test]
     fn carries_non_escaping_constructor_allocations() {
-        let caller_id = RuntimeFunctionId::new(1, 10);
-        let constructor_id = RuntimeFunctionId::new(1, 20);
+        let caller_id = RuntimeFunctionId::from_raw_parts(1, 10);
+        let constructor_id = RuntimeFunctionId::from_raw_parts(1, 20);
         let escape_summary = EscapeSummaryModule {
             functions: HashMap::from([(
                 caller_id,

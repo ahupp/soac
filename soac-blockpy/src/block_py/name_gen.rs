@@ -117,12 +117,15 @@ pub struct RuntimeFunctionId(u64);
 impl RuntimeFunctionId {
     pub const GLOBAL: Self = Self(u64::MAX);
 
-    pub const fn new(module_id: u32, function_id: u32) -> Self {
-        Self(((module_id as u64) << 32) | function_id as u64)
+    pub const fn new(module_id: RuntimeModuleId, function_id: LocalFunctionId) -> Self {
+        Self(((module_id.as_u32() as u64) << 32) | function_id.as_u32() as u64)
     }
 
-    pub const fn from_parts(module_id: RuntimeModuleId, function_id: LocalFunctionId) -> Self {
-        Self(((module_id.as_u32() as u64) << 32) | function_id.as_u32() as u64)
+    pub const fn from_raw_parts(module_id: u32, function_id: u32) -> Self {
+        Self::new(
+            RuntimeModuleId::new(module_id),
+            LocalFunctionId::new(function_id),
+        )
     }
 
     pub const fn from_packed_runtime_u64(packed: u64) -> Self {
@@ -398,7 +401,7 @@ impl FunctionNameGen {
 
 #[derive(Debug)]
 pub struct ModuleNameGen {
-    module_id: u32,
+    module_id: RuntimeModuleId,
     state: Arc<AtomicU32>,
 }
 
@@ -409,18 +412,20 @@ impl ModuleNameGen {
 
     pub fn recovered(module_id: u32, next_function_id: u32) -> Self {
         Self {
-            module_id,
+            module_id: RuntimeModuleId::new(module_id),
             state: Arc::new(AtomicU32::new(next_function_id)),
         }
     }
 
     pub fn module_id(&self) -> u32 {
-        self.module_id
+        self.module_id.as_u32()
     }
 
     pub fn next_function_name_gen(&self) -> FunctionNameGen {
-        let function_id =
-            RuntimeFunctionId::new(self.module_id, self.state.fetch_add(1, Ordering::Relaxed));
+        let function_id = RuntimeFunctionId::new(
+            self.module_id,
+            LocalFunctionId::new(self.state.fetch_add(1, Ordering::Relaxed)),
+        );
         FunctionNameGen::new(function_id)
     }
 }
@@ -455,8 +460,7 @@ mod tests {
 
     #[test]
     fn runtime_function_id_roundtrips_runtime_packed_identity() {
-        let runtime_id =
-            RuntimeFunctionId::from_parts(RuntimeModuleId::new(17), LocalFunctionId::new(42));
+        let runtime_id = RuntimeFunctionId::new(RuntimeModuleId::new(17), LocalFunctionId::new(42));
         let function_id =
             RuntimeFunctionId::from_packed_runtime_u64(runtime_id.to_packed_runtime_u64());
 

@@ -3,8 +3,8 @@ use anyhow::{Context, Result, bail};
 use soac_blockpy::block_py::{
     BlockPyFunction, BlockPyModule, ChildVisitable, HasSemanticInstrId, InstrCodegen, InstrId,
     Literal, LocalFunctionId, ModuleContentId, NameLocation, PersistentFunctionId,
-    RuntimeFunctionId, SerializedFunctionDebugName, SerializedFunctionId, SerializedIdentityTables,
-    SerializedModuleId, SerializedModuleIdentity, Visit,
+    RuntimeFunctionId, RuntimeModuleId, SerializedFunctionDebugName, SerializedFunctionId,
+    SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity, Visit,
 };
 use soac_blockpy::codegen_cache::{CachedCodegenModuleMetadata, PythonModuleCacheSource};
 use soac_blockpy::passes::{CodegenModuleShape, InstrResolved};
@@ -63,8 +63,8 @@ impl FunctionOptimizationPlan {
         self.function.local_function_id()
     }
 
-    pub const fn runtime_function_id(&self, module_id: u32) -> RuntimeFunctionId {
-        RuntimeFunctionId::new(module_id, self.local_function_id().as_u32())
+    pub const fn runtime_function_id(&self, module_id: RuntimeModuleId) -> RuntimeFunctionId {
+        RuntimeFunctionId::new(module_id, self.local_function_id())
     }
 }
 
@@ -1264,9 +1264,9 @@ mod tests {
 
     #[test]
     fn profile_evidence_store_loads_counter_dump_once_into_function_views() {
-        let function_id = RuntimeFunctionId::new(7, 1);
+        let function_id = RuntimeFunctionId::from_raw_parts(7, 1);
         let instr_id = InstrId::new(BlockLabel::from_index(3), 4);
-        let target_id = RuntimeFunctionId::new(7, 2);
+        let target_id = RuntimeFunctionId::from_raw_parts(7, 2);
         let target_persistent = PersistentFunctionId::new(
             ModuleContentId::new("pkg.mod", 0x1234),
             target_id.local_function_id(),
@@ -1441,9 +1441,9 @@ mod tests {
 
     #[test]
     fn profile_evidence_store_synthesizes_targets_from_loaded_module_identity() {
-        let caller_id = RuntimeFunctionId::new(7, 1);
-        let target_id = RuntimeFunctionId::new(8, 2);
-        let unrelated_callee_id = RuntimeFunctionId::new(8, 99);
+        let caller_id = RuntimeFunctionId::from_raw_parts(7, 1);
+        let target_id = RuntimeFunctionId::from_raw_parts(8, 2);
+        let unrelated_callee_id = RuntimeFunctionId::from_raw_parts(8, 99);
         let instr_id = InstrId::new(BlockLabel::from_index(3), 4);
         let caller_record = CounterDumpRecord {
             source_hash: 0x1234,

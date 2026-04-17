@@ -233,8 +233,8 @@ mod tests {
             scope: "function",
             kind: "runtime_incref",
             site_kind: "runtime",
-            function_id: Some(RuntimeFunctionId::new(1, 7)),
-            current_function_id: Some(RuntimeFunctionId::new(1, 7)),
+            function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
+            current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
             instr_id: Some(InstrId::new(BlockLabel::from_index(2), 4)),
             function_qualname: Some("pkg.mod.f"),
             block_label: None,
@@ -248,7 +248,7 @@ mod tests {
             rendered.contains(
                 format!(
                     "site_function_id={}",
-                    RuntimeFunctionId::new(1, 7).to_packed_runtime_u64()
+                    RuntimeFunctionId::from_raw_parts(1, 7).to_packed_runtime_u64()
                 )
                 .as_str()
             ),
@@ -258,7 +258,7 @@ mod tests {
             rendered.contains(
                 format!(
                     "current_function_id={}",
-                    RuntimeFunctionId::new(1, 7).to_packed_runtime_u64()
+                    RuntimeFunctionId::from_raw_parts(1, 7).to_packed_runtime_u64()
                 )
                 .as_str()
             ),
@@ -316,13 +316,13 @@ mod tests {
             scope: "this",
             kind: "call_hot_targets",
             site_kind: "runtime",
-            function_id: Some(RuntimeFunctionId::new(1, 7)),
-            current_function_id: Some(RuntimeFunctionId::new(1, 7)),
+            function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
+            current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
             instr_id: Some(InstrId::new(BlockLabel::from_index(2), 4)),
             function_qualname: Some("pkg.mod.f"),
             block_label: None,
             value: 11,
-            observed_value: Some(RuntimeFunctionId::new(1, 9).to_packed_runtime_u64()),
+            observed_value: Some(RuntimeFunctionId::from_raw_parts(1, 9).to_packed_runtime_u64()),
             max_overcount: Some(1),
         };
 
@@ -345,13 +345,15 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "call_hot_targets".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(RuntimeFunctionId::new(1, 7)),
-                    current_function_id: Some(RuntimeFunctionId::new(1, 7)),
+                    function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
+                    current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(2), 4)),
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
                     value: 11,
-                    observed_value: Some(RuntimeFunctionId::new(1, 9).to_packed_runtime_u64()),
+                    observed_value: Some(
+                        RuntimeFunctionId::from_raw_parts(1, 9).to_packed_runtime_u64(),
+                    ),
                     max_overcount: Some(1),
                 },
                 CounterDumpRow {
@@ -359,13 +361,15 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "call_hot_targets".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(RuntimeFunctionId::new(1, 7)),
-                    current_function_id: Some(RuntimeFunctionId::new(1, 7)),
+                    function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
+                    current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(2), 4)),
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
                     value: 5,
-                    observed_value: Some(RuntimeFunctionId::new(1, 10).to_packed_runtime_u64()),
+                    observed_value: Some(
+                        RuntimeFunctionId::from_raw_parts(1, 10).to_packed_runtime_u64(),
+                    ),
                     max_overcount: Some(0),
                 },
                 CounterDumpRow {
@@ -373,8 +377,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "call_hot_targets".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(RuntimeFunctionId::new(1, 8)),
-                    current_function_id: Some(RuntimeFunctionId::new(1, 8)),
+                    function_id: Some(RuntimeFunctionId::from_raw_parts(1, 8)),
+                    current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 8)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(3), 1)),
                     function_qualname: Some("pkg.mod.g".to_string()),
                     block_label: None,
@@ -387,8 +391,8 @@ mod tests {
                     scope: "this".to_string(),
                     kind: "call_hot_targets".to_string(),
                     site_kind: "runtime".to_string(),
-                    function_id: Some(RuntimeFunctionId::new(1, 8)),
-                    current_function_id: Some(RuntimeFunctionId::new(1, 8)),
+                    function_id: Some(RuntimeFunctionId::from_raw_parts(1, 8)),
+                    current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 8)),
                     instr_id: Some(InstrId::new(BlockLabel::from_index(3), 2)),
                     function_qualname: Some("pkg.mod.h".to_string()),
                     block_label: None,

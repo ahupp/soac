@@ -1104,7 +1104,7 @@ def f(x):
                     id: runtime_name.name().to_string().into(),
                     location: NameLocation::RuntimeName(runtime_name),
                 })),
-                RuntimeFunctionId::new(42, runtime_name as u32),
+                RuntimeFunctionId::from_raw_parts(42, runtime_name as u32),
                 vec![CallArgPositional::Positional(InstrCodegen::Load(
                     Load::new(ResolvedName {
                         id: "x".to_string().into(),

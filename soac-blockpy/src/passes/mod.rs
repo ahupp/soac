@@ -3739,7 +3739,7 @@ def caller(it):\n    return it.__next__()\n",
         let guard = InstrTyped::DirectCallGuardTest(TypedDirectCallGuardTest::new(
             load,
             TypedDirectCallGuardTestKind::RuntimeFunctionId {
-                function_id: RuntimeFunctionId::new(0, 7),
+                function_id: RuntimeFunctionId::from_raw_parts(0, 7),
             },
         ));
 
@@ -3801,7 +3801,7 @@ def caller(it):\n    return it.__next__()\n",
             func,
             vec![CallArgPositional::Positional(arg)],
             TypedDirectCallableCallGuard::Function(TypedDirectFunctionCallGuard {
-                function_id: RuntimeFunctionId::new(0, 8),
+                function_id: RuntimeFunctionId::from_raw_parts(0, 8),
                 arg_plan: TypedDirectCallArgPlan {
                     sources: vec![TypedDirectCallArgSource::Provided(0)],
                 },
@@ -3832,7 +3832,7 @@ def caller(it):\n    return it.__next__()\n",
             vec![CallArgPositional::Positional(arg)],
             "__next__",
             TypedDirectMethodCallGuard {
-                function_id: RuntimeFunctionId::new(0, 9),
+                function_id: RuntimeFunctionId::from_raw_parts(0, 9),
                 owner_type_ref: TypedAttrOwnerRef::TypeKey {
                     module_name: "__main__".to_string(),
                     qualname: "IterRange".to_string(),

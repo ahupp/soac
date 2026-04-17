@@ -304,10 +304,14 @@ mod test {
             .encode()
             .unwrap();
         counters.extend_from_slice(
-            counter_record_for_module_identity("pkg.callee", 0x5678, RuntimeFunctionId::new(8, 99))
-                .encode()
-                .unwrap()
-                .as_slice(),
+            counter_record_for_module_identity(
+                "pkg.callee",
+                0x5678,
+                RuntimeFunctionId::from_raw_parts(8, 99),
+            )
+            .encode()
+            .unwrap()
+            .as_slice(),
         );
         fs::write(counters_path.as_path(), counters).unwrap();
         let out_root = root.join("modules-out");
@@ -578,7 +582,9 @@ mod test {
                     function_qualname: Some("f".to_string()),
                     block_label: Some("bb0".to_string()),
                     value: 1,
-                    observed_value: Some(RuntimeFunctionId::new(8, 2).to_packed_runtime_u64()),
+                    observed_value: Some(
+                        RuntimeFunctionId::from_raw_parts(8, 2).to_packed_runtime_u64(),
+                    ),
                     max_overcount: None,
                 },
                 CounterDumpRow {

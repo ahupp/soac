@@ -51,8 +51,8 @@ use soac_blockpy::block_py::{
     CounterScope, CounterSite, Del, DeoptEntrySource, FunctionExecutionMode, FunctionKind, GetAttr,
     HasMeta, HasSemanticInstrId, InstrCodegen, InstrId, InstrKey, Literal, Load, LocalFunctionId,
     LocalLocation, Meta, ModuleContentId, NameLocation, ParamKind, PersistentFunctionId,
-    ResolvedName, RuntimeFunctionId, RuntimeName, StorageLayout, Store, Visit, VisitMut, WithMeta,
-    operation as blockpy_intrinsics,
+    ResolvedName, RuntimeFunctionId, RuntimeModuleId, RuntimeName, StorageLayout, Store, Visit,
+    VisitMut, WithMeta, operation as blockpy_intrinsics,
 };
 use soac_blockpy::passes::{
     CodegenModuleShape, ConstructorFieldValue, DirectFunctionIdGuardTest,
@@ -12910,7 +12910,8 @@ fn planned_evidence_for_shared_state(
 ) -> Result<HashMap<RuntimeFunctionId, FunctionProfileEvidence>, String> {
     let mut evidence_by_function = HashMap::new();
     for planned_function in &plan.functions {
-        let current_function_id = planned_function.runtime_function_id(shared_state.module_id());
+        let current_function_id =
+            planned_function.runtime_function_id(RuntimeModuleId::new(shared_state.module_id()));
         let current_function = shared_state
             .lookup_function(current_function_id)
             .ok_or_else(|| {
@@ -12955,7 +12956,7 @@ fn planned_evidence_for_precompile(
     )
     .map_err(|err| err.to_string())?;
 
-    let module_id = module.module_name_gen.module_id();
+    let module_id = RuntimeModuleId::new(module.module_name_gen.module_id());
     let has_function = |function_id: RuntimeFunctionId| {
         module
             .callable_defs
@@ -12982,7 +12983,7 @@ fn planned_evidence_for_precompile(
                     return Ok(module_index
                         .and_then(|module_index| module_index.function_id_for_target(target)));
                 }
-                let target_function_id = RuntimeFunctionId::new(module_id, target.local.as_u32());
+                let target_function_id = RuntimeFunctionId::new(module_id, target.local);
                 Ok(has_function(target_function_id).then_some(target_function_id))
             })
             .map_err(|err| err.to_string())?;
@@ -13027,7 +13028,7 @@ fn resolve_planned_function_target(
         target_shared_state_owner.as_ref()
     };
     let function_id =
-        RuntimeFunctionId::new(target_shared_state.module_id(), target.local.as_u32());
+        RuntimeFunctionId::from_raw_parts(target_shared_state.module_id(), target.local.as_u32());
     Ok(target_shared_state
         .lookup_function(function_id)
         .map(|function| function.function_id))
@@ -24376,7 +24377,8 @@ impl PrecompileModuleIndex {
         let module = self
             .modules_by_identity
             .get(&(target.module.module_name.clone(), target.module.source_hash))?;
-        let function_id = RuntimeFunctionId::new(module.module_id, target.local.as_u32());
+        let function_id =
+            RuntimeFunctionId::from_raw_parts(module.module_id, target.local.as_u32());
         self.function(function_id).map(|_| function_id)
     }
 

@@ -571,8 +571,16 @@ mod test {
 
     #[test]
     fn counter_modules_dedup_by_module_source_and_module_id() {
-        let record = counter_record("pkg.mod", 0x1234, Some(RuntimeFunctionId::new(7, 1)));
-        let other_record = counter_record("pkg.mod", 0x1234, Some(RuntimeFunctionId::new(7, 2)));
+        let record = counter_record(
+            "pkg.mod",
+            0x1234,
+            Some(RuntimeFunctionId::from_raw_parts(7, 1)),
+        );
+        let other_record = counter_record(
+            "pkg.mod",
+            0x1234,
+            Some(RuntimeFunctionId::from_raw_parts(7, 2)),
+        );
         let bytes = [record.encode().unwrap(), other_record.encode().unwrap()].concat();
         let records = parse_counter_dump_records(bytes.as_slice()).unwrap();
 
@@ -590,10 +598,14 @@ mod test {
 
     #[test]
     fn counter_modules_reject_mixed_module_ids_in_one_record() {
-        let mut record = counter_record("pkg.mod", 0x1234, Some(RuntimeFunctionId::new(7, 1)));
+        let mut record = counter_record(
+            "pkg.mod",
+            0x1234,
+            Some(RuntimeFunctionId::from_raw_parts(7, 1)),
+        );
         record
             .rows
-            .push(counter_row(Some(RuntimeFunctionId::new(8, 1))));
+            .push(counter_row(Some(RuntimeFunctionId::from_raw_parts(8, 1))));
         let bytes = record.encode().unwrap();
         let records = parse_counter_dump_records(bytes.as_slice()).unwrap();
 

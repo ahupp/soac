@@ -641,11 +641,11 @@ def f():
             assert_ne!(
                 direct_function_symbol_scope_for_shared_state(
                     first.as_ref(),
-                    RuntimeFunctionId::new(0, 1)
+                    RuntimeFunctionId::from_raw_parts(0, 1)
                 ),
                 direct_function_symbol_scope_for_shared_state(
                     second.as_ref(),
-                    RuntimeFunctionId::new(0, 1)
+                    RuntimeFunctionId::from_raw_parts(0, 1)
                 )
             );
         });
@@ -3872,7 +3872,7 @@ def build(values):
         };
         call.access = soac_blockpy::passes::TypedCallAccessPlan::GuardedCallable {
             function_guards: vec![soac_blockpy::passes::TypedDirectFunctionCallGuard {
-                function_id: RuntimeFunctionId::new(0, 1),
+                function_id: RuntimeFunctionId::from_raw_parts(0, 1),
                 arg_plan: soac_blockpy::passes::TypedDirectCallArgPlan {
                     sources: vec![soac_blockpy::passes::TypedDirectCallArgSource::Provided(0)],
                 },
@@ -3918,7 +3918,7 @@ def build(values):
         let call = with_instr_id(
             InstrCodegen::CallDirect(CallDirect::new(
                 with_instr_id(name_expr(test_global_name("callee")), callable_instr_id),
-                RuntimeFunctionId::new(0, 1),
+                RuntimeFunctionId::from_raw_parts(0, 1),
                 vec![CallArgPositional::Positional(with_instr_id(
                     constants.int_expr(1),
                     positional_instr_id,
@@ -3952,7 +3952,7 @@ def build(values):
         let positional_instr_id = InstrId::new(BlockLabel::from_index(0), 2);
         let call = InstrCodegen::CallDirect(CallDirect::new(
             name_expr(test_global_name("callee")),
-            RuntimeFunctionId::new(0, 1),
+            RuntimeFunctionId::from_raw_parts(0, 1),
             vec![CallArgPositional::Positional(with_instr_id(
                 name_expr(test_name("x")),
                 positional_instr_id,
@@ -8480,7 +8480,7 @@ def f(x):
             vec![],
             ret_term(InstrCodegen::CallDirect(CallDirect::new(
                 name_expr(test_constant_name(0)),
-                RuntimeFunctionId::new(0, 999),
+                RuntimeFunctionId::from_raw_parts(0, 999),
                 vec![CallArgPositional::Positional(name_expr(
                     test_constant_name(1),
                 ))],
@@ -12171,7 +12171,7 @@ def g():
                 vec![],
                 ret_term(InstrCodegen::CallDirect(CallDirect::new(
                     name_expr(test_constant_name(0)),
-                    RuntimeFunctionId::new(0, 999),
+                    RuntimeFunctionId::from_raw_parts(0, 999),
                     vec![CallArgPositional::Positional(name_expr(
                         test_constant_name(1),
                     ))],
@@ -19206,7 +19206,7 @@ def f(x, y):
 
     #[test]
     fn profiled_runtime_iter_receiver_call_direct_requires_straightline_constructor() {
-        let constructor_id = RuntimeFunctionId::new(7, 11);
+        let constructor_id = RuntimeFunctionId::from_raw_parts(7, 11);
         let receiver = InstrCodegen::Call(Call::new(
             name_expr(test_global_name("RangeLike")),
             vec![CallArgPositional::Positional(name_expr(test_local_name(

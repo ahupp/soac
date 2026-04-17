@@ -125,7 +125,10 @@ fn main() -> Result<(), String> {
     let function_id = profile_module_id
         .filter(|_| args.function_id.runtime_module_id().as_u32() == 0)
         .map(|module_id| {
-            RuntimeFunctionId::new(module_id, args.function_id.local_function_id().as_u32())
+            RuntimeFunctionId::from_raw_parts(
+                module_id,
+                args.function_id.local_function_id().as_u32(),
+            )
         })
         .unwrap_or(args.function_id);
     let module = if let Some(module_id) = profile_module_id {
