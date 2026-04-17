@@ -394,11 +394,13 @@ so a later turn can resume without rediscovering context.
   symlinks repo-local `soac-module-cache`, but the `Justfile` does not export
   `SOAC_MODULE_CACHE_DIR` by default so specialization runs can use
   `$SOAC_WORK_DIR/modules` as their module-artifact root. The `Justfile`
-  respects pre-set values for those variables. `just setup-dev-env`
-  installs the repo-local `ruff`
-  command. Test and benchmark recipes use `UV_OFFLINE=1` for uv-backed venv
-  refreshes; use `just update-venv` or rerun `just setup-dev-env` when
-  dependency changes intentionally require network access.
+  respects pre-set values for those variables. `just setup-dev-env` reuses an
+  already-installed nightly Rust toolchain and Cranelift codegen component
+  rather than upgrading them on every run, because nightly refreshes force
+  rebuilds. It also installs the repo-local `ruff` command. Test and benchmark
+  recipes use `UV_OFFLINE=1` for uv-backed venv refreshes; use
+  `just update-venv` or rerun `just setup-dev-env` when dependency changes
+  intentionally require network access.
 - `SOAC_PARENT_REPO`
   Optional override for `just setup-dev-env` in a jj worktree. The setup recipe
   normally infers the parent checkout from a file-backed `.jj/repo`; the parent

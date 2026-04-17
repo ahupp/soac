@@ -284,8 +284,16 @@ setup-dev-env:
     exit 1
   fi
 
-  rustup toolchain install nightly
-  rustup component add rustc-codegen-cranelift-preview --toolchain nightly
+  if rustup run nightly rustc --version >/dev/null 2>&1; then
+    echo "setup-dev-env: reusing installed nightly Rust toolchain"
+  else
+    rustup toolchain install nightly
+  fi
+  if rustup component list --installed --toolchain nightly | grep -Eq '^rustc-codegen-cranelift(-preview)?(-|$)'; then
+    echo "setup-dev-env: reusing installed nightly Cranelift codegen component"
+  else
+    rustup component add rustc-codegen-cranelift-preview --toolchain nightly
+  fi
   cargo install --locked inferno
   env -u UV_OFFLINE uv tool install ruff
   echo 'Run "apt update && apt install -y gdb"'

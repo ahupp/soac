@@ -7,11 +7,13 @@ Install the Python-side venv and the nightly Rust codegen backend used by
 just setup-dev-env
 ```
 
-`setup-dev-env` also installs the `ruff` command with uv. The repo keeps uv
-state under the working tree (`.uv-cache`, `.uv/`, `.xdg/`, and
-`soac-module-cache`) and puts the repo-local uv tool bin directory on `PATH`,
-so later test and benchmark recipes can run uv in offline mode instead of
-fetching through the sandbox.
+`setup-dev-env` reuses an already-installed nightly Rust toolchain and Cranelift
+codegen component rather than upgrading them on every run, because a nightly
+refresh forces rebuilds. It also installs the `ruff` command with uv. The repo
+keeps uv state under the working tree (`.uv-cache`, `.uv/`, `.xdg/`, and
+`soac-module-cache`) and puts the repo-local uv tool bin directory on `PATH`, so
+later test and benchmark recipes can run uv in offline mode instead of fetching
+through the sandbox.
 
 For jj worktrees, `just setup-dev-env` infers the parent checkout from a
 file-backed `.jj/repo` when possible. Set
