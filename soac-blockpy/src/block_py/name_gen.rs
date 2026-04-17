@@ -286,6 +286,37 @@ pub struct SerializedIdentityTables {
     pub debug_names: Vec<SerializedFunctionDebugName>,
 }
 
+impl SerializedIdentityTables {
+    pub fn module(
+        &self,
+        module_id: SerializedModuleId,
+    ) -> anyhow::Result<&SerializedModuleIdentity> {
+        self.modules
+            .get(module_id.as_u32() as usize)
+            .ok_or_else(|| {
+                anyhow::anyhow!("serialized identity table is missing module id {module_id}")
+            })
+    }
+
+    pub fn persistent_function_id(
+        &self,
+        function: SerializedFunctionId,
+    ) -> anyhow::Result<PersistentFunctionId> {
+        let module = self.module(function.module_id())?;
+        Ok(PersistentFunctionId::new(
+            ModuleContentId::new(module.module_name.clone(), module.source_hash),
+            function.local_function_id(),
+        ))
+    }
+
+    pub fn debug_name_for_function(&self, function: SerializedFunctionId) -> Option<&str> {
+        self.debug_names
+            .iter()
+            .find(|debug_name| debug_name.function == function)
+            .map(|debug_name| debug_name.qualname.as_str())
+    }
+}
+
 #[derive(
     Debug,
     Clone,
@@ -458,8 +489,9 @@ impl Default for FunctionNameGen {
 #[cfg(test)]
 mod tests {
     use super::{
-        LocalFunctionId, RuntimeFunctionId, RuntimeModuleId, SerializedFunctionDebugName,
-        SerializedFunctionId, SerializedModuleId,
+        LocalFunctionId, ModuleContentId, PersistentFunctionId, RuntimeFunctionId, RuntimeModuleId,
+        SerializedFunctionDebugName, SerializedFunctionId, SerializedIdentityTables,
+        SerializedModuleId, SerializedModuleIdentity,
     };
 
     #[test]
@@ -497,5 +529,34 @@ mod tests {
         };
 
         assert_eq!(debug_name.function, function);
+    }
+
+    #[test]
+    fn serialized_identity_tables_resolve_artifact_local_function_ids() {
+        let function =
+            SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(7));
+        let tables = SerializedIdentityTables {
+            modules: vec![SerializedModuleIdentity {
+                module_name: "pkg.mod".to_string(),
+                source_hash: 0x1234,
+                cache_identity: Some("test-cache".to_string()),
+            }],
+            debug_names: vec![SerializedFunctionDebugName {
+                function,
+                qualname: "outer.<locals>.inner".to_string(),
+            }],
+        };
+
+        assert_eq!(
+            tables.persistent_function_id(function).unwrap(),
+            PersistentFunctionId::new(
+                ModuleContentId::new("pkg.mod", 0x1234),
+                LocalFunctionId::new(7)
+            )
+        );
+        assert_eq!(
+            tables.debug_name_for_function(function),
+            Some("outer.<locals>.inner")
+        );
     }
 }

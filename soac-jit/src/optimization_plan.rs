@@ -524,29 +524,13 @@ impl OptimizationPlan {
         &self,
         function: SerializedFunctionId,
     ) -> Result<PersistentFunctionId> {
-        let module_index = function.module_id().as_u32() as usize;
-        let module = self
-            .identity_tables
-            .modules
-            .get(module_index)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "optimization plan references missing serialized module id {}",
-                    function.module_id()
-                )
-            })?;
-        Ok(PersistentFunctionId::new(
-            ModuleContentId::new(module.module_name.clone(), module.source_hash),
-            function.local_function_id(),
-        ))
+        self.identity_tables
+            .persistent_function_id(function)
+            .with_context(|| format!("resolve optimization-plan function id {function}"))
     }
 
     pub fn debug_name_for_function(&self, function: SerializedFunctionId) -> Option<&str> {
-        self.identity_tables
-            .debug_names
-            .iter()
-            .find(|debug_name| debug_name.function == function)
-            .map(|debug_name| debug_name.qualname.as_str())
+        self.identity_tables.debug_name_for_function(function)
     }
 
     pub fn from_evidence(
