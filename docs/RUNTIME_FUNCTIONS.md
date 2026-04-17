@@ -204,7 +204,6 @@ _index
 IterRange
 range
 tuple_from_iter
-eval_string_literal
 __deepcopy__
 templatelib_Template
 templatelib_Interpolation

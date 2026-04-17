@@ -2992,12 +2992,6 @@ pub(crate) fn lower_name_binding_in_core_blockpy_module_with_unsound_runtime_bui
     ModuleConstantExtractor::default().extract_module(module)
 }
 
-pub(crate) fn lower_name_binding_in_core_blockpy_module(
-    module: BlockPyModule<CoreModuleShape>,
-) -> BlockPyModule<ResolvedStorageModuleShape> {
-    lower_name_binding_in_core_blockpy_module_with_options(module, false)
-}
-
 pub(crate) fn lower_name_binding_in_core_blockpy_module_with_options(
     module: BlockPyModule<CoreModuleShape>,
     runtime_names_as_globals: bool,

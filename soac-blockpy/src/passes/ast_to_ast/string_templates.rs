@@ -5,6 +5,7 @@ use crate::passes::InstrRuff;
 use crate::transformer::{walk_expr, Transformer};
 use crate::{passes::ast_to_ast::expr_utils::make_tuple, py_expr};
 use ruff_python_ast::{self as ast, Expr};
+use ruff_python_parser::{ParseError, ParseErrorType};
 use ruff_text_size::{Ranged, TextRange};
 
 fn join_parts(parts: Vec<Expr>, force_join: bool) -> Expr {
@@ -230,7 +231,7 @@ fn parse_hex_escape(bytes: &[u8], offset: usize, len: usize) -> Option<u32> {
     Some(value)
 }
 
-fn has_active_surrogate_escape(content: &str) -> bool {
+fn has_active_lone_surrogate_escape(content: &str) -> bool {
     let bytes = content.as_bytes();
     let mut index = 0usize;
     while index < bytes.len() {
@@ -260,39 +261,124 @@ fn has_active_surrogate_escape(content: &str) -> bool {
     false
 }
 
-fn string_literal_needs_source_eval(context: &Context, value: &ast::StringLiteralValue) -> bool {
+fn string_literal_has_lone_surrogate_escape(
+    context: &Context,
+    value: &ast::StringLiteralValue,
+) -> bool {
     value.iter().any(|part| {
         !part.flags.prefix().is_raw()
             && source_slice(&context.source, part.content_range())
-                .is_some_and(has_active_surrogate_escape)
+                .is_some_and(has_active_lone_surrogate_escape)
     })
 }
 
-struct SurrogateStringLiteralLowerer<'a> {
-    context: &'a Context,
+fn interpolated_elements_have_lone_surrogate_escape(
+    context: &Context,
+    elements: &ast::InterpolatedStringElements,
+    is_raw: bool,
+) -> bool {
+    elements.iter().any(|element| match element {
+        ast::InterpolatedStringElement::Literal(lit) => {
+            !is_raw
+                && source_slice(&context.source, lit.range())
+                    .is_some_and(has_active_lone_surrogate_escape)
+        }
+        ast::InterpolatedStringElement::Interpolation(interp) => {
+            interp.format_spec.as_ref().is_some_and(|format_spec| {
+                interpolated_elements_have_lone_surrogate_escape(
+                    context,
+                    &format_spec.elements,
+                    is_raw,
+                )
+            })
+        }
+    })
 }
 
-impl Transformer for SurrogateStringLiteralLowerer<'_> {
+fn fstring_value_has_lone_surrogate_escape(context: &Context, value: &ast::FStringValue) -> bool {
+    value.iter().any(|part| match part {
+        ast::FStringPart::Literal(lit) => {
+            !lit.flags.prefix().is_raw()
+                && source_slice(&context.source, lit.content_range())
+                    .is_some_and(has_active_lone_surrogate_escape)
+        }
+        ast::FStringPart::FString(fstring) => interpolated_elements_have_lone_surrogate_escape(
+            context,
+            &fstring.elements,
+            fstring.flags.prefix().is_raw(),
+        ),
+    })
+}
+
+fn tstring_value_has_lone_surrogate_escape(context: &Context, value: &ast::TStringValue) -> bool {
+    value.iter().any(|tstring| {
+        interpolated_elements_have_lone_surrogate_escape(
+            context,
+            &tstring.elements,
+            tstring.flags.prefix().is_raw(),
+        )
+    })
+}
+
+struct LoneSurrogateStringLiteralRejecter<'a> {
+    context: &'a Context,
+    error: Option<ParseError>,
+}
+
+impl Transformer for LoneSurrogateStringLiteralRejecter<'_> {
     fn visit_expr(&mut self, expr: &mut Expr) {
+        if self.error.is_some() {
+            return;
+        }
         match expr {
             Expr::StringLiteral(node)
-                if string_literal_needs_source_eval(self.context, &node.value) =>
+                if string_literal_has_lone_surrogate_escape(self.context, &node.value) =>
             {
-                let literal_source = source_slice(&self.context.source, node.range())
-                    .map(str::to_string)
-                    .unwrap_or_else(|| crate::ruff_ast_to_string(&*expr));
-                *expr = py_expr!(
-                    "__soac__.eval_string_literal({source:literal})",
-                    source = literal_source
-                );
+                self.error = Some(ParseError {
+                    error: ParseErrorType::OtherError(
+                        "SOAC does not support string literals containing lone surrogate escapes"
+                            .to_string(),
+                    ),
+                    location: node.range(),
+                });
+            }
+            Expr::FString(node)
+                if fstring_value_has_lone_surrogate_escape(self.context, &node.value) =>
+            {
+                self.error = Some(ParseError {
+                    error: ParseErrorType::OtherError(
+                        "SOAC does not support f-string literals containing lone surrogate escapes"
+                            .to_string(),
+                    ),
+                    location: node.range(),
+                });
+            }
+            Expr::TString(node)
+                if tstring_value_has_lone_surrogate_escape(self.context, &node.value) =>
+            {
+                self.error = Some(ParseError {
+                    error: ParseErrorType::OtherError(
+                        "SOAC does not support t-string literals containing lone surrogate escapes"
+                            .to_string(),
+                    ),
+                    location: node.range(),
+                });
             }
             _ => walk_expr(self, expr),
         }
     }
 }
 
-pub fn rewrite_surrogate_escape_string_literals(context: &Context, body: &mut Suite) {
-    SurrogateStringLiteralLowerer { context }.visit_body(body);
+pub fn reject_lone_surrogate_string_literals(
+    context: &Context,
+    body: &mut Suite,
+) -> Result<(), ParseError> {
+    let mut rejecter = LoneSurrogateStringLiteralRejecter {
+        context,
+        error: None,
+    };
+    rejecter.visit_body(body);
+    rejecter.error.map_or(Ok(()), Err)
 }
 
 pub fn lower_string_templates_in_instr_ruff(expr: InstrRuff) -> InstrRuff {

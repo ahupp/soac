@@ -99,10 +99,6 @@ def aiter(obj):
     return iterator
 
 
-def eval_string_literal(source):
-    return _builtins.eval(f"({source})", {"__builtins__": {}}, {})
-
-
 def __deepcopy__(memo):
     # Modules are not pickleable; keep runtime as a singleton during deepcopy().
     return _sys.modules[__name__]

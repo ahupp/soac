@@ -1102,26 +1102,14 @@ def check_exit():
         assert module.check_exit() is False
 
 
-def test_soac_subinterpreter_shared_surrogate_key_raises(tmp_path):
+def test_soac_lone_surrogate_string_literal_raises(tmp_path):
     source = r"""
-import _interpreters
-
-interp = _interpreters.create()
-try:
-    try:
-        _interpreters.run_string(interp, "a", shared={"\uD82A": 0})
-    except UnicodeEncodeError as exc:
-        VALUE = "surrogates not allowed" in str(exc)
-    else:
-        VALUE = False
-finally:
-    _interpreters.destroy(interp)
+VALUE = "\uD82A"
 """
 
-    with soac_module(
-        tmp_path, "subinterpreter_shared_surrogate_key", source
-    ) as module:
-        assert module.VALUE is True
+    with pytest.raises(SyntaxError, match="lone surrogate"):
+        with soac_module(tmp_path, "lone_surrogate_string_literal", source):
+            pass
 
 
 def test_soac_attribute_assignment_temps_do_not_keep_cycle_alive(tmp_path):

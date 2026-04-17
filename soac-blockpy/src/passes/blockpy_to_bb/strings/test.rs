@@ -183,14 +183,26 @@ def f(obj, mapping, key, value):
 }
 
 #[test]
-fn preserves_surrogate_escaped_string_literals_in_module_constants() {
-    let source = "def f():\n    return \"\\udca7\" \"b\"\n";
-    let bb_module = tracked_name_binding_module(source);
-    let prepared = lower_try_jump_exception_flow(&bb_module);
-    let normalized = normalize_bb_module_strings(&prepared);
+fn rejects_lone_surrogate_escaped_string_literals() {
+    for source in [
+        "def f():\n    return \"\\udca7\" \"b\"\n",
+        "def f():\n    return f\"\\udca7{x}\"\n",
+    ] {
+        let err = match lower_python_to_blockpy_for_testing(source) {
+            Ok(_) => panic!("lone surrogate string literals should fail explicitly"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("lone surrogate"),
+            "unexpected error: {err}"
+        );
+    }
 
-    assert!(
-        module_constants_contain_string(&normalized.module_constants),
-        "expected surrogate-escaped string to remain in module constants"
-    );
+    for source in [
+        "def f():\n    return r\"\\udca7\" \"b\"\n",
+        "def f(x):\n    return rf\"\\udca7{x}\"\n",
+    ] {
+        lower_python_to_blockpy_for_testing(source)
+            .expect("raw string literals should preserve backslash-u text");
+    }
 }

@@ -35,6 +35,10 @@ pub(crate) struct AstToAstPassResult {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct LoweringOptions {
+    /// If `true`, compile `soac.runtime` bootstrap references as ordinary
+    /// globals instead of `RuntimeName` constants. `RuntimeName` constants load
+    /// from `soac.runtime`, so using them while compiling `soac.runtime` itself
+    /// would make module initialization circular.
     pub runtime_names_as_globals: bool,
     pub pre_optimization_cache_path: Option<PathBuf>,
     pub pre_optimization_cache_metadata: Option<CachedCodegenModuleMetadata>,
@@ -61,8 +65,6 @@ fn rewrite_ast_to_ast_module(context: &Context, mut module: Suite) -> AstToAstPa
     // and either drop the annotations (in functions) or generate an
     // __annotate__ function (in modules and classes)
     rewrite_stmt::annotation::rewrite_ann_assign_to_dunder_annotate(context, &mut module);
-
-    string_templates::rewrite_surrogate_escape_string_literals(context, &mut module);
 
     // Lower helper-scoped expressions that synthesize nested defs for Python
     // scoping semantics before the more direct BlockPy expr lowering boundary.
@@ -219,6 +221,8 @@ fn rewrite_pre_optimization_module_from_source(
         pass_tracker.record_timing("parse", || -> std::result::Result<_, ParseError> {
             let mut module = parse_module(source).map(|module| module.into_syntax())?;
             rewrite_future_annotations::rewrite(&mut module.body)?;
+            let context = Context::new(source);
+            string_templates::reject_lone_surrogate_string_literals(&context, &mut module.body)?;
             Ok(module)
         })?;
 
@@ -309,18 +313,15 @@ fn rewrite_pre_optimization_module_from_source(
        - locals are assigned stack slots, and become LoadLocation / StoreLocation / DelLocation with local-slot locations.
 
     */
+    // `soac.runtime` is compiled by the import hook too. While compiling that
+    // module, runtime-name constants cannot be materialized by importing
+    // `soac.runtime`, so the bootstrap mode leaves those loads as globals.
     let name_binding: BlockPyModule<ResolvedStorageModuleShape> =
         pass_tracker.run_pass("name_binding", || {
-            if runtime_names_as_globals {
-                passes::lower_name_binding_in_core_blockpy_module_with_options(
-                    core_blockpy_without_await_or_yield,
-                    true,
-                )
-            } else {
-                passes::lower_name_binding_in_core_blockpy_module(
-                    core_blockpy_without_await_or_yield,
-                )
-            }
+            passes::lower_name_binding_in_core_blockpy_module_with_options(
+                core_blockpy_without_await_or_yield,
+                runtime_names_as_globals,
+            )
         });
 
     let global_index: BlockPyModule<ResolvedStorageModuleShape> = pass_tracker

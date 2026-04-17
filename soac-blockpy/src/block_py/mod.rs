@@ -294,7 +294,6 @@ define_runtime_names! {
     Index => "_index",
     UnsupportedFrameBuiltin => "_unsupported_frame_builtin",
     TupleFromIter => "tuple_from_iter",
-    EvalStringLiteral => "eval_string_literal",
     Deepcopy => "__deepcopy__",
     TypingGeneric => "typing_Generic",
     TypingTypeVar => "typing_TypeVar",

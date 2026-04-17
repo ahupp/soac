@@ -79,6 +79,13 @@ Result: FAILURE
       - special cases that match on specific internal variable names
       - many different sites aware of scoping rules
 
+# Unsupported Source Forms
+
+- SOAC does not support string literals containing lone surrogate escapes such
+  as `"\uD800"`. These are uncommon, cannot be represented as ordinary Rust
+  `str` data after parsing, and should fail explicitly instead of being routed
+  through a runtime `eval()` workaround.
+
 # Environment Variables
 
 This repo consults a number of environment variables directly. The list
