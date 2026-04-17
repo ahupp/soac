@@ -105,6 +105,13 @@ impl InlineCallee {
     pub fn module_constants(&self) -> Option<&[InstrResolved]> {
         self.module_constants.as_deref()
     }
+
+    pub fn with_function(&self, function: BlockPyFunction<CodegenModuleShape>) -> Self {
+        Self {
+            function,
+            module_constants: self.module_constants.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -387,7 +394,7 @@ fn scalar_replace_non_escaping_constructor_allocations_in_function(
 fn inline_simple_direct_call_stores_in_function(
     function: &mut BlockPyFunction<CodegenModuleShape>,
     module_constants: &mut Vec<InstrResolved>,
-    _inline_plan: &InlinePlanModule,
+    inline_plan: &InlinePlanModule,
     callees: &HashMap<RuntimeFunctionId, InlineCallee>,
     stats: &mut InlineRewriteStats,
 ) -> bool {
@@ -404,7 +411,7 @@ fn inline_simple_direct_call_stores_in_function(
             function,
             module_constants,
             block,
-            _inline_plan,
+            inline_plan,
             callees,
             &original_block_by_label,
             stats,
@@ -424,12 +431,14 @@ fn build_direct_store_rewrite(
     caller: &mut BlockPyFunction<CodegenModuleShape>,
     caller_constants: &mut Vec<InstrResolved>,
     block: Block<InstrCodegen>,
-    _inline_plan: &InlinePlanModule,
+    inline_plan: &InlinePlanModule,
     callees: &HashMap<RuntimeFunctionId, InlineCallee>,
     original_block_by_label: &HashMap<BlockLabel, Block<InstrCodegen>>,
     stats: &mut InlineRewriteStats,
 ) -> InlineBlockRewrite {
-    let Some(candidate) = find_inline_store_candidate(&block, caller.function_id, callees) else {
+    let Some(candidate) =
+        find_inline_store_candidate(&block, caller.function_id, inline_plan, callees)
+    else {
         return InlineBlockRewrite::Unchanged(block);
     };
     let callee = callees
@@ -1966,6 +1975,7 @@ struct InlineStoreCandidate {
 fn find_inline_store_candidate(
     block: &Block<InstrCodegen>,
     caller_id: RuntimeFunctionId,
+    inline_plan: &InlinePlanModule,
     callees: &HashMap<RuntimeFunctionId, InlineCallee>,
 ) -> Option<InlineStoreCandidate> {
     block
@@ -1982,7 +1992,10 @@ fn find_inline_store_candidate(
             if call.function_id == caller_id {
                 return None;
             }
-            callees.get(&call.function_id)?;
+            let callee = callees.get(&call.function_id)?;
+            if call_direct_looks_like_constructor_allocation(call, callee.function(), inline_plan) {
+                return None;
+            }
             Some(InlineStoreCandidate {
                 instr_index,
                 callee_id: call.function_id,
@@ -1990,6 +2003,34 @@ fn find_inline_store_candidate(
                 target: store.name.clone(),
             })
         })
+}
+
+fn call_direct_looks_like_constructor_allocation(
+    call: &CallDirect<InstrCodegen>,
+    callee: &BlockPyFunction<CodegenModuleShape>,
+    inline_plan: &InlinePlanModule,
+) -> bool {
+    if callee.names.fn_name != "__init__"
+        || inline_plan
+            .straightline_constructor(call.function_id)
+            .is_none()
+        || !call.keywords.is_empty()
+    {
+        return false;
+    }
+    let mut positional_arg_count = 0usize;
+    for arg in &call.args {
+        match arg {
+            CallArgPositional::Positional(_) => positional_arg_count += 1,
+            CallArgPositional::Starred(_) => return false,
+        }
+    }
+    let accepted_positional_args = callee
+        .params
+        .iter()
+        .filter(|param| matches!(param.kind, ParamKind::PosOnly | ParamKind::Any))
+        .count();
+    positional_arg_count + 1 == accepted_positional_args
 }
 
 pub fn bind_simple_direct_call_inline_args(
@@ -3443,6 +3484,58 @@ def make(obj, x):
             .expect("continuation should be inserted");
         assert!(continuation.body.is_empty());
         assert!(matches!(continuation.term, BlockTerm::Return(_)));
+    }
+
+    #[test]
+    fn leaves_constructor_allocation_direct_calls_for_scalar_replacement() {
+        let mut module = lower_python_to_blockpy_for_testing(
+            r#"
+class Box:
+    def __init__(self, value):
+        self.value = value
+
+def make(x):
+    out = None
+    return out
+"#,
+        )
+        .expect("transform should succeed")
+        .codegen_module;
+        let inline_plan = plan_module_inlining(&summarize_module_escapes(&module));
+        let constructor_id =
+            module.callable_defs[function_index_by_qualname(&module, "Box.__init__")].function_id;
+        let make_index = function_index_by_qualname(&module, "make");
+        let out_target = local_resolved_name(&module.callable_defs[make_index], "out");
+        let x_arg = local_load(&module.callable_defs[make_index], "x");
+        module.callable_defs[make_index].blocks[0]
+            .body
+            .push(InstrCodegen::Store(Store::new(
+                out_target,
+                InstrCodegen::CallDirect(CallDirect::new(
+                    global_load("Box"),
+                    constructor_id,
+                    vec![CallArgPositional::Positional(x_arg)],
+                    Vec::new(),
+                )),
+            )));
+
+        let stats = inline_simple_direct_call_stores(&mut module, &inline_plan);
+
+        assert_eq!(
+            stats,
+            InlineRewriteStats {
+                rewritten_stores: 0,
+                skipped_candidates: 0,
+            }
+        );
+        let make = function_by_qualname(&module, "make");
+        assert!(
+            make.blocks
+                .iter()
+                .flat_map(|block| block.body.iter())
+                .any(|instr| matches!(instr, InstrCodegen::Store(store) if matches!(store.value.as_ref(), InstrCodegen::CallDirect(call) if call.function_id == constructor_id))),
+            "constructor allocation should remain direct for scalar replacement: {make:#?}"
+        );
     }
 
     #[test]

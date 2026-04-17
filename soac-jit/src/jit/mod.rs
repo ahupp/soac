@@ -80,7 +80,9 @@ use soac_blockpy::passes::{
     inline_direct_call_stores_with_callees, lower_codegen_function_to_typed,
     lower_typed_function_call_access_plan_instrs, lower_typed_function_if_tests_to_truthy,
     plan_module_inlining, refresh_typed_function_value_facts,
-    rewrite_profiled_function_call_store_sites, rewrite_static_runtime_constructor_call_stores,
+    rewrite_profiled_function_call_store_sites,
+    rewrite_profiled_function_call_store_sites_with_constructor_targets,
+    rewrite_static_runtime_constructor_call_stores,
     scalar_replace_non_escaping_constructor_allocations,
     straightline_field_initializer_rejection_reason, summarize_module_escapes,
     try_lower_typed_instr_to_codegen_legacy, try_lower_typed_term_to_codegen_legacy,
@@ -1355,6 +1357,60 @@ fn collect_profiled_direct_call_sites(
     collector.out
 }
 
+fn function_by_id(
+    module: &BlockPyModule<CodegenModuleShape>,
+    function_id: RuntimeFunctionId,
+) -> Option<&BlockPyFunction<CodegenModuleShape>> {
+    module
+        .callable_defs
+        .iter()
+        .find(|function| function.function_id == function_id)
+}
+
+fn collect_profiled_direct_call_sites_for_inline_tree(
+    module: &BlockPyModule<CodegenModuleShape>,
+    root_function: &BlockPyFunction<CodegenModuleShape>,
+    profile: &SpecializationProfile<'_>,
+) -> Result<Vec<ProfiledDirectCallSite>, String> {
+    let mut out = Vec::new();
+    let mut pending = VecDeque::from([root_function.function_id]);
+    let mut visited = HashSet::new();
+    while let Some(function_id) = pending.pop_front() {
+        if !visited.insert(function_id) {
+            continue;
+        }
+        let Some(function) = function_by_id(module, function_id) else {
+            continue;
+        };
+        let call_target_specializations = profile.call_target_specializations(function_id)?;
+        if call_target_specializations.is_empty() {
+            continue;
+        }
+        let call_sites =
+            collect_profiled_direct_call_sites(module, function, &call_target_specializations);
+        for call_site in &call_sites {
+            for target_id in call_site.targets.iter().copied() {
+                if function_by_id(module, target_id).is_some() {
+                    pending.push_back(target_id);
+                }
+            }
+        }
+        if function_id == root_function.function_id {
+            out.extend(call_sites);
+        } else {
+            out.extend(
+                call_sites
+                    .into_iter()
+                    .map(|call_site| ProfiledDirectCallSite {
+                        method_name: None,
+                        targets: call_site.targets,
+                    }),
+            );
+        }
+    }
+    Ok(out)
+}
+
 fn predeclare_direct_call_owner_type_imports(
     jit_module: &mut JITModule,
     module: &BlockPyModule<CodegenModuleShape>,
@@ -1367,8 +1423,7 @@ fn predeclare_direct_call_owner_type_imports(
         return Ok(out);
     }
 
-    let call_sites =
-        collect_profiled_direct_call_sites(module, function, &call_target_specializations);
+    let call_sites = collect_profiled_direct_call_sites_for_inline_tree(module, function, profile)?;
     let mut constructor_owner_lookups = 0usize;
     let mut constructor_owner_matches = 0usize;
     let mut method_owner_lookups = 0usize;
@@ -2063,7 +2118,8 @@ fn build_profiled_inline_callee_maps(
             ));
         }
     }
-    for function_id in target_ids {
+    let mut pending_target_ids = target_ids.iter().copied().collect::<VecDeque<_>>();
+    while let Some(function_id) = pending_target_ids.pop_front() {
         if callee_functions.contains_key(&function_id) {
             continue;
         }
@@ -2106,8 +2162,62 @@ fn build_profiled_inline_callee_maps(
                 shared_state.lowered_module.module_constants.clone(),
             ),
         );
+        let call_target_specializations = profile.call_target_specializations(function_id)?;
+        for targets in call_target_specializations.values() {
+            for target_id in targets {
+                if target_ids.insert(*target_id) {
+                    pending_target_ids.push_back(*target_id);
+                }
+            }
+        }
     }
+    specialize_profiled_inline_callees(profile, &mut callee_functions, &mut inline_callees)?;
     Ok((callee_functions, inline_callees, external_inline_plan))
+}
+
+fn specialize_profiled_inline_callees(
+    profile: &SpecializationProfile<'_>,
+    callee_functions: &mut HashMap<RuntimeFunctionId, BlockPyFunction<CodegenModuleShape>>,
+    inline_callees: &mut HashMap<RuntimeFunctionId, InlineCallee>,
+) -> Result<(), String> {
+    let function_ids = inline_callees.keys().copied().collect::<Vec<_>>();
+    for function_id in function_ids {
+        let call_target_specializations = profile.call_target_specializations(function_id)?;
+        if call_target_specializations.is_empty() {
+            continue;
+        }
+        let Some(inline_callee) = inline_callees.get(&function_id).cloned() else {
+            continue;
+        };
+        let mut function = inline_callee.function().clone();
+        let stats = rewrite_profiled_function_call_store_sites_with_constructor_targets(
+            &mut function,
+            &call_target_specializations,
+            callee_functions,
+            true,
+        );
+        if stats.rewritten_stores == 0 {
+            continue;
+        }
+        info!(
+            target: "soac_jit_profiled_inline_callee_specialization",
+            function_id = %function.function_id,
+            qualname = %function.names.qualname,
+            rewritten_stores = stats.rewritten_stores,
+            skipped_empty_targets = stats.skipped_empty_targets,
+            skipped_incompatible_targets = stats.skipped_incompatible_targets,
+            skipped_missing_callee_targets = stats.skipped_missing_callee_targets,
+            skipped_arity_mismatch_targets = stats.skipped_arity_mismatch_targets,
+            skipped_unsupported_init_targets = stats.skipped_unsupported_init_targets,
+            skipped_missing_storage_layout_targets = stats.skipped_missing_storage_layout_targets,
+            skipped_unsupported_param_kind_targets = stats.skipped_unsupported_param_kind_targets,
+            skipped_missing_param_storage_targets = stats.skipped_missing_param_storage_targets,
+            "soac_jit_profiled_inline_callee_specialization"
+        );
+        callee_functions.insert(function_id, function.clone());
+        inline_callees.insert(function_id, inline_callee.with_function(function));
+    }
+    Ok(())
 }
 
 fn straightline_constructor_ids_in_plan(
@@ -15498,9 +15608,25 @@ fn emit_call_direct_expr_with_local_env(
     if target_function.names.fn_name == "__init__"
         && !call_direct_callable_is_explicit_init_attr(call, ctx)
     {
+        let fallback = fallback_call();
+        let InstrCodegen::Call(fallback_call) = &fallback else {
+            unreachable!("CallDirect fallback should be a generic Call");
+        };
+        let profiled_targets = [call.function_id];
+        if let Some(value) = emit_codegen_simple_call_with_local_env(
+            fb,
+            fallback_call,
+            local_env,
+            ctx,
+            Some(&profiled_targets),
+            None,
+            codegen_env,
+            func_imports,
+        ) {
+            return value;
+        }
         ctx.direct_edge_stats
             .record_call_direct_unsupported_shape_fallback();
-        let fallback = fallback_call();
         return emit_codegen_expr_with_local_env(
             fb,
             &fallback,

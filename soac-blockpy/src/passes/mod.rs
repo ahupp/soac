@@ -3077,7 +3077,9 @@ impl ModuleShape for CodegenUnidentifiedModuleShape {
 pub(crate) use blockpy_generators::lower_yield_in_lowered_core_blockpy_module_bundle;
 pub use blockpy_to_bb::{lower_try_jump_exception_flow, normalize_bb_module_strings};
 pub use direct_call_transform::{
-    rewrite_profiled_function_call_store_sites, DirectCallStoreRewriteStats,
+    rewrite_profiled_function_call_store_sites,
+    rewrite_profiled_function_call_store_sites_with_constructor_targets,
+    DirectCallStoreRewriteStats,
 };
 pub use escape_analysis::{
     straightline_field_initializer_rejection_reason, summarize_module_escapes,

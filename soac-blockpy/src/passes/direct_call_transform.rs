@@ -25,10 +25,16 @@ pub struct DirectCallStoreRewriteStats {
 }
 
 struct StoreCallCandidate {
-    instr_index: usize,
-    target: ResolvedName,
+    site: CallCandidateSite,
     call: Call<InstrCodegen>,
     targets: Vec<RuntimeFunctionId>,
+}
+
+enum CallCandidateSite {
+    Store {
+        instr_index: usize,
+        target: ResolvedName,
+    },
 }
 
 enum StoreCallRewrite {
@@ -41,6 +47,20 @@ pub fn rewrite_profiled_function_call_store_sites(
     targets_by_instr_id: &HashMap<InstrId, Vec<RuntimeFunctionId>>,
     callees: &HashMap<RuntimeFunctionId, BlockPyFunction<CodegenModuleShape>>,
 ) -> DirectCallStoreRewriteStats {
+    rewrite_profiled_function_call_store_sites_with_constructor_targets(
+        function,
+        targets_by_instr_id,
+        callees,
+        false,
+    )
+}
+
+pub fn rewrite_profiled_function_call_store_sites_with_constructor_targets(
+    function: &mut BlockPyFunction<CodegenModuleShape>,
+    targets_by_instr_id: &HashMap<InstrId, Vec<RuntimeFunctionId>>,
+    callees: &HashMap<RuntimeFunctionId, BlockPyFunction<CodegenModuleShape>>,
+    allow_constructor_targets: bool,
+) -> DirectCallStoreRewriteStats {
     let mut stats = DirectCallStoreRewriteStats::default();
     let original_blocks = std::mem::take(&mut function.blocks);
     let mut rewritten_blocks = Vec::with_capacity(original_blocks.len());
@@ -50,6 +70,7 @@ pub fn rewrite_profiled_function_call_store_sites(
             block,
             targets_by_instr_id,
             callees,
+            allow_constructor_targets,
             &mut stats,
         ) {
             StoreCallRewrite::Rewritten(blocks) => {
@@ -71,6 +92,7 @@ fn rewrite_profiled_function_call_store_block(
     block: Block<InstrCodegen>,
     targets_by_instr_id: &HashMap<InstrId, Vec<RuntimeFunctionId>>,
     callees: &HashMap<RuntimeFunctionId, BlockPyFunction<CodegenModuleShape>>,
+    allow_constructor_targets: bool,
     stats: &mut DirectCallStoreRewriteStats,
 ) -> StoreCallRewrite {
     let Some(candidate) = find_store_call_candidate(&block, targets_by_instr_id) else {
@@ -90,6 +112,7 @@ fn rewrite_profiled_function_call_store_block(
         positional_arg_exprs.len(),
         candidate.targets,
         callees,
+        allow_constructor_targets,
         stats,
     );
     if candidate_targets.is_empty() {
@@ -115,9 +138,14 @@ fn rewrite_profiled_function_call_store_block(
         .map(|_| function.name_gen.next_block_name())
         .collect::<Vec<_>>();
 
-    let mut before = block.body;
-    let after = before.split_off(candidate.instr_index + 1);
-    before.truncate(candidate.instr_index);
+    let (mut before, after) = match &candidate.site {
+        CallCandidateSite::Store { instr_index, .. } => {
+            let mut before = block.body;
+            let after = before.split_off(*instr_index + 1);
+            before.truncate(*instr_index);
+            (before, Some((after, block.term)))
+        }
+    };
     before.push(
         Store::new(temp_name.clone(), *candidate.call.func)
             .with_meta(Meta::synthetic())
@@ -171,73 +199,87 @@ fn rewrite_profiled_function_call_store_block(
     }
 
     for (function_id, hot_label) in candidate_targets.iter().copied().zip(hot_labels) {
+        let result_value = InstrCodegen::CallDirect(
+            CallDirect::new(
+                load_temp(&temp_name),
+                function_id,
+                load_temp_args(&arg_temp_names),
+                Vec::new(),
+            )
+            .with_meta(Meta::synthetic()),
+        );
+        let (body, term) = direct_call_result_block_body_and_term(
+            &candidate.site,
+            result_value,
+            &arg_temp_names,
+            &temp_name,
+            continuation_label,
+        );
         blocks.push(Block::new(
             hot_label,
-            vec![Store::new(
-                candidate.target.clone(),
-                InstrCodegen::CallDirect(
-                    CallDirect::new(
-                        load_temp(&temp_name),
-                        function_id,
-                        load_temp_args(&arg_temp_names),
-                        Vec::new(),
-                    )
-                    .with_meta(Meta::synthetic()),
-                ),
-            )
-            .with_meta(Meta::synthetic())
-            .into()],
-            BlockTerm::Jump(BlockEdge::new(continuation_label)),
+            body,
+            term,
             Vec::new(),
             exc_edge.clone(),
         ));
-        append_cleanup_dels(
-            blocks.last_mut().expect("hot block should exist"),
-            &arg_temp_names,
-        );
-        append_cleanup_del(
-            blocks.last_mut().expect("hot block should exist"),
-            &temp_name,
-        );
     }
 
+    let result_value = InstrCodegen::Call(
+        Call::new(
+            load_temp(&temp_name),
+            load_temp_args(&arg_temp_names),
+            Vec::new(),
+        )
+        .with_meta(Meta::synthetic()),
+    );
+    let (body, term) = direct_call_result_block_body_and_term(
+        &candidate.site,
+        result_value,
+        &arg_temp_names,
+        &temp_name,
+        continuation_label,
+    );
     blocks.push(Block::new(
         generic_label,
-        vec![Store::new(
-            candidate.target,
-            InstrCodegen::Call(
-                Call::new(
-                    load_temp(&temp_name),
-                    load_temp_args(&arg_temp_names),
-                    Vec::new(),
-                )
-                .with_meta(Meta::synthetic()),
-            ),
-        )
-        .with_meta(Meta::synthetic())
-        .into()],
-        BlockTerm::Jump(BlockEdge::new(continuation_label)),
+        body,
+        term,
         Vec::new(),
         exc_edge.clone(),
     ));
-    append_cleanup_dels(
-        blocks.last_mut().expect("generic block should exist"),
-        &arg_temp_names,
-    );
-    append_cleanup_del(
-        blocks.last_mut().expect("generic block should exist"),
-        &temp_name,
-    );
 
-    blocks.push(Block::new(
-        continuation_label,
-        after,
-        block.term,
-        Vec::new(),
-        exc_edge,
-    ));
+    if let Some((after, term)) = after {
+        blocks.push(Block::new(
+            continuation_label,
+            after,
+            term,
+            Vec::new(),
+            exc_edge,
+        ));
+    }
 
     StoreCallRewrite::Rewritten(blocks)
+}
+
+fn direct_call_result_block_body_and_term(
+    site: &CallCandidateSite,
+    result_value: InstrCodegen,
+    arg_temp_names: &[ResolvedName],
+    callable_temp_name: &ResolvedName,
+    continuation_label: BlockLabel,
+) -> (Vec<InstrCodegen>, BlockTerm<InstrCodegen>) {
+    let mut body = Vec::new();
+    match site {
+        CallCandidateSite::Store { target, .. } => {
+            body.push(
+                Store::new(target.clone(), result_value)
+                    .with_meta(Meta::synthetic())
+                    .into(),
+            );
+            append_cleanup_dels_to_body(&mut body, arg_temp_names);
+            append_cleanup_del_to_body(&mut body, callable_temp_name);
+            (body, BlockTerm::Jump(BlockEdge::new(continuation_label)))
+        }
+    }
 }
 
 fn find_store_call_candidate(
@@ -258,8 +300,10 @@ fn find_store_call_candidate(
             let instr_id = call.try_semantic_instr_id()?;
             let targets = dedup_targets(targets_by_instr_id.get(&instr_id)?);
             Some(StoreCallCandidate {
-                instr_index,
-                target: store.name.clone(),
+                site: CallCandidateSite::Store {
+                    instr_index,
+                    target: store.name.clone(),
+                },
                 call: call.clone(),
                 targets,
             })
@@ -279,6 +323,7 @@ fn compatible_inline_targets(
     positional_arg_count: usize,
     targets: Vec<RuntimeFunctionId>,
     callees: &HashMap<RuntimeFunctionId, BlockPyFunction<CodegenModuleShape>>,
+    allow_constructor_targets: bool,
     stats: &mut DirectCallStoreRewriteStats,
 ) -> Vec<RuntimeFunctionId> {
     targets
@@ -289,9 +334,11 @@ fn compatible_inline_targets(
                 stats.skipped_missing_callee_targets += 1;
                 return false;
             };
-            if let Some(reason) =
-                simple_positional_inline_incompatibility(callee, positional_arg_count)
-            {
+            if let Some(reason) = simple_positional_inline_incompatibility(
+                callee,
+                positional_arg_count,
+                allow_constructor_targets,
+            ) {
                 stats.skipped_incompatible_targets += 1;
                 match reason {
                     SimplePositionalInlineIncompatibility::ArityMismatch => {
@@ -329,26 +376,29 @@ enum SimplePositionalInlineIncompatibility {
 fn simple_positional_inline_incompatibility(
     callee: &BlockPyFunction<CodegenModuleShape>,
     positional_arg_count: usize,
+    allow_constructor_targets: bool,
 ) -> Option<SimplePositionalInlineIncompatibility> {
-    if callee.names.fn_name == "__init__" {
+    if callee.names.fn_name == "__init__" && !allow_constructor_targets {
         return Some(SimplePositionalInlineIncompatibility::UnsupportedInitTarget);
     }
     let Some(storage_layout) = &callee.storage_layout else {
         return Some(SimplePositionalInlineIncompatibility::MissingStorageLayout);
     };
+    let required_positional_args =
+        positional_arg_count + usize::from(callee.names.fn_name == "__init__");
     let accepted_positional_args = callee
         .params
         .iter()
         .filter(|param| matches!(param.kind, ParamKind::PosOnly | ParamKind::Any))
         .count();
-    if positional_arg_count > accepted_positional_args {
+    if required_positional_args > accepted_positional_args {
         return Some(SimplePositionalInlineIncompatibility::ArityMismatch);
     }
     let mut consumed_positional_args = 0usize;
     for param in callee.params.iter() {
         match param.kind {
             ParamKind::PosOnly | ParamKind::Any => {
-                if consumed_positional_args < positional_arg_count {
+                if consumed_positional_args < required_positional_args {
                     consumed_positional_args += 1;
                 } else if !param.has_default {
                     return Some(SimplePositionalInlineIncompatibility::ArityMismatch);
@@ -410,14 +460,14 @@ fn load_temp_args(temp_names: &[ResolvedName]) -> Vec<CallArgPositional<InstrCod
         .collect()
 }
 
-fn append_cleanup_dels(block: &mut Block<InstrCodegen>, temp_names: &[ResolvedName]) {
+fn append_cleanup_dels_to_body(body: &mut Vec<InstrCodegen>, temp_names: &[ResolvedName]) {
     for temp_name in temp_names.iter().rev() {
-        append_cleanup_del(block, temp_name);
+        append_cleanup_del_to_body(body, temp_name);
     }
 }
 
-fn append_cleanup_del(block: &mut Block<InstrCodegen>, temp_name: &ResolvedName) {
-    block.body.push(
+fn append_cleanup_del_to_body(body: &mut Vec<InstrCodegen>, temp_name: &ResolvedName) {
+    body.push(
         Del::new(temp_name.clone(), false)
             .with_meta(Meta::synthetic())
             .into(),
@@ -614,7 +664,80 @@ def caller(cls, x):\n    y = cls(x)\n    return y\n",
                 .iter()
                 .flat_map(|block| &block.body)
                 .any(|instr| matches!(instr, InstrCodegen::Store(store) if matches!(store.value.as_ref(), InstrCodegen::Call(_)))),
-            "ordinary direct-call rewrite must not treat class-call args as __init__ args"
+            "ordinary direct-call rewrite should leave constructor calls for typed specialization"
+        );
+        validate_codegen_instr_ids(&module).expect("unchanged module should still validate");
+    }
+
+    #[test]
+    fn optionally_rewrites_constructor_targets_for_inline_fragments() {
+        let mut module = lowered_module(
+            "class Box:\n    def __init__(self, value):\n        self.value = value\n\n\
+def caller(cls, x):\n    y = cls(x)\n    return y\n",
+        );
+        let init_id =
+            module.callable_defs[function_index_by_qualname(&module, "Box.__init__")].function_id;
+        let caller_index = function_index_by_qualname(&module, "caller");
+        let mut collector = CallInstrCollector::default();
+        collector.visit_fn(&module.callable_defs[caller_index]);
+        let call_instr_id = collector
+            .calls
+            .first()
+            .copied()
+            .expect("caller should have a generic constructor call");
+
+        let callees = callee_map(&module);
+        let stats = rewrite_profiled_function_call_store_sites_with_constructor_targets(
+            &mut module.callable_defs[caller_index],
+            &HashMap::from([(call_instr_id, vec![init_id])]),
+            &callees,
+            true,
+        );
+
+        assert_eq!(stats.rewritten_stores, 1);
+        assert_eq!(stats.skipped_unsupported_init_targets, 0);
+        assert!(
+            module.callable_defs[caller_index]
+                .blocks
+                .iter()
+                .flat_map(|block| &block.body)
+                .any(|instr| matches!(instr, InstrCodegen::Store(store) if matches!(store.value.as_ref(), InstrCodegen::CallDirect(call) if call.function_id == init_id))),
+            "hot arm should leave constructor calls as CallDirect(__init__) for constructor specialization"
+        );
+        validate_codegen_instr_ids(&module).expect("rewrite should leave unique instruction ids");
+    }
+
+    #[test]
+    fn leaves_return_constructor_targets_for_constructor_specialization() {
+        let mut module = lowered_module(
+            "class Record:\n    def __init__(self, PtrComp=None, Discr=0, EnumComp=0, IntComp=0, StringComp=0):\n        self.PtrComp = PtrComp\n        self.Discr = Discr\n        self.EnumComp = EnumComp\n        self.IntComp = IntComp\n        self.StringComp = StringComp\n    def copy(self):\n        return Record(self.PtrComp, self.Discr, self.EnumComp, self.IntComp, self.StringComp)\n",
+        );
+        let init_id = module.callable_defs[function_index_by_qualname(&module, "Record.__init__")]
+            .function_id;
+        let copy_index = function_index_by_qualname(&module, "Record.copy");
+        let mut collector = CallInstrCollector::default();
+        collector.visit_fn(&module.callable_defs[copy_index]);
+        let call_instr_id = collector
+            .calls
+            .first()
+            .copied()
+            .expect("copy should have a generic constructor return call");
+
+        let callees = callee_map(&module);
+        let stats = rewrite_profiled_function_call_store_sites_with_constructor_targets(
+            &mut module.callable_defs[copy_index],
+            &HashMap::from([(call_instr_id, vec![init_id])]),
+            &callees,
+            true,
+        );
+
+        assert_eq!(stats.rewritten_stores, 0);
+        assert!(
+            module.callable_defs[copy_index]
+                .blocks
+                .iter()
+                .any(|block| matches!(block.term, BlockTerm::Return(InstrCodegen::Call(_)))),
+            "return-call sites should stay generic until allocation materialization across inline continuations is handled"
         );
         validate_codegen_instr_ids(&module).expect("unchanged module should still validate");
     }
