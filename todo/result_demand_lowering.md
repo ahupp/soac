@@ -173,7 +173,9 @@ actually materialized as owned temporaries.
 Side-effect operations that return `None` by helper convention now carry
 `None` singleton facts, giving planned-result consumers a structured way to
 recognize their immortal result instead of special-casing helper names in
-codegen.
+codegen. The generic statement-result discard boundary now consumes those facts
+for legacy-shaped producers too, so effect-only side-effect statements can skip
+discard `DECREF`s when the produced value is known immortal.
 Return values, local store RHS expressions, raise exception expressions,
 generic/direct call inputs, and operator/intrinsic inputs are annotated before
 JIT codegen and consumed directly from the typed instruction.

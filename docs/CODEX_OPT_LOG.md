@@ -5,6 +5,27 @@ optimization attempts made by Codex agents. Keep entries succinct: what
 changed or was tried, which jj change id carried it when landed, the
 benchmarked throughput delta, and the headline pre/post numbers.
 
+## 2026-04-17 - Use side-effect result facts for statement discards
+
+- jj change id: `nlmuuwvl`
+- summary: Effect-only statement result discard now consumes codegen result
+  facts, so legacy-shaped side-effect producers that are known to return
+  immortal `None` skip unnecessary discard refcount code.
+- throughput: `+0.69%` median
+- pre-change benchmark:
+  - apply, refcounts enabled, 1M loops x3: `186721`, `253477`,
+    `255209 loops/s`
+  - apply, refcounts disabled, 1M loops x3: `333205`, `327666`,
+    `304328 loops/s`
+  - total pystone code size: `400294 bytes`
+- post-change benchmark:
+  - apply, refcounts enabled, 1M loops x3: `255234`, `257154`,
+    `253164 loops/s`
+  - apply, refcounts disabled, 1M loops x3: `344973`, `342741`,
+    `328802 loops/s`
+  - total pystone code size: `396565 bytes`
+- refcount counters: unchanged in a 100k-loop verify run
+
 ## 2026-04-17 - Preserve typed direct-call and module-constant ownership
 
 - jj change id: `vwopwllm`

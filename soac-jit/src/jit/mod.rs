@@ -10309,8 +10309,10 @@ fn emit_checked_owned_pyobject_result_for_demand(
                 &[],
             );
             fb.switch_to_block(value_ok_block);
-            fb.ins()
-                .call(ctx.decref_ref, &[ctx.consts.thread_state_value, value]);
+            if !facts.is_immortal() {
+                fb.ins()
+                    .call(ctx.decref_ref, &[ctx.consts.thread_state_value, value]);
+            }
             EmitResult::no_value()
         }
         ResultDemand::PyObject { .. } => {
@@ -19465,12 +19467,10 @@ fn emit_codegen_stmt_result_with_local_env(
     }
     let value =
         emit_codegen_stmt_with_local_env(fb, expr, local_env, emit_ctx, codegen_env, func_imports);
+    let facts = py_facts_for_codegen_expr_with_local_env(expr, local_env, emit_ctx)
+        .unwrap_or_else(PyObjFacts::unknown);
     Ok(emit_owned_pyobject_result_for_demand(
-        fb,
-        value,
-        PyObjFacts::unknown(),
-        emit_ctx,
-        demand,
+        fb, value, facts, emit_ctx, demand,
     ))
 }
 
