@@ -27,8 +27,8 @@ use crate::function_instantiation::{
 use crate::module_constants::{ModuleCodegenConstants, ModuleConstantId};
 use crate::module_type::{CounterRuntimeSlot, SharedModuleState, build_counter_storage_layout};
 use crate::optimization_plan::{
-    FunctionProfileEvidence, OptimizationPlan, PlannedIndexedFieldSpecialization,
-    load_optimization_plan,
+    FunctionProfileEvidence, OptimizationPlan, PlannedFunctionTarget,
+    PlannedIndexedFieldSpecialization, load_optimization_plan,
 };
 use cranelift_codegen::cfg_printer::CFGPrinter;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
@@ -12462,7 +12462,9 @@ fn planned_evidence_for_shared_state(
                 )
             })?;
         let mut evidence = plan
-            .evidence_for_function(planned_function.function_id)
+            .evidence_for_function(planned_function.function_id, |target| {
+                Ok(resolve_planned_function_target(shared_state, target))
+            })
             .map_err(|err| err.to_string())?;
         remap_same_module_call_targets(
             &mut evidence,
@@ -12473,6 +12475,23 @@ fn planned_evidence_for_shared_state(
         evidence_by_function.insert(current_function.function_id, evidence);
     }
     Ok(evidence_by_function)
+}
+
+fn resolve_planned_function_target(
+    shared_state: &SharedModuleState,
+    target: &PlannedFunctionTarget,
+) -> Option<FunctionId> {
+    if target.module_name != shared_state.module_name
+        || target.source_hash != shared_state.source_hash
+    {
+        return None;
+    }
+    shared_state
+        .lowered_module
+        .callable_defs
+        .iter()
+        .find(|function| function.names.qualname == target.qualname)
+        .map(|function| function.function_id)
 }
 
 fn remap_same_module_call_targets(

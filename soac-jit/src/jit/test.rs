@@ -23,7 +23,8 @@ mod tests {
     use crate::jit::direct_abi::RuntimePrimitiveId;
     use crate::optimization_plan::{
         FunctionOptimizationPlan, OptimizationDecision, OptimizationPlan, PlannedAction,
-        PlannedAlternative, PlannedFallback, PlannedGuard, PlannedReplacement, ShapeFamily,
+        PlannedAlternative, PlannedFallback, PlannedFunctionTarget, PlannedGuard,
+        PlannedReplacement, ShapeFamily,
     };
     use cranelift_codegen::cursor::Cursor;
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyModule, PyModuleMethods, PyTuple};
@@ -16205,10 +16206,13 @@ def f(x, y):
                 crate::module_type::build_shared_state_for_testing(py, module, module_name, "")
                     .expect("shared state should build");
             let planned_module_id = 42;
-            let planned_callee_function_id =
-                FunctionId::new(planned_module_id, callee_function_id.function_id());
             let planned_caller_function_id =
                 FunctionId::new(planned_module_id, caller_function_id.function_id());
+            let planned_callee_target = PlannedFunctionTarget {
+                module_name: module_name.to_string(),
+                source_hash: shared_state.source_hash,
+                qualname: "callee".to_string(),
+            };
             let cache_identity = pre_optimization_module_cache_identity(
                 env!("SOAC_BUILD_IDENTITY"),
                 shared_state.module_name == "soac.runtime",
@@ -16226,11 +16230,11 @@ def f(x, y):
                             instr_id,
                             replacement: PlannedReplacement::Guarded {
                                 alternatives: vec![PlannedAlternative {
-                                    guards: vec![PlannedGuard::FunctionId {
-                                        function_id: planned_callee_function_id,
+                                    guards: vec![PlannedGuard::FunctionTarget {
+                                        target: planned_callee_target.clone(),
                                     }],
                                     action: PlannedAction::DirectCall {
-                                        function_id: planned_callee_function_id,
+                                        target: planned_callee_target.clone(),
                                     },
                                 }],
                                 fallback: PlannedFallback::OriginalInstruction,

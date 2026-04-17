@@ -24,6 +24,7 @@ pub struct FunctionProfileEvidence {
 pub struct ProfileEvidenceStore {
     functions: HashMap<(String, FunctionId), FunctionProfileEvidence>,
     module_source_hashes: HashMap<String, u64>,
+    function_targets: HashMap<FunctionId, PlannedFunctionTarget>,
     field_index_specializations_by_attr: HashMap<String, Vec<PlannedIndexedFieldSpecialization>>,
 }
 
@@ -68,8 +69,8 @@ pub struct PlannedAlternative {
 
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum PlannedGuard {
-    FunctionId {
-        function_id: FunctionId,
+    FunctionTarget {
+        target: PlannedFunctionTarget,
     },
     ObservedShape {
         family: ShapeFamily,
@@ -83,7 +84,7 @@ pub enum PlannedGuard {
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum PlannedAction {
     DirectCall {
-        function_id: FunctionId,
+        target: PlannedFunctionTarget,
     },
     SpecializedShape {
         family: ShapeFamily,
@@ -92,6 +93,15 @@ pub enum PlannedAction {
     IndexedField {
         specialization: PlannedIndexedFieldSpecialization,
     },
+}
+
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+pub struct PlannedFunctionTarget {
+    pub module_name: String,
+    pub source_hash: u64,
+    pub qualname: String,
 }
 
 #[derive(
@@ -155,6 +165,26 @@ impl ProfileEvidenceStore {
                 let Some(function_id) = row.function_id else {
                     continue;
                 };
+                if let Some(function_qualname) = row.function_qualname.as_ref() {
+                    store
+                        .function_targets
+                        .entry(function_id)
+                        .or_insert_with(|| PlannedFunctionTarget {
+                            module_name: module_name.clone(),
+                            source_hash: record.source_hash(),
+                            qualname: function_qualname.to_string(),
+                        });
+                    if let Some(current_function_id) = row.current_function_id {
+                        store
+                            .function_targets
+                            .entry(current_function_id)
+                            .or_insert_with(|| PlannedFunctionTarget {
+                                module_name: module_name.clone(),
+                                source_hash: record.source_hash(),
+                                qualname: function_qualname.to_string(),
+                            });
+                    }
+                }
                 let Some(instr_id) = row.instr_id else {
                     continue;
                 };
@@ -272,6 +302,10 @@ impl ProfileEvidenceStore {
         self.module_source_hashes.get(module_name).copied()
     }
 
+    pub fn function_target(&self, function_id: FunctionId) -> Option<&PlannedFunctionTarget> {
+        self.function_targets.get(&function_id)
+    }
+
     pub fn field_index_specializations_for_attr(
         &self,
         attr_name: &str,
@@ -288,13 +322,33 @@ impl OptimizationPlan {
         module: &BlockPyModule<CodegenModuleShape>,
         evidence_store: &ProfileEvidenceStore,
     ) -> Self {
+        let local_function_targets = module
+            .callable_defs
+            .iter()
+            .map(|function| {
+                (
+                    function.function_id,
+                    PlannedFunctionTarget {
+                        module_name: metadata.module_name.clone(),
+                        source_hash: metadata.source_hash,
+                        qualname: function.names.qualname.clone(),
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
         let mut functions = module
             .callable_defs
             .iter()
             .filter_map(|function| {
                 let evidence = evidence_store
                     .for_function(metadata.module_name.as_str(), function.function_id);
-                let decisions = decisions_for_function(module, function, evidence_store, &evidence);
+                let decisions = decisions_for_function(
+                    module,
+                    function,
+                    evidence_store,
+                    &local_function_targets,
+                    &evidence,
+                );
                 (!decisions.is_empty()).then(|| FunctionOptimizationPlan {
                     function_id: function.function_id,
                     qualname: function.names.qualname.clone(),
@@ -352,6 +406,7 @@ impl OptimizationPlan {
     pub fn evidence_for_function(
         &self,
         function_id: FunctionId,
+        call_target_resolver: impl Fn(&PlannedFunctionTarget) -> Result<Option<FunctionId>>,
     ) -> Result<FunctionProfileEvidence> {
         let Some(function) = self
             .functions
@@ -362,17 +417,20 @@ impl OptimizationPlan {
         };
         let mut evidence = FunctionProfileEvidence::default();
         for decision in &function.decisions {
-            apply_decision_to_evidence(decision, &mut evidence)?;
+            apply_decision_to_evidence(decision, &mut evidence, &call_target_resolver)?;
         }
         Ok(evidence)
     }
 
-    pub fn evidence_by_function(&self) -> Result<HashMap<FunctionId, FunctionProfileEvidence>> {
+    pub fn evidence_by_function(
+        &self,
+        call_target_resolver: impl Fn(&PlannedFunctionTarget) -> Result<Option<FunctionId>>,
+    ) -> Result<HashMap<FunctionId, FunctionProfileEvidence>> {
         let mut out = HashMap::new();
         for function in &self.functions {
             let mut evidence = FunctionProfileEvidence::default();
             for decision in &function.decisions {
-                apply_decision_to_evidence(decision, &mut evidence)?;
+                apply_decision_to_evidence(decision, &mut evidence, &call_target_resolver)?;
             }
             out.insert(function.function_id, evidence);
         }
@@ -390,6 +448,7 @@ pub fn load_optimization_plan(path: &Path) -> Result<OptimizationPlan> {
 fn apply_decision_to_evidence(
     decision: &OptimizationDecision,
     evidence: &mut FunctionProfileEvidence,
+    call_target_resolver: &impl Fn(&PlannedFunctionTarget) -> Result<Option<FunctionId>>,
 ) -> Result<()> {
     match &decision.replacement {
         PlannedReplacement::Guarded {
@@ -397,7 +456,12 @@ fn apply_decision_to_evidence(
             fallback: PlannedFallback::OriginalInstruction,
         } => {
             for alternative in alternatives {
-                apply_alternative_to_evidence(decision.instr_id, alternative, evidence)?;
+                apply_alternative_to_evidence(
+                    decision.instr_id,
+                    alternative,
+                    evidence,
+                    call_target_resolver,
+                )?;
             }
         }
         PlannedReplacement::BranchPreference { prefer_true } => {
@@ -413,36 +477,39 @@ fn apply_alternative_to_evidence(
     instr_id: InstrId,
     alternative: &PlannedAlternative,
     evidence: &mut FunctionProfileEvidence,
+    call_target_resolver: &impl Fn(&PlannedFunctionTarget) -> Result<Option<FunctionId>>,
 ) -> Result<()> {
-    match alternative.action {
-        PlannedAction::DirectCall { function_id } => {
+    match &alternative.action {
+        PlannedAction::DirectCall { target } => {
             validate_alternative_guard(
                 alternative,
-                |guard| matches!(guard, PlannedGuard::FunctionId { function_id: guarded } if *guarded == function_id),
+                |guard| matches!(guard, PlannedGuard::FunctionTarget { target: guarded } if guarded == target),
                 "direct-call alternative",
             )?;
-            push_unique(
-                evidence
-                    .call_target_specializations
-                    .entry(instr_id)
-                    .or_default(),
-                function_id,
-            );
+            if let Some(function_id) = call_target_resolver(target)? {
+                push_unique(
+                    evidence
+                        .call_target_specializations
+                        .entry(instr_id)
+                        .or_default(),
+                    function_id,
+                );
+            }
         }
         PlannedAction::SpecializedShape { family, shape } => {
             validate_alternative_guard(
                 alternative,
-                |guard| matches!(guard, PlannedGuard::ObservedShape { family: guarded_family, shape: guarded_shape } if *guarded_family == family && *guarded_shape == shape),
+                |guard| matches!(guard, PlannedGuard::ObservedShape { family: guarded_family, shape: guarded_shape } if guarded_family == family && guarded_shape == shape),
                 "shape-specialization alternative",
             )?;
             push_unique(
-                shape_map_for_family(evidence, family)
+                shape_map_for_family(evidence, *family)
                     .entry(instr_id)
                     .or_default(),
-                shape,
+                *shape,
             );
         }
-        PlannedAction::IndexedField { ref specialization } => {
+        PlannedAction::IndexedField { specialization } => {
             validate_alternative_guard(
                 alternative,
                 |guard| matches!(guard, PlannedGuard::IndexedField { specialization: guarded } if guarded == specialization),
@@ -483,9 +550,16 @@ fn shape_map_for_family(
     }
 }
 
-fn decisions_from_evidence(evidence: &FunctionProfileEvidence) -> Vec<OptimizationDecision> {
+fn decisions_from_evidence(
+    evidence: &FunctionProfileEvidence,
+    function_target_resolver: impl Fn(FunctionId) -> Option<PlannedFunctionTarget>,
+) -> Vec<OptimizationDecision> {
     let mut decisions = Vec::new();
-    extend_call_target_decisions(&mut decisions, &evidence.call_target_specializations);
+    extend_call_target_decisions(
+        &mut decisions,
+        &evidence.call_target_specializations,
+        &function_target_resolver,
+    );
     extend_instr_u64_decisions(
         &mut decisions,
         &evidence.operator_specializations,
@@ -522,23 +596,29 @@ fn decisions_from_evidence(evidence: &FunctionProfileEvidence) -> Vec<Optimizati
 fn extend_call_target_decisions(
     decisions: &mut Vec<OptimizationDecision>,
     values_by_instr: &HashMap<InstrId, Vec<FunctionId>>,
+    function_target_resolver: &impl Fn(FunctionId) -> Option<PlannedFunctionTarget>,
 ) {
     let mut entries = values_by_instr.iter().collect::<Vec<_>>();
     entries.sort_by_key(|(instr_id, _values)| **instr_id);
     for (instr_id, values) in entries {
         let mut values = values.clone();
         values.sort();
+        let alternatives = values
+            .into_iter()
+            .filter_map(function_target_resolver)
+            .map(|target| PlannedAlternative {
+                guards: vec![PlannedGuard::FunctionTarget {
+                    target: target.clone(),
+                }],
+                action: PlannedAction::DirectCall { target },
+            })
+            .collect::<Vec<_>>();
+        if alternatives.is_empty() {
+            continue;
+        }
         decisions.push(OptimizationDecision {
             instr_id: *instr_id,
-            replacement: guarded_replacement(
-                values
-                    .into_iter()
-                    .map(|function_id| PlannedAlternative {
-                        guards: vec![PlannedGuard::FunctionId { function_id }],
-                        action: PlannedAction::DirectCall { function_id },
-                    })
-                    .collect(),
-            ),
+            replacement: guarded_replacement(alternatives),
         });
     }
 }
@@ -651,11 +731,17 @@ fn decisions_for_function(
     module: &BlockPyModule<CodegenModuleShape>,
     function: &BlockPyFunction<CodegenModuleShape>,
     evidence_store: &ProfileEvidenceStore,
+    local_function_targets: &HashMap<FunctionId, PlannedFunctionTarget>,
     evidence: &FunctionProfileEvidence,
 ) -> Vec<OptimizationDecision> {
     let mut evidence = evidence.clone();
     add_field_index_evidence_for_function(module, function, evidence_store, &mut evidence);
-    decisions_from_evidence(&evidence)
+    decisions_from_evidence(&evidence, |function_id| {
+        local_function_targets
+            .get(&function_id)
+            .or_else(|| evidence_store.function_target(function_id))
+            .cloned()
+    })
 }
 
 fn add_field_index_evidence_for_function(
@@ -809,7 +895,9 @@ fn format_alternative(alternative: &PlannedAlternative) -> String {
 
 fn format_guard(guard: &PlannedGuard) -> String {
     match guard {
-        PlannedGuard::FunctionId { function_id } => format!("FunctionId({function_id})"),
+        PlannedGuard::FunctionTarget { target } => {
+            format!("FunctionTarget({})", format_function_target(target))
+        }
         PlannedGuard::ObservedShape { family, shape } => {
             format!("{}Shape({shape})", format_shape_family(*family))
         }
@@ -821,7 +909,9 @@ fn format_guard(guard: &PlannedGuard) -> String {
 
 fn format_action(action: &PlannedAction) -> String {
     match action {
-        PlannedAction::DirectCall { function_id } => format!("DirectCall({function_id})"),
+        PlannedAction::DirectCall { target } => {
+            format!("DirectCall({})", format_function_target(target))
+        }
         PlannedAction::SpecializedShape { family, shape } => {
             format!("Specialized{}({shape})", format_shape_family(*family))
         }
@@ -829,6 +919,13 @@ fn format_action(action: &PlannedAction) -> String {
             format!("IndexedField({})", format_indexed_field(specialization))
         }
     }
+}
+
+fn format_function_target(target: &PlannedFunctionTarget) -> String {
+    format!(
+        "{}:{}#0x{:016x}",
+        target.module_name, target.qualname, target.source_hash
+    )
 }
 
 fn format_indexed_field(specialization: &PlannedIndexedFieldSpecialization) -> String {
@@ -891,6 +988,11 @@ mod tests {
         let function_id = FunctionId::new(7, 1);
         let instr_id = InstrId::new(BlockLabel::from_index(3), 4);
         let target_id = FunctionId::new(7, 2);
+        let target = PlannedFunctionTarget {
+            module_name: "pkg.mod".to_string(),
+            source_hash: 0x1234,
+            qualname: "callee".to_string(),
+        };
         let field_specialization = PlannedIndexedFieldSpecialization {
             owner_type: PlannedTypeKey {
                 module_name: "pkg.types".to_string(),
@@ -963,7 +1065,9 @@ mod tests {
         evidence
             .field_index_specializations
             .insert(instr_id, vec![field_specialization.clone()]);
-        let decisions = decisions_from_evidence(&evidence);
+        let decisions = decisions_from_evidence(&evidence, |function_id| {
+            (function_id == target_id).then(|| target.clone())
+        });
         assert!(matches!(
             decisions[0].replacement,
             PlannedReplacement::Guarded { .. }
@@ -975,7 +1079,7 @@ mod tests {
         assert_eq!(
             alternatives[0].action,
             PlannedAction::DirectCall {
-                function_id: target_id
+                target: target.clone()
             }
         );
         assert_eq!(
@@ -1001,7 +1105,11 @@ mod tests {
             "test-cache",
         )
         .unwrap();
-        let planned_evidence = plan.evidence_by_function().unwrap();
+        let planned_evidence = plan
+            .evidence_by_function(|planned_target| {
+                Ok((planned_target == &target).then_some(target_id))
+            })
+            .unwrap();
         let planned_function = planned_evidence.get(&function_id).unwrap();
         assert_eq!(
             planned_function
