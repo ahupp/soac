@@ -8993,6 +8993,79 @@ def f(x):
     }
 
     #[test]
+    fn runtime_deopt_guard_miss_tracks_defs_across_normal_successors() {
+        let mut function = test_function();
+        function.params = ParamSpec {
+            params: vec![
+                Param {
+                    name: "a".into(),
+                    kind: ParamKind::Any,
+                    has_default: false,
+                },
+                Param {
+                    name: "b".into(),
+                    kind: ParamKind::Any,
+                    has_default: false,
+                },
+            ],
+        };
+        let entry_label = function.name_gen.next_block_name();
+        let successor_label = function.name_gen.next_block_name();
+        let store_instr_id = InstrId::new(entry_label, 0);
+        let add_instr_id = InstrId::new(entry_label, 1);
+        let c_name = test_local_name("c", 2);
+        let entry = CodegenBlock {
+            label: entry_label,
+            body: vec![with_instr_id(
+                op_expr(Store::new(
+                    c_name.clone(),
+                    with_instr_id(
+                        op_expr(BinOp::new(
+                            BinOpKind::Add,
+                            name_expr(test_name("a")),
+                            name_expr(test_local_name("b", 1)),
+                        )),
+                        add_instr_id,
+                    ),
+                )),
+                store_instr_id,
+            )],
+            term: BlockTerm::Jump(BlockEdge::new(successor_label)),
+            params: vec![],
+            exc_edge: None,
+        };
+        let successor = CodegenBlock {
+            label: successor_label,
+            body: vec![],
+            term: ret_term(name_expr(c_name)),
+            params: vec![],
+            exc_edge: None,
+        };
+        function.blocks = vec![entry, successor];
+        set_stack_slots(&mut function, &["a", "b", "c"]);
+        let module = test_module(ModuleNameGen::new(0), vec![function]);
+        let function = &module.callable_defs[0];
+        let point = LocalEnvResumePoint::BeforeInstr {
+            key: InstrKey::new(function.function_id, store_instr_id),
+        };
+        let facts = infer_module_value_facts(&module);
+        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+            .expect("JIT deopt resume planning should succeed");
+        let function_plan = module_plan
+            .function(function.function_id)
+            .expect("function should have a JIT deopt plan");
+        let entry = function_plan
+            .entry(point)
+            .expect("store point should have a resume entry");
+
+        assert_eq!(
+            runtime_jit_deopt_guard_miss_resume_entry_supported(function, point, entry),
+            Ok(()),
+            "the replay tail defines c before the successor reads it, so c should not be required as a live input"
+        );
+    }
+
+    #[test]
     fn runtime_deopt_table_marks_increment_counter_body_tail_continuation() {
         let function = with_single_test_block(
             test_function(),
@@ -14871,10 +14944,10 @@ def f(x):
     }
 
     #[test]
-    fn specialized_jit_exact_int_binop_uses_operator_fast_path() {
+    fn specialized_jit_exact_int_binop_uses_compact_long_fast_path() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
-            "specialized_jit_exact_int_binop_uses_operator_fast_path",
+            "specialized_jit_exact_int_binop_uses_compact_long_fast_path",
         ) {
             return;
         }
@@ -14935,21 +15008,18 @@ def f(x):
                 ),
             )],
         );
-        let helper_names = import_user_names_for_symbols(&built, &["dp_jit_exact_long_add_slot"]);
+        let box_helpers = import_user_names_for_symbols(&built, &["PyLong_FromLongLong"]);
         assert_eq!(
-            count_direct_calls_to_runtime_helpers(&built.ctx.func, &helper_names),
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &box_helpers),
             1,
-            "exact-int binop specialization should call the profiled PyLong number slot",
+            "profiled exact-int add should box the machine result directly",
         );
-        assert!(
-            function_contains_iconst_imm(
-                &built.ctx.func,
-                crate::operator_specialization::pack_binary_shape(
-                    crate::operator_specialization::ExactTypeTag::Int,
-                    crate::operator_specialization::ExactTypeTag::Int,
-                ) as i64,
-            ),
-            "exact-int binop specialization should guard on the profiled exact-int shape",
+        let generic_helpers =
+            import_user_names_for_symbols(&built, &["PyNumber_Add", "dp_jit_exact_long_add_slot"]);
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &generic_helpers),
+            0,
+            "profiled exact-int add should not call generic or profiled PyLong helpers",
         );
         assert!(
             !function_contains_iconst_imm(
@@ -14960,7 +15030,7 @@ def f(x):
         );
         assert!(
             count_symbolic_global_values(&built.ctx.func) > baseline_symbolic_globals,
-            "exact-int binop specialization should add a symbolic global for the profiled type guard",
+            "exact-int binop specialization should add a symbolic global for the PyLong guard",
         );
     }
 
@@ -15307,10 +15377,10 @@ def f(x):
     }
 
     #[test]
-    fn specialized_jit_exact_int_compare_uses_operator_fast_path() {
+    fn specialized_jit_exact_int_compare_uses_compact_long_fast_path() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
-            "specialized_jit_exact_int_compare_uses_operator_fast_path",
+            "specialized_jit_exact_int_compare_uses_compact_long_fast_path",
         ) {
             return;
         }
@@ -15371,22 +15441,14 @@ def f(x):
                 ),
             )],
         );
-        let helper_names =
-            import_user_names_for_symbols(&built, &["dp_jit_exact_long_richcompare_slot"]);
+        let helper_names = import_user_names_for_symbols(
+            &built,
+            &["PyObject_RichCompare", "dp_jit_exact_long_richcompare_slot"],
+        );
         assert_eq!(
             count_direct_calls_to_runtime_helpers(&built.ctx.func, &helper_names),
-            1,
-            "exact-int compare specialization should call the profiled PyLong richcompare slot",
-        );
-        assert!(
-            function_contains_iconst_imm(
-                &built.ctx.func,
-                crate::operator_specialization::pack_binary_shape(
-                    crate::operator_specialization::ExactTypeTag::Int,
-                    crate::operator_specialization::ExactTypeTag::Int,
-                ) as i64,
-            ),
-            "exact-int compare specialization should guard on the profiled exact-int shape",
+            0,
+            "profiled exact-int compare should lower to compact-long guards and a raw integer compare",
         );
         assert!(
             !function_contains_iconst_imm(
@@ -15397,7 +15459,7 @@ def f(x):
         );
         assert!(
             count_symbolic_global_values(&built.ctx.func) > baseline_symbolic_globals,
-            "exact-int compare specialization should add a symbolic global for the profiled type guard",
+            "exact-int compare specialization should add a symbolic global for the PyLong guard",
         );
     }
 
@@ -15489,6 +15551,134 @@ def f(x):
             count_direct_calls_to_runtime_helpers(&built.ctx.func, &bool_helper_names),
             0,
             "if-condition exact-int compare should lower to compact-long guards and a raw integer compare"
+        );
+    }
+
+    #[test]
+    fn specialized_jit_exact_int_add_then_if_compare_uses_compact_long_machine_ops() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "specialized_jit_exact_int_add_then_if_compare_uses_compact_long_machine_ops",
+        ) {
+            return;
+        }
+        let blocks = [
+            1usize as ObjPtr,
+            2usize as ObjPtr,
+            3usize as ObjPtr,
+            4usize as ObjPtr,
+        ];
+        let mut constants = TestConstantPool::default();
+        let mut function = test_function();
+        function.params = ParamSpec {
+            params: vec![
+                Param {
+                    name: "a".into(),
+                    kind: ParamKind::Any,
+                    has_default: false,
+                },
+                Param {
+                    name: "b".into(),
+                    kind: ParamKind::Any,
+                    has_default: false,
+                },
+            ],
+        };
+        let entry_label = function.name_gen.next_block_name();
+        let test_label = function.name_gen.next_block_name();
+        let then_label = function.name_gen.next_block_name();
+        let else_label = function.name_gen.next_block_name();
+        let store_instr_id = InstrId::new(entry_label, 0);
+        let add_instr_id = InstrId::new(entry_label, 1);
+        let compare_instr_id = InstrId::new(test_label, 0);
+        let c_name = test_local_name("c", 2);
+        let entry = CodegenBlock {
+            label: entry_label,
+            body: vec![with_instr_id(
+                op_expr(Store::new(
+                    c_name.clone(),
+                    with_instr_id(
+                        op_expr(BinOp::new(
+                            BinOpKind::Add,
+                            name_expr(test_name("a")),
+                            name_expr(test_local_name("b", 1)),
+                        )),
+                        add_instr_id,
+                    ),
+                )),
+                store_instr_id,
+            )],
+            term: BlockTerm::Jump(BlockEdge::new(test_label)),
+            params: vec![],
+            exc_edge: None,
+        };
+        let test_block = CodegenBlock {
+            label: test_label,
+            body: vec![],
+            term: BlockTerm::IfTerm(soac_blockpy::block_py::TermIf {
+                test: with_instr_id(
+                    op_expr(BinOp::new(
+                        BinOpKind::Gt,
+                        name_expr(c_name),
+                        constants.int_expr(0),
+                    )),
+                    compare_instr_id,
+                ),
+                then_label,
+                else_label,
+            }),
+            params: vec![],
+            exc_edge: None,
+        };
+        let then_block = CodegenBlock {
+            label: then_label,
+            body: vec![],
+            term: ret_term(name_expr(test_runtime_name("TRUE"))),
+            params: vec![],
+            exc_edge: None,
+        };
+        let else_block = CodegenBlock {
+            label: else_label,
+            body: vec![],
+            term: ret_term(none_expr()),
+            params: vec![],
+            exc_edge: None,
+        };
+        function.blocks = vec![entry, test_block, then_block, else_block];
+        set_stack_slots(&mut function, &["a", "b", "c"]);
+        let exact_int_shape = crate::operator_specialization::pack_binary_shape(
+            crate::operator_specialization::ExactTypeTag::Int,
+            crate::operator_specialization::ExactTypeTag::Int,
+        );
+        let (_jit_module, built) = build_test_jit_function_with_operator_specializations(
+            &function,
+            &blocks,
+            constants.module_constants,
+            &[
+                (add_instr_id, exact_int_shape),
+                (compare_instr_id, exact_int_shape),
+            ],
+        );
+        let helper_names = import_user_names_for_symbols(
+            &built,
+            &[
+                "PyNumber_Add",
+                "dp_jit_exact_long_add_slot",
+                "PyObject_RichCompare",
+                "dp_jit_exact_long_richcompare_slot",
+                "dp_jit_is_true",
+            ],
+        );
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &helper_names),
+            0,
+            "profiled add-then-if exact-int path should use compact-long machine ops"
+        );
+        let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
+        assert_eq!(
+            count_cold_block_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
+            2,
+            "add and compare compact-long guard misses should each deopt"
         );
     }
 

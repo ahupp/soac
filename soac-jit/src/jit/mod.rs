@@ -5712,9 +5712,15 @@ fn runtime_jit_deopt_continuation_local_reads(
     let owned_cell_locations = runtime_jit_deopt_owned_cell_locations(function, &location_by_name);
     let mut reads = HashSet::new();
     let mut visited = HashSet::new();
-    let mut worklist = VecDeque::from([cursor]);
-    while let Some(cursor) = worklist.pop_front() {
-        if !visited.insert((cursor.block(), cursor.body_index())) {
+    // Track locals definitely written by the replayed tail along normal control flow.
+    // Exception edges stay conservative because they can leave before later tail writes.
+    let mut worklist = VecDeque::from([(cursor, HashSet::new())]);
+    while let Some((cursor, incoming_defs)) = worklist.pop_front() {
+        if !visited.insert((
+            cursor.block(),
+            cursor.body_index(),
+            runtime_jit_deopt_sorted_local_slots(&incoming_defs),
+        )) {
             continue;
         }
         let Some(block) = blocks_by_label.get(&cursor.block()).copied() else {
@@ -5723,7 +5729,7 @@ fn runtime_jit_deopt_continuation_local_reads(
         let Some(body_tail) = block.body.get(cursor.body_index()..) else {
             return Err(RuntimeJitDeoptUnsupportedReason::UnsupportedBlockTail);
         };
-        let mut defs = HashSet::new();
+        let mut defs = incoming_defs;
         for instr in body_tail {
             runtime_jit_deopt_collect_local_reads(
                 instr,
@@ -5742,8 +5748,16 @@ fn runtime_jit_deopt_continuation_local_reads(
             &mut reads,
         );
         if let Some(edge) = &block.exc_edge {
-            runtime_jit_deopt_collect_edge_local_reads(edge, &defs, &location_by_name, &mut reads);
-            worklist.push_back(RuntimeJitDeoptCursor::at_block_entry(edge.target));
+            runtime_jit_deopt_collect_edge_local_reads(
+                edge,
+                &HashSet::new(),
+                &location_by_name,
+                &mut reads,
+            );
+            worklist.push_back((
+                RuntimeJitDeoptCursor::at_block_entry(edge.target),
+                HashSet::new(),
+            ));
         }
         match &block.term {
             BlockTerm::Jump(edge) => {
@@ -5753,22 +5767,41 @@ fn runtime_jit_deopt_continuation_local_reads(
                     &location_by_name,
                     &mut reads,
                 );
-                worklist.push_back(RuntimeJitDeoptCursor::at_block_entry(edge.target));
+                worklist.push_back((RuntimeJitDeoptCursor::at_block_entry(edge.target), defs));
             }
             BlockTerm::IfTerm(if_term) => {
-                worklist.push_back(RuntimeJitDeoptCursor::at_block_entry(if_term.then_label));
-                worklist.push_back(RuntimeJitDeoptCursor::at_block_entry(if_term.else_label));
+                worklist.push_back((
+                    RuntimeJitDeoptCursor::at_block_entry(if_term.then_label),
+                    defs.clone(),
+                ));
+                worklist.push_back((
+                    RuntimeJitDeoptCursor::at_block_entry(if_term.else_label),
+                    defs,
+                ));
             }
             BlockTerm::BranchTable(branch) => {
                 for target in &branch.targets {
-                    worklist.push_back(RuntimeJitDeoptCursor::at_block_entry(*target));
+                    worklist
+                        .push_back((RuntimeJitDeoptCursor::at_block_entry(*target), defs.clone()));
                 }
-                worklist.push_back(RuntimeJitDeoptCursor::at_block_entry(branch.default_label));
+                worklist.push_back((
+                    RuntimeJitDeoptCursor::at_block_entry(branch.default_label),
+                    defs,
+                ));
             }
             BlockTerm::Raise(_) | BlockTerm::Return(_) => {}
         }
     }
     Ok(reads)
+}
+
+fn runtime_jit_deopt_sorted_local_slots(defs: &HashSet<LocalLocation>) -> Vec<u32> {
+    let mut slots = defs
+        .iter()
+        .map(|location| location.slot())
+        .collect::<Vec<_>>();
+    slots.sort_unstable();
+    slots
 }
 
 fn runtime_jit_deopt_owned_cell_locations(

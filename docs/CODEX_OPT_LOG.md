@@ -1008,3 +1008,20 @@ benchmarked throughput delta, and the headline pre/post numbers.
   - no-refcount diagnostic, 1M loops x5: `345491`, `351148`, `349593`,
     `350474`, `353850 loops/s`
   - pystone JIT code bytes: `370090`
+
+## 2026-04-17 - Profile-shape compact exact-int ops
+
+- jj change id: `vwwpmtkw`
+- summary: profiled exact-`int` add/sub/mul and comparisons now guard exact
+  compact `PyLong` operands, run the arithmetic or comparison on extracted
+  machine integers, and deopt to the generic continuation on guard miss.
+- throughput: `+3.93%` specialized pystone median; no-refcount diagnostic
+  `+0.08%`; code size `+1.21%`
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `206655`, `250581`, `260174 loops/s`
+  - no-refcount diagnostic, 1M loops x3: `341530`, `343662`, `340408 loops/s`
+  - pystone JIT code bytes: `370090`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `260428`, `260904`, `256758 loops/s`
+  - no-refcount diagnostic, 1M loops x3: `344871`, `341789`, `335818 loops/s`
+  - pystone JIT code bytes: `374554`

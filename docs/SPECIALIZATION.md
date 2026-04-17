@@ -820,15 +820,17 @@ exact-list/exact-int arms and share generic fallback paths.
   `soac-jit/src/jit/intrinsics.rs:714`.
 - The fast path:
   - records the current observed operand shape
-  - compares it against the profiled exact-int shape
+  - compares it against the profiled exact-int shape for operations that still
+    use the helper fallback path
   - skips the shape guard when value facts already prove both operands are
     exact `int`
-  - for profiled-only exact-int shapes, calls the profiled `PyLong` number
-    slot helper
-  - for fact-proven exact-int shapes, guards that both runtime objects are
-    compact exact `PyLong` objects, unboxes them, performs supported arithmetic
-    as machine `i64`, boxes the result with `PyLong_FromLongLong`, and deopts
-    or falls back on type/compactness/overflow miss
+  - for profiled or fact-proven exact-int `Add`, `Sub`, and `Mul`, guards that
+    both runtime objects are compact exact `PyLong` objects, unboxes them,
+    performs the arithmetic as machine `i64`, boxes the result with
+    `PyLong_FromLongLong`, and deopts or falls back on type/compactness/
+    overflow miss
+  - for other profiled-only exact-int binary operators, calls the profiled
+    `PyLong` number slot helper after the exact shape guard
   - on miss in `verify`/`apply` mode, uses a cold
     `dp_jit_deopt_resume` continuation when both operands are safe to
     replay
@@ -846,9 +848,9 @@ exact-list/exact-int arms and share generic fallback paths.
   - no mixed-type shapes
   - excluded binops still always use generic lowering
 - Soundness boundary:
-  - specialization is guarded by exact observed type-shape match
-  - fact-proven exact-int operands still guard exact runtime `PyLong` layout
-    before direct compact-long memory access
+  - helper-backed specialization is guarded by exact observed type-shape match
+  - compact-long machine-code specialization guards exact runtime `PyLong`
+    layout and compact representation before direct memory access
   - unsupported or mismatched shapes either deopt to the generic
     continuation or fall back to generic lowering
 - Natural extensions:
@@ -911,8 +913,9 @@ exact-list/exact-int arms and share generic fallback paths.
   `emit_specialized_binop`, at
   `soac-jit/src/jit/intrinsics.rs`.
 - If the profiled shape is exact `int`/`int`, comparisons such as
-  `Eq`, `Ne`, `Lt`, `Le`, `Gt`, and `Ge` use the direct exact-int helper path
-  instead of generic `PyObject_RichCompare` lowering.
+  `Eq`, `Ne`, `Lt`, `Le`, `Gt`, and `Ge` guard compact exact `PyLong` layout
+  and emit a direct integer comparison instead of generic
+  `PyObject_RichCompare` lowering.
 - When the comparison is consumed by `I32Bool01` demand, such as an
   `if` condition, the profiled exact-int path guards compact exact `PyLong`
   layout, unboxes both operands, emits a direct integer comparison, and

@@ -1178,28 +1178,19 @@ fn emit_compact_long_arithmetic<'fb, E>(
 }
 
 fn emit_compact_long_binary_op_or_deopt<'fb, E>(
+    op_kind: blockpy_intrinsics::BinOpKind,
     kind: ExactIntBinaryOpKind,
     state: &mut impl OperationEmitState<'fb, E>,
     instr_id: soac_blockpy::block_py::InstrId,
     pre_guard_operands: &[&E],
     arg_values: &[(ir::Value, bool)],
     fallback_counter_id: Option<CounterId>,
+    generic_fallback_on_guard_miss: bool,
 ) -> Option<ir::Value>
 where
     E: Instr,
 {
-    if !matches!(
-        kind,
-        ExactIntBinaryOpKind::Add
-            | ExactIntBinaryOpKind::Sub
-            | ExactIntBinaryOpKind::Mul
-            | ExactIntBinaryOpKind::Eq
-            | ExactIntBinaryOpKind::Ne
-            | ExactIntBinaryOpKind::Lt
-            | ExactIntBinaryOpKind::Le
-            | ExactIntBinaryOpKind::Gt
-            | ExactIntBinaryOpKind::Ge
-    ) {
+    if !exact_int_kind_supports_compact_long_binary_op(kind) {
         return None;
     }
 
@@ -1227,7 +1218,11 @@ where
         JitGuardMissDispatch::FallbackBlock(fallback_block) => {
             state.fb().switch_to_block(fallback_block);
             increment_counter_with_state(state, fallback_counter_id);
-            let fallback_result = emit_exact_long_binary_op(kind, state, arg_values);
+            let fallback_result = if generic_fallback_on_guard_miss {
+                emit_binop_with_arg_values(op_kind, state, arg_values)
+            } else {
+                emit_exact_long_binary_op(kind, state, arg_values)
+            };
             state
                 .fb()
                 .ins()
@@ -1250,6 +1245,21 @@ where
 
     state.fb().switch_to_block(result_block);
     Some(state.fb().block_params(result_block)[0])
+}
+
+fn exact_int_kind_supports_compact_long_binary_op(kind: ExactIntBinaryOpKind) -> bool {
+    matches!(
+        kind,
+        ExactIntBinaryOpKind::Add
+            | ExactIntBinaryOpKind::Sub
+            | ExactIntBinaryOpKind::Mul
+            | ExactIntBinaryOpKind::Eq
+            | ExactIntBinaryOpKind::Ne
+            | ExactIntBinaryOpKind::Lt
+            | ExactIntBinaryOpKind::Le
+            | ExactIntBinaryOpKind::Gt
+            | ExactIntBinaryOpKind::Ge
+    )
 }
 
 fn emit_compact_long_compare_i32_bool01_or_deopt<'fb, E>(
@@ -1578,11 +1588,7 @@ where
     }
 
     let arg_values = state.emit_arg_values(&[op.left.as_ref(), op.right.as_ref()]);
-    let shape = if counter_id.is_some() || (!facts_prove_exact_int && !hot_shapes.is_empty()) {
-        Some(emit_binary_operator_shape_from_values(state, &arg_values))
-    } else {
-        None
-    };
+    let mut shape = counter_id.map(|_| emit_binary_operator_shape_from_values(state, &arg_values));
     if let Some(counter_id) = counter_id {
         let counter_slot =
             super::top_value_counter_slot_for_id(state.ctx().counter_slots_by_id, counter_id)
@@ -1619,12 +1625,14 @@ where
     if facts_prove_exact_int {
         increment_counter_with_state(state, specialized_hit_counter_id);
         if let Some(result) = emit_compact_long_binary_op_or_deopt(
+            op.kind,
             exact_int_kind,
             state,
             instr_id,
             &[op.left.as_ref(), op.right.as_ref()],
             &arg_values,
             specialized_fallback_counter_id,
+            false,
         ) {
             return Some(result);
         }
@@ -1643,20 +1651,35 @@ where
         return Some(emit_binop_with_arg_values(op.kind, state, &arg_values));
     }
 
+    let pre_guard_operands = [op.left.as_ref(), op.right.as_ref()];
+    if exact_int_kind_supports_compact_long_binary_op(exact_int_kind) {
+        increment_counter_with_state(state, specialized_hit_counter_id);
+        return emit_compact_long_binary_op_or_deopt(
+            op.kind,
+            exact_int_kind,
+            state,
+            instr_id,
+            &pre_guard_operands,
+            &arg_values,
+            specialized_fallback_counter_id,
+            true,
+        );
+    }
+
     let result_block = state.fb().create_block();
     state.fb().append_block_param(result_block, ptr_ty);
     let generic_block = state.fb().create_block();
     state.fb().set_cold_block(generic_block);
-    let pre_guard_operands = [op.left.as_ref(), op.right.as_ref()];
     let guard_miss_dispatch =
         state.prepare_guard_miss_dispatch_for_instr(instr_id, &pre_guard_operands, generic_block);
     let direct_block = state.fb().create_block();
+    let shape =
+        shape.get_or_insert_with(|| emit_binary_operator_shape_from_values(state, &arg_values));
     let expected_shape = state.fb().ins().iconst(i64_ty, exact_int_shape as i64);
-    let is_match =
-        state
-            .fb()
-            .ins()
-            .icmp(ir::condcodes::IntCC::Equal, shape.unwrap(), expected_shape);
+    let is_match = state
+        .fb()
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, *shape, expected_shape);
     state.fb().ins().brif(
         is_match,
         direct_block,
