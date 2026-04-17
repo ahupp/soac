@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Default)]
 struct Args {
     counters: Option<PathBuf>,
-    module: Option<PathBuf>,
+    modules: Vec<PathBuf>,
+    module_root: Option<PathBuf>,
     out: Option<PathBuf>,
 }
 
@@ -32,20 +33,74 @@ fn run_with_args(args: impl IntoIterator<Item = OsString>) -> Result<()> {
     let counters_path = args
         .counters
         .ok_or_else(|| anyhow!("missing required --counters <profile.bin>"))?;
-    let module_path = args
-        .module
-        .ok_or_else(|| anyhow!("missing required --module <mod.blockpy>"))?;
     let out_root = args
         .out
         .ok_or_else(|| anyhow!("missing required --out <root-dir>"))?;
 
     let evidence_store = ProfileEvidenceStore::from_counter_dump(counters_path.as_path())?;
-    let cache = load_codegen_module_cache(module_path.as_path())
+    let mut modules = args.modules;
+    let root_mode = args.module_root.is_some();
+    let mut root_modules = match args.module_root {
+        Some(root) => cached_module_paths_under_root(root.as_path())?,
+        None => Vec::new(),
+    };
+    modules.append(&mut root_modules);
+    modules.sort();
+    modules.dedup();
+    if modules.is_empty() {
+        bail!("missing required --module <mod.blockpy> or --module-root <root-dir>");
+    }
+
+    let mut written = 0usize;
+    let mut skipped = 0usize;
+    for module_path in modules {
+        match decide_module_optimizations(
+            &evidence_store,
+            module_path.as_path(),
+            out_root.as_path(),
+            !root_mode,
+        )? {
+            Some(report) => {
+                written += 1;
+                println!(
+                    "wrote {} for module={} source_hash=0x{:016x} ({} functions)",
+                    report.output_path.display(),
+                    report.module_name,
+                    report.source_hash,
+                    report.function_count
+                );
+            }
+            None => {
+                skipped += 1;
+            }
+        }
+    }
+    println!("optimization decisions: wrote {written} module plan(s), skipped {skipped} module(s)");
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ModuleDecisionReport {
+    output_path: PathBuf,
+    module_name: String,
+    source_hash: u64,
+    function_count: usize,
+}
+
+fn decide_module_optimizations(
+    evidence_store: &ProfileEvidenceStore,
+    module_path: &Path,
+    out_root: &Path,
+    strict: bool,
+) -> Result<Option<ModuleDecisionReport>> {
+    let cache = load_codegen_module_cache(module_path)
         .with_context(|| format!("load BlockPy module cache {}", module_path.display()))?;
-    validate_counter_evidence_matches_module(&evidence_store, &cache)?;
-    let plan = OptimizationPlan::from_evidence(&cache.metadata, &cache.module, &evidence_store);
+    if !validate_counter_evidence_matches_module(evidence_store, &cache, strict)? {
+        return Ok(None);
+    }
+    let plan = OptimizationPlan::from_evidence(&cache.metadata, &cache.module, evidence_store);
     let output_path = module_optimization_plan_path(
-        out_root.as_path(),
+        out_root,
         cache.metadata.source,
         cache.metadata.module_name.as_str(),
     )
@@ -56,32 +111,60 @@ fn run_with_args(args: impl IntoIterator<Item = OsString>) -> Result<()> {
         )
     })?;
     write_optimization_plan(output_path.as_path(), &plan)?;
-    println!(
-        "wrote {} for module={} source_hash=0x{:016x} ({} functions)",
-        output_path.display(),
-        plan.module_name,
-        plan.source_hash,
-        plan.functions.len()
-    );
-    Ok(())
+    Ok(Some(ModuleDecisionReport {
+        output_path,
+        module_name: plan.module_name,
+        source_hash: plan.source_hash,
+        function_count: plan.functions.len(),
+    }))
 }
 
 fn validate_counter_evidence_matches_module(
     evidence_store: &ProfileEvidenceStore,
     cache: &CachedCodegenModule,
-) -> Result<()> {
+    strict: bool,
+) -> Result<bool> {
     match evidence_store.module_source_hash(cache.metadata.module_name.as_str()) {
-        Some(source_hash) if source_hash == cache.metadata.source_hash => Ok(()),
+        Some(source_hash) if source_hash == cache.metadata.source_hash => Ok(true),
         Some(source_hash) => bail!(
             "counter dump source hash for module {} is 0x{source_hash:016x}, but cached BlockPy module has 0x{:016x}",
             cache.metadata.module_name,
             cache.metadata.source_hash
         ),
-        None => bail!(
+        None if strict => bail!(
             "counter dump does not contain module {}",
             cache.metadata.module_name
         ),
+        None => Ok(false),
     }
+}
+
+fn cached_module_paths_under_root(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    collect_cached_module_paths(root, &mut out)?;
+    out.sort();
+    Ok(out)
+}
+
+fn collect_cached_module_paths(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("read module cache path metadata {}", path.display()))?;
+    if metadata.is_file() {
+        if path.file_name().and_then(|name| name.to_str()) == Some("mod.blockpy") {
+            out.push(path.to_path_buf());
+        }
+        return Ok(());
+    }
+    if !metadata.is_dir() {
+        return Ok(());
+    }
+    let entries = fs::read_dir(path)
+        .with_context(|| format!("read module cache directory {}", path.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("read entry in {}", path.display()))?;
+        collect_cached_module_paths(entry.path().as_path(), out)?;
+    }
+    Ok(())
 }
 
 fn write_optimization_plan(path: &Path, plan: &OptimizationPlan) -> Result<()> {
@@ -122,7 +205,8 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Args> {
             .ok_or_else(|| anyhow!("non-UTF-8 argument is unsupported: {arg:?}"))?;
         match flag {
             "--counters" => parsed.counters = Some(next_path(&mut args, flag)?),
-            "--module" => parsed.module = Some(next_path(&mut args, flag)?),
+            "--module" => parsed.modules.push(next_path(&mut args, flag)?),
+            "--module-root" => parsed.module_root = Some(next_path(&mut args, flag)?),
             "--out" => parsed.out = Some(next_path(&mut args, flag)?),
             "--help" | "-h" => {
                 print_usage();
@@ -142,7 +226,7 @@ fn next_path(args: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<Pa
 
 fn print_usage() {
     println!(
-        "usage: decide_optimizations --counters <profile.bin> --module <mod.blockpy> --out <root-dir>"
+        "usage: decide_optimizations --counters <profile.bin> [--module <mod.blockpy> ... | --module-root <root-dir>] --out <root-dir>"
     );
 }
 
@@ -278,6 +362,131 @@ mod test {
             "expected a per-instruction indexed-field decision"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn module_root_writes_all_counter_referenced_cached_modules() {
+        let root = unique_temp_dir();
+        let module_cache_root = root.join("modules-in");
+        let out_root = root.join("modules-out");
+
+        let first = store_test_module(
+            module_cache_root.as_path(),
+            "pkg.first",
+            "def f(obj):\n    return obj.x\n",
+            10,
+        );
+        let second = store_test_module(
+            module_cache_root.as_path(),
+            "pkg.second",
+            "def g(obj):\n    return obj.x\n",
+            11,
+        );
+        let _unused = store_test_module(
+            module_cache_root.as_path(),
+            "pkg.unused",
+            "def h(obj):\n    return obj.x\n",
+            12,
+        );
+        let instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+        let mut counters =
+            counter_record("pkg.first", first.source_hash, first.function_id, instr_id)
+                .encode()
+                .unwrap();
+        counters.extend_from_slice(
+            counter_record(
+                "pkg.second",
+                second.source_hash,
+                second.function_id,
+                instr_id,
+            )
+            .encode()
+            .unwrap()
+            .as_slice(),
+        );
+        let counters_path = root.join("profile.bin");
+        fs::write(counters_path.as_path(), counters).unwrap();
+
+        run_with_args([
+            OsString::from("--counters"),
+            counters_path.into_os_string(),
+            OsString::from("--module-root"),
+            module_cache_root.clone().into_os_string(),
+            OsString::from("--out"),
+            out_root.clone().into_os_string(),
+        ])
+        .unwrap();
+
+        for module_name in ["pkg.first", "pkg.second"] {
+            let output_path = module_optimization_plan_path(
+                out_root.as_path(),
+                PythonModuleCacheSource::Project,
+                module_name,
+            )
+            .unwrap();
+            assert!(
+                output_path.exists(),
+                "expected optimization plan for {module_name} at {}",
+                output_path.display()
+            );
+        }
+        let unused_path = module_optimization_plan_path(
+            out_root.as_path(),
+            PythonModuleCacheSource::Project,
+            "pkg.unused",
+        )
+        .unwrap();
+        assert!(
+            !unused_path.exists(),
+            "module-root mode should skip cached modules absent from the counter dump"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    struct StoredTestModule {
+        source_hash: u64,
+        function_id: FunctionId,
+    }
+
+    fn store_test_module(
+        module_cache_root: &Path,
+        module_name: &str,
+        source: &str,
+        module_id: u32,
+    ) -> StoredTestModule {
+        let source_hash = hash_module_source(source);
+        let metadata = CachedCodegenModuleMetadata {
+            source: PythonModuleCacheSource::Project,
+            module_name: module_name.to_string(),
+            source_hash,
+            cache_identity: TEST_BUILD_IDENTITY.to_string(),
+        };
+        let module_cache_path = codegen_module_cache_path(
+            module_cache_root,
+            metadata.source,
+            metadata.module_name.as_str(),
+        )
+        .unwrap();
+        let lowered = lower_python_to_blockpy_recorded_with_options(
+            source,
+            ModuleNameGen::new(module_id),
+            LoweringOptions {
+                runtime_names_as_globals: false,
+                pre_optimization_cache_path: Some(module_cache_path),
+                pre_optimization_cache_metadata: Some(metadata),
+            },
+        )
+        .unwrap();
+        let function_id = lowered
+            .codegen_module
+            .callable_defs
+            .first()
+            .map(|function| function.function_id)
+            .expect("test module should contain one function");
+        StoredTestModule {
+            source_hash,
+            function_id,
+        }
     }
 
     fn counter_record(

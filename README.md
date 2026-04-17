@@ -352,15 +352,18 @@ globals are out of scope for now.
   `SOAC_PRECOMPILED_LIBRARY` to the resulting
   `.so` to let runtime direct-function setup use matching precompiled entries.
 
-- `cargo run -p soac-inspector --bin decide_optimizations -- --counters <profile.bin> --module <mod.blockpy> --out <root-dir>`
-  Load a counter dump once, load one cached BlockPy module, and write that
-  module's binary optimization-decision artifact under `<root-dir>` using the
-  stable module artifact path, such as `python-stdlib/typing/mod.opt`. Use
-  `cargo run -p soac-inspector --bin print_optimization_plan -- --plan <mod.opt>`
-  to pretty-print it for inspection. In `SOAC_OPT_MODE=verify|apply`, runtime
-  specialization looks for a matching `mod.opt` in the active module cache and
-  uses it before falling back to `profile.bin` counters for decision-backed
-  call, operator, getitem, setitem, and branch specializations.
+- `cargo run -p soac-inspector --bin decide_optimizations -- --counters <profile.bin> --module-root <modules-root> --out <root-dir>`
+  Load a counter dump once, scan a cached BlockPy module root for `mod.blockpy`
+  files, and write binary optimization-decision artifacts under `<root-dir>`
+  using stable module artifact paths such as `python-stdlib/typing/mod.opt`.
+  Pass one or more `--module <mod.blockpy>` arguments for narrower debugging.
+  Use `cargo run -p soac-inspector --bin print_optimization_plan -- --plan <mod.opt>`
+  to pretty-print a plan for inspection. `just benchmark` runs this after the
+  profile pass so verify/apply exercise the decision artifacts. In
+  `SOAC_OPT_MODE=verify|apply`, runtime specialization looks for a matching
+  `mod.opt` in the active module cache and uses it before falling back to
+  `profile.bin` counters for decision-backed call, operator, getitem, setitem,
+  and branch specializations.
 
 - `SOAC_JIT_PERF_HELPER_FRAMES=1`
   In `fn should_preserve_perf_helper_frames`, at

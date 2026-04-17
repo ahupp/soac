@@ -1189,7 +1189,7 @@ _call-target-specializations-from-dump dump_path:
   #!/usr/bin/env bash
   set -euo pipefail
   cd "$REPO_ROOT"
-  cargo run -p soac-inspector --bin inspect_counters -- --specializations "{{dump_path}}"
+  cargo run --release -p soac-inspector --bin inspect_counters -- --specializations "{{dump_path}}"
 
 benchmark-verify loops="100000" counters_dir="": (update-venv-offline) (build-extension "release")
   #!/usr/bin/env bash
@@ -1338,6 +1338,13 @@ benchmark benchmark_loops="1000000" verify_loops="100000" results_root="bench" r
     SOAC_CRANELIFT_OPT_LEVEL="$CRANELIFT_OPT_LEVEL" \
     SOAC_OPT_MODE=profile \
       "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
+
+    echo
+    echo "decide optimization plans"
+    cargo run --release -p soac-inspector --bin decide_optimizations -- \
+      --counters "$counters_dir/profile.bin" \
+      --module-root "$SOAC_MODULE_CACHE_DIR" \
+      --out "$SOAC_MODULE_CACHE_DIR"
 
     echo
     echo "jit transformed verify pass"
