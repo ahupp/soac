@@ -522,8 +522,12 @@ run-and-view-speedscope loops="10000000" counters_dir="" output_prefix="logs/pys
     echo "counter profile not found at $COUNTERS_FILE; run 'just benchmark' first or pass counters_dir=<dir>" >&2
     exit 1
   fi
+  if [[ -z "${SOAC_MODULE_CACHE_DIR_FROM_ENV:-}" ]]; then
+    export SOAC_MODULE_CACHE_DIR="$COUNTERS_DIR/modules"
+  fi
 
   cd "$REPO_ROOT"
+  SOAC_MODULE_CACHE_DIR="${SOAC_MODULE_CACHE_DIR:-}" just _decide-optimizations-for-counters-dir "$COUNTERS_DIR"
   SOAC_WORK_DIR="$COUNTERS_DIR" \
   SOAC_OPT_MODE=apply \
     just perf-pystone-jit-warm "{{loops}}" "{{output_prefix}}"
@@ -749,12 +753,17 @@ perf-pystone-jit-specialized loops="10000000" output_prefix="logs/pystone_jit_pe
   cd "$REPO_ROOT"
   counters_dir="$(mktemp -d "${TMPDIR:-/tmp}/soac_perf_counters_XXXXXX")"
   trap 'rm -rf "$counters_dir"' EXIT
+  if [[ -z "${SOAC_MODULE_CACHE_DIR_FROM_ENV:-}" ]]; then
+    export SOAC_MODULE_CACHE_DIR="$counters_dir/modules"
+  fi
 
   LOOPS="${SPECIALIZATION_PROFILE_LOOPS}" \
   WARMUP_LOOPS="${WARMUP_LOOPS}" \
   SOAC_WORK_DIR="$counters_dir" \
   SOAC_OPT_MODE=profile \
     "$REPO_ROOT/.venv/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)' >/tmp/soac_perf_specialization_profile.out 2>&1
+
+  SOAC_MODULE_CACHE_DIR="${SOAC_MODULE_CACHE_DIR:-}" just _decide-optimizations-for-counters-dir "$counters_dir"
 
   SOAC_WORK_DIR="$counters_dir" \
   SOAC_OPT_MODE=apply \
@@ -1199,6 +1208,33 @@ _call-target-specializations-from-dump dump_path:
   cd "$REPO_ROOT"
   cargo run --release -p soac-inspector --bin inspect_counters -- --specializations "{{dump_path}}"
 
+[private]
+_decide-optimizations-for-counters-dir counters_dir:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cd "$REPO_ROOT"
+  COUNTERS_DIR="{{counters_dir}}"
+  if [[ "$COUNTERS_DIR" != /* ]]; then
+    COUNTERS_DIR="$REPO_ROOT/$COUNTERS_DIR"
+  fi
+  if [[ ! -f "$COUNTERS_DIR/profile.bin" ]]; then
+    echo "counter profile not found at $COUNTERS_DIR/profile.bin; run a profile pass first" >&2
+    exit 1
+  fi
+  if [[ -z "${SOAC_MODULE_CACHE_DIR:-}" ]]; then
+    if [[ -z "${SOAC_MODULE_CACHE_DIR_FROM_ENV:-}" ]]; then
+      export SOAC_MODULE_CACHE_DIR="$COUNTERS_DIR/modules"
+    else
+      export SOAC_MODULE_CACHE_DIR="$SOAC_MODULE_CACHE_DIR_FROM_ENV"
+    fi
+  fi
+  echo "decide optimization plans"
+  echo "counters: $COUNTERS_DIR/profile.bin"
+  echo "module cache dir: $SOAC_MODULE_CACHE_DIR"
+  cargo run --release -p soac-inspector --bin decide_optimizations -- \
+    --counters "$COUNTERS_DIR/profile.bin" \
+    --out "$SOAC_MODULE_CACHE_DIR"
+
 benchmark-verify loops="100000" counters_dir="": (update-venv-offline) (build-extension "release")
   #!/usr/bin/env bash
   set -euo pipefail
@@ -1219,6 +1255,8 @@ benchmark-verify loops="100000" counters_dir="": (update-venv-offline) (build-ex
   fi
   rm -f "$COUNTERS_DIR/events.jsonl"
   rm -f "$COUNTERS_DIR/verify.bin"
+
+  SOAC_MODULE_CACHE_DIR="$SOAC_MODULE_CACHE_DIR" just _decide-optimizations-for-counters-dir "$COUNTERS_DIR"
 
   echo "jit transformed verify pass"
   echo "loops: {{loops}}"
@@ -1348,10 +1386,7 @@ benchmark benchmark_loops="1000000" verify_loops="100000" results_root="bench" r
       "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
 
     echo
-    echo "decide optimization plans"
-    cargo run --release -p soac-inspector --bin decide_optimizations -- \
-      --counters "$counters_dir/profile.bin" \
-      --out "$SOAC_MODULE_CACHE_DIR"
+    SOAC_MODULE_CACHE_DIR="$SOAC_MODULE_CACHE_DIR" just _decide-optimizations-for-counters-dir "$counters_dir"
 
     echo
     echo "jit transformed verify pass"
@@ -1415,6 +1450,10 @@ precompile-shared-library counters="" out="logs/libsoac_precompiled.so" object_d
     if [[ "$(basename "$COUNTERS_PARENT")" == "counters" ]]; then
       export SOAC_MODULE_CACHE_DIR="$COUNTERS_PARENT/modules"
     fi
+  fi
+  COUNTERS_DIR="$(dirname "$COUNTERS")"
+  if [[ "$(basename "$COUNTERS")" == "profile.bin" ]]; then
+    SOAC_MODULE_CACHE_DIR="${SOAC_MODULE_CACHE_DIR:-}" just _decide-optimizations-for-counters-dir "$COUNTERS_DIR"
   fi
 
   OUT="{{out}}"
@@ -1504,6 +1543,8 @@ _benchmark-run-specialized-perf result_dir perf_loops="10000000": ensure-cpython
     echo "counter profile not found at $COUNTERS_DIR/profile.bin; run 'just benchmark' first or pass result_dir=<dir>" >&2
     exit 1
   fi
+
+  SOAC_MODULE_CACHE_DIR="$SOAC_MODULE_CACHE_DIR" just _decide-optimizations-for-counters-dir "$COUNTERS_DIR"
 
   OUTPUT_PREFIX="$RESULT_DIR/$(basename "$RESULT_DIR")_perf"
   SOAC_WORK_DIR="$COUNTERS_DIR" \

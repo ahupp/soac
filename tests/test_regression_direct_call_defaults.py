@@ -7,7 +7,7 @@ import sys
 
 import pytest
 
-from tests._integration import soac_module
+from tests._integration import decide_optimizations_for_work_dir, soac_module
 
 
 def test_vectorcall_wrong_arity_is_checked_before_direct_entry(tmp_path):
@@ -79,6 +79,7 @@ def run():
     profile_env = {**base_env, "SOAC_OPT_MODE": "profile"}
     _run_soac_module(tmp_path, module_name, profile_env)
     assert (work_dir / "profile.bin").exists()
+    assert decide_optimizations_for_work_dir(work_dir) >= 1
 
     apply_env = {
         **base_env,

@@ -3041,6 +3041,60 @@ def build(values):
         std::fs::write(path, archive.as_ref()).expect("test optimization plan should be writable");
     }
 
+    fn write_test_operator_optimization_plan(
+        module_cache_root: &Path,
+        module_name: &str,
+        source_hash: u64,
+        cache_identity: &str,
+        function: &BlockPyFunction<CodegenModuleShape>,
+        operator_specializations: &[(InstrId, u64)],
+    ) {
+        let serialized_function = test_serialized_function_id(0, function.function_id);
+        let plan = OptimizationPlan {
+            source: PythonModuleCacheSource::Project,
+            module_name: module_name.to_string(),
+            source_hash,
+            cache_identity: cache_identity.to_string(),
+            identity_tables: test_plan_identities(
+                module_name,
+                source_hash,
+                cache_identity,
+                serialized_function,
+                function.names.qualname.as_str(),
+                &[],
+            ),
+            functions: vec![FunctionOptimizationPlan {
+                function: serialized_function,
+                decisions: operator_specializations
+                    .iter()
+                    .map(|(instr_id, shape)| OptimizationDecision {
+                        instr_id: *instr_id,
+                        replacement: PlannedReplacement::Guarded {
+                            alternatives: vec![PlannedAlternative {
+                                guards: vec![PlannedGuard::ObservedShape {
+                                    family: ShapeFamily::Operator,
+                                    shape: *shape,
+                                }],
+                                action: PlannedAction::SpecializedShape {
+                                    family: ShapeFamily::Operator,
+                                    shape: *shape,
+                                },
+                            }],
+                            fallback: PlannedFallback::OriginalInstruction,
+                        },
+                    })
+                    .collect(),
+            }],
+        };
+        let plan_path = module_optimization_plan_path(
+            module_cache_root,
+            PythonModuleCacheSource::Project,
+            module_name,
+        )
+        .expect("test optimization plan path should build");
+        write_test_optimization_plan(plan_path.as_path(), &plan);
+    }
+
     fn test_serialized_function_id(
         serialized_module_id: u32,
         function_id: RuntimeFunctionId,
@@ -5827,42 +5881,15 @@ def build(values):
         let function = module.callable_defs[0].clone();
         let module_name = "counter_test";
         let soac_work_dir = fresh_test_work_dir("test-work");
-        write_test_counter_dump(
-            soac_work_dir.join("profile.bin").as_path(),
-            &CounterDumpRecord {
-                source_hash: 0,
-                module_name: module_name.to_string(),
-                package_name: None,
-                rows: operator_specializations
-                    .iter()
-                    .enumerate()
-                    .map(|(index, (instr_id, shape))| CounterDumpRow {
-                        counter_id: u32::try_from(index)
-                            .expect("test specialization count should fit in u32"),
-                        scope: "this".to_string(),
-                        kind: "operator_hot_shapes".to_string(),
-                        site_kind: "runtime".to_string(),
-                        function_id: Some(function.function_id),
-                        current_function_id: Some(function.function_id),
-                        instr_id: Some(*instr_id),
-                        function_qualname: Some(function.names.qualname.clone()),
-                        block_label: None,
-                        value: 1,
-                        observed_value: Some(*shape),
-                        max_overcount: Some(0),
-                    })
-                    .collect(),
-                module_keys: Vec::new(),
-                type_keys: Vec::new(),
-                type_table: Vec::new(),
-            },
-        );
+        let module_cache_root = soac_work_dir.join("modules");
 
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
         let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
+        let old_soac_module_cache_dir = std::env::var_os("SOAC_MODULE_CACHE_DIR");
         unsafe {
             std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
+            std::env::set_var("SOAC_MODULE_CACHE_DIR", &module_cache_root);
             std::env::set_var("SOAC_OPT_MODE", "apply");
         }
         crate::initialize_test_python();
@@ -5871,6 +5898,18 @@ def build(values):
             let shared_state =
                 crate::module_type::build_shared_state_for_testing(py, module, module_name, "")
                     .expect("shared state should build");
+            let cache_identity = pre_optimization_module_cache_identity(
+                env!("SOAC_BUILD_IDENTITY"),
+                shared_state.module_name == "soac.runtime",
+            );
+            write_test_operator_optimization_plan(
+                module_cache_root.as_path(),
+                module_name,
+                shared_state.source_hash,
+                cache_identity.as_str(),
+                &function,
+                operator_specializations,
+            );
             let compile_session = crate::session::CompileSession::new();
             let mut jit_module =
                 new_jit_module(&compile_session).expect("test jit module should construct");
@@ -5920,6 +5959,10 @@ def build(values):
             match old_soac_opt_mode {
                 Some(value) => std::env::set_var("SOAC_OPT_MODE", value),
                 None => std::env::remove_var("SOAC_OPT_MODE"),
+            }
+            match old_soac_module_cache_dir {
+                Some(value) => std::env::set_var("SOAC_MODULE_CACHE_DIR", value),
+                None => std::env::remove_var("SOAC_MODULE_CACHE_DIR"),
             }
         }
 
@@ -19237,8 +19280,6 @@ def f(x, y):
 
     #[test]
     fn profiled_store_call_rewrite_feeds_blockpy_inliner() {
-        let soac_work_dir = fresh_test_work_dir("profiled-store-call-inline-plan");
-        let profile_path = soac_work_dir.join("profile.bin");
         let module_name = "profiled_store_call_inline_plan_test";
         let module_name_gen = ModuleNameGen::new(0);
         let mut callee_function = test_function_in_module(&module_name_gen, "callee");
@@ -19296,35 +19337,14 @@ def f(x, y):
             module_name_gen,
             vec![callee_function.clone(), caller_function.clone()],
         );
-        write_test_counter_dump(
-            profile_path.as_path(),
-            &CounterDumpRecord {
-                source_hash: 0,
-                module_name: module_name.to_string(),
-                package_name: None,
-                rows: vec![CounterDumpRow {
-                    counter_id: 0,
-                    scope: "this".to_string(),
-                    kind: "call_hot_targets".to_string(),
-                    site_kind: "runtime".to_string(),
-                    function_id: Some(caller_function.function_id),
-                    current_function_id: Some(caller_function.function_id),
-                    instr_id: Some(call_instr_id),
-                    function_qualname: Some(caller_function.names.qualname.clone()),
-                    block_label: None,
-                    value: 1,
-                    observed_value: Some(callee_function.function_id.to_packed_runtime_u64()),
-                    max_overcount: Some(0),
-                }],
-                module_keys: Vec::new(),
-                type_keys: Vec::new(),
-                type_table: Vec::new(),
-            },
-        );
+        let mut caller_evidence = FunctionProfileEvidence::default();
+        caller_evidence
+            .call_target_specializations
+            .insert(call_instr_id, vec![callee_function.function_id]);
         let profile = SpecializationProfile::from_precompile(
             module_name,
-            Some(profile_path.as_path()),
-            HashMap::new(),
+            None,
+            HashMap::from([(caller_function.function_id, caller_evidence)]),
         )
         .expect("test specialization profile should construct");
         let plan = build_profiled_jit_module_plan(&module, &profile, None, None, &HashMap::new())
@@ -19358,8 +19378,6 @@ def f(x, y):
 
     #[test]
     fn profiled_no_arg_method_store_rewrite_uses_receiver_guard_and_inlines_target() {
-        let soac_work_dir = fresh_test_work_dir("profiled-method-call-inline-plan");
-        let profile_path = soac_work_dir.join("profile.bin");
         let module_name = "profiled_method_call_inline_plan_test";
         let module_name_gen = ModuleNameGen::new(0);
         let mut constants = TestConstantPool::default();
@@ -19415,35 +19433,14 @@ def f(x, y):
             vec![next_function.clone(), caller_function.clone()],
         );
         module.module_constants = constants.module_constants;
-        write_test_counter_dump(
-            profile_path.as_path(),
-            &CounterDumpRecord {
-                source_hash: 0,
-                module_name: module_name.to_string(),
-                package_name: None,
-                rows: vec![CounterDumpRow {
-                    counter_id: 0,
-                    scope: "this".to_string(),
-                    kind: "call_hot_targets".to_string(),
-                    site_kind: "runtime".to_string(),
-                    function_id: Some(caller_function.function_id),
-                    current_function_id: Some(caller_function.function_id),
-                    instr_id: Some(call_instr_id),
-                    function_qualname: Some(caller_function.names.qualname.clone()),
-                    block_label: None,
-                    value: 1,
-                    observed_value: Some(next_function.function_id.to_packed_runtime_u64()),
-                    max_overcount: Some(0),
-                }],
-                module_keys: Vec::new(),
-                type_keys: Vec::new(),
-                type_table: Vec::new(),
-            },
-        );
+        let mut caller_evidence = FunctionProfileEvidence::default();
+        caller_evidence
+            .call_target_specializations
+            .insert(call_instr_id, vec![next_function.function_id]);
         let profile = SpecializationProfile::from_precompile(
             module_name,
-            Some(profile_path.as_path()),
-            HashMap::new(),
+            None,
+            HashMap::from([(caller_function.function_id, caller_evidence)]),
         )
         .expect("test specialization profile should construct");
         let direct_owner_attr_specializations = HashMap::from([(

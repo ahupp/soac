@@ -246,13 +246,15 @@ typed variables must use recognized values. Boolean knobs accept `1`, `true`,
     already set it.
   - `profile`: run unspecialized, instrument specialization input
     counters, and write `$SOAC_WORK_DIR/profile.bin`.
-  - `verify`: read `$SOAC_WORK_DIR/profile.bin`, apply its
-    specializations, instrument specialization input counters again, and
-    write `$SOAC_WORK_DIR/verify.bin`. Verify mode exercises indexed
-    store fast paths so their hit/fallback counters measure the
-    specialized steady-state path.
-  - `apply`: read `$SOAC_WORK_DIR/profile.bin`, apply its
-    specializations, and emit no specialization counter dump files.
+  - `verify`: read per-module `mod.opt` optimization plans from the
+    active module cache, apply their specializations, instrument
+    specialization input counters again, and write
+    `$SOAC_WORK_DIR/verify.bin`. Verify mode exercises indexed store
+    fast paths so their hit/fallback counters measure the specialized
+    steady-state path.
+  - `apply`: read per-module `mod.opt` optimization plans from the
+    active module cache, apply their specializations, and emit no
+    specialization counter dump files.
     When event logging is enabled through `SOAC_LOG` or the default
     `$SOAC_WORK_DIR/events.jsonl`, apply mode still records in-process
     indexed specialization hit/fallback and deopt-entry counts long enough to
@@ -324,11 +326,13 @@ globals are out of scope for now.
   revision that it executed, so switch revisions first with `jj edit <rev>` if
   you want to benchmark some revision other than the current checkout. By
   default it keeps the benchmark log, raw counter files (`profile.bin`,
-  `verify.bin`, `events.jsonl`), and the revision-scoped BlockPy module cache
-  under `counters/modules`; it does not run `perf` and it does not build
-  inspector-based counter/CLIF artifacts. The specialized apply phase reports
-  both the default
-  refcounts-enabled throughput and an additional unsound
+  `verify.bin`, `events.jsonl`), generated `mod.opt` optimization plans, and
+  the revision-scoped BlockPy module cache under `counters/modules`; it does
+  not run `perf` and it does not build inspector-based counter/CLIF artifacts.
+  The profile pass is immediately followed by `decide_optimizations`, so verify
+  and apply consume planned decisions rather than raw counters. The specialized
+  apply phase reports both the default refcounts-enabled throughput and an
+  additional unsound
   `SOAC_JIT_EMIT_REFCOUNTS=0` diagnostic throughput.
 
 - `just benchmark-deep-profile`
@@ -338,14 +342,17 @@ globals are out of scope for now.
 
 - `just benchmark-deep-profile-from-profile <result-dir>`
   Start from an existing result directory with `counters/profile.bin`,
-  rerun only the verify pass to produce `verify.bin`, then add the same
-  deep-profile artifacts without rerunning the profile pass.
+  regenerate `mod.opt` plans, rerun only the verify pass to produce
+  `verify.bin`, then add the same deep-profile artifacts without rerunning the
+  profile pass.
 
 - `just precompile-shared-library counters=<profile.bin> out=<lib.so>`
   Offline precompile a counter-referenced set of cached BlockPy modules into
-  relocatable object files and link them into a shared library. The counter file
-  normally comes from a previous profile pass, and the matching pre-optimization
-  BlockPy cache entries must still exist in the active module cache. With the
+  relocatable object files and link them into a shared library. The recipe
+  regenerates `mod.opt` plans from the counter file before compiling. The
+  counter file normally comes from a previous profile pass, and the matching
+  pre-optimization BlockPy cache entries must still exist in the active module
+  cache. With the
   default benchmark cache isolation, that cache is the benchmark result's
   `counters/modules` directory; when `counters` points at
   `.../counters/profile.bin` and `SOAC_MODULE_CACHE_DIR` was not set explicitly,
@@ -364,9 +371,8 @@ globals are out of scope for now.
   to pretty-print a plan for inspection. `just benchmark` runs this after the
   profile pass so verify/apply exercise the decision artifacts. In
   `SOAC_OPT_MODE=verify|apply`, runtime specialization looks for a matching
-  `mod.opt` in the active module cache and uses it before falling back to
-  `profile.bin` counters for decision-backed call, operator, getitem, setitem,
-  and branch specializations.
+  `mod.opt` in the active module cache for decision-backed call, operator,
+  getitem, setitem, indexed-field, and branch specializations.
 
 - `SOAC_JIT_PERF_HELPER_FRAMES=1`
   In `fn should_preserve_perf_helper_frames`, at

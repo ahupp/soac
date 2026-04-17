@@ -2,7 +2,7 @@ use super::operation_specializations;
 use super::{
     CpythonTypeSymbol, ImportSpec, JitDeoptExitRef, JitEmitCtx, JitGuardMissDispatch, RelocTypeRef,
     SOAC_RUNTIME_LOAD_GLOBAL_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_IMPORT, SigType,
-    codegen_constant_string_value, emit_exact_type_version_match, emit_increment_counter_slot,
+    emit_exact_type_version_match, emit_increment_counter_slot,
     emit_owned_module_constant_from_parts, step_null_block_args,
 };
 use crate::jit::blockpy_intrinsics;
@@ -598,12 +598,10 @@ fn emit_specialized_getattr<'fb>(
     state: &mut impl OperationEmitState<'fb, InstrCodegen>,
 ) -> Option<ir::Value> {
     let instr_id = op.semantic_instr_id();
-    let attr_name = codegen_constant_string_value(state.ctx().module, op.attr.as_ref())?;
     let specializations = state
         .ctx()
         .field_index_specializations_by_instr
-        .get(&instr_id)
-        .or_else(|| state.ctx().field_index_specializations.get(attr_name))?
+        .get(&instr_id)?
         .iter()
         .cloned()
         .collect::<Vec<_>>();
@@ -757,12 +755,10 @@ fn emit_specialized_setattr<'fb>(
     }
 
     let instr_id = op.semantic_instr_id();
-    let attr_name = codegen_constant_string_value(state.ctx().module, op.attr.as_ref())?;
     let specializations = state
         .ctx()
         .field_index_specializations_by_instr
-        .get(&instr_id)
-        .or_else(|| state.ctx().field_index_specializations.get(attr_name))?
+        .get(&instr_id)?
         .iter()
         .cloned()
         .collect::<Vec<_>>();

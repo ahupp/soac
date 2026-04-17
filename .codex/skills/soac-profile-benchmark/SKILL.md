@@ -70,6 +70,7 @@ directory, especially:
 - `counters/profile.bin`
 - `counters/verify.bin`
 - `counters/events.jsonl`
+- `counters/modules/**/mod.opt`
 
 If the deep-profile recipe was used, also read:
 

@@ -16,10 +16,13 @@ use crate::config::{
 };
 use crate::counter::TopValueCounter;
 use crate::counter_dump::{
-    CollectedTypeKeyLayout, CounterDumpFile, CounterDumpTypeKey, collect_type_key_layouts,
-    collect_type_table, read_block_entry_counts_from_file, read_branch_preferences_from_file,
-    read_call_target_specializations_from_file, read_getitem_specializations_from_file,
-    read_operator_specializations_from_file, read_setitem_specializations_from_file,
+    CollectedTypeKeyLayout, CounterDumpTypeKey, read_block_entry_counts_from_file,
+};
+#[cfg(test)]
+use crate::counter_dump::{
+    CounterDumpFile, CounterDumpKeyLayout, CounterDumpRecord, CounterDumpRow,
+    CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry, collect_type_key_layouts,
+    collect_type_table, write_counter_dump_records,
 };
 use crate::function_instantiation::{
     SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_SYMBOL, make_function_kind_abi_tag,
@@ -27,6 +30,8 @@ use crate::function_instantiation::{
 };
 use crate::module_constants::{ModuleCodegenConstants, ModuleConstantId};
 use crate::module_type::{CounterRuntimeSlot, SharedModuleState, build_counter_storage_layout};
+#[cfg(test)]
+use crate::optimization_plan::ProfileEvidenceStore;
 use crate::optimization_plan::{
     FunctionProfileEvidence, OptimizationPlan, PlannedIndexedFieldSpecialization,
     load_optimization_plan,
@@ -1291,11 +1296,6 @@ fn predeclare_specialization_type_imports(
     profile: &SpecializationProfile<'_>,
 ) -> Result<(), String> {
     let mut type_refs = HashSet::new();
-    for specializations in profile.counter_field_index_specializations()?.values() {
-        for specialization in specializations {
-            type_refs.insert(specialization.owner_type_ref.clone());
-        }
-    }
     for evidence in profile.planned_evidence.values() {
         for planned_specializations in evidence.field_index_specializations.values() {
             for planned in planned_specializations {
@@ -12472,15 +12472,13 @@ pub(super) fn typed_constant_string_value<'a>(
 }
 
 fn annotate_typed_attr_accesses(
-    module: &BlockPyModule<CodegenModuleShape>,
+    _module: &BlockPyModule<CodegenModuleShape>,
     function: &mut BlockPyFunction<TypedCodegenModuleShape>,
-    field_index_specializations: &HashMap<String, Vec<FieldIndexSpecialization>>,
+    _field_index_specializations: &HashMap<String, Vec<FieldIndexSpecialization>>,
     field_index_specializations_by_instr: &HashMap<InstrId, Vec<FieldIndexSpecialization>>,
     specialize_stores: bool,
 ) -> usize {
     struct Annotator<'a> {
-        module: &'a BlockPyModule<CodegenModuleShape>,
-        field_index_specializations: &'a HashMap<String, Vec<FieldIndexSpecialization>>,
         field_index_specializations_by_instr: &'a HashMap<InstrId, Vec<FieldIndexSpecialization>>,
         specialize_stores: bool,
         count: usize,
@@ -12490,14 +12488,10 @@ fn annotate_typed_attr_accesses(
         fn guards_for_attr(
             &self,
             instr_id: InstrId,
-            attr: &InstrTyped,
+            _attr: &InstrTyped,
         ) -> Option<Vec<TypedIndexedFieldGuard>> {
             self.field_index_specializations_by_instr
                 .get(&instr_id)
-                .or_else(|| {
-                    typed_constant_string_value(self.module, attr)
-                        .and_then(|attr_name| self.field_index_specializations.get(attr_name))
-                })
                 .filter(|specializations| !specializations.is_empty())
                 .map(|specializations| {
                     specializations
@@ -12534,8 +12528,6 @@ fn annotate_typed_attr_accesses(
     }
 
     let mut annotator = Annotator {
-        module,
-        field_index_specializations,
         field_index_specializations_by_instr,
         specialize_stores,
         count: 0,
@@ -12934,7 +12926,168 @@ fn load_planned_evidence_for_runtime_state(
         .map_err(|err| err.to_string())?;
         return planned_evidence_for_shared_state(&plan, shared_state, compile_session);
     }
+    #[cfg(test)]
+    if let Some(evidence) = synthesize_test_planned_evidence_for_runtime_state(
+        cache_root.as_path(),
+        shared_state,
+        compile_session,
+    )? {
+        return Ok(evidence);
+    }
     Ok(HashMap::new())
+}
+
+#[cfg(test)]
+fn synthesize_test_planned_evidence_for_runtime_state(
+    cache_root: &Path,
+    shared_state: &SharedModuleState,
+    compile_session: Option<&crate::session::CompileSession>,
+) -> Result<Option<HashMap<RuntimeFunctionId, FunctionProfileEvidence>>, String> {
+    let Some(path) = counter_dump_input_path_from_env()? else {
+        return Ok(None);
+    };
+    let path = path.as_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let mut evidence_store = ProfileEvidenceStore::from_counter_dump(path).map_err(|err| {
+        format!(
+            "load test optimization evidence from {}: {err}",
+            path.display()
+        )
+    })?;
+    let Some(source_hash) = evidence_store.module_source_hash(shared_state.module_name.as_str())
+    else {
+        return Ok(None);
+    };
+    if source_hash != shared_state.source_hash {
+        if source_hash != 0 {
+            return Ok(None);
+        }
+        std::fs::create_dir_all(cache_root).map_err(|err| {
+            format!(
+                "create synthesized test evidence dir {}: {err}",
+                cache_root.display()
+            )
+        })?;
+        let adjusted_path = cache_root.join(".test-profile-source-hash-adjusted.bin");
+        let dump = CounterDumpFile::open(path)?;
+        let records = dump
+            .records()?
+            .into_iter()
+            .map(|record| {
+                let module_name = record.module_name()?.to_string();
+                let source_hash = if module_name == shared_state.module_name {
+                    shared_state.source_hash
+                } else {
+                    record.source_hash()
+                };
+                let mut rows = Vec::new();
+                for row_index in 0..record.row_count() {
+                    let row = record.row(row_index)?;
+                    rows.push(CounterDumpRow {
+                        counter_id: row.counter_id,
+                        scope: row.scope.to_string(),
+                        kind: row.kind.to_string(),
+                        site_kind: row.site_kind.to_string(),
+                        function_id: row.function_id,
+                        current_function_id: row.current_function_id,
+                        instr_id: row.instr_id,
+                        function_qualname: row.function_qualname.map(str::to_string),
+                        block_label: row.block_label.map(str::to_string),
+                        value: row.value,
+                        observed_value: row.observed_value,
+                        max_overcount: row.max_overcount,
+                    });
+                }
+                let mut module_keys = Vec::new();
+                for key_index in 0..record.module_key_count() {
+                    let key = record.module_key(key_index)?;
+                    module_keys.push(CounterDumpKeyLayout {
+                        owner: key.owner.to_string(),
+                        key: key.key.to_string(),
+                        index: key.index,
+                    });
+                }
+                let mut type_keys = Vec::new();
+                for key_index in 0..record.type_key_count() {
+                    let key = record.type_key(key_index)?;
+                    type_keys.push(CounterDumpTypeKeyLayout {
+                        owner_type_id: key.owner_type_id,
+                        key: key.key.to_string(),
+                        index: key.index,
+                    });
+                }
+                let mut type_table = Vec::new();
+                for entry_index in 0..record.type_table_count() {
+                    let entry = record.type_table_entry(entry_index)?;
+                    type_table.push(CounterDumpTypeTableEntry {
+                        type_id: entry.type_id,
+                        key: CounterDumpTypeKey {
+                            module_name: entry.module_name.to_string(),
+                            qualname: entry.qualname.to_string(),
+                        },
+                    });
+                }
+                Ok(CounterDumpRecord {
+                    source_hash,
+                    module_name,
+                    package_name: record.package_name()?.map(str::to_string),
+                    rows,
+                    module_keys,
+                    type_keys,
+                    type_table,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        write_counter_dump_records(adjusted_path.as_path(), records.iter())?;
+        evidence_store =
+            ProfileEvidenceStore::from_counter_dump(adjusted_path.as_path()).map_err(|err| {
+                format!(
+                    "load adjusted test optimization evidence from {}: {err}",
+                    adjusted_path.display()
+                )
+            })?;
+    }
+    let cache_identity = pre_optimization_module_cache_identity(
+        env!("SOAC_BUILD_IDENTITY"),
+        shared_state.module_name == "soac.runtime",
+    );
+    let metadata = soac_blockpy::codegen_cache::CachedCodegenModuleMetadata {
+        source: shared_state
+            .module_cache_source
+            .unwrap_or(PythonModuleCacheSource::Project),
+        module_name: shared_state.module_name.clone(),
+        source_hash: shared_state.source_hash,
+        cache_identity,
+    };
+    let plan =
+        OptimizationPlan::from_evidence(&metadata, &shared_state.lowered_module, &evidence_store);
+    if plan.functions.is_empty() {
+        return Ok(None);
+    }
+    let path = module_optimization_plan_path(
+        cache_root,
+        metadata.source,
+        shared_state.module_name.as_str(),
+    )?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "create synthesized test plan dir {}: {err}",
+                parent.display()
+            )
+        })?;
+    }
+    let archive = rkyv::to_bytes::<rkyv::rancor::Error>(&plan)
+        .map_err(|err| format!("serialize synthesized test optimization plan: {err}"))?;
+    std::fs::write(path.as_path(), archive.as_ref()).map_err(|err| {
+        format!(
+            "write synthesized test optimization plan {}: {err}",
+            path.display()
+        )
+    })?;
+    planned_evidence_for_shared_state(&plan, shared_state, compile_session).map(Some)
 }
 
 fn planned_evidence_for_shared_state(
@@ -13147,106 +13300,84 @@ impl<'a> SpecializationProfile<'a> {
     }
 
     fn has_specialization_inputs(&self) -> bool {
-        !self.planned_evidence.is_empty() || self.has_existing_counter_dump()
+        !self.planned_evidence.is_empty()
+            || (self.profiled_cold_blocks && self.has_existing_counter_dump())
     }
 
     fn call_target_specializations(
         &self,
         function_id: RuntimeFunctionId,
     ) -> Result<HashMap<InstrId, Vec<RuntimeFunctionId>>, String> {
-        if let Some(evidence) = self.planned_evidence.get(&function_id) {
-            return Ok(evidence.call_target_specializations.clone());
-        }
-        let Some(module_name) = self.module_name else {
-            return Ok(HashMap::new());
-        };
-        let Some(path) = existing_counter_dump_path(self.counter_dump_path.as_deref()) else {
-            return Ok(HashMap::new());
-        };
-        read_call_target_specializations_from_file(path, module_name, function_id)
+        Ok(self
+            .planned_evidence
+            .get(&function_id)
+            .map(|evidence| evidence.call_target_specializations.clone())
+            .unwrap_or_default())
     }
 
     fn operator_specializations(
         &self,
         function_id: RuntimeFunctionId,
     ) -> Result<HashMap<InstrId, Vec<u64>>, String> {
-        if let Some(evidence) = self.planned_evidence.get(&function_id) {
-            return Ok(evidence.operator_specializations.clone());
-        }
-        let Some(module_name) = self.module_name else {
-            return Ok(HashMap::new());
-        };
-        let Some(path) = existing_counter_dump_path(self.counter_dump_path.as_deref()) else {
-            return Ok(HashMap::new());
-        };
-        read_operator_specializations_from_file(path, module_name, function_id)
+        Ok(self
+            .planned_evidence
+            .get(&function_id)
+            .map(|evidence| evidence.operator_specializations.clone())
+            .unwrap_or_default())
     }
 
     fn getitem_specializations(
         &self,
         function_id: RuntimeFunctionId,
     ) -> Result<HashMap<InstrId, Vec<u64>>, String> {
-        if let Some(evidence) = self.planned_evidence.get(&function_id) {
-            return Ok(evidence.getitem_specializations.clone());
-        }
-        let Some(module_name) = self.module_name else {
-            return Ok(HashMap::new());
-        };
-        let Some(path) = existing_counter_dump_path(self.counter_dump_path.as_deref()) else {
-            return Ok(HashMap::new());
-        };
-        read_getitem_specializations_from_file(path, module_name, function_id)
+        Ok(self
+            .planned_evidence
+            .get(&function_id)
+            .map(|evidence| evidence.getitem_specializations.clone())
+            .unwrap_or_default())
     }
 
     fn setitem_specializations(
         &self,
         function_id: RuntimeFunctionId,
     ) -> Result<HashMap<InstrId, Vec<u64>>, String> {
-        if let Some(evidence) = self.planned_evidence.get(&function_id) {
-            return Ok(evidence.setitem_specializations.clone());
-        }
-        let Some(module_name) = self.module_name else {
-            return Ok(HashMap::new());
-        };
-        let Some(path) = existing_counter_dump_path(self.counter_dump_path.as_deref()) else {
-            return Ok(HashMap::new());
-        };
-        read_setitem_specializations_from_file(path, module_name, function_id)
+        Ok(self
+            .planned_evidence
+            .get(&function_id)
+            .map(|evidence| evidence.setitem_specializations.clone())
+            .unwrap_or_default())
     }
 
     fn branch_preferences(
         &self,
         function_id: RuntimeFunctionId,
     ) -> Result<HashMap<InstrId, bool>, String> {
-        if let Some(evidence) = self.planned_evidence.get(&function_id) {
-            return Ok(evidence.branch_prefer_true.clone());
-        }
-        let Some(module_name) = self.module_name else {
-            return Ok(HashMap::new());
-        };
-        let Some(path) = existing_counter_dump_path(self.counter_dump_path.as_deref()) else {
-            return Ok(HashMap::new());
-        };
-        read_branch_preferences_from_file(path, module_name, function_id)
-    }
-
-    fn counter_field_index_specializations(
-        &self,
-    ) -> Result<HashMap<String, Vec<FieldIndexSpecialization>>, String> {
-        let Some(path) = existing_counter_dump_path(self.counter_dump_path.as_deref()) else {
-            return Ok(HashMap::new());
-        };
-        load_field_index_specializations_from_path(path)
+        Ok(self
+            .planned_evidence
+            .get(&function_id)
+            .map(|evidence| evidence.branch_prefer_true.clone())
+            .unwrap_or_default())
     }
 
     fn field_index_specializations(
         &self,
-        function_id: RuntimeFunctionId,
+        _function_id: RuntimeFunctionId,
     ) -> Result<HashMap<String, Vec<FieldIndexSpecialization>>, String> {
-        if self.planned_evidence.contains_key(&function_id) {
-            return Ok(HashMap::new());
+        let mut out = HashMap::<String, Vec<FieldIndexSpecialization>>::new();
+        for evidence in self.planned_evidence.values() {
+            for planned_specializations in evidence.field_index_specializations.values() {
+                for planned in planned_specializations {
+                    if let Some(specialization) = field_index_specialization_from_planned(planned)?
+                    {
+                        push_unique_specialization(
+                            out.entry(planned.attr_name.clone()).or_default(),
+                            specialization,
+                        );
+                    }
+                }
+            }
         }
-        self.counter_field_index_specializations()
+        Ok(out)
     }
 
     fn field_index_specializations_by_instr(
@@ -13818,6 +13949,7 @@ fn push_unique_specialization(
     }
 }
 
+#[cfg(test)]
 fn load_field_index_specializations_from_path(
     path: &Path,
 ) -> Result<HashMap<String, Vec<FieldIndexSpecialization>>, String> {

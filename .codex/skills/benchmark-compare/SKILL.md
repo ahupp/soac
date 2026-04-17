@@ -25,8 +25,10 @@ Important files:
 - `benchmark.txt`: textual report with profile, verify, and specialized
   apply-pass timings.
 - `counters/profile.bin`: counters collected by the profile pass.
+- `counters/modules/**/mod.opt`: optimization decisions generated from the
+  profile counters and cached BlockPy modules.
 - `counters/verify.bin`: verify-mode counters collected while applying
-  profile specializations.
+  planned specializations.
 - `profile_counters.txt` and `verify_counters.txt`: textual counter dumps.
 - `profile_specializations.txt` and `verify_specializations.txt`:
   specialization summaries.

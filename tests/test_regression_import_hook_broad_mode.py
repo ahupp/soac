@@ -10,7 +10,7 @@ import sys
 import pytest
 
 from soac import import_hook
-from tests._integration import soac_module
+from tests._integration import decide_optimizations_for_work_dir, soac_module
 
 BROAD_MODE_SLOW = pytest.mark.slow(
     reason="broad import-hook mode transforms stdlib dependency graphs in fresh processes"
@@ -918,6 +918,13 @@ assert runtime.typing_Generic is not None
         text=True,
     )
     assert profile_result.returncode == 0, profile_result.stdout + profile_result.stderr
+    assert (
+        decide_optimizations_for_work_dir(
+            tmp_path / "runtime-profile-counters",
+            module_cache_dir=tmp_path / "module-cache",
+        )
+        >= 1
+    )
 
     verify_result = subprocess.run(
         [sys.executable, "-c", script],

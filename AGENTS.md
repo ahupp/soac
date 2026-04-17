@@ -427,11 +427,14 @@ so a later turn can resume without rediscovering context.
   `apply`; recipes should pass the same `SOAC_WORK_DIR` and change only
   the mode between passes. `none` is the explicit ordinary
   unspecialized/no-counter mode and should not read or write counter
-  dumps. `verify` exercises indexed store fast paths so hit/fallback
-  counters measure the specialized steady-state path. `apply` still
-  skips counter dump files, but when event logging is enabled it records
-  indexed specialization hit/fallback counts and deopt-entry counts long enough
-  to emit `soac_specialization_runtime` summary events.
+  dumps. `profile` writes raw evidence to `profile.bin`; run
+  `decide_optimizations` to turn that evidence plus cached BlockPy modules into
+  per-module `mod.opt` plans before entering `verify` or `apply`. `verify`
+  exercises indexed store fast paths so hit/fallback counters measure the
+  specialized steady-state path. `apply` still skips counter dump files, but
+  when event logging is enabled it records indexed specialization hit/fallback
+  counts and deopt-entry counts long enough to emit
+  `soac_specialization_runtime` summary events.
 - `SOAC_ENABLE_PROFILED_COLD_BLOCKS`
   Optional opt-in for replaying `block_entry` counters from
   `$SOAC_WORK_DIR/profile.bin` as Cranelift `cold` block hints during
@@ -501,22 +504,24 @@ so a later turn can resume without rediscovering context.
 - `just precompile-shared-library counters=<profile.bin> out=<lib.so>`
   Offline precompiles all modules referenced by a counter dump from cached
   pre-optimization BlockPy modules, writes per-module object files, and links a
-  shared library. It expects matching module-cache entries in
+  shared library. The recipe regenerates `mod.opt` plans before compiling. It
+  expects matching module-cache entries in
   `SOAC_MODULE_CACHE_DIR`, in `$SOAC_WORK_DIR/modules` when the cache
   directory is unset, or in `<counters-dir>/modules` when precompiling from an
   explicit counter dump; run a profile/benchmark pass first when the cache is
   empty. Use `SOAC_PRECOMPILED_LIBRARY` to point runtime execution at the
   resulting shared library.
-- `cargo run -p soac-inspector --bin decide_optimizations -- --counters <profile.bin> --module <mod.blockpy> --out <root-dir>`
+- `cargo run -p soac-inspector --bin decide_optimizations -- --counters <profile.bin> --out <root-dir>`
   Standalone optimization-decision planner. It loads the counter dump once,
-  loads one cached BlockPy module, and writes the module's binary `mod.opt`
-  artifact under the requested root, such as
-  `$SOAC_WORK_DIR/modules/python-stdlib/typing/mod.opt`. Use
+  scans cached BlockPy modules under the output root by default, and writes
+  binary `mod.opt` artifacts beside those modules, such as
+  `$SOAC_WORK_DIR/modules/python-stdlib/typing/mod.opt`. Use `--module` for a
+  narrow debugging input or `--module-root` to scan a different cache root. Use
   `cargo run -p soac-inspector --bin print_optimization_plan -- --plan <mod.opt>`
   to pretty-print it for inspection. In `SOAC_OPT_MODE=verify|apply`, runtime
   specialization looks for a matching `mod.opt` in the active module cache and
-  uses it before falling back to `profile.bin` counters for decision-backed
-  call, operator, getitem, setitem, and branch specializations.
+  uses it for decision-backed call, operator, getitem, setitem, indexed-field,
+  and branch specializations.
 - `SOAC_CRANELIFT_OPT_LEVEL`
   Optional Cranelift process-JIT optimization level override:
   `none`, `speed`, or `speed_and_size`. Normal runtime and benchmark
