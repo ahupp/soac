@@ -170,6 +170,10 @@ survives the specialization guard lowering.
 Typed attribute get/set fallback and indexed field get/set emission now also
 consume typed PyObject input ownership and release only operands that were
 actually materialized as owned temporaries.
+Side-effect operations that return `None` by helper convention now carry
+`None` singleton facts, giving planned-result consumers a structured way to
+recognize their immortal result instead of special-casing helper names in
+codegen.
 Return values, local store RHS expressions, raise exception expressions,
 generic/direct call inputs, and operator/intrinsic inputs are annotated before
 JIT codegen and consumed directly from the typed instruction.

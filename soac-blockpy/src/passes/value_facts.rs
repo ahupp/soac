@@ -551,6 +551,10 @@ impl FunctionFactInferer<'_> {
                 infer_unary_result_facts(op.kind, self.infer_expr_facts(&op.operand))
                     .unwrap_or_else(ValueFacts::unknown_pyobj)
             }
+            InstrCodegen::SetAttr(_)
+            | InstrCodegen::SetItem(_)
+            | InstrCodegen::DelItem(_)
+            | InstrCodegen::Del(_) => ValueFacts::PyObj(PyObjFacts::none_singleton()),
             InstrCodegen::Tuple(_) => ValueFacts::PyObj(PyObjFacts::known_not_none()),
             _ => ValueFacts::unknown_pyobj(),
         }
@@ -974,6 +978,24 @@ mod test {
         }
     }
 
+    struct FirstMatchingInstrFinder {
+        key: Option<crate::block_py::InstrKey>,
+        function_id: crate::block_py::FunctionId,
+        matches: fn(&InstrCodegen) -> bool,
+    }
+
+    impl Visit<InstrCodegen> for FirstMatchingInstrFinder {
+        fn visit_instr(&mut self, expr: &InstrCodegen)
+        where
+            InstrCodegen: ChildVisitable<InstrCodegen>,
+        {
+            if self.key.is_none() && (self.matches)(expr) {
+                self.key = Some(expr.semantic_instr_key(self.function_id));
+            }
+            expr.visit_children(self);
+        }
+    }
+
     fn returned_py_facts(source: &str) -> PyObjFacts {
         let lowered = lower_python_to_blockpy_for_testing(
             format!(
@@ -1001,6 +1023,41 @@ def f():
         let facts = infer_module_value_facts(&lowered);
         let Some(ValueFacts::PyObj(py_facts)) = facts.fact_for(none_key) else {
             panic!("missing facts for returned expression");
+        };
+        py_facts
+    }
+
+    fn first_matching_instr_py_facts(
+        function_body: &str,
+        matches: fn(&InstrCodegen) -> bool,
+    ) -> PyObjFacts {
+        let lowered = lower_python_to_blockpy_for_testing(
+            format!(
+                r#"
+def f(obj, key, value):
+{function_body}
+"#,
+            )
+            .as_str(),
+        )
+        .expect("transform should succeed")
+        .codegen_module;
+        let function = lowered
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "f")
+            .expect("missing lowered function f");
+        let mut finder = FirstMatchingInstrFinder {
+            key: None,
+            function_id: function.function_id,
+            matches,
+        };
+        finder.visit_fn(function);
+        let key = finder.key.expect("expected matching instruction");
+
+        let facts = infer_module_value_facts(&lowered);
+        let Some(ValueFacts::PyObj(py_facts)) = facts.fact_for(key) else {
+            panic!("missing facts for matching instruction");
         };
         py_facts
     }
@@ -1160,6 +1217,33 @@ def f(x, flag):
         assert_eq!(py_facts.bool_singleton, BoolSingletonFact::IsFalse);
         assert_eq!(py_facts.refcount, RefcountFact::Immortal);
         assert_eq!(py_facts.is_truthy(), Some(false));
+    }
+
+    #[test]
+    fn infers_none_singleton_facts_for_side_effect_operation_results() {
+        for (source, matches) in [
+            (
+                "    obj.attr = value",
+                (|expr| matches!(expr, InstrCodegen::SetAttr(_))) as fn(&InstrCodegen) -> bool,
+            ),
+            (
+                "    obj[key] = value",
+                (|expr| matches!(expr, InstrCodegen::SetItem(_))) as fn(&InstrCodegen) -> bool,
+            ),
+            (
+                "    del obj[key]",
+                (|expr| matches!(expr, InstrCodegen::DelItem(_))) as fn(&InstrCodegen) -> bool,
+            ),
+            (
+                "    del value",
+                (|expr| matches!(expr, InstrCodegen::Del(_))) as fn(&InstrCodegen) -> bool,
+            ),
+        ] {
+            let py_facts = first_matching_instr_py_facts(source, matches);
+            assert!(py_facts.is_none(), "{source}");
+            assert!(py_facts.is_exact_type(PyExactType::NoneType), "{source}");
+            assert!(py_facts.is_immortal(), "{source}");
+        }
     }
 
     #[test]

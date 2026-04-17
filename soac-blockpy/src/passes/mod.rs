@@ -2269,6 +2269,11 @@ fn infer_typed_instr_result_facts(expr: &InstrTyped) -> Option<ValueFacts> {
             op.args.as_slice(),
             op.keywords.as_slice(),
         ),
+        InstrTyped::SetAttrTyped(_)
+        | InstrTyped::LegacySetAttr(_)
+        | InstrTyped::LegacySetItem(_)
+        | InstrTyped::LegacyDelItem(_)
+        | InstrTyped::LegacyDel(_) => Some(ValueFacts::PyObj(PyObjFacts::none_singleton())),
         _ => None,
     }
 }
