@@ -18,6 +18,7 @@ mod bb_shape;
 mod compat;
 pub(crate) mod expr_lowering;
 mod module_plan;
+mod param_specs;
 mod stmt_lowering;
 mod stmt_sequences;
 mod try_regions;

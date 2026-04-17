@@ -28,15 +28,15 @@ use crate::block_py::{
     ExprEllipsisLiteral, ExprFString, ExprGenerator, ExprIf, ExprIpyEscapeCommand, ExprLambda,
     ExprList, ExprListComp, ExprName, ExprNamed, ExprNoneLiteral, ExprNumberLiteral, ExprSet,
     ExprSetComp, ExprSlice, ExprStarred, ExprStringLiteral, ExprSubscript, ExprTString, ExprTuple,
-    GetAttr, GetItem, HasMeta, IdentifiedInstr, IncrementCounter, Instr, InstrKey,
-    InstrWithConstantNone, LiteralValue, Load, LocalLocation, MakeCell, MakeFunction,
-    MakeFunctionWithClosure, MapFunction, MapInstr, MapModule, Mappable, Meta, ModuleShape,
-    NameLike, NameLocation, ResolvedName, RuntimeFunctionId, RuntimeName, SetAttr, SetItem,
-    StmtAnnAssign, StmtAssert, StmtAssign, StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue,
-    StmtDelete, StmtExpr, StmtFor, StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom,
-    StmtIpyEscapeCommand, StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry,
-    StmtTypeAlias, StmtWhile, StmtWith, Store, TryMapInstr, TryMapModule, TryMapTerm, Tuple,
-    UnaryOp, UnresolvedName, Visit, VisitMut, WithMeta, Yield, YieldFrom,
+    GetAttr, GetItem, HasMeta, IncrementCounter, Instr, InstrKey, InstrWithConstantNone,
+    LiteralValue, Load, LocalLocation, MakeCell, MakeFunction, MakeFunctionWithClosure,
+    MapFunction, MapInstr, MapModule, Mappable, Meta, ModuleShape, NameLike, NameLocation,
+    ResolvedName, RuntimeFunctionId, RuntimeName, SetAttr, SetItem, StmtAnnAssign, StmtAssert,
+    StmtAssign, StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue, StmtDelete, StmtExpr,
+    StmtFor, StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom, StmtIpyEscapeCommand,
+    StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry, StmtTypeAlias, StmtWhile,
+    StmtWith, Store, TryMapInstr, TryMapModule, TryMapTerm, Tuple, UnaryOp, UnresolvedName, Visit,
+    VisitMut, WithMeta, Yield, YieldFrom,
 };
 use ruff_python_ast::{self as ast};
 use soac_macros::{enum_broadcast, DelegateMatchDefault};
@@ -109,6 +109,7 @@ pub struct RuffModuleShape;
 
 impl ModuleShape for RuffModuleShape {
     type Instr = InstrRuff;
+    type ModuleConstant = InstrResolved;
 }
 
 impl Instr for InstrRuff {
@@ -2791,14 +2792,6 @@ pub fn try_lower_typed_module_to_codegen_legacy(
     TypedToCodegen.try_map_module(module)
 }
 
-impl<I> Instr for IdentifiedInstr<I>
-where
-    I: Instr,
-{
-    type Name = I::Name;
-    type Extra = I::Extra;
-}
-
 impl InstrWithConstantNone for InstrCodegenOp {
     fn constant_none() -> Self {
         runtime_name_load("NONE")
@@ -2985,6 +2978,7 @@ pub struct CoreModuleShapeWithAwaitAndYield;
 
 impl ModuleShape for CoreModuleShapeWithAwaitAndYield {
     type Instr = InstrWithAwaitAndYield;
+    type ModuleConstant = InstrResolved;
 }
 
 #[derive(Debug, Clone)]
@@ -2992,6 +2986,7 @@ pub struct CoreModuleShapeWithYield;
 
 impl ModuleShape for CoreModuleShapeWithYield {
     type Instr = InstrWithYield;
+    type ModuleConstant = InstrResolved;
 }
 
 #[derive(Debug, Clone)]
@@ -2999,6 +2994,7 @@ pub struct CoreModuleShape;
 
 impl ModuleShape for CoreModuleShape {
     type Instr = InstrLow<UnresolvedName>;
+    type ModuleConstant = InstrResolved;
 }
 
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -3006,6 +3002,7 @@ pub struct ResolvedStorageModuleShape;
 
 impl ModuleShape for ResolvedStorageModuleShape {
     type Instr = InstrResolved;
+    type ModuleConstant = InstrResolved;
 }
 
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -3013,6 +3010,7 @@ pub struct CodegenModuleShape;
 
 impl ModuleShape for CodegenModuleShape {
     type Instr = InstrCodegen;
+    type ModuleConstant = InstrResolved;
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -3065,6 +3063,7 @@ pub struct TypedCodegenModuleShape;
 
 impl ModuleShape for TypedCodegenModuleShape {
     type Instr = InstrTyped;
+    type ModuleConstant = InstrResolved;
 }
 
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -3072,6 +3071,7 @@ pub struct CodegenUnidentifiedModuleShape;
 
 impl ModuleShape for CodegenUnidentifiedModuleShape {
     type Instr = InstrCodegen;
+    type ModuleConstant = InstrResolved;
 }
 
 pub(crate) use blockpy_generators::lower_yield_in_lowered_core_blockpy_module_bundle;

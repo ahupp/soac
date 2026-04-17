@@ -1,4 +1,3 @@
-use crate::block_py::param_specs::{collect_param_spec_and_defaults, param_defaults_to_expr};
 use crate::block_py::{
     BindingKind, BlockPyFunction, BlockPyModule, CallableScopeInfo, CellBindingKind, FunctionKind,
     FunctionNameGen, ModuleNameGen, ModuleShape,
@@ -9,6 +8,9 @@ use crate::passes::ast_to_ast::rewrite_class_def::make_type_param_info;
 use crate::passes::ast_to_ast::rewrite_stmt;
 use crate::passes::ast_to_ast::rewrite_stmt::annotation::FUNCTION_ANNOTATE_PREFIX;
 use crate::passes::ast_to_ast::semantic::{SemanticAstState, SemanticScope};
+use crate::passes::ruff_to_blockpy::param_specs::{
+    collect_param_spec_and_defaults, param_defaults_to_expr,
+};
 use crate::passes::CoreModuleShapeWithAwaitAndYield;
 use crate::transformer::{walk_expr, walk_stmt, Transformer};
 use crate::{py_expr, py_stmt, py_stmt_typed};

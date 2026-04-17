@@ -1,6 +1,19 @@
 [workspace]
-members = ["soac-blockpy", "soac-pyo3", "soac-jit", "soac-inspector", "soac-macros"]
-default-members = ["soac-blockpy", "soac-pyo3", "soac-jit", "soac-inspector"]
+members = [
+    "soac-blockpy",
+    "soac-core",
+    "soac-pyo3",
+    "soac-jit",
+    "soac-inspector",
+    "soac-macros",
+]
+default-members = [
+    "soac-blockpy",
+    "soac-core",
+    "soac-pyo3",
+    "soac-jit",
+    "soac-inspector",
+]
 # soac-runtime is standalone since its built to CLIF 
 exclude = ["soac-runtime"]
 resolver = "2"

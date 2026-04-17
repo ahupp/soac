@@ -1,0 +1,10 @@
+[package]
+name = "soac-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = { version = "1.0.100", features = ["backtrace"] }
+rkyv = { version = "0.8", default-features = false, features = ["std", "bytecheck"] }
+ruff_python_ast = { workspace = true }
+ruff_text_size = { workspace = true }

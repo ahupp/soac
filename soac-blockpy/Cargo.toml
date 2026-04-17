@@ -28,3 +28,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 anyhow = { version = "1.0.100", features = ["backtrace"] }
 derive_more = { version = "2", features = ["from"] }
 soac-macros = { path = "../soac-macros" }
+soac-core = { path = "../soac-core" }

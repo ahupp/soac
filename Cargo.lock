@@ -1738,9 +1738,20 @@ dependencies = [
  "ruff_text_size",
  "serde_json",
  "similar",
+ "soac-core",
  "soac-macros",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "soac-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rkyv",
+ "ruff_python_ast",
+ "ruff_text_size",
 ]
 
 [[package]]

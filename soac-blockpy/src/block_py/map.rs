@@ -170,7 +170,7 @@ where
 pub(crate) trait MapModule<PIn, POut>: MapFunction<PIn, POut>
 where
     PIn: ModuleShape,
-    POut: ModuleShape,
+    POut: ModuleShape<ModuleConstant = PIn::ModuleConstant>,
 {
     fn map_module(&mut self, module: BlockPyModule<PIn>) -> BlockPyModule<POut> {
         BlockPyModule {
@@ -190,7 +190,7 @@ where
 impl<PIn, POut, M> MapModule<PIn, POut> for M
 where
     PIn: ModuleShape,
-    POut: ModuleShape,
+    POut: ModuleShape<ModuleConstant = PIn::ModuleConstant>,
     M: MapFunction<PIn, POut>,
 {
 }
@@ -223,7 +223,7 @@ pub(crate) fn map_module_functions<PIn, POut>(
 ) -> BlockPyModule<POut>
 where
     PIn: ModuleShape,
-    POut: ModuleShape,
+    POut: ModuleShape<ModuleConstant = PIn::ModuleConstant>,
 {
     BlockPyModule {
         module_name_gen: module.module_name_gen,
@@ -340,7 +340,7 @@ where
 pub(crate) trait TryMapModule<PIn, POut, Error>: TryMapFunction<PIn, POut, Error>
 where
     PIn: ModuleShape,
-    POut: ModuleShape,
+    POut: ModuleShape<ModuleConstant = PIn::ModuleConstant>,
 {
     fn try_map_module(&mut self, module: BlockPyModule<PIn>) -> Result<BlockPyModule<POut>, Error> {
         Ok(BlockPyModule {
@@ -360,7 +360,7 @@ where
 impl<PIn, POut, Error, M> TryMapModule<PIn, POut, Error> for M
 where
     PIn: ModuleShape,
-    POut: ModuleShape,
+    POut: ModuleShape<ModuleConstant = PIn::ModuleConstant>,
     M: TryMapFunction<PIn, POut, Error>,
 {
 }

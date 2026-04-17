@@ -1,6 +1,7 @@
 use super::*;
 use crate::passes::{CoreModuleShape, InstrRuff};
 use crate::py_expr;
+use ruff_python_ast as ast;
 
 #[test]
 fn cfg_block_new_sets_explicit_term() {

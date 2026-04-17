@@ -34,11 +34,33 @@ high-churn implementation code so common edits rebuild less of the workspace.
 - Shared config, logging, build identity, counter schema, and profile formats are currently spread
   across frontend, JIT, inspector, and runtime entrypoints.
 
+## Done
+
+### `soac-core`
+
+Own the first stable BlockPy model slice from the `soac-ir` proposal.
+
+Completed: added the `soac-core` workspace crate and moved context-free BlockPy model
+infrastructure there. `soac-blockpy` remains the lowering facade and re-exports these model types
+while keeping concrete instruction payloads, visitor/mapping helpers, CFG rewrites, validation,
+pretty-printing, and pass-specific lowering code local to `soac-blockpy`.
+
+Contents:
+
+- `BlockPyModule`, `BlockPyFunction`, blocks, terms, edges, and block params
+- module/function/runtime ids and name generators
+- source metadata and semantic instruction ids
+- parameter specs
+- scope/storage-layout data
+- counter site definitions
+
 ## Proposed Crates
 
 ### `soac-ir`
 
-Own the stable data model that downstream crates consume.
+Own the remaining stable data model that downstream crates consume. The current concrete crate name
+for the first slice is `soac-core`; this proposal still covers the follow-up model moves that have
+not happened yet.
 
 Likely contents:
 
@@ -174,9 +196,9 @@ keeps web dependencies out of non-web rendering and offline analysis tools.
    - extension build path
 2. Remove accidental crate outputs if safe. In particular, verify whether `soac-blockpy` still needs
    to build a `cdylib`; if not, make it an `rlib` only.
-3. Add `soac-ir` and move stable BlockPy payload types first.
-4. Keep `soac-blockpy` as a facade re-exporting `soac-ir` so the first extraction does not require a
-   whole-workspace import rewrite.
+3. Done, partial: add `soac-core` and move the first stable BlockPy model slice.
+4. Done, partial: keep `soac-blockpy` as a facade re-exporting `soac-core` so the first extraction
+   does not require a whole-workspace import rewrite.
 5. Change `soac-jit`, `soac-pyo3`, `soac-inspector`, and offline tools to import shared IR from
    `soac-ir` where possible.
 6. Add `soac-lowering` and move passes, driver, transformer, and template code there.
@@ -219,15 +241,15 @@ keeps web dependencies out of non-web rendering and offline analysis tools.
 
 ## First Concrete Step
 
-Start with the `soac-ir` extraction.
+Start with the remaining `soac-core`/`soac-ir` extraction.
 
 Definition of done for the first step:
 
-- New workspace crate `soac-ir`.
-- Stable BlockPy data structures move from `soac-blockpy` into `soac-ir`.
+- New workspace crate `soac-core`.
+- Stable BlockPy module/function/block, metadata, parameter, scope/storage, name/id, and counter
+  site data move from `soac-blockpy` into `soac-core`.
 - `soac-blockpy` re-exports the moved types so existing users keep compiling during migration.
 - `soac-jit` imports at least the core BlockPy instruction/module/function types directly from
-  `soac-ir`.
+  `soac-core`.
 - A lowering-pass-only edit no longer forces `soac-jit` to rebuild, verified with a simple
   before/after compile timing check.
-

@@ -1,4 +1,4 @@
-use super::{BlockLabel, RuntimeFunctionId};
+use super::{BlockLabel, Instr, RuntimeFunctionId};
 use ruff_python_ast::{self as ast, HasNodeIndex};
 use ruff_text_size::{Ranged, TextRange};
 use std::fmt;
@@ -126,6 +126,14 @@ where
             op: self.op.with_meta(meta),
         }
     }
+}
+
+impl<I> Instr for IdentifiedInstr<I>
+where
+    I: Instr,
+{
+    type Name = I::Name;
+    type Extra = I::Extra;
 }
 
 #[derive(Debug, Clone, Default, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]

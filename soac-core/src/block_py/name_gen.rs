@@ -1,7 +1,7 @@
 use ruff_python_ast as ast;
 use std::fmt;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 #[derive(
     Debug,
@@ -404,7 +404,7 @@ impl FunctionNameGen {
         }
     }
 
-    pub(crate) fn share(&self) -> Self {
+    pub fn share(&self) -> Self {
         Self {
             state: Arc::clone(&self.state),
         }
